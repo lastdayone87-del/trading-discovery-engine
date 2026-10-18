@@ -1,7 +1,7 @@
 import type { ExcludedCountry } from '../src/types';
 import { getExcludedCountries } from './db';
 import { COUNTRY_EXCLUSION_POLICY_LOCK, CountryExclusionMatch, findCountryExclusion, normalizeCountryName } from './countryExclusionRules';
-import { canonicalCountry } from './countryInference';
+import { resolveCountryIdentity } from './countryInference';
 
 export { findCountryExclusion, normalizeCountryName } from './countryExclusionRules';
 
@@ -120,7 +120,13 @@ export function findCountryExclusionWithAliases(
   const raw = findCountryExclusion(country, exclusions);
   if (raw) return raw;
   if (typeof country !== 'string' || !country.trim()) return null;
-  return findCountryExclusion(canonicalCountry(country), exclusions);
+  // resolveCountryIdentity covers the full modeled universe: ISO codes and
+  // COUNTRY_ALIASES keys plus the localized/exonym variants modeled in
+  // BARE_COUNTRY_NAME_VARIANTS (e.g. "Côte d'Ivoire" -> 'Ivory Coast',
+  // "Česká republika" -> 'Czechia'). The SQL-side counterpart resolves the
+  // same table (countryAliasResolutionJson), so code and database share one
+  // identity universe for exclusion matching.
+  return findCountryExclusion(resolveCountryIdentity(country), exclusions);
 }
 
 /**
@@ -135,8 +141,10 @@ export function findCountryExclusionWithAliases(
  *   - a policy commit that lands between an earlier read and this query is
  *     still honored (statement snapshot), closing the check-then-serve race
  *     without requiring a transaction;
- *   - excluded rows — including ISO/alias forms like 'DE' against 'Germany' —
- *     are rejected before LIMIT/OFFSET, so they can never consume batch slots;
+ *   - excluded rows — including ISO/alias forms like 'DE' against 'Germany'
+ *     and modeled localized variants like "Côte d'Ivoire" against
+ *     'Ivory Coast' — are rejected before LIMIT/OFFSET, so they can never
+ *     consume batch slots;
  *   - a NULL column stays allowed, matching the in-code matcher.
  */
 export function excludedCountrySqlPredicate(columnSql: string, mapParam: string): string {

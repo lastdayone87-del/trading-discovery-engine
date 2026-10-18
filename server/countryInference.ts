@@ -238,27 +238,47 @@ export function countryIsoAlias(value: string): string | null {
   return alias ? alias.toUpperCase() : null;
 }
 
-let cachedCountryAliasResolutionJson: string | null = null;
+let cachedCountryIdentityResolution: Record<string, string> | null = null;
 
 /**
- * Normalized alias-to-canonical resolution table for SQL predicates that must
- * mirror `canonicalCountry` in the database: keys are normalized alias
- * spellings (`normalizeCountryName`), values are normalized canonical country
- * names (e.g. `{"de":"germany","us":"united states"}`). Server-side exclusion
- * prefilters pass it as a `::jsonb` parameter and combine it with a live
- * `excluded_countries` subquery, so stored ISO/alias forms cannot survive a
- * WHERE clause (and cannot consume LIMIT/OFFSET slots) while the comparison
- * still uses the same alias universe as the in-code resolver.
+ * Normalized spelling-to-canonical resolution table: normalized
+ * `COUNTRY_ALIASES` keys plus the modeled localized/exonym variants from
+ * `BARE_COUNTRY_NAME_VARIANTS` map to their normalized canonical country
+ * (e.g. `{"de":"germany","côte d'ivoire":"ivory coast"}`). It is the single
+ * source for (a) `resolveCountryIdentity`, which the in-code country-exclusion
+ * matcher resolves stored spellings through, and (b) the `::jsonb` parameter
+ * of the server-side exclusion prefilters (`excludedCountrySqlPredicate`), so
+ * SQL and JS share one alias universe and stored localized forms cannot
+ * survive a WHERE clause or bypass the guard.
  */
-export function countryAliasResolutionJson(): string {
-  if (cachedCountryAliasResolutionJson === null) {
+export function countryIdentityResolution(): Record<string, string> {
+  if (cachedCountryIdentityResolution === null) {
     const resolution: Record<string, string> = {};
     for (const [alias, country] of Object.entries(COUNTRY_ALIASES)) {
       resolution[normalizeCountryName(alias)] = normalizeCountryName(canonicalCountry(country));
     }
-    cachedCountryAliasResolutionJson = JSON.stringify(resolution);
+    for (const [country, variants] of Object.entries(BARE_COUNTRY_NAME_VARIANTS)) {
+      const canonical = normalizeCountryName(canonicalCountry(country));
+      for (const variant of variants) resolution[normalizeCountryName(variant)] = canonical;
+    }
+    cachedCountryIdentityResolution = resolution;
   }
-  return cachedCountryAliasResolutionJson;
+  return cachedCountryIdentityResolution;
+}
+
+/**
+ * Resolves a stored country spelling (canonical name, ISO code, alias, or
+ * modeled localized/exonym variant) to its canonical identity. Unknown
+ * spellings fall back to `canonicalCountry` unchanged, so callers keep the
+ * existing behavior for anything outside the modeled universe.
+ */
+export function resolveCountryIdentity(value: string): string {
+  return countryIdentityResolution()[normalizeCountryName(value)] ?? canonicalCountry(value);
+}
+
+/** JSON form of `countryIdentityResolution()` for SQL predicates (see its doc). */
+export function countryAliasResolutionJson(): string {
+  return JSON.stringify(countryIdentityResolution());
 }
 
 /**

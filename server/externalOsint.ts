@@ -268,7 +268,7 @@ export async function materializeExternalOsintProposals(options: { enabled:boole
     // something to select. The in-transaction check inside
     // persistExternalOsintProposal remains the authoritative guard.
     const aggregates=aggregateOsintEvidence(options.observations,options.now);
-    if(aggregates.length===0)return 0;
+    if(!aggregates.some(a=>a.eligible))return 0;
     const db=options.runner||await getDb();
     const exclusions=await readExcludedCountries(db);
     const chosen=selectBoundedOsintEvidence(aggregates.filter(a=>!findCountryExclusionWithAliases(a.country,exclusions)),{global:options.caps?.global??20,perSourceFamily:options.caps?.perSourceFamily??5,perCountry:options.caps?.perCountry??4});

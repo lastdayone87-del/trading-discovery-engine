@@ -6,6 +6,7 @@ import { buildFrontierProposal, generateCountryNativeProposals, persistFrontierP
 import { materializeExternalOsintProposals, persistExternalOsintProposal } from './externalOsint';
 import { generateMultilingualActions } from './persistentResearchController';
 import { findCountryExclusionWithAliases, readExcludedCountries } from './countryExclusion';
+import { countryAliasResolutionJson } from './countryInference';
 import { addExcludedCountryGuarded } from './countryExclusionRules';
 import { getNeighborhoodCandidates } from './discoveryFrontierAllocator';
 import { evaluateTrialGate } from './discoveryFrontierTrials';
@@ -399,6 +400,28 @@ test('OSINT materialization fills the bounded selection with allowed markets des
   assert.equal(inserts[0].params?.[1], 'United States', 'only the allowed market may consume the bounded selection');
 });
 
+test('OSINT materialization skips the policy read when no aggregate is eligible', async () => {
+  const osintEligible = (country: string, id: string): any => ({
+    observationId: id, sourceId: `src-${id}`, sourceFamily: 'PUBLIC_COMMUNITY',
+    fetchedAt: '2026-10-17T00:00:00.000Z', observedAt: '2026-10-17T00:00:00.000Z',
+    country, locale: 'en-US', language: 'en', script: 'Latn', surface: `surface ${country}`,
+    canonicalConcept: 'ETF', extractionMethod: 'manual', extractionVersion: 'v1',
+    confidence: 0.9, reliability: 0.9, relevance: 0.9, supportingEvidence: {}, contentChecksum: `sum-${id}`, correlationKey: `corr-${id}`
+  });
+  const runner = makeRunner([excludedGermany]);
+  // A single observation per country fails independence, so nothing is
+  // eligible: the exclusion list must not be read at all.
+  const count = await materializeExternalOsintProposals({
+    enabled: true,
+    observations: [osintEligible('Germany', 'g1')],
+    caps: { global: 1, perSourceFamily: 1, perCountry: 1 },
+    runner,
+    now: new Date('2026-10-18T00:00:00Z')
+  });
+  assert.equal(count, 0);
+  assert.equal(runner.calls.length, 0, 'no policy read when nothing is eligible to select');
+});
+
 test('OSINT persistence fails closed for an ISO alias of an excluded market', async () => {
   const runner = makeRunner([
     excludedGermany,
@@ -603,6 +626,38 @@ test('alias-form excluded rows are rejected in SQL and cannot consume page slots
   assert.match(paged!.sql, /excluded_countries excluded/, 'the query must filter against the live policy table');
   assert.match(paged!.sql, /\$4::jsonb/, 'the statement must carry the alias resolution map');
   assert.equal(JSON.parse(String(paged!.params?.[3])).de, 'germany', "SQL alias resolution must map 'de' to 'germany', matching the in-code matcher");
+});
+
+test('modeled localized variants resolve for exclusion matching in code and in the SQL map', () => {
+  // The domicile layer already models localized/exonym spellings
+  // (BARE_COUNTRY_NAME_VARIANTS). Exclusion identity shares that universe, or
+  // a stored "Côte d'Ivoire" row would slip past an 'Ivory Coast' policy.
+  const ivoryCoast = { country_name: 'Ivory Coast', reason: 'regulatory prohibition' };
+  assert.ok(findCountryExclusionWithAliases("Côte d'Ivoire", [ivoryCoast]), 'localized spelling must match');
+  assert.ok(findCountryExclusionWithAliases('cote divoire', [ivoryCoast]), 'plain-ASCII variant must match');
+  assert.ok(findCountryExclusionWithAliases('Česká republika', [{ country_name: 'Czechia', reason: 'regulatory prohibition' }]), 'diacritic variant must match');
+  assert.equal(findCountryExclusionWithAliases('Germany', [ivoryCoast]), null, 'other markets stay allowed');
+  const map = JSON.parse(countryAliasResolutionJson()) as Record<string, string>;
+  assert.equal(map["côte d'ivoire"], 'ivory coast', 'the SQL map must resolve localized variants too');
+  assert.equal(map['česká republika'], 'czechia');
+  assert.equal(map['de'], 'germany');
+});
+
+test('pagination has a hard page backstop: a window that never advances cannot loop unbounded', async () => {
+  // Pathological runner: every window returns a full page of excluded rows
+  // that only the JS matcher drops (a SQL/JS mismatch deeper than the
+  // modeled identity universe). The loop must stop at the backstop instead
+  // of issuing full-window queries forever.
+  const offsets: number[] = [];
+  const runner = makeRunner([
+    excludedGermany,
+    { match: /concept_market_affinities/, respond: (_sql, params) => { offsets.push(Number(params?.[2] ?? 0)); return { rows: Array.from({ length: 200 }, (_, i) => ({ ...germanSurface(i), surface_id: 8000 + i })) }; } },
+    { match: /research_programs/, respond: () => ({ rows: [{ id: 1, scope: '{}' }] }) }
+  ]);
+  const count = await generateMultilingualActions('2026-10-18T00:00:00Z', runner);
+  assert.equal(count, 0, 'no allowed surface exists in the pathological corpus');
+  assert.equal(offsets.length, 100, 'the hard backstop ends the scan after 100 windows');
+  assert.equal(offsets[99], 99 * 200);
 });
 
 test('pagination order is total: ties cannot skip or duplicate eligible surfaces across offset pages', async () => {
