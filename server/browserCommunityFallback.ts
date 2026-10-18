@@ -801,9 +801,12 @@ export class RenderedFallbackGate {
     });
   }
 
-  async run<T>(operation: () => Promise<T>): Promise<T> {
+  async run<T>(operation: (admittedAtMs: number) => Promise<T>): Promise<T> {
     const release = await this.acquire();
-    try { return await operation(); } finally { release(); }
+    // Admission is timestamped here so callers can start budget clocks at the
+    // moment the gate slot was granted, even if they serialize internally
+    // afterwards (see withRenderedQueueLifecycleLock).
+    try { return await operation(Date.now()); } finally { release(); }
   }
 
   snapshot(): { active: number; pending: number; concurrency: number; maxPending: number } {
@@ -1061,9 +1064,13 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   retain(seedUrl,seedUrl);
 
   try {
-    return await renderedFallbackGate.run(() => withRenderedQueueLifecycleLock(async () => {
+    return await renderedFallbackGate.run((gateAdmittedAtMs) => withRenderedQueueLifecycleLock(async () => {
       telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'GATE_ACQUIRED');
-      const startedAt = Date.now();
+      // Total-budget clock: starts at gate admission, before the lifecycle
+      // lock below, so a crawl admitted by a wider gate (env concurrency 2)
+      // consumes budget while waiting behind a serialized predecessor instead
+      // of occupying a gate slot with a fresh clock — the pre-lock semantics.
+      const startedAt = gateAdmittedAtMs;
       const { PlaywrightCrawler, RequestQueue, Configuration } = await import('crawlee');
       // Crawlee 3.18 registers anonymous process-wide `migrating`/`aborting`
       // listeners for every RequestQueue instance and never removes them, and

@@ -143,6 +143,17 @@ test('crawler uses a per-invocation named queue, drops it, and reclaims its list
   assert.ok(finalizeIndex >= 0 && openIndex < finalizeIndex, 'lifecycle finalizer runs after the queue open');
 });
 
+test('total-budget clock starts at gate admission, before the lifecycle lock', async () => {
+  // Regression guard: serializing the lifecycle must not delay the crawl's
+  // total-budget clock — an admitted crawl has to consume budget while it
+  // waits behind the lifecycle lock, so `startedAt` comes from the gate's
+  // admission timestamp rather than from lock acquisition time.
+  const source = await import('node:fs/promises').then(fs => fs.readFile(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8'));
+  assert.match(source, /renderedFallbackGate\.run\(\(gateAdmittedAtMs\) => withRenderedQueueLifecycleLock\(async \(\) => \{/);
+  assert.match(source, /const startedAt = gateAdmittedAtMs;/);
+  assert.match(source, /return await operation\(Date\.now\(\)\);/);
+});
+
 test('cleanup failure is observable without changing the crawl result', async () => {
   // A failing drop() must emit one bounded warning (queue name + redacted
   // cause, never raw secrets) while resolving normally so the settled crawl
@@ -265,10 +276,24 @@ test('crawlee 3.18: queue construction registers process-wide lifecycle listener
   const { config } = isolatedTestConfig();
   const emitter = renderedQueueLifecycleEmitter(config.getEventManager());
   assert.ok(emitter, 'Crawlee EventManager exposes the process-wide emitter');
-  const queue = await RequestQueue.open('rendered-community-contract', { config });
-  assert.ok(emitter.listeners('migrating').length > 0, 'queue construction registers migrating listeners');
-  assert.ok(emitter.listeners('aborting').length > 0, 'queue construction registers aborting listeners');
-  await queue.drop().catch(() => undefined);
+  const baseline = {
+    migrating: emitter.listeners('migrating').length,
+    aborting: emitter.listeners('aborting').length,
+  };
+  const ledger = captureRenderedQueueLifecycleListeners(emitter);
+  try {
+    const queue = await RequestQueue.open('rendered-community-contract', { config });
+    assert.ok(emitter.listeners('migrating').length > baseline.migrating, 'queue construction registers migrating listeners');
+    assert.ok(emitter.listeners('aborting').length > baseline.aborting, 'queue construction registers aborting listeners');
+    await queue.drop().catch(() => undefined);
+  } finally {
+    // drop() does not unregister the anonymous listeners the constructor
+    // added; reclaim them so this test does not retain the dropped queue graph
+    // even for its own lifetime (same reclamation the production finally uses).
+    reclaimRenderedQueueLifecycleListeners(emitter, ledger);
+  }
+  assert.equal(emitter.listeners('migrating').length, baseline.migrating, 'contract test leaves no migrating listeners behind');
+  assert.equal(emitter.listeners('aborting').length, baseline.aborting, 'contract test leaves no aborting listeners behind');
 });
 
 test('repeated serialized crawl lifecycles do not accumulate queue listeners', async () => {
