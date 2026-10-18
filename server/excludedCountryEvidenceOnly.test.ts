@@ -7,7 +7,7 @@ import { materializeExternalOsintProposals, persistExternalOsintProposal } from 
 import { generateMultilingualActions } from './persistentResearchController';
 import { excludedCountrySqlPredicate, findCountryExclusionWithAliases, readExcludedCountries } from './countryExclusion';
 import { canonicalCountry, countryAliasResolutionJson, countryIdentityResolution, resolveCountryIdentity } from './countryInference';
-import { addExcludedCountryGuarded } from './countryExclusionRules';
+import { addExcludedCountryGuarded, removeExcludedCountryGuarded } from './countryExclusionRules';
 import { getNeighborhoodCandidates } from './discoveryFrontierAllocator';
 import { evaluateTrialGate } from './discoveryFrontierTrials';
 
@@ -780,6 +780,22 @@ test('a blank exclusion name is rejected before the write can fail every guarded
   assert.equal(runner.calls.length, 0, 'no advisory lock and no insert may run for an unreadable name');
 });
 
+test('the guarded write stores the trimmed identity so a padded name cannot duplicate or defeat removal', async () => {
+  const runner = makeRunner([{ match: /INSERT INTO excluded_countries/, respond: () => ({ rows: [], rowCount: 1 }) }]);
+  await addExcludedCountryGuarded(runner as any, { country_name: '  Germany\u00a0', reason: 'regulatory prohibition' });
+  const insert = runner.calls.find(c => /INSERT INTO excluded_countries/.test(c.sql));
+  assert.equal(insert?.params?.[0], 'Germany', 'leading/trailing Unicode whitespace must be trimmed before storing');
+});
+
+test('removal deletes by the same normalized identity as the matchers', async () => {
+  const runner = makeRunner([{ match: /DELETE FROM excluded_countries/, respond: () => ({ rows: [], rowCount: 1 }) }]);
+  await removeExcludedCountryGuarded(runner as any, 'Germany');
+  const del = runner.calls.find(c => /DELETE FROM excluded_countries/.test(c.sql));
+  assert.match(del!.sql, /normalize\(country_name, NFKC\)/, 'the stored side must use the shared identity normalization');
+  assert.match(del!.sql, /normalize\(\$1, NFKC\)/, 'the requested name must be normalized the same way');
+  assert.equal(del!.params?.[0], 'Germany');
+});
+
 test('an exclusion row stored in an alias or localized form is canonicalized on the stored side too', async () => {
   const storedAlias = [{ country_name: 'DE', reason: 'regulatory prohibition' }];
   assert.equal(findCountryExclusionWithAliases('Germany', storedAlias)?.country, 'DE', 'canonical candidate must match a stored ISO alias');
@@ -803,9 +819,16 @@ test('an exclusion row stored in an alias or localized form is canonicalized on 
 test('the SQL prefilter resolves stored policy rows through the same identity map (parity lock)', () => {
   const sql = excludedCountrySqlPredicate('n.country', '$3');
   assert.match(sql, /excluded_countries excluded/);
-  assert.match(sql, /\$3::jsonb ->> lower\(regexp_replace\(trim\(excluded\.country_name\)/, 'the stored policy row must be resolved through the alias map');
-  assert.match(sql, /\$3::jsonb ->> lower\(regexp_replace\(trim\(n\.country\)/, 'the candidate column must be resolved through the alias map');
+  assert.match(sql, /\$3::jsonb ->> lower\(regexp_replace\(btrim\(normalize\(excluded\.country_name, NFKC\)/, 'the stored policy row must be resolved through the alias map');
+  assert.match(sql, /\$3::jsonb ->> lower\(regexp_replace\(btrim\(normalize\(n\.country, NFKC\)/, 'the candidate column must be resolved through the alias map');
   assert.equal(sql.includes(' OR '), false, 'a single canonical-vs-canonical comparison covers both sides');
+  // normalizeCountryName() parity: NFKC first (fullwidth letters and NBSP fold
+  // to ASCII), then the full JavaScript whitespace trim (not PostgreSQL's
+  // ASCII-space trim), collapse, lowercase.
+  assert.ok(sql.includes('normalize(excluded.country_name, NFKC)'), 'NFKC parity on the stored side');
+  assert.ok(sql.includes('normalize(n.country, NFKC)'), 'NFKC parity on the candidate side');
+  assert.ok(sql.includes("'\\s+'"), 'the whitespace class must be emitted with a single backslash');
+  assert.equal(sql.includes("'\\\\s+'"), false, 'a double backslash would match a literal backslash, not whitespace');
 });
 
 test('a standalone pg.Client runner is reused, never mistaken for a Pool (pool ownership)', async () => {

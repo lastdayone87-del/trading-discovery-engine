@@ -1,6 +1,6 @@
 import type { ExcludedCountry } from '../src/types';
 import { getExcludedCountries } from './db';
-import { COUNTRY_EXCLUSION_POLICY_LOCK, CountryExclusionMatch, findCountryExclusion, normalizeCountryName } from './countryExclusionRules';
+import { COUNTRY_EXCLUSION_POLICY_LOCK, CountryExclusionMatch, countryNameNormSql, findCountryExclusion, normalizeCountryName } from './countryExclusionRules';
 import { resolveCountryIdentity } from './countryInference';
 
 export { findCountryExclusion, normalizeCountryName } from './countryExclusionRules';
@@ -146,6 +146,11 @@ export function findCountryExclusionWithAliases(
  *   resolve(excluded.country_name) = resolve(column)
  *   where resolve(x) = COALESCE(map ->> norm(x), x)
  *
+ * `norm` is countryNameNormSql(), the SQL mirror of normalizeCountryName()
+ * (NFKC, Unicode-whitespace trim, whitespace collapse, lowercase), so the
+ * map keys (built with the JavaScript normalization) and the columns agree
+ * even for compatibility-form or NBSP-padded spellings.
+ *
  * Because it reads `excluded_countries` in the same statement:
  *   - a policy commit that lands between an earlier read and this query is
  *     still honored (statement snapshot), closing the check-then-serve race
@@ -157,7 +162,7 @@ export function findCountryExclusionWithAliases(
  *   - a NULL column stays allowed, matching the in-code matcher.
  */
 export function excludedCountrySqlPredicate(columnSql: string, mapParam: string): string {
-  const norm = (expr: string) => `lower(regexp_replace(trim(${expr}), '\\s+', ' ', 'g'))`;
+  const norm = countryNameNormSql;
   const resolved = (expr: string) => `COALESCE(${mapParam}::jsonb ->> ${norm(expr)}, ${expr})`;
   return `NOT EXISTS (SELECT 1 FROM excluded_countries excluded WHERE ${norm(resolved('excluded.country_name'))} = ${norm(resolved(columnSql))})`;
 }
