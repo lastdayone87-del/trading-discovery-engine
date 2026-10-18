@@ -208,7 +208,9 @@ test('Checkpoint 3 Blocker 4 Fix: Frontier quota efficiency uses exact quality_n
 });
 
 test('Checkpoint 3 Blocker 5 Fix: COUNTRY_NATIVE provenance distinguishes observed evidence from bootstrap vocabulary', async () => {
-  const proposals = await generateCountryNativeProposals('US', 5);
+  // An explicit runner with an empty exclusion list and no rows exercises the
+  // bootstrap fallback for a market whose exclusion status is known allowed.
+  const proposals = await generateCountryNativeProposals('US', 5, { runner: { query: async () => ({ rows: [] as any[] }) } });
   assert.ok(proposals.length > 0);
 
   for (const p of proposals) {

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { getDb } from './db';
 import { canonicalCountry } from './countryInference';
-import { findCountryExclusion, readExcludedCountries } from './countryExclusion';
+import { findCountryExclusionWithAliases, lockExclusionPolicyForGuardedWrite, readExcludedCountries } from './countryExclusion';
 import { inferScript, isNoiseOrBoilerplate, normalizeNativeTerm } from './countryNativeIntelligence';
 import { buildFrontierProposal, type DiscoveryFrontierProposal } from './discoveryProposalGenerators';
 import { createNeighborhoodChecksum } from './discoveryNeighborhood';
@@ -209,10 +209,35 @@ export function buildExternalOsintProposal(evidence: OsintEvidenceAggregate, rev
 }
 
 export async function persistExternalOsintProposal(proposal: DiscoveryFrontierProposal, runner?: Queryable): Promise<boolean> {
-  const db=runner||await getDb(); const d=proposal.targetDimensions;
+  // Pool discipline: a shared advisory lock is only held until the end of its
+  // transaction, so when the runner is a Pool (or absent) own a transaction
+  // that spans the exclusion check and the proposal writes below.
+  const isPool = (candidate: any) => candidate && 'connect' in candidate && typeof candidate.connect === 'function' && !('release' in candidate);
+  if (!runner || isPool(runner)) {
+    const pool: any = runner || await getDb();
+    if (isPool(pool)) {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const persisted = await persistExternalOsintProposal(proposal, client);
+        await client.query('COMMIT');
+        return persisted;
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    }
+  }
+  const db: Queryable = runner || await getDb(); const d=proposal.targetDimensions;
   // Excluded-country guardrail: excluded markets are evidence-only; OSINT
-  // proposals must not materialize for them.
-  if (findCountryExclusion(proposal.country, await readExcludedCountries(db))) return false;
+  // proposals must not materialize for them. The shared policy lock is held
+  // through the writes below (same transaction), so an exclusion committed
+  // mid-write cannot race this check; the alias-aware matcher closes ISO-code
+  // forms like 'DE' against a stored 'Germany' entry.
+  await lockExclusionPolicyForGuardedWrite(db);
+  if (findCountryExclusionWithAliases(proposal.country, await readExcludedCountries(db))) return false;
   // Resolve to the existing terminology authority when it already knows this
   // identity. OSINT retains distinct evidence/proposal provenance and never
   // creates or mutates canonical terminology on its own.

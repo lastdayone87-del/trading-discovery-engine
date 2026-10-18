@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { getDb } from './db';
 import { canonicalCountry } from './countryInference';
-import { findCountryExclusion, readExcludedCountries } from './countryExclusion';
+import { findCountryExclusionWithAliases, lockExclusionPolicyForGuardedWrite, readExcludedCountries } from './countryExclusion';
 import { isQualityCreator } from './queryPerformance';
 
 type Queryable = Pool | PoolClient | { query: (sql: string, params?: any[]) => Promise<any> };
@@ -475,8 +475,11 @@ export async function recomputeNativeEvidenceProjection(
   const governedBootstrapEvidence = bootstrapSeedCount > 0 || Boolean(provenanceCounts.COUNTRY_VOCABULARY);
   // Excluded-country guardrail: derived proposal eligibility is suppressed
   // for excluded markets so their terminology stays evidence-only even when
-  // the native evidence above would otherwise qualify it.
-  const countryExclusion = findCountryExclusion(term.country, await readExcludedCountries(runner));
+  // the native evidence above would otherwise qualify it. The shared policy
+  // lock is taken before the read and held through the projection upsert
+  // below (same transaction), serializing the check with policy writers.
+  await lockExclusionPolicyForGuardedWrite(runner);
+  const countryExclusion = findCountryExclusionWithAliases(term.country, await readExcludedCountries(runner));
   const nativeProposalEligible =
     !countryExclusion &&
     ((nativeObservedCount >= 1 && (nativeQualityCreatorCount >= 2 || structuredMatched)) ||

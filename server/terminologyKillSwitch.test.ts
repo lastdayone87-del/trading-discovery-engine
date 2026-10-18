@@ -134,8 +134,9 @@ test('extraction path: inactive switch proceeds into normal extraction work', as
 
 const plannerTermsRow = { id: 1, term: 'DAX', lifecycle_status: 'SEARCH_TRIAL', score: 0.5 };
 const fakeClient = (calls: { n: number }) => ({
-  query: async () => {
+  query: async (sql: string) => {
     calls.n++;
+    if (sql.includes('excluded_countries')) return { rows: [] };
     return { rows: [plannerTermsRow] };
   },
 }) as any;
@@ -172,6 +173,7 @@ const scriptedPlannerClient = (calls: { sql: string[] }, settingValue: string | 
     if (sql.includes('app_settings')) {
       return { rows: settingValue == null ? [] : [{ setting_value: settingValue }] };
     }
+    if (sql.includes('excluded_countries')) return { rows: [] };
     return { rows: [plannerTermsRow] };
   },
 }) as any;
@@ -205,6 +207,7 @@ const scriptedTransactionClient = (calls: { sql: string[] }, settingValue: strin
       if (poisoned) {
         throw new Error('current transaction is aborted, commands ignored until end of transaction block');
       }
+      if (sql.includes('excluded_countries')) return { rows: [] };
       return { rows: [plannerTermsRow] };
     },
   } as any;

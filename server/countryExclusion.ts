@@ -1,6 +1,7 @@
 import type { ExcludedCountry } from '../src/types';
 import { getExcludedCountries } from './db';
-import { CountryExclusionMatch, findCountryExclusion, normalizeCountryName } from './countryExclusionRules';
+import { COUNTRY_EXCLUSION_POLICY_LOCK, CountryExclusionMatch, findCountryExclusion, normalizeCountryName } from './countryExclusionRules';
+import { canonicalCountry } from './countryInference';
 
 export { findCountryExclusion, normalizeCountryName } from './countryExclusionRules';
 
@@ -71,10 +72,53 @@ export async function assertCountryAllowed(country: string | null | undefined, c
  * read the same authority as the guarded write (a transaction-bound client
  * stays on that transaction; a pool stays on the pool). Throws on read
  * failure: guardrails fail closed at the caller, never silently open.
+ *
+ * A malformed result is a read failure too: a missing/non-array `rows` or a
+ * row without a country_name must never be interpreted as "no exclusions".
+ * A legitimate empty row set ({ rows: [] }) is the only valid empty result.
  */
 export async function readExcludedCountries(
   runner: { query: (sql: string, params?: any[]) => Promise<any> }
 ): Promise<ExcludedCountry[]> {
   const result = await runner.query('SELECT country_name, reason FROM excluded_countries');
-  return (result.rows || []) as ExcludedCountry[];
+  const rows = result?.rows;
+  if (!Array.isArray(rows)) throw new Error('EXCLUDED_COUNTRIES_READ_MALFORMED');
+  for (const row of rows) {
+    if (!row || typeof row.country_name !== 'string' || !row.country_name.trim() || typeof row.reason !== 'string') {
+      throw new Error('EXCLUDED_COUNTRIES_READ_MALFORMED');
+    }
+  }
+  return rows as ExcludedCountry[];
+}
+
+/**
+ * Takes the SHARED exclusion-policy advisory lock on the runner. Call this on
+ * the same transaction-bound runner that will perform the protected write,
+ * before reading the exclusion list: exclusion-list writers take the
+ * EXCLUSIVE variant of the same lock, so a policy change cannot commit
+ * between the guarded check and the protected write. A pool runner cannot
+ * hold an xact lock across statements — guarded writers wrap the check and
+ * the mutation in one transaction-bound client (the Pool-discipline pattern
+ * used by this codebase) before calling this.
+ */
+export async function lockExclusionPolicyForGuardedWrite(
+  runner: { query: (sql: string, params?: any[]) => Promise<any> }
+): Promise<void> {
+  await runner.query(`SELECT pg_advisory_xact_lock_shared(hashtext($1))`, [COUNTRY_EXCLUSION_POLICY_LOCK]);
+}
+
+/**
+ * Alias-aware exclusion matcher. Checks the raw input and its canonical
+ * country identity, so ISO/alias forms (e.g. 'DE', 'PK') cannot bypass an
+ * exclusion stored under the canonical name. Unknown countries normalize to
+ * themselves and match nothing unless literally listed.
+ */
+export function findCountryExclusionWithAliases(
+  country: string | null | undefined,
+  exclusions: ExcludedCountry[]
+): CountryExclusionMatch | null {
+  const raw = findCountryExclusion(country, exclusions);
+  if (raw) return raw;
+  if (typeof country !== 'string' || !country.trim()) return null;
+  return findCountryExclusion(canonicalCountry(country), exclusions);
 }

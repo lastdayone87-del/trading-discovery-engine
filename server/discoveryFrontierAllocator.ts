@@ -10,6 +10,7 @@ import type { NeighborhoodFrontierState } from './discoveryFrontierState';
 import { effectiveProjectionProposalEvidence } from './discoveryProposalGenerators';
 import { isOsintSnapshotFresh } from './externalOsint';
 import { isShadowBraveCanaryAllowed, providerSnapshot, rotateActiveProviderRow, ledgerProviderToRegistryKey, providerCooldownObservationWindowSecs, type ProviderAllocation } from './providerAwareRetrieval';
+import { findCountryExclusionWithAliases, lockExclusionPolicyForGuardedWrite, readExcludedCountries } from './countryExclusion';
 
 export const PERSISTENT_RESEARCH_PHASE8_VERSION = 'discovery-frontier-allocator-v1';
 
@@ -257,6 +258,16 @@ export async function getNeighborhoodCandidates(
   const db = client || (process.env.DATABASE_URL ? await getDb() : null);
   if (!db) return [];
   const quotaDay = getYouTubeQuotaDay(now);
+  // Excluded-country guardrail at allocation time: previously persisted
+  // PENDING proposals (OSINT or country-native bootstrap) must not be served
+  // after their country joins the exclusion list. When the caller supplies a
+  // transaction-bound runner (the canary path does), the shared policy lock
+  // is held until that transaction commits, serializing the check with the
+  // allocation decision written there. A pool runner only sees read-time
+  // policy state, which is still fail-closed for serving.
+  await lockExclusionPolicyForGuardedWrite(db);
+  const exclusions = await readExcludedCountries(db);
+  if (targetCountry && findCountryExclusionWithAliases(targetCountry, exclusions)) return [];
 
   const query = `
     SELECT
@@ -316,7 +327,7 @@ export async function getNeighborhoodCandidates(
         AND allocation_origin = 'FRONTIER_CANARY'
         AND decision_status IN ('RESERVED', 'COMMITTED')
     ) recent ON true
-    ${targetCountry ? 'WHERE LOWER(n.country) = LOWER($3)' : ''}
+    ${targetCountry ? 'WHERE LOWER(n.country) = LOWER($3) AND' : 'WHERE'} NOT EXISTS (SELECT 1 FROM excluded_countries excluded WHERE lower(regexp_replace(trim(excluded.country_name), '\\s+', ' ', 'g')) = lower(regexp_replace(trim(n.country), '\\s+', ' ', 'g')))
     ORDER BY n.last_observed_at DESC
     LIMIT 50
   `;
@@ -324,7 +335,7 @@ export async function getNeighborhoodCandidates(
   const params = targetCountry ? [now.toISOString(), quotaDay, targetCountry] : [now.toISOString(), quotaDay];
   const res = await db.query(query, params);
 
-  return res.rows.map((row: any) => {
+  return res.rows.filter((row: any) => !findCountryExclusionWithAliases(row.country, exclusions)).map((row: any) => {
     const rawDims = typeof row.dimensions === 'string' ? JSON.parse(row.dimensions) : (row.dimensions || {});
     const dimensions: DiscoveryNeighborhoodDimensions = {
       country: row.country || targetCountry || 'US',

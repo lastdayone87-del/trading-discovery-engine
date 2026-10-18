@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { getDb } from './db';
 import { buildDiscoveryNeighborhood, createNeighborhoodChecksum, type DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
 import { canonicalCountry, countryIsoAlias } from './countryInference';
-import { findCountryExclusion, readExcludedCountries } from './countryExclusion';
+import { findCountryExclusionWithAliases, lockExclusionPolicyForGuardedWrite, readExcludedCountries } from './countryExclusion';
 import { computeEvidenceChecksum } from './countryNativeIntelligence';
 import { QUALITY_CREATOR_SCORE_THRESHOLD } from './queryPerformance';
 
@@ -310,13 +310,24 @@ export async function generateCountryNativeProposals(country: string, limit = 10
   const normC = canonicalC.toUpperCase();
   const seedKey = country.toUpperCase().trim();
 
+  // Excluded-country guardrail: excluded markets are evidence-only, so no
+  // country-native proposal may be generated for them — even when stale
+  // eligible projections remain. The guard sits OUTSIDE the fallback try:
+  // when the database is unavailable or the exclusion read fails for a named
+  // country, exclusion status is unknown and the only safe answer is no
+  // proposals. The static seed dictionary must never be reachable while the
+  // exclusion status of the requested country is unknown.
+  let db: { query: (sql: string, params?: any[]) => Promise<any> } | null = null;
   try {
-    const db = deps?.runner || await getDb().catch(() => null);
+    db = deps?.runner || await getDb();
+    const exclusions = await readExcludedCountries(db);
+    if (findCountryExclusionWithAliases(country, exclusions)) return [];
+  } catch {
+    return [];
+  }
+
+  try {
     if (db) {
-      // Excluded-country guardrail: excluded markets are evidence-only, so no
-      // country-native proposal may be generated for them — even when stale
-      // eligible projections remain. Fail closed before any eligible query.
-      if (findCountryExclusion(country, await readExcludedCountries(db))) return [];
       // 1. First, check Phase 10 proposal-eligible native projections from canonical_trading_terms
       const nativeProjRes = await db.query(
         `SELECT
@@ -604,21 +615,40 @@ export async function generateTemporalProposals(country: string, limit = 10): Pr
  * improves monotonically without losing an already persisted signal.
  */
 export async function persistFrontierProposals(
-  proposals: DiscoveryFrontierProposal[]
+  proposals: DiscoveryFrontierProposal[],
+  deps?: { runner?: { query: (sql: string, params?: any[]) => Promise<any> } }
 ): Promise<number> {
   if (!proposals.length) return 0;
-  const db = await getDb();
+  const db: any = deps?.runner || await getDb();
+  // A Pool cannot hold the shared exclusion-policy lock across statements:
+  // own a transaction per proposal so the exclusion check and the proposal
+  // write serialize with exclusion-list updates. A caller-supplied client
+  // (no `connect`) joins the caller's transaction and owns its commit.
+  const ownsClient = 'connect' in db && typeof db.connect === 'function' && !('release' in db);
   let inserted = 0;
 
   for (const p of proposals) {
     let client: any = null;
     let runner: any = db;
     try {
-      const canonicalTermId = Number(p.supportingEvidence.canonicalTermId);
-      if (p.proposalFamily === 'COUNTRY_NATIVE' && Number.isSafeInteger(canonicalTermId) && canonicalTermId > 0) {
+      if (ownsClient) {
         client = await db.connect();
         runner = client;
         await runner.query('BEGIN');
+      }
+      // Excluded-country guardrail at persistence time: the same transaction
+      // that writes the proposal takes the shared policy lock and re-reads
+      // the list, so a market excluded mid-batch cannot have a proposal —
+      // generated or static seed — persisted after the policy change
+      // committed. Exclusion status is authoritative for every family.
+      await lockExclusionPolicyForGuardedWrite(runner);
+      const exclusions = await readExcludedCountries(runner);
+      if (findCountryExclusionWithAliases(p.country, exclusions)) {
+        if (ownsClient) await runner.query('ROLLBACK');
+        continue;
+      }
+      const canonicalTermId = Number(p.supportingEvidence.canonicalTermId);
+      if (p.proposalFamily === 'COUNTRY_NATIVE' && Number.isSafeInteger(canonicalTermId) && canonicalTermId > 0) {
         await runner.query('SELECT id FROM canonical_trading_terms WHERE id=$1 FOR SHARE', [canonicalTermId]);
         const authoritative = await runner.query(
           `SELECT native_evidence_status,source_provenance_family,source_provenance_families,
@@ -629,7 +659,8 @@ export async function persistFrontierProposals(
           [canonicalTermId]
         );
         if (!authoritative.rowCount) {
-          await runner.query('ROLLBACK'); client.release(); client = null; continue;
+          if (ownsClient) await runner.query('ROLLBACK');
+          continue;
         }
         const row = authoritative.rows[0];
         const effective = effectiveProjectionProposalEvidence(row);
@@ -640,7 +671,8 @@ export async function persistFrontierProposals(
             String(p.supportingEvidence.evidenceRevision || '0') !== currentRevision ||
             p.supportingEvidence.nativeEvidenceStatus !== effective.nativeEvidenceStatus ||
             p.supportingEvidence.sourceProvenanceFamily !== effective.sourceProvenanceFamily) {
-          await runner.query('ROLLBACK'); client.release(); client = null; continue;
+          if (ownsClient) await runner.query('ROLLBACK');
+          continue;
         }
       }
       if (p.targetNeighborhoodKey) {
@@ -747,9 +779,9 @@ export async function persistFrontierProposals(
       ]
     );
       if (res.rowCount) inserted++;
-      if (client) await runner.query('COMMIT');
+      if (ownsClient) await runner.query('COMMIT');
     } catch (error) {
-      if (client) await runner.query('ROLLBACK');
+      if (ownsClient) await runner.query('ROLLBACK').catch(() => undefined);
       throw error;
     } finally {
       if (client) client.release();
