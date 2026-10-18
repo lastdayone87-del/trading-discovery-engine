@@ -15,6 +15,7 @@ import {
   isRetryableInfrastructureFailure
 } from './db';
 import { assertCountryAllowed } from './countryExclusion';
+import { isTerminologyKillSwitchActive, TERMINOLOGY_KILL_SWITCH_KEY } from './terminologyKillSwitch';
 import { limitRepeatedPrimaryTerms, planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, queriesOutsideCooldown, rotateAwayFromMostRecentIntent, reformulatePollutedQuery } from './queryPlanner';
 import { selectQueryCollection, isSeverelyContaminatedQuery, type QueryFunnelMetrics } from './queryPerformance';
 import { attributeTerminologyPerformance, buildNoveltyBaseline, classifyNativeCandidate, detectSpamSignals, findLiteralSpan, getPlannerTerminology, normalizeTerm, observeTerminology, observeTerminologyDetailed, KNOWN_INSTRUMENT_TERMS, type LiteralSourceText, type LiteralSpanMatch, type NativeAdmissionRejectReason, type NoveltyBaseline, type TerminologyObservationResult } from './terminologyIntelligence';
@@ -467,7 +468,10 @@ export interface ExtractionVideoSource {
  * so a save that failed after its observation committed cannot strand missing
  * rows behind early-return paths. Honors the normal extraction bars (confirmed
  * trading status, quality threshold, no manual-search training) exactly like
- * the main path. Idempotent; returns true when extraction ran.
+ * the main path. Idempotent; returns true when the replay completed without
+ * error. While the terminology kill switch is active extraction is a no-op,
+ * so `true` then means "no error", not "work performed" (production callers
+ * currently ignore the value; tests assert it).
  */
 export async function replayVocabularyForRetry(
   channel: ChannelRecord,
@@ -760,9 +764,24 @@ export async function extractVocabularyFromCreator(
   humanApproved = false,
   languageContext?: ExplicitTerminologyLanguageContext,
   videoIds?: Array<string | null>,
-  origins?: ExtractionSourceOrigins
+  origins?: ExtractionSourceOrigins,
+  deps?: { isKillSwitchActive?: () => Promise<boolean> }
 ): Promise<ExtractedTermRecord[]> {
   const extracted: ExtractedTermRecord[] = [];
+
+  // Extraction-path kill switch: while active this function is a hard no-op.
+  // No rule evidence, no provider calls (Groq or Gemini), no writes — the
+  // emergency stop must stop new terminology evidence, not just the AI leg.
+  // The check runs before any database work so a stop cannot depend on the
+  // rest of the pipeline being healthy.
+  const killSwitchActive = await (deps?.isKillSwitchActive ?? isTerminologyKillSwitchActive)();
+  if (killSwitchActive) {
+    console.warn(
+      `[Vocabulary Extraction] Skipped for channel ${channel.channel_id}: terminology kill switch is active (app_settings.${TERMINOLOGY_KILL_SWITCH_KEY}='true').`
+    );
+    return [];
+  }
+
   const ai = getAIClient();
 
   if (!channel.country || channel.country === 'Unknown' || channel.trading_status !== 'TRADING_CONFIRMED') return [];

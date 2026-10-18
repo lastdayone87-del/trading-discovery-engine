@@ -907,7 +907,8 @@ test('groq-only extraction persists GROQ provenance end to end', {
     );
     const channel = await db.query(`SELECT * FROM channels WHERE channel_id=$1`, [channelId]).then(r => r.rows[0]);
     await extractVocabularyFromCreator(
-      channel, [`${wedgedTerm} Heute`, 'DAX Analyse'], '', false, undefined, undefined
+      channel, [`${wedgedTerm} Heute`, 'DAX Analyse'], '', false, undefined, undefined, undefined,
+      { isKillSwitchActive: async () => false } // pin control state: e2e must not read live operator settings
     );
     const rows = (await db.query(
       `SELECT t.canonical_term, o.evidence->>'extractor' AS extractor
@@ -956,7 +957,8 @@ test('unusable groq output yields no observations without crashing', {
       [channelId, `https://youtube.com/channel/${channelId}`]
     );
     const channel = await db.query(`SELECT * FROM channels WHERE channel_id=$1`, [channelId]).then(r => r.rows[0]);
-    await extractVocabularyFromCreator(channel, ['Morgenstimmung'], '', false, undefined, undefined);
+    await extractVocabularyFromCreator(channel, ['Morgenstimmung'], '', false, undefined, undefined, undefined,
+      { isKillSwitchActive: async () => false }); // pin control state: e2e must not read live operator settings
     const count = await db.query(`SELECT count(*)::int n FROM terminology_observations WHERE source_channel_id=$1`, [channelId]);
     assert.equal(Number(count.rows[0]?.n), 0);
     // The Groq attempt genuinely ran and declined (leaving parsed unset for
@@ -1011,7 +1013,8 @@ test('declined groq output invokes the gemini fallback end to end', {
     );
     const channel = await db.query(`SELECT * FROM channels WHERE channel_id=$1`, [channelId]).then(r => r.rows[0]);
     await extractVocabularyFromCreator(
-      channel, ['gratis Signale Gruppe beitreten', `${fallbackTerm} Heute`], '', false, undefined, undefined
+      channel, ['gratis Signale Gruppe beitreten', `${fallbackTerm} Heute`], '', false, undefined, undefined, undefined,
+      { isKillSwitchActive: async () => false } // pin control state: e2e must not read live operator settings
     );
     // Groq ran and its spam-only output was declined (no vacuous skip)...
     assert.ok(groqFetches >= 1, 'groq extraction never ran');
