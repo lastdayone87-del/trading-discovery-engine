@@ -10,7 +10,8 @@ import { classifyExternalIdentity, enqueueStructuredProviderSweep, resolveExactE
 import { coverageEstimate, coverageSnapshotKey, deterministicCoverageLifecycle, ecosystemOverlap, expandCoverageHierarchy } from './persistentResearchPhase4';
 import { admitResearchMultilingualSurface, detectTerminologyBurst, persistResearchCorpusDocument, publicationRequestContract, terminologyTrialAssignment } from './persistentResearchPhase3';
 import { enqueueConceptResolution } from './conceptGraph';
-import { findCountryExclusionWithAliases, lockExclusionPolicyForGuardedWrite, readExcludedCountries } from './countryExclusion';
+import { excludedCountrySqlPredicate, findCountryExclusionWithAliases, lockExclusionPolicyForGuardedWrite, readExcludedCountries } from './countryExclusion';
+import { countryAliasResolutionJson } from './countryInference';
 import { ensureArtifactSourceFamily, extractCreatorRelationships, graphExperimentAssignment, resolveExactYouTubeRelationshipTarget } from './persistentResearchPhase2';
 import { recordTemporalRelationship } from './temporalResearchFrontier';
 
@@ -92,15 +93,16 @@ export async function generateMultilingualActions(cutoff:string,runner?:{query:(
   await lockExclusionPolicyForGuardedWrite(db);
   const exclusions=await readExcludedCountries(db);
   // Exclusion filtering happens BEFORE the effective batch cap. The SQL
-  // prefilter (= the operator-visible exclusion predicate) drops standard
-  // matches inside the window; canonical/alias forms that SQL cannot compare
-  // are caught by the matcher. Pages are read until the eligible batch of 200
-  // is filled or the bounded page budget is exhausted, so >200 excluded rows
-  // can never starve eligible markets behind the LIMIT window.
+  // prefilter is alias-aware and reads the live policy table, so excluded
+  // rows (including ISO/alias forms like 'DE' against 'Germany') are rejected
+  // before LIMIT/OFFSET and can never occupy a page slot. Pages are read
+  // until the eligible batch of 200 is filled or the result window is
+  // exhausted (a short page ends the loop), so no fixed page budget can
+  // starve eligible markets.
   const surfaces:DbRow[]=[];
-  const PAGE=200,MAX_PAGES=5;
-  for(let page=0;page<MAX_PAGES&&surfaces.length<PAGE;page++){
-    const pageResult=await db.query(`SELECT c.id concept_id,s.id surface_id,s.literal,s.normalized,s.language,s.script,s.locale,a.country,cs.id sense_id,array_agg(DISTINCT art.id::text) source_ids FROM concepts c JOIN concept_surface_senses cs ON cs.concept_id=c.id AND cs.sense_status='APPROVED' JOIN term_surfaces s ON s.id=cs.surface_id AND s.valid_from<=$1 AND (s.valid_to IS NULL OR s.valid_to>$1) JOIN concept_market_affinities a ON a.concept_id=c.id AND a.surface_id=s.id AND a.locally_eligible=true JOIN corpus_candidate_occurrences o ON o.normalized_span=s.normalized JOIN corpus_documents d ON d.id=o.document_id JOIN corpus_source_artifacts art ON art.id=d.artifact_id WHERE c.status='ACTIVE' AND NOT EXISTS (SELECT 1 FROM excluded_countries excluded WHERE lower(regexp_replace(trim(excluded.country_name), '\\s+', ' ', 'g')) = lower(regexp_replace(trim(a.country), '\\s+', ' ', 'g'))) GROUP BY c.id,s.id,a.country,cs.id HAVING count(DISTINCT art.id)>=2 ORDER BY c.id,s.locale,s.id,a.country,cs.id LIMIT $2 OFFSET $3`,[cutoff,PAGE,page*PAGE]);
+  const PAGE=200;
+  for(let page=0;surfaces.length<PAGE;page++){
+    const pageResult=await db.query(`SELECT c.id concept_id,s.id surface_id,s.literal,s.normalized,s.language,s.script,s.locale,a.country,cs.id sense_id,array_agg(DISTINCT art.id::text) source_ids FROM concepts c JOIN concept_surface_senses cs ON cs.concept_id=c.id AND cs.sense_status='APPROVED' JOIN term_surfaces s ON s.id=cs.surface_id AND s.valid_from<=$1 AND (s.valid_to IS NULL OR s.valid_to>$1) JOIN concept_market_affinities a ON a.concept_id=c.id AND a.surface_id=s.id AND a.locally_eligible=true JOIN corpus_candidate_occurrences o ON o.normalized_span=s.normalized JOIN corpus_documents d ON d.id=o.document_id JOIN corpus_source_artifacts art ON art.id=d.artifact_id WHERE c.status='ACTIVE' AND ${excludedCountrySqlPredicate('a.country', '$4')} GROUP BY c.id,s.id,a.country,cs.id HAVING count(DISTINCT art.id)>=2 ORDER BY c.id,s.locale,s.id,a.country,cs.id LIMIT $2 OFFSET $3`,[cutoff,PAGE,page*PAGE,countryAliasResolutionJson()]);
     const kept=pageResult.rows.filter((s:DbRow)=>!findCountryExclusionWithAliases(s.country,exclusions));
     surfaces.push(...kept.slice(0,PAGE-surfaces.length));
     if(pageResult.rows.length<PAGE)break;

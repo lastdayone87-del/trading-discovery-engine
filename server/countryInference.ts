@@ -238,6 +238,29 @@ export function countryIsoAlias(value: string): string | null {
   return alias ? alias.toUpperCase() : null;
 }
 
+let cachedCountryAliasResolutionJson: string | null = null;
+
+/**
+ * Normalized alias-to-canonical resolution table for SQL predicates that must
+ * mirror `canonicalCountry` in the database: keys are normalized alias
+ * spellings (`normalizeCountryName`), values are normalized canonical country
+ * names (e.g. `{"de":"germany","us":"united states"}`). Server-side exclusion
+ * prefilters pass it as a `::jsonb` parameter and combine it with a live
+ * `excluded_countries` subquery, so stored ISO/alias forms cannot survive a
+ * WHERE clause (and cannot consume LIMIT/OFFSET slots) while the comparison
+ * still uses the same alias universe as the in-code resolver.
+ */
+export function countryAliasResolutionJson(): string {
+  if (cachedCountryAliasResolutionJson === null) {
+    const resolution: Record<string, string> = {};
+    for (const [alias, country] of Object.entries(COUNTRY_ALIASES)) {
+      resolution[normalizeCountryName(alias)] = normalizeCountryName(canonicalCountry(country));
+    }
+    cachedCountryAliasResolutionJson = JSON.stringify(resolution);
+  }
+  return cachedCountryAliasResolutionJson;
+}
+
 /**
  * Alias spellings (as stored in COUNTRY_ALIASES keys) that canonicalize to a
  * supported production country. Single source for scope-eligibility alias

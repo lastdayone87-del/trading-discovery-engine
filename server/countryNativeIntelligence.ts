@@ -2,7 +2,6 @@ import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { getDb } from './db';
 import { canonicalCountry } from './countryInference';
-import { findCountryExclusionWithAliases, lockExclusionPolicyForGuardedWrite, readExcludedCountries } from './countryExclusion';
 import { isQualityCreator } from './queryPerformance';
 
 type Queryable = Pool | PoolClient | { query: (sql: string, params?: any[]) => Promise<any> };
@@ -472,18 +471,15 @@ export async function recomputeNativeEvidenceProjection(
 
   // Native Proposal Eligibility Rule:
   // Requires native_observed_count >= 1 AND (qualityCreatorCount >= 2 OR structuredMatched) OR governed country_vocabularies / BOOTSTRAP_SEED
+  // Evidence-only by design: exclusion policy is enforced where proposals are
+  // read/served (the fail-closed generation prelude and the guarded proposal
+  // persistence), never persisted into this flag. Persisting policy here would
+  // keep a market hidden after its exclusion is removed until the next
+  // recompute, so removal would not take effect immediately.
   const governedBootstrapEvidence = bootstrapSeedCount > 0 || Boolean(provenanceCounts.COUNTRY_VOCABULARY);
-  // Excluded-country guardrail: derived proposal eligibility is suppressed
-  // for excluded markets so their terminology stays evidence-only even when
-  // the native evidence above would otherwise qualify it. The shared policy
-  // lock is taken before the read and held through the projection upsert
-  // below (same transaction), serializing the check with policy writers.
-  await lockExclusionPolicyForGuardedWrite(runner);
-  const countryExclusion = findCountryExclusionWithAliases(term.country, await readExcludedCountries(runner));
   const nativeProposalEligible =
-    !countryExclusion &&
-    ((nativeObservedCount >= 1 && (nativeQualityCreatorCount >= 2 || structuredMatched)) ||
-    governedBootstrapEvidence);
+    (nativeObservedCount >= 1 && (nativeQualityCreatorCount >= 2 || structuredMatched)) ||
+    governedBootstrapEvidence;
 
   // Calculate Native Confidence Score (0.0 to 1.0)
   let confidence = 0.20; // Base

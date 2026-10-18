@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { refreshTerminologyLifecycle, getPlannerTerminology } from './terminologyIntelligence';
 import { recomputeNativeEvidenceProjection } from './countryNativeIntelligence';
 import { buildFrontierProposal, generateCountryNativeProposals, persistFrontierProposals } from './discoveryProposalGenerators';
-import { persistExternalOsintProposal } from './externalOsint';
+import { materializeExternalOsintProposals, persistExternalOsintProposal } from './externalOsint';
 import { generateMultilingualActions } from './persistentResearchController';
 import { findCountryExclusionWithAliases, readExcludedCountries } from './countryExclusion';
 import { addExcludedCountryGuarded } from './countryExclusionRules';
@@ -225,6 +225,35 @@ test('planner serving returns nothing for an ISO alias of an excluded market', a
   assert.equal(planQueried, false);
 });
 
+test('planner serving re-checks the live policy table: an exclusion committed after the read is still honored', async () => {
+  // Interleaving the guard read cannot see: the read runs first and observes
+  // an empty list, then the exclusion commits, then the serving query runs.
+  // The in-query predicate must reject the market even though the stale read
+  // allowed it - this is the check-then-serve window.
+  let committed: Array<{ country_name: string; reason: string }> = [];
+  const runner = makeRunner([
+    { match: READ_EXCLUSIONS, respond: () => ({ rows: committed }) },
+    { match: /FROM canonical_trading_terms t LEFT JOIN terminology_performance/, respond: (sql, params) => {
+      const aliasMap = (params?.[1] ? JSON.parse(String(params[1])) : {}) as Record<string, string>;
+      const norm = (v: string) => v.trim().toLowerCase().replace(/\s+/g, ' ');
+      committed = [{ country_name: 'Germany', reason: 'regulatory prohibition' }];
+      // A query without the live policy predicate just serves the row (the
+      // real database still has it search_eligible until the next lifecycle
+      // refresh), which is exactly the check-then-serve bug this locks out.
+      if (!/excluded_countries excluded/.test(sql)) return { rows: [{ id: 1, term: 'DAX', lifecycle_status: 'SEARCH_TRIAL', score: 0.5 }] };
+      const stored = norm('Germany');
+      const resolved = aliasMap[stored] ?? stored;
+      const excluded = committed.some(e => norm(e.country_name) === stored || norm(e.country_name) === resolved);
+      return { rows: excluded ? [] : [{ id: 1, term: 'DAX', lifecycle_status: 'SEARCH_TRIAL', score: 0.5 }] };
+    } }
+  ]);
+  const rows = await getPlannerTerminology('Germany', runner, { isKillSwitchActive: async () => false });
+  assert.deepEqual(rows, [], 'a policy commit between the read and the serving query must still block serving');
+  const served = runner.calls.find(c => /FROM canonical_trading_terms t/.test(c.sql));
+  assert.match(served!.sql, /excluded_countries excluded/);
+  assert.match(served!.sql, /\$2::jsonb/);
+});
+
 test('planner serving aborts when the exclusion read fails (fail closed)', async () => {
   await assert.rejects(
     getPlannerTerminology('Germany', makeRunner([throwingExclusions]), { isKillSwitchActive: async () => false }),
@@ -337,6 +366,39 @@ test('OSINT proposals still materialize for non-excluded markets (guard control)
   assert.ok(runner.calls.some(c => /INSERT INTO discovery_neighborhoods/.test(c.sql)));
 });
 
+test('OSINT materialization fills the bounded selection with allowed markets despite excluded aggregates', async () => {
+  // The selector walks country/family buckets in sorted order ('Germany'
+  // before 'United States'), so with a global cap of one an excluded
+  // aggregate would consume the only slot and the allowed market would never
+  // be attempted. Excluded aggregates must be filtered out before the
+  // bounded selection, not after it.
+  const osintObservation = (country: string, id: string): any => ({
+    observationId: id, sourceId: `src-${id}`, sourceFamily: 'PUBLIC_COMMUNITY',
+    fetchedAt: '2026-10-17T00:00:00.000Z', observedAt: '2026-10-17T00:00:00.000Z',
+    country, locale: 'en-US', language: 'en', script: 'Latn', surface: `surface ${country}`,
+    canonicalConcept: 'ETF', extractionMethod: 'manual', extractionVersion: 'v1',
+    confidence: 0.9, reliability: 0.9, relevance: 0.9, supportingEvidence: {}, contentChecksum: `sum-${id}`, correlationKey: `corr-${id}`
+  });
+  const runner = makeRunner([
+    excludedGermany,
+    { match: /pg_advisory_xact_lock_shared/, respond: () => ({ rows: [] }) },
+    { match: /FROM canonical_trading_terms/, respond: () => ({ rows: [] }) },
+    { match: /INSERT INTO discovery_neighborhoods/, respond: () => ({ rows: [], rowCount: 1 }) },
+    { match: /INSERT INTO frontier_discovery_proposals/, respond: () => ({ rows: [{ id: 1 }], rowCount: 1 }) }
+  ]);
+  const count = await materializeExternalOsintProposals({
+    enabled: true,
+    observations: [osintObservation('Germany', 'g1'), osintObservation('Germany', 'g2'), osintObservation('United States', 'u1'), osintObservation('United States', 'u2')],
+    caps: { global: 1, perSourceFamily: 1, perCountry: 1 },
+    runner,
+    now: new Date('2026-10-18T00:00:00Z')
+  });
+  assert.equal(count, 1, 'the allowed market must materialize instead of being starved by the excluded aggregate');
+  const inserts = runner.calls.filter(c => /INSERT INTO frontier_discovery_proposals/.test(c.sql));
+  assert.equal(inserts.length, 1);
+  assert.equal(inserts[0].params?.[1], 'United States', 'only the allowed market may consume the bounded selection');
+});
+
 test('OSINT persistence fails closed for an ISO alias of an excluded market', async () => {
   const runner = makeRunner([
     excludedGermany,
@@ -376,25 +438,27 @@ const projectionObservations: Handler = {
   })
 };
 
-test('native evidence projection suppresses proposal eligibility for an excluded market', async () => {
+test('native evidence projection stays evidence-only: policy is enforced at serving time, never persisted', async () => {
+  // Exclusion is a serving decision. Persisting it into the eligibility flag
+  // would keep a market hidden after its exclusion is removed until the next
+  // recompute, so the projection must not read or embed policy at all.
   const runner = makeRunner([excludedGermany, projectionTerm, projectionObservations]);
   const projection = await recomputeNativeEvidenceProjection(99, runner);
-  assert.equal(projection?.nativeProposalEligible, false);
+  assert.equal(projection?.nativeProposalEligible, true, 'eligibility stays evidence-derived even while the market is excluded');
   const upsert = runner.calls.find(c => /INSERT INTO country_native_evidence_projections/.test(c.sql));
   assert.ok(upsert);
-  assert.equal(upsert?.params?.[27], false);
+  assert.equal(upsert?.params?.[27], true);
+  assert.equal(
+    runner.calls.filter(c => /^SELECT country_name, reason FROM excluded_countries$/.test(c.sql)).length,
+    0,
+    'projection recompute must not couple policy into persisted evidence flags'
+  );
 });
 
 test('native evidence projection keeps proposal eligibility for non-excluded markets (guard control)', async () => {
   const runner = makeRunner([noExclusions, projectionTerm, projectionObservations]);
   const projection = await recomputeNativeEvidenceProjection(99, runner);
   assert.equal(projection?.nativeProposalEligible, true);
-});
-
-test('native evidence projection aborts when the exclusion read fails (fail closed)', async () => {
-  const runner = makeRunner([throwingExclusions, projectionTerm, projectionObservations]);
-  await assert.rejects(recomputeNativeEvidenceProjection(99, runner), /exclusion-read-failed/);
-  assert.equal(runner.calls.some(c => /INSERT INTO country_native_evidence_projections/.test(c.sql)), false);
 });
 
 test('allocation candidates exclude an excluded target country without serving stale pending proposals', async () => {
@@ -483,7 +547,11 @@ test('concept-graph multilingual actions still materialize for non-excluded mark
   assert.ok(runner.calls.some(c => /INSERT INTO discovery_actions/.test(c.sql)));
 });
 
-test('more than 200 excluded surfaces cannot starve eligible markets behind the batch window', async () => {
+test('JS-side alias filtering still protects the bounded page window when rows slip the SQL predicate', async () => {
+  // The fake ignores the query's exclusion predicate, simulating rows the SQL
+  // layer missed (spellings beyond the alias universe). The in-code matcher
+  // must still keep them out of the batch, and pagination must walk past
+  // their window to reach the eligible rows behind them.
   const corpus = [...Array.from({ length: 205 }, (_, i) => germanSurface(i)), usSurface(0), usSurface(1)];
   const offsets: number[] = [];
   const runner = makeRunner([
@@ -497,6 +565,44 @@ test('more than 200 excluded surfaces cannot starve eligible markets behind the 
   assert.ok(count >= 1, 'eligible rows beyond the exclusion window must be processed');
   assert.deepEqual(offsets, [0, 200], 'bounded pagination: two windows cover 205 excluded rows followed by eligible rows');
   assert.ok(runner.calls.some(c => /INSERT INTO discovery_actions/.test(c.sql)));
+});
+
+test('alias-form excluded rows are rejected in SQL and cannot consume page slots', async () => {
+  // 1005 rows stored as the ISO alias 'DE' while 'Germany' is excluded. If
+  // they were only filtered in code they would exhaust the entire former
+  // five-page budget (1000 rows) and the two eligible US rows behind them
+  // would never be reached. The emulated database applies the query's own
+  // predicate: match the live policy table using the alias-resolution map
+  // parameter ($4), so alias rows are removed before LIMIT/OFFSET.
+  const germanAliasRow = (i: number): Row => ({ ...germanSurface(i), country: 'DE' });
+  const corpus: Row[] = [...Array.from({ length: 1005 }, (_, i) => germanAliasRow(i)), usSurface(0), usSurface(1)];
+  const offsets: number[] = [];
+  const runner = makeRunner([
+    excludedGermany,
+    { match: /concept_market_affinities/, respond: (sql, params) => {
+      const aliasMap = (params?.[3] ? JSON.parse(String(params[3])) : {}) as Record<string, string>;
+      const norm = (v: string) => v.trim().toLowerCase().replace(/\s+/g, ' ');
+      const excluded = (country: string) => {
+        const stored = norm(country);
+        const resolved = aliasMap[stored] ?? stored;
+        return norm('Germany') === stored || norm('Germany') === resolved;
+      };
+      const offset = Number(params?.[2] ?? 0);
+      const limit = Number(params?.[1] ?? 200);
+      offsets.push(offset);
+      return { rows: corpus.filter(row => !excluded(String(row.country))).slice(offset, offset + limit) };
+    } },
+    { match: /research_programs/, respond: () => ({ rows: [{ id: 1, scope: '{}' }] }) },
+    { match: /INSERT INTO discovery_hypotheses/, respond: () => ({ rows: [{ id: 7 }], rowCount: 1 }) },
+    { match: /INSERT INTO discovery_actions/, respond: () => ({ rows: [{ id: 8 }], rowCount: 1 }) }
+  ]);
+  const count = await generateMultilingualActions('2026-10-18T00:00:00Z', runner);
+  assert.equal(count, 2, 'the eligible batch must be filled despite >1000 alias-form excluded rows');
+  assert.deepEqual(offsets, [0], 'alias rows must be rejected before the window: one page fills the batch');
+  const paged = runner.calls.find(c => /concept_market_affinities/.test(c.sql));
+  assert.match(paged!.sql, /excluded_countries excluded/, 'the query must filter against the live policy table');
+  assert.match(paged!.sql, /\$4::jsonb/, 'the statement must carry the alias resolution map');
+  assert.equal(JSON.parse(String(paged!.params?.[3])).de, 'germany', "SQL alias resolution must map 'de' to 'germany', matching the in-code matcher");
 });
 
 test('pagination order is total: ties cannot skip or duplicate eligible surfaces across offset pages', async () => {

@@ -51,8 +51,13 @@ test('PostgreSQL concurrency: exclusion writers serialize with guarded shared-lo
     assert.ok(after.some(row => row.country_name === country), 'the committed exclusion is visible to guarded readers');
     await first.query('COMMIT');
   } finally {
-    await removeExcludedCountry(country).catch(() => undefined);
+    // Release both transactions before cleanup: the removal helper needs the
+    // EXCLUSIVE policy lock, so a shared holder left open by a failed
+    // assertion would deadlock the cleanup and hide the original failure.
+    await first.query('ROLLBACK').catch(() => undefined);
+    await second.query('ROLLBACK').catch(() => undefined);
     first.release();
     second.release();
+    await removeExcludedCountry(country).catch(() => undefined);
   }
 });

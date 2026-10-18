@@ -122,3 +122,24 @@ export function findCountryExclusionWithAliases(
   if (typeof country !== 'string' || !country.trim()) return null;
   return findCountryExclusion(canonicalCountry(country), exclusions);
 }
+
+/**
+ * Live-table SQL predicate mirroring findCountryExclusionWithAliases inside
+ * the database. `columnSql` is the stored country expression and `mapParam`
+ * is the JSONB alias-resolution parameter (countryAliasResolutionJson()):
+ *
+ *   norm(excluded.country_name) = norm(column)
+ *   OR norm(excluded.country_name) = norm(COALESCE(map ->> norm(column), column))
+ *
+ * Because it reads `excluded_countries` in the same statement:
+ *   - a policy commit that lands between an earlier read and this query is
+ *     still honored (statement snapshot), closing the check-then-serve race
+ *     without requiring a transaction;
+ *   - excluded rows — including ISO/alias forms like 'DE' against 'Germany' —
+ *     are rejected before LIMIT/OFFSET, so they can never consume batch slots;
+ *   - a NULL column stays allowed, matching the in-code matcher.
+ */
+export function excludedCountrySqlPredicate(columnSql: string, mapParam: string): string {
+  const norm = (expr: string) => `lower(regexp_replace(trim(${expr}), '\\s+', ' ', 'g'))`;
+  return `NOT EXISTS (SELECT 1 FROM excluded_countries excluded WHERE ${norm('excluded.country_name')} = ${norm(columnSql)} OR ${norm('excluded.country_name')} = ${norm(`COALESCE(${mapParam}::jsonb ->> ${norm(columnSql)}, ${columnSql})`)})`;
+}

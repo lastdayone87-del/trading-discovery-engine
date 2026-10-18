@@ -208,21 +208,42 @@ test('Checkpoint 3 Blocker 4 Fix: Frontier quota efficiency uses exact quality_n
 });
 
 test('Checkpoint 3 Blocker 5 Fix: COUNTRY_NATIVE provenance distinguishes observed evidence from bootstrap vocabulary', async () => {
-  // An explicit runner with an empty exclusion list and no rows exercises the
-  // bootstrap fallback for a market whose exclusion status is known allowed.
-  const proposals = await generateCountryNativeProposals('US', 5, { runner: { query: async () => ({ rows: [] as any[] }) } });
-  assert.ok(proposals.length > 0);
-
-  for (const p of proposals) {
-    const provType = (p.supportingEvidence as any)?.provenanceType;
-    assert.ok(
-      provType === 'observed_native_evidence' || provType === 'bootstrap_vocabulary',
-      'COUNTRY_NATIVE proposal must explicitly state provenanceType as observed_native_evidence or bootstrap_vocabulary'
+  // Bootstrap branch: an explicit runner with an empty exclusion list and no
+  // projection rows exercises the governed bootstrap fallback for a market
+  // whose exclusion status is known allowed.
+  const bootstrapProposals = await generateCountryNativeProposals('US', 5, { runner: { query: async () => ({ rows: [] as any[] }) } });
+  assert.ok(bootstrapProposals.length > 0);
+  for (const p of bootstrapProposals) {
+    assert.equal(
+      (p.supportingEvidence as any)?.provenanceType,
+      'bootstrap_vocabulary',
+      'the empty-projection path must state bootstrap_vocabulary provenance'
     );
-    if (provType === 'bootstrap_vocabulary') {
-      assert.ok(p.sourceProvenance.startsWith('bootstrap_vocabulary:'), 'Bootstrap vocabulary must have bootstrap_vocabulary sourceProvenance tag');
-    } else {
-      assert.ok(p.sourceProvenance.startsWith('observed_native_evidence:'), 'Observed native evidence must have observed_native_evidence sourceProvenance tag');
-    }
+    assert.ok(p.sourceProvenance.startsWith('bootstrap_vocabulary:'), 'Bootstrap vocabulary must have bootstrap_vocabulary sourceProvenance tag');
   }
+
+  // Observed branch: a mocked Phase 10 projection row must produce
+  // observed_native_evidence provenance, so the observed-evidence assertions
+  // this test is named for still run.
+  const projectionRow = {
+    canonical_term_id: 501, canonical_term: 'S&P 500 futures', concept_id: 7, language: 'en', script: 'Latn',
+    dominant_locale: 'en-US', native_confidence_score: 0.82, native_evidence_status: 'NATIVE_OBSERVED',
+    source_provenance_family: 'CREATOR_METADATA', source_provenance_families: ['CREATOR_METADATA'],
+    bootstrap_seed_count: 0, quality_creator_count: 3, native_quality_creator_count: 3, distinct_creator_count: 3,
+    structured_entity_matched: true, evidence_revision: 2, is_code_switched: false, code_switch_type: null,
+    observed_creator_countries: ['US'], observed_market_countries: ['US'],
+    last_observed_at: '2026-10-17T00:00:00.000Z', projection_updated_at: '2026-10-17T00:00:00.000Z'
+  };
+  const observedRunner = {
+    query: async (sql: string) => {
+      if (/^SELECT country_name, reason FROM excluded_countries$/.test(sql)) return { rows: [] as any[] };
+      if (/country_native_evidence_projections/.test(sql)) return { rows: [projectionRow] };
+      return { rows: [] as any[] };
+    }
+  };
+  const observedProposals = await generateCountryNativeProposals('US', 5, { runner: observedRunner });
+  assert.equal(observedProposals.length, 1, 'the eligible projection row must produce exactly one proposal');
+  const observed = observedProposals[0];
+  assert.equal((observed.supportingEvidence as any)?.provenanceType, 'observed_native_evidence');
+  assert.ok(observed.sourceProvenance.startsWith('observed_native_evidence:'), 'Observed native evidence must have observed_native_evidence sourceProvenance tag');
 });

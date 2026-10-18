@@ -260,7 +260,18 @@ export async function materializeExternalOsintProposals(options: { enabled:boole
   if (!options.enabled) return 0;
   const deadline = options.deadlineMs ?? 5_000;
   const work = async () => {
-    const chosen=selectBoundedOsintEvidence(aggregateOsintEvidence(options.observations,options.now),{global:options.caps?.global??20,perSourceFamily:options.caps?.perSourceFamily??5,perCountry:options.caps?.perCountry??4});
+    // Excluded-country aggregates must not consume the bounded selection
+    // (global/perSourceFamily/perCountry caps) before the per-proposal guard
+    // drops them, or allowed markets can be starved of the batch. The policy
+    // read here is fail-closed (an unreadable list aborts materialization
+    // instead of selecting on unknown policy) and only runs when there is
+    // something to select. The in-transaction check inside
+    // persistExternalOsintProposal remains the authoritative guard.
+    const aggregates=aggregateOsintEvidence(options.observations,options.now);
+    if(aggregates.length===0)return 0;
+    const db=options.runner||await getDb();
+    const exclusions=await readExcludedCountries(db);
+    const chosen=selectBoundedOsintEvidence(aggregates.filter(a=>!findCountryExclusionWithAliases(a.country,exclusions)),{global:options.caps?.global??20,perSourceFamily:options.caps?.perSourceFamily??5,perCountry:options.caps?.perCountry??4});
     const results=await Promise.all(chosen.map((e,i)=>persistExternalOsintProposal(buildExternalOsintProposal(e,Date.parse(e.newestObservedAt)+i),options.runner)));
     return results.filter(Boolean).length;
   };

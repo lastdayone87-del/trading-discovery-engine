@@ -10,7 +10,8 @@ import type { NeighborhoodFrontierState } from './discoveryFrontierState';
 import { effectiveProjectionProposalEvidence } from './discoveryProposalGenerators';
 import { isOsintSnapshotFresh } from './externalOsint';
 import { isShadowBraveCanaryAllowed, providerSnapshot, rotateActiveProviderRow, ledgerProviderToRegistryKey, providerCooldownObservationWindowSecs, type ProviderAllocation } from './providerAwareRetrieval';
-import { findCountryExclusionWithAliases, lockExclusionPolicyForGuardedWrite, readExcludedCountries } from './countryExclusion';
+import { excludedCountrySqlPredicate, findCountryExclusionWithAliases, lockExclusionPolicyForGuardedWrite, readExcludedCountries } from './countryExclusion';
+import { countryAliasResolutionJson } from './countryInference';
 
 export const PERSISTENT_RESEARCH_PHASE8_VERSION = 'discovery-frontier-allocator-v1';
 
@@ -327,12 +328,12 @@ export async function getNeighborhoodCandidates(
         AND allocation_origin = 'FRONTIER_CANARY'
         AND decision_status IN ('RESERVED', 'COMMITTED')
     ) recent ON true
-    ${targetCountry ? 'WHERE LOWER(n.country) = LOWER($3) AND' : 'WHERE'} NOT EXISTS (SELECT 1 FROM excluded_countries excluded WHERE lower(regexp_replace(trim(excluded.country_name), '\\s+', ' ', 'g')) = lower(regexp_replace(trim(n.country), '\\s+', ' ', 'g')))
+    ${targetCountry ? 'WHERE LOWER(n.country) = LOWER($3) AND' : 'WHERE'} ${excludedCountrySqlPredicate('n.country', targetCountry ? '$4' : '$3')}
     ORDER BY n.last_observed_at DESC
     LIMIT 50
   `;
 
-  const params = targetCountry ? [now.toISOString(), quotaDay, targetCountry] : [now.toISOString(), quotaDay];
+  const params = targetCountry ? [now.toISOString(), quotaDay, targetCountry, countryAliasResolutionJson()] : [now.toISOString(), quotaDay, countryAliasResolutionJson()];
   const res = await db.query(query, params);
 
   return res.rows.filter((row: any) => !findCountryExclusionWithAliases(row.country, exclusions)).map((row: any) => {

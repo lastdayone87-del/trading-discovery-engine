@@ -4,8 +4,8 @@ import type { CountryVocabulary, QueryRecord } from '../src/types';
 import type { QueryFunnelMetrics } from './queryPerformance';
 import { getDb } from './db';
 import { isTerminologyKillSwitchActive, isTerminologyKillSwitchActiveOn } from './terminologyKillSwitch';
-import { canonicalCountry } from './countryInference';
-import { findCountryExclusionWithAliases, lockExclusionPolicyForGuardedWrite, readExcludedCountries } from './countryExclusion';
+import { canonicalCountry, countryAliasResolutionJson } from './countryInference';
+import { excludedCountrySqlPredicate, findCountryExclusionWithAliases, lockExclusionPolicyForGuardedWrite, readExcludedCountries } from './countryExclusion';
 import {
   computeEvidenceChecksum,
   computeObservationKey,
@@ -1295,9 +1295,12 @@ export async function getPlannerTerminology(country: string, clientOverride?: Qu
   // terminology never reaches planner serving — including while stale legacy
   // rows remain search_eligible until their next lifecycle refresh revokes.
   // Stored terms are keyed by canonical country; the raw input is checked too
-  // so ISO/alias forms cannot slip past the list.
+  // so ISO/alias forms cannot slip past the list. The serving query embeds the
+  // same predicate against the live policy table, so an exclusion committed
+  // after this read but before the SELECT is still honored (statement
+  // snapshot), closing the check-then-serve window.
   const exclusions = await readExcludedCountries(runner);
   if (findCountryExclusionWithAliases(country, exclusions)) return [];
-  const result = await runner.query(`SELECT t.id,t.canonical_term term,t.lifecycle_status,COALESCE(AVG(p.decayed_yield_score),0)::float score FROM canonical_trading_terms t LEFT JOIN terminology_performance p ON p.canonical_term_id=t.id WHERE t.country=$1 AND t.search_eligible=true AND t.lifecycle_status IN ('SEARCH_TRIAL','PROVEN_SEARCH_TERM') GROUP BY t.id ORDER BY score DESC,t.last_observed_at DESC NULLS LAST LIMIT 50`, [canonicalCountry(country)]);
+  const result = await runner.query(`SELECT t.id,t.canonical_term term,t.lifecycle_status,COALESCE(AVG(p.decayed_yield_score),0)::float score FROM canonical_trading_terms t LEFT JOIN terminology_performance p ON p.canonical_term_id=t.id WHERE t.country=$1 AND t.search_eligible=true AND t.lifecycle_status IN ('SEARCH_TRIAL','PROVEN_SEARCH_TERM') AND ${excludedCountrySqlPredicate('t.country', '$2')} GROUP BY t.id ORDER BY score DESC,t.last_observed_at DESC NULLS LAST LIMIT 50`, [canonicalCountry(country), countryAliasResolutionJson()]);
   return result.rows.map(row => ({ id: Number(row.id), term: row.term, score: Number(row.score), lifecycle: row.lifecycle_status as 'SEARCH_TRIAL' | 'PROVEN_SEARCH_TERM' }));
 }
