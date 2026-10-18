@@ -801,9 +801,12 @@ export class RenderedFallbackGate {
     });
   }
 
-  async run<T>(operation: () => Promise<T>): Promise<T> {
+  async run<T>(operation: (admittedAtMs: number) => Promise<T>): Promise<T> {
     const release = await this.acquire();
-    try { return await operation(); } finally { release(); }
+    // Admission is timestamped here so callers can start budget clocks at the
+    // moment the gate slot was granted, even if they serialize internally
+    // afterwards (see withRenderedQueueLifecycleLock).
+    try { return await operation(Date.now()); } finally { release(); }
   }
 
   snapshot(): { active: number; pending: number; concurrency: number; maxPending: number } {
@@ -862,6 +865,133 @@ export async function dropIsolatedRenderedQueue(
       `[RenderedAcquisition] Isolated request queue cleanup failed for ${name}: ${browserCauseSnippet(error) || 'unknown storage error'}`,
     );
   }
+}
+
+/**
+ * Minimal structural view of Crawlee's process-wide `AsyncEventEmitter`
+ * (reachable at runtime as `EventManager.events`; protected in Crawlee's type
+ * declarations). Only the listener bookkeeping methods are needed.
+ */
+export interface RenderedQueueLifecycleEmitter {
+  listeners(event: string): unknown[];
+  off(event: string, listener: unknown): unknown;
+}
+
+/** Listener identities registered before a crawl opened its isolated queue. */
+export interface RenderedQueueListenerLedger {
+  migrating: Set<unknown>;
+  aborting: Set<unknown>;
+}
+
+const RENDERED_QUEUE_LIFECYCLE_EVENTS = ['migrating', 'aborting'] as const;
+
+function isRenderedQueueLifecycleEmitter(value: unknown): value is RenderedQueueLifecycleEmitter {
+  const candidate = value as Partial<RenderedQueueLifecycleEmitter> | null | undefined;
+  return !!candidate && typeof candidate.listeners === 'function' && typeof candidate.off === 'function';
+}
+
+/** Extracts the process-wide queue lifecycle emitter from a Crawlee
+ * EventManager, or undefined when that shape is unavailable. */
+export function renderedQueueLifecycleEmitter(eventManager: unknown): RenderedQueueLifecycleEmitter | undefined {
+  const events = (eventManager as { events?: unknown } | null | undefined)?.events;
+  return isRenderedQueueLifecycleEmitter(events) ? events : undefined;
+}
+
+/** Records the 'migrating'/'aborting' listeners already present before a crawl
+ * opens its isolated queue. */
+export function captureRenderedQueueLifecycleListeners(
+  emitter: RenderedQueueLifecycleEmitter | undefined,
+): RenderedQueueListenerLedger {
+  return {
+    migrating: new Set(emitter ? emitter.listeners('migrating') : []),
+    aborting: new Set(emitter ? emitter.listeners('aborting') : []),
+  };
+}
+
+/**
+ * Removes exactly the 'migrating'/'aborting' listeners that were registered
+ * since the ledger was captured and returns the number removed.
+ *
+ * Crawlee 3.18 registers anonymous process-wide `migrating`/`aborting`
+ * listeners when a RequestQueue is constructed and nothing ever removes them:
+ * `drop()` only deletes storage, crawler teardown only removes the crawler's
+ * own bound listeners, and `RequestQueue._reset()` (protected) does not touch
+ * listeners. A dropped per-crawl queue therefore stayed strongly referenced
+ * forever, and each retained instance keeps its RequestDeduplicationCache —
+ * two `new Array(1_000_000)` slot tables, ~16 MB per instance (verified by
+ * heap profiling: ~15 MB live growth per queue lifecycle; flat once listeners
+ * are reclaimed). Reuse after `drop()` is not a supported alternative (no
+ * public re-open; `drop()` closes the StorageManager registration), so the
+ * smallest safe lifecycle change is to keep the fresh-queue-per-crawl
+ * isolation semantics and reclaim the queue's process-wide registrations in
+ * the crawl finally. `renderedFallbackGate` plus
+ * `withRenderedQueueLifecycleLock` serialize each crawl end-to-end, so no
+ * other live queue can own a listener added after the capture; a future
+ * Crawlee that stops registering or stops leaking degrades to a harmless
+ * no-op.
+ */
+export function reclaimRenderedQueueLifecycleListeners(
+  emitter: RenderedQueueLifecycleEmitter | undefined,
+  ledger: RenderedQueueListenerLedger,
+): number {
+  if (!emitter) return 0;
+  let reclaimed = 0;
+  for (const event of RENDERED_QUEUE_LIFECYCLE_EVENTS) {
+    for (const listener of emitter.listeners(event)) {
+      if (!ledger[event].has(listener)) {
+        emitter.off(event, listener);
+        reclaimed++;
+      }
+    }
+  }
+  return reclaimed;
+}
+
+let renderedQueueLifecycleTail: Promise<void> = Promise.resolve();
+
+/**
+ * Serializes a complete per-crawl queue lifecycle — emitter capture, isolated
+ * queue open, crawler run, drop, and listener reclamation — on one
+ * process-wide promise chain. The rendered fallback gate admits up to
+ * RENDERED_FALLBACK_CONCURRENCY crawls (env-bound 1..2), but the
+ * snapshot-based reclamation above can only attribute listeners correctly
+ * while no other queue is being constructed on the shared emitter: without
+ * serialization an earlier crawl's cleanup removes a later crawl's still-live
+ * listeners. At the default gate width of 1 this adds no scheduling (the gate
+ * already serializes, and crawler runs are further serialized onto the
+ * process-wide browser runtime lease).
+ */
+export async function withRenderedQueueLifecycleLock<T>(operation: () => Promise<T>): Promise<T> {
+  const previous = renderedQueueLifecycleTail;
+  let release!: () => void;
+  renderedQueueLifecycleTail = new Promise<void>(resolve => { release = resolve; });
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
+
+/**
+ * End-of-crawl cleanup shared by every path through the crawl finally: drop
+ * the isolated queue (best-effort with a bounded warning — see
+ * dropIsolatedRenderedQueue) and then reclaim the anonymous process-wide
+ * listeners the queue construction added, so the dropped queue and its ~16 MB
+ * RequestDeduplicationCache become collectable. Exported so tests can drive
+ * the exact lifecycle the finally runs, including the failing-drop path.
+ * Returns the number of reclaimed listeners.
+ */
+export async function finalizeRenderedQueueLifecycle(options: {
+  queue: { drop(): Promise<void> } | undefined;
+  name: string | undefined;
+  emitter: RenderedQueueLifecycleEmitter | undefined;
+  ledger: RenderedQueueListenerLedger;
+}): Promise<number> {
+  if (options.queue && options.name !== undefined) {
+    await dropIsolatedRenderedQueue(options.queue, options.name);
+  }
+  return reclaimRenderedQueueLifecycleListeners(options.emitter, options.ledger);
 }
 
 /** Expensive Tier-2 acquisition. Finding one invite no longer terminates the
@@ -934,15 +1064,34 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   retain(seedUrl,seedUrl);
 
   try {
-    return await renderedFallbackGate.run(async () => {
+    return await renderedFallbackGate.run((gateAdmittedAtMs) => withRenderedQueueLifecycleLock(async () => {
       telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'GATE_ACQUIRED');
-      const startedAt = Date.now();
-      const { PlaywrightCrawler, RequestQueue } = await import('crawlee');
-      // Per-invocation isolated queue: never the process-default persisted
-      // queue (see openIsolatedRenderedRequestQueue). Dropped in the finally
-      // below on every path so named queues cannot accumulate.
-      const isolated = await openIsolatedRenderedRequestQueue((name) => RequestQueue.open(name));
+      // Total-budget clock: starts at gate admission, before the lifecycle
+      // lock below, so a crawl admitted by a wider gate (env concurrency 2)
+      // consumes budget while waiting behind a serialized predecessor instead
+      // of occupying a gate slot with a fresh clock — the pre-lock semantics.
+      const startedAt = gateAdmittedAtMs;
+      const { PlaywrightCrawler, RequestQueue, Configuration } = await import('crawlee');
+      // Crawlee 3.18 registers anonymous process-wide `migrating`/`aborting`
+      // listeners for every RequestQueue instance and never removes them, and
+      // each instance carries a ~16 MB RequestDeduplicationCache (two
+      // 1,000,000-slot arrays). Unreclaimed, every dropped per-crawl queue
+      // stayed strongly referenced forever — ~15 MB live growth per crawl,
+      // reaching the 2048 MB heap cap in ~35 minutes at production render
+      // rates (FATAL ERROR: Reached heap limit). Capture the emitter state
+      // before opening and reclaim the new listeners in the finally below:
+      // the fresh-queue-per-crawl isolation semantics stay unchanged while the
+      // dropped queue graph becomes collectable. The whole capture-through-
+      // reclamation window runs under withRenderedQueueLifecycleLock so
+      // overlapping crawls (env concurrency 2) cannot cross-remove listeners.
+      const queueEventEmitter = renderedQueueLifecycleEmitter(Configuration.getGlobalConfig().getEventManager());
+      const queueListenerLedger = captureRenderedQueueLifecycleListeners(queueEventEmitter);
+      let isolated: { name: string; queue: InstanceType<typeof RequestQueue> } | undefined;
       try {
+        // Per-invocation isolated queue: never the process-default persisted
+        // queue (see openIsolatedRenderedRequestQueue). Dropped in the finally
+        // below on every path so named queues cannot accumulate.
+        isolated = await openIsolatedRenderedRequestQueue((name) => RequestQueue.open(name));
         const crawler = new PlaywrightCrawler({
           requestQueue: isolated.queue,
           maxRequestsPerCrawl: limits.maxPages,
@@ -1261,13 +1410,22 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         if (zeroPageReason) telemetry.zeroPageReason=zeroPageReason;
         return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,dropReasons:drops.snapshot(),detail:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
       } finally {
-        // The isolated queue must never outlive its crawl: drop it on success,
-        // failure, and unexpected throws alike so named queues cannot
-        // accumulate in storage. Cleanup is best-effort with a bounded warning
-        // (see dropIsolatedRenderedQueue) — it never affects the crawl result.
-        await dropIsolatedRenderedQueue(isolated.queue, isolated.name);
+        // The isolated queue must never outlive its crawl: the lifecycle
+        // finalizer drops it on success, failure, and unexpected throws alike
+        // (best-effort with a bounded warning — see dropIsolatedRenderedQueue)
+        // and then reclaims the anonymous process-wide listeners the queue
+        // construction added (see the capture above), so the dropped queue and
+        // its ~16 MB deduplication cache become collectable. Runs on every
+        // path, including open failures and drop failures; it never affects
+        // the crawl result.
+        await finalizeRenderedQueueLifecycle({
+          queue: isolated?.queue,
+          name: isolated?.name,
+          emitter: queueEventEmitter,
+          ledger: queueListenerLedger,
+        });
       }
-    });
+    }));
   } catch (error:any) {
     const candidates=mergeDiscordCandidates(discovered);
     const saturated=error?.message==='RENDERED_FALLBACK_SATURATED';
