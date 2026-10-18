@@ -30,7 +30,7 @@ jobs:
       - name: Verify Chromium is installed
         run: npx playwright install --list
       - name: Browser fallback and retry-policy regressions
-        run: node --import tsx --test server/browserCommunityFallback.test.ts server/browserCommunityFallback.integration.test.ts
+        run: node --import tsx --test server/browserCommunityFallback.test.ts server/browserCommunityFallback.integration.test.ts server/renderedQueueIsolation.test.ts
       - name: TypeScript validation
         run: npm run lint
       - name: Production build

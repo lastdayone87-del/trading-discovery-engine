@@ -4,9 +4,11 @@ import { Configuration, RequestQueue, type Request } from 'crawlee';
 import {
   captureRenderedQueueLifecycleListeners,
   dropIsolatedRenderedQueue,
+  finalizeRenderedQueueLifecycle,
   openIsolatedRenderedRequestQueue,
   reclaimRenderedQueueLifecycleListeners,
   renderedQueueLifecycleEmitter,
+  withRenderedQueueLifecycleLock,
   type RenderedQueueLifecycleEmitter,
 } from './browserCommunityFallback';
 
@@ -20,7 +22,9 @@ import {
 // every RequestQueue instance and never removes them, so dropped per-crawl
 // queues (and their ~16 MB RequestDeduplicationCache) stayed retained until
 // the process hit its heap limit. Reclamation must remove exactly the
-// listeners added during one serialized crawl and nothing else.
+// listeners added during one crawl, and the lifecycle lock must keep
+// overlapping crawls (env concurrency 2) from cross-removing each other's
+// listeners.
 
 function isolatedTestConfig() {
   return { config: new Configuration({ persistStorage: false }) };
@@ -116,24 +120,27 @@ test('queue opener mints a unique name per invocation', async () => {
   assert.equal(seen.length, 2);
 });
 
-test('crawler uses a per-invocation named queue, always drops it, and reclaims its listeners', async () => {
-  // Wiring contract: construction receives an explicitly opened queue; a
-  // finally guarantees best-effort drop on every path so named queues cannot
-  // accumulate in storage; the process-wide listener ledger is captured
-  // before opening and reclaimed after the drop so the dropped queue graph
-  // (including Crawlee's ~16 MB RequestDeduplicationCache per instance) does
-  // not stay retained by anonymous EventManager listeners.
+test('crawler uses a per-invocation named queue, drops it, and reclaims its listeners under the lifecycle lock', async () => {
+  // Wiring contract: construction receives an explicitly opened queue; the
+  // finally drives the shared lifecycle finalizer (drop + listener
+  // reclamation) on every path so named queues cannot accumulate in storage
+  // and dropped queue graphs (including Crawlee's ~16 MB
+  // RequestDeduplicationCache per instance) do not stay retained by anonymous
+  // EventManager listeners; the whole window runs under the process-wide
+  // lifecycle lock so overlapping crawls cannot cross-remove listeners.
   const source = await import('node:fs/promises').then(fs => fs.readFile(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8'));
   assert.match(source, /openIsolatedRenderedRequestQueue\(\(name\) => RequestQueue\.open\(name\)\)/);
   assert.match(source, /requestQueue: isolated\.queue,/);
-  assert.match(source, /await dropIsolatedRenderedQueue\(isolated\.queue, isolated\.name\)/);
+  assert.match(source, /await finalizeRenderedQueueLifecycle\(\{/);
+  assert.match(source, /await dropIsolatedRenderedQueue\(options\.queue, options\.name\)/);
+  const lockIndex = source.indexOf('withRenderedQueueLifecycleLock(async () => {');
   const captureIndex = source.indexOf('captureRenderedQueueLifecycleListeners(queueEventEmitter)');
   const openIndex = source.indexOf('openIsolatedRenderedRequestQueue((name) => RequestQueue.open(name))');
-  const dropIndex = source.indexOf('await dropIsolatedRenderedQueue(isolated.queue, isolated.name)');
-  const reclaimIndex = source.indexOf('reclaimRenderedQueueLifecycleListeners(queueEventEmitter, queueListenerLedger)');
-  assert.ok(captureIndex >= 0, 'listener ledger capture is wired');
+  const finalizeIndex = source.indexOf('await finalizeRenderedQueueLifecycle({');
+  assert.ok(lockIndex >= 0, 'lifecycle lock wraps the crawl');
+  assert.ok(captureIndex >= 0 && lockIndex < captureIndex, 'listener ledger capture happens under the lifecycle lock');
   assert.ok(openIndex >= 0 && captureIndex < openIndex, 'ledger capture precedes opening the queue');
-  assert.ok(dropIndex >= 0 && reclaimIndex >= 0 && dropIndex < reclaimIndex, 'listener reclamation follows the queue drop');
+  assert.ok(finalizeIndex >= 0 && openIndex < finalizeIndex, 'lifecycle finalizer runs after the queue open');
 });
 
 test('cleanup failure is observable without changing the crawl result', async () => {
@@ -221,7 +228,11 @@ test('listener capture and reclamation degrade to a no-op without the emitter sh
   assert.equal(renderedQueueLifecycleEmitter({ events }), events);
 });
 
-test('drop failure still warrants listener reclamation (queue graph must not stay retained)', async () => {
+test('lifecycle finalizer reclaims listeners even when the queue drop fails', async () => {
+  // Drives the exact exported finalizer the crawl finally calls: the drop
+  // rejects (bounded warning only — see dropIsolatedRenderedQueue) and
+  // listener reclamation still runs, so a failed drop cannot retain the queue
+  // graph.
   const emitter = createTestEmitter({});
   const ledger = captureRenderedQueueLifecycleListeners(emitter);
   emitter.add('migrating', () => undefined);
@@ -230,13 +241,19 @@ test('drop failure still warrants listener reclamation (queue graph must not sta
   const warnings: string[] = [];
   const originalWarn = console.warn;
   console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+  let reclaimed = 0;
   try {
-    await dropIsolatedRenderedQueue({ drop: async () => { throw new Error('disk full'); } }, 'rendered-community-test-4');
+    reclaimed = await finalizeRenderedQueueLifecycle({
+      queue: { drop: async () => { throw new Error('disk full'); } },
+      name: 'rendered-community-test-4',
+      emitter,
+      ledger,
+    });
   } finally {
     console.warn = originalWarn;
   }
   assert.equal(warnings.length, 1);
-  assert.equal(reclaimRenderedQueueLifecycleListeners(emitter, ledger), 3);
+  assert.equal(reclaimed, 3);
   assert.deepEqual(emitter.listeners('migrating'), []);
   assert.deepEqual(emitter.listeners('aborting'), []);
 });
@@ -294,4 +311,66 @@ test('reclaimed lifecycles keep cross-crawl isolation: stale handled state does 
   reclaimRenderedQueueLifecycleListeners(emitter, ledger);
   assert.equal(emitter.listeners('migrating').length, 0);
   assert.equal(emitter.listeners('aborting').length, 0);
+});
+
+test('lifecycle lock serializes overlapping crawls and reclaims exactly each queue listeners', async () => {
+  // Safety for RENDERED_FALLBACK_CONCURRENCY=2: even if the gate admits two
+  // crawls, the queue lifecycle lock keeps capture-through-reclamation
+  // atomic, so each crawl reclaims exactly the listeners its own queue added.
+  const { config } = isolatedTestConfig();
+  const emitter = renderedQueueLifecycleEmitter(config.getEventManager());
+  assert.ok(emitter, 'Crawlee EventManager exposes the process-wide emitter');
+  const sequence: string[] = [];
+  let active = 0;
+  let maxActive = 0;
+  const simulateCrawl = (tag: string, holdMs: number) => withRenderedQueueLifecycleLock(async () => {
+    active++;
+    maxActive = Math.max(maxActive, active);
+    try {
+      const ledger = captureRenderedQueueLifecycleListeners(emitter);
+      const isolated = await openIsolatedRenderedRequestQueue((name) => RequestQueue.open(name, { config }));
+      sequence.push(`${tag}:opened`);
+      await new Promise(resolve => setTimeout(resolve, holdMs));
+      const reclaimed = await finalizeRenderedQueueLifecycle({
+        queue: isolated.queue,
+        name: isolated.name,
+        emitter,
+        ledger,
+      });
+      assert.equal(reclaimed, 3, `${tag} reclaims exactly its own three listeners`);
+      sequence.push(`${tag}:finalized`);
+    } finally {
+      active--;
+    }
+  });
+  await Promise.all([simulateCrawl('a', 60), simulateCrawl('b', 20)]);
+  assert.equal(maxActive, 1, 'queue lifecycles never overlap');
+  assert.deepEqual(sequence, ['a:opened', 'a:finalized', 'b:opened', 'b:finalized']);
+  assert.equal(emitter.listeners('migrating').length, 0);
+  assert.equal(emitter.listeners('aborting').length, 0);
+});
+
+test('unsynchronized reclamation would cross-remove a live queue (race documented, prevented by the lock)', async () => {
+  const { config } = isolatedTestConfig();
+  const emitter = renderedQueueLifecycleEmitter(config.getEventManager());
+  assert.ok(emitter, 'Crawlee EventManager exposes the process-wide emitter');
+  const total = () => emitter.listeners('migrating').length + emitter.listeners('aborting').length;
+  assert.equal(total(), 0);
+  // Crawl A captures the empty baseline and opens its queue...
+  const ledgerA = captureRenderedQueueLifecycleListeners(emitter);
+  const first = await openIsolatedRenderedRequestQueue((name) => RequestQueue.open(name, { config }));
+  // ...then crawl B opens its queue while A is still live (what env
+  // concurrency 2 would allow without the lifecycle lock).
+  const ledgerB = captureRenderedQueueLifecycleListeners(emitter);
+  const second = await openIsolatedRenderedRequestQueue((name) => RequestQueue.open(name, { config }));
+  const bothLive = total();
+  assert.ok(bothLive > 0, 'queue construction registered process-wide listeners');
+  // A finishing would remove everything added after its capture — including
+  // B's still-live listeners — hence the lifecycle lock.
+  const removedByA = reclaimRenderedQueueLifecycleListeners(emitter, ledgerA);
+  assert.equal(removedByA, bothLive, 'A removes B listeners as well without serialization');
+  assert.equal(total(), 0, 'B is left live without its lifecycle handlers');
+  assert.equal(reclaimRenderedQueueLifecycleListeners(emitter, ledgerB), 0);
+  await dropIsolatedRenderedQueue(first.queue, first.name).catch(() => undefined);
+  await dropIsolatedRenderedQueue(second.queue, second.name).catch(() => undefined);
 });

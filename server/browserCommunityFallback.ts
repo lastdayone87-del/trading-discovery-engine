@@ -921,10 +921,11 @@ export function captureRenderedQueueLifecycleListeners(
  * public re-open; `drop()` closes the StorageManager registration), so the
  * smallest safe lifecycle change is to keep the fresh-queue-per-crawl
  * isolation semantics and reclaim the queue's process-wide registrations in
- * the crawl finally. `renderedFallbackGate` serializes crawls (concurrency
- * 1), so no other live queue can own a listener added after the capture; a
- * future Crawlee that stops registering or stops leaking degrades to a
- * harmless no-op.
+ * the crawl finally. `renderedFallbackGate` plus
+ * `withRenderedQueueLifecycleLock` serialize each crawl end-to-end, so no
+ * other live queue can own a listener added after the capture; a future
+ * Crawlee that stops registering or stops leaking degrades to a harmless
+ * no-op.
  */
 export function reclaimRenderedQueueLifecycleListeners(
   emitter: RenderedQueueLifecycleEmitter | undefined,
@@ -941,6 +942,53 @@ export function reclaimRenderedQueueLifecycleListeners(
     }
   }
   return reclaimed;
+}
+
+let renderedQueueLifecycleTail: Promise<void> = Promise.resolve();
+
+/**
+ * Serializes a complete per-crawl queue lifecycle — emitter capture, isolated
+ * queue open, crawler run, drop, and listener reclamation — on one
+ * process-wide promise chain. The rendered fallback gate admits up to
+ * RENDERED_FALLBACK_CONCURRENCY crawls (env-bound 1..2), but the
+ * snapshot-based reclamation above can only attribute listeners correctly
+ * while no other queue is being constructed on the shared emitter: without
+ * serialization an earlier crawl's cleanup removes a later crawl's still-live
+ * listeners. At the default gate width of 1 this adds no scheduling (the gate
+ * already serializes, and crawler runs are further serialized onto the
+ * process-wide browser runtime lease).
+ */
+export async function withRenderedQueueLifecycleLock<T>(operation: () => Promise<T>): Promise<T> {
+  const previous = renderedQueueLifecycleTail;
+  let release!: () => void;
+  renderedQueueLifecycleTail = new Promise<void>(resolve => { release = resolve; });
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
+
+/**
+ * End-of-crawl cleanup shared by every path through the crawl finally: drop
+ * the isolated queue (best-effort with a bounded warning — see
+ * dropIsolatedRenderedQueue) and then reclaim the anonymous process-wide
+ * listeners the queue construction added, so the dropped queue and its ~16 MB
+ * RequestDeduplicationCache become collectable. Exported so tests can drive
+ * the exact lifecycle the finally runs, including the failing-drop path.
+ * Returns the number of reclaimed listeners.
+ */
+export async function finalizeRenderedQueueLifecycle(options: {
+  queue: { drop(): Promise<void> } | undefined;
+  name: string | undefined;
+  emitter: RenderedQueueLifecycleEmitter | undefined;
+  ledger: RenderedQueueListenerLedger;
+}): Promise<number> {
+  if (options.queue && options.name !== undefined) {
+    await dropIsolatedRenderedQueue(options.queue, options.name);
+  }
+  return reclaimRenderedQueueLifecycleListeners(options.emitter, options.ledger);
 }
 
 /** Expensive Tier-2 acquisition. Finding one invite no longer terminates the
@@ -1013,7 +1061,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   retain(seedUrl,seedUrl);
 
   try {
-    return await renderedFallbackGate.run(async () => {
+    return await renderedFallbackGate.run(() => withRenderedQueueLifecycleLock(async () => {
       telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'GATE_ACQUIRED');
       const startedAt = Date.now();
       const { PlaywrightCrawler, RequestQueue, Configuration } = await import('crawlee');
@@ -1026,7 +1074,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
       // rates (FATAL ERROR: Reached heap limit). Capture the emitter state
       // before opening and reclaim the new listeners in the finally below:
       // the fresh-queue-per-crawl isolation semantics stay unchanged while the
-      // dropped queue graph becomes collectable.
+      // dropped queue graph becomes collectable. The whole capture-through-
+      // reclamation window runs under withRenderedQueueLifecycleLock so
+      // overlapping crawls (env concurrency 2) cannot cross-remove listeners.
       const queueEventEmitter = renderedQueueLifecycleEmitter(Configuration.getGlobalConfig().getEventManager());
       const queueListenerLedger = captureRenderedQueueLifecycleListeners(queueEventEmitter);
       let isolated: { name: string; queue: InstanceType<typeof RequestQueue> } | undefined;
@@ -1353,18 +1403,22 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         if (zeroPageReason) telemetry.zeroPageReason=zeroPageReason;
         return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,dropReasons:drops.snapshot(),detail:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
       } finally {
-        // The isolated queue must never outlive its crawl: drop it on success,
-        // failure, and unexpected throws alike so named queues cannot
-        // accumulate in storage. Cleanup is best-effort with a bounded warning
-        // (see dropIsolatedRenderedQueue) — it never affects the crawl result.
-        if (isolated) await dropIsolatedRenderedQueue(isolated.queue, isolated.name);
-        // Reclaim the anonymous process-wide listeners the queue construction
-        // added (see the capture above) so the dropped queue and its ~16 MB
-        // deduplication cache become collectable. Runs on every path, including
-        // open failures and drop failures.
-        reclaimRenderedQueueLifecycleListeners(queueEventEmitter, queueListenerLedger);
+        // The isolated queue must never outlive its crawl: the lifecycle
+        // finalizer drops it on success, failure, and unexpected throws alike
+        // (best-effort with a bounded warning — see dropIsolatedRenderedQueue)
+        // and then reclaims the anonymous process-wide listeners the queue
+        // construction added (see the capture above), so the dropped queue and
+        // its ~16 MB deduplication cache become collectable. Runs on every
+        // path, including open failures and drop failures; it never affects
+        // the crawl result.
+        await finalizeRenderedQueueLifecycle({
+          queue: isolated?.queue,
+          name: isolated?.name,
+          emitter: queueEventEmitter,
+          ledger: queueListenerLedger,
+        });
       }
-    });
+    }));
   } catch (error:any) {
     const candidates=mergeDiscordCandidates(discovered);
     const saturated=error?.message==='RENDERED_FALLBACK_SATURATED';
