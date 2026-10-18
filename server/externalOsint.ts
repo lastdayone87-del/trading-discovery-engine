@@ -3,6 +3,7 @@ import type { Pool, PoolClient } from 'pg';
 import { getDb } from './db';
 import { canonicalCountry } from './countryInference';
 import { findCountryExclusionWithAliases, lockExclusionPolicyForGuardedWrite, readExcludedCountries } from './countryExclusion';
+import { isConnectionPool } from './pgPoolOwnership';
 import { inferScript, isNoiseOrBoilerplate, normalizeNativeTerm } from './countryNativeIntelligence';
 import { buildFrontierProposal, type DiscoveryFrontierProposal } from './discoveryProposalGenerators';
 import { createNeighborhoodChecksum } from './discoveryNeighborhood';
@@ -211,11 +212,13 @@ export function buildExternalOsintProposal(evidence: OsintEvidenceAggregate, rev
 export async function persistExternalOsintProposal(proposal: DiscoveryFrontierProposal, runner?: Queryable): Promise<boolean> {
   // Pool discipline: a shared advisory lock is only held until the end of its
   // transaction, so when the runner is a Pool (or absent) own a transaction
-  // that spans the exclusion check and the proposal writes below.
-  const isPool = (candidate: any) => candidate && 'connect' in candidate && typeof candidate.connect === 'function' && !('release' in candidate);
-  if (!runner || isPool(runner)) {
+  // that spans the exclusion check and the proposal writes below. A caller-
+  // supplied client is reused as-is: a standalone pg.Client also exposes
+  // connect(), so pool ownership must be detected explicitly
+  // (isConnectionPool), never by "has connect()".
+  if (!runner || isConnectionPool(runner)) {
     const pool: any = runner || await getDb();
-    if (isPool(pool)) {
+    if (isConnectionPool(pool)) {
       const client = await pool.connect();
       try {
         await client.query('BEGIN');

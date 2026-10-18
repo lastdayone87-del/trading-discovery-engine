@@ -12,6 +12,7 @@ import { admitResearchMultilingualSurface, detectTerminologyBurst, persistResear
 import { enqueueConceptResolution } from './conceptGraph';
 import { excludedCountrySqlPredicate, findCountryExclusionWithAliases, lockExclusionPolicyForGuardedWrite, readExcludedCountries } from './countryExclusion';
 import { countryAliasResolutionJson } from './countryInference';
+import { isConnectionPool } from './pgPoolOwnership';
 import { ensureArtifactSourceFamily, extractCreatorRelationships, graphExperimentAssignment, resolveExactYouTubeRelationshipTarget } from './persistentResearchPhase2';
 import { recordTemporalRelationship } from './temporalResearchFrontier';
 
@@ -78,11 +79,11 @@ export async function generateMultilingualActions(cutoff:string,runner?:{query:(
   // Pool discipline: the shared exclusion-policy lock and the action writes
   // below must share one transaction-bound client, or the lock releases
   // before the protected writes. A caller-supplied client joins the caller's
-  // transaction and owns its commit.
-  const isPool=(candidate:any)=>candidate&&'connect' in candidate&&typeof candidate.connect==='function'&&!('release' in candidate);
-  if(!runner||isPool(runner)){
+  // transaction and owns its commit; only real pools are checked out
+  // (isConnectionPool - a standalone pg.Client also exposes connect()).
+  if(!runner||isConnectionPool(runner)){
     const pool:any=runner||await getDb();
-    if(isPool(pool)){
+    if(isConnectionPool(pool)){
       const client=await pool.connect();
       try{await client.query('BEGIN');const actions=await generateMultilingualActions(cutoff,client);await client.query('COMMIT');return actions;}
       catch(error){await client.query('ROLLBACK').catch(()=>undefined);throw error;}

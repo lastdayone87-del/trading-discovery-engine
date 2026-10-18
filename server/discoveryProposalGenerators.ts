@@ -3,6 +3,7 @@ import { getDb } from './db';
 import { buildDiscoveryNeighborhood, createNeighborhoodChecksum, type DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
 import { canonicalCountry, countryIsoAlias } from './countryInference';
 import { findCountryExclusionWithAliases, lockExclusionPolicyForGuardedWrite, readExcludedCountries } from './countryExclusion';
+import { isConnectionPool } from './pgPoolOwnership';
 import { computeEvidenceChecksum } from './countryNativeIntelligence';
 import { QUALITY_CREATOR_SCORE_THRESHOLD } from './queryPerformance';
 
@@ -623,8 +624,9 @@ export async function persistFrontierProposals(
   // A Pool cannot hold the shared exclusion-policy lock across statements:
   // own a transaction per proposal so the exclusion check and the proposal
   // write serialize with exclusion-list updates. A caller-supplied client
-  // (no `connect`) joins the caller's transaction and owns its commit.
-  const ownsClient = 'connect' in db && typeof db.connect === 'function' && !('release' in db);
+  // (standalone Client/PoolClient) joins the caller's transaction and owns
+  // its commit; only real pools are checked out (isConnectionPool).
+  const ownsClient = isConnectionPool(db);
   let inserted = 0;
 
   for (const p of proposals) {

@@ -27,6 +27,11 @@ export async function addExcludedCountryGuarded(
   runner: { query: (sql: string, params?: any[]) => Promise<any> },
   country: ExcludedCountry
 ): Promise<void> {
+  // readExcludedCountries() classifies a blank country_name as a malformed row
+  // and throws, failing every guarded lifecycle/planner/OSINT check closed
+  // until an operator removes the row. Reject the write before the row can
+  // exist; an unreadable identity needs no advisory lock to be rejected.
+  if (!normalizeCountryName(country?.country_name)) throw new Error('EXCLUDED_COUNTRY_NAME_REQUIRED');
   await runner.query('SELECT pg_advisory_xact_lock(hashtext($1))', [COUNTRY_EXCLUSION_POLICY_LOCK]);
   await runner.query('INSERT INTO excluded_countries(country_name,reason) VALUES($1,$2) ON CONFLICT(country_name) DO UPDATE SET reason=excluded.reason', [country.country_name, country.reason]);
 }

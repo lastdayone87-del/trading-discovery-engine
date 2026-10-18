@@ -5,7 +5,7 @@ import { recomputeNativeEvidenceProjection } from './countryNativeIntelligence';
 import { buildFrontierProposal, generateCountryNativeProposals, persistFrontierProposals } from './discoveryProposalGenerators';
 import { materializeExternalOsintProposals, persistExternalOsintProposal } from './externalOsint';
 import { generateMultilingualActions } from './persistentResearchController';
-import { findCountryExclusionWithAliases, readExcludedCountries } from './countryExclusion';
+import { excludedCountrySqlPredicate, findCountryExclusionWithAliases, readExcludedCountries } from './countryExclusion';
 import { countryAliasResolutionJson, countryIdentityResolution } from './countryInference';
 import { addExcludedCountryGuarded } from './countryExclusionRules';
 import { getNeighborhoodCandidates } from './discoveryFrontierAllocator';
@@ -753,22 +753,123 @@ test('exclusion matching resolves ISO aliases on the input identity', () => {
   assert.equal(findCountryExclusionWithAliases('India', exclusions), null, 'allowed countries stay allowed');
 });
 
+test('a blank exclusion name is rejected before the write can fail every guarded read closed', async () => {
+  const runner = makeRunner([{ match: /INSERT INTO excluded_countries/, respond: () => ({ rows: [], rowCount: 1 }) }]);
+  for (const blank of ['', '   ', '\u00a0']) {
+    await assert.rejects(
+      addExcludedCountryGuarded(runner as any, { country_name: blank, reason: 'regulatory prohibition' }),
+      /EXCLUDED_COUNTRY_NAME_REQUIRED/
+    );
+  }
+  assert.equal(runner.calls.length, 0, 'no advisory lock and no insert may run for an unreadable name');
+});
+
+test('an exclusion row stored in an alias or localized form is canonicalized on the stored side too', async () => {
+  const storedAlias = [{ country_name: 'DE', reason: 'regulatory prohibition' }];
+  assert.equal(findCountryExclusionWithAliases('Germany', storedAlias)?.country, 'DE', 'canonical candidate must match a stored ISO alias');
+  assert.equal(findCountryExclusionWithAliases('de', storedAlias)?.country, 'DE');
+  assert.equal(
+    findCountryExclusionWithAliases('Ivory Coast', [{ country_name: "Côte d'Ivoire", reason: 'regulatory prohibition' }])?.country,
+    "Côte d'Ivoire",
+    'stored localized variant must match the canonical candidate'
+  );
+  assert.equal(findCountryExclusionWithAliases('France', storedAlias), null, 'other markets stay allowed');
+  // The guarded write path applies the same stored-side identity.
+  const runner = makeRunner([
+    { match: READ_EXCLUSIONS, respond: () => ({ rows: storedAlias }) },
+    { match: /INSERT INTO frontier_discovery_proposals/, respond: () => ({ rows: [], rowCount: 1 }) }
+  ]);
+  const inserted = await persistFrontierProposals([seedProposal('Germany')], { runner });
+  assert.equal(inserted, 0, 'an alias-form policy row must still block the canonical market');
+  assert.equal(runner.calls.some(c => /INSERT INTO frontier_discovery_proposals/.test(c.sql)), false);
+});
+
+test('the SQL prefilter resolves stored policy rows through the same identity map (parity lock)', () => {
+  const sql = excludedCountrySqlPredicate('n.country', '$3');
+  assert.match(sql, /excluded_countries excluded/);
+  assert.match(sql, /\$3::jsonb ->> lower\(regexp_replace\(trim\(excluded\.country_name\)/, 'the stored policy row must be resolved through the alias map');
+  assert.match(sql, /\$3::jsonb ->> lower\(regexp_replace\(trim\(n\.country\)/, 'the candidate column must be resolved through the alias map');
+  assert.equal(sql.includes(' OR '), false, 'a single canonical-vs-canonical comparison covers both sides');
+});
+
+test('a standalone pg.Client runner is reused, never mistaken for a Pool (pool ownership)', async () => {
+  // A standalone Client exposes connect() but is itself the queryable:
+  // checking it out would call connect() on the caller's client and then try
+  // to release() a Client (which has no release). connect() must never run.
+  const connectMustNotBeCalled = () => { throw new Error('connect() must not be called on a caller-supplied client'); };
+
+  const frontierRunner: any = makeRunner([
+    noExclusions,
+    { match: /INSERT INTO frontier_discovery_proposals/, respond: () => ({ rows: [], rowCount: 1 }) }
+  ]);
+  frontierRunner.connect = connectMustNotBeCalled;
+  assert.equal(await persistFrontierProposals([seedProposal('United States')], { runner: frontierRunner }), 1);
+  assert.ok(frontierRunner.calls.some(c => /INSERT INTO frontier_discovery_proposals/.test(c.sql)));
+
+  const osintRunner: any = makeRunner([
+    noExclusions,
+    { match: /FROM canonical_trading_terms/, respond: () => ({ rows: [] }) },
+    { match: /INSERT INTO discovery_neighborhoods/, respond: () => ({ rows: [], rowCount: 1 }) },
+    { match: /INSERT INTO frontier_discovery_proposals/, respond: () => ({ rows: [], rowCount: 1 }) }
+  ]);
+  osintRunner.connect = connectMustNotBeCalled;
+  const persisted = await persistExternalOsintProposal({ country: 'United States', language: 'en', concept: 'ETF', targetNeighborhoodKey: 'us-en-etf-client', supportingEvidence: {}, targetDimensions: {} } as any, osintRunner);
+  assert.equal(persisted, true);
+  assert.ok(osintRunner.calls.some(c => /INSERT INTO frontier_discovery_proposals/.test(c.sql)));
+
+  const actionRunner: any = makeRunner([
+    noExclusions,
+    { match: /concept_market_affinities/, respond: () => ({ rows: [usSurface(0)] }) },
+    { match: /research_programs/, respond: () => ({ rows: [{ id: 1, scope: '{}' }] }) },
+    { match: /INSERT INTO discovery_hypotheses/, respond: () => ({ rows: [{ id: 7 }], rowCount: 1 }) },
+    { match: /INSERT INTO discovery_actions/, respond: () => ({ rows: [{ id: 8 }], rowCount: 1 }) }
+  ]);
+  actionRunner.connect = connectMustNotBeCalled;
+  assert.equal(await generateMultilingualActions('2026-10-18T00:00:00Z', actionRunner), 1);
+  assert.ok(actionRunner.calls.some(c => /INSERT INTO discovery_actions/.test(c.sql)));
+});
+
+test('a connect-only pool double is still checked out under the guarded write (pool discipline unchanged)', async () => {
+  const statements: string[] = [];
+  let released = 0;
+  const client = {
+    query: async (sql: string) => {
+      statements.push(sql);
+      if (/INSERT INTO frontier_discovery_proposals/.test(sql)) return { rows: [], rowCount: 1 };
+      return { rows: [] };
+    },
+    release: () => { released += 1; }
+  };
+  let checkedOut = 0;
+  const pool: any = { connect: async () => { checkedOut += 1; return client; } };
+  const inserted = await persistFrontierProposals([seedProposal('United States')], { runner: pool });
+  assert.equal(inserted, 1);
+  assert.equal(checkedOut, 1, 'the pool must hand out exactly one client');
+  assert.equal(released, 1, 'the checked-out client must be released');
+  assert.equal(statements[0], 'BEGIN', 'the guarded write must own a transaction on the checked-out client');
+  assert.ok(statements.includes('COMMIT'));
+});
+
 // ---------------------------------------------------------------------------
 // Concurrency: an exclusion committed mid-write cannot bypass a guarded check
 // ---------------------------------------------------------------------------
 
 type LockRegistry = { shared: number; exclusive: boolean };
 
+// Bounded cooperative wait (same 3s deadline used by the advisory-lock waits
+// below): a regression that stalls the guarded write before the protected
+// insert must fail the suite, never hang it.
+const waitFor = async (condition: () => boolean, timeoutMessage: string) => {
+  const started = Date.now();
+  while (!condition()) {
+    if (Date.now() - started > 3000) throw new Error(timeoutMessage);
+    await new Promise(resolve => setTimeout(resolve, 1));
+  }
+};
+
 function makePolicySession(registry: LockRegistry, exclusionStore: Row[], name: string, order: string[], pause: { armed: boolean; reached: boolean; resume: () => void; gate: Promise<void> }) {
   let heldShared = 0;
   let heldExclusive = false;
-  const waitFor = async (condition: () => boolean) => {
-    const started = Date.now();
-    while (!condition()) {
-      if (Date.now() - started > 3000) throw new Error(`${name}: advisory lock wait timed out`);
-      await new Promise(resolve => setTimeout(resolve, 1));
-    }
-  };
   return {
     async query(sql: string, params?: any[]) {
       if (/^BEGIN$/.test(sql)) return { rows: [] };
@@ -778,12 +879,12 @@ function makePolicySession(registry: LockRegistry, exclusionStore: Row[], name: 
         return { rows: [] };
       }
       if (/pg_advisory_xact_lock_shared/.test(sql)) {
-        await waitFor(() => !registry.exclusive);
+        await waitFor(() => !registry.exclusive, `${name}: advisory lock wait timed out`);
         registry.shared += 1; heldShared += 1;
         return { rows: [] };
       }
       if (/pg_advisory_xact_lock\(/.test(sql)) {
-        await waitFor(() => !registry.exclusive && registry.shared === 0);
+        await waitFor(() => !registry.exclusive && registry.shared === 0, `${name}: advisory lock wait timed out`);
         registry.exclusive = true; heldExclusive = true;
         return { rows: [] };
       }
@@ -827,7 +928,7 @@ test('an exclusion committed mid-write cannot bypass the guarded check (advisory
 
   await guarded.query('BEGIN');
   const guardedWrite = persistExternalOsintProposal(proposal, guarded as any);
-  while (!pause.reached) await new Promise(resolve => setTimeout(resolve, 1));
+  await waitFor(() => pause.reached, 'guarded write never reached the protected insert');
 
   // The guarded write has read the (empty) exclusion list and holds the shared
   // policy lock. Start the policy writer: it must block on the exclusive lock.
