@@ -2019,12 +2019,11 @@ export function decideExclusionAuditRowAction(input: {
   discordStatus: unknown;
   discordInvite: unknown;
 }): ExclusionAuditRowAction {
-  // Status writes and invite hygiene are independent: an already-REJECTED row
-  // must never be re-stamped (idempotent churn), but the Discord persistence
-  // rule still forbids storing an invite on a DEAD/NON_TRADING/UNCERTAIN
-  // channel — including when country re-validation confirms REJECTED again.
-  // Checking cleanup before the status branch keeps the rejected-row cleanup
-  // semantics identical to the pre-batching separate cleanup pass.
+  // The status branch runs first so a fresh REJECTED write is never blocked by
+  // a stale invite, matching the pre-batching if/else-if order. Already-
+  // REJECTED rows are never re-stamped (idempotent churn), but the Discord
+  // persistence rule still applies to them: an invite on a
+  // DEAD/NON_TRADING/UNCERTAIN channel is cleared.
   if (input.validationStatus === 'REJECTED' && !input.alreadyRejected) return 'reject-write';
   if (
     (input.discordStatus === 'DEAD' ||
@@ -2050,7 +2049,10 @@ export async function auditExistingChannelsWithExclusionEngine(): Promise<{ tota
         const { rows, nextCursor } = await fetchExclusionAuditBatch(db, cursor, EXCLUSION_AUDIT_BATCH_SIZE, scope);
         if (!rows.length) break;
         for (const candidate of rows) {
-          total++;
+          // Preserve the pre-batching `total` contract: channels whose country
+          // is re-tested. The rejected-cleanup scope performs no validation, so
+          // it must not inflate the re-tested count.
+          if (!alreadyRejected) total++;
           // Country revalidation applies only to the audit scope: the
           // rejected-cleanup scope never re-judges country status (the row is
           // already REJECTED and the audit never un-REJECTs), so validation
@@ -2122,7 +2124,7 @@ export async function auditExistingChannelsWithExclusionEngine(): Promise<{ tota
       }
     }
 
-    console.log(`[Database Audit] Re-tested ${total} stored channels: ${rejectedCount} excluded channels marked REJECTED; cleared ${cleanedInvites} stale invites from rejected rows.`);
+    console.log(`[Database Audit] Re-tested ${total} stored channels: ${rejectedCount} excluded channels marked REJECTED; cleared ${cleanedInvites} stale invites under the Discord persistence rule.`);
     return { total, rejected: rejectedCount };
   } catch (err) {
     console.error('Error during database channel exclusion audit:', err);

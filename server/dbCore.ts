@@ -392,12 +392,17 @@ export async function getAllChannels(): Promise<ChannelRecord[]> {
   return res.rows.map(rowToChannel);
 }
 
-// Memory-bounded rejected-view: same predicate the
+// Rejected-view SQL pushdown: the predicate the
 // /api/channels/diagnostics/rejected route previously applied in Node after
-// loading every stored channel. Same order, no full-table load into memory.
-export async function listRejectedChannelDiagnostics(): Promise<ChannelRecord[]> {
-  const db = await getDb();
-  const res = await db.query(`SELECT * FROM channels WHERE country_status='REJECTED' OR scan_status='SKIPPED_EXCLUDED' OR trading_status='NON_TRADING' OR discord_status='NON_TRADING' ORDER BY first_seen DESC`);
+// loading every stored channel now runs in PostgreSQL, so non-matching rows
+// are never transferred into Node. The matching result set itself is not
+// capped (the route's legacy contract is the full rejected view); only the
+// non-rejected rows are excluded at the database.
+export async function listRejectedChannelDiagnostics(
+  db?: Pick<InstanceType<typeof Pool>, 'query'>
+): Promise<ChannelRecord[]> {
+  const conn = db ?? await getDb();
+  const res = await conn.query(`SELECT * FROM channels WHERE country_status='REJECTED' OR scan_status='SKIPPED_EXCLUDED' OR trading_status='NON_TRADING' OR discord_status='NON_TRADING' ORDER BY first_seen DESC`);
   return res.rows.map(rowToChannel);
 }
 

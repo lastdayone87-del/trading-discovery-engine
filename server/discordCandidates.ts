@@ -230,9 +230,17 @@ export function extractDiscordCandidates(text:string,sourceSurface:AcquisitionSu
   if(!text)return [];
   const clean=text.replace(/\\\/|\\u002f/gi,'/').replace(/\\u003a/gi,':').replace(/\\u0026/gi,'&').replace(/%2f/gi,'/').replace(/%3a/gi,':');
   const found:DiscordCandidate[]=[];
+  // Copy regexp captures before they escape extraction: V8 represents slices
+  // of a large subject string as SlicedString views that keep the whole
+  // subject alive. The rendered crawler scans full page snapshots and drops
+  // the HTML immediately, so an un-copied rawLocator would pin every
+  // invite-bearing snapshot until the crawl completes.
+  const detach=(value:string):string=>Buffer.from(value,'utf8').toString('utf8');
   const push=(rawLocator:string,locatorType:DiscordLocatorType,code:string|undefined,confidence:'EXPLICIT'|'RESOLVED'|'HEURISTIC')=>{
     if(code&&(code.length<2||code.length>128||reserved.has(code.toLowerCase())))return;
-    const value=candidate({locatorType,sourceSurface,rawLocator,nativeInviteCode:code,normalizedLocator:code?`https://discord.gg/${code}`:undefined,sourceUrl,extractionConfidence:confidence});
+    const ownLocator=detach(rawLocator);
+    const ownCode=code===undefined?undefined:detach(code);
+    const value=candidate({locatorType,sourceSurface,rawLocator:ownLocator,nativeInviteCode:ownCode,normalizedLocator:ownCode?`https://discord.gg/${ownCode}`:undefined,sourceUrl,extractionConfidence:confidence});
     if(!found.some(item=>item.candidateId===value.candidateId))found.push(value);
   };
   const native=/(?:https?:\/\/)?(?:www\.)?(discord\.gg|discord\.com\/invite|discordapp\.com\/invite|discord\.app\/invite)\/([^\s"'<>\)\\/?#&]+)/gi;

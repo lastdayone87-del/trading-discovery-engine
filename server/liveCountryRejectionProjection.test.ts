@@ -111,8 +111,13 @@ test('startup audit restores Discord cleanup for rejected rows in a bounded pass
   // scope skips validateChannelCountry entirely and clears only the stale
   // invite through the standard full-row write path.
   assert.match(fn, /const valRes = alreadyRejected\s*\n\s*\? null\s*\n\s*: await validateChannelCountry\(/);
-  assert.match(fn, /channel\.discord_invite = null/);
-  assert.match(fn, /await upsertChannel\(channel\)/);
+  const cleanupStart = fn.indexOf('channel.discord_invite = null');
+  const cleanupEnd = fn.indexOf('cleanedInvites++', cleanupStart);
+  assert.ok(cleanupStart >= 0 && cleanupEnd > cleanupStart);
+  // Scope the persistence assertion to the cleanup branch: the reject-write
+  // branch also calls upsertChannel(channel), so an unscoped match would pass
+  // even if invite cleanup stopped persisting.
+  assert.match(fn.slice(cleanupStart, cleanupEnd), /await upsertChannel\(channel\)/);
 });
 
 test('live non-terminal replacement keeps country and scope consistent', async () => {
