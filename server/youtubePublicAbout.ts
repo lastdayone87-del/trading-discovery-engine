@@ -132,14 +132,18 @@ export async function fetchPublicYouTubePage(
 }
 
 /**
- * Parse channel About/bio and links from a public channel page HTML body.
- * Prefer ytInitialData channelMetadataRenderer.description; fall back to og/name description.
+ * Parse About-page metadata: ytInitialData credentials plus og/description
+ * fallbacks. Single shared implementation for the Gate 1 public-About
+ * country fallback and channel inspection, so retention or schema fixes
+ * cannot diverge between the two callers. og/meta captures are regexp slices
+ * of the full page and are detached before they escape; ytInitialData values
+ * come from JSON.parse and are already independent strings.
  */
-export function parseYouTubeChannelAboutFromHtml(
-  html: string,
-  options?: { enableDebug?: boolean; finalUrl?: string }
-): PublicYouTubeChannelAbout {
-  const cleanHtml = decodeEmbeddedMarkup(html);
+export function parseAboutPageMetadataFromHtml(html: string): {
+  bio?: string;
+  thumbnailUrl?: string;
+  explicitLinks: string[];
+} {
   let thumbnailUrl: string | undefined;
   let bio: string | undefined;
   const explicitLinks: string[] = [];
@@ -194,6 +198,22 @@ export function parseYouTubeChannelAboutFromHtml(
       html.match(/<meta\s+property="og:description"\s+content="([^"]+)"/i);
     if (ogDesc?.[1]) bio = detachPageSlice(ogDesc[1]);
   }
+
+  return { bio, thumbnailUrl, explicitLinks };
+}
+
+/**
+ * Parse channel About/bio and links from a public channel page HTML body.
+ * Prefer ytInitialData channelMetadataRenderer.description; fall back to og/name description.
+ * Metadata parsing is shared with channel inspection through
+ * parseAboutPageMetadataFromHtml so the two callers cannot diverge.
+ */
+export function parseYouTubeChannelAboutFromHtml(
+  html: string,
+  options?: { enableDebug?: boolean; finalUrl?: string }
+): PublicYouTubeChannelAbout {
+  const cleanHtml = decodeEmbeddedMarkup(html);
+  const { bio, thumbnailUrl, explicitLinks } = parseAboutPageMetadataFromHtml(html);
 
   // Page-asset infrastructure endpoints (thumbnails, playback, telemetry,
   // schema, fonts) captured by the indiscriminate scrape above can never be
