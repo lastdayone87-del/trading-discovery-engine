@@ -125,10 +125,11 @@ test('already-REJECTED rows with stale invites take invite-cleanup, status prese
       'invite-cleanup'
     );
   }
-  // A REJECTED validation on an already-rejected row only re-stamps; dropped.
+  // A REJECTED validation on an already-rejected row only skips the status
+  // re-stamp; the stale invite must still be cleaned (persistence rule wins).
   assert.equal(
     decideExclusionAuditRowAction({ alreadyRejected: true, validationStatus: 'REJECTED', discordStatus: 'DEAD', discordInvite: 'https://discord.gg/abc' }),
-    'none'
+    'invite-cleanup'
   );
   assert.equal(
     decideExclusionAuditRowAction({ alreadyRejected: true, validationStatus: 'LIKELY', discordStatus: 'ACTIVE', discordInvite: 'https://discord.gg/abc' }),

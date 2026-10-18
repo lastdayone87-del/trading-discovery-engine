@@ -2019,7 +2019,13 @@ export function decideExclusionAuditRowAction(input: {
   discordStatus: unknown;
   discordInvite: unknown;
 }): ExclusionAuditRowAction {
-  if (input.validationStatus === 'REJECTED') return input.alreadyRejected ? 'none' : 'reject-write';
+  // Status writes and invite hygiene are independent: an already-REJECTED row
+  // must never be re-stamped (idempotent churn), but the Discord persistence
+  // rule still forbids storing an invite on a DEAD/NON_TRADING/UNCERTAIN
+  // channel — including when country re-validation confirms REJECTED again.
+  // Checking cleanup before the status branch keeps the rejected-row cleanup
+  // semantics identical to the pre-batching separate cleanup pass.
+  if (input.validationStatus === 'REJECTED' && !input.alreadyRejected) return 'reject-write';
   if (
     (input.discordStatus === 'DEAD' ||
       input.discordStatus === 'NON_TRADING' ||
@@ -2036,6 +2042,7 @@ export async function auditExistingChannelsWithExclusionEngine(): Promise<{ tota
     const db = await getDb();
     let total = 0;
     let rejectedCount = 0;
+    let cleanedInvites = 0;
     for (const scope of ['audit', 'rejected-cleanup'] as const) {
       const alreadyRejected = scope === 'rejected-cleanup';
       let cursor: ExclusionAuditCursor = { cursorSeen: null, cursorId: '' };
@@ -2044,28 +2051,36 @@ export async function auditExistingChannelsWithExclusionEngine(): Promise<{ tota
         if (!rows.length) break;
         for (const candidate of rows) {
           total++;
+          // Country revalidation applies only to the audit scope: the
+          // rejected-cleanup scope never re-judges country status (the row is
+          // already REJECTED and the audit never un-REJECTs), so validation
+          // there would be dead work. Cleanup is decided from the persistence
+          // rule alone and is therefore independent of validation outcome.
           // Provenance boundary (see country revalidation above): the bulk audit
           // has no stored bio text available, and trail prose quotes country names
           // from prior validation/ acquisition logs. Feeding it as the Bio would
           // manufacture P2 evidence and terminally REJECT clean channels, so the
           // audit may only use the creator-level channelName. Unproven → untouched.
-          const valRes = await validateChannelCountry(
-            {
-              channelName: candidate.channel_name,
-              description: '',
-              videoTitles: [candidate.channel_name],
-              externalLinks: candidate.discord_invite ? [candidate.discord_invite] : []
-            },
-            null
-          );
+          const valRes = alreadyRejected
+            ? null
+            : await validateChannelCountry(
+                {
+                  channelName: candidate.channel_name,
+                  description: '',
+                  videoTitles: [candidate.channel_name],
+                  externalLinks: candidate.discord_invite ? [candidate.discord_invite] : []
+                },
+                null
+              );
 
           const action = decideExclusionAuditRowAction({
             alreadyRejected,
-            validationStatus: valRes.status,
+            validationStatus: valRes?.status ?? '',
             discordStatus: candidate.discord_status,
             discordInvite: candidate.discord_invite
           });
           if (action === 'reject-write') {
+            if (!valRes) continue; // unreachable: only non-rejected rows can write a rejection
             rejectedCount++;
             const channel = await getChannelById(candidate.channel_id);
             if (!channel) continue;
@@ -2098,40 +2113,13 @@ export async function auditExistingChannelsWithExclusionEngine(): Promise<{ tota
             if (!channel) continue;
             channel.discord_invite = null;
             await upsertChannel(channel);
+            cleanedInvites++;
           }
         }
 
         if (!nextCursor || rows.length < EXCLUSION_AUDIT_BATCH_SIZE) break;
         cursor = nextCursor;
       }
-    }
-
-    // Rejected-row Discord hygiene: the country pass above intentionally skips
-    // REJECTED rows (never un-REJECTs, memory-bounded keyset), but those rows
-    // must still reach invite cleanup. This separate bounded keyset pass
-    // selects only narrow cleanup-eligible columns and performs no country
-    // validation — full rows load only for rows that actually need the write.
-    let cleanedInvites = 0;
-    let cleanupSeen: string | null = null;
-    let cleanupId = '';
-    for (;;) {
-      const stale = await db.query(
-        `SELECT channel_id, discord_status, discord_invite, first_seen FROM channels WHERE country_status = 'REJECTED' AND discord_status IN ('DEAD','NON_TRADING','UNCERTAIN') AND discord_invite IS NOT NULL AND ($1::timestamptz IS NULL OR (first_seen, channel_id) < ($1::timestamptz, $2::text)) ORDER BY first_seen DESC, channel_id DESC LIMIT $3`,
-        [cleanupSeen, cleanupId, EXCLUSION_AUDIT_BATCH_SIZE]
-      );
-      if (!stale.rowCount) break;
-      for (const candidate of stale.rows) {
-        const channel = await getChannelById(candidate.channel_id);
-        if (!channel) continue;
-        if (channel.discord_invite == null) continue;
-        channel.discord_invite = null;
-        await upsertChannel(channel);
-        cleanedInvites++;
-      }
-      if (stale.rows.length < EXCLUSION_AUDIT_BATCH_SIZE) break;
-      const lastStale = stale.rows[stale.rows.length - 1];
-      cleanupSeen = lastStale.first_seen instanceof Date ? lastStale.first_seen.toISOString() : String(lastStale.first_seen);
-      cleanupId = String(lastStale.channel_id);
     }
 
     console.log(`[Database Audit] Re-tested ${total} stored channels: ${rejectedCount} excluded channels marked REJECTED; cleared ${cleanedInvites} stale invites from rejected rows.`);

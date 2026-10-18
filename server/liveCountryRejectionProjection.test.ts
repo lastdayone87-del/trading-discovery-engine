@@ -93,18 +93,26 @@ test('startup audit restores Discord cleanup for rejected rows in a bounded pass
     source.indexOf('export async function auditExistingChannelsWithExclusionEngine'),
     source.indexOf('export type ManualRecheckErrorClass'),
   );
-  // Country revalidation still skips REJECTED rows (never un-REJECTs).
-  assert.match(fn, /WHERE country_status IS DISTINCT FROM 'REJECTED'/);
-  // A second bounded keyset pass covers rejected rows for invite hygiene only.
-  assert.match(fn, /WHERE country_status = 'REJECTED' AND discord_status IN \('DEAD','NON_TRADING','UNCERTAIN'\) AND discord_invite IS NOT NULL/);
-  assert.match(fn, /LIMIT \$3/);
+  const batch = source.slice(
+    source.indexOf('export async function fetchExclusionAuditBatch'),
+    source.indexOf('export type ExclusionAuditRowAction'),
+  );
+  // Country revalidation still skips REJECTED rows (never un-REJECTs); the
+  // rejected-cleanup scope keeps the previous invite-hygiene predicate. Both
+  // bounded keyset predicates live in the shared batch reader.
+  assert.match(batch, /country_status IS DISTINCT FROM 'REJECTED'/);
+  assert.match(batch, /country_status = 'REJECTED' AND discord_status IN \('DEAD','NON_TRADING','UNCERTAIN'\) AND discord_invite IS NOT NULL/);
+  assert.match(batch, /LIMIT \$3/);
+  assert.match(fn, /for \(const scope of \['audit', 'rejected-cleanup'\] as const\)/);
+  assert.match(fn, /fetchExclusionAuditBatch\(db, cursor, EXCLUSION_AUDIT_BATCH_SIZE, scope\)/);
+  assert.match(fn, /decideExclusionAuditRowAction/);
   assert.match(fn, /cleanedInvites\+\+/);
-  // The cleanup pass performs no country validation and clears only the
-  // stale invite through the standard full-row write path.
-  const cleanup = fn.slice(fn.indexOf("country_status = 'REJECTED'"));
-  assert.doesNotMatch(cleanup, /validateChannelCountry/);
-  assert.match(cleanup, /channel\.discord_invite = null/);
-  assert.match(cleanup, /await upsertChannel\(channel\)/);
+  // The cleanup pass performs no country validation: the rejected-cleanup
+  // scope skips validateChannelCountry entirely and clears only the stale
+  // invite through the standard full-row write path.
+  assert.match(fn, /const valRes = alreadyRejected\s*\n\s*\? null\s*\n\s*: await validateChannelCountry\(/);
+  assert.match(fn, /channel\.discord_invite = null/);
+  assert.match(fn, /await upsertChannel\(channel\)/);
 });
 
 test('live non-terminal replacement keeps country and scope consistent', async () => {
