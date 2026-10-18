@@ -238,7 +238,7 @@ export function countryIsoAlias(value: string): string | null {
   return alias ? alias.toUpperCase() : null;
 }
 
-let cachedCountryIdentityResolution: Record<string, string> | null = null;
+let cachedCountryIdentityResolution: Readonly<Record<string, string>> | null = null;
 
 /**
  * Normalized spelling-to-canonical resolution table: normalized
@@ -249,9 +249,10 @@ let cachedCountryIdentityResolution: Record<string, string> | null = null;
  * matcher resolves stored spellings through, and (b) the `::jsonb` parameter
  * of the server-side exclusion prefilters (`excludedCountrySqlPredicate`), so
  * SQL and JS share one alias universe and stored localized forms cannot
- * survive a WHERE clause or bypass the guard.
+ * survive a WHERE clause or bypass the guard. The returned table is frozen:
+ * importers cannot mutate a shared guard input out from under either matcher.
  */
-export function countryIdentityResolution(): Record<string, string> {
+export function countryIdentityResolution(): Readonly<Record<string, string>> {
   if (cachedCountryIdentityResolution === null) {
     const resolution: Record<string, string> = {};
     for (const [alias, country] of Object.entries(COUNTRY_ALIASES)) {
@@ -261,7 +262,7 @@ export function countryIdentityResolution(): Record<string, string> {
       const canonical = normalizeCountryName(canonicalCountry(country));
       for (const variant of variants) resolution[normalizeCountryName(variant)] = canonical;
     }
-    cachedCountryIdentityResolution = resolution;
+    cachedCountryIdentityResolution = Object.freeze(resolution);
   }
   return cachedCountryIdentityResolution;
 }

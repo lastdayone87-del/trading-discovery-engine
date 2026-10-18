@@ -6,7 +6,7 @@ import { buildFrontierProposal, generateCountryNativeProposals, persistFrontierP
 import { materializeExternalOsintProposals, persistExternalOsintProposal } from './externalOsint';
 import { generateMultilingualActions } from './persistentResearchController';
 import { findCountryExclusionWithAliases, readExcludedCountries } from './countryExclusion';
-import { countryAliasResolutionJson } from './countryInference';
+import { countryAliasResolutionJson, countryIdentityResolution } from './countryInference';
 import { addExcludedCountryGuarded } from './countryExclusionRules';
 import { getNeighborhoodCandidates } from './discoveryFrontierAllocator';
 import { evaluateTrialGate } from './discoveryFrontierTrials';
@@ -641,6 +641,18 @@ test('modeled localized variants resolve for exclusion matching in code and in t
   assert.equal(map["côte d'ivoire"], 'ivory coast', 'the SQL map must resolve localized variants too');
   assert.equal(map['česká republika'], 'czechia');
   assert.equal(map['de'], 'germany');
+});
+
+test('the shared identity-resolution table is frozen: importers cannot corrupt either matcher', () => {
+  const resolution = countryIdentityResolution();
+  assert.ok(Object.isFrozen(resolution), 'the resolution universe backing both matchers must be immutable');
+  assert.throws(
+    () => { (resolution as Record<string, string>)['de'] = 'france'; },
+    TypeError,
+    'mutation attempts must fail instead of silently redirecting exclusion matching'
+  );
+  assert.equal(countryIdentityResolution()['de'], 'germany');
+  assert.equal(findCountryExclusionWithAliases('DE', [{ country_name: 'Germany', reason: 'x' }])?.country, 'Germany');
 });
 
 test('pagination has a hard page backstop: a window that never advances cannot loop unbounded', async () => {
