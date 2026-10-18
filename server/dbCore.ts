@@ -392,6 +392,20 @@ export async function getAllChannels(): Promise<ChannelRecord[]> {
   return res.rows.map(rowToChannel);
 }
 
+// Rejected-view SQL pushdown: the predicate the
+// /api/channels/diagnostics/rejected route previously applied in Node after
+// loading every stored channel now runs in PostgreSQL, so non-matching rows
+// are never transferred into Node. The matching result set itself is not
+// capped (the route's legacy contract is the full rejected view); only the
+// non-rejected rows are excluded at the database.
+export async function listRejectedChannelDiagnostics(
+  db?: Pick<InstanceType<typeof Pool>, 'query'>
+): Promise<ChannelRecord[]> {
+  const conn = db ?? await getDb();
+  const res = await conn.query(`SELECT * FROM channels WHERE country_status='REJECTED' OR scan_status='SKIPPED_EXCLUDED' OR trading_status='NON_TRADING' OR discord_status='NON_TRADING' ORDER BY first_seen DESC`);
+  return res.rows.map(rowToChannel);
+}
+
 export interface ChannelListingFilter {includeRejected?:boolean;diagnosticsOnly?:boolean;search?:string;country?:string;countryStatus?:string;tradingStatus?:string;discordStatus?:string;scanStatus?:string}
 // This is the single definition of the operator-visible discovery corpus. Keep
 // both the paginated listing and dashboard aggregates anchored to this policy.
