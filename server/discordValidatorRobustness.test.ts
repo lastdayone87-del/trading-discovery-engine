@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { validateDiscordInvite } from './discordValidator';
+import { DISCORD_UNEXPECTED_404_BOUNDED_OBSERVATIONS, validateDiscordInvite } from './discordValidator';
 
 const noopEmit = async () => {};
 const json = (body: unknown, status = 200) =>
@@ -90,6 +90,49 @@ test('404 without unknown-invite code stays retryable and inconclusive', async (
   assert.equal(result.retryable, true);
   assert.notEqual(result.status, 'DEAD');
   assert.equal(result.inviteUrl, null);
+});
+
+// The unexpected-404 class (e.g. provider error 50270) is bounded: retryable
+// while the durable observation budget is unspent, terminal at the ceiling.
+test('unexpected 404 provider failure stays bounded-retryable below the observation ceiling', async () => {
+  const result = await validateDiscordInvite(
+    'flakycode50270',
+    opts(async () => json({ code: 50270, message: 'not here' }, 404)),
+  );
+  assert.equal(result.operationalOutcome, 'PROVIDER_FAILURE');
+  assert.equal(result.retryable, true);
+  assert.equal(result.validationStatus, 'RETRY_PENDING');
+  assert.notEqual(result.status, 'DEAD');
+});
+
+test('unexpected 404 provider failure becomes terminal at the observation ceiling', async () => {
+  const result = await validateDiscordInvite(
+    'flakycode50270',
+    opts(
+      async () => json({ code: 50270, message: 'not here' }, 404),
+      { priorProviderFailureObservations: DISCORD_UNEXPECTED_404_BOUNDED_OBSERVATIONS - 1 },
+    ),
+  );
+  assert.equal(result.operationalOutcome, 'PROVIDER_FAILURE');
+  assert.equal(result.retryable, false);
+  assert.equal(result.validationStatus, 'FAILED_OPERATIONAL');
+  assert.equal(result.livenessStatus, 'UNCERTAIN');
+  assert.notEqual(result.status, 'DEAD');
+  assert.notEqual(result.status, 'ACTIVE');
+  assert.match(String(result.relevanceReason || ''), /bounded/);
+});
+
+test('unknown-invite 10006 confirmation contract is unchanged by the bounded-404 policy', async () => {
+  const result = await validateDiscordInvite(
+    'deadcode1',
+    opts(
+      async () => json({ code: 10006, message: 'Unknown Invite' }, 404),
+      { priorProviderFailureObservations: DISCORD_UNEXPECTED_404_BOUNDED_OBSERVATIONS },
+    ),
+  );
+  assert.equal(result.operationalOutcome, 'INVALID_OBSERVED');
+  assert.equal(result.retryable, true);
+  assert.notEqual(result.status, 'DEAD');
 });
 
 // Rate limiting is retried, then parked — never invalid.

@@ -28,7 +28,18 @@ interface OperationsCounters {
   invalidApiKeyQuarantinesTotal: number;
 }
 
-function freshCounters(): OperationsCounters {
+interface CommunityRecoveryCounters {
+  /** Recovery cycles that durably enqueued a bounded enrichment recovery job. */
+  operationalEnrichmentRecoveryEnqueuedTotal: number;
+  /** Cycle event key collisions: an idempotent duplicate, never a second enqueue. */
+  operationalEnrichmentRecoveryDuplicateEventsTotal: number;
+  /** Channels that exhausted the bounded recovery cycle ceiling. */
+  operationalEnrichmentRecoveryExhaustedTotal: number;
+  /** Proven RENDERED_FALLBACK_SATURATED capacity deferrals (no work started). */
+  communitySaturationDeferralsTotal: number;
+}
+
+function freshCounters(): OperationsCounters & CommunityRecoveryCounters {
   return {
     gate1EvaluationsTotal: {
       REJECT_EXCLUDED: 0,
@@ -47,6 +58,10 @@ function freshCounters(): OperationsCounters {
       UNKNOWN: 0,
     },
     invalidApiKeyQuarantinesTotal: 0,
+    operationalEnrichmentRecoveryEnqueuedTotal: 0,
+    operationalEnrichmentRecoveryDuplicateEventsTotal: 0,
+    operationalEnrichmentRecoveryExhaustedTotal: 0,
+    communitySaturationDeferralsTotal: 0,
   };
 }
 
@@ -90,6 +105,22 @@ export function bumpInvalidApiKeyQuarantine(): void {
   counters.invalidApiKeyQuarantinesTotal += 1;
 }
 
+export function bumpOperationalEnrichmentRecoveryEnqueued(): void {
+  counters.operationalEnrichmentRecoveryEnqueuedTotal += 1;
+}
+
+export function bumpOperationalEnrichmentRecoveryDuplicateEvent(): void {
+  counters.operationalEnrichmentRecoveryDuplicateEventsTotal += 1;
+}
+
+export function bumpOperationalEnrichmentRecoveryExhausted(): void {
+  counters.operationalEnrichmentRecoveryExhaustedTotal += 1;
+}
+
+export function bumpCommunitySaturationDeferral(): void {
+  counters.communitySaturationDeferralsTotal += 1;
+}
+
 /**
  * Idempotency guard for job-disposition telemetry. failJob performs its writes
  * outside a transaction: if a secondary bookkeeping write fails after the job
@@ -125,13 +156,17 @@ export function jobDispositionExecutionKey(
   return `job:${String(jobId)}:attempt:${String(attempts)}`;
 }
 
-export function operationsTelemetrySnapshot(): OperationsCounters {
+export function operationsTelemetrySnapshot(): OperationsCounters & CommunityRecoveryCounters {
   return {
     gate1EvaluationsTotal: { ...counters.gate1EvaluationsTotal },
     repeatFailureSkipsTotal: counters.repeatFailureSkipsTotal,
     repeatFailureHistoryOutagesTotal: counters.repeatFailureHistoryOutagesTotal,
     jobFailureDispositionsTotal: { ...counters.jobFailureDispositionsTotal },
     invalidApiKeyQuarantinesTotal: counters.invalidApiKeyQuarantinesTotal,
+    operationalEnrichmentRecoveryEnqueuedTotal: counters.operationalEnrichmentRecoveryEnqueuedTotal,
+    operationalEnrichmentRecoveryDuplicateEventsTotal: counters.operationalEnrichmentRecoveryDuplicateEventsTotal,
+    operationalEnrichmentRecoveryExhaustedTotal: counters.operationalEnrichmentRecoveryExhaustedTotal,
+    communitySaturationDeferralsTotal: counters.communitySaturationDeferralsTotal,
   };
 }
 
@@ -143,4 +178,8 @@ export function resetOperationsTelemetry(): void {
   counters.repeatFailureHistoryOutagesTotal = fresh.repeatFailureHistoryOutagesTotal;
   counters.jobFailureDispositionsTotal = fresh.jobFailureDispositionsTotal;
   counters.invalidApiKeyQuarantinesTotal = fresh.invalidApiKeyQuarantinesTotal;
+  counters.operationalEnrichmentRecoveryEnqueuedTotal = fresh.operationalEnrichmentRecoveryEnqueuedTotal;
+  counters.operationalEnrichmentRecoveryDuplicateEventsTotal = fresh.operationalEnrichmentRecoveryDuplicateEventsTotal;
+  counters.operationalEnrichmentRecoveryExhaustedTotal = fresh.operationalEnrichmentRecoveryExhaustedTotal;
+  counters.communitySaturationDeferralsTotal = fresh.communitySaturationDeferralsTotal;
 }

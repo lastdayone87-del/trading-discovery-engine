@@ -34,6 +34,7 @@ import {
   deleteDiscordCandidates,
   selectDiscordCandidate,
   countDiscordInvalidObservations,
+  countDiscordProviderFailureObservations,
   appendExternalAcquisitionObservations,
   getNeighborhoodForQueryRun,
   markCommunityInspectionStarted,
@@ -93,6 +94,7 @@ import { recordExecutionStage, withExecutionTrace } from './executionTrace';
 import { recordNomination } from './candidateAdmission/store';
 import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
 import { triggerPhaseBObservationReconciliation } from './phaseBObservationOutbox';
+import { bumpCommunitySaturationDeferral } from './operationsTelemetry';
 import { canContinueCommunityInspectionAfterDegradedManualClassification } from './manualRecheckPolicy';
 import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_RETRY_REASON, FOUND_GAP_RETRYABLE_FAILURE_CLASSES, buildCommunityRetryJobMetadata, isAttemptFreeCommunityFailure, attemptFreeDiscordValidation, retryAtFromUnknown, retryReasonFromError, type CommunityRetryDirective} from './communityRetryPolicy';
 import { classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
@@ -591,6 +593,10 @@ export async function processNextSearchJob(
       const directive=inspectionResult?inspectionResult.retryDirective:undefined;
       if(directive?.attemptFree&&directive.retryReason===COMMUNITY_RETRY_REASON.BROWSER_RUNTIME_UNAVAILABLE){
         const deferred=Object.assign(new Error(`Community acquisition deferred: ${directive.reason}`),{code:directive.code,retryable:true,retryAt:directive.retryAt});
+        // Observability for the dominant saturation-deferral path: the
+        // RENDERED_FALLBACK_SATURATED class rejects before admission, so this
+        // deferral proves no acquisition work started and stays attempt-free.
+        if(String(directive.reason||'').includes('RENDERED_FALLBACK_SATURATED'))bumpCommunitySaturationDeferral();
         throw deferred;
       }
       const refreshed=await getChannelById(channel.channel_id);
@@ -1665,6 +1671,10 @@ export async function inspectAndValidateChannel(
         if(!candidate.nativeInviteCode)continue;
         const locator=candidate.normalizedLocator||`https://discord.gg/${candidate.nativeInviteCode}`;
         const priorInvalidObservations=await countDiscordInvalidObservations(channel.channel_id,candidate.candidateId,locator);
+        // Bounded unexpected-404 budget (e.g. provider error 50270): after the
+        // durable observation ceiling the lookup is terminal instead of
+        // re-arming RETRY_PENDING forever.
+        const priorProviderFailureObservations=await countDiscordProviderFailureObservations(channel.channel_id,candidate.candidateId,locator);
         const validation=await validateDiscordInvite(candidate.nativeInviteCode,{
           parentContext:{
             tradingStatus:channel.trading_status,
@@ -1676,7 +1686,8 @@ export async function inspectAndValidateChannel(
             ownershipStatus:candidate.ownershipStatus,
             ownershipConfidence:candidate.ownershipConfidence
           },
-          priorInvalidObservations
+          priorInvalidObservations,
+          priorProviderFailureObservations
         });
         await appendDiscordCheckAttempts(channel.channel_id,validation.candidateInviteUrl,validation.status,validation.attempts,{candidateId:candidate.candidateId,rawLocator:candidate.rawLocator,locatorType:candidate.locatorType,resolvedLocator:validation.candidateInviteUrl,sourceSurface:candidate.sourceSurface,sourceUrl:candidate.sourceUrl});
         if(validation.operationalOutcome==='CONFIRMED_INVALID'){terminalInvalid.push(validation);continue;}
@@ -1924,6 +1935,9 @@ export async function enqueueCommunityAcquisitionRetry(channelId:string,directiv
     retryReason:directive?.retryReason||'COMMUNITY_REQUIRED_ACQUISITION_FAILURE',
     retrySource:source
   });
+  // Saturation deferrals scheduled from a fresh inspection never pass through
+  // the retry-worker deferral branch; count them at the durable enqueue point.
+  if(String(directive?.reason||'').includes('RENDERED_FALLBACK_SATURATED'))bumpCommunitySaturationDeferral();
   const job=await enqueueJob('RETRY_COMMUNITY_ACQUISITION',{channelId,...metadata},{idempotencyKey:communityAcquisitionRetryKey(channelId),priority:15,maxAttempts:5,runAfter:directive?.retryAt?new Date(directive.retryAt).toISOString():undefined,clientOverride});
   // Preserve a pending job's original ownership and retry window while merging
   // the latest attributable reason into its durable payload.

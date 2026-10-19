@@ -53,7 +53,7 @@ test('manual, enrichment, and autonomous state transitions reuse the durable job
 test('an expired provider retryAt is terminal at the final bounded attempt', () => {
   const now = 10_000;
   const decision = decideJobFailure({code:'YOUTUBE_PROVIDERS_COOLING_DOWN',retryAt:now-1},3,3,now);
-  assert.deepEqual(decision,{disposition:'FAILED'});
+  assert.deepEqual(decision,{disposition:'FAILED',operationallyBlocked:true});
   assert.deepEqual(decideJobFailure(new Error('genuine enrichment failure'),3,3,now),{disposition:'FAILED'});
 });
 

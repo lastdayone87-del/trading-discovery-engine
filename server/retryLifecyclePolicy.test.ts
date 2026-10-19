@@ -19,7 +19,7 @@ test('community acquisition capacity failure is attempt-free and honors provider
 test('provider cooldown honors retryAt while consuming the bounded attempt budget',()=>{
   const retryAt=now+60_000;
   assert.deepEqual(decideJobFailure({code:'YOUTUBE_PROVIDERS_COOLING_DOWN',retryAt},2,3,now),{disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:retryAt});
-  assert.deepEqual(decideJobFailure({code:'YOUTUBE_PROVIDERS_COOLING_DOWN',retryAt},3,3,now),{disposition:'FAILED'});
+  assert.deepEqual(decideJobFailure({code:'YOUTUBE_PROVIDERS_COOLING_DOWN',retryAt},3,3,now),{disposition:'FAILED',operationallyBlocked:true});
 });
 
 test('provider pool exhaustion becomes terminal at max attempts',()=>{

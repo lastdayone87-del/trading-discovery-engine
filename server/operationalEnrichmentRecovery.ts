@@ -1,5 +1,6 @@
 import type { ChannelRecord } from '../src/types';
 import { evaluateLowAudienceGate } from './lowAudienceGate';
+import { bumpOperationalEnrichmentRecoveryDuplicateEvent, bumpOperationalEnrichmentRecoveryEnqueued, bumpOperationalEnrichmentRecoveryExhausted } from './operationsTelemetry';
 
 export const OPERATIONAL_ENRICHMENT_RECOVERY_COOLDOWN_MS = 24 * 60 * 60_000;
 
@@ -105,6 +106,48 @@ export async function projectProviderDeferredEnrichment(
 
 export type EnqueueOperationalEnrichmentRecovery = (channel: ChannelRecord, reasonCodes: string[]) => Promise<void>;
 
+export const OPERATIONAL_ENRICHMENT_RECOVERY_POLICY_VERSION = 'operational-enrichment-recovery-v2';
+
+/**
+ * Explicit ceiling on recovery cycles per channel. Each recorded cycle is one
+ * durable recovery enqueue after the 24h cooldown, and enqueueJob reopens a
+ * FAILED row on its channel-scoped idempotency key, so without a ceiling a
+ * provider-blocked channel could be resurrected every cooldown forever. At the
+ * ceiling the reconciliation writes an idempotent terminal event and never
+ * re-enqueues; the terminal event is also excluded from the selection gate.
+ */
+export const OPERATIONAL_ENRICHMENT_MAX_RECOVERY_CYCLES = 3;
+
+const OPERATIONAL_ENRICHMENT_CYCLE_EVENT_PREFIX = 'operational-enrichment:';
+const OPERATIONAL_ENRICHMENT_TERMINAL_EVENT_PREFIX = 'operational-enrichment-terminal:';
+
+/** Unique per channel/job/attempt/cycle recovery event key for the durable ledger. */
+export function operationalEnrichmentCycleEventKey(channelId: string, jobId: string, attempts: unknown, cycle: number): string {
+  return `${OPERATIONAL_ENRICHMENT_CYCLE_EVENT_PREFIX}${channelId}:${jobId}:attempt:${String(attempts)}:cycle:${Math.max(1, Math.floor(cycle))}`;
+}
+
+/** Idempotent per-channel terminal marker: recovery budget exhausted. */
+export function operationalEnrichmentTerminalEventKey(channelId: string): string {
+  return `${OPERATIONAL_ENRICHMENT_TERMINAL_EVENT_PREFIX}${channelId}`;
+}
+
+async function insertOperationalEnrichmentRecoveryEvent(
+  db: any,
+  eventKey: string,
+  channelId: string,
+  failedJobId: string,
+  priorScanStatus: string,
+  reasonCodes: string[]
+): Promise<boolean> {
+  const inserted = await db.query(
+    `INSERT INTO operational_enrichment_recovery_events(event_key,channel_id,job_id,prior_scan_status,reason_codes,policy_version)
+     VALUES($1,$2,$3,$4,$5::jsonb,$6)
+     ON CONFLICT(event_key) DO NOTHING`,
+    [eventKey, channelId, failedJobId, priorScanStatus, JSON.stringify(reasonCodes), OPERATIONAL_ENRICHMENT_RECOVERY_POLICY_VERSION]
+  );
+  return (Number(inserted?.rowCount) || 0) > 0;
+}
+
 export async function reconcileOperationalEnrichmentRecovery(
   getDb: () => Promise<any>,
   getChannelById: (id: string) => Promise<ChannelRecord | null>,
@@ -116,27 +159,48 @@ export async function reconcileOperationalEnrichmentRecovery(
   if (now - lastOperationalEnrichmentReconciliationAt < 60_000) return 0;
   lastOperationalEnrichmentReconciliationAt = now;
   const db = await getDb();
+  // The failed-job predicate admits both marked terminal failures and the raw
+  // bounded provider-cooling terminal messages persisted before the marker was
+  // added (historical rows). The LATERAL carries the owning job and channel
+  // recovery-cycle count so enqueue idempotency and the cycle ceiling are
+  // decided from durable state, never from process memory.
   const rows = await db.query(
-    `SELECT c.channel_id
+    `SELECT c.channel_id,
+            failed_job.id AS failed_job_id,
+            failed_job.attempts AS failed_job_attempts,
+            (SELECT count(*)::int
+               FROM operational_enrichment_recovery_events cycle_event
+              WHERE cycle_event.channel_id=c.channel_id
+                AND cycle_event.event_key LIKE 'operational-enrichment:%') AS recovery_cycles
        FROM channels c
+       JOIN LATERAL (
+         SELECT failed_job.id, failed_job.attempts
+           FROM jobs failed_job
+          WHERE failed_job.type='ENRICH_CHANNEL'
+            AND failed_job.status='FAILED'
+            AND (failed_job.last_error ILIKE 'OPERATIONALLY_BLOCKED_RETRY_REQUIRED:%'
+                 OR failed_job.last_error ILIKE 'Every configured YouTube provider is cooling down%'
+                 OR failed_job.last_error ILIKE 'YouTube API project pool is quota-exhausted%')
+            AND failed_job.payload->>'channelId'=c.channel_id
+          ORDER BY failed_job.updated_at DESC NULLS LAST, failed_job.created_at DESC NULLS LAST, failed_job.id DESC
+          LIMIT 1
+       ) failed_job ON true
       WHERE c.scan_status IN('FAILED','FAILED_PERMANENT','PROVIDER_DEFERRED')
         AND c.trading_status IS DISTINCT FROM 'NON_TRADING'
         AND c.trading_status IS DISTINCT FROM 'HUMAN_REJECTED'
         AND c.discord_validation_status IS DISTINCT FROM 'COMPLETED'
         AND c.country_status IS DISTINCT FROM 'REJECTED'
         AND (c.last_checked IS NULL OR c.last_checked < now() - interval '24 hours')
-        AND EXISTS (
-          SELECT 1 FROM jobs failed_job
-           WHERE failed_job.type='ENRICH_CHANNEL'
-             AND failed_job.status='FAILED'
-             AND failed_job.last_error ILIKE 'OPERATIONALLY_BLOCKED_RETRY_REQUIRED:%'
-             AND failed_job.payload->>'channelId'=c.channel_id
-        )
         AND NOT EXISTS (
           SELECT 1 FROM jobs active_job
            WHERE active_job.type IN('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION')
              AND active_job.status IN('PENDING','PROCESSING')
              AND active_job.payload->>'channelId'=c.channel_id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM operational_enrichment_recovery_events terminal_event
+           WHERE terminal_event.channel_id=c.channel_id
+             AND terminal_event.event_key LIKE 'operational-enrichment-terminal:%'
         )
       ORDER BY c.last_checked ASC NULLS FIRST
       LIMIT $1`,
@@ -146,6 +210,26 @@ export async function reconcileOperationalEnrichmentRecovery(
   for (const row of rows.rows) {
     const channel = await getChannelById(row.channel_id);
     if (!channel) continue;
+    const failedJobId = String(row.failed_job_id || '');
+    const recoveryCycles = Number(row.recovery_cycles) || 0;
+    if (recoveryCycles >= OPERATIONAL_ENRICHMENT_MAX_RECOVERY_CYCLES) {
+      // Budget exhausted: record the idempotent terminal marker once and stop.
+      // No channel mutation and no enqueue — the channel stays in its truthful
+      // operational-failure projection and can never be reopened by recovery.
+      const marked = await insertOperationalEnrichmentRecoveryEvent(
+        db,
+        operationalEnrichmentTerminalEventKey(channel.channel_id),
+        channel.channel_id,
+        failedJobId,
+        channel.scan_status,
+        ['OPERATIONAL_RECOVERY_ATTEMPTS_EXHAUSTED']
+      );
+      if (marked) {
+        bumpOperationalEnrichmentRecoveryExhausted();
+        console.warn(JSON.stringify({event:'operational_enrichment_recovery_exhausted',channelId:channel.channel_id,failedJobId,recoveryCycles,maxRecoveryCycles:OPERATIONAL_ENRICHMENT_MAX_RECOVERY_CYCLES,timestamp:new Date(now).toISOString()}));
+      }
+      continue;
+    }
     // A stored known-low count must not re-enter enrichment through recovery:
     // project the low-audience skip instead of re-enqueueing.
     if (evaluateLowAudienceGate(channel.subscriber_count).shouldSkipDeepEnrichment) {
@@ -163,6 +247,23 @@ export async function reconcileOperationalEnrichmentRecovery(
     } catch (error) {
       await upsertChannel(channel);
       throw error;
+    }
+    // Record the cycle after the enqueue committed: a crash between the two
+    // leaves the channel reactivated with durable work (safe), and a concurrent
+    // duplicate collides on the event key instead of producing a second cycle.
+    const recorded = await insertOperationalEnrichmentRecoveryEvent(
+      db,
+      operationalEnrichmentCycleEventKey(channel.channel_id, failedJobId, row.failed_job_attempts, recoveryCycles + 1),
+      channel.channel_id,
+      failedJobId,
+      channel.scan_status,
+      decision.reasonCodes
+    );
+    if (recorded) {
+      bumpOperationalEnrichmentRecoveryEnqueued();
+      console.info(JSON.stringify({event:'operational_enrichment_recovery_enqueued',channelId:channel.channel_id,failedJobId,cycle:recoveryCycles+1,maxRecoveryCycles:OPERATIONAL_ENRICHMENT_MAX_RECOVERY_CYCLES,reasonCodes:decision.reasonCodes,timestamp:new Date(now).toISOString()}));
+    } else {
+      bumpOperationalEnrichmentRecoveryDuplicateEvent();
     }
     reconciled++;
   }
