@@ -28,6 +28,8 @@ function makeStore() {
         candidates: row.candidates,
         observations: row.observations,
         renderedCovered: row.renderedCovered,
+        sourceChannelId: row.sourceChannelId ?? null,
+        claimStatus: row.claimStatus ?? 'NONE',
         provenance: row.provenance ?? {},
         firstObservedAt: prior?.firstObservedAt ?? now,
         lastObservedAt: now,
@@ -38,7 +40,15 @@ function makeStore() {
       for (const link of recorded) links.push({ channelId, ...link });
     },
   };
-  return { store, rows, links };
+  // Test-side mirror of queueManager.markSiteInspectionsClaimed: production
+  // flips PENDING rows once admission commits. Tests that model a completed
+  // pipeline call this between inspections.
+  const markClaimed = (channelId: string) => {
+    for (const row of rows.values()) {
+      if (row.sourceChannelId === channelId && row.claimStatus === 'PENDING') row.claimStatus = 'CLAIMED';
+    }
+  };
+  return { store, rows, links, markClaimed };
 }
 
 const DESCS = ['d1', 'd2', 'd3', 'd4', 'd5'];
@@ -58,7 +68,7 @@ function makeFetch(fetched: string[]) {
 }
 
 test('Trader A/B: shared affiliate site is crawled once; coverage reused, discoveries never transferred', async () => {
-  const { store, rows, links } = makeStore();
+  const { store, rows, links, markClaimed } = makeStore();
   const fetched: string[] = [];
   const fetchImpl = makeFetch(fetched);
   const base = { videoDescriptions: DESCS, externalFetchImpl: fetchImpl, urlFailureHistoryLoader: async () => [], siteInspectionStore: store } as const;
@@ -81,12 +91,18 @@ test('Trader A/B: shared affiliate site is crawled once; coverage reused, discov
   );
 
   const before = fetched.length;
+  // The pipeline admits Trader A's candidates and flips its cache rows to
+  // CLAIMED (queueManager.markSiteInspectionsClaimed) before anyone else can
+  // borrow the affiliate's coverage.
+  markClaimed('UCTraderA00000000000001');
   const b = await runChannelInspection({
     ...base,
     channelId: 'UCTraderB00000000000002',
     channelName: 'Trader B',
     channelBio: 'Another educator',
-    channelLinks: ['https://soso.com', 'https://apextrader.com/'],
+    // Same covered path: strict (default) FOUND borrowing requires path
+    // coverage, so B's request must match the covered /pricing page.
+    channelLinks: ['https://soso.com', 'https://apextrader.com/pricing'],
   });
   assert.equal(fetched.length, before + 1, 'only the new site is fetched for Trader B');
   assert.deepEqual(fetched.slice(before), ['https://soso.com/'], 'no second affiliate crawl');
@@ -94,7 +110,7 @@ test('Trader A/B: shared affiliate site is crawled once; coverage reused, discov
 
   const borrowed = (b.acquisitionOutcomes || []).filter(item => (item as unknown as Record<string, unknown>).siteCacheHit === true);
   assert.ok(borrowed.length >= 1, 'Trader B carries borrowed site observations');
-  assert.ok(borrowed.every(item => item.requestedUrl === 'https://apextrader.com/'), 'borrowed rows are re-attributed to Trader B');
+  assert.ok(borrowed.every(item => item.requestedUrl === 'https://apextrader.com/pricing'), 'borrowed rows are re-attributed to Trader B');
   assert.ok(borrowed.every(item => item.surface === 'CREATOR_WEBSITES'));
   // Cross-creator invariant: coverage is reused, discoveries are not. Trader
   // B never crawled the affiliate, so Trader A's invite must not surface for
@@ -282,7 +298,7 @@ function makeCoexistFetch(fetched: string[]) {
 }
 
 test('shared shortener host: distinct wrappers coexist, resolve independently, never cross-borrow', async () => {
-  const { store, rows } = makeStore();
+  const { store, rows, markClaimed } = makeStore();
   const fetched: string[] = [];
   const fetchImpl = makeCoexistFetch(fetched);
   const base = { videoDescriptions: DESCS, externalFetchImpl: fetchImpl, urlFailureHistoryLoader: async () => [], siteInspectionStore: store } as const;
@@ -292,6 +308,9 @@ test('shared shortener host: distinct wrappers coexist, resolve independently, n
 
   await run('UCShortCoexist000001', 'Wrapper A', 'https://shortener.com/a');
   await run('UCShortCoexist000002', 'Wrapper B', 'https://shortener.com/b');
+  // Admission committed for each wrapper's own destination row.
+  markClaimed('UCShortCoexist000001');
+  markClaimed('UCShortCoexist000002');
   const alias = rows.get('shortener.com');
   assert.equal(alias?.outcome, 'REDIRECTED', 'one shared alias row');
   assert.equal((alias?.observations as unknown[]).length, 2, 'both bindings coexist instead of overwriting');
@@ -310,6 +329,7 @@ test('shared shortener host: distinct wrappers coexist, resolve independently, n
   assert.ok(!(revisitB.discordCandidates || []).some(c => c.nativeInviteCode === 'invitea' || c.nativeInviteCode === 'inviteb'));
 
   await run('UCShortCoexist000005', 'Wrapper C', 'https://shortener.com/c');
+  markClaimed('UCShortCoexist000005');
   assert.equal((rows.get('shortener.com')?.observations as unknown[]).length, 3, 'same-destination wrappers accumulate bindings');
   const beforeCRevisit = fetched.length;
   const revisitC = await run('UCShortCoexist000006', 'Wrapper C again', 'https://shortener.com/c');
@@ -481,7 +501,7 @@ test('repeat-failure skip stays authoritative over cache borrowing', async () =>
 });
 
 test('retry on complete coverage still borrows; only incomplete sites reacquire', async () => {
-  const { store } = makeStore();
+  const { store, markClaimed } = makeStore();
   const fetched: string[] = [];
   const fetchImpl = makeFetch(fetched);
   const base = { videoDescriptions: DESCS, externalFetchImpl: fetchImpl, urlFailureHistoryLoader: async () => [], siteInspectionStore: store } as const;
@@ -496,6 +516,8 @@ test('retry on complete coverage still borrows; only incomplete sites reacquire'
   assert.equal(first.foundInvite, 'apexroom', 'first inspection discovers its own invite');
   const afterFirst = fetched.length;
   assert.ok(afterFirst >= 1, 'first inspection crawls');
+  // The pipeline admitted the invite; the row is now neutral coverage.
+  markClaimed('UCRetryOwned00000001');
 
   // The first crawl completed the row, so even a retry-owned run borrows it:
   // there is no incomplete coverage to reacquire. Incomplete rows (covered
@@ -516,7 +538,7 @@ test('retry on complete coverage still borrows; only incomplete sites reacquire'
     channelId: 'UCRetryOther00000002',
     channelName: 'Other Creator',
     channelBio: 'Another educator',
-    channelLinks: ['https://apextrader.com/'],
+    channelLinks: ['https://apextrader.com/pricing'],
   });
   assert.equal(fetched.length, beforeBorrow, 'later creator performs zero fetches on fresh coverage');
   assert.equal(other.foundInvite, null, 'later creator receives no borrowed invite');
@@ -538,7 +560,7 @@ test('retry reacquires only the incomplete site; fresh covered sites still borro
     return new Response('<html><body>plain creator site</body></html>', { status: 200, headers: { 'content-type': 'text/html' } });
   }) as typeof fetch;
   const now = new Date().toISOString();
-  const seedRow = (identity: string, outcome: string, retryable: boolean, invite: string | null) => rows.set(identity, {
+  const seedRow = (identity: string, outcome: string, retryable: boolean, invite: string | null, claimStatus = 'NONE') => rows.set(identity, {
     siteIdentity: identity,
     identityTier: 'A',
     identityBasis: 'ICANN registrable domain',
@@ -553,16 +575,18 @@ test('retry reacquires only the incomplete site; fresh covered sites still borro
     candidates: invite ? [{ candidateId: `${identity}-c1`, nativeInviteCode: invite, sourceUrl: `https://${identity}/` }] : [],
     observations: [{ requestedUrl: `https://${identity}/`, rootUrl: `https://${identity}/`, outcome, retryable, detail: 'injected', observedAt: now }],
     renderedCovered: false,
+    claimStatus,
     provenance: {},
     firstObservedAt: now,
     lastObservedAt: now,
     observedCount: 1,
   });
   // Site A: incomplete/retryable coverage owning the retry. Sites B and C:
-  // fresh complete coverage, each holding another creator's invite.
+  // fresh complete coverage (admission already committed — CLAIMED), each
+  // holding another creator's invite.
   seedRow('site-a.example', 'PARTIALLY_INSPECTED', true, null);
-  seedRow('site-b.example', 'FOUND', false, 'invite-b');
-  seedRow('site-c.example', 'INSPECTED_NO_MATCH', false, 'invite-c');
+  seedRow('site-b.example', 'FOUND', false, 'invite-b', 'CLAIMED');
+  seedRow('site-c.example', 'FOUND', false, 'invite-c', 'CLAIMED');
 
   const result = await runChannelInspection({
     videoDescriptions: DESCS,

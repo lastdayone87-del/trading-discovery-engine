@@ -80,12 +80,14 @@ test('foundInvite for an unknown invite keeps the legacy path', () => {
   assert.equal(r.discoveredInvite, 'NEWCODE');
 });
 
-test('unparseable values fail open to legacy behavior', () => {
-  const weird = { ...cand('okcode1'), nativeInviteCode: 'not an invite!!' };
-  const r = admitDiscordCandidates([weird], null, new Set());
-  assert.equal(r.candidates.length, 1);
+test('unparseable legacy foundInvite values fail closed: they never become candidates', () => {
+  // P1 extraction integrity: prose/fragments are not invite codes. The
+  // legacy foundInvite path only admits values whose code canonicalizes.
   const legacy = admitDiscordCandidates([], 'some free text', new Set());
-  assert.equal(legacy.candidates.length, 1);
+  assert.equal(legacy.candidates.length, 0);
+  assert.equal(legacy.discoveredInvite, null);
+  const valid = admitDiscordCandidates([], 'discord.gg/valroom', new Set(['valroom']));
+  assert.equal(valid.candidates.length, 1, 'canonicalizable legacy values still take the legacy path');
 });
 
 test('mixed batch keeps admitted and drops duplicates independently', () => {
@@ -137,12 +139,14 @@ test('legacy foundInvite is persisted, claimed, and admitted when structured los
       calls.push({ op: 'claim', arg: items.map(i => i.code) });
       return items.map(i => ({ code: i.code, admitted: true, firstChannelId: 'chanX' }));
     },
-    removeLosers: async (channelId: string, codes: string[], onlyNewerThan?: string) => {
+    removeLosers: async (channelId: string, codes: string[], candidateIds: string[], onlyNewerThan?: string) => {
       calls.push({ op: 'delete', arg: codes });
+      assert.ok(Array.isArray(candidateIds) && candidateIds.length >= codes.length, 'loser delete carries execution-scoped candidate ids');
       assert.ok(typeof onlyNewerThan === 'string' && !Number.isNaN(Date.parse(onlyNewerThan)), 'loser delete carries a provisional watermark');
       assert.ok(Date.parse(onlyNewerThan as string) <= Date.now(), 'watermark predates the delete');
       return codes.length;
     },
+    executionNow: async () => new Date().toISOString(),
   };
   // Structured OLD1 loses globally, but the trail foundInvite names an
   // unevaluated NEW2: legacy path persists, claims, and admits it.
@@ -155,6 +159,7 @@ test('legacy foundInvite is persisted, claimed, and admitted when structured los
         : { code: i.code, admitted: false, firstChannelId: 'chanOther' });
     },
     removeLosers: deps.removeLosers,
+    executionNow: deps.executionNow,
   };
   const result = await admitInspectionDiscordCandidates([mkCand('OLD1')] as never, 'NEW2', 'chanX', ownedByOther as never);
   assert.deepEqual(calls.map(c => c.op), ['persist', 'claim', 'persist', 'claim', 'delete']);
@@ -166,7 +171,10 @@ test('reconcile and validation share one admitted inspection view', async () => 
   const fs = await import('node:fs');
   const { fileURLToPath } = await import('node:url');
   const source = fs.readFileSync(fileURLToPath(new URL('./queueManager.ts', import.meta.url)), 'utf8');
-  assert.match(source, /reconcileDiscordDiscoveryFromInspection\(channel, admittedInspection,/);
+  // The validation branch reconciles the ADMITTED view (post-claim, post-drain)
+  // — never the raw inspection — so validation and discovery projection can
+  // never disagree about which candidates this execution owns.
+  assert.match(source, /reconcileDiscordDiscoveryFromInspection\(channel,\s*admittedInspection,\s*\{validationProjected:true\}\)/);
 });
 
 test('foundInvite naming an unevaluated code is claimed, not suppressed', () => {
@@ -182,12 +190,21 @@ test('foundInvite naming an unevaluated code is claimed, not suppressed', () => 
   assert.equal(r.discardedCount, 1);
 });
 
-test('duplicate-only inspection preserves an already-validated Discord state', async () => {
+test('live country rejection preserves existing Discord state and returns before the claim', async () => {
   const fs = await import('node:fs');
   const { fileURLToPath } = await import('node:url');
   const source = fs.readFileSync(fileURLToPath(new URL('./queueManager.ts', import.meta.url)), 'utf8');
-  const gateIdx = source.indexOf('if (!hasInspectionFailure && !hasCandidate && !alreadyValidatedDiscord) {');
-  assert.ok(gateIdx >= 0, 'validated-success guard exists on the duplicate-only absence projection');
+  const rejectionIdx = source.indexOf("if (liveCountry.status === 'REJECTED') {");
+  const claimIdx = source.indexOf('await admitInspectionDiscordCandidates(');
+  assert.ok(rejectionIdx >= 0, 'live rejection path exists');
+  assert.ok(rejectionIdx < claimIdx, 'P2: a rejected creator is decided before the authoritative claim');
+  const rejectionBlock = source.slice(rejectionIdx, claimIdx);
+  // Nothing was admitted this run, so the existing Discord state is preserved
+  // exactly: no NOT_FOUND projection, no candidate persistence, no claim.
+  assert.ok(!rejectionBlock.includes("channel.discord_status='NOT_FOUND'"), 'duplicate-only absence is never projected over existing state');
+  assert.ok(!rejectionBlock.includes('persistDiscordCandidates'));
+  assert.ok(!rejectionBlock.includes('claimDiscordInvites'));
+  assert.match(rejectionBlock, /applyLiveCountryRejectionToInspected\(channel, liveCountry, now\);/);
 });
 
 test('choke invokes persist, claim, delete in order with correct payloads', async () => {
@@ -211,10 +228,13 @@ test('choke invokes persist, claim, delete in order with correct payloads', asyn
       calls.push({ op: 'claim', arg: items.map(i => i.code) });
       return items.map(i => ({ code: i.code, admitted: i.code !== 'old1', firstChannelId: i.code !== 'old1' ? 'chanX' : 'chanOther' }));
     },
-    removeLosers: async (channelId: string, codes: string[]) => {
+    removeLosers: async (channelId: string, codes: string[], candidateIds: string[], onlyNewerThan: string) => {
       calls.push({ op: 'delete', arg: codes });
+      assert.ok(candidateIds.length === codes.length && candidateIds.includes('test:OLD1'), 'execution-scoped candidate ids travel with the loser delete');
+      assert.ok(typeof onlyNewerThan === 'string', 'DB-clock watermark present');
       return codes.length;
     },
+    executionNow: async () => '2026-10-19T00:00:00.000Z',
   };
   const result = await admitInspectionDiscordCandidates(
     [mkCand('NEW1'), mkCand('OLD1')] as never,
@@ -239,6 +259,7 @@ test('choke claims legacy foundInvite only when nothing admitted', async () => {
       return items.map(i => ({ code: i.code, admitted: true, firstChannelId: 'chanX' }));
     },
     removeLosers: async () => 0,
+    executionNow: async () => new Date().toISOString(),
   };
   // Structured admitted: foundInvite code must NOT be claimed (no parking).
   await admitInspectionDiscordCandidates(

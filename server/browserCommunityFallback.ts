@@ -160,6 +160,24 @@ export interface BrowserFallbackResult {
   requiredUnvisited?: string[];
   requiredTransientFailures?: string[];
   requiredPermanentFailures?: string[];
+  /**
+   * Interaction coverage certificate (v3 completion, all optional/additive):
+   * evidence-bearing controls seen on processed pages, how many were clicked
+   * or failed, and how many were skipped by the click/control budget. A
+   * non-zero failure/skip count means content behind a control was never
+   * examined and the run must not resolve as a clean no-match.
+   */
+  evidenceControlsTotal?: number;
+  evidenceControlsClicked?: number;
+  evidenceControlsFailed?: number;
+  evidenceControlsSkipped?: number;
+  /** True when any evidence-bearing control failed or was skipped: coverage
+   * is incomplete even if every request succeeded. */
+  interactionGap?: boolean;
+  /** True when the required set grew after scroll/click interactions (links
+   * revealed only after the initial snapshot). Diagnostic, never a gap by
+   * itself: newly revealed links classify normally in required coverage. */
+  requiredSnapshotExpanded?: boolean;
 }
 
 export const DEFAULT_BROWSER_FALLBACK_BUDGET: BrowserFallbackBudget = {
@@ -172,7 +190,15 @@ export const DEFAULT_BROWSER_FALLBACK_BUDGET: BrowserFallbackBudget = {
   totalTimeoutMs: 60_000,
 };
 
-export const COMMUNITY_HINTS = /discord|community|join|chat|member|membership|vip|group|private|trading.?room|links?|social|contact|about/i;
+export const COMMUNITY_HINTS = /discord|community|join|chat|member|membership|vip|group|private|trading.?room|links?|social|contact|about|whop|skool|circle|patreon|premium|paid|subscribe|signals?|mentor|access/i;
+
+/**
+ * Interactive controls that can reveal content only through interaction:
+ * links, buttons, ARIA buttons/tabs, native disclosures (`summary`), and
+ * collapsed accordion triggers. The selector is shared by enumeration and
+ * clicking so locator indexes always refer to the same full query.
+ */
+export const RENDERED_CONTROL_SELECTOR = 'a,button,[role="button"],[role="tab"],summary,[aria-expanded="false"]';
 
 /**
  * Telegram channel pages contain a link for virtually every message. Those
@@ -648,6 +674,13 @@ export function resolveRenderedCompletionState(input: {
    * is not coverage proof in that case.
    */
   pageBudgetExhausted?: boolean;
+  /**
+   * Evidence-bearing interaction gap: a control that could reveal community
+   * content failed or was skipped by the click/control budget. An invite can
+   * live behind an unexecuted click, so the run is not complete coverage and
+   * must stay retryable rather than resolving as a clean absence.
+   */
+  interactionGap?: boolean;
 }): { complete: boolean; retryable: boolean; failureClass: 'NO_PAGE_PROCESSED' | undefined } {
   // Processed means actual successfully inspected page evidence — a request
   // merely starting (admitted but never inspected) is zero-page evidence.
@@ -659,8 +692,9 @@ export function resolveRenderedCompletionState(input: {
   // succeeded (the failed child may hold the Discord evidence sought).
   // Timeouts still fail even with pages (expired budget leaves coverage
   // genuinely unknown; reported as partial downstream when pages exist).
-  // Click outcomes never participate: clicks are opportunistic traversal,
-  // not acquisition evidence.
+  // Click failures and skipped evidence-bearing controls stay incomplete:
+  // interaction-gated content is acquisition evidence, not opportunistic
+  // traversal, once a control matches the community-evidence filter.
   const terminalFailures = input.telemetry?.unresolvedFailedRequests || 0;
   // Failures with zero inspected pages also stay incomplete: page evidence is
   // what the Discord search consumes, so failed attempts that never yielded a
@@ -673,7 +707,8 @@ export function resolveRenderedCompletionState(input: {
   // still queued, so an explicit budget cutoff keeps the result incomplete
   // and retryable even when nothing failed.
   const pageBudgetCutoff = input.pageBudgetExhausted === true;
-  const incomplete = !processed || input.timedOut || terminalFailures > 0 || failedWithNoPages || pageBudgetCutoff;
+  const interactionIncomplete = input.interactionGap === true;
+  const incomplete = !processed || input.timedOut || terminalFailures > 0 || failedWithNoPages || pageBudgetCutoff || interactionIncomplete;
   return { complete: !incomplete, retryable: incomplete, failureClass: !processed ? 'NO_PAGE_PROCESSED' : undefined };
 }
 
@@ -1034,6 +1069,16 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   // URLs accumulate in visit order for the shared-evidence registry.
   let seedDocumentSeen = false;
   let seedRequiredLinks: string[] = [];
+  // Interaction coverage certificate state (v3): evidence-bearing controls
+  // seen/clicked/failed/skipped across processed pages, and whether the seed
+  // required set grew after scroll/click interactions.
+  let seedSnapshotUrl = '';
+  let requiredSnapshotExpanded = false;
+  let evidenceControlsSeen = 0;
+  let evidenceControlsClicked = 0;
+  let evidenceControlsFailed = 0;
+  let evidenceControlsSkipped = 0;
+  let interactionGap = false;
   const terminalSuccessUrls: string[] = [];
   // Per visited page, the same-host community-hint links discovered on it
   // (same predicate as the enqueue path): lets callers prove required-set
@@ -1182,6 +1227,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'PAGE_PROCESSED');
             if (!seedDocumentSeen) {
               seedDocumentSeen = true;
+              seedSnapshotUrl = page.url();
               try {
                 seedRequiredLinks = discoverRequiredSeedLinks(await page.content(), page.url());
               } catch {
@@ -1198,7 +1244,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               if (after <= before) break;
             }
 
-            const controls = await page.locator('a,button,[role="button"]').evaluateAll((nodes, pattern) => {
+            const controls = await page.locator(RENDERED_CONTROL_SELECTOR).evaluateAll((nodes, pattern) => {
               const re = new RegExp(pattern, 'i');
               // Bounded candidate pool (64): the click plan partitions the
               // complete matching set FIRST so skipped navigable anchors can
@@ -1217,7 +1263,15 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // (href-less buttons, fragments, JS links, cross-host targets).
             // Slice accounting covers the remainder beyond clicks and skips.
             const clickPlan = partitionRenderedClickTargets(controls, page.url(), limits.maxClicksPerPage);
-            drops.count('control-slice', Math.max(0, controls.length - clickPlan.toClick.length - clickPlan.skippedNavigableAnchors));
+            const sliceDropped = Math.max(0, controls.length - clickPlan.toClick.length - clickPlan.skippedNavigableAnchors);
+            evidenceControlsSeen += controls.length;
+            if (sliceDropped > 0) {
+              // Every enumerated control matched the community-evidence filter;
+              // dropping one for budget means its content was never examined.
+              drops.count('control-slice', sliceDropped);
+              evidenceControlsSkipped += sliceDropped;
+              interactionGap = true;
+            }
             // Shared enqueue admission (single rule definition): already-visited
             // exclusion, then the shared crawl admission boundary, then the
             // community-hint filter. Used by both enqueue passes below.
@@ -1246,10 +1300,18 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               await enqueueLinks({ strategy: 'same-hostname', transformRequestFunction: req => (admitEnqueueRequest(req.url) ? req : false) });
             }
 
-            for (const control of clickPlan.toClick) {
-              if (Date.now() - startedAt >= limits.totalTimeoutMs) break;
-              const locator=page.locator('a,button,[role="button"]').nth(control.index);
-              await attemptRenderedControlClick(createRenderedControlClickDeps({
+            const clickTargets = clickPlan.toClick;
+            for (let clickIndex = 0; clickIndex < clickTargets.length; clickIndex++) {
+              if (Date.now() - startedAt >= limits.totalTimeoutMs) {
+                const skipped = clickTargets.length - clickIndex;
+                evidenceControlsSkipped += skipped;
+                drops.count('control-slice', skipped);
+                interactionGap = true;
+                break;
+              }
+              const control = clickTargets[clickIndex];
+              const locator=page.locator(RENDERED_CONTROL_SELECTOR).nth(control.index);
+              const clickOutcome = await attemptRenderedControlClick(createRenderedControlClickDeps({
                 locator: locator as unknown as RenderedClickEndpoint,
                 page: page as unknown as RenderedClickSettler,
                 control,
@@ -1258,10 +1320,42 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 telemetry,
                 onClicked: () => { clicks++; },
               }));
+              if (clickOutcome.ok) evidenceControlsClicked++;
+              else {
+                // A failed evidence-bearing click may hide the invite; the run
+                // stays incomplete so the gap is retried rather than reported
+                // as a clean absence.
+                evidenceControlsFailed++;
+                interactionGap = true;
+              }
             }
 
             if (Date.now() - startedAt < limits.totalTimeoutMs) {
               await enqueueLinks({strategy:'same-hostname',transformRequestFunction:req=>(admitEnqueueRequest(req.url)?req:false)});
+            }
+            // Required-set re-snapshot (coverage certificate): links revealed by
+            // scrolling or by the click passes are obligations too. Recompute
+            // the seed document's same-host community-hint links after all
+            // interactions and merge new ones into the required set. When a
+            // click navigated the seed document away, current content is no
+            // longer the requested seed page: record the expansion for
+            // diagnostics but never invent required obligations from a
+            // different document (its links were enqueued/inspected instead).
+            if (seedDocumentSeen) {
+              try {
+                const currentUrl = page.url();
+                const sameDocument = normalizeVisitUrl(currentUrl) === normalizeVisitUrl(seedSnapshotUrl);
+                if (sameDocument) {
+                  const known = new Set(seedRequiredLinks);
+                  let added = 0;
+                  for (const link of discoverRequiredSeedLinks(await page.content(), currentUrl)) {
+                    if (!known.has(link)) { known.add(link); added++; }
+                  }
+                  if (added > 0) { seedRequiredLinks = [...known]; requiredSnapshotExpanded = true; }
+                } else {
+                  requiredSnapshotExpanded = true;
+                }
+              } catch { /* snapshot never breaks inspection */ }
             }
             // Success is recorded only after the request's full page-processing
             // lifecycle completes (load, scroll traversal, control enumeration,
@@ -1317,7 +1411,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           : pendingEligibleRequests > 0 && reachedPageBudget;
         const timedOut=Date.now()-startedAt>=limits.totalTimeoutMs;
         telemetry.unresolvedFailedRequests=renderedUnresolvedFailureCount(requestTracker);
-        const completion=resolveRenderedCompletionState({inspectedPages,timedOut,telemetry,pageBudgetExhausted});
+        const completion=resolveRenderedCompletionState({inspectedPages,timedOut,telemetry,pageBudgetExhausted,interactionGap});
         const noPageProcessed=completion.failureClass==='NO_PAGE_PROCESSED';
         const zeroPageReason=resolveRenderedZeroPageReason({inspectedPages,timedOut,saturated:false,browserLaunchFailed:false,thrown:false,telemetry});
         if (zeroPageReason) telemetry.zeroPageReason=zeroPageReason;
@@ -1394,9 +1488,15 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           requiredUnvisited: seedDocumentSeen && requiredUnvisited.length ? requiredUnvisited : undefined,
           requiredTransientFailures: seedDocumentSeen && requiredTransientFailures.length ? requiredTransientFailures : undefined,
           requiredPermanentFailures: seedDocumentSeen && requiredPermanentFailures.length ? requiredPermanentFailures : undefined,
+          evidenceControlsTotal: evidenceControlsSeen || undefined,
+          evidenceControlsClicked: evidenceControlsClicked || undefined,
+          evidenceControlsFailed: evidenceControlsFailed || undefined,
+          evidenceControlsSkipped: evidenceControlsSkipped || undefined,
+          interactionGap: interactionGap || undefined,
+          requiredSnapshotExpanded: requiredSnapshotExpanded || undefined,
           detail:candidates.length
             ? `Rendered fallback retained ${candidates.length} distinct Discord candidate(s) across ${inspectedPages} page(s); ${telemetry.requestsFailed} request(s) failed within the bounded crawl; ${browserFallbackTelemetrySummary(telemetry)}`
-            : timedOut?`Rendered acquisition budget expired before coverage completed; ${browserFallbackTelemetrySummary(telemetry)}`:telemetry.unresolvedFailedRequests>0?`Rendered acquisition incomplete: ${telemetry.unresolvedFailedRequests} request(s) terminally failed within the bounded crawl; ${browserFallbackTelemetrySummary(telemetry)}`:noPageProcessed?`Rendered acquisition incomplete: no page was processed (NO_PAGE_PROCESSED); ${browserFallbackTelemetrySummary(telemetry)}`:`Rendered acquisition completed across ${inspectedPages} page(s) without an invite; ${browserFallbackTelemetrySummary(telemetry)}`,
+            : timedOut?`Rendered acquisition budget expired before coverage completed; ${browserFallbackTelemetrySummary(telemetry)}`:telemetry.unresolvedFailedRequests>0?`Rendered acquisition incomplete: ${telemetry.unresolvedFailedRequests} request(s) terminally failed within the bounded crawl; ${browserFallbackTelemetrySummary(telemetry)}`:noPageProcessed?`Rendered acquisition incomplete: no page was processed (NO_PAGE_PROCESSED); ${browserFallbackTelemetrySummary(telemetry)}`:interactionGap?`Rendered acquisition incomplete: ${evidenceControlsFailed} evidence-bearing control click(s) failed and ${evidenceControlsSkipped} were skipped by the control budget; coverage is not complete; ${browserFallbackTelemetrySummary(telemetry)}`:`Rendered acquisition completed across ${inspectedPages} page(s) without an invite; ${browserFallbackTelemetrySummary(telemetry)}`,
         };
       } catch (error:any) {
         const candidates=mergeDiscordCandidates(discovered);

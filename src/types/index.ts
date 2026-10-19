@@ -17,6 +17,25 @@ export type DiscordResolutionStatus='NOT_ATTEMPTED'|'RESOLVED'|'UNRESOLVED';
 export type DiscordLivenessStatus='NOT_CHECKED'|'ACTIVE'|'INVALID_OBSERVED'|'DEAD'|'UNCERTAIN';
 export type DiscordRelevanceStatus='NOT_CHECKED'|'TRADING_RELEVANT'|'NON_TRADING'|'UNCERTAIN';
 export type DiscordValidationStatus='NOT_STARTED'|'RETRY_PENDING'|'SUCCEEDED'|'FAILED_OPERATIONAL'|'COMPLETED';
+/** Platform community surfaces (paid/private membership products) observed by
+ * inspection. Evidence that a community exists even when no Discord invite can
+ * be verified; never a substitute for a verified Discord invite. */
+export type CommunityPlatform = 'WHOP' | 'SKOOL' | 'CIRCLE' | 'PATREON' | 'OTHER';
+/** Access character of an observed community surface. UNKNOWN means a platform
+ * community URL was observed but the static evidence neither proved paid nor
+ * public access; it is still community evidence, not "no community". */
+export type CommunityIntentKind = 'PUBLIC' | 'PAID' | 'PRIVATE' | 'UNKNOWN';
+export type CommunityDiscoveryStatus = 'NONE' | 'COMMUNITY_INDICATED_NO_INVITE' | 'PAID_COMMUNITY_INDICATED';
+export interface CommunityIntentEvidence {
+  communityPlatform: CommunityPlatform;
+  communityUrl: string;
+  intent: CommunityIntentKind;
+  paidSignals: string[];
+  privateSignals: string[];
+  observedAt: string;
+  sourcePageUrl: string;
+  extractionConfidence: 'EXPLICIT' | 'INFERRED';
+}
 
 export type ScanStatus = 'PENDING' | 'LOCKED' | 'ENRICHMENT_PENDING' | 'ENRICHING' | 'PROVIDER_DEFERRED' | 'NEEDS_REVIEW' | 'COMPLETED' | 'FAILED' | 'FAILED_PERMANENT' | 'SKIPPED_NON_TRADING' | 'SKIPPED_EXCLUDED' | 'SKIPPED_LOW_AUDIENCE';
 
@@ -159,6 +178,11 @@ export interface ChannelRecord {
   discord_relevance_status?: DiscordRelevanceStatus;
   discord_validation_status?: DiscordValidationStatus;
   discord_candidates?: Array<{candidate_id:string;raw_locator:string;normalized_locator:string;display_locator?:string|null;locator_type:string;source_surface?:string;source_url?:string;source_observations?:Array<{sourceSurface?:string;sourceUrl?:string;rawLocator?:string}>;candidate_status:string;validation_status:string;liveness_status:string;relevance_status:string;retryable:boolean;attempt_count:number;last_checked?:string;failure_reason?:string;selected:boolean}>;
+  /** Platform community intent observed by inspection: distinguishes "a
+   * community exists (possibly paid/private) but no Discord invite was
+   * verified" from "no community found". Never carries an invite. */
+  community_discovery_status?: CommunityDiscoveryStatus;
+  community_intents?: CommunityIntentEvidence[] | null;
   post_approval_job_status?: 'PENDING'|'PROCESSING'|'COMPLETED'|'FAILED';
   post_approval_job_error?: string;
   post_approval_job_attempts?: number;

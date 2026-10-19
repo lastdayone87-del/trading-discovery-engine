@@ -233,6 +233,10 @@ export const FOUND_GAP_RETRYABLE_FAILURE_CLASSES = new Set([
   'REQUIRED_UNVISITED_BUDGET_GAP',
   'RENDERED_TIMEOUT',
   'RENDERED_PARTIAL_COVERAGE',
+  // Interaction gap: invite(s) retained but an evidence-bearing control
+  // (join button/tab/accordion) failed or was skipped, so content was never
+  // examined. Unlike ordinary FOUND rows this gap owns bounded recovery.
+  'RENDERED_INTERACTION_GAP',
 ]);
 
 export function isCommunityRetryableObservation(item: CommunityRetryObservation): boolean {

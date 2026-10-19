@@ -725,9 +725,13 @@ test('v2 review: scheduler and worker wiring call sites are pinned', () => {
   assert.match(queue, /shouldScheduleFoundGapAcquisitionRetry\(inspection\)/);
   assert.match(queue, /shouldCompleteSuppressedRetryJob\(inspectionResult,refreshed\?\.scan_status\)/);
   const fallback = readFileSync(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8');
-  const enqueuePos = fallback.indexOf('Capture the original page');
-  const clickPos = fallback.indexOf('for (const control of clickPlan.toClick)');
+  // Capture the original page's anchors before any control click can navigate
+  // the document away; the post-click enqueue then covers JS-revealed links.
+  const enqueuePos = fallback.indexOf("await enqueueLinks({ strategy: 'same-hostname'");
+  const clickPos = fallback.indexOf('const clickTargets = clickPlan.toClick;');
+  const postClickEnqueuePos = fallback.indexOf("await enqueueLinks({strategy:'same-hostname'", clickPos);
   assert.ok(enqueuePos !== -1 && clickPos !== -1 && enqueuePos < clickPos, 'anchors enqueue before navigating clicks');
+  assert.ok(postClickEnqueuePos > clickPos, 'JS-revealed anchors enqueue after clicks');
 });
 
 // REVIEW e2e: a FOUND+required-gap inspection actually creates the durable
@@ -1054,8 +1058,13 @@ test('found-gap retry survives the no-admission NOT_FOUND branch', async () => {
   assert.equal(calls.length, 1, 'exactly one durable retry job must be scheduled');
   assert.equal(calls[0].channelId, 'UCashish0000000000000001');
   assert.equal(calls[0].directive, gapDirective, 'the queued job must contain inspection.retryDirective');
-  assert.equal((channel as { scan_status?: unknown }).scan_status, 'COMPLETED');
-  assert.equal((channel as { discord_status?: unknown }).discord_status, 'NOT_FOUND');
+  // E7 pending-work guard: a FOUND inspection with an outstanding retryable
+  // required gap is not a clean absence. It projects operational failure +
+  // RETRY_PENDING instead of COMPLETED/NOT_FOUND, and the durable retry job
+  // still survives the branch.
+  assert.equal((channel as { scan_status?: unknown }).scan_status, 'FAILED');
+  assert.equal((channel as { discord_status?: unknown }).discord_status, 'UNCERTAIN');
+  assert.equal((channel as { discord_validation_status?: unknown }).discord_validation_status, 'RETRY_PENDING');
   assert.equal((channel as { discord_discovery_status?: unknown }).discord_discovery_status, 'NOT_DISCOVERED');
   // FOUND_COMPLETE (directive absent) schedules nothing; status identical.
   // The clean fixture carries a real retryable FOUND+required-gap outcome so
@@ -1085,7 +1094,9 @@ test('found-gap retry survives the no-admission NOT_FOUND branch', async () => {
     }) as never,
   );
   assert.equal(cleanCalls.length, 0);
-  assert.equal((cleanChannel as { scan_status?: unknown }).scan_status, 'COMPLETED');
+  // The retryable required gap still blocks a clean completion even without a
+  // directive: no job is scheduled, but the channel never claims COMPLETED.
+  assert.equal((cleanChannel as { scan_status?: unknown }).scan_status, 'FAILED');
   // A missing retry directive never schedules, even with gap rows present;
   // a plain FOUND_COMPLETE row without any gap class likewise never does.
   assert.equal(

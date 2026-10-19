@@ -128,11 +128,19 @@ maybe('prune removes obsolete links with expired inspections and keeps current a
   assert.deepEqual(again.rows.map(r => String(r.site_identity)).sort(), leftovers, 'repeat run deletes nothing further');
 });
 
-maybe('site_inspections carries no creator column by schema', async () => {
+maybe('site_inspections carries no borrower ownership attribution column', async () => {
   const { getDb } = await import('./dbCore');
   const db = await getDb();
   const cols = await db.query(`SELECT column_name FROM information_schema.columns WHERE table_name='site_inspections'`);
   const names = cols.rows.map(r => String(r.column_name));
   assert.ok(names.includes('site_identity'), 'cache keyed by site identity');
-  assert.equal(names.some(name => /channel|creator/.test(name)), false, 'no creator attribution column may exist on the global cache');
+  // The global cache must never carry a borrower/owner attribution column:
+  // ownership is re-inferred per borrower, never inherited from the cache.
+  assert.equal(names.some(name => name === 'channel_id' || name === 'creator_id' || name === 'owner_channel_id'), false, 'no ownership attribution column may exist on the global cache');
+  // Recording provenance is the one explicit, nullable exception. It exists
+  // only for the claim handshake and same-owner candidate recovery; a borrower
+  // whose channel differs never receives the recording channel's candidates.
+  const provenance = await db.query(`SELECT is_nullable, data_type FROM information_schema.columns WHERE table_name='site_inspections' AND column_name='source_channel_id'`);
+  assert.equal(provenance.rows.length, 1, 'recording provenance exists for claim handshake + same-owner recovery');
+  assert.equal(provenance.rows[0].is_nullable, 'YES', 'provenance is nullable (legacy rows recover nothing)');
 });

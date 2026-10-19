@@ -6,12 +6,13 @@ import { readFileSync } from 'node:fs';
 // budgets themselves are unchanged (rendered 6/5/4, 60s timeout).
 import {
   COMMUNITY_HINTS,
+  RENDERED_CONTROL_SELECTOR,
   resolveRenderedCompletionState,
 } from './browserCommunityFallback';
 import {
   communityNavigationScore,
-  shouldFollowCommunityTarget,
 } from './inspector';
+import { shouldFollowDestination } from './destinationPolicy';
 import {
   CRAWL_DROP_REASONS,
   createDropCounter,
@@ -32,26 +33,50 @@ test('relevant same-host URL with a recognized community hint is enqueueable', (
   );
 });
 
-test('score-0 URL is dropped, never enqueued', () => {
+test('score-0 same-origin URL stays navigable via the evidence floor; unknown hosts stay closed', () => {
+  // Scoring itself is unchanged: a generic path scores zero.
   assert.equal(communityNavigationScore('https://example.com/blog/market-recap', 'Weekly notes'), 0);
   assert.equal(communityNavigationScore('https://example.com/pricing', 'Plans'), 0);
+  // Destination policy: same-origin pages keep a nonzero floor (the creator's
+  // own site may use an unfamiliar path for its community page).
+  const sameOrigin = shouldFollowDestination({ url: 'https://example.com/pricing', currentUrl: 'https://example.com/' });
+  assert.equal(sameOrigin.eligible, true);
+  assert.equal(sameOrigin.reason, 'same-origin');
+  assert.ok(sameOrigin.score >= 1);
+  // The same generic path on an unknown host never opens a new domain.
+  const crossOrigin = shouldFollowDestination({ url: 'https://unrelated.test/pricing', currentUrl: 'https://example.com/', anchorText: 'Plans' });
+  assert.equal(crossOrigin.eligible, false);
+  assert.equal(crossOrigin.reason, 'no-community-evidence');
 });
 
-test('disallowed cross-origin URL is dropped; allowed hosts stay eligible', () => {
-  assert.equal(shouldFollowCommunityTarget('https://example.com/community', ''), false);
-  assert.equal(shouldFollowCommunityTarget('https://linktr.ee/somecreator', ''), true);
-  assert.equal(shouldFollowCommunityTarget('https://whop.com/some-desk', ''), true);
-  assert.equal(shouldFollowCommunityTarget('not a url', ''), false);
+test('cross-origin destinations follow evidence, not a hard host allowlist', () => {
+  // Known community/link-hub hosts are eligible without anchor evidence.
+  assert.equal(shouldFollowDestination({ url: 'https://linktr.ee/somecreator', currentUrl: 'https://creator.test/' }).eligible, true);
+  assert.equal(shouldFollowDestination({ url: 'https://whop.com/some-desk', currentUrl: 'https://creator.test/' }).eligible, true);
+  // Unknown creators' domains with explicit community evidence are eligible
+  // (the proven false-negative this policy fixes).
+  const evidenced = shouldFollowDestination({ url: 'https://signal-provider.example/community', currentUrl: 'https://creator.test/', anchorText: 'Join our Discord' });
+  assert.equal(evidenced.eligible, true);
+  assert.equal(evidenced.reason, 'community-evidence');
+  // Structured nominations (sitemap/navigation patterns) open a host too.
+  assert.equal(shouldFollowDestination({ url: 'https://unknown.example/portal', currentUrl: 'https://creator.test/', structuredNominated: true }).eligible, true);
+  // Admission-rejected and unparsable URLs are dropped at the shared boundary.
+  assert.equal(shouldFollowDestination({ url: 'not a url', currentUrl: 'https://creator.test/' }).eligible, false);
+  assert.equal(shouldFollowDestination({ url: 'not a url', currentUrl: 'https://creator.test/' }).reason, 'admission-rejected');
+  assert.equal(shouldFollowDestination({ url: 'https://unknown.test/join', currentUrl: 'https://creator.test/', anchorText: 'Member area' }).eligible, true);
+  assert.equal(shouldFollowDestination({ url: 'https://unknown.test/docs', currentUrl: 'https://creator.test/', anchorText: 'Docs' }).eligible, false);
 });
 
-test('rendered hint vocabulary is unchanged (no widening without capacity)', () => {
-  assert.equal(
-    COMMUNITY_HINTS.source,
-    'discord|community|join|chat|member|membership|vip|group|private|trading.?room|links?|social|contact|about'
-  );
-  assert.ok(COMMUNITY_HINTS.test('https://example.com/community'));
+test('rendered hint vocabulary covers community and paid-platform destinations', () => {
+  for (const marker of ['discord', 'community', 'join', 'whop', 'skool', 'circle', 'patreon', 'premium', 'paid', 'subscribe', 'access']) {
+    assert.ok(COMMUNITY_HINTS.test(`https://example.com/${marker}`), `hints must cover ${marker}`);
+  }
+  assert.ok(COMMUNITY_HINTS.test('https://example.com/membership'));
+  assert.ok(COMMUNITY_HINTS.test('https://example.com/mentor'));
   assert.ok(!COMMUNITY_HINTS.test('https://example.com/blog/market-recap'));
   assert.ok(!COMMUNITY_HINTS.test('https://example.com/pricing'));
+  // Interactive control enumeration/click selector is a single shared query.
+  assert.equal(RENDERED_CONTROL_SELECTOR, 'a,button,[role="button"],[role="tab"],summary,[aria-expanded="false"]');
 });
 
 test('drop counter tallies taxonomy reasons only', () => {
@@ -66,6 +91,7 @@ test('drop counter tallies taxonomy reasons only', () => {
   assert.ok(isCrawlDropReason('score-zero'));
   assert.ok(!isCrawlDropReason('bogus-reason'));
   assert.ok(!isCrawlDropReason('cross-origin-allowed'));
+  assert.ok(isCrawlDropReason('destination-budget'));
 });
 
 test('per-link drops are deduped across extraction passes', () => {
@@ -109,13 +135,15 @@ test('telemetry constructors carry drops and scroll usage', () => {
   assert.equal(empty.dropReasons, undefined);
 });
 
-test('static exploration bound is 12 with drop accounting at every rule', () => {
+test('static exploration bound is 12 with destination-budget drop accounting', () => {
   const source = readFileSync(new URL('./inspector.ts', import.meta.url), 'utf8');
   assert.match(source, /while\(queue\.length&&explored<12\)/);
   for (const marker of [
     "countUnique('invalid-protocol'",
-    "countUnique('cross-origin-disallowed'",
-    "countUnique('score-zero'",
+    "shouldFollowDestination(",
+    'createDestinationBudget()',
+    "drops.count('destination-budget')",
+    "seedCeiling??='exploration-limit'",
     "drops.count('duplicate'",
     "drops.count('queue-cap'",
     "drops.count('depth-limit'",
@@ -125,10 +153,8 @@ test('static exploration bound is 12 with drop accounting at every rule', () => 
   ]) {
     assert.ok(source.includes(marker), `missing static wiring: ${marker}`);
   }
-  // Accepted cross-origin links are navigated, never counted as drops.
-  assert.ok(!source.includes("drops.count('cross-origin-allowed')"));
-  assert.equal(CRAWL_DROP_REASONS.length, 15, 'admission-rejected extends the closed taxonomy additively');
-  assert.ok(CRAWL_DROP_REASONS.includes('admission-rejected'));
+  assert.equal(CRAWL_DROP_REASONS.length, 16, 'destination-budget extends the closed taxonomy additively');
+  assert.ok(CRAWL_DROP_REASONS.includes('destination-budget'));
 });
 
 test('rendered control-slice, hint-reject, scroll, and stop accounting are wired', () => {
@@ -226,7 +252,7 @@ test('constructors sanitize drop reasons and scroll usage at construction time',
   assert.deepEqual(dirtyStatic.dropReasons, { 'queue-cap': 999999 });
 });
 
-test('allowed cross-origin community link is navigated without drop counting', async () => {
+test('evidenced cross-origin community link is navigated; unevidenced outbound link is dropped', async () => {
   const { crawlExternalLinks } = await import('./inspector');
   const htmlResponse = (html: string) =>
     new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
@@ -237,22 +263,23 @@ test('allowed cross-origin community link is navigated without drop counting', a
     if (url === 'https://creator.test/')
       return htmlResponse(
         '<a href="https://linktr.ee/creator">Linktree community</a>' +
-        '<a href="https://evil.test/community">External community</a>'
+        '<a href="https://outside.test/prices">Pricing plans</a>'
       );
     return htmlResponse('<p>Leaf page without invite.</p>');
   }) as typeof fetch;
   const result = await crawlExternalLinks(['https://creator.test/'], [], undefined, fakeFetch);
-  // The allowlisted cross-origin link is eligible and fetched…
-  assert.ok(calls.includes('https://linktr.ee/creator'), 'allowlisted cross-origin link must be navigated');
-  // …while the disallowed one is neither fetched nor silently ignored.
-  assert.ok(!calls.includes('https://evil.test/community'), 'disallowed cross-origin link must not be fetched');
+  // The known community host is eligible and fetched…
+  assert.ok(calls.includes('https://linktr.ee/creator'), 'known community host must be navigated');
+  // …while an outbound link with no community evidence is neither fetched nor
+  // silently ignored.
+  assert.ok(!calls.includes('https://outside.test/prices'), 'unevidenced cross-origin link must not be fetched');
   const seed = result.observations.find(item => item.requestedUrl === 'https://creator.test/');
   const drops = (seed?.telemetry as { dropReasons?: Record<string, number> } | undefined)?.dropReasons || {};
   assert.equal(drops['cross-origin-allowed'], undefined);
   assert.equal(drops['cross-origin-disallowed'], 1);
 });
 
-test('fragment variants of one disallowed URL count as a single drop', async () => {
+test('fragment variants of one dropped URL count as a single drop', async () => {
   const { crawlExternalLinks } = await import('./inspector');
   const htmlResponse = (html: string) =>
     new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
@@ -260,8 +287,8 @@ test('fragment variants of one disallowed URL count as a single drop', async () 
     const url = String(input);
     if (url === 'https://creator.test/')
       return htmlResponse(
-        '<a href="https://outside.test/community#top">External community</a>' +
-        '<a href="https://outside.test/community#join">External community</a>'
+        '<a href="https://outside.test/docs#top">Product docs</a>' +
+        '<a href="https://outside.test/docs#install">Product docs</a>'
       );
     return htmlResponse('<p>Leaf page without invite.</p>');
   }) as typeof fetch;

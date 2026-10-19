@@ -134,7 +134,8 @@ test('website crawler follows prioritized same-origin community navigation to a 
     const url = String(input);
     calls.push(url);
     if (url === 'https://creator.test/') {
-      return htmlResponse('<a href="https://elsewhere.test/community">External community</a><a href="/community">Community</a>');
+      // Non-evidenced outbound link: still never opened (hard safety floor).
+      return htmlResponse('<a href="https://elsewhere.test/about">External site</a><a href="/community">Community</a>');
     }
     if (url === 'https://creator.test/community') {
       return htmlResponse('<a href="/members">Members</a>');
@@ -153,7 +154,38 @@ test('website crawler follows prioritized same-origin community navigation to a 
     'https://creator.test/community',
     'https://creator.test/members'
   ]);
-  assert.equal(calls.some(url => url.startsWith('https://elsewhere.test/')), false, 'crawler must not wander off the creator origin');
+  assert.equal(calls.some(url => url.startsWith('https://elsewhere.test/')), false, 'crawler must not wander to non-evidenced external links');
+});
+
+test('evidenced cross-domain community link is followed, bounded by the per-seed destination budget', async () => {
+  // P1 change of contract: an explicit community reference ("External
+  // community") to an unknown host is a confirmed false-negative source
+  // (swingfish case), so it IS pursued — but only within the bounded
+  // cross-origin budget, and the same-origin invite path still wins.
+  const calls: string[] = [];
+  const fakeFetch = (async (input: RequestInfo | URL) => {
+    const url = String(input);
+    calls.push(url);
+    if (url === 'https://creator.test/') {
+      return htmlResponse('<a href="https://elsewhere.test/community">External community</a><a href="/community">Community</a>');
+    }
+    if (url === 'https://creator.test/community') {
+      return htmlResponse('<a href="/members">Members</a>');
+    }
+    if (url === 'https://creator.test/members') {
+      return htmlResponse('<a href="https://discord.gg/RealTradingRoom">Join our Discord</a>');
+    }
+    if (url === 'https://elsewhere.test/community') {
+      return htmlResponse('no invite here');
+    }
+    throw new Error(`Unexpected crawl: ${url}`);
+  }) as typeof fetch;
+
+  const result = await crawlExternalLinks(['https://creator.test/'], [], undefined, fakeFetch);
+  assert.equal(result.outcome, 'FOUND');
+  assert.equal(result.foundInvite, 'RealTradingRoom');
+  assert.ok(calls.includes('https://elsewhere.test/community'), 'evidenced cross-domain community destination is pursued');
+  assert.ok(calls.includes('https://creator.test/community') && calls.includes('https://creator.test/members'));
 });
 
 test('website crawler remains bounded to eight prioritized follow-up pages', async () => {

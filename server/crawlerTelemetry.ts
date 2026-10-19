@@ -20,6 +20,12 @@ export const CRAWL_DROP_REASONS = [
   'queue-cap',
   'depth-limit',
   'exploration-limit',
+  /**
+   * Per-seed cross-origin destination fan-out bound. A page with many
+   * evidence-bearing external targets can exceed the bounded host/page budget;
+   * skips set the seed ceiling so absence is never reported as complete.
+   */
+  'destination-budget',
   'already-visited',
   'control-slice',
   'page-budget',

@@ -1,10 +1,12 @@
 import * as cheerio from 'cheerio';
 import { decodeEmbeddedMarkup, detachPageSlice, extractDynamicTargetValues, extractEmbeddedUrls, extractYouTubeVideoIds } from './crawlerExtraction';
 import { InspectionStep } from '../src/types';
-import { getChannelById, getSiteInspections, upsertSiteInspection, recordCreatorSiteLinks, getSiteProfiles, recordPageCoverage, upsertFrontierQueueItem, countFrontierQueue, accumulateRouteStats, upsertSiteProfile, type SiteInspectionRow } from './db';
+import type { CommunityIntentEvidence } from '../src/types';
+import { extractCommunityIntentEvidence } from './communityIntent';
+import { getChannelById, getSiteInspections, upsertSiteInspection, recordCreatorSiteLinks, getSiteProfiles, recordPageCoverage, upsertFrontierQueueItem, countFrontierQueue, accumulateRouteStats, upsertSiteProfile, recordDiscoveryRecoveryAudit, type SiteInspectionRow } from './db';
 import { routePatternFor, shouldAccumulateRouteObservation, evaluateDomainWeightShadow, isDomainWeightExperimentConsumptionEnabled, type DomainWeightShadowEvaluation } from './domainLearner';
 import { decideFrontierStep, scoreFrontierCandidate, classifyBlockedAcquisition, isFrontierEnabled, MAX_FRONTIER_PAGES_PER_SITE, MAX_FRONTIER_QUEUE_PER_SITE, FRONTIER_POLICY_VERSION, type FrontierCrawlOptions } from './frontierManager';
-import { canonicalSiteIdentity, isSiteInspectionReusable, buildBorrowedSiteInspection, siteInspectionCoversRequest, isSufficientRenderedCoverage, rootCoverageTerminal, mergeRedirectBinding, redirectBindingFor, redirectDestinations, REDIRECT_BINDING_KIND, checksumSiteFacts, SITE_INSPECTION_POLICY_VERSION, isExactBarrierPageCover, type SiteIdentity, type SiteInspectionStore } from './siteInspectionCache';
+import { canonicalSiteIdentity, isSiteInspectionReusable, buildBorrowedSiteInspection, siteInspectionCoversRequest, isSufficientRenderedCoverage, rootCoverageTerminal, mergeRedirectBinding, redirectBindingFor, redirectDestinations, REDIRECT_BINDING_KIND, checksumSiteFacts, SITE_INSPECTION_POLICY_VERSION, isExactBarrierPageCover, aggregateSeedOutcome, SITE_INSPECTION_CLAIM_STATUS, type SiteIdentity, type SiteInspectionStore } from './siteInspectionCache';
 import { fetchRecentVideoDescriptionsWithIds, type RecentVideoDescription } from './youtube';
 import {candidateFromNativeInvite,extractDiscordCandidates,makeDiscordCandidate,mergeDiscordCandidates,type DiscordCandidate} from './discordCandidates';
 import { bumpRepeatFailureHistoryOutage, bumpRepeatFailureSkip } from './operationsTelemetry';
@@ -13,6 +15,7 @@ import { normalizeVisitUrl, type BrowserFallbackBudget } from './browserCommunit
 import { parseAboutPageMetadataFromHtml } from './youtubePublicAbout';
 import {effectiveAcquisitionOutcomes,hasMessagingBridgeEvidence,isDiscordCommunityAcquisitionSurface,isDotlessHostnameUrl,isMessagingPreviewUrl,isAuxiliaryTriageCandidate,isAuxiliaryForOutcome,acquisitionOwnershipUrl,isPageAssetInfrastructureUrl,rankCommunitySurfaces,scoreCommunitySurface,assessCrawlAdmission,recoverTruncatedQueryToRoot,isPossiblyTruncatedPath} from './communitySurfacePolicy';
 import { isAcquisitionLadderEnabled, resolveRenderEscalation, selectSameSiteSitemapSeedCandidates, selectStructuredNavigationCandidates, MAX_LADDER_SITEMAP_SEEDS, MAX_LADDER_PROFILE_RUNS_PER_INSPECTION, ACQUISITION_LADDER_POLICY_VERSION } from './acquisitionLadder';
+import { shouldFollowDestination, selectDiverseNavigationQueue, createDestinationBudget } from './destinationPolicy';
 import { extractHeadDiscovery, isSiteProfilerEnabled, runSiteProfiler } from './siteProfiler';
 import {clampRetryAtTimestamp, communityAcquisitionRetryDirective, isCommunityRetryableObservation, retryAtFromUnknown, type CommunityRetryDirective} from './communityRetryPolicy';
 import {renderedCrawlerTelemetry, staticCrawlerTelemetry, createDropCounter, type CrawlerTelemetry, type CeilingKind, type ExperimentAttribution} from './crawlerTelemetry';
@@ -118,6 +121,10 @@ export interface InspectionResult {
    */
   retrySuppressedUrls?: string[];
   discordCandidates?: DiscordCandidate[];
+  /** P4 platform-community evidence observed during this inspection
+   * (Whop/Skool/Circle/Patreon). Projected as COMMUNITY_INDICATED_NO_INVITE /
+   * PAID_COMMUNITY_INDICATED; never an invite. */
+  communityIntent?: CommunityIntentEvidence[];
 }
 export type ExternalAcquisitionStatus='FOUND'|'INSPECTED_NO_MATCH'|'PARTIALLY_INSPECTED'|'ACQUISITION_FAILED';
 export type AcquisitionSurface='YOUTUBE_ABOUT'|'RECENT_VIDEO_DESCRIPTIONS'|'CHANNEL_EXTERNAL_LINKS'|'CREATOR_WEBSITES'|'SOCIAL_PROFILES'|'DISCORD_VALIDATION';
@@ -192,7 +199,6 @@ async function fetchWithTimeout(url: string, depth = 0): Promise<{ html: string;
 const COMMUNITY_PATH_HINTS = ['discord','community','join','chat','member','membership','vip','group','private','trading-room','trading-floor','room','links','resources','social','contact','about'];
 const CROSS_DOMAIN_COMMUNITY_HOSTS = new Set(['linktr.ee','www.linktr.ee','beacons.ai','www.beacons.ai','bio.link','www.bio.link','solo.to','www.solo.to','campsite.bio','www.campsite.bio','lnk.bio','www.lnk.bio','skool.com','www.skool.com','whop.com','www.whop.com','circle.so','www.circle.so','patreon.com','www.patreon.com']);
 export function communityNavigationScore(href:string,label:string):number {const haystack=`${href} ${label}`.toLowerCase();let score=0;for(const hint of COMMUNITY_PATH_HINTS)if(haystack.includes(hint))score+=hint==='discord'?100:hint==='community'||hint==='join'?50:10;return score;}
-export function shouldFollowCommunityTarget(url:string,_label:string):boolean {try{return CROSS_DOMAIN_COMMUNITY_HOSTS.has(new URL(url).hostname.toLowerCase());}catch{return false;}}
 
 /**
  * Derive creator-canonical website hosts from channel links for Discord
@@ -257,7 +263,7 @@ async function fetchExternalPage(url:string,fetchImpl:typeof fetch):Promise<{pag
   finally { clearTimeout(timer); }
 }
 
-export interface ExternalDiscordCrawlResult {foundInvite:string|null;foundLocation?:string;details:string;outcome:ExternalAcquisitionStatus;observations:ExternalAcquisitionObservation[];candidates:DiscordCandidate[];domainWeightShadows?:DomainWeightShadowEvaluation[];/** Terminal-success page URLs (finals) in visit order for the shared-evidence registry. Additive; absent on early failure paths. */visitedUrls?:string[];/** Root-page scored navigation targets (single-seed calls) for lender inventory. Additive. */rootNavigation?:Array<{url:string;score:number}>}
+export interface ExternalDiscordCrawlResult {foundInvite:string|null;foundLocation?:string;details:string;outcome:ExternalAcquisitionStatus;observations:ExternalAcquisitionObservation[];candidates:DiscordCandidate[];domainWeightShadows?:DomainWeightShadowEvaluation[];/** Terminal-success page URLs (finals) in visit order for the shared-evidence registry. Additive; absent on early failure paths. */visitedUrls?:string[];/** Root-page scored navigation targets (single-seed calls) for lender inventory. Additive. */rootNavigation?:Array<{url:string;score:number}>;/** P4 platform-community evidence observed while crawling (Whop/Skool/Circle/Patreon). Never an invite; absent means no evidence. */communityIntent?:CommunityIntentEvidence[]}
 
 /**
  * Shared static lender inventory (v2 L1): terminal-success root inspections
@@ -303,7 +309,7 @@ function preserveResolvedWrapperProvenance(wrapperCandidate:DiscordCandidate,nat
 /** Bounded static acquisition that retains every Discord candidate observed
  * within the page budget. A first invite is evidence, not a stop condition. */
 export async function crawlExternalLinks(links:string[],logDetails:string[]=[],debugLog?:any,fetchImpl:typeof fetch=fetch,surface:AcquisitionSurface='CREATOR_WEBSITES',required=false,wrapperUrl?:string,ladderStructured?:boolean,frontier?:FrontierCrawlOptions,seedAdmission?:{admitted:number;considered:number}|null,evaluateDomainWeights?:boolean,preVisited?:string[]|SharedStaticInventory,r6Options?:{loginSemantics?:boolean;partialStaticRetry?:boolean}):Promise<ExternalDiscordCrawlResult>{
-  let scannedCount=0;const observations:ExternalAcquisitionObservation[]=[];const discovered:DiscordCandidate[]=[];const domainWeightShadows:DomainWeightShadowEvaluation[]=[];
+  let scannedCount=0;const observations:ExternalAcquisitionObservation[]=[];const discovered:DiscordCandidate[]=[];const domainWeightShadows:DomainWeightShadowEvaluation[]=[];const communityIntents:CommunityIntentEvidence[]=[];
   // Shared-visit pre-seeding (v2 L1): terminal-success finals inspected by an
   // earlier same-inspection crawl are never refetched. Same-tier evidence
   // only (static tier here); higher-tier needs are unaffected. Accepts raw
@@ -430,21 +436,24 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     const inspectPage=(current:{html:string;finalUrl:string},depth:number):Array<{url:string;score:number}>=>{
       pagesInspected++;logDetails.push(`Successfully loaded ${current.finalUrl} (${current.html.length} bytes, depth ${depth})`);
       discovered.push(...extractDiscordCandidates(`${current.finalUrl}\n${current.html}`,surface,current.finalUrl).filter(candidate=>candidate.nativeInviteCode));
-      const $=cheerio.load(current.html),navigation:Array<{url:string;score:number}>=[];
-      $('a[href]').each((_,el)=>{const href=($(el).attr('href')||'').trim(),label=$(el).text().trim();if(!href)return;const anchorCandidates=extractDiscordCandidates(`${href} ${label}`,surface,current.finalUrl).filter(candidate=>candidate.nativeInviteCode);if(anchorCandidates.length){for(const candidate of anchorCandidates){candidate.observations=(candidate.observations||[]).map(obs=>({...obs,sourceAnchorText:label,sourcePageDepth:depth}));discovered.push(candidate);}return;}try{const absolute=new URL(href,current.finalUrl),origin=new URL(current.finalUrl);absolute.hash='';if(!['http:','https:'].includes(absolute.protocol)){drops.countUnique('invalid-protocol',href);return;}const discoveredAdmission=assessCrawlAdmission(absolute.toString());if(!discoveredAdmission.eligible){drops.countUnique('admission-rejected',absolute.toString());return;}const crossOrigin=absolute.origin!==origin.origin;if(crossOrigin&&!shouldFollowCommunityTarget(absolute.toString(),label)){drops.countUnique('cross-origin-disallowed',absolute.toString());return;}const score=communityNavigationScore(absolute.pathname+absolute.search,label)+(CROSS_DOMAIN_COMMUNITY_HOSTS.has(absolute.hostname.toLowerCase())?40:0);if(score<=0){drops.countUnique('score-zero',absolute.toString());return;}navigation.push({url:absolute.toString(),score});}catch{drops.countUnique('invalid-protocol',href);}});
-      for(const rawTarget of extractDynamicTargetValues(current.html)){const target=rawTarget.trim();const targetCandidates=extractDiscordCandidates(target,surface,current.finalUrl).filter(candidate=>candidate.nativeInviteCode);if(targetCandidates.length){discovered.push(...targetCandidates);continue;}try{const absolute=new URL(target,current.finalUrl),origin=new URL(current.finalUrl);absolute.hash='';if(!['http:','https:'].includes(absolute.protocol)){drops.countUnique('invalid-protocol',target);continue;}const dynamicAdmission=assessCrawlAdmission(absolute.toString());if(!dynamicAdmission.eligible){drops.countUnique('admission-rejected',absolute.toString());continue;}const crossOriginTarget=absolute.origin!==origin.origin;if(crossOriginTarget&&!shouldFollowCommunityTarget(absolute.toString(),target)){drops.countUnique('cross-origin-disallowed',absolute.toString());continue;}const score=communityNavigationScore(absolute.pathname+absolute.search,target)+(CROSS_DOMAIN_COMMUNITY_HOSTS.has(absolute.hostname.toLowerCase())?40:0);if(score<=0){drops.countUnique('score-zero',absolute.toString());continue;}navigation.push({url:absolute.toString(),score});}catch{drops.countUnique('invalid-protocol',target);}}
+      // P4: platform-community evidence on every inspected page (best-effort:
+      // evidence extraction never breaks crawling or invite discovery).
+      try{communityIntents.push(...extractCommunityIntentEvidence({pageUrl:current.finalUrl,html:current.html}));}catch{/* intent evidence is best-effort */}
+      const $=cheerio.load(current.html),navigation:Array<{url:string;score:number;from?:string}>=[];
+      $('a[href]').each((_,el)=>{const href=($(el).attr('href')||'').trim(),label=$(el).text().trim();if(!href)return;const anchorCandidates=extractDiscordCandidates(`${href} ${label}`,surface,current.finalUrl).filter(candidate=>candidate.nativeInviteCode);if(anchorCandidates.length){for(const candidate of anchorCandidates){candidate.observations=(candidate.observations||[]).map(obs=>({...obs,sourceAnchorText:label,sourcePageDepth:depth}));discovered.push(candidate);}return;}try{const absolute=new URL(href,current.finalUrl);absolute.hash='';if(!['http:','https:'].includes(absolute.protocol)){drops.countUnique('invalid-protocol',href);return;}const decision=shouldFollowDestination({url:absolute.toString(),currentUrl:current.finalUrl,anchorText:label,baseScore:communityNavigationScore(absolute.pathname+absolute.search,label)});if(!decision.eligible){drops.countUnique(decision.reason==='admission-rejected'?'admission-rejected':'cross-origin-disallowed',absolute.toString());return;}navigation.push({url:absolute.toString(),score:decision.score,from:current.finalUrl});}catch{drops.countUnique('invalid-protocol',href);}});
+      for(const rawTarget of extractDynamicTargetValues(current.html)){const target=rawTarget.trim();const targetCandidates=extractDiscordCandidates(target,surface,current.finalUrl).filter(candidate=>candidate.nativeInviteCode);if(targetCandidates.length){discovered.push(...targetCandidates);continue;}try{const absolute=new URL(target,current.finalUrl);absolute.hash='';if(!['http:','https:'].includes(absolute.protocol)){drops.countUnique('invalid-protocol',target);continue;}const decision=shouldFollowDestination({url:absolute.toString(),currentUrl:current.finalUrl,anchorText:target,baseScore:communityNavigationScore(absolute.pathname+absolute.search,target)});if(!decision.eligible){drops.countUnique(decision.reason==='admission-rejected'?'admission-rejected':'cross-origin-disallowed',absolute.toString());continue;}navigation.push({url:absolute.toString(),score:decision.score,from:current.finalUrl});}catch{drops.countUnique('invalid-protocol',target);}}
       // P-B ladder structured step (flag-gated): sameAs/canonical inventory
       // joins navigation under identical scoring, cross-origin, and budget
       // rules. Flag off skips this block entirely (legacy navigation only).
       if(ladderStructured){try{
         const head=extractHeadDiscovery(current.html,current.finalUrl);
-        const origin=new URL(current.finalUrl);
         for(const candidate of selectStructuredNavigationCandidates({canonicalHrefs:head.canonicalHrefs,jsonLdSameAs:head.jsonLdSameAs},current.finalUrl)){
           if(visited.has(candidate.url)){drops.countUnique('already-visited',candidate.url);continue;}
           const structuredAdmission=assessCrawlAdmission(candidate.url);if(!structuredAdmission.eligible){drops.countUnique('admission-rejected',candidate.url);continue;}
-          const absolute=new URL(candidate.url),crossOrigin=absolute.origin!==origin.origin;
-          if(crossOrigin&&!shouldFollowCommunityTarget(absolute.toString(),'')){drops.countUnique('cross-origin-disallowed',absolute.toString());continue;}
-          navigation.push({url:absolute.toString(),score:candidate.score});
+          const absolute=new URL(candidate.url);
+          const structuredDecision=shouldFollowDestination({url:absolute.toString(),currentUrl:current.finalUrl,structuredNominated:true,baseScore:candidate.score});
+          if(!structuredDecision.eligible){drops.countUnique(structuredDecision.reason==='admission-rejected'?'admission-rejected':'cross-origin-disallowed',absolute.toString());continue;}
+          navigation.push({url:absolute.toString(),score:structuredDecision.score,from:current.finalUrl});
         }
       }catch{/* structured inventory never breaks navigation */}}
       navigation.sort((a,b)=>b.score-a.score);return navigation;
@@ -454,7 +463,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     // the queue bound: duplicate URLs must never consume budget while unique
     // eligible targets are dropped. Truncation of eligible uniques is itself
     // incomplete coverage.
-    const dedupedNavigation=(()=>{const best=new Map<string,{url:string;score:number}>();for(const item of firstNavigation){const prior=best.get(item.url);if(!prior||item.score>prior.score)best.set(item.url,item);}return [...best.values()];})();const duplicateDropped=Math.max(0,firstNavigation.length-dedupedNavigation.length);if(duplicateDropped>0)drops.count('duplicate',duplicateDropped);if(dedupedNavigation.length>12)seedCeiling??='queue-cap';const droppedByCap=Math.max(0,dedupedNavigation.length-12);if(droppedByCap>0)drops.count('queue-cap',droppedByCap);const queue=dedupedNavigation.slice(0,12).map(item=>({...item,depth:1}));let explored=0;
+    const dedupedNavigation=(()=>{const best=new Map<string,{url:string;score:number;from?:string}>();for(const item of firstNavigation){const prior=best.get(item.url);if(!prior||item.score>prior.score)best.set(item.url,item);}return [...best.values()];})();const duplicateDropped=Math.max(0,firstNavigation.length-dedupedNavigation.length);if(duplicateDropped>0)drops.count('duplicate',duplicateDropped);if(dedupedNavigation.length>12)seedCeiling??='queue-cap';const queueSelection=selectDiverseNavigationQueue(dedupedNavigation,12);if(queueSelection.dropped>0)drops.count('queue-cap',queueSelection.dropped);const queue=queueSelection.selected.map(item=>({...item,depth:1}));let explored=0;
     // P-D domain-weight shadow evaluation (observational only, default-off):
     // records what approved weights WOULD have picked against the live
     // score order. Never routes, budgets, or stops; null unless the
@@ -474,6 +483,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     // Root-page discovered links enter the persisted queue like any child
     // page's links, so root-only discoveries are recorded too.
     if(frontierOn){await frontierAdmitChildren(dedupedNavigation,1);}
+    const destinationBudget=createDestinationBudget();
     while(queue.length&&explored<12){
     if(frontierOn){
       // P-C stopping arbiter (flag-gated): halts child exploration on
@@ -486,7 +496,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       },{marginalFloor:frontier?.marginalFloor??0,remainingValueFloor:frontier?.remainingValueFloor??0,marginalWindow:frontier?.marginalWindow??5});
       if(frontierDecision.action==='STOP'){seedCeiling??='frontier-yield';drops.count('frontier-yield-stop');logDetails.push(`[Frontier] stopping child exploration: ${frontierDecision.reason}.`);break;}
     }
-    queue.sort((a,b)=>b.score-a.score);const next=queue.shift()!;if(next.depth>2){seedCeiling??='depth-limit';drops.count('depth-limit');continue;}if(visited.has(next.url)||sharedVisited.has(sharedKey(next.url)??'')){drops.count('already-visited');continue;}visited.add(next.url);explored++;logDetails.push(`Prioritized website crawl depth ${next.depth}: ${next.url}`);const subAcquired=await fetchExternalPage(next.url,fetchImpl),subPage=subAcquired.page;if(subAcquired.observation)observations.push({...subAcquired.observation,wrapperUrl,surface,required,rootUrl:url,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,ceiling:subPage?.truncated?'response-cap':undefined})});if(!subPage){
+    queue.sort((a,b)=>b.score-a.score);const next=queue.shift()!;if(next.depth>2){seedCeiling??='depth-limit';drops.count('depth-limit');continue;}if(visited.has(next.url)||sharedVisited.has(sharedKey(next.url)??'')){drops.count('already-visited');continue;}const reservation=destinationBudget.reserve(next.url,next.from||url);if(!reservation.admitted){seedCeiling??='exploration-limit';drops.count('destination-budget');logDetails.push(`Destination budget (${reservation.reason}): skipped ${next.url}; seed coverage remains incomplete.`);continue;}visited.add(next.url);explored++;logDetails.push(`Prioritized website crawl depth ${next.depth}: ${next.url}`);const subAcquired=await fetchExternalPage(next.url,fetchImpl),subPage=subAcquired.page;if(subAcquired.observation)observations.push({...subAcquired.observation,wrapperUrl,surface,required,rootUrl:url,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,ceiling:subPage?.truncated?'response-cap':undefined})});if(!subPage){
       if(frontierOn){
         const failed=subAcquired.observation;
         const terminal=classifyBlockedAcquisition({httpStatus:failed?.httpStatus,failureClass:failed?.failureClass,timedOut:failed?.failureClass==='TIMEOUT',transportFailed:failed?.failureClass==='NETWORK_FAILURE'});
@@ -504,7 +514,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       frontierYieldHistory.push(childYield);frontierEvidenceUnits+=childYield;
       await frontierRecordCoverage(next.url,childYield>0?'FOUND':(subPage.truncated?'PARTIALLY_INSPECTED':'INSPECTED_NO_MATCH'),'HTTP_STATIC',childYield);
       await frontierAdmitChildren(children,next.depth);
-    }if(next.depth>=2){const unvisitedChildren=children.filter(child=>(!visited.has(child.url)&&!sharedVisited.has(sharedKey(child.url)??'')));if(unvisitedChildren.length>0){seedCeiling??='depth-limit';drops.count('depth-limit',unvisitedChildren.length);}}else for(const child of children)if((!visited.has(child.url)&&!sharedVisited.has(sharedKey(child.url)??'')))queue.push({...child,depth:next.depth+1});}
+    }if(next.depth>=2){const seenChildren=new Set<string>();const unvisitedChildren=children.filter(child=>{if(seenChildren.has(child.url))return false;seenChildren.add(child.url);return !visited.has(child.url)&&!sharedVisited.has(sharedKey(child.url)??'');});if(unvisitedChildren.length>0){seedCeiling??='depth-limit';drops.count('depth-limit',unvisitedChildren.length);}}else{const bestChild=new Map<string,{url:string;score:number;from?:string}>();for(const child of children){const prior=bestChild.get(child.url);if(!prior||child.score>prior.score)bestChild.set(child.url,child);}const duplicateChildren=Math.max(0,children.length-bestChild.size);if(duplicateChildren>0)drops.count('duplicate',duplicateChildren);for(const child of [...bestChild.values()])if((!visited.has(child.url)&&!sharedVisited.has(sharedKey(child.url)??'')))queue.push({...child,depth:next.depth+1});}}
     if(queue.some(item=>!visited.has(item.url)))seedCeiling??='exploration-limit';const leftoverUnvisited=queue.filter(item=>!visited.has(item.url)).length;if(leftoverUnvisited>0)drops.count('exploration-limit',leftoverUnvisited);
     if(wrapperCandidate){const nativeForSeed=discovered.slice(beforeSeed).filter(candidate=>candidate.nativeInviteCode);if(nativeForSeed.length){discovered.splice(beforeSeed,discovered.length-beforeSeed,...preserveResolvedWrapperProvenance(wrapperCandidate,nativeForSeed));}}
     const foundForSeed=discovered.length>beforeSeed;
@@ -534,6 +544,12 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
         }
       }
     } catch { confirmedLogin = false; confirmedPaywall = false; }
+    if (confirmedPaywall) {
+      // P4: a confirmed paywall on a community-platform page is paid-community
+      // intent, never "nothing found". The invite may exist behind membership;
+      // the paid signal is recorded as first-class evidence.
+      try{communityIntents.push(...extractCommunityIntentEvidence({pageUrl:page.finalUrl,html:page.html,confirmedPaywall:true}));}catch{/* intent evidence is best-effort */}
+    }
     const confirmedBarrier = confirmedLogin || confirmedPaywall;
     const barrierClass = confirmedLogin ? LOGIN_WALL_FAILURE_CLASS : PAYWALL_FAILURE_CLASS;
     // Safe partial-static gaps (resolved-flag gated, independent):
@@ -556,7 +572,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
   }
   const candidates=mergeDiscordCandidates(discovered);const failed=observations.filter(item=>item.outcome==='ACQUISITION_FAILED').length,inspected=observations.filter(item=>item.outcome==='INSPECTED_NO_MATCH').length,partial=observations.filter(item=>item.outcome==='PARTIALLY_INSPECTED').length,found=observations.some(item=>item.outcome==='FOUND');const outcome:ExternalAcquisitionStatus=found?'FOUND':(failed&&inspected)||partial>0?'PARTIALLY_INSPECTED':failed?'ACQUISITION_FAILED':'INSPECTED_NO_MATCH';
   logDetails.push(`Crawled ${scannedCount} external link(s); retained ${candidates.length} distinct Discord candidate(s).`);
-  return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,details:logDetails.join('\n'),outcome,observations,candidates,domainWeightShadows,visitedUrls:crawledUrls,rootNavigation};
+  return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,details:logDetails.join('\n'),outcome,observations,candidates,domainWeightShadows,visitedUrls:crawledUrls,rootNavigation,communityIntent:communityIntents};
 }
 
 /**
@@ -591,6 +607,8 @@ export async function crawlMessagingPreview(seedUrl:string,logDetails:string[]=[
     return {foundInvite:null,details:logDetails.join('\n'),outcome:'ACQUISITION_FAILED',observations:[{...acquired.observation,wrapperUrl,surface,required:true,observedAt,telemetry:staticCrawlerTelemetry({redirectsFollowed:0,pagesInspected:0})}],candidates:[],bridgeEvidence:false,previewHtmlLength:0,truncated:false};
   }
   const page=acquired.page!;
+  let previewIntent:CommunityIntentEvidence[]=[];
+  try{previewIntent=extractCommunityIntentEvidence({pageUrl:page.finalUrl,html:page.html,confirmedPaywall:acquired.observation?.failureClass==='PAYWALL_WALL'});}catch{/* intent evidence is best-effort */}
   if(debugLog)debugLog.redirectsFollowed.push({from:seedUrl,to:page.finalUrl});
   let found:DiscordCandidate[]=[];
   try{
@@ -602,7 +620,7 @@ export async function crawlMessagingPreview(seedUrl:string,logDetails:string[]=[
   if(debugLog)debugLog.discordRegexAttempts.push({source:'crawlMessagingPreview_html',url:page.finalUrl,result:found.map(c=>c.nativeInviteCode)});
   if(found.length){
     const candidates=mergeDiscordCandidates(found);
-    return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,details:`[Messaging preview] Retained ${candidates.length} Discord candidate(s) statically from ${page.finalUrl} (${page.html.length} bytes, 0 Playwright launches).`,outcome:'FOUND',observations:[{requestedUrl:seedUrl,finalUrl:page.finalUrl,wrapperUrl,surface,required:false,outcome:'FOUND',retryable:false,httpStatus:200,detail:`${candidates.length} Discord candidate(s) statically retained from messaging preview`,observedAt,telemetry:staticCrawlerTelemetry({redirectsFollowed:page.finalUrl!==seedUrl?1:0,pagesInspected:1,ceiling:page.truncated===true?'response-cap':undefined})}],candidates,bridgeEvidence:false,previewHtmlLength:page.html.length,truncated:page.truncated===true};
+    return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,details:`[Messaging preview] Retained ${candidates.length} Discord candidate(s) statically from ${page.finalUrl} (${page.html.length} bytes, 0 Playwright launches).`,outcome:'FOUND',observations:[{requestedUrl:seedUrl,finalUrl:page.finalUrl,wrapperUrl,surface,required:false,outcome:'FOUND',retryable:false,httpStatus:200,detail:`${candidates.length} Discord candidate(s) statically retained from messaging preview`,observedAt,telemetry:staticCrawlerTelemetry({redirectsFollowed:page.finalUrl!==seedUrl?1:0,pagesInspected:1,ceiling:page.truncated===true?'response-cap':undefined})}],candidates,bridgeEvidence:false,previewHtmlLength:page.html.length,truncated:page.truncated===true,communityIntent:previewIntent};
   }
   const bridgeEvidence=hasMessagingBridgeEvidence(page.html);
   const truncated=page.truncated===true;
@@ -611,9 +629,9 @@ export async function crawlMessagingPreview(seedUrl:string,logDetails:string[]=[
   // partial so it can never resolve a definitive clean negative, even when
   // the observed prefix holds no bridge evidence.
   if(truncated){
-    return {foundInvite:null,details:logDetails.join('\n'),outcome:'PARTIALLY_INSPECTED',observations:[{requestedUrl:seedUrl,finalUrl:page.finalUrl,wrapperUrl,surface,required:true,outcome:'PARTIALLY_INSPECTED',retryable:true,httpStatus:200,failureClass:'RESPONSE_TRUNCATED',detail:`Messaging preview truncated at the bounded-response cap before full coverage (${page.html.length} bytes observed)`,observedAt,telemetry:staticCrawlerTelemetry({redirectsFollowed:page.finalUrl!==seedUrl?1:0,pagesInspected:1,ceiling:'response-cap'})}],candidates:[],bridgeEvidence,previewHtmlLength:page.html.length,truncated:true};
+    return {foundInvite:null,details:logDetails.join('\n'),outcome:'PARTIALLY_INSPECTED',observations:[{requestedUrl:seedUrl,finalUrl:page.finalUrl,wrapperUrl,surface,required:true,outcome:'PARTIALLY_INSPECTED',retryable:true,httpStatus:200,failureClass:'RESPONSE_TRUNCATED',detail:`Messaging preview truncated at the bounded-response cap before full coverage (${page.html.length} bytes observed)`,observedAt,telemetry:staticCrawlerTelemetry({redirectsFollowed:page.finalUrl!==seedUrl?1:0,pagesInspected:1,ceiling:'response-cap'})}],candidates:[],bridgeEvidence,previewHtmlLength:page.html.length,truncated:true,communityIntent:previewIntent};
   }
-  return {foundInvite:null,details:logDetails.join('\n'),outcome:'INSPECTED_NO_MATCH',observations:[{requestedUrl:seedUrl,finalUrl:page.finalUrl,wrapperUrl,surface,required:false,outcome:'INSPECTED_NO_MATCH',retryable:false,httpStatus:200,detail:bridgeEvidence?'Messaging preview statically inspected without an extractable invite; bridge evidence present':`Messaging preview statically inspected without a Discord invite (${page.html.length} bytes, 0 Playwright launches)`,observedAt,telemetry:staticCrawlerTelemetry({redirectsFollowed:page.finalUrl!==seedUrl?1:0,pagesInspected:1})}],candidates:[],bridgeEvidence,previewHtmlLength:page.html.length,truncated:false};
+  return {foundInvite:null,details:logDetails.join('\n'),outcome:'INSPECTED_NO_MATCH',observations:[{requestedUrl:seedUrl,finalUrl:page.finalUrl,wrapperUrl,surface,required:false,outcome:'INSPECTED_NO_MATCH',retryable:false,httpStatus:200,detail:bridgeEvidence?'Messaging preview statically inspected without an extractable invite; bridge evidence present':`Messaging preview statically inspected without a Discord invite (${page.html.length} bytes, 0 Playwright launches)`,observedAt,telemetry:staticCrawlerTelemetry({redirectsFollowed:page.finalUrl!==seedUrl?1:0,pagesInspected:1})}],candidates:[],bridgeEvidence,previewHtmlLength:page.html.length,truncated:false,communityIntent:previewIntent};
 }
 
 async function crawlSocialBios(socialUrls:string[],logDetails:string[]=[],debugLog?:any):Promise<ExternalDiscordCrawlResult>{return crawlExternalLinks(socialUrls,logDetails,debugLog,fetch,'SOCIAL_PROFILES');}
@@ -674,6 +692,13 @@ function renderedAcquisitionOutcome(rendered:BrowserFallbackResult,renderedProce
   const hasUnvisited = !!gap && gap.unvisited.length > 0;
   const hasTransient = !!gap && gap.transientFailures.length > 0;
   const hasPermanentOnly = !!gap && !hasUnvisited && !hasTransient && gap.permanentFailures.length > 0;
+  // Interaction gap: an evidence-bearing control (button/tab/accordion that can
+  // reveal community content, e.g. a "Join Discord" toggle) failed to click or
+  // was skipped by the control budget. Unlike a wall-clock stop after full
+  // required-link coverage, this is content that was never examined, so it can
+  // never resolve as a clean absence and keeps bounded retry alive.
+  const interactionGap = rendered.interactionGap === true;
+  const interactionClass = interactionGap ? 'RENDERED_INTERACTION_GAP' : undefined;
   // FOUND never erases outstanding required obligations: invites are retained
   // and reported, while a retryable gap keeps bounded recovery alive through
   // the returned gapRetryable flag (consumed by the caller into the
@@ -681,6 +706,9 @@ function renderedAcquisitionOutcome(rendered:BrowserFallbackResult,renderedProce
   if(renderedCandidates.length) {
     if (hasUnvisited) return {outcome:'FOUND',failureClass:'REQUIRED_UNVISITED_BUDGET_GAP',gapRetryable:true};
     if (hasTransient) return {outcome:'FOUND',failureClass:rendered.timedOut?'RENDERED_TIMEOUT':'RENDERED_PARTIAL_COVERAGE',gapRetryable:true};
+    // A retryable interaction gap may hide further invites, so it outranks a
+    // permanent-only required failure (which never owns retry work).
+    if (interactionGap) return {outcome:'FOUND',failureClass:rendered.timedOut?'RENDERED_TIMEOUT':'RENDERED_INTERACTION_GAP',gapRetryable:true};
     if (hasPermanentOnly) return {outcome:'FOUND',gapRetryable:false};
     return{outcome:'FOUND'};
   }
@@ -693,8 +721,10 @@ function renderedAcquisitionOutcome(rendered:BrowserFallbackResult,renderedProce
   // coverage; legacy results without it keep exact legacy behavior.
   const requiredCovered = rendered.requiredTotal !== undefined && (rendered.inspectedPages || 0) > 0 &&
     !(rendered.requiredUnvisited?.length) && !(rendered.requiredTransientFailures?.length) && !(rendered.requiredPermanentFailures?.length);
-  if (requiredCovered) return {outcome:'INSPECTED_NO_MATCH'};
-  if(rendered.complete&&renderedProcessed)return{outcome:'INSPECTED_NO_MATCH'};
+  // Required-link coverage never absorbs an interaction gap: a click-only
+  // control that failed or was skipped could still be holding the invite.
+  if (requiredCovered && !interactionGap) return {outcome:'INSPECTED_NO_MATCH'};
+  if(rendered.complete&&renderedProcessed&&!interactionGap)return{outcome:'INSPECTED_NO_MATCH'};
   // A timeout is a total-timeout ceiling, not proof of page-budget pressure:
   // keep RENDERED_BUDGET_EXPIRED only when page-budget drops evidence it,
   // otherwise attribute the timeout truthfully so it never reads as budget.
@@ -705,8 +735,8 @@ function renderedAcquisitionOutcome(rendered:BrowserFallbackResult,renderedProce
   // with no other gap) stays visible but never owns retry work: identical
   // refetch patterns cannot clear access denial.
   if (hasPermanentOnly) return{outcome:rendered.inspectedPages>0?'PARTIALLY_INSPECTED':'ACQUISITION_FAILED',failureClass:rendered.timedOut?'RENDERED_TIMEOUT':'RENDERED_PARTIAL_COVERAGE',gapRetryable:false};
-  if(rendered.inspectedPages>0)return{outcome:'PARTIALLY_INSPECTED',failureClass:timeoutClass||'RENDERED_PARTIAL_COVERAGE'};
-  return{outcome:'ACQUISITION_FAILED',failureClass:timeoutClass||rendered.failureClass||'NO_PAGE_PROCESSED'};
+  if(rendered.inspectedPages>0)return{outcome:'PARTIALLY_INSPECTED',failureClass:timeoutClass||interactionClass||'RENDERED_PARTIAL_COVERAGE',gapRetryable:interactionGap||undefined};
+  return{outcome:'ACQUISITION_FAILED',failureClass:timeoutClass||interactionClass||rendered.failureClass||'NO_PAGE_PROCESSED',gapRetryable:interactionGap||undefined};
 }
 
 /**
@@ -970,6 +1000,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   const addExternalUrls=(text:string,source:string)=>{const urls=extractExternalUrlsFromText(text);if(debugLog)debugLog.extractedUrls.push(...urls);for(const url of urls){if(!logAdmissionRejection(url))continue;const normalized=normalizeExternalUrl(url);if(!normalized||isPageAssetInfrastructureUrl(normalized.url))continue;collectedExternalUrls.push({...normalized,contextMatches:checkContext(text,url),source});}};
   for(const link of links)if(link&&typeof link==='string'){if(debugLog)debugLog.extractedUrls.push(link);if(!logAdmissionRejection(link))continue;const normalizedLink=normalizeExternalUrl(link);if(!normalizedLink||isPageAssetInfrastructureUrl(normalizedLink.url))continue;collectedExternalUrls.push({...normalizedLink,contextMatches:false,source:'CHANNEL_LINKS'});}for(const link of channelData.socialLinks||[])if(link&&typeof link==='string'){if(debugLog)debugLog.extractedUrls.push(link);if(!logAdmissionRejection(link))continue;const normalizedSocial=normalizeExternalUrl(link);if(!normalizedSocial||isPageAssetInfrastructureUrl(normalizedSocial.url))continue;collectedExternalUrls.push({...normalizedSocial,contextMatches:false,source:'SOCIAL_LINKS'});}
   const discoveredCandidates:DiscordCandidate[]=[];const retainCandidates=(items:DiscordCandidate[])=>{discoveredCandidates.push(...items.filter(item=>item.nativeInviteCode));};
+  const communityIntentEvidence:CommunityIntentEvidence[]=[];const retainCommunityIntent=(items:CommunityIntentEvidence[]|undefined)=>{if(items?.length)communityIntentEvidence.push(...items);};
   // Creator-canonical domains: hosts from creator-controlled channel links
   // (YouTube About external links, incl. live-refreshed). Wires the existing
   // CREATOR_CANONICAL_DOMAIN (+55) ownership signal in inferDiscordOwnership,
@@ -1194,7 +1225,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   // proofs. Static terminal-success finals accumulate separately for
   // same-tier pre-seeding (rendered runs never skip on static evidence:
   // tier monotonicity — only rendered evidence satisfies rendered needs).
-  interface SharedRenderedRecord {bySeed:string;pages:number;candidatesFound:number;hintLinks:string[];}
+  interface SharedRenderedRecord {bySeed:string;pages:number;candidatesFound:number;hintLinks:string[];complete:boolean;}
   const sharedRenderedEvidence=new Map<string,SharedRenderedRecord[]>();
   const sharedStaticVisited=new Set<string>();
   const sharedStaticRoots=new Map<string,{bySeed:string;finalUrl:string;childLinks:Array<{url:string;score:number}>;terminalSuccess?:boolean}>();
@@ -1208,8 +1239,16 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
     sharedStaticRoots.set(rootKey,{bySeed:seedUrl,finalUrl:(crawlRes.visitedUrls as string[])[0],childLinks:crawlRes.rootNavigation as Array<{url:string;score:number}>,terminalSuccess:true});
     return true;
   };
-  const recordRenderedEvidence=(seedUrl:string,rendered:{visitedUrls?:string[];pageHintLinks?:Record<string,string[]>;inspectedPages?:number},candidates:{sourceUrl?:string}[]):void=>{const hintIndex=rendered.pageHintLinks||{};for(const raw of rendered.visitedUrls||[]){const key=normalizeVisitUrl(raw);if(!key)continue;const found=candidates.filter(c=>normalizeVisitUrl(c.sourceUrl||'')===key).length;const list=sharedRenderedEvidence.get(key)||[];if(!list.some(r=>r.bySeed===seedUrl))list.push({bySeed:seedUrl,pages:1,candidatesFound:found,hintLinks:[...(hintIndex[key]||[])]});sharedRenderedEvidence.set(key,list);}};
-  const findRenderedShare=(seedUrl:string):SharedRenderedRecord|null=>{const key=normalizeVisitUrl(seedUrl);if(!key)return null;const recs=sharedRenderedEvidence.get(key);const rec=recs&&recs[0];if(!rec)return null;for(const raw of rec.hintLinks){const hk=normalizeVisitUrl(raw);if(!hk)continue;if(!sharedRenderedEvidence.get(hk)?.length)return null;}return rec;};
+  // Lender gate (fail closed): only complete, non-timed-out rendered runs
+  // without an interaction gap may enter the shared inventory. A truncated or
+  // interaction-gapped lender would let a later borrower skip rendering based
+  // on coverage that never existed — the exact class of leak this gate closes.
+  const recordRenderedEvidence=(seedUrl:string,rendered:{visitedUrls?:string[];pageHintLinks?:Record<string,string[]>;inspectedPages?:number;complete?:boolean;timedOut?:boolean;interactionGap?:boolean},candidates:{sourceUrl?:string}[]):void=>{
+    if(rendered.complete!==true||rendered.timedOut===true||rendered.interactionGap===true)return;
+    const hintIndex=rendered.pageHintLinks||{};
+    for(const raw of rendered.visitedUrls||[]){const key=normalizeVisitUrl(raw);if(!key)continue;const found=candidates.filter(c=>normalizeVisitUrl(c.sourceUrl||'')===key).length;const list=sharedRenderedEvidence.get(key)||[];if(!list.some(r=>r.bySeed===seedUrl))list.push({bySeed:seedUrl,pages:1,candidatesFound:found,hintLinks:[...(hintIndex[key]||[])],complete:true});sharedRenderedEvidence.set(key,list);}
+  };
+  const findRenderedShare=(seedUrl:string):SharedRenderedRecord|null=>{const key=normalizeVisitUrl(seedUrl);if(!key)return null;const recs=sharedRenderedEvidence.get(key);const rec=recs&&recs[0];if(!rec||rec.complete!==true)return null;for(const raw of rec.hintLinks){const hk=normalizeVisitUrl(raw);if(!hk)continue;if(!sharedRenderedEvidence.get(hk)?.length)return null;}return rec;};
   // R6 admission audit trail: truncation recovery/signal lines join the Step 4
   // log so the trail shows exactly which seeds were recovered or flagged.
   for(const line of admissionRejectionLogs)step5Logs.push(line);
@@ -1266,9 +1305,16 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
       const seedFinal=[...seedObservations].reverse().find(o=>typeof o.finalUrl==='string'&&o.finalUrl)?.finalUrl as string|undefined;
       const identity=canonicalSiteIdentity(item.url,seedFinal||null);
       if(!identity)return;
+      // Aggregate outcome (E1): strongest observation + candidate presence,
+      // never array position. `rollup` remains only for HTTP status/detail.
       const rollup=[...seedObservations].reverse().find(o=>o.requestedUrl===item.url);
-      const outcome=rollup?.outcome||'INSPECTED_NO_MATCH';
       const invites=seedCandidates.map(c=>c.nativeInviteCode).filter((code):code is string=>typeof code==='string'&&!!code);
+      const outcome=aggregateSeedOutcome(seedObservations,invites.length);
+      // Claim handshake (E2): candidate-bearing rows start PENDING; the queue
+      // flips them to CLAIMED once admission committed. PENDING rows are never
+      // reusable, so the crash window between cache write and claim forces an
+      // idempotent re-admission instead of silent discovery loss.
+      const claimStatus=invites.length?SITE_INSPECTION_CLAIM_STATUS.PENDING:SITE_INSPECTION_CLAIM_STATUS.NONE;
       await siteCache.write({
         siteIdentity:identity.siteIdentity,identityTier:identity.tier,identityBasis:identity.basis,
         canonicalUrl:identity.crawlUrl,finalUrl:seedFinal||null,outcome,
@@ -1280,6 +1326,8 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
         candidates:seedCandidates as unknown as Array<Record<string,unknown>>,
         observations:seedObservations as unknown as Array<Record<string,unknown>>,
         renderedCovered,
+        sourceChannelId:channelData.channelId||null,
+        claimStatus,
         provenance:{policyVersion:SITE_INSPECTION_POLICY_VERSION},
       });
       const requestedIdentity=canonicalSiteIdentity(item.url);
@@ -1311,7 +1359,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   // Messaging previews are attempted first via the lightweight static path so a
   // cheap FOUND can never be starved by expensive website crawls, and messaging
   // candidates join websiteCandidates before the Step 4 aggregate below.
-  if(messagingUrls.length){step5Logs.push(`Inspecting ${messagingUrls.length} messaging preview URL(s) via lightweight static inspection (0 default Playwright launches; render only on bridge evidence).`);for(const item of messagingUrls){step5Logs.push(`[Messaging preview] ${item.url} (Source: ${item.source})`);let preview:Awaited<ReturnType<typeof crawlMessagingPreview>>|null=null;try{preview=await crawlMessagingPreview(item.url,[],debugLog,channelData.externalFetchImpl||fetch,'CREATOR_WEBSITES',item.wrapperUrl);}catch(error:any){acquisitionOutcomes.push({requestedUrl:item.url,wrapperUrl:item.wrapperUrl,surface:'CREATOR_WEBSITES',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'ISOLATED_ACQUISITION_ERROR',detail:`Messaging preview isolated after unexpected error; remaining candidates continue: ${error instanceof Error?error.message:String(error)}`,observedAt:now,telemetry:staticCrawlerTelemetry({redirectsFollowed:0,pagesInspected:0})});continue;}acquisitionOutcomes.push(...preview.observations);websiteCandidates.push(...preview.candidates);if(preview.outcome==='FOUND'){step5Logs.push(`Messaging preview retained Discord candidate(s) statically; no escalation needed.`);continue;}    // Bridge evidence alone justifies escalation: creator classification must
+  if(messagingUrls.length){step5Logs.push(`Inspecting ${messagingUrls.length} messaging preview URL(s) via lightweight static inspection (0 default Playwright launches; render only on bridge evidence).`);for(const item of messagingUrls){step5Logs.push(`[Messaging preview] ${item.url} (Source: ${item.source})`);let preview:Awaited<ReturnType<typeof crawlMessagingPreview>>|null=null;try{preview=await crawlMessagingPreview(item.url,[],debugLog,channelData.externalFetchImpl||fetch,'CREATOR_WEBSITES',item.wrapperUrl);}catch(error:any){acquisitionOutcomes.push({requestedUrl:item.url,wrapperUrl:item.wrapperUrl,surface:'CREATOR_WEBSITES',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'ISOLATED_ACQUISITION_ERROR',detail:`Messaging preview isolated after unexpected error; remaining candidates continue: ${error instanceof Error?error.message:String(error)}`,observedAt:now,telemetry:staticCrawlerTelemetry({redirectsFollowed:0,pagesInspected:0})});continue;}acquisitionOutcomes.push(...preview.observations);websiteCandidates.push(...preview.candidates);retainCommunityIntent(preview.communityIntent);if(preview.outcome==='FOUND'){step5Logs.push(`Messaging preview retained Discord candidate(s) statically; no escalation needed.`);continue;}    // Bridge evidence alone justifies escalation: creator classification must
     // never silently suppress a legitimate messaging discovery path. A
     // truncated preview escalates the same way: the unobserved remainder may
     // hold the invite, so a cut-off prefix without bridge evidence still keeps
@@ -1449,6 +1497,37 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   if(seedCachedRow&&(seedCachedRow.failureClass==='LOGIN_WALL'||seedCachedRow.failureClass==='PAYWALL_WALL'||seedCachedRow.failureClass==='PERMANENT_ACCESS_BLOCK')&&strictBorrow){
     if(!isExactBarrierPageCover(seedCachedRow,coverageUrl)){seedCachedRow=undefined;}
   }
+  // Same-owner cache candidate recovery (E3): the row holds THIS channel's
+  // own unclaimed candidates from a crashed/quota-aborted run (PENDING claim
+  // handshake). Borrow the coverage observations and push the candidates back
+  // through the normal pipeline: global claim, ownership inference, and
+  // validation still decide. Cross-creator borrows never reach this path and
+  // stay candidate-free; the queue flips the row to CLAIMED once admission
+  // commits.
+  const unclaimedOwnCandidates = seedCachedRow
+    && Array.isArray(seedCachedRow.candidates) && seedCachedRow.candidates.length > 0
+    && seedCachedRow.claimStatus !== SITE_INSPECTION_CLAIM_STATUS.CLAIMED
+    && seedCachedRow.claimStatus !== SITE_INSPECTION_CLAIM_STATUS.DISCARDED;
+  const sameOwnerRecovery = unclaimedOwnCandidates && !!channelData.channelId && seedCachedRow!.sourceChannelId === channelData.channelId;
+  if (sameOwnerRecovery) {
+    const borrowed = buildBorrowedSiteInspection(seedCachedRow!,{requestedUrl:item.url,surface:'CREATOR_WEBSITES',required:false,wrapperUrl:item.wrapperUrl,observedAt:now,channelId:channelData.channelId});
+    acquisitionOutcomes.push(...borrowed.observations as unknown as ExternalAcquisitionObservation[]);
+    const recoveredCandidates = borrowed.recoveredCandidates as unknown as DiscordCandidate[];
+    if (recoveredCandidates.length) {
+      websiteCandidates.push(...recoveredCandidates);
+      step5Logs.push(`[Site cache] ${item.url} recovered ${recoveredCandidates.length} same-owner candidate(s) from cached inspection for re-admission (${seedCachedRow!.siteIdentity}, observed ${seedCachedRow!.lastObservedAt}).`);
+      // Explicit recovery audit (P3 item 12): the recovery itself is recorded,
+      // best-effort, before the candidates re-enter normal admission.
+      await recordDiscoveryRecoveryAudit({
+        channelId: channelData.channelId,
+        source: 'CACHE',
+        siteIdentity: seedCachedRow!.siteIdentity,
+        candidateIds: recoveredCandidates.map(candidate => candidate.candidateId),
+        detail: `same-owner cache recovery for ${item.url}`,
+      }).catch(() => undefined);
+      continue;
+    }
+  }
   if(seedCachedRow&&seedReusable&&!seedCovered){
     step5Logs.push(`[Site cache] ${item.url} not covered by cached inspection for ${seedCachedRow.siteIdentity} (cached ${seedCachedRow.lastObservedAt}); recrawling for full path coverage.`);
   }
@@ -1483,7 +1562,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   if(seedCachedRow&&seedReusable&&seedCovered){
     step5Logs.push(`[Site cache] ${item.url} bypasses borrowed coverage for retry-owned reacquisition of incomplete coverage; re-crawling.`);
   }
-  step5Logs.push(`[Crawling] ${item.url} (Priority Score: ${scoreCommunitySurface(item)}, Context Match: ${item.contextMatches}, Source: ${item.source})`);const crawlRes=(await safeCrawlStatic(item.url,debugLog,channelData.externalFetchImpl||fetch,'CREATOR_WEBSITES',item.wrapperUrl,ladderOn,frontierOptsFor(item.url),ladderOn?ladderSeedAdmission:undefined,evaluateDomainWeights,{visitedKeys:[...sharedStaticVisited,...sharedRenderedEvidence.keys()],roots:sharedStaticRoots},{ loginSemantics, partialStaticRetry })).crawlRes;for(const raw of crawlRes.visitedUrls||[]){const key=normalizeVisitUrl(raw);if(key)sharedStaticVisited.add(key);}feedSharedStaticRoot(item.url,crawlRes);
+  step5Logs.push(`[Crawling] ${item.url} (Priority Score: ${scoreCommunitySurface(item)}, Context Match: ${item.contextMatches}, Source: ${item.source})`);const crawlRes=(await safeCrawlStatic(item.url,debugLog,channelData.externalFetchImpl||fetch,'CREATOR_WEBSITES',item.wrapperUrl,ladderOn,frontierOptsFor(item.url),ladderOn?ladderSeedAdmission:undefined,evaluateDomainWeights,{visitedKeys:[...sharedStaticVisited,...sharedRenderedEvidence.keys()],roots:sharedStaticRoots},{ loginSemantics, partialStaticRetry })).crawlRes;retainCommunityIntent(crawlRes.communityIntent);for(const raw of crawlRes.visitedUrls||[]){const key=normalizeVisitUrl(raw);if(key)sharedStaticVisited.add(key);}feedSharedStaticRoot(item.url,crawlRes);
   // Relevance telemetry (additive, no semantics): tag static observations with
   // tier/reason so retry ownership, outcome collapse, and audit can determine
   // eligibility without changing legacy behavior when disabled (ELIGIBLE).
@@ -1565,7 +1644,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
     if (staticTerminalBarrier) {
       step5Logs.push(`[Terminal barrier] ${item.url} conclusive permanent barrier established statically (${crawlRes.outcome}); no rendered escalation.`);
     }
-    if(!staticTerminalBarrier && !demoteSkipsRender && creatorLikelyTrading&&(crawlRes.outcome!=='FOUND'||!hasCreatorOwned)){const {crawlRenderedCommunitySurface,wasRenderedResultProcessed}=await import('./browserCommunityFallback');const ladderDecision=resolveRenderEscalation({staticOutcome:crawlRes.outcome,creatorLikelyTrading:true,surface:'CREATOR_WEBSITES',hasCreatorOwnedEvidence:crawlRes.outcome==='FOUND'&&hasCreatorOwned});if(ladderOn)step5Logs.push(`[Ladder] render decision for ${item.url}: ${ladderDecision.justification} (${ACQUISITION_LADDER_POLICY_VERSION}).`);const shouldRendered=ladderDecision.escalate;if(shouldRendered){const sharedHit=findRenderedShare(item.url);if(sharedHit){acquisitionOutcomes.push({requestedUrl:item.url,finalUrl:item.url,wrapperUrl:item.wrapperUrl,surface:'CREATOR_WEBSITES',required:false,outcome:sharedHit.candidatesFound>0?'FOUND':'INSPECTED_NO_MATCH',retryable:false,httpStatus:200,detail:`Shared rendered evidence from ${sharedHit.bySeed} (terminal success, no refetch).`,observedAt:now,telemetry:renderedCrawlerTelemetry({inspectedPages:1,clicks:0,complete:true})});step5Logs.push(`[Shared evidence] ${item.url} reuses rendered inspection from ${sharedHit.bySeed}; no refetch.`);await captureSeedSiteInspection(item,seedOutcomeStart,seedCandidateStart,false);continue;}const rendered=await (channelData.renderedFallback||crawlRenderedCommunitySurface)(item.url,{alreadyVisited:[...sharedRenderedEvidence.keys()]}).catch((error:any)=>isolatedRenderedFallback(item.url,error)),renderedProcessed=wasRenderedResultProcessed(rendered),renderedCandidates=normalizedRenderedCandidates(rendered,'CREATOR_WEBSITES',item.url);websiteCandidates.push(...renderedCandidates);const renderedResult=renderedAcquisitionOutcome(rendered,renderedProcessed,renderedCandidates,requiredGapFromRendered(rendered)),renderedOutcome:ExternalAcquisitionStatus=renderedResult.outcome;acquisitionOutcomes.push({requestedUrl:item.url,finalUrl:rendered.foundLocation,wrapperUrl:item.wrapperUrl,surface:'CREATOR_WEBSITES',required:true,outcome:renderedOutcome,retryable:renderedResult.gapRetryable!==undefined?renderedResult.gapRetryable:(rendered.retryable||!renderedProcessed),failureClass:renderedResult.failureClass,detail:rendered.detail,observedAt:now,telemetry:renderedCrawlerTelemetry({inspectedPages:rendered.inspectedPages,clicks:rendered.clicks,complete:rendered.complete,timedOut:rendered.timedOut,telemetry:rendered.telemetry,scrollsUsed:rendered.scrolls||0,dropReasons:rendered.dropReasons,experimentAttribution:ladderRenderAttribution})});if(renderedCandidates.length&&renderedResult.gapRetryable!==undefined&&!isAuxiliaryForOutcome(item.url))foundGapSeeds.push({url:item.url,retryable:renderedResult.gapRetryable});recordRenderedEvidence(item.url,rendered,renderedCandidates);step5Logs.push(renderedCandidates.length?`Rendered fallback retained ${renderedCandidates.length} candidate(s).`:rendered.detail);seedRenderedCovered=isSufficientRenderedCoverage({complete:rendered.complete,timedOut:rendered.timedOut},renderedProcessed);}}
+    if(!staticTerminalBarrier && !demoteSkipsRender && creatorLikelyTrading&&(crawlRes.outcome!=='FOUND'||!hasCreatorOwned)){const {crawlRenderedCommunitySurface,wasRenderedResultProcessed}=await import('./browserCommunityFallback');const ladderDecision=resolveRenderEscalation({staticOutcome:crawlRes.outcome,creatorLikelyTrading:true,surface:'CREATOR_WEBSITES',hasCreatorOwnedEvidence:crawlRes.outcome==='FOUND'&&hasCreatorOwned});if(ladderOn)step5Logs.push(`[Ladder] render decision for ${item.url}: ${ladderDecision.justification} (${ACQUISITION_LADDER_POLICY_VERSION}).`);const shouldRendered=ladderDecision.escalate;if(shouldRendered){const sharedHit=findRenderedShare(item.url);if(sharedHit){acquisitionOutcomes.push({requestedUrl:item.url,finalUrl:item.url,wrapperUrl:item.wrapperUrl,surface:'CREATOR_WEBSITES',required:false,outcome:sharedHit.candidatesFound>0?'FOUND':'INSPECTED_NO_MATCH',retryable:false,httpStatus:200,detail:`Shared rendered evidence from ${sharedHit.bySeed} (terminal success, no refetch).`,observedAt:now,telemetry:renderedCrawlerTelemetry({inspectedPages:1,clicks:0,complete:true})});step5Logs.push(`[Shared evidence] ${item.url} reuses rendered inspection from ${sharedHit.bySeed}; no refetch.`);await captureSeedSiteInspection(item,seedOutcomeStart,seedCandidateStart,false);continue;}const rendered=await (channelData.renderedFallback||crawlRenderedCommunitySurface)(item.url,{alreadyVisited:[...sharedRenderedEvidence.keys()]}).catch((error:any)=>isolatedRenderedFallback(item.url,error)),renderedProcessed=wasRenderedResultProcessed(rendered),renderedCandidates=normalizedRenderedCandidates(rendered,'CREATOR_WEBSITES',item.url);websiteCandidates.push(...renderedCandidates);const renderedResult=renderedAcquisitionOutcome(rendered,renderedProcessed,renderedCandidates,requiredGapFromRendered(rendered)),renderedOutcome:ExternalAcquisitionStatus=renderedResult.outcome;acquisitionOutcomes.push({requestedUrl:item.url,finalUrl:rendered.foundLocation,wrapperUrl:item.wrapperUrl,surface:'CREATOR_WEBSITES',required:true,outcome:renderedOutcome,retryable:renderedResult.gapRetryable!==undefined?renderedResult.gapRetryable:(rendered.retryable||!renderedProcessed),failureClass:renderedResult.failureClass,detail:rendered.detail,observedAt:now,telemetry:renderedCrawlerTelemetry({inspectedPages:rendered.inspectedPages,clicks:rendered.clicks,complete:rendered.complete,timedOut:rendered.timedOut,telemetry:rendered.telemetry,scrollsUsed:rendered.scrolls||0,dropReasons:rendered.dropReasons,experimentAttribution:ladderRenderAttribution})});if(renderedCandidates.length&&renderedResult.gapRetryable!==undefined&&!isAuxiliaryForOutcome(item.url))foundGapSeeds.push({url:item.url,retryable:renderedResult.gapRetryable});recordRenderedEvidence(item.url,rendered,renderedCandidates);step5Logs.push(renderedCandidates.length?`Rendered fallback retained ${renderedCandidates.length} candidate(s).`:rendered.detail);seedRenderedCovered=isSufficientRenderedCoverage({complete:rendered.complete,timedOut:rendered.timedOut,interactionGap:rendered.interactionGap},renderedProcessed);}}
     // Seed-slice relevance tagging (flag-gated): covers rendered + shared-hit
     // observations pushed above so DEMOTE seeds stay non-owning through every
     // acquisition path. Static observations were tagged identically earlier.
@@ -1584,7 +1663,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   let socialLoginSemantics = true, socialPartialRetry = true;
   try { socialLoginSemantics = await isLoginBlockSemanticsEnabled(); } catch { socialLoginSemantics = true; }
   try { socialPartialRetry = await isPartialStaticRetryEnabled(); } catch { socialPartialRetry = true; }
-  for(const item of socialBioUrls){const socialAdmissionCheck=assessCrawlAdmission(item.url);if(!socialAdmissionCheck.eligible){step6Logs.push(`Admission rejected (${socialAdmissionCheck.reasonCode}): ${item.url}; not crawled.`);continue;}const repeatSkipSoc=repeatSkipLine(item.url);if(repeatSkipSoc){step6Logs.push(repeatSkipSoc);continue;}step6Logs.push(`[Crawling] ${item.url} (Priority Score: ${scoreCommunitySurface(item)}, Source: ${item.source})`);const crawlRes=(await safeCrawlStatic(item.url,debugLog,channelData.externalFetchImpl||fetch,'SOCIAL_PROFILES',item.wrapperUrl,ladderOn,frontierOptsFor(item.url),undefined,evaluateDomainWeights,undefined,{ loginSemantics: socialLoginSemantics, partialStaticRetry: socialPartialRetry })).crawlRes;acquisitionOutcomes.push(...crawlRes.observations);for(const shadow of crawlRes.domainWeightShadows||[])step6Logs.push(`[DomainWeightShadow] site=${shadow.siteIdentity} weights=${shadow.weightsVersion} routes=${shadow.routeCount} baseline=${shadow.baselineTopUrl} shadow=${shadow.shadowPickUrl} agreement=${shadow.agreement}.`);socialCandidates.push(...crawlRes.candidates);const staticMerged=mergeDiscordCandidates(crawlRes.candidates,ownershipInput),hasCreatorOwned=staticMerged.some(c=>c.ownershipStatus==='CREATOR_OWNED');
+  for(const item of socialBioUrls){const socialAdmissionCheck=assessCrawlAdmission(item.url);if(!socialAdmissionCheck.eligible){step6Logs.push(`Admission rejected (${socialAdmissionCheck.reasonCode}): ${item.url}; not crawled.`);continue;}const repeatSkipSoc=repeatSkipLine(item.url);if(repeatSkipSoc){step6Logs.push(repeatSkipSoc);continue;}step6Logs.push(`[Crawling] ${item.url} (Priority Score: ${scoreCommunitySurface(item)}, Source: ${item.source})`);const crawlRes=(await safeCrawlStatic(item.url,debugLog,channelData.externalFetchImpl||fetch,'SOCIAL_PROFILES',item.wrapperUrl,ladderOn,frontierOptsFor(item.url),undefined,evaluateDomainWeights,undefined,{ loginSemantics: socialLoginSemantics, partialStaticRetry: socialPartialRetry })).crawlRes;retainCommunityIntent(crawlRes.communityIntent);acquisitionOutcomes.push(...crawlRes.observations);for(const shadow of crawlRes.domainWeightShadows||[])step6Logs.push(`[DomainWeightShadow] site=${shadow.siteIdentity} weights=${shadow.weightsVersion} routes=${shadow.routeCount} baseline=${shadow.baselineTopUrl} shadow=${shadow.shadowPickUrl} agreement=${shadow.agreement}.`);socialCandidates.push(...crawlRes.candidates);const staticMerged=mergeDiscordCandidates(crawlRes.candidates,ownershipInput),hasCreatorOwned=staticMerged.some(c=>c.ownershipStatus==='CREATOR_OWNED');
     // Conclusive static terminal barrier: same no-escalation rule as website
     // seeds — a terminal LOGIN_WALL/PAYWALL_WALL/PERMANENT_ACCESS_BLOCK must
     // stay visible and non-retryable, never replaced by rendered work.
@@ -1624,5 +1703,5 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   // is unchanged.
   const coveredRetryUrls=new Set(communityRequired.map(o=>(o as {requestedUrl?:unknown}).requestedUrl));
   const staticGapExtras=acquisitionOutcomes.filter(o=>!o.required&&(o as {failureClass?:unknown}).failureClass===STATIC_BUDGET_GAP_FAILURE_CLASS&&(o as {retryable?:unknown}).retryable===true&&isCommunityRetryableObservation(o as never)&&!coveredRetryUrls.has((o as {requestedUrl?:unknown}).requestedUrl));
-  return {foundInvite:mergedCandidates[0]?.nativeInviteCode||null,foundLocation:mergedCandidates[0]?.sourceUrl?.match(/VIDEO_\d+_DESCRIPTION/)?.[0]||mergedCandidates[0]?.sourceSurface,steps,extractedThumbnailUrl,debugLog,observedAboutBio:bio,observedChannelLinks:links,observedVideoDescriptions:channelSampledDescs().slice(0,10),observedVideoDescriptionsAuthoritative:channelSampled.length>0,acquisitionStatus:mergedCandidates.length?'FOUND':acquisitionStatus,acquisitionOutcomes,retryDirective:communityAcquisitionRetryDirective([...communityRequired,...staticGapExtras],consecutiveTimeoutSuppressed),retrySuppressedUrls:[...consecutiveTimeoutSuppressed],discordCandidates:mergedCandidates};
+  return {foundInvite:mergedCandidates[0]?.nativeInviteCode||null,foundLocation:mergedCandidates[0]?.sourceUrl?.match(/VIDEO_\d+_DESCRIPTION/)?.[0]||mergedCandidates[0]?.sourceSurface,steps,extractedThumbnailUrl,debugLog,observedAboutBio:bio,observedChannelLinks:links,observedVideoDescriptions:channelSampledDescs().slice(0,10),observedVideoDescriptionsAuthoritative:channelSampled.length>0,acquisitionStatus:mergedCandidates.length?'FOUND':acquisitionStatus,acquisitionOutcomes,retryDirective:communityAcquisitionRetryDirective([...communityRequired,...staticGapExtras],consecutiveTimeoutSuppressed),retrySuppressedUrls:[...consecutiveTimeoutSuppressed],discordCandidates:mergedCandidates,communityIntent:communityIntentEvidence.length?communityIntentEvidence:undefined};
 }
