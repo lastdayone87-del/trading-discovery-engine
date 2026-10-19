@@ -1,6 +1,6 @@
 # Phase 1 rollback proof for migrations 146/147.
 #
-# Runs the full pre-146 lineage (001..144) onto a disposable postgres:17
+# Runs the full pre-146 lineage (001..145) onto a disposable postgres:17
 # service container, captures the pre-state, applies 146+147 with the same
 # per-migration transaction semantics as scripts/runMigrations.ts, verifies
 # the expected widening, proves the rollback guard refuses non-destructively
@@ -50,7 +50,7 @@ jobs:
           mkdir -p evidence
           psql "$DATABASE_URL" -tAc "SELECT version()" | tee evidence/server_version.txt
 
-      - name: Apply migrations 001-144 (pre-146/147 state, runner semantics)
+      - name: Apply migrations 001-145 (pre-146/147 state, runner semantics)
         run: |
           set -euo pipefail
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c \
@@ -65,7 +65,7 @@ jobs:
               -c "COMMIT"
           done
           psql "$DATABASE_URL" -At -c "SELECT 'pre_state_max_version='||max(version) FROM schema_migrations" | tee evidence/pre_state_max_version.txt
-          test "$(psql "$DATABASE_URL" -At -c "SELECT max(version) FROM schema_migrations")" = "144"
+          test "$(psql "$DATABASE_URL" -At -c "SELECT max(version) FROM schema_migrations")" = "145"
 
       - name: Capture pre-state (constraints + full schema dump)
         run: |
@@ -136,7 +136,7 @@ jobs:
           test "$(psql "$DATABASE_URL" -At -c "SELECT to_regclass('public.discovery_probe_ledger') IS NOT NULL")" = "f"
           test "$(psql "$DATABASE_URL" -At -c "SELECT count(*) FROM discovery_provider_registry WHERE provider_key='evidence_extraction'")" = "0"
           test "$(psql "$DATABASE_URL" -At -c "SELECT count(*) FROM schema_migrations WHERE version IN (146,147)")" = "0"
-          test "$(psql "$DATABASE_URL" -At -c "SELECT max(version) FROM schema_migrations")" = "144"
+          test "$(psql "$DATABASE_URL" -At -c "SELECT max(version) FROM schema_migrations")" = "145"
           echo "ROLLBACK VERIFIED: zero schema drift, byte-identical staging constraints, ledger/registry/version rows removed"
 
       - name: Re-apply proof (rollback removes version rows so the runner re-applies)
