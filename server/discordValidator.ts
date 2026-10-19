@@ -56,6 +56,13 @@ export interface DiscordValidationOptions {
   fetchImpl?: typeof fetch;
   emitProviderEvent?: typeof appendProviderCallEvent;
   priorInvalidObservations?: number;
+  /**
+   * Durable count of prior PROVIDER_FAILURE observations with HTTP 404 (the
+   * bounded unexpected-not-found class, e.g. Discord provider error 50270).
+   * Supplied by the caller from discord_check_attempts so the classification
+   * becomes terminal after the bounded observation budget.
+   */
+  priorProviderFailureObservations?: number;
   /** Maximum additional public Discord requests after a successful invite lookup. */
   publicEvidenceMaxRequests?:number;
 }
@@ -169,6 +176,16 @@ async function fetchPublicEvidence(input:{
   return {text:pieces.filter(Boolean).join(' '),coverage};
 }
 
+/**
+ * Bounded-retry budget for unexpected Discord 404s that are NOT the known
+ * unknown-invite code (10006) — in production these are HTTP 404 responses
+ * carrying provider error code 50270. An unexpected 404 can prove neither
+ * death nor liveness, so it stays retryable while unproven; after this many
+ * durable observations the lookup is classified terminal
+ * (FAILED_OPERATIONAL) instead of looping RETRY_PENDING forever.
+ */
+export const DISCORD_UNEXPECTED_404_BOUNDED_OBSERVATIONS = 3;
+
 export async function validateDiscordInvite(inviteCode:string, options?:DiscordValidationOptions):Promise<DiscordValidationResult> {
   const cleanCode=inviteCode.replace(/^[\\/]+/,'').replace(/.*(?:discord\.gg|discord\.com\/invite|discordapp\.com\/invite|discord\.app\/invite)\//i,'').split(/[\?\#\/]/)[0].trim();
   const RESERVED_WORDS=['channels','guilds','store','download','nitro','login','register','api','widget','terms','privacy','branding','jobs','before','after','next','prev','index','home','about','contact','faq','support','invite','oauth2','template'];
@@ -190,9 +207,15 @@ export async function validateDiscordInvite(inviteCode:string, options?:DiscordV
       let discordErrorCode:number|undefined;try{const body=await res.clone().json();discordErrorCode=Number(body?.code)||undefined;}catch{}
       const expectedInvalid=res.status===404&&discordErrorCode===10006;
       const prior=Math.max(0,options?.priorInvalidObservations||0);
+      const priorProviderFailures=Math.max(0,options?.priorProviderFailureObservations||0);
+      // Bounded unexpected-404 policy: this response is the (prior+1)th in the
+      // durable series; at the budget ceiling it becomes terminal instead of
+      // re-arming RETRY_PENDING. Only the known unknown-invite 10006 code is
+      // exempt (that path has its own two-observation confirmation contract).
+      const boundedNotFoundExhausted=res.status===404&&!expectedInvalid&&priorProviderFailures+1>=DISCORD_UNEXPECTED_404_BOUNDED_OBSERVATIONS;
       const outcome:DiscordOperationalOutcome=expectedInvalid?(prior>=1?'CONFIRMED_INVALID':'INVALID_OBSERVED'):res.status===429?'RATE_LIMITED':[401,403].includes(res.status)?'AUTHENTICATION_FAILURE':res.status>=500?'PROVIDER_FAILURE':'PROVIDER_FAILURE';
-      const retryable=outcome==='RATE_LIMITED'||(outcome==='PROVIDER_FAILURE'&&(res.status>=500||res.status===404));
-      const reason=outcome==='CONFIRMED_INVALID'?'Discord invalid-invite response was confirmed by a separate durable observation':outcome==='INVALID_OBSERVED'?'Discord reported an invalid invite; terminal confirmation is pending':`Discord invite lookup returned HTTP ${res.status}`;
+      const retryable=outcome==='RATE_LIMITED'||(outcome==='PROVIDER_FAILURE'&&(res.status>=500||(res.status===404&&!boundedNotFoundExhausted)));
+      const reason=boundedNotFoundExhausted?`Discord invite lookup returned HTTP 404 (provider error ${discordErrorCode??'unknown'}) after ${priorProviderFailures+1} bounded observation(s); classified terminal`:outcome==='CONFIRMED_INVALID'?'Discord invalid-invite response was confirmed by a separate durable observation':outcome==='INVALID_OBSERVED'?'Discord reported an invalid invite; terminal confirmation is pending':`Discord invite lookup returned HTTP ${res.status}`;
       const effectiveRetryable=outcome==='INVALID_OBSERVED'||retryable;
       attempts.push({attemptNumber,operationalOutcome:outcome,retryable:effectiveRetryable,httpStatus:res.status,providerErrorCode:discordErrorCode,responseContentType:res.headers.get('content-type')||undefined,reason,checkedAt:new Date().toISOString()});
       if(outcome==='CONFIRMED_INVALID')return result({status:'DEAD',confidence:100,inviteUrl:null,relevanceReason:reason,operationalOutcome:outcome,retryable:false,livenessStatus:'DEAD',relevanceStatus:'NOT_CHECKED',resolutionStatus:'RESOLVED',validationStatus:'COMPLETED'});
