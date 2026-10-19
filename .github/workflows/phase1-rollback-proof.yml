@@ -55,7 +55,9 @@ jobs:
           set -euo pipefail
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c \
             "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
-          for f in $(ls server/db/migrations/*.sql | sort | grep -vE '/(14[67])_'); do
+          # 148+ are newer features with their own proof workflows; this proof
+          # is scoped to the 146/147 rollback and must not advance past 147.
+          for f in $(ls server/db/migrations/*.sql | sort | grep -vE '/(14[678])_'); do
             name=$(basename "$f"); version=${name%%_*}
             psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q \
               -c "BEGIN" -f "$f" \
