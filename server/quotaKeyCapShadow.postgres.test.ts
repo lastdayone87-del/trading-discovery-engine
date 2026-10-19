@@ -12,6 +12,7 @@ import {
   sweepShadowLeases,
   type ShadowPoolPort,
 } from './quotaKeyCapShadow';
+import { getYouTubeQuotaDay } from './youtubeQuotaDay';
 
 /**
  * Live-database tests for the shadow-only per-key cap accounting. These run
@@ -22,8 +23,9 @@ import {
  *
  * Without that variable every test below skips. The schema used here is the
  * production shape: migration 115 (youtube_key_quota_usage) plus migration
- * 148 (shadow leases/events), applied idempotently by this suite. Each run
- * uses a unique quota_day tag so repeated runs never interfere.
+ * 148 (shadow leases/events), applied idempotently by this suite. The quota
+ * day is the real America/Los_Angeles day (same helper as the hooks) and
+ * every run uses unique key fingerprints, so repeated runs never interfere.
  */
 const dedicatedUrl = process.env.QUOTA_SHADOW_TEST_DATABASE_URL;
 
@@ -47,7 +49,10 @@ const migration148 = readFileSync(
   'utf8'
 );
 
-const day = `shadow-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
+const runTag = `${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
+const quotaDay = getYouTubeQuotaDay(new Date());
+const keyFor = (name: string): string => `fp-${name}-${runTag}`;
+const keyPattern = `fp-%-${runTag}`;
 const enabledReader = async (key: string, fallback: string): Promise<string> => {
   if (key === 'youtube_key_cap_shadow_enabled') return 'true';
   if (key === 'youtube_key_cap_shadow_cap_units') return '9000';
@@ -79,14 +84,14 @@ async function seedSettledUnits(keyFingerprint: string, units: number): Promise<
      VALUES($1, $2, 1, $3, 10000)
      ON CONFLICT(quota_day, key_fingerprint)
      DO UPDATE SET units_used = $3, updated_at = now()`,
-    [day, keyFingerprint, units]
+    [quotaDay, keyFingerprint, units]
   );
 }
 
 async function leaseCount(keyFingerprint: string): Promise<number> {
   const result = await requirePool().query(
     `SELECT count(*)::int AS count FROM youtube_key_cap_shadow_leases WHERE quota_day=$1 AND key_fingerprint=$2`,
-    [day, keyFingerprint]
+    [quotaDay, keyFingerprint]
   );
   return Number(result.rows[0].count);
 }
@@ -94,7 +99,7 @@ async function leaseCount(keyFingerprint: string): Promise<number> {
 async function eventRows(keyFingerprint: string): Promise<Array<{ event: string; projected_units: number }>> {
   const result = await requirePool().query(
     `SELECT event, projected_units FROM youtube_key_cap_shadow_events WHERE quota_day=$1 AND key_fingerprint=$2 ORDER BY created_at ASC`,
-    [day, keyFingerprint]
+    [quotaDay, keyFingerprint]
   );
   return result.rows;
 }
@@ -102,9 +107,9 @@ async function eventRows(keyFingerprint: string): Promise<Array<{ event: string;
 after(async () => {
   if (pool) {
     try {
-      await pool.query(`DELETE FROM youtube_key_cap_shadow_leases WHERE quota_day=$1`, [day]);
-      await pool.query(`DELETE FROM youtube_key_cap_shadow_events WHERE quota_day=$1`, [day]);
-      await pool.query(`DELETE FROM youtube_key_quota_usage WHERE quota_day=$1`, [day]);
+      await pool.query(`DELETE FROM youtube_key_cap_shadow_leases WHERE key_fingerprint LIKE $1`, [keyPattern]);
+      await pool.query(`DELETE FROM youtube_key_cap_shadow_events WHERE key_fingerprint LIKE $1`, [keyPattern]);
+      await pool.query(`DELETE FROM youtube_key_quota_usage WHERE key_fingerprint LIKE $1`, [keyPattern]);
     } finally {
       await pool.end();
     }
@@ -124,13 +129,13 @@ maybe('boundary: 9000 admitted, the next unit is WOULD_REJECT, leases count as i
   await ensureSchema();
   resetShadowConfigCacheForTests();
   resetShadowSweepClockForTests();
-  const key = `fp-boundary-${day}`;
+  const key = keyFor('boundary');
   await seedSettledUnits(key, 8990);
   const shadowPool = requirePool() as unknown as ShadowPoolPort;
 
   const first = await recordShadowDispatchSafe(
     { readSetting: enabledReader, pool: shadowPool },
-    { keyFingerprint: key, operationId: `${day}:boundary:1`, units: 10 }
+    { keyFingerprint: key, operationId: `${runTag}:boundary:1`, units: 10 }
   );
   assert.equal(first.projectedBefore, 8990);
   assert.equal(first.event, null, '8990 + 10 = 9000 is admitted');
@@ -140,7 +145,7 @@ maybe('boundary: 9000 admitted, the next unit is WOULD_REJECT, leases count as i
   // accounting this request would still see 8990 and be admitted.
   const second = await recordShadowDispatchSafe(
     { readSetting: enabledReader, pool: shadowPool },
-    { keyFingerprint: key, operationId: `${day}:boundary:2`, units: 1 }
+    { keyFingerprint: key, operationId: `${runTag}:boundary:2`, units: 1 }
   );
   assert.equal(second.projectedBefore, 9000, 'in-flight lease is included in the projection');
   assert.equal(second.event, 'WOULD_REJECT', '9000 + 1 = 9001 blocks');
@@ -157,11 +162,11 @@ maybe('partial fit below the cap is WOULD_DEFER', async () => {
   await ensureSchema();
   resetShadowConfigCacheForTests();
   resetShadowSweepClockForTests();
-  const key = `fp-defer-${day}`;
+  const key = keyFor('defer');
   await seedSettledUnits(key, 8995);
   const result = await recordShadowDispatchSafe(
     { readSetting: enabledReader, pool: requirePool() as unknown as ShadowPoolPort },
-    { keyFingerprint: key, operationId: `${day}:defer:1`, units: 10 }
+    { keyFingerprint: key, operationId: `${runTag}:defer:1`, units: 10 }
   );
   assert.equal(result.projectedBefore, 8995);
   assert.equal(result.event, 'WOULD_DEFER', '8995 + 10 = 9005 crosses the cap from below');
@@ -174,10 +179,10 @@ maybe('duplicate accounting: one lease and one event per operation id', async ()
   await ensureSchema();
   resetShadowConfigCacheForTests();
   resetShadowSweepClockForTests();
-  const key = `fp-duplicate-${day}`;
+  const key = keyFor('duplicate');
   await seedSettledUnits(key, 9000);
   const shadowPool = requirePool() as unknown as ShadowPoolPort;
-  const operationId = `${day}:duplicate:1`;
+  const operationId = `${runTag}:duplicate:1`;
 
   const first = await recordShadowDispatchSafe(
     { readSetting: enabledReader, pool: shadowPool },
@@ -199,7 +204,7 @@ maybe('concurrency: 20 parallel dispatches serialize per key/day and cap exactly
   await ensureSchema();
   resetShadowConfigCacheForTests();
   resetShadowSweepClockForTests();
-  const key = `fp-concurrent-${day}`;
+  const key = keyFor('concurrent');
   await seedSettledUnits(key, 8990);
   const shadowPool = requirePool() as unknown as ShadowPoolPort;
 
@@ -209,7 +214,7 @@ maybe('concurrency: 20 parallel dispatches serialize per key/day and cap exactly
         { readSetting: enabledReader, pool: shadowPool },
         {
           keyFingerprint: key,
-          operationId: `${day}:concurrent:${index}`,
+          operationId: `${runTag}:concurrent:${index}`,
           units: 1,
           lockTimeoutMs: 3000,
         }
@@ -231,13 +236,13 @@ maybe('stale leases expire, are excluded from projections and swept on restart',
   await ensureSchema();
   resetShadowConfigCacheForTests();
   resetShadowSweepClockForTests();
-  const key = `fp-stale-${day}`;
-  const staleOperationId = `${day}:stale:1`;
+  const key = keyFor('stale');
+  const staleOperationId = `${runTag}:stale:1`;
   await seedSettledUnits(key, 8990);
   await requirePool().query(
     `INSERT INTO youtube_key_cap_shadow_leases(quota_day, operation_id, key_fingerprint, reserved_units, reserved_at, expires_at)
      VALUES($1, $2, $3, 9000, now() - interval '10 minutes', now() - interval '5 minutes')`,
-    [day, staleOperationId, key]
+    [quotaDay, staleOperationId, key]
   );
 
   // Restart recovery: the first observation after a restart sweeps expired
@@ -245,13 +250,13 @@ maybe('stale leases expire, are excluded from projections and swept on restart',
   // poison the projection.
   const result = await recordShadowDispatchSafe(
     { readSetting: enabledReader, pool: requirePool() as unknown as ShadowPoolPort },
-    { keyFingerprint: key, operationId: `${day}:stale:2`, units: 10 }
+    { keyFingerprint: key, operationId: `${runTag}:stale:2`, units: 10 }
   );
   assert.equal(result.projectedBefore, 8990, 'expired lease is not part of the projection');
   assert.equal(result.event, null, '8990 + 10 = 9000 admitted');
   const stale = await requirePool().query(
     `SELECT count(*)::int AS count FROM youtube_key_cap_shadow_leases WHERE quota_day=$1 AND operation_id=$2`,
-    [day, staleOperationId]
+    [quotaDay, staleOperationId]
   );
   assert.equal(Number(stale.rows[0].count), 0, 'expired lease removed by the restart sweep');
 
@@ -263,8 +268,8 @@ maybe('settlement releases the in-flight lease exactly once', async () => {
   await ensureSchema();
   resetShadowConfigCacheForTests();
   resetShadowSweepClockForTests();
-  const key = `fp-settle-${day}`;
-  const operationId = `${day}:settle:1`;
+  const key = keyFor('settle');
+  const operationId = `${runTag}:settle:1`;
   await seedSettledUnits(key, 100);
   const shadowPool = requirePool() as unknown as ShadowPoolPort;
 
@@ -275,8 +280,8 @@ maybe('settlement releases the in-flight lease exactly once', async () => {
   assert.equal(dispatch.leaseInserted, true);
   assert.equal(await leaseCount(key), 1);
 
-  const first = await settleShadowLease(shadowPool, { quotaDay: day, keyFingerprint: key, units: 1 });
-  const second = await settleShadowLease(shadowPool, { quotaDay: day, keyFingerprint: key, units: 1 });
+  const first = await settleShadowLease(shadowPool, { quotaDay, keyFingerprint: key, units: 1 });
+  const second = await settleShadowLease(shadowPool, { quotaDay, keyFingerprint: key, units: 1 });
   assert.equal(first, true, 'matching lease released');
   assert.equal(second, false, 'double settlement is a no-op');
   assert.equal(await leaseCount(key), 0);
@@ -286,7 +291,7 @@ maybe('settlement releases the in-flight lease exactly once', async () => {
   await seedSettledUnits(key, 101);
   const next = await recordShadowDispatchSafe(
     { readSetting: enabledReader, pool: shadowPool },
-    { keyFingerprint: key, operationId: `${day}:settle:2`, units: 8899 }
+    { keyFingerprint: key, operationId: `${runTag}:settle:2`, units: 8899 }
   );
   assert.equal(next.projectedBefore, 101);
   assert.equal(next.event, null, '101 + 8899 = 9000 admitted');
