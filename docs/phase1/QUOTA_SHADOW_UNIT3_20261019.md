@@ -1,0 +1,123 @@
+# Unit 3 — 9,000-unit/key/day quota cap, shadow mode only
+
+Date: 2026-10-19 · Branch: `phase1-hardening` · Implementation SHA: `c0d8318`
+(CI/test follow-ups `b62c45a`, `ef7b4c0`, `a664f78`, `3be3202`; CI green run:
+https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39325618390)
+
+Scope: observational shadow accounting for a projected per-key YouTube daily
+cap of **9,000 units**. Hard enforcement, key configuration changes and any
+change to official API traffic remain gated on explicit operator approval.
+
+## What shipped
+
+| Artifact | Purpose |
+| --- | --- |
+| `server/db/migrations/148_youtube_key_cap_shadow.sql` | `youtube_key_cap_shadow_leases` + `youtube_key_cap_shadow_events` (observational; no `app_settings` row, absent flag = OFF) |
+| `server/quotaKeyCapShadow.ts` | Config, projection, classification, locking, dedupe, sweeps, savepoint settlement |
+| `server/youtube.ts` (~line 438) | Dispatch hook: in-flight lease + projection observation for the dispatched key |
+| `server/dbCore.ts` (`incrementQuota`) | Settlement hook: releases one matching lease exactly once |
+| `server/quotaKeyCapShadow.test.ts` | 12 unit tests |
+| `server/quotaKeyCapShadow.postgres.test.ts` | PostgreSQL suite (dedicated-DB gated) |
+| `scripts/quota_shadow_replay.ts` | Offline 3-day CSV replay |
+| `.github/workflows/phase1-quota-shadow-tests.yml` | CI: tsc + unit tests + postgres:17 full lineage |
+
+## Inertness guarantees (verified)
+
+- **OFF by default.** `youtube_key_cap_shadow_enabled` absent or non-`true`
+  disables everything; settings are cached 30 s and read failures fail closed.
+- **Never blocks requests.** Per-key/day advisory lock is bounded by
+  `lock_timeout` (100 ms default). On timeout the observation is skipped
+  (`lockSkipped=true`, no lease, no event) — the request proceeds untouched.
+- **Never alters traffic or key state.** No dispatch, retry, pool, quota-row or
+  key-configuration code path is modified. Events are pure inserts.
+- **Settlement cannot poison official accounting.** The lease release runs in a
+  savepoint inside the charge transaction; any shadow error rolls back to the
+  savepoint and is swallowed. Duplicate charges are never double-released
+  (the settle path is skipped when the idempotency guard already saw the op).
+- **No production migration applied.** Prod remains at migration 145; queues
+  untouched; no probe/discovery traffic.
+
+## Boundary semantics
+
+`projected + request <= 9000` is admitted. `8999 + 1 = 9000` admitted;
+`9000 + 1 = 9001` blocked. Classification: crossing from below =
+`WOULD_DEFER`, projected at/over the cap = `WOULD_REJECT`. Verified by unit and
+PostgreSQL tests.
+
+## Counted quantity
+
+`projected = settled usage (youtube_key_quota_usage.units_used for the day/key)
++ unexpired in-flight leases`. Leases are unique per `(quota_day, operation_id)`
+(duplicate accounting impossible), carry a TTL (default 120 s), are excluded
+from projections once expired, and are swept on first use after a restart and
+at most once per minute. Settlement removes exactly one matching lease, so
+settled usage + leases never double count.
+
+## Test evidence
+
+- Unit (local, `node --import tsx --test server/quotaKeyCapShadow.test.ts`):
+  **12/12 pass**; `npx tsc --noEmit` clean.
+- PostgreSQL (CI postgres:17, full migration lineage via `runMigrations.ts`,
+  includes 148): **8/8 pass, 0 skipped** — boundary, defer, duplicate
+  accounting, 20-way concurrency (10 admitted / 10 `WOULD_REJECT`, no skips),
+  stale-lease sweep + restart recovery, settlement release
+  (run https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39325618390).
+- Existing quota suites (local): 65/68 pass. The 3 failures are in
+  `server/quotaRecovery.test.ts` and reproduce identically on the pristine
+  commit `17002fb` (branch is 17 behind `origin/main`); they are pre-existing
+  and will be rechecked after the Unit 4 rebase.
+- Rollback proof fix: the 146/147 workflow now excludes migration 148
+  (`pre_state_max_version` regression on `c0d8318`), green on `b62c45a`/`ef7b4c0`.
+
+## Three-day replay (2026-10-16 → 2026-10-18, America/Los_Angeles)
+
+Source: `quota_calls_1016_1018.csv` (22,301 rows; 15,477 SUCCESS replayed).
+Artifacts: `/tmp/opencode/evidence/quota_shadow_replay_20261019.{json,md}`.
+Hard-enforcement semantics: blocked calls are not counted as executed.
+
+| day | keys | allowed | would-defer | would-reject | settled units |
+| --- | --- | --- | --- | --- | --- |
+| 2026-10-16 | 12 | 3,456 | 104 | 1,826 | 108,000 |
+| 2026-10-17 | 12 | 3,834 | 165 | 355 | 107,784 |
+| 2026-10-18 | 24 | 5,062 | 118 | 557 | 163,660 |
+
+- Totals with in-flight leases: 12,352 allowed / 387 would-defer / 2,738
+  would-reject. **Settled-only projection is identical** because observed
+  traffic was serialized per key (peak concurrent in-flight = 1); the lease
+  mechanism's protective value is proven by the synthetic concurrency tests.
+- Real-data boundary behavior: high-cost search calls (100 units) near the cap
+  appear as `WOULD_DEFER`; keys that exhausted their 9,000 units show
+  `WOULD_REJECT` for subsequent calls.
+- Accounting gaps/assumptions: 6,824 non-SUCCESS rows excluded (6,541
+  RATE_LIMITED, 281 PERMANENT_ERROR, 2 TRANSIENT_ERROR); 11 duplicate
+  `request_id` rows; `reserved_cost = actual_cost` for all rows; max latency
+  9,073 ms (well below the 120 s lease TTL); charges without an observed
+  dispatch or with extra quota callbacks cannot release a lease (they are
+  conservative: over-lease until TTL expiry, never undercount).
+
+## Known limitations
+
+- Advisory-lock timeout skips are the only accounted observation gap; zero
+  skips were observed in CI (20-way contention at 3 s budget).
+- Replay models SUCCESS rows only; failures were excluded rather than modeled
+  as expiring reservations.
+- The shadow does not retroactively detect past-cap usage; it only records
+  projections at dispatch time.
+
+## Accidental-commit coordination status
+
+Stray commit `4dc893d` ("test(discovery): rollback proof for migrations
+146/147", duplicate files) is the local HEAD of the sibling worktree
+`/root/projects/trading-discovery-engine` on `feat/discovery-integrity-p1-p4`.
+It was never pushed: `origin/feat/discovery-integrity-p1-p4` remains `73d714f`.
+Authoritative copies of the content live on `phase1-hardening` (`b0c207f`,
+`c0d8318`). No reset was performed because that worktree is in active use by a
+sibling session and this unit must not modify that branch; when the session is
+idle, dropping it is a single `git reset --hard 73d714f` (or `git stash` first
+if it holds uncommitted work). No impact on this unit or the upcoming PR.
+
+## Production state
+
+Unchanged: migration 145, discovery flags absent, no probe rows, queues as
+snapshotted. Migration 148 is not applied to production. Next: Unit 4 rebase,
+full suites, tsc, PR (unmerged).
