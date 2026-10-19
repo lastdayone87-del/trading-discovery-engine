@@ -1,7 +1,7 @@
 /**
- * Migration 148 + persistence text contracts.
+ * Migration 149 + persistence text contracts.
  *
- * Migration 148 is the schema change behind the discovery-integrity fixes:
+ * Migration 149 is the schema change behind the discovery-integrity fixes:
  * site-inspection claim handshake columns, channel community-intent state, and
  * the explicit recovery audit table. These assertions are intentionally
  * textual: they pin the exact additive shape so a later edit cannot silently
@@ -13,17 +13,17 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const migrationsDir = fileURLToPath(new URL('./db/migrations/', import.meta.url));
-const migration = readFileSync(`${migrationsDir}148_discovery_integrity_state.sql`, 'utf8');
+const migration = readFileSync(`${migrationsDir}149_discovery_integrity_state.sql`, 'utf8');
 const dbCore = readFileSync(fileURLToPath(new URL('./dbCore.ts', import.meta.url)), 'utf8');
 const siteCache = readFileSync(fileURLToPath(new URL('./siteInspectionCache.ts', import.meta.url)), 'utf8');
 
-test('migration 148 is present and sorts after every earlier migration', () => {
+test('migration 149 is present and sorts after every earlier migration', () => {
   const files = readdirSync(migrationsDir).filter(name => name.endsWith('.sql')).sort();
-  assert.ok(files.includes('148_discovery_integrity_state.sql'));
-  assert.equal(files[files.length - 1], '148_discovery_integrity_state.sql', '148 is the newest migration');
+  assert.ok(files.includes('149_discovery_integrity_state.sql'));
+  assert.equal(files[files.length - 1], '149_discovery_integrity_state.sql', '149 is the newest migration');
 });
 
-test('migration 148 is additive-only (no drops, deletes, or rewrites)', () => {
+test('migration 149 is additive-only (no drops, deletes, or rewrites)', () => {
   const statements = migration.replace(/COMMENT ON[^;]+;/g, '').split(';').map(part => part.trim()).filter(Boolean);
   assert.ok(statements.length > 0);
   for (const statement of statements) {
