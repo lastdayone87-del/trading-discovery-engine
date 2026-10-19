@@ -18,7 +18,7 @@ const MODULES = [
   'server/discovery/evidenceStaging.ts',
   'server/discovery/evidencePipeline.ts',
 ];
-const MIGRATION = 'server/db/migrations/145_evidence_extraction_staging.sql';
+const MIGRATION = 'server/db/migrations/146_evidence_extraction_staging.sql';
 
 function read(path: string): string {
   return readFileSync(new URL(`../../${path}`, import.meta.url), 'utf8');
