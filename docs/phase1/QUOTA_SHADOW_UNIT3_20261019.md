@@ -119,5 +119,19 @@ if it holds uncommitted work). No impact on this unit or the upcoming PR.
 ## Production state
 
 Unchanged: migration 145, discovery flags absent, no probe rows, queues as
-snapshotted. Migration 148 is not applied to production. Next: Unit 4 rebase,
-full suites, tsc, PR (unmerged).
+snapshotted. Migration 148 is not applied to production.
+
+## Post-rebase verification (Unit 4, 2026-10-19)
+
+Rebased onto `origin/main` `82e60e7`; all 15 commits replayed with identical
+patches (`git range-diff` =). Migrations 146/147/148 remain unique and follow
+main's 145.
+
+- CI on `ee5d172` — quota shadow workflow **success**: unit job (tsc clean +
+  12/12 unit tests) and postgres job (8/8, full lineage via `runMigrations`):
+  https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39330317693
+- Local relevant suite batch on the rebased tree: 315 tests, 303 pass, 3 fail,
+  9 skipped; the 3 failures are the pre-existing `quotaRecovery.test.ts` trio
+  that fail identically on pristine `origin/main` (5/8 pass baseline).
+- Rollback proof 146/147 re-verified on the rebased tree (pre-state 145, zero
+  drift): https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39330317684

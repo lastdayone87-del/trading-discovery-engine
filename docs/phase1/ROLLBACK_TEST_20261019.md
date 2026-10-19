@@ -75,3 +75,16 @@ psql "$URL" -f scripts/rollback_146_147.sql   # after 001–147 applied via the 
 
 The script is single-transaction and idempotent; it refuses (non-
 destructively) while evidence-only staging rows exist.
+
+## Post-rebase re-verification (Unit 4, 2026-10-19)
+
+The branch was rebased onto `origin/main` `82e60e7` (which includes migration
+145). The proof now applies the pre-146 lineage `001..145` and asserts
+`max(version)=145` both before and after rollback.
+
+- CI run (success): https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39330317684 · HEAD `ee5d172`
+- PostgreSQL 17.11; `pre_state_max_version=145`
+- Guard refusal preserved: `rollback_146_147 blocked: 1 … row(s)`
+- Transcript: `BEGIN → DO → DROP TABLE → 6×ALTER TABLE → DELETE 1 → DELETE 2 → COMMIT`
+- Re-apply + second rollback identical; `constraints_diff.txt` 0 bytes; `schema_diff.txt` 0 bytes
+- Artifacts (12 files): `/tmp/opencode/evidence/rollback_unit4/phase1-rollback-proof/`
