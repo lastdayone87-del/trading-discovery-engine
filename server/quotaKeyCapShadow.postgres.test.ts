@@ -225,7 +225,10 @@ maybe('concurrency: 20 parallel dispatches serialize per key/day and cap exactly
   assert.equal(results.filter((result) => result.lockSkipped).length, 0, 'no observation skipped');
   assert.equal(results.filter((result) => result.event === null).length, 10, '10 requests fit: 8990 -> 9000');
   assert.equal(results.filter((result) => result.event === 'WOULD_REJECT').length, 10, 'the remaining 10 block');
-  assert.equal(await leaseCount(key), 10);
+  // Shadow mode never blocks: every observed request still executes, so every
+  // request holds a lease (20 total). Only the 10 crossing the cap produce
+  // WOULD_REJECT events.
+  assert.equal(await leaseCount(key), 20);
   const events = await eventRows(key);
   assert.equal(events.length, 10);
   assert.ok(events.every((row) => row.event === 'WOULD_REJECT'));
