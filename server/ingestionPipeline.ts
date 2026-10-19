@@ -33,6 +33,7 @@ import { shouldPreserveExistingChannel } from './terminalPreservationPolicy';
 import { CANDIDATE_TRIAGE_POLICY_VERSION, hasIndependentTradingHypothesis, triageAutonomousSearchCandidate } from './candidateTriage';
 import { evaluateLowAudienceGate, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
 import { shouldReactivateCommunityRecovery, reactivateCommunityRecovery } from './communityRecovery';
+import { maybeRunDiscoveryEvidenceExtraction } from './discovery/evidencePipeline';
 
 export interface IngestionCandidate extends DiscoveredChannelRaw {
   // Option for additional candidate details if provided
@@ -441,6 +442,31 @@ export async function processChannelThroughPipeline(
   // Gate 1 allow-path telemetry: reached only when the channel was neither
   // rejected nor routed to review above.
   bumpGate1Evaluation(countryVal.gateDisposition);
+
+  // Evidence-first discovery Phase 1 (flag `discovery_extraction_enabled`,
+  // absent => OFF): harvest deterministic candidate signals from the metadata
+  // already parsed above and stage screened PROBE_ELIGIBLE candidates.
+  // Fire-and-forget, no new fetches, errors logged and swallowed; writes only
+  // the staging domain and never touches serving/eligibility paths.
+  void maybeRunDiscoveryEvidenceExtraction({
+    channelId: candidate.channelId,
+    channelName: candidate.channelName,
+    description: candidate.description,
+    pinnedComment: candidate.pinnedComment,
+    videoTitles: candidate.videoTitles,
+    videoDescriptions: candidate.videoDescriptions,
+    videos: candidate.videos,
+    detectedLanguages: candidate.detectedLanguages,
+    transcriptExcerpts: candidate.transcriptExcerpts,
+    creatorCountry,
+    fallbackCountry: targetCountry,
+  }).catch(error =>
+    console.warn(
+      `[DiscoveryExtraction] run failed for ${candidate.channelId}:`,
+      error instanceof Error ? error.message : error
+    )
+  );
+
   const lowAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount);
   if (lowAudienceGate.shouldSkipDeepEnrichment) {
     console.log(`[Unified Ingestion Pipeline - Phase 7] Channel '${candidate.channelName}' (${candidate.channelId}) has ${candidate.subscriberCount} subscribers (< 30 threshold). Storing and marking low-audience skip.`);
