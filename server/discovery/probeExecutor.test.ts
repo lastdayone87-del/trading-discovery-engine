@@ -146,7 +146,11 @@ function deps(overrides: Partial<ProbeExecutorDeps> = {}): ProbeExecutorDeps {
     store: new MemoryStore(),
     now: () => new Date('2026-01-01T00:00:00.000Z'),
     readSetting: async (key, fallback) =>
-      key === 'discovery_probe_enabled' ? 'true' : fallback,
+      key === 'discovery_probe_enabled'
+        ? 'true'
+        : key === 'discovery_probe_allowed_countries'
+          ? 'US,Germany'
+          : fallback,
     ...overrides,
   };
 }
@@ -197,6 +201,35 @@ test('kill switch active stops before reservation', async () => {
   assert.equal(summary.skipped, true);
   assert.equal(summary.reason, 'KILL_SWITCH_ACTIVE');
   assert.equal(store.rows.length, 0);
+});
+
+test('kill switch flipped after reservation suppresses retrieval at the outbound boundary', async () => {
+  const store = new MemoryStore();
+  let retrieved = 0;
+  let killReads = 0;
+  const summary = await runApprovedProbe(candidate, {
+    store,
+    now: () => new Date('2026-01-01T00:00:00.000Z'),
+    readSetting: async (key, fallback) => {
+      if (key === 'discovery_probe_enabled') return 'true';
+      if (key === 'discovery_probe_kill_switch') {
+        killReads += 1;
+        // First read is the entry check (clear); the re-read immediately
+        // before the outbound call trips the kill switch.
+        return killReads === 1 ? 'false' : 'true';
+      }
+      if (key === 'discovery_probe_allowed_countries') return 'US,Germany';
+      return fallback;
+    },
+    retrievePage: async () => {
+      retrieved += 1;
+      return { channels: [channel(1)] };
+    },
+  });
+  assert.equal(retrieved, 0, 'no retrieval call may happen after the recheck trips');
+  assert.equal(summary.ran, true);
+  assert.equal(summary.reason, 'KILL_SWITCH_RECHECK');
+  assert.equal(summary.outcome, 'FAILED');
 });
 
 test('one page is retrieved, each channel is ingested, counts and units are recorded', async () => {

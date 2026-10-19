@@ -240,6 +240,88 @@ export async function runApprovedProbe(
     const retrievePage = deps.retrievePage ?? defaultRetrievePage;
     const ingestChannel = deps.ingestChannel ?? defaultIngestChannel;
     const executeStartedAt = Date.now();
+
+    // Kill-switch RE-READ at the outbound boundary: either setting can flip
+    // between reservation and this point, so both are re-read immediately
+    // before the request. A trip (or a settings read failure) suppresses the
+    // request entirely and records the reserved attempt as FAILED.
+    try {
+      const [liveFlag, liveKillSwitch] = await Promise.all([
+        readSetting(DISCOVERY_PROBE_FLAG_KEY, 'false'),
+        readSetting(DISCOVERY_PROBE_KILL_SWITCH_KEY, 'false'),
+      ]);
+      const flagOn = String(liveFlag).trim().toLowerCase() === 'true';
+      const killed = String(liveKillSwitch).trim().toLowerCase() === 'true';
+      if (!flagOn || killed) {
+        const blockReason = killed ? 'KILL_SWITCH_RECHECK' : 'FLAG_RECHECK';
+        await recordProbeOutcome(
+          {
+            probeId: probe.id,
+            outcome: 'FAILED',
+            resultsCount: 0,
+            newCreators: 0,
+            reasons: [blockReason],
+            details: {
+              failureCode: blockReason,
+              elapsedMs: Date.now() - startedAt,
+              executionMs: Date.now() - executeStartedAt,
+              units: 0,
+              pageSize: PROBE_PAGE_SIZE,
+              policyVersion: PROBE_POLICY_VERSION,
+            },
+          },
+          deps
+        );
+        return {
+          ran: true,
+          skipped: false,
+          reason: blockReason,
+          probeId: probe.id,
+          attemptNo: probe.attemptNo,
+          outcome: 'FAILED',
+          resultsCount: 0,
+          ingestedCount: 0,
+          newCreators: 0,
+          elapsedMs: Date.now() - startedAt,
+          units: 0,
+          policyVersion: PROBE_POLICY_VERSION,
+        };
+      }
+    } catch {
+      await recordProbeOutcome(
+        {
+          probeId: probe.id,
+          outcome: 'FAILED',
+          resultsCount: 0,
+          newCreators: 0,
+          reasons: ['KILL_SWITCH_RECHECK_READ_FAILED'],
+          details: {
+            failureCode: 'KILL_SWITCH_RECHECK_READ_FAILED',
+            elapsedMs: Date.now() - startedAt,
+            executionMs: Date.now() - executeStartedAt,
+            units: 0,
+            pageSize: PROBE_PAGE_SIZE,
+            policyVersion: PROBE_POLICY_VERSION,
+          },
+        },
+        deps
+      );
+      return {
+        ran: true,
+        skipped: false,
+        reason: 'KILL_SWITCH_RECHECK_READ_FAILED',
+        probeId: probe.id,
+        attemptNo: probe.attemptNo,
+        outcome: 'FAILED',
+        resultsCount: 0,
+        ingestedCount: 0,
+        newCreators: 0,
+        elapsedMs: Date.now() - startedAt,
+        units: 0,
+        policyVersion: PROBE_POLICY_VERSION,
+      };
+    }
+
     let page: ProbeRetrievalResult;
     try {
       page = await retrievePage({
