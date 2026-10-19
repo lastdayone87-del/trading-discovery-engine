@@ -1,0 +1,159 @@
+# Phase 1 rollback proof for migrations 146/147.
+#
+# Runs the full pre-146 lineage (001..144) onto a disposable postgres:17
+# service container, captures the pre-state, applies 146+147 with the same
+# per-migration transaction semantics as scripts/runMigrations.ts, verifies
+# the expected widening, proves the rollback guard refuses non-destructively
+# while evidence-only rows exist, runs scripts/rollback_146_147.sql, and
+# requires zero schema drift afterwards (byte-identical staging constraints).
+# Scratch database only; no production resources are referenced.
+name: Phase 1 rollback proof (146-147)
+
+on:
+  push:
+    branches:
+      - phase1-hardening
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rollback-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/tde_rollback
+      ADMIN_URL: postgresql://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create scratch database tde_rollback
+        run: |
+          set -euo pipefail
+          psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS tde_rollback"
+          psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -c "CREATE DATABASE tde_rollback"
+          mkdir -p evidence
+          psql "$DATABASE_URL" -tAc "SELECT version()" | tee evidence/server_version.txt
+
+      - name: Apply migrations 001-144 (pre-146/147 state, runner semantics)
+        run: |
+          set -euo pipefail
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c \
+            "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+          for f in $(ls server/db/migrations/*.sql | sort | grep -vE '/(14[67])_'); do
+            name=$(basename "$f"); version=${name%%_*}
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q \
+              -c "BEGIN" -f "$f" \
+              -c "INSERT INTO schema_migrations(version,name,applied_at) VALUES ($version, '$name', now())" \
+              -c "COMMIT"
+          done
+          psql "$DATABASE_URL" -At -c "SELECT 'pre_state_max_version='||max(version) FROM schema_migrations" | tee evidence/pre_state_max_version.txt
+          test "$(psql "$DATABASE_URL" -At -c "SELECT max(version) FROM schema_migrations")" = "144"
+
+      - name: Capture pre-state (constraints + full schema dump)
+        run: |
+          set -euo pipefail
+          psql "$DATABASE_URL" -At -c "SELECT conname||' :: '||pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='discovery_candidate_staging'::regclass ORDER BY conname" > evidence/constraints_pre.txt
+          docker run --rm --network host postgres:17 \
+            pg_dump --schema-only --no-owner --no-privileges "$DATABASE_URL" \
+            | sed -e '/^\\restrict/d' -e '/^\\unrestrict/d' > evidence/schema_pre.sql
+          wc -l evidence/constraints_pre.txt evidence/schema_pre.sql
+
+      - name: Apply migrations 146 + 147
+        run: |
+          set -euo pipefail
+          for f in server/db/migrations/146_*.sql server/db/migrations/147_*.sql; do
+            name=$(basename "$f"); version=${name%%_*}
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q \
+              -c "BEGIN" -f "$f" \
+              -c "INSERT INTO schema_migrations(version,name,applied_at) VALUES ($version, '$name', now())" \
+              -c "COMMIT"
+          done
+
+      - name: Verify expected 146/147 changes
+        run: |
+          set -euo pipefail
+          psql "$DATABASE_URL" -At -c "SELECT conname||' :: '||pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='discovery_candidate_staging'::regclass ORDER BY conname" > evidence/constraints_post.txt
+          grep -q "EVIDENCE_EXTRACTION" evidence/constraints_post.txt
+          grep -q "EVIDENCE_ONLY" evidence/constraints_post.txt
+          grep -q "SEARCH_TERM" evidence/constraints_post.txt
+          test "$(psql "$DATABASE_URL" -At -c "SELECT to_regclass('public.discovery_probe_ledger') IS NOT NULL")" = "t"
+          test "$(psql "$DATABASE_URL" -At -c "SELECT count(*) FROM pg_indexes WHERE tablename='discovery_probe_ledger'")" = "4"
+          test "$(psql "$DATABASE_URL" -At -c "SELECT count(*) FROM discovery_provider_registry WHERE provider_key='evidence_extraction'")" = "1"
+          test "$(psql "$DATABASE_URL" -At -c "SELECT count(*) FROM schema_migrations WHERE version IN (146,147)")" = "2"
+          echo "POST-146/147 EXPECTED CHANGES VERIFIED"
+
+      - name: Guard test - rollback must refuse non-destructively while evidence rows exist
+        run: |
+          set -euo pipefail
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "INSERT INTO discovery_candidate_staging (staging_key, provider_key, retrieval_surface, provider_capability, candidate_type, normalized_identity, raw_locator, country, discovery_mode, resolution_status) VALUES ('evidence-guard-test', 'evidence_extraction', 'SEARCH', 'EVIDENCE_EXTRACTION', 'SEARCH_TERM', 'guard:test', 'guard:test', 'United States', 'EVIDENCE_EXTRACTION', 'EVIDENCE_ONLY')"
+          set +e
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f scripts/rollback_146_147.sql > evidence/rollback_guard_blocked.log 2>&1
+          rc=$?
+          set -e
+          test $rc -ne 0
+          grep -q "rollback_146_147 blocked" evidence/rollback_guard_blocked.log
+          test "$(psql "$DATABASE_URL" -At -c "SELECT count(*) FROM discovery_candidate_staging WHERE staging_key='evidence-guard-test'")" = "1"
+          test "$(psql "$DATABASE_URL" -At -c "SELECT to_regclass('public.discovery_probe_ledger') IS NOT NULL")" = "t"
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "DELETE FROM discovery_candidate_staging WHERE staging_key='evidence-guard-test'"
+          echo "GUARD REFUSAL VERIFIED (row and ledger preserved, rollback aborted)"
+
+      - name: Run rollback
+        run: |
+          set -euo pipefail
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f scripts/rollback_146_147.sql 2>&1 | tee evidence/rollback_execution.log
+
+      - name: Post-rollback verification (zero drift)
+        run: |
+          set -euo pipefail
+          psql "$DATABASE_URL" -At -c "SELECT conname||' :: '||pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='discovery_candidate_staging'::regclass ORDER BY conname" > evidence/constraints_final.txt
+          docker run --rm --network host postgres:17 \
+            pg_dump --schema-only --no-owner --no-privileges "$DATABASE_URL" \
+            | sed -e '/^\\restrict/d' -e '/^\\unrestrict/d' > evidence/schema_final.sql
+          diff -u evidence/constraints_pre.txt evidence/constraints_final.txt > evidence/constraints_diff.txt || true
+          diff -u evidence/schema_pre.sql evidence/schema_final.sql > evidence/schema_diff.txt || true
+          test ! -s evidence/constraints_diff.txt
+          test ! -s evidence/schema_diff.txt
+          test "$(psql "$DATABASE_URL" -At -c "SELECT to_regclass('public.discovery_probe_ledger') IS NOT NULL")" = "f"
+          test "$(psql "$DATABASE_URL" -At -c "SELECT count(*) FROM discovery_provider_registry WHERE provider_key='evidence_extraction'")" = "0"
+          test "$(psql "$DATABASE_URL" -At -c "SELECT count(*) FROM schema_migrations WHERE version IN (146,147)")" = "0"
+          test "$(psql "$DATABASE_URL" -At -c "SELECT max(version) FROM schema_migrations")" = "144"
+          echo "ROLLBACK VERIFIED: zero schema drift, byte-identical staging constraints, ledger/registry/version rows removed"
+
+      - name: Re-apply proof (rollback removes version rows so the runner re-applies)
+        run: |
+          set -euo pipefail
+          for f in server/db/migrations/146_*.sql server/db/migrations/147_*.sql; do
+            name=$(basename "$f"); version=${name%%_*}
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q \
+              -c "BEGIN" -f "$f" \
+              -c "INSERT INTO schema_migrations(version,name,applied_at) VALUES ($version, '$name', now())" \
+              -c "COMMIT"
+          done
+          test "$(psql "$DATABASE_URL" -At -c "SELECT to_regclass('public.discovery_probe_ledger') IS NOT NULL")" = "t"
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f scripts/rollback_146_147.sql > evidence/rollback_second_run.log 2>&1
+          test "$(psql "$DATABASE_URL" -At -c "SELECT to_regclass('public.discovery_probe_ledger') IS NOT NULL")" = "f"
+          echo "RE-APPLY + SECOND ROLLBACK OK (version-keyed runner cannot silently skip)"
+
+      - name: Upload evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase1-rollback-proof
+          path: evidence/
+          if-no-files-found: warn
