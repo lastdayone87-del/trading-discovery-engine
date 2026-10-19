@@ -232,7 +232,10 @@ maybe('concurrency: 20 parallel dispatches serialize per key/day and cap exactly
   const events = await eventRows(key);
   assert.equal(events.length, 10);
   assert.ok(events.every((row) => row.event === 'WOULD_REJECT'));
-  assert.ok(events.every((row) => row.projected_units === 9000));
+  // Rejected calls still execute in shadow mode and still hold leases, so the
+  // projection keeps rising above the cap after the first rejection (9000,
+  // 9001, ...). Every blocking observation is therefore >= cap.
+  assert.ok(events.every((row) => row.projected_units >= 9000));
 });
 
 maybe('stale leases expire, are excluded from projections and swept on restart', async () => {
