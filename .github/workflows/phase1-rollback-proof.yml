@@ -102,7 +102,7 @@ jobs:
       - name: Guard test - rollback must refuse non-destructively while evidence rows exist
         run: |
           set -euo pipefail
-          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "INSERT INTO discovery_candidate_staging (staging_key, provider_key, retrieval_surface, provider_capability, candidate_type, normalized_identity, raw_locator, country, discovery_mode, resolution_status) VALUES ('evidence-guard-test', 'evidence_extraction', 'SEARCH', 'EVIDENCE_EXTRACTION', 'SEARCH_TERM', 'guard:test', 'guard:test', 'United States', 'EVIDENCE_EXTRACTION', 'EVIDENCE_ONLY')"
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "INSERT INTO discovery_candidate_staging (staging_key, provider_key, retrieval_surface, provider_capability, candidate_type, normalized_identity, raw_locator, country, discovery_mode, resolution_status, canonical_candidate_key) VALUES ('evidence-guard-test', 'evidence_extraction', 'SEARCH', 'EVIDENCE_EXTRACTION', 'SEARCH_TERM', 'guard:test', 'guard:test', 'United States', 'EVIDENCE_EXTRACTION', 'EVIDENCE_ONLY', 'guard:canonical:test')"
           set +e
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f scripts/rollback_146_147.sql > evidence/rollback_guard_blocked.log 2>&1
           rc=$?
