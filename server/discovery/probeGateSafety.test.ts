@@ -16,7 +16,7 @@ const MODULES = [
   'server/discovery/probeLedger.ts',
   'server/discovery/probeExecutor.ts',
 ];
-const MIGRATION = 'server/db/migrations/146_discovery_probe_ledger.sql';
+const MIGRATION = 'server/db/migrations/147_discovery_probe_ledger.sql';
 
 function read(path: string): string {
   return readFileSync(new URL(`../../${path}`, import.meta.url), 'utf8');
