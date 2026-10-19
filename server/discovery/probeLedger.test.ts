@@ -170,8 +170,101 @@ function clock(startIso = '2026-01-01T00:00:00.000Z') {
 }
 
 function settings(values: Record<string, string> = {}) {
-  return async (key: string, fallback: string) => values[key] ?? fallback;
+  // The fixture allowlist is intentionally wide so scenario tests exercise the
+  // original denial paths; default-US fail-closed behavior is covered by the
+  // dedicated run-boundary tests below.
+  const fixtureDefaults: Record<string, string> = {
+    discovery_probe_allowed_countries:
+      'US,Germany,Italy,Brazil,Japan,Spain,France,Canada,India',
+  };
+  return async (key: string, fallback: string) => values[key] ?? fixtureDefaults[key] ?? fallback;
 }
+
+test('total run cap denies reservations beyond discovery_probe_max_total', async () => {
+  const store = new MemoryProbeStore();
+  const time = clock();
+  const deps = { store, now: time.now, readSetting: settings({ discovery_probe_max_total: '3' }) };
+  for (let index = 1; index <= 3; index += 1) {
+    const granted = await reserveProbe(
+      { candidateKey: `cap-${index}`, term: 'orderflow', country: 'Germany' },
+      deps
+    );
+    assert.equal(granted.granted, true, `reservation ${index} should be granted`);
+  }
+  const denied = await reserveProbe(
+    { candidateKey: 'cap-4', term: 'orderflow', country: 'Germany' },
+    deps
+  );
+  assert.equal(denied.granted, false);
+  assert.equal(denied.reason, PROBE_REASONS.totalBudget);
+});
+
+test('total cap clamps to [1, 30] and defaults to 30', () => {
+  const base = {
+    maxPerCandidate: '3',
+    minIntervalHours: '24',
+    maxPerDay: '20',
+    maxPerCountryPerDay: '10',
+    allowOfficial: 'false',
+    inFlightTtlMinutes: '15',
+    maxAgeDays: '14',
+  };
+  assert.equal(resolveProbeCapsFromValues({ ...base, maxTotal: '9999' }).maxTotal, 30);
+  assert.equal(resolveProbeCapsFromValues({ ...base, maxTotal: '0' }).maxTotal, 1);
+  assert.equal(resolveProbeCapsFromValues({ ...base }).maxTotal, 30);
+});
+
+test('deadline denies after expiry and fails closed on malformed values', async () => {
+  const store = new MemoryProbeStore();
+  const now = () => new Date('2026-01-01T00:00:00.000Z');
+  const expired = await reserveProbe(
+    { candidateKey: 'deadline-1', term: 'orderflow', country: 'Germany' },
+    {
+      store,
+      now,
+      readSetting: settings({ discovery_probe_deadline: '2020-01-01T00:00:00.000Z' }),
+    }
+  );
+  assert.equal(expired.granted, false);
+  assert.equal(expired.reason, PROBE_REASONS.deadlinePassed);
+
+  const malformed = await reserveProbe(
+    { candidateKey: 'deadline-2', term: 'orderflow', country: 'Germany' },
+    { store, now, readSetting: settings({ discovery_probe_deadline: 'soon-ish' }) }
+  );
+  assert.equal(malformed.granted, false);
+  assert.equal(malformed.reason, PROBE_REASONS.deadlineInvalid);
+
+  const open = await reserveProbe(
+    { candidateKey: 'deadline-3', term: 'orderflow', country: 'Germany' },
+    { store, now, readSetting: settings() }
+  );
+  assert.equal(open.granted, true);
+});
+
+test('country allowlist denies non-listed countries and fails closed on empty values', async () => {
+  const store = new MemoryProbeStore();
+  const now = () => new Date('2026-01-01T00:00:00.000Z');
+  const franceDefaultUs = await reserveProbe(
+    { candidateKey: 'allow-1', term: 'orderflow', country: 'France' },
+    { store, now, readSetting: settings({ discovery_probe_allowed_countries: 'US' }) }
+  );
+  assert.equal(franceDefaultUs.granted, false);
+  assert.equal(franceDefaultUs.reason, PROBE_REASONS.countryNotAllowed);
+
+  const franceExplicit = await reserveProbe(
+    { candidateKey: 'allow-2', term: 'orderflow', country: 'France' },
+    { store, now, readSetting: settings({ discovery_probe_allowed_countries: ' US , France ' }) }
+  );
+  assert.equal(franceExplicit.granted, true);
+
+  const emptyList = await reserveProbe(
+    { candidateKey: 'allow-3', term: 'orderflow', country: 'US' },
+    { store, now, readSetting: settings({ discovery_probe_allowed_countries: ' ' }) }
+  );
+  assert.equal(emptyList.granted, false);
+  assert.equal(emptyList.reason, PROBE_REASONS.countryNotAllowed);
+});
 
 const HOUR_MS = 60 * 60 * 1000;
 
@@ -480,6 +573,10 @@ test('caps default conservatively and settings can only tighten', () => {
     allowOfficial: false,
     inFlightTtlMinutes: PROBE_DEFAULTS.inFlightTtlMinutes,
     maxAgeDays: PROBE_DEFAULTS.maxAgeDays,
+    maxTotal: PROBE_DEFAULTS.maxTotal,
+    deadlineIso: null,
+    deadlineMalformed: false,
+    allowedCountries: ['United States'],
   });
 
   const loosened = resolveProbeCapsFromValues({

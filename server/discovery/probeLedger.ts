@@ -43,12 +43,24 @@ export const PROBE_SETTING_KEYS = {
   allowOfficial: DISCOVERY_PROBE_ALLOW_OFFICIAL_KEY,
   inFlightTtlMinutes: 'discovery_probe_inflight_ttl_minutes',
   maxAgeDays: 'discovery_probe_max_age_days',
+  maxTotal: 'discovery_probe_max_total',
+  deadline: 'discovery_probe_deadline',
+  allowedCountries: 'discovery_probe_allowed_countries',
 } as const;
 
 /**
  * Conservative defaults + hard ceilings. A missing key uses the default; an
  * unparseable/looser value is clamped so a misconfiguration can never enlarge
  * the probe budget beyond the approved bounds.
+ *
+ * Additional run bounds (approval surface):
+ *  - maxTotal: absolute probe cap for the bounded run. Default AND hard ceiling
+ *    are 30; settings can only tighten (1..30).
+ *  - deadline: ISO-8601 UTC instants after which reservations are denied
+ *    (RUN_DEADLINE_PASSED). Absent = no deadline. Malformed fails closed
+ *    (RUN_DEADLINE_INVALID) so a typo can never extend a run.
+ *  - allowedCountries: comma-separated ISO-2 allowlist, default 'US'. Empty or
+ *    malformed values fail closed (deny every country).
  */
 export const PROBE_DEFAULTS = {
   maxPerCandidate: 3,
@@ -58,6 +70,8 @@ export const PROBE_DEFAULTS = {
   allowOfficial: false,
   inFlightTtlMinutes: 15,
   maxAgeDays: 14,
+  maxTotal: 30,
+  allowedCountries: 'US',
 } as const;
 
 export const PROBE_HARD_LIMITS = {
@@ -69,6 +83,7 @@ export const PROBE_HARD_LIMITS = {
   minInFlightTtlMinutes: 1,
   maxInFlightTtlMinutes: 60,
   maxAgeDays: 14,
+  maxTotal: 30,
 } as const;
 
 export const PROBE_ROUTES = ['youtube-innertube', 'youtube-data-api'] as const;
@@ -87,6 +102,14 @@ export interface ProbeCaps {
   allowOfficial: boolean;
   inFlightTtlMinutes: number;
   maxAgeDays: number;
+  /** Absolute cap across the whole bounded run (1..30; settings can only tighten). */
+  maxTotal: number;
+  /** ISO instant after which no reservation is granted; null = no deadline. */
+  deadlineIso: string | null;
+  /** True when the configured deadline is unparseable: fail closed. */
+  deadlineMalformed: boolean;
+  /** ISO-2 allowlist; empty array = deny every country (fail closed). */
+  allowedCountries: string[];
 }
 
 export interface ProbeLedgerRow {
@@ -219,6 +242,10 @@ export const PROBE_REASONS = {
   minInterval: 'MIN_INTERVAL_NOT_ELAPSED',
   globalDailyCap: 'GLOBAL_DAILY_CAP_REACHED',
   countryDailyCap: 'COUNTRY_DAILY_CAP_REACHED',
+  totalBudget: 'TOTAL_BUDGET_EXHAUSTED',
+  deadlinePassed: 'RUN_DEADLINE_PASSED',
+  deadlineInvalid: 'RUN_DEADLINE_INVALID',
+  countryNotAllowed: 'COUNTRY_NOT_ALLOWED',
   inconclusiveNeedsEvidence: 'INCONCLUSIVE_REQUIRES_NEW_EVIDENCE_VERSION',
 } as const;
 
@@ -307,6 +334,9 @@ export function resolveProbeCapsFromValues(values: {
   allowOfficial: string;
   inFlightTtlMinutes: string;
   maxAgeDays: string;
+  maxTotal?: string;
+  deadline?: string;
+  allowedCountries?: string;
 }): ProbeCaps {
   const int = (raw: string, fallback: number, min: number, max: number): number => {
     const trimmed = String(raw ?? '').trim();
@@ -345,21 +375,56 @@ export function resolveProbeCapsFromValues(values: {
       PROBE_HARD_LIMITS.maxInFlightTtlMinutes
     ),
     maxAgeDays: int(values.maxAgeDays, PROBE_DEFAULTS.maxAgeDays, 1, PROBE_HARD_LIMITS.maxAgeDays),
+    maxTotal: int(values.maxTotal ?? '', PROBE_DEFAULTS.maxTotal, 1, PROBE_HARD_LIMITS.maxTotal),
+    ...(() => {
+      const rawDeadline = String(values.deadline ?? '').trim();
+      let deadlineIso: string | null = null;
+      let deadlineMalformed = false;
+      if (rawDeadline) {
+        const parsed = new Date(rawDeadline);
+        if (Number.isNaN(parsed.getTime())) deadlineMalformed = true;
+        else deadlineIso = parsed.toISOString();
+      }
+      const rawCountries =
+        values.allowedCountries === undefined
+          ? PROBE_DEFAULTS.allowedCountries
+          : String(values.allowedCountries).trim();
+      const allowedCountries = rawCountries
+        ? rawCountries
+            .split(',')
+            .map(entry => canonicalCountry(entry.trim()))
+            .filter(entry => Boolean(entry))
+        : [];
+      return { deadlineIso, deadlineMalformed, allowedCountries };
+    })(),
   };
 }
 
 /** Reads every cap. Any read failure propagates so reserveProbe fails closed. */
 export async function resolveProbeCaps(readSetting: ProbeSettingReader): Promise<ProbeCaps> {
-  const [maxPerCandidate, minIntervalHours, maxPerDay, maxPerCountryPerDay, allowOfficial, inFlightTtlMinutes, maxAgeDays] =
-    await Promise.all([
-      readSetting(PROBE_SETTING_KEYS.maxPerCandidate, String(PROBE_DEFAULTS.maxPerCandidate)),
-      readSetting(PROBE_SETTING_KEYS.minIntervalHours, String(PROBE_DEFAULTS.minIntervalHours)),
-      readSetting(PROBE_SETTING_KEYS.maxPerDay, String(PROBE_DEFAULTS.maxPerDay)),
-      readSetting(PROBE_SETTING_KEYS.maxPerCountryPerDay, String(PROBE_DEFAULTS.maxPerCountryPerDay)),
-      readSetting(PROBE_SETTING_KEYS.allowOfficial, PROBE_DEFAULTS.allowOfficial ? 'true' : 'false'),
-      readSetting(PROBE_SETTING_KEYS.inFlightTtlMinutes, String(PROBE_DEFAULTS.inFlightTtlMinutes)),
-      readSetting(PROBE_SETTING_KEYS.maxAgeDays, String(PROBE_DEFAULTS.maxAgeDays)),
-    ]);
+  const [
+    maxPerCandidate,
+    minIntervalHours,
+    maxPerDay,
+    maxPerCountryPerDay,
+    allowOfficial,
+    inFlightTtlMinutes,
+    maxAgeDays,
+    maxTotal,
+    deadline,
+    allowedCountries,
+  ] = await Promise.all([
+    readSetting(PROBE_SETTING_KEYS.maxPerCandidate, String(PROBE_DEFAULTS.maxPerCandidate)),
+    readSetting(PROBE_SETTING_KEYS.minIntervalHours, String(PROBE_DEFAULTS.minIntervalHours)),
+    readSetting(PROBE_SETTING_KEYS.maxPerDay, String(PROBE_DEFAULTS.maxPerDay)),
+    readSetting(PROBE_SETTING_KEYS.maxPerCountryPerDay, String(PROBE_DEFAULTS.maxPerCountryPerDay)),
+    readSetting(PROBE_SETTING_KEYS.allowOfficial, PROBE_DEFAULTS.allowOfficial ? 'true' : 'false'),
+    readSetting(PROBE_SETTING_KEYS.inFlightTtlMinutes, String(PROBE_DEFAULTS.inFlightTtlMinutes)),
+    readSetting(PROBE_SETTING_KEYS.maxAgeDays, String(PROBE_DEFAULTS.maxAgeDays)),
+    readSetting(PROBE_SETTING_KEYS.maxTotal, String(PROBE_DEFAULTS.maxTotal)),
+    readSetting(PROBE_SETTING_KEYS.deadline, ''),
+    readSetting(PROBE_SETTING_KEYS.allowedCountries, PROBE_DEFAULTS.allowedCountries),
+  ]);
   return resolveProbeCapsFromValues({
     maxPerCandidate,
     minIntervalHours,
@@ -368,6 +433,9 @@ export async function resolveProbeCaps(readSetting: ProbeSettingReader): Promise
     allowOfficial,
     inFlightTtlMinutes,
     maxAgeDays,
+    maxTotal,
+    deadline,
+    allowedCountries,
   });
 }
 
@@ -604,6 +672,16 @@ export async function reserveProbe(
     const nowIso = now.toISOString();
     const dayStartIso = utcDayStart(now).toISOString();
 
+    // Bounded-run safeguards (approval surface): absolute deadline + country
+    // allowlist. Both fail closed when malformed; settings can only tighten.
+    if (caps.deadlineMalformed) return denial(PROBE_REASONS.deadlineInvalid);
+    if (caps.deadlineIso && now.getTime() > new Date(caps.deadlineIso).getTime()) {
+      return denial(PROBE_REASONS.deadlinePassed);
+    }
+    if (!caps.allowedCountries.includes(country)) {
+      return denial(PROBE_REASONS.countryNotAllowed);
+    }
+
     return await store.transaction(async tx => {
       await tx.lockCandidate(candidateKey);
       const stats = await tx.getCandidateStats(candidateKey);
@@ -660,6 +738,11 @@ export async function reserveProbe(
       const countryCount = await tx.countProbesSince(dayStartIso, country);
       if (countryCount >= caps.maxPerCountryPerDay) {
         return denial(PROBE_REASONS.countryDailyCap, last);
+      }
+      // Absolute run cap: counts every attempt ever reserved (epoch start).
+      const totalCount = await tx.countProbesSince(new Date(0).toISOString());
+      if (totalCount >= caps.maxTotal) {
+        return denial(PROBE_REASONS.totalBudget, last);
       }
 
       const attemptNo = input.attemptNo ?? (last?.attemptNo ?? 0) + 1;
