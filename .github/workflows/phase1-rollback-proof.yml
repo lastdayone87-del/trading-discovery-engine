@@ -88,12 +88,13 @@ jobs:
       - name: Verify expected 146/147 changes
         run: |
           set -euo pipefail
+          set -x
           psql "$DATABASE_URL" -At -c "SELECT conname||' :: '||pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='discovery_candidate_staging'::regclass ORDER BY conname" > evidence/constraints_post.txt
           grep -q "EVIDENCE_EXTRACTION" evidence/constraints_post.txt
           grep -q "EVIDENCE_ONLY" evidence/constraints_post.txt
           grep -q "SEARCH_TERM" evidence/constraints_post.txt
           test "$(psql "$DATABASE_URL" -At -c "SELECT to_regclass('public.discovery_probe_ledger') IS NOT NULL")" = "t"
-          test "$(psql "$DATABASE_URL" -At -c "SELECT count(*) FROM pg_indexes WHERE tablename='discovery_probe_ledger'")" = "4"
+          test "$(psql "$DATABASE_URL" -At -c "SELECT count(*) FROM pg_indexes WHERE tablename='discovery_probe_ledger' AND indexname IN ('discovery_probe_ledger_candidate_idx','discovery_probe_ledger_reserved_idx','discovery_probe_ledger_country_reserved_idx','discovery_probe_ledger_inflight_idx')")" = "4"
           test "$(psql "$DATABASE_URL" -At -c "SELECT count(*) FROM discovery_provider_registry WHERE provider_key='evidence_extraction'")" = "1"
           test "$(psql "$DATABASE_URL" -At -c "SELECT count(*) FROM schema_migrations WHERE version IN (146,147)")" = "2"
           echo "POST-146/147 EXPECTED CHANGES VERIFIED"
@@ -121,6 +122,7 @@ jobs:
       - name: Post-rollback verification (zero drift)
         run: |
           set -euo pipefail
+          set -x
           psql "$DATABASE_URL" -At -c "SELECT conname||' :: '||pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='discovery_candidate_staging'::regclass ORDER BY conname" > evidence/constraints_final.txt
           docker run --rm --network host postgres:17 \
             pg_dump --schema-only --no-owner --no-privileges "$DATABASE_URL" \
