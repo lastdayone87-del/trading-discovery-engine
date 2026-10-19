@@ -195,3 +195,22 @@ export function mergeCommunityIntentEvidence(
     .sort((a, b) => (b.observedAt || '').localeCompare(a.observedAt || ''))
     .slice(0, Math.max(1, max));
 }
+
+/**
+ * Apply observed platform-community intent to a channel. This is deliberately
+ * disjoint from the Discord projection: it writes only the community state and
+ * never reads or writes discord_status / discord_discovery_status /
+ * discord_invite, so a retained invite and an additional intent coexist.
+ */
+export function applyCommunityIntentEvidence(
+  channel: {
+    community_intents?: CommunityIntentEvidence[] | null;
+    community_discovery_status?: CommunityDiscoveryStatus | null;
+  },
+  incoming: CommunityIntentEvidence[] | null | undefined,
+): boolean {
+  if (!incoming?.length) return false;
+  channel.community_intents = mergeCommunityIntentEvidence(channel.community_intents, incoming);
+  channel.community_discovery_status = resolveCommunityDiscoveryStatus(channel.community_intents);
+  return true;
+}

@@ -53,7 +53,7 @@ import { trialContinuationCap } from './discoveryFrontierTrials';
 import { aggregatedLanguageCandidateSet, mergeCountryValidationResults, validateChannelCountry } from './countryValidator';
 import { runChannelInspection } from './inspector';
 import { hasRetryableCommunityAcquisitionFailure } from './communityRetryPolicy';
-import { mergeCommunityIntentEvidence, resolveCommunityDiscoveryStatus } from './communityIntent';
+import { applyCommunityIntentEvidence } from './communityIntent';
 import { validateDiscordInvite } from './discordValidator';
 import {projectDiscordValidation, reconcileDiscordDiscoveryFromInspection} from './discordProjection';
 import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, fetchYouTubeChannelCountryMetadata, DiscoveredChannelRaw, RetrievalLane } from './youtube';
@@ -1869,10 +1869,7 @@ export async function inspectAndValidateChannel(
     // any other observed surface yields COMMUNITY_INDICATED_NO_INVITE.
     // Evidence merges with existing rows by community URL and keeps the
     // strongest classification (never downgraded by a later weak observation).
-    if (inspection.communityIntent?.length) {
-      channel.community_intents = mergeCommunityIntentEvidence(channel.community_intents, inspection.communityIntent);
-      channel.community_discovery_status = resolveCommunityDiscoveryStatus(channel.community_intents);
-    }
+    applyCommunityIntentEvidence(channel, inspection.communityIntent);
 
   } catch (err) {
     // Preserve any structured discovery even when validation or later

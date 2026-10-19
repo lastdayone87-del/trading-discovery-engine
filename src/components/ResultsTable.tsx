@@ -2,6 +2,7 @@ import { apiFetch } from '../apiClient';
 import { discordCandidateDisplayUrl } from '../utils/discordLocator';
 import React, { useEffect, useMemo, useState } from 'react';
 import { ChannelRecord, ReviewQueueItem } from '../types';
+import { communityIntentDisplay } from './communityIntentDisplay';
 import { ExternalLink, RefreshCw, Eye, Copy, Check, Search, CheckCircle2, XCircle, ShieldAlert, X } from 'lucide-react';
 import { responseError, submitReviewDecision } from '../reviewDecision';
 
@@ -348,6 +349,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                   const retryReconciliationLabel = c.community_retry_job_reconciliation_status === 'RECONCILIATION_REQUIRED'
                     ? `${c.community_retry_job_reconciliation_code || 'STALE_RETRY'} · RECONCILIATION REQUIRED`
                     : '';
+                  const communityIntent = communityIntentDisplay(c);
                   return (
                   <tr key={c.channel_id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40 transition-colors">
                     
@@ -521,10 +523,35 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                           ? 'Website acquisition incomplete'
                           : (c.discord_validation_status === 'NOT_STARTED' || !c.discord_validation_status) && c.scan_status !== 'COMPLETED' && c.scan_status !== 'FAILED' && c.scan_status !== 'FAILED_PERMANENT' && !c.discord_candidate_locator && !c.discord_invite
                           ? 'Not yet inspected'
-                          : c.scan_status === 'COMPLETED' && c.discord_validation_status === 'COMPLETED' && !c.discord_candidate_locator && !c.discord_invite
+                          : communityIntent.present && !c.discord_invite && !c.discord_candidate_locator
+                          ? 'No Discord invite · community indicated'
+                          : c.scan_status === 'COMPLETED' && c.discord_validation_status === 'COMPLETED' && !c.discord_candidate_locator && !c.discord_invite && !communityIntent.present
                           ? 'Clean inspection · no community found'
                           : 'Not discovered'}
                       </div>
+                      {communityIntent.present && (
+                        <div data-testid="community-intent" className={`mt-1.5 rounded-md border px-2 py-1.5 ${
+                          communityIntent.tone === 'paid'
+                            ? 'border-amber-300 bg-amber-50 dark:border-amber-800 dark:bg-amber-950/40'
+                            : 'border-sky-200 bg-sky-50 dark:border-sky-800 dark:bg-sky-950/40'
+                        }`}>
+                          <div className={`text-[10px] font-bold ${
+                            communityIntent.tone === 'paid'
+                              ? 'text-amber-800 dark:text-amber-300'
+                              : 'text-sky-800 dark:text-sky-300'
+                          }`}>
+                            {communityIntent.label}
+                          </div>
+                          {communityIntent.evidence.length > 0 ? communityIntent.evidence.map(item => (
+                            <div key={item.key} className="mt-0.5 text-[10px] text-slate-600 dark:text-slate-300" title={item.url}>
+                              <span className="font-semibold">{item.platform}</span> · {item.intent} · <span className="font-mono break-all">{item.displayUrl}</span>
+                              {item.signals.length > 0 && <span> · {item.signals.join(', ')}</span>}
+                            </div>
+                          )) : (
+                            <div className="mt-0.5 text-[10px] text-slate-500 dark:text-slate-400">Evidence recorded by inspection</div>
+                          )}
+                        </div>
+                      )}
                       {c.discord_liveness_status&&c.discord_liveness_status!=='NOT_CHECKED'&&<div className="text-[10px] text-slate-500">Liveness: <b>{c.discord_liveness_status.replaceAll('_',' ')}</b></div>}
                       {c.discord_relevance_status&&c.discord_relevance_status!=='NOT_CHECKED'&&<div className="text-[10px] text-slate-500">Relevance: <b>{c.discord_relevance_status.replaceAll('_',' ')}</b></div>}
                       {retryReconciliationRequired && <div className="text-[10px] font-semibold text-rose-600" title={retryReconciliationReason}>{retryReconciliationLabel || 'STALE_RETRY · RECONCILIATION REQUIRED'} · reason: {retryReasonLabel}</div>}

@@ -15,6 +15,7 @@ import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
+  applyCommunityIntentEvidence,
   communityPlatformForHost,
   detectPaidSignals,
   detectPrivateSignals,
@@ -180,11 +181,30 @@ test('crawlExternalLinks surfaces reached platform intent; a no-invite platform 
 
 test('projection contract: inspection intent becomes channel state, never "no community"', () => {
   const queue = readSource('queueManager.ts');
-  assert.match(queue, /if \(inspection\.communityIntent\?\.length\) \{/);
-  assert.match(queue, /channel\.community_intents = mergeCommunityIntentEvidence\(channel\.community_intents, inspection\.communityIntent\);/);
-  assert.match(queue, /channel\.community_discovery_status = resolveCommunityDiscoveryStatus\(channel\.community_intents\);/);
+  assert.match(queue, /applyCommunityIntentEvidence\(channel, inspection\.communityIntent\);/);
   const inspector = readSource('inspector.ts');
   assert.match(inspector, /keepCommunityIntent|retainCommunityIntent/);
+});
+
+test('a retained invite and an additional community intent coexist without overwriting either state', () => {
+  const channel: any = {
+    discord_status: 'ACTIVE',
+    discord_discovery_status: 'VALIDATED',
+    discord_invite: 'https://discord.gg/creatora',
+    community_discovery_status: 'NONE',
+    community_intents: null,
+  };
+  const paid = extractCommunityIntentEvidence({
+    pageUrl: 'https://www.whop.com/vip-trading',
+    html: '<h1>VIP Trading Membership</h1><p>Members only — $49/mo</p>',
+  });
+  assert.equal(paid[0]?.intent, 'PAID');
+  assert.equal(applyCommunityIntentEvidence(channel, paid), true);
+  assert.equal(channel.discord_status, 'ACTIVE');
+  assert.equal(channel.discord_discovery_status, 'VALIDATED');
+  assert.equal(channel.discord_invite, 'https://discord.gg/creatora');
+  assert.equal(channel.community_discovery_status, 'PAID_COMMUNITY_INDICATED');
+  assert.equal(channel.community_intents[0].communityUrl, paid[0].communityUrl);
 });
 
 test('persistence contract: channel community state is stored and read back', () => {

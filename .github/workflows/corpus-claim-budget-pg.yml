@@ -5,6 +5,12 @@ on:
     paths:
       - 'server/queueManager.ts'
       - 'server/dbCore.ts'
+      - 'server/communityIntent.ts'
+      - 'server/communityIntentPersistence.postgres.test.ts'
+      - 'server/dashboardCommunityIntentRendering.test.ts'
+      - 'server/paidCommunityIntent.test.ts'
+      - 'src/components/ResultsTable.tsx'
+      - 'src/components/communityIntentDisplay.ts'
       - 'server/candidateCorpus.ts'
       - 'server/candidateScoring.ts'
       - 'server/persistentResearchPhase3.ts'
@@ -68,6 +74,10 @@ jobs:
         run: npx tsx --test server/corpusClaimBudget.postgres.test.ts
       - name: Corpus pipeline unit tests
         run: npx tsx --test server/corpusPipelineWorker.test.ts
+      - name: Community intent PostgreSQL persistence/API test
+        run: npx tsx --test server/communityIntentPersistence.postgres.test.ts
+      - name: Community intent dashboard/projection tests
+        run: npx tsx --test server/dashboardCommunityIntentRendering.test.ts server/paidCommunityIntent.test.ts
   bootstrap-pg-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 20
