@@ -1,0 +1,67 @@
+# Phase 1 quota cap shadow (migration 148) — unit + PostgreSQL tests.
+#
+# Scratch-only: disposable postgres:17 service container, no production
+# resources are referenced. Applies the full migration lineage with the real
+# runner (including 148) and runs the shadow-accounting suites: boundary,
+# duplicate accounting, 20-way per-key concurrency, stale-lease sweep,
+# restart recovery and settlement release.
+name: Phase 1 quota shadow (148)
+
+on:
+  push:
+    branches:
+      - phase1-hardening
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: TypeScript check
+        run: npx tsc --noEmit
+      - name: Quota shadow unit tests (pure logic + guarded hooks)
+        run: npx tsx --test server/quotaKeyCapShadow.test.ts
+
+  postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: tde_quota_shadow
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d tde_quota_shadow"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/tde_quota_shadow
+      QUOTA_SHADOW_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/tde_quota_shadow
+      PGSSL: disable
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Apply full migration lineage (runner semantics, includes 148)
+        run: npx tsx scripts/runMigrations.ts
+      - name: Quota shadow PostgreSQL tests
+        run: npx tsx --test server/quotaKeyCapShadow.postgres.test.ts

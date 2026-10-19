@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { ChannelActivityBand, CountryMetadataStatus, CountryVocabulary } from '../src/types';
-import { incrementQuota, getAppSetting, getYouTubeKeyPool, appendProviderCallEvent, recordYouTubeInvalidInput, isYouTubeInputQuarantined, recordYouTubeProviderSuspension } from './db';
+import { incrementQuota, getAppSetting, getDb, getYouTubeKeyPool, appendProviderCallEvent, recordYouTubeInvalidInput, isYouTubeInputQuarantined, recordYouTubeProviderSuspension } from './db';
 import { fingerprintYouTubeKey } from './youtubeQuotaAttribution';
+import { recordShadowDispatchSafe } from './quotaKeyCapShadow';
 import { getConfiguredYouTubeProviders, getYouTubeQuotaGroupForKey } from './youtubeKeyPool';
 import {
   YOUTUBE_INPUT_QUARANTINE_TTL_MS,
@@ -434,6 +435,16 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
         // wire, this response must compare stale (not current) when the
         // reader validates it below.
         const dispatchFailureGeneration=dispatchedProviderKey?youtubeProviderCooldown.failureGeneration(dispatchedProviderKey):undefined;
+        if(dispatchedProviderKey){
+          // Shadow-only cap observation (never blocks or alters dispatch):
+          // record an in-flight lease plus any projected WOULD_DEFER/
+          // WOULD_REJECT for the 9,000-unit/day per-key cap. Disabled by
+          // default; every failure is swallowed inside the helper.
+          await recordShadowDispatchSafe(
+            {readSetting:getAppSetting,pool:await getDb()},
+            {keyFingerprint:fingerprintYouTubeKey(dispatchedProviderKey),operationId:`shadow:${operation}:${randomUUID()}`,units:actualCost}
+          );
+        }
         let response: Response;
         try {
           response=await fetch(dispatchedUrl,{signal});

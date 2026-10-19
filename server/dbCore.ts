@@ -12,6 +12,7 @@ import { getConfiguredYouTubeKeys, getConfiguredYouTubeProviders } from './youtu
 import { youtubeProviderCooldown, type YouTubeProviderOperationalStatus } from './youtubeProviderCooldown';
 import type { AuditEvent } from './operatorAuth';
 import type { ProviderCallEvent } from './providerResilience';
+import { resolveShadowConfig, settleShadowLeaseWithSavepoint } from './quotaKeyCapShadow';
 import { canonicalCountry } from './countryInference';
 import { safeCrawlerTelemetry, type CrawlerTelemetry } from './crawlerTelemetry';
 import { validateLedgerInput, type ValidationKind, type ValidationStatus } from './phase3Validation';
@@ -868,7 +869,7 @@ export async function claimYouTubeQuotaOperation(client:QueryExecutor, operation
 export async function incrementQuota(units:number, providerKey:string, operationId?: string):Promise<void>{
   if(!Number.isSafeInteger(units)||units<=0)throw new Error('YouTube quota charge must be a positive integer.');
   const keys=getYouTubeKeyPool(); const keyIndex=keys.indexOf(providerKey)+1; if(keyIndex<1)throw new Error('YouTube quota charge provider key is not configured.');
-  const db=await getDb(); const client=await db.connect(); const today=getYouTubeQuotaDay(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=getDailyYouTubeQuotaBudget();
+  const today=getYouTubeQuotaDay(); const shadowConfig=await resolveShadowConfig(getAppSetting).catch(()=>null); const db=await getDb(); const client=await db.connect(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=getDailyYouTubeQuotaBudget();
   try{
     await client.query('BEGIN');
     if (operationId) {
@@ -878,7 +879,14 @@ export async function incrementQuota(units:number, providerKey:string, operation
       // charge instead of double-counting the same response.
       if (!await claimYouTubeQuotaOperation(client, operationId, today, fingerprintYouTubeKey(providerKey), units)) { await client.query('COMMIT'); return; }
     }
-    await ensureYouTubeQuotaDay(client,today,limit);await client.query(`SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE`);await ensureYouTubeKeyRows(client,today,keys,perKey);await client.query(`UPDATE quota_tracker SET units_used=units_used+$1,daily_limit=$2,last_reset=$3 WHERE id='youtube'`,[units,limit,today]);await client.query(`UPDATE youtube_key_quota_usage SET units_used=units_used+$1,updated_at=now() WHERE quota_day=$2 AND key_fingerprint=$3`,[units,today,fingerprintYouTubeKey(providerKey)]);await client.query('COMMIT');}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
+    await ensureYouTubeQuotaDay(client,today,limit);await client.query(`SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE`);await ensureYouTubeKeyRows(client,today,keys,perKey);await client.query(`UPDATE quota_tracker SET units_used=units_used+$1,daily_limit=$2,last_reset=$3 WHERE id='youtube'`,[units,limit,today]);await client.query(`UPDATE youtube_key_quota_usage SET units_used=units_used+$1,updated_at=now() WHERE quota_day=$2 AND key_fingerprint=$3`,[units,today,fingerprintYouTubeKey(providerKey)]);
+    if(shadowConfig?.enabled){
+      // Shadow-only observation: release one matching in-flight lease so
+      // settled usage + leases never double count. Savepoint-guarded so a
+      // shadow failure can never poison the official charge transaction.
+      await settleShadowLeaseWithSavepoint(client,{quotaDay:today,keyFingerprint:fingerprintYouTubeKey(providerKey),units});
+    }
+    await client.query('COMMIT');}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
 }
 
 export async function getSchemaInfo(): Promise<{currentVersion:number;migrations:Array<{version:number;name:string;applied_at:string}>;channelCount:number}> { const db=await getDb(); const mig=await db.query('SELECT version,name,applied_at FROM schema_migrations ORDER BY version'); const cnt=await db.query('SELECT COUNT(*)::int count FROM channels'); return {currentVersion:mig.rows.at(-1)?.version||0,migrations:mig.rows.map(r=>({version:r.version,name:r.name,applied_at:iso(r.applied_at)!})),channelCount:cnt.rows[0].count}; }
