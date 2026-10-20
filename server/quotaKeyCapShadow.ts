@@ -1,9 +1,10 @@
-import { getYouTubeQuotaDay } from './youtubeQuotaDay';
+import { getNextYouTubeQuotaResetAt, getYouTubeQuotaDay, getYouTubeQuotaDayStartAt } from './youtubeQuotaDay';
 
 /**
- * Shadow-only accounting for a projected per-key YouTube daily cap.
+ * Per-key YouTube daily cap accounting: observational shadow mode plus a
+ * separate, default-OFF hard-enforcement path that reuses the same leases.
  *
- * Hard guarantees:
+ * Shadow mode guarantees:
  *  - Enabled by `youtube_key_cap_shadow_enabled = 'true'` only; absent/other
  *    values are OFF. Read failures disable the shadow (never throw).
  *  - Observational: records leases + WOULD_DEFER/WOULD_REJECT events only.
@@ -18,7 +19,11 @@ import { getYouTubeQuotaDay } from './youtubeQuotaDay';
 export const SHADOW_ENABLED_KEY = 'youtube_key_cap_shadow_enabled';
 export const SHADOW_CAP_KEY = 'youtube_key_cap_shadow_cap_units';
 export const SHADOW_TTL_KEY = 'youtube_key_cap_shadow_lease_ttl_ms';
+/** Hard-enforcement flag. Absent/non-true => OFF (shadow-only, legacy traffic). */
+export const ENFORCED_KEY = 'youtube_key_daily_cap_enforced';
 export const SHADOW_CAP_UNITS = 9000;
+/** Hard cap is fixed at the approved 9,000 units/key/Pacific day. */
+export const ENFORCED_CAP_UNITS = 9000;
 export const SHADOW_LEASE_TTL_MS = 120_000;
 export const SHADOW_CONFIG_TTL_MS = 30_000;
 export const SHADOW_SWEEP_INTERVAL_MS = 60_000;
@@ -35,6 +40,8 @@ export const SHADOW_STATEMENT_TIMEOUT_MS = 5_000;
 /** Lifetime of the inert settlement tombstone. It must outlive any cancelled
  * observation so a late insert cannot recreate a lease or event. */
 export const SHADOW_SETTLEMENT_TOMBSTONE_TTL_MS = 15 * 60_000;
+/** Fail-closed reservation lock budget. A reservation waits at most this long. */
+export const ENFORCED_LOCK_TIMEOUT_MS = 5_000;
 
 export type ShadowEvent = 'WOULD_DEFER' | 'WOULD_REJECT';
 export type ShadowSettingReader = (key: string, fallback: string) => Promise<string>;
@@ -45,6 +52,82 @@ export interface ShadowConfig {
 }
 export interface ShadowQueryClient {
   query(text: string, values?: unknown[]): Promise<{ rows: Array<Record<string, unknown>>; rowCount?: number | null }>;
+}
+
+export type KeyCapMode = 'enforce' | 'shadow';
+
+/**
+ * Reservation identity attached to the provider Response and handed to
+ * incrementQuota() so the exact lease (day + operation + key) settles in the
+ * same transaction as the official charge. quotaDay is the dispatch day, so a
+ * request that crosses Pacific midnight still settles into the day it was
+ * admitted against.
+ */
+export interface KeyCapReservationContext {
+  mode: KeyCapMode;
+  operationId: string;
+  quotaDay: string;
+  keyFingerprint: string;
+  /** Units reserved at dispatch; settlement must match exactly. */
+  units: number;
+}
+
+export interface EnforcedKeyCapReservation extends KeyCapReservationContext {
+  mode: 'enforce';
+  projectedBefore: number;
+}
+
+/** Raised when the per-key/day hard cap cannot admit the request. Callers may
+ * rotate to another key for this acquisition, but must never mark the key
+ * suspended/dead: capacity exhaustion is not a key-health failure. */
+export class YouTubeKeyCapExceededError extends Error {
+  readonly code = 'YOUTUBE_KEY_CAP_EXCEEDED';
+  readonly keyCapExceeded = true;
+  readonly rotateKey = true;
+  readonly markSuspension = false;
+  /** Prevent generic failure handlers from classifying this as key death. */
+  readonly providerFailureRecorded = true;
+  constructor(
+    readonly quotaDay: string,
+    readonly keyFingerprint: string,
+    readonly projectedUnits: number,
+    readonly requestUnits: number,
+    readonly capUnits: number = ENFORCED_CAP_UNITS,
+  ) {
+    super(
+      `YouTube API key daily cap exceeded for ${quotaDay}: ${projectedUnits} settled/in-flight + ${requestUnits} requested > ${capUnits}.`,
+    );
+    this.name = 'YouTubeKeyCapExceededError';
+  }
+}
+
+/** Raised when enforcement cannot prove capacity (settings/DB/lock/release
+ * failure). Fail closed: the official provider call must not proceed. */
+export class YouTubeKeyCapUnavailableError extends Error {
+  readonly code = 'YOUTUBE_KEY_CAP_UNAVAILABLE';
+  readonly keyCapUnavailable = true;
+  readonly rotateKey = true;
+  readonly markSuspension = false;
+  readonly providerFailureRecorded = true;
+  constructor(
+    message: string,
+    readonly details: {
+      quotaDay?: string;
+      keyFingerprint?: string;
+      operationId?: string;
+      cause?: unknown;
+    } = {},
+  ) {
+    super(message, details.cause === undefined ? undefined : { cause: details.cause });
+    this.name = 'YouTubeKeyCapUnavailableError';
+  }
+}
+
+export function isYouTubeKeyCapError(error: unknown): boolean {
+  return error instanceof YouTubeKeyCapExceededError
+    || error instanceof YouTubeKeyCapUnavailableError
+    || (error as { code?: unknown } | null)?.code === 'YOUTUBE_KEY_CAP_EXCEEDED'
+    || (error as { code?: unknown } | null)?.code === 'YOUTUBE_KEY_CAP_UNAVAILABLE';
 }
 
 /** Integer 1..9000; malformed or missing values fall back to 9000. */
@@ -115,12 +198,44 @@ export function resetShadowConfigCacheForTests(): void {
   cachedConfig = null;
 }
 
+let cachedEnforcement: { at: number; enabled: boolean } | null = null;
+
+/**
+ * Reads `youtube_key_daily_cap_enforced` (default false). A settings read
+ * failure is never treated as "disabled": it throws a typed unavailable error
+ * so an enabled deployment cannot silently bypass its cap. Normal absent/false
+ * values keep the legacy shadow-only path.
+ */
+export async function resolveKeyCapEnforcement(
+  readSetting: ShadowSettingReader,
+  now: number = Date.now()
+): Promise<boolean> {
+  if (cachedEnforcement && now - cachedEnforcement.at < SHADOW_CONFIG_TTL_MS) return cachedEnforcement.enabled;
+  try {
+    const raw = await readSetting(ENFORCED_KEY, 'false');
+    const enabled = String(raw).trim().toLowerCase() === 'true';
+    cachedEnforcement = { at: now, enabled };
+    return enabled;
+  } catch (error) {
+    // Last-known state: an enabled deployment stays fail-closed, while a
+    // successfully observed OFF state keeps the legacy shadow-only behavior.
+    if (cachedEnforcement?.enabled === false) return false;
+    throw new YouTubeKeyCapUnavailableError('Unable to read YouTube key cap enforcement setting.', { cause: error });
+  }
+}
+
+export function resetKeyCapEnforcementCacheForTests(): void {
+  cachedEnforcement = null;
+}
+
 let lastSweepAt = 0;
 let lastEventSweepAt = 0;
+let lastEnforcedSweepAt = 0;
 
 export function resetShadowSweepClockForTests(): void {
   lastSweepAt = 0;
   lastEventSweepAt = 0;
+  lastEnforcedSweepAt = 0;
 }
 
 export interface ShadowDispatchInput {
@@ -215,15 +330,21 @@ export async function recordShadowDispatch(
 export interface ShadowSettlementInput {
   quotaDay: string;
   keyFingerprint: string;
-  units: number;
-  /** Exact dispatch operation id when available. Settlement then removes that
-   * lease and writes an inert tombstone, so a cancelled/late observation can
-   * never recreate the lease or a false cap event. */
+  /** Required for legacy unit-matched settlement; optional with operationId. */
+  units?: number;
+  /** Exact reservation identity. When present, day+operation+key settles one
+   * lease and writes an inert tombstone, so a cancelled/late observation
+   * cannot recreate the lease or a false cap event. */
   operationId?: string;
   now?: Date;
 }
 
-const SETTLE_SQL = `
+const SETTLE_EXACT_SQL = `
+DELETE FROM youtube_key_cap_shadow_leases
+ WHERE quota_day = $1 AND operation_id = $2 AND key_fingerprint = $3
+`;
+
+const SETTLE_LEGACY_SQL = `
 DELETE FROM youtube_key_cap_shadow_leases
  WHERE id = (
    SELECT id FROM youtube_key_cap_shadow_leases
@@ -238,7 +359,7 @@ DELETE FROM youtube_key_cap_shadow_leases
 const SETTLE_BY_OPERATION_SQL = `
 WITH removed AS (
   DELETE FROM youtube_key_cap_shadow_leases
-   WHERE quota_day = $1 AND operation_id = $2
+   WHERE quota_day = $1 AND operation_id = $2 AND key_fingerprint = $3
    RETURNING 1
 )
 INSERT INTO youtube_key_cap_shadow_settled
@@ -249,10 +370,11 @@ ON CONFLICT (quota_day, operation_id) DO UPDATE
 `;
 
 /**
- * Releases one matching in-flight lease when the official charge settles, so
- * settled usage + leases never double count. With an operation id the release
- * is exact and writes an inert tombstone that fences a late/cancelled
- * observation; without one it falls back to the documented exact-unit match.
+ * Releases one in-flight lease when the official charge settles, so settled
+ * usage + leases never double count. With an operation id the release is exact
+ * and writes an inert tombstone that fences a late/cancelled observation;
+ * without one the legacy exact-unit match is retained for older callers.
+ * Charges with no observed dispatch (or extra quota callbacks) are no-ops.
  */
 export async function settleShadowLease(
   client: ShadowQueryClient,
@@ -270,7 +392,7 @@ export async function settleShadowLease(
     ]);
     return (result.rowCount ?? 0) > 0;
   }
-  const result = await client.query(SETTLE_SQL, [
+  const result = await client.query(SETTLE_LEGACY_SQL, [
     input.quotaDay,
     input.keyFingerprint,
     input.units,
@@ -295,6 +417,25 @@ export async function settleShadowLeaseWithSavepoint(
     await client.query('RELEASE SAVEPOINT youtube_cap_shadow_settle').catch(() => undefined);
     return false;
   }
+}
+
+/**
+ * Settles a reservation context inside the official charge transaction.
+ * Enforce failures propagate (rolling back the charge); shadow failures stay
+ * inside a savepoint and are swallowed exactly as before.
+ */
+export async function settleKeyCapReservation(
+  client: ShadowQueryClient,
+  context: KeyCapReservationContext,
+  options: { savepoint?: boolean } = {},
+): Promise<boolean> {
+  const input: ShadowSettlementInput = {
+    quotaDay: context.quotaDay,
+    keyFingerprint: context.keyFingerprint,
+    operationId: context.operationId,
+  };
+  const useSavepoint = options.savepoint ?? context.mode === 'shadow';
+  return useSavepoint ? settleShadowLeaseWithSavepoint(client, input) : settleShadowLease(client, input);
 }
 
 export async function sweepShadowLeases(
@@ -439,6 +580,236 @@ export async function recordShadowDispatchSafe(
     }
   } catch {
     return SHADOW_DISPATCH_DISABLED;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Hard enforcement (default OFF; uses the same lease table as the shadow)
+// ---------------------------------------------------------------------------
+
+export interface EnforcedReservationInput {
+  keyFingerprint: string;
+  operationId: string;
+  units: number;
+  quotaDay?: string;
+  now?: Date;
+  lockTimeoutMs?: number;
+}
+
+export interface KeyCapReserveDeps {
+  readSetting: ShadowSettingReader;
+  pool: ShadowPoolPort;
+}
+
+const PROJECTED_SQL = `
+SELECT COALESCE((
+         SELECT units_used FROM youtube_key_quota_usage
+          WHERE quota_day = $1 AND key_fingerprint = $2
+       ), 0)::int
+     + COALESCE((
+         SELECT SUM(reserved_units) FROM youtube_key_cap_shadow_leases
+          WHERE quota_day = $1 AND key_fingerprint = $2 AND expires_at > $3
+       ), 0)::int AS projected_units
+`;
+
+const EXISTING_LEASE_SQL = `
+SELECT id, key_fingerprint, reserved_units FROM youtube_key_cap_shadow_leases
+ WHERE quota_day = $1 AND operation_id = $2
+ FOR UPDATE
+`;
+
+const INSERT_LEASE_SQL = `
+INSERT INTO youtube_key_cap_shadow_leases
+  (quota_day, operation_id, key_fingerprint, reserved_units, reserved_at, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (quota_day, operation_id) DO NOTHING
+RETURNING id
+`;
+
+const REFRESH_LEASE_SQL = `
+UPDATE youtube_key_cap_shadow_leases SET expires_at = $3
+ WHERE quota_day = $1 AND operation_id = $2 AND key_fingerprint = $4
+`;
+
+function normalizedReservationInput(input: EnforcedReservationInput): {
+  units: number;
+  keyFingerprint: string;
+  operationId: string;
+  quotaDay: string;
+  now: Date;
+} {
+  const units = Math.max(1, Math.round(Number(input.units)));
+  const keyFingerprint = String(input.keyFingerprint || '');
+  const operationId = String(input.operationId || '');
+  const now = input.now ?? new Date();
+  // Anchor the day to the existing America/Los_Angeles day-start helper so
+  // reservation and settlement never fall back to UTC date truncation.
+  const quotaDayStartAt = getYouTubeQuotaDayStartAt(now);
+  const quotaDay = input.quotaDay || getYouTubeQuotaDay(new Date(quotaDayStartAt));
+  if (!keyFingerprint || !operationId || !Number.isFinite(units)) {
+    throw new YouTubeKeyCapUnavailableError('Invalid YouTube key cap reservation input.', {
+      quotaDay,
+      keyFingerprint,
+      operationId,
+    });
+  }
+  return { units, keyFingerprint, operationId, quotaDay, now };
+}
+
+function capUnavailable(
+  message: string,
+  input: { quotaDay?: string; keyFingerprint?: string; operationId?: string },
+  cause?: unknown,
+): YouTubeKeyCapUnavailableError {
+  return new YouTubeKeyCapUnavailableError(message, { ...input, cause });
+}
+
+/**
+ * Reserves capacity only when `youtube_key_daily_cap_enforced=true`; returns
+ * null (zero DB work beyond the settings read) when OFF. Callers must treat a
+ * thrown error as fatal for the official request.
+ */
+export async function reserveYouTubeKeyCap(
+  deps: KeyCapReserveDeps,
+  input: EnforcedReservationInput,
+): Promise<EnforcedKeyCapReservation | null> {
+  if (!await resolveKeyCapEnforcement(deps.readSetting)) return null;
+  return reserveEnforcedKeyCap(deps, input);
+}
+
+/**
+ * One short transaction per dispatch: per-key/day advisory lock, projection =
+ * settled usage + unexpired in-flight leases, then an idempotent lease insert
+ * only when projected + request <= 9000. Different operations on the same key
+ * serialize behind the lock; operations on different keys proceed in parallel.
+ */
+export async function reserveEnforcedKeyCap(
+  deps: KeyCapReserveDeps,
+  input: EnforcedReservationInput,
+): Promise<EnforcedKeyCapReservation> {
+  const normalized = normalizedReservationInput(input);
+  const { units, keyFingerprint, operationId, quotaDay, now } = normalized;
+  const lockTimeoutMs = Math.max(
+    1,
+    Math.min(ENFORCED_LOCK_TIMEOUT_MS, Math.round(Number(input.lockTimeoutMs ?? ENFORCED_LOCK_TIMEOUT_MS))),
+  );
+  // A hard-cap reservation must never lapse while its HTTP request may still
+  // be in flight or while a successful response is waiting to be accounted.
+  // Keep it until the Pacific day resets; a crashed process then under-admits
+  // for the rest of the day instead of reopening capacity it may have spent.
+  const expiresAt = new Date(getNextYouTubeQuotaResetAt(now));
+  // Reuse the shadow sweep for day-old enforced leases. Cleanup is never
+  // fatal to an admission decision; it only bounds table growth.
+  if (now.getTime() - lastEnforcedSweepAt >= SHADOW_SWEEP_INTERVAL_MS) {
+    lastEnforcedSweepAt = now.getTime();
+    await sweepShadowLeases(deps.pool, now).catch(() => 0);
+  }
+  let client: ShadowConnectionPort;
+  try {
+    client = await deps.pool.connect();
+  } catch (error) {
+    throw capUnavailable('YouTube key cap database connection failed.', { quotaDay, keyFingerprint, operationId }, error);
+  }
+  try {
+    await client.query('BEGIN');
+    await client.query(`SET LOCAL lock_timeout = '${lockTimeoutMs}ms'`);
+    try {
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
+        `youtube-key-cap-enforce:${quotaDay}:${keyFingerprint}`,
+      ]);
+    } catch (error) {
+      throw capUnavailable(
+        (error as { code?: unknown } | null)?.code === '55P03'
+          ? 'YouTube key cap reservation lock timed out.'
+          : 'YouTube key cap reservation lock failed.',
+        { quotaDay, keyFingerprint, operationId },
+        error,
+      );
+    }
+
+    // Retrying the same dispatch identity is idempotent: extend its lease but
+    // never charge capacity twice.
+    const existing = await client.query(EXISTING_LEASE_SQL, [quotaDay, operationId]);
+    if (existing.rows.length > 0) {
+      if (String(existing.rows[0].key_fingerprint) !== keyFingerprint) {
+        throw capUnavailable('YouTube key cap operation ID is already reserved for another key.', {
+          quotaDay, keyFingerprint, operationId,
+        });
+      }
+      const reservedUnits = Number(existing.rows[0].reserved_units);
+      if (!Number.isSafeInteger(reservedUnits) || reservedUnits !== units) {
+        throw capUnavailable('YouTube key cap operation ID is already reserved with different units.', {
+          quotaDay, keyFingerprint, operationId,
+        });
+      }
+      await client.query(REFRESH_LEASE_SQL, [quotaDay, operationId, expiresAt, keyFingerprint]);
+      const projected = await client.query(PROJECTED_SQL, [quotaDay, keyFingerprint, now]);
+      await client.query('COMMIT');
+      return {
+        mode: 'enforce',
+        operationId,
+        quotaDay,
+        keyFingerprint,
+        units,
+        projectedBefore: Number(projected.rows[0]?.projected_units ?? 0),
+      };
+    }
+
+    const projected = await client.query(PROJECTED_SQL, [quotaDay, keyFingerprint, now]);
+    const projectedBefore = Number(projected.rows[0]?.projected_units ?? 0);
+    if (!Number.isFinite(projectedBefore) || projectedBefore + units > ENFORCED_CAP_UNITS) {
+      throw new YouTubeKeyCapExceededError(quotaDay, keyFingerprint, projectedBefore, units);
+    }
+    const inserted = await client.query(INSERT_LEASE_SQL, [
+      quotaDay, operationId, keyFingerprint, units, now, expiresAt,
+    ]);
+    if ((inserted.rowCount ?? 0) < 1) {
+      // A concurrent dispatch on another key/day can only collide on the
+      // global (quota_day, operation_id) uniqueness rule. Never admit an
+      // ambiguous identity.
+      const conflicting = await client.query(
+        `SELECT key_fingerprint FROM youtube_key_cap_shadow_leases WHERE quota_day = $1 AND operation_id = $2`,
+        [quotaDay, operationId],
+      );
+      if (String(conflicting.rows[0]?.key_fingerprint || '') !== keyFingerprint) {
+        throw capUnavailable('YouTube key cap operation ID collided with another reservation.', {
+          quotaDay, keyFingerprint, operationId,
+        });
+      }
+    }
+    await client.query('COMMIT');
+    return { mode: 'enforce', operationId, quotaDay, keyFingerprint, units, projectedBefore };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    if (isYouTubeKeyCapError(error)) throw error;
+    throw capUnavailable('YouTube key cap reservation transaction failed.', {
+      quotaDay, keyFingerprint, operationId,
+    }, error);
+  } finally {
+    client.release?.();
+  }
+}
+
+/**
+ * Releases an exact reservation for a failed (non-OK / thrown) provider call.
+ * Enforce-mode failures throw typed unavailable (fail closed); shadow-mode
+ * failures are swallowed because the lease expires by TTL.
+ */
+export async function releaseKeyCapReservation(
+  pool: ShadowQueryClient,
+  context: KeyCapReservationContext,
+): Promise<boolean> {
+  try {
+    const result = await pool.query(
+      `DELETE FROM youtube_key_cap_shadow_leases WHERE quota_day = $1 AND operation_id = $2 AND key_fingerprint = $3`,
+      [context.quotaDay, context.operationId, context.keyFingerprint],
+    );
+    return (result.rowCount ?? 0) > 0;
+  } catch (error) {
+    if (context.mode === 'enforce') {
+      throw capUnavailable('YouTube key cap reservation release failed.', context, error);
+    }
+    return false;
   }
 }
 

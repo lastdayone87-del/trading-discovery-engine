@@ -195,7 +195,7 @@ test('prune validates retention before touching the database', async () => {
   }
 });
 
-test('incrementQuota combines group-aware budgeting with operationId idempotency', async () => {
+test('incrementQuota combines group-aware budgeting, operationId idempotency, and dispatch-day per-key accounting', async () => {
   const { readFileSync } = await import('node:fs');
   const dbCore = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
   const start = dbCore.indexOf('export async function incrementQuota');
@@ -210,6 +210,15 @@ test('incrementQuota combines group-aware budgeting with operationId idempotency
   // alongside group-aware budgeting (neither side taken wholesale).
   assert.match(charge, /if \(operationId\)/);
   assert.match(charge, /claimYouTubeQuotaOperation\(client, operationId/);
+  // Per-key usage and lease settlement follow the dispatch day, while the
+  // singleton quota_tracker stays on the current Pacific day. A late prior-day
+  // settlement must not rewind last_reset and zero current-day usage.
+  assert.ok(charge.includes('const keyQuotaDay=reservation?.quotaDay||getYouTubeQuotaDay();'));
+  assert.ok(charge.includes('const trackerDay=getYouTubeQuotaDay();'));
+  assert.ok(charge.includes('ensureYouTubeQuotaDay(client,trackerDay,limit)'));
+  assert.ok(charge.includes('ensureYouTubeKeyRows(client,keyQuotaDay,keys,perKey)'));
+  assert.ok(charge.includes('[units,limit,trackerDay]'));
+  assert.ok(charge.includes('[units,keyQuotaDay,keyFingerprint]'));
   // getQuota reports the same group-aware daily limit.
   const quotaStart = dbCore.indexOf('export async function getQuota');
   const quotaEnd = dbCore.indexOf('export async function incrementQuota', quotaStart);
