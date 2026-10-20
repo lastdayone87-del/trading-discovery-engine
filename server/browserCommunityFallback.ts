@@ -588,6 +588,54 @@ export function partitionRenderedClickTargets(
 }
 
 /**
+ * Click slots still available after reserving the controls already queued but
+ * not yet attempted. Freshly revealed controls must not be appended beyond the
+ * per-page cap: the loop stops at that cap, so an over-queued control would be
+ * neither clicked nor counted as a coverage gap.
+ */
+export function remainingRenderedClickBudget(
+  maxClicks: number,
+  clickedThisPage: number,
+  pendingQueuedTargets: number,
+): number {
+  const cap = Math.max(0, Math.trunc(maxClicks) || 0);
+  const clicked = Math.max(0, Math.trunc(clickedThisPage) || 0);
+  const pending = Math.max(0, Math.trunc(pendingQueuedTargets) || 0);
+  return Math.max(0, cap - clicked - pending);
+}
+
+/**
+ * Plan the controls discovered by re-enumeration after a click. Controls that
+ * do not fit the truly remaining budget are returned as skipped coverage
+ * obligations, while navigable anchors stay enqueue-handled and are not
+ * counted as click skips. This is also used after the final permitted click,
+ * when the remaining budget is zero but its disclosures still need accounting.
+ */
+export function planRevealedRenderedClickTargets(
+  controls: RenderedControlTarget[],
+  pageUrl: string,
+  maxClicks: number,
+  clickedThisPage: number,
+  pendingQueuedTargets: number,
+): { toClick: RenderedControlTarget[]; skipped: RenderedControlTarget[]; remainingClickBudget: number } {
+  const remainingClickBudget = remainingRenderedClickBudget(maxClicks, clickedThisPage, pendingQueuedTargets);
+  const plan = partitionRenderedClickTargets(controls, pageUrl, remainingClickBudget);
+  const plannedMarkers = new Set(
+    plan.toClick
+      .map(target => target.marker)
+      .filter((marker): marker is string => Boolean(marker)),
+  );
+  const skipped = controls.filter(target => {
+    const marker = target.marker;
+    return typeof marker === 'string'
+      && marker.length > 0
+      && !plannedMarkers.has(marker)
+      && !isSkippableNavigableAnchorClick(target, pageUrl);
+  });
+  return { toClick: plan.toClick, skipped, remainingClickBudget };
+}
+
+/**
  * Rendered completion invariant (recall correctness): `complete=true` must
  * never occur when zero pages/requests were processed. The crawler can resolve
  * without ever admitting a request to the request handler (seed rejected
@@ -1397,24 +1445,32 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 interactionGap = true;
               }
               // A successful click can reveal new evidence-bearing controls
-              // (second interaction). Re-enumerate with the remaining click
-              // budget and queue only controls not already handled.
-              if (clickedThisPage < limits.maxClicksPerPage && Date.now() - startedAt < limits.totalTimeoutMs) {
+              // (second interaction). Re-enumerate after every click, including
+              // the final allowed one: controls revealed by the last click are
+              // still unexamined, and the later link pass cannot click them.
+              // Reserve the slots for controls already queued but not yet
+              // attempted so the refreshed plan can never overrun the cap.
+              if (Date.now() - startedAt < limits.totalTimeoutMs) {
                 try {
                   const refreshed = await enumerateControls();
                   recordControlEnumeration(refreshed.total);
                   const unqueued = refreshed.controls.filter(target => target.marker && !queuedMarkers.has(target.marker));
-                  const freshPlan = partitionRenderedClickTargets(unqueued, page.url(), limits.maxClicksPerPage - clickedThisPage);
+                  const pendingQueuedTargets = Math.max(0, clickTargets.length - clickIndex - 1);
+                  const freshPlan = planRevealedRenderedClickTargets(
+                    unqueued,
+                    page.url(),
+                    limits.maxClicksPerPage,
+                    clickedThisPage,
+                    pendingQueuedTargets,
+                  );
                   // Newly revealed controls that do not fit the remaining click
                   // budget were never examined. Count only genuinely new skips
                   // (initial overflow/slice drops are already counted) and make
                   // the interaction gap explicit so the page cannot resolve as
                   // a clean no-match.
                   let freshDropped = 0;
-                  for (const target of unqueued) {
+                  for (const target of freshPlan.skipped) {
                     if (!target.marker || countedControlSkips.has(target.marker)) continue;
-                    if (freshPlan.toClick.some(planned => planned.marker === target.marker)) continue;
-                    if (isSkippableNavigableAnchorClick(target, page.url())) continue;
                     countedControlSkips.add(target.marker);
                     freshDropped++;
                   }

@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { resolveRenderedCompletionState } from './browserCommunityFallback';
+import { planRevealedRenderedClickTargets, remainingRenderedClickBudget, resolveRenderedCompletionState } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -55,6 +55,38 @@ test('an evidence-bearing interaction gap keeps a processed run incomplete and r
   });
   assert.equal(clean.complete, true, 'without a gap the processed run still resolves clean');
   assert.equal(clean.retryable, false);
+});
+
+test('revealed controls reserve the click slots for already-queued controls', () => {
+  // Three controls are queued under a four-click cap. After the first click,
+  // two original controls are still waiting, so only one slot remains for the
+  // two controls that click revealed; the second must be counted as skipped.
+  assert.equal(remainingRenderedClickBudget(4, 1, 2), 1);
+  const revealed = [
+    { index: 3, marker: 'oc-revealed-3', text: 'Join Discord', href: null, tag: 'button' as const },
+    { index: 4, marker: 'oc-revealed-4', text: 'Open community', href: null, tag: 'button' as const },
+  ];
+  const plan = planRevealedRenderedClickTargets(revealed, 'https://creator.example/', 4, 1, 2);
+  assert.equal(plan.remainingClickBudget, 1);
+  assert.deepEqual(plan.toClick.map(target => target.marker), ['oc-revealed-3']);
+  assert.deepEqual(plan.skipped.map(target => target.marker), ['oc-revealed-4'], 'the over-budget disclosure is a coverage gap, not silently queued');
+  assert.equal(remainingRenderedClickBudget(4, 0, 0), 4);
+  assert.equal(remainingRenderedClickBudget(4, 2, 5), 0);
+});
+
+test('controls revealed by the final permitted click are counted as skipped', () => {
+  // The fourth click consumes the cap and has no slot for a disclosed control,
+  // but its disclosure still has to become an interaction-gap obligation.
+  assert.equal(remainingRenderedClickBudget(4, 4, 0), 0);
+  const revealed = [
+    { index: 5, marker: 'oc-final-button', text: 'Join Discord', href: null, tag: 'button' as const },
+    { index: 6, marker: 'oc-final-anchor', text: 'Community', href: '/community', tag: 'anchor' as const },
+  ];
+  const plan = planRevealedRenderedClickTargets(revealed, 'https://creator.example/', 4, 4, 0);
+  assert.deepEqual(plan.toClick, [], 'no click slot remains after the final permitted click');
+  assert.deepEqual(plan.skipped.map(target => target.marker), ['oc-final-button'], 'click-only disclosure is a coverage gap');
+  // The navigable anchor remains enqueue-handled, not a click skip.
+  assert.equal(plan.skipped.some(target => target.marker === 'oc-final-anchor'), false);
 });
 
 test('an interaction gap never counts as sufficient rendered coverage for the site cache', () => {
@@ -98,7 +130,10 @@ test('rendered control coverage counts overflow and uses stable markers across D
   assert.match(source, /recordControlEnumeration\(firstEnumeration\.total\)/);
   assert.match(source, /data-oc-control/);
   assert.match(source, /partitionRenderedClickTargets\(controls, page\.url\(\), limits\.maxClicksPerPage, limits\.clickOffset\)/, 'the retry offset rotates the full pool before the cap');
-  assert.match(source, /partitionRenderedClickTargets\(unqueued, page\.url\(\), limits\.maxClicksPerPage - clickedThisPage\)/, 'new controls are re-enumerated within the remaining click budget');
+  assert.match(source, /const pendingQueuedTargets = Math\.max\(0, clickTargets\.length - clickIndex - 1\)/, 'queued-but-unclicked controls consume the remaining budget');
+  assert.match(source, /const freshPlan = planRevealedRenderedClickTargets\(\s*unqueued,\s*page\.url\(\),\s*limits\.maxClicksPerPage,\s*clickedThisPage,\s*pendingQueuedTargets,?\s*\)/, 'revealed controls are planned against the truly remaining slots');
+  assert.match(source, /if \(Date\.now\(\) - startedAt < limits\.totalTimeoutMs\) \{\s*try \{\s*const refreshed = await enumerateControls\(\)/, 'the final allowed click still re-enumerates revealed controls');
+  assert.doesNotMatch(source, /clickedThisPage < limits\.maxClicksPerPage && Date\.now\(\) - startedAt < limits\.totalTimeoutMs\) \{/, 'the old final-click guard must not return');
   assert.match(source, /freshDropped\+\+/, 're-enumerated controls beyond the remaining budget are counted as skipped');
   assert.match(source, /drops\.count\('control-slice', freshDropped\)/, 'revealed-control slices are recorded');
   assert.match(source, /interactionGap:interactionGap\|\|undefined/, 'throw paths retain the interaction gap');
