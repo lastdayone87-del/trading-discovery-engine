@@ -65,7 +65,7 @@ test('live rejection branch uses the helper and persists via the finally upsert 
   // terminal live rejection must finalize this channel's examined candidates,
   // otherwise the same site remains permanently non-reusable and is recrawled
   // by later creators.
-  assert.match(branch, /markSiteInspectionsDiscarded\(channel\.channel_id,rejectedCandidateIds\)/);
+  assert.match(branch, /markSiteInspectionsRejected\(channel\.channel_id,rejectedCandidateIds\)/);
   // No direct channel write in the branch: the function's finally-block upsert
   // owns persistence, so exactly one durable channel write path exists.
   assert.doesNotMatch(branch, /await upsertChannel/);

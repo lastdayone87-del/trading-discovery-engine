@@ -77,6 +77,19 @@ test('reuse matrix: fresh hits borrow, expired and malformed rows recrawl', () =
   assert.equal(isSiteInspectionReusable(row({ lastObservedAt: 'not-a-date' }), NOW), false);
 });
 
+test('country-rejected FOUND cache rows are never borrowed as coverage', () => {
+  const clean = row({ outcome: 'FOUND', candidates: [], lastObservedAt: hoursAgo(1) });
+  assert.equal(isSiteInspectionReusable(clean, NOW), true, 'ordinary clean positives remain reusable');
+  assert.equal(
+    isSiteInspectionReusable(
+      row({ ...clean, provenance: { coverageBorrowable: false, discardedReason: 'COUNTRY_REJECTED' } }),
+      NOW,
+    ),
+    false,
+    'a rejected, unclaimed FOUND crawl must force a fresh crawl so its invite can be re-admitted',
+  );
+});
+
 test('borrowed observations refresh the audit trail but preserve site-facts', () => {
   const source = row({
     finalUrl: 'https://apextrader.com/home',

@@ -65,6 +65,10 @@ export interface CachedSiteInspection {
    * row is PENDING for at least one recording channel and is never reusable
    * as borrowed coverage. */
   pendingClaims?: Record<string, Array<Record<string, unknown>>>;
+  /** Site-fact provenance. `coverageBorrowable: false` marks a terminal
+   * country-rejected crawl whose unclaimed discoveries were discarded: other
+   * creators must recrawl rather than borrow FOUND coverage and miss them. */
+  provenance?: Record<string, unknown>;
 }
 
 export interface BorrowedSiteInspection {
@@ -103,6 +107,11 @@ const ageMs = (lastObservedAt: string | null, nowMs: number): number | null => {
  * original crawl's clock and the next borrower recrawls. */
 export function isSiteInspectionReusable(row: CachedSiteInspection | null | undefined, nowMs: number = Date.now()): boolean {
   if (!row || !row.siteIdentity) return false;
+  // A country-rejected crawl discarded this channel's unclaimed candidates
+  // without admitting them. Its FOUND observations are still fresh, but they
+  // must not become borrowed coverage for an allowed creator: the invite is
+  // available and only a real recrawl can re-admit it under the new owner.
+  if (row.provenance?.coverageBorrowable === false) return false;
   // PENDING is never reusable, even when a later writer replaced the row-level
   // candidate array: the per-channel pending map still owns unclaimed
   // discoveries that must be recovered before anyone borrows this coverage.

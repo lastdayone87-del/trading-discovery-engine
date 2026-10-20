@@ -1,10 +1,12 @@
 /**
- * Migration 149/150 + persistence text contracts.
+ * Migration 149/150/151 + persistence text contracts.
  *
  * Migration 149 is the schema change behind the discovery-integrity fixes:
  * site-inspection claim handshake columns, channel community-intent state, and
  * the explicit recovery audit table. Migration 150 adds the per-channel
  * pending-candidate map so a second writer cannot erase an unclaimed invite.
+ * Migration 151 adds the inert shadow-cap settlement fence so a late
+ * observation cannot recreate a lease or a false cap event.
  * These assertions are intentionally textual: they pin the exact additive
  * shape so a later edit cannot silently turn the migration destructive or
  * rename a column the code depends on.
@@ -17,15 +19,24 @@ import { fileURLToPath } from 'node:url';
 const migrationsDir = fileURLToPath(new URL('./db/migrations/', import.meta.url));
 const migration = readFileSync(`${migrationsDir}149_discovery_integrity_state.sql`, 'utf8');
 const pendingClaimsMigration = readFileSync(`${migrationsDir}150_site_inspection_pending_claims.sql`, 'utf8');
+const shadowSettlementMigration = readFileSync(`${migrationsDir}151_youtube_key_cap_shadow_settled.sql`, 'utf8');
 const dbCore = readFileSync(fileURLToPath(new URL('./dbCore.ts', import.meta.url)), 'utf8');
 const siteCache = readFileSync(fileURLToPath(new URL('./siteInspectionCache.ts', import.meta.url)), 'utf8');
 const rollbackProof = readFileSync(fileURLToPath(new URL('../.github/workflows/phase1-rollback-proof.yml', import.meta.url)), 'utf8');
 
-test('migration 150 is present and sorts after every earlier migration', () => {
+test('migration 151 is present and sorts after every earlier migration', () => {
   const files = readdirSync(migrationsDir).filter(name => name.endsWith('.sql')).sort();
   assert.ok(files.includes('149_discovery_integrity_state.sql'));
   assert.ok(files.includes('150_site_inspection_pending_claims.sql'));
-  assert.equal(files[files.length - 1], '150_site_inspection_pending_claims.sql', '150 is the newest migration');
+  assert.ok(files.includes('151_youtube_key_cap_shadow_settled.sql'));
+  assert.equal(files[files.length - 1], '151_youtube_key_cap_shadow_settled.sql', '151 is the newest migration');
+});
+
+test('migration 151 adds only the inert shadow settlement fence', () => {
+  assert.match(shadowSettlementMigration, /CREATE TABLE IF NOT EXISTS youtube_key_cap_shadow_settled/);
+  assert.match(shadowSettlementMigration, /PRIMARY KEY \(quota_day, operation_id\)/);
+  assert.match(shadowSettlementMigration, /CREATE INDEX IF NOT EXISTS youtube_key_cap_shadow_settled_expiry_idx/);
+  assert.doesNotMatch(shadowSettlementMigration, /\b(?:DROP|DELETE|TRUNCATE|UPDATE)\b/i, 'settlement migration is additive-only');
 });
 
 test('migration 150 adds only the per-channel pending-candidate map', () => {

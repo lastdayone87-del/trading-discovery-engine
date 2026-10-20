@@ -260,7 +260,8 @@ test('accounting wrapper uses one stable operation ID and surfaces accounting er
   // retries (generated once), unique per response (fresh UUID per call),
   // so a retry after an unknown commit outcome cannot double-charge.
   assert.match(wrapper, /const operationId = randomUUID\(\);/);
-  assert.match(wrapper, /incrementQuota\(unitsConsumed, providerKey, operationId\)/);
+  assert.match(wrapper, /const shadowOperationId = getYouTubeResponseShadowOperationId\(response\);/);
+  assert.match(wrapper, /incrementQuota\(unitsConsumed, providerKey, operationId, shadowOperationId\)/);
   assert.match(wrapper, /throw new YouTubeQuotaAccountingError\(units, providerKey, \{ cause: error \}\);/);
   // The ledger honors the ID transactionally, with a pre-migration
   // fallback so accounting keeps working until migration 133 applies.

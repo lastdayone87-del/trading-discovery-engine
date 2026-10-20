@@ -43,6 +43,7 @@ import {
   markCommunityInspectionStarted,
   markSiteInspectionsClaimed,
   markSiteInspectionsDiscarded,
+  markSiteInspectionsRejected,
   type DiscordAttemptCandidate,
   type DiscordInviteClaim,
   type OrphanDiscordCandidateRow,
@@ -1833,7 +1834,7 @@ export async function inspectAndValidateChannel(
       // channel's examined candidates; other channels' pending entries stay.
       const rejectedCandidateIds=[...new Set((inspection.discordCandidates||[])
         .map(candidate=>candidate.candidateId).filter(Boolean))];
-      if(rejectedCandidateIds.length)await markSiteInspectionsDiscarded(channel.channel_id,rejectedCandidateIds).catch(()=>undefined);
+      if(rejectedCandidateIds.length)await markSiteInspectionsRejected(channel.channel_id,rejectedCandidateIds).catch(()=>undefined);
       applyLiveCountryRejectionToInspected(channel, liveCountry, now);
       channel.inspection_trail=[countryStep, ...inspection.steps, liveCountryStep];
       console.warn(JSON.stringify({event:'live_country_rejected_before_claim',channelId:channel.channel_id,detectedCountry:liveCountry.detectedCreatorCountry||null,timestamp:now}));

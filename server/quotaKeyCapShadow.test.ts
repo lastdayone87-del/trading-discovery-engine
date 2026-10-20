@@ -10,6 +10,7 @@ import {
   resetShadowConfigCacheForTests,
   resetShadowSweepClockForTests,
   resolveShadowConfig,
+  settleShadowLease,
   simulateShadowReplay,
   sweepShadowLeases,
   type ShadowPoolPort,
@@ -144,13 +145,14 @@ test('recordShadowDispatchSafe enabled: sweeps, locks, records and commits', asy
   );
   // 8999 projected + 2 requested = 9001 -> WOULD_DEFER
   assert.deepEqual(result, { projectedBefore: 8999, event: 'WOULD_DEFER', leaseInserted: true, lockSkipped: false });
-  assert.equal(pool.poolQueries.length, 1, 'first call after restart sweeps stale leases');
+  assert.equal(pool.poolQueries.length, 2, 'first call after restart sweeps stale leases and settlement tombstones');
   assert.match(pool.poolQueries[0].text, /DELETE FROM youtube_key_cap_shadow_leases WHERE expires_at <= \$1/);
+  assert.match(pool.poolQueries[1].text, /DELETE FROM youtube_key_cap_shadow_settled WHERE expires_at <= \$1/);
   assert.equal(pool.connections.length, 1);
   const connection = pool.connections[0];
   const texts = connection.queries.map((query) => query.text);
   assert.ok(texts.includes('BEGIN'));
-  assert.ok(texts.some((text) => text.startsWith('SET LOCAL lock_timeout')));
+  assert.ok(texts.some((text) => /SET LOCAL lock_timeout.*SET LOCAL statement_timeout/.test(text)));
   const lockQuery = connection.queries.find((query) => query.text.includes('pg_advisory_xact_lock'));
   assert.ok(lockQuery, 'advisory lock taken');
   assert.equal(
@@ -165,7 +167,7 @@ test('recordShadowDispatchSafe enabled: sweeps, locks, records and commits', asy
     { readSetting: enabledReader, pool },
     { keyFingerprint: 'fp-enabled', operationId: 'op-enabled-2', units: 1, now: new Date(now.getTime() + 1000) }
   );
-  assert.equal(pool.poolQueries.length, 1, 'sweep is throttled to once per minute');
+  assert.equal(pool.poolQueries.length, 2, 'sweep is throttled to once per minute');
   assert.equal(second.event, null, '8999 + 1 = 9000 stays admitted');
 });
 
@@ -205,15 +207,57 @@ test('recordShadowDispatchSafe swallows infrastructure failures entirely', async
   assert.deepEqual(result, { projectedBefore: 0, event: null, leaseInserted: false, lockSkipped: false });
 });
 
-test('sweepShadowLeases deletes expired leases and reports the row count', async () => {
+test('settlement by operation id removes the lease and writes a dedicated tombstone', async () => {
+  const queries: Array<{ text: string; values?: unknown[] }> = [];
   const client: ShadowQueryClient = {
     query: async (text, values) => {
-      assert.match(text, /DELETE FROM youtube_key_cap_shadow_leases WHERE expires_at <= \$1/);
-      assert.ok(values?.[0] instanceof Date);
-      return { rows: [], rowCount: 3 };
+      queries.push({ text, values });
+      return { rows: [], rowCount: 1 };
     },
   };
-  assert.equal(await sweepShadowLeases(client, new Date()), 3);
+  const settled = await settleShadowLease(client, {
+    quotaDay: '2026-10-20',
+    keyFingerprint: 'fp-tombstone',
+    units: 1,
+    operationId: 'shadow:op-tombstone',
+  });
+  assert.equal(settled, true);
+  assert.equal(queries.length, 1);
+  assert.match(queries[0].text, /DELETE FROM youtube_key_cap_shadow_leases/);
+  assert.match(queries[0].text, /operation_id = \$2/);
+  assert.match(queries[0].text, /INSERT INTO youtube_key_cap_shadow_settled/);
+  assert.match(queries[0].text, /ON CONFLICT \(quota_day, operation_id\) DO UPDATE/);
+  assert.equal(queries[0].values?.[1], 'shadow:op-tombstone');
+});
+
+test('aborted shadow observation performs no queries or connection work', async () => {
+  resetShadowConfigCacheForTests();
+  resetShadowSweepClockForTests();
+  const pool = new FakePool(dispatchHandler());
+  const controller = new AbortController();
+  controller.abort();
+  const result = await recordShadowDispatchSafe(
+    { readSetting: enabledReader, pool },
+    { keyFingerprint: 'fp-aborted', operationId: 'op-aborted', units: 1, signal: controller.signal }
+  );
+  assert.deepEqual(result, { projectedBefore: 0, event: null, leaseInserted: false, lockSkipped: false });
+  assert.equal(pool.connections.length, 0);
+  assert.equal(pool.poolQueries.length, 0);
+});
+
+test('sweepShadowLeases deletes expired leases and settlement tombstones', async () => {
+  const seen: string[] = [];
+  const client: ShadowQueryClient = {
+    query: async (text, values) => {
+      seen.push(text);
+      assert.ok(values?.[0] instanceof Date);
+      return { rows: [], rowCount: text.includes('youtube_key_cap_shadow_settled') ? 2 : 3 };
+    },
+  };
+  assert.equal(await sweepShadowLeases(client, new Date()), 5);
+  assert.equal(seen.length, 2);
+  assert.match(seen[0], /DELETE FROM youtube_key_cap_shadow_leases WHERE expires_at <= \$1/);
+  assert.match(seen[1], /DELETE FROM youtube_key_cap_shadow_settled WHERE expires_at <= \$1/);
 });
 
 test('simulateShadowReplay: boundary exactly at 9000 admitted, 9001 rejected', () => {

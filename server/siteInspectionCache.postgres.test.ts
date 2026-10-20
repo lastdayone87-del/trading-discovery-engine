@@ -7,8 +7,9 @@ import {
   pruneSiteInspections,
   markSiteInspectionsClaimed,
   markSiteInspectionsDiscarded,
+  markSiteInspectionsRejected,
 } from './dbCore';
-import { buildBorrowedSiteInspection } from './siteInspectionCache';
+import { buildBorrowedSiteInspection, isSiteInspectionReusable } from './siteInspectionCache';
 
 const enabled = Boolean(process.env.DATABASE_URL);
 const maybe = enabled ? test : test.skip;
@@ -109,6 +110,43 @@ maybe('cross-writer pending claims keep each channel unclaimed invite recoverabl
   assert.equal(row.claimStatus, 'DISCARDED');
   assert.deepEqual(row.pendingClaims, {});
   assert.deepEqual(row.candidates, []);
+});
+
+maybe('country rejection finalizes claims but keeps the FOUND row non-borrowable', async t => {
+  const { getDb } = await import('./dbCore');
+  const db = await getDb();
+  const REJECTED_SITE = 'apex-country-rejected.example';
+  const cleanup = async () => {
+    await db.query(`DELETE FROM site_inspections WHERE site_identity=$1`, [REJECTED_SITE]);
+  };
+  await cleanup();
+  t.after(cleanup);
+  const candidate = { candidateId: 'rejected-candidate', nativeInviteCode: 'rejectedRoom', sourceSurface: 'CREATOR_WEBSITES' };
+  await upsertSiteInspection({
+    siteIdentity: REJECTED_SITE, identityTier: 'A', identityBasis: 'test',
+    canonicalUrl: `https://${REJECTED_SITE}/`, outcome: 'FOUND', retryable: false,
+    candidates: [candidate], observations: [{ outcome: 'FOUND' }],
+    renderedCovered: false, sourceChannelId: CHANNEL_A, claimStatus: 'PENDING', provenance: {},
+  });
+
+  await markSiteInspectionsRejected(CHANNEL_A, ['rejected-candidate']);
+  let [row] = await getSiteInspections([REJECTED_SITE]);
+  assert.equal(row.claimStatus, 'DISCARDED');
+  assert.deepEqual(row.pendingClaims, {});
+  assert.deepEqual(row.candidates, []);
+  assert.equal(row.provenance?.coverageBorrowable, false);
+  assert.equal(row.provenance?.discardedReason, 'COUNTRY_REJECTED');
+  assert.equal(isSiteInspectionReusable(row, Date.now()), false, 'rejected FOUND facts must not be borrowed');
+
+  // A real recrawl replaces provenance and restores ordinary coverage reuse.
+  await upsertSiteInspection({
+    siteIdentity: REJECTED_SITE, identityTier: 'A', identityBasis: 'test',
+    canonicalUrl: `https://${REJECTED_SITE}/`, outcome: 'FOUND', retryable: false,
+    candidates: [], observations: [{ outcome: 'FOUND' }],
+    renderedCovered: true, provenance: { policyVersion: 'test' },
+  });
+  [row] = await getSiteInspections([REJECTED_SITE]);
+  assert.equal(isSiteInspectionReusable(row, Date.now()), true, 'fresh crawl clears the non-borrowable fence');
 });
 
 maybe('same-channel seed writes merge unclaimed candidates instead of replacing them', async t => {

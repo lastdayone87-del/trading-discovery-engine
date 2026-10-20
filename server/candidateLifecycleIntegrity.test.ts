@@ -429,6 +429,11 @@ test('E6 (contract): orphan predicate and drain wiring match the DB semantics', 
   assert.ok(claimIndex >= 0 && drainIndex > claimIndex, 'orphan drain follows the claim handshake');
   assert.match(db, /export async function markSiteInspectionsClaimed\(channelId: string, admittedCandidateIds: string\[\] = \[\]\)/);
   assert.match(db, /export async function markSiteInspectionsDiscarded\(channelId: string, discardedCandidateIds: string\[\] = \[\]\)/);
+  assert.match(db, /export async function markSiteInspectionsRejected\(channelId: string, rejectedCandidateIds: string\[\] = \[\]\)/);
+  assert.match(db, /coverageBorrowable: false/);
+  assert.match(db, /discardedReason: 'COUNTRY_REJECTED'/);
+  assert.match(db, /provenance=CASE WHEN \$5::jsonb='\{\}'::jsonb THEN provenance/);
+  assert.match(queue, /markSiteInspectionsRejected\(channel\.channel_id,rejectedCandidateIds\)/);
   assert.match(db, /pending_claims/);
   assert.match(queue, /event:'orphan_candidates_drained'/);
   assert.match(queue, /event:'orphan_candidate_residue_removed'/);

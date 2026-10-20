@@ -23,6 +23,16 @@ export const SHADOW_LEASE_TTL_MS = 120_000;
 export const SHADOW_CONFIG_TTL_MS = 30_000;
 export const SHADOW_SWEEP_INTERVAL_MS = 60_000;
 export const SHADOW_LOCK_TIMEOUT_MS = 100;
+/** Maximum time a completed provider response waits for the optional shadow
+ * observation before the request is released. The background observation is
+ * cancelled and any late insert is fenced by the settlement tombstone. */
+export const SHADOW_OBSERVATION_BUDGET_MS = 500;
+/** Statement bound for shadow-only database work. A timed-out observation is
+ * skipped rather than holding a pool connection indefinitely. */
+export const SHADOW_STATEMENT_TIMEOUT_MS = 5_000;
+/** Lifetime of the inert settlement tombstone. It must outlive any cancelled
+ * observation so a late insert cannot recreate a lease or event. */
+export const SHADOW_SETTLEMENT_TOMBSTONE_TTL_MS = 15 * 60_000;
 
 export type ShadowEvent = 'WOULD_DEFER' | 'WOULD_REJECT';
 export type ShadowSettingReader = (key: string, fallback: string) => Promise<string>;
@@ -136,10 +146,14 @@ WITH projected AS (
            SELECT SUM(reserved_units) FROM youtube_key_cap_shadow_leases
             WHERE quota_day = $1 AND key_fingerprint = $2 AND expires_at > $3
          ), 0)::int AS before_units
+), settled AS (
+  SELECT 1 FROM youtube_key_cap_shadow_settled
+   WHERE quota_day = $1 AND operation_id = $4 AND expires_at > $3
 ), lease AS (
   INSERT INTO youtube_key_cap_shadow_leases
     (quota_day, operation_id, key_fingerprint, reserved_units, reserved_at, expires_at)
-  VALUES ($1, $4, $2, $5, $3, $6)
+  SELECT $1, $4, $2, $5, $3, $6
+   WHERE NOT EXISTS (SELECT 1 FROM settled)
   ON CONFLICT (quota_day, operation_id) DO NOTHING
   RETURNING 1 AS inserted
 ), event AS (
@@ -150,6 +164,9 @@ WITH projected AS (
          before_units, $5, $7, $3
     FROM projected
    WHERE before_units + $5 > $7
+     -- A settlement tombstone (or a duplicate observation) means this
+     -- operation is already accounted; never create a late false event.
+     AND EXISTS (SELECT 1 FROM lease)
   ON CONFLICT (quota_day, operation_id) DO NOTHING
   RETURNING event
 )
@@ -194,6 +211,10 @@ export interface ShadowSettlementInput {
   quotaDay: string;
   keyFingerprint: string;
   units: number;
+  /** Exact dispatch operation id when available. Settlement then removes that
+   * lease and writes an inert tombstone, so a cancelled/late observation can
+   * never recreate the lease or a false cap event. */
+  operationId?: string;
   now?: Date;
 }
 
@@ -209,16 +230,41 @@ DELETE FROM youtube_key_cap_shadow_leases
  )
 `;
 
+const SETTLE_BY_OPERATION_SQL = `
+WITH removed AS (
+  DELETE FROM youtube_key_cap_shadow_leases
+   WHERE quota_day = $1 AND operation_id = $2
+   RETURNING 1
+)
+INSERT INTO youtube_key_cap_shadow_settled
+  (quota_day, operation_id, key_fingerprint, settled_at, expires_at)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (quota_day, operation_id) DO UPDATE
+  SET expires_at = GREATEST(youtube_key_cap_shadow_settled.expires_at, EXCLUDED.expires_at)
+`;
+
 /**
  * Releases one matching in-flight lease when the official charge settles, so
- * settled usage + leases never double count. Exact-unit match; charges with no
- * observed dispatch (or extra quota callbacks) are no-ops (documented gap).
+ * settled usage + leases never double count. With an operation id the release
+ * is exact and writes an inert tombstone that fences a late/cancelled
+ * observation; without one it falls back to the documented exact-unit match.
  */
 export async function settleShadowLease(
   client: ShadowQueryClient,
   input: ShadowSettlementInput
 ): Promise<boolean> {
   const now = input.now ?? new Date();
+  if (input.operationId) {
+    const expiresAt = new Date(now.getTime() + SHADOW_SETTLEMENT_TOMBSTONE_TTL_MS);
+    const result = await client.query(SETTLE_BY_OPERATION_SQL, [
+      input.quotaDay,
+      input.operationId,
+      input.keyFingerprint,
+      now,
+      expiresAt,
+    ]);
+    return (result.rowCount ?? 0) > 0;
+  }
   const result = await client.query(SETTLE_SQL, [
     input.quotaDay,
     input.keyFingerprint,
@@ -250,11 +296,13 @@ export async function sweepShadowLeases(
   client: ShadowQueryClient,
   now: Date = new Date()
 ): Promise<number> {
-  const result = await client.query(
-    `DELETE FROM youtube_key_cap_shadow_leases WHERE expires_at <= $1`,
-    [now]
-  );
-  return result.rowCount ?? 0;
+  const [leases, settled] = await Promise.all([
+    client.query(`DELETE FROM youtube_key_cap_shadow_leases WHERE expires_at <= $1`, [now]),
+    // Settlement tombstones are inert and excluded from projections; once
+    // expired they no longer need to fence a late observation.
+    client.query(`DELETE FROM youtube_key_cap_shadow_settled WHERE expires_at <= $1`, [now]),
+  ]);
+  return (leases.rowCount ?? 0) + (settled.rowCount ?? 0);
 }
 
 export interface ShadowConnectionPort extends ShadowQueryClient {
@@ -294,11 +342,15 @@ export async function recordShadowDispatchSafe(
     units: number;
     now?: Date;
     lockTimeoutMs?: number;
+    /** Cancels optional shadow work after the request has been released. */
+    signal?: AbortSignal;
   }
 ): Promise<ShadowDispatchResult> {
+  const aborted = (): boolean => input.signal?.aborted === true;
   try {
+    if (aborted()) return SHADOW_DISPATCH_DISABLED;
     const config = await resolveShadowConfig(deps.readSetting);
-    if (!config.enabled) return SHADOW_DISPATCH_DISABLED;
+    if (!config.enabled || aborted()) return SHADOW_DISPATCH_DISABLED;
     const units = Math.max(1, Math.round(input.units));
     const operationId = String(input.operationId || '');
     if (!input.keyFingerprint || !operationId || !Number.isFinite(units)) return SHADOW_DISPATCH_DISABLED;
@@ -306,6 +358,7 @@ export async function recordShadowDispatchSafe(
     if (now.getTime() - lastSweepAt >= SHADOW_SWEEP_INTERVAL_MS) {
       lastSweepAt = now.getTime();
       await sweepShadowLeases(deps.pool, now).catch(() => 0);
+      if (aborted()) return SHADOW_DISPATCH_DISABLED;
     }
     const quotaDay = getYouTubeQuotaDay(now);
     const lockTimeoutMs = Math.max(
@@ -313,9 +366,18 @@ export async function recordShadowDispatchSafe(
       Math.min(5000, Math.round(Number(input.lockTimeoutMs ?? SHADOW_LOCK_TIMEOUT_MS)))
     );
     const client = await deps.pool.connect();
+    if (aborted()) {
+      client.release?.();
+      return SHADOW_DISPATCH_DISABLED;
+    }
     try {
       await client.query('BEGIN');
-      await client.query(`SET LOCAL lock_timeout = '${lockTimeoutMs}ms'`);
+      // One round trip for both bounds: the lock wait is short, and the
+      // remaining shadow-only statements cannot hold the connection after
+      // the caller's observation budget.
+      await client.query(
+        `SET LOCAL lock_timeout = '${lockTimeoutMs}ms'; SET LOCAL statement_timeout = '${SHADOW_STATEMENT_TIMEOUT_MS}ms'`
+      );
       try {
         await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
           `youtube-key-cap-shadow:${quotaDay}:${input.keyFingerprint}`,
@@ -327,6 +389,10 @@ export async function recordShadowDispatchSafe(
         }
         throw lockError;
       }
+      if (aborted()) {
+        await client.query('ROLLBACK').catch(() => undefined);
+        return SHADOW_DISPATCH_DISABLED;
+      }
       const result = await recordShadowDispatch(client, {
         quotaDay,
         keyFingerprint: input.keyFingerprint,
@@ -336,6 +402,10 @@ export async function recordShadowDispatchSafe(
         leaseTtlMs: config.leaseTtlMs,
         now,
       });
+      if (aborted()) {
+        await client.query('ROLLBACK').catch(() => undefined);
+        return SHADOW_DISPATCH_DISABLED;
+      }
       await client.query('COMMIT');
       return result;
     } catch (error) {

@@ -947,7 +947,7 @@ export async function claimYouTubeQuotaOperation(client:QueryExecutor, operation
   }
 }
 
-export async function incrementQuota(units:number, providerKey:string, operationId?: string):Promise<void>{
+export async function incrementQuota(units:number, providerKey:string, operationId?: string, shadowOperationId?: string):Promise<void>{
   if(!Number.isSafeInteger(units)||units<=0)throw new Error('YouTube quota charge must be a positive integer.');
   const keys=getYouTubeKeyPool(); const keyIndex=keys.indexOf(providerKey)+1; if(keyIndex<1)throw new Error('YouTube quota charge provider key is not configured.');
   const today=getYouTubeQuotaDay(); const shadowConfig=await resolveShadowConfig(getAppSetting).catch(()=>null); const db=await getDb(); const client=await db.connect(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=getDailyYouTubeQuotaBudget();
@@ -965,7 +965,7 @@ export async function incrementQuota(units:number, providerKey:string, operation
       // Shadow-only observation: release one matching in-flight lease so
       // settled usage + leases never double count. Savepoint-guarded so a
       // shadow failure can never poison the official charge transaction.
-      await settleShadowLeaseWithSavepoint(client,{quotaDay:today,keyFingerprint:fingerprintYouTubeKey(providerKey),units});
+      await settleShadowLeaseWithSavepoint(client,{quotaDay:today,keyFingerprint:fingerprintYouTubeKey(providerKey),units,operationId:shadowOperationId});
     }
     await client.query('COMMIT');}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
 }
@@ -1287,6 +1287,7 @@ async function finalizeSiteInspectionClaims(
   channelId: string,
   candidateIds: string[],
   terminalStatus: 'CLAIMED' | 'DISCARDED',
+  provenancePatch: Record<string, unknown> = {},
 ): Promise<number> {
   const ids = new Set((candidateIds || []).filter(id => typeof id === 'string' && !!id));
   if (!channelId || !ids.size) return 0;
@@ -1329,14 +1330,18 @@ async function finalizeSiteInspectionClaims(
       const hasPending = Object.keys(claims).length > 0
         || (row.source_channel_id === channelId && rowCandidates.length > 0);
       const nextStatus = hasPending ? 'PENDING' : terminalStatus;
-      // DISCARDED is terminal and reusable: no stale candidate payload may
-      // remain to resurrect the foreign-owned discovery on a later borrow.
+      // DISCARDED is terminal: no stale candidate payload may remain to
+      // resurrect a foreign-owned discovery. A country-rejected caller adds
+      // coverageBorrowable:false so the FOUND observations cannot become
+      // borrowed coverage either; an ordinary discard remains reusable.
       const nextCandidates = !hasPending && terminalStatus === 'DISCARDED' ? [] : rowCandidates;
       await client.query(
         `UPDATE site_inspections
-            SET pending_claims=$2::jsonb,claim_status=$3,candidates=$4::jsonb
+            SET pending_claims=$2::jsonb,claim_status=$3,candidates=$4::jsonb,
+                provenance=CASE WHEN $5::jsonb='{}'::jsonb THEN provenance
+                                ELSE COALESCE(provenance,'{}'::jsonb)||$5::jsonb END
           WHERE site_identity=$1`,
-        [siteIdentity, JSON.stringify(claims), nextStatus, JSON.stringify(nextCandidates)],
+        [siteIdentity, JSON.stringify(claims), nextStatus, JSON.stringify(nextCandidates), JSON.stringify(provenancePatch)],
       );
       updated++;
     }
@@ -1369,6 +1374,19 @@ export async function markSiteInspectionsClaimed(channelId: string, admittedCand
  * target. */
 export async function markSiteInspectionsDiscarded(channelId: string, discardedCandidateIds: string[] = []): Promise<number> {
   return finalizeSiteInspectionClaims(channelId, discardedCandidateIds, 'DISCARDED');
+}
+
+/** Finalizes a terminal country rejection's pending cache claims while
+ * marking the row non-borrowable. Unlike an ordinary admission discard, these
+ * FOUND observations were never admitted by any creator: borrowing them as
+ * coverage would let a later allowed creator skip the crawl and miss the
+ * still-unclaimed invite. A fresh crawl overwrites provenance and restores
+ * normal reuse. */
+export async function markSiteInspectionsRejected(channelId: string, rejectedCandidateIds: string[] = []): Promise<number> {
+  return finalizeSiteInspectionClaims(channelId, rejectedCandidateIds, 'DISCARDED', {
+    coverageBorrowable: false,
+    discardedReason: 'COUNTRY_REJECTED',
+  });
 }
 
 /** Records creator -> site references (never ownership). Written on every

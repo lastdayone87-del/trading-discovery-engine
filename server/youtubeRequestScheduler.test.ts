@@ -149,16 +149,24 @@ test('youtubeFetch always bounds the scheduler head request', () => {
   assert.doesNotMatch(youtubeFetch, /provider_deadlines_enabled|PROVIDER_DEADLINES_ENABLED/);
 });
 
-test('youtubeFetch starts shadow accounting before the fetch and joins it before settlement', () => {
+test('youtubeFetch starts shadow accounting before the fetch and joins it with a bounded abort', () => {
   const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
   const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));
   const shadowStart = youtubeFetch.indexOf('shadowObservation=(async()=>{');
   const fetchStart = youtubeFetch.indexOf('response=await fetch(dispatchedUrl,{signal})');
-  const shadowJoin = youtubeFetch.indexOf('await shadowObservation');
+  const shadowJoin = youtubeFetch.indexOf('await joinShadowObservation(');
   assert.ok(shadowStart >= 0, 'shadow observation starts in the dispatch callback');
   assert.ok(fetchStart > shadowStart, 'shadow observation is started without gating the fetch');
   assert.ok(shadowJoin > fetchStart, 'shadow observation is joined only after the provider call completes');
+  assert.match(youtubeFetch, /shadowAbort=new AbortController\(\)/);
+  assert.match(youtubeFetch, /signal:observationController\.signal/);
+  assert.match(youtubeFetch, /youtubeResponseShadowOperations\.set\(response, shadowOperationId\)/);
+  const helper = source.slice(source.indexOf('async function joinShadowObservation'), source.indexOf('async function youtubeFetch'));
+  assert.match(helper, /Promise\.race\(/);
+  assert.match(helper, /controller\.abort\(\)/);
+  assert.match(helper, /SHADOW_OBSERVATION_BUDGET_MS/);
   assert.doesNotMatch(youtubeFetch, /await recordShadowDispatchSafe\(\s*\{readSetting:getAppSetting,pool:await getDb\(\)\}/);
+  assert.doesNotMatch(youtubeFetch, /await shadowObservation/);
 });
 
 test('youtubeFetch reselects from the live provider pool at dispatch and clears the actual provider history on success', () => {
