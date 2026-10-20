@@ -65,8 +65,10 @@ test('community retry enqueue merges per-seed click progress against the current
   const merge = client.queries.find(q => q.sql.includes('UPDATE jobs SET payload=CASE'));
   assert.ok(merge, 'enqueue merges into the pending durable payload');
   assert.match(merge.sql, /jsonb_typeof\(\$2::jsonb->'clickOffsets'\)='object'/, 'only a real offset map triggers the nested merge');
+  assert.match(merge.sql, /\(payload \|\| \(\$2::jsonb - 'clickOffsets'\)\)/, 'the rest of the incoming retry metadata still merges');
   assert.match(merge.sql, /COALESCE\(payload->'clickOffsets','\{\}'::jsonb\) \|\| \(\$2::jsonb->'clickOffsets'\)/, 'the merge reads the current database map, not enqueueJob\'s earlier copy');
   assert.deepEqual(JSON.parse(String(merge?.values?.[1])).clickOffsets, { 'https://creator.test': 4 }, 'the statement carries only this enqueue\'s offsets; other seeds are preserved by the SQL merge');
+  assert.equal(JSON.parse(String(merge?.values?.[1])).retryCode, 'BROWSER_RUNTIME_UNAVAILABLE', 'retry reason/code metadata is not dropped by the offset branch');
 });
 
 test('community retry enqueue without offsets leaves the durable offset map untouched', async () => {

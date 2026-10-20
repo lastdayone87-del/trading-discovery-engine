@@ -2349,13 +2349,14 @@ export async function enqueueCommunityAcquisitionRetry(channelId:string,directiv
   // this statement: a retry worker can advance the PROCESSING job between
   // enqueueJob's RETURNING and this update, and writing back the earlier copy
   // would rewind its newer offsets. When this enqueue carries offsets, merge
-  // them over the row's current map (incoming keys win); otherwise leave the
-  // existing map untouched.
+  // them over the row's current map (incoming keys win) while still merging
+  // the rest of the incoming metadata (retry code/reason/source); otherwise
+  // leave the existing offset map untouched.
   const runner:{query:(sql:string,params?:unknown[])=>Promise<unknown>} = clientOverride||await getDb();
   await runner.query(
     `UPDATE jobs SET payload=CASE
        WHEN jsonb_typeof($2::jsonb->'clickOffsets')='object'
-         THEN (payload - 'clickOffsets') || jsonb_build_object(
+         THEN ((payload || ($2::jsonb - 'clickOffsets')) - 'clickOffsets') || jsonb_build_object(
            'clickOffsets',
            COALESCE(payload->'clickOffsets','{}'::jsonb) || ($2::jsonb->'clickOffsets')
          )

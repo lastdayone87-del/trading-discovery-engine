@@ -41,6 +41,8 @@ maybe('partial retry enqueues and progress writes deep-merge per-seed click offs
   };
   await enqueueCommunityAcquisitionRetry(channelId, directive, 'INSPECTION');
   let row = await db.query(`SELECT payload FROM jobs WHERE id=$1`, [seeded.id]);
+  assert.equal(row.rows[0].payload.retryCode, 'COMMUNITY_ACQUISITION_REQUIRED', 'the click-offset branch still merges the incoming retry code');
+  assert.equal(row.rows[0].payload.retryReason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
   assert.deepEqual(row.rows[0].payload.clickOffsets, {
     'https://seed-a.test/': 4,
     'https://seed-b.test/': 3,
