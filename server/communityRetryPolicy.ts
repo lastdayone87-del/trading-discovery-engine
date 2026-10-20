@@ -2,6 +2,11 @@ import assert from 'node:assert/strict';
 import { assessCrawlAdmission, isAuxiliaryForOutcome, acquisitionOwnershipUrl } from './communitySurfacePolicy';
 
 export const COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE = 'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE';
+/** Generic retry code for real inspection work that must run again without
+ * being a capacity deferral. It is deliberately not attempt-free: the prior
+ * inspection executed acquisition work (or must validate a stored locator),
+ * so each durable attempt consumes budget. */
+export const COMMUNITY_ACQUISITION_REQUIRED = 'COMMUNITY_ACQUISITION_REQUIRED';
 
 export const COMMUNITY_RETRY_REASON = {
   NO_SURFACE: 'NO_SURFACE',

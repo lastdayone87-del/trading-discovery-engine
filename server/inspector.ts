@@ -6,7 +6,7 @@ import { extractCommunityIntentEvidence } from './communityIntent';
 import { getChannelById, getSiteInspections, upsertSiteInspection, recordCreatorSiteLinks, getSiteProfiles, recordPageCoverage, upsertFrontierQueueItem, countFrontierQueue, accumulateRouteStats, upsertSiteProfile, recordDiscoveryRecoveryAudit, type SiteInspectionRow } from './db';
 import { routePatternFor, shouldAccumulateRouteObservation, evaluateDomainWeightShadow, isDomainWeightExperimentConsumptionEnabled, type DomainWeightShadowEvaluation } from './domainLearner';
 import { decideFrontierStep, scoreFrontierCandidate, classifyBlockedAcquisition, isFrontierEnabled, MAX_FRONTIER_PAGES_PER_SITE, MAX_FRONTIER_QUEUE_PER_SITE, FRONTIER_POLICY_VERSION, type FrontierCrawlOptions } from './frontierManager';
-import { canonicalSiteIdentity, isSiteInspectionReusable, buildBorrowedSiteInspection, siteInspectionCoversRequest, isSufficientRenderedCoverage, rootCoverageTerminal, mergeRedirectBinding, redirectBindingFor, redirectDestinations, REDIRECT_BINDING_KIND, checksumSiteFacts, SITE_INSPECTION_POLICY_VERSION, isExactBarrierPageCover, aggregateSeedOutcome, SITE_INSPECTION_CLAIM_STATUS, type SiteIdentity, type SiteInspectionStore } from './siteInspectionCache';
+import { canonicalSiteIdentity, isSiteInspectionReusable, buildBorrowedSiteInspection, hasSameOwnerPendingCandidates, siteInspectionCoversRequest, isSufficientRenderedCoverage, rootCoverageTerminal, mergeRedirectBinding, redirectBindingFor, redirectDestinations, REDIRECT_BINDING_KIND, checksumSiteFacts, SITE_INSPECTION_POLICY_VERSION, isExactBarrierPageCover, aggregateSeedOutcome, SITE_INSPECTION_CLAIM_STATUS, type SiteIdentity, type SiteInspectionStore } from './siteInspectionCache';
 import { fetchRecentVideoDescriptionsWithIds, type RecentVideoDescription } from './youtube';
 import {candidateFromNativeInvite,extractDiscordCandidates,makeDiscordCandidate,mergeDiscordCandidates,type DiscordCandidate} from './discordCandidates';
 import { bumpRepeatFailureHistoryOutage, bumpRepeatFailureSkip } from './operationsTelemetry';
@@ -1616,11 +1616,10 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   // validation still decide. Cross-creator borrows never reach this path and
   // stay candidate-free; the queue flips the row to CLAIMED once admission
   // commits.
-  const unclaimedOwnCandidates = seedCachedRow
-    && Array.isArray(seedCachedRow.candidates) && seedCachedRow.candidates.length > 0
-    && seedCachedRow.claimStatus !== SITE_INSPECTION_CLAIM_STATUS.CLAIMED
-    && seedCachedRow.claimStatus !== SITE_INSPECTION_CLAIM_STATUS.DISCARDED;
-  const sameOwnerRecovery = unclaimedOwnCandidates && !!channelData.channelId && seedCachedRow!.sourceChannelId === channelData.channelId;
+  // Migration 150: the row may now contain another channel's pending
+  // candidates alongside ours, so recovery is decided by this channel's own
+  // pending map entry, not by the last writer's row-level source channel.
+  const sameOwnerRecovery = hasSameOwnerPendingCandidates(seedCachedRow, channelData.channelId);
   if (sameOwnerRecovery) {
     const borrowed = buildBorrowedSiteInspection(seedCachedRow!,{requestedUrl:item.url,surface:'CREATOR_WEBSITES',required:false,wrapperUrl:item.wrapperUrl,observedAt:now,channelId:channelData.channelId});
     retainCommunityIntent(borrowed.communityIntents as unknown as CommunityIntentEvidence[]);

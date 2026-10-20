@@ -1130,10 +1130,32 @@ export interface SiteInspectionRow {
    * never reusable until admission flips them to CLAIMED/DISCARDED. Optional
    * for the same reason; absent/unknown is treated fail-closed by consumers. */
   claimStatus?: string;
+  /** Per-channel unclaimed candidates (migration 150). A non-empty map keeps
+   * the row PENDING and preserves every channel's crash-window evidence even
+   * when another channel later rewrites the site facts. Legacy rows without
+   * the column fall back to sourceChannelId + candidates. */
+  pendingClaims?: Record<string, Array<Record<string, unknown>>>;
   provenance: Record<string, unknown>;
   firstObservedAt: string | null;
   lastObservedAt: string | null;
   observedCount: number;
+}
+
+/** Parses the migration-150 pending-claims map. Unknown/invalid shapes are
+ * treated as an empty map (fail closed toward the legacy row fields). */
+function pendingClaimsFromColumn(value: unknown): Record<string, Array<Record<string, unknown>>> {
+  let source = value;
+  if (typeof source === 'string') {
+    try { source = JSON.parse(source); } catch { return {}; }
+  }
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return {};
+  const parsed: Record<string, Array<Record<string, unknown>>> = {};
+  for (const [channelId, candidates] of Object.entries(source as Record<string, unknown>)) {
+    if (!channelId || !Array.isArray(candidates)) continue;
+    const records = candidates.filter((candidate): candidate is Record<string, unknown> => !!candidate && typeof candidate === 'object');
+    if (records.length) parsed[channelId] = records;
+  }
+  return parsed;
 }
 
 function rowToSiteInspection(item: Record<string, unknown>): SiteInspectionRow {
@@ -1156,6 +1178,7 @@ function rowToSiteInspection(item: Record<string, unknown>): SiteInspectionRow {
     renderedCovered: item.rendered_covered === true,
     sourceChannelId: typeof item.source_channel_id === 'string' ? item.source_channel_id : null,
     claimStatus: text(item.claim_status),
+    pendingClaims: pendingClaimsFromColumn(item.pending_claims),
     provenance: (item.provenance && typeof item.provenance === 'object' ? item.provenance : {}) as Record<string, unknown>,
     firstObservedAt: typeof item.first_observed_at === 'string' ? item.first_observed_at : (item.first_observed_at instanceof Date ? item.first_observed_at.toISOString() : null),
     lastObservedAt: typeof item.last_observed_at === 'string' ? item.last_observed_at : (item.last_observed_at instanceof Date ? item.last_observed_at.toISOString() : null),
@@ -1179,9 +1202,11 @@ export async function getSiteInspections(identities: string[]): Promise<SiteInsp
   }
 }
 
-/** Stores the site-facts learned by crawling one site. Last-writer-wins on
- * repeat crawls (fresher payload replaces older); concurrent first crawls
- * converge via ON CONFLICT. Never carries creator attribution. */
+/** Stores the site-facts learned by crawling one site. Site facts are
+ * last-writer-wins (fresher payload replaces older), but unclaimed candidates
+ * are NOT: each recording channel keeps its own pending list in
+ * `pending_claims`, so a later crawl can never erase another channel's
+ * crash-window discovery before admission. Never carries creator attribution. */
 export async function upsertSiteInspection(row: {
   siteIdentity: string; identityTier: string; identityBasis: string;
   canonicalUrl: string; finalUrl?: string | null; outcome: string; retryable: boolean;
@@ -1192,43 +1217,133 @@ export async function upsertSiteInspection(row: {
 }): Promise<void> {
   if (!row.siteIdentity) return;
   const db = await getDb();
-  await db.query(`INSERT INTO site_inspections(site_identity,identity_tier,identity_basis,canonical_url,final_url,outcome,retryable,http_status,failure_class,detail,payload_checksum,candidates,observations,rendered_covered,source_channel_id,claim_status,community_intents,provenance,first_observed_at,last_observed_at,observed_count)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,now(),now(),1)
+  const claimChannel = typeof row.sourceChannelId === 'string' && row.sourceChannelId ? row.sourceChannelId : '';
+  const initialPendingClaims = (row.claimStatus || 'NONE') === 'PENDING' && claimChannel && Array.isArray(row.candidates) && row.candidates.length
+    ? { [claimChannel]: row.candidates }
+    : {};
+  await db.query(`INSERT INTO site_inspections(site_identity,identity_tier,identity_basis,canonical_url,final_url,outcome,retryable,http_status,failure_class,detail,payload_checksum,candidates,observations,rendered_covered,source_channel_id,claim_status,community_intents,provenance,pending_claims,first_observed_at,last_observed_at,observed_count)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,now(),now(),1)
     ON CONFLICT(site_identity) DO UPDATE SET identity_tier=excluded.identity_tier,identity_basis=excluded.identity_basis,canonical_url=excluded.canonical_url,final_url=excluded.final_url,outcome=excluded.outcome,retryable=excluded.retryable,http_status=excluded.http_status,failure_class=excluded.failure_class,detail=excluded.detail,payload_checksum=excluded.payload_checksum,
       candidates=CASE WHEN site_inspections.claim_status='PENDING' AND jsonb_array_length(site_inspections.candidates)>0 AND jsonb_array_length(excluded.candidates)=0 THEN site_inspections.candidates ELSE excluded.candidates END,
       observations=excluded.observations,rendered_covered=excluded.rendered_covered,
       source_channel_id=CASE WHEN site_inspections.claim_status='PENDING' AND jsonb_array_length(site_inspections.candidates)>0 AND jsonb_array_length(excluded.candidates)=0 THEN site_inspections.source_channel_id ELSE excluded.source_channel_id END,
-      claim_status=CASE WHEN site_inspections.claim_status='PENDING' AND jsonb_array_length(site_inspections.candidates)>0 AND jsonb_array_length(excluded.candidates)=0 THEN site_inspections.claim_status ELSE excluded.claim_status END,
       community_intents=CASE WHEN jsonb_array_length(excluded.community_intents)=0 AND jsonb_array_length(site_inspections.community_intents)>0 THEN site_inspections.community_intents ELSE excluded.community_intents END,
-      provenance=excluded.provenance,last_observed_at=now(),observed_count=site_inspections.observed_count+1`,
-    [row.siteIdentity, row.identityTier || 'A', row.identityBasis || '', row.canonicalUrl, row.finalUrl || null, row.outcome, row.retryable, row.httpStatus ?? null, row.failureClass || '', row.detail || '', row.payloadChecksum || null, JSON.stringify(row.candidates || []), JSON.stringify(row.observations || []), row.renderedCovered, row.sourceChannelId || null, row.claimStatus || 'NONE', JSON.stringify(row.communityIntents || []), JSON.stringify(row.provenance || {})]);
+      provenance=excluded.provenance,
+      pending_claims=CASE
+        WHEN excluded.claim_status='PENDING' AND excluded.source_channel_id IS NOT NULL AND jsonb_array_length(excluded.candidates)>0
+        THEN (
+          CASE WHEN COALESCE(site_inspections.pending_claims,'{}'::jsonb)='{}'::jsonb
+                    AND site_inspections.claim_status='PENDING'
+                    AND site_inspections.source_channel_id IS NOT NULL
+                    AND jsonb_array_length(site_inspections.candidates)>0
+               THEN jsonb_build_object(site_inspections.source_channel_id,site_inspections.candidates)
+               ELSE COALESCE(site_inspections.pending_claims,'{}'::jsonb) END
+        ) || jsonb_build_object(excluded.source_channel_id,excluded.candidates)
+        ELSE COALESCE(site_inspections.pending_claims,'{}'::jsonb) END,
+      claim_status=CASE
+        WHEN excluded.claim_status='PENDING' AND excluded.source_channel_id IS NOT NULL AND jsonb_array_length(excluded.candidates)>0 THEN 'PENDING'
+        WHEN COALESCE(site_inspections.pending_claims,'{}'::jsonb) <> '{}'::jsonb THEN 'PENDING'
+        WHEN site_inspections.claim_status='PENDING' AND jsonb_array_length(site_inspections.candidates)>0 AND jsonb_array_length(excluded.candidates)=0 THEN 'PENDING'
+        ELSE excluded.claim_status END,
+      last_observed_at=now(),observed_count=site_inspections.observed_count+1`,
+    [row.siteIdentity, row.identityTier || 'A', row.identityBasis || '', row.canonicalUrl, row.finalUrl || null, row.outcome, row.retryable, row.httpStatus ?? null, row.failureClass || '', row.detail || '', row.payloadChecksum || null, JSON.stringify(row.candidates || []), JSON.stringify(row.observations || []), row.renderedCovered, row.sourceChannelId || null, row.claimStatus || 'NONE', JSON.stringify(row.communityIntents || []), JSON.stringify(row.provenance || {}), JSON.stringify(initialPendingClaims)]);
 }
 
-/** Marks this channel's PENDING site-inspection rows as CLAIMED after the
- * authoritative Discord admission committed (E2). Only rows containing a
- * candidate that actually reached admission are flipped; a prior interrupted
- * run's unadmitted candidates must stay non-reusable. Rows with unclaimed
- * candidates stay PENDING until this flip, so a crash between cache write and
- * admission degrades to an idempotent recrawl/re-admission instead of silent
- * discovery loss. Best-effort: a pre-migration database missing the column
- * resolves to zero. */
-export async function markSiteInspectionsClaimed(channelId: string, admittedCandidateIds: string[] = []): Promise<number> {
-  const ids = [...new Set((admittedCandidateIds || []).filter(id => typeof id === 'string' && !!id))];
-  if (!channelId || !ids.length) return 0;
+/** Finalizes one channel's pending cache candidates after admission. Only the
+ * executing channel's candidate ids are removed; candidates recorded by any
+ * other channel stay pending (finding: a second crawl must never erase an
+ * unclaimed invite). When no pending evidence remains the row becomes the
+ * supplied terminal state; a DISCARDED result also clears the stale candidate
+ * payload so the site becomes reusable coverage. Legacy PENDING rows written
+ * before migration 150 are finalized through their source_channel_id +
+ * candidates pair. Best-effort on pre-migration databases: missing columns
+ * resolve to zero. */
+async function finalizeSiteInspectionClaims(
+  channelId: string,
+  candidateIds: string[],
+  terminalStatus: 'CLAIMED' | 'DISCARDED',
+): Promise<number> {
+  const ids = new Set((candidateIds || []).filter(id => typeof id === 'string' && !!id));
+  if (!channelId || !ids.size) return 0;
   const db = await getDb();
+  let client: Awaited<ReturnType<typeof db.connect>> | null = null;
   try {
-    const res = await db.query(`UPDATE site_inspections SET claim_status='CLAIMED'
-      WHERE source_channel_id=$1 AND claim_status='PENDING'
-        AND EXISTS (
-          SELECT 1 FROM jsonb_array_elements(candidates) candidate
-          WHERE candidate->>'candidateId' = ANY($2::text[])
-        )`, [channelId, ids]);
-    return res.rowCount || 0;
+    client = await db.connect();
+    await client.query('BEGIN');
+    const res = await client.query(
+      `SELECT site_identity,source_channel_id,claim_status,candidates,pending_claims
+         FROM site_inspections
+        WHERE claim_status='PENDING'
+          AND (pending_claims ? $1 OR (source_channel_id=$1 AND jsonb_array_length(candidates)>0))
+        FOR UPDATE`,
+      [channelId],
+    );
+    let updated = 0;
+    for (const raw of res.rows || []) {
+      const row = raw as Record<string, unknown>;
+      const siteIdentity = typeof row.site_identity === 'string' ? row.site_identity : '';
+      if (!siteIdentity) continue;
+      const claims = pendingClaimsFromColumn(row.pending_claims);
+      const ownClaims = Array.isArray(claims[channelId]) ? claims[channelId] : null;
+      let changed = false;
+      let rowCandidates = Array.isArray(row.candidates)
+        ? row.candidates.filter((candidate): candidate is Record<string, unknown> => !!candidate && typeof candidate === 'object')
+        : [];
+      if (ownClaims) {
+        const remaining = ownClaims.filter(candidate => !ids.has(String(candidate.candidateId || '')));
+        changed = remaining.length !== ownClaims.length;
+        if (remaining.length) claims[channelId] = remaining;
+        else delete claims[channelId];
+      }
+      if (row.source_channel_id === channelId) {
+        const remaining = rowCandidates.filter(candidate => !ids.has(String(candidate.candidateId || '')));
+        if (!ownClaims) changed = remaining.length !== rowCandidates.length;
+        rowCandidates = remaining;
+      }
+      if (!changed) continue;
+      const hasPending = Object.keys(claims).length > 0
+        || (row.source_channel_id === channelId && rowCandidates.length > 0);
+      const nextStatus = hasPending ? 'PENDING' : terminalStatus;
+      // DISCARDED is terminal and reusable: no stale candidate payload may
+      // remain to resurrect the foreign-owned discovery on a later borrow.
+      const nextCandidates = !hasPending && terminalStatus === 'DISCARDED' ? [] : rowCandidates;
+      await client.query(
+        `UPDATE site_inspections
+            SET pending_claims=$2::jsonb,claim_status=$3,candidates=$4::jsonb
+          WHERE site_identity=$1`,
+        [siteIdentity, JSON.stringify(claims), nextStatus, JSON.stringify(nextCandidates)],
+      );
+      updated++;
+    }
+    await client.query('COMMIT');
+    return updated;
   } catch (error) {
+    if (client) await client.query('ROLLBACK').catch(() => undefined);
     const code = (error as { code?: unknown } | null)?.code;
     if (code === '42P01' || code === '42703') return 0;
     throw error;
+  } finally {
+    client?.release();
   }
+}
+
+/** Marks this channel's PENDING site-inspection rows as CLAIMED after the
+ * authoritative Discord admission committed (E2). Callers pass every
+ * candidate id from the execution, not only admitted winners: the whole
+ * execution is final, so an admitted row becomes reusable while an all-losing
+ * execution uses markSiteInspectionsDiscarded instead. Best-effort: a
+ * pre-migration database missing the column resolves to zero. */
+export async function markSiteInspectionsClaimed(channelId: string, admittedCandidateIds: string[] = []): Promise<number> {
+  return finalizeSiteInspectionClaims(channelId, admittedCandidateIds, 'CLAIMED');
+}
+
+/** Marks this channel's PENDING site-inspection rows as DISCARDED when every
+ * candidate was rejected (duplicate-owned or otherwise not admitted). The
+ * row's candidate payload is cleared once no channel still has pending work,
+ * making the site reusable terminal coverage instead of a permanent recrawl
+ * target. */
+export async function markSiteInspectionsDiscarded(channelId: string, discardedCandidateIds: string[] = []): Promise<number> {
+  return finalizeSiteInspectionClaims(channelId, discardedCandidateIds, 'DISCARDED');
 }
 
 /** Records creator -> site references (never ownership). Written on every

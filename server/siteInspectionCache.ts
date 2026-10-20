@@ -61,6 +61,10 @@ export interface CachedSiteInspection {
   /** Claim handshake state; absent/unknown is treated as not-claimable
    * (fail closed) whenever candidates are present. */
   claimStatus?: string | null;
+  /** Per-channel unclaimed candidates (migration 150). Non-empty means the
+   * row is PENDING for at least one recording channel and is never reusable
+   * as borrowed coverage. */
+  pendingClaims?: Record<string, Array<Record<string, unknown>>>;
 }
 
 export interface BorrowedSiteInspection {
@@ -99,6 +103,11 @@ const ageMs = (lastObservedAt: string | null, nowMs: number): number | null => {
  * original crawl's clock and the next borrower recrawls. */
 export function isSiteInspectionReusable(row: CachedSiteInspection | null | undefined, nowMs: number = Date.now()): boolean {
   if (!row || !row.siteIdentity) return false;
+  // PENDING is never reusable, even when a later writer replaced the row-level
+  // candidate array: the per-channel pending map still owns unclaimed
+  // discoveries that must be recovered before anyone borrows this coverage.
+  if (row.claimStatus === SITE_INSPECTION_CLAIM_STATUS.PENDING) return false;
+  if (row.pendingClaims && Object.values(row.pendingClaims).some(candidates => Array.isArray(candidates) && candidates.length > 0)) return false;
   const hasCandidates = Array.isArray(row.candidates) && row.candidates.length > 0;
   if (hasCandidates) {
     // Write-invariant repair gate (E1): a negative row that still carries
@@ -122,6 +131,28 @@ export function isSiteInspectionReusable(row: CachedSiteInspection | null | unde
   return age <= SITE_INSPECTION_FRESH_TTL_MS;
 }
 
+/** True only when this channel has recoverable unclaimed candidates on the
+ * row: either its own migration-150 pending entry, or a legacy single-owner
+ * PENDING row. A pending map for other channels never grants candidate
+ * recovery to a borrower, and final CLAIMED/DISCARDED rows are not replayed. */
+export function hasSameOwnerPendingCandidates(
+  row: CachedSiteInspection | null | undefined,
+  channelId?: string | null,
+): boolean {
+  if (!row || !channelId) return false;
+  const pendingClaims = row.pendingClaims && typeof row.pendingClaims === 'object' ? row.pendingClaims : {};
+  const pendingChannels = Object.keys(pendingClaims);
+  const own = pendingClaims[channelId];
+  if (Array.isArray(own) && own.length > 0) return true;
+  if (pendingChannels.length > 0) return false;
+  return row.claimStatus !== SITE_INSPECTION_CLAIM_STATUS.CLAIMED
+    && row.claimStatus !== SITE_INSPECTION_CLAIM_STATUS.DISCARDED
+    && typeof row.sourceChannelId === 'string'
+    && row.sourceChannelId === channelId
+    && Array.isArray(row.candidates)
+    && row.candidates.length > 0;
+}
+
 /** Builds the borrower's per-creator observations from a cached row. The
  * requested/root URLs and observedAt reflect THIS inspection (fresh audit
  * trail); outcome, retryable, failure class, telemetry, and the cached
@@ -129,8 +160,8 @@ export function isSiteInspectionReusable(row: CachedSiteInspection | null | unde
  * verbatim: the borrowing call has identical structure to the original, so
  * retry attribution matches a fresh crawl. Provenance marks the borrow so
  * crawled vs reused evidence stays distinguishable downstream.
- * Candidates are deliberately excluded: discoveries belong to the
- * originating investigation and are never transferred across creators. */
+ * Cross-creator candidates are deliberately excluded; only this channel's
+ * unclaimed pending-map entry may be recovered by the caller. */
 export function buildBorrowedSiteInspection(
   row: CachedSiteInspection,
   borrower: { requestedUrl: string; surface: string; required: boolean; wrapperUrl?: string; observedAt: string; channelId?: string },
@@ -156,19 +187,30 @@ export function buildBorrowedSiteInspection(
     };
   });
   // Same-owner candidate recovery (E3): candidates flow back ONLY to the
-  // recording channel. Ownership is re-inferred and the global claim still
-  // decides during normal admission; cross-creator borrowers stay
-  // candidate-free by construction.
-  const sameOwner = typeof borrower.channelId === 'string' && borrower.channelId.length > 0 &&
+  // channel that recorded them. Migration 150 keeps one pending list per
+  // channel, so a site rewritten by another creator still returns exactly this
+  // channel's unclaimed discoveries. Ownership is re-inferred and the global
+  // claim still decides during normal admission; cross-creator borrowers stay
+  // candidate-free by construction. Legacy rows (no pending map) fall back to
+  // the single sourceChannelId pair.
+  const pendingClaims = row.pendingClaims && typeof row.pendingClaims === 'object' ? row.pendingClaims : {};
+  const hasPendingMap = Object.keys(pendingClaims).length > 0;
+  const ownPending = typeof borrower.channelId === 'string' && borrower.channelId
+    ? pendingClaims[borrower.channelId]
+    : undefined;
+  const legacyOwnCandidates = !hasPendingMap &&
+    typeof borrower.channelId === 'string' && borrower.channelId.length > 0 &&
     typeof row.sourceChannelId === 'string' && row.sourceChannelId.length > 0 &&
     row.sourceChannelId === borrower.channelId;
-  const recoveredCandidates = sameOwner && Array.isArray(row.candidates)
-    ? row.candidates.filter(item => item && typeof item === 'object')
-    : [];
+  const recoveredCandidates = Array.isArray(ownPending)
+    ? ownPending.filter(item => item && typeof item === 'object')
+    : legacyOwnCandidates && Array.isArray(row.candidates)
+      ? row.candidates.filter(item => item && typeof item === 'object')
+      : [];
   const communityIntents = Array.isArray(row.communityIntents)
     ? row.communityIntents.filter(item => item && typeof item === 'object')
     : [];
-  return { row: { ...row, candidates: [] }, observations, recoveredCandidates, communityIntents };
+  return { row: { ...row, candidates: [], pendingClaims: {} }, observations, recoveredCandidates, communityIntents };
 }
 
 /** Strongest-observation aggregate for a seed's cache row (E1): array

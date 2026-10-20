@@ -42,6 +42,7 @@ import {
   getNeighborhoodForQueryRun,
   markCommunityInspectionStarted,
   markSiteInspectionsClaimed,
+  markSiteInspectionsDiscarded,
   type DiscordAttemptCandidate,
   type DiscordInviteClaim,
   type OrphanDiscordCandidateRow,
@@ -102,7 +103,7 @@ import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
 import { triggerPhaseBObservationReconciliation } from './phaseBObservationOutbox';
 import { bumpCommunitySaturationDeferral } from './operationsTelemetry';
 import { canContinueCommunityInspectionAfterDegradedManualClassification } from './manualRecheckPolicy';
-import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_RETRY_REASON, FOUND_GAP_RETRYABLE_FAILURE_CLASSES, buildCommunityRetryJobMetadata, isAttemptFreeCommunityFailure, attemptFreeDiscordValidation, retryAtFromUnknown, retryReasonFromError, type CommunityRetryDirective} from './communityRetryPolicy';
+import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_ACQUISITION_REQUIRED, COMMUNITY_RETRY_REASON, FOUND_GAP_RETRYABLE_FAILURE_CLASSES, buildCommunityRetryJobMetadata, isAttemptFreeCommunityFailure, attemptFreeDiscordValidation, retryAtFromUnknown, retryReasonFromError, type CommunityRetryDirective} from './communityRetryPolicy';
 import { classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
 import { discordCandidateCompositeRank } from './discordOwnershipSelection';
 import { admitDiscordCandidates, buildLegacyDiscordCandidate, canonicalDiscordInviteId, discordInviteCodeOf, extractDiscordInviteCodeRaw, inferDiscordOwnership, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
@@ -360,10 +361,15 @@ export async function admitInspectionDiscordCandidates(
 /**
  * Duplicate-owner provenance projection (E8/E9 follow-up). A fresh duplicate
  * claim always replaces the saved owner id. When no duplicate was observed,
- * only a fresh, processed website/social inspection can prove the prior
- * duplicate disappeared: cache-only borrows deliberately return no candidates
- * and must not erase the saved provenance. Failed or partial fresh runs also
- * cannot establish absence, so the prior owner id is preserved. Pure.
+ * only complete, fresh website/social coverage can prove the prior duplicate
+ * disappeared. Absence needs aggregate completeness, not one successful seed:
+ *  - cache-only borrows are never proof (they return no candidates);
+ *  - any failed, partial, or unprocessed seed leaves the prior owner intact
+ *    because that seed could still contain the duplicate;
+ *  - the owner clears only when every relevant observation is a fresh
+ *    processed negative or a FOUND row from this execution.
+ * A single FOUND alongside a failed seed therefore preserves provenance.
+ * Pure and unit-tested.
  */
 export function nextDiscordDuplicateOwnerChannelId(input: {
   discardedOwnerChannelIds: string[];
@@ -378,14 +384,16 @@ export function nextDiscordDuplicateOwnerChannelId(input: {
 }): string | null {
   const replacement = input.discardedOwnerChannelIds.find(Boolean);
   if (replacement) return replacement;
-  const freshProcessedWebsiteEvidence = input.observations.some(observation => {
-    if (observation.surface !== 'CREATOR_WEBSITES' && observation.surface !== 'SOCIAL_PROFILES') return false;
+  const relevant = (input.observations || []).filter(observation =>
+    observation && (observation.surface === 'CREATOR_WEBSITES' || observation.surface === 'SOCIAL_PROFILES'));
+  if (!relevant.length) return input.previousOwnerChannelId || null;
+  const completeAbsenceEvidence = relevant.every(observation => {
     if (observation.siteCacheHit === true) return false;
     if (observation.outcome === 'FOUND') return true;
     return observation.outcome === 'INSPECTED_NO_MATCH'
       && hasProcessedAcquisitionEvidence(observation as Parameters<typeof hasProcessedAcquisitionEvidence>[0]);
   });
-  return freshProcessedWebsiteEvidence ? null : (input.previousOwnerChannelId || null);
+  return completeAbsenceEvidence ? null : (input.previousOwnerChannelId || null);
 }
 /**
  * Orphan drain (E6). Candidates persisted by an execution that never reached
@@ -1537,8 +1545,11 @@ export async function persistCommunityRetryClickOffsets(
   const safe = resolveInspectionClickOffsets(offsets);
   if (!jobId || !safe) return;
   const db = clientOverride || await getDb();
+  // Deep-merge per-seed offsets: a partial map (manual retry, one seed
+  // re-inspected) must never erase progress recorded for other seeds on the
+  // same durable job. Incoming values win for keys they contain.
   await db.query(
-    `UPDATE jobs SET payload=payload || jsonb_build_object('clickOffsets',$2::jsonb),updated_at=now() WHERE id=$1 AND status='PROCESSING'`,
+    `UPDATE jobs SET payload=(payload - 'clickOffsets') || jsonb_build_object('clickOffsets',COALESCE(payload->'clickOffsets','{}'::jsonb) || $2::jsonb),updated_at=now() WHERE id=$1 AND status='PROCESSING'`,
     [jobId, JSON.stringify(safe)]
   );
 }
@@ -1835,15 +1846,24 @@ export async function inspectAndValidateChannel(
     // orchestration (persist, claim, delete losers) is injectable for tests;
     // production passes the real implementations below.
     const structuredCandidates=(inspection.discordCandidates||[]).filter(candidate=>!!discordInviteCodeOf(candidate.nativeInviteCode));
+    const executedCandidateIds=[...new Set(structuredCandidates.map(candidate=>candidate.candidateId).filter(Boolean))];
     let chokeAdmission=await admitInspectionDiscordCandidates(structuredCandidates,inspection.foundInvite,channel.channel_id);
     if(chokeAdmission.discardedCount)console.info(JSON.stringify({event:'discord_duplicate_discarded',channelId:channel.channel_id,discardedCount:chokeAdmission.discardedCount,discardedOwnerChannelIds:chokeAdmission.discardedOwnerChannelIds,timestamp:new Date().toISOString()}));
     admittedInspection={...inspection,discordCandidates:chokeAdmission.candidates,foundInvite:chokeAdmission.discoveredInvite};
 
-    // Durable cache handshake (E2): admission committed for this channel, so
-    // its candidate-bearing cache rows become reusable coverage again.
-    // Best-effort by design — a failure leaves rows PENDING, which only
-    // forces an idempotent recrawl/re-admission, never a silent loss.
-    await markSiteInspectionsClaimed(channel.channel_id,chokeAdmission.candidates.map(candidate=>candidate.candidateId)).catch(()=>undefined);
+    // Durable cache handshake (E2): this execution is final for every
+    // candidate it examined. If at least one candidate reached admission the
+    // rows become reusable CLAIMED coverage; when every candidate lost the
+    // global claim (foreign-owned duplicates) they become terminal DISCARDED
+    // instead of staying PENDING and forcing an endless recrawl. Only this
+    // channel's pending ids are finalized, so another channel's unclaimed
+    // discoveries survive. Best-effort by design — a failure leaves rows
+    // PENDING, which only forces an idempotent recrawl/re-admission, never a
+    // silent loss.
+    if(executedCandidateIds.length){
+      if(chokeAdmission.candidates.length)await markSiteInspectionsClaimed(channel.channel_id,executedCandidateIds).catch(()=>undefined);
+      else await markSiteInspectionsDiscarded(channel.channel_id,executedCandidateIds).catch(()=>undefined);
+    }
 
     // Orphan drain (E6): a candidate persisted by an execution that crashed
     // before its claim has no validation attempt and no path back into
@@ -2149,16 +2169,23 @@ export async function handleRelationshipCanaryExpansionJob(
  * The projection may only complete a channel when no discovery obligation
  * remains outstanding; otherwise it would strand the work. Pure over
  * channel + inspection state (no DB): the durable retry job is preserved by
- * never clearing scan attempts on a pending projection. Four keep-pending
+ * never clearing scan attempts on a pending projection. Three keep-pending
  * signals:
  *  - a stored locator whose validation never reached a terminal verdict;
  *  - a FOUND+required-gap directive (invites retained, gap unresolved);
- *  - any mandatory required observation that is retryable.
+ *  - a mandatory community-surface observation that is retryable.
+ *
+ * The retryable-observation check intentionally reuses the shared
+ * isCommunityRetryableObservation boundary. A raw `required && retryable`
+ * check would treat YouTube About / recent-video-description upstream
+ * failures as Discord work, converting a completed negative into FAILED and
+ * scheduling a fabricated capacity retry.
  */
 export function detectPendingDiscoveryWork(
   channel: Pick<ChannelRecord,'discord_candidate_locator'|'discord_validation_status'|'discord_discovery_status'>,
   inspection: {
-    acquisitionOutcomes?: Array<{ outcome?: unknown; retryable?: unknown; required?: unknown; failureClass?: unknown }>;
+    acquisitionOutcomes?: Array<{ surface?: unknown; outcome?: unknown; retryable?: unknown; required?: unknown; failureClass?: unknown }>;
+    retrySuppressedUrls?: unknown;
     retryDirective?: unknown;
   } | null | undefined,
 ): { pending: boolean; reasons: string[] } {
@@ -2175,11 +2202,18 @@ export function detectPendingDiscoveryWork(
   if (locatorUnvalidated) reasons.push('locator-unvalidated');
   if (shouldScheduleFoundGapAcquisitionRetry(inspection)) reasons.push('found-gap-retry');
   const outcomes = Array.isArray(inspection?.acquisitionOutcomes) ? inspection.acquisitionOutcomes : [];
-  if (outcomes.some(item => item && typeof item === 'object' && (item as { required?: unknown }).required === true && (item as { retryable?: unknown }).retryable === true)) {
+  const suppressed = Array.isArray(inspection?.retrySuppressedUrls) ? inspection.retrySuppressedUrls.map(String) : undefined;
+  if (hasRetryableCommunityAcquisitionFailure(outcomes as Parameters<typeof hasRetryableCommunityAcquisitionFailure>[0], suppressed)) {
     reasons.push('required-retryable-observation');
   }
   return { pending: reasons.length > 0, reasons };
 }
+
+/** Maximum locator-only pending projections before the stored locator is
+ * treated as operationally exhausted. Bound is the durable retry job's own
+ * 5-attempt ceiling: a stale locator can no longer re-arm itself forever when
+ * a fresh inspection keeps finding no replacement candidate. */
+export const LOCATOR_PENDING_PROJECTION_LIMIT = 5;
 
 export async function projectNotFoundAfterInspection(
   channel: ChannelRecord,
@@ -2194,12 +2228,28 @@ export async function projectNotFoundAfterInspection(
 ): Promise<void> {
       // Pending-work guard (E7): never project COMPLETED/attempts=0 onto a
       // channel that still owns discovery work — a stored unvalidated locator,
-      // a FOUND+required-gap directive, or a retryable mandatory observation.
+      // a FOUND+required-gap directive, or a retryable community observation.
       // Project operational failure + RETRY_PENDING instead and preserve the
-      // durable job: scan_attempts stay untouched and any directive merges
-      // idempotently into the existing per-channel retry job.
+      // durable job: any directive merges idempotently into the existing
+      // per-channel retry job.
+      //
+      // Locator-only pending work is bounded by the channel's durable scan
+      // attempts. Without this bound a stored locator whose site never yields
+      // it again re-arms RETRY_PENDING on every pass (and the idempotent
+      // enqueue resets job attempts after terminal states), so the channel
+      // never reaches a verdict. After the same 5-attempt ceiling as the retry
+      // job, the locator becomes terminal FAILED_OPERATIONAL and the normal
+      // absence projection runs. Other pending reasons keep their established
+      // unbounded-preservation semantics because they own real acquisition work.
       const pendingWork=detectPendingDiscoveryWork(channel,inspection);
-      if(pendingWork.pending){
+      const locatorOnly=pendingWork.reasons.length===1&&pendingWork.reasons[0]==='locator-unvalidated';
+      const locatorExhausted=locatorOnly&&Math.max(0,Number(channel.scan_attempts)||0)>=LOCATOR_PENDING_PROJECTION_LIMIT;
+      if(locatorExhausted){
+        channel.discord_validation_status='FAILED_OPERATIONAL';
+      }else if(locatorOnly){
+        channel.scan_attempts=Math.max(0,Number(channel.scan_attempts)||0)+1;
+      }
+      if(pendingWork.pending&&!locatorExhausted){
         const alreadyValidatedSuccess=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
         if(!alreadyValidatedSuccess){
           channel.discord_status='UNCERTAIN';
@@ -2214,10 +2264,14 @@ export async function projectNotFoundAfterInspection(
         // or required-retryable observation may not have produced an
         // inspection directive, so fall back to a bounded retry directive
         // rather than leaving pending state with no worker to consume it.
+        // The fallback is NOT attempt-free and is not labeled a capacity
+        // deferral: real inspection work already ran and must consume one
+        // durable attempt (only proven capacity/browser no-start keeps
+        // attempt-free semantics).
         const pendingDirective:CommunityRetryDirective|undefined=inspection?.retryDirective||
           (scheduleRetry?{
-            attemptFree:true,
-            code:COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,
+            attemptFree:false,
+            code:COMMUNITY_ACQUISITION_REQUIRED,
             reason:`Pending discovery work: ${pendingWork.reasons.join(', ')}`,
             retryReason:COMMUNITY_RETRY_REASON.COMMUNITY_REQUIRED_ACQUISITION_FAILURE,
           }:undefined);
@@ -2278,6 +2332,20 @@ export function shouldCompleteSuppressedRetryJob(inspection:{
   return scanStatus==='FAILED'||scanStatus==='FAILED_PERMANENT';
 }
 
+/** Merge per-seed click progress: incoming values win for keys they contain,
+ * every previously recorded seed survives. Returns undefined when both sides
+ * carry no valid offset (so payloads are not polluted with empty maps). */
+export function mergeClickOffsetProgress(
+  existing: unknown,
+  incoming: unknown,
+): Record<string, number> | undefined {
+  const merged = {
+    ...(resolveInspectionClickOffsets(existing) || {}),
+    ...(resolveInspectionClickOffsets(incoming) || {}),
+  };
+  return Object.keys(merged).length ? merged : undefined;
+}
+
 export async function enqueueCommunityAcquisitionRetry(channelId:string,directive?:CommunityRetryDirective,source:'INSPECTION'|'RECOVERY'|'LEGACY'='INSPECTION',clientOverride?:{query:(sql:string,params?:unknown[])=>Promise<{rows:unknown[];rowCount:number}>}):Promise<void>{
   const metadata=buildCommunityRetryJobMetadata({
     code:directive?.code||COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,
@@ -2292,7 +2360,24 @@ export async function enqueueCommunityAcquisitionRetry(channelId:string,directiv
   // Preserve a pending job's original ownership and retry window while merging
   // the latest attributable reason into its durable payload.
   const runner:{query:(sql:string,params?:unknown[])=>Promise<unknown>} = clientOverride||await getDb();
-  await runner.query(`UPDATE jobs SET payload=payload || $2::jsonb,updated_at=now() WHERE id=$1 AND status IN('PENDING','PROCESSING')`,[job.id,JSON.stringify(metadata)]);
+  // Per-seed click progress is append-only across partial enqueues. A plain
+  // payload `||` would replace the entire clickOffsets object when a manual
+  // retry carries only the seed it re-inspected. enqueueJob's RETURNING gives
+  // the current durable payload, so merge nested maps before writing:
+  // incoming keys win, every other seed's offset is preserved.
+  let existingPayload: unknown = job.payload;
+  if (typeof existingPayload === 'string') {
+    try { existingPayload = JSON.parse(existingPayload); } catch { existingPayload = undefined; }
+  }
+  const mergedClickOffsets = mergeClickOffsetProgress(
+    (existingPayload as { clickOffsets?: unknown } | null | undefined)?.clickOffsets,
+    metadata.clickOffsets,
+  );
+  const durableMetadata = mergedClickOffsets ? { ...metadata, clickOffsets: mergedClickOffsets } : metadata;
+  await runner.query(
+    `UPDATE jobs SET payload=payload || $2::jsonb,updated_at=now() WHERE id=$1 AND status IN('PENDING','PROCESSING')`,
+    [job.id,JSON.stringify(durableMetadata)]
+  );
 }
 
 export function operationalEnrichmentRecoveryKey(channelId:string):string{return `operational-enrichment-recovery:${channelId}`;}

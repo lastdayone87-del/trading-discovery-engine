@@ -1139,11 +1139,12 @@ test('found-gap retry survives the no-admission NOT_FOUND branch', async () => {
     }) as never,
   );
   // Pending work always owns a durable job (E7): a missing inspection
-  // directive gets a bounded attempt-free fallback rather than stranding
-  // RETRY_PENDING state.
+  // directive gets a bounded, attempt-consuming fallback rather than
+  // stranding RETRY_PENDING state. It is not labeled a capacity deferral:
+  // the backing inspection already ran real acquisition work.
   assert.equal(cleanCalls.length, 1);
-  assert.equal((cleanCalls[0] as { attemptFree?: unknown }).attemptFree, true);
-  assert.equal((cleanCalls[0] as { code?: unknown }).code, 'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE');
+  assert.equal((cleanCalls[0] as { attemptFree?: unknown }).attemptFree, false);
+  assert.equal((cleanCalls[0] as { code?: unknown }).code, 'COMMUNITY_ACQUISITION_REQUIRED');
   // The retryable required gap still blocks a clean completion even without an
   // inspection directive: the channel never claims COMPLETED.
   assert.equal((cleanChannel as { scan_status?: unknown }).scan_status, 'FAILED');

@@ -5,7 +5,10 @@ import {
   upsertSiteInspection,
   recordCreatorSiteLinks,
   pruneSiteInspections,
+  markSiteInspectionsClaimed,
+  markSiteInspectionsDiscarded,
 } from './dbCore';
+import { buildBorrowedSiteInspection } from './siteInspectionCache';
 
 const enabled = Boolean(process.env.DATABASE_URL);
 const maybe = enabled ? test : test.skip;
@@ -46,6 +49,66 @@ maybe('site inspections upsert, read back, and converge across writers', async t
   assert.equal(second[0].observedCount, 2);
   assert.equal(second[0].renderedCovered, true);
   assert.equal(await getSiteInspections([]).then(rows => rows.length), 0, 'empty input reads nothing');
+});
+
+maybe('cross-writer pending claims keep each channel unclaimed invite recoverable', async t => {
+  const { getDb } = await import('./dbCore');
+  const db = await getDb();
+  const CROSS_SITE = 'apex-cross-writer-pending.example';
+  const cleanup = async () => {
+    await db.query(`DELETE FROM site_inspections WHERE site_identity=$1`, [CROSS_SITE]);
+  };
+  await cleanup();
+  t.after(cleanup);
+  const candidateA = { candidateId: 'candidate-a', nativeInviteCode: 'alphaRoom', sourceSurface: 'CREATOR_WEBSITES' };
+  const candidateB = { candidateId: 'candidate-b', nativeInviteCode: 'betaRoom', sourceSurface: 'CREATOR_WEBSITES' };
+  await upsertSiteInspection({
+    siteIdentity: CROSS_SITE, identityTier: 'A', identityBasis: 'test',
+    canonicalUrl: `https://${CROSS_SITE}/`, outcome: 'FOUND', retryable: false,
+    candidates: [candidateA], observations: [{ outcome: 'FOUND' }],
+    renderedCovered: false, sourceChannelId: CHANNEL_A, claimStatus: 'PENDING', provenance: {},
+  });
+  await upsertSiteInspection({
+    siteIdentity: CROSS_SITE, identityTier: 'A', identityBasis: 'test',
+    canonicalUrl: `https://${CROSS_SITE}/`, outcome: 'FOUND', retryable: false,
+    candidates: [candidateB], observations: [{ outcome: 'FOUND' }],
+    renderedCovered: false, sourceChannelId: CHANNEL_B, claimStatus: 'PENDING', provenance: {},
+  });
+  let [row] = await getSiteInspections([CROSS_SITE]);
+  assert.equal(row.claimStatus, 'PENDING');
+  assert.deepEqual(Object.keys(row.pendingClaims || {}).sort(), [CHANNEL_A, CHANNEL_B].sort());
+  assert.deepEqual((row.pendingClaims?.[CHANNEL_A] || []).map(c => c.candidateId), ['candidate-a']);
+  assert.deepEqual((row.pendingClaims?.[CHANNEL_B] || []).map(c => c.candidateId), ['candidate-b']);
+  const borrower = (channelId: string) => ({
+    requestedUrl: `https://${CROSS_SITE}/`,
+    surface: 'CREATOR_WEBSITES',
+    required: true,
+    observedAt: new Date().toISOString(),
+    channelId,
+  });
+  assert.deepEqual(
+    buildBorrowedSiteInspection(row, borrower(CHANNEL_A)).recoveredCandidates.map(c => c.candidateId),
+    ['candidate-a'],
+    'the first channel recovers only its own invite after the second writer',
+  );
+  assert.deepEqual(
+    buildBorrowedSiteInspection(row, borrower(CHANNEL_B)).recoveredCandidates.map(c => c.candidateId),
+    ['candidate-b'],
+    'the second channel recovers its own invite',
+  );
+  // A admits: only A's pending entry finalizes; B's evidence stays PENDING.
+  await markSiteInspectionsClaimed(CHANNEL_A, ['candidate-a']);
+  [row] = await getSiteInspections([CROSS_SITE]);
+  assert.equal(row.claimStatus, 'PENDING');
+  assert.equal(row.pendingClaims?.[CHANNEL_A], undefined);
+  assert.deepEqual((row.pendingClaims?.[CHANNEL_B] || []).map(c => c.candidateId), ['candidate-b']);
+  // B loses every claim: row becomes terminal DISCARDED and drops the stale
+  // candidate payload, making the site reusable instead of endlessly pending.
+  await markSiteInspectionsDiscarded(CHANNEL_B, ['candidate-b']);
+  [row] = await getSiteInspections([CROSS_SITE]);
+  assert.equal(row.claimStatus, 'DISCARDED');
+  assert.deepEqual(row.pendingClaims, {});
+  assert.deepEqual(row.candidates, []);
 });
 
 maybe('an empty incoming intent array never erases cached root community evidence', async t => {

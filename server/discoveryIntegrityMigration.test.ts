@@ -1,11 +1,13 @@
 /**
- * Migration 149 + persistence text contracts.
+ * Migration 149/150 + persistence text contracts.
  *
  * Migration 149 is the schema change behind the discovery-integrity fixes:
  * site-inspection claim handshake columns, channel community-intent state, and
- * the explicit recovery audit table. These assertions are intentionally
- * textual: they pin the exact additive shape so a later edit cannot silently
- * turn the migration destructive or rename a column the code depends on.
+ * the explicit recovery audit table. Migration 150 adds the per-channel
+ * pending-candidate map so a second writer cannot erase an unclaimed invite.
+ * These assertions are intentionally textual: they pin the exact additive
+ * shape so a later edit cannot silently turn the migration destructive or
+ * rename a column the code depends on.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -14,13 +16,21 @@ import { fileURLToPath } from 'node:url';
 
 const migrationsDir = fileURLToPath(new URL('./db/migrations/', import.meta.url));
 const migration = readFileSync(`${migrationsDir}149_discovery_integrity_state.sql`, 'utf8');
+const pendingClaimsMigration = readFileSync(`${migrationsDir}150_site_inspection_pending_claims.sql`, 'utf8');
 const dbCore = readFileSync(fileURLToPath(new URL('./dbCore.ts', import.meta.url)), 'utf8');
 const siteCache = readFileSync(fileURLToPath(new URL('./siteInspectionCache.ts', import.meta.url)), 'utf8');
 
-test('migration 149 is present and sorts after every earlier migration', () => {
+test('migration 150 is present and sorts after every earlier migration', () => {
   const files = readdirSync(migrationsDir).filter(name => name.endsWith('.sql')).sort();
   assert.ok(files.includes('149_discovery_integrity_state.sql'));
-  assert.equal(files[files.length - 1], '149_discovery_integrity_state.sql', '149 is the newest migration');
+  assert.ok(files.includes('150_site_inspection_pending_claims.sql'));
+  assert.equal(files[files.length - 1], '150_site_inspection_pending_claims.sql', '150 is the newest migration');
+});
+
+test('migration 150 adds only the per-channel pending-candidate map', () => {
+  assert.match(pendingClaimsMigration, /ALTER TABLE site_inspections ADD COLUMN IF NOT EXISTS pending_claims JSONB NOT NULL DEFAULT '\{\}'::jsonb;/);
+  assert.match(pendingClaimsMigration, /site_inspections_pending_claims_object_check[\s\S]*?CHECK \(jsonb_typeof\(pending_claims\) = 'object'\) NOT VALID;/);
+  assert.doesNotMatch(pendingClaimsMigration, /\b(?:DROP|DELETE|TRUNCATE|UPDATE)\b/i, 'pending-claims migration is additive-only');
 });
 
 test('migration 149 is additive-only (no drops, deletes, or rewrites)', () => {
@@ -68,22 +78,27 @@ test('recovery audit table records source, channel, candidate ids, and counts', 
   assert.match(migration, /CREATE INDEX IF NOT EXISTS idx_discovery_recovery_audit_channel/);
 });
 
-test('dbCore writes and reads the same claim/community column names', () => {
-  assert.match(dbCore, /INSERT INTO site_inspections\(site_identity,identity_tier,identity_basis,canonical_url,final_url,outcome,retryable,http_status,failure_class,detail,payload_checksum,candidates,observations,rendered_covered,source_channel_id,claim_status,community_intents,provenance,/);
-  assert.match(dbCore, /UPDATE site_inspections SET claim_status='CLAIMED'[\s\S]*?WHERE source_channel_id=\$1 AND claim_status='PENDING'/);
+test('dbCore writes and reads the same claim/community/pending column names', () => {
+  assert.match(dbCore, /INSERT INTO site_inspections\(site_identity,identity_tier,identity_basis,canonical_url,final_url,outcome,retryable,http_status,failure_class,detail,payload_checksum,candidates,observations,rendered_covered,source_channel_id,claim_status,community_intents,provenance,pending_claims,/);
+  assert.match(dbCore, /pendingClaims: pendingClaimsFromColumn\(item\.pending_claims\),/);
   assert.match(dbCore, /sourceChannelId: typeof item\.source_channel_id === 'string' \? item\.source_channel_id : null,/);
   assert.match(dbCore, /claimStatus: text\(item\.claim_status\),/);
 });
 
-test('claim handshake only flips PENDING rows for the recording channel and admitted candidates', () => {
+test('claim handshake only finalizes PENDING rows for the executing channel and its candidates', () => {
   // A CLAIMED/DISCARDED row is terminal; an unclaimed (NONE) row is never
   // promoted, because NONE with candidates must keep forcing a recrawl.
   assert.match(siteCache, /export const SITE_INSPECTION_CLAIM_STATUS = \{/);
-  assert.match(dbCore, /WHERE source_channel_id=\$1 AND claim_status='PENDING'/);
-  assert.match(dbCore, /candidate->>'candidateId' = ANY\(\$2::text\[\]\)/);
+  assert.match(dbCore, /async function finalizeSiteInspectionClaims\(/);
+  assert.match(dbCore, /WHERE claim_status='PENDING'[\s\S]*?FOR UPDATE/);
+  assert.match(dbCore, /export async function markSiteInspectionsDiscarded\(/);
+  assert.match(siteCache, /if \(row\.claimStatus === SITE_INSPECTION_CLAIM_STATUS\.PENDING\) return false;/);
   assert.match(siteCache, /if \(row\.claimStatus !== SITE_INSPECTION_CLAIM_STATUS\.CLAIMED && row\.claimStatus !== SITE_INSPECTION_CLAIM_STATUS\.DISCARDED\) return false;/);
 });
 
-test('site-cache upsert preserves an unadmitted candidate-bearing PENDING payload', () => {
+test('site-cache upsert preserves all writers pending candidates independently', () => {
   assert.match(dbCore, /site_inspections\.claim_status='PENDING' AND jsonb_array_length\(site_inspections\.candidates\)>0 AND jsonb_array_length\(excluded\.candidates\)=0 THEN site_inspections\.candidates/);
+  assert.match(dbCore, /pending_claims=CASE[\s\S]*?jsonb_build_object\(excluded\.source_channel_id,excluded\.candidates\)/);
+  assert.match(siteCache, /const ownPending = typeof borrower\.channelId === 'string'/);
+  assert.match(siteCache, /row: \{ \.\.\.row, candidates: \[\], pendingClaims: \{\} \}/);
 });
