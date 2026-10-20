@@ -1,8 +1,9 @@
 # Unit 3 — 9,000-unit/key/day quota cap (shadow evidence + default-OFF enforcement)
 
-Date: 2026-10-19 · Branch: `phase1-hardening` · Implementation SHA: `c0d8318`
-(CI/test follow-ups `b62c45a`, `ef7b4c0`, `a664f78`, `3be3202`; CI green run:
-https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39325618390)
+Date: 2026-10-19 (updated 2026-10-20) · Shadow branch `phase1-hardening` head
+`f3e5f43`; hard-cap branch `feat/youtube-key-hard-cap` head `33d2f3f`.
+Evidence runs: shadow [39481878389](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39481878389),
+hard cap [39485338052](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39485338052).
 
 Status: the migration-148 shadow implementation is historical evidence. The
 hard-cap implementation on `feat/youtube-key-hard-cap` is **implemented but
@@ -17,7 +18,7 @@ change to official API traffic remain gated on explicit operator approval.
 | `server/quotaKeyCapShadow.ts` | Config, projection, classification, locking, dedupe, sweeps, savepoint settlement; default-OFF hard reservation/settlement |
 | `server/youtube.ts` (~line 438) | Dispatch hook: in-flight lease + projection observation for the dispatched key |
 | `server/dbCore.ts` (`incrementQuota`) | Settlement hook: releases one matching lease exactly once |
-| `server/quotaKeyCapShadow.test.ts` | 21 unit tests (12 original + 9 hard-cap cases) |
+| `server/quotaKeyCapShadow.test.ts` | 23 unit tests (14 shadow + 9 hard-cap cases) |
 | `server/quotaKeyCapShadow.postgres.test.ts` | PostgreSQL suite (dedicated-DB gated) |
 | `scripts/quota_shadow_replay.ts` | Offline 3-day CSV replay |
 | `.github/workflows/phase1-quota-shadow-tests.yml` | CI: tsc + unit tests + postgres:17 full lineage |
@@ -151,9 +152,10 @@ main's 145.
 
 ## Hard-cap enforcement (default OFF) — implementation on `feat/youtube-key-hard-cap`
 
-Date: 2026-10-20 · Base: PR #531 head `45d4978` · Status: **implemented,
-disabled by default, not deployed, not enabled.** Production remains unchanged
-and no migration has been applied.
+Date: 2026-10-20 · Branch `feat/youtube-key-hard-cap` head `33d2f3f`, based on
+PR #531 head `f3e5f43` · Status: **implemented, disabled by default, not
+deployed, not enabled.** Production remains unchanged and no migration has
+been applied to it.
 
 ### Design
 
@@ -189,8 +191,12 @@ and no migration has been applied.
   `incrementQuota(units, key, operationId)` callers still work. Enforced
   settlement rejects a charged unit count that differs from the reserved units.
 - **Shadow compatibility:** the shadow still records its lease/event when
-  enforcement is OFF. Shadow dispatch now uses the same stable operation
-  identity and exact settlement, removing the previous key+units ambiguity.
+  enforcement is OFF. Dispatch remains fire-and-forget: it does not await
+  settings, pool acquisition or the write before the provider request. When
+  the background observation has attached its stable operation identity before
+  the response settles, shadow settlement is exact; if it loses that race, the
+  observational lease is bounded by its 120 s TTL. Enforced reservation is
+  synchronous, so enforced settlement is always exact.
   `settleShadowLease()` accepts an optional `operationId`; the legacy
   unit-matched form remains.
 - **Failed calls:** enforced reservations are **not released** on a non-OK
@@ -246,22 +252,23 @@ disabled zero-query no-op, typed fail-closed lock/DB/connect/settings errors,
 changed units rejected), exact context settlement (enforce fatal, shadow
 savepoint-swallowed), exact lease release and shadow-settlement compatibility.
 
-PostgreSQL (`server/quotaKeyCapShadow.postgres.test.ts`, dedicated
+PostgreSQL (`server/quotaKeyCapShadow.postgres.test.ts` plus
+`server/discovery/probeLedger.postgres.test.ts`, dedicated
 `QUOTA_SHADOW_TEST_DATABASE_URL`): boundary 9,000/9,001; 20 concurrent same-key
 reservations with exactly 10 admitted; two independent keys; in-flight lease
 counting; expired lease exclusion; exact settlement of only the matching
 day/operation/key; duplicate operation id (same units idempotent, changed units
 rejected); settlement failure leaving the conservative lease; Pacific midnight
-+ both DST rollovers; restart with a new pool observing persisted leases.
-These are gated by `dedicatedUrl` and skip when no dedicated database is
-supplied.
++ both DST rollovers; restart with a new pool observing persisted leases; and
+two probe-budget concurrency cases.
 
-Local results for this implementation: `npx tsc --noEmit` clean; the targeted
-unit file passes **21/21**. The PostgreSQL suite contains **17 cases** and was
-**not run locally** (this host has no container runtime and no dedicated test
-database). It is wired to the existing `postgres:17` CI service; no enforcement
-claim is made from local runs. Do not cite this document as CI proof for the
-hard-cap branch until that run is green.
+CI results for `33d2f3f` (run
+https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39485338052):
+`npx tsc --noEmit` clean; **46/46 unit** (23 quota cap + 9 dbCore quota +
+14 probe executor) and **20/20 PostgreSQL**, 0 skipped. Local PostgreSQL was not
+available on this host; the postgres:17 CI service is the database proof. No
+enforcement claim is made from shadow observations, and this run did not enable
+or deploy the feature.
 
 ### Rollout gates (all required before enabling)
 
