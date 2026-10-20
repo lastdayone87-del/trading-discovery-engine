@@ -61,11 +61,11 @@ test('operational enrichment recovery respects the 24-hour cooldown', () => {
   assert.deepEqual(decision.reasonCodes, ['OPERATIONAL_RECOVERY_COOLDOWN_ACTIVE']);
 });
 
-test('runtime reconciliation selects only the latest relevant job, not an older failed one', () => {
+test('runtime reconciliation selects the latest qualifying failed job, not a newer unrelated failure', () => {
   const source = readFileSync(new URL('./operationalEnrichmentRecovery.ts', import.meta.url), 'utf8');
   assert.match(source, /SELECT latest_job\.id, latest_job\.attempts, latest_job\.status, latest_job\.last_error/);
-  assert.match(source, /JOIN LATERAL \([\s\S]*?latest_job\.type IN\('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION'\)[\s\S]*?ORDER BY latest_job\.updated_at DESC/);
-  assert.match(source, /failed_job ON failed_job\.status='FAILED'/);
+  assert.match(source, /JOIN LATERAL \([\s\S]*?latest_job\.type IN\('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION'\)[\s\S]*?latest_job\.status='FAILED'[\s\S]*?ORDER BY latest_job\.updated_at DESC/);
+  assert.match(source, /\) failed_job ON true/);
 });
 
 test('recovery enqueue and ledger write roll back together when the ledger write fails', async () => {
@@ -160,7 +160,7 @@ test('provider-deferred enrichment remains governed and reactivates after cooldo
 test('provider-deferred projection is bounded and preserves semantic exclusions',()=>{
   const source=readFileSync(new URL('./operationalEnrichmentRecovery.ts',import.meta.url),'utf8');
   assert.match(source,/projectProviderDeferredEnrichment/);
-  assert.match(source,/failed_job\.last_error ILIKE 'OPERATIONALLY_BLOCKED_RETRY_REQUIRED:%'/);
+  assert.match(source,/latest_job\.last_error ILIKE 'OPERATIONALLY_BLOCKED_RETRY_REQUIRED:%'/);
   assert.match(source,/c\.trading_status IS DISTINCT FROM 'NON_TRADING'/);
   assert.match(source,/c\.discord_validation_status IS DISTINCT FROM 'COMPLETED'/);
   assert.match(source,/LIMIT \$1/);

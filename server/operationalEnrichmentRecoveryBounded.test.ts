@@ -61,8 +61,8 @@ test('bounded provider-cooling terminals carry the operational-blocked marker (r
 
 test('recovery predicate admits historical raw provider-cooling terminal messages and is cycle-bounded', () => {
   const source = readFileSync(new URL('./operationalEnrichmentRecovery.ts', import.meta.url), 'utf8');
-  assert.match(source, /failed_job\.last_error ILIKE 'OPERATIONALLY_BLOCKED_RETRY_REQUIRED:%'/);
-  assert.match(source, /failed_job\.last_error ILIKE 'Every configured YouTube provider is cooling down%'/);
+  assert.match(source, /latest_job\.last_error ILIKE 'OPERATIONALLY_BLOCKED_RETRY_REQUIRED:%'/);
+  assert.match(source, /latest_job\.last_error ILIKE 'Every configured YouTube provider is cooling down%'/);
   assert.match(source, /OPERATIONAL_ENRICHMENT_MAX_RECOVERY_CYCLES = 3/);
   assert.match(source, /cycle_event\.event_key LIKE 'operational-enrichment:%'/);
   assert.match(source, /terminal_event\.event_key LIKE 'operational-enrichment-terminal:%'/);

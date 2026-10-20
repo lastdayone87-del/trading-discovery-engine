@@ -21,7 +21,8 @@ and `server/discovery/probeExecutor.ts` on the `phase1-hardening` worktree.
 | Official route | Disabled | `discovery_probe_allow_official` + executor route check | Executor returns `OFFICIAL_ROUTE_NOT_IMPLEMENTED`; only `youtube-innertube` executes. |
 | Pages per probe | 1 | `defaultRetrievePage` passes `cursor: null` | No continuation. Page size constant 20. |
 | Channels ingested | 20 per probe | `MAX_CHANNELS_INGESTED_PER_PROBE` | **Per probe, not a total across the run.** Distinct channels are capped before ingestion. |
-| Official quota units | 0 | Executor records `units: 0` and only calls the InnerTube provider | The ledger row stores `units=0`. |
+| Probe retrieval units | 0 | Executor records `units: 0` for its one InnerTube page | The ledger row stores retrieval `units=0`. This is **not** a total-spend claim. |
+| Downstream official calls | Not counted by the probe ledger | `defaultIngestChannel` delegates to the existing ingestion pipeline | Hydration can call the official Data API; those calls use the normal quota path and must be measured/reported separately. |
 
 The 72-hour window is **not structurally enforced by the code**. It is a
 configuration/deadline envelope: set `discovery_probe_deadline` at start+72h and
@@ -43,8 +44,12 @@ sighting does not count.
 
 ### Hard safety gates (any failure = FAIL, stop immediately)
 
-1. **Zero official quota units** attributable to probes; zero official-provider
-   calls from the probe path.
+1. **Probe retrieval is zero-unit and no unaccounted official call occurs.**
+   The probe ledger records zero InnerTube retrieval units. Delegated
+   ingestion may make official Data API calls; those must be independently
+   visible in the official quota accounting, with no bypass. If that spend
+   cannot be measured, the canary FAILS. Do not claim zero total official
+   calls.
 2. **Zero eligibility/serving changes**: no `search_eligible` mutation, no
    catalog/lifecycle mutation beyond the existing ingestion pipeline, and no
    promotion-gate change.
@@ -102,5 +107,7 @@ queue changes, or gate relaxation.
    settings; the flag stays OFF until then.
 4. A configured deadline and country allowlist; verify the deadline denial and
    kill-switch suppression before the first probe.
-5. A monitoring/read-only evidence path that can prove zero official units and
-   no eligibility/serving changes.
+5. A monitoring/read-only evidence path that can prove probe retrieval units,
+   separately report any downstream official units, and prove no
+   eligibility/serving changes. If downstream official spend is not
+   observable, the canary is not runnable.

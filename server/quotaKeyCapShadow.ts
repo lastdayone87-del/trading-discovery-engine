@@ -510,12 +510,18 @@ export function simulateShadowReplay(
     peakInFlight: 0,
     byDay: {},
   };
-  const events: Array<{ t: number; kind: 0 | 1; index: number }> = [];
+  // kind 0 = dispatch, 1 = lease TTL expiry, 2 = completion/settlement.
+  const events: Array<{ t: number; kind: 0 | 1 | 2; index: number }> = [];
   calls.forEach((call, index) => {
     if (!(call.reservedUnits > 0)) return;
     const latency = Number.isFinite(call.latencyMs) && call.latencyMs > 0 ? call.latencyMs : 0;
-    events.push({ t: call.occurredAtMs - latency, kind: 0, index });
-    events.push({ t: call.occurredAtMs, kind: 1, index });
+    const dispatchAt = call.occurredAtMs - latency;
+    events.push({ t: dispatchAt, kind: 0, index });
+    // A lease expires after its TTL even if the provider call is still open.
+    // Settlement at completion releases any still-active lease, but must not
+    // extend occupancy past the live TTL.
+    events.push({ t: dispatchAt + SHADOW_LEASE_TTL_MS, kind: 1, index });
+    events.push({ t: call.occurredAtMs, kind: 2, index });
   });
   events.sort((a, b) => (a.t === b.t ? a.kind - b.kind : a.t - b.t));
   const allowed = new Set<number>();
@@ -549,6 +555,11 @@ export function simulateShadowReplay(
       );
       dispatchState.dayTotals.allowed += 1;
       summary.peakInFlight = Math.max(summary.peakInFlight, dispatchState.active.size);
+    } else if (event.kind === 1) {
+      if (allowed.has(event.index)) {
+        const lease = leaseState.get(event.index);
+        (lease?.state ?? dispatchState).active.delete(event.index);
+      }
     } else if (allowed.has(event.index)) {
       const settledUnits = Number.isFinite(call.settledUnits) ? call.settledUnits : call.reservedUnits;
       const lease = leaseState.get(event.index);

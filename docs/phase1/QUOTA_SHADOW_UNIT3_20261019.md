@@ -88,8 +88,10 @@ rows and runs no sweeps.
 ## Three-day replay (2026-10-16 → 2026-10-18, America/Los_Angeles)
 
 Source: `quota_calls_1016_1018.csv` (22,301 rows; 15,477 SUCCESS replayed).
-Artifacts: `/tmp/opencode/evidence/quota_shadow_replay_20261019.{json,md}`.
-Hard-enforcement semantics: blocked calls are not counted as executed.
+Replay outputs were reviewed locally and are intentionally not committed here:
+the source CSV contains provider request identifiers. The replay command is in
+`scripts/quota_shadow_replay.ts`. Hard-enforcement semantics: blocked calls are
+not counted as executed.
 
 | day | keys | allowed | would-defer | would-reject | settled units |
 | --- | --- | --- | --- | --- | --- |
@@ -122,18 +124,6 @@ Hard-enforcement semantics: blocked calls are not counted as executed.
   as expiring reservations.
 - The shadow does not retroactively detect past-cap usage; it only records
   projections at dispatch time.
-
-## Accidental-commit coordination status
-
-Stray commit `4dc893d` ("test(discovery): rollback proof for migrations
-146/147", duplicate files) is the local HEAD of the sibling worktree
-`/root/projects/trading-discovery-engine` on `feat/discovery-integrity-p1-p4`.
-It was never pushed: `origin/feat/discovery-integrity-p1-p4` remains `73d714f`.
-Authoritative copies of the content live on `phase1-hardening` (`b0c207f`,
-`c0d8318`). No reset was performed because that worktree is in active use by a
-sibling session and this unit must not modify that branch; when the session is
-idle, dropping it is a single `git reset --hard 73d714f` (or `git stash` first
-if it holds uncommitted work). No impact on this unit or the upcoming PR.
 
 ## Production state
 

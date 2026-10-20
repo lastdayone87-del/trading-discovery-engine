@@ -140,7 +140,15 @@ async function defaultRetrievePage(request: ProbeRetrievalRequest): Promise<Prob
   return { channels: page.channels, rawResultCount: page.rawResultCount };
 }
 
-/** Existing ingestion/verification entry point, same convention as queueManager. */
+/**
+ * Existing ingestion/verification entry point, same convention as queueManager.
+ *
+ * The probe ledger's `units: 0` covers only the InnerTube search page. This
+ * delegated pipeline may perform official Data API hydration (for example when
+ * country or subscriber count is missing); those calls use the normal
+ * `youtubeFetch`/quota accounting path and must be reported separately. Do not
+ * treat the probe outcome's zero units as total provider spend.
+ */
 async function defaultIngestChannel(
   channel: ProbeChannel,
   country: string
@@ -424,10 +432,15 @@ export async function runApprovedProbe(
 
     const resultsCount = distinct.length;
     const allIngestFailed = bounded.length > 0 && ingestFailures.length === bounded.length;
+    // A gate recheck can stop after retrieval but before the first ingestion.
+    // That is an interrupted execution, not an inconclusive yield result, and
+    // must record FAILED so the reservation is not mistaken for a completed
+    // probe with no creator yield.
+    const interruptedBeforeIngest = gateStopReasons.length > 0 && ingestedCount === 0;
     const outcome: ProbeOutcome =
       resultsCount === 0
         ? 'EMPTY'
-        : allIngestFailed
+        : allIngestFailed || interruptedBeforeIngest
           ? 'FAILED'
           : newCreators > 0
             ? 'SUCCESS'

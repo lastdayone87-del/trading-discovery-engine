@@ -4,10 +4,11 @@
  *
  * Pure computation: no database, no network, no provider keys (key_fp values
  * are already non-reversible fingerprints). For every SUCCESS call the
- * reservation is modeled as held from `occurred_at - latency_ms` until
- * `occurred_at`, grouped by the America/Los_Angeles quota day, and the same
- * classifier used by the live shadow hooks decides what a hard cap WOULD
- * have deferred or rejected. Settled usage of blocked calls is not added
+ * reservation is modeled from `occurred_at - latency_ms` until completion or
+ * lease TTL expiry (whichever is first), grouped by the America/Los_Angeles
+ * quota day, and the same classifier used by the live shadow hooks decides
+ * what a hard cap WOULD have deferred or rejected. The official settlement
+ * remains on the completion day. Settled usage of blocked calls is not added
  * (hard enforcement would not have executed them).
  *
  * Usage:
@@ -126,9 +127,9 @@ function main(): void {
     if (reservedCost !== actualCost) stats.reservedNotEqualActual += 1;
     calls.push({
       occurredAtMs,
-      // The live projection expires leases at the TTL; holding longer in the
-      // replay would overstate in-flight occupancy for very slow calls.
-      latencyMs: Math.min(latency, SHADOW_LEASE_TTL_MS),
+      // Preserve the observed start. The simulator expires the lease at the
+      // TTL independently, rather than shifting the request start forward.
+      latencyMs: latency,
       keyFingerprint: keyFp,
       reservedUnits: reservedCost,
       settledUnits: actualCost,

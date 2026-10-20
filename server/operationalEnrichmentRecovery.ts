@@ -183,9 +183,11 @@ export async function reconcileOperationalEnrichmentRecovery(
   const db = await getDb();
   // The failed-job predicate admits both marked terminal failures and the raw
   // bounded provider-cooling terminal messages persisted before the marker was
-  // added (historical rows). The LATERAL carries the owning job and channel
-  // recovery-cycle count so enqueue idempotency and the cycle ceiling are
-  // decided from durable state, never from process memory.
+  // added (historical rows). Select the latest *qualifying failed* job: a newer
+  // unrelated failed job (for example a community-acquisition failure) must not
+  // hide an older bounded-enrichment failure that still needs recovery. The
+  // LATERAL also carries the channel recovery-cycle count so enqueue idempotency
+  // and the cycle ceiling are decided from durable state, never process memory.
   const rows = await db.query(
     `SELECT c.channel_id,
             failed_job.id AS failed_job_id,
@@ -200,12 +202,13 @@ export async function reconcileOperationalEnrichmentRecovery(
            FROM jobs latest_job
           WHERE latest_job.type IN('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION')
             AND latest_job.payload->>'channelId'=c.channel_id
+            AND latest_job.status='FAILED'
+            AND (latest_job.last_error ILIKE 'OPERATIONALLY_BLOCKED_RETRY_REQUIRED:%'
+                 OR latest_job.last_error ILIKE 'Every configured YouTube provider is cooling down%'
+                 OR latest_job.last_error ILIKE 'YouTube API project pool is quota-exhausted%')
           ORDER BY latest_job.updated_at DESC NULLS LAST, latest_job.created_at DESC NULLS LAST, latest_job.id DESC
           LIMIT 1
-       ) failed_job ON failed_job.status='FAILED'
-          AND (failed_job.last_error ILIKE 'OPERATIONALLY_BLOCKED_RETRY_REQUIRED:%'
-               OR failed_job.last_error ILIKE 'Every configured YouTube provider is cooling down%'
-               OR failed_job.last_error ILIKE 'YouTube API project pool is quota-exhausted%')
+       ) failed_job ON true
       WHERE c.scan_status IN('FAILED','FAILED_PERMANENT','PROVIDER_DEFERRED')
         AND c.trading_status IS DISTINCT FROM 'NON_TRADING'
         AND c.trading_status IS DISTINCT FROM 'HUMAN_REJECTED'

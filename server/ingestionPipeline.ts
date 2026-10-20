@@ -39,6 +39,8 @@ import { maybeRunDiscoveryEvidenceExtraction } from './discovery/evidencePipelin
 // not open hundreds of concurrent staging transactions. Serialize the
 // fire-and-forget runs; each run is cheap and already bounded internally.
 let discoveryExtractionTail: Promise<unknown> = Promise.resolve();
+let discoveryExtractionBacklog = 0;
+const MAX_DISCOVERY_EXTRACTION_BACKLOG = 8;
 
 export interface IngestionCandidate extends DiscoveredChannelRaw {
   // Option for additional candidate details if provided
@@ -453,29 +455,42 @@ export async function processChannelThroughPipeline(
   // already parsed above and stage screened PROBE_ELIGIBLE candidates.
   // Fire-and-forget, no new fetches, errors logged and swallowed; writes only
   // the staging domain and never touches serving/eligibility paths.
-  discoveryExtractionTail = discoveryExtractionTail
-    .catch(() => undefined)
-    .then(() =>
-      maybeRunDiscoveryEvidenceExtraction({
-        channelId: candidate.channelId,
-        channelName: candidate.channelName,
-        description: candidate.description,
-        pinnedComment: candidate.pinnedComment,
-        videoTitles: candidate.videoTitles,
-        videoDescriptions: candidate.videoDescriptions,
-        videos: candidate.videos,
-        detectedLanguages: candidate.detectedLanguages,
-        transcriptExcerpts: candidate.transcriptExcerpts,
-        creatorCountry,
-        fallbackCountry: targetCountry,
-      })
-    )
-    .catch(error =>
-      console.warn(
-        `[DiscoveryExtraction] run failed for ${candidate.channelId}:`,
-        error instanceof Error ? error.message : error
-      )
+  if (discoveryExtractionBacklog >= MAX_DISCOVERY_EXTRACTION_BACKLOG) {
+    // This observation is intentionally best-effort. Bound the number of
+    // waiting runs so a stalled staging write cannot retain an unbounded list
+    // of candidate payloads; drop the newest observation instead.
+    console.warn(
+      `[DiscoveryExtraction] backlog full (${MAX_DISCOVERY_EXTRACTION_BACKLOG}); skipping ${candidate.channelId}`
     );
+  } else {
+    discoveryExtractionBacklog += 1;
+    discoveryExtractionTail = discoveryExtractionTail
+      .catch(() => undefined)
+      .then(() =>
+        maybeRunDiscoveryEvidenceExtraction({
+          channelId: candidate.channelId,
+          channelName: candidate.channelName,
+          description: candidate.description,
+          pinnedComment: candidate.pinnedComment,
+          videoTitles: candidate.videoTitles,
+          videoDescriptions: candidate.videoDescriptions,
+          videos: candidate.videos,
+          detectedLanguages: candidate.detectedLanguages,
+          transcriptExcerpts: candidate.transcriptExcerpts,
+          creatorCountry,
+          fallbackCountry: targetCountry,
+        })
+      )
+      .catch(error =>
+        console.warn(
+          `[DiscoveryExtraction] run failed for ${candidate.channelId}:`,
+          error instanceof Error ? error.message : error
+        )
+      )
+      .finally(() => {
+        discoveryExtractionBacklog -= 1;
+      });
+  }
 
   const lowAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount);
   if (lowAudienceGate.shouldSkipDeepEnrichment) {

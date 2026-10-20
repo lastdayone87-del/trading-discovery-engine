@@ -376,6 +376,33 @@ test('kill switch tripped during ingestion stops the remaining channels', async 
   assert.ok(store.rows[0].reasons.includes('KILL_SWITCH_RECHECK'));
 });
 
+test('kill switch tripped before the first ingestion records FAILED, not INCONCLUSIVE', async () => {
+  const store = new MemoryStore();
+  let kill = false;
+  const summary = await runApprovedProbe(candidate, deps({
+    store,
+    readSetting: async (key, fallback) => {
+      if (key === 'discovery_probe_enabled') return 'true';
+      if (key === 'discovery_probe_kill_switch') return kill ? 'true' : 'false';
+      if (key === 'discovery_probe_allowed_countries') return 'US,Germany';
+      return fallback;
+    },
+    retrievePage: async () => {
+      kill = true;
+      return { channels: [channel(1), channel(2)] };
+    },
+    ingestChannel: async () => {
+      throw new Error('ingestion must not start after the kill switch trips');
+    },
+  }));
+  assert.equal(summary.outcome, 'FAILED');
+  assert.equal(summary.ingestedCount, 0);
+  assert.equal(summary.newCreators, 0);
+  assert.equal(store.rows[0].status, 'FAILED');
+  assert.equal(store.rows[0].outcome, 'FAILED');
+  assert.ok(store.rows[0].reasons.includes('KILL_SWITCH_RECHECK'));
+});
+
 test('individual ingestion failures do not abort the probe', async () => {
   const store = new MemoryStore();
   const summary = await runApprovedProbe(candidate, deps({

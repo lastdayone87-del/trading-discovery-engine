@@ -48,9 +48,9 @@ approved disposable pattern (used by `corpus-claim-budget-pg.yml` and
    schema dumps must be empty; ledger absent; `evidence_extraction` registry row absent and the
    pre-existing migration-130 `youtube-innertube` row preserved;
    `schema_migrations` rows absent; `max(version)=145`.
-9. Re-apply proof: re-apply 146+147 → ledger present → run rollback again →
-   transcript identical, using the same per-file transaction/version-row
-   semantics as the runner.
+9. Re-apply proof: manually replays 146+147 with the runner's per-file
+   transaction/version-row semantics (it does not execute the runner binary),
+   verifies the ledger, then runs rollback again; transcript is identical.
 
 ## Verdict — byte-identical, zero drift
 
