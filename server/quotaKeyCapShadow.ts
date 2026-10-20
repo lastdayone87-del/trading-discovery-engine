@@ -22,6 +22,8 @@ export const SHADOW_CAP_UNITS = 9000;
 export const SHADOW_LEASE_TTL_MS = 120_000;
 export const SHADOW_CONFIG_TTL_MS = 30_000;
 export const SHADOW_SWEEP_INTERVAL_MS = 60_000;
+export const SHADOW_EVENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+export const SHADOW_EVENT_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 export const SHADOW_LOCK_TIMEOUT_MS = 100;
 
 export type ShadowEvent = 'WOULD_DEFER' | 'WOULD_REJECT';
@@ -104,9 +106,11 @@ export function resetShadowConfigCacheForTests(): void {
 }
 
 let lastSweepAt = 0;
+let lastEventSweepAt = 0;
 
 export function resetShadowSweepClockForTests(): void {
   lastSweepAt = 0;
+  lastEventSweepAt = 0;
 }
 
 export interface ShadowDispatchInput {
@@ -135,6 +139,7 @@ WITH projected AS (
        + COALESCE((
            SELECT SUM(reserved_units) FROM youtube_key_cap_shadow_leases
             WHERE quota_day = $1 AND key_fingerprint = $2 AND expires_at > $3
+              AND operation_id <> $4
          ), 0)::int AS before_units
 ), lease AS (
   INSERT INTO youtube_key_cap_shadow_leases
@@ -257,6 +262,20 @@ export async function sweepShadowLeases(
   return result.rowCount ?? 0;
 }
 
+/** Bounded retention for the observational event log (30 days by default). */
+export async function sweepShadowEvents(
+  client: ShadowQueryClient,
+  now: Date = new Date(),
+  retentionMs: number = SHADOW_EVENT_RETENTION_MS
+): Promise<number> {
+  const cutoff = new Date(now.getTime() - Math.max(0, retentionMs));
+  const result = await client.query(
+    `DELETE FROM youtube_key_cap_shadow_events WHERE created_at <= $1`,
+    [cutoff]
+  );
+  return result.rowCount ?? 0;
+}
+
 export interface ShadowConnectionPort extends ShadowQueryClient {
   release?: () => void;
 }
@@ -306,6 +325,10 @@ export async function recordShadowDispatchSafe(
     if (now.getTime() - lastSweepAt >= SHADOW_SWEEP_INTERVAL_MS) {
       lastSweepAt = now.getTime();
       await sweepShadowLeases(deps.pool, now).catch(() => 0);
+    }
+    if (now.getTime() - lastEventSweepAt >= SHADOW_EVENT_SWEEP_INTERVAL_MS) {
+      lastEventSweepAt = now.getTime();
+      await sweepShadowEvents(deps.pool, now).catch(() => 0);
     }
     const quotaDay = getYouTubeQuotaDay(now);
     const lockTimeoutMs = Math.max(
@@ -388,7 +411,11 @@ export function simulateShadowReplay(
   const settledOnly = options.settledOnly === true;
   type State = { settled: number; active: Map<number, number>; summary: ShadowReplayKeyDay; dayTotals: ShadowReplaySummary['byDay'][string] };
   const states = new Map<string, State>();
-  const callDay = (call: ShadowReplayCall): string =>
+  const callLatency = (call: ShadowReplayCall): number =>
+    Number.isFinite(call.latencyMs) && call.latencyMs > 0 ? call.latencyMs : 0;
+  const dispatchDay = (call: ShadowReplayCall): string =>
+    call.day ?? getYouTubeQuotaDay(new Date(call.occurredAtMs - callLatency(call)));
+  const settleDay = (call: ShadowReplayCall): string =>
     call.day ?? getYouTubeQuotaDay(new Date(call.occurredAtMs));
   const stateFor = (day: string, key: string): State => {
     const id = `${day}|${key}`;
@@ -422,37 +449,48 @@ export function simulateShadowReplay(
   });
   events.sort((a, b) => (a.t === b.t ? a.kind - b.kind : a.t - b.t));
   const allowed = new Set<number>();
+  const leaseState = new Map<number, { state: State; key: string }>();
   for (const event of events) {
     const call = calls[event.index];
-    const day = callDay(call);
-    const state = stateFor(day, call.keyFingerprint);
+    const key = call.keyFingerprint;
+    const dispatchState = stateFor(dispatchDay(call), key);
     if (event.kind === 0) {
       const activeUnits = settledOnly
         ? 0
-        : Array.from(state.active.values()).reduce((sum, units) => sum + units, 0);
+        : Array.from(dispatchState.active.values()).reduce((sum, units) => sum + units, 0);
       const wouldBlock = classifyShadowWouldBlock(
-        state.settled + activeUnits,
+        dispatchState.settled + activeUnits,
         call.reservedUnits,
         capUnits
       );
       if (wouldBlock) {
-        state.summary[wouldBlock === 'WOULD_DEFER' ? 'wouldDefer' : 'wouldReject'] += 1;
-        state.dayTotals[wouldBlock === 'WOULD_DEFER' ? 'wouldDefer' : 'wouldReject'] += 1;
+        dispatchState.summary[wouldBlock === 'WOULD_DEFER' ? 'wouldDefer' : 'wouldReject'] += 1;
+        dispatchState.dayTotals[wouldBlock === 'WOULD_DEFER' ? 'wouldDefer' : 'wouldReject'] += 1;
         summary[wouldBlock === 'WOULD_DEFER' ? 'totalWouldDefer' : 'totalWouldReject'] += 1;
         continue;
       }
       allowed.add(event.index);
-      state.active.set(event.index, call.reservedUnits);
-      state.summary.allowed += 1;
-      state.summary.peakInFlight = Math.max(state.summary.peakInFlight, state.active.size);
-      state.dayTotals.allowed += 1;
-      summary.peakInFlight = Math.max(summary.peakInFlight, state.active.size);
+      leaseState.set(event.index, { state: dispatchState, key });
+      dispatchState.active.set(event.index, call.reservedUnits);
+      dispatchState.summary.allowed += 1;
+      dispatchState.summary.peakInFlight = Math.max(
+        dispatchState.summary.peakInFlight,
+        dispatchState.active.size
+      );
+      dispatchState.dayTotals.allowed += 1;
+      summary.peakInFlight = Math.max(summary.peakInFlight, dispatchState.active.size);
     } else if (allowed.has(event.index)) {
       const settledUnits = Number.isFinite(call.settledUnits) ? call.settledUnits : call.reservedUnits;
-      state.active.delete(event.index);
-      state.settled += settledUnits;
-      state.summary.settledUnits += settledUnits;
-      state.dayTotals.settledUnits += settledUnits;
+      const lease = leaseState.get(event.index);
+      const dispatch = lease?.state ?? dispatchState;
+      dispatch.active.delete(event.index);
+      // The official charge settles on the completion day. Keep admission
+      // capacity on the dispatch day (where the lease was created); only the
+      // settled usage moves to the completion day when they differ.
+      const settleState = stateFor(settleDay(call), lease?.key ?? key);
+      settleState.settled += settledUnits;
+      settleState.summary.settledUnits += settledUnits;
+      settleState.dayTotals.settledUnits += settledUnits;
     }
   }
   for (const [id, state] of states) {

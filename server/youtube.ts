@@ -439,11 +439,19 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
           // Shadow-only cap observation (never blocks or alters dispatch):
           // record an in-flight lease plus any projected WOULD_DEFER/
           // WOULD_REJECT for the 9,000-unit/day per-key cap. Disabled by
-          // default; every failure is swallowed inside the helper.
-          await recordShadowDispatchSafe(
-            {readSetting:getAppSetting,pool:await getDb()},
-            {keyFingerprint:fingerprintYouTubeKey(dispatchedProviderKey),operationId:`shadow:${operation}:${randomUUID()}`,units:actualCost}
-          );
+          // default; every failure is swallowed inside the helper. Start it
+          // without awaiting, including the pool acquisition, so an exhausted
+          // DB can never delay or time out the provider request. A late lease
+          // is observational and expires by its TTL.
+          const shadowOperationId=`shadow:${operation}:${randomUUID()}`;
+          void (async()=>{
+            try{
+              await recordShadowDispatchSafe(
+                {readSetting:getAppSetting,pool:await getDb()},
+                {keyFingerprint:fingerprintYouTubeKey(dispatchedProviderKey),operationId:shadowOperationId,units:actualCost}
+              );
+            }catch{/* shadow-only */ }
+          })();
         }
         let response: Response;
         try {

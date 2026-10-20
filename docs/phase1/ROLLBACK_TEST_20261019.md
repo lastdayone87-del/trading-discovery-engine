@@ -1,16 +1,16 @@
 # Rollback proof — migrations 146/147 (2026-10-19)
 
-Status: **HISTORICAL PASS, CURRENT FIXES PENDING CI.** The last observed
-green proof is GitHub Actions run
+Status: **PASS.** GitHub Actions run
+[39472633816](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39472633816)
+(branch `phase1-hardening`, head `89974f8`) is green on a disposable
+`postgres:17` service container. It verifies the current fixes: numeric
+`<=145` pre-state selection, preservation of the pre-existing migration-130
+`youtube-innertube` provider row, ledger-row guard, and `ON_ERROR_STOP`.
+Earlier run
 [39330317684](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39330317684)
-(branch `phase1-hardening`, head `ee5d172`) on a disposable `postgres:17`
-service container. The current fix commit adds rollback fixes (numeric `<=145` pre-state
-selection, preservation of the pre-existing migration-130 `youtube-innertube`
-provider row, ledger-row guard, `ON_ERROR_STOP`) that are **not yet verified by
-CI**. Do not cite this document as proof for those
-changes until a new green run is recorded here. The earlier run
-39320564700/head `92686a5` is historical (pre-rebase lineage 144). Production
-untouched; scratch database only.
+(head `ee5d172`) was the prior historical proof; 39320564700/head `92686a5`
+used the older pre-rebase lineage 144. Production untouched; scratch database
+only.
 
 ## Why CI (environment note)
 
@@ -39,9 +39,11 @@ approved disposable pattern (used by `corpus-claim-budget-pg.yml` and
    `scripts/rollback_146_147.sql` → must abort with
    `rollback_146_147 blocked: 1 … row(s)`; assert row and ledger still
    present (non-destructive); remove the test row.
-7. Run `scripts/rollback_146_147.sql` (transcript: `BEGIN → DO → DROP TABLE →
-   6 × ALTER TABLE (constraint restore) → DELETE 1 (registry row) →
-   DELETE 2 (schema_migrations 146/147) → COMMIT`).
+7. Run `scripts/rollback_146_147.sql` (observed transcript: `BEGIN → DO → DO
+   → DROP TABLE → 9 × ALTER TABLE (constraint restore) → DELETE 1
+   (evidence_extraction registry row) → DELETE 0 (migration-130
+   youtube-innertube row preserved) → DELETE 2 (schema_migrations 146/147) →
+   COMMIT`).
 8. Post-rollback verification: `diff` of constraint definitions and of full
    schema dumps must be empty; ledger absent; `evidence_extraction` registry row absent and the
    pre-existing migration-130 `youtube-innertube` row preserved;
@@ -55,18 +57,18 @@ approved disposable pattern (used by `corpus-claim-budget-pg.yml` and
 - `constraints_pre.txt == constraints_final.txt` —
   sha256 `870ec871aa5e364816429333da0409dfe6894bebcadcf6caff04b3af3b8d3dee`
 - `schema_pre.sql == schema_final.sql` —
-  sha256 `eb183df144ea35bc8a0bcb6b481c67fb1bd4a77c8ad8d291edcb7835c3527ed7`
+  sha256 `140cc55b19ceb51b5ae654adc08fb74b484fb39cffc00f30b10a7b573eebe7ea`
+  (current run; the historical run's dump hash differed, so only the current
+  observed value is cited here)
 - `constraints_diff.txt` = 0 bytes, `schema_diff.txt` = 0 bytes.
-- Guard refusal log: `psql:scripts/rollback_146_147.sql:38: ERROR:
+- Guard refusal log: `psql:scripts/rollback_146_147.sql:40: ERROR:
   rollback_146_147 blocked …` (row/ledger preserved; nothing deleted).
+- PostgreSQL `17.11`; `pre_state_max_version=145`.
 
 ## Evidence inventory
 
-Current fixes are pending a new CI run; this section describes the historical
-green artifact.
-
-The durable evidence for the historical green run is the
-`phase1-rollback-proof` GitHub Actions artifact attached to run 39330317684: `server_version.txt`,
+The durable evidence for the current green run is the
+`phase1-rollback-proof` GitHub Actions artifact attached to run 39472633816: `server_version.txt`,
 `pre_state_max_version.txt`, `constraints_pre.txt`, `constraints_post.txt`,
 `constraints_final.txt`, `constraints_diff.txt`, `schema_pre.sql`,
 `schema_final.sql`, `schema_diff.txt`, `rollback_guard_blocked.log`,
@@ -88,15 +90,23 @@ psql "$URL" -f scripts/rollback_146_147.sql   # after 001–147 applied via the 
 The script is single-transaction and idempotent; it refuses (non-
 destructively) while evidence-only staging rows exist.
 
-## Post-rebase re-verification (Unit 4, 2026-10-19)
+## Current fix verification (2026-10-20)
+
+- CI run (success): https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39472633816 · HEAD `89974f8`
+- PostgreSQL 17.11; `pre_state_max_version=145`
+- Guard refusal preserved: `rollback_146_147 blocked: 1 … row(s)`
+- Transcript: `BEGIN → DO → DO → DROP TABLE → 9×ALTER TABLE → DELETE 1 → DELETE 0 → DELETE 2 → COMMIT`
+- Re-apply + second rollback identical; `constraints_diff.txt` 0 bytes; `schema_diff.txt` 0 bytes
+- Artifacts: `phase1-rollback-proof` artifact on the run above (12 files).
+
+## Historical post-rebase re-verification (Unit 4, 2026-10-19)
 
 The branch was rebased onto `origin/main` `82e60e7` (which includes migration
-145). The proof now applies the pre-146 lineage `001..145` and asserts
+145). The proof applies the pre-146 lineage `001..145` and asserts
 `max(version)=145` both before and after rollback.
 
 - CI run (success): https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39330317684 · HEAD `ee5d172`
 - PostgreSQL 17.11; `pre_state_max_version=145`
 - Guard refusal preserved: `rollback_146_147 blocked: 1 … row(s)`
-- Transcript: `BEGIN → DO → DROP TABLE → 6×ALTER TABLE → DELETE 1 → DELETE 2 → COMMIT`
 - Re-apply + second rollback identical; `constraints_diff.txt` 0 bytes; `schema_diff.txt` 0 bytes
-- Artifacts: `phase1-rollback-proof` artifact on the run above (12 files).
+- Artifacts: `phase1-rollback-proof` artifact on that historical run (12 files).

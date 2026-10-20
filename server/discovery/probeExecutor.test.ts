@@ -334,6 +334,48 @@ test('retrieval failure records FAILED with a failure code and never throws', as
   assert.equal(store.rows[0].details.failureCode, 'INNERTUBE_API_RATE_LIMIT_429');
 });
 
+test('all ingestion failures record FAILED, not INCONCLUSIVE', async () => {
+  const store = new MemoryStore();
+  const summary = await runApprovedProbe(candidate, deps({
+    store,
+    retrievePage: async () => ({ channels: [channel(1), channel(2)] }),
+    ingestChannel: async () => {
+      throw new Error('pipeline unavailable');
+    },
+  }));
+  assert.equal(summary.outcome, 'FAILED');
+  assert.equal(summary.ingestedCount, 0);
+  assert.equal(summary.newCreators, 0);
+  assert.equal(store.rows[0].status, 'FAILED');
+  assert.equal(store.rows[0].outcome, 'FAILED');
+  assert.ok(store.rows[0].reasons.includes('INGEST_FAILURES'));
+  assert.equal(store.rows[0].details.ingestFailureCount, 2);
+});
+
+test('kill switch tripped during ingestion stops the remaining channels', async () => {
+  const store = new MemoryStore();
+  const ingested: string[] = [];
+  let kill = false;
+  const summary = await runApprovedProbe(candidate, deps({
+    store,
+    readSetting: async (key, fallback) => {
+      if (key === 'discovery_probe_enabled') return 'true';
+      if (key === 'discovery_probe_kill_switch') return kill ? 'true' : 'false';
+      if (key === 'discovery_probe_allowed_countries') return 'US,Germany';
+      return fallback;
+    },
+    retrievePage: async () => ({ channels: [channel(1), channel(2), channel(3)] }),
+    ingestChannel: async raw => {
+      ingested.push(raw.channelId);
+      kill = true;
+      return { wasKnown: false, isNew: true, persisted: true };
+    },
+  }));
+  assert.deepEqual(ingested, [channel(1).channelId]);
+  assert.equal(summary.outcome, 'SUCCESS');
+  assert.ok(store.rows[0].reasons.includes('KILL_SWITCH_RECHECK'));
+});
+
 test('individual ingestion failures do not abort the probe', async () => {
   const store = new MemoryStore();
   const summary = await runApprovedProbe(candidate, deps({

@@ -187,6 +187,7 @@ test('re-running the same channel pass is idempotent end to end', async () => {
   const first = await maybeRunDiscoveryEvidenceExtraction(baseInput(), deps);
   const second = await maybeRunDiscoveryEvidenceExtraction(baseInput(), deps);
   assert.ok(first.stagedCount > 0);
+  assert.ok(first.observationCount > 0, 'first run must persist observations, not only staging rows');
   assert.equal(second.stagedCount, 0);
   assert.equal(second.duplicateCount, first.stagedCount);
   assert.equal(second.observationCount, 0);
