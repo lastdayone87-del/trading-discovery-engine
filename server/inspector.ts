@@ -530,7 +530,11 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     // Root-page discovered links enter the persisted queue like any child
     // page's links, so root-only discoveries are recorded too.
     if(frontierOn){await frontierAdmitChildren(dedupedNavigation,1);}
-    const destinationBudget=createDestinationBudget({seedUrl:url});
+    // Redirect-aware seed origin: a creator seed commonly redirects from the
+    // bare host to www (or to a canonical path). The loaded root origin — not
+    // the pre-redirect requested URL — is the creator site whose internal
+    // links must stay exempt from the external-host page budget.
+    const destinationBudget=createDestinationBudget({seedUrl:page.finalUrl});
     while(queue.length&&explored<12){
     if(frontierOn){
       // P-C stopping arbiter (flag-gated): halts child exploration on

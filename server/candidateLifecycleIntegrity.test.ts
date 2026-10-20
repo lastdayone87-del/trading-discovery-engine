@@ -26,7 +26,7 @@ import {
   SITE_INSPECTION_RETRYABLE_FAILURE_TTL_MS,
   type CachedSiteInspection,
 } from './siteInspectionCache';
-import { admitInspectionDiscordCandidates, drainOrphanDiscordCandidates, projectNotFoundAfterInspection } from './queueManager';
+import { admitInspectionDiscordCandidates, drainOrphanDiscordCandidates, nextDiscordDuplicateOwnerChannelId, projectNotFoundAfterInspection } from './queueManager';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import type { DiscordCandidate } from './discordCandidates';
@@ -157,7 +157,7 @@ test('E10 (dbCore contract): deletion is bounded by exact candidate ids AND the 
 
 test('duplicate ownership provenance stores only the owner channel id, never the invite code or assignment', () => {
   const queue = readSource('queueManager.ts');
-  assert.match(queue, /channel\.discord_duplicate_owner_channel_id = chokeAdmission\.discardedOwnerChannelIds\[0\] \|\| null/);
+  assert.match(queue, /channel\.discord_duplicate_owner_channel_id = nextDiscordDuplicateOwnerChannelId\(\{/);
   assert.match(queue, /discardedOwnerChannelIds/);
   const db = readSource('dbCore.ts');
   assert.match(db, /discord_duplicate_owner_channel_id: row\.discord_duplicate_owner_channel_id \|\| null/);
@@ -167,6 +167,48 @@ test('duplicate ownership provenance stores only the owner channel id, never the
   const migrations = readSource('db/migrations/149_discovery_integrity_state.sql');
   assert.match(migrations, /ADD COLUMN IF NOT EXISTS discord_duplicate_owner_channel_id TEXT/);
   assert.doesNotMatch(queue, /discord_invite\s*=\s*chokeAdmission\.discarded/);
+});
+
+test('cache-only scans preserve duplicate-owner provenance until fresh processed evidence clears it', () => {
+  const borrowed = [{
+    surface: 'CREATOR_WEBSITES' as const,
+    outcome: 'INSPECTED_NO_MATCH' as const,
+    siteCacheHit: true,
+    telemetry: { pagesInspected: 1, requestsStarted: 0, redirectsFollowed: 0 },
+  }];
+  assert.equal(nextDiscordDuplicateOwnerChannelId({
+    discardedOwnerChannelIds: [],
+    previousOwnerChannelId: 'owner-old',
+    observations: borrowed,
+  }), 'owner-old', 'cache-only coverage cannot prove the duplicate disappeared');
+
+  const failedFresh = [{
+    surface: 'CREATOR_WEBSITES' as const,
+    outcome: 'ACQUISITION_FAILED' as const,
+    telemetry: { pagesInspected: 0, requestsStarted: 1, redirectsFollowed: 0 },
+  }];
+  assert.equal(nextDiscordDuplicateOwnerChannelId({
+    discardedOwnerChannelIds: [],
+    previousOwnerChannelId: 'owner-old',
+    observations: failedFresh,
+  }), 'owner-old', 'a failed fresh run cannot establish absence');
+
+  const freshClean = [{
+    surface: 'CREATOR_WEBSITES' as const,
+    outcome: 'INSPECTED_NO_MATCH' as const,
+    telemetry: { pagesInspected: 1, requestsStarted: 1, redirectsFollowed: 0 },
+  }];
+  assert.equal(nextDiscordDuplicateOwnerChannelId({
+    discardedOwnerChannelIds: [],
+    previousOwnerChannelId: 'owner-old',
+    observations: freshClean,
+  }), null, 'fresh processed evidence clears stale provenance');
+
+  assert.equal(nextDiscordDuplicateOwnerChannelId({
+    discardedOwnerChannelIds: ['owner-new'],
+    previousOwnerChannelId: 'owner-old',
+    observations: borrowed,
+  }), 'owner-new', 'a fresh duplicate replaces the saved owner even on a mostly cached scan');
 });
 
 test('E6: orphan drain re-admits claimable orphans and removes foreign-owned residue', async () => {

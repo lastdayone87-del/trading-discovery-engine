@@ -50,6 +50,14 @@ test('legitimate invite forms keep working: path depth, fragments, punctuation, 
   assert.equal(discordInviteCodeOf('discord.gg/Room123'), 'room123', 'canonicalization lowercases');
 });
 
+test('prose punctuation before a direct invite is accepted', () => {
+  assert.deepEqual(codeOf('Discord:https://discord.gg/Room123'), ['Room123'], 'colon after prose is not a URL boundary');
+  assert.deepEqual(codeOf('Discord:discord.gg/Room123'), ['Room123'], 'colon-prefixed bare host is a direct reference');
+  assert.deepEqual(codeOf('Join here: https://discord.com/invite/Room123'), ['Room123']);
+  // Embedded query/redirect references still fail closed.
+  assert.deepEqual(codeOf('https://example.com/redirect?target=https://discord.gg/fakecode'), []);
+});
+
 test('codes are restricted to the invite alphabet: punctuation and prose are rejected', () => {
   assert.equal(sanitizeDiscordInviteCode('abc123.'), null, 'punctuation never becomes part of a code');
   assert.equal(sanitizeDiscordInviteCode('a'), null, 'single-character codes are rejected');

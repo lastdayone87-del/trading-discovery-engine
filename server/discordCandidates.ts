@@ -68,7 +68,13 @@ export function sanitizeDiscordInviteCode(value:string|null|undefined):string|nu
 // path, or word. `example.com/discord.gg/x` and `notdiscord.gg/x` are not
 // Discord invite references; a query/redirect parameter is likewise not a
 // direct invite. The same boundary is used by every URL-form extractor.
-const INVITE_HOST_BOUNDARY='(?<![\\w.\\-\\/?&#=:])';
+// Prose punctuation (including a colon after "Discord") may precede a direct
+// invite, but a scheme colon must not let the protocol-relative branch match
+// inside `https://` or another redirect URL. The second lookbehind rejects a
+// match beginning at `//` directly after a URL scheme; the same invite is
+// still matched from its host or `https://` start when the preceding token is
+// prose.
+const INVITE_HOST_BOUNDARY='(?<![\\w.\\-\\/?&#=])(?<!(?:https?|ftp|file|javascript):)';
 const INVITE_PROTOCOL='(?:(?:https?:)?\\/\\/)?(?:www\\.)?';
 const NATIVE_INVITE_HOST='(?:discord\\.gg|discord\\.com\\/invite|discordapp\\.com\\/invite|discord\\.app\\/invite)';
 const ALTERNATIVE_INVITE_HOST='(?:dsc\\.gg|discord\\.me|discord\\.io)';

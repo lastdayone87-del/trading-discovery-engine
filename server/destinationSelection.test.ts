@@ -157,6 +157,35 @@ test('external-host children count against the seed-origin-aware page budget', (
   assert.deepEqual(budget.reserve('https://a.example/3', 'https://a.example/2'), { admitted: false, reason: 'page-budget' });
 });
 
+test('a redirected creator root origin stays exempt from the destination page budget', async () => {
+  const fetched: string[] = [];
+  const fetchedResponse = (body: string, url: string) => {
+    const response = htmlResponse(body);
+    Object.defineProperty(response, 'url', { value: url });
+    return response;
+  };
+  const result = await crawlExternalLinks(
+    ['https://creator.test/'],
+    [],
+    undefined,
+    (async (input) => {
+      const url = String(input);
+      fetched.push(url);
+      if (url === 'https://creator.test/') {
+        return fetchedResponse(
+          '<a href="/one">one</a><a href="/two">two</a><a href="/three">three</a>',
+          'https://www.creator.test/',
+        );
+      }
+      return fetchedResponse('<html><body>No invite here</body></html>', url);
+    }) as typeof fetch,
+  );
+  assert.ok(fetched.includes('https://www.creator.test/one'), 'root redirect target keeps its own same-origin children free');
+  assert.ok(fetched.includes('https://www.creator.test/two'));
+  assert.ok(fetched.includes('https://www.creator.test/three'), 'the third same-origin child is not charged to the external-host page budget');
+  assert.equal(result.outcome, 'INSPECTED_NO_MATCH');
+});
+
 test('per-seed destination budget bounds cross-origin fan-out but never blocks same-origin', () => {
   const budget = createDestinationBudget({ maxCrossOriginHosts: 3, maxPagesPerHost: 2 });
   assert.deepEqual(budget.reserve('https://a.example/1', 'https://creator.test/'), { admitted: true, reason: 'admitted' });

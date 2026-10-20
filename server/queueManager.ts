@@ -51,7 +51,7 @@ import { reserveIncrementalTreatmentPageQuota, enqueueChildAndCommitPageReservat
 import { resolveExecutionSearchWindow } from './retrievalExperiment';
 import { trialContinuationCap } from './discoveryFrontierTrials';
 import { aggregatedLanguageCandidateSet, mergeCountryValidationResults, validateChannelCountry } from './countryValidator';
-import { runChannelInspection } from './inspector';
+import { runChannelInspection, hasProcessedAcquisitionEvidence } from './inspector';
 import { hasRetryableCommunityAcquisitionFailure } from './communityRetryPolicy';
 import { applyCommunityIntentEvidence } from './communityIntent';
 import { validateDiscordInvite } from './discordValidator';
@@ -356,6 +356,36 @@ export async function admitInspectionDiscordCandidates(
   const loserCodes = [...claimSources.keys()].filter(code => !admittedCodes.has(code));
   if (loserCodes.length) await deps.removeLosers(channelId, loserCodes, provisionalIdsForCode(new Set(loserCodes)), provisionalSince);
   return { candidates: admission.candidates, discoveredInvite: admission.discoveredInvite, discardedCount: admission.discardedCount, discardedOwnerChannelIds: [...new Set(discardedOwnerChannelIds)] };
+}
+/**
+ * Duplicate-owner provenance projection (E8/E9 follow-up). A fresh duplicate
+ * claim always replaces the saved owner id. When no duplicate was observed,
+ * only a fresh, processed website/social inspection can prove the prior
+ * duplicate disappeared: cache-only borrows deliberately return no candidates
+ * and must not erase the saved provenance. Failed or partial fresh runs also
+ * cannot establish absence, so the prior owner id is preserved. Pure.
+ */
+export function nextDiscordDuplicateOwnerChannelId(input: {
+  discardedOwnerChannelIds: string[];
+  previousOwnerChannelId?: string | null;
+  observations: Array<{
+    surface?: string;
+    outcome?: string;
+    telemetry?: { pagesInspected?: number; requestsStarted?: number; redirectsFollowed?: number };
+    sharedEvidenceFrom?: string;
+    siteCacheHit?: unknown;
+  }>;
+}): string | null {
+  const replacement = input.discardedOwnerChannelIds.find(Boolean);
+  if (replacement) return replacement;
+  const freshProcessedWebsiteEvidence = input.observations.some(observation => {
+    if (observation.surface !== 'CREATOR_WEBSITES' && observation.surface !== 'SOCIAL_PROFILES') return false;
+    if (observation.siteCacheHit === true) return false;
+    if (observation.outcome === 'FOUND') return true;
+    return observation.outcome === 'INSPECTED_NO_MATCH'
+      && hasProcessedAcquisitionEvidence(observation as Parameters<typeof hasProcessedAcquisitionEvidence>[0]);
+  });
+  return freshProcessedWebsiteEvidence ? null : (input.previousOwnerChannelId || null);
 }
 /**
  * Orphan drain (E6). Candidates persisted by an execution that never reached
@@ -1734,8 +1764,14 @@ export async function inspectAndValidateChannel(
     const structuredCandidates=(inspection.discordCandidates||[]).filter(candidate=>!!discordInviteCodeOf(candidate.nativeInviteCode));
     let chokeAdmission=await admitInspectionDiscordCandidates(structuredCandidates,inspection.foundInvite,channel.channel_id);
     // Provenance-only duplicate record: owner channel id, never the invite
-    // code. A clean/own-invite inspection clears stale duplicate evidence.
-    channel.discord_duplicate_owner_channel_id = chokeAdmission.discardedOwnerChannelIds[0] || null;
+    // code. A fresh processed inspection clears stale duplicate evidence; a
+    // cache-only scan preserves it because borrowed coverage cannot establish
+    // that the duplicate disappeared.
+    channel.discord_duplicate_owner_channel_id = nextDiscordDuplicateOwnerChannelId({
+      discardedOwnerChannelIds: chokeAdmission.discardedOwnerChannelIds,
+      previousOwnerChannelId: channel.discord_duplicate_owner_channel_id,
+      observations: inspection.acquisitionOutcomes || [],
+    });
     if(chokeAdmission.discardedCount)console.info(JSON.stringify({event:'discord_duplicate_discarded',channelId:channel.channel_id,discardedCount:chokeAdmission.discardedCount,discardedOwnerChannelIds:chokeAdmission.discardedOwnerChannelIds,timestamp:new Date().toISOString()}));
     admittedInspection={...inspection,discordCandidates:chokeAdmission.candidates,foundInvite:chokeAdmission.discoveredInvite};
 
