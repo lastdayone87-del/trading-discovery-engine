@@ -18,13 +18,13 @@ const jobRow = {
   created_at: '2026-09-01T00:00:00.000Z',
 };
 
-function mockClient(existingPayload: Record<string, unknown> = {}) {
+function mockClient() {
   const queries: Array<{ sql: string; values?: unknown[] }> = [];
   return {
     queries,
     async query(sql: string, values?: unknown[]) {
       queries.push({ sql, values });
-      if (sql.includes('INSERT INTO jobs')) return { rows: [{ ...jobRow, payload: JSON.stringify(existingPayload) }], rowCount: 1 };
+      if (sql.includes('INSERT INTO jobs')) return { rows: [jobRow], rowCount: 1 };
       return { rows: [], rowCount: 1 };
     },
   };
@@ -53,10 +53,8 @@ test('community retry enqueue is idempotent per channel and keeps the bounded at
   assert.equal(communityAcquisitionRetryKey('UC_IDEMPOTENT'), 'community-acquisition-retry:UC_IDEMPOTENT');
 });
 
-test('community retry enqueue persists per-seed click progress for the next attempt', async () => {
-  const client = mockClient({
-    clickOffsets: { 'https://other-seed.test': 2, 'https://creator.test': 1 },
-  });
+test('community retry enqueue merges per-seed click progress against the current row', async () => {
+  const client = mockClient();
   await enqueueCommunityAcquisitionRetry('UC_CLICK', {
     ...saturationDirective,
     clickOffsets: { 'https://creator.test': 4 },
@@ -64,12 +62,20 @@ test('community retry enqueue persists per-seed click progress for the next atte
   const insert = client.queries.find(q => q.sql.includes('INSERT INTO jobs'));
   const payload = JSON.parse(String(insert?.values?.[1]));
   assert.deepEqual(payload.clickOffsets, { 'https://creator.test': 4 });
-  const merge = client.queries.find(q => q.sql.includes('UPDATE jobs SET payload=payload || $2::jsonb'));
+  const merge = client.queries.find(q => q.sql.includes('UPDATE jobs SET payload=CASE'));
   assert.ok(merge, 'enqueue merges into the pending durable payload');
-  assert.deepEqual(JSON.parse(String(merge?.values?.[1])).clickOffsets, {
-    'https://other-seed.test': 2,
-    'https://creator.test': 4,
-  }, 'a partial manual retry preserves offsets for seeds it did not inspect');
+  assert.match(merge.sql, /jsonb_typeof\(\$2::jsonb->'clickOffsets'\)='object'/, 'only a real offset map triggers the nested merge');
+  assert.match(merge.sql, /COALESCE\(payload->'clickOffsets','\{\}'::jsonb\) \|\| \(\$2::jsonb->'clickOffsets'\)/, 'the merge reads the current database map, not enqueueJob\'s earlier copy');
+  assert.deepEqual(JSON.parse(String(merge?.values?.[1])).clickOffsets, { 'https://creator.test': 4 }, 'the statement carries only this enqueue\'s offsets; other seeds are preserved by the SQL merge');
+});
+
+test('community retry enqueue without offsets leaves the durable offset map untouched', async () => {
+  const client = mockClient();
+  await enqueueCommunityAcquisitionRetry('UC_NO_CLICK_MAP', saturationDirective, 'INSPECTION', client as any);
+  const merge = client.queries.find(q => q.sql.includes('UPDATE jobs SET payload=CASE'));
+  assert.ok(merge);
+  assert.equal(JSON.parse(String(merge?.values?.[1])).clickOffsets, undefined);
+  assert.match(merge.sql, /ELSE payload \|\| \$2::jsonb END/);
 });
 
 test('a partial retry-progress write preserves other seeds', async () => {

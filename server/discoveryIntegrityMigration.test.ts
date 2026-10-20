@@ -19,6 +19,7 @@ const migration = readFileSync(`${migrationsDir}149_discovery_integrity_state.sq
 const pendingClaimsMigration = readFileSync(`${migrationsDir}150_site_inspection_pending_claims.sql`, 'utf8');
 const dbCore = readFileSync(fileURLToPath(new URL('./dbCore.ts', import.meta.url)), 'utf8');
 const siteCache = readFileSync(fileURLToPath(new URL('./siteInspectionCache.ts', import.meta.url)), 'utf8');
+const rollbackProof = readFileSync(fileURLToPath(new URL('../.github/workflows/phase1-rollback-proof.yml', import.meta.url)), 'utf8');
 
 test('migration 150 is present and sorts after every earlier migration', () => {
   const files = readdirSync(migrationsDir).filter(name => name.endsWith('.sql')).sort();
@@ -31,6 +32,11 @@ test('migration 150 adds only the per-channel pending-candidate map', () => {
   assert.match(pendingClaimsMigration, /ALTER TABLE site_inspections ADD COLUMN IF NOT EXISTS pending_claims JSONB NOT NULL DEFAULT '\{\}'::jsonb;/);
   assert.match(pendingClaimsMigration, /site_inspections_pending_claims_object_check[\s\S]*?CHECK \(jsonb_typeof\(pending_claims\) = 'object'\) NOT VALID;/);
   assert.doesNotMatch(pendingClaimsMigration, /\b(?:DROP|DELETE|TRUNCATE|UPDATE)\b/i, 'pending-claims migration is additive-only');
+});
+
+test('rollback proof seeds only the pre-146 lineage', () => {
+  assert.match(rollbackProof, /\[ "\$version" -lt 146 \] \|\| continue/, 'migration 150+ is filtered by numeric version');
+  assert.doesNotMatch(rollbackProof, /grep -vE '\//, 'the fixed 14x exclusion regex must not return');
 });
 
 test('migration 149 is additive-only (no drops, deletes, or rewrites)', () => {
@@ -98,7 +104,9 @@ test('claim handshake only finalizes PENDING rows for the executing channel and 
 
 test('site-cache upsert preserves all writers pending candidates independently', () => {
   assert.match(dbCore, /site_inspections\.claim_status='PENDING' AND jsonb_array_length\(site_inspections\.candidates\)>0 AND jsonb_array_length\(excluded\.candidates\)=0 THEN site_inspections\.candidates/);
-  assert.match(dbCore, /pending_claims=CASE[\s\S]*?jsonb_build_object\(excluded\.source_channel_id,excluded\.candidates\)/);
+  assert.match(dbCore, /pending_claims=CASE[\s\S]*?jsonb_build_object\(\s*excluded\.source_channel_id,/);
+  assert.match(dbCore, /SELECT DISTINCT ON \(COALESCE\(NULLIF\(candidate->>'candidateId',''\), 'ord:'\|\|ord\)\)/, 'same-channel seed writes merge by candidate id');
+  assert.match(dbCore, /COALESCE\(site_inspections\.pending_claims->excluded\.source_channel_id,'\[\]'::jsonb\)/, 'the merge retains this channel\'s earlier seed candidates');
   assert.match(siteCache, /const ownPending = typeof borrower\.channelId === 'string'/);
   assert.match(siteCache, /row: \{ \.\.\.row, candidates: \[\], pendingClaims: \{\} \}/);
 });

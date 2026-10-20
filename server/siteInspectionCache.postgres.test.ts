@@ -111,6 +111,50 @@ maybe('cross-writer pending claims keep each channel unclaimed invite recoverabl
   assert.deepEqual(row.candidates, []);
 });
 
+maybe('same-channel seed writes merge unclaimed candidates instead of replacing them', async t => {
+  const { getDb } = await import('./dbCore');
+  const db = await getDb();
+  const SAME_CHANNEL_SITE = 'apex-same-channel-pending.example';
+  const cleanup = async () => {
+    await db.query(`DELETE FROM site_inspections WHERE site_identity=$1`, [SAME_CHANNEL_SITE]);
+  };
+  await cleanup();
+  t.after(cleanup);
+  const candidateOne = { candidateId: 'candidate-one', nativeInviteCode: 'oneRoom', sourceSurface: 'CREATOR_WEBSITES' };
+  const candidateTwo = { candidateId: 'candidate-two', nativeInviteCode: 'twoRoom', sourceSurface: 'CREATOR_WEBSITES' };
+  const writeSeed = (candidates: Array<Record<string, unknown>>) => upsertSiteInspection({
+    siteIdentity: SAME_CHANNEL_SITE, identityTier: 'A', identityBasis: 'test',
+    canonicalUrl: `https://${SAME_CHANNEL_SITE}/`, outcome: 'FOUND', retryable: false,
+    candidates, observations: [{ outcome: 'FOUND' }],
+    renderedCovered: false, sourceChannelId: CHANNEL_A, claimStatus: 'PENDING', provenance: {},
+  });
+  await writeSeed([candidateOne]);
+  await writeSeed([candidateTwo]);
+  await writeSeed([candidateTwo]);
+  let [row] = await getSiteInspections([SAME_CHANNEL_SITE]);
+  assert.equal(row.claimStatus, 'PENDING');
+  assert.deepEqual(
+    (row.pendingClaims?.[CHANNEL_A] || []).map(c => c.candidateId),
+    ['candidate-one', 'candidate-two'],
+    'both seeds are recoverable and duplicate candidate ids collapse to the newest copy',
+  );
+  assert.deepEqual(
+    buildBorrowedSiteInspection(row, {
+      requestedUrl: `https://${SAME_CHANNEL_SITE}/`,
+      surface: 'CREATOR_WEBSITES',
+      required: true,
+      observedAt: new Date().toISOString(),
+      channelId: CHANNEL_A,
+    }).recoveredCandidates.map(c => c.candidateId),
+    ['candidate-one', 'candidate-two'],
+  );
+  await markSiteInspectionsClaimed(CHANNEL_A, ['candidate-one', 'candidate-two']);
+  [row] = await getSiteInspections([SAME_CHANNEL_SITE]);
+  assert.equal(row.claimStatus, 'CLAIMED');
+  assert.deepEqual(row.pendingClaims, {});
+  assert.deepEqual(row.candidates, []);
+});
+
 maybe('an empty incoming intent array never erases cached root community evidence', async t => {
   const { getDb } = await import('./dbCore');
   const db = await getDb();

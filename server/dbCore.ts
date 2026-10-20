@@ -1205,7 +1205,8 @@ export async function getSiteInspections(identities: string[]): Promise<SiteInsp
 /** Stores the site-facts learned by crawling one site. Site facts are
  * last-writer-wins (fresher payload replaces older), but unclaimed candidates
  * are NOT: each recording channel keeps its own pending list in
- * `pending_claims`, so a later crawl can never erase another channel's
+ * `pending_claims`, and multiple seed writes from the same channel merge by
+ * candidate id, so a later crawl or seed can never erase an unclaimed
  * crash-window discovery before admission. Never carries creator attribution. */
 export async function upsertSiteInspection(row: {
   siteIdentity: string; identityTier: string; identityBasis: string;
@@ -1238,7 +1239,21 @@ export async function upsertSiteInspection(row: {
                     AND jsonb_array_length(site_inspections.candidates)>0
                THEN jsonb_build_object(site_inspections.source_channel_id,site_inspections.candidates)
                ELSE COALESCE(site_inspections.pending_claims,'{}'::jsonb) END
-        ) || jsonb_build_object(excluded.source_channel_id,excluded.candidates)
+        ) || jsonb_build_object(
+          excluded.source_channel_id,
+          COALESCE((
+            SELECT jsonb_agg(candidate ORDER BY ord)
+              FROM (
+                SELECT DISTINCT ON (COALESCE(NULLIF(candidate->>'candidateId',''), 'ord:'||ord))
+                       candidate, ord
+                  FROM jsonb_array_elements(
+                         COALESCE(site_inspections.pending_claims->excluded.source_channel_id,'[]'::jsonb)
+                         || excluded.candidates
+                       ) WITH ORDINALITY AS t(candidate, ord)
+                 ORDER BY COALESCE(NULLIF(candidate->>'candidateId',''), 'ord:'||ord), ord DESC
+              ) merged
+          ), '[]'::jsonb)
+        )
         ELSE COALESCE(site_inspections.pending_claims,'{}'::jsonb) END,
       claim_status=CASE
         WHEN excluded.claim_status='PENDING' AND excluded.source_channel_id IS NOT NULL AND jsonb_array_length(excluded.candidates)>0 THEN 'PENDING'

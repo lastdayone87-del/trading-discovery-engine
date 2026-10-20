@@ -2332,20 +2332,6 @@ export function shouldCompleteSuppressedRetryJob(inspection:{
   return scanStatus==='FAILED'||scanStatus==='FAILED_PERMANENT';
 }
 
-/** Merge per-seed click progress: incoming values win for keys they contain,
- * every previously recorded seed survives. Returns undefined when both sides
- * carry no valid offset (so payloads are not polluted with empty maps). */
-export function mergeClickOffsetProgress(
-  existing: unknown,
-  incoming: unknown,
-): Record<string, number> | undefined {
-  const merged = {
-    ...(resolveInspectionClickOffsets(existing) || {}),
-    ...(resolveInspectionClickOffsets(incoming) || {}),
-  };
-  return Object.keys(merged).length ? merged : undefined;
-}
-
 export async function enqueueCommunityAcquisitionRetry(channelId:string,directive?:CommunityRetryDirective,source:'INSPECTION'|'RECOVERY'|'LEGACY'='INSPECTION',clientOverride?:{query:(sql:string,params?:unknown[])=>Promise<{rows:unknown[];rowCount:number}>}):Promise<void>{
   const metadata=buildCommunityRetryJobMetadata({
     code:directive?.code||COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,
@@ -2358,25 +2344,25 @@ export async function enqueueCommunityAcquisitionRetry(channelId:string,directiv
   if(String(directive?.reason||'').includes('RENDERED_FALLBACK_SATURATED'))bumpCommunitySaturationDeferral();
   const job=await enqueueJob('RETRY_COMMUNITY_ACQUISITION',{channelId,...metadata},{idempotencyKey:communityAcquisitionRetryKey(channelId),priority:15,maxAttempts:5,runAfter:directive?.retryAt?new Date(directive.retryAt).toISOString():undefined,clientOverride});
   // Preserve a pending job's original ownership and retry window while merging
-  // the latest attributable reason into its durable payload.
+  // the latest attributable reason into its durable payload. Per-seed click
+  // progress is append-only, and the merge must read the CURRENT row inside
+  // this statement: a retry worker can advance the PROCESSING job between
+  // enqueueJob's RETURNING and this update, and writing back the earlier copy
+  // would rewind its newer offsets. When this enqueue carries offsets, merge
+  // them over the row's current map (incoming keys win); otherwise leave the
+  // existing map untouched.
   const runner:{query:(sql:string,params?:unknown[])=>Promise<unknown>} = clientOverride||await getDb();
-  // Per-seed click progress is append-only across partial enqueues. A plain
-  // payload `||` would replace the entire clickOffsets object when a manual
-  // retry carries only the seed it re-inspected. enqueueJob's RETURNING gives
-  // the current durable payload, so merge nested maps before writing:
-  // incoming keys win, every other seed's offset is preserved.
-  let existingPayload: unknown = job.payload;
-  if (typeof existingPayload === 'string') {
-    try { existingPayload = JSON.parse(existingPayload); } catch { existingPayload = undefined; }
-  }
-  const mergedClickOffsets = mergeClickOffsetProgress(
-    (existingPayload as { clickOffsets?: unknown } | null | undefined)?.clickOffsets,
-    metadata.clickOffsets,
-  );
-  const durableMetadata = mergedClickOffsets ? { ...metadata, clickOffsets: mergedClickOffsets } : metadata;
   await runner.query(
-    `UPDATE jobs SET payload=payload || $2::jsonb,updated_at=now() WHERE id=$1 AND status IN('PENDING','PROCESSING')`,
-    [job.id,JSON.stringify(durableMetadata)]
+    `UPDATE jobs SET payload=CASE
+       WHEN jsonb_typeof($2::jsonb->'clickOffsets')='object'
+         THEN (payload - 'clickOffsets') || jsonb_build_object(
+           'clickOffsets',
+           COALESCE(payload->'clickOffsets','{}'::jsonb) || ($2::jsonb->'clickOffsets')
+         )
+       ELSE payload || $2::jsonb END,
+       updated_at=now()
+     WHERE id=$1 AND status IN('PENDING','PROCESSING')`,
+    [job.id,JSON.stringify(metadata)]
   );
 }
 

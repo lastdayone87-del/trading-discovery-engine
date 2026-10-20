@@ -55,11 +55,13 @@ jobs:
           set -euo pipefail
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c \
             "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
-          # 148+ are newer features with their own proof workflows; this proof
-          # is scoped to the 146/147 rollback and must not advance past 147
-          # (nor apply the additive 149 discovery-integrity migration).
-          for f in $(ls server/db/migrations/*.sql | sort | grep -vE '/(14[6789])_'); do
+          # 146+ are newer features with their own proof workflows; this proof
+          # is scoped to the 146/147 rollback and must not advance past 147.
+          # Filter by numeric version rather than a fixed 14x regex so future
+          # migrations (including 150) cannot silently enter the pre-state.
+          for f in $(ls server/db/migrations/*.sql | sort); do
             name=$(basename "$f"); version=${name%%_*}
+            [ "$version" -lt 146 ] || continue
             psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q \
               -c "BEGIN" -f "$f" \
               -c "INSERT INTO schema_migrations(version,name,applied_at) VALUES ($version, '$name', now())" \
