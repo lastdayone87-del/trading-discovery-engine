@@ -1,24 +1,28 @@
 # Unit 3 — 9,000-unit/key/day quota cap (shadow evidence + default-OFF enforcement)
 
 Date: 2026-10-19 (updated 2026-10-20) · Shadow branch `phase1-hardening` head
-`f3e5f43`; hard-cap branch `feat/youtube-key-hard-cap` head `33d2f3f`.
-Evidence runs: shadow [39481878389](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39481878389),
-hard cap [39485338052](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39485338052).
+`64d83fb`; hard-cap branch `feat/youtube-key-hard-cap` head `9f6001a`.
+Evidence runs: shadow [39490594873](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39490594873),
+hard cap [39493711615](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39493711615).
 
 Status: the migration-148 shadow implementation is historical evidence. The
 hard-cap implementation on `feat/youtube-key-hard-cap` is **implemented but
 default OFF, not deployed and not enabled**. Key configuration changes and any
 change to official API traffic remain gated on explicit operator approval.
+PR #530 was merged into `phase1-hardening` at `6267ba1` by an external actor; the
+hard-cap branch is rebased on the resulting tree and includes migrations
+149–152. This session did not perform that merge.
 
 ## What shipped
 
 | Artifact | Purpose |
 | --- | --- |
 | `server/db/migrations/148_youtube_key_cap_shadow.sql` | `youtube_key_cap_shadow_leases` + `youtube_key_cap_shadow_events` (observational; no `app_settings` row, absent flag = OFF) |
+| `server/db/migrations/151_youtube_key_cap_shadow_settled.sql` | Inert settlement tombstones from the merged #530 work; fences late shadow observations. No hard-cap table. |
 | `server/quotaKeyCapShadow.ts` | Config, projection, classification, locking, dedupe, sweeps, savepoint settlement; default-OFF hard reservation/settlement |
 | `server/youtube.ts` (~line 438) | Dispatch hook: in-flight lease + projection observation for the dispatched key |
 | `server/dbCore.ts` (`incrementQuota`) | Settlement hook: releases one matching lease exactly once |
-| `server/quotaKeyCapShadow.test.ts` | 23 unit tests (14 shadow + 9 hard-cap cases) |
+| `server/quotaKeyCapShadow.test.ts` | 26 unit tests (17 shadow/operation + 9 hard-cap cases) |
 | `server/quotaKeyCapShadow.postgres.test.ts` | PostgreSQL suite (dedicated-DB gated) |
 | `scripts/quota_shadow_replay.ts` | Offline 3-day CSV replay |
 | `.github/workflows/phase1-quota-shadow-tests.yml` | CI: tsc + unit tests + postgres:17 full lineage |
@@ -152,10 +156,10 @@ main's 145.
 
 ## Hard-cap enforcement (default OFF) — implementation on `feat/youtube-key-hard-cap`
 
-Date: 2026-10-20 · Branch `feat/youtube-key-hard-cap` head `33d2f3f`, based on
-PR #531 head `f3e5f43` · Status: **implemented, disabled by default, not
-deployed, not enabled.** Production remains unchanged and no migration has
-been applied to it.
+Date: 2026-10-20 · Branch `feat/youtube-key-hard-cap` head `9f6001a`, based on
+PR #531 head `64d83fb` after the external #530 merge `6267ba1` · Status:
+**implemented, disabled by default, not deployed, not enabled.** Production
+remains unchanged and no migration has been applied to it.
 
 ### Design
 
@@ -164,14 +168,16 @@ been applied to it.
   the existing shadow-only path. No `app_settings` row is created by code or
   migration.
 - **Reused storage:** the existing migration 148
-  `youtube_key_cap_shadow_leases` table. **No new table and no new migration.**
-  The unique `(quota_day, operation_id)` key is the idempotency authority.
+  `youtube_key_cap_shadow_leases` table, plus migration 151's inert
+  `youtube_key_cap_shadow_settled` tombstones inherited from the merged #530
+  work. **The hard-cap change adds no new table and no new migration.** The
+  unique `(quota_day, operation_id)` key is the idempotency authority.
   Enforced leases expire at the next Pacific midnight and an opportunistic
   once-per-minute sweep bounds table growth; expired leases never count.
 - **Reservation point:** `youtubeFetch()` reserves after the final dispatched
   provider key is selected and before the official HTTP request. One stable
   `cap:${operation}:${uuid}` identity is generated per dispatch and reused for
-  the lease, optional shadow-failure release and response settlement.
+  the lease and response settlement.
 - **Transaction:** one short transaction per dispatch with
   `pg_advisory_xact_lock(hashtext('youtube-key-cap-enforce:<day>:<fingerprint>'))`
   and `SET LOCAL lock_timeout = '5000ms'`. The projection is
@@ -192,13 +198,15 @@ been applied to it.
   settlement rejects a charged unit count that differs from the reserved units.
 - **Shadow compatibility:** the shadow still records its lease/event when
   enforcement is OFF. Dispatch remains fire-and-forget: it does not await
-  settings, pool acquisition or the write before the provider request. When
-  the background observation has attached its stable operation identity before
-  the response settles, shadow settlement is exact; if it loses that race, the
-  observational lease is bounded by its 120 s TTL. Enforced reservation is
-  synchronous, so enforced settlement is always exact.
-  `settleShadowLease()` accepts an optional `operationId`; the legacy
-  unit-matched form remains.
+  settings, pool acquisition or the write before the provider request. The
+  completed observation is joined for at most 500 ms; a cancelled/late write is
+  fenced by the migration-151 tombstone. Shadow settlement uses the exact
+  operation identity when present. Because the shadow settlement hook still
+  uses the completion day, a cross-midnight call can leave the prior-day lease
+  until its 120 s TTL; that is observational only. Enforced reservation is
+  synchronous and uses the dispatch day, so enforced settlement is exact.
+  `settleShadowLease()` also retains the legacy unit-matched form for callers
+  without an operation id.
 - **Failed calls:** enforced reservations are **not released** on a non-OK
   response, fetch failure or timeout. The outcome is ambiguous and may already
   have consumed provider quota, so the lease remains until the Pacific day
@@ -262,17 +270,17 @@ rejected); settlement failure leaving the conservative lease; Pacific midnight
 + both DST rollovers; restart with a new pool observing persisted leases; and
 two probe-budget concurrency cases.
 
-CI results for `33d2f3f` (run
-https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39485338052):
-`npx tsc --noEmit` clean; **46/46 unit** (23 quota cap + 9 dbCore quota +
-14 probe executor) and **20/20 PostgreSQL**, 0 skipped. Local PostgreSQL was not
+CI results for `9f6001a` (run
+https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39493711615):
+`npx tsc --noEmit` clean; **50/50 unit** (26 quota cap + 9 dbCore quota +
+15 probe executor) and **20/20 PostgreSQL**, 0 skipped. Local PostgreSQL was not
 available on this host; the postgres:17 CI service is the database proof. No
 enforcement claim is made from shadow observations, and this run did not enable
 or deploy the feature.
 
 ### Rollout gates (all required before enabling)
 
-1. Migration 148 applied by the normal deploy migration runner; no manual DDL.
+1. Migrations 148 and 151 applied by the normal deploy migration runner; no manual DDL.
 2. CI postgres suite green against postgres:17 with the dedicated URL.
 3. Sustained shadow evidence reviewed: `WOULD_DEFER`/`WOULD_REJECT` rates,
    lock timeouts, day-reset recovery, and key headroom per quota group.

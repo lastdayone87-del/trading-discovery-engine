@@ -361,12 +361,15 @@ WITH removed AS (
   DELETE FROM youtube_key_cap_shadow_leases
    WHERE quota_day = $1 AND operation_id = $2 AND key_fingerprint = $3
    RETURNING 1
+), tombstone AS (
+  INSERT INTO youtube_key_cap_shadow_settled
+    (quota_day, operation_id, key_fingerprint, settled_at, expires_at)
+  VALUES ($1, $2, $3, $4, $5)
+  ON CONFLICT (quota_day, operation_id) DO UPDATE
+    SET expires_at = GREATEST(youtube_key_cap_shadow_settled.expires_at, EXCLUDED.expires_at)
+  RETURNING 1
 )
-INSERT INTO youtube_key_cap_shadow_settled
-  (quota_day, operation_id, key_fingerprint, settled_at, expires_at)
-VALUES ($1, $2, $3, $4, $5)
-ON CONFLICT (quota_day, operation_id) DO UPDATE
-  SET expires_at = GREATEST(youtube_key_cap_shadow_settled.expires_at, EXCLUDED.expires_at)
+SELECT (SELECT count(*)::int FROM removed) AS removed
 `;
 
 /**
@@ -390,7 +393,8 @@ export async function settleShadowLease(
       now,
       expiresAt,
     ]);
-    return (result.rowCount ?? 0) > 0;
+    const removed = result.rows?.[0]?.removed;
+    return removed === undefined ? (result.rowCount ?? 0) > 0 : Number(removed) > 0;
   }
   const result = await client.query(SETTLE_LEGACY_SQL, [
     input.quotaDay,
