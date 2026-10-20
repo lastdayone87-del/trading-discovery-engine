@@ -390,7 +390,7 @@ async function reserveEnforced(
     keyFingerprint,
     operationId,
     units,
-    now: options.now,
+    now: options.now ?? fixedNow,
     lockTimeoutMs: options.lockTimeoutMs ?? 5000,
   });
 }
@@ -476,12 +476,12 @@ maybe('enforce: stale/expired leases never block new capacity', async () => {
   await seedSettledUnits(key, 0);
   await requirePool().query(
     `INSERT INTO youtube_key_cap_shadow_leases(quota_day, operation_id, key_fingerprint, reserved_units, reserved_at, expires_at)
-     VALUES($1, $2, $3, 9000, now() - interval '10 minutes', now() - interval '5 minutes')`,
-    [quotaDay, staleOperationId, key]
+     VALUES($1, $2, $3, 9000, $4::timestamptz - interval '10 minutes', $4::timestamptz - interval '5 minutes')`,
+    [quotaDay, staleOperationId, key, fixedNow]
   );
   const admitted = await reserveEnforced(key, `${runTag}:enforce-stale:new`, 9000);
   assert.equal(admitted.projectedBefore, 0, 'expired lease is excluded from the projection');
-  await sweepShadowLeases(requirePool() as unknown as ShadowPoolPort, new Date());
+  await sweepShadowLeases(requirePool() as unknown as ShadowPoolPort, fixedNow);
   const stale = await requirePool().query(
     `SELECT count(*)::int AS count FROM youtube_key_cap_shadow_leases WHERE quota_day=$1 AND operation_id=$2`,
     [quotaDay, staleOperationId]
