@@ -17,7 +17,7 @@
  * units/attempt/outcome/results/idempotency columns. `terminology_trial_controls`
  * is a singleton kill switch, `discovery_actions` is a program-scoped planner
  * row, `discovery_provider_registry` is a provider catalog, and `jobs` is a
- * queue. Additive migration 146 therefore creates `discovery_probe_ledger`.
+ * queue. Additive migration 147 therefore creates `discovery_probe_ledger`.
  *
  * Enforcement is both in code (all caps/termination/idempotency decisions) and
  * in SQL (transaction + advisory lock per candidate, UNIQUE(candidate_key,
@@ -26,7 +26,7 @@
  */
 
 import { getAppSetting, getDb } from '../dbCore';
-import { canonicalCountry } from '../countryInference';
+import { canonicalCountry, isKnownCountry } from '../countryInference';
 
 export const PROBE_POLICY_VERSION = 'bounded-probe-v1';
 
@@ -176,6 +176,8 @@ export interface ProbeLedgerClient extends ProbeLedgerQueryable {
 
 export interface ProbeLedgerTransaction {
   lockCandidate: (candidateKey: string) => Promise<void>;
+  /** Serializes budget reads/inserts for a scope (UTC day or all-time). Optional for in-memory tests. */
+  lockBudget?: (scope: string) => Promise<void>;
   getCandidateStats: (candidateKey: string) => Promise<{ attempts: number; firstReservedAt: string | null }>;
   getLastAttempt: (candidateKey: string) => Promise<ProbeLedgerRow | null>;
   getInflight: (candidateKey: string, nowIso: string) => Promise<ProbeLedgerRow | null>;
@@ -391,9 +393,13 @@ export function resolveProbeCapsFromValues(values: {
           : String(values.allowedCountries).trim();
       const allowedCountries = rawCountries
         ? rawCountries
-            .split(',')
-            .map(entry => canonicalCountry(entry.trim()))
-            .filter(entry => Boolean(entry))
+            // Country names may contain spaces ("United States"); only comma/
+            // semicolon is a list separator. Whitespace-only lists still fail
+            // the known-country filter below.
+            .split(/[,;]+/)
+            .map(entry => entry.trim())
+            .filter(entry => Boolean(entry) && isKnownCountry(entry))
+            .map(entry => canonicalCountry(entry))
         : [];
       return { deadlineIso, deadlineMalformed, allowedCountries };
     })(),
@@ -452,7 +458,12 @@ export class SqlProbeLedgerStore implements ProbeLedgerStore {
   constructor(private readonly client: ProbeLedgerClient) {}
 
   private async withTransaction<T>(fn: (queryable: ProbeLedgerQueryable) => Promise<T>): Promise<T> {
-    if (typeof this.client.connect === 'function') {
+    // pg.Pool exposes connect()+totalCount; pg.Client also has connect() but
+    // is already a single connection and must not be reconnected per txn.
+    const isPool =
+      typeof this.client.connect === 'function' &&
+      typeof (this.client as unknown as { totalCount?: unknown }).totalCount === 'number';
+    if (isPool) {
       const connection = await this.client.connect();
       try {
         await connection.query('BEGIN');
@@ -481,7 +492,14 @@ export class SqlProbeLedgerStore implements ProbeLedgerStore {
     return this.withTransaction(async queryable => {
       const tx: ProbeLedgerTransaction = {
         lockCandidate: async candidateKey => {
-          await queryable.query('SELECT pg_advisory_xact_lock(hashtext($1)::bigint)', [candidateKey]);
+          await queryable.query('SELECT pg_advisory_xact_lock(hashtext($1)::bigint)', [
+            `probe-candidate:${candidateKey}`,
+          ]);
+        },
+        lockBudget: async scope => {
+          await queryable.query('SELECT pg_advisory_xact_lock(hashtext($1)::bigint)', [
+            `probe-budget:${scope}`,
+          ]);
         },
         getCandidateStats: async candidateKey => {
           const result = await queryable.query(
@@ -687,6 +705,20 @@ export async function reserveProbe(
       const stats = await tx.getCandidateStats(candidateKey);
       const last = await tx.getLastAttempt(candidateKey);
 
+      // Replay identity is resolved before conclusion checks. A retry of an
+      // already-recorded attempt must return that row even after the candidate
+      // has concluded; otherwise a lost response looks like a new denial.
+      if (input.attemptNo !== undefined) {
+        const existing = await tx.findAttempt(candidateKey, input.attemptNo);
+        if (existing) {
+          return { granted: false, duplicate: true, reason: PROBE_REASONS.duplicateAttempt, probe: existing };
+        }
+        const expected = (last?.attemptNo ?? 0) + 1;
+        if (!Number.isInteger(input.attemptNo) || input.attemptNo !== expected) {
+          return denial(PROBE_REASONS.invalidAttemptNo, last);
+        }
+      }
+
       if (stats.attempts >= caps.maxPerCandidate) {
         return denial(PROBE_REASONS.candidateConcluded, last);
       }
@@ -709,28 +741,26 @@ export async function reserveProbe(
         return { granted: false, duplicate: true, reason: PROBE_REASONS.duplicateInflight, probe: inflight };
       }
 
-      if (input.attemptNo !== undefined) {
-        const existing = await tx.findAttempt(candidateKey, input.attemptNo);
-        if (existing) {
-          return { granted: false, duplicate: true, reason: PROBE_REASONS.duplicateAttempt, probe: existing };
-        }
-        const expected = (last?.attemptNo ?? 0) + 1;
-        if (!Number.isInteger(input.attemptNo) || input.attemptNo !== expected) {
-          return denial(PROBE_REASONS.invalidAttemptNo, last);
-        }
-      }
-
       // A crashed/expired reservation consumes its attempt but must not hold
       // the candidate hostage for another 24h: only non-expired attempts
       // enforce the minimum interval.
+      const lastIsExpired =
+        last?.status === 'EXPIRED' ||
+        (!!last &&
+          (last.status === 'RESERVED' || last.status === 'RUNNING') &&
+          new Date(last.expiresAt).getTime() <= now.getTime());
       if (
         last &&
-        last.status !== 'EXPIRED' &&
+        !lastIsExpired &&
         now.getTime() - new Date(last.reservedAt).getTime() < caps.minIntervalHours * 60 * 60 * 1000
       ) {
         return denial(PROBE_REASONS.minInterval, last);
       }
 
+      // One day-scoped advisory lock covers the UTC-day counters and the insert.
+      // Without it, two candidates under different per-candidate locks could
+      // both pass the global/country checks and exceed the daily pilot budget.
+      await tx.lockBudget?.(dayStartIso);
       const globalCount = await tx.countProbesSince(dayStartIso);
       if (globalCount >= caps.maxPerDay) {
         return denial(PROBE_REASONS.globalDailyCap, last);
@@ -739,6 +769,10 @@ export async function reserveProbe(
       if (countryCount >= caps.maxPerCountryPerDay) {
         return denial(PROBE_REASONS.countryDailyCap, last);
       }
+      // The absolute run cap spans UTC days, so the day-scoped lock cannot
+      // serialize it. Take a second, all-time lock before counting; every
+      // reservation takes day -> all-time in the same order (no deadlock).
+      await tx.lockBudget?.('all-time');
       // Absolute run cap: counts every attempt ever reserved (epoch start).
       const totalCount = await tx.countProbesSince(new Date(0).toISOString());
       if (totalCount >= caps.maxTotal) {

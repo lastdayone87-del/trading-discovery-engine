@@ -4,6 +4,7 @@ import {
   EVIDENCE_RESOLUTION_STATUS,
   evidenceObservationKey,
   stageEvidenceCandidates,
+  type EvidenceStagingClient,
   type EvidenceStagingQueryable,
 } from './evidenceStaging';
 import { extractEvidenceCandidates, type EvidenceProvenance } from './evidenceExtraction';
@@ -52,11 +53,16 @@ test('staging writer follows Brave conventions with distinct evidence values', a
   );
   assert.equal(result.stagedCount, candidates.length);
   assert.equal(result.duplicateCount, 0);
-  assert.ok(result.observationCount >= candidates.length);
+  const expectedObservations = new Set(
+    candidates.flatMap(candidate => candidate.provenance.map(provenance =>
+      evidenceObservationKey(candidate.canonicalCandidateKey, 'UCstage000000000000000000', provenance)
+    ))
+  ).size;
+  assert.equal(result.observationCount, expectedObservations);
 
   const staging = db.statements.find(statement => statement.sql.includes('INSERT INTO discovery_candidate_staging'));
   assert.ok(staging);
-  assert.match(staging!.sql, /ON CONFLICT \(staging_key\) DO UPDATE SET updated_at=now\(\)/);
+  assert.match(staging!.sql, /ON CONFLICT \(staging_key\) DO UPDATE SET\s+updated_at=now\(\)/);
   assert.match(staging!.sql, /RETURNING id, \(xmax=0\) AS inserted/);
   const params = staging!.params;
   assert.equal(params[0], params[1]); // staging_key = canonical_candidate_key
@@ -124,4 +130,46 @@ test('staging without a country fails loudly instead of writing an invalid row',
     stageEvidenceCandidates(fixtures(), { channelId: 'UCx', country: '  ' }, db),
     /EVIDENCE_STAGING_COUNTRY_REQUIRED/
   );
+});
+
+
+test('a mid-batch failure rolls the entire staging batch back', async () => {
+  class FailingTxPool implements EvidenceStagingClient {
+    totalCount = 1;
+    statements: string[] = [];
+    constructor(private readonly inner: FakeStagingDb) {}
+
+    async query(sql: string, params: unknown[] = []) {
+      return this.inner.query(sql, params);
+    }
+
+    async connect() {
+      let observationAttempts = 0;
+      return {
+        query: async (sql: string, params: unknown[] = []) => {
+          this.statements.push(sql);
+          if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [] };
+          if (sql.includes('INSERT INTO discovery_candidate_observations')) {
+            observationAttempts += 1;
+            if (observationAttempts === 2) throw new Error('injected observation failure');
+          }
+          return this.inner.query(sql, params);
+        },
+        release: () => undefined,
+      };
+    }
+  }
+
+  const pool = new FailingTxPool(new FakeStagingDb());
+  await assert.rejects(
+    stageEvidenceCandidates(
+      fixtures(),
+      { channelId: 'UCrollback', country: 'Germany', language: 'de' },
+      pool
+    ),
+    /injected observation failure/
+  );
+  assert.ok(pool.statements.includes('BEGIN'));
+  assert.ok(pool.statements.includes('ROLLBACK'));
+  assert.ok(!pool.statements.includes('COMMIT'));
 });

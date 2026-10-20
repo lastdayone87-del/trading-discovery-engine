@@ -3,13 +3,15 @@
  *
  * Pure and fully unit-testable: no DB, no network, no clocks. Consumes
  * extracted evidence candidates plus a pre-loaded screening baseline (catalog
- * terms, canonical staging keys, curated country vocabulary) and produces
+ * terms and curated country vocabulary) and produces
  * PROBE_ELIGIBLE / REJECT with machine-readable reasons.
  *
  * Approved D4 change: a missing curated vocabulary row for the candidate's
  * country is NOT a rejection cause. Deterministic checks (spam, generic,
- * catalog/staging duplication, lookup health, language fit when a curated
- * profile exists) still apply and can admit the candidate to PROBE_ELIGIBLE.
+ * catalog duplication, lookup health, language fit when a curated profile
+ * exists) still apply and can admit the candidate to PROBE_ELIGIBLE. A key
+ * already present in staging is NOT a rejection: staging is idempotent and a
+ * new observation of an existing candidate must still be recorded.
  *
  * Authority boundary: PROBE_ELIGIBLE is inert staging metadata. This module
  * never reads or writes `search_eligible`, never mutates the canonical
@@ -32,9 +34,9 @@ export type ScreeningDecision = 'PROBE_ELIGIBLE' | 'REJECT';
 /**
  * Baseline assembled by the pipeline runner from DB lookups. Lookup success
  * and row presence are deliberately distinct:
- * - `catalogOk`/`stagedOk`/`vocabOk` false means the lookup itself FAILED and
- *   screening fails closed (a transient read error must never make a known
- *   term look novel).
+ * - `catalogOk`/`vocabOk` false means the lookup itself FAILED and screening
+ *   fails closed (a transient read error must never make a known term look
+ *   novel).
  * - `vocabLanguages === null` means the lookup SUCCEEDED and the country has
  *   no curated vocabulary row — approved D4 non-rejection (see module doc).
  */
@@ -43,9 +45,6 @@ export interface EvidenceScreeningBaseline {
   catalogOk: boolean;
   /** normalizeTerm forms already present in the canonical catalog for the country. */
   catalogTerms: string[];
-  stagedOk: boolean;
-  /** canonical_candidate_key values already staged (any provider). */
-  stagedCanonicalKeys: string[];
   vocabOk: boolean;
   /** Curated vocabulary languages, or null when the country has no row. */
   vocabLanguages: string[] | null;
@@ -87,7 +86,6 @@ export const SCREENING_REASONS = {
   TOO_SHORT: 'TOO_SHORT',
   GENERIC_TERM: 'GENERIC_TERM',
   DUPLICATE_CATALOG: 'DUPLICATE_CATALOG',
-  DUPLICATE_STAGED: 'DUPLICATE_STAGED',
   DUPLICATE_BATCH: 'DUPLICATE_BATCH',
   LANGUAGE_MISMATCH: 'LANGUAGE_MISMATCH',
 } as const;
@@ -97,11 +95,25 @@ function primaryLanguage(value: string): string {
   return normalized ? normalized.split('-')[0] : '';
 }
 
+function comparisonForms(term: string): string[] {
+  const normalized = normalizeTerm(term);
+  const withoutSurfacePrefix = normalized.replace(/^[#@]+/u, '');
+  return withoutSurfacePrefix && withoutSurfacePrefix !== normalized
+    ? [normalized, withoutSurfacePrefix]
+    : [normalized];
+}
+
 function genericForms(baseline: EvidenceScreeningBaseline): Set<string> {
   const forms = new Set<string>();
-  for (const term of GENERIC_DISCOVERY_TERMS) forms.add(normalizeTerm(term));
-  for (const term of KNOWN_INSTRUMENT_TERMS) forms.add(normalizeTerm(term));
-  for (const term of baseline.curatedTerms) forms.add(normalizeTerm(term));
+  for (const term of GENERIC_DISCOVERY_TERMS) {
+    for (const form of comparisonForms(term)) forms.add(form);
+  }
+  for (const term of KNOWN_INSTRUMENT_TERMS) {
+    for (const form of comparisonForms(term)) forms.add(form);
+  }
+  for (const term of baseline.curatedTerms) {
+    for (const form of comparisonForms(term)) forms.add(form);
+  }
   return forms;
 }
 
@@ -109,6 +121,7 @@ function evaluateOne(
   candidate: EvidenceCandidate,
   baseline: EvidenceScreeningBaseline,
   genericSet: Set<string>,
+  catalogSet: Set<string>,
   batchKeys: Set<string>
 ): ScreenedEvidenceCandidate {
   const reject = (reasons: string[]): ScreenedEvidenceCandidate => ({
@@ -126,7 +139,7 @@ function evaluateOne(
 
   // Fail closed before any positive classification: a failed baseline lookup
   // is unknown novelty, never assumed-novel evidence.
-  if (!baseline.catalogOk || !baseline.stagedOk || !baseline.vocabOk) {
+  if (!baseline.catalogOk || !baseline.vocabOk) {
     return reject([SCREENING_REASONS.BASELINE_LOOKUP_FAILED]);
   }
 
@@ -134,6 +147,7 @@ function evaluateOne(
   if (!normalized || Array.from(normalized).length < 2) {
     return reject([SCREENING_REASONS.TOO_SHORT]);
   }
+  const forms = comparisonForms(normalized);
 
   const spamSignals = detectSpamSignals(normalized);
   if (spamSignals.length > 0) return reject(spamSignals.map(code => `SPAM:${code}`));
@@ -142,18 +156,15 @@ function evaluateOne(
     return reject([SCREENING_REASONS.DUPLICATE_BATCH]);
   }
 
-  if (baseline.catalogTerms.some(term => normalizeTerm(term) === normalized)) {
+  if (forms.some(form => catalogSet.has(form))) {
     return reject([SCREENING_REASONS.DUPLICATE_CATALOG]);
-  }
-  if (baseline.stagedCanonicalKeys.includes(candidate.canonicalCandidateKey)) {
-    return reject([SCREENING_REASONS.DUPLICATE_STAGED]);
   }
 
   const quality = evaluateTermQualityFlags(normalized, {
     language: baseline.language,
     curatedTerms: baseline.curatedTerms,
   });
-  if (quality.generic || genericSet.has(normalized)) {
+  if (quality.generic || forms.some(form => genericSet.has(form))) {
     return reject([SCREENING_REASONS.GENERIC_TERM]);
   }
 
@@ -179,7 +190,13 @@ export function screenEvidenceCandidate(
   candidate: EvidenceCandidate,
   baseline: EvidenceScreeningBaseline
 ): ScreenedEvidenceCandidate {
-  return evaluateOne(candidate, baseline, genericForms(baseline), new Set());
+  return evaluateOne(
+    candidate,
+    baseline,
+    genericForms(baseline),
+    new Set(baseline.catalogTerms.flatMap(comparisonForms)),
+    new Set()
+  );
 }
 
 /**
@@ -192,9 +209,10 @@ export function screenEvidenceCandidates(
   baseline: EvidenceScreeningBaseline
 ): ScreenedEvidenceCandidate[] {
   const genericSet = genericForms(baseline);
+  const catalogSet = new Set(baseline.catalogTerms.flatMap(comparisonForms));
   const batchKeys = new Set<string>();
   return candidates.map(candidate => {
-    const result = evaluateOne(candidate, baseline, genericSet, batchKeys);
+    const result = evaluateOne(candidate, baseline, genericSet, catalogSet, batchKeys);
     if (result.decision === 'PROBE_ELIGIBLE') batchKeys.add(candidate.canonicalCandidateKey);
     return result;
   });

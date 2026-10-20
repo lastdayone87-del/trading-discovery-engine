@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { extractEvidenceCandidates } from './evidenceExtraction';
 import { stageEvidenceCandidates } from './evidenceStaging';
@@ -34,6 +34,14 @@ test('discovery extraction postgres tests require a dedicated database (skipped 
 if (dedicated) process.env.DATABASE_URL = dedicated;
 const maybe = dedicated ? test : test.skip;
 
+if (dedicated) {
+  after(async () => {
+    const { getDb } = await import('../dbCore');
+    const pool = (await getDb()) as unknown as { end?: () => Promise<void> };
+    await pool.end?.();
+  });
+}
+
 type Db = { query: (text: string, params?: any[]) => Promise<{ rows: any[] }> };
 
 async function db(): Promise<Db> {
@@ -55,7 +63,7 @@ async function assertIsolatedTestDb(database: Db) {
   const provider = await database.query(
     `SELECT provider_key FROM discovery_provider_registry WHERE provider_key='evidence_extraction'`
   );
-  assert.equal(provider.rows.length, 1, 'migration 145 must be applied to the dedicated test database');
+  assert.equal(provider.rows.length, 1, 'migration 146 must be applied to the dedicated test database');
 }
 
 function uniqueFixture(): { term: string; channelId: string; tag: string } {

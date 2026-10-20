@@ -17,15 +17,17 @@ import {
 /**
  * Deterministic ledger tests. The in-memory store mirrors the SQL store's
  * decision surface; SQL uniqueness/idempotency is additionally asserted in
- * probeGateSafety.test.ts (migration 146) and probeLedgerSql.test.ts.
+ * probeGateSafety.test.ts (migration 147) and probeLedgerSql.test.ts.
  */
 class MemoryProbeStore implements ProbeLedgerStore {
   rows: ProbeLedgerRow[] = [];
+  locks: string[] = [];
   private seq = 0;
 
   private tx(): ProbeLedgerTransaction {
     return {
       lockCandidate: async () => undefined,
+      lockBudget: async scope => { this.locks.push(scope); },
       getCandidateStats: async candidateKey => {
         const rows = this.rows.filter(row => row.candidateKey === candidateKey);
         return {
@@ -258,12 +260,28 @@ test('country allowlist denies non-listed countries and fails closed on empty va
   );
   assert.equal(franceExplicit.granted, true);
 
+  const multiWordName = await reserveProbe(
+    { candidateKey: 'allow-4', term: 'orderflow', country: 'US' },
+    { store, now, readSetting: settings({ discovery_probe_allowed_countries: 'United States' }) }
+  );
+  assert.equal(multiWordName.granted, true, 'multi-word country names are not split on whitespace');
+
   const emptyList = await reserveProbe(
-    { candidateKey: 'allow-3', term: 'orderflow', country: 'US' },
+    { candidateKey: 'allow-5', term: 'orderflow', country: 'US' },
     { store, now, readSetting: settings({ discovery_probe_allowed_countries: ' ' }) }
   );
   assert.equal(emptyList.granted, false);
   assert.equal(emptyList.reason, PROBE_REASONS.countryNotAllowed);
+});
+
+test('budget reservations lock the UTC day and the all-time total separately', async () => {
+  const store = new MemoryProbeStore();
+  const result = await reserveProbe(
+    { candidateKey: 'budget-lock-1', term: 'orderflow', country: 'US' },
+    { store, now: () => new Date('2026-01-01T00:00:00.000Z'), readSetting: settings() }
+  );
+  assert.equal(result.granted, true);
+  assert.deepEqual(store.locks, ['2026-01-01T00:00:00.000Z', 'all-time']);
 });
 
 const HOUR_MS = 60 * 60 * 1000;

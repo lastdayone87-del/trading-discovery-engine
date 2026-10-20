@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
-import { shouldReactivateOperationalEnrichment, reactivateOperationalEnrichment } from './operationalEnrichmentRecovery';
+import {
+  reconcileOperationalEnrichmentRecovery,
+  shouldReactivateOperationalEnrichment,
+  reactivateOperationalEnrichment,
+} from './operationalEnrichmentRecovery';
 
 const base = (overrides: Record<string, unknown> = {}) => ({
   channel_id: 'channel-1',
@@ -55,6 +59,63 @@ test('operational enrichment recovery respects the 24-hour cooldown', () => {
   const decision = shouldReactivateOperationalEnrichment(base({ last_checked: '2026-08-23T12:00:00.000Z' }), Date.parse('2026-08-24T00:00:00.000Z'));
   assert.equal(decision.reactivate, false);
   assert.deepEqual(decision.reasonCodes, ['OPERATIONAL_RECOVERY_COOLDOWN_ACTIVE']);
+});
+
+test('runtime reconciliation selects only the latest relevant job, not an older failed one', () => {
+  const source = readFileSync(new URL('./operationalEnrichmentRecovery.ts', import.meta.url), 'utf8');
+  assert.match(source, /SELECT latest_job\.id, latest_job\.attempts, latest_job\.status, latest_job\.last_error/);
+  assert.match(source, /JOIN LATERAL \([\s\S]*?latest_job\.type IN\('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION'\)[\s\S]*?ORDER BY latest_job\.updated_at DESC/);
+  assert.match(source, /failed_job ON failed_job\.status='FAILED'/);
+});
+
+test('recovery enqueue and ledger write roll back together when the ledger write fails', async () => {
+  const channel = base({ channel_id: 'channel-tx', last_checked: '2026-08-20T00:00:00.000Z' });
+  const upserts: Array<Record<string, unknown>> = [];
+  const statements: string[] = [];
+  const pool = {
+    totalCount: 1,
+    query: async (sql: string) => {
+      statements.push(sql);
+      if (sql.includes('FROM channels c')) {
+        return {
+          rows: [{
+            channel_id: channel.channel_id,
+            failed_job_id: 'job-1',
+            failed_job_attempts: 2,
+            recovery_cycles: 0,
+          }],
+        };
+      }
+      throw new Error(`unexpected pool query: ${sql}`);
+    },
+    connect: async () => ({
+      query: async (sql: string) => {
+        statements.push(sql);
+        if (sql === 'BEGIN' || sql === 'ROLLBACK') return { rows: [] };
+        if (sql.includes('INSERT INTO operational_enrichment_recovery_events')) {
+          throw new Error('injected ledger failure');
+        }
+        return { rows: [] };
+      },
+      release: () => undefined,
+    }),
+  };
+
+  await assert.rejects(
+    reconcileOperationalEnrichmentRecovery(
+      async () => pool,
+      async () => channel as any,
+      async updated => { upserts.push(updated as unknown as Record<string, unknown>); },
+      async () => undefined,
+      20,
+      Date.now() + 120_000,
+    ),
+    /injected ledger failure/
+  );
+  assert.ok(statements.includes('BEGIN'));
+  assert.ok(statements.includes('ROLLBACK'));
+  assert.ok(!statements.includes('COMMIT'));
+  assert.equal(upserts.length, 2, 'reactivated channel is restored after the transaction fails');
 });
 
 test('runtime reconciliation admits confirmed trading rows and is null-safe for unresolved metadata', () => {

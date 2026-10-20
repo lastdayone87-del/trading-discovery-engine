@@ -229,6 +229,14 @@ export function canonicalCountry(value: string): string {
   return COUNTRY_ALIASES[normalized] || Object.keys(COUNTRY_SIGNALS).find(country => normalizeCountryName(country) === normalized) || value.trim();
 }
 
+/** True only for aliases/canonical names in the country vocabulary. */
+export function isKnownCountry(value: string): boolean {
+  const normalized = normalizeCountryName(value);
+  if (!normalized) return false;
+  if (COUNTRY_ALIASES[normalized]) return true;
+  return Object.keys(COUNTRY_SIGNALS).some(country => normalizeCountryName(country) === normalized);
+}
+
 /** Returns the authoritative two-letter alias for a canonical country identity, when configured. */
 export function countryIsoAlias(value: string): string | null {
   const canonical = canonicalCountry(value);

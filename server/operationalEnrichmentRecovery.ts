@@ -104,7 +104,11 @@ export async function projectProviderDeferredEnrichment(
   return projected;
 }
 
-export type EnqueueOperationalEnrichmentRecovery = (channel: ChannelRecord, reasonCodes: string[]) => Promise<void>;
+export type EnqueueOperationalEnrichmentRecovery = (
+  channel: ChannelRecord,
+  reasonCodes: string[],
+  client?: any
+) => Promise<void>;
 
 export const OPERATIONAL_ENRICHMENT_RECOVERY_POLICY_VERSION = 'operational-enrichment-recovery-v2';
 
@@ -148,6 +152,24 @@ async function insertOperationalEnrichmentRecoveryEvent(
   return (Number(inserted?.rowCount) || 0) > 0;
 }
 
+async function withRecoveryTransaction<T>(db: any, fn: (queryable: any) => Promise<T>): Promise<T> {
+  if (typeof db.connect !== 'function' || typeof db.totalCount !== 'number') {
+    return fn(db);
+  }
+  const connection = await db.connect();
+  try {
+    await connection.query('BEGIN');
+    const result = await fn(connection);
+    await connection.query('COMMIT');
+    return result;
+  } catch (error) {
+    await connection.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    connection.release?.();
+  }
+}
+
 export async function reconcileOperationalEnrichmentRecovery(
   getDb: () => Promise<any>,
   getChannelById: (id: string) => Promise<ChannelRecord | null>,
@@ -174,17 +196,16 @@ export async function reconcileOperationalEnrichmentRecovery(
                 AND cycle_event.event_key LIKE 'operational-enrichment:%') AS recovery_cycles
        FROM channels c
        JOIN LATERAL (
-         SELECT failed_job.id, failed_job.attempts
-           FROM jobs failed_job
-          WHERE failed_job.type='ENRICH_CHANNEL'
-            AND failed_job.status='FAILED'
-            AND (failed_job.last_error ILIKE 'OPERATIONALLY_BLOCKED_RETRY_REQUIRED:%'
-                 OR failed_job.last_error ILIKE 'Every configured YouTube provider is cooling down%'
-                 OR failed_job.last_error ILIKE 'YouTube API project pool is quota-exhausted%')
-            AND failed_job.payload->>'channelId'=c.channel_id
-          ORDER BY failed_job.updated_at DESC NULLS LAST, failed_job.created_at DESC NULLS LAST, failed_job.id DESC
+         SELECT latest_job.id, latest_job.attempts, latest_job.status, latest_job.last_error
+           FROM jobs latest_job
+          WHERE latest_job.type IN('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION')
+            AND latest_job.payload->>'channelId'=c.channel_id
+          ORDER BY latest_job.updated_at DESC NULLS LAST, latest_job.created_at DESC NULLS LAST, latest_job.id DESC
           LIMIT 1
-       ) failed_job ON true
+       ) failed_job ON failed_job.status='FAILED'
+          AND (failed_job.last_error ILIKE 'OPERATIONALLY_BLOCKED_RETRY_REQUIRED:%'
+               OR failed_job.last_error ILIKE 'Every configured YouTube provider is cooling down%'
+               OR failed_job.last_error ILIKE 'YouTube API project pool is quota-exhausted%')
       WHERE c.scan_status IN('FAILED','FAILED_PERMANENT','PROVIDER_DEFERRED')
         AND c.trading_status IS DISTINCT FROM 'NON_TRADING'
         AND c.trading_status IS DISTINCT FROM 'HUMAN_REJECTED'
@@ -242,23 +263,26 @@ export async function reconcileOperationalEnrichmentRecovery(
     if (!decision.reactivate) continue;
     const updated = reactivateOperationalEnrichment(channel, decision.reasonCodes, new Date(now).toISOString());
     await upsertChannel(updated);
+    let recorded = false;
     try {
-      await enqueueRecoveryJob(updated, decision.reasonCodes);
+      // Enqueue and ledger write share one transaction on the real pool: a
+      // failed ledger insert must not leave a reopened job that consumes a
+      // recovery cycle without a durable record (or vice versa).
+      recorded = await withRecoveryTransaction(db, async queryable => {
+        await enqueueRecoveryJob(updated, decision.reasonCodes, queryable);
+        return insertOperationalEnrichmentRecoveryEvent(
+          queryable,
+          operationalEnrichmentCycleEventKey(channel.channel_id, failedJobId, row.failed_job_attempts, recoveryCycles + 1),
+          channel.channel_id,
+          failedJobId,
+          channel.scan_status,
+          decision.reasonCodes
+        );
+      });
     } catch (error) {
       await upsertChannel(channel);
       throw error;
     }
-    // Record the cycle after the enqueue committed: a crash between the two
-    // leaves the channel reactivated with durable work (safe), and a concurrent
-    // duplicate collides on the event key instead of producing a second cycle.
-    const recorded = await insertOperationalEnrichmentRecoveryEvent(
-      db,
-      operationalEnrichmentCycleEventKey(channel.channel_id, failedJobId, row.failed_job_attempts, recoveryCycles + 1),
-      channel.channel_id,
-      failedJobId,
-      channel.scan_status,
-      decision.reasonCodes
-    );
     if (recorded) {
       bumpOperationalEnrichmentRecoveryEnqueued();
       console.info(JSON.stringify({event:'operational_enrichment_recovery_enqueued',channelId:channel.channel_id,failedJobId,cycle:recoveryCycles+1,maxRecoveryCycles:OPERATIONAL_ENRICHMENT_MAX_RECOVERY_CYCLES,reasonCodes:decision.reasonCodes,timestamp:new Date(now).toISOString()}));

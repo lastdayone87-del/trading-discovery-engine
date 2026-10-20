@@ -32,8 +32,6 @@ function baseline(overrides: Partial<EvidenceScreeningBaseline> = {}): EvidenceS
     country: 'Germany',
     catalogOk: true,
     catalogTerms: [],
-    stagedOk: true,
-    stagedCanonicalKeys: [],
     vocabOk: true,
     vocabLanguages: null,
     curatedTerms: [],
@@ -64,14 +62,10 @@ test('a missing vocabulary row is not the same as a failed vocabulary lookup', (
   assert.deepEqual(failed.reasons, [SCREENING_REASONS.BASELINE_LOOKUP_FAILED]);
 });
 
-test('catalog and staging lookup failures fail closed before any positive classification', () => {
+test('catalog lookup failure fails closed before any positive classification', () => {
   const noCatalog = screenEvidenceCandidate(candidate('Flux Orderflow Strategie'), baseline({ catalogOk: false }));
   assert.equal(noCatalog.decision, 'REJECT');
   assert.deepEqual(noCatalog.reasons, [SCREENING_REASONS.BASELINE_LOOKUP_FAILED]);
-
-  const noStaging = screenEvidenceCandidate(candidate('Flux Orderflow Strategie'), baseline({ stagedOk: false }));
-  assert.equal(noStaging.decision, 'REJECT');
-  assert.deepEqual(noStaging.reasons, [SCREENING_REASONS.BASELINE_LOOKUP_FAILED]);
 });
 
 test('country vocabulary language profile rejects explicit mismatches and passes matches', () => {
@@ -119,19 +113,18 @@ test('generic terms reject: domain generics, known instruments, curated vocabula
   assert.deepEqual([curated.decision, curated.reasons], ['REJECT', [SCREENING_REASONS.GENERIC_TERM]]);
 });
 
-test('duplicates against the catalog and staged staging keys reject deterministically', () => {
+test('catalog duplicates reject; an already-staged candidate remains eligible for a new observation', () => {
   const duplicateCatalog = screenEvidenceCandidate(
     candidate('Order Flow'),
     baseline({ catalogTerms: ['order flow'] })
   );
   assert.deepEqual([duplicateCatalog.decision, duplicateCatalog.reasons], ['REJECT', [SCREENING_REASONS.DUPLICATE_CATALOG]]);
 
-  const key = evidenceCandidateKeyForTerm(normalizeTerm('Order Flow'));
-  const duplicateStaged = screenEvidenceCandidate(
-    candidate('Order Flow'),
-    baseline({ stagedCanonicalKeys: [key] })
-  );
-  assert.deepEqual([duplicateStaged.decision, duplicateStaged.reasons], ['REJECT', [SCREENING_REASONS.DUPLICATE_STAGED]]);
+  // Staging is idempotent; an existing key must still accept a fresh
+  // provenance observation. Only intra-batch duplicates are rejected.
+  const alreadyStaged = screenEvidenceCandidate(candidate('Order Flow'), baseline());
+  assert.equal(alreadyStaged.decision, 'PROBE_ELIGIBLE');
+  assert.ok(alreadyStaged.reasons.includes(SCREENING_REASONS.PASS));
 });
 
 test('batches reject intra-batch duplicates after the first occurrence', () => {

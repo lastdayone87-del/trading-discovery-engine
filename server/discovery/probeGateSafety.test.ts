@@ -57,9 +57,14 @@ test('probe code never mutates the catalog, lifecycle, or serving tables', () =>
 test('probe code imports no HTTP client and no official YouTube API module', () => {
   for (const path of MODULES) {
     const stripped = code(read(path));
-    assert.doesNotMatch(stripped, /\bfetch\s*\(/, `${path} performs network fetches`);
-    assert.doesNotMatch(stripped, /youtubei\.js|crawlee|node:https?|axios/i, `${path} imports a network client`);
-    assert.doesNotMatch(stripped, /from '\.\.\/youtube'/, `${path} imports the official YouTube API module`);
+    assert.doesNotMatch(stripped, /\bfetch\s*\(|globalThis\.fetch/i, `${path} performs network fetches`);
+    assert.doesNotMatch(
+      stripped,
+      /youtubei\.js|crawlee|node:https?|axios|playwright|puppeteer|youtube-search-api/i,
+      `${path} imports a network client`
+    );
+    assert.doesNotMatch(stripped, /from\s+["']\.\.\/youtube["']/, `${path} imports the official YouTube API module`);
+    assert.doesNotMatch(stripped, /import\s*\(\s*["']\.\.\/youtube["']\s*\)/, `${path} dynamically imports the official YouTube API module`);
     assert.doesNotMatch(stripped, /searchYouTubeChannels|searchYouTubeChannelPage/, `${path} calls the official API`);
   }
 });
@@ -77,7 +82,7 @@ test('probe executor uses the existing InnerTube executor and ingestion pipeline
   assert.match(ledger, /discovery_probe_kill_switch/);
 });
 
-test('migration 146 is additive, flag-free, and enforces probe idempotency', () => {
+test('migration 147 is additive, flag-free, and enforces probe idempotency', () => {
   const stripped = code(read(MIGRATION));
   assert.doesNotMatch(stripped, /search_eligible/i);
   assert.doesNotMatch(stripped, /INSERT\s+INTO\s+app_settings/i);

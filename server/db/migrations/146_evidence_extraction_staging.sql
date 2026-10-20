@@ -1,4 +1,4 @@
--- Migration 145: Evidence-first discovery Phase 1 — staging domain widening.
+-- Migration 146: Evidence-first discovery Phase 1 — staging domain widening.
 --
 -- Recon gap found (plan §5 fallback): discovery_candidate_staging CHECK
 -- constraints from migration 112 only admit Brave-lane values, so the
@@ -22,19 +22,19 @@ ALTER TABLE discovery_candidate_staging
   DROP CONSTRAINT IF EXISTS discovery_candidate_staging_discovery_mode_check;
 ALTER TABLE discovery_candidate_staging
   ADD CONSTRAINT discovery_candidate_staging_discovery_mode_check
-  CHECK (discovery_mode IN ('DIRECT_YOUTUBE', 'EXTERNAL_OSINT', 'EVIDENCE_EXTRACTION'));
+  CHECK (discovery_mode IN ('DIRECT_YOUTUBE', 'EXTERNAL_OSINT', 'EVIDENCE_EXTRACTION')) NOT VALID;
 
 ALTER TABLE discovery_candidate_staging
   DROP CONSTRAINT IF EXISTS discovery_candidate_staging_resolution_status_check;
 ALTER TABLE discovery_candidate_staging
   ADD CONSTRAINT discovery_candidate_staging_resolution_status_check
-  CHECK (resolution_status IN ('PENDING', 'RESOLVED', 'FAILED', 'SKIPPED', 'EVIDENCE_ONLY'));
+  CHECK (resolution_status IN ('PENDING', 'RESOLVED', 'FAILED', 'SKIPPED', 'EVIDENCE_ONLY')) NOT VALID;
 
 ALTER TABLE discovery_candidate_staging
   DROP CONSTRAINT IF EXISTS discovery_candidate_staging_candidate_type_check;
 ALTER TABLE discovery_candidate_staging
   ADD CONSTRAINT discovery_candidate_staging_candidate_type_check
-  CHECK (candidate_type IN ('CHANNEL_ID', 'HANDLE', 'VIDEO_ID', 'EXTERNAL_EVIDENCE', 'SEARCH_TERM'));
+  CHECK (candidate_type IN ('CHANNEL_ID', 'HANDLE', 'VIDEO_ID', 'EXTERNAL_EVIDENCE', 'SEARCH_TERM')) NOT VALID;
 
 INSERT INTO discovery_provider_registry (
   provider_key, provider_family, provider_kind, capabilities, quota_domain,
@@ -42,5 +42,5 @@ INSERT INTO discovery_provider_registry (
 ) VALUES (
   'evidence_extraction', 'evidence', 'EVIDENCE',
   '["EXTRACT_METADATA_EVIDENCE"]'::jsonb, 'LOCAL_COMPUTE',
-  NULL, 'SHADOW', 0, 'system:migration-145'
+  NULL, 'SHADOW', 0, 'system:migration-146'
 ) ON CONFLICT (provider_key) DO NOTHING;

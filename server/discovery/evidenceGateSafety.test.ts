@@ -49,7 +49,7 @@ test('new discovery code never mutates the canonical catalog', () => {
 
 test('staging writer never emits the Brave pending resolution value', () => {
   const stripped = code(read('server/discovery/evidenceStaging.ts'));
-  assert.doesNotMatch(stripped, /'PENDING'/);
+  assert.doesNotMatch(stripped, /\bPENDING\b/);
   assert.match(stripped, /EVIDENCE_ONLY/);
 });
 
@@ -67,8 +67,12 @@ test('migration is additive, creates no flag row, and widens the required domain
 test('the extraction slice is flag-gated, fire-and-forget, and network-free', () => {
   for (const path of MODULES) {
     const stripped = code(read(path));
-    assert.doesNotMatch(stripped, /\bfetch\s*\(/, `${path} performs network fetches`);
-    assert.doesNotMatch(stripped, /node:https?|youtubei|crawlee/i, `${path} imports a network client`);
+    assert.doesNotMatch(stripped, /\bfetch\s*\(|globalThis\.fetch/i, `${path} performs network fetches`);
+    assert.doesNotMatch(
+      stripped,
+      /node:https?|youtubei|crawlee|playwright|puppeteer|youtube-search-api/i,
+      `${path} imports a network client`
+    );
   }
   const pipeline = code(read('server/discovery/evidencePipeline.ts'));
   assert.match(pipeline, /discovery_extraction_enabled/);
@@ -76,9 +80,10 @@ test('the extraction slice is flag-gated, fire-and-forget, and network-free', ()
 
   const ingestion = read('server/ingestionPipeline.ts');
   assert.match(ingestion, /import \{ maybeRunDiscoveryEvidenceExtraction \} from '\.\/discovery\/evidencePipeline'/);
-  const hookStart = ingestion.indexOf('void maybeRunDiscoveryEvidenceExtraction(');
+  const hookStart = ingestion.indexOf('maybeRunDiscoveryEvidenceExtraction({');
   assert.ok(hookStart >= 0, 'ingestion hook must call the runner fire-and-forget');
   const hookBlock = ingestion.slice(hookStart, ingestion.indexOf('const lowAudienceGate', hookStart));
   assert.match(hookBlock, /\.catch\(error/);
+  assert.match(ingestion, /discoveryExtractionTail/);
   assert.doesNotMatch(code(hookBlock), /search_eligible/i);
 });

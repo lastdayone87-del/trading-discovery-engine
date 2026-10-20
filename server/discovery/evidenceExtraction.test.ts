@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   EVIDENCE_EXTRACTION_VERSION,
+  MAX_CANDIDATES_PER_EXTRACTION,
   MAX_PROVENANCE_PER_CANDIDATE,
   evidenceCandidateKeyForTerm,
   evidenceCanonicalIdentity,
@@ -146,4 +147,62 @@ test('provenance is capped and candidates carry bounded frequency', () => {
 test('empty and malformed metadata never throws and yields no candidates', () => {
   assert.deepEqual(extractEvidenceCandidates({ channelId: 'UCempty' }), []);
   assert.deepEqual(extractEvidenceCandidates({ channelId: 'UCempty', videoTags: [], topicLabels: [] }), []);
+});
+
+test('n-grams never span punctuation boundaries', () => {
+  const candidates = extractEvidenceCandidates({
+    channelId: 'UCpunct',
+    description: 'order.flow and alpha-beta gamma',
+  });
+  assert.equal(byNormalized(candidates, 'order flow'), undefined);
+  assert.equal(byNormalized(candidates, 'alpha beta'), undefined);
+});
+
+test('trailing sentence punctuation is trimmed from hashtag and mention spans', () => {
+  const description = 'Follow #OrderFlow. and @SmartMoney, now';
+  const candidates = extractEvidenceCandidates({ channelId: 'UCtrim', description });
+  const hashtag = byNormalized(candidates, '#orderflow');
+  const mention = byNormalized(candidates, '@smartmoney');
+  assert.ok(hashtag);
+  assert.ok(mention);
+  const points = Array.from(description.normalize('NFC'));
+  for (const candidate of [hashtag!, mention!]) {
+    const span = candidate.provenance[0]?.textSpan;
+    assert.ok(span);
+    const slice = points.slice(span!.start, span!.end).join('');
+    assert.doesNotMatch(slice, /[.,;:!?]$/u);
+  }
+});
+
+test('explicitly empty structured videos suppress stale parallel title arrays', () => {
+  const candidates = extractEvidenceCandidates({
+    channelId: 'UCemptyvideos',
+    videos: [],
+    videoTitles: ['stale title must not be harvested'],
+    videoDescriptions: ['stale description must not be harvested'],
+  });
+  assert.deepEqual(candidates, []);
+});
+
+test('malformed non-array and non-object metadata is ignored without throwing', () => {
+  const candidates = extractEvidenceCandidates({
+    channelId: 'UCmalformed',
+    description: 42 as unknown as string,
+    channelHandle: 7 as unknown as string,
+    videoTags: 'not-an-array' as unknown as string[],
+    topicLabels: [null, 3] as unknown as string[],
+    videos: [null, 42] as unknown as Array<{ id: string; title: string; description: string }>,
+  });
+  assert.deepEqual(candidates, []);
+});
+
+test('candidate cap retains the most frequently observed signals', () => {
+  const videoTags = [
+    'repeated signal phrase',
+    'repeated signal phrase',
+    ...Array.from({ length: MAX_CANDIDATES_PER_EXTRACTION + 20 }, (_, index) => `uniqueterm${index}x`),
+  ];
+  const candidates = extractEvidenceCandidates({ channelId: 'UCcaporder', videoTags });
+  assert.equal(candidates.length, MAX_CANDIDATES_PER_EXTRACTION);
+  assert.ok(candidates.some(candidate => candidate.normalizedTerm === 'repeated signal phrase'));
 });

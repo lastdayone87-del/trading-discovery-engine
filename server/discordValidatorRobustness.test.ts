@@ -122,6 +122,25 @@ test('unexpected 404 provider failure becomes terminal at the observation ceilin
   assert.match(String(result.relevanceReason || ''), /bounded/);
 });
 
+test('unexpected 404s seen inside one call consume the same bounded observation budget', async () => {
+  let calls = 0;
+  const result = await validateDiscordInvite(
+    'internalfailures',
+    opts(
+      async () => {
+        calls += 1;
+        return json({ code: 50270, message: 'provider error' }, 404);
+      },
+      { maxAttempts: DISCORD_UNEXPECTED_404_BOUNDED_OBSERVATIONS },
+    ),
+  );
+  assert.equal(calls, DISCORD_UNEXPECTED_404_BOUNDED_OBSERVATIONS);
+  assert.equal(result.operationalOutcome, 'PROVIDER_FAILURE');
+  assert.equal(result.retryable, false);
+  assert.equal(result.validationStatus, 'FAILED_OPERATIONAL');
+  assert.match(String(result.relevanceReason || ''), /bounded/);
+});
+
 test('unknown-invite 10006 confirmation contract is unchanged by the bounded-404 policy', async () => {
   const result = await validateDiscordInvite(
     'deadcode1',

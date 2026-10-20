@@ -200,6 +200,7 @@ export async function validateDiscordInvite(inviteCode:string, options?:DiscordV
   const maxAttempts=Math.min(5,Math.max(1,options?.maxAttempts||3));
   const fetchImpl=options?.fetchImpl||fetch;
   const emit=options?.emitProviderEvent||appendProviderCallEvent;
+  let unexpectedNotFoundObservations=0;
   for(let attemptNumber=1;attemptNumber<=maxAttempts;attemptNumber++)try{
     const apiUrl=`https://discord.com/api/v9/invites/${encodeURIComponent(cleanCode)}?with_counts=true`;
     const res=await executeProviderCall({context:{provider:'discord',operation:'invite-lookup',attempt:attemptNumber},timeoutMs:Number(process.env.DISCORD_PROVIDER_TIMEOUT_MS||'15000'),enabled:process.env.PROVIDER_DEADLINES_ENABLED==='true',emit,call:signal=>fetchImpl(apiUrl,{signal,headers:{'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}})});
@@ -208,14 +209,16 @@ export async function validateDiscordInvite(inviteCode:string, options?:DiscordV
       const expectedInvalid=res.status===404&&discordErrorCode===10006;
       const prior=Math.max(0,options?.priorInvalidObservations||0);
       const priorProviderFailures=Math.max(0,options?.priorProviderFailureObservations||0);
-      // Bounded unexpected-404 policy: this response is the (prior+1)th in the
-      // durable series; at the budget ceiling it becomes terminal instead of
-      // re-arming RETRY_PENDING. Only the known unknown-invite 10006 code is
+      if(res.status===404&&!expectedInvalid)unexpectedNotFoundObservations++;
+      // Bounded unexpected-404 policy: count both durable prior observations
+      // and unexpected 404s already seen in THIS call. Otherwise internal
+      // retries could exceed the three-observation budget before the caller
+      // receives a terminal result. Only the known unknown-invite 10006 code is
       // exempt (that path has its own two-observation confirmation contract).
-      const boundedNotFoundExhausted=res.status===404&&!expectedInvalid&&priorProviderFailures+1>=DISCORD_UNEXPECTED_404_BOUNDED_OBSERVATIONS;
+      const boundedNotFoundExhausted=res.status===404&&!expectedInvalid&&priorProviderFailures+unexpectedNotFoundObservations>=DISCORD_UNEXPECTED_404_BOUNDED_OBSERVATIONS;
       const outcome:DiscordOperationalOutcome=expectedInvalid?(prior>=1?'CONFIRMED_INVALID':'INVALID_OBSERVED'):res.status===429?'RATE_LIMITED':[401,403].includes(res.status)?'AUTHENTICATION_FAILURE':res.status>=500?'PROVIDER_FAILURE':'PROVIDER_FAILURE';
       const retryable=outcome==='RATE_LIMITED'||(outcome==='PROVIDER_FAILURE'&&(res.status>=500||(res.status===404&&!boundedNotFoundExhausted)));
-      const reason=boundedNotFoundExhausted?`Discord invite lookup returned HTTP 404 (provider error ${discordErrorCode??'unknown'}) after ${priorProviderFailures+1} bounded observation(s); classified terminal`:outcome==='CONFIRMED_INVALID'?'Discord invalid-invite response was confirmed by a separate durable observation':outcome==='INVALID_OBSERVED'?'Discord reported an invalid invite; terminal confirmation is pending':`Discord invite lookup returned HTTP ${res.status}`;
+      const reason=boundedNotFoundExhausted?`Discord invite lookup returned HTTP 404 (provider error ${discordErrorCode??'unknown'}) after ${priorProviderFailures+unexpectedNotFoundObservations} bounded observation(s); classified terminal`:outcome==='CONFIRMED_INVALID'?'Discord invalid-invite response was confirmed by a separate durable observation':outcome==='INVALID_OBSERVED'?'Discord reported an invalid invite; terminal confirmation is pending':`Discord invite lookup returned HTTP ${res.status}`;
       const effectiveRetryable=outcome==='INVALID_OBSERVED'||retryable;
       attempts.push({attemptNumber,operationalOutcome:outcome,retryable:effectiveRetryable,httpStatus:res.status,providerErrorCode:discordErrorCode,responseContentType:res.headers.get('content-type')||undefined,reason,checkedAt:new Date().toISOString()});
       if(outcome==='CONFIRMED_INVALID')return result({status:'DEAD',confidence:100,inviteUrl:null,relevanceReason:reason,operationalOutcome:outcome,retryable:false,livenessStatus:'DEAD',relevanceStatus:'NOT_CHECKED',resolutionStatus:'RESOLVED',validationStatus:'COMPLETED'});

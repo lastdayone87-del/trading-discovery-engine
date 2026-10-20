@@ -1956,9 +1956,9 @@ export function operationalEnrichmentRecoveryKey(channelId:string):string{return
 export function buildOperationalEnrichmentRecoveryPayload(channel:Pick<ChannelRecord,'channel_id'|'channel_name'|'youtube_url'|'country'|'discovery_source'|'subscriber_count'|'channel_thumbnail_url'>,reasonCodes:string[]){
   return {channelId:channel.channel_id,targetCountry:channel.country,source:(channel.discovery_source||'recovery') as DiscoverySource,enrichmentStage:1,evidenceAction:'CHANNEL_RECENT_METADATA',candidate:{channelId:channel.channel_id,channelName:channel.channel_name,youtubeUrl:channel.youtube_url,locationTag:channel.country,description:'',videoTitles:[],channelLinks:[],subscriberCount:channel.subscriber_count,channelThumbnailUrl:channel.channel_thumbnail_url,enrichmentStage:1},recoveryReasonCodes:reasonCodes};
 }
-async function enqueueOperationalEnrichmentRecoveryJob(channel:ChannelRecord,reasonCodes:string[]):Promise<void>{
-  const job=await enqueueJob('ENRICH_CHANNEL',buildOperationalEnrichmentRecoveryPayload(channel,reasonCodes),{idempotencyKey:operationalEnrichmentRecoveryKey(channel.channel_id),priority:10,maxAttempts:4});
-  await (await getDb()).query(`UPDATE jobs SET first_transient_failure_at=NULL WHERE id=$1 AND status='PENDING'`,[job.id]);
+async function enqueueOperationalEnrichmentRecoveryJob(channel:ChannelRecord,reasonCodes:string[],clientOverride?:any):Promise<void>{
+  const job=await enqueueJob('ENRICH_CHANNEL',buildOperationalEnrichmentRecoveryPayload(channel,reasonCodes),{idempotencyKey:operationalEnrichmentRecoveryKey(channel.channel_id),priority:10,maxAttempts:4,clientOverride});
+  await (clientOverride||await getDb()).query(`UPDATE jobs SET first_transient_failure_at=NULL WHERE id=$1 AND status='PENDING'`,[job.id]);
 }
 
 /**

@@ -395,7 +395,7 @@ test('official route stays rejected through the executor', async () => {
     })
   );
   assert.equal(summary.skipped, true);
-  assert.equal(summary.reason, 'OFFICIAL_ROUTE_DISABLED');
+  assert.equal(summary.reason, 'OFFICIAL_ROUTE_NOT_IMPLEMENTED');
   assert.equal(retrieved, 0);
   assert.equal(store.rows.length, 0);
 });
