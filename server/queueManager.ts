@@ -1524,6 +1524,25 @@ export function resolveInspectionClickOffsets(value: unknown): Record<string, nu
   return Object.keys(offsets).length ? offsets : undefined;
 }
 
+/** Persist per-seed click progress on the currently processing retry job.
+ * Without this write the same durable attempt would reload its pre-run payload
+ * on failJob and re-click the same window; progress is attempt state, not only
+ * next-enqueue state. Best-effort and non-empty only: an empty map must never
+ * erase previously recorded progress. */
+export async function persistCommunityRetryClickOffsets(
+  jobId: string,
+  offsets: Record<string, number> | undefined,
+  clientOverride?: { query(sql: string, params?: unknown[]): Promise<unknown> },
+): Promise<void> {
+  const safe = resolveInspectionClickOffsets(offsets);
+  if (!jobId || !safe) return;
+  const db = clientOverride || await getDb();
+  await db.query(
+    `UPDATE jobs SET payload=payload || jsonb_build_object('clickOffsets',$2::jsonb),updated_at=now() WHERE id=$1 AND status='PROCESSING'`,
+    [jobId, JSON.stringify(safe)]
+  );
+}
+
 /**
  * Projects a live post-inspection country rejection onto the channel row.
  * Mutates and returns the same row: country_status REJECTED, detected
@@ -1744,8 +1763,15 @@ export async function inspectAndValidateChannel(
     });
     // Carry only controls this run actually examined into any retry directive.
     // A pre-click failure leaves the previous per-seed offsets unchanged, so
-    // the next attempt reuses the same window instead of skipping it.
+    // the next attempt reuses the same window instead of skipping it. The
+    // current retry job's payload is updated too: its remaining durable
+    // attempts reload that payload rather than going through enqueue again.
     if(inspection.retryDirective)inspection.retryDirective={...inspection.retryDirective,clickOffsets:inspection.nextClickOffsets};
+    if(executionMarker?.jobId&&inspection.nextClickOffsets&&Object.keys(inspection.nextClickOffsets).length){
+      await persistCommunityRetryClickOffsets(executionMarker.jobId,inspection.nextClickOffsets).catch(error=>{
+        console.warn(JSON.stringify({event:'community_retry_click_offsets_persist_failed',jobId:executionMarker.jobId,channelId:channel.channel_id,error:error instanceof Error?error.message:String(error),timestamp:new Date().toISOString()}));
+      });
+    }
     if(inspection.acquisitionOutcomes?.length)await appendExternalAcquisitionObservations(channel.channel_id,inspection.acquisitionOutcomes)
       .catch(error=>console.warn(`[ExternalAcquisition] observational write failed for ${channel.channel_id}:`,error instanceof Error?error.message:error));
 

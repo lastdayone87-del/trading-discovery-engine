@@ -26,7 +26,7 @@ import {
   SITE_INSPECTION_RETRYABLE_FAILURE_TTL_MS,
   type CachedSiteInspection,
 } from './siteInspectionCache';
-import { admitInspectionDiscordCandidates, drainOrphanDiscordCandidates, inspectionClickOffsetForRetry, nextDiscordDuplicateOwnerChannelId, projectNotFoundAfterInspection } from './queueManager';
+import { admitInspectionDiscordCandidates, drainOrphanDiscordCandidates, inspectionClickOffsetForRetry, nextDiscordDuplicateOwnerChannelId, persistCommunityRetryClickOffsets, projectNotFoundAfterInspection } from './queueManager';
 import { nextRenderedClickOffsets } from './inspector';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -239,6 +239,21 @@ test('gap retries advance only by controls actually examined', () => {
   assert.match(queue, /scanAttempts: inspectionClickOffsetForRetry\(channel\.scan_attempts, executionMarker\)/);
   assert.match(queue, /clickOffsets: executionMarker\?\.isRetryOwnedReacquire \? resolveInspectionClickOffsets\(executionMarker\.clickOffsets\) : undefined/);
   assert.match(readSource('inspector.ts'), /clickOffset:renderedClickOffsetForSeed\(item\.url\)/);
+});
+
+test('processing retry jobs persist click progress for their remaining attempts', async () => {
+  const queries: Array<{ sql: string; params?: unknown[] }> = [];
+  await persistCommunityRetryClickOffsets('job-click', { 'https://creator.test/': 4 }, {
+    query: async (sql, params) => { queries.push({ sql, params }); return { rowCount: 1 }; },
+  });
+  assert.equal(queries.length, 1);
+  assert.match(queries[0].sql, /payload=payload \|\| jsonb_build_object\('clickOffsets'/);
+  assert.deepEqual(JSON.parse(String(queries[0].params?.[1])), { 'https://creator.test/': 4 });
+  await persistCommunityRetryClickOffsets('job-click', {}, {
+    query: async (sql, params) => { queries.push({ sql, params }); return { rowCount: 1 }; },
+  });
+  assert.equal(queries.length, 1, 'empty progress never clears the existing payload map');
+  assert.match(readSource('queueManager.ts'), /persistCommunityRetryClickOffsets\(executionMarker\.jobId,inspection\.nextClickOffsets\)/);
 });
 
 test('E6: orphan drain re-admits claimable orphans and removes foreign-owned residue', async () => {
