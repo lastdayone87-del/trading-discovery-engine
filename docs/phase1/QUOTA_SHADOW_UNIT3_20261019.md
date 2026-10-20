@@ -1,9 +1,9 @@
 # Unit 3 — 9,000-unit/key/day quota cap (shadow evidence + default-OFF enforcement)
 
 Date: 2026-10-19 (updated 2026-10-20) · Shadow branch `phase1-hardening` head
-`64d83fb`; hard-cap branch `feat/youtube-key-hard-cap` head `c7f66dc`.
-Evidence runs: shadow [39490594873](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39490594873),
-hard cap [39497257438](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39497257438).
+`3c53e57`; hard-cap branch `feat/youtube-key-hard-cap` code head `5ecd905`.
+Evidence runs: shadow [39500041358](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39500041358),
+hard cap [39501810518](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39501810518).
 
 Status: the migration-148 shadow implementation is historical evidence. The
 hard-cap implementation on `feat/youtube-key-hard-cap` is **implemented but
@@ -22,7 +22,7 @@ hard-cap branch is rebased on the resulting tree and includes migrations
 | `server/quotaKeyCapShadow.ts` | Config, projection, classification, locking, dedupe, sweeps, savepoint settlement; default-OFF hard reservation/settlement |
 | `server/youtube.ts` (~line 438) | Dispatch hook: in-flight lease + projection observation for the dispatched key |
 | `server/dbCore.ts` (`incrementQuota`) | Settlement hook: releases one matching lease exactly once |
-| `server/quotaKeyCapShadow.test.ts` | 26 unit tests (17 shadow/operation + 9 hard-cap cases) |
+| `server/quotaKeyCapShadow.test.ts` | 27 unit tests (18 shadow/operation + 9 hard-cap cases) |
 | `server/quotaKeyCapShadow.postgres.test.ts` | PostgreSQL suite (dedicated-DB gated) |
 | `scripts/quota_shadow_replay.ts` | Offline 3-day CSV replay |
 | `.github/workflows/phase1-quota-shadow-tests.yml` | CI: tsc + unit tests + postgres:17 full lineage |
@@ -156,8 +156,8 @@ main's 145.
 
 ## Hard-cap enforcement (default OFF) — implementation on `feat/youtube-key-hard-cap`
 
-Date: 2026-10-20 · Branch `feat/youtube-key-hard-cap` head `c7f66dc`, based on
-PR #531 head `64d83fb` after the external #530 merge `6267ba1` · Status:
+Date: 2026-10-20 · Branch `feat/youtube-key-hard-cap` code head `5ecd905`, based on
+PR #531 head `3c53e57` after the external #530 merge `6267ba1` · Status:
 **implemented, disabled by default, not deployed, not enabled.** Production
 remains unchanged and no migration has been applied to it.
 
@@ -271,8 +271,8 @@ rejected); settlement failure leaving the conservative lease; Pacific midnight
 two probe-budget concurrency cases.
 
 CI results for `9f6001a` (run
-https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39497257438):
-`npx tsc --noEmit` clean; **50/50 unit** (26 quota cap + 9 dbCore quota +
+https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39501810518):
+`npx tsc --noEmit` clean; **51/51 unit** (27 quota cap + 9 dbCore quota +
 15 probe executor) and **21/21 PostgreSQL**, 0 skipped. Local PostgreSQL was not
 available on this host; the postgres:17 CI service is the database proof. No
 enforcement claim is made from shadow observations, and this run did not enable
