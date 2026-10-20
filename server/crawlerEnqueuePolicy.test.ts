@@ -141,7 +141,7 @@ test('static exploration bound is 12 with destination-budget drop accounting', (
   for (const marker of [
     "countUnique('invalid-protocol'",
     "shouldFollowDestination(",
-    'createDestinationBudget()',
+    'createDestinationBudget({seedUrl:page.finalUrl})',
     "drops.count('destination-budget')",
     "seedCeiling??='exploration-limit'",
     "drops.count('duplicate'",
