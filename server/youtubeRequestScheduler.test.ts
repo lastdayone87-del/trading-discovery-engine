@@ -149,6 +149,13 @@ test('youtubeFetch always bounds the scheduler head request', () => {
   assert.doesNotMatch(youtubeFetch, /provider_deadlines_enabled|PROVIDER_DEADLINES_ENABLED/);
 });
 
+test('youtubeFetch never awaits shadow accounting before the official fetch', () => {
+  const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));
+  assert.match(youtubeFetch, /void \(async\(\)=>\{[\s\S]*?recordShadowDispatchSafe[\s\S]*?\}\)\(\);/);
+  assert.doesNotMatch(youtubeFetch, /await recordShadowDispatchSafe\(\s*\{readSetting:getAppSetting,pool:await getDb\(\)\}/);
+});
+
 test('youtubeFetch reselects from the live provider pool at dispatch and clears the actual provider history on success', () => {
   const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
   const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));

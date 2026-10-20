@@ -440,10 +440,22 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
           // record an in-flight lease plus any projected WOULD_DEFER/
           // WOULD_REJECT for the 9,000-unit/day per-key cap. Disabled by
           // default; every failure is swallowed inside the helper.
-          await recordShadowDispatchSafe(
-            {readSetting:getAppSetting,pool:await getDb()},
-            {keyFingerprint:fingerprintYouTubeKey(dispatchedProviderKey),operationId:`shadow:${operation}:${randomUUID()}`,units:actualCost}
-          );
+          //
+          // Fire-and-forget is deliberate. The provider deadline starts
+          // before this callback runs, and the shadow path can wait on the
+          // setting read, pool acquisition, sweep, and advisory lock. Awaiting
+          // it here lets a slow database consume the official request's
+          // deadline before fetch() is even called. Observation is optional;
+          // the real request is not.
+          void (async()=>{
+            try{
+              const pool=await getDb();
+              await recordShadowDispatchSafe(
+                {readSetting:getAppSetting,pool},
+                {keyFingerprint:fingerprintYouTubeKey(dispatchedProviderKey),operationId:`shadow:${operation}:${randomUUID()}`,units:actualCost}
+              );
+            }catch{/* shadow accounting is observational only */}
+          })();
         }
         let response: Response;
         try {

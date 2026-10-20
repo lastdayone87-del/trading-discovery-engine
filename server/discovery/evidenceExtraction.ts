@@ -118,21 +118,27 @@ export interface EvidenceExtractionInput {
 /**
  * Boundary stopwords for n-gram segmentation (segment split, not rejection).
  * Deliberately small, multilingual, and data-independent.
+ *
+ * Single-character words stay in this set (and in the token stream): the
+ * tokenizer must not drop them before segmentation. Otherwise `alpha a beta`
+ * becomes the fabricated term `alpha beta`, and Spanish `y` / Portuguese `e`
+ * silently merge unrelated phrases.
  */
 export const NGRAM_STOPWORDS: ReadonlySet<string> = new Set([
   'a', 'an', 'and', 'are', 'as', 'at', 'be', 'but', 'by', 'can', 'for', 'from',
-  'had', 'has', 'have', 'he', 'her', 'his', 'how', 'in', 'is', 'it', 'its',
+  'had', 'has', 'have', 'he', 'her', 'his', 'how', 'i', 'in', 'is', 'it', 'its',
   'not', 'of', 'on', 'or', 'our', 'out', 'she', 'that', 'the', 'their', 'them',
   'this', 'to', 'was', 'we', 'were', 'what', 'when', 'where', 'which', 'who',
   'will', 'with', 'you', 'your',
   'le', 'la', 'les', 'un', 'une', 'des', 'du', 'de', 'et', 'pour', 'avec',
   'vous', 'votre', 'mon', 'ma', 'mes', 'au', 'aux', 'en', 'par', 'sur', 'ce',
   'cette', 'ces', 'dans', 'est', 'sont', 'nous', 'je', 'tu', 'il', 'elle',
+  'à',
   'der', 'die', 'das', 'und', 'für', 'mit', 'ihr', 'ihre', 'dein', 'deine',
   'von', 'zu', 'im', 'ist', 'sind', 'auf', 'als', 'ein', 'eine', 'einen',
   'el', 'los', 'las', 'una', 'del', 'y', 'para', 'con', 'tu', 'su', 'por',
-  'como', 'más', 'mas', 'es', 'son', 'se', 'nos',
-  'o', 'os', 'as', 'um', 'uma', 'do', 'da', 'dos', 'das', 'e', 'com', 'seu',
+  'como', 'más', 'mas', 'es', 'son', 'se', 'nos', 'u',
+  'o', 'os', 'as', 'um', 'uma', 'do', 'da', 'dos', 'das', 'e', 'é', 'è', 'com', 'seu',
   'sua', 'são', 'sao', 'não', 'nao', 'você', 'voce',
   'il', 'lo', 'gli', 'di', 'per', 'che', 'non', 'sono',
 ]);
@@ -188,7 +194,10 @@ function tokenizeWithCodePointOffsets(text: string): Token[] {
     const start = index;
     while (index < points.length && WORD_POINT.test(points[index])) index += 1;
     const tokenText = points.slice(start, index).join('');
-    if (Array.from(tokenText).length < 2) continue;
+    // Keep single-character tokens here. They may be stopword boundaries
+    // (a/y/e/o/u/i/à/é/è) or meaningful one-letter identifiers; either way,
+    // dropping them before segmenting fabricates cross-boundary n-grams.
+    // The final candidate-length check still rejects a one-character term.
     tokens.push({ text: tokenText, normalized: normalizeTerm(tokenText), start, end: index });
   }
   return tokens;
