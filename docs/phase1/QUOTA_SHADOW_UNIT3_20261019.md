@@ -1,8 +1,8 @@
 # Unit 3 — 9,000-unit/key/day quota cap, shadow mode only
 
-Date: 2026-10-19 · Branch: `phase1-hardening` · Implementation SHA: `c0d8318`
-(CI/test follow-ups `b62c45a`, `ef7b4c0`, `a664f78`, `3be3202`; CI green run:
-https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39325618390)
+Date: 2026-10-19 (updated 2026-10-20) · Branch: `phase1-hardening` · Implementation SHA: `f3e5f43`
+(round-1 review fixes; CI green run:
+https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39481878389)
 
 Scope: observational shadow accounting for a projected per-key YouTube daily
 cap of **9,000 units**. Hard enforcement, key configuration changes and any
@@ -16,10 +16,11 @@ change to official API traffic remain gated on explicit operator approval.
 | `server/quotaKeyCapShadow.ts` | Config, projection, classification, locking, dedupe, sweeps, savepoint settlement |
 | `server/youtube.ts` (~line 438) | Dispatch hook: in-flight lease + projection observation for the dispatched key |
 | `server/dbCore.ts` (`incrementQuota`) | Settlement hook: releases one matching lease exactly once |
-| `server/quotaKeyCapShadow.test.ts` | 12 unit tests |
-| `server/quotaKeyCapShadow.postgres.test.ts` | PostgreSQL suite (dedicated-DB gated) |
+| `server/quotaKeyCapShadow.test.ts` | 14 shadow unit tests |
+| `server/quotaKeyCapShadow.postgres.test.ts` | 8 PostgreSQL shadow cases (dedicated-DB gated) |
+| `server/discovery/probeLedger.postgres.test.ts` | 2 PostgreSQL probe-budget concurrency cases |
 | `scripts/quota_shadow_replay.ts` | Offline 3-day CSV replay |
-| `.github/workflows/phase1-quota-shadow-tests.yml` | CI: tsc + unit tests + postgres:17 full lineage |
+| `.github/workflows/phase1-quota-shadow-tests.yml` | CI: tsc + quota/probe unit tests + postgres:17 full lineage |
 
 ## Inertness guarantees (verified)
 
@@ -57,9 +58,12 @@ PostgreSQL tests.
 (duplicate accounting impossible), carry a TTL (default 120 s), are excluded
 from projections once expired, and are swept on first use after a restart and
 at most once per minute. The projection excludes the current operation's own
-lease so an idempotent replay cannot count itself. Settlement is best-effort
-and removes one matching lease; a lease written after settlement (because the
-dispatch hook is fire-and-forget) remains observational until its TTL expires.
+lease so an idempotent replay cannot count itself. In this shadow-only branch,
+settlement is best-effort and matches by day/key/units; a cross-midnight or
+equal-cost ambiguity can therefore leave a lease until its TTL expires, and a
+lease written after settlement (fire-and-forget dispatch) is observational
+until the TTL. The separate hard-cap branch carries the exact operation
+identity and dispatch day, so enforced settlement is exact.
 
 Events are retained for **30 days** (created-at index); an enabled process
 sweeps older rows at most once every six hours. Disabled shadow mode writes no
@@ -67,19 +71,19 @@ rows and runs no sweeps.
 
 ## Test evidence
 
-- Unit (local, `node --import tsx --test server/quotaKeyCapShadow.test.ts`):
-  **12/12 pass**; `npx tsc --noEmit` clean.
+- Unit (CI, `server/quotaKeyCapShadow.test.ts` + `server/discovery/probeExecutor.test.ts`):
+  **28/28 pass, 0 skipped**; `npx tsc --noEmit` clean.
 - PostgreSQL (CI postgres:17, full migration lineage via `runMigrations.ts`,
-  includes 148): **8/8 pass, 0 skipped** — boundary, defer, duplicate
-  accounting, 20-way concurrency (10 admitted / 10 `WOULD_REJECT`, no skips),
-  stale-lease sweep + restart recovery, settlement release
-  (run https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39325618390).
-- Existing quota suites (local): 65/68 pass. The 3 failures are in
-  `server/quotaRecovery.test.ts` and reproduce identically on the pristine
-  commit `17002fb` (branch is 17 behind `origin/main`); they are pre-existing
-  and will be rechecked after the Unit 4 rebase.
-- Rollback proof fix: the 146/147 workflow now excludes migration 148
-  (`pre_state_max_version` regression on `c0d8318`), green on `b62c45a`/`ef7b4c0`.
+  includes 148): **10/10 pass, 0 skipped** — 8 shadow cases (boundary, defer,
+  duplicate accounting, 20-way concurrency, stale-lease sweep + restart,
+  settlement) and 2 probe-budget cases (different candidates on one day, and
+  different days against the absolute total cap).
+  Run https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39481878389.
+- Rollback proof at `f3e5f43`: **pass**, pre-state 145, zero schema/constraint
+  drift (run https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39481878050).
+- All other workflows at `f3e5f43` are green. The PR Agent workflow failed on
+  an invalid Gemini API key (`API_KEY_INVALID`), an infrastructure failure, not
+  a code finding.
 
 ## Three-day replay (2026-10-16 → 2026-10-18, America/Los_Angeles)
 
@@ -111,6 +115,9 @@ Hard-enforcement semantics: blocked calls are not counted as executed.
 
 - Advisory-lock timeout skips are the only accounted observation gap; zero
   skips were observed in CI (20-way contention at 3 s budget).
+- Shadow settlement is not operation-exact in this branch; equal-cost or
+  cross-midnight ambiguity is bounded by the 120 s lease TTL. The hard-cap
+  branch settles by exact operation ID and dispatch day.
 - Replay models SUCCESS rows only; failures were excluded rather than modeled
   as expiring reservations.
 - The shadow does not retroactively detect past-cap usage; it only records

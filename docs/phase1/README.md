@@ -1,6 +1,6 @@
 # Phase 1 — durable source of truth
 
-Last updated: 2026-10-20. This directory is the durable index for the Phase 1
+Last updated: 2026-10-20 (post-round-1). This directory is the durable index for the Phase 1
 discovery work. It records decisions and evidence, not deployment state. When a
 document and a live system disagree, the live system wins and the document must
 be corrected.
@@ -9,13 +9,13 @@ be corrected.
 
 | Item | State |
 | --- | --- |
-| PR #531 (migrations 146/147 + discovery hardening) | Open; fixes committed on `phase1-hardening`; CI and review round 1 pending |
-| Migration 148 (quota lease/event storage) | In PR #531 lineage; not applied to production |
-| Hard cap (9,000 units/key/Pacific day) | Implemented on `feat/youtube-key-hard-cap`; **default OFF, not deployed, not enabled** |
+| PR #531 (migrations 146/147/148 + discovery hardening) | Open; head `f3e5f43`; all code workflows green; round-1 fixes pushed; round-2 review pending. PR Agent is failing only on `API_KEY_INVALID` (tooling), not code |
+| Migration 148 (quota lease/event storage) | In PR #531 lineage; applied only to disposable CI databases; **not** applied to production |
+| Hard cap (9,000 units/key/Pacific day) | Implemented on `feat/youtube-key-hard-cap` head `33d2f3f`; CI run [39485338052](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39485338052) green (46/46 unit, 20/20 PostgreSQL); **default OFF, not deployed, not enabled** |
 | InnerTube production use | **Not authorized** — see [INNERTUBE_POLICY_POSITION_20261020.md](INNERTUBE_POLICY_POSITION_20261020.md) |
-| Probe pilot | **Not runnable** while the InnerTube position is unresolved; limits below |
+| Probe pilot | **Not runnable** while the InnerTube position is unresolved; limits below. No probe has been run |
 | GCP key-suspension investigation | **Open / access-blocked** — see [GCP_SUSPENSION_DIAGNOSTIC_20261020.md](GCP_SUSPENSION_DIAGNOSTIC_20261020.md) |
-| Merge / deploy / migration apply / flag changes / probes | **Not approved**; stop before any of these |
+| Merge / deploy / migration apply / flag changes / probes | **Not approved**; stop before any of these. Shadow/CI evidence is not production proof |
 
 ## Documents
 
