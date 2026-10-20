@@ -58,7 +58,8 @@ test('Channels Table API and UI preserve the default exclusion and explicit filt
   const db = fs.readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
   const table = fs.readFileSync(new URL('../src/components/ResultsTable.tsx', import.meta.url), 'utf8');
   assert.match(server, /scanStatus:req\.query\.scan_status as string\|undefined/);
-  assert.match(db, /SELECT \$\{columns\} FROM channels WHERE \$\{where\} ORDER BY first_seen DESC,channel_id LIMIT/);
+  assert.match(db, /const orderBy=args\.recentInvites\?RECENT_INVITE_ORDER_SQL:'first_seen DESC,channel_id'/);
+  assert.match(db, /SELECT \$\{columns\} FROM channels WHERE \$\{where\} ORDER BY \$\{orderBy\} LIMIT/);
   assert.match(db, /SELECT COUNT\(\*\)::int total,MAX\(updated_at\) revision FROM channels WHERE \$\{where\}/);
   assert.match(db, /getChannelListingRevision[\s\S]+channelListingWhere\(db,args\)/);
   assert.match(table, /selectedScanStatus === 'SKIPPED_LOW_AUDIENCE' \|\| c\.scan_status !== 'SKIPPED_LOW_AUDIENCE'/);

@@ -7,6 +7,8 @@
  * pending-candidate map so a second writer cannot erase an unclaimed invite.
  * Migration 151 adds the inert shadow-cap settlement fence so a late
  * observation cannot recreate a lease or a false cap event.
+ * Migration 152 adds the nullable Discord first-validation timestamp and
+ * backfills it only from successful append-only check attempts.
  * These assertions are intentionally textual: they pin the exact additive
  * shape so a later edit cannot silently turn the migration destructive or
  * rename a column the code depends on.
@@ -20,16 +22,30 @@ const migrationsDir = fileURLToPath(new URL('./db/migrations/', import.meta.url)
 const migration = readFileSync(`${migrationsDir}149_discovery_integrity_state.sql`, 'utf8');
 const pendingClaimsMigration = readFileSync(`${migrationsDir}150_site_inspection_pending_claims.sql`, 'utf8');
 const shadowSettlementMigration = readFileSync(`${migrationsDir}151_youtube_key_cap_shadow_settled.sql`, 'utf8');
+const firstValidatedMigration = readFileSync(`${migrationsDir}152_discord_candidate_first_validated.sql`, 'utf8');
 const dbCore = readFileSync(fileURLToPath(new URL('./dbCore.ts', import.meta.url)), 'utf8');
 const siteCache = readFileSync(fileURLToPath(new URL('./siteInspectionCache.ts', import.meta.url)), 'utf8');
 const rollbackProof = readFileSync(fileURLToPath(new URL('../.github/workflows/phase1-rollback-proof.yml', import.meta.url)), 'utf8');
 
-test('migration 151 is present and sorts after every earlier migration', () => {
+test('migration 152 is present and sorts after every earlier migration', () => {
   const files = readdirSync(migrationsDir).filter(name => name.endsWith('.sql')).sort();
   assert.ok(files.includes('149_discovery_integrity_state.sql'));
   assert.ok(files.includes('150_site_inspection_pending_claims.sql'));
   assert.ok(files.includes('151_youtube_key_cap_shadow_settled.sql'));
-  assert.equal(files[files.length - 1], '151_youtube_key_cap_shadow_settled.sql', '151 is the newest migration');
+  assert.ok(files.includes('152_discord_candidate_first_validated.sql'));
+  assert.equal(files[files.length - 1], '152_discord_candidate_first_validated.sql', '152 is the newest migration');
+});
+
+test('migration 152 records and backfills only successful Discord validation time', () => {
+  assert.match(firstValidatedMigration, /ALTER TABLE discord_candidates ADD COLUMN IF NOT EXISTS first_validated_at TIMESTAMPTZ;/);
+  assert.match(firstValidatedMigration, /operational_outcome='SUCCEEDED'/);
+  assert.match(firstValidatedMigration, /MIN\(checked_at\)/);
+  assert.match(firstValidatedMigration, /GROUP BY channel_id, lower\(COALESCE\(resolved_locator, invite_locator\)\)/);
+  assert.match(firstValidatedMigration, /dc\.normalized_locator=successful_validation\.normalized_locator/);
+  assert.match(firstValidatedMigration, /dc\.first_validated_at IS NULL OR dc\.first_validated_at > successful_validation\.first_validated_at/);
+  assert.match(firstValidatedMigration, /LEAST\(COALESCE\(first_validated_at,NEW\.checked_at\),NEW\.checked_at\)/);
+  assert.doesNotMatch(firstValidatedMigration, /discovered_at\s*\)?\s*AS\s+first_validated_at/i, 'discovery time is never used as confirmation time');
+  assert.doesNotMatch(firstValidatedMigration, /discord_invite_registry[\s\S]*first_validated_at/i, 'registry first-seen time is never used as confirmation time');
 });
 
 test('migration 151 adds only the inert shadow settlement fence', () => {

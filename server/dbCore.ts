@@ -367,6 +367,7 @@ export function rowToChannel(row: any): ChannelRecord {
     confidence_score: row.confidence_score || 0,
     discord_status: row.discord_status,
     discord_invite: row.discord_invite || null,
+    discord_invite_first_validated_at: iso(row.discord_invite_first_validated_at),
     scan_status: row.scan_status,
     scan_attempts: row.scan_attempts || 0,
     discovery_source: row.discovery_source,
@@ -490,7 +491,35 @@ export async function listRejectedChannelDiagnostics(
   return res.rows.map(rowToChannel);
 }
 
-export interface ChannelListingFilter {includeRejected?:boolean;diagnosticsOnly?:boolean;search?:string;country?:string;countryStatus?:string;tradingStatus?:string;discordStatus?:string;scanStatus?:string}
+export interface ChannelListingFilter {includeRejected?:boolean;diagnosticsOnly?:boolean;search?:string;country?:string;countryStatus?:string;tradingStatus?:string;discordStatus?:string;scanStatus?:string;recentInvites?:boolean}
+/** The recently-confirmed view is an intersection, never a replacement: the
+ * selected Discord category still applies, and every row must have a live
+ * invite that was successfully validated. NOT_FOUND, PENDING, UNCERTAIN, DEAD,
+ * duplicate-owned, and otherwise unconfirmed rows are excluded. NON_TRADING is
+ * retained so the existing category remains independently selectable; its
+ * invite is normally withheld by the projection. */
+export const CONFIRMED_DISCORD_INVITE_SQL = `discord_invite IS NOT NULL
+  AND discord_validation_status IN ('SUCCEEDED','COMPLETED')
+  AND discord_liveness_status='ACTIVE'
+  AND discord_discovery_status='VALIDATED'
+  AND discord_status IN ('ACTIVE','ACTIVE_LOW_VOLUME','NON_TRADING')
+  AND discord_duplicate_owner_channel_id IS NULL`;
+/** Correlation-safe confirmation timestamp for the channel's selected
+ * candidate. The column is only populated from a successful check attempt; a
+ * NULL result is rendered as an explicitly unavailable date, never guessed. */
+export const DISCORD_INVITE_FIRST_VALIDATED_SQL = `(SELECT dc.first_validated_at
+    FROM discord_candidates dc
+   WHERE dc.channel_id=channels.channel_id
+     AND (
+       (channels.discord_candidate_id IS NOT NULL AND dc.candidate_id=channels.discord_candidate_id)
+       OR (channels.discord_candidate_id IS NULL AND dc.normalized_locator=lower(COALESCE(channels.discord_candidate_locator,channels.discord_invite)))
+     )
+     AND dc.candidate_status='VALIDATED'
+     AND dc.validation_status='COMPLETED'
+     AND dc.liveness_status='ACTIVE'
+   ORDER BY dc.selected DESC,dc.first_validated_at DESC NULLS LAST
+   LIMIT 1)`;
+export const RECENT_INVITE_ORDER_SQL = 'discord_invite_first_validated_at DESC NULLS LAST,channel_id DESC';
 // This is the single definition of the operator-visible discovery corpus. Keep
 // both the paginated listing and dashboard aggregates anchored to this policy.
 // The NOT EXISTS check makes policy changes effective immediately, even for a
@@ -561,6 +590,7 @@ export function buildChannelListingWhere(defaultServing:{predicate:string;scope:
   add('country',args.country); add('country_status',args.countryStatus); add('trading_status',args.tradingStatus);
   if(args.discordStatus==='INVITE_OWNED_BY_ANOTHER_CHANNEL')clauses.push('discord_duplicate_owner_channel_id IS NOT NULL');
   else add('discord_status',args.discordStatus);
+  if(args.recentInvites)clauses.push(CONFIRMED_DISCORD_INVITE_SQL);
   if(args.scanStatus==='SKIPPED_LOW_AUDIENCE'){
     values.push(args.scanStatus);
     clauses.push(`(scan_status=$${values.length} OR ${KNOWN_LOW_AUDIENCE_SQL})`);
@@ -575,6 +605,7 @@ export async function listChannelsPage(args:ChannelListingFilter&{limit:number;o
   const db=await getDb(); const limit=Math.min(250,Math.max(1,args.limit)); const offset=Math.max(0,args.offset);
   const {where,values}=await channelListingWhere(db,args);
   const columns=`channel_id,channel_name,youtube_url,country,country_status,scope_eligibility,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,inspection_trail,subscriber_count,channel_thumbnail_url,quality_score,trading_status,trading_confidence_score,trading_category,country_metadata_status,country_metadata_checked_at,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,community_discovery_status,community_intents,discord_duplicate_owner_channel_id,
+    ${DISCORD_INVITE_FIRST_VALIDATED_SQL} AS discord_invite_first_validated_at,
     (SELECT COUNT(*)::int FROM discord_candidates dc WHERE dc.channel_id=channels.channel_id) candidate_count,
     COALESCE((SELECT jsonb_agg((to_jsonb(dc) || jsonb_build_object('display_locator', (SELECT COALESCE(a.resolved_locator, a.invite_locator) FROM discord_check_attempts a WHERE a.channel_id=dc.channel_id AND lower(COALESCE(a.resolved_locator, a.invite_locator))=dc.normalized_locator ORDER BY a.checked_at DESC LIMIT 1))) ORDER BY dc.selected DESC,dc.last_checked DESC NULLS LAST,dc.discovered_at) FROM discord_candidates dc WHERE dc.channel_id=channels.channel_id AND dc.candidate_status='VALIDATED' AND dc.validation_status='COMPLETED' AND dc.liveness_status='ACTIVE'),'[]'::jsonb) discord_candidates,
     (SELECT status FROM jobs WHERE type='POST_APPROVAL_ENRICH' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) post_approval_job_status,
@@ -597,8 +628,9 @@ export async function listChannelsPage(args:ChannelListingFilter&{limit:number;o
     (SELECT COALESCE(payload->>'reconciliationStatus','NONE') FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) community_retry_job_reconciliation_status,
     (SELECT payload->>'reconciliationCode' FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) community_retry_job_reconciliation_code,
     (SELECT payload->>'reconciliationReason' FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) community_retry_job_reconciliation_reason`;
+  const orderBy=args.recentInvites?RECENT_INVITE_ORDER_SQL:'first_seen DESC,channel_id';
   const [page,summary]=await Promise.all([
-    db.query(`SELECT ${columns} FROM channels WHERE ${where} ORDER BY first_seen DESC,channel_id LIMIT $${values.length+1} OFFSET $${values.length+2}`,[...values,limit,offset]),
+    db.query(`SELECT ${columns} FROM channels WHERE ${where} ORDER BY ${orderBy} LIMIT $${values.length+1} OFFSET $${values.length+2}`,[...values,limit,offset]),
     db.query(`SELECT COUNT(*)::int total,MAX(updated_at) revision FROM channels WHERE ${where}`,values)
   ]);
   return {items:page.rows.map(rowToChannelWithDiscoveryVisibility),total:Number(summary.rows[0].total||0),revision:iso(summary.rows[0].revision)};

@@ -5,6 +5,8 @@ import { ChannelRecord, ReviewQueueItem } from '../types';
 import { communityIntentDisplay } from './communityIntentDisplay';
 import { ExternalLink, RefreshCw, Eye, Copy, Check, Search, CheckCircle2, XCircle, ShieldAlert, X } from 'lucide-react';
 import { responseError, submitReviewDecision } from '../reviewDecision';
+import { formatFoundAgo } from '../utils/relativeTime';
+import { isConfirmedDiscordInvite } from '../discordInviteView';
 
 interface Props {
   channels: ChannelRecord[];
@@ -15,7 +17,7 @@ interface Props {
   pendingReviewCount?: number;
   onFiltersChange?: (filters:DashboardChannelFilters)=>void;
 }
-export interface DashboardChannelFilters {search:string;country:string;countryStatus:string;tradingStatus:string;discordStatus:string;scanStatus:string}
+export interface DashboardChannelFilters {search:string;country:string;countryStatus:string;tradingStatus:string;discordStatus:string;scanStatus:string;recentInvites?:boolean}
 
 type ReviewAction = 'approve' | 'reject' | 'force-rescan';
 
@@ -26,6 +28,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
   const [selectedTradingStatus, setSelectedTradingStatus] = useState('ALL');
   const [selectedDiscordStatus, setSelectedDiscordStatus] = useState('ALL');
   const [selectedScanStatus, setSelectedScanStatus] = useState('ALL');
+  const [recentInvites, setRecentInvites] = useState(false);
 
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [recheckingId, setRecheckingId] = useState<string | null>(null);
@@ -56,7 +59,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
 
   useEffect(()=>{if(!reviewEnabled||(!reviewerDefaultsAvailable&&(!reviewToken||!reviewer)))return;apiFetch('/api/review-reasons',{headers:reviewHeaders()}).then(r=>r.ok?r.json():Promise.reject()).then(setReasonCatalog).catch(()=>setReasonCatalog(null));},[reviewEnabled,reviewerDefaultsAvailable,reviewToken,reviewer]);
 
-  useEffect(()=>{if(!onFiltersChange)return;const timer=setTimeout(()=>onFiltersChange({search:searchTerm,country:selectedCountry,countryStatus:selectedCountryStatus,tradingStatus:selectedTradingStatus,discordStatus:selectedDiscordStatus,scanStatus:selectedScanStatus}),200);return()=>clearTimeout(timer);},[searchTerm,selectedCountry,selectedCountryStatus,selectedTradingStatus,selectedDiscordStatus,selectedScanStatus,onFiltersChange]);
+  useEffect(()=>{if(!onFiltersChange)return;const timer=setTimeout(()=>onFiltersChange({search:searchTerm,country:selectedCountry,countryStatus:selectedCountryStatus,tradingStatus:selectedTradingStatus,discordStatus:selectedDiscordStatus,scanStatus:selectedScanStatus,recentInvites}),200);return()=>clearTimeout(timer);},[searchTerm,selectedCountry,selectedCountryStatus,selectedTradingStatus,selectedDiscordStatus,selectedScanStatus,recentInvites,onFiltersChange]);
 
   const filteredChannels = useMemo(()=>channels.filter(c => {
     const matchesSearch = c.channel_name.toLowerCase().includes(searchTerm.toLowerCase()) ||
@@ -72,9 +75,10 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
     const matchesScanStatus = selectedScanStatus === 'ALL' || c.scan_status === selectedScanStatus;
     const matchesLowAudienceVisibility = selectedScanStatus === 'SKIPPED_LOW_AUDIENCE' || c.scan_status !== 'SKIPPED_LOW_AUDIENCE';
     const matchesReviewView = !pendingReviewOnly || (c.scan_status === 'NEEDS_REVIEW' && !decidedChannelIds.has(c.channel_id));
+    const matchesRecentInvites = !recentInvites || isConfirmedDiscordInvite(c);
 
-    return matchesSearch && matchesCountry && matchesCountryStatus && matchesTradingStatus && matchesDiscordStatus && matchesScanStatus && matchesLowAudienceVisibility && matchesReviewView;
-  }),[channels,searchTerm,selectedCountry,selectedCountryStatus,selectedTradingStatus,selectedDiscordStatus,selectedScanStatus,pendingReviewOnly,decidedChannelIds]);
+    return matchesSearch && matchesCountry && matchesCountryStatus && matchesTradingStatus && matchesDiscordStatus && matchesScanStatus && matchesLowAudienceVisibility && matchesReviewView && matchesRecentInvites;
+  }),[channels,searchTerm,selectedCountry,selectedCountryStatus,selectedTradingStatus,selectedDiscordStatus,selectedScanStatus,pendingReviewOnly,decidedChannelIds,recentInvites]);
 
   const handleCopyLink = (url: string, id: string) => {
     navigator.clipboard.writeText(url);
@@ -269,6 +273,20 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
               <option value="NEEDS_REVIEW">NEEDS REVIEW</option>
             </select>
 
+            {onFiltersChange && (
+              <button
+                type="button"
+                aria-pressed={recentInvites}
+                aria-label="Sort by recently confirmed Discord invites, newest first"
+                title="Show only confirmed, validated Discord invites sorted by first successful validation time. The selected Discord category still applies."
+                onClick={() => setRecentInvites(value => !value)}
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold rounded-lg border transition-colors ${recentInvites ? 'border-indigo-600 bg-indigo-600 text-white' : 'border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:border-indigo-300 dark:hover:border-indigo-700'}`}
+              >
+                <CheckCircle2 className="h-3.5 w-3.5" />
+                Recently confirmed
+              </button>
+            )}
+
             {/* Discord Status */}
             <select
               value={selectedDiscordStatus}
@@ -333,11 +351,12 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
               {filteredChannels.length === 0 ? (
                 <tr>
                   <td colSpan={8} className="py-12 text-center text-slate-500 dark:text-slate-400">
-                    {pendingReviewOnly ? 'No channels are awaiting human review.' : 'No validated channels match the selected filters.'}
+                    {pendingReviewOnly ? 'No channels are awaiting human review.' : recentInvites ? 'No confirmed, validated Discord invites match the selected filters.' : 'No validated channels match the selected filters.'}
                   </td>
                 </tr>
               ) : (
                 filteredChannels.map(c => {
+                  const foundAge = formatFoundAgo(c.discord_invite_first_validated_at);
                   const retryReconciliationRequired = c.community_retry_job_reconciliation_status === 'RECONCILIATION_REQUIRED';
                   const retryReconciliationReason = c.community_retry_job_reconciliation_reason || 'Legacy community retry was reclassified by the governed reconciliation pass.';
                   const automaticRetryActive = !retryReconciliationRequired && (c.community_retry_job_status === 'PENDING' || c.community_retry_job_status === 'PROCESSING');
@@ -514,6 +533,17 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                           >
                             {copiedId === c.channel_id ? <Check className="w-3 h-3 text-emerald-500" /> : <Copy className="w-3 h-3" />}
                           </button>
+                        </div>
+                      )}
+                      {c.discord_invite && (foundAge || recentInvites) && (
+                        <div
+                          data-testid="discord-found-age"
+                          className={`mt-0.5 text-[10px] font-medium ${foundAge ? 'text-emerald-700 dark:text-emerald-400' : 'text-slate-500 dark:text-slate-400'}`}
+                          title={c.discord_invite_first_validated_at
+                            ? `First successful validation: ${new Date(c.discord_invite_first_validated_at).toLocaleString()}`
+                            : 'No trustworthy successful validation timestamp is recorded for this invite.'}
+                        >
+                          {foundAge || 'Found time unavailable'}
                         </div>
                       )}
                       {c.discord_duplicate_owner_channel_id && (

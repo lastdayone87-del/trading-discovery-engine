@@ -21,6 +21,11 @@ test('default page and revision requests do not send a low-audience filter impli
   assert.equal(params.has('scan_status'),false);
 });
 
+test('recently confirmed invites serialize as a server-side view for both page and revision polling',()=>{
+  const params=channelListingSearchParams({...filters,recentInvites:true,discordStatus:'ACTIVE'},false);
+  assert.deepEqual([...params.entries()],[['recent_invites','true'],['discord_status','ACTIVE']]);
+});
+
 test('explicit low-audience selection serializes alongside other filters',()=>{
   const params=channelListingSearchParams({
     ...filters,

@@ -21,7 +21,7 @@ export default function App() {
   const [channelTotal, setChannelTotal] = useState(0);
   const [channelOffset, setChannelOffset] = useState(0);
   const listingRevision = useRef<string | null>(null);
-  const [channelFilters,setChannelFilters]=useState<DashboardChannelFilters>({search:'',country:'ALL',countryStatus:'ALL',tradingStatus:'ALL',discordStatus:'ALL',scanStatus:'ALL'});
+  const [channelFilters,setChannelFilters]=useState<DashboardChannelFilters>({search:'',country:'ALL',countryStatus:'ALL',tradingStatus:'ALL',discordStatus:'ALL',scanStatus:'ALL',recentInvites:false});
   const [includeRejected, setIncludeRejected] = useState(false);
   const [vocabularies, setVocabularies] = useState<CountryVocabulary[]>([]);
   const [excludedCountries, setExcludedCountries] = useState<ExcludedCountry[]>([]);
