@@ -352,3 +352,16 @@ test('simulateShadowReplay: a slow call holds its lease only through the TTL', (
   assert.equal(summary.totalWouldReject, 1);
   assert.equal(summary.byDay[day].byKey.k1.settledUnits, 10);
 });
+
+test('simulateShadowReplay: an expiring lease frees capacity at the exact TTL instant', () => {
+  const day = '2026-10-16';
+  const calls = [
+    // Dispatches at t=0, completes and expires at t=120s.
+    { occurredAtMs: SHADOW_LEASE_TTL_MS, latencyMs: SHADOW_LEASE_TTL_MS, keyFingerprint: 'k1', reservedUnits: 10, settledUnits: 10, day },
+    // Dispatches at the exact instant the first lease expires.
+    { occurredAtMs: SHADOW_LEASE_TTL_MS, latencyMs: 0, keyFingerprint: 'k1', reservedUnits: 10, settledUnits: 10, day },
+  ];
+  const summary = simulateShadowReplay(calls, { capUnits: 10 });
+  assert.equal(summary.totalAllowed, 2);
+  assert.equal(summary.totalWouldDefer + summary.totalWouldReject, 0);
+});

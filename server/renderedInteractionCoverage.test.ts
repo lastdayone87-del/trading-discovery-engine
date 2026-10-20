@@ -102,6 +102,10 @@ test('rendered control coverage counts overflow and uses stable markers across D
   assert.match(source, /freshDropped\+\+/, 're-enumerated controls beyond the remaining budget are counted as skipped');
   assert.match(source, /drops\.count\('control-slice', freshDropped\)/, 'revealed-control slices are recorded');
   assert.match(source, /interactionGap:interactionGap\|\|undefined/, 'throw paths retain the interaction gap');
+  assert.match(source, /if \(clickedThisPage >= limits\.maxClicksPerPage\) \{[\s\S]*?clickTargets\.slice\(clickIndex\)/,
+    'queued controls beyond the click cap are counted as skipped');
+  assert.match(source, /if \(clickedThisPage >= limits\.maxClicksPerPage[\s\S]*?Date\.now\(\) - startedAt < limits\.totalTimeoutMs\)[\s\S]*?enumerateControls\(\)/,
+    'the final allowed click re-enumerates newly revealed controls');
 });
 
 test('shared rendered evidence stays fail-closed: gapped/timed-out lenders never enter inventory', () => {

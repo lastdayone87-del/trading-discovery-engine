@@ -1347,7 +1347,24 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             const queuedMarkers = new Set(clickTargets.map(target => target.marker).filter((marker): marker is string => Boolean(marker)));
             let clickedThisPage = 0;
             for (let clickIndex = 0; clickIndex < clickTargets.length; clickIndex++) {
-              if (clickedThisPage >= limits.maxClicksPerPage) break;
+              if (clickedThisPage >= limits.maxClicksPerPage) {
+                // Controls appended by an earlier re-enumeration can remain
+                // queued when the click cap is reached. They were never
+                // examined, so they are skips, not a clean no-match.
+                let cappedSkips = 0;
+                for (const target of clickTargets.slice(clickIndex)) {
+                  const marker = target.marker;
+                  if (marker && countedControlSkips.has(marker)) continue;
+                  if (marker) countedControlSkips.add(marker);
+                  cappedSkips++;
+                }
+                if (cappedSkips > 0) {
+                  drops.count('control-slice', cappedSkips);
+                  evidenceControlsSkipped += cappedSkips;
+                  interactionGap = true;
+                }
+                break;
+              }
               if (Date.now() - startedAt >= limits.totalTimeoutMs) {
                 const skipped = clickTargets.length - clickIndex;
                 evidenceControlsSkipped += skipped;
@@ -1413,6 +1430,29 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                   }
                 } catch { /* re-enumeration keeps the original bounded plan */ }
               }
+            }
+            if (clickedThisPage >= limits.maxClicksPerPage
+              && Date.now() - startedAt < limits.totalTimeoutMs) {
+              // The final allowed click may reveal additional evidence-bearing
+              // controls after the loop has no budget left to enumerate them.
+              // Enumerate once more and record every new unqueued control as a
+              // skip so the page remains retryable instead of resolving clean.
+              try {
+                const refreshed = await enumerateControls();
+                recordControlEnumeration(refreshed.total);
+                let revealedSkips = 0;
+                for (const target of refreshed.controls) {
+                  if (!target.marker || queuedMarkers.has(target.marker) || countedControlSkips.has(target.marker)) continue;
+                  if (isSkippableNavigableAnchorClick(target, page.url())) continue;
+                  countedControlSkips.add(target.marker);
+                  revealedSkips++;
+                }
+                if (revealedSkips > 0) {
+                  drops.count('control-slice', revealedSkips);
+                  evidenceControlsSkipped += revealedSkips;
+                  interactionGap = true;
+                }
+              } catch { /* post-cap re-enumeration is best-effort */ }
             }
             evidenceControlsSeen += pageControlTotal;
 

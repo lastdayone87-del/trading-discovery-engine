@@ -511,6 +511,9 @@ export function simulateShadowReplay(
     byDay: {},
   };
   // kind 0 = dispatch, 1 = lease TTL expiry, 2 = completion/settlement.
+  // At an equal timestamp an expiry runs before a dispatch (a lease ending at
+  // t no longer blocks a call starting at t), while a zero-latency dispatch
+  // still runs before its own settlement.
   const events: Array<{ t: number; kind: 0 | 1 | 2; index: number }> = [];
   calls.forEach((call, index) => {
     if (!(call.reservedUnits > 0)) return;
@@ -523,7 +526,8 @@ export function simulateShadowReplay(
     events.push({ t: dispatchAt + SHADOW_LEASE_TTL_MS, kind: 1, index });
     events.push({ t: call.occurredAtMs, kind: 2, index });
   });
-  events.sort((a, b) => (a.t === b.t ? a.kind - b.kind : a.t - b.t));
+  const eventPriority: Record<0 | 1 | 2, number> = { 1: 0, 0: 1, 2: 2 };
+  events.sort((a, b) => (a.t === b.t ? eventPriority[a.kind] - eventPriority[b.kind] : a.t - b.t));
   const allowed = new Set<number>();
   const leaseState = new Map<number, { state: State; key: string }>();
   for (const event of events) {
