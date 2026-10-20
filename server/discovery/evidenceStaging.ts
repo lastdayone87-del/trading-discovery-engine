@@ -23,7 +23,6 @@
  */
 
 import { createHash } from 'node:crypto';
-import { getDb } from '../dbCore';
 import {
   EVIDENCE_CANDIDATE_TYPE,
   EVIDENCE_EXTRACTION_DISCOVERY_MODE,
@@ -39,6 +38,16 @@ export const EVIDENCE_RESOLUTION_STATUS = 'EVIDENCE_ONLY';
 
 export interface EvidenceStagingQueryable {
   query: (sql: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }>;
+}
+
+export interface EvidenceStagingConnection extends EvidenceStagingQueryable {
+  release?: () => void;
+}
+
+export interface EvidenceStagingClient extends EvidenceStagingQueryable {
+  connect?: () => Promise<EvidenceStagingConnection>;
+  /** Present on pg.Pool; distinguishes a pool from an already-connected client. */
+  totalCount?: number;
 }
 
 export interface EvidenceStagingContext {
@@ -69,7 +78,9 @@ export function evidenceObservationKey(
         provenance.sourceType,
         provenance.sourceId,
         provenance.sourceHash,
+        provenance.sourceIndex,
         provenance.extractionMethod,
+        provenance.textSpan ? `${provenance.textSpan.start}-${provenance.textSpan.end}` : 'null',
       ].join('|')
     )
     .digest('hex');
@@ -98,6 +109,7 @@ async function stageOne(
           sourceIndex: primary.sourceIndex,
           textSpan: primary.textSpan,
           extractionMethod: primary.extractionMethod,
+          sourceHash: primary.sourceHash,
         }
       : null,
   };
@@ -114,7 +126,12 @@ async function stageOne(
        neighborhood_key, discovery_mode, provenance, resolution_status, validation_status, metadata
      )
      VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-     ON CONFLICT (staging_key) DO UPDATE SET updated_at=now()
+     ON CONFLICT (staging_key) DO UPDATE SET
+       updated_at=now(),
+       provenance=excluded.provenance,
+       metadata=excluded.metadata,
+       country=excluded.country,
+       language=excluded.language
      RETURNING id, (xmax=0) AS inserted`,
     [
       stagingKey,
@@ -177,37 +194,62 @@ async function stageOne(
         JSON.stringify({ frequency: candidate.frequency, extractorVersion: EVIDENCE_EXTRACTION_VERSION }),
       ]
     );
-    if (res.rows?.[0]?.id !== undefined && observation.rows?.[0]?.observation_key !== undefined) {
+    if (observation.rows?.[0]?.observation_key !== undefined) {
       observationCount += 1;
     }
   }
   return { inserted, observationCount };
 }
 
+async function withStagingTransaction<T>(
+  client: EvidenceStagingClient,
+  fn: (db: EvidenceStagingQueryable) => Promise<T>
+): Promise<T> {
+  if (typeof client.connect !== 'function' || typeof client.totalCount !== 'number') {
+    // Test/in-memory clients (and already-connected clients) execute directly.
+    return fn(client);
+  }
+  const connection = await client.connect();
+  try {
+    await connection.query('BEGIN');
+    const result = await fn(connection);
+    await connection.query('COMMIT');
+    return result;
+  } catch (error) {
+    await connection.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    connection.release?.();
+  }
+}
+
 /**
  * Stage PROBE_ELIGIBLE candidates. Idempotent: re-running with identical input
  * increments duplicateCount without duplicating rows or observations.
- * `client` is injected by the pipeline runner; direct callers without a client
- * degrade to a no-op (test-safe default — never opens a pool implicitly).
+ * `client` is injected by the pipeline runner; without one this is a no-op so
+ * direct callers can never open an implicit pool/write. A batch is staged in a
+ * single transaction when the client exposes a pool, so a failure mid-batch
+ * cannot leave staging rows without their observations.
  */
 export async function stageEvidenceCandidates(
   candidates: EvidenceCandidate[],
   context: EvidenceStagingContext,
-  client?: EvidenceStagingQueryable
+  client?: EvidenceStagingClient
 ): Promise<EvidenceStagingResult> {
   if (candidates.length === 0) return { stagedCount: 0, duplicateCount: 0, observationCount: 0 };
-  const db = client || (process.env.DATABASE_URL ? (await getDb()) as unknown as EvidenceStagingQueryable : null);
-  if (!db) return { stagedCount: 0, duplicateCount: 0, observationCount: 0 };
+  if (!client) return { stagedCount: 0, duplicateCount: 0, observationCount: 0 };
   if (!context.country || !context.country.trim()) throw new Error('EVIDENCE_STAGING_COUNTRY_REQUIRED');
 
-  let stagedCount = 0;
-  let duplicateCount = 0;
-  let observationCount = 0;
-  for (const candidate of candidates) {
-    const result = await stageOne(db, candidate, context);
-    if (result.inserted) stagedCount += 1;
-    else duplicateCount += 1;
-    observationCount += result.observationCount;
-  }
-  return { stagedCount, duplicateCount, observationCount };
+  return withStagingTransaction(client, async db => {
+    let stagedCount = 0;
+    let duplicateCount = 0;
+    let observationCount = 0;
+    for (const candidate of candidates) {
+      const result = await stageOne(db, candidate, context);
+      if (result.inserted) stagedCount += 1;
+      else duplicateCount += 1;
+      observationCount += result.observationCount;
+    }
+    return { stagedCount, duplicateCount, observationCount };
+  });
 }

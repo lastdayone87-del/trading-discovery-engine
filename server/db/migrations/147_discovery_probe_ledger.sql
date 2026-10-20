@@ -1,4 +1,4 @@
--- Migration 146: Evidence-first discovery Phase 2 — bounded probe ledger.
+-- Migration 147: Evidence-first discovery Phase 2 — bounded probe ledger.
 --
 -- Ledger decision (recon, read-only over migrations 002/027/043/048):
 -- `terminology_trial_assignments` is NOT repurposed as the probe ledger.
@@ -21,6 +21,17 @@
 -- The ledger is inert until `discovery_probe_enabled` is exactly 'true' AND
 -- an approved caller invokes runApprovedProbe; absent => OFF.
 
+-- The InnerTube lane has zero Data API units but is still a registered
+-- provider; the ledger FK below must not accept an arbitrary provider string.
+INSERT INTO discovery_provider_registry (
+  provider_key, provider_family, provider_kind, capabilities, quota_domain,
+  terms_reference, mode, daily_cost_cap, updated_by
+) VALUES (
+  'youtube-innertube', 'youtube', 'RETRIEVAL',
+  '["SEARCH_YOUTUBE"]'::jsonb, 'YOUTUBE_INNERTUBE_FREE',
+  'https://www.youtube.com/t/terms', 'ACTIVE', 0, 'system:migration-147'
+) ON CONFLICT (provider_key) DO NOTHING;
+
 CREATE TABLE IF NOT EXISTS discovery_probe_ledger (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   -- Candidate identity is the existing canonical_candidate_key (staging key).
@@ -30,7 +41,8 @@ CREATE TABLE IF NOT EXISTS discovery_probe_ledger (
   term TEXT NOT NULL,
   country TEXT NOT NULL,
   route TEXT NOT NULL CHECK (route IN ('youtube-innertube', 'youtube-data-api')),
-  provider_key TEXT NOT NULL DEFAULT 'youtube-innertube',
+  provider_key TEXT NOT NULL DEFAULT 'youtube-innertube'
+    REFERENCES discovery_provider_registry(provider_key) ON DELETE RESTRICT,
   -- Quota accounting: InnerTube is quota-free, so every probe records units=0.
   units INTEGER NOT NULL DEFAULT 0 CHECK (units >= 0),
   attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
@@ -51,8 +63,6 @@ CREATE TABLE IF NOT EXISTS discovery_probe_ledger (
   UNIQUE (candidate_key, attempt_no)
 );
 
-CREATE INDEX IF NOT EXISTS discovery_probe_ledger_candidate_idx
-  ON discovery_probe_ledger(candidate_key, attempt_no);
 CREATE INDEX IF NOT EXISTS discovery_probe_ledger_reserved_idx
   ON discovery_probe_ledger(reserved_at);
 CREATE INDEX IF NOT EXISTS discovery_probe_ledger_country_reserved_idx

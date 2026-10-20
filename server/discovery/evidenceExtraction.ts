@@ -182,25 +182,36 @@ export function hashEvidenceSource(text: string): string {
   return createHash('sha256').update(text.normalize('NFKC')).digest('hex');
 }
 
-function tokenizeWithCodePointOffsets(text: string): Token[] {
+/**
+ * Tokenizes into punctuation-delimited segments. Whitespace separates words
+ * inside a segment; any other non-word code point (comma, period, slash,
+ * quotes, emoji, etc.) terminates the segment so an n-gram can never span
+ * punctuation. Keeping one-character tokens here lets the code-point floor
+ * reject them without silently gluing neighbours together.
+ */
+function tokenizeSegmentsWithCodePointOffsets(text: string): Token[][] {
   const points = Array.from(text.normalize('NFC'));
-  const tokens: Token[] = [];
+  const segments: Token[][] = [];
+  let current: Token[] = [];
   let index = 0;
+  const flush = () => {
+    if (current.length) segments.push(current);
+    current = [];
+  };
   while (index < points.length) {
-    if (!WORD_POINT.test(points[index])) {
-      index += 1;
+    const point = points[index];
+    if (WORD_POINT.test(point)) {
+      const start = index;
+      while (index < points.length && WORD_POINT.test(points[index])) index += 1;
+      const tokenText = points.slice(start, index).join('');
+      current.push({ text: tokenText, normalized: normalizeTerm(tokenText), start, end: index });
       continue;
     }
-    const start = index;
-    while (index < points.length && WORD_POINT.test(points[index])) index += 1;
-    const tokenText = points.slice(start, index).join('');
-    // Keep single-character tokens here. They may be stopword boundaries
-    // (a/y/e/o/u/i/à/é/è) or meaningful one-letter identifiers; either way,
-    // dropping them before segmenting fabricates cross-boundary n-grams.
-    // The final candidate-length check still rejects a one-character term.
-    tokens.push({ text: tokenText, normalized: normalizeTerm(tokenText), start, end: index });
+    if (!/\s/u.test(point)) flush();
+    index += 1;
   }
-  return tokens;
+  flush();
+  return segments;
 }
 
 /**
@@ -249,22 +260,22 @@ export function extractEvidenceCandidates(input: EvidenceExtractionInput): Evide
   };
 
   const harvestNgrams = (text: string, points: string[], source: SourceContext) => {
-    const tokens = tokenizeWithCodePointOffsets(text);
-    if (tokens.length < NGRAM_MIN_TOKENS) return;
-    let emitted = 0;
-    // Stopwords split the token stream into segments; n-grams never span a
-    // segment boundary (deterministic, language-agnostic boundary rule).
     const segments: Token[][] = [];
-    let current: Token[] = [];
-    for (const token of tokens) {
-      if (NGRAM_STOPWORDS.has(token.normalized)) {
-        if (current.length) segments.push(current);
-        current = [];
-      } else {
-        current.push(token);
+    // Punctuation already split the text; stopwords split each remaining
+    // token run. N-grams never span either boundary.
+    for (const tokenSegment of tokenizeSegmentsWithCodePointOffsets(text)) {
+      let current: Token[] = [];
+      for (const token of tokenSegment) {
+        if (NGRAM_STOPWORDS.has(token.normalized)) {
+          if (current.length) segments.push(current);
+          current = [];
+        } else {
+          current.push(token);
+        }
       }
+      if (current.length) segments.push(current);
     }
-    if (current.length) segments.push(current);
+    let emitted = 0;
     outer: for (const segment of segments) {
       for (let start = 0; start < segment.length; start += 1) {
         for (let size = NGRAM_MIN_TOKENS; size <= NGRAM_MAX_TOKENS; size += 1) {
@@ -289,7 +300,7 @@ export function extractEvidenceCandidates(input: EvidenceExtractionInput): Evide
     sourceId: string,
     sourceIndex: number
   ) => {
-    if (!text || !text.trim()) return;
+    if (typeof text !== 'string' || !text.trim()) return;
     const source: SourceContext = {
       sourceType,
       sourceId,
@@ -297,17 +308,29 @@ export function extractEvidenceCandidates(input: EvidenceExtractionInput): Evide
       sourceHash: hashEvidenceSource(text),
     };
     for (const span of extractHashtagsWithOffsets(text)) {
-      push(span.literal, span.literal, 'HASHTAG', 'HASHTAG', source, { start: span.startOffset, end: span.endOffset });
+      const literal = span.literal.replace(/[.\-]+$/u, '');
+      if (!literal || literal === '#') continue;
+      const trim = Array.from(span.literal).length - Array.from(literal).length;
+      push(literal, literal, 'HASHTAG', 'HASHTAG', source, {
+        start: span.startOffset,
+        end: span.endOffset - trim,
+      });
     }
     for (const span of extractHandlesWithOffsets(text)) {
-      push(span.literal, span.literal, 'MENTION', 'MENTION', source, { start: span.startOffset, end: span.endOffset });
+      const literal = span.literal.replace(/[.\-]+$/u, '');
+      if (!literal || literal === '@') continue;
+      const trim = Array.from(span.literal).length - Array.from(literal).length;
+      push(literal, literal, 'MENTION', 'MENTION', source, {
+        start: span.startOffset,
+        end: span.endOffset - trim,
+      });
     }
     harvestNgrams(text, Array.from(text.normalize('NFC')), source);
   };
 
   // Deterministic harvest order: handle, tags, topics, then text fields.
   const channelSourceId = `channel:${input.channelId}`;
-  if (input.channelHandle && input.channelHandle.trim()) {
+  if (typeof input.channelHandle === 'string' && input.channelHandle.trim()) {
     const trimmed = input.channelHandle.trim();
     const rawHandle = trimmed.startsWith('@') ? trimmed : `@${trimmed}`;
     push(rawHandle, rawHandle, 'HANDLE', 'HANDLE', {
@@ -317,7 +340,7 @@ export function extractEvidenceCandidates(input: EvidenceExtractionInput): Evide
       sourceHash: hashEvidenceSource(trimmed),
     }, null);
   }
-  (input.videoTags || []).forEach((tag, index) => {
+  (Array.isArray(input.videoTags) ? input.videoTags : []).forEach((tag, index) => {
     if (typeof tag !== 'string' || !tag.trim()) return;
     const trimmed = tag.trim();
     push(trimmed, trimmed, 'VIDEO_TAG', 'VIDEO_TAG', {
@@ -327,7 +350,7 @@ export function extractEvidenceCandidates(input: EvidenceExtractionInput): Evide
       sourceHash: hashEvidenceSource(trimmed),
     }, null);
   });
-  (input.topicLabels || []).forEach((topic, index) => {
+  (Array.isArray(input.topicLabels) ? input.topicLabels : []).forEach((topic, index) => {
     if (typeof topic !== 'string' || !topic.trim()) return;
     const trimmed = topic.trim();
     push(trimmed, trimmed, 'TOPIC_LABEL', 'TOPIC_DETAIL', {
@@ -341,17 +364,21 @@ export function extractEvidenceCandidates(input: EvidenceExtractionInput): Evide
   harvestText(input.channelName, 'CHANNEL_NAME', channelSourceId, 0);
   harvestText(input.description, 'CHANNEL_DESCRIPTION', channelSourceId, 0);
 
-  if (input.videos && input.videos.length) {
-    input.videos.forEach((video, index) => {
-      const videoSourceId = `video:${video?.id || index}`;
-      harvestText(video?.title, 'VIDEO_TITLE', videoSourceId, index);
-      harvestText(video?.description, 'VIDEO_DESCRIPTION', videoSourceId, index);
+  // Structured videos take precedence even when explicitly empty; otherwise a
+  // caller that already selected zero structured videos would have stale
+  // parallel arrays harvested unexpectedly.
+  if (input.videos !== undefined) {
+    (Array.isArray(input.videos) ? input.videos : []).forEach((video, index) => {
+      if (!video || typeof video !== 'object') return;
+      const videoSourceId = `video:${video.id || index}`;
+      harvestText(video.title, 'VIDEO_TITLE', videoSourceId, index);
+      harvestText(video.description, 'VIDEO_DESCRIPTION', videoSourceId, index);
     });
   } else {
-    (input.videoTitles || []).forEach((title, index) => {
+    (Array.isArray(input.videoTitles) ? input.videoTitles : []).forEach((title, index) => {
       harvestText(title, 'VIDEO_TITLE', `video:${index}`, index);
     });
-    (input.videoDescriptions || []).forEach((description, index) => {
+    (Array.isArray(input.videoDescriptions) ? input.videoDescriptions : []).forEach((description, index) => {
       harvestText(description, 'VIDEO_DESCRIPTION', `video:${index}`, index);
     });
   }
@@ -367,13 +394,16 @@ export function extractEvidenceCandidates(input: EvidenceExtractionInput): Evide
     frequency: entry.frequency,
     provenance: entry.provenance,
   }));
-  // Deterministic ordering: canonical key first, literal as tiebreaker.
+  // Bound the batch by observed frequency, then canonical identity/literal as
+  // deterministic tiebreakers. A hash-only cut could discard a repeated signal
+  // while retaining one-off noise.
   candidates.sort((a, b) =>
-    a.canonicalCandidateKey < b.canonicalCandidateKey ? -1
-    : a.canonicalCandidateKey > b.canonicalCandidateKey ? 1
-    : a.rawTerm < b.rawTerm ? -1
-    : a.rawTerm > b.rawTerm ? 1
-    : 0
+    b.frequency - a.frequency
+    || (a.canonicalCandidateKey < b.canonicalCandidateKey ? -1
+      : a.canonicalCandidateKey > b.canonicalCandidateKey ? 1
+      : a.rawTerm < b.rawTerm ? -1
+      : a.rawTerm > b.rawTerm ? 1
+      : 0)
   );
   return candidates.slice(0, MAX_CANDIDATES_PER_EXTRACTION);
 }

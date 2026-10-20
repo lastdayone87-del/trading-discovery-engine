@@ -29,7 +29,7 @@ import {
 } from './evidenceScreening';
 import {
   stageEvidenceCandidates,
-  type EvidenceStagingQueryable,
+  type EvidenceStagingClient,
   type EvidenceStagingResult,
 } from './evidenceStaging';
 
@@ -48,7 +48,7 @@ export interface DiscoveryExtractionDeps {
   /** Injectable settings reader (flag + terminology kill switch). */
   readSetting?: (key: string) => Promise<string>;
   /** Injectable queryable; defaults to the app pool when DATABASE_URL is configured. */
-  client?: EvidenceStagingQueryable;
+  client?: EvidenceStagingClient;
 }
 
 export interface DiscoveryExtractionRunSummary {
@@ -114,7 +114,7 @@ export async function maybeRunDiscoveryEvidenceExtraction(
   const client =
     deps?.client ??
     (process.env.DATABASE_URL
-      ? ((await getDb()) as unknown as EvidenceStagingQueryable)
+      ? ((await getDb()) as unknown as EvidenceStagingClient)
       : null);
   if (!client) return skippedSummary('NO_DATABASE');
 
@@ -169,24 +169,10 @@ export async function maybeRunDiscoveryEvidenceExtraction(
     catalogOk = false;
   }
 
-  let stagedOk = true;
-  let stagedCanonicalKeys: string[] = [];
-  try {
-    const res = await client.query(
-      `SELECT canonical_candidate_key FROM discovery_candidate_staging WHERE canonical_candidate_key = ANY($1::text[])`,
-      [extracted.map(candidate => candidate.canonicalCandidateKey)]
-    );
-    stagedCanonicalKeys = res.rows.map(row => String(row.canonical_candidate_key ?? '')).filter(Boolean);
-  } catch {
-    stagedOk = false;
-  }
-
   const baseline: EvidenceScreeningBaseline = {
     country,
     catalogOk,
     catalogTerms,
-    stagedOk,
-    stagedCanonicalKeys,
     vocabOk,
     vocabLanguages,
     curatedTerms,

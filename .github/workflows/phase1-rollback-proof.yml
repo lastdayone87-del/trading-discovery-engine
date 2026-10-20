@@ -55,13 +55,11 @@ jobs:
           set -euo pipefail
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c \
             "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
-          # 146+ are newer features with their own proof workflows; this proof
-          # is scoped to the 146/147 rollback and must not advance past 147.
-          # Filter by numeric version rather than a fixed 14x regex so future
-          # migrations (including 150) cannot silently enter the pre-state.
+          # Select by numeric upper bound, not by excluding today's numbers:
+          # a future 149+ migration must not be applied in the pre-state step.
           for f in $(ls server/db/migrations/*.sql | sort); do
             name=$(basename "$f"); version=${name%%_*}
-            [ "$version" -lt 146 ] || continue
+            if [ "$version" -gt 145 ]; then continue; fi
             psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q \
               -c "BEGIN" -f "$f" \
               -c "INSERT INTO schema_migrations(version,name,applied_at) VALUES ($version, '$name', now())" \
@@ -99,8 +97,9 @@ jobs:
           grep -q "EVIDENCE_ONLY" evidence/constraints_post.txt
           grep -q "SEARCH_TERM" evidence/constraints_post.txt
           test "$(psql "$DATABASE_URL" -At -c "SELECT to_regclass('public.discovery_probe_ledger') IS NOT NULL")" = "t"
-          test "$(psql "$DATABASE_URL" -At -c "SELECT count(*) FROM pg_indexes WHERE tablename='discovery_probe_ledger' AND indexname IN ('discovery_probe_ledger_candidate_idx','discovery_probe_ledger_reserved_idx','discovery_probe_ledger_country_reserved_idx','discovery_probe_ledger_inflight_idx')")" = "4"
+          test "$(psql "$DATABASE_URL" -At -c "SELECT count(*) FROM pg_indexes WHERE tablename='discovery_probe_ledger' AND indexname IN ('discovery_probe_ledger_reserved_idx','discovery_probe_ledger_country_reserved_idx','discovery_probe_ledger_inflight_idx')")" = "3"
           test "$(psql "$DATABASE_URL" -At -c "SELECT count(*) FROM discovery_provider_registry WHERE provider_key='evidence_extraction'")" = "1"
+          test "$(psql "$DATABASE_URL" -At -c "SELECT count(*) FROM discovery_provider_registry WHERE provider_key='youtube-innertube'")" = "1"
           test "$(psql "$DATABASE_URL" -At -c "SELECT count(*) FROM schema_migrations WHERE version IN (146,147)")" = "2"
           echo "POST-146/147 EXPECTED CHANGES VERIFIED"
 
@@ -138,11 +137,14 @@ jobs:
           test ! -s evidence/schema_diff.txt
           test "$(psql "$DATABASE_URL" -At -c "SELECT to_regclass('public.discovery_probe_ledger') IS NOT NULL")" = "f"
           test "$(psql "$DATABASE_URL" -At -c "SELECT count(*) FROM discovery_provider_registry WHERE provider_key='evidence_extraction'")" = "0"
+          # youtube-innertube predates 146/147 (migration 130); rollback must
+          # preserve it, so the expected post-rollback count is 1, not 0.
+          test "$(psql "$DATABASE_URL" -At -c "SELECT count(*) FROM discovery_provider_registry WHERE provider_key='youtube-innertube'")" = "1"
           test "$(psql "$DATABASE_URL" -At -c "SELECT count(*) FROM schema_migrations WHERE version IN (146,147)")" = "0"
           test "$(psql "$DATABASE_URL" -At -c "SELECT max(version) FROM schema_migrations")" = "145"
           echo "ROLLBACK VERIFIED: zero schema drift, byte-identical staging constraints, ledger/registry/version rows removed"
 
-      - name: Re-apply proof (rollback removes version rows so the runner re-applies)
+      - name: Re-apply proof (same per-file transaction/version-row semantics as the runner)
         run: |
           set -euo pipefail
           for f in server/db/migrations/146_*.sql server/db/migrations/147_*.sql; do
@@ -155,7 +157,7 @@ jobs:
           test "$(psql "$DATABASE_URL" -At -c "SELECT to_regclass('public.discovery_probe_ledger') IS NOT NULL")" = "t"
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f scripts/rollback_146_147.sql > evidence/rollback_second_run.log 2>&1
           test "$(psql "$DATABASE_URL" -At -c "SELECT to_regclass('public.discovery_probe_ledger') IS NOT NULL")" = "f"
-          echo "RE-APPLY + SECOND ROLLBACK OK (version-keyed runner cannot silently skip)"
+          echo "RE-APPLY + SECOND ROLLBACK OK (version-keyed re-apply semantics)"
 
       - name: Upload evidence artifact
         if: always()

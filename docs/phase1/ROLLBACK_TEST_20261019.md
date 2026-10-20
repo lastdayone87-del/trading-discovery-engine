@@ -1,9 +1,16 @@
 # Rollback proof — migrations 146/147 (2026-10-19)
 
-Status: **PASS** — verified on a disposable `postgres:17` service container in
-GitHub Actions run [39320564700](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39320564700)
-(branch `phase1-hardening`, head `92686a5`). Production untouched; scratch
-database only.
+Status: **HISTORICAL PASS, CURRENT FIXES PENDING CI.** The last observed
+green proof is GitHub Actions run
+[39330317684](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39330317684)
+(branch `phase1-hardening`, head `ee5d172`) on a disposable `postgres:17`
+service container. The current fix commit adds rollback fixes (numeric `<=145` pre-state
+selection, preservation of the pre-existing migration-130 `youtube-innertube`
+provider row, ledger-row guard, `ON_ERROR_STOP`) that are **not yet verified by
+CI**. Do not cite this document as proof for those
+changes until a new green run is recorded here. The earlier run
+39320564700/head `92686a5` is historical (pre-rebase lineage 144). Production
+untouched; scratch database only.
 
 ## Why CI (environment note)
 
@@ -18,15 +25,16 @@ approved disposable pattern (used by `corpus-claim-budget-pg.yml` and
 
 1. Create scratch DB `tde_rollback`; `schema_migrations` bootstrap mirrors
    `scripts/runMigrations.ts`.
-2. Apply migrations **001–144 only** (runner semantics: per-file transaction
-   + version row). Captured: `pre_state_max_version=144`.
+2. Apply migrations **001–145 only** (runner semantics: per-file transaction
+   + version row). Captured: `pre_state_max_version=145`.
 3. Capture pre-state: staging-table constraint definitions + full
    `pg_dump --schema-only`.
 4. Apply **146 + 147** with the same semantics.
 5. Verify expected changes: staging checks now admit `EVIDENCE_EXTRACTION`,
    `EVIDENCE_ONLY`, `SEARCH_TERM`; `discovery_probe_ledger` exists with its
-   four explicit indexes; `discovery_provider_registry` row present;
-   `schema_migrations` rows 146+147 present.
+   three explicit indexes plus the unique-attempt index;
+   `discovery_provider_registry` rows for `evidence_extraction` and
+   `youtube-innertube` present; `schema_migrations` rows 146+147 present.
 6. Guard test: INSERT one evidence-only staging row, run
    `scripts/rollback_146_147.sql` → must abort with
    `rollback_146_147 blocked: 1 … row(s)`; assert row and ledger still
@@ -35,10 +43,12 @@ approved disposable pattern (used by `corpus-claim-budget-pg.yml` and
    6 × ALTER TABLE (constraint restore) → DELETE 1 (registry row) →
    DELETE 2 (schema_migrations 146/147) → COMMIT`).
 8. Post-rollback verification: `diff` of constraint definitions and of full
-   schema dumps must be empty; ledger absent; registry row absent;
-   `schema_migrations` rows absent; `max(version)=144`.
+   schema dumps must be empty; ledger absent; `evidence_extraction` registry row absent and the
+   pre-existing migration-130 `youtube-innertube` row preserved;
+   `schema_migrations` rows absent; `max(version)=145`.
 9. Re-apply proof: re-apply 146+147 → ledger present → run rollback again →
-   transcript identical. The version-keyed runner cannot silently skip.
+   transcript identical, using the same per-file transaction/version-row
+   semantics as the runner.
 
 ## Verdict — byte-identical, zero drift
 
@@ -52,13 +62,15 @@ approved disposable pattern (used by `corpus-claim-budget-pg.yml` and
 
 ## Evidence inventory
 
-Artifact `phase1-rollback-proof` (run 39320564700), stored at
-`/tmp/opencode/evidence/rollback_unit2/ci-run3/`:
-`server_version.txt`, `pre_state_max_version.txt`, `constraints_pre.txt`,
-`constraints_post.txt`, `constraints_final.txt`, `constraints_diff.txt`,
-`schema_pre.sql`, `schema_final.sql`, `schema_diff.txt`,
-`rollback_guard_blocked.log`, `rollback_execution.log`,
-`rollback_second_run.log`.
+Current fixes are pending a new CI run; this section describes the historical
+green artifact.
+
+The durable evidence for the historical green run is the
+`phase1-rollback-proof` GitHub Actions artifact attached to run 39330317684: `server_version.txt`,
+`pre_state_max_version.txt`, `constraints_pre.txt`, `constraints_post.txt`,
+`constraints_final.txt`, `constraints_diff.txt`, `schema_pre.sql`,
+`schema_final.sql`, `schema_diff.txt`, `rollback_guard_blocked.log`,
+`rollback_execution.log`, `rollback_second_run.log`.
 
 Earlier failed runs (harness assertion bugs, fixed in `c0dd00f` and
 `92686a5`): 39319683794 (index-count assertion), 39320205159 (guard INSERT
@@ -87,4 +99,4 @@ The branch was rebased onto `origin/main` `82e60e7` (which includes migration
 - Guard refusal preserved: `rollback_146_147 blocked: 1 … row(s)`
 - Transcript: `BEGIN → DO → DROP TABLE → 6×ALTER TABLE → DELETE 1 → DELETE 2 → COMMIT`
 - Re-apply + second rollback identical; `constraints_diff.txt` 0 bytes; `schema_diff.txt` 0 bytes
-- Artifacts (12 files): `/tmp/opencode/evidence/rollback_unit4/phase1-rollback-proof/`
+- Artifacts: `phase1-rollback-proof` artifact on the run above (12 files).

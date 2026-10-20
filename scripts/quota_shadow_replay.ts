@@ -126,7 +126,9 @@ function main(): void {
     if (reservedCost !== actualCost) stats.reservedNotEqualActual += 1;
     calls.push({
       occurredAtMs,
-      latencyMs: latency,
+      // The live projection expires leases at the TTL; holding longer in the
+      // replay would overstate in-flight occupancy for very slow calls.
+      latencyMs: Math.min(latency, SHADOW_LEASE_TTL_MS),
       keyFingerprint: keyFp,
       reservedUnits: reservedCost,
       settledUnits: actualCost,
@@ -143,14 +145,14 @@ function main(): void {
     capUnits: args.cap,
     quotaDay: 'America/Los_Angeles',
     boundaryRule:
-      'projected + request <= cap admitted; crossing from below = WOULD_DEFER; projected >= cap = WOULD_REJECT (9000 admitted / 9001 blocked)',
+      `projected + request <= cap admitted; crossing from below = WOULD_DEFER; projected >= cap = WOULD_REJECT (${args.cap} admitted / ${args.cap + 1} blocked)`,
     stats,
     simulations: { withInFlightLeases: withLeases, settledOnly },
   };
   writeFileSync(`${args.out}.json`, `${JSON.stringify(report, null, 2)}\n`);
 
   const lines: string[] = [];
-  lines.push('# Quota cap shadow replay — 9,000 units/key/day');
+  lines.push(`# Quota cap shadow replay — ${args.cap.toLocaleString('en-US')} units/key/day`);
   lines.push('');
   lines.push(`Generated: ${generatedAt}`);
   lines.push(`Source: \`${args.csv}\` (${stats.totalRows} rows)`);

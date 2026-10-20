@@ -18,6 +18,8 @@
 -- NOT to be run against production without an approved maintenance window;
 -- scratch-tested only (see docs/phase1/ROLLBACK_TEST_20261019.md).
 
+\set ON_ERROR_STOP on
+
 BEGIN;
 
 DO $$
@@ -37,8 +39,22 @@ BEGIN
   END IF;
 END $$;
 
--- 147 rollback: drop the bounded probe ledger (its indexes and comments drop
--- with the table). Idempotent.
+-- 147 rollback: refuse to destroy probe history. The ledger is the durable
+-- idempotency/attempt record; dropping it with rows would reset attempt numbers
+-- and allow previously consumed probes to be replayed.
+DO $$
+DECLARE
+  ledger_rows BIGINT := 0;
+BEGIN
+  IF to_regclass('discovery_probe_ledger') IS NOT NULL THEN
+    SELECT count(*) INTO ledger_rows FROM discovery_probe_ledger;
+  END IF;
+  IF ledger_rows > 0 THEN
+    RAISE EXCEPTION
+      'rollback_146_147 blocked: % discovery_probe_ledger row(s) exist; archive them first',
+      ledger_rows;
+  END IF;
+END $$;
 DROP TABLE IF EXISTS discovery_probe_ledger;
 
 -- 146 rollback: restore the exact migration-112 CHECK definitions.
@@ -46,25 +62,35 @@ ALTER TABLE discovery_candidate_staging
   DROP CONSTRAINT IF EXISTS discovery_candidate_staging_discovery_mode_check;
 ALTER TABLE discovery_candidate_staging
   ADD CONSTRAINT discovery_candidate_staging_discovery_mode_check
-  CHECK (discovery_mode IN ('DIRECT_YOUTUBE', 'EXTERNAL_OSINT'));
+  CHECK (discovery_mode IN ('DIRECT_YOUTUBE', 'EXTERNAL_OSINT')) NOT VALID;
+ALTER TABLE discovery_candidate_staging
+  VALIDATE CONSTRAINT discovery_candidate_staging_discovery_mode_check;
 
 ALTER TABLE discovery_candidate_staging
   DROP CONSTRAINT IF EXISTS discovery_candidate_staging_resolution_status_check;
 ALTER TABLE discovery_candidate_staging
   ADD CONSTRAINT discovery_candidate_staging_resolution_status_check
-  CHECK (resolution_status IN ('PENDING', 'RESOLVED', 'FAILED', 'SKIPPED'));
+  CHECK (resolution_status IN ('PENDING', 'RESOLVED', 'FAILED', 'SKIPPED')) NOT VALID;
+ALTER TABLE discovery_candidate_staging
+  VALIDATE CONSTRAINT discovery_candidate_staging_resolution_status_check;
 
 ALTER TABLE discovery_candidate_staging
   DROP CONSTRAINT IF EXISTS discovery_candidate_staging_candidate_type_check;
 ALTER TABLE discovery_candidate_staging
   ADD CONSTRAINT discovery_candidate_staging_candidate_type_check
-  CHECK (candidate_type IN ('CHANNEL_ID', 'HANDLE', 'VIDEO_ID', 'EXTERNAL_EVIDENCE'));
+  CHECK (candidate_type IN ('CHANNEL_ID', 'HANDLE', 'VIDEO_ID', 'EXTERNAL_EVIDENCE')) NOT VALID;
+ALTER TABLE discovery_candidate_staging
+  VALIDATE CONSTRAINT discovery_candidate_staging_candidate_type_check;
 
 -- 146 rollback: remove the provider registry row added by the widening.
 -- (FK on discovery_candidate_staging.provider_key is ON DELETE RESTRICT; the
 -- guard above already proved no staging row references it.)
 DELETE FROM discovery_provider_registry
- WHERE provider_key = 'evidence_extraction';
+ WHERE provider_key = 'evidence_extraction'
+   AND updated_by = 'system:migration-146';
+DELETE FROM discovery_provider_registry
+ WHERE provider_key = 'youtube-innertube'
+   AND updated_by = 'system:migration-147';
 
 -- Allow identical re-application of 146/147 by the version-keyed runner.
 DELETE FROM schema_migrations WHERE version IN (146, 147);

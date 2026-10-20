@@ -176,7 +176,11 @@ function failureCode(error: unknown): string {
   return message.trim() ? message.trim().slice(0, 120) : 'PROBE_EXECUTION_FAILED';
 }
 
-function isNewCreator(outcome: Pick<ProbeIngestResult, 'wasKnown' | 'isNew'>): boolean {
+function isNewCreator(outcome: Pick<ProbeIngestResult, 'wasKnown' | 'isNew' | 'persisted'>): boolean {
+  // A candidate that was not persisted (for example, routed to review before a
+  // canonical channel row was written) is not a discovery. Count only
+  // genuinely net-new, saved channels.
+  if (outcome.persisted === false) return false;
   if (typeof outcome.wasKnown === 'boolean') return outcome.wasKnown === false;
   return outcome.isNew === true;
 }
@@ -212,6 +216,13 @@ export async function runApprovedProbe(
       return skippedSummary('KILL_SWITCH_READ_FAILED', Date.now() - startedAt);
     }
     if (killSwitch === 'true') return skippedSummary('KILL_SWITCH_ACTIVE', Date.now() - startedAt);
+
+    // The bounded probe executor implements only the zero-unit InnerTube lane.
+    // Do not let an allow-official setting silently turn a reservation into an
+    // unaccounted official Data API call.
+    if ((candidate.route ?? 'youtube-innertube') !== 'youtube-innertube') {
+      return skippedSummary('OFFICIAL_ROUTE_NOT_IMPLEMENTED', Date.now() - startedAt);
+    }
 
     const reservation = await reserveProbe(
       {
@@ -379,7 +390,7 @@ export async function runApprovedProbe(
     for (const channel of bounded) {
       try {
         const outcome = await ingestChannel(channel, probe.country);
-        ingestedCount += 1;
+        if (outcome.persisted !== false) ingestedCount += 1;
         if (isNewCreator(outcome)) newCreators += 1;
       } catch (error) {
         ingestFailures.push(`${channel.channelId}:${failureCode(error)}`);
