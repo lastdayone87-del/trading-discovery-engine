@@ -1482,6 +1482,23 @@ export function nextChannelScanAttempts(current:number,terminalSemanticOrSuccess
   return terminalSemanticOrSuccess?0:Math.max(0,current)+1;
 }
 
+/** Click-window offset for an inspection. Initial scans start at zero. A
+ * durable RETRY_COMMUNITY_ACQUISITION inspection uses the job attempt number,
+ * not channel.scan_attempts: successful validation resets that channel field
+ * to zero, which would otherwise pin every FOUND-gap retry to the first click
+ * window. Each retry advances by one full page budget so controls beyond the
+ * first window are eventually examined even when scheduleRetry=false. */
+export function inspectionClickOffsetForRetry(
+  channelAttempts: number | undefined,
+  executionMarker?: { attemptNumber?: number; isRetryOwnedReacquire?: boolean },
+  maxClicksPerPage = 4,
+): number {
+  const channelOffset = Math.max(0, Math.trunc(Number(channelAttempts)) || 0);
+  if (!executionMarker?.isRetryOwnedReacquire) return channelOffset;
+  const attempt = Math.max(0, Math.trunc(Number(executionMarker.attemptNumber)) || 0);
+  return Math.max(channelOffset, attempt * Math.max(1, Math.trunc(maxClicksPerPage) || 4));
+}
+
 /**
  * Projects a live post-inspection country rejection onto the channel row.
  * Mutates and returns the same row: country_status REJECTED, detected
@@ -1696,7 +1713,7 @@ export async function inspectAndValidateChannel(
       socialLinks: rawDetails?.channelLinks || [],
       youtubeUrl: channel.youtube_url,
       forceLiveFetch: isManualScan || !rawDetails?.description,
-      scanAttempts: channel.scan_attempts,
+      scanAttempts: inspectionClickOffsetForRetry(channel.scan_attempts, executionMarker),
       bypassBorrowedCoverage: resolveBorrowBypassForInspectionMarker(executionMarker)
     });
     if(inspection.acquisitionOutcomes?.length)await appendExternalAcquisitionObservations(channel.channel_id,inspection.acquisitionOutcomes)

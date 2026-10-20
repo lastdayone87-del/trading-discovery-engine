@@ -26,7 +26,7 @@ import {
   SITE_INSPECTION_RETRYABLE_FAILURE_TTL_MS,
   type CachedSiteInspection,
 } from './siteInspectionCache';
-import { admitInspectionDiscordCandidates, drainOrphanDiscordCandidates, nextDiscordDuplicateOwnerChannelId, projectNotFoundAfterInspection } from './queueManager';
+import { admitInspectionDiscordCandidates, drainOrphanDiscordCandidates, inspectionClickOffsetForRetry, nextDiscordDuplicateOwnerChannelId, projectNotFoundAfterInspection } from './queueManager';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import type { DiscordCandidate } from './discordCandidates';
@@ -209,6 +209,19 @@ test('cache-only scans preserve duplicate-owner provenance until fresh processed
     previousOwnerChannelId: 'owner-old',
     observations: borrowed,
   }), 'owner-new', 'a fresh duplicate replaces the saved owner even on a mostly cached scan');
+});
+
+test('gap retries advance the click window from durable job attempts despite scan_attempts reset', () => {
+  const retry = (attemptNumber: number) => ({
+    attemptNumber,
+    isRetryOwnedReacquire: true,
+  });
+  assert.equal(inspectionClickOffsetForRetry(0), 0, 'initial inspection starts at the first window');
+  assert.equal(inspectionClickOffsetForRetry(0, retry(1)), 4, 'first durable retry starts after the first four-control window');
+  assert.equal(inspectionClickOffsetForRetry(0, retry(2)), 8, 'later retries advance to the next window even when scan_attempts was reset to 0');
+  assert.equal(inspectionClickOffsetForRetry(10, retry(1)), 10, 'a larger channel offset is never regressed');
+  assert.equal(inspectionClickOffsetForRetry(0, { attemptNumber: 3, isRetryOwnedReacquire: false }), 0, 'non-retry scans keep their channel offset');
+  assert.match(readSource('queueManager.ts'), /scanAttempts: inspectionClickOffsetForRetry\(channel\.scan_attempts, executionMarker\)/);
 });
 
 test('E6: orphan drain re-admits claimable orphans and removes foreign-owned residue', async () => {
