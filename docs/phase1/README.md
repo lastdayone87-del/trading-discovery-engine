@@ -9,10 +9,10 @@ be corrected.
 
 | Item | State |
 | --- | --- |
-| PR #531 (migrations 146/147/148 + discovery hardening) | Open; head `64d83fb`; all code workflows green at that head; round-1 fixes pushed; review follow-up pending. PR Agent is failing only on `API_KEY_INVALID` (tooling), not code |
+| PR #531 (migrations 146/147/148 + discovery hardening) | Open; head `8e696ed`; all code workflows green at that head; round-1 fixes pushed; round-2 follow-ups pushed. PR Agent still fails only on `API_KEY_INVALID` (tooling), not code |
 | PR #530 (discovery integrity) | **Merged into `phase1-hardening` at `6267ba1` by an external actor, not this session.** Added migrations 149–152 and changed the base/order; do not treat this as approval of #531 |
 | Migrations 148 and 149–152 | In the `phase1-hardening` lineage; applied only to disposable CI databases; **not** applied to production |
-| Hard cap (9,000 units/key/Pacific day) | Implemented on `feat/youtube-key-hard-cap` head `c7f66dc`, rebased on `64d83fb`; CI run [39497257438](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39497257438) (50/50 unit, 20/20 PostgreSQL when green); **default OFF, not deployed, not enabled** |
+| Hard cap (9,000 units/key/Pacific day) | Implemented on `feat/youtube-key-hard-cap` head `c7f66dc`, rebased on `64d83fb`; CI run [39497257438](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39497257438) green (50/50 unit, 21/21 PostgreSQL); **default OFF, not deployed, not enabled** |
 | InnerTube production use | **Not authorized** — see [INNERTUBE_POLICY_POSITION_20261020.md](INNERTUBE_POLICY_POSITION_20261020.md) |
 | Probe pilot | **Not runnable** while the InnerTube position is unresolved; limits below. No probe has been run. Probe-ledger units are retrieval-only; delegated ingestion official spend is separately accounted |
 | GCP key-suspension investigation | **Open / access-blocked** — see [GCP_SUSPENSION_DIAGNOSTIC_20261020.md](GCP_SUSPENSION_DIAGNOSTIC_20261020.md) |

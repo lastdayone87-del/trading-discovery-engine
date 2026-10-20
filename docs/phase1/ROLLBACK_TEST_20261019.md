@@ -1,8 +1,8 @@
 # Rollback proof — migrations 146/147 (2026-10-19)
 
 Status: **PASS.** GitHub Actions run
-[39481878050](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39481878050)
-(branch `phase1-hardening`, head `f3e5f43`) is green on a disposable
+[39500041456](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39500041456)
+(branch `phase1-hardening`, head `8e696ed`) is green on a disposable
 `postgres:17` service container. It verifies the current fixes: numeric
 `<=145` pre-state selection, preservation of the pre-existing migration-130
 `youtube-innertube` provider row, ledger-row guard, and `ON_ERROR_STOP`.
@@ -68,7 +68,7 @@ approved disposable pattern (used by `corpus-claim-budget-pg.yml` and
 ## Evidence inventory
 
 The durable evidence for the current green run is the
-`phase1-rollback-proof` GitHub Actions artifact attached to run 39481878050: `server_version.txt`,
+`phase1-rollback-proof` GitHub Actions artifact attached to run 39500041456: `server_version.txt`,
 `pre_state_max_version.txt`, `constraints_pre.txt`, `constraints_post.txt`,
 `constraints_final.txt`, `constraints_diff.txt`, `schema_pre.sql`,
 `schema_final.sql`, `schema_diff.txt`, `rollback_guard_blocked.log`,
@@ -92,7 +92,7 @@ destructively) while evidence-only staging rows exist.
 
 ## Current fix verification (2026-10-20)
 
-- CI run (success): https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39481878050 · HEAD `f3e5f43`
+- CI run (success): https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39500041456 · HEAD `8e696ed`
 - PostgreSQL 17.11; `pre_state_max_version=145`
 - Guard refusal preserved: `rollback_146_147 blocked: 1 … row(s)`
 - Transcript: `BEGIN → DO → DO → DROP TABLE → 9×ALTER TABLE → DELETE 1 → DELETE 0 → DELETE 2 → COMMIT`

@@ -1,8 +1,8 @@
 # Unit 3 — 9,000-unit/key/day quota cap, shadow mode only
 
-Date: 2026-10-19 (updated 2026-10-20) · Branch: `phase1-hardening` · Implementation SHA: `64d83fb`
+Date: 2026-10-19 (updated 2026-10-20) · Branch: `phase1-hardening` · Implementation SHA: `8e696ed`
 (after the external #530 merge `6267ba1`; CI green run:
-https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39490594873)
+https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39500041358)
 
 Scope: observational shadow accounting for a projected per-key YouTube daily
 cap of **9,000 units**. Hard enforcement, key configuration changes and any
@@ -73,17 +73,17 @@ rows and runs no sweeps.
 ## Test evidence
 
 - Unit (CI, `server/quotaKeyCapShadow.test.ts` + `server/discovery/probeExecutor.test.ts`):
-  **32/32 pass, 0 skipped** (17 quota + 15 probe); `npx tsc --noEmit` clean.
+  **33/33 pass, 0 skipped** (18 quota + 15 probe); `npx tsc --noEmit` clean.
 - PostgreSQL (CI postgres:17, full migration lineage via `runMigrations.ts`,
-  includes 148): **10/10 pass, 0 skipped** — 8 shadow cases (boundary, defer,
+  includes 148): **11/11 pass, 0 skipped** — 9 quota/shadow cases (boundary, defer,
   duplicate accounting, 20-way concurrency, stale-lease sweep + restart,
   settlement) and 2 probe-budget cases (different candidates on one day, and
   different days against the absolute total cap).
-  Run https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39490594873.
-- Rollback proof at `64d83fb`: **pass**, pre-state 145, zero schema/constraint
+  Run https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39500041358.
+- Rollback proof at `8e696ed`: **pass**, pre-state 145, zero schema/constraint
   drift; constraints sha256 `870ec871…d3dee`, schema sha256 `140cc55b…7ea`
-  (run https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39490594874).
-- All other workflows at `64d83fb` are green. The PR Agent workflow failed on
+  (run https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39500041456).
+- All other workflows at `8e696ed` are green. The PR Agent workflow failed on
   an invalid Gemini API key (`API_KEY_INVALID`), an infrastructure failure, not
   a code finding.
 
