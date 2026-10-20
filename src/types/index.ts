@@ -7,6 +7,7 @@ export interface DashboardOperationalSummary {
   activeDiscords: number;
   pendingScans: number;
   pendingReviews: number;
+  legacyUnclassifiedChannels: number;
   scope: { storedChannels: 'ALL_STORED_CHANNELS'; operationalMetrics: 'ALL_STORED_CHANNELS'; pendingReviews: 'DURABLE_REVIEW_QUEUE' };
   deployment: { environment: string; service: string; instance: string };
 }
@@ -17,6 +18,25 @@ export type DiscordResolutionStatus='NOT_ATTEMPTED'|'RESOLVED'|'UNRESOLVED';
 export type DiscordLivenessStatus='NOT_CHECKED'|'ACTIVE'|'INVALID_OBSERVED'|'DEAD'|'UNCERTAIN';
 export type DiscordRelevanceStatus='NOT_CHECKED'|'TRADING_RELEVANT'|'NON_TRADING'|'UNCERTAIN';
 export type DiscordValidationStatus='NOT_STARTED'|'RETRY_PENDING'|'SUCCEEDED'|'FAILED_OPERATIONAL'|'COMPLETED';
+/** Platform community surfaces (paid/private membership products) observed by
+ * inspection. Evidence that a community exists even when no Discord invite can
+ * be verified; never a substitute for a verified Discord invite. */
+export type CommunityPlatform = 'WHOP' | 'SKOOL' | 'CIRCLE' | 'PATREON' | 'OTHER';
+/** Access character of an observed community surface. UNKNOWN means a platform
+ * community URL was observed but the static evidence neither proved paid nor
+ * public access; it is still community evidence, not "no community". */
+export type CommunityIntentKind = 'PUBLIC' | 'PAID' | 'PRIVATE' | 'UNKNOWN';
+export type CommunityDiscoveryStatus = 'NONE' | 'COMMUNITY_INDICATED_NO_INVITE' | 'PAID_COMMUNITY_INDICATED';
+export interface CommunityIntentEvidence {
+  communityPlatform: CommunityPlatform;
+  communityUrl: string;
+  intent: CommunityIntentKind;
+  paidSignals: string[];
+  privateSignals: string[];
+  observedAt: string;
+  sourcePageUrl: string;
+  extractionConfidence: 'EXPLICIT' | 'INFERRED';
+}
 
 export type ScanStatus = 'PENDING' | 'LOCKED' | 'ENRICHMENT_PENDING' | 'ENRICHING' | 'PROVIDER_DEFERRED' | 'NEEDS_REVIEW' | 'COMPLETED' | 'FAILED' | 'FAILED_PERMANENT' | 'SKIPPED_NON_TRADING' | 'SKIPPED_EXCLUDED' | 'SKIPPED_LOW_AUDIENCE';
 
@@ -149,6 +169,10 @@ export interface ChannelRecord {
   confidence_score: number;
   discord_status: DiscordStatus;
   discord_invite?: string | null;
+  /** Earliest successful validation of the selected invite, or null when no
+   * trustworthy confirmation timestamp exists. Never derived from first_seen
+   * or enrichment time. */
+  discord_invite_first_validated_at?: string | null;
   discord_discovery_status?: DiscordDiscoveryStatus;
   discord_candidate_locator?: string | null;
   discord_candidate_id?: string | null;
@@ -158,7 +182,17 @@ export interface ChannelRecord {
   discord_liveness_status?: DiscordLivenessStatus;
   discord_relevance_status?: DiscordRelevanceStatus;
   discord_validation_status?: DiscordValidationStatus;
-  discord_candidates?: Array<{candidate_id:string;raw_locator:string;normalized_locator:string;display_locator?:string|null;locator_type:string;source_surface?:string;source_url?:string;source_observations?:Array<{sourceSurface?:string;sourceUrl?:string;rawLocator?:string}>;candidate_status:string;validation_status:string;liveness_status:string;relevance_status:string;retryable:boolean;attempt_count:number;last_checked?:string;failure_reason?:string;selected:boolean}>;
+  discord_candidates?: Array<{candidate_id:string;raw_locator:string;normalized_locator:string;display_locator?:string|null;locator_type:string;source_surface?:string;source_url?:string;source_observations?:Array<{sourceSurface?:string;sourceUrl?:string;rawLocator?:string}>;candidate_status:string;validation_status:string;liveness_status:string;relevance_status:string;retryable:boolean;attempt_count:number;first_validated_at?:string|null;last_checked?:string;failure_reason?:string;selected:boolean}>;
+  /** Platform community intent observed by inspection: distinguishes "a
+   * community exists (possibly paid/private) but no Discord invite was
+   * verified" from "no community found". Never carries an invite. */
+  community_discovery_status?: CommunityDiscoveryStatus;
+  community_intents?: CommunityIntentEvidence[] | null;
+  /** Non-null when an invite was found but its registry owner is another
+   * channel. Owner id only; never the code, a candidate, or an assignment. */
+  discord_duplicate_owner_channel_id?: string | null;
+  /** Read-only reporting classification; never persisted. */
+  discovery_visibility?: 'VALIDATED' | 'DISCOVERED_VALIDATION_FAILED' | 'NOT_DISCOVERED' | 'LEGACY_UNCLASSIFIED';
   post_approval_job_status?: 'PENDING'|'PROCESSING'|'COMPLETED'|'FAILED';
   post_approval_job_error?: string;
   post_approval_job_attempts?: number;

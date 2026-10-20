@@ -95,6 +95,18 @@ test('n-gram segmentation stops at stopwords and never fabricates cross-boundary
   assert.ok(!terms.includes('for beginners'));
 });
 
+test('single-character stopwords remain n-gram boundaries', () => {
+  const candidates = extractEvidenceCandidates({
+    channelId: 'UCsingleCharStopwords',
+    description: 'alpha a beta mercado y trading lucro e perda I trade',
+  });
+  const terms = candidates.map(candidate => candidate.normalizedTerm);
+  assert.ok(!terms.includes('alpha beta'), `fabricated English boundary: ${JSON.stringify(terms)}`);
+  assert.ok(!terms.includes('mercado trading'), `fabricated Spanish boundary: ${JSON.stringify(terms)}`);
+  assert.ok(!terms.includes('lucro perda'), `fabricated Portuguese boundary: ${JSON.stringify(terms)}`);
+  assert.ok(!terms.includes('i trade'), `single-letter English stopword leaked: ${JSON.stringify(terms)}`);
+});
+
 test('structured videos take precedence over parallel title/description arrays', () => {
   const candidates = extractEvidenceCandidates({
     channelId: 'UCprecedence',

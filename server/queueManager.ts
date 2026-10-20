@@ -32,22 +32,30 @@ import {
   persistDiscordCandidates,
   claimDiscordInvites,
   deleteDiscordCandidates,
+  getDbStatementNow,
+  listOrphanDiscordCandidates,
+  deleteOrphanDiscordCandidates,
   selectDiscordCandidate,
   countDiscordInvalidObservations,
   countDiscordProviderFailureObservations,
   appendExternalAcquisitionObservations,
   getNeighborhoodForQueryRun,
   markCommunityInspectionStarted,
+  markSiteInspectionsClaimed,
+  markSiteInspectionsDiscarded,
+  markSiteInspectionsRejected,
   type DiscordAttemptCandidate,
-  type DiscordInviteClaim
+  type DiscordInviteClaim,
+  type OrphanDiscordCandidateRow,
 } from './db';
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
 import { reserveIncrementalTreatmentPageQuota, enqueueChildAndCommitPageReservation } from './retrievalPolicyCanary';
 import { resolveExecutionSearchWindow } from './retrievalExperiment';
 import { trialContinuationCap } from './discoveryFrontierTrials';
 import { aggregatedLanguageCandidateSet, mergeCountryValidationResults, validateChannelCountry } from './countryValidator';
-import { runChannelInspection } from './inspector';
+import { runChannelInspection, hasProcessedAcquisitionEvidence } from './inspector';
 import { hasRetryableCommunityAcquisitionFailure } from './communityRetryPolicy';
+import { applyCommunityIntentEvidence } from './communityIntent';
 import { validateDiscordInvite } from './discordValidator';
 import {projectDiscordValidation, reconcileDiscordDiscoveryFromInspection} from './discordProjection';
 import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, fetchYouTubeChannelCountryMetadata, DiscoveredChannelRaw, RetrievalLane } from './youtube';
@@ -96,10 +104,10 @@ import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
 import { triggerPhaseBObservationReconciliation } from './phaseBObservationOutbox';
 import { bumpCommunitySaturationDeferral } from './operationsTelemetry';
 import { canContinueCommunityInspectionAfterDegradedManualClassification } from './manualRecheckPolicy';
-import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_RETRY_REASON, FOUND_GAP_RETRYABLE_FAILURE_CLASSES, buildCommunityRetryJobMetadata, isAttemptFreeCommunityFailure, attemptFreeDiscordValidation, retryAtFromUnknown, retryReasonFromError, type CommunityRetryDirective} from './communityRetryPolicy';
+import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_ACQUISITION_REQUIRED, COMMUNITY_RETRY_REASON, FOUND_GAP_RETRYABLE_FAILURE_CLASSES, buildCommunityRetryJobMetadata, isAttemptFreeCommunityFailure, attemptFreeDiscordValidation, retryAtFromUnknown, retryReasonFromError, type CommunityRetryDirective} from './communityRetryPolicy';
 import { classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
 import { discordCandidateCompositeRank } from './discordOwnershipSelection';
-import { admitDiscordCandidates, buildLegacyDiscordCandidate, discordInviteCodeOf, type DiscordCandidate } from './discordCandidates';
+import { admitDiscordCandidates, buildLegacyDiscordCandidate, canonicalDiscordInviteId, discordInviteCodeOf, extractDiscordInviteCodeRaw, inferDiscordOwnership, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
 import { processPendingStagedCandidates } from './candidateStaging';
 
 const WORKER_ID = `worker_${process.pid}`;
@@ -266,14 +274,19 @@ export function resolveBorrowBypassForInspectionMarker(marker?: { isRetryOwnedRe
 /**
  * Choke-point orchestration for global canonical Discord discard. Crash-safe
  * ordering per call: persist provisional rows (idempotent upsert), claim all
- * codes, delete losers. Dependencies are injectable so invocation order,
- * payloads, and admission outcomes are unit-testable without a database;
+ * codes, delete losers. Deletion is execution-scoped by exact candidate id AND
+ * a DB-clock watermark captured before persisting, so pre-existing rows for the
+ * same channel are never collateral. Dependencies are injectable so invocation
+ * order, payloads, and admission outcomes are unit-testable without a database;
  * production passes the real persist/claim/delete implementations.
  */
 export interface DiscordChokeDeps {
   persist(channelId: string, candidates: DiscordAttemptCandidate[]): Promise<void>;
   claim(items: Array<{ code: string; sourceSurface?: string | null; sourceUrl?: string | null }>, channelId: string): Promise<DiscordInviteClaim[]>;
-  removeLosers(channelId: string, codes: string[], onlyNewerThan: string): Promise<number>;
+  removeLosers(channelId: string, codes: string[], candidateIds: string[], onlyNewerThan: string): Promise<number>;
+  /** Execution clock seam (E10). Production reads the DB statement clock so
+   * the deletion watermark shares the clock that wrote `discovered_at`. */
+  executionNow(): Promise<string>;
 }
 export async function admitInspectionDiscordCandidates(
   structuredCandidates: DiscordCandidate[],
@@ -282,9 +295,10 @@ export async function admitInspectionDiscordCandidates(
   deps: DiscordChokeDeps = {
     persist: (targetChannelId, candidates) => persistDiscordCandidates(targetChannelId, candidates),
     claim: (items, targetChannelId) => claimDiscordInvites(items, targetChannelId),
-    removeLosers: (targetChannelId, codes, onlyNewerThan) => deleteDiscordCandidates(targetChannelId, codes, onlyNewerThan),
+    removeLosers: (targetChannelId, codes, candidateIds, onlyNewerThan) => deleteDiscordCandidates(targetChannelId, codes, candidateIds, onlyNewerThan),
+    executionNow: () => getDbStatementNow(),
   },
-): Promise<{ candidates: DiscordCandidate[]; discoveredInvite: string | null; discardedCount: number }> {
+): Promise<{ candidates: DiscordCandidate[]; discoveredInvite: string | null; discardedCount: number; discardedOwnerChannelIds: string[] }> {
   const toPersist = (list: DiscordCandidate[]) => list.map(candidate => ({
     candidateId: candidate.candidateId,
     rawLocator: candidate.rawLocator,
@@ -295,21 +309,30 @@ export async function admitInspectionDiscordCandidates(
     observations: candidate.observations,
   }));
   // Provisional watermark: loser cleanup only removes rows created by this
-  // execution (discovered_at at/after the first persist below). Pre-existing
-  // validated/selected/historical rows for the same channel are never deleted
-  // merely because the channel later loses the global claim.
-  const provisionalSince = new Date().toISOString();
+  // execution (discovered_at at/after the DB statement clock read below).
+  // DB-side time keeps the window consistent with persisted discovered_at.
+  const provisionalSince = await deps.executionNow();
   const preLegacy = !structuredCandidates.length && foundInvite
     ? buildLegacyDiscordCandidate(foundInvite, discordInviteCodeOf(foundInvite))
     : null;
   const provisional = [...structuredCandidates, ...(preLegacy ? [preLegacy] : [])];
   if (provisional.length) await deps.persist(channelId, toPersist(provisional));
+  const provisionalIdsForCode = (want: Set<string>) => [...new Set(provisional
+    .filter(candidate => { const code = discordInviteCodeOf(candidate.nativeInviteCode); return !!code && want.has(code); })
+    .map(candidate => candidate.candidateId)
+    .filter(Boolean))];
   const claimSources = new Map<string, { surface: string | null; url: string | null }>();
   for (const candidate of provisional) {
     const code = discordInviteCodeOf(candidate.nativeInviteCode);
     if (code && !claimSources.has(code)) claimSources.set(code, { surface: candidate.sourceSurface || null, url: candidate.sourceUrl || null });
   }
   const inviteClaims = await deps.claim([...claimSources.entries()].map(([code, src]) => ({ code, sourceSurface: src.surface, sourceUrl: src.url })), channelId);
+  // Provenance only: owner ids of codes this inspection found but could not
+  // claim. The code itself is deliberately not persisted on the affected
+  // channel (no invite assignment, no candidate row).
+  const discardedOwnerChannelIds = inviteClaims
+    .filter(claim => !claim.admitted && claim.firstChannelId && claim.firstChannelId !== channelId)
+    .map(claim => String(claim.firstChannelId));
   let admittedCodes = new Set(inviteClaims.filter(claim => claim.admitted).map(claim => claim.code));
   let admission = admitDiscordCandidates(structuredCandidates, foundInvite, admittedCodes);
   // A trail-level foundInvite naming a code outside the structured set is
@@ -327,13 +350,127 @@ export async function admitInspectionDiscordCandidates(
         admittedCodes = new Set([...admittedCodes, foundCode]);
         admission = admitDiscordCandidates(structuredCandidates, foundInvite, admittedCodes);
       } else {
-        await deps.removeLosers(channelId, [foundCode], provisionalSince);
+        if (legacyClaim.firstChannelId && legacyClaim.firstChannelId !== channelId) discardedOwnerChannelIds.push(String(legacyClaim.firstChannelId));
+        await deps.removeLosers(channelId, [foundCode], [legacyFallback.candidateId], provisionalSince);
       }
     }
   }
   const loserCodes = [...claimSources.keys()].filter(code => !admittedCodes.has(code));
-  if (loserCodes.length) await deps.removeLosers(channelId, loserCodes, provisionalSince);
-  return { candidates: admission.candidates, discoveredInvite: admission.discoveredInvite, discardedCount: admission.discardedCount };
+  if (loserCodes.length) await deps.removeLosers(channelId, loserCodes, provisionalIdsForCode(new Set(loserCodes)), provisionalSince);
+  return { candidates: admission.candidates, discoveredInvite: admission.discoveredInvite, discardedCount: admission.discardedCount, discardedOwnerChannelIds: [...new Set(discardedOwnerChannelIds)] };
+}
+/**
+ * Duplicate-owner provenance projection (E8/E9 follow-up). A fresh duplicate
+ * claim always replaces the saved owner id. When no duplicate was observed,
+ * only complete, fresh website/social coverage can prove the prior duplicate
+ * disappeared. Absence needs aggregate completeness, not one successful seed:
+ *  - cache-only borrows are never proof (they return no candidates);
+ *  - any failed, partial, or unprocessed seed leaves the prior owner intact
+ *    because that seed could still contain the duplicate;
+ *  - the owner clears only when every relevant observation is a fresh
+ *    processed negative or a FOUND row from this execution.
+ * A single FOUND alongside a failed seed therefore preserves provenance.
+ * Pure and unit-tested.
+ */
+export function nextDiscordDuplicateOwnerChannelId(input: {
+  discardedOwnerChannelIds: string[];
+  previousOwnerChannelId?: string | null;
+  observations: Array<{
+    surface?: string;
+    outcome?: string;
+    telemetry?: { pagesInspected?: number; requestsStarted?: number; redirectsFollowed?: number };
+    sharedEvidenceFrom?: string;
+    siteCacheHit?: unknown;
+  }>;
+}): string | null {
+  const replacement = input.discardedOwnerChannelIds.find(Boolean);
+  if (replacement) return replacement;
+  const relevant = (input.observations || []).filter(observation =>
+    observation && (observation.surface === 'CREATOR_WEBSITES' || observation.surface === 'SOCIAL_PROFILES'));
+  if (!relevant.length) return input.previousOwnerChannelId || null;
+  const completeAbsenceEvidence = relevant.every(observation => {
+    if (observation.siteCacheHit === true) return false;
+    if (observation.outcome === 'FOUND') return true;
+    return observation.outcome === 'INSPECTED_NO_MATCH'
+      && hasProcessedAcquisitionEvidence(observation as Parameters<typeof hasProcessedAcquisitionEvidence>[0]);
+  });
+  return completeAbsenceEvidence ? null : (input.previousOwnerChannelId || null);
+}
+/**
+ * Orphan drain (E6). Candidates persisted by an execution that never reached
+ * validation (crash window between persist and claim) sit as
+ * candidate_status='DISCOVERED'/validation_status='NOT_STARTED' forever unless
+ * the exact code is rediscovered. The next inspection of the owning channel
+ * re-admits them through the same global claim: codes still available (or
+ * already owned by this channel) join the normal validation set; codes owned
+ * by another channel are residue and are removed by exact candidate id.
+ */
+export async function drainOrphanDiscordCandidates(
+  channelId: string,
+  deps: Pick<DiscordChokeDeps, 'claim'> & {
+    list(channelId: string, limit?: number): Promise<OrphanDiscordCandidateRow[]>;
+    removeOrphans(channelId: string, candidateIds: string[]): Promise<number>;
+  } = {
+    claim: (items, targetChannelId) => claimDiscordInvites(items, targetChannelId),
+    list: (targetChannelId, limit) => listOrphanDiscordCandidates(targetChannelId, limit),
+    removeOrphans: (targetChannelId, candidateIds) => deleteOrphanDiscordCandidates(targetChannelId, candidateIds),
+  },
+  limit = 5,
+): Promise<{ candidates: DiscordCandidate[]; removed: number; discardedOwnerChannelIds: string[] }> {
+  const rows = await deps.list(channelId, limit);
+  if (!rows.length) return { candidates: [], removed: 0, discardedOwnerChannelIds: [] };
+  // Orphan rows are matched by exact candidate id and the same
+  // DISCOVERED/NOT_STARTED predicate that listed them; their discovered_at
+  // predates this execution, so no time watermark applies.
+  const sources = new Map<string, { surface: string | null; url: string | null }>();
+  for (const row of rows) {
+    const code = discordInviteCodeOf(row.canonicalCode || row.normalizedLocator);
+    if (code && !sources.has(code)) sources.set(code, { surface: row.sourceSurface, url: row.sourceUrl });
+  }
+  const claims = await deps.claim([...sources.entries()].map(([code, src]) => ({ code, sourceSurface: src.surface, sourceUrl: src.url })), channelId);
+  const admitted = new Set(claims.filter(claim => claim.admitted).map(claim => claim.code));
+  // A discarded orphan is still positive evidence that the channel publishes
+  // this invite, so retain the foreign owner for dashboard provenance even
+  // though the code and candidate row are deleted below.
+  const foreignOwnerByCode = new Map<string, string>();
+  for (const claim of claims) {
+    if (!claim.admitted && claim.firstChannelId && claim.firstChannelId !== channelId) {
+      foreignOwnerByCode.set(claim.code, claim.firstChannelId);
+    }
+  }
+  const discardedOwnerChannelIds = new Set<string>();
+  const loserIds: string[] = [];
+  const candidates: DiscordCandidate[] = [];
+  for (const row of rows) {
+    const code = discordInviteCodeOf(row.canonicalCode || row.normalizedLocator);
+    if (!code || !admitted.has(code)) {
+      const owner = code ? foreignOwnerByCode.get(code) : undefined;
+      if (owner) discardedOwnerChannelIds.add(owner);
+      if (row.candidateId) loserIds.push(row.candidateId);
+      continue;
+    }
+    // Preserve the original-case invite code for validation (Discord codes are
+    // case-sensitive) and re-derive ownership from the persisted observations.
+    // The registry claim above intentionally uses the lowercase key only.
+    const nativeInviteCode = extractDiscordInviteCodeRaw(row.rawLocator)
+      || extractDiscordInviteCodeRaw(row.normalizedLocator)
+      || code;
+    const recovered: DiscordCandidate = {
+      candidateId: row.candidateId,
+      canonicalInviteId: canonicalDiscordInviteId(code),
+      locatorType: (row.locatorType as DiscordCandidate['locatorType']) || 'NATIVE_INVITE',
+      sourceSurface: (row.sourceSurface as DiscordCandidate['sourceSurface']) || 'CHANNEL_EXTERNAL_LINKS',
+      rawLocator: row.rawLocator || row.normalizedLocator,
+      normalizedLocator: row.normalizedLocator,
+      nativeInviteCode,
+      sourceUrl: row.sourceUrl || undefined,
+      extractionConfidence: 'EXPLICIT',
+      observations: row.observations as DiscordCandidate['observations'],
+    };
+    candidates.push({...recovered,...inferDiscordOwnership(recovered)});
+  }
+  const removed = loserIds.length ? await deps.removeOrphans(channelId, loserIds) : 0;
+  return { candidates, removed, discardedOwnerChannelIds: [...discardedOwnerChannelIds] };
 }
 /**
  * Pure SEARCH worker wall-time split (observability only): quota-wait vs
@@ -583,7 +720,7 @@ export async function processNextSearchJob(
       // unresolved acquisition for the same channel: its inspection must
       // re-acquire rather than borrow its own incomplete coverage in a loop.
       // First-time inspections leave the flag unset and borrow normally.
-      const inspectionResult=await inspectAndValidateChannel(channel,undefined,false,false,false,{jobId:job.id,attemptNumber:job.attempts,isRetryOwnedReacquire:true});
+      const inspectionResult=await inspectAndValidateChannel(channel,undefined,false,false,false,{jobId:job.id,attemptNumber:job.attempts,isRetryOwnedReacquire:true,clickOffsets:resolveInspectionClickOffsets(job.payload.clickOffsets)});
       // Attempt-free deferral is reserved for capacity/browser signals where no
       // real acquisition was attempted (browser runtime unavailable). Genuine
       // acquisition failures (COMMUNITY_REQUIRED) consumed a real inspection
@@ -702,7 +839,10 @@ export async function processNextSearchJob(
       if(investigationId)candidate.investigationId=investigationId;
       await assertCountryAllowed(targetCountry, `enrichment_worker:${job.id}`);
       const channel = await getChannelById(channelId);
-      if (!channel || isTerminalState(channel) || channel.trading_status !== 'UNCERTAIN') {
+      // REJECTED rows are terminal for every pipeline (isTerminalState) and
+      // are additionally guarded explicitly here (P2) so a future terminal
+      // state change can never let an excluded creator spend enrichment quota.
+      if (!channel || channel.country_status === 'REJECTED' || isTerminalState(channel) || channel.trading_status !== 'UNCERTAIN') {
         // Retry repair: a retried ENRICH job replays vocabulary extraction so a
         // save that failed after its observation committed cannot strand rows
         // behind this early completion (same bars as the ingestion helper).
@@ -1366,6 +1506,55 @@ export function nextChannelScanAttempts(current:number,terminalSemanticOrSuccess
   return terminalSemanticOrSuccess?0:Math.max(0,current)+1;
 }
 
+/** Click-window offset default for an inspection. Initial scans keep the
+ * channel's legacy attempt offset; a durable retry starts every newly seen
+ * seed at zero and reads per-seed progress from the retry payload. Job attempt
+ * numbers deliberately never advance this value: a retry that failed before
+ * clicking any control must reuse the same window. */
+export function inspectionClickOffsetForRetry(
+  channelAttempts: number | undefined,
+  executionMarker?: { isRetryOwnedReacquire?: boolean },
+): number {
+  const channelOffset = Math.max(0, Math.trunc(Number(channelAttempts)) || 0);
+  return executionMarker?.isRetryOwnedReacquire ? 0 : channelOffset;
+}
+
+/** Defensive projection of durable retry click offsets from JSON payloads.
+ * Invalid entries are dropped; a retry then restarts that seed at zero rather
+ * than trusting a non-numeric offset. */
+export function resolveInspectionClickOffsets(value: unknown): Record<string, number> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const offsets: Record<string, number> = {};
+  for (const [url, raw] of Object.entries(value as Record<string, unknown>)) {
+    const offset = Math.trunc(Number(raw));
+    if (!url || !Number.isFinite(offset) || offset <= 0) continue;
+    offsets[url] = offset;
+  }
+  return Object.keys(offsets).length ? offsets : undefined;
+}
+
+/** Persist per-seed click progress on the currently processing retry job.
+ * Without this write the same durable attempt would reload its pre-run payload
+ * on failJob and re-click the same window; progress is attempt state, not only
+ * next-enqueue state. Best-effort and non-empty only: an empty map must never
+ * erase previously recorded progress. */
+export async function persistCommunityRetryClickOffsets(
+  jobId: string,
+  offsets: Record<string, number> | undefined,
+  clientOverride?: { query(sql: string, params?: unknown[]): Promise<unknown> },
+): Promise<void> {
+  const safe = resolveInspectionClickOffsets(offsets);
+  if (!jobId || !safe) return;
+  const db = clientOverride || await getDb();
+  // Deep-merge per-seed offsets: a partial map (manual retry, one seed
+  // re-inspected) must never erase progress recorded for other seeds on the
+  // same durable job. Incoming values win for keys they contain.
+  await db.query(
+    `UPDATE jobs SET payload=(payload - 'clickOffsets') || jsonb_build_object('clickOffsets',COALESCE(payload->'clickOffsets','{}'::jsonb) || $2::jsonb),updated_at=now() WHERE id=$1 AND status='PROCESSING'`,
+    [jobId, JSON.stringify(safe)]
+  );
+}
+
 /**
  * Projects a live post-inspection country rejection onto the channel row.
  * Mutates and returns the same row: country_status REJECTED, detected
@@ -1443,7 +1632,7 @@ export async function inspectAndValidateChannel(
   isManualScan: boolean = false,
   enableDebug: boolean = false,
   scheduleRetry: boolean = true,
-  executionMarker?: { jobId: string; attemptNumber: number; isRetryOwnedReacquire?: boolean }
+  executionMarker?: { jobId: string; attemptNumber: number; isRetryOwnedReacquire?: boolean; clickOffsets?: Record<string, number> }
 ): Promise<{ debugLog?: any; inspection?: Awaited<ReturnType<typeof runChannelInspection>>; retryDirective?: CommunityRetryDirective } | void> {
   if (isTerminalState(channel) && !isManualScan) {
     console.log(`[Queue Manager] Channel '${channel.channel_name}' (${channel.channel_id}) is in terminal state '${channel.country_status}' / '${channel.trading_status}'. Aborting inspection.`);
@@ -1455,6 +1644,37 @@ export async function inspectAndValidateChannel(
     channel.scan_status = 'PENDING';
     await upsertChannel(channel);
     return;
+  }
+
+  // Retry-owned stored-country pre-check (P2): a durable retry must not spend
+  // a crawl/persist/claim cycle on a creator whose stored country evidence
+  // already resolves excluded under the current policy. The live revalidation
+  // below runs with whatever metadata the retry carries (often none), so
+  // without this check a policy-updated exclusion list could let the retry
+  // claim invites that a metadata-complete run would reject before any claim.
+  // Only proven evidence blocks (CONFIRMED stored country + exclusion-list
+  // match), exactly like the ENRICH claim gate; LIKELY and below stay
+  // fail-open.
+  if (executionMarker?.isRetryOwnedReacquire && channel.country_status === 'CONFIRMED' && channel.country) {
+    const storedExclusion = await getCountryExclusion(channel.country);
+    const storedBlock = shouldBlockEnrichClaimForCountry(channel.country_status, channel.country, storedExclusion);
+    if (storedBlock) {
+      const rejectionNow = new Date().toISOString();
+      channel.country_status = 'REJECTED';
+      channel.scope_eligibility = resolveScopeEligibility(channel.country);
+      channel.scan_status = 'COMPLETED';
+      channel.last_checked = rejectionNow;
+      channel.inspection_trail = [...(channel.inspection_trail || []), {
+        step: 'COUNTRY_VALIDATION',
+        title: `Country Validation (${channel.country})`,
+        status: 'REJECTED',
+        details: `${channel.country} is excluded by policy: ${storedBlock.reason}. Blocked retry-owned reacquisition before crawl/claim.`,
+        timestamp: rejectionNow,
+      }];
+      await upsertChannel(channel);
+      console.warn(JSON.stringify({event:'excluded_channel_blocked',channelId:channel.channel_id,detectedCountry:channel.country,reason:storedBlock.reason,context:'retry_owned_reacquire',timestamp:rejectionNow}));
+      return;
+    }
   }
 
   // Durable proof that community inspection genuinely began. Both early
@@ -1549,41 +1769,32 @@ export async function inspectAndValidateChannel(
       socialLinks: rawDetails?.channelLinks || [],
       youtubeUrl: channel.youtube_url,
       forceLiveFetch: isManualScan || !rawDetails?.description,
+      scanAttempts: inspectionClickOffsetForRetry(channel.scan_attempts, executionMarker),
+      clickOffsets: executionMarker?.isRetryOwnedReacquire ? resolveInspectionClickOffsets(executionMarker.clickOffsets) : undefined,
       bypassBorrowedCoverage: resolveBorrowBypassForInspectionMarker(executionMarker)
     });
+    // Carry only controls this run actually examined into any retry directive.
+    // A pre-click failure leaves the previous per-seed offsets unchanged, so
+    // the next attempt reuses the same window instead of skipping it. The
+    // current retry job's payload is updated too: its remaining durable
+    // attempts reload that payload rather than going through enqueue again.
+    if(inspection.retryDirective)inspection.retryDirective={...inspection.retryDirective,clickOffsets:inspection.nextClickOffsets};
+    if(executionMarker?.jobId&&inspection.nextClickOffsets&&Object.keys(inspection.nextClickOffsets).length){
+      await persistCommunityRetryClickOffsets(executionMarker.jobId,inspection.nextClickOffsets).catch(error=>{
+        console.warn(JSON.stringify({event:'community_retry_click_offsets_persist_failed',jobId:executionMarker.jobId,channelId:channel.channel_id,error:error instanceof Error?error.message:String(error),timestamp:new Date().toISOString()}));
+      });
+    }
     if(inspection.acquisitionOutcomes?.length)await appendExternalAcquisitionObservations(channel.channel_id,inspection.acquisitionOutcomes)
       .catch(error=>console.warn(`[ExternalAcquisition] observational write failed for ${channel.channel_id}:`,error instanceof Error?error.message:error));
 
-    // Global canonical discard (single authoritative claim for this
-    // inspection). Crash-safe ordering: persist provisional rows first
-    // (idempotent upsert), then claim, then delete losers. A crash between
-    // steps always converges on retry, and the registry can never name a
-    // code whose candidate row was never written in the same execution.
-    // Codes owned by other channels are discarded completely here (row
-    // deleted, no check record, no validation, no projection); same-channel
-    // and unknown codes proceed exactly as before.
-    // Structured candidates are authoritative for discovery; foundInvite is a
-    // compatibility fallback for older inspection results without the
-    // structured collection. The admitted view below preserves that
-    // precedence while enforcing the global canonical discard. The choke
-    // orchestration (persist, claim, delete losers) is injectable for tests;
-    // production passes the real implementations below.
-    const structuredCandidates=(inspection.discordCandidates||[]).filter(candidate=>!!candidate.nativeInviteCode);
-    const chokeAdmission=await admitInspectionDiscordCandidates(structuredCandidates,inspection.foundInvite,channel.channel_id);
-    if(chokeAdmission.discardedCount)console.info(JSON.stringify({event:'discord_duplicate_discarded',channelId:channel.channel_id,discardedCount:chokeAdmission.discardedCount,timestamp:new Date().toISOString()}));
-    admittedInspection={...inspection,discordCandidates:chokeAdmission.candidates,foundInvite:chokeAdmission.discoveredInvite};
-
-    // The admitted inspection view (computed once at the authoritative claim
-    // above) shapes every downstream gate, so a duplicate-only inspection
-    // can neither reconcile nor project a discarded invite.
-
     // Live About-page hydration can reveal stronger country evidence than the
-
-    // Live About-page hydration can reveal stronger country evidence than the
-    // search snippet. Re-evaluate before persisting any discovered community.
-    // The country voter receives the FRESH channel-sampled descriptions
-    // acquired during this inspection (authoritative provenance) — never the
-    // stale pre-inspection rawDetails sample, which may be search-selected or
+    // search snippet. Re-evaluate BEFORE the authoritative claim (P2/E5): a
+    // policy-rejected creator must never persist, claim, or validate an
+    // invite — a rejected tenant winning a registry entry permanently blocks
+    // the real creator (the registry has no release/reassignment path). The
+    // country voter receives the FRESH channel-sampled descriptions acquired
+    // during this inspection (authoritative provenance) — never the stale
+    // pre-inspection rawDetails sample, which may be search-selected or
     // absent on retries. When inspection acquired nothing fresh, the voter
     // abstains on descriptions rather than evaluating stale input.
     const rawLiveCountry = await validateChannelCountry({channelName:channel.channel_name,
@@ -1610,33 +1821,105 @@ export async function inspectAndValidateChannel(
       timestamp: now
     };
     if (liveCountry.status === 'REJECTED') {
-      // Terminal live rejection: project fresh score/scan/check metadata via
-      // the shared helper (persisted by the finally-block upsert below — no
-      // direct write here), then keep the existing Discord/trail projections.
+      // Terminal live rejection decided BEFORE the authoritative claim: no
+      // candidate row is persisted, no registry entry is claimed, and no
+      // validation runs for a rejected creator. The live verdict and the real
+      // inspection steps are recorded; the existing Discord/discovery state is
+      // preserved exactly as it was (nothing was admitted this run).
+      //
+      // The crawl already wrote this channel's candidate-bearing site-cache
+      // rows as PENDING. Those rows are never reusable while pending, and a
+      // rejected creator is terminal, so without finalizing them the same site
+      // would be recrawled forever by later creators. Discard only this
+      // channel's examined candidates; other channels' pending entries stay.
+      const rejectedCandidateIds=[...new Set((inspection.discordCandidates||[])
+        .map(candidate=>candidate.candidateId).filter(Boolean))];
+      if(rejectedCandidateIds.length)await markSiteInspectionsRejected(channel.channel_id,rejectedCandidateIds).catch(()=>undefined);
       applyLiveCountryRejectionToInspected(channel, liveCountry, now);
-      // The live country decision is terminal, but the inspection already ran.
-      // Preserve its real steps and only project NOT_FOUND when the inspection
-      // actually completed without a candidate or an acquisition failure.
-      const hasInspectionFailure = inspection.acquisitionStatus === 'ACQUISITION_FAILED' || inspection.acquisitionStatus === 'PARTIALLY_INSPECTED';
-      const hasCandidate = Boolean(admittedInspection.foundInvite || admittedInspection.discordCandidates?.some(candidate => candidate.nativeInviteCode));
-      // A duplicate-only inspection must never erase an already-validated
-      // Discord state: without admitted candidates there is nothing new to
-      // project, so a VALIDATED/ACTIVE-or-DEAD channel keeps its outcome.
-      // Mirrors the alreadyValidatedSuccess guard of the normal path below.
-      const alreadyValidatedDiscord=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
-      if (!hasInspectionFailure && !hasCandidate && !alreadyValidatedDiscord) {
-        channel.discord_status='NOT_FOUND';
-        channel.discord_validation_status='COMPLETED';
-        channel.discord_resolution_status='NOT_ATTEMPTED';
-        channel.discord_liveness_status='NOT_CHECKED';
-        channel.discord_relevance_status='NOT_CHECKED';
-        channel.discord_discovery_status='NOT_DISCOVERED';
-      } else if (hasCandidate) {
-        reconcileDiscordDiscoveryFromInspection(channel, admittedInspection, {validationProjected:false});
-      }
       channel.inspection_trail=[countryStep, ...inspection.steps, liveCountryStep];
+      console.warn(JSON.stringify({event:'live_country_rejected_before_claim',channelId:channel.channel_id,detectedCountry:liveCountry.detectedCreatorCountry||null,timestamp:now}));
       return;
     }
+
+    // Global canonical discard (single authoritative claim for this
+    // inspection). Crash-safe ordering: persist provisional rows first
+    // (idempotent upsert), then claim, then delete losers. A crash between
+    // steps always converges on retry, and the registry can never name a
+    // code whose candidate row was never written in the same execution.
+    // Codes owned by other channels are discarded completely here (row
+    // deleted, no check record, no validation, no projection); same-channel
+    // and unknown codes proceed exactly as before.
+    // Structured candidates are authoritative for discovery; foundInvite is a
+    // compatibility fallback for older inspection results without the
+    // structured collection. The admitted view below preserves that
+    // precedence while enforcing the global canonical discard. The choke
+    // orchestration (persist, claim, delete losers) is injectable for tests;
+    // production passes the real implementations below.
+    const structuredCandidates=(inspection.discordCandidates||[]).filter(candidate=>!!discordInviteCodeOf(candidate.nativeInviteCode));
+    const executedCandidateIds=[...new Set(structuredCandidates.map(candidate=>candidate.candidateId).filter(Boolean))];
+    let chokeAdmission=await admitInspectionDiscordCandidates(structuredCandidates,inspection.foundInvite,channel.channel_id);
+    if(chokeAdmission.discardedCount)console.info(JSON.stringify({event:'discord_duplicate_discarded',channelId:channel.channel_id,discardedCount:chokeAdmission.discardedCount,discardedOwnerChannelIds:chokeAdmission.discardedOwnerChannelIds,timestamp:new Date().toISOString()}));
+    admittedInspection={...inspection,discordCandidates:chokeAdmission.candidates,foundInvite:chokeAdmission.discoveredInvite};
+
+    // Durable cache handshake (E2): this execution is final for every
+    // candidate it examined. If at least one candidate reached admission the
+    // rows become reusable CLAIMED coverage; when every candidate lost the
+    // global claim (foreign-owned duplicates) they become terminal DISCARDED
+    // instead of staying PENDING and forcing an endless recrawl. Only this
+    // channel's pending ids are finalized, so another channel's unclaimed
+    // discoveries survive. Best-effort by design — a failure leaves rows
+    // PENDING, which only forces an idempotent recrawl/re-admission, never a
+    // silent loss.
+    if(executedCandidateIds.length){
+      if(chokeAdmission.candidates.length)await markSiteInspectionsClaimed(channel.channel_id,executedCandidateIds).catch(()=>undefined);
+      else await markSiteInspectionsDiscarded(channel.channel_id,executedCandidateIds).catch(()=>undefined);
+    }
+
+    // Orphan drain (E6): a candidate persisted by an execution that crashed
+    // before its claim has no validation attempt and no path back into
+    // discovery. Re-admit those rows through the same global claim now, so a
+    // discovery is never permanently stranded. Codes owned by another channel
+    // are residue and are removed by exact candidate id; codes still
+    // available (or already owned here) join the validation set below.
+    const orphanDrain=await drainOrphanDiscordCandidates(channel.channel_id).catch(error=>{
+      console.warn(JSON.stringify({event:'orphan_candidate_drain_failed',channelId:channel.channel_id,error:error instanceof Error?error.message:String(error),timestamp:new Date().toISOString()}));
+      return {candidates:[] as DiscordCandidate[],removed:0,discardedOwnerChannelIds:[] as string[]};
+    });
+    // An orphan row can be the same candidate this execution just persisted
+    // (and already admitted). Merge by canonical invite rather than appending
+    // it, so one invite is never validated twice and the original-case code
+    // cannot be replaced by the orphan's lowercase value.
+    const admittedIds=new Set(chokeAdmission.candidates.map(candidate=>candidate.candidateId));
+    const freshOrphans=orphanDrain.candidates.filter(candidate=>!admittedIds.has(candidate.candidateId));
+    if(freshOrphans.length){
+      const merged=mergeDiscordCandidates([...chokeAdmission.candidates,...freshOrphans],{creatorName:channel.channel_name});
+      chokeAdmission={...chokeAdmission,candidates:merged,discoveredInvite:chokeAdmission.discoveredInvite||merged[0]?.nativeInviteCode||null};
+      admittedInspection={...inspection,discordCandidates:chokeAdmission.candidates,foundInvite:chokeAdmission.discoveredInvite};
+      console.info(JSON.stringify({event:'orphan_candidates_drained',channelId:channel.channel_id,count:freshOrphans.length,removed:orphanDrain.removed,timestamp:new Date().toISOString()}));
+    } else if(orphanDrain.removed){
+      console.info(JSON.stringify({event:'orphan_candidate_residue_removed',channelId:channel.channel_id,removed:orphanDrain.removed,timestamp:new Date().toISOString()}));
+    }
+    // Orphan residue is provenance too: the row is deleted, but its foreign
+    // owner must still drive the dashboard's duplicate-owned state.
+    if(orphanDrain.discardedOwnerChannelIds.length){
+      chokeAdmission={...chokeAdmission,discardedOwnerChannelIds:[...new Set([...chokeAdmission.discardedOwnerChannelIds,...orphanDrain.discardedOwnerChannelIds])]};
+      console.info(JSON.stringify({event:'orphan_duplicate_provenance_retained',channelId:channel.channel_id,discardedOwnerChannelIds:orphanDrain.discardedOwnerChannelIds,timestamp:new Date().toISOString()}));
+    }
+    // Provenance-only duplicate record: owner channel id, never the invite
+    // code. A fresh processed inspection clears stale duplicate evidence; a
+    // cache-only scan preserves it because borrowed coverage cannot establish
+    // that the duplicate disappeared. Computed after the orphan drain so
+    // foreign-owned residue contributes its owner before the row is deleted.
+    channel.discord_duplicate_owner_channel_id = nextDiscordDuplicateOwnerChannelId({
+      discardedOwnerChannelIds: chokeAdmission.discardedOwnerChannelIds,
+      previousOwnerChannelId: channel.discord_duplicate_owner_channel_id,
+      observations: inspection.acquisitionOutcomes || [],
+    });
+
+    // The admitted inspection view (computed once at the authoritative claim
+    // above) shapes every downstream gate, so a duplicate-only inspection
+    // can neither reconcile nor project a discarded invite.
+
     if (liveCountry.detectedCreatorCountry !== undefined) {
       projectLiveCountryAttribution(channel, {
         detectedCreatorCountry: liveCountry.detectedCreatorCountry,
@@ -1706,9 +1989,17 @@ export async function inspectAndValidateChannel(
       channel.last_checked=now;
       reconcileDiscordDiscoveryFromInspection(channel,admittedInspection,{validationProjected:true});
       retryDirective=attemptFree?{attemptFree:true,code:COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,reason:`Discord validation remained ${selected.operationalOutcome}`,retryAt:undefined,retryReason:'COMMUNITY_REQUIRED_ACQUISITION_FAILURE'}:undefined;
+      if(retryDirective&&inspection.nextClickOffsets&&Object.keys(inspection.nextClickOffsets).length)retryDirective={...retryDirective,clickOffsets:inspection.nextClickOffsets};
       if(selected.retryable&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id,retryDirective);
       if(scheduleRetry&&shouldScheduleFoundGapAcquisitionRetry(inspection))await enqueueCommunityAcquisitionRetry(channel.channel_id,inspection.retryDirective);
-    } else if(inspection.acquisitionStatus==='ACQUISITION_FAILED'||inspection.acquisitionStatus==='PARTIALLY_INSPECTED') {
+    } else if(inspection.acquisitionStatus==='ACQUISITION_FAILED'||inspection.acquisitionStatus==='PARTIALLY_INSPECTED'||
+      // Raw FOUND with zero admitted candidates: every retained candidate was
+      // discarded by the global canonical claim, so the raw aggregate cannot
+      // resolve this channel (E8). Branch on admitted state instead — the
+      // failure/partial path re-derives required-work ownership (retryable
+      // observations, FOUND+gap directives) without projecting a
+      // candidate-free "not found".
+      (inspection.acquisitionStatus==='FOUND'&&!discoveredInvite&&!candidates.some(candidate=>candidate.nativeInviteCode))) {
       // A failed or partial crawl is operational uncertainty, not confirmed absence.
       const alreadyValidatedSuccess=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
       // Shared predicate (not a local outcome check): required retryable FAILED
@@ -1732,6 +2023,11 @@ export async function inspectAndValidateChannel(
       // this compatibility projection.
       channel.last_checked=now;
       if(retryDirective?.attemptFree&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id,retryDirective);
+      // Retained-invite FOUND gap (multi-invite recall): the validation branch
+      // owns this for admitted invites; discarded/unadmitted FOUND aggregates
+      // reach this branch instead (E8) and must not lose the outstanding
+      // bounded recovery.
+      if(scheduleRetry&&shouldScheduleFoundGapAcquisitionRetry(inspection))await enqueueCommunityAcquisitionRetry(channel.channel_id,inspection.retryDirective);
     } else {
       // Final NOT_FOUND projection after all steps (no admitted/discovered
       // invite and no FAILED/PARTIAL acquisition status). Extracted for
@@ -1739,14 +2035,26 @@ export async function inspectAndValidateChannel(
       await projectNotFoundAfterInspection(channel,inspection,admittedInspection,scheduleRetry);
     }
 
+    // P4: platform-community evidence (Whop/Skool/Circle/Patreon) observed by
+    // this inspection is projected as first-class channel state, never
+    // collapsed into "no community found". A confirmed paywall yields PAID;
+    // any other observed surface yields COMMUNITY_INDICATED_NO_INVITE.
+    // Evidence merges with existing rows by community URL and keeps the
+    // strongest classification (never downgraded by a later weak observation).
+    applyCommunityIntentEvidence(channel, inspection.communityIntent);
+
   } catch (err) {
     // Preserve any structured discovery even when validation or later
     // processing throws. If the choke-point claim itself failed, fall back to
     // the raw inspection (pre-existing behavior): this must run before catch
-    // persistence and retry.
+    // persistence and retry. Community intent is independent evidence and is
+    // merged here too, otherwise a failure after inspection would erase a
+    // Whop/Skool/Circle/Patreon surface from the persisted channel.
+    applyCommunityIntentEvidence(channel, inspection?.communityIntent);
     reconcileDiscordDiscoveryFromInspection(channel,admittedInspection??inspection,{validationProjected:false});
     attemptFree=isAttemptFreeCommunityFailure(err);
     retryDirective=attemptFree?{attemptFree:true,code:COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,reason:String(err?.message||err),retryAt:retryAtFromUnknown(err),retryReason:retryReasonFromError(err)}:undefined;
+    if(retryDirective&&inspection?.nextClickOffsets&&Object.keys(inspection.nextClickOffsets).length)retryDirective={...retryDirective,clickOffsets:inspection.nextClickOffsets};
     if(!attemptFree)channel.scan_attempts++;
     // Durable RETRY_COMMUNITY_ACQUISITION owns the retry budget. Keep channel
     // state retryable here so an internal scan counter cannot prematurely stop
@@ -1866,16 +2174,121 @@ export async function handleRelationshipCanaryExpansionJob(
  * transport defaults to the durable scheduler and is injectable in tests;
  * validation, choke, status, and retry-policy semantics are untouched.
  */
+/**
+ * Pending-discovery-work detector for the final NOT_FOUND projection (E7).
+ * The projection may only complete a channel when no discovery obligation
+ * remains outstanding; otherwise it would strand the work. Pure over
+ * channel + inspection state (no DB): the durable retry job is preserved by
+ * never clearing scan attempts on a pending projection. Three keep-pending
+ * signals:
+ *  - a stored locator whose validation never reached a terminal verdict;
+ *  - a FOUND+required-gap directive (invites retained, gap unresolved);
+ *  - a mandatory community-surface observation that is retryable.
+ *
+ * The retryable-observation check intentionally reuses the shared
+ * isCommunityRetryableObservation boundary. A raw `required && retryable`
+ * check would treat YouTube About / recent-video-description upstream
+ * failures as Discord work, converting a completed negative into FAILED and
+ * scheduling a fabricated capacity retry.
+ */
+export function detectPendingDiscoveryWork(
+  channel: Pick<ChannelRecord,'discord_candidate_locator'|'discord_validation_status'|'discord_discovery_status'>,
+  inspection: {
+    acquisitionOutcomes?: Array<{ surface?: unknown; outcome?: unknown; retryable?: unknown; required?: unknown; failureClass?: unknown }>;
+    retrySuppressedUrls?: unknown;
+    retryDirective?: unknown;
+  } | null | undefined,
+): { pending: boolean; reasons: string[] } {
+  const reasons: string[] = [];
+  const locator = typeof channel.discord_candidate_locator === 'string' ? channel.discord_candidate_locator.trim() : '';
+  const validationStatus = String(channel.discord_validation_status || '');
+  // A stored locator owns pending work only while validation is genuinely
+  // unfinished. FAILED_OPERATIONAL is a terminal operational verdict; treating
+  // it as unfinished would reopen an exhausted retry forever.
+  const locatorUnvalidated = !!locator && (
+    validationStatus === 'RETRY_PENDING' ||
+    validationStatus === 'NOT_STARTED'
+  );
+  if (locatorUnvalidated) reasons.push('locator-unvalidated');
+  if (shouldScheduleFoundGapAcquisitionRetry(inspection)) reasons.push('found-gap-retry');
+  const outcomes = Array.isArray(inspection?.acquisitionOutcomes) ? inspection.acquisitionOutcomes : [];
+  const suppressed = Array.isArray(inspection?.retrySuppressedUrls) ? inspection.retrySuppressedUrls.map(String) : undefined;
+  if (hasRetryableCommunityAcquisitionFailure(outcomes as Parameters<typeof hasRetryableCommunityAcquisitionFailure>[0], suppressed)) {
+    reasons.push('required-retryable-observation');
+  }
+  return { pending: reasons.length > 0, reasons };
+}
+
+/** Maximum locator-only pending projections before the stored locator is
+ * treated as operationally exhausted. Bound is the durable retry job's own
+ * 5-attempt ceiling: a stale locator can no longer re-arm itself forever when
+ * a fresh inspection keeps finding no replacement candidate. */
+export const LOCATOR_PENDING_PROJECTION_LIMIT = 5;
+
 export async function projectNotFoundAfterInspection(
   channel: ChannelRecord,
   inspection: {
     acquisitionOutcomes?: Array<{ outcome?: unknown; retryable?: unknown; failureClass?: unknown }>;
     retryDirective?: CommunityRetryDirective;
+    nextClickOffsets?: Record<string, number>;
   } | null | undefined,
   admittedInspection: Parameters<typeof reconcileDiscordDiscoveryFromInspection>[1],
   scheduleRetry: boolean,
   enqueue: (channelId: string, directive?: CommunityRetryDirective) => Promise<void> = enqueueCommunityAcquisitionRetry,
 ): Promise<void> {
+      // Pending-work guard (E7): never project COMPLETED/attempts=0 onto a
+      // channel that still owns discovery work — a stored unvalidated locator,
+      // a FOUND+required-gap directive, or a retryable community observation.
+      // Project operational failure + RETRY_PENDING instead and preserve the
+      // durable job: any directive merges idempotently into the existing
+      // per-channel retry job.
+      //
+      // Locator-only pending work is bounded by the channel's durable scan
+      // attempts. Without this bound a stored locator whose site never yields
+      // it again re-arms RETRY_PENDING on every pass (and the idempotent
+      // enqueue resets job attempts after terminal states), so the channel
+      // never reaches a verdict. After the same 5-attempt ceiling as the retry
+      // job, the locator becomes terminal FAILED_OPERATIONAL and the normal
+      // absence projection runs. Other pending reasons keep their established
+      // unbounded-preservation semantics because they own real acquisition work.
+      const pendingWork=detectPendingDiscoveryWork(channel,inspection);
+      const locatorOnly=pendingWork.reasons.length===1&&pendingWork.reasons[0]==='locator-unvalidated';
+      const locatorExhausted=locatorOnly&&Math.max(0,Number(channel.scan_attempts)||0)>=LOCATOR_PENDING_PROJECTION_LIMIT;
+      if(locatorExhausted){
+        channel.discord_validation_status='FAILED_OPERATIONAL';
+      }else if(locatorOnly){
+        channel.scan_attempts=Math.max(0,Number(channel.scan_attempts)||0)+1;
+      }
+      if(pendingWork.pending&&!locatorExhausted){
+        const alreadyValidatedSuccess=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
+        if(!alreadyValidatedSuccess){
+          channel.discord_status='UNCERTAIN';
+          channel.discord_liveness_status=channel.discord_candidate_locator?(channel.discord_liveness_status||'UNCERTAIN'):'NOT_CHECKED';
+          channel.discord_resolution_status=channel.discord_resolution_status||'RESOLVED';
+          channel.discord_validation_status='RETRY_PENDING';
+          channel.discord_discovery_status=channel.discord_candidate_locator?'DISCOVERED_VALIDATION_FAILED':(channel.discord_discovery_status||'NOT_DISCOVERED');
+        }
+        channel.scan_status='FAILED';
+        reconcileDiscordDiscoveryFromInspection(channel,admittedInspection,{validationProjected:false});
+        // Pending work must always own a durable job. A locator/NOT_STARTED
+        // or required-retryable observation may not have produced an
+        // inspection directive, so fall back to a bounded retry directive
+        // rather than leaving pending state with no worker to consume it.
+        // The fallback is NOT attempt-free and is not labeled a capacity
+        // deferral: real inspection work already ran and must consume one
+        // durable attempt (only proven capacity/browser no-start keeps
+        // attempt-free semantics).
+        const pendingDirective:CommunityRetryDirective|undefined=inspection?.retryDirective||
+          (scheduleRetry?{
+            attemptFree:false,
+            code:COMMUNITY_ACQUISITION_REQUIRED,
+            reason:`Pending discovery work: ${pendingWork.reasons.join(', ')}`,
+            retryReason:COMMUNITY_RETRY_REASON.COMMUNITY_REQUIRED_ACQUISITION_FAILURE,
+          }:undefined);
+        if(scheduleRetry&&pendingDirective)await enqueue(channel.channel_id,inspection?.nextClickOffsets&&Object.keys(inspection.nextClickOffsets).length?{...pendingDirective,clickOffsets:inspection.nextClickOffsets}:pendingDirective);
+        channel.last_checked=new Date().toISOString();
+        return;
+      }
       // Nothing Found After All Steps
       const alreadyValidatedSuccess=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
       if(!alreadyValidatedSuccess){
@@ -1933,16 +2346,56 @@ export async function enqueueCommunityAcquisitionRetry(channelId:string,directiv
   const metadata=buildCommunityRetryJobMetadata({
     code:directive?.code||COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,
     retryReason:directive?.retryReason||'COMMUNITY_REQUIRED_ACQUISITION_FAILURE',
-    retrySource:source
+    retrySource:source,
+    clickOffsets:directive?.clickOffsets
   });
   // Saturation deferrals scheduled from a fresh inspection never pass through
   // the retry-worker deferral branch; count them at the durable enqueue point.
   if(String(directive?.reason||'').includes('RENDERED_FALLBACK_SATURATED'))bumpCommunitySaturationDeferral();
   const job=await enqueueJob('RETRY_COMMUNITY_ACQUISITION',{channelId,...metadata},{idempotencyKey:communityAcquisitionRetryKey(channelId),priority:15,maxAttempts:5,runAfter:directive?.retryAt?new Date(directive.retryAt).toISOString():undefined,clientOverride});
   // Preserve a pending job's original ownership and retry window while merging
-  // the latest attributable reason into its durable payload.
+  // the latest attributable reason into its durable payload. Per-seed click
+  // progress is monotonic, and the merge must read the CURRENT row inside this
+  // statement: a retry worker can advance the PROCESSING job between
+  // enqueueJob's RETURNING and this update, and writing back the earlier copy
+  // would rewind its newer offsets. A fresh scan has no previous offset map,
+  // so its lower first-page offsets must never replace a retry's higher
+  // progress. When this enqueue carries offsets, keep the greater stored or
+  // incoming offset for each seed while still merging the rest of the
+  // incoming metadata (retry code/reason/source); otherwise leave the
+  // existing offset map untouched.
   const runner:{query:(sql:string,params?:unknown[])=>Promise<unknown>} = clientOverride||await getDb();
-  await runner.query(`UPDATE jobs SET payload=payload || $2::jsonb,updated_at=now() WHERE id=$1 AND status IN('PENDING','PROCESSING')`,[job.id,JSON.stringify(metadata)]);
+  await runner.query(
+    `UPDATE jobs SET payload=CASE
+       WHEN jsonb_typeof($2::jsonb->'clickOffsets')='object'
+         THEN ((payload || ($2::jsonb - 'clickOffsets')) - 'clickOffsets') || jsonb_build_object(
+           'clickOffsets',
+           COALESCE((
+             SELECT jsonb_object_agg(keys.key, GREATEST(
+               CASE WHEN jsonb_typeof(payload->'clickOffsets')='object'
+                      AND jsonb_typeof(payload->'clickOffsets'->keys.key)='number'
+                    THEN (payload->'clickOffsets'->keys.key #>> '{}')::numeric ELSE 0 END,
+               CASE WHEN jsonb_typeof($2::jsonb->'clickOffsets'->keys.key)='number'
+                    THEN ($2::jsonb->'clickOffsets'->keys.key #>> '{}')::numeric ELSE 0 END
+             ))
+             FROM (
+               SELECT jsonb_object_keys(
+                 CASE WHEN jsonb_typeof(payload->'clickOffsets')='object'
+                      THEN payload->'clickOffsets' ELSE '{}'::jsonb END
+               ) AS key
+               UNION
+               SELECT jsonb_object_keys($2::jsonb->'clickOffsets') AS key
+             ) keys
+             WHERE (jsonb_typeof(payload->'clickOffsets')='object'
+                    AND jsonb_typeof(payload->'clickOffsets'->keys.key)='number')
+                OR jsonb_typeof($2::jsonb->'clickOffsets'->keys.key)='number'
+           ), '{}'::jsonb)
+         )
+       ELSE payload || $2::jsonb END,
+       updated_at=now()
+     WHERE id=$1 AND status IN('PENDING','PROCESSING')`,
+    [job.id,JSON.stringify(metadata)]
+  );
 }
 
 export function operationalEnrichmentRecoveryKey(channelId:string):string{return `operational-enrichment-recovery:${channelId}`;}

@@ -22,10 +22,11 @@ import { getYouTubeQuotaDay } from './youtubeQuotaDay';
  *   QUOTA_SHADOW_TEST_DATABASE_URL=postgresql://... npx tsx --test server/quotaKeyCapShadow.postgres.test.ts
  *
  * Without that variable every test below skips. The schema used here is the
- * production shape: migration 115 (youtube_key_quota_usage) plus migration
- * 148 (shadow leases/events), applied idempotently by this suite. The quota
- * day is the real America/Los_Angeles day (same helper as the hooks) and
- * every run uses unique key fingerprints, so repeated runs never interfere.
+ * production shape: migration 115 (youtube_key_quota_usage), migration 148
+ * (shadow leases/events), and migration 151 (settlement fence), applied
+ * idempotently by this suite. The quota day is the real America/Los_Angeles
+ * day (same helper as the hooks) and every run uses unique key fingerprints,
+ * so repeated runs never interfere.
  */
 const dedicatedUrl = process.env.QUOTA_SHADOW_TEST_DATABASE_URL;
 
@@ -46,6 +47,10 @@ const migration115 = readFileSync(
 );
 const migration148 = readFileSync(
   fileURLToPath(new URL('./db/migrations/148_youtube_key_cap_shadow.sql', import.meta.url)),
+  'utf8'
+);
+const migration151 = readFileSync(
+  fileURLToPath(new URL('./db/migrations/151_youtube_key_cap_shadow_settled.sql', import.meta.url)),
   'utf8'
 );
 
@@ -76,6 +81,7 @@ async function ensureSchema(): Promise<void> {
       pool = new pg.Pool({ connectionString: dedicatedUrl, max: 25 });
       await pool.query(migration115);
       await pool.query(migration148);
+      await pool.query(migration151);
     })();
   }
   return schemaReady;
@@ -111,6 +117,7 @@ after(async () => {
   if (pool) {
     try {
       await pool.query(`DELETE FROM youtube_key_cap_shadow_leases WHERE key_fingerprint LIKE $1`, [keyPattern]);
+      await pool.query(`DELETE FROM youtube_key_cap_shadow_settled WHERE key_fingerprint LIKE $1`, [keyPattern]);
       await pool.query(`DELETE FROM youtube_key_cap_shadow_events WHERE key_fingerprint LIKE $1`, [keyPattern]);
       await pool.query(`DELETE FROM youtube_key_quota_usage WHERE key_fingerprint LIKE $1`, [keyPattern]);
     } finally {
@@ -119,13 +126,16 @@ after(async () => {
   }
 });
 
-maybe('schema: migrations 115 and 148 apply cleanly', async () => {
+maybe('schema: migrations 115, 148, and 151 apply cleanly', async () => {
   await ensureSchema();
   const tables = await requirePool().query(
-    `SELECT to_regclass('youtube_key_cap_shadow_leases') AS leases, to_regclass('youtube_key_cap_shadow_events') AS events`
+    `SELECT to_regclass('youtube_key_cap_shadow_leases') AS leases,
+            to_regclass('youtube_key_cap_shadow_events') AS events,
+            to_regclass('youtube_key_cap_shadow_settled') AS settled`
   );
   assert.ok(tables.rows[0].leases);
   assert.ok(tables.rows[0].events);
+  assert.ok(tables.rows[0].settled);
 });
 
 maybe('boundary: 9000 admitted, the next unit is WOULD_REJECT, leases count as in-flight', async () => {
@@ -201,6 +211,50 @@ maybe('duplicate accounting: one lease and one event per operation id', async ()
   assert.equal(second.leaseInserted, false, 'duplicate lease insert is deduplicated');
   assert.equal(await leaseCount(key), 1);
   assert.equal((await eventRows(key)).length, 1, 'duplicate event insert is deduplicated');
+});
+
+maybe('settlement tombstone fences a late dispatch after the response settled', async () => {
+  await ensureSchema();
+  resetShadowConfigCacheForTests();
+  resetShadowSweepClockForTests();
+  const key = keyFor('tombstone');
+  const operationId = `${runTag}:tombstone:1`;
+  await seedSettledUnits(key, 100);
+  const shadowPool = requirePool() as unknown as ShadowPoolPort;
+
+  const dispatch = await recordShadowDispatchSafe(
+    { readSetting: enabledReader, pool: shadowPool },
+    { keyFingerprint: key, operationId, units: 1 }
+  );
+  assert.equal(dispatch.leaseInserted, true);
+  await settleShadowLease(shadowPool, { quotaDay, keyFingerprint: key, units: 1, operationId });
+  assert.equal(await leaseCount(key), 0, 'settlement removes the in-flight lease');
+  const settled = await requirePool().query(
+    `SELECT count(*)::int AS count FROM youtube_key_cap_shadow_settled
+      WHERE quota_day=$1 AND operation_id=$2 AND expires_at > now()`,
+    [quotaDay, operationId]
+  );
+  assert.equal(Number(settled.rows[0].count), 1, 'settlement tombstone remains to fence late inserts');
+
+  // Simulate the observation completing after settlement and the official
+  // counter now being above the cap: the exact operation must not recreate a
+  // lease or write a false WOULD_REJECT event.
+  await seedSettledUnits(key, 9000);
+  const late = await recordShadowDispatchSafe(
+    { readSetting: enabledReader, pool: shadowPool },
+    { keyFingerprint: key, operationId, units: 1 }
+  );
+  assert.equal(late.leaseInserted, false);
+  assert.equal((await eventRows(key)).length, 0, 'late observation is fenced by its tombstone');
+
+  // The fence is operation-specific: a genuinely new observation still works.
+  const other = await recordShadowDispatchSafe(
+    { readSetting: enabledReader, pool: shadowPool },
+    { keyFingerprint: key, operationId: `${runTag}:tombstone:2`, units: 1 }
+  );
+  assert.equal(other.leaseInserted, true);
+  assert.equal(other.event, 'WOULD_REJECT');
+  assert.equal((await eventRows(key)).length, 1);
 });
 
 maybe('concurrency: 20 parallel dispatches serialize per key/day and cap exactly', async () => {

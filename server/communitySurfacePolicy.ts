@@ -26,7 +26,7 @@ const LINK_HUB_HOSTS = new Set([
   'www.lnk.bio',
 ]);
 
-const COMMUNITY_PLATFORM_HOSTS = new Set([
+export const COMMUNITY_PLATFORM_HOSTS = new Set([
   'skool.com',
   'www.skool.com',
   'whop.com',

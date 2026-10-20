@@ -2,6 +2,11 @@ import assert from 'node:assert/strict';
 import { assessCrawlAdmission, isAuxiliaryForOutcome, acquisitionOwnershipUrl } from './communitySurfacePolicy';
 
 export const COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE = 'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE';
+/** Generic retry code for real inspection work that must run again without
+ * being a capacity deferral. It is deliberately not attempt-free: the prior
+ * inspection executed acquisition work (or must validate a stored locator),
+ * so each durable attempt consumes budget. */
+export const COMMUNITY_ACQUISITION_REQUIRED = 'COMMUNITY_ACQUISITION_REQUIRED';
 
 export const COMMUNITY_RETRY_REASON = {
   NO_SURFACE: 'NO_SURFACE',
@@ -45,6 +50,10 @@ export interface CommunityRetryDirective {
   retryAt?: number;
   reason: string;
   retryReason: CommunityRetryReason;
+  /** Per-seed rendered click-window progress durably carried into the next
+   * retry. Keys are normalized seed URLs; values count controls already
+   * examined. Omitted when no rendered window progressed. */
+  clickOffsets?: Record<string, number>;
 }
 
 export interface CommunityRetryJobMetadata {
@@ -56,6 +65,8 @@ export interface CommunityRetryJobMetadata {
   reconciliationStatus: CommunityRetryReconciliationStatus;
   reconciliationReason?: string;
   reconciliationObservedAt?: string;
+  /** Durable per-seed click-window progress (see CommunityRetryDirective). */
+  clickOffsets?: Record<string, number>;
   reconciliationHistory?: Array<{
     status: CommunityRetryReconciliationStatus;
     reason: string;
@@ -148,6 +159,7 @@ export function buildCommunityRetryJobMetadata(args: {
   retryReason: CommunityRetryReason;
   retrySource?: CommunityRetrySource;
   observedAt?: string;
+  clickOffsets?: Record<string, number>;
 }): CommunityRetryJobMetadata {
   return {
     retryLifecycleVersion: 2,
@@ -155,7 +167,8 @@ export function buildCommunityRetryJobMetadata(args: {
     retryCode: args.code,
     retrySource: args.retrySource || 'INSPECTION',
     retryObservedAt: args.observedAt || new Date().toISOString(),
-    reconciliationStatus: 'NONE'
+    reconciliationStatus: 'NONE',
+    ...(args.clickOffsets && Object.keys(args.clickOffsets).length ? { clickOffsets: { ...args.clickOffsets } } : {})
   };
 }
 
@@ -233,6 +246,10 @@ export const FOUND_GAP_RETRYABLE_FAILURE_CLASSES = new Set([
   'REQUIRED_UNVISITED_BUDGET_GAP',
   'RENDERED_TIMEOUT',
   'RENDERED_PARTIAL_COVERAGE',
+  // Interaction gap: invite(s) retained but an evidence-bearing control
+  // (join button/tab/accordion) failed or was skipped, so content was never
+  // examined. Unlike ordinary FOUND rows this gap owns bounded recovery.
+  'RENDERED_INTERACTION_GAP',
 ]);
 
 export function isCommunityRetryableObservation(item: CommunityRetryObservation): boolean {

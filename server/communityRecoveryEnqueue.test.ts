@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
-import { communityAcquisitionRetryKey, enqueueCommunityAcquisitionRetry } from './queueManager';
+import { communityAcquisitionRetryKey, enqueueCommunityAcquisitionRetry, persistCommunityRetryClickOffsets } from './queueManager';
 import { operationsTelemetrySnapshot, resetOperationsTelemetry } from './operationsTelemetry';
 
 const jobRow = {
@@ -65,8 +65,45 @@ test('community retry enqueue is idempotent per channel and keeps the bounded at
   assert.equal(communityAcquisitionRetryKey('UC_IDEMPOTENT'), 'community-acquisition-retry:UC_IDEMPOTENT');
 });
 
-test('saturation deferrals are counted at the durable community enqueue point', async () => {
-  resetOperationsTelemetry();
+test('community retry enqueue merges per-seed click progress monotonically against the current row', async () => {
+  const client = mockClient();
+  await enqueueCommunityAcquisitionRetry('UC_CLICK', {
+    ...saturationDirective,
+    clickOffsets: { 'https://creator.test': 4 },
+  }, 'INSPECTION', client as any);
+  const insert = client.queries.find(q => q.sql.includes('INSERT INTO jobs'));
+  const payload = JSON.parse(String(insert?.values?.[1]));
+  assert.deepEqual(payload.clickOffsets, { 'https://creator.test': 4 });
+  const merge = client.queries.find(q => q.sql.includes('UPDATE jobs SET payload=CASE'));
+  assert.ok(merge, 'enqueue merges into the pending durable payload');
+  assert.match(merge.sql, /jsonb_typeof\(\$2::jsonb->'clickOffsets'\)='object'/, 'only a real offset map triggers the nested merge');
+  assert.match(merge.sql, /\(payload \|\| \(\$2::jsonb - 'clickOffsets'\)\)/, 'the rest of the incoming retry metadata still merges');
+  assert.match(merge.sql, /jsonb_object_keys\(/, 'the merge reads the current database map, not enqueueJob\'s earlier copy');
+  assert.match(merge.sql, /GREATEST\(/, 'a lower offset from a fresh scan cannot rewind stored retry progress');
+  assert.match(merge.sql, /#>> '\{\}'/, 'only numeric stored/incoming offsets participate in the maximum');
+  assert.deepEqual(JSON.parse(String(merge?.values?.[1])).clickOffsets, { 'https://creator.test': 4 }, 'the statement carries only this enqueue\'s offsets; other seeds are preserved by the SQL merge');
+  assert.equal(JSON.parse(String(merge?.values?.[1])).retryCode, 'BROWSER_RUNTIME_UNAVAILABLE', 'retry reason/code metadata is not dropped by the offset branch');
+});
+
+test('community retry enqueue without offsets leaves the durable offset map untouched', async () => {
+  const client = mockClient();
+  await enqueueCommunityAcquisitionRetry('UC_NO_CLICK_MAP', saturationDirective, 'INSPECTION', client as any);
+  const merge = client.queries.find(q => q.sql.includes('UPDATE jobs SET payload=CASE'));
+  assert.ok(merge);
+  assert.equal(JSON.parse(String(merge?.values?.[1])).clickOffsets, undefined);
+  assert.match(merge.sql, /ELSE payload \|\| \$2::jsonb END/);
+});
+
+test('a partial retry-progress write preserves other seeds', async () => {
+  const client = mockClient();
+  await persistCommunityRetryClickOffsets('job-community-1', { 'https://seed-b.test': 2 }, client as any);
+  const update = client.queries.find(q => q.sql.includes("UPDATE jobs SET payload=(payload - 'clickOffsets')"));
+  assert.ok(update);
+  assert.match(update.sql, /COALESCE\(payload->'clickOffsets','\{\}'::jsonb\) \|\| \$2::jsonb/);
+  assert.deepEqual(update.values, ['job-community-1', JSON.stringify({ 'https://seed-b.test': 2 })]);
+});
+
+test('saturation deferrals are counted at the durable community enqueue point', async () => {  resetOperationsTelemetry();
   const client = mockClient();
   await enqueueCommunityAcquisitionRetry('UC_SAT', saturationDirective, 'INSPECTION', client as any);
   const snapshot = operationsTelemetrySnapshot();

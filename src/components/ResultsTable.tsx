@@ -2,8 +2,11 @@ import { apiFetch } from '../apiClient';
 import { discordCandidateDisplayUrl } from '../utils/discordLocator';
 import React, { useEffect, useMemo, useState } from 'react';
 import { ChannelRecord, ReviewQueueItem } from '../types';
+import { communityIntentDisplay } from './communityIntentDisplay';
 import { ExternalLink, RefreshCw, Eye, Copy, Check, Search, CheckCircle2, XCircle, ShieldAlert, X } from 'lucide-react';
 import { responseError, submitReviewDecision } from '../reviewDecision';
+import { formatFoundAgo } from '../utils/relativeTime';
+import { isConfirmedDiscordInvite } from '../discordInviteView';
 
 interface Props {
   channels: ChannelRecord[];
@@ -14,7 +17,7 @@ interface Props {
   pendingReviewCount?: number;
   onFiltersChange?: (filters:DashboardChannelFilters)=>void;
 }
-export interface DashboardChannelFilters {search:string;country:string;countryStatus:string;tradingStatus:string;discordStatus:string;scanStatus:string}
+export interface DashboardChannelFilters {search:string;country:string;countryStatus:string;tradingStatus:string;discordStatus:string;scanStatus:string;recentInvites?:boolean}
 
 type ReviewAction = 'approve' | 'reject' | 'force-rescan';
 
@@ -25,6 +28,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
   const [selectedTradingStatus, setSelectedTradingStatus] = useState('ALL');
   const [selectedDiscordStatus, setSelectedDiscordStatus] = useState('ALL');
   const [selectedScanStatus, setSelectedScanStatus] = useState('ALL');
+  const [recentInvites, setRecentInvites] = useState(false);
 
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [recheckingId, setRecheckingId] = useState<string | null>(null);
@@ -55,7 +59,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
 
   useEffect(()=>{if(!reviewEnabled||(!reviewerDefaultsAvailable&&(!reviewToken||!reviewer)))return;apiFetch('/api/review-reasons',{headers:reviewHeaders()}).then(r=>r.ok?r.json():Promise.reject()).then(setReasonCatalog).catch(()=>setReasonCatalog(null));},[reviewEnabled,reviewerDefaultsAvailable,reviewToken,reviewer]);
 
-  useEffect(()=>{if(!onFiltersChange)return;const timer=setTimeout(()=>onFiltersChange({search:searchTerm,country:selectedCountry,countryStatus:selectedCountryStatus,tradingStatus:selectedTradingStatus,discordStatus:selectedDiscordStatus,scanStatus:selectedScanStatus}),200);return()=>clearTimeout(timer);},[searchTerm,selectedCountry,selectedCountryStatus,selectedTradingStatus,selectedDiscordStatus,selectedScanStatus,onFiltersChange]);
+  useEffect(()=>{if(!onFiltersChange)return;const timer=setTimeout(()=>onFiltersChange({search:searchTerm,country:selectedCountry,countryStatus:selectedCountryStatus,tradingStatus:selectedTradingStatus,discordStatus:selectedDiscordStatus,scanStatus:selectedScanStatus,recentInvites}),200);return()=>clearTimeout(timer);},[searchTerm,selectedCountry,selectedCountryStatus,selectedTradingStatus,selectedDiscordStatus,selectedScanStatus,recentInvites,onFiltersChange]);
 
   const filteredChannels = useMemo(()=>channels.filter(c => {
     const matchesSearch = c.channel_name.toLowerCase().includes(searchTerm.toLowerCase()) ||
@@ -64,13 +68,17 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
     const matchesCountry = selectedCountry === 'ALL' || c.country === selectedCountry;
     const matchesCountryStatus = selectedCountryStatus === 'ALL' || c.country_status === selectedCountryStatus;
     const matchesTradingStatus = selectedTradingStatus === 'ALL' || c.trading_status === selectedTradingStatus;
-    const matchesDiscordStatus = selectedDiscordStatus === 'ALL' || c.discord_status === selectedDiscordStatus;
+    const matchesDiscordStatus = selectedDiscordStatus === 'ALL'
+      || (selectedDiscordStatus === 'INVITE_OWNED_BY_ANOTHER_CHANNEL'
+        ? Boolean(c.discord_duplicate_owner_channel_id)
+        : c.discord_status === selectedDiscordStatus);
     const matchesScanStatus = selectedScanStatus === 'ALL' || c.scan_status === selectedScanStatus;
     const matchesLowAudienceVisibility = selectedScanStatus === 'SKIPPED_LOW_AUDIENCE' || c.scan_status !== 'SKIPPED_LOW_AUDIENCE';
     const matchesReviewView = !pendingReviewOnly || (c.scan_status === 'NEEDS_REVIEW' && !decidedChannelIds.has(c.channel_id));
+    const matchesRecentInvites = !recentInvites || isConfirmedDiscordInvite(c);
 
-    return matchesSearch && matchesCountry && matchesCountryStatus && matchesTradingStatus && matchesDiscordStatus && matchesScanStatus && matchesLowAudienceVisibility && matchesReviewView;
-  }),[channels,searchTerm,selectedCountry,selectedCountryStatus,selectedTradingStatus,selectedDiscordStatus,selectedScanStatus,pendingReviewOnly,decidedChannelIds]);
+    return matchesSearch && matchesCountry && matchesCountryStatus && matchesTradingStatus && matchesDiscordStatus && matchesScanStatus && matchesLowAudienceVisibility && matchesReviewView && matchesRecentInvites;
+  }),[channels,searchTerm,selectedCountry,selectedCountryStatus,selectedTradingStatus,selectedDiscordStatus,selectedScanStatus,pendingReviewOnly,decidedChannelIds,recentInvites]);
 
   const handleCopyLink = (url: string, id: string) => {
     navigator.clipboard.writeText(url);
@@ -265,6 +273,20 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
               <option value="NEEDS_REVIEW">NEEDS REVIEW</option>
             </select>
 
+            {onFiltersChange && (
+              <button
+                type="button"
+                aria-pressed={recentInvites}
+                aria-label="Sort by recently confirmed Discord invites, newest first"
+                title="Show only confirmed, validated Discord invites sorted by first successful validation time. The selected Discord category still applies."
+                onClick={() => setRecentInvites(value => !value)}
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold rounded-lg border transition-colors ${recentInvites ? 'border-indigo-600 bg-indigo-600 text-white' : 'border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:border-indigo-300 dark:hover:border-indigo-700'}`}
+              >
+                <CheckCircle2 className="h-3.5 w-3.5" />
+                Recently confirmed
+              </button>
+            )}
+
             {/* Discord Status */}
             <select
               value={selectedDiscordStatus}
@@ -277,6 +299,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
               <option value="UNCERTAIN">UNCERTAIN (Ambiguous Niche)</option>
               <option value="NON_TRADING">NON_TRADING (Irrelevant Niche)</option>
               <option value="NOT_FOUND">NOT FOUND</option>
+              <option value="INVITE_OWNED_BY_ANOTHER_CHANNEL">INVITE OWNED BY ANOTHER CHANNEL</option>
               <option value="PENDING">PENDING</option>
               <option value="DEAD">DEAD / Expired</option>
             </select>
@@ -328,11 +351,12 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
               {filteredChannels.length === 0 ? (
                 <tr>
                   <td colSpan={8} className="py-12 text-center text-slate-500 dark:text-slate-400">
-                    {pendingReviewOnly ? 'No channels are awaiting human review.' : 'No validated channels match the selected filters.'}
+                    {pendingReviewOnly ? 'No channels are awaiting human review.' : recentInvites ? 'No confirmed, validated Discord invites match the selected filters.' : 'No validated channels match the selected filters.'}
                   </td>
                 </tr>
               ) : (
                 filteredChannels.map(c => {
+                  const foundAge = formatFoundAgo(c.discord_invite_first_validated_at);
                   const retryReconciliationRequired = c.community_retry_job_reconciliation_status === 'RECONCILIATION_REQUIRED';
                   const retryReconciliationReason = c.community_retry_job_reconciliation_reason || 'Legacy community retry was reclassified by the governed reconciliation pass.';
                   const automaticRetryActive = !retryReconciliationRequired && (c.community_retry_job_status === 'PENDING' || c.community_retry_job_status === 'PROCESSING');
@@ -348,6 +372,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                   const retryReconciliationLabel = c.community_retry_job_reconciliation_status === 'RECONCILIATION_REQUIRED'
                     ? `${c.community_retry_job_reconciliation_code || 'STALE_RETRY'} · RECONCILIATION REQUIRED`
                     : '';
+                  const communityIntent = communityIntentDisplay(c);
                   return (
                   <tr key={c.channel_id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40 transition-colors">
                     
@@ -510,8 +535,29 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                           </button>
                         </div>
                       )}
+                      {c.discord_invite && (foundAge || recentInvites) && (
+                        <div
+                          data-testid="discord-found-age"
+                          className={`mt-0.5 text-[10px] font-medium ${foundAge ? 'text-emerald-700 dark:text-emerald-400' : 'text-slate-500 dark:text-slate-400'}`}
+                          title={c.discord_invite_first_validated_at
+                            ? `First successful validation: ${new Date(c.discord_invite_first_validated_at).toLocaleString()}`
+                            : 'No trustworthy successful validation timestamp is recorded for this invite.'}
+                        >
+                          {foundAge || 'Found time unavailable'}
+                        </div>
+                      )}
+                      {c.discord_duplicate_owner_channel_id && (
+                        <div data-testid="duplicate-owned-invite" className="mt-1 rounded-md border border-amber-300 bg-amber-50 px-2 py-1.5 text-[10px] dark:border-amber-800 dark:bg-amber-950/40">
+                          <div className="font-bold text-amber-800 dark:text-amber-300">Invite found, owned by another channel</div>
+                          <div className="mt-0.5 font-mono text-slate-600 dark:text-slate-300" title={c.discord_duplicate_owner_channel_id}>
+                            Owner channel: {c.discord_duplicate_owner_channel_id}
+                          </div>
+                        </div>
+                      )}
                       <div className="mt-1 text-[10px] text-slate-500 dark:text-slate-400">
-                        {c.discord_discovery_status === 'DISCOVERED_VALIDATION_FAILED'
+                        {c.discord_duplicate_owner_channel_id
+                          ? 'Invite found, owned by another channel'
+                          : c.discord_discovery_status === 'DISCOVERED_VALIDATION_FAILED'
                           ? 'Discovered · validation failed'
                           : c.discord_discovery_status === 'VALIDATED' && c.discord_status === 'UNCERTAIN'
                           ? 'Discovered · validation ambiguous'
@@ -521,10 +567,35 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                           ? 'Website acquisition incomplete'
                           : (c.discord_validation_status === 'NOT_STARTED' || !c.discord_validation_status) && c.scan_status !== 'COMPLETED' && c.scan_status !== 'FAILED' && c.scan_status !== 'FAILED_PERMANENT' && !c.discord_candidate_locator && !c.discord_invite
                           ? 'Not yet inspected'
-                          : c.scan_status === 'COMPLETED' && c.discord_validation_status === 'COMPLETED' && !c.discord_candidate_locator && !c.discord_invite
+                          : communityIntent.present && !c.discord_invite && !c.discord_candidate_locator
+                          ? 'No Discord invite · community indicated'
+                          : c.scan_status === 'COMPLETED' && c.discord_validation_status === 'COMPLETED' && !c.discord_candidate_locator && !c.discord_invite && !communityIntent.present && !c.discord_duplicate_owner_channel_id
                           ? 'Clean inspection · no community found'
                           : 'Not discovered'}
                       </div>
+                      {communityIntent.present && (
+                        <div data-testid="community-intent" className={`mt-1.5 rounded-md border px-2 py-1.5 ${
+                          communityIntent.tone === 'paid'
+                            ? 'border-amber-300 bg-amber-50 dark:border-amber-800 dark:bg-amber-950/40'
+                            : 'border-sky-200 bg-sky-50 dark:border-sky-800 dark:bg-sky-950/40'
+                        }`}>
+                          <div className={`text-[10px] font-bold ${
+                            communityIntent.tone === 'paid'
+                              ? 'text-amber-800 dark:text-amber-300'
+                              : 'text-sky-800 dark:text-sky-300'
+                          }`}>
+                            {communityIntent.label}
+                          </div>
+                          {communityIntent.evidence.length > 0 ? communityIntent.evidence.map(item => (
+                            <div key={item.key} className="mt-0.5 text-[10px] text-slate-600 dark:text-slate-300" title={item.url}>
+                              <span className="font-semibold">{item.platform}</span> · {item.intent} · <span className="font-mono break-all">{item.displayUrl}</span>
+                              {item.signals.length > 0 && <span> · {item.signals.join(', ')}</span>}
+                            </div>
+                          )) : (
+                            <div className="mt-0.5 text-[10px] text-slate-500 dark:text-slate-400">Evidence recorded by inspection</div>
+                          )}
+                        </div>
+                      )}
                       {c.discord_liveness_status&&c.discord_liveness_status!=='NOT_CHECKED'&&<div className="text-[10px] text-slate-500">Liveness: <b>{c.discord_liveness_status.replaceAll('_',' ')}</b></div>}
                       {c.discord_relevance_status&&c.discord_relevance_status!=='NOT_CHECKED'&&<div className="text-[10px] text-slate-500">Relevance: <b>{c.discord_relevance_status.replaceAll('_',' ')}</b></div>}
                       {retryReconciliationRequired && <div className="text-[10px] font-semibold text-rose-600" title={retryReconciliationReason}>{retryReconciliationLabel || 'STALE_RETRY · RECONCILIATION REQUIRED'} · reason: {retryReasonLabel}</div>}
@@ -557,6 +628,11 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                       }`}>
                         {retryReconciliationRequired ? 'RECONCILIATION REQUIRED' : c.discord_validation_status === 'RETRY_PENDING' && c.scan_status === 'FAILED' ? automaticRetryActive ? automaticRetryDue ? 'RETRY DUE' : 'RETRY QUEUED' : automaticRetryTerminal ? automaticRetryBudgetExhausted ? 'RETRY BUDGET EXHAUSTED' : 'RETRY TERMINAL' : 'RECOVERY AVAILABLE' : c.scan_status === 'PROVIDER_DEFERRED' ? 'PROVIDER DEFERRED' : c.scan_status}
                       </span>
+                      {c.discovery_visibility === 'LEGACY_UNCLASSIFIED' && (
+                        <span data-testid="legacy-unclassified" title="Legacy row: no discovery pass, no inspection trail, and no candidate evidence. This is not an inspected clean negative." className="mt-1 inline-flex items-center gap-1 rounded border border-slate-300 bg-slate-100 px-1.5 py-0.5 text-[9px] font-bold text-slate-600 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-300">
+                          LEGACY · NEVER INSPECTED
+                        </span>
+                      )}
                       {c.scan_status === 'PROVIDER_DEFERRED' && <span className="block text-[10px] text-amber-600 mt-0.5">Operationally blocked · awaiting provider recovery</span>}
                       {c.scan_attempts > 0 && (
                         <span className="block text-[10px] text-slate-400 mt-0.5">

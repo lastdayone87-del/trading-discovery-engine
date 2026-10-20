@@ -1,6 +1,6 @@
 import React from 'react';
 import { DashboardOperationalSummary, QueueStatus, QuotaInfo } from '../types';
-import { Radar, Table, Clock, Cpu, Settings, ShieldCheck, Database, Radio, Brain } from 'lucide-react';
+import { Radar, Table, Clock, Cpu, Settings, ShieldCheck, Database, Radio, Brain, ShieldAlert } from 'lucide-react';
 
 interface Props {
   activeTab: 'discovery' | 'results' | 'pending' | 'queues' | 'settings' | 'intelligence' | 'regression';
@@ -70,6 +70,12 @@ export const Navbar: React.FC<Props> = ({ activeTab, setActiveTab, queueStatus, 
               <Clock className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
               <span>Pending Scans:</span>
               <span className="font-extrabold font-mono">{operationalSummary?.pendingScans ?? '—'}</span>
+            </div>
+
+            <div title="Stored channels with no discovery pass, no inspection trail, and no candidate evidence — distinct from inspected clean negatives." className="px-3 py-1.5 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 flex items-center gap-2">
+              <ShieldAlert className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400" />
+              <span className="text-slate-500 dark:text-slate-400">Legacy Unclassified:</span>
+              <span className="font-extrabold font-mono text-slate-900 dark:text-white">{operationalSummary?.legacyUnclassifiedChannels ?? '—'}</span>
             </div>
           </div>
 

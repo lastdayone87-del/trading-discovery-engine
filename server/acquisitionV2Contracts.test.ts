@@ -19,7 +19,7 @@ import {
   enqueueCommunityAcquisitionRetry,
   projectNotFoundAfterInspection,
 } from './queueManager';
-import { crawlExternalLinks, runChannelInspection, isReusableStaticRootLender } from './inspector';
+import { buildSharedStaticRootRecord, crawlExternalLinks, runChannelInspection, isReusableStaticRootLender } from './inspector';
 import type { BrowserFallbackResult } from './browserCommunityFallback';
 
 const PAGE = 'https://creator.example.com/guide';
@@ -598,6 +598,51 @@ test('v2 review: shared static roots skip refetch but still acquire children', a
   assert.equal(rootRows[0].telemetry?.pagesInspected, 1);
 });
 
+test('v2 review: shared static root replay carries lender community intent to the borrower', async () => {
+  const lenderIntent = {
+    communityPlatform: 'WHOP' as const,
+    communityUrl: 'https://www.whop.com/creator',
+    intent: 'UNKNOWN' as const,
+    paidSignals: [],
+    privateSignals: [],
+    observedAt: '2026-10-20T00:00:00.000Z',
+    sourcePageUrl: 'https://intent.example.com/',
+    extractionConfidence: 'EXPLICIT' as const,
+  };
+  const record = buildSharedStaticRootRecord('https://intent.example.com/', {
+    outcome: 'INSPECTED_NO_MATCH',
+    visitedUrls: ['https://intent.example.com/'],
+    rootNavigation: [],
+    communityIntent: [lenderIntent],
+  });
+  assert.ok(record, 'terminal-success lender record is built');
+  const key = normalizeVisitUrl('https://intent.example.com/');
+  assert.ok(key);
+  const borrowerFetched: string[] = [];
+  const borrower = await crawlExternalLinks(
+    ['https://intent.example.com/'],
+    [],
+    undefined,
+    (async (input) => {
+      borrowerFetched.push(String(input));
+      return noInviteHtml();
+    }) as typeof fetch,
+    'CREATOR_WEBSITES',
+    false,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    { visitedKeys: ['https://intent.example.com/'], roots: new Map([[key as string, record]]) },
+  );
+  assert.equal(borrowerFetched.length, 0, 'the shared root is not refetched');
+  assert.ok(
+    borrower.communityIntent?.some(item => item.communityPlatform === 'WHOP' && item.intent === 'UNKNOWN'),
+    'lender root community intent survives the borrow',
+  );
+});
+
 // REVIEW: bare/www collapse is port-aware.
 test('v2 review: collapse requires equal normalized ports', async () => {
   const samePort = await inspectLinks(['https://port.example.com:8443/a', 'https://www.port.example.com:8443/a']);
@@ -725,9 +770,13 @@ test('v2 review: scheduler and worker wiring call sites are pinned', () => {
   assert.match(queue, /shouldScheduleFoundGapAcquisitionRetry\(inspection\)/);
   assert.match(queue, /shouldCompleteSuppressedRetryJob\(inspectionResult,refreshed\?\.scan_status\)/);
   const fallback = readFileSync(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8');
-  const enqueuePos = fallback.indexOf('Capture the original page');
-  const clickPos = fallback.indexOf('for (const control of clickPlan.toClick)');
+  // Capture the original page's anchors before any control click can navigate
+  // the document away; the post-click enqueue then covers JS-revealed links.
+  const enqueuePos = fallback.indexOf("await enqueueLinks({ strategy: 'same-hostname'");
+  const clickPos = fallback.indexOf('const clickTargets = [...clickPlan.toClick];');
+  const postClickEnqueuePos = fallback.indexOf("await enqueueLinks({strategy:'same-hostname'", clickPos);
   assert.ok(enqueuePos !== -1 && clickPos !== -1 && enqueuePos < clickPos, 'anchors enqueue before navigating clicks');
+  assert.ok(postClickEnqueuePos > clickPos, 'JS-revealed anchors enqueue after clicks');
 });
 
 // REVIEW e2e: a FOUND+required-gap inspection actually creates the durable
@@ -760,6 +809,10 @@ test('v2 review e2e: FOUND+gap inspection creates the durable retry job', async 
   `);
   const client = {
     query: async (sql: string, params: unknown[] = []) => {
+      // This SQL.js fake exercises job creation, not PostgreSQL JSONB math.
+      // The monotonic click-offset merge is covered by the real PostgreSQL
+      // regression in communityRetryClickOffsets.postgres.test.ts.
+      if (sql.includes('UPDATE jobs SET payload=CASE')) return { rows: [], rowCount: 1 };
       let processed = sql.replace(/::jsonb/gi, '').replace(/now\(\)/gi, `datetime('now')`);
       try {
         const stmt = db.prepare(processed);
@@ -1054,8 +1107,13 @@ test('found-gap retry survives the no-admission NOT_FOUND branch', async () => {
   assert.equal(calls.length, 1, 'exactly one durable retry job must be scheduled');
   assert.equal(calls[0].channelId, 'UCashish0000000000000001');
   assert.equal(calls[0].directive, gapDirective, 'the queued job must contain inspection.retryDirective');
-  assert.equal((channel as { scan_status?: unknown }).scan_status, 'COMPLETED');
-  assert.equal((channel as { discord_status?: unknown }).discord_status, 'NOT_FOUND');
+  // E7 pending-work guard: a FOUND inspection with an outstanding retryable
+  // required gap is not a clean absence. It projects operational failure +
+  // RETRY_PENDING instead of COMPLETED/NOT_FOUND, and the durable retry job
+  // still survives the branch.
+  assert.equal((channel as { scan_status?: unknown }).scan_status, 'FAILED');
+  assert.equal((channel as { discord_status?: unknown }).discord_status, 'UNCERTAIN');
+  assert.equal((channel as { discord_validation_status?: unknown }).discord_validation_status, 'RETRY_PENDING');
   assert.equal((channel as { discord_discovery_status?: unknown }).discord_discovery_status, 'NOT_DISCOVERED');
   // FOUND_COMPLETE (directive absent) schedules nothing; status identical.
   // The clean fixture carries a real retryable FOUND+required-gap outcome so
@@ -1080,14 +1138,22 @@ test('found-gap retry survives the no-admission NOT_FOUND branch', async () => {
     } as never,
     { discordCandidates: [], foundInvite: null, steps: [] } as never,
     true,
-    (async () => {
-      cleanCalls.push(1);
+    (async (_channelId: string, directive?: unknown) => {
+      cleanCalls.push(directive);
     }) as never,
   );
-  assert.equal(cleanCalls.length, 0);
-  assert.equal((cleanChannel as { scan_status?: unknown }).scan_status, 'COMPLETED');
-  // A missing retry directive never schedules, even with gap rows present;
-  // a plain FOUND_COMPLETE row without any gap class likewise never does.
+  // Pending work always owns a durable job (E7): a missing inspection
+  // directive gets a bounded, attempt-consuming fallback rather than
+  // stranding RETRY_PENDING state. It is not labeled a capacity deferral:
+  // the backing inspection already ran real acquisition work.
+  assert.equal(cleanCalls.length, 1);
+  assert.equal((cleanCalls[0] as { attemptFree?: unknown }).attemptFree, false);
+  assert.equal((cleanCalls[0] as { code?: unknown }).code, 'COMMUNITY_ACQUISITION_REQUIRED');
+  // The retryable required gap still blocks a clean completion even without an
+  // inspection directive: the channel never claims COMPLETED.
+  assert.equal((cleanChannel as { scan_status?: unknown }).scan_status, 'FAILED');
+  // The gap-only scheduler still refuses to schedule by itself without a
+  // directive; the durable fallback above is the explicit pending-work path.
   assert.equal(
     shouldScheduleFoundGapAcquisitionRetry({ acquisitionOutcomes: [], retryDirective: undefined }),
     false,

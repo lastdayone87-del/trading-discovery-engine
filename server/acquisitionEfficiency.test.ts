@@ -76,6 +76,15 @@ test('acquisition: click budget binds attempted clicks, slice remainder stays ac
   assert.equal(controls.length - plan.toClick.length - plan.skippedNavigableAnchors, 2);
 });
 
+test('acquisition: retry offset rotates the full eligible pool before the click cap', () => {
+  const controls = [button(0), button(1), button(2), button(3), button(4), button(5)];
+  const plan = partitionRenderedClickTargets(controls, PAGE, 4, 4);
+  // Rotating the already-truncated plan would return [0,1,2,3] again; the
+  // retry must reach unexamined controls beyond the first budget window.
+  assert.deepEqual(plan.toClick.map((c) => c.index), [4, 5, 0, 1]);
+  assert.equal(controls.length - plan.toClick.length - plan.skippedNavigableAnchors, 2);
+});
+
 // Seed fan-out: bare/www duplicates collapse; distinct paths/tenants do not.
 const html = (body: string) =>
   new Response(`<html><body>${body}</body></html>`, { status: 200, headers: { 'content-type': 'text/html' } });

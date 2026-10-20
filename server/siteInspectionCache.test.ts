@@ -77,6 +77,19 @@ test('reuse matrix: fresh hits borrow, expired and malformed rows recrawl', () =
   assert.equal(isSiteInspectionReusable(row({ lastObservedAt: 'not-a-date' }), NOW), false);
 });
 
+test('country-rejected FOUND cache rows are never borrowed as coverage', () => {
+  const clean = row({ outcome: 'FOUND', candidates: [], lastObservedAt: hoursAgo(1) });
+  assert.equal(isSiteInspectionReusable(clean, NOW), true, 'ordinary clean positives remain reusable');
+  assert.equal(
+    isSiteInspectionReusable(
+      row({ ...clean, provenance: { coverageBorrowable: false, discardedReason: 'COUNTRY_REJECTED' } }),
+      NOW,
+    ),
+    false,
+    'a rejected, unclaimed FOUND crawl must force a fresh crawl so its invite can be re-admitted',
+  );
+});
+
 test('borrowed observations refresh the audit trail but preserve site-facts', () => {
   const source = row({
     finalUrl: 'https://apextrader.com/home',
@@ -86,6 +99,7 @@ test('borrowed observations refresh the audit trail but preserve site-facts', ()
       { requestedUrl: 'https://apextrader.com/pricing', surface: 'CREATOR_WEBSITES', required: true, outcome: 'FOUND', retryable: false, detail: 'rendered', observedAt: hoursAgo(2) },
     ],
     candidates: [{ candidateId: 'c1', nativeInviteCode: 'apexroom', sourceUrl: 'https://apextrader.com/home' }],
+    communityIntents: [{ communityPlatform: 'WHOP', communityUrl: 'https://www.whop.com/apex', intent: 'PAID', paidSignals: ['price'], privateSignals: [], observedAt: hoursAgo(2), sourcePageUrl: 'https://apextrader.com/home', extractionConfidence: 'EXPLICIT' }],
   });
   const borrowed = buildBorrowedSiteInspection(source, {
     requestedUrl: 'https://apextrader.com/',
@@ -107,6 +121,8 @@ test('borrowed observations refresh the audit trail but preserve site-facts', ()
   assert.equal(first.siteCacheHit, true);
   assert.equal(first.siteIdentity, 'apextrader.com');
   assert.equal(first.siteObservedAt, hoursAgo(1));
+  assert.equal(borrowed.communityIntents.length, 1, 'cached community intent survives the borrow');
+  assert.equal((borrowed.communityIntents[0] as Record<string, unknown>).communityPlatform, 'WHOP');
   assert.deepEqual((borrowed as unknown as Record<string, unknown>).candidates, undefined, 'borrowed inspections carry no candidates across creators');
   assert.deepEqual(borrowed.row.candidates, [], 'borrowed row is candidate-free at the API boundary');
 });

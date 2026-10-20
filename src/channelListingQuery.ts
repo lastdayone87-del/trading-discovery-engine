@@ -4,6 +4,7 @@ import type { DashboardChannelFilters } from './components/ResultsTable';
 export function channelListingSearchParams(filters:DashboardChannelFilters,includeRejected:boolean):URLSearchParams {
   const params=new URLSearchParams();
   if(includeRejected){params.set('include_rejected','true');params.set('diagnostics_only','true');}
+  if(filters.recentInvites)params.set('recent_invites','true');
   if(filters.search)params.set('search',filters.search);
   if(filters.country!=='ALL')params.set('country',filters.country);
   if(filters.countryStatus!=='ALL')params.set('country_status',filters.countryStatus);

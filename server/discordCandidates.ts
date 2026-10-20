@@ -43,9 +43,9 @@ export const canonicalDiscordInviteId=(code:string)=>`discord:${String(code||'')
  * persistence path so both agree on shape. */
 export function buildLegacyDiscordCandidate(foundInvite:string,legacyCode:string|null):DiscordCandidate|null{
   if(!foundInvite)return null;
-  if(!legacyCode){
-    return {candidateId:`legacy:${foundInvite}`,locatorType:'NATIVE_INVITE',sourceSurface:'CHANNEL_EXTERNAL_LINKS',rawLocator:foundInvite,nativeInviteCode:foundInvite,normalizedLocator:`https://discord.gg/${foundInvite}`,extractionConfidence:'EXPLICIT'};
-  }
+  // Unparseable legacy values are prose/fragments, not invite codes. They must
+  // not become candidates: only shapes that canonicalize are admissible.
+  if(!legacyCode)return null;
   const rawCode=extractDiscordInviteCodeRaw(foundInvite)||foundInvite;
   return {candidateId:`legacy:${foundInvite}`,locatorType:'NATIVE_INVITE',sourceSurface:'CHANNEL_EXTERNAL_LINKS',rawLocator:foundInvite,nativeInviteCode:rawCode,normalizedLocator:`https://discord.gg/${legacyCode}`,extractionConfidence:'EXPLICIT'};
 }
@@ -54,22 +54,67 @@ export interface AdmittedDiscordCandidates {
   discoveredInvite:string|null;
   discardedCount:number;
 }
+/**
+ * A Discord invite code, canonicalized: zero-width/format characters stripped,
+ * outer whitespace trimmed, and then validated against the actual invite-code
+ * alphabet. Punctuation and arbitrary prose are rejected rather than lowercased
+ * into a registry claim (`abc123.` is not code `abc123.`).
+ */
+export function sanitizeDiscordInviteCode(value:string|null|undefined):string|null{
+  const code=String(value??'').replace(/[\u200B-\u200D\uFEFF\u2060]/g,'').trim();
+  return /^[A-Za-z0-9_-]{2,128}$/.test(code)?code:null;
+}
+// Host boundary: the host token must not be embedded inside another domain,
+// path, or word. `example.com/discord.gg/x` and `notdiscord.gg/x` are not
+// Discord invite references; a query/redirect parameter is likewise not a
+// direct invite. The same boundary is used by every URL-form extractor.
+// Prose punctuation (including a colon after "Discord") may precede a direct
+// invite, but a scheme colon must not let the protocol-relative branch match
+// inside `https://` or another redirect URL. The second lookbehind rejects a
+// match beginning at `//` directly after a URL scheme; the same invite is
+// still matched from its host or `https://` start when the preceding token is
+// prose.
+const INVITE_HOST_BOUNDARY='(?<![\\w.\\-\\/?&#=])(?<!(?:https?|ftp|file|javascript):)';
+const INVITE_PROTOCOL='(?:(?:https?:)?\\/\\/)?(?:www\\.)?';
+const NATIVE_INVITE_HOST='(?:discord\\.gg|discord\\.com\\/invite|discordapp\\.com\\/invite|discord\\.app\\/invite)';
+const ALTERNATIVE_INVITE_HOST='(?:dsc\\.gg|discord\\.me|discord\\.io)';
+// The code capture must end at a real token boundary: a longer
+// code-alphabet run is not an invite (`a`×129 must not truncate to `a`×128).
+const INVITE_CODE_CAPTURE='([A-Za-z0-9_-]{2,128})(?![A-Za-z0-9_-])';
+/** Decode the bounded obfuscation forms that still name a real invite:
+ * escaped slashes/colons/percent forms, numeric HTML entities, zero-width
+ * format characters, and bracketed dot separators (`discord[.]gg`). Only
+ * Discord-shaped tokens are rewritten; arbitrary text is never transformed. */
+export function decodeInviteObfuscation(text:string):string{
+  return String(text||'')
+    .replace(/[\u200B-\u200D\uFEFF\u2060]/g,'')
+    .replace(/\\\/|\\u002f/gi,'/')
+    .replace(/\\u003a/gi,':')
+    .replace(/\\u0026/gi,'&')
+    .replace(/%2f/gi,'/')
+    .replace(/%3a/gi,':')
+    .replace(/&#x0*2e;|&#0*46;/gi,'.')
+    .replace(/&#x0*3a;|&#0*58;/gi,':')
+    .replace(/&#x0*2f;|&#0*47;/gi,'/')
+    .replace(/&#x0*26;|&#0*38;/gi,'&')
+    .replace(/discord\s*[\[(]\s*[.·•]\s*[\])]\s*gg/gi,'discord.gg')
+    .replace(/discord\s*[\[(]\s*dot\s*[\])]\s*gg/gi,'discord.gg')
+    .replace(/discord\s*[\[(]\s*[.·•]\s*[\])]\s*(com|app)/gi,'discord.$1');
+}
 /** Canonical invite code shared by every layer that must agree on Discord
  * invite identity (registry claims, choke-point filtering, tests). Accepts a
  * bare code or any Discord URL form (discord.gg, discord.com/invite, dsc.gg,
- * …) in any casing; returns the lowercase code, or null when unparseable
- * (callers fail open and preserve legacy behavior for such inputs). */
-/** Case-preserved invite code extraction: accepts a bare code or any Discord
- * URL form and returns the raw code, or null when unparseable. */
+ * …) in any casing; returns the raw code, or null when unparseable. */
 export function extractDiscordInviteCodeRaw(value:string|null|undefined):string|null{
-  const text=String(value||'').trim();
+  const text=decodeInviteObfuscation(String(value||'')).trim();
   if(!text)return null;
-  const match=text.match(/(?:discord\.gg|discord\.(?:com|app)\/invite|discordapp\.com\/invite|discord\.(?:me|io)|dsc\.gg)\/([^\s"'<>\/?#&]+)/i);
-  const raw=match?match[1]:text;
-  if(/[\s\/]/.test(raw))return null;
-  const code=raw.trim();
-  if(code.length<2||code.length>128)return null;
-  return code;
+  const urlForm=new RegExp(`${INVITE_HOST_BOUNDARY}${INVITE_PROTOCOL}(?:${NATIVE_INVITE_HOST}|${ALTERNATIVE_INVITE_HOST})\\/${INVITE_CODE_CAPTURE}`,'i');
+  const match=text.match(urlForm);
+  if(match)return sanitizeDiscordInviteCode(match[1]);
+  // Bare values are accepted only when the whole token is a valid invite-code
+  // shape. Prose, punctuation, and URL fragments fail closed here; legacy
+  // production values were URL-derived codes, so this preserves recovery.
+  return sanitizeDiscordInviteCode(text);
 }
 /** Canonical invite code shared by every layer that must agree on Discord
  * invite identity (registry claims, choke-point filtering, tests): the
@@ -228,7 +273,7 @@ export function mergeDiscordCandidates(items:DiscordCandidate[],input:{creatorNa
 
 export function extractDiscordCandidates(text:string,sourceSurface:AcquisitionSurface='CHANNEL_EXTERNAL_LINKS',sourceUrl?:string):DiscordCandidate[]{
   if(!text)return [];
-  const clean=text.replace(/\\\/|\\u002f/gi,'/').replace(/\\u003a/gi,':').replace(/\\u0026/gi,'&').replace(/%2f/gi,'/').replace(/%3a/gi,':');
+  const clean=decodeInviteObfuscation(text);
   const found:DiscordCandidate[]=[];
   // Copy regexp captures before they escape extraction: V8 represents slices
   // of a large subject string as SlicedString views that keep the whole
@@ -243,11 +288,11 @@ export function extractDiscordCandidates(text:string,sourceSurface:AcquisitionSu
     const value=candidate({locatorType,sourceSurface,rawLocator:ownLocator,nativeInviteCode:ownCode,normalizedLocator:ownCode?`https://discord.gg/${ownCode}`:undefined,sourceUrl,extractionConfidence:confidence});
     if(!found.some(item=>item.candidateId===value.candidateId))found.push(value);
   };
-  const native=/(?:https?:\/\/)?(?:www\.)?(discord\.gg|discord\.com\/invite|discordapp\.com\/invite|discord\.app\/invite)\/([^\s"'<>\)\\/?#&]+)/gi;
-  for(let match;(match=native.exec(clean))!==null;)push(match[0],'NATIVE_INVITE',match[2],'EXPLICIT');
-  const alternative=/(?:https?:\/\/)?(?:www\.)?(dsc\.gg|discord\.me|discord\.io)\/([^\s"'<>\)\\/?#&]+)/gi;
+  const native=new RegExp(`${INVITE_HOST_BOUNDARY}${INVITE_PROTOCOL}${NATIVE_INVITE_HOST}\\/${INVITE_CODE_CAPTURE}`,'gi');
+  for(let match;(match=native.exec(clean))!==null;){const code=sanitizeDiscordInviteCode(match[1]);if(code)push(match[0],'NATIVE_INVITE',code,'EXPLICIT');}
+  const alternative=new RegExp(`${INVITE_HOST_BOUNDARY}${INVITE_PROTOCOL}${ALTERNATIVE_INVITE_HOST}\\/${INVITE_CODE_CAPTURE}`,'gi');
   for(let match;(match=alternative.exec(clean))!==null;)push(match[0],'ALTERNATIVE_REDIRECT',undefined,'EXPLICIT');
-  const directory=/(?:https?:\/\/)?(?:www\.)?disboard\.org\/server\/([^\s"'<>\)\\/?#&]+)/gi;
+  const directory=new RegExp(`${INVITE_HOST_BOUNDARY}${INVITE_PROTOCOL}disboard\\.org\\/server\\/${INVITE_CODE_CAPTURE}`,'gi');
   for(let match;(match=directory.exec(clean))!==null;)push(match[0],'DIRECTORY_PAGE',undefined,'EXPLICIT');
   return found;
 }
@@ -259,8 +304,8 @@ export function candidateFromNativeInvite(input:{
   rawLocator?:string;
   extractionConfidence?:DiscordCandidate['extractionConfidence'];
 }):DiscordCandidate|null{
-  const code=String(input.nativeInviteCode||'').trim();
-  if(!code||code.length<2||code.length>128||reserved.has(code.toLowerCase()))return null;
+  const code=sanitizeDiscordInviteCode(input.nativeInviteCode);
+  if(!code||reserved.has(code.toLowerCase()))return null;
   const raw=input.rawLocator||`https://discord.gg/${code}`;
   return candidate({
     locatorType:'NATIVE_INVITE',

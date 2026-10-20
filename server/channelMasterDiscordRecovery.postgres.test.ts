@@ -55,7 +55,12 @@ maybe('real PostgreSQL master listing, KPI, filters, revision, pagination and ca
   assert.ok(candidates.some(c=>c.relevance_status==='TRADING_RELEVANT'&&c.liveness_status==='ACTIVE'));
   await selectDiscordCandidate('confirmed','other');
   assert.equal((await db.query(`SELECT candidate_id FROM discord_candidates WHERE channel_id='confirmed' AND selected`)).rows[0].candidate_id,'other');
-  const api=await listChannelsPage({limit:100,offset:0,search:'confirmed'}); assert.equal(api.items[0].discord_candidates?.length,2);
+  const api=await listChannelsPage({limit:100,offset:0,search:'confirmed'});
+  // The operator listing projects only validated, completed, active
+  // candidates. The TIMEOUT candidate above stays in the raw table (asserted
+  // by count/attempt-sum) but is not operator-visible until validated.
+  assert.equal(api.items[0].discord_candidates?.length,1);
+  assert.equal(api.items[0].discord_candidates?.[0]?.candidate_id,'other');
 });
 
 after(async()=>{if(enabled)(await getDb()).end();});

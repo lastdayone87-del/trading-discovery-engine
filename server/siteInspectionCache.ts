@@ -20,6 +20,21 @@ export const SITE_INSPECTION_FRESH_TTL_MS = 30 * 24 * 60 * 60_000;
 export const SITE_INSPECTION_RETRYABLE_FAILURE_TTL_MS = 24 * 60 * 60_000;
 export const SITE_INSPECTION_POLICY_VERSION = 'site-inspection-cache-v1';
 
+/** Durable cache->queue claim handshake (E2). Rows written with candidates
+ * start PENDING; the queue flips them to CLAIMED once admission committed
+ * (candidates either persist+claim or are globally discarded), or DISCARDED
+ * when an execution explicitly discards the candidates. NONE marks
+ * candidate-free rows where no handshake is needed. PENDING rows are never
+ * reusable: a crash/quota window between cache write and admission forces a
+ * recrawl that re-admits idempotently instead of silently losing discovery. */
+export const SITE_INSPECTION_CLAIM_STATUS = {
+  NONE: 'NONE',
+  PENDING: 'PENDING',
+  CLAIMED: 'CLAIMED',
+  DISCARDED: 'DISCARDED',
+} as const;
+export type SiteInspectionClaimStatus = typeof SITE_INSPECTION_CLAIM_STATUS[keyof typeof SITE_INSPECTION_CLAIM_STATUS];
+
 /** Minimal structural view of a site_inspections row (DB mapping lives in
  * dbCore.ts). Candidates/observations are the raw crawl outputs:
  * ownership is always re-inferred per borrower, never stored. */
@@ -36,8 +51,24 @@ export interface CachedSiteInspection {
   payloadChecksum: string | null;
   candidates: Array<Record<string, unknown>>;
   observations: Array<Record<string, unknown>>;
+  /** Platform-community evidence observed by the original crawl. Replayed on
+   * cache hits so a borrow cannot turn a community into "no community found". */
+  communityIntents?: Array<Record<string, unknown>>;
   renderedCovered: boolean;
   lastObservedAt: string | null;
+  /** Recording channel for same-owner candidate recovery; null on legacy rows. */
+  sourceChannelId?: string | null;
+  /** Claim handshake state; absent/unknown is treated as not-claimable
+   * (fail closed) whenever candidates are present. */
+  claimStatus?: string | null;
+  /** Per-channel unclaimed candidates (migration 150). Non-empty means the
+   * row is PENDING for at least one recording channel and is never reusable
+   * as borrowed coverage. */
+  pendingClaims?: Record<string, Array<Record<string, unknown>>>;
+  /** Site-fact provenance. `coverageBorrowable: false` marks a terminal
+   * country-rejected crawl whose unclaimed discoveries were discarded: other
+   * creators must recrawl rather than borrow FOUND coverage and miss them. */
+  provenance?: Record<string, unknown>;
 }
 
 export interface BorrowedSiteInspection {
@@ -54,6 +85,15 @@ export interface BorrowedSiteInspection {
    * Cached discovery candidates are never returned here and must never be
    * merged into another creator's investigation. */
   observations: Array<Record<string, unknown>>;
+  /** Same-owner candidate recovery (E3): populated ONLY when the borrower is
+   * the row's recording channel (`sourceChannelId`). The caller feeds these
+   * through the normal admission path (persist -> global claim -> validation),
+   * so ownership and validation still decide; cross-creator borrows always
+   * receive an empty list. */
+  recoveredCandidates: Array<Record<string, unknown>>;
+  /** Site-level platform-community evidence from the cached inspection.
+   * Extraction-only: it never becomes an invite or a registry claim. */
+  communityIntents: Array<Record<string, unknown>>;
 }
 
 const ageMs = (lastObservedAt: string | null, nowMs: number): number | null => {
@@ -67,12 +107,59 @@ const ageMs = (lastObservedAt: string | null, nowMs: number): number | null => {
  * original crawl's clock and the next borrower recrawls. */
 export function isSiteInspectionReusable(row: CachedSiteInspection | null | undefined, nowMs: number = Date.now()): boolean {
   if (!row || !row.siteIdentity) return false;
+  // A country-rejected crawl discarded this channel's unclaimed candidates
+  // without admitting them. Its FOUND observations are still fresh, but they
+  // must not become borrowed coverage for an allowed creator: the invite is
+  // available and only a real recrawl can re-admit it under the new owner.
+  if (row.provenance?.coverageBorrowable === false) return false;
+  // PENDING is never reusable, even when a later writer replaced the row-level
+  // candidate array: the per-channel pending map still owns unclaimed
+  // discoveries that must be recovered before anyone borrows this coverage.
+  if (row.claimStatus === SITE_INSPECTION_CLAIM_STATUS.PENDING) return false;
+  if (row.pendingClaims && Object.values(row.pendingClaims).some(candidates => Array.isArray(candidates) && candidates.length > 0)) return false;
+  const hasCandidates = Array.isArray(row.candidates) && row.candidates.length > 0;
+  if (hasCandidates) {
+    // Write-invariant repair gate (E1): a negative row that still carries
+    // candidates contradicts itself. Never reuse it; a recrawl repairs the
+    // aggregate outcome on write.
+    if (row.outcome !== 'FOUND') return false;
+    // Durable claim handshake (E2): a FOUND row with unclaimed candidates is
+    // not reusable until admission committed. Same-owner recovery handles the
+    // recording channel separately; everyone else recrawls.
+    if (row.claimStatus !== SITE_INSPECTION_CLAIM_STATUS.CLAIMED && row.claimStatus !== SITE_INSPECTION_CLAIM_STATUS.DISCARDED) return false;
+  }
   const age = ageMs(row.lastObservedAt, nowMs);
   if (age === null) return false;
-  if (row.outcome === 'ACQUISITION_FAILED' && row.retryable) {
+  // Trust-level TTL (E4): retryable rows and partial-coverage rows keep the
+  // short 24h window regardless of outcome — retryable negatives,
+  // interaction-gap FOUND rows, and unresolved required gaps must never pin
+  // 30-day "freshness" to incomplete coverage.
+  if (row.retryable === true || row.outcome === 'PARTIALLY_INSPECTED') {
     return age <= SITE_INSPECTION_RETRYABLE_FAILURE_TTL_MS;
   }
   return age <= SITE_INSPECTION_FRESH_TTL_MS;
+}
+
+/** True only when this channel has recoverable unclaimed candidates on the
+ * row: either its own migration-150 pending entry, or a legacy single-owner
+ * PENDING row. A pending map for other channels never grants candidate
+ * recovery to a borrower, and final CLAIMED/DISCARDED rows are not replayed. */
+export function hasSameOwnerPendingCandidates(
+  row: CachedSiteInspection | null | undefined,
+  channelId?: string | null,
+): boolean {
+  if (!row || !channelId) return false;
+  const pendingClaims = row.pendingClaims && typeof row.pendingClaims === 'object' ? row.pendingClaims : {};
+  const pendingChannels = Object.keys(pendingClaims);
+  const own = pendingClaims[channelId];
+  if (Array.isArray(own) && own.length > 0) return true;
+  if (pendingChannels.length > 0) return false;
+  return row.claimStatus !== SITE_INSPECTION_CLAIM_STATUS.CLAIMED
+    && row.claimStatus !== SITE_INSPECTION_CLAIM_STATUS.DISCARDED
+    && typeof row.sourceChannelId === 'string'
+    && row.sourceChannelId === channelId
+    && Array.isArray(row.candidates)
+    && row.candidates.length > 0;
 }
 
 /** Builds the borrower's per-creator observations from a cached row. The
@@ -82,11 +169,11 @@ export function isSiteInspectionReusable(row: CachedSiteInspection | null | unde
  * verbatim: the borrowing call has identical structure to the original, so
  * retry attribution matches a fresh crawl. Provenance marks the borrow so
  * crawled vs reused evidence stays distinguishable downstream.
- * Candidates are deliberately excluded: discoveries belong to the
- * originating investigation and are never transferred across creators. */
+ * Cross-creator candidates are deliberately excluded; only this channel's
+ * unclaimed pending-map entry may be recovered by the caller. */
 export function buildBorrowedSiteInspection(
   row: CachedSiteInspection,
-  borrower: { requestedUrl: string; surface: string; required: boolean; wrapperUrl?: string; observedAt: string },
+  borrower: { requestedUrl: string; surface: string; required: boolean; wrapperUrl?: string; observedAt: string; channelId?: string },
 ): BorrowedSiteInspection {
   const observations = (Array.isArray(row.observations) ? row.observations : []).map(item => {
     const source = (item && typeof item === 'object' ? item : {}) as Record<string, unknown>;
@@ -108,7 +195,66 @@ export function buildBorrowedSiteInspection(
       siteObservedAt: row.lastObservedAt,
     };
   });
-  return { row: { ...row, candidates: [] }, observations };
+  // Same-owner candidate recovery (E3): candidates flow back ONLY to the
+  // channel that recorded them. Migration 150 keeps one pending list per
+  // channel, so a site rewritten by another creator still returns exactly this
+  // channel's unclaimed discoveries. Ownership is re-inferred and the global
+  // claim still decides during normal admission; cross-creator borrowers stay
+  // candidate-free by construction. Legacy rows (no pending map) fall back to
+  // the single sourceChannelId pair.
+  const pendingClaims = row.pendingClaims && typeof row.pendingClaims === 'object' ? row.pendingClaims : {};
+  const hasPendingMap = Object.keys(pendingClaims).length > 0;
+  const ownPending = typeof borrower.channelId === 'string' && borrower.channelId
+    ? pendingClaims[borrower.channelId]
+    : undefined;
+  const legacyOwnCandidates = !hasPendingMap &&
+    typeof borrower.channelId === 'string' && borrower.channelId.length > 0 &&
+    typeof row.sourceChannelId === 'string' && row.sourceChannelId.length > 0 &&
+    row.sourceChannelId === borrower.channelId;
+  const recoveredCandidates = Array.isArray(ownPending)
+    ? ownPending.filter(item => item && typeof item === 'object')
+    : legacyOwnCandidates && Array.isArray(row.candidates)
+      ? row.candidates.filter(item => item && typeof item === 'object')
+      : [];
+  const communityIntents = Array.isArray(row.communityIntents)
+    ? row.communityIntents.filter(item => item && typeof item === 'object')
+    : [];
+  return { row: { ...row, candidates: [], pendingClaims: {} }, observations, recoveredCandidates, communityIntents };
+}
+
+/** Strongest-observation aggregate for a seed's cache row (E1): array
+ * position must never decide the stored outcome. Candidates or any FOUND
+ * observation -> FOUND; else any PARTIALLY_INSPECTED -> PARTIALLY_INSPECTED;
+ * else an ACQUISITION_FAILED that processed pages -> PARTIALLY_INSPECTED
+ * (uncertain coverage, never a clean negative); else a zero-page
+ * ACQUISITION_FAILED -> ACQUISITION_FAILED; else INSPECTED_NO_MATCH.
+ * Pure. */
+export function aggregateSeedOutcome(
+  observations: Array<{ outcome?: unknown; telemetry?: unknown }>,
+  candidateCount: number,
+): string {
+  if (Number(candidateCount) > 0) return 'FOUND';
+  let sawPartial = false;
+  let sawFailure = false;
+  let sawFailureWithPages = false;
+  for (const item of Array.isArray(observations) ? observations : []) {
+    if (!item || typeof item !== 'object') continue;
+    const outcome = String((item as { outcome?: unknown }).outcome || '');
+    if (!outcome) continue;
+    if (outcome === 'FOUND') return 'FOUND';
+    if (outcome === 'PARTIALLY_INSPECTED') sawPartial = true;
+    if (outcome === 'ACQUISITION_FAILED') {
+      sawFailure = true;
+      const telemetry = (item as { telemetry?: unknown }).telemetry;
+      const pages = telemetry && typeof telemetry === 'object'
+        ? Number((telemetry as { pagesInspected?: unknown }).pagesInspected) || 0
+        : 0;
+      if (pages > 0) sawFailureWithPages = true;
+    }
+  }
+  if (sawPartial || sawFailureWithPages) return 'PARTIALLY_INSPECTED';
+  if (sawFailure) return 'ACQUISITION_FAILED';
+  return 'INSPECTED_NO_MATCH';
 }
 
 /** Root-page terminal for coverage rows: reflects ONLY the root page's own
@@ -122,14 +268,15 @@ export function rootCoverageTerminal(rootYield: number, truncated: boolean): 'FO
 
 /** Whether a rendered run counts as sufficient rendered coverage for the
  * site cache. Attempted is not covered: timeouts, interruptions, partial
- * page processing, and zero-page runs must never satisfy renderedCovered —
- * only a complete, processed run does. Retryable partial results stay
- * retryable through the row's own retryable flag, not through this bit. */
+ * page processing, interaction gaps, and zero-page runs must never satisfy
+ * renderedCovered — only a complete, processed, fully-interacted run does.
+ * Retryable partial results stay retryable through the row's own retryable
+ * flag, not through this bit. */
 export function isSufficientRenderedCoverage(
-  rendered: { complete?: unknown; timedOut?: unknown },
+  rendered: { complete?: unknown; timedOut?: unknown; interactionGap?: unknown },
   processed: boolean,
 ): boolean {
-  return processed === true && rendered.complete === true && rendered.timedOut !== true;
+  return processed === true && rendered.complete === true && rendered.timedOut !== true && rendered.interactionGap !== true;
 }
 
 /** Normalized page key for coverage checks: scheme plus lowercased host

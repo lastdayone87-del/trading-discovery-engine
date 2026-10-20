@@ -72,6 +72,13 @@ test('new community retry metadata carries the current lifecycle version',()=>{
   assert.equal(metadata.retryLifecycleVersion,2);
 });
 
+test('community retry metadata carries only non-empty click-window progress',()=>{
+  const empty=buildCommunityRetryJobMetadata({code:'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE',retryReason:'COMMUNITY_REQUIRED_ACQUISITION_FAILURE',clickOffsets:{}});
+  assert.equal('clickOffsets' in empty,false,'empty progress is omitted rather than persisted as a reset');
+  const progressed=buildCommunityRetryJobMetadata({code:'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE',retryReason:'COMMUNITY_REQUIRED_ACQUISITION_FAILURE',clickOffsets:{'https://creator.test':4}});
+  assert.deepEqual(progressed.clickOffsets,{'https://creator.test':4});
+});
+
 test('required partial coverage preserves retry ownership as recoverable',()=>{
   const partial={surface:'CREATOR_WEBSITES',required:true,outcome:'PARTIALLY_INSPECTED',retryable:true,failureClass:'RENDERED_BUDGET_EXPIRED'};
   assert.equal(isCommunityRetryableObservation(partial),true);

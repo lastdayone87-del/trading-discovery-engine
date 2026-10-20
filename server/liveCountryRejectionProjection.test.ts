@@ -61,8 +61,13 @@ test('live rejection branch uses the helper and persists via the finally upsert 
   );
   assert.match(branch, /applyLiveCountryRejectionToInspected\(channel, liveCountry, now\)/);
   assert.match(branch, /channel\.inspection_trail=\[countryStep, \.\.\.inspection\.steps, liveCountryStep\]/);
-  // No direct write in the branch: the function's finally-block upsert owns
-  // persistence, so exactly one durable write path exists.
+  // The crawl already wrote candidate-bearing cache rows as PENDING. A
+  // terminal live rejection must finalize this channel's examined candidates,
+  // otherwise the same site remains permanently non-reusable and is recrawled
+  // by later creators.
+  assert.match(branch, /markSiteInspectionsRejected\(channel\.channel_id,rejectedCandidateIds\)/);
+  // No direct channel write in the branch: the function's finally-block upsert
+  // owns persistence, so exactly one durable channel write path exists.
   assert.doesNotMatch(branch, /await upsertChannel/);
 });
 
