@@ -7,6 +7,7 @@ export interface DashboardOperationalSummary {
   activeDiscords: number;
   pendingScans: number;
   pendingReviews: number;
+  legacyUnclassifiedChannels: number;
   scope: { storedChannels: 'ALL_STORED_CHANNELS'; operationalMetrics: 'ALL_STORED_CHANNELS'; pendingReviews: 'DURABLE_REVIEW_QUEUE' };
   deployment: { environment: string; service: string; instance: string };
 }

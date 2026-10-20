@@ -429,6 +429,24 @@ export function rowToChannel(row: any): ChannelRecord {
   return channel;
 }
 
+/** Projects the P3 item 12 visibility class for listings that selected the
+ * inspection trail and the channel's candidate count. Other row readers must
+ * not call this without those fields; a missing count would misclassify a
+ * candidate-bearing legacy row as never inspected. */
+function rowToChannelWithDiscoveryVisibility(row: any): ChannelRecord {
+  const channel = rowToChannel(row);
+  const trail = Array.isArray(channel.inspection_trail) ? channel.inspection_trail : [];
+  return {
+    ...channel,
+    discovery_visibility: classifyDiscoveryVisibility({
+      discordDiscoveryStatus: channel.discord_discovery_status,
+      discordValidationStatus: channel.discord_validation_status,
+      inspectionTrailPresent: trail.length > 0,
+      candidateCount: Number(row.candidate_count || 0),
+    }),
+  };
+}
+
 /**
  * Separately determines whether an active retry should be projected for a
  * channel (PR #434 item 8, review fixes 5-6). History in `rowToChannel` output
@@ -556,7 +574,8 @@ async function channelListingWhere(db:InstanceType<typeof Pool>,args:ChannelList
 export async function listChannelsPage(args:ChannelListingFilter&{limit:number;offset:number}):Promise<{items:ChannelRecord[];total:number;revision:string|null}> {
   const db=await getDb(); const limit=Math.min(250,Math.max(1,args.limit)); const offset=Math.max(0,args.offset);
   const {where,values}=await channelListingWhere(db,args);
-  const columns=`channel_id,channel_name,youtube_url,country,country_status,scope_eligibility,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,subscriber_count,channel_thumbnail_url,quality_score,trading_status,trading_confidence_score,trading_category,country_metadata_status,country_metadata_checked_at,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,community_discovery_status,community_intents,discord_duplicate_owner_channel_id,
+  const columns=`channel_id,channel_name,youtube_url,country,country_status,scope_eligibility,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,inspection_trail,subscriber_count,channel_thumbnail_url,quality_score,trading_status,trading_confidence_score,trading_category,country_metadata_status,country_metadata_checked_at,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,community_discovery_status,community_intents,discord_duplicate_owner_channel_id,
+    (SELECT COUNT(*)::int FROM discord_candidates dc WHERE dc.channel_id=channels.channel_id) candidate_count,
     COALESCE((SELECT jsonb_agg((to_jsonb(dc) || jsonb_build_object('display_locator', (SELECT COALESCE(a.resolved_locator, a.invite_locator) FROM discord_check_attempts a WHERE a.channel_id=dc.channel_id AND lower(COALESCE(a.resolved_locator, a.invite_locator))=dc.normalized_locator ORDER BY a.checked_at DESC LIMIT 1))) ORDER BY dc.selected DESC,dc.last_checked DESC NULLS LAST,dc.discovered_at) FROM discord_candidates dc WHERE dc.channel_id=channels.channel_id AND dc.candidate_status='VALIDATED' AND dc.validation_status='COMPLETED' AND dc.liveness_status='ACTIVE'),'[]'::jsonb) discord_candidates,
     (SELECT status FROM jobs WHERE type='POST_APPROVAL_ENRICH' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) post_approval_job_status,
     (SELECT last_error FROM jobs WHERE type='POST_APPROVAL_ENRICH' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) post_approval_job_error,
@@ -582,7 +601,7 @@ export async function listChannelsPage(args:ChannelListingFilter&{limit:number;o
     db.query(`SELECT ${columns} FROM channels WHERE ${where} ORDER BY first_seen DESC,channel_id LIMIT $${values.length+1} OFFSET $${values.length+2}`,[...values,limit,offset]),
     db.query(`SELECT COUNT(*)::int total,MAX(updated_at) revision FROM channels WHERE ${where}`,values)
   ]);
-  return {items:page.rows.map(rowToChannel),total:Number(summary.rows[0].total||0),revision:iso(summary.rows[0].revision)};
+  return {items:page.rows.map(rowToChannelWithDiscoveryVisibility),total:Number(summary.rows[0].total||0),revision:iso(summary.rows[0].revision)};
 }
 
 export async function getLegacyCommunityRetryDiagnostics(legacyBefore='2026-08-25T16:00:02.000Z'):Promise<{legacyBefore:string;rows:Array<Record<string,unknown>>}> {
@@ -678,17 +697,18 @@ export async function getChannelListingRevision(args:ChannelListingFilter):Promi
   return {total:Number(result.rows[0].total||0),revision:iso(result.rows[0].revision)};
 }
 
-export interface DashboardOperationalSummary {storedChannels:number;activeDiscords:number;pendingScans:number;pendingReviews:number;scope:{storedChannels:string;operationalMetrics:string;pendingReviews:string};deployment:{environment:string;service:string;instance:string}}
+export interface DashboardOperationalSummary {storedChannels:number;activeDiscords:number;pendingScans:number;pendingReviews:number;legacyUnclassifiedChannels:number;scope:{storedChannels:string;operationalMetrics:string;pendingReviews:string};deployment:{environment:string;service:string;instance:string}}
 export async function getDashboardOperationalSummary(env:NodeJS.ProcessEnv=process.env):Promise<DashboardOperationalSummary> {
   const db=await getDb();
   // Stored means every durable channel row; serving eligibility is a separate policy.
   const result=await db.query(`SELECT COUNT(*)::int stored_channels,
     COUNT(*) FILTER(WHERE discord_status IN('ACTIVE','ACTIVE_LOW_VOLUME'))::int active_discords,
     COUNT(*) FILTER(WHERE scan_status IN('PENDING','LOCKED','ENRICHMENT_PENDING','ENRICHING','NEEDS_REVIEW'))::int pending_scans,
-    (SELECT COUNT(*)::int FROM channel_reviews WHERE state='PENDING') pending_reviews
+    (SELECT COUNT(*)::int FROM channel_reviews WHERE state='PENDING') pending_reviews,
+    (SELECT COUNT(*)::int FROM channels c WHERE c.discord_discovery_status='NOT_DISCOVERED' AND c.discord_validation_status='NOT_STARTED' AND (c.inspection_trail IS NULL OR c.inspection_trail::text IN ('[]','null')) AND NOT EXISTS(SELECT 1 FROM discord_candidates dc WHERE dc.channel_id=c.channel_id)) legacy_unclassified_channels
     FROM channels`);
   const row=result.rows[0];
-  return {storedChannels:Number(row.stored_channels||0),activeDiscords:Number(row.active_discords||0),pendingScans:Number(row.pending_scans||0),pendingReviews:Number(row.pending_reviews||0),
+  return {storedChannels:Number(row.stored_channels||0),activeDiscords:Number(row.active_discords||0),pendingScans:Number(row.pending_scans||0),pendingReviews:Number(row.pending_reviews||0),legacyUnclassifiedChannels:Number(row.legacy_unclassified_channels||0),
     scope:{storedChannels:'ALL_STORED_CHANNELS',operationalMetrics:'ALL_STORED_CHANNELS',pendingReviews:'DURABLE_REVIEW_QUEUE'},
     deployment:{environment:env.RAILWAY_ENVIRONMENT_NAME||env.DEPLOYMENT_ENVIRONMENT||env.NODE_ENV||'unknown',service:env.RAILWAY_SERVICE_NAME||env.SERVICE_NAME||'trading-discovery-engine',instance:env.RAILWAY_DEPLOYMENT_ID?.slice(0,12)||env.DEPLOYMENT_ID?.slice(0,12)||'local'}};
 }
@@ -698,17 +718,7 @@ export async function getChannelById(channelId: string): Promise<ChannelRecord |
     (SELECT COUNT(*)::int FROM discord_candidates dc WHERE dc.channel_id=c.channel_id) candidate_count
     FROM channels c WHERE c.channel_id=$1`, [channelId]);
   if (!res.rows[0]) return null;
-  const channel = rowToChannel(res.rows[0]);
-  const trail = Array.isArray(channel.inspection_trail) ? channel.inspection_trail : [];
-  return {
-    ...channel,
-    discovery_visibility: classifyDiscoveryVisibility({
-      discordDiscoveryStatus: channel.discord_discovery_status,
-      discordValidationStatus: channel.discord_validation_status,
-      inspectionTrailPresent: trail.length > 0,
-      candidateCount: Number(res.rows[0].candidate_count || 0),
-    }),
-  };
+  return rowToChannelWithDiscoveryVisibility(res.rows[0]);
 }
 
 export async function upsertChannel(channel: ChannelRecord): Promise<void> {

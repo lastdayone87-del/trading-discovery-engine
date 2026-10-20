@@ -598,6 +598,11 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                       }`}>
                         {retryReconciliationRequired ? 'RECONCILIATION REQUIRED' : c.discord_validation_status === 'RETRY_PENDING' && c.scan_status === 'FAILED' ? automaticRetryActive ? automaticRetryDue ? 'RETRY DUE' : 'RETRY QUEUED' : automaticRetryTerminal ? automaticRetryBudgetExhausted ? 'RETRY BUDGET EXHAUSTED' : 'RETRY TERMINAL' : 'RECOVERY AVAILABLE' : c.scan_status === 'PROVIDER_DEFERRED' ? 'PROVIDER DEFERRED' : c.scan_status}
                       </span>
+                      {c.discovery_visibility === 'LEGACY_UNCLASSIFIED' && (
+                        <span data-testid="legacy-unclassified" title="Legacy row: no discovery pass, no inspection trail, and no candidate evidence. This is not an inspected clean negative." className="mt-1 inline-flex items-center gap-1 rounded border border-slate-300 bg-slate-100 px-1.5 py-0.5 text-[9px] font-bold text-slate-600 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-300">
+                          LEGACY · NEVER INSPECTED
+                        </span>
+                      )}
                       {c.scan_status === 'PROVIDER_DEFERRED' && <span className="block text-[10px] text-amber-600 mt-0.5">Operationally blocked · awaiting provider recovery</span>}
                       {c.scan_attempts > 0 && (
                         <span className="block text-[10px] text-slate-400 mt-0.5">

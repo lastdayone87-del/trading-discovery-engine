@@ -149,10 +149,15 @@ test('youtubeFetch always bounds the scheduler head request', () => {
   assert.doesNotMatch(youtubeFetch, /provider_deadlines_enabled|PROVIDER_DEADLINES_ENABLED/);
 });
 
-test('youtubeFetch never awaits shadow accounting before the official fetch', () => {
+test('youtubeFetch starts shadow accounting before the fetch and joins it before settlement', () => {
   const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
   const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));
-  assert.match(youtubeFetch, /void \(async\(\)=>\{[\s\S]*?recordShadowDispatchSafe[\s\S]*?\}\)\(\);/);
+  const shadowStart = youtubeFetch.indexOf('shadowObservation=(async()=>{');
+  const fetchStart = youtubeFetch.indexOf('response=await fetch(dispatchedUrl,{signal})');
+  const shadowJoin = youtubeFetch.indexOf('await shadowObservation');
+  assert.ok(shadowStart >= 0, 'shadow observation starts in the dispatch callback');
+  assert.ok(fetchStart > shadowStart, 'shadow observation is started without gating the fetch');
+  assert.ok(shadowJoin > fetchStart, 'shadow observation is joined only after the provider call completes');
   assert.doesNotMatch(youtubeFetch, /await recordShadowDispatchSafe\(\s*\{readSetting:getAppSetting,pool:await getDb\(\)\}/);
 });
 

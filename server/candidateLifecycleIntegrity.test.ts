@@ -616,4 +616,14 @@ test('P3 item 12: cache recovery writes an explicit audit row (best-effort) and 
   assert.match(db, /export async function countLegacyUnclassifiedChannels\(\):Promise<number>/);
   assert.match(db, /classifyDiscoveryVisibility\(\{/, 'the pure classifier feeds the channel projection');
   assert.match(db, /discovery_visibility: classifyDiscoveryVisibility/);
+  // The main /api/channels listing is the dashboard projection: it must
+  // select both classification inputs and route rows through the same
+  // visibility helper as the single-channel endpoint.
+  assert.match(db, /inspection_trail,subscriber_count/);
+  assert.match(db, /FROM discord_candidates dc WHERE dc\.channel_id=channels\.channel_id\) candidate_count/);
+  assert.match(db, /items:page\.rows\.map\(rowToChannelWithDiscoveryVisibility\)/);
+  assert.match(db, /legacyUnclassifiedChannels:Number\(row\.legacy_unclassified_channels\|\|0\)/);
+  const ui = readSource('../src/components/ResultsTable.tsx');
+  assert.match(ui, /data-testid="legacy-unclassified"/);
+  assert.match(ui, /c\.discovery_visibility === 'LEGACY_UNCLASSIFIED'/);
 });

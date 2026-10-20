@@ -384,9 +384,10 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
   trace('after timeout-setting-read at server/youtube.ts:119');
   const timeout=Number.isFinite(configuredTimeout)&&configuredTimeout>0?configuredTimeout:30_000;
   let dispatchedProviderKey=providerKey;
+  let shadowObservation:Promise<void>|undefined;
   trace('before scheduler-run at server/youtube.ts:126');
   try {
-    return await youtubeRequestScheduler.run(()=>{
+    const response=await youtubeRequestScheduler.run(()=>{
       const dispatchAttempt = ++providerDispatchAttempt;
       let dispatchedUrl=url;
       if(providerKey){
@@ -441,13 +442,16 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
           // WOULD_REJECT for the 9,000-unit/day per-key cap. Disabled by
           // default; every failure is swallowed inside the helper.
           //
-          // Fire-and-forget is deliberate. The provider deadline starts
-          // before this callback runs, and the shadow path can wait on the
-          // setting read, pool acquisition, sweep, and advisory lock. Awaiting
-          // it here lets a slow database consume the official request's
-          // deadline before fetch() is even called. Observation is optional;
-          // the real request is not.
-          void (async()=>{
+          // Start the observation without awaiting it: the provider deadline
+          // starts before this callback runs, and the shadow path can wait on
+          // the setting read, pool acquisition, sweep, and advisory lock.
+          // Awaiting it here lets a slow database consume the official
+          // request's deadline before fetch() is even called. The promise is
+          // joined after the provider call completes (below), so lease
+          // creation still strictly precedes the caller's quota settlement:
+          // a completed request can never leave a late lease that would be
+          // counted twice. Observation is optional; the real request is not.
+          shadowObservation=(async()=>{
             try{
               const pool=await getDb();
               await recordShadowDispatchSafe(
@@ -503,6 +507,12 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
         return response;
       }});
     }, trace, priority);
+    // The provider call (and its deadline) is complete; the scheduler slot is
+    // already released. Join the best-effort observation here, before
+    // returning the response the caller will settle quota for, so the lease
+    // cannot be inserted after its own settlement.
+    if(shadowObservation)await shadowObservation;
+    return response;
   } catch(error) {
     if(dispatchedProviderKey&&error&&typeof error==='object'){
       const wrappedCause=(error as any).cause;

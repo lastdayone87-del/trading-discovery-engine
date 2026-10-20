@@ -46,7 +46,8 @@ test('candidate authority is durable, normalized unique, selected, and returned 
 });
 
 test('dashboard retained candidates are validated active invites, while audit inventory remains persisted separately',()=>{
-  const listing=dbCore.slice(dbCore.indexOf('export async function listChannelsPage'),dbCore.indexOf('export async function listChannelsPage')+1800);
+  const listingStart=dbCore.indexOf('export async function listChannelsPage');
+  const listing=dbCore.slice(listingStart,dbCore.indexOf('export async function getLegacyCommunityRetryDiagnostics',listingStart));
   assert.match(listing,/FROM discord_candidates dc WHERE dc\.channel_id=channels\.channel_id AND dc\.candidate_status='VALIDATED' AND dc\.validation_status='COMPLETED' AND dc\.liveness_status='ACTIVE'/);
   assert.match(dbCore,/export async function persistDiscordCandidates/);
   assert.match(dbCore,/INSERT INTO discord_candidates\(channel_id,candidate_id,raw_locator/);

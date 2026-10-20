@@ -1825,6 +1825,15 @@ export async function inspectAndValidateChannel(
       // validation runs for a rejected creator. The live verdict and the real
       // inspection steps are recorded; the existing Discord/discovery state is
       // preserved exactly as it was (nothing was admitted this run).
+      //
+      // The crawl already wrote this channel's candidate-bearing site-cache
+      // rows as PENDING. Those rows are never reusable while pending, and a
+      // rejected creator is terminal, so without finalizing them the same site
+      // would be recrawled forever by later creators. Discard only this
+      // channel's examined candidates; other channels' pending entries stay.
+      const rejectedCandidateIds=[...new Set((inspection.discordCandidates||[])
+        .map(candidate=>candidate.candidateId).filter(Boolean))];
+      if(rejectedCandidateIds.length)await markSiteInspectionsDiscarded(channel.channel_id,rejectedCandidateIds).catch(()=>undefined);
       applyLiveCountryRejectionToInspected(channel, liveCountry, now);
       channel.inspection_trail=[countryStep, ...inspection.steps, liveCountryStep];
       console.warn(JSON.stringify({event:'live_country_rejected_before_claim',channelId:channel.channel_id,detectedCountry:liveCountry.detectedCreatorCountry||null,timestamp:now}));
