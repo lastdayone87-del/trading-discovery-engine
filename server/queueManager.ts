@@ -2345,20 +2345,41 @@ export async function enqueueCommunityAcquisitionRetry(channelId:string,directiv
   const job=await enqueueJob('RETRY_COMMUNITY_ACQUISITION',{channelId,...metadata},{idempotencyKey:communityAcquisitionRetryKey(channelId),priority:15,maxAttempts:5,runAfter:directive?.retryAt?new Date(directive.retryAt).toISOString():undefined,clientOverride});
   // Preserve a pending job's original ownership and retry window while merging
   // the latest attributable reason into its durable payload. Per-seed click
-  // progress is append-only, and the merge must read the CURRENT row inside
-  // this statement: a retry worker can advance the PROCESSING job between
+  // progress is monotonic, and the merge must read the CURRENT row inside this
+  // statement: a retry worker can advance the PROCESSING job between
   // enqueueJob's RETURNING and this update, and writing back the earlier copy
-  // would rewind its newer offsets. When this enqueue carries offsets, merge
-  // them over the row's current map (incoming keys win) while still merging
-  // the rest of the incoming metadata (retry code/reason/source); otherwise
-  // leave the existing offset map untouched.
+  // would rewind its newer offsets. A fresh scan has no previous offset map,
+  // so its lower first-page offsets must never replace a retry's higher
+  // progress. When this enqueue carries offsets, keep the greater stored or
+  // incoming offset for each seed while still merging the rest of the
+  // incoming metadata (retry code/reason/source); otherwise leave the
+  // existing offset map untouched.
   const runner:{query:(sql:string,params?:unknown[])=>Promise<unknown>} = clientOverride||await getDb();
   await runner.query(
     `UPDATE jobs SET payload=CASE
        WHEN jsonb_typeof($2::jsonb->'clickOffsets')='object'
          THEN ((payload || ($2::jsonb - 'clickOffsets')) - 'clickOffsets') || jsonb_build_object(
            'clickOffsets',
-           COALESCE(payload->'clickOffsets','{}'::jsonb) || ($2::jsonb->'clickOffsets')
+           COALESCE((
+             SELECT jsonb_object_agg(keys.key, GREATEST(
+               CASE WHEN jsonb_typeof(payload->'clickOffsets')='object'
+                      AND jsonb_typeof(payload->'clickOffsets'->keys.key)='number'
+                    THEN (payload->'clickOffsets'->keys.key #>> '{}')::numeric ELSE 0 END,
+               CASE WHEN jsonb_typeof($2::jsonb->'clickOffsets'->keys.key)='number'
+                    THEN ($2::jsonb->'clickOffsets'->keys.key #>> '{}')::numeric ELSE 0 END
+             ))
+             FROM (
+               SELECT jsonb_object_keys(
+                 CASE WHEN jsonb_typeof(payload->'clickOffsets')='object'
+                      THEN payload->'clickOffsets' ELSE '{}'::jsonb END
+               ) AS key
+               UNION
+               SELECT jsonb_object_keys($2::jsonb->'clickOffsets') AS key
+             ) keys
+             WHERE (jsonb_typeof(payload->'clickOffsets')='object'
+                    AND jsonb_typeof(payload->'clickOffsets'->keys.key)='number')
+                OR jsonb_typeof($2::jsonb->'clickOffsets'->keys.key)='number'
+           ), '{}'::jsonb)
          )
        ELSE payload || $2::jsonb END,
        updated_at=now()

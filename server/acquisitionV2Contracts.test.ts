@@ -809,6 +809,10 @@ test('v2 review e2e: FOUND+gap inspection creates the durable retry job', async 
   `);
   const client = {
     query: async (sql: string, params: unknown[] = []) => {
+      // This SQL.js fake exercises job creation, not PostgreSQL JSONB math.
+      // The monotonic click-offset merge is covered by the real PostgreSQL
+      // regression in communityRetryClickOffsets.postgres.test.ts.
+      if (sql.includes('UPDATE jobs SET payload=CASE')) return { rows: [], rowCount: 1 };
       let processed = sql.replace(/::jsonb/gi, '').replace(/now\(\)/gi, `datetime('now')`);
       try {
         const stmt = db.prepare(processed);
