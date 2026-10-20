@@ -62,7 +62,7 @@ test('migration 150 adds only the per-channel pending-candidate map', () => {
 });
 
 test('rollback proof seeds only the pre-146 lineage', () => {
-  assert.match(rollbackProof, /if \[ "\$version" -gt 145 \]; then continue; fi/, 'migration 150+ is filtered by numeric version');
+  assert.match(rollbackProof, /if \[ "\$version" -gt 145 \]; then continue; fi/, 'migrations 146+ are excluded from the pre-state by numeric version');
   assert.doesNotMatch(rollbackProof, /grep -vE '\//, 'the fixed 14x exclusion regex must not return');
 });
 

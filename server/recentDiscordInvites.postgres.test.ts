@@ -22,6 +22,7 @@ maybe('recently confirmed invites are ordered, filtered, paginated, and backfill
     newActive: id('new-active'),
     tieA: id('tie-a'),
     tieB: id('tie-b'),
+    mismatchedCandidateId: id('mismatched-candidate-id'),
     legacyNull: id('legacy-null'),
     notFound: id('excluded-not-found'),
     pending: id('excluded-pending'),
@@ -124,6 +125,40 @@ maybe('recently confirmed invites are ordered, filtered, paginated, and backfill
     status: 'DEAD', validation: 'COMPLETED', liveness: 'DEAD', discovery: 'VALIDATED',
   });
 
+  // Persist retains the first candidate id for an already-known locator while
+  // the channel can project a newer id. The timestamp lookup must fall back to
+  // the selected locator when the projected id has no candidate row.
+  const mismatchedUrl = 'https://discord.gg/mismatchedcandidate';
+  await insertChannel(ids.mismatchedCandidateId, '2020-01-01T00:00:00.000Z', { invite: mismatchedUrl });
+  await persistDiscordCandidates(ids.mismatchedCandidateId, [{
+    candidateId: 'candidate-retained',
+    rawLocator: 'discord.gg/mismatchedcandidate',
+    resolvedLocator: mismatchedUrl,
+    locatorType: 'NATIVE_INVITE',
+    sourceSurface: 'YOUTUBE_ABOUT',
+  }]);
+  await appendDiscordCheckAttempts(ids.mismatchedCandidateId, mismatchedUrl, 'ACTIVE', [{
+    attemptNumber: 1,
+    operationalOutcome: 'SUCCEEDED',
+    retryable: false,
+    reason: 'active',
+    checkedAt: '2026-10-16T18:00:00.000Z',
+  }], {
+    candidateId: 'candidate-projected',
+    rawLocator: 'discord.gg/mismatchedcandidate',
+    resolvedLocator: mismatchedUrl,
+    locatorType: 'NATIVE_INVITE',
+  });
+  await db.query(
+    `UPDATE channels SET discord_status='ACTIVE',discord_invite=$2,discord_candidate_id=$3,
+       discord_candidate_locator=$2,discord_candidate_raw_locator='discord.gg/mismatchedcandidate',
+       discord_candidate_type='NATIVE_INVITE',discord_resolution_status='RESOLVED',
+       discord_liveness_status='ACTIVE',discord_relevance_status='TRADING_RELEVANT',
+       discord_validation_status='SUCCEEDED',discord_discovery_status='VALIDATED'
+     WHERE channel_id=$1`,
+    [ids.mismatchedCandidateId, mismatchedUrl, 'candidate-projected'],
+  );
+
   const old = await confirm(ids.oldActive, 'oldactive', '2026-10-20T18:00:00.000Z');
   const low = await confirm(ids.lowVolume, 'lowvolume', '2026-10-19T18:00:00.000Z', 'ACTIVE_LOW_VOLUME');
   const fresh = await confirm(ids.newActive, 'newactive', '2026-10-18T18:00:00.000Z');
@@ -142,31 +177,36 @@ maybe('recently confirmed invites are ordered, filtered, paginated, and backfill
   }], { candidateId: old.candidateId, rawLocator: 'discord.gg/oldactive', resolvedLocator: old.url, locatorType: 'NATIVE_INVITE' });
 
   const all = await listChannelsPage({ limit: 100, offset: 0, search, recentInvites: true });
-  assert.equal(all.total, 6, 'only confirmed active/low-volume legacy-null rows are in the recent view');
+  assert.equal(all.total, 7, 'only confirmed active/low-volume legacy-null rows are in the recent view');
   assert.deepEqual(all.items.map(channel => channel.channel_id), [
-    ids.oldActive, ids.lowVolume, ids.newActive, ids.tieB, ids.tieA, ids.legacyNull,
+    ids.oldActive, ids.lowVolume, ids.newActive, ids.tieB, ids.tieA,
+    ids.mismatchedCandidateId, ids.legacyNull,
   ]);
   assert.equal(all.items[0].discord_invite_first_validated_at, '2026-10-20T18:00:00.000Z');
-  assert.equal(all.items[5].discord_invite_first_validated_at, null, 'missing confirmation time is not synthesized');
+  assert.equal(all.items[5].discord_invite_first_validated_at, '2026-10-16T18:00:00.000Z', 'locator fallback keeps the confirmation timestamp');
+  assert.equal(all.items[6].discord_invite_first_validated_at, null, 'missing confirmation time is not synthesized');
 
   const page1 = await listChannelsPage({ limit: 2, offset: 0, search, recentInvites: true });
   const page2 = await listChannelsPage({ limit: 2, offset: 2, search, recentInvites: true });
   const page3 = await listChannelsPage({ limit: 2, offset: 4, search, recentInvites: true });
-  assert.equal(page1.total, 6);
+  const page4 = await listChannelsPage({ limit: 2, offset: 6, search, recentInvites: true });
+  assert.equal(page1.total, 7);
   assert.deepEqual(page1.items.map(channel => channel.channel_id), [ids.oldActive, ids.lowVolume]);
   assert.deepEqual(page2.items.map(channel => channel.channel_id), [ids.newActive, ids.tieB]);
-  assert.deepEqual(page3.items.map(channel => channel.channel_id), [ids.tieA, ids.legacyNull]);
+  assert.deepEqual(page3.items.map(channel => channel.channel_id), [ids.tieA, ids.mismatchedCandidateId]);
+  assert.deepEqual(page4.items.map(channel => channel.channel_id), [ids.legacyNull]);
   assert.equal(page3.items[0].discord_invite_first_validated_at, '2026-10-17T18:00:00.000Z');
-  assert.equal(page3.items[1].discord_invite_first_validated_at, null);
+  assert.equal(page3.items[1].discord_invite_first_validated_at, '2026-10-16T18:00:00.000Z');
+  assert.equal(page4.items[0].discord_invite_first_validated_at, null);
   assert.equal(tieB.candidateId, 'candidate-tie-b');
   assert.equal(tieA.candidateId, 'candidate-tie-a');
   assert.equal(fresh.candidateId, 'candidate-newactive');
   assert.equal(low.candidateId, 'candidate-lowvolume');
 
   const activeOnly = await listChannelsPage({ limit: 100, offset: 0, search, recentInvites: true, discordStatus: 'ACTIVE' });
-  assert.equal(activeOnly.total, 5);
+  assert.equal(activeOnly.total, 6);
   assert.deepEqual(activeOnly.items.map(channel => channel.channel_id), [
-    ids.oldActive, ids.newActive, ids.tieB, ids.tieA, ids.legacyNull,
+    ids.oldActive, ids.newActive, ids.tieB, ids.tieA, ids.mismatchedCandidateId, ids.legacyNull,
   ]);
   const lowOnly = await listChannelsPage({ limit: 100, offset: 0, search, recentInvites: true, discordStatus: 'ACTIVE_LOW_VOLUME' });
   assert.deepEqual(lowOnly.items.map(channel => channel.channel_id), [ids.lowVolume]);

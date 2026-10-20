@@ -505,19 +505,30 @@ export const CONFIRMED_DISCORD_INVITE_SQL = `discord_invite IS NOT NULL
   AND discord_status IN ('ACTIVE','ACTIVE_LOW_VOLUME','NON_TRADING')
   AND discord_duplicate_owner_channel_id IS NULL`;
 /** Correlation-safe confirmation timestamp for the channel's selected
- * candidate. The column is only populated from a successful check attempt; a
- * NULL result is rendered as an explicitly unavailable date, never guessed. */
+ * candidate. Candidate persistence retains the first id for an already-known
+ * locator, so prefer the projected id and fall back to the selected locator
+ * only when that id has no row. The column is only populated from a successful
+ * check attempt; a NULL result is rendered as an explicitly unavailable date,
+ * never guessed. */
 export const DISCORD_INVITE_FIRST_VALIDATED_SQL = `(SELECT dc.first_validated_at
     FROM discord_candidates dc
    WHERE dc.channel_id=channels.channel_id
      AND (
-       (channels.discord_candidate_id IS NOT NULL AND dc.candidate_id=channels.discord_candidate_id)
-       OR (channels.discord_candidate_id IS NULL AND dc.normalized_locator=lower(COALESCE(channels.discord_candidate_locator,channels.discord_invite)))
+       dc.candidate_id=channels.discord_candidate_id
+       OR (
+         dc.normalized_locator=lower(COALESCE(channels.discord_candidate_locator,channels.discord_invite))
+         AND NOT EXISTS (
+           SELECT 1 FROM discord_candidates selected
+           WHERE selected.channel_id=channels.channel_id
+             AND selected.candidate_id=channels.discord_candidate_id
+         )
+       )
      )
      AND dc.candidate_status='VALIDATED'
      AND dc.validation_status='COMPLETED'
      AND dc.liveness_status='ACTIVE'
-   ORDER BY dc.selected DESC,dc.first_validated_at DESC NULLS LAST
+   ORDER BY CASE WHEN dc.candidate_id=channels.discord_candidate_id THEN 0 ELSE 1 END,
+            dc.selected DESC,dc.first_validated_at DESC NULLS LAST
    LIMIT 1)`;
 export const RECENT_INVITE_ORDER_SQL = 'discord_invite_first_validated_at DESC NULLS LAST,channel_id DESC';
 // This is the single definition of the operator-visible discovery corpus. Keep
