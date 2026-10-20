@@ -4,8 +4,12 @@
  * One approved probe = one InnerTube search page (~20 results, cursor null),
  * followed by the EXISTING ingestion/verification pipeline for each returned
  * channel (`processChannelThroughPipeline`, the same entry the autonomous
- * Innertube caller uses via processDiscoveredChannel). No new HTTP client, no
- * official YouTube Data API call, no LLM call, no eligibility/serving writes.
+ * Innertube caller uses via processDiscoveredChannel). Probe retrieval itself
+ * uses only the existing InnerTube executor and records zero official quota
+ * units. The delegated ingestion pipeline may call official Data API or LLM
+ * paths according to its own configuration and accounting; those downstream
+ * units are outside this probe ledger and are not modeled here. No new HTTP
+ * client and no eligibility/serving writes.
  *
  * Integration contract: `runApprovedProbe(candidate)` is the single entry.
  * It (a) re-reads `discovery_probe_enabled` (absent => OFF) and the probe kill
@@ -387,7 +391,28 @@ export async function runApprovedProbe(
     let ingestedCount = 0;
     let newCreators = 0;
     const ingestFailures: string[] = [];
+    const gateStopReasons: string[] = [];
     for (const channel of bounded) {
+      // Re-read both gates before every delegated ingestion. A trip after the
+      // reservation must stop the remaining outbound work, not just the
+      // initial InnerTube page fetch.
+      let gateFlag = '';
+      let gateKill = '';
+      try {
+        gateFlag = String(await readSetting(DISCOVERY_PROBE_FLAG_KEY, 'false')).trim().toLowerCase();
+        gateKill = String(await readSetting(DISCOVERY_PROBE_KILL_SWITCH_KEY, 'false')).trim().toLowerCase();
+      } catch {
+        gateStopReasons.push('GATE_RECHECK_READ_FAILED');
+        break;
+      }
+      if (gateFlag !== 'true') {
+        gateStopReasons.push('FLAG_OFF_RECHECK');
+        break;
+      }
+      if (gateKill === 'true') {
+        gateStopReasons.push('KILL_SWITCH_RECHECK');
+        break;
+      }
       try {
         const outcome = await ingestChannel(channel, probe.country);
         if (outcome.persisted !== false) ingestedCount += 1;
@@ -398,11 +423,19 @@ export async function runApprovedProbe(
     }
 
     const resultsCount = distinct.length;
+    const allIngestFailed = bounded.length > 0 && ingestFailures.length === bounded.length;
     const outcome: ProbeOutcome =
-      resultsCount === 0 ? 'EMPTY' : newCreators > 0 ? 'SUCCESS' : 'INCONCLUSIVE';
+      resultsCount === 0
+        ? 'EMPTY'
+        : allIngestFailed
+          ? 'FAILED'
+          : newCreators > 0
+            ? 'SUCCESS'
+            : 'INCONCLUSIVE';
     const elapsedMs = Date.now() - startedAt;
     const reasons: string[] = [outcome === 'SUCCESS' ? 'NEW_CREATORS_FOUND' : outcome];
     if (ingestFailures.length > 0) reasons.push('INGEST_FAILURES');
+    reasons.push(...gateStopReasons);
     if (distinct.length > bounded.length) reasons.push('INGEST_CAP_APPLIED');
 
     const recorded = await recordProbeOutcome(

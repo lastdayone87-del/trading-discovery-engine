@@ -29,8 +29,8 @@ jobs:
       - run: npm install
       - name: TypeScript check
         run: npx tsc --noEmit
-      - name: Quota shadow unit tests (pure logic + guarded hooks)
-        run: npx tsx --test server/quotaKeyCapShadow.test.ts
+      - name: Quota shadow and probe executor unit tests
+        run: npx tsx --test server/quotaKeyCapShadow.test.ts server/discovery/probeExecutor.test.ts
 
   postgres:
     runs-on: ubuntu-latest
@@ -63,5 +63,5 @@ jobs:
       - run: npm install
       - name: Apply full migration lineage (runner semantics, includes 148)
         run: npx tsx scripts/runMigrations.ts
-      - name: Quota shadow PostgreSQL tests
-        run: npx tsx --test server/quotaKeyCapShadow.postgres.test.ts
+      - name: Quota shadow and probe budget PostgreSQL tests
+        run: npx tsx --test server/quotaKeyCapShadow.postgres.test.ts server/discovery/probeLedger.postgres.test.ts

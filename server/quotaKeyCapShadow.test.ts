@@ -12,6 +12,7 @@ import {
   resolveShadowConfig,
   settleShadowLease,
   simulateShadowReplay,
+  sweepShadowEvents,
   sweepShadowLeases,
   type ShadowPoolPort,
   type ShadowQueryClient,
@@ -106,12 +107,17 @@ test('resolveShadowConfig is fail-closed, clamps settings and caches for 30s', a
     if (key === 'youtube_key_cap_shadow_lease_ttl_ms') return '30000';
     return fallback;
   };
-  const config = await resolveShadowConfig(reader);
+  const t0 = 1_000_000;
+  const config = await resolveShadowConfig(reader, t0);
   assert.deepEqual(config, { enabled: true, capUnits: 4500, leaseTtlMs: 30_000 });
   const before = calls.length;
-  const cached = await resolveShadowConfig(reader);
+  const cached = await resolveShadowConfig(reader, t0 + 29_999);
   assert.deepEqual(cached, config);
   assert.equal(calls.length, before, 'second resolve must be served from cache');
+
+  const refreshed = await resolveShadowConfig(reader, t0 + 30_001);
+  assert.deepEqual(refreshed, config);
+  assert.equal(calls.length, before + 3, 'expired cache must re-read all three settings');
 
   resetShadowConfigCacheForTests();
   const failingReader = async (): Promise<string> => {
@@ -145,9 +151,10 @@ test('recordShadowDispatchSafe enabled: sweeps, locks, records and commits', asy
   );
   // 8999 projected + 2 requested = 9001 -> WOULD_DEFER
   assert.deepEqual(result, { projectedBefore: 8999, event: 'WOULD_DEFER', leaseInserted: true, lockSkipped: false });
-  assert.equal(pool.poolQueries.length, 2, 'first call after restart sweeps stale leases and settlement tombstones');
+  assert.equal(pool.poolQueries.length, 3, 'first call after restart sweeps stale leases, settlement tombstones, and old events');
   assert.match(pool.poolQueries[0].text, /DELETE FROM youtube_key_cap_shadow_leases WHERE expires_at <= \$1/);
   assert.match(pool.poolQueries[1].text, /DELETE FROM youtube_key_cap_shadow_settled WHERE expires_at <= \$1/);
+  assert.match(pool.poolQueries[2].text, /DELETE FROM youtube_key_cap_shadow_events WHERE created_at <= \$1/);
   assert.equal(pool.connections.length, 1);
   const connection = pool.connections[0];
   const texts = connection.queries.map((query) => query.text);
@@ -167,7 +174,7 @@ test('recordShadowDispatchSafe enabled: sweeps, locks, records and commits', asy
     { readSetting: enabledReader, pool },
     { keyFingerprint: 'fp-enabled', operationId: 'op-enabled-2', units: 1, now: new Date(now.getTime() + 1000) }
   );
-  assert.equal(pool.poolQueries.length, 2, 'sweep is throttled to once per minute');
+  assert.equal(pool.poolQueries.length, 3, 'sweeps are throttled');
   assert.equal(second.event, null, '8999 + 1 = 9000 stays admitted');
 });
 
@@ -260,6 +267,20 @@ test('sweepShadowLeases deletes expired leases and settlement tombstones', async
   assert.match(seen[1], /DELETE FROM youtube_key_cap_shadow_settled WHERE expires_at <= \$1/);
 });
 
+test('sweepShadowEvents deletes observations older than the retention window', async () => {
+  const now = new Date('2026-10-20T12:00:00.000Z');
+  let cutoff: Date | undefined;
+  const client: ShadowQueryClient = {
+    query: async (text, values) => {
+      assert.match(text, /DELETE FROM youtube_key_cap_shadow_events WHERE created_at <= \$1/);
+      cutoff = values?.[0] as Date;
+      return { rows: [], rowCount: 2 };
+    },
+  };
+  assert.equal(await sweepShadowEvents(client, now), 2);
+  assert.equal(cutoff?.toISOString(), '2026-09-20T12:00:00.000Z');
+});
+
 test('simulateShadowReplay: boundary exactly at 9000 admitted, 9001 rejected', () => {
   const day = '2026-10-16';
   const calls = [
@@ -288,6 +309,23 @@ test('simulateShadowReplay: in-flight leases prevent concurrent over-admission',
   const settledOnly = simulateShadowReplay(calls, { capUnits: 10, settledOnly: true });
   assert.equal(settledOnly.totalAllowed, 2, 'settled-only projection misses the concurrent lease');
   assert.equal(settledOnly.totalWouldDefer, 0);
+});
+
+test('simulateShadowReplay: cross-midnight settlement stays on completion day', () => {
+  // Completion just after Pacific midnight; dispatch was 60s before midnight.
+  const completion = Date.parse('2026-10-16T07:00:30.000Z');
+  const summary = simulateShadowReplay([
+    {
+      occurredAtMs: completion,
+      latencyMs: 60_000,
+      keyFingerprint: 'k1',
+      reservedUnits: 9000,
+      settledUnits: 9000,
+    },
+  ]);
+  assert.equal(summary.byDay['2026-10-15'].allowed, 1);
+  assert.equal(summary.byDay['2026-10-15'].settledUnits, 0);
+  assert.equal(summary.byDay['2026-10-16'].settledUnits, 9000);
 });
 
 test('simulateShadowReplay: settlement releases capacity for later calls', () => {

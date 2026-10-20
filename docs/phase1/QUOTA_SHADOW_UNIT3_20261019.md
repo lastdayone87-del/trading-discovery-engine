@@ -25,11 +25,17 @@ change to official API traffic remain gated on explicit operator approval.
 
 - **OFF by default.** `youtube_key_cap_shadow_enabled` absent or non-`true`
   disables everything; settings are cached 30 s and read failures fail closed.
-- **Never blocks requests.** Per-key/day advisory lock is bounded by
-  `lock_timeout` (100 ms default). On timeout the observation is skipped
-  (`lockSkipped=true`, no lease, no event) — the request proceeds untouched.
+- **Does not delay provider dispatch.** The hook starts the observation
+  fire-and-forget; it does not await settings, pool acquisition, the advisory
+  lock or the insert. A saturated pool or slow database can therefore leave a
+  late/no-op observation, but it cannot delay or fail the YouTube request. The
+  background write still uses a per-key/day advisory lock bounded by
+  `lock_timeout` (100 ms default); on timeout it is skipped
+  (`lockSkipped=true`, no lease, no event).
 - **Never alters traffic or key state.** No dispatch, retry, pool, quota-row or
-  key-configuration code path is modified. Events are pure inserts.
+  key-configuration code path is modified. Events are pure inserts. A late
+  lease is observational and expires by its TTL (120 s default); it cannot
+  block or reject traffic.
 - **Settlement cannot poison official accounting.** The lease release runs in a
   savepoint inside the charge transaction; any shadow error rolls back to the
   savepoint and is swallowed. Duplicate charges are never double-released
@@ -50,8 +56,14 @@ PostgreSQL tests.
 + unexpired in-flight leases`. Leases are unique per `(quota_day, operation_id)`
 (duplicate accounting impossible), carry a TTL (default 120 s), are excluded
 from projections once expired, and are swept on first use after a restart and
-at most once per minute. Settlement removes exactly one matching lease, so
-settled usage + leases never double count.
+at most once per minute. The projection excludes the current operation's own
+lease so an idempotent replay cannot count itself. Settlement is best-effort
+and removes one matching lease; a lease written after settlement (because the
+dispatch hook is fire-and-forget) remains observational until its TTL expires.
+
+Events are retained for **30 days** (created-at index); an enabled process
+sweeps older rows at most once every six hours. Disabled shadow mode writes no
+rows and runs no sweeps.
 
 ## Test evidence
 

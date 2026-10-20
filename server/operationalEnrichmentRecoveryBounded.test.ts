@@ -122,28 +122,37 @@ test('a colliding cycle event is a counted idempotent duplicate, never a second 
   const now = T0 + 240_000;
   const { db, queries } = mockDb(
     [{ channel_id: 'channel-1', failed_job_id: 'job-9', failed_job_attempts: 4, recovery_cycles: 0 }],
-    { eventInserts: [0] },
+    { eventInserts: [0, 0] },
   );
   const enqueued: string[] = [];
-  const reconciled = await reconcileOperationalEnrichmentRecovery(
+  // Model the durable queue's per-channel idempotency key: the second replay
+  // may call enqueue again, but it must not create a second job.
+  const durableJobs = new Set<string>();
+  const reconcile = (at: number) => reconcileOperationalEnrichmentRecovery(
     async () => db,
     async () => (channelBase() as any),
     async () => undefined,
-    async (channel) => { enqueued.push(channel.channel_id); },
+    async (channel) => {
+      if (!durableJobs.has(channel.channel_id)) {
+        durableJobs.add(channel.channel_id);
+        enqueued.push(channel.channel_id);
+      }
+    },
     20,
-    now,
+    at,
   );
-  assert.equal(reconciled, 1);
-  assert.deepEqual(enqueued, ['channel-1']);
+  assert.equal(await reconcile(now), 1);
+  assert.equal(await reconcile(now + 120_000), 1);
+  assert.deepEqual(enqueued, ['channel-1'], 'replay must not create a second durable job');
   assert.ok(queries.some(q => q.sql.includes('INSERT INTO operational_enrichment_recovery_events')));
   const snapshot = operationsTelemetrySnapshot();
-  assert.equal(snapshot.operationalEnrichmentRecoveryDuplicateEventsTotal, 1);
+  assert.equal(snapshot.operationalEnrichmentRecoveryDuplicateEventsTotal, 2);
   assert.equal(snapshot.operationalEnrichmentRecoveryEnqueuedTotal, 0);
 });
 
 test('the recovery ceiling writes one terminal marker and never re-enqueues', async () => {
   resetOperationsTelemetry();
-  const now = T0 + 360_000;
+  const now = T0 + 480_000;
   const { db, queries } = mockDb(
     [{
       channel_id: 'channel-1',
@@ -179,7 +188,7 @@ test('the recovery ceiling writes one terminal marker and never re-enqueues', as
 
 test('reconciliation is a no-op inside the throttle window and without qualifying rows', async () => {
   resetOperationsTelemetry();
-  const now = T0 + 600_000;
+  const now = T0 + 720_000;
   const { db } = mockDb([]);
   let getDbCalls = 0;
   const getDb = async () => { getDbCalls++; return db; };

@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS youtube_key_cap_shadow_events (
 
 CREATE INDEX IF NOT EXISTS youtube_key_cap_shadow_events_day_key_idx
   ON youtube_key_cap_shadow_events (quota_day, key_fingerprint, event);
+CREATE INDEX IF NOT EXISTS youtube_key_cap_shadow_events_created_idx
+  ON youtube_key_cap_shadow_events (created_at);
 
 COMMENT ON TABLE youtube_key_cap_shadow_leases IS
   'In-flight YouTube per-key quota leases for shadow cap accounting. Inert unless youtube_key_cap_shadow_enabled=true; never blocks traffic.';

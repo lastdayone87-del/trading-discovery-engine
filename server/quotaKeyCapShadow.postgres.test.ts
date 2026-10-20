@@ -55,7 +55,10 @@ const migration151 = readFileSync(
 );
 
 const runTag = `${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
-const quotaDay = getYouTubeQuotaDay(new Date());
+// Freeze the accounting instant near Pacific noon so a suite that starts near
+// midnight cannot compute quotaDay from one instant and dispatch from another.
+const fixedNow = new Date('2026-10-20T19:00:00.000Z');
+const quotaDay = getYouTubeQuotaDay(fixedNow);
 const keyFor = (name: string): string => `fp-${name}-${runTag}`;
 const keyPattern = `fp-%-${runTag}`;
 const enabledReader = async (key: string, fallback: string): Promise<string> => {
@@ -145,7 +148,7 @@ maybe('boundary: 9000 admitted, the next unit is WOULD_REJECT, leases count as i
 
   const first = await recordShadowDispatchSafe(
     { readSetting: enabledReader, pool: shadowPool },
-    { keyFingerprint: key, operationId: `${runTag}:boundary:1`, units: 10 }
+    { keyFingerprint: key, operationId: `${runTag}:boundary:1`, units: 10, now: fixedNow }
   );
   assert.equal(first.projectedBefore, 8990);
   assert.equal(first.event, null, '8990 + 10 = 9000 is admitted');
@@ -155,7 +158,7 @@ maybe('boundary: 9000 admitted, the next unit is WOULD_REJECT, leases count as i
   // accounting this request would still see 8990 and be admitted.
   const second = await recordShadowDispatchSafe(
     { readSetting: enabledReader, pool: shadowPool },
-    { keyFingerprint: key, operationId: `${runTag}:boundary:2`, units: 1 }
+    { keyFingerprint: key, operationId: `${runTag}:boundary:2`, units: 1, now: fixedNow }
   );
   assert.equal(second.projectedBefore, 9000, 'in-flight lease is included in the projection');
   assert.equal(second.event, 'WOULD_REJECT', '9000 + 1 = 9001 blocks');
@@ -176,7 +179,7 @@ maybe('partial fit below the cap is WOULD_DEFER', async () => {
   await seedSettledUnits(key, 8995);
   const result = await recordShadowDispatchSafe(
     { readSetting: enabledReader, pool: requirePool() as unknown as ShadowPoolPort },
-    { keyFingerprint: key, operationId: `${runTag}:defer:1`, units: 10 }
+    { keyFingerprint: key, operationId: `${runTag}:defer:1`, units: 10, now: fixedNow }
   );
   assert.equal(result.projectedBefore, 8995);
   assert.equal(result.event, 'WOULD_DEFER', '8995 + 10 = 9005 crosses the cap from below');
@@ -196,11 +199,11 @@ maybe('duplicate accounting: one lease and one event per operation id', async ()
 
   const first = await recordShadowDispatchSafe(
     { readSetting: enabledReader, pool: shadowPool },
-    { keyFingerprint: key, operationId, units: 1 }
+    { keyFingerprint: key, operationId, units: 1, now: fixedNow }
   );
   const second = await recordShadowDispatchSafe(
     { readSetting: enabledReader, pool: shadowPool },
-    { keyFingerprint: key, operationId, units: 1 }
+    { keyFingerprint: key, operationId, units: 1, now: fixedNow }
   );
   assert.equal(first.event, 'WOULD_REJECT');
   assert.equal(second.event, 'WOULD_REJECT', 'classification is still reported on retry');
@@ -270,6 +273,7 @@ maybe('concurrency: 20 parallel dispatches serialize per key/day and cap exactly
           keyFingerprint: key,
           operationId: `${runTag}:concurrent:${index}`,
           units: 1,
+          now: fixedNow,
           lockTimeoutMs: 3000,
         }
       )
@@ -301,8 +305,8 @@ maybe('stale leases expire, are excluded from projections and swept on restart',
   await seedSettledUnits(key, 8990);
   await requirePool().query(
     `INSERT INTO youtube_key_cap_shadow_leases(quota_day, operation_id, key_fingerprint, reserved_units, reserved_at, expires_at)
-     VALUES($1, $2, $3, 9000, now() - interval '10 minutes', now() - interval '5 minutes')`,
-    [quotaDay, staleOperationId, key]
+     VALUES($1, $2, $3, 9000, $4::timestamptz - interval '10 minutes', $4::timestamptz - interval '5 minutes')`,
+    [quotaDay, staleOperationId, key, fixedNow]
   );
 
   // Restart recovery: the first observation after a restart sweeps expired
@@ -310,7 +314,7 @@ maybe('stale leases expire, are excluded from projections and swept on restart',
   // poison the projection.
   const result = await recordShadowDispatchSafe(
     { readSetting: enabledReader, pool: requirePool() as unknown as ShadowPoolPort },
-    { keyFingerprint: key, operationId: `${runTag}:stale:2`, units: 10 }
+    { keyFingerprint: key, operationId: `${runTag}:stale:2`, units: 10, now: fixedNow }
   );
   assert.equal(result.projectedBefore, 8990, 'expired lease is not part of the projection');
   assert.equal(result.event, null, '8990 + 10 = 9000 admitted');
@@ -320,7 +324,7 @@ maybe('stale leases expire, are excluded from projections and swept on restart',
   );
   assert.equal(Number(stale.rows[0].count), 0, 'expired lease removed by the restart sweep');
 
-  const swept = await sweepShadowLeases(requirePool() as unknown as ShadowPoolPort, new Date());
+  const swept = await sweepShadowLeases(requirePool() as unknown as ShadowPoolPort, fixedNow);
   assert.ok(swept >= 0);
 });
 
@@ -335,13 +339,13 @@ maybe('settlement releases the in-flight lease exactly once', async () => {
 
   const dispatch = await recordShadowDispatchSafe(
     { readSetting: enabledReader, pool: shadowPool },
-    { keyFingerprint: key, operationId, units: 1 }
+    { keyFingerprint: key, operationId, units: 1, now: fixedNow }
   );
   assert.equal(dispatch.leaseInserted, true);
   assert.equal(await leaseCount(key), 1);
 
-  const first = await settleShadowLease(shadowPool, { quotaDay, keyFingerprint: key, units: 1 });
-  const second = await settleShadowLease(shadowPool, { quotaDay, keyFingerprint: key, units: 1 });
+  const first = await settleShadowLease(shadowPool, { quotaDay, keyFingerprint: key, units: 1, now: fixedNow });
+  const second = await settleShadowLease(shadowPool, { quotaDay, keyFingerprint: key, units: 1, now: fixedNow });
   assert.equal(first, true, 'matching lease released');
   assert.equal(second, false, 'double settlement is a no-op');
   assert.equal(await leaseCount(key), 0);
@@ -351,7 +355,7 @@ maybe('settlement releases the in-flight lease exactly once', async () => {
   await seedSettledUnits(key, 101);
   const next = await recordShadowDispatchSafe(
     { readSetting: enabledReader, pool: shadowPool },
-    { keyFingerprint: key, operationId: `${runTag}:settle:2`, units: 8899 }
+    { keyFingerprint: key, operationId: `${runTag}:settle:2`, units: 8899, now: fixedNow }
   );
   assert.equal(next.projectedBefore, 101);
   assert.equal(next.event, null, '101 + 8899 = 9000 admitted');
