@@ -407,9 +407,9 @@ export async function drainOrphanDiscordCandidates(
     removeOrphans: (targetChannelId, candidateIds) => deleteOrphanDiscordCandidates(targetChannelId, candidateIds),
   },
   limit = 5,
-): Promise<{ candidates: DiscordCandidate[]; removed: number }> {
+): Promise<{ candidates: DiscordCandidate[]; removed: number; discardedOwnerChannelIds: string[] }> {
   const rows = await deps.list(channelId, limit);
-  if (!rows.length) return { candidates: [], removed: 0 };
+  if (!rows.length) return { candidates: [], removed: 0, discardedOwnerChannelIds: [] };
   // Orphan rows are matched by exact candidate id and the same
   // DISCOVERED/NOT_STARTED predicate that listed them; their discovered_at
   // predates this execution, so no time watermark applies.
@@ -420,11 +420,26 @@ export async function drainOrphanDiscordCandidates(
   }
   const claims = await deps.claim([...sources.entries()].map(([code, src]) => ({ code, sourceSurface: src.surface, sourceUrl: src.url })), channelId);
   const admitted = new Set(claims.filter(claim => claim.admitted).map(claim => claim.code));
+  // A discarded orphan is still positive evidence that the channel publishes
+  // this invite, so retain the foreign owner for dashboard provenance even
+  // though the code and candidate row are deleted below.
+  const foreignOwnerByCode = new Map<string, string>();
+  for (const claim of claims) {
+    if (!claim.admitted && claim.firstChannelId && claim.firstChannelId !== channelId) {
+      foreignOwnerByCode.set(claim.code, claim.firstChannelId);
+    }
+  }
+  const discardedOwnerChannelIds = new Set<string>();
   const loserIds: string[] = [];
   const candidates: DiscordCandidate[] = [];
   for (const row of rows) {
     const code = discordInviteCodeOf(row.canonicalCode || row.normalizedLocator);
-    if (!code || !admitted.has(code)) { if (row.candidateId) loserIds.push(row.candidateId); continue; }
+    if (!code || !admitted.has(code)) {
+      const owner = code ? foreignOwnerByCode.get(code) : undefined;
+      if (owner) discardedOwnerChannelIds.add(owner);
+      if (row.candidateId) loserIds.push(row.candidateId);
+      continue;
+    }
     // Preserve the original-case invite code for validation (Discord codes are
     // case-sensitive) and re-derive ownership from the persisted observations.
     // The registry claim above intentionally uses the lowercase key only.
@@ -446,7 +461,7 @@ export async function drainOrphanDiscordCandidates(
     candidates.push({...recovered,...inferDiscordOwnership(recovered)});
   }
   const removed = loserIds.length ? await deps.removeOrphans(channelId, loserIds) : 0;
-  return { candidates, removed };
+  return { candidates, removed, discardedOwnerChannelIds: [...discardedOwnerChannelIds] };
 }
 /**
  * Pure SEARCH worker wall-time split (observability only): quota-wait vs
@@ -1780,15 +1795,6 @@ export async function inspectAndValidateChannel(
     // production passes the real implementations below.
     const structuredCandidates=(inspection.discordCandidates||[]).filter(candidate=>!!discordInviteCodeOf(candidate.nativeInviteCode));
     let chokeAdmission=await admitInspectionDiscordCandidates(structuredCandidates,inspection.foundInvite,channel.channel_id);
-    // Provenance-only duplicate record: owner channel id, never the invite
-    // code. A fresh processed inspection clears stale duplicate evidence; a
-    // cache-only scan preserves it because borrowed coverage cannot establish
-    // that the duplicate disappeared.
-    channel.discord_duplicate_owner_channel_id = nextDiscordDuplicateOwnerChannelId({
-      discardedOwnerChannelIds: chokeAdmission.discardedOwnerChannelIds,
-      previousOwnerChannelId: channel.discord_duplicate_owner_channel_id,
-      observations: inspection.acquisitionOutcomes || [],
-    });
     if(chokeAdmission.discardedCount)console.info(JSON.stringify({event:'discord_duplicate_discarded',channelId:channel.channel_id,discardedCount:chokeAdmission.discardedCount,discardedOwnerChannelIds:chokeAdmission.discardedOwnerChannelIds,timestamp:new Date().toISOString()}));
     admittedInspection={...inspection,discordCandidates:chokeAdmission.candidates,foundInvite:chokeAdmission.discoveredInvite};
 
@@ -1806,7 +1812,7 @@ export async function inspectAndValidateChannel(
     // available (or already owned here) join the validation set below.
     const orphanDrain=await drainOrphanDiscordCandidates(channel.channel_id).catch(error=>{
       console.warn(JSON.stringify({event:'orphan_candidate_drain_failed',channelId:channel.channel_id,error:error instanceof Error?error.message:String(error),timestamp:new Date().toISOString()}));
-      return {candidates:[] as DiscordCandidate[],removed:0};
+      return {candidates:[] as DiscordCandidate[],removed:0,discardedOwnerChannelIds:[] as string[]};
     });
     // An orphan row can be the same candidate this execution just persisted
     // (and already admitted). Merge by canonical invite rather than appending
@@ -1822,6 +1828,22 @@ export async function inspectAndValidateChannel(
     } else if(orphanDrain.removed){
       console.info(JSON.stringify({event:'orphan_candidate_residue_removed',channelId:channel.channel_id,removed:orphanDrain.removed,timestamp:new Date().toISOString()}));
     }
+    // Orphan residue is provenance too: the row is deleted, but its foreign
+    // owner must still drive the dashboard's duplicate-owned state.
+    if(orphanDrain.discardedOwnerChannelIds.length){
+      chokeAdmission={...chokeAdmission,discardedOwnerChannelIds:[...new Set([...chokeAdmission.discardedOwnerChannelIds,...orphanDrain.discardedOwnerChannelIds])]};
+      console.info(JSON.stringify({event:'orphan_duplicate_provenance_retained',channelId:channel.channel_id,discardedOwnerChannelIds:orphanDrain.discardedOwnerChannelIds,timestamp:new Date().toISOString()}));
+    }
+    // Provenance-only duplicate record: owner channel id, never the invite
+    // code. A fresh processed inspection clears stale duplicate evidence; a
+    // cache-only scan preserves it because borrowed coverage cannot establish
+    // that the duplicate disappeared. Computed after the orphan drain so
+    // foreign-owned residue contributes its owner before the row is deleted.
+    channel.discord_duplicate_owner_channel_id = nextDiscordDuplicateOwnerChannelId({
+      discardedOwnerChannelIds: chokeAdmission.discardedOwnerChannelIds,
+      previousOwnerChannelId: channel.discord_duplicate_owner_channel_id,
+      observations: inspection.acquisitionOutcomes || [],
+    });
 
     // The admitted inspection view (computed once at the authoritative claim
     // above) shapes every downstream gate, so a duplicate-only inspection

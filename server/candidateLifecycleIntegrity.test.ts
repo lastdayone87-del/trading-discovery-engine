@@ -242,6 +242,7 @@ test('E6: orphan drain re-admits claimable orphans and removes foreign-owned res
   assert.deepEqual(claims.sort(), ['free', 'taken']);
   assert.deepEqual(result.candidates.map(candidate => candidate.nativeInviteCode), ['free']);
   assert.equal(result.removed, 1);
+  assert.deepEqual(result.discardedOwnerChannelIds, ['chanB'], 'foreign owner survives the orphan row deletion as provenance');
   assert.deepEqual(removed, [['orphan-taken']], 'foreign-owned residue is deleted by exact id');
 });
 
@@ -270,6 +271,7 @@ test('E6: orphan drain preserves the original invite casing and ownership eviden
   assert.equal(result.candidates[0]?.nativeInviteCode, 'G2YjkcCgY', 'validation keeps the case-sensitive code');
   assert.equal(result.candidates[0]?.ownershipStatus, 'CREATOR_OWNED');
   assert.deepEqual(removed, []);
+  assert.deepEqual(result.discardedOwnerChannelIds, []);
 });
 
 test('E6: drain is a no-op when no orphans exist', async () => {
@@ -279,7 +281,7 @@ test('E6: drain is a no-op when no orphans exist', async () => {
     list: async () => [],
     removeOrphans: async () => 0,
   } as never);
-  assert.deepEqual(result, { candidates: [], removed: 0 });
+  assert.deepEqual(result, { candidates: [], removed: 0, discardedOwnerChannelIds: [] });
   assert.equal(claimCalls, 0);
 });
 
@@ -297,6 +299,9 @@ test('E6 (contract): orphan predicate and drain wiring match the DB semantics', 
   assert.match(db, /candidate->>'candidateId' = ANY\(\$2::text\[\]\)/);
   assert.match(queue, /event:'orphan_candidates_drained'/);
   assert.match(queue, /event:'orphan_candidate_residue_removed'/);
+  const provenanceIndex = queue.indexOf('channel.discord_duplicate_owner_channel_id = nextDiscordDuplicateOwnerChannelId');
+  assert.ok(provenanceIndex > drainIndex, 'provenance is projected after the orphan drain contributes foreign owners');
+  assert.match(queue, /discardedOwnerChannelIds:\[\.\.\.new Set\(\[\.\.\.chokeAdmission\.discardedOwnerChannelIds,\.\.\.orphanDrain\.discardedOwnerChannelIds\]\)\]/);
 });
 
 test('E7: a stored RETRY_PENDING locator never projects COMPLETED absence', async () => {
