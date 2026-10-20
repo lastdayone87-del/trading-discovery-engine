@@ -86,6 +86,7 @@ test('borrowed observations refresh the audit trail but preserve site-facts', ()
       { requestedUrl: 'https://apextrader.com/pricing', surface: 'CREATOR_WEBSITES', required: true, outcome: 'FOUND', retryable: false, detail: 'rendered', observedAt: hoursAgo(2) },
     ],
     candidates: [{ candidateId: 'c1', nativeInviteCode: 'apexroom', sourceUrl: 'https://apextrader.com/home' }],
+    communityIntents: [{ communityPlatform: 'WHOP', communityUrl: 'https://www.whop.com/apex', intent: 'PAID', paidSignals: ['price'], privateSignals: [], observedAt: hoursAgo(2), sourcePageUrl: 'https://apextrader.com/home', extractionConfidence: 'EXPLICIT' }],
   });
   const borrowed = buildBorrowedSiteInspection(source, {
     requestedUrl: 'https://apextrader.com/',
@@ -107,6 +108,8 @@ test('borrowed observations refresh the audit trail but preserve site-facts', ()
   assert.equal(first.siteCacheHit, true);
   assert.equal(first.siteIdentity, 'apextrader.com');
   assert.equal(first.siteObservedAt, hoursAgo(1));
+  assert.equal(borrowed.communityIntents.length, 1, 'cached community intent survives the borrow');
+  assert.equal((borrowed.communityIntents[0] as Record<string, unknown>).communityPlatform, 'WHOP');
   assert.deepEqual((borrowed as unknown as Record<string, unknown>).candidates, undefined, 'borrowed inspections carry no candidates across creators');
   assert.deepEqual(borrowed.row.candidates, [], 'borrowed row is candidate-free at the API boundary');
 });

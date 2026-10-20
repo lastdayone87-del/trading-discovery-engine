@@ -90,8 +90,14 @@ test('E4: retryable/partial rows keep the short TTL; complete positives keep the
   assert.equal(isSiteInspectionReusable(cachedRow({ retryable: true, lastObservedAt: new Date(now - 60_000).toISOString() }), now), true, 'fresh retryable row is reusable');
 });
 
-test('E3: same-owner recovery re-admits candidates; cross-creator borrows stay candidate-free', () => {
-  const row = cachedRow({ candidates: [candidateRecord('owneronly')], sourceChannelId: 'chanA' });
+test('E3: same-owner recovery re-admits candidates only after the claim handshake; cross-creator borrows stay candidate-free', () => {
+  const pendingRow = cachedRow({
+    candidates: [candidateRecord('owneronly')],
+    sourceChannelId: 'chanA',
+    claimStatus: SITE_INSPECTION_CLAIM_STATUS.PENDING,
+  });
+  assert.equal(isSiteInspectionReusable(pendingRow, Date.now()), false, 'PENDING candidates are not borrowed coverage');
+  const row = { ...pendingRow, claimStatus: SITE_INSPECTION_CLAIM_STATUS.CLAIMED };
   const borrowerBase = { requestedUrl: 'https://unknown.example/join', surface: 'CREATOR_WEBSITES', required: false, observedAt: new Date().toISOString() };
   const sameOwner = buildBorrowedSiteInspection(row, { ...borrowerBase, channelId: 'chanA' });
   assert.equal(sameOwner.recoveredCandidates.length, 1, 'recording channel recovers its own candidates');
@@ -104,6 +110,13 @@ test('E3: same-owner recovery re-admits candidates; cross-creator borrows stay c
   assert.deepEqual(buildBorrowedSiteInspection(legacyRow, { ...borrowerBase, channelId: 'chanA' }).recoveredCandidates, [], 'legacy rows without a recording channel recover nothing');
 });
 
+test('E3: same-owner recovery never treats a PENDING candidate row as completed coverage', () => {
+  const inspector = readSource('inspector.ts');
+  assert.match(inspector, /const canBorrowRecovered = seedReusable && seedCovered/);
+  assert.match(inspector, /if \(canBorrowRecovered\) \{[\s\S]*?acquisitionOutcomes\.push\(\.\.\.borrowed\.observations/);
+  assert.match(inspector, /recoveredCandidates\.length[\s\S]*?PENDING rows are deliberately non-reusable/);
+});
+
 test('E10: loser cleanup runs on the DB clock with exact execution candidate ids', async () => {
   const ops: string[] = [];
   const deletes: Array<{ codes: string[]; ids: string[]; watermark: string }> = [];
@@ -111,7 +124,7 @@ test('E10: loser cleanup runs on the DB clock with exact execution candidate ids
     persist: async () => { ops.push('persist'); },
     claim: async (items: Array<{ code: string }>) => {
       ops.push('claim');
-      return items.map(item => ({ code: item.code, admitted: item.code === 'winner' }));
+      return items.map(item => ({ code: item.code, admitted: item.code === 'winner', firstChannelId: item.code === 'winner' ? 'chanA' : 'chanB' }));
     },
     removeLosers: async (_channelId: string, codes: string[], ids: string[], watermark: string) => {
       ops.push('delete');
@@ -127,6 +140,8 @@ test('E10: loser cleanup runs on the DB clock with exact execution candidate ids
   const result = await admitInspectionDiscordCandidates(candidates, null, 'chanA', deps as never);
   assert.equal(result.discoveredInvite, 'winner');
   assert.equal(result.candidates.length, 1);
+  assert.deepEqual(result.discardedOwnerChannelIds, ['chanB'], 'the owner id is retained as provenance only');
+  assert.equal(result.candidates.some(candidate => candidate.nativeInviteCode === 'loser'), false, 'the duplicate-owned code never enters the admitted set');
   assert.deepEqual(ops, ['now', 'persist', 'claim', 'delete'], 'DB clock read precedes persist; delete follows claim');
   assert.equal(deletes.length, 1);
   assert.deepEqual(deletes[0].codes, ['loser']);
@@ -138,6 +153,20 @@ test('E10 (dbCore contract): deletion is bounded by exact candidate ids AND the 
   const source = readSource('dbCore.ts');
   assert.match(source, /DELETE FROM discord_candidates WHERE channel_id=\$1 AND candidate_id=ANY\(\$4::text\[\]\) AND discovered_at>=\$3::timestamptz/);
   assert.match(source, /export async function getDbStatementNow\(\)/);
+});
+
+test('duplicate ownership provenance stores only the owner channel id, never the invite code or assignment', () => {
+  const queue = readSource('queueManager.ts');
+  assert.match(queue, /channel\.discord_duplicate_owner_channel_id = chokeAdmission\.discardedOwnerChannelIds\[0\] \|\| null/);
+  assert.match(queue, /discardedOwnerChannelIds/);
+  const db = readSource('dbCore.ts');
+  assert.match(db, /discord_duplicate_owner_channel_id: row\.discord_duplicate_owner_channel_id \|\| null/);
+  assert.match(db, /discord_duplicate_owner_channel_id=excluded\.discord_duplicate_owner_channel_id/);
+  assert.match(db, /if\(args\.discordStatus==='INVITE_OWNED_BY_ANOTHER_CHANNEL'\)clauses\.push\('discord_duplicate_owner_channel_id IS NOT NULL'\)/);
+  assert.match(readSource('../src/components/ResultsTable.tsx'), /INVITE_OWNED_BY_ANOTHER_CHANNEL/);
+  const migrations = readSource('db/migrations/149_discovery_integrity_state.sql');
+  assert.match(migrations, /ADD COLUMN IF NOT EXISTS discord_duplicate_owner_channel_id TEXT/);
+  assert.doesNotMatch(queue, /discord_invite\s*=\s*chokeAdmission\.discarded/);
 });
 
 test('E6: orphan drain re-admits claimable orphans and removes foreign-owned residue', async () => {
@@ -161,6 +190,33 @@ test('E6: orphan drain re-admits claimable orphans and removes foreign-owned res
   assert.deepEqual(removed, [['orphan-taken']], 'foreign-owned residue is deleted by exact id');
 });
 
+test('E6: orphan drain preserves the original invite casing and ownership evidence', async () => {
+  const removed: string[][] = [];
+  const claims: string[] = [];
+  const result = await drainOrphanDiscordCandidates('chanA', {
+    claim: async (items: Array<{ code: string }>) => {
+      claims.push(...items.map(item => item.code));
+      return items.map(item => ({ code: item.code, admitted: true, firstChannelId: 'chanA' }));
+    },
+    list: async () => [{
+      candidateId: 'orphan-cased',
+      rawLocator: 'https://discord.gg/G2YjkcCgY',
+      normalizedLocator: 'https://discord.gg/g2yjkccgy',
+      locatorType: 'NATIVE_INVITE',
+      sourceSurface: 'CHANNEL_EXTERNAL_LINKS',
+      sourceUrl: 'https://youtube.test/channel/about',
+      observations: [{ sourceSurface: 'CHANNEL_EXTERNAL_LINKS', sourceUrl: 'https://youtube.test/channel/about', rawLocator: 'https://discord.gg/G2YjkcCgY', extractionConfidence: 'EXPLICIT' }],
+      canonicalCode: 'g2yjkccgy',
+      discoveredAt: '2026-10-18T00:00:00.000Z',
+    }],
+    removeOrphans: async (_channelId: string, ids: string[]) => { removed.push(ids); return ids.length; },
+  } as never);
+  assert.deepEqual(claims, ['g2yjkccgy'], 'the registry claim uses the canonical lowercase key');
+  assert.equal(result.candidates[0]?.nativeInviteCode, 'G2YjkcCgY', 'validation keeps the case-sensitive code');
+  assert.equal(result.candidates[0]?.ownershipStatus, 'CREATOR_OWNED');
+  assert.deepEqual(removed, []);
+});
+
 test('E6: drain is a no-op when no orphans exist', async () => {
   let claimCalls = 0;
   const result = await drainOrphanDiscordCandidates('chanA', {
@@ -179,9 +235,11 @@ test('E6 (contract): orphan predicate and drain wiring match the DB semantics', 
   const queue = readSource('queueManager.ts');
   // Drain runs after the admission claim so orphan rows can never be deleted
   // while the same execution still owns their codes.
-  const claimIndex = queue.indexOf('await markSiteInspectionsClaimed(channel.channel_id).catch(()=>undefined);');
+  const claimIndex = queue.indexOf('await markSiteInspectionsClaimed(channel.channel_id,chokeAdmission.candidates.map(candidate=>candidate.candidateId)).catch');
   const drainIndex = queue.indexOf('const orphanDrain=await drainOrphanDiscordCandidates(channel.channel_id).catch');
   assert.ok(claimIndex >= 0 && drainIndex > claimIndex, 'orphan drain follows the claim handshake');
+  assert.match(db, /export async function markSiteInspectionsClaimed\(channelId: string, admittedCandidateIds: string\[\] = \[\]\)/);
+  assert.match(db, /candidate->>'candidateId' = ANY\(\$2::text\[\]\)/);
   assert.match(queue, /event:'orphan_candidates_drained'/);
   assert.match(queue, /event:'orphan_candidate_residue_removed'/);
 });
@@ -217,6 +275,63 @@ test('E7: a stored RETRY_PENDING locator never projects COMPLETED absence', asyn
   assert.deepEqual(enqueued, ['chanA'], 'the durable retry job is preserved');
 });
 
+test('E7: FAILED_OPERATIONAL is terminal and never reopens pending work', async () => {
+  const channel = {
+    channel_id: 'chan-terminal',
+    channel_name: 'Terminal',
+    youtube_url: 'https://youtube.test/terminal',
+    country: 'US',
+    country_status: 'CONFIRMED',
+    confidence_score: 1,
+    discord_status: 'UNCERTAIN',
+    scan_status: 'FAILED',
+    scan_attempts: 5,
+    discord_candidate_locator: 'https://discord.gg/terminalroom',
+    discord_validation_status: 'FAILED_OPERATIONAL',
+    discord_discovery_status: 'DISCOVERED_VALIDATION_FAILED',
+  } as never;
+  const enqueued: string[] = [];
+  await projectNotFoundAfterInspection(
+    channel,
+    { acquisitionOutcomes: [] },
+    { candidates: [], foundInvite: null } as never,
+    true,
+    async (channelId: string) => { enqueued.push(channelId); },
+  );
+  const updated = channel as Record<string, unknown>;
+  assert.equal(updated.scan_status, 'COMPLETED');
+  assert.equal(updated.discord_validation_status, 'FAILED_OPERATIONAL');
+  assert.deepEqual(enqueued, [], 'an exhausted terminal verdict schedules no retry');
+});
+
+test('E7: NOT_STARTED locator work without an inspection directive still gets a durable job', async () => {
+  const channel = {
+    channel_id: 'chan-pending',
+    channel_name: 'Pending',
+    youtube_url: 'https://youtube.test/pending',
+    country: 'US',
+    country_status: 'CONFIRMED',
+    confidence_score: 1,
+    discord_status: 'PENDING',
+    scan_status: 'PENDING',
+    scan_attempts: 1,
+    discord_candidate_locator: 'https://discord.gg/pendingroom',
+    discord_validation_status: 'NOT_STARTED',
+    discord_discovery_status: 'DISCOVERED_VALIDATION_FAILED',
+  } as never;
+  const directives: unknown[] = [];
+  await projectNotFoundAfterInspection(
+    channel,
+    { acquisitionOutcomes: [] },
+    { candidates: [], foundInvite: null } as never,
+    true,
+    async (_channelId: string, directive?: unknown) => { directives.push(directive); },
+  );
+  assert.equal((channel as Record<string, unknown>).scan_status, 'FAILED');
+  assert.equal(directives.length, 1, 'pending locator work owns a retry job');
+  assert.equal((directives[0] as { attemptFree?: boolean }).attemptFree, true);
+});
+
 test('E7: a channel without pending work still projects clean absence', async () => {
   const channel = {
     channel_id: 'chanB',
@@ -246,4 +361,6 @@ test('P3 item 12: cache recovery writes an explicit audit row (best-effort) and 
   const db = readSource('dbCore.ts');
   assert.match(db, /INSERT INTO discovery_recovery_audit\(channel_id,source,site_identity,candidate_ids,candidate_count,detail\)/);
   assert.match(db, /export async function countLegacyUnclassifiedChannels\(\):Promise<number>/);
+  assert.match(db, /classifyDiscoveryVisibility\(\{/, 'the pure classifier feeds the channel projection');
+  assert.match(db, /discovery_visibility: classifyDiscoveryVisibility/);
 });

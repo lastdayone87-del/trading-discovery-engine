@@ -14,6 +14,7 @@ import type { AuditEvent } from './operatorAuth';
 import type { ProviderCallEvent } from './providerResilience';
 import { resolveShadowConfig, settleShadowLeaseWithSavepoint } from './quotaKeyCapShadow';
 import { canonicalCountry } from './countryInference';
+import { classifyDiscoveryVisibility } from './discoveryStateVisibility';
 import { safeCrawlerTelemetry, type CrawlerTelemetry } from './crawlerTelemetry';
 import { validateLedgerInput, type ValidationKind, type ValidationStatus } from './phase3Validation';
 import { browserCapabilityIsUnavailable } from './browserCapability';
@@ -398,6 +399,7 @@ export function rowToChannel(row: any): ChannelRecord {
     discord_candidates: parseJson(row.discord_candidates, []),
     community_discovery_status: row.community_discovery_status === 'COMMUNITY_INDICATED_NO_INVITE' || row.community_discovery_status === 'PAID_COMMUNITY_INDICATED' ? row.community_discovery_status : 'NONE',
     community_intents: parseJson(row.community_intents, null),
+    discord_duplicate_owner_channel_id: row.discord_duplicate_owner_channel_id || null,
     post_approval_job_status: row.post_approval_job_status || undefined,
     post_approval_job_error: row.post_approval_job_error || undefined,
     community_retry_job_status: row.community_retry_job_status || undefined,
@@ -539,7 +541,8 @@ export function buildChannelListingWhere(defaultServing:{predicate:string;scope:
   const add=(column:string,value:string|undefined)=>{if(value&&value!=='ALL'){values.push(value);clauses.push(`${column}=$${values.length}`);}};
   if(args.search){values.push(args.search);clauses.push(`(channel_name ILIKE '%'||$${values.length}||'%' OR youtube_url ILIKE '%'||$${values.length}||'%')`);}
   add('country',args.country); add('country_status',args.countryStatus); add('trading_status',args.tradingStatus);
-  add('discord_status',args.discordStatus);
+  if(args.discordStatus==='INVITE_OWNED_BY_ANOTHER_CHANNEL')clauses.push('discord_duplicate_owner_channel_id IS NOT NULL');
+  else add('discord_status',args.discordStatus);
   if(args.scanStatus==='SKIPPED_LOW_AUDIENCE'){
     values.push(args.scanStatus);
     clauses.push(`(scan_status=$${values.length} OR ${KNOWN_LOW_AUDIENCE_SQL})`);
@@ -553,7 +556,7 @@ async function channelListingWhere(db:InstanceType<typeof Pool>,args:ChannelList
 export async function listChannelsPage(args:ChannelListingFilter&{limit:number;offset:number}):Promise<{items:ChannelRecord[];total:number;revision:string|null}> {
   const db=await getDb(); const limit=Math.min(250,Math.max(1,args.limit)); const offset=Math.max(0,args.offset);
   const {where,values}=await channelListingWhere(db,args);
-  const columns=`channel_id,channel_name,youtube_url,country,country_status,scope_eligibility,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,subscriber_count,channel_thumbnail_url,quality_score,trading_status,trading_confidence_score,trading_category,country_metadata_status,country_metadata_checked_at,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,community_discovery_status,community_intents,
+  const columns=`channel_id,channel_name,youtube_url,country,country_status,scope_eligibility,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,subscriber_count,channel_thumbnail_url,quality_score,trading_status,trading_confidence_score,trading_category,country_metadata_status,country_metadata_checked_at,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,community_discovery_status,community_intents,discord_duplicate_owner_channel_id,
     COALESCE((SELECT jsonb_agg((to_jsonb(dc) || jsonb_build_object('display_locator', (SELECT COALESCE(a.resolved_locator, a.invite_locator) FROM discord_check_attempts a WHERE a.channel_id=dc.channel_id AND lower(COALESCE(a.resolved_locator, a.invite_locator))=dc.normalized_locator ORDER BY a.checked_at DESC LIMIT 1))) ORDER BY dc.selected DESC,dc.last_checked DESC NULLS LAST,dc.discovered_at) FROM discord_candidates dc WHERE dc.channel_id=channels.channel_id AND dc.candidate_status='VALIDATED' AND dc.validation_status='COMPLETED' AND dc.liveness_status='ACTIVE'),'[]'::jsonb) discord_candidates,
     (SELECT status FROM jobs WHERE type='POST_APPROVAL_ENRICH' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) post_approval_job_status,
     (SELECT last_error FROM jobs WHERE type='POST_APPROVAL_ENRICH' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) post_approval_job_error,
@@ -691,8 +694,21 @@ export async function getDashboardOperationalSummary(env:NodeJS.ProcessEnv=proce
 }
 export async function getChannelById(channelId: string): Promise<ChannelRecord | null> {
   const db = await getDb();
-  const res = await db.query('SELECT * FROM channels WHERE channel_id=$1', [channelId]);
-  return res.rows[0] ? rowToChannel(res.rows[0]) : null;
+  const res = await db.query(`SELECT c.*,
+    (SELECT COUNT(*)::int FROM discord_candidates dc WHERE dc.channel_id=c.channel_id) candidate_count
+    FROM channels c WHERE c.channel_id=$1`, [channelId]);
+  if (!res.rows[0]) return null;
+  const channel = rowToChannel(res.rows[0]);
+  const trail = Array.isArray(channel.inspection_trail) ? channel.inspection_trail : [];
+  return {
+    ...channel,
+    discovery_visibility: classifyDiscoveryVisibility({
+      discordDiscoveryStatus: channel.discord_discovery_status,
+      discordValidationStatus: channel.discord_validation_status,
+      inspectionTrailPresent: trail.length > 0,
+      candidateCount: Number(res.rows[0].candidate_count || 0),
+    }),
+  };
 }
 
 export async function upsertChannel(channel: ChannelRecord): Promise<void> {
@@ -710,10 +726,10 @@ export async function upsertChannel(channel: ChannelRecord): Promise<void> {
     // through untouched.
     const scopeEligibility = scopeEligibilityForWrite(channel);
     await client.query(`INSERT INTO channels (
-    channel_id,channel_name,youtube_url,country,country_status,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,next_check,inspection_trail,subscriber_count,channel_thumbnail_url,quality_score,quality_breakdown,trading_status,trading_confidence_score,trading_category,trading_relevance_breakdown,country_metadata_status,country_metadata_checked_at,public_about_status,public_about_checked_at,public_about_attempts,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,scope_eligibility,community_discovery_status,community_intents,updated_at
-  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,now())
+    channel_id,channel_name,youtube_url,country,country_status,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,next_check,inspection_trail,subscriber_count,channel_thumbnail_url,quality_score,quality_breakdown,trading_status,trading_confidence_score,trading_category,trading_relevance_breakdown,country_metadata_status,country_metadata_checked_at,public_about_status,public_about_checked_at,public_about_attempts,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,scope_eligibility,community_discovery_status,community_intents,discord_duplicate_owner_channel_id,updated_at
+  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,now())
   ON CONFLICT(channel_id) DO UPDATE SET
-    channel_name=excluded.channel_name,youtube_url=excluded.youtube_url,country=excluded.country,country_status=excluded.country_status,confidence_score=excluded.confidence_score,discord_status=excluded.discord_status,discord_invite=excluded.discord_invite,scan_status=excluded.scan_status,scan_attempts=excluded.scan_attempts,discovery_source=excluded.discovery_source,last_checked=excluded.last_checked,next_check=excluded.next_check,inspection_trail=excluded.inspection_trail,subscriber_count=excluded.subscriber_count,channel_thumbnail_url=excluded.channel_thumbnail_url,quality_score=excluded.quality_score,quality_breakdown=excluded.quality_breakdown,trading_status=excluded.trading_status,trading_confidence_score=excluded.trading_confidence_score,trading_category=excluded.trading_category,trading_relevance_breakdown=excluded.trading_relevance_breakdown,country_metadata_status=excluded.country_metadata_status,country_metadata_checked_at=excluded.country_metadata_checked_at,public_about_status=excluded.public_about_status,public_about_checked_at=excluded.public_about_checked_at,public_about_attempts=excluded.public_about_attempts,latest_upload_at=excluded.latest_upload_at,uploads_last_30_days=excluded.uploads_last_30_days,uploads_last_90_days=excluded.uploads_last_90_days,uploads_last_365_days=excluded.uploads_last_365_days,activity_band=excluded.activity_band,activity_score=excluded.activity_score,activity_observed_at=excluded.activity_observed_at,discord_discovery_status=excluded.discord_discovery_status,discord_candidate_locator=excluded.discord_candidate_locator,discord_candidate_id=excluded.discord_candidate_id,discord_candidate_raw_locator=excluded.discord_candidate_raw_locator,discord_candidate_type=excluded.discord_candidate_type,discord_resolution_status=excluded.discord_resolution_status,discord_liveness_status=excluded.discord_liveness_status,discord_relevance_status=excluded.discord_relevance_status,discord_validation_status=excluded.discord_validation_status,scope_eligibility=excluded.scope_eligibility,community_discovery_status=excluded.community_discovery_status,community_intents=excluded.community_intents,updated_at=now()`, [
+    channel_name=excluded.channel_name,youtube_url=excluded.youtube_url,country=excluded.country,country_status=excluded.country_status,confidence_score=excluded.confidence_score,discord_status=excluded.discord_status,discord_invite=excluded.discord_invite,scan_status=excluded.scan_status,scan_attempts=excluded.scan_attempts,discovery_source=excluded.discovery_source,last_checked=excluded.last_checked,next_check=excluded.next_check,inspection_trail=excluded.inspection_trail,subscriber_count=excluded.subscriber_count,channel_thumbnail_url=excluded.channel_thumbnail_url,quality_score=excluded.quality_score,quality_breakdown=excluded.quality_breakdown,trading_status=excluded.trading_status,trading_confidence_score=excluded.trading_confidence_score,trading_category=excluded.trading_category,trading_relevance_breakdown=excluded.trading_relevance_breakdown,country_metadata_status=excluded.country_metadata_status,country_metadata_checked_at=excluded.country_metadata_checked_at,public_about_status=excluded.public_about_status,public_about_checked_at=excluded.public_about_checked_at,public_about_attempts=excluded.public_about_attempts,latest_upload_at=excluded.latest_upload_at,uploads_last_30_days=excluded.uploads_last_30_days,uploads_last_90_days=excluded.uploads_last_90_days,uploads_last_365_days=excluded.uploads_last_365_days,activity_band=excluded.activity_band,activity_score=excluded.activity_score,activity_observed_at=excluded.activity_observed_at,discord_discovery_status=excluded.discord_discovery_status,discord_candidate_locator=excluded.discord_candidate_locator,discord_candidate_id=excluded.discord_candidate_id,discord_candidate_raw_locator=excluded.discord_candidate_raw_locator,discord_candidate_type=excluded.discord_candidate_type,discord_resolution_status=excluded.discord_resolution_status,discord_liveness_status=excluded.discord_liveness_status,discord_relevance_status=excluded.discord_relevance_status,discord_validation_status=excluded.discord_validation_status,scope_eligibility=excluded.scope_eligibility,community_discovery_status=excluded.community_discovery_status,community_intents=excluded.community_intents,discord_duplicate_owner_channel_id=excluded.discord_duplicate_owner_channel_id,updated_at=now()`, [
     channel.channel_id, channel.channel_name, channel.youtube_url, channel.country, channel.country_status, channel.confidence_score || 0,
     channel.discord_status, channel.discord_invite || null, channel.scan_status, channel.scan_attempts || 0, channel.discovery_source,
     channel.first_seen || new Date().toISOString(), channel.last_checked || null, null, JSON.stringify(channel.inspection_trail || []),
@@ -725,7 +741,7 @@ export async function upsertChannel(channel: ChannelRecord): Promise<void> {
     channel.public_about_status || 'NOT_ATTEMPTED', channel.public_about_checked_at || null, channel.public_about_attempts || 0,
     channel.latest_upload_at || null, channel.uploads_last_30_days || 0, channel.uploads_last_90_days || 0,
     channel.uploads_last_365_days || 0, channel.activity_band || 'UNKNOWN', channel.activity_score ?? 50,
-    channel.activity_observed_at || null,channel.discord_discovery_status||'NOT_DISCOVERED',channel.discord_candidate_locator||null,channel.discord_candidate_id||null,channel.discord_candidate_raw_locator||null,channel.discord_candidate_type||null,channel.discord_resolution_status||'NOT_ATTEMPTED',channel.discord_liveness_status||'NOT_CHECKED',channel.discord_relevance_status||'NOT_CHECKED',channel.discord_validation_status||'NOT_STARTED',scopeEligibility,channel.community_discovery_status||'NONE',JSON.stringify(channel.community_intents||[])
+    channel.activity_observed_at || null,channel.discord_discovery_status||'NOT_DISCOVERED',channel.discord_candidate_locator||null,channel.discord_candidate_id||null,channel.discord_candidate_raw_locator||null,channel.discord_candidate_type||null,channel.discord_resolution_status||'NOT_ATTEMPTED',channel.discord_liveness_status||'NOT_CHECKED',channel.discord_relevance_status||'NOT_CHECKED',channel.discord_validation_status||'NOT_STARTED',scopeEligibility,channel.community_discovery_status||'NONE',JSON.stringify(channel.community_intents||[]),channel.discord_duplicate_owner_channel_id||null
     ]);
     if (prior.rowCount) {
       const before = isQualityCreator(prior.rows[0].trading_status, Number(prior.rows[0].quality_score || 0));
@@ -1102,6 +1118,9 @@ export interface SiteInspectionRow {
   payloadChecksum: string | null;
   candidates: Array<Record<string, unknown>>;
   observations: Array<Record<string, unknown>>;
+  /** Platform-community evidence observed while inspecting this site. It is
+   * replayed on cache hits; it is never an invite or ownership attribution. */
+  communityIntents?: Array<Record<string, unknown>>;
   renderedCovered: boolean;
   /** Recording channel for same-owner candidate recovery (E3). Optional so
    * legacy fixtures/rows type-check; production mapping always populates it
@@ -1133,6 +1152,7 @@ function rowToSiteInspection(item: Record<string, unknown>): SiteInspectionRow {
     payloadChecksum: typeof item.payload_checksum === 'string' ? item.payload_checksum : null,
     candidates: Array.isArray(item.candidates) ? item.candidates as Array<Record<string, unknown>> : [],
     observations: Array.isArray(item.observations) ? item.observations as Array<Record<string, unknown>> : [],
+    communityIntents: Array.isArray(item.community_intents) ? item.community_intents as Array<Record<string, unknown>> : [],
     renderedCovered: item.rendered_covered === true,
     sourceChannelId: typeof item.source_channel_id === 'string' ? item.source_channel_id : null,
     claimStatus: text(item.claim_status),
@@ -1167,27 +1187,42 @@ export async function upsertSiteInspection(row: {
   canonicalUrl: string; finalUrl?: string | null; outcome: string; retryable: boolean;
   httpStatus?: number | null; failureClass?: string; detail?: string; payloadChecksum?: string | null;
   candidates: Array<Record<string, unknown>>; observations: Array<Record<string, unknown>>;
+  communityIntents?: Array<Record<string, unknown>>;
   renderedCovered: boolean; sourceChannelId?: string | null; claimStatus?: string; provenance?: Record<string, unknown>;
 }): Promise<void> {
   if (!row.siteIdentity) return;
   const db = await getDb();
-  await db.query(`INSERT INTO site_inspections(site_identity,identity_tier,identity_basis,canonical_url,final_url,outcome,retryable,http_status,failure_class,detail,payload_checksum,candidates,observations,rendered_covered,source_channel_id,claim_status,provenance,first_observed_at,last_observed_at,observed_count)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,now(),now(),1)
-    ON CONFLICT(site_identity) DO UPDATE SET identity_tier=excluded.identity_tier,identity_basis=excluded.identity_basis,canonical_url=excluded.canonical_url,final_url=excluded.final_url,outcome=excluded.outcome,retryable=excluded.retryable,http_status=excluded.http_status,failure_class=excluded.failure_class,detail=excluded.detail,payload_checksum=excluded.payload_checksum,candidates=excluded.candidates,observations=excluded.observations,rendered_covered=excluded.rendered_covered,source_channel_id=excluded.source_channel_id,claim_status=excluded.claim_status,provenance=excluded.provenance,last_observed_at=now(),observed_count=site_inspections.observed_count+1`,
-    [row.siteIdentity, row.identityTier || 'A', row.identityBasis || '', row.canonicalUrl, row.finalUrl || null, row.outcome, row.retryable, row.httpStatus ?? null, row.failureClass || '', row.detail || '', row.payloadChecksum || null, JSON.stringify(row.candidates || []), JSON.stringify(row.observations || []), row.renderedCovered, row.sourceChannelId || null, row.claimStatus || 'NONE', JSON.stringify(row.provenance || {})]);
+  await db.query(`INSERT INTO site_inspections(site_identity,identity_tier,identity_basis,canonical_url,final_url,outcome,retryable,http_status,failure_class,detail,payload_checksum,candidates,observations,rendered_covered,source_channel_id,claim_status,community_intents,provenance,first_observed_at,last_observed_at,observed_count)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,now(),now(),1)
+    ON CONFLICT(site_identity) DO UPDATE SET identity_tier=excluded.identity_tier,identity_basis=excluded.identity_basis,canonical_url=excluded.canonical_url,final_url=excluded.final_url,outcome=excluded.outcome,retryable=excluded.retryable,http_status=excluded.http_status,failure_class=excluded.failure_class,detail=excluded.detail,payload_checksum=excluded.payload_checksum,
+      candidates=CASE WHEN site_inspections.claim_status='PENDING' AND jsonb_array_length(site_inspections.candidates)>0 AND jsonb_array_length(excluded.candidates)=0 THEN site_inspections.candidates ELSE excluded.candidates END,
+      observations=excluded.observations,rendered_covered=excluded.rendered_covered,
+      source_channel_id=CASE WHEN site_inspections.claim_status='PENDING' AND jsonb_array_length(site_inspections.candidates)>0 AND jsonb_array_length(excluded.candidates)=0 THEN site_inspections.source_channel_id ELSE excluded.source_channel_id END,
+      claim_status=CASE WHEN site_inspections.claim_status='PENDING' AND jsonb_array_length(site_inspections.candidates)>0 AND jsonb_array_length(excluded.candidates)=0 THEN site_inspections.claim_status ELSE excluded.claim_status END,
+      community_intents=excluded.community_intents,
+      provenance=excluded.provenance,last_observed_at=now(),observed_count=site_inspections.observed_count+1`,
+    [row.siteIdentity, row.identityTier || 'A', row.identityBasis || '', row.canonicalUrl, row.finalUrl || null, row.outcome, row.retryable, row.httpStatus ?? null, row.failureClass || '', row.detail || '', row.payloadChecksum || null, JSON.stringify(row.candidates || []), JSON.stringify(row.observations || []), row.renderedCovered, row.sourceChannelId || null, row.claimStatus || 'NONE', JSON.stringify(row.communityIntents || []), JSON.stringify(row.provenance || {})]);
 }
 
 /** Marks this channel's PENDING site-inspection rows as CLAIMED after the
- * authoritative Discord admission committed (E2). Rows with unclaimed
- * candidates stay non-reusable until this flip, so a crash between cache
- * write and admission degrades to an idempotent recrawl/re-admission instead
- * of silent discovery loss. Best-effort: a pre-migration database missing
- * the column resolves to zero. */
-export async function markSiteInspectionsClaimed(channelId: string): Promise<number> {
-  if (!channelId) return 0;
+ * authoritative Discord admission committed (E2). Only rows containing a
+ * candidate that actually reached admission are flipped; a prior interrupted
+ * run's unadmitted candidates must stay non-reusable. Rows with unclaimed
+ * candidates stay PENDING until this flip, so a crash between cache write and
+ * admission degrades to an idempotent recrawl/re-admission instead of silent
+ * discovery loss. Best-effort: a pre-migration database missing the column
+ * resolves to zero. */
+export async function markSiteInspectionsClaimed(channelId: string, admittedCandidateIds: string[] = []): Promise<number> {
+  const ids = [...new Set((admittedCandidateIds || []).filter(id => typeof id === 'string' && !!id))];
+  if (!channelId || !ids.length) return 0;
   const db = await getDb();
   try {
-    const res = await db.query(`UPDATE site_inspections SET claim_status='CLAIMED' WHERE source_channel_id=$1 AND claim_status='PENDING'`, [channelId]);
+    const res = await db.query(`UPDATE site_inspections SET claim_status='CLAIMED'
+      WHERE source_channel_id=$1 AND claim_status='PENDING'
+        AND EXISTS (
+          SELECT 1 FROM jsonb_array_elements(candidates) candidate
+          WHERE candidate->>'candidateId' = ANY($2::text[])
+        )`, [channelId, ids]);
     return res.rowCount || 0;
   } catch (error) {
     const code = (error as { code?: unknown } | null)?.code;

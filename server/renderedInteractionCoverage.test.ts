@@ -83,6 +83,24 @@ test('outcome classifier source contracts: gap outranks clean resolution and nev
   assert.match(source, /failureClass:timeoutClass\|\|interactionClass\|\|'RENDERED_PARTIAL_COVERAGE'/);
 });
 
+test('zero-candidate interaction gaps stay retryable even with permanent-only link failures', () => {
+  const source = readFileSync(fileURLToPath(new URL('./inspector.ts', import.meta.url)), 'utf8');
+  assert.match(
+    source,
+    /if \(interactionGap\) return\{outcome:rendered\.inspectedPages>0\?'PARTIALLY_INSPECTED':'ACQUISITION_FAILED',failureClass:rendered\.timedOut\?'RENDERED_TIMEOUT':'RENDERED_INTERACTION_GAP',gapRetryable:true\};/,
+    'interaction gap must precede the permanent-only return',
+  );
+});
+
+test('rendered control coverage counts overflow and uses stable markers across DOM mutations', () => {
+  const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
+  assert.match(source, /return \{ controls, total: matched\.length \}/, 'total matches are returned before the 64-item slice');
+  assert.match(source, /recordControlEnumeration\(firstEnumeration\.total\)/);
+  assert.match(source, /data-oc-control/);
+  assert.match(source, /partitionRenderedClickTargets\(unqueued, page\.url\(\), limits\.maxClicksPerPage - clickedThisPage\)/, 'new controls are re-enumerated within the remaining click budget');
+  assert.match(source, /interactionGap:interactionGap\|\|undefined/, 'throw paths retain the interaction gap');
+});
+
 test('shared rendered evidence stays fail-closed: gapped/timed-out lenders never enter inventory', () => {
   const source = readFileSync(fileURLToPath(new URL('./inspector.ts', import.meta.url)), 'utf8');
   assert.match(

@@ -68,7 +68,7 @@ export function sanitizeDiscordInviteCode(value:string|null|undefined):string|nu
 // path, or word. `example.com/discord.gg/x` and `notdiscord.gg/x` are not
 // Discord invite references; a query/redirect parameter is likewise not a
 // direct invite. The same boundary is used by every URL-form extractor.
-const INVITE_HOST_BOUNDARY='(?<![\\w.\\-\\/])';
+const INVITE_HOST_BOUNDARY='(?<![\\w.\\-\\/?&#=:])';
 const INVITE_PROTOCOL='(?:(?:https?:)?\\/\\/)?(?:www\\.)?';
 const NATIVE_INVITE_HOST='(?:discord\\.gg|discord\\.com\\/invite|discordapp\\.com\\/invite|discord\\.app\\/invite)';
 const ALTERNATIVE_INVITE_HOST='(?:dsc\\.gg|discord\\.me|discord\\.io)';
@@ -93,7 +93,7 @@ export function decodeInviteObfuscation(text:string):string{
     .replace(/&#x0*26;|&#0*38;/gi,'&')
     .replace(/discord\s*[\[(]\s*[.·•]\s*[\])]\s*gg/gi,'discord.gg')
     .replace(/discord\s*[\[(]\s*dot\s*[\])]\s*gg/gi,'discord.gg')
-    .replace(/discord\s*[\[(]\s*[.·•]\s*[\])]\s*(com|app)/gi,'discord.$2');
+    .replace(/discord\s*[\[(]\s*[.·•]\s*[\])]\s*(com|app)/gi,'discord.$1');
 }
 /** Canonical invite code shared by every layer that must agree on Discord
  * invite identity (registry claims, choke-point filtering, tests). Accepts a

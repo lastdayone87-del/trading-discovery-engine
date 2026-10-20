@@ -69,7 +69,7 @@ export interface DestinationDecision {
 }
 
 export function isKnownCommunityDestinationHost(host: string): boolean {
-  const lower = String(host || '').toLowerCase().replace(/^www\./, '');
+  const lower = String(host || '').toLowerCase().replace(/\.$/, '').replace(/^www\./, '');
   if (!lower) return false;
   return [...LINK_HUB_HOSTS, ...COMMUNITY_PLATFORM_HOSTS].some(entry => {
     const bare = entry.replace(/^www\./, '');
@@ -119,7 +119,12 @@ export function shouldFollowDestination(input: {
   }
 
   const baseScore = Math.max(0, Number(input.baseScore) || 0);
-  const text = `${input.url} ${input.anchorText || ''}`;
+  // Use the destination pathname, never its query string: a tracking parameter
+  // such as `?campaign=signal` is not evidence that an unrelated host is a
+  // community surface. Anchor text remains the primary user-visible signal.
+  let pathname = input.url;
+  try { pathname = new URL(input.url).pathname || '/'; } catch { /* admission already validated */ }
+  const text = `${pathname} ${input.anchorText || ''}`;
   const knownHost = isKnownCommunityDestinationHost(host);
   const strongEvidence = hasStrongCommunityEvidence(text);
   const weakEvidence = WEAK_COMMUNITY_EVIDENCE.test(text);
@@ -162,7 +167,9 @@ export function shouldFollowDestination(input: {
 export function destinationTemplate(url: string): string {
   try {
     const parsed = new URL(url);
-    const path = parsed.pathname.replace(/\/+$/, '').replace(/\d+/g, ':n') || '/';
+    const path = parsed.pathname.replace(/\/+$/, '').split('/')
+      .map(segment => /^\d+$/.test(segment) ? ':n' : segment)
+      .join('/') || '/';
     return `${parsed.hostname.toLowerCase()}${path}`;
   } catch {
     return String(url || '');
@@ -210,12 +217,20 @@ export function selectDiverseNavigationQueue<T extends { url: string; score: num
 export function createDestinationBudget(input: {
   maxCrossOriginHosts?: number;
   maxPagesPerHost?: number;
+  /** Original seed URL. Its origin stays free; once the crawler leaves that
+   * origin, every destination host is counted even for same-origin children
+   * of the external host. Without it, legacy same-origin behavior is retained. */
+  seedUrl?: string;
 } = {}): {
   reserve: (url: string, currentUrl: string) => { admitted: boolean; reason: 'same-origin' | 'admitted' | 'host-budget' | 'page-budget' };
 } {
   const maxHosts = Math.max(1, Math.trunc(input.maxCrossOriginHosts ?? 3) || 3);
   const maxPages = Math.max(1, Math.trunc(input.maxPagesPerHost ?? 2) || 2);
   const pagesByHost = new Map<string, Set<string>>();
+  let seedOrigin: string | null = null;
+  if (input.seedUrl) {
+    try { seedOrigin = new URL(input.seedUrl).origin; } catch { seedOrigin = null; }
+  }
   return {
     reserve(url: string, currentUrl: string) {
       let target: URL;
@@ -226,7 +241,11 @@ export function createDestinationBudget(input: {
       } catch {
         return { admitted: false, reason: 'page-budget' as const };
       }
-      if (target.origin === current.origin) return { admitted: true, reason: 'same-origin' as const };
+      // Only the original seed origin is exempt. After entering an external
+      // host, its own internal links are still bounded by maxPagesPerHost.
+      if (seedOrigin ? target.origin === seedOrigin : target.origin === current.origin) {
+        return { admitted: true, reason: 'same-origin' as const };
+      }
       const key = `${target.origin}${target.pathname}${target.search}`;
       const host = target.hostname.toLowerCase();
       const pages = pagesByHost.get(host) || new Set<string>();

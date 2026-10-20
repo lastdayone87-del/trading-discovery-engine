@@ -183,6 +183,11 @@ export interface ChannelRecord {
    * verified" from "no community found". Never carries an invite. */
   community_discovery_status?: CommunityDiscoveryStatus;
   community_intents?: CommunityIntentEvidence[] | null;
+  /** Non-null when an invite was found but its registry owner is another
+   * channel. Owner id only; never the code, a candidate, or an assignment. */
+  discord_duplicate_owner_channel_id?: string | null;
+  /** Read-only reporting classification; never persisted. */
+  discovery_visibility?: 'VALIDATED' | 'DISCOVERED_VALIDATION_FAILED' | 'NOT_DISCOVERED' | 'LEGACY_UNCLASSIFIED';
   post_approval_job_status?: 'PENDING'|'PROCESSING'|'COMPLETED'|'FAILED';
   post_approval_job_error?: string;
   post_approval_job_attempts?: number;

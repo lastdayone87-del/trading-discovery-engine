@@ -728,7 +728,7 @@ test('v2 review: scheduler and worker wiring call sites are pinned', () => {
   // Capture the original page's anchors before any control click can navigate
   // the document away; the post-click enqueue then covers JS-revealed links.
   const enqueuePos = fallback.indexOf("await enqueueLinks({ strategy: 'same-hostname'");
-  const clickPos = fallback.indexOf('const clickTargets = clickPlan.toClick;');
+  const clickPos = fallback.indexOf('const clickTargets = [...clickPlan.toClick];');
   const postClickEnqueuePos = fallback.indexOf("await enqueueLinks({strategy:'same-hostname'", clickPos);
   assert.ok(enqueuePos !== -1 && clickPos !== -1 && enqueuePos < clickPos, 'anchors enqueue before navigating clicks');
   assert.ok(postClickEnqueuePos > clickPos, 'JS-revealed anchors enqueue after clicks');
@@ -1089,16 +1089,21 @@ test('found-gap retry survives the no-admission NOT_FOUND branch', async () => {
     } as never,
     { discordCandidates: [], foundInvite: null, steps: [] } as never,
     true,
-    (async () => {
-      cleanCalls.push(1);
+    (async (_channelId: string, directive?: unknown) => {
+      cleanCalls.push(directive);
     }) as never,
   );
-  assert.equal(cleanCalls.length, 0);
-  // The retryable required gap still blocks a clean completion even without a
-  // directive: no job is scheduled, but the channel never claims COMPLETED.
+  // Pending work always owns a durable job (E7): a missing inspection
+  // directive gets a bounded attempt-free fallback rather than stranding
+  // RETRY_PENDING state.
+  assert.equal(cleanCalls.length, 1);
+  assert.equal((cleanCalls[0] as { attemptFree?: unknown }).attemptFree, true);
+  assert.equal((cleanCalls[0] as { code?: unknown }).code, 'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE');
+  // The retryable required gap still blocks a clean completion even without an
+  // inspection directive: the channel never claims COMPLETED.
   assert.equal((cleanChannel as { scan_status?: unknown }).scan_status, 'FAILED');
-  // A missing retry directive never schedules, even with gap rows present;
-  // a plain FOUND_COMPLETE row without any gap class likewise never does.
+  // The gap-only scheduler still refuses to schedule by itself without a
+  // directive; the durable fallback above is the explicit pending-work path.
   assert.equal(
     shouldScheduleFoundGapAcquisitionRetry({ acquisitionOutcomes: [], retryDirective: undefined }),
     false,

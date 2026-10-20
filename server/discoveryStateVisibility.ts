@@ -35,6 +35,6 @@ export function classifyDiscoveryVisibility(input: DiscoveryVisibilityInput): Di
   if (status === 'DISCOVERED_VALIDATION_FAILED') return 'DISCOVERED_VALIDATION_FAILED';
   const candidates = Number(input.candidateCount || 0);
   const validationStatus = String(input.discordValidationStatus || 'NOT_STARTED');
-  if (!input.inspectionTrailPresent && candidates === 0 && validationStatus === 'NOT_STARTED') return 'LEGACY_UNCLASSIFIED';
+  if (status === 'NOT_DISCOVERED' && !input.inspectionTrailPresent && candidates === 0 && validationStatus === 'NOT_STARTED') return 'LEGACY_UNCLASSIFIED';
   return 'NOT_DISCOVERED';
 }

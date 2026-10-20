@@ -10,7 +10,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { shouldFollowDestination, selectDiverseNavigationQueue, createDestinationBudget, isKnownCommunityDestinationHost } from './destinationPolicy';
+import { shouldFollowDestination, selectDiverseNavigationQueue, createDestinationBudget, isKnownCommunityDestinationHost, destinationTemplate } from './destinationPolicy';
 import { CRAWL_DROP_REASONS } from './crawlerTelemetry';
 import { crawlExternalLinks } from './inspector';
 
@@ -103,14 +103,12 @@ test('broker hosts and affiliate redirects are downranked, not admitted blindly'
   assert.ok(affiliate.score < plain.score, 'referral parameters are downranked');
 });
 
-test('admission boundary still rejects non-public/invalid destinations', () => {
-  for (const url of ['http://localhost/community', 'https://unrelated.example/join']) {
-    const decision = shouldFollowDestination({ url, currentUrl: 'https://creator.test/', anchorText: 'Join our Discord' });
-    if (url.startsWith('http://localhost')) {
-      assert.equal(decision.eligible, false);
-      assert.equal(decision.reason, 'admission-rejected');
-    }
-  }
+test('admission boundary still rejects non-public destinations; anchor evidence remains eligible', () => {
+  const localhost = shouldFollowDestination({ url: 'http://localhost/community', currentUrl: 'https://creator.test/', anchorText: 'Join our Discord' });
+  assert.equal(localhost.eligible, false);
+  assert.equal(localhost.reason, 'admission-rejected');
+  const evidenced = shouldFollowDestination({ url: 'https://unrelated.example/join', currentUrl: 'https://creator.test/', anchorText: 'Join our Discord' });
+  assert.equal(evidenced.eligible, true, 'the explicit community anchor is eligible on an unknown public host');
 });
 
 test('duplicate URLs never consume queue budget while unique eligible targets are dropped', () => {
@@ -125,6 +123,38 @@ test('duplicate URLs never consume queue budget while unique eligible targets ar
   assert.equal(selection.dropped, 1);
   // Selection is still score-ordered: the diverse replacement takes the last slot.
   assert.ok(selection.selected[0].score >= selection.selected[1].score);
+});
+
+test('tracking query parameters are not community evidence', () => {
+  assert.equal(shouldFollowDestination({
+    url: 'https://unrelated.example/page?campaign=signal',
+    currentUrl: 'https://creator.test/',
+    anchorText: 'Read more',
+  }).eligible, false);
+  assert.equal(shouldFollowDestination({
+    url: 'https://community.example/join',
+    currentUrl: 'https://creator.test/',
+    anchorText: 'Read more',
+  }).eligible, true);
+});
+
+test('known community hosts accept trailing-dot aliases', () => {
+  assert.equal(isKnownCommunityDestinationHost('linktr.ee.'), true);
+  assert.equal(isKnownCommunityDestinationHost('www.whop.com.'), true);
+});
+
+test('destination templates collapse only complete numeric path segments', () => {
+  assert.equal(destinationTemplate('https://creator.test/page/2'), 'creator.test/page/:n');
+  assert.equal(destinationTemplate('https://creator.test/community2'), 'creator.test/community2');
+  assert.notEqual(destinationTemplate('https://creator.test/community2'), destinationTemplate('https://creator.test/community3'));
+});
+
+test('external-host children count against the seed-origin-aware page budget', () => {
+  const budget = createDestinationBudget({ seedUrl: 'https://creator.test/', maxCrossOriginHosts: 3, maxPagesPerHost: 2 });
+  assert.deepEqual(budget.reserve('https://creator.test/about', 'https://creator.test/'), { admitted: true, reason: 'same-origin' });
+  assert.deepEqual(budget.reserve('https://a.example/1', 'https://creator.test/'), { admitted: true, reason: 'admitted' });
+  assert.deepEqual(budget.reserve('https://a.example/2', 'https://a.example/1'), { admitted: true, reason: 'admitted' });
+  assert.deepEqual(budget.reserve('https://a.example/3', 'https://a.example/2'), { admitted: false, reason: 'page-budget' });
 });
 
 test('per-seed destination budget bounds cross-origin fan-out but never blocks same-origin', () => {

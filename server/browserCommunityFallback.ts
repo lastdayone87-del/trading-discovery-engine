@@ -35,6 +35,10 @@ export interface BrowserFallbackBudget {
    * before.
    */
   alreadyVisited?: string[];
+  /** Rotate which evidence controls get the bounded click budget on retries.
+   * Stable across a single page; callers may seed from scan attempts so a
+   * retry can examine controls beyond the first budget window. */
+  clickOffset?: number;
 }
 
 export interface BrowserFallbackTelemetry {
@@ -512,6 +516,9 @@ export function createRenderedControlClickDeps(input: {
  */
 export interface RenderedControlTarget {
   index: number;
+  /** Stable per-element marker assigned at enumeration. Positional indexes
+   * become stale when an earlier click expands/collapses the DOM. */
+  marker?: string;
   text: string;
   href: string | null;
   /**
@@ -1244,19 +1251,41 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               if (after <= before) break;
             }
 
-            const controls = await page.locator(RENDERED_CONTROL_SELECTOR).evaluateAll((nodes, pattern) => {
-              const re = new RegExp(pattern, 'i');
-              // Bounded candidate pool (64): the click plan partitions the
-              // complete matching set FIRST so skipped navigable anchors can
-              // never hide a later click-only control behind the old take-12
-              // window. Locator indexes stay positional in the full query.
-              // The tag feeds bounded click-failure aggregates (anchor/button/
-              // role) and nothing else: selection behavior is unchanged.
-              return nodes.map((node, index) => {
-                const tagName = ((node as HTMLElement).tagName || '').toLowerCase();
-                return {index,text:`${(node as HTMLElement).innerText || ''} ${(node as HTMLAnchorElement).href || ''} ${(node as HTMLElement).getAttribute('aria-label') || ''}`,href:(node as HTMLAnchorElement).href || null,tag:(tagName === 'a' ? 'anchor' : tagName === 'button' ? 'button' : 'role') as 'anchor' | 'button' | 'role'};
-              }).filter(item => re.test(item.text)).slice(0, 64);
-            }, COMMUNITY_HINTS.source);
+            const enumerateControls = async (): Promise<{ controls: RenderedControlTarget[]; total: number }> =>
+              page.locator(RENDERED_CONTROL_SELECTOR).evaluateAll((nodes, pattern) => {
+                const re = new RegExp(pattern, 'i');
+                // Count the complete matching set before applying the bounded
+                // 64-item pool. Overflow is unexamined content and must stay
+                // visible in the coverage certificate.
+                const matched = nodes.map((node, index) => {
+                  const tagName = ((node as HTMLElement).tagName || '').toLowerCase();
+                  return {index,text:`${(node as HTMLElement).innerText || ''} ${(node as HTMLAnchorElement).href || ''} ${(node as HTMLElement).getAttribute('aria-label') || ''}`,href:(node as HTMLAnchorElement).href || null,tag:(tagName === 'a' ? 'anchor' : tagName === 'button' ? 'button' : 'role') as 'anchor' | 'button' | 'role'};
+                }).filter(item => re.test(item.text));
+                const controls = matched.slice(0, 64).map(item => {
+                  const node = nodes[item.index] as HTMLElement;
+                  const existing = node.getAttribute('data-oc-control');
+                  const marker = existing || `oc-${Date.now().toString(36)}-${item.index}-${Math.random().toString(36).slice(2, 8)}`;
+                  if (!existing) node.setAttribute('data-oc-control', marker);
+                  return { ...item, marker };
+                });
+                return { controls, total: matched.length };
+              }, COMMUNITY_HINTS.source);
+            let pageControlTotal = 0;
+            let pageControlOverflow = 0;
+            const recordControlEnumeration = (total: number): void => {
+              pageControlTotal = Math.max(pageControlTotal, total);
+              const overflow = Math.max(0, total - 64);
+              if (overflow > pageControlOverflow) {
+                const added = overflow - pageControlOverflow;
+                pageControlOverflow = overflow;
+                drops.count('control-slice', added);
+                evidenceControlsSkipped += added;
+                interactionGap = true;
+              }
+            };
+            const firstEnumeration = await enumerateControls();
+            recordControlEnumeration(firstEnumeration.total);
+            const controls = firstEnumeration.controls;
             // Navigable same-host anchors are already discovered through
             // enqueueLinks and Discord-scanned before any click, so the click
             // budget is reserved for controls that only a click can act on
@@ -1264,7 +1293,6 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // Slice accounting covers the remainder beyond clicks and skips.
             const clickPlan = partitionRenderedClickTargets(controls, page.url(), limits.maxClicksPerPage);
             const sliceDropped = Math.max(0, controls.length - clickPlan.toClick.length - clickPlan.skippedNavigableAnchors);
-            evidenceControlsSeen += controls.length;
             if (sliceDropped > 0) {
               // Every enumerated control matched the community-evidence filter;
               // dropping one for budget means its content was never examined.
@@ -1300,8 +1328,15 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               await enqueueLinks({ strategy: 'same-hostname', transformRequestFunction: req => (admitEnqueueRequest(req.url) ? req : false) });
             }
 
-            const clickTargets = clickPlan.toClick;
+            const clickTargets = [...clickPlan.toClick];
+            // Rotate the bounded budget on retries so a control beyond the
+            // first budget window can eventually be examined.
+            const rotateBy = Math.max(0, Math.trunc(limits.clickOffset || 0)) % Math.max(1, clickTargets.length);
+            if (rotateBy > 0) clickTargets.push(...clickTargets.splice(0, rotateBy));
+            const queuedMarkers = new Set(clickTargets.map(target => target.marker).filter((marker): marker is string => Boolean(marker)));
+            let clickedThisPage = 0;
             for (let clickIndex = 0; clickIndex < clickTargets.length; clickIndex++) {
+              if (clickedThisPage >= limits.maxClicksPerPage) break;
               if (Date.now() - startedAt >= limits.totalTimeoutMs) {
                 const skipped = clickTargets.length - clickIndex;
                 evidenceControlsSkipped += skipped;
@@ -1310,7 +1345,12 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 break;
               }
               const control = clickTargets[clickIndex];
-              const locator=page.locator(RENDERED_CONTROL_SELECTOR).nth(control.index);
+              clickedThisPage++;
+              // Stable marker first: positional nth() indexes are invalidated
+              // when an earlier disclosure changes the selector membership.
+              const locator = control.marker
+                ? page.locator(`[data-oc-control="${control.marker.replace(/"/g, '\\"')}"]`).first()
+                : page.locator(RENDERED_CONTROL_SELECTOR).nth(control.index);
               const clickOutcome = await attemptRenderedControlClick(createRenderedControlClickDeps({
                 locator: locator as unknown as RenderedClickEndpoint,
                 page: page as unknown as RenderedClickSettler,
@@ -1328,7 +1368,24 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 evidenceControlsFailed++;
                 interactionGap = true;
               }
+              // A successful click can reveal new evidence-bearing controls
+              // (second interaction). Re-enumerate with the remaining click
+              // budget and queue only controls not already handled.
+              if (clickedThisPage < limits.maxClicksPerPage && Date.now() - startedAt < limits.totalTimeoutMs) {
+                try {
+                  const refreshed = await enumerateControls();
+                  recordControlEnumeration(refreshed.total);
+                  const unqueued = refreshed.controls.filter(target => target.marker && !queuedMarkers.has(target.marker));
+                  const freshPlan = partitionRenderedClickTargets(unqueued, page.url(), limits.maxClicksPerPage - clickedThisPage);
+                  for (const target of freshPlan.toClick) {
+                    if (!target.marker || queuedMarkers.has(target.marker)) continue;
+                    queuedMarkers.add(target.marker);
+                    clickTargets.push(target);
+                  }
+                } catch { /* re-enumeration keeps the original bounded plan */ }
+              }
             }
+            evidenceControlsSeen += pageControlTotal;
 
             if (Date.now() - startedAt < limits.totalTimeoutMs) {
               await enqueueLinks({strategy:'same-hostname',transformRequestFunction:req=>(admitEnqueueRequest(req.url)?req:false)});
@@ -1508,7 +1565,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         if (causeSnippet) telemetry.launchCauseSnippet=causeSnippet;
         const zeroPageReason=resolveRenderedZeroPageReason({inspectedPages,timedOut:false,saturated:false,browserLaunchFailed,thrown:true,telemetry});
         if (zeroPageReason) telemetry.zeroPageReason=zeroPageReason;
-        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,dropReasons:drops.snapshot(),detail:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
+        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,dropReasons:drops.snapshot(),interactionGap:interactionGap||undefined,evidenceControlsTotal:evidenceControlsSeen||undefined,evidenceControlsClicked:evidenceControlsClicked||undefined,evidenceControlsFailed:evidenceControlsFailed||undefined,evidenceControlsSkipped:evidenceControlsSkipped||undefined,detail:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
       } finally {
         // The isolated queue must never outlive its crawl: the lifecycle
         // finalizer drops it on success, failure, and unexpected throws alike

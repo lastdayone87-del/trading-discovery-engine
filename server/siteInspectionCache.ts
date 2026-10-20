@@ -51,6 +51,9 @@ export interface CachedSiteInspection {
   payloadChecksum: string | null;
   candidates: Array<Record<string, unknown>>;
   observations: Array<Record<string, unknown>>;
+  /** Platform-community evidence observed by the original crawl. Replayed on
+   * cache hits so a borrow cannot turn a community into "no community found". */
+  communityIntents?: Array<Record<string, unknown>>;
   renderedCovered: boolean;
   lastObservedAt: string | null;
   /** Recording channel for same-owner candidate recovery; null on legacy rows. */
@@ -80,6 +83,9 @@ export interface BorrowedSiteInspection {
    * so ownership and validation still decide; cross-creator borrows always
    * receive an empty list. */
   recoveredCandidates: Array<Record<string, unknown>>;
+  /** Site-level platform-community evidence from the cached inspection.
+   * Extraction-only: it never becomes an invite or a registry claim. */
+  communityIntents: Array<Record<string, unknown>>;
 }
 
 const ageMs = (lastObservedAt: string | null, nowMs: number): number | null => {
@@ -159,7 +165,10 @@ export function buildBorrowedSiteInspection(
   const recoveredCandidates = sameOwner && Array.isArray(row.candidates)
     ? row.candidates.filter(item => item && typeof item === 'object')
     : [];
-  return { row: { ...row, candidates: [] }, observations, recoveredCandidates };
+  const communityIntents = Array.isArray(row.communityIntents)
+    ? row.communityIntents.filter(item => item && typeof item === 'object')
+    : [];
+  return { row: { ...row, candidates: [] }, observations, recoveredCandidates, communityIntents };
 }
 
 /** Strongest-observation aggregate for a seed's cache row (E1): array

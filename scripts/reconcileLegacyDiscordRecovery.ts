@@ -98,7 +98,10 @@ async function main() {
   // only when classification/owner agree; any conflict is real corruption.
   const observationCountMismatches = rows.filter(row => {
     const manifestForSite = bySite.get(row.site_identity) || [];
-    return Number(row.code_count || manifestForSite.length) !== manifestForSite.length;
+    // A blank/missing code_count is not a defaulted pass: the frozen row must
+    // carry a canonical integer or the artifact is incomplete.
+    if (!/^\d+$/.test(String(row.code_count ?? '').trim())) return true;
+    return Number(row.code_count) !== manifestForSite.length;
   });
   const distinctCodeMismatches = rows.filter(row => {
     const rowCodes = new Set((row.codes || '').split('|').filter(Boolean).map(code => code.toLowerCase()));
@@ -119,15 +122,6 @@ async function main() {
     || new Set(list.map(item => item.registry_owner)).size > 1);
   const duplicateSites = rows.length - new Set(rows.map(row => row.site_identity)).size;
 
-  // Classification buckets (frozen manifest semantics).
-  const classification = (name: string) => manifest.filter(item => item.classification === name);
-  const sameOwnerMissing = classification('REGISTERED_SAME_OWNER_MISSING_CODE');
-  const sameOwnerHasCode = classification('REGISTERED_SAME_OWNER_HAS_CODE');
-  const otherOwner = classification('REGISTERED_OTHER_OWNER');
-  const cacheOnly = classification('CACHE_ONLY');
-  const platformSharedRows = manifest.filter(item => item.registry_owner === PLATFORM_SHARED_OWNER);
-  const withheldRows = manifest.filter(item => GUARDED_INVITES.some(guard => guard.code.toLowerCase() === item.code.toLowerCase() && guard.policy === 'FOUND_WITHHELD'));
-
   // Per-row action plan: never reassign, never execute here. Codes that fail
   // the P1 canonical alphabet are rejected before any ownership logic: they
   // are extraction artifacts (arrow suffixes, `https:`, markdown fragments),
@@ -135,6 +129,10 @@ async function main() {
   const actionFor = (item: Row): string => {
     const code = (item.code || '').toLowerCase();
     if (!CANONICAL_CODE.test(item.code || '')) return 'rejected_invalid_code';
+    if (GUARDED_INVITES.some(guard => guard.code.toLowerCase() === code
+      && guard.expectedOwnerId
+      && item.registry_owner
+      && item.registry_owner !== guard.expectedOwnerId)) return 'blocked_owner_mismatch';
     if (GUARDED_INVITES.some(guard => guard.code.toLowerCase() === code && guard.policy === 'FOUND_WITHHELD')) return 'blocked_withheld_policy';
     if (item.registry_owner === PLATFORM_SHARED_OWNER) return 'blocked_platform_shared';
     if (item.classification === 'REGISTERED_OTHER_OWNER') return 'blocked_other_owner';
@@ -157,6 +155,10 @@ async function main() {
   const frozenRows = rows.length;
   const snapshotReconciliation = {
     observed_earlier_counts: snapshotCounts.filter(count => count !== frozenRows),
+    expected_manifest_observations: 823,
+    expected_snapshot_rows: 491,
+    manifest_observation_count_match: manifest.length === 823,
+    snapshot_row_count_match: frozenRows === 491,
     frozen_count: frozenRows,
     frozen_distinct_sites: rowSites.size,
     frozen_distinct_codes: manifestCodes.size,
@@ -171,7 +173,9 @@ async function main() {
   };
 
   const namedTargets = NAMED_TARGETS.map(target => {
-    const hits = manifest.filter(item => item.code.toLowerCase() === target.code.toLowerCase());
+    const hits = manifest.filter(item => item.code.toLowerCase() === target.code.toLowerCase()
+      && item.site_identity === target.expectedSite
+      && String(item.linked_creators || '').split('|').some(creator => creator.split(':')[0].trim() === target.channelId));
     const actions = [...new Set(hits.map(actionFor))];
     return {
       label: target.label,
@@ -186,9 +190,9 @@ async function main() {
         action: actionFor(item),
         linked_creators: item.linked_creators || null,
       })),
-      recovery_path: actions.every(action => action === 'safe_same_owner_recover_candidate')
+      recovery_path: actions.length > 0 && actions.every(action => action === 'safe_same_owner_recover_candidate')
         ? 'same_owner_recovery'
-        : actions.every(action => action === 'manual_review_cache_only')
+        : actions.length > 0 && actions.every(action => action === 'manual_review_cache_only')
           ? 'normal_admission_on_recrawl'
           : 'blocked_or_invalid',
     };
@@ -203,7 +207,7 @@ async function main() {
       policy: guard.policy,
       expected_owner_id: guard.expectedOwnerId,
       observed_owner_ids: owners,
-      owner_unchanged: owners.every(owner => owner === guard.expectedOwnerId),
+      owner_unchanged: hits.length > 0 && owners.length === 1 && owners[0] === guard.expectedOwnerId,
       actions: [...new Set(hits.map(actionFor))],
     };
   });
@@ -217,6 +221,8 @@ async function main() {
         ? 'unregistered cache-only code; normal admission on recrawl decides (never auto-claimed)'
         : action === 'rejected_invalid_code'
           ? 'code fails the canonical invite alphabet after P1 extraction hardening; never recover'
+        : action === 'blocked_owner_mismatch'
+          ? 'observed owner differs from the guarded expected owner; quarantine, never recover'
         : action === 'blocked_other_owner'
           ? 'code owned by another creator; no reassignment'
           : action === 'blocked_platform_shared'
@@ -262,17 +268,22 @@ async function main() {
         && observationCountMismatches.length === 0
         && distinctCodeMismatches.length === 0
         && conflictingPairs.length === 0
-        && duplicateSites === 0,
+        && duplicateSites === 0
+        && manifest.length === 823
+        && frozenRows === 491,
     },
     snapshot_reconciliation: snapshotReconciliation,
     recovery_buckets: {
+      // Action-named buckets must mirror actionFor precedence; category lengths
+      // can disagree when a guarded/owner-mismatched row is blocked first.
       safe_same_owner_recover_candidates: actionCounts.safe_same_owner_recover_candidate || 0,
-      skip_already_has_code: sameOwnerHasCode.length,
-      blocked_other_owner: otherOwner.length,
+      skip_already_has_code: actionCounts.skip_already_has_code || 0,
+      blocked_other_owner: actionCounts.blocked_other_owner || 0,
+      blocked_owner_mismatch: actionCounts.blocked_owner_mismatch || 0,
       rejected_invalid_code: actionCounts.rejected_invalid_code || 0,
-      manual_review_cache_only: cacheOnly.length,
-      platform_shared_rows: platformSharedRows.length,
-      withheld_policy_rows: withheldRows.length,
+      manual_review_cache_only: actionCounts.manual_review_cache_only || 0,
+      platform_shared_rows: actionCounts.blocked_platform_shared || 0,
+      withheld_policy_rows: actionCounts.blocked_withheld_policy || 0,
       rejected_rows: actionCounts.rejected_invalid_code || 0,
       unresolved_rows: actionCounts.unresolved || 0,
       action_counts: actionCounts,

@@ -113,6 +113,28 @@ test('a private no-invite community shows intent and evidence, never clean inspe
   assert.match(html, /community\.circle\.so\/c\/private-trading/);
 });
 
+test('a retained invite makes the additional community label invite-neutral', async () => {
+  const html = await renderDashboard(channel({
+    discord_invite: 'https://discord.gg/retained',
+    community_discovery_status: 'COMMUNITY_INDICATED_NO_INVITE',
+    community_intents: [{ ...paidIntent, intent: 'UNKNOWN', paidSignals: [] }],
+  }));
+
+  assert.match(html, /ADDITIONAL COMMUNITY INDICATED/);
+  assert.doesNotMatch(html, /COMMUNITY INDICATED · NO INVITE/);
+  assert.match(html, /https:\/\/discord\.gg\/retained/);
+});
+
+test('a duplicate-owned invite is visible without becoming an invite or a clean inspection', async () => {
+  const html = await renderDashboard(channel({
+    discord_duplicate_owner_channel_id: 'UC_owner_other',
+  }));
+
+  assert.match(html, /Invite found, owned by another channel/);
+  assert.match(html, /UC_owner_other/);
+  assert.doesNotMatch(html, /Clean inspection · no community found/);
+});
+
 test('a genuinely clean inspection still renders the no-community label', async () => {
   const html = await renderDashboard(channel({}));
 

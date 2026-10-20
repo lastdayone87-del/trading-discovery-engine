@@ -20,7 +20,7 @@ import { resolveBorrowBypassForInspectionMarker } from './queueManager';
 const source = readFileSync(fileURLToPath(new URL('./queueManager.ts', import.meta.url)), 'utf8');
 
 test('live country rejection is decided before the authoritative candidate claim', () => {
-  const rejectionIndex = source.indexOf("event:'live_country_rejected_before_claim'");
+  const rejectionIndex = source.indexOf("if (liveCountry.status === 'REJECTED') {");
   const claimIndex = source.indexOf('await admitInspectionDiscordCandidates(structuredCandidates,inspection.foundInvite,channel.channel_id)');
   assert.ok(rejectionIndex > 0, 'live rejection path exists');
   assert.ok(claimIndex > 0, 'choke claim call exists');
@@ -28,11 +28,12 @@ test('live country rejection is decided before the authoritative candidate claim
   assert.match(source, /applyLiveCountryRejectionToInspected\(channel, liveCountry, now\);/);
   // The rejection branch returns without touching the claim.
   const between = source.slice(rejectionIndex, claimIndex);
+  assert.match(between, /return;/, 'the rejection branch returns before claim');
   assert.ok(!between.includes('persistDiscordCandidates'), 'no candidate persistence inside the rejection path');
 });
 
 test('retry-owned reacquisition blocks stored confirmed exclusions before crawling', () => {
-  const precheckIndex = source.indexOf("context:'retry_owned_reacquire'");
+  const precheckIndex = source.indexOf("executionMarker?.isRetryOwnedReacquire && channel.country_status === 'CONFIRMED'");
   const crawlIndex = source.indexOf('inspection = await runChannelInspection({');
   assert.ok(precheckIndex > 0, 'stored-country pre-check exists');
   assert.ok(precheckIndex < crawlIndex, 'the pre-check runs before any crawl spend');

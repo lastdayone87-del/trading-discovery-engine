@@ -65,7 +65,10 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
     const matchesCountry = selectedCountry === 'ALL' || c.country === selectedCountry;
     const matchesCountryStatus = selectedCountryStatus === 'ALL' || c.country_status === selectedCountryStatus;
     const matchesTradingStatus = selectedTradingStatus === 'ALL' || c.trading_status === selectedTradingStatus;
-    const matchesDiscordStatus = selectedDiscordStatus === 'ALL' || c.discord_status === selectedDiscordStatus;
+    const matchesDiscordStatus = selectedDiscordStatus === 'ALL'
+      || (selectedDiscordStatus === 'INVITE_OWNED_BY_ANOTHER_CHANNEL'
+        ? Boolean(c.discord_duplicate_owner_channel_id)
+        : c.discord_status === selectedDiscordStatus);
     const matchesScanStatus = selectedScanStatus === 'ALL' || c.scan_status === selectedScanStatus;
     const matchesLowAudienceVisibility = selectedScanStatus === 'SKIPPED_LOW_AUDIENCE' || c.scan_status !== 'SKIPPED_LOW_AUDIENCE';
     const matchesReviewView = !pendingReviewOnly || (c.scan_status === 'NEEDS_REVIEW' && !decidedChannelIds.has(c.channel_id));
@@ -278,6 +281,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
               <option value="UNCERTAIN">UNCERTAIN (Ambiguous Niche)</option>
               <option value="NON_TRADING">NON_TRADING (Irrelevant Niche)</option>
               <option value="NOT_FOUND">NOT FOUND</option>
+              <option value="INVITE_OWNED_BY_ANOTHER_CHANNEL">INVITE OWNED BY ANOTHER CHANNEL</option>
               <option value="PENDING">PENDING</option>
               <option value="DEAD">DEAD / Expired</option>
             </select>
@@ -512,8 +516,18 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                           </button>
                         </div>
                       )}
+                      {c.discord_duplicate_owner_channel_id && (
+                        <div data-testid="duplicate-owned-invite" className="mt-1 rounded-md border border-amber-300 bg-amber-50 px-2 py-1.5 text-[10px] dark:border-amber-800 dark:bg-amber-950/40">
+                          <div className="font-bold text-amber-800 dark:text-amber-300">Invite found, owned by another channel</div>
+                          <div className="mt-0.5 font-mono text-slate-600 dark:text-slate-300" title={c.discord_duplicate_owner_channel_id}>
+                            Owner channel: {c.discord_duplicate_owner_channel_id}
+                          </div>
+                        </div>
+                      )}
                       <div className="mt-1 text-[10px] text-slate-500 dark:text-slate-400">
-                        {c.discord_discovery_status === 'DISCOVERED_VALIDATION_FAILED'
+                        {c.discord_duplicate_owner_channel_id
+                          ? 'Invite found, owned by another channel'
+                          : c.discord_discovery_status === 'DISCOVERED_VALIDATION_FAILED'
                           ? 'Discovered · validation failed'
                           : c.discord_discovery_status === 'VALIDATED' && c.discord_status === 'UNCERTAIN'
                           ? 'Discovered · validation ambiguous'
@@ -525,7 +539,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                           ? 'Not yet inspected'
                           : communityIntent.present && !c.discord_invite && !c.discord_candidate_locator
                           ? 'No Discord invite · community indicated'
-                          : c.scan_status === 'COMPLETED' && c.discord_validation_status === 'COMPLETED' && !c.discord_candidate_locator && !c.discord_invite && !communityIntent.present
+                          : c.scan_status === 'COMPLETED' && c.discord_validation_status === 'COMPLETED' && !c.discord_candidate_locator && !c.discord_invite && !communityIntent.present && !c.discord_duplicate_owner_channel_id
                           ? 'Clean inspection · no community found'
                           : 'Not discovered'}
                       </div>

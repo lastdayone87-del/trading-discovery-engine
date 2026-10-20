@@ -34,6 +34,9 @@ test('host boundary: embedded discord.gg paths, lookalike hosts, and word fragme
     'https://evil-discord.gg/room123',
     'https://example.com/discord.gg/room123',
     'https://snapchat.com/add/discord.gg/room123',
+    'https://example.com/redirect?target=https://discord.gg/fakecode',
+    'https://example.com/redirect?target=discord.gg/fakecode',
+    'https://example.com/redirect?next=&target=discord.gg/fakecode',
   ]) {
     assert.deepEqual(codeOf(input), [], input);
   }
@@ -67,6 +70,8 @@ test('unparseable bare legacy foundInvite values never become candidates', () =>
 test('entity and dot obfuscation decode to real invites; obfuscation never invents codes', () => {
   assert.deepEqual(codeOf('Join discord&#46;gg/entityroom'), ['entityroom']);
   assert.deepEqual(codeOf('Join discord[.]gg/dotroom'), ['dotroom']);
+  assert.deepEqual(codeOf('Join discord[.]com/invite/dotcomroom'), ['dotcomroom'], 'bracketed .com keeps the host suffix');
+  assert.deepEqual(codeOf('Join discord[.]app/invite/dotapproom'), ['dotapproom'], 'bracketed .app keeps the host suffix');
   assert.deepEqual(codeOf('Join discord\uFF0Egg/dotroom'), [], 'full-width dot is not decoded into a host');
 });
 

@@ -105,7 +105,7 @@ import { canContinueCommunityInspectionAfterDegradedManualClassification } from 
 import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_RETRY_REASON, FOUND_GAP_RETRYABLE_FAILURE_CLASSES, buildCommunityRetryJobMetadata, isAttemptFreeCommunityFailure, attemptFreeDiscordValidation, retryAtFromUnknown, retryReasonFromError, type CommunityRetryDirective} from './communityRetryPolicy';
 import { classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
 import { discordCandidateCompositeRank } from './discordOwnershipSelection';
-import { admitDiscordCandidates, buildLegacyDiscordCandidate, canonicalDiscordInviteId, discordInviteCodeOf, type DiscordCandidate } from './discordCandidates';
+import { admitDiscordCandidates, buildLegacyDiscordCandidate, canonicalDiscordInviteId, discordInviteCodeOf, extractDiscordInviteCodeRaw, inferDiscordOwnership, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
 import { processPendingStagedCandidates } from './candidateStaging';
 
 const WORKER_ID = `worker_${process.pid}`;
@@ -296,7 +296,7 @@ export async function admitInspectionDiscordCandidates(
     removeLosers: (targetChannelId, codes, candidateIds, onlyNewerThan) => deleteDiscordCandidates(targetChannelId, codes, candidateIds, onlyNewerThan),
     executionNow: () => getDbStatementNow(),
   },
-): Promise<{ candidates: DiscordCandidate[]; discoveredInvite: string | null; discardedCount: number }> {
+): Promise<{ candidates: DiscordCandidate[]; discoveredInvite: string | null; discardedCount: number; discardedOwnerChannelIds: string[] }> {
   const toPersist = (list: DiscordCandidate[]) => list.map(candidate => ({
     candidateId: candidate.candidateId,
     rawLocator: candidate.rawLocator,
@@ -325,6 +325,12 @@ export async function admitInspectionDiscordCandidates(
     if (code && !claimSources.has(code)) claimSources.set(code, { surface: candidate.sourceSurface || null, url: candidate.sourceUrl || null });
   }
   const inviteClaims = await deps.claim([...claimSources.entries()].map(([code, src]) => ({ code, sourceSurface: src.surface, sourceUrl: src.url })), channelId);
+  // Provenance only: owner ids of codes this inspection found but could not
+  // claim. The code itself is deliberately not persisted on the affected
+  // channel (no invite assignment, no candidate row).
+  const discardedOwnerChannelIds = inviteClaims
+    .filter(claim => !claim.admitted && claim.firstChannelId && claim.firstChannelId !== channelId)
+    .map(claim => String(claim.firstChannelId));
   let admittedCodes = new Set(inviteClaims.filter(claim => claim.admitted).map(claim => claim.code));
   let admission = admitDiscordCandidates(structuredCandidates, foundInvite, admittedCodes);
   // A trail-level foundInvite naming a code outside the structured set is
@@ -342,13 +348,14 @@ export async function admitInspectionDiscordCandidates(
         admittedCodes = new Set([...admittedCodes, foundCode]);
         admission = admitDiscordCandidates(structuredCandidates, foundInvite, admittedCodes);
       } else {
+        if (legacyClaim.firstChannelId && legacyClaim.firstChannelId !== channelId) discardedOwnerChannelIds.push(String(legacyClaim.firstChannelId));
         await deps.removeLosers(channelId, [foundCode], [legacyFallback.candidateId], provisionalSince);
       }
     }
   }
   const loserCodes = [...claimSources.keys()].filter(code => !admittedCodes.has(code));
   if (loserCodes.length) await deps.removeLosers(channelId, loserCodes, provisionalIdsForCode(new Set(loserCodes)), provisionalSince);
-  return { candidates: admission.candidates, discoveredInvite: admission.discoveredInvite, discardedCount: admission.discardedCount };
+  return { candidates: admission.candidates, discoveredInvite: admission.discoveredInvite, discardedCount: admission.discardedCount, discardedOwnerChannelIds: [...new Set(discardedOwnerChannelIds)] };
 }
 /**
  * Orphan drain (E6). Candidates persisted by an execution that never reached
@@ -388,18 +395,25 @@ export async function drainOrphanDiscordCandidates(
   for (const row of rows) {
     const code = discordInviteCodeOf(row.canonicalCode || row.normalizedLocator);
     if (!code || !admitted.has(code)) { if (row.candidateId) loserIds.push(row.candidateId); continue; }
-    candidates.push({
+    // Preserve the original-case invite code for validation (Discord codes are
+    // case-sensitive) and re-derive ownership from the persisted observations.
+    // The registry claim above intentionally uses the lowercase key only.
+    const nativeInviteCode = extractDiscordInviteCodeRaw(row.rawLocator)
+      || extractDiscordInviteCodeRaw(row.normalizedLocator)
+      || code;
+    const recovered: DiscordCandidate = {
       candidateId: row.candidateId,
       canonicalInviteId: canonicalDiscordInviteId(code),
       locatorType: (row.locatorType as DiscordCandidate['locatorType']) || 'NATIVE_INVITE',
       sourceSurface: (row.sourceSurface as DiscordCandidate['sourceSurface']) || 'CHANNEL_EXTERNAL_LINKS',
       rawLocator: row.rawLocator || row.normalizedLocator,
       normalizedLocator: row.normalizedLocator,
-      nativeInviteCode: code,
+      nativeInviteCode,
       sourceUrl: row.sourceUrl || undefined,
       extractionConfidence: 'EXPLICIT',
       observations: row.observations as DiscordCandidate['observations'],
-    });
+    };
+    candidates.push({...recovered,...inferDiscordOwnership(recovered)});
   }
   const removed = loserIds.length ? await deps.removeOrphans(channelId, loserIds) : 0;
   return { candidates, removed };
@@ -1652,6 +1666,7 @@ export async function inspectAndValidateChannel(
       socialLinks: rawDetails?.channelLinks || [],
       youtubeUrl: channel.youtube_url,
       forceLiveFetch: isManualScan || !rawDetails?.description,
+      scanAttempts: channel.scan_attempts,
       bypassBorrowedCoverage: resolveBorrowBypassForInspectionMarker(executionMarker)
     });
     if(inspection.acquisitionOutcomes?.length)await appendExternalAcquisitionObservations(channel.channel_id,inspection.acquisitionOutcomes)
@@ -1718,14 +1733,17 @@ export async function inspectAndValidateChannel(
     // production passes the real implementations below.
     const structuredCandidates=(inspection.discordCandidates||[]).filter(candidate=>!!discordInviteCodeOf(candidate.nativeInviteCode));
     let chokeAdmission=await admitInspectionDiscordCandidates(structuredCandidates,inspection.foundInvite,channel.channel_id);
-    if(chokeAdmission.discardedCount)console.info(JSON.stringify({event:'discord_duplicate_discarded',channelId:channel.channel_id,discardedCount:chokeAdmission.discardedCount,timestamp:new Date().toISOString()}));
+    // Provenance-only duplicate record: owner channel id, never the invite
+    // code. A clean/own-invite inspection clears stale duplicate evidence.
+    channel.discord_duplicate_owner_channel_id = chokeAdmission.discardedOwnerChannelIds[0] || null;
+    if(chokeAdmission.discardedCount)console.info(JSON.stringify({event:'discord_duplicate_discarded',channelId:channel.channel_id,discardedCount:chokeAdmission.discardedCount,discardedOwnerChannelIds:chokeAdmission.discardedOwnerChannelIds,timestamp:new Date().toISOString()}));
     admittedInspection={...inspection,discordCandidates:chokeAdmission.candidates,foundInvite:chokeAdmission.discoveredInvite};
 
     // Durable cache handshake (E2): admission committed for this channel, so
     // its candidate-bearing cache rows become reusable coverage again.
     // Best-effort by design — a failure leaves rows PENDING, which only
     // forces an idempotent recrawl/re-admission, never a silent loss.
-    await markSiteInspectionsClaimed(channel.channel_id).catch(()=>undefined);
+    await markSiteInspectionsClaimed(channel.channel_id,chokeAdmission.candidates.map(candidate=>candidate.candidateId)).catch(()=>undefined);
 
     // Orphan drain (E6): a candidate persisted by an execution that crashed
     // before its claim has no validation attempt and no path back into
@@ -1737,10 +1755,17 @@ export async function inspectAndValidateChannel(
       console.warn(JSON.stringify({event:'orphan_candidate_drain_failed',channelId:channel.channel_id,error:error instanceof Error?error.message:String(error),timestamp:new Date().toISOString()}));
       return {candidates:[] as DiscordCandidate[],removed:0};
     });
-    if(orphanDrain.candidates.length){
-      chokeAdmission={...chokeAdmission,candidates:[...chokeAdmission.candidates,...orphanDrain.candidates],discoveredInvite:chokeAdmission.discoveredInvite||orphanDrain.candidates[0]?.nativeInviteCode||null};
+    // An orphan row can be the same candidate this execution just persisted
+    // (and already admitted). Merge by canonical invite rather than appending
+    // it, so one invite is never validated twice and the original-case code
+    // cannot be replaced by the orphan's lowercase value.
+    const admittedIds=new Set(chokeAdmission.candidates.map(candidate=>candidate.candidateId));
+    const freshOrphans=orphanDrain.candidates.filter(candidate=>!admittedIds.has(candidate.candidateId));
+    if(freshOrphans.length){
+      const merged=mergeDiscordCandidates([...chokeAdmission.candidates,...freshOrphans],{creatorName:channel.channel_name});
+      chokeAdmission={...chokeAdmission,candidates:merged,discoveredInvite:chokeAdmission.discoveredInvite||merged[0]?.nativeInviteCode||null};
       admittedInspection={...inspection,discordCandidates:chokeAdmission.candidates,foundInvite:chokeAdmission.discoveredInvite};
-      console.info(JSON.stringify({event:'orphan_candidates_drained',channelId:channel.channel_id,count:orphanDrain.candidates.length,removed:orphanDrain.removed,timestamp:new Date().toISOString()}));
+      console.info(JSON.stringify({event:'orphan_candidates_drained',channelId:channel.channel_id,count:freshOrphans.length,removed:orphanDrain.removed,timestamp:new Date().toISOString()}));
     } else if(orphanDrain.removed){
       console.info(JSON.stringify({event:'orphan_candidate_residue_removed',channelId:channel.channel_id,removed:orphanDrain.removed,timestamp:new Date().toISOString()}));
     }
@@ -1875,7 +1900,10 @@ export async function inspectAndValidateChannel(
     // Preserve any structured discovery even when validation or later
     // processing throws. If the choke-point claim itself failed, fall back to
     // the raw inspection (pre-existing behavior): this must run before catch
-    // persistence and retry.
+    // persistence and retry. Community intent is independent evidence and is
+    // merged here too, otherwise a failure after inspection would erase a
+    // Whop/Skool/Circle/Patreon surface from the persisted channel.
+    applyCommunityIntentEvidence(channel, inspection?.communityIntent);
     reconcileDiscordDiscoveryFromInspection(channel,admittedInspection??inspection,{validationProjected:false});
     attemptFree=isAttemptFreeCommunityFailure(err);
     retryDirective=attemptFree?{attemptFree:true,code:COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,reason:String(err?.message||err),retryAt:retryAtFromUnknown(err),retryReason:retryReasonFromError(err)}:undefined;
@@ -2019,12 +2047,12 @@ export function detectPendingDiscoveryWork(
   const reasons: string[] = [];
   const locator = typeof channel.discord_candidate_locator === 'string' ? channel.discord_candidate_locator.trim() : '';
   const validationStatus = String(channel.discord_validation_status || '');
-  // A stored locator whose validation never reached a terminal verdict owns
-  // pending work regardless of how this inspection resolved.
+  // A stored locator owns pending work only while validation is genuinely
+  // unfinished. FAILED_OPERATIONAL is a terminal operational verdict; treating
+  // it as unfinished would reopen an exhausted retry forever.
   const locatorUnvalidated = !!locator && (
     validationStatus === 'RETRY_PENDING' ||
-    validationStatus === 'NOT_STARTED' ||
-    (channel.discord_discovery_status === 'DISCOVERED_VALIDATION_FAILED' && validationStatus !== 'COMPLETED' && validationStatus !== 'SUCCEEDED')
+    validationStatus === 'NOT_STARTED'
   );
   if (locatorUnvalidated) reasons.push('locator-unvalidated');
   if (shouldScheduleFoundGapAcquisitionRetry(inspection)) reasons.push('found-gap-retry');
@@ -2063,8 +2091,18 @@ export async function projectNotFoundAfterInspection(
         }
         channel.scan_status='FAILED';
         reconcileDiscordDiscoveryFromInspection(channel,admittedInspection,{validationProjected:false});
-        if(scheduleRetry&&inspection?.retryDirective&&typeof inspection.retryDirective==='object')await enqueue(channel.channel_id,inspection.retryDirective);
-        else if(scheduleRetry&&shouldScheduleFoundGapAcquisitionRetry(inspection))await enqueue(channel.channel_id,inspection.retryDirective);
+        // Pending work must always own a durable job. A locator/NOT_STARTED
+        // or required-retryable observation may not have produced an
+        // inspection directive, so fall back to a bounded retry directive
+        // rather than leaving pending state with no worker to consume it.
+        const pendingDirective:CommunityRetryDirective|undefined=inspection?.retryDirective||
+          (scheduleRetry?{
+            attemptFree:true,
+            code:COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,
+            reason:`Pending discovery work: ${pendingWork.reasons.join(', ')}`,
+            retryReason:COMMUNITY_RETRY_REASON.COMMUNITY_REQUIRED_ACQUISITION_FAILURE,
+          }:undefined);
+        if(scheduleRetry&&pendingDirective)await enqueue(channel.channel_id,pendingDirective);
         channel.last_checked=new Date().toISOString();
         return;
       }

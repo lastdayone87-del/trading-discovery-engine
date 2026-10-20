@@ -26,9 +26,11 @@ const PLATFORM_BY_BASE_HOST: Record<string, CommunityPlatform> = {
 /** Maps a hostname (with or without `www.`, optionally a tenant subdomain) to
  * its community platform, or null when the host is not a known surface. */
 export function communityPlatformForHost(host: string): CommunityPlatform | null {
-  const normalized = String(host || '').trim().toLowerCase().replace(/^www\./, '').split(':')[0];
+  const normalized = String(host || '').trim().toLowerCase().split(':')[0].replace(/\.$/, '').replace(/^www\./, '');
   if (!normalized) return null;
-  const direct = PLATFORM_BY_BASE_HOST[normalized];
+  // Object.hasOwn prevents prototype keys ("constructor", "__proto__") from
+  // being mistaken for platform entries.
+  const direct = Object.hasOwn(PLATFORM_BY_BASE_HOST, normalized) ? PLATFORM_BY_BASE_HOST[normalized] : null;
   if (direct) return direct;
   for (const [base, platform] of Object.entries(PLATFORM_BY_BASE_HOST)) {
     if (normalized.endsWith(`.${base}`)) return platform;
@@ -41,12 +43,13 @@ export function communityPlatformForHost(host: string): CommunityPlatform | null
 export const PAID_SIGNAL_DETECTORS: Array<{ name: string; pattern: RegExp }> = [
   { name: 'price', pattern: /\$\s?\d+(?:[.,]\d+)?|\b(?:usd|eur|gbp)\s?\d+(?:[.,]\d+)?\b/i },
   { name: 'per-month', pattern: /\/\s?(?:mo|month)\b|\bper\s+month\b|\bmonthly\b/i },
-  // Only the product word ("membership(s)") is a paid signal; bare
-  // "members"/"members only" is an access gate (PRIVATE), not a price.
-  { name: 'membership', pattern: /\bmemberships?\b/i },
-  { name: 'subscription', pattern: /\bsubscri(?:be|ber|ption)\b/i },
-  { name: 'premium', pattern: /\bpremium\b/i },
-  { name: 'paid-access', pattern: /\bpaid\b|\bpaywall\b|\bunlock\b/i },
+  // Bare "members"/"members only" is an access gate (PRIVATE), not a price.
+  // A membership product word needs a paid/tier qualifier or fee noun; bare
+  // "membership" can describe a free community.
+  { name: 'membership', pattern: /\b(?:vip|paid|premium|exclusive|monthly|annual)\s+memberships?\b|\bmemberships?\s+(?:fee|price|cost|plan|tier)\b/i },
+  { name: 'subscription', pattern: /\b(?:vip|paid|premium|monthly|annual)\s+subscri(?:be|ber|ption)\b|\bsubscri(?:be|ber|ption)\s+(?:fee|price|cost|plan|tier)\b/i },
+  { name: 'premium', pattern: /\bpremium\s+(?:access|membership|community|content|plan|tier)\b/i },
+  { name: 'paid-access', pattern: /\bpaywall\b|\bpaid\s+(?:access|membership|community|plan|tier)\b/i },
 ];
 
 /** Explicit access-gate wording: PRIVATE is claimed only on direct gates. */
@@ -94,14 +97,35 @@ export interface CommunityIntentScanInput {
   confirmedPaywall?: boolean;
 }
 
+/** Text a visitor can actually see. Script/style/comment bodies are not page
+ * copy and must never contribute paid/private signals (a membership SDK in a
+ * <script> is not a paywall). Structured-data detection still reads raw HTML
+ * separately. */
+function visiblePageText(html: string): string {
+  return String(html || '')
+    .replace(/<script\b[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style\b[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript\b[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&(?:nbsp|amp|lt|gt|quot|#39);/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 /** Anchor scan (href + visible text) without pulling a full DOM parser: the
- * crawler already parses anchors separately; this module stays standalone. */
+ * crawler already parses anchors separately; this module stays standalone.
+ * Attribute parsing requires whitespace/start before `href`, so `data-href`
+ * is not mistaken for a link, and supports quoted or unquoted values. */
 function pageAnchors(html: string): Array<{ href: string; text: string }> {
   const anchors: Array<{ href: string; text: string }> = [];
-  const pattern = /<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  const pattern = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
   for (const match of html.matchAll(pattern)) {
+    const hrefMatch = match[1].match(/(?:^|\s)href\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/i);
+    const href = hrefMatch?.[1] ?? hrefMatch?.[2] ?? hrefMatch?.[3] ?? '';
+    if (!href) continue;
     const text = match[2].replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-    anchors.push({ href: match[1], text });
+    anchors.push({ href, text });
   }
   return anchors;
 }
@@ -116,6 +140,7 @@ function pageAnchors(html: string): Array<{ href: string; text: string }> {
  */
 export function extractCommunityIntentEvidence(input: CommunityIntentScanInput): CommunityIntentEvidence[] {
   const html = String(input.html || '');
+  const pageText = visiblePageText(html);
   const observedAt = input.observedAt || new Date().toISOString();
   const found = new Map<string, CommunityIntentEvidence>();
 
@@ -127,10 +152,10 @@ export function extractCommunityIntentEvidence(input: CommunityIntentScanInput):
     if (!platform) return;
     parsed.hash = '';
     const communityUrl = parsed.toString();
-    const paid = pageLevel ? detectPaidSignals(html) : detectPaidSignals(contextText);
+    const paid = pageLevel ? detectPaidSignals(pageText) : detectPaidSignals(contextText);
     if (pageLevel && hasPaidStructuredData(html) && !paid.includes('structured-data-paid')) paid.push('structured-data-paid');
     if (pageLevel && input.confirmedPaywall && !paid.includes('paywall')) paid.push('paywall');
-    const privateSignals = pageLevel ? detectPrivateSignals(html) : detectPrivateSignals(contextText);
+    const privateSignals = pageLevel ? detectPrivateSignals(pageText) : detectPrivateSignals(contextText);
     const intent = classifyCommunityIntent({ paid, private: privateSignals });
     const evidence: CommunityIntentEvidence = {
       communityPlatform: platform,
@@ -191,9 +216,17 @@ export function mergeCommunityIntentEvidence(
       privateSignals: [...new Set([...(prior.privateSignals || []), ...(item.privateSignals || [])])],
     });
   }
-  return [...byUrl.values()]
-    .sort((a, b) => (b.observedAt || '').localeCompare(a.observedAt || ''))
-    .slice(0, Math.max(1, max));
+  const sorted = [...byUrl.values()]
+    .sort((a, b) => (b.observedAt || '').localeCompare(a.observedAt || ''));
+  const capped = sorted.slice(0, Math.max(1, max));
+  // Recency must not evict the strongest paid evidence: a paid surface older
+  // than the cap still proves the creator runs a paid community. Replace the
+  // oldest retained slot with the newest paid record when none survived.
+  if (capped.length && !capped.some(item => item.intent === 'PAID')) {
+    const paid = sorted.find(item => item.intent === 'PAID');
+    if (paid) capped[capped.length - 1] = paid;
+  }
+  return capped;
 }
 
 /**

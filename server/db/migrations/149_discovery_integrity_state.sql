@@ -1,4 +1,4 @@
--- Migration 148: discovery-integrity state additions (P1-P4).
+-- Migration 149: discovery-integrity state additions (P1-P4).
 --
 -- Additive columns only; no backfills, no constraint validation, no data
 -- deletion, safe inside the single-transaction runner (matching 134/146/147).
@@ -14,6 +14,8 @@
 --      coverage), DISCARDED (terminal). Candidate-bearing rows in NONE/
 --      PENDING are never reusable: a crash between persist and admission
 --      must force an idempotent recrawl, never a silent loss.
+--    - community_intents: platform-community evidence observed while
+--      inspecting the site, stored so a cache hit cannot erase intent.
 --
 -- 2. channels community-intent state (P4):
 --    - community_discovery_status: NONE when no platform-community surface
@@ -26,12 +28,21 @@
 --    - community_intents: evidence array (platform, URL, intent kind,
 --      signals, observation provenance). Extraction-only: never an invite,
 --      never a registry claim, never validated.
+--    - discord_duplicate_owner_channel_id: non-null only when this channel
+--      discovered an invite whose canonical registry claim belongs to another
+--      channel. It records the owner channel id and nothing else: no code,
+--      no candidate row, no assignment, no ownership transfer.
 
 ALTER TABLE site_inspections ADD COLUMN IF NOT EXISTS source_channel_id TEXT;
 ALTER TABLE site_inspections ADD COLUMN IF NOT EXISTS claim_status TEXT NOT NULL DEFAULT 'NONE';
 DO $$ BEGIN
   ALTER TABLE site_inspections ADD CONSTRAINT site_inspections_claim_status_check
-    CHECK (claim_status IN ('NONE','PENDING','CLAIMED','DISCARDED'));
+    CHECK (claim_status IN ('NONE','PENDING','CLAIMED','DISCARDED')) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+ALTER TABLE site_inspections ADD COLUMN IF NOT EXISTS community_intents JSONB NOT NULL DEFAULT '[]'::jsonb;
+DO $$ BEGIN
+  ALTER TABLE site_inspections ADD CONSTRAINT site_inspections_community_intents_array_check
+    CHECK (jsonb_typeof(community_intents) = 'array') NOT VALID;
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 CREATE INDEX IF NOT EXISTS idx_site_inspections_source_channel
   ON site_inspections(source_channel_id, claim_status) WHERE source_channel_id IS NOT NULL;
@@ -39,22 +50,30 @@ CREATE INDEX IF NOT EXISTS idx_site_inspections_source_channel
 ALTER TABLE channels ADD COLUMN IF NOT EXISTS community_discovery_status TEXT NOT NULL DEFAULT 'NONE';
 DO $$ BEGIN
   ALTER TABLE channels ADD CONSTRAINT channels_community_discovery_status_check
-    CHECK (community_discovery_status IN ('NONE','COMMUNITY_INDICATED_NO_INVITE','PAID_COMMUNITY_INDICATED'));
+    CHECK (community_discovery_status IN ('NONE','COMMUNITY_INDICATED_NO_INVITE','PAID_COMMUNITY_INDICATED')) NOT VALID;
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 ALTER TABLE channels ADD COLUMN IF NOT EXISTS community_intents JSONB NOT NULL DEFAULT '[]'::jsonb;
 DO $$ BEGIN
   ALTER TABLE channels ADD CONSTRAINT channels_community_intents_array_check
-    CHECK (jsonb_typeof(community_intents) = 'array');
+    CHECK (jsonb_typeof(community_intents) = 'array') NOT VALID;
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+ALTER TABLE channels ADD COLUMN IF NOT EXISTS discord_duplicate_owner_channel_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_channels_discord_duplicate_owner
+  ON channels(discord_duplicate_owner_channel_id)
+  WHERE discord_duplicate_owner_channel_id IS NOT NULL;
 
 COMMENT ON COLUMN site_inspections.source_channel_id IS
   'Channel whose inspection wrote this row (same-owner recovery + claim handshake only; never ownership transfer).';
 COMMENT ON COLUMN site_inspections.claim_status IS
   'Candidate claim handshake: NONE/PENDING rows with candidates are never reusable coverage.';
+COMMENT ON COLUMN site_inspections.community_intents IS
+  'Platform-community evidence observed while inspecting this site; replayed on cache hits, never an invite.';
 COMMENT ON COLUMN channels.community_discovery_status IS
   'P4 platform-community intent: community observed without a verified Discord invite is never "no community found".';
 COMMENT ON COLUMN channels.community_intents IS
   'P4 evidence array for observed Whop/Skool/Circle/Patreon surfaces; extraction-only, never an invite.';
+COMMENT ON COLUMN channels.discord_duplicate_owner_channel_id IS
+  'Invite found but owned by another channel: owner channel id only; code/candidate/assignment are never stored here.';
 
 -- 3. Explicit recovery audit (P3 item 12): every candidate recovered from
 --    cache or historical evidence gets an explicit row. Recovery re-enters the

@@ -24,19 +24,25 @@ test('migration 149 is present and sorts after every earlier migration', () => {
 });
 
 test('migration 149 is additive-only (no drops, deletes, or rewrites)', () => {
-  const statements = migration.replace(/COMMENT ON[^;]+;/g, '').split(';').map(part => part.trim()).filter(Boolean);
+  // Strip comments and reject destructive keywords anywhere in a fragment,
+  // not only at the fragment start: ALTER TABLE ... DROP, DO blocks, and
+  // comment-hidden statements must all fail the guard.
+  const withoutComments = migration
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/--[^\n]*/g, ' ');
+  const statements = withoutComments.replace(/COMMENT ON[^;]+;/g, '').split(';').map(part => part.trim()).filter(Boolean);
   assert.ok(statements.length > 0);
   for (const statement of statements) {
-    assert.doesNotMatch(statement, /^\s*DROP\b/i, `destructive statement: ${statement.slice(0, 80)}`);
-    assert.doesNotMatch(statement, /^\s*DELETE\b/i, `destructive statement: ${statement.slice(0, 80)}`);
-    assert.doesNotMatch(statement, /^\s*UPDATE\b/i, `destructive statement: ${statement.slice(0, 80)}`);
-    assert.doesNotMatch(statement, /^\s*TRUNCATE\b/i, `destructive statement: ${statement.slice(0, 80)}`);
+    assert.doesNotMatch(statement, /\b(?:DROP|DELETE|TRUNCATE|UPDATE)\b/i, `destructive statement: ${statement.slice(0, 80)}`);
   }
   assert.match(migration, /ALTER TABLE site_inspections ADD COLUMN IF NOT EXISTS source_channel_id TEXT;/);
   assert.match(migration, /ALTER TABLE site_inspections ADD COLUMN IF NOT EXISTS claim_status TEXT NOT NULL DEFAULT 'NONE';/);
   assert.match(migration, /ALTER TABLE channels ADD COLUMN IF NOT EXISTS community_discovery_status TEXT NOT NULL DEFAULT 'NONE';/);
   assert.match(migration, /ALTER TABLE channels ADD COLUMN IF NOT EXISTS community_intents JSONB NOT NULL DEFAULT '\[\]'::jsonb;/);
+  assert.match(migration, /ALTER TABLE channels ADD COLUMN IF NOT EXISTS discord_duplicate_owner_channel_id TEXT;/);
   assert.match(migration, /CREATE TABLE IF NOT EXISTS discovery_recovery_audit/);
+  assert.match(migration, /ALTER TABLE site_inspections ADD CONSTRAINT site_inspections_claim_status_check[\s\S]*?NOT VALID;/);
+  assert.match(migration, /ALTER TABLE channels ADD CONSTRAINT channels_community_discovery_status_check[\s\S]*?NOT VALID;/);
 });
 
 test('claim-status constraint matches the runtime handshake states', () => {
@@ -63,16 +69,21 @@ test('recovery audit table records source, channel, candidate ids, and counts', 
 });
 
 test('dbCore writes and reads the same claim/community column names', () => {
-  assert.match(dbCore, /INSERT INTO site_inspections\(site_identity,identity_tier,identity_basis,canonical_url,final_url,outcome,retryable,http_status,failure_class,detail,payload_checksum,candidates,observations,rendered_covered,source_channel_id,claim_status,provenance,/);
-  assert.match(dbCore, /UPDATE site_inspections SET claim_status='CLAIMED' WHERE source_channel_id=\$1 AND claim_status='PENDING'/);
+  assert.match(dbCore, /INSERT INTO site_inspections\(site_identity,identity_tier,identity_basis,canonical_url,final_url,outcome,retryable,http_status,failure_class,detail,payload_checksum,candidates,observations,rendered_covered,source_channel_id,claim_status,community_intents,provenance,/);
+  assert.match(dbCore, /UPDATE site_inspections SET claim_status='CLAIMED'[\s\S]*?WHERE source_channel_id=\$1 AND claim_status='PENDING'/);
   assert.match(dbCore, /sourceChannelId: typeof item\.source_channel_id === 'string' \? item\.source_channel_id : null,/);
   assert.match(dbCore, /claimStatus: text\(item\.claim_status\),/);
 });
 
-test('claim handshake only flips PENDING rows for the recording channel', () => {
+test('claim handshake only flips PENDING rows for the recording channel and admitted candidates', () => {
   // A CLAIMED/DISCARDED row is terminal; an unclaimed (NONE) row is never
   // promoted, because NONE with candidates must keep forcing a recrawl.
   assert.match(siteCache, /export const SITE_INSPECTION_CLAIM_STATUS = \{/);
   assert.match(dbCore, /WHERE source_channel_id=\$1 AND claim_status='PENDING'/);
+  assert.match(dbCore, /candidate->>'candidateId' = ANY\(\$2::text\[\]\)/);
   assert.match(siteCache, /if \(row\.claimStatus !== SITE_INSPECTION_CLAIM_STATUS\.CLAIMED && row\.claimStatus !== SITE_INSPECTION_CLAIM_STATUS\.DISCARDED\) return false;/);
+});
+
+test('site-cache upsert preserves an unadmitted candidate-bearing PENDING payload', () => {
+  assert.match(dbCore, /site_inspections\.claim_status='PENDING' AND jsonb_array_length\(site_inspections\.candidates\)>0 AND jsonb_array_length\(excluded\.candidates\)=0 THEN site_inspections\.candidates/);
 });

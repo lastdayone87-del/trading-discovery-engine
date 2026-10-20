@@ -38,7 +38,7 @@ test('platform hosts map by exact host or tenant subdomain; lookalikes never mat
   assert.equal(communityPlatformForHost('www.skool.com'), 'SKOOL');
   assert.equal(communityPlatformForHost('app.circle.so'), 'CIRCLE');
   assert.equal(communityPlatformForHost('www.patreon.com'), 'PATREON');
-  for (const host of ['notwhop.com', 'example.com', 'whop.com.evil.example', 'skool.community']) {
+  for (const host of ['notwhop.com', 'example.com', 'whop.com.evil.example', 'skool.community', 'constructor', '__proto__']) {
     assert.equal(communityPlatformForHost(host), null, host);
   }
 });
@@ -49,6 +49,52 @@ test('signal detection is bounded and evidence-named', () => {
   assert.deepEqual(detectPrivateSignals('Members only content'), ['members-only']);
   assert.deepEqual(detectPrivateSignals('Sign in to continue'), ['login-required']);
   assert.deepEqual(detectPrivateSignals('a normal page'), []);
+});
+
+test('script/style bodies and bare membership wording do not fabricate paid intent', () => {
+  assert.deepEqual(detectPaidSignals('membership community'), []);
+  assert.deepEqual(detectPaidSignals('We offer a free membership'), []);
+  const evidence = extractCommunityIntentEvidence({
+    pageUrl: 'https://www.whop.com/free-room',
+    html: '<script>window.plan="premium subscription paid";</script><style>.paid{color:red}</style><p>Free community</p>',
+  });
+  assert.equal(evidence.length, 1);
+  assert.equal(evidence[0].intent, 'UNKNOWN');
+  assert.deepEqual(evidence[0].paidSignals, []);
+});
+
+test('anchor parsing ignores data-href and accepts unquoted href values', () => {
+  const evidence = extractCommunityIntentEvidence({
+    pageUrl: 'https://creator.test/',
+    html: '<a data-href="https://www.skool.com/fake">Not a link</a><a href=https://www.skool.com/real>Real community</a>',
+  });
+  const urls = evidence.map(item => item.communityUrl);
+  assert.ok(urls.includes('https://www.skool.com/real'));
+  assert.ok(!urls.includes('https://www.skool.com/fake'));
+});
+
+test('paid evidence survives the recency cap even when it is older than ten newer surfaces', () => {
+  const paid = {
+    communityPlatform: 'WHOP' as const,
+    communityUrl: 'https://www.whop.com/paid',
+    intent: 'PAID' as const,
+    paidSignals: ['price'],
+    privateSignals: [],
+    observedAt: '2026-01-01T00:00:00.000Z',
+    sourcePageUrl: 'https://www.whop.com/paid',
+    extractionConfidence: 'EXPLICIT' as const,
+  };
+  const newer = Array.from({ length: 15 }, (_, index) => ({
+    ...paid,
+    communityUrl: `https://www.skool.com/free-${index}`,
+    intent: 'UNKNOWN' as const,
+    paidSignals: [],
+    observedAt: new Date(Date.parse('2026-10-01T00:00:00.000Z') + index * 86_400_000).toISOString(),
+  }));
+  const capped = mergeCommunityIntentEvidence([paid], newer, 10);
+  assert.equal(capped.length, 10);
+  assert.ok(capped.some(item => item.intent === 'PAID'), 'paid evidence cannot be evicted by recency');
+  assert.equal(resolveCommunityDiscoveryStatus(capped), 'PAID_COMMUNITY_INDICATED');
 });
 
 test('a Whop page with price/membership evidence resolves PAID_COMMUNITY_INDICATED', () => {
@@ -159,10 +205,12 @@ test('merge keeps the strongest classification, unions signals, and caps newest-
 });
 
 test('crawlExternalLinks surfaces reached platform intent; a no-invite platform page is not "no community"', async () => {
+  const calls: string[] = [];
   const fetchImpl = (async (input: RequestInfo | URL) => {
     const url = String(input);
+    calls.push(url);
     if (url === 'https://creator.test/') {
-      return html('<a href="https://www.whop.com/creator">Join our paid community</a>');
+      return html('<a href="https://www.whop.com/creator">Join our community</a>');
     }
     if (url === 'https://www.whop.com/creator') {
       return html('<h1>VIP Trading Membership</h1><p>Members only — $49/mo</p>', url);
@@ -171,7 +219,8 @@ test('crawlExternalLinks surfaces reached platform intent; a no-invite platform 
   }) as typeof fetch;
   const result = await crawlExternalLinks(['https://creator.test/'], [], undefined, fetchImpl);
   const intents = result.communityIntent || [];
-  const whop = intents.find(item => item.communityPlatform === 'WHOP');
+  const whop = intents.find(item => item.communityPlatform === 'WHOP' && item.intent === 'PAID');
+  assert.ok(calls.includes('https://www.whop.com/creator'), 'the platform destination is actually fetched');
   assert.ok(whop, 'the reached Whop surface is recorded as intent');
   assert.equal(whop.intent, 'PAID');
   assert.ok(whop.paidSignals.length > 0, 'paid signals are attached as evidence');
