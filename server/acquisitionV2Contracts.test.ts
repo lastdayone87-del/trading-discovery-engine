@@ -19,7 +19,7 @@ import {
   enqueueCommunityAcquisitionRetry,
   projectNotFoundAfterInspection,
 } from './queueManager';
-import { crawlExternalLinks, runChannelInspection, isReusableStaticRootLender } from './inspector';
+import { buildSharedStaticRootRecord, crawlExternalLinks, runChannelInspection, isReusableStaticRootLender } from './inspector';
 import type { BrowserFallbackResult } from './browserCommunityFallback';
 
 const PAGE = 'https://creator.example.com/guide';
@@ -596,6 +596,51 @@ test('v2 review: shared static roots skip refetch but still acquire children', a
   assert.equal(rootRows.length, 1);
   assert.equal(rootRows[0].sharedEvidenceFrom, 'https://dup.example.com/');
   assert.equal(rootRows[0].telemetry?.pagesInspected, 1);
+});
+
+test('v2 review: shared static root replay carries lender community intent to the borrower', async () => {
+  const lenderIntent = {
+    communityPlatform: 'WHOP' as const,
+    communityUrl: 'https://www.whop.com/creator',
+    intent: 'UNKNOWN' as const,
+    paidSignals: [],
+    privateSignals: [],
+    observedAt: '2026-10-20T00:00:00.000Z',
+    sourcePageUrl: 'https://intent.example.com/',
+    extractionConfidence: 'EXPLICIT' as const,
+  };
+  const record = buildSharedStaticRootRecord('https://intent.example.com/', {
+    outcome: 'INSPECTED_NO_MATCH',
+    visitedUrls: ['https://intent.example.com/'],
+    rootNavigation: [],
+    communityIntent: [lenderIntent],
+  });
+  assert.ok(record, 'terminal-success lender record is built');
+  const key = normalizeVisitUrl('https://intent.example.com/');
+  assert.ok(key);
+  const borrowerFetched: string[] = [];
+  const borrower = await crawlExternalLinks(
+    ['https://intent.example.com/'],
+    [],
+    undefined,
+    (async (input) => {
+      borrowerFetched.push(String(input));
+      return noInviteHtml();
+    }) as typeof fetch,
+    'CREATOR_WEBSITES',
+    false,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    { visitedKeys: ['https://intent.example.com/'], roots: new Map([[key as string, record]]) },
+  );
+  assert.equal(borrowerFetched.length, 0, 'the shared root is not refetched');
+  assert.ok(
+    borrower.communityIntent?.some(item => item.communityPlatform === 'WHOP' && item.intent === 'UNKNOWN'),
+    'lender root community intent survives the borrow',
+  );
 });
 
 // REVIEW: bare/www collapse is port-aware.

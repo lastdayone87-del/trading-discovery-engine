@@ -97,7 +97,10 @@ test('rendered control coverage counts overflow and uses stable markers across D
   assert.match(source, /return \{ controls, total: matched\.length \}/, 'total matches are returned before the 64-item slice');
   assert.match(source, /recordControlEnumeration\(firstEnumeration\.total\)/);
   assert.match(source, /data-oc-control/);
+  assert.match(source, /partitionRenderedClickTargets\(controls, page\.url\(\), limits\.maxClicksPerPage, limits\.clickOffset\)/, 'the retry offset rotates the full pool before the cap');
   assert.match(source, /partitionRenderedClickTargets\(unqueued, page\.url\(\), limits\.maxClicksPerPage - clickedThisPage\)/, 'new controls are re-enumerated within the remaining click budget');
+  assert.match(source, /freshDropped\+\+/, 're-enumerated controls beyond the remaining budget are counted as skipped');
+  assert.match(source, /drops\.count\('control-slice', freshDropped\)/, 'revealed-control slices are recorded');
   assert.match(source, /interactionGap:interactionGap\|\|undefined/, 'throw paths retain the interaction gap');
 });
 

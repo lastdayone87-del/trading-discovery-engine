@@ -564,8 +564,9 @@ export function partitionRenderedClickTargets(
   controls: RenderedControlTarget[],
   pageUrl: string,
   maxClicks: number,
+  offset = 0,
 ): { toClick: RenderedControlTarget[]; skippedNavigableAnchors: number } {
-  const toClick: RenderedControlTarget[] = [];
+  const eligible: RenderedControlTarget[] = [];
   let skippedNavigableAnchors = 0;
   const cap = Math.max(0, Math.trunc(maxClicks) || 0);
   for (const control of controls) {
@@ -573,10 +574,17 @@ export function partitionRenderedClickTargets(
       skippedNavigableAnchors++;
       continue;
     }
-    if (toClick.length >= cap) continue;
-    toClick.push(control);
+    eligible.push(control);
   }
-  return { toClick, skippedNavigableAnchors };
+  // Rotate the complete eligible pool before applying the per-page cap. This
+  // is what lets a retry reach controls beyond the first click window; rotating
+  // the already-truncated plan would only reorder the same first controls.
+  const rawOffset = Math.trunc(offset) || 0;
+  const start = eligible.length > 0
+    ? ((rawOffset % eligible.length) + eligible.length) % eligible.length
+    : 0;
+  const rotated = start > 0 ? [...eligible.slice(start), ...eligible.slice(0, start)] : eligible;
+  return { toClick: rotated.slice(0, cap), skippedNavigableAnchors };
 }
 
 /**
@@ -1291,7 +1299,14 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // budget is reserved for controls that only a click can act on
             // (href-less buttons, fragments, JS links, cross-host targets).
             // Slice accounting covers the remainder beyond clicks and skips.
-            const clickPlan = partitionRenderedClickTargets(controls, page.url(), limits.maxClicksPerPage);
+            const clickPlan = partitionRenderedClickTargets(controls, page.url(), limits.maxClicksPerPage, limits.clickOffset);
+            const countedControlSkips = new Set<string>();
+            for (const control of controls) {
+              if (control.marker && !clickPlan.toClick.some(target => target.marker === control.marker)
+                && !isSkippableNavigableAnchorClick(control, page.url())) {
+                countedControlSkips.add(control.marker);
+              }
+            }
             const sliceDropped = Math.max(0, controls.length - clickPlan.toClick.length - clickPlan.skippedNavigableAnchors);
             if (sliceDropped > 0) {
               // Every enumerated control matched the community-evidence filter;
@@ -1329,10 +1344,6 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             }
 
             const clickTargets = [...clickPlan.toClick];
-            // Rotate the bounded budget on retries so a control beyond the
-            // first budget window can eventually be examined.
-            const rotateBy = Math.max(0, Math.trunc(limits.clickOffset || 0)) % Math.max(1, clickTargets.length);
-            if (rotateBy > 0) clickTargets.push(...clickTargets.splice(0, rotateBy));
             const queuedMarkers = new Set(clickTargets.map(target => target.marker).filter((marker): marker is string => Boolean(marker)));
             let clickedThisPage = 0;
             for (let clickIndex = 0; clickIndex < clickTargets.length; clickIndex++) {
@@ -1377,6 +1388,24 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                   recordControlEnumeration(refreshed.total);
                   const unqueued = refreshed.controls.filter(target => target.marker && !queuedMarkers.has(target.marker));
                   const freshPlan = partitionRenderedClickTargets(unqueued, page.url(), limits.maxClicksPerPage - clickedThisPage);
+                  // Newly revealed controls that do not fit the remaining click
+                  // budget were never examined. Count only genuinely new skips
+                  // (initial overflow/slice drops are already counted) and make
+                  // the interaction gap explicit so the page cannot resolve as
+                  // a clean no-match.
+                  let freshDropped = 0;
+                  for (const target of unqueued) {
+                    if (!target.marker || countedControlSkips.has(target.marker)) continue;
+                    if (freshPlan.toClick.some(planned => planned.marker === target.marker)) continue;
+                    if (isSkippableNavigableAnchorClick(target, page.url())) continue;
+                    countedControlSkips.add(target.marker);
+                    freshDropped++;
+                  }
+                  if (freshDropped > 0) {
+                    drops.count('control-slice', freshDropped);
+                    evidenceControlsSkipped += freshDropped;
+                    interactionGap = true;
+                  }
                   for (const target of freshPlan.toClick) {
                     if (!target.marker || queuedMarkers.has(target.marker)) continue;
                     queuedMarkers.add(target.marker);

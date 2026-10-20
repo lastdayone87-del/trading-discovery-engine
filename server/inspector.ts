@@ -272,13 +272,24 @@ export interface ExternalDiscordCrawlResult {foundInvite:string|null;foundLocati
  * acquire its own children. Same-inspection scope only; rendered-tier needs
  * never consult it (tier monotonicity).
  */
+export interface SharedStaticRootRecord {
+  bySeed: string;
+  finalUrl: string;
+  childLinks: Array<{ url: string; score: number }>;
+  /** Site-level Whop/Skool/Circle/Patreon evidence observed by the lender.
+   * Replayed to borrowers that reuse the lender's root bytes; never an invite
+   * and never an ownership claim. Optional for pre-existing inventories. */
+  communityIntents?: CommunityIntentEvidence[];
+  terminalSuccess?: boolean;
+}
+
 export interface SharedStaticInventory {
   visitedKeys: string[];
   // terminalSuccess marks lender records proven terminal-success at the
   // static tier. Lookup refuses explicit `false` records (truncated lenders)
   // so borrowers never inherit cut coverage; missing flags predate the gate
   // and are treated as terminal (they were fed under it).
-  roots: Map<string, { bySeed: string; finalUrl: string; childLinks: Array<{ url: string; score: number }>; terminalSuccess?: boolean }>;
+  roots: Map<string, SharedStaticRootRecord>;
 }
 
 /**
@@ -296,6 +307,32 @@ export function isReusableStaticRootLender(result: {
   if (result.outcome !== 'INSPECTED_NO_MATCH' && result.outcome !== 'FOUND') return false;
   if (!Array.isArray(result.visitedUrls) || result.visitedUrls.length === 0) return false;
   return Array.isArray(result.rootNavigation);
+}
+
+/** Builds the reusable shared-root record for a terminal-success lender.
+ * Community intent rides with the lender's root evidence because a borrower
+ * skips the root fetch entirely; dropping it here would erase a Whop/Skool/
+ * Circle/Patreon signal for every later borrower. Pure and exported so the
+ * feed and replay contracts are directly testable. */
+export function buildSharedStaticRootRecord(
+  seedUrl: string,
+  result: {
+    outcome: unknown;
+    visitedUrls?: unknown;
+    rootNavigation?: unknown;
+    communityIntent?: CommunityIntentEvidence[];
+  },
+): SharedStaticRootRecord | null {
+  if (!isReusableStaticRootLender(result)) return null;
+  const rootKey = normalizeVisitUrl(seedUrl);
+  if (!rootKey) return null;
+  return {
+    bySeed: seedUrl,
+    finalUrl: (result.visitedUrls as string[])[0],
+    childLinks: result.rootNavigation as Array<{ url: string; score: number }>,
+    communityIntents: Array.isArray(result.communityIntent) ? result.communityIntent : [],
+    terminalSuccess: true,
+  };
 }
 
 function preserveResolvedWrapperProvenance(wrapperCandidate:DiscordCandidate,nativeCandidates:DiscordCandidate[]):DiscordCandidate[]{
@@ -406,12 +443,13 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
         }));
       }catch{/* admission is best-effort persistence, never crawl behavior */}
     };
-    const lookupSharedStaticRoot=(u:string):{bySeed:string;finalUrl:string;childLinks:Array<{url:string;score:number}>;terminalSuccess?:boolean}|null=>{const key=sharedKey(u);if(!key||!sharedRoots)return null;const rec=sharedRoots.get(key)||null;if(rec&&rec.terminalSuccess===false)return null;return rec;};
+    const lookupSharedStaticRoot=(u:string):SharedStaticRootRecord|null=>{const key=sharedKey(u);if(!key||!sharedRoots)return null;const rec=sharedRoots.get(key)||null;if(rec&&rec.terminalSuccess===false)return null;return rec;};
     const sharedRoot=lookupSharedStaticRoot(url);
     let page:{html:string;finalUrl:string;truncated:boolean}|null;
     let fetchFailure:{httpStatus?:number;failureClass?:string}|undefined;
     if(sharedRoot){
       logDetails.push(`[Shared static evidence] ${url} reuses root inspection from ${sharedRoot.bySeed}; child acquisition continues below.`);
+      if(sharedRoot.communityIntents?.length)communityIntents.push(...sharedRoot.communityIntents);
       page={html:'',finalUrl:sharedRoot.finalUrl,truncated:false};
     }else{
       const acquired=await fetchExternalPage(url,fetchImpl);
@@ -1246,15 +1284,15 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   interface SharedRenderedRecord {bySeed:string;pages:number;candidatesFound:number;hintLinks:string[];complete:boolean;}
   const sharedRenderedEvidence=new Map<string,SharedRenderedRecord[]>();
   const sharedStaticVisited=new Set<string>();
-  const sharedStaticRoots=new Map<string,{bySeed:string;finalUrl:string;childLinks:Array<{url:string;score:number}>;terminalSuccess?:boolean}>();
+  const sharedStaticRoots=new Map<string,SharedStaticRootRecord>();
   // Lender feed gate: only terminal-success static roots enter the shared
   // inventory (see isReusableStaticRootLender). Truncated/incomplete lenders
   // never become reusable, so borrowers can never inherit cut coverage.
-  const feedSharedStaticRoot=(seedUrl:string,crawlRes:{outcome:unknown;visitedUrls?:unknown;rootNavigation?:unknown}):boolean=>{
-    if(!isReusableStaticRootLender(crawlRes))return false;
+  const feedSharedStaticRoot=(seedUrl:string,crawlRes:{outcome:unknown;visitedUrls?:unknown;rootNavigation?:unknown;communityIntent?:CommunityIntentEvidence[]}):boolean=>{
+    const record=buildSharedStaticRootRecord(seedUrl,crawlRes);
     const rootKey=normalizeVisitUrl(seedUrl);
-    if(!rootKey||sharedStaticRoots.has(rootKey))return false;
-    sharedStaticRoots.set(rootKey,{bySeed:seedUrl,finalUrl:(crawlRes.visitedUrls as string[])[0],childLinks:crawlRes.rootNavigation as Array<{url:string;score:number}>,terminalSuccess:true});
+    if(!record||!rootKey||sharedStaticRoots.has(rootKey))return false;
+    sharedStaticRoots.set(rootKey,record);
     return true;
   };
   // Lender gate (fail closed): only complete, non-timed-out rendered runs

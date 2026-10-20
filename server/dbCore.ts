@@ -1199,7 +1199,7 @@ export async function upsertSiteInspection(row: {
       observations=excluded.observations,rendered_covered=excluded.rendered_covered,
       source_channel_id=CASE WHEN site_inspections.claim_status='PENDING' AND jsonb_array_length(site_inspections.candidates)>0 AND jsonb_array_length(excluded.candidates)=0 THEN site_inspections.source_channel_id ELSE excluded.source_channel_id END,
       claim_status=CASE WHEN site_inspections.claim_status='PENDING' AND jsonb_array_length(site_inspections.candidates)>0 AND jsonb_array_length(excluded.candidates)=0 THEN site_inspections.claim_status ELSE excluded.claim_status END,
-      community_intents=excluded.community_intents,
+      community_intents=CASE WHEN jsonb_array_length(excluded.community_intents)=0 AND jsonb_array_length(site_inspections.community_intents)>0 THEN site_inspections.community_intents ELSE excluded.community_intents END,
       provenance=excluded.provenance,last_observed_at=now(),observed_count=site_inspections.observed_count+1`,
     [row.siteIdentity, row.identityTier || 'A', row.identityBasis || '', row.canonicalUrl, row.finalUrl || null, row.outcome, row.retryable, row.httpStatus ?? null, row.failureClass || '', row.detail || '', row.payloadChecksum || null, JSON.stringify(row.candidates || []), JSON.stringify(row.observations || []), row.renderedCovered, row.sourceChannelId || null, row.claimStatus || 'NONE', JSON.stringify(row.communityIntents || []), JSON.stringify(row.provenance || {})]);
 }

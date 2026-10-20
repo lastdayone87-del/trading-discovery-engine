@@ -48,6 +48,47 @@ maybe('site inspections upsert, read back, and converge across writers', async t
   assert.equal(await getSiteInspections([]).then(rows => rows.length), 0, 'empty input reads nothing');
 });
 
+maybe('an empty incoming intent array never erases cached root community evidence', async t => {
+  const { getDb } = await import('./dbCore');
+  const db = await getDb();
+  const INTENT_SITE = 'apex-intent-preserve.example';
+  t.after(async () => {
+    await db.query(`DELETE FROM site_inspections WHERE site_identity=$1`, [INTENT_SITE]);
+  });
+  await db.query(`DELETE FROM site_inspections WHERE site_identity=$1`, [INTENT_SITE]);
+  const intent = {
+    communityPlatform: 'WHOP', communityUrl: 'https://www.whop.com/creator',
+    intent: 'PAID', paidSignals: ['price'], privateSignals: [], observedAt: new Date().toISOString(),
+    sourcePageUrl: `https://${INTENT_SITE}/`, extractionConfidence: 'EXPLICIT',
+  };
+  await upsertSiteInspection({
+    siteIdentity: INTENT_SITE, identityTier: 'A', identityBasis: 'test',
+    canonicalUrl: `https://${INTENT_SITE}/`, outcome: 'FOUND', retryable: false,
+    candidates: [], observations: [{ outcome: 'FOUND' }], communityIntents: [intent],
+    renderedCovered: false, provenance: {},
+  });
+  await upsertSiteInspection({
+    siteIdentity: INTENT_SITE, identityTier: 'A', identityBasis: 'test',
+    canonicalUrl: `https://${INTENT_SITE}/`, outcome: 'INSPECTED_NO_MATCH', retryable: false,
+    candidates: [], observations: [{ outcome: 'INSPECTED_NO_MATCH' }], communityIntents: [],
+    renderedCovered: false, provenance: {},
+  });
+  const preserved = await getSiteInspections([INTENT_SITE]);
+  assert.equal(preserved[0].communityIntents?.length, 1, 'empty refresh preserves the lender root intent');
+  assert.equal((preserved[0].communityIntents?.[0] as { intent?: string }).intent, 'PAID');
+  // A non-empty fresh intent still replaces the stale evidence.
+  await upsertSiteInspection({
+    siteIdentity: INTENT_SITE, identityTier: 'A', identityBasis: 'test',
+    canonicalUrl: `https://${INTENT_SITE}/`, outcome: 'INSPECTED_NO_MATCH', retryable: false,
+    candidates: [], observations: [{ outcome: 'INSPECTED_NO_MATCH' }],
+    communityIntents: [{ ...intent, communityUrl: 'https://www.skool.com/creator', intent: 'UNKNOWN' }],
+    renderedCovered: false, provenance: {},
+  });
+  const replaced = await getSiteInspections([INTENT_SITE]);
+  assert.equal(replaced[0].communityIntents?.length, 1);
+  assert.equal((replaced[0].communityIntents?.[0] as { communityUrl?: string }).communityUrl, 'https://www.skool.com/creator');
+});
+
 maybe('creator associations record per creator without touching site rows', async t => {
   const { getDb } = await import('./dbCore');
   const db = await getDb();
