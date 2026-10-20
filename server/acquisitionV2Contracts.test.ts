@@ -773,7 +773,7 @@ test('v2 review: scheduler and worker wiring call sites are pinned', () => {
   // Capture the original page's anchors before any control click can navigate
   // the document away; the post-click enqueue then covers JS-revealed links.
   const enqueuePos = fallback.indexOf("await enqueueLinks({ strategy: 'same-hostname'");
-  const clickPos = fallback.indexOf('const clickTargets = [...clickPlan.toClick];');
+  const clickPos = fallback.indexOf('const clickLoop = await runRenderedClickLoop({');
   const postClickEnqueuePos = fallback.indexOf("await enqueueLinks({strategy:'same-hostname'", clickPos);
   assert.ok(enqueuePos !== -1 && clickPos !== -1 && enqueuePos < clickPos, 'anchors enqueue before navigating clicks');
   assert.ok(postClickEnqueuePos > clickPos, 'JS-revealed anchors enqueue after clicks');
