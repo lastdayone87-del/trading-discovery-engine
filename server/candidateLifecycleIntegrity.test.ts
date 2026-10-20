@@ -27,6 +27,7 @@ import {
   type CachedSiteInspection,
 } from './siteInspectionCache';
 import { admitInspectionDiscordCandidates, drainOrphanDiscordCandidates, inspectionClickOffsetForRetry, nextDiscordDuplicateOwnerChannelId, projectNotFoundAfterInspection } from './queueManager';
+import { nextRenderedClickOffsets } from './inspector';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import type { DiscordCandidate } from './discordCandidates';
@@ -211,17 +212,33 @@ test('cache-only scans preserve duplicate-owner provenance until fresh processed
   }), 'owner-new', 'a fresh duplicate replaces the saved owner even on a mostly cached scan');
 });
 
-test('gap retries advance the click window from durable job attempts despite scan_attempts reset', () => {
-  const retry = (attemptNumber: number) => ({
-    attemptNumber,
-    isRetryOwnedReacquire: true,
-  });
+test('gap retries advance only by controls actually examined', () => {
   assert.equal(inspectionClickOffsetForRetry(0), 0, 'initial inspection starts at the first window');
-  assert.equal(inspectionClickOffsetForRetry(0, retry(1)), 4, 'first durable retry starts after the first four-control window');
-  assert.equal(inspectionClickOffsetForRetry(0, retry(2)), 8, 'later retries advance to the next window even when scan_attempts was reset to 0');
-  assert.equal(inspectionClickOffsetForRetry(10, retry(1)), 10, 'a larger channel offset is never regressed');
-  assert.equal(inspectionClickOffsetForRetry(0, { attemptNumber: 3, isRetryOwnedReacquire: false }), 0, 'non-retry scans keep their channel offset');
-  assert.match(readSource('queueManager.ts'), /scanAttempts: inspectionClickOffsetForRetry\(channel\.scan_attempts, executionMarker\)/);
+  assert.equal(inspectionClickOffsetForRetry(0, { isRetryOwnedReacquire: true }), 0, 'a retry without recorded progress reuses the first window');
+  assert.equal(inspectionClickOffsetForRetry(10, { isRetryOwnedReacquire: true }), 0, 'durable job attempts never override per-seed progress');
+  assert.equal(inspectionClickOffsetForRetry(10, { isRetryOwnedReacquire: false }), 10, 'non-retry scans keep their channel offset');
+
+  const failedBeforeClick = nextRenderedClickOffsets(undefined, [
+    { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 0 } },
+  ]);
+  assert.deepEqual(failedBeforeClick, {}, 'a failure before any control keeps the same window');
+  assert.deepEqual(nextRenderedClickOffsets(failedBeforeClick, [
+    { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 0 } },
+  ]), {}, 'repeated pre-click failures never invent progress');
+  assert.deepEqual(nextRenderedClickOffsets(undefined, [
+    { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 3 } },
+    { requestedUrl: 'https://other.test/', telemetry: { clicksStarted: 0 } },
+  ]), { 'https://creator.test/': 3 }, 'only a seed that actually clicked advances');
+  assert.deepEqual(nextRenderedClickOffsets({ 'https://creator.test/': 4 }, [
+    { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 4 } },
+  ]), { 'https://creator.test/': 8 }, 'the next retry starts after the window already examined');
+  assert.deepEqual(nextRenderedClickOffsets(undefined, [
+    { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 9 } },
+  ]), { 'https://creator.test/': 4 }, 'multi-page click totals advance at most one page window');
+  const queue = readSource('queueManager.ts');
+  assert.match(queue, /scanAttempts: inspectionClickOffsetForRetry\(channel\.scan_attempts, executionMarker\)/);
+  assert.match(queue, /clickOffsets: executionMarker\?\.isRetryOwnedReacquire \? resolveInspectionClickOffsets\(executionMarker\.clickOffsets\) : undefined/);
+  assert.match(readSource('inspector.ts'), /clickOffset:renderedClickOffsetForSeed\(item\.url\)/);
 });
 
 test('E6: orphan drain re-admits claimable orphans and removes foreign-owned residue', async () => {

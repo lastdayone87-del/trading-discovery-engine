@@ -711,7 +711,7 @@ export async function processNextSearchJob(
       // unresolved acquisition for the same channel: its inspection must
       // re-acquire rather than borrow its own incomplete coverage in a loop.
       // First-time inspections leave the flag unset and borrow normally.
-      const inspectionResult=await inspectAndValidateChannel(channel,undefined,false,false,false,{jobId:job.id,attemptNumber:job.attempts,isRetryOwnedReacquire:true});
+      const inspectionResult=await inspectAndValidateChannel(channel,undefined,false,false,false,{jobId:job.id,attemptNumber:job.attempts,isRetryOwnedReacquire:true,clickOffsets:resolveInspectionClickOffsets(job.payload.clickOffsets)});
       // Attempt-free deferral is reserved for capacity/browser signals where no
       // real acquisition was attempted (browser runtime unavailable). Genuine
       // acquisition failures (COMMUNITY_REQUIRED) consumed a real inspection
@@ -1497,21 +1497,31 @@ export function nextChannelScanAttempts(current:number,terminalSemanticOrSuccess
   return terminalSemanticOrSuccess?0:Math.max(0,current)+1;
 }
 
-/** Click-window offset for an inspection. Initial scans start at zero. A
- * durable RETRY_COMMUNITY_ACQUISITION inspection uses the job attempt number,
- * not channel.scan_attempts: successful validation resets that channel field
- * to zero, which would otherwise pin every FOUND-gap retry to the first click
- * window. Each retry advances by one full page budget so controls beyond the
- * first window are eventually examined even when scheduleRetry=false. */
+/** Click-window offset default for an inspection. Initial scans keep the
+ * channel's legacy attempt offset; a durable retry starts every newly seen
+ * seed at zero and reads per-seed progress from the retry payload. Job attempt
+ * numbers deliberately never advance this value: a retry that failed before
+ * clicking any control must reuse the same window. */
 export function inspectionClickOffsetForRetry(
   channelAttempts: number | undefined,
-  executionMarker?: { attemptNumber?: number; isRetryOwnedReacquire?: boolean },
-  maxClicksPerPage = 4,
+  executionMarker?: { isRetryOwnedReacquire?: boolean },
 ): number {
   const channelOffset = Math.max(0, Math.trunc(Number(channelAttempts)) || 0);
-  if (!executionMarker?.isRetryOwnedReacquire) return channelOffset;
-  const attempt = Math.max(0, Math.trunc(Number(executionMarker.attemptNumber)) || 0);
-  return Math.max(channelOffset, attempt * Math.max(1, Math.trunc(maxClicksPerPage) || 4));
+  return executionMarker?.isRetryOwnedReacquire ? 0 : channelOffset;
+}
+
+/** Defensive projection of durable retry click offsets from JSON payloads.
+ * Invalid entries are dropped; a retry then restarts that seed at zero rather
+ * than trusting a non-numeric offset. */
+export function resolveInspectionClickOffsets(value: unknown): Record<string, number> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const offsets: Record<string, number> = {};
+  for (const [url, raw] of Object.entries(value as Record<string, unknown>)) {
+    const offset = Math.trunc(Number(raw));
+    if (!url || !Number.isFinite(offset) || offset <= 0) continue;
+    offsets[url] = offset;
+  }
+  return Object.keys(offsets).length ? offsets : undefined;
 }
 
 /**
@@ -1591,7 +1601,7 @@ export async function inspectAndValidateChannel(
   isManualScan: boolean = false,
   enableDebug: boolean = false,
   scheduleRetry: boolean = true,
-  executionMarker?: { jobId: string; attemptNumber: number; isRetryOwnedReacquire?: boolean }
+  executionMarker?: { jobId: string; attemptNumber: number; isRetryOwnedReacquire?: boolean; clickOffsets?: Record<string, number> }
 ): Promise<{ debugLog?: any; inspection?: Awaited<ReturnType<typeof runChannelInspection>>; retryDirective?: CommunityRetryDirective } | void> {
   if (isTerminalState(channel) && !isManualScan) {
     console.log(`[Queue Manager] Channel '${channel.channel_name}' (${channel.channel_id}) is in terminal state '${channel.country_status}' / '${channel.trading_status}'. Aborting inspection.`);
@@ -1729,8 +1739,13 @@ export async function inspectAndValidateChannel(
       youtubeUrl: channel.youtube_url,
       forceLiveFetch: isManualScan || !rawDetails?.description,
       scanAttempts: inspectionClickOffsetForRetry(channel.scan_attempts, executionMarker),
+      clickOffsets: executionMarker?.isRetryOwnedReacquire ? resolveInspectionClickOffsets(executionMarker.clickOffsets) : undefined,
       bypassBorrowedCoverage: resolveBorrowBypassForInspectionMarker(executionMarker)
     });
+    // Carry only controls this run actually examined into any retry directive.
+    // A pre-click failure leaves the previous per-seed offsets unchanged, so
+    // the next attempt reuses the same window instead of skipping it.
+    if(inspection.retryDirective)inspection.retryDirective={...inspection.retryDirective,clickOffsets:inspection.nextClickOffsets};
     if(inspection.acquisitionOutcomes?.length)await appendExternalAcquisitionObservations(channel.channel_id,inspection.acquisitionOutcomes)
       .catch(error=>console.warn(`[ExternalAcquisition] observational write failed for ${channel.channel_id}:`,error instanceof Error?error.message:error));
 
@@ -1918,6 +1933,7 @@ export async function inspectAndValidateChannel(
       channel.last_checked=now;
       reconcileDiscordDiscoveryFromInspection(channel,admittedInspection,{validationProjected:true});
       retryDirective=attemptFree?{attemptFree:true,code:COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,reason:`Discord validation remained ${selected.operationalOutcome}`,retryAt:undefined,retryReason:'COMMUNITY_REQUIRED_ACQUISITION_FAILURE'}:undefined;
+      if(retryDirective&&inspection.nextClickOffsets&&Object.keys(inspection.nextClickOffsets).length)retryDirective={...retryDirective,clickOffsets:inspection.nextClickOffsets};
       if(selected.retryable&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id,retryDirective);
       if(scheduleRetry&&shouldScheduleFoundGapAcquisitionRetry(inspection))await enqueueCommunityAcquisitionRetry(channel.channel_id,inspection.retryDirective);
     } else if(inspection.acquisitionStatus==='ACQUISITION_FAILED'||inspection.acquisitionStatus==='PARTIALLY_INSPECTED'||
@@ -1982,6 +1998,7 @@ export async function inspectAndValidateChannel(
     reconcileDiscordDiscoveryFromInspection(channel,admittedInspection??inspection,{validationProjected:false});
     attemptFree=isAttemptFreeCommunityFailure(err);
     retryDirective=attemptFree?{attemptFree:true,code:COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,reason:String(err?.message||err),retryAt:retryAtFromUnknown(err),retryReason:retryReasonFromError(err)}:undefined;
+    if(retryDirective&&inspection?.nextClickOffsets&&Object.keys(inspection.nextClickOffsets).length)retryDirective={...retryDirective,clickOffsets:inspection.nextClickOffsets};
     if(!attemptFree)channel.scan_attempts++;
     // Durable RETRY_COMMUNITY_ACQUISITION owns the retry budget. Keep channel
     // state retryable here so an internal scan counter cannot prematurely stop
@@ -2143,6 +2160,7 @@ export async function projectNotFoundAfterInspection(
   inspection: {
     acquisitionOutcomes?: Array<{ outcome?: unknown; retryable?: unknown; failureClass?: unknown }>;
     retryDirective?: CommunityRetryDirective;
+    nextClickOffsets?: Record<string, number>;
   } | null | undefined,
   admittedInspection: Parameters<typeof reconcileDiscordDiscoveryFromInspection>[1],
   scheduleRetry: boolean,
@@ -2177,7 +2195,7 @@ export async function projectNotFoundAfterInspection(
             reason:`Pending discovery work: ${pendingWork.reasons.join(', ')}`,
             retryReason:COMMUNITY_RETRY_REASON.COMMUNITY_REQUIRED_ACQUISITION_FAILURE,
           }:undefined);
-        if(scheduleRetry&&pendingDirective)await enqueue(channel.channel_id,pendingDirective);
+        if(scheduleRetry&&pendingDirective)await enqueue(channel.channel_id,inspection?.nextClickOffsets&&Object.keys(inspection.nextClickOffsets).length?{...pendingDirective,clickOffsets:inspection.nextClickOffsets}:pendingDirective);
         channel.last_checked=new Date().toISOString();
         return;
       }
@@ -2238,7 +2256,8 @@ export async function enqueueCommunityAcquisitionRetry(channelId:string,directiv
   const metadata=buildCommunityRetryJobMetadata({
     code:directive?.code||COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,
     retryReason:directive?.retryReason||'COMMUNITY_REQUIRED_ACQUISITION_FAILURE',
-    retrySource:source
+    retrySource:source,
+    clickOffsets:directive?.clickOffsets
   });
   // Saturation deferrals scheduled from a fresh inspection never pass through
   // the retry-worker deferral branch; count them at the durable enqueue point.

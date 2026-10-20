@@ -53,8 +53,20 @@ test('community retry enqueue is idempotent per channel and keeps the bounded at
   assert.equal(communityAcquisitionRetryKey('UC_IDEMPOTENT'), 'community-acquisition-retry:UC_IDEMPOTENT');
 });
 
-test('saturation deferrals are counted at the durable community enqueue point', async () => {
-  resetOperationsTelemetry();
+test('community retry enqueue persists per-seed click progress for the next attempt', async () => {
+  const client = mockClient();
+  await enqueueCommunityAcquisitionRetry('UC_CLICK', {
+    ...saturationDirective,
+    clickOffsets: { 'https://creator.test': 4 },
+  }, 'INSPECTION', client as any);
+  const insert = client.queries.find(q => q.sql.includes('INSERT INTO jobs'));
+  const payload = JSON.parse(String(insert?.values?.[1]));
+  assert.deepEqual(payload.clickOffsets, { 'https://creator.test': 4 });
+  const merge = client.queries.find(q => q.sql.includes('UPDATE jobs SET payload=payload'));
+  assert.deepEqual(JSON.parse(String(merge?.values?.[1])).clickOffsets, { 'https://creator.test': 4 });
+});
+
+test('saturation deferrals are counted at the durable community enqueue point', async () => {  resetOperationsTelemetry();
   const client = mockClient();
   await enqueueCommunityAcquisitionRetry('UC_SAT', saturationDirective, 'INSPECTION', client as any);
   const snapshot = operationsTelemetrySnapshot();

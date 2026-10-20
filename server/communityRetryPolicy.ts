@@ -45,6 +45,10 @@ export interface CommunityRetryDirective {
   retryAt?: number;
   reason: string;
   retryReason: CommunityRetryReason;
+  /** Per-seed rendered click-window progress durably carried into the next
+   * retry. Keys are normalized seed URLs; values count controls already
+   * examined. Omitted when no rendered window progressed. */
+  clickOffsets?: Record<string, number>;
 }
 
 export interface CommunityRetryJobMetadata {
@@ -56,6 +60,8 @@ export interface CommunityRetryJobMetadata {
   reconciliationStatus: CommunityRetryReconciliationStatus;
   reconciliationReason?: string;
   reconciliationObservedAt?: string;
+  /** Durable per-seed click-window progress (see CommunityRetryDirective). */
+  clickOffsets?: Record<string, number>;
   reconciliationHistory?: Array<{
     status: CommunityRetryReconciliationStatus;
     reason: string;
@@ -148,6 +154,7 @@ export function buildCommunityRetryJobMetadata(args: {
   retryReason: CommunityRetryReason;
   retrySource?: CommunityRetrySource;
   observedAt?: string;
+  clickOffsets?: Record<string, number>;
 }): CommunityRetryJobMetadata {
   return {
     retryLifecycleVersion: 2,
@@ -155,7 +162,8 @@ export function buildCommunityRetryJobMetadata(args: {
     retryCode: args.code,
     retrySource: args.retrySource || 'INSPECTION',
     retryObservedAt: args.observedAt || new Date().toISOString(),
-    reconciliationStatus: 'NONE'
+    reconciliationStatus: 'NONE',
+    ...(args.clickOffsets && Object.keys(args.clickOffsets).length ? { clickOffsets: { ...args.clickOffsets } } : {})
   };
 }
 
