@@ -674,8 +674,8 @@ test('dashboard copy distinguishes incomplete, not-yet-inspected, and clean stat
   assert.match(table, /Website acquisition incomplete/);
   assert.match(table, /Not yet inspected/);
   assert.match(table, /Clean inspection · no community found/);
-  assert.match(table, /\(c\.scan_status==='FAILED'\|\|c\.scan_status==='FAILED_PERMANENT'\|\|c\.scan_status==='ENRICHMENT_PENDING'\)/);
-  assert.match(table, /\(automaticRetryActive\|\|automaticRetryTerminal\)/);
+  assert.match(table, /\(c\.scan_status\s*===\s*'FAILED'\s*\|\|\s*c\.scan_status\s*===\s*'FAILED_PERMANENT'\s*\|\|\s*c\.scan_status\s*===\s*'ENRICHMENT_PENDING'\)/);
+  assert.match(table, /\(automaticRetryActive\s*\|\|\s*automaticRetryTerminal\)/);
 });
 
 // G. Video-description discovery remains enabled (recall invariant).
