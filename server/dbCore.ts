@@ -18,7 +18,7 @@ import { classifyDiscoveryVisibility } from './discoveryStateVisibility';
 import { safeCrawlerTelemetry, type CrawlerTelemetry } from './crawlerTelemetry';
 import { validateLedgerInput, type ValidationKind, type ValidationStatus } from './phase3Validation';
 import { browserCapabilityIsUnavailable } from './browserCapability';
-import { STALE_CHANNEL_LOCK_AFTER_MINUTES } from './staleChannelLockRecovery';
+import { STALE_CHANNEL_LOCK_AFTER_MINUTES, STALE_CHANNEL_LOCK_RECOVERY_BATCH_SIZE } from './staleChannelLockRecovery';
 import { assertMinimalPayload, compareMetrics, replayFunnel, REPLAY_FEATURE_VERSION, REPLAY_POLICY_VERSION, type FunnelMetrics, type OutcomeEventType, type VerificationStatus } from './replayMeasurement';
 import { mapQueryRunToNeighborhood, createNeighborhoodKey, type DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
 import { deriveNeighborhoodObservationMetrics } from './neighborhoodAnalytics';
@@ -2118,12 +2118,28 @@ export async function recoverStaleJobs(staleAfterMinutes=15):Promise<number>{con
  * The jobs table is authoritative: a live PROCESSING job for the same channel
  * always protects the lock, even when the row is older than the grace period.
  * The age bound covers legacy/search-worker scans that do not carry a
- * per-channel job id, so a normal in-flight scan is never cleared.
+ * per-channel job id, so a normal in-flight scan is never cleared. Each sweep
+ * is capped and skips rows already claimed by another sweep; the next tick
+ * continues the backlog.
  */
-export async function recoverStaleChannelLocks(staleAfterMinutes=STALE_CHANNEL_LOCK_AFTER_MINUTES):Promise<number>{
+export async function recoverStaleChannelLocks(staleAfterMinutes=STALE_CHANNEL_LOCK_AFTER_MINUTES,batchSize=STALE_CHANNEL_LOCK_RECOVERY_BATCH_SIZE):Promise<number>{
   const db=await getDb();
   const res=await db.query(
-    `UPDATE channels c
+    `WITH eligible AS (
+        SELECT c.channel_id
+          FROM channels c
+         WHERE c.scan_status='LOCKED'
+           AND c.updated_at < now()-($1||' minutes')::interval
+           AND NOT EXISTS (
+             SELECT 1 FROM jobs live
+             WHERE live.status='PROCESSING'
+               AND live.payload->>'channelId'=c.channel_id
+           )
+         ORDER BY c.updated_at, c.channel_id
+         LIMIT ($2)::bigint
+         FOR UPDATE SKIP LOCKED
+      )
+      UPDATE channels c
         SET scan_status = CASE
             WHEN c.trading_status = 'NEEDS_REVIEW' THEN 'NEEDS_REVIEW'
             WHEN c.trading_status = 'UNCERTAIN'
@@ -2136,18 +2152,13 @@ export async function recoverStaleChannelLocks(staleAfterMinutes=STALE_CHANNEL_L
             ELSE 'PENDING'
           END,
           updated_at = now()
-      WHERE c.scan_status='LOCKED'
-        AND c.updated_at < now()-($1||' minutes')::interval
-        AND NOT EXISTS (
-          SELECT 1 FROM jobs live
-          WHERE live.status='PROCESSING'
-            AND live.payload->>'channelId'=c.channel_id
-        )
+        FROM eligible e
+       WHERE c.channel_id = e.channel_id
       RETURNING c.channel_id`,
-    [String(staleAfterMinutes)]
+    [String(staleAfterMinutes),String(batchSize)]
   );
   const recovered=res.rowCount||0;
-  if(recovered>0)console.warn(JSON.stringify({event:'stale_channel_locks_recovered',recovered,staleAfterMinutes,timestamp:new Date().toISOString()}));
+  if(recovered>0)console.warn(JSON.stringify({event:'stale_channel_locks_recovered',recovered,staleAfterMinutes,batchSize,timestamp:new Date().toISOString()}));
   return recovered;
 }
 

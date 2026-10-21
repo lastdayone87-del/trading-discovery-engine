@@ -1,4 +1,5 @@
 import { browserCapabilityIsUnavailable } from './browserCapability';
+import { shouldRunStaleChannelLockRecovery } from './staleChannelLockRecovery';
 import {
   getDb,
   enqueueJob,
@@ -112,6 +113,11 @@ import { admitDiscordCandidates, buildLegacyDiscordCandidate, canonicalDiscordIn
 import { processPendingStagedCandidates } from './candidateStaging';
 
 const WORKER_ID = `worker_${process.pid}`;
+
+/** Last runtime stale-channel-lock sweep started by this process. Worker
+ * pools tick every second; this timestamp keeps the sweep on a shared
+ * cooldown instead of running unbounded on every claim. */
+let lastStaleChannelLockRecoveryMs: number | null = null;
 
 /**
  * Pushes a new search query job to the Search Jobs Queue.
@@ -618,7 +624,16 @@ export async function processNextSearchJob(
   workerId = WORKER_ID
 ): Promise<boolean> {
   await recoverStaleJobs();
-  await recoverStaleChannelLocks();
+  if (shouldRunStaleChannelLockRecovery({ lastRunMs: lastStaleChannelLockRecoveryMs })) {
+    lastStaleChannelLockRecoveryMs = Date.now();
+    try {
+      await recoverStaleChannelLocks();
+    } catch (error) {
+      // Do not lock the sweep out for a full interval after a transient error.
+      lastStaleChannelLockRecoveryMs = null;
+      throw error;
+    }
+  }
   await recoverStaleInvestigationSteps();
   await reconcileOrphanInvestigations();
   await reconcileCommunityAcquisitionRecovery(getDb, getChannelById, upsertChannel, 20, Date.now(), (channelId, retryReason) => enqueueCommunityAcquisitionRetry(channelId, { attemptFree: true, code: COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, reason: retryReason || 'Recovery-triggered community retry', retryAt: undefined, retryReason: retryReason === 'BROWSER_RUNTIME_UNAVAILABLE' ? 'BROWSER_RUNTIME_UNAVAILABLE' : 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE' }, 'RECOVERY'));

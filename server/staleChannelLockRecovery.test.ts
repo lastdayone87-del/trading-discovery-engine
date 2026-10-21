@@ -3,8 +3,11 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
   STALE_CHANNEL_LOCK_AFTER_MINUTES,
+  STALE_CHANNEL_LOCK_RECOVERY_BATCH_SIZE,
+  STALE_CHANNEL_LOCK_RECOVERY_INTERVAL_MS,
   projectRecoveredStaleChannelLockStatus,
   shouldRecoverStaleChannelLock,
+  shouldRunStaleChannelLockRecovery,
 } from './staleChannelLockRecovery';
 
 const migration = readFileSync(new URL('./db/migrations/090_reconcile_stale_channel_locks.sql', import.meta.url), 'utf8');
@@ -25,6 +28,8 @@ test('terminal job release also reconciles a stranded channel lock', () => {
   assert.match(terminalMigration, /c\.scan_status = 'LOCKED'/);
   assert.match(terminalMigration, /live\.id <> NEW\.id/);
   assert.match(terminalMigration, /live\.status='PROCESSING'/);
+  assert.match(terminalMigration, /NEW\.status = 'PENDING' OR c\.updated_at < now\(\) - interval '60 minutes'/);
+  assert.match(terminalMigration, /pg_advisory_xact_lock\(hashtext\('channel_lock_release:' \|\| channel_id_value\)\)/);
 });
 
 test('stale channel lock recovery is bounded and never clears a live owner', () => {
@@ -51,6 +56,32 @@ test('stale channel lock recovery is bounded and never clears a live owner', () 
   assert.equal(shouldRecoverStaleChannelLock({
     scanStatus: 'LOCKED', updatedAt: null, hasLiveProcessingJob: false, nowMs,
   }), false, 'a missing timestamp cannot prove abandonment');
+
+  assert.equal(shouldRecoverStaleChannelLock({
+    scanStatus: 'LOCKED',
+    updatedAt: new Date(nowMs - STALE_CHANNEL_LOCK_AFTER_MINUTES * 60_000).toISOString(),
+    hasLiveProcessingJob: false,
+    nowMs,
+  }), false, 'exactly at the grace period matches the strict SQL boundary');
+});
+
+test('runtime recovery sweep is throttled and bounded per tick', () => {
+  const nowMs = Date.parse('2026-10-21T03:00:00.000Z');
+
+  assert.equal(shouldRunStaleChannelLockRecovery({ nowMs, lastRunMs: null }), true, 'the first tick runs');
+  assert.equal(shouldRunStaleChannelLockRecovery({
+    nowMs, lastRunMs: nowMs - (STALE_CHANNEL_LOCK_RECOVERY_INTERVAL_MS - 1),
+  }), false, 'a tick inside the cooldown skips the sweep');
+  assert.equal(shouldRunStaleChannelLockRecovery({
+    nowMs, lastRunMs: nowMs - STALE_CHANNEL_LOCK_RECOVERY_INTERVAL_MS,
+  }), true, 'a tick at the cooldown boundary runs');
+
+  assert.ok(STALE_CHANNEL_LOCK_RECOVERY_BATCH_SIZE > 0 && STALE_CHANNEL_LOCK_RECOVERY_BATCH_SIZE <= 100);
+  assert.match(dbSource, /LIMIT \(\$2\)::bigint/);
+  assert.match(dbSource, /FOR UPDATE SKIP LOCKED/);
+  assert.match(dbSource, /STALE_CHANNEL_LOCK_RECOVERY_BATCH_SIZE/);
+  assert.match(queueSource, /shouldRunStaleChannelLockRecovery/);
+  assert.match(queueSource, /lastStaleChannelLockRecoveryMs/);
 });
 
 test('terminated jobs recover only after the grace period when no live job remains', () => {

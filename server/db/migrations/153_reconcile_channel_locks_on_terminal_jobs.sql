@@ -1,8 +1,19 @@
 -- Terminal job completion is also a durable release signal for a channel lock.
 -- Migration 090 only reconciled PROCESSING -> PENDING retries. A job that is
 -- terminally FAILED/COMPLETED can leave the channel LOCKED when the worker
--- exits before the inspection finalizer runs. Widen the same guarded trigger;
--- a live PROCESSING job for the channel still protects the lock.
+-- exits before the inspection finalizer runs.
+--
+-- Terminal releases stay age-bounded: a lock younger than the recovery grace
+-- period may belong to an independent search-family or synchronous inspection
+-- that carries no channel-keyed PROCESSING job, so only abandoned locks are
+-- cleared immediately. Older locks are recovered by this trigger or by the
+-- runtime sweep with the same 60-minute bound. The PENDING retry branch keeps
+-- migration 090 semantics (no age bound).
+--
+-- Releases for the same channel are serialized with a transaction-scoped
+-- advisory lock so two channel-keyed jobs exiting concurrently cannot each
+-- mistake the other for a live lock owner and strand the channel until the
+-- sweep runs.
 
 CREATE OR REPLACE FUNCTION reconcile_channel_lock_after_job_release()
 RETURNS TRIGGER AS $$
@@ -19,6 +30,8 @@ BEGIN
     RETURN NEW;
   END IF;
 
+  PERFORM pg_advisory_xact_lock(hashtext('channel_lock_release:' || channel_id_value));
+
   UPDATE channels c
   SET scan_status = CASE
       WHEN c.trading_status = 'NEEDS_REVIEW' THEN 'NEEDS_REVIEW'
@@ -34,6 +47,7 @@ BEGIN
     updated_at = now()
   WHERE c.channel_id = channel_id_value
     AND c.scan_status = 'LOCKED'
+    AND (NEW.status = 'PENDING' OR c.updated_at < now() - interval '60 minutes')
     AND NOT EXISTS (
       SELECT 1 FROM jobs live
       WHERE live.status='PROCESSING'
