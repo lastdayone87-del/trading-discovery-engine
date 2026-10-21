@@ -17,6 +17,20 @@
 import * as cheerio from 'cheerio';
 import { getAppSetting } from './dbCore';
 import { MAX_CRAWL_RESPONSE_CHARS } from './crawlResponseBounds';
+import {
+  assessPublicDestination,
+  defaultDnsResolve,
+  isPublicInternetUrl,
+  isPublicIpAddress,
+  PUBLIC_DESTINATION_DNS_TIMEOUT_MS,
+  type DnsResolver,
+  type PublicDestinationDecision,
+  type PublicDestinationReason,
+} from './publicDestination';
+import { withPinnedExternalFetch } from './pinnedExternalFetch';
+
+export { isPublicInternetUrl, isPublicIpAddress };
+export type { DnsResolver };
 
 export const SITE_PROFILER_POLICY_VERSION = 'site-profiler-v1';
 export const SITE_PROFILER_SETTING_KEY = 'site_profiler_enabled';
@@ -585,6 +599,8 @@ export interface ProfilerFetch {
   text: string;
   truncated: boolean;
   finalUrl: string;
+  /** Raw Retry-After header from the final response, when present. */
+  retryAfter?: string;
   /** URLs requested in order, including the initial URL. Preserves redirect
    * provenance now that the profiler follows redirects itself. */
   redirectsFollowed: string[];
@@ -595,12 +611,82 @@ export interface ProfilerFetch {
   redirectRejected: boolean;
   /** The refused destination, present only when redirectRejected. */
   rejectedRedirect?: string;
+  /** Machine-readable cause when the redirect chain stopped before a final
+   * response. Distinct classes let callers keep a retryable DNS failure
+   * separate from a permanent private-destination block. */
+  redirectFailure?: ProfilerRedirectFailure;
 }
 
-/** Maximum redirect hops per profiler fetch. Conservative: discovery
- * inventories never need deep chains; the cap bounds time, DNS lookups, and
- * connection use per inventory request. */
+/** Why a redirect chain stopped. Non-public and malformed destinations are
+ * security/input barriers; DNS and timeout classes are retryable transport
+ * failures; loop/limit classes describe a bounded chain that never reached a
+ * final response. */
+export type ProfilerRedirectFailure =
+  | 'NON_PUBLIC_DESTINATION'
+  | 'MALFORMED_LOCATION'
+  | 'DNS_RESOLUTION_FAILED'
+  | 'DNS_TIMEOUT'
+  | 'REDIRECT_LOOP'
+  | 'REDIRECT_LIMIT';
+
+export interface ProfilerTransportFailure {
+  name: string;
+  message: string;
+  code?: string;
+  causeCode?: string;
+}
+
+export interface ProfilerFetchOptions {
+  /** Maximum redirect hops for this fetch. Profiler inventories keep the
+   * conservative profiler cap; the crawler passes its own 20-hop budget. */
+  maxHops?: number;
+  /** Called before fetchProfilerUrl returns null so callers can preserve
+   * AbortError/ESSRFBLOCKED/transport cause in their observations. */
+  onTransportError?: (failure: ProfilerTransportFailure) => void;
+  /** Decide whether the final response body is needed. Profiler inventories
+   * read it by default. The static crawler suppresses body reads for non-2xx
+   * responses (except the bounded 401/403 marker probe) and unsupported
+   * content types, so a stalled error body cannot consume the fetch budget or
+   * hide Retry-After. Redirect-hop loop bodies are likewise suppressed. */
+  shouldReadFinalBody?: (response: Response) => boolean;
+}
+
+/** Maximum redirect hops per profiler inventory fetch. Conservative:
+ * discovery inventories never need deep chains; the cap bounds time, DNS
+ * lookups, and connection use per inventory request. */
 export const MAX_PROFILER_REDIRECT_HOPS = 5;
+
+/** The crawler intentionally retains a wider chain budget than the profiler:
+ * creator sites commonly use multi-hop marketing redirects, and the previous
+ * shared fetch followed up to 20. Every hop is still destination-checked. */
+export const CRAWLER_MAX_REDIRECT_HOPS = 20;
+
+function redirectFailureFor(reason: PublicDestinationReason): ProfilerRedirectFailure {
+  switch (reason) {
+    case 'NON_PUBLIC_ADDRESS':
+    case 'NON_PUBLIC_RESOLVED_ADDRESS':
+      return 'NON_PUBLIC_DESTINATION';
+    case 'DNS_RESOLUTION_FAILED':
+      return 'DNS_RESOLUTION_FAILED';
+    case 'DNS_TIMEOUT':
+      return 'DNS_TIMEOUT';
+    case 'INVALID_URL':
+    case 'NON_HTTP_SCHEME':
+      return 'MALFORMED_LOCATION';
+    default:
+      return 'MALFORMED_LOCATION';
+  }
+}
+
+function profilerTransportFailure(error: unknown): ProfilerTransportFailure {
+  const value = error as (Error & { code?: string; cause?: { code?: string } }) | undefined;
+  return {
+    name: value?.name || 'Error',
+    message: String(value?.message || value || 'unknown transport failure').slice(0, 300),
+    code: typeof value?.code === 'string' ? value.code : undefined,
+    causeCode: typeof value?.cause?.code === 'string' ? value.cause.code : undefined,
+  };
+}
 
 const PROFILER_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
@@ -615,6 +701,19 @@ async function cancelRedirectBody(response: Response): Promise<void> {
   }
 }
 
+async function cancelAndEmptyBody(response: Response): Promise<{
+  contentType: string;
+  text: string;
+  truncated: boolean;
+}> {
+  await cancelRedirectBody(response);
+  return {
+    contentType: response.headers.get('content-type') || '',
+    text: '',
+    truncated: false,
+  };
+}
+
 /** Destination guard bounded by the fetch's remaining time budget. A slow
  * or stalled DNS lookup must never outlive the profiler timeout that
  * bounds the fetch itself: on budget exhaustion the destination is
@@ -623,18 +722,21 @@ async function guardRedirectWithBudget(
   nextUrl: string,
   resolveHost: DnsResolver,
   remainingMs: number,
-): Promise<boolean> {
-  if (!Number.isFinite(remainingMs) || remainingMs <= 0) return false;
-  let timer: ReturnType<typeof setTimeout> | undefined;
+): Promise<PublicDestinationDecision> {
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
+    return { allowed: false, reason: 'DNS_TIMEOUT' };
+  }
   try {
-    const budget = new Promise<false>(resolve => {
-      timer = setTimeout(() => resolve(false), remainingMs);
-    });
-    return await Promise.race([isPublicInternetUrl(nextUrl, resolveHost), budget]);
+    // Use the smaller of the global DNS deadline and the fetch's remaining
+    // budget. assessPublicDestination performs the actual deadline race, so a
+    // stalled resolver cannot outlive either bound.
+    return await assessPublicDestination(
+      nextUrl,
+      resolveHost,
+      Math.min(PUBLIC_DESTINATION_DNS_TIMEOUT_MS, remainingMs),
+    );
   } catch {
-    return false;
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
+    return { allowed: false, reason: 'DNS_RESOLUTION_FAILED' };
   }
 }
 
@@ -689,10 +791,16 @@ export async function fetchProfilerUrl(
   maxChars: number,
   timeoutMs: number = PROFILER_FETCH_TIMEOUT_MS,
   resolveHost: DnsResolver = defaultDnsResolve,
+  headers: Record<string, string> = profilerFetchHeaders(),
+  options: ProfilerFetchOptions = {},
 ): Promise<ProfilerFetch | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const startedAt = Date.now();
+  const maxHops = Math.max(1, Math.trunc(options.maxHops ?? MAX_PROFILER_REDIRECT_HOPS));
+  // Apply connection-time DNS pinning to the real fetch as well. Injected test
+  // fetches are returned unchanged, and an already-wrapped fetch is a no-op.
+  const guardedFetch = withPinnedExternalFetch(fetchImpl);
   try {
     const redirectsFollowed: string[] = [];
     const visited = new Set<string>();
@@ -700,17 +808,20 @@ export async function fetchProfilerUrl(
     for (;;) {
       redirectsFollowed.push(currentUrl);
       visited.add(currentUrl);
-      const response = await fetchImpl(currentUrl, {
+      const response = await guardedFetch(currentUrl, {
         signal: controller.signal,
-        headers: profilerFetchHeaders(),
+        headers,
         redirect: 'manual',
       });
       const location = response.headers.get('location');
       if (!PROFILER_REDIRECT_STATUSES.has(response.status) || !location) {
-        const body = await readBoundedBody(response, maxChars);
+        const body = options.shouldReadFinalBody?.(response) === false
+          ? await cancelAndEmptyBody(response)
+          : await readBoundedBody(response, maxChars);
         return {
           status: response.status,
           ...body,
+          retryAfter: response.headers.get('retry-after') || '',
           finalUrl: response.url || currentUrl,
           redirectsFollowed,
           redirectRejected: false,
@@ -732,28 +843,29 @@ export async function fetchProfilerUrl(
           redirectsFollowed,
           redirectRejected: true,
           rejectedRedirect: location,
+          redirectFailure: 'MALFORMED_LOCATION',
         };
       }
       if (visited.has(nextUrl)) {
         // Loop: stop at the last safe URL instead of burning the hop budget.
-        const body = await readBoundedBody(response, maxChars);
+        const body = options.shouldReadFinalBody?.(response) === false
+          ? await cancelAndEmptyBody(response)
+          : await readBoundedBody(response, maxChars);
         return {
           status: response.status,
           ...body,
+          retryAfter: response.headers.get('retry-after') || '',
           finalUrl: response.url || currentUrl,
           redirectsFollowed,
           redirectRejected: false,
+          redirectFailure: 'REDIRECT_LOOP',
         };
       }
-      let allowed = false;
-      try {
-        // Bounded by the fetch's remaining budget: a stalled DNS lookup
-        // fails closed instead of delaying inspection past the timeout.
-        allowed = await guardRedirectWithBudget(nextUrl, resolveHost, startedAt + timeoutMs - Date.now());
-      } catch {
-        allowed = false;
-      }
-      if (!allowed) {
+      // Bounded by the fetch's remaining budget: a stalled DNS lookup fails
+      // closed instead of delaying inspection past the timeout. The decision
+      // preserves the reason (private vs DNS vs timeout) for the caller.
+      const decision = await guardRedirectWithBudget(nextUrl, resolveHost, startedAt + timeoutMs - Date.now());
+      if (!decision.allowed) {
         await cancelRedirectBody(response);
         return {
           status: response.status,
@@ -764,9 +876,10 @@ export async function fetchProfilerUrl(
           redirectsFollowed,
           redirectRejected: true,
           rejectedRedirect: nextUrl,
+          redirectFailure: redirectFailureFor(decision.reason),
         };
       }
-      if (redirectsFollowed.length >= MAX_PROFILER_REDIRECT_HOPS) {
+      if (redirectsFollowed.length >= maxHops) {
         // Hop budget exhausted on an otherwise-allowed chain: stop at the
         // last safe URL. The non-2xx status keeps this a skip, never evidence.
         await cancelRedirectBody(response);
@@ -778,6 +891,7 @@ export async function fetchProfilerUrl(
           finalUrl: response.url || currentUrl,
           redirectsFollowed,
           redirectRejected: false,
+          redirectFailure: 'REDIRECT_LIMIT',
         };
       }
       try {
@@ -787,7 +901,8 @@ export async function fetchProfilerUrl(
       }
       currentUrl = nextUrl;
     }
-  } catch {
+  } catch (error) {
+    options.onTransportError?.(profilerTransportFailure(error));
     return null;
   } finally {
     clearTimeout(timer);
@@ -806,80 +921,9 @@ export function profilerFetchHeaders(): Record<string, string> {
   };
 }
 
-export type DnsResolver = (hostname: string) => Promise<string[]>;
-
-async function defaultDnsResolve(hostname: string): Promise<string[]> {
-  const { lookup } = await import('node:dns/promises');
-  const records = await lookup(hostname, { all: true });
-  return records.map(record => record.address);
-}
-
-/** True only for globally routable unicast addresses. Everything else —
- * loopback, link-local, private, carrier-grade NAT, documentation,
- * multicast, reserved, unspecified — is non-public. Unparsable input
- * fails closed (false). IPv4-mapped IPv6 is judged by its inner address. */
-export function isPublicIpAddress(host: string): boolean {
-  const lower = host.toLowerCase().replace(/^\[(.*)\]$/, '$1');
-  const v4 = lower.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (v4) {
-    const octets = v4.slice(1, 5).map(Number);
-    if (octets.some(octet => octet > 255)) return false;
-    const [a, b] = octets;
-    if (a === 10) return false;
-    if (a === 172 && b >= 16 && b <= 31) return false;
-    if (a === 192 && b === 168) return false;
-    if (a === 127) return false;
-    if (a === 169 && b === 254) return false;
-    if (a === 0) return false;
-    if (a === 100 && b >= 64 && b <= 127) return false;
-    if (a === 192 && b === 0 && (octets[2] === 0 || octets[2] === 2)) return false;
-    if (a === 198 && (b === 18 || b === 19)) return false;
-    if (a === 198 && b === 51 && octets[2] === 100) return false;
-    if (a === 203 && b === 0 && octets[2] === 113) return false;
-    if (a >= 224) return false;
-    return true;
-  }
-  if (!lower.includes(':')) return false;
-  const bare = lower.split('%')[0];
-  if (bare === '::' || bare === '::1') return false;
-  if (bare.startsWith('ff')) return false;
-  if (bare.startsWith('fc') || bare.startsWith('fd')) return false;
-  const first = bare.split(':')[0];
-  const firstValue = parseInt(first || '0', 16);
-  if (Number.isFinite(firstValue) && firstValue >= 0xfe80 && firstValue <= 0xfebf) return false;
-  const mapped = bare.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-  if (mapped) return isPublicIpAddress(mapped[1]);
-  if (!/^[0-9a-f:]+$/.test(bare)) return false;
-  return true;
-}
-
-/** Whether fetching this URL stays on the public internet. IP literals are
- * judged directly; hostnames resolve (every returned address must be
- * public); resolution failure or unparsable input fails closed. Used for
- * site-advertised discovery URLs (sitemaps, feeds) and redirect landing
- * checks so a compromised site cannot aim server-side fetches at private
- * services. Seed/homepage fetches keep the crawler-wide trust posture. */
-export async function isPublicInternetUrl(raw: string, resolve: DnsResolver = defaultDnsResolve): Promise<boolean> {
-  let parsed: URL;
-  try {
-    parsed = new URL(raw);
-  } catch {
-    return false;
-  }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
-  const hostname = parsed.hostname;
-  if (/^\d+\.\d+\.\d+\.\d+$/.test(hostname) || hostname.includes(':')) {
-    return isPublicIpAddress(hostname);
-  }
-  let addresses: string[];
-  try {
-    addresses = await resolve(hostname.toLowerCase());
-  } catch {
-    return false;
-  }
-  if (!addresses.length) return false;
-  return addresses.every(address => isPublicIpAddress(address));
-}
+/* The IP/DNS destination guard lives in `publicDestination.ts` so admission
+ * policy can use it without importing the profiler's database/HTTP stack.
+ * Re-exported above for existing profiler callers and tests. */
 
 export interface ProfilerInput {
   siteIdentity: string;
@@ -893,6 +937,10 @@ export interface ProfilerDeps {
   /** Hostname-to-address resolver for the SSRF destination guard. Defaults
    * to system DNS; tests inject fixed answers (never real lookups). */
   resolveHost?: DnsResolver;
+  /** Optional tighter deadline for the seed DNS lookup. Never exceeds the
+   * shared public-destination deadline; callers with a shorter fetch budget
+   * can pass it here. */
+  dnsTimeoutMs?: number;
 }
 
 function provenanceFor(sourceUrl: string, fetchedAt: string, method: string): FieldProvenance {
@@ -904,12 +952,37 @@ function provenanceFor(sourceUrl: string, fetchedAt: string, method: string): Fi
  * finding carries source URL + timestamp + method. Redirects, sitemap
  * entries, and feed items are inventoried as discovery nominations only —
  * this function crawls no further than its bounded inventory list. */
+export type SiteProfilerRunResult =
+  | { status: 'DISABLED'; profile: null }
+  | { status: 'BLOCKED'; profile: null; reason: PublicDestinationReason; hostname?: string }
+  | { status: 'PROFILED'; profile: SiteProfile };
+
 export async function runSiteProfiler(
   input: ProfilerInput,
   deps: ProfilerDeps,
   isEnabled: () => Promise<boolean> = isSiteProfilerEnabled,
-): Promise<{ status: 'DISABLED' | 'PROFILED'; profile: SiteProfile | null }> {
+): Promise<SiteProfilerRunResult> {
   if (!(await isEnabled())) return { status: 'DISABLED', profile: null };
+  // The profiler is a fetch path too. Never inventory a seed that is already
+  // non-public, including a public-looking hostname resolving to private
+  // space. A rejected seed is an explicit limitation, not an empty profile:
+  // returning PROFILED with a null profile made the block indistinguishable
+  // from a successful empty inventory.
+  const seedDestination = await assessPublicDestination(
+    input.seedUrl,
+    deps.resolveHost,
+    deps.dnsTimeoutMs === undefined
+      ? PUBLIC_DESTINATION_DNS_TIMEOUT_MS
+      : Math.min(PUBLIC_DESTINATION_DNS_TIMEOUT_MS, deps.dnsTimeoutMs),
+  );
+  if (!seedDestination.allowed) {
+    return {
+      status: 'BLOCKED',
+      profile: null,
+      reason: seedDestination.reason,
+      hostname: seedDestination.hostname,
+    };
+  }
   const now = deps.now ?? (() => new Date().toISOString());
   const provenance: Record<string, FieldProvenance> = {};
   const stamp = (field: string, sourceUrl: string, method: string) => {

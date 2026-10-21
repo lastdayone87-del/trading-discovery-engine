@@ -1,5 +1,6 @@
 import * as cheerio from 'cheerio';
 import { assessCrawlAdmission } from './communitySurfacePolicy';
+import { assessPublicDestination, type DnsResolver } from './publicDestination';
 import { candidateFromNativeInvite, extractDiscordCandidates, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
 import { browserLaunchOptions, classifyBrowserFailure, isBrowserRuntimeFailure, markBrowserCapabilityReady, markBrowserCapabilityUnavailable, withBrowserRuntimeLease, type BrowserFailureClass } from './browserCapability';
 import type { RenderedLifecycleStage, RenderedZeroPageReason, CrawlDropReason } from './crawlerTelemetry';
@@ -39,6 +40,11 @@ export interface BrowserFallbackBudget {
    * Stable across a single page; callers may seed from scan attempts so a
    * retry can examine controls beyond the first budget window. */
   clickOffset?: number;
+  /** Optional resolver for the rendered-tier public-destination guard. The
+   * browser path is defense-in-depth: static SSRF blocks must never escalate,
+   * and every navigation/subrequest is also checked here. Tests inject a
+   * deterministic resolver; production defaults to system DNS. */
+  resolveHost?: DnsResolver;
 }
 
 export interface BrowserFallbackTelemetry {
@@ -134,7 +140,7 @@ export interface BrowserFallbackResult {
    * alongside (not inside) BrowserFailureClass so retry accounting can defer
    * it attempt-free without tripping browser-capability health marking.
    */
-  failureClass?: BrowserFailureClass | 'NO_PAGE_PROCESSED' | 'RENDERED_FALLBACK_SATURATED';
+  failureClass?: BrowserFailureClass | 'NO_PAGE_PROCESSED' | 'RENDERED_FALLBACK_SATURATED' | 'SSRF_BLOCKED';
   telemetry?: BrowserFallbackTelemetry;
   detail: string;
   /**
@@ -1220,6 +1226,25 @@ export async function finalizeRenderedQueueLifecycle(options: {
  * retained so ownership can be decided after acquisition. */
 export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Partial<BrowserFallbackBudget> = {}): Promise<BrowserFallbackResult> {
   const limits = { ...DEFAULT_BROWSER_FALLBACK_BUDGET, ...budget };
+  // The rendered tier is a separate network client (Chromium), not covered by
+  // the pinned Node fetch. Never launch a browser for a seed that is already
+  // non-public or whose DNS answer is private; fail closed and preserve an
+  // explicit, non-retryable reason for the caller. Static SSRF_BLOCKED seeds
+  // are also barred from escalation before they reach this function.
+  const seedDestination = await assessPublicDestination(seedUrl, limits.resolveHost);
+  if (!seedDestination.allowed) {
+    return {
+      foundInvite: null,
+      inspectedPages: 0,
+      scrolls: 0,
+      clicks: 0,
+      complete: false,
+      retryable: false,
+      timedOut: false,
+      failureClass: 'SSRF_BLOCKED',
+      detail: `Rendered acquisition blocked before browser launch: seed is not a public destination (${seedDestination.reason})${seedDestination.hostname ? `: ${seedDestination.hostname}` : ''}.`,
+    };
+  }
   let inspectedPages = 0, scrolls = 0, clicks = 0;
   // Per-crawl drop accounting (compact ints only): where candidate links or
   // pages were lost to enqueue/click/budget rules. Attached to the result for
@@ -1323,6 +1348,33 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         // queue (see openIsolatedRenderedRequestQueue). Dropped in the finally
         // below on every path so named queues cannot accumulate.
         isolated = await openIsolatedRenderedRequestQueue((name) => RequestQueue.open(name));
+        // Chromium resolves independently of the pinned Node fetch. Check every
+        // HTTP(S) navigation/subrequest against the same public-destination
+        // policy before it leaves the browser. Caching is per host for this
+        // crawl only; the route layer is defense-in-depth, while the static
+        // path remains the DNS-pinned enforcement boundary.
+        const renderedDestinationCache = new Map<string, Promise<boolean>>();
+        const renderedRequestAllowed = (raw: string): Promise<boolean> => {
+          let parsed: URL;
+          try {
+            parsed = new URL(raw);
+          } catch {
+            return Promise.resolve(false);
+          }
+          if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+            // data:, blob:, about:, and similar are not network destinations.
+            return Promise.resolve(true);
+          }
+          const key = parsed.hostname.toLowerCase();
+          let check = renderedDestinationCache.get(key);
+          if (!check) {
+            check = assessPublicDestination(raw, limits.resolveHost)
+              .then(decision => decision.allowed)
+              .catch(() => false);
+            renderedDestinationCache.set(key, check);
+          }
+          return check;
+        };
         const crawler = new PlaywrightCrawler({
           requestQueue: isolated.queue,
           maxRequestsPerCrawl: limits.maxPages,
@@ -1338,8 +1390,18 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           launchContext: { launchOptions: browserLaunchOptions() },
           preNavigationHooks: [async ({ page }) => {
             await page.route('**/*', async route => {
-              const type = route.request().resourceType();
-              if (['image', 'media', 'font'].includes(type)) await route.abort(); else await route.continue();
+              const request = route.request();
+              const type = request.resourceType();
+              if (['image', 'media', 'font'].includes(type)) {
+                await route.abort();
+                return;
+              }
+              if (!(await renderedRequestAllowed(request.url()))) {
+                telemetry.blockedRequests++;
+                await route.abort('blockedbyclient');
+                return;
+              }
+              await route.continue();
             });
           }],
           errorHandler: async ({ request, session }, error) => {
