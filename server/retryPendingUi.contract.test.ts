@@ -15,7 +15,7 @@ test('recoverable Discord validation distinguishes queued, budget-exhausted, ter
   assert.match(resultsTable,/community_retry_job_status === 'PENDING'/);
   assert.match(resultsTable,/community_retry_job_status === 'PROCESSING'/);
   assert.match(resultsTable,/community_retry_job_status === 'FAILED'/);
-  assert.match(resultsTable,/discord_validation_status==='RETRY_PENDING'/);
+  assert.match(resultsTable,/discord_validation_status\s*===\s*'RETRY_PENDING'/);
   assert.doesNotMatch(resultsTable,/Validation retry pending/);
   assert.doesNotMatch(resultsTable,/Re-check Now required/);
   assert.match(dbCore,/community_retry_job_status/);
