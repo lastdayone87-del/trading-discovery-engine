@@ -11,7 +11,7 @@ import {
   reconcileDiscordDiscoveryFromInspection,
 } from './discordProjection';
 import type { DiscordValidationResult } from './discordValidator';
-import { buildChannelListingWhere, CONFIRMED_DISCORD_INVITE_SQL } from './db';
+import { buildChannelListingWhere, CONFIRMED_DISCORD_INVITE_SQL, overlayLockedDiscordProjection } from './db';
 import { projectNotFoundAfterInspection } from './queueManager';
 import { isConfirmedDiscordInvite } from '../src/discordInviteView';
 
@@ -307,4 +307,35 @@ test('pipeline and queue delegate Discord preservation to the shared guards', ()
   assert.match(queue, /const shouldProjectValidation=canProjectDiscordValidation\(channel,selected,selectedCandidate\);/);
   assert.match(queue, /if\(shouldProjectValidation\)\{Object\.assign\(channel,projectDiscordValidation\(channel,selected,selectedCandidate\)\);await selectDiscordCandidate\(channel\.channel_id,selectedCandidate\.candidateId\);\}/);
   assert.doesNotMatch(queue, /channel\.discord_discovery_status==='VALIDATED'&&\(channel\.discord_status==='ACTIVE'\|\|channel\.discord_status==='DEAD'\)/);
+});
+
+test('classification-only upserts take the locked row Discord projection instead of a stale snapshot', () => {
+  const stale = cbrackn({ trading_status: 'UNCERTAIN' }) as any;
+  const locked = cbrackn({
+    discord_status: 'DEAD',
+    discord_invite: null,
+    discord_liveness_status: 'DEAD',
+    discord_validation_status: 'COMPLETED',
+    discord_duplicate_owner_channel_id: 'UC_owner_other',
+    trading_status: 'TRADING_CONFIRMED',
+  }) as any;
+
+  const merged = overlayLockedDiscordProjection(stale, locked);
+  assert.equal(merged.discord_status, 'DEAD', 'a stale ACTIVE snapshot must not resurrect a confirmed DEAD projection');
+  assert.equal(merged.discord_invite, null);
+  assert.equal(merged.discord_liveness_status, 'DEAD');
+  assert.equal(merged.discord_duplicate_owner_channel_id, 'UC_owner_other', 'the whole Discord projection is kept');
+  assert.equal(merged.trading_status, 'UNCERTAIN', 'non-Discord classification fields still come from the caller');
+  assert.equal(overlayLockedDiscordProjection(stale, undefined).discord_status, 'ACTIVE', 'the insert path keeps the caller snapshot');
+
+  const pipeline = readFileSync(fileURLToPath(new URL('./ingestionPipeline.ts', import.meta.url)), 'utf8');
+  assert.equal(
+    (pipeline.match(/upsertChannel\((?:withheldChannel|uncertainChannel),\{preserveDiscordOnUpdate:true\}\)/g) || []).length,
+    2,
+    'both classification-only branches opt into the locked-row projection',
+  );
+
+  const dbCoreSource = readFileSync(fileURLToPath(new URL('./dbCore.ts', import.meta.url)), 'utf8');
+  assert.match(dbCoreSource, /options\?\.preserveDiscordOnUpdate && prior\.rowCount/);
+  assert.match(dbCoreSource, /DISCORD_PROJECTION_WRITE_COLUMNS/);
 });

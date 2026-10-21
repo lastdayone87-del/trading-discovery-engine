@@ -695,7 +695,7 @@ export async function processChannelThroughPipeline(
       Object.assign(withheldChannel,projectTradingReclassificationDiscordState(withheldChannel));
       withheldChannel.last_checked=now;
       applyCandidateObservability(withheldChannel,candidate);
-      await upsertChannel(withheldChannel);
+      await upsertChannel(withheldChannel,{preserveDiscordOnUpdate:true});
       void recordAdmissionShadow({channelId:candidate.channelId,priorState:'WITHHELD_INVESTIGATING',classificationStatus:'NEEDS_REVIEW',investigationState:'REVIEW_ELIGIBLE',classificationDiagnosticId,
         candidateHypothesis:{plausibleTradingHypothesis:false,positiveEvidenceCount:productionClassification.decision.positiveEvidence.length,triagePolicyVersion:CANDIDATE_TRIAGE_POLICY_VERSION},
         evidenceCoverage:{sufficiency:productionClassification.decision.evidenceCollection.sufficiency,degraded:productionClassification.decision.evidenceCollection.degraded,fieldsPresent:productionClassification.decision.evidenceCollection.fieldsPresent,enrichmentStage:currentStage,reasonCodes:['NO_INDEPENDENT_TRADING_HYPOTHESIS_AFTER_ENRICHMENT']}})
@@ -756,7 +756,9 @@ export async function processChannelThroughPipeline(
     uncertainChannel.last_checked = now;
     applyCandidateObservability(uncertainChannel, candidate);
 
-    await upsertChannel(uncertainChannel);
+    // Classification-only write: the upsert keeps the locked row's Discord
+    // projection so a validation committed during classification still wins.
+    await upsertChannel(uncertainChannel,{preserveDiscordOnUpdate:true});
     await recordReviewEligibilityShadow({channelId:candidate.channelId,classificationDiagnosticId,...reviewEligibilityInput,decidedAt:productionClassification.decision.timestamp});
     const authoritativeChannel=(await getChannelById(candidate.channelId))||uncertainChannel;
 

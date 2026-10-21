@@ -46,6 +46,13 @@ when a serving selection already exists, so the scan-attempt reset cannot
 recreate `locator-unvalidated` retry work and the channel reaches a verdict
 while its established projection is preserved.
 
+Classification-only writes are race-safe as well: the ingestion pipeline opts
+into `preserveDiscordOnUpdate`, and `upsertChannel` overlays the Discord
+projection read from the row it already locks inside the upsert transaction.
+A validation result committed while classification was running therefore wins
+over the stale in-memory snapshot, and non-Discord fields still come from the
+caller. The insert path keeps the caller's defaults.
+
 ## Regression coverage
 
 `server/discordStateProjectionPreservation.test.ts` covers:
@@ -64,7 +71,11 @@ while its established projection is preserved.
 - the startup exclusion-audit decision preserving a review-pending invite while
   still cleaning stale non-review invites and rejected-cleanup rows;
 - an exhausted stored locator reaching a terminal verdict even when an
-  established serving selection exists, without re-arming retry work.
+  established serving selection exists, without re-arming retry work;
+- a classification-only upsert keeping the locked row's Discord projection:
+  a stale `ACTIVE` snapshot cannot resurrect a concurrent `DEAD` verdict, and
+  a stale `DEAD` snapshot cannot downgrade a newer live projection
+  (`server/channelUpsertDiscordProjection.postgres.test.ts`).
 
 ## Separate follow-ups (not changed here)
 

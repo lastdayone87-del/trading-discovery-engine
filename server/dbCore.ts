@@ -764,15 +764,43 @@ export async function getChannelById(channelId: string): Promise<ChannelRecord |
   return rowToChannelWithDiscoveryVisibility(res.rows[0]);
 }
 
-export async function upsertChannel(channel: ChannelRecord): Promise<void> {
+const DISCORD_PROJECTION_WRITE_COLUMNS=[
+  'discord_status','discord_invite','discord_discovery_status','discord_candidate_locator',
+  'discord_candidate_id','discord_candidate_raw_locator','discord_candidate_type',
+  'discord_resolution_status','discord_liveness_status','discord_relevance_status',
+  'discord_validation_status','discord_duplicate_owner_channel_id',
+] as const;
+
+/**
+ * Classification-only writes carry a Discord snapshot that may predate a
+ * concurrent validation. When the caller opts in, the locked row's Discord
+ * projection wins over that stale snapshot, so a validation result committed
+ * while classification was running is never overwritten; every non-Discord
+ * field still comes from the caller. Insert paths (no existing row) keep the
+ * caller's defaults. Pure by design so the merge rule is directly testable.
+ */
+export function overlayLockedDiscordProjection<T extends Partial<ChannelRecord>>(proposed:T,locked:Partial<ChannelRecord>|null|undefined):T{
+  if(!locked)return proposed;
+  const merged:{[key:string]:unknown}={...proposed};
+  for(const column of DISCORD_PROJECTION_WRITE_COLUMNS)merged[column]=locked[column];
+  return merged as T;
+}
+
+export async function upsertChannel(channel: ChannelRecord, options?: { preserveDiscordOnUpdate?: boolean }): Promise<void> {
   const db = await getDb();
   const client = await db.connect();
   try {
     await client.query('BEGIN');
     const prior = await client.query(
-      'SELECT quality_score,trading_status FROM channels WHERE channel_id=$1 FOR UPDATE',
+      `SELECT quality_score,trading_status,${DISCORD_PROJECTION_WRITE_COLUMNS.join(',')} FROM channels WHERE channel_id=$1 FOR UPDATE`,
       [channel.channel_id]
     );
+    // The row is locked above for this transaction: a classification-only write
+    // must not push its stale Discord snapshot over a validation result that
+    // committed while classification was running.
+    if (options?.preserveDiscordOnUpdate && prior.rowCount) {
+      channel = overlayLockedDiscordProjection(channel, prior.rows[0]);
+    }
     // Write-path invariant (final country → final scope_eligibility): always
     // derived from the row's country. A stale stored value must never survive
     // a country attribution change; country, status and confidence flow
