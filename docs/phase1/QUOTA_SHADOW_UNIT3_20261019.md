@@ -1,9 +1,11 @@
 # Unit 3 — 9,000-unit/key/day quota cap (shadow evidence + default-OFF enforcement)
 
 Date: 2026-10-19 (updated 2026-10-21) · Shadow branch `main`/`phase1-hardening` head
-`b1aafab`; hard-cap branch `feat/youtube-key-hard-cap` code head `2f4afdd`.
-Evidence runs: shadow [39500041358](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39500041358),
-hard cap [39527946479](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39527946479).
+`b1aafab`; hard-cap PR [#533](https://github.com/lastdayone87-del/trading-discovery-engine/pull/533)
+code head `ac32978`.
+Evidence runs: shadow [39500041358](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39500041358);
+hard cap [39597625145](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39597625145)
+and rotation [39597631538](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39597631538).
 
 Status: the migration-148 shadow implementation is historical evidence. The
 hard-cap implementation on `feat/youtube-key-hard-cap` is **implemented but
@@ -156,7 +158,7 @@ main's 145.
 
 ## Hard-cap enforcement (default OFF) — implementation on `feat/youtube-key-hard-cap`
 
-Date: 2026-10-21 · Branch `feat/youtube-key-hard-cap` code head `2f4afdd`, based on
+Date: 2026-10-21 · Branch `feat/youtube-key-hard-cap` code head `ac32978`, based on
 current main `b1aafab` (merged #530, #531, #532) · Status:
 **implemented, disabled by default, not deployed, not enabled.** Production
 remains unchanged and no migration has been applied to it.
@@ -164,16 +166,18 @@ remains unchanged and no migration has been applied to it.
 ### Design
 
 - **Setting:** `youtube_key_daily_cap_enforced`, default **false**. The setting
-  is read through `resolveKeyCapEnforcement()`; absent/non-`true` values keep
-  the existing shadow-only path. No `app_settings` row is created by code or
-  migration.
+  is read through `resolveKeyCapEnforcement()`; only the literal string `true`
+  enables the cap. Successful absent/false reads keep the existing shadow-only
+  path; a settings-read failure is fail-closed, not evidence of OFF. No
+  `app_settings` row is created by code or migration.
 - **Reused storage:** the existing migration 148
   `youtube_key_cap_shadow_leases` table, plus migration 151's inert
   `youtube_key_cap_shadow_settled` tombstones inherited from the merged #530
   work. **The hard-cap change adds no new table and no new migration.** The
   unique `(quota_day, operation_id)` key is the idempotency authority.
-  Enforced leases expire at the next Pacific midnight and an opportunistic
-  once-per-minute sweep bounds table growth; expired leases never count.
+  Enforced leases expire at the next Pacific midnight; optional lease/event
+  sweeps are **not** run on the enforced admission path. Expired leases never
+  count, and the shadow path keeps its own bounded cleanup.
 - **Reservation point:** `youtubeFetch()` reserves after the final dispatched
   provider key is selected and before the official HTTP request. One stable
   `cap:${operation}:${uuid}` identity is generated per dispatch and reused for
@@ -270,17 +274,44 @@ rejected); settlement failure leaving the conservative lease; Pacific midnight
 + both DST rollovers; restart with a new pool observing persisted leases; and
 two probe-budget concurrency cases.
 
-CI results for `9f6001a` (run
-https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39527946479):
-`npx tsc --noEmit` clean; **51/51 unit** (27 quota cap + 9 dbCore quota +
-15 probe executor) and **21/21 PostgreSQL**, 0 skipped. Local PostgreSQL was not
-available on this host; the postgres:17 CI service is the database proof. No
-enforcement claim is made from shadow observations, and this run did not enable
-or deploy the feature.
+CI results for final code head `ac32978`:
+
+- quota shadow run [39597625145](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39597625145):
+  `npx tsc --noEmit` clean; **51/51 unit** (27 quota cap + 9 dbCore quota +
+  15 probe executor) and **21/21 PostgreSQL**, 0 skipped; **72/72 total**.
+- rotation run [39597631538](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39597631538):
+  **69/69 pass**, 0 skipped.
+- The 3954440 run initially exposed two time-dependent PostgreSQL cases that
+  used wall-clock `now` against fixed-day rows. The test-only fix at `ac32978`
+  pins the dispatch/tombstone instant; the rerun is green. No production-code
+  behavior changed in that test fix.
+- Local PostgreSQL was not available on this host; the postgres:17 CI service
+  is the database proof. No enforcement claim is made from shadow observations,
+  and this run did not enable or deploy the feature.
+
+### Round-2 review disposition
+
+Fixed at `3954440`/`8283bcd`/`ac32978`: literal-`true` parsing, cold/stale
+settings fail-closed behavior, post-spend accounting failures stopping key
+failover, the stale `youtubeKeyHealth.test.ts` assertion, removal of the
+enforced-path sweep, and the Pacific-day test freeze.
+
+Documented rather than changed:
+
+- cold settings failure is intentionally fail-closed (a settings outage is not
+  evidence of OFF);
+- the dispatch path performs one bounded settings read per 30s cache window
+  before spending provider units;
+- the added dispatch-day accounting check remains a source-contract test, while
+  the PostgreSQL suite executes settlement/rollback/restart/midnight cases;
+- an abort during reservation may leave a conservative lease until Pacific
+  midnight (under-admission, never over-spend).
+
 
 ### Rollout gates (all required before enabling)
 
-1. Migrations 148 and 151 applied by the normal deploy migration runner; no manual DDL.
+1. Migrations 146–152 (including the reused 148 leases and 151 tombstones)
+   applied by the normal deploy migration runner; no manual DDL.
 2. CI postgres suite green against postgres:17 with the dedicated URL.
 3. Sustained shadow evidence reviewed: `WOULD_DEFER`/`WOULD_REJECT` rates,
    lock timeouts, day-reset recovery, and key headroom per quota group.
@@ -289,7 +320,8 @@ or deploy the feature.
    and `YOUTUBE_KEY_CAP_UNAVAILABLE` rates and provider rotation behavior.
 6. Rollback is immediate: set the setting to `false` (or delete the row). The
    legacy shadow path resumes; already-created enforced leases remain until the
-   Pacific day reset (conservative) and are swept after expiry.
+   Pacific day reset (conservative). The enforced admission path has no sweep;
+   expired leases are excluded from the projection.
 
 This document does **not** claim the setting is enabled, the feature is
 deployed, or enforcement is active.
