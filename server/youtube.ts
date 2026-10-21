@@ -210,7 +210,7 @@ export async function fetchYouTubePlaylistChannels(playlistId:string,limit:numbe
     for(let attempt=0;attempt<providerIndexes.length;attempt++){const index=providerIndexes[attempt];
       try{const url=buildYouTubeApiUrl('playlistItems',keys[index],{part:'snippet',playlistId,maxResults});const response=await youtubeFetch(url,'playlist-items',1,attempt+1,acquisition,'enrichment',keys[index]);await accountYouTubeQuotaResponse(response, 1);const data=await readYouTubeJsonObject(response, 'playlist-items');
         return (data.items||[]).map((item:any)=>({channelId:String(item.snippet?.videoOwnerChannelId||''),channelName:String(item.snippet?.videoOwnerChannelTitle||''),description:String(item.snippet?.description||''),videoTitles:[String(item.snippet?.title||'')],observedAt})).filter((x:PlaylistChannelObservation)=>x.channelId&&x.channelName);
-      }catch(error){recordProviderFailure(keys[index],error);if(isQuotaExceeded(error))quotaExceededCount++;if(attempt===providerIndexes.length-1){acquisition.providerFailed(quotaExceededCount===providerIndexes.length?'QUOTA_EXHAUSTED':'INDETERMINATE');throwIfAllProvidersCoolingDown(keys);throw error;}}
+      }catch(error){if(isYouTubeQuotaAccountingError(error))throw error;recordProviderFailure(keys[index],error);if(isQuotaExceeded(error))quotaExceededCount++;if(attempt===providerIndexes.length-1){acquisition.providerFailed(quotaExceededCount===providerIndexes.length?'QUOTA_EXHAUSTED':'INDETERMINATE');throwIfAllProvidersCoolingDown(keys);throw error;}}
     }throw new Error('All configured YouTube API keys failed for playlist inspection.');
   } finally { acquisition.release(); }
 }
@@ -909,6 +909,9 @@ export async function searchYouTubeChannelPage(
           return { channels: results, nextPageToken: data.nextPageToken || null, rawResultCount: (data.items || []).length };
         }
       } catch (e) {
+        // A successful response that cannot be accounted must not be fetched
+        // again with another key; the provider already spent the units.
+        if(isYouTubeQuotaAccountingError(e))throw e;
         recordProviderFailure(apiKey, e);
         if (isQuotaExceeded(e)) quotaExceededCount++;
         console.warn(`[YouTube API Pool] Key #${currentIndex + 1} fetch error:`, e);
@@ -995,6 +998,7 @@ export async function fetchRecentVideoDescriptionsWithIds(channelId: string): Pr
         if (searchItems.length > 0) return searchItems;
       }
     } catch (e) {
+      if(isYouTubeQuotaAccountingError(e))throw e;
       recordProviderFailure(apiKey,e);
       if (isQuotaExceeded(e)) quotaExceededCount++;
       console.warn(`[YouTube API] Failed to fetch video descriptions for ${channelId}:`, e);
@@ -1027,9 +1031,10 @@ async function accountYouTubeQuotaResponse(response: Response, units: number): P
   try {
     await retryYouTubeQuotaAccounting(unitsConsumed => incrementQuota(unitsConsumed, providerKey, operationId, reservation ?? shadowOperationId), units);
   } catch (error) {
-    // A cap settlement failure is already typed and carries rotate-only /
-    // never-suspend semantics; do not wrap it as a provider failure.
-    if (isYouTubeKeyCapError(error)) throw error;
+    // Any accounting/settlement failure after a successful provider response
+    // must stop the caller from refetching the same logical request with
+    // another key. Preserve the cause for diagnostics, but surface one typed
+    // accounting error so every provider loop breaks out before failover.
     throw new YouTubeQuotaAccountingError(units, providerKey, { cause: error });
   }
   return providerKey;
@@ -1436,7 +1441,10 @@ export async function fetchYouTubeChannelCountryMetadata(channelId: string, fall
           ? withoutTranscriptLanguages(fallback.transcriptExcerpts)
           : fallback.transcriptExcerpts,
         countryMetadataStatus: officialCountry ? 'AVAILABLE_DECLARED' : 'AVAILABLE_NOT_DECLARED', countryMetadataCheckedAt: checkedAt };
-    } catch (error) { recordProviderFailure(keys[index],error);if (isQuotaExceeded(error)) quotaExceededCount++; }
+    } catch (error) {
+      if(isYouTubeQuotaAccountingError(error))throw error;
+      recordProviderFailure(keys[index],error);if (isQuotaExceeded(error)) quotaExceededCount++;
+    }
   }
   acquisition.providerFailed(quotaExceededCount === keys.length ? 'QUOTA_EXHAUSTED' : 'INDETERMINATE');
   return { ...fallback, countryMetadataStatus: 'UNAVAILABLE', countryMetadataCheckedAt: checkedAt };

@@ -48,10 +48,6 @@ export const ENFORCED_STATEMENT_TIMEOUT_MS = 5_000;
 /** Bound pool acquisition on the enforced path. A checked-out connection that
  * arrives after this deadline is released instead of being used. */
 export const ENFORCED_CONNECT_TIMEOUT_MS = 5_000;
-/** How long a successfully observed OFF setting may still be trusted after a
- * settings read failure. A cold/unknown cache falls back to legacy OFF traffic;
- * a stale OFF cache cannot silently outlive a later ON change. */
-export const ENFORCEMENT_FAILURE_GRACE_MS = 5 * 60_000;
 
 export type ShadowEvent = 'WOULD_DEFER' | 'WOULD_REJECT';
 export type ShadowSettingReader = (key: string, fallback: string) => Promise<string>;
@@ -211,16 +207,13 @@ export function resetShadowConfigCacheForTests(): void {
 let cachedEnforcement: { at: number; enabled: boolean } | null = null;
 
 /**
- * Reads `youtube_key_daily_cap_enforced` (default false). 
+ * Reads `youtube_key_daily_cap_enforced` (default false). Only the literal
+ * string `true` enables the cap; case/whitespace variants remain OFF.
  *
- * Failure semantics:
- *  - A cold/unknown cache falls back to OFF so the default-off feature does
- *    not add a new failure mode to legacy traffic.
- *  - A recently observed OFF value may ride through a settings outage for a
- *    bounded grace window.
- *  - A stale OFF cache or a previously observed ON value fails closed; an
- *    operator who enabled enforcement must not silently lose it after a
- *    settings read failure.
+ * A settings read failure is not evidence that the feature is OFF. It throws a
+ * typed unavailable error so a process that starts while enforcement is ON
+ * cannot silently dispatch unreserved requests. Successful absent/false reads
+ * still preserve the legacy shadow-only path.
  */
 export async function resolveKeyCapEnforcement(
   readSetting: ShadowSettingReader,
@@ -229,12 +222,10 @@ export async function resolveKeyCapEnforcement(
   if (cachedEnforcement && now - cachedEnforcement.at < SHADOW_CONFIG_TTL_MS) return cachedEnforcement.enabled;
   try {
     const raw = await readSetting(ENFORCED_KEY, 'false');
-    const enabled = String(raw).trim().toLowerCase() === 'true';
+    const enabled = raw === 'true';
     cachedEnforcement = { at: now, enabled };
     return enabled;
   } catch (error) {
-    if (!cachedEnforcement) return false;
-    if (cachedEnforcement.enabled === false && now - cachedEnforcement.at < ENFORCEMENT_FAILURE_GRACE_MS) return false;
     throw new YouTubeKeyCapUnavailableError('Unable to read YouTube key cap enforcement setting.', { cause: error });
   }
 }
@@ -245,12 +236,10 @@ export function resetKeyCapEnforcementCacheForTests(): void {
 
 let lastSweepAt = 0;
 let lastEventSweepAt = 0;
-let lastEnforcedSweepAt = 0;
 
 export function resetShadowSweepClockForTests(): void {
   lastSweepAt = 0;
   lastEventSweepAt = 0;
-  lastEnforcedSweepAt = 0;
 }
 
 export interface ShadowDispatchInput {
@@ -737,12 +726,10 @@ export async function reserveEnforcedKeyCap(
   // Keep it until the Pacific day resets; a crashed process then under-admits
   // for the rest of the day instead of reopening capacity it may have spent.
   const expiresAt = new Date(getNextYouTubeQuotaResetAt(now));
-  // Reuse the shadow sweep for day-old enforced leases. Cleanup is never
-  // fatal to an admission decision; it only bounds table growth.
-  if (now.getTime() - lastEnforcedSweepAt >= SHADOW_SWEEP_INTERVAL_MS) {
-    lastEnforcedSweepAt = now.getTime();
-    await sweepShadowLeases(deps.pool, now).catch(() => 0);
-  }
+  // Do not run optional lease/event maintenance before admission: an
+  // unbounded pool query here would delay the reservation and the provider
+  // scheduler. Expired enforced leases are still excluded from the projection
+  // below, and the shadow path performs its own bounded cleanup.
   let client: ShadowConnectionPort | undefined;
   let connectTimer: ReturnType<typeof setTimeout> | undefined;
   let connectTimedOut = false;

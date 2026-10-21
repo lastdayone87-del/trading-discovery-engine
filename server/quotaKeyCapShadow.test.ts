@@ -5,7 +5,6 @@ import {
   ENFORCED_KEY,
   ENFORCED_LOCK_TIMEOUT_MS,
   ENFORCED_STATEMENT_TIMEOUT_MS,
-  ENFORCEMENT_FAILURE_GRACE_MS,
   SHADOW_CAP_UNITS,
   SHADOW_LEASE_TTL_MS,
   YouTubeKeyCapExceededError,
@@ -421,32 +420,29 @@ const enforcedReader = async (key: string, fallback: string): Promise<string> =>
   return fallback;
 };
 
-test('resolveKeyCapEnforcement defaults OFF, bounds cached-OFF failure grace, and fails closed after ON', async () => {
+test('resolveKeyCapEnforcement is literal-true, caches 30s, and fails closed on settings read errors', async () => {
   resetKeyCapEnforcementCacheForTests();
   assert.equal(await resolveKeyCapEnforcement(async (_key, fallback) => fallback), false, 'absent flag is OFF');
   resetKeyCapEnforcementCacheForTests();
-  assert.equal(await resolveKeyCapEnforcement(async () => ' TRUE '), true, 'explicit true enables enforcement');
+  assert.equal(await resolveKeyCapEnforcement(async () => ' TRUE '), false, 'case/whitespace variants are not activation');
+  resetKeyCapEnforcementCacheForTests();
+  assert.equal(await resolveKeyCapEnforcement(async () => 'true'), true, 'only literal true enables enforcement');
   const before = Date.now();
   assert.equal(await resolveKeyCapEnforcement(async () => 'false', before + 1_000), true, 'cached true is not bypassed by a transient re-read');
   resetKeyCapEnforcementCacheForTests();
-  assert.equal(
-    await resolveKeyCapEnforcement(async () => { throw new Error('settings down'); }),
-    false,
-    'cold/unknown settings failure keeps legacy OFF traffic'
+  await assert.rejects(
+    resolveKeyCapEnforcement(async () => { throw new Error('settings down'); }),
+    (error: unknown) => error instanceof YouTubeKeyCapUnavailableError
+      && isYouTubeKeyCapError(error)
+      && /enforcement setting/.test((error as Error).message),
+    'a cold settings failure is not evidence of OFF'
   );
   resetKeyCapEnforcementCacheForTests();
   const base = Date.now();
   assert.equal(await resolveKeyCapEnforcement(async () => 'false', base), false);
-  assert.equal(
-    await resolveKeyCapEnforcement(async () => { throw new Error('settings down'); }, base + 31_000),
-    false,
-    'a recently observed OFF state rides through a bounded settings outage'
-  );
   await assert.rejects(
-    resolveKeyCapEnforcement(async () => { throw new Error('settings down'); }, base + ENFORCEMENT_FAILURE_GRACE_MS + 1),
-    (error: unknown) => error instanceof YouTubeKeyCapUnavailableError
-      && isYouTubeKeyCapError(error)
-      && /enforcement setting/.test((error as Error).message),
+    resolveKeyCapEnforcement(async () => { throw new Error('settings down'); }, base + 31_000),
+    (error: unknown) => error instanceof YouTubeKeyCapUnavailableError,
     'a stale OFF cache cannot outlive a later ON change'
   );
   resetKeyCapEnforcementCacheForTests();
