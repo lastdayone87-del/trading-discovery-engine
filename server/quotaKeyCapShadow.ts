@@ -42,6 +42,16 @@ export const SHADOW_STATEMENT_TIMEOUT_MS = 5_000;
 export const SHADOW_SETTLEMENT_TOMBSTONE_TTL_MS = 15 * 60_000;
 /** Fail-closed reservation lock budget. A reservation waits at most this long. */
 export const ENFORCED_LOCK_TIMEOUT_MS = 5_000;
+/** Bound the per-dispatch reservation statements; a stalled database must not
+ * hold the shared YouTube scheduler indefinitely. */
+export const ENFORCED_STATEMENT_TIMEOUT_MS = 5_000;
+/** Bound pool acquisition on the enforced path. A checked-out connection that
+ * arrives after this deadline is released instead of being used. */
+export const ENFORCED_CONNECT_TIMEOUT_MS = 5_000;
+/** How long a successfully observed OFF setting may still be trusted after a
+ * settings read failure. A cold/unknown cache falls back to legacy OFF traffic;
+ * a stale OFF cache cannot silently outlive a later ON change. */
+export const ENFORCEMENT_FAILURE_GRACE_MS = 5 * 60_000;
 
 export type ShadowEvent = 'WOULD_DEFER' | 'WOULD_REJECT';
 export type ShadowSettingReader = (key: string, fallback: string) => Promise<string>;
@@ -201,10 +211,16 @@ export function resetShadowConfigCacheForTests(): void {
 let cachedEnforcement: { at: number; enabled: boolean } | null = null;
 
 /**
- * Reads `youtube_key_daily_cap_enforced` (default false). A settings read
- * failure is never treated as "disabled": it throws a typed unavailable error
- * so an enabled deployment cannot silently bypass its cap. Normal absent/false
- * values keep the legacy shadow-only path.
+ * Reads `youtube_key_daily_cap_enforced` (default false). 
+ *
+ * Failure semantics:
+ *  - A cold/unknown cache falls back to OFF so the default-off feature does
+ *    not add a new failure mode to legacy traffic.
+ *  - A recently observed OFF value may ride through a settings outage for a
+ *    bounded grace window.
+ *  - A stale OFF cache or a previously observed ON value fails closed; an
+ *    operator who enabled enforcement must not silently lose it after a
+ *    settings read failure.
  */
 export async function resolveKeyCapEnforcement(
   readSetting: ShadowSettingReader,
@@ -217,9 +233,8 @@ export async function resolveKeyCapEnforcement(
     cachedEnforcement = { at: now, enabled };
     return enabled;
   } catch (error) {
-    // Last-known state: an enabled deployment stays fail-closed, while a
-    // successfully observed OFF state keeps the legacy shadow-only behavior.
-    if (cachedEnforcement?.enabled === false) return false;
+    if (!cachedEnforcement) return false;
+    if (cachedEnforcement.enabled === false && now - cachedEnforcement.at < ENFORCEMENT_FAILURE_GRACE_MS) return false;
     throw new YouTubeKeyCapUnavailableError('Unable to read YouTube key cap enforcement setting.', { cause: error });
   }
 }
@@ -669,6 +684,26 @@ function capUnavailable(
 }
 
 /**
+ * A reservation is bound to the Pacific quota day current at insert time. The
+ * database/lock waits can cross midnight; never dispatch a new-day request
+ * against yesterday's capacity. Failing closed here is safer than spending
+ * unreserved units on the new day.
+ */
+export function assertKeyCapReservationDayCurrent(
+  context: KeyCapReservationContext,
+  now: Date = new Date(),
+): void {
+  const currentDay = getYouTubeQuotaDay(now);
+  if (context.quotaDay !== currentDay) {
+    throw capUnavailable('YouTube key cap reservation crossed the Pacific quota day before dispatch.', {
+      quotaDay: context.quotaDay,
+      keyFingerprint: context.keyFingerprint,
+      operationId: context.operationId,
+    });
+  }
+}
+
+/**
  * Reserves capacity only when `youtube_key_daily_cap_enforced=true`; returns
  * null (zero DB work beyond the settings read) when OFF. Callers must treat a
  * thrown error as fatal for the official request.
@@ -708,15 +743,35 @@ export async function reserveEnforcedKeyCap(
     lastEnforcedSweepAt = now.getTime();
     await sweepShadowLeases(deps.pool, now).catch(() => 0);
   }
-  let client: ShadowConnectionPort;
+  let client: ShadowConnectionPort | undefined;
+  let connectTimer: ReturnType<typeof setTimeout> | undefined;
+  let connectTimedOut = false;
   try {
-    client = await deps.pool.connect();
+    const pending = deps.pool.connect();
+    // A timed-out connect can still resolve later. Release that late
+    // connection instead of leaking it or allowing it to be used after the
+    // caller has already failed closed.
+    pending.then(late => { if (connectTimedOut) late.release?.(); }).catch(() => undefined);
+    const timeout = new Promise<never>((_resolve, reject) => {
+      connectTimer = setTimeout(() => {
+        connectTimedOut = true;
+        reject(capUnavailable('YouTube key cap database connection timed out.', { quotaDay, keyFingerprint, operationId }));
+      }, ENFORCED_CONNECT_TIMEOUT_MS);
+    });
+    client = await Promise.race([pending, timeout]);
   } catch (error) {
+    if (isYouTubeKeyCapError(error)) throw error;
     throw capUnavailable('YouTube key cap database connection failed.', { quotaDay, keyFingerprint, operationId }, error);
+  } finally {
+    if (connectTimer) clearTimeout(connectTimer);
+  }
+  if (!client) {
+    throw capUnavailable('YouTube key cap database connection failed.', { quotaDay, keyFingerprint, operationId });
   }
   try {
     await client.query('BEGIN');
     await client.query(`SET LOCAL lock_timeout = '${lockTimeoutMs}ms'`);
+    await client.query(`SET LOCAL statement_timeout = '${ENFORCED_STATEMENT_TIMEOUT_MS}ms'`);
     try {
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
         `youtube-key-cap-enforce:${quotaDay}:${keyFingerprint}`,
@@ -791,29 +846,6 @@ export async function reserveEnforcedKeyCap(
     }, error);
   } finally {
     client.release?.();
-  }
-}
-
-/**
- * Releases an exact reservation for a failed (non-OK / thrown) provider call.
- * Enforce-mode failures throw typed unavailable (fail closed); shadow-mode
- * failures are swallowed because the lease expires by TTL.
- */
-export async function releaseKeyCapReservation(
-  pool: ShadowQueryClient,
-  context: KeyCapReservationContext,
-): Promise<boolean> {
-  try {
-    const result = await pool.query(
-      `DELETE FROM youtube_key_cap_shadow_leases WHERE quota_day = $1 AND operation_id = $2 AND key_fingerprint = $3`,
-      [context.quotaDay, context.operationId, context.keyFingerprint],
-    );
-    return (result.rowCount ?? 0) > 0;
-  } catch (error) {
-    if (context.mode === 'enforce') {
-      throw capUnavailable('YouTube key cap reservation release failed.', context, error);
-    }
-    return false;
   }
 }
 

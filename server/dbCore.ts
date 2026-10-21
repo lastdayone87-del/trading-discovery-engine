@@ -1088,7 +1088,6 @@ export async function incrementQuota(
   // current-day aggregate; give it the current day so a late prior-day charge
   // can never rewind last_reset and zero the current day's usage.
   const keyQuotaDay=reservation?.quotaDay||getYouTubeQuotaDay();
-  const trackerDay=getYouTubeQuotaDay();
   if(reservation?.mode==='enforce'&&reservation.keyFingerprint!==keyFingerprint){
     throw new YouTubeKeyCapUnavailableError('YouTube key cap reservation key does not match the charged provider key.',{
       quotaDay:reservation.quotaDay,keyFingerprint:reservation.keyFingerprint,operationId:reservation.operationId,
@@ -1102,6 +1101,11 @@ export async function incrementQuota(
   const shadowConfig=reservation?null:await resolveShadowConfig(getAppSetting).catch(()=>null); const db=await getDb(); const client=await db.connect(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=getDailyYouTubeQuotaBudget();
   try{
     await client.query('BEGIN');
+    // Read the aggregate tracker day after pool acquisition and BEGIN. A
+    // connection wait can cross Pacific midnight; using a pre-wait day would
+    // let ensureYouTubeQuotaDay reset the tracker backward and erase the new
+    // day's usage. The per-key reservation day remains the dispatch day.
+    const trackerDay=getYouTubeQuotaDay();
     if (operationId) {
       // Idempotency guard: one row per accounted provider response, written
       // in the same transaction as the charge. A retry after an unknown

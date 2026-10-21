@@ -215,6 +215,9 @@ test('incrementQuota combines group-aware budgeting, operationId idempotency, an
   // settlement must not rewind last_reset and zero current-day usage.
   assert.ok(charge.includes('const keyQuotaDay=reservation?.quotaDay||getYouTubeQuotaDay();'));
   assert.ok(charge.includes('const trackerDay=getYouTubeQuotaDay();'));
+  const beginIndex = charge.indexOf("await client.query('BEGIN')");
+  const trackerIndex = charge.indexOf('const trackerDay=getYouTubeQuotaDay();');
+  assert.ok(beginIndex >= 0 && trackerIndex > beginIndex, 'tracker day is sampled after pool acquisition/BEGIN');
   assert.ok(charge.includes('ensureYouTubeQuotaDay(client,trackerDay,limit)'));
   assert.ok(charge.includes('ensureYouTubeKeyRows(client,keyQuotaDay,keys,perKey)'));
   assert.ok(charge.includes('[units,limit,trackerDay]'));

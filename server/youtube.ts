@@ -3,6 +3,7 @@ import { ChannelActivityBand, CountryMetadataStatus, CountryVocabulary } from '.
 import { incrementQuota, getAppSetting, getDb, getYouTubeKeyPool, appendProviderCallEvent, recordYouTubeInvalidInput, isYouTubeInputQuarantined, recordYouTubeProviderSuspension } from './db';
 import { fingerprintYouTubeKey } from './youtubeQuotaAttribution';
 import {
+  assertKeyCapReservationDayCurrent,
   isYouTubeKeyCapError,
   recordShadowDispatchSafe,
   reserveEnforcedKeyCap,
@@ -494,9 +495,14 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
             throw error;
           }
         }
+        if(capReservation){
+          // The reservation transaction may have waited across Pacific
+          // midnight. Do not send a new-day request against yesterday's
+          // capacity; fail closed and let the caller retry.
+          assertKeyCapReservationDayCurrent(capReservation, new Date());
+        }
         if(dispatchedProviderKey && !capReservation){
-          // Shadow-only cap observation (never blocks or alters dispatch):
-          // record an in-flight lease plus any projected WOULD_DEFER/
+          // Shadow-only cap observation (never blocks or alters dispatch):          // record an in-flight lease plus any projected WOULD_DEFER/
           // WOULD_REJECT for the 9,000-unit/day per-key cap. Disabled by
           // default; every failure is swallowed inside the helper.
           //
@@ -582,6 +588,19 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
     return response;
   } catch(error) {
     shadowAbort?.abort();
+    // executeProviderCall normalizes unknown failures into ProviderCallError.
+    // Cap admission failures are control-flow signals, not provider failures:
+    // unwrap them so callers can see YOUTUBE_KEY_CAP_EXCEEDED/UNAVAILABLE and
+    // never mark the key suspended.
+    const capError = isYouTubeKeyCapError(error)
+      ? error
+      : isYouTubeKeyCapError((error as any)?.cause)
+        ? (error as any).cause
+        : null;
+    if(capError&&typeof capError==='object'){
+      if(dispatchedProviderKey)(capError as any).providerKey=dispatchedProviderKey;
+      throw capError;
+    }
     if(dispatchedProviderKey&&error&&typeof error==='object'){
       const wrappedCause=(error as any).cause;
       const providerFailureRecorded=(error as any).providerFailureRecorded===true||(wrappedCause&&typeof wrappedCause==='object'&&(wrappedCause as any).providerFailureRecorded===true);
@@ -1385,10 +1404,13 @@ export async function fetchYouTubeChannelCountryMetadata(channelId: string, fall
     try {
       const url = buildYouTubeApiUrl('channels',keys[index],{part:'snippet,brandingSettings,statistics',id:channelId});
       const response = await youtubeFetch(url, 'channel-country-metadata', 1, attempt + 1, acquisition, 'enrichment', keys[index]);
+      // A successful channels.list response consumed one unit even when the
+      // payload has no items[0] or later fails validation. Account before
+      // inspecting the body so not-found/invalid bodies cannot hide spend.
+      await accountYouTubeQuotaResponse(response, 1);
       const data = await readYouTubeJsonObject(response, 'channel-country-metadata');
       const channel = data.items?.[0];
       if (!channel) throw new Error(`YouTube channel '${channelId}' was not found.`);
-      await accountYouTubeQuotaResponse(response, 1);
       const officialCountry = channel.brandingSettings?.channel?.country;
       const subscriberCount = channel.statistics?.hiddenSubscriberCount === true ? fallback.subscriberCount : (channel.statistics?.subscriberCount || fallback.subscriberCount);
       // Same validated fallback rules as enrichment: already-fetched

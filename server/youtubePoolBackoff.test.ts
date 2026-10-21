@@ -53,4 +53,4 @@ test('YouTube acquisition reports provider success only after validated JSON and
   }
 });
 
-test('quota reason detection follows wrapped provider errors without treating generic failures as exhaustion',()=>{const quota=Object.assign(new Error('Provider rate limit reached.'),{cause:Object.assign(new Error('YouTube HTTP 403 (quotaExceeded)'),{quotaExceeded:true})});assert.equal(isQuotaExceeded(quota),true);assert.equal(isQuotaExceeded(Object.assign(new Error('YouTube HTTP 503'),{status:503})),false)});
+test('quota reason detection follows wrapped provider errors without treating generic failures as exhaustion',()=>{const quota=Object.assign(new Error('Provider rate limit reached.'),{cause:Object.assign(new Error('YouTube HTTP 403 (quotaExceeded)'),{quotaExceeded:true})});assert.equal(isQuotaExceeded(quota),true);assert.equal(isQuotaExceeded(Object.assign(new Error('YouTube HTTP 503'),{status:503})),false);assert.equal(isQuotaExceeded(Object.assign(new Error('local cap'),{code:'YOUTUBE_KEY_CAP_EXCEEDED',keyCapExceeded:true})),true,'local cap exhaustion is classified as quota exhaustion, not a dead key')});
