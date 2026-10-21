@@ -110,6 +110,69 @@ test('cbrackn: a validated ACTIVE invite survives a later UNCERTAIN trading recl
   assert.equal(hasEstablishedValidatedDiscordSelection(original), true);
 });
 
+test('legacy ACTIVE/DEAD rows with missing or NOT_DISCOVERED discovery remain established', () => {
+  for (const discoveryStatus of [undefined, 'NOT_DISCOVERED']) {
+    const legacy = cbrackn({
+      discord_discovery_status: discoveryStatus,
+      discord_validation_status: undefined,
+    }) as any;
+    assert.equal(
+      hasEstablishedValidatedDiscordSelection(legacy),
+      true,
+      `legacy ACTIVE row with discovery=${String(discoveryStatus)} must be established`,
+    );
+    assert.equal(
+      canProjectDiscordValidation(legacy, invalidSelectedValidation, invalidCandidate),
+      false,
+      'a different invalid candidate must not replace a legacy serving invite',
+    );
+
+    const reclassified = { ...legacy } as any;
+    Object.assign(reclassified, projectTradingReclassificationDiscordState(legacy));
+    assert.equal(reclassified.discord_status, 'ACTIVE');
+    assert.equal(reclassified.discord_invite, VALID_URL);
+  }
+
+  const legacyDead = cbrackn({
+    discord_status: 'DEAD',
+    discord_discovery_status: 'NOT_DISCOVERED',
+    discord_validation_status: undefined,
+  }) as any;
+  assert.equal(hasEstablishedValidatedDiscordSelection(legacyDead), true);
+
+  const legacyDeadWithoutInvite = cbrackn({
+    discord_status: 'DEAD',
+    discord_invite: null,
+    discord_candidate_id: null,
+    discord_candidate_locator: null,
+    discord_discovery_status: 'NOT_DISCOVERED',
+    discord_validation_status: undefined,
+  }) as any;
+  assert.equal(hasEstablishedValidatedDiscordSelection(legacyDeadWithoutInvite), false);
+
+  const explicitFailure = cbrackn({
+    discord_discovery_status: 'DISCOVERED_VALIDATION_FAILED',
+    discord_validation_status: 'RETRY_PENDING',
+  }) as any;
+  assert.equal(
+    hasEstablishedValidatedDiscordSelection(explicitFailure),
+    false,
+    'an explicit validation failure must remain repairable',
+  );
+});
+
+test('review-only projection preserves an existing invite when the selection is not established', () => {
+  const existing = cbrackn({
+    discord_status: 'UNCERTAIN',
+    discord_discovery_status: 'NOT_DISCOVERED',
+    discord_validation_status: undefined,
+  }) as any;
+
+  const projected = projectTradingReclassificationDiscordState(existing);
+  assert.equal(projected.discord_status, 'UNCERTAIN');
+  assert.equal(projected.discord_invite, VALID_URL);
+});
+
 test('cbrackn: a later inspection containing only RuhggKuW cannot replace the live aHJH5Zuxgb invite', () => {
   const reclassified = cbrackn({ trading_status: 'UNCERTAIN', discord_status: 'UNCERTAIN' }) as any;
   assert.equal(hasEstablishedValidatedDiscordSelection(reclassified), true, 'validation identity is independent of the mutable top-level status');
@@ -238,7 +301,8 @@ test('pipeline and queue delegate Discord preservation to the shared guards', ()
   assert.match(pipeline, /preservedDiscordState=existing&&hasEstablishedValidatedDiscordSelection\(existing\)/);
   assert.match(pipeline, /uncertainChannel\.discord_status = preservedDiscordState\?\.discord_status \?\? 'UNCERTAIN'/);
   assert.doesNotMatch(pipeline, /uncertainChannel\.discord_status = 'UNCERTAIN';/);
-  assert.match(pipeline, /withheldChannel\.discord_status=preservedDiscordState\?\.discord_status\?\?'UNCERTAIN'/);
+  assert.match(pipeline, /Object\.assign\(withheldChannel,projectTradingReclassificationDiscordState\(withheldChannel\)\)/);
+  assert.doesNotMatch(pipeline, /withheldChannel\.discord_invite=preservedDiscordState\?\.discord_invite\?\?null/);
 
   assert.match(queue, /const shouldProjectValidation=canProjectDiscordValidation\(channel,selected,selectedCandidate\);/);
   assert.match(queue, /if\(shouldProjectValidation\)\{Object\.assign\(channel,projectDiscordValidation\(channel,selected,selectedCandidate\)\);await selectDiscordCandidate\(channel\.channel_id,selectedCandidate\.candidateId\);\}/);

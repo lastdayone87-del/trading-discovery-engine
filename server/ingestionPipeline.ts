@@ -689,8 +689,10 @@ export async function processChannelThroughPipeline(
       withheldChannel.trading_status='NEEDS_REVIEW'; withheldChannel.trading_confidence_score=tradingVal.confidenceScore;
       withheldChannel.trading_category=tradingVal.category; withheldChannel.trading_relevance_breakdown=tradingVal.breakdown;
       withheldChannel.scan_status='NEEDS_REVIEW';
-      withheldChannel.discord_status=preservedDiscordState?.discord_status??'UNCERTAIN';
-      withheldChannel.discord_invite=preservedDiscordState?.discord_invite??null;
+      // This branch performs no Discord validation. Reuse the shared
+      // classification-only projection so an existing invite is never cleared
+      // merely because the row is not recognized as an established selection.
+      Object.assign(withheldChannel,projectTradingReclassificationDiscordState(withheldChannel));
       withheldChannel.last_checked=now;
       applyCandidateObservability(withheldChannel,candidate);
       await upsertChannel(withheldChannel);

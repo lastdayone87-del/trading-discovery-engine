@@ -17,10 +17,21 @@ type DiscordSelectionIdentity=Pick<ChannelRecord,
  * the durable authority for this decision.
  *
  * Legacy ACTIVE/DEAD rows without the separated validation columns remain
- * protected for compatibility.
+ * protected for compatibility. Migration 067 gives those rows the
+ * NOT_DISCOVERED default even though they already carry a serving invite, so
+ * the legacy shape must be recognized before the VALIDATED-only check.
  */
 export function hasEstablishedValidatedDiscordSelection(channel:DiscordSelectionIdentity):boolean{
-  if(channel.discord_discovery_status!=='VALIDATED')return false;
+  const legacyServingStatus=channel.discord_status==='ACTIVE'
+    ||channel.discord_status==='ACTIVE_LOW_VOLUME'
+    ||channel.discord_status==='DEAD';
+  if(channel.discord_discovery_status!=='VALIDATED'){
+    // Only the pre-067 default is legacy-compatible. An explicit
+    // DISCOVERED_VALIDATION_FAILED row must remain eligible for repair.
+    return legacyServingStatus
+      &&Boolean(channel.discord_invite)
+      &&(!channel.discord_discovery_status||channel.discord_discovery_status==='NOT_DISCOVERED');
+  }
   const completed=channel.discord_validation_status==='COMPLETED'||channel.discord_validation_status==='SUCCEEDED';
   const hasCandidateIdentity=Boolean(channel.discord_candidate_id||channel.discord_candidate_locator||channel.discord_invite);
   return (completed&&hasCandidateIdentity)

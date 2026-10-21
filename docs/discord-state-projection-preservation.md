@@ -47,7 +47,11 @@ validation either.
 - a genuinely dead selected candidate still transitioning to `DEAD`;
 - a new valid candidate still being selected;
 - dashboard count/filter/recent-confirmed consistency;
-- failed/partial reconciliation not downgrading completed validation.
+- failed/partial reconciliation not downgrading completed validation;
+- legacy `ACTIVE`/`DEAD` rows defaulted to `NOT_DISCOVERED` by migration 067
+  remaining established when they carry a serving invite;
+- the post-enrichment review-only path retaining an existing invite even when
+  no established selection is recognized.
 
 ## Separate follow-ups (not changed here)
 
