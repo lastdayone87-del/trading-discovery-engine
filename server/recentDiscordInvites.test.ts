@@ -9,7 +9,7 @@ import type { ChannelRecord } from '../src/types';
 const serving = { predicate: "country_status <> 'REJECTED'", scope: 'ELIGIBLE_OPERATOR_VISIBLE_CHANNELS' };
 const baseFilters = { includeRejected: false, diagnosticsOnly: false };
 type InviteFields = Pick<ChannelRecord,
-  'discord_invite'|'discord_status'|'discord_validation_status'|'discord_liveness_status'|'discord_discovery_status'|'discord_duplicate_owner_channel_id'>;
+  'discord_invite'|'discord_status'|'discord_validation_status'|'discord_liveness_status'|'discord_discovery_status'|'discord_duplicate_owner_channel_id'|'discord_selected_invite_conflict'>;
 
 const confirmed: InviteFields = {
   discord_invite: 'https://discord.gg/trading',
@@ -18,6 +18,7 @@ const confirmed: InviteFields = {
   discord_liveness_status: 'ACTIVE',
   discord_discovery_status: 'VALIDATED',
   discord_duplicate_owner_channel_id: null,
+  discord_selected_invite_conflict: false,
 };
 
 test('recent view requires a confirmed, validated, live invite before pagination', () => {
@@ -27,7 +28,8 @@ test('recent view requires a confirmed, validated, live invite before pagination
   assert.match(result.where, /discord_liveness_status='ACTIVE'/);
   assert.match(result.where, /discord_discovery_status='VALIDATED'/);
   assert.match(result.where, /discord_status IN \('ACTIVE','ACTIVE_LOW_VOLUME','NON_TRADING'\)/);
-  assert.match(result.where, /discord_duplicate_owner_channel_id IS NULL/);
+  assert.match(result.where, /NOT \(EXISTS \([\s\S]*discord_invite_registry owner[\s\S]*owner\.first_channel_id <> channel_id/);
+  assert.doesNotMatch(result.where, /discord_duplicate_owner_channel_id IS NULL/);
   // Category selection is an independent AND clause, not an override.
   assert.match(result.where, /discord_status=\$1/);
   assert.deepEqual(result.values, ['ACTIVE_LOW_VOLUME']);
@@ -48,7 +50,10 @@ test('local confirmed-invite filter excludes non-finds and unconfirmed states', 
   assert.equal(isConfirmedDiscordInvite({ ...confirmed, discord_status: 'PENDING' }), false);
   assert.equal(isConfirmedDiscordInvite({ ...confirmed, discord_status: 'DEAD' }), false);
   assert.equal(isConfirmedDiscordInvite({ ...confirmed, discord_invite: null }), false);
-  assert.equal(isConfirmedDiscordInvite({ ...confirmed, discord_duplicate_owner_channel_id: 'UC-owner' }), false);
+  assert.equal(isConfirmedDiscordInvite({ ...confirmed, discord_duplicate_owner_channel_id: 'UC-owner' }), true,
+    'historical provenance for a discarded candidate must not hide the selected invite');
+  assert.equal(isConfirmedDiscordInvite({ ...confirmed, discord_selected_invite_conflict: true }), false,
+    'a selected invite registered to another channel is excluded');
   assert.equal(isConfirmedDiscordInvite({ ...confirmed, discord_validation_status: 'RETRY_PENDING' }), false);
   assert.equal(isConfirmedDiscordInvite({ ...confirmed, discord_liveness_status: 'UNCERTAIN' }), false);
   assert.equal(isConfirmedDiscordInvite({ ...confirmed, discord_discovery_status: 'DISCOVERED_VALIDATION_FAILED' }), false);
@@ -59,9 +64,14 @@ test('recent invite sorting is server-side and has a stable channel tie-breaker'
   const server = readFileSync(fileURLToPath(new URL('../server.ts', import.meta.url)), 'utf8');
   const query = readFileSync(fileURLToPath(new URL('../src/channelListingQuery.ts', import.meta.url)), 'utf8');
   const ui = readFileSync(fileURLToPath(new URL('../src/components/ResultsTable.tsx', import.meta.url)), 'utf8');
+  const view = readFileSync(fileURLToPath(new URL('../src/discordInviteView.ts', import.meta.url)), 'utf8');
   assert.match(db, /const orderBy=args\.recentInvites\?RECENT_INVITE_ORDER_SQL:'first_seen DESC,channel_id'/);
   assert.match(db, /ORDER BY \$\{orderBy\} LIMIT/);
   assert.match(db, /RECENT_INVITE_ORDER_SQL = 'discord_invite_first_validated_at DESC NULLS LAST,channel_id DESC'/);
+  assert.match(db, /DISCORD_SELECTED_INVITE_CONFLICT_SQL\} AS discord_selected_invite_conflict/);
+  assert.match(db, /discord_selected_invite_conflict: row\.discord_selected_invite_conflict/);
+  assert.match(view, /!channel\.discord_selected_invite_conflict/);
+  assert.doesNotMatch(view, /!channel\.discord_duplicate_owner_channel_id/);
   assert.match(server, /recentInvites:req\.query\.recent_invites==='true'/);
   assert.match(query, /if\(filters\.recentInvites\)params\.set\('recent_invites','true'\)/);
   assert.match(ui, /Recently confirmed/);

@@ -7,6 +7,7 @@ import {
   completeJob,
   failJob,
   recoverStaleJobs,
+  recoverStaleChannelLocks,
   getChannelById,
   getQueriesByCountry,
   upsertChannel,
@@ -617,6 +618,7 @@ export async function processNextSearchJob(
   workerId = WORKER_ID
 ): Promise<boolean> {
   await recoverStaleJobs();
+  await recoverStaleChannelLocks();
   await recoverStaleInvestigationSteps();
   await reconcileOrphanInvestigations();
   await reconcileCommunityAcquisitionRecovery(getDb, getChannelById, upsertChannel, 20, Date.now(), (channelId, retryReason) => enqueueCommunityAcquisitionRetry(channelId, { attemptFree: true, code: COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, reason: retryReason || 'Recovery-triggered community retry', retryAt: undefined, retryReason: retryReason === 'BROWSER_RUNTIME_UNAVAILABLE' ? 'BROWSER_RUNTIME_UNAVAILABLE' : 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE' }, 'RECOVERY'));
