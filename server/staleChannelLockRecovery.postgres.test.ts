@@ -31,6 +31,11 @@ maybe('runtime sweep recovers only abandoned locks without a live processing job
   const insertedJobs: string[] = [];
   const cleanup = async () => {
     if (insertedJobs.length) await db.query(`DELETE FROM jobs WHERE id = ANY($1::uuid[])`, [insertedJobs]).catch(() => undefined);
+    // channel_reviews holds an ON DELETE RESTRICT FK to channels; the eligibility
+    // decision row itself is immutable by design, so only the repairable projection
+    // and the review row are cleaned up.
+    await db.query(`DELETE FROM channel_reviews WHERE channel_id = ANY($1::text[])`, [Object.values(ids)]).catch(() => undefined);
+    await db.query(`DELETE FROM review_eligibility_projection WHERE channel_id = ANY($1::text[])`, [Object.values(ids)]).catch(() => undefined);
     await db.query(`DELETE FROM channels WHERE channel_id = ANY($1::text[])`, [Object.values(ids)]).catch(() => undefined);
   };
   await cleanup();
@@ -66,11 +71,43 @@ maybe('runtime sweep recovers only abandoned locks without a live processing job
     const res = await db.query(`SELECT scan_status FROM channels WHERE channel_id=$1`, [channelId]);
     return res.rows[0]?.scan_status as string | undefined;
   };
+  /**
+   * Migration 094's channels_authoritative_needs_review trigger rewrites any
+   * NEEDS_REVIEW write without an authoritative serving decision back to
+   * UNCERTAIN/ENRICHMENT_PENDING. Reproduce the real lineage first (serving
+   * decision -> ELIGIBLE projection -> PENDING review), then flip the channel,
+   * so the sweep sees a genuine LOCKED-but-NEEDS_REVIEW row to preserve.
+   */
+  const seedAuthoritativeReview = async (channelId: string, updatedAt: string) => {
+    const decision = await db.query(
+      `INSERT INTO review_eligibility_decisions(
+        decision_key,channel_id,status,reason_codes,input_snapshot,input_checksum,
+        policy_version,mode,assignment_basis_points,randomization_value,assigned,serving_authority
+      ) VALUES($1,$2,'ELIGIBLE','[]'::jsonb,'{}'::jsonb,'stale-lock-fixture','review-eligibility-v2-serving-1','CANARY',0,0,true,true)
+      RETURNING id`,
+      [`${PREFIX}decision-${channelId}`, channelId],
+    );
+    const decisionId = String(decision.rows[0].id);
+    await db.query(
+      `INSERT INTO review_eligibility_projection(
+        channel_id,status,version,decision_id,reason_codes,evidence_checksum,policy_version,decided_at
+      ) VALUES($1,'ELIGIBLE',1,$2,'[]'::jsonb,'stale-lock-fixture','review-eligibility-v2-serving-1',now())`,
+      [channelId, decisionId],
+    );
+    await db.query(
+      `INSERT INTO channel_reviews(channel_id,state,evidence_snapshot,pending_since)
+       VALUES($1,'PENDING',$2::jsonb,now())`,
+      [channelId, JSON.stringify({ source: 'review-eligibility-v2-serving', eligibilityDecisionId: decisionId })],
+    );
+    await db.query(`UPDATE channels SET trading_status='NEEDS_REVIEW',updated_at=$2::timestamptz WHERE channel_id=$1`, [channelId, updatedAt]);
+  };
 
   await insertChannel(ids.old, { updatedAt: new Date(Date.now() - 61 * 60_000).toISOString() });
   await insertChannel(ids.fresh);
   await insertChannel(ids.live, { updatedAt: new Date(Date.now() - 61 * 60_000).toISOString() });
-  await insertChannel(ids.review, { updatedAt: new Date(Date.now() - 61 * 60_000).toISOString(), tradingStatus: 'NEEDS_REVIEW' });
+  const reviewUpdatedAt = new Date(Date.now() - 61 * 60_000).toISOString();
+  await insertChannel(ids.review, { updatedAt: reviewUpdatedAt, tradingStatus: 'UNCERTAIN' });
+  await seedAuthoritativeReview(ids.review, reviewUpdatedAt);
   await insertChannel(ids.enrich, { updatedAt: new Date(Date.now() - 61 * 60_000).toISOString(), tradingStatus: 'UNCERTAIN' });
   await insertJob('ENRICH_CHANNEL', 'PROCESSING', ids.live);
   await insertJob('ENRICH_CHANNEL', 'PENDING', ids.enrich);
