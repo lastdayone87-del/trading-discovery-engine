@@ -217,13 +217,6 @@ function summariseChannel(row) {
 }
 
 (async () => {
-  const client = new Client({
-    connectionString: DATABASE_URL,
-    ssl: DATABASE_URL.includes('sslmode=require') ? { rejectUnauthorized: false } : undefined,
-    application_name: 'dashboard-paid-community-investigation',
-    statement_timeout: 120000,
-  });
-  await client.connect();
   const report = {
     generatedAt: new Date().toISOString(),
     criteria: {
@@ -242,7 +235,13 @@ function summariseChannel(row) {
     stevenLord: null,
   };
 
+  const client = new Client({
+    connectionString: DATABASE_URL,
+    application_name: 'dashboard-paid-community-investigation',
+    statement_timeout: 120000,
+  });
   try {
+    await client.connect();
     await client.query('BEGIN TRANSACTION READ ONLY');
     await client.query("SET LOCAL statement_timeout = '120s'");
     await client.query("SET LOCAL lock_timeout = '5s'");
