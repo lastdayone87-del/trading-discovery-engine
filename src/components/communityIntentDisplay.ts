@@ -1,4 +1,5 @@
 import type { ChannelRecord, CommunityIntentEvidence } from '../types';
+import { isPlatformOwnedCommunityUrl } from '../utils/platformOwnedPages';
 
 export interface CommunityIntentEvidenceView {
   key: string;
@@ -27,7 +28,19 @@ export function communityIntentDisplay(
   const status = channel.community_discovery_status;
   const intents = channel.community_intents || [];
   const paidIntentItems = intents.filter(item => item?.communityUrl && item.intent === 'PAID');
-  const paid = status === 'PAID_COMMUNITY_INDICATED' || intents.some(item => item.intent === 'PAID');
+  // Platform-owned marketing/docs/newsroom pages can carry price wording
+  // without describing the creator's own community. When every PAID record is
+  // one of those pages, the badge must not present the channel as paid;
+  // genuine creator-specific evidence still does, and mixed evidence keeps
+  // the badge. The classified records are the ones the label and the top of
+  // the evidence list are built from. Presentation-only: persisted status and
+  // stored evidence are not changed.
+  const creatorPaidIntentItems = paidIntentItems.filter(
+    item => !isPlatformOwnedCommunityUrl(item.communityPlatform, item.communityUrl),
+  );
+  const platformOwnedPaidOnly = paidIntentItems.length > 0 && creatorPaidIntentItems.length === 0;
+  const paid = !platformOwnedPaidOnly
+    && (status === 'PAID_COMMUNITY_INDICATED' || intents.some(item => item?.intent === 'PAID'));
   const present = paid || status === 'COMMUNITY_INDICATED_NO_INVITE' || intents.length > 0;
   if (!present) {
     return { present: false, label: '', tone: 'indicated', evidence: [] };
@@ -38,11 +51,13 @@ export function communityIntentDisplay(
   // independent in the label so the table never contradicts itself.
   const hasDiscord = Boolean(channel.discord_invite || channel.discord_candidate_locator);
 
-  // Paid evidence can sit beyond the first three stored records. Put those
-  // records first so the displayed evidence (and the platform named in the
-  // label) always includes the platform that established paid intent.
-  const orderedIntents = paid && paidIntentItems.length > 0
-    ? [...paidIntentItems, ...intents]
+  // Creator-specific paid evidence can sit beyond the first three stored
+  // records. Put those records first so the displayed evidence (and the
+  // platform named in the label) always includes the platform that
+  // established genuine paid intent. Platform-owned records stay in the
+  // remaining stored evidence.
+  const orderedIntents = paid && creatorPaidIntentItems.length > 0
+    ? [...creatorPaidIntentItems, ...intents]
     : intents;
   const seen = new Set<string>();
   const evidence: CommunityIntentEvidenceView[] = [];
@@ -55,8 +70,10 @@ export function communityIntentDisplay(
 
   // Count platforms across every eligible stored intent, not only the three
   // displayed entries, so the "+N" suffix never undercounts. A paid summary
-  // names only the platforms that carry paid intent.
-  const suffixIntents = paid ? paidIntentItems : intents;
+  // names only the platforms that carry creator-specific paid intent; when
+  // the badge comes from the persisted status alone (no classified paid
+  // records), the suffix stays empty exactly as before.
+  const suffixIntents = paid ? creatorPaidIntentItems : intents;
   const platforms = [...new Set(suffixIntents
     .filter(item => item?.communityUrl)
     .map(item => platformLabel(item.communityPlatform)))];

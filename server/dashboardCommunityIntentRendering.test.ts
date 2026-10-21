@@ -99,6 +99,57 @@ test('paid community intent uses one compact summary and keeps evidence behind d
   assert.match(html, /<summary/);
 });
 
+test('platform-owned paid pages alone do not present the channel as a paid community', async () => {
+  const html = await renderDashboard(channel({
+    discord_status: 'NOT_FOUND',
+    community_discovery_status: 'PAID_COMMUNITY_INDICATED',
+    community_intents: [{
+      ...paidIntent,
+      communityUrl: 'https://newsroom.whop.com/whop-economic-intelligence/',
+      sourcePageUrl: 'https://newsroom.whop.com/whop-economic-intelligence/',
+    }],
+  }));
+
+  assert.doesNotMatch(html, /Paid community/);
+  assert.match(html, /Community indicated \(Whop\) · no invite/);
+  // Stored evidence is still displayed: only the badge is filtered.
+  assert.match(html, /newsroom\.whop\.com\/whop-economic-intelligence/);
+});
+
+test('creator-specific paid evidence still presents the channel as a paid community', async () => {
+  const html = await renderDashboard(channel({
+    discord_status: 'NOT_FOUND',
+    community_discovery_status: 'PAID_COMMUNITY_INDICATED',
+    community_intents: [paidIntent],
+  }));
+
+  assert.match(html, /Paid community \(Whop\)/);
+  assert.doesNotMatch(html, /Community indicated/);
+});
+
+test('mixed platform-owned and creator-specific paid evidence keeps the paid badge', async () => {
+  const html = await renderDashboard(channel({
+    discord_status: 'NOT_FOUND',
+    community_discovery_status: 'PAID_COMMUNITY_INDICATED',
+    community_intents: [
+      {
+        ...paidIntent,
+        communityUrl: 'https://newsroom.whop.com/whop-economic-intelligence/',
+        sourcePageUrl: 'https://newsroom.whop.com/whop-economic-intelligence/',
+      },
+      {
+        ...paidIntent,
+        communityPlatform: 'SKOOL',
+        communityUrl: 'https://www.skool.com/creator-community',
+        sourcePageUrl: 'https://creator.test/',
+      },
+    ],
+  }));
+
+  assert.match(html, /Paid community \(Skool\)/);
+  assert.doesNotMatch(html, /Community indicated/);
+});
+
 test('a stored intent without a platform value cannot break the table render', async () => {
   // JSONB is not schema-validated; an older record may omit communityPlatform.
   const malformed: Record<string, unknown> = { ...paidIntent };
