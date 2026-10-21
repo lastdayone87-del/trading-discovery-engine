@@ -14,10 +14,11 @@
 const fs = require('node:fs');
 const { Client } = require('pg');
 
-const DATABASE_URL = process.env.DATABASE_URL;
-if (!DATABASE_URL) throw new Error('DATABASE_URL secret is required');
+const DATABASE_URLS = [process.env.DATABASE_URL, process.env.FALLBACK_DATABASE_URL].filter(Boolean);
+if (!DATABASE_URLS.length) throw new Error('DATABASE_URL secret is required');
 const OUT_DIR = 'forensic-output';
 fs.mkdirSync(OUT_DIR, { recursive: true });
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 const PLATFORMS = ['WHOP', 'SKOOL', 'CIRCLE', 'PATREON'];
 
@@ -233,15 +234,42 @@ function summariseChannel(row) {
     platformBreakdown: {},
     evidenceMechanisms: {},
     stevenLord: null,
+    connectionAttempts: [],
   };
 
-  const client = new Client({
-    connectionString: DATABASE_URL,
-    application_name: 'dashboard-paid-community-investigation',
-    statement_timeout: 120000,
-  });
+  let client = null;
+  for (let sourceIndex = 0; sourceIndex < DATABASE_URLS.length && !client; sourceIndex += 1) {
+    for (let attempt = 1; attempt <= 3 && !client; attempt += 1) {
+      const candidate = new Client({
+        connectionString: DATABASE_URLS[sourceIndex],
+        application_name: 'dashboard-paid-community-investigation',
+        statement_timeout: 120000,
+      });
+      try {
+        await candidate.connect();
+        await candidate.query('SELECT 1 AS ok');
+        client = candidate;
+        report.connectionAttempts.push({ source: sourceIndex, attempt, ok: true });
+      } catch (error) {
+        report.connectionAttempts.push({
+          source: sourceIndex,
+          attempt,
+          ok: false,
+          code: error && error.code ? error.code : null,
+        });
+        await candidate.end().catch(() => undefined);
+        if (attempt < 3) await sleep(3000);
+      }
+    }
+  }
+  if (!client) {
+    report.error = { name: 'ConnectionError', message: 'No read-only database connection succeeded' };
+    fs.writeFileSync(`${OUT_DIR}/community-intent-investigation.json`, `${JSON.stringify(report, null, 2)}\n`);
+    console.log(JSON.stringify({ error: report.error, connectionAttempts: report.connectionAttempts }, null, 2));
+    return;
+  }
+
   try {
-    await client.connect();
     await client.query('BEGIN TRANSACTION READ ONLY');
     await client.query("SET LOCAL statement_timeout = '120s'");
     await client.query("SET LOCAL lock_timeout = '5s'");
@@ -386,7 +414,7 @@ function summariseChannel(row) {
     report.error = error instanceof Error ? { name: error.name, message: error.message, code: error.code } : String(error);
     console.error('[dashboard-investigation] failed:', error);
   } finally {
-    await client.end().catch(() => undefined);
+    if (client) await client.end().catch(() => undefined);
   }
 
   fs.writeFileSync(`${OUT_DIR}/community-intent-investigation.json`, `${JSON.stringify(report, null, 2)}\n`);

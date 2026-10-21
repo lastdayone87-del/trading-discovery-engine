@@ -13,6 +13,7 @@ jobs:
     timeout-minutes: 120
     env:
       DATABASE_URL: ${{ secrets.RAILWAY_FORENSIC_DATABASE_URL }}
+      FALLBACK_DATABASE_URL: ${{ secrets.DATABASE_URL }}
       FORENSIC_JOB_BATCH: "5"
       FORENSIC_OBS_LIMIT: "80"
       # No practical population cap — process all matching retry jobs/channels
