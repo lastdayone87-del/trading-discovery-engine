@@ -9,6 +9,8 @@
  * observation cannot recreate a lease or a false cap event.
  * Migration 152 adds the nullable Discord first-validation timestamp and
  * backfills it only from successful append-only check attempts.
+ * Migration 153 widens the guarded job-release trigger so terminal jobs also
+ * reconcile abandoned channel locks.
  * These assertions are intentionally textual: they pin the exact additive
  * shape so a later edit cannot silently turn the migration destructive or
  * rename a column the code depends on.
@@ -23,17 +25,28 @@ const migration = readFileSync(`${migrationsDir}149_discovery_integrity_state.sq
 const pendingClaimsMigration = readFileSync(`${migrationsDir}150_site_inspection_pending_claims.sql`, 'utf8');
 const shadowSettlementMigration = readFileSync(`${migrationsDir}151_youtube_key_cap_shadow_settled.sql`, 'utf8');
 const firstValidatedMigration = readFileSync(`${migrationsDir}152_discord_candidate_first_validated.sql`, 'utf8');
+const lockRecoveryMigration = readFileSync(`${migrationsDir}153_reconcile_channel_locks_on_terminal_jobs.sql`, 'utf8');
 const dbCore = readFileSync(fileURLToPath(new URL('./dbCore.ts', import.meta.url)), 'utf8');
 const siteCache = readFileSync(fileURLToPath(new URL('./siteInspectionCache.ts', import.meta.url)), 'utf8');
 const rollbackProof = readFileSync(fileURLToPath(new URL('../.github/workflows/phase1-rollback-proof.yml', import.meta.url)), 'utf8');
 
-test('migration 152 is present and sorts after every earlier migration', () => {
+test('migration 153 is present and sorts after every earlier migration', () => {
   const files = readdirSync(migrationsDir).filter(name => name.endsWith('.sql')).sort();
   assert.ok(files.includes('149_discovery_integrity_state.sql'));
   assert.ok(files.includes('150_site_inspection_pending_claims.sql'));
   assert.ok(files.includes('151_youtube_key_cap_shadow_settled.sql'));
   assert.ok(files.includes('152_discord_candidate_first_validated.sql'));
-  assert.equal(files[files.length - 1], '152_discord_candidate_first_validated.sql', '152 is the newest migration');
+  assert.ok(files.includes('153_reconcile_channel_locks_on_terminal_jobs.sql'));
+  assert.equal(files[files.length - 1], '153_reconcile_channel_locks_on_terminal_jobs.sql', '153 is the newest migration');
+});
+
+test('migration 153 releases a lock only after a terminal job and only without a live processing job', () => {
+  assert.match(lockRecoveryMigration, /CREATE OR REPLACE FUNCTION reconcile_channel_lock_after_job_release/);
+  assert.match(lockRecoveryMigration, /OLD\.status <> 'PROCESSING'/);
+  assert.match(lockRecoveryMigration, /NEW\.status NOT IN \('PENDING','FAILED','COMPLETED'\)/);
+  assert.match(lockRecoveryMigration, /live\.status='PROCESSING'[\s\S]*?live\.id <> NEW\.id[\s\S]*?live\.payload->>'channelId'=c\.channel_id/);
+  assert.match(lockRecoveryMigration, /WHEN \([\s\S]*?NEW\.status IN \('PENDING','FAILED','COMPLETED'\)[\s\S]*?\)/);
+  assert.match(lockRecoveryMigration, /c\.scan_status = 'LOCKED'/, 'only locked rows are reconciled');
 });
 
 test('migration 152 records and backfills only successful Discord validation time', () => {
