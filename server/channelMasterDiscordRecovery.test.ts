@@ -42,7 +42,7 @@ test('candidate authority is durable, normalized unique, selected, and returned 
   assert.match(queue,/persistDiscordCandidates/);
   assert.match(queue,/selectDiscordCandidate/);
   assert.match(ui,/candidate\.failure_reason/);
-  assert.match(ui,/candidate\.retryable\?'Retryable':'Terminal'/);
+  assert.match(ui,/candidate\.retryable\s*\?\s*'Retryable'\s*:\s*'Terminal'/);
 });
 
 test('dashboard retained candidates are validated active invites, while audit inventory remains persisted separately',()=>{
