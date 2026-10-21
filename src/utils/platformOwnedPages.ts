@@ -63,6 +63,17 @@ const RESERVED_PLATFORM_SUBDOMAINS = new Set([
   'signup', 'signin', 'auth', 'billing', 'trust', 'security',
 ]);
 
+// Whop serves its frontend bundles and translation/API fixtures from the same
+// host as creator pages. A URL under one of these segments is platform
+// plumbing, never a creator community, even when its body contains prices.
+const WHOP_PLATFORM_ASSET_SEGMENTS = new Set([
+  '_web', '_next', 'assets', 'static', 'cdn', 'translations',
+]);
+
+// A community surface is an HTML page. Known static-file extensions are
+// platform assets even when they appear outside an /assets/ directory.
+const WHOP_PLATFORM_ASSET_EXTENSIONS = /\.(?:json|js|mjs|css|map|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|eot)$/i;
+
 /** Maps a hostname (with or without `www.`, optionally a tenant subdomain) to
  * its community platform, or null when the host is not a known platform. */
 export function platformHostForHostname(hostname: string | null | undefined): CommunityPlatformHost | null {
@@ -107,6 +118,10 @@ export function isPlatformOwnedCommunityUrl(
     // Whop creator pages are path-based. Every whop.com subdomain in the
     // observed evidence set is a platform property (newsroom/docs/careers/...).
     if (host !== 'whop.com' && host !== 'www.whop.com') return true;
+    // Whop's own bundles/translation JSONs can contain price and per-month
+    // text. They are platform assets, not paid community surfaces.
+    if (segments.some(segment => WHOP_PLATFORM_ASSET_SEGMENTS.has(segment))) return true;
+    if (WHOP_PLATFORM_ASSET_EXTENSIONS.test(url.pathname)) return true;
     // Whop also serves creator product/store pages as /discover/<slug> and
     // /marketplace/<slug>. Those are creator-specific even though the parent
     // catalog path is a platform surface; nested catalog pages such as

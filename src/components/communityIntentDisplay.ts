@@ -27,21 +27,24 @@ export function communityIntentDisplay(
 ): CommunityIntentDisplay {
   const status = channel.community_discovery_status;
   const intents = channel.community_intents || [];
-  const paidIntentItems = intents.filter(item => item?.communityUrl && item.intent === 'PAID');
-  // Platform-owned marketing/docs/newsroom pages can carry price wording
-  // without describing the creator's own community. When every PAID record is
-  // one of those pages, the badge must not present the channel as paid;
-  // genuine creator-specific evidence still does, and mixed evidence keeps
-  // the badge. The classified records are the ones the label and the top of
-  // the evidence list are built from. Presentation-only: persisted status and
-  // stored evidence are not changed.
-  const creatorPaidIntentItems = paidIntentItems.filter(
-    item => !isPlatformOwnedCommunityUrl(item.communityPlatform, item.communityUrl),
+  // Platform-owned marketing/docs/newsroom/asset pages can carry price
+  // wording without describing the creator's own community. They are not
+  // community intent at all: remove them from the badge, the evidence list,
+  // and the platform suffix. Genuine creator-specific evidence still counts,
+  // and mixed evidence keeps only the creator-specific records. This is a
+  // presentation projection; persisted status and stored evidence are not
+  // changed.
+  const creatorIntents = intents.filter(
+    item => item?.communityUrl && !isPlatformOwnedCommunityUrl(item.communityPlatform, item.communityUrl),
   );
-  const platformOwnedPaidOnly = paidIntentItems.length > 0 && creatorPaidIntentItems.length === 0;
-  const paid = !platformOwnedPaidOnly
-    && (status === 'PAID_COMMUNITY_INDICATED' || intents.some(item => item?.intent === 'PAID'));
-  const present = paid || status === 'COMMUNITY_INDICATED_NO_INVITE' || intents.length > 0;
+  const creatorPaidIntentItems = creatorIntents.filter(item => item.intent === 'PAID');
+  const onlyPlatformOwnedIntents = intents.some(item => item?.communityUrl) && creatorIntents.length === 0;
+  const paid = !onlyPlatformOwnedIntents
+    && (status === 'PAID_COMMUNITY_INDICATED' || creatorPaidIntentItems.length > 0);
+  // A status-only indication (no stored URLs) remains visible. If the only
+  // stored evidence is platform-owned, there is no community intent to show.
+  const present = !onlyPlatformOwnedIntents
+    && (paid || status === 'COMMUNITY_INDICATED_NO_INVITE' || creatorIntents.length > 0);
   if (!present) {
     return { present: false, label: '', tone: 'indicated', evidence: [] };
   }
@@ -54,11 +57,10 @@ export function communityIntentDisplay(
   // Creator-specific paid evidence can sit beyond the first three stored
   // records. Put those records first so the displayed evidence (and the
   // platform named in the label) always includes the platform that
-  // established genuine paid intent. Platform-owned records stay in the
-  // remaining stored evidence.
+  // established genuine paid intent. Platform-owned records are excluded.
   const orderedIntents = paid && creatorPaidIntentItems.length > 0
-    ? [...creatorPaidIntentItems, ...intents]
-    : intents;
+    ? [...creatorPaidIntentItems, ...creatorIntents]
+    : creatorIntents;
   const seen = new Set<string>();
   const evidence: CommunityIntentEvidenceView[] = [];
   for (const item of orderedIntents) {
