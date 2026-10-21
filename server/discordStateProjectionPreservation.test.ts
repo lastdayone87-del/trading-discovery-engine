@@ -334,6 +334,8 @@ test('classification-only upserts take the locked row Discord projection instead
     2,
     'both classification-only branches opt into the locked-row projection',
   );
+  assert.match(pipeline, /const authoritativeWithheld=\(await getChannelById\(candidate\.channelId\)\)\|\|withheldChannel;/, 'the withheld branch returns the persisted row, not the pre-merge snapshot');
+  assert.match(pipeline, /discordStatus:authoritativeWithheld\.discord_status,discordInvite:authoritativeWithheld\.discord_invite\?\?null,channelRecord:authoritativeWithheld/);
 
   const dbCoreSource = readFileSync(fileURLToPath(new URL('./dbCore.ts', import.meta.url)), 'utf8');
   assert.match(dbCoreSource, /options\?\.preserveDiscordOnUpdate && prior\.rowCount/);
