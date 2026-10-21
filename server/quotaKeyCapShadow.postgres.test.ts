@@ -241,8 +241,8 @@ maybe('settlement tombstone fences a late dispatch after the response settled', 
   assert.equal(await leaseCount(key), 0, 'settlement removes the in-flight lease');
   const settled = await requirePool().query(
     `SELECT count(*)::int AS count FROM youtube_key_cap_shadow_settled
-      WHERE quota_day=$1 AND operation_id=$2 AND expires_at > now()`,
-    [quotaDay, operationId]
+      WHERE quota_day=$1 AND operation_id=$2 AND expires_at > $3`,
+    [quotaDay, operationId, fixedNow]
   );
   assert.equal(Number(settled.rows[0].count), 1, 'settlement tombstone remains to fence late inserts');
 
