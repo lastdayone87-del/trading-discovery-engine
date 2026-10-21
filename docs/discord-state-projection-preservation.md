@@ -37,6 +37,15 @@ selection. Failed, partial, pending-work, and absence reconciliation paths all
 use the same durable predicate, so they cannot downgrade a completed
 validation either.
 
+The review-only retention is honored across restarts too: the startup
+exclusion audit reads `scan_status` and leaves the retained invite of a channel
+explicitly withheld for human review (`NEEDS_REVIEW`) in place until the review
+resolves, instead of clearing it as a stale invite on the next boot. An
+exhausted stored locator becomes a terminal `FAILED_OPERATIONAL` verdict even
+when a serving selection already exists, so the scan-attempt reset cannot
+recreate `locator-unvalidated` retry work and the channel reaches a verdict
+while its established projection is preserved.
+
 ## Regression coverage
 
 `server/discordStateProjectionPreservation.test.ts` covers:
@@ -51,7 +60,11 @@ validation either.
 - legacy `ACTIVE`/`DEAD` rows defaulted to `NOT_DISCOVERED` by migration 067
   remaining established when they carry a serving invite;
 - the post-enrichment review-only path retaining an existing invite even when
-  no established selection is recognized.
+  no established selection is recognized;
+- the startup exclusion-audit decision preserving a review-pending invite while
+  still cleaning stale non-review invites and rejected-cleanup rows;
+- an exhausted stored locator reaching a terminal verdict even when an
+  established serving selection exists, without re-arming retry work.
 
 ## Separate follow-ups (not changed here)
 

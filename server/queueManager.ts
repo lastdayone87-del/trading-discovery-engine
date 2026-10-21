@@ -2253,7 +2253,15 @@ export async function projectNotFoundAfterInspection(
       const locatorOnly=pendingWork.reasons.length===1&&pendingWork.reasons[0]==='locator-unvalidated';
       const locatorExhausted=locatorOnly&&Math.max(0,Number(channel.scan_attempts)||0)>=LOCATOR_PENDING_PROJECTION_LIMIT;
       const alreadyValidatedSuccess=hasEstablishedValidatedDiscordSelection(channel);
-      if(locatorExhausted&&!alreadyValidatedSuccess){
+      // Exhaustion belongs to the stored locator's unfinished retry work, not
+      // to the serving selection. It must become terminal even when an
+      // established serving selection exists: leaving RETRY_PENDING/NOT_STARTED
+      // in place lets the later scan_attempts reset recreate
+      // `locator-unvalidated` pending work, so the channel would re-arm the
+      // same retry cycle forever. The established Discord projection
+      // (status/invite/discovery) stays protected by the
+      // `alreadyValidatedSuccess` guards below.
+      if(locatorExhausted){
         channel.discord_validation_status='FAILED_OPERATIONAL';
       }else if(locatorOnly){
         channel.scan_attempts=Math.max(0,Number(channel.scan_attempts)||0)+1;
@@ -2440,6 +2448,7 @@ export interface ExclusionAuditBatchRow {
   country: string | null;
   discord_status: string;
   discord_invite: string | null;
+  scan_status: string;
   cursor_seen: string;
 }
 export interface ExclusionAuditDb {
@@ -2462,7 +2471,7 @@ export async function fetchExclusionAuditBatch(
     ? `country_status = 'REJECTED' AND discord_status IN ('DEAD','NON_TRADING','UNCERTAIN') AND discord_invite IS NOT NULL`
     : `country_status IS DISTINCT FROM 'REJECTED'`;
   const res = await db.query(
-    `SELECT channel_id, channel_name, country, discord_status, discord_invite, first_seen::text AS cursor_seen FROM channels WHERE ${statusPredicate} AND ($1::timestamptz IS NULL OR (first_seen, channel_id) < ($1::timestamptz, $2::text)) ORDER BY first_seen DESC, channel_id DESC LIMIT $3`,
+    `SELECT channel_id, channel_name, country, discord_status, discord_invite, scan_status, first_seen::text AS cursor_seen FROM channels WHERE ${statusPredicate} AND ($1::timestamptz IS NULL OR (first_seen, channel_id) < ($1::timestamptz, $2::text)) ORDER BY first_seen DESC, channel_id DESC LIMIT $3`,
     [cursor.cursorSeen, cursor.cursorId, limit]
   );
   const rows = res.rows;
@@ -2477,13 +2486,19 @@ export type ExclusionAuditRowAction = 'reject-write' | 'invite-cleanup' | 'none'
  * a REJECTED validation writes only for not-yet-rejected rows (re-stamping
  * already-REJECTED rows is dropped as idempotent churn), otherwise the
  * Discord persistence rule applies to every row including already-REJECTED
- * ones — so invite cleanup semantics are unchanged.
+ * ones. A channel explicitly withheld for human review (`NEEDS_REVIEW`) is
+ * the one exception: the review-only projection intentionally stores the
+ * retained invite on an UNCERTAIN row as review evidence, so the audit must
+ * not clear it before the review decision has been made. Rejected-cleanup
+ * still enforces the persistence rule, and a resolved review leaves
+ * NEEDS_REVIEW so the normal cleanup resumes.
  */
 export function decideExclusionAuditRowAction(input: {
   alreadyRejected: boolean;
   validationStatus: string;
   discordStatus: unknown;
   discordInvite: unknown;
+  scanStatus?: unknown;
 }): ExclusionAuditRowAction {
   // The status branch runs first so a fresh REJECTED write is never blocked by
   // a stale invite, matching the pre-batching if/else-if order. Already-
@@ -2497,6 +2512,7 @@ export function decideExclusionAuditRowAction(input: {
       input.discordStatus === 'UNCERTAIN') &&
     input.discordInvite !== null
   ) {
+    if (!input.alreadyRejected && input.scanStatus === 'NEEDS_REVIEW') return 'none';
     return 'invite-cleanup';
   }
   return 'none';
@@ -2545,7 +2561,8 @@ export async function auditExistingChannelsWithExclusionEngine(): Promise<{ tota
             alreadyRejected,
             validationStatus: valRes?.status ?? '',
             discordStatus: candidate.discord_status,
-            discordInvite: candidate.discord_invite
+            discordInvite: candidate.discord_invite,
+            scanStatus: candidate.scan_status
           });
           if (action === 'reject-write') {
             if (!valRes) continue; // unreachable: only non-rejected rows can write a rejection

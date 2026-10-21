@@ -561,6 +561,49 @@ test('E7: locator-only pending work is bounded and falls through to a terminal f
   assert.deepEqual(enqueued, [], 'an exhausted locator no longer re-arms the retry job');
 });
 
+test('E7: an exhausted locator is terminal even when a legacy serving selection is established', async () => {
+  const channel = {
+    channel_id: 'chan-exhausted-established',
+    channel_name: 'Exhausted locator with serving invite',
+    youtube_url: 'https://youtube.test/exhausted-established',
+    country: 'US',
+    country_status: 'CONFIRMED',
+    confidence_score: 1,
+    discord_status: 'ACTIVE',
+    discord_invite: 'https://discord.gg/stale-room',
+    scan_status: 'FAILED',
+    scan_attempts: LOCATOR_PENDING_PROJECTION_LIMIT,
+    discord_candidate_locator: 'https://discord.gg/stale-room',
+    discord_validation_status: 'RETRY_PENDING',
+    discord_discovery_status: 'NOT_DISCOVERED',
+  } as never;
+  const enqueued: string[] = [];
+  await projectNotFoundAfterInspection(
+    channel,
+    { acquisitionOutcomes: [] },
+    { candidates: [], foundInvite: null } as never,
+    true,
+    async (channelId: string) => { enqueued.push(channelId); },
+  );
+  const updated = channel as Record<string, unknown>;
+  assert.equal(updated.scan_status, 'COMPLETED', 'the channel reaches a verdict instead of re-arming');
+  assert.equal(updated.discord_validation_status, 'FAILED_OPERATIONAL', 'the exhausted locator work is terminal even with an established selection');
+  assert.equal(updated.discord_status, 'ACTIVE', 'the established serving projection is preserved');
+  assert.equal(updated.discord_invite, 'https://discord.gg/stale-room', 'the live invite is preserved');
+  assert.deepEqual(enqueued, [], 'an exhausted locator no longer re-arms the retry job');
+  // A later pass must not recreate locator-unvalidated pending work from the
+  // reset scan attempts, which was the unverdictable retry cycle.
+  await projectNotFoundAfterInspection(
+    channel,
+    { acquisitionOutcomes: [] },
+    { candidates: [], foundInvite: null } as never,
+    true,
+    async (channelId: string) => { enqueued.push(channelId); },
+  );
+  assert.deepEqual(enqueued, [], 'the terminal verdict survives the scan-attempt reset');
+  assert.equal((channel as Record<string, unknown>).scan_attempts, 0);
+});
+
 test('E7: pending detection uses community-surface retry semantics, not raw required/retryable flags', () => {
   const youtubeUpstreamFailure = detectPendingDiscoveryWork(
     { discord_candidate_locator: null, discord_validation_status: 'NOT_STARTED', discord_discovery_status: 'NOT_DISCOVERED' },
