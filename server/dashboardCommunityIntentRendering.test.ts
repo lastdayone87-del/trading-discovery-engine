@@ -68,16 +68,20 @@ const channel = (overrides: Partial<ChannelRecord>): ChannelRecord => ({
   ...overrides,
 });
 
-async function renderDashboard(input: ChannelRecord): Promise<string> {
+async function renderChannels(input: ChannelRecord[]): Promise<string> {
   const { ResultsTable } = await import('../src/components/ResultsTable');
   return renderToStaticMarkup(React.createElement(ResultsTable, {
-    channels: [input],
+    channels: input,
     onRecheck: async () => {},
     onInspect: () => {},
   }));
 }
 
-test('paid community intent replaces the clean-inspection text with status and evidence', async () => {
+async function renderDashboard(input: ChannelRecord): Promise<string> {
+  return renderChannels([input]);
+}
+
+test('paid community intent uses one compact summary and keeps evidence behind disclosure', async () => {
   const html = await renderDashboard(channel({
     discord_status: 'NOT_FOUND',
     community_discovery_status: 'PAID_COMMUNITY_INDICATED',
@@ -86,10 +90,13 @@ test('paid community intent replaces the clean-inspection text with status and e
 
   assert.doesNotMatch(html, /Clean inspection · no community found/);
   assert.match(html, /No Discord invite · community indicated/);
-  assert.match(html, /PAID COMMUNITY INDICATED/);
-  assert.match(html, /WHOP/);
+  assert.match(html, /Paid community \(Whop\)/);
+  assert.doesNotMatch(html, /PAID COMMUNITY INDICATED/);
+  assert.match(html, /Whop/);
   assert.match(html, /whop\.com\/creator/);
   assert.match(html, /price, membership/);
+  assert.match(html, /data-testid="community-intent"/);
+  assert.match(html, /<summary/);
 });
 
 test('a private no-invite community shows intent and evidence, never clean inspection', async () => {
@@ -107,8 +114,8 @@ test('a private no-invite community shows intent and evidence, never clean inspe
   }));
 
   assert.doesNotMatch(html, /Clean inspection · no community found/);
-  assert.match(html, /COMMUNITY INDICATED · NO INVITE/);
-  assert.match(html, /CIRCLE/);
+  assert.match(html, /Community indicated \(Circle\) · no invite/);
+  assert.match(html, /Circle/);
   assert.match(html, /PRIVATE/);
   assert.match(html, /community\.circle\.so\/c\/private-trading/);
 });
@@ -120,29 +127,48 @@ test('a retained invite makes the additional community label invite-neutral', as
     community_intents: [{ ...paidIntent, intent: 'UNKNOWN', paidSignals: [] }],
   }));
 
-  assert.match(html, /ADDITIONAL COMMUNITY INDICATED/);
-  assert.doesNotMatch(html, /COMMUNITY INDICATED · NO INVITE/);
+  assert.match(html, /Additional community \(Whop\)/);
+  assert.doesNotMatch(html, /Community indicated \(Whop\) · no invite/);
   assert.match(html, /https:\/\/discord\.gg\/retained/);
 });
 
-test('a duplicate-owned invite is visible without becoming an invite or a clean inspection', async () => {
+test('duplicate ownership is one compact summary with a linked owner name, not a repeated warning or raw id', async () => {
   const html = await renderDashboard(channel({
     discord_duplicate_owner_channel_id: 'UC_owner_other',
+    discord_duplicate_owner_channel_name: 'OFM',
   }));
 
-  assert.match(html, /Invite found, owned by another channel/);
-  assert.match(html, /UC_owner_other/);
+  assert.match(html, /Second invite owned elsewhere/);
+  assert.match(html, /data-testid="duplicate-owned-invite"/);
+  assert.match(html, /href="#channel-row-UC_owner_other"[^>]*>OFM<\/a>/);
+  assert.doesNotMatch(html, /Invite found, owned by another channel/);
+  assert.doesNotMatch(html, /Owner channel: UC_owner_other/);
   assert.doesNotMatch(html, /Clean inspection · no community found/);
 });
 
-test('a genuinely clean inspection still renders the no-community label', async () => {
+test('duplicate owner name falls back to the loaded owner row and links to that row', async () => {
+  const owner = channel({ channel_id: 'UC_owner_other', channel_name: 'OFM' });
+  const duplicate = channel({
+    channel_id: 'UC_duplicate',
+    channel_name: 'Duplicate Creator',
+    discord_duplicate_owner_channel_id: owner.channel_id,
+  });
+  const html = await renderChannels([duplicate, owner]);
+
+  assert.match(html, /id="channel-row-UC_owner_other"/);
+  assert.match(html, /href="#channel-row-UC_owner_other"[^>]*>OFM<\/a>/);
+  assert.match(html, /data-testid="discord-owner-link"/);
+});
+
+test('a genuinely clean inspection still renders the no-community summary', async () => {
   const html = await renderDashboard(channel({}));
 
   assert.match(html, /Clean inspection · no community found/);
+  assert.match(html, /data-testid="discord-generic-summary"/);
   assert.doesNotMatch(html, /data-testid="community-intent"/);
 });
 
-test('a retained invite and an additional intent render side by side without overwriting either', async () => {
+test('a retained invite and an additional intent render independently without overwriting either', async () => {
   const html = await renderDashboard(channel({
     discord_status: 'ACTIVE',
     discord_invite: 'https://discord.gg/creatora',
@@ -156,8 +182,28 @@ test('a retained invite and an additional intent render side by side without ove
   assert.match(html, /Discovered · validation completed/);
   assert.match(html, /discord\.gg\/creatora/);
   assert.match(html, /data-testid="community-intent"/);
-  assert.match(html, /PAID COMMUNITY INDICATED/);
-  assert.match(html, /WHOP/);
+  assert.match(html, /Paid community \(Whop\)/);
+  assert.match(html, /Whop/);
   assert.match(html, /whop\.com\/creator/);
   assert.doesNotMatch(html, /Clean inspection · no community found/);
+});
+
+test('retry and candidate evidence remain available behind the single summary', async () => {
+  const html = await renderDashboard(channel({
+    discord_status: 'ACTIVE',
+    discord_invite: 'https://discord.gg/retained',
+    discord_discovery_status: 'VALIDATED',
+    discord_validation_status: 'RETRY_PENDING',
+    scan_status: 'FAILED',
+    community_retry_job_status: 'PENDING',
+    community_retry_job_retry_reason: 'NO_SURFACE',
+    community_retry_job_attempts: 0,
+    community_retry_job_max_attempts: 3,
+    community_retry_job_execution_count: 0,
+  }));
+
+  assert.match(html, /data-testid="discord-generic-summary"/);
+  assert.match(html, /Automatic retry queued · reason: NO SURFACE/);
+  assert.match(html, /Retry-window attempts: 0\/3|Pending · not yet executed \(0\/3\)/);
+  assert.match(html, /https:\/\/discord\.gg\/retained/);
 });

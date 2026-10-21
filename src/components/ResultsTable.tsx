@@ -3,7 +3,7 @@ import { discordCandidateDisplayUrl } from '../utils/discordLocator';
 import React, { useEffect, useMemo, useState } from 'react';
 import { ChannelRecord, ReviewQueueItem } from '../types';
 import { communityIntentDisplay } from './communityIntentDisplay';
-import { ExternalLink, RefreshCw, Eye, Copy, Check, Search, CheckCircle2, XCircle, ShieldAlert, X } from 'lucide-react';
+import { ExternalLink, RefreshCw, Eye, Copy, Check, Search, CheckCircle2, XCircle, ShieldAlert, X, ChevronRight } from 'lucide-react';
 import { responseError, submitReviewDecision } from '../reviewDecision';
 import { formatFoundAgo } from '../utils/relativeTime';
 import { isConfirmedDiscordInvite } from '../discordInviteView';
@@ -373,8 +373,71 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                     ? `${c.community_retry_job_reconciliation_code || 'STALE_RETRY'} · RECONCILIATION REQUIRED`
                     : '';
                   const communityIntent = communityIntentDisplay(c);
+                  const genericDiscordStatus = c.discord_duplicate_owner_channel_id
+                    ? 'Second invite owned elsewhere'
+                    : c.discord_discovery_status === 'DISCOVERED_VALIDATION_FAILED'
+                    ? 'Discovered · validation failed'
+                    : c.discord_discovery_status === 'VALIDATED' && c.discord_status === 'UNCERTAIN'
+                    ? 'Discovered · validation ambiguous'
+                    : c.discord_discovery_status === 'VALIDATED'
+                    ? 'Discovered · validation completed'
+                    : c.discord_status === 'UNCERTAIN' && (c.discord_validation_status === 'RETRY_PENDING' || c.discord_validation_status === 'FAILED_OPERATIONAL') && !c.discord_candidate_locator && !c.discord_invite
+                    ? 'Website acquisition incomplete'
+                    : (c.discord_validation_status === 'NOT_STARTED' || !c.discord_validation_status) && c.scan_status !== 'COMPLETED' && c.scan_status !== 'FAILED' && c.scan_status !== 'FAILED_PERMANENT' && !c.discord_candidate_locator && !c.discord_invite
+                    ? 'Not yet inspected'
+                    : communityIntent.present && !c.discord_invite && !c.discord_candidate_locator
+                    ? 'No Discord invite · community indicated'
+                    : c.scan_status === 'COMPLETED' && c.discord_validation_status === 'COMPLETED' && !c.discord_candidate_locator && !c.discord_invite && !communityIntent.present && !c.discord_duplicate_owner_channel_id
+                    ? 'Clean inspection · no community found'
+                    : 'Not discovered';
+                  const discordExpandedDetails = (
+                    <div className="mt-1 space-y-0.5 border-t border-slate-200 pt-1 text-slate-600 dark:border-slate-700 dark:text-slate-300">
+                      {c.discord_invite && (foundAge || recentInvites) && (
+                        <div
+                          data-testid="discord-found-age"
+                          className={foundAge ? 'font-medium text-emerald-700 dark:text-emerald-400' : 'text-slate-500 dark:text-slate-400'}
+                          title={c.discord_invite_first_validated_at
+                            ? `First successful validation: ${new Date(c.discord_invite_first_validated_at).toLocaleString()}`
+                            : 'No trustworthy successful validation timestamp is recorded for this invite.'}
+                        >
+                          {foundAge || 'Found time unavailable'}
+                        </div>
+                      )}
+                      {c.discord_liveness_status && c.discord_liveness_status !== 'NOT_CHECKED' && <div>Liveness: <b>{c.discord_liveness_status.replaceAll('_', ' ')}</b></div>}
+                      {c.discord_relevance_status && c.discord_relevance_status !== 'NOT_CHECKED' && <div>Relevance: <b>{c.discord_relevance_status.replaceAll('_', ' ')}</b></div>}
+                      {retryReconciliationRequired && <div className="font-semibold text-rose-600" title={retryReconciliationReason}>{retryReconciliationLabel || 'STALE_RETRY · RECONCILIATION REQUIRED'} · reason: {retryReasonLabel}</div>}
+                      {retryReconciliationRequired && <div className="text-slate-500">{retryReconciliationReason}</div>}
+                      {!retryReconciliationRequired && (c.scan_status === 'FAILED' || c.scan_status === 'FAILED_PERMANENT' || c.scan_status === 'ENRICHMENT_PENDING') && c.discord_validation_status === 'RETRY_PENDING' && (automaticRetryActive || automaticRetryTerminal) && <div className="font-semibold text-amber-600">{automaticRetryActive ? `Automatic retry ${c.community_retry_job_status === 'PROCESSING' ? 'in progress' : automaticRetryDue ? 'due now' : 'queued'} · reason: ${retryReasonLabel}` : automaticRetryTerminal ? automaticRetryBudgetExhausted ? `Automatic retry budget exhausted · governed recovery available · reason: ${retryReasonLabel}` : `Automatic retry stopped after terminal failure · governed recovery available · reason: ${retryReasonLabel}` : `No automatic retry queued · reason: ${retryReasonLabel} · governed recovery available`}</div>}
+                      {!retryReconciliationRequired && c.discord_validation_status === 'RETRY_PENDING' && retryReconciliationLabel && <div className="font-semibold text-rose-600">{retryReconciliationLabel}</div>}
+                      {retryReconciliationRequired && c.community_retry_job_attempts != null && c.community_retry_job_max_attempts != null && <div className="text-slate-500">Historical retry attempts preserved: {c.community_retry_job_attempts}/{c.community_retry_job_max_attempts}</div>}
+                      {!retryReconciliationRequired && (c.scan_status === 'FAILED' || c.scan_status === 'FAILED_PERMANENT' || c.scan_status === 'ENRICHMENT_PENDING') && c.discord_validation_status === 'RETRY_PENDING' && (automaticRetryActive || automaticRetryTerminal) && c.community_retry_job_attempts != null && c.community_retry_job_max_attempts != null && <div className="text-slate-500">{c.community_retry_job_attempts === 0 && (c.community_retry_job_execution_count || 0) === 0 ? `Pending · not yet executed (0/${c.community_retry_job_max_attempts})${c.community_retry_job_run_after && c.community_retry_job_status === 'PENDING' ? ` · next ${new Date(c.community_retry_job_run_after).toLocaleString()}` : ''}` : `Retry-window attempts: ${c.community_retry_job_attempts}/${c.community_retry_job_max_attempts}`}{c.community_retry_job_attempts > 0 && c.community_retry_job_run_after && c.community_retry_job_status === 'PENDING' ? ` · ${automaticRetryDue ? 'due' : 'next'} ${new Date(c.community_retry_job_run_after).toLocaleString()}` : ''}</div>}
+                      {!retryReconciliationRequired && (c.scan_status === 'FAILED' || c.scan_status === 'FAILED_PERMANENT' || c.scan_status === 'ENRICHMENT_PENDING') && c.discord_validation_status === 'RETRY_PENDING' && (automaticRetryActive || automaticRetryTerminal) && c.community_retry_job_execution_count != null && <div className="text-slate-500" title="Worker claims = every time a worker picked up this retry (each claim is recorded). Capacity deferrals = claims rejected before any acquisition ran (browser/quota unavailable; they never consume the attempts budget). Executed attempts = claims carrying durable proof that community inspection actually began (marked at the inspection boundary, then completed or failed with a real error); bare claims, deferrals, stale recoveries, and pre-dispatch failures are never counted.">Worker claims: {c.community_retry_job_execution_count} · capacity deferrals: {c.community_retry_job_deferral_count || 0} · executed attempts: {c.community_retry_job_executed_count ?? Math.max(0, (c.community_retry_job_execution_count || 0) - (c.community_retry_job_deferral_count || 0))}{c.community_retry_job_last_execution_status ? ` · last ${c.community_retry_job_last_execution_status.toLowerCase()}` : ''}</div>}
+                      {c.discord_liveness_status === 'INVALID_OBSERVED' && <div className="text-amber-600">Invalid observation awaiting confirmation</div>}
+                      {c.discord_candidate_type && <div className="text-slate-400">Locator: {c.discord_candidate_type.replaceAll('_', ' ')}</div>}
+                      {c.discord_candidate_locator && !c.discord_invite && c.discord_liveness_status === 'ACTIVE' && <div className="mt-0.5 max-w-48 truncate font-mono text-slate-500" title={c.discord_candidate_locator}>Validated candidate: {c.discord_candidate_locator.replace(/^https?:\/\//, '')}</div>}
+                      {(c.discord_candidates?.length || 0) > 0 && <details className="mt-1"><summary className="cursor-pointer font-semibold text-indigo-600">{c.discord_candidates!.length} candidate{c.discord_candidates!.length === 1 ? '' : 's'} · view</summary><div className="mt-1 min-w-0 space-y-1">{c.discord_candidates!.map(candidate => <div key={candidate.candidate_id} className="rounded border border-slate-200 p-1.5 dark:border-slate-700"><div className="font-mono break-all">{discordCandidateDisplayUrl(candidate) || candidate.normalized_locator} {candidate.selected && <b className="text-emerald-600">· SELECTED</b>}</div><div>{candidate.source_observations?.map(item => item.sourceSurface).filter(Boolean).join(', ') || candidate.source_surface || 'Unknown source'} · {candidate.candidate_status} · {candidate.validation_status}</div><div>Liveness: {candidate.liveness_status} · Relevance: {candidate.relevance_status} · Attempts: {candidate.attempt_count}</div><div>{candidate.retryable ? 'Retryable' : 'Terminal'}{candidate.last_checked ? ` · ${new Date(candidate.last_checked).toLocaleString()}` : ''}</div>{candidate.failure_reason && <div className="text-rose-600">{candidate.failure_reason}</div>}</div>)}</div></details>}
+                    </div>
+                  );
+                  const duplicateOwnerName = c.discord_duplicate_owner_channel_id
+                    ? (c.discord_duplicate_owner_channel_name
+                      || channels.find(item => item.channel_id === c.discord_duplicate_owner_channel_id)?.channel_name
+                      || 'another channel')
+                    : null;
+                  const duplicateOwnerHref = c.discord_duplicate_owner_channel_id
+                    ? `#channel-row-${c.discord_duplicate_owner_channel_id}`
+                    : undefined;
+                  const focusDuplicateOwner = (event: React.MouseEvent<HTMLAnchorElement>) => {
+                    event.stopPropagation();
+                    if (!c.discord_duplicate_owner_channel_id) return;
+                    const ownerRow = document.getElementById(`channel-row-${c.discord_duplicate_owner_channel_id}`);
+                    if (!ownerRow) return;
+                    event.preventDefault();
+                    ownerRow.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    ownerRow.classList.add('ring-2', 'ring-amber-400');
+                    window.setTimeout(() => ownerRow.classList.remove('ring-2', 'ring-amber-400'), 1600);
+                  };
                   return (
-                  <tr key={c.channel_id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40 transition-colors">
+                  <tr id={`channel-row-${c.channel_id}`} key={c.channel_id} className="scroll-mt-24 hover:bg-slate-50/70 dark:hover:bg-slate-800/40 transition-colors">
                     
                     {/* Channel & Link */}
                     <td className="py-3 px-4">
@@ -497,118 +560,95 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                     </td>
 
                     {/* Discord Status & Link */}
-                    <td className="py-3 px-4">
-                      <span className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-bold ${
-                        c.discord_status === 'ACTIVE'
-                          ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/80 dark:text-emerald-300'
-                          : c.discord_status === 'ACTIVE_LOW_VOLUME'
-                          ? 'bg-teal-100 text-teal-800 dark:bg-teal-950/80 dark:text-teal-300'
-                          : c.discord_status === 'UNCERTAIN'
-                          ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/80 dark:text-amber-300 border border-amber-200 dark:border-amber-800'
-                          : c.discord_status === 'NON_TRADING'
-                          ? 'bg-purple-100 text-purple-800 dark:bg-purple-950/80 dark:text-purple-300 border border-purple-200 dark:border-purple-800'
-                          : c.discord_status === 'DEAD'
-                          ? 'bg-rose-100 text-rose-800 dark:bg-rose-950/80 dark:text-rose-300'
-                          : c.discord_status === 'PENDING'
-                          ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/80 dark:text-amber-300'
-                          : 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300'
-                      }`}>
-                        {c.discord_status}
-                      </span>
-
-                      {c.discord_invite && (
-                        <div className="mt-1 flex items-center gap-1.5">
-                          <a
-                            href={c.discord_invite}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="font-mono text-[11px] text-indigo-600 dark:text-indigo-400 font-semibold hover:underline"
-                          >
-                            {c.discord_invite.replace('https://', '')}
-                          </a>
-                          <button
-                            onClick={() => handleCopyLink(c.discord_invite!, c.channel_id)}
-                            className="p-1 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
-                            title="Copy link"
-                          >
-                            {copiedId === c.channel_id ? <Check className="w-3 h-3 text-emerald-500" /> : <Copy className="w-3 h-3" />}
-                          </button>
-                        </div>
-                      )}
-                      {c.discord_invite && (foundAge || recentInvites) && (
-                        <div
-                          data-testid="discord-found-age"
-                          className={`mt-0.5 text-[10px] font-medium ${foundAge ? 'text-emerald-700 dark:text-emerald-400' : 'text-slate-500 dark:text-slate-400'}`}
-                          title={c.discord_invite_first_validated_at
-                            ? `First successful validation: ${new Date(c.discord_invite_first_validated_at).toLocaleString()}`
-                            : 'No trustworthy successful validation timestamp is recorded for this invite.'}
-                        >
-                          {foundAge || 'Found time unavailable'}
-                        </div>
-                      )}
-                      {c.discord_duplicate_owner_channel_id && (
-                        <div data-testid="duplicate-owned-invite" className="mt-1 rounded-md border border-amber-300 bg-amber-50 px-2 py-1.5 text-[10px] dark:border-amber-800 dark:bg-amber-950/40">
-                          <div className="font-bold text-amber-800 dark:text-amber-300">Invite found, owned by another channel</div>
-                          <div className="mt-0.5 font-mono text-slate-600 dark:text-slate-300" title={c.discord_duplicate_owner_channel_id}>
-                            Owner channel: {c.discord_duplicate_owner_channel_id}
-                          </div>
-                        </div>
-                      )}
-                      <div className="mt-1 text-[10px] text-slate-500 dark:text-slate-400">
-                        {c.discord_duplicate_owner_channel_id
-                          ? 'Invite found, owned by another channel'
-                          : c.discord_discovery_status === 'DISCOVERED_VALIDATION_FAILED'
-                          ? 'Discovered · validation failed'
-                          : c.discord_discovery_status === 'VALIDATED' && c.discord_status === 'UNCERTAIN'
-                          ? 'Discovered · validation ambiguous'
-                          : c.discord_discovery_status === 'VALIDATED'
-                          ? 'Discovered · validation completed'
-                          : c.discord_status === 'UNCERTAIN' && (c.discord_validation_status === 'RETRY_PENDING' || c.discord_validation_status === 'FAILED_OPERATIONAL') && !c.discord_candidate_locator && !c.discord_invite
-                          ? 'Website acquisition incomplete'
-                          : (c.discord_validation_status === 'NOT_STARTED' || !c.discord_validation_status) && c.scan_status !== 'COMPLETED' && c.scan_status !== 'FAILED' && c.scan_status !== 'FAILED_PERMANENT' && !c.discord_candidate_locator && !c.discord_invite
-                          ? 'Not yet inspected'
-                          : communityIntent.present && !c.discord_invite && !c.discord_candidate_locator
-                          ? 'No Discord invite · community indicated'
-                          : c.scan_status === 'COMPLETED' && c.discord_validation_status === 'COMPLETED' && !c.discord_candidate_locator && !c.discord_invite && !communityIntent.present && !c.discord_duplicate_owner_channel_id
-                          ? 'Clean inspection · no community found'
-                          : 'Not discovered'}
-                      </div>
-                      {communityIntent.present && (
-                        <div data-testid="community-intent" className={`mt-1.5 rounded-md border px-2 py-1.5 ${
-                          communityIntent.tone === 'paid'
-                            ? 'border-amber-300 bg-amber-50 dark:border-amber-800 dark:bg-amber-950/40'
-                            : 'border-sky-200 bg-sky-50 dark:border-sky-800 dark:bg-sky-950/40'
-                        }`}>
-                          <div className={`text-[10px] font-bold ${
-                            communityIntent.tone === 'paid'
-                              ? 'text-amber-800 dark:text-amber-300'
-                              : 'text-sky-800 dark:text-sky-300'
+                    <td className="min-w-[220px] max-w-[240px] py-2 px-3 align-top">
+                      <div data-testid="discord-cell" className="text-[10px] leading-4">
+                        <div className="flex min-w-0 items-center gap-1.5">
+                          <span className={`inline-flex shrink-0 items-center rounded-full px-1.5 py-0.5 text-[9px] font-bold leading-none ${
+                            c.discord_status === 'ACTIVE'
+                              ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/80 dark:text-emerald-300'
+                              : c.discord_status === 'ACTIVE_LOW_VOLUME'
+                              ? 'bg-teal-100 text-teal-800 dark:bg-teal-950/80 dark:text-teal-300'
+                              : c.discord_status === 'UNCERTAIN'
+                              ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/80 dark:text-amber-300 border border-amber-200 dark:border-amber-800'
+                              : c.discord_status === 'NON_TRADING'
+                              ? 'bg-purple-100 text-purple-800 dark:bg-purple-950/80 dark:text-purple-300 border border-purple-200 dark:border-purple-800'
+                              : c.discord_status === 'DEAD'
+                              ? 'bg-rose-100 text-rose-800 dark:bg-rose-950/80 dark:text-rose-300'
+                              : c.discord_status === 'PENDING'
+                              ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/80 dark:text-amber-300'
+                              : 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300'
                           }`}>
-                            {communityIntent.label}
-                          </div>
-                          {communityIntent.evidence.length > 0 ? communityIntent.evidence.map(item => (
-                            <div key={item.key} className="mt-0.5 text-[10px] text-slate-600 dark:text-slate-300" title={item.url}>
-                              <span className="font-semibold">{item.platform}</span> · {item.intent} · <span className="font-mono break-all">{item.displayUrl}</span>
-                              {item.signals.length > 0 && <span> · {item.signals.join(', ')}</span>}
-                            </div>
-                          )) : (
-                            <div className="mt-0.5 text-[10px] text-slate-500 dark:text-slate-400">Evidence recorded by inspection</div>
+                            {c.discord_status}
+                          </span>
+                          {c.discord_invite && (
+                            <>
+                              <a
+                                href={c.discord_invite}
+                                target="_blank"
+                                rel="noreferrer"
+                                title={c.discord_invite}
+                                className="min-w-0 flex-1 truncate font-mono text-[10px] font-semibold text-indigo-600 hover:underline dark:text-indigo-400"
+                              >
+                                {c.discord_invite.replace(/^https?:\/\//, '').replace(/^www\./, '')}
+                              </a>
+                              <button
+                                onClick={() => handleCopyLink(c.discord_invite!, c.channel_id)}
+                                className="shrink-0 p-0.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+                                title="Copy link"
+                                aria-label="Copy Discord invite"
+                              >
+                                {copiedId === c.channel_id ? <Check className="h-3 w-3 text-emerald-500" /> : <Copy className="h-3 w-3" />}
+                              </button>
+                            </>
                           )}
                         </div>
-                      )}
-                      {c.discord_liveness_status&&c.discord_liveness_status!=='NOT_CHECKED'&&<div className="text-[10px] text-slate-500">Liveness: <b>{c.discord_liveness_status.replaceAll('_',' ')}</b></div>}
-                      {c.discord_relevance_status&&c.discord_relevance_status!=='NOT_CHECKED'&&<div className="text-[10px] text-slate-500">Relevance: <b>{c.discord_relevance_status.replaceAll('_',' ')}</b></div>}
-                      {retryReconciliationRequired && <div className="text-[10px] font-semibold text-rose-600" title={retryReconciliationReason}>{retryReconciliationLabel || 'STALE_RETRY · RECONCILIATION REQUIRED'} · reason: {retryReasonLabel}</div>}
-                      {retryReconciliationRequired && <div className="text-[10px] text-slate-500">{retryReconciliationReason}</div>}
-                      {!retryReconciliationRequired && (c.scan_status==='FAILED'||c.scan_status==='FAILED_PERMANENT'||c.scan_status==='ENRICHMENT_PENDING') && c.discord_validation_status==='RETRY_PENDING'&&(automaticRetryActive||automaticRetryTerminal)&&<div className="text-[10px] font-semibold text-amber-600">{automaticRetryActive ? `Automatic retry ${c.community_retry_job_status === 'PROCESSING' ? 'in progress' : automaticRetryDue ? 'due now' : 'queued'} · reason: ${retryReasonLabel}` : automaticRetryTerminal ? automaticRetryBudgetExhausted ? `Automatic retry budget exhausted · governed recovery available · reason: ${retryReasonLabel}` : `Automatic retry stopped after terminal failure · governed recovery available · reason: ${retryReasonLabel}` : `No automatic retry queued · reason: ${retryReasonLabel} · governed recovery available`}</div>}
-                      {!retryReconciliationRequired && c.discord_validation_status==='RETRY_PENDING'&&retryReconciliationLabel&&<div className="text-[10px] font-semibold text-rose-600">{retryReconciliationLabel}</div>}
-                      {retryReconciliationRequired && c.community_retry_job_attempts!=null&&c.community_retry_job_max_attempts!=null&&<div className="text-[10px] text-slate-500">Historical retry attempts preserved: {c.community_retry_job_attempts}/{c.community_retry_job_max_attempts}</div>}
-                      {!retryReconciliationRequired && (c.scan_status==='FAILED'||c.scan_status==='FAILED_PERMANENT'||c.scan_status==='ENRICHMENT_PENDING') && c.discord_validation_status==='RETRY_PENDING'&&(automaticRetryActive||automaticRetryTerminal)&&c.community_retry_job_attempts!=null&&c.community_retry_job_max_attempts!=null&&<div className="text-[10px] text-slate-500">{c.community_retry_job_attempts===0&&(c.community_retry_job_execution_count||0)===0?`Pending · not yet executed (0/${c.community_retry_job_max_attempts})${c.community_retry_job_run_after&&c.community_retry_job_status==='PENDING'?` · next ${new Date(c.community_retry_job_run_after).toLocaleString()}`:''}`:`Retry-window attempts: ${c.community_retry_job_attempts}/${c.community_retry_job_max_attempts}`}{c.community_retry_job_attempts>0&&c.community_retry_job_run_after&&c.community_retry_job_status==='PENDING'?` · ${automaticRetryDue?'due':'next'} ${new Date(c.community_retry_job_run_after).toLocaleString()}`:''}</div>}
-                      {!retryReconciliationRequired && (c.scan_status==='FAILED'||c.scan_status==='FAILED_PERMANENT'||c.scan_status==='ENRICHMENT_PENDING') && c.discord_validation_status==='RETRY_PENDING'&&(automaticRetryActive||automaticRetryTerminal)&&c.community_retry_job_execution_count!=null&&<div className="text-[10px] text-slate-500" title="Worker claims = every time a worker picked up this retry (each claim is recorded). Capacity deferrals = claims rejected before any acquisition ran (browser/quota unavailable; they never consume the attempts budget). Executed attempts = claims carrying durable proof that community inspection actually began (marked at the inspection boundary, then completed or failed with a real error); bare claims, deferrals, stale recoveries, and pre-dispatch failures are never counted.">Worker claims: {c.community_retry_job_execution_count} · capacity deferrals: {c.community_retry_job_deferral_count||0} · executed attempts: {c.community_retry_job_executed_count??Math.max(0,(c.community_retry_job_execution_count||0)-(c.community_retry_job_deferral_count||0))}{c.community_retry_job_last_execution_status?` · last ${c.community_retry_job_last_execution_status.toLowerCase()}`:''}</div>}
-                      {c.discord_liveness_status==='INVALID_OBSERVED'&&<div className="text-[10px] text-amber-600">Invalid observation awaiting confirmation</div>}
-                      {c.discord_candidate_type&&<div className="text-[10px] text-slate-400">Locator: {c.discord_candidate_type.replaceAll('_',' ')}</div>}
-                      {c.discord_candidate_locator && !c.discord_invite && c.discord_liveness_status === 'ACTIVE' && <div className="mt-0.5 max-w-48 truncate font-mono text-[10px] text-slate-500" title={c.discord_candidate_locator}>Validated candidate: {c.discord_candidate_locator.replace('https://','')}</div>}
-                      {(c.discord_candidates?.length||0)>0&&<details className="mt-1 text-[10px]"><summary className="cursor-pointer font-semibold text-indigo-600">{c.discord_candidates!.length} candidate{c.discord_candidates!.length===1?'':'s'} · view</summary><div className="mt-1 space-y-1 min-w-64">{c.discord_candidates!.map(candidate=><div key={candidate.candidate_id} className="rounded border border-slate-200 p-1.5 dark:border-slate-700"><div className="font-mono break-all">{discordCandidateDisplayUrl(candidate) || candidate.normalized_locator} {candidate.selected&&<b className="text-emerald-600">· SELECTED</b>}</div><div>{candidate.source_observations?.map(item=>item.sourceSurface).filter(Boolean).join(', ')||candidate.source_surface||'Unknown source'} · {candidate.candidate_status} · {candidate.validation_status}</div><div>Liveness: {candidate.liveness_status} · Relevance: {candidate.relevance_status} · Attempts: {candidate.attempt_count}</div><div>{candidate.retryable?'Retryable':'Terminal'}{candidate.last_checked?` · ${new Date(candidate.last_checked).toLocaleString()}`:''}</div>{candidate.failure_reason&&<div className="text-rose-600">{candidate.failure_reason}</div>}</div>)}</div></details>}
+
+                        {communityIntent.present && (
+                          <details data-testid="community-intent" className="group border-l-2 border-amber-400 pl-1.5">
+                            <summary className="flex cursor-pointer list-none items-center gap-1 [&::-webkit-details-marker]:hidden">
+                              <ChevronRight className="h-3 w-3 shrink-0 text-amber-500 transition-transform group-open:rotate-90" aria-hidden="true" />
+                              <span className={`truncate font-bold ${communityIntent.tone === 'paid' ? 'text-amber-800 dark:text-amber-300' : 'text-sky-800 dark:text-sky-300'}`}>
+                                {communityIntent.label}
+                              </span>
+                            </summary>
+                            <div className="mt-1 space-y-0.5 pl-4">
+                              {communityIntent.evidence.length > 0 ? communityIntent.evidence.map(item => (
+                                <div key={item.key} data-testid="community-intent-evidence" title={item.url}>
+                                  <span className="font-semibold">{item.platform}</span> · {item.intent} · <a href={item.url} target="_blank" rel="noreferrer" className="font-mono break-all text-indigo-600 hover:underline dark:text-indigo-400">{item.displayUrl}</a>
+                                  {item.signals.length > 0 && <span> · {item.signals.join(', ')}</span>}
+                                </div>
+                              )) : (
+                                <div className="text-slate-500 dark:text-slate-400">Evidence recorded by inspection</div>
+                              )}
+                              {!duplicateOwnerName && <div data-testid="discord-generic-status">{genericDiscordStatus}</div>}
+                              {!duplicateOwnerName && discordExpandedDetails}
+                            </div>
+                          </details>
+                        )}
+
+                        {duplicateOwnerName && (
+                          <details data-testid="duplicate-owned-invite" className="group border-l-2 border-amber-400 pl-1.5">
+                            <summary className="flex cursor-pointer list-none items-center gap-1 [&::-webkit-details-marker]:hidden">
+                              <ChevronRight className="h-3 w-3 shrink-0 text-amber-500 transition-transform group-open:rotate-90" aria-hidden="true" />
+                              <span className="truncate font-bold text-amber-800 dark:text-amber-300">Second invite owned elsewhere</span>
+                            </summary>
+                            <div className="mt-1 space-y-1 pl-4 text-slate-600 dark:text-slate-300">
+                              <div>Owned by <a href={duplicateOwnerHref} onClick={focusDuplicateOwner} data-testid="discord-owner-link" className="font-semibold text-amber-800 underline decoration-amber-500/70 underline-offset-2 dark:text-amber-300">{duplicateOwnerName}</a>. The selected invite above is unchanged.</div>
+                              {discordExpandedDetails}
+                            </div>
+                          </details>
+                        )}
+
+                        {!communityIntent.present && !duplicateOwnerName && (
+                          <details data-testid="discord-generic-summary" className="group border-l-2 border-slate-300 pl-1.5">
+                            <summary className="flex cursor-pointer list-none items-center gap-1 [&::-webkit-details-marker]:hidden">
+                              <ChevronRight className="h-3 w-3 shrink-0 text-slate-400 transition-transform group-open:rotate-90" aria-hidden="true" />
+                              <span className="truncate font-semibold text-slate-600 dark:text-slate-300">{genericDiscordStatus}</span>
+                            </summary>
+                            <div className="mt-1 pl-4">{discordExpandedDetails}</div>
+                          </details>
+                        )}
+                      </div>
                     </td>
 
                     {/* Scan Status */}

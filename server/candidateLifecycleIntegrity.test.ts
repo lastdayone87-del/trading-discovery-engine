@@ -208,6 +208,8 @@ test('duplicate ownership provenance stores only the owner channel id, never the
   assert.match(queue, /discardedOwnerChannelIds/);
   const db = readSource('dbCore.ts');
   assert.match(db, /discord_duplicate_owner_channel_id: row\.discord_duplicate_owner_channel_id \|\| null/);
+  assert.match(db, /discord_duplicate_owner_channel_name: row\.discord_duplicate_owner_channel_name \|\| null/);
+  assert.match(db, /SELECT owner\.channel_name FROM channels owner WHERE owner\.channel_id=channels\.discord_duplicate_owner_channel_id/);
   assert.match(db, /discord_duplicate_owner_channel_id=excluded\.discord_duplicate_owner_channel_id/);
   assert.match(db, /if\(args\.discordStatus==='INVITE_OWNED_BY_ANOTHER_CHANNEL'\)clauses\.push\('discord_duplicate_owner_channel_id IS NOT NULL'\)/);
   assert.match(readSource('../src/components/ResultsTable.tsx'), /INVITE_OWNED_BY_ANOTHER_CHANNEL/);

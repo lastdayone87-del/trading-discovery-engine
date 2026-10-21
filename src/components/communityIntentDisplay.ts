@@ -36,11 +36,6 @@ export function communityIntentDisplay(
   // already retains a Discord invite or candidate. Keep the two facts
   // independent in the label so the table never contradicts itself.
   const hasDiscord = Boolean(channel.discord_invite || channel.discord_candidate_locator);
-  const label = paid
-    ? 'PAID COMMUNITY INDICATED'
-    : hasDiscord
-      ? 'ADDITIONAL COMMUNITY INDICATED'
-      : 'COMMUNITY INDICATED · NO INVITE';
   const seen = new Set<string>();
   const evidence: CommunityIntentEvidenceView[] = [];
   for (const item of intents) {
@@ -50,14 +45,33 @@ export function communityIntentDisplay(
     if (evidence.length >= 3) break;
   }
 
+  const platforms = [...new Set(evidence.map(item => item.platform))];
+  const platformSuffix = platforms.length > 0 ? ` (${platforms.slice(0, 2).join(', ')}${platforms.length > 2 ? ', +' + (platforms.length - 2) : ''})` : '';
+  const label = paid
+    ? `Paid community${platformSuffix}`
+    : hasDiscord
+      ? `Additional community${platformSuffix}`
+      : `Community indicated${platformSuffix} · no invite`;
+
   return { present: true, label, tone: paid ? 'paid' : 'indicated', evidence };
+}
+
+function platformLabel(platform: string): string {
+  const known: Record<string, string> = {
+    WHOP: 'Whop',
+    SKOOL: 'Skool',
+    CIRCLE: 'Circle',
+    PATREON: 'Patreon',
+    DISCORD: 'Discord',
+  };
+  return known[platform.toUpperCase()] || platform;
 }
 
 function evidenceView(item: CommunityIntentEvidence): CommunityIntentEvidenceView {
   const signals = [...new Set([...(item.paidSignals || []), ...(item.privateSignals || [])])].slice(0, 5);
   return {
     key: `${item.communityPlatform}:${item.communityUrl}`,
-    platform: item.communityPlatform,
+    platform: platformLabel(item.communityPlatform),
     intent: item.intent,
     url: item.communityUrl,
     displayUrl: item.communityUrl.replace(/^https?:\/\//, '').replace(/^www\./, ''),
