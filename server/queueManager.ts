@@ -57,7 +57,7 @@ import { runChannelInspection, hasProcessedAcquisitionEvidence } from './inspect
 import { hasRetryableCommunityAcquisitionFailure } from './communityRetryPolicy';
 import { applyCommunityIntentEvidence } from './communityIntent';
 import { validateDiscordInvite } from './discordValidator';
-import {projectDiscordValidation, reconcileDiscordDiscoveryFromInspection} from './discordProjection';
+import {canProjectDiscordValidation,hasEstablishedValidatedDiscordSelection,projectDiscordValidation,reconcileDiscordDiscoveryFromInspection} from './discordProjection';
 import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, fetchYouTubeChannelCountryMetadata, DiscoveredChannelRaw, RetrievalLane } from './youtube';
 import {buildProviderRequestBaseId,executeAllocatedRetrievalPage,providerSnapshot,YOUTUBE_SEARCH_PROVIDER,type ProviderAllocation} from './providerAwareRetrieval';
 import './braveSearch';
@@ -1979,9 +1979,7 @@ export async function inspectAndValidateChannel(
       }
       if(!selected&&terminalInvalid.length===candidates.filter(candidate=>candidate.nativeInviteCode).length){selected=terminalInvalid[0];selectedCandidate=candidates[0];}
       if(!selected)throw new Error('No resolvable native Discord candidate was available for validation');
-      const alreadyValidatedSuccess=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
-      const sameValidatedCandidate=!channel.discord_candidate_id||channel.discord_candidate_id===selectedCandidate.candidateId;
-      const shouldProjectValidation=!alreadyValidatedSuccess||selected.operationalOutcome==='SUCCEEDED'||(selected.operationalOutcome==='CONFIRMED_INVALID'&&sameValidatedCandidate);
+      const shouldProjectValidation=canProjectDiscordValidation(channel,selected,selectedCandidate);
       if(shouldProjectValidation){Object.assign(channel,projectDiscordValidation(channel,selected,selectedCandidate));await selectDiscordCandidate(channel.channel_id,selectedCandidate.candidateId);}
       attemptFree=attemptFreeDiscordValidation(selected.operationalOutcome,selected.retryable);
       channel.scan_status=selected.operationalOutcome==='SUCCEEDED'||selected.operationalOutcome==='CONFIRMED_INVALID'?'COMPLETED':'FAILED';
@@ -2001,7 +1999,7 @@ export async function inspectAndValidateChannel(
       // candidate-free "not found".
       (inspection.acquisitionStatus==='FOUND'&&!discoveredInvite&&!candidates.some(candidate=>candidate.nativeInviteCode))) {
       // A failed or partial crawl is operational uncertainty, not confirmed absence.
-      const alreadyValidatedSuccess=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
+      const alreadyValidatedSuccess=hasEstablishedValidatedDiscordSelection(channel);
       // Shared predicate (not a local outcome check): required retryable FAILED
       // and required retryable PARTIALLY_INSPECTED both own the RETRY_PENDING
       // path, so partial-only acquisitions never strand in FAILED_OPERATIONAL.
@@ -2260,7 +2258,7 @@ export async function projectNotFoundAfterInspection(
         channel.scan_attempts=Math.max(0,Number(channel.scan_attempts)||0)+1;
       }
       if(pendingWork.pending&&!locatorExhausted){
-        const alreadyValidatedSuccess=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
+        const alreadyValidatedSuccess=hasEstablishedValidatedDiscordSelection(channel);
         if(!alreadyValidatedSuccess){
           channel.discord_status='UNCERTAIN';
           channel.discord_liveness_status=channel.discord_candidate_locator?(channel.discord_liveness_status||'UNCERTAIN'):'NOT_CHECKED';
@@ -2290,7 +2288,7 @@ export async function projectNotFoundAfterInspection(
         return;
       }
       // Nothing Found After All Steps
-      const alreadyValidatedSuccess=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
+      const alreadyValidatedSuccess=hasEstablishedValidatedDiscordSelection(channel);
       if(!alreadyValidatedSuccess){
         channel.discord_status = channel.discord_candidate_locator?'UNCERTAIN':'NOT_FOUND';
         if(!channel.discord_candidate_locator){channel.discord_resolution_status='NOT_ATTEMPTED';channel.discord_liveness_status='NOT_CHECKED';channel.discord_relevance_status='NOT_CHECKED';channel.discord_validation_status='COMPLETED';}

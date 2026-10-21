@@ -6,6 +6,7 @@ import { resolveScopeEligibility } from './scopeEligibility';
 import { classifyTradingRelevanceDetailed } from './tradingRelevanceClassifier';
 import { runAndRecordAdaptiveShadow } from './adaptiveTradingClassifier';
 import { inspectAndValidateChannel } from './queueManager';
+import { hasEstablishedValidatedDiscordSelection, projectTradingReclassificationDiscordState } from './discordProjection';
 import { applyPublicAboutToCandidate, fetchLiveYouTubeChannelData, shouldAttemptPublicAboutCountryFallback } from './youtubePublicAbout';
 import {
   getChannelById,
@@ -659,6 +660,13 @@ export async function processChannelThroughPipeline(
 
     const currentStage=candidate.enrichmentStage||0;
     const independentHypothesis=hasIndependentTradingHypothesis(productionClassification.decision);
+    // Trading classification is not Discord validation evidence. Capture any
+    // already-established Discord projection before this branch mutates the
+    // shared existing row, so a later UNCERTAIN/review reclassification cannot
+    // clear a live invite or make it look unvalidated to the retry path.
+    const preservedDiscordState=existing&&hasEstablishedValidatedDiscordSelection(existing)
+      ?projectTradingReclassificationDiscordState(existing)
+      :null;
 
     // Once creator-level enrichment has run, absence of any independent trading
     // hypothesis means machine evidence is exhausted without a safe terminal
@@ -680,7 +688,10 @@ export async function processChannelThroughPipeline(
       withheldChannel.country=creatorCountry; withheldChannel.country_status=countryVal.status; withheldChannel.confidence_score=countryVal.score;
       withheldChannel.trading_status='NEEDS_REVIEW'; withheldChannel.trading_confidence_score=tradingVal.confidenceScore;
       withheldChannel.trading_category=tradingVal.category; withheldChannel.trading_relevance_breakdown=tradingVal.breakdown;
-      withheldChannel.scan_status='NEEDS_REVIEW'; withheldChannel.discord_status='UNCERTAIN'; withheldChannel.discord_invite=null; withheldChannel.last_checked=now;
+      withheldChannel.scan_status='NEEDS_REVIEW';
+      withheldChannel.discord_status=preservedDiscordState?.discord_status??'UNCERTAIN';
+      withheldChannel.discord_invite=preservedDiscordState?.discord_invite??null;
+      withheldChannel.last_checked=now;
       applyCandidateObservability(withheldChannel,candidate);
       await upsertChannel(withheldChannel);
       void recordAdmissionShadow({channelId:candidate.channelId,priorState:'WITHHELD_INVESTIGATING',classificationStatus:'NEEDS_REVIEW',investigationState:'REVIEW_ELIGIBLE',classificationDiagnosticId,
@@ -689,7 +700,7 @@ export async function processChannelThroughPipeline(
         .catch(error=>console.warn(`[CandidateAdmission] post-enrichment withholding write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
       void recordReviewEligibilityShadow({channelId:candidate.channelId,classificationDiagnosticId,classificationStatus:'UNCERTAIN',investigationState:'NEEDS_REVIEW',plausibleTradingHypothesis:false,evidenceSufficient:productionClassification.decision.evidenceCollection.sufficiency==='SUFFICIENT',independentEvidence:false,countryAllowed:true,operationalFailure:false,providerDegraded:productionClassification.decision.evidenceCollection.degraded,unsupportedLanguage:productionClassification.decision.evidenceCollection.providers.some(provider=>provider.outcome==='ABSTAINED_UNSUPPORTED_LANGUAGE'),terminalDecision:false,decidedAt:productionClassification.decision.timestamp})
         .catch(error=>console.warn(`[ReviewEligibility] withholding shadow write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
-      return {channelId:candidate.channelId,channelName:candidate.channelName,isNew:!existing,wasKnown:!!existing,persisted:true,countryStatus:countryVal.status,tradingStatus:'NEEDS_REVIEW',discordStatus:'UNCERTAIN',discordInvite:null,channelRecord:withheldChannel};
+      return {channelId:candidate.channelId,channelName:candidate.channelName,isNew:!existing,wasKnown:!!existing,persisted:true,countryStatus:countryVal.status,tradingStatus:'NEEDS_REVIEW',discordStatus:withheldChannel.discord_status,discordInvite:withheldChannel.discord_invite??null,channelRecord:withheldChannel};
     }
 
     const legacyAction:EvidenceActionType=currentStage>=2?'HUMAN_REVIEW':currentStage===1?'VIDEO_PLAYLIST_CORROBORATION':'CHANNEL_RECENT_METADATA';
@@ -738,7 +749,8 @@ export async function processChannelThroughPipeline(
     uncertainChannel.trading_category = tradingVal.category;
     uncertainChannel.trading_relevance_breakdown = tradingVal.breakdown;
     uncertainChannel.scan_status = finalScanStatus;
-    uncertainChannel.discord_status = 'UNCERTAIN';
+    uncertainChannel.discord_status = preservedDiscordState?.discord_status ?? 'UNCERTAIN';
+    if (preservedDiscordState) uncertainChannel.discord_invite = preservedDiscordState.discord_invite;
     uncertainChannel.last_checked = now;
     applyCandidateObservability(uncertainChannel, candidate);
 
@@ -764,8 +776,8 @@ export async function processChannelThroughPipeline(
       persisted: true,
       countryStatus: countryVal.status,
       tradingStatus: authoritativeChannel.trading_status || finalUncertainStatus,
-      discordStatus: 'UNCERTAIN',
-      discordInvite: null,
+      discordStatus: authoritativeChannel.discord_status,
+      discordInvite: authoritativeChannel.discord_invite ?? null,
       channelRecord: authoritativeChannel
     };
   }

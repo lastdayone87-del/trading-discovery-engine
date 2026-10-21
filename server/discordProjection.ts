@@ -1,8 +1,79 @@
 import type {ChannelRecord} from '../src/types';
 import type {DiscordValidationResult} from './discordValidator';
-import type {DiscordCandidate} from './discordCandidates';
+import {discordInviteCodeOf, type DiscordCandidate} from './discordCandidates';
 
 export type DiscordProjection=Pick<ChannelRecord,'discord_status'|'discord_invite'|'discord_candidate_locator'|'discord_candidate_id'|'discord_candidate_raw_locator'|'discord_candidate_type'|'discord_resolution_status'|'discord_liveness_status'|'discord_relevance_status'|'discord_validation_status'|'discord_discovery_status'>;
+
+type DiscordSelectionIdentity=Pick<ChannelRecord,
+  'discord_status'|'discord_invite'|'discord_candidate_id'|'discord_candidate_locator'|
+  'discord_discovery_status'|'discord_validation_status'>;
+
+/**
+ * True when the row already owns a completed validation for a concrete
+ * Discord candidate. The mutable top-level `discord_status` is deliberately
+ * not required: a trading reclassification previously reset it to UNCERTAIN,
+ * which made an established invite look unvalidated and allowed a later
+ * terminal-invalid candidate to replace it. Discovery/validation identity is
+ * the durable authority for this decision.
+ *
+ * Legacy ACTIVE/DEAD rows without the separated validation columns remain
+ * protected for compatibility.
+ */
+export function hasEstablishedValidatedDiscordSelection(channel:DiscordSelectionIdentity):boolean{
+  if(channel.discord_discovery_status!=='VALIDATED')return false;
+  const completed=channel.discord_validation_status==='COMPLETED'||channel.discord_validation_status==='SUCCEEDED';
+  const hasCandidateIdentity=Boolean(channel.discord_candidate_id||channel.discord_candidate_locator||channel.discord_invite);
+  return (completed&&hasCandidateIdentity)
+    ||channel.discord_status==='ACTIVE'
+    ||channel.discord_status==='ACTIVE_LOW_VOLUME'
+    ||channel.discord_status==='DEAD';
+}
+
+/** Candidate identity is durable across log/prose forms: prefer the stable
+ * candidate id, then compare the canonical invite code so a legacy id change
+ * cannot make the same invite look like a different candidate. */
+export function isSameSelectedDiscordCandidate(
+  channel:DiscordSelectionIdentity,
+  candidate:Pick<DiscordCandidate,'candidateId'|'nativeInviteCode'|'normalizedLocator'>
+):boolean{
+  const currentId=channel.discord_candidate_id?.trim();
+  if(currentId&&currentId===candidate.candidateId)return true;
+  const currentCode=discordInviteCodeOf(channel.discord_candidate_locator||channel.discord_invite);
+  const candidateCode=discordInviteCodeOf(candidate.nativeInviteCode||candidate.normalizedLocator);
+  if(currentCode&&candidateCode)return currentCode===candidateCode;
+  return !currentId&&!channel.discord_candidate_locator&&!channel.discord_invite;
+}
+
+/**
+ * A completed validation is a terminal-ish projection: only a new successful
+ * validation or confirmation that the SAME selected candidate is invalid may
+ * replace it. A terminal-invalid different candidate must not erase a live
+ * invite merely because the top-level trading status was reset to UNCERTAIN.
+ */
+export function canProjectDiscordValidation(
+  channel:DiscordSelectionIdentity,
+  validation:Pick<DiscordValidationResult,'operationalOutcome'>,
+  candidate:DiscordCandidate
+):boolean{
+  if(!hasEstablishedValidatedDiscordSelection(channel))return true;
+  return validation.operationalOutcome==='SUCCEEDED'
+    ||(validation.operationalOutcome==='CONFIRMED_INVALID'&&isSameSelectedDiscordCandidate(channel,candidate));
+}
+
+/**
+ * Trading classification is a separate fact from Discord liveness. A
+ * classification-only pass may change trading_status/scan_status, but it must
+ * not clear a previously established Discord projection.
+ */
+export function projectTradingReclassificationDiscordState(
+  channel:DiscordSelectionIdentity,
+  fallbackStatus:ChannelRecord['discord_status']='UNCERTAIN'
+):Pick<ChannelRecord,'discord_status'|'discord_invite'>{
+  return {
+    discord_status:hasEstablishedValidatedDiscordSelection(channel)?channel.discord_status:fallbackStatus,
+    discord_invite:channel.discord_invite??null,
+  };
+}
 
 /**
  * The Discord invite endpoint can prove liveness while exposing too little
@@ -109,11 +180,10 @@ export function reconcileDiscordDiscoveryFromInspection(
     channel.discord_discovery_status === 'NOT_DISCOVERED' ||
     channel.discord_discovery_status == null;
 
-  const alreadyValidatedSuccess =
-    channel.discord_discovery_status === 'VALIDATED' &&
-    (channel.discord_status === 'ACTIVE' || channel.discord_status === 'DEAD');
-
-  if (alreadyValidatedSuccess) return;
+  // Durable identity, not the mutable serving status: an established
+  // validation must survive an error/partial/absence reconcile even when a
+  // trading reclassification has reset discord_status to UNCERTAIN.
+  if (hasEstablishedValidatedDiscordSelection(channel)) return;
 
   if (isPureAbsence || channel.discord_status === 'PENDING' || !channel.discord_status) channel.discord_status = 'UNCERTAIN';
   if (channel.discord_discovery_status !== 'VALIDATED') channel.discord_discovery_status = 'DISCOVERED_VALIDATION_FAILED';
