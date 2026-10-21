@@ -1,9 +1,9 @@
 # Unit 3 — 9,000-unit/key/day quota cap (shadow evidence + default-OFF enforcement)
 
-Date: 2026-10-19 (updated 2026-10-20) · Shadow branch `phase1-hardening` head
-`3c53e57`; hard-cap branch `feat/youtube-key-hard-cap` code head `5ecd905`.
+Date: 2026-10-19 (updated 2026-10-21) · Shadow branch `main`/`phase1-hardening` head
+`b1aafab`; hard-cap branch `feat/youtube-key-hard-cap` code head `2f4afdd`.
 Evidence runs: shadow [39500041358](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39500041358),
-hard cap [39501810518](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39501810518).
+hard cap [39527946479](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39527946479).
 
 Status: the migration-148 shadow implementation is historical evidence. The
 hard-cap implementation on `feat/youtube-key-hard-cap` is **implemented but
@@ -156,8 +156,8 @@ main's 145.
 
 ## Hard-cap enforcement (default OFF) — implementation on `feat/youtube-key-hard-cap`
 
-Date: 2026-10-20 · Branch `feat/youtube-key-hard-cap` code head `5ecd905`, based on
-PR #531 head `3c53e57` after the external #530 merge `6267ba1` · Status:
+Date: 2026-10-21 · Branch `feat/youtube-key-hard-cap` code head `2f4afdd`, based on
+current main `b1aafab` (merged #530, #531, #532) · Status:
 **implemented, disabled by default, not deployed, not enabled.** Production
 remains unchanged and no migration has been applied to it.
 
@@ -271,7 +271,7 @@ rejected); settlement failure leaving the conservative lease; Pacific midnight
 two probe-budget concurrency cases.
 
 CI results for `9f6001a` (run
-https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39501810518):
+https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39527946479):
 `npx tsc --noEmit` clean; **51/51 unit** (27 quota cap + 9 dbCore quota +
 15 probe executor) and **21/21 PostgreSQL**, 0 skipped. Local PostgreSQL was not
 available on this host; the postgres:17 CI service is the database proof. No
