@@ -80,6 +80,8 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
     return matchesSearch && matchesCountry && matchesCountryStatus && matchesTradingStatus && matchesDiscordStatus && matchesScanStatus && matchesLowAudienceVisibility && matchesReviewView && matchesRecentInvites;
   }),[channels,searchTerm,selectedCountry,selectedCountryStatus,selectedTradingStatus,selectedDiscordStatus,selectedScanStatus,pendingReviewOnly,decidedChannelIds,recentInvites]);
 
+  const visibleChannelIds = useMemo(()=>new Set(filteredChannels.map(c=>c.channel_id)),[filteredChannels]);
+
   const handleCopyLink = (url: string, id: string) => {
     navigator.clipboard.writeText(url);
     setCopiedId(id);
@@ -423,9 +425,13 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                       || channels.find(item => item.channel_id === c.discord_duplicate_owner_channel_id)?.channel_name
                       || 'another channel')
                     : null;
-                  const duplicateOwnerHref = c.discord_duplicate_owner_channel_id
+                  const duplicateOwnerVisible = Boolean(
+                    c.discord_duplicate_owner_channel_id && visibleChannelIds.has(c.discord_duplicate_owner_channel_id),
+                  );
+                  const duplicateOwnerHref = c.discord_duplicate_owner_channel_id && duplicateOwnerVisible
                     ? `#channel-row-${c.discord_duplicate_owner_channel_id}`
                     : undefined;
+                  const hasStoredInvite = Boolean(c.discord_invite);
                   const focusDuplicateOwner = (event: React.MouseEvent<HTMLAnchorElement>) => {
                     event.stopPropagation();
                     if (!c.discord_duplicate_owner_channel_id) return;
@@ -630,10 +636,16 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                           <details data-testid="duplicate-owned-invite" className="group border-l-2 border-amber-400 pl-1.5">
                             <summary className="flex cursor-pointer list-none items-center gap-1 [&::-webkit-details-marker]:hidden">
                               <ChevronRight className="h-3 w-3 shrink-0 text-amber-500 transition-transform group-open:rotate-90" aria-hidden="true" />
-                              <span className="truncate font-bold text-amber-800 dark:text-amber-300">Second invite owned elsewhere</span>
+                              <span className="truncate font-bold text-amber-800 dark:text-amber-300">{hasStoredInvite ? 'Second invite owned elsewhere' : 'Owned by another channel'}</span>
                             </summary>
                             <div className="mt-1 space-y-1 pl-4 text-slate-600 dark:text-slate-300">
-                              <div>Owned by <a href={duplicateOwnerHref} onClick={focusDuplicateOwner} data-testid="discord-owner-link" className="font-semibold text-amber-800 underline decoration-amber-500/70 underline-offset-2 dark:text-amber-300">{duplicateOwnerName}</a>. The selected invite above is unchanged.</div>
+                              <div>
+                                Owned by {duplicateOwnerVisible ? (
+                                  <a href={duplicateOwnerHref} onClick={focusDuplicateOwner} data-testid="discord-owner-link" className="font-semibold text-amber-800 underline decoration-amber-500/70 underline-offset-2 dark:text-amber-300">{duplicateOwnerName}</a>
+                                ) : (
+                                  <span data-testid="discord-owner-name" className="font-semibold text-amber-800 dark:text-amber-300">{duplicateOwnerName}</span>
+                                )}. {hasStoredInvite ? 'The selected invite above is unchanged.' : 'No invite is retained on this channel.'}
+                              </div>
                               {discordExpandedDetails}
                             </div>
                           </details>

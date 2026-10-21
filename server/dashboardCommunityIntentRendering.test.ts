@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import type { ChannelRecord, CommunityIntentEvidence } from '../src/types';
+import type { ChannelRecord, CommunityIntentEvidence, CommunityPlatform } from '../src/types';
 
 // ResultsTable reads reviewer defaults from localStorage during render. This is
 // a server-rendering test for the dashboard cell, not a browser test.
@@ -132,18 +132,39 @@ test('a retained invite makes the additional community label invite-neutral', as
   assert.match(html, /https:\/\/discord\.gg\/retained/);
 });
 
-test('duplicate ownership is one compact summary with a linked owner name, not a repeated warning or raw id', async () => {
+test('duplicate ownership without a stored invite explains ownership without implying a selected invite', async () => {
   const html = await renderDashboard(channel({
     discord_duplicate_owner_channel_id: 'UC_owner_other',
     discord_duplicate_owner_channel_name: 'OFM',
   }));
 
-  assert.match(html, /Second invite owned elsewhere/);
+  assert.match(html, /Owned by another channel/);
   assert.match(html, /data-testid="duplicate-owned-invite"/);
-  assert.match(html, /href="#channel-row-UC_owner_other"[^>]*>OFM<\/a>/);
+  assert.match(html, /data-testid="discord-owner-name"/);
+  assert.match(html, /OFM/);
+  assert.doesNotMatch(html, /Second invite owned elsewhere/);
+  assert.doesNotMatch(html, /The selected invite above is unchanged/);
+  assert.doesNotMatch(html, /href="#channel-row-UC_owner_other"/);
   assert.doesNotMatch(html, /Invite found, owned by another channel/);
   assert.doesNotMatch(html, /Owner channel: UC_owner_other/);
   assert.doesNotMatch(html, /Clean inspection · no community found/);
+});
+
+test('duplicate ownership with a stored invite keeps the selected-invite wording and links a rendered owner', async () => {
+  const owner = channel({ channel_id: 'UC_owner_other', channel_name: 'OFM' });
+  const duplicate = channel({
+    channel_id: 'UC_duplicate',
+    channel_name: 'Duplicate Creator',
+    discord_invite: 'https://discord.gg/duplicate',
+    discord_duplicate_owner_channel_id: owner.channel_id,
+  });
+  const html = await renderChannels([duplicate, owner]);
+
+  assert.match(html, /Second invite owned elsewhere/);
+  assert.match(html, /href="#channel-row-UC_owner_other"[^>]*>OFM<\/a>/);
+  assert.match(html, /The selected invite above is unchanged/);
+  assert.match(html, /data-testid="discord-owner-link"/);
+  assert.match(html, /discord\.gg\/duplicate/);
 });
 
 test('duplicate owner name falls back to the loaded owner row and links to that row', async () => {
@@ -200,10 +221,93 @@ test('retry and candidate evidence remain available behind the single summary', 
     community_retry_job_attempts: 0,
     community_retry_job_max_attempts: 3,
     community_retry_job_execution_count: 0,
+    discord_candidates: [{
+      candidate_id: 'cand-retained',
+      raw_locator: 'discord.gg/candidate',
+      normalized_locator: 'https://discord.gg/candidate',
+      locator_type: 'INVITE',
+      source_surface: 'website',
+      source_observations: [{ sourceSurface: 'website', sourceUrl: 'https://creator.test/' }],
+      candidate_status: 'VALIDATED',
+      validation_status: 'SUCCEEDED',
+      liveness_status: 'ACTIVE',
+      relevance_status: 'RELEVANT',
+      retryable: false,
+      attempt_count: 1,
+      selected: true,
+    }],
   }));
 
   assert.match(html, /data-testid="discord-generic-summary"/);
   assert.match(html, /Automatic retry queued · reason: NO SURFACE/);
   assert.match(html, /Retry-window attempts: 0\/3|Pending · not yet executed \(0\/3\)/);
   assert.match(html, /https:\/\/discord\.gg\/retained/);
+  assert.match(html, /1 candidate · view/);
+  assert.match(html, /discord\.gg\/candidate/);
+  assert.match(html, /SELECTED/);
+});
+
+test('paid summary names the paid platform even when non-paid records come first', async () => {
+  const skoolUnpaid: CommunityIntentEvidence = {
+    ...paidIntent,
+    communityPlatform: 'SKOOL',
+    communityUrl: 'https://www.skool.com/creator-community',
+    intent: 'UNKNOWN',
+    paidSignals: [],
+  };
+  const circlePrivate: CommunityIntentEvidence = {
+    ...paidIntent,
+    communityPlatform: 'CIRCLE',
+    communityUrl: 'https://community.circle.so/c/creator',
+    intent: 'PRIVATE',
+    paidSignals: [],
+  };
+  const html = await renderDashboard(channel({
+    community_discovery_status: 'PAID_COMMUNITY_INDICATED',
+    community_intents: [skoolUnpaid, circlePrivate, paidIntent],
+  }));
+
+  assert.match(html, /Paid community \(Whop\)/);
+  assert.doesNotMatch(html, /Paid community \(Skool/);
+  assert.match(html, /whop\.com\/creator/);
+});
+
+test('paid summary counts every paid platform, not only the displayed evidence entries', async () => {
+  const paidPlatform = (platform: CommunityPlatform, url: string): CommunityIntentEvidence => ({
+    ...paidIntent,
+    communityPlatform: platform,
+    communityUrl: url,
+  });
+  const html = await renderDashboard(channel({
+    community_discovery_status: 'PAID_COMMUNITY_INDICATED',
+    community_intents: [
+      paidPlatform('WHOP', 'https://www.whop.com/creator'),
+      paidPlatform('SKOOL', 'https://www.skool.com/creator'),
+      paidPlatform('CIRCLE', 'https://community.circle.so/c/creator'),
+      paidPlatform('PATREON', 'https://www.patreon.com/creator'),
+    ],
+  }));
+
+  assert.match(html, /Paid community \(Whop, Skool, \+2\)/);
+});
+
+test('community-indicated summary counts platforms beyond the three displayed evidence entries', async () => {
+  const plainIntent = (platform: CommunityPlatform, url: string): CommunityIntentEvidence => ({
+    ...paidIntent,
+    communityPlatform: platform,
+    communityUrl: url,
+    intent: 'UNKNOWN',
+    paidSignals: [],
+  });
+  const html = await renderDashboard(channel({
+    community_discovery_status: 'COMMUNITY_INDICATED_NO_INVITE',
+    community_intents: [
+      plainIntent('WHOP', 'https://www.whop.com/creator'),
+      plainIntent('SKOOL', 'https://www.skool.com/creator'),
+      plainIntent('CIRCLE', 'https://community.circle.so/c/creator'),
+      plainIntent('PATREON', 'https://www.patreon.com/creator'),
+    ],
+  }));
+
+  assert.match(html, /Community indicated \(Whop, Skool, \+2\) · no invite/);
 });
