@@ -625,13 +625,15 @@ export async function processNextSearchJob(
 ): Promise<boolean> {
   await recoverStaleJobs();
   if (shouldRunStaleChannelLockRecovery({ lastRunMs: lastStaleChannelLockRecoveryMs })) {
+    // Stamp before running so a failing sweep backs off for the normal
+    // interval instead of being retried on every worker tick.
     lastStaleChannelLockRecoveryMs = Date.now();
     try {
       await recoverStaleChannelLocks();
     } catch (error) {
-      // Do not lock the sweep out for a full interval after a transient error.
-      lastStaleChannelLockRecoveryMs = null;
-      throw error;
+      // Auxiliary housekeeping: a persistent sweep failure must be visible in
+      // logs without stalling the search claim path on every tick.
+      console.error('stale_channel_lock_recovery_failed', error);
     }
   }
   await recoverStaleInvestigationSteps();

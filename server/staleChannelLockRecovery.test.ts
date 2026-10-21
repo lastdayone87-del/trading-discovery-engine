@@ -124,6 +124,15 @@ test('worker tick runs channel lock recovery alongside stale job recovery', () =
   assert.match(queueSource, /await recoverStaleJobs\(\);[\s\S]*await recoverStaleChannelLocks\(\);/);
 });
 
+test('a failing channel lock sweep is logged, not rethrown into the claim path', () => {
+  // The sweep is auxiliary housekeeping: a persistent failure must back off
+  // for the normal interval and continue, or every worker tick would abort
+  // before the job claim for as long as the failure lasts.
+  assert.match(queueSource, /lastStaleChannelLockRecoveryMs = Date\.now\(\);\s*try\s*\{\s*await recoverStaleChannelLocks\(\);\s*\}\s*catch \(error\)\s*\{[\s\S]*?console\.error\('stale_channel_lock_recovery_failed', error\);/);
+  assert.doesNotMatch(queueSource, /lastStaleChannelLockRecoveryMs = null/);
+  assert.doesNotMatch(queueSource, /throw error;[\s\S]{0,120}await recoverStaleInvestigationSteps/);
+});
+
 test('one-time cleanup is bounded to old LOCKED rows without live ownership', () => {
   assert.match(migration, /c\.updated_at < now\(\)-interval '60 minutes'/);
   assert.match(migration, /WHERE c\.scan_status='LOCKED'/);
