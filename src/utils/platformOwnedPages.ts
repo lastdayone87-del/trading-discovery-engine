@@ -27,11 +27,11 @@ const KNOWN_PLATFORMS: readonly CommunityPlatformHost[] = ['WHOP', 'SKOOL', 'CIR
 const RESERVED_PATHS: Record<CommunityPlatformHost, ReadonlySet<string>> = {
   WHOP: new Set([
     '', 'about', 'academy', 'affiliates', 'api', 'apps', 'blog', 'brand', 'blueprints',
-    'careers', 'company', 'contact', 'creators', 'customers', 'developers', 'discover',
-    'docs', 'enterprise', 'events', 'features', 'guides', 'help', 'jobs', 'legal',
-    'login', 'marketplace', 'newsroom', 'partners', 'press', 'pricing', 'privacy',
-    'resources', 'security', 'signin', 'signup', 'sitemap', 'status', 'support',
-    'team', 'terms', 'trust',
+    'browse', 'careers', 'categories', 'collections', 'company', 'contact', 'creators',
+    'customers', 'developers', 'discover', 'docs', 'enterprise', 'events', 'explore',
+    'features', 'guides', 'help', 'jobs', 'leaderboards', 'legal', 'login', 'marketplace',
+    'newsroom', 'partners', 'press', 'pricing', 'privacy', 'resources', 'search', 'security',
+    'sell', 'signin', 'signup', 'sitemap', 'status', 'support', 'team', 'terms', 'trust',
   ]),
   SKOOL: new Set([
     '', 'about', 'academy', 'affiliates', 'api', 'blog', 'brand', 'careers', 'communities',
@@ -107,6 +107,13 @@ export function isPlatformOwnedCommunityUrl(
     // Whop creator pages are path-based. Every whop.com subdomain in the
     // observed evidence set is a platform property (newsroom/docs/careers/...).
     if (host !== 'whop.com' && host !== 'www.whop.com') return true;
+    // Whop also serves creator product/store pages as /discover/<slug> and
+    // /marketplace/<slug>. Those are creator-specific even though the parent
+    // catalog path is a platform surface; nested catalog pages such as
+    // /discover/browse/... remain platform-owned.
+    if ((first === 'discover' || first === 'marketplace')
+      && segments.length === 2
+      && !RESERVED_PATHS.WHOP.has(segments[1])) return false;
     return RESERVED_PATHS.WHOP.has(first);
   }
 
@@ -118,7 +125,7 @@ export function isPlatformOwnedCommunityUrl(
     // are platform-owned; every other subdomain stays creator-specific so
     // genuine paid evidence still triggers the badge.
     if (host !== 'skool.com' && host !== 'www.skool.com') {
-      const sub = host.split('.')[0];
+      const sub = host.replace(/^www\./, '').split('.')[0];
       return RESERVED_PLATFORM_SUBDOMAINS.has(sub);
     }
     return RESERVED_PATHS.SKOOL.has(first);
@@ -131,7 +138,7 @@ export function isPlatformOwnedCommunityUrl(
     if (first === 'c' && segments.length >= 2) return false;
     if (first === 'join' && segments.length >= 2) return false;
     if (host !== 'circle.so' && host !== 'www.circle.so') {
-      const sub = host.split('.')[0];
+      const sub = host.replace(/^www\./, '').split('.')[0];
       return RESERVED_PLATFORM_SUBDOMAINS.has(sub);
     }
     return RESERVED_PATHS.CIRCLE.has(first);

@@ -375,7 +375,10 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                     ? `${c.community_retry_job_reconciliation_code || 'STALE_RETRY'} · RECONCILIATION REQUIRED`
                     : '';
                   const communityIntent = communityIntentDisplay(c);
-                  const genericDiscordStatus = c.discord_duplicate_owner_channel_id
+                  const selectedInviteConflict = Boolean(c.discord_selected_invite_conflict);
+                  const genericDiscordStatus = selectedInviteConflict
+                    ? 'Selected invite owned by another channel'
+                    : c.discord_duplicate_owner_channel_id
                     ? 'Second invite owned elsewhere'
                     : c.discord_discovery_status === 'DISCOVERED_VALIDATION_FAILED'
                     ? 'Discovered · validation failed'
@@ -636,15 +639,30 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                           <details data-testid="duplicate-owned-invite" className="group border-l-2 border-amber-400 pl-1.5">
                             <summary className="flex cursor-pointer list-none items-center gap-1 [&::-webkit-details-marker]:hidden">
                               <ChevronRight className="h-3 w-3 shrink-0 text-amber-500 transition-transform group-open:rotate-90" aria-hidden="true" />
-                              <span className="truncate font-bold text-amber-800 dark:text-amber-300">{hasStoredInvite ? 'Second invite owned elsewhere' : 'Owned by another channel'}</span>
+                              <span className="truncate font-bold text-amber-800 dark:text-amber-300">{selectedInviteConflict ? 'Selected invite owned by another channel' : hasStoredInvite ? 'Second invite owned elsewhere' : 'Owned by another channel'}</span>
                             </summary>
                             <div className="mt-1 space-y-1 pl-4 text-slate-600 dark:text-slate-300">
                               <div>
-                                Owned by {duplicateOwnerVisible ? (
-                                  <a href={duplicateOwnerHref} onClick={focusDuplicateOwner} data-testid="discord-owner-link" className="font-semibold text-amber-800 underline decoration-amber-500/70 underline-offset-2 dark:text-amber-300">{duplicateOwnerName}</a>
+                                {selectedInviteConflict ? (
+                                  <>
+                                    The selected invite is registered to another channel.
+                                    {duplicateOwnerName && (
+                                      <> A previously discarded invite was owned by {duplicateOwnerVisible ? (
+                                        <a href={duplicateOwnerHref} onClick={focusDuplicateOwner} data-testid="discord-owner-link" className="font-semibold text-amber-800 underline decoration-amber-500/70 underline-offset-2 dark:text-amber-300">{duplicateOwnerName}</a>
+                                      ) : (
+                                        <span data-testid="discord-owner-name" className="font-semibold text-amber-800 dark:text-amber-300">{duplicateOwnerName}</span>
+                                      )}.</>
+                                    )}
+                                  </>
                                 ) : (
-                                  <span data-testid="discord-owner-name" className="font-semibold text-amber-800 dark:text-amber-300">{duplicateOwnerName}</span>
-                                )}. {hasStoredInvite ? 'The selected invite above is unchanged.' : 'No invite is retained on this channel.'}
+                                  <>
+                                    Owned by {duplicateOwnerVisible ? (
+                                      <a href={duplicateOwnerHref} onClick={focusDuplicateOwner} data-testid="discord-owner-link" className="font-semibold text-amber-800 underline decoration-amber-500/70 underline-offset-2 dark:text-amber-300">{duplicateOwnerName}</a>
+                                    ) : (
+                                      <span data-testid="discord-owner-name" className="font-semibold text-amber-800 dark:text-amber-300">{duplicateOwnerName}</span>
+                                    )}. {hasStoredInvite ? 'The selected invite above is unchanged.' : 'No invite is retained on this channel.'}
+                                  </>
+                                )}
                               </div>
                               {discordExpandedDetails}
                             </div>

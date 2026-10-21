@@ -166,6 +166,59 @@ test('a Skool tenant subdomain keeps its creator-specific paid evidence', async 
   assert.doesNotMatch(html, /Community indicated/);
 });
 
+test('a www-prefixed Skool tenant subdomain keeps its creator-specific paid evidence', async () => {
+  const html = await renderDashboard(channel({
+    discord_status: 'NOT_FOUND',
+    community_discovery_status: 'PAID_COMMUNITY_INDICATED',
+    community_intents: [{
+      ...paidIntent,
+      communityPlatform: 'SKOOL',
+      communityUrl: 'https://www.trading.skool.com/atlas',
+      sourcePageUrl: 'https://www.youtube.com/@atlas',
+    }],
+  }));
+
+  assert.match(html, /Paid community \(Skool\)/);
+  assert.doesNotMatch(html, /Community indicated/);
+});
+
+test('a Whop discover product page keeps creator-specific paid evidence', async () => {
+  const html = await renderDashboard(channel({
+    discord_status: 'NOT_FOUND',
+    community_discovery_status: 'PAID_COMMUNITY_INDICATED',
+    community_intents: [{
+      ...paidIntent,
+      communityUrl: 'https://whop.com/discover/creator-slug/',
+      sourcePageUrl: 'https://whop.com/discover/creator-slug/',
+    }],
+  }));
+
+  assert.match(html, /Paid community \(Whop\)/);
+  assert.doesNotMatch(html, /Community indicated/);
+});
+
+test('Whop sales and catalog browse pages remain platform-owned', async () => {
+  const html = await renderDashboard(channel({
+    discord_status: 'NOT_FOUND',
+    community_discovery_status: 'PAID_COMMUNITY_INDICATED',
+    community_intents: [
+      {
+        ...paidIntent,
+        communityUrl: 'https://whop.com/sell/',
+        sourcePageUrl: 'https://whop.com/sell/',
+      },
+      {
+        ...paidIntent,
+        communityUrl: 'https://whop.com/discover/browse/marketplace/',
+        sourcePageUrl: 'https://whop.com/discover/browse/marketplace/',
+      },
+    ],
+  }));
+
+  assert.doesNotMatch(html, /Paid community/);
+  assert.match(html, /Community indicated \(Whop\) · no invite/);
+});
+
 test('a reserved Skool platform subdomain does not present the channel as paid', async () => {
   const html = await renderDashboard(channel({
     discord_status: 'NOT_FOUND',
@@ -182,6 +235,22 @@ test('a reserved Skool platform subdomain does not present the channel as paid',
   assert.match(html, /Community indicated \(Skool\) · no invite/);
 });
 
+test('a www-prefixed reserved Skool subdomain remains platform-owned', async () => {
+  const html = await renderDashboard(channel({
+    discord_status: 'NOT_FOUND',
+    community_discovery_status: 'PAID_COMMUNITY_INDICATED',
+    community_intents: [{
+      ...paidIntent,
+      communityPlatform: 'SKOOL',
+      communityUrl: 'https://www.help.skool.com/pricing',
+      sourcePageUrl: 'https://www.help.skool.com/pricing',
+    }],
+  }));
+
+  assert.doesNotMatch(html, /Paid community/);
+  assert.match(html, /Community indicated \(Skool\) · no invite/);
+});
+
 test('a stored intent without a platform value cannot break the table render', async () => {
   // JSONB is not schema-validated; an older record may omit communityPlatform.
   const malformed: Record<string, unknown> = { ...paidIntent };
@@ -190,6 +259,21 @@ test('a stored intent without a platform value cannot break the table render', a
     discord_status: 'NOT_FOUND',
     community_discovery_status: 'PAID_COMMUNITY_INDICATED',
     community_intents: [malformed as unknown as CommunityIntentEvidence],
+  }));
+
+  assert.match(html, /Paid community \(Other\)/);
+  assert.match(html, /whop\.com\/creator/);
+});
+
+test('a non-string stored platform value cannot break the table render', async () => {
+  const malformed = {
+    ...paidIntent,
+    communityPlatform: { unexpected: true } as unknown as CommunityPlatform,
+  };
+  const html = await renderDashboard(channel({
+    discord_status: 'NOT_FOUND',
+    community_discovery_status: 'PAID_COMMUNITY_INDICATED',
+    community_intents: [malformed],
   }));
 
   assert.match(html, /Paid community \(Other\)/);
@@ -276,6 +360,36 @@ test('duplicate owner name falls back to the loaded owner row and links to that 
   assert.match(html, /id="channel-row-UC_owner_other"/);
   assert.match(html, /href="#channel-row-UC_owner_other"[^>]*>OFM<\/a>/);
   assert.match(html, /data-testid="discord-owner-link"/);
+});
+
+test('a selected-invite conflict uses conflict wording and labels historical provenance separately', async () => {
+  const owner = channel({ channel_id: 'UC_selected_owner', channel_name: 'Selected Owner' });
+  const conflicting = channel({
+    channel_id: 'UC_conflict',
+    channel_name: 'Conflicting Creator',
+    discord_invite: 'https://discord.gg/conflict',
+    discord_selected_invite_conflict: true,
+    discord_duplicate_owner_channel_id: owner.channel_id,
+  });
+  const html = await renderChannels([conflicting, owner]);
+
+  assert.match(html, /Selected invite owned by another channel/);
+  assert.doesNotMatch(html, /Second invite owned elsewhere/);
+  assert.match(html, /The selected invite is registered to another channel/);
+  assert.match(html, /A previously discarded invite was owned by/);
+  assert.match(html, /href="#channel-row-UC_selected_owner"[^>]*>Selected Owner<\/a>/);
+  assert.match(html, /data-testid="discord-owner-link"/);
+});
+
+test('a selected-invite conflict without historical provenance stays generic', async () => {
+  const html = await renderDashboard(channel({
+    discord_invite: 'https://discord.gg/conflict',
+    discord_selected_invite_conflict: true,
+  }));
+
+  assert.match(html, /Selected invite owned by another channel/);
+  assert.doesNotMatch(html, /Second invite owned elsewhere/);
+  assert.doesNotMatch(html, /data-testid="discord-owner-link"/);
 });
 
 test('a genuinely clean inspection still renders the no-community summary', async () => {

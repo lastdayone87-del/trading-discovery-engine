@@ -89,8 +89,9 @@ export function communityIntentDisplay(
 
 function platformLabel(platform: string | null | undefined): string {
   // Persisted JSONB is not schema-validated: an older record without a
-  // platform must not break the whole table render.
-  if (!platform) return 'Other';
+  // platform, or with a non-string value, must not break the whole table
+  // render.
+  if (typeof platform !== 'string' || !platform) return 'Other';
   const known: Record<string, string> = {
     WHOP: 'Whop',
     SKOOL: 'Skool',
