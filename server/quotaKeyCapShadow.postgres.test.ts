@@ -234,10 +234,10 @@ maybe('settlement tombstone fences a late dispatch after the response settled', 
 
   const dispatch = await recordShadowDispatchSafe(
     { readSetting: enabledReader, pool: shadowPool },
-    { keyFingerprint: key, operationId, units: 1 }
+    { keyFingerprint: key, operationId, units: 1, now: fixedNow }
   );
   assert.equal(dispatch.leaseInserted, true);
-  await settleShadowLease(shadowPool, { quotaDay, keyFingerprint: key, units: 1, operationId });
+  await settleShadowLease(shadowPool, { quotaDay, keyFingerprint: key, units: 1, operationId, now: fixedNow });
   assert.equal(await leaseCount(key), 0, 'settlement removes the in-flight lease');
   const settled = await requirePool().query(
     `SELECT count(*)::int AS count FROM youtube_key_cap_shadow_settled
@@ -252,7 +252,7 @@ maybe('settlement tombstone fences a late dispatch after the response settled', 
   await seedSettledUnits(key, 9000);
   const late = await recordShadowDispatchSafe(
     { readSetting: enabledReader, pool: shadowPool },
-    { keyFingerprint: key, operationId, units: 1 }
+    { keyFingerprint: key, operationId, units: 1, now: fixedNow }
   );
   assert.equal(late.leaseInserted, false);
   assert.equal((await eventRows(key)).length, 0, 'late observation is fenced by its tombstone');
@@ -260,7 +260,7 @@ maybe('settlement tombstone fences a late dispatch after the response settled', 
   // The fence is operation-specific: a genuinely new observation still works.
   const other = await recordShadowDispatchSafe(
     { readSetting: enabledReader, pool: shadowPool },
-    { keyFingerprint: key, operationId: `${runTag}:tombstone:2`, units: 1 }
+    { keyFingerprint: key, operationId: `${runTag}:tombstone:2`, units: 1, now: fixedNow }
   );
   assert.equal(other.leaseInserted, true);
   assert.equal(other.event, 'WOULD_REJECT');
@@ -626,7 +626,7 @@ maybe('enforce: a new pool after restart still sees persisted leases', async () 
     await assert.rejects(
       reserveEnforcedKeyCap(
         { readSetting: enabledReader, pool: restartPool as unknown as ShadowPoolPort },
-        { keyFingerprint: key, operationId: `${runTag}:enforce-restart:2`, units: 1, lockTimeoutMs: 5000 }
+        { keyFingerprint: key, operationId: `${runTag}:enforce-restart:2`, units: 1, now: fixedNow, lockTimeoutMs: 5000 }
       ),
       (error: unknown) => error instanceof YouTubeKeyCapExceededError && error.projectedUnits === 9000
     );
