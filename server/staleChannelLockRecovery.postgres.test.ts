@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getDb, recoverStaleChannelLocks } from './db';
+import { decideReview } from './reviewStore';
 
 const enabled = Boolean(process.env.DATABASE_URL);
 const maybe = enabled ? test : test.skip;
@@ -287,4 +288,105 @@ maybe('concurrent terminal releases serialize and clear an abandoned lock', asyn
     'PENDING',
     'after both terminal releases commit, the abandoned lock is clear without waiting for the sweep',
   );
+});
+
+maybe('review rejection takes the job lock before the channel lock', async t => {
+  const db = await getDb();
+  const suffix = `${Date.now()}_${process.pid}_review-overlap`;
+  const channelId = `${PREFIX}review-overlap-${suffix}`;
+  const jobIds: string[] = [];
+  const cleanup = async () => {
+    if (jobIds.length) await db.query(`DELETE FROM jobs WHERE id = ANY($1::uuid[])`, [jobIds]).catch(() => undefined);
+    await db.query(`DELETE FROM channel_review_decisions WHERE channel_id=$1`, [channelId]).catch(() => undefined);
+    await db.query(`DELETE FROM channel_reviews WHERE channel_id=$1`, [channelId]).catch(() => undefined);
+    await db.query(`DELETE FROM channels WHERE channel_id=$1`, [channelId]).catch(() => undefined);
+  };
+  await cleanup();
+  t.after(cleanup);
+
+  await db.query(
+    `INSERT INTO channels(
+      channel_id,channel_name,youtube_url,country,country_status,discord_status,discord_invite,
+      scan_status,discovery_source,first_seen,trading_status,subscriber_count,
+      discord_validation_status,discord_liveness_status,discord_discovery_status
+    ) VALUES($1,$2,$3,'Germany','CONFIRMED','NOT_FOUND',NULL,'LOCKED','automated_query',now(),'TRADING_CONFIRMED','1000','COMPLETED','NOT_CHECKED','NOT_DISCOVERED')`,
+    [channelId, `review overlap ${channelId}`, `https://youtube.test/${channelId}`],
+  );
+  await db.query(
+    `INSERT INTO channel_reviews(channel_id,state,evidence_snapshot,pending_since)
+     VALUES($1,'PENDING',$2::jsonb,now())`,
+    [channelId, JSON.stringify({ source: 'review-overlap-regression' })],
+  );
+  const job = await db.query(
+    `INSERT INTO jobs(type,status,payload,max_attempts)
+     VALUES('ENRICH_CHANNEL','PROCESSING',$1::jsonb,3) RETURNING id`,
+    [JSON.stringify({ channelId })],
+  );
+  const jobId = String(job.rows[0].id);
+  jobIds.push(jobId);
+
+  const worker = await db.connect();
+  try {
+    await worker.query('BEGIN');
+    // Hold the job row without changing status, so the migration 153 trigger
+    // does not fire yet. The review rejection must wait here before it is
+    // allowed to lock the channel.
+    await worker.query(`UPDATE jobs SET locked_at=now() WHERE id=$1`, [jobId]);
+
+    const reviewPromise = decideReview({
+      channelId,
+      action: 'REJECT',
+      expectedVersion: 1,
+      reviewer: 'review-overlap-test',
+      reviewReasonCode: 'NOT_TRADING_CREATOR',
+      reviewReasonVersion: 'human-review-reasons-v1',
+      idempotencyKey: `review-overlap-${suffix}`,
+    });
+
+    let waitingOnJob = false;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const waiting = await db.query(
+        `SELECT count(*)::int AS count
+         FROM pg_stat_activity
+         WHERE datname=current_database()
+           AND state='active'
+           AND wait_event_type='Lock'
+           AND query ILIKE '%jobs%'`,
+      );
+      if (Number(waiting.rows[0]?.count || 0) > 0) {
+        waitingOnJob = true;
+        break;
+      }
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.equal(waitingOnJob, true, 'review rejection should wait on the worker job lock');
+
+    // If the review took the channel first (the old order), this NOWAIT probe
+    // fails. With jobs-first ordering the channel is not locked while the
+    // review waits for the worker, so there is no cycle for the worker's
+    // terminal trigger to close.
+    const probe = await db.connect();
+    try {
+      await probe.query('BEGIN');
+      await probe.query(`SELECT 1 FROM channels WHERE channel_id=$1 FOR UPDATE NOWAIT`, [channelId]);
+      await probe.query('ROLLBACK');
+    } catch (error) {
+      await probe.query('ROLLBACK').catch(() => undefined);
+      throw new Error(`review rejection acquired the channel before the job lock: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      probe.release();
+    }
+
+    await worker.query('COMMIT');
+    const result = await reviewPromise;
+    assert.equal(result.review.state, 'REJECTED');
+    assert.equal(result.channel.tradingStatus, 'HUMAN_REJECTED');
+    const persistedJob = await db.query(`SELECT status FROM jobs WHERE id=$1`, [jobId]);
+    assert.equal(persistedJob.rows[0]?.status, 'FAILED');
+  } catch (error) {
+    await worker.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    worker.release();
+  }
 });

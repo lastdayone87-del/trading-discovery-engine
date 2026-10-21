@@ -55,6 +55,18 @@ export async function decideReview(input:DecideInput) {
       FROM channel_review_decisions d JOIN channel_reviews r USING(channel_id) JOIN channels c USING(channel_id)
       WHERE d.idempotency_key=$1`,[input.idempotencyKey]);
     if(prior.rowCount){const saved=prior.rows[0];await client.query('COMMIT');return {decision:saved,review:{state:saved.state,reviewVersion:saved.current_review_version},channel:{channelId:saved.channel_id,tradingStatus:saved.trading_status,scanStatus:saved.scan_status,discordStatus:saved.discord_status},queuePending:saved.state==='PENDING',idempotent:true};}
+    // Canonical lock order is jobs -> channel. The migration 153 terminal-job
+    // trigger already holds the job row before it touches the channel. Taking
+    // the channel first here (the old order) let a worker hold the job while
+    // waiting for the channel, then this transaction hold the channel while
+    // waiting for the job: a classic lock-order deadlock. Lock the jobs that
+    // this rejection will cancel before locking the review/channel rows.
+    if(input.action==='REJECT') {
+      await client.query(
+        `SELECT id FROM jobs WHERE status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$1 ORDER BY id FOR UPDATE`,
+        [input.channelId],
+      );
+    }
     const locked=await client.query(`SELECT r.*,to_jsonb(c) channel_snapshot FROM channel_reviews r JOIN channels c USING(channel_id) WHERE r.channel_id=$1 FOR UPDATE OF r,c`,[input.channelId]);
     if(!locked.rowCount) throw new ReviewNotFoundError('Review item not found.');
     const row=locked.rows[0];
