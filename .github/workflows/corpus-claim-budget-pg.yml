@@ -7,6 +7,7 @@ on:
       - 'server/dbCore.ts'
       - 'server/communityIntent.ts'
       - 'server/communityIntentPersistence.postgres.test.ts'
+      - 'server/channelUpsertDiscordProjection.postgres.test.ts'
       - 'server/dashboardCommunityIntentRendering.test.ts'
       - 'server/paidCommunityIntent.test.ts'
       - 'src/components/ResultsTable.tsx'
@@ -78,6 +79,8 @@ jobs:
         run: npx tsx --test server/communityIntentPersistence.postgres.test.ts
       - name: Community intent dashboard/projection tests
         run: npx tsx --test server/dashboardCommunityIntentRendering.test.ts server/paidCommunityIntent.test.ts
+      - name: Channel upsert Discord projection PostgreSQL tests
+        run: npx tsx --test server/channelUpsertDiscordProjection.postgres.test.ts
   bootstrap-pg-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 20

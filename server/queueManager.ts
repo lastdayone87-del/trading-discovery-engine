@@ -57,7 +57,7 @@ import { runChannelInspection, hasProcessedAcquisitionEvidence } from './inspect
 import { hasRetryableCommunityAcquisitionFailure } from './communityRetryPolicy';
 import { applyCommunityIntentEvidence } from './communityIntent';
 import { validateDiscordInvite } from './discordValidator';
-import {projectDiscordValidation, reconcileDiscordDiscoveryFromInspection} from './discordProjection';
+import {canProjectDiscordValidation,hasEstablishedValidatedDiscordSelection,projectDiscordValidation,reconcileDiscordDiscoveryFromInspection} from './discordProjection';
 import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, fetchYouTubeChannelCountryMetadata, DiscoveredChannelRaw, RetrievalLane } from './youtube';
 import {buildProviderRequestBaseId,executeAllocatedRetrievalPage,providerSnapshot,YOUTUBE_SEARCH_PROVIDER,type ProviderAllocation} from './providerAwareRetrieval';
 import './braveSearch';
@@ -1979,9 +1979,7 @@ export async function inspectAndValidateChannel(
       }
       if(!selected&&terminalInvalid.length===candidates.filter(candidate=>candidate.nativeInviteCode).length){selected=terminalInvalid[0];selectedCandidate=candidates[0];}
       if(!selected)throw new Error('No resolvable native Discord candidate was available for validation');
-      const alreadyValidatedSuccess=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
-      const sameValidatedCandidate=!channel.discord_candidate_id||channel.discord_candidate_id===selectedCandidate.candidateId;
-      const shouldProjectValidation=!alreadyValidatedSuccess||selected.operationalOutcome==='SUCCEEDED'||(selected.operationalOutcome==='CONFIRMED_INVALID'&&sameValidatedCandidate);
+      const shouldProjectValidation=canProjectDiscordValidation(channel,selected,selectedCandidate);
       if(shouldProjectValidation){Object.assign(channel,projectDiscordValidation(channel,selected,selectedCandidate));await selectDiscordCandidate(channel.channel_id,selectedCandidate.candidateId);}
       attemptFree=attemptFreeDiscordValidation(selected.operationalOutcome,selected.retryable);
       channel.scan_status=selected.operationalOutcome==='SUCCEEDED'||selected.operationalOutcome==='CONFIRMED_INVALID'?'COMPLETED':'FAILED';
@@ -2001,7 +1999,7 @@ export async function inspectAndValidateChannel(
       // candidate-free "not found".
       (inspection.acquisitionStatus==='FOUND'&&!discoveredInvite&&!candidates.some(candidate=>candidate.nativeInviteCode))) {
       // A failed or partial crawl is operational uncertainty, not confirmed absence.
-      const alreadyValidatedSuccess=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
+      const alreadyValidatedSuccess=hasEstablishedValidatedDiscordSelection(channel);
       // Shared predicate (not a local outcome check): required retryable FAILED
       // and required retryable PARTIALLY_INSPECTED both own the RETRY_PENDING
       // path, so partial-only acquisitions never strand in FAILED_OPERATIONAL.
@@ -2254,13 +2252,21 @@ export async function projectNotFoundAfterInspection(
       const pendingWork=detectPendingDiscoveryWork(channel,inspection);
       const locatorOnly=pendingWork.reasons.length===1&&pendingWork.reasons[0]==='locator-unvalidated';
       const locatorExhausted=locatorOnly&&Math.max(0,Number(channel.scan_attempts)||0)>=LOCATOR_PENDING_PROJECTION_LIMIT;
+      const alreadyValidatedSuccess=hasEstablishedValidatedDiscordSelection(channel);
+      // Exhaustion belongs to the stored locator's unfinished retry work, not
+      // to the serving selection. It must become terminal even when an
+      // established serving selection exists: leaving RETRY_PENDING/NOT_STARTED
+      // in place lets the later scan_attempts reset recreate
+      // `locator-unvalidated` pending work, so the channel would re-arm the
+      // same retry cycle forever. The established Discord projection
+      // (status/invite/discovery) stays protected by the
+      // `alreadyValidatedSuccess` guards below.
       if(locatorExhausted){
         channel.discord_validation_status='FAILED_OPERATIONAL';
       }else if(locatorOnly){
         channel.scan_attempts=Math.max(0,Number(channel.scan_attempts)||0)+1;
       }
       if(pendingWork.pending&&!locatorExhausted){
-        const alreadyValidatedSuccess=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
         if(!alreadyValidatedSuccess){
           channel.discord_status='UNCERTAIN';
           channel.discord_liveness_status=channel.discord_candidate_locator?(channel.discord_liveness_status||'UNCERTAIN'):'NOT_CHECKED';
@@ -2290,16 +2296,17 @@ export async function projectNotFoundAfterInspection(
         return;
       }
       // Nothing Found After All Steps
-      const alreadyValidatedSuccess=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
       if(!alreadyValidatedSuccess){
         channel.discord_status = channel.discord_candidate_locator?'UNCERTAIN':'NOT_FOUND';
         if(!channel.discord_candidate_locator){channel.discord_resolution_status='NOT_ATTEMPTED';channel.discord_liveness_status='NOT_CHECKED';channel.discord_relevance_status='NOT_CHECKED';channel.discord_validation_status='COMPLETED';}
+        // Only a complete inspection with no prior established discovery may
+        // project absence. An established VALIDATED candidate must not be
+        // downgraded merely because this later inspection retained no invite.
+        if(!channel.discord_candidate_locator)channel.discord_discovery_status='NOT_DISCOVERED';
+        else channel.discord_discovery_status='DISCOVERED_VALIDATION_FAILED';
       }
       channel.scan_status = 'COMPLETED';
       channel.scan_attempts = 0;
-      // Only a complete inspection with no prior discovery may project absence.
-      if(!channel.discord_candidate_locator)channel.discord_discovery_status='NOT_DISCOVERED';
-      else channel.discord_discovery_status='DISCOVERED_VALIDATION_FAILED';
       reconcileDiscordDiscoveryFromInspection(channel,admittedInspection,{validationProjected:false});
       // FOUND_REQUIRED_GAP with no admitted invite: the validation branch and
       // the FAILED/PARTIAL branch both skipped, so an outstanding retryable
@@ -2441,6 +2448,7 @@ export interface ExclusionAuditBatchRow {
   country: string | null;
   discord_status: string;
   discord_invite: string | null;
+  scan_status: string;
   cursor_seen: string;
 }
 export interface ExclusionAuditDb {
@@ -2463,7 +2471,7 @@ export async function fetchExclusionAuditBatch(
     ? `country_status = 'REJECTED' AND discord_status IN ('DEAD','NON_TRADING','UNCERTAIN') AND discord_invite IS NOT NULL`
     : `country_status IS DISTINCT FROM 'REJECTED'`;
   const res = await db.query(
-    `SELECT channel_id, channel_name, country, discord_status, discord_invite, first_seen::text AS cursor_seen FROM channels WHERE ${statusPredicate} AND ($1::timestamptz IS NULL OR (first_seen, channel_id) < ($1::timestamptz, $2::text)) ORDER BY first_seen DESC, channel_id DESC LIMIT $3`,
+    `SELECT channel_id, channel_name, country, discord_status, discord_invite, scan_status, first_seen::text AS cursor_seen FROM channels WHERE ${statusPredicate} AND ($1::timestamptz IS NULL OR (first_seen, channel_id) < ($1::timestamptz, $2::text)) ORDER BY first_seen DESC, channel_id DESC LIMIT $3`,
     [cursor.cursorSeen, cursor.cursorId, limit]
   );
   const rows = res.rows;
@@ -2478,13 +2486,19 @@ export type ExclusionAuditRowAction = 'reject-write' | 'invite-cleanup' | 'none'
  * a REJECTED validation writes only for not-yet-rejected rows (re-stamping
  * already-REJECTED rows is dropped as idempotent churn), otherwise the
  * Discord persistence rule applies to every row including already-REJECTED
- * ones — so invite cleanup semantics are unchanged.
+ * ones. A channel explicitly withheld for human review (`NEEDS_REVIEW`) is
+ * the one exception: the review-only projection intentionally stores the
+ * retained invite on an UNCERTAIN row as review evidence, so the audit must
+ * not clear it before the review decision has been made. Rejected-cleanup
+ * still enforces the persistence rule, and a resolved review leaves
+ * NEEDS_REVIEW so the normal cleanup resumes.
  */
 export function decideExclusionAuditRowAction(input: {
   alreadyRejected: boolean;
   validationStatus: string;
   discordStatus: unknown;
   discordInvite: unknown;
+  scanStatus?: unknown;
 }): ExclusionAuditRowAction {
   // The status branch runs first so a fresh REJECTED write is never blocked by
   // a stale invite, matching the pre-batching if/else-if order. Already-
@@ -2498,6 +2512,7 @@ export function decideExclusionAuditRowAction(input: {
       input.discordStatus === 'UNCERTAIN') &&
     input.discordInvite !== null
   ) {
+    if (!input.alreadyRejected && input.scanStatus === 'NEEDS_REVIEW') return 'none';
     return 'invite-cleanup';
   }
   return 'none';
@@ -2546,7 +2561,8 @@ export async function auditExistingChannelsWithExclusionEngine(): Promise<{ tota
             alreadyRejected,
             validationStatus: valRes?.status ?? '',
             discordStatus: candidate.discord_status,
-            discordInvite: candidate.discord_invite
+            discordInvite: candidate.discord_invite,
+            scanStatus: candidate.scan_status
           });
           if (action === 'reject-write') {
             if (!valRes) continue; // unreachable: only non-rejected rows can write a rejection
