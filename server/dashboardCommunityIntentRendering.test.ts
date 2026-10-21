@@ -150,6 +150,38 @@ test('mixed platform-owned and creator-specific paid evidence keeps the paid bad
   assert.doesNotMatch(html, /Community indicated/);
 });
 
+test('a Skool tenant subdomain keeps its creator-specific paid evidence', async () => {
+  const html = await renderDashboard(channel({
+    discord_status: 'NOT_FOUND',
+    community_discovery_status: 'PAID_COMMUNITY_INDICATED',
+    community_intents: [{
+      ...paidIntent,
+      communityPlatform: 'SKOOL',
+      communityUrl: 'https://trading.skool.com/atlas',
+      sourcePageUrl: 'https://www.youtube.com/@atlas',
+    }],
+  }));
+
+  assert.match(html, /Paid community \(Skool\)/);
+  assert.doesNotMatch(html, /Community indicated/);
+});
+
+test('a reserved Skool platform subdomain does not present the channel as paid', async () => {
+  const html = await renderDashboard(channel({
+    discord_status: 'NOT_FOUND',
+    community_discovery_status: 'PAID_COMMUNITY_INDICATED',
+    community_intents: [{
+      ...paidIntent,
+      communityPlatform: 'SKOOL',
+      communityUrl: 'https://help.skool.com/pricing',
+      sourcePageUrl: 'https://help.skool.com/pricing',
+    }],
+  }));
+
+  assert.doesNotMatch(html, /Paid community/);
+  assert.match(html, /Community indicated \(Skool\) · no invite/);
+});
+
 test('a stored intent without a platform value cannot break the table render', async () => {
   // JSONB is not schema-validated; an older record may omit communityPlatform.
   const malformed: Record<string, unknown> = { ...paidIntent };

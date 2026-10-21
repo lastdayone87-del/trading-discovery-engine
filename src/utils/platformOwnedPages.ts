@@ -9,9 +9,12 @@
  *
  * This helper mirrors the conservative classifier used by the read-only paid
  * community provenance investigation, so the dashboard and the review data
- * agree on which evidence is creator-specific. It reads nothing and writes
- * nothing: persisted `community_discovery_status`/`community_intents` remain
- * authoritative, and callers use this only to decide what to display.
+ * agree on which evidence is creator-specific, with one deliberate
+ * refinement: Skool tenant subdomains (for example trading.skool.com) are
+ * creator sites in the rest of the pipeline, so only reserved platform
+ * subdomain labels are treated as platform-owned there. It reads nothing and
+ * writes nothing: persisted `community_discovery_status`/`community_intents`
+ * remain authoritative, and callers use this only to decide what to display.
  */
 
 export type CommunityPlatformHost = 'WHOP' | 'SKOOL' | 'CIRCLE' | 'PATREON';
@@ -55,7 +58,7 @@ const RESERVED_PATHS: Record<CommunityPlatformHost, ReadonlySet<string>> = {
   ]),
 };
 
-const RESERVED_CIRCLE_SUBDOMAINS = new Set([
+const RESERVED_PLATFORM_SUBDOMAINS = new Set([
   'www', 'help', 'support', 'docs', 'blog', 'careers', 'status', 'api', 'login',
   'signup', 'signin', 'auth', 'billing', 'trust', 'security',
 ]);
@@ -108,8 +111,16 @@ export function isPlatformOwnedCommunityUrl(
   }
 
   if (storedPlatform === 'SKOOL') {
-    // Skool creator communities are path-based on skool.com / www.skool.com.
-    if (host !== 'skool.com' && host !== 'www.skool.com') return true;
+    // Skool creator communities are path-based on skool.com / www.skool.com,
+    // but Skool also supports creator tenant subdomains (for example
+    // trading.skool.com/<community>) that the rest of the pipeline treats as
+    // distinct creator sites. Only explicitly reserved platform subdomains
+    // are platform-owned; every other subdomain stays creator-specific so
+    // genuine paid evidence still triggers the badge.
+    if (host !== 'skool.com' && host !== 'www.skool.com') {
+      const sub = host.split('.')[0];
+      return RESERVED_PLATFORM_SUBDOMAINS.has(sub);
+    }
     return RESERVED_PATHS.SKOOL.has(first);
   }
 
@@ -121,7 +132,7 @@ export function isPlatformOwnedCommunityUrl(
     if (first === 'join' && segments.length >= 2) return false;
     if (host !== 'circle.so' && host !== 'www.circle.so') {
       const sub = host.split('.')[0];
-      return RESERVED_CIRCLE_SUBDOMAINS.has(sub);
+      return RESERVED_PLATFORM_SUBDOMAINS.has(sub);
     }
     return RESERVED_PATHS.CIRCLE.has(first);
   }
