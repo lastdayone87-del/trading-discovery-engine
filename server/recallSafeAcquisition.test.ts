@@ -397,7 +397,15 @@ test('exhausted crawl budget produces PARTIALLY_INSPECTED at channel level', asy
     renderedFallback: emptyRendered,
   });
   assert.equal(result.acquisitionStatus, 'PARTIALLY_INSPECTED');
-  assert.equal(result.retryDirective, undefined);
+  // Static budget exhaustion is now an attempt-free community retry
+  // (STATIC_BUDGET_GAP); it must not consume the channel's scan attempt.
+  assert.deepEqual(result.retryDirective, {
+    attemptFree: true,
+    code: 'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE',
+    reason: 'STATIC_BUDGET_GAP',
+    retryReason: 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE',
+    retryAt: undefined,
+  });
   assert.equal(result.steps.find((step) => step.step === 'CUSTOM_DOMAINS')?.status, 'PARTIAL');
 });
 
