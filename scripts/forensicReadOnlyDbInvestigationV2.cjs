@@ -1,642 +1,408 @@
 /**
- * Full-population low temporary-space READ-ONLY forensic investigation.
- * Keyset job scan + per-channel indexed lookups; correlation in Node.
+ * TEMPORARY read-only investigation: paid-community evidence provenance.
+ *
+ * This replaces the retry-job forensic script only on the temporary
+ * investigation branch. It never writes to the database: the transaction is
+ * READ ONLY and all queries are SELECTs.
+ *
+ * Goal:
+ *  1. Explain where a channel's platform-community evidence URLs came from.
+ *  2. Count PAID_COMMUNITY_INDICATED channels whose PAID evidence is only the
+ *     platform's own docs/careers/blog/marketing/help pages.
+ *  3. Preserve exact URLs/sources for review before proposing a filter.
  */
 const fs = require('node:fs');
 const { Client } = require('pg');
 
 const DATABASE_URL = process.env.DATABASE_URL;
 if (!DATABASE_URL) throw new Error('DATABASE_URL secret is required');
+const OUT_DIR = 'forensic-output';
+fs.mkdirSync(OUT_DIR, { recursive: true });
 
-const TARGET_REASONS = [
-  'COMMUNITY_REQUIRED_ACQUISITION_FAILURE',
-  'UPSTREAM_REQUIRED_ACQUISITION_FAILURE',
-];
+const PLATFORMS = ['WHOP', 'SKOOL', 'CIRCLE', 'PATREON'];
 
-const JOB_BATCH = Math.max(1, Number(process.env.FORENSIC_JOB_BATCH || 5));
-const OBS_LIMIT = Math.max(1, Number(process.env.FORENSIC_OBS_LIMIT || 80));
-const MAX_CHANNELS = Math.max(1, Number(process.env.FORENSIC_MAX_CHANNELS || 100000));
+// Conservative platform-owned path prefixes. Anything else on the platform
+// host is treated as creator-specific, so the filter does not assume that
+// single-segment creator URLs are platform pages.
+const RESERVED_PATHS = {
+  WHOP: new Set([
+    '', 'about', 'academy', 'affiliates', 'api', 'apps', 'blog', 'brand', 'blueprints',
+    'careers', 'company', 'contact', 'creators', 'customers', 'developers', 'discover',
+    'docs', 'enterprise', 'events', 'features', 'guides', 'help', 'jobs', 'legal',
+    'login', 'marketplace', 'newsroom', 'partners', 'press', 'pricing', 'privacy',
+    'resources', 'security', 'signin', 'signup', 'sitemap', 'status', 'support',
+    'team', 'terms', 'trust',
+  ]),
+  SKOOL: new Set([
+    '', 'about', 'academy', 'affiliates', 'api', 'blog', 'brand', 'careers', 'communities',
+    'community-guidelines', 'company', 'contact', 'creators', 'customers', 'developers',
+    'discover', 'download', 'enterprise', 'events', 'features', 'games', 'guidelines',
+    'help', 'jobs', 'leaderboard', 'leaderboards', 'legal', 'login', 'newsroom',
+    'pricing', 'privacy', 'resources', 'signin', 'signup', 'sitemap', 'status',
+    'support', 'terms',
+  ]),
+  CIRCLE: new Set([
+    '', 'about', 'academy', 'api', 'blog', 'brand', 'careers', 'communities', 'community',
+    'company', 'contact', 'creators', 'customers', 'demo', 'developers', 'docs', 'events',
+    'features', 'help', 'integrations', 'jobs', 'legal', 'login', 'newsroom', 'pricing',
+    'privacy', 'resources', 'security', 'signin', 'signup', 'sitemap', 'status', 'support',
+    'terms', 'trust',
+  ]),
+  PATREON: new Set([
+    '', 'about', 'api', 'blog', 'brand', 'careers', 'collections', 'community',
+    'communities', 'company', 'contact', 'create', 'creators', 'developers', 'discover',
+    'explore', 'features', 'help', 'home', 'jobs', 'join', 'legal', 'membership',
+    'newsroom', 'paid', 'podcast', 'policy', 'press', 'pricing', 'privacy', 'resources',
+    'search', 'signin', 'signup', 'sitemap', 'status', 'support', 'terms', 'trust',
+    'video',
+  ]),
+};
 
-function parseJson(v) {
-  if (v == null) return null;
-  if (typeof v === 'object') return v;
-  try { return JSON.parse(v); } catch { return v; }
-}
+const RESERVED_CIRCLE_SUBDOMAINS = new Set([
+  'www', 'help', 'support', 'docs', 'blog', 'careers', 'status', 'api', 'login',
+  'signup', 'signin', 'auth', 'billing', 'trust', 'security',
+]);
 
-function sanitize(v) {
-  if (typeof v === 'string') {
-    return v.replace(/postgres(?:ql)?:\/\/[^\s:@]+:[^\s@]+@/gi, 'postgresql://[REDACTED]@');
-  }
-  if (Array.isArray(v)) return v.map(sanitize);
-  if (v && typeof v === 'object') {
-    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, sanitize(x)]));
-  }
-  return v;
-}
-
-async function q(client, label, sql, params = []) {
-  const started = Date.now();
+function lowerHost(input) {
   try {
-    const res = await client.query(sql, params);
-    if (process.env.FORENSIC_VERBOSE === '1' || label.startsWith('probe') || label.startsWith('index') || label.startsWith('jobs_')) {
-      console.error(`[forensic] ok ${label} rows=${res.rowCount} ms=${Date.now() - started}`);
+    return new URL(input).hostname.toLowerCase().replace(/\.$/, '').replace(/^www\./, '');
+  } catch {
+    return '';
+  }
+}
+
+function parsedUrl(input) {
+  try { return new URL(input); } catch { return null; }
+}
+
+function segments(input) {
+  const u = parsedUrl(input);
+  if (!u) return [];
+  return u.pathname.split('/').filter(Boolean).map(part => decodeURIComponent(part).toLowerCase());
+}
+
+function normalizedUrl(input) {
+  const u = parsedUrl(input);
+  if (!u) return String(input || '').trim().toLowerCase().replace(/\/+$/, '');
+  u.hash = '';
+  return `${u.origin.toLowerCase()}${u.pathname.replace(/\/+$/, '')}`;
+}
+
+function platformForHost(host) {
+  const h = String(host || '').toLowerCase().replace(/\.$/, '').replace(/^www\./, '');
+  if (h === 'whop.com' || h.endsWith('.whop.com')) return 'WHOP';
+  if (h === 'skool.com' || h.endsWith('.skool.com')) return 'SKOOL';
+  if (h === 'circle.so' || h.endsWith('.circle.so')) return 'CIRCLE';
+  if (h === 'patreon.com' || h.endsWith('.patreon.com')) return 'PATREON';
+  return null;
+}
+
+/** A platform-own page is the platform's corporate/docs/careers/etc surface,
+ * not a creator tenant/storefront. Kept deliberately conservative: only known
+ * platform paths/subdomains are rejected. */
+function isPlatformOwnPage(rawUrl, platformOverride) {
+  const u = parsedUrl(rawUrl);
+  if (!u) return false;
+  const platform = platformOverride || platformForHost(u.hostname);
+  if (!platform) return false;
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+  const host = u.hostname.toLowerCase().replace(/\.$/, '');
+  const segs = segments(rawUrl);
+  const first = segs[0] || '';
+
+  if (platform === 'WHOP') {
+    // Whop creator pages are path-based. Every whop.com subdomain in the
+    // observed evidence set is a platform property (docs/careers/help/...).
+    if (host !== 'whop.com' && host !== 'www.whop.com') return true;
+    return RESERVED_PATHS.WHOP.has(first);
+  }
+
+  if (platform === 'SKOOL') {
+    // Skool creator communities are path-based on skool.com / www.skool.com.
+    if (host !== 'skool.com' && host !== 'www.skool.com') return true;
+    return RESERVED_PATHS.SKOOL.has(first);
+  }
+
+  if (platform === 'CIRCLE') {
+    // Circle tenant communities are usually on a *.circle.so subdomain. The
+    // platform's own marketing/docs site is circle.so. A /c/<slug> or
+    // /join/<slug> path is community-specific even on a shared host.
+    if (first === 'c' && segs.length >= 2) return false;
+    if (first === 'join' && segs.length >= 2) return false;
+    if (host !== 'circle.so' && host !== 'www.circle.so') {
+      const sub = host.split('.')[0];
+      return RESERVED_CIRCLE_SUBDOMAINS.has(sub);
     }
-    return res;
-  } catch (err) {
-    console.error(`[forensic] FAIL ${label} ms=${Date.now() - started}: ${err.message}`);
-    err.forensicLabel = label;
-    err.forensicSql = sql.replace(/\s+/g, ' ').trim().slice(0, 240);
-    throw err;
+    return RESERVED_PATHS.CIRCLE.has(first);
   }
+
+  if (platform === 'PATREON') {
+    // Creator pages are patreon.com/<creator>, /c/<creator>, /join/<creator>.
+    if (first === 'c' && segs.length >= 2) return false;
+    if (first === 'join' && segs.length >= 2) return false;
+    if (host !== 'patreon.com' && host !== 'www.patreon.com') return true;
+    return RESERVED_PATHS.PATREON.has(first);
+  }
+
+  return false;
 }
 
-async function trySet(client, sql) {
-  try {
-    await client.query(sql);
-    return true;
-  } catch (e) {
-    console.error(`[forensic] optional SET skipped: ${e.message}`);
-    return false;
-  }
+function evidenceKind(evidence) {
+  const platform = String(evidence.communityPlatform || '').toUpperCase();
+  const url = evidence.communityUrl;
+  if (!PLATFORMS.includes(platform)) return 'unknown_platform';
+  return isPlatformOwnPage(url, platform) ? 'platform_own' : 'creator_specific';
 }
 
-function surfaceOf(prov) {
-  return String(parseJson(prov)?.surface || '').toUpperCase();
+function sourceKind(evidence, platform) {
+  const community = normalizedUrl(evidence.communityUrl);
+  const source = normalizedUrl(evidence.sourcePageUrl);
+  if (community && source && community === source) return 'same_page';
+  if (!source) return 'missing_source';
+  return isPlatformOwnPage(evidence.sourcePageUrl, platform)
+    ? 'linked_from_platform_page'
+    : 'linked_from_creator_page';
 }
 
-function isYoutubeSurface(s) {
-  return s === 'YOUTUBE_ABOUT' || s === 'RECENT_VIDEO_DESCRIPTIONS';
+function safeIntents(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch { return []; }
+  }
+  return [];
 }
 
-function isCommunitySurface(s) {
-  return [
-    'CHANNEL_EXTERNAL_LINKS',
-    'CREATOR_WEBSITES',
-    'SOCIAL_PROFILES',
-    'CUSTOM_DOMAIN',
-    'COMMUNITY',
-  ].includes(s);
-}
-
-function classifyChannel(item) {
-  const reasons = item.projected_reasons || [];
-  const hasUpstream = reasons.includes('UPSTREAM_REQUIRED_ACQUISITION_FAILURE');
-  const hasCommunity = reasons.includes('COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
-  const qf = item.qualifying_failures || [];
-  const communityQ = qf.filter((o) => isCommunitySurface(surfaceOf(o.provenance)));
-  const upstreamQ = qf.filter((o) => isYoutubeSurface(surfaceOf(o.provenance)));
-  const latestSurface = surfaceOf(item.latest_qualifying_failure?.provenance);
-  const latestIsCommunity = isCommunitySurface(latestSurface);
-  const latestIsUpstream = isYoutubeSurface(latestSurface);
-
-  const noQualifying = qf.length === 0;
-  const step4PartialOrBudget = item.step4_status === 'PARTIAL' || item.budget_expired;
-
-  // Priority order (specific first)
-  if (noQualifying && step4PartialOrBudget) {
-    return 'PARTIAL_OR_BUDGET_WITHOUT_QUALIFYING_FAILURE';
-  }
-  if (item.later_success_after_failure) {
-    return 'STALE_DURABLE_RETRY_METADATA';
-  }
-  if (noQualifying) {
-    return 'STALE_DURABLE_RETRY_METADATA';
-  }
-  if (hasUpstream && latestIsCommunity) {
-    return 'UPSTREAM_ON_COMMUNITY_SURFACE';
-  }
-  if (hasUpstream && upstreamQ.length > 0 && communityQ.length === 0) {
-    return 'LEGITIMATE_UPSTREAM_FAILURE';
-  }
-  if (hasUpstream && upstreamQ.length > 0) {
-    return 'LEGITIMATE_UPSTREAM_FAILURE';
-  }
-  if (hasCommunity && communityQ.length > 0 && upstreamQ.length === 0) {
-    return 'LEGITIMATE_COMMUNITY_FAILURE';
-  }
-  if (hasCommunity && communityQ.length > 0) {
-    return 'LEGITIMATE_COMMUNITY_FAILURE';
-  }
-  if (hasCommunity && upstreamQ.length > 0 && communityQ.length === 0) {
-    return 'OTHER/AMBIGUOUS';
-  }
-  if (qf.length > 0) {
-    return 'OTHER/AMBIGUOUS';
-  }
-  return 'OTHER/AMBIGUOUS';
-}
-
-function extractStep4Meta(trailItems) {
-  const step4 = trailItems.filter((x) =>
-    /step\s*4|linked websites|custom[_ ]domains|partial|budget|rendered/i.test(JSON.stringify(x))
-  );
-  const text = JSON.stringify(step4);
-  const step4Status = /\bPARTIAL\b/i.test(text) ? 'PARTIAL' : /\bCOMPLETE\b|\bDONE\b|\bSUCCESS\b/i.test(text) ? 'COMPLETE' : null;
-  const budgetExpired = /budget expired|Rendered acquisition budget|budgetExhausted/i.test(text);
-
-  let selectedUrlCount = null;
-  let attemptedUrlCount = null;
-  let completedUrlCount = null;
-  let failedUrlCount = null;
-  let unattemptedUrlCount = null;
-
-  for (const item of step4) {
-    const s = typeof item === 'object' && item ? item : {};
-    const candidates = [s, s.details, s.meta, s.telemetry, s.summary].filter(Boolean);
-    for (const c of candidates) {
-      if (!c || typeof c !== 'object') continue;
-      if (selectedUrlCount == null && c.selectedUrlCount != null) selectedUrlCount = Number(c.selectedUrlCount);
-      if (attemptedUrlCount == null && (c.attemptedUrlCount != null || c.urlsAttempted != null)) {
-        attemptedUrlCount = Number(c.attemptedUrlCount ?? c.urlsAttempted);
-      }
-      if (completedUrlCount == null && (c.completedUrlCount != null || c.urlsCompleted != null)) {
-        completedUrlCount = Number(c.completedUrlCount ?? c.urlsCompleted);
-      }
-      if (failedUrlCount == null && (c.failedUrlCount != null || c.urlsFailed != null)) {
-        failedUrlCount = Number(c.failedUrlCount ?? c.urlsFailed);
-      }
-      if (unattemptedUrlCount == null && (c.unattemptedUrlCount != null || c.urlsUnattempted != null || c.skippedUrlCount != null)) {
-        unattemptedUrlCount = Number(c.unattemptedUrlCount ?? c.urlsUnattempted ?? c.skippedUrlCount);
-      }
-    }
-  }
-
+function summariseChannel(row) {
+  const intents = safeIntents(row.community_intents).filter(item => item && item.communityUrl);
+  const evidence = intents.map(item => {
+    const platform = String(item.communityPlatform || platformForHost(parsedUrl(item.communityUrl)?.hostname) || '').toUpperCase();
+    return {
+      platform,
+      communityUrl: item.communityUrl,
+      sourcePageUrl: item.sourcePageUrl || null,
+      intent: item.intent || 'UNKNOWN',
+      paidSignals: Array.isArray(item.paidSignals) ? item.paidSignals : [],
+      privateSignals: Array.isArray(item.privateSignals) ? item.privateSignals : [],
+      observedAt: item.observedAt || null,
+      extractionConfidence: item.extractionConfidence || null,
+      kind: evidenceKind({ ...item, communityPlatform: platform }),
+      sourceKind: sourceKind({ ...item, communityPlatform: platform }, platform),
+    };
+  });
+  const paid = evidence.filter(item => item.intent === 'PAID');
+  const creatorPaid = paid.filter(item => item.kind === 'creator_specific');
+  const platformPaid = paid.filter(item => item.kind === 'platform_own');
   return {
-    step4,
-    step4Status,
-    budgetExpired,
-    selectedUrlCount,
-    attemptedUrlCount,
-    completedUrlCount,
-    failedUrlCount,
-    unattemptedUrlCount,
+    channel_id: row.channel_id,
+    channel_name: row.channel_name,
+    youtube_url: row.youtube_url,
+    subscriber_count: row.subscriber_count,
+    country: row.country,
+    community_discovery_status: row.community_discovery_status,
+    discord_invite: row.discord_invite,
+    community_intents: evidence,
+    paid_count: paid.length,
+    creator_paid_count: creatorPaid.length,
+    platform_paid_count: platformPaid.length,
+    classification: paid.length === 0 ? 'no_paid_evidence'
+      : creatorPaid.length === 0 ? 'platform_only'
+      : platformPaid.length === 0 ? 'creator_only'
+      : 'mixed',
+    platforms_with_platform_paid: [...new Set(platformPaid.map(item => item.platform).filter(Boolean))],
+    platforms_with_creator_paid: [...new Set(creatorPaid.map(item => item.platform).filter(Boolean))],
   };
 }
 
-async function main() {
+(async () => {
   const client = new Client({
     connectionString: DATABASE_URL,
-    application_name: 'forensic-readonly-full-pop',
-    statement_timeout: 60000,
+    ssl: DATABASE_URL.includes('sslmode=require') ? { rejectUnauthorized: false } : undefined,
+    application_name: 'dashboard-paid-community-investigation',
+    statement_timeout: 120000,
   });
   await client.connect();
-
-  const progress = {
-    phase: 'init',
-    minimal_query_ok: false,
-    jobs_scanned: 0,
-    channels_found: 0,
-    channels_processed: 0,
+  const report = {
+    generatedAt: new Date().toISOString(),
+    criteria: {
+      reservedPaths: Object.fromEntries(Object.entries(RESERVED_PATHS).map(([k, v]) => [k, [...v]])),
+      circleReservedSubdomains: [...RESERVED_CIRCLE_SUBDOMAINS],
+      rules: [
+        'WHOP: whop.com paths not in reserved list, or any non-whop.com subdomain, are creator-specific. All observed *.whop.com subdomains are platform properties.',
+        'SKOOL: skool.com/www.skool.com paths not in reserved list are creator-specific; other skool.com subdomains are platform properties.',
+        'CIRCLE: circle.so paths in reserved list are platform-owned; /c/<slug> and /join/<slug> are creator-specific; tenant *.circle.so subdomains are creator-specific unless reserved.',
+        'PATREON: /c/<slug> and /join/<slug> are creator-specific; patreon.com first path not reserved is creator-specific; other subdomains are platform-owned.',
+      ],
+    },
+    paidChannels: [],
+    platformBreakdown: {},
+    evidenceMechanisms: {},
+    stevenLord: null,
   };
 
   try {
     await client.query('BEGIN TRANSACTION READ ONLY');
-    await trySet(client, "SET LOCAL statement_timeout = '60s'");
-    await trySet(client, "SET LOCAL lock_timeout = '5s'");
-    await trySet(client, "SET LOCAL work_mem = '1MB'");
-    await trySet(client, "SET LOCAL temp_file_limit = '32MB'");
+    await client.query("SET LOCAL statement_timeout = '120s'");
+    await client.query("SET LOCAL lock_timeout = '5s'");
+    await client.query("SET LOCAL work_mem = '8MB'");
+    await client.query("SET LOCAL temp_file_limit = '64MB'");
 
-    progress.phase = 'probe';
-    await q(client, 'probe_select_1', 'SELECT 1 AS ok');
-    progress.minimal_query_ok = true;
+    const paidRes = await client.query(`
+      SELECT channel_id, channel_name, youtube_url, subscriber_count, country,
+             community_discovery_status, community_intents, discord_invite,
+             discord_duplicate_owner_channel_id, last_checked
+      FROM channels
+      WHERE community_discovery_status = 'PAID_COMMUNITY_INDICATED'
+      ORDER BY channel_name ASC NULLS LAST, channel_id ASC
+    `);
+    report.paidChannelCount = paidRes.rowCount;
+    report.paidChannels = paidRes.rows.map(summariseChannel);
 
-    progress.phase = 'catalog';
-    const idx = await q(
-      client,
-      'index_probe',
-      `SELECT indexname FROM pg_indexes
-       WHERE schemaname = 'public'
-         AND tablename IN ('jobs','external_acquisition_observations','channels','job_attempts')
-       LIMIT 50`
-    );
+    const platformBreakdown = Object.fromEntries(PLATFORMS.map(platform => [platform, {
+      channelsWithPaidPlatformEvidence: 0,
+      platformOnlyPaidChannels: 0,
+      mixedPaidChannels: 0,
+      platformPaidEvidence: 0,
+      creatorPaidEvidence: 0,
+      examples: [],
+    }]));
+    const mechanisms = {};
+    let platformOnlyTotal = 0;
+    let mixedTotal = 0;
+    let creatorOnlyTotal = 0;
+    let noPaidEvidenceTotal = 0;
 
-    progress.phase = 'scan_jobs';
-    const jobsByChannel = new Map();
+    for (const channel of report.paidChannels) {
+      if (channel.classification === 'platform_only') platformOnlyTotal += 1;
+      else if (channel.classification === 'mixed') mixedTotal += 1;
+      else if (channel.classification === 'creator_only') creatorOnlyTotal += 1;
+      else noPaidEvidenceTotal += 1;
 
-    for (const reason of TARGET_REASONS) {
-      let lastCreated = null;
-      let lastId = null;
-      let safetyLoops = 0;
-      while (safetyLoops < 20000) {
-        safetyLoops += 1;
-        let sql;
-        let params;
-        if (lastId == null) {
-          sql = `
-            SELECT id::text AS job_id, status, attempts, max_attempts,
-                   run_after, created_at, updated_at, last_error,
-                   payload->>'channelId' AS channel_id,
-                   payload->>'retryReason' AS retry_reason,
-                   payload->>'retryCode' AS retry_code,
-                   payload->>'retrySource' AS retry_source,
-                   payload->>'observedAt' AS retry_observed_at,
-                   payload->>'observationAt' AS observation_at,
-                   payload->>'reconciliationStatus' AS reconciliation_status,
-                   payload->>'reconciliationCode' AS reconciliation_code,
-                   payload->>'deferralCount' AS deferral_count
-            FROM jobs
-            WHERE type = 'RETRY_COMMUNITY_ACQUISITION'
-              AND payload->>'retryReason' = $1
-            ORDER BY created_at ASC, id ASC
-            LIMIT $2`;
-          params = [reason, JOB_BATCH];
-        } else {
-          sql = `
-            SELECT id::text AS job_id, status, attempts, max_attempts,
-                   run_after, created_at, updated_at, last_error,
-                   payload->>'channelId' AS channel_id,
-                   payload->>'retryReason' AS retry_reason,
-                   payload->>'retryCode' AS retry_code,
-                   payload->>'retrySource' AS retry_source,
-                   payload->>'observedAt' AS retry_observed_at,
-                   payload->>'observationAt' AS observation_at,
-                   payload->>'reconciliationStatus' AS reconciliation_status,
-                   payload->>'reconciliationCode' AS reconciliation_code,
-                   payload->>'deferralCount' AS deferral_count
-            FROM jobs
-            WHERE type = 'RETRY_COMMUNITY_ACQUISITION'
-              AND payload->>'retryReason' = $1
-              AND (created_at, id) > ($2::timestamptz, $3::uuid)
-            ORDER BY created_at ASC, id ASC
-            LIMIT $4`;
-          params = [reason, lastCreated, lastId, JOB_BATCH];
+      for (const item of channel.community_intents) {
+        if (!PLATFORMS.includes(item.platform)) continue;
+        const bucket = platformBreakdown[item.platform];
+        if (item.intent === 'PAID') {
+          if (item.kind === 'platform_own') bucket.platformPaidEvidence += 1;
+          if (item.kind === 'creator_specific') bucket.creatorPaidEvidence += 1;
         }
+        const key = `${item.platform}:${item.kind}:${item.intent}:${item.sourceKind}`;
+        mechanisms[key] = (mechanisms[key] || 0) + 1;
+      }
 
-        const batch = await q(client, `jobs_${reason.slice(0, 16)}_${safetyLoops}`, sql, params);
-        progress.jobs_scanned += batch.rowCount;
-        if (batch.rowCount === 0) break;
-
-        for (const row of batch.rows) {
-          if (!row.channel_id) continue;
-          if (!jobsByChannel.has(row.channel_id)) {
-            if (jobsByChannel.size >= MAX_CHANNELS) continue;
-            jobsByChannel.set(row.channel_id, []);
+      for (const platform of PLATFORMS) {
+        const paidForPlatform = channel.community_intents.filter(item => item.platform === platform && item.intent === 'PAID');
+        if (!paidForPlatform.length) continue;
+        platformBreakdown[platform].channelsWithPaidPlatformEvidence += 1;
+        if (channel.classification === 'platform_only') {
+          platformBreakdown[platform].platformOnlyPaidChannels += 1;
+          if (platformBreakdown[platform].examples.length < 3) {
+            platformBreakdown[platform].examples.push({
+              channel_id: channel.channel_id,
+              channel_name: channel.channel_name,
+              youtube_url: channel.youtube_url,
+              evidence: channel.community_intents.filter(item => item.platform === platform),
+              all_paid_evidence: channel.community_intents.filter(item => item.intent === 'PAID'),
+            });
           }
-          jobsByChannel.get(row.channel_id).push(row);
-          lastCreated = row.created_at;
-          lastId = row.job_id;
-        }
-        if (batch.rowCount < JOB_BATCH) break;
-        if (safetyLoops % 50 === 0) {
-          console.error(`[forensic] progress jobs_scanned=${progress.jobs_scanned} channels=${jobsByChannel.size}`);
+        } else if (channel.classification === 'mixed') {
+          platformBreakdown[platform].mixedPaidChannels += 1;
         }
       }
     }
 
-    const channelIds = [...jobsByChannel.keys()];
-    progress.channels_found = channelIds.length;
-    progress.phase = 'per_channel';
-    console.error(`[forensic] scanning ${channelIds.length} channels (jobs=${progress.jobs_scanned})`);
-
-    const report = [];
-
-    for (let i = 0; i < channelIds.length; i++) {
-      const channelId = channelIds[i];
-      const retryJobs = jobsByChannel.get(channelId) || [];
-      // Prefer most recent job first for projection fields
-      retryJobs.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-
-      const chRes = await q(
-        client,
-        `channel_${i}`,
-        `SELECT channel_id, channel_name, discord_status, discord_validation_status,
-                scan_status, scan_attempts, last_checked, next_check,
-                inspection_trail, created_at, updated_at
-         FROM channels
-         WHERE channel_id = $1
-         LIMIT 1`,
-        [channelId]
-      );
-      const channel = chRes.rows[0] || null;
-
-      const obsRes = await q(
-        client,
-        `obs_${i}`,
-        `SELECT observation_key, channel_id, requested_url, final_url, outcome,
-                retryable, http_status, failure_class, detail, provenance,
-                policy_version, observed_at
-         FROM external_acquisition_observations
-         WHERE channel_id = $1
-         ORDER BY observed_at DESC
-         LIMIT $2`,
-        [channelId, OBS_LIMIT]
-      );
-
-      const obs = obsRes.rows.map((o) => ({ ...o, provenance: parseJson(o.provenance) }));
-
-      const qualifying = obs.filter(
-        (o) =>
-          o.outcome === 'ACQUISITION_FAILED' &&
-          o.retryable === true &&
-          parseJson(o.provenance)?.required !== false
-      );
-
-      const trail = parseJson(channel?.inspection_trail);
-      const trailItems = Array.isArray(trail) ? trail : trail ? [trail] : [];
-      const step4Meta = extractStep4Meta(trailItems);
-
-      const urlsAttempted = [...new Set(obs.map((o) => o.requested_url).filter(Boolean))];
-      const urlsFailed = [
-        ...new Set(
-          obs
-            .filter((o) => o.outcome === 'ACQUISITION_FAILED')
-            .map((o) => o.requested_url)
-            .filter(Boolean)
-        ),
-      ];
-      const urlsCompleted = [
-        ...new Set(
-          obs
-            .filter((o) => o.outcome === 'FOUND' || o.outcome === 'INSPECTED_NO_MATCH')
-            .map((o) => o.requested_url)
-            .filter(Boolean)
-        ),
-      ];
-
-      const latestQualifying = qualifying[0] || null;
-      const laterSuccess =
-        !!latestQualifying &&
-        obs.some(
-          (o) =>
-            new Date(o.observed_at) > new Date(latestQualifying.observed_at) &&
-            (o.outcome === 'FOUND' || o.outcome === 'INSPECTED_NO_MATCH')
-        );
-
-      let jobAttemptSummary = null;
-      try {
-        const jid = retryJobs[0]?.job_id;
-        if (jid) {
-          const att = await q(
-            client,
-            `attempts_${i}`,
-            `SELECT count(*)::int AS n,
-                    max(started_at) AS last_started_at,
-                    max(finished_at) AS last_finished_at
-             FROM job_attempts WHERE job_id = $1::uuid`,
-            [jid]
-          );
-          jobAttemptSummary = {
-            latest_job_id: jid,
-            attempt_rows: att.rows[0]?.n ?? 0,
-            last_started_at: att.rows[0]?.last_started_at || null,
-            last_finished_at: att.rows[0]?.last_finished_at || null,
-          };
-        }
-      } catch (_) {
-        jobAttemptSummary = null;
-      }
-
-      const item = {
-        channel_id: channelId,
-        channel_name: channel?.channel_name || null,
-        projected_reasons: [...new Set(retryJobs.map((j) => j.retry_reason).filter(Boolean))],
-        retry_codes: [...new Set(retryJobs.map((j) => j.retry_code).filter(Boolean))],
-        retry_sources: [...new Set(retryJobs.map((j) => j.retry_source).filter(Boolean))],
-        retry_jobs: sanitize(retryJobs),
-        latest_retry_job: sanitize(retryJobs[0] || null),
-        channel_state: sanitize({
-          channel_id: channel?.channel_id,
-          channel_name: channel?.channel_name,
-          discord_status: channel?.discord_status,
-          discord_validation_status: channel?.discord_validation_status,
-          scan_status: channel?.scan_status,
-          scan_attempts: channel?.scan_attempts,
-          last_checked: channel?.last_checked,
-          next_check: channel?.next_check,
-          updated_at: channel?.updated_at,
-        }),
-        step4_relevant_inspection_trail: sanitize(step4Meta.step4),
-        step4_status: step4Meta.step4Status,
-        budget_expired: step4Meta.budgetExpired,
-        step4_selected_url_count: step4Meta.selectedUrlCount,
-        step4_attempted_url_count: step4Meta.attemptedUrlCount,
-        step4_completed_url_count: step4Meta.completedUrlCount,
-        step4_failed_url_count: step4Meta.failedUrlCount,
-        step4_unattempted_url_count: step4Meta.unattemptedUrlCount,
-        urls_attempted_count: urlsAttempted.length,
-        urls_failed_count: urlsFailed.length,
-        urls_completed_count: urlsCompleted.length,
-        urls_attempted: urlsAttempted.slice(0, 40),
-        urls_failed: urlsFailed.slice(0, 40),
-        later_success_after_failure: laterSuccess,
-        qualifying_failures: sanitize(qualifying),
-        latest_qualifying_failure: sanitize(latestQualifying),
-        observation_summary: {
-          total_returned: obs.length,
-          acquisition_failed: obs.filter((o) => o.outcome === 'ACQUISITION_FAILED').length,
-          retryable_failures: obs.filter(
-            (o) => o.outcome === 'ACQUISITION_FAILED' && o.retryable === true
-          ).length,
-          required_retryable_failures: qualifying.length,
-          community_surface_required_retryable_failures: qualifying.filter((o) =>
-            isCommunitySurface(surfaceOf(o.provenance))
-          ).length,
-          youtube_about_or_recent_video_failures: obs.filter((o) =>
-            isYoutubeSurface(surfaceOf(o.provenance))
-          ).length,
-          found: obs.filter((o) => o.outcome === 'FOUND').length,
-          no_match: obs.filter((o) => o.outcome === 'INSPECTED_NO_MATCH').length,
-          partially_inspected: obs.filter((o) => o.outcome === 'PARTIALLY_INSPECTED').length,
-        },
-        acquisition_observations: sanitize(obs),
-        job_attempt_summary: jobAttemptSummary,
-      };
-      item.verdict = classifyChannel(item);
-      report.push(item);
-      progress.channels_processed = i + 1;
-
-      if ((i + 1) % 100 === 0) {
-        console.error(`[forensic] channels processed ${i + 1}/${channelIds.length}`);
-      }
-    }
-
-    const counts = {
-      matching_retry_jobs_scanned: progress.jobs_scanned,
-      distinct_affected_channels: report.length,
-      community_reason_jobs: [...jobsByChannel.values()]
-        .flat()
-        .filter((r) => r.retry_reason === TARGET_REASONS[0]).length,
-      upstream_reason_jobs: [...jobsByChannel.values()]
-        .flat()
-        .filter((r) => r.retry_reason === TARGET_REASONS[1]).length,
-      channels_with_community_reason: report.filter((r) =>
-        r.projected_reasons.includes(TARGET_REASONS[0])
-      ).length,
-      channels_with_upstream_reason: report.filter((r) =>
-        r.projected_reasons.includes(TARGET_REASONS[1])
-      ).length,
-      channels_with_required_retryable_failure: report.filter(
-        (r) => r.observation_summary.required_retryable_failures > 0
-      ).length,
-      channels_with_community_surface_required_retryable_failure: report.filter(
-        (r) => r.observation_summary.community_surface_required_retryable_failures > 0
-      ).length,
-      channels_with_no_qualifying_observation: report.filter(
-        (r) => r.observation_summary.required_retryable_failures === 0
-      ).length,
-      channels_with_step4_partial: report.filter((r) => r.step4_status === 'PARTIAL').length,
-      channels_with_budget_expired: report.filter((r) => r.budget_expired).length,
-      channels_with_later_success_after_failure: report.filter(
-        (r) => r.later_success_after_failure
-      ).length,
-      channels_with_completed_retry_job: report.filter(
-        (r) => r.latest_retry_job?.status === 'COMPLETED'
-      ).length,
-      channels_with_upstream_reason_latest_community_surface: report.filter(
-        (r) =>
-          r.projected_reasons.includes('UPSTREAM_REQUIRED_ACQUISITION_FAILURE') &&
-          isCommunitySurface(surfaceOf(r.latest_qualifying_failure?.provenance))
-      ).length,
-      verdict_counts: report.reduce((acc, r) => {
-        acc[r.verdict] = (acc[r.verdict] || 0) + 1;
-        return acc;
-      }, {}),
+    report.classificationTotals = {
+      platform_only: platformOnlyTotal,
+      creator_only: creatorOnlyTotal,
+      mixed: mixedTotal,
+      no_paid_evidence: noPaidEvidenceTotal,
     };
+    report.platformBreakdown = platformBreakdown;
+    report.evidenceMechanisms = mechanisms;
 
-    const failureClassDist = {};
-    const surfaceDist = {};
-    for (const r of report) {
-      const fc = r.latest_qualifying_failure?.failure_class || '(none)';
-      failureClassDist[fc] = (failureClassDist[fc] || 0) + 1;
-      const s = surfaceOf(r.latest_qualifying_failure?.provenance) || '(none)';
-      surfaceDist[s] = (surfaceDist[s] || 0) + 1;
-    }
-    counts.failure_class_distribution = failureClassDist;
-    counts.surface_distribution = surfaceDist;
-
-    const forensicTable = report.map((r) => ({
-      Channel: r.channel_id,
-      Name: r.channel_name,
-      Reason: (r.projected_reasons || []).join('|'),
-      RetryCode: (r.retry_codes || []).join('|'),
-      RetrySource: (r.retry_sources || []).join('|'),
-      JobStatus: r.latest_retry_job?.status || null,
-      JobAttempts: r.latest_retry_job?.attempts ?? null,
-      Deferral: r.latest_retry_job?.deferral_count ?? null,
-      ScanStatus: r.channel_state?.scan_status || null,
-      DiscordStatus: r.channel_state?.discord_status || null,
-      LastChecked: r.channel_state?.last_checked || null,
-      Step4: r.step4_status || (r.budget_expired ? 'BUDGET' : 'n/a'),
-      URLs_attempted: r.urls_attempted_count,
-      URLs_completed: r.urls_completed_count,
-      Failed: r.urls_failed_count,
-      Qualifying_failure: r.observation_summary.required_retryable_failures > 0,
-      Required_retryable: r.observation_summary.required_retryable_failures,
-      Community_surface_q: r.observation_summary.community_surface_required_retryable_failures,
-      Later_success: r.later_success_after_failure,
-      Failure_class: r.latest_qualifying_failure?.failure_class || null,
-      Surface: surfaceOf(r.latest_qualifying_failure?.provenance) || null,
-      Verdict: r.verdict,
-    }));
-
-    // Representative examples per verdict
-    const examples = {};
-    for (const r of report) {
-      if (!examples[r.verdict]) examples[r.verdict] = [];
-      if (examples[r.verdict].length < 8) {
-        examples[r.verdict].push({
-          channel_id: r.channel_id,
-          channel_name: r.channel_name,
-          reasons: r.projected_reasons,
-          step4_status: r.step4_status,
-          budget_expired: r.budget_expired,
-          later_success_after_failure: r.later_success_after_failure,
-          latest_qualifying: r.latest_qualifying_failure
-            ? {
-                outcome: r.latest_qualifying_failure.outcome,
-                retryable: r.latest_qualifying_failure.retryable,
-                failure_class: r.latest_qualifying_failure.failure_class,
-                surface: surfaceOf(r.latest_qualifying_failure.provenance),
-                required: parseJson(r.latest_qualifying_failure.provenance)?.required,
-                observed_at: r.latest_qualifying_failure.observed_at,
-                requested_url: r.latest_qualifying_failure.requested_url,
-              }
-            : null,
-          job_status: r.latest_retry_job?.status,
-          observation_summary: r.observation_summary,
-        });
+    // Source investigation for Steven Lord and the three observed platform URLs.
+    const targetRes = await client.query(`
+      SELECT channel_id, channel_name, youtube_url, subscriber_count, country,
+             community_discovery_status, community_intents, discord_invite,
+             discord_duplicate_owner_channel_id, last_checked
+      FROM channels
+      WHERE channel_name ILIKE '%steven lord%'
+         OR community_intents::text ILIKE '%docs.whop.com%'
+         OR community_intents::text ILIKE '%whop.com/careers%'
+         OR community_intents::text ILIKE '%whop.com/blueprints%'
+      ORDER BY channel_name ASC NULLS LAST, channel_id ASC
+      LIMIT 100
+    `);
+    const targetIds = targetRes.rows.map(row => row.channel_id);
+    let creatorLinks = [];
+    let siteInspections = [];
+    let observations = [];
+    if (targetIds.length) {
+      const linksRes = await client.query(`
+        SELECT channel_id, site_identity, source_surface, source_url, first_seen, last_seen
+        FROM creator_site_links
+        WHERE channel_id = ANY($1::text[])
+        ORDER BY channel_id ASC, last_seen DESC
+      `, [targetIds]);
+      creatorLinks = linksRes.rows;
+      const identities = [...new Set(linksRes.rows.map(row => row.site_identity).filter(Boolean))];
+      if (identities.length) {
+        const sitesRes = await client.query(`
+          SELECT site_identity, identity_tier, identity_basis, canonical_url, final_url,
+                 outcome, source_channel_id, claim_status, community_intents, provenance,
+                 observations, last_observed_at
+          FROM site_inspections
+          WHERE site_identity = ANY($1::text[])
+          ORDER BY last_observed_at DESC
+          LIMIT 100
+        `, [identities]);
+        siteInspections = sitesRes.rows;
       }
+      const obsRes = await client.query(`
+        SELECT channel_id, requested_url, final_url, outcome, retryable, failure_class,
+               detail, provenance, observed_at
+        FROM external_acquisition_observations
+        WHERE channel_id = ANY($1::text[])
+        ORDER BY observed_at DESC
+        LIMIT 200
+      `, [targetIds]);
+      observations = obsRes.rows;
     }
-
-    fs.mkdirSync('forensic-output', { recursive: true });
-    const payload = {
-      generated_at: new Date().toISOString(),
-      mode: 'READ_ONLY_POSTGRES_FORENSIC_FULL_POPULATION',
-      safety: {
-        transaction: 'READ ONLY',
-        statement_timeout: '60s',
-        work_mem: '1MB',
-        writes_performed: false,
-        production_mutations: false,
-        strategy: 'per-reason keyset job scan + per-channel indexed lookups; correlation in Node; no population cap',
-      },
-      progress,
-      indexes_seen: idx.rows.map((r) => r.indexname),
-      target_reasons: TARGET_REASONS,
-      counts,
-      examples_by_verdict: examples,
-      forensic_table: forensicTable,
-      affected_channels: report,
+    report.stevenLord = {
+      matchedChannels: targetRes.rows.map(summariseChannel),
+      creatorSiteLinks: creatorLinks,
+      siteInspections: siteInspections.map(row => ({
+        ...row,
+        community_intents: safeIntents(row.community_intents),
+        observations: Array.isArray(row.observations) ? row.observations.slice(0, 30) : [],
+        provenance: row.provenance && typeof row.provenance === 'object' ? row.provenance : {},
+      })),
+      observations,
     };
-    fs.writeFileSync('forensic-output/forensic-report.json', JSON.stringify(payload, null, 2) + '\n');
-
-    const md = [
-      '# Production Forensic DB Investigation (FULL POPULATION)',
-      '',
-      `Generated: ${payload.generated_at}`,
-      '',
-      '## Safety',
-      '- READ ONLY transaction',
-      '- Keyset + per-channel indexed lookups; no production writes',
-      '',
-      '## Counts',
-    ];
-    for (const [k, v] of Object.entries(counts)) {
-      md.push(`- **${k}**: ${typeof v === 'object' ? JSON.stringify(v) : v}`);
-    }
-    md.push('', '## Examples by verdict');
-    for (const [verdict, list] of Object.entries(examples)) {
-      md.push('', `### ${verdict}`);
-      for (const ex of list) {
-        md.push(`- ${ex.channel_id} (${ex.channel_name || '?'}) reasons=${(ex.reasons || []).join('|')} job=${ex.job_status} later_success=${ex.later_success_after_failure}`);
-      }
-    }
-    md.push('', '## Forensic table', '', '```json', JSON.stringify(forensicTable, null, 2), '```');
-    fs.writeFileSync('forensic-output/forensic-report.md', md.join('\n') + '\n');
-
-    // Slim CSV-like table for quick review
-    fs.writeFileSync(
-      'forensic-output/forensic-table.json',
-      JSON.stringify({ generated_at: payload.generated_at, counts, forensic_table: forensicTable, examples_by_verdict: examples }, null, 2) + '\n'
-    );
 
     await client.query('COMMIT');
-    console.log(JSON.stringify({ ok: true, counts, progress }, null, 2));
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => {});
-    fs.mkdirSync('forensic-output', { recursive: true });
-    fs.writeFileSync(
-      'forensic-output/forensic-failure.json',
-      JSON.stringify(
-        {
-          generated_at: new Date().toISOString(),
-          progress,
-          failed_label: e.forensicLabel || null,
-          failed_sql_preview: e.forensicSql || null,
-          message: e.message,
-          note: 'Stopped without destructive cleanup.',
-        },
-        null,
-        2
-      ) + '\n'
-    );
-    throw e;
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+    report.error = error instanceof Error ? { name: error.name, message: error.message, code: error.code } : String(error);
+    console.error('[dashboard-investigation] failed:', error);
   } finally {
-    await client.end();
+    await client.end().catch(() => undefined);
   }
-}
 
-main().catch((e) => {
-  console.error('[forensic-read-only-full] failed:', e.message);
-  process.exit(1);
-});
+  fs.writeFileSync(`${OUT_DIR}/community-intent-investigation.json`, `${JSON.stringify(report, null, 2)}\n`);
+  console.log(JSON.stringify({
+    paidChannelCount: report.paidChannelCount,
+    classificationTotals: report.classificationTotals,
+    platformBreakdown: Object.fromEntries(Object.entries(report.platformBreakdown || {}).map(([platform, value]) => [platform, {
+      channelsWithPaidPlatformEvidence: value.channelsWithPaidPlatformEvidence,
+      platformOnlyPaidChannels: value.platformOnlyPaidChannels,
+      mixedPaidChannels: value.mixedPaidChannels,
+      platformPaidEvidence: value.platformPaidEvidence,
+      creatorPaidEvidence: value.creatorPaidEvidence,
+      examples: value.examples.map(example => example.channel_name),
+    }])),
+    stevenLordChannels: report.stevenLord?.matchedChannels?.map(channel => channel.channel_name),
+    error: report.error || null,
+  }, null, 2));
+})();
