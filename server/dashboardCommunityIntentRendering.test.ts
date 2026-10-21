@@ -99,6 +99,20 @@ test('paid community intent uses one compact summary and keeps evidence behind d
   assert.match(html, /<summary/);
 });
 
+test('a stored intent without a platform value cannot break the table render', async () => {
+  // JSONB is not schema-validated; an older record may omit communityPlatform.
+  const malformed: Record<string, unknown> = { ...paidIntent };
+  delete malformed.communityPlatform;
+  const html = await renderDashboard(channel({
+    discord_status: 'NOT_FOUND',
+    community_discovery_status: 'PAID_COMMUNITY_INDICATED',
+    community_intents: [malformed as unknown as CommunityIntentEvidence],
+  }));
+
+  assert.match(html, /Paid community \(Other\)/);
+  assert.match(html, /whop\.com\/creator/);
+});
+
 test('a private no-invite community shows intent and evidence, never clean inspection', async () => {
   const privateIntent: CommunityIntentEvidence = {
     ...paidIntent,
