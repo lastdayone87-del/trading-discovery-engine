@@ -15,6 +15,7 @@
  * UNKNOWN when the static evidence cannot say — honesty over guessing.
  */
 import type { CommunityDiscoveryStatus, CommunityIntentEvidence, CommunityIntentKind, CommunityPlatform } from '../src/types';
+import { isPlatformOwnedCommunityUrl } from '../src/utils/platformOwnedPages';
 
 const PLATFORM_BY_BASE_HOST: Record<string, CommunityPlatform> = {
   'whop.com': 'WHOP',
@@ -36,6 +37,16 @@ export function communityPlatformForHost(host: string): CommunityPlatform | null
     if (normalized.endsWith(`.${base}`)) return platform;
   }
   return null;
+}
+
+/** Platform-owned corporate pages and static assets are not community
+ * evidence. Keep this check in one place so extraction, merge, and status
+ * projection agree with the dashboard classifier. */
+function isPlatformOwnedEvidence(
+  item: { communityPlatform?: CommunityPlatform | null; communityUrl?: string | null } | null | undefined,
+): boolean {
+  return Boolean(item?.communityUrl)
+    && isPlatformOwnedCommunityUrl(item.communityPlatform, item.communityUrl);
 }
 
 /** Paid-access static signals. Each name is recorded in evidence so a report
@@ -152,6 +163,10 @@ export function extractCommunityIntentEvidence(input: CommunityIntentScanInput):
     if (!platform) return;
     parsed.hash = '';
     const communityUrl = parsed.toString();
+    // Corporate/docs/newsroom pages and platform asset files can contain
+    // price strings without describing a creator community. Do not turn them
+    // into stored intent in the first place.
+    if (isPlatformOwnedCommunityUrl(platform, communityUrl)) return;
     const paid = pageLevel ? detectPaidSignals(pageText) : detectPaidSignals(contextText);
     if (pageLevel && hasPaidStructuredData(html) && !paid.includes('structured-data-paid')) paid.push('structured-data-paid');
     if (pageLevel && input.confirmedPaywall && !paid.includes('paywall')) paid.push('paywall');
@@ -187,11 +202,17 @@ export function extractCommunityIntentEvidence(input: CommunityIntentScanInput):
   return [...found.values()];
 }
 
-/** Status projection: PAID wins when any observed surface proved paid access;
- * any other observed platform surface still yields COMMUNITY_INDICATED_NO_INVITE
- * (never "no community"). Empty evidence is NONE. */
-export function resolveCommunityDiscoveryStatus(intents: Array<Pick<CommunityIntentEvidence, 'intent'>> | null | undefined): CommunityDiscoveryStatus {
-  const list = intents || [];
+type CommunityIntentStatusEvidence = Pick<CommunityIntentEvidence, 'intent'>
+  & Partial<Pick<CommunityIntentEvidence, 'communityPlatform' | 'communityUrl'>>;
+
+/** Status projection: PAID wins when any observed creator-specific surface
+ * proved paid access; any other creator-specific surface still yields
+ * COMMUNITY_INDICATED_NO_INVITE. Platform-owned pages/assets never establish
+ * status, and empty creator-specific evidence is NONE. */
+export function resolveCommunityDiscoveryStatus(
+  intents: CommunityIntentStatusEvidence[] | null | undefined,
+): CommunityDiscoveryStatus {
+  const list = (intents || []).filter(item => !isPlatformOwnedEvidence(item));
   if (!list.length) return 'NONE';
   return list.some(item => item.intent === 'PAID') ? 'PAID_COMMUNITY_INDICATED' : 'COMMUNITY_INDICATED_NO_INVITE';
 }
@@ -206,6 +227,9 @@ export function mergeCommunityIntentEvidence(
   const byUrl = new Map<string, CommunityIntentEvidence>();
   for (const item of [...(existing || []), ...(incoming || [])]) {
     if (!item || typeof item.communityUrl !== 'string' || !item.communityUrl) continue;
+    // Legacy rows may already contain platform-owned evidence. Drop them on
+    // the next merge so status is recomputed from creator-specific URLs only.
+    if (isPlatformOwnedEvidence(item)) continue;
     const prior = byUrl.get(item.communityUrl);
     if (!prior) { byUrl.set(item.communityUrl, { ...item, paidSignals: [...new Set(item.paidSignals || [])], privateSignals: [...new Set(item.privateSignals || [])] }); continue; }
     const newest = (item.observedAt || '') >= (prior.observedAt || '') ? item : prior;

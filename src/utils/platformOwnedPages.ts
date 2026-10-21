@@ -1,20 +1,18 @@
 /**
- * Presentation-only classification of persisted community evidence URLs.
+ * Side-effect-free classification of community evidence URLs.
  *
  * Platform hosts (Whop/Skool/Circle/Patreon) mix creator community pages with
  * the platform's own corporate, docs, newsroom, and marketing pages. Those
  * platform-owned pages can carry price/membership wording without describing
- * the creator's own community, so a dashboard badge built only from them is a
- * false positive.
+ * the creator's own community, so a badge built only from them is a false
+ * positive. The dashboard uses this for presentation, and extraction uses the
+ * same check to reject platform-owned URLs before storing evidence.
  *
  * This helper mirrors the conservative classifier used by the read-only paid
- * community provenance investigation, so the dashboard and the review data
- * agree on which evidence is creator-specific, with one deliberate
- * refinement: Skool tenant subdomains (for example trading.skool.com) are
- * creator sites in the rest of the pipeline, so only reserved platform
- * subdomain labels are treated as platform-owned there. It reads nothing and
- * writes nothing: persisted `community_discovery_status`/`community_intents`
- * remain authoritative, and callers use this only to decide what to display.
+ * community provenance investigation, with one deliberate refinement: Skool
+ * tenant subdomains (for example trading.skool.com) are creator sites in the
+ * rest of the pipeline, so only reserved platform subdomain labels are treated
+ * as platform-owned there. It reads nothing and writes nothing.
  */
 
 export type CommunityPlatformHost = 'WHOP' | 'SKOOL' | 'CIRCLE' | 'PATREON';
