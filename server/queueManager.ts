@@ -2252,13 +2252,13 @@ export async function projectNotFoundAfterInspection(
       const pendingWork=detectPendingDiscoveryWork(channel,inspection);
       const locatorOnly=pendingWork.reasons.length===1&&pendingWork.reasons[0]==='locator-unvalidated';
       const locatorExhausted=locatorOnly&&Math.max(0,Number(channel.scan_attempts)||0)>=LOCATOR_PENDING_PROJECTION_LIMIT;
-      if(locatorExhausted){
+      const alreadyValidatedSuccess=hasEstablishedValidatedDiscordSelection(channel);
+      if(locatorExhausted&&!alreadyValidatedSuccess){
         channel.discord_validation_status='FAILED_OPERATIONAL';
       }else if(locatorOnly){
         channel.scan_attempts=Math.max(0,Number(channel.scan_attempts)||0)+1;
       }
       if(pendingWork.pending&&!locatorExhausted){
-        const alreadyValidatedSuccess=hasEstablishedValidatedDiscordSelection(channel);
         if(!alreadyValidatedSuccess){
           channel.discord_status='UNCERTAIN';
           channel.discord_liveness_status=channel.discord_candidate_locator?(channel.discord_liveness_status||'UNCERTAIN'):'NOT_CHECKED';
@@ -2288,16 +2288,17 @@ export async function projectNotFoundAfterInspection(
         return;
       }
       // Nothing Found After All Steps
-      const alreadyValidatedSuccess=hasEstablishedValidatedDiscordSelection(channel);
       if(!alreadyValidatedSuccess){
         channel.discord_status = channel.discord_candidate_locator?'UNCERTAIN':'NOT_FOUND';
         if(!channel.discord_candidate_locator){channel.discord_resolution_status='NOT_ATTEMPTED';channel.discord_liveness_status='NOT_CHECKED';channel.discord_relevance_status='NOT_CHECKED';channel.discord_validation_status='COMPLETED';}
+        // Only a complete inspection with no prior established discovery may
+        // project absence. An established VALIDATED candidate must not be
+        // downgraded merely because this later inspection retained no invite.
+        if(!channel.discord_candidate_locator)channel.discord_discovery_status='NOT_DISCOVERED';
+        else channel.discord_discovery_status='DISCOVERED_VALIDATION_FAILED';
       }
       channel.scan_status = 'COMPLETED';
       channel.scan_attempts = 0;
-      // Only a complete inspection with no prior discovery may project absence.
-      if(!channel.discord_candidate_locator)channel.discord_discovery_status='NOT_DISCOVERED';
-      else channel.discord_discovery_status='DISCOVERED_VALIDATION_FAILED';
       reconcileDiscordDiscoveryFromInspection(channel,admittedInspection,{validationProjected:false});
       // FOUND_REQUIRED_GAP with no admitted invite: the validation branch and
       // the FAILED/PARTIAL branch both skipped, so an outstanding retryable

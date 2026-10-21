@@ -12,6 +12,7 @@ import {
 } from './discordProjection';
 import type { DiscordValidationResult } from './discordValidator';
 import { buildChannelListingWhere, CONFIRMED_DISCORD_INVITE_SQL } from './db';
+import { projectNotFoundAfterInspection } from './queueManager';
 import { isConfirmedDiscordInvite } from '../src/discordInviteView';
 
 const VALID_CODE = 'aHJH5Zuxgb';
@@ -205,6 +206,29 @@ test('failed or partial reconcile does not downgrade a completed established val
   assert.equal(channel.discord_liveness_status, 'ACTIVE');
   assert.equal(channel.discord_validation_status, 'COMPLETED');
   assert.equal(channel.discord_discovery_status, 'VALIDATED');
+});
+
+test('absence projection cannot downgrade an established validated selection', async () => {
+  const channel = cbrackn() as any;
+
+  await projectNotFoundAfterInspection(
+    channel,
+    { acquisitionOutcomes: [] },
+    {
+      discordCandidates: [],
+      foundInvite: null,
+      steps: [{ status: 'NOT_FOUND', details: 'No invite in bio or links' }],
+    },
+    false,
+  );
+
+  assert.equal(channel.discord_status, 'ACTIVE');
+  assert.equal(channel.discord_invite, VALID_URL);
+  assert.equal(channel.discord_candidate_id, validCandidate.candidateId);
+  assert.equal(channel.discord_candidate_locator, VALID_URL);
+  assert.equal(channel.discord_validation_status, 'COMPLETED');
+  assert.equal(channel.discord_discovery_status, 'VALIDATED');
+  assert.equal(channel.scan_status, 'COMPLETED');
 });
 
 test('pipeline and queue delegate Discord preservation to the shared guards', () => {
