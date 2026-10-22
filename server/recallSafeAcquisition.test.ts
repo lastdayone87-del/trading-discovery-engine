@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
-import { crawlExternalLinks, crawlMessagingPreview, normalizeExternalUrl, runChannelInspection } from './inspector';
+import { crawlExternalLinks as crawlExternalLinksImpl, crawlMessagingPreview as crawlMessagingPreviewImpl, normalizeExternalUrl, runChannelInspection as runChannelInspectionImpl } from './inspector';
+import { crawlExternalLinksForTest as crawlExternalLinks, crawlMessagingPreviewForTest as crawlMessagingPreview, runChannelInspectionForTest as runChannelInspection } from './testCrawlHelpers';
 import {
   hasMessagingBridgeEvidence,
   isDotlessHostnameUrl,

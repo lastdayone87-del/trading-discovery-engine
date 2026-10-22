@@ -23,7 +23,7 @@ import {
   mergeCommunityIntentEvidence,
   resolveCommunityDiscoveryStatus,
 } from './communityIntent';
-import { crawlExternalLinks } from './inspector';
+import { crawlExternalLinksForTest as crawlExternalLinks } from './testCrawlHelpers';
 import type { CommunityIntentEvidence } from '../src/types';
 
 const readSource = (name: string) => readFileSync(fileURLToPath(new URL(`./${name}`, import.meta.url)), 'utf8');

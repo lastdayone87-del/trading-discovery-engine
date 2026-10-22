@@ -179,7 +179,7 @@ test('direct Discord invite in URL is captured without crawling', () => {
 });
 
 test('depth-two unvisited children are counted as depth-limit drops', async () => {
-  const { crawlExternalLinks } = await import('./inspector');
+  const { crawlExternalLinksForTest: crawlExternalLinks } = await import('./testCrawlHelpers');
   const htmlResponse = (html: string) =>
     new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
   const fakeFetch = (async (input: RequestInfo | URL) => {
@@ -253,7 +253,7 @@ test('constructors sanitize drop reasons and scroll usage at construction time',
 });
 
 test('evidenced cross-origin community link is navigated; unevidenced outbound link is dropped', async () => {
-  const { crawlExternalLinks } = await import('./inspector');
+  const { crawlExternalLinksForTest: crawlExternalLinks } = await import('./testCrawlHelpers');
   const htmlResponse = (html: string) =>
     new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
   const calls: string[] = [];
@@ -280,7 +280,7 @@ test('evidenced cross-origin community link is navigated; unevidenced outbound l
 });
 
 test('fragment variants of one dropped URL count as a single drop', async () => {
-  const { crawlExternalLinks } = await import('./inspector');
+  const { crawlExternalLinksForTest: crawlExternalLinks } = await import('./testCrawlHelpers');
   const htmlResponse = (html: string) =>
     new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
   const fakeFetch = (async (input: RequestInfo | URL) => {
@@ -300,7 +300,7 @@ test('fragment variants of one dropped URL count as a single drop', async () => 
 });
 
 test('depth-limit ceiling is named on the partial seed without touching terminal failures', async () => {
-  const { crawlExternalLinks } = await import('./inspector');
+  const { crawlExternalLinksForTest: crawlExternalLinks } = await import('./testCrawlHelpers');
   const htmlResponse = (html: string) =>
     new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
   const fakeFetch = (async (input: RequestInfo | URL) => {
@@ -321,7 +321,7 @@ test('depth-limit ceiling is named on the partial seed without touching terminal
 });
 
 test('oversized navigation queue names queue-cap on the partial seed', async () => {
-  const { crawlExternalLinks } = await import('./inspector');
+  const { crawlExternalLinksForTest: crawlExternalLinks } = await import('./testCrawlHelpers');
   const links = Array.from({ length: 14 }, (_, index) => `<a href="/hub-${index}">Community hub ${index}</a>`).join('');
   const htmlResponse = (html: string) =>
     new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
@@ -338,7 +338,7 @@ test('oversized navigation queue names queue-cap on the partial seed', async () 
 });
 
 test('first ceiling wins when a crawl trips several caps', async () => {
-  const { crawlExternalLinks } = await import('./inspector');
+  const { crawlExternalLinksForTest: crawlExternalLinks } = await import('./testCrawlHelpers');
   const links = Array.from({ length: 13 }, (_, index) => `<a href="/hub-${index}">Community hub ${index}</a>`).join('');
   const htmlResponse = (html: string) =>
     new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
@@ -361,7 +361,7 @@ test('first ceiling wins when a crawl trips several caps', async () => {
 });
 
 test('later response-cap truncation is counted even when another ceiling claimed the label', async () => {
-  const { crawlExternalLinks } = await import('./inspector');
+  const { crawlExternalLinksForTest: crawlExternalLinks } = await import('./testCrawlHelpers');
   const { MAX_CRAWL_RESPONSE_CHARS } = await import('./crawlResponseBounds');
   const padding = 'v '.repeat(MAX_CRAWL_RESPONSE_CHARS / 2 + 50_000);
   const bigHtml = `<html><body>${padding}</body></html>`;

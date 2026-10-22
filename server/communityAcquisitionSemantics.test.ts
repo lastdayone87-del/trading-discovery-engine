@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {validateDiscordInvite} from './discordValidator';
-import {crawlExternalLinks,runChannelInspection} from './inspector';
+import {crawlExternalLinks as crawlExternalLinksImpl,runChannelInspection as runChannelInspectionImpl} from './inspector';
+import { crawlExternalLinksForTest as crawlExternalLinks, runChannelInspectionForTest as runChannelInspection } from './testCrawlHelpers';
 import {communityAcquisitionRetryKey} from './queueManager';
 import {ProviderCallError} from './providerResilience';
 import {readFileSync} from 'node:fs';

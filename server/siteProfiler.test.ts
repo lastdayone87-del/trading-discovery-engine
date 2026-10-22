@@ -230,7 +230,7 @@ test('profiler assembles a provenance-complete inventory from bounded fetches', 
   });
   const result = await runSiteProfiler(
     { siteIdentity: 'example.com', identityTier: 'A', seedUrl: 'https://example.com/' },
-    { fetchImpl, now: () => '2026-10-01T00:00:00.000Z' },
+    { fetchImpl, now: () => '2026-10-01T00:00:00.000Z', resolveHost: async () => ['93.184.216.1'] },
     async () => true,
   );
   assert.equal(result.status, 'PROFILED');
@@ -273,7 +273,7 @@ test('profiler records robots fetch states without turning failures into negativ
     }) as typeof fetch;
     const result = await runSiteProfiler(
       { siteIdentity: 'example.com', identityTier: 'A', seedUrl: 'https://example.com/' },
-      { fetchImpl, now: () => '2026-10-01T00:00:00.000Z' },
+      { fetchImpl, now: () => '2026-10-01T00:00:00.000Z', resolveHost: async () => ['93.184.216.1'] },
       async () => true,
     );
     assert.equal(result.profile!.robotsFetch.state, expected, `robots ${status} -> ${expected}`);
@@ -711,6 +711,7 @@ test('redirect chains remain bounded', async () => {
   assert.ok(requested.length <= MAX_PROFILER_REDIRECT_HOPS, `chain bounded, got ${requested.length} requests`);
   assert.ok(fetched!.redirectsFollowed.length <= MAX_PROFILER_REDIRECT_HOPS);
   assert.equal(fetched!.redirectRejected, false, 'exhaustion is a skip, not a rejection');
+  assert.equal(fetched!.redirectFailure, 'REDIRECT_LIMIT');
   assert.notEqual(fetched!.status, 200, 'capped chain never presents deep content as the fetch result');
 });
 
@@ -766,6 +767,7 @@ test('stalled redirect DNS fails closed within the fetch budget', async () => {
   const fetched = await fetchProfilerUrl('https://public.example/feed', fetchImpl, 1000, 60, resolveHost);
   const elapsed = Date.now() - startedAt;
   assert.equal(fetched!.redirectRejected, true, 'unknown (budget-exhausted) destination fails closed');
+  assert.equal(fetched!.redirectFailure, 'DNS_TIMEOUT');
   assert.ok(!requested.some(url => url.includes('slow.example')), 'unvalidated destination never contacted');
   assert.ok(elapsed < 2000, `bounded by budget, took ${elapsed}ms`);
 });
@@ -791,4 +793,51 @@ test('rejected redirect responses release their bodies', async () => {
   );
   assert.equal(fetched!.redirectRejected, true);
   assert.equal(cancelled, 1, 'rejected redirect body released, not left open');
+});
+
+test('profiler budget exhaustion returns INCOMPLETE instead of a persistable profile', async () => {
+  const fetchImpl = ((_input: unknown, init?: { signal?: AbortSignal }) => new Promise((_resolve, reject) => {
+    init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+  })) as typeof fetch;
+  const result = await runSiteProfiler(
+    { siteIdentity: 'slow.example', identityTier: 'A', seedUrl: 'https://slow.example/' },
+    {
+      fetchImpl,
+      resolveHost: async () => ['93.184.216.1'],
+      profileTimeoutMs: 20,
+      now: () => '2026-10-01T00:00:00.000Z',
+    },
+    async () => true,
+  );
+  assert.equal(result.status, 'INCOMPLETE');
+  assert.equal(result.profile?.robotsFetch.state, 'UNREACHABLE');
+});
+
+test('profiler budget exhaustion during the last feed guard is INCOMPLETE', async () => {
+  const publicIp = '93.184.216.1';
+  const seed = 'https://slow-feed.example/';
+  const feed = 'https://feed.slow-feed.example/feed';
+  const resolveHost = async (host: string): Promise<string[]> => {
+    if (host === 'feed.slow-feed.example') return new Promise<string[]>(() => {});
+    return [publicIp];
+  };
+  const fetchImpl = (async (input: unknown) => {
+    const url = String(input);
+    if (url.endsWith('/robots.txt')) {
+      return new Response('User-agent: *\nAllow: /\n', { status: 200, headers: { 'content-type': 'text/plain' } });
+    }
+    if (url === seed) {
+      return new Response(
+        `<html><head><link rel="alternate" type="application/rss+xml" href="${feed}"></head><body>ok</body></html>`,
+        { status: 200, headers: { 'content-type': 'text/html' } },
+      );
+    }
+    return new Response('not found', { status: 404, headers: { 'content-type': 'text/plain' } });
+  }) as typeof fetch;
+  const result = await runSiteProfiler(
+    { siteIdentity: 'slow-feed.example', identityTier: 'A', seedUrl: seed },
+    { fetchImpl, resolveHost, profileTimeoutMs: 120, now: () => '2026-10-01T00:00:00.000Z' },
+    async () => true,
+  );
+  assert.equal(result.status, 'INCOMPLETE');
 });

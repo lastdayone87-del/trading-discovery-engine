@@ -1,3 +1,5 @@
+import { isPublicIpAddress } from './publicDestination';
+
 export interface CommunitySurfaceCandidate {
   url: string;
   contextMatches: boolean;
@@ -345,11 +347,13 @@ export function isPageAssetInfrastructureUrl(rawUrl: string): boolean {
  * admission path (`normalizeExternalUrl`, `crawlExternalLinks`, the Step 4/5
  * seed loops, and the retry-eligibility predicate) consults it, so future
  * callers cannot bypass it. It is deliberately NOT a relevance ranker and
- * NOT a domain blacklist/whitelist: dotted hosts of any kind — including
- * unfamiliar, commercial, or affiliate hosts — stay eligible here. Only
- * candidates whose invalidity or resource status is deterministically
- * established from the URL itself are rejected. Scoring (`scoreCommunitySurface`)
- * only orders eligible candidates and never decides admission.
+ * NOT a domain blacklist/whitelist: dotted public hosts of any kind —
+ * including unfamiliar, commercial, or affiliate hosts — stay eligible here.
+ * Non-public IP literals are rejected synchronously; hostnames are resolved
+ * and checked immediately before the fetch. Only candidates whose invalidity
+ * or resource status is deterministically established from the URL itself are
+ * rejected here. Scoring (`scoreCommunitySurface`) only orders eligible
+ * candidates and never decides admission.
  */
 export const CRAWL_ADMISSION_POLICY_VERSION = 'crawl-admission-v1';
 
@@ -360,6 +364,7 @@ export type CrawlAdmissionReasonCode =
   | 'EMPTY_HOST'
   | 'DOTLESS_HOST'
   | 'EMPTY_LABEL'
+  | 'NON_PUBLIC_ADDRESS'
   | 'ASSET_HOST'
   | 'RESOURCE_EXTENSION';
 
@@ -398,6 +403,15 @@ export function assessCrawlAdmission(rawUrl: string): CrawlAdmissionDecision {
   // asset filter) and must not turn a single-label host into a dotted one.
   const host = rawHost.toLowerCase().replace(/\.$/, '');
   if (!host) return { eligible: false, reasonCode: 'EMPTY_HOST' };
+  // IP literals are never community websites when they point at loopback,
+  // private, link-local, metadata, or another reserved range. This is the
+  // synchronous half of the destination guard; hostname DNS checks happen
+  // before the fetch so admission stays deterministic.
+  const ipv4Literal = /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host);
+  const ipv6Literal = host.includes(':');
+  if ((ipv4Literal || ipv6Literal) && !isPublicIpAddress(host)) {
+    return { eligible: false, reasonCode: 'NON_PUBLIC_ADDRESS' };
+  }
   // Bracketed IP literals (IPv6) are genuine website targets under the
   // existing URL model (same carve-out as `isDotlessHostnameUrl`).
   if (!rawHost.startsWith('[')) {

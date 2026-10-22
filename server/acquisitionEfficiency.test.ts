@@ -7,7 +7,8 @@ import {
 } from './browserCommunityFallback';
 import { hasConsecutiveTimeoutExhaustion } from './crawlUrlSkipPolicy';
 import { communityAcquisitionRetryDirective } from './communityRetryPolicy';
-import { runChannelInspection } from './inspector';
+import { runChannelInspection as runChannelInspectionImpl } from './inspector';
+import { runChannelInspectionForTest as runChannelInspection } from './testCrawlHelpers';
 import type { BrowserFallbackResult } from './browserCommunityFallback';
 
 const PAGE = 'https://creator.example.com/guide';

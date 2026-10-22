@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { normalizeExternalUrl, crawlExternalLinks, runChannelInspection } from './inspector';
+import { normalizeExternalUrl, crawlExternalLinks as crawlExternalLinksImpl, runChannelInspection as runChannelInspectionImpl } from './inspector';
+import { crawlExternalLinksForTest as crawlExternalLinks, runChannelInspectionForTest as runChannelInspection } from './testCrawlHelpers';
 import {
   assessCrawlAdmission,
   recoverTruncatedQueryToRoot,
@@ -152,9 +153,22 @@ test('R6: valid dotted trading and community domains remain eligible', () => {
   }
 });
 
-// 5. Valid IP/IPv6 URLs remain eligible where the existing URL model supports them.
-test('R6: IPv4 and bracketed IPv6 literals remain eligible', () => {
-  for (const raw of ['https://192.168.0.1/', 'http://[::1]/', 'http://[2606:4700:4700::1111]/']) {
+// 5. Private/reserved IP literals are rejected at admission; public IPs remain
+// eligible because the existing URL model supports them.
+test('R6: private/reserved IP literals are rejected while public IPs remain eligible', () => {
+  for (const raw of [
+    'https://192.168.0.1/',
+    'http://127.0.0.1/',
+    'http://10.0.0.5/',
+    'http://169.254.169.254/latest/meta-data',
+    'http://[::1]/',
+    'http://[fc00::1]/',
+    'http://[::ffff:127.0.0.1]/',
+  ]) {
+    assert.deepEqual(assessCrawlAdmission(raw), { eligible: false, reasonCode: 'NON_PUBLIC_ADDRESS' }, raw);
+    assert.equal(normalizeExternalUrl(raw), null, `normalize must reject: ${raw}`);
+  }
+  for (const raw of ['https://8.8.8.8/', 'http://[2606:4700:4700::1111]/']) {
     assert.deepEqual(assessCrawlAdmission(raw), { eligible: true, reasonCode: 'ELIGIBLE' }, raw);
     assert.ok(normalizeExternalUrl(raw), `normalize must admit: ${raw}`);
   }
@@ -440,11 +454,11 @@ test('R6 review: scheme-less host:port admitted, non-HTTP schemes rejected', () 
   assert.equal(normalizeExternalUrl('ftp://example.com/file'), null);
   // Agreement battery (youtube/discord wrappers excluded: normalization owns
   // those classifications on top of admission).
-  const bothAdmit = ['https://g.co/', 'https://creator.example.com/guide', 'example.com:8080/path', 'http://[::1]/'];
+  const bothAdmit = ['https://g.co/', 'https://creator.example.com/guide', 'example.com:8080/path', 'http://[2606:4700:4700::1111]/'];
   for (const raw of bothAdmit) {
     assert.ok(assessCrawlAdmission(raw).eligible && normalizeExternalUrl(raw), `both must admit: ${raw}`);
   }
-  const bothReject = ['https://g/', 'https://i.ytimg.com/x.jpg', 'ftp://example.com/f', 'https://', 'https://.com/'];
+  const bothReject = ['https://g/', 'https://i.ytimg.com/x.jpg', 'ftp://example.com/f', 'https://', 'https://.com/', 'http://[::1]/'];
   for (const raw of bothReject) {
     assert.ok(!assessCrawlAdmission(raw).eligible && !normalizeExternalUrl(raw), `both must reject: ${raw}`);
   }

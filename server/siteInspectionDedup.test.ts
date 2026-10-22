@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { runChannelInspection, creatorWebsiteHostsFromLinks } from './inspector';
+import { runChannelInspection as runChannelInspectionImpl, creatorWebsiteHostsFromLinks } from './inspector';
+import { runChannelInspectionForTest as runChannelInspection } from './testCrawlHelpers';
 import { mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
 import type { SiteInspectionRow } from './dbCore';
 import type { SiteInspectionStore } from './siteInspectionCache';

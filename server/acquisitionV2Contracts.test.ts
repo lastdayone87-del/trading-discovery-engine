@@ -19,7 +19,8 @@ import {
   enqueueCommunityAcquisitionRetry,
   projectNotFoundAfterInspection,
 } from './queueManager';
-import { buildSharedStaticRootRecord, crawlExternalLinks, runChannelInspection, isReusableStaticRootLender } from './inspector';
+import { buildSharedStaticRootRecord, crawlExternalLinks as crawlExternalLinksImpl, runChannelInspection as runChannelInspectionImpl, isReusableStaticRootLender } from './inspector';
+import { crawlExternalLinksForTest as crawlExternalLinks, runChannelInspectionForTest as runChannelInspection } from './testCrawlHelpers';
 import type { BrowserFallbackResult } from './browserCommunityFallback';
 
 const PAGE = 'https://creator.example.com/guide';

@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  runChannelInspection,
+  runChannelInspection as runChannelInspectionImpl,
   isCommunityRelevantObservation,
   summarizeEffectiveLinkedWebsiteAcquisition,
   summarizeLinkedWebsiteAcquisition,
   normalizeExternalUrl,
 } from './inspector';
+import { runChannelInspectionForTest as runChannelInspection } from './testCrawlHelpers';
 import { isAuxiliaryForOutcome, acquisitionOwnershipUrl } from './communitySurfacePolicy';
 import {
   communityAcquisitionRetryDirective,

@@ -4,7 +4,8 @@ import { readFileSync } from 'node:fs';
 import { triageAutonomousSearchCandidate } from './candidateTriage';
 import { allocateSearchOrdering } from './searchOrdering';
 import { evaluateContinuation } from './continuationPolicy';
-import { crawlExternalLinks, runChannelInspection } from './inspector';
+import { crawlExternalLinks as crawlExternalLinksImpl, runChannelInspection as runChannelInspectionImpl } from './inspector';
+import { crawlExternalLinksForTest as crawlExternalLinks, runChannelInspectionForTest as runChannelInspection } from './testCrawlHelpers';
 import { calculateCreatorQualityScore } from './queryIntelligence';
 
 function tradingVideoCandidate(publishedAt: string) {

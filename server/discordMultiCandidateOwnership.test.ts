@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {crawlExternalLinks,runChannelInspection} from './inspector';
+import {crawlExternalLinks as crawlExternalLinksImpl,runChannelInspection as runChannelInspectionImpl} from './inspector';
+import { crawlExternalLinksForTest as crawlExternalLinks, runChannelInspectionForTest as runChannelInspection } from './testCrawlHelpers';
 import {extractDiscordCandidates,mergeDiscordCandidates} from './discordCandidates';
 import {discordCandidateCompositeRank} from './discordOwnershipSelection';
 

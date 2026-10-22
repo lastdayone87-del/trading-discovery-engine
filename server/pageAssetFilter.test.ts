@@ -41,7 +41,7 @@ test('public-about extraction filters asset URLs so they cannot become crawl see
 });
 
 test('asset URLs in channelLinks and socialLinks never become crawl seeds', async () => {
-  const { runChannelInspection } = await import('./inspector');
+  const { runChannelInspectionForTest: runChannelInspection } = await import('./testCrawlHelpers');
   const fetched: string[] = [];
   const fetchImpl = (async (url: unknown) => {
     fetched.push(String(url));
