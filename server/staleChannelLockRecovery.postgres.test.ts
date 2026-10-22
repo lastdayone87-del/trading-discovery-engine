@@ -290,7 +290,7 @@ maybe('concurrent terminal releases serialize and clear an abandoned lock', asyn
   );
 });
 
-maybe('review rejection takes the job lock before the channel lock', async t => {
+maybe('review rejection and worker terminal update do not deadlock', async t => {
   const db = await getDb();
   const suffix = `${Date.now()}_${process.pid}_review-overlap`;
   const channelId = `${PREFIX}review-overlap-${suffix}`;
@@ -311,8 +311,8 @@ maybe('review rejection takes the job lock before the channel lock', async t => 
     `INSERT INTO channels(
       channel_id,channel_name,youtube_url,country,country_status,discord_status,discord_invite,
       scan_status,discovery_source,first_seen,trading_status,subscriber_count,
-      discord_validation_status,discord_liveness_status,discord_discovery_status
-    ) VALUES($1,$2,$3,'Germany','CONFIRMED','NOT_FOUND',NULL,'LOCKED','automated_query',now(),'TRADING_CONFIRMED','1000','COMPLETED','NOT_CHECKED','NOT_DISCOVERED')`,
+      discord_validation_status,discord_liveness_status,discord_discovery_status,updated_at
+    ) VALUES($1,$2,$3,'Germany','CONFIRMED','NOT_FOUND',NULL,'LOCKED','automated_query',now(),'TRADING_CONFIRMED','1000','COMPLETED','NOT_CHECKED','NOT_DISCOVERED',now()-interval '61 minutes')`,
     [channelId, `review overlap ${channelId}`, `https://youtube.test/${channelId}`],
   );
   await db.query(
@@ -320,13 +320,20 @@ maybe('review rejection takes the job lock before the channel lock', async t => 
      VALUES($1,'PENDING',$2::jsonb,now())`,
     [channelId, JSON.stringify({ source: 'review-overlap-regression' })],
   );
-  const job = await db.query(
+  const processingJob = await db.query(
     `INSERT INTO jobs(type,status,payload,max_attempts)
      VALUES('ENRICH_CHANNEL','PROCESSING',$1::jsonb,3) RETURNING id`,
     [JSON.stringify({ channelId })],
   );
-  const jobId = String(job.rows[0].id);
-  jobIds.push(jobId);
+  const processingJobId = String(processingJob.rows[0].id);
+  jobIds.push(processingJobId);
+  const pendingJob = await db.query(
+    `INSERT INTO jobs(type,status,payload,max_attempts)
+     VALUES('ENRICH_CHANNEL','PENDING',$1::jsonb,3) RETURNING id`,
+    [JSON.stringify({ channelId })],
+  );
+  const pendingJobId = String(pendingJob.rows[0].id);
+  jobIds.push(pendingJobId);
 
   const worker = await db.connect();
   let workerCommitted = false;
@@ -338,7 +345,7 @@ maybe('review rejection takes the job lock before the channel lock', async t => 
     // Hold the job row without changing status, so the migration 153 trigger
     // does not fire yet. The review rejection must wait here before it is
     // allowed to lock the channel.
-    await worker.query(`UPDATE jobs SET locked_at=now() WHERE id=$1`, [jobId]);
+    await worker.query(`UPDATE jobs SET locked_at=now() WHERE id=$1`, [processingJobId]);
 
     const reviewPromise = decideReview({
       channelId,
@@ -393,6 +400,17 @@ maybe('review rejection takes the job lock before the channel lock', async t => 
       probe.release();
     }
 
+    // The worker terminal update fires migration 153's channel trigger. The
+    // channel is older than the recovery grace period, so the trigger must
+    // actually attempt the channel update while the rejection is waiting on
+    // the worker's job lock. A statement timeout turns the old lock order into
+    // a clear test failure instead of an indefinite hang.
+    await worker.query("SET LOCAL statement_timeout='3s'");
+    try {
+      await worker.query(`UPDATE jobs SET status='COMPLETED',updated_at=now() WHERE id=$1`, [processingJobId]);
+    } catch (error) {
+      throw new Error(`worker terminal update did not complete while rejection waited: ${error instanceof Error ? error.message : String(error)}`);
+    }
     await worker.query('COMMIT');
     workerCommitted = true;
     const outcome = await reviewOutcome;
@@ -401,8 +419,13 @@ maybe('review rejection takes the job lock before the channel lock', async t => 
     const result = outcome.value;
     assert.equal(result.review.state, 'REJECTED');
     assert.equal(result.channel.tradingStatus, 'HUMAN_REJECTED');
-    const persistedJob = await db.query(`SELECT status FROM jobs WHERE id=$1`, [jobId]);
-    assert.equal(persistedJob.rows[0]?.status, 'FAILED');
+    const persistedJobs = await db.query(
+      `SELECT id,status FROM jobs WHERE id = ANY($1::uuid[]) ORDER BY id`,
+      [[processingJobId, pendingJobId]],
+    );
+    const persistedById = new Map(persistedJobs.rows.map(row => [String(row.id), String(row.status)]));
+    assert.equal(persistedById.get(processingJobId), 'COMPLETED', 'worker completion must survive the rejection');
+    assert.equal(persistedById.get(pendingJobId), 'FAILED', 'the pending sibling must be cancelled by rejection');
   } finally {
     if (!workerCommitted) await worker.query('ROLLBACK').catch(() => undefined);
     if (reviewOutcome) await reviewOutcome;
