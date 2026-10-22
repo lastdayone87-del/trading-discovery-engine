@@ -526,7 +526,7 @@ test('route guard fails closed when destination resolution rejects with shutdown
   assert.match(String(unexpected[0]), /connection closed by resolver/);
 });
 
-test('route guard skips settlement when the route lookup is already handled', async () => {
+test('route guard attempts a fail-closed abort when the route lookup is already handled', async () => {
   const actions: string[] = [];
   const unexpected: unknown[] = [];
   const guard = createRenderedRouteGuard(
@@ -536,11 +536,14 @@ test('route guard skips settlement when the route lookup is already handled', as
 
   await guard.handler({
     request: () => { throw new Error('Route is already handled!'); },
-    abort: async (code?: string) => { actions.push(`abort:${code || ''}`); },
+    abort: async (code?: string) => {
+      actions.push(`abort:${code || ''}`);
+      throw new Error('Route is already handled!');
+    },
     continue: async () => { actions.push('continue'); },
   });
 
-  assert.deepEqual(actions, []);
+  assert.deepEqual(actions, ['abort:failed']);
   assert.equal(unexpected.length, 0);
 });
 

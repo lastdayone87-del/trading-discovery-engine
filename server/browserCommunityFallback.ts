@@ -1348,12 +1348,15 @@ export function createRenderedRouteGuard(
     try {
       request = route.request();
     } catch (error) {
-      // Only route lookup itself may be skipped for a lifecycle race. A
-      // shutdown-looking error from the destination check below must still
-      // fail closed, because the classifier also matches generic resolver or
-      // socket-close text.
-      if (isExpectedRenderedRouteShutdownError(error)) return;
-      reportUnexpectedRenderedRouteError(error, options.onUnexpectedRouteError);
+      // The classifier also matches generic resolver or socket-close text, so
+      // it is only used to suppress noisy lookup reports here. Still attempt a
+      // fail-closed abort; settleRenderedRoute treats an already-handled or
+      // already-closed route as benign. A shutdown-looking error from the
+      // destination check below is handled by the outer catch without a
+      // classifier short-circuit.
+      if (!isExpectedRenderedRouteShutdownError(error)) {
+        reportUnexpectedRenderedRouteError(error, options.onUnexpectedRouteError);
+      }
       await settleRenderedRoute(route, 'abort', 'failed', options.onUnexpectedRouteError);
       return;
     }
