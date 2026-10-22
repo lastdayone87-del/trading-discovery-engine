@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { crawlExternalLinks } from './inspector';
+import { crawlExternalLinks as crawlExternalLinksImpl } from './inspector';
+import { crawlExternalLinksForTest as crawlExternalLinks } from './testCrawlHelpers';
 
 const here = (name: string) => readFileSync(fileURLToPath(new URL(name, import.meta.url)), 'utf8');
 

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { normalizeExternalUrl, crawlExternalLinks, runChannelInspection } from './inspector';
+import { normalizeExternalUrl, crawlExternalLinks as crawlExternalLinksImpl, runChannelInspection as runChannelInspectionImpl } from './inspector';
+import { crawlExternalLinksForTest as crawlExternalLinks, runChannelInspectionForTest as runChannelInspection } from './testCrawlHelpers';
 import {
   assessCrawlAdmission,
   recoverTruncatedQueryToRoot,

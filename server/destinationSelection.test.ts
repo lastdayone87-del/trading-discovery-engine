@@ -12,7 +12,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { shouldFollowDestination, selectDiverseNavigationQueue, createDestinationBudget, isKnownCommunityDestinationHost, destinationTemplate } from './destinationPolicy';
 import { CRAWL_DROP_REASONS } from './crawlerTelemetry';
-import { crawlExternalLinks } from './inspector';
+import { crawlExternalLinks as crawlExternalLinksImpl } from './inspector';
+import { crawlExternalLinksForTest as crawlExternalLinks } from './testCrawlHelpers';
 
 const htmlResponse = (body: string) =>
   new Response(body, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });

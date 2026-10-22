@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { runChannelInspection } from './inspector';
+import { runChannelInspection as runChannelInspectionImpl } from './inspector';
+import { runChannelInspectionForTest as runChannelInspection } from './testCrawlHelpers';
 import type { BrowserFallbackResult } from './browserCommunityFallback';
 
 const html = (body: string, url = '') => {

@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {inferDiscordOwnership,makeDiscordCandidate} from './discordCandidates';
 import {validateDiscordInvite} from './discordValidator';
-import {creatorWebsiteHostsFromLinks,runChannelInspection} from './inspector';
+import {creatorWebsiteHostsFromLinks,runChannelInspection as runChannelInspectionImpl} from './inspector';
+import { runChannelInspectionForTest as runChannelInspection } from './testCrawlHelpers';
 
 const noopEmit=async()=>{};
 const json=(body:any,status=200)=>new Response(JSON.stringify(body),{status,headers:{'content-type':'application/json'}});

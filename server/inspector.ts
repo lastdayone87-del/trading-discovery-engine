@@ -21,7 +21,7 @@ import {clampRetryAtTimestamp, communityAcquisitionRetryDirective, isCommunityRe
 import {renderedCrawlerTelemetry, staticCrawlerTelemetry, createDropCounter, type CrawlerTelemetry, type CeilingKind, type ExperimentAttribution} from './crawlerTelemetry';
 import {fetchUrlFailureHistory, skippedUrlsFromHistory, normalizeSkipUrl, hasConsecutiveTimeoutExhaustion, type UrlFailureRow} from './crawlUrlSkipPolicy';
 import { MAX_CRAWL_RESPONSE_CHARS, readBoundedResponseText } from './crawlResponseBounds';
-import { assessPublicDestination, defaultDnsResolve, type DnsResolver } from './publicDestination';
+import { assessPublicDestination, defaultDnsResolve, PUBLIC_DESTINATION_DNS_TIMEOUT_MS, type DnsResolver } from './publicDestination';
 import { withPinnedExternalFetch } from './pinnedExternalFetch';
 import { classifyUrlRelevance, type RelevanceDecision } from './acquisitionRelevance';
 import {
@@ -269,14 +269,13 @@ export function creatorWebsiteHostsFromLinks(links: Array<string | null | undefi
 }
 
 /**
- * Resolver selection for the crawler. Production uses system DNS; an injected
- * test fetch cannot resolve fixture-only hostnames, so it gets a synthetic
- * public answer unless the test explicitly supplies a resolver. Redirects to
- * private literals are still rejected in both modes, and production always
- * uses the real resolver plus the connection-time pinned dispatcher.
+ * Resolver selection for the crawler. The real resolver is the default for
+ * every fetch implementation, including injected/proxy fetches. Tests that use
+ * fixture-only hostnames must pass an explicit resolver; there is deliberately
+ * no synthetic-public fallback, because that would fail open for a production
+ * caller that injects an instrumented fetch. Connection-time pinning is still
+ * only available on the real fetch (see pinnedExternalFetch.ts).
  */
-const fixturePublicResolver: DnsResolver = async () => ['93.184.216.1'];
-
 // Keep the crawler's existing request identity. The shared bounded fetch now
 // owns redirects, but switching User-Agent/Accept headers would independently
 // change what origins serve and make this security fix harder to review.
@@ -286,19 +285,31 @@ const CRAWLER_FETCH_HEADERS: Record<string, string> = {
   'Accept-Language': 'en-US,en;q=0.5',
 };
 
-function resolverForFetch(fetchImpl: typeof fetch, resolveHost?: DnsResolver): DnsResolver {
-  if (resolveHost) return resolveHost;
-  return fetchImpl === fetch ? defaultDnsResolve : fixturePublicResolver;
+const CRAWLER_FETCH_TIMEOUT_MS = 10_000;
+
+function resolverForFetch(_fetchImpl: typeof fetch, resolveHost?: DnsResolver): DnsResolver {
+  return resolveHost ?? defaultDnsResolve;
 }
 
 async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:DnsResolver):Promise<{page:{html:string;finalUrl:string;truncated:boolean}|null;observation?:Omit<ExternalAcquisitionObservation,'surface'|'required'|'observedAt'|'wrapperUrl'>}> {
   const resolver=resolverForFetch(fetchImpl,resolveHost);
+  // The end-to-end budget starts before the admission lookup. The lookup gets
+  // only the remaining slice, and the following fetch gets what is left after
+  // DNS; a 3s resolver can therefore never add 3s on top of a 10s fetch.
+  const fetchStartedAt=Date.now();
   // Initial destination check happens BEFORE any request. This covers seeds
   // that bypass admission (for example a direct messaging-preview call) and
   // rejects public-looking hostnames that currently resolve to private space.
   // DNS failure/timeout stays retryable and is classified separately from a
   // deliberate non-public block; malformed URLs are input errors, not SSRF.
-  const initial=await assessPublicDestination(url,resolver);
+  const initial=await assessPublicDestination(
+    url,
+    resolver,
+    Math.min(
+      PUBLIC_DESTINATION_DNS_TIMEOUT_MS,
+      Math.max(1, CRAWLER_FETCH_TIMEOUT_MS - (Date.now() - fetchStartedAt)),
+    ),
+  );
   if(!initial.allowed){
     const nonPublic=initial.reason==='NON_PUBLIC_ADDRESS'||initial.reason==='NON_PUBLIC_RESOLVED_ADDRESS'||initial.reason==='NON_HTTP_SCHEME';
     const failureClass=nonPublic?'SSRF_BLOCKED':initial.reason==='DNS_TIMEOUT'?'TIMEOUT':initial.reason==='DNS_RESOLUTION_FAILED'?'NETWORK_FAILURE':'INVALID_URL';
@@ -315,9 +326,15 @@ async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:
   // Redirects are followed manually inside fetchProfilerUrl; every Location
   // is resolved and checked against the same public-destination guard before
   // it is contacted. The wrapper pins DNS at connect time for the real fetch.
-  const fetchStartedAt=Date.now();
   let transportFailure:ProfilerTransportFailure|undefined;
-  const fetched=await fetchProfilerUrl(url,withPinnedExternalFetch(fetchImpl),MAX_CRAWL_RESPONSE_CHARS,10000,resolver,CRAWLER_FETCH_HEADERS,{
+  const fetched=await fetchProfilerUrl(
+    url,
+    withPinnedExternalFetch(fetchImpl),
+    MAX_CRAWL_RESPONSE_CHARS,
+    Math.max(1, CRAWLER_FETCH_TIMEOUT_MS - (Date.now() - fetchStartedAt)),
+    resolver,
+    CRAWLER_FETCH_HEADERS,
+    {
     maxHops:CRAWLER_MAX_REDIRECT_HOPS,
     onTransportError:failure=>{transportFailure=failure;},
     // Preserve the pre-refactor acquisition contract: only read a final body
@@ -1295,7 +1312,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
             const tier=canonicalSiteIdentity(seed.url)?.tier||'A';
             const result=await runSiteProfiler(
               {siteIdentity:identity,identityTier:tier,seedUrl:seed.url},
-              {fetchImpl:channelData.externalFetchImpl||fetch,...(channelData.destinationResolver?{resolveHost:channelData.destinationResolver}:channelData.externalFetchImpl?{resolveHost:fixturePublicResolver}:{})},
+              {fetchImpl:channelData.externalFetchImpl||fetch,...(channelData.destinationResolver?{resolveHost:channelData.destinationResolver}:{})},
             );
             if(result.status!=='PROFILED'||!result.profile)continue;
             const profile=result.profile;

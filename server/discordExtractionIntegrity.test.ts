@@ -18,7 +18,8 @@ import {
   sanitizeDiscordInviteCode,
   buildLegacyDiscordCandidate,
 } from './discordCandidates';
-import { crawlExternalLinks } from './inspector';
+import { crawlExternalLinks as crawlExternalLinksImpl } from './inspector';
+import { crawlExternalLinksForTest as crawlExternalLinks } from './testCrawlHelpers';
 
 const codeOf = (text: string) => extractDiscordCandidates(text, 'CREATOR_WEBSITES').map(candidate => candidate.nativeInviteCode);
 

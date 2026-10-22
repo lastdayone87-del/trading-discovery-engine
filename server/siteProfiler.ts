@@ -963,6 +963,12 @@ export async function runSiteProfiler(
   isEnabled: () => Promise<boolean> = isSiteProfilerEnabled,
 ): Promise<SiteProfilerRunResult> {
   if (!(await isEnabled())) return { status: 'DISABLED', profile: null };
+  // The 10s budget covers seed admission through the last bounded inventory
+  // fetch. Without this, a 3s admission lookup would add to every fetch timer
+  // and could hold a profile for 13s or more.
+  const profileStartedAt = Date.now();
+  const remainingProfileBudgetMs = (): number =>
+    Math.max(1, PROFILER_FETCH_TIMEOUT_MS - (Date.now() - profileStartedAt));
   // The profiler is a fetch path too. Never inventory a seed that is already
   // non-public, including a public-looking hostname resolving to private
   // space. A rejected seed is an explicit limitation, not an empty profile:
@@ -971,9 +977,12 @@ export async function runSiteProfiler(
   const seedDestination = await assessPublicDestination(
     input.seedUrl,
     deps.resolveHost,
-    deps.dnsTimeoutMs === undefined
-      ? PUBLIC_DESTINATION_DNS_TIMEOUT_MS
-      : Math.min(PUBLIC_DESTINATION_DNS_TIMEOUT_MS, deps.dnsTimeoutMs),
+    Math.min(
+      remainingProfileBudgetMs(),
+      deps.dnsTimeoutMs === undefined
+        ? PUBLIC_DESTINATION_DNS_TIMEOUT_MS
+        : Math.min(PUBLIC_DESTINATION_DNS_TIMEOUT_MS, deps.dnsTimeoutMs),
+    ),
   );
   if (!seedDestination.allowed) {
     return {
@@ -1001,7 +1010,7 @@ export async function runSiteProfiler(
   let parsedRobots: ParsedRobots = { groups: [], sitemaps: [], malformed: false };
   let robotsEvaluation: RobotsEvaluation = { allowed: null, crawlDelaySeconds: null, matchedRule: null };
   if (robotsUrl) {
-    const fetched = await fetchProfilerUrl(robotsUrl, deps.fetchImpl, ROBOTS_MAX_BYTES, PROFILER_FETCH_TIMEOUT_MS, deps.resolveHost);
+    const fetched = await fetchProfilerUrl(robotsUrl, deps.fetchImpl, ROBOTS_MAX_BYTES, remainingProfileBudgetMs(), deps.resolveHost);
     stamp('robots', robotsUrl, 'profiler:robots-fetch');
     if (!fetched) {
       robotsFetch = { state: 'UNREACHABLE', fetchedAt: now() };
@@ -1047,7 +1056,7 @@ export async function runSiteProfiler(
   const feeds: FeedInventoryEntry[] = [];
   let homeFinalUrl: string | null = null;
   if (!robotsBlocksFurther && !seedDisallowed) {
-    const homeFetched = await fetchProfilerUrl(input.seedUrl, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS, PROFILER_FETCH_TIMEOUT_MS, deps.resolveHost);
+    const homeFetched = await fetchProfilerUrl(input.seedUrl, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS, remainingProfileBudgetMs(), deps.resolveHost);
     stamp('homepage', input.seedUrl, 'profiler:homepage-fetch');
     if (homeFetched && homeFetched.status >= 200 && homeFetched.status < 300 && await allowFetched(homeFetched.finalUrl)) {
       homeFinalUrl = homeFetched.finalUrl;
@@ -1083,7 +1092,7 @@ export async function runSiteProfiler(
       // lookups across adversarial locations.
       sitemapFetches += 1;
       if (!(await allowUrl(location))) continue;
-      const fetched = await fetchProfilerUrl(location, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS, PROFILER_FETCH_TIMEOUT_MS, deps.resolveHost);
+      const fetched = await fetchProfilerUrl(location, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS, remainingProfileBudgetMs(), deps.resolveHost);
       stamp(`sitemap:${location}`, location, 'profiler:sitemap-fetch');
       if (!fetched || fetched.status < 200 || fetched.status >= 300) continue;
       if (!(await allowFetched(fetched.finalUrl))) continue;
@@ -1153,7 +1162,7 @@ export async function runSiteProfiler(
       if (!(await allowUrl(destRobotsUrl))) {
         destRobotsBlocksAll = true;
       } else {
-        const destFetched = await fetchProfilerUrl(destRobotsUrl, deps.fetchImpl, ROBOTS_MAX_BYTES, PROFILER_FETCH_TIMEOUT_MS, deps.resolveHost);
+        const destFetched = await fetchProfilerUrl(destRobotsUrl, deps.fetchImpl, ROBOTS_MAX_BYTES, remainingProfileBudgetMs(), deps.resolveHost);
         stamp('robots:destination', destRobotsUrl, 'profiler:robots-fetch');
         if (!destFetched) destRobotsBlocksAll = true;
         else if (destFetched.status === 429 || destFetched.status >= 500) destRobotsBlocksAll = true;
@@ -1187,7 +1196,7 @@ export async function runSiteProfiler(
       feedFetches += 1;
       if (!(await allowUrl(location))) continue;
       if (!(await destFeedAllowed(location))) continue;
-      const fetched = await fetchProfilerUrl(location, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS, PROFILER_FETCH_TIMEOUT_MS, deps.resolveHost);
+      const fetched = await fetchProfilerUrl(location, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS, remainingProfileBudgetMs(), deps.resolveHost);
       stamp(`feed:${location}`, location, 'profiler:feed-fetch');
       if (!fetched || fetched.status < 200 || fetched.status >= 300) continue;
       if (!(await allowFetched(fetched.finalUrl))) continue;

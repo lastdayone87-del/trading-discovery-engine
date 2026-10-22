@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { runChannelInspection } from './inspector';
+import { runChannelInspection as runChannelInspectionImpl } from './inspector';
+import { runChannelInspectionForTest as runChannelInspection } from './testCrawlHelpers';
 import type { BrowserFallbackResult } from './browserCommunityFallback';
 
 const staticNoMatchFetch: typeof fetch = async () => new Response(

@@ -11,7 +11,8 @@ import {
   type BrowserFallbackTelemetry,
 } from './browserCommunityFallback';
 import type { BrowserFallbackResult } from './browserCommunityFallback';
-import { normalizeExternalUrl, runChannelInspection } from './inspector';
+import { normalizeExternalUrl, runChannelInspection as runChannelInspectionImpl } from './inspector';
+import { runChannelInspectionForTest as runChannelInspection } from './testCrawlHelpers';
 
 const zeroTelemetry = (): BrowserFallbackTelemetry => ({
   requestsStarted: 0,
@@ -738,7 +739,7 @@ test('child observations collapse to the seed root URL', async () => {
 
 // Static crawl tags every observation of a seed crawl with the seed root.
 test('static crawl observations carry the seed root URL', async () => {
-  const { crawlExternalLinks } = await import('./inspector');
+  const { crawlExternalLinksForTest: crawlExternalLinks } = await import('./testCrawlHelpers');
   const result = await crawlExternalLinks(
     ['https://rootsite.example/'],
     [],

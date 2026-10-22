@@ -403,8 +403,7 @@ test('messaging-preview fetches apply the initial destination guard', async () =
     }) as typeof fetch,
     'CREATOR_WEBSITES',
     undefined,
-    publicResolver,
-  );
+    publicResolver);
   assert.deepEqual(fetched, []);
   assert.equal(result.outcome, 'ACQUISITION_FAILED');
   assert.equal(result.observations[0]?.failureClass, 'SSRF_BLOCKED');
@@ -454,6 +453,24 @@ test('rendered fallback refuses a private seed before launching a browser', asyn
   assert.equal(result.retryable, false);
   assert.equal(result.inspectedPages, 0);
   assert.match(result.detail, /not a public destination/);
+});
+
+test('rendered fallback keeps temporary seed DNS failures retryable', async () => {
+  const failed = await crawlRenderedCommunitySurface('https://transient.example/', {
+    resolveHost: async () => { throw Object.assign(new Error('temporary resolver failure'), { code: 'EAI_AGAIN' }); },
+  });
+  assert.equal(failed.retryable, true);
+  assert.notEqual(failed.failureClass, 'SSRF_BLOCKED');
+  assert.equal(failed.inspectedPages, 0);
+  assert.match(failed.detail, /DNS_RESOLUTION_FAILED/);
+
+  const timedOut = await crawlRenderedCommunitySurface('https://slow.example/', {
+    resolveHost: async () => { throw Object.assign(new Error('resolver timeout'), { code: 'ETIMEDOUT' }); },
+  });
+  assert.equal(timedOut.retryable, true);
+  assert.equal(timedOut.timedOut, true);
+  assert.notEqual(timedOut.failureClass, 'SSRF_BLOCKED');
+  assert.match(timedOut.detail, /DNS_TIMEOUT/);
 });
 
 test('profiler transport failures preserve the security/transport cause', async () => {

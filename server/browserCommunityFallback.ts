@@ -3,6 +3,7 @@ import { assessCrawlAdmission } from './communitySurfacePolicy';
 import { assessPublicDestination, type DnsResolver } from './publicDestination';
 import { candidateFromNativeInvite, extractDiscordCandidates, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
 import { browserLaunchOptions, classifyBrowserFailure, isBrowserRuntimeFailure, markBrowserCapabilityReady, markBrowserCapabilityUnavailable, withBrowserRuntimeLease, type BrowserFailureClass } from './browserCapability';
+import { startBrowserEgressProxy, type BrowserEgressProxy } from './browserEgressProxy';
 import type { RenderedLifecycleStage, RenderedZeroPageReason, CrawlDropReason } from './crawlerTelemetry';
 import { redactCauseSnippet, createDropCounter } from './crawlerTelemetry';
 import {
@@ -1228,21 +1229,29 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   const limits = { ...DEFAULT_BROWSER_FALLBACK_BUDGET, ...budget };
   // The rendered tier is a separate network client (Chromium), not covered by
   // the pinned Node fetch. Never launch a browser for a seed that is already
-  // non-public or whose DNS answer is private; fail closed and preserve an
-  // explicit, non-retryable reason for the caller. Static SSRF_BLOCKED seeds
-  // are also barred from escalation before they reach this function.
+  // non-public or whose DNS answer is private; fail closed and preserve the
+  // reason for the caller. Confirmed non-public seeds are terminal; transient
+  // DNS failures stay retryable. Static SSRF_BLOCKED seeds are also barred
+  // from escalation before they reach this function.
   const seedDestination = await assessPublicDestination(seedUrl, limits.resolveHost);
   if (!seedDestination.allowed) {
+    // A temporary resolver failure is not a confirmed private destination:
+    // keep it retryable and do not label it SSRF_BLOCKED. Confirmed
+    // non-public answers/addresses remain terminal.
+    const dnsTransient = seedDestination.reason === 'DNS_TIMEOUT' || seedDestination.reason === 'DNS_RESOLUTION_FAILED';
+    const confirmedNonPublic = seedDestination.reason === 'NON_PUBLIC_ADDRESS'
+      || seedDestination.reason === 'NON_PUBLIC_RESOLVED_ADDRESS'
+      || seedDestination.reason === 'NON_HTTP_SCHEME';
     return {
       foundInvite: null,
       inspectedPages: 0,
       scrolls: 0,
       clicks: 0,
       complete: false,
-      retryable: false,
-      timedOut: false,
-      failureClass: 'SSRF_BLOCKED',
-      detail: `Rendered acquisition blocked before browser launch: seed is not a public destination (${seedDestination.reason})${seedDestination.hostname ? `: ${seedDestination.hostname}` : ''}.`,
+      retryable: dnsTransient,
+      timedOut: seedDestination.reason === 'DNS_TIMEOUT',
+      failureClass: confirmedNonPublic ? 'SSRF_BLOCKED' : undefined,
+      detail: `Rendered acquisition blocked before browser launch: seed is not a public destination (${seedDestination.reason})${seedDestination.hostname ? `: ${seedDestination.hostname}` : ''}${dnsTransient ? '; temporary DNS failure, retryable' : ''}.`,
     };
   }
   let inspectedPages = 0, scrolls = 0, clicks = 0;
@@ -1343,17 +1352,25 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
       const queueEventEmitter = renderedQueueLifecycleEmitter(Configuration.getGlobalConfig().getEventManager());
       const queueListenerLedger = captureRenderedQueueLifecycleListeners(queueEventEmitter);
       let isolated: { name: string; queue: InstanceType<typeof RequestQueue> } | undefined;
+      let egressProxy: BrowserEgressProxy | undefined;
       try {
         // Per-invocation isolated queue: never the process-default persisted
         // queue (see openIsolatedRenderedRequestQueue). Dropped in the finally
         // below on every path so named queues cannot accumulate.
         isolated = await openIsolatedRenderedRequestQueue((name) => RequestQueue.open(name));
+        // The route checks below are only a preflight. Chromium resolves again
+        // when it connects, so all browser traffic goes through a loopback
+        // proxy that resolves once, rejects mixed/private answers, and pins
+        // the selected address. This closes the connection-time rebinding gap
+        // that a Playwright route handler cannot close.
+        egressProxy = await startBrowserEgressProxy();
         // Chromium resolves independently of the pinned Node fetch. Check every
         // HTTP(S) navigation/subrequest against the same public-destination
-        // policy before it leaves the browser. Caching is per host for this
-        // crawl only; the route layer is defense-in-depth, while the static
-        // path remains the DNS-pinned enforcement boundary.
-        const renderedDestinationCache = new Map<string, Promise<boolean>>();
+        // policy before it leaves the browser. There is deliberately no
+        // crawl-long host cache: a one-time public answer must not authorize a
+        // later connection attempt (DNS rebinding). This route check is
+        // defense-in-depth; the loopback proxy started above pins the address
+        // Chromium actually connects to.
         const renderedRequestAllowed = (raw: string): Promise<boolean> => {
           let parsed: URL;
           try {
@@ -1365,16 +1382,31 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // data:, blob:, about:, and similar are not network destinations.
             return Promise.resolve(true);
           }
-          const key = parsed.hostname.toLowerCase();
-          let check = renderedDestinationCache.get(key);
-          if (!check) {
-            check = assessPublicDestination(raw, limits.resolveHost)
-              .then(decision => decision.allowed)
-              .catch(() => false);
-            renderedDestinationCache.set(key, check);
-          }
-          return check;
+          return assessPublicDestination(raw, limits.resolveHost)
+            .then(decision => decision.allowed)
+            .catch(() => false);
         };
+        // A context-wide route also covers popups. Redirects are enforced at
+        // the loopback proxy on every new connection, so Chromium's redirect
+        // following cannot skip the destination check even though the route
+        // layer only sees the initial URL. The proxy is also the DNS-pinning
+        // enforcement point; this handler is the earlier URL preflight.
+        const routedContexts = new WeakSet<object>();
+        const renderedRouteHandler = async (route: any): Promise<void> => {
+          const request = route.request();
+          const type = request.resourceType();
+          if (['image', 'media', 'font'].includes(type)) {
+            await route.abort();
+            return;
+          }
+          if (!(await renderedRequestAllowed(request.url()))) {
+            telemetry.blockedRequests++;
+            await route.abort('blockedbyclient');
+            return;
+          }
+          await route.continue();
+        };
+        const launchOptions = browserLaunchOptions();
         const crawler = new PlaywrightCrawler({
           requestQueue: isolated.queue,
           maxRequestsPerCrawl: limits.maxPages,
@@ -1387,22 +1419,25 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           sameDomainDelaySecs: 1,
           navigationTimeoutSecs: Math.ceil(limits.navigationTimeoutMs / 1000),
           requestHandlerTimeoutSecs: Math.ceil(limits.totalTimeoutMs / 1000),
-          launchContext: { launchOptions: browserLaunchOptions() },
+          launchContext: {
+            launchOptions: {
+              ...launchOptions,
+              // `<-loopback>` disables Chromium's implicit loopback proxy
+              // bypass, so even a link to 127.0.0.1 must pass the pinning proxy.
+              proxy: { server: egressProxy.url, bypass: '<-loopback>' },
+            },
+          },
+          browserPoolOptions: {
+            prePageCreateHooks: [(_pageId, _controller, pageOptions) => {
+              if (pageOptions) pageOptions.serviceWorkers = 'block';
+            }],
+          },
           preNavigationHooks: [async ({ page }) => {
-            await page.route('**/*', async route => {
-              const request = route.request();
-              const type = request.resourceType();
-              if (['image', 'media', 'font'].includes(type)) {
-                await route.abort();
-                return;
-              }
-              if (!(await renderedRequestAllowed(request.url()))) {
-                telemetry.blockedRequests++;
-                await route.abort('blockedbyclient');
-                return;
-              }
-              await route.continue();
-            });
+            const context = page.context();
+            if (!routedContexts.has(context)) {
+              routedContexts.add(context);
+              await context.route('**/*', renderedRouteHandler);
+            }
           }],
           errorHandler: async ({ request, session }, error) => {
             telemetry.requestsFailed++;
@@ -1800,12 +1835,18 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         // its ~16 MB deduplication cache become collectable. Runs on every
         // path, including open failures and drop failures; it never affects
         // the crawl result.
-        await finalizeRenderedQueueLifecycle({
-          queue: isolated?.queue,
-          name: isolated?.name,
-          emitter: queueEventEmitter,
-          ledger: queueListenerLedger,
-        });
+        try {
+          await finalizeRenderedQueueLifecycle({
+            queue: isolated?.queue,
+            name: isolated?.name,
+            emitter: queueEventEmitter,
+            ledger: queueListenerLedger,
+          });
+        } finally {
+          // The loopback proxy must not outlive the browser session; closing
+          // is best-effort and never changes the crawl result.
+          await egressProxy?.close().catch(() => undefined);
+        }
       }
     }));
   } catch (error:any) {

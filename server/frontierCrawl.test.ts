@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { crawlExternalLinks } from './inspector';
+import { crawlExternalLinks as crawlExternalLinksImpl } from './inspector';
+import { crawlExternalLinksForTest as crawlExternalLinks } from './testCrawlHelpers';
 import type { FrontierCrawlOptions } from './frontierManager';
 
 function makeSiteFetch() {

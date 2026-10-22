@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { MAX_CRAWL_RESPONSE_CHARS, readBoundedResponseText } from './crawlResponseBounds';
-import { crawlExternalLinks, crawlMessagingPreview } from './inspector';
+import { crawlExternalLinks as crawlExternalLinksImpl, crawlMessagingPreview as crawlMessagingPreviewImpl } from './inspector';
+import { crawlExternalLinksForTest as crawlExternalLinks, crawlMessagingPreviewForTest as crawlMessagingPreview } from './testCrawlHelpers';
 import { fetchLiveYouTubeChannelData } from './youtubePublicAbout';
 
 const htmlResponse = (html: string): Response =>
