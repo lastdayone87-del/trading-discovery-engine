@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { chromium, type Browser, type BrowserContext } from 'playwright';
+import type { Browser, BrowserContext } from 'playwright';
 import { browserLaunchOptions } from './browserCapability';
 import { createRenderedRouteGuard, installRenderedRouteCloseCleanup, type RenderedRouteGuard } from './browserCommunityFallback';
 
@@ -11,7 +11,8 @@ function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T | Promi
   return { promise, resolve };
 }
 
-test('Playwright context close with an in-flight route does not produce an unhandled rejection', { timeout: 30_000 }, async () => {
+test('Playwright context close with an in-flight route does not produce an unhandled rejection', { skip: process.platform === 'android', timeout: 30_000 }, async () => {
+  const { chromium } = await import('playwright');
   const unhandled: unknown[] = [];
   const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
   process.on('unhandledRejection', onUnhandled);
