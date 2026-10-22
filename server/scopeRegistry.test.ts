@@ -270,18 +270,21 @@ test('write-path invariant: final country always determines scope, stale values 
   assert.equal(scopeEligibilityForWrite({ country: 'Germany' }), 'IN_SCOPE');
 });
 
-test('upsertChannel derives scope from the row country and reads no stored value', async () => {
+test('channel upsert derives scope from the row country and reads no stored value', async () => {
   const { readFile } = await import('node:fs/promises');
   const source = await readFile(new URL('./dbCore.ts', import.meta.url), 'utf8');
-  const upsert = source.slice(
-    source.indexOf('export async function upsertChannel'),
-    source.indexOf('export async function upsertChannel') + 6000,
-  );
-  assert.match(upsert, /scopeEligibilityForWrite\(channel\)/);
+  const writeStart = source.indexOf('export async function writeChannelUpsert');
+  const upsertStart = source.indexOf('export async function upsertChannel');
+  assert.ok(writeStart >= 0, 'writeChannelUpsert must remain the write helper');
+  assert.ok(upsertStart > writeStart, 'upsertChannel must call the write helper');
+  const write = source.slice(writeStart, upsertStart);
+  assert.match(write, /scopeEligibilityForWrite\(channel\)/);
   assert.ok(
-    !upsert.includes('channel.scope_eligibility'),
+    !write.includes('channel.scope_eligibility'),
     'upsert must never read a stored eligibility value',
   );
+  const upsert = source.slice(upsertStart, upsertStart + 6000);
+  assert.match(upsert, /writeChannelUpsert\(client, channel, options\)/);
 });
 
 test('dormant exclusion yields to explicit scope selection, never to silence', async () => {

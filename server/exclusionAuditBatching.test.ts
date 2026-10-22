@@ -58,6 +58,7 @@ function subMsRows(count: number): FakeRow[] {
     country: null,
     discord_status: 'ACTIVE',
     discord_invite: null,
+    scan_status: 'COMPLETED',
     cursor_seen: seenAt(i + 1),
     country_status: 'CONFIRMED'
   }));
@@ -94,15 +95,16 @@ test('batch SQL uses exact-text cursor, tie-breaker, and narrow columns', async 
   assert.match(sql, /\(first_seen, channel_id\) < \(\$1::timestamptz, \$2::text\)/);
   assert.match(sql, /ORDER BY first_seen DESC, channel_id DESC/);
   assert.match(sql, /country_status IS DISTINCT FROM 'REJECTED'/);
+  assert.match(sql, /scan_status/, 'the audit decision needs review-pending state');
   assert.doesNotMatch(sql, /SELECT \*/);
 });
 
 test('rejected-cleanup scope visits only invite-cleanup-eligible REJECTED rows', async () => {
   const rows: FakeRow[] = [
-    { channel_id: 'r1', channel_name: 'R1', country: null, discord_status: 'DEAD', discord_invite: 'https://discord.gg/a', cursor_seen: seenAt(30), country_status: 'REJECTED' },
-    { channel_id: 'r2', channel_name: 'R2', country: null, discord_status: 'ACTIVE', discord_invite: 'https://discord.gg/b', cursor_seen: seenAt(20), country_status: 'REJECTED' },
-    { channel_id: 'r3', channel_name: 'R3', country: null, discord_status: 'NON_TRADING', discord_invite: null, cursor_seen: seenAt(10), country_status: 'REJECTED' },
-    { channel_id: 'c1', channel_name: 'C1', country: null, discord_status: 'DEAD', discord_invite: 'https://discord.gg/c', cursor_seen: seenAt(40), country_status: 'CONFIRMED' }
+    { channel_id: 'r1', channel_name: 'R1', country: null, discord_status: 'DEAD', discord_invite: 'https://discord.gg/a', scan_status: 'COMPLETED', cursor_seen: seenAt(30), country_status: 'REJECTED' },
+    { channel_id: 'r2', channel_name: 'R2', country: null, discord_status: 'ACTIVE', discord_invite: 'https://discord.gg/b', scan_status: 'COMPLETED', cursor_seen: seenAt(20), country_status: 'REJECTED' },
+    { channel_id: 'r3', channel_name: 'R3', country: null, discord_status: 'NON_TRADING', discord_invite: null, scan_status: 'COMPLETED', cursor_seen: seenAt(10), country_status: 'REJECTED' },
+    { channel_id: 'c1', channel_name: 'C1', country: null, discord_status: 'DEAD', discord_invite: 'https://discord.gg/c', scan_status: 'COMPLETED', cursor_seen: seenAt(40), country_status: 'CONFIRMED' }
   ];
   const db = fakeDb(rows, 'rejected-cleanup');
   const visited: string[] = [];
@@ -157,5 +159,33 @@ test('non-rejected country audit behavior is unchanged', () => {
   assert.equal(
     decideExclusionAuditRowAction({ alreadyRejected: false, validationStatus: 'LIKELY', discordStatus: 'UNCERTAIN', discordInvite: null }),
     'none'
+  );
+});
+
+test('review-pending rows retain their invite for the pending review decision', () => {
+  // The review-only projection deliberately stores the retained invite on an
+  // UNCERTAIN row. The audit must leave it in place until the review is
+  // resolved; a resolved review leaves NEEDS_REVIEW, so the persistence rule
+  // resumes without another inspection.
+  assert.equal(
+    decideExclusionAuditRowAction({ alreadyRejected: false, validationStatus: 'UNCERTAIN', discordStatus: 'UNCERTAIN', discordInvite: 'https://discord.gg/retained', scanStatus: 'NEEDS_REVIEW' }),
+    'none'
+  );
+  // The same row shape outside review is still a stale invite.
+  assert.equal(
+    decideExclusionAuditRowAction({ alreadyRejected: false, validationStatus: 'UNCERTAIN', discordStatus: 'UNCERTAIN', discordInvite: 'https://discord.gg/retained', scanStatus: 'COMPLETED' }),
+    'invite-cleanup'
+  );
+  // Rejected-cleanup still enforces invite hygiene even with a stale
+  // NEEDS_REVIEW marker: a rejected channel is terminal, not review evidence.
+  assert.equal(
+    decideExclusionAuditRowAction({ alreadyRejected: true, validationStatus: 'UNCERTAIN', discordStatus: 'UNCERTAIN', discordInvite: 'https://discord.gg/retained', scanStatus: 'NEEDS_REVIEW' }),
+    'invite-cleanup'
+  );
+  // A review-pending row can still be country-rejected by the audit; the
+  // status write stays the first action.
+  assert.equal(
+    decideExclusionAuditRowAction({ alreadyRejected: false, validationStatus: 'REJECTED', discordStatus: 'UNCERTAIN', discordInvite: 'https://discord.gg/retained', scanStatus: 'NEEDS_REVIEW' }),
+    'reject-write'
   );
 });

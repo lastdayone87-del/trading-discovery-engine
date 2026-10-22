@@ -18,6 +18,7 @@ import { classifyDiscoveryVisibility } from './discoveryStateVisibility';
 import { safeCrawlerTelemetry, type CrawlerTelemetry } from './crawlerTelemetry';
 import { validateLedgerInput, type ValidationKind, type ValidationStatus } from './phase3Validation';
 import { browserCapabilityIsUnavailable } from './browserCapability';
+import { STALE_CHANNEL_LOCK_AFTER_MINUTES, STALE_CHANNEL_LOCK_RECOVERY_BATCH_SIZE } from './staleChannelLockRecovery';
 import { assertMinimalPayload, compareMetrics, replayFunnel, REPLAY_FEATURE_VERSION, REPLAY_POLICY_VERSION, type FunnelMetrics, type OutcomeEventType, type VerificationStatus } from './replayMeasurement';
 import { mapQueryRunToNeighborhood, createNeighborhoodKey, type DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
 import { deriveNeighborhoodObservationMetrics } from './neighborhoodAnalytics';
@@ -401,6 +402,8 @@ export function rowToChannel(row: any): ChannelRecord {
     community_discovery_status: row.community_discovery_status === 'COMMUNITY_INDICATED_NO_INVITE' || row.community_discovery_status === 'PAID_COMMUNITY_INDICATED' ? row.community_discovery_status : 'NONE',
     community_intents: parseJson(row.community_intents, null),
     discord_duplicate_owner_channel_id: row.discord_duplicate_owner_channel_id || null,
+    discord_selected_invite_conflict: row.discord_selected_invite_conflict === true || row.discord_selected_invite_conflict === 't',
+    discord_duplicate_owner_channel_name: row.discord_duplicate_owner_channel_name || null,
     post_approval_job_status: row.post_approval_job_status || undefined,
     post_approval_job_error: row.post_approval_job_error || undefined,
     community_retry_job_status: row.community_retry_job_status || undefined,
@@ -473,7 +476,7 @@ export function isActiveCommunityRetry(channel: {
 
 export async function getAllChannels(): Promise<ChannelRecord[]> {
   const db = await getDb();
-  const res = await db.query('SELECT * FROM channels ORDER BY first_seen DESC');
+  const res = await db.query(`SELECT *, ${DISCORD_SELECTED_INVITE_CONFLICT_SQL} AS discord_selected_invite_conflict FROM channels ORDER BY first_seen DESC`);
   return res.rows.map(rowToChannel);
 }
 
@@ -487,23 +490,44 @@ export async function listRejectedChannelDiagnostics(
   db?: Pick<InstanceType<typeof Pool>, 'query'>
 ): Promise<ChannelRecord[]> {
   const conn = db ?? await getDb();
-  const res = await conn.query(`SELECT * FROM channels WHERE country_status='REJECTED' OR scan_status='SKIPPED_EXCLUDED' OR trading_status='NON_TRADING' OR discord_status='NON_TRADING' ORDER BY first_seen DESC`);
+  const res = await conn.query(`SELECT *, ${DISCORD_SELECTED_INVITE_CONFLICT_SQL} AS discord_selected_invite_conflict FROM channels WHERE country_status='REJECTED' OR scan_status='SKIPPED_EXCLUDED' OR trading_status='NON_TRADING' OR discord_status='NON_TRADING' ORDER BY first_seen DESC`);
   return res.rows.map(rowToChannel);
 }
 
 export interface ChannelListingFilter {includeRejected?:boolean;diagnosticsOnly?:boolean;search?:string;country?:string;countryStatus?:string;tradingStatus?:string;discordStatus?:string;scanStatus?:string;recentInvites?:boolean}
+/** Canonical selected-invite code, matching the registry backfill/canonicalizer.
+ * The channel's serving invite is the selected invite; the candidate locator is
+ * only a fallback for projections that have not re-materialized the URL. */
+export const DISCORD_SELECTED_INVITE_CODE_SQL = `lower(split_part(
+    regexp_replace(
+      regexp_replace(COALESCE(discord_invite,discord_candidate_locator), '[?#].*$', ''),
+      '^(https?://)?(discord\\.gg|discord\\.com/invite|discord\\.app/invite|discordapp\\.com/invite|discord\\.(me|io)|dsc\\.gg)/+',
+      ''
+    ),
+    '/', 1
+  ))`;
+/** A selected invite is owned elsewhere only when its canonical code has a
+ * registry winner that is a different channel. The historical
+ * discord_duplicate_owner_channel_id remains provenance for a discarded
+ * candidate, not an eligibility verdict for the invite that is actually
+ * served. */
+export const DISCORD_SELECTED_INVITE_CONFLICT_SQL = `EXISTS (
+    SELECT 1 FROM discord_invite_registry owner
+    WHERE owner.canonical_code = ${DISCORD_SELECTED_INVITE_CODE_SQL}
+      AND owner.first_channel_id <> channel_id
+  )`;
 /** The recently-confirmed view is an intersection, never a replacement: the
  * selected Discord category still applies, and every row must have a live
  * invite that was successfully validated. NOT_FOUND, PENDING, UNCERTAIN, DEAD,
- * duplicate-owned, and otherwise unconfirmed rows are excluded. NON_TRADING is
- * retained so the existing category remains independently selectable; its
- * invite is normally withheld by the projection. */
+ * selected-invite-owned-elsewhere, and otherwise unconfirmed rows are excluded.
+ * NON_TRADING is retained so the existing category remains independently
+ * selectable; its invite is normally withheld by the projection. */
 export const CONFIRMED_DISCORD_INVITE_SQL = `discord_invite IS NOT NULL
   AND discord_validation_status IN ('SUCCEEDED','COMPLETED')
   AND discord_liveness_status='ACTIVE'
   AND discord_discovery_status='VALIDATED'
   AND discord_status IN ('ACTIVE','ACTIVE_LOW_VOLUME','NON_TRADING')
-  AND discord_duplicate_owner_channel_id IS NULL`;
+  AND NOT (${DISCORD_SELECTED_INVITE_CONFLICT_SQL})`;
 /** Correlation-safe confirmation timestamp for the channel's selected
  * candidate. Candidate persistence retains the first id for an already-known
  * locator, so prefer the projected id and fall back to the selected locator
@@ -616,6 +640,8 @@ export async function listChannelsPage(args:ChannelListingFilter&{limit:number;o
   const db=await getDb(); const limit=Math.min(250,Math.max(1,args.limit)); const offset=Math.max(0,args.offset);
   const {where,values}=await channelListingWhere(db,args);
   const columns=`channel_id,channel_name,youtube_url,country,country_status,scope_eligibility,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,inspection_trail,subscriber_count,channel_thumbnail_url,quality_score,trading_status,trading_confidence_score,trading_category,country_metadata_status,country_metadata_checked_at,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,community_discovery_status,community_intents,discord_duplicate_owner_channel_id,
+    ${DISCORD_SELECTED_INVITE_CONFLICT_SQL} AS discord_selected_invite_conflict,
+    (SELECT owner.channel_name FROM channels owner WHERE owner.channel_id=channels.discord_duplicate_owner_channel_id) discord_duplicate_owner_channel_name,
     ${DISCORD_INVITE_FIRST_VALIDATED_SQL} AS discord_invite_first_validated_at,
     (SELECT COUNT(*)::int FROM discord_candidates dc WHERE dc.channel_id=channels.channel_id) candidate_count,
     COALESCE((SELECT jsonb_agg((to_jsonb(dc) || jsonb_build_object('display_locator', (SELECT COALESCE(a.resolved_locator, a.invite_locator) FROM discord_check_attempts a WHERE a.channel_id=dc.channel_id AND lower(COALESCE(a.resolved_locator, a.invite_locator))=dc.normalized_locator ORDER BY a.checked_at DESC LIMIT 1))) ORDER BY dc.selected DESC,dc.last_checked DESC NULLS LAST,dc.discovered_at) FROM discord_candidates dc WHERE dc.channel_id=channels.channel_id AND dc.candidate_status='VALIDATED' AND dc.validation_status='COMPLETED' AND dc.liveness_status='ACTIVE'),'[]'::jsonb) discord_candidates,
@@ -758,44 +784,97 @@ export async function getDashboardOperationalSummary(env:NodeJS.ProcessEnv=proce
 export async function getChannelById(channelId: string): Promise<ChannelRecord | null> {
   const db = await getDb();
   const res = await db.query(`SELECT c.*,
+    ${DISCORD_SELECTED_INVITE_CONFLICT_SQL} AS discord_selected_invite_conflict,
+    (SELECT owner.channel_name FROM channels owner WHERE owner.channel_id=c.discord_duplicate_owner_channel_id) discord_duplicate_owner_channel_name,
     (SELECT COUNT(*)::int FROM discord_candidates dc WHERE dc.channel_id=c.channel_id) candidate_count
     FROM channels c WHERE c.channel_id=$1`, [channelId]);
   if (!res.rows[0]) return null;
   return rowToChannelWithDiscoveryVisibility(res.rows[0]);
 }
 
-export async function upsertChannel(channel: ChannelRecord): Promise<void> {
+const DISCORD_PROJECTION_WRITE_COLUMNS=[
+  'discord_status','discord_invite','discord_discovery_status','discord_candidate_locator',
+  'discord_candidate_id','discord_candidate_raw_locator','discord_candidate_type',
+  'discord_resolution_status','discord_liveness_status','discord_relevance_status',
+  'discord_validation_status','discord_duplicate_owner_channel_id',
+] as const;
+
+// The initial SELECT can miss a row that a concurrent writer inserts before
+// this transaction reaches INSERT. The conflict path must therefore apply the
+// same preserve rule as the locked-row overlay; otherwise a stale
+// classification snapshot overwrites the newly inserted Discord projection.
+const preserveDiscordOnConflictSql = (column: string) =>
+  `${column}=CASE WHEN $49::boolean THEN channels.${column} ELSE excluded.${column} END`;
+
+/**
+ * Classification-only writes carry a Discord snapshot that may predate a
+ * concurrent validation. When the caller opts in, the locked row's Discord
+ * projection wins over that stale snapshot, so a validation result committed
+ * while classification was running is never overwritten; every non-Discord
+ * field still comes from the caller. Insert paths (no existing row) keep the
+ * caller's defaults. Pure by design so the merge rule is directly testable.
+ */
+export function overlayLockedDiscordProjection<T extends Partial<ChannelRecord>>(proposed:T,locked:Partial<ChannelRecord>|null|undefined):T{
+  if(!locked)return proposed;
+  const merged:{[key:string]:unknown}={...proposed};
+  for(const column of DISCORD_PROJECTION_WRITE_COLUMNS)merged[column]=locked[column];
+  return merged as T;
+}
+
+type ChannelUpsertClient = { query: (text: string, params?: unknown[]) => Promise<unknown> };
+
+/**
+ * Writes the channel row inside the caller's transaction. Kept separate from
+ * the read/lock preamble so the PostgreSQL regression can reproduce the
+ * read-misses-row, concurrent-insert, conflict-write interleaving without a
+ * test-only hook in production code.
+ */
+export async function writeChannelUpsert(
+  client: ChannelUpsertClient,
+  channel: ChannelRecord,
+  options?: { preserveDiscordOnUpdate?: boolean },
+): Promise<void> {
+  // Write-path invariant (final country → final scope_eligibility): always
+  // derived from the row's country. A stale stored value must never survive
+  // a country attribution change; country, status and confidence flow
+  // through untouched.
+  const scopeEligibility = scopeEligibilityForWrite(channel);
+  await client.query(`INSERT INTO channels (
+  channel_id,channel_name,youtube_url,country,country_status,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,next_check,inspection_trail,subscriber_count,channel_thumbnail_url,quality_score,quality_breakdown,trading_status,trading_confidence_score,trading_category,trading_relevance_breakdown,country_metadata_status,country_metadata_checked_at,public_about_status,public_about_checked_at,public_about_attempts,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,scope_eligibility,community_discovery_status,community_intents,discord_duplicate_owner_channel_id,updated_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,now())
+ON CONFLICT(channel_id) DO UPDATE SET
+  channel_name=excluded.channel_name,youtube_url=excluded.youtube_url,country=excluded.country,country_status=excluded.country_status,confidence_score=excluded.confidence_score,${preserveDiscordOnConflictSql('discord_status')},${preserveDiscordOnConflictSql('discord_invite')},scan_status=excluded.scan_status,scan_attempts=excluded.scan_attempts,discovery_source=excluded.discovery_source,last_checked=excluded.last_checked,next_check=excluded.next_check,inspection_trail=excluded.inspection_trail,subscriber_count=excluded.subscriber_count,channel_thumbnail_url=excluded.channel_thumbnail_url,quality_score=excluded.quality_score,quality_breakdown=excluded.quality_breakdown,trading_status=excluded.trading_status,trading_confidence_score=excluded.trading_confidence_score,trading_category=excluded.trading_category,trading_relevance_breakdown=excluded.trading_relevance_breakdown,country_metadata_status=excluded.country_metadata_status,country_metadata_checked_at=excluded.country_metadata_checked_at,public_about_status=excluded.public_about_status,public_about_checked_at=excluded.public_about_checked_at,public_about_attempts=excluded.public_about_attempts,latest_upload_at=excluded.latest_upload_at,uploads_last_30_days=excluded.uploads_last_30_days,uploads_last_90_days=excluded.uploads_last_90_days,uploads_last_365_days=excluded.uploads_last_365_days,activity_band=excluded.activity_band,activity_score=excluded.activity_score,activity_observed_at=excluded.activity_observed_at,${preserveDiscordOnConflictSql('discord_discovery_status')},${preserveDiscordOnConflictSql('discord_candidate_locator')},${preserveDiscordOnConflictSql('discord_candidate_id')},${preserveDiscordOnConflictSql('discord_candidate_raw_locator')},${preserveDiscordOnConflictSql('discord_candidate_type')},${preserveDiscordOnConflictSql('discord_resolution_status')},${preserveDiscordOnConflictSql('discord_liveness_status')},${preserveDiscordOnConflictSql('discord_relevance_status')},${preserveDiscordOnConflictSql('discord_validation_status')},scope_eligibility=excluded.scope_eligibility,community_discovery_status=excluded.community_discovery_status,community_intents=excluded.community_intents,${preserveDiscordOnConflictSql('discord_duplicate_owner_channel_id')},updated_at=now()`, [
+  channel.channel_id, channel.channel_name, channel.youtube_url, channel.country, channel.country_status, channel.confidence_score || 0,
+  channel.discord_status, channel.discord_invite || null, channel.scan_status, channel.scan_attempts || 0, channel.discovery_source,
+  channel.first_seen || new Date().toISOString(), channel.last_checked || null, null, JSON.stringify(channel.inspection_trail || []),
+  channel.subscriber_count || null, channel.channel_thumbnail_url || null, channel.quality_score || 0,
+  channel.quality_breakdown ? JSON.stringify(channel.quality_breakdown) : null, channel.trading_status || 'UNCERTAIN',
+  channel.trading_confidence_score || 0, channel.trading_category || 'General Trading',
+  channel.trading_relevance_breakdown ? JSON.stringify(channel.trading_relevance_breakdown) : null,
+  channel.country_metadata_status || 'NOT_REQUESTED', channel.country_metadata_checked_at || null,
+  channel.public_about_status || 'NOT_ATTEMPTED', channel.public_about_checked_at || null, channel.public_about_attempts || 0,
+  channel.latest_upload_at || null, channel.uploads_last_30_days || 0, channel.uploads_last_90_days || 0,
+  channel.uploads_last_365_days || 0, channel.activity_band || 'UNKNOWN', channel.activity_score ?? 50,
+  channel.activity_observed_at || null,channel.discord_discovery_status||'NOT_DISCOVERED',channel.discord_candidate_locator||null,channel.discord_candidate_id||null,channel.discord_candidate_raw_locator||null,channel.discord_candidate_type||null,channel.discord_resolution_status||'NOT_ATTEMPTED',channel.discord_liveness_status||'NOT_CHECKED',channel.discord_relevance_status||'NOT_CHECKED',channel.discord_validation_status||'NOT_STARTED',scopeEligibility,channel.community_discovery_status||'NONE',JSON.stringify(channel.community_intents||[]),channel.discord_duplicate_owner_channel_id||null,options?.preserveDiscordOnUpdate===true
+  ]);
+}
+
+export async function upsertChannel(channel: ChannelRecord, options?: { preserveDiscordOnUpdate?: boolean }): Promise<void> {
   const db = await getDb();
   const client = await db.connect();
   try {
     await client.query('BEGIN');
     const prior = await client.query(
-      'SELECT quality_score,trading_status FROM channels WHERE channel_id=$1 FOR UPDATE',
+      `SELECT quality_score,trading_status,${DISCORD_PROJECTION_WRITE_COLUMNS.join(',')} FROM channels WHERE channel_id=$1 FOR UPDATE`,
       [channel.channel_id]
     );
-    // Write-path invariant (final country → final scope_eligibility): always
-    // derived from the row's country. A stale stored value must never survive
-    // a country attribution change; country, status and confidence flow
-    // through untouched.
-    const scopeEligibility = scopeEligibilityForWrite(channel);
-    await client.query(`INSERT INTO channels (
-    channel_id,channel_name,youtube_url,country,country_status,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,next_check,inspection_trail,subscriber_count,channel_thumbnail_url,quality_score,quality_breakdown,trading_status,trading_confidence_score,trading_category,trading_relevance_breakdown,country_metadata_status,country_metadata_checked_at,public_about_status,public_about_checked_at,public_about_attempts,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,scope_eligibility,community_discovery_status,community_intents,discord_duplicate_owner_channel_id,updated_at
-  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,now())
-  ON CONFLICT(channel_id) DO UPDATE SET
-    channel_name=excluded.channel_name,youtube_url=excluded.youtube_url,country=excluded.country,country_status=excluded.country_status,confidence_score=excluded.confidence_score,discord_status=excluded.discord_status,discord_invite=excluded.discord_invite,scan_status=excluded.scan_status,scan_attempts=excluded.scan_attempts,discovery_source=excluded.discovery_source,last_checked=excluded.last_checked,next_check=excluded.next_check,inspection_trail=excluded.inspection_trail,subscriber_count=excluded.subscriber_count,channel_thumbnail_url=excluded.channel_thumbnail_url,quality_score=excluded.quality_score,quality_breakdown=excluded.quality_breakdown,trading_status=excluded.trading_status,trading_confidence_score=excluded.trading_confidence_score,trading_category=excluded.trading_category,trading_relevance_breakdown=excluded.trading_relevance_breakdown,country_metadata_status=excluded.country_metadata_status,country_metadata_checked_at=excluded.country_metadata_checked_at,public_about_status=excluded.public_about_status,public_about_checked_at=excluded.public_about_checked_at,public_about_attempts=excluded.public_about_attempts,latest_upload_at=excluded.latest_upload_at,uploads_last_30_days=excluded.uploads_last_30_days,uploads_last_90_days=excluded.uploads_last_90_days,uploads_last_365_days=excluded.uploads_last_365_days,activity_band=excluded.activity_band,activity_score=excluded.activity_score,activity_observed_at=excluded.activity_observed_at,discord_discovery_status=excluded.discord_discovery_status,discord_candidate_locator=excluded.discord_candidate_locator,discord_candidate_id=excluded.discord_candidate_id,discord_candidate_raw_locator=excluded.discord_candidate_raw_locator,discord_candidate_type=excluded.discord_candidate_type,discord_resolution_status=excluded.discord_resolution_status,discord_liveness_status=excluded.discord_liveness_status,discord_relevance_status=excluded.discord_relevance_status,discord_validation_status=excluded.discord_validation_status,scope_eligibility=excluded.scope_eligibility,community_discovery_status=excluded.community_discovery_status,community_intents=excluded.community_intents,discord_duplicate_owner_channel_id=excluded.discord_duplicate_owner_channel_id,updated_at=now()`, [
-    channel.channel_id, channel.channel_name, channel.youtube_url, channel.country, channel.country_status, channel.confidence_score || 0,
-    channel.discord_status, channel.discord_invite || null, channel.scan_status, channel.scan_attempts || 0, channel.discovery_source,
-    channel.first_seen || new Date().toISOString(), channel.last_checked || null, null, JSON.stringify(channel.inspection_trail || []),
-    channel.subscriber_count || null, channel.channel_thumbnail_url || null, channel.quality_score || 0,
-    channel.quality_breakdown ? JSON.stringify(channel.quality_breakdown) : null, channel.trading_status || 'UNCERTAIN',
-    channel.trading_confidence_score || 0, channel.trading_category || 'General Trading',
-    channel.trading_relevance_breakdown ? JSON.stringify(channel.trading_relevance_breakdown) : null,
-    channel.country_metadata_status || 'NOT_REQUESTED', channel.country_metadata_checked_at || null,
-    channel.public_about_status || 'NOT_ATTEMPTED', channel.public_about_checked_at || null, channel.public_about_attempts || 0,
-    channel.latest_upload_at || null, channel.uploads_last_30_days || 0, channel.uploads_last_90_days || 0,
-    channel.uploads_last_365_days || 0, channel.activity_band || 'UNKNOWN', channel.activity_score ?? 50,
-    channel.activity_observed_at || null,channel.discord_discovery_status||'NOT_DISCOVERED',channel.discord_candidate_locator||null,channel.discord_candidate_id||null,channel.discord_candidate_raw_locator||null,channel.discord_candidate_type||null,channel.discord_resolution_status||'NOT_ATTEMPTED',channel.discord_liveness_status||'NOT_CHECKED',channel.discord_relevance_status||'NOT_CHECKED',channel.discord_validation_status||'NOT_STARTED',scopeEligibility,channel.community_discovery_status||'NONE',JSON.stringify(channel.community_intents||[]),channel.discord_duplicate_owner_channel_id||null
-    ]);
+    // The row is locked above for this transaction: a classification-only write
+    // must not push its stale Discord snapshot over a validation result that
+    // committed while classification was running.
+    if (options?.preserveDiscordOnUpdate && prior.rowCount) {
+      channel = overlayLockedDiscordProjection(channel, prior.rows[0]);
+    }
+    await writeChannelUpsert(client, channel, options);
     if (prior.rowCount) {
       const before = isQualityCreator(prior.rows[0].trading_status, Number(prior.rows[0].quality_score || 0));
       const after = isQualityCreator(channel.trading_status || 'UNCERTAIN', Number(channel.quality_score || 0));
@@ -2059,6 +2138,55 @@ export function decideJobFailure(error:any,attempts:number,maxAttempts:number,no
 }
 export async function failJob(jobId:string,error:any):Promise<JobFailureDisposition|null>{const db=await getDb(); const res=await db.query('SELECT attempts,max_attempts,created_at FROM jobs WHERE id=$1',[jobId]); if(!res.rowCount)return null; const {attempts,max_attempts,created_at}=res.rows[0]; const msg=String(error?.message||error).slice(0,2000); let geminiSemanticCooldownExpiryMs: number|undefined=undefined; let groqSemanticCooldownExpiryMs: number|undefined=undefined; let geminiFreeSemanticCooldownExpiryMs: number|undefined=undefined; const providerReasons=Array.isArray(error?.providerReasons)?error.providerReasons.map(String):[]; if(providerReasons.includes('SEMANTIC_DEFERRED_RATE_PRESSURE')||providerReasons.includes('GEMINI_CAPACITY_DEFERRED')||(providerReasons.includes('PROVIDER_RATE_LIMIT')&&failedProviderOrg(error,['PROVIDER_RATE_LIMIT'],['gemini_semantic'])!==undefined)){const failedGeminiOrg=failedProviderOrg(error,['SEMANTIC_DEFERRED_RATE_PRESSURE','GEMINI_CAPACITY_DEFERRED','PROVIDER_RATE_LIMIT'],['gemini_semantic']);geminiSemanticCooldownExpiryMs=failedGeminiOrg?await resolveGeminiOrgSemanticCooldownExpiryMs(failedGeminiOrg,Date.now()):await resolveGeminiSemanticCooldownExpiryMs(Date.now());} if(providerReasons.includes('GROQ_RATE_LIMITED')){const failedGroqOrg=failedProviderOrg(error,['GROQ_RATE_LIMITED']);groqSemanticCooldownExpiryMs=failedGroqOrg?await resolveGroqOrgCooldownExpiryMs(failedGroqOrg,Date.now()):await resolveGroqSemanticCooldownExpiryMs(Date.now());} if(providerReasons.includes('GEMINI_FREE_RATE_LIMITED')){geminiFreeSemanticCooldownExpiryMs=await resolveGeminiFreeSemanticCooldownExpiryMs(Date.now());}const decision=decideJobFailure(error,attempts,max_attempts,Date.now(),new Date(created_at).getTime(),geminiSemanticCooldownExpiryMs,groqSemanticCooldownExpiryMs,geminiFreeSemanticCooldownExpiryMs);const persistedMessage=decision.operationallyBlocked?`OPERATIONALLY_BLOCKED_RETRY_REQUIRED: ${msg}`:msg;if(decision.disposition==='RETRYING_WITHOUT_ATTEMPT'){await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,new Date(decision.runAfter!).toISOString()]);}else if(decision.disposition==='FAILED'){await db.query(`UPDATE jobs SET status='FAILED',last_error=$2,locked_by=NULL,locked_at=NULL,updated_at=now() WHERE id=$1`,[jobId,persistedMessage]);}else{const seconds=Math.min(900,30*Math.pow(2,Math.max(0,attempts-1))); await db.query(`UPDATE jobs SET status='PENDING',last_error=$2,locked_by=NULL,locked_at=NULL,run_after=now()+($3||' seconds')::interval,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,String(seconds)]);} await db.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$2 WHERE job_id=$1 AND finished_at IS NULL`,[jobId,persistedMessage]);return decision.disposition;}
 export async function recoverStaleJobs(staleAfterMinutes=15):Promise<number>{const db=await getDb(); const client=await db.connect(); try{await client.query('BEGIN'); const stuck=await client.query(`SELECT id,type,locked_by,locked_at,attempts FROM jobs WHERE status='PROCESSING' AND locked_at < now()-($1||' minutes')::interval FOR UPDATE`,[String(staleAfterMinutes)]); const res=await client.query(`UPDATE jobs SET status='PENDING',locked_by=NULL,locked_at=NULL,updated_at=now(),last_error=COALESCE(last_error,'Recovered stale processing lock') WHERE id=ANY($1::uuid[])`,[stuck.rows.map(row=>row.id)]); if(res.rowCount) await client.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=COALESCE(error,'Worker heartbeat expired; job recovered for retry') WHERE finished_at IS NULL AND job_id=ANY($1::uuid[])`,[stuck.rows.map(row=>row.id)]); await client.query('COMMIT'); const summary=summarizeRecoveredStaleJobs(stuck.rows,Date.now()); if(summary.recovered>0)console.warn(JSON.stringify({event:'stale_jobs_recovered',...summary,staleAfterMinutes,timestamp:new Date().toISOString()})); return res.rowCount||0;}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}}
+
+/**
+ * Reconciles channel-level LOCKED projections whose durable owner is gone.
+ * The jobs table is authoritative: a live PROCESSING job for the same channel
+ * always protects the lock, even when the row is older than the grace period.
+ * The age bound covers legacy/search-worker scans that do not carry a
+ * per-channel job id, so a normal in-flight scan is never cleared. Each sweep
+ * is capped and skips rows already claimed by another sweep; the next tick
+ * continues the backlog.
+ */
+export async function recoverStaleChannelLocks(staleAfterMinutes=STALE_CHANNEL_LOCK_AFTER_MINUTES,batchSize=STALE_CHANNEL_LOCK_RECOVERY_BATCH_SIZE):Promise<number>{
+  const db=await getDb();
+  const res=await db.query(
+    `WITH eligible AS (
+        SELECT c.channel_id
+          FROM channels c
+         WHERE c.scan_status='LOCKED'
+           AND c.updated_at < now()-($1||' minutes')::interval
+           AND NOT EXISTS (
+             SELECT 1 FROM jobs live
+             WHERE live.status='PROCESSING'
+               AND live.payload->>'channelId'=c.channel_id
+           )
+         ORDER BY c.updated_at, c.channel_id
+         LIMIT ($2)::bigint
+         FOR UPDATE SKIP LOCKED
+      )
+      UPDATE channels c
+        SET scan_status = CASE
+            WHEN c.trading_status = 'NEEDS_REVIEW' THEN 'NEEDS_REVIEW'
+            WHEN c.trading_status = 'UNCERTAIN'
+              AND EXISTS (
+                SELECT 1 FROM jobs pending
+                WHERE pending.type='ENRICH_CHANNEL'
+                  AND pending.status='PENDING'
+                  AND pending.payload->>'channelId'=c.channel_id
+              ) THEN 'ENRICHMENT_PENDING'
+            ELSE 'PENDING'
+          END,
+          updated_at = now()
+        FROM eligible e
+       WHERE c.channel_id = e.channel_id
+      RETURNING c.channel_id`,
+    [String(staleAfterMinutes),String(batchSize)]
+  );
+  const recovered=res.rowCount||0;
+  if(recovered>0)console.warn(JSON.stringify({event:'stale_channel_locks_recovered',recovered,staleAfterMinutes,batchSize,timestamp:new Date().toISOString()}));
+  return recovered;
+}
 
 /**
  * Pure aggregation for stale-job recovery observability (no I/O): per-type

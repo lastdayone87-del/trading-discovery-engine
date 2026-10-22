@@ -398,7 +398,15 @@ test('exhausted crawl budget produces PARTIALLY_INSPECTED at channel level', asy
     renderedFallback: emptyRendered,
   });
   assert.equal(result.acquisitionStatus, 'PARTIALLY_INSPECTED');
-  assert.equal(result.retryDirective, undefined);
+  // Static budget exhaustion is now an attempt-free community retry
+  // (STATIC_BUDGET_GAP); it must not consume the channel's scan attempt.
+  assert.deepEqual(result.retryDirective, {
+    attemptFree: true,
+    code: 'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE',
+    reason: 'STATIC_BUDGET_GAP',
+    retryReason: 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE',
+    retryAt: undefined,
+  });
   assert.equal(result.steps.find((step) => step.step === 'CUSTOM_DOMAINS')?.status, 'PARTIAL');
 });
 
@@ -675,8 +683,8 @@ test('dashboard copy distinguishes incomplete, not-yet-inspected, and clean stat
   assert.match(table, /Website acquisition incomplete/);
   assert.match(table, /Not yet inspected/);
   assert.match(table, /Clean inspection · no community found/);
-  assert.match(table, /\(c\.scan_status==='FAILED'\|\|c\.scan_status==='FAILED_PERMANENT'\|\|c\.scan_status==='ENRICHMENT_PENDING'\)/);
-  assert.match(table, /\(automaticRetryActive\|\|automaticRetryTerminal\)/);
+  assert.match(table, /\(c\.scan_status\s*===\s*'FAILED'\s*\|\|\s*c\.scan_status\s*===\s*'FAILED_PERMANENT'\s*\|\|\s*c\.scan_status\s*===\s*'ENRICHMENT_PENDING'\)/);
+  assert.match(table, /\(automaticRetryActive\s*\|\|\s*automaticRetryTerminal\)/);
 });
 
 // G. Video-description discovery remains enabled (recall invariant).

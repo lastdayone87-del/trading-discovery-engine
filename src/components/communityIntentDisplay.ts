@@ -1,4 +1,5 @@
 import type { ChannelRecord, CommunityIntentEvidence } from '../types';
+import { isPlatformOwnedCommunityUrl } from '../utils/platformOwnedPages';
 
 export interface CommunityIntentEvidenceView {
   key: string;
@@ -26,8 +27,31 @@ export function communityIntentDisplay(
 ): CommunityIntentDisplay {
   const status = channel.community_discovery_status;
   const intents = channel.community_intents || [];
-  const paid = status === 'PAID_COMMUNITY_INDICATED' || intents.some(item => item.intent === 'PAID');
-  const present = paid || status === 'COMMUNITY_INDICATED_NO_INVITE' || intents.length > 0;
+  // Platform-owned marketing/docs/newsroom/asset pages can carry price
+  // wording without describing the creator's own community. They are not
+  // community intent at all: remove them from the badge, the evidence list,
+  // and the platform suffix. Genuine creator-specific evidence still counts,
+  // and mixed evidence keeps only the creator-specific records. This is a
+  // presentation projection; persisted status and stored evidence are not
+  // changed.
+  const creatorIntents = intents.filter(
+    item => item?.communityUrl && !isPlatformOwnedCommunityUrl(item.communityPlatform, item.communityUrl),
+  );
+  const creatorPaidIntentItems = creatorIntents.filter(item => item.intent === 'PAID');
+  const hasStoredUrls = intents.some(item => Boolean(item?.communityUrl));
+  const onlyPlatformOwnedIntents = hasStoredUrls && creatorIntents.length === 0;
+  // When stored URLs exist, the persisted status may still have been set by a
+  // platform-owned paid page that this projection just removed. In that case
+  // only creator-specific PAID records can establish the paid badge. A
+  // status-only record (no stored URLs) keeps the persisted status as its
+  // only signal.
+  const paid = hasStoredUrls
+    ? creatorPaidIntentItems.length > 0
+    : status === 'PAID_COMMUNITY_INDICATED';
+  // A status-only indication (no stored URLs) remains visible. If the only
+  // stored evidence is platform-owned, there is no community intent to show.
+  const present = !onlyPlatformOwnedIntents
+    && (paid || status === 'COMMUNITY_INDICATED_NO_INVITE' || creatorIntents.length > 0);
   if (!present) {
     return { present: false, label: '', tone: 'indicated', evidence: [] };
   }
@@ -36,28 +60,62 @@ export function communityIntentDisplay(
   // already retains a Discord invite or candidate. Keep the two facts
   // independent in the label so the table never contradicts itself.
   const hasDiscord = Boolean(channel.discord_invite || channel.discord_candidate_locator);
-  const label = paid
-    ? 'PAID COMMUNITY INDICATED'
-    : hasDiscord
-      ? 'ADDITIONAL COMMUNITY INDICATED'
-      : 'COMMUNITY INDICATED · NO INVITE';
+
+  // Creator-specific paid evidence can sit beyond the first three stored
+  // records. Put those records first so the displayed evidence (and the
+  // platform named in the label) always includes the platform that
+  // established genuine paid intent. Platform-owned records are excluded.
+  const orderedIntents = paid && creatorPaidIntentItems.length > 0
+    ? [...creatorPaidIntentItems, ...creatorIntents]
+    : creatorIntents;
   const seen = new Set<string>();
   const evidence: CommunityIntentEvidenceView[] = [];
-  for (const item of intents) {
+  for (const item of orderedIntents) {
     if (!item?.communityUrl || seen.has(item.communityUrl)) continue;
     seen.add(item.communityUrl);
     evidence.push(evidenceView(item));
     if (evidence.length >= 3) break;
   }
 
+  // Count platforms across every eligible stored intent, not only the three
+  // displayed entries, so the "+N" suffix never undercounts. A paid summary
+  // names only the platforms that carry creator-specific paid intent; when
+  // the badge comes from the persisted status alone (no classified paid
+  // records), the suffix stays empty exactly as before.
+  const suffixIntents = paid ? creatorPaidIntentItems : creatorIntents;
+  const platforms = [...new Set(suffixIntents
+    .filter(item => item?.communityUrl)
+    .map(item => platformLabel(item.communityPlatform)))];
+  const platformSuffix = platforms.length > 0 ? ` (${platforms.slice(0, 2).join(', ')}${platforms.length > 2 ? ', +' + (platforms.length - 2) : ''})` : '';
+  const label = paid
+    ? `Paid community${platformSuffix}`
+    : hasDiscord
+      ? `Additional community${platformSuffix}`
+      : `Community indicated${platformSuffix} · no invite`;
+
   return { present: true, label, tone: paid ? 'paid' : 'indicated', evidence };
+}
+
+function platformLabel(platform: string | null | undefined): string {
+  // Persisted JSONB is not schema-validated: an older record without a
+  // platform, or with a non-string value, must not break the whole table
+  // render.
+  if (typeof platform !== 'string' || !platform) return 'Other';
+  const known: Record<string, string> = {
+    WHOP: 'Whop',
+    SKOOL: 'Skool',
+    CIRCLE: 'Circle',
+    PATREON: 'Patreon',
+    DISCORD: 'Discord',
+  };
+  return known[platform.toUpperCase()] || platform;
 }
 
 function evidenceView(item: CommunityIntentEvidence): CommunityIntentEvidenceView {
   const signals = [...new Set([...(item.paidSignals || []), ...(item.privateSignals || [])])].slice(0, 5);
   return {
     key: `${item.communityPlatform}:${item.communityUrl}`,
-    platform: item.communityPlatform,
+    platform: platformLabel(item.communityPlatform),
     intent: item.intent,
     url: item.communityUrl,
     displayUrl: item.communityUrl.replace(/^https?:\/\//, '').replace(/^www\./, ''),

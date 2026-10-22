@@ -191,6 +191,12 @@ export interface ChannelRecord {
   /** Non-null when an invite was found but its registry owner is another
    * channel. Owner id only; never the code, a candidate, or an assignment. */
   discord_duplicate_owner_channel_id?: string | null;
+  /** Computed from the currently served invite's canonical registry owner.
+   * Historical duplicate provenance does not make the served invite a
+   * conflict when the selected code is owned by this same channel. */
+  discord_selected_invite_conflict?: boolean;
+  /** Read-only display name resolved from the owner row for the Discord cell. */
+  discord_duplicate_owner_channel_name?: string | null;
   /** Read-only reporting classification; never persisted. */
   discovery_visibility?: 'VALIDATED' | 'DISCOVERED_VALIDATION_FAILED' | 'NOT_DISCOVERED' | 'LEGACY_UNCLASSIFIED';
   post_approval_job_status?: 'PENDING'|'PROCESSING'|'COMPLETED'|'FAILED';

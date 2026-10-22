@@ -23,8 +23,8 @@ import {
   mergeCommunityIntentEvidence,
   resolveCommunityDiscoveryStatus,
 } from './communityIntent';
-import { crawlExternalLinks as crawlExternalLinksImpl } from './inspector';
 import { crawlExternalLinksForTest as crawlExternalLinks } from './testCrawlHelpers';
+import type { CommunityIntentEvidence } from '../src/types';
 
 const readSource = (name: string) => readFileSync(fileURLToPath(new URL(`./${name}`, import.meta.url)), 'utf8');
 
@@ -159,6 +159,92 @@ test('generic pages with no platform surface produce no intent at all', () => {
   assert.equal(resolveCommunityDiscoveryStatus([]), 'NONE');
 });
 
+test('platform-owned corporate pages and assets are excluded from extraction', () => {
+  const evidence = extractCommunityIntentEvidence({
+    pageUrl: 'https://creator.test/',
+    html: [
+      '<a href="https://whop.com/careers">Whop careers</a>',
+      '<a href="https://whop.com/login?next=%2F">Whop login</a>',
+      '<a href="https://newsroom.whop.com/whop-economic-intelligence/price">$99/mo membership</a>',
+      '<a href="https://whop.com/_web/assets/gha-39651352868-1/translations/en/checkout-planid-3e0f42-6337b6e753.json">$49/mo membership</a>',
+      '<a href="https://www.whop.com/discover/creator">Join the community</a>',
+      '<a href="https://www.skool.com/creator-room">Free community</a>',
+    ].join(''),
+  });
+  const urls = evidence.map(item => item.communityUrl);
+
+  assert.ok(urls.includes('https://www.whop.com/discover/creator'), 'genuine Whop creator page remains eligible');
+  assert.ok(urls.includes('https://www.skool.com/creator-room'), 'genuine Skool creator page remains eligible');
+  assert.ok(!urls.some(url => url.includes('/careers')), 'corporate careers page is excluded');
+  assert.ok(!urls.some(url => url.includes('/login')), 'login page is excluded');
+  assert.ok(!urls.some(url => url.includes('newsroom.whop.com')), 'newsroom page is excluded');
+  assert.ok(!urls.some(url => url.includes('/_web/assets/')), 'Whop asset JSON is excluded');
+  assert.equal(resolveCommunityDiscoveryStatus(evidence), 'COMMUNITY_INDICATED_NO_INVITE');
+});
+
+test('the Skool Games community survives extraction, merge, and status projection', () => {
+  const evidence = extractCommunityIntentEvidence({
+    pageUrl: 'https://www.skool.com/games',
+    html: '<h1>Skool Games</h1><p>Paid membership $49/mo</p>',
+  });
+
+  assert.equal(evidence.length, 1);
+  assert.equal(evidence[0].communityPlatform, 'SKOOL');
+  assert.equal(evidence[0].communityUrl, 'https://www.skool.com/games');
+  assert.equal(evidence[0].intent, 'PAID');
+  assert.equal(resolveCommunityDiscoveryStatus(evidence), 'PAID_COMMUNITY_INDICATED');
+
+  const merged = mergeCommunityIntentEvidence([], evidence);
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].communityUrl, 'https://www.skool.com/games');
+  assert.equal(resolveCommunityDiscoveryStatus(merged), 'PAID_COMMUNITY_INDICATED');
+});
+
+test('a platform-owned page with price text cannot establish community status', () => {
+  const corporate = extractCommunityIntentEvidence({
+    pageUrl: 'https://whop.com/careers',
+    html: '<h1>$49/mo membership</h1>',
+  });
+  const asset = extractCommunityIntentEvidence({
+    pageUrl: 'https://whop.com/_web/assets/gha-39651352868-1/translations/en/checkout-planid-3e0f42-6337b6e753.json',
+    html: '{"price":"$49/mo","membership":true}',
+  });
+
+  assert.deepEqual(corporate, []);
+  assert.deepEqual(asset, []);
+  assert.equal(resolveCommunityDiscoveryStatus([...corporate, ...asset]), 'NONE');
+});
+
+test('legacy platform-owned evidence is removed and cannot keep a paid status', () => {
+  const legacy = (communityUrl: string): CommunityIntentEvidence => ({
+    communityPlatform: 'WHOP',
+    communityUrl,
+    intent: 'PAID',
+    paidSignals: ['price', 'per-month'],
+    privateSignals: [],
+    observedAt: '2026-10-01T00:00:00.000Z',
+    sourcePageUrl: communityUrl,
+    extractionConfidence: 'EXPLICIT',
+  });
+  const creatorIntent: CommunityIntentEvidence = {
+    ...legacy('https://whop.com/discover/creator'),
+    intent: 'UNKNOWN',
+    paidSignals: [],
+  };
+  const channel: any = {
+    community_discovery_status: 'PAID_COMMUNITY_INDICATED',
+    community_intents: [
+      legacy('https://newsroom.whop.com/whop-economic-intelligence/price'),
+      legacy('https://whop.com/_web/assets/gha-39651352868-1/translations/en/root-661470c958.json'),
+    ],
+  };
+
+  assert.equal(applyCommunityIntentEvidence(channel, [creatorIntent]), true);
+  assert.equal(channel.community_intents.length, 1);
+  assert.equal(channel.community_intents[0].communityUrl, 'https://whop.com/discover/creator');
+  assert.equal(channel.community_discovery_status, 'COMMUNITY_INDICATED_NO_INVITE');
+});
+
 test('page-level and anchor evidence for the same community URL merge to the strongest intent', () => {
   const evidence = extractCommunityIntentEvidence({
     pageUrl: 'https://www.skool.com/room',
@@ -255,6 +341,43 @@ test('a retained invite and an additional community intent coexist without overw
   assert.equal(channel.discord_invite, 'https://discord.gg/creatora');
   assert.equal(channel.community_discovery_status, 'PAID_COMMUNITY_INDICATED');
   assert.equal(channel.community_intents[0].communityUrl, paid[0].communityUrl);
+});
+
+test('an empty inspection removes legacy platform-owned rows without erasing creator evidence', () => {
+  const legacy = (communityUrl: string): CommunityIntentEvidence => ({
+    communityPlatform: 'WHOP',
+    communityUrl,
+    intent: 'PAID',
+    paidSignals: ['price'],
+    privateSignals: [],
+    observedAt: '2026-10-01T00:00:00.000Z',
+    sourcePageUrl: communityUrl,
+    extractionConfidence: 'EXPLICIT',
+  });
+  const creatorIntent: CommunityIntentEvidence = {
+    ...legacy('https://whop.com/discover/creator'),
+    intent: 'UNKNOWN',
+    paidSignals: [],
+  };
+  const platformOnly: any = {
+    community_discovery_status: 'PAID_COMMUNITY_INDICATED',
+    community_intents: [
+      legacy('https://newsroom.whop.com/whop-economic-intelligence/price'),
+      legacy('https://whop.com/_web/assets/gha-39651352868-1/translations/en/root-661470c958.json'),
+    ],
+  };
+  assert.equal(applyCommunityIntentEvidence(platformOnly, []), true);
+  assert.deepEqual(platformOnly.community_intents, []);
+  assert.equal(platformOnly.community_discovery_status, 'NONE');
+
+  const withCreator: any = {
+    community_discovery_status: 'PAID_COMMUNITY_INDICATED',
+    community_intents: [legacy('https://newsroom.whop.com/whop-economic-intelligence/price'), creatorIntent],
+  };
+  assert.equal(applyCommunityIntentEvidence(withCreator, []), true);
+  assert.equal(withCreator.community_intents.length, 1);
+  assert.equal(withCreator.community_intents[0].communityUrl, creatorIntent.communityUrl);
+  assert.equal(withCreator.community_discovery_status, 'COMMUNITY_INDICATED_NO_INVITE');
 });
 
 test('persistence contract: channel community state is stored and read back', () => {
