@@ -143,6 +143,29 @@ async function handleHttpRequest(
   req.pipe(upstream);
 }
 
+/** Parse a CONNECT authority without letting a scheme's default-port rule
+ * erase an explicit port. `https:` preserves an explicit :80; the bare host
+ * still defaults to 443. Userinfo, paths, queries, fragments, and whitespace
+ * are rejected rather than normalized into a different host. */
+export function parseConnectAuthority(
+  authority: string | undefined,
+): { hostname: string; port: number } | undefined {
+  const raw = authority?.trim();
+  if (!raw || /[\/?#@\s]/.test(raw)) return undefined;
+  try {
+    const target = new URL(`https://${raw}`);
+    if (target.username || target.password || target.pathname !== '/' || target.search || target.hash) {
+      return undefined;
+    }
+    return {
+      hostname: target.hostname,
+      port: target.port ? Number(target.port) : 443,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 async function handleConnect(
   req: IncomingMessage,
   clientSocket: Duplex,
@@ -153,14 +176,12 @@ async function handleConnect(
   // The client can disconnect while DNS is in flight. Keep an error listener
   // attached for that window so the socket error cannot become unhandled.
   clientSocket.once('error', () => clientSocket.destroy());
-  let target: URL;
-  try {
-    target = new URL(`http://${req.url}`);
-  } catch {
+  const target = parseConnectAuthority(req.url);
+  if (!target) {
     clientSocket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
     return;
   }
-  const port = originPort(target, 443);
+  const port = target.port;
   if (!PUBLIC_PORTS.has(port)) {
     clientSocket.end('HTTP/1.1 403 Forbidden\r\n\r\n');
     return;

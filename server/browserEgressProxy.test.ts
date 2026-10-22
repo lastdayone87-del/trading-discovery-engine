@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { request as httpRequest } from 'node:http';
 import { connect as netConnect } from 'node:net';
-import { resolvePinnedPublicAddress, startBrowserEgressProxy } from './browserEgressProxy';
+import { parseConnectAuthority, resolvePinnedPublicAddress, startBrowserEgressProxy } from './browserEgressProxy';
 
 const PUBLIC = { address: '93.184.216.1', family: 4 };
 const PRIVATE = { address: '10.0.0.5', family: 4 };
@@ -53,6 +53,20 @@ test('pinned browser resolution accepts only wholly public answers', async () =>
     /BLOCKED_DESTINATION/,
   );
   await assert.rejects(resolvePinnedPublicAddress('empty.example', async () => []), /BLOCKED_DESTINATION/);
+});
+
+test('CONNECT authority parsing preserves explicit ports and rejects ambiguity', () => {
+  assert.deepEqual(parseConnectAuthority('public.example:80'), { hostname: 'public.example', port: 80 });
+  assert.deepEqual(parseConnectAuthority('public.example'), { hostname: 'public.example', port: 443 });
+  assert.deepEqual(parseConnectAuthority('public.example:443'), { hostname: 'public.example', port: 443 });
+  assert.deepEqual(parseConnectAuthority('[2001:4860:4860::8888]:443'), {
+    hostname: '[2001:4860:4860::8888]',
+    port: 443,
+  });
+  assert.equal(parseConnectAuthority('user@public.example:443'), undefined);
+  assert.equal(parseConnectAuthority('public.example:443/path'), undefined);
+  assert.equal(parseConnectAuthority('public.example:not-a-port'), undefined);
+  assert.equal(parseConnectAuthority(undefined), undefined);
 });
 
 test('pinned browser resolution has a bounded DNS deadline', async () => {
