@@ -592,7 +592,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                               target="_blank"
                               rel="noreferrer"
                               title={c.discord_invite}
-                              className="min-w-0 flex-1 break-all font-mono text-[11px] font-semibold text-indigo-600 hover:underline dark:text-indigo-400"
+                              className="min-w-0 break-all font-mono text-[11px] font-semibold text-indigo-600 hover:underline dark:text-indigo-400"
                             >
                               {c.discord_invite.replace(/^https?:\/\//, '').replace(/^www\./, '')}
                             </a>
