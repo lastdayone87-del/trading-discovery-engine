@@ -99,7 +99,7 @@ test('paid community intent uses one compact summary and keeps evidence behind d
   assert.match(html, /<summary/);
 });
 
-test('platform-owned paid pages alone do not present the channel as a paid community', async () => {
+test('platform-owned paid pages alone do not present community intent', async () => {
   const html = await renderDashboard(channel({
     discord_status: 'NOT_FOUND',
     community_discovery_status: 'PAID_COMMUNITY_INDICATED',
@@ -110,10 +110,71 @@ test('platform-owned paid pages alone do not present the channel as a paid commu
     }],
   }));
 
-  assert.doesNotMatch(html, /Paid community/);
-  assert.match(html, /Community indicated \(Whop\) · no invite/);
-  // Stored evidence is still displayed: only the badge is filtered.
-  assert.match(html, /newsroom\.whop\.com\/whop-economic-intelligence/);
+  assert.doesNotMatch(html, /data-testid="community-intent"/);
+  assert.doesNotMatch(html, /Paid community|Community indicated|Additional community/);
+  assert.doesNotMatch(html, /newsroom\.whop\.com/);
+});
+
+test('Live Market Coach corporate pages alone do not present community intent', async () => {
+  const html = await renderDashboard(channel({
+    channel_id: 'live-market-coach',
+    channel_name: 'Live Market Coach',
+    discord_status: 'UNCERTAIN',
+    discord_validation_status: 'RETRY_PENDING',
+    community_discovery_status: 'PAID_COMMUNITY_INDICATED',
+    community_intents: [
+      {
+        ...paidIntent,
+        communityUrl: 'https://whop.com/careers',
+        sourcePageUrl: 'https://whop.com/careers',
+        intent: 'UNKNOWN',
+        paidSignals: [],
+      },
+      {
+        ...paidIntent,
+        communityUrl: 'https://whop.com/login?next=%2F&newUserNext=%2Fstart%3Fnew_user%3D1',
+        sourcePageUrl: 'https://whop.com/login?next=%2F&newUserNext=%2Fstart%3Fnew_user%3D1',
+        intent: 'UNKNOWN',
+        paidSignals: [],
+      },
+      {
+        ...paidIntent,
+        communityUrl: 'https://newsroom.whop.com/whop-economic-intelligence/price',
+        sourcePageUrl: 'https://newsroom.whop.com/whop-economic-intelligence/price',
+      },
+    ],
+  }));
+
+  assert.doesNotMatch(html, /data-testid="community-intent"/);
+  assert.doesNotMatch(html, /Paid community|Community indicated|Additional community/);
+  assert.doesNotMatch(html, /whop\.com\/careers|whop\.com\/login|newsroom\.whop\.com/);
+});
+
+test('Whop asset JSONs with price text do not present a paid community', async () => {
+  const assetIntent = (url: string): CommunityIntentEvidence => ({
+    ...paidIntent,
+    communityUrl: url,
+    sourcePageUrl: url,
+  });
+  const html = await renderDashboard(channel({
+    channel_id: 'gakuna-trading-course',
+    channel_name: 'Gakuna Trading Course',
+    discord_status: 'ACTIVE',
+    discord_invite: 'https://discord.gg/gakuna',
+    discord_discovery_status: 'VALIDATED',
+    discord_validation_status: 'SUCCEEDED',
+    community_discovery_status: 'PAID_COMMUNITY_INDICATED',
+    community_intents: [
+      assetIntent('https://whop.com/_web/assets/gha-39651352868-1/translations/en/checkout-planid-3e0f42-6337b6e753.json'),
+      assetIntent('https://whop.com/_web/assets/gha-39651352868-1/translations/en/root-661470c958.json'),
+      assetIntent('https://whop.com/_web/assets/gha-39651309620-1/translations/en/app-404897-ad4dae54ee.json'),
+    ],
+  }));
+
+  assert.doesNotMatch(html, /data-testid="community-intent"/);
+  assert.doesNotMatch(html, /Paid community|Community indicated|Additional community/);
+  assert.doesNotMatch(html, /_web\/assets/);
+  assert.match(html, /discord\.gg\/gakuna/);
 });
 
 test('creator-specific paid evidence still presents the channel as a paid community', async () => {
@@ -125,6 +186,33 @@ test('creator-specific paid evidence still presents the channel as a paid commun
 
   assert.match(html, /Paid community \(Whop\)/);
   assert.doesNotMatch(html, /Community indicated/);
+});
+
+test('non-paid creator evidence does not inherit a paid badge from a filtered platform page', async () => {
+  const platformPaid: CommunityIntentEvidence = {
+    ...paidIntent,
+    communityUrl: 'https://newsroom.whop.com/whop-economic-intelligence/',
+    sourcePageUrl: 'https://newsroom.whop.com/whop-economic-intelligence/',
+  };
+  const creatorUnpaid: CommunityIntentEvidence = {
+    ...paidIntent,
+    communityPlatform: 'SKOOL',
+    communityUrl: 'https://www.skool.com/creator-community',
+    sourcePageUrl: 'https://creator.test/',
+    intent: 'UNKNOWN',
+    paidSignals: [],
+  };
+  const html = await renderDashboard(channel({
+    discord_status: 'NOT_FOUND',
+    community_discovery_status: 'PAID_COMMUNITY_INDICATED',
+    community_intents: [platformPaid, creatorUnpaid],
+  }));
+
+  assert.doesNotMatch(html, /Paid community/);
+  assert.match(html, /Community indicated \(Skool\) · no invite/);
+  assert.doesNotMatch(html, /\(Whop\)/);
+  assert.doesNotMatch(html, /newsroom\.whop\.com/);
+  assert.match(html, /skool\.com\/creator-community/);
 });
 
 test('mixed platform-owned and creator-specific paid evidence keeps the paid badge', async () => {
@@ -148,6 +236,7 @@ test('mixed platform-owned and creator-specific paid evidence keeps the paid bad
 
   assert.match(html, /Paid community \(Skool\)/);
   assert.doesNotMatch(html, /Community indicated/);
+  assert.doesNotMatch(html, /newsroom\.whop\.com/);
 });
 
 test('a Skool tenant subdomain keeps its creator-specific paid evidence', async () => {
@@ -215,8 +304,8 @@ test('Whop sales and catalog browse pages remain platform-owned', async () => {
     ],
   }));
 
-  assert.doesNotMatch(html, /Paid community/);
-  assert.match(html, /Community indicated \(Whop\) · no invite/);
+  assert.doesNotMatch(html, /data-testid="community-intent"/);
+  assert.doesNotMatch(html, /Paid community|Community indicated|Additional community/);
 });
 
 test('a reserved Skool platform subdomain does not present the channel as paid', async () => {
@@ -231,8 +320,8 @@ test('a reserved Skool platform subdomain does not present the channel as paid',
     }],
   }));
 
-  assert.doesNotMatch(html, /Paid community/);
-  assert.match(html, /Community indicated \(Skool\) · no invite/);
+  assert.doesNotMatch(html, /data-testid="community-intent"/);
+  assert.doesNotMatch(html, /Paid community|Community indicated|Additional community/);
 });
 
 test('a www-prefixed reserved Skool subdomain remains platform-owned', async () => {
@@ -247,8 +336,8 @@ test('a www-prefixed reserved Skool subdomain remains platform-owned', async () 
     }],
   }));
 
-  assert.doesNotMatch(html, /Paid community/);
-  assert.match(html, /Community indicated \(Skool\) · no invite/);
+  assert.doesNotMatch(html, /data-testid="community-intent"/);
+  assert.doesNotMatch(html, /Paid community|Community indicated|Additional community/);
 });
 
 test('a stored intent without a platform value cannot break the table render', async () => {
