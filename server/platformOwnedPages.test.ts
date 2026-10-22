@@ -34,6 +34,11 @@ test('Whop creator pages remain creator-specific', () => {
   }
 });
 
+test('the Skool Games community is not a reserved platform page', () => {
+  assert.equal(isPlatformOwnedCommunityUrl('SKOOL', 'https://www.skool.com/games'), false);
+  assert.equal(isPlatformOwnedCommunityUrl('SKOOL', 'https://skool.com/games/about'), false);
+});
+
 test('other platform tenant communities are not reclassified by Whop asset rules', () => {
   assert.equal(isPlatformOwnedCommunityUrl('SKOOL', 'https://trading.skool.com/atlas'), false);
   assert.equal(isPlatformOwnedCommunityUrl('CIRCLE', 'https://community.circle.so/c/creator'), false);

@@ -36,7 +36,7 @@ const RESERVED_PATHS: Record<CommunityPlatformHost, ReadonlySet<string>> = {
   SKOOL: new Set([
     '', 'about', 'academy', 'affiliates', 'api', 'blog', 'brand', 'careers', 'communities',
     'community-guidelines', 'company', 'contact', 'creators', 'customers', 'developers',
-    'discover', 'download', 'enterprise', 'events', 'features', 'games', 'guidelines',
+    'discover', 'download', 'enterprise', 'events', 'features', 'guidelines',
     'help', 'jobs', 'leaderboard', 'leaderboards', 'legal', 'login', 'newsroom',
     'pricing', 'privacy', 'resources', 'signin', 'signup', 'sitemap', 'status',
     'support', 'terms',
