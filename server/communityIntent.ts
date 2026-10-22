@@ -266,8 +266,21 @@ export function applyCommunityIntentEvidence(
   },
   incoming: CommunityIntentEvidence[] | null | undefined,
 ): boolean {
-  if (!incoming?.length) return false;
-  channel.community_intents = mergeCommunityIntentEvidence(channel.community_intents, incoming);
-  channel.community_discovery_status = resolveCommunityDiscoveryStatus(channel.community_intents);
+  // An empty inspection must not erase creator-specific evidence, but it can
+  // still remove legacy platform-owned rows. Otherwise those rows keep a
+  // PAID_COMMUNITY_INDICATED projection forever when every later inspection
+  // finds no community surface. Non-empty observations merge as before.
+  const cleaned = mergeCommunityIntentEvidence(channel.community_intents, incoming);
+  const projected = resolveCommunityDiscoveryStatus(cleaned);
+  if (!incoming?.length) {
+    const changed = (channel.community_intents?.length || 0) !== cleaned.length
+      || (channel.community_discovery_status || 'NONE') !== projected;
+    if (!changed) return false;
+    channel.community_intents = cleaned;
+    channel.community_discovery_status = projected;
+    return true;
+  }
+  channel.community_intents = cleaned;
+  channel.community_discovery_status = projected;
   return true;
 }

@@ -343,6 +343,43 @@ test('a retained invite and an additional community intent coexist without overw
   assert.equal(channel.community_intents[0].communityUrl, paid[0].communityUrl);
 });
 
+test('an empty inspection removes legacy platform-owned rows without erasing creator evidence', () => {
+  const legacy = (communityUrl: string): CommunityIntentEvidence => ({
+    communityPlatform: 'WHOP',
+    communityUrl,
+    intent: 'PAID',
+    paidSignals: ['price'],
+    privateSignals: [],
+    observedAt: '2026-10-01T00:00:00.000Z',
+    sourcePageUrl: communityUrl,
+    extractionConfidence: 'EXPLICIT',
+  });
+  const creatorIntent: CommunityIntentEvidence = {
+    ...legacy('https://whop.com/discover/creator'),
+    intent: 'UNKNOWN',
+    paidSignals: [],
+  };
+  const platformOnly: any = {
+    community_discovery_status: 'PAID_COMMUNITY_INDICATED',
+    community_intents: [
+      legacy('https://newsroom.whop.com/whop-economic-intelligence/price'),
+      legacy('https://whop.com/_web/assets/gha-39651352868-1/translations/en/root-661470c958.json'),
+    ],
+  };
+  assert.equal(applyCommunityIntentEvidence(platformOnly, []), true);
+  assert.deepEqual(platformOnly.community_intents, []);
+  assert.equal(platformOnly.community_discovery_status, 'NONE');
+
+  const withCreator: any = {
+    community_discovery_status: 'PAID_COMMUNITY_INDICATED',
+    community_intents: [legacy('https://newsroom.whop.com/whop-economic-intelligence/price'), creatorIntent],
+  };
+  assert.equal(applyCommunityIntentEvidence(withCreator, []), true);
+  assert.equal(withCreator.community_intents.length, 1);
+  assert.equal(withCreator.community_intents[0].communityUrl, creatorIntent.communityUrl);
+  assert.equal(withCreator.community_discovery_status, 'COMMUNITY_INDICATED_NO_INVITE');
+});
+
 test('persistence contract: channel community state is stored and read back', () => {
   const db = readSource('dbCore.ts');
   assert.match(db, /community_discovery_status: row\.community_discovery_status === 'COMMUNITY_INDICATED_NO_INVITE' \|\| row\.community_discovery_status === 'PAID_COMMUNITY_INDICATED' \? row\.community_discovery_status : 'NONE'/);
