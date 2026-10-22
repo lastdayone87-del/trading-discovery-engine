@@ -1222,6 +1222,224 @@ export async function finalizeRenderedQueueLifecycle(options: {
   return reclaimRenderedQueueLifecycleListeners(options.emitter, options.ledger);
 }
 
+/** Minimal Playwright route shape used by the rendered guard. Keeping this
+ * structural makes the lifecycle testable without importing Playwright or
+ * requiring a browser launch, while remaining assignment-compatible with
+ * Playwright's Route type. */
+export interface RenderedRouteLike {
+  request(): { url(): string; resourceType(): string };
+  abort(errorCode?: string): Promise<void>;
+  continue(): Promise<void>;
+}
+
+/** Minimal context shape needed by the rendered route guard. */
+export interface RenderedRouteContextLike {
+  unrouteAll(options?: { behavior?: 'default' | 'wait' | 'ignoreErrors' }): Promise<void>;
+}
+
+interface RenderedRouteGuardOptions {
+  /** Same public-destination check used by the crawl. A rejection is treated
+   * as "not allowed" by the caller and therefore fails closed. */
+  isAllowed(rawUrl: string): Promise<boolean>;
+  /** Called only when the destination policy rejects a network request. */
+  onBlocked(): void;
+  /** Optional safe sink for unexpected route failures. It must not throw and
+   * is never called for expected shutdown races. */
+  onUnexpectedRouteError?(error: unknown): void;
+}
+
+export interface RenderedRouteGuard {
+  handler(route: RenderedRouteLike): Promise<void>;
+  /** Idempotent, best-effort removal of the context route. The `ignoreErrors`
+   * behavior tells Playwright to ignore route callbacks that are still in
+   * flight when the context is closed; it deliberately does not wait for
+   * them, so shutdown cannot hang on a slow DNS preflight. */
+  dispose(): Promise<void>;
+}
+
+const RENDERED_NON_NETWORK_RESOURCE_TYPES = new Set(['image', 'media', 'font']);
+
+function renderedRouteErrorText(error: unknown, seen = new Set<unknown>()): string {
+  if (error && typeof error === 'object') {
+    if (seen.has(error)) return '';
+    seen.add(error);
+    const value = error as { name?: unknown; message?: unknown; cause?: unknown };
+    return `${String(value.name || '')} ${String(value.message || '')} ${renderedRouteErrorText(value.cause, seen)}`.toLowerCase();
+  }
+  return String(error || '').toLowerCase();
+}
+
+/**
+ * Returns true only for lifecycle races in which Playwright already closed the
+ * page/context/browser or completed the route. These are expected during
+ * shutdown and must not be reported as routing/security failures. Other route
+ * errors still follow the fail-closed path in the guard.
+ */
+export function isExpectedRenderedRouteShutdownError(error: unknown): boolean {
+  const text = renderedRouteErrorText(error);
+  return /targetclosed|target (page|context|browser).*closed|(page|context|browser) (has been|is|was) closed|route (is )?already handled|request (is )?already handled|session (has been|is) closed|connection (has been|is) closed/.test(text);
+}
+
+function reportUnexpectedRenderedRouteError(
+  error: unknown,
+  onUnexpectedRouteError: ((error: unknown) => void) | undefined,
+): void {
+  try {
+    onUnexpectedRouteError?.(error);
+  } catch {
+    // Diagnostics must never break the route callback or reopen the request.
+  }
+}
+
+async function settleRenderedRoute(
+  route: RenderedRouteLike,
+  action: 'abort' | 'continue',
+  errorCode?: string,
+  onUnexpectedRouteError?: (error: unknown) => void,
+): Promise<void> {
+  try {
+    if (action === 'abort') {
+      await route.abort(errorCode);
+    } else {
+      await route.continue();
+    }
+  } catch (error) {
+    if (isExpectedRenderedRouteShutdownError(error)) return;
+    reportUnexpectedRenderedRouteError(error, onUnexpectedRouteError);
+    // The callback must never reject: Playwright reports a rejected route
+    // callback as a process-level unhandled error. If continue failed for an
+    // unrelated reason, fail closed instead of allowing the request through.
+    if (action !== 'abort') {
+      try {
+        await route.abort('failed');
+      } catch (abortError) {
+        if (!isExpectedRenderedRouteShutdownError(abortError)) {
+          reportUnexpectedRenderedRouteError(abortError, onUnexpectedRouteError);
+        }
+        // The route is already unusable; there is no safe action left. Do
+        // not rethrow from the callback and take down the crawler process.
+      }
+    }
+  }
+}
+
+/**
+ * Builds a context-wide route handler that enforces the rendered-tier public
+ * destination check and survives context/browser shutdown.
+ *
+ * The handler is intentionally the only place that settles routes. It fails
+ * closed on unexpected errors and treats target-closed/already-handled races
+ * as benign. `dispose` is idempotent and safe to call repeatedly from browser
+ * close hooks and the crawl finally.
+ */
+export function createRenderedRouteGuard(
+  context: RenderedRouteContextLike,
+  options: RenderedRouteGuardOptions,
+): RenderedRouteGuard {
+  let disposed = false;
+  let disposePromise: Promise<void> | undefined;
+
+  const handler = async (route: RenderedRouteLike): Promise<void> => {
+    if (disposed) {
+      await settleRenderedRoute(route, 'abort', 'failed', options.onUnexpectedRouteError);
+      return;
+    }
+    let request: ReturnType<RenderedRouteLike['request']>;
+    try {
+      request = route.request();
+    } catch (error) {
+      // The classifier also matches generic resolver or socket-close text, so
+      // it is only used to suppress noisy lookup reports here. Still attempt a
+      // fail-closed abort; settleRenderedRoute treats an already-handled or
+      // already-closed route as benign. A shutdown-looking error from the
+      // destination check below is handled by the outer catch without a
+      // classifier short-circuit.
+      if (!isExpectedRenderedRouteShutdownError(error)) {
+        reportUnexpectedRenderedRouteError(error, options.onUnexpectedRouteError);
+      }
+      await settleRenderedRoute(route, 'abort', 'failed', options.onUnexpectedRouteError);
+      return;
+    }
+    try {
+      if (RENDERED_NON_NETWORK_RESOURCE_TYPES.has(request.resourceType())) {
+        await settleRenderedRoute(route, 'abort', undefined, options.onUnexpectedRouteError);
+        return;
+      }
+      if (!(await options.isAllowed(request.url()))) {
+        options.onBlocked();
+        await settleRenderedRoute(route, 'abort', 'blockedbyclient', options.onUnexpectedRouteError);
+        return;
+      }
+      await settleRenderedRoute(route, 'continue', undefined, options.onUnexpectedRouteError);
+    } catch (error) {
+      reportUnexpectedRenderedRouteError(error, options.onUnexpectedRouteError);
+      // Unknown routing/security failures are never allowed to open the
+      // request path or escape as an unhandled rejection. If the browser has
+      // already gone away, settleRenderedRoute treats the abort rejection as
+      // a benign shutdown race.
+      await settleRenderedRoute(route, 'abort', 'failed', options.onUnexpectedRouteError);
+    }
+  };
+
+  return {
+    handler,
+    dispose(): Promise<void> {
+      if (!disposePromise) {
+        disposed = true;
+        disposePromise = (async () => {
+          try {
+            await context.unrouteAll({ behavior: 'ignoreErrors' });
+          } catch {
+            // Contexts can already be gone when a browser is retired. Cleanup
+            // is best-effort and must not alter the crawl result or crash the
+            // process; the handler remains fail-closed if the route survives.
+          }
+        })();
+      }
+      return disposePromise;
+    },
+  };
+}
+
+/** Dispose every context guard. Repeated calls are safe because each guard
+ * memoizes its disposal promise. */
+export async function disposeRenderedRouteGuards(guards: Iterable<RenderedRouteGuard>): Promise<void> {
+  await Promise.all([...guards].map(guard => guard.dispose()));
+}
+
+/**
+ * Installs a context/browser close wrapper that removes the route before the
+ * target closes. Playwright does not expose a context-close hook, so wrapping
+ * the object's close method is the lifecycle point that is guaranteed to run
+ * for both browser-pool retirement and normal crawler teardown.
+ *
+ * The wrapper is installed once per target, preserves close arguments, and
+ * runs cleanup even if the original close fails. Cleanup itself is idempotent.
+ */
+const renderedCloseCleanupTargets = new WeakSet<object>();
+
+export function installRenderedRouteCloseCleanup<T extends { close(...args: any[]): Promise<void> }>(
+  target: T,
+  dispose: () => Promise<void>,
+): void {
+  if (renderedCloseCleanupTargets.has(target)) return;
+  const originalClose = target.close.bind(target);
+  let closePromise: Promise<void> | undefined;
+  target.close = async (...args: any[]): Promise<void> => {
+    if (!closePromise) {
+      closePromise = (async () => {
+        try {
+          await dispose();
+        } finally {
+          await originalClose(...args);
+        }
+      })();
+    }
+    return closePromise;
+  };
+  renderedCloseCleanupTargets.add(target);
+}
+
 /** Expensive Tier-2 acquisition. Finding one invite no longer terminates the
  * rendered crawl: every invite visible within the bounded page/click budget is
  * retained so ownership can be decided after acquisition. */
@@ -1353,6 +1571,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
       const queueListenerLedger = captureRenderedQueueLifecycleListeners(queueEventEmitter);
       let isolated: { name: string; queue: InstanceType<typeof RequestQueue> } | undefined;
       let egressProxy: BrowserEgressProxy | undefined;
+      const renderedRouteGuards = new Map<object, RenderedRouteGuard>();
       try {
         // Per-invocation isolated queue: never the process-default persisted
         // queue (see openIsolatedRenderedRequestQueue). Dropped in the finally
@@ -1391,21 +1610,6 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         // following cannot skip the destination check even though the route
         // layer only sees the initial URL. The proxy is also the DNS-pinning
         // enforcement point; this handler is the earlier URL preflight.
-        const routedContexts = new WeakSet<object>();
-        const renderedRouteHandler = async (route: any): Promise<void> => {
-          const request = route.request();
-          const type = request.resourceType();
-          if (['image', 'media', 'font'].includes(type)) {
-            await route.abort();
-            return;
-          }
-          if (!(await renderedRequestAllowed(request.url()))) {
-            telemetry.blockedRequests++;
-            await route.abort('blockedbyclient');
-            return;
-          }
-          await route.continue();
-        };
         const launchOptions = browserLaunchOptions();
         const crawler = new PlaywrightCrawler({
           requestQueue: isolated.queue,
@@ -1434,9 +1638,26 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           },
           preNavigationHooks: [async ({ page }) => {
             const context = page.context();
-            if (!routedContexts.has(context)) {
-              routedContexts.add(context);
-              await context.route('**/*', renderedRouteHandler);
+            if (!renderedRouteGuards.has(context)) {
+              const guard = createRenderedRouteGuard(context, {
+                isAllowed: renderedRequestAllowed,
+                onBlocked: () => { telemetry.blockedRequests++; },
+                onUnexpectedRouteError: error => {
+                  const cause = browserCauseSnippet(error, 300);
+                  console.warn(`[RenderedRoute] unexpected route failure; request aborted${cause ? `: ${cause}` : ''}`);
+                },
+              });
+              renderedRouteGuards.set(context, guard);
+              try {
+                await context.route('**/*', guard.handler);
+                // Install the close wrapper only after the route exists so a
+                // failed install never leaves a stale close disposer behind.
+                installRenderedRouteCloseCleanup(context, () => guard.dispose());
+              } catch (error) {
+                renderedRouteGuards.delete(context);
+                await guard.dispose();
+                throw error;
+              }
             }
           }],
           errorHandler: async ({ request, session }, error) => {
@@ -1834,7 +2055,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         // construction added (see the capture above), so the dropped queue and
         // its ~16 MB deduplication cache become collectable. Runs on every
         // path, including open failures and drop failures; it never affects
-        // the crawl result.
+        // the crawl result. The normal browser-close wrapper normally unwinds
+        // the context route already; this is the launch-failure/fallback path.
+        await disposeRenderedRouteGuards(renderedRouteGuards.values());
         try {
           await finalizeRenderedQueueLifecycle({
             queue: isolated?.queue,
