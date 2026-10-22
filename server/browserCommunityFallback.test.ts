@@ -507,6 +507,43 @@ test('route guard fails closed when the destination check itself rejects', async
   assert.deepEqual(actions, ['abort:failed']);
 });
 
+test('route guard fails closed when destination resolution rejects with shutdown-looking text', async () => {
+  const actions: string[] = [];
+  const unexpected: unknown[] = [];
+  const guard = createRenderedRouteGuard(
+    { unrouteAll: async () => {} },
+    {
+      isAllowed: async () => { throw new Error('connection closed by resolver'); },
+      onBlocked: () => {},
+      onUnexpectedRouteError: error => { unexpected.push(error); },
+    },
+  );
+
+  await guard.handler(routeLike('https://public.example/', 'document', async (name, code) => { actions.push(`${name}:${code || ''}`); }));
+
+  assert.deepEqual(actions, ['abort:failed']);
+  assert.equal(unexpected.length, 1);
+  assert.match(String(unexpected[0]), /connection closed by resolver/);
+});
+
+test('route guard skips settlement when the route lookup is already handled', async () => {
+  const actions: string[] = [];
+  const unexpected: unknown[] = [];
+  const guard = createRenderedRouteGuard(
+    { unrouteAll: async () => {} },
+    { isAllowed: async () => true, onBlocked: () => {}, onUnexpectedRouteError: error => { unexpected.push(error); } },
+  );
+
+  await guard.handler({
+    request: () => { throw new Error('Route is already handled!'); },
+    abort: async (code?: string) => { actions.push(`abort:${code || ''}`); },
+    continue: async () => { actions.push('continue'); },
+  });
+
+  assert.deepEqual(actions, []);
+  assert.equal(unexpected.length, 0);
+});
+
 test('route shutdown classifier accepts expected close races but not policy failures', () => {
   assert.equal(isExpectedRenderedRouteShutdownError(new Error('TargetClosedError2: Target page, context or browser has been closed')), true);
   assert.equal(isExpectedRenderedRouteShutdownError(new Error('route.continue: Target page, context or browser has been closed')), true);

@@ -1344,8 +1344,20 @@ export function createRenderedRouteGuard(
       await settleRenderedRoute(route, 'abort', 'failed', options.onUnexpectedRouteError);
       return;
     }
+    let request: ReturnType<RenderedRouteLike['request']>;
     try {
-      const request = route.request();
+      request = route.request();
+    } catch (error) {
+      // Only route lookup itself may be skipped for a lifecycle race. A
+      // shutdown-looking error from the destination check below must still
+      // fail closed, because the classifier also matches generic resolver or
+      // socket-close text.
+      if (isExpectedRenderedRouteShutdownError(error)) return;
+      reportUnexpectedRenderedRouteError(error, options.onUnexpectedRouteError);
+      await settleRenderedRoute(route, 'abort', 'failed', options.onUnexpectedRouteError);
+      return;
+    }
+    try {
       if (RENDERED_NON_NETWORK_RESOURCE_TYPES.has(request.resourceType())) {
         await settleRenderedRoute(route, 'abort', undefined, options.onUnexpectedRouteError);
         return;
@@ -1357,10 +1369,11 @@ export function createRenderedRouteGuard(
       }
       await settleRenderedRoute(route, 'continue', undefined, options.onUnexpectedRouteError);
     } catch (error) {
-      if (isExpectedRenderedRouteShutdownError(error)) return;
       reportUnexpectedRenderedRouteError(error, options.onUnexpectedRouteError);
       // Unknown routing/security failures are never allowed to open the
-      // request path or escape as an unhandled rejection.
+      // request path or escape as an unhandled rejection. If the browser has
+      // already gone away, settleRenderedRoute treats the abort rejection as
+      // a benign shutdown race.
       await settleRenderedRoute(route, 'abort', 'failed', options.onUnexpectedRouteError);
     }
   };
