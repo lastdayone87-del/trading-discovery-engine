@@ -569,10 +569,10 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                     </td>
 
                     {/* Discord Status & Link */}
-                    <td className="min-w-[220px] max-w-[240px] py-2 px-3 align-top">
-                      <div data-testid="discord-cell" className="text-[10px] leading-4">
-                        <div className="flex min-w-0 items-center gap-1.5">
-                          <span className={`inline-flex shrink-0 items-center rounded-full px-1.5 py-0.5 text-[9px] font-bold leading-none ${
+                    <td className="min-w-[290px] max-w-[310px] py-2 px-3 align-top">
+                      <div data-testid="discord-cell" className="text-[11px] leading-5">
+                        <div className="flex min-w-0 items-start gap-1.5">
+                          <span className={`mt-0.5 inline-flex shrink-0 items-center rounded-full px-1.5 py-0.5 text-[10px] font-bold leading-none ${
                             c.discord_status === 'ACTIVE'
                               ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/80 dark:text-emerald-300'
                               : c.discord_status === 'ACTIVE_LOW_VOLUME'
@@ -596,17 +596,17 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                                 target="_blank"
                                 rel="noreferrer"
                                 title={c.discord_invite}
-                                className="min-w-0 flex-1 truncate font-mono text-[10px] font-semibold text-indigo-600 hover:underline dark:text-indigo-400"
+                                className="min-w-0 flex-1 break-all font-mono text-[11px] font-semibold text-indigo-600 hover:underline dark:text-indigo-400"
                               >
                                 {c.discord_invite.replace(/^https?:\/\//, '').replace(/^www\./, '')}
                               </a>
                               <button
                                 onClick={() => handleCopyLink(c.discord_invite!, c.channel_id)}
-                                className="shrink-0 p-0.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+                                className="mt-0.5 shrink-0 p-0.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
                                 title="Copy link"
                                 aria-label="Copy Discord invite"
                               >
-                                {copiedId === c.channel_id ? <Check className="h-3 w-3 text-emerald-500" /> : <Copy className="h-3 w-3" />}
+                                {copiedId === c.channel_id ? <Check className="h-3.5 w-3.5 text-emerald-500" /> : <Copy className="h-3.5 w-3.5" />}
                               </button>
                             </>
                           )}
@@ -615,7 +615,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                         {communityIntent.present && (
                           <details data-testid="community-intent" className="group border-l-2 border-amber-400 pl-1.5">
                             <summary className="flex cursor-pointer list-none items-center gap-1 [&::-webkit-details-marker]:hidden">
-                              <ChevronRight className="h-3 w-3 shrink-0 text-amber-500 transition-transform group-open:rotate-90" aria-hidden="true" />
+                              <ChevronRight className="h-3.5 w-3.5 shrink-0 text-amber-500 transition-transform group-open:rotate-90" aria-hidden="true" />
                               <span className={`truncate font-bold ${communityIntent.tone === 'paid' ? 'text-amber-800 dark:text-amber-300' : 'text-sky-800 dark:text-sky-300'}`}>
                                 {communityIntent.label}
                               </span>
