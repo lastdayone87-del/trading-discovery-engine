@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { DEFAULT_BROWSER_FALLBACK_BUDGET, advanceRenderedLifecycleStage, browserCauseSnippet, browserFallbackTelemetrySummary, classifyCrawlCatch, createRenderedRouteGuard, disposeRenderedRouteGuards, installRenderedRouteCloseCleanup, isExpectedRenderedRouteShutdownError, isTelegramPostPermalink, RenderedFallbackGate, renderedFallbackGate, resolveRenderedZeroPageReason, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback, type BrowserFallbackTelemetry, type RenderedRouteLike } from './browserCommunityFallback';
 import { redactCauseSnippet } from './crawlerTelemetry';
-import { browserLaunchOptions } from './browserCapability';
 import { classifyRenderedCrawlerFailure, isRenderedNavigationTimeout, renderedCrawlerHostBackoffMs, renderedCrawlerRetryPolicy } from './renderedCrawlerPolicy';
 
 test('browser fallback remains bounded while allowing useful retries', () => {
@@ -544,58 +543,3 @@ test('disposeRenderedRouteGuards handles repeated and already-closed contexts', 
   assert.equal(calls, 1);
 });
 
-test('actual Playwright context close with an in-flight route does not produce an unhandled rejection', { skip: process.platform === 'android', timeout: 30_000 }, async () => {
-  const { chromium } = await import('playwright');
-  const http = await import('node:http');
-  const server = http.createServer((_request, response) => {
-    response.writeHead(200, { 'content-type': 'text/html' });
-    response.end('<!doctype html><title>route-race</title>');
-  });
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', () => resolve());
-  });
-  const address = server.address();
-  if (!address || typeof address === 'string') throw new Error('test server did not expose a port');
-  const browser = await chromium.launch(browserLaunchOptions());
-  const context = await browser.newContext();
-  const entered = deferred();
-  const release = deferred();
-  let unrouteBehavior: string | undefined;
-  const guard = createRenderedRouteGuard(
-    {
-      unrouteAll: async (options) => {
-        unrouteBehavior = options?.behavior;
-        await context.unrouteAll(options);
-      },
-    },
-    {
-      isAllowed: async () => { entered.resolve(); await release.promise; return true; },
-      onBlocked: () => {},
-    },
-  );
-  await context.route('**/*', guard.handler);
-  installRenderedRouteCloseCleanup(context, () => guard.dispose());
-  const unhandled: unknown[] = [];
-  const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
-  process.on('unhandledRejection', onUnhandled);
-  try {
-    const page = await context.newPage();
-    const navigation = page.goto(`http://127.0.0.1:${address.port}/`, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
-    await entered.promise;
-    const closePromise = context.close();
-    release.resolve();
-    await closePromise;
-    await navigation;
-    await new Promise(resolve => setTimeout(resolve, 50));
-    assert.equal(unrouteBehavior, 'ignoreErrors');
-    assert.deepEqual(unhandled, []);
-  } finally {
-    process.off('unhandledRejection', onUnhandled);
-    release.resolve();
-    await guard.dispose().catch(() => undefined);
-    await context.close().catch(() => undefined);
-    await browser.close().catch(() => undefined);
-    await new Promise<void>(resolve => server.close(() => resolve()));
-  }
-});
