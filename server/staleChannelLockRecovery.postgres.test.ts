@@ -411,6 +411,12 @@ maybe('review rejection and worker terminal update do not deadlock', async t => 
     } catch (error) {
       throw new Error(`worker terminal update did not complete while rejection waited: ${error instanceof Error ? error.message : String(error)}`);
     }
+    const triggered = await worker.query(`SELECT scan_status FROM channels WHERE channel_id=$1`, [channelId]);
+    assert.equal(
+      triggered.rows[0]?.scan_status,
+      'PENDING',
+      'the terminal update must fire migration 153 and release the abandoned channel lock',
+    );
     await worker.query('COMMIT');
     workerCommitted = true;
     const outcome = await reviewOutcome;
