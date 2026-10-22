@@ -437,6 +437,35 @@ test('duplicate ownership with a stored invite keeps the selected-invite wording
   assert.match(html, /discord\.gg\/duplicate/);
 });
 
+test('found age stays visible above an expandable duplicate-owner summary', async () => {
+  const owner = channel({ channel_id: 'UC_owner_other', channel_name: 'OFM' });
+  const duplicate = channel({
+    channel_id: 'UC_duplicate',
+    channel_name: 'Duplicate Creator',
+    discord_status: 'ACTIVE_LOW_VOLUME',
+    discord_invite: 'https://discord.gg/party-in-cosmic-horizon',
+    discord_invite_first_validated_at: new Date(Date.now() - 9 * 60 * 60 * 1000).toISOString(),
+    discord_duplicate_owner_channel_id: owner.channel_id,
+    community_discovery_status: 'COMMUNITY_INDICATED_NO_INVITE',
+    community_intents: [{ ...paidIntent, intent: 'UNKNOWN', paidSignals: [] }],
+  });
+  const html = await renderChannels([duplicate, owner]);
+  const cellStart = html.indexOf('data-testid="discord-cell"');
+  const duplicateStart = html.indexOf('data-testid="duplicate-owned-invite"');
+  assert.ok(cellStart >= 0 && duplicateStart > cellStart, 'duplicate-owner summary should follow the direct cell content');
+  const directCell = html.slice(cellStart, duplicateStart);
+
+  assert.match(directCell, /data-testid="discord-found-age"/);
+  assert.match(directCell, /Found 9h ago/);
+  assert.ok(
+    directCell.indexOf('discord.gg/party-in-cosmic-horizon') < directCell.indexOf('Found 9h ago'),
+    'invite should appear before the always-visible found-age line',
+  );
+  assert.match(directCell, /aria-label="Copy Discord invite"/);
+  assert.match(html, /min-w-\[280px\]/);
+  assert.match(html, /Second invite owned elsewhere/);
+});
+
 test('duplicate owner name falls back to the loaded owner row and links to that row', async () => {
   const owner = channel({ channel_id: 'UC_owner_other', channel_name: 'OFM' });
   const duplicate = channel({

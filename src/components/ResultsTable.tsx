@@ -80,6 +80,11 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
     return matchesSearch && matchesCountry && matchesCountryStatus && matchesTradingStatus && matchesDiscordStatus && matchesScanStatus && matchesLowAudienceVisibility && matchesReviewView && matchesRecentInvites;
   }),[channels,searchTerm,selectedCountry,selectedCountryStatus,selectedTradingStatus,selectedDiscordStatus,selectedScanStatus,pendingReviewOnly,decidedChannelIds,recentInvites]);
 
+  const hasLongDiscordInvite = useMemo(()=>filteredChannels.some(c => {
+    const invite = c.discord_invite;
+    return Boolean(invite && invite.replace(/^https?:\/\//, '').replace(/^www\./, '').length > 24);
+  }),[filteredChannels]);
+
   const visibleChannelIds = useMemo(()=>new Set(filteredChannels.map(c=>c.channel_id)),[filteredChannels]);
 
   const handleCopyLink = (url: string, id: string) => {
@@ -397,17 +402,6 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                     : 'Not discovered';
                   const discordExpandedDetails = (
                     <div className="mt-1 space-y-0.5 border-t border-slate-200 pt-1 text-slate-600 dark:border-slate-700 dark:text-slate-300">
-                      {c.discord_invite && (foundAge || recentInvites) && (
-                        <div
-                          data-testid="discord-found-age"
-                          className={foundAge ? 'font-medium text-emerald-700 dark:text-emerald-400' : 'text-slate-500 dark:text-slate-400'}
-                          title={c.discord_invite_first_validated_at
-                            ? `First successful validation: ${new Date(c.discord_invite_first_validated_at).toLocaleString()}`
-                            : 'No trustworthy successful validation timestamp is recorded for this invite.'}
-                        >
-                          {foundAge || 'Found time unavailable'}
-                        </div>
-                      )}
                       {c.discord_liveness_status && c.discord_liveness_status !== 'NOT_CHECKED' && <div>Liveness: <b>{c.discord_liveness_status.replaceAll('_', ' ')}</b></div>}
                       {c.discord_relevance_status && c.discord_relevance_status !== 'NOT_CHECKED' && <div>Relevance: <b>{c.discord_relevance_status.replaceAll('_', ' ')}</b></div>}
                       {retryReconciliationRequired && <div className="font-semibold text-rose-600" title={retryReconciliationReason}>{retryReconciliationLabel || 'STALE_RETRY · RECONCILIATION REQUIRED'} · reason: {retryReasonLabel}</div>}
@@ -569,10 +563,10 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                     </td>
 
                     {/* Discord Status & Link */}
-                    <td className="min-w-[290px] max-w-[310px] py-2 px-3 align-top">
+                    <td className={`${hasLongDiscordInvite ? 'min-w-[280px] max-w-[300px]' : 'min-w-[220px] max-w-[240px]'} py-2 px-3 align-top`}>
                       <div data-testid="discord-cell" className="text-[11px] leading-5">
-                        <div className="flex min-w-0 items-start gap-1.5">
-                          <span className={`mt-0.5 inline-flex shrink-0 items-center rounded-full px-1.5 py-0.5 text-[10px] font-bold leading-none ${
+                        <div className="flex min-w-0 items-start">
+                          <span className={`inline-flex shrink-0 items-center rounded-full px-1.5 py-0.5 text-[10px] font-bold leading-none ${
                             c.discord_status === 'ACTIVE'
                               ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/80 dark:text-emerald-300'
                               : c.discord_status === 'ACTIVE_LOW_VOLUME'
@@ -589,28 +583,41 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                           }`}>
                             {c.discord_status}
                           </span>
-                          {c.discord_invite && (
-                            <>
-                              <a
-                                href={c.discord_invite}
-                                target="_blank"
-                                rel="noreferrer"
-                                title={c.discord_invite}
-                                className="min-w-0 flex-1 break-all font-mono text-[11px] font-semibold text-indigo-600 hover:underline dark:text-indigo-400"
-                              >
-                                {c.discord_invite.replace(/^https?:\/\//, '').replace(/^www\./, '')}
-                              </a>
-                              <button
-                                onClick={() => handleCopyLink(c.discord_invite!, c.channel_id)}
-                                className="mt-0.5 shrink-0 p-0.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
-                                title="Copy link"
-                                aria-label="Copy Discord invite"
-                              >
-                                {copiedId === c.channel_id ? <Check className="h-3.5 w-3.5 text-emerald-500" /> : <Copy className="h-3.5 w-3.5" />}
-                              </button>
-                            </>
-                          )}
                         </div>
+
+                        {c.discord_invite && (
+                          <div className="mt-0.5 flex min-w-0 items-start gap-1.5">
+                            <a
+                              href={c.discord_invite}
+                              target="_blank"
+                              rel="noreferrer"
+                              title={c.discord_invite}
+                              className="min-w-0 flex-1 break-all font-mono text-[11px] font-semibold text-indigo-600 hover:underline dark:text-indigo-400"
+                            >
+                              {c.discord_invite.replace(/^https?:\/\//, '').replace(/^www\./, '')}
+                            </a>
+                            <button
+                              onClick={() => handleCopyLink(c.discord_invite!, c.channel_id)}
+                              className="mt-0.5 shrink-0 p-0.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+                              title="Copy link"
+                              aria-label="Copy Discord invite"
+                            >
+                              {copiedId === c.channel_id ? <Check className="h-3.5 w-3.5 text-emerald-500" /> : <Copy className="h-3.5 w-3.5" />}
+                            </button>
+                          </div>
+                        )}
+
+                        {c.discord_invite && (foundAge || recentInvites) && (
+                          <div
+                            data-testid="discord-found-age"
+                            className={`mt-0.5 ${foundAge ? 'font-medium text-emerald-700 dark:text-emerald-400' : 'text-slate-500 dark:text-slate-400'}`}
+                            title={c.discord_invite_first_validated_at
+                              ? `First successful validation: ${new Date(c.discord_invite_first_validated_at).toLocaleString()}`
+                              : 'No trustworthy successful validation timestamp is recorded for this invite.'}
+                          >
+                            {foundAge || 'Found time unavailable'}
+                          </div>
+                        )}
 
                         {communityIntent.present && (
                           <details data-testid="community-intent" className="group border-l-2 border-amber-400 pl-1.5">
