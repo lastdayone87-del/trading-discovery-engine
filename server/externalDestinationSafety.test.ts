@@ -443,6 +443,15 @@ test('static SSRF block is terminal and never escalates to rendered fallback', a
   const blocked = (result.acquisitionOutcomes || []).filter(item => item.failureClass === 'SSRF_BLOCKED');
   assert.ok(blocked.length >= 1, 'the block remains visible in acquisition outcomes');
   assert.ok(blocked.every(item => item.retryable === false), 'SSRF blocks are non-retryable');
+  assert.ok(
+    blocked.some(item => item.required === true && item.requestedUrl === 'https://internal.example/community'),
+    'a blocked seed is a required channel-level failure',
+  );
+  assert.equal(
+    result.acquisitionStatus,
+    'ACQUISITION_FAILED',
+    'a seed that was never inspected must not report a definitive no-match',
+  );
 });
 
 test('rendered fallback refuses a private seed before launching a browser', async () => {

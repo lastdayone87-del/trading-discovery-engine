@@ -1134,7 +1134,22 @@ export function formatLinkedWebsiteAcquisitionSummary(summary: LinkedWebsiteAcqu
 }
 
 export async function runChannelInspection(channelData:{enableDebug?:boolean;channelId:string;channelName?:string;channelBio:string;channelLinks?:string[];pinnedComment?:string;videoDescriptions?:string[];socialLinks?:string[];youtubeUrl?:string;forceLiveFetch?:boolean;liveChannelDataLoader?:typeof fetchLiveYouTubeChannelData;recentVideoDescriptionsLoader?:(channelId:string)=>Promise<Array<string|{videoId?:string|null;description?:string|null}>>;externalFetchImpl?:typeof fetch;destinationResolver?:DnsResolver;creatorLikelyTrading?:boolean;renderedFallback?:(seedUrl:string,budget?:Partial<BrowserFallbackBudget>)=>Promise<BrowserFallbackResult>;urlFailureHistoryLoader?:(channelId:string,urls?:string[])=>Promise<UrlFailureRow[]>;siteInspectionStore?:SiteInspectionStore;bypassBorrowedCoverage?:boolean;scanAttempts?:number;clickOffsets?:Record<string,number>;}):Promise<InspectionResult>{
-  const steps:InspectionStep[]=[];const now=new Date().toISOString();let extractedThumbnailUrl:string|undefined;const acquisitionOutcomes:ExternalAcquisitionObservation[]=[];let acquiredAboutUrl:string|undefined;const acquiredRecentDescriptionSurfaces:string[]=[];let debugLog:any=channelData.enableDebug?{rawAboutPageHtml:null,fetchLog:null,extractedUrls:[],redirectsFollowed:[],discordRegexAttempts:[],failureStep:null}:undefined;let bio=channelData.channelBio||'',links=channelData.channelLinks||[],videoDescs=channelData.videoDescriptions||[];let creatorLikelyTrading=channelData.creatorLikelyTrading,creatorName=channelData.channelName||'';
+  const steps:InspectionStep[]=[];const now=new Date().toISOString();let extractedThumbnailUrl:string|undefined;
+  const markSsrfSeedRequired = (observations: ExternalAcquisitionObservation[], seedUrl: string): void => {
+    const key = normalizeVisitUrl(seedUrl);
+    for (const obs of observations) {
+      if (String(obs.failureClass || '') !== 'SSRF_BLOCKED') continue;
+      if (normalizeVisitUrl(String(obs.requestedUrl || '')) !== key) continue;
+      // A blocked seed is a required acquisition failure even though normal
+      // static website observations are optional. It was not inspected, so a
+      // channel-level INSPECTED_NO_MATCH would be a false negative.
+      obs.required = true;
+      obs.retryable = false;
+      obs.detail = `${obs.detail}; destination block is a required channel-level failure`;
+    }
+  };
+
+  const acquisitionOutcomes:ExternalAcquisitionObservation[]=[];let acquiredAboutUrl:string|undefined;const acquiredRecentDescriptionSurfaces:string[]=[];let debugLog:any=channelData.enableDebug?{rawAboutPageHtml:null,fetchLog:null,extractedUrls:[],redirectsFollowed:[],discordRegexAttempts:[],failureStep:null}:undefined;let bio=channelData.channelBio||'',links=channelData.channelLinks||[],videoDescs=channelData.videoDescriptions||[];let creatorLikelyTrading=channelData.creatorLikelyTrading,creatorName=channelData.channelName||'';
   if((creatorLikelyTrading===undefined||!creatorName)&&channelData.channelId){try{const stored=await getChannelById(channelData.channelId);if(creatorLikelyTrading===undefined)creatorLikelyTrading=stored?.trading_status==='TRADING_CONFIRMED';if(!creatorName)creatorName=stored?.channel_name||'';}catch{if(creatorLikelyTrading===undefined)creatorLikelyTrading=false;}}creatorLikelyTrading=creatorLikelyTrading===true;
   // Per-seed rendered rotation state. Retry jobs carry the durable map in
   // their payload; initial scans fall back to the legacy channel attempt
@@ -1797,6 +1812,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   const staticSsrfBarrier = crawlRes.observations.some(o =>
     String(o.failureClass || '') === 'SSRF_BLOCKED' &&
     normalizeVisitUrl(String(o.requestedUrl || '')) === normalizeVisitUrl(item.url));
+  if (staticSsrfBarrier) markSsrfSeedRequired(crawlRes.observations, item.url);
   const staticTerminalBarrier = staticSsrfBarrier || (loginSemantics && crawlRes.observations.some(o =>
     (o.outcome === 'PARTIALLY_INSPECTED' || o.outcome === 'ACQUISITION_FAILED') &&
     (String(o.failureClass || '') === LOGIN_WALL_FAILURE_CLASS ||
@@ -1893,6 +1909,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
     const socialSsrfBarrier = crawlRes.observations.some(o =>
       String(o.failureClass || '') === 'SSRF_BLOCKED' &&
       normalizeVisitUrl(String(o.requestedUrl || '')) === normalizeVisitUrl(item.url));
+    if (socialSsrfBarrier) markSsrfSeedRequired(crawlRes.observations, item.url);
     const socialTerminalBarrier = socialSsrfBarrier || (socialLoginSemantics && crawlRes.observations.some(o =>
       (o.outcome === 'PARTIALLY_INSPECTED' || o.outcome === 'ACQUISITION_FAILED') &&
       (String(o.failureClass || '') === 'LOGIN_WALL' ||

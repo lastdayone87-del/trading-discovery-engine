@@ -941,6 +941,9 @@ export interface ProfilerDeps {
    * shared public-destination deadline; callers with a shorter fetch budget
    * can pass it here. */
   dnsTimeoutMs?: number;
+  /** Test/embedding override for the whole-profile budget. Production uses
+   * PROFILER_FETCH_TIMEOUT_MS (10s). */
+  profileTimeoutMs?: number;
 }
 
 function provenanceFor(sourceUrl: string, fetchedAt: string, method: string): FieldProvenance {
@@ -955,6 +958,7 @@ function provenanceFor(sourceUrl: string, fetchedAt: string, method: string): Fi
 export type SiteProfilerRunResult =
   | { status: 'DISABLED'; profile: null }
   | { status: 'BLOCKED'; profile: null; reason: PublicDestinationReason; hostname?: string }
+  | { status: 'INCOMPLETE'; profile: SiteProfile; reason: 'BUDGET_EXHAUSTED' }
   | { status: 'PROFILED'; profile: SiteProfile };
 
 export async function runSiteProfiler(
@@ -967,8 +971,18 @@ export async function runSiteProfiler(
   // fetch. Without this, a 3s admission lookup would add to every fetch timer
   // and could hold a profile for 13s or more.
   const profileStartedAt = Date.now();
+  const profileTimeoutMs = Math.max(1, Math.trunc(deps.profileTimeoutMs ?? PROFILER_FETCH_TIMEOUT_MS));
   const remainingProfileBudgetMs = (): number =>
-    Math.max(1, PROFILER_FETCH_TIMEOUT_MS - (Date.now() - profileStartedAt));
+    Math.max(1, profileTimeoutMs - (Date.now() - profileStartedAt));
+  const profileBudgetExpired = (): boolean => Date.now() - profileStartedAt >= profileTimeoutMs;
+  // A profile that ran out of its shared budget must not be stored as a
+  // complete PROFILED result: the caller would then skip the missing
+  // sitemap/feed inventory until an unrelated refresh. Return INCOMPLETE so
+  // the seed remains eligible for another attempt.
+  let budgetStoppedWork = false;
+  const noteProfileBudget = (): void => {
+    if (profileBudgetExpired()) budgetStoppedWork = true;
+  };
   // The profiler is a fetch path too. Never inventory a seed that is already
   // non-public, including a public-looking hostname resolving to private
   // space. A rejected seed is an explicit limitation, not an empty profile:
@@ -1010,7 +1024,9 @@ export async function runSiteProfiler(
   let parsedRobots: ParsedRobots = { groups: [], sitemaps: [], malformed: false };
   let robotsEvaluation: RobotsEvaluation = { allowed: null, crawlDelaySeconds: null, matchedRule: null };
   if (robotsUrl) {
+    noteProfileBudget();
     const fetched = await fetchProfilerUrl(robotsUrl, deps.fetchImpl, ROBOTS_MAX_BYTES, remainingProfileBudgetMs(), deps.resolveHost);
+    noteProfileBudget();
     stamp('robots', robotsUrl, 'profiler:robots-fetch');
     if (!fetched) {
       robotsFetch = { state: 'UNREACHABLE', fetchedAt: now() };
@@ -1034,12 +1050,13 @@ export async function runSiteProfiler(
     }
   }
 
-  const allowUrl = (url: string): Promise<boolean> => isPublicInternetUrl(url, deps.resolveHost);
+  const allowUrl = (url: string): Promise<boolean> =>
+    isPublicInternetUrl(url, deps.resolveHost, remainingProfileBudgetMs());
   const allowFetched = async (finalUrl: string): Promise<boolean> => {
     // Redirects can land anywhere regardless of where they started: a
     // private landing discards the body, never enters the inventory.
     if (!finalUrl) return true;
-    return isPublicInternetUrl(finalUrl, deps.resolveHost);
+    return isPublicInternetUrl(finalUrl, deps.resolveHost, remainingProfileBudgetMs());
   };
 
   // Robots-gated inventory: a disallowed seed path, a rate limit, or an
@@ -1056,7 +1073,9 @@ export async function runSiteProfiler(
   const feeds: FeedInventoryEntry[] = [];
   let homeFinalUrl: string | null = null;
   if (!robotsBlocksFurther && !seedDisallowed) {
+    noteProfileBudget();
     const homeFetched = await fetchProfilerUrl(input.seedUrl, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS, remainingProfileBudgetMs(), deps.resolveHost);
+    noteProfileBudget();
     stamp('homepage', input.seedUrl, 'profiler:homepage-fetch');
     if (homeFetched && homeFetched.status >= 200 && homeFetched.status < 300 && await allowFetched(homeFetched.finalUrl)) {
       homeFinalUrl = homeFetched.finalUrl;
@@ -1091,8 +1110,10 @@ export async function runSiteProfiler(
       // a DNS-backed check, so skipping the counter would allow unbounded
       // lookups across adversarial locations.
       sitemapFetches += 1;
+      noteProfileBudget();
       if (!(await allowUrl(location))) continue;
       const fetched = await fetchProfilerUrl(location, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS, remainingProfileBudgetMs(), deps.resolveHost);
+      noteProfileBudget();
       stamp(`sitemap:${location}`, location, 'profiler:sitemap-fetch');
       if (!fetched || fetched.status < 200 || fetched.status >= 300) continue;
       if (!(await allowFetched(fetched.finalUrl))) continue;
@@ -1162,7 +1183,9 @@ export async function runSiteProfiler(
       if (!(await allowUrl(destRobotsUrl))) {
         destRobotsBlocksAll = true;
       } else {
+        noteProfileBudget();
         const destFetched = await fetchProfilerUrl(destRobotsUrl, deps.fetchImpl, ROBOTS_MAX_BYTES, remainingProfileBudgetMs(), deps.resolveHost);
+        noteProfileBudget();
         stamp('robots:destination', destRobotsUrl, 'profiler:robots-fetch');
         if (!destFetched) destRobotsBlocksAll = true;
         else if (destFetched.status === 429 || destFetched.status >= 500) destRobotsBlocksAll = true;
@@ -1194,9 +1217,11 @@ export async function runSiteProfiler(
     for (const location of feedCandidates) {
       if (feeds.length >= MAX_FEEDS_PER_SITE || feedFetches >= MAX_FEEDS_PER_SITE + 1) break;
       feedFetches += 1;
+      noteProfileBudget();
       if (!(await allowUrl(location))) continue;
       if (!(await destFeedAllowed(location))) continue;
       const fetched = await fetchProfilerUrl(location, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS, remainingProfileBudgetMs(), deps.resolveHost);
+      noteProfileBudget();
       stamp(`feed:${location}`, location, 'profiler:feed-fetch');
       if (!fetched || fetched.status < 200 || fetched.status >= 300) continue;
       if (!(await allowFetched(fetched.finalUrl))) continue;
@@ -1221,27 +1246,28 @@ export async function runSiteProfiler(
     pathDepth,
   });
 
-  return {
-    status: 'PROFILED',
-    profile: {
-      siteIdentity: input.siteIdentity,
-      identityTier: input.identityTier,
-      seedUrl: input.seedUrl,
-      robotsFetch,
-      robotsEvaluation,
-      robotsSitemaps: parsedRobots.sitemaps,
-      sitemaps,
-      sitemapLocationsSkipped,
-      feeds,
-      head,
-      canonicalConflicts,
-      pageType,
-      politeness: {
-        crawlDelaySeconds: robotsEvaluation.crawlDelaySeconds,
-        sameHostDelayHint: robotsEvaluation.crawlDelaySeconds !== null,
-      },
-      provenance,
-      policyVersion: SITE_PROFILER_POLICY_VERSION,
+  const profile: SiteProfile = {
+    siteIdentity: input.siteIdentity,
+    identityTier: input.identityTier,
+    seedUrl: input.seedUrl,
+    robotsFetch,
+    robotsEvaluation,
+    robotsSitemaps: parsedRobots.sitemaps,
+    sitemaps,
+    sitemapLocationsSkipped,
+    feeds,
+    head,
+    canonicalConflicts,
+    pageType,
+    politeness: {
+      crawlDelaySeconds: robotsEvaluation.crawlDelaySeconds,
+      sameHostDelayHint: robotsEvaluation.crawlDelaySeconds !== null,
     },
+    provenance,
+    policyVersion: SITE_PROFILER_POLICY_VERSION,
   };
+  if (budgetStoppedWork) {
+    return { status: 'INCOMPLETE', profile, reason: 'BUDGET_EXHAUSTED' };
+  }
+  return { status: 'PROFILED', profile };
 }

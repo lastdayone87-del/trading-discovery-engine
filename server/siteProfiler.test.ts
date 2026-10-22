@@ -794,3 +794,21 @@ test('rejected redirect responses release their bodies', async () => {
   assert.equal(fetched!.redirectRejected, true);
   assert.equal(cancelled, 1, 'rejected redirect body released, not left open');
 });
+
+test('profiler budget exhaustion returns INCOMPLETE instead of a persistable profile', async () => {
+  const fetchImpl = ((_input: unknown, init?: { signal?: AbortSignal }) => new Promise((_resolve, reject) => {
+    init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+  })) as typeof fetch;
+  const result = await runSiteProfiler(
+    { siteIdentity: 'slow.example', identityTier: 'A', seedUrl: 'https://slow.example/' },
+    {
+      fetchImpl,
+      resolveHost: async () => ['93.184.216.1'],
+      profileTimeoutMs: 20,
+      now: () => '2026-10-01T00:00:00.000Z',
+    },
+    async () => true,
+  );
+  assert.equal(result.status, 'INCOMPLETE');
+  assert.equal(result.profile?.robotsFetch.state, 'UNREACHABLE');
+});

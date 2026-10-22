@@ -12,7 +12,7 @@
  * rewritten to the origin path and sent to the pinned address. Ports are
  * restricted to 80/443 because this proxy exists only for public web pages.
  */
-import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer, request as httpRequest, type ClientRequest, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { connect as netConnect, isIP } from 'node:net';
 import type { Duplex } from 'node:stream';
 import { lookup as dnsLookup } from 'node:dns/promises';
@@ -28,10 +28,12 @@ export interface BrowserEgressProxy {
 export interface BrowserEgressProxyOptions {
   lookup?: BrowserProxyLookup;
   dnsTimeoutMs?: number;
+  requestTimeoutMs?: number;
 }
 
 const PUBLIC_PORTS = new Set([80, 443]);
 const DEFAULT_DNS_TIMEOUT_MS = 3_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 
 const defaultLookup: BrowserProxyLookup = async (hostname) =>
   dnsLookup(hostname, { all: true, verbatim: true });
@@ -96,6 +98,8 @@ async function handleHttpRequest(
   res: ServerResponse,
   lookup: BrowserProxyLookup,
   dnsTimeoutMs: number,
+  requestTimeoutMs: number,
+  pendingRequests: Set<ClientRequest>,
 ): Promise<void> {
   const target = parseHttpTarget(req.url);
   if (!target) {
@@ -114,6 +118,8 @@ async function handleHttpRequest(
     deny(res);
     return;
   }
+  // The browser may have abandoned this request while DNS was in flight.
+  if (req.destroyed || res.destroyed || res.writableEnded) return;
   const headers: Record<string, string | string[] | undefined> = { ...req.headers, host: target.host };
   delete headers['proxy-connection'];
   delete headers['proxy-authorization'];
@@ -125,18 +131,51 @@ async function handleHttpRequest(
     path: `${target.pathname}${target.search}`,
     headers,
   });
+  pendingRequests.add(upstream);
+  let timedOut = false;
+  let finished = false;
+  const deadline = setTimeout(() => {
+    timedOut = true;
+    upstream.destroy(new Error('UPSTREAM_TIMEOUT'));
+  }, requestTimeoutMs);
+  const finish = (): void => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(deadline);
+    pendingRequests.delete(upstream);
+  };
+  const abortUpstream = (): void => {
+    if (!upstream.destroyed) upstream.destroy();
+  };
+  // A browser that abandons the request must not leave an origin connection
+  // running after the crawl. `res.close` with writableEnded=false is the
+  // client-abort signal; normal response completion sets writableEnded=true.
+  req.once('aborted', abortUpstream);
+  req.once('error', abortUpstream);
+  res.once('close', () => {
+    if (!res.writableEnded) abortUpstream();
+  });
+  res.once('error', abortUpstream);
+  upstream.once('close', finish);
   upstream.once('error', () => {
-    if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
-    res.end('Upstream request failed');
+    finish();
+    if (res.destroyed) return;
+    if (!res.headersSent) res.writeHead(timedOut ? 504 : 502, { 'content-type': 'text/plain' });
+    res.end(timedOut ? 'Upstream request timed out' : 'Upstream request failed');
   });
   upstream.once('response', upstreamRes => {
     res.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers);
+    upstreamRes.once('error', () => {
+      upstream.destroy();
+      res.destroy();
+    });
     upstreamRes.pipe(res);
   });
   // The rendered crawler does not need WebSockets. Reject an upgrade instead
   // of leaving the client connected to a response that never arrives.
   upstream.once('upgrade', (_upstreamRes, upstreamSocket) => {
     upstreamSocket.destroy();
+    finish();
     if (!res.headersSent) res.writeHead(403, { 'content-type': 'text/plain' });
     res.end('WebSocket upgrade blocked');
   });
@@ -228,9 +267,11 @@ export async function startBrowserEgressProxy(
 ): Promise<BrowserEgressProxy> {
   const lookup = options.lookup ?? defaultLookup;
   const dnsTimeoutMs = options.dnsTimeoutMs ?? DEFAULT_DNS_TIMEOUT_MS;
+  const requestTimeoutMs = Math.max(1, Math.trunc(options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS));
   const sockets = new Set<Duplex>();
+  const pendingRequests = new Set<ClientRequest>();
   const server: Server = createServer((req, res) => {
-    void handleHttpRequest(req, res, lookup, dnsTimeoutMs).catch(() => deny(res));
+    void handleHttpRequest(req, res, lookup, dnsTimeoutMs, requestTimeoutMs, pendingRequests).catch(() => deny(res));
   });
   server.on('connect', (req, socket, head) => {
     sockets.add(socket);
@@ -251,6 +292,8 @@ export async function startBrowserEgressProxy(
   return {
     url: `http://127.0.0.1:${address.port}`,
     close: async () => {
+      for (const request of pendingRequests) request.destroy();
+      pendingRequests.clear();
       for (const socket of sockets) socket.destroy();
       sockets.clear();
       server.closeAllConnections?.();
