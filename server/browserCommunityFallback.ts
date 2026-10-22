@@ -1243,6 +1243,9 @@ interface RenderedRouteGuardOptions {
   isAllowed(rawUrl: string): Promise<boolean>;
   /** Called only when the destination policy rejects a network request. */
   onBlocked(): void;
+  /** Optional safe sink for unexpected route failures. It must not throw and
+   * is never called for expected shutdown races. */
+  onUnexpectedRouteError?(error: unknown): void;
 }
 
 export interface RenderedRouteGuard {
@@ -1277,10 +1280,22 @@ export function isExpectedRenderedRouteShutdownError(error: unknown): boolean {
   return /targetclosed|target (page|context|browser).*closed|(page|context|browser) (has been|is|was) closed|route (is )?already handled|request (is )?already handled|session (has been|is) closed|connection (has been|is) closed/.test(text);
 }
 
+function reportUnexpectedRenderedRouteError(
+  error: unknown,
+  onUnexpectedRouteError: ((error: unknown) => void) | undefined,
+): void {
+  try {
+    onUnexpectedRouteError?.(error);
+  } catch {
+    // Diagnostics must never break the route callback or reopen the request.
+  }
+}
+
 async function settleRenderedRoute(
   route: RenderedRouteLike,
   action: 'abort' | 'continue',
   errorCode?: string,
+  onUnexpectedRouteError?: (error: unknown) => void,
 ): Promise<void> {
   try {
     if (action === 'abort') {
@@ -1290,13 +1305,17 @@ async function settleRenderedRoute(
     }
   } catch (error) {
     if (isExpectedRenderedRouteShutdownError(error)) return;
+    reportUnexpectedRenderedRouteError(error, onUnexpectedRouteError);
     // The callback must never reject: Playwright reports a rejected route
     // callback as a process-level unhandled error. If continue failed for an
     // unrelated reason, fail closed instead of allowing the request through.
     if (action !== 'abort') {
       try {
         await route.abort('failed');
-      } catch {
+      } catch (abortError) {
+        if (!isExpectedRenderedRouteShutdownError(abortError)) {
+          reportUnexpectedRenderedRouteError(abortError, onUnexpectedRouteError);
+        }
         // The route is already unusable; there is no safe action left. Do
         // not rethrow from the callback and take down the crawler process.
       }
@@ -1322,26 +1341,27 @@ export function createRenderedRouteGuard(
 
   const handler = async (route: RenderedRouteLike): Promise<void> => {
     if (disposed) {
-      await settleRenderedRoute(route, 'abort', 'failed');
+      await settleRenderedRoute(route, 'abort', 'failed', options.onUnexpectedRouteError);
       return;
     }
     try {
       const request = route.request();
       if (RENDERED_NON_NETWORK_RESOURCE_TYPES.has(request.resourceType())) {
-        await settleRenderedRoute(route, 'abort');
+        await settleRenderedRoute(route, 'abort', undefined, options.onUnexpectedRouteError);
         return;
       }
       if (!(await options.isAllowed(request.url()))) {
         options.onBlocked();
-        await settleRenderedRoute(route, 'abort', 'blockedbyclient');
+        await settleRenderedRoute(route, 'abort', 'blockedbyclient', options.onUnexpectedRouteError);
         return;
       }
-      await settleRenderedRoute(route, 'continue');
+      await settleRenderedRoute(route, 'continue', undefined, options.onUnexpectedRouteError);
     } catch (error) {
       if (isExpectedRenderedRouteShutdownError(error)) return;
+      reportUnexpectedRenderedRouteError(error, options.onUnexpectedRouteError);
       // Unknown routing/security failures are never allowed to open the
       // request path or escape as an unhandled rejection.
-      await settleRenderedRoute(route, 'abort', 'failed');
+      await settleRenderedRoute(route, 'abort', 'failed', options.onUnexpectedRouteError);
     }
   };
 
@@ -1606,6 +1626,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               const guard = createRenderedRouteGuard(context, {
                 isAllowed: renderedRequestAllowed,
                 onBlocked: () => { telemetry.blockedRequests++; },
+                onUnexpectedRouteError: error => {
+                  const cause = browserCauseSnippet(error, 300);
+                  console.warn(`[RenderedRoute] unexpected route failure; request aborted${cause ? `: ${cause}` : ''}`);
+                },
               });
               renderedRouteGuards.set(context, guard);
               try {

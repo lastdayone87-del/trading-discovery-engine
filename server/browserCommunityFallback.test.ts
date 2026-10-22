@@ -428,9 +428,10 @@ test('route guard treats an in-flight target-closed rejection as benign and clea
 
 test('route guard treats a target-closed continue failure as benign even before cleanup', async () => {
   const actions: string[] = [];
+  let unexpected = 0;
   const guard = createRenderedRouteGuard(
     { unrouteAll: async () => {} },
-    { isAllowed: async () => true, onBlocked: () => {} },
+    { isAllowed: async () => true, onBlocked: () => {}, onUnexpectedRouteError: () => { unexpected++; } },
   );
 
   await guard.handler({
@@ -440,6 +441,7 @@ test('route guard treats a target-closed continue failure as benign even before 
   });
 
   assert.deepEqual(actions, []);
+  assert.equal(unexpected, 0);
 });
 
 test('route guard preserves normal routing and the public-destination block', async () => {
@@ -460,9 +462,10 @@ test('route guard preserves normal routing and the public-destination block', as
 
 test('route guard fails closed on unexpected callback errors instead of swallowing them', async () => {
   const actions: string[] = [];
+  const unexpected: unknown[] = [];
   const guard = createRenderedRouteGuard(
     { unrouteAll: async () => {} },
-    { isAllowed: async () => true, onBlocked: () => {} },
+    { isAllowed: async () => true, onBlocked: () => {}, onUnexpectedRouteError: error => { unexpected.push(error); } },
   );
 
   await guard.handler({
@@ -472,6 +475,26 @@ test('route guard fails closed on unexpected callback errors instead of swallowi
   });
 
   assert.deepEqual(actions, ['abort:failed']);
+  assert.equal(unexpected.length, 1);
+  assert.match(String(unexpected[0]), /unexpected continue failure/);
+});
+
+test('route guard reports an unexpected fallback abort failure without rejecting', async () => {
+  const unexpected: unknown[] = [];
+  const guard = createRenderedRouteGuard(
+    { unrouteAll: async () => {} },
+    { isAllowed: async () => true, onBlocked: () => {}, onUnexpectedRouteError: error => { unexpected.push(error); } },
+  );
+
+  await guard.handler({
+    request: () => ({ url: () => 'https://public.example/', resourceType: () => 'document' }),
+    continue: async () => { throw new Error('continue boom'); },
+    abort: async () => { throw new Error('abort boom'); },
+  });
+
+  assert.equal(unexpected.length, 2);
+  assert.match(String(unexpected[0]), /continue boom/);
+  assert.match(String(unexpected[1]), /abort boom/);
 });
 
 test('route guard fails closed when the destination check itself rejects', async () => {
