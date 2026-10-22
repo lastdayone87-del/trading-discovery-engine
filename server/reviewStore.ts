@@ -59,11 +59,14 @@ export async function decideReview(input:DecideInput) {
     // trigger already holds the job row before it touches the channel. Taking
     // the channel first here (the old order) let a worker hold the job while
     // waiting for the channel, then this transaction hold the channel while
-    // waiting for the job: a classic lock-order deadlock. Lock the jobs that
-    // this rejection will cancel before locking the review/channel rows.
+    // waiting for the job: a classic lock-order deadlock. Cancel (and thereby
+    // lock) the active jobs in one statement before locking the review/channel
+    // rows. Doing the cancellation here, rather than after the channel lock,
+    // also means a job created between this statement and the channel lock is
+    // never locked in the opposite order.
     if(input.action==='REJECT') {
       await client.query(
-        `SELECT id FROM jobs WHERE status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$1 ORDER BY id FOR UPDATE`,
+        `UPDATE jobs SET status='FAILED',last_error='Cancelled by human rejection',locked_by=NULL,locked_at=NULL,updated_at=now() WHERE status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$1`,
         [input.channelId],
       );
     }
@@ -79,7 +82,6 @@ export async function decideReview(input:DecideInput) {
       await client.query(`INSERT INTO jobs(type,payload,priority,max_attempts,idempotency_key) VALUES('POST_APPROVAL_ENRICH',$1,1000,4,$2) ON CONFLICT(idempotency_key) DO NOTHING`,[JSON.stringify({channelId:input.channelId,reviewVersion:nextVersion}),`post-approval:${input.channelId}:${nextVersion}`]);
     } else if(input.action==='REJECT') {
       await client.query(`UPDATE channels SET trading_status='HUMAN_REJECTED',scan_status='SKIPPED_NON_TRADING',discord_status='NON_TRADING',updated_at=now() WHERE channel_id=$1`,[input.channelId]);
-      await client.query(`UPDATE jobs SET status='FAILED',last_error='Cancelled by human rejection',locked_by=NULL,locked_at=NULL,updated_at=now() WHERE status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$1`,[input.channelId]);
     } else {
       await client.query(`SET LOCAL app.force_review_rescan='on'`);
       await client.query(`UPDATE channel_reviews SET state='SUPERSEDED',updated_at=now() WHERE channel_id=$1`,[input.channelId]);

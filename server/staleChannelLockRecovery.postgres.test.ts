@@ -297,6 +297,9 @@ maybe('review rejection takes the job lock before the channel lock', async t => 
   const jobIds: string[] = [];
   const cleanup = async () => {
     if (jobIds.length) await db.query(`DELETE FROM jobs WHERE id = ANY($1::uuid[])`, [jobIds]).catch(() => undefined);
+    // channel_review_decisions is append-only by trigger. This test database
+    // is disposable, and unique fixture IDs keep repeated runs isolated even
+    // when the immutable decision cannot be removed.
     await db.query(`DELETE FROM channel_review_decisions WHERE channel_id=$1`, [channelId]).catch(() => undefined);
     await db.query(`DELETE FROM channel_reviews WHERE channel_id=$1`, [channelId]).catch(() => undefined);
     await db.query(`DELETE FROM channels WHERE channel_id=$1`, [channelId]).catch(() => undefined);
@@ -326,8 +329,12 @@ maybe('review rejection takes the job lock before the channel lock', async t => 
   jobIds.push(jobId);
 
   const worker = await db.connect();
+  let workerCommitted = false;
+  type ReviewOutcome = { ok: true; value: Awaited<ReturnType<typeof decideReview>> } | { ok: false; error: unknown };
+  let reviewOutcome: Promise<ReviewOutcome> | undefined;
   try {
     await worker.query('BEGIN');
+    const workerPid = Number((await worker.query('SELECT pg_backend_pid() AS pid')).rows[0].pid);
     // Hold the job row without changing status, so the migration 153 trigger
     // does not fire yet. The review rejection must wait here before it is
     // allowed to lock the channel.
@@ -342,16 +349,25 @@ maybe('review rejection takes the job lock before the channel lock', async t => 
       reviewReasonVersion: 'human-review-reasons-v1',
       idempotencyKey: `review-overlap-${suffix}`,
     });
+    // Attach the settlement handler immediately so an assertion failure can
+    // still roll back the worker and await the rejection without an unhandled
+    // rejection racing fixture cleanup.
+    reviewOutcome = reviewPromise.then(
+      value => ({ ok: true as const, value }),
+      error => ({ ok: false as const, error }),
+    );
 
     let waitingOnJob = false;
     for (let attempt = 0; attempt < 100; attempt += 1) {
       const waiting = await db.query(
         `SELECT count(*)::int AS count
-         FROM pg_stat_activity
-         WHERE datname=current_database()
-           AND state='active'
-           AND wait_event_type='Lock'
-           AND query ILIKE '%jobs%'`,
+         FROM pg_stat_activity a
+         WHERE a.pid <> pg_backend_pid()
+           AND a.state='active'
+           AND a.wait_event_type='Lock'
+           AND a.query LIKE '%Cancelled by human rejection%'
+           AND $1::int = ANY(pg_blocking_pids(a.pid))`,
+        [workerPid],
       );
       if (Number(waiting.rows[0]?.count || 0) > 0) {
         waitingOnJob = true;
@@ -378,15 +394,18 @@ maybe('review rejection takes the job lock before the channel lock', async t => 
     }
 
     await worker.query('COMMIT');
-    const result = await reviewPromise;
+    workerCommitted = true;
+    const outcome = await reviewOutcome;
+    if (!outcome) throw new Error('review rejection did not settle');
+    if ('error' in outcome) throw outcome.error;
+    const result = outcome.value;
     assert.equal(result.review.state, 'REJECTED');
     assert.equal(result.channel.tradingStatus, 'HUMAN_REJECTED');
     const persistedJob = await db.query(`SELECT status FROM jobs WHERE id=$1`, [jobId]);
     assert.equal(persistedJob.rows[0]?.status, 'FAILED');
-  } catch (error) {
-    await worker.query('ROLLBACK').catch(() => undefined);
-    throw error;
   } finally {
+    if (!workerCommitted) await worker.query('ROLLBACK').catch(() => undefined);
+    if (reviewOutcome) await reviewOutcome;
     worker.release();
   }
 });
