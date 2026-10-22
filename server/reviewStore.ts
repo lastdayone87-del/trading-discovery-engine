@@ -55,6 +55,21 @@ export async function decideReview(input:DecideInput) {
       FROM channel_review_decisions d JOIN channel_reviews r USING(channel_id) JOIN channels c USING(channel_id)
       WHERE d.idempotency_key=$1`,[input.idempotencyKey]);
     if(prior.rowCount){const saved=prior.rows[0];await client.query('COMMIT');return {decision:saved,review:{state:saved.state,reviewVersion:saved.current_review_version},channel:{channelId:saved.channel_id,tradingStatus:saved.trading_status,scanStatus:saved.scan_status,discordStatus:saved.discord_status},queuePending:saved.state==='PENDING',idempotent:true};}
+    // Canonical lock order is jobs -> channel. The migration 153 terminal-job
+    // trigger already holds the job row before it touches the channel. Taking
+    // the channel first here (the old order) let a worker hold the job while
+    // waiting for the channel, then this transaction hold the channel while
+    // waiting for the job: a classic lock-order deadlock. Cancel (and thereby
+    // lock) the active jobs in one statement before locking the review/channel
+    // rows. Doing the cancellation here, rather than after the channel lock,
+    // also means a job created between this statement and the channel lock is
+    // never locked in the opposite order.
+    if(input.action==='REJECT') {
+      await client.query(
+        `UPDATE jobs SET status='FAILED',last_error='Cancelled by human rejection',locked_by=NULL,locked_at=NULL,updated_at=now() WHERE status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$1`,
+        [input.channelId],
+      );
+    }
     const locked=await client.query(`SELECT r.*,to_jsonb(c) channel_snapshot FROM channel_reviews r JOIN channels c USING(channel_id) WHERE r.channel_id=$1 FOR UPDATE OF r,c`,[input.channelId]);
     if(!locked.rowCount) throw new ReviewNotFoundError('Review item not found.');
     const row=locked.rows[0];
@@ -67,7 +82,6 @@ export async function decideReview(input:DecideInput) {
       await client.query(`INSERT INTO jobs(type,payload,priority,max_attempts,idempotency_key) VALUES('POST_APPROVAL_ENRICH',$1,1000,4,$2) ON CONFLICT(idempotency_key) DO NOTHING`,[JSON.stringify({channelId:input.channelId,reviewVersion:nextVersion}),`post-approval:${input.channelId}:${nextVersion}`]);
     } else if(input.action==='REJECT') {
       await client.query(`UPDATE channels SET trading_status='HUMAN_REJECTED',scan_status='SKIPPED_NON_TRADING',discord_status='NON_TRADING',updated_at=now() WHERE channel_id=$1`,[input.channelId]);
-      await client.query(`UPDATE jobs SET status='FAILED',last_error='Cancelled by human rejection',locked_by=NULL,locked_at=NULL,updated_at=now() WHERE status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$1`,[input.channelId]);
     } else {
       await client.query(`SET LOCAL app.force_review_rescan='on'`);
       await client.query(`UPDATE channel_reviews SET state='SUPERSEDED',updated_at=now() WHERE channel_id=$1`,[input.channelId]);

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getDb, recoverStaleChannelLocks } from './db';
+import { decideReview } from './reviewStore';
 
 const enabled = Boolean(process.env.DATABASE_URL);
 const maybe = enabled ? test : test.skip;
@@ -287,4 +288,153 @@ maybe('concurrent terminal releases serialize and clear an abandoned lock', asyn
     'PENDING',
     'after both terminal releases commit, the abandoned lock is clear without waiting for the sweep',
   );
+});
+
+maybe('review rejection and worker terminal update do not deadlock', async t => {
+  const db = await getDb();
+  const suffix = `${Date.now()}_${process.pid}_review-overlap`;
+  const channelId = `${PREFIX}review-overlap-${suffix}`;
+  const jobIds: string[] = [];
+  const cleanup = async () => {
+    if (jobIds.length) await db.query(`DELETE FROM jobs WHERE id = ANY($1::uuid[])`, [jobIds]).catch(() => undefined);
+    // channel_review_decisions is append-only by trigger. This test database
+    // is disposable, and unique fixture IDs keep repeated runs isolated even
+    // when the immutable decision cannot be removed.
+    await db.query(`DELETE FROM channel_review_decisions WHERE channel_id=$1`, [channelId]).catch(() => undefined);
+    await db.query(`DELETE FROM channel_reviews WHERE channel_id=$1`, [channelId]).catch(() => undefined);
+    await db.query(`DELETE FROM channels WHERE channel_id=$1`, [channelId]).catch(() => undefined);
+  };
+  await cleanup();
+  t.after(cleanup);
+
+  await db.query(
+    `INSERT INTO channels(
+      channel_id,channel_name,youtube_url,country,country_status,discord_status,discord_invite,
+      scan_status,discovery_source,first_seen,trading_status,subscriber_count,
+      discord_validation_status,discord_liveness_status,discord_discovery_status,updated_at
+    ) VALUES($1,$2,$3,'Germany','CONFIRMED','NOT_FOUND',NULL,'LOCKED','automated_query',now(),'TRADING_CONFIRMED','1000','COMPLETED','NOT_CHECKED','NOT_DISCOVERED',now()-interval '61 minutes')`,
+    [channelId, `review overlap ${channelId}`, `https://youtube.test/${channelId}`],
+  );
+  await db.query(
+    `INSERT INTO channel_reviews(channel_id,state,evidence_snapshot,pending_since)
+     VALUES($1,'PENDING',$2::jsonb,now())`,
+    [channelId, JSON.stringify({ source: 'review-overlap-regression' })],
+  );
+  const processingJob = await db.query(
+    `INSERT INTO jobs(type,status,payload,max_attempts)
+     VALUES('ENRICH_CHANNEL','PROCESSING',$1::jsonb,3) RETURNING id`,
+    [JSON.stringify({ channelId })],
+  );
+  const processingJobId = String(processingJob.rows[0].id);
+  jobIds.push(processingJobId);
+  const pendingJob = await db.query(
+    `INSERT INTO jobs(type,status,payload,max_attempts)
+     VALUES('ENRICH_CHANNEL','PENDING',$1::jsonb,3) RETURNING id`,
+    [JSON.stringify({ channelId })],
+  );
+  const pendingJobId = String(pendingJob.rows[0].id);
+  jobIds.push(pendingJobId);
+
+  const worker = await db.connect();
+  let workerCommitted = false;
+  type ReviewOutcome = { ok: true; value: Awaited<ReturnType<typeof decideReview>> } | { ok: false; error: unknown };
+  let reviewOutcome: Promise<ReviewOutcome> | undefined;
+  try {
+    await worker.query('BEGIN');
+    const workerPid = Number((await worker.query('SELECT pg_backend_pid() AS pid')).rows[0].pid);
+    // Hold the job row without changing status, so the migration 153 trigger
+    // does not fire yet. The review rejection must wait here before it is
+    // allowed to lock the channel.
+    await worker.query(`UPDATE jobs SET locked_at=now() WHERE id=$1`, [processingJobId]);
+
+    const reviewPromise = decideReview({
+      channelId,
+      action: 'REJECT',
+      expectedVersion: 1,
+      reviewer: 'review-overlap-test',
+      reviewReasonCode: 'NOT_TRADING_CREATOR',
+      reviewReasonVersion: 'human-review-reasons-v1',
+      idempotencyKey: `review-overlap-${suffix}`,
+    });
+    // Attach the settlement handler immediately so an assertion failure can
+    // still roll back the worker and await the rejection without an unhandled
+    // rejection racing fixture cleanup.
+    reviewOutcome = reviewPromise.then(
+      value => ({ ok: true as const, value }),
+      error => ({ ok: false as const, error }),
+    );
+
+    let waitingOnJob = false;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const waiting = await db.query(
+        `SELECT count(*)::int AS count
+         FROM pg_stat_activity a
+         WHERE a.pid <> pg_backend_pid()
+           AND a.state='active'
+           AND a.wait_event_type='Lock'
+           AND a.query LIKE '%Cancelled by human rejection%'
+           AND $1::int = ANY(pg_blocking_pids(a.pid))`,
+        [workerPid],
+      );
+      if (Number(waiting.rows[0]?.count || 0) > 0) {
+        waitingOnJob = true;
+        break;
+      }
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.equal(waitingOnJob, true, 'review rejection should wait on the worker job lock');
+
+    // If the review took the channel first (the old order), this NOWAIT probe
+    // fails. With jobs-first ordering the channel is not locked while the
+    // review waits for the worker, so there is no cycle for the worker's
+    // terminal trigger to close.
+    const probe = await db.connect();
+    try {
+      await probe.query('BEGIN');
+      await probe.query(`SELECT 1 FROM channels WHERE channel_id=$1 FOR UPDATE NOWAIT`, [channelId]);
+      await probe.query('ROLLBACK');
+    } catch (error) {
+      await probe.query('ROLLBACK').catch(() => undefined);
+      throw new Error(`review rejection acquired the channel before the job lock: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      probe.release();
+    }
+
+    // The worker terminal update fires migration 153's channel trigger. The
+    // channel is older than the recovery grace period, so the trigger must
+    // actually attempt the channel update while the rejection is waiting on
+    // the worker's job lock. A statement timeout turns the old lock order into
+    // a clear test failure instead of an indefinite hang.
+    await worker.query("SET LOCAL statement_timeout='3s'");
+    try {
+      await worker.query(`UPDATE jobs SET status='COMPLETED',updated_at=now() WHERE id=$1`, [processingJobId]);
+    } catch (error) {
+      throw new Error(`worker terminal update did not complete while rejection waited: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const triggered = await worker.query(`SELECT scan_status FROM channels WHERE channel_id=$1`, [channelId]);
+    assert.equal(
+      triggered.rows[0]?.scan_status,
+      'PENDING',
+      'the terminal update must fire migration 153 and release the abandoned channel lock',
+    );
+    await worker.query('COMMIT');
+    workerCommitted = true;
+    const outcome = await reviewOutcome;
+    if (!outcome) throw new Error('review rejection did not settle');
+    if ('error' in outcome) throw outcome.error;
+    const result = outcome.value;
+    assert.equal(result.review.state, 'REJECTED');
+    assert.equal(result.channel.tradingStatus, 'HUMAN_REJECTED');
+    const persistedJobs = await db.query(
+      `SELECT id,status FROM jobs WHERE id = ANY($1::uuid[]) ORDER BY id`,
+      [[processingJobId, pendingJobId]],
+    );
+    const persistedById = new Map(persistedJobs.rows.map(row => [String(row.id), String(row.status)]));
+    assert.equal(persistedById.get(processingJobId), 'COMPLETED', 'worker completion must survive the rejection');
+    assert.equal(persistedById.get(pendingJobId), 'FAILED', 'the pending sibling must be cancelled by rejection');
+  } finally {
+    if (!workerCommitted) await worker.query('ROLLBACK').catch(() => undefined);
+    if (reviewOutcome) await reviewOutcome;
+    worker.release();
+  }
 });
