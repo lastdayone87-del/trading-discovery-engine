@@ -11,8 +11,9 @@ function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T | Promi
   return { promise, resolve };
 }
 
-test('Playwright context close with an in-flight route does not produce an unhandled rejection', { skip: process.platform === 'android', timeout: 30_000 }, async () => {
+test('Crawlee browser close with an in-flight route unwinds before closing the context', { skip: process.platform === 'android', timeout: 30_000 }, async () => {
   const { chromium } = await import('playwright');
+  const { PlaywrightBrowser } = await import('@crawlee/browser-pool');
   const unhandled: unknown[] = [];
   const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
   process.on('unhandledRejection', onUnhandled);
@@ -36,11 +37,14 @@ test('Playwright context close with an in-flight route does not produce an unhan
     browser = await chromium.launch(browserLaunchOptions());
     context = await browser.newContext();
     const entered = deferred();
+    const order: string[] = [];
     let unrouteBehavior: string | undefined;
+    context.once('close', () => { order.push('context-close'); });
     guard = createRenderedRouteGuard(
       {
         unrouteAll: async options => {
           unrouteBehavior = options?.behavior;
+          order.push('unroute');
           await context!.unrouteAll(options);
         },
       },
@@ -55,13 +59,18 @@ test('Playwright context close with an in-flight route does not produce an unhan
     const page = await context.newPage();
     const navigation = page.goto(`http://127.0.0.1:${address.port}/`, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
     await entered.promise;
-    const closePromise = context.close();
+    // This is the browser-level retirement path Crawlee uses. Its
+    // PlaywrightBrowser.close() delegates to browserContext.close(), so the
+    // installed context-close wrapper must run before the context goes away.
+    const crawleeBrowser = new PlaywrightBrowser({ browserContext: context, version: 'test' });
+    const closePromise = crawleeBrowser.close();
     release.resolve();
     await closePromise;
     await navigation;
     await new Promise(resolve => setTimeout(resolve, 50));
 
     assert.equal(unrouteBehavior, 'ignoreErrors');
+    assert.deepEqual(order, ['unroute', 'context-close']);
     assert.deepEqual(unhandled, []);
   } finally {
     process.off('unhandledRejection', onUnhandled);
