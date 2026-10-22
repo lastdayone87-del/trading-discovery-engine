@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { getChannelById, getDb, upsertChannel } from './db';
+import { getChannelById, getDb, upsertChannel, writeChannelUpsert } from './db';
 
 const enabled = Boolean(process.env.DATABASE_URL);
 const maybe = enabled ? test : test.skip;
@@ -74,4 +74,92 @@ maybe('classification-only upserts never overwrite a newer Discord projection', 
   const overwritten = await getChannelById(channelId);
   assert.equal(overwritten?.discord_status, 'DEAD');
   assert.equal(overwritten?.discord_invite, null);
+});
+
+maybe('classification-only upsert preserves a Discord row inserted between its read and write', async t => {
+  const db = await getDb();
+  const channelId = `${PREFIX}insert-race-${Date.now()}_${process.pid}`;
+  const cleanup = async () => {
+    await db.query(`DELETE FROM channels WHERE channel_id=$1`, [channelId]).catch(() => undefined);
+  };
+  await cleanup();
+  t.after(cleanup);
+
+  const stale = {
+    channel_id: channelId,
+    channel_name: 'classification after concurrent insert',
+    youtube_url: `https://youtube.test/${channelId}`,
+    country: 'Germany',
+    country_status: 'CONFIRMED',
+    confidence_score: 90,
+    discord_status: 'DEAD',
+    discord_invite: null,
+    discord_discovery_status: 'NOT_DISCOVERED',
+    discord_candidate_locator: null,
+    discord_candidate_id: null,
+    discord_candidate_raw_locator: null,
+    discord_candidate_type: null,
+    discord_resolution_status: 'NOT_ATTEMPTED',
+    discord_liveness_status: 'DEAD',
+    discord_relevance_status: 'NOT_CHECKED',
+    discord_validation_status: 'COMPLETED',
+    discord_duplicate_owner_channel_id: null,
+    scan_status: 'COMPLETED',
+    discovery_source: 'automated_query',
+    trading_status: 'TRADING_CONFIRMED',
+  } as any;
+
+  const active = {
+    ...stale,
+    channel_name: 'concurrent active insert',
+    discord_status: 'ACTIVE',
+    discord_invite: 'https://discord.gg/inserted',
+    discord_discovery_status: 'VALIDATED',
+    discord_candidate_locator: 'https://discord.gg/inserted',
+    discord_candidate_id: 'inserted-candidate',
+    discord_resolution_status: 'RESOLVED',
+    discord_liveness_status: 'ACTIVE',
+    discord_relevance_status: 'TRADING_RELEVANT',
+    discord_validation_status: 'COMPLETED',
+  };
+
+  // Reproduce the interleaving that the original read-then-write path missed:
+  // the classification transaction's locked read returns no row, then another
+  // writer inserts and commits before the conflict write runs.
+  const classification = await db.connect();
+  const concurrent = await db.connect();
+  try {
+    await classification.query('BEGIN');
+    await classification.query(`SET LOCAL statement_timeout='5s'`);
+    const prior = await classification.query(
+      `SELECT quality_score,trading_status FROM channels WHERE channel_id=$1 FOR UPDATE`,
+      [channelId],
+    );
+    assert.equal(prior.rowCount, 0, 'the classification read must miss the row to exercise the insert race');
+
+    // The concurrent writer uses the same production write helper with a
+    // bounded statement, so an unexpected lock wait fails the regression
+    // quickly instead of consuming the CI job timeout.
+    await concurrent.query('BEGIN');
+    await concurrent.query(`SET LOCAL statement_timeout='5s'`);
+    await writeChannelUpsert(concurrent, active);
+    await concurrent.query('COMMIT');
+
+    await writeChannelUpsert(classification, stale, { preserveDiscordOnUpdate: true });
+    await classification.query('COMMIT');
+  } catch (error) {
+    await classification.query('ROLLBACK').catch(() => undefined);
+    await concurrent.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    classification.release();
+    concurrent.release();
+  }
+
+  const row = await getChannelById(channelId);
+  assert.equal(row?.discord_status, 'ACTIVE', 'the concurrent ACTIVE insert must not be replaced by the stale DEAD snapshot');
+  assert.equal(row?.discord_invite, 'https://discord.gg/inserted');
+  assert.equal(row?.discord_liveness_status, 'ACTIVE');
+  assert.equal(row?.discord_validation_status, 'COMPLETED');
+  assert.equal(row?.channel_name, 'classification after concurrent insert', 'non-Discord fields still come from the classification write');
 });
