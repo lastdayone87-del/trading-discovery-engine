@@ -188,6 +188,33 @@ test('creator-specific paid evidence still presents the channel as a paid commun
   assert.doesNotMatch(html, /Community indicated/);
 });
 
+test('non-paid creator evidence does not inherit a paid badge from a filtered platform page', async () => {
+  const platformPaid: CommunityIntentEvidence = {
+    ...paidIntent,
+    communityUrl: 'https://newsroom.whop.com/whop-economic-intelligence/',
+    sourcePageUrl: 'https://newsroom.whop.com/whop-economic-intelligence/',
+  };
+  const creatorUnpaid: CommunityIntentEvidence = {
+    ...paidIntent,
+    communityPlatform: 'SKOOL',
+    communityUrl: 'https://www.skool.com/creator-community',
+    sourcePageUrl: 'https://creator.test/',
+    intent: 'UNKNOWN',
+    paidSignals: [],
+  };
+  const html = await renderDashboard(channel({
+    discord_status: 'NOT_FOUND',
+    community_discovery_status: 'PAID_COMMUNITY_INDICATED',
+    community_intents: [platformPaid, creatorUnpaid],
+  }));
+
+  assert.doesNotMatch(html, /Paid community/);
+  assert.match(html, /Community indicated \(Skool\) · no invite/);
+  assert.doesNotMatch(html, /\(Whop\)/);
+  assert.doesNotMatch(html, /newsroom\.whop\.com/);
+  assert.match(html, /skool\.com\/creator-community/);
+});
+
 test('mixed platform-owned and creator-specific paid evidence keeps the paid badge', async () => {
   const html = await renderDashboard(channel({
     discord_status: 'NOT_FOUND',

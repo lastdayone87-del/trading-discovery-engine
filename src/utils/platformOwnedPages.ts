@@ -119,8 +119,10 @@ export function isPlatformOwnedCommunityUrl(
     // observed evidence set is a platform property (newsroom/docs/careers/...).
     if (host !== 'whop.com' && host !== 'www.whop.com') return true;
     // Whop's own bundles/translation JSONs can contain price and per-month
-    // text. They are platform assets, not paid community surfaces.
-    if (segments.some(segment => WHOP_PLATFORM_ASSET_SEGMENTS.has(segment))) return true;
+    // text. A known static-file extension is a platform asset regardless of
+    // the route. Asset-named path segments are checked after the creator-page
+    // exception below so a real /discover/assets or /marketplace/assets slug
+    // is not mistaken for plumbing.
     if (WHOP_PLATFORM_ASSET_EXTENSIONS.test(url.pathname)) return true;
     // Whop also serves creator product/store pages as /discover/<slug> and
     // /marketplace/<slug>. Those are creator-specific even though the parent
@@ -129,6 +131,7 @@ export function isPlatformOwnedCommunityUrl(
     if ((first === 'discover' || first === 'marketplace')
       && segments.length === 2
       && !RESERVED_PATHS.WHOP.has(segments[1])) return false;
+    if (segments.some(segment => WHOP_PLATFORM_ASSET_SEGMENTS.has(segment))) return true;
     return RESERVED_PATHS.WHOP.has(first);
   }
 

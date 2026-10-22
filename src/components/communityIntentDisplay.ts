@@ -38,9 +38,16 @@ export function communityIntentDisplay(
     item => item?.communityUrl && !isPlatformOwnedCommunityUrl(item.communityPlatform, item.communityUrl),
   );
   const creatorPaidIntentItems = creatorIntents.filter(item => item.intent === 'PAID');
-  const onlyPlatformOwnedIntents = intents.some(item => item?.communityUrl) && creatorIntents.length === 0;
-  const paid = !onlyPlatformOwnedIntents
-    && (status === 'PAID_COMMUNITY_INDICATED' || creatorPaidIntentItems.length > 0);
+  const hasStoredUrls = intents.some(item => Boolean(item?.communityUrl));
+  const onlyPlatformOwnedIntents = hasStoredUrls && creatorIntents.length === 0;
+  // When stored URLs exist, the persisted status may still have been set by a
+  // platform-owned paid page that this projection just removed. In that case
+  // only creator-specific PAID records can establish the paid badge. A
+  // status-only record (no stored URLs) keeps the persisted status as its
+  // only signal.
+  const paid = hasStoredUrls
+    ? creatorPaidIntentItems.length > 0
+    : status === 'PAID_COMMUNITY_INDICATED';
   // A status-only indication (no stored URLs) remains visible. If the only
   // stored evidence is platform-owned, there is no community intent to show.
   const present = !onlyPlatformOwnedIntents
@@ -75,7 +82,7 @@ export function communityIntentDisplay(
   // names only the platforms that carry creator-specific paid intent; when
   // the badge comes from the persisted status alone (no classified paid
   // records), the suffix stays empty exactly as before.
-  const suffixIntents = paid ? creatorPaidIntentItems : intents;
+  const suffixIntents = paid ? creatorPaidIntentItems : creatorIntents;
   const platforms = [...new Set(suffixIntents
     .filter(item => item?.communityUrl)
     .map(item => platformLabel(item.communityPlatform)))];

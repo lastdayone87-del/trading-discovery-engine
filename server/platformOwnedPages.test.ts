@@ -25,6 +25,8 @@ test('Whop creator pages remain creator-specific', () => {
     'https://www.whop.com/creator',
     'https://whop.com/discover/creator-slug',
     'https://whop.com/marketplace/creator-slug',
+    'https://whop.com/discover/assets',
+    'https://whop.com/marketplace/assets',
   ];
 
   for (const url of urls) {
