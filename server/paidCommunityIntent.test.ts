@@ -182,6 +182,24 @@ test('platform-owned corporate pages and assets are excluded from extraction', (
   assert.equal(resolveCommunityDiscoveryStatus(evidence), 'COMMUNITY_INDICATED_NO_INVITE');
 });
 
+test('the Skool Games community survives extraction, merge, and status projection', () => {
+  const evidence = extractCommunityIntentEvidence({
+    pageUrl: 'https://www.skool.com/games',
+    html: '<h1>Skool Games</h1><p>Paid membership $49/mo</p>',
+  });
+
+  assert.equal(evidence.length, 1);
+  assert.equal(evidence[0].communityPlatform, 'SKOOL');
+  assert.equal(evidence[0].communityUrl, 'https://www.skool.com/games');
+  assert.equal(evidence[0].intent, 'PAID');
+  assert.equal(resolveCommunityDiscoveryStatus(evidence), 'PAID_COMMUNITY_INDICATED');
+
+  const merged = mergeCommunityIntentEvidence([], evidence);
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].communityUrl, 'https://www.skool.com/games');
+  assert.equal(resolveCommunityDiscoveryStatus(merged), 'PAID_COMMUNITY_INDICATED');
+});
+
 test('a platform-owned page with price text cannot establish community status', () => {
   const corporate = extractCommunityIntentEvidence({
     pageUrl: 'https://whop.com/careers',
