@@ -1111,12 +1111,16 @@ export async function runSiteProfiler(
       // lookups across adversarial locations.
       sitemapFetches += 1;
       noteProfileBudget();
-      if (!(await allowUrl(location))) continue;
+      const sitemapAllowed = await allowUrl(location);
+      noteProfileBudget();
+      if (!sitemapAllowed) continue;
       const fetched = await fetchProfilerUrl(location, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS, remainingProfileBudgetMs(), deps.resolveHost);
       noteProfileBudget();
       stamp(`sitemap:${location}`, location, 'profiler:sitemap-fetch');
       if (!fetched || fetched.status < 200 || fetched.status >= 300) continue;
-      if (!(await allowFetched(fetched.finalUrl))) continue;
+      const finalSitemapAllowed = await allowFetched(fetched.finalUrl);
+      noteProfileBudget();
+      if (!finalSitemapAllowed) continue;
       const parsed = parseSitemapXml(fetched.text, location, fetched.truncated);
       if (parsed.kind === 'unknown') continue;
       sitemaps.push(parsed);
@@ -1180,10 +1184,11 @@ export async function runSiteProfiler(
     const crossHostRedirect = !!destOrigin && !!origin && destOrigin !== origin;
     if (crossHostRedirect && destOrigin) {
       const destRobotsUrl = `${destOrigin}/robots.txt`;
-      if (!(await allowUrl(destRobotsUrl))) {
+      const destRobotsAllowed = await allowUrl(destRobotsUrl);
+      noteProfileBudget();
+      if (!destRobotsAllowed) {
         destRobotsBlocksAll = true;
       } else {
-        noteProfileBudget();
         const destFetched = await fetchProfilerUrl(destRobotsUrl, deps.fetchImpl, ROBOTS_MAX_BYTES, remainingProfileBudgetMs(), deps.resolveHost);
         noteProfileBudget();
         stamp('robots:destination', destRobotsUrl, 'profiler:robots-fetch');
@@ -1218,13 +1223,19 @@ export async function runSiteProfiler(
       if (feeds.length >= MAX_FEEDS_PER_SITE || feedFetches >= MAX_FEEDS_PER_SITE + 1) break;
       feedFetches += 1;
       noteProfileBudget();
-      if (!(await allowUrl(location))) continue;
-      if (!(await destFeedAllowed(location))) continue;
+      const feedAllowed = await allowUrl(location);
+      noteProfileBudget();
+      if (!feedAllowed) continue;
+      const feedPolicyAllowed = await destFeedAllowed(location);
+      noteProfileBudget();
+      if (!feedPolicyAllowed) continue;
       const fetched = await fetchProfilerUrl(location, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS, remainingProfileBudgetMs(), deps.resolveHost);
       noteProfileBudget();
       stamp(`feed:${location}`, location, 'profiler:feed-fetch');
       if (!fetched || fetched.status < 200 || fetched.status >= 300) continue;
-      if (!(await allowFetched(fetched.finalUrl))) continue;
+      const finalFeedAllowed = await allowFetched(fetched.finalUrl);
+      noteProfileBudget();
+      if (!finalFeedAllowed) continue;
       const parsed = parseFeedXml(fetched.text, location, fetched.truncated);
       if (parsed.format === 'unknown') continue;
       feeds.push({ ...parsed, feedUrl: location });

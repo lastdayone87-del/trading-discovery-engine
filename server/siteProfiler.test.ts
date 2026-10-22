@@ -812,3 +812,32 @@ test('profiler budget exhaustion returns INCOMPLETE instead of a persistable pro
   assert.equal(result.status, 'INCOMPLETE');
   assert.equal(result.profile?.robotsFetch.state, 'UNREACHABLE');
 });
+
+test('profiler budget exhaustion during the last feed guard is INCOMPLETE', async () => {
+  const publicIp = '93.184.216.1';
+  const seed = 'https://slow-feed.example/';
+  const feed = 'https://feed.slow-feed.example/feed';
+  const resolveHost = async (host: string): Promise<string[]> => {
+    if (host === 'feed.slow-feed.example') return new Promise<string[]>(() => {});
+    return [publicIp];
+  };
+  const fetchImpl = (async (input: unknown) => {
+    const url = String(input);
+    if (url.endsWith('/robots.txt')) {
+      return new Response('User-agent: *\nAllow: /\n', { status: 200, headers: { 'content-type': 'text/plain' } });
+    }
+    if (url === seed) {
+      return new Response(
+        `<html><head><link rel="alternate" type="application/rss+xml" href="${feed}"></head><body>ok</body></html>`,
+        { status: 200, headers: { 'content-type': 'text/html' } },
+      );
+    }
+    return new Response('not found', { status: 404, headers: { 'content-type': 'text/plain' } });
+  }) as typeof fetch;
+  const result = await runSiteProfiler(
+    { siteIdentity: 'slow-feed.example', identityTier: 'A', seedUrl: seed },
+    { fetchImpl, resolveHost, profileTimeoutMs: 120, now: () => '2026-10-01T00:00:00.000Z' },
+    async () => true,
+  );
+  assert.equal(result.status, 'INCOMPLETE');
+});

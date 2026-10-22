@@ -159,8 +159,15 @@ async function handleHttpRequest(
   upstream.once('close', finish);
   upstream.once('error', () => {
     finish();
-    if (res.destroyed) return;
-    if (!res.headersSent) res.writeHead(timedOut ? 504 : 502, { 'content-type': 'text/plain' });
+    if (res.destroyed || res.writableEnded) return;
+    // Once headers are on the wire, appending an error string to a 200
+    // response would look like a complete page to Chromium. Abort the
+    // response instead so the crawler sees a failed navigation.
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
+    res.writeHead(timedOut ? 504 : 502, { 'content-type': 'text/plain' });
     res.end(timedOut ? 'Upstream request timed out' : 'Upstream request failed');
   });
   upstream.once('response', upstreamRes => {
