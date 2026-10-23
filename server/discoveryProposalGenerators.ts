@@ -48,13 +48,17 @@ export function createProposalDedupKey(
   proposalFamily: ProposalFamily,
   country: string,
   concept: string,
-  targetNeighborhoodKey?: string | null
+  targetNeighborhoodKey?: string | null,
+  dedupDiscriminator?: string | null
 ): string {
   const normFamily = proposalFamily.toUpperCase().trim();
   const normCountry = country.toUpperCase().trim();
   const normConcept = concept.normalize('NFKC').trim().toLowerCase();
   const normNeighborhood = (targetNeighborhoodKey || 'none').trim().toLowerCase();
-  const raw = `${normFamily}|${normCountry}|${normConcept}|${normNeighborhood}`;
+  const base = `${normFamily}|${normCountry}|${normConcept}|${normNeighborhood}`;
+  const discriminator = (dedupDiscriminator || '').normalize('NFKC').trim().toLowerCase();
+  // Preserve every pre-existing key exactly when no discriminator is supplied.
+  const raw = discriminator ? `${base}|${discriminator}` : base;
   return createHash('sha256').update(raw).digest('hex');
 }
 
@@ -114,6 +118,12 @@ export function buildFrontierProposal(params: {
   ttlDays?: number;
   expiresAt?: string;
   preserveCountryIdentity?: boolean;
+  /**
+   * Optional stable discriminator for time-bounded proposal families. It is
+   * intentionally ignored outside CREATOR_DERIVED so existing keys remain
+   * byte-for-byte stable.
+   */
+  dedupDiscriminator?: string;
 }): DiscoveryFrontierProposal {
   const dimensions: DiscoveryNeighborhoodDimensions = {
     country: params.country,
@@ -127,7 +137,13 @@ export function buildFrontierProposal(params: {
   };
 
   const neighborhood = buildDiscoveryNeighborhood(dimensions);
-  const dedupKey = createProposalDedupKey(params.proposalFamily, params.country, params.concept, neighborhood.neighborhoodKey);
+  const dedupKey = createProposalDedupKey(
+    params.proposalFamily,
+    params.country,
+    params.concept,
+    neighborhood.neighborhoodKey,
+    params.proposalFamily === 'CREATOR_DERIVED' ? params.dedupDiscriminator : undefined
+  );
 
   const ttl = params.ttlDays ?? 14;
   const requestedExpiry = params.expiresAt ? Date.parse(params.expiresAt) : NaN;
@@ -292,6 +308,7 @@ export async function generateCreatorDerivedProposals(
         sourceFamily: 'creator_derived',
         sourceProvenance: `creator_metadata:${row.channel_id}:${concept.term}`,
         expiresAt: options.expiresAt,
+        dedupDiscriminator: options.pilotAssignmentKey || options.pilotQuotaDay,
         supportingEvidence: {
           channelId: row.channel_id,
           channelTitle: row.channel_name,
@@ -700,10 +717,11 @@ export async function generateTemporalProposals(country: string, limit = 10): Pr
  * improves monotonically without losing an already persisted signal.
  */
 export async function persistFrontierProposals(
-  proposals: DiscoveryFrontierProposal[]
+  proposals: DiscoveryFrontierProposal[],
+  dbOverride?: any
 ): Promise<number> {
   if (!proposals.length) return 0;
-  const db = await getDb();
+  const db = dbOverride || await getDb();
   let inserted = 0;
 
   for (const p of proposals) {

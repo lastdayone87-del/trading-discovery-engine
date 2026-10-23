@@ -8,6 +8,9 @@ import {
   computeAdaptivePilotMetrics,
   recordAdaptivePilotAssignment
 } from './adaptiveDiscoveryPilot';
+import { ADAPTIVE_PILOT_POLICY_VERSION } from './adaptiveDiscoveryPilotPolicy';
+import { buildFrontierProposal, persistFrontierProposals } from './discoveryProposalGenerators';
+import { getNeighborhoodCandidates } from './discoveryFrontierAllocator';
 
 /**
  * Dedicated-database tests for the adaptive pilot assignment ledger. The CI
@@ -78,6 +81,78 @@ maybe('assignments are immutable and idempotent for the same country-day', async
     [seed]
   );
   assert.equal(Number(count.rows[0].count), 1);
+});
+
+maybe('a recurring creator concept is persisted and allocatable on the next treatment day', async () => {
+  const db = await requirePool();
+  const concept = `price action ${runTag}`;
+  const dayOneStart = '2026-10-23T07:00:00.000Z';
+  const dayOneEnd = '2026-10-24T07:00:00.000Z';
+  const dayTwoStart = '2026-10-24T07:00:00.000Z';
+  const dayTwoEnd = '2026-10-25T07:00:00.000Z';
+  const dayTwoAssignment = await recordAdaptivePilotAssignment({
+    country: 'US',
+    quotaDay: '2026-10-24',
+    arm: 'TREATMENT',
+    treatmentPercent: 100,
+    seed,
+    windowStart: dayTwoStart,
+    windowEnd: dayTwoEnd
+  }, db);
+
+  const proposal = (quotaDay: string, expiresAt: string, assignmentKey: string) =>
+    buildFrontierProposal({
+      proposalFamily: 'CREATOR_DERIVED',
+      country: 'US',
+      concept,
+      retrievalLane: 'VIDEO',
+      sourceFamily: 'creator_derived',
+      sourceProvenance: `creator_metadata:pg-${runTag}:${concept}`,
+      expiresAt,
+      dedupDiscriminator: assignmentKey,
+      supportingEvidence: {
+        channelId: `pg-${runTag}`,
+        nativeTerm: concept,
+        sourceProvenanceFamily: 'CREATOR_DERIVED',
+        pilotArm: 'TREATMENT',
+        pilotQuotaDay: quotaDay,
+        pilotAssignmentKey: assignmentKey,
+        pilotPolicyVersion: ADAPTIVE_PILOT_POLICY_VERSION
+      },
+      noveltyRationale: 'PostgreSQL consecutive-day regression.'
+    });
+
+  const dayOne = proposal('2026-10-23', dayOneEnd, `day-one-${runTag}`);
+  const dayTwo = proposal('2026-10-24', dayTwoEnd, dayTwoAssignment.assignmentKey);
+  assert.notEqual(dayOne.dedupKey, dayTwo.dedupKey);
+
+  try {
+    assert.equal(await persistFrontierProposals([dayOne], db), 1);
+    assert.equal(await persistFrontierProposals([dayTwo], db), 1);
+
+    const rows = await db.query(
+      `SELECT proposal_id::text, dedup_key, supporting_evidence->>'pilotQuotaDay' AS quota_day
+       FROM frontier_discovery_proposals WHERE concept=$1`,
+      [concept]
+    );
+    assert.equal(rows.rowCount, 2, 'both country-day proposals must persist');
+    const dayOneId = rows.rows.find(row => row.quota_day === '2026-10-23')?.proposal_id;
+    const dayTwoId = rows.rows.find(row => row.quota_day === '2026-10-24')?.proposal_id;
+    assert.ok(dayOneId && dayTwoId);
+
+    await db.query(
+      `INSERT INTO app_settings(setting_key,setting_value)
+       VALUES('adaptive_discovery_pilot_enabled','true')
+       ON CONFLICT(setting_key) DO UPDATE SET setting_value='true'`
+    );
+    const candidates = await getNeighborhoodCandidates('US', new Date('2026-10-24T12:00:00.000Z'), db);
+    assert.ok(candidates.some(candidate => candidate.proposalId === dayTwoId), 'day-two proposal must be allocatable');
+    assert.ok(!candidates.some(candidate => candidate.proposalId === dayOneId), 'expired day-one proposal must not be selected');
+  } finally {
+    await db.query(`DELETE FROM app_settings WHERE setting_key='adaptive_discovery_pilot_enabled'`).catch(() => undefined);
+    await db.query(`DELETE FROM frontier_discovery_proposals WHERE concept=$1`, [concept]).catch(() => undefined);
+    await db.query(`DELETE FROM discovery_neighborhoods WHERE neighborhood_key=$1`, [dayTwo.targetNeighborhoodKey]).catch(() => undefined);
+  }
 });
 
 maybe('metrics return zero runs for an assignment without completed observations', async () => {

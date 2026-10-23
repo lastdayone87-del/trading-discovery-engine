@@ -341,6 +341,43 @@ test('allocator fails closed for creator-derived proposals outside an active tre
   assert.equal((await filterAdaptivePilotCandidates([{ ...candidate, proposalEvidenceSnapshot: { supportingEvidence: { pilotArm: 'TREATMENT', pilotQuotaDay: '2026-10-23', pilotPolicyVersion: 'older-policy' } } }], '2026-10-23', enabled)).length, 0);
 });
 
+test('day-two creator-derived evidence remains allocatable after the day-one proposal expires', async () => {
+  const build = (quotaDay: string, expiresAt: string, assignmentKey: string) => buildFrontierProposal({
+    proposalFamily: 'CREATOR_DERIVED',
+    country: 'US',
+    concept: 'price action',
+    retrievalLane: 'VIDEO',
+    sourceFamily: 'creator_derived',
+    sourceProvenance: 'creator_metadata:test:price action',
+    expiresAt,
+    dedupDiscriminator: assignmentKey,
+    supportingEvidence: {
+      channelId: 'creator-1',
+      nativeTerm: 'price action',
+      sourceProvenanceFamily: 'CREATOR_DERIVED',
+      pilotArm: 'TREATMENT',
+      pilotQuotaDay: quotaDay,
+      pilotAssignmentKey: assignmentKey,
+      pilotPolicyVersion: ADAPTIVE_PILOT_POLICY_VERSION
+    },
+    noveltyRationale: 'fixture'
+  });
+  const dayOne = build('2026-10-23', '2026-10-24T07:00:00.000Z', 'assignment-day-one');
+  const dayTwo = build('2026-10-24', '2026-10-25T07:00:00.000Z', 'assignment-day-two');
+  const candidate = (proposal: DiscoveryFrontierProposal) => ({
+    proposalFamily: proposal.proposalFamily,
+    proposalEvidenceSnapshot: {
+      proposalFamily: proposal.proposalFamily,
+      supportingEvidence: proposal.supportingEvidence
+    }
+  }) as any;
+  const enabled = { query: async () => ({ rows: [{ setting_value: 'true' }] }) };
+
+  assert.notEqual(dayOne.dedupKey, dayTwo.dedupKey);
+  assert.equal((await filterAdaptivePilotCandidates([candidate(dayTwo)], '2026-10-24', enabled)).length, 1);
+  assert.equal((await filterAdaptivePilotCandidates([candidate(dayOne)], '2026-10-24', enabled)).length, 0);
+});
+
 test('metrics are bounded by the report window and isolated by policy version', async () => {
   let captured: { sql: string; params: unknown[] } | null = null;
   const client = {
