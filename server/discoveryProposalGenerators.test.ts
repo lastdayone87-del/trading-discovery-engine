@@ -70,6 +70,46 @@ test('creator-derived proposals bind actual channel columns and a checksummed fo
   assert.match(String(proposal.supportingEvidence.evidenceVersion), /^1970-01-01T00:00:00.000Z\|/);
 });
 
+test('creator-derived proposals for consecutive treatment days produce distinct dedup keys', () => {
+  const neighborhood = 'US|en|GENERAL|price action|VIDEO|RELEVANCE|none|creator_derived';
+  const stable = createProposalDedupKey('CREATOR_DERIVED', 'US', 'price action', neighborhood);
+  const empty = createProposalDedupKey('CREATOR_DERIVED', 'US', 'price action', neighborhood, '');
+  const dayOne = createProposalDedupKey('CREATOR_DERIVED', 'US', 'price action', neighborhood, 'assignment-day-one');
+  const dayTwo = createProposalDedupKey('CREATOR_DERIVED', 'US', 'price action', neighborhood, 'assignment-day-two');
+
+  assert.equal(stable, empty, 'An absent discriminator must preserve the historical key');
+  assert.notEqual(dayOne, dayTwo, 'A recurring creator concept must get a new key on the next pilot day');
+  assert.equal(dayOne, createProposalDedupKey('CREATOR_DERIVED', 'US', 'price action', neighborhood, 'assignment-day-one'));
+
+  const first = buildFrontierProposal({
+    proposalFamily: 'CREATOR_DERIVED',
+    country: 'United States',
+    concept: 'price action',
+    retrievalLane: 'VIDEO',
+    sourceFamily: 'creator_derived',
+    sourceProvenance: 'creator_metadata:creator-1:price action',
+    dedupDiscriminator: 'assignment-day-one',
+    expiresAt: '2026-10-24T07:00:00.000Z',
+    supportingEvidence: { nativeTerm: 'price action' },
+    noveltyRationale: 'Verified-creator follow-up.'
+  });
+  const second = buildFrontierProposal({
+    proposalFamily: 'CREATOR_DERIVED',
+    country: 'United States',
+    concept: 'price action',
+    retrievalLane: 'VIDEO',
+    sourceFamily: 'creator_derived',
+    sourceProvenance: 'creator_metadata:creator-1:price action',
+    dedupDiscriminator: 'assignment-day-two',
+    expiresAt: '2026-10-25T07:00:00.000Z',
+    supportingEvidence: { nativeTerm: 'price action' },
+    noveltyRationale: 'Verified-creator follow-up.'
+  });
+
+  assert.notEqual(first.dedupKey, second.dedupKey);
+  assert.equal(first.targetNeighborhoodKey, second.targetNeighborhoodKey, 'Both day-specific rows must point at the same governed neighborhood');
+});
+
 test('creator-derived generator uses the channels schema and governed vocabulary evidence', async () => {
   const source = await import('node:fs').then(fs => fs.readFileSync(
     new URL('./discoveryProposalGenerators.ts', import.meta.url),
@@ -84,5 +124,6 @@ test('creator-derived generator uses the channels schema and governed vocabulary
   assert.match(source, /pilotQuotaDay: options\.pilotQuotaDay/);
   assert.match(source, /pilotAssignmentKey: options\.pilotAssignmentKey/);
   assert.match(source, /pilotPolicyVersion: options\.pilotPolicyVersion/);
+  assert.match(source, /dedupDiscriminator: options\.pilotAssignmentKey \|\| options\.pilotQuotaDay/);
   assert.doesNotMatch(source, /c\.title/);
 });
