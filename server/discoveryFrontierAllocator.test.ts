@@ -41,7 +41,7 @@ test('pinned mode cannot steal another country when the requested country has no
   const mockClient = {
     query: async (sql: string, params?: unknown[]) => {
       if (sql.includes('discovery_neighborhoods')) {
-        candidateTarget = params?.[2];
+        candidateTarget = params?.[3];
         return { rows: [] };
       }
       return { rows: [] };

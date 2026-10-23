@@ -83,5 +83,6 @@ test('creator-derived generator uses the channels schema and governed vocabulary
   assert.match(source, /expiresAt: options\.expiresAt/);
   assert.match(source, /pilotQuotaDay: options\.pilotQuotaDay/);
   assert.match(source, /pilotAssignmentKey: options\.pilotAssignmentKey/);
+  assert.match(source, /pilotPolicyVersion: options\.pilotPolicyVersion/);
   assert.doesNotMatch(source, /c\.title/);
 });

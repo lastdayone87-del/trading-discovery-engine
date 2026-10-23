@@ -235,6 +235,7 @@ export interface CreatorDerivedProposalOptions {
   pilotQuotaDay?: string;
   pilotAssignmentKey?: string;
   pilotArm?: 'TREATMENT' | 'CONTROL';
+  pilotPolicyVersion?: string;
 }
 
 export async function generateCreatorDerivedProposals(
@@ -303,7 +304,8 @@ export async function generateCreatorDerivedProposals(
           lastObservedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at,
           pilotArm: options.pilotArm || null,
           pilotQuotaDay: options.pilotQuotaDay || null,
-          pilotAssignmentKey: options.pilotAssignmentKey || null
+          pilotAssignmentKey: options.pilotAssignmentKey || null,
+          pilotPolicyVersion: options.pilotPolicyVersion || null
         },
         confidence: 0.70,
         noveltyRationale: `Follow-up query seeded by verified quality creator "${row.channel_name}" using ${concept.method.toLocaleLowerCase('en')} evidence.`

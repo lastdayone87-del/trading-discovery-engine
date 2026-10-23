@@ -8,6 +8,7 @@ import { allocateSearchOrdering, SearchOrdering } from './searchOrdering';
 import { calculateEffectiveYouTubeBudget, calculateYouTubeDailyBudget, describeQuotaProjectMap } from './quotaPolicy';
 import { scopeEligibilityForWrite } from './scopeEligibility';
 import { getYouTubeQuotaDay } from './youtubeQuotaDay';
+import { ADAPTIVE_PILOT_POLICY_VERSION } from './adaptiveDiscoveryPilotPolicy';
 import { getConfiguredYouTubeKeys, getConfiguredYouTubeProviders } from './youtubeKeyPool';
 import { youtubeProviderCooldown, type YouTubeProviderOperationalStatus } from './youtubeProviderCooldown';
 import type { AuditEvent } from './operatorAuth';
@@ -2787,9 +2788,10 @@ export async function scheduleAutonomousQueryRuns(
                AND (p.proposal_family <> 'CREATOR_DERIVED' OR (
                  p.supporting_evidence->>'pilotArm' = 'TREATMENT'
                  AND p.supporting_evidence->>'pilotQuotaDay' = d.quota_day
+                 AND p.supporting_evidence->>'pilotPolicyVersion' = $2
                  AND (p.expires_at IS NULL OR p.expires_at > now())
                ))
-             RETURNING p.proposal_id`, [candidate.frontierDecisionId]
+             RETURNING p.proposal_id`, [candidate.frontierDecisionId, ADAPTIVE_PILOT_POLICY_VERSION]
           );
           if (!consumed.rowCount) throw new Error(`FRONTIER_PROPOSAL_CONSUME_FAILED: ${candidate.frontierDecisionId}`);
         }
