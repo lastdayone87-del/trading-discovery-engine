@@ -304,38 +304,58 @@ export async function materializeAdaptiveDiscoveryPilotProposals(
   const generateDerived = deps.generateDerived || generateCreatorDerivedProposals;
   const persist = deps.persist || persistFrontierProposals;
 
-  const assignments: AdaptivePilotAssignment[] = [];
-  const groups: Array<{ country: string; proposals: DiscoveryFrontierProposal[] }> = [];
+  type PilotCountryResult = {
+    assignment: AdaptivePilotAssignment;
+    group: { country: string; proposals: DiscoveryFrontierProposal[] };
+  };
+  const deadlineAt = Date.now() + deadlineMs;
+  const remainingDeadlineMs = () => Math.max(1, deadlineAt - Date.now());
 
-  for (const country of normalizedCountries) {
-    const arm = assignAdaptivePilotArm({
+  // Countries run concurrently under one shared deadline. The recorded
+  // assignment, never a recomputed local arm, governs treatment so a config
+  // change during the quota day cannot desynchronize execution from audit.
+  const results = await Promise.all(normalizedCountries.map(async (country): Promise<PilotCountryResult | null> => {
+    const assignment = await settleBeforeDeadline(recordAssignment({
       country,
       quotaDay,
-      treatmentPercent: pilot.treatmentPercent,
-      seed: pilot.seed
-    });
-    assignments.push(await recordAssignment({
-      country,
-      quotaDay,
-      arm,
+      arm: assignAdaptivePilotArm({
+        country,
+        quotaDay,
+        treatmentPercent: pilot.treatmentPercent,
+        seed: pilot.seed
+      }),
       treatmentPercent: pilot.treatmentPercent,
       seed: pilot.seed,
       windowStart,
       windowEnd
-    }));
+    }), remainingDeadlineMs(), null);
+    if (!assignment) return null;
 
-    const native = await settleBeforeDeadline(generateNative(country, perCountryCap), deadlineMs, []);
-    const derived = arm === 'TREATMENT'
-      ? await settleBeforeDeadline(generateDerived(country, perCountryCap), deadlineMs, [])
-      : [];
-    groups.push({
-      country,
-      proposals: arm === 'TREATMENT' ? interleaveFamilies(native, derived) : native
-    });
-  }
+    const [native, derived] = await Promise.all([
+      settleBeforeDeadline(generateNative(country, perCountryCap), remainingDeadlineMs(), []),
+      assignment.arm === 'TREATMENT'
+        ? settleBeforeDeadline(generateDerived(country, perCountryCap, {
+            expiresAt: assignment.windowEnd,
+            pilotQuotaDay: assignment.quotaDay,
+            pilotAssignmentKey: assignment.assignmentKey,
+            pilotArm: assignment.arm
+          }), remainingDeadlineMs(), [])
+        : Promise.resolve([])
+    ]);
+    const proposals = (assignment.arm === 'TREATMENT'
+      ? interleaveFamilies(native, derived)
+      : native).slice(0, perCountryCap);
+    return { assignment, group: { country, proposals } };
+  }));
+
+  const successful = results
+    .filter((item): item is PilotCountryResult => item !== null)
+    .sort((a, b) => a.assignment.country.localeCompare(b.assignment.country));
+  const assignments = successful.map(item => item.assignment);
+  const groups = successful.map(item => item.group);
 
   const selected = selectFairAdaptiveProposals(groups, globalCap, fairnessCursor);
-  const persisted = await settleBeforeDeadline(persist(selected), deadlineMs, 0);
+  const persisted = await settleBeforeDeadline(persist(selected), remainingDeadlineMs(), 0);
   return {
     enabled: true,
     generated: selected.length,
@@ -461,6 +481,7 @@ export function aggregateAdaptivePilotMetrics(rows: AdaptivePilotAggregateRow[])
 export async function computeAdaptivePilotMetrics(input: {
   windowStart: string;
   windowEnd: string;
+  policyVersion?: string;
   client?: AdaptivePilotDb;
 }): Promise<AdaptivePilotMetrics> {
   const startMs = Date.parse(input.windowStart);
@@ -468,11 +489,14 @@ export async function computeAdaptivePilotMetrics(input: {
   if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
     throw new Error('ADAPTIVE_PILOT_INVALID_WINDOW');
   }
+  const policyVersion = input.policyVersion || ADAPTIVE_PILOT_POLICY_VERSION;
   const db = input.client || (await getDb());
   const result = await db.query(
     `WITH latest_obs AS (
        SELECT DISTINCT ON (query_run_id) *
        FROM discovery_evaluation_run_observations
+       WHERE allocation_at >= $1::timestamptz - interval '1 day'
+         AND allocation_at < $2::timestamptz + interval '1 day'
        ORDER BY query_run_id, observation_revision DESC
      )
      SELECT
@@ -495,11 +519,13 @@ export async function computeAdaptivePilotMetrics(input: {
       AND o.allocation_at >= a.window_start
       AND o.allocation_at < a.window_end
      WHERE a.window_start >= $1 AND a.window_start < $2
+       AND a.policy_version = $3
      GROUP BY a.arm
      ORDER BY a.arm`,
-    [input.windowStart, input.windowEnd]
+    [input.windowStart, input.windowEnd, policyVersion]
   );
   return summarizeAdaptivePilotMetrics({
+    policyVersion,
     windowStart: new Date(startMs).toISOString(),
     windowEnd: new Date(endMs).toISOString(),
     rows: result.rows.map(row => ({
@@ -522,6 +548,7 @@ export async function computeAdaptivePilotMetrics(input: {
 
 /** Pure summary used by the database report and deterministic tests. */
 export function summarizeAdaptivePilotMetrics(input: {
+  policyVersion?: string;
   windowStart: string;
   windowEnd: string;
   rows: AdaptivePilotAggregateRow[];
@@ -531,7 +558,7 @@ export function summarizeAdaptivePilotMetrics(input: {
   const control = arms.find(arm => arm.arm === 'CONTROL')!;
   const delta = (a: number, b: number): number => b > 0 ? a / b - 1 : 0;
   return {
-    policyVersion: ADAPTIVE_PILOT_POLICY_VERSION,
+    policyVersion: input.policyVersion || ADAPTIVE_PILOT_POLICY_VERSION,
     windowStart: input.windowStart,
     windowEnd: input.windowEnd,
     arms: { TREATMENT: treatment, CONTROL: control },
