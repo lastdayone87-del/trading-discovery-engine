@@ -5,6 +5,11 @@ import {
   ENFORCED_KEY,
   ENFORCED_LOCK_TIMEOUT_MS,
   ENFORCED_STATEMENT_TIMEOUT_MS,
+  PROBE_QUOTA_DEFAULT_CAP_UNITS,
+  PROBE_QUOTA_MAX_SHARE,
+  ProbeQuotaDisabledError,
+  ProbeQuotaExceededError,
+  ProbeQuotaUnavailableError,
   SHADOW_CAP_UNITS,
   SHADOW_LEASE_TTL_MS,
   YouTubeKeyCapExceededError,
@@ -15,15 +20,21 @@ import {
   keyCapAdvisoryLockName,
   parseShadowCapUnits,
   parseShadowLeaseTtlMs,
+  probeQuotaMaxCapUnits,
   recordShadowDispatchSafe,
   reserveEnforcedKeyCap,
+  reserveProbeQuota,
   reserveYouTubeKeyCap,
   resetKeyCapEnforcementCacheForTests,
+  resetProbeQuotaConfigCacheForTests,
+  resetProbeQuotaExhaustionCacheForTests,
   resetShadowConfigCacheForTests,
   resetShadowSweepClockForTests,
   resolveKeyCapEnforcement,
+  resolveProbeQuotaConfig,
   resolveShadowConfig,
   settleKeyCapReservation,
+  settleProbeQuotaReservation,
   settleShadowLease,
   simulateShadowReplay,
   sweepShadowEvents,
@@ -684,4 +695,128 @@ test('settleShadowLease exact operation ID releases only that day/key lease', as
   assert.deepEqual(queries[0].values?.slice(0, 3), ['2026-10-16', 'op-exact', 'fp-exact']);
   assert.equal(queries[0].values?.length, 5);
   assert.ok(queries[0].values?.[3] instanceof Date);
+});
+
+
+test('probe allocation ceiling is 10% of the effective budget with a 20k hard ceiling', () => {
+  const oneKey = probeQuotaMaxCapUnits({ YOUTUBE_API_KEY: 'test-key', YOUTUBE_DAILY_QUOTA_PER_KEY: '10000' });
+  assert.equal(oneKey, 1000);
+  assert.equal(PROBE_QUOTA_MAX_SHARE, 0.10);
+  const noKeys = probeQuotaMaxCapUnits({});
+  assert.equal(noKeys, 100, 'no configured budget still yields a safe fail-closed floor');
+});
+
+test('probe allocation config is opt-in, bounded, and malformed settings fail closed', async () => {
+  resetProbeQuotaConfigCacheForTests();
+  const disabled = await resolveProbeQuotaConfig(async (_key, fallback) => fallback, Date.now(), {
+    YOUTUBE_API_KEY: 'test-key', YOUTUBE_DAILY_QUOTA_PER_KEY: '10000',
+  });
+  assert.equal(disabled.enabled, false);
+  assert.equal(disabled.capUnits, 0);
+  assert.equal(disabled.maxCapUnits, 1000);
+
+  resetProbeQuotaConfigCacheForTests();
+  const enabled = await resolveProbeQuotaConfig(async (key, fallback) => {
+    if (key === 'youtube_probe_official_quota_enabled') return 'true';
+    if (key === 'youtube_probe_daily_cap_units') return '750';
+    return fallback;
+  }, Date.now(), { YOUTUBE_API_KEY: 'test-key', YOUTUBE_DAILY_QUOTA_PER_KEY: '10000' });
+  assert.equal(enabled.enabled, true);
+  assert.equal(enabled.capUnits, 750);
+  assert.equal(enabled.effectiveDailyBudget, 10000);
+
+  resetProbeQuotaConfigCacheForTests();
+  await assert.rejects(
+    resolveProbeQuotaConfig(async (key, fallback) => {
+      if (key === 'youtube_probe_official_quota_enabled') return 'true';
+      if (key === 'youtube_probe_daily_cap_units') return '1001';
+      return fallback;
+    }, Date.now(), { YOUTUBE_API_KEY: 'test-key', YOUTUBE_DAILY_QUOTA_PER_KEY: '10000' }),
+    (error: unknown) => error instanceof ProbeQuotaUnavailableError && error.code === 'PROBE_QUOTA_UNAVAILABLE'
+  );
+
+  resetProbeQuotaConfigCacheForTests();
+  await assert.rejects(
+    resolveProbeQuotaConfig(async (key, fallback) => {
+      if (key === 'youtube_probe_official_quota_enabled') return 'true';
+      if (key === 'youtube_probe_daily_cap_units') return 'not-a-number';
+      return fallback;
+    }, Date.now(), { YOUTUBE_API_KEY: 'test-key', YOUTUBE_DAILY_QUOTA_PER_KEY: '10000' }),
+    (error: unknown) => error instanceof ProbeQuotaUnavailableError
+  );
+  assert.equal(PROBE_QUOTA_DEFAULT_CAP_UNITS, 10000);
+});
+
+test('probe reservation fails closed before touching the pool when disabled', async () => {
+  resetProbeQuotaConfigCacheForTests();
+  resetProbeQuotaExhaustionCacheForTests();
+  let connects = 0;
+  const pool = { connect: async () => { connects++; throw new Error('must not connect'); } } as unknown as ShadowPoolPort;
+  await assert.rejects(
+    reserveProbeQuota({ readSetting: async (_key, fallback) => fallback, pool }, {
+      keyFingerprint: 'fp', operationId: 'op', units: 1,
+    }),
+    (error: unknown) => error instanceof ProbeQuotaDisabledError && error.code === 'PROBE_QUOTA_DISABLED'
+  );
+  assert.equal(connects, 0);
+});
+
+test('probe settlement uses the exact probe lease and rejects unit mismatch', async () => {
+  const queries: Array<{ text: string; values?: unknown[] }> = [];
+  const client: ShadowQueryClient = {
+    query: async (text, values) => {
+      queries.push({ text, values });
+      if (text.includes('SELECT reserved_units, allocation')) {
+        return { rows: [{ reserved_units: 10, allocation: 'PROBE' }], rowCount: 1 };
+      }
+      if (text.includes('WITH removed AS')) {
+        return { rows: [{ removed: 1, units_used: 10 }], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+  };
+  const reservation = {
+    mode: 'probe' as const,
+    operationId: 'op-probe-settle',
+    quotaDay: '2026-10-20',
+    keyFingerprint: 'fp-probe-settle',
+    units: 10,
+    capUnits: 100,
+    projectedBefore: 0,
+  };
+  assert.equal(await settleProbeQuotaReservation(client, reservation), true);
+  assert.ok(queries.some(query => query.text.includes('allocation = \'PROBE\'')));
+  assert.ok(queries.some(query => query.text.includes('INSERT INTO youtube_probe_quota_usage')));
+
+  const mismatch: ShadowQueryClient = {
+    query: async (text) => {
+      if (text.includes('SELECT reserved_units, allocation')) {
+        return { rows: [{ reserved_units: 10, allocation: 'NORMAL' }], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+  };
+  await assert.rejects(
+    settleProbeQuotaReservation(mismatch, reservation),
+    (error: unknown) => error instanceof ProbeQuotaUnavailableError
+  );
+});
+
+test('probe dispatcher is fenced before fetch and settles through the official charge', async () => {
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  const probeReserve = source.indexOf('probeReservation=await reserveProbeQuota');
+  const fetchCall = source.indexOf('fetch(dispatchedUrl', probeReserve);
+  assert.ok(probeReserve >= 0 && fetchCall > probeReserve, 'probe reservation must precede the official request');
+  assert.match(source, /probeQuotaReservation:probeReservation/);
+  assert.match(source, /keyCap \|\| probe/);
+  assert.match(source, /incrementQuota\(unitsConsumed, providerKey, operationId, settlement\)/);
+});
+
+test('queue workers run PROBE normally and fail only UNKNOWN provenance', async () => {
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  assert.match(source, /if \(quotaOrigin === 'UNKNOWN'\)/);
+  assert.match(source, /runWithOfficialYouTubeQuotaOrigin\(quotaOrigin,/);
+  assert.doesNotMatch(source, /if \(quotaOrigin !== 'NORMAL'\)/);
 });

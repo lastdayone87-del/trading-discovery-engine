@@ -8,6 +8,7 @@
 
 import { getDb } from './dbCore';
 import {
+  currentOfficialYouTubeQuotaOrigin,
   mergeQuotaOrigins,
   type ResolvedQuotaOrigin,
 } from './officialYouTubeQuotaFence';
@@ -54,15 +55,15 @@ function rowOrigin(value: unknown): QuotaOrigin | 'UNKNOWN' {
 export async function getChannelQuotaOrigin(
   channelId: string,
   client?: QuotaOriginDb,
-): Promise<QuotaOrigin | null> {
+): Promise<QuotaOrigin | 'UNKNOWN' | null> {
   if (!channelId) return null;
   const db = client ?? (await getDb());
   const result = await db.query(
     `SELECT quota_origin FROM channels WHERE channel_id=$1`,
     [channelId],
   );
-  if (!result.rowCount) return null;
-  return rowOrigin(result.rows[0]?.quota_origin) === 'PROBE' ? 'PROBE' : 'NORMAL';
+  if (!result.rows?.length) return null;
+  return rowOrigin(result.rows[0]?.quota_origin);
 }
 
 /**
@@ -74,10 +75,18 @@ export async function resolvePipelineQuotaOrigin(
   options?: { quotaOrigin?: QuotaOrigin | null },
   client?: QuotaOriginDb,
 ): Promise<ResolvedQuotaOrigin> {
-  const hinted = mergeQuotaOrigins(candidate.quotaOrigin, options?.quotaOrigin);
+  // The ambient context is authoritative too: a nested pipeline call must
+  // never downgrade an enclosing PROBE queue/probe run to NORMAL just because
+  // the caller omitted an explicit hint.
+  const hinted = mergeQuotaOrigins(
+    candidate.quotaOrigin,
+    options?.quotaOrigin,
+    currentOfficialYouTubeQuotaOrigin(),
+  );
   if (hinted === 'PROBE') return 'PROBE';
+  if (hinted === 'UNKNOWN') return 'UNKNOWN';
 
-  let stored: QuotaOrigin | null;
+  let stored: QuotaOrigin | 'UNKNOWN' | null;
   try {
     stored = await getChannelQuotaOrigin(String(candidate.channelId || ''), client);
   } catch {
@@ -85,8 +94,7 @@ export async function resolvePipelineQuotaOrigin(
   }
 
   if (stored === null) return hinted ?? 'NORMAL';
-  const storedOrigin = stored === 'PROBE' ? 'PROBE' : 'NORMAL';
-  return mergeQuotaOrigins(hinted, storedOrigin) ?? 'NORMAL';
+  return mergeQuotaOrigins(hinted, stored) ?? 'UNKNOWN';
 }
 
 function collectChannelIds(payload: any): string[] {

@@ -213,8 +213,13 @@ test('incrementQuota combines group-aware budgeting, operationId idempotency, an
   // Per-key usage and lease settlement follow the dispatch day, while the
   // singleton quota_tracker stays on the current Pacific day. A late prior-day
   // settlement must not rewind last_reset and zero current-day usage.
-  assert.ok(charge.includes('const keyQuotaDay=reservation?.quotaDay||getYouTubeQuotaDay();'));
+  assert.match(charge, /const keyQuotaDay=reservation\?\.quotaDay\|\|probeReservation\?\.quotaDay\|\|getYouTubeQuotaDay\(\);/);
   assert.ok(charge.includes('const trackerDay=getYouTubeQuotaDay();'));
+  // Probe allocation settlement is part of the same official-charge
+  // transaction; it cannot be silently skipped or moved outside the charge.
+  assert.ok(charge.includes('settleProbeQuotaReservation(client,probeReservation)'));
+  const probeSettleIndex = charge.indexOf('settleProbeQuotaReservation');
+  assert.ok(probeSettleIndex >= 0 && charge.indexOf("await client.query('COMMIT')", probeSettleIndex) > probeSettleIndex);
   const beginIndex = charge.indexOf("await client.query('BEGIN')");
   const trackerIndex = charge.indexOf('const trackerDay=getYouTubeQuotaDay();');
   assert.ok(beginIndex >= 0 && trackerIndex > beginIndex, 'tracker day is sampled after pool acquisition/BEGIN');
@@ -227,4 +232,24 @@ test('incrementQuota combines group-aware budgeting, operationId idempotency, an
   const quotaEnd = dbCore.indexOf('export async function incrementQuota', quotaStart);
   const quota = dbCore.slice(quotaStart, quotaEnd);
   assert.match(quota, /const limit=getDailyYouTubeQuotaBudget\(\)/);
+});
+
+test('probe allocation and per-key cap exhaustion defer without consuming an attempt', async () => {
+  const { decideJobFailure } = await import('./dbCore');
+  const { ProbeQuotaExceededError, ProbeQuotaDisabledError } = await import('./quotaKeyCapShadow');
+  const { getNextYouTubeQuotaResetAt } = await import('./youtubeQuotaDay');
+  const now = new Date('2026-10-20T19:00:00.000Z').getTime();
+  const probe = new ProbeQuotaExceededError('2026-10-20', 90, 20, 100, new Date(now));
+  const probeDecision = decideJobFailure(probe, 1, 5, now);
+  assert.equal(probeDecision.disposition, 'RETRYING_WITHOUT_ATTEMPT');
+  assert.equal(probeDecision.runAfter, getNextYouTubeQuotaResetAt(new Date(now)));
+
+  const disabled = new ProbeQuotaDisabledError('2026-10-20');
+  const disabledDecision = decideJobFailure(disabled, 1, 5, now);
+  assert.equal(disabledDecision.disposition, 'RETRYING_WITHOUT_ATTEMPT');
+
+  const keyCap = Object.assign(new Error('key cap'), { code: 'YOUTUBE_KEY_CAP_EXCEEDED' });
+  const keyDecision = decideJobFailure(keyCap, 1, 5, now);
+  assert.equal(keyDecision.disposition, 'RETRYING_WITHOUT_ATTEMPT');
+  assert.equal(keyDecision.runAfter, getNextYouTubeQuotaResetAt(new Date(now)));
 });

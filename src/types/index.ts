@@ -44,7 +44,8 @@ export type DiscoverySource = 'manual_search' | 'automated_query' | 'recheck';
 
 /**
  * Durable provenance for the official YouTube Data API quota fence.
- * PROBE is sticky and may never spend official quota; NORMAL may.
+ * PROBE is sticky and spends only from the independent probe allocation;
+ * NORMAL uses the ordinary budget.
  */
 export type QuotaOrigin = 'NORMAL' | 'PROBE';
 

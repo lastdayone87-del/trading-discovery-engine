@@ -725,19 +725,19 @@ export async function processNextSearchJob(
   const investigationId=String(job.payload?.investigationId||''),investigationStepId=String(job.payload?.investigationStepId||'');
   const traceId=String(job.payload?.traceId||'');
   // Establish durable provenance before any handler can reserve quota, hydrate
-  // metadata, or open a provider request. Probe-origin jobs are terminally
-  // rejected; they were produced by a zero-official-quota lane and must not
-  // become an official-quota run through a queue retry. UNKNOWN fails closed.
+  // metadata, or open a provider request. Probe-origin jobs run normally but
+  // every official call reserves from the independent probe allocation.
+  // UNKNOWN fails closed before any work, provider request, or review write.
   const quotaOrigin = await resolveJobQuotaOrigin(job);
-  if (quotaOrigin !== 'NORMAL') {
+  if (quotaOrigin === 'UNKNOWN') {
     await failJob(job.id, new OfficialYouTubeQuotaFenceError(
       quotaOrigin,
       `queueJob:${job.type}`,
-      `job ${job.id} is ${quotaOrigin === 'PROBE' ? 'probe-origin' : 'of unknown origin'}`,
+      `job ${job.id} has no durable quota provenance`,
     ));
     return true;
   }
-  return runWithOfficialYouTubeQuotaOrigin('NORMAL', `queueJob:${job.type}`, () => withExecutionTrace(traceId,async()=>{
+  return runWithOfficialYouTubeQuotaOrigin(quotaOrigin, `queueJob:${job.type}`, () => withExecutionTrace(traceId,async()=>{
   const heartbeat = setInterval(() => {
     heartbeatJob(job.id, workerId).catch(error => console.error(`[Queue Worker:${workerId}] Heartbeat failed:`, error));
     if(investigationId&&investigationStepId)heartbeatInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,workerId}).catch(error=>console.error(`[Investigation:${investigationId}] Heartbeat failed:`,error));

@@ -1,21 +1,28 @@
 import { randomUUID } from 'node:crypto';
 import { ChannelActivityBand, CountryMetadataStatus, CountryVocabulary, QuotaOrigin } from '../src/types';
 import {
-  assertOfficialYouTubeAllowed,
-  isOfficialYouTubeQuotaAllowed,
+  assertOfficialYouTubeQuotaOriginKnown,
+  currentOfficialYouTubeQuotaOrigin,
   isOfficialYouTubeQuotaFenceError,
+  isProbeOfficialYouTubeQuotaOrigin,
 } from './officialYouTubeQuotaFence';
 import { incrementQuota, getAppSetting, getDb, getYouTubeKeyPool, appendProviderCallEvent, recordYouTubeInvalidInput, isYouTubeInputQuarantined, recordYouTubeProviderSuspension } from './db';
 import { fingerprintYouTubeKey } from './youtubeQuotaAttribution';
 import {
   assertKeyCapReservationDayCurrent,
+  assertProbeQuotaReservationDayCurrent,
+  isProbeQuotaControlError,
   isYouTubeKeyCapError,
   recordShadowDispatchSafe,
+  releaseProbeQuotaReservation,
   reserveEnforcedKeyCap,
+  reserveProbeQuota,
   resolveKeyCapEnforcement,
   settleKeyCapReservation,
   SHADOW_OBSERVATION_BUDGET_MS,
   type KeyCapReservationContext,
+  type ProbeQuotaReservation,
+  type QuotaSettlementContext,
 } from './quotaKeyCapShadow';
 import { getConfiguredYouTubeProviders, getYouTubeQuotaGroupForKey } from './youtubeKeyPool';
 import {
@@ -193,7 +200,7 @@ export interface PlaylistChannelObservation {channelId:string;channelName:string
 
 /** One bounded channelSections.list request; only explicit multipleChannels IDs survive parsing. */
 export async function fetchYouTubeFeaturedChannels(sourceChannelId: string, maximumFanout: number): Promise<FeaturedChannelProviderResult> {
-  assertOfficialYouTubeAllowed('fetchYouTubeFeaturedChannels');
+  assertOfficialYouTubeQuotaOriginKnown('fetchYouTubeFeaturedChannels');
   if (!/^UC[A-Za-z0-9_-]{22}$/.test(sourceChannelId) || !Number.isInteger(maximumFanout) || maximumFanout < 1 || maximumFanout > 10) throw new Error('INVALID_FEATURED_CHANNEL_PROVIDER_INPUT');
   const keys = getYouTubeKeyPool(); if (!keys.length) throw new Error('YouTube featured-channel inspection requires an API key.');
   const acquisition = youtubePoolBackoff.beginAcquisition();
@@ -232,7 +239,7 @@ export async function fetchYouTubeFeaturedChannels(sourceChannelId: string, maxi
 
 /** One bounded playlistItems call (cost: one unit); no pagination is followed by the canary. */
 export async function fetchYouTubePlaylistChannels(playlistId:string,limit:number):Promise<PlaylistChannelObservation[]> {
-  assertOfficialYouTubeAllowed('fetchYouTubePlaylistChannels');
+  assertOfficialYouTubeQuotaOriginKnown('fetchYouTubePlaylistChannels');
   const keys=getYouTubeKeyPool();if(!keys.length)throw new Error('YouTube playlist inspection requires an API key.');
   const acquisition=youtubePoolBackoff.beginAcquisition(); let quotaExceededCount=0;
   const maxResults=Math.min(50,Math.max(1,Math.trunc(limit)));const observedAt=new Date().toISOString();
@@ -253,7 +260,7 @@ export async function fetchYouTubePlaylistChannels(playlistId:string,limit:numbe
 let activeKeyIndex = 0;
 let outboundTraceSequence = 0;
 const failedDispatchProvidersByAcquisition = new WeakMap<object, Set<string>>();
-const youtubeResponseProviderContext = new WeakMap<Response, { providerKey?: string; acquisition?: YouTubePoolAcquisition; providerFailureGeneration?: number; keyCapReservation?: KeyCapReservationContext }>();
+const youtubeResponseProviderContext = new WeakMap<Response, { providerKey?: string; acquisition?: YouTubePoolAcquisition; providerFailureGeneration?: number; keyCapReservation?: KeyCapReservationContext; probeQuotaReservation?: ProbeQuotaReservation }>();
 
 function failedDispatchProviders(acquisition?: YouTubePoolAcquisition): Set<string> | undefined {
   if (!acquisition || (typeof acquisition !== 'object' && typeof acquisition !== 'function')) return undefined;
@@ -339,9 +346,9 @@ async function persistYouTubeKeySuspension(providerKey: string, reason: string):
 }
 
 export function recordProviderFailure(key: string, error: unknown): void {
-  // A policy fence is not a provider failure. Never cool a key, persist a
-  // suspension, or attribute the probe's zero-quota policy to the provider.
-  if (isOfficialYouTubeQuotaFenceError(error)) return;
+  // Policy/capacity controls are not provider failures. Never cool a key,
+  // persist a suspension, or attribute budget exhaustion to provider health.
+  if (isOfficialYouTubeQuotaFenceError(error) || isProbeQuotaControlError(error)) return;
   const dispatchedKey = typeof (error as any)?.providerKey === 'string' ? (error as any).providerKey : key;
   // A rate-limited key is retired for this acquisition, while the bounded
   // outer provider loop may continue with another eligible key. If the whole
@@ -453,7 +460,7 @@ function preDispatchAbortError(signal:AbortSignal):Error{
 async function youtubeFetch(url:string,operation:string,actualCost:number,attempt=1,acquisition?:YouTubePoolAcquisition,priority:YouTubeRequestPriority='enrichment',providerKey?:string,lifecycle?:YouTubeProviderLifecycle):Promise<Response>{
   // Single choke point for every official YouTube Data API request. Probe
   // work must never reach this line; a missing/unknown origin fails closed.
-  assertOfficialYouTubeAllowed(`youtubeFetch:${operation}`);
+  assertOfficialYouTubeQuotaOriginKnown(`youtubeFetch:${operation}`);
   const traceId = `${operation}-${attempt}-${++outboundTraceSequence}`;
   let providerDispatchAttempt = 0;
   const trace = (stage: string) => console.log(`[YouTube Outbound Trace] ${traceId} ${stage}`);
@@ -520,11 +527,34 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
         // wire, this response must compare stale (not current) when the
         // reader validates it below.
         const dispatchFailureGeneration=dispatchedProviderKey?youtubeProviderCooldown.failureGeneration(dispatchedProviderKey):undefined;
+        // Probe-origin work reserves from its independent daily allocation
+        // even while the #533 global hard cap is OFF. The reservation is
+        // atomic and shared by every probe/worker, so concurrent jobs cannot
+        // overrun the bucket. The allocation is additive to the per-key cap
+        // when that cap is enabled; both settle in the official-charge tx.
+        let probeReservation: ProbeQuotaReservation | null = null;
+        if(dispatchedProviderKey && isProbeOfficialYouTubeQuotaOrigin()){
+          try {
+            probeReservation=await reserveProbeQuota(
+              {readSetting:getAppSetting,pool:await getDb()},
+              {keyFingerprint:fingerprintYouTubeKey(dispatchedProviderKey),operationId:`probe:${operation}:${randomUUID()}`,units:actualCost,now:new Date()}
+            );
+          } catch(error) {
+            // Budget/policy exhaustion is not key death and must not poison
+            // the provider pool. It still fails the request closed.
+            if(!isProbeQuotaControlError(error)) failedDispatchProviders(acquisition)?.add(dispatchedProviderKey);
+            throw error;
+          }
+        }
+        const releaseProbeReservationSafe=async():Promise<void>=>{
+          if(!probeReservation)return;
+          try{const pool=await getDb();await releaseProbeQuotaReservation(pool,probeReservation);}catch{/* conservative lease expiry remains the backstop */}
+        };
         // Hard cap ON: reserve before the official HTTP request. Settings,
         // database, lock and capacity failures are fatal here (fail closed).
         // Enforcement OFF keeps the observational shadow path below unchanged.
         let capReservation: KeyCapReservationContext | null = null;
-        if(dispatchedProviderKey){
+        if(dispatchedProviderKey && !probeReservation){
           try {
             if(await resolveKeyCapEnforcement(getAppSetting)){
               const capNow=new Date();
@@ -534,7 +564,10 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
               );
             }
           } catch(error) {
-            failedDispatchProviders(acquisition)?.add(dispatchedProviderKey);
+            // The probe lease was admitted first; do not strand it when the
+            // independent global-cap admission fails.
+            await releaseProbeReservationSafe();
+            if(!isProbeQuotaControlError(error)) failedDispatchProviders(acquisition)?.add(dispatchedProviderKey);
             throw error;
           }
         }
@@ -546,19 +579,25 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
           try{assertKeyCapReservationDayCurrent(capReservation, new Date());}
           catch(error){
             try{const pool=await getDb();await settleKeyCapReservation(pool,capReservation);}catch{/* expiry remains the backstop */}
+            await releaseProbeReservationSafe();
             throw error;
           }
         }
+        if(probeReservation){
+          try{assertProbeQuotaReservationDayCurrent(probeReservation, new Date());}
+          catch(error){await releaseProbeReservationSafe();throw error;}
+        }
         if(signal.aborted){
           // Reservation work can outlive the provider deadline. fetch() would
-          // abort without dispatching, so release the exact lease instead of
+          // abort without dispatching, so release the exact leases instead of
           // leaving admitted capacity stranded until the Pacific reset.
           if(capReservation){
             try{const pool=await getDb();await settleKeyCapReservation(pool,capReservation);}catch{/* expiry remains the backstop */}
           }
+          await releaseProbeReservationSafe();
           throw preDispatchAbortError(signal);
         }
-        if(dispatchedProviderKey && !capReservation){
+        if(dispatchedProviderKey && !capReservation && !probeReservation){
           // Shadow-only cap observation (never blocks or alters dispatch):          // record an in-flight lease plus any projected WOULD_DEFER/
           // WOULD_REJECT for the 9,000-unit/day per-key cap. Disabled by
           // default; every failure is swallowed inside the helper.
@@ -590,6 +629,10 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
         try {
           response=await fetch(dispatchedUrl,{signal});
         } catch (error) {
+          // Keep the reservation: YouTube may count a dispatched request even
+          // when the transport fails. The lease expires at the next Pacific
+          // reset if no charge is ever recorded; releasing here could
+          // under-count real provider spend under concurrency.
           if(dispatchedProviderKey){
             failedDispatchProviders(acquisition)?.add(dispatchedProviderKey);
             if(error&&typeof error==='object')Object.assign(error,{providerKey:dispatchedProviderKey});
@@ -598,6 +641,9 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
         }
         trace(`after HTTP fetch at server/youtube.ts:131 (status=${response.status})`);
         if(!response.ok){
+          // Hold the reservation until reset: a non-2xx request can still have
+          // consumed provider quota, and the conservative lease prevents
+          // concurrent retries from over-admitting the allocation.
           trace('before HTTP-error-body-read at server/youtube.ts:135');
           const error=await youtubeHttpError(response,trace);
           trace('after HTTP-error-body-read at server/youtube.ts:135');
@@ -637,7 +683,7 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
           }
           throw error;
         }
-        youtubeResponseProviderContext.set(response,{providerKey:dispatchedProviderKey,acquisition,providerFailureGeneration:dispatchFailureGeneration,keyCapReservation:capReservation ?? undefined});
+        youtubeResponseProviderContext.set(response,{providerKey:dispatchedProviderKey,acquisition,providerFailureGeneration:dispatchFailureGeneration,keyCapReservation:capReservation ?? undefined,probeQuotaReservation:probeReservation ?? undefined});
         return response;
       }});
     }, trace, priority);
@@ -658,14 +704,14 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
     // Cap admission failures are control-flow signals, not provider failures:
     // unwrap them so callers can see YOUTUBE_KEY_CAP_EXCEEDED/UNAVAILABLE and
     // never mark the key suspended.
-    const capError = isYouTubeKeyCapError(error)
+    const controlError = isYouTubeKeyCapError(error) || isProbeQuotaControlError(error)
       ? error
-      : isYouTubeKeyCapError((error as any)?.cause)
+      : isYouTubeKeyCapError((error as any)?.cause) || isProbeQuotaControlError((error as any)?.cause)
         ? (error as any).cause
         : null;
-    if(capError&&typeof capError==='object'){
-      if(dispatchedProviderKey)(capError as any).providerKey=dispatchedProviderKey;
-      throw capError;
+    if(controlError&&typeof controlError==='object'){
+      if(dispatchedProviderKey)(controlError as any).providerKey=dispatchedProviderKey;
+      throw controlError;
     }
     if(dispatchedProviderKey&&error&&typeof error==='object'){
       const wrappedCause=(error as any).cause;
@@ -870,7 +916,7 @@ export async function searchYouTubeChannels(
  * channels.list(forHandle); video IDs use videos.list(snippet). No text-name
  * matching is permitted because ambiguous names are not authoritative identity. */
 export async function resolveYouTubeLocatorAuthoritatively(identity: string, type: 'HANDLE' | 'VIDEO_ID' | 'CHANNEL_ID'): Promise<string | null> {
-  assertOfficialYouTubeAllowed('resolveYouTubeLocatorAuthoritatively');
+  assertOfficialYouTubeQuotaOriginKnown('resolveYouTubeLocatorAuthoritatively');
   if (type === 'CHANNEL_ID') return /^UC[A-Za-z0-9_-]{22}$/.test(identity) ? identity : null;
   const keys = getYouTubeKeyPool();
   if (!keys.length) throw new Error('YOUTUBE_RESOLUTION_CAPACITY_UNAVAILABLE');
@@ -921,7 +967,7 @@ export async function searchYouTubeChannelPage(
    */
   searchWindow?: { publishedAfter?: string; publishedBefore?: string } | null
 ): Promise<YouTubeChannelPage> {
-  assertOfficialYouTubeAllowed('searchYouTubeChannelPage');
+  assertOfficialYouTubeQuotaOriginKnown('searchYouTubeChannelPage');
   const sanitizedQuery = sanitizeSearchQuery(query, countryName);
   if (!sanitizedQuery) return { channels: [], nextPageToken: null, rawResultCount: 0 };
   // Fail fast on a durably quarantined query before touching any key.
@@ -1015,7 +1061,7 @@ export async function fetchRecentVideoDescriptionsFromAPI(channelId: string): Pr
  * retry, and error semantics are identical — this is the same code path.
  */
 export async function fetchRecentVideoDescriptionsWithIds(channelId: string): Promise<RecentVideoDescription[]> {
-  assertOfficialYouTubeAllowed('fetchRecentVideoDescriptionsWithIds');
+  assertOfficialYouTubeQuotaOriginKnown('fetchRecentVideoDescriptionsWithIds');
   const keyPool = getYouTubeKeyPool();
   if (!channelId) return [];
   if (keyPool.length === 0) throw new Error('Recent-video description API is unavailable because no provider is configured.');
@@ -1105,10 +1151,16 @@ export async function fetchRecentVideoDescriptionsWithIds(channelId: string): Pr
 async function accountYouTubeQuotaResponse(response: Response, units: number): Promise<string> {
   const providerKey = getYouTubeResponseProviderKey(response);
   const operationId = randomUUID();
-  const reservation = youtubeResponseProviderContext.get(response)?.keyCapReservation;
+  const context = youtubeResponseProviderContext.get(response);
+  const keyCap = context?.keyCapReservation;
+  const probe = context?.probeQuotaReservation;
   const shadowOperationId = getYouTubeResponseShadowOperationId(response);
+  const settlement: QuotaSettlementContext | string | undefined =
+    keyCap || probe
+      ? { keyCap, probe, shadowOperationId }
+      : shadowOperationId;
   try {
-    await retryYouTubeQuotaAccounting(unitsConsumed => incrementQuota(unitsConsumed, providerKey, operationId, reservation ?? shadowOperationId), units);
+    await retryYouTubeQuotaAccounting(unitsConsumed => incrementQuota(unitsConsumed, providerKey, operationId, settlement), units);
   } catch (error) {
     // Any accounting/settlement failure after a successful provider response
     // must stop the caller from refetching the same logical request with
@@ -1313,7 +1365,7 @@ export async function fetchYouTubeChannelEnrichment(
   onAdditionalQuota?: YouTubeAdditionalQuotaCallback,
   priority:YouTubeRequestPriority='enrichment'
 ): Promise<DiscoveredChannelRaw> {
-  assertOfficialYouTubeAllowed('fetchYouTubeChannelEnrichment');
+  assertOfficialYouTubeQuotaOriginKnown('fetchYouTubeChannelEnrichment');
   const keyPool = getYouTubeKeyPool();
   if (keyPool.length === 0) {
     throw new Error('YouTube enrichment requires at least one configured YouTube API key.');
@@ -1473,13 +1525,8 @@ export async function fetchYouTubeChannelEnrichment(
 
 /** One-unit basic metadata hydration used when country or subscriber evidence is missing. */
 export async function fetchYouTubeChannelCountryMetadata(channelId: string, fallback: DiscoveredChannelRaw): Promise<DiscoveredChannelRaw> {
+  assertOfficialYouTubeQuotaOriginKnown('fetchYouTubeChannelCountryMetadata');
   const checkedAt = new Date().toISOString();
-  // Probe-origin ingestion must degrade to public-page evidence rather than
-  // spend a channels.list unit. This path never throws, so return an explicit
-  // not-requested status instead of pretending provider capacity was absent.
-  if (!isOfficialYouTubeQuotaAllowed()) {
-    return { ...fallback, countryMetadataStatus: 'NOT_REQUESTED', countryMetadataCheckedAt: checkedAt };
-  }
   const keys = getYouTubeKeyPool();
   if (!keys.length) return { ...fallback, countryMetadataStatus: 'UNAVAILABLE', countryMetadataCheckedAt: checkedAt };
   let acquisition; try { acquisition=youtubePoolBackoff.beginAcquisition(); }

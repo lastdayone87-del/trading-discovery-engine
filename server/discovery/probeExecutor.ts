@@ -5,11 +5,12 @@
  * followed by the EXISTING ingestion/verification pipeline for each returned
  * channel (`processChannelThroughPipeline`, the same entry the autonomous
  * Innertube caller uses via processDiscoveredChannel). Probe retrieval itself
- * uses only the existing InnerTube executor and records zero official quota
- * units. The delegated ingestion pipeline may call official Data API or LLM
- * paths according to its own configuration and accounting; those downstream
- * units are outside this probe ledger and are not modeled here. No new HTTP
- * client and no eligibility/serving writes.
+ * uses only the existing InnerTube executor and records zero retrieval quota
+ * units. The delegated ingestion pipeline runs under sticky PROBE provenance;
+ * every downstream official Data API call (hydration, ENRICH_CHANNEL, retries,
+ * recovery) reserves from the independent probe allocation in
+ * `quotaKeyCapShadow.ts`. LLM calls remain outside the YouTube ledger. No new
+ * HTTP client and no eligibility/serving writes.
  *
  * Integration contract: `runApprovedProbe(candidate)` is the single entry.
  * It (a) re-reads `discovery_probe_enabled` (absent => OFF) and the probe kill
@@ -212,7 +213,8 @@ export async function runApprovedProbe(
 ): Promise<ProbeRunSummary> {
   // Every probe-originated async continuation, including injected ingestion
   // implementations, executes under a sticky PROBE context. Anything that
-  // reaches the official YouTube dispatcher fails closed before a request.
+  // reaches the official YouTube dispatcher must reserve from the independent
+  // probe allocation before a request; missing/invalid allocation fails closed.
   return runWithOfficialYouTubeQuotaOrigin('PROBE', 'runApprovedProbe', () =>
     runApprovedProbeInContext(candidate, deps),
   );

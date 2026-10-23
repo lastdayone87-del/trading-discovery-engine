@@ -1,4 +1,6 @@
 import { getNextYouTubeQuotaResetAt, getYouTubeQuotaDay, getYouTubeQuotaDayStartAt } from './youtubeQuotaDay';
+import { DEFAULT_YOUTUBE_DAILY_QUOTA_PER_KEY, calculateEffectiveYouTubeBudget } from './quotaPolicy';
+import { getConfiguredYouTubeProviders } from './youtubeKeyPool';
 
 /**
  * Per-key YouTube daily cap accounting: observational shadow mode plus a
@@ -24,6 +26,18 @@ export const ENFORCED_KEY = 'youtube_key_daily_cap_enforced';
 export const SHADOW_CAP_UNITS = 9000;
 /** Hard cap is fixed at the approved 9,000 units/key/Pacific day. */
 export const ENFORCED_CAP_UNITS = 9000;
+/**
+ * Independent probe-origin allocation. This is not the global hard cap: it is
+ * enforced even when `youtube_key_daily_cap_enforced` is OFF, because probe
+ * work must have an explicit, bounded official-quota budget before it starts.
+ * Both controls apply when the global cap is ON.
+ */
+export const PROBE_QUOTA_ENABLED_KEY = 'youtube_probe_official_quota_enabled';
+export const PROBE_QUOTA_CAP_KEY = 'youtube_probe_daily_cap_units';
+export const PROBE_QUOTA_DEFAULT_CAP_UNITS = 10_000;
+export const PROBE_QUOTA_MAX_SHARE = 0.10;
+export const PROBE_QUOTA_HARD_CEILING_UNITS = 20_000;
+export const PROBE_QUOTA_MIN_CAP_UNITS = 100;
 export const SHADOW_LEASE_TTL_MS = 120_000;
 export const SHADOW_CONFIG_TTL_MS = 30_000;
 export const SHADOW_SWEEP_INTERVAL_MS = 60_000;
@@ -147,6 +161,136 @@ export function isYouTubeKeyCapError(error: unknown): boolean {
     || error instanceof YouTubeKeyCapUnavailableError
     || (error as { code?: unknown } | null)?.code === 'YOUTUBE_KEY_CAP_EXCEEDED'
     || (error as { code?: unknown } | null)?.code === 'YOUTUBE_KEY_CAP_UNAVAILABLE';
+}
+
+/**
+ * Probe allocation lifecycle errors. They are policy/capacity signals, never
+ * provider health failures: callers must not suspend a key, and queue retries
+ * must not consume an attempt.
+ */
+export class ProbeQuotaExceededError extends Error {
+  readonly code = 'QUOTA_ALLOCATION_EXHAUSTED';
+  readonly retryable = true;
+  readonly probeQuotaExceeded = true;
+  readonly providerFailureRecorded = true;
+  readonly retryAt: number;
+  constructor(
+    readonly quotaDay: string,
+    readonly projectedUnits: number,
+    readonly requestUnits: number,
+    readonly capUnits: number,
+    now: Date = new Date(),
+  ) {
+    super(
+      `Probe official YouTube allocation exhausted for ${quotaDay}: ${projectedUnits} settled/in-flight + ${requestUnits} requested > ${capUnits}.`,
+    );
+    this.name = 'ProbeQuotaExceededError';
+    this.retryAt = getNextYouTubeQuotaResetAt(now);
+  }
+}
+
+export class ProbeQuotaUnavailableError extends Error {
+  readonly code = 'PROBE_QUOTA_UNAVAILABLE';
+  readonly retryable = true;
+  readonly probeQuotaUnavailable = true;
+  readonly providerFailureRecorded = true;
+  readonly retryAt: number;
+  constructor(
+    message: string,
+    readonly details: { quotaDay?: string; operationId?: string; cause?: unknown } = {},
+  ) {
+    super(message, details.cause === undefined ? undefined : { cause: details.cause });
+    this.name = 'ProbeQuotaUnavailableError';
+    this.retryAt = Date.now() + 60_000;
+  }
+}
+
+export class ProbeQuotaDisabledError extends Error {
+  readonly code = 'PROBE_QUOTA_DISABLED';
+  readonly retryable = true;
+  readonly probeQuotaDisabled = true;
+  readonly providerFailureRecorded = true;
+  readonly retryAt: number;
+  constructor(readonly quotaDay: string) {
+    super(`Probe official YouTube allocation is not enabled for ${quotaDay}.`);
+    this.name = 'ProbeQuotaDisabledError';
+    this.retryAt = getNextYouTubeQuotaResetAt(new Date());
+  }
+}
+
+export function isProbeQuotaControlError(error: unknown): boolean {
+  return error instanceof ProbeQuotaExceededError
+    || error instanceof ProbeQuotaUnavailableError
+    || error instanceof ProbeQuotaDisabledError
+    || (error as { code?: unknown } | null)?.code === 'QUOTA_ALLOCATION_EXHAUSTED'
+    || (error as { code?: unknown } | null)?.code === 'PROBE_QUOTA_UNAVAILABLE'
+    || (error as { code?: unknown } | null)?.code === 'PROBE_QUOTA_DISABLED';
+}
+
+export function isProbeQuotaExceededError(error: unknown): boolean {
+  return error instanceof ProbeQuotaExceededError
+    || (error as { probeQuotaExceeded?: unknown } | null)?.probeQuotaExceeded === true;
+}
+
+export interface ProbeQuotaConfig {
+  enabled: boolean;
+  capUnits: number;
+  maxCapUnits: number;
+  effectiveDailyBudget: number;
+}
+
+export function probeQuotaMaxCapUnits(environment: NodeJS.ProcessEnv = process.env): number {
+  const perKey = Number(environment.YOUTUBE_DAILY_QUOTA_PER_KEY || DEFAULT_YOUTUBE_DAILY_QUOTA_PER_KEY);
+  const providers = getConfiguredYouTubeProviders(environment);
+  const budget = calculateEffectiveYouTubeBudget(providers, perKey);
+  return Math.max(
+    PROBE_QUOTA_MIN_CAP_UNITS,
+    Math.min(PROBE_QUOTA_HARD_CEILING_UNITS, Math.floor(budget * PROBE_QUOTA_MAX_SHARE)),
+  );
+}
+
+let cachedProbeConfig: { at: number; config: ProbeQuotaConfig } | null = null;
+
+/**
+ * Probe allocation is opt-in. Missing/disabled config is NOT "unlimited"; the
+ * dispatcher fails closed. A malformed cap fails closed. The cap may not exceed
+ * 10% of the effective daily YouTube budget (project-aware) or 20,000 units.
+ */
+export async function resolveProbeQuotaConfig(
+  readSetting: ShadowSettingReader,
+  now: number = Date.now(),
+  environment: NodeJS.ProcessEnv = process.env,
+): Promise<ProbeQuotaConfig> {
+  if (cachedProbeConfig && now - cachedProbeConfig.at < SHADOW_CONFIG_TTL_MS) return cachedProbeConfig.config;
+  let enabledRaw: string;
+  let capRaw: string;
+  try {
+    [enabledRaw, capRaw] = await Promise.all([
+      readSetting(PROBE_QUOTA_ENABLED_KEY, 'false'),
+      readSetting(PROBE_QUOTA_CAP_KEY, '0'),
+    ]);
+  } catch (error) {
+    throw new ProbeQuotaUnavailableError('Unable to read the probe official-quota allocation settings.', { cause: error });
+  }
+  const providers = getConfiguredYouTubeProviders(environment);
+  const perKey = Number(environment.YOUTUBE_DAILY_QUOTA_PER_KEY || DEFAULT_YOUTUBE_DAILY_QUOTA_PER_KEY);
+  const effectiveDailyBudget = calculateEffectiveYouTubeBudget(providers, perKey);
+  const maxCapUnits = probeQuotaMaxCapUnits(environment);
+  const enabled = enabledRaw === 'true';
+  const parsedCap = Number(String(capRaw).trim());
+  const capUnits = Number.isSafeInteger(parsedCap) ? parsedCap : 0;
+  if (enabled && (capUnits < PROBE_QUOTA_MIN_CAP_UNITS || capUnits > maxCapUnits)) {
+    throw new ProbeQuotaUnavailableError(
+      `Probe official-quota cap must be an integer between ${PROBE_QUOTA_MIN_CAP_UNITS} and ${maxCapUnits} (10% of the effective daily budget, hard ceiling ${PROBE_QUOTA_HARD_CEILING_UNITS}).`,
+    );
+  }
+  const config = { enabled, capUnits, maxCapUnits, effectiveDailyBudget };
+  cachedProbeConfig = { at: now, config };
+  return config;
+}
+
+export function resetProbeQuotaConfigCacheForTests(): void {
+  cachedProbeConfig = null;
 }
 
 /** Integer 1..9000; malformed or missing values fall back to 9000. */
@@ -871,6 +1015,279 @@ export async function reserveEnforcedKeyCap(
   } finally {
     client.release?.();
   }
+}
+
+// ---------------------------------------------------------------------------
+// Probe-origin official allocation (default OFF; enforced independently of the
+// global per-key hard cap, and additive when the global cap is ON)
+// ---------------------------------------------------------------------------
+
+export interface ProbeQuotaReservation {
+  mode: 'probe';
+  operationId: string;
+  quotaDay: string;
+  keyFingerprint: string;
+  units: number;
+  capUnits: number;
+  projectedBefore: number;
+}
+
+/** Composite settlement passed to incrementQuota when both controls apply. */
+export interface QuotaSettlementContext {
+  keyCap?: KeyCapReservationContext;
+  probe?: ProbeQuotaReservation;
+  shadowOperationId?: string;
+}
+
+const PROBE_PROJECTED_SQL = `
+SELECT COALESCE((
+         SELECT units_used FROM youtube_probe_quota_usage
+          WHERE quota_day = $1
+       ), 0)::int
+     + COALESCE((
+         SELECT SUM(reserved_units) FROM youtube_key_cap_shadow_leases
+          WHERE quota_day = $1 AND allocation = 'PROBE' AND expires_at > $2
+       ), 0)::int AS projected_units
+`;
+
+const PROBE_EXISTING_SQL = `
+SELECT key_fingerprint, reserved_units, allocation
+  FROM youtube_key_cap_shadow_leases
+ WHERE quota_day = $1 AND operation_id = $2
+ FOR UPDATE
+`;
+
+const PROBE_INSERT_SQL = `
+INSERT INTO youtube_key_cap_shadow_leases
+  (quota_day, operation_id, key_fingerprint, reserved_units, reserved_at, expires_at, allocation)
+VALUES ($1, $2, $3, $4, $5, $6, 'PROBE')
+ON CONFLICT (quota_day, operation_id) DO NOTHING
+RETURNING id
+`;
+
+const PROBE_REFRESH_SQL = `
+UPDATE youtube_key_cap_shadow_leases SET expires_at = $3
+ WHERE quota_day = $1 AND operation_id = $2 AND allocation = 'PROBE'
+`;
+
+const PROBE_RELEASE_SQL = `
+DELETE FROM youtube_key_cap_shadow_leases
+ WHERE quota_day = $1 AND operation_id = $2 AND allocation = 'PROBE'
+`;
+
+const PROBE_SETTLE_SQL = `
+WITH removed AS (
+  DELETE FROM youtube_key_cap_shadow_leases
+   WHERE quota_day = $1 AND operation_id = $2 AND allocation = 'PROBE' AND reserved_units = $3
+   RETURNING 1
+), used AS (
+  INSERT INTO youtube_probe_quota_usage (quota_day, units_used, updated_at)
+  SELECT $1, $3, now() WHERE EXISTS (SELECT 1 FROM removed)
+  ON CONFLICT (quota_day) DO UPDATE
+    SET units_used = youtube_probe_quota_usage.units_used + EXCLUDED.units_used,
+        updated_at = now()
+  RETURNING units_used
+)
+SELECT (SELECT count(*)::int FROM removed) AS removed,
+       (SELECT units_used FROM used) AS units_used
+`;
+
+let probeQuotaExhaustedUntilMs = 0;
+
+export function resetProbeQuotaExhaustionCacheForTests(): void {
+  probeQuotaExhaustedUntilMs = 0;
+}
+
+export function assertProbeQuotaReservationDayCurrent(
+  reservation: ProbeQuotaReservation,
+  now: Date = new Date(),
+): void {
+  const currentDay = getYouTubeQuotaDay(now);
+  if (reservation.quotaDay !== currentDay) {
+    throw new ProbeQuotaUnavailableError('Probe quota reservation crossed the Pacific quota day before dispatch.', {
+      quotaDay: reservation.quotaDay,
+      operationId: reservation.operationId,
+    });
+  }
+}
+
+/**
+ * Reserves from the shared probe-origin daily bucket. The advisory lock is
+ * global for the Pacific day, so concurrent probes/workers cannot collectively
+ * over-admit. The lease is settled in the same transaction as the official
+ * quota charge; failed dispatches release it explicitly.
+ */
+export async function reserveProbeQuota(
+  deps: KeyCapReserveDeps,
+  input: EnforcedReservationInput,
+): Promise<ProbeQuotaReservation> {
+  const normalized = normalizedReservationInput(input);
+  const { units, keyFingerprint, operationId, quotaDay, now } = normalized;
+  if (Date.now() < probeQuotaExhaustedUntilMs) {
+    throw new ProbeQuotaExceededError(quotaDay, 0, units, 0, now);
+  }
+  const config = await resolveProbeQuotaConfig(deps.readSetting, now.getTime());
+  if (!config.enabled) throw new ProbeQuotaDisabledError(quotaDay);
+  const capUnits = config.capUnits;
+  const lockTimeoutMs = Math.max(
+    1,
+    Math.min(ENFORCED_LOCK_TIMEOUT_MS, Math.round(Number(input.lockTimeoutMs ?? ENFORCED_LOCK_TIMEOUT_MS))),
+  );
+  const expiresAt = new Date(getNextYouTubeQuotaResetAt(now));
+  let client: ShadowConnectionPort | undefined;
+  let connectTimer: ReturnType<typeof setTimeout> | undefined;
+  let connectTimedOut = false;
+  try {
+    const pending = deps.pool.connect();
+    pending.then(late => { if (connectTimedOut) late.release?.(); }).catch(() => undefined);
+    const timeout = new Promise<never>((_resolve, reject) => {
+      connectTimer = setTimeout(() => {
+        connectTimedOut = true;
+        reject(new ProbeQuotaUnavailableError('Probe quota database connection timed out.', { quotaDay, operationId }));
+      }, ENFORCED_CONNECT_TIMEOUT_MS);
+    });
+    client = await Promise.race([pending, timeout]);
+  } catch (error) {
+    if (isProbeQuotaControlError(error)) throw error;
+    throw new ProbeQuotaUnavailableError('Probe quota database connection failed.', { quotaDay, operationId, cause: error });
+  } finally {
+    if (connectTimer) clearTimeout(connectTimer);
+  }
+  if (!client) {
+    throw new ProbeQuotaUnavailableError('Probe quota database connection failed.', { quotaDay, operationId });
+  }
+  try {
+    await client.query('BEGIN');
+    await client.query(`SET LOCAL lock_timeout = '${lockTimeoutMs}ms'`);
+    await client.query(`SET LOCAL statement_timeout = '${ENFORCED_STATEMENT_TIMEOUT_MS}ms'`);
+    try {
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
+        `youtube-probe-quota:${quotaDay}`,
+      ]);
+    } catch (error) {
+      throw new ProbeQuotaUnavailableError(
+        (error as { code?: unknown } | null)?.code === '55P03'
+          ? 'Probe quota reservation lock timed out.'
+          : 'Probe quota reservation lock failed.',
+        { quotaDay, operationId, cause: error },
+      );
+    }
+
+    const existing = await client.query(PROBE_EXISTING_SQL, [quotaDay, operationId]);
+    if (existing.rows.length > 0) {
+      const row = existing.rows[0];
+      if (row.allocation !== 'PROBE') {
+        throw new ProbeQuotaUnavailableError('Probe quota operation ID is already reserved for a non-probe allocation.', {
+          quotaDay, operationId,
+        });
+      }
+      if (String(row.key_fingerprint) !== keyFingerprint || Number(row.reserved_units) !== units) {
+        throw new ProbeQuotaUnavailableError('Probe quota operation ID is already reserved with different key/units.', {
+          quotaDay, operationId,
+        });
+      }
+      await client.query(PROBE_REFRESH_SQL, [quotaDay, operationId, expiresAt]);
+      const projected = await client.query(PROBE_PROJECTED_SQL, [quotaDay, now]);
+      await client.query('COMMIT');
+      return {
+        mode: 'probe', operationId, quotaDay, keyFingerprint, units, capUnits,
+        projectedBefore: Number(projected.rows[0]?.projected_units ?? 0),
+      };
+    }
+
+    // When the #533 per-key cap is enabled, the probe lease is also the
+    // per-key lease: check the per-key projection inside this same transaction
+    // instead of inserting a second lease for the same units. This keeps both
+    // controls atomic and avoids double-counting probe spend in the key cap.
+    if (await resolveKeyCapEnforcement(deps.readSetting, now.getTime())) {
+      const keyProjected = await client.query(PROJECTED_SQL, [quotaDay, keyFingerprint, now]);
+      const keyProjectedBefore = Number(keyProjected.rows[0]?.projected_units ?? 0);
+      if (!Number.isFinite(keyProjectedBefore) || keyProjectedBefore + units > ENFORCED_CAP_UNITS) {
+        throw new YouTubeKeyCapExceededError(quotaDay, keyFingerprint, keyProjectedBefore, units);
+      }
+    }
+
+    const projected = await client.query(PROBE_PROJECTED_SQL, [quotaDay, now]);
+    const projectedBefore = Number(projected.rows[0]?.projected_units ?? 0);
+    if (!Number.isFinite(projectedBefore) || projectedBefore + units > capUnits) {
+      probeQuotaExhaustedUntilMs = Date.now() + 30_000;
+      throw new ProbeQuotaExceededError(quotaDay, projectedBefore, units, capUnits, now);
+    }
+    const inserted = await client.query(PROBE_INSERT_SQL, [
+      quotaDay, operationId, keyFingerprint, units, now, expiresAt,
+    ]);
+    if ((inserted.rowCount ?? 0) < 1) {
+      throw new ProbeQuotaUnavailableError('Probe quota operation ID collided with another reservation.', {
+        quotaDay, operationId,
+      });
+    }
+    await client.query('COMMIT');
+    return { mode: 'probe', operationId, quotaDay, keyFingerprint, units, capUnits, projectedBefore };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    if (isProbeQuotaControlError(error)) throw error;
+    throw new ProbeQuotaUnavailableError('Probe quota reservation transaction failed.', {
+      quotaDay, operationId, cause: error,
+    });
+  } finally {
+    client.release?.();
+  }
+}
+
+/** Releases a probe lease for a dispatch that failed before official spend. */
+export async function releaseProbeQuotaReservation(
+  client: ShadowQueryClient,
+  reservation: Pick<ProbeQuotaReservation, 'quotaDay' | 'operationId'>,
+): Promise<boolean> {
+  const result = await client.query(PROBE_RELEASE_SQL, [reservation.quotaDay, reservation.operationId]);
+  return (result.rowCount ?? 0) > 0;
+}
+
+/**
+ * Settles a successful official charge. Must run inside incrementQuota's
+ * transaction: the usage increment and lease removal commit atomically with
+ * the official charge, so a crash cannot lose or double-count spend.
+ */
+export async function settleProbeQuotaReservation(
+  client: ShadowQueryClient,
+  reservation: ProbeQuotaReservation,
+): Promise<boolean> {
+  const existing = await client.query(
+    `SELECT reserved_units, allocation FROM youtube_key_cap_shadow_leases
+      WHERE quota_day = $1 AND operation_id = $2 FOR UPDATE`,
+    [reservation.quotaDay, reservation.operationId],
+  );
+  if (existing.rows.length === 0) return false;
+  const row = existing.rows[0];
+  if (row.allocation !== 'PROBE' || Number(row.reserved_units) !== reservation.units) {
+    throw new ProbeQuotaUnavailableError('Probe quota settlement does not match the reservation.', {
+      quotaDay: reservation.quotaDay,
+      operationId: reservation.operationId,
+    });
+  }
+  const result = await client.query(PROBE_SETTLE_SQL, [
+    reservation.quotaDay, reservation.operationId, reservation.units,
+  ]);
+  return Number(result.rows?.[0]?.removed ?? 0) > 0;
+}
+
+export async function getProbeQuotaStatus(
+  client: ShadowQueryClient,
+  now: Date = new Date(),
+  config?: ProbeQuotaConfig,
+): Promise<{ quotaDay: string; usedUnits: number; inFlightUnits: number; capUnits: number }> {
+  const quotaDay = getYouTubeQuotaDay(now);
+  const result = await client.query(
+    `SELECT COALESCE((SELECT units_used FROM youtube_probe_quota_usage WHERE quota_day=$1),0)::int AS used_units,
+            COALESCE((SELECT SUM(reserved_units) FROM youtube_key_cap_shadow_leases WHERE quota_day=$1 AND allocation='PROBE' AND expires_at>$2),0)::int AS in_flight_units`,
+    [quotaDay, now],
+  );
+  return {
+    quotaDay,
+    usedUnits: Number(result.rows[0]?.used_units ?? 0),
+    inFlightUnits: Number(result.rows[0]?.in_flight_units ?? 0),
+    capUnits: config?.capUnits ?? 0,
+  };
 }
 
 // ---------------------------------------------------------------------------

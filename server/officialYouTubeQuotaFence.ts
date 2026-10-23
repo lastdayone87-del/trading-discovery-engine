@@ -1,9 +1,11 @@
 /**
  * Official YouTube Data API quota fence.
  *
- * Probe-originated work must never spend official YouTube Data API quota.
- * Retrieval for probes uses InnerTube (zero official units); every downstream
- * path that could reach `server/youtube.ts` is fenced here.
+ * Probe retrieval uses InnerTube (zero official units). Downstream hydration,
+ * enrichment, queued jobs and retries are allowed to spend official YouTube
+ * quota only from the independent probe allocation enforced in
+ * `quotaKeyCapShadow.ts`. Every official call establishes provenance here;
+ * unknown origin fails closed.
  *
  * The fence is intentionally small and dependency-free so it can be imported
  * from the probe layer, the ingestion pipeline, queue dispatch, and the
@@ -14,7 +16,8 @@
  *  - no AsyncLocalStorage context => NORMAL (legacy production callers)
  *  - PROBE is sticky: a nested NORMAL context can never downgrade it
  *  - UNKNOWN dominates NORMAL and is fail-closed
- *  - PROBE dominates UNKNOWN so the most restrictive provenance wins
+ *  - PROBE dominates UNKNOWN/NORMAL so a probe's provenance cannot be
+ *    downgraded by a nested caller
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -90,13 +93,22 @@ export function currentOfficialYouTubeQuotaEntry(): string | null {
   return storage.getStore()?.entry ?? null;
 }
 
-export function isOfficialYouTubeQuotaAllowed(): boolean {
-  return currentOfficialYouTubeQuotaOrigin() === 'NORMAL';
+export function isOfficialYouTubeQuotaOriginKnown(): boolean {
+  return currentOfficialYouTubeQuotaOrigin() !== 'UNKNOWN';
 }
 
-export function assertOfficialYouTubeAllowed(entry: string): void {
+export function isProbeOfficialYouTubeQuotaOrigin(): boolean {
+  return currentOfficialYouTubeQuotaOrigin() === 'PROBE';
+}
+
+/**
+ * Every official entry point must establish provenance before dispatch. NORMAL
+ * and PROBE are both allowed; PROBE spends from the independent probe
+ * allocation. UNKNOWN is not allowed to spend and fails closed.
+ */
+export function assertOfficialYouTubeQuotaOriginKnown(entry: string): void {
   const origin = currentOfficialYouTubeQuotaOrigin();
-  if (origin !== 'NORMAL') {
+  if (origin === 'UNKNOWN') {
     throw new OfficialYouTubeQuotaFenceError(origin, entry);
   }
 }

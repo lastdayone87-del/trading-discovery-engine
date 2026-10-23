@@ -7,12 +7,12 @@ import { allocateRetrievalLane, RetrievalLane } from './retrievalLanes';
 import { allocateSearchOrdering, SearchOrdering } from './searchOrdering';
 import { calculateEffectiveYouTubeBudget, calculateYouTubeDailyBudget, describeQuotaProjectMap } from './quotaPolicy';
 import { scopeEligibilityForWrite } from './scopeEligibility';
-import { getYouTubeQuotaDay } from './youtubeQuotaDay';
+import { getNextYouTubeQuotaResetAt, getYouTubeQuotaDay } from './youtubeQuotaDay';
 import { getConfiguredYouTubeKeys, getConfiguredYouTubeProviders } from './youtubeKeyPool';
 import { youtubeProviderCooldown, type YouTubeProviderOperationalStatus } from './youtubeProviderCooldown';
 import type { AuditEvent } from './operatorAuth';
 import type { ProviderCallEvent } from './providerResilience';
-import { resolveShadowConfig, settleKeyCapReservation, settleShadowLeaseWithSavepoint, YouTubeKeyCapUnavailableError, type KeyCapReservationContext } from './quotaKeyCapShadow';
+import { ProbeQuotaUnavailableError, resolveShadowConfig, settleKeyCapReservation, settleProbeQuotaReservation, settleShadowLeaseWithSavepoint, YouTubeKeyCapUnavailableError, type KeyCapReservationContext, type QuotaSettlementContext } from './quotaKeyCapShadow';
 import { canonicalCountry } from './countryInference';
 import { classifyDiscoveryVisibility } from './discoveryStateVisibility';
 import { safeCrawlerTelemetry, type CrawlerTelemetry } from './crawlerTelemetry';
@@ -1083,12 +1083,19 @@ export async function incrementQuota(
   units:number,
   providerKey:string,
   operationId?: string,
-  shadowOperationIdOrReservation?: string | KeyCapReservationContext
+  shadowOperationIdOrReservation?: string | KeyCapReservationContext | QuotaSettlementContext
 ):Promise<void>{
-  const reservation = typeof shadowOperationIdOrReservation === 'object' && shadowOperationIdOrReservation !== null
-    ? shadowOperationIdOrReservation
+  const objectArg = typeof shadowOperationIdOrReservation === 'object' && shadowOperationIdOrReservation !== null
+    ? shadowOperationIdOrReservation as KeyCapReservationContext | QuotaSettlementContext
     : undefined;
-  const shadowOperationId = typeof shadowOperationIdOrReservation === 'string' ? shadowOperationIdOrReservation : undefined;
+  const composite = objectArg && ('keyCap' in objectArg || 'probe' in objectArg)
+    ? objectArg as QuotaSettlementContext
+    : undefined;
+  const reservation = composite ? composite.keyCap : objectArg as KeyCapReservationContext | undefined;
+  const probeReservation = composite?.probe;
+  const shadowOperationId = typeof shadowOperationIdOrReservation === 'string'
+    ? shadowOperationIdOrReservation
+    : composite?.shadowOperationId;
   if(!Number.isSafeInteger(units)||units<=0)throw new Error('YouTube quota charge must be a positive integer.');
   const keys=getYouTubeKeyPool(); const keyIndex=keys.indexOf(providerKey)+1; if(keyIndex<1)throw new Error('YouTube quota charge provider key is not configured.');
   const keyFingerprint=fingerprintYouTubeKey(providerKey);
@@ -1097,7 +1104,7 @@ export async function incrementQuota(
   // attributed to the day that admitted it. The single-row quota_tracker is a
   // current-day aggregate; give it the current day so a late prior-day charge
   // can never rewind last_reset and zero the current day's usage.
-  const keyQuotaDay=reservation?.quotaDay||getYouTubeQuotaDay();
+  const keyQuotaDay=reservation?.quotaDay||probeReservation?.quotaDay||getYouTubeQuotaDay();
   if(reservation?.mode==='enforce'&&reservation.keyFingerprint!==keyFingerprint){
     throw new YouTubeKeyCapUnavailableError('YouTube key cap reservation key does not match the charged provider key.',{
       quotaDay:reservation.quotaDay,keyFingerprint:reservation.keyFingerprint,operationId:reservation.operationId,
@@ -1108,7 +1115,12 @@ export async function incrementQuota(
       quotaDay:reservation.quotaDay,keyFingerprint:keyFingerprint,operationId:reservation.operationId,
     });
   }
-  const shadowConfig=reservation?null:await resolveShadowConfig(getAppSetting).catch(()=>null); const db=await getDb(); const client=await db.connect(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=getDailyYouTubeQuotaBudget();
+  if(probeReservation&&(probeReservation.keyFingerprint!==keyFingerprint||probeReservation.units!==units)){
+    throw new ProbeQuotaUnavailableError('Probe allocation reservation does not match the charged key/units.',{
+      quotaDay:probeReservation.quotaDay,operationId:probeReservation.operationId,
+    });
+  }
+  const shadowConfig=(reservation||probeReservation)?null:await resolveShadowConfig(getAppSetting).catch(()=>null); const db=await getDb(); const client=await db.connect(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=getDailyYouTubeQuotaBudget();
   try{
     await client.query('BEGIN');
     // Read the aggregate tracker day after pool acquisition and BEGIN. A
@@ -1129,7 +1141,13 @@ export async function incrementQuota(
       // charge. Enforce failures roll the charge back (fail closed); shadow
       // failures stay savepoint-guarded and never poison the charge.
       await settleKeyCapReservation(client,reservation);
-    } else if(shadowConfig?.enabled){
+    }
+    if(probeReservation){
+      // Probe usage and lease removal commit with the charge. A settlement
+      // failure rolls back the charge so the allocation cannot silently drift.
+      await settleProbeQuotaReservation(client,probeReservation);
+    }
+    if(!reservation && !probeReservation && shadowConfig?.enabled){
       // Legacy shadow settlement (no reservation context): release the
       // exact operation lease when the caller supplied one, otherwise the
       // legacy unit-matched lease. Savepoint-guarded.
@@ -2153,7 +2171,20 @@ export function decideJobFailure(error:any,attempts:number,maxAttempts:number,no
   // The quota fence is a policy terminal, not a provider failure. It must
   // never retry, cool a provider, or consume the job retry budget.
   if(isOfficialYouTubeQuotaFenceError(error))return {disposition:'FAILED'};
-  if(String(error?.code||'')==='INVESTIGATION_DEADLINE_EXCEEDED')return {disposition:'FAILED'};
+  // Probe allocation controls are capacity/policy signals. Defer without
+  // consuming an attempt and without turning the channel into a human-review
+  // case. The reset instant is carried by the typed error.
+  const failureCode=String(error?.code||'');
+  if(failureCode==='QUOTA_ALLOCATION_EXHAUSTED'||failureCode==='PROBE_QUOTA_DISABLED'||failureCode==='PROBE_QUOTA_UNAVAILABLE'){
+    const retryAt=Number(error?.retryAt);
+    return {disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:Number.isFinite(retryAt)&&retryAt>now?retryAt:now+60_000};
+  }
+  if(failureCode==='YOUTUBE_KEY_CAP_EXCEEDED'){
+    // Capacity exhaustion is a policy wait, not a job failure. Wait for the
+    // Pacific reset without consuming an attempt or creating review work.
+    return {disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:getNextYouTubeQuotaResetAt(new Date(now))};
+  }
+  if(failureCode==='INVESTIGATION_DEADLINE_EXCEEDED')return {disposition:'FAILED'};
   if(isRetryableInfrastructureFailure(error)){
     if(now-firstFailureAt>=MAX_TRANSIENT_RETRY_AGE_MS)return {disposition:'FAILED',operationallyBlocked:true};
     const retryAt=Number(error?.retryAt);

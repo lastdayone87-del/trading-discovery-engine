@@ -1,8 +1,9 @@
 -- Migration 154: durable probe-origin fence marker for official YouTube quota.
 --
--- Additive only. PROBE is sticky: once a channel is persisted by a probe it
--- may never spend official YouTube Data API quota, including hydration,
--- ENRICH_CHANNEL jobs, retries, and recovery. NORMAL is the legacy path.
+-- Additive only. PROBE is sticky: once a channel is persisted by a probe,
+-- every downstream official YouTube Data API call (hydration, ENRICH_CHANNEL,
+-- retries, recovery) is charged to the independent probe allocation. NORMAL is
+-- the legacy path. Neither marker bypasses quota enforcement.
 --
 -- There is no reliable backfill for channels ingested by earlier probe runs:
 -- the probe ledger stores candidate keys and channel summaries but not the
@@ -21,4 +22,4 @@ CREATE INDEX IF NOT EXISTS channels_quota_origin_probe_idx
   WHERE quota_origin = 'PROBE';
 
 COMMENT ON COLUMN channels.quota_origin IS
-  'Official YouTube Data API quota provenance. PROBE is sticky and may never call the official API; NORMAL may.';
+  'Official YouTube Data API quota provenance. PROBE is sticky and spends only from the independent probe allocation; NORMAL uses the ordinary budget.';
