@@ -133,8 +133,11 @@ test('treatment materializes native plus creator-derived proposals and records t
       return assignment(input.country, input.arm);
     },
     generateNative: async () => [nativeProposal()],
-    generateDerived: async () => {
+    generateDerived: async (_country, _limit, options) => {
       derivedCalls++;
+      assert.equal(options?.pilotPolicyVersion, ADAPTIVE_PILOT_POLICY_VERSION);
+      assert.equal(options?.pilotQuotaDay, '2026-10-23');
+      assert.equal(options?.pilotArm, 'TREATMENT');
       return [derivedProposal()];
     },
     persist: async proposals => {
@@ -324,7 +327,7 @@ test('allocator fails closed for creator-derived proposals outside an active tre
     proposalFamily: 'CREATOR_DERIVED',
     proposalEvidenceSnapshot: {
       proposalFamily: 'CREATOR_DERIVED',
-      supportingEvidence: { pilotArm: 'TREATMENT', pilotQuotaDay: '2026-10-23' }
+      supportingEvidence: { pilotArm: 'TREATMENT', pilotQuotaDay: '2026-10-23', pilotPolicyVersion: ADAPTIVE_PILOT_POLICY_VERSION }
     }
   } as any;
   const enabled = { query: async () => ({ rows: [{ setting_value: 'true' }] }) };
@@ -334,7 +337,8 @@ test('allocator fails closed for creator-derived proposals outside an active tre
   assert.equal((await filterAdaptivePilotCandidates([candidate], '2026-10-22', enabled)).length, 0);
   assert.equal((await filterAdaptivePilotCandidates([candidate], '2026-10-23', disabled)).length, 0);
   assert.equal((await filterAdaptivePilotCandidates([candidate], '2026-10-23', null)).length, 0);
-  assert.equal((await filterAdaptivePilotCandidates([{ ...candidate, proposalEvidenceSnapshot: { supportingEvidence: { pilotArm: 'CONTROL', pilotQuotaDay: '2026-10-23' } } }], '2026-10-23', enabled)).length, 0);
+  assert.equal((await filterAdaptivePilotCandidates([{ ...candidate, proposalEvidenceSnapshot: { supportingEvidence: { pilotArm: 'CONTROL', pilotQuotaDay: '2026-10-23', pilotPolicyVersion: ADAPTIVE_PILOT_POLICY_VERSION } } }], '2026-10-23', enabled)).length, 0);
+  assert.equal((await filterAdaptivePilotCandidates([{ ...candidate, proposalEvidenceSnapshot: { supportingEvidence: { pilotArm: 'TREATMENT', pilotQuotaDay: '2026-10-23', pilotPolicyVersion: 'older-policy' } } }], '2026-10-23', enabled)).length, 0);
 });
 
 test('metrics are bounded by the report window and isolated by policy version', async () => {

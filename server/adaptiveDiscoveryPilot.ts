@@ -14,6 +14,8 @@ import {
   getYouTubeQuotaDay,
   getYouTubeQuotaDayStartAt
 } from './youtubeQuotaDay';
+import { ADAPTIVE_PILOT_POLICY_VERSION } from './adaptiveDiscoveryPilotPolicy';
+export { ADAPTIVE_PILOT_POLICY_VERSION } from './adaptiveDiscoveryPilotPolicy';
 
 /**
  * Opt-in adaptive country-aware discovery pilot.
@@ -29,7 +31,6 @@ import {
  * remain the only authorities.
  */
 
-export const ADAPTIVE_PILOT_POLICY_VERSION = 'adaptive-country-pilot-v1';
 export const ADAPTIVE_PILOT_DEFAULT_TREATMENT_PERCENT = 50;
 export const ADAPTIVE_PILOT_DEFAULT_SEED = 'adaptive-pilot-v1';
 
@@ -338,7 +339,8 @@ export async function materializeAdaptiveDiscoveryPilotProposals(
             expiresAt: assignment.windowEnd,
             pilotQuotaDay: assignment.quotaDay,
             pilotAssignmentKey: assignment.assignmentKey,
-            pilotArm: assignment.arm
+            pilotArm: assignment.arm,
+            pilotPolicyVersion: ADAPTIVE_PILOT_POLICY_VERSION
           }), remainingDeadlineMs(), [])
         : Promise.resolve([])
     ]);

@@ -9,6 +9,7 @@ import {
 import type { NeighborhoodFrontierState } from './discoveryFrontierState';
 import { effectiveProjectionProposalEvidence } from './discoveryProposalGenerators';
 import { isOsintSnapshotFresh } from './externalOsint';
+import { ADAPTIVE_PILOT_POLICY_VERSION } from './adaptiveDiscoveryPilotPolicy';
 import { isShadowBraveCanaryAllowed, providerSnapshot, rotateActiveProviderRow, ledgerProviderToRegistryKey, providerCooldownObservationWindowSecs, type ProviderAllocation } from './providerAwareRetrieval';
 
 export const PERSISTENT_RESEARCH_PHASE8_VERSION = 'discovery-frontier-allocator-v1';
@@ -310,6 +311,7 @@ export async function getNeighborhoodCandidates(
           OR (
             supporting_evidence->>'pilotArm' = 'TREATMENT'
             AND supporting_evidence->>'pilotQuotaDay' = $2
+            AND supporting_evidence->>'pilotPolicyVersion' = $3
             AND EXISTS (
               SELECT 1 FROM app_settings
               WHERE setting_key = 'adaptive_discovery_pilot_enabled'
@@ -326,12 +328,14 @@ export async function getNeighborhoodCandidates(
         AND allocation_origin = 'FRONTIER_CANARY'
         AND decision_status IN ('RESERVED', 'COMMITTED')
     ) recent ON true
-    ${targetCountry ? 'WHERE LOWER(n.country) = LOWER($3)' : ''}
+    ${targetCountry ? 'WHERE LOWER(n.country) = LOWER($4)' : ''}
     ORDER BY n.last_observed_at DESC
     LIMIT 50
   `;
 
-  const params = targetCountry ? [now.toISOString(), quotaDay, targetCountry] : [now.toISOString(), quotaDay];
+  const params = targetCountry
+    ? [now.toISOString(), quotaDay, ADAPTIVE_PILOT_POLICY_VERSION, targetCountry]
+    : [now.toISOString(), quotaDay, ADAPTIVE_PILOT_POLICY_VERSION];
   const res = await db.query(query, params);
 
   const candidates = res.rows.map((row: any) => {
@@ -383,7 +387,8 @@ export async function getNeighborhoodCandidates(
 export async function filterAdaptivePilotCandidates(
   candidates: NeighborhoodCandidate[],
   quotaDay: string,
-  db: any | null
+  db: any | null,
+  policyVersion: string = ADAPTIVE_PILOT_POLICY_VERSION
 ): Promise<NeighborhoodCandidate[]> {
   const isDerived = (candidate: NeighborhoodCandidate): boolean =>
     candidate.proposalFamily === 'CREATOR_DERIVED' ||
@@ -404,7 +409,9 @@ export async function filterAdaptivePilotCandidates(
   return candidates.filter(candidate => {
     if (!isDerived(candidate)) return true;
     const evidence = (candidate.proposalEvidenceSnapshot?.supportingEvidence || {}) as Record<string, unknown>;
-    return evidence.pilotArm === 'TREATMENT' && evidence.pilotQuotaDay === quotaDay;
+    return evidence.pilotArm === 'TREATMENT'
+      && evidence.pilotQuotaDay === quotaDay
+      && evidence.pilotPolicyVersion === policyVersion;
   });
 }
 
