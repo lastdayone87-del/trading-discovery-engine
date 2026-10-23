@@ -1,5 +1,10 @@
 import { randomUUID } from 'node:crypto';
-import { ChannelActivityBand, CountryMetadataStatus, CountryVocabulary } from '../src/types';
+import { ChannelActivityBand, CountryMetadataStatus, CountryVocabulary, QuotaOrigin } from '../src/types';
+import {
+  assertOfficialYouTubeAllowed,
+  isOfficialYouTubeQuotaAllowed,
+  isOfficialYouTubeQuotaFenceError,
+} from './officialYouTubeQuotaFence';
 import { incrementQuota, getAppSetting, getDb, getYouTubeKeyPool, appendProviderCallEvent, recordYouTubeInvalidInput, isYouTubeInputQuarantined, recordYouTubeProviderSuspension } from './db';
 import { fingerprintYouTubeKey } from './youtubeQuotaAttribution';
 import {
@@ -129,6 +134,8 @@ export interface DiscoveredChannelRaw {
   youtubeUrl: string;
   description: string;
   videoTitles: string[];
+  /** Sticky provenance used by the official YouTube quota fence. */
+  quotaOrigin?: QuotaOrigin;
   locationTag?: string;
   channelLinks?: string[];
   pinnedComment?: string;
@@ -186,6 +193,7 @@ export interface PlaylistChannelObservation {channelId:string;channelName:string
 
 /** One bounded channelSections.list request; only explicit multipleChannels IDs survive parsing. */
 export async function fetchYouTubeFeaturedChannels(sourceChannelId: string, maximumFanout: number): Promise<FeaturedChannelProviderResult> {
+  assertOfficialYouTubeAllowed('fetchYouTubeFeaturedChannels');
   if (!/^UC[A-Za-z0-9_-]{22}$/.test(sourceChannelId) || !Number.isInteger(maximumFanout) || maximumFanout < 1 || maximumFanout > 10) throw new Error('INVALID_FEATURED_CHANNEL_PROVIDER_INPUT');
   const keys = getYouTubeKeyPool(); if (!keys.length) throw new Error('YouTube featured-channel inspection requires an API key.');
   const acquisition = youtubePoolBackoff.beginAcquisition();
@@ -224,6 +232,7 @@ export async function fetchYouTubeFeaturedChannels(sourceChannelId: string, maxi
 
 /** One bounded playlistItems call (cost: one unit); no pagination is followed by the canary. */
 export async function fetchYouTubePlaylistChannels(playlistId:string,limit:number):Promise<PlaylistChannelObservation[]> {
+  assertOfficialYouTubeAllowed('fetchYouTubePlaylistChannels');
   const keys=getYouTubeKeyPool();if(!keys.length)throw new Error('YouTube playlist inspection requires an API key.');
   const acquisition=youtubePoolBackoff.beginAcquisition(); let quotaExceededCount=0;
   const maxResults=Math.min(50,Math.max(1,Math.trunc(limit)));const observedAt=new Date().toISOString();
@@ -330,6 +339,9 @@ async function persistYouTubeKeySuspension(providerKey: string, reason: string):
 }
 
 export function recordProviderFailure(key: string, error: unknown): void {
+  // A policy fence is not a provider failure. Never cool a key, persist a
+  // suspension, or attribute the probe's zero-quota policy to the provider.
+  if (isOfficialYouTubeQuotaFenceError(error)) return;
   const dispatchedKey = typeof (error as any)?.providerKey === 'string' ? (error as any).providerKey : key;
   // A rate-limited key is retired for this acquisition, while the bounded
   // outer provider loop may continue with another eligible key. If the whole
@@ -439,6 +451,9 @@ function preDispatchAbortError(signal:AbortSignal):Error{
 }
 
 async function youtubeFetch(url:string,operation:string,actualCost:number,attempt=1,acquisition?:YouTubePoolAcquisition,priority:YouTubeRequestPriority='enrichment',providerKey?:string,lifecycle?:YouTubeProviderLifecycle):Promise<Response>{
+  // Single choke point for every official YouTube Data API request. Probe
+  // work must never reach this line; a missing/unknown origin fails closed.
+  assertOfficialYouTubeAllowed(`youtubeFetch:${operation}`);
   const traceId = `${operation}-${attempt}-${++outboundTraceSequence}`;
   let providerDispatchAttempt = 0;
   const trace = (stage: string) => console.log(`[YouTube Outbound Trace] ${traceId} ${stage}`);
@@ -855,6 +870,7 @@ export async function searchYouTubeChannels(
  * channels.list(forHandle); video IDs use videos.list(snippet). No text-name
  * matching is permitted because ambiguous names are not authoritative identity. */
 export async function resolveYouTubeLocatorAuthoritatively(identity: string, type: 'HANDLE' | 'VIDEO_ID' | 'CHANNEL_ID'): Promise<string | null> {
+  assertOfficialYouTubeAllowed('resolveYouTubeLocatorAuthoritatively');
   if (type === 'CHANNEL_ID') return /^UC[A-Za-z0-9_-]{22}$/.test(identity) ? identity : null;
   const keys = getYouTubeKeyPool();
   if (!keys.length) throw new Error('YOUTUBE_RESOLUTION_CAPACITY_UNAVAILABLE');
@@ -905,6 +921,7 @@ export async function searchYouTubeChannelPage(
    */
   searchWindow?: { publishedAfter?: string; publishedBefore?: string } | null
 ): Promise<YouTubeChannelPage> {
+  assertOfficialYouTubeAllowed('searchYouTubeChannelPage');
   const sanitizedQuery = sanitizeSearchQuery(query, countryName);
   if (!sanitizedQuery) return { channels: [], nextPageToken: null, rawResultCount: 0 };
   // Fail fast on a durably quarantined query before touching any key.
@@ -998,6 +1015,7 @@ export async function fetchRecentVideoDescriptionsFromAPI(channelId: string): Pr
  * retry, and error semantics are identical — this is the same code path.
  */
 export async function fetchRecentVideoDescriptionsWithIds(channelId: string): Promise<RecentVideoDescription[]> {
+  assertOfficialYouTubeAllowed('fetchRecentVideoDescriptionsWithIds');
   const keyPool = getYouTubeKeyPool();
   if (!channelId) return [];
   if (keyPool.length === 0) throw new Error('Recent-video description API is unavailable because no provider is configured.');
@@ -1295,6 +1313,7 @@ export async function fetchYouTubeChannelEnrichment(
   onAdditionalQuota?: YouTubeAdditionalQuotaCallback,
   priority:YouTubeRequestPriority='enrichment'
 ): Promise<DiscoveredChannelRaw> {
+  assertOfficialYouTubeAllowed('fetchYouTubeChannelEnrichment');
   const keyPool = getYouTubeKeyPool();
   if (keyPool.length === 0) {
     throw new Error('YouTube enrichment requires at least one configured YouTube API key.');
@@ -1454,8 +1473,14 @@ export async function fetchYouTubeChannelEnrichment(
 
 /** One-unit basic metadata hydration used when country or subscriber evidence is missing. */
 export async function fetchYouTubeChannelCountryMetadata(channelId: string, fallback: DiscoveredChannelRaw): Promise<DiscoveredChannelRaw> {
-  const keys = getYouTubeKeyPool();
   const checkedAt = new Date().toISOString();
+  // Probe-origin ingestion must degrade to public-page evidence rather than
+  // spend a channels.list unit. This path never throws, so return an explicit
+  // not-requested status instead of pretending provider capacity was absent.
+  if (!isOfficialYouTubeQuotaAllowed()) {
+    return { ...fallback, countryMetadataStatus: 'NOT_REQUESTED', countryMetadataCheckedAt: checkedAt };
+  }
+  const keys = getYouTubeKeyPool();
   if (!keys.length) return { ...fallback, countryMetadataStatus: 'UNAVAILABLE', countryMetadataCheckedAt: checkedAt };
   let acquisition; try { acquisition=youtubePoolBackoff.beginAcquisition(); }
   catch { return { ...fallback, countryMetadataStatus: 'UNAVAILABLE', countryMetadataCheckedAt: checkedAt }; }

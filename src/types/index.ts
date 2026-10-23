@@ -42,6 +42,12 @@ export type ScanStatus = 'PENDING' | 'LOCKED' | 'ENRICHMENT_PENDING' | 'ENRICHIN
 
 export type DiscoverySource = 'manual_search' | 'automated_query' | 'recheck';
 
+/**
+ * Durable provenance for the official YouTube Data API quota fence.
+ * PROBE is sticky and may never spend official quota; NORMAL may.
+ */
+export type QuotaOrigin = 'NORMAL' | 'PROBE';
+
 export type TradingStatus = 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW' | 'HUMAN_REJECTED';
 
 export type ReviewState = 'NOT_REQUIRED' | 'PENDING' | 'APPROVED' | 'REJECTED' | 'SUPERSEDED';
@@ -228,6 +234,8 @@ export interface ChannelRecord {
   scan_status: ScanStatus;
   scan_attempts: number;
   discovery_source: DiscoverySource;
+  /** Sticky provenance marker for the official YouTube quota fence. */
+  quota_origin?: QuotaOrigin;
   first_seen: string;
   last_checked?: string | null;
   inspection_trail?: InspectionStep[];

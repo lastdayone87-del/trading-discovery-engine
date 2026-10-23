@@ -73,6 +73,11 @@ import { resolveTerminalEnrichmentFailure } from './enrichmentLifecycle';
 import { recordEvidenceActionOutcome } from './voiEvidenceController';
 import { completeInvestigationStep, failInvestigationStep, heartbeatInvestigationStep, reconcileOrphanInvestigations, recoverStaleInvestigationSteps, startInvestigationStep } from './investigationWorkflow';
 import { ChannelRecord, CountryStatus, DiscoverySource, SearchJob, InspectionStep, DiscordStatus } from '../src/types';
+import {
+  OfficialYouTubeQuotaFenceError,
+  runWithOfficialYouTubeQuotaOrigin,
+} from './officialYouTubeQuotaFence';
+import { resolveJobQuotaOrigin } from './quotaOrigin';
 import { assertCountryAllowed, ExcludedCountryError, getCountryExclusion, shouldBlockEnrichClaimForCountry } from './countryExclusion';
 import { randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
@@ -719,7 +724,20 @@ export async function processNextSearchJob(
   if (!job) return false;
   const investigationId=String(job.payload?.investigationId||''),investigationStepId=String(job.payload?.investigationStepId||'');
   const traceId=String(job.payload?.traceId||'');
-  return withExecutionTrace(traceId,async()=>{
+  // Establish durable provenance before any handler can reserve quota, hydrate
+  // metadata, or open a provider request. Probe-origin jobs are terminally
+  // rejected; they were produced by a zero-official-quota lane and must not
+  // become an official-quota run through a queue retry. UNKNOWN fails closed.
+  const quotaOrigin = await resolveJobQuotaOrigin(job);
+  if (quotaOrigin !== 'NORMAL') {
+    await failJob(job.id, new OfficialYouTubeQuotaFenceError(
+      quotaOrigin,
+      `queueJob:${job.type}`,
+      `job ${job.id} is ${quotaOrigin === 'PROBE' ? 'probe-origin' : 'of unknown origin'}`,
+    ));
+    return true;
+  }
+  return runWithOfficialYouTubeQuotaOrigin('NORMAL', `queueJob:${job.type}`, () => withExecutionTrace(traceId,async()=>{
   const heartbeat = setInterval(() => {
     heartbeatJob(job.id, workerId).catch(error => console.error(`[Queue Worker:${workerId}] Heartbeat failed:`, error));
     if(investigationId&&investigationStepId)heartbeatInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,workerId}).catch(error=>console.error(`[Investigation:${investigationId}] Heartbeat failed:`,error));
@@ -1501,7 +1519,7 @@ export async function processNextSearchJob(
   } finally {
     clearInterval(heartbeat);
   }
-  });
+  }));
 }
 
 export interface ProcessDiscoveredChannelOutcome {

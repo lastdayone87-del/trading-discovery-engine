@@ -36,6 +36,7 @@ import {
   type ProbeSettingReader,
   type ProbeRoute,
 } from './probeLedger';
+import { runWithOfficialYouTubeQuotaOrigin } from '../officialYouTubeQuotaFence';
 
 export const PROBE_PAGE_SIZE = 20;
 export const MAX_CHANNELS_INGESTED_PER_PROBE = 20;
@@ -155,11 +156,12 @@ async function defaultIngestChannel(
 ): Promise<ProbeIngestResult> {
   const { processChannelThroughPipeline } = await import('../ingestionPipeline');
   const outcome = await processChannelThroughPipeline(
-    channel,
+    { ...channel, quotaOrigin: 'PROBE' },
     country,
     'automated_query',
     false,
-    false
+    false,
+    { quotaOrigin: 'PROBE' },
   );
   return { wasKnown: outcome.wasKnown, isNew: outcome.isNew, persisted: outcome.persisted };
 }
@@ -205,6 +207,18 @@ function isNewCreator(outcome: Pick<ProbeIngestResult, 'wasKnown' | 'isNew' | 'p
  * requires a different evidenceVersion); FAILED = retrieval/execution error.
  */
 export async function runApprovedProbe(
+  candidate: ApprovedProbeCandidate,
+  deps: ProbeExecutorDeps = {}
+): Promise<ProbeRunSummary> {
+  // Every probe-originated async continuation, including injected ingestion
+  // implementations, executes under a sticky PROBE context. Anything that
+  // reaches the official YouTube dispatcher fails closed before a request.
+  return runWithOfficialYouTubeQuotaOrigin('PROBE', 'runApprovedProbe', () =>
+    runApprovedProbeInContext(candidate, deps),
+  );
+}
+
+async function runApprovedProbeInContext(
   candidate: ApprovedProbeCandidate,
   deps: ProbeExecutorDeps = {}
 ): Promise<ProbeRunSummary> {

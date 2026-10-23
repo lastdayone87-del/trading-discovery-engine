@@ -35,6 +35,13 @@ import { CANDIDATE_TRIAGE_POLICY_VERSION, hasIndependentTradingHypothesis, triag
 import { evaluateLowAudienceGate, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
 import { shouldReactivateCommunityRecovery, reactivateCommunityRecovery } from './communityRecovery';
 import { maybeRunDiscoveryEvidenceExtraction } from './discovery/evidencePipeline';
+import {
+  currentOfficialYouTubeQuotaOrigin,
+  OfficialYouTubeQuotaFenceError,
+  persistedQuotaOrigin,
+  runWithOfficialYouTubeQuotaOrigin,
+} from './officialYouTubeQuotaFence';
+import { resolvePipelineQuotaOrigin } from './quotaOrigin';
 
 // Extraction is best-effort and flag-gated, but a burst of ingestion jobs must
 // not open hundreds of concurrent staging transactions. Serialize the
@@ -112,13 +119,49 @@ export function applyGate1CountryRejectionToExisting(
   applyCandidateObservability(row, candidate);
   return row;
 }
+/**
+ * Establishes the official-quota provenance before any pipeline work. Probe
+ * channels are sticky in the database, so a retry or re-enrichment cannot
+ * silently become a NORMAL (official-quota) run.
+ */
 export async function processChannelThroughPipeline(
   candidate: IngestionCandidate,
   targetCountry: string,
   source: DiscoverySource,
   isManualScan: boolean = false,
   isEnrichmentPass: boolean = false,
-  options?: { forceExtraction?: boolean }
+  options?: { forceExtraction?: boolean; quotaOrigin?: 'NORMAL' | 'PROBE' }
+): Promise<IngestionPipelineOutcome> {
+  const resolvedOrigin = await resolvePipelineQuotaOrigin(candidate, options);
+  if (resolvedOrigin === 'UNKNOWN') {
+    throw new OfficialYouTubeQuotaFenceError(
+      'UNKNOWN',
+      'processChannelThroughPipeline',
+      `could not establish quota origin for ${candidate.channelId || 'unknown channel'}`,
+    );
+  }
+  candidate.quotaOrigin = resolvedOrigin;
+  return runWithOfficialYouTubeQuotaOrigin(
+    resolvedOrigin,
+    'processChannelThroughPipeline',
+    () => processChannelThroughPipelineInContext(
+      candidate,
+      targetCountry,
+      source,
+      isManualScan,
+      isEnrichmentPass,
+      options,
+    ),
+  );
+}
+
+async function processChannelThroughPipelineInContext(
+  candidate: IngestionCandidate,
+  targetCountry: string,
+  source: DiscoverySource,
+  isManualScan: boolean = false,
+  isEnrichmentPass: boolean = false,
+  options?: { forceExtraction?: boolean; quotaOrigin?: 'NORMAL' | 'PROBE' }
 ): Promise<IngestionPipelineOutcome> {
   const now = new Date().toISOString();
   if (await getAppSetting('decision_evaluation_sampling_enabled', 'false') === 'true') {
@@ -765,7 +808,7 @@ export async function processChannelThroughPipeline(
 
     if (lifecycle.shouldEnqueue) {
       const action=ACTIONS.find(item=>item.action===appliedAction),nextStage=action?.enrichmentStage||Math.min(2,currentStage+1);
-      const vitality=deriveVitalityScheduling(productionClassification.input.activity_metadata,productionClassification.decision.timestamp),priority=10+vitality.jobPriorityDelta,payload={ channelId: candidate.channelId, targetCountry, source, candidate, enrichmentStage:nextStage, evidenceAcquisitionDecisionId:evidencePlan?.decisionId, evidenceAction:appliedAction, vitalityScheduling:vitality };
+      const vitality=deriveVitalityScheduling(productionClassification.input.activity_metadata,productionClassification.decision.timestamp),priority=10+vitality.jobPriorityDelta,payload={ channelId: candidate.channelId, targetCountry, source, candidate, enrichmentStage:nextStage, quotaOrigin: currentOfficialYouTubeQuotaOrigin() === 'PROBE' ? 'PROBE' : 'NORMAL', evidenceAcquisitionDecisionId:evidencePlan?.decisionId, evidenceAction:appliedAction, vitalityScheduling:vitality };
       const workflowAssignment=await assignRelease5Serving('INVESTIGATION_WORKFLOW',candidate.channelId).catch(()=>({assigned:false,mode:'OFF'})),legacyWorkflowEnabled=await getAppSetting('investigation_workflow_enabled','false')==='true';
       if(workflowAssignment.assigned||legacyWorkflowEnabled){
         try{await scheduleInvestigationStep({investigationId:candidate.investigationId,channelId:candidate.channelId,diagnosticId:classificationDiagnosticId,actionType:appliedAction,jobType:'ENRICH_CHANNEL',jobPayload:payload,priority,maxAttempts:4,idempotencyKey:`investigation-step:${candidate.channelId}:${classificationDiagnosticId||now}:${appliedAction}`,policyVersion:INVESTIGATION_POLICY_VERSION,utilityContractVersion:'utility-constraints-v1',deadlineMinutes:Number(await getAppSetting('investigation_deadline_minutes','30'))||30});}
@@ -863,6 +906,11 @@ export async function processChannelThroughPipeline(
 }
 
 function applyCandidateObservability(channel: ChannelRecord, candidate: IngestionCandidate): void {
+  channel.quota_origin = persistedQuotaOrigin(
+    channel.quota_origin,
+    candidate.quotaOrigin,
+    currentOfficialYouTubeQuotaOrigin(),
+  );
   channel.country_metadata_status = candidate.countryMetadataStatus || channel.country_metadata_status || 'NOT_REQUESTED';
   channel.country_metadata_checked_at = candidate.countryMetadataCheckedAt || channel.country_metadata_checked_at || null;
   channel.public_about_status = (candidate as any).publicAboutStatus || channel.public_about_status || 'NOT_ATTEMPTED';
