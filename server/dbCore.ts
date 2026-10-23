@@ -2871,7 +2871,7 @@ export async function scheduleAutonomousQueryRuns(
              FROM frontier_allocation_decisions d
              WHERE d.decision_id=$1 AND d.proposal_id=p.proposal_id
                AND d.decision_status='COMMITTED' AND p.trial_status='PENDING'
-               AND p.proposal_family IN ('COUNTRY_NATIVE','EXTERNAL_OSINT')
+               AND p.proposal_family IN ('COUNTRY_NATIVE','EXTERNAL_OSINT','CREATOR_DERIVED')
              RETURNING p.proposal_id`, [candidate.frontierDecisionId]
           );
           if (!consumed.rowCount) throw new Error(`FRONTIER_PROPOSAL_CONSUME_FAILED: ${candidate.frontierDecisionId}`);

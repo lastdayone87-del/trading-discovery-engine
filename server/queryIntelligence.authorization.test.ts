@@ -80,3 +80,16 @@ test('Stage 3 classifies over-specific native terms before planner authorization
     supportingEvidence: { nativeTerm: 'one two three four', evidenceChecksum: 'checksum-stage3' }
   }))), 'QUERY_SPECIFICITY_REJECTED');
 });
+
+test('creator-derived follow-up proposals pass the same immutable lineage gate as native proposals', () => {
+  const result = classifyCountryNativeAuthorizationInput(input({
+    proposalFamily: 'CREATOR_DERIVED',
+    supportingEvidence: {
+      nativeTerm: 'price action',
+      evidenceChecksum: 'creator-checksum',
+      sourceProvenanceFamily: 'CREATOR_DERIVED'
+    }
+  }));
+  assert.equal(result.status, 'VALID');
+  if (result.status === 'VALID') assert.equal(result.nativeTerm, 'price action');
+});
