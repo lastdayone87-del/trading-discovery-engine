@@ -1092,11 +1092,10 @@ SELECT (SELECT count(*)::int FROM removed) AS removed,
        (SELECT units_used FROM used) AS units_used
 `;
 
-let probeQuotaExhaustedUntilMs = 0;
-
-export function resetProbeQuotaExhaustionCacheForTests(): void {
-  probeQuotaExhaustedUntilMs = 0;
-}
+// Kept as a test hook for callers that reset all probe-allocation caches.
+// Exhaustion is always checked against the database so a release or an
+// operator cap increase is observed immediately.
+export function resetProbeQuotaExhaustionCacheForTests(): void {}
 
 export function assertProbeQuotaReservationDayCurrent(
   reservation: ProbeQuotaReservation,
@@ -1123,9 +1122,6 @@ export async function reserveProbeQuota(
 ): Promise<ProbeQuotaReservation> {
   const normalized = normalizedReservationInput(input);
   const { units, keyFingerprint, operationId, quotaDay, now } = normalized;
-  if (Date.now() < probeQuotaExhaustedUntilMs) {
-    throw new ProbeQuotaExceededError(quotaDay, 0, units, 0, now);
-  }
   const config = await resolveProbeQuotaConfig(deps.readSetting, now.getTime());
   if (!config.enabled) throw new ProbeQuotaDisabledError(quotaDay);
   const capUnits = config.capUnits;
@@ -1210,7 +1206,6 @@ export async function reserveProbeQuota(
     const projected = await client.query(PROBE_PROJECTED_SQL, [quotaDay, now]);
     const projectedBefore = Number(projected.rows[0]?.projected_units ?? 0);
     if (!Number.isFinite(projectedBefore) || projectedBefore + units > capUnits) {
-      probeQuotaExhaustedUntilMs = Date.now() + 30_000;
       throw new ProbeQuotaExceededError(quotaDay, projectedBefore, units, capUnits, now);
     }
     const inserted = await client.query(PROBE_INSERT_SQL, [
@@ -1225,7 +1220,7 @@ export async function reserveProbeQuota(
     return { mode: 'probe', operationId, quotaDay, keyFingerprint, units, capUnits, projectedBefore };
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined);
-    if (isProbeQuotaControlError(error)) throw error;
+    if (isProbeQuotaControlError(error) || isYouTubeKeyCapError(error)) throw error;
     throw new ProbeQuotaUnavailableError('Probe quota reservation transaction failed.', {
       quotaDay, operationId, cause: error,
     });
