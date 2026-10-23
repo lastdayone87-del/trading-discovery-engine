@@ -306,6 +306,16 @@ export async function getNeighborhoodCandidates(
         AND (expires_at IS NULL OR expires_at > $1)
         AND (proposal_family <> 'EXTERNAL_OSINT'
           OR COALESCE((supporting_evidence->>'expiresAt')::timestamptz, '-infinity'::timestamptz) > $1)
+        AND (proposal_family <> 'CREATOR_DERIVED'
+          OR (
+            supporting_evidence->>'pilotArm' = 'TREATMENT'
+            AND supporting_evidence->>'pilotQuotaDay' = $2
+            AND EXISTS (
+              SELECT 1 FROM app_settings
+              WHERE setting_key = 'adaptive_discovery_pilot_enabled'
+                AND setting_value = 'true'
+            )
+          ))
       ORDER BY created_at DESC LIMIT 1
     ) p ON true
     LEFT JOIN LATERAL (
@@ -324,7 +334,7 @@ export async function getNeighborhoodCandidates(
   const params = targetCountry ? [now.toISOString(), quotaDay, targetCountry] : [now.toISOString(), quotaDay];
   const res = await db.query(query, params);
 
-  return res.rows.map((row: any) => {
+  const candidates = res.rows.map((row: any) => {
     const rawDims = typeof row.dimensions === 'string' ? JSON.parse(row.dimensions) : (row.dimensions || {});
     const dimensions: DiscoveryNeighborhoodDimensions = {
       country: row.country || targetCountry || 'US',
@@ -361,6 +371,41 @@ export async function getNeighborhoodCandidates(
       expectedQuotaCost: 100
     };
   });
+  return filterAdaptivePilotCandidates(candidates, quotaDay, db);
+}
+
+/**
+ * Fail-closed guard for the adaptive pilot. CREATOR_DERIVED proposals are
+ * executable only on their originating TREATMENT country-day while the pilot
+ * is enabled. Legacy/native/OSINT candidates are unaffected and do not touch
+ * the pilot ledger.
+ */
+export async function filterAdaptivePilotCandidates(
+  candidates: NeighborhoodCandidate[],
+  quotaDay: string,
+  db: any | null
+): Promise<NeighborhoodCandidate[]> {
+  const isDerived = (candidate: NeighborhoodCandidate): boolean =>
+    candidate.proposalFamily === 'CREATOR_DERIVED' ||
+    candidate.proposalEvidenceSnapshot?.proposalFamily === 'CREATOR_DERIVED';
+  if (!candidates.some(isDerived)) return candidates;
+  let enabled = false;
+  if (db) {
+    try {
+      const setting = await db.query(
+        `SELECT setting_value FROM app_settings WHERE setting_key='adaptive_discovery_pilot_enabled'`
+      );
+      enabled = String(setting?.rows?.[0]?.setting_value ?? '') === 'true';
+    } catch {
+      enabled = false;
+    }
+  }
+  if (!enabled) return candidates.filter(candidate => !isDerived(candidate));
+  return candidates.filter(candidate => {
+    if (!isDerived(candidate)) return true;
+    const evidence = (candidate.proposalEvidenceSnapshot?.supportingEvidence || {}) as Record<string, unknown>;
+    return evidence.pilotArm === 'TREATMENT' && evidence.pilotQuotaDay === quotaDay;
+  });
 }
 
 /**
@@ -377,7 +422,10 @@ export async function evaluateShadowFrontierAllocation(input: {
 }): Promise<AllocationDecision> {
   const now = input.now || new Date();
   const quotaDay = getYouTubeQuotaDay(now);
-  const candidates = input.candidates || await getNeighborhoodCandidates(input.legacyCountry, now, input.client);
+  const candidateDb = input.client || (process.env.DATABASE_URL ? await getDb() : null);
+  const candidates = input.candidates
+    ? await filterAdaptivePilotCandidates(input.candidates, quotaDay, candidateDb)
+    : await getNeighborhoodCandidates(input.legacyCountry, now, input.client);
   const expStatus = await getPacificQuotaDayExplorationStatus(now, input.client).catch(() => ({
     explorationRatio: 0,
     explorationFloorActive: false,

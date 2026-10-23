@@ -5,6 +5,7 @@ import {
   ADAPTIVE_PILOT_POLICY_VERSION,
   aggregateAdaptivePilotMetrics,
   assignAdaptivePilotArm,
+  computeAdaptivePilotMetrics,
   materializeAdaptiveDiscoveryPilotProposals,
   resolveAdaptivePilotConfig,
   summarizeAdaptivePilotMetrics,
@@ -12,6 +13,7 @@ import {
   type AdaptivePilotAssignment
 } from './adaptiveDiscoveryPilot';
 import { buildFrontierProposal, extractCreatorDerivedConcept, type DiscoveryFrontierProposal } from './discoveryProposalGenerators';
+import { filterAdaptivePilotCandidates } from './discoveryFrontierAllocator';
 
 const nativeProposal = (country = 'US'): DiscoveryFrontierProposal => buildFrontierProposal({
   proposalFamily: 'COUNTRY_NATIVE',
@@ -224,4 +226,160 @@ test('metrics absent for an arm produce safe zeros rather than NaN', () => {
   assert.equal(treatment.reliability, 0);
   assert.equal(treatment.quotaPerRelevantCreator, null);
   assert.ok(Number.isFinite(treatment.duplicateRate));
+});
+
+
+test('execution follows the recorded arm, not a recomputed config arm', async () => {
+  let derivedCalls = 0;
+  const result = await materializeAdaptiveDiscoveryPilotProposals(['US'], {
+    globalCap: 10,
+    perCountryCap: 5,
+    now: new Date('2026-10-23T15:00:00Z')
+  }, {
+    readConfig: async () => ({ enabled: true, treatmentPercent: 100, seed: 'test' }),
+    recordAssignment: async input => assignment(input.country, 'CONTROL'),
+    generateNative: async () => [nativeProposal()],
+    generateDerived: async () => {
+      derivedCalls++;
+      return [derivedProposal()];
+    },
+    persist: async proposals => proposals.length
+  });
+  assert.equal(derivedCalls, 0);
+  assert.equal(result.assignments[0].arm, 'CONTROL');
+  assert.deepEqual(result.proposals.map(p => p.proposalFamily), ['COUNTRY_NATIVE']);
+});
+
+test('treatment groups never exceed the shared per-country cap', async () => {
+  const nativeA = nativeProposal('US');
+  const nativeB = buildFrontierProposal({
+    proposalFamily: 'COUNTRY_NATIVE',
+    country: 'US',
+    concept: 'Nasdaq futures',
+    sourceProvenance: 'test:native-b',
+    supportingEvidence: { nativeTerm: 'Nasdaq futures', sourceProvenanceFamily: 'COUNTRY_VOCABULARY' },
+    confidence: 0.8,
+    noveltyRationale: 'fixture'
+  });
+  const derivedA = derivedProposal('US');
+  const derivedB = buildFrontierProposal({
+    proposalFamily: 'CREATOR_DERIVED',
+    country: 'US',
+    concept: 'gold',
+    sourceProvenance: 'creator_metadata:test:gold',
+    supportingEvidence: { channelId: 'creator-2', channelTitle: 'Creator Two', nativeTerm: 'gold', sourceProvenanceFamily: 'CREATOR_DERIVED' },
+    confidence: 0.7,
+    noveltyRationale: 'fixture'
+  });
+  const result = await materializeAdaptiveDiscoveryPilotProposals(['US'], {
+    globalCap: 10,
+    perCountryCap: 2,
+    now: new Date('2026-10-23T15:00:00Z')
+  }, {
+    readConfig: async () => ({ enabled: true, treatmentPercent: 100, seed: 'test' }),
+    recordAssignment: async input => assignment(input.country, 'TREATMENT'),
+    generateNative: async () => [nativeA, nativeB],
+    generateDerived: async () => [derivedA, derivedB],
+    persist: async proposals => proposals.length
+  });
+  assert.equal(result.proposals.length, 2);
+  assert.deepEqual(result.proposals.map(p => p.proposalFamily), ['COUNTRY_NATIVE', 'CREATOR_DERIVED']);
+});
+
+test('country assignments are recorded concurrently under one cycle', async () => {
+  const countries = ['US', 'GB', 'DE'];
+  let started = 0;
+  let maxConcurrent = 0;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const timeout = new Promise<never>((_, reject) => {
+    const timer = setTimeout(() => reject(new Error('assignments did not run concurrently')), 2000);
+    timer.unref?.();
+  });
+  const work = materializeAdaptiveDiscoveryPilotProposals(countries, {
+    globalCap: 10,
+    perCountryCap: 2,
+    now: new Date('2026-10-23T15:00:00Z')
+  }, {
+    readConfig: async () => ({ enabled: true, treatmentPercent: 100, seed: 'test' }),
+    recordAssignment: async input => {
+      started++;
+      maxConcurrent = Math.max(maxConcurrent, started);
+      if (started === countries.length) release();
+      await gate;
+      started--;
+      return assignment(input.country, input.arm);
+    },
+    generateNative: async () => [nativeProposal()],
+    generateDerived: async () => [derivedProposal()],
+    persist: async proposals => proposals.length
+  });
+  const result = await Promise.race([work, timeout]);
+  assert.ok(maxConcurrent > 1, `expected concurrent assignment calls, saw ${maxConcurrent}`);
+  assert.equal(result.assignments.length, countries.length);
+});
+
+test('allocator fails closed for creator-derived proposals outside an active treatment day', async () => {
+  const candidate = {
+    proposalFamily: 'CREATOR_DERIVED',
+    proposalEvidenceSnapshot: {
+      proposalFamily: 'CREATOR_DERIVED',
+      supportingEvidence: { pilotArm: 'TREATMENT', pilotQuotaDay: '2026-10-23' }
+    }
+  } as any;
+  const enabled = { query: async () => ({ rows: [{ setting_value: 'true' }] }) };
+  const disabled = { query: async () => ({ rows: [{ setting_value: 'false' }] }) };
+
+  assert.equal((await filterAdaptivePilotCandidates([candidate], '2026-10-23', enabled)).length, 1);
+  assert.equal((await filterAdaptivePilotCandidates([candidate], '2026-10-22', enabled)).length, 0);
+  assert.equal((await filterAdaptivePilotCandidates([candidate], '2026-10-23', disabled)).length, 0);
+  assert.equal((await filterAdaptivePilotCandidates([candidate], '2026-10-23', null)).length, 0);
+  assert.equal((await filterAdaptivePilotCandidates([{ ...candidate, proposalEvidenceSnapshot: { supportingEvidence: { pilotArm: 'CONTROL', pilotQuotaDay: '2026-10-23' } } }], '2026-10-23', enabled)).length, 0);
+});
+
+test('metrics are bounded by the report window and isolated by policy version', async () => {
+  let captured: { sql: string; params: unknown[] } | null = null;
+  const client = {
+    query: async (sql: string, params: unknown[]) => {
+      captured = { sql, params };
+      return { rows: [] };
+    }
+  };
+  const metrics = await computeAdaptivePilotMetrics({
+    windowStart: '2026-10-23T07:00:00.000Z',
+    windowEnd: '2026-10-24T07:00:00.000Z',
+    policyVersion: 'adaptive-country-pilot-v2',
+    client
+  });
+  assert.ok(captured);
+  assert.match(captured!.sql, /allocation_at >= \$1::timestamptz - interval '1 day'/);
+  assert.match(captured!.sql, /a\.policy_version = \$3/);
+  assert.deepEqual(captured!.params, [
+    '2026-10-23T07:00:00.000Z',
+    '2026-10-24T07:00:00.000Z',
+    'adaptive-country-pilot-v2'
+  ]);
+  assert.equal(metrics.policyVersion, 'adaptive-country-pilot-v2');
+});
+
+test('creator-derived proposal expiry is bound to the pilot day window', () => {
+  const expiry = '2026-10-24T07:00:00.000Z';
+  const proposal = buildFrontierProposal({
+    proposalFamily: 'CREATOR_DERIVED',
+    country: 'US',
+    concept: 'price action',
+    sourceProvenance: 'creator_metadata:test:price action',
+    retrievalLane: 'VIDEO',
+    supportingEvidence: {
+      nativeTerm: 'price action',
+      pilotArm: 'TREATMENT',
+      pilotQuotaDay: '2026-10-23',
+      pilotAssignmentKey: 'assignment-key'
+    },
+    confidence: 0.7,
+    noveltyRationale: 'fixture',
+    expiresAt: expiry
+  });
+  assert.equal(proposal.expiresAt, expiry);
+  assert.equal(proposal.targetDimensions.retrievalLane, 'VIDEO');
 });

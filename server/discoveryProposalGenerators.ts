@@ -112,6 +112,7 @@ export function buildFrontierProposal(params: {
   confidence?: number;
   noveltyRationale: string;
   ttlDays?: number;
+  expiresAt?: string;
   preserveCountryIdentity?: boolean;
 }): DiscoveryFrontierProposal {
   const dimensions: DiscoveryNeighborhoodDimensions = {
@@ -129,7 +130,10 @@ export function buildFrontierProposal(params: {
   const dedupKey = createProposalDedupKey(params.proposalFamily, params.country, params.concept, neighborhood.neighborhoodKey);
 
   const ttl = params.ttlDays ?? 14;
-  const expiresAt = new Date(Date.now() + ttl * 86_400_000).toISOString();
+  const requestedExpiry = params.expiresAt ? Date.parse(params.expiresAt) : NaN;
+  const expiresAt = Number.isFinite(requestedExpiry)
+    ? new Date(requestedExpiry).toISOString()
+    : new Date(Date.now() + ttl * 86_400_000).toISOString();
 
   const supportingEvidence = params.supportingEvidence || {};
   const checksummedEvidenceFamilies: ProposalFamily[] = ['COUNTRY_NATIVE', 'CREATOR_DERIVED'];
@@ -225,7 +229,19 @@ export function extractCreatorDerivedConcept(row: {
   return null;
 }
 
-export async function generateCreatorDerivedProposals(country: string, limit = 10): Promise<DiscoveryFrontierProposal[]> {
+export interface CreatorDerivedProposalOptions {
+  /** End of the governing country-day assignment; proposals must not outlive it. */
+  expiresAt?: string;
+  pilotQuotaDay?: string;
+  pilotAssignmentKey?: string;
+  pilotArm?: 'TREATMENT' | 'CONTROL';
+}
+
+export async function generateCreatorDerivedProposals(
+  country: string,
+  limit = 10,
+  options: CreatorDerivedProposalOptions = {}
+): Promise<DiscoveryFrontierProposal[]> {
   const db = await getDb();
   const canonicalC = canonicalCountry(country);
   const res = await db.query(
@@ -235,11 +251,13 @@ export async function generateCreatorDerivedProposals(country: string, limit = 1
      LEFT JOIN LATERAL (
        SELECT array_agg(term) FILTER (WHERE term IS NOT NULL) AS terms
        FROM (
-         SELECT term
-         FROM extracted_trading_vocabulary
-         WHERE UPPER(country) = UPPER($1) AND source_channel_id = c.channel_id
-           AND char_length(term) BETWEEN 3 AND 60
-         ORDER BY trust_tier ASC, occurrences DESC, last_extracted DESC
+         SELECT v.term
+         FROM extracted_vocabulary_sources s
+         JOIN extracted_trading_vocabulary v ON v.id = s.term_id
+         WHERE s.channel_id = c.channel_id
+           AND UPPER(v.country) = UPPER($1)
+           AND char_length(v.term) BETWEEN 3 AND 60
+         ORDER BY v.trust_tier ASC, v.occurrences DESC, v.last_extracted DESC
          LIMIT 5
        ) ranked_terms
      ) v ON true
@@ -269,8 +287,10 @@ export async function generateCreatorDerivedProposals(country: string, limit = 1
         country,
         concept: concept.term,
         primaryTermFamily: concept.term,
+        retrievalLane: 'VIDEO',
         sourceFamily: 'creator_derived',
         sourceProvenance: `creator_metadata:${row.channel_id}:${concept.term}`,
+        expiresAt: options.expiresAt,
         supportingEvidence: {
           channelId: row.channel_id,
           channelTitle: row.channel_name,
@@ -280,7 +300,10 @@ export async function generateCreatorDerivedProposals(country: string, limit = 1
           extractionMethod: concept.method,
           channelQualityScore: Number(row.quality_score || 0),
           tradingCategory: row.trading_category || null,
-          lastObservedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at
+          lastObservedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at,
+          pilotArm: options.pilotArm || null,
+          pilotQuotaDay: options.pilotQuotaDay || null,
+          pilotAssignmentKey: options.pilotAssignmentKey || null
         },
         confidence: 0.70,
         noveltyRationale: `Follow-up query seeded by verified quality creator "${row.channel_name}" using ${concept.method.toLocaleLowerCase('en')} evidence.`

@@ -16,6 +16,7 @@ import {
   assignAdaptivePilotArm,
   summarizeAdaptivePilotMetrics,
   ADAPTIVE_PILOT_DEFAULT_SEED,
+  ADAPTIVE_PILOT_POLICY_VERSION,
   type AdaptivePilotAggregateRow
 } from '../server/adaptiveDiscoveryPilot';
 import { getYouTubeQuotaDay } from '../server/youtubeQuotaDay';
@@ -41,7 +42,7 @@ const result = await db.query(
      known_creators,new_creators,relevant_new_creators,quality_new_creators,
      confirmed_new_creators,quota_consumed,provider_failed
    FROM discovery_evaluation_run_observations
-   WHERE completed_at >= $1 AND completed_at < $2
+   WHERE allocation_at >= $1 AND allocation_at < $2
    ORDER BY query_run_id, observation_revision DESC`,
   [start.toISOString(), end.toISOString()]
 );
@@ -96,6 +97,7 @@ totals.TREATMENT.countries = countries.TREATMENT.size;
 totals.CONTROL.countries = countries.CONTROL.size;
 
 const metrics = summarizeAdaptivePilotMetrics({
+  policyVersion: ADAPTIVE_PILOT_POLICY_VERSION,
   windowStart: start.toISOString(),
   windowEnd: end.toISOString(),
   rows: [totals.TREATMENT, totals.CONTROL]
