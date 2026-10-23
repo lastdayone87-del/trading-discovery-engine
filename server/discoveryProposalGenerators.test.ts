@@ -50,3 +50,32 @@ test('Phase 6: Country-native proposal generator uses native market terms withou
   assert.equal(proposalsBR[0].country, 'Brazil');
   assert.ok(proposalsBR.some(p => p.concept.includes('B3') || p.concept.includes('mini indice')), 'Brazilian native terms must be present');
 });
+
+test('creator-derived proposals bind actual channel columns and a checksummed follow-up concept', () => {
+  const proposal = buildFrontierProposal({
+    proposalFamily: 'CREATOR_DERIVED',
+    country: 'United States',
+    concept: 'price action',
+    sourceProvenance: 'creator_metadata:creator-1:price action',
+    supportingEvidence: {
+      channelId: 'creator-1',
+      nativeTerm: 'price action',
+      sourceProvenanceFamily: 'CREATOR_DERIVED'
+    },
+    noveltyRationale: 'Verified-creator follow-up.'
+  });
+  assert.equal(proposal.proposalFamily, 'CREATOR_DERIVED');
+  assert.equal(proposal.supportingEvidence.nativeTerm, 'price action');
+  assert.match(String(proposal.supportingEvidence.evidenceChecksum), /^[a-f0-9]{16,64}$/);
+  assert.match(String(proposal.supportingEvidence.evidenceVersion), /^1970-01-01T00:00:00.000Z\|/);
+});
+
+test('creator-derived generator uses the channels schema and governed vocabulary evidence', async () => {
+  const source = await import('node:fs').then(fs => fs.readFileSync(
+    new URL('./discoveryProposalGenerators.ts', import.meta.url),
+    'utf8'
+  ));
+  assert.match(source, /c\.channel_name/);
+  assert.match(source, /extracted_trading_vocabulary/);
+  assert.doesNotMatch(source, /c\.title/);
+});

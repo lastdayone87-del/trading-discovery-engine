@@ -132,8 +132,9 @@ export function buildFrontierProposal(params: {
   const expiresAt = new Date(Date.now() + ttl * 86_400_000).toISOString();
 
   const supportingEvidence = params.supportingEvidence || {};
+  const checksummedEvidenceFamilies: ProposalFamily[] = ['COUNTRY_NATIVE', 'CREATOR_DERIVED'];
   const evidenceChecksum = countryNativeEvidenceChecksum(supportingEvidence);
-  const versionedEvidence = params.proposalFamily === 'COUNTRY_NATIVE'
+  const versionedEvidence = checksummedEvidenceFamilies.includes(params.proposalFamily)
     ? { ...supportingEvidence, evidenceChecksum, evidenceVersion: countryNativeEvidenceVersion(supportingEvidence, evidenceChecksum) }
     : supportingEvidence;
   return {
@@ -180,34 +181,109 @@ export async function generateLearnedProposals(country: string, limit = 10): Pro
 }
 
 // 2. CREATOR_DERIVED Generator
+const CREATOR_DERIVED_TERM_PATTERN = /\b(dax|nasdaq|s&p(?: 500)?|ftse(?: 100)?|nikkei(?: 225)?|bitcoin|btc|ethereum|eth|gold|silver|oil|crude|copper|eurusd|gbpusd|usdjpy|euro stoxx|bund|gilt|price action|technical analysis)\b/i;
+const CREATOR_DERIVED_GENERIC_TERMS = new Set([
+  'channel', 'official', 'youtube', 'video', 'videos', 'welcome', 'general', 'general trading',
+  'trader', 'traders', 'trading', 'finance', 'financial', 'futures', 'future', 'options',
+  'option', 'stocks', 'stock', 'stock market', 'forex', 'fx', 'crypto', 'cryptocurrency',
+  'commodities', 'commodity', 'indices', 'index', 'investing', 'investment', 'market',
+  'markets', 'market analysis', 'day trading', 'swing trading', 'scalping'
+]);
+
+function cleanCreatorDerivedTerm(value: unknown): string {
+  return String(value || '').normalize('NFKC').trim().replace(/\s+/g, ' ');
+}
+
+function creatorDerivedWordCount(term: string): number {
+  return term ? term.split(/\s+/).length : 0;
+}
+
+/** Pure term selection used by both the generator and its unit tests. */
+export function extractCreatorDerivedConcept(row: {
+  channel_name?: string | null;
+  trading_category?: string | null;
+  vocabulary_terms?: string[] | null;
+}): { term: string; method: 'VOCABULARY' | 'TRADING_CATEGORY' | 'CHANNEL_NAME' } | null {
+  const vocabularyTerms = Array.isArray(row.vocabulary_terms) ? row.vocabulary_terms : [];
+  for (const raw of vocabularyTerms) {
+    const vocabulary = cleanCreatorDerivedTerm(raw);
+    if (vocabulary.length >= 3 && creatorDerivedWordCount(vocabulary) <= 3 &&
+        !CREATOR_DERIVED_GENERIC_TERMS.has(vocabulary.toLocaleLowerCase('en'))) {
+      return { term: vocabulary, method: 'VOCABULARY' };
+    }
+  }
+  const category = cleanCreatorDerivedTerm(row.trading_category);
+  if (category && creatorDerivedWordCount(category) <= 3 &&
+      !CREATOR_DERIVED_GENERIC_TERMS.has(category.toLocaleLowerCase('en'))) {
+    return { term: category, method: 'TRADING_CATEGORY' };
+  }
+  const channelName = cleanCreatorDerivedTerm(row.channel_name);
+  const match = channelName.match(CREATOR_DERIVED_TERM_PATTERN);
+  if (match && match[0]) {
+    return { term: match[0], method: 'CHANNEL_NAME' };
+  }
+  return null;
+}
+
 export async function generateCreatorDerivedProposals(country: string, limit = 10): Promise<DiscoveryFrontierProposal[]> {
   const db = await getDb();
+  const canonicalC = canonicalCountry(country);
   const res = await db.query(
-    `SELECT c.channel_id, c.title, c.description, c.primary_market
+    `SELECT c.channel_id, c.channel_name, c.trading_category, c.quality_score, c.updated_at,
+            v.terms AS vocabulary_terms
      FROM channels c
-     WHERE UPPER(c.country) = $1 AND c.trading_status = 'TRADING_CONFIRMED' AND c.quality_score >= ${QUALITY_CREATOR_SCORE_THRESHOLD}
+     LEFT JOIN LATERAL (
+       SELECT array_agg(term) FILTER (WHERE term IS NOT NULL) AS terms
+       FROM (
+         SELECT term
+         FROM extracted_trading_vocabulary
+         WHERE UPPER(country) = UPPER($1) AND source_channel_id = c.channel_id
+           AND char_length(term) BETWEEN 3 AND 60
+         ORDER BY trust_tier ASC, occurrences DESC, last_extracted DESC
+         LIMIT 5
+       ) ranked_terms
+     ) v ON true
+     WHERE UPPER(c.country) = UPPER($1)
+       AND c.trading_status = 'TRADING_CONFIRMED'
+       AND c.quality_score >= $2
      ORDER BY c.updated_at DESC
-     LIMIT $2`,
-    [country.toUpperCase(), limit]
+     LIMIT $3`,
+    [canonicalC, QUALITY_CREATOR_SCORE_THRESHOLD, Math.max(1, limit)]
   );
 
   const proposals: DiscoveryFrontierProposal[] = [];
+  const seenTerms = new Set<string>();
   for (const row of res.rows) {
-    const rawTitle = row.title || '';
-    // Extract candidate trading keywords from channel title / description metadata
-    const terms = rawTitle.split(/\s+/).filter((t: string) => t.length >= 4 && !/youtube|channel|video|official/i.test(t));
-    const term = terms[0] || rawTitle;
-    if (!term) continue;
-
+    const concept = extractCreatorDerivedConcept({
+      channel_name: row.channel_name,
+      trading_category: row.trading_category,
+      vocabulary_terms: row.vocabulary_terms
+    });
+    if (!concept) continue;
+    const termKey = concept.term.toLocaleLowerCase('en');
+    if (seenTerms.has(termKey)) continue;
+    seenTerms.add(termKey);
     proposals.push(
       buildFrontierProposal({
         proposalFamily: 'CREATOR_DERIVED',
         country,
-        concept: term,
-        sourceProvenance: `creator_metadata:${row.channel_id}`,
-        supportingEvidence: { channelId: row.channel_id, channelTitle: row.title },
+        concept: concept.term,
+        primaryTermFamily: concept.term,
+        sourceFamily: 'creator_derived',
+        sourceProvenance: `creator_metadata:${row.channel_id}:${concept.term}`,
+        supportingEvidence: {
+          channelId: row.channel_id,
+          channelTitle: row.channel_name,
+          nativeTerm: concept.term,
+          sourceProvenanceFamily: 'CREATOR_DERIVED',
+          sourceFamilies: ['CREATOR_DERIVED'],
+          extractionMethod: concept.method,
+          channelQualityScore: Number(row.quality_score || 0),
+          tradingCategory: row.trading_category || null,
+          lastObservedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at
+        },
         confidence: 0.70,
-        noveltyRationale: `Derived from verified quality trading creator "${row.title}" metadata.`
+        noveltyRationale: `Follow-up query seeded by verified quality creator "${row.channel_name}" using ${concept.method.toLocaleLowerCase('en')} evidence.`
       })
     );
   }
