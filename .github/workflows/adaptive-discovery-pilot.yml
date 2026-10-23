@@ -7,10 +7,14 @@ on:
   pull_request:
     paths:
       - 'server/adaptiveDiscoveryPilot.ts'
+      - 'server/adaptiveDiscoveryPilotPolicy.ts'
       - 'server/adaptiveDiscoveryPilot.test.ts'
       - 'server/adaptiveDiscoveryPilot.postgres.test.ts'
       - 'server/discoveryProposalGenerators.ts'
       - 'server/discoveryProposalGenerators.test.ts'
+      - 'server/discoveryFrontierAllocator.ts'
+      - 'server/discoveryFrontierAllocator.test.ts'
+      - 'server/discoveryFrontierAllocatorRotation.test.ts'
       - 'server/queryIntelligence.ts'
       - 'server/queryIntelligence.authorization.test.ts'
       - 'server/autonomousDiscovery.ts'
