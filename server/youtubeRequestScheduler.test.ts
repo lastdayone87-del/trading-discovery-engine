@@ -333,3 +333,38 @@ test('recent-video description provider exhaustion propagates all-provider coold
   const recent = source.slice(source.indexOf('export async function fetchRecentVideoDescriptionsFromAPI'), source.indexOf('/**\n * Fetches richer official channel metadata'));
   assert.match(recent, /acquisition\.providerFailed\([\s\S]*throwIfAllProvidersCoolingDown\(keyPool\)/);
 });
+
+test('every provider loop rethrows a probe allocation refusal before key failover', () => {
+  const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  const blocks: Array<[string, number, number]> = [
+    ['featured channels',
+      source.indexOf('export async function fetchYouTubeFeaturedChannels'),
+      source.indexOf('/** One bounded playlistItems call')],
+    ['playlist inspection',
+      source.indexOf('export async function fetchYouTubePlaylistChannels'),
+      source.indexOf('/**\n * Retrieves all valid YouTube API keys')],
+    ['locator resolution',
+      source.indexOf('export async function resolveYouTubeLocatorAuthoritatively'),
+      source.indexOf('export interface YouTubeChannelPage')],
+    ['channel search',
+      source.indexOf('export async function searchYouTubeChannelPage'),
+      source.indexOf('/**\n * Fetches recent video titles')],
+    ['recent videos',
+      source.indexOf('export async function fetchRecentVideoDescriptionsFromAPI'),
+      source.indexOf('/**\n * Fetches richer official channel metadata')],
+    ['channel enrichment',
+      source.indexOf('export async function fetchYouTubeChannelEnrichment'),
+      source.indexOf('/** One-unit basic metadata hydration')],
+    ['country metadata',
+      source.indexOf('export async function fetchYouTubeChannelCountryMetadata'),
+      source.length],
+  ];
+  for (const [name, start, end] of blocks) {
+    assert.ok(start >= 0 && end > start, `${name} source block exists`);
+    const block = source.slice(start, end);
+    const rethrow = block.indexOf('isProbeQuotaControlError');
+    assert.ok(rethrow >= 0, `${name} recognizes probe quota refusals`);
+    const record = block.indexOf('recordProviderFailure');
+    assert.ok(record < 0 || rethrow < record, `${name} rethrows before recording a key failure`);
+  }
+});

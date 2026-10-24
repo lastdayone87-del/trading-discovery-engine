@@ -18,6 +18,20 @@ export interface QuotaOriginDb {
   query: (sql: string, params?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }>;
 }
 
+/**
+ * A provenance read could not complete. This is infrastructure, not a
+ * provenance verdict: the job may retry without spending official quota.
+ */
+export class QuotaOriginUnavailableError extends Error {
+  readonly code = 'QUOTA_ORIGIN_UNAVAILABLE';
+  readonly retryable = true;
+
+  constructor(message: string, readonly details: { cause?: unknown } = {}) {
+    super(message, details.cause === undefined ? undefined : { cause: details.cause });
+    this.name = 'QuotaOriginUnavailableError';
+  }
+}
+
 const NORMAL_ONLY_JOB_TYPES = new Set([
   'SEARCH_YOUTUBE',
   'MANUAL_SEARCH_PAGE',
@@ -131,8 +145,10 @@ function collectChannelIds(payload: any): string[] {
 
 /**
  * Resolves the origin for a claimed job from the persisted payload and the
- * authoritative channel rows. Channel-keyed jobs with a missing row or a failed
- * DB read return UNKNOWN and are failed closed by the queue dispatcher.
+ * authoritative channel rows. Channel-keyed jobs with a missing or malformed
+ * row return UNKNOWN and are failed closed by the queue dispatcher. A database
+ * read failure throws QuotaOriginUnavailableError so the dispatcher's normal
+ * retry lifecycle applies instead of a terminal provenance failure.
  */
 export async function resolveJobQuotaOrigin(
   job: { type: string; payload?: any },
@@ -156,8 +172,11 @@ export async function resolveJobQuotaOrigin(
       `SELECT channel_id, quota_origin FROM channels WHERE channel_id = ANY($1::text[])`,
       [channelIds],
     ) as { rows: any[] };
-  } catch {
-    return 'UNKNOWN';
+  } catch (error) {
+    throw new QuotaOriginUnavailableError(
+      `Unable to read durable quota provenance for job type ${job.type}.`,
+      { cause: error },
+    );
   }
 
   const byId = new Map<string, string>();

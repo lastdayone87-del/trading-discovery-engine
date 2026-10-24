@@ -724,20 +724,7 @@ export async function processNextSearchJob(
   if (!job) return false;
   const investigationId=String(job.payload?.investigationId||''),investigationStepId=String(job.payload?.investigationStepId||'');
   const traceId=String(job.payload?.traceId||'');
-  // Establish durable provenance before any handler can reserve quota, hydrate
-  // metadata, or open a provider request. Probe-origin jobs run normally but
-  // every official call reserves from the independent probe allocation.
-  // UNKNOWN fails closed before any work, provider request, or review write.
-  const quotaOrigin = await resolveJobQuotaOrigin(job);
-  if (quotaOrigin === 'UNKNOWN') {
-    await failJob(job.id, new OfficialYouTubeQuotaFenceError(
-      quotaOrigin,
-      `queueJob:${job.type}`,
-      `job ${job.id} has no durable quota provenance`,
-    ));
-    return true;
-  }
-  return runWithOfficialYouTubeQuotaOrigin(quotaOrigin, `queueJob:${job.type}`, () => withExecutionTrace(traceId,async()=>{
+  return withExecutionTrace(traceId, async()=>{
   const heartbeat = setInterval(() => {
     heartbeatJob(job.id, workerId).catch(error => console.error(`[Queue Worker:${workerId}] Heartbeat failed:`, error));
     if(investigationId&&investigationStepId)heartbeatInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,workerId}).catch(error=>console.error(`[Investigation:${investigationId}] Heartbeat failed:`,error));
@@ -745,6 +732,20 @@ export async function processNextSearchJob(
   heartbeat.unref?.();
 
   try {
+    // Establish durable provenance before any handler can reserve quota,
+    // hydrate metadata, or open a provider request. Probe-origin jobs run
+    // normally but every official call reserves from the independent probe
+    // allocation. Resolve inside this try so a provenance read failure follows
+    // the same failure lifecycle and job-specific cleanup as handler errors.
+    const quotaOrigin = await resolveJobQuotaOrigin(job);
+    if (quotaOrigin === 'UNKNOWN') {
+      throw new OfficialYouTubeQuotaFenceError(
+        quotaOrigin,
+        `queueJob:${job.type}`,
+        `job ${job.id} has no durable quota provenance`,
+      );
+    }
+    return await runWithOfficialYouTubeQuotaOrigin(quotaOrigin, `queueJob:${job.type}`, async () => {
     if(investigationId&&investigationStepId&&!await startInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,attempt:job.attempts,workerId})){await completeJob(job.id);return true;}
     await recordExecutionStage('DISPATCHER','REACHED',{jobId:job.id,type:job.type});
     if(job.type==='RETRY_COMMUNITY_ACQUISITION'){
@@ -1466,6 +1467,7 @@ export async function processNextSearchJob(
     }
     await completeJob(job.id);
     return true;
+    });
   } catch (err: any) {
     if (err instanceof ExcludedCountryError) {
       // A policy change can make an already-persisted job ineligible. Consume it
@@ -1519,7 +1521,7 @@ export async function processNextSearchJob(
   } finally {
     clearInterval(heartbeat);
   }
-  }));
+  });
 }
 
 export interface ProcessDiscoveredChannelOutcome {

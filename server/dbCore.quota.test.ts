@@ -253,3 +253,26 @@ test('probe allocation and per-key cap exhaustion defer without consuming an att
   assert.equal(keyDecision.disposition, 'RETRYING_WITHOUT_ATTEMPT');
   assert.equal(keyDecision.runAfter, getNextYouTubeQuotaResetAt(new Date(now)));
 });
+
+test('normal allocation exhaustion keeps its transient age limit; probe markers do not', async () => {
+  const { decideJobFailure } = await import('./dbCore');
+  const { ProbeQuotaExceededError, ProbeQuotaUnavailableError } = await import('./quotaKeyCapShadow');
+  const now = new Date('2026-10-20T19:00:00.000Z').getTime();
+  const sevenHoursAgo = now - 7 * 60 * 60_000;
+
+  // The shared QUOTA_ALLOCATION_EXHAUSTED code is also the pre-existing normal
+  // allocation error. It must not inherit the probe terminal's unbounded defer.
+  const normal = decideJobFailure({ code: 'QUOTA_ALLOCATION_EXHAUSTED', retryAt: now + 60_000 }, 3, 3, now, sevenHoursAgo);
+  assert.equal(normal.disposition, 'FAILED');
+  assert.equal(normal.operationallyBlocked, true);
+
+  const probe = new ProbeQuotaExceededError('2026-10-20', 90, 20, 100, new Date(now));
+  assert.equal(decideJobFailure(probe, 3, 3, now, sevenHoursAgo).disposition, 'RETRYING_WITHOUT_ATTEMPT');
+
+  // Unavailable probe storage keeps the transient age limit and its 60s retry.
+  const unavailable = new ProbeQuotaUnavailableError('probe settings read failed');
+  const unavailableDecision = decideJobFailure(unavailable, 3, 3, now, sevenHoursAgo);
+  assert.equal(unavailableDecision.disposition, 'FAILED');
+  assert.equal(unavailableDecision.operationallyBlocked, true);
+  assert.equal(decideJobFailure(unavailable, 3, 3, now, now).disposition, 'RETRYING_WITHOUT_ATTEMPT');
+});

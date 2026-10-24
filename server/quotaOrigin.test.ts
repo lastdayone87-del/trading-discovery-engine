@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import {
   OfficialYouTubeQuotaFenceError,
@@ -11,6 +12,7 @@ import {
   runWithOfficialYouTubeQuotaOrigin,
 } from './officialYouTubeQuotaFence';
 import {
+  QuotaOriginUnavailableError,
   getChannelQuotaOrigin,
   resolveJobQuotaOrigin,
   resolvePipelineQuotaOrigin,
@@ -56,12 +58,17 @@ test('job origin: payload PROBE is sticky; persisted PROBE upgrades NORMAL', asy
   assert.equal(queries, 1);
 });
 
-test('job origin: missing channel, malformed hint, or DB failure is UNKNOWN', async () => {
+test('job origin: missing channel or malformed hint is terminal UNKNOWN; a DB failure is retryable', async () => {
   const missing: QuotaOriginDb = { query: async () => ({ rows: [], rowCount: 0 }) };
   assert.equal(await resolveJobQuotaOrigin({ type: 'ENRICH_CHANNEL', payload: { channelId: 'gone' } }, missing), 'UNKNOWN');
   assert.equal(await resolveJobQuotaOrigin({ type: 'ENRICH_CHANNEL', payload: { channelId: 'x', quotaOrigin: 'something' } }, missing), 'UNKNOWN');
   const failing: QuotaOriginDb = { query: async () => { throw new Error('db down'); } };
-  assert.equal(await resolveJobQuotaOrigin({ type: 'ENRICH_CHANNEL', payload: { channelId: 'x' } }, failing), 'UNKNOWN');
+  await assert.rejects(
+    resolveJobQuotaOrigin({ type: 'ENRICH_CHANNEL', payload: { channelId: 'x' } }, failing),
+    (error: unknown) => error instanceof QuotaOriginUnavailableError
+      && (error as QuotaOriginUnavailableError).code === 'QUOTA_ORIGIN_UNAVAILABLE'
+      && (error as QuotaOriginUnavailableError).retryable === true,
+  );
   assert.equal(await resolveJobQuotaOrigin({ type: 'SEARCH_YOUTUBE', payload: {} }, failing), 'NORMAL');
 });
 
@@ -87,6 +94,18 @@ test('non-channel canary jobs default to NORMAL and still honor an explicit PROB
     'PROBE',
     'an explicit probe-origin hint remains authoritative'
   );
+});
+
+test('queue dispatcher routes provenance failures through the handler lifecycle', () => {
+  const source = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  const start = source.indexOf('const job = await claimNextJob');
+  const dispatcher = source.slice(start, source.indexOf('export interface ProcessDiscoveredChannelOutcome'));
+  assert.ok(start >= 0 && dispatcher.length > 0);
+  assert.match(dispatcher, /try \{[\s\S]*resolveJobQuotaOrigin\(job\)/);
+  assert.match(dispatcher, /throw new OfficialYouTubeQuotaFenceError/);
+  assert.match(dispatcher, /return await runWithOfficialYouTubeQuotaOrigin\(quotaOrigin/);
+  assert.doesNotMatch(dispatcher, /failJob\(job\.id, new OfficialYouTubeQuotaFenceError/,
+    'terminal provenance failures must use the job-specific catch/cleanup path');
 });
 
 test('pipeline origin: existing PROBE is sticky; malformed persisted marker fails closed', async () => {

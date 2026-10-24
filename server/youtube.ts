@@ -224,6 +224,10 @@ export async function fetchYouTubeFeaturedChannels(sourceChannelId: string, maxi
         // body validation/parsing: refetching would charge a second request
         // against one job reservation.
         if (responseAccounted || isYouTubeQuotaAccountingError(error)) throw error;
+        // The probe allocation is one Pacific-day bucket, not a per-key
+        // budget. Trying another key cannot succeed and would only repeat the
+        // same refusal.
+        if (isProbeQuotaControlError(error)) throw error;
         recordProviderFailure(apiKey, error);
         if (isQuotaExceeded(error)) quotaExceededCount++;
         if (attempt === providerIndexes.length - 1) {
@@ -248,7 +252,7 @@ export async function fetchYouTubePlaylistChannels(playlistId:string,limit:numbe
     for(let attempt=0;attempt<providerIndexes.length;attempt++){const index=providerIndexes[attempt];let responseAccounted=false;
       try{const url=buildYouTubeApiUrl('playlistItems',keys[index],{part:'snippet',playlistId,maxResults});const response=await youtubeFetch(url,'playlist-items',1,attempt+1,acquisition,'enrichment',keys[index]);await accountYouTubeQuotaResponse(response, 1);responseAccounted=true;const data=await readYouTubeJsonObject(response, 'playlist-items');
         return (data.items||[]).map((item:any)=>({channelId:String(item.snippet?.videoOwnerChannelId||''),channelName:String(item.snippet?.videoOwnerChannelTitle||''),description:String(item.snippet?.description||''),videoTitles:[String(item.snippet?.title||'')],observedAt})).filter((x:PlaylistChannelObservation)=>x.channelId&&x.channelName);
-      }catch(error){if(responseAccounted||isYouTubeQuotaAccountingError(error))throw error;recordProviderFailure(keys[index],error);if(isQuotaExceeded(error))quotaExceededCount++;if(attempt===providerIndexes.length-1){acquisition.providerFailed(quotaExceededCount===providerIndexes.length?'QUOTA_EXHAUSTED':'INDETERMINATE');throwIfAllProvidersCoolingDown(keys);throw error;}}
+      }catch(error){if(responseAccounted||isYouTubeQuotaAccountingError(error))throw error;if(isProbeQuotaControlError(error))throw error;recordProviderFailure(keys[index],error);if(isQuotaExceeded(error))quotaExceededCount++;if(attempt===providerIndexes.length-1){acquisition.providerFailed(quotaExceededCount===providerIndexes.length?'QUOTA_EXHAUSTED':'INDETERMINATE');throwIfAllProvidersCoolingDown(keys);throw error;}}
     }throw new Error('All configured YouTube API keys failed for playlist inspection.');
   } finally { acquisition.release(); }
 }
@@ -935,6 +939,8 @@ export async function resolveYouTubeLocatorAuthoritatively(identity: string, typ
         if (typeof channelId === 'string' && /^UC[A-Za-z0-9_-]{22}$/.test(channelId)) return channelId;
         return null;
       } catch (error) {
+        // Probe allocation is global for the day; do not rotate keys.
+        if (isProbeQuotaControlError(error)) throw error;
         if (attempt === keys.length - 1) throw error;
       }
     }
@@ -1026,6 +1032,8 @@ export async function searchYouTubeChannelPage(
         // A successful response that cannot be accounted must not be fetched
         // again with another key; the provider already spent the units.
         if(isYouTubeQuotaAccountingError(e))throw e;
+        // A probe refusal is a single day-wide bucket, not a key failure.
+        if(isProbeQuotaControlError(e))throw e;
         recordProviderFailure(apiKey, e);
         if (isQuotaExceeded(e)) quotaExceededCount++;
         console.warn(`[YouTube API Pool] Key #${currentIndex + 1} fetch error:`, e);
@@ -1124,6 +1132,10 @@ export async function fetchRecentVideoDescriptionsWithIds(channelId: string): Pr
       }
     } catch (e) {
       if(isYouTubeQuotaAccountingError(e))throw e;
+      // The optional video-details refusal above keeps the already-paid search
+      // snippets; a refusal on the primary search is global and must not be
+      // retried against every remaining key.
+      if(isProbeQuotaControlError(e))throw e;
       recordProviderFailure(apiKey,e);
       if (isQuotaExceeded(e)) quotaExceededCount++;
       console.warn(`[YouTube API] Failed to fetch video descriptions for ${channelId}:`, e);
@@ -1509,6 +1521,9 @@ export async function fetchYouTubeChannelEnrichment(
       // another key would burn a second provider call while the first
       // call's units stay unrecorded. Surface immediately instead.
       if(isYouTubeQuotaAccountingError(error))throw error;
+      // Probe allocation refusals are global for the Pacific day; key
+      // failover cannot change the outcome.
+      if(isProbeQuotaControlError(error))throw error;
       recordProviderFailure(apiKey,error);
       if (isQuotaExceeded(error)) quotaExceededCount++;
       lastError = error instanceof Error ? error : new Error(String(error));
@@ -1531,8 +1546,9 @@ export async function fetchYouTubeChannelCountryMetadata(channelId: string, fall
   if (!keys.length) return { ...fallback, countryMetadataStatus: 'UNAVAILABLE', countryMetadataCheckedAt: checkedAt };
   let acquisition; try { acquisition=youtubePoolBackoff.beginAcquisition(); }
   catch { return { ...fallback, countryMetadataStatus: 'UNAVAILABLE', countryMetadataCheckedAt: checkedAt }; }
-  // A quarantined channel degrades to the fallback (this path never throws);
-  // a gate read failure proceeds best-effort since the call below records it.
+  // A quarantined channel degrades to the fallback. Ordinary provider
+  // failures also degrade to the fallback; probe quota refusals below are
+  // policy signals and propagate to the caller's normal failure lifecycle.
   try {
     await throwIfYouTubeInputQuarantined('channel-country-metadata', { channelId });
   } catch (error) {
@@ -1578,6 +1594,9 @@ export async function fetchYouTubeChannelCountryMetadata(channelId: string, fall
         countryMetadataStatus: officialCountry ? 'AVAILABLE_DECLARED' : 'AVAILABLE_NOT_DECLARED', countryMetadataCheckedAt: checkedAt };
     } catch (error) {
       if(isYouTubeQuotaAccountingError(error))throw error;
+      // A probe refusal is a day-wide policy signal. Returning UNAVAILABLE
+      // here would hide it and retrying another key cannot succeed.
+      if(isProbeQuotaControlError(error))throw error;
       recordProviderFailure(keys[index],error);if (isQuotaExceeded(error)) quotaExceededCount++;
     }
   }

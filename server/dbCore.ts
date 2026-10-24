@@ -2171,14 +2171,17 @@ export function decideJobFailure(error:any,attempts:number,maxAttempts:number,no
   // The quota fence is a policy terminal, not a provider failure. It must
   // never retry, cool a provider, or consume the job retry budget.
   if(isOfficialYouTubeQuotaFenceError(error))return {disposition:'FAILED'};
-  // Probe allocation controls are capacity/policy signals. Defer without
-  // consuming an attempt and without turning the channel into a human-review
-  // case. The reset instant is carried by the typed error.
-  const failureCode=String(error?.code||'');
-  if(failureCode==='QUOTA_ALLOCATION_EXHAUSTED'||failureCode==='PROBE_QUOTA_DISABLED'||failureCode==='PROBE_QUOTA_UNAVAILABLE'){
+  // Probe allocation policy terminals defer without consuming an attempt and
+  // without turning the channel into a human-review case. Match only the
+  // probe-specific markers: QUOTA_ALLOCATION_EXHAUSTED also identifies the
+  // pre-existing normal allocation error, which must keep its six-hour
+  // transient age limit. PROBE_QUOTA_UNAVAILABLE is retryable infrastructure
+  // and also keeps that age limit.
+  if(error?.probeQuotaExceeded===true||error?.probeQuotaDisabled===true){
     const retryAt=Number(error?.retryAt);
     return {disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:Number.isFinite(retryAt)&&retryAt>now?retryAt:now+60_000};
   }
+  const failureCode=String(error?.code||'');
   if(failureCode==='YOUTUBE_KEY_CAP_EXCEEDED'){
     // Capacity exhaustion is a policy wait, not a job failure. Wait for the
     // Pacific reset without consuming an attempt or creating review work.

@@ -1,9 +1,9 @@
 /**
  * Official YouTube Data API quota fence.
  *
- * Probe retrieval uses InnerTube (zero official units). Downstream hydration,
- * enrichment, queued jobs and retries are allowed to spend official YouTube
- * quota only from the independent probe allocation enforced in
+ * Probe retrieval uses InnerTube for discovery. Downstream hydration,
+ * enrichment, queued jobs and retries may spend official YouTube quota, but
+ * probe-origin work draws from the independent probe allocation enforced in
  * `quotaKeyCapShadow.ts`. Every official call establishes provenance here;
  * unknown origin fails closed.
  *
