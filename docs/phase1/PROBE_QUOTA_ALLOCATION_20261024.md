@@ -151,22 +151,22 @@ file; only the two #533-owned docs (`README.md`,
 `QUOTA_SHADOW_UNIT3_20261019.md`) differ, because their final #533 versions are
 kept. The reconciliation therefore changes no runtime behavior.
 
-At reviewed code/test head `318cf68`: `npx tsc --noEmit` is clean; the focused
-quota subset is **79/79 pass** locally, the discovery/retrieval batch is
-**26/26**, the terminology contracts are **97/97**, and the broader
+At reviewed code/test head `275bb3c`: `npx tsc --noEmit` is clean; the focused
+quota subset is **79/79 pass** locally, the discovery/retrieval/manual batch is
+**48/48**, the terminology contracts are **97/97**, and the broader
 quota/maintenance/contract batch is **156/156 pass**. PostgreSQL is CI-only on
 this host (no local server); the postgres:17 run applies the full migration
 lineage including 154/155. Phase 1 quota shadow
-[40100592990](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40100592990)
+[40102160449](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40102160449)
 passed **79/79 unit** and **31/31 PostgreSQL**, 0 skipped. The corpus PostgreSQL
 run
-[40100597868](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40100597868)
+[40102164533](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40102164533)
 ran the new channel-upsert regression **3/3**, 0 skipped. The autonomous
 retrieval safety run
-[40100597891](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40100597891)
-passed **32/32** and the discovery-depth run
-[40100597898](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40100597898)
-passed **14/14**. All other code workflows at `318cf68` are green; PR Agent
+[40102164551](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40102164551)
+passed **35/35** and the discovery-depth run
+[40102164521](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40102164521)
+passed **14/14**. All other code workflows at `275bb3c` are green; PR Agent
 remains red only on Gemini `API_KEY_INVALID`. No enforcement, probe, or
 adaptive settings were changed.
 
@@ -220,22 +220,33 @@ confirmed ones were fixed in code:
   `ENRICH_CHANNEL` is only the queue carrier: the handler replays the original
   discovery pipeline before the enrichment-only eligibility gate, so rows that
   discovery may revisit (UNCERTAIN country evidence or an aged machine
-  NON_TRADING decision) are not silently completed as ineligible. The
-  idempotency key collapses repeated sightings, and a scheduling failure is
-  logged without aborting the page. While the allocation stays disabled that
-  job follows the documented attempt-free daily deferral; it does not consume
-  ordinary quota or attempts.
+  NON_TRADING decision) are not silently completed as ineligible. Retries also
+  propagate the normal repair flag, so a partially completed replay cannot
+  strand vocabulary extraction behind the preserved-channel early return. The
+  idempotency key collapses repeated sightings. If enqueueing the retry fails,
+  the refusal is propagated instead of swallowing it: the page is then
+  retried/deferred by the queue rather than silently losing the channel when
+  the nomination ledger is disabled. While the allocation stays disabled the
+  deferred job follows the documented attempt-free daily deferral; it does not
+  consume ordinary quota or attempts.
 - **Deferred results no longer make normal pagination stop.** Autonomous pages
   keep the actual provider `rawResultCount` for reporting, but duplicate math
-  subtracts results that were never evaluated. A page containing only deferred
-  results is treated as inconclusive, not low-yield, so it continues until a
-  real page/creator ceiling instead of consuming the consecutive-low-yield
-  budget. The page is persisted with a `DEFERRED_ONLY` reason code, and the
-  continuation-state rebuild treats it as transparent: it neither extends nor
-  resets the low-yield streak. Manual-search pages use the same exclusion
-  through `manualSearchContinuationMetrics`, so operator-driven pagination also
-  reaches its real ceiling instead of scoring deferred channels as country
-  misses or duplicates.
+  subtracts the raw provider occurrences that were never evaluated (not one per
+  distinct deferred channel, which would leave repeated occurrences in the
+  duplicate total). A page containing only deferred results is treated as
+  inconclusive, not low-yield, so it continues until a real page/creator
+  ceiling instead of consuming the consecutive-low-yield budget. The page is
+  persisted with a `DEFERRED_ONLY` reason code, and the continuation-state
+  rebuild treats it as transparent: it neither extends nor resets the
+  low-yield streak.
+- **Manual pagination uses evaluated creators for continuation.** The page
+  audit keeps the raw and unique provider IDs, but the session's continuation
+  set now stores only evaluated IDs. A deferred creator therefore cannot
+  consume the creator ceiling or make its first evaluated appearance look
+  previously seen. Manual duplicate ratio now counts repeated raw occurrences,
+  not previously seen creators, so known creators do not make a distinct page
+  look duplicate-heavy. Completed-run aggregation also retains the deferred
+  and evaluated raw counts needed to reconcile the page records.
 - **Probe reservations cannot hide an enforcement enable.** While the per-key
   enforcement cache holds OFF, `reserveProbeQuota` re-reads the setting before
   skipping the 9,000-unit projection. Ordinary dispatch keeps the bounded
@@ -243,7 +254,11 @@ confirmed ones were fixed in code:
 
 Not changed: the daily requeue when the probe allocation is disabled remains
 the intended fail-closed drain behavior; changing it requires a bounded-retry
-decision. The ≥120 s shadow drain plus provider timeout is still the activation
+decision. A manual recheck that is refused by the probe allocation after the
+worker sets `providerAttempted` may leave its operational reservation marked
+`CONSUMED`; that row is audit-only, because no official request was dispatched,
+`incrementQuota` is untouched, and `tryReserveQuota` only counts `RESERVED`
+rows. The ≥120 s shadow drain plus provider timeout is still the activation
 precondition for mixed cached-OFF/enforced traffic.
 
 **Audited and not changed (Qodo, `server/queueManager.ts:2860`).** The finding
