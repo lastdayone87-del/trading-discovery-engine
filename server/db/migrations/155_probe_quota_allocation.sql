@@ -7,6 +7,10 @@
 -- empty, and no app_settings row is created. Both probe flags are absent => no
 -- probe-origin official calls are admitted.
 
+-- Bound the lock wait on the live lease table so a blocked deployment cannot
+-- queue every later migration behind it. Scoped by the migration transaction.
+SET LOCAL lock_timeout = '10s';
+
 ALTER TABLE youtube_key_cap_shadow_leases
   ADD COLUMN IF NOT EXISTS allocation TEXT NOT NULL DEFAULT 'NORMAL';
 
