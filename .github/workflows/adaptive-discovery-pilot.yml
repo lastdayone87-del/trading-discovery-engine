@@ -1,0 +1,83 @@
+# Adaptive country-aware discovery pilot: deterministic assignment, proposal
+# wiring and metric aggregation. Scratch-only postgres:17 service; no
+# production resources are referenced.
+name: Adaptive discovery pilot
+
+on:
+  pull_request:
+    paths:
+      - 'server/adaptiveDiscoveryPilot.ts'
+      - 'server/adaptiveDiscoveryPilotPolicy.ts'
+      - 'server/adaptiveDiscoveryPilot.test.ts'
+      - 'server/adaptiveDiscoveryPilot.postgres.test.ts'
+      - 'server/discoveryProposalGenerators.ts'
+      - 'server/discoveryProposalGenerators.test.ts'
+      - 'server/discoveryFrontierAllocator.ts'
+      - 'server/discoveryFrontierAllocator.test.ts'
+      - 'server/discoveryFrontierAllocatorRotation.test.ts'
+      - 'server/queryIntelligence.ts'
+      - 'server/queryIntelligence.authorization.test.ts'
+      - 'server/autonomousDiscovery.ts'
+      - 'server/dbCore.ts'
+      - 'server/db/migrations/156_adaptive_discovery_pilot.sql'
+      - '.github/workflows/adaptive-discovery-pilot.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: TypeScript check
+        run: npx tsc --noEmit
+      - name: Adaptive pilot and frontier unit tests
+        run: >-
+          node --import tsx --test
+          server/adaptiveDiscoveryPilot.test.ts
+          server/discoveryProposalGenerators.test.ts
+          server/queryIntelligence.authorization.test.ts
+          server/discoveryFrontierAllocator.test.ts
+          server/discoveryFrontierAllocatorRotation.test.ts
+
+  postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: tde_adaptive_pilot
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d tde_adaptive_pilot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/tde_adaptive_pilot
+      ADAPTIVE_PILOT_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/tde_adaptive_pilot
+      PGSSL: disable
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Apply full migration lineage (includes 156)
+        run: npx tsx scripts/runMigrations.ts
+      - name: Adaptive pilot PostgreSQL tests
+        run: node --import tsx --test server/adaptiveDiscoveryPilot.postgres.test.ts

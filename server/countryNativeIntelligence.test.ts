@@ -832,15 +832,16 @@ test('Phase 10: persisted-cursor round robin preserves generator ranking and has
   assert.deepEqual([...served].sort(), [...countries].sort());
 });
 
-test('Phase 10: the existing autonomous producer materializes only bounded native proposals before Phase 8 allocation', () => {
+test('Phase 10: the autonomous producer uses bounded pilot-aware materialization before Phase 8 allocation', () => {
   const source = fs.readFileSync(new URL('./autonomousDiscovery.ts', import.meta.url), 'utf8');
-  assert.match(source, /materializeBoundedCountryNativeProposals/);
+  const materializationCall = source.indexOf('await materializeAdaptiveDiscoveryPilotProposals(countries, {');
+  assert.ok(materializationCall >= 0, 'the producer must call the pilot-aware materializer');
   assert.doesNotMatch(source, /generateFrontierProposalsForCountry/);
   assert.match(source, /country_native_materialization_cursor/);
   assert.match(source, /fairnessCursor: nativeFairnessCursor/);
   assert.ok(
-    source.indexOf('materializeBoundedCountryNativeProposals') < source.indexOf('evaluateShadowFrontierAllocation({ opportunityKey'),
-    'proposal materialization must precede the existing Phase 8 allocation boundary'
+    materializationCall < source.indexOf('evaluateShadowFrontierAllocation({ opportunityKey'),
+    'the materialization call, not its import, must precede the existing Phase 8 allocation boundary'
   );
 });
 
@@ -862,7 +863,7 @@ test('Phase 10: a hung optional materializer is bounded and native neighborhoods
 test('Phase 10: every scheduler skip has an explicit reservation disposition and successful scheduling consumes once', () => {
   const scheduler = fs.readFileSync(new URL('./autonomousDiscovery.ts', import.meta.url), 'utf8');
   const allocator = fs.readFileSync(new URL('./discoveryFrontierAllocator.ts', import.meta.url), 'utf8');
-  const db = fs.readFileSync(new URL('./db.ts', import.meta.url), 'utf8');
+  const db = fs.readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
   assert.match(scheduler, /Batch diversity guard skipped reserved allocation/);
   assert.match(scheduler, /quarantineUnexecutableAllocation/);
   assert.match(allocator, /trial_status='EXPIRED'/);
@@ -870,10 +871,11 @@ test('Phase 10: every scheduler skip has an explicit reservation disposition and
   assert.match(db, /SET trial_status='TRIED'/);
   assert.match(db, /p\.trial_status='PENDING'/);
   assert.match(db, /WHERE id=\$1 AND status NOT IN \(\'COMPLETED\',\'FAILED\'\)/);
+  assert.match(db, /CREATOR_DERIVED/);
 });
 
 test('Phase 10: authoritative query completion attributes native outcomes through persisted allocation lineage', () => {
-  const source = fs.readFileSync(new URL('./db.ts', import.meta.url), 'utf8');
+  const source = fs.readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
   assert.match(source, /attributeCompletedCountryNativeRun\(client,runId,metrics\)/);
   assert.match(source, /proposal_evidence_snapshot/);
   assert.doesNotMatch(source, /JOIN frontier_discovery_proposals p ON p\.proposal_id=d\.proposal_id/);

@@ -39,7 +39,7 @@ import {
   markAllocationDecisionDeferred
 } from './discoveryFrontierAllocator';
 import { reconcileYouTubeQuotaRolloverAndGetAutonomousSnapshot } from './quotaRolloverReconciliation';
-import { materializeBoundedCountryNativeProposals } from './discoveryProposalGenerators';
+import { materializeAdaptiveDiscoveryPilotProposals } from './adaptiveDiscoveryPilot';
 import { materializeStoredExternalOsintProposals } from './externalOsint';
 import { randomUUID } from 'node:crypto';
 import { createDiscoveryCycleDiagnostics, recordDiscoveryCandidateDiagnostic, sanitizeSchedulingError, type DiscoveryCandidateDiagnostic, type DiscoveryCandidateDiagnosticPatch, type DiscoveryCycleDiagnostics } from './discoveryTelemetry';
@@ -431,12 +431,19 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
     // Phase 8 remains the sole allocation authority; generation failures cannot
     // block the legacy Query Intelligence scheduler.
     const nativeFairnessCursor = Math.max(0, Number(await getAppSetting('country_native_materialization_cursor', '0')) || 0);
-    await materializeBoundedCountryNativeProposals(countries, {
+    await materializeAdaptiveDiscoveryPilotProposals(countries, {
       globalCap: 25,
       perCountryCap: 5,
-      fairnessCursor: nativeFairnessCursor
-    }).then(() => setAppSetting('country_native_materialization_cursor', String(nativeFairnessCursor + 25)))
-      .catch(error => console.warn('[FrontierProposals] Country-native generation warning:', error));
+      fairnessCursor: nativeFairnessCursor,
+      now
+    }).then(result => {
+      if (result.enabled) {
+        const treatment = result.assignments.filter(item => item.arm === 'TREATMENT').length;
+        const control = result.assignments.length - treatment;
+        log(`Adaptive pilot materialization: ${result.persisted} proposal(s); ${treatment} treatment and ${control} control country-day assignment(s).`);
+      }
+      return setAppSetting('country_native_materialization_cursor', String(nativeFairnessCursor + 25));
+    }).catch(error => console.warn('[FrontierProposals] Adaptive proposal generation warning:', error));
     const osintEnabled = await getAppSetting('external_osint_materialization_enabled', 'false') === 'true';
     await materializeStoredExternalOsintProposals({ enabled: osintEnabled, deadlineMs: 2_500 })
       .catch(error => console.warn('[FrontierProposals] External OSINT degradation; legacy discovery continues:', error));
@@ -505,7 +512,15 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       // research, native, or no experiment requested).
       let selectedExperiment: SelectionExperimentObservation | null = null;
       const nativeSnapshot = frontierAllocationInfo?.decision?.proposalEvidenceSnapshot;
-      const governedConceptProposal = ['COUNTRY_NATIVE', 'EXTERNAL_OSINT'].includes(nativeSnapshot?.proposalFamily);
+      const governedConceptProposal = ['COUNTRY_NATIVE', 'EXTERNAL_OSINT', 'CREATOR_DERIVED'].includes(nativeSnapshot?.proposalFamily);
+      // Name the recorded family in the scheduling reason. Creator-derived and
+      // external proposals share this scheduling branch, so a fixed
+      // COUNTRY_NATIVE label would misattribute the selected work.
+      const governedProposalLabel = nativeSnapshot?.proposalFamily === 'CREATOR_DERIVED'
+        ? 'CREATOR_DERIVED'
+        : nativeSnapshot?.proposalFamily === 'EXTERNAL_OSINT'
+          ? 'EXTERNAL_OSINT'
+          : 'COUNTRY_NATIVE';
 
       // Benchmark-designated attempts (benchmark-preregistration-v1
       // execution): serve ONLY the designated pool row or nothing. An
@@ -575,9 +590,9 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
           selected = {
             queryRecord: nativeQuery,
             selectionStrategy: 'NEIGHBORHOOD_TARGETED',
-            reason: 'Query Intelligence constructed the selected immutable COUNTRY_NATIVE proposal through governed retrieval policy.'
+            reason: `Query Intelligence constructed the selected immutable ${governedProposalLabel} proposal through governed retrieval policy.`
           };
-          candidateDiagnostic = { ...candidateDiagnostic, selectionSource: 'COUNTRY_NATIVE', selectedQueryId: selected.queryRecord.id };
+          candidateDiagnostic = { ...candidateDiagnostic, selectionSource: governedProposalLabel, selectedQueryId: selected.queryRecord.id };
         } else if (targeted?.selectionStrategy === 'NEIGHBORHOOD_TARGETED') {
           selected = targeted;
           candidateDiagnostic = { ...candidateDiagnostic, selectionSource: 'NEIGHBORHOOD_TARGETED', selectedQueryId: selected.queryRecord.id };
@@ -597,7 +612,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
             // on an unrelated generic query after releasing its reservation.
             candidateDiagnostic = {
               ...candidateDiagnostic,
-              selectionSource: 'COUNTRY_NATIVE',
+              selectionSource: governedProposalLabel,
               authorityOutcome: nativeAuthorization?.status === 'AUTHORIZED' ? 'ELIGIBLE' : 'REJECTED',
               authorityReasonCodes: nativeAuthorization?.status === 'REJECTED' ? [nativeAuthorization.code] : undefined,
               disposition: 'SKIPPED',

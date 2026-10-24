@@ -10,6 +10,11 @@
 -- final channel IDs. Such rows remain NORMAL and must be identified by a
 -- separate audited migration if that becomes necessary.
 
+-- Fail fast instead of queueing behind long-lived readers on the hot channels
+-- table. The migration runner executes each file inside a transaction, so this
+-- setting is scoped to this migration.
+SET LOCAL lock_timeout = '10s';
+
 ALTER TABLE channels
   ADD COLUMN IF NOT EXISTS quota_origin TEXT NOT NULL DEFAULT 'NORMAL';
 
