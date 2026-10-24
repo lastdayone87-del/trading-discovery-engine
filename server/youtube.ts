@@ -8,6 +8,7 @@ import {
   recordShadowDispatchSafe,
   reserveEnforcedKeyCap,
   resolveKeyCapEnforcement,
+  settleKeyCapReservation,
   SHADOW_OBSERVATION_BUDGET_MS,
   type KeyCapReservationContext,
 } from './quotaKeyCapShadow';
@@ -194,15 +195,20 @@ export async function fetchYouTubeFeaturedChannels(sourceChannelId: string, maxi
     for (let attempt = 0; attempt < providerIndexes.length; attempt++) {
       const index = providerIndexes[attempt];
       const apiKey = keys[index];
+      let responseAccounted = false;
       try {
         const url = buildYouTubeApiUrl('channelSections', apiKey, { part: 'snippet,contentDetails', channelId: sourceChannelId, maxResults: Math.min(50, maximumFanout) });
         const response = await youtubeFetch(url, 'featured-channel-sections', FEATURED_CHANNEL_PROVIDER_COST, attempt + 1, acquisition, 'enrichment', apiKey);
         await accountYouTubeQuotaResponse(response, FEATURED_CHANNEL_PROVIDER_COST);
+        responseAccounted = true;
         return parseFeaturedChannelSections({ sourceChannelId, maximumFanout, response: await readYouTubeJsonObject(response, 'featured-channel-sections'), observedAt: new Date().toISOString() });
       } catch (error) {
         // A successful provider response that cannot be accounted must not be
         // retried on another key: the first call may already have spent units.
-        if (isYouTubeQuotaAccountingError(error)) throw error;
+        // The same applies to a response that was accounted and then failed
+        // body validation/parsing: refetching would charge a second request
+        // against one job reservation.
+        if (responseAccounted || isYouTubeQuotaAccountingError(error)) throw error;
         recordProviderFailure(apiKey, error);
         if (isQuotaExceeded(error)) quotaExceededCount++;
         if (attempt === providerIndexes.length - 1) {
@@ -223,10 +229,10 @@ export async function fetchYouTubePlaylistChannels(playlistId:string,limit:numbe
   const maxResults=Math.min(50,Math.max(1,Math.trunc(limit)));const observedAt=new Date().toISOString();
   try {
     const providerIndexes=availableKeyIndexes(keys);
-    for(let attempt=0;attempt<providerIndexes.length;attempt++){const index=providerIndexes[attempt];
-      try{const url=buildYouTubeApiUrl('playlistItems',keys[index],{part:'snippet',playlistId,maxResults});const response=await youtubeFetch(url,'playlist-items',1,attempt+1,acquisition,'enrichment',keys[index]);await accountYouTubeQuotaResponse(response, 1);const data=await readYouTubeJsonObject(response, 'playlist-items');
+    for(let attempt=0;attempt<providerIndexes.length;attempt++){const index=providerIndexes[attempt];let responseAccounted=false;
+      try{const url=buildYouTubeApiUrl('playlistItems',keys[index],{part:'snippet',playlistId,maxResults});const response=await youtubeFetch(url,'playlist-items',1,attempt+1,acquisition,'enrichment',keys[index]);await accountYouTubeQuotaResponse(response, 1);responseAccounted=true;const data=await readYouTubeJsonObject(response, 'playlist-items');
         return (data.items||[]).map((item:any)=>({channelId:String(item.snippet?.videoOwnerChannelId||''),channelName:String(item.snippet?.videoOwnerChannelTitle||''),description:String(item.snippet?.description||''),videoTitles:[String(item.snippet?.title||'')],observedAt})).filter((x:PlaylistChannelObservation)=>x.channelId&&x.channelName);
-      }catch(error){if(isYouTubeQuotaAccountingError(error))throw error;recordProviderFailure(keys[index],error);if(isQuotaExceeded(error))quotaExceededCount++;if(attempt===providerIndexes.length-1){acquisition.providerFailed(quotaExceededCount===providerIndexes.length?'QUOTA_EXHAUSTED':'INDETERMINATE');throwIfAllProvidersCoolingDown(keys);throw error;}}
+      }catch(error){if(responseAccounted||isYouTubeQuotaAccountingError(error))throw error;recordProviderFailure(keys[index],error);if(isQuotaExceeded(error))quotaExceededCount++;if(attempt===providerIndexes.length-1){acquisition.providerFailed(quotaExceededCount===providerIndexes.length?'QUOTA_EXHAUSTED':'INDETERMINATE');throwIfAllProvidersCoolingDown(keys);throw error;}}
     }throw new Error('All configured YouTube API keys failed for playlist inspection.');
   } finally { acquisition.release(); }
 }
@@ -426,6 +432,12 @@ async function joinShadowObservation(
   }
 }
 
+function preDispatchAbortError(signal:AbortSignal):Error{
+  const error=Object.assign(new Error('YouTube provider call was cancelled before dispatch.'),{name:'AbortError'});
+  if(signal.reason!==undefined)(error as Error & {cause?:unknown}).cause=signal.reason;
+  return error;
+}
+
 async function youtubeFetch(url:string,operation:string,actualCost:number,attempt=1,acquisition?:YouTubePoolAcquisition,priority:YouTubeRequestPriority='enrichment',providerKey?:string,lifecycle?:YouTubeProviderLifecycle):Promise<Response>{
   const traceId = `${operation}-${attempt}-${++outboundTraceSequence}`;
   let providerDispatchAttempt = 0;
@@ -514,8 +526,22 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
         if(capReservation){
           // The reservation transaction may have waited across Pacific
           // midnight. Do not send a new-day request against yesterday's
-          // capacity; fail closed and let the caller retry.
-          assertKeyCapReservationDayCurrent(capReservation, new Date());
+          // capacity; fail closed and let the caller retry. Release the exact
+          // lease first so a refused dispatch cannot hold capacity until reset.
+          try{assertKeyCapReservationDayCurrent(capReservation, new Date());}
+          catch(error){
+            try{const pool=await getDb();await settleKeyCapReservation(pool,capReservation);}catch{/* expiry remains the backstop */}
+            throw error;
+          }
+        }
+        if(signal.aborted){
+          // Reservation work can outlive the provider deadline. fetch() would
+          // abort without dispatching, so release the exact lease instead of
+          // leaving admitted capacity stranded until the Pacific reset.
+          if(capReservation){
+            try{const pool=await getDb();await settleKeyCapReservation(pool,capReservation);}catch{/* expiry remains the backstop */}
+          }
+          throw preDispatchAbortError(signal);
         }
         if(dispatchedProviderKey && !capReservation){
           // Shadow-only cap observation (never blocks or alters dispatch):          // record an in-flight lease plus any projected WOULD_DEFER/

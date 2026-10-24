@@ -19,7 +19,7 @@ test('dispatch provider selection reselects a currently healthy key when the que
 
 test('youtubeFetch performs live reselection inside scheduler dispatch and rebuilds the provider URL', () => {
   const source=fs.readFileSync(new URL('./youtube.ts',import.meta.url),'utf8');
-  const schedulerStart=source.indexOf('return await youtubeRequestScheduler.run(()=>{');
+  const schedulerStart=source.indexOf('youtubeRequestScheduler.run(()=>{');
   const selection=source.indexOf('selectYouTubeDispatchProviderIndex(livePool,providerKey)',schedulerStart);
   const rewrite=source.indexOf("rebuiltUrl.searchParams.set('key',dispatchedProviderKey)",selection);
   const outbound=source.indexOf('fetch(dispatchedUrl,{signal})',rewrite);
@@ -48,6 +48,38 @@ test('featured-channel inspection fails over across healthy keys', () => {
   assert.match(block, /attempt === providerIndexes\.length - 1/);
   assert.match(block, /throwIfAllProvidersCoolingDown\(keys\)/);
   assert.doesNotMatch(block, /const index = availableKeyIndexes\(keys\)\[0\]/);
+});
+
+test('featured and playlist inspections never refetch after an accounted response', () => {
+  const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  for (const [startMarker, endMarker] of [
+    ['export async function fetchYouTubeFeaturedChannels', '/** One bounded playlistItems call'],
+    ['export async function fetchYouTubePlaylistChannels', '/**\n * Retrieves all valid YouTube API keys'],
+  ]) {
+    const start = source.indexOf(startMarker);
+    const end = source.indexOf(endMarker, start);
+    assert.ok(start >= 0 && end > start, `${startMarker} boundary must remain discoverable`);
+    const block = source.slice(start, end);
+    assert.match(block, /let responseAccounted\s*=\s*false;/);
+    const account = block.indexOf('await accountYouTubeQuotaResponse(');
+    const markAccounted = block.slice(account).search(/responseAccounted\s*=\s*true;/) + account;
+    const guardMatch = block.slice(markAccounted).match(/if\s*\(\s*responseAccounted\s*\|\|/);
+    const guard = guardMatch ? markAccounted + guardMatch.index! : -1;
+    assert.ok(account >= 0 && markAccounted > account && guard > markAccounted,
+      `${startMarker} must surface a post-accounting parse failure instead of failing over`);
+  }
+});
+
+test('pre-dispatch abort releases the exact enforced lease before throwing', () => {
+  const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));
+  const abortCheck = youtubeFetch.indexOf('if(signal.aborted)');
+  const fetchCall = youtubeFetch.indexOf('response=await fetch(dispatchedUrl');
+  assert.ok(abortCheck >= 0 && fetchCall > abortCheck, 'abort check must precede dispatch');
+  const block = youtubeFetch.slice(abortCheck, fetchCall);
+  assert.match(block, /settleKeyCapReservation\(pool,capReservation\)/);
+  assert.match(block, /throw preDispatchAbortError\(signal\)/);
+  assert.match(youtubeFetch, /assertKeyCapReservationDayCurrent\(capReservation, new Date\(\)\)[\s\S]*settleKeyCapReservation/);
 });
 
 test('youtubeFetch gates dispatch on suspension hydration and captures generation before fetch', () => {
