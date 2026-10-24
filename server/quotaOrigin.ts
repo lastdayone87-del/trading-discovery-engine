@@ -29,6 +29,12 @@ const NORMAL_ONLY_JOB_TYPES = new Set([
   'PERSISTENT_RESEARCH_EXTERNAL_PROVIDER',
   'RESOLVE_STAGED_CANDIDATE',
   'COUNTRY_BOUNDARY_REPROCESS',
+  // Operator/canary jobs whose payloads are not channel-keyed (a playlist ID
+  // or a relationship seed cohort). They have their own adapter quota controls
+  // and are not probe-origin. A probe-origin variant must carry an explicit
+  // quotaOrigin:'PROBE' hint, which is honored before this allowlist.
+  'INSPECT_PLAYLIST',
+  'RELATIONSHIP_CANARY_EXPANSION',
 ]);
 
 function normalizeQuotaOrigin(value: unknown): QuotaOrigin | undefined {

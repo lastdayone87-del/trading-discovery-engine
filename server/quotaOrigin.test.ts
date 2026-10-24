@@ -65,6 +65,30 @@ test('job origin: missing channel, malformed hint, or DB failure is UNKNOWN', as
   assert.equal(await resolveJobQuotaOrigin({ type: 'SEARCH_YOUTUBE', payload: {} }, failing), 'NORMAL');
 });
 
+test('non-channel canary jobs default to NORMAL and still honor an explicit PROBE hint', async () => {
+  const neverQueried: QuotaOriginDb = {
+    query: async () => { throw new Error('non-channel jobs must not query channel provenance'); },
+  };
+  assert.equal(
+    await resolveJobQuotaOrigin({ type: 'INSPECT_PLAYLIST', payload: { playlistId: 'PL123' } }, neverQueried),
+    'NORMAL',
+    'playlist canaries have their own adapter budget and no channel row'
+  );
+  assert.equal(
+    await resolveJobQuotaOrigin({
+      type: 'RELATIONSHIP_CANARY_EXPANSION',
+      payload: { cohortId: 'cohort-1', seeds: [{ kind: 'channel', id: `UC${'a'.repeat(22)}` }] },
+    }, neverQueried),
+    'NORMAL',
+    'relationship canaries are ordinary-quota jobs unless explicitly marked'
+  );
+  assert.equal(
+    await resolveJobQuotaOrigin({ type: 'INSPECT_PLAYLIST', payload: { playlistId: 'PL123', quotaOrigin: 'PROBE' } }, neverQueried),
+    'PROBE',
+    'an explicit probe-origin hint remains authoritative'
+  );
+});
+
 test('pipeline origin: existing PROBE is sticky; malformed persisted marker fails closed', async () => {
   const probe: QuotaOriginDb = { query: async () => ({ rows: [{ quota_origin: 'PROBE' }], rowCount: 1 }) };
   assert.equal(await resolvePipelineQuotaOrigin({ channelId: 'c' }, undefined, probe), 'PROBE');
