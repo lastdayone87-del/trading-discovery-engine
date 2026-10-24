@@ -78,6 +78,7 @@ import {
   runWithOfficialYouTubeQuotaOrigin,
 } from './officialYouTubeQuotaFence';
 import { resolveJobQuotaOrigin } from './quotaOrigin';
+import { isProbeQuotaControlError } from './quotaKeyCapShadow';
 import { assertCountryAllowed, ExcludedCountryError, getCountryExclusion, shouldBlockEnrichClaimForCountry } from './countryExclusion';
 import { randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
@@ -819,14 +820,18 @@ export async function processNextSearchJob(
         // failures defer attempt-free with their retry schedule, while genuine
         // failures consume one bounded attempt and eventually project a
         // truthful terminal state. A plain Error would erase that distinction.
+        const probeControl=result.probeQuotaExceeded===true||result.probeQuotaDisabled===true||result.probeQuotaUnavailable===true;
         const typedTransient=result.retryable===true
-          &&['TIMEOUT','CANCELLED','RATE_LIMIT','TRANSIENT','CREDENTIALS_EXHAUSTED'].includes(String(result.errorClass||''));
+          &&(probeControl||['TIMEOUT','CANCELLED','RATE_LIMIT','TRANSIENT','CREDENTIALS_EXHAUSTED'].includes(String(result.errorClass||'')));
         throw Object.assign(new Error(result.message),{
           code:result.code,
           retryable:typedTransient,
           errorClass:typedTransient?result.errorClass:undefined,
           retryAt:typedTransient?result.retryAt:undefined,
-          retryAfterMs:typedTransient?result.retryAfterMs:undefined
+          retryAfterMs:typedTransient?result.retryAfterMs:undefined,
+          ...(result.probeQuotaExceeded===true?{probeQuotaExceeded:true}:{}),
+          ...(result.probeQuotaDisabled===true?{probeQuotaDisabled:true}:{}),
+          ...(result.probeQuotaUnavailable===true?{probeQuotaUnavailable:true}:{})
         });
       }
       const refreshed=await getChannelById(channelId);
@@ -2666,6 +2671,10 @@ export interface ManualRecheckResult {
     errorClass?: ManualRecheckErrorClass;
   retryAt?: number;
   retryAfterMs?: number;
+  /** Probe allocation refusals remain policy waits through the worker bridge. */
+  probeQuotaExceeded?: boolean;
+  probeQuotaDisabled?: boolean;
+  probeQuotaUnavailable?: boolean;
   languageContext?: ExplicitTerminologyLanguageContext;
 }
 const OFFICIAL_RECHECK_UNITS_PER_PROVIDER = 101;
@@ -2692,12 +2701,23 @@ export async function reserveOfficialRecheckQuota(operationType: string, operati
   });
 }
 
-function classifyManualRecheckAcquisitionFailure(error: any): {
+/** executeProviderCall wraps quota refusals as a provider error, so the probe
+ * policy marker must be recovered from the cause chain before classification. */
+function probeQuotaControlInChain(error: any, depth = 0): any {
+  if (!error || typeof error !== 'object' || depth > 4) return null;
+  if (isProbeQuotaControlError(error)) return error;
+  return probeQuotaControlInChain(error.cause, depth + 1);
+}
+
+export function classifyManualRecheckAcquisitionFailure(error: any): {
   errorClass?: ManualRecheckErrorClass;
   retryable: boolean;
   code: string;
   retryAt?: number;
   retryAfterMs?: number;
+  probeQuotaExceeded?: boolean;
+  probeQuotaDisabled?: boolean;
+  probeQuotaUnavailable?: boolean;
 } {
   const message = String(error?.message || error || '');
   const rawErrorClass = String(error?.errorClass || '').toUpperCase() as ManualRecheckErrorClass;
@@ -2705,6 +2725,24 @@ function classifyManualRecheckAcquisitionFailure(error: any): {
   const status = Number(error?.status || error?.statusCode || error?.response?.status);
   const retryAt = Number(error?.retryAt);
   const retryAfterMs = Number(error?.retryAfterMs);
+  const probeControl = probeQuotaControlInChain(error);
+
+  // Probe allocation refusals are policy/capacity waits, not ordinary provider
+  // failures. Preserve the marker and reset time so maintenance recovery can
+  // defer attempt-free until capacity returns instead of aging out as FAILED.
+  if (probeControl) {
+    const probeRetryAt = Number(probeControl.retryAt);
+    return {
+      errorClass: MANUAL_RECHECK_ERROR_CLASSES.has(rawErrorClass) ? rawErrorClass : undefined,
+      retryable: true,
+      code: String(probeControl.code || code),
+      retryAt: Number.isFinite(probeRetryAt) ? probeRetryAt : (Number.isFinite(retryAt) ? retryAt : undefined),
+      retryAfterMs: Number.isFinite(retryAfterMs) ? retryAfterMs : undefined,
+      probeQuotaExceeded: probeControl.probeQuotaExceeded === true,
+      probeQuotaDisabled: probeControl.probeQuotaDisabled === true,
+      probeQuotaUnavailable: probeControl.probeQuotaUnavailable === true || probeControl.code === 'PROBE_QUOTA_UNAVAILABLE'
+    };
+  }
 
   // Attempt-free infrastructure retries are deliberately opt-in. The
   // upstream error itself must already carry a recognized transient
@@ -2824,15 +2862,21 @@ export async function triggerManualRecheck(
     } catch (error: any) {
       const detail = error instanceof Error ? error.message : String(error);
       const failure = classifyManualRecheckAcquisitionFailure(error);
+      const probeControl = failure.probeQuotaExceeded === true
+        || failure.probeQuotaDisabled === true
+        || failure.probeQuotaUnavailable === true;
       console.warn(`[Manual Recheck] Fresh YouTube creator acquisition failed for ${channelId}; preserving prior trading classification: ${detail}`);
       return {
         success: false,
         message: `Manual re-scan could not acquire fresh YouTube creator evidence. Existing trading classification was preserved. ${detail}`,
-        code: 'MANUAL_RESCAN_UPSTREAM_FAILURE',
+        code: probeControl ? failure.code : 'MANUAL_RESCAN_UPSTREAM_FAILURE',
         retryable: failure.retryable,
         errorClass: failure.errorClass,
         retryAt: failure.retryAt,
         retryAfterMs: failure.retryAfterMs,
+        probeQuotaExceeded: failure.probeQuotaExceeded === true,
+        probeQuotaDisabled: failure.probeQuotaDisabled === true,
+        probeQuotaUnavailable: failure.probeQuotaUnavailable === true,
         channel
       };
     }

@@ -276,3 +276,40 @@ test('normal allocation exhaustion keeps its transient age limit; probe markers 
   assert.equal(unavailableDecision.operationallyBlocked, true);
   assert.equal(decideJobFailure(unavailable, 3, 3, now, now).disposition, 'RETRYING_WITHOUT_ATTEMPT');
 });
+
+test('manual recheck preserves probe policy waits through provider wrapping', async () => {
+  const { classifyManualRecheckAcquisitionFailure } = await import('./queueManager');
+  const { ProbeQuotaDisabledError, ProbeQuotaExceededError } = await import('./quotaKeyCapShadow');
+  const { classifyProviderError } = await import('./providerResilience');
+  const { decideJobFailure } = await import('./dbCore');
+  const { getNextYouTubeQuotaResetAt } = await import('./youtubeQuotaDay');
+  const now = new Date('2026-10-20T19:00:00.000Z').getTime();
+  const reset = getNextYouTubeQuotaResetAt(new Date(now));
+  const sevenHoursAgo = now - 7 * 60 * 60_000;
+
+  const cases = [
+    { probe: new ProbeQuotaDisabledError('2026-10-20'), marker: 'probeQuotaDisabled' as const },
+    { probe: new ProbeQuotaExceededError('2026-10-20', 90, 20, 100, new Date(now)), marker: 'probeQuotaExceeded' as const }
+  ];
+  for (const { probe, marker } of cases) {
+    // executeProviderCall wraps the refusal; the policy marker must survive.
+    const wrapped = classifyProviderError(probe);
+    const classified = classifyManualRecheckAcquisitionFailure(wrapped);
+    assert.equal(classified.retryable, true);
+    assert.equal(classified[marker], true);
+    assert.ok(Number.isFinite(classified.retryAt));
+    if (marker === 'probeQuotaExceeded') assert.equal(classified.retryAt, reset);
+
+    const jobError = Object.assign(new Error('manual recheck acquisition failed'), {
+      code: classified.code,
+      retryable: classified.retryable,
+      errorClass: classified.errorClass,
+      retryAt: classified.retryAt,
+      ...(classified.probeQuotaExceeded ? { probeQuotaExceeded: true } : {}),
+      ...(classified.probeQuotaDisabled ? { probeQuotaDisabled: true } : {})
+    });
+    const decision = decideJobFailure(jobError, 3, 3, now, sevenHoursAgo);
+    assert.equal(decision.disposition, 'RETRYING_WITHOUT_ATTEMPT');
+    assert.equal(decision.runAfter, classified.retryAt);
+  }
+});
