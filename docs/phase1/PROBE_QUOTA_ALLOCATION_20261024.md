@@ -151,22 +151,22 @@ file; only the two #533-owned docs (`README.md`,
 `QUOTA_SHADOW_UNIT3_20261019.md`) differ, because their final #533 versions are
 kept. The reconciliation therefore changes no runtime behavior.
 
-At reviewed code/test head `33e350e`: `npx tsc --noEmit` is clean; the focused
-quota subset is **79/79 pass** locally, the retrieval/manual batch is **31/31**,
-the terminology contracts are **97/97**, and the broader
+At reviewed code/test head `318cf68`: `npx tsc --noEmit` is clean; the focused
+quota subset is **79/79 pass** locally, the discovery/retrieval batch is
+**26/26**, the terminology contracts are **97/97**, and the broader
 quota/maintenance/contract batch is **156/156 pass**. PostgreSQL is CI-only on
 this host (no local server); the postgres:17 run applies the full migration
 lineage including 154/155. Phase 1 quota shadow
-[40099217126](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40099217126)
+[40100592990](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40100592990)
 passed **79/79 unit** and **31/31 PostgreSQL**, 0 skipped. The corpus PostgreSQL
 run
-[40099221721](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40099221721)
+[40100597868](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40100597868)
 ran the new channel-upsert regression **3/3**, 0 skipped. The autonomous
 retrieval safety run
-[40099221711](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40099221711)
-passed **31/31** and the discovery-depth run
-[40099221629](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40099221629)
-passed **14/14**. All other code workflows at `33e350e` are green; PR Agent
+[40100597891](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40100597891)
+passed **32/32** and the discovery-depth run
+[40100597898](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40100597898)
+passed **14/14**. All other code workflows at `318cf68` are green; PR Agent
 remains red only on Gemini `API_KEY_INVALID`. No enforcement, probe, or
 adaptive settings were changed.
 
@@ -215,8 +215,12 @@ confirmed ones were fixed in code:
   deferred channel.
 - **Contained deferrals leave a channel-specific retry.** Returning null alone
   lost the observation until a later manual/search sighting. Each contained
-  refusal now enqueues one low-priority, PROBE-origin `ENRICH_CHANNEL` job per
-  channel and Pacific day, scheduled at the refusal's retry time. The
+  refusal now enqueues one low-priority, PROBE-origin discovery-replay job per
+  channel and Pacific day, scheduled at the refusal's retry time.
+  `ENRICH_CHANNEL` is only the queue carrier: the handler replays the original
+  discovery pipeline before the enrichment-only eligibility gate, so rows that
+  discovery may revisit (UNCERTAIN country evidence or an aged machine
+  NON_TRADING decision) are not silently completed as ineligible. The
   idempotency key collapses repeated sightings, and a scheduling failure is
   logged without aborting the page. While the allocation stays disabled that
   job follows the documented attempt-free daily deferral; it does not consume
@@ -226,10 +230,12 @@ confirmed ones were fixed in code:
   subtracts results that were never evaluated. A page containing only deferred
   results is treated as inconclusive, not low-yield, so it continues until a
   real page/creator ceiling instead of consuming the consecutive-low-yield
-  budget. Manual-search pages use the same exclusion through
-  `manualSearchContinuationMetrics`, so operator-driven pagination also reaches
-  its real ceiling instead of scoring deferred channels as country misses or
-  duplicates.
+  budget. The page is persisted with a `DEFERRED_ONLY` reason code, and the
+  continuation-state rebuild treats it as transparent: it neither extends nor
+  resets the low-yield streak. Manual-search pages use the same exclusion
+  through `manualSearchContinuationMetrics`, so operator-driven pagination also
+  reaches its real ceiling instead of scoring deferred channels as country
+  misses or duplicates.
 - **Probe reservations cannot hide an enforcement enable.** While the per-key
   enforcement cache holds OFF, `reserveProbeQuota` re-reads the setting before
   skipping the 9,000-unit projection. Ordinary dispatch keeps the bounded
