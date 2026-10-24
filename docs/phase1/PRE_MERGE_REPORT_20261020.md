@@ -14,12 +14,13 @@ This version supersedes the 2026-10-21 draft and is updated in the existing
 - **PR #531** merged externally at `2026-10-20T23:37:42Z`; GitHub reports merge
   commit `b1aafabf506c5c86856ec2e9f87e50591854c69b`. Its net diff is **106
   files, +14,595/−358** from base `82e60e7`.
-- **PR #533** is open against `main`; code/test head `8c0e4eb` plus this docs
-  amendment, default OFF. It is not merged, deployed, or enabled.
-- **PR #546** is open and **stacked on #533**; code head `62c5f30` plus this
-  docs amendment. It adds the independent probe-origin allocation; default OFF,
-  not deployed, not activated.
-- **PR #545** is open against `main`; head `8f16150`. It adds the default-OFF
+- **PR #533** is open against `main`; code/test head `c7fae59`, docs head
+  `0633929`, default OFF. It is not merged, deployed, or enabled.
+- **PR #546** is open and **stacked on #533**; code/test head `d405880`,
+  rebased onto #533 `0633929`, plus this docs amendment. It adds the
+  independent probe-origin allocation; default OFF, not deployed, not
+  activated.
+- **PR #545** is open against `main`; head `269c4bf`. It adds the default-OFF
   adaptive creator-derived pilot and the predeclared 14-day plan; no live data.
 - **Probe activation is blocked by the InnerTube policy and missing approval,
   not by a zero-official-unit requirement.** Option 2 is adopted: probe-origin
@@ -80,7 +81,8 @@ files.
 ## 3. PR #533 review, tests, and dispositions
 
 PR: [#533](https://github.com/lastdayone87-del/trading-discovery-engine/pull/533)
-· base `main` · branch `feat/youtube-key-hard-cap` · code/test head `8c0e4eb`
+· base `main` · branch `feat/youtube-key-hard-cap` · code/test head `c7fae59`
+· docs head `0633929`
 · default OFF · no new migration in #533 itself (the probe/adaptive stack adds
 154–156).
 
@@ -102,8 +104,12 @@ PR: [#533](https://github.com/lastdayone87-del/trading-discovery-engine/pull/533
 
 ### CI and local evidence
 
-At `8c0e4eb`, `npm run lint` is clean and the focused quota/scheduler/
-settlement suite is **64/64 pass** locally. The broader local 310-test batch had
+At `c7fae59`, `npm run lint` is clean. The final Phase 1 quota shadow run
+[40064403283](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40064403283)
+is green with **53/53 unit** and **23/23 PostgreSQL**, 0 skipped; rotation run
+[40064406104](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40064406104)
+is green with **71/71**, 0 skipped. The focused quota/scheduler/settlement
+suite is **64/64 pass** locally. The broader local 310-test batch had
 282 pass, 23 skip, and 5 failures; all 5 are pre-existing at `7be108a`
 (confirmed by stashing the changes): three `quotaRecovery`, one
 `youtubeLiveProviderDispatch`, and one `youtubeProviderShadowQuality`. They are
@@ -317,7 +323,7 @@ deployment, migration, flag change, or probe.
 
 | Step | Track A — integration / hard cap | Track B — probe / pilot | Gate |
 | --- | --- | --- | --- |
-| 1 | Merge #533 at `8c0e4eb`+docs, then #546 at `62c5f30`+docs; deploy **default OFF** | Keep probes disabled | Explicit merge/deploy approval |
+| 1 | Merge #533 at `0633929`, then #546 at `d405880`+docs; deploy **default OFF** | Keep probes disabled | Explicit merge/deploy approval |
 | 2 | Apply 154/155/156 through the normal runner; verify settings absent and no behavior change | Confirm policy/route decision | Migration/deploy approval; production migration state check |
 | 3 | Verify absent/false setting, shadow-only behavior, rollback path | Confirm the 10,000-unit probe allocation, fail-closed absent state, and cap enforcement procedure | Post-deploy verification |
 | 4 | Choose enforcement timing; run the shadow drain (lease TTL/provider timeout, preferably a full Pacific day) before enabling #533 | No probe until written authorization and explicit activation | Separate enforcement approval |
@@ -381,8 +387,8 @@ No merge, deployment, production migration apply, app-settings/flag change,
 enforcement activation, queue unpause/resume, or probe has been performed by
 this session. Remaining gates:
 
-1. Explicit approval to merge #533 at `8c0e4eb`+docs, then #546 at
-   `62c5f30`+docs; #546 must not merge independently. #545 follows separately.
+1. Explicit approval to merge #533 at `0633929`, then #546 at `d405880`+docs;
+   #546 must not merge independently. #545 follows separately.
 2. Explicit approval to deploy, with a verified rollback path and normal-runner
    migration apply; production migration state is currently unverified.
 3. Verify migrations 154/155/156 are additive and that absent settings produce

@@ -80,6 +80,37 @@ and review gates are unchanged. Existing enrichment is not starved: the probe
 bucket is additive and isolated, and the only shared limit is #533's per-key
 9,000 cap, which applies to all spend equally.
 
+### Shared-budget admission for operational rechecks
+
+The probe bucket is a **sub-cap inside the shared 350,000-unit daily budget**,
+not an additive reserve above it. Every official probe call still increments
+`quota_tracker.units_used` and the per-key usage row, so the probe bucket can
+only be spent while the shared budget has headroom.
+
+The operational recheck workers (post-approval/force-rescan, false-negative
+recovery, country-boundary recovery) and direct manual rechecks reserve from
+the ordinary shared budget before they run. `tryReserveQuota` deliberately
+treats allocation percentages as scheduling preferences, not hard partitions:
+it refuses only when `actual_used + reserved_total + units` exceeds the shared
+daily budget. A probe-origin recheck therefore cannot bypass the shared-budget
+gate, but ordinary work cannot consume the probe bucket's separate 10,000-unit
+counter either.
+
+Two consequences are intentional:
+
+- When the shared daily budget is exhausted, probe-origin rechecks wait for the
+  Pacific reset instead of spending past the configured total. This is
+  fail-closed (under-admission, never over-spend), not a probe-policy defect.
+- The recheck reservation is sized for the worst-case key failover
+  (`101 × key-pool size`), so in the last few thousand units of the shared
+  budget it can refuse a probe call that would itself have fit. That is a
+  conservative admission granularity; it clears at reset and cannot overspend.
+
+Reserving the probe cap out of ordinary admission (subtracting it from the
+ordinary daily budget) would let probe work keep headroom without exceeding the
+shared total. That is a separate allocation-policy decision and is **not**
+enabled or implied by this PR.
+
 ## Absent-settings behavior and migration additivity
 
 - With both probe settings absent, `resolveProbeQuotaConfig()` returns disabled;
@@ -110,6 +141,22 @@ bucket is additive and isolated, and the only shared limit is #533's per-key
   `entity_bindings`; `INSPECT_FEATURED_CHANNELS` treats a missing `channels`
   row as NORMAL (its adapter controls still apply) while an existing PROBE row
   remains sticky and a malformed persisted marker still fails closed.
+
+## Rebase and evidence (2026-10-24)
+
+#546 was rebased onto #533's final head `0633929`. Its earlier duplicate of
+#533's refused-lease/refetch fix (`bf44342`) was reconciled commit by commit.
+The rebased tree is identical to pre-rebase `9d36e29` for every code and test
+file; only the two #533-owned docs (`README.md`,
+`QUOTA_SHADOW_UNIT3_20261019.md`) differ, because their final #533 versions are
+kept. The reconciliation therefore changes no runtime behavior.
+
+At code/test head `d405880`: `npm run lint` is clean; the CI-equivalent unit
+subset is **76/76 pass** locally and the broader quota/maintenance/contract
+batch is **123/123 pass**. PostgreSQL is CI-only on this host (no local server);
+the postgres:17 run applies the full migration lineage including 154/155. The
+final run at the docs head is recorded in the PR checks and the consolidated
+report. No enforcement, probe, or adaptive settings were changed.
 
 ## Post-review hardening (2026-10-24)
 
@@ -147,6 +194,16 @@ the intended fail-closed drain behavior; changing it requires a bounded-retry
 decision. The per-key enforcement cache can lag an enable by the settings TTL;
 the documented ≥120 s drain plus provider timeout exceeds that window, so it is
 an activation precondition rather than a code defect.
+
+**Audited and not changed (Qodo, `server/queueManager.ts:2860`).** The finding
+says probe recovery stalls because workers require an ordinary ENRICHMENT
+reservation. `tryReserveQuota` does not enforce an ENRICHMENT sub-budget; it
+gates on the shared daily budget, and every probe call also increments the
+shared tracker. Skipping that gate for probe jobs would allow total spend above
+the configured budget. The observed wait is conservative under-admission that
+clears at the Pacific reset. See "Shared-budget admission for operational
+rechecks" above. Reserving probe headroom out of ordinary admission is a
+separate policy decision, not a review fix.
 
 ## Enforcement switch-on and shadow drain
 
