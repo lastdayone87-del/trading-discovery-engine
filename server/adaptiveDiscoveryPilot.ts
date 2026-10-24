@@ -518,9 +518,10 @@ export async function computeAdaptivePilotMetrics(input: {
      FROM adaptive_discovery_pilot_assignments a
      LEFT JOIN latest_obs o
        ON LOWER(o.country) = LOWER(a.country)
-      AND o.allocation_at >= a.window_start
-      AND o.allocation_at < a.window_end
-     WHERE a.window_start >= $1 AND a.window_start < $2
+      AND o.allocation_at >= GREATEST(a.window_start, $1::timestamptz)
+      AND o.allocation_at < LEAST(a.window_end, $2::timestamptz)
+     WHERE a.window_start < $2
+       AND a.window_end > $1
        AND a.policy_version = $3
      GROUP BY a.arm
      ORDER BY a.arm`,
