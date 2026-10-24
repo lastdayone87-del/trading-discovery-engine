@@ -1,6 +1,6 @@
 # Phase 1 — durable source of truth
 
-Last updated: 2026-10-20 (post-#530 integration). This directory is the durable index for the Phase 1
+Last updated: 2026-10-24 (adaptive pilot predeclaration). This directory is the durable index for the Phase 1
 discovery work. It records decisions and evidence, not deployment state. When a
 document and a live system disagree, the live system wins and the document must
 be corrected.
@@ -14,7 +14,8 @@ be corrected.
 | Migrations 148 and 149–152 | In the `phase1-hardening` lineage; applied only to disposable CI databases; **not** applied to production |
 | Hard cap (9,000 units/key/Pacific day) | Implemented on `feat/youtube-key-hard-cap` docs head `9ab4f35` (code/test `5ecd905`), rebased on phase1 `3c53e57`; CI run [39501810518](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39501810518) green (51/51 unit, 21/21 PostgreSQL, 0 skipped); **default OFF, not deployed, not enabled** |
 | InnerTube production use | **Not authorized** — see [INNERTUBE_POLICY_POSITION_20261020.md](INNERTUBE_POLICY_POSITION_20261020.md) |
-| Probe pilot | **Not runnable** while the InnerTube position is unresolved; limits below. No probe has been run. Probe-ledger units are retrieval-only; delegated ingestion official spend is separately accounted |
+| Probe pilot | **Not runnable / not authorized.** No probe has been run. Under the option-2 decision, probe-origin official work may spend official quota but is capped by PR #546 (10,000 units/Pacific day) and, when enabled, by PR #533's 9,000/key cap. InnerTube retrieval itself is not billed. |
+| Adaptive creator-derived pilot (PR #545) | **Default OFF, not activated, no live data.** Deterministic 50/50 country-day pilot; predeclared metrics and activation plan in [ADAPTIVE_DISCOVERY_PILOT_20261024.md](ADAPTIVE_DISCOVERY_PILOT_20261024.md). Migration 156 is additive and unapplied. |
 | GCP key-suspension investigation | **Open / access-blocked** — see [GCP_SUSPENSION_DIAGNOSTIC_20261020.md](GCP_SUSPENSION_DIAGNOSTIC_20261020.md) |
 | Merge / deploy / migration apply / flag changes / probes | **Not approved**; stop before any of these. Shadow/CI evidence is not production proof |
 
@@ -29,6 +30,7 @@ be corrected.
 | [PILOT_LIMITS_AND_CANARY_20261020.md](PILOT_LIMITS_AND_CANARY_20261020.md) | Code-enforced vs config-only limits; canary pass/fail |
 | [QUALIFIED_CREATOR_FORECAST_20261020.md](QUALIFIED_CREATOR_FORECAST_20261020.md) | Evidence-based dates and yield scenarios for persisted qualified creators |
 | [PRE_MERGE_REPORT_20261020.md](PRE_MERGE_REPORT_20261020.md) | Proposed heads, review dispositions, tests, residual issues, and closed gates |
+| [ADAPTIVE_DISCOVERY_PILOT_20261024.md](ADAPTIVE_DISCOVERY_PILOT_20261024.md) | 14-day 50/50 pilot question, predeclared metrics, early read, and activation plan |
 
 ## Non-negotiable boundaries
 

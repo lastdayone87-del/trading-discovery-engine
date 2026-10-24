@@ -1205,7 +1205,7 @@ export type QueryIntelligenceAuthorizationInputResult =
 /** Pure, database-free classification of the immutable proposal/evidence input. */
 export function classifyCountryNativeAuthorizationInput(args: CountryNativeAuthorizationInput): QueryIntelligenceAuthorizationInputResult {
   const snapshot = args.proposalEvidenceSnapshot;
-  if (!['COUNTRY_NATIVE', 'EXTERNAL_OSINT'].includes(snapshot?.proposalFamily)) {
+  if (!['COUNTRY_NATIVE', 'EXTERNAL_OSINT', 'CREATOR_DERIVED'].includes(snapshot?.proposalFamily)) {
     return { status: 'REJECTED', code: 'PROPOSAL_FAMILY_UNSUPPORTED' };
   }
   const targetKey = createNeighborhoodKey(args.targetNeighborhoodDimensions);

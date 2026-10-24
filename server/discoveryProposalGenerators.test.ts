@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import {
   buildFrontierProposal,
   createProposalDedupKey,
-  generateCountryNativeProposals
+  generateCountryNativeProposals,
+  generateCreatorDerivedProposals,
+  generateFrontierProposalsForCountry
 } from './discoveryProposalGenerators';
 
 test('Phase 6: Proposal dedup key is deterministic and unique across dimensions', () => {
@@ -49,4 +51,96 @@ test('Phase 6: Country-native proposal generator uses native market terms withou
   assert.ok(proposalsBR.length > 0);
   assert.equal(proposalsBR[0].country, 'Brazil');
   assert.ok(proposalsBR.some(p => p.concept.includes('B3') || p.concept.includes('mini indice')), 'Brazilian native terms must be present');
+});
+
+test('creator-derived proposals bind actual channel columns and a checksummed follow-up concept', () => {
+  const proposal = buildFrontierProposal({
+    proposalFamily: 'CREATOR_DERIVED',
+    country: 'United States',
+    concept: 'price action',
+    sourceProvenance: 'creator_metadata:creator-1:price action',
+    supportingEvidence: {
+      channelId: 'creator-1',
+      nativeTerm: 'price action',
+      sourceProvenanceFamily: 'CREATOR_DERIVED'
+    },
+    noveltyRationale: 'Verified-creator follow-up.'
+  });
+  assert.equal(proposal.proposalFamily, 'CREATOR_DERIVED');
+  assert.equal(proposal.supportingEvidence.nativeTerm, 'price action');
+  assert.match(String(proposal.supportingEvidence.evidenceChecksum), /^[a-f0-9]{16,64}$/);
+  assert.match(String(proposal.supportingEvidence.evidenceVersion), /^1970-01-01T00:00:00.000Z\|/);
+});
+
+test('creator-derived proposals for consecutive treatment days produce distinct dedup keys', () => {
+  const neighborhood = 'US|en|GENERAL|price action|VIDEO|RELEVANCE|none|creator_derived';
+  const stable = createProposalDedupKey('CREATOR_DERIVED', 'US', 'price action', neighborhood);
+  const empty = createProposalDedupKey('CREATOR_DERIVED', 'US', 'price action', neighborhood, '');
+  const dayOne = createProposalDedupKey('CREATOR_DERIVED', 'US', 'price action', neighborhood, 'assignment-day-one');
+  const dayTwo = createProposalDedupKey('CREATOR_DERIVED', 'US', 'price action', neighborhood, 'assignment-day-two');
+
+  assert.equal(stable, empty, 'An absent discriminator must preserve the historical key');
+  assert.notEqual(dayOne, dayTwo, 'A recurring creator concept must get a new key on the next pilot day');
+  assert.equal(dayOne, createProposalDedupKey('CREATOR_DERIVED', 'US', 'price action', neighborhood, 'assignment-day-one'));
+
+  const first = buildFrontierProposal({
+    proposalFamily: 'CREATOR_DERIVED',
+    country: 'United States',
+    concept: 'price action',
+    retrievalLane: 'VIDEO',
+    sourceFamily: 'creator_derived',
+    sourceProvenance: 'creator_metadata:creator-1:price action',
+    dedupDiscriminator: 'assignment-day-one',
+    expiresAt: '2026-10-24T07:00:00.000Z',
+    supportingEvidence: { nativeTerm: 'price action' },
+    noveltyRationale: 'Verified-creator follow-up.'
+  });
+  const second = buildFrontierProposal({
+    proposalFamily: 'CREATOR_DERIVED',
+    country: 'United States',
+    concept: 'price action',
+    retrievalLane: 'VIDEO',
+    sourceFamily: 'creator_derived',
+    sourceProvenance: 'creator_metadata:creator-1:price action',
+    dedupDiscriminator: 'assignment-day-two',
+    expiresAt: '2026-10-25T07:00:00.000Z',
+    supportingEvidence: { nativeTerm: 'price action' },
+    noveltyRationale: 'Verified-creator follow-up.'
+  });
+
+  assert.notEqual(first.dedupKey, second.dedupKey);
+  assert.equal(first.targetNeighborhoodKey, second.targetNeighborhoodKey, 'Both day-specific rows must point at the same governed neighborhood');
+});
+
+test('a zero family or global cap generates nothing before querying', async () => {
+  assert.deepEqual(await generateCreatorDerivedProposals('US', 0), [],
+    'a zero family cap must not fall through to a LIMIT 1 query');
+  assert.deepEqual(
+    await generateFrontierProposalsForCountry('US', { perFamilyCap: 0, globalCap: 25 }),
+    { generated: 0, persisted: 0, proposals: [] },
+    'perFamilyCap=0 must not persist one proposal per family'
+  );
+  assert.deepEqual(
+    await generateFrontierProposalsForCountry('US', { perFamilyCap: 5, globalCap: 0 }),
+    { generated: 0, persisted: 0, proposals: [] },
+    'globalCap=0 must not persist the first proposal'
+  );
+});
+
+test('creator-derived generator uses the channels schema and governed vocabulary evidence', async () => {
+  const source = await import('node:fs').then(fs => fs.readFileSync(
+    new URL('./discoveryProposalGenerators.ts', import.meta.url),
+    'utf8'
+  ));
+  assert.match(source, /c\.channel_name/);
+  assert.match(source, /extracted_trading_vocabulary/);
+  assert.match(source, /extracted_vocabulary_sources/);
+  assert.match(source, /v\.id = s\.term_id/);
+  assert.match(source, /retrievalLane: 'VIDEO'/);
+  assert.match(source, /expiresAt: options\.expiresAt/);
+  assert.match(source, /pilotQuotaDay: options\.pilotQuotaDay/);
+  assert.match(source, /pilotAssignmentKey: options\.pilotAssignmentKey/);
+  assert.match(source, /pilotPolicyVersion: options\.pilotPolicyVersion/);
+  assert.match(source, /dedupDiscriminator: options\.pilotAssignmentKey \|\| options\.pilotQuotaDay/);
+  assert.doesNotMatch(source, /c\.title/);
 });
