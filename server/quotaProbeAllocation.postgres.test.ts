@@ -20,6 +20,13 @@ import {
 } from './quotaKeyCapShadow';
 import { getYouTubeQuotaDay } from './youtubeQuotaDay';
 
+// The probe allocation is derived from the effective YouTube budget. Establish
+// a deterministic one-key budget so the 100-unit cap below is valid even when
+// the CI process has no provider keys configured (which correctly fails
+// closed with a zero 10% share).
+process.env.YOUTUBE_API_KEY = 'probe-allocation-postgres-test-key';
+process.env.YOUTUBE_DAILY_QUOTA_PER_KEY = '10000';
+
 /**
  * Dedicated-database tests for the independent probe-origin official quota
  * allocation. They never run without QUOTA_SHADOW_TEST_DATABASE_URL and never
