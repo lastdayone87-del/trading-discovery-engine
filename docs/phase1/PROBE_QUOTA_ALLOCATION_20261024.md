@@ -151,18 +151,24 @@ file; only the two #533-owned docs (`README.md`,
 `QUOTA_SHADOW_UNIT3_20261019.md`) differ, because their final #533 versions are
 kept. The reconciliation therefore changes no runtime behavior.
 
-At reviewed code/test head `fec2bbd`: `npx tsc --noEmit` is clean; the focused
-quota subset is **79/79 pass** locally and the broader
-quota/maintenance/contract batch is **153/153 pass**. PostgreSQL is CI-only on
+At reviewed code/test head `33e350e`: `npx tsc --noEmit` is clean; the focused
+quota subset is **79/79 pass** locally, the retrieval/manual batch is **31/31**,
+the terminology contracts are **97/97**, and the broader
+quota/maintenance/contract batch is **156/156 pass**. PostgreSQL is CI-only on
 this host (no local server); the postgres:17 run applies the full migration
 lineage including 154/155. Phase 1 quota shadow
-[40092039328](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40092039328)
+[40099217126](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40099217126)
 passed **79/79 unit** and **31/31 PostgreSQL**, 0 skipped. The corpus PostgreSQL
 run
-[40092042533](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40092042533)
-ran the new channel-upsert regression **3/3**, 0 skipped. All other code
-workflows at `fec2bbd` are green; PR Agent remains red only on Gemini
-`API_KEY_INVALID`. No enforcement, probe, or adaptive settings were changed.
+[40099221721](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40099221721)
+ran the new channel-upsert regression **3/3**, 0 skipped. The autonomous
+retrieval safety run
+[40099221711](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40099221711)
+passed **31/31** and the discovery-depth run
+[40099221629](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40099221629)
+passed **14/14**. All other code workflows at `33e350e` are green; PR Agent
+remains red only on Gemini `API_KEY_INVALID`. No enforcement, probe, or
+adaptive settings were changed.
 
 ## Post-review hardening (2026-10-24)
 
@@ -207,6 +213,23 @@ confirmed ones were fixed in code:
   propagate the refusal so the queue can defer them to the Pacific reset.
   Nomination rows remain; funnel observations/sightings are skipped for the
   deferred channel.
+- **Contained deferrals leave a channel-specific retry.** Returning null alone
+  lost the observation until a later manual/search sighting. Each contained
+  refusal now enqueues one low-priority, PROBE-origin `ENRICH_CHANNEL` job per
+  channel and Pacific day, scheduled at the refusal's retry time. The
+  idempotency key collapses repeated sightings, and a scheduling failure is
+  logged without aborting the page. While the allocation stays disabled that
+  job follows the documented attempt-free daily deferral; it does not consume
+  ordinary quota or attempts.
+- **Deferred results no longer make normal pagination stop.** Autonomous pages
+  keep the actual provider `rawResultCount` for reporting, but duplicate math
+  subtracts results that were never evaluated. A page containing only deferred
+  results is treated as inconclusive, not low-yield, so it continues until a
+  real page/creator ceiling instead of consuming the consecutive-low-yield
+  budget. Manual-search pages use the same exclusion through
+  `manualSearchContinuationMetrics`, so operator-driven pagination also reaches
+  its real ceiling instead of scoring deferred channels as country misses or
+  duplicates.
 - **Probe reservations cannot hide an enforcement enable.** While the per-key
   enforcement cache holds OFF, `reserveProbeQuota` re-reads the setting before
   skipping the 9,000-unit projection. Ordinary dispatch keeps the bounded
