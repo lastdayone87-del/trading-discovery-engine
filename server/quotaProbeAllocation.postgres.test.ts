@@ -9,6 +9,7 @@ import {
   YouTubeKeyCapExceededError,
   getProbeQuotaStatus,
   releaseProbeQuotaReservation,
+  reserveEnforcedKeyCap,
   reserveProbeQuota,
   resetKeyCapEnforcementCacheForTests,
   resetProbeQuotaConfigCacheForTests,
@@ -280,6 +281,39 @@ maybe('when the #533 per-key cap is ON, the same probe lease is checked once aga
   // The probe bucket would have admitted 10 (it is empty), but the global
   // per-key projection is the tighter limit: 8995 + 10 > 9000.
   assert.equal(await leaseCount(`${runTag}:keycap:`), 0);
+});
+
+maybe('concurrent probe and enforced reservations for one key cannot jointly over-admit 9,000', async () => {
+  await ensureSchema();
+  await clearProbeState();
+  resetCaches();
+  const deps = { readSetting: keyCapReader, pool: requirePool() as unknown as ShadowPoolPort };
+  for (let round = 0; round < 6; round++) {
+    const key = keyFor(`mixed-${round}`);
+    await requirePool().query(
+      `INSERT INTO youtube_key_quota_usage(quota_day, key_fingerprint, key_index, units_used, daily_limit)
+       VALUES($1,$2,1,8990,10000)
+       ON CONFLICT(quota_day, key_fingerprint)
+       DO UPDATE SET units_used=$3, updated_at=now()`,
+      [quotaDay, key, 8990]
+    );
+    const prefix = `${runTag}:mixed:${round}:`;
+    const outcomes = await Promise.allSettled([
+      reserveProbeQuota(deps, {
+        keyFingerprint: key, operationId: `${prefix}probe`, units: 10, now: fixedNow,
+      }),
+      reserveEnforcedKeyCap(deps, {
+        keyFingerprint: key, operationId: `${prefix}cap`, units: 10, now: fixedNow,
+      }),
+    ]);
+    const admitted = outcomes.filter(outcome => outcome.status === 'fulfilled');
+    assert.equal(admitted.length, 1, `round ${round}: exactly one 10-unit writer fits 8,990 + 10 = 9,000`);
+    const rejected = outcomes.find(outcome => outcome.status === 'rejected');
+    assert.ok(
+      rejected?.status === 'rejected' && rejected.reason instanceof YouTubeKeyCapExceededError,
+      `round ${round}: the loser is a typed per-key rejection`
+    );
+  }
 });
 
 maybe('probe allocation projects only probe-origin settled usage, not ordinary enrichment', async () => {

@@ -46,6 +46,22 @@ import {
 import { getNextYouTubeQuotaResetAt, getYouTubeQuotaDay } from './youtubeQuotaDay';
 import { readFileSync } from 'node:fs';
 
+test('probe reservation takes the shared key/day lock before projecting or inserting', () => {
+  const source = readFileSync(new URL('./quotaKeyCapShadow.ts', import.meta.url), 'utf8');
+  const start = source.indexOf('export async function reserveProbeQuota');
+  const end = source.indexOf('/** Releases a probe lease', start);
+  assert.ok(start >= 0 && end > start, 'reserveProbeQuota boundary must remain discoverable');
+  const block = source.slice(start, end);
+  const keyLock = block.indexOf('keyCapAdvisoryLockName(quotaDay, keyFingerprint)');
+  const bucketLock = block.indexOf('youtube-probe-quota:${quotaDay}');
+  const projection = block.indexOf('PROBE_PROJECTED_SQL');
+  const insertion = block.indexOf('PROBE_INSERT_SQL');
+  assert.ok(keyLock >= 0, 'probe reservation takes the shared key lock');
+  assert.ok(bucketLock > keyLock, 'the global bucket lock follows the key lock');
+  assert.ok(projection > bucketLock, 'projection happens after both locks');
+  assert.ok(insertion > projection, 'insertion happens after projection');
+});
+
 test('shadow and enforcement share one key/day advisory lock namespace', () => {
   assert.equal(
     keyCapAdvisoryLockName('2026-10-20', 'fp-test'),

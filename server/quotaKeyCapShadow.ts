@@ -1111,10 +1111,12 @@ export function assertProbeQuotaReservationDayCurrent(
 }
 
 /**
- * Reserves from the shared probe-origin daily bucket. The advisory lock is
- * global for the Pacific day, so concurrent probes/workers cannot collectively
- * over-admit. The lease is settled in the same transaction as the official
- * quota charge; failed dispatches release it explicitly.
+ * Reserves from the shared probe-origin daily bucket. Two advisory locks make
+ * admission atomic: the shared key/day lock serializes with shadow and
+ * enforced lease writers, and the global Pacific-day lock keeps concurrent
+ * probe/worker reservations inside the bucket. The lease is settled in the
+ * same transaction as the official quota charge; failed dispatches release it
+ * explicitly.
  */
 export async function reserveProbeQuota(
   deps: KeyCapReserveDeps,
@@ -1156,6 +1158,24 @@ export async function reserveProbeQuota(
     await client.query('BEGIN');
     await client.query(`SET LOCAL lock_timeout = '${lockTimeoutMs}ms'`);
     await client.query(`SET LOCAL statement_timeout = '${ENFORCED_STATEMENT_TIMEOUT_MS}ms'`);
+    // Probe leases live in the key-cap lease table and count toward the
+    // per-key projection when enforcement is on. Take the same key/day lock
+    // as shadow and enforced writers before reading or inserting, otherwise
+    // an enforced projection can miss a concurrently inserted probe lease
+    // and over-admit the key. Key first, then the global bucket lock, so all
+    // writers that take both use one order.
+    try {
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
+        keyCapAdvisoryLockName(quotaDay, keyFingerprint),
+      ]);
+    } catch (error) {
+      throw new ProbeQuotaUnavailableError(
+        (error as { code?: unknown } | null)?.code === '55P03'
+          ? 'Probe quota key lock timed out.'
+          : 'Probe quota key lock failed.',
+        { quotaDay, operationId, cause: error },
+      );
+    }
     try {
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
         `youtube-probe-quota:${quotaDay}`,

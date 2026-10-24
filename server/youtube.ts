@@ -656,7 +656,7 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
             // request cost while the failed leases remain conservative until
             // reset. Surface it once and let the caller's bounded key
             // failover decide whether another provider is worth trying.
-            if(runtimeRateLimited&&capReservation&&error&&typeof error==='object'){
+            if(runtimeRateLimited&&(capReservation||probeReservation)&&error&&typeof error==='object'){
               Object.assign(error,{youtubeQuotaReservationRetryBounded:true});
             }
             if(!runtimeRateLimited)failedDispatchProviders(acquisition)?.add(dispatchedProviderKey);

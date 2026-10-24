@@ -50,8 +50,8 @@ test('a quota-reserved 429 is tagged and never replayed by the scheduler', () =>
   const fetchBlock = youtube.slice(fetchStart, fetchEnd);
   assert.match(
     fetchBlock,
-    /runtimeRateLimited&&capReservation&&error&&typeof error==='object'\)\{\s*Object\.assign\(error,\{youtubeQuotaReservationRetryBounded:true\}\)/,
-    'a 429 carrying a live reservation must be marked bounded'
+    /runtimeRateLimited&&\(capReservation\|\|probeReservation\)&&error&&typeof error==='object'\)\{\s*Object\.assign\(error,\{youtubeQuotaReservationRetryBounded:true\}\)/,
+    'a 429 carrying a live key-cap or probe reservation must be marked bounded'
   );
   const retryCheck = scheduler.slice(
     scheduler.indexOf("this.noteRuntimeRateLimit(details, actualSpacingMs, request.priority, request.trace);"),
