@@ -1257,6 +1257,7 @@ export async function processNextSearchJob(
     const queryRecord=queryId?await getQueryById(queryId):null;
     const observations: QueryObservation[] = [];
     const sightings = [];
+    let deferredResults = 0;
     const channelLoopStartMs = Date.now();
     for (const [index, raw] of distinctExtracted.entries()) {
       // A durable nomination is written before channel processing. When the
@@ -1269,8 +1270,10 @@ export async function processNextSearchJob(
       raw.nominationId=nomination.id||undefined;raw.queryRunId=queryRunId;raw.discoveryJobId=job.id;
       const outcome = await processDiscoveredChannelContained(raw, country, source, { forceExtraction: isRepairEligibleRetry(job) });
       // A sticky-PROBE channel refused by its own allocation is deferred for
-      // this run; the rest of the NORMAL page must still be processed.
-      if (!outcome) continue;
+      // this run; the rest of the NORMAL page must still be processed. Keep it
+      // out of yield/duplicate math: it was not evaluated, and counting it as
+      // a duplicate can stop pagination before later normal results.
+      if (!outcome) { deferredResults++; continue; }
       const funnelOutcome: FunnelOutcome = outcome.countryStatus === 'REJECTED'
         ? 'COUNTRY_REJECTED'
         : outcome.tradingStatus === 'HUMAN_REJECTED' ? 'NON_TRADING' : outcome.tradingStatus;
@@ -1296,7 +1299,7 @@ export async function processNextSearchJob(
     if (queryRunId && queryId) {
       const queryRecord = await getQueryById(queryId);
       if (!queryRecord) throw new Error(`Query ${queryId} no longer exists for run ${queryRunId}.`);
-      const metrics = calculateQueryFunnel(searchPage?.rawResultCount ?? extracted.length, observations);
+      const metrics = calculateQueryFunnel(searchPage?.rawResultCount ?? extracted.length, observations, deferredResults);
       await recordQueryRunSightings(queryRunId, queryId, sightings.map(s=>({...s,pageNumber})));
       const globalMaxPages = Math.max(1, Number(await getAppSetting('autonomous_pagination_max_pages', '3')));
       const maxPages = retrievalTreatmentOrigin === 'CANARY_TREATMENT'
@@ -1311,6 +1314,10 @@ export async function processNextSearchJob(
         : maxPages;
       const maxLow = Math.max(1, Number(await getAppSetting('autonomous_pagination_max_low_yield_pages', '2')));
       const prior = await getAutonomousContinuationState(queryRunId, pageNumber);
+      const evaluatedRawResults = metrics.evaluatedRawResults ?? metrics.rawResults;
+      const duplicateRatio = evaluatedRawResults > 0
+        ? metrics.duplicateResults / evaluatedRawResults
+        : metrics.deferredResults ? 0 : 1;
       const decision = evaluateContinuation({
         pageNumber, maxPages: trialBoundedMaxPages, hasNextPage: !!searchPage?.nextPageToken,
         distinctCreators: metrics.distinctResults,
@@ -1322,9 +1329,10 @@ export async function processNextSearchJob(
         delayedQualityCreators: prior.delayedQualityCreators,
         countryPrecision: metrics.countryPrecision,
         communityDiversity: metrics.tradingConfirmed ? metrics.communitiesDiscovered / metrics.tradingConfirmed : 0,
-        duplicateRatio: metrics.rawResults ? metrics.duplicateResults / metrics.rawResults : 1,
+        duplicateRatio,
         consecutiveLowYieldPages: prior.consecutiveLowYieldPages,
-        maxConsecutiveLowYieldPages: maxLow
+        maxConsecutiveLowYieldPages: maxLow,
+        deferredOnly: observations.length === 0 && deferredResults > 0
       });
       const enabled = await getAppSetting('autonomous_pagination_enabled', 'true') === 'true';
       const stoppingReason = decision.shouldContinue ? null : decision.primaryReason;
@@ -1337,7 +1345,7 @@ export async function processNextSearchJob(
         countryPrecision: metrics.countryPrecision,
         communityDiversity: metrics.tradingConfirmed ? metrics.communitiesDiscovered / metrics.tradingConfirmed : 0,
         noveltyRatio: metrics.noveltyRatio,
-        duplicateRatio: metrics.rawResults ? metrics.duplicateResults / metrics.rawResults : 1,
+        duplicateRatio,
         quotaUnits: providerQuotaUnits, decision, stoppingReason, pageMetrics: metrics,
         retrievalConfigKey, retrievalTreatmentOrigin
       };
@@ -1687,6 +1695,42 @@ export function shouldContainProbeQuotaRefusal(
   return jobOrigin === 'NORMAL' && probeQuotaControlInChain(error) !== null;
 }
 
+/**
+ * Pure payload/key builder for the per-channel retry created when a NORMAL
+ * batch contains a sticky-PROBE channel whose own allocation refuses it.
+ * A page-level retry would spend the whole page again, so the deferral is
+ * persisted as one PROBE-origin enrichment job per channel and quota day.
+ * `enqueueJob`'s idempotency key collapses repeated sightings to one job.
+ */
+export function probeDeferredEnrichmentJob(
+  raw: DiscoveredChannelRaw,
+  targetCountry: string,
+  source: DiscoverySource,
+  control: unknown,
+  now: number = Date.now(),
+): { payload: Record<string, unknown>; opts: { priority: number; maxAttempts: number; runAfter: string; idempotencyKey: string } } {
+  const quotaDay = String((control as any)?.quotaDay || (control as any)?.details?.quotaDay || '');
+  const retryAt = Number((control as any)?.retryAt);
+  const runAfter = new Date(Number.isFinite(retryAt) && retryAt > now ? retryAt : now + 60_000).toISOString();
+  return {
+    payload: {
+      channelId: raw.channelId,
+      targetCountry,
+      source,
+      candidate: raw,
+      enrichmentStage: 1,
+      quotaOrigin: 'PROBE',
+      probeDeferred: true,
+    },
+    opts: {
+      priority: 5,
+      maxAttempts: 4,
+      runAfter,
+      idempotencyKey: `probe-deferred-enrich:${raw.channelId}:${quotaDay || runAfter.slice(0, 10)}`,
+    },
+  };
+}
+
 export async function processDiscoveredChannelContained(
   raw: DiscoveredChannelRaw,
   targetCountry: string,
@@ -1698,6 +1742,22 @@ export async function processDiscoveredChannelContained(
   } catch (error) {
     if (!shouldContainProbeQuotaRefusal(error)) throw error;
     const control = probeQuotaControlInChain(error);
+    let retryScheduled = false;
+    try {
+      const deferred = probeDeferredEnrichmentJob(raw, targetCountry, source, control);
+      await enqueueJob('ENRICH_CHANNEL', deferred.payload, deferred.opts);
+      retryScheduled = true;
+    } catch (scheduleError) {
+      // A scheduling failure must not abort the rest of a NORMAL page. The
+      // nomination ledger already records the observation for operator review.
+      console.warn(JSON.stringify({
+        event: 'probe_quota_channel_retry_schedule_failed',
+        channelId: raw.channelId,
+        source,
+        reason: String(scheduleError instanceof Error ? scheduleError.message : scheduleError).slice(0, 300),
+        timestamp: new Date().toISOString(),
+      }));
+    }
     console.warn(JSON.stringify({
       event: 'probe_quota_channel_deferred',
       channelId: raw.channelId,
@@ -1705,6 +1765,7 @@ export async function processDiscoveredChannelContained(
       targetCountry,
       code: String((control as any)?.code || 'PROBE_QUOTA_DEFERRED'),
       reason: String((control as any)?.message || control).slice(0, 300),
+      retryScheduled,
       jobOrigin: currentOfficialYouTubeQuotaOrigin(),
       timestamp: new Date().toISOString(),
     }));

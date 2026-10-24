@@ -316,7 +316,7 @@ test('manual recheck preserves probe policy waits through provider wrapping', as
 });
 
 test('normal-origin batches contain probe channel refusals; probe jobs still defer', async () => {
-  const { shouldContainProbeQuotaRefusal } = await import('./queueManager');
+  const { shouldContainProbeQuotaRefusal, probeDeferredEnrichmentJob } = await import('./queueManager');
   const { ProbeQuotaDisabledError } = await import('./quotaKeyCapShadow');
   const { runWithOfficialYouTubeQuotaOrigin } = await import('./officialYouTubeQuotaFence');
   const refusal = new ProbeQuotaDisabledError('2026-10-20');
@@ -341,4 +341,24 @@ test('normal-origin batches contain probe channel refusals; probe jobs still def
   assert.match(source, /processFeaturedChannelInspectionJob\(job,processDiscoveredChannelContained\)/);
   assert.match(source, /const outcome = await processDiscoveredChannelContained\(raw, country, source/);
   assert.match(source, /const outcome = await processDiscoveredChannelContained\(raw, session\.country, 'manual_search'\)/);
+  assert.match(source, /calculateQueryFunnel\(searchPage\?\.rawResultCount \?\? extracted\.length, observations, deferredResults\)/);
+  assert.match(source, /deferredOnly: observations\.length === 0 && deferredResults > 0/);
+  assert.match(source, /enqueueJob\('ENRICH_CHANNEL', deferred\.payload, deferred\.opts\)/);
+
+  const raw = { channelId: 'deferred-channel', channelName: 'Deferred', youtubeUrl: 'https://youtube.test/deferred' } as any;
+  const now = Date.parse('2026-10-20T19:00:00.000Z');
+  const scheduled = probeDeferredEnrichmentJob(raw, 'Germany', 'automated_query', {
+    quotaDay: '2026-10-20',
+    retryAt: Date.parse('2026-10-21T07:00:00.000Z'),
+  }, now);
+  assert.equal(scheduled.payload.channelId, 'deferred-channel');
+  assert.equal(scheduled.payload.quotaOrigin, 'PROBE', 'the per-channel retry must stay on the probe allocation');
+  assert.equal(scheduled.payload.probeDeferred, true);
+  assert.equal(scheduled.opts.runAfter, '2026-10-21T07:00:00.000Z');
+  assert.equal(scheduled.opts.idempotencyKey, 'probe-deferred-enrich:deferred-channel:2026-10-20');
+  const sameDay = probeDeferredEnrichmentJob(raw, 'Germany', 'manual_search', {
+    quotaDay: '2026-10-20',
+    retryAt: Date.parse('2026-10-21T07:00:00.000Z'),
+  }, now + 1_000);
+  assert.equal(sameDay.opts.idempotencyKey, scheduled.opts.idempotencyKey, 'repeated sightings collapse to one deferred job per channel/day');
 });

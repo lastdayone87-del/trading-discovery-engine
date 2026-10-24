@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { calculateQueryFunnel, isSeverelyContaminatedQuery, selectQueryCollection, type QueryObservation } from './queryPerformance';
+import { evaluateContinuation } from './continuationPolicy';
 
 test('query funnel keeps duplicates, known channels, exclusions, and classifications separate', () => {
   const observations: QueryObservation[] = [
@@ -74,6 +75,40 @@ test('out-of-scope fresh channels earn no learning credit when scope is observed
   // IN_SCOPE earns; legacy-missing stays neutral (backward compatible);
   // explicitly observed OUT_OF_SCOPE and UNRESOLVED do not.
   assert.equal(metrics.inScopeNewChannels, 2);
+});
+
+test('deferred probe results keep raw reporting but do not count as duplicates', () => {
+  const observations: QueryObservation[] = [
+    { channelId: 'a', wasKnown: false, persisted: true, funnelOutcome: 'TRADING_CONFIRMED', qualityScore: 80, hasCommunity: false },
+    { channelId: 'b', wasKnown: false, persisted: true, funnelOutcome: 'UNCERTAIN', qualityScore: 40, hasCommunity: false },
+  ];
+  const metrics = calculateQueryFunnel(10, observations, 6);
+  assert.equal(metrics.rawResults, 10, 'the provider result count is preserved for reporting');
+  assert.equal(metrics.deferredResults, 6);
+  assert.equal(metrics.evaluatedRawResults, 4);
+  assert.equal(metrics.duplicateResults, 2, 'deferred results are not duplicates');
+});
+
+test('deferred-only pages do not stop normal pagination as low yield', () => {
+  const metrics = calculateQueryFunnel(6, [], 6);
+  const page = {
+    pageNumber: 1, maxPages: 3, hasNextPage: true,
+    distinctCreators: metrics.distinctResults,
+    cumulativeDistinctCreators: metrics.distinctResults,
+    newCreators: metrics.newChannels, confirmedCreators: metrics.tradingConfirmed,
+    qualityConfirmedCreators: metrics.qualityChannels,
+    countryPrecision: metrics.countryPrecision,
+    communityDiversity: 0,
+    duplicateRatio: metrics.evaluatedRawResults ? metrics.duplicateResults / metrics.evaluatedRawResults : 0,
+    consecutiveLowYieldPages: 1, maxConsecutiveLowYieldPages: 2,
+    deferredOnly: true,
+  };
+  const decision = evaluateContinuation(page);
+  assert.equal(decision.shouldContinue, true);
+  assert.equal(decision.lowYield, false);
+  assert.equal(decision.primaryReason, 'CONTINUE_EXPLORATION');
+  assert.equal(evaluateContinuation({ ...page, pageNumber: 3 }).shouldContinue, false);
+  assert.equal(evaluateContinuation({ ...page, pageNumber: 3 }).primaryReason, 'PAGE_CEILING');
 });
 
 test('scope weighting stays neutral when no observation carries scope', () => {

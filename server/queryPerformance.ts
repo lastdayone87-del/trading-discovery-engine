@@ -25,6 +25,14 @@ export interface QueryObservation {
 
 export interface QueryFunnelMetrics {
   rawResults: number;
+  /**
+   * Provider results that were deliberately not evaluated (for example a
+   * sticky-PROBE channel deferred by its disabled allocation). They stay in
+   * rawResults for reporting but are excluded from duplicate accounting.
+   */
+  deferredResults?: number;
+  /** rawResults minus deferredResults; zero is safe for legacy rows. */
+  evaluatedRawResults?: number;
   distinctResults: number;
   duplicateResults: number;
   knownChannels: number;
@@ -53,7 +61,17 @@ export interface QueryFunnelMetrics {
 
 const ratio = (numerator: number, denominator: number): number => denominator > 0 ? numerator / denominator : 0;
 
-export function calculateQueryFunnel(rawResults: number, observations: QueryObservation[]): QueryFunnelMetrics {
+export function calculateQueryFunnel(
+  rawResults: number,
+  observations: QueryObservation[],
+  deferredResults: number = 0,
+): QueryFunnelMetrics {
+  // A deferred provider result was never evaluated, so counting it as a
+  // duplicate (or as a country miss) makes a normal page look low-yield and
+  // can stop pagination before later eligible results. Keep rawResults intact
+  // for reporting and subtract only the deferred share from duplicate math.
+  const deferred = Math.max(0, Math.min(rawResults, Math.floor(deferredResults)));
+  const evaluatedRawResults = rawResults - deferred;
   const distinct = new Map<string, QueryObservation>();
   for (const observation of observations) if (!distinct.has(observation.channelId)) distinct.set(observation.channelId, observation);
   const values = [...distinct.values()];
@@ -97,8 +115,10 @@ export function calculateQueryFunnel(rawResults: number, observations: QueryObse
 
   return {
     rawResults,
+    deferredResults: deferred,
+    evaluatedRawResults,
     distinctResults: values.length,
-    duplicateResults: Math.max(0, rawResults - values.length),
+    duplicateResults: Math.max(0, evaluatedRawResults - values.length),
     knownChannels: values.filter(value => value.wasKnown).length,
     newChannels: values.filter(value => value.persisted && !value.wasKnown).length,
     inScopeNewChannels: inScopeFresh.length,

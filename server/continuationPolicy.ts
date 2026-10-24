@@ -10,6 +10,12 @@ export interface ContinuationPolicyInput {
   delayedConfirmedCreators?: number; delayedNonTradingCreators?: number; delayedQualityCreators?: number;
   countryPrecision: number; communityDiversity: number; duplicateRatio: number;
   consecutiveLowYieldPages: number; maxConsecutiveLowYieldPages: number;
+  /**
+   * The page contained only deferred (not evaluated) provider results. It
+   * carries no yield signal, so zero-value/duplicate/precision penalties must
+   * not be attributed to it; page and creator ceilings still apply.
+   */
+  deferredOnly?: boolean;
 }
 
 export interface ContinuationDecision {
@@ -21,6 +27,20 @@ const clamp = (n: number) => Math.max(0, Math.min(1, Number.isFinite(n) ? n : 0)
 
 /** Pure, deterministic policy shared by human-directed and autonomous discovery. */
 export function evaluateContinuation(input: ContinuationPolicyInput): ContinuationDecision {
+  if (input.deferredOnly) {
+    const reasons: ContinuationReasonCode[] = [];
+    if (!input.hasNextPage) reasons.push('NO_NEXT_PAGE');
+    if (input.pageNumber >= input.maxPages) reasons.push('PAGE_CEILING');
+    if (input.maxDistinctCreators && input.cumulativeDistinctCreators >= input.maxDistinctCreators) reasons.push('CREATOR_CEILING');
+    const terminal = reasons.find(r => ['NO_NEXT_PAGE','PAGE_CEILING','CREATOR_CEILING'].includes(r));
+    return {
+      shouldContinue: !terminal,
+      lowYield: false,
+      marginalUtility: 0,
+      primaryReason: terminal || 'CONTINUE_EXPLORATION',
+      reasonCodes: reasons.length ? reasons : ['CONTINUE_EXPLORATION'],
+    };
+  }
   const cumulativeDistinct = Math.max(1, input.cumulativeDistinctCreators || input.distinctCreators);
   const effectiveConfirmed = Math.max(input.confirmedCreators, input.delayedConfirmedCreators || 0);
   const effectiveQuality = Math.max(input.qualityConfirmedCreators, input.delayedQualityCreators || 0);
