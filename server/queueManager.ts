@@ -2812,7 +2812,15 @@ export async function triggerManualRecheck(
     let freshCandidate: DiscoveredChannelRaw;
     try {
       providerAttempted = true;
-      freshCandidate = await fetchYouTubeChannelEnrichment(channelId, fallback, 1);
+      // Manual recheck runs outside a queue job, so it must establish the
+      // persisted provenance itself. A probe-ingested channel is sticky PROBE;
+      // fetching as NORMAL here would spend ordinary quota (and could be
+      // refused when the ordinary path is fenced).
+      freshCandidate = await runWithOfficialYouTubeQuotaOrigin(
+        channel.quota_origin === 'PROBE' ? 'PROBE' : 'NORMAL',
+        `manualRecheck:${channelId}`,
+        () => fetchYouTubeChannelEnrichment(channelId, fallback, 1),
+      );
     } catch (error: any) {
       const detail = error instanceof Error ? error.message : String(error);
       const failure = classifyManualRecheckAcquisitionFailure(error);

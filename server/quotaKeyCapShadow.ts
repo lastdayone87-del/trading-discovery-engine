@@ -219,12 +219,24 @@ export class ProbeQuotaDisabledError extends Error {
 }
 
 export function isProbeQuotaControlError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const candidate = error as {
+    code?: unknown;
+    probeQuotaExceeded?: unknown;
+    probeQuotaUnavailable?: unknown;
+    probeQuotaDisabled?: unknown;
+  };
+  // QUOTA_ALLOCATION_EXHAUSTED also identifies the pre-existing ordinary
+  // allocation error, so only the probe-specific marker can match it. The
+  // marker-based clauses also cover a duplicate module instance.
   return error instanceof ProbeQuotaExceededError
     || error instanceof ProbeQuotaUnavailableError
     || error instanceof ProbeQuotaDisabledError
-    || (error as { code?: unknown } | null)?.code === 'QUOTA_ALLOCATION_EXHAUSTED'
-    || (error as { code?: unknown } | null)?.code === 'PROBE_QUOTA_UNAVAILABLE'
-    || (error as { code?: unknown } | null)?.code === 'PROBE_QUOTA_DISABLED';
+    || candidate.probeQuotaExceeded === true
+    || candidate.probeQuotaUnavailable === true
+    || candidate.probeQuotaDisabled === true
+    || candidate.code === 'PROBE_QUOTA_UNAVAILABLE'
+    || candidate.code === 'PROBE_QUOTA_DISABLED';
 }
 
 export function isProbeQuotaExceededError(error: unknown): boolean {
@@ -243,10 +255,10 @@ export function probeQuotaMaxCapUnits(environment: NodeJS.ProcessEnv = process.e
   const perKey = Number(environment.YOUTUBE_DAILY_QUOTA_PER_KEY || DEFAULT_YOUTUBE_DAILY_QUOTA_PER_KEY);
   const providers = getConfiguredYouTubeProviders(environment);
   const budget = calculateEffectiveYouTubeBudget(providers, perKey);
-  return Math.max(
-    PROBE_QUOTA_MIN_CAP_UNITS,
-    Math.min(PROBE_QUOTA_HARD_CEILING_UNITS, Math.floor(budget * PROBE_QUOTA_MAX_SHARE)),
-  );
+  // Never raise the maximum above the 10% share. When the share is below the
+  // 100-unit floor the allocation is unavailable; resolveProbeQuotaConfig
+  // rejects enabling it rather than silently granting a larger share.
+  return Math.max(0, Math.min(PROBE_QUOTA_HARD_CEILING_UNITS, Math.floor(budget * PROBE_QUOTA_MAX_SHARE)));
 }
 
 let cachedProbeConfig: { at: number; config: ProbeQuotaConfig } | null = null;
@@ -284,6 +296,11 @@ export async function resolveProbeQuotaConfig(
   const enabled = enabledRaw === 'true';
   const parsedCap = Number(String(capRaw).trim());
   const capUnits = Number.isSafeInteger(parsedCap) ? parsedCap : 0;
+  if (enabled && maxCapUnits < PROBE_QUOTA_MIN_CAP_UNITS) {
+    throw new ProbeQuotaUnavailableError(
+      `Probe official-quota allocation is unavailable: 10% of the effective daily budget is ${maxCapUnits}, below the ${PROBE_QUOTA_MIN_CAP_UNITS}-unit minimum.`,
+    );
+  }
   if (enabled && (capUnits < PROBE_QUOTA_MIN_CAP_UNITS || capUnits > maxCapUnits)) {
     throw new ProbeQuotaUnavailableError(
       `Probe official-quota cap must be an integer between ${PROBE_QUOTA_MIN_CAP_UNITS} and ${maxCapUnits} (10% of the effective daily budget, hard ceiling ${PROBE_QUOTA_HARD_CEILING_UNITS}).`,
@@ -1080,21 +1097,22 @@ DELETE FROM youtube_key_cap_shadow_leases
  WHERE quota_day = $1 AND operation_id = $2 AND allocation = 'PROBE'
 `;
 
-const PROBE_SETTLE_SQL = `
-WITH removed AS (
-  DELETE FROM youtube_key_cap_shadow_leases
-   WHERE quota_day = $1 AND operation_id = $2 AND allocation = 'PROBE' AND reserved_units = $3
-   RETURNING 1
-), used AS (
-  INSERT INTO youtube_probe_quota_usage (quota_day, units_used, updated_at)
-  SELECT $1, $3, now() WHERE EXISTS (SELECT 1 FROM removed)
-  ON CONFLICT (quota_day) DO UPDATE
-    SET units_used = youtube_probe_quota_usage.units_used + EXCLUDED.units_used,
-        updated_at = now()
-  RETURNING units_used
-)
-SELECT (SELECT count(*)::int FROM removed) AS removed,
-       (SELECT units_used FROM used) AS units_used
+/** Durable exactly-once marker for one settled probe reservation. Reuses the
+ * accounting idempotency table (7-day retention), so a lease that expired or
+ * was swept before its provider response settled still records spend once and
+ * a replay cannot increment the probe bucket twice. */
+const PROBE_SETTLE_CLAIM_SQL = `
+INSERT INTO youtube_quota_accounting_ops(op_id, quota_day, key_fingerprint, units)
+VALUES($1,$2,$3,$4) ON CONFLICT(op_id) DO NOTHING RETURNING op_id
+`;
+
+const PROBE_RECORD_USAGE_SQL = `
+INSERT INTO youtube_probe_quota_usage (quota_day, units_used, updated_at)
+VALUES ($1, $2, now())
+ON CONFLICT (quota_day) DO UPDATE
+  SET units_used = youtube_probe_quota_usage.units_used + EXCLUDED.units_used,
+      updated_at = now()
+RETURNING units_used
 `;
 
 // Kept as a test hook for callers that reset all probe-allocation caches.
@@ -1277,18 +1295,52 @@ export async function settleProbeQuotaReservation(
       WHERE quota_day = $1 AND operation_id = $2 FOR UPDATE`,
     [reservation.quotaDay, reservation.operationId],
   );
-  if (existing.rows.length === 0) return false;
-  const row = existing.rows[0];
-  if (row.allocation !== 'PROBE' || Number(row.reserved_units) !== reservation.units) {
-    throw new ProbeQuotaUnavailableError('Probe quota settlement does not match the reservation.', {
-      quotaDay: reservation.quotaDay,
-      operationId: reservation.operationId,
-    });
+  const leasePresent = existing.rows.length > 0;
+  if (leasePresent) {
+    const row = existing.rows[0];
+    if (row.allocation !== 'PROBE' || Number(row.reserved_units) !== reservation.units) {
+      throw new ProbeQuotaUnavailableError('Probe quota settlement does not match the reservation.', {
+        quotaDay: reservation.quotaDay,
+        operationId: reservation.operationId,
+      });
+    }
   }
-  const result = await client.query(PROBE_SETTLE_SQL, [
-    reservation.quotaDay, reservation.operationId, reservation.units,
-  ]);
-  return Number(result.rows?.[0]?.removed ?? 0) > 0;
+  // A provider response can settle after its lease expired and was swept.
+  // The reservation identity is still authoritative: claim it durably before
+  // recording usage. The claim, the usage increment, the lease removal and
+  // the official charge all commit in one transaction.
+  const claimed = await claimProbeSettlementOnce(client, reservation);
+  if (claimed) {
+    await client.query(PROBE_RECORD_USAGE_SQL, [reservation.quotaDay, reservation.units]);
+  }
+  if (leasePresent) {
+    await client.query(PROBE_RELEASE_SQL, [reservation.quotaDay, reservation.operationId]);
+  }
+  return claimed || leasePresent;
+}
+
+/** Claims the exact reservation once. A missing accounting table is tolerated
+ * for pre-133 databases, matching the official-charge guard. */
+async function claimProbeSettlementOnce(
+  client: ShadowQueryClient,
+  reservation: ProbeQuotaReservation,
+): Promise<boolean> {
+  await client.query('SAVEPOINT youtube_probe_settlement_claim');
+  try {
+    const claimed = await client.query(PROBE_SETTLE_CLAIM_SQL, [
+      reservation.operationId,
+      reservation.quotaDay,
+      reservation.keyFingerprint,
+      reservation.units,
+    ]);
+    await client.query('RELEASE SAVEPOINT youtube_probe_settlement_claim');
+    return (claimed.rowCount ?? 0) > 0;
+  } catch (error) {
+    await client.query('ROLLBACK TO SAVEPOINT youtube_probe_settlement_claim').catch(() => undefined);
+    await client.query('RELEASE SAVEPOINT youtube_probe_settlement_claim').catch(() => undefined);
+    if ((error as { code?: unknown } | null)?.code !== '42P01') throw error;
+    return true;
+  }
 }
 
 export async function getProbeQuotaStatus(

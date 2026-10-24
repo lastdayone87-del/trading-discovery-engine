@@ -96,6 +96,57 @@ test('non-channel canary jobs default to NORMAL and still honor an explicit PROB
   );
 });
 
+test('featured canary tolerates a missing source row but keeps an existing PROBE row', async () => {
+  const missing: QuotaOriginDb = { query: async () => ({ rows: [], rowCount: 0 }) };
+  assert.equal(
+    await resolveJobQuotaOrigin({
+      type: 'INSPECT_FEATURED_CHANNELS',
+      payload: { sourceChannelId: `UC${'b'.repeat(22)}` },
+    }, missing),
+    'NORMAL',
+    'a featured source may exist only in creator_outcome_records/entity_bindings'
+  );
+  assert.equal(
+    await resolveJobQuotaOrigin({
+      type: 'INSPECT_FEATURED_CHANNELS',
+      payload: { sourceChannelId: `UC${'b'.repeat(22)}`, quotaOrigin: 'PROBE' },
+    }, missing),
+    'PROBE',
+  );
+  const probe: QuotaOriginDb = {
+    query: async () => ({ rows: [{ channel_id: `UC${'b'.repeat(22)}`, quota_origin: 'PROBE' }], rowCount: 1 }),
+  };
+  assert.equal(
+    await resolveJobQuotaOrigin({
+      type: 'INSPECT_FEATURED_CHANNELS',
+      payload: { sourceChannelId: `UC${'b'.repeat(22)}` },
+    }, probe),
+    'PROBE',
+    'an existing probe-marked source remains sticky'
+  );
+  const malformed: QuotaOriginDb = {
+    query: async () => ({ rows: [{ channel_id: `UC${'b'.repeat(22)}`, quota_origin: 'weird' }], rowCount: 1 }),
+  };
+  assert.equal(
+    await resolveJobQuotaOrigin({
+      type: 'INSPECT_FEATURED_CHANNELS',
+      payload: { sourceChannelId: `UC${'b'.repeat(22)}` },
+    }, malformed),
+    'UNKNOWN',
+    'a malformed persisted marker still fails closed'
+  );
+});
+
+test('pipeline origin read failure is retryable infrastructure, not a terminal verdict', async () => {
+  const failing: QuotaOriginDb = { query: async () => { throw new Error('db down'); } };
+  await assert.rejects(
+    resolvePipelineQuotaOrigin({ channelId: 'c' }, undefined, failing),
+    (error: unknown) => error instanceof QuotaOriginUnavailableError
+      && (error as QuotaOriginUnavailableError).code === 'QUOTA_ORIGIN_UNAVAILABLE'
+      && (error as QuotaOriginUnavailableError).retryable === true,
+  );
+});
+
 test('queue dispatcher routes provenance failures through the handler lifecycle', () => {
   const source = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
   const start = source.indexOf('const job = await claimNextJob');

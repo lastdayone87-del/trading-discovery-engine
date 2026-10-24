@@ -28,7 +28,9 @@ and accounted.
 At the current effective budget of 35 keys × 10,000 = **350,000 units/Pacific
 day**, 10,000 is **2.86%** of the budget and **3.17%** of #533's 315,000-unit
 hard-cap ceiling (35 × 9,000). The validation maximum at this budget is
-20,000.
+20,000. If the effective budget is small enough that its 10% share is below
+100 units, the allocation cannot be enabled at all (fail closed) rather than
+granting the 100-unit floor.
 
 The bucket is per **Pacific day**, the same day boundary as #533. It is not a
 per-key bucket and it is not shared with ordinary enrichment. When #533
@@ -104,6 +106,47 @@ bucket is additive and isolated, and the only shared limit is #533's per-key
   while no provider request can occur. Probe refusals are rethrown by every
   provider loop instead of being hidden by key failover or a fallback
   `UNAVAILABLE` metadata result.
+- A featured-canary source may exist only in `creator_outcome_records` /
+  `entity_bindings`; `INSPECT_FEATURED_CHANNELS` treats a missing `channels`
+  row as NORMAL (its adapter controls still apply) while an existing PROBE row
+  remains sticky and a malformed persisted marker still fails closed.
+
+## Post-review hardening (2026-10-24)
+
+The independent review findings were re-validated against the branch and the
+confirmed ones were fixed in code:
+
+- **Pipeline provenance read failure** now throws retryable
+  `QuotaOriginUnavailableError` instead of returning terminal `UNKNOWN`; a
+  malformed persisted marker remains a real `UNKNOWN` verdict.
+- **Scheduler provenance is captured at enqueue time** and restored exactly at
+  dispatch. The shared queue drain no longer lets a PROBE drain charge NORMAL
+  work to the probe bucket (or the reverse). Exact restoration is confined to
+  the queue boundary; ordinary nested calls keep sticky PROBE semantics.
+- **Probe policy refusals short-circuit the scheduler.** `executeProviderCall`
+  wraps messages containing “quota” as `RATE_LIMIT`; the scheduler now walks
+  the cause chain and rejects probe-control errors without runtime-rate-limit
+  pacing, adaptive interval changes, or replay of the admission check.
+- **Probe settlement is exactly-once across lease expiry and sweeping.** A
+  provider response that settles after its 120 s lease was swept still records
+  usage once; the claim is a row in the existing 7-day accounting idempotency
+  table, committed with the official charge and the usage increment.
+- **`isProbeQuotaControlError` no longer matches bare
+  `QUOTA_ALLOCATION_EXHAUSTED`**, which also identifies the pre-existing
+  ordinary allocation error. Probe-specific markers remain the discriminator.
+- **Small budgets cannot exceed the 10% share.** If 10% of the effective daily
+  budget is below the 100-unit minimum, enabling the allocation fails closed
+  as unavailable instead of raising the maximum to 100.
+- **Manual recheck** now establishes the channel's persisted provenance before
+  its first official enrichment call (`channel.quota_origin === 'PROBE'`).
+- **Pre-dispatch abort** releases the exact enforced lease and the exact probe
+  lease instead of leaving admitted capacity until the Pacific reset.
+
+Not changed: the daily requeue when the probe allocation is disabled remains
+the intended fail-closed drain behavior; changing it requires a bounded-retry
+decision. The per-key enforcement cache can lag an enable by the settings TTL;
+the documented ≥120 s drain plus provider timeout exceeds that window, so it is
+an activation precondition rather than a code defect.
 
 ## Enforcement switch-on and shadow drain
 

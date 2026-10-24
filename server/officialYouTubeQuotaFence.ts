@@ -129,3 +129,19 @@ export function runWithOfficialYouTubeQuotaOrigin<T>(
   const effective = mergeQuotaOrigins(inherited, origin) ?? 'UNKNOWN';
   return storage.run({ origin: effective, entry }, fn);
 }
+
+/**
+ * Runs `fn` in an exact origin context, ignoring any inherited context.
+ *
+ * Only for work that crosses an asynchronous queue boundary: the origin
+ * captured when the request was enqueued is authoritative, not the origin of
+ * whichever queue drain happens to execute it. Ordinary callers must use
+ * `runWithOfficialYouTubeQuotaOrigin` so probe provenance stays sticky.
+ */
+export function runWithExactOfficialYouTubeQuotaOrigin<T>(
+  origin: ResolvedQuotaOrigin | QuotaOrigin,
+  entry: string,
+  fn: () => T,
+): T {
+  return storage.run({ origin, entry }, fn);
+}

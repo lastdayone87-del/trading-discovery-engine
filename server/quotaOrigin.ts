@@ -70,7 +70,8 @@ function rowOrigin(value: unknown): QuotaOrigin | 'UNKNOWN' {
 
 /**
  * Reads the persisted marker. Returns null only when the channel row does not
- * exist. Database failures throw and callers map them to UNKNOWN.
+ * exist. Database failures throw QuotaOriginUnavailableError from the
+ * pipeline resolver; a malformed persisted value is a real UNKNOWN verdict.
  */
 export async function getChannelQuotaOrigin(
   channelId: string,
@@ -109,8 +110,14 @@ export async function resolvePipelineQuotaOrigin(
   let stored: QuotaOrigin | 'UNKNOWN' | null;
   try {
     stored = await getChannelQuotaOrigin(String(candidate.channelId || ''), client);
-  } catch {
-    return 'UNKNOWN';
+  } catch (error) {
+    // A provenance read failure is infrastructure, not a provenance verdict.
+    // Returning UNKNOWN here would become a terminal quota-fence failure and
+    // permanently drop retryable work.
+    throw new QuotaOriginUnavailableError(
+      `Unable to read persisted quota provenance for channel ${candidate.channelId || 'unknown'}.`,
+      { cause: error },
+    );
   }
 
   if (stored === null) return hinted ?? 'NORMAL';
@@ -184,9 +191,17 @@ export async function resolveJobQuotaOrigin(
     if (typeof row?.channel_id === 'string') byId.set(row.channel_id, String(row.quota_origin));
   }
 
+  // A featured-canary source can exist only in creator_outcome_records /
+  // entity_bindings, so it may have no channels row. The adapter still has its
+  // own canary controls and ordinary quota; treat a missing source row as
+  // NORMAL for this job type only, while an existing PROBE row stays sticky.
+  const missingRowIsNormal = job.type === 'INSPECT_FEATURED_CHANNELS';
   let resolved: ResolvedQuotaOrigin = hinted ?? 'NORMAL';
   for (const channelId of channelIds) {
-    if (!byId.has(channelId)) return 'UNKNOWN';
+    if (!byId.has(channelId)) {
+      if (missingRowIsNormal) continue;
+      return 'UNKNOWN';
+    }
     const origin = rowOrigin(byId.get(channelId));
     if (origin === 'UNKNOWN') return 'UNKNOWN';
     resolved = mergeQuotaOrigins(resolved, origin) ?? 'NORMAL';
