@@ -134,8 +134,9 @@ test('treatment materializes native plus creator-derived proposals and records t
       return assignment(input.country, input.arm);
     },
     generateNative: async () => [nativeProposal()],
-    generateDerived: async (_country, _limit, options) => {
+    generateDerived: async (country, _limit, options) => {
       derivedCalls++;
+      assert.equal(country, 'United States', 'proposal generation must receive the canonical country identity');
       assert.equal(options?.pilotPolicyVersion, ADAPTIVE_PILOT_POLICY_VERSION);
       assert.equal(options?.pilotQuotaDay, '2026-10-23');
       assert.equal(options?.pilotArm, 'TREATMENT');
@@ -407,7 +408,8 @@ test('metrics are bounded by the report window and isolated by policy version', 
   });
   assert.ok(captured);
   assert.match(captured!.sql, /allocation_at >= \$1::timestamptz - interval '1 day'/);
-  assert.match(captured!.sql, /o\.allocation_at >= GREATEST\(a\.window_start, \$1::timestamptz\)/);
+  assert.match(captured!.sql, /o\.allocation_at >= GREATEST\(a\.window_start, a\.created_at, \$1::timestamptz\)/,
+    'pre-activation observations must not be attributed to a country-day assignment');
   assert.match(captured!.sql, /o\.allocation_at < LEAST\(a\.window_end, \$2::timestamptz\)/);
   assert.match(captured!.sql, /a\.window_start < \$2\s+AND a\.window_end > \$1/);
   assert.match(captured!.sql, /a\.policy_version = \$3/);

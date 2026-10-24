@@ -305,7 +305,12 @@ export async function generateCreatorDerivedProposals(
     proposals.push(
       buildFrontierProposal({
         proposalFamily: 'CREATOR_DERIVED',
-        country,
+        // Preserve the canonical country identity in target dimensions. Query
+        // authorization resolves curated anchors by exact canonical name
+        // (e.g. "United States"); an uppercased identity would find no anchor
+        // and reject every treatment query as RETRIEVAL_ANCHOR_UNAVAILABLE.
+        country: canonicalC,
+        preserveCountryIdentity: true,
         concept: concept.term,
         primaryTermFamily: concept.term,
         retrievalLane: 'VIDEO',

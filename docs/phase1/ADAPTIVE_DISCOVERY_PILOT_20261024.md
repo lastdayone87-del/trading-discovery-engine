@@ -79,6 +79,16 @@ capture before any pilot data existed:
   provider failures, matching the evaluation contract.
 - The assignment ledger is unique per `(country, quota_day)`, not per policy
   version; a policy release during the day reuses the recorded arm.
+- `CREATOR_DERIVED` proposals preserve the canonical country identity (for
+  example `United States`, not `UNITED STATES`) in their target dimensions.
+  Query authorization resolves curated anchors by exact canonical name; an
+  uppercased identity finds no anchor and rejects every treatment query as
+  `RETRIEVAL_ANCHOR_UNAVAILABLE`.
+- Metrics count observations from the assignment's `created_at` boundary, not
+  from the Pacific-day start. A mid-day activation therefore cannot attribute
+  pre-activation runs to the assigned arm. Activate at a fresh Pacific reset,
+  and treat any country-day with a mid-day disable as an excluded rollback day
+  rather than as pilot evidence.
 
 ## Cheapest early read
 

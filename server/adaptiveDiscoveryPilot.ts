@@ -300,7 +300,10 @@ export async function materializeAdaptiveDiscoveryPilotProposals(
   const quotaDay = getYouTubeQuotaDay(now);
   const windowStart = new Date(getYouTubeQuotaDayStartAt(now)).toISOString();
   const windowEnd = new Date(getNextYouTubeQuotaResetAt(now)).toISOString();
-  const normalizedCountries = [...new Set(countries.map(country => canonicalCountry(country).toUpperCase()).filter(Boolean))];
+  // Keep the canonical country identity downstream. The assignment ledger
+  // uppercases its own storage key, but proposal target dimensions must retain
+  // the canonical name so query authorization can resolve curated anchors.
+  const normalizedCountries = [...new Set(countries.map(country => canonicalCountry(country)).filter(Boolean))];
   const recordAssignment = deps.recordAssignment || recordAdaptivePilotAssignment;
   const generateNative = deps.generateNative || generateCountryNativeProposals;
   const generateDerived = deps.generateDerived || generateCreatorDerivedProposals;
@@ -543,7 +546,10 @@ export async function computeAdaptivePilotMetrics(input: {
      FROM adaptive_discovery_pilot_assignments a
      LEFT JOIN latest_obs o
        ON LOWER(o.country) = LOWER(a.country)
-      AND o.allocation_at >= GREATEST(a.window_start, $1::timestamptz)
+      -- created_at is the auditable activation boundary for this country-day.
+      -- Excluding earlier runs keeps a mid-day activation from assigning
+      -- pre-activation observations to the arm retroactively.
+      AND o.allocation_at >= GREATEST(a.window_start, a.created_at, $1::timestamptz)
       AND o.allocation_at < LEAST(a.window_end, $2::timestamptz)
      WHERE a.window_start < $2
        AND a.window_end > $1

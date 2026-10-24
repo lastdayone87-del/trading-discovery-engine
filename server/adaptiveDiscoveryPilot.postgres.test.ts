@@ -9,8 +9,13 @@ import {
   recordAdaptivePilotAssignment
 } from './adaptiveDiscoveryPilot';
 import { ADAPTIVE_PILOT_POLICY_VERSION } from './adaptiveDiscoveryPilotPolicy';
-import { buildFrontierProposal, persistFrontierProposals } from './discoveryProposalGenerators';
+import {
+  buildFrontierProposal,
+  generateCreatorDerivedProposals,
+  persistFrontierProposals
+} from './discoveryProposalGenerators';
 import { getNeighborhoodCandidates } from './discoveryFrontierAllocator';
+import { planCountryNativeProposalQuery } from './queryPlanner';
 
 /**
  * Dedicated-database tests for the adaptive pilot assignment ledger. The CI
@@ -167,6 +172,44 @@ maybe('a recurring creator concept is persisted and allocatable on the next trea
     await db.query(`DELETE FROM app_settings WHERE setting_key='adaptive_discovery_pilot_enabled'`).catch(() => undefined);
     await db.query(`DELETE FROM frontier_discovery_proposals WHERE concept=$1`, [concept]).catch(() => undefined);
     await db.query(`DELETE FROM discovery_neighborhoods WHERE neighborhood_key=$1`, [dayTwo.targetNeighborhoodKey]).catch(() => undefined);
+  }
+});
+
+maybe('creator-derived proposals retain a canonical country that can authorize a treatment query', async () => {
+  const db = await requirePool();
+  const country = 'Luxembourg';
+  const channelId = `creator-country-${runTag}`;
+  await db.query(
+    `INSERT INTO channels(
+       channel_id,channel_name,youtube_url,country,country_status,discord_status,
+       scan_status,discovery_source,first_seen,quality_score,trading_status,trading_category
+     ) VALUES($1,$2,$3,$4,'CONFIRMED','NOT_FOUND','COMPLETE','YOUTUBE',now(),90,'TRADING_CONFIRMED','Futures')
+     ON CONFLICT(channel_id) DO UPDATE SET
+       channel_name=EXCLUDED.channel_name,country=EXCLUDED.country,
+       quality_score=EXCLUDED.quality_score,trading_status=EXCLUDED.trading_status,
+       trading_category=EXCLUDED.trading_category,updated_at=now()`,
+    [channelId, 'DAX Mastery', `https://youtube.test/${channelId}`, country]
+  );
+  try {
+    // Mirrors the uppercase identity the assignment ledger stores; the
+    // proposal itself must still carry the canonical country identity.
+    const proposals = await generateCreatorDerivedProposals('LUXEMBOURG', 5);
+    const proposal = proposals.find(item => item.country === country);
+    assert.ok(proposal, 'creator-derived proposal must preserve the canonical country name');
+    assert.equal(proposal.targetDimensions.country, country,
+      'target dimensions must use the same canonical identity as the proposal');
+    const nativeTerm = String(proposal.supportingEvidence.nativeTerm || '');
+    assert.ok(nativeTerm);
+    const planned = planCountryNativeProposalQuery({
+      country: proposal.targetDimensions.country,
+      nativeTerm,
+      targetIntent: proposal.targetDimensions.queryIntent,
+      allocationLineage: { proposalId: 'canonical-country-regression' }
+    });
+    assert.ok(planned,
+      'a canonical country must resolve a curated retrieval anchor instead of RETRIEVAL_ANCHOR_UNAVAILABLE');
+  } finally {
+    await db.query('DELETE FROM channels WHERE channel_id=$1', [channelId]).catch(() => undefined);
   }
 });
 
