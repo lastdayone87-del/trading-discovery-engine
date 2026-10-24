@@ -69,6 +69,7 @@ the lease until the Pacific reset, which can under-admit but cannot overspend.
 | Concurrent jobs | Shared key lock + global bucket lock + unique `(quota_day, operation_id)`; concurrent reservations cannot overrun either control |
 | Key failover | Each dispatched key reserves; the reservation is attached to that response and settles with it |
 | Non-probe work | No probe reservation; uses the ordinary path, so probe spend cannot starve it and ordinary spend cannot consume the probe bucket |
+| Playlist / relationship canaries | These payloads are not channel-keyed, so they resolve as NORMAL and keep their own adapter budgets. They are not probe-origin; a probe-origin variant must carry an explicit `quotaOrigin: 'PROBE'` hint. |
 
 `isProbeOfficialYouTubeQuotaOrigin()` is resolved from durable provenance, not
 from a process-local flag. A probe discovery is **not** human-reviewed or
@@ -91,6 +92,12 @@ bucket is additive and isolated, and the only shared limit is #533's per-key
 - Applying 154/155 with settings absent changes no runtime behavior. #546
   cannot merge before #533; the combined migrations are 154/155 on top of the
   already-merged 146–153 lineage.
+- With settings absent, known non-channel canary jobs (`INSPECT_PLAYLIST`,
+  `RELATIONSHIP_CANARY_EXPANSION`) still resolve as NORMAL and run under their
+  existing adapter controls. A review-found regression that failed them as
+  `UNKNOWN` before their handlers ran was fixed at `c29ccc8` and covered by a
+  regression test. Genuinely unknown or malformed provenance still fails
+  closed before provider work.
 
 ## Enforcement switch-on and shadow drain
 

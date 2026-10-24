@@ -16,7 +16,7 @@ This version supersedes the 2026-10-21 draft and is updated in the existing
   files, +14,595/−358** from base `82e60e7`.
 - **PR #533** is open against `main`; code/test head `8c0e4eb` plus this docs
   amendment, default OFF. It is not merged, deployed, or enabled.
-- **PR #546** is open and **stacked on #533**; code head `d960199` plus this
+- **PR #546** is open and **stacked on #533**; code head `c29ccc8` plus this
   docs amendment. It adds the independent probe-origin allocation; default OFF,
   not deployed, not activated.
 - **PR #545** is open against `main`; head `8f16150`. It adds the default-OFF
@@ -223,10 +223,19 @@ Option 2 replaces that requirement with a durable, capped, accounted path:
   use this path. A 429 carrying either a probe or key-cap reservation is not
   replayed by the scheduler.
 
+A review-found regression was fixed at `c29ccc8`: `INSPECT_PLAYLIST` and
+`RELATIONSHIP_CANARY_EXPANSION` payloads are not channel-keyed, so the job
+resolver was returning `UNKNOWN` and failing them before their handlers ran
+even with probe settings absent. Those known ordinary-quota canaries now
+resolve as `NORMAL` and keep their own adapter budgets; an explicit
+`quotaOrigin: 'PROBE'` hint still wins. Genuinely unknown/malformed provenance
+continues to fail closed before provider work.
+
 Verification covers: the source-order lock test, the idempotent/retry and
 exactly-once settlement PostgreSQL tests, the 20-way bucket concurrency test,
-the mixed probe/enforced per-key contention test, and the existing #533
-mixed-mode tests. See [PROBE_QUOTA_ALLOCATION_20261024.md](PROBE_QUOTA_ALLOCATION_20261024.md).
+the mixed probe/enforced per-key contention test, the non-channel canary
+regression test, and the existing #533 mixed-mode tests. See
+[PROBE_QUOTA_ALLOCATION_20261024.md](PROBE_QUOTA_ALLOCATION_20261024.md).
 
 This does **not** authorize a probe. The InnerTube policy, explicit activation,
 and the canary gates still apply.
@@ -285,7 +294,7 @@ deployment, migration, flag change, or probe.
 
 | Step | Track A — integration / hard cap | Track B — probe / pilot | Gate |
 | --- | --- | --- | --- |
-| 1 | Merge #533 at `8c0e4eb`+docs, then #546 at `d960199`+docs; deploy **default OFF** | Keep probes disabled | Explicit merge/deploy approval |
+| 1 | Merge #533 at `8c0e4eb`+docs, then #546 at `c29ccc8`+docs; deploy **default OFF** | Keep probes disabled | Explicit merge/deploy approval |
 | 2 | Apply 154/155/156 through the normal runner; verify settings absent and no behavior change | Confirm policy/route decision | Migration/deploy approval; production migration state check |
 | 3 | Verify absent/false setting, shadow-only behavior, rollback path | Confirm the 10,000-unit probe allocation, fail-closed absent state, and cap enforcement procedure | Post-deploy verification |
 | 4 | Choose enforcement timing; run the shadow drain (lease TTL/provider timeout, preferably a full Pacific day) before enabling #533 | No probe until written authorization and explicit activation | Separate enforcement approval |
@@ -350,7 +359,7 @@ enforcement activation, queue unpause/resume, or probe has been performed by
 this session. Remaining gates:
 
 1. Explicit approval to merge #533 at `8c0e4eb`+docs, then #546 at
-   `d960199`+docs; #546 must not merge independently. #545 follows separately.
+   `c29ccc8`+docs; #546 must not merge independently. #545 follows separately.
 2. Explicit approval to deploy, with a verified rollback path and normal-runner
    migration apply; production migration state is currently unverified.
 3. Verify migrations 154/155/156 are additive and that absent settings produce
