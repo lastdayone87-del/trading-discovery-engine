@@ -350,8 +350,15 @@ test('normal-origin batches contain probe channel refusals; probe jobs still def
     source.indexOf('job.payload.probeDeferredDiscovery === true') < source.indexOf("channel.trading_status !== 'UNCERTAIN'"),
     'the deferred discovery replay must run before the enrichment eligibility gate',
   );
+  assert.match(source, /forceExtraction: job\.payload\.forceExtraction === true \|\| isRepairEligibleRetry\(job\)/);
+  assert.match(source, /probe_quota_channel_retry_schedule_failed[\s\S]{0,900}throw error;/);
   assert.match(source, /manualSearchContinuationMetrics\(\{/);
   assert.match(source, /deferredOnly:manualMetrics\.deferredOnly/);
+  assert.match(source, /evaluatedIds:manualMetrics\.evaluatedUniqueIds/);
+  const manualStore = readFileSync(new URL('./manualSearchStore.ts', import.meta.url), 'utf8');
+  assert.match(manualStore, /unique_channel_ids=COALESCE/);
+  assert.match(manualStore, /JSON\.stringify\(p\.uniqueIds\)/, 'page observations keep the raw unique audit');
+  assert.match(manualStore, /JSON\.stringify\(p\.evaluatedIds\)/, 'session continuation stores only evaluated creators');
 
   const raw = { channelId: 'deferred-channel', channelName: 'Deferred', youtubeUrl: 'https://youtube.test/deferred' } as any;
   const now = Date.parse('2026-10-20T19:00:00.000Z');

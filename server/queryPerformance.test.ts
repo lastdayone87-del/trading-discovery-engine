@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { calculateQueryFunnel, isSeverelyContaminatedQuery, manualSearchContinuationMetrics, selectQueryCollection, type QueryObservation } from './queryPerformance';
+import { calculateQueryFunnel, countDeferredRawResults, isSeverelyContaminatedQuery, manualSearchContinuationMetrics, selectQueryCollection, type QueryObservation } from './queryPerformance';
 import { countTrailingLowYieldPages, evaluateContinuation } from './continuationPolicy';
+import { aggregatePageMetrics } from './autonomousPageStore';
 
 test('query funnel keeps duplicates, known channels, exclusions, and classifications separate', () => {
   const observations: QueryObservation[] = [
@@ -104,7 +105,7 @@ test('manual page metrics exclude deferred channels from novelty and precision',
   assert.equal(metrics.deferredOnly, false);
   assert.equal(metrics.distinctCreators, 2);
   assert.equal(metrics.noveltyRatio, 0.5);
-  assert.ok(Math.abs(metrics.duplicateRatio - 2 / 3) < 1e-12, 'one of three evaluated raw results is a duplicate');
+  assert.ok(Math.abs(metrics.duplicateRatio - 1 / 3) < 1e-12, 'one of three evaluated raw results is a duplicate');
   assert.equal(metrics.countryPrecision, 0.5);
 
   const allDeferred = manualSearchContinuationMetrics({
@@ -119,6 +120,40 @@ test('manual page metrics exclude deferred channels from novelty and precision',
   assert.equal(allDeferred.deferredOnly, true);
   assert.equal(allDeferred.duplicateRatio, 0);
   assert.equal(allDeferred.countryPrecision, 0);
+});
+
+test('manual duplicate ratio counts repeated occurrences, not previously seen creators', () => {
+  const metrics = manualSearchContinuationMetrics({
+    rawIds: ['known', 'known', 'new'],
+    uniqueIds: ['known', 'new'],
+    deferredIds: [],
+    previousIds: ['known'],
+    countryAccepted: 2,
+    confirmedCount: 0,
+    communityCount: 0,
+  });
+  assert.ok(Math.abs(metrics.duplicateRatio - 1 / 3) < 1e-12, 'only the repeated occurrence is a duplicate');
+  assert.equal(metrics.noveltyRatio, 0.5, 'the previously seen creator is not novel, but is also not a duplicate');
+});
+
+test('deferred raw counting uses provider occurrences, not distinct channels', () => {
+  assert.equal(countDeferredRawResults(['a', 'b', 'b', 'c'], ['b']), 2);
+  assert.equal(countDeferredRawResults(['a', 'a', 'b'], new Set(['a', 'b'])), 3);
+  assert.equal(countDeferredRawResults(['a', 'b'], []), 0);
+});
+
+test('completed run metrics preserve deferred accounting', () => {
+  const first = calculateQueryFunnel(4, [
+    { channelId: 'a', wasKnown: false, persisted: true, funnelOutcome: 'TRADING_CONFIRMED', qualityScore: 80, hasCommunity: false },
+  ], 2);
+  const second = calculateQueryFunnel(3, [
+    { channelId: 'b', wasKnown: false, persisted: true, funnelOutcome: 'UNCERTAIN', qualityScore: 40, hasCommunity: false },
+  ], 1);
+  const aggregate = aggregatePageMetrics([first, second]);
+  assert.equal(aggregate.rawResults, 7);
+  assert.equal(aggregate.deferredResults, 3);
+  assert.equal(aggregate.evaluatedRawResults, 4);
+  assert.equal(aggregate.duplicateResults, 2);
 });
 
 test('deferred-only pages do not stop normal pagination as low yield', () => {

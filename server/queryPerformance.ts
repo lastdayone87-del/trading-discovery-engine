@@ -61,6 +61,17 @@ export interface QueryFunnelMetrics {
 
 const ratio = (numerator: number, denominator: number): number => denominator > 0 ? numerator / denominator : 0;
 
+/**
+ * Deferred accounting uses raw provider occurrences, not distinct channels:
+ * a deferred channel repeated three times on a page accounts for three
+ * unevaluated results. Counting it once would leave the extra occurrences in
+ * the duplicate total and can still stop pagination as duplicate-heavy.
+ */
+export function countDeferredRawResults(rawIds: string[], deferredIds: Iterable<string>): number {
+  const deferred = deferredIds instanceof Set ? deferredIds : new Set(deferredIds);
+  return rawIds.reduce((count, id) => count + (deferred.has(id) ? 1 : 0), 0);
+}
+
 export function calculateQueryFunnel(
   rawResults: number,
   observations: QueryObservation[],
@@ -175,7 +186,7 @@ export function manualSearchContinuationMetrics(input: {
     distinctCreators: evaluatedUniqueIds.length,
     noveltyRatio: evaluatedUniqueIds.length ? novelIds.length / evaluatedUniqueIds.length : 0,
     duplicateRatio: evaluatedRawCount
-      ? Math.max(0, 1 - novelIds.length / evaluatedRawCount)
+      ? Math.max(0, (evaluatedRawCount - evaluatedUniqueIds.length) / evaluatedRawCount)
       : deferred.size ? 0 : 1,
     countryPrecision: evaluatedUniqueIds.length ? input.countryAccepted / evaluatedUniqueIds.length : 0,
     communityDiversity: input.confirmedCount ? input.communityCount / input.confirmedCount : 0,

@@ -65,7 +65,7 @@ import {buildProviderRequestBaseId,executeAllocatedRetrievalPage,providerSnapsho
 import './braveSearch';
 import './youtubeInnertubeProvider';
 import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator, replayVocabularyForRetry } from './queryIntelligence';
-import { calculateQueryFunnel, manualSearchContinuationMetrics, type FunnelOutcome, type QueryObservation } from './queryPerformance';
+import { calculateQueryFunnel, countDeferredRawResults, manualSearchContinuationMetrics, type FunnelOutcome, type QueryObservation } from './queryPerformance';
 import { resolveScopeEligibility } from './scopeEligibility';
 import { processChannelThroughPipeline, isTerminalState, applyGate1CountryRejectionToExisting } from './ingestionPipeline';
 import { evaluateLowAudienceGate } from './lowAudienceGate';
@@ -890,7 +890,7 @@ export async function processNextSearchJob(
       // deferred work.
       if (job.payload.probeDeferredDiscovery === true) {
         await processDiscoveredChannel(candidate, targetCountry, source, {
-          forceExtraction: job.payload.forceExtraction === true,
+          forceExtraction: job.payload.forceExtraction === true || isRepairEligibleRetry(job),
         });
         await completeJob(job.id);
         return true;
@@ -1270,7 +1270,7 @@ export async function processNextSearchJob(
     const queryRecord=queryId?await getQueryById(queryId):null;
     const observations: QueryObservation[] = [];
     const sightings = [];
-    let deferredResults = 0;
+    const deferredChannelIds = new Set<string>();
     const channelLoopStartMs = Date.now();
     for (const [index, raw] of distinctExtracted.entries()) {
       // A durable nomination is written before channel processing. When the
@@ -1286,7 +1286,7 @@ export async function processNextSearchJob(
       // this run; the rest of the NORMAL page must still be processed. Keep it
       // out of yield/duplicate math: it was not evaluated, and counting it as
       // a duplicate can stop pagination before later normal results.
-      if (!outcome) { deferredResults++; continue; }
+      if (!outcome) { deferredChannelIds.add(raw.channelId); continue; }
       const funnelOutcome: FunnelOutcome = outcome.countryStatus === 'REJECTED'
         ? 'COUNTRY_REJECTED'
         : outcome.tradingStatus === 'HUMAN_REJECTED' ? 'NON_TRADING' : outcome.tradingStatus;
@@ -1309,6 +1309,10 @@ export async function processNextSearchJob(
       });
     }
     const channelLoopEndMs = Date.now();
+    const deferredResults = countDeferredRawResults(
+      extracted.map(channel => channel.channelId),
+      deferredChannelIds,
+    );
     if (queryRunId && queryId) {
       const queryRecord = await getQueryById(queryId);
       if (!queryRecord) throw new Error(`Query ${queryId} no longer exists for run ${queryRunId}.`);
@@ -1760,7 +1764,6 @@ export async function processDiscoveredChannelContained(
   } catch (error) {
     if (!shouldContainProbeQuotaRefusal(error)) throw error;
     const control = probeQuotaControlInChain(error);
-    let retryScheduled = false;
     try {
       const deferred = probeDeferredDiscoveryJob(
         raw,
@@ -1771,17 +1774,21 @@ export async function processDiscoveredChannelContained(
         options?.forceExtraction === true,
       );
       await enqueueJob('ENRICH_CHANNEL', deferred.payload, deferred.opts);
-      retryScheduled = true;
     } catch (scheduleError) {
-      // A scheduling failure must not abort the rest of a NORMAL page. The
-      // nomination ledger already records the observation for operator review.
+      // Without a durable retry this channel would be lost, and the nomination
+      // ledger may be disabled. Propagate the refusal instead of completing the
+      // page: the queue then defers/retries the NORMAL job rather than silently
+      // discarding the deferred channel.
       console.warn(JSON.stringify({
         event: 'probe_quota_channel_retry_schedule_failed',
         channelId: raw.channelId,
         source,
+        targetCountry,
+        code: String((control as any)?.code || 'PROBE_QUOTA_DEFERRED'),
         reason: String(scheduleError instanceof Error ? scheduleError.message : scheduleError).slice(0, 300),
         timestamp: new Date().toISOString(),
       }));
+      throw error;
     }
     console.warn(JSON.stringify({
       event: 'probe_quota_channel_deferred',
@@ -1790,7 +1797,7 @@ export async function processDiscoveredChannelContained(
       targetCountry,
       code: String((control as any)?.code || 'PROBE_QUOTA_DEFERRED'),
       reason: String((control as any)?.message || control).slice(0, 300),
-      retryScheduled,
+      retryScheduled: true,
       jobOrigin: currentOfficialYouTubeQuotaOrigin(),
       timestamp: new Date().toISOString(),
     }));
@@ -3187,7 +3194,7 @@ async function executeManualSearchPage(sessionId: string, pageNumber: number, pa
     const hasNextVariant = variantIndex + 1 < session.generatedQueryVariants.length;
     const decision = evaluateContinuation({pageNumber,maxPages,hasNextPage:!!page.nextPageToken||hasNextVariant,distinctCreators:manualMetrics.distinctCreators,cumulativeDistinctCreators:projectedUnique,maxDistinctCreators:maxCreators,newCreators:manualMetrics.novelIds.length,confirmedCreators:confirmedIds.length,qualityConfirmedCreators:qualityConfirmedIds.length,countryPrecision:manualMetrics.countryPrecision,communityDiversity:manualMetrics.communityDiversity,duplicateRatio:manualMetrics.duplicateRatio,consecutiveLowYieldPages:session.consecutiveLowYieldPages,maxConsecutiveLowYieldPages:maxLowYield,deferredOnly:manualMetrics.deferredOnly});
     const stopReason = decision.shouldContinue ? null : decision.primaryReason;
-    const updated = await recordManualSearchPage(sessionId, { pageNumber, queryVariant, lane: session.retrievalLane, inputPageToken: pageToken, nextPageToken: page.nextPageToken, rawResultCount:page.rawResultCount, rawIds, uniqueIds, knownIds, acceptedIds, confirmedIds, qualityConfirmedIds, averageQualityScore:qualityScores.length?qualityScores.reduce((a,b)=>a+b,0)/qualityScores.length:0, countryPrecision:manualMetrics.countryPrecision,communityDiversity:manualMetrics.communityDiversity,noveltyRatio:manualMetrics.noveltyRatio, duplicateRatio:manualMetrics.duplicateRatio, quotaUnits: 100, quotaEfficiency: qualityConfirmedIds.length / 100, creatorYield: confirmedIds.length, lowYield:decision.lowYield,marginalUtility:decision.marginalUtility,shouldContinue:decision.shouldContinue,primaryReason:decision.primaryReason,reasonCodes:decision.reasonCodes,maxPages, stopReason });
+    const updated = await recordManualSearchPage(sessionId, { pageNumber, queryVariant, lane: session.retrievalLane, inputPageToken: pageToken, nextPageToken: page.nextPageToken, rawResultCount:page.rawResultCount, rawIds, uniqueIds, evaluatedIds:manualMetrics.evaluatedUniqueIds, knownIds, acceptedIds, confirmedIds, qualityConfirmedIds, averageQualityScore:qualityScores.length?qualityScores.reduce((a,b)=>a+b,0)/qualityScores.length:0, countryPrecision:manualMetrics.countryPrecision,communityDiversity:manualMetrics.communityDiversity,noveltyRatio:manualMetrics.noveltyRatio, duplicateRatio:manualMetrics.duplicateRatio, quotaUnits: 100, quotaEfficiency: qualityConfirmedIds.length / 100, creatorYield: confirmedIds.length, lowYield:decision.lowYield,marginalUtility:decision.marginalUtility,shouldContinue:decision.shouldContinue,primaryReason:decision.primaryReason,reasonCodes:decision.reasonCodes,maxPages, stopReason });
     if (!stopReason) {
       const nextVariantIndex = page.nextPageToken ? variantIndex : variantIndex + 1;
       await enqueueJob('MANUAL_SEARCH_PAGE', { sessionId, pageNumber: pageNumber + 1, pageToken: page.nextPageToken, variantIndex: nextVariantIndex }, { priority: 200, maxAttempts: 3, idempotencyKey: `manual-page:${sessionId}:${pageNumber + 1}` });
