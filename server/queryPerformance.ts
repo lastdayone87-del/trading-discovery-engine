@@ -25,6 +25,14 @@ export interface QueryObservation {
 
 export interface QueryFunnelMetrics {
   rawResults: number;
+  /**
+   * Provider results that were deliberately not evaluated (for example a
+   * sticky-PROBE channel deferred by its disabled allocation). They stay in
+   * rawResults for reporting but are excluded from duplicate accounting.
+   */
+  deferredResults?: number;
+  /** rawResults minus deferredResults; zero is safe for legacy rows. */
+  evaluatedRawResults?: number;
   distinctResults: number;
   duplicateResults: number;
   knownChannels: number;
@@ -53,7 +61,17 @@ export interface QueryFunnelMetrics {
 
 const ratio = (numerator: number, denominator: number): number => denominator > 0 ? numerator / denominator : 0;
 
-export function calculateQueryFunnel(rawResults: number, observations: QueryObservation[]): QueryFunnelMetrics {
+export function calculateQueryFunnel(
+  rawResults: number,
+  observations: QueryObservation[],
+  deferredResults: number = 0,
+): QueryFunnelMetrics {
+  // A deferred provider result was never evaluated, so counting it as a
+  // duplicate (or as a country miss) makes a normal page look low-yield and
+  // can stop pagination before later eligible results. Keep rawResults intact
+  // for reporting and subtract only the deferred share from duplicate math.
+  const deferred = Math.max(0, Math.min(rawResults, Math.floor(deferredResults)));
+  const evaluatedRawResults = rawResults - deferred;
   const distinct = new Map<string, QueryObservation>();
   for (const observation of observations) if (!distinct.has(observation.channelId)) distinct.set(observation.channelId, observation);
   const values = [...distinct.values()];
@@ -97,8 +115,10 @@ export function calculateQueryFunnel(rawResults: number, observations: QueryObse
 
   return {
     rawResults,
+    deferredResults: deferred,
+    evaluatedRawResults,
     distinctResults: values.length,
-    duplicateResults: Math.max(0, rawResults - values.length),
+    duplicateResults: Math.max(0, evaluatedRawResults - values.length),
     knownChannels: values.filter(value => value.wasKnown).length,
     newChannels: values.filter(value => value.persisted && !value.wasKnown).length,
     inScopeNewChannels: inScopeFresh.length,
@@ -114,6 +134,51 @@ export function calculateQueryFunnel(rawResults: number, observations: QueryObse
     countryPrecision,
     tradingPrecision,
     performanceScore
+  };
+}
+
+/**
+ * Manual-search continuation inputs with deferred (not evaluated) channels
+ * removed from the novelty/precision denominator. Manual pages are
+ * operator-driven and do not use calculateQueryFunnel, but they share the
+ * same failure mode: a deferred channel must not look like a country miss or
+ * a duplicate. The raw provider IDs stay available for the stored page audit.
+ */
+export function manualSearchContinuationMetrics(input: {
+  rawIds: string[];
+  uniqueIds: string[];
+  deferredIds: string[];
+  previousIds: string[];
+  countryAccepted: number;
+  confirmedCount: number;
+  communityCount: number;
+}): {
+  evaluatedUniqueIds: string[];
+  novelIds: string[];
+  deferredOnly: boolean;
+  distinctCreators: number;
+  noveltyRatio: number;
+  duplicateRatio: number;
+  countryPrecision: number;
+  communityDiversity: number;
+} {
+  const deferred = new Set(input.deferredIds);
+  const previous = new Set(input.previousIds);
+  const evaluatedUniqueIds = input.uniqueIds.filter(id => !deferred.has(id));
+  const deferredRawCount = input.rawIds.filter(id => deferred.has(id)).length;
+  const evaluatedRawCount = Math.max(0, input.rawIds.length - deferredRawCount);
+  const novelIds = evaluatedUniqueIds.filter(id => !previous.has(id));
+  return {
+    evaluatedUniqueIds,
+    novelIds,
+    deferredOnly: evaluatedUniqueIds.length === 0 && deferred.size > 0,
+    distinctCreators: evaluatedUniqueIds.length,
+    noveltyRatio: evaluatedUniqueIds.length ? novelIds.length / evaluatedUniqueIds.length : 0,
+    duplicateRatio: evaluatedRawCount
+      ? Math.max(0, 1 - novelIds.length / evaluatedRawCount)
+      : deferred.size ? 0 : 1,
+    countryPrecision: evaluatedUniqueIds.length ? input.countryAccepted / evaluatedUniqueIds.length : 0,
+    communityDiversity: input.confirmedCount ? input.communityCount / input.confirmedCount : 0,
   };
 }
 

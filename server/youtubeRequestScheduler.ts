@@ -1,4 +1,11 @@
 import { getYouTubeQuotaGroupForKey } from './youtubeKeyPool';
+import { isProbeQuotaControlError } from './quotaKeyCapShadow';
+import {
+  currentOfficialYouTubeQuotaEntry,
+  currentOfficialYouTubeQuotaOrigin,
+  runWithExactOfficialYouTubeQuotaOrigin,
+  type ResolvedQuotaOrigin,
+} from './officialYouTubeQuotaFence';
 
 export type YouTubeRequestPriority =
   | 'manual'
@@ -34,6 +41,9 @@ interface QueuedRequest<T> {
   priority: YouTubeRequestPriority;
   sequence: number;
   enqueuedAt: number;
+  /** Provenance captured while enqueueing, restored exactly at dispatch. */
+  quotaOrigin: ResolvedQuotaOrigin;
+  quotaOriginEntry: string;
   resolve: (value: T | PromiseLike<T>) => void;
   reject: (reason?: unknown) => void;
 }
@@ -57,6 +67,18 @@ function quotaReservationRetryBounded(error: unknown, depth = 0): boolean {
   const candidate = error as { youtubeQuotaReservationRetryBounded?: unknown; cause?: unknown };
   return candidate.youtubeQuotaReservationRetryBounded === true
     || quotaReservationRetryBounded(candidate.cause, depth + 1);
+}
+
+/**
+ * Probe allocation refusals are policy terminals, not provider rate limits.
+ * executeProviderCall classifies the message ("quota") as RATE_LIMIT and wraps
+ * the original error as cause, so the scheduler must inspect the chain before
+ * pacing or retrying the shared queue.
+ */
+function probeQuotaControlInChain(error: unknown, depth = 0): boolean {
+  if (!error || typeof error !== 'object' || depth > 4) return false;
+  if (isProbeQuotaControlError(error)) return true;
+  return probeQuotaControlInChain((error as { cause?: unknown }).cause, depth + 1);
 }
 
 function sharedRuntimeCoolingDelayMs(error: unknown): number | null {
@@ -137,7 +159,21 @@ export class YouTubeRequestScheduler {
 
   run<T>(call: () => Promise<T>, trace?: (stage: string) => void, priority: YouTubeRequestPriority = 'enrichment'): Promise<T> {
     return new Promise<T>((resolve, reject) => {
-      this.queue.push({ call, trace, priority, sequence: this.sequence++, enqueuedAt: (this.options.now ?? Date.now)(), resolve, reject });
+      this.queue.push({
+        call,
+        trace,
+        priority,
+        sequence: this.sequence++,
+        enqueuedAt: (this.options.now ?? Date.now)(),
+        // Capture here, not at drain time: the shared queue is drained by
+        // whichever caller happens to be active, so an inherited PROBE context
+        // could otherwise charge NORMAL work to the probe bucket (or vice
+        // versa) across async boundaries.
+        quotaOrigin: currentOfficialYouTubeQuotaOrigin(),
+        quotaOriginEntry: currentOfficialYouTubeQuotaEntry() ?? 'youtubeRequestScheduler',
+        resolve,
+        reject,
+      });
       void this.processQueue();
     });
   }
@@ -253,12 +289,21 @@ export class YouTubeRequestScheduler {
       const actualSpacingMs = this.lastDispatchAt === null ? null : Math.max(0, dispatchAt - this.lastDispatchAt);
       this.lastDispatchAt = dispatchAt;
       try {
-        const value = await request.call();
+        const value = await runWithExactOfficialYouTubeQuotaOrigin(
+          request.quotaOrigin,
+          request.quotaOriginEntry,
+          () => request.call(),
+        );
         this.noteSuccessfulCall(request.trace);
         request.trace?.('after scheduled-call at server/youtubeRequestScheduler.ts:166');
         request.resolve(value);
         return;
       } catch (error) {
+        if (probeQuotaControlInChain(error)) {
+          request.trace?.('probe-quota-control-no-retry');
+          request.reject(error);
+          return;
+        }
         const coolingDelayMs = sharedRuntimeCoolingDelayMs(error);
         if (coolingDelayMs !== null) {
           // Only absorb the short corroborated shared-runtime pause. If every

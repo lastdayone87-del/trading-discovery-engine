@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { calculateQueryFunnel, isSeverelyContaminatedQuery, selectQueryCollection, type QueryObservation } from './queryPerformance';
+import { calculateQueryFunnel, isSeverelyContaminatedQuery, manualSearchContinuationMetrics, selectQueryCollection, type QueryObservation } from './queryPerformance';
+import { countTrailingLowYieldPages, evaluateContinuation } from './continuationPolicy';
 
 test('query funnel keeps duplicates, known channels, exclusions, and classifications separate', () => {
   const observations: QueryObservation[] = [
@@ -74,6 +75,89 @@ test('out-of-scope fresh channels earn no learning credit when scope is observed
   // IN_SCOPE earns; legacy-missing stays neutral (backward compatible);
   // explicitly observed OUT_OF_SCOPE and UNRESOLVED do not.
   assert.equal(metrics.inScopeNewChannels, 2);
+});
+
+test('deferred probe results keep raw reporting but do not count as duplicates', () => {
+  const observations: QueryObservation[] = [
+    { channelId: 'a', wasKnown: false, persisted: true, funnelOutcome: 'TRADING_CONFIRMED', qualityScore: 80, hasCommunity: false },
+    { channelId: 'b', wasKnown: false, persisted: true, funnelOutcome: 'UNCERTAIN', qualityScore: 40, hasCommunity: false },
+  ];
+  const metrics = calculateQueryFunnel(10, observations, 6);
+  assert.equal(metrics.rawResults, 10, 'the provider result count is preserved for reporting');
+  assert.equal(metrics.deferredResults, 6);
+  assert.equal(metrics.evaluatedRawResults, 4);
+  assert.equal(metrics.duplicateResults, 2, 'deferred results are not duplicates');
+});
+
+test('manual page metrics exclude deferred channels from novelty and precision', () => {
+  const metrics = manualSearchContinuationMetrics({
+    rawIds: ['a', 'a', 'b', 'c'],
+    uniqueIds: ['a', 'b', 'c'],
+    deferredIds: ['b'],
+    previousIds: ['a'],
+    countryAccepted: 1,
+    confirmedCount: 0,
+    communityCount: 0,
+  });
+  assert.deepEqual(metrics.evaluatedUniqueIds, ['a', 'c']);
+  assert.deepEqual(metrics.novelIds, ['c']);
+  assert.equal(metrics.deferredOnly, false);
+  assert.equal(metrics.distinctCreators, 2);
+  assert.equal(metrics.noveltyRatio, 0.5);
+  assert.ok(Math.abs(metrics.duplicateRatio - 2 / 3) < 1e-12, 'one of three evaluated raw results is a duplicate');
+  assert.equal(metrics.countryPrecision, 0.5);
+
+  const allDeferred = manualSearchContinuationMetrics({
+    rawIds: ['b'],
+    uniqueIds: ['b'],
+    deferredIds: ['b'],
+    previousIds: [],
+    countryAccepted: 0,
+    confirmedCount: 0,
+    communityCount: 0,
+  });
+  assert.equal(allDeferred.deferredOnly, true);
+  assert.equal(allDeferred.duplicateRatio, 0);
+  assert.equal(allDeferred.countryPrecision, 0);
+});
+
+test('deferred-only pages do not stop normal pagination as low yield', () => {
+  const metrics = calculateQueryFunnel(6, [], 6);
+  const page = {
+    pageNumber: 1, maxPages: 3, hasNextPage: true,
+    distinctCreators: metrics.distinctResults,
+    cumulativeDistinctCreators: metrics.distinctResults,
+    newCreators: metrics.newChannels, confirmedCreators: metrics.tradingConfirmed,
+    qualityConfirmedCreators: metrics.qualityChannels,
+    countryPrecision: metrics.countryPrecision,
+    communityDiversity: 0,
+    duplicateRatio: metrics.evaluatedRawResults ? metrics.duplicateResults / metrics.evaluatedRawResults : 0,
+    consecutiveLowYieldPages: 1, maxConsecutiveLowYieldPages: 2,
+    deferredOnly: true,
+  };
+  const decision = evaluateContinuation(page);
+  assert.equal(decision.shouldContinue, true);
+  assert.equal(decision.lowYield, false);
+  assert.equal(decision.primaryReason, 'CONTINUE_EXPLORATION');
+  assert.ok(decision.reasonCodes.includes('DEFERRED_ONLY'));
+  assert.equal(evaluateContinuation({ ...page, pageNumber: 3 }).shouldContinue, false);
+  assert.equal(evaluateContinuation({ ...page, pageNumber: 3 }).primaryReason, 'PAGE_CEILING');
+});
+
+test('deferred-only pages are transparent when rebuilding the low-yield streak', () => {
+  const rows = [
+    { marginalUtility: 0, reasonCodes: ['DEFERRED_ONLY'] },
+    { marginalUtility: 0.1, reasonCodes: ['ZERO_CONFIRMED_VALUE'] },
+    { marginalUtility: 0, reasonCodes: ['DEFERRED_ONLY'] },
+    { marginalUtility: 0.1, reasonCodes: ['DUPLICATE_HEAVY'] },
+    { marginalUtility: 0.8, reasonCodes: ['CONTINUE_PRODUCTIVE'] },
+  ];
+  assert.equal(countTrailingLowYieldPages(rows), 2, 'deferred-only pages neither extend nor reset the streak');
+  assert.equal(countTrailingLowYieldPages([
+    { marginalUtility: 0.1, reasonCodes: ['WRONG_COUNTRY'] },
+    { marginalUtility: 0, reasonCodes: ['DEFERRED_ONLY'] },
+    { marginalUtility: 0.8, reasonCodes: ['CONTINUE_PRODUCTIVE'] },
+  ]), 1);
 });
 
 test('scope weighting stays neutral when no observation carries scope', () => {

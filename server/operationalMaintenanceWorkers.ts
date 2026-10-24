@@ -205,14 +205,20 @@ function startFalseNegativeRecoveryWorker(workerId: string): void {
       if (!channelId) throw new Error('False-negative recovery job is missing channelId.');
       const result = await triggerManualRecheck(channelId, true, true);
       if (!result.success) {
+        const probeControl = result.probeQuotaExceeded === true
+          || result.probeQuotaDisabled === true
+          || result.probeQuotaUnavailable === true;
         const typedTransient = result.retryable === true
-          && ['TIMEOUT', 'CANCELLED', 'RATE_LIMIT', 'TRANSIENT', 'CREDENTIALS_EXHAUSTED'].includes(String(result.errorClass || ''));
+          && (probeControl || ['TIMEOUT', 'CANCELLED', 'RATE_LIMIT', 'TRANSIENT', 'CREDENTIALS_EXHAUSTED'].includes(String(result.errorClass || '')));
         const error = Object.assign(new Error(result.message), {
           code: result.code,
           retryable: typedTransient,
           errorClass: typedTransient ? result.errorClass : undefined,
           retryAt: typedTransient ? result.retryAt : undefined,
-          retryAfterMs: typedTransient ? result.retryAfterMs : undefined
+          retryAfterMs: typedTransient ? result.retryAfterMs : undefined,
+          ...(result.probeQuotaExceeded === true ? { probeQuotaExceeded: true } : {}),
+          ...(result.probeQuotaDisabled === true ? { probeQuotaDisabled: true } : {}),
+          ...(result.probeQuotaUnavailable === true ? { probeQuotaUnavailable: true } : {})
         });
         throw error;
       }
@@ -266,14 +272,20 @@ function startCountryBoundaryRecoveryWorker(workerId: string): void {
       if (!channelId) throw new Error('Country-boundary recovery job is missing channelId.');
       const result = await triggerManualRecheck(channelId, true, true);
       if (!result.success) {
+        const probeControl = result.probeQuotaExceeded === true
+          || result.probeQuotaDisabled === true
+          || result.probeQuotaUnavailable === true;
         const typedTransient = result.retryable === true
-          && ['TIMEOUT', 'CANCELLED', 'RATE_LIMIT', 'TRANSIENT', 'CREDENTIALS_EXHAUSTED'].includes(String(result.errorClass || ''));
+          && (probeControl || ['TIMEOUT', 'CANCELLED', 'RATE_LIMIT', 'TRANSIENT', 'CREDENTIALS_EXHAUSTED'].includes(String(result.errorClass || '')));
         throw Object.assign(new Error(result.message), {
           code: result.code,
           retryable: typedTransient,
           errorClass: typedTransient ? result.errorClass : undefined,
           retryAt: typedTransient ? result.retryAt : undefined,
-          retryAfterMs: typedTransient ? result.retryAfterMs : undefined
+          retryAfterMs: typedTransient ? result.retryAfterMs : undefined,
+          ...(result.probeQuotaExceeded === true ? { probeQuotaExceeded: true } : {}),
+          ...(result.probeQuotaDisabled === true ? { probeQuotaDisabled: true } : {}),
+          ...(result.probeQuotaUnavailable === true ? { probeQuotaUnavailable: true } : {})
         });
       }
       await completeJob(job.id);

@@ -11,6 +11,15 @@ test('manual recheck acquires fresh creator metadata and reruns unified trading 
   assert.match(recheck, /processChannelThroughPipeline\(freshCandidate, channel\.country, 'recheck', true, true\)/);
 });
 
+test('manual recheck establishes persisted provenance before official enrichment', () => {
+  const fetchIndex = recheck.indexOf('fetchYouTubeChannelEnrichment(channelId, fallback, 1)');
+  const originIndex = recheck.lastIndexOf('runWithOfficialYouTubeQuotaOrigin(', fetchIndex);
+  assert.ok(fetchIndex >= 0 && originIndex >= 0 && originIndex < fetchIndex,
+    'the persisted origin must wrap the enrichment fetch');
+  const wrapper = recheck.slice(originIndex, fetchIndex);
+  assert.match(wrapper, /channel\.quota_origin === 'PROBE' \? 'PROBE' : 'NORMAL'/);
+});
+
 test('manual recheck may continue community inspection only through the explicit degraded-classification fallback', () => {
   assert.match(recheck, /canContinueCommunityInspectionAfterDegradedManualClassification\(/);
   assert.match(recheck, /existingTradingStatus:\s*preserved\.trading_status/);

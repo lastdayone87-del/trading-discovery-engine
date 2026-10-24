@@ -1,7 +1,7 @@
 import { getDb } from './db';
 import type { RetrievalLane } from './retrievalLanes';
 import type { SearchOrdering } from './searchOrdering';
-import type { ContinuationDecision } from './continuationPolicy';
+import { countTrailingLowYieldPages, type ContinuationDecision } from './continuationPolicy';
 import type { QueryFunnelMetrics } from './queryPerformance';
 
 export interface AutonomousPageObservation {
@@ -38,13 +38,10 @@ export async function getAutonomousContinuationState(runId:string, pageNumber?: 
   ]);
 
   const delayed = delayedRes.rows[0] || { delayed_confirmed: 0, delayed_non_trading: 0, delayed_quality: 0 };
-  let consecutive=0;
-  for(const row of pagesRes.rows){
-    const codes=typeof row.decision_reason_codes==='string'?JSON.parse(row.decision_reason_codes):row.decision_reason_codes;
-    const low=Number(row.marginal_utility)<.2||codes?.some((x:string)=>['ZERO_CONFIRMED_VALUE','DUPLICATE_HEAVY','WRONG_COUNTRY'].includes(x));
-    if(!low)break;
-    consecutive++;
-  }
+  const consecutive = countTrailingLowYieldPages(pagesRes.rows.map(row => {
+    const codes = typeof row.decision_reason_codes === 'string' ? JSON.parse(row.decision_reason_codes) : row.decision_reason_codes;
+    return { marginalUtility: Number(row.marginal_utility), reasonCodes: Array.isArray(codes) ? codes : [] };
+  }));
   return {
     consecutiveLowYieldPages:consecutive,
     cumulativeDistinctCreators:pagesRes.rows.reduce((n,row)=>n+Number(row.distinct_creator_count||0),0),

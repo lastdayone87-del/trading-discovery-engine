@@ -65,7 +65,7 @@ import {buildProviderRequestBaseId,executeAllocatedRetrievalPage,providerSnapsho
 import './braveSearch';
 import './youtubeInnertubeProvider';
 import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator, replayVocabularyForRetry } from './queryIntelligence';
-import { calculateQueryFunnel, type FunnelOutcome, type QueryObservation } from './queryPerformance';
+import { calculateQueryFunnel, manualSearchContinuationMetrics, type FunnelOutcome, type QueryObservation } from './queryPerformance';
 import { resolveScopeEligibility } from './scopeEligibility';
 import { processChannelThroughPipeline, isTerminalState, applyGate1CountryRejectionToExisting } from './ingestionPipeline';
 import { evaluateLowAudienceGate } from './lowAudienceGate';
@@ -73,6 +73,13 @@ import { resolveTerminalEnrichmentFailure } from './enrichmentLifecycle';
 import { recordEvidenceActionOutcome } from './voiEvidenceController';
 import { completeInvestigationStep, failInvestigationStep, heartbeatInvestigationStep, reconcileOrphanInvestigations, recoverStaleInvestigationSteps, startInvestigationStep } from './investigationWorkflow';
 import { ChannelRecord, CountryStatus, DiscoverySource, SearchJob, InspectionStep, DiscordStatus } from '../src/types';
+import {
+  OfficialYouTubeQuotaFenceError,
+  currentOfficialYouTubeQuotaOrigin,
+  runWithOfficialYouTubeQuotaOrigin,
+} from './officialYouTubeQuotaFence';
+import { resolveJobQuotaOrigin } from './quotaOrigin';
+import { isProbeQuotaControlError } from './quotaKeyCapShadow';
 import { assertCountryAllowed, ExcludedCountryError, getCountryExclusion, shouldBlockEnrichClaimForCountry } from './countryExclusion';
 import { randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
@@ -719,7 +726,7 @@ export async function processNextSearchJob(
   if (!job) return false;
   const investigationId=String(job.payload?.investigationId||''),investigationStepId=String(job.payload?.investigationStepId||'');
   const traceId=String(job.payload?.traceId||'');
-  return withExecutionTrace(traceId,async()=>{
+  return withExecutionTrace(traceId, async()=>{
   const heartbeat = setInterval(() => {
     heartbeatJob(job.id, workerId).catch(error => console.error(`[Queue Worker:${workerId}] Heartbeat failed:`, error));
     if(investigationId&&investigationStepId)heartbeatInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,workerId}).catch(error=>console.error(`[Investigation:${investigationId}] Heartbeat failed:`,error));
@@ -727,6 +734,20 @@ export async function processNextSearchJob(
   heartbeat.unref?.();
 
   try {
+    // Establish durable provenance before any handler can reserve quota,
+    // hydrate metadata, or open a provider request. Probe-origin jobs run
+    // normally but every official call reserves from the independent probe
+    // allocation. Resolve inside this try so a provenance read failure follows
+    // the same failure lifecycle and job-specific cleanup as handler errors.
+    const quotaOrigin = await resolveJobQuotaOrigin(job);
+    if (quotaOrigin === 'UNKNOWN') {
+      throw new OfficialYouTubeQuotaFenceError(
+        quotaOrigin,
+        `queueJob:${job.type}`,
+        `job ${job.id} has no durable quota provenance`,
+      );
+    }
+    return await runWithOfficialYouTubeQuotaOrigin(quotaOrigin, `queueJob:${job.type}`, async () => {
     if(investigationId&&investigationStepId&&!await startInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,attempt:job.attempts,workerId})){await completeJob(job.id);return true;}
     await recordExecutionStage('DISPATCHER','REACHED',{jobId:job.id,type:job.type});
     if(job.type==='RETRY_COMMUNITY_ACQUISITION'){
@@ -781,8 +802,8 @@ export async function processNextSearchJob(
       await completeJob(job.id);
       return true;
     }
-    if(job.type==='INSPECT_PLAYLIST'){await processPlaylistInspectionJob(job,processDiscoveredChannel);return true;}
-    if(job.type==='INSPECT_FEATURED_CHANNELS'){await processFeaturedChannelInspectionJob(job,processDiscoveredChannel);return true;}
+    if(job.type==='INSPECT_PLAYLIST'){await processPlaylistInspectionJob(job,processDiscoveredChannelContained);return true;}
+    if(job.type==='INSPECT_FEATURED_CHANNELS'){await processFeaturedChannelInspectionJob(job,processDiscoveredChannelContained);return true;}
     if(job.type==='RELATIONSHIP_CANARY_EXPANSION'){
       await handleRelationshipCanaryExpansionJob(job, undefined, { workerId, attemptNumber: job.attempts });return true;
     }
@@ -800,14 +821,18 @@ export async function processNextSearchJob(
         // failures defer attempt-free with their retry schedule, while genuine
         // failures consume one bounded attempt and eventually project a
         // truthful terminal state. A plain Error would erase that distinction.
+        const probeControl=result.probeQuotaExceeded===true||result.probeQuotaDisabled===true||result.probeQuotaUnavailable===true;
         const typedTransient=result.retryable===true
-          &&['TIMEOUT','CANCELLED','RATE_LIMIT','TRANSIENT','CREDENTIALS_EXHAUSTED'].includes(String(result.errorClass||''));
+          &&(probeControl||['TIMEOUT','CANCELLED','RATE_LIMIT','TRANSIENT','CREDENTIALS_EXHAUSTED'].includes(String(result.errorClass||'')));
         throw Object.assign(new Error(result.message),{
           code:result.code,
           retryable:typedTransient,
           errorClass:typedTransient?result.errorClass:undefined,
           retryAt:typedTransient?result.retryAt:undefined,
-          retryAfterMs:typedTransient?result.retryAfterMs:undefined
+          retryAfterMs:typedTransient?result.retryAfterMs:undefined,
+          ...(result.probeQuotaExceeded===true?{probeQuotaExceeded:true}:{}),
+          ...(result.probeQuotaDisabled===true?{probeQuotaDisabled:true}:{}),
+          ...(result.probeQuotaUnavailable===true?{probeQuotaUnavailable:true}:{})
         });
       }
       const refreshed=await getChannelById(channelId);
@@ -857,6 +882,19 @@ export async function processNextSearchJob(
       const enrichmentStage=Math.min(3,Math.max(1,Number(job.payload.enrichmentStage||1))) as 1|2|3;
       if(investigationId)candidate.investigationId=investigationId;
       await assertCountryAllowed(targetCountry, `enrichment_worker:${job.id}`);
+      // A contained probe refusal defers the original discovery pipeline, not
+      // an enrichment-only retry. Replay discovery before the enrichment
+      // eligibility gate: discovery may revisit an existing TRADING_CONFIRMED
+      // row with UNCERTAIN country evidence, or an aged machine NON_TRADING
+      // row, and those rows would otherwise complete here without doing the
+      // deferred work.
+      if (job.payload.probeDeferredDiscovery === true) {
+        await processDiscoveredChannel(candidate, targetCountry, source, {
+          forceExtraction: job.payload.forceExtraction === true,
+        });
+        await completeJob(job.id);
+        return true;
+      }
       const channel = await getChannelById(channelId);
       // REJECTED rows are terminal for every pipeline (isTerminalState) and
       // are additionally guarded explicitly here (P2) so a future terminal
@@ -1232,6 +1270,7 @@ export async function processNextSearchJob(
     const queryRecord=queryId?await getQueryById(queryId):null;
     const observations: QueryObservation[] = [];
     const sightings = [];
+    let deferredResults = 0;
     const channelLoopStartMs = Date.now();
     for (const [index, raw] of distinctExtracted.entries()) {
       // A durable nomination is written before channel processing. When the
@@ -1242,7 +1281,12 @@ export async function processNextSearchJob(
         country,declaredLanguage:raw.detectedLanguages?.[0]?.language,retrievalLane,searchOrdering,pageNumber,resultRank:index+1,
         matchedDocument:raw.matchedDocument||{type:'UNKNOWN'},rawObservation:{channelName:raw.channelName,youtubeUrl:raw.youtubeUrl,locationTag:raw.locationTag||null}},'INVESTIGATION_QUEUED');
       raw.nominationId=nomination.id||undefined;raw.queryRunId=queryRunId;raw.discoveryJobId=job.id;
-      const outcome = await processDiscoveredChannel(raw, country, source, { forceExtraction: isRepairEligibleRetry(job) });
+      const outcome = await processDiscoveredChannelContained(raw, country, source, { forceExtraction: isRepairEligibleRetry(job) });
+      // A sticky-PROBE channel refused by its own allocation is deferred for
+      // this run; the rest of the NORMAL page must still be processed. Keep it
+      // out of yield/duplicate math: it was not evaluated, and counting it as
+      // a duplicate can stop pagination before later normal results.
+      if (!outcome) { deferredResults++; continue; }
       const funnelOutcome: FunnelOutcome = outcome.countryStatus === 'REJECTED'
         ? 'COUNTRY_REJECTED'
         : outcome.tradingStatus === 'HUMAN_REJECTED' ? 'NON_TRADING' : outcome.tradingStatus;
@@ -1268,7 +1312,7 @@ export async function processNextSearchJob(
     if (queryRunId && queryId) {
       const queryRecord = await getQueryById(queryId);
       if (!queryRecord) throw new Error(`Query ${queryId} no longer exists for run ${queryRunId}.`);
-      const metrics = calculateQueryFunnel(searchPage?.rawResultCount ?? extracted.length, observations);
+      const metrics = calculateQueryFunnel(searchPage?.rawResultCount ?? extracted.length, observations, deferredResults);
       await recordQueryRunSightings(queryRunId, queryId, sightings.map(s=>({...s,pageNumber})));
       const globalMaxPages = Math.max(1, Number(await getAppSetting('autonomous_pagination_max_pages', '3')));
       const maxPages = retrievalTreatmentOrigin === 'CANARY_TREATMENT'
@@ -1283,6 +1327,10 @@ export async function processNextSearchJob(
         : maxPages;
       const maxLow = Math.max(1, Number(await getAppSetting('autonomous_pagination_max_low_yield_pages', '2')));
       const prior = await getAutonomousContinuationState(queryRunId, pageNumber);
+      const evaluatedRawResults = metrics.evaluatedRawResults ?? metrics.rawResults;
+      const duplicateRatio = evaluatedRawResults > 0
+        ? metrics.duplicateResults / evaluatedRawResults
+        : metrics.deferredResults ? 0 : 1;
       const decision = evaluateContinuation({
         pageNumber, maxPages: trialBoundedMaxPages, hasNextPage: !!searchPage?.nextPageToken,
         distinctCreators: metrics.distinctResults,
@@ -1294,9 +1342,10 @@ export async function processNextSearchJob(
         delayedQualityCreators: prior.delayedQualityCreators,
         countryPrecision: metrics.countryPrecision,
         communityDiversity: metrics.tradingConfirmed ? metrics.communitiesDiscovered / metrics.tradingConfirmed : 0,
-        duplicateRatio: metrics.rawResults ? metrics.duplicateResults / metrics.rawResults : 1,
+        duplicateRatio,
         consecutiveLowYieldPages: prior.consecutiveLowYieldPages,
-        maxConsecutiveLowYieldPages: maxLow
+        maxConsecutiveLowYieldPages: maxLow,
+        deferredOnly: observations.length === 0 && deferredResults > 0
       });
       const enabled = await getAppSetting('autonomous_pagination_enabled', 'true') === 'true';
       const stoppingReason = decision.shouldContinue ? null : decision.primaryReason;
@@ -1309,7 +1358,7 @@ export async function processNextSearchJob(
         countryPrecision: metrics.countryPrecision,
         communityDiversity: metrics.tradingConfirmed ? metrics.communitiesDiscovered / metrics.tradingConfirmed : 0,
         noveltyRatio: metrics.noveltyRatio,
-        duplicateRatio: metrics.rawResults ? metrics.duplicateResults / metrics.rawResults : 1,
+        duplicateRatio,
         quotaUnits: providerQuotaUnits, decision, stoppingReason, pageMetrics: metrics,
         retrievalConfigKey, retrievalTreatmentOrigin
       };
@@ -1448,6 +1497,7 @@ export async function processNextSearchJob(
     }
     await completeJob(job.id);
     return true;
+    });
   } catch (err: any) {
     if (err instanceof ExcludedCountryError) {
       // A policy change can make an already-persisted job ineligible. Consume it
@@ -1640,6 +1690,112 @@ export async function processDiscoveredChannel(
   options?: { forceExtraction?: boolean }
 ): Promise<ProcessDiscoveredChannelOutcome> {
   return processChannelThroughPipeline(raw, targetCountry, source, false, false, options);
+}
+
+/**
+ * Contains a probe-origin quota refusal inside a normal-origin batch.
+ *
+ * Search, manual-search, playlist and featured-channel workers process a page
+ * serially. A sticky-PROBE channel may be refused before dispatch when the
+ * probe allocation is disabled/exhausted; that policy wait must not abort the
+ * remaining NORMAL channels or make the page retry and spend its quota again.
+ * Probe-origin jobs still propagate the refusal so the queue can defer them.
+ */
+export function shouldContainProbeQuotaRefusal(
+  error: unknown,
+  jobOrigin: 'NORMAL' | 'PROBE' | 'UNKNOWN' = currentOfficialYouTubeQuotaOrigin(),
+): boolean {
+  return jobOrigin === 'NORMAL' && probeQuotaControlInChain(error) !== null;
+}
+
+/**
+ * Pure payload/key builder for the per-channel retry created when a NORMAL
+ * batch contains a sticky-PROBE channel whose own allocation refuses it.
+ * A page-level retry would spend the whole page again, so the deferral is
+ * persisted as one PROBE-origin discovery-replay job per channel and quota
+ * day. ENRICH_CHANNEL is only the queue carrier type; the handler replays the
+ * original discovery pipeline so revisitable rows are not skipped by the
+ * enrichment-only eligibility gate. `enqueueJob`'s idempotency key collapses
+ * repeated sightings to one job.
+ */
+export function probeDeferredDiscoveryJob(
+  raw: DiscoveredChannelRaw,
+  targetCountry: string,
+  source: DiscoverySource,
+  control: unknown,
+  now: number = Date.now(),
+  forceExtraction: boolean = false,
+): { payload: Record<string, unknown>; opts: { priority: number; maxAttempts: number; runAfter: string; idempotencyKey: string } } {
+  const quotaDay = String((control as any)?.quotaDay || (control as any)?.details?.quotaDay || '');
+  const retryAt = Number((control as any)?.retryAt);
+  const runAfter = new Date(Number.isFinite(retryAt) && retryAt > now ? retryAt : now + 60_000).toISOString();
+  return {
+    payload: {
+      channelId: raw.channelId,
+      targetCountry,
+      source,
+      candidate: raw,
+      enrichmentStage: 1,
+      forceExtraction,
+      quotaOrigin: 'PROBE',
+      probeDeferredDiscovery: true,
+    },
+    opts: {
+      priority: 5,
+      maxAttempts: 4,
+      runAfter,
+      idempotencyKey: `probe-deferred-discovery:${raw.channelId}:${quotaDay || runAfter.slice(0, 10)}`,
+    },
+  };
+}
+
+export async function processDiscoveredChannelContained(
+  raw: DiscoveredChannelRaw,
+  targetCountry: string,
+  source: DiscoverySource,
+  options?: { forceExtraction?: boolean },
+): Promise<ProcessDiscoveredChannelOutcome | null> {
+  try {
+    return await processDiscoveredChannel(raw, targetCountry, source, options);
+  } catch (error) {
+    if (!shouldContainProbeQuotaRefusal(error)) throw error;
+    const control = probeQuotaControlInChain(error);
+    let retryScheduled = false;
+    try {
+      const deferred = probeDeferredDiscoveryJob(
+        raw,
+        targetCountry,
+        source,
+        control,
+        Date.now(),
+        options?.forceExtraction === true,
+      );
+      await enqueueJob('ENRICH_CHANNEL', deferred.payload, deferred.opts);
+      retryScheduled = true;
+    } catch (scheduleError) {
+      // A scheduling failure must not abort the rest of a NORMAL page. The
+      // nomination ledger already records the observation for operator review.
+      console.warn(JSON.stringify({
+        event: 'probe_quota_channel_retry_schedule_failed',
+        channelId: raw.channelId,
+        source,
+        reason: String(scheduleError instanceof Error ? scheduleError.message : scheduleError).slice(0, 300),
+        timestamp: new Date().toISOString(),
+      }));
+    }
+    console.warn(JSON.stringify({
+      event: 'probe_quota_channel_deferred',
+      channelId: raw.channelId,
+      source,
+      targetCountry,
+      code: String((control as any)?.code || 'PROBE_QUOTA_DEFERRED'),
+      reason: String((control as any)?.message || control).slice(0, 300),
+      retryScheduled,
+      jobOrigin: currentOfficialYouTubeQuotaOrigin(),
+      timestamp: new Date().toISOString(),
+    }));
+    return null;
+  }
 }
 
 /**
@@ -2646,6 +2802,10 @@ export interface ManualRecheckResult {
     errorClass?: ManualRecheckErrorClass;
   retryAt?: number;
   retryAfterMs?: number;
+  /** Probe allocation refusals remain policy waits through the worker bridge. */
+  probeQuotaExceeded?: boolean;
+  probeQuotaDisabled?: boolean;
+  probeQuotaUnavailable?: boolean;
   languageContext?: ExplicitTerminologyLanguageContext;
 }
 const OFFICIAL_RECHECK_UNITS_PER_PROVIDER = 101;
@@ -2672,12 +2832,23 @@ export async function reserveOfficialRecheckQuota(operationType: string, operati
   });
 }
 
-function classifyManualRecheckAcquisitionFailure(error: any): {
+/** executeProviderCall wraps quota refusals as a provider error, so the probe
+ * policy marker must be recovered from the cause chain before classification. */
+function probeQuotaControlInChain(error: any, depth = 0): any {
+  if (!error || typeof error !== 'object' || depth > 4) return null;
+  if (isProbeQuotaControlError(error)) return error;
+  return probeQuotaControlInChain(error.cause, depth + 1);
+}
+
+export function classifyManualRecheckAcquisitionFailure(error: any): {
   errorClass?: ManualRecheckErrorClass;
   retryable: boolean;
   code: string;
   retryAt?: number;
   retryAfterMs?: number;
+  probeQuotaExceeded?: boolean;
+  probeQuotaDisabled?: boolean;
+  probeQuotaUnavailable?: boolean;
 } {
   const message = String(error?.message || error || '');
   const rawErrorClass = String(error?.errorClass || '').toUpperCase() as ManualRecheckErrorClass;
@@ -2685,6 +2856,24 @@ function classifyManualRecheckAcquisitionFailure(error: any): {
   const status = Number(error?.status || error?.statusCode || error?.response?.status);
   const retryAt = Number(error?.retryAt);
   const retryAfterMs = Number(error?.retryAfterMs);
+  const probeControl = probeQuotaControlInChain(error);
+
+  // Probe allocation refusals are policy/capacity waits, not ordinary provider
+  // failures. Preserve the marker and reset time so maintenance recovery can
+  // defer attempt-free until capacity returns instead of aging out as FAILED.
+  if (probeControl) {
+    const probeRetryAt = Number(probeControl.retryAt);
+    return {
+      errorClass: MANUAL_RECHECK_ERROR_CLASSES.has(rawErrorClass) ? rawErrorClass : undefined,
+      retryable: true,
+      code: String(probeControl.code || code),
+      retryAt: Number.isFinite(probeRetryAt) ? probeRetryAt : (Number.isFinite(retryAt) ? retryAt : undefined),
+      retryAfterMs: Number.isFinite(retryAfterMs) ? retryAfterMs : undefined,
+      probeQuotaExceeded: probeControl.probeQuotaExceeded === true,
+      probeQuotaDisabled: probeControl.probeQuotaDisabled === true,
+      probeQuotaUnavailable: probeControl.probeQuotaUnavailable === true || probeControl.code === 'PROBE_QUOTA_UNAVAILABLE'
+    };
+  }
 
   // Attempt-free infrastructure retries are deliberately opt-in. The
   // upstream error itself must already carry a recognized transient
@@ -2792,19 +2981,33 @@ export async function triggerManualRecheck(
     let freshCandidate: DiscoveredChannelRaw;
     try {
       providerAttempted = true;
-      freshCandidate = await fetchYouTubeChannelEnrichment(channelId, fallback, 1);
+      // Manual recheck runs outside a queue job, so it must establish the
+      // persisted provenance itself. A probe-ingested channel is sticky PROBE;
+      // fetching as NORMAL here would spend ordinary quota (and could be
+      // refused when the ordinary path is fenced).
+      freshCandidate = await runWithOfficialYouTubeQuotaOrigin(
+        channel.quota_origin === 'PROBE' ? 'PROBE' : 'NORMAL',
+        `manualRecheck:${channelId}`,
+        () => fetchYouTubeChannelEnrichment(channelId, fallback, 1),
+      );
     } catch (error: any) {
       const detail = error instanceof Error ? error.message : String(error);
       const failure = classifyManualRecheckAcquisitionFailure(error);
+      const probeControl = failure.probeQuotaExceeded === true
+        || failure.probeQuotaDisabled === true
+        || failure.probeQuotaUnavailable === true;
       console.warn(`[Manual Recheck] Fresh YouTube creator acquisition failed for ${channelId}; preserving prior trading classification: ${detail}`);
       return {
         success: false,
         message: `Manual re-scan could not acquire fresh YouTube creator evidence. Existing trading classification was preserved. ${detail}`,
-        code: 'MANUAL_RESCAN_UPSTREAM_FAILURE',
+        code: probeControl ? failure.code : 'MANUAL_RESCAN_UPSTREAM_FAILURE',
         retryable: failure.retryable,
         errorClass: failure.errorClass,
         retryAt: failure.retryAt,
         retryAfterMs: failure.retryAfterMs,
+        probeQuotaExceeded: failure.probeQuotaExceeded === true,
+        probeQuotaDisabled: failure.probeQuotaDisabled === true,
+        probeQuotaUnavailable: failure.probeQuotaUnavailable === true,
         channel
       };
     }
@@ -2951,13 +3154,15 @@ async function executeManualSearchPage(sessionId: string, pageNumber: number, pa
     const qualityConfirmedIds: string[] = [];
     const qualityScores: number[] = [];
     const communityIds: string[] = [];
+    const deferredIds = new Set<string>();
     let countryAccepted = 0;
     for (const [index,raw] of unique.entries()) {
       const nomination=await recordNomination({channelId:raw.channelId,sourceType:'manual_search',sourceActionId:sessionId,query:queryVariant,
         queryGenerationMode:'OPERATOR_DIRECTED',country:session.country,retrievalLane:session.retrievalLane,pageNumber,resultRank:index+1,
         matchedDocument:raw.matchedDocument||{type:'MANUAL'},rawObservation:{channelName:raw.channelName,youtubeUrl:raw.youtubeUrl,sessionId,variantIndex}},'INVESTIGATION_QUEUED');
       raw.nominationId=nomination.id||undefined;
-      const outcome = await processDiscoveredChannel(raw, session.country, 'manual_search');
+      const outcome = await processDiscoveredChannelContained(raw, session.country, 'manual_search');
+      if (!outcome) { deferredIds.add(raw.channelId); continue; }
       if (outcome.wasKnown) knownIds.push(outcome.channelId);
       if (outcome.persisted && outcome.countryStatus !== 'REJECTED') acceptedIds.push(outcome.channelId);
       if (outcome.countryStatus !== 'REJECTED') countryAccepted++;
@@ -2969,15 +3174,20 @@ async function executeManualSearchPage(sessionId: string, pageNumber: number, pa
         if (outcome.discordStatus === 'ACTIVE' || outcome.discordStatus === 'ACTIVE_LOW_VOLUME') communityIds.push(outcome.channelId);
       }
     }
-    const previous = new Set(session.uniqueChannelIds);
-    const novelIds = uniqueIds.filter(id => !previous.has(id));
-    const noveltyRatio = uniqueIds.length ? novelIds.length / uniqueIds.length : 0;
-    const duplicateRatio = rawIds.length ? 1 - (novelIds.length / rawIds.length) : 1;
-    const projectedUnique = new Set([...session.uniqueChannelIds, ...uniqueIds]).size;
+    const manualMetrics = manualSearchContinuationMetrics({
+      rawIds,
+      uniqueIds,
+      deferredIds: [...deferredIds],
+      previousIds: session.uniqueChannelIds,
+      countryAccepted,
+      confirmedCount: confirmedIds.length,
+      communityCount: communityIds.length,
+    });
+    const projectedUnique = new Set([...session.uniqueChannelIds, ...manualMetrics.evaluatedUniqueIds]).size;
     const hasNextVariant = variantIndex + 1 < session.generatedQueryVariants.length;
-    const decision = evaluateContinuation({pageNumber,maxPages,hasNextPage:!!page.nextPageToken||hasNextVariant,distinctCreators:uniqueIds.length,cumulativeDistinctCreators:projectedUnique,maxDistinctCreators:maxCreators,newCreators:novelIds.length,confirmedCreators:confirmedIds.length,qualityConfirmedCreators:qualityConfirmedIds.length,countryPrecision:unique.length?countryAccepted/unique.length:0,communityDiversity:confirmedIds.length?communityIds.length/confirmedIds.length:0,duplicateRatio,consecutiveLowYieldPages:session.consecutiveLowYieldPages,maxConsecutiveLowYieldPages:maxLowYield});
+    const decision = evaluateContinuation({pageNumber,maxPages,hasNextPage:!!page.nextPageToken||hasNextVariant,distinctCreators:manualMetrics.distinctCreators,cumulativeDistinctCreators:projectedUnique,maxDistinctCreators:maxCreators,newCreators:manualMetrics.novelIds.length,confirmedCreators:confirmedIds.length,qualityConfirmedCreators:qualityConfirmedIds.length,countryPrecision:manualMetrics.countryPrecision,communityDiversity:manualMetrics.communityDiversity,duplicateRatio:manualMetrics.duplicateRatio,consecutiveLowYieldPages:session.consecutiveLowYieldPages,maxConsecutiveLowYieldPages:maxLowYield,deferredOnly:manualMetrics.deferredOnly});
     const stopReason = decision.shouldContinue ? null : decision.primaryReason;
-    const updated = await recordManualSearchPage(sessionId, { pageNumber, queryVariant, lane: session.retrievalLane, inputPageToken: pageToken, nextPageToken: page.nextPageToken, rawResultCount:page.rawResultCount, rawIds, uniqueIds, knownIds, acceptedIds, confirmedIds, qualityConfirmedIds, averageQualityScore:qualityScores.length?qualityScores.reduce((a,b)=>a+b,0)/qualityScores.length:0, countryPrecision:unique.length?countryAccepted/unique.length:0,communityDiversity:confirmedIds.length?communityIds.length/confirmedIds.length:0,noveltyRatio, duplicateRatio, quotaUnits: 100, quotaEfficiency: qualityConfirmedIds.length / 100, creatorYield: confirmedIds.length, lowYield:decision.lowYield,marginalUtility:decision.marginalUtility,shouldContinue:decision.shouldContinue,primaryReason:decision.primaryReason,reasonCodes:decision.reasonCodes,maxPages, stopReason });
+    const updated = await recordManualSearchPage(sessionId, { pageNumber, queryVariant, lane: session.retrievalLane, inputPageToken: pageToken, nextPageToken: page.nextPageToken, rawResultCount:page.rawResultCount, rawIds, uniqueIds, knownIds, acceptedIds, confirmedIds, qualityConfirmedIds, averageQualityScore:qualityScores.length?qualityScores.reduce((a,b)=>a+b,0)/qualityScores.length:0, countryPrecision:manualMetrics.countryPrecision,communityDiversity:manualMetrics.communityDiversity,noveltyRatio:manualMetrics.noveltyRatio, duplicateRatio:manualMetrics.duplicateRatio, quotaUnits: 100, quotaEfficiency: qualityConfirmedIds.length / 100, creatorYield: confirmedIds.length, lowYield:decision.lowYield,marginalUtility:decision.marginalUtility,shouldContinue:decision.shouldContinue,primaryReason:decision.primaryReason,reasonCodes:decision.reasonCodes,maxPages, stopReason });
     if (!stopReason) {
       const nextVariantIndex = page.nextPageToken ? variantIndex : variantIndex + 1;
       await enqueueJob('MANUAL_SEARCH_PAGE', { sessionId, pageNumber: pageNumber + 1, pageToken: page.nextPageToken, variantIndex: nextVariantIndex }, { priority: 200, maxAttempts: 3, idempotencyKey: `manual-page:${sessionId}:${pageNumber + 1}` });
