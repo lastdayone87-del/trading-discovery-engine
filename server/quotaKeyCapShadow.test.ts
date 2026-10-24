@@ -763,6 +763,23 @@ test('probe allocation config is opt-in, bounded, and malformed settings fail cl
   assert.equal(PROBE_QUOTA_DEFAULT_CAP_UNITS, 10000);
 });
 
+test('a stalled probe allocation settings read is bounded and fails closed', async () => {
+  resetProbeQuotaConfigCacheForTests();
+  const started = Date.now();
+  await assert.rejects(
+    resolveProbeQuotaConfig(
+      () => new Promise<string>(() => undefined),
+      Date.now(),
+      { YOUTUBE_API_KEY: 'test-key', YOUTUBE_DAILY_QUOTA_PER_KEY: '10000' },
+      5,
+    ),
+    (error: unknown) => error instanceof ProbeQuotaUnavailableError
+      && /timed out/.test(String((error as Error).cause ?? error.message)),
+    'a stalled probe settings query must deny instead of holding dispatch'
+  );
+  assert.ok(Date.now() - started < 500, 'the read is bounded by the deadline');
+});
+
 test('probe reservation fails closed before touching the pool when disabled', async () => {
   resetProbeQuotaConfigCacheForTests();
   resetProbeQuotaExhaustionCacheForTests();

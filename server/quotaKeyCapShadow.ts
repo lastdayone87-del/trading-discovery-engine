@@ -260,15 +260,20 @@ export async function resolveProbeQuotaConfig(
   readSetting: ShadowSettingReader,
   now: number = Date.now(),
   environment: NodeJS.ProcessEnv = process.env,
+  timeoutMs: number = SETTINGS_READ_TIMEOUT_MS,
 ): Promise<ProbeQuotaConfig> {
   if (cachedProbeConfig && now - cachedProbeConfig.at < SHADOW_CONFIG_TTL_MS) return cachedProbeConfig.config;
   let enabledRaw: string;
   let capRaw: string;
   try {
-    [enabledRaw, capRaw] = await Promise.all([
-      readSetting(PROBE_QUOTA_ENABLED_KEY, 'false'),
-      readSetting(PROBE_QUOTA_CAP_KEY, '0'),
-    ]);
+    [enabledRaw, capRaw] = await readSettingWithDeadline(
+      Promise.all([
+        readSetting(PROBE_QUOTA_ENABLED_KEY, 'false'),
+        readSetting(PROBE_QUOTA_CAP_KEY, '0'),
+      ]),
+      timeoutMs,
+      'Probe official-quota setting read timed out.',
+    );
   } catch (error) {
     throw new ProbeQuotaUnavailableError('Unable to read the probe official-quota allocation settings.', { cause: error });
   }

@@ -328,6 +328,16 @@ Fixed at `8683a11` (Qodo round):
   surfaced once; the scheduler no longer replays the closure and reserves the
   full cost on every attempt.
 
+Fixed at `8c0e4eb` (Greptile round):
+
+- **Stalled settings read:** `resolveKeyCapEnforcement` now races the read
+  against a 2 s deadline and fails closed, so a settings-query stall cannot pin
+  the dispatch queue past the provider abort.
+- **Featured-channel failover:** `fetchYouTubeFeaturedChannels` now loops over
+  available keys with bounded attempts and failure accounting instead of using
+  one key and relying on scheduler replay, which reserved-429 suppression
+  removed.
+
 Documented rather than changed:
 
 - cold settings failure is intentionally fail-closed (a settings outage is not
