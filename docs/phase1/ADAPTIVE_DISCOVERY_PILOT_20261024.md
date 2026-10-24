@@ -35,8 +35,8 @@ never received the treatment, so replay differences are not causal evidence.
 ## Predeclared questions
 
 **Primary:** in treatment country-days, does creator-derived materialization
-increase persisted, genuinely new, relevant creators per run without a
-material increase in duplicates or a reliability/quota regression?
+increase persisted, genuinely new creators that meet the quality bar per run
+without a material increase in duplicates or a reliability/quota regression?
 
 **Secondary:**
 
@@ -52,16 +52,33 @@ No metric requires additional provider calls.
 
 | Metric | Definition | Why it matters |
 | --- | --- | --- |
-| **Genuinely new relevant creators** | `relevantNewCreators`: persisted channels with `wasKnown=false` (or `isNew=true`), `TRADING_CONFIRMED`, quality score ≥55 | The only creator count that can justify expansion |
-| **Novelty rate** | `newCreators / rawResults` | Share of returned results that are new, not repeat sightings |
+| **Genuinely new quality creators** | `qualityNewCreators`: persisted channels with `wasKnown=false`, `TRADING_CONFIRMED`, quality score ≥55 | The only creator count that can justify expansion |
+| **Broad new relevant creators** | `relevantNewCreators`: persisted channels with `wasKnown=false` and `TRADING_CONFIRMED` or `NEEDS_REVIEW`, with no quality cutoff | Operational relevance context; never used for expansion |
+| **Novelty rate** | `newCreators / distinctCreators` (exposed as `noveltyRate`) | Share of distinct creators that are new, matching the canonical evaluator |
 | **Duplicate rate** | `knownCreators / distinctCreators` | Whether treatment mostly rediscovers the catalog |
-| **Relevant creators per run** | `relevantNewCreators / runs` | Primary yield comparison |
-| **Reliability** | `1 - providerFailures / runs` | Whether treatment remains operable under provider pressure |
-| **Quota use** | `quotaConsumed` and `quotaConsumed / relevantNewCreators` | Efficiency versus the control arm |
+| **Quality creators per run** | `qualityNewCreators / runs` (exposed as `qualityYieldPerRun`) | Primary yield comparison |
+| **Reliability** | `1 - (providerFailures + invalidQueries) / runs` (exposed as `failedRuns` and `reliability`) | Whether treatment remains operable under provider pressure; invalid queries are terminal failures |
+| **Quota use** | `quotaConsumed` and `quotaConsumed / qualityNewCreators` (exposed as `quotaPerQualityCreator`) | Efficiency versus the control arm |
 
 A creator that is returned but not persisted, a review-routed row, or a repeat
 sighting is not a new creator. Assignment is recorded before generation and is
-immutable for the country-day; a later setting change cannot flip an arm.
+immutable for the country-day; a later setting change or policy release cannot
+flip an arm or create a second arm for the same day.
+
+### Review hardening before activation (2026-10-24)
+
+The draft metric definitions were reconciled with the authoritative observation
+capture before any pilot data existed:
+
+- `qualityNewCreators` is the expansion count and drives every success/quota
+  rule; `relevantNewCreators` remains a broader operational count and cannot
+  justify expansion.
+- Novelty uses `newCreators / distinctCreators`, matching
+  `discoveryTrustEvaluation`, and is exposed as `noveltyRate`.
+- Reliability counts `invalidQueries` as terminal failures in addition to
+  provider failures, matching the evaluation contract.
+- The assignment ledger is unique per `(country, quota_day)`, not per policy
+  version; a policy release during the day reuses the recorded arm.
 
 ## Cheapest early read
 
@@ -73,8 +90,8 @@ Predeclare the read before activation:
 
 - **Day 3 read:** compute the primary and secondary metrics. Stop the pilot if
   treatment reliability is below 0.80, if the duplicate rate is more than 10
-  percentage points worse than control, or if quota per relevant creator is
-  more than 1.5× control. Continue only if treatment relevant creators/run is
+  percentage points worse than control, or if quota per quality creator is
+  more than 1.5× control. Continue only if treatment quality creators/run is
   at least equal to control and duplicates are not worse.
 - **Day 7 interim:** repeat the same read; do not change arms or reuse the
   day-3 sample as independent evidence.
@@ -88,13 +105,16 @@ the predeclared day-14 read supports a recommendation.
 
 Recommend expansion only if **all** of the following hold at day 14:
 
-1. Treatment relevant creators/run is at least **1.25× control**.
+1. Treatment quality creators/run (`qualityYieldPerRun`) is at least
+   **1.25× control**.
 2. Treatment duplicate rate is **not higher** than control by more than 5
    percentage points.
-3. Treatment novelty rate is **not lower** than control.
-4. Treatment reliability is **at least 0.90** and not more than 5 percentage
-   points below control.
-5. Quota per relevant new creator is **not more than 1.25× control**.
+3. Treatment novelty rate (`newCreators / distinctCreators`) is **not lower**
+   than control.
+4. Treatment reliability (`1 - (providerFailures + invalidQueries) / runs`) is
+   **at least 0.90** and not more than 5 percentage points below control.
+5. Quota per quality new creator (`quotaPerQualityCreator`) is **not more than
+   1.25× control**.
 
 Any safety or reliability stop fails regardless of yield. A null result keeps
 the pilot off; it does not authorize a larger tranche.

@@ -834,13 +834,14 @@ test('Phase 10: persisted-cursor round robin preserves generator ranking and has
 
 test('Phase 10: the autonomous producer uses bounded pilot-aware materialization before Phase 8 allocation', () => {
   const source = fs.readFileSync(new URL('./autonomousDiscovery.ts', import.meta.url), 'utf8');
-  assert.match(source, /materializeAdaptiveDiscoveryPilotProposals/);
+  const materializationCall = source.indexOf('await materializeAdaptiveDiscoveryPilotProposals(countries, {');
+  assert.ok(materializationCall >= 0, 'the producer must call the pilot-aware materializer');
   assert.doesNotMatch(source, /generateFrontierProposalsForCountry/);
   assert.match(source, /country_native_materialization_cursor/);
   assert.match(source, /fairnessCursor: nativeFairnessCursor/);
   assert.ok(
-    source.indexOf('materializeAdaptiveDiscoveryPilotProposals') < source.indexOf('evaluateShadowFrontierAllocation({ opportunityKey'),
-    'proposal materialization must precede the existing Phase 8 allocation boundary'
+    materializationCall < source.indexOf('evaluateShadowFrontierAllocation({ opportunityKey'),
+    'the materialization call, not its import, must precede the existing Phase 8 allocation boundary'
   );
 });
 

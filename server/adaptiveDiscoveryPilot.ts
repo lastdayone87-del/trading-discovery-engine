@@ -165,7 +165,8 @@ function mapAssignment(row: any): AdaptivePilotAssignment {
 
 /**
  * Inserts the immutable assignment or returns the already-recorded arm. A
- * config change during the same country-day can never flip an assignment.
+ * config change or policy release during the same country-day can never flip
+ * an assignment or create a second arm for that day.
  */
 export async function recordAdaptivePilotAssignment(
   input: AdaptivePilotAssignmentInput,
@@ -186,7 +187,7 @@ export async function recordAdaptivePilotAssignment(
        assignment_key,country,quota_day,arm,treatment_percent,assignment_seed,
        policy_version,window_start,window_end
      ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
-     ON CONFLICT(country,quota_day,policy_version) DO NOTHING
+     ON CONFLICT(country,quota_day) DO NOTHING
      RETURNING *`,
     [
       assignmentKey,
@@ -203,8 +204,8 @@ export async function recordAdaptivePilotAssignment(
   if (inserted.rows[0]) return mapAssignment(inserted.rows[0]);
   const existing = await db.query(
     `SELECT * FROM adaptive_discovery_pilot_assignments
-     WHERE country=$1 AND quota_day=$2 AND policy_version=$3`,
-    [country, input.quotaDay, policyVersion]
+     WHERE country=$1 AND quota_day=$2`,
+    [country, input.quotaDay]
   );
   if (!existing.rows[0]) throw new Error('ADAPTIVE_PILOT_ASSIGNMENT_NOT_RECORDED');
   return mapAssignment(existing.rows[0]);
@@ -381,6 +382,7 @@ export interface AdaptivePilotAggregateRow {
   confirmedNewCreators: number;
   quotaConsumed: number;
   providerFailures: number;
+  invalidQueries: number;
 }
 
 export interface AdaptivePilotArmMetrics {
@@ -397,12 +399,18 @@ export interface AdaptivePilotArmMetrics {
   confirmedNewCreators: number;
   quotaConsumed: number;
   providerFailures: number;
+  invalidQueries: number;
+  /** providerFailures + invalidQueries (the evaluation contract's terminal failures). */
+  failedRuns: number;
   duplicateRate: number;
   relevanceRate: number;
   yieldPerRun: number;
   relevantYieldPerRun: number;
+  qualityYieldPerRun: number;
+  noveltyRate: number;
   reliability: number;
   quotaPerRelevantCreator: number | null;
+  quotaPerQualityCreator: number | null;
 }
 
 export interface AdaptivePilotMetrics {
@@ -414,6 +422,8 @@ export interface AdaptivePilotMetrics {
     treatmentVsControl: {
       newCreatorsPerRun: number;
       relevantCreatorsPerRun: number;
+      qualityCreatorsPerRun: number;
+      noveltyRate: number;
       duplicateRate: number;
       reliability: number;
     };
@@ -440,12 +450,17 @@ export function aggregateAdaptivePilotMetrics(rows: AdaptivePilotAggregateRow[])
     confirmedNewCreators: 0,
     quotaConsumed: 0,
     providerFailures: 0,
+    invalidQueries: 0,
+    failedRuns: 0,
     duplicateRate: 0,
     relevanceRate: 0,
     yieldPerRun: 0,
     relevantYieldPerRun: 0,
+    qualityYieldPerRun: 0,
+    noveltyRate: 0,
     reliability: 0,
-    quotaPerRelevantCreator: null
+    quotaPerRelevantCreator: null,
+    quotaPerQualityCreator: null
   });
   const byArm: Record<AdaptivePilotArm, AdaptivePilotArmMetrics> = {
     TREATMENT: empty('TREATMENT'),
@@ -465,16 +480,25 @@ export function aggregateAdaptivePilotMetrics(rows: AdaptivePilotAggregateRow[])
     target.confirmedNewCreators += num(row.confirmedNewCreators);
     target.quotaConsumed += num(row.quotaConsumed);
     target.providerFailures += num(row.providerFailures);
+    target.invalidQueries += num(row.invalidQueries);
   }
   for (const target of Object.values(byArm)) {
     const ratio = (numerator: number, denominator: number) => denominator > 0 ? numerator / denominator : 0;
+    target.failedRuns = target.providerFailures + target.invalidQueries;
     target.duplicateRate = ratio(target.knownCreators, target.distinctCreators);
     target.relevanceRate = ratio(target.relevantNewCreators, target.newCreators);
     target.yieldPerRun = ratio(target.newCreators, target.runs);
     target.relevantYieldPerRun = ratio(target.relevantNewCreators, target.runs);
-    target.reliability = target.runs > 0 ? 1 - ratio(target.providerFailures, target.runs) : 0;
+    target.qualityYieldPerRun = ratio(target.qualityNewCreators, target.runs);
+    target.noveltyRate = ratio(target.newCreators, target.distinctCreators);
+    // Match the evaluation contract: an invalid query is a terminal failure,
+    // not a successful run with zero results.
+    target.reliability = target.runs > 0 ? 1 - ratio(target.failedRuns, target.runs) : 0;
     target.quotaPerRelevantCreator = target.relevantNewCreators > 0
       ? target.quotaConsumed / target.relevantNewCreators
+      : null;
+    target.quotaPerQualityCreator = target.qualityNewCreators > 0
+      ? target.quotaConsumed / target.qualityNewCreators
       : null;
   }
   return [byArm.TREATMENT, byArm.CONTROL];
@@ -514,7 +538,8 @@ export async function computeAdaptivePilotMetrics(input: {
        COALESCE(SUM(o.quality_new_creators),0)::int AS quality_new_creators,
        COALESCE(SUM(o.confirmed_new_creators),0)::int AS confirmed_new_creators,
        COALESCE(SUM(o.quota_consumed),0)::int AS quota_consumed,
-       (COUNT(DISTINCT o.query_run_id) FILTER (WHERE o.provider_failed))::int AS provider_failures
+       (COUNT(DISTINCT o.query_run_id) FILTER (WHERE o.provider_failed))::int AS provider_failures,
+       (COUNT(DISTINCT o.query_run_id) FILTER (WHERE o.invalid_query))::int AS invalid_queries
      FROM adaptive_discovery_pilot_assignments a
      LEFT JOIN latest_obs o
        ON LOWER(o.country) = LOWER(a.country)
@@ -544,7 +569,8 @@ export async function computeAdaptivePilotMetrics(input: {
       qualityNewCreators: num(row.quality_new_creators),
       confirmedNewCreators: num(row.confirmed_new_creators),
       quotaConsumed: num(row.quota_consumed),
-      providerFailures: num(row.provider_failures)
+      providerFailures: num(row.provider_failures),
+      invalidQueries: num(row.invalid_queries)
     }))
   });
 }
@@ -569,6 +595,8 @@ export function summarizeAdaptivePilotMetrics(input: {
       treatmentVsControl: {
         newCreatorsPerRun: delta(treatment.yieldPerRun, control.yieldPerRun),
         relevantCreatorsPerRun: delta(treatment.relevantYieldPerRun, control.relevantYieldPerRun),
+        qualityCreatorsPerRun: delta(treatment.qualityYieldPerRun, control.qualityYieldPerRun),
+        noveltyRate: delta(treatment.noveltyRate, control.noveltyRate),
         duplicateRate: delta(treatment.duplicateRate, control.duplicateRate),
         reliability: delta(treatment.reliability, control.reliability)
       }

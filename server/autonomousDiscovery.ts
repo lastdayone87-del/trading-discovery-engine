@@ -513,6 +513,14 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       let selectedExperiment: SelectionExperimentObservation | null = null;
       const nativeSnapshot = frontierAllocationInfo?.decision?.proposalEvidenceSnapshot;
       const governedConceptProposal = ['COUNTRY_NATIVE', 'EXTERNAL_OSINT', 'CREATOR_DERIVED'].includes(nativeSnapshot?.proposalFamily);
+      // Name the recorded family in the scheduling reason. Creator-derived and
+      // external proposals share this scheduling branch, so a fixed
+      // COUNTRY_NATIVE label would misattribute the selected work.
+      const governedProposalLabel = nativeSnapshot?.proposalFamily === 'CREATOR_DERIVED'
+        ? 'CREATOR_DERIVED'
+        : nativeSnapshot?.proposalFamily === 'EXTERNAL_OSINT'
+          ? 'EXTERNAL_OSINT'
+          : 'COUNTRY_NATIVE';
 
       // Benchmark-designated attempts (benchmark-preregistration-v1
       // execution): serve ONLY the designated pool row or nothing. An
@@ -582,9 +590,9 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
           selected = {
             queryRecord: nativeQuery,
             selectionStrategy: 'NEIGHBORHOOD_TARGETED',
-            reason: 'Query Intelligence constructed the selected immutable COUNTRY_NATIVE proposal through governed retrieval policy.'
+            reason: `Query Intelligence constructed the selected immutable ${governedProposalLabel} proposal through governed retrieval policy.`
           };
-          candidateDiagnostic = { ...candidateDiagnostic, selectionSource: nativeSnapshot?.proposalFamily === 'CREATOR_DERIVED' ? 'CREATOR_DERIVED' : 'COUNTRY_NATIVE', selectedQueryId: selected.queryRecord.id };
+          candidateDiagnostic = { ...candidateDiagnostic, selectionSource: governedProposalLabel, selectedQueryId: selected.queryRecord.id };
         } else if (targeted?.selectionStrategy === 'NEIGHBORHOOD_TARGETED') {
           selected = targeted;
           candidateDiagnostic = { ...candidateDiagnostic, selectionSource: 'NEIGHBORHOOD_TARGETED', selectedQueryId: selected.queryRecord.id };
@@ -604,7 +612,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
             // on an unrelated generic query after releasing its reservation.
             candidateDiagnostic = {
               ...candidateDiagnostic,
-              selectionSource: nativeSnapshot?.proposalFamily === 'CREATOR_DERIVED' ? 'CREATOR_DERIVED' : 'COUNTRY_NATIVE',
+              selectionSource: governedProposalLabel,
               authorityOutcome: nativeAuthorization?.status === 'AUTHORIZED' ? 'ELIGIBLE' : 'REJECTED',
               authorityReasonCodes: nativeAuthorization?.status === 'REJECTED' ? [nativeAuthorization.code] : undefined,
               disposition: 'SKIPPED',
