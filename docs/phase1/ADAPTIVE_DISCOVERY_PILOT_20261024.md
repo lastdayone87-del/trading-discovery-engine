@@ -1,7 +1,7 @@
 # Adaptive creator-derived pilot — question, metrics, and activation plan
 
 Date: 2026-10-24 · PR: [#545](https://github.com/lastdayone87-del/trading-discovery-engine/pull/545)
-· Branch: `feat/adaptive-country-pilot` · Status: **default OFF, not activated,
+· Branch: `feat/adaptive-discovery-pilot` · Status: **default OFF, not activated,
 not deployed, no live treatment data.** This document is a predeclared
 evaluation plan, not evidence that the treatment works.
 
