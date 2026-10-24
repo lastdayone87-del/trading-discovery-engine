@@ -213,6 +213,37 @@ maybe('creator-derived proposals retain a canonical country that can authorize a
   }
 });
 
+maybe('default metrics retain an assignment reused across a policy release', async () => {
+  const db = await requirePool();
+  const quotaDay = '2026-10-22';
+  const oldPolicy = 'adaptive-country-pilot-v1';
+  await recordAdaptivePilotAssignment({
+    country: 'Ireland',
+    quotaDay,
+    arm: 'CONTROL',
+    treatmentPercent: 50,
+    seed,
+    policyVersion: oldPolicy,
+    windowStart: '2026-10-22T07:00:00.000Z',
+    windowEnd: '2026-10-23T07:00:00.000Z'
+  }, db);
+  const allPolicies = await computeAdaptivePilotMetrics({
+    windowStart: '2026-10-22T00:00:00.000Z',
+    windowEnd: '2026-10-23T00:00:00.000Z',
+    client: db
+  });
+  assert.ok(allPolicies.arms.CONTROL.assignments >= 1,
+    'the default report must include an assignment that kept its original policy version');
+  const strictCohort = await computeAdaptivePilotMetrics({
+    windowStart: '2026-10-22T00:00:00.000Z',
+    windowEnd: '2026-10-23T00:00:00.000Z',
+    policyVersion: 'adaptive-country-pilot-unreleased',
+    client: db
+  });
+  assert.equal(strictCohort.arms.CONTROL.assignments, 0,
+    'an explicit policy-version filter must remain available for strict cohorts');
+});
+
 maybe('metrics return zero runs for an assignment without completed observations', async () => {
   const db = await requirePool();
   await recordAdaptivePilotAssignment({

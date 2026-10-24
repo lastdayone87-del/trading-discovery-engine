@@ -518,7 +518,15 @@ export async function computeAdaptivePilotMetrics(input: {
   if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
     throw new Error('ADAPTIVE_PILOT_INVALID_WINDOW');
   }
-  const policyVersion = input.policyVersion || ADAPTIVE_PILOT_POLICY_VERSION;
+  // A policy release mid-day reuses the recorded country-day assignment, so
+  // that assignment keeps the policy version that randomized it. Default the
+  // report to every assignment in the window; an explicit policyVersion is an
+  // optional strict-cohort filter, not the default read.
+  const policyVersion = input.policyVersion?.trim() || null;
+  const policyFilter = policyVersion ? 'AND a.policy_version = $3' : '';
+  const params = policyVersion
+    ? [input.windowStart, input.windowEnd, policyVersion]
+    : [input.windowStart, input.windowEnd];
   const db = input.client || (await getDb());
   const result = await db.query(
     `WITH latest_obs AS (
@@ -553,13 +561,13 @@ export async function computeAdaptivePilotMetrics(input: {
       AND o.allocation_at < LEAST(a.window_end, $2::timestamptz)
      WHERE a.window_start < $2
        AND a.window_end > $1
-       AND a.policy_version = $3
+       ${policyFilter}
      GROUP BY a.arm
      ORDER BY a.arm`,
-    [input.windowStart, input.windowEnd, policyVersion]
+    params
   );
   return summarizeAdaptivePilotMetrics({
-    policyVersion,
+    policyVersion: policyVersion || 'ALL',
     windowStart: new Date(startMs).toISOString(),
     windowEnd: new Date(endMs).toISOString(),
     rows: result.rows.map(row => ({

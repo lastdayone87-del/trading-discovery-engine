@@ -79,6 +79,10 @@ capture before any pilot data existed:
   provider failures, matching the evaluation contract.
 - The assignment ledger is unique per `(country, quota_day)`, not per policy
   version; a policy release during the day reuses the recorded arm.
+- The default metrics read includes every assignment overlapping the report
+  window, including days that kept a prior policy version after a mid-day
+  release. Passing an explicit `policyVersion` narrows the read to a strict
+  same-policy cohort; it must not be the default evaluation read.
 - `CREATOR_DERIVED` proposals preserve the canonical country identity (for
   example `United States`, not `UNITED STATES`) in their target dimensions.
   Query authorization resolves curated anchors by exact canonical name; an

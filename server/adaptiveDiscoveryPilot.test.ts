@@ -422,6 +422,29 @@ test('metrics are bounded by the report window and isolated by policy version', 
   assert.equal(metrics.policyVersion, 'adaptive-country-pilot-v2');
 });
 
+test('default metrics include assignments reused across a policy release', async () => {
+  let captured: { sql: string; params: unknown[] } | null = null;
+  const client = {
+    query: async (sql: string, params: unknown[]) => {
+      captured = { sql, params };
+      return { rows: [] };
+    }
+  };
+  const metrics = await computeAdaptivePilotMetrics({
+    windowStart: '2026-10-23T07:00:00.000Z',
+    windowEnd: '2026-10-24T07:00:00.000Z',
+    client
+  });
+  assert.ok(captured);
+  assert.doesNotMatch(captured!.sql, /a\.policy_version =/,
+    'the default read must not hide an assignment that kept its original policy version');
+  assert.deepEqual(captured!.params, [
+    '2026-10-23T07:00:00.000Z',
+    '2026-10-24T07:00:00.000Z'
+  ]);
+  assert.equal(metrics.policyVersion, 'ALL');
+});
+
 test('assignment ledger keeps one arm per country-day across a policy release', () => {
   const migration = readFileSync(new URL('./db/migrations/156_adaptive_discovery_pilot.sql', import.meta.url), 'utf8');
   assert.ok(migration.includes('UNIQUE(country, quota_day)'),
