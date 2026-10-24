@@ -519,6 +519,23 @@ test('a stalled settings read is bounded and fails closed', async () => {
   assert.ok(Date.now() - started < 500, 'the read is bounded by the deadline, not the DB pool');
 });
 
+test('refreshCachedDisabled re-reads a cached OFF enforcement', async () => {
+  resetKeyCapEnforcementCacheForTests();
+  const base = Date.now();
+  assert.equal(await resolveKeyCapEnforcement(async (_key, fallback) => fallback, base), false);
+  let reads = 0;
+  assert.equal(await resolveKeyCapEnforcement(
+    async (key, fallback) => {
+      reads++;
+      return key === ENFORCED_KEY ? 'true' : fallback;
+    },
+    base + 1,
+    undefined,
+    { refreshCachedDisabled: true },
+  ), true);
+  assert.equal(reads, 1, 'a cached OFF value must not hide a concurrent enable');
+});
+
 test('a reservation that crosses Pacific midnight fails closed before dispatch', () => {
   const context: KeyCapReservationContext = {
     mode: 'enforce', quotaDay: '2026-03-08', operationId: 'op-midnight', keyFingerprint: 'fp-midnight', units: 1,
@@ -819,6 +836,58 @@ test('probe reservation fails closed before touching the pool when disabled', as
     (error: unknown) => error instanceof ProbeQuotaDisabledError && error.code === 'PROBE_QUOTA_DISABLED'
   );
   assert.equal(connects, 0);
+});
+
+test('probe reservation force-refreshes a cached OFF enforcement before skipping the key cap', async () => {
+  const previousKey = process.env.YOUTUBE_API_KEY;
+  const previousPerKey = process.env.YOUTUBE_DAILY_QUOTA_PER_KEY;
+  process.env.YOUTUBE_API_KEY = 'test-key';
+  process.env.YOUTUBE_DAILY_QUOTA_PER_KEY = '10000';
+  resetProbeQuotaConfigCacheForTests();
+  resetProbeQuotaExhaustionCacheForTests();
+  resetKeyCapEnforcementCacheForTests();
+  try {
+    const now = new Date('2026-10-20T19:00:00.000Z');
+    assert.equal(await resolveKeyCapEnforcement(async (_key, fallback) => fallback, now.getTime()), false);
+    let keyProjectionChecks = 0;
+    const pool = new FakePool(text => {
+      if (text.includes('pg_advisory_xact_lock')) return { rows: [] };
+      if (text.includes('youtube_key_quota_usage')) {
+        keyProjectionChecks++;
+        return { rows: [{ projected_units: 8999 }] };
+      }
+      if (text.includes('youtube_probe_quota_usage')) return { rows: [{ projected_units: 0 }] };
+      if (text.includes('SELECT key_fingerprint, reserved_units, allocation')) return { rows: [] };
+      if (text.includes('INSERT INTO youtube_key_cap_shadow_leases')) {
+        return { rows: [{ id: 'lease-1' }], rowCount: 1 };
+      }
+      return { rows: [] };
+    });
+    const reader = async (key: string, fallback: string): Promise<string> => {
+      if (key === 'youtube_probe_official_quota_enabled') return 'true';
+      if (key === 'youtube_probe_daily_cap_units') return '100';
+      if (key === ENFORCED_KEY) return 'true';
+      return fallback;
+    };
+    await assert.rejects(
+      reserveProbeQuota({ readSetting: reader, pool }, {
+        keyFingerprint: 'fp-cached-off',
+        operationId: 'op-cached-off',
+        units: 2,
+        now,
+      }),
+      (error: unknown) => error instanceof YouTubeKeyCapExceededError,
+    );
+    assert.equal(keyProjectionChecks, 1, 'the probe reservation must apply the 9,000-unit projection after enforcement is enabled');
+  } finally {
+    if (previousKey === undefined) delete process.env.YOUTUBE_API_KEY;
+    else process.env.YOUTUBE_API_KEY = previousKey;
+    if (previousPerKey === undefined) delete process.env.YOUTUBE_DAILY_QUOTA_PER_KEY;
+    else process.env.YOUTUBE_DAILY_QUOTA_PER_KEY = previousPerKey;
+    resetProbeQuotaConfigCacheForTests();
+    resetProbeQuotaExhaustionCacheForTests();
+    resetKeyCapEnforcementCacheForTests();
+  }
 });
 
 test('probe settlement uses the exact probe lease and rejects unit mismatch', async () => {

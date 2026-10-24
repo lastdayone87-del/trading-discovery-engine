@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getChannelById, getDb, upsertChannel, writeChannelUpsert } from './db';
+import { runWithOfficialYouTubeQuotaOrigin } from './officialYouTubeQuotaFence';
 
 const enabled = Boolean(process.env.DATABASE_URL);
 const maybe = enabled ? test : test.skip;
@@ -162,4 +163,53 @@ maybe('classification-only upsert preserves a Discord row inserted between its r
   assert.equal(row?.discord_liveness_status, 'ACTIVE');
   assert.equal(row?.discord_validation_status, 'COMPLETED');
   assert.equal(row?.channel_name, 'classification after concurrent insert', 'non-Discord fields still come from the classification write');
+});
+
+maybe('quota origin is insert-only: probe rediscovery never rewrites an existing marker', async t => {
+  const db = await getDb();
+  const normalId = `${PREFIX}quota-normal-${Date.now()}_${process.pid}`;
+  const probeId = `${PREFIX}quota-probe-${Date.now()}_${process.pid}`;
+  const cleanup = async () => {
+    await db.query(`DELETE FROM channels WHERE channel_id = ANY($1::text[])`, [[normalId, probeId]]).catch(() => undefined);
+  };
+  await cleanup();
+  t.after(cleanup);
+
+  const base = {
+    channel_id: normalId,
+    channel_name: 'quota origin fixture',
+    youtube_url: `https://youtube.test/${normalId}`,
+    country: 'Germany',
+    country_status: 'CONFIRMED',
+    confidence_score: 90,
+    discord_status: 'NOT_FOUND',
+    discord_invite: null,
+    scan_status: 'COMPLETED',
+    discovery_source: 'probe',
+    trading_status: 'TRADING_CONFIRMED',
+    quota_origin: 'NORMAL',
+  } as any;
+
+  await upsertChannel(base);
+  await runWithOfficialYouTubeQuotaOrigin('PROBE', 'quota-origin-test', () =>
+    upsertChannel({ ...base, subscriber_count: 123 } as any),
+  );
+  assert.equal(
+    (await getChannelById(normalId))?.quota_origin,
+    'NORMAL',
+    'a probe run that rediscovers an established NORMAL channel must not move it to the probe bucket',
+  );
+
+  const probeBase = { ...base, channel_id: probeId, quota_origin: 'PROBE' } as any;
+  await runWithOfficialYouTubeQuotaOrigin('PROBE', 'quota-origin-test', () => upsertChannel(probeBase));
+  assert.equal((await getChannelById(probeId))?.quota_origin, 'PROBE', 'a probe-created row keeps PROBE');
+
+  await runWithOfficialYouTubeQuotaOrigin('NORMAL', 'quota-origin-test', () =>
+    upsertChannel({ ...probeBase, subscriber_count: 456 } as any),
+  );
+  assert.equal(
+    (await getChannelById(probeId))?.quota_origin,
+    'PROBE',
+    'a normal upsert must not downgrade a PROBE row',
+  );
 });

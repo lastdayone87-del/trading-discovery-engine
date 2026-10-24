@@ -417,8 +417,19 @@ export async function resolveKeyCapEnforcement(
   readSetting: ShadowSettingReader,
   now: number = Date.now(),
   timeoutMs: number = SETTINGS_READ_TIMEOUT_MS,
+  options: { refreshCachedDisabled?: boolean } = {},
 ): Promise<boolean> {
-  if (cachedEnforcement && now - cachedEnforcement.at < SHADOW_CONFIG_TTL_MS) return cachedEnforcement.enabled;
+  // A cached OFF value is safe for ordinary dispatch, but a probe reservation
+  // can be the first writer after an operator enables the hard cap. It must
+  // re-read the setting: otherwise it skips the per-key 9,000-unit projection
+  // for up to the cache TTL and can over-admit an enforced key.
+  if (
+    cachedEnforcement &&
+    now - cachedEnforcement.at < SHADOW_CONFIG_TTL_MS &&
+    !(options.refreshCachedDisabled && !cachedEnforcement.enabled)
+  ) {
+    return cachedEnforcement.enabled;
+  }
   try {
     const raw = await readSettingWithDeadline(
       readSetting(ENFORCED_KEY, 'false'),
@@ -1238,7 +1249,12 @@ export async function reserveProbeQuota(
     // per-key lease: check the per-key projection inside this same transaction
     // instead of inserting a second lease for the same units. This keeps both
     // controls atomic and avoids double-counting probe spend in the key cap.
-    if (await resolveKeyCapEnforcement(deps.readSetting, now.getTime())) {
+    if (await resolveKeyCapEnforcement(
+      deps.readSetting,
+      now.getTime(),
+      SETTINGS_READ_TIMEOUT_MS,
+      { refreshCachedDisabled: true },
+    )) {
       const keyProjected = await client.query(PROJECTED_SQL, [quotaDay, keyFingerprint, now]);
       const keyProjectedBefore = Number(keyProjected.rows[0]?.projected_units ?? 0);
       if (!Number.isFinite(keyProjectedBefore) || keyProjectedBefore + units > ENFORCED_CAP_UNITS) {

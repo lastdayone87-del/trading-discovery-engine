@@ -75,6 +75,7 @@ import { completeInvestigationStep, failInvestigationStep, heartbeatInvestigatio
 import { ChannelRecord, CountryStatus, DiscoverySource, SearchJob, InspectionStep, DiscordStatus } from '../src/types';
 import {
   OfficialYouTubeQuotaFenceError,
+  currentOfficialYouTubeQuotaOrigin,
   runWithOfficialYouTubeQuotaOrigin,
 } from './officialYouTubeQuotaFence';
 import { resolveJobQuotaOrigin } from './quotaOrigin';
@@ -801,8 +802,8 @@ export async function processNextSearchJob(
       await completeJob(job.id);
       return true;
     }
-    if(job.type==='INSPECT_PLAYLIST'){await processPlaylistInspectionJob(job,processDiscoveredChannel);return true;}
-    if(job.type==='INSPECT_FEATURED_CHANNELS'){await processFeaturedChannelInspectionJob(job,processDiscoveredChannel);return true;}
+    if(job.type==='INSPECT_PLAYLIST'){await processPlaylistInspectionJob(job,processDiscoveredChannelContained);return true;}
+    if(job.type==='INSPECT_FEATURED_CHANNELS'){await processFeaturedChannelInspectionJob(job,processDiscoveredChannelContained);return true;}
     if(job.type==='RELATIONSHIP_CANARY_EXPANSION'){
       await handleRelationshipCanaryExpansionJob(job, undefined, { workerId, attemptNumber: job.attempts });return true;
     }
@@ -1266,7 +1267,10 @@ export async function processNextSearchJob(
         country,declaredLanguage:raw.detectedLanguages?.[0]?.language,retrievalLane,searchOrdering,pageNumber,resultRank:index+1,
         matchedDocument:raw.matchedDocument||{type:'UNKNOWN'},rawObservation:{channelName:raw.channelName,youtubeUrl:raw.youtubeUrl,locationTag:raw.locationTag||null}},'INVESTIGATION_QUEUED');
       raw.nominationId=nomination.id||undefined;raw.queryRunId=queryRunId;raw.discoveryJobId=job.id;
-      const outcome = await processDiscoveredChannel(raw, country, source, { forceExtraction: isRepairEligibleRetry(job) });
+      const outcome = await processDiscoveredChannelContained(raw, country, source, { forceExtraction: isRepairEligibleRetry(job) });
+      // A sticky-PROBE channel refused by its own allocation is deferred for
+      // this run; the rest of the NORMAL page must still be processed.
+      if (!outcome) continue;
       const funnelOutcome: FunnelOutcome = outcome.countryStatus === 'REJECTED'
         ? 'COUNTRY_REJECTED'
         : outcome.tradingStatus === 'HUMAN_REJECTED' ? 'NON_TRADING' : outcome.tradingStatus;
@@ -1665,6 +1669,47 @@ export async function processDiscoveredChannel(
   options?: { forceExtraction?: boolean }
 ): Promise<ProcessDiscoveredChannelOutcome> {
   return processChannelThroughPipeline(raw, targetCountry, source, false, false, options);
+}
+
+/**
+ * Contains a probe-origin quota refusal inside a normal-origin batch.
+ *
+ * Search, manual-search, playlist and featured-channel workers process a page
+ * serially. A sticky-PROBE channel may be refused before dispatch when the
+ * probe allocation is disabled/exhausted; that policy wait must not abort the
+ * remaining NORMAL channels or make the page retry and spend its quota again.
+ * Probe-origin jobs still propagate the refusal so the queue can defer them.
+ */
+export function shouldContainProbeQuotaRefusal(
+  error: unknown,
+  jobOrigin: 'NORMAL' | 'PROBE' | 'UNKNOWN' = currentOfficialYouTubeQuotaOrigin(),
+): boolean {
+  return jobOrigin === 'NORMAL' && probeQuotaControlInChain(error) !== null;
+}
+
+export async function processDiscoveredChannelContained(
+  raw: DiscoveredChannelRaw,
+  targetCountry: string,
+  source: DiscoverySource,
+  options?: { forceExtraction?: boolean },
+): Promise<ProcessDiscoveredChannelOutcome | null> {
+  try {
+    return await processDiscoveredChannel(raw, targetCountry, source, options);
+  } catch (error) {
+    if (!shouldContainProbeQuotaRefusal(error)) throw error;
+    const control = probeQuotaControlInChain(error);
+    console.warn(JSON.stringify({
+      event: 'probe_quota_channel_deferred',
+      channelId: raw.channelId,
+      source,
+      targetCountry,
+      code: String((control as any)?.code || 'PROBE_QUOTA_DEFERRED'),
+      reason: String((control as any)?.message || control).slice(0, 300),
+      jobOrigin: currentOfficialYouTubeQuotaOrigin(),
+      timestamp: new Date().toISOString(),
+    }));
+    return null;
+  }
 }
 
 /**
@@ -3029,7 +3074,8 @@ async function executeManualSearchPage(sessionId: string, pageNumber: number, pa
         queryGenerationMode:'OPERATOR_DIRECTED',country:session.country,retrievalLane:session.retrievalLane,pageNumber,resultRank:index+1,
         matchedDocument:raw.matchedDocument||{type:'MANUAL'},rawObservation:{channelName:raw.channelName,youtubeUrl:raw.youtubeUrl,sessionId,variantIndex}},'INVESTIGATION_QUEUED');
       raw.nominationId=nomination.id||undefined;
-      const outcome = await processDiscoveredChannel(raw, session.country, 'manual_search');
+      const outcome = await processDiscoveredChannelContained(raw, session.country, 'manual_search');
+      if (!outcome) continue;
       if (outcome.wasKnown) knownIds.push(outcome.channelId);
       if (outcome.persisted && outcome.countryStatus !== 'REJECTED') acceptedIds.push(outcome.channelId);
       if (outcome.countryStatus !== 'REJECTED') countryAccepted++;

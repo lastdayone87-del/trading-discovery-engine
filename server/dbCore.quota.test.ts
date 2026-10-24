@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { claimYouTubeQuotaOperation } from './dbCore';
 
 interface MockState {
@@ -312,4 +313,32 @@ test('manual recheck preserves probe policy waits through provider wrapping', as
     assert.equal(decision.disposition, 'RETRYING_WITHOUT_ATTEMPT');
     assert.equal(decision.runAfter, classified.retryAt);
   }
+});
+
+test('normal-origin batches contain probe channel refusals; probe jobs still defer', async () => {
+  const { shouldContainProbeQuotaRefusal } = await import('./queueManager');
+  const { ProbeQuotaDisabledError } = await import('./quotaKeyCapShadow');
+  const { runWithOfficialYouTubeQuotaOrigin } = await import('./officialYouTubeQuotaFence');
+  const refusal = new ProbeQuotaDisabledError('2026-10-20');
+
+  assert.equal(shouldContainProbeQuotaRefusal(refusal, 'NORMAL'), true);
+  assert.equal(shouldContainProbeQuotaRefusal(refusal, 'PROBE'), false);
+  assert.equal(shouldContainProbeQuotaRefusal(refusal, 'UNKNOWN'), false);
+  assert.equal(
+    shouldContainProbeQuotaRefusal(Object.assign(new Error('provider wrapper'), { cause: refusal }), 'NORMAL'),
+    true,
+    'a wrapped probe marker is recovered from the cause chain',
+  );
+  assert.equal(shouldContainProbeQuotaRefusal(new Error('ordinary provider failure'), 'NORMAL'), false);
+  assert.equal(
+    runWithOfficialYouTubeQuotaOrigin('PROBE', 'test', () => shouldContainProbeQuotaRefusal(refusal)),
+    false,
+    'a probe-origin job must let the refusal reach the queue deferral',
+  );
+
+  const source = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  assert.match(source, /processPlaylistInspectionJob\(job,processDiscoveredChannelContained\)/);
+  assert.match(source, /processFeaturedChannelInspectionJob\(job,processDiscoveredChannelContained\)/);
+  assert.match(source, /const outcome = await processDiscoveredChannelContained\(raw, country, source/);
+  assert.match(source, /const outcome = await processDiscoveredChannelContained\(raw, session\.country, 'manual_search'\)/);
 });
