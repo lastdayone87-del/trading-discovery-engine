@@ -113,6 +113,10 @@ export const youtubePoolBackoff = new YouTubePoolBackoff({
 export function isQuotaExceeded(error: unknown): boolean {
   let current: any = error;
   for (let depth = 0; current && depth < 5; depth++, current = current.cause) {
+    // Local hard-cap exhaustion is an admission signal, not a provider quota
+    // error or a dead key. Callers still need to classify it as exhausted so
+    // they do not burn retry attempts on the same capped pool.
+    if (current.keyCapExceeded === true) return true;
     if (current.quotaExceeded === true || /quotaExceeded|dailyLimitExceeded/i.test(String(current.message ?? ''))) return true;
   }
   return false;

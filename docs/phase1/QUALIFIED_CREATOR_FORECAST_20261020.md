@@ -1,4 +1,4 @@
-# Qualified-creator forecast and dates — 2026-10-20
+# Qualified-creator forecast and dates — 2026-10-21
 
 Status: **conditional forecast, not a promise and not an activation request.**
 Under the current InnerTube policy there is **no authorized production date**.
@@ -46,27 +46,33 @@ points as guaranteed dates.
 
 Assumptions for the conditional dates:
 
-- PR #531 is merged and deployed through the approved path.
+- PR #533 is merged and the pilot stack is deployed through the approved path,
+  default OFF.
+- Thread 77 has a reviewed, structural no-official-spend fence.
 - The InnerTube policy is replaced by written authorization, or a separately
-  reviewed official-route implementation is approved. Neither exists today.
-- Explicit activation approval is given at **2026-10-21 07:00Z**
-  (2026-10-21 00:00 America/Los_Angeles).
+  reviewed official-route replacement is approved. Neither exists today.
+- Explicit activation approval is given before the first probe, not before this
+  report.
 - The single-country cap is 10 probes per UTC day; probes execute immediately
   when capacity opens. The total cap is 30.
 
 | Milestone | Conditional earliest | Basis / confidence |
 | --- | --- | --- |
-| First authorized probe | **2026-10-21 07:00Z** | Immediately after the assumed approval; **low confidence**, because approvals and prerequisites do not exist |
-| 20th probe (existence check) | **2026-10-22 00:00Z** | 10 on UTC 10/21 + 10 on UTC 10/22; earliest possible scheduling |
-| 30th probe / canary data complete | **2026-10-23 00:00Z** | 10 per UTC day for 10/21, 10/22, 10/23 |
-| Earliest defensible canary decision | **2026-10-23** (review after the 30th probe) | Requires the safety gates and persistence audit; **low confidence** until a probe baseline exists |
-| Earliest possible first persisted qualified creator | **2026-10-21** | First probe could succeed; probability is low at any plausible `p` |
-| Full 72-hour observation, if required | **2026-10-24 07:00Z** | 72h after the assumed start; **not code-enforced** (deadline must be configured) |
+| Integration/pilot-stack deployment | **2026-10-26** | Default OFF; requires merge/deploy approval and verified migration state; **low confidence** |
+| First authorized probe | **2026-10-27** | Only after policy authorization, Thread 77 fence, and explicit activation; **low confidence** because none exists today |
+| 20th probe (existence check) | **2026-10-28** | 10 on UTC 10/27 + 10 on UTC 10/28; earliest possible scheduling |
+| 30th probe / tranche data complete | **2026-10-29** | 10 per UTC day for 10/27, 10/28, 10/29 |
+| Earliest defensible canary decision | **2026-10-30** | After the 30th probe, persistence audit, and 72-hour observation; **low confidence** |
+| Earliest possible first persisted qualified creator | **2026-10-27** | First probe could succeed; probability depends on unmeasured `p` |
+| Full 72-hour observation, if required | **2026-10-30 07:00Z** | 72h after a 10/27 07:00Z start; **not code-enforced** (deadline must be configured) |
 
-No date is defensible under the current InnerTube policy. The suspended-key
-retry date (2026-10-22) does not create a probe path: the probe executor rejects
-the official route, and the hard cap remains default OFF pending separate
-approval.
+**24 October is not a deployment date.** It was only the hypothetical end of a
+72-hour observation if a pilot had started on 21 October; no pilot started.
+**26 October is the earliest conditional deployment of the pilot stack with
+flags OFF, not an activation date.** No date is defensible under the current
+InnerTube policy. The suspended-key retry date (2026-10-22) does not create a
+probe path: the probe executor rejects the official route, Thread 77 is not
+fenced, and the hard cap remains default OFF pending separate approval.
 
 ## What would change the forecast
 

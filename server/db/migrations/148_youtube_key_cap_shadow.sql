@@ -1,12 +1,13 @@
--- Migration 148: YouTube per-key daily cap — SHADOW accounting (inert).
+-- Migration 148: YouTube per-key daily cap — shared lease/event storage.
 --
--- Observational only. The guard flag `youtube_key_cap_shadow_enabled` is
--- operator-managed and ABSENT => OFF; this migration creates no app_settings
--- row and no hard-enforcement path. When enabled, hooks record in-flight
--- leases and WOULD_DEFER/WOULD_REJECT events for a projected 9,000-unit/day
--- per-key cap. They never block, defer, retry or alter official API traffic,
--- key configuration or provider dispatch. Hard enforcement remains gated on
--- explicit operator approval.
+-- Shared by observational shadow accounting and the separate, default-OFF
+-- hard-cap code path. This migration creates no app_settings row. Both flags
+-- are operator-managed and ABSENT => OFF. Shadow hooks record in-flight leases
+-- and WOULD_DEFER/WOULD_REJECT events for a projected 9,000-unit/day per-key
+-- cap; shadow never blocks, defers, retries or alters official API traffic,
+-- key configuration or provider dispatch. Hard enforcement reserves the same
+-- lease rows only when its flag is explicitly true, and remains gated on
+-- operator approval. The migration itself changes no traffic.
 --
 -- quota_day is TEXT for parity with youtube_key_quota_usage.quota_day.
 
@@ -46,6 +47,6 @@ CREATE INDEX IF NOT EXISTS youtube_key_cap_shadow_events_created_idx
   ON youtube_key_cap_shadow_events (created_at);
 
 COMMENT ON TABLE youtube_key_cap_shadow_leases IS
-  'In-flight YouTube per-key quota leases for shadow cap accounting. Inert unless youtube_key_cap_shadow_enabled=true; never blocks traffic.';
+  'In-flight YouTube per-key quota leases for shadow accounting and the separate default-OFF hard-cap path. The migration creates no flag and changes no traffic.';
 COMMENT ON TABLE youtube_key_cap_shadow_events IS
   'Projected WOULD_DEFER/WOULD_REJECT observations for a 9000-unit/day per-key YouTube cap. Observational only; no enforcement.';

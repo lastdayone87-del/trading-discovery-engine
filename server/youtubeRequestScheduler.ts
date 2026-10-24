@@ -46,6 +46,19 @@ interface RuntimeRateLimitObservation {
 
 const sleepFor = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
+/**
+ * A dispatch that already holds a quota reservation must not be replayed by
+ * the scheduler on a raw 429: every replay would reserve another full request
+ * cost while the failed lease remains conservatively held until reset. Walk
+ * the cause chain because executeProviderCall wraps the tagged provider error.
+ */
+function quotaReservationRetryBounded(error: unknown, depth = 0): boolean {
+  if (!error || typeof error !== 'object' || depth > 4) return false;
+  const candidate = error as { youtubeQuotaReservationRetryBounded?: unknown; cause?: unknown };
+  return candidate.youtubeQuotaReservationRetryBounded === true
+    || quotaReservationRetryBounded(candidate.cause, depth + 1);
+}
+
 function sharedRuntimeCoolingDelayMs(error: unknown): number | null {
   if (!error || typeof error !== 'object') return null;
   const candidate = error as { code?: unknown; retryable?: unknown; retryAfterMs?: unknown };
@@ -274,6 +287,11 @@ export class YouTubeRequestScheduler {
         }
 
         this.noteRuntimeRateLimit(details, actualSpacingMs, request.priority, request.trace);
+        if (quotaReservationRetryBounded(error)) {
+          request.trace?.('quota-reserved-runtime-rate-limit-no-retry');
+          request.reject(error);
+          return;
+        }
         const maxRetries = this.runtimeRetryLimit();
         if (runtimeRateLimitRetries >= maxRetries) {
           if (error && typeof error === 'object') Object.assign(error, { code: 'YOUTUBE_RUNTIME_RATE_PRESSURE', retryable: true });

@@ -2,7 +2,16 @@ import { randomUUID } from 'node:crypto';
 import { ChannelActivityBand, CountryMetadataStatus, CountryVocabulary } from '../src/types';
 import { incrementQuota, getAppSetting, getDb, getYouTubeKeyPool, appendProviderCallEvent, recordYouTubeInvalidInput, isYouTubeInputQuarantined, recordYouTubeProviderSuspension } from './db';
 import { fingerprintYouTubeKey } from './youtubeQuotaAttribution';
-import { recordShadowDispatchSafe, SHADOW_OBSERVATION_BUDGET_MS } from './quotaKeyCapShadow';
+import {
+  assertKeyCapReservationDayCurrent,
+  isYouTubeKeyCapError,
+  recordShadowDispatchSafe,
+  reserveEnforcedKeyCap,
+  resolveKeyCapEnforcement,
+  settleKeyCapReservation,
+  SHADOW_OBSERVATION_BUDGET_MS,
+  type KeyCapReservationContext,
+} from './quotaKeyCapShadow';
 import { getConfiguredYouTubeProviders, getYouTubeQuotaGroupForKey } from './youtubeKeyPool';
 import {
   YOUTUBE_INPUT_QUARANTINE_TTL_MS,
@@ -180,15 +189,36 @@ export async function fetchYouTubeFeaturedChannels(sourceChannelId: string, maxi
   if (!/^UC[A-Za-z0-9_-]{22}$/.test(sourceChannelId) || !Number.isInteger(maximumFanout) || maximumFanout < 1 || maximumFanout > 10) throw new Error('INVALID_FEATURED_CHANNEL_PROVIDER_INPUT');
   const keys = getYouTubeKeyPool(); if (!keys.length) throw new Error('YouTube featured-channel inspection requires an API key.');
   const acquisition = youtubePoolBackoff.beginAcquisition();
+  let quotaExceededCount = 0;
   try {
-    const index = availableKeyIndexes(keys)[0];
-    const url = buildYouTubeApiUrl('channelSections', keys[index], { part: 'snippet,contentDetails', channelId: sourceChannelId, maxResults: Math.min(50, maximumFanout) });
-    let response: Response;
-    try {
-      response = await youtubeFetch(url, 'featured-channel-sections', FEATURED_CHANNEL_PROVIDER_COST, 1, acquisition, 'enrichment', keys[index]);
-    } catch (error) { recordProviderFailure(keys[index], error); acquisition.providerFailed(isQuotaExceeded(error) ? 'QUOTA_EXHAUSTED' : 'INDETERMINATE'); throw error; }
-    await incrementQuota(FEATURED_CHANNEL_PROVIDER_COST, getYouTubeResponseProviderKey(response), undefined, getYouTubeResponseShadowOperationId(response));
-    return parseFeaturedChannelSections({ sourceChannelId, maximumFanout, response: await readYouTubeJsonObject(response, 'featured-channel-sections'), observedAt: new Date().toISOString() });
+    const providerIndexes = availableKeyIndexes(keys);
+    for (let attempt = 0; attempt < providerIndexes.length; attempt++) {
+      const index = providerIndexes[attempt];
+      const apiKey = keys[index];
+      let responseAccounted = false;
+      try {
+        const url = buildYouTubeApiUrl('channelSections', apiKey, { part: 'snippet,contentDetails', channelId: sourceChannelId, maxResults: Math.min(50, maximumFanout) });
+        const response = await youtubeFetch(url, 'featured-channel-sections', FEATURED_CHANNEL_PROVIDER_COST, attempt + 1, acquisition, 'enrichment', apiKey);
+        await accountYouTubeQuotaResponse(response, FEATURED_CHANNEL_PROVIDER_COST);
+        responseAccounted = true;
+        return parseFeaturedChannelSections({ sourceChannelId, maximumFanout, response: await readYouTubeJsonObject(response, 'featured-channel-sections'), observedAt: new Date().toISOString() });
+      } catch (error) {
+        // A successful provider response that cannot be accounted must not be
+        // retried on another key: the first call may already have spent units.
+        // The same applies to a response that was accounted and then failed
+        // body validation/parsing: refetching would charge a second request
+        // against one job reservation.
+        if (responseAccounted || isYouTubeQuotaAccountingError(error)) throw error;
+        recordProviderFailure(apiKey, error);
+        if (isQuotaExceeded(error)) quotaExceededCount++;
+        if (attempt === providerIndexes.length - 1) {
+          acquisition.providerFailed(quotaExceededCount === providerIndexes.length ? 'QUOTA_EXHAUSTED' : 'INDETERMINATE');
+          throwIfAllProvidersCoolingDown(keys);
+          throw error;
+        }
+      }
+    }
+    throw new Error('All configured YouTube API keys failed for featured-channel inspection.');
   } finally { acquisition.release(); }
 }
 
@@ -199,10 +229,10 @@ export async function fetchYouTubePlaylistChannels(playlistId:string,limit:numbe
   const maxResults=Math.min(50,Math.max(1,Math.trunc(limit)));const observedAt=new Date().toISOString();
   try {
     const providerIndexes=availableKeyIndexes(keys);
-    for(let attempt=0;attempt<providerIndexes.length;attempt++){const index=providerIndexes[attempt];
-      try{const url=buildYouTubeApiUrl('playlistItems',keys[index],{part:'snippet',playlistId,maxResults});const response=await youtubeFetch(url,'playlist-items',1,attempt+1,acquisition,'enrichment',keys[index]);const data=await readYouTubeJsonObject(response, 'playlist-items');await incrementQuota(1, getYouTubeResponseProviderKey(response), undefined, getYouTubeResponseShadowOperationId(response));
+    for(let attempt=0;attempt<providerIndexes.length;attempt++){const index=providerIndexes[attempt];let responseAccounted=false;
+      try{const url=buildYouTubeApiUrl('playlistItems',keys[index],{part:'snippet',playlistId,maxResults});const response=await youtubeFetch(url,'playlist-items',1,attempt+1,acquisition,'enrichment',keys[index]);await accountYouTubeQuotaResponse(response, 1);responseAccounted=true;const data=await readYouTubeJsonObject(response, 'playlist-items');
         return (data.items||[]).map((item:any)=>({channelId:String(item.snippet?.videoOwnerChannelId||''),channelName:String(item.snippet?.videoOwnerChannelTitle||''),description:String(item.snippet?.description||''),videoTitles:[String(item.snippet?.title||'')],observedAt})).filter((x:PlaylistChannelObservation)=>x.channelId&&x.channelName);
-      }catch(error){recordProviderFailure(keys[index],error);if(isQuotaExceeded(error))quotaExceededCount++;if(attempt===providerIndexes.length-1){acquisition.providerFailed(quotaExceededCount===providerIndexes.length?'QUOTA_EXHAUSTED':'INDETERMINATE');throwIfAllProvidersCoolingDown(keys);throw error;}}
+      }catch(error){if(responseAccounted||isYouTubeQuotaAccountingError(error))throw error;recordProviderFailure(keys[index],error);if(isQuotaExceeded(error))quotaExceededCount++;if(attempt===providerIndexes.length-1){acquisition.providerFailed(quotaExceededCount===providerIndexes.length?'QUOTA_EXHAUSTED':'INDETERMINATE');throwIfAllProvidersCoolingDown(keys);throw error;}}
     }throw new Error('All configured YouTube API keys failed for playlist inspection.');
   } finally { acquisition.release(); }
 }
@@ -214,7 +244,7 @@ export async function fetchYouTubePlaylistChannels(playlistId:string,limit:numbe
 let activeKeyIndex = 0;
 let outboundTraceSequence = 0;
 const failedDispatchProvidersByAcquisition = new WeakMap<object, Set<string>>();
-const youtubeResponseProviderContext = new WeakMap<Response, { providerKey?: string; acquisition?: YouTubePoolAcquisition; providerFailureGeneration?: number }>();
+const youtubeResponseProviderContext = new WeakMap<Response, { providerKey?: string; acquisition?: YouTubePoolAcquisition; providerFailureGeneration?: number; keyCapReservation?: KeyCapReservationContext }>();
 
 function failedDispatchProviders(acquisition?: YouTubePoolAcquisition): Set<string> | undefined {
   if (!acquisition || (typeof acquisition !== 'object' && typeof acquisition !== 'function')) return undefined;
@@ -402,6 +432,12 @@ async function joinShadowObservation(
   }
 }
 
+function preDispatchAbortError(signal:AbortSignal):Error{
+  const error=Object.assign(new Error('YouTube provider call was cancelled before dispatch.'),{name:'AbortError'});
+  if(signal.reason!==undefined)(error as Error & {cause?:unknown}).cause=signal.reason;
+  return error;
+}
+
 async function youtubeFetch(url:string,operation:string,actualCost:number,attempt=1,acquisition?:YouTubePoolAcquisition,priority:YouTubeRequestPriority='enrichment',providerKey?:string,lifecycle?:YouTubeProviderLifecycle):Promise<Response>{
   const traceId = `${operation}-${attempt}-${++outboundTraceSequence}`;
   let providerDispatchAttempt = 0;
@@ -469,9 +505,46 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
         // wire, this response must compare stale (not current) when the
         // reader validates it below.
         const dispatchFailureGeneration=dispatchedProviderKey?youtubeProviderCooldown.failureGeneration(dispatchedProviderKey):undefined;
+        // Hard cap ON: reserve before the official HTTP request. Settings,
+        // database, lock and capacity failures are fatal here (fail closed).
+        // Enforcement OFF keeps the observational shadow path below unchanged.
+        let capReservation: KeyCapReservationContext | null = null;
         if(dispatchedProviderKey){
-          // Shadow-only cap observation (never blocks or alters dispatch):
-          // record an in-flight lease plus any projected WOULD_DEFER/
+          try {
+            if(await resolveKeyCapEnforcement(getAppSetting)){
+              const capNow=new Date();
+              capReservation=await reserveEnforcedKeyCap(
+                {readSetting:getAppSetting,pool:await getDb()},
+                {keyFingerprint:fingerprintYouTubeKey(dispatchedProviderKey),operationId:`cap:${operation}:${randomUUID()}`,units:actualCost,now:capNow}
+              );
+            }
+          } catch(error) {
+            failedDispatchProviders(acquisition)?.add(dispatchedProviderKey);
+            throw error;
+          }
+        }
+        if(capReservation){
+          // The reservation transaction may have waited across Pacific
+          // midnight. Do not send a new-day request against yesterday's
+          // capacity; fail closed and let the caller retry. Release the exact
+          // lease first so a refused dispatch cannot hold capacity until reset.
+          try{assertKeyCapReservationDayCurrent(capReservation, new Date());}
+          catch(error){
+            try{const pool=await getDb();await settleKeyCapReservation(pool,capReservation);}catch{/* expiry remains the backstop */}
+            throw error;
+          }
+        }
+        if(signal.aborted){
+          // Reservation work can outlive the provider deadline. fetch() would
+          // abort without dispatching, so release the exact lease instead of
+          // leaving admitted capacity stranded until the Pacific reset.
+          if(capReservation){
+            try{const pool=await getDb();await settleKeyCapReservation(pool,capReservation);}catch{/* expiry remains the backstop */}
+          }
+          throw preDispatchAbortError(signal);
+        }
+        if(dispatchedProviderKey && !capReservation){
+          // Shadow-only cap observation (never blocks or alters dispatch):          // record an in-flight lease plus any projected WOULD_DEFER/
           // WOULD_REJECT for the 9,000-unit/day per-key cap. Disabled by
           // default; every failure is swallowed inside the helper.
           //
@@ -516,6 +589,15 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
           if(dispatchedProviderKey){
             const consumerSuspended=isConsumerSuspended(error);
             const runtimeRateLimited=isYouTubeRateLimited(error);
+            // A quota reservation was already written for this dispatch. Do
+            // not let the scheduler re-run the whole dispatch closure up to
+            // 30 times on raw 429s: each retry would reserve another full
+            // request cost while the failed leases remain conservative until
+            // reset. Surface it once and let the caller's bounded key
+            // failover decide whether another provider is worth trying.
+            if(runtimeRateLimited&&capReservation&&error&&typeof error==='object'){
+              Object.assign(error,{youtubeQuotaReservationRetryBounded:true});
+            }
             if(!runtimeRateLimited)failedDispatchProviders(acquisition)?.add(dispatchedProviderKey);
             if(consumerSuspended)youtubeProviderCooldown.failed(dispatchedProviderKey,'CONSUMER_SUSPENDED');
             // A dead API key is unusable like a suspended one: quarantine it for
@@ -540,7 +622,7 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
           }
           throw error;
         }
-        youtubeResponseProviderContext.set(response,{providerKey:dispatchedProviderKey,acquisition,providerFailureGeneration:dispatchFailureGeneration});
+        youtubeResponseProviderContext.set(response,{providerKey:dispatchedProviderKey,acquisition,providerFailureGeneration:dispatchFailureGeneration,keyCapReservation:capReservation ?? undefined});
         return response;
       }});
     }, trace, priority);
@@ -557,6 +639,19 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
     return response;
   } catch(error) {
     shadowAbort?.abort();
+    // executeProviderCall normalizes unknown failures into ProviderCallError.
+    // Cap admission failures are control-flow signals, not provider failures:
+    // unwrap them so callers can see YOUTUBE_KEY_CAP_EXCEEDED/UNAVAILABLE and
+    // never mark the key suspended.
+    const capError = isYouTubeKeyCapError(error)
+      ? error
+      : isYouTubeKeyCapError((error as any)?.cause)
+        ? (error as any).cause
+        : null;
+    if(capError&&typeof capError==='object'){
+      if(dispatchedProviderKey)(capError as any).providerKey=dispatchedProviderKey;
+      throw capError;
+    }
     if(dispatchedProviderKey&&error&&typeof error==='object'){
       const wrappedCause=(error as any).cause;
       const providerFailureRecorded=(error as any).providerFailureRecorded===true||(wrappedCause&&typeof wrappedCause==='object'&&(wrappedCause as any).providerFailureRecorded===true);
@@ -772,8 +867,8 @@ export async function resolveYouTubeLocatorAuthoritatively(identity: string, typ
         : buildYouTubeApiUrl('videos', apiKey, { part: 'snippet', id: identity });
       try {
         const response = await youtubeFetch(url, `resolve-${type.toLowerCase()}`, 1, attempt + 1, acquisition, 'enrichment', apiKey);
+        await accountYouTubeQuotaResponse(response, 1);
         const data = await readYouTubeJsonObject(response, `resolve-${type.toLowerCase()}`);
-        await incrementQuota(1, getYouTubeResponseProviderKey(response), undefined, getYouTubeResponseShadowOperationId(response));
         const channelId = type === 'HANDLE' ? data.items?.[0]?.id : data.items?.[0]?.snippet?.channelId;
         if (typeof channelId === 'string' && /^UC[A-Za-z0-9_-]{22}$/.test(channelId)) return channelId;
         return null;
@@ -852,7 +947,7 @@ export async function searchYouTubeChannelPage(
 
         if (res.ok) {
           console.log(`[YouTube Outbound Trace] search-${attempt + 1} before quota-write at server/youtube.ts:261`);
-          await incrementQuota(100, getYouTubeResponseProviderKey(res), undefined, getYouTubeResponseShadowOperationId(res)); // 100 units for YouTube Search call
+          await accountYouTubeQuotaResponse(res, 100); // 100 units for YouTube Search call
           console.log(`[YouTube Outbound Trace] search-${attempt + 1} after quota-write at server/youtube.ts:261`);
           console.log(`[YouTube Outbound Trace] search-${attempt + 1} before success-body-read at server/youtube.ts:264`);
           const data = await readYouTubeJsonObject(res, 'search');
@@ -865,6 +960,9 @@ export async function searchYouTubeChannelPage(
           return { channels: results, nextPageToken: data.nextPageToken || null, rawResultCount: (data.items || []).length };
         }
       } catch (e) {
+        // A successful response that cannot be accounted must not be fetched
+        // again with another key; the provider already spent the units.
+        if(isYouTubeQuotaAccountingError(e))throw e;
         recordProviderFailure(apiKey, e);
         if (isQuotaExceeded(e)) quotaExceededCount++;
         console.warn(`[YouTube API Pool] Key #${currentIndex + 1} fetch error:`, e);
@@ -919,7 +1017,7 @@ export async function fetchRecentVideoDescriptionsWithIds(channelId: string): Pr
 
       if (res.ok) {
         acquiredResponse = true;
-        await incrementQuota(100, getYouTubeResponseProviderKey(res), undefined, getYouTubeResponseShadowOperationId(res));
+        await accountYouTubeQuotaResponse(res, 100);
         const data = await readYouTubeJsonObject(res, 'recent-videos-search');
         const searchItems: RecentVideoDescription[] = [];
         const videoIds: string[] = [];
@@ -933,10 +1031,10 @@ export async function fetchRecentVideoDescriptionsWithIds(channelId: string): Pr
         }
 
         if (videoIds.length > 0) {
-          const videosUrl = buildYouTubeApiUrl('videos',apiKey,{part:'snippet',id:videoIds.join(',')});
-          const vRes = await youtubeFetch(videosUrl,'video-details',1,1,acquisition,'enrichment',apiKey);
-          if (vRes.ok) {
-            await incrementQuota(1, getYouTubeResponseProviderKey(vRes), undefined, getYouTubeResponseShadowOperationId(vRes));
+          try {
+            const videosUrl = buildYouTubeApiUrl('videos',apiKey,{part:'snippet',id:videoIds.join(',')});
+            const vRes = await youtubeFetch(videosUrl,'video-details',1,1,acquisition,'enrichment',apiKey);
+            await accountYouTubeQuotaResponse(vRes, 1);
             const vData = await readYouTubeJsonObject(vRes, 'video-details');
             const fullItems: RecentVideoDescription[] = [];
             for (const item of vData.items || []) {
@@ -945,12 +1043,23 @@ export async function fetchRecentVideoDescriptionsWithIds(channelId: string): Pr
               }
             }
             if (fullItems.length > 0) return fullItems;
+          } catch (error) {
+            // The 100-unit search above is already paid for and its snippets
+            // are usable. A cap rejection or provider failure on the optional
+            // 1-unit follow-up must not discard them and repeat the search on
+            // another key. Accounting failures still surface: the follow-up
+            // call may already have spent units.
+            if (isYouTubeQuotaAccountingError(error)) throw error;
+            if (!isYouTubeKeyCapError(error)) {
+              console.warn(`[YouTube API] Optional video-details fetch failed for ${channelId}; using paid search descriptions:`, error);
+            }
           }
         }
 
         if (searchItems.length > 0) return searchItems;
       }
     } catch (e) {
+      if(isYouTubeQuotaAccountingError(e))throw e;
       recordProviderFailure(apiKey,e);
       if (isQuotaExceeded(e)) quotaExceededCount++;
       console.warn(`[YouTube API] Failed to fetch video descriptions for ${channelId}:`, e);
@@ -978,10 +1087,15 @@ export async function fetchRecentVideoDescriptionsWithIds(channelId: string): Pr
 async function accountYouTubeQuotaResponse(response: Response, units: number): Promise<string> {
   const providerKey = getYouTubeResponseProviderKey(response);
   const operationId = randomUUID();
+  const reservation = youtubeResponseProviderContext.get(response)?.keyCapReservation;
   const shadowOperationId = getYouTubeResponseShadowOperationId(response);
   try {
-    await retryYouTubeQuotaAccounting(unitsConsumed => incrementQuota(unitsConsumed, providerKey, operationId, shadowOperationId), units);
+    await retryYouTubeQuotaAccounting(unitsConsumed => incrementQuota(unitsConsumed, providerKey, operationId, reservation ?? shadowOperationId), units);
   } catch (error) {
+    // Any accounting/settlement failure after a successful provider response
+    // must stop the caller from refetching the same logical request with
+    // another key. Preserve the cause for diagnostics, but surface one typed
+    // accounting error so every provider loop breaks out before failover.
     throw new YouTubeQuotaAccountingError(units, providerKey, { cause: error });
   }
   return providerKey;
@@ -1216,16 +1330,18 @@ export async function fetchYouTubeChannelEnrichment(
         // every activity stat below is preserved while quota burn drops 50x.
         if(!channelCheckpoint){
           const channelFirstResponse = await youtubeFetch(channelUrl,'channel-details',1,attempt+1,acquisition,priority,apiKey);
-          const channelFirstPayload = await readYouTubeJsonObject(channelFirstResponse, 'channel-details');
+          // Account the provider call before parsing: a malformed successful
+          // body must still settle its reservation, otherwise the lease holds
+          // capacity until the Pacific reset and the loop rotates keys.
           await accountYouTubeQuotaResponse(channelFirstResponse, 1);
+          const channelFirstPayload = await readYouTubeJsonObject(channelFirstResponse, 'channel-details');
           channelCheckpoint = channelFirstPayload;
         }
         const uploadsPlaylistId = channelCheckpoint.items?.[0]?.contentDetails?.relatedPlaylists?.uploads;
         if (uploadsPlaylistId) {
           const recentResponse = await youtubeFetch(buildYouTubeApiUrl('playlistItems',apiKey,{part:'snippet,contentDetails',playlistId:String(uploadsPlaylistId),maxResults:10}),'channel-uploads',1,attempt+1,acquisition,priority,apiKey);
-          const uploadsPayload = await readYouTubeJsonObject(recentResponse, 'channel-uploads');
           await accountYouTubeQuotaResponse(recentResponse, 1);
-          uploadsCheckpoint = adaptPlaylistItemsToSearchShape(uploadsPayload);
+          uploadsCheckpoint = adaptPlaylistItemsToSearchShape(await readYouTubeJsonObject(recentResponse, 'channel-uploads'));
         } else {
           uploadsCheckpoint = { items: [] };
         }
@@ -1233,8 +1349,8 @@ export async function fetchYouTubeChannelEnrichment(
       if(!channelCheckpoint){
         if(attempt>0)await topUp(1);
         const channelResponse = await youtubeFetch(channelUrl,'channel-details',1,attempt+1,acquisition,priority,apiKey);
-        const channelPayload = await readYouTubeJsonObject(channelResponse, 'channel-details');
         await accountYouTubeQuotaResponse(channelResponse, 1);
+        const channelPayload = await readYouTubeJsonObject(channelResponse, 'channel-details');
         channelCheckpoint = channelPayload;
       }
       const recentData=uploadsCheckpoint;
@@ -1261,13 +1377,13 @@ export async function fetchYouTubeChannelEnrichment(
         if(!playlistsCheckpoint){
           if(attempt>0)await topUp(100);
           const playlistResponse=await youtubeFetch(buildYouTubeApiUrl('search',apiKey,{part:'snippet',channelId,type:'playlist',maxResults:10}),'enrichment-playlists',100,attempt+1,acquisition,priority,apiKey);
-          const playlistPayload=await readYouTubeJsonObject(playlistResponse,'enrichment-playlists');
           await accountYouTubeQuotaResponse(playlistResponse, 100);
+          const playlistPayload=await readYouTubeJsonObject(playlistResponse,'enrichment-playlists');
           playlistsCheckpoint=playlistPayload;
         }
         const playlistPayload=playlistsCheckpoint;
         playlists=playlistPayload.items.map((item:any)=>({id:item.id?.playlistId,name:String(item.snippet?.title||''),description:String(item.snippet?.description||'')})).filter((item:any)=>item.name);
-        if(ids){if(!videoDetailsCheckpoint){if(attempt>0)await topUp(1);const videoResponse=await youtubeFetch(buildYouTubeApiUrl('videos',apiKey,{part:'snippet',id:ids}),'enrichment-video-details',1,attempt+1,acquisition,priority,apiKey);const videoDetailsPayload=await readYouTubeJsonObject(videoResponse,'enrichment-video-details');await accountYouTubeQuotaResponse(videoResponse, 1);videoDetailsCheckpoint=videoDetailsPayload;}const byId=new Map(videoDetailsCheckpoint.items?.map((item:any)=>[item.id,item.snippet])||[]);videos=videos.map(video=>({...video,description:String((byId.get(video.id) as any)?.description||video.description||''),language:snippetLanguage(byId.get(video.id))}));}
+        if(ids){if(!videoDetailsCheckpoint){if(attempt>0)await topUp(1);const videoResponse=await youtubeFetch(buildYouTubeApiUrl('videos',apiKey,{part:'snippet',id:ids}),'enrichment-video-details',1,attempt+1,acquisition,priority,apiKey);await accountYouTubeQuotaResponse(videoResponse, 1);const videoDetailsPayload=await readYouTubeJsonObject(videoResponse,'enrichment-video-details');videoDetailsCheckpoint=videoDetailsPayload;}const byId=new Map(videoDetailsCheckpoint.items?.map((item:any)=>[item.id,item.snippet])||[]);videos=videos.map(video=>({...video,description:String((byId.get(video.id) as any)?.description||video.description||''),language:snippetLanguage(byId.get(video.id))}));}
       }
 
       // Channel-level provider language as fallback only, resolved through
@@ -1356,10 +1472,13 @@ export async function fetchYouTubeChannelCountryMetadata(channelId: string, fall
     try {
       const url = buildYouTubeApiUrl('channels',keys[index],{part:'snippet,brandingSettings,statistics',id:channelId});
       const response = await youtubeFetch(url, 'channel-country-metadata', 1, attempt + 1, acquisition, 'enrichment', keys[index]);
+      // A successful channels.list response consumed one unit even when the
+      // payload has no items[0] or later fails validation. Account before
+      // inspecting the body so not-found/invalid bodies cannot hide spend.
+      await accountYouTubeQuotaResponse(response, 1);
       const data = await readYouTubeJsonObject(response, 'channel-country-metadata');
       const channel = data.items?.[0];
       if (!channel) throw new Error(`YouTube channel '${channelId}' was not found.`);
-      await incrementQuota(1, getYouTubeResponseProviderKey(response), undefined, getYouTubeResponseShadowOperationId(response));
       const officialCountry = channel.brandingSettings?.channel?.country;
       const subscriberCount = channel.statistics?.hiddenSubscriberCount === true ? fallback.subscriberCount : (channel.statistics?.subscriberCount || fallback.subscriberCount);
       // Same validated fallback rules as enrichment: already-fetched
@@ -1385,7 +1504,10 @@ export async function fetchYouTubeChannelCountryMetadata(channelId: string, fall
           ? withoutTranscriptLanguages(fallback.transcriptExcerpts)
           : fallback.transcriptExcerpts,
         countryMetadataStatus: officialCountry ? 'AVAILABLE_DECLARED' : 'AVAILABLE_NOT_DECLARED', countryMetadataCheckedAt: checkedAt };
-    } catch (error) { recordProviderFailure(keys[index],error);if (isQuotaExceeded(error)) quotaExceededCount++; }
+    } catch (error) {
+      if(isYouTubeQuotaAccountingError(error))throw error;
+      recordProviderFailure(keys[index],error);if (isQuotaExceeded(error)) quotaExceededCount++;
+    }
   }
   acquisition.providerFailed(quotaExceededCount === keys.length ? 'QUOTA_EXHAUSTED' : 'INDETERMINATE');
   return { ...fallback, countryMetadataStatus: 'UNAVAILABLE', countryMetadataCheckedAt: checkedAt };
