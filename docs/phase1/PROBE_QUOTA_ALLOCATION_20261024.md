@@ -151,12 +151,18 @@ file; only the two #533-owned docs (`README.md`,
 `QUOTA_SHADOW_UNIT3_20261019.md`) differ, because their final #533 versions are
 kept. The reconciliation therefore changes no runtime behavior.
 
-At code/test head `d405880`: `npm run lint` is clean; the CI-equivalent unit
-subset is **76/76 pass** locally and the broader quota/maintenance/contract
-batch is **123/123 pass**. PostgreSQL is CI-only on this host (no local server);
-the postgres:17 run applies the full migration lineage including 154/155. The
-final run at the docs head is recorded in the PR checks and the consolidated
-report. No enforcement, probe, or adaptive settings were changed.
+At reviewed code/test head `fec2bbd`: `npx tsc --noEmit` is clean; the focused
+quota subset is **79/79 pass** locally and the broader
+quota/maintenance/contract batch is **153/153 pass**. PostgreSQL is CI-only on
+this host (no local server); the postgres:17 run applies the full migration
+lineage including 154/155. Phase 1 quota shadow
+[40092039328](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40092039328)
+passed **79/79 unit** and **31/31 PostgreSQL**, 0 skipped. The corpus PostgreSQL
+run
+[40092042533](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40092042533)
+ran the new channel-upsert regression **3/3**, 0 skipped. All other code
+workflows at `fec2bbd` are green; PR Agent remains red only on Gemini
+`API_KEY_INVALID`. No enforcement, probe, or adaptive settings were changed.
 
 ## Post-review hardening (2026-10-24)
 
@@ -188,12 +194,28 @@ confirmed ones were fixed in code:
   its first official enrichment call (`channel.quota_origin === 'PROBE'`).
 - **Pre-dispatch abort** releases the exact enforced lease and the exact probe
   lease instead of leaving admitted capacity until the Pacific reset.
+- **Durable provenance is insert-only.** `writeChannelUpsert` preserves
+  `channels.quota_origin` in its `ON CONFLICT` clause. A probe run that
+  rediscovers an established NORMAL channel no longer rewrites it to PROBE and
+  strands later enrichment/recovery on the probe bucket; a probe-created INSERT
+  still starts PROBE, and PROBE is never downgraded. Migration 154's column is
+  `NOT NULL DEFAULT 'NORMAL'`, so the preserved value cannot be NULL.
+- **Probe refusals are contained per channel in NORMAL batches.** Search,
+  manual-search, playlist, and featured workers previously let one sticky-PROBE
+  channel refused by its own allocation abort the whole page. They now log the
+  deferral and continue with the remaining channels; probe-origin jobs still
+  propagate the refusal so the queue can defer them to the Pacific reset.
+  Nomination rows remain; funnel observations/sightings are skipped for the
+  deferred channel.
+- **Probe reservations cannot hide an enforcement enable.** While the per-key
+  enforcement cache holds OFF, `reserveProbeQuota` re-reads the setting before
+  skipping the 9,000-unit projection. Ordinary dispatch keeps the bounded
+  cache, and a read failure still fails closed.
 
 Not changed: the daily requeue when the probe allocation is disabled remains
 the intended fail-closed drain behavior; changing it requires a bounded-retry
-decision. The per-key enforcement cache can lag an enable by the settings TTL;
-the documented ≥120 s drain plus provider timeout exceeds that window, so it is
-an activation precondition rather than a code defect.
+decision. The ≥120 s shadow drain plus provider timeout is still the activation
+precondition for mixed cached-OFF/enforced traffic.
 
 **Audited and not changed (Qodo, `server/queueManager.ts:2860`).** The finding
 says probe recovery stalls because workers require an ordinary ENRICHMENT
