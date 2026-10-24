@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { calculateQueryFunnel, isSeverelyContaminatedQuery, manualSearchContinuationMetrics, selectQueryCollection, type QueryObservation } from './queryPerformance';
-import { evaluateContinuation } from './continuationPolicy';
+import { countTrailingLowYieldPages, evaluateContinuation } from './continuationPolicy';
 
 test('query funnel keeps duplicates, known channels, exclusions, and classifications separate', () => {
   const observations: QueryObservation[] = [
@@ -139,8 +139,25 @@ test('deferred-only pages do not stop normal pagination as low yield', () => {
   assert.equal(decision.shouldContinue, true);
   assert.equal(decision.lowYield, false);
   assert.equal(decision.primaryReason, 'CONTINUE_EXPLORATION');
+  assert.ok(decision.reasonCodes.includes('DEFERRED_ONLY'));
   assert.equal(evaluateContinuation({ ...page, pageNumber: 3 }).shouldContinue, false);
   assert.equal(evaluateContinuation({ ...page, pageNumber: 3 }).primaryReason, 'PAGE_CEILING');
+});
+
+test('deferred-only pages are transparent when rebuilding the low-yield streak', () => {
+  const rows = [
+    { marginalUtility: 0, reasonCodes: ['DEFERRED_ONLY'] },
+    { marginalUtility: 0.1, reasonCodes: ['ZERO_CONFIRMED_VALUE'] },
+    { marginalUtility: 0, reasonCodes: ['DEFERRED_ONLY'] },
+    { marginalUtility: 0.1, reasonCodes: ['DUPLICATE_HEAVY'] },
+    { marginalUtility: 0.8, reasonCodes: ['CONTINUE_PRODUCTIVE'] },
+  ];
+  assert.equal(countTrailingLowYieldPages(rows), 2, 'deferred-only pages neither extend nor reset the streak');
+  assert.equal(countTrailingLowYieldPages([
+    { marginalUtility: 0.1, reasonCodes: ['WRONG_COUNTRY'] },
+    { marginalUtility: 0, reasonCodes: ['DEFERRED_ONLY'] },
+    { marginalUtility: 0.8, reasonCodes: ['CONTINUE_PRODUCTIVE'] },
+  ]), 1);
 });
 
 test('scope weighting stays neutral when no observation carries scope', () => {

@@ -882,6 +882,19 @@ export async function processNextSearchJob(
       const enrichmentStage=Math.min(3,Math.max(1,Number(job.payload.enrichmentStage||1))) as 1|2|3;
       if(investigationId)candidate.investigationId=investigationId;
       await assertCountryAllowed(targetCountry, `enrichment_worker:${job.id}`);
+      // A contained probe refusal defers the original discovery pipeline, not
+      // an enrichment-only retry. Replay discovery before the enrichment
+      // eligibility gate: discovery may revisit an existing TRADING_CONFIRMED
+      // row with UNCERTAIN country evidence, or an aged machine NON_TRADING
+      // row, and those rows would otherwise complete here without doing the
+      // deferred work.
+      if (job.payload.probeDeferredDiscovery === true) {
+        await processDiscoveredChannel(candidate, targetCountry, source, {
+          forceExtraction: job.payload.forceExtraction === true,
+        });
+        await completeJob(job.id);
+        return true;
+      }
       const channel = await getChannelById(channelId);
       // REJECTED rows are terminal for every pipeline (isTerminalState) and
       // are additionally guarded explicitly here (P2) so a future terminal
@@ -1699,15 +1712,19 @@ export function shouldContainProbeQuotaRefusal(
  * Pure payload/key builder for the per-channel retry created when a NORMAL
  * batch contains a sticky-PROBE channel whose own allocation refuses it.
  * A page-level retry would spend the whole page again, so the deferral is
- * persisted as one PROBE-origin enrichment job per channel and quota day.
- * `enqueueJob`'s idempotency key collapses repeated sightings to one job.
+ * persisted as one PROBE-origin discovery-replay job per channel and quota
+ * day. ENRICH_CHANNEL is only the queue carrier type; the handler replays the
+ * original discovery pipeline so revisitable rows are not skipped by the
+ * enrichment-only eligibility gate. `enqueueJob`'s idempotency key collapses
+ * repeated sightings to one job.
  */
-export function probeDeferredEnrichmentJob(
+export function probeDeferredDiscoveryJob(
   raw: DiscoveredChannelRaw,
   targetCountry: string,
   source: DiscoverySource,
   control: unknown,
   now: number = Date.now(),
+  forceExtraction: boolean = false,
 ): { payload: Record<string, unknown>; opts: { priority: number; maxAttempts: number; runAfter: string; idempotencyKey: string } } {
   const quotaDay = String((control as any)?.quotaDay || (control as any)?.details?.quotaDay || '');
   const retryAt = Number((control as any)?.retryAt);
@@ -1719,14 +1736,15 @@ export function probeDeferredEnrichmentJob(
       source,
       candidate: raw,
       enrichmentStage: 1,
+      forceExtraction,
       quotaOrigin: 'PROBE',
-      probeDeferred: true,
+      probeDeferredDiscovery: true,
     },
     opts: {
       priority: 5,
       maxAttempts: 4,
       runAfter,
-      idempotencyKey: `probe-deferred-enrich:${raw.channelId}:${quotaDay || runAfter.slice(0, 10)}`,
+      idempotencyKey: `probe-deferred-discovery:${raw.channelId}:${quotaDay || runAfter.slice(0, 10)}`,
     },
   };
 }
@@ -1744,7 +1762,14 @@ export async function processDiscoveredChannelContained(
     const control = probeQuotaControlInChain(error);
     let retryScheduled = false;
     try {
-      const deferred = probeDeferredEnrichmentJob(raw, targetCountry, source, control);
+      const deferred = probeDeferredDiscoveryJob(
+        raw,
+        targetCountry,
+        source,
+        control,
+        Date.now(),
+        options?.forceExtraction === true,
+      );
       await enqueueJob('ENRICH_CHANNEL', deferred.payload, deferred.opts);
       retryScheduled = true;
     } catch (scheduleError) {

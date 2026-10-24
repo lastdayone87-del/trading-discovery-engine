@@ -1,7 +1,8 @@
 export type ContinuationReasonCode =
   | 'CONTINUE_PRODUCTIVE' | 'CONTINUE_EXPLORATION' | 'NO_NEXT_PAGE'
   | 'PAGE_CEILING' | 'CREATOR_CEILING' | 'CONSECUTIVE_LOW_YIELD'
-  | 'ZERO_CONFIRMED_VALUE' | 'DUPLICATE_HEAVY' | 'WRONG_COUNTRY';
+  | 'ZERO_CONFIRMED_VALUE' | 'DUPLICATE_HEAVY' | 'WRONG_COUNTRY'
+  | 'DEFERRED_ONLY';
 
 export interface ContinuationPolicyInput {
   pageNumber: number; maxPages: number; hasNextPage: boolean;
@@ -28,7 +29,7 @@ const clamp = (n: number) => Math.max(0, Math.min(1, Number.isFinite(n) ? n : 0)
 /** Pure, deterministic policy shared by human-directed and autonomous discovery. */
 export function evaluateContinuation(input: ContinuationPolicyInput): ContinuationDecision {
   if (input.deferredOnly) {
-    const reasons: ContinuationReasonCode[] = [];
+    const reasons: ContinuationReasonCode[] = ['DEFERRED_ONLY'];
     if (!input.hasNextPage) reasons.push('NO_NEXT_PAGE');
     if (input.pageNumber >= input.maxPages) reasons.push('PAGE_CEILING');
     if (input.maxDistinctCreators && input.cumulativeDistinctCreators >= input.maxDistinctCreators) reasons.push('CREATOR_CEILING');
@@ -38,7 +39,7 @@ export function evaluateContinuation(input: ContinuationPolicyInput): Continuati
       lowYield: false,
       marginalUtility: 0,
       primaryReason: terminal || 'CONTINUE_EXPLORATION',
-      reasonCodes: reasons.length ? reasons : ['CONTINUE_EXPLORATION'],
+      reasonCodes: reasons,
     };
   }
   const cumulativeDistinct = Math.max(1, input.cumulativeDistinctCreators || input.distinctCreators);
@@ -71,4 +72,24 @@ export function evaluateContinuation(input: ContinuationPolicyInput): Continuati
   const terminal = reasons.find(r => ['NO_NEXT_PAGE','PAGE_CEILING','CREATOR_CEILING','CONSECUTIVE_LOW_YIELD'].includes(r));
   const primaryReason = terminal || (lowYield ? (reasons[0] || 'CONTINUE_EXPLORATION') : 'CONTINUE_PRODUCTIVE');
   return { shouldContinue: !terminal, lowYield, marginalUtility, primaryReason, reasonCodes: reasons.length ? reasons : ['CONTINUE_PRODUCTIVE'] };
+}
+
+/**
+ * Rebuilds the trailing low-yield streak from persisted pages. Deferred-only
+ * pages carry no yield signal, so they are transparent: they neither extend
+ * nor reset the streak. Without this, a deferred page's placeholder
+ * `marginalUtility` of 0 would look like a low-yield failure on the next page.
+ */
+export function countTrailingLowYieldPages(
+  rows: Array<{ marginalUtility: number; reasonCodes: string[] }>,
+): number {
+  let consecutive = 0;
+  for (const row of rows) {
+    if (row.reasonCodes.includes('DEFERRED_ONLY')) continue;
+    const low = Number(row.marginalUtility) < 0.2 ||
+      row.reasonCodes.some(code => ['ZERO_CONFIRMED_VALUE','DUPLICATE_HEAVY','WRONG_COUNTRY'].includes(code));
+    if (!low) break;
+    consecutive++;
+  }
+  return consecutive;
 }
