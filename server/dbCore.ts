@@ -12,7 +12,7 @@ import { getConfiguredYouTubeKeys, getConfiguredYouTubeProviders } from './youtu
 import { youtubeProviderCooldown, type YouTubeProviderOperationalStatus } from './youtubeProviderCooldown';
 import type { AuditEvent } from './operatorAuth';
 import type { ProviderCallEvent } from './providerResilience';
-import { resolveShadowConfig, settleShadowLeaseWithSavepoint } from './quotaKeyCapShadow';
+import { resolveShadowConfig, settleKeyCapReservation, settleShadowLeaseWithSavepoint, YouTubeKeyCapUnavailableError, type KeyCapReservationContext } from './quotaKeyCapShadow';
 import { canonicalCountry } from './countryInference';
 import { classifyDiscoveryVisibility } from './discoveryStateVisibility';
 import { safeCrawlerTelemetry, type CrawlerTelemetry } from './crawlerTelemetry';
@@ -1069,25 +1069,61 @@ export async function claimYouTubeQuotaOperation(client:QueryExecutor, operation
   }
 }
 
-export async function incrementQuota(units:number, providerKey:string, operationId?: string, shadowOperationId?: string):Promise<void>{
+export async function incrementQuota(
+  units:number,
+  providerKey:string,
+  operationId?: string,
+  shadowOperationIdOrReservation?: string | KeyCapReservationContext
+):Promise<void>{
+  const reservation = typeof shadowOperationIdOrReservation === 'object' && shadowOperationIdOrReservation !== null
+    ? shadowOperationIdOrReservation
+    : undefined;
+  const shadowOperationId = typeof shadowOperationIdOrReservation === 'string' ? shadowOperationIdOrReservation : undefined;
   if(!Number.isSafeInteger(units)||units<=0)throw new Error('YouTube quota charge must be a positive integer.');
   const keys=getYouTubeKeyPool(); const keyIndex=keys.indexOf(providerKey)+1; if(keyIndex<1)throw new Error('YouTube quota charge provider key is not configured.');
-  const today=getYouTubeQuotaDay(); const shadowConfig=await resolveShadowConfig(getAppSetting).catch(()=>null); const db=await getDb(); const client=await db.connect(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=getDailyYouTubeQuotaBudget();
+  const keyFingerprint=fingerprintYouTubeKey(providerKey);
+  // Per-key usage and lease settlement use the dispatch day, so a response
+  // that settles after Pacific midnight (or across a DST boundary) remains
+  // attributed to the day that admitted it. The single-row quota_tracker is a
+  // current-day aggregate; give it the current day so a late prior-day charge
+  // can never rewind last_reset and zero the current day's usage.
+  const keyQuotaDay=reservation?.quotaDay||getYouTubeQuotaDay();
+  if(reservation?.mode==='enforce'&&reservation.keyFingerprint!==keyFingerprint){
+    throw new YouTubeKeyCapUnavailableError('YouTube key cap reservation key does not match the charged provider key.',{
+      quotaDay:reservation.quotaDay,keyFingerprint:reservation.keyFingerprint,operationId:reservation.operationId,
+    });
+  }
+  if(reservation?.mode==='enforce'&&reservation.units!==units){
+    throw new YouTubeKeyCapUnavailableError('YouTube key cap reservation units do not match the official charge.',{
+      quotaDay:reservation.quotaDay,keyFingerprint:keyFingerprint,operationId:reservation.operationId,
+    });
+  }
+  const shadowConfig=reservation?null:await resolveShadowConfig(getAppSetting).catch(()=>null); const db=await getDb(); const client=await db.connect(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=getDailyYouTubeQuotaBudget();
   try{
     await client.query('BEGIN');
+    // Read the aggregate tracker day after pool acquisition and BEGIN. A
+    // connection wait can cross Pacific midnight; using a pre-wait day would
+    // let ensureYouTubeQuotaDay reset the tracker backward and erase the new
+    // day's usage. The per-key reservation day remains the dispatch day.
+    const trackerDay=getYouTubeQuotaDay();
     if (operationId) {
       // Idempotency guard: one row per accounted provider response, written
       // in the same transaction as the charge. A retry after an unknown
       // commit outcome finds its own operation ID and skips the duplicate
       // charge instead of double-counting the same response.
-      if (!await claimYouTubeQuotaOperation(client, operationId, today, fingerprintYouTubeKey(providerKey), units)) { await client.query('COMMIT'); return; }
+      if (!await claimYouTubeQuotaOperation(client, operationId, keyQuotaDay, keyFingerprint, units)) { await client.query('COMMIT'); return; }
     }
-    await ensureYouTubeQuotaDay(client,today,limit);await client.query(`SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE`);await ensureYouTubeKeyRows(client,today,keys,perKey);await client.query(`UPDATE quota_tracker SET units_used=units_used+$1,daily_limit=$2,last_reset=$3 WHERE id='youtube'`,[units,limit,today]);await client.query(`UPDATE youtube_key_quota_usage SET units_used=units_used+$1,updated_at=now() WHERE quota_day=$2 AND key_fingerprint=$3`,[units,today,fingerprintYouTubeKey(providerKey)]);
-    if(shadowConfig?.enabled){
-      // Shadow-only observation: release one matching in-flight lease so
-      // settled usage + leases never double count. Savepoint-guarded so a
-      // shadow failure can never poison the official charge transaction.
-      await settleShadowLeaseWithSavepoint(client,{quotaDay:today,keyFingerprint:fingerprintYouTubeKey(providerKey),units,operationId:shadowOperationId});
+    await ensureYouTubeQuotaDay(client,trackerDay,limit);await client.query(`SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE`);await ensureYouTubeKeyRows(client,keyQuotaDay,keys,perKey);await client.query(`UPDATE quota_tracker SET units_used=units_used+$1,daily_limit=$2,last_reset=$3 WHERE id='youtube'`,[units,limit,trackerDay]);await client.query(`UPDATE youtube_key_quota_usage SET units_used=units_used+$1,updated_at=now() WHERE quota_day=$2 AND key_fingerprint=$3`,[units,keyQuotaDay,keyFingerprint]);
+    if(reservation){
+      // Settle the exact lease in the SAME transaction as the official
+      // charge. Enforce failures roll the charge back (fail closed); shadow
+      // failures stay savepoint-guarded and never poison the charge.
+      await settleKeyCapReservation(client,reservation);
+    } else if(shadowConfig?.enabled){
+      // Legacy shadow settlement (no reservation context): release the
+      // exact operation lease when the caller supplied one, otherwise the
+      // legacy unit-matched lease. Savepoint-guarded.
+      await settleShadowLeaseWithSavepoint(client,{quotaDay:keyQuotaDay,keyFingerprint,units,operationId:shadowOperationId});
     }
     await client.query('COMMIT');}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
 }

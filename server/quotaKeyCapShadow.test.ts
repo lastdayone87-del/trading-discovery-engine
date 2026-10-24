@@ -1,23 +1,51 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  ENFORCED_CAP_UNITS,
+  ENFORCED_KEY,
+  ENFORCED_LOCK_TIMEOUT_MS,
+  ENFORCED_STATEMENT_TIMEOUT_MS,
   SHADOW_CAP_UNITS,
   SHADOW_LEASE_TTL_MS,
+  YouTubeKeyCapExceededError,
+  YouTubeKeyCapUnavailableError,
+  assertKeyCapReservationDayCurrent,
   classifyShadowWouldBlock,
+  isYouTubeKeyCapError,
+  keyCapAdvisoryLockName,
   parseShadowCapUnits,
   parseShadowLeaseTtlMs,
   recordShadowDispatchSafe,
+  reserveEnforcedKeyCap,
+  reserveYouTubeKeyCap,
+  resetKeyCapEnforcementCacheForTests,
   resetShadowConfigCacheForTests,
   resetShadowSweepClockForTests,
+  resolveKeyCapEnforcement,
   resolveShadowConfig,
+  settleKeyCapReservation,
   settleShadowLease,
   simulateShadowReplay,
   sweepShadowEvents,
   sweepShadowLeases,
+  type KeyCapReservationContext,
   type ShadowPoolPort,
   type ShadowQueryClient,
 } from './quotaKeyCapShadow';
-import { getYouTubeQuotaDay } from './youtubeQuotaDay';
+import { getNextYouTubeQuotaResetAt, getYouTubeQuotaDay } from './youtubeQuotaDay';
+import { readFileSync } from 'node:fs';
+
+test('shadow and enforcement share one key/day advisory lock namespace', () => {
+  assert.equal(
+    keyCapAdvisoryLockName('2026-10-20', 'fp-test'),
+    'youtube-key-cap:2026-10-20:fp-test'
+  );
+  const source = readFileSync(new URL('./quotaKeyCapShadow.ts', import.meta.url), 'utf8');
+  assert.match(source, /keyCapAdvisoryLockName\(quotaDay, input\.keyFingerprint\)/);
+  assert.match(source, /keyCapAdvisoryLockName\(quotaDay, keyFingerprint\)/);
+  assert.doesNotMatch(source, /youtube-key-cap-shadow:/);
+  assert.doesNotMatch(source, /youtube-key-cap-enforce:/);
+});
 
 type Rows = { rows: Array<Record<string, unknown>>; rowCount?: number | null };
 type QueryHandler = (text: string, values?: unknown[]) => Rows;
@@ -164,7 +192,7 @@ test('recordShadowDispatchSafe enabled: sweeps, locks, records and commits', asy
   assert.ok(lockQuery, 'advisory lock taken');
   assert.equal(
     lockQuery!.values?.[0],
-    `youtube-key-cap-shadow:${getYouTubeQuotaDay(now)}:fp-enabled`
+    `youtube-key-cap:${getYouTubeQuotaDay(now)}:fp-enabled`
   );
   assert.ok(texts.includes('COMMIT'));
   assert.ok(!texts.includes('ROLLBACK'));
@@ -364,4 +392,296 @@ test('simulateShadowReplay: an expiring lease frees capacity at the exact TTL in
   const summary = simulateShadowReplay(calls, { capUnits: 10 });
   assert.equal(summary.totalAllowed, 2);
   assert.equal(summary.totalWouldDefer + summary.totalWouldReject, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Hard enforcement (default OFF) — pure/unit coverage with mock clients
+// ---------------------------------------------------------------------------
+
+function enforcementHandler(
+  projected: number,
+  options: {
+    existing?: Record<string, unknown> | null;
+    insert?: boolean;
+    failQuery?: string;
+    lockCode?: string;
+  } = {},
+): QueryHandler {
+  return (text) => {
+    if (options.failQuery && text.includes(options.failQuery)) throw new Error('database unavailable');
+    if (text.includes('pg_advisory_xact_lock')) {
+      if (options.lockCode) throw Object.assign(new Error('lock failure'), { code: options.lockCode });
+      return { rows: [] };
+    }
+    if (text.includes('SELECT id, key_fingerprint')) {
+      return { rows: options.existing ? [options.existing] : [] };
+    }
+    if (text.includes('SELECT COALESCE((')) {
+      return { rows: [{ projected_units: projected }] };
+    }
+    if (text.includes('INSERT INTO youtube_key_cap_shadow_leases')) {
+      return options.insert === false
+        ? { rows: [], rowCount: 0 }
+        : { rows: [{ id: 'lease-1' }], rowCount: 1 };
+    }
+    if (text.includes('UPDATE youtube_key_cap_shadow_leases SET expires_at')) return { rows: [] };
+    return { rows: [] };
+  };
+}
+
+const enforcedReader = async (key: string, fallback: string): Promise<string> => {
+  if (key === ENFORCED_KEY) return 'true';
+  return fallback;
+};
+
+test('resolveKeyCapEnforcement is literal-true, caches 30s, and fails closed on settings read errors', async () => {
+  resetKeyCapEnforcementCacheForTests();
+  assert.equal(await resolveKeyCapEnforcement(async (_key, fallback) => fallback), false, 'absent flag is OFF');
+  resetKeyCapEnforcementCacheForTests();
+  assert.equal(await resolveKeyCapEnforcement(async () => ' TRUE '), false, 'case/whitespace variants are not activation');
+  resetKeyCapEnforcementCacheForTests();
+  assert.equal(await resolveKeyCapEnforcement(async () => 'true'), true, 'only literal true enables enforcement');
+  const before = Date.now();
+  assert.equal(await resolveKeyCapEnforcement(async () => 'false', before + 1_000), true, 'cached true is not bypassed by a transient re-read');
+  resetKeyCapEnforcementCacheForTests();
+  await assert.rejects(
+    resolveKeyCapEnforcement(async () => { throw new Error('settings down'); }),
+    (error: unknown) => error instanceof YouTubeKeyCapUnavailableError
+      && isYouTubeKeyCapError(error)
+      && /enforcement setting/.test((error as Error).message),
+    'a cold settings failure is not evidence of OFF'
+  );
+  resetKeyCapEnforcementCacheForTests();
+  const base = Date.now();
+  assert.equal(await resolveKeyCapEnforcement(async () => 'false', base), false);
+  await assert.rejects(
+    resolveKeyCapEnforcement(async () => { throw new Error('settings down'); }, base + 31_000),
+    (error: unknown) => error instanceof YouTubeKeyCapUnavailableError,
+    'a stale OFF cache cannot outlive a later ON change'
+  );
+  resetKeyCapEnforcementCacheForTests();
+  assert.equal(await resolveKeyCapEnforcement(async () => 'true', base), true);
+  await assert.rejects(
+    resolveKeyCapEnforcement(async () => { throw new Error('settings down'); }, base + 31_000),
+    (error: unknown) => error instanceof YouTubeKeyCapUnavailableError,
+    'a previously observed ON state fails closed'
+  );
+});
+
+test('a stalled settings read is bounded and fails closed', async () => {
+  resetKeyCapEnforcementCacheForTests();
+  const started = Date.now();
+  await assert.rejects(
+    resolveKeyCapEnforcement(() => new Promise<string>(() => undefined), Date.now(), 5),
+    (error: unknown) => error instanceof YouTubeKeyCapUnavailableError
+      && /timed out/.test(String((error as Error).cause ?? error.message)),
+    'a settings query that never resolves must not hold the dispatch queue'
+  );
+  assert.ok(Date.now() - started < 500, 'the read is bounded by the deadline, not the DB pool');
+});
+
+test('a reservation that crosses Pacific midnight fails closed before dispatch', () => {
+  const context: KeyCapReservationContext = {
+    mode: 'enforce', quotaDay: '2026-03-08', operationId: 'op-midnight', keyFingerprint: 'fp-midnight', units: 1,
+  };
+  assert.doesNotThrow(() => assertKeyCapReservationDayCurrent(context, new Date('2026-03-09T06:59:59.000Z')));
+  assert.throws(
+    () => assertKeyCapReservationDayCurrent(context, new Date('2026-03-09T07:00:00.000Z')),
+    (error: unknown) => error instanceof YouTubeKeyCapUnavailableError
+      && /crossed the Pacific quota day/.test((error as Error).message)
+  );
+});
+
+test('reserveYouTubeKeyCap disabled is a zero-query no-op (legacy behavior preserved)', async () => {
+  resetKeyCapEnforcementCacheForTests();
+  const pool = new FakePool(enforcementHandler(0));
+  const reservation = await reserveYouTubeKeyCap(
+    { readSetting: async (_key, fallback) => fallback, pool },
+    { keyFingerprint: 'fp-off', operationId: 'op-off', units: 100 }
+  );
+  assert.equal(reservation, null);
+  assert.equal(pool.connections.length, 0);
+  assert.equal(pool.poolQueries.length, 0);
+});
+
+test('reserveEnforcedKeyCap boundary: 8999 + 1 admitted, 9000 + 1 typed exceeded', async () => {
+  resetKeyCapEnforcementCacheForTests();
+  const now = new Date('2026-10-16T07:30:00.000Z');
+  const day = getYouTubeQuotaDay(now);
+  const admittedPool = new FakePool(enforcementHandler(8999));
+  const admitted = await reserveEnforcedKeyCap(
+    { readSetting: enforcedReader, pool: admittedPool },
+    { keyFingerprint: 'fp-boundary', operationId: 'op-boundary-1', units: 1, now }
+  );
+  assert.equal(admitted.mode, 'enforce');
+  assert.equal(admitted.quotaDay, day);
+  assert.equal(admitted.projectedBefore, 8999);
+  const connection = admittedPool.connections[0];
+  const texts = connection.queries.map(query => query.text);
+  assert.ok(texts.includes('BEGIN'));
+  assert.ok(texts.some(text => text.startsWith(`SET LOCAL lock_timeout = '${ENFORCED_LOCK_TIMEOUT_MS}ms'`)));
+  assert.ok(texts.some(text => text.startsWith(`SET LOCAL statement_timeout = '${ENFORCED_STATEMENT_TIMEOUT_MS}ms'`)));
+  assert.equal(
+    connection.queries.find(query => query.text.includes('pg_advisory_xact_lock'))?.values?.[0],
+    `youtube-key-cap:${day}:fp-boundary`
+  );
+  assert.ok(texts.includes('COMMIT'));
+  assert.ok(connection.released);
+
+  const insert = connection.queries.find(query => query.text.includes('INSERT INTO youtube_key_cap_shadow_leases'));
+  assert.ok(insert);
+  assert.equal(
+    (insert!.values?.[5] as Date).getTime(),
+    getNextYouTubeQuotaResetAt(now),
+    'enforced leases remain reserved until the Pacific day resets, not a short TTL'
+  );
+
+  const deniedPool = new FakePool(enforcementHandler(9000));
+  await assert.rejects(
+    reserveEnforcedKeyCap(
+      { readSetting: enforcedReader, pool: deniedPool },
+      { keyFingerprint: 'fp-boundary', operationId: 'op-boundary-2', units: 1, now }
+    ),
+    (error: unknown) => error instanceof YouTubeKeyCapExceededError
+      && error.code === 'YOUTUBE_KEY_CAP_EXCEEDED'
+      && error.projectedUnits === 9000
+      && error.requestUnits === 1
+      && error.capUnits === ENFORCED_CAP_UNITS
+      && error.rotateKey === true
+      && error.markSuspension === false
+  );
+  const deniedTexts = deniedPool.connections[0].queries.map(query => query.text);
+  assert.ok(deniedTexts.includes('ROLLBACK'));
+  assert.ok(!deniedTexts.includes('COMMIT'));
+});
+
+test('enforce reservation failures are typed and fail closed (lock, DB, connect)', async () => {
+  const now = new Date('2026-10-16T07:30:00.000Z');
+  const lockPool = new FakePool(enforcementHandler(0, { lockCode: '55P03' }));
+  await assert.rejects(
+    reserveEnforcedKeyCap(
+      { readSetting: enforcedReader, pool: lockPool },
+      { keyFingerprint: 'fp-lock', operationId: 'op-lock', units: 1, now }
+    ),
+    (error: unknown) => error instanceof YouTubeKeyCapUnavailableError
+      && /lock timed out/.test((error as Error).message)
+      && isYouTubeKeyCapError(error)
+  );
+  assert.ok(lockPool.connections[0].queries.map(query => query.text).includes('ROLLBACK'));
+  assert.ok(lockPool.connections[0].released);
+
+  const dbPool = new FakePool(enforcementHandler(0, { failQuery: 'SELECT COALESCE((' }));
+  await assert.rejects(
+    reserveEnforcedKeyCap(
+      { readSetting: enforcedReader, pool: dbPool },
+      { keyFingerprint: 'fp-db', operationId: 'op-db', units: 1, now }
+    ),
+    (error: unknown) => error instanceof YouTubeKeyCapUnavailableError && /transaction failed/.test((error as Error).message)
+  );
+
+  const downPool: ShadowPoolPort = {
+    query: async () => ({ rows: [] }),
+    connect: async () => { throw new Error('pool exhausted'); },
+  };
+  await assert.rejects(
+    reserveEnforcedKeyCap(
+      { readSetting: enforcedReader, pool: downPool },
+      { keyFingerprint: 'fp-down', operationId: 'op-down', units: 1, now }
+    ),
+    (error: unknown) => error instanceof YouTubeKeyCapUnavailableError && /connection failed/.test((error as Error).message)
+  );
+});
+
+test('duplicate operation ID is idempotent for the same units and rejects changed units', async () => {
+  const now = new Date('2026-10-16T07:30:00.000Z');
+  const existing = { id: 'lease-1', key_fingerprint: 'fp-dup', reserved_units: 1 };
+  const pool = new FakePool(enforcementHandler(9000, { existing }));
+  const reservation = await reserveEnforcedKeyCap(
+    { readSetting: enforcedReader, pool },
+    { keyFingerprint: 'fp-dup', operationId: 'op-dup', units: 1, now }
+  );
+  assert.equal(reservation.operationId, 'op-dup');
+  const texts = pool.connections[0].queries.map(query => query.text);
+  assert.ok(texts.some(text => text.includes('UPDATE youtube_key_cap_shadow_leases SET expires_at')));
+  assert.ok(!texts.some(text => text.includes('INSERT INTO youtube_key_cap_shadow_leases')));
+  assert.ok(texts.includes('COMMIT'));
+
+  const mismatchPool = new FakePool(enforcementHandler(8999, { existing }));
+  await assert.rejects(
+    reserveEnforcedKeyCap(
+      { readSetting: enforcedReader, pool: mismatchPool },
+      { keyFingerprint: 'fp-dup', operationId: 'op-dup', units: 9000, now }
+    ),
+    (error: unknown) => error instanceof YouTubeKeyCapUnavailableError
+      && /different units/.test((error as Error).message)
+  );
+  const mismatchTexts = mismatchPool.connections[0].queries.map(query => query.text);
+  assert.ok(mismatchTexts.includes('ROLLBACK'));
+  assert.ok(!mismatchTexts.includes('COMMIT'));
+});
+
+test('settleKeyCapReservation uses exact day/operation/key and keeps enforce failures fatal', async () => {
+  const queries: Array<{ text: string; values?: unknown[] }> = [];
+  const client: ShadowQueryClient = {
+    query: async (text, values) => {
+      queries.push({ text, values });
+      return { rows: [], rowCount: 1 };
+    },
+  };
+  const context: KeyCapReservationContext = {
+    mode: 'enforce', quotaDay: '2026-10-16', operationId: 'op-settle', keyFingerprint: 'fp-settle', units: 1,
+  };
+  assert.equal(await settleKeyCapReservation(client, context), true);
+  assert.match(queries[0].text, /DELETE FROM youtube_key_cap_shadow_leases/);
+  assert.match(queries[0].text, /quota_day = \$1 AND operation_id = \$2 AND key_fingerprint = \$3/);
+  assert.deepEqual(queries[0].values?.slice(0, 3), ['2026-10-16', 'op-settle', 'fp-settle']);
+  assert.equal(queries[0].values?.length, 5);
+  assert.ok(queries[0].values?.[3] instanceof Date);
+  assert.ok(!queries.some(query => query.text.startsWith('SAVEPOINT')));
+
+  const failing: ShadowQueryClient = {
+    query: async () => { throw new Error('settlement down'); },
+  };
+  await assert.rejects(settleKeyCapReservation(failing, context), /settlement down/);
+});
+
+test('shadow context settlement is savepoint-guarded and swallows failure', async () => {
+  const queries: Array<{ text: string; values?: unknown[] }> = [];
+  const client: ShadowQueryClient = {
+    query: async (text, values) => {
+      queries.push({ text, values });
+      return { rows: [], rowCount: 1 };
+    },
+  };
+  const context: KeyCapReservationContext = {
+    mode: 'shadow', quotaDay: '2026-10-16', operationId: 'op-shadow-settle', keyFingerprint: 'fp-shadow-settle', units: 1,
+  };
+  assert.equal(await settleKeyCapReservation(client, context), true);
+  assert.ok(queries.some(query => query.text === 'SAVEPOINT youtube_cap_shadow_settle'));
+  assert.ok(queries.some(query => query.text === 'RELEASE SAVEPOINT youtube_cap_shadow_settle'));
+
+  const failing: ShadowQueryClient = {
+    query: async (text) => {
+      if (text === 'SAVEPOINT youtube_cap_shadow_settle') return { rows: [] };
+      throw new Error('shadow settlement down');
+    },
+  };
+  assert.equal(await settleKeyCapReservation(failing, context), false);
+});
+
+test('settleShadowLease exact operation ID releases only that day/key lease', async () => {
+  const queries: Array<{ text: string; values?: unknown[] }> = [];
+  const client: ShadowQueryClient = {
+    query: async (text, values) => {
+      queries.push({ text, values });
+      return { rows: [], rowCount: 1 };
+    },
+  };
+  assert.equal(await settleShadowLease(client, {
+    quotaDay: '2026-10-16', operationId: 'op-exact', keyFingerprint: 'fp-exact',
+  }), true);
+  assert.match(queries[0].text, /operation_id = \$2 AND key_fingerprint = \$3/);
+  assert.deepEqual(queries[0].values?.slice(0, 3), ['2026-10-16', 'op-exact', 'fp-exact']);
+  assert.equal(queries[0].values?.length, 5);
+  assert.ok(queries[0].values?.[3] instanceof Date);
 });

@@ -1,16 +1,17 @@
-# Phase 1 quota cap shadow (migration 148) — unit + PostgreSQL tests.
+# Phase 1 quota cap (migration 148) — unit + PostgreSQL tests.
 #
 # Scratch-only: disposable postgres:17 service container, no production
 # resources are referenced. Applies the full migration lineage with the real
-# runner (including 148) and runs the shadow-accounting suites: boundary,
-# duplicate accounting, 20-way per-key concurrency, stale-lease sweep,
-# restart recovery and settlement release.
-name: Phase 1 quota shadow (148)
+# runner (including 148) and runs the shadow + default-OFF hard-cap suites:
+# boundary, duplicate accounting, 20-way per-key concurrency, stale-lease
+# sweep, restart recovery, exact settlement, Pacific midnight/DST.
+name: Phase 1 quota cap (148)
 
 on:
   push:
     branches:
       - phase1-hardening
+      - feat/youtube-key-hard-cap
   workflow_dispatch:
 
 permissions:
@@ -29,8 +30,8 @@ jobs:
       - run: npm install
       - name: TypeScript check
         run: npx tsc --noEmit
-      - name: Quota shadow and probe executor unit tests
-        run: npx tsx --test server/quotaKeyCapShadow.test.ts server/discovery/probeExecutor.test.ts
+      - name: Quota cap, dispatch-day, and probe executor unit tests
+        run: npx tsx --test server/quotaKeyCapShadow.test.ts server/dbCore.quota.test.ts server/discovery/probeExecutor.test.ts
 
   postgres:
     runs-on: ubuntu-latest
