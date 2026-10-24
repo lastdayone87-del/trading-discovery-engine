@@ -1,6 +1,6 @@
 # Phase 1 — durable source of truth
 
-Last updated: 2026-10-20 (post-#530 integration). This directory is the durable index for the Phase 1
+Last updated: 2026-10-24 (hard-cap and probe-allocation review hardening). This directory is the durable index for the Phase 1
 discovery work. It records decisions and evidence, not deployment state. When a
 document and a live system disagree, the live system wins and the document must
 be corrected.
@@ -9,10 +9,11 @@ be corrected.
 
 | Item | State |
 | --- | --- |
-| PR #531 (migrations 146/147/148 + discovery hardening) | Open; code/test head `8e696ed` (docs follow-up on top); all code workflows green at that head; round-1 fixes pushed; round-2 follow-ups pushed and all 20 threads resolved. PR Agent still fails only on `API_KEY_INVALID` (tooling), not code. Proposed merge SHA and gates: [PRE_MERGE_REPORT_20261020.md](PRE_MERGE_REPORT_20261020.md) |
-| PR #530 (discovery integrity) | **Merged into `phase1-hardening` at `6267ba1` by an external actor, not this session.** Added migrations 149–152 and changed the base/order; do not treat this as approval of #531 |
-| Migrations 148 and 149–152 | In the `phase1-hardening` lineage; applied only to disposable CI databases; **not** applied to production |
-| Hard cap (9,000 units/key/Pacific day) | Implemented on `feat/youtube-key-hard-cap` code/test head `2f4afdd`, rebased on current main `b1aafab` (docs commit on top); CI run [39527946479](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39527946479) green (51/51 unit, 21/21 PostgreSQL, 0 skipped); **default OFF, not deployed, not enabled** |
+| PR #531 (migrations 146/147/148 + discovery hardening) | **Merged** on 2026-10-20T23:37:42Z (with #532; #530 already merged). No merge, deploy, migration apply, or flag change was performed by this session |
+| PR #530 (discovery integrity) | **Merged into `phase1-hardening` at `6267ba1` by an external actor, not this session.** Added migrations 149–152 and changed the base/order |
+| Migrations 148–153 | Present on `main` (`13a151b`); migrations 154–155 are only on the stacked #546 branch. Applied only to disposable CI databases; **not** applied to production |
+| Hard cap (9,000 units/key/Pacific day) | Implemented on `feat/youtube-key-hard-cap` code/test head `c7fae59`, rebased on current main `13a151b`; CI run [40062160087](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40062160087) green (53/53 unit, 23/23 PostgreSQL, 0 skipped) and rotation run [40062163280](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40062163280) green (71/71); **default OFF, not deployed, not enabled** |
+| Probe-origin official allocation (#546) | Stacked on #533 at `ea92fdc`; default OFF, not deployed, migrations 154–155 unapplied. Option 2: probe-origin work may spend official quota only through its independent, capped Pacific-day bucket; no probe has been activated |
 | InnerTube production use | **Not authorized** — see [INNERTUBE_POLICY_POSITION_20261020.md](INNERTUBE_POLICY_POSITION_20261020.md) |
 | Probe pilot | **Not runnable** while the InnerTube position is unresolved; limits below. No probe has been run. Probe-ledger units are retrieval-only; delegated ingestion official spend is separately accounted |
 | GCP key-suspension investigation | **Open / access-blocked** — see [GCP_SUSPENSION_DIAGNOSTIC_20261020.md](GCP_SUSPENSION_DIAGNOSTIC_20261020.md) |

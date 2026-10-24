@@ -1,19 +1,21 @@
 # Unit 3 — 9,000-unit/key/day quota cap (shadow evidence + default-OFF enforcement)
 
-Date: 2026-10-19 (updated 2026-10-21) · Shadow branch `main`/`phase1-hardening` head
-`b1aafab`; hard-cap PR [#533](https://github.com/lastdayone87-del/trading-discovery-engine/pull/533)
-code head `ac32978`.
-Evidence runs: shadow [39500041358](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39500041358);
-hard cap [39597625145](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39597625145)
-and rotation [39597631538](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39597631538).
+Date: 2026-10-19 (updated 2026-10-24) · `origin/main` head `13a151b`;
+hard-cap PR [#533](https://github.com/lastdayone87-del/trading-discovery-engine/pull/533)
+code/test head `c7fae59` (rebased on current main).
+Current evidence runs: shadow [40062160087](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40062160087);
+rotation [40062163280](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40062163280).
+Historical evidence: shadow [39500041358](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39500041358);
+hard cap [39597625145](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39597625145).
 
 Status: the migration-148 shadow implementation is historical evidence. The
 hard-cap implementation on `feat/youtube-key-hard-cap` is **implemented but
 default OFF, not deployed and not enabled**. Key configuration changes and any
 change to official API traffic remain gated on explicit operator approval.
-PR #530 was merged into `phase1-hardening` at `6267ba1` by an external actor; the
-hard-cap branch is rebased on the resulting tree and includes migrations
-149–152. This session did not perform that merge.
+PR #530 was merged into `phase1-hardening` at `6267ba1` by an external actor;
+#531 and #532 merged on 2026-10-20. The hard-cap branch is rebased on current
+main and includes migrations 149–153. This session did not perform those
+merges.
 
 ## What shipped
 
@@ -24,7 +26,7 @@ hard-cap branch is rebased on the resulting tree and includes migrations
 | `server/quotaKeyCapShadow.ts` | Config, projection, classification, locking, dedupe, sweeps, savepoint settlement; default-OFF hard reservation/settlement |
 | `server/youtube.ts` (~line 438) | Dispatch hook: in-flight lease + projection observation for the dispatched key |
 | `server/dbCore.ts` (`incrementQuota`) | Settlement hook: releases one matching lease exactly once |
-| `server/quotaKeyCapShadow.test.ts` | 27 unit tests (18 shadow/operation + 9 hard-cap cases) |
+| `server/quotaKeyCapShadow.test.ts` | 29 unit tests (shadow, enforcement, and settlement cases) |
 | `server/quotaKeyCapShadow.postgres.test.ts` | PostgreSQL suite (dedicated-DB gated) |
 | `scripts/quota_shadow_replay.ts` | Offline 3-day CSV replay |
 | `.github/workflows/phase1-quota-shadow-tests.yml` | CI: tsc + unit tests + postgres:17 full lineage |
@@ -75,17 +77,20 @@ rows and runs no sweeps.
 
 ## Test evidence
 
-- Unit (local, `node --import tsx --test server/quotaKeyCapShadow.test.ts`):
-  **12/12 pass**; `npx tsc --noEmit` clean.
-- PostgreSQL (CI postgres:17, full migration lineage via `runMigrations.ts`,
-  includes 148): **8/8 pass, 0 skipped** — boundary, defer, duplicate
-  accounting, 20-way concurrency (10 admitted / 10 `WOULD_REJECT`, no skips),
-  stale-lease sweep + restart recovery, settlement release
-  (run https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39325618390).
-- Existing quota suites (local): 65/68 pass. The 3 failures are in
-  `server/quotaRecovery.test.ts` and reproduce identically on the pristine
-  commit `17002fb` (branch is 17 behind `origin/main`); they are pre-existing
-  and will be rechecked after the Unit 4 rebase.
+- Final head `c7fae59`, CI run
+  [40062160087](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40062160087):
+  `npx tsc --noEmit` clean; unit job **53/53 pass** (29 quota cap + 9 dbCore
+  quota + 15 probe executor) and PostgreSQL job **23/23 pass**, 0 skipped.
+- Rotation run
+  [40062163280](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40062163280):
+  **71/71 pass**, 0 skipped.
+- Historical initial migration-148 evidence: 12/12 unit locally; 8/8
+  PostgreSQL (run
+  [39325618390](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39325618390)).
+- Focused local suites on `c7fae59`: 34/34 dispatch/scheduler/settlement tests
+  pass. Four unrelated failures reproduce on the untouched tree
+  (`quotaPolicy` allocation/rollover/shared-capacity cases and one
+  `youtubeProviderShadowQuality` Latin-script case); they are pre-existing.
 - Rollback proof fix: the 146/147 workflow now excludes migration 148
   (`pre_state_max_version` regression on `c0d8318`), green on `b62c45a`/`ef7b4c0`.
 
@@ -158,10 +163,11 @@ main's 145.
 
 ## Hard-cap enforcement (default OFF) — implementation on `feat/youtube-key-hard-cap`
 
-Date: 2026-10-21 · Branch `feat/youtube-key-hard-cap` code head `ac32978`, based on
-current main `b1aafab` (merged #530, #531, #532) · Status:
-**implemented, disabled by default, not deployed, not enabled.** Production
-remains unchanged and no migration has been applied to it.
+Date: 2026-10-21 (updated 2026-10-24) · Branch `feat/youtube-key-hard-cap`
+code/test head `c7fae59`, based on current main `13a151b` (merged #530, #531,
+#532) · Status: **implemented, disabled by default, not deployed, not
+enabled.** Production remains unchanged and no migration has been applied to
+it.
 
 ### Design
 
@@ -215,9 +221,16 @@ remains unchanged and no migration has been applied to it.
   response, fetch failure or timeout. The outcome is ambiguous and may already
   have consumed provider quota, so the lease remains until the Pacific day
   reset; this is conservative and can under-admit, but cannot overrun the cap.
-  Shadow reservations are observational and may release on failure because their
-  TTL bounds the effect. Successful responses settle the exact lease; if
-  accounting fails, the lease stays in place.
+  A reservation refused **before dispatch** (the Pacific day changed between
+  reservation and dispatch, or the caller aborted) is different: nothing was
+  sent, so the exact lease is released through the settlement path instead of
+  holding capacity until reset. Shadow reservations are observational and may
+  release on failure because their TTL bounds the effect. Successful responses
+  settle the exact lease; if accounting fails, the lease stays in place.
+- **Post-accounting parse failures:** featured-channel and playlist loops
+  account a successful provider response exactly once. If body parsing then
+  fails, the error is rethrown instead of failing over to another key, so one
+  job cannot be charged for two provider requests.
 
 ### Fail-closed semantics (only when enabled)
 
@@ -274,14 +287,18 @@ rejected); settlement failure leaving the conservative lease; Pacific midnight
 + both DST rollovers; restart with a new pool observing persisted leases; and
 two probe-budget concurrency cases.
 
-CI results for final code head `ac32978`:
+CI results for final code/test head `c7fae59`:
 
-- quota shadow run [39597625145](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39597625145):
-  `npx tsc --noEmit` clean; **51/51 unit** (27 quota cap + 9 dbCore quota +
-  15 probe executor) and **21/21 PostgreSQL**, 0 skipped; **72/72 total**.
-- rotation run [39597631538](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39597631538):
-  **69/69 pass**, 0 skipped.
-- The 3954440 run initially exposed two time-dependent PostgreSQL cases that
+- quota shadow run [40062160087](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40062160087):
+  `npx tsc --noEmit` clean; **53/53 unit** (29 quota cap + 9 dbCore quota +
+  15 probe executor) and **23/23 PostgreSQL**, 0 skipped; **76/76 total**.
+- rotation run [40062163280](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/40062163280):
+  **71/71 pass**, 0 skipped.
+- Historical `ac32978` evidence: 51/51 unit and 21/21 PostgreSQL (run
+  [39597625145](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39597625145)),
+  rotation 69/69 (run
+  [39597631538](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39597631538)).
+  The 3954440 run initially exposed two time-dependent PostgreSQL cases that
   used wall-clock `now` against fixed-day rows. The test-only fix at `ac32978`
   pins the dispatch/tombstone instant; the rerun is green. No production-code
   behavior changed in that test fix.
@@ -304,13 +321,34 @@ Documented rather than changed:
   before spending provider units;
 - the added dispatch-day accounting check remains a source-contract test, while
   the PostgreSQL suite executes settlement/rollback/restart/midnight cases;
-- an abort during reservation may leave a conservative lease until Pacific
-  midnight (under-admission, never over-spend).
+- an ambiguous **post-dispatch** failure (non-OK response, fetch error or
+  timeout) may leave a conservative lease until Pacific midnight
+  (under-admission, never over-spend).
 
+### Round-3 review disposition (`c7fae59`)
+
+Fixed:
+
+- featured-channel and playlist loops no longer refetch after a successful
+  response was already accounted and then failed body parsing, so one job
+  cannot spend two provider requests;
+- a reservation refused before dispatch (Pacific-day mismatch) and a lease
+  admitted before a caller abort are released through the exact tombstone
+  path instead of holding capacity until the day reset.
+
+Documented rather than changed:
+
+- the bounded settings read fails closed at its deadline, but the underlying
+  PostgreSQL query cannot be cancelled by that deadline. Dispatch is released
+  on time; the query finishes in the background. This is a framework
+  limitation, not evidence of a successful OFF read;
+- the source-contract scheduler assertion was updated to the current
+  `youtubeRequestScheduler.run(()=>{` shape; it remains a structural check, not
+  a behavioral substitute for the runtime suite.
 
 ### Rollout gates (all required before enabling)
 
-1. Migrations 146–152 (including the reused 148 leases and 151 tombstones)
+1. Migrations 146–153 (including the reused 148 leases and 151 tombstones)
    applied by the normal deploy migration runner; no manual DDL.
 2. CI postgres suite green against postgres:17 with the dedicated URL.
 3. Sustained shadow evidence reviewed: `WOULD_DEFER`/`WOULD_REJECT` rates,
