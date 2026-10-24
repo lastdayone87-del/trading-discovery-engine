@@ -1,29 +1,33 @@
-# Phase 1 verification and pre-merge report — 2026-10-21
+# Phase 1 verification and pre-merge report — 2026-10-24
 
 Status: **STOPPED FOR EXPLICIT APPROVAL.** This session has not merged,
 deployed, applied a production migration, changed a flag/setting, activated
 enforcement, resumed a queue, or run a probe. PR #531 was already merged by an
 external actor; this report records that fact and does not attempt to undo it.
 
-This version supersedes the 2026-10-20 draft and is updated in the existing
-`feat/youtube-key-hard-cap` / PR #533 workstream. No separate docs-only PR was
-opened.
+This version supersedes the 2026-10-21 draft and is updated in the existing
+`feat/youtube-key-hard-cap` / PR #533 workstream. #546 is stacked on #533 and
+#545 is independent; no separate docs-only PR was opened.
 
 ## 1. Verdict
 
 - **PR #531** merged externally at `2026-10-20T23:37:42Z`; GitHub reports merge
   commit `b1aafabf506c5c86856ec2e9f87e50591854c69b`. Its net diff is **106
   files, +14,595/−358** from base `82e60e7`.
-- **PR #533** is open against `main` at `b1aafab`, code head `ac32978`, default
-  OFF. It is not merged, deployed, or enabled.
-- **Probe activation is blocked** by Thread 77 (no structural zero-official-unit
-  guarantee) and by the InnerTube policy (production use not authorized). No
-  production probe date is currently defensible.
-- **24 October is not a deployment date.** It was only the hypothetical end of
-  a 72-hour observation if a pilot had started on 21 October. No pilot started.
-- **26 October is the earliest conditional integration/pilot-stack deployment
-  date** (default OFF), not an activation date. The earliest conditional probe
-  activation is **27 October**, and only after every gate below is satisfied.
+- **PR #533** is open against `main`; code/test head `8683a11` plus this docs
+  amendment, default OFF. It is not merged, deployed, or enabled.
+- **PR #546** is open and **stacked on #533**; code head `9be594f` plus this
+  docs amendment. It adds the independent probe-origin allocation; default OFF,
+  not deployed, not activated.
+- **PR #545** is open against `main`; head `8f16150`. It adds the default-OFF
+  adaptive creator-derived pilot and the predeclared 14-day plan; no live data.
+- **Probe activation is blocked by the InnerTube policy and missing approval,
+  not by a zero-official-unit requirement.** Option 2 is adopted: probe-origin
+  official work may spend official quota, capped at 10,000 units/Pacific day by
+  #546 and at 9,000/key/day by #533 when enforcement is on. No production probe
+  date is currently defensible.
+- **No deployment date is set.** Any future deployment is default OFF and
+  requires the explicit approvals in section 9.
 
 ## 2. PR #531 merge, exact scope, and compatibility
 
@@ -76,8 +80,9 @@ files.
 ## 3. PR #533 review, tests, and dispositions
 
 PR: [#533](https://github.com/lastdayone87-del/trading-discovery-engine/pull/533)
-· base `b1aafab` · branch `feat/youtube-key-hard-cap` · code head `ac32978` ·
-default OFF · no new migration.
+· base `main` · branch `feat/youtube-key-hard-cap` · code/test head `8683a11`
+· default OFF · no new migration in #533 itself (the probe/adaptive stack adds
+154–156).
 
 ### Review rounds and heads
 
@@ -88,34 +93,44 @@ default OFF · no new migration.
    (literal-`true` parsing, cold-settings handling, post-spend refetch, and an
    old test assertion). Fixes landed at `3954440`; test-only Pacific-day fixes
    landed at `8283bcd` and `ac32978`.
-3. **No third feature/review round was requested.** `ac32978` is the
-   stabilization head. Any further bot comment is triaged as a disposition, not
-   as a new design round.
+3. **Round 3 (Qodo)** — findings 1, 2, and 4 were fixed at `8683a11`; finding 3
+   is a small behavior fix included there; findings 5/6 are this docs
+   amendment; finding 7 is accepted conservative behavior (below).
 
 ### CI and local evidence
 
-| Head | Evidence | Result |
-| --- | --- | --- |
-| `c39b965` | quota shadow run [39536992512](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39536992512) | **51/51 unit + 21/21 PostgreSQL**, 0 skipped |
-| `c39b965` | rotation run [39536998343](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39536998343) | **69/69 pass**, 0 skipped |
-| `3954440` | local `tsc` + 5 focused files | **103/103 pass**; tsc clean |
-| `3954440` | quota shadow CI | unit green; PostgreSQL exposed two time-dependent tests (see below) |
-| `ac32978` | quota shadow run [39597625145](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39597625145) | **51/51 unit + 21/21 PostgreSQL**, 0 skipped; **72/72 total** |
-| `ac32978` | rotation run [39597631538](https://github.com/lastdayone87-del/trading-discovery-engine/actions/runs/39597631538) | **69/69 pass**, 0 skipped |
+At `8683a11`, `npm run lint` is clean and the focused quota/scheduler/
+settlement suite is **59/59 pass** locally. The broader local 310-test batch had
+282 pass, 23 skip, and 5 failures; all 5 are pre-existing at `7be108a`
+(confirmed by stashing the changes): three `quotaRecovery`, one
+`youtubeLiveProviderDispatch`, and one `youtubeProviderShadowQuality`. They are
+not introduced by this PR.
 
-At `c39b965`, every PR check was green except **PR Agent review**. Its log
-shows Gemini `API_KEY_INVALID`; that is an infrastructure failure, not a code
-finding. It is not claimed as passing.
-
-At `3954440`, PostgreSQL reported 19/21 because two tests used wall-clock
-`now` while their seed rows were pinned to `2026-10-20`. The CI run crossed the
-Pacific day boundary. `8283bcd` froze `now: fixedNow` in the dispatch calls;
-`ac32978` also evaluated the settlement tombstone at that frozen instant. These
-are test-only corrections, not production-code changes. The final rerun is
-72/72 unit+PostgreSQL and 69/69 rotation, with 0 skipped.
+PostgreSQL tests are CI-only on this host (the local server attempt was
+abandoned); the dedicated-URL CI run is the database proof. **The final CI run
+at the docs head is recorded in the PR checks and the consolidated report.**
+Every code workflow was green before this docs amendment; **PR Agent review**
+fails only on Gemini `API_KEY_INVALID` (tooling), not on a code finding, and is
+not claimed as passing.
 
 ### Findings fixed in this PR
 
+- **Qodo 1 — malformed successful responses held capacity.** Accounting now
+  runs before parsing in locator resolution, channel-first, channel-uploads,
+  channel, enrichment-playlists, and enrichment-video-details. A malformed 2xx
+  still settles its reservation instead of leaving a lease until reset and
+  rotating keys.
+- **Qodo 2 — mixed shadow/enforced writers used separate locks.** Both modes
+  now use one `youtube-key-cap:<day>:<fingerprint>` advisory namespace, so an
+  enforced projection sees a concurrent shadow lease. PostgreSQL tests cover
+  deterministic mixed contention and concurrent mixed-mode admission.
+- **Qodo 3 — a capped optional follow-up discarded paid results.** The
+  100-unit recent-video search snippets are preserved when the optional
+  1-unit video-details call is cap-rejected or fails; accounting failures still
+  surface.
+- **Qodo 4 — 429 retries exhausted capacity.** A 429 that carries a live
+  reservation is tagged and surfaced once instead of replaying the dispatch
+  closure; plain 429s keep the bounded scheduler retry budget.
 - Pacific-midnight reservation is fail-closed on a day change.
 - Enforced admission no longer performs optional lease/event sweeps; DB
   connection and statement waits are bounded.
@@ -164,42 +179,46 @@ are test-only corrections, not production-code changes. The final rerun is
   bounded read per 30-second cache window is required to know whether a hard
   cap applies before spending provider units. The shadow path remains
   fire-and-forget.
+- **Qodo 7: a timed-out/ambiguous dispatch keeps its lease.** Accepted by
+  design. YouTube may count a request that never returned a response, so
+  releasing the lease could over-admit. The lease expires at the Pacific
+  reset; this is conservative under-admission, not over-spend.
 
-## 4. Thread 77 — zero-unit probe versus the 9,000-unit cap
+## 4. Thread 77 — resolved by option-2 allocation
 
-**Conclusion: Thread 77 remains an activation blocker. Zero official API units
-are not structurally guaranteed.**
+**Conclusion: the zero-official-unit requirement is withdrawn. Probe-origin
+official work is allowed only through the #546 reservation fence.**
 
-The code path is:
+The old blocker was real: `defaultIngestChannel` delegates to
+`processChannelThroughPipeline`, which can call `channels.list` and enqueue
+`ENRICH_CHANNEL` jobs that later call the ordinary `youtubeFetch` path. The
+probe ledger's `units: 0` covers only the InnerTube retrieval page, so it was
+never a total-spend guarantee.
 
-1. `server/discovery/probeExecutor.ts:152-164` — `defaultIngestChannel`
-   dynamically imports and calls `processChannelThroughPipeline(...)`.
-2. `server/ingestionPipeline.ts:268` — if country or subscriber evidence is
-   missing, the pipeline calls `fetchYouTubeChannelCountryMetadata(...)`, which
-   reaches official `channels.list` through `youtubeFetch`.
-3. `server/ingestionPipeline.ts:749-756` — the same pipeline can schedule or
-   enqueue `ENRICH_CHANNEL` jobs. Those jobs later execute official calls
-   through the normal YouTube path.
-4. `server/youtube.ts:480-497` (hard-cap branch) — reservation happens only if
-   `youtube_key_daily_cap_enforced` resolves to `true`; otherwise the path is
-   shadow-only. Even when enabled, the reservation enforces a **9,000-unit
-   per-key/day ceiling**, not a zero-unit budget.
-5. `server/discovery/probeExecutor.ts:461-465, 478-489` — the probe result
-   hard-codes `units: 0`; that field covers the InnerTube retrieval page only.
-6. `server/discovery/probeLedger.ts:685-687` — the `allowOfficial` setting
-   rejects only route `youtube-data-api`. It does not fence downstream official
-   hydration/enrichment, which uses the ordinary pipeline.
-7. `server/discovery/probeGateSafety.test.ts:57-68` — the “no official API”
-   test checks only direct imports/network clients in the two probe modules. It
-   explicitly permits the delegated `processChannelThroughPipeline` at
-   `:72-75`; it does not follow transitive imports or queued jobs.
+Option 2 replaces that requirement with a durable, capped, accounted path:
 
-Therefore a probe can record `units: 0` while the delegated pipeline spends
-official units. The hard cap limits the maximum spend when enabled; it does not
-make the probe zero-spend, and it is default OFF. The required safeguard is a
-durable probe-origin “official quota forbidden” fence propagated through
-ingestion and queued jobs, fail-closed before every `youtubeFetch`; or a
-retrieval/staging-only ingestion path. No such fence is implemented.
+- `quota_origin` (migration 154) is carried from probe discovery onto channels
+  and jobs, so a queued enrichment/recovery retains `PROBE` provenance.
+- Before every official dispatch, `youtubeFetch` resolves the origin and calls
+  `reserveProbeQuota`; a missing/disabled/malformed allocation fails closed.
+- The reservation takes the shared `youtube-key-cap:<day>:<fingerprint>` lock
+  and the global `youtube-probe-quota:<day>` lock, checks the 10,000-unit
+  bucket and (when #533 enforcement is on) the 9,000/key projection, and
+  inserts one `allocation='PROBE'` lease.
+- Settlement removes that lease and increments `youtube_probe_quota_usage` in
+  the same transaction as the official charge. A retry/recovery reserves
+  independently; a concurrent job cannot overrun either control.
+- Direct hydration, queued enrichment, retries, recovery, and key failover all
+  use this path. A 429 carrying either a probe or key-cap reservation is not
+  replayed by the scheduler.
+
+Verification covers: the source-order lock test, the idempotent/retry and
+exactly-once settlement PostgreSQL tests, the 20-way bucket concurrency test,
+the mixed probe/enforced per-key contention test, and the existing #533
+mixed-mode tests. See [PROBE_QUOTA_ALLOCATION_20261024.md](PROBE_QUOTA_ALLOCATION_20261024.md).
+
+This does **not** authorize a probe. The InnerTube policy, explicit activation,
+and the canary gates still apply.
 
 ## 5. Reported 119 failures versus current `main`
 
@@ -243,32 +262,30 @@ Consequences:
 
 - No production probe or product InnerTube traffic is authorized.
 - The probe ledger’s official-route gate is not a substitute for provider
-  permission, and it does not cover Thread 77’s downstream official calls.
+  permission. Downstream official calls are covered by the #546 reservation
+  fence, not by the retrieval ledger.
 - No probe start date is defensible under current policy, regardless of the
-  code schedule below. A policy/route decision must precede activation.
+  code sequence below. A policy/route decision must precede activation.
 
-## 7. Dated parallel schedule — resolving 24 October versus 26 October
+## 7. Conditional sequence (no dates promised)
 
-All dates are conditional. They are not approvals and do not authorize a merge,
+All steps are conditional. They are not approvals and do not authorize a merge,
 deployment, migration, flag change, or probe.
 
-| Date (UTC) | Track A — integration / hard cap | Track B — probe / pilot | Gate |
+| Step | Track A — integration / hard cap | Track B — probe / pilot | Gate |
 | --- | --- | --- | --- |
-| **2026-10-21** | Final stabilization head `ac32978`; record CI; no merge | Thread 77 fence design; policy review; no probe | This report; explicit operator decision |
-| **2026-10-22** | If approved: merge #533 and deploy **default OFF**; apply migrations only through the normal runner | Confirm authorized route or keep probes disabled | Merge/deploy approval; production migration status check |
-| **2026-10-23** | Verify absent/false setting, shadow-only behavior, rollback path | Implement/review the official-quota fence; no probe | Post-deploy verification |
-| **2026-10-24** | **No deployment event.** This is only the hypothetical 72-hour observation endpoint for a 21 October start, which did not occur | No probe | No gate can open on this date |
-| **2026-10-25** | Buffer / rollback checkpoint | Policy/fence completion only | No automatic action |
-| **2026-10-26** | **Earliest conditional integration/pilot-stack deployment** (default OFF; no enforcement) | No activation | All code, migration, rollback, and approval gates |
-| **2026-10-27** | Soak/verification | **Earliest conditional probe activation**; first probe, 10/day maximum | Thread 77 fence + written policy/route authorization + explicit activation approval |
-| **2026-10-29** | — | 30th probe; canary data complete at 10/day | Persistence/qualification audit |
-| **2026-10-30 07:00Z** | — | 72-hour observation ends if the pilot started 27 October 07:00Z | Observation window is not code-enforced |
+| 1 | Merge #533 at `8683a11`+docs, then #546 at `9be594f`+docs; deploy **default OFF** | Keep probes disabled | Explicit merge/deploy approval |
+| 2 | Apply 154/155/156 through the normal runner; verify settings absent and no behavior change | Confirm policy/route decision | Migration/deploy approval; production migration state check |
+| 3 | Verify absent/false setting, shadow-only behavior, rollback path | Confirm the 10,000-unit probe allocation, fail-closed absent state, and cap enforcement procedure | Post-deploy verification |
+| 4 | Choose enforcement timing; run the shadow drain (lease TTL/provider timeout, preferably a full Pacific day) before enabling #533 | No probe until written authorization and explicit activation | Separate enforcement approval |
+| 5 | Enable `youtube_key_daily_cap_enforced=true` only after the drain; monitor `YOUTUBE_KEY_CAP_*` | First probe only after activation; 10/day maximum | Separate activation approvals |
+| 6 | Soak/rollback checkpoint | 30th probe + persistence/qualification audit | Canary decision rule |
+| 7 | — | 72-hour observation if configured | Deadline is config-only, not code-enforced |
 
-**Resolution:** 24 October is not a deployment date; it is a void hypothetical
-observation endpoint. 26 October is the earliest conditional deployment of the
-pilot stack with flags OFF, not a pilot start. 27 October is the earliest
-conditional activation, and only if the policy and Thread 77 gates are actually
-closed. Under current policy, even 27 October is not authorized.
+**Resolution:** no calendar date is currently defensible. The prior 24 October
+and 26 October references were hypothetical and are withdrawn. The sequence
+above starts only after explicit approval; even then, probe activation requires
+the separate InnerTube/policy gate.
 
 ## 8. First qualified creator — conditional forecast
 
@@ -280,10 +297,20 @@ returned channels, staged candidates, or review-only rows do not count.
 Measured paid-search baselines (996 runs, 173,300 units, 2026-10-02 → 10-18):
 **41.9 qualified / 1,000 units** across all runs; **29.1 qualified / 1,000
 units** for paid YouTube search only. These are **not convertible** to a
-per-probe rate: a probe is one InnerTube page of up to 20 channels at zero
-official units, not a 100-unit search call. The historical free-InnerTube
-aggregate is not a per-probe denominator. There is no observed probe-stage
-yield baseline.
+per-probe rate: a probe retrieval page is unbilled, and its delegated official
+work is capped separately. The historical free-InnerTube aggregate is not a
+per-probe denominator. There is no observed probe-stage yield baseline.
+
+Expected **official units per qualified creator** under option 2:
+
+- paid-search comparator: **≈34 units** (1,000 / 29.1);
+- probe stage 1: **2 units per ingested channel**, ≈40 units per 20-channel
+  probe;
+- at the 5% canary bar (1 qualified creator / 20 probes): **≈800 units per
+  qualified creator**, range **≈400–1,200** at 3.3–10%;
+- stage-2 enrichment can add up to 101 units per enriched channel and must be
+  reported separately. See
+  [PROBE_QUOTA_ALLOCATION_20261024.md](PROBE_QUOTA_ALLOCATION_20261024.md).
 
 Planning scenarios below assume independent probes with a constant probability
 `p` of at least one persisted qualified net-new creator per probe, and 30
@@ -295,15 +322,14 @@ probes:
 | 1 in 20 (5%) | 1.5 | 21.5% | 78.5% |
 | 1 in 10 (10%) | 3.0 | 4.2% | 95.8% |
 
-If activation occurred on 27 October at 10 probes/day, the technical earliest
-first creator is **27 October** (the first probe). At `p=5%`, the 50% point is
-about 14 probes, during **28 October**; at `p=10%`, about 7 probes, on
-**27 October**; at `p=3.3%`, about 21 probes, on **29 October**. These are
-scenario medians, not promises.
+At 10 probes/day, the first creator could appear on activation day 0. At
+`p=5%`, the 50% point is about 14 probes (activation day 1); at `p=10%`, about
+7 probes (day 0); at `p=3.3%`, about 21 probes (day 2). These are scenario
+medians, not promises or dates.
 
 **Defensible estimate:** 1–3 creators over a 30-probe tranche, with a 64–96%
 chance of at least one for `p=3.3–10%`; **low confidence**, because no probe
-yield has been observed and the InnerTube policy/Thread 77 gates are not
+yield has been observed and the InnerTube policy/activation gates are not
 closed. Do not report a point estimate as observed yield.
 
 ## 9. Gates still closed and required approvals
@@ -312,16 +338,23 @@ No merge, deployment, production migration apply, app-settings/flag change,
 enforcement activation, queue unpause/resume, or probe has been performed by
 this session. Remaining gates:
 
-1. Explicit approval to merge #533 (code + this report) at `ac32978`/this docs
-   head.
+1. Explicit approval to merge #533 at `8683a11`+docs, then #546 at
+   `9be594f`+docs; #546 must not merge independently. #545 follows separately.
 2. Explicit approval to deploy, with a verified rollback path and normal-runner
    migration apply; production migration state is currently unverified.
-3. Separate approval to activate `youtube_key_daily_cap_enforced=true`.
-4. A structural Thread 77 fence plus tests proving no probe-origin official
-   spend can bypass it.
+3. Verify migrations 154/155/156 are additive and that absent settings produce
+   no probe reservation, adaptive proposal, or enforcement.
+4. Separate approval to activate `youtube_key_daily_cap_enforced=true`, after
+   the shadow drain in
+   [PROBE_QUOTA_ALLOCATION_20261024.md](PROBE_QUOTA_ALLOCATION_20261024.md).
 5. Written InnerTube/provider authorization, or an approved official-route
    replacement, before any probe.
-6. Explicit pilot activation approval and a configured observation deadline.
+6. Explicit probe activation approval, `youtube_probe_official_quota_enabled`
+   + a valid 10,000-unit cap, and a configured observation deadline.
+7. Explicit adaptive pilot approval, including
+   `frontier_allocation_enabled=true` and the four-country eligible scope; the
+   14-day read is predeclared in
+   [ADAPTIVE_DISCOVERY_PILOT_20261024.md](ADAPTIVE_DISCOVERY_PILOT_20261024.md).
 
 ## Appendix A — 53 #530-only inherited files in the #531 merge
 

@@ -189,8 +189,10 @@ it.
   `cap:${operation}:${uuid}` identity is generated per dispatch and reused for
   the lease and response settlement.
 - **Transaction:** one short transaction per dispatch with
-  `pg_advisory_xact_lock(hashtext('youtube-key-cap-enforce:<day>:<fingerprint>'))`
-  and `SET LOCAL lock_timeout = '5000ms'`. The projection is
+  `pg_advisory_xact_lock(hashtext('youtube-key-cap:<day>:<fingerprint>'))`
+  and `SET LOCAL lock_timeout = '5000ms'`. Shadow and enforced writers share
+  this one namespace so a mixed-mode rollout cannot project past a concurrent
+  lease. The projection is
   `youtube_key_quota_usage.units_used + SUM(unexpired leases)` for that
   key/day. A lease is inserted only when `projected + units <= 9000`; the
   admission boundary is exactly 9,000 (8,999 + 1 admitted, 9,000 + 1 denied).
@@ -306,12 +308,25 @@ CI results for final code/test head `c7fae59`:
   is the database proof. No enforcement claim is made from shadow observations,
   and this run did not enable or deploy the feature.
 
-### Round-2 review disposition
+### Review disposition through 2026-10-24
 
 Fixed at `3954440`/`8283bcd`/`ac32978`: literal-`true` parsing, cold/stale
 settings fail-closed behavior, post-spend accounting failures stopping key
 failover, the stale `youtubeKeyHealth.test.ts` assertion, removal of the
 enforced-path sweep, and the Pacific-day test freeze.
+
+Fixed at `8683a11` (Qodo round):
+
+- **Malformed successful responses:** accounting now precedes parsing in every
+  official response path, so a 2xx body that fails validation still settles.
+- **Mixed shadow/enforced locking:** both writers share
+  `youtube-key-cap:<day>:<fingerprint>`. PostgreSQL tests cover deterministic
+  contention and concurrent mixed-mode admission.
+- **Optional follow-up:** a cap-rejected `video-details` call no longer
+  discards the already-paid 100-unit search snippets.
+- **Bounded 429 retries:** a 429 carrying a live reservation is tagged and
+  surfaced once; the scheduler no longer replays the closure and reserves the
+  full cost on every attempt.
 
 Documented rather than changed:
 
@@ -348,15 +363,20 @@ Documented rather than changed:
 
 ### Rollout gates (all required before enabling)
 
-1. Migrations 146–153 (including the reused 148 leases and 151 tombstones)
-   applied by the normal deploy migration runner; no manual DDL.
+1. Migrations 146–155 (including the reused 148 leases, 151 tombstones,
+   154 origin, and 155 probe allocation) applied by the normal deploy migration
+   runner; no manual DDL.
 2. CI postgres suite green against postgres:17 with the dedicated URL.
 3. Sustained shadow evidence reviewed: `WOULD_DEFER`/`WOULD_REJECT` rates,
    lock timeouts, day-reset recovery, and key headroom per quota group.
-4. Explicit operator approval to set `youtube_key_daily_cap_enforced=true`.
-5. Canary enablement per environment, then monitor `YOUTUBE_KEY_CAP_EXCEEDED`
+4. **Drain:** run shadow mode for at least the lease TTL (120 s) plus the
+   provider timeout, and preferably one full Pacific day, before switching.
+   Avoid mixed cached-OFF/enforced traffic during the switch; the shared lock
+   makes mixed modes safe, but the drain removes observational ambiguity.
+5. Explicit operator approval to set `youtube_key_daily_cap_enforced=true`.
+6. Canary enablement per environment, then monitor `YOUTUBE_KEY_CAP_EXCEEDED`
    and `YOUTUBE_KEY_CAP_UNAVAILABLE` rates and provider rotation behavior.
-6. Rollback is immediate: set the setting to `false` (or delete the row). The
+7. Rollback is immediate: set the setting to `false` (or delete the row). The
    legacy shadow path resumes; already-created enforced leases remain until the
    Pacific day reset (conservative). The enforced admission path has no sweep;
    expired leases are excluded from the projection.
