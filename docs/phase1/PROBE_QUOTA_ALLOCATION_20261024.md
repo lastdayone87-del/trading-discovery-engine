@@ -98,6 +98,12 @@ bucket is additive and isolated, and the only shared limit is #533's per-key
   `UNKNOWN` before their handlers ran was fixed at `c29ccc8` and covered by a
   regression test. Genuinely unknown or malformed provenance still fails
   closed before provider work.
+- A provenance read failure is retryable (`QUOTA_ORIGIN_UNAVAILABLE`) and
+  spends nothing. Terminal `UNKNOWN` is thrown inside the dispatcher's handler
+  `try`, so the normal job-attempt transition and job-specific cleanup run
+  while no provider request can occur. Probe refusals are rethrown by every
+  provider loop instead of being hidden by key failover or a fallback
+  `UNAVAILABLE` metadata result.
 
 ## Enforcement switch-on and shadow drain
 

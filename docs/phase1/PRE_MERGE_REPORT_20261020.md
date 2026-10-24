@@ -16,7 +16,7 @@ This version supersedes the 2026-10-21 draft and is updated in the existing
   files, +14,595/−358** from base `82e60e7`.
 - **PR #533** is open against `main`; code/test head `8c0e4eb` plus this docs
   amendment, default OFF. It is not merged, deployed, or enabled.
-- **PR #546** is open and **stacked on #533**; code head `c29ccc8` plus this
+- **PR #546** is open and **stacked on #533**; code head `62c5f30` plus this
   docs amendment. It adds the independent probe-origin allocation; default OFF,
   not deployed, not activated.
 - **PR #545** is open against `main`; head `8f16150`. It adds the default-OFF
@@ -231,6 +231,29 @@ resolve as `NORMAL` and keep their own adapter budgets; an explicit
 `quotaOrigin: 'PROBE'` hint still wins. Genuinely unknown/malformed provenance
 continues to fail closed before provider work.
 
+Three further review findings were fixed at `62c5f30`:
+
+- `decideJobFailure` now matches only the probe-specific
+  `probeQuotaExceeded`/`probeQuotaDisabled` markers. The shared normal
+  `QUOTA_ALLOCATION_EXHAUSTED` code keeps its six-hour transient age limit, and
+  `PROBE_QUOTA_UNAVAILABLE` remains retryable infrastructure with its 60-second
+  retry hint. A probe-capacity refusal still defers without consuming an
+  attempt.
+- Channel-search, recent-video, enrichment, country-metadata, playlist,
+  featured-channel, and locator provider loops rethrow probe refusals before
+  `recordProviderFailure` and before trying the next key. The probe allocation
+  is one Pacific-day bucket, so key failover cannot change the outcome and must
+  not hide the refusal as missing metadata.
+- A provenance database read failure now throws retryable
+  `QuotaOriginUnavailableError`. Terminal `UNKNOWN` is thrown inside the
+  dispatcher's handler `try`, so the normal catch, job-attempt transition, and
+  job-specific cleanup/projection paths run instead of an early `failJob`.
+  Non-channel canaries remain on their ordinary adapter budgets.
+
+Regression coverage was added for the age-limit split, the retryable/terminal
+provenance distinction, the dispatcher lifecycle ordering, and a source
+contract over every provider loop.
+
 Verification covers: the source-order lock test, the idempotent/retry and
 exactly-once settlement PostgreSQL tests, the 20-way bucket concurrency test,
 the mixed probe/enforced per-key contention test, the non-channel canary
@@ -294,7 +317,7 @@ deployment, migration, flag change, or probe.
 
 | Step | Track A — integration / hard cap | Track B — probe / pilot | Gate |
 | --- | --- | --- | --- |
-| 1 | Merge #533 at `8c0e4eb`+docs, then #546 at `c29ccc8`+docs; deploy **default OFF** | Keep probes disabled | Explicit merge/deploy approval |
+| 1 | Merge #533 at `8c0e4eb`+docs, then #546 at `62c5f30`+docs; deploy **default OFF** | Keep probes disabled | Explicit merge/deploy approval |
 | 2 | Apply 154/155/156 through the normal runner; verify settings absent and no behavior change | Confirm policy/route decision | Migration/deploy approval; production migration state check |
 | 3 | Verify absent/false setting, shadow-only behavior, rollback path | Confirm the 10,000-unit probe allocation, fail-closed absent state, and cap enforcement procedure | Post-deploy verification |
 | 4 | Choose enforcement timing; run the shadow drain (lease TTL/provider timeout, preferably a full Pacific day) before enabling #533 | No probe until written authorization and explicit activation | Separate enforcement approval |
@@ -359,7 +382,7 @@ enforcement activation, queue unpause/resume, or probe has been performed by
 this session. Remaining gates:
 
 1. Explicit approval to merge #533 at `8c0e4eb`+docs, then #546 at
-   `c29ccc8`+docs; #546 must not merge independently. #545 follows separately.
+   `62c5f30`+docs; #546 must not merge independently. #545 follows separately.
 2. Explicit approval to deploy, with a verified rollback path and normal-runner
    migration apply; production migration state is currently unverified.
 3. Verify migrations 154/155/156 are additive and that absent settings produce
