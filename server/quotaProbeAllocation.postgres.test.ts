@@ -215,9 +215,16 @@ maybe('reservation retry is idempotent and settlement is exactly-once', async ()
   assert.equal(first.operationId, retry.operationId);
   assert.equal(await leaseCount(prefix), 1, 'a duplicate attempt reuses one lease');
 
+  // Settlement uses a savepoint because production always calls it inside
+  // incrementQuota's transaction. Mirror that contract here.
   const client = await requirePool().connect();
   try {
+    await client.query('BEGIN');
     assert.equal(await settleProbeQuotaReservation(client, first), true);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
   } finally {
     client.release();
   }
@@ -226,7 +233,12 @@ maybe('reservation retry is idempotent and settlement is exactly-once', async ()
 
   const secondClient = await requirePool().connect();
   try {
+    await secondClient.query('BEGIN');
     assert.equal(await settleProbeQuotaReservation(secondClient, first), false);
+    await secondClient.query('COMMIT');
+  } catch (error) {
+    await secondClient.query('ROLLBACK').catch(() => undefined);
+    throw error;
   } finally {
     secondClient.release();
   }
