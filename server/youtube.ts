@@ -547,6 +547,15 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
           if(dispatchedProviderKey){
             const consumerSuspended=isConsumerSuspended(error);
             const runtimeRateLimited=isYouTubeRateLimited(error);
+            // A quota reservation was already written for this dispatch. Do
+            // not let the scheduler re-run the whole dispatch closure up to
+            // 30 times on raw 429s: each retry would reserve another full
+            // request cost while the failed leases remain conservative until
+            // reset. Surface it once and let the caller's bounded key
+            // failover decide whether another provider is worth trying.
+            if(runtimeRateLimited&&capReservation&&error&&typeof error==='object'){
+              Object.assign(error,{youtubeQuotaReservationRetryBounded:true});
+            }
             if(!runtimeRateLimited)failedDispatchProviders(acquisition)?.add(dispatchedProviderKey);
             if(consumerSuspended)youtubeProviderCooldown.failed(dispatchedProviderKey,'CONSUMER_SUSPENDED');
             // A dead API key is unusable like a suspended one: quarantine it for
@@ -816,8 +825,8 @@ export async function resolveYouTubeLocatorAuthoritatively(identity: string, typ
         : buildYouTubeApiUrl('videos', apiKey, { part: 'snippet', id: identity });
       try {
         const response = await youtubeFetch(url, `resolve-${type.toLowerCase()}`, 1, attempt + 1, acquisition, 'enrichment', apiKey);
-        const data = await readYouTubeJsonObject(response, `resolve-${type.toLowerCase()}`);
         await accountYouTubeQuotaResponse(response, 1);
+        const data = await readYouTubeJsonObject(response, `resolve-${type.toLowerCase()}`);
         const channelId = type === 'HANDLE' ? data.items?.[0]?.id : data.items?.[0]?.snippet?.channelId;
         if (typeof channelId === 'string' && /^UC[A-Za-z0-9_-]{22}$/.test(channelId)) return channelId;
         return null;
@@ -980,9 +989,9 @@ export async function fetchRecentVideoDescriptionsWithIds(channelId: string): Pr
         }
 
         if (videoIds.length > 0) {
-          const videosUrl = buildYouTubeApiUrl('videos',apiKey,{part:'snippet',id:videoIds.join(',')});
-          const vRes = await youtubeFetch(videosUrl,'video-details',1,1,acquisition,'enrichment',apiKey);
-          if (vRes.ok) {
+          try {
+            const videosUrl = buildYouTubeApiUrl('videos',apiKey,{part:'snippet',id:videoIds.join(',')});
+            const vRes = await youtubeFetch(videosUrl,'video-details',1,1,acquisition,'enrichment',apiKey);
             await accountYouTubeQuotaResponse(vRes, 1);
             const vData = await readYouTubeJsonObject(vRes, 'video-details');
             const fullItems: RecentVideoDescription[] = [];
@@ -992,6 +1001,16 @@ export async function fetchRecentVideoDescriptionsWithIds(channelId: string): Pr
               }
             }
             if (fullItems.length > 0) return fullItems;
+          } catch (error) {
+            // The 100-unit search above is already paid for and its snippets
+            // are usable. A cap rejection or provider failure on the optional
+            // 1-unit follow-up must not discard them and repeat the search on
+            // another key. Accounting failures still surface: the follow-up
+            // call may already have spent units.
+            if (isYouTubeQuotaAccountingError(error)) throw error;
+            if (!isYouTubeKeyCapError(error)) {
+              console.warn(`[YouTube API] Optional video-details fetch failed for ${channelId}; using paid search descriptions:`, error);
+            }
           }
         }
 
@@ -1269,16 +1288,18 @@ export async function fetchYouTubeChannelEnrichment(
         // every activity stat below is preserved while quota burn drops 50x.
         if(!channelCheckpoint){
           const channelFirstResponse = await youtubeFetch(channelUrl,'channel-details',1,attempt+1,acquisition,priority,apiKey);
-          const channelFirstPayload = await readYouTubeJsonObject(channelFirstResponse, 'channel-details');
+          // Account the provider call before parsing: a malformed successful
+          // body must still settle its reservation, otherwise the lease holds
+          // capacity until the Pacific reset and the loop rotates keys.
           await accountYouTubeQuotaResponse(channelFirstResponse, 1);
+          const channelFirstPayload = await readYouTubeJsonObject(channelFirstResponse, 'channel-details');
           channelCheckpoint = channelFirstPayload;
         }
         const uploadsPlaylistId = channelCheckpoint.items?.[0]?.contentDetails?.relatedPlaylists?.uploads;
         if (uploadsPlaylistId) {
           const recentResponse = await youtubeFetch(buildYouTubeApiUrl('playlistItems',apiKey,{part:'snippet,contentDetails',playlistId:String(uploadsPlaylistId),maxResults:10}),'channel-uploads',1,attempt+1,acquisition,priority,apiKey);
-          const uploadsPayload = await readYouTubeJsonObject(recentResponse, 'channel-uploads');
           await accountYouTubeQuotaResponse(recentResponse, 1);
-          uploadsCheckpoint = adaptPlaylistItemsToSearchShape(uploadsPayload);
+          uploadsCheckpoint = adaptPlaylistItemsToSearchShape(await readYouTubeJsonObject(recentResponse, 'channel-uploads'));
         } else {
           uploadsCheckpoint = { items: [] };
         }
@@ -1286,8 +1307,8 @@ export async function fetchYouTubeChannelEnrichment(
       if(!channelCheckpoint){
         if(attempt>0)await topUp(1);
         const channelResponse = await youtubeFetch(channelUrl,'channel-details',1,attempt+1,acquisition,priority,apiKey);
-        const channelPayload = await readYouTubeJsonObject(channelResponse, 'channel-details');
         await accountYouTubeQuotaResponse(channelResponse, 1);
+        const channelPayload = await readYouTubeJsonObject(channelResponse, 'channel-details');
         channelCheckpoint = channelPayload;
       }
       const recentData=uploadsCheckpoint;
@@ -1314,13 +1335,13 @@ export async function fetchYouTubeChannelEnrichment(
         if(!playlistsCheckpoint){
           if(attempt>0)await topUp(100);
           const playlistResponse=await youtubeFetch(buildYouTubeApiUrl('search',apiKey,{part:'snippet',channelId,type:'playlist',maxResults:10}),'enrichment-playlists',100,attempt+1,acquisition,priority,apiKey);
-          const playlistPayload=await readYouTubeJsonObject(playlistResponse,'enrichment-playlists');
           await accountYouTubeQuotaResponse(playlistResponse, 100);
+          const playlistPayload=await readYouTubeJsonObject(playlistResponse,'enrichment-playlists');
           playlistsCheckpoint=playlistPayload;
         }
         const playlistPayload=playlistsCheckpoint;
         playlists=playlistPayload.items.map((item:any)=>({id:item.id?.playlistId,name:String(item.snippet?.title||''),description:String(item.snippet?.description||'')})).filter((item:any)=>item.name);
-        if(ids){if(!videoDetailsCheckpoint){if(attempt>0)await topUp(1);const videoResponse=await youtubeFetch(buildYouTubeApiUrl('videos',apiKey,{part:'snippet',id:ids}),'enrichment-video-details',1,attempt+1,acquisition,priority,apiKey);const videoDetailsPayload=await readYouTubeJsonObject(videoResponse,'enrichment-video-details');await accountYouTubeQuotaResponse(videoResponse, 1);videoDetailsCheckpoint=videoDetailsPayload;}const byId=new Map(videoDetailsCheckpoint.items?.map((item:any)=>[item.id,item.snippet])||[]);videos=videos.map(video=>({...video,description:String((byId.get(video.id) as any)?.description||video.description||''),language:snippetLanguage(byId.get(video.id))}));}
+        if(ids){if(!videoDetailsCheckpoint){if(attempt>0)await topUp(1);const videoResponse=await youtubeFetch(buildYouTubeApiUrl('videos',apiKey,{part:'snippet',id:ids}),'enrichment-video-details',1,attempt+1,acquisition,priority,apiKey);await accountYouTubeQuotaResponse(videoResponse, 1);const videoDetailsPayload=await readYouTubeJsonObject(videoResponse,'enrichment-video-details');videoDetailsCheckpoint=videoDetailsPayload;}const byId=new Map(videoDetailsCheckpoint.items?.map((item:any)=>[item.id,item.snippet])||[]);videos=videos.map(video=>({...video,description:String((byId.get(video.id) as any)?.description||video.description||''),language:snippetLanguage(byId.get(video.id))}));}
       }
 
       // Channel-level provider language as fallback only, resolved through

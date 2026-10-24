@@ -12,6 +12,7 @@ import {
   assertKeyCapReservationDayCurrent,
   classifyShadowWouldBlock,
   isYouTubeKeyCapError,
+  keyCapAdvisoryLockName,
   parseShadowCapUnits,
   parseShadowLeaseTtlMs,
   recordShadowDispatchSafe,
@@ -32,6 +33,19 @@ import {
   type ShadowQueryClient,
 } from './quotaKeyCapShadow';
 import { getNextYouTubeQuotaResetAt, getYouTubeQuotaDay } from './youtubeQuotaDay';
+import { readFileSync } from 'node:fs';
+
+test('shadow and enforcement share one key/day advisory lock namespace', () => {
+  assert.equal(
+    keyCapAdvisoryLockName('2026-10-20', 'fp-test'),
+    'youtube-key-cap:2026-10-20:fp-test'
+  );
+  const source = readFileSync(new URL('./quotaKeyCapShadow.ts', import.meta.url), 'utf8');
+  assert.match(source, /keyCapAdvisoryLockName\(quotaDay, input\.keyFingerprint\)/);
+  assert.match(source, /keyCapAdvisoryLockName\(quotaDay, keyFingerprint\)/);
+  assert.doesNotMatch(source, /youtube-key-cap-shadow:/);
+  assert.doesNotMatch(source, /youtube-key-cap-enforce:/);
+});
 
 type Rows = { rows: Array<Record<string, unknown>>; rowCount?: number | null };
 type QueryHandler = (text: string, values?: unknown[]) => Rows;
@@ -178,7 +192,7 @@ test('recordShadowDispatchSafe enabled: sweeps, locks, records and commits', asy
   assert.ok(lockQuery, 'advisory lock taken');
   assert.equal(
     lockQuery!.values?.[0],
-    `youtube-key-cap-shadow:${getYouTubeQuotaDay(now)}:fp-enabled`
+    `youtube-key-cap:${getYouTubeQuotaDay(now)}:fp-enabled`
   );
   assert.ok(texts.includes('COMMIT'));
   assert.ok(!texts.includes('ROLLBACK'));
@@ -497,7 +511,7 @@ test('reserveEnforcedKeyCap boundary: 8999 + 1 admitted, 9000 + 1 typed exceeded
   assert.ok(texts.some(text => text.startsWith(`SET LOCAL statement_timeout = '${ENFORCED_STATEMENT_TIMEOUT_MS}ms'`)));
   assert.equal(
     connection.queries.find(query => query.text.includes('pg_advisory_xact_lock'))?.values?.[0],
-    `youtube-key-cap-enforce:${day}:fp-boundary`
+    `youtube-key-cap:${day}:fp-boundary`
   );
   assert.ok(texts.includes('COMMIT'));
   assert.ok(connection.released);

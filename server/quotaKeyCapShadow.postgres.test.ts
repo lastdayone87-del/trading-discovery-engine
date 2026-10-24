@@ -7,6 +7,7 @@ import type { Pool } from 'pg';
 import {
   YouTubeKeyCapExceededError,
   YouTubeKeyCapUnavailableError,
+  keyCapAdvisoryLockName,
   recordShadowDispatchSafe,
   reserveEnforcedKeyCap,
   resetKeyCapEnforcementCacheForTests,
@@ -439,6 +440,90 @@ maybe('enforce concurrency: 20 same-key reservations serialize and admit exactly
     outcome.status === 'rejected' && outcome.reason instanceof YouTubeKeyCapExceededError
   ));
   assert.equal(await leaseForDayCount(quotaDay, key), 10, 'admitted count is exact, no lock-timeout bypass');
+});
+
+maybe('mixed-mode: shadow and enforcement serialize on one key/day advisory lock', async () => {
+  await ensureSchema();
+  resetShadowConfigCacheForTests();
+  resetShadowSweepClockForTests();
+  resetKeyCapEnforcementCacheForTests();
+  const key = keyFor('mixed-lock');
+  await seedSettledUnits(key, 0);
+  const holder = await requirePool().connect();
+  try {
+    await holder.query('BEGIN');
+    await holder.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
+      keyCapAdvisoryLockName(quotaDay, key),
+    ]);
+
+    // Both writers must contend on the same lock. A separate shadow/enforce
+    // namespace would let each complete while this lock is held.
+    const shadow = await recordShadowDispatchSafe(
+      { readSetting: enabledReader, pool: requirePool() as unknown as ShadowPoolPort },
+      {
+        keyFingerprint: key,
+        operationId: `${runTag}:mixed-lock:shadow`,
+        units: 1,
+        now: fixedNow,
+        lockTimeoutMs: 150,
+      }
+    );
+    assert.equal(shadow.lockSkipped, true, 'shadow writer contends on the shared lock');
+    assert.equal(shadow.leaseInserted, false);
+
+    await assert.rejects(
+      reserveEnforced(key, `${runTag}:mixed-lock:enforce`, 1, { lockTimeoutMs: 150 }),
+      (error: unknown) => error instanceof YouTubeKeyCapUnavailableError
+        && /lock timed out/.test((error as Error).message),
+      'enforced writer contends on the same shared lock'
+    );
+  } finally {
+    await holder.query('ROLLBACK').catch(() => undefined);
+    holder.release();
+  }
+  assert.equal(await leaseCount(key), 0, 'timed-out writers insert no lease');
+});
+
+maybe('mixed-mode concurrency: shadow and enforced dispatches admit exactly the remaining capacity', async () => {
+  await ensureSchema();
+  resetShadowConfigCacheForTests();
+  resetShadowSweepClockForTests();
+  resetKeyCapEnforcementCacheForTests();
+  const key = keyFor('mixed-concurrent');
+  await seedSettledUnits(key, 8990);
+  const shadowPool = requirePool() as unknown as ShadowPoolPort;
+
+  const shadowTasks = Array.from({ length: 10 }, (_, index) =>
+    recordShadowDispatchSafe(
+      { readSetting: enabledReader, pool: shadowPool },
+      {
+        keyFingerprint: key,
+        operationId: `${runTag}:mixed-concurrent:shadow:${index}`,
+        units: 1,
+        now: fixedNow,
+        lockTimeoutMs: 4000,
+      }
+    )
+  );
+  const enforceTasks = Array.from({ length: 10 }, (_, index) =>
+    reserveEnforced(key, `${runTag}:mixed-concurrent:enforce:${index}`, 1, { lockTimeoutMs: 4000 })
+  );
+
+  const [shadowResults, enforceResults] = await Promise.all([
+    Promise.all(shadowTasks),
+    Promise.allSettled(enforceTasks),
+  ]);
+
+  assert.equal(shadowResults.filter(result => result.lockSkipped).length, 0, 'no shadow observation skipped');
+  const shadowAdmitted = shadowResults.filter(result => result.event === null).length;
+  const enforceAdmitted = enforceResults.filter(result => result.status === 'fulfilled').length;
+  assert.equal(shadowAdmitted + enforceAdmitted, 10, '8990 + exactly 10 mixed admissions = 9000');
+  assert.ok(
+    enforceResults
+      .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+      .every(result => result.reason instanceof YouTubeKeyCapExceededError),
+    'enforced denials are typed capacity errors, not lock failures'
+  );
 });
 
 maybe('enforce: two keys have independent daily capacity', async () => {

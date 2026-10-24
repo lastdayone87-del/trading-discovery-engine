@@ -135,6 +135,55 @@ test('raw provider 429 still escapes to provider failover instead of being sched
   assert.equal(attempts, 1);
 });
 
+test('a quota-reserved 429 is surfaced without scheduler replay', async () => {
+  let attempts = 0;
+  const scheduler = new YouTubeRequestScheduler({
+    minIntervalMs: 0,
+    initialRateLimitBackoffMs: 500,
+    maxRateLimitBackoffMs: 2_000,
+    maxRuntimeRateLimitRetries: 30,
+    sleep: async () => undefined
+  });
+  const rateLimit = Object.assign(new Error('YouTube HTTP 429 RESOURCE_EXHAUSTED (rateLimitExceeded)'), {
+    status: 429,
+    providerReasons: ['rateLimitExceeded'],
+    quotaExceeded: false,
+    youtubeQuotaReservationRetryBounded: true
+  });
+
+  await assert.rejects(scheduler.run(async () => {
+    attempts += 1;
+    throw Object.assign(new Error('Provider rate limit reached.'), {
+      errorClass: 'RATE_LIMIT',
+      retryable: true,
+      cause: rateLimit
+    });
+  }), /Provider rate limit reached/);
+  assert.equal(attempts, 1, 'the dispatch closure is not replayed after a reserved 429');
+});
+
+test('a plain 429 still uses the configured bounded scheduler retry budget', async () => {
+  let attempts = 0;
+  const scheduler = new YouTubeRequestScheduler({
+    minIntervalMs: 0,
+    initialRateLimitBackoffMs: 500,
+    maxRateLimitBackoffMs: 2_000,
+    maxRuntimeRateLimitRetries: 2,
+    sleep: async () => undefined
+  });
+  const rateLimit = Object.assign(new Error('YouTube HTTP 429 RESOURCE_EXHAUSTED (rateLimitExceeded)'), {
+    status: 429,
+    providerReasons: ['rateLimitExceeded'],
+    quotaExceeded: false
+  });
+
+  await assert.rejects(scheduler.run(async () => {
+    attempts += 1;
+    throw rateLimit;
+  }), rateLimit);
+  assert.equal(attempts, 3, 'initial dispatch plus two bounded retries');
+});
+
 test('distinguishes runtime rate limiting from project quota exhaustion through wrapped errors', () => {
   const rateLimit = Object.assign(new Error('YouTube HTTP 429 RESOURCE_EXHAUSTED (rateLimitExceeded)'), { status: 429, providerReasons: ['rateLimitExceeded'], quotaExceeded: false });
   assert.equal(isYouTubeRateLimited(Object.assign(new Error('Provider rate limit reached.'), { cause: rateLimit })), true);

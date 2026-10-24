@@ -49,6 +49,16 @@ export const ENFORCED_STATEMENT_TIMEOUT_MS = 5_000;
  * arrives after this deadline is released instead of being used. */
 export const ENFORCED_CONNECT_TIMEOUT_MS = 5_000;
 
+/**
+ * One lock namespace for every lease writer and projection reader for a
+ * key/day. Shadow and enforced dispatch must serialize against each other
+ * during a setting rollout; separate namespaces let an enforced projection
+ * miss a concurrent shadow lease and over-admit.
+ */
+export function keyCapAdvisoryLockName(quotaDay: string, keyFingerprint: string): string {
+  return `youtube-key-cap:${quotaDay}:${keyFingerprint}`;
+}
+
 export type ShadowEvent = 'WOULD_DEFER' | 'WOULD_REJECT';
 export type ShadowSettingReader = (key: string, fallback: string) => Promise<string>;
 export interface ShadowConfig {
@@ -552,7 +562,7 @@ export async function recordShadowDispatchSafe(
       );
       try {
         await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
-          `youtube-key-cap-shadow:${quotaDay}:${input.keyFingerprint}`,
+          keyCapAdvisoryLockName(quotaDay, input.keyFingerprint),
         ]);
       } catch (lockError) {
         await client.query('ROLLBACK').catch(() => undefined);
@@ -761,7 +771,7 @@ export async function reserveEnforcedKeyCap(
     await client.query(`SET LOCAL statement_timeout = '${ENFORCED_STATEMENT_TIMEOUT_MS}ms'`);
     try {
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
-        `youtube-key-cap-enforce:${quotaDay}:${keyFingerprint}`,
+        keyCapAdvisoryLockName(quotaDay, keyFingerprint),
       ]);
     } catch (error) {
       throw capUnavailable(
