@@ -1,17 +1,18 @@
-# Phase 1 quota cap (migration 148) — unit + PostgreSQL tests.
+# Phase 1 quota cap (148) + probe allocation (155) — unit + PostgreSQL tests.
 #
 # Scratch-only: disposable postgres:17 service container, no production
 # resources are referenced. Applies the full migration lineage with the real
 # runner (including 148) and runs the shadow + default-OFF hard-cap suites:
 # boundary, duplicate accounting, 20-way per-key concurrency, stale-lease
 # sweep, restart recovery, exact settlement, Pacific midnight/DST.
-name: Phase 1 quota cap (148)
+name: Phase 1 quota cap + probe allocation
 
 on:
   push:
     branches:
       - phase1-hardening
       - feat/youtube-key-hard-cap
+      - feat/probe-quota-allocation
   workflow_dispatch:
 
 permissions:
@@ -31,7 +32,7 @@ jobs:
       - name: TypeScript check
         run: npx tsc --noEmit
       - name: Quota cap, dispatch-day, and probe executor unit tests
-        run: npx tsx --test server/quotaKeyCapShadow.test.ts server/dbCore.quota.test.ts server/discovery/probeExecutor.test.ts
+        run: npx tsx --test server/quotaKeyCapShadow.test.ts server/quotaOrigin.test.ts server/dbCore.quota.test.ts server/discovery/probeExecutor.test.ts
 
   postgres:
     runs-on: ubuntu-latest
@@ -62,7 +63,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm install
-      - name: Apply full migration lineage (runner semantics, includes 148)
+      - name: Apply full migration lineage (runner semantics, includes 148, 154, 155)
         run: npx tsx scripts/runMigrations.ts
       - name: Quota shadow and probe budget PostgreSQL tests
-        run: npx tsx --test server/quotaKeyCapShadow.postgres.test.ts server/discovery/probeLedger.postgres.test.ts
+        run: npx tsx --test server/quotaKeyCapShadow.postgres.test.ts server/quotaProbeAllocation.postgres.test.ts server/discovery/probeLedger.postgres.test.ts

@@ -7,12 +7,12 @@ import { allocateRetrievalLane, RetrievalLane } from './retrievalLanes';
 import { allocateSearchOrdering, SearchOrdering } from './searchOrdering';
 import { calculateEffectiveYouTubeBudget, calculateYouTubeDailyBudget, describeQuotaProjectMap } from './quotaPolicy';
 import { scopeEligibilityForWrite } from './scopeEligibility';
-import { getYouTubeQuotaDay } from './youtubeQuotaDay';
+import { getNextYouTubeQuotaResetAt, getYouTubeQuotaDay } from './youtubeQuotaDay';
 import { getConfiguredYouTubeKeys, getConfiguredYouTubeProviders } from './youtubeKeyPool';
 import { youtubeProviderCooldown, type YouTubeProviderOperationalStatus } from './youtubeProviderCooldown';
 import type { AuditEvent } from './operatorAuth';
 import type { ProviderCallEvent } from './providerResilience';
-import { resolveShadowConfig, settleKeyCapReservation, settleShadowLeaseWithSavepoint, YouTubeKeyCapUnavailableError, type KeyCapReservationContext } from './quotaKeyCapShadow';
+import { ProbeQuotaUnavailableError, resolveShadowConfig, settleKeyCapReservation, settleProbeQuotaReservation, settleShadowLeaseWithSavepoint, YouTubeKeyCapUnavailableError, type KeyCapReservationContext, type QuotaSettlementContext } from './quotaKeyCapShadow';
 import { canonicalCountry } from './countryInference';
 import { classifyDiscoveryVisibility } from './discoveryStateVisibility';
 import { safeCrawlerTelemetry, type CrawlerTelemetry } from './crawlerTelemetry';
@@ -38,6 +38,11 @@ import { sanitizeSchedulingError, type DiscoveryCandidateDiagnosticPatch } from 
 import { classifyProviderCapacityFailure, classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
 import { decideQueryRunJobLifecycle, type QueryJobLifecycleStatus, type QueryRunLifecycleStatus } from './queryRunJobLifecycle';
 import type { SelectionExperimentObservation } from './querySelectionExperiments';
+import {
+  currentOfficialYouTubeQuotaOrigin,
+  isOfficialYouTubeQuotaFenceError,
+  persistedQuotaOrigin,
+} from './officialYouTubeQuotaFence';
 
 const { Pool } = pg;
 const MIGRATIONS_DIR = path.join(process.cwd(), 'server', 'db', 'migrations');
@@ -372,6 +377,7 @@ export function rowToChannel(row: any): ChannelRecord {
     scan_status: row.scan_status,
     scan_attempts: row.scan_attempts || 0,
     discovery_source: row.discovery_source,
+    quota_origin: row.quota_origin === 'PROBE' ? 'PROBE' : 'NORMAL',
     first_seen: iso(row.first_seen) || new Date().toISOString(),
     last_checked: iso(row.last_checked),
     inspection_trail: parseJson(row.inspection_trail, []),
@@ -639,7 +645,7 @@ async function channelListingWhere(db:InstanceType<typeof Pool>,args:ChannelList
 export async function listChannelsPage(args:ChannelListingFilter&{limit:number;offset:number}):Promise<{items:ChannelRecord[];total:number;revision:string|null}> {
   const db=await getDb(); const limit=Math.min(250,Math.max(1,args.limit)); const offset=Math.max(0,args.offset);
   const {where,values}=await channelListingWhere(db,args);
-  const columns=`channel_id,channel_name,youtube_url,country,country_status,scope_eligibility,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,inspection_trail,subscriber_count,channel_thumbnail_url,quality_score,trading_status,trading_confidence_score,trading_category,country_metadata_status,country_metadata_checked_at,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,community_discovery_status,community_intents,discord_duplicate_owner_channel_id,
+  const columns=`channel_id,channel_name,youtube_url,country,country_status,scope_eligibility,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,quota_origin,first_seen,last_checked,inspection_trail,subscriber_count,channel_thumbnail_url,quality_score,trading_status,trading_confidence_score,trading_category,country_metadata_status,country_metadata_checked_at,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,community_discovery_status,community_intents,discord_duplicate_owner_channel_id,
     ${DISCORD_SELECTED_INVITE_CONFLICT_SQL} AS discord_selected_invite_conflict,
     (SELECT owner.channel_name FROM channels owner WHERE owner.channel_id=channels.discord_duplicate_owner_channel_id) discord_duplicate_owner_channel_name,
     ${DISCORD_INVITE_FIRST_VALIDATED_SQL} AS discord_invite_first_validated_at,
@@ -839,11 +845,20 @@ export async function writeChannelUpsert(
   // a country attribution change; country, status and confidence flow
   // through untouched.
   const scopeEligibility = scopeEligibilityForWrite(channel);
+  // INSERT may use the caller/ambient origin so a probe-created row starts
+  // PROBE. The ON CONFLICT clause preserves the existing durable marker: a
+  // probe run that rediscovers an established NORMAL channel must not rewrite
+  // it, or later enrichment/recovery would be stranded on the probe bucket
+  // (and defer daily while that allocation is disabled).
+  const persistedOrigin = persistedQuotaOrigin(
+    channel.quota_origin,
+    currentOfficialYouTubeQuotaOrigin(),
+  );
   await client.query(`INSERT INTO channels (
-  channel_id,channel_name,youtube_url,country,country_status,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,next_check,inspection_trail,subscriber_count,channel_thumbnail_url,quality_score,quality_breakdown,trading_status,trading_confidence_score,trading_category,trading_relevance_breakdown,country_metadata_status,country_metadata_checked_at,public_about_status,public_about_checked_at,public_about_attempts,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,scope_eligibility,community_discovery_status,community_intents,discord_duplicate_owner_channel_id,updated_at
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,now())
+  channel_id,channel_name,youtube_url,country,country_status,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,next_check,inspection_trail,subscriber_count,channel_thumbnail_url,quality_score,quality_breakdown,trading_status,trading_confidence_score,trading_category,trading_relevance_breakdown,country_metadata_status,country_metadata_checked_at,public_about_status,public_about_checked_at,public_about_attempts,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,scope_eligibility,community_discovery_status,community_intents,discord_duplicate_owner_channel_id,quota_origin,updated_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$50,now())
 ON CONFLICT(channel_id) DO UPDATE SET
-  channel_name=excluded.channel_name,youtube_url=excluded.youtube_url,country=excluded.country,country_status=excluded.country_status,confidence_score=excluded.confidence_score,${preserveDiscordOnConflictSql('discord_status')},${preserveDiscordOnConflictSql('discord_invite')},scan_status=excluded.scan_status,scan_attempts=excluded.scan_attempts,discovery_source=excluded.discovery_source,last_checked=excluded.last_checked,next_check=excluded.next_check,inspection_trail=excluded.inspection_trail,subscriber_count=excluded.subscriber_count,channel_thumbnail_url=excluded.channel_thumbnail_url,quality_score=excluded.quality_score,quality_breakdown=excluded.quality_breakdown,trading_status=excluded.trading_status,trading_confidence_score=excluded.trading_confidence_score,trading_category=excluded.trading_category,trading_relevance_breakdown=excluded.trading_relevance_breakdown,country_metadata_status=excluded.country_metadata_status,country_metadata_checked_at=excluded.country_metadata_checked_at,public_about_status=excluded.public_about_status,public_about_checked_at=excluded.public_about_checked_at,public_about_attempts=excluded.public_about_attempts,latest_upload_at=excluded.latest_upload_at,uploads_last_30_days=excluded.uploads_last_30_days,uploads_last_90_days=excluded.uploads_last_90_days,uploads_last_365_days=excluded.uploads_last_365_days,activity_band=excluded.activity_band,activity_score=excluded.activity_score,activity_observed_at=excluded.activity_observed_at,${preserveDiscordOnConflictSql('discord_discovery_status')},${preserveDiscordOnConflictSql('discord_candidate_locator')},${preserveDiscordOnConflictSql('discord_candidate_id')},${preserveDiscordOnConflictSql('discord_candidate_raw_locator')},${preserveDiscordOnConflictSql('discord_candidate_type')},${preserveDiscordOnConflictSql('discord_resolution_status')},${preserveDiscordOnConflictSql('discord_liveness_status')},${preserveDiscordOnConflictSql('discord_relevance_status')},${preserveDiscordOnConflictSql('discord_validation_status')},scope_eligibility=excluded.scope_eligibility,community_discovery_status=excluded.community_discovery_status,community_intents=excluded.community_intents,${preserveDiscordOnConflictSql('discord_duplicate_owner_channel_id')},updated_at=now()`, [
+  channel_name=excluded.channel_name,youtube_url=excluded.youtube_url,country=excluded.country,country_status=excluded.country_status,confidence_score=excluded.confidence_score,${preserveDiscordOnConflictSql('discord_status')},${preserveDiscordOnConflictSql('discord_invite')},scan_status=excluded.scan_status,scan_attempts=excluded.scan_attempts,discovery_source=excluded.discovery_source,last_checked=excluded.last_checked,next_check=excluded.next_check,inspection_trail=excluded.inspection_trail,subscriber_count=excluded.subscriber_count,channel_thumbnail_url=excluded.channel_thumbnail_url,quality_score=excluded.quality_score,quality_breakdown=excluded.quality_breakdown,trading_status=excluded.trading_status,trading_confidence_score=excluded.trading_confidence_score,trading_category=excluded.trading_category,trading_relevance_breakdown=excluded.trading_relevance_breakdown,country_metadata_status=excluded.country_metadata_status,country_metadata_checked_at=excluded.country_metadata_checked_at,public_about_status=excluded.public_about_status,public_about_checked_at=excluded.public_about_checked_at,public_about_attempts=excluded.public_about_attempts,latest_upload_at=excluded.latest_upload_at,uploads_last_30_days=excluded.uploads_last_30_days,uploads_last_90_days=excluded.uploads_last_90_days,uploads_last_365_days=excluded.uploads_last_365_days,activity_band=excluded.activity_band,activity_score=excluded.activity_score,activity_observed_at=excluded.activity_observed_at,${preserveDiscordOnConflictSql('discord_discovery_status')},${preserveDiscordOnConflictSql('discord_candidate_locator')},${preserveDiscordOnConflictSql('discord_candidate_id')},${preserveDiscordOnConflictSql('discord_candidate_raw_locator')},${preserveDiscordOnConflictSql('discord_candidate_type')},${preserveDiscordOnConflictSql('discord_resolution_status')},${preserveDiscordOnConflictSql('discord_liveness_status')},${preserveDiscordOnConflictSql('discord_relevance_status')},${preserveDiscordOnConflictSql('discord_validation_status')},scope_eligibility=excluded.scope_eligibility,community_discovery_status=excluded.community_discovery_status,community_intents=excluded.community_intents,${preserveDiscordOnConflictSql('discord_duplicate_owner_channel_id')},quota_origin=channels.quota_origin,updated_at=now()`, [
   channel.channel_id, channel.channel_name, channel.youtube_url, channel.country, channel.country_status, channel.confidence_score || 0,
   channel.discord_status, channel.discord_invite || null, channel.scan_status, channel.scan_attempts || 0, channel.discovery_source,
   channel.first_seen || new Date().toISOString(), channel.last_checked || null, null, JSON.stringify(channel.inspection_trail || []),
@@ -855,7 +870,7 @@ ON CONFLICT(channel_id) DO UPDATE SET
   channel.public_about_status || 'NOT_ATTEMPTED', channel.public_about_checked_at || null, channel.public_about_attempts || 0,
   channel.latest_upload_at || null, channel.uploads_last_30_days || 0, channel.uploads_last_90_days || 0,
   channel.uploads_last_365_days || 0, channel.activity_band || 'UNKNOWN', channel.activity_score ?? 50,
-  channel.activity_observed_at || null,channel.discord_discovery_status||'NOT_DISCOVERED',channel.discord_candidate_locator||null,channel.discord_candidate_id||null,channel.discord_candidate_raw_locator||null,channel.discord_candidate_type||null,channel.discord_resolution_status||'NOT_ATTEMPTED',channel.discord_liveness_status||'NOT_CHECKED',channel.discord_relevance_status||'NOT_CHECKED',channel.discord_validation_status||'NOT_STARTED',scopeEligibility,channel.community_discovery_status||'NONE',JSON.stringify(channel.community_intents||[]),channel.discord_duplicate_owner_channel_id||null,options?.preserveDiscordOnUpdate===true
+  channel.activity_observed_at || null,channel.discord_discovery_status||'NOT_DISCOVERED',channel.discord_candidate_locator||null,channel.discord_candidate_id||null,channel.discord_candidate_raw_locator||null,channel.discord_candidate_type||null,channel.discord_resolution_status||'NOT_ATTEMPTED',channel.discord_liveness_status||'NOT_CHECKED',channel.discord_relevance_status||'NOT_CHECKED',channel.discord_validation_status||'NOT_STARTED',scopeEligibility,channel.community_discovery_status||'NONE',JSON.stringify(channel.community_intents||[]),channel.discord_duplicate_owner_channel_id||null,options?.preserveDiscordOnUpdate===true,persistedOrigin
   ]);
 }
 
@@ -1073,12 +1088,19 @@ export async function incrementQuota(
   units:number,
   providerKey:string,
   operationId?: string,
-  shadowOperationIdOrReservation?: string | KeyCapReservationContext
+  shadowOperationIdOrReservation?: string | KeyCapReservationContext | QuotaSettlementContext
 ):Promise<void>{
-  const reservation = typeof shadowOperationIdOrReservation === 'object' && shadowOperationIdOrReservation !== null
-    ? shadowOperationIdOrReservation
+  const objectArg = typeof shadowOperationIdOrReservation === 'object' && shadowOperationIdOrReservation !== null
+    ? shadowOperationIdOrReservation as KeyCapReservationContext | QuotaSettlementContext
     : undefined;
-  const shadowOperationId = typeof shadowOperationIdOrReservation === 'string' ? shadowOperationIdOrReservation : undefined;
+  const composite = objectArg && ('keyCap' in objectArg || 'probe' in objectArg)
+    ? objectArg as QuotaSettlementContext
+    : undefined;
+  const reservation = composite ? composite.keyCap : objectArg as KeyCapReservationContext | undefined;
+  const probeReservation = composite?.probe;
+  const shadowOperationId = typeof shadowOperationIdOrReservation === 'string'
+    ? shadowOperationIdOrReservation
+    : composite?.shadowOperationId;
   if(!Number.isSafeInteger(units)||units<=0)throw new Error('YouTube quota charge must be a positive integer.');
   const keys=getYouTubeKeyPool(); const keyIndex=keys.indexOf(providerKey)+1; if(keyIndex<1)throw new Error('YouTube quota charge provider key is not configured.');
   const keyFingerprint=fingerprintYouTubeKey(providerKey);
@@ -1087,7 +1109,7 @@ export async function incrementQuota(
   // attributed to the day that admitted it. The single-row quota_tracker is a
   // current-day aggregate; give it the current day so a late prior-day charge
   // can never rewind last_reset and zero the current day's usage.
-  const keyQuotaDay=reservation?.quotaDay||getYouTubeQuotaDay();
+  const keyQuotaDay=reservation?.quotaDay||probeReservation?.quotaDay||getYouTubeQuotaDay();
   if(reservation?.mode==='enforce'&&reservation.keyFingerprint!==keyFingerprint){
     throw new YouTubeKeyCapUnavailableError('YouTube key cap reservation key does not match the charged provider key.',{
       quotaDay:reservation.quotaDay,keyFingerprint:reservation.keyFingerprint,operationId:reservation.operationId,
@@ -1098,7 +1120,12 @@ export async function incrementQuota(
       quotaDay:reservation.quotaDay,keyFingerprint:keyFingerprint,operationId:reservation.operationId,
     });
   }
-  const shadowConfig=reservation?null:await resolveShadowConfig(getAppSetting).catch(()=>null); const db=await getDb(); const client=await db.connect(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=getDailyYouTubeQuotaBudget();
+  if(probeReservation&&(probeReservation.keyFingerprint!==keyFingerprint||probeReservation.units!==units)){
+    throw new ProbeQuotaUnavailableError('Probe allocation reservation does not match the charged key/units.',{
+      quotaDay:probeReservation.quotaDay,operationId:probeReservation.operationId,
+    });
+  }
+  const shadowConfig=(reservation||probeReservation)?null:await resolveShadowConfig(getAppSetting).catch(()=>null); const db=await getDb(); const client=await db.connect(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=getDailyYouTubeQuotaBudget();
   try{
     await client.query('BEGIN');
     // Read the aggregate tracker day after pool acquisition and BEGIN. A
@@ -1119,7 +1146,13 @@ export async function incrementQuota(
       // charge. Enforce failures roll the charge back (fail closed); shadow
       // failures stay savepoint-guarded and never poison the charge.
       await settleKeyCapReservation(client,reservation);
-    } else if(shadowConfig?.enabled){
+    }
+    if(probeReservation){
+      // Probe usage and lease removal commit with the charge. A settlement
+      // failure rolls back the charge so the allocation cannot silently drift.
+      await settleProbeQuotaReservation(client,probeReservation);
+    }
+    if(!reservation && !probeReservation && shadowConfig?.enabled){
       // Legacy shadow settlement (no reservation context): release the
       // exact operation lease when the caller supplied one, otherwise the
       // legacy unit-matched lease. Savepoint-guarded.
@@ -2140,7 +2173,26 @@ export function isRetryableInfrastructureFailure(error:any):boolean{
   return false;
 }
 export function decideJobFailure(error:any,attempts:number,maxAttempts:number,now=Date.now(),firstFailureAt=now,geminiSemanticCooldownExpiryMs?:number,groqSemanticCooldownExpiryMs?:number,geminiFreeSemanticCooldownExpiryMs?:number):{disposition:JobFailureDisposition;runAfter?:number;operationallyBlocked?:boolean}{
-  if(String(error?.code||'')==='INVESTIGATION_DEADLINE_EXCEEDED')return {disposition:'FAILED'};
+  // The quota fence is a policy terminal, not a provider failure. It must
+  // never retry, cool a provider, or consume the job retry budget.
+  if(isOfficialYouTubeQuotaFenceError(error))return {disposition:'FAILED'};
+  // Probe allocation policy terminals defer without consuming an attempt and
+  // without turning the channel into a human-review case. Match only the
+  // probe-specific markers: QUOTA_ALLOCATION_EXHAUSTED also identifies the
+  // pre-existing normal allocation error, which must keep its six-hour
+  // transient age limit. PROBE_QUOTA_UNAVAILABLE is retryable infrastructure
+  // and also keeps that age limit.
+  if(error?.probeQuotaExceeded===true||error?.probeQuotaDisabled===true){
+    const retryAt=Number(error?.retryAt);
+    return {disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:Number.isFinite(retryAt)&&retryAt>now?retryAt:now+60_000};
+  }
+  const failureCode=String(error?.code||'');
+  if(failureCode==='YOUTUBE_KEY_CAP_EXCEEDED'){
+    // Capacity exhaustion is a policy wait, not a job failure. Wait for the
+    // Pacific reset without consuming an attempt or creating review work.
+    return {disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:getNextYouTubeQuotaResetAt(new Date(now))};
+  }
+  if(failureCode==='INVESTIGATION_DEADLINE_EXCEEDED')return {disposition:'FAILED'};
   if(isRetryableInfrastructureFailure(error)){
     if(now-firstFailureAt>=MAX_TRANSIENT_RETRY_AGE_MS)return {disposition:'FAILED',operationallyBlocked:true};
     const retryAt=Number(error?.retryAt);

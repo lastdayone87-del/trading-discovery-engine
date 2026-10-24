@@ -31,6 +31,13 @@ test('quota-exhausted enrichment defers attempt-free instead of consuming budget
   assert.match(queueManager, /code: 'QUOTA_ALLOCATION_EXHAUSTED'/);
   assert.match(queueManager, /errorClass: 'RATE_LIMIT'/);
   assert.match(queueManager, /'TIMEOUT','CANCELLED','RATE_LIMIT','TRANSIENT','CREDENTIALS_EXHAUSTED'/);
+  // Probe policy refusals arrive wrapped by executeProviderCall. Preserve the
+  // probe marker and reset time so failJob waits for capacity instead of
+  // aging the approved enrichment out as an ordinary provider failure.
+  assert.match(queueManager, /probeQuotaExceeded: failure\.probeQuotaExceeded === true/);
+  assert.match(queueManager, /probeQuotaDisabled: failure\.probeQuotaDisabled === true/);
+  assert.match(queueManager, /result\.probeQuotaExceeded===true\?\{probeQuotaExceeded:true\}:\{\}/);
+  assert.match(queueManager, /result\.probeQuotaDisabled===true\?\{probeQuotaDisabled:true\}:\{\}/);
 });
 
 test('existing community retry terminal projection remains a separate lifecycle path', () => {

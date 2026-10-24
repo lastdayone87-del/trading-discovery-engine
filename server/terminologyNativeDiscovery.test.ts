@@ -2193,7 +2193,7 @@ test('retry forces extraction replay on the preserved-channel path', () => {
   const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
   assert.match(queue, /forceExtraction:isRepairEligibleRetry\(job\)/);
   assert.match(queue, /await replayVocabularyForRetry\(channel, candidate, source, true\)/);
-  assert.match(queue, /processDiscoveredChannel\(raw, country, source, \{ forceExtraction: isRepairEligibleRetry\(job\) \}\)/);
+  assert.match(queue, /processDiscoveredChannelContained\(raw, country, source, \{ forceExtraction: isRepairEligibleRetry\(job\) \}\)/);
 });
 
 test('extraction caller marks non-metadata origins honestly', () => {

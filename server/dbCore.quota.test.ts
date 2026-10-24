@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { claimYouTubeQuotaOperation } from './dbCore';
 
 interface MockState {
@@ -213,8 +214,13 @@ test('incrementQuota combines group-aware budgeting, operationId idempotency, an
   // Per-key usage and lease settlement follow the dispatch day, while the
   // singleton quota_tracker stays on the current Pacific day. A late prior-day
   // settlement must not rewind last_reset and zero current-day usage.
-  assert.ok(charge.includes('const keyQuotaDay=reservation?.quotaDay||getYouTubeQuotaDay();'));
+  assert.match(charge, /const keyQuotaDay=reservation\?\.quotaDay\|\|probeReservation\?\.quotaDay\|\|getYouTubeQuotaDay\(\);/);
   assert.ok(charge.includes('const trackerDay=getYouTubeQuotaDay();'));
+  // Probe allocation settlement is part of the same official-charge
+  // transaction; it cannot be silently skipped or moved outside the charge.
+  assert.ok(charge.includes('settleProbeQuotaReservation(client,probeReservation)'));
+  const probeSettleIndex = charge.indexOf('settleProbeQuotaReservation');
+  assert.ok(probeSettleIndex >= 0 && charge.indexOf("await client.query('COMMIT')", probeSettleIndex) > probeSettleIndex);
   const beginIndex = charge.indexOf("await client.query('BEGIN')");
   const trackerIndex = charge.indexOf('const trackerDay=getYouTubeQuotaDay();');
   assert.ok(beginIndex >= 0 && trackerIndex > beginIndex, 'tracker day is sampled after pool acquisition/BEGIN');
@@ -227,4 +233,148 @@ test('incrementQuota combines group-aware budgeting, operationId idempotency, an
   const quotaEnd = dbCore.indexOf('export async function incrementQuota', quotaStart);
   const quota = dbCore.slice(quotaStart, quotaEnd);
   assert.match(quota, /const limit=getDailyYouTubeQuotaBudget\(\)/);
+});
+
+test('probe allocation and per-key cap exhaustion defer without consuming an attempt', async () => {
+  const { decideJobFailure } = await import('./dbCore');
+  const { ProbeQuotaExceededError, ProbeQuotaDisabledError } = await import('./quotaKeyCapShadow');
+  const { getNextYouTubeQuotaResetAt } = await import('./youtubeQuotaDay');
+  const now = new Date('2026-10-20T19:00:00.000Z').getTime();
+  const probe = new ProbeQuotaExceededError('2026-10-20', 90, 20, 100, new Date(now));
+  const probeDecision = decideJobFailure(probe, 1, 5, now);
+  assert.equal(probeDecision.disposition, 'RETRYING_WITHOUT_ATTEMPT');
+  assert.equal(probeDecision.runAfter, getNextYouTubeQuotaResetAt(new Date(now)));
+
+  const disabled = new ProbeQuotaDisabledError('2026-10-20');
+  const disabledDecision = decideJobFailure(disabled, 1, 5, now);
+  assert.equal(disabledDecision.disposition, 'RETRYING_WITHOUT_ATTEMPT');
+
+  const keyCap = Object.assign(new Error('key cap'), { code: 'YOUTUBE_KEY_CAP_EXCEEDED' });
+  const keyDecision = decideJobFailure(keyCap, 1, 5, now);
+  assert.equal(keyDecision.disposition, 'RETRYING_WITHOUT_ATTEMPT');
+  assert.equal(keyDecision.runAfter, getNextYouTubeQuotaResetAt(new Date(now)));
+});
+
+test('normal allocation exhaustion keeps its transient age limit; probe markers do not', async () => {
+  const { decideJobFailure } = await import('./dbCore');
+  const { ProbeQuotaExceededError, ProbeQuotaUnavailableError } = await import('./quotaKeyCapShadow');
+  const now = new Date('2026-10-20T19:00:00.000Z').getTime();
+  const sevenHoursAgo = now - 7 * 60 * 60_000;
+
+  // The shared QUOTA_ALLOCATION_EXHAUSTED code is also the pre-existing normal
+  // allocation error. It must not inherit the probe terminal's unbounded defer.
+  const normal = decideJobFailure({ code: 'QUOTA_ALLOCATION_EXHAUSTED', retryAt: now + 60_000 }, 3, 3, now, sevenHoursAgo);
+  assert.equal(normal.disposition, 'FAILED');
+  assert.equal(normal.operationallyBlocked, true);
+
+  const probe = new ProbeQuotaExceededError('2026-10-20', 90, 20, 100, new Date(now));
+  assert.equal(decideJobFailure(probe, 3, 3, now, sevenHoursAgo).disposition, 'RETRYING_WITHOUT_ATTEMPT');
+
+  // Unavailable probe storage keeps the transient age limit and its 60s retry.
+  const unavailable = new ProbeQuotaUnavailableError('probe settings read failed');
+  const unavailableDecision = decideJobFailure(unavailable, 3, 3, now, sevenHoursAgo);
+  assert.equal(unavailableDecision.disposition, 'FAILED');
+  assert.equal(unavailableDecision.operationallyBlocked, true);
+  assert.equal(decideJobFailure(unavailable, 3, 3, now, now).disposition, 'RETRYING_WITHOUT_ATTEMPT');
+});
+
+test('manual recheck preserves probe policy waits through provider wrapping', async () => {
+  const { classifyManualRecheckAcquisitionFailure } = await import('./queueManager');
+  const { ProbeQuotaDisabledError, ProbeQuotaExceededError } = await import('./quotaKeyCapShadow');
+  const { classifyProviderError } = await import('./providerResilience');
+  const { decideJobFailure } = await import('./dbCore');
+  const { getNextYouTubeQuotaResetAt } = await import('./youtubeQuotaDay');
+  const now = new Date('2026-10-20T19:00:00.000Z').getTime();
+  const reset = getNextYouTubeQuotaResetAt(new Date(now));
+  const sevenHoursAgo = now - 7 * 60 * 60_000;
+
+  const cases = [
+    { probe: new ProbeQuotaDisabledError('2026-10-20'), marker: 'probeQuotaDisabled' as const },
+    { probe: new ProbeQuotaExceededError('2026-10-20', 90, 20, 100, new Date(now)), marker: 'probeQuotaExceeded' as const }
+  ];
+  for (const { probe, marker } of cases) {
+    // executeProviderCall wraps the refusal; the policy marker must survive.
+    const wrapped = classifyProviderError(probe);
+    const classified = classifyManualRecheckAcquisitionFailure(wrapped);
+    assert.equal(classified.retryable, true);
+    assert.equal(classified[marker], true);
+    assert.ok(Number.isFinite(classified.retryAt));
+    if (marker === 'probeQuotaExceeded') assert.equal(classified.retryAt, reset);
+
+    const jobError = Object.assign(new Error('manual recheck acquisition failed'), {
+      code: classified.code,
+      retryable: classified.retryable,
+      errorClass: classified.errorClass,
+      retryAt: classified.retryAt,
+      ...(classified.probeQuotaExceeded ? { probeQuotaExceeded: true } : {}),
+      ...(classified.probeQuotaDisabled ? { probeQuotaDisabled: true } : {})
+    });
+    const decision = decideJobFailure(jobError, 3, 3, now, sevenHoursAgo);
+    assert.equal(decision.disposition, 'RETRYING_WITHOUT_ATTEMPT');
+    assert.equal(decision.runAfter, classified.retryAt);
+  }
+});
+
+test('normal-origin batches contain probe channel refusals; probe jobs still defer', async () => {
+  const { shouldContainProbeQuotaRefusal, probeDeferredDiscoveryJob } = await import('./queueManager');
+  const { ProbeQuotaDisabledError } = await import('./quotaKeyCapShadow');
+  const { runWithOfficialYouTubeQuotaOrigin } = await import('./officialYouTubeQuotaFence');
+  const refusal = new ProbeQuotaDisabledError('2026-10-20');
+
+  assert.equal(shouldContainProbeQuotaRefusal(refusal, 'NORMAL'), true);
+  assert.equal(shouldContainProbeQuotaRefusal(refusal, 'PROBE'), false);
+  assert.equal(shouldContainProbeQuotaRefusal(refusal, 'UNKNOWN'), false);
+  assert.equal(
+    shouldContainProbeQuotaRefusal(Object.assign(new Error('provider wrapper'), { cause: refusal }), 'NORMAL'),
+    true,
+    'a wrapped probe marker is recovered from the cause chain',
+  );
+  assert.equal(shouldContainProbeQuotaRefusal(new Error('ordinary provider failure'), 'NORMAL'), false);
+  assert.equal(
+    runWithOfficialYouTubeQuotaOrigin('PROBE', 'test', () => shouldContainProbeQuotaRefusal(refusal)),
+    false,
+    'a probe-origin job must let the refusal reach the queue deferral',
+  );
+
+  const source = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  assert.match(source, /processPlaylistInspectionJob\(job,processDiscoveredChannelContained\)/);
+  assert.match(source, /processFeaturedChannelInspectionJob\(job,processDiscoveredChannelContained\)/);
+  assert.match(source, /const outcome = await processDiscoveredChannelContained\(raw, country, source/);
+  assert.match(source, /const outcome = await processDiscoveredChannelContained\(raw, session\.country, 'manual_search'\)/);
+  assert.match(source, /calculateQueryFunnel\(searchPage\?\.rawResultCount \?\? extracted\.length, observations, deferredResults\)/);
+  assert.match(source, /deferredOnly: observations\.length === 0 && deferredResults > 0/);
+  assert.match(source, /enqueueJob\('ENRICH_CHANNEL', deferred\.payload, deferred\.opts\)/);
+  assert.match(source, /job\.payload\.probeDeferredDiscovery === true/);
+  assert.match(source, /await processDiscoveredChannel\(candidate, targetCountry, source,/);
+  assert.ok(
+    source.indexOf('job.payload.probeDeferredDiscovery === true') < source.indexOf("channel.trading_status !== 'UNCERTAIN'"),
+    'the deferred discovery replay must run before the enrichment eligibility gate',
+  );
+  assert.match(source, /forceExtraction: job\.payload\.forceExtraction === true \|\| isRepairEligibleRetry\(job\)/);
+  assert.match(source, /probe_quota_channel_retry_schedule_failed[\s\S]{0,900}throw error;/);
+  assert.match(source, /manualSearchContinuationMetrics\(\{/);
+  assert.match(source, /deferredOnly:manualMetrics\.deferredOnly/);
+  assert.match(source, /evaluatedIds:manualMetrics\.evaluatedUniqueIds/);
+  const manualStore = readFileSync(new URL('./manualSearchStore.ts', import.meta.url), 'utf8');
+  assert.match(manualStore, /unique_channel_ids=COALESCE/);
+  assert.match(manualStore, /JSON\.stringify\(p\.uniqueIds\)/, 'page observations keep the raw unique audit');
+  assert.match(manualStore, /JSON\.stringify\(p\.evaluatedIds\)/, 'session continuation stores only evaluated creators');
+
+  const raw = { channelId: 'deferred-channel', channelName: 'Deferred', youtubeUrl: 'https://youtube.test/deferred' } as any;
+  const now = Date.parse('2026-10-20T19:00:00.000Z');
+  const scheduled = probeDeferredDiscoveryJob(raw, 'Germany', 'automated_query', {
+    quotaDay: '2026-10-20',
+    retryAt: Date.parse('2026-10-21T07:00:00.000Z'),
+  }, now, true);
+  assert.equal(scheduled.payload.channelId, 'deferred-channel');
+  assert.equal(scheduled.payload.quotaOrigin, 'PROBE', 'the per-channel retry must stay on the probe allocation');
+  assert.equal(scheduled.payload.probeDeferredDiscovery, true);
+  assert.equal(scheduled.payload.forceExtraction, true);
+  assert.equal(scheduled.opts.runAfter, '2026-10-21T07:00:00.000Z');
+  assert.equal(scheduled.opts.idempotencyKey, 'probe-deferred-discovery:deferred-channel:2026-10-20');
+  const sameDay = probeDeferredDiscoveryJob(raw, 'Germany', 'manual_search', {
+    quotaDay: '2026-10-20',
+    retryAt: Date.parse('2026-10-21T07:00:00.000Z'),
+  }, now + 1_000);
+  assert.equal(sameDay.opts.idempotencyKey, scheduled.opts.idempotencyKey, 'repeated sightings collapse to one deferred job per channel/day');
 });

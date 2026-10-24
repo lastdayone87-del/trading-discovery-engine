@@ -37,7 +37,10 @@ test('migration 153 is present and sorts after every earlier migration', () => {
   assert.ok(files.includes('151_youtube_key_cap_shadow_settled.sql'));
   assert.ok(files.includes('152_discord_candidate_first_validated.sql'));
   assert.ok(files.includes('153_reconcile_channel_locks_on_terminal_jobs.sql'));
-  assert.equal(files[files.length - 1], '153_reconcile_channel_locks_on_terminal_jobs.sql', '153 is the newest migration');
+  const lockIndex = files.indexOf('153_reconcile_channel_locks_on_terminal_jobs.sql');
+  for (const earlier of files.filter(file => Number(file.split('_')[0]) < 153)) {
+    assert.ok(files.indexOf(earlier) < lockIndex, `${earlier} must sort before migration 153`);
+  }
 });
 
 test('migration 153 releases a lock only after a terminal job and only without a live processing job', () => {

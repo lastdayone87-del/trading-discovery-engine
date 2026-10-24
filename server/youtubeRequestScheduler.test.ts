@@ -2,6 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { YouTubeRequestScheduler } from './youtubeRequestScheduler';
 import { isYouTubeRateLimited } from './youtube';
+import { currentOfficialYouTubeQuotaOrigin, runWithOfficialYouTubeQuotaOrigin } from './officialYouTubeQuotaFence';
+import { ProbeQuotaExceededError } from './quotaKeyCapShadow';
+import { ProviderCallError } from './providerResilience';
 import fs from 'node:fs';
 
 test('serializes concurrent outbound calls and spaces their starts', async () => {
@@ -225,7 +228,7 @@ test('youtubeFetch reselects from the live provider pool at dispatch and clears 
   assert.match(youtubeFetch, /selectYouTubeDispatchProviderIndex\(livePool,providerKey\)/);
   assert.match(youtubeFetch, /rebuiltUrl\.searchParams\.set\('key',dispatchedProviderKey\)/);
   assert.match(youtubeFetch, /fetch\(dispatchedUrl,\{signal\}\)/);
-  assert.match(youtubeFetch, /dispatchFailureGeneration=dispatchedProviderKey\?youtubeProviderCooldown\.failureGeneration\(dispatchedProviderKey\):undefined[\s\S]*fetch\(dispatchedUrl,\{signal\}\)[\s\S]*youtubeResponseProviderContext\.set\(response,\{providerKey:dispatchedProviderKey,acquisition,providerFailureGeneration:dispatchFailureGeneration,keyCapReservation:capReservation \?\? undefined\}\)/);
+  assert.match(youtubeFetch, /dispatchFailureGeneration=dispatchedProviderKey\?youtubeProviderCooldown\.failureGeneration\(dispatchedProviderKey\):undefined[\s\S]*fetch\(dispatchedUrl,\{signal\}\)[\s\S]*youtubeResponseProviderContext\.set\(response,\{providerKey:dispatchedProviderKey,acquisition,providerFailureGeneration:dispatchFailureGeneration,keyCapReservation:capReservation \?\? undefined,probeQuotaReservation:probeReservation \?\? undefined\}\)/);
   assert.match(youtubeFetch, /Object\.assign\(error,\{providerKey:dispatchedProviderKey/);
 });
 
@@ -275,7 +278,7 @@ test('post-response validation failures preserve the actual dispatched provider 
   const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));
   const reader = source.slice(source.indexOf('export async function readYouTubeJsonObject'), source.indexOf('/** A request-rate limit'));
   assert.match(source, /youtubeResponseProviderContext = new WeakMap<Response/);
-  assert.match(youtubeFetch, /youtubeResponseProviderContext\.set\(response,\{providerKey:dispatchedProviderKey,acquisition,providerFailureGeneration:dispatchFailureGeneration,keyCapReservation:capReservation \?\? undefined\}\)/);
+  assert.match(youtubeFetch, /youtubeResponseProviderContext\.set\(response,\{providerKey:dispatchedProviderKey,acquisition,providerFailureGeneration:dispatchFailureGeneration,keyCapReservation:capReservation \?\? undefined,probeQuotaReservation:probeReservation \?\? undefined\}\)/);
   assert.doesNotMatch(youtubeFetch, /youtubeProviderCooldown\.succeeded\(dispatchedProviderKey\)/);
   assert.match(reader, /const context = youtubeResponseProviderContext\.get\(response\)/);
   assert.match(reader, /failedDispatchProviders\(context\.acquisition\)\?\.add\(context\.providerKey\)/);
@@ -332,4 +335,97 @@ test('recent-video description provider exhaustion propagates all-provider coold
   const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
   const recent = source.slice(source.indexOf('export async function fetchRecentVideoDescriptionsFromAPI'), source.indexOf('/**\n * Fetches richer official channel metadata'));
   assert.match(recent, /acquisition\.providerFailed\([\s\S]*throwIfAllProvidersCoolingDown\(keyPool\)/);
+});
+
+test('scheduler restores the enqueue-time origin instead of the shared drain context', async () => {
+  const seen: string[] = [];
+  let releaseNormal!: () => void;
+  const normalHeld = new Promise<void>(resolve => { releaseNormal = resolve; });
+  const normalDrain = new YouTubeRequestScheduler({ minIntervalMs: 0, initialRateLimitBackoffMs: 500, maxRateLimitBackoffMs: 2_000 });
+  const normalFirst = normalDrain.run(async () => {
+    await normalHeld;
+    seen.push(`normal-first:${currentOfficialYouTubeQuotaOrigin()}`);
+  });
+  const probeSecond = runWithOfficialYouTubeQuotaOrigin('PROBE', 'test-enqueue-probe', () =>
+    normalDrain.run(async () => { seen.push(`probe-second:${currentOfficialYouTubeQuotaOrigin()}`); }));
+  releaseNormal();
+  await Promise.all([normalFirst, probeSecond]);
+
+  let releaseProbe!: () => void;
+  const probeHeld = new Promise<void>(resolve => { releaseProbe = resolve; });
+  const probeDrain = new YouTubeRequestScheduler({ minIntervalMs: 0, initialRateLimitBackoffMs: 500, maxRateLimitBackoffMs: 2_000 });
+  const probeFirst = runWithOfficialYouTubeQuotaOrigin('PROBE', 'test-drain-probe', () =>
+    probeDrain.run(async () => {
+      await probeHeld;
+      seen.push(`probe-first:${currentOfficialYouTubeQuotaOrigin()}`);
+    }));
+  const normalSecond = probeDrain.run(async () => {
+    seen.push(`normal-second:${currentOfficialYouTubeQuotaOrigin()}`);
+  });
+  releaseProbe();
+  await Promise.all([probeFirst, normalSecond]);
+
+  assert.deepEqual(seen, [
+    'normal-first:NORMAL',
+    'probe-second:PROBE',
+    'probe-first:PROBE',
+    'normal-second:NORMAL',
+  ]);
+});
+
+test('scheduler rejects a wrapped probe control error without pacing or retry', async () => {
+  const scheduler = new YouTubeRequestScheduler({
+    minIntervalMs: 0,
+    initialRateLimitBackoffMs: 500,
+    maxRateLimitBackoffMs: 2_000,
+    maxRuntimeRateLimitRetries: 30,
+  });
+  let calls = 0;
+  const control = new ProbeQuotaExceededError('2026-10-20', 100, 1, 100);
+  await assert.rejects(
+    scheduler.run(async () => {
+      calls += 1;
+      // executeProviderCall classifies "quota" in the message as RATE_LIMIT and
+      // wraps the original policy error as cause.
+      throw new ProviderCallError('Provider rate limit reached (quota).', 'RATE_LIMIT', true, { cause: control });
+    }),
+    (error: unknown) => error instanceof ProviderCallError && (error as ProviderCallError).cause === control,
+  );
+  assert.equal(calls, 1, 'a probe policy refusal must not replay the admission check');
+  assert.equal(scheduler.getRatePressureSnapshot().recent429s, 0, 'a policy refusal is not shared runtime pressure');
+});
+
+test('every provider loop rethrows a probe allocation refusal before key failover', () => {
+  const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  const blocks: Array<[string, number, number]> = [
+    ['featured channels',
+      source.indexOf('export async function fetchYouTubeFeaturedChannels'),
+      source.indexOf('/** One bounded playlistItems call')],
+    ['playlist inspection',
+      source.indexOf('export async function fetchYouTubePlaylistChannels'),
+      source.indexOf('/**\n * Retrieves all valid YouTube API keys')],
+    ['locator resolution',
+      source.indexOf('export async function resolveYouTubeLocatorAuthoritatively'),
+      source.indexOf('export interface YouTubeChannelPage')],
+    ['channel search',
+      source.indexOf('export async function searchYouTubeChannelPage'),
+      source.indexOf('/**\n * Fetches recent video titles')],
+    ['recent videos',
+      source.indexOf('export async function fetchRecentVideoDescriptionsFromAPI'),
+      source.indexOf('/**\n * Fetches richer official channel metadata')],
+    ['channel enrichment',
+      source.indexOf('export async function fetchYouTubeChannelEnrichment'),
+      source.indexOf('/** One-unit basic metadata hydration')],
+    ['country metadata',
+      source.indexOf('export async function fetchYouTubeChannelCountryMetadata'),
+      source.length],
+  ];
+  for (const [name, start, end] of blocks) {
+    assert.ok(start >= 0 && end > start, `${name} source block exists`);
+    const block = source.slice(start, end);
+    const rethrow = block.indexOf('isProbeQuotaControlError');
+    assert.ok(rethrow >= 0, `${name} recognizes probe quota refusals`);
+    const record = block.indexOf('recordProviderFailure');
+    assert.ok(record < 0 || rethrow < record, `${name} rethrows before recording a key failure`);
+  }
 });

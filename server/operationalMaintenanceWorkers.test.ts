@@ -59,6 +59,13 @@ test('false-negative recovery grants attempt-free retries only to typed transien
   assert.doesNotMatch(workers, /errorClass: retryable \? 'TRANSIENT'/);
 });
 
+test('probe quota refusals keep their policy wait through maintenance recovery', () => {
+  assert.match(workers, /result\.probeQuotaExceeded === true/);
+  assert.match(workers, /result\.probeQuotaDisabled === true/);
+  assert.match(workers, /probeQuotaExceeded: true/);
+  assert.match(workers, /probeQuotaDisabled: true/);
+});
+
 test('maintenance concurrency is bounded and starts after database readiness in server runtime', () => {
   assert.match(workers, /COMMUNITY_RETRY_WORKER_CONCURRENCY/);
   assert.match(workers, /Math\.min\(5/);

@@ -5,11 +5,12 @@
  * followed by the EXISTING ingestion/verification pipeline for each returned
  * channel (`processChannelThroughPipeline`, the same entry the autonomous
  * Innertube caller uses via processDiscoveredChannel). Probe retrieval itself
- * uses only the existing InnerTube executor and records zero official quota
- * units. The delegated ingestion pipeline may call official Data API or LLM
- * paths according to its own configuration and accounting; those downstream
- * units are outside this probe ledger and are not modeled here. No new HTTP
- * client and no eligibility/serving writes.
+ * uses only the existing InnerTube executor and records zero retrieval quota
+ * units. The delegated ingestion pipeline runs under sticky PROBE provenance;
+ * every downstream official Data API call (hydration, ENRICH_CHANNEL, retries,
+ * recovery) reserves from the independent probe allocation in
+ * `quotaKeyCapShadow.ts`. LLM calls remain outside the YouTube ledger. No new
+ * HTTP client and no eligibility/serving writes.
  *
  * Integration contract: `runApprovedProbe(candidate)` is the single entry.
  * It (a) re-reads `discovery_probe_enabled` (absent => OFF) and the probe kill
@@ -36,6 +37,7 @@ import {
   type ProbeSettingReader,
   type ProbeRoute,
 } from './probeLedger';
+import { runWithOfficialYouTubeQuotaOrigin } from '../officialYouTubeQuotaFence';
 
 export const PROBE_PAGE_SIZE = 20;
 export const MAX_CHANNELS_INGESTED_PER_PROBE = 20;
@@ -155,11 +157,12 @@ async function defaultIngestChannel(
 ): Promise<ProbeIngestResult> {
   const { processChannelThroughPipeline } = await import('../ingestionPipeline');
   const outcome = await processChannelThroughPipeline(
-    channel,
+    { ...channel, quotaOrigin: 'PROBE' },
     country,
     'automated_query',
     false,
-    false
+    false,
+    { quotaOrigin: 'PROBE' },
   );
   return { wasKnown: outcome.wasKnown, isNew: outcome.isNew, persisted: outcome.persisted };
 }
@@ -205,6 +208,19 @@ function isNewCreator(outcome: Pick<ProbeIngestResult, 'wasKnown' | 'isNew' | 'p
  * requires a different evidenceVersion); FAILED = retrieval/execution error.
  */
 export async function runApprovedProbe(
+  candidate: ApprovedProbeCandidate,
+  deps: ProbeExecutorDeps = {}
+): Promise<ProbeRunSummary> {
+  // Every probe-originated async continuation, including injected ingestion
+  // implementations, executes under a sticky PROBE context. Anything that
+  // reaches the official YouTube dispatcher must reserve from the independent
+  // probe allocation before a request; missing/invalid allocation fails closed.
+  return runWithOfficialYouTubeQuotaOrigin('PROBE', 'runApprovedProbe', () =>
+    runApprovedProbeInContext(candidate, deps),
+  );
+}
+
+async function runApprovedProbeInContext(
   candidate: ApprovedProbeCandidate,
   deps: ProbeExecutorDeps = {}
 ): Promise<ProbeRunSummary> {
