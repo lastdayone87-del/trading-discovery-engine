@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import {
   ADAPTIVE_PILOT_DEFAULT_SEED,
@@ -199,21 +200,29 @@ test('pilot metrics expose net-new, relevance, duplicate, reliability and resour
       {
         arm: 'TREATMENT', assignments: 5, countries: 5, runs: 10, rawResults: 500,
         distinctCreators: 100, knownCreators: 40, newCreators: 20, relevantNewCreators: 12,
-        qualityNewCreators: 8, confirmedNewCreators: 5, quotaConsumed: 1000, providerFailures: 1
+        qualityNewCreators: 8, confirmedNewCreators: 5, quotaConsumed: 1000,
+        providerFailures: 1, invalidQueries: 1
       },
       {
         arm: 'CONTROL', assignments: 5, countries: 5, runs: 10, rawResults: 500,
         distinctCreators: 100, knownCreators: 60, newCreators: 10, relevantNewCreators: 4,
-        qualityNewCreators: 2, confirmedNewCreators: 1, quotaConsumed: 1000, providerFailures: 2
+        qualityNewCreators: 2, confirmedNewCreators: 1, quotaConsumed: 1000,
+        providerFailures: 2, invalidQueries: 1
       }
     ]
   });
   assert.equal(metrics.arms.TREATMENT.yieldPerRun, 2);
   assert.equal(metrics.arms.TREATMENT.relevantYieldPerRun, 1.2);
+  assert.equal(metrics.arms.TREATMENT.qualityYieldPerRun, 0.8);
+  assert.equal(metrics.arms.TREATMENT.noveltyRate, 0.2, 'novelty uses distinct creators, not raw results');
   assert.equal(metrics.arms.TREATMENT.duplicateRate, 0.4);
-  assert.equal(metrics.arms.TREATMENT.reliability, 0.9);
+  assert.equal(metrics.arms.TREATMENT.failedRuns, 2, 'invalid queries are terminal failures like provider failures');
+  assert.equal(metrics.arms.TREATMENT.reliability, 0.8);
   assert.equal(metrics.arms.TREATMENT.quotaPerRelevantCreator, 1000 / 12);
+  assert.equal(metrics.arms.TREATMENT.quotaPerQualityCreator, 1000 / 8);
   assert.ok(metrics.uplift.treatmentVsControl.newCreatorsPerRun > 0.99);
+  assert.ok(metrics.uplift.treatmentVsControl.qualityCreatorsPerRun > 0);
+  assert.ok(metrics.uplift.treatmentVsControl.noveltyRate > 0);
   assert.ok(metrics.uplift.treatmentVsControl.duplicateRate < 0);
   assert.ok(metrics.uplift.treatmentVsControl.reliability > 0);
 });
@@ -222,12 +231,16 @@ test('metrics absent for an arm produce safe zeros rather than NaN', () => {
   const arms = aggregateAdaptivePilotMetrics([{
     arm: 'CONTROL', assignments: 1, countries: 1, runs: 0, rawResults: 0,
     distinctCreators: 0, knownCreators: 0, newCreators: 0, relevantNewCreators: 0,
-    qualityNewCreators: 0, confirmedNewCreators: 0, quotaConsumed: 0, providerFailures: 0
+    qualityNewCreators: 0, confirmedNewCreators: 0, quotaConsumed: 0,
+    providerFailures: 0, invalidQueries: 0
   }]);
   const treatment = arms.find(arm => arm.arm === 'TREATMENT')!;
   assert.equal(treatment.yieldPerRun, 0);
+  assert.equal(treatment.qualityYieldPerRun, 0);
+  assert.equal(treatment.noveltyRate, 0);
   assert.equal(treatment.reliability, 0);
   assert.equal(treatment.quotaPerRelevantCreator, null);
+  assert.equal(treatment.quotaPerQualityCreator, null);
   assert.ok(Number.isFinite(treatment.duplicateRate));
 });
 
@@ -398,12 +411,31 @@ test('metrics are bounded by the report window and isolated by policy version', 
   assert.match(captured!.sql, /o\.allocation_at < LEAST\(a\.window_end, \$2::timestamptz\)/);
   assert.match(captured!.sql, /a\.window_start < \$2\s+AND a\.window_end > \$1/);
   assert.match(captured!.sql, /a\.policy_version = \$3/);
+  assert.match(captured!.sql, /FILTER \(WHERE o\.invalid_query\)/);
   assert.deepEqual(captured!.params, [
     '2026-10-23T07:00:00.000Z',
     '2026-10-24T07:00:00.000Z',
     'adaptive-country-pilot-v2'
   ]);
   assert.equal(metrics.policyVersion, 'adaptive-country-pilot-v2');
+});
+
+test('assignment ledger keeps one arm per country-day across a policy release', () => {
+  const migration = readFileSync(new URL('./db/migrations/156_adaptive_discovery_pilot.sql', import.meta.url), 'utf8');
+  assert.ok(migration.includes('UNIQUE(country, quota_day)'),
+    'the country-day assignment must be unique independent of policy_version');
+  assert.ok(!migration.includes('UNIQUE(country, quota_day, policy_version)'),
+    'a policy release must not create a second arm for the same country-day');
+  const source = readFileSync(new URL('./adaptiveDiscoveryPilot.ts', import.meta.url), 'utf8');
+  assert.match(source, /ON CONFLICT\(country,quota_day\) DO NOTHING/);
+  assert.match(source, /WHERE country=\$1 AND quota_day=\$2`/);
+});
+
+test('creator-derived and external scheduling reasons name the recorded family', () => {
+  const source = readFileSync(new URL('./autonomousDiscovery.ts', import.meta.url), 'utf8');
+  assert.match(source, /const governedProposalLabel = nativeSnapshot\?\.proposalFamily === 'CREATOR_DERIVED'/);
+  assert.match(source, /immutable \$\{governedProposalLabel\} proposal/);
+  assert.doesNotMatch(source, /immutable COUNTRY_NATIVE proposal/);
 });
 
 test('creator-derived proposal expiry is bound to the pilot day window', () => {

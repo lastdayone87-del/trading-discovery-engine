@@ -40,7 +40,7 @@ const result = await db.query(
   `SELECT DISTINCT ON (query_run_id)
      query_run_id,country,allocation_at,completed_at,raw_results,distinct_creators,
      known_creators,new_creators,relevant_new_creators,quality_new_creators,
-     confirmed_new_creators,quota_consumed,provider_failed
+     confirmed_new_creators,quota_consumed,provider_failed,invalid_query
    FROM discovery_evaluation_run_observations
    WHERE allocation_at >= $1 AND allocation_at < $2
    ORDER BY query_run_id, observation_revision DESC`,
@@ -56,12 +56,14 @@ const totals: Record<'TREATMENT' | 'CONTROL', AdaptivePilotAggregateRow> = {
   TREATMENT: {
     arm: 'TREATMENT', assignments: 0, countries: 0, runs: 0, rawResults: 0,
     distinctCreators: 0, knownCreators: 0, newCreators: 0, relevantNewCreators: 0,
-    qualityNewCreators: 0, confirmedNewCreators: 0, quotaConsumed: 0, providerFailures: 0
+    qualityNewCreators: 0, confirmedNewCreators: 0, quotaConsumed: 0,
+    providerFailures: 0, invalidQueries: 0
   },
   CONTROL: {
     arm: 'CONTROL', assignments: 0, countries: 0, runs: 0, rawResults: 0,
     distinctCreators: 0, knownCreators: 0, newCreators: 0, relevantNewCreators: 0,
-    qualityNewCreators: 0, confirmedNewCreators: 0, quotaConsumed: 0, providerFailures: 0
+    qualityNewCreators: 0, confirmedNewCreators: 0, quotaConsumed: 0,
+    providerFailures: 0, invalidQueries: 0
   }
 };
 
@@ -89,6 +91,7 @@ for (const row of result.rows) {
   target.confirmedNewCreators += Number(row.confirmed_new_creators || 0);
   target.quotaConsumed += Number(row.quota_consumed || 0);
   target.providerFailures += row.provider_failed ? 1 : 0;
+  target.invalidQueries += row.invalid_query ? 1 : 0;
 }
 
 totals.TREATMENT.assignments = [...assignments].filter(key => key.startsWith('TREATMENT|')).length;

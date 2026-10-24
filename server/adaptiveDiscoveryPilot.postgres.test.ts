@@ -76,11 +76,26 @@ maybe('assignments are immutable and idempotent for the same country-day', async
   assert.equal(first.arm, 'TREATMENT');
   assert.equal(replay.arm, 'TREATMENT', 'a later config change must not flip an existing country-day arm');
   assert.equal(replay.assignmentKey, first.assignmentKey);
+  const policyReplay = await recordAdaptivePilotAssignment({
+    country: 'US',
+    quotaDay: '2026-10-23',
+    arm: 'CONTROL',
+    treatmentPercent: 50,
+    seed,
+    windowStart,
+    windowEnd,
+    policyVersion: 'adaptive-country-pilot-v2'
+  }, db);
+  assert.equal(policyReplay.arm, 'TREATMENT',
+    'a policy release during the day must reuse the recorded arm');
+  assert.equal(policyReplay.assignmentKey, first.assignmentKey);
+  assert.equal(policyReplay.policyVersion, ADAPTIVE_PILOT_POLICY_VERSION,
+    'the ledger keeps the policy that actually randomized the day');
   const count = await db.query(
     'SELECT count(*)::int AS count FROM adaptive_discovery_pilot_assignments WHERE assignment_seed=$1',
     [seed]
   );
-  assert.equal(Number(count.rows[0].count), 1);
+  assert.equal(Number(count.rows[0].count), 1, 'one country-day must never have two arms');
 });
 
 maybe('a recurring creator concept is persisted and allocatable on the next treatment day', async () => {

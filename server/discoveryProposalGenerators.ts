@@ -259,6 +259,10 @@ export async function generateCreatorDerivedProposals(
   limit = 10,
   options: CreatorDerivedProposalOptions = {}
 ): Promise<DiscoveryFrontierProposal[]> {
+  // A zero (or negative) family cap means "generate none". Check before the
+  // database call so the cap cannot be exceeded by a clamped LIMIT 1.
+  if (!Number.isFinite(limit) || limit <= 0) return [];
+  const boundedLimit = Math.max(0, Math.floor(limit));
   const db = await getDb();
   const canonicalC = canonicalCountry(country);
   const res = await db.query(
@@ -283,7 +287,7 @@ export async function generateCreatorDerivedProposals(
        AND c.quality_score >= $2
      ORDER BY c.updated_at DESC
      LIMIT $3`,
-    [canonicalC, QUALITY_CREATOR_SCORE_THRESHOLD, Math.max(1, limit)]
+    [canonicalC, QUALITY_CREATOR_SCORE_THRESHOLD, boundedLimit]
   );
 
   const proposals: DiscoveryFrontierProposal[] = [];
@@ -882,6 +886,12 @@ export async function generateFrontierProposalsForCountry(
 ): Promise<{ generated: number; persisted: number; proposals: DiscoveryFrontierProposal[] }> {
   const perFamilyCap = config.perFamilyCap ?? 5;
   const globalCap = config.globalCap ?? 25;
+  // Zero is a valid cap and must generate/persist nothing. Return before any
+  // generator query so neither the family cap nor the global cap can be
+  // exceeded by the in-memory dedup loop.
+  if (perFamilyCap <= 0 || globalCap <= 0) {
+    return { generated: 0, persisted: 0, proposals: [] };
+  }
 
   const [
     learned,

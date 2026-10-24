@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import {
   buildFrontierProposal,
   createProposalDedupKey,
-  generateCountryNativeProposals
+  generateCountryNativeProposals,
+  generateCreatorDerivedProposals,
+  generateFrontierProposalsForCountry
 } from './discoveryProposalGenerators';
 
 test('Phase 6: Proposal dedup key is deterministic and unique across dimensions', () => {
@@ -108,6 +110,21 @@ test('creator-derived proposals for consecutive treatment days produce distinct 
 
   assert.notEqual(first.dedupKey, second.dedupKey);
   assert.equal(first.targetNeighborhoodKey, second.targetNeighborhoodKey, 'Both day-specific rows must point at the same governed neighborhood');
+});
+
+test('a zero family or global cap generates nothing before querying', async () => {
+  assert.deepEqual(await generateCreatorDerivedProposals('US', 0), [],
+    'a zero family cap must not fall through to a LIMIT 1 query');
+  assert.deepEqual(
+    await generateFrontierProposalsForCountry('US', { perFamilyCap: 0, globalCap: 25 }),
+    { generated: 0, persisted: 0, proposals: [] },
+    'perFamilyCap=0 must not persist one proposal per family'
+  );
+  assert.deepEqual(
+    await generateFrontierProposalsForCountry('US', { perFamilyCap: 5, globalCap: 0 }),
+    { generated: 0, persisted: 0, proposals: [] },
+    'globalCap=0 must not persist the first proposal'
+  );
 });
 
 test('creator-derived generator uses the channels schema and governed vocabulary evidence', async () => {

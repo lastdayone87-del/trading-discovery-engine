@@ -17,7 +17,10 @@ CREATE TABLE IF NOT EXISTS adaptive_discovery_pilot_assignments (
   window_end TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   CHECK (window_end > window_start),
-  UNIQUE(country, quota_day, policy_version)
+  -- One assignment per country-Pacific-day. policy_version records which
+  -- policy governed the day; a later policy release must not rerandomize an
+  -- already-assigned day and split it between arms.
+  UNIQUE(country, quota_day)
 );
 
 CREATE INDEX IF NOT EXISTS adaptive_pilot_assignment_window_idx
