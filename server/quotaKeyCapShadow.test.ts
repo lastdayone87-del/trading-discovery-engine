@@ -468,6 +468,18 @@ test('resolveKeyCapEnforcement is literal-true, caches 30s, and fails closed on 
   );
 });
 
+test('a stalled settings read is bounded and fails closed', async () => {
+  resetKeyCapEnforcementCacheForTests();
+  const started = Date.now();
+  await assert.rejects(
+    resolveKeyCapEnforcement(() => new Promise<string>(() => undefined), Date.now(), 5),
+    (error: unknown) => error instanceof YouTubeKeyCapUnavailableError
+      && /timed out/.test(String((error as Error).cause ?? error.message)),
+    'a settings query that never resolves must not hold the dispatch queue'
+  );
+  assert.ok(Date.now() - started < 500, 'the read is bounded by the deadline, not the DB pool');
+});
+
 test('a reservation that crosses Pacific midnight fails closed before dispatch', () => {
   const context: KeyCapReservationContext = {
     mode: 'enforce', quotaDay: '2026-03-08', operationId: 'op-midnight', keyFingerprint: 'fp-midnight', units: 1,

@@ -36,6 +36,20 @@ test('youtubeFetch performs live reselection inside scheduler dispatch and rebui
   assert.match(reader,/if\(validatedIndex>=0\)activeKeyIndex=advanceYouTubeRotation\(validatedPool\.length,validatedIndex\)/);
 });
 
+test('featured-channel inspection fails over across healthy keys', () => {
+  const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  const start = source.indexOf('export async function fetchYouTubeFeaturedChannels');
+  const end = source.indexOf('/** One bounded playlistItems call', start);
+  assert.ok(start >= 0 && end > start, 'featured-channel function must remain discoverable');
+  const block = source.slice(start, end);
+  assert.match(block, /for \(let attempt = 0; attempt < providerIndexes\.length; attempt\+\+\)/);
+  assert.match(block, /youtubeFetch\(url, 'featured-channel-sections'[^)]*apiKey\)/);
+  assert.match(block, /recordProviderFailure\(apiKey, error\)/);
+  assert.match(block, /attempt === providerIndexes\.length - 1/);
+  assert.match(block, /throwIfAllProvidersCoolingDown\(keys\)/);
+  assert.doesNotMatch(block, /const index = availableKeyIndexes\(keys\)\[0\]/);
+});
+
 test('youtubeFetch gates dispatch on suspension hydration and captures generation before fetch', () => {
   const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
   const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));

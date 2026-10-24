@@ -188,15 +188,31 @@ export async function fetchYouTubeFeaturedChannels(sourceChannelId: string, maxi
   if (!/^UC[A-Za-z0-9_-]{22}$/.test(sourceChannelId) || !Number.isInteger(maximumFanout) || maximumFanout < 1 || maximumFanout > 10) throw new Error('INVALID_FEATURED_CHANNEL_PROVIDER_INPUT');
   const keys = getYouTubeKeyPool(); if (!keys.length) throw new Error('YouTube featured-channel inspection requires an API key.');
   const acquisition = youtubePoolBackoff.beginAcquisition();
+  let quotaExceededCount = 0;
   try {
-    const index = availableKeyIndexes(keys)[0];
-    const url = buildYouTubeApiUrl('channelSections', keys[index], { part: 'snippet,contentDetails', channelId: sourceChannelId, maxResults: Math.min(50, maximumFanout) });
-    let response: Response;
-    try {
-      response = await youtubeFetch(url, 'featured-channel-sections', FEATURED_CHANNEL_PROVIDER_COST, 1, acquisition, 'enrichment', keys[index]);
-    } catch (error) { recordProviderFailure(keys[index], error); acquisition.providerFailed(isQuotaExceeded(error) ? 'QUOTA_EXHAUSTED' : 'INDETERMINATE'); throw error; }
-    await accountYouTubeQuotaResponse(response, FEATURED_CHANNEL_PROVIDER_COST);
-    return parseFeaturedChannelSections({ sourceChannelId, maximumFanout, response: await readYouTubeJsonObject(response, 'featured-channel-sections'), observedAt: new Date().toISOString() });
+    const providerIndexes = availableKeyIndexes(keys);
+    for (let attempt = 0; attempt < providerIndexes.length; attempt++) {
+      const index = providerIndexes[attempt];
+      const apiKey = keys[index];
+      try {
+        const url = buildYouTubeApiUrl('channelSections', apiKey, { part: 'snippet,contentDetails', channelId: sourceChannelId, maxResults: Math.min(50, maximumFanout) });
+        const response = await youtubeFetch(url, 'featured-channel-sections', FEATURED_CHANNEL_PROVIDER_COST, attempt + 1, acquisition, 'enrichment', apiKey);
+        await accountYouTubeQuotaResponse(response, FEATURED_CHANNEL_PROVIDER_COST);
+        return parseFeaturedChannelSections({ sourceChannelId, maximumFanout, response: await readYouTubeJsonObject(response, 'featured-channel-sections'), observedAt: new Date().toISOString() });
+      } catch (error) {
+        // A successful provider response that cannot be accounted must not be
+        // retried on another key: the first call may already have spent units.
+        if (isYouTubeQuotaAccountingError(error)) throw error;
+        recordProviderFailure(apiKey, error);
+        if (isQuotaExceeded(error)) quotaExceededCount++;
+        if (attempt === providerIndexes.length - 1) {
+          acquisition.providerFailed(quotaExceededCount === providerIndexes.length ? 'QUOTA_EXHAUSTED' : 'INDETERMINATE');
+          throwIfAllProvidersCoolingDown(keys);
+          throw error;
+        }
+      }
+    }
+    throw new Error('All configured YouTube API keys failed for featured-channel inspection.');
   } finally { acquisition.release(); }
 }
 

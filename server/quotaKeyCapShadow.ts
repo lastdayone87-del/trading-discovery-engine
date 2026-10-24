@@ -49,6 +49,9 @@ export const ENFORCED_STATEMENT_TIMEOUT_MS = 5_000;
  * arrives after this deadline is released instead of being used. */
 export const ENFORCED_CONNECT_TIMEOUT_MS = 5_000;
 
+/** A settings read must not hold the dispatch queue past this deadline. */
+export const SETTINGS_READ_TIMEOUT_MS = 2_000;
+
 /**
  * One lock namespace for every lease writer and projection reader for a
  * key/day. Shadow and enforced dispatch must serialize against each other
@@ -225,13 +228,37 @@ let cachedEnforcement: { at: number; enabled: boolean } | null = null;
  * cannot silently dispatch unreserved requests. Successful absent/false reads
  * still preserve the legacy shadow-only path.
  */
+async function readSettingWithDeadline<T>(
+  read: Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      read,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), Math.max(1, timeoutMs));
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export async function resolveKeyCapEnforcement(
   readSetting: ShadowSettingReader,
-  now: number = Date.now()
+  now: number = Date.now(),
+  timeoutMs: number = SETTINGS_READ_TIMEOUT_MS,
 ): Promise<boolean> {
   if (cachedEnforcement && now - cachedEnforcement.at < SHADOW_CONFIG_TTL_MS) return cachedEnforcement.enabled;
   try {
-    const raw = await readSetting(ENFORCED_KEY, 'false');
+    const raw = await readSettingWithDeadline(
+      readSetting(ENFORCED_KEY, 'false'),
+      timeoutMs,
+      'YouTube key cap enforcement setting read timed out.',
+    );
     const enabled = raw === 'true';
     cachedEnforcement = { at: now, enabled };
     return enabled;
