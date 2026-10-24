@@ -65,7 +65,7 @@ import {buildProviderRequestBaseId,executeAllocatedRetrievalPage,providerSnapsho
 import './braveSearch';
 import './youtubeInnertubeProvider';
 import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator, replayVocabularyForRetry } from './queryIntelligence';
-import { calculateQueryFunnel, type FunnelOutcome, type QueryObservation } from './queryPerformance';
+import { calculateQueryFunnel, manualSearchContinuationMetrics, type FunnelOutcome, type QueryObservation } from './queryPerformance';
 import { resolveScopeEligibility } from './scopeEligibility';
 import { processChannelThroughPipeline, isTerminalState, applyGate1CountryRejectionToExisting } from './ingestionPipeline';
 import { evaluateLowAudienceGate } from './lowAudienceGate';
@@ -3129,6 +3129,7 @@ async function executeManualSearchPage(sessionId: string, pageNumber: number, pa
     const qualityConfirmedIds: string[] = [];
     const qualityScores: number[] = [];
     const communityIds: string[] = [];
+    const deferredIds = new Set<string>();
     let countryAccepted = 0;
     for (const [index,raw] of unique.entries()) {
       const nomination=await recordNomination({channelId:raw.channelId,sourceType:'manual_search',sourceActionId:sessionId,query:queryVariant,
@@ -3136,7 +3137,7 @@ async function executeManualSearchPage(sessionId: string, pageNumber: number, pa
         matchedDocument:raw.matchedDocument||{type:'MANUAL'},rawObservation:{channelName:raw.channelName,youtubeUrl:raw.youtubeUrl,sessionId,variantIndex}},'INVESTIGATION_QUEUED');
       raw.nominationId=nomination.id||undefined;
       const outcome = await processDiscoveredChannelContained(raw, session.country, 'manual_search');
-      if (!outcome) continue;
+      if (!outcome) { deferredIds.add(raw.channelId); continue; }
       if (outcome.wasKnown) knownIds.push(outcome.channelId);
       if (outcome.persisted && outcome.countryStatus !== 'REJECTED') acceptedIds.push(outcome.channelId);
       if (outcome.countryStatus !== 'REJECTED') countryAccepted++;
@@ -3148,15 +3149,20 @@ async function executeManualSearchPage(sessionId: string, pageNumber: number, pa
         if (outcome.discordStatus === 'ACTIVE' || outcome.discordStatus === 'ACTIVE_LOW_VOLUME') communityIds.push(outcome.channelId);
       }
     }
-    const previous = new Set(session.uniqueChannelIds);
-    const novelIds = uniqueIds.filter(id => !previous.has(id));
-    const noveltyRatio = uniqueIds.length ? novelIds.length / uniqueIds.length : 0;
-    const duplicateRatio = rawIds.length ? 1 - (novelIds.length / rawIds.length) : 1;
-    const projectedUnique = new Set([...session.uniqueChannelIds, ...uniqueIds]).size;
+    const manualMetrics = manualSearchContinuationMetrics({
+      rawIds,
+      uniqueIds,
+      deferredIds: [...deferredIds],
+      previousIds: session.uniqueChannelIds,
+      countryAccepted,
+      confirmedCount: confirmedIds.length,
+      communityCount: communityIds.length,
+    });
+    const projectedUnique = new Set([...session.uniqueChannelIds, ...manualMetrics.evaluatedUniqueIds]).size;
     const hasNextVariant = variantIndex + 1 < session.generatedQueryVariants.length;
-    const decision = evaluateContinuation({pageNumber,maxPages,hasNextPage:!!page.nextPageToken||hasNextVariant,distinctCreators:uniqueIds.length,cumulativeDistinctCreators:projectedUnique,maxDistinctCreators:maxCreators,newCreators:novelIds.length,confirmedCreators:confirmedIds.length,qualityConfirmedCreators:qualityConfirmedIds.length,countryPrecision:unique.length?countryAccepted/unique.length:0,communityDiversity:confirmedIds.length?communityIds.length/confirmedIds.length:0,duplicateRatio,consecutiveLowYieldPages:session.consecutiveLowYieldPages,maxConsecutiveLowYieldPages:maxLowYield});
+    const decision = evaluateContinuation({pageNumber,maxPages,hasNextPage:!!page.nextPageToken||hasNextVariant,distinctCreators:manualMetrics.distinctCreators,cumulativeDistinctCreators:projectedUnique,maxDistinctCreators:maxCreators,newCreators:manualMetrics.novelIds.length,confirmedCreators:confirmedIds.length,qualityConfirmedCreators:qualityConfirmedIds.length,countryPrecision:manualMetrics.countryPrecision,communityDiversity:manualMetrics.communityDiversity,duplicateRatio:manualMetrics.duplicateRatio,consecutiveLowYieldPages:session.consecutiveLowYieldPages,maxConsecutiveLowYieldPages:maxLowYield,deferredOnly:manualMetrics.deferredOnly});
     const stopReason = decision.shouldContinue ? null : decision.primaryReason;
-    const updated = await recordManualSearchPage(sessionId, { pageNumber, queryVariant, lane: session.retrievalLane, inputPageToken: pageToken, nextPageToken: page.nextPageToken, rawResultCount:page.rawResultCount, rawIds, uniqueIds, knownIds, acceptedIds, confirmedIds, qualityConfirmedIds, averageQualityScore:qualityScores.length?qualityScores.reduce((a,b)=>a+b,0)/qualityScores.length:0, countryPrecision:unique.length?countryAccepted/unique.length:0,communityDiversity:confirmedIds.length?communityIds.length/confirmedIds.length:0,noveltyRatio, duplicateRatio, quotaUnits: 100, quotaEfficiency: qualityConfirmedIds.length / 100, creatorYield: confirmedIds.length, lowYield:decision.lowYield,marginalUtility:decision.marginalUtility,shouldContinue:decision.shouldContinue,primaryReason:decision.primaryReason,reasonCodes:decision.reasonCodes,maxPages, stopReason });
+    const updated = await recordManualSearchPage(sessionId, { pageNumber, queryVariant, lane: session.retrievalLane, inputPageToken: pageToken, nextPageToken: page.nextPageToken, rawResultCount:page.rawResultCount, rawIds, uniqueIds, knownIds, acceptedIds, confirmedIds, qualityConfirmedIds, averageQualityScore:qualityScores.length?qualityScores.reduce((a,b)=>a+b,0)/qualityScores.length:0, countryPrecision:manualMetrics.countryPrecision,communityDiversity:manualMetrics.communityDiversity,noveltyRatio:manualMetrics.noveltyRatio, duplicateRatio:manualMetrics.duplicateRatio, quotaUnits: 100, quotaEfficiency: qualityConfirmedIds.length / 100, creatorYield: confirmedIds.length, lowYield:decision.lowYield,marginalUtility:decision.marginalUtility,shouldContinue:decision.shouldContinue,primaryReason:decision.primaryReason,reasonCodes:decision.reasonCodes,maxPages, stopReason });
     if (!stopReason) {
       const nextVariantIndex = page.nextPageToken ? variantIndex : variantIndex + 1;
       await enqueueJob('MANUAL_SEARCH_PAGE', { sessionId, pageNumber: pageNumber + 1, pageToken: page.nextPageToken, variantIndex: nextVariantIndex }, { priority: 200, maxAttempts: 3, idempotencyKey: `manual-page:${sessionId}:${pageNumber + 1}` });

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { calculateQueryFunnel, isSeverelyContaminatedQuery, selectQueryCollection, type QueryObservation } from './queryPerformance';
+import { calculateQueryFunnel, isSeverelyContaminatedQuery, manualSearchContinuationMetrics, selectQueryCollection, type QueryObservation } from './queryPerformance';
 import { evaluateContinuation } from './continuationPolicy';
 
 test('query funnel keeps duplicates, known channels, exclusions, and classifications separate', () => {
@@ -87,6 +87,38 @@ test('deferred probe results keep raw reporting but do not count as duplicates',
   assert.equal(metrics.deferredResults, 6);
   assert.equal(metrics.evaluatedRawResults, 4);
   assert.equal(metrics.duplicateResults, 2, 'deferred results are not duplicates');
+});
+
+test('manual page metrics exclude deferred channels from novelty and precision', () => {
+  const metrics = manualSearchContinuationMetrics({
+    rawIds: ['a', 'a', 'b', 'c'],
+    uniqueIds: ['a', 'b', 'c'],
+    deferredIds: ['b'],
+    previousIds: ['a'],
+    countryAccepted: 1,
+    confirmedCount: 0,
+    communityCount: 0,
+  });
+  assert.deepEqual(metrics.evaluatedUniqueIds, ['a', 'c']);
+  assert.deepEqual(metrics.novelIds, ['c']);
+  assert.equal(metrics.deferredOnly, false);
+  assert.equal(metrics.distinctCreators, 2);
+  assert.equal(metrics.noveltyRatio, 0.5);
+  assert.ok(Math.abs(metrics.duplicateRatio - 2 / 3) < 1e-12, 'one of three evaluated raw results is a duplicate');
+  assert.equal(metrics.countryPrecision, 0.5);
+
+  const allDeferred = manualSearchContinuationMetrics({
+    rawIds: ['b'],
+    uniqueIds: ['b'],
+    deferredIds: ['b'],
+    previousIds: [],
+    countryAccepted: 0,
+    confirmedCount: 0,
+    communityCount: 0,
+  });
+  assert.equal(allDeferred.deferredOnly, true);
+  assert.equal(allDeferred.duplicateRatio, 0);
+  assert.equal(allDeferred.countryPrecision, 0);
 });
 
 test('deferred-only pages do not stop normal pagination as low yield', () => {

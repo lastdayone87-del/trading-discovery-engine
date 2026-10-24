@@ -344,6 +344,8 @@ test('normal-origin batches contain probe channel refusals; probe jobs still def
   assert.match(source, /calculateQueryFunnel\(searchPage\?\.rawResultCount \?\? extracted\.length, observations, deferredResults\)/);
   assert.match(source, /deferredOnly: observations\.length === 0 && deferredResults > 0/);
   assert.match(source, /enqueueJob\('ENRICH_CHANNEL', deferred\.payload, deferred\.opts\)/);
+  assert.match(source, /manualSearchContinuationMetrics\(\{/);
+  assert.match(source, /deferredOnly:manualMetrics\.deferredOnly/);
 
   const raw = { channelId: 'deferred-channel', channelName: 'Deferred', youtubeUrl: 'https://youtube.test/deferred' } as any;
   const now = Date.parse('2026-10-20T19:00:00.000Z');

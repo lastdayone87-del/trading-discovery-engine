@@ -138,6 +138,51 @@ export function calculateQueryFunnel(
 }
 
 /**
+ * Manual-search continuation inputs with deferred (not evaluated) channels
+ * removed from the novelty/precision denominator. Manual pages are
+ * operator-driven and do not use calculateQueryFunnel, but they share the
+ * same failure mode: a deferred channel must not look like a country miss or
+ * a duplicate. The raw provider IDs stay available for the stored page audit.
+ */
+export function manualSearchContinuationMetrics(input: {
+  rawIds: string[];
+  uniqueIds: string[];
+  deferredIds: string[];
+  previousIds: string[];
+  countryAccepted: number;
+  confirmedCount: number;
+  communityCount: number;
+}): {
+  evaluatedUniqueIds: string[];
+  novelIds: string[];
+  deferredOnly: boolean;
+  distinctCreators: number;
+  noveltyRatio: number;
+  duplicateRatio: number;
+  countryPrecision: number;
+  communityDiversity: number;
+} {
+  const deferred = new Set(input.deferredIds);
+  const previous = new Set(input.previousIds);
+  const evaluatedUniqueIds = input.uniqueIds.filter(id => !deferred.has(id));
+  const deferredRawCount = input.rawIds.filter(id => deferred.has(id)).length;
+  const evaluatedRawCount = Math.max(0, input.rawIds.length - deferredRawCount);
+  const novelIds = evaluatedUniqueIds.filter(id => !previous.has(id));
+  return {
+    evaluatedUniqueIds,
+    novelIds,
+    deferredOnly: evaluatedUniqueIds.length === 0 && deferred.size > 0,
+    distinctCreators: evaluatedUniqueIds.length,
+    noveltyRatio: evaluatedUniqueIds.length ? novelIds.length / evaluatedUniqueIds.length : 0,
+    duplicateRatio: evaluatedRawCount
+      ? Math.max(0, 1 - novelIds.length / evaluatedRawCount)
+      : deferred.size ? 0 : 1,
+    countryPrecision: evaluatedUniqueIds.length ? input.countryAccepted / evaluatedUniqueIds.length : 0,
+    communityDiversity: input.confirmedCount ? input.communityCount / input.confirmedCount : 0,
+  };
+}
+
+/**
  * A query that produces a sufficiently large, overwhelmingly unresolved or
  * non-trading cohort is unsafe to recycle through autonomous exploration.
  * Quarantine it after the first bad run instead of requiring a second flood to
