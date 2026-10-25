@@ -59,6 +59,9 @@ export function reactivateOperationalEnrichment(
   };
 }
 
+// Start timestamp of the previous reconciliation. This is a start-to-start
+// throttle, not a completion-to-start delay: a scan that itself lasts longer
+// than 60 seconds already satisfies the interval.
 let lastOperationalEnrichmentReconciliationAt = 0;
 // Process-local single-flight guard. Production runs one app replica, and all
 // worker loops share this module, so a boolean stops the 15 loops from piling
@@ -184,11 +187,15 @@ export async function reconcileOperationalEnrichmentRecovery(
   limit = 20,
   now = Date.now()
 ): Promise<number> {
-  // Check the in-flight guard before the cooldown: a concurrent worker with a
+  // Check the in-flight guard before the throttle: a concurrent worker with a
   // slightly later clock must not start a second scan, and a skipped call must
-  // not extend the cooldown window.
+  // not extend the throttle window.
   if (operationalEnrichmentReconciliationInFlight) return 0;
   if (now - lastOperationalEnrichmentReconciliationAt < 60_000) return 0;
+  // Stamp the start, preserving the existing start-to-start contract. If a scan
+  // outlives the window, the next scan may start as soon as this one finishes;
+  // the single-flight guard still prevents overlap, and the two starts remain
+  // at least the scan duration apart.
   lastOperationalEnrichmentReconciliationAt = now;
   operationalEnrichmentReconciliationInFlight = true;
   try {
