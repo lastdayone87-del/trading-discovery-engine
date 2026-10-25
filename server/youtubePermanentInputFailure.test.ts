@@ -66,6 +66,10 @@ test('youtubeFetch classifies permanent input only after excluding every key-lev
 });
 
 test('every official key loop stops rotating on permanent input', () => {
+  // Source-order guards, not a runtime loop harness: these functions depend on
+  // the live key pool, quota reservations, scheduler, and database. They prove
+  // the permanent-input throw precedes failure recording and the retry/rotation
+  // branch in every loop. A mocked end-to-end loop test remains a known gap.
   const loops: Array<[string, string | undefined]> = [
     ['export async function fetchYouTubeFeaturedChannels', '/** One bounded playlistItems call'],
     ['export async function fetchYouTubePlaylistChannels', '/**\n * Retrieves all valid YouTube API keys'],
@@ -77,6 +81,13 @@ test('every official key loop stops rotating on permanent input', () => {
   ];
   for (const [start, end] of loops) {
     const block = functionBlock(start, end);
-    assert.match(block, /isYouTubePermanentInputError\(/, `${start} must stop key rotation on permanent input`);
+    const permanent = block.indexOf('isYouTubePermanentInputError(');
+    assert.ok(permanent >= 0, `${start} must stop key rotation on permanent input`);
+    const rotation = block.indexOf('recordProviderFailure');
+    const rotationMarker = rotation >= 0 ? rotation : block.indexOf('attempt === keys.length - 1');
+    assert.ok(
+      rotationMarker > permanent,
+      `${start} must throw on permanent input before recording a key failure or rotating to another key`,
+    );
   }
 });
