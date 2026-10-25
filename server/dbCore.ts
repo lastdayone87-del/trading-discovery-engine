@@ -15,6 +15,7 @@ import type { AuditEvent } from './operatorAuth';
 import type { ProviderCallEvent } from './providerResilience';
 import { toWellFormedDeep, stringifyWellFormedJson } from './unicodeSafety';
 import { ProbeQuotaUnavailableError, resolveShadowConfig, settleKeyCapReservation, settleProbeQuotaReservation, settleShadowLeaseWithSavepoint, YouTubeKeyCapUnavailableError, type KeyCapReservationContext, type QuotaSettlementContext } from './quotaKeyCapShadow';
+import { isYouTubePermanentInputError } from './youtubeKeyHealth';
 import { canonicalCountry } from './countryInference';
 import { classifyDiscoveryVisibility } from './discoveryStateVisibility';
 import { safeCrawlerTelemetry, type CrawlerTelemetry } from './crawlerTelemetry';
@@ -2274,6 +2275,10 @@ export function decideJobFailure(error:any,attempts:number,maxAttempts:number,no
     const retryAt=Number(error?.retryAt);
     return {disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:Number.isFinite(retryAt)&&retryAt>now?retryAt:now+60_000};
   }
+  // A permanent invalid input (deleted channel/playlist, malformed request)
+  // is rejected identically by every key and every retry. Terminal without
+  // consuming a retry budget or creating operational-review work.
+  if(isYouTubePermanentInputError(error))return {disposition:'FAILED'};
   const failureCode=String(error?.code||'');
   if(failureCode==='YOUTUBE_KEY_CAP_EXCEEDED'){
     // Capacity exhaustion is a policy wait, not a job failure. Wait for the

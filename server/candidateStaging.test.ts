@@ -5,6 +5,7 @@ import {
   updateStagedCandidateResolution,
   processPendingStagedCandidates
 } from './candidateStaging';
+import { YouTubePermanentInputError } from './youtubeKeyHealth';
 
 test('getPendingStagedCandidates returns empty list when DB is offline', async () => {
   const candidates = await getPendingStagedCandidates(10);
@@ -96,4 +97,46 @@ test('processPendingStagedCandidates defers external evidence without explicit Y
   assert.equal(result.deferred, 1);
   assert.equal(result.skipped, 0);
   assert.equal(updatedStatus, null);
+});
+
+test('processPendingStagedCandidates fails permanent input instead of deferring it', async () => {
+  let updated: { status?: string; reason?: string } = {};
+  const mockDb = {
+    query: async (sql: string, params: any[]) => {
+      if (sql.includes('SELECT')) {
+        return {
+          rows: [{
+            id: 'staging-id-3',
+            staging_key: 'key-3',
+            provider_key: 'brave-search',
+            candidate_type: 'HANDLE',
+            normalized_identity: '@deleted-channel',
+            raw_locator: 'https://youtube.com/@deleted-channel',
+            country: 'US',
+            discovery_mode: 'DIRECT_YOUTUBE',
+            resolution_status: 'PENDING',
+            metadata: {}
+          }]
+        };
+      }
+      if (sql.includes('UPDATE')) {
+        updated = { status: params[1], reason: params[4] };
+        return { rowCount: 1 };
+      }
+      return { rows: [] };
+    }
+  };
+  const resolver = async () => {
+    throw new YouTubePermanentInputError(
+      'resolve-handle',
+      Object.assign(new Error('YouTube HTTP 404'), { status: 404, providerReasons: ['channelNotFound'] }),
+    );
+  };
+
+  const result = await processPendingStagedCandidates(resolver, mockDb);
+
+  assert.equal(result.processed, 1);
+  assert.equal(result.deferred, 0);
+  assert.equal(updated.status, 'FAILED');
+  assert.equal(updated.reason, 'AUTHORITATIVE_CHANNEL_RESOLUTION_PERMANENT_INPUT');
 });

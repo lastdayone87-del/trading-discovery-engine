@@ -74,6 +74,38 @@ export function isYouTubePageTokenFailure(error: unknown): boolean {
   return Array.isArray(reasons) && reasons.some(reason => PAGE_TOKEN_REASON_PATTERN.test(String(reason)));
 }
 
+/** A request input the provider will reject identically on every key: a
+ * deleted channel/playlist (404) or a malformed identifier (400/422). It is
+ * deliberately distinct from a bad API key, a suspended consumer, quota
+ * exhaustion, rate limiting, and a stale page token, none of which prove the
+ * input is permanently invalid. Marked through `executeProviderCall`'s
+ * wrapping by carrying the marker on the cause chain. */
+export class YouTubePermanentInputError extends Error {
+  readonly code = 'YOUTUBE_PERMANENT_INPUT';
+  readonly youtubePermanentInput = true;
+  readonly status?: number;
+  readonly providerReasons?: string[];
+  constructor(operation: string, cause: unknown) {
+    super(`YouTube ${operation} rejected the request input permanently.`, { cause });
+    this.name = 'YouTubePermanentInputError';
+    const source = cause as { status?: unknown; providerReasons?: unknown } | null;
+    if (typeof source?.status === 'number') this.status = source.status;
+    if (Array.isArray(source?.providerReasons)) this.providerReasons = source.providerReasons.map(String);
+  }
+}
+
+/** Detects the permanent-input marker at any depth of the provider error
+ * chain. `executeProviderCall` wraps the original error in a ProviderCallError
+ * whose `cause` is the marked error, so a top-level-only check would miss it. */
+export function isYouTubePermanentInputError(error: unknown): boolean {
+  let current: any = error;
+  for (let depth = 0; current && depth < 6; depth++, current = current.cause) {
+    if (current instanceof YouTubePermanentInputError) return true;
+    if (current.code === 'YOUTUBE_PERMANENT_INPUT' || current.youtubePermanentInput === true) return true;
+  }
+  return false;
+}
+
 /** Serializes durable suspension writes (persist + clear) in process
  * arrival order. The pool runs several clients, so without this a gated
  * clear issued before a concurrent re-suspension's upsert can still execute
