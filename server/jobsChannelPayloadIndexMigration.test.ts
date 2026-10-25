@@ -13,6 +13,9 @@ import { fileURLToPath } from 'node:url';
 const migrationsDir = fileURLToPath(new URL('./db/migrations/', import.meta.url));
 const migrationName = '157_jobs_channel_payload_index.sql';
 const migration = readFileSync(`${migrationsDir}${migrationName}`, 'utf8');
+const withoutSqlComments = migration
+  .replace(/\/\*[\s\S]*?\*\//g, ' ')
+  .replace(/--[^\n]*/g, ' ');
 
 test('migration 157 is present and sorts after migration 156', () => {
   const files = readdirSync(migrationsDir).filter(name => name.endsWith('.sql')).sort();
@@ -27,12 +30,16 @@ test('migration 157 adopts the exact channel-payload index without rebuilding it
     /CREATE INDEX IF NOT EXISTS idx_jobs_channel_payload\s+ON public\.jobs USING btree \(\(\(payload ->> 'channelId'::text\)\)\);/,
   );
   assert.match(migration, /COMMENT ON INDEX public\.idx_jobs_channel_payload/);
-  assert.doesNotMatch(migration, /CONCURRENTLY/i, 'the migration runner wraps files in a transaction');
+  assert.match(migration, /catalog no-op/);
+  assert.match(migration, /write-blocking lock/);
+  assert.match(migration, /lock_timeout bounds the wait/);
+  assert.doesNotMatch(
+    withoutSqlComments,
+    /CONCURRENTLY/i,
+    'the migration runner wraps files in a transaction, so the SQL itself must not request a concurrent build',
+  );
 });
 
 test('migration 157 is additive-only', () => {
-  const withoutComments = migration
-    .replace(/\/\*[\s\S]*?\*\//g, ' ')
-    .replace(/--[^\n]*/g, ' ');
-  assert.doesNotMatch(withoutComments, /\b(?:DROP|DELETE|TRUNCATE|UPDATE)\b/i);
+  assert.doesNotMatch(withoutSqlComments, /\b(?:DROP|DELETE|TRUNCATE|UPDATE)\b/i);
 });
