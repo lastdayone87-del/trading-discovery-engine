@@ -33,6 +33,7 @@ import {
 import { isConfirmedLoginWall, LOGIN_WALL_FAILURE_CLASS, isConfirmedPaywall, PAYWALL_FAILURE_CLASS } from './loginWallDetection';
 import { hasBlockMarkers } from './permanentBlockDetection';
 import { isConclusivePermanentBlock, PERMANENT_ACCESS_BLOCK_FAILURE_CLASS } from './permanentBlockDetection';
+import { assessStaticNotFoundBody, isConfirmedStaticTerminalNotFound, markConfirmedStaticTerminalNotFound } from './staticTerminalNotFound';
 import { STATIC_BUDGET_GAP_FAILURE_CLASS } from './communityRetryPolicy';
 
 export type SampledVideoInput =
@@ -140,7 +141,7 @@ export interface InspectionResult {
 }
 export type ExternalAcquisitionStatus='FOUND'|'INSPECTED_NO_MATCH'|'PARTIALLY_INSPECTED'|'ACQUISITION_FAILED';
 export type AcquisitionSurface='YOUTUBE_ABOUT'|'RECENT_VIDEO_DESCRIPTIONS'|'CHANNEL_EXTERNAL_LINKS'|'CREATOR_WEBSITES'|'SOCIAL_PROFILES'|'DISCORD_VALIDATION';
-export interface ExternalAcquisitionObservation {requestedUrl:string;finalUrl?:string;wrapperUrl?:string;surface:AcquisitionSurface;required:boolean;outcome:ExternalAcquisitionStatus;retryable:boolean;httpStatus?:number;failureClass?:string;retryAt?:number;detail:string;observedAt:string;telemetry?:CrawlerTelemetry;rootUrl?:string;/** Lender seed URL when this row references shared same-inspection evidence instead of a direct fetch. The lender inspected the bytes; this row carries no page counters of its own. */sharedEvidenceFrom?:string}
+export interface ExternalAcquisitionObservation {requestedUrl:string;finalUrl?:string;wrapperUrl?:string;surface:AcquisitionSurface;required:boolean;outcome:ExternalAcquisitionStatus;retryable:boolean;httpStatus?:number;failureClass?:string;retryAt?:number;detail:string;observedAt:string;telemetry?:CrawlerTelemetry;rootUrl?:string;/** Body-level confirmation from the bounded static 404/410 probe. This is not a skip: the whole seed predicate must also pass. */staticNotFoundBodyConfirmed?:boolean;staticNotFoundBodyReason?:string;/** True only when rendered escalation was actually skipped for this seed; persisted provenance for post-deploy measurement. The observation itself stays FAILED/non-retryable. */staticTerminalNotFound?:boolean;staticTerminalNotFoundReason?:string;/** Lender seed URL when this row references shared same-inspection evidence instead of a direct fetch. The lender inspected the bytes; this row carries no page counters of its own. */sharedEvidenceFrom?:string}
 
 /** Advance per-seed click-window progress only by controls this inspection
  * actually started clicking. A failed/zero-page run contributes nothing, so a
@@ -296,7 +297,7 @@ function resolverForFetch(_fetchImpl: typeof fetch, resolveHost?: DnsResolver): 
   return resolveHost ?? defaultDnsResolve;
 }
 
-async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:DnsResolver):Promise<{page:{html:string;finalUrl:string;truncated:boolean}|null;observation?:Omit<ExternalAcquisitionObservation,'surface'|'required'|'observedAt'|'wrapperUrl'>}> {
+async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:DnsResolver,probeTerminalNotFoundBody=false):Promise<{page:{html:string;finalUrl:string;truncated:boolean}|null;observation?:Omit<ExternalAcquisitionObservation,'surface'|'required'|'observedAt'|'wrapperUrl'>}> {
   const resolver=resolverForFetch(fetchImpl,resolveHost);
   // The end-to-end budget starts before the admission lookup. The lookup gets
   // only the remaining slice, and the following fetch gets what is left after
@@ -349,9 +350,24 @@ async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:
     shouldReadFinalBody:response=>{
       const contentType=response.headers.get('content-type')||'';
       if(response.status===401||response.status===403)return true;
+      // Bounded 404/410 probe (seed only): only declared text-like error
+      // bodies can prove a plain terminal page. Untyped, JSON, and binary
+      // bodies stay unread and therefore keep the rendered path (no body
+      // evidence is never terminal evidence). Child-page 404s are never used
+      // by the terminal barrier, so they keep the pre-existing body-
+      // suppression behavior.
+      if(probeTerminalNotFoundBody&&(response.status===404||response.status===410)){
+        const type=contentType.toLowerCase();
+        const charset=/charset\s*=\s*"?([^";]+)/i.exec(type)?.[1]?.trim()||'';
+        // The probe reader decodes UTF-8 only. UTF-16/32 bodies would hide
+        // links behind NUL bytes, so leave them unread and render-eligible.
+        if(charset.startsWith('utf-16')||charset.startsWith('utf-32'))return false;
+        return type.includes('text/')||type.includes('application/xhtml+xml')||type.includes('application/xml')||type.includes('+xml');
+      }
       if(response.status<200||response.status>=300)return false;
       return contentType.includes('text/html')||contentType.includes('json')||contentType.includes('plain');
     },
+    ...(probeTerminalNotFoundBody?{terminalNotFoundBodyMaxChars:64_000,terminalNotFoundBodyTimeoutMs:1_500}:{}),
   });
   if(!fetched){
     const timedOut=transportFailure?.name==='AbortError'||Date.now()-fetchStartedAt>=9900;
@@ -394,7 +410,19 @@ async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:
     // body was already read by fetchProfilerUrl, so markers are evaluated on
     // the same bytes the old response probe used.
     const blockMarkers=(fetched.status===401||fetched.status===403)&&hasBlockMarkers(fetched.text);
-    return {page:null,observation:{requestedUrl:url,finalUrl:fetched.finalUrl,outcome:'ACQUISITION_FAILED',retryable,httpStatus:fetched.status,failureClass:fetched.status===429?'RATE_LIMIT':fetched.status>=500?'TRANSIENT_HTTP':'HTTP_ERROR',retryAt,detail:`HTTP ${fetched.status}`,...(blockMarkers?{blockMarkers:true}:{})}};
+    // Optional-surface terminal evidence (additive; the observation remains a
+    // visible FAILED/non-retryable HTTP_ERROR). Only a readable, complete,
+    // link-free/no-community 404/410 body qualifies; every uncertain case
+    // keeps the existing rendered escalation.
+    const staticNotFound=(probeTerminalNotFoundBody&&(fetched.status===404||fetched.status===410))
+      ? assessStaticNotFoundBody({
+          text:fetched.text,
+          truncated:fetched.truncated,
+          bodySuppressed:fetched.bodySuppressed===true,
+          bodyProbeFailed:fetched.bodyProbeFailed===true,
+        })
+      : null;
+    return {page:null,observation:{requestedUrl:url,finalUrl:fetched.finalUrl,outcome:'ACQUISITION_FAILED',retryable,httpStatus:fetched.status,failureClass:fetched.status===429?'RATE_LIMIT':fetched.status>=500?'TRANSIENT_HTTP':'HTTP_ERROR',retryAt,detail:`HTTP ${fetched.status}`,...(blockMarkers?{blockMarkers:true}:{}),...(staticNotFound?.confirmed?{staticNotFoundBodyConfirmed:true,staticNotFoundBodyReason:staticNotFound.reason}:{})}};
   }
   if(!contentType.includes('text/html')&&!contentType.includes('json')&&!contentType.includes('plain'))return {page:null,observation:{requestedUrl:url,finalUrl:fetched.finalUrl,outcome:'ACQUISITION_FAILED',retryable:false,httpStatus:fetched.status,failureClass:'UNSUPPORTED_CONTENT_TYPE',detail:`Unsupported content type ${contentType||'unknown'}`}};
   return {page:{html:fetched.text,finalUrl:fetched.finalUrl,truncated:fetched.truncated}};
@@ -589,7 +617,9 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       if(sharedRoot.communityIntents?.length)communityIntents.push(...sharedRoot.communityIntents);
       page={html:'',finalUrl:sharedRoot.finalUrl,truncated:false};
     }else{
-      const acquired=await fetchExternalPage(url,fetchImpl,resolveHost);
+      // The terminal 404/410 barrier only ever consumes the seed's own
+      // observation, so only seed fetches pay for the bounded body probe.
+      const acquired=await fetchExternalPage(url,fetchImpl,resolveHost,true);
       page=acquired.page;
       if(acquired.observation){observations.push({...acquired.observation,wrapperUrl,surface,required,rootUrl:url,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected})});fetchFailure=acquired.observation;}
     }
@@ -1842,7 +1872,20 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
     String(o.failureClass || '') === 'SSRF_BLOCKED' &&
     normalizeVisitUrl(String(o.requestedUrl || '')) === normalizeVisitUrl(item.url));
   if (staticSsrfBarrier) markSsrfSeedRequired(crawlRes.observations, item.url);
-  const staticTerminalBarrier = staticSsrfBarrier || (loginSemantics && crawlRes.observations.some(o =>
+  // Confirmed static 404/410 on an optional creator website is terminal: the
+  // bounded body probe proved there is no link, community marker, block page,
+  // or unread/truncated content that a rendered browser could still recover.
+  // Required YouTube surfaces are structurally ineligible.
+  const staticNotFoundBarrier = isConfirmedStaticTerminalNotFound({
+    surface: 'CREATOR_WEBSITES',
+    seedUrl: item.url,
+    crawlOutcome: crawlRes.outcome,
+    observations: crawlRes.observations,
+    candidateCount: crawlRes.candidates.length,
+    communityIntentCount: crawlRes.communityIntent?.length || 0,
+  });
+  if (staticNotFoundBarrier) markConfirmedStaticTerminalNotFound({ seedUrl: item.url, observations: crawlRes.observations });
+  const staticTerminalBarrier = staticSsrfBarrier || staticNotFoundBarrier || (loginSemantics && crawlRes.observations.some(o =>
     (o.outcome === 'PARTIALLY_INSPECTED' || o.outcome === 'ACQUISITION_FAILED') &&
     (String(o.failureClass || '') === LOGIN_WALL_FAILURE_CLASS ||
      String(o.failureClass || '') === PAYWALL_FAILURE_CLASS ||
@@ -1909,6 +1952,12 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
     }
     if (staticSsrfBarrier) {
       step5Logs.push(`[Security barrier] ${item.url} static SSRF destination block is terminal; no rendered escalation.`);
+    } else if (staticNotFoundBarrier) {
+      const notFoundObservation = crawlRes.observations.find(o =>
+        String(o.requestedUrl || '') === item.url &&
+        String(o.failureClass || '') === 'HTTP_ERROR' &&
+        (Number(o.httpStatus) === 404 || Number(o.httpStatus) === 410));
+      step5Logs.push(`[Terminal barrier] ${item.url} confirmed static HTTP ${notFoundObservation?.httpStatus || '404/410'} with no recoverable content; no rendered escalation.`);
     } else if (staticTerminalBarrier) {
       step5Logs.push(`[Terminal barrier] ${item.url} conclusive permanent barrier established statically (${crawlRes.outcome}); no rendered escalation.`);
     }
@@ -1939,13 +1988,29 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
       String(o.failureClass || '') === 'SSRF_BLOCKED' &&
       normalizeVisitUrl(String(o.requestedUrl || '')) === normalizeVisitUrl(item.url));
     if (socialSsrfBarrier) markSsrfSeedRequired(crawlRes.observations, item.url);
-    const socialTerminalBarrier = socialSsrfBarrier || (socialLoginSemantics && crawlRes.observations.some(o =>
+    // Same confirmed-terminal 404/410 rule for optional social profiles.
+    const socialNotFoundBarrier = isConfirmedStaticTerminalNotFound({
+      surface: 'SOCIAL_PROFILES',
+      seedUrl: item.url,
+      crawlOutcome: crawlRes.outcome,
+      observations: crawlRes.observations,
+      candidateCount: crawlRes.candidates.length,
+      communityIntentCount: crawlRes.communityIntent?.length || 0,
+    });
+    if (socialNotFoundBarrier) markConfirmedStaticTerminalNotFound({ seedUrl: item.url, observations: crawlRes.observations });
+    const socialTerminalBarrier = socialSsrfBarrier || socialNotFoundBarrier || (socialLoginSemantics && crawlRes.observations.some(o =>
       (o.outcome === 'PARTIALLY_INSPECTED' || o.outcome === 'ACQUISITION_FAILED') &&
       (String(o.failureClass || '') === 'LOGIN_WALL' ||
        String(o.failureClass || '') === 'PAYWALL_WALL' ||
        String(o.failureClass || '') === 'PERMANENT_ACCESS_BLOCK')));
     if (socialSsrfBarrier) {
       step6Logs.push(`[Security barrier] ${item.url} static SSRF destination block is terminal; no rendered escalation.`);
+    } else if (socialNotFoundBarrier) {
+      const notFoundObservation = crawlRes.observations.find(o =>
+        String(o.requestedUrl || '') === item.url &&
+        String(o.failureClass || '') === 'HTTP_ERROR' &&
+        (Number(o.httpStatus) === 404 || Number(o.httpStatus) === 410));
+      step6Logs.push(`[Terminal barrier] ${item.url} confirmed static HTTP ${notFoundObservation?.httpStatus || '404/410'} with no recoverable content; no rendered escalation.`);
     } else if (socialTerminalBarrier) {
       step6Logs.push(`[Terminal barrier] ${item.url} conclusive permanent barrier established statically (${crawlRes.outcome}); no rendered escalation.`);
     }

@@ -615,6 +615,12 @@ export interface ProfilerFetch {
    * response. Distinct classes let callers keep a retryable DNS failure
    * separate from a permanent private-destination block. */
   redirectFailure?: ProfilerRedirectFailure;
+  /** True when the caller declined to read the final body. `text` is empty by
+   * contract, not because the origin sent an empty body. */
+  bodySuppressed?: boolean;
+  /** True when the opt-in 404/410 body probe failed or exceeded its deadline.
+   * The status remains valid, but body evidence is unavailable. */
+  bodyProbeFailed?: boolean;
 }
 
 /** Why a redirect chain stopped. Non-public and malformed destinations are
@@ -649,6 +655,12 @@ export interface ProfilerFetchOptions {
    * content types, so a stalled error body cannot consume the fetch budget or
    * hide Retry-After. Redirect-hop loop bodies are likewise suppressed. */
   shouldReadFinalBody?: (response: Response) => boolean;
+  /** Opt-in bounded body probe for 404/410 final responses. Only consulted
+   * when `shouldReadFinalBody` allows the read. The cap keeps a large error
+   * page from consuming the ordinary 2M-char crawl budget. */
+  terminalNotFoundBodyMaxChars?: number;
+  /** Deadline for the 404/410 body probe. Defaults to 1500ms. */
+  terminalNotFoundBodyTimeoutMs?: number;
 }
 
 /** Maximum redirect hops per profiler inventory fetch. Conservative:
@@ -695,7 +707,9 @@ const PROFILER_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
  * memory pressure from accumulating across rejected hops. */
 async function cancelRedirectBody(response: Response): Promise<void> {
   try {
-    await response.body?.cancel();
+    // Never await an unbounded cancellation promise: a stalled stream must
+    // not outlive the fetch/probe deadline that bounded the request.
+    void response.body?.cancel().catch(() => {});
   } catch {
     // Best effort; already-consumed or locked bodies need no release.
   }
@@ -777,6 +791,74 @@ async function readBoundedBody(response: Response, maxChars: number): Promise<{
   return { contentType, text, truncated };
 }
 
+/** Bounded, deadline-guarded body reader for the optional 404/410 probe. A
+ * stalled error body must not consume the fetch's remaining budget, so this
+ * races each read against a short deadline and reports failure explicitly
+ * instead of treating an unreadable body as empty evidence. */
+async function readBoundedBodyWithDeadline(
+  response: Response,
+  maxChars: number,
+  timeoutMs: number,
+): Promise<{
+  contentType: string;
+  text: string;
+  truncated: boolean;
+  bodyProbeFailed?: boolean;
+}> {
+  const contentType = response.headers.get('content-type') || '';
+  const reader = response.body?.getReader();
+  if (!reader) {
+    try {
+      const text = await response.text();
+      return { contentType, text: text.slice(0, maxChars), truncated: text.length > maxChars };
+    } catch {
+      return { contentType, text: '', truncated: false, bodyProbeFailed: true };
+    }
+  }
+  const decoder = new TextDecoder();
+  let text = '';
+  let truncated = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('TERMINAL_NOT_FOUND_BODY_TIMEOUT')), Math.max(1, timeoutMs));
+  });
+  try {
+    for (;;) {
+      const { done, value } = await Promise.race([reader.read(), deadline]);
+      if (done) break;
+      text += decoder.decode(value, { stream: true });
+      if (text.length > maxChars) {
+        truncated = true;
+        text = text.slice(0, maxChars);
+        try {
+          // Cancellation is best effort; awaiting it would let a stalled
+          // stream defeat the probe's size/deadline bounds.
+          void reader.cancel().catch(() => {});
+        } catch {
+          // Best effort; the prefix is already retained.
+        }
+        break;
+      }
+    }
+    text += decoder.decode();
+    return { contentType, text, truncated };
+  } catch {
+    try {
+      void reader.cancel().catch(() => {});
+    } catch {
+      // Best effort; the probe failure is reported to the caller.
+    }
+    return { contentType, text: '', truncated: false, bodyProbeFailed: true };
+  } finally {
+    if (timer) clearTimeout(timer);
+    try {
+      reader.releaseLock();
+    } catch {
+      // Lock release is best-effort; the stream is already consumed/cancelled.
+    }
+  }
+}
+
 /** Bounded fetch shared by profiler inventory steps: timeout, byte budget,
  * and destination-safe redirect handling. Redirects are followed MANUALLY
  * (never `follow`): each Location is resolved against the current URL and
@@ -801,6 +883,19 @@ export async function fetchProfilerUrl(
   // Apply connection-time DNS pinning to the real fetch as well. Injected test
   // fetches are returned unchanged, and an already-wrapped fetch is a no-op.
   const guardedFetch = withPinnedExternalFetch(fetchImpl);
+  const readFinalBody = async (response: Response) => {
+    if (options.shouldReadFinalBody?.(response) === false) {
+      return { ...(await cancelAndEmptyBody(response)), bodySuppressed: true as const };
+    }
+    if ((response.status === 404 || response.status === 410) && options.terminalNotFoundBodyMaxChars) {
+      return readBoundedBodyWithDeadline(
+        response,
+        Math.min(maxChars, options.terminalNotFoundBodyMaxChars),
+        options.terminalNotFoundBodyTimeoutMs ?? 1_500,
+      );
+    }
+    return readBoundedBody(response, maxChars);
+  };
   try {
     const redirectsFollowed: string[] = [];
     const visited = new Set<string>();
@@ -815,9 +910,7 @@ export async function fetchProfilerUrl(
       });
       const location = response.headers.get('location');
       if (!PROFILER_REDIRECT_STATUSES.has(response.status) || !location) {
-        const body = options.shouldReadFinalBody?.(response) === false
-          ? await cancelAndEmptyBody(response)
-          : await readBoundedBody(response, maxChars);
+        const body = await readFinalBody(response);
         return {
           status: response.status,
           ...body,
@@ -848,9 +941,7 @@ export async function fetchProfilerUrl(
       }
       if (visited.has(nextUrl)) {
         // Loop: stop at the last safe URL instead of burning the hop budget.
-        const body = options.shouldReadFinalBody?.(response) === false
-          ? await cancelAndEmptyBody(response)
-          : await readBoundedBody(response, maxChars);
+        const body = await readFinalBody(response);
         return {
           status: response.status,
           ...body,
