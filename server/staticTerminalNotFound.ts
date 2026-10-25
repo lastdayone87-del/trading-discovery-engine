@@ -18,7 +18,9 @@
  * eligible.
  */
 
+import { decodeInviteObfuscation, extractDiscordCandidates } from './discordCandidates';
 import { hasBlockMarkers } from './permanentBlockDetection';
+import { normalizeVisitUrl } from './visitUrl';
 
 export type StaticNotFoundSurface = 'CREATOR_WEBSITES' | 'SOCIAL_PROFILES';
 
@@ -47,12 +49,30 @@ export interface StaticNotFoundObservation {
   httpStatus?: number;
   retryable?: boolean;
   blockMarkers?: boolean;
+  /** The bounded static body probe confirmed a terminal-looking 404/410 body.
+   * This is body evidence only; the seed is not skipped until the whole
+   * predicate passes and the caller marks `staticTerminalNotFound`. */
+  staticNotFoundBodyConfirmed?: boolean;
+  staticNotFoundBodyReason?: string;
+  /** True only when rendered escalation was actually skipped for this seed.
+   * Persisted provenance for post-deploy measurement keys on this field. */
   staticTerminalNotFound?: boolean;
+  staticTerminalNotFoundReason?: string;
   telemetry?: { pagesInspected?: number };
 }
 
+// Hosts the rendered extractor can turn into a community candidate. Keep the
+// broad host check (including invite forms without a code) so a body that
+// merely names a community surface keeps the rendered path. Obfuscated forms
+// are decoded first; the shared extractor is the authority for invite URLs.
 const COMMUNITY_MARKER_PATTERN =
-  /(?:discord(?:app)?\.(?:gg|com\/invite)|dsc\.gg|discord\.me|t\.me\/|telegram\.me\/|whop\.com\/|skool\.com\/|circle\.so\/|patreon\.com\/)/i;
+  /(?:discord\.gg|discord\.com\/invite|discordapp\.com\/invite|discord\.app\/invite|dsc\.gg|discord\.me|discord\.io|t\.me\/|telegram\.me\/|whop\.com\/|skool\.com\/|circle\.so\/|patreon\.com\/)/i;
+
+function hasCommunityContent(text: string): boolean {
+  const decoded = decodeInviteObfuscation(text);
+  if (COMMUNITY_MARKER_PATTERN.test(decoded)) return true;
+  return extractDiscordCandidates(decoded).length > 0;
+}
 const EXPLICIT_NOT_FOUND_PATTERN =
   /\b(?:404|410|not\s+found|page\s+(?:not\s+found|does\s+not\s+exist|doesn't\s+exist|could\s+not\s+be\s+found|cannot\s+be\s+found)|no\s+longer\s+(?:available|exists)|this\s+page\s+is\s+gone)\b/i;
 const ANCHOR_PATTERN = /<(?:a|area)\b[^>]*\bhref\s*=/i;
@@ -85,7 +105,7 @@ export function assessStaticNotFoundBody(input: {
   if (input.truncated === true) return { confirmed: false, reason: 'TRUNCATED' };
   const text = String(input.text || '');
   if (hasBlockMarkers(text)) return { confirmed: false, reason: 'BLOCK_MARKERS' };
-  if (COMMUNITY_MARKER_PATTERN.test(text)) return { confirmed: false, reason: 'HAS_COMMUNITY_CONTENT' };
+  if (hasCommunityContent(text)) return { confirmed: false, reason: 'HAS_COMMUNITY_CONTENT' };
   if (ANCHOR_PATTERN.test(text)) return { confirmed: false, reason: 'HAS_LINKS' };
   if (CLIENT_RENDER_PATTERN.test(text)) return { confirmed: false, reason: 'CLIENT_RENDER_SHELL' };
   const trimmed = text.trim();
@@ -96,21 +116,6 @@ export function assessStaticNotFoundBody(input: {
   }
   if (trimmed.length <= SMALL_BODY_CHARS) return { confirmed: true, reason: 'NO_LINKS_SMALL_BODY' };
   return { confirmed: false, reason: 'LARGE_BODY' };
-}
-
-/** Keep in sync with normalizeVisitUrl in browserCommunityFallback.ts. */
-function normalizeSeedKey(rawUrl: string): string | null {
-  const trimmed = String(rawUrl || '').trim();
-  if (!trimmed) return null;
-  try {
-    const parsed = new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
-    const path = parsed.pathname.replace(/\/+$/, '') || '/';
-    const port = parsed.port ? `:${parsed.port}` : '';
-    return `${parsed.protocol}//${parsed.hostname.toLowerCase()}${port}${path}${parsed.search}`;
-  } catch {
-    return null;
-  }
 }
 
 /**
@@ -131,10 +136,10 @@ export function isConfirmedStaticTerminalNotFound(input: {
   if (input.crawlOutcome !== 'ACQUISITION_FAILED') return false;
   if (input.candidateCount > 0) return false;
   if ((input.communityIntentCount ?? 0) > 0) return false;
-  const seedKey = normalizeSeedKey(input.seedUrl);
+  const seedKey = normalizeVisitUrl(input.seedUrl);
   if (!seedKey) return false;
   const seedObservations = input.observations.filter(
-    observation => normalizeSeedKey(String(observation.requestedUrl || '')) === seedKey,
+    observation => normalizeVisitUrl(String(observation.requestedUrl || '')) === seedKey,
   );
   if (seedObservations.length !== 1) return false;
   const seed = seedObservations[0];
@@ -142,7 +147,7 @@ export function isConfirmedStaticTerminalNotFound(input: {
   if (seed.failureClass !== 'HTTP_ERROR') return false;
   if (seed.httpStatus !== 404 && seed.httpStatus !== 410) return false;
   if (seed.retryable !== false) return false;
-  if (seed.staticTerminalNotFound !== true) return false;
+  if (seed.staticNotFoundBodyConfirmed !== true) return false;
   if (seed.blockMarkers === true) return false;
   // Any successful or partially inspected evidence means the seed was not a
   // clean terminal miss; leave rendered escalation untouched.
@@ -151,4 +156,27 @@ export function isConfirmedStaticTerminalNotFound(input: {
     observation.outcome === 'INSPECTED_NO_MATCH' ||
     observation.outcome === 'PARTIALLY_INSPECTED')) return false;
   return true;
+}
+
+/**
+ * Record that rendered escalation was actually skipped. The fetch-level body
+ * probe may confirm terminal-looking content even when another condition
+ * (community intent, a candidate, or mixed evidence) keeps rendering; only
+ * this marker is persisted as `staticTerminalNotFound` provenance, so
+ * post-deploy counts cannot overstate avoided renders.
+ */
+export function markConfirmedStaticTerminalNotFound(input: {
+  seedUrl: string;
+  observations: StaticNotFoundObservation[];
+}): void {
+  const seedKey = normalizeVisitUrl(input.seedUrl);
+  if (!seedKey) return;
+  const seed = input.observations.find(
+    observation =>
+      normalizeVisitUrl(String(observation.requestedUrl || '')) === seedKey &&
+      observation.staticNotFoundBodyConfirmed === true,
+  );
+  if (!seed) return;
+  seed.staticTerminalNotFound = true;
+  seed.staticTerminalNotFoundReason = seed.staticNotFoundBodyReason;
 }

@@ -707,7 +707,9 @@ const PROFILER_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
  * memory pressure from accumulating across rejected hops. */
 async function cancelRedirectBody(response: Response): Promise<void> {
   try {
-    await response.body?.cancel();
+    // Never await an unbounded cancellation promise: a stalled stream must
+    // not outlive the fetch/probe deadline that bounded the request.
+    void response.body?.cancel().catch(() => {});
   } catch {
     // Best effort; already-consumed or locked bodies need no release.
   }
@@ -829,7 +831,9 @@ async function readBoundedBodyWithDeadline(
         truncated = true;
         text = text.slice(0, maxChars);
         try {
-          await reader.cancel();
+          // Cancellation is best effort; awaiting it would let a stalled
+          // stream defeat the probe's size/deadline bounds.
+          void reader.cancel().catch(() => {});
         } catch {
           // Best effort; the prefix is already retained.
         }
@@ -840,7 +844,7 @@ async function readBoundedBodyWithDeadline(
     return { contentType, text, truncated };
   } catch {
     try {
-      await reader.cancel();
+      void reader.cancel().catch(() => {});
     } catch {
       // Best effort; the probe failure is reported to the caller.
     }

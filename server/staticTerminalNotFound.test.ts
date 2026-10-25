@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { assessStaticNotFoundBody, isConfirmedStaticTerminalNotFound } from './staticTerminalNotFound';
+import { fetchProfilerUrl } from './siteProfiler';
 import { runChannelInspectionForTest as runChannelInspection } from './testCrawlHelpers';
 import type { BrowserFallbackResult } from './browserCommunityFallback';
 
@@ -30,7 +31,8 @@ function observation(overrides: Record<string, unknown> = {}) {
     failureClass: 'HTTP_ERROR',
     httpStatus: 404,
     retryable: false,
-    staticTerminalNotFound: true,
+    staticNotFoundBodyConfirmed: true,
+    staticNotFoundBodyReason: 'NO_LINKS_SMALL_BODY',
     ...overrides,
   };
 }
@@ -92,7 +94,17 @@ test('static 404 body: community content keeps rendered escalation', () => {
   for (const marker of [
     'https://discord.gg/creator',
     'https://discord.com/invite/creator',
+    'https://discordapp.com/invite/creator',
+    'https://discord.app/invite/creator',
+    'https://discord.io/creator',
+    'https://dsc.gg/creator',
+    'https://discord.me/creator',
+    'https://discord&#46;gg/creator',
+    'https://discord[.]gg/creator',
+    'https://discord[dot]gg/creator',
+    'discord.gg/creator',
     'https://t.me/creator',
+    'https://telegram.me/creator',
     'https://whop.com/creator',
     'https://skool.com/creator',
     'https://circle.so/creator',
@@ -238,7 +250,7 @@ test('seed predicate: transient, retryable, blocked, and soft/partial evidence k
   assert.equal(
     isConfirmedStaticTerminalNotFound({
       ...base,
-      observations: [observation({ staticTerminalNotFound: false })],
+      observations: [observation({ staticNotFoundBodyConfirmed: false })],
     }),
     false,
     'body not confirmed',
@@ -377,6 +389,36 @@ test('404 with a link or community marker still renders', async () => {
   }
 });
 
+test('body confirmation without an actual skip is not persisted as a terminal render avoidance', async () => {
+  const renders = countRenderCalls();
+  const url = 'https://patreon.com/gone';
+  const result = await inspect({
+    channelLinks: [url],
+    fetchImpl: (async () => response('', 404)) as unknown as typeof fetch,
+    renderedFallback: renders.fallback,
+  });
+  const seed = (result.acquisitionOutcomes || []).find(item => item.requestedUrl === url);
+  assert.ok(seed, 'seed observation exists');
+  assert.equal(seed.staticNotFoundBodyConfirmed, true, 'body probe confirmed the plain 404');
+  assert.notEqual(seed.staticTerminalNotFound, true, 'community intent kept rendering, so no skip is recorded');
+  assert.equal(renders.calls(), 1);
+});
+
+test('untyped 404 bodies are not read as terminal evidence', async () => {
+  const renders = countRenderCalls();
+  const url = 'https://creator.example.com/untyped';
+  const result = await inspect({
+    channelLinks: [url],
+    fetchImpl: (async () => new Response(new Uint8Array([0x00, 0x01, 0x02]), { status: 404 })) as unknown as typeof fetch,
+    renderedFallback: renders.fallback,
+  });
+  const seed = (result.acquisitionOutcomes || []).find(item => item.requestedUrl === url);
+  assert.ok(seed, 'seed observation exists');
+  assert.notEqual(seed.staticNotFoundBodyConfirmed, true);
+  assert.notEqual(seed.staticTerminalNotFound, true);
+  assert.equal(renders.calls(), 1);
+});
+
 test('transient 5xx keeps rendered fallback', async () => {
   const renders = countRenderCalls();
   await inspect({
@@ -411,6 +453,101 @@ test('valid static community link is retained and never treated as terminal', as
   assert.ok(codes.includes('valid-room'));
   const seed = (result.acquisitionOutcomes || []).find(item => item.requestedUrl === url);
   assert.notEqual(seed?.staticTerminalNotFound, true);
+});
+
+// ---------------------------------------------------------------------------
+// Probe transport: the bounded 404/410 reader must stay bounded even when the
+// response stream stalls, fails, or exceeds the probe cap.
+// ---------------------------------------------------------------------------
+
+const publicResolver = async () => ['93.184.216.1'];
+
+test('terminal body probe returns within budget when the stream stalls and cancel never settles', async () => {
+  let cancelRequested = false;
+  const stream = new ReadableStream<Uint8Array>({
+    pull: () => new Promise<void>(() => {}),
+    cancel: () => {
+      cancelRequested = true;
+      return new Promise<void>(() => {});
+    },
+  });
+  const fetchImpl = (async () =>
+    new Response(stream, { status: 404, headers: { 'content-type': 'text/html' } })) as unknown as typeof fetch;
+  const started = Date.now();
+  const fetched = await fetchProfilerUrl(
+    'https://public.example/gone',
+    fetchImpl,
+    1_000,
+    5_000,
+    publicResolver,
+    undefined,
+    {
+      shouldReadFinalBody: () => true,
+      terminalNotFoundBodyMaxChars: 1_000,
+      terminalNotFoundBodyTimeoutMs: 50,
+    },
+  );
+  const elapsed = Date.now() - started;
+  assert.equal(fetched!.status, 404);
+  assert.equal(fetched!.bodyProbeFailed, true);
+  assert.equal(fetched!.text, '');
+  assert.equal(cancelRequested, true, 'cancellation requested without awaiting it');
+  assert.ok(elapsed < 1_000, `probe stayed bounded, took ${elapsed}ms`);
+});
+
+test('terminal body probe reports a failing stream as unreadable, never empty evidence', async () => {
+  const stream = new ReadableStream<Uint8Array>({
+    start: controller => controller.error(new Error('stream failed')),
+  });
+  const fetchImpl = (async () =>
+    new Response(stream, { status: 410, headers: { 'content-type': 'text/html' } })) as unknown as typeof fetch;
+  const fetched = await fetchProfilerUrl(
+    'https://public.example/gone',
+    fetchImpl,
+    1_000,
+    5_000,
+    publicResolver,
+    undefined,
+    {
+      shouldReadFinalBody: () => true,
+      terminalNotFoundBodyMaxChars: 1_000,
+      terminalNotFoundBodyTimeoutMs: 100,
+    },
+  );
+  assert.equal(fetched!.status, 410);
+  assert.equal(fetched!.bodyProbeFailed, true);
+  assert.equal(fetched!.text, '');
+});
+
+test('terminal body probe truncates oversized bodies and keeps them non-terminal', async () => {
+  const stream = new ReadableStream<Uint8Array>({
+    start: controller => {
+      controller.enqueue(new TextEncoder().encode(`<html><body>${'x'.repeat(2_000)}</body></html>`));
+      controller.close();
+    },
+  });
+  const fetchImpl = (async () =>
+    new Response(stream, { status: 404, headers: { 'content-type': 'text/html' } })) as unknown as typeof fetch;
+  const fetched = await fetchProfilerUrl(
+    'https://public.example/gone',
+    fetchImpl,
+    10_000,
+    5_000,
+    publicResolver,
+    undefined,
+    {
+      shouldReadFinalBody: () => true,
+      terminalNotFoundBodyMaxChars: 100,
+      terminalNotFoundBodyTimeoutMs: 1_000,
+    },
+  );
+  assert.equal(fetched!.status, 404);
+  assert.equal(fetched!.truncated, true);
+  assert.equal(fetched!.bodyProbeFailed, undefined);
+  assert.deepEqual(assessStaticNotFoundBody({ text: fetched!.text, truncated: fetched!.truncated }), {
+    confirmed: false,
+    reason: 'TRUNCATED',
+  });
 });
 
 test('required YouTube About failure is not suppressed by the optional-surface rule', async () => {

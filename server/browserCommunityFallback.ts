@@ -6,6 +6,7 @@ import { browserLaunchOptions, classifyBrowserFailure, isBrowserRuntimeFailure, 
 import { startBrowserEgressProxy, type BrowserEgressProxy } from './browserEgressProxy';
 import type { RenderedLifecycleStage, RenderedZeroPageReason, CrawlDropReason } from './crawlerTelemetry';
 import { redactCauseSnippet, createDropCounter } from './crawlerTelemetry';
+import { normalizeVisitUrl } from './visitUrl';
 import {
   DEFAULT_RENDERED_MAX_REQUEST_RETRIES,
   DEFAULT_RENDERED_MAX_SESSION_ROTATIONS,
@@ -260,21 +261,11 @@ export function visitIdentityKeys(requestUrl: string, finalUrl: string): string[
  * already-visited exclusion): scheme + lowercased host + non-default port +
  * pathname (trailing slash trimmed) + verbatim query. Same rule both sides
  * so independently recorded URLs meet on one key. Null when unparsable.
+ *
+ * Re-exported from visitUrl so the static terminal-not-found barrier cannot
+ * drift from the rendered crawler's identity rule.
  */
-export function normalizeVisitUrl(rawUrl: string): string | null {
-  const trimmed = String(rawUrl || '').trim();
-  if (!trimmed) return null;
-  let parsed: URL;
-  try {
-    parsed = new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
-  } catch {
-    return null;
-  }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
-  const path = parsed.pathname.replace(/\/+$/, '') || '/';
-  const port = parsed.port ? `:${parsed.port}` : '';
-  return `${parsed.protocol}//${parsed.hostname.toLowerCase()}${port}${path}${parsed.search}`;
-}
+export { normalizeVisitUrl } from './visitUrl';
 
 /**
  * Required-set classification (v2 coverage contract), pure and unit-tested:
