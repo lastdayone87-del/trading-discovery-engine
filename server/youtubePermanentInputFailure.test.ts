@@ -65,11 +65,36 @@ test('youtubeFetch classifies permanent input only after excluding every key-lev
   assert.match(branch, /charges at least one unit/);
 });
 
+function balancedBraceBlock(source: string, start: number): string {
+  const open = source.indexOf('{', start);
+  assert.ok(open >= 0, 'block must have an opening brace');
+  let depth = 0;
+  for (let index = open; index < source.length; index += 1) {
+    if (source[index] === '{') depth += 1;
+    else if (source[index] === '}') {
+      depth -= 1;
+      if (depth === 0) return source.slice(open, index + 1);
+    }
+  }
+  throw new Error('unbalanced block');
+}
+
+function catchBlockContaining(source: string, marker: string): string {
+  const catchPattern = /\bcatch\s*(?:\([^)]*\))?\s*\{/g;
+  let match: RegExpExecArray | null;
+  while ((match = catchPattern.exec(source)) !== null) {
+    const block = balancedBraceBlock(source, match.index);
+    if (block.includes(marker)) return block;
+  }
+  throw new Error(`no catch block contains ${marker}`);
+}
+
 test('every official key loop stops rotating on permanent input', () => {
   // Source-order guards, not a runtime loop harness: these functions depend on
-  // the live key pool, quota reservations, scheduler, and database. They prove
-  // the permanent-input throw precedes failure recording and the retry/rotation
-  // branch in every loop. A mocked end-to-end loop test remains a known gap.
+  // the live key pool, quota reservations, scheduler, and database. Each guard
+  // is checked inside the catch block that actually handles the loop failure,
+  // not against an unrelated textual occurrence elsewhere in the function.
+  // A mocked end-to-end loop test remains a known gap.
   const loops: Array<[string, string | undefined]> = [
     ['export async function fetchYouTubeFeaturedChannels', '/** One bounded playlistItems call'],
     ['export async function fetchYouTubePlaylistChannels', '/**\n * Retrieves all valid YouTube API keys'],
@@ -81,13 +106,19 @@ test('every official key loop stops rotating on permanent input', () => {
   ];
   for (const [start, end] of loops) {
     const block = functionBlock(start, end);
-    const permanent = block.indexOf('isYouTubePermanentInputError(');
-    assert.ok(permanent >= 0, `${start} must stop key rotation on permanent input`);
-    const rotation = block.indexOf('recordProviderFailure');
-    const rotationMarker = rotation >= 0 ? rotation : block.indexOf('attempt === keys.length - 1');
+    const catchBlock = catchBlockContaining(block, 'isYouTubePermanentInputError(');
+    const permanent = catchBlock.indexOf('isYouTubePermanentInputError(');
+    const rotation = catchBlock.indexOf('recordProviderFailure');
+    const rotationMarker = rotation >= 0 ? rotation : catchBlock.indexOf('attempt === keys.length - 1');
     assert.ok(
       rotationMarker > permanent,
       `${start} must throw on permanent input before recording a key failure or rotating to another key`,
+    );
+    const guard = catchBlock.slice(permanent, permanent + 180);
+    assert.match(
+      guard,
+      /isYouTubePermanentInputError\([^)]*\)\s*\)?\s*(throw|return)/,
+      `${start} must throw or return on permanent input, not merely log it`,
     );
   }
 });
