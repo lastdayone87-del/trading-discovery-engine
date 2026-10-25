@@ -14,6 +14,7 @@ import {
   candidateDocumentRefs,
   hasCreatorLevelSemanticContext,
   parseSemanticResult,
+  semanticObservabilityFields,
   SEMANTIC_FEATURE_VERSION,
   SEMANTIC_PROMPT_VERSION,
   type SemanticModelClient,
@@ -688,7 +689,7 @@ export function defaultClient(
       const orgId = groqRouteOrg(route);
       const base = {
         id: randomUUID(), provider: 'groq', operation: 'multilingual-semantic-classification',
-        jobId: observability?.jobId, runId: observability?.runId,
+        ...semanticObservabilityFields(observability),
         requestMetadata: { groqRoute: route.id, groqOrg: orgId }, attempt: 1,
         reservedCost: 0, policyVersion: 'provider-resilience-v1',
       };

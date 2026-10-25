@@ -13,6 +13,7 @@ import {
   buildSemanticPrompt,
   hasCreatorLevelSemanticContext,
   parseSemanticResult,
+  semanticObservabilityFields,
   SEMANTIC_FEATURE_VERSION,
   SEMANTIC_PROMPT_VERSION,
   type SemanticModelClient,
@@ -227,7 +228,7 @@ export function defaultClient(
         const timer = deadlinesEnabled ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
         const base = {
           id: randomUUID(), provider: 'gemini-free', operation: 'multilingual-semantic-classification',
-          jobId: observability?.jobId, runId: observability?.runId,
+          ...semanticObservabilityFields(observability),
           requestMetadata: { geminiFreeRoute: route.id }, attempt: 1,
           reservedCost: 0, policyVersion: 'provider-resilience-v1',
         };

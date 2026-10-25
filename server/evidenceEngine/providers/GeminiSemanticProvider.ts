@@ -29,6 +29,31 @@ export interface SemanticObservabilityContext {
   runId?: string;
 }
 
+/** Shared attribution fields for every semantic provider ledger event. Keeping
+ * this in one place means a writer cannot silently drop jobId/runId. */
+export function semanticObservabilityFields(
+  observability?: SemanticObservabilityContext,
+): { jobId?: string; runId?: string } {
+  const fields: { jobId?: string; runId?: string } = {};
+  if (observability?.jobId) fields.jobId = observability.jobId;
+  if (observability?.runId) fields.runId = observability.runId;
+  return fields;
+}
+
+/** Paid-provider context passed to executeProviderCall, which copies these
+ * fields onto the persisted provider_call_events row. */
+export function geminiSemanticProviderContext(
+  observability: SemanticObservabilityContext | undefined,
+  requestMetadata: Record<string, string>,
+) {
+  return {
+    provider: 'gemini' as const,
+    operation: 'multilingual-semantic-classification',
+    ...semanticObservabilityFields(observability),
+    requestMetadata,
+  };
+}
+
 export interface SemanticModelClient {
   classify(prompt: string, model: string, observability?: SemanticObservabilityContext): Promise<unknown>;
 }
@@ -199,7 +224,7 @@ function defaultClient(): SemanticModelClient | undefined {
     const response = await runGeminiRouteFailover(routes, async route => {
       try {
         return await executeProviderCall({
-          context: { provider: 'gemini', operation: 'multilingual-semantic-classification', jobId: observability?.jobId, runId: observability?.runId, requestMetadata: { geminiRoute: route.id, geminiOrg: geminiRouteOrg(route) } },
+          context: geminiSemanticProviderContext(observability, { geminiRoute: route.id, geminiOrg: geminiRouteOrg(route) }),
           timeoutMs: Number(process.env.GEMINI_PROVIDER_TIMEOUT_MS || '135000'),
           enabled: process.env.PROVIDER_DEADLINES_ENABLED !== 'false', emit: appendProviderCallEvent,
           call: (signal) => sdkFor(route).models.generateContent({ model, contents: prompt, config: { responseMimeType: 'application/json', temperature: 0, abortSignal: signal } })

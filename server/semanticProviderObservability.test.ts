@@ -1,9 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { GeminiSemanticProvider } from './evidenceEngine/providers/GeminiSemanticProvider';
-import { GeminiFreeSemanticProvider } from './evidenceEngine/providers/GeminiFreeSemanticProvider';
-import { GroqSemanticProvider } from './evidenceEngine/providers/GroqSemanticProvider';
+import {
+  GeminiSemanticProvider,
+  geminiSemanticProviderContext,
+  semanticObservabilityFields,
+} from './evidenceEngine/providers/GeminiSemanticProvider';
+import {
+  GeminiFreeSemanticProvider,
+  defaultClient as freeDefaultClient,
+  resetGeminiFreeCooldownForTests,
+} from './evidenceEngine/providers/GeminiFreeSemanticProvider';
+import {
+  GroqSemanticProvider,
+  defaultClient as groqDefaultClient,
+} from './evidenceEngine/providers/GroqSemanticProvider';
+import { ProviderCallError } from './providerResilience';
 
 const input = {
   channel_id: 'channel-1',
@@ -41,17 +53,78 @@ test('every semantic provider forwards job and run attribution to its model clie
   }
 });
 
-test('semantic provider ledger events carry jobId and runId on every provider family', () => {
-  const sources = [
-    'evidenceEngine/providers/GeminiSemanticProvider.ts',
+test('shared attribution helpers emit only present fields and build the paid context', () => {
+  assert.deepEqual(semanticObservabilityFields({ jobId: 'job-1', runId: 'run-1' }), { jobId: 'job-1', runId: 'run-1' });
+  assert.deepEqual(semanticObservabilityFields({ jobId: 'job-1' }), { jobId: 'job-1' });
+  assert.deepEqual(semanticObservabilityFields(undefined), {});
+  assert.deepEqual(
+    geminiSemanticProviderContext({ jobId: 'job-1', runId: 'run-1' }, { geminiRoute: 'route-1', geminiOrg: 'org-1' }),
+    {
+      provider: 'gemini',
+      operation: 'multilingual-semantic-classification',
+      jobId: 'job-1',
+      runId: 'run-1',
+      requestMetadata: { geminiRoute: 'route-1', geminiOrg: 'org-1' },
+    },
+  );
+});
+
+test('free-tier deferral ledger event carries job and run attribution', async () => {
+  resetGeminiFreeCooldownForTests();
+  const savedKey = process.env.GEMINI_FREE_API_KEY;
+  process.env.GEMINI_FREE_API_KEY = 'test-key';
+  const events: Array<{ jobId?: string; runId?: string }> = [];
+  try {
+    const client = freeDefaultClient(async event => { events.push(event as never); }, {
+      persistedCooldownExpiryMs: async () => Date.now() + 60_000,
+    });
+    const error = await client!
+      .classify('prompt', 'model', { jobId: 'job-free', runId: 'run-free' })
+      .then(() => null, (e: unknown) => e);
+    assert.ok(error instanceof ProviderCallError && error.errorClass === 'RATE_LIMIT');
+    assert.equal(events.length, 1);
+    assert.equal(events[0].jobId, 'job-free');
+    assert.equal(events[0].runId, 'run-free');
+  } finally {
+    if (savedKey === undefined) delete process.env.GEMINI_FREE_API_KEY;
+    else process.env.GEMINI_FREE_API_KEY = savedKey;
+    resetGeminiFreeCooldownForTests();
+  }
+});
+
+test('groq success ledger event carries job and run attribution', async () => {
+  const savedFetch = globalThis.fetch;
+  const savedKey = process.env.GROQ_API_KEY;
+  globalThis.fetch = (async () => new Response(
+    JSON.stringify({ choices: [{ message: { content: '{"ok":true}' } }] }),
+    { status: 200, headers: { 'content-type': 'application/json' } },
+  )) as unknown as typeof fetch;
+  process.env.GROQ_API_KEY = 'test-key';
+  const events: Array<{ jobId?: string; runId?: string }> = [];
+  try {
+    const client = groqDefaultClient(async event => { events.push(event as never); }, {
+      persistedCooldownExpiryMs: async () => undefined,
+    });
+    await client!.classify('prompt', 'model', { jobId: 'job-groq', runId: 'run-groq' });
+    assert.equal(events.length, 1);
+    assert.equal(events[0].jobId, 'job-groq');
+    assert.equal(events[0].runId, 'run-groq');
+  } finally {
+    globalThis.fetch = savedFetch;
+    if (savedKey === undefined) delete process.env.GROQ_API_KEY;
+    else process.env.GROQ_API_KEY = savedKey;
+  }
+});
+
+test('every provider writer uses the shared attribution path', () => {
+  const paid = readFileSync(new URL('./evidenceEngine/providers/GeminiSemanticProvider.ts', import.meta.url), 'utf8');
+  assert.match(paid, /context: geminiSemanticProviderContext\(observability/);
+  for (const relative of [
     'evidenceEngine/providers/GeminiFreeSemanticProvider.ts',
     'evidenceEngine/providers/GroqSemanticProvider.ts',
-  ];
-  for (const relative of sources) {
+  ]) {
     const source = readFileSync(new URL(`./${relative}`, import.meta.url), 'utf8');
-    assert.match(source, /jobId: observability\?\.jobId, runId: observability\?\.runId/, relative);
-    // The paid provider declares the shared type; the other two import it.
-    assert.match(source, /(?:interface|type) SemanticObservabilityContext/, relative);
+    assert.match(source, /\.\.\.semanticObservabilityFields\(observability\)/, relative);
   }
 });
 
