@@ -75,16 +75,30 @@ function hasCommunityContent(text: string): boolean {
 }
 const EXPLICIT_NOT_FOUND_PATTERN =
   /\b(?:404|410|not\s+found|page\s+(?:not\s+found|does\s+not\s+exist|doesn't\s+exist|could\s+not\s+be\s+found|cannot\s+be\s+found)|no\s+longer\s+(?:available|exists)|this\s+page\s+is\s+gone)\b/i;
-const ANCHOR_PATTERN = /<(?:a|area)\b[^>]*\bhref\s*=/i;
+// Bound tag-attribute scans. The body is attacker-controlled (up to 64 KB);
+// an unbounded `[^>]*` would rescan to end-of-body for every unclosed `<a`,
+// `<meta`, or inline-handler prefix and could block the event loop.
+const ANCHOR_PATTERN = /<(?:a|area)\b[^<>]{0,2000}\bhref\s*=/i;
 // A small shell can still become a soft 404 or redirect once scripts run, or
 // expose content through an embedded frame/form/inline handler. Such bodies
 // are never terminal even when they carry no anchor.
-const CLIENT_RENDER_PATTERN = /<(?:script|iframe|form|object|embed)\b|<meta\b[^>]*\bhttp-equiv\s*=\s*["']?refresh|<[^>]+\son[a-z]+\s*=/i;
+const CLIENT_RENDER_PATTERN = /<(?:script|iframe|form|object|embed)\b|<meta\b[^<>]{0,2000}\bhttp-equiv\s*=\s*["']?refresh|<[^<>]{1,2000}\son[a-z]+\s*=/i;
 const SMALL_BODY_CHARS = 2_048;
+const HEADING_SCAN_CHARS = 16_384;
+const HEADING_TEXT_CHARS = 4_096;
 
 function tagText(html: string, tag: string): string {
-  const match = new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i').exec(html);
-  return match ? match[1].replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim() : '';
+  // Index-based extraction with bounded scans, not a backtracking regex.
+  const source = html.slice(0, HEADING_SCAN_CHARS);
+  const lower = source.toLowerCase();
+  const openMatch = new RegExp(`<${tag}(?=[\\s/>])`, 'i').exec(source);
+  if (!openMatch) return '';
+  const openEnd = lower.indexOf('>', openMatch.index + tag.length + 1);
+  if (openEnd < 0) return '';
+  const close = lower.indexOf(`</${tag}>`, openEnd + 1);
+  if (close < 0) return '';
+  const content = source.slice(openEnd + 1, Math.min(close, openEnd + 1 + HEADING_TEXT_CHARS));
+  return content.replace(/<[^<>]{0,2000}>/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 /**
@@ -104,6 +118,9 @@ export function assessStaticNotFoundBody(input: {
   if (input.bodySuppressed === true) return { confirmed: false, reason: 'BODY_NOT_READ' };
   if (input.truncated === true) return { confirmed: false, reason: 'TRUNCATED' };
   const text = String(input.text || '');
+  // UTF-16/UTF-32 decoded as UTF-8 leaves NULs between characters, which can
+  // hide links and community markers. Never treat such a body as empty/plain.
+  if (text.includes('\u0000')) return { confirmed: false, reason: 'UNREADABLE' };
   if (hasBlockMarkers(text)) return { confirmed: false, reason: 'BLOCK_MARKERS' };
   if (hasCommunityContent(text)) return { confirmed: false, reason: 'HAS_COMMUNITY_CONTENT' };
   if (ANCHOR_PATTERN.test(text)) return { confirmed: false, reason: 'HAS_LINKS' };

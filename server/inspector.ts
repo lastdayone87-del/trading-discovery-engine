@@ -358,6 +358,10 @@ async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:
       // suppression behavior.
       if(probeTerminalNotFoundBody&&(response.status===404||response.status===410)){
         const type=contentType.toLowerCase();
+        const charset=/charset\s*=\s*"?([^";]+)/i.exec(type)?.[1]?.trim()||'';
+        // The probe reader decodes UTF-8 only. UTF-16/32 bodies would hide
+        // links behind NUL bytes, so leave them unread and render-eligible.
+        if(charset.startsWith('utf-16')||charset.startsWith('utf-32'))return false;
         return type.includes('text/')||type.includes('application/xhtml+xml')||type.includes('application/xml')||type.includes('+xml');
       }
       if(response.status<200||response.status>=300)return false;

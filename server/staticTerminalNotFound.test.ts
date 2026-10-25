@@ -147,6 +147,28 @@ test('static 404 body: bot/block markers keep rendered escalation', () => {
   );
 });
 
+test('static 404 body: pathological unclosed markup stays bounded', () => {
+  for (const body of [
+    '<'.repeat(64_000),
+    '<title>'.repeat(8_000),
+    '<a '.repeat(20_000),
+    '<meta '.repeat(20_000),
+  ]) {
+    const started = Date.now();
+    const assessment = assessStaticNotFoundBody({ text: body, truncated: false });
+    const elapsed = Date.now() - started;
+    assert.equal(assessment.confirmed, false, body.slice(0, 12));
+    assert.ok(elapsed < 1_000, `bounded scan, took ${elapsed}ms`);
+  }
+});
+
+test('static 404 body: NUL-containing text is unreadable, never terminal', () => {
+  assert.deepEqual(
+    assessStaticNotFoundBody({ text: '<html><body>\u0000J\u0000o\u0000i\u0000n\u0000</body></html>', truncated: false }),
+    { confirmed: false, reason: 'UNREADABLE' },
+  );
+});
+
 test('static 404 body: unread, truncated, and large bodies are never terminal', () => {
   assert.deepEqual(assessStaticNotFoundBody({ text: '', truncated: false, bodySuppressed: true }), {
     confirmed: false,
@@ -417,6 +439,24 @@ test('untyped 404 bodies are not read as terminal evidence', async () => {
   assert.notEqual(seed.staticNotFoundBodyConfirmed, true);
   assert.notEqual(seed.staticTerminalNotFound, true);
   assert.equal(renders.calls(), 1);
+});
+
+test('UTF-16 XHTML 404 bodies keep rendered fallback', async () => {
+  const body = Buffer.from('<html><body>Join https://discord.gg/creator</body></html>', 'utf16le');
+  for (const contentType of ['application/xhtml+xml; charset=utf-16le', 'application/xhtml+xml']) {
+    const renders = countRenderCalls();
+    const url = 'https://creator.example.com/utf16';
+    const result = await inspect({
+      channelLinks: [url],
+      fetchImpl: (async () => new Response(body, { status: 404, headers: { 'content-type': contentType } })) as unknown as typeof fetch,
+      renderedFallback: renders.fallback,
+    });
+    const seed = (result.acquisitionOutcomes || []).find(item => item.requestedUrl === url);
+    assert.ok(seed, `seed observation exists (${contentType})`);
+    assert.notEqual(seed.staticNotFoundBodyConfirmed, true, contentType);
+    assert.notEqual(seed.staticTerminalNotFound, true, contentType);
+    assert.equal(renders.calls(), 1, contentType);
+  }
 });
 
 test('transient 5xx keeps rendered fallback', async () => {
