@@ -169,6 +169,24 @@ test('static 404 body: thousands of title elements stay bounded', () => {
   assert.ok(elapsed < 2_000, `title scan took ${elapsed}ms`);
 });
 
+test('static 404 body: plaintext inside a title cannot hide a later link', () => {
+  const body =
+    '<html><head><title>404 Not Found<plaintext></title><a href="/community">Join</a></body></html>';
+  assert.deepEqual(
+    assessStaticNotFoundBody({ text: body, truncated: false }),
+    { confirmed: false, reason: 'HAS_LINKS' },
+  );
+});
+
+test('static 404 body: plaintext in the body is unsafe markup', () => {
+  const body =
+    '<html><head><title>404 Not Found</title></head><body><plaintext><a href="/join">Join</a></body></html>';
+  assert.deepEqual(
+    assessStaticNotFoundBody({ text: body, truncated: false }),
+    { confirmed: false, reason: 'UNSAFE_MARKUP' },
+  );
+});
+
 test('static 404 body: community content keeps rendered escalation', () => {
   for (const marker of [
     'https://discord.gg/creator',

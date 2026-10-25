@@ -85,11 +85,11 @@ const MAX_TAG_CHARS = 2_000;
 const SMALL_BODY_CHARS = 2_048;
 const HEADING_TEXT_CHARS = 4_096;
 // Elements whose content is text, not markup. Skipping them keeps JavaScript
-// or CSS containing `<` from being mistaken for unreadable markup. `plaintext`
-// has no closing tag and consumes the rest of the document. `title` is not
-// skipped: in HTML it is RCDATA, but an SVG `<title>` can contain a real
-// `<a>` element, and scanning it only ever keeps rendered escalation.
-const RAW_TEXT_TAGS = new Set(['script', 'style', 'textarea', 'xmp', 'plaintext']);
+// or CSS containing `<` from being mistaken for unreadable markup. `title` is
+// handled separately: HTML title is RCDATA, but an SVG `<title>` can contain a
+// real `<a>` element. `plaintext` is treated as unsafe rather than trusted to
+// consume the response.
+const RAW_TEXT_TAGS = new Set(['script', 'style', 'textarea', 'xmp']);
 const CLIENT_RENDER_TAGS = new Set(['script', 'iframe', 'form', 'object', 'embed']);
 
 interface TagBounds {
@@ -122,7 +122,6 @@ function findTagEnd(source: string, start: number): TagBounds {
 }
 
 function skipRawText(source: string, lowerSource: string, from: number, tag: string): TagBounds {
-  if (tag === 'plaintext') return { end: source.length, uncertain: false };
   const close = lowerSource.indexOf(`</${tag}`, from);
   if (close < 0) return { end: source.length, uncertain: true };
   return findTagEnd(source, close + 2 + tag.length);
@@ -141,8 +140,13 @@ interface MarkupScan {
  *
  * `lowerText` is prepared once per assessment so raw-text lookups never
  * re-lowercase the whole attacker-controlled body for each element.
+ *
+ * `mode: 'title'` scans inside a title element. HTML title content is RCDATA,
+ * but an SVG title can contain real anchors; scanning the bounded content
+ * finds those anchors without letting a literal raw-text tag inside the title
+ * consume markup after `</title>`.
  */
-function scanMarkup(text: string, lowerText: string): MarkupScan {
+function scanMarkup(text: string, lowerText: string, mode: 'body' | 'title' = 'body'): MarkupScan {
   const result: MarkupScan = { hasLink: false, hasClientRender: false, uncertain: false };
   let index = 0;
   while (index < text.length) {
@@ -190,7 +194,24 @@ function scanMarkup(text: string, lowerText: string): MarkupScan {
     if (name === 'meta' && /\bhttp-equiv\s*=\s*["']?refresh/i.test(tagText)) result.hasClientRender = true;
     if (/\son[a-z]+\s*=/i.test(tagText)) result.hasClientRender = true;
     index = bounds.end + 1;
-    if (RAW_TEXT_TAGS.has(name)) {
+    if (name === 'plaintext') {
+      // In body context, never trust an obsolete plaintext element to consume
+      // the rest of the response. Inside a bounded title slice it cannot reach
+      // markup after `</title>`, so continue scanning that slice normally.
+      if (mode === 'body') return { ...result, uncertain: true };
+    }
+    if (mode === 'body' && name === 'title') {
+      const close = lowerText.indexOf('</title', index);
+      if (close < 0) return { ...result, uncertain: true };
+      const content = text.slice(index, close);
+      const inner = scanMarkup(content, content.toLowerCase(), 'title');
+      if (inner.uncertain) return { ...result, uncertain: true };
+      if (inner.hasLink) result.hasLink = true;
+      if (inner.hasClientRender) result.hasClientRender = true;
+      index = close;
+      continue;
+    }
+    if (mode === 'body' && RAW_TEXT_TAGS.has(name)) {
       const raw = skipRawText(text, lowerText, index, name);
       if (raw.uncertain) return { ...result, uncertain: true };
       index = raw.end + 1;
@@ -233,6 +254,7 @@ function findOpeningTag(source: string, lowerSource: string, tag: string): { sta
     if (bounds.uncertain) return { start: lt, end: bounds.end, uncertain: true };
     if (name === tag) return { start: lt, end: bounds.end, uncertain: false };
     index = bounds.end + 1;
+    if (name === 'plaintext') return { start: lt, end: bounds.end, uncertain: true };
     if (RAW_TEXT_TAGS.has(name)) {
       const raw = skipRawText(source, lowerSource, index, name);
       if (raw.uncertain) return { start: lt, end: raw.end, uncertain: true };
@@ -286,6 +308,7 @@ function stripHeadingTags(content: string): { text: string; uncertain: boolean }
     if (bounds.uncertain) return { text: '', uncertain: true };
     text += ' ';
     index = bounds.end + 1;
+    if (name === 'plaintext') return { text: '', uncertain: true };
     if (RAW_TEXT_TAGS.has(name)) {
       const raw = skipRawText(content, lowerContent, index, name);
       if (raw.uncertain) return { text: '', uncertain: true };
