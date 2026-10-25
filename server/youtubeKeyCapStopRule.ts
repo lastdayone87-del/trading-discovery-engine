@@ -225,6 +225,33 @@ export function shouldClearPriorDayStopMarker(content: string, currentQuotaDay: 
 }
 
 /**
+ * A prior-day marker may only be retired by an enforcing sample that passed
+ * every health and queue check. An alert-only or partially unhealthy sample
+ * must leave the old fail-closed signal in place.
+ */
+export function shouldClearPriorDayStopMarkerForSample(input: {
+  content: string;
+  currentQuotaDay: string;
+  alertOnly: boolean;
+  sampleHealthy: boolean;
+}): boolean {
+  if (input.alertOnly || !input.sampleHealthy) return false;
+  return shouldClearPriorDayStopMarker(input.content, input.currentQuotaDay);
+}
+
+/**
+ * A stop only counts as already persisted when it belongs to the current
+ * Pacific quota day. Yesterday's stop must not cause an alert-only sample to
+ * retain today's newly evaluated stop and arm a later enforcing run.
+ */
+export function stopAlreadyPersistedForQuotaDay(
+  state: KeyCapMonitorState | null,
+  quotaDay: string,
+): boolean {
+  return state?.quotaDay === quotaDay && Boolean(state.stopReason);
+}
+
+/**
  * An alert-only observation must not arm enforcement. If a stop was already
  * persisted by an enforcing run, keep it; otherwise drop the stop fields from
  * the dedupe state while retaining the durable-count high-water mark.

@@ -42,17 +42,34 @@ export function parseTransientRetryAgeMs(value:unknown,fallback=6*60*60_000):num
 const MAX_TRANSIENT_RETRY_AGE_MS=parseTransientRetryAgeMs(process.env.MAX_TRANSIENT_RETRY_AGE_MS);
 
 /**
- * Persist the structured failure code alongside the human-readable message.
- * The cap monitor counts `job_attempts.error`, and several typed errors
- * (`YouTubeKeyCapUnavailableError`, `ProbeQuotaExceededError`) carry their
- * safety code only on the object. Prefixing the code keeps the failure ledger
- * countable without a schema change and without changing the thrown error.
+ * Persist only the structured codes the cap monitor needs. Prefixing every
+ * string `error.code` would change unrelated persisted messages, including the
+ * prefix-anchored `Community acquisition deferred:` recovery patterns.
+ */
+export const MONITORED_JOB_FAILURE_CODES = new Set([
+  'YOUTUBE_KEY_CAP_UNAVAILABLE',
+  'QUOTA_ALLOCATION_EXHAUSTED',
+]);
+
+/**
+ * `executeProviderCall` normalizes a YouTube HTTP quota error into a generic
+ * `Provider rate limit reached.` message and keeps `quotaExceeded` /
+ * `providerReasons` only as metadata. Add a countable marker for that wrapped
+ * shape so provider quota failures still reach the stop rule.
  */
 export function persistedJobFailureMessage(error:any):string{
   const message=String(error?.message||error).slice(0,2000);
   const code=typeof error?.code==='string'?error.code.trim():'';
-  if(!code||message.startsWith(`${code}:`))return message;
-  return `${code}: ${message}`.slice(0,2000);
+  const providerQuotaSignal=error?.quotaExceeded===true
+    || (Array.isArray(error?.providerReasons)
+      && error.providerReasons.some((reason:unknown)=>/^(quotaExceeded|dailyLimitExceeded)$/i.test(String(reason))));
+  const monitoredCode=MONITORED_JOB_FAILURE_CODES.has(code)
+    ? code
+    : providerQuotaSignal
+      ? 'YOUTUBE_QUOTA_EXCEEDED'
+      : '';
+  if(!monitoredCode||message.startsWith(`${monitoredCode}:`))return message;
+  return `${monitoredCode}: ${message}`.slice(0,2000);
 }
 
 export function resolveTransientFailureAnchor(error:any,persistedFirstTransientFailureAt:unknown,now=Date.now()):number{

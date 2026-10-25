@@ -12,8 +12,10 @@ import {
   monitorSecondaryWindowStart,
   parseKeyCapStopMarker,
   shouldClearPriorDayStopMarker,
+  shouldClearPriorDayStopMarkerForSample,
   shouldWriteStopMarker,
   stateForAlertOnlySample,
+  stopAlreadyPersistedForQuotaDay,
 } from './youtubeKeyCapStopRule';
 
 test('corrected stop rule counts both cap codes and keeps the unavailable guard', () => {
@@ -165,6 +167,37 @@ test('stop markers carry the quota day and only stale quota stops auto-clear', (
   // inspect them rather than letting a new day erase a fail-closed signal.
   assert.equal(shouldClearPriorDayStopMarker('STOP|CAP_EVENTS|detail|2026-10-25T20:00:00.000Z', '2026-10-26'), false);
   assert.equal(shouldClearPriorDayStopMarker('not-a-stop', '2026-10-26'), false);
+});
+
+test('only a healthy enforcing sample retires a prior-day stop marker', () => {
+  const marker = formatKeyCapStopMarker({
+    reason: 'CAP_EVENTS',
+    detail: 'cap_exceeded=501',
+    at: new Date('2026-10-25T20:00:00.000Z'),
+    quotaDay: '2026-10-25',
+  });
+  const base = {
+    content: marker,
+    currentQuotaDay: '2026-10-26',
+    alertOnly: false,
+    sampleHealthy: true,
+  };
+  assert.equal(shouldClearPriorDayStopMarkerForSample(base), true);
+  assert.equal(shouldClearPriorDayStopMarkerForSample({ ...base, alertOnly: true }), false);
+  assert.equal(shouldClearPriorDayStopMarkerForSample({ ...base, sampleHealthy: false }), false);
+  assert.equal(
+    shouldClearPriorDayStopMarkerForSample({ ...base, currentQuotaDay: '2026-10-25' }),
+    false,
+  );
+});
+
+test('only a current-day stop counts as already persisted', () => {
+  const today = initialKeyCapMonitorState('2026-10-26');
+  today.stopReason = 'CAP_EVENTS';
+  assert.equal(stopAlreadyPersistedForQuotaDay(today, '2026-10-26'), true);
+  assert.equal(stopAlreadyPersistedForQuotaDay({ ...today, quotaDay: '2026-10-25' }, '2026-10-26'), false);
+  assert.equal(stopAlreadyPersistedForQuotaDay({ ...today, stopReason: null }, '2026-10-26'), false);
+  assert.equal(stopAlreadyPersistedForQuotaDay(null, '2026-10-26'), false);
 });
 
 test('alert-only state never arms a later enforcing run', () => {

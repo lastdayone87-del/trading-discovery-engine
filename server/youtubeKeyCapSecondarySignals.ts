@@ -32,6 +32,7 @@ SELECT
   (SELECT COUNT(*) FROM job_attempts
     WHERE finished_at > $1
       AND (error LIKE '%QUOTA_ALLOCATION_EXHAUSTED%'
+           OR error LIKE '%YOUTUBE_QUOTA_EXCEEDED%'
            OR error ILIKE '%quota allocation is exhausted%'
            OR error ILIKE '%quotaExceeded%'
            OR error ILIKE '%dailyLimitExceeded%'))::int AS quota_exhausted

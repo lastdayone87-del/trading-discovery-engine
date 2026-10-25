@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { failedAttemptFinalizeQuery, persistedJobFailureMessage } from './db';
+import { ProviderCallError } from './providerResilience';
 import { ProbeQuotaExceededError, YouTubeKeyCapUnavailableError } from './quotaKeyCapShadow';
 
 test('structured failure codes are persisted in the attempt message', () => {
@@ -31,7 +32,39 @@ test('structured failure codes are persisted in the attempt message', () => {
   const long = Object.assign(new Error('x'.repeat(3_000)), { code: 'LONG' });
   const persisted = persistedJobFailureMessage(long);
   assert.equal(persisted.length, 2_000);
-  assert.ok(persisted.startsWith('LONG: '));
+  assert.ok(!persisted.startsWith('LONG: '), 'unrelated codes keep the original prefix');
+
+  // Community recovery matches this prefix exactly; a generic code prefix
+  // would stop lease renewal and terminal reactivation.
+  const deferral = Object.assign(
+    new Error('Community acquisition deferred: browser capacity'),
+    { code: 'BROWSER_RUNTIME_UNAVAILABLE' },
+  );
+  assert.equal(
+    persistedJobFailureMessage(deferral),
+    'Community acquisition deferred: browser capacity',
+  );
+
+  // executeProviderCall normalizes a YouTube quota error into a generic
+  // message but retains the quota metadata; persist a countable marker.
+  const wrappedProviderQuota = new ProviderCallError(
+    'Provider rate limit reached.',
+    'RATE_LIMIT',
+    true,
+    { status: 403, quotaExceeded: true, providerReasons: ['quotaExceeded'] },
+  );
+  assert.equal(
+    persistedJobFailureMessage(wrappedProviderQuota),
+    'YOUTUBE_QUOTA_EXCEEDED: Provider rate limit reached.',
+  );
+  const reasonOnly = Object.assign(
+    new Error('Provider rate limit reached.'),
+    { providerReasons: ['dailyLimitExceeded'] },
+  );
+  assert.equal(
+    persistedJobFailureMessage(reasonOnly),
+    'YOUTUBE_QUOTA_EXCEEDED: Provider rate limit reached.',
+  );
 });
 
 test('captured attempt row is finalized by id, never by open-row sweep', () => {

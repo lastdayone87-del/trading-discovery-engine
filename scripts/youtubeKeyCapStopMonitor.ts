@@ -44,7 +44,7 @@ import {
 import { readYouTubeKeyCapSecondarySignals } from '../server/youtubeKeyCapSecondarySignals';
 import {
   readKeyCapMonitorStop,
-  recordKeyCapMonitorStop,
+  recordKeyCapMonitorStopWithRetry,
   type KeyCapMonitorStop,
 } from '../server/youtubeKeyCapMonitorStops';
 import {
@@ -52,9 +52,10 @@ import {
   formatKeyCapStopMarker,
   keyCapStopMarkerQuotaDay,
   monitorSecondaryWindowStart,
-  shouldClearPriorDayStopMarker,
+  shouldClearPriorDayStopMarkerForSample,
   shouldWriteStopMarker,
   stateForAlertOnlySample,
+  stopAlreadyPersistedForQuotaDay,
   type KeyCapMonitorState,
 } from '../server/youtubeKeyCapStopRule';
 
@@ -138,11 +139,16 @@ function readStopMarkerDay(): string | null {
   }
 }
 
-function clearPriorDayStopFile(currentQuotaDay: string): void {
+function clearPriorDayStopFile(currentQuotaDay: string, sampleHealthy: boolean): void {
   try {
     if (!existsSync(STOP_FILE)) return;
     const content = readFileSync(STOP_FILE, 'utf8');
-    if (!shouldClearPriorDayStopMarker(content, currentQuotaDay)) return;
+    if (!shouldClearPriorDayStopMarkerForSample({
+      content,
+      currentQuotaDay,
+      alertOnly: ALERT_ONLY,
+      sampleHealthy,
+    })) return;
     unlinkSync(STOP_FILE);
     appendLog(`${new Date().toISOString()}|STOP_FILE_CLEARED|prior_day|${currentQuotaDay}`);
   } catch (error) {
@@ -285,7 +291,7 @@ async function main(): Promise<void> {
       };
     }
 
-    const stopAlreadyPersisted = Boolean(state?.stopReason);
+    const stopAlreadyPersisted = stopAlreadyPersistedForQuotaDay(state, sample.quotaDay);
     const evaluation = evaluateDurableKeyCapMonitorSample(
       state,
       {
@@ -318,20 +324,9 @@ async function main(): Promise<void> {
     if (evaluation.verdict.stop) {
       const reason = evaluation.verdict.reason!;
       if (!ALERT_ONLY) {
-        try {
-          await recordKeyCapMonitorStop(db, {
-            quotaDay: sample.quotaDay,
-            reason,
-            detail: evaluation.verdict.detail,
-            at: now,
-          });
-        } catch (error) {
-          logKeyCapRefusalAccountingFailure(error, {
-            branch: 'monitor-stop-persist',
-            quotaDay: sample.quotaDay,
-            reason,
-          });
-        }
+        // The local marker is the immediate fail-closed signal. Write it
+        // before the durable insert so a slow database cannot delay the
+        // runner's stop, then retry the durable row for several minutes.
         const markerDay = readStopMarkerDay();
         if (shouldWriteStopMarker({
           alertOnly: false,
@@ -341,6 +336,24 @@ async function main(): Promise<void> {
         })) {
           writeStop(reason, evaluation.verdict.detail, now, sample.quotaDay);
         }
+        try {
+          await recordKeyCapMonitorStopWithRetry(db, {
+            quotaDay: sample.quotaDay,
+            reason,
+            detail: evaluation.verdict.detail,
+            at: now,
+          }, {
+            attempts: 12,
+            delayMs: attempt => Math.min(30_000, 1_000 * 2 ** (attempt - 1)),
+          });
+        } catch (error) {
+          logKeyCapRefusalAccountingFailure(error, {
+            branch: 'monitor-stop-persist',
+            quotaDay: sample.quotaDay,
+            reason,
+          });
+          appendLog(`${now.toISOString()}|STOP_PERSIST_FAILED|${reason}`);
+        }
         process.exit(2);
       }
       // Alert-only must not arm or disarm enforcement: no stop file write, no
@@ -348,12 +361,16 @@ async function main(): Promise<void> {
       appendAlertOnce('CAP_STOP', now, `continuing after cap stop ${reason}`);
     } else {
       clearAlert('CAP_STOP');
-      // An alert-only observation must not clear a stop that an enforcing run
-      // wrote. Only an enforcing healthy sample may retire yesterday's marker.
-      if (!ALERT_ONLY) clearPriorDayStopFile(sample.quotaDay);
     }
 
+    // Do not retire yesterday's marker until the whole sample is healthy. If
+    // health or queue checks fail, the old stop must stay in place while the
+    // two-failure counters escalate; otherwise the runner can resume during
+    // the gap, and MONITOR_ONCE could return without a replacement stop.
+    let sampleHealthy = true;
+
     if (!sample.health.ready || sample.health.http !== 200) {
+      sampleHealthy = false;
       healthFailures += 1;
       if (healthFailures >= 2) {
         if (ALERT_ONLY) {
@@ -369,6 +386,7 @@ async function main(): Promise<void> {
     }
 
     if (sample.queue.searchPending > MAX_SEARCH_PENDING || sample.queue.enrichPending > MAX_ENRICH_PENDING) {
+      sampleHealthy = false;
       queueFailures += 1;
       if (queueFailures >= 2) {
         if (ALERT_ONLY) {
@@ -392,6 +410,11 @@ async function main(): Promise<void> {
       clearAlert('QUEUE_GROWTH');
     }
 
+    // Alert-only must not clear an enforcing run's stop. Only an enforcing
+    // sample that passes cap, health, and queue checks retires yesterday's
+    // quota marker.
+    clearPriorDayStopFile(sample.quotaDay, sampleHealthy);
+
     if (now.getTime() - lastPruneMs >= PRUNE_INTERVAL_MS) {
       lastPruneMs = now.getTime();
       try {
@@ -411,5 +434,20 @@ async function main(): Promise<void> {
 
 main().catch(error => {
   console.error('youtube-key-cap-stop-monitor failed:', error);
+  // Database initialization or an unexpected top-level failure can reject
+  // before the sampling loop's two-failure escalation. Leave an immediate
+  // fail-closed marker unless a more specific stop already exists.
+  try {
+    if (!existsSync(STOP_FILE)) {
+      writeStop(
+        'MONITOR_UNAVAILABLE',
+        `monitor failed: ${String((error as Error)?.message || error).slice(0, 200)}`,
+        new Date(),
+        '',
+      );
+    }
+  } catch {
+    // The runner still refuses a missing/dead monitor; preserve exit 1.
+  }
   process.exit(1);
 });

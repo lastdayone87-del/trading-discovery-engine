@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  KEY_CAP_MONITOR_STOP_PERSIST_ATTEMPTS,
   READ_KEY_CAP_MONITOR_STOP_SQL,
   RECORD_KEY_CAP_MONITOR_STOP_SQL,
   readKeyCapMonitorStop,
   recordKeyCapMonitorStop,
+  recordKeyCapMonitorStopWithRetry,
   type MonitorStopQueryClient,
 } from './youtubeKeyCapMonitorStops';
 
@@ -82,6 +84,49 @@ test('durable monitor stop insert is first-writer-wins', async () => {
   });
   assert.equal(calls.length, 2);
   assert.match(calls[1].text, /FROM youtube_key_cap_monitor_stops/);
+});
+
+test('durable stop persistence retries transient failures before exiting', async () => {
+  assert.equal(KEY_CAP_MONITOR_STOP_PERSIST_ATTEMPTS, 5);
+  let inserts = 0;
+  const client: MonitorStopQueryClient = {
+    query: async (text) => {
+      if (text.includes('INSERT INTO youtube_key_cap_monitor_stops')) {
+        inserts += 1;
+        if (inserts < 3) throw new Error('transient database failure');
+        return { rows: [row] };
+      }
+      return { rows: [row] };
+    },
+  };
+  const result = await recordKeyCapMonitorStopWithRetry(client, {
+    quotaDay: '2026-10-26',
+    reason: 'CAP_EVENTS',
+    detail: 'cap_exceeded=501',
+    at: new Date('2026-10-26T08:00:00.000Z'),
+  }, { attempts: 5, delayMs: () => 0 });
+  assert.equal(inserts, 3);
+  assert.equal(result.reason, 'CAP_EVENTS');
+});
+
+test('durable stop persistence surfaces the final error after bounded retries', async () => {
+  let calls = 0;
+  const client: MonitorStopQueryClient = {
+    query: async () => {
+      calls += 1;
+      throw new Error('database unavailable');
+    },
+  };
+  await assert.rejects(
+    recordKeyCapMonitorStopWithRetry(client, {
+      quotaDay: '2026-10-26',
+      reason: 'CAP_UNAVAILABLE',
+      detail: 'cap_unavailable=4',
+      at: new Date('2026-10-26T08:00:00.000Z'),
+    }, { attempts: 3, delayMs: () => 0 }),
+    /database unavailable/,
+  );
+  assert.equal(calls, 3);
 });
 
 test('durable monitor stop rejects invalid rows and reasons', async () => {

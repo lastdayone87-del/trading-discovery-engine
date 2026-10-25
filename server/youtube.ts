@@ -990,9 +990,11 @@ export async function searchYouTubeChannelPage(
   await recordExecutionStage('PROVIDER_ACQUISITION','REACHED',{provider:'youtube',configuredKeys:keyPool.length});
   const acquisition = youtubePoolBackoff.beginAcquisition();
   let quotaExceededCount = 0;
+  let attemptedKeyCount = 0;
 
   try { if (keyPool.length > 0) {
     const providerIndexes = availableKeyIndexes(keyPool);
+    attemptedKeyCount = providerIndexes.length;
     for (let attempt = 0; attempt < providerIndexes.length; attempt++) {
       const currentIndex = providerIndexes[attempt];
       const apiKey = keyPool[currentIndex];
@@ -1044,8 +1046,28 @@ export async function searchYouTubeChannelPage(
     console.warn('[YouTube API Pool] All API keys in pool encountered quotaExceeded or error or returned no results.');
   }
 
-  throw new Error('All configured YouTube API keys failed for this discovery request.');
+  throw buildYouTubeDiscoveryTerminalError(quotaExceededCount, attemptedKeyCount);
   } finally { acquisition.release(); }
+}
+
+/**
+ * Preserve a countable provider-quota signal when every discovery key fails.
+ * The per-key errors are swallowed by the rotation loop, so without this
+ * metadata `failJob` would persist only the generic terminal message and the
+ * cap monitor could not count the provider quota failures.
+ */
+export function buildYouTubeDiscoveryTerminalError(
+  quotaExceededCount: number,
+  attemptedKeys: number,
+): Error {
+  const quotaExhausted = attemptedKeys > 0 && quotaExceededCount === attemptedKeys;
+  const error = new Error(quotaExhausted
+    ? 'All configured YouTube API keys reported quota exhaustion for this discovery request.'
+    : 'All configured YouTube API keys failed for this discovery request.');
+  if (quotaExceededCount > 0) {
+    Object.assign(error, { quotaExceeded: true, providerReasons: ['quotaExceeded'] });
+  }
+  return error;
 }
 
 /**

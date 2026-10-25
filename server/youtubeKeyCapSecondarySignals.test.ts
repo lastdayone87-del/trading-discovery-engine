@@ -24,6 +24,7 @@ test('secondary signals use the attempt ledger only and match structured/provide
   assert.doesNotMatch(text, /FROM jobs\b/, 'jobs.last_error duplicates the attempt message');
   assert.match(text, /YOUTUBE_KEY_CAP_UNAVAILABLE/);
   assert.match(text, /QUOTA_ALLOCATION_EXHAUSTED/);
+  assert.match(text, /YOUTUBE_QUOTA_EXCEEDED/);
   assert.match(text, /quotaExceeded/);
   assert.match(text, /dailyLimitExceeded/);
   assert.match(READ_SECONDARY_SIGNALS_SQL, /finished_at > \$1/);

@@ -73,6 +73,45 @@ export async function readKeyCapMonitorStop(
   return row ? normalizeStop(row) : null;
 }
 
+export const KEY_CAP_MONITOR_STOP_PERSIST_ATTEMPTS = 5;
+
+/**
+ * Retry a transient durable-stop failure before the monitor exits. The local
+ * stop file remains the immediate signal; this reduces the window where a
+ * container replacement could lose a rolling-window stop because the durable
+ * row was never written.
+ */
+export async function recordKeyCapMonitorStopWithRetry(
+  client: MonitorStopQueryClient,
+  input: {
+    quotaDay: string;
+    reason: KeyCapStopReason;
+    detail: string;
+    at: Date;
+  },
+  options: {
+    attempts?: number;
+    delayMs?: (attempt: number) => number;
+  } = {},
+): Promise<KeyCapMonitorStop> {
+  const configuredAttempts = Number(options.attempts);
+  const attempts = Number.isSafeInteger(configuredAttempts) && configuredAttempts >= 1
+    ? configuredAttempts
+    : KEY_CAP_MONITOR_STOP_PERSIST_ATTEMPTS;
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await recordKeyCapMonitorStop(client, input);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts) break;
+      const delay = options.delayMs ? options.delayMs(attempt) : attempt * 1_000;
+      if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  throw lastError;
+}
+
 /**
  * First stop wins. A concurrent monitor or a retry cannot replace the reason
  * or timestamp that the runner already observed.

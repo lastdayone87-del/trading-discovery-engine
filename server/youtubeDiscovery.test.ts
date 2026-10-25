@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { extractDiscoveredChannels } from './youtube';
+import { buildYouTubeDiscoveryTerminalError, extractDiscoveredChannels } from './youtube';
 
 test('video lane extracts unique channels and retains matching video evidence', () => {
   const results = extractDiscoveredChannels([
@@ -26,6 +26,26 @@ test('video lane keeps per-title IDs with descriptions', () => {
     { id: 'v1', title: 'DAX setup', description: 'first' },
     { id: 'v2', title: 'DAX analysis', description: 'second' },
   ]);
+});
+
+test('discovery terminal error preserves provider quota metadata', () => {
+  const all = buildYouTubeDiscoveryTerminalError(2, 2) as Error & {
+    quotaExceeded?: boolean;
+    providerReasons?: string[];
+  };
+  assert.match(all.message, /quota exhaustion/);
+  assert.equal(all.quotaExceeded, true);
+  assert.deepEqual(all.providerReasons, ['quotaExceeded']);
+
+  const some = buildYouTubeDiscoveryTerminalError(1, 2) as Error & { quotaExceeded?: boolean };
+  assert.equal(some.quotaExceeded, true);
+
+  const none = buildYouTubeDiscoveryTerminalError(0, 2) as Error & {
+    quotaExceeded?: boolean;
+    providerReasons?: string[];
+  };
+  assert.equal(none.quotaExceeded, undefined);
+  assert.equal(none.providerReasons, undefined);
 });
 
 test('channel lane preserves direct channel discovery behavior', () => {
