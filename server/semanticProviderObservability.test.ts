@@ -135,3 +135,79 @@ test('the ingestion pipeline maps the active job/run onto the classifier input',
   assert.match(queue, /processChannelThroughPipeline\(enriched[\s\S]{0,240}jobId:job\.id/);
   assert.match(queue, /processDiscoveredChannel\(candidate[\s\S]{0,240}jobId: job\.id/);
 });
+
+test('404 model fallback forwards attribution on every retry for all providers', async () => {
+  const saved = {
+    MULTILINGUAL_CANDIDATE_MODEL: process.env.MULTILINGUAL_CANDIDATE_MODEL,
+    MULTILINGUAL_ADJUDICATOR_MODEL: process.env.MULTILINGUAL_ADJUDICATOR_MODEL,
+    GEMINI_FREE_CANDIDATE_MODEL: process.env.GEMINI_FREE_CANDIDATE_MODEL,
+    GEMINI_FREE_ADJUDICATOR_MODEL: process.env.GEMINI_FREE_ADJUDICATOR_MODEL,
+    GROQ_CANDIDATE_MODEL: process.env.GROQ_CANDIDATE_MODEL,
+    GROQ_ADJUDICATOR_MODEL: process.env.GROQ_ADJUDICATOR_MODEL,
+  };
+  process.env.MULTILINGUAL_CANDIDATE_MODEL = 'candidate-model';
+  process.env.MULTILINGUAL_ADJUDICATOR_MODEL = 'fallback-model';
+  process.env.GEMINI_FREE_CANDIDATE_MODEL = 'candidate-model';
+  process.env.GEMINI_FREE_ADJUDICATOR_MODEL = 'fallback-model';
+  process.env.GROQ_CANDIDATE_MODEL = 'candidate-model';
+  process.env.GROQ_ADJUDICATOR_MODEL = 'fallback-model';
+  try {
+    for (const Provider of [GeminiSemanticProvider, GeminiFreeSemanticProvider, GroqSemanticProvider]) {
+      const seen: unknown[] = [];
+      const client = {
+        async classify(_prompt: string, _model: string, observability?: unknown) {
+          seen.push(observability);
+          if (seen.length === 1) {
+            throw new ProviderCallError('Model not found', 'PERMANENT_INPUT', false, { status: 404 });
+          }
+          return unrelatedResult;
+        },
+      };
+      await new Provider(client as any).collectEvidence(input, {} as any);
+      assert.equal(seen.length, 2, Provider.name);
+      assert.deepEqual(seen[1], { jobId: 'job-observability-1', runId: 'run-observability-1' }, Provider.name);
+    }
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('adjudication forwards attribution on the second semantic call', async () => {
+  const saved = process.env.MULTILINGUAL_ADJUDICATION_ENABLED;
+  process.env.MULTILINGUAL_ADJUDICATION_ENABLED = 'true';
+  try {
+    const seen: unknown[] = [];
+    const client = {
+      async classify(_prompt: string, _model: string, observability?: unknown) {
+        seen.push(observability);
+        return seen.length === 1
+          ? { ...unrelatedResult, label: 'AMBIGUOUS', confidence: 50 }
+          : unrelatedResult;
+      },
+    };
+    await new GeminiSemanticProvider(client as any).collectEvidence(input, {} as any);
+    assert.equal(seen.length, 2);
+    assert.deepEqual(seen[1], { jobId: 'job-observability-1', runId: 'run-observability-1' });
+  } finally {
+    if (saved === undefined) delete process.env.MULTILINGUAL_ADJUDICATION_ENABLED;
+    else process.env.MULTILINGUAL_ADJUDICATION_ENABLED = saved;
+  }
+});
+
+test('groq citation repair forwards attribution on the repair call', async () => {
+  const seen: unknown[] = [];
+  const client = {
+    async classify(_prompt: string, _model: string, observability?: unknown) {
+      seen.push(observability);
+      return seen.length === 1
+        ? { ...unrelatedResult, confidence: 96, citations: [] }
+        : unrelatedResult;
+    },
+  };
+  await new GroqSemanticProvider(client as any).collectEvidence(input, {} as any);
+  assert.equal(seen.length, 2);
+  assert.deepEqual(seen[1], { jobId: 'job-observability-1', runId: 'run-observability-1' });
+});
