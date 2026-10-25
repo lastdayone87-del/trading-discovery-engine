@@ -266,6 +266,21 @@ test('static 404 body: NUL-containing text is unreadable, never terminal', () =>
   );
 });
 
+test('static 404 body: explicit heading beyond the old body/heading windows is terminal', () => {
+  // The old implementation sliced the body to 16,384 characters and the
+  // heading text to 4,096. The body probe itself accepts 64,000, so a real
+  // link-free 404 with a late or long heading must not force a browser launch.
+  const lateTitle = `<html><head>${' '.repeat(20_000)}<title>404 Not Found</title></head><body>missing</body></html>`;
+  const longHeading = `<html><head><title>${'x'.repeat(5_000)} 404 Not Found</title></head><body>missing</body></html>`;
+  for (const body of [lateTitle, longHeading]) {
+    assert.deepEqual(
+      assessStaticNotFoundBody({ text: body, truncated: false }),
+      { confirmed: true, reason: 'NO_LINKS_EXPLICIT_NOT_FOUND' },
+      body.slice(0, 40),
+    );
+  }
+});
+
 test('static 404 body: unread, truncated, and large bodies are never terminal', () => {
   assert.deepEqual(assessStaticNotFoundBody({ text: '', truncated: false, bodySuppressed: true }), {
     confirmed: false,

@@ -83,7 +83,6 @@ const EXPLICIT_NOT_FOUND_PATTERN =
 // caller keeps rendered escalation instead of guessing what the tag contains.
 const MAX_TAG_CHARS = 2_000;
 const SMALL_BODY_CHARS = 2_048;
-const HEADING_TEXT_CHARS = 4_096;
 // Elements whose content is text, not markup. Skipping them keeps JavaScript
 // or CSS containing `<` from being mistaken for unreadable markup. `title` is
 // handled separately: HTML title is RCDATA, but an SVG `<title>` can contain a
@@ -329,7 +328,10 @@ function tagText(html: string, lowerHtml: string, tag: string): { text: string; 
   if (close < 0) return { text: '', uncertain: false };
   const closeEnd = findTagEnd(html, close + 2 + tag.length);
   if (closeEnd.uncertain) return { text: '', uncertain: true };
-  const content = html.slice(open.end + 1, Math.min(close, open.end + 1 + HEADING_TEXT_CHARS));
+  // The body probe is already capped at 64 KB. Scan the complete heading
+  // content so an explicit not-found phrase is not hidden by an artificial
+  // 4 KB text window; stripHeadingTags stays linear and bounded by that body.
+  const content = html.slice(open.end + 1, close);
   const stripped = stripHeadingTags(content);
   return stripped.uncertain ? { text: '', uncertain: true } : { text: stripped.text, uncertain: false };
 }
