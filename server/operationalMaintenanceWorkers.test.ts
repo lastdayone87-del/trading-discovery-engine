@@ -72,6 +72,7 @@ test('maintenance concurrency is bounded and starts after database readiness in 
   assert.match(startup, /if \(isServerRuntime\(\)\) \{[\s\S]*startOperationalMaintenanceWorkers\(\);/);
   assert.match(startup, /markDatabaseReady/);
   assert.match(startup, /Operational maintenance consumers started after database readiness/);
+  assert.equal(workers.match(/startOperationalMaintenanceScheduler\(\)/g)?.length, 1);
 });
 
 test('only the community retry consumer scales; every other family runs exactly one loop', () => {
@@ -95,8 +96,8 @@ test('only the community retry consumer scales; every other family runs exactly 
 });
 
 test('legacy community reconciliation restores completed history without a stale-retry worker pass', () => {
-  const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
-  assert.match(queue, /const legacyCommunityReconciliation = await reconcileLegacyCommunityRetryOwnership/);
-  assert.match(queue, /Restored \$\{legacyCommunityReconciliation\.closedNonCommunity\} legacy non-community job/);
-  assert.doesNotMatch(queue, /reconcilePendingCommunityRetryJobs/);
+  const scheduler = readFileSync(new URL('./operationalMaintenanceScheduler.ts', import.meta.url), 'utf8');
+  assert.match(scheduler, /const legacyCommunityReconciliation = await reconcileLegacyCommunityRetryOwnership/);
+  assert.match(scheduler, /Restored \$\{legacyCommunityReconciliation\.closedNonCommunity\} legacy non-community job/);
+  assert.doesNotMatch(scheduler, /reconcilePendingCommunityRetryJobs/);
 });

@@ -140,12 +140,13 @@ test('migration 121 is narrow, transactional, and resets stale transient-age pro
   assert.doesNotMatch(migration, /DELETE FROM channels|TRUNCATE|DROP TABLE/);
 });
 
-test('worker invokes operational enrichment recovery before claiming the next job', () => {
-  const source = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
-  assert.match(source, /await reconcileOperationalEnrichmentRecovery\(getDb, getChannelById, upsertChannel, enqueueOperationalEnrichmentRecoveryJob/);
-  assert.match(source, /operationalEnrichmentRecoveryKey\(channel\.channel_id\)/);
-  assert.match(source, /recoveryReasonCodes/);
-  assert.match(source, /UPDATE jobs SET first_transient_failure_at=NULL WHERE id=\$1 AND status='PENDING'/);
+test('maintenance interval invokes operational enrichment recovery outside the claim path', () => {
+  const scheduler = readFileSync(new URL('./operationalMaintenanceScheduler.ts', import.meta.url), 'utf8');
+  assert.match(scheduler, /reconcileOperationalEnrichmentRecovery\(\s*getDb,\s*getChannelById,\s*upsertChannel,\s*enqueueOperationalEnrichmentRecoveryJob/);
+  const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  assert.match(queue, /operationalEnrichmentRecoveryKey\(channel\.channel_id\)/);
+  assert.match(queue, /recoveryReasonCodes/);
+  assert.match(queue, /UPDATE jobs SET first_transient_failure_at=NULL WHERE id=\$1 AND status='PENDING'/);
 });
 
 
@@ -169,7 +170,8 @@ test('provider-deferred projection is bounded and preserves semantic exclusions'
 
 
 test('queue worker projects provider-owned enrichment failures distinctly from ordinary failures',()=>{
-  const source=readFileSync(new URL('./queueManager.ts',import.meta.url),'utf8');
-  assert.match(source,/isProviderDeferredEnrichmentError\(err\) \? 'PROVIDER_DEFERRED' : 'FAILED'/);
-  assert.match(source,/await projectProviderDeferredEnrichment\(getDb, getChannelById, upsertChannel, 100\)/);
+  const queue=readFileSync(new URL('./queueManager.ts',import.meta.url),'utf8');
+  assert.match(queue,/isProviderDeferredEnrichmentError\(err\) \? 'PROVIDER_DEFERRED' : 'FAILED'/);
+  const scheduler=readFileSync(new URL('./operationalMaintenanceScheduler.ts',import.meta.url),'utf8');
+  assert.match(scheduler,/projectProviderDeferredEnrichment\(getDb, getChannelById, upsertChannel, 100\)/);
 });

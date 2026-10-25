@@ -10,6 +10,7 @@ import {
 } from './db';
 import { youtubeProviderCooldown } from './youtubeProviderCooldown';
 import { COUNTRY_BOUNDARY_RECOVERY_JOB } from './countryBoundaryRecovery';
+import { startOperationalMaintenanceScheduler } from './operationalMaintenanceScheduler';
 
 type ClaimableOverride = NonNullable<Parameters<typeof processNextSearchJob>[0]>;
 
@@ -364,6 +365,9 @@ export function startOperationalMaintenanceWorkers(): void {
   // generic maintenance concurrency setting: harvest/scoring work is DB-local
   // and strictly gated by corpus/scoring controls and budgets.
   startCorpusPipelineWorker(`corpus_pipeline_${process.pid}_0`);
+  // Recovery/projection sweeps are not claim-critical and run on one shared
+  // interval instead of ahead of every claim in every worker pool.
+  startOperationalMaintenanceScheduler();
 }
 
 export function getOperationalMaintenanceJobTypesForTests(): string[] {

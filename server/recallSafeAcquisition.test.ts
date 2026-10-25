@@ -603,9 +603,10 @@ test('failure-class fallback preserves community ownership when the surface is u
 
 test('queue retry overrides attribute community surfaces as community-owned', () => {
   const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  const scheduler = readFileSync(new URL('./operationalMaintenanceScheduler.ts', import.meta.url), 'utf8');
   assert.match(queue, /retryReason:directive\?\.retryReason\|\|'COMMUNITY_REQUIRED_ACQUISITION_FAILURE'/);
   assert.match(queue, /reason:`Discord validation remained \$\{selected\.operationalOutcome\}`,retryAt:undefined,retryReason:'COMMUNITY_REQUIRED_ACQUISITION_FAILURE'/);
-  assert.match(queue, /retryReason === 'BROWSER_RUNTIME_UNAVAILABLE' \? 'BROWSER_RUNTIME_UNAVAILABLE' : 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE'/);
+  assert.match(scheduler, /retryReason: retryReason === 'BROWSER_RUNTIME_UNAVAILABLE'\s*\? 'BROWSER_RUNTIME_UNAVAILABLE'\s*: COMMUNITY_RETRY_REASON\.COMMUNITY_REQUIRED_ACQUISITION_FAILURE/);
   assert.doesNotMatch(queue, /retryReason:directive\?\.retryReason\|\|'UPSTREAM_REQUIRED_ACQUISITION_FAILURE'/);
 });
 

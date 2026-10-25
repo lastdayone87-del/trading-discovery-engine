@@ -276,10 +276,12 @@ test('automatic reconciliation restores the prior failure projection when recove
 test('production ingestion and manual recheck entry points invoke community recovery reactivation', () => {
   const pipeSource = read('server/ingestionPipeline.ts');
   const queueSource = read('server/queueManager.ts');
+  const schedulerSource = read('server/operationalMaintenanceScheduler.ts');
 
   assert.match(pipeSource, /shouldReactivateCommunityRecovery\(existing, candidate, isManualScan\)/);
   assert.match(queueSource, /shouldReactivateCommunityRecovery\(channel, undefined, true\)/);
-  assert.match(queueSource, /reconcileCommunityAcquisitionRecovery\(getDb, getChannelById, upsertChannel, 20, Date\.now\(\),/);
-  assert.match(queueSource, /reconcileLegacyCommunityRetryOwnership\(getDb, 250\)/);
+  assert.match(schedulerSource, /reconcileCommunityAcquisitionRecovery\(\s*getDb,\s*getChannelById,\s*upsertChannel,\s*20,\s*Date\.now\(\),/);
+  assert.match(schedulerSource, /reconcileLegacyCommunityRetryOwnership\(getDb, 250\)/);
   assert.doesNotMatch(queueSource, /reconcilePendingCommunityRetryJobs\(getDb, 100\)/);
+  assert.doesNotMatch(queueSource, /reconcileCommunityAcquisitionRecovery\(/);
 });
