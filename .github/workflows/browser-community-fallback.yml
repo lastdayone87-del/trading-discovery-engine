@@ -9,7 +9,10 @@ on:
       - 'server/browserCommunityFallback.browser.test.ts'
       - 'server/browserCommunityFallback.integration.test.ts'
       - 'server/renderedQueueIsolation.test.ts'
+      - 'server/staticTerminalNotFound.ts'
+      - 'server/staticTerminalNotFound.test.ts'
       - 'server/inspector.ts'
+      - 'server/siteProfiler.ts'
       - 'package.json'
       - 'package-lock.json'
       - 'nixpacks.toml'
@@ -32,7 +35,7 @@ jobs:
       - name: Verify Chromium is installed
         run: npx playwright install --list
       - name: Browser fallback and retry-policy regressions
-        run: node --import tsx --test server/browserCommunityFallback.test.ts server/browserCommunityFallback.browser.test.ts server/browserCommunityFallback.integration.test.ts server/renderedQueueIsolation.test.ts
+        run: node --import tsx --test server/browserCommunityFallback.test.ts server/browserCommunityFallback.browser.test.ts server/browserCommunityFallback.integration.test.ts server/renderedQueueIsolation.test.ts server/staticTerminalNotFound.test.ts
       - name: TypeScript validation
         run: npm run lint
       - name: Production build
