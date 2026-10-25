@@ -18,6 +18,7 @@ import {
   SEMANTIC_PROMPT_VERSION,
   type SemanticModelClient,
   type SemanticModelResult,
+  type SemanticObservabilityContext,
 } from './GeminiSemanticProvider';
 
 export const DEFAULT_GROQ_CANDIDATE_MODEL = 'openai/gpt-oss-120b';
@@ -679,7 +680,7 @@ export function defaultClient(
   const timeoutMs = groqTimeoutMs();
   const deadlinesEnabled = groqDeadlinesEnabled();
   const persistedCooldownExpiryMs = deps?.persistedCooldownExpiryMs ?? defaultPersistedCooldownExpiryMs;
-  return { classify: async (prompt, model) => {
+  return { classify: async (prompt, model, observability) => {
     const response = await runGroqRouteFailover(routes, async route => {
       const started = Date.now();
       const controller = new AbortController();
@@ -687,6 +688,7 @@ export function defaultClient(
       const orgId = groqRouteOrg(route);
       const base = {
         id: randomUUID(), provider: 'groq', operation: 'multilingual-semantic-classification',
+        jobId: observability?.jobId, runId: observability?.runId,
         requestMetadata: { groqRoute: route.id, groqOrg: orgId }, attempt: 1,
         reservedCost: 0, policyVersion: 'provider-resilience-v1',
       };
@@ -800,14 +802,14 @@ export function defaultClient(
   }};
 }
 
-async function classifyCandidateWith404Fallback(client: SemanticModelClient, candidatePrompt: string, candidateModel: string, fallbackModel: string) {
+async function classifyCandidateWith404Fallback(client: SemanticModelClient, candidatePrompt: string, candidateModel: string, fallbackModel: string, observability?: SemanticObservabilityContext) {
   try {
-    return { value: await client.classify(candidatePrompt, candidateModel), model: candidateModel, fallbackUsed: false };
+    return { value: await client.classify(candidatePrompt, candidateModel, observability), model: candidateModel, fallbackUsed: false };
   } catch (error) {
     const isModel404 = error instanceof ProviderCallError && error.errorClass === 'PERMANENT_INPUT' && error.status === 404;
     if (!isModel404 || candidateModel === fallbackModel) throw error;
     console.warn('[Groq Semantic] Candidate model returned 404; retrying once with configured adjudicator model.', { candidateModel, fallbackModel });
-    return { value: await client.classify(candidatePrompt, fallbackModel), model: fallbackModel, fallbackUsed: true };
+    return { value: await client.classify(candidatePrompt, fallbackModel, observability), model: fallbackModel, fallbackUsed: true };
   }
 }
 
@@ -885,8 +887,9 @@ export class GroqSemanticProvider implements EvidenceProvider {
     if (!client) return [];
     const candidateModel = process.env.GROQ_CANDIDATE_MODEL || DEFAULT_GROQ_CANDIDATE_MODEL;
     const adjudicatorModel = process.env.GROQ_ADJUDICATOR_MODEL || DEFAULT_GROQ_ADJUDICATOR_MODEL;
+    const observability = { jobId: input.job_id, runId: input.run_id };
     const candidatePrompt = buildSemanticPrompt(input, 'CANDIDATE');
-    const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel);
+    const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel, observability);
     let result = parseSemanticResult(candidate.value);
     let model = candidate.model;
     const fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
@@ -901,7 +904,7 @@ export class GroqSemanticProvider implements EvidenceProvider {
     let repairedCitations: SemanticModelResult['citations'] | null = null;
     if (isDecisiveButUncited(result)) {
       try {
-        const repaired = parseSemanticResult(await client.classify(buildCitationRepairPrompt(candidatePrompt, result, candidateDocumentRefs(input)), model));
+        const repaired = parseSemanticResult(await client.classify(buildCitationRepairPrompt(candidatePrompt, result, candidateDocumentRefs(input)), model, observability));
         const retained = retainSuppliedCitations(repaired.citations, candidateDocumentRefs(input));
         if (retained.length > 0) {
           result = { ...result, citations: retained };
@@ -922,7 +925,7 @@ export class GroqSemanticProvider implements EvidenceProvider {
     // on model-name inequality, so identical candidate/adjudicator defaults
     // still adjudicate low-confidence results.
     if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && process.env.MULTILINGUAL_ADJUDICATION_ENABLED === 'true' && !candidate.fallbackUsed) {
-      result = parseSemanticResult(await client.classify(buildSemanticPrompt(input, 'ADJUDICATION'), adjudicatorModel)); model = adjudicatorModel;
+      result = parseSemanticResult(await client.classify(buildSemanticPrompt(input, 'ADJUDICATION'), adjudicatorModel, observability)); model = adjudicatorModel;
     }
     const calibrated = calibrateSemanticConfidence(result.confidence);
     const abstained = !result.supportedLanguage || result.label === 'AMBIGUOUS' || calibrated < 50 || result.citations.length === 0;

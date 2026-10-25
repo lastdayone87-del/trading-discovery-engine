@@ -23,8 +23,14 @@ export interface SemanticModelResult {
   citations: EvidenceFieldRef[];
 }
 
+export interface SemanticObservabilityContext {
+  /** Provider-ledger attribution; never part of the prompt. */
+  jobId?: string;
+  runId?: string;
+}
+
 export interface SemanticModelClient {
-  classify(prompt: string, model: string): Promise<unknown>;
+  classify(prompt: string, model: string, observability?: SemanticObservabilityContext): Promise<unknown>;
 }
 
 export interface GeminiRoute { id: string; key: string; orgId?: string; }
@@ -179,7 +185,7 @@ function defaultClient(): SemanticModelClient | undefined {
     sdkByRoute.set(route.id, created);
     return created;
   };
-  return { classify: async (prompt, model) => {
+  return { classify: async (prompt, model, observability) => {
     // Enter through a healthy account: accounts already cooling in the
     // persisted ledger are deprioritized before any API call path, so a
     // cooling account's sibling is never pointlessly deferred. Single-org
@@ -193,7 +199,7 @@ function defaultClient(): SemanticModelClient | undefined {
     const response = await runGeminiRouteFailover(routes, async route => {
       try {
         return await executeProviderCall({
-          context: { provider: 'gemini', operation: 'multilingual-semantic-classification', requestMetadata: { geminiRoute: route.id, geminiOrg: geminiRouteOrg(route) } },
+          context: { provider: 'gemini', operation: 'multilingual-semantic-classification', jobId: observability?.jobId, runId: observability?.runId, requestMetadata: { geminiRoute: route.id, geminiOrg: geminiRouteOrg(route) } },
           timeoutMs: Number(process.env.GEMINI_PROVIDER_TIMEOUT_MS || '135000'),
           enabled: process.env.PROVIDER_DEADLINES_ENABLED !== 'false', emit: appendProviderCallEvent,
           call: (signal) => sdkFor(route).models.generateContent({ model, contents: prompt, config: { responseMimeType: 'application/json', temperature: 0, abortSignal: signal } })
@@ -290,14 +296,14 @@ export function parseSemanticResult(value: any): SemanticModelResult {
   };
 }
 
-async function classifyCandidateWith404Fallback(client: SemanticModelClient, candidatePrompt: string, candidateModel: string, fallbackModel: string) {
+async function classifyCandidateWith404Fallback(client: SemanticModelClient, candidatePrompt: string, candidateModel: string, fallbackModel: string, observability?: SemanticObservabilityContext) {
   try {
-    return { value: await client.classify(candidatePrompt, candidateModel), model: candidateModel, fallbackUsed: false };
+    return { value: await client.classify(candidatePrompt, candidateModel, observability), model: candidateModel, fallbackUsed: false };
   } catch (error) {
     const isModel404 = error instanceof ProviderCallError && error.errorClass === 'PERMANENT_INPUT' && error.status === 404;
     if (!isModel404 || candidateModel === fallbackModel) throw error;
     console.warn('[Gemini Semantic] Candidate model returned 404; retrying once with configured adjudicator model.', { candidateModel, fallbackModel });
-    return { value: await client.classify(candidatePrompt, fallbackModel), model: fallbackModel, fallbackUsed: true };
+    return { value: await client.classify(candidatePrompt, fallbackModel, observability), model: fallbackModel, fallbackUsed: true };
   }
 }
 
@@ -318,8 +324,9 @@ export class GeminiSemanticProvider implements EvidenceProvider {
     if (!client) return [];
     const candidateModel = process.env.MULTILINGUAL_CANDIDATE_MODEL || DEFAULT_MULTILINGUAL_CANDIDATE_MODEL;
     const adjudicatorModel = process.env.MULTILINGUAL_ADJUDICATOR_MODEL || DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL;
+    const observability = { jobId: input.job_id, runId: input.run_id };
     const candidatePrompt = prompt(input, 'CANDIDATE');
-    const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel);
+    const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel, observability);
     let result = parse(candidate.value);
     let model = candidate.model;
     const fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
@@ -328,7 +335,7 @@ export class GeminiSemanticProvider implements EvidenceProvider {
     // on model-name inequality, so identical candidate/adjudicator defaults
     // still adjudicate low-confidence results.
     if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && process.env.MULTILINGUAL_ADJUDICATION_ENABLED === 'true' && !candidate.fallbackUsed) {
-      result = parse(await client.classify(prompt(input, 'ADJUDICATION'), adjudicatorModel)); model = adjudicatorModel;
+      result = parse(await client.classify(prompt(input, 'ADJUDICATION'), adjudicatorModel, observability)); model = adjudicatorModel;
     }
     const calibrated = calibrateSemanticConfidence(result.confidence);
     const abstained = !result.supportedLanguage || result.label === 'AMBIGUOUS' || calibrated < 50 || result.citations.length === 0;

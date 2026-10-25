@@ -124,13 +124,21 @@ export function applyGate1CountryRejectionToExisting(
  * channels are sticky in the database, so a retry or re-enrichment cannot
  * silently become a NORMAL (official-quota) run.
  */
+export interface PipelineExecutionOptions {
+  forceExtraction?: boolean;
+  quotaOrigin?: 'NORMAL' | 'PROBE';
+  /** Observability attribution for semantic provider ledger rows. */
+  jobId?: string;
+  runId?: string;
+}
+
 export async function processChannelThroughPipeline(
   candidate: IngestionCandidate,
   targetCountry: string,
   source: DiscoverySource,
   isManualScan: boolean = false,
   isEnrichmentPass: boolean = false,
-  options?: { forceExtraction?: boolean; quotaOrigin?: 'NORMAL' | 'PROBE' }
+  options?: PipelineExecutionOptions
 ): Promise<IngestionPipelineOutcome> {
   const resolvedOrigin = await resolvePipelineQuotaOrigin(candidate, options);
   if (resolvedOrigin === 'UNKNOWN') {
@@ -161,7 +169,7 @@ async function processChannelThroughPipelineInContext(
   source: DiscoverySource,
   isManualScan: boolean = false,
   isEnrichmentPass: boolean = false,
-  options?: { forceExtraction?: boolean; quotaOrigin?: 'NORMAL' | 'PROBE' }
+  options?: PipelineExecutionOptions
 ): Promise<IngestionPipelineOutcome> {
   const now = new Date().toISOString();
   if (await getAppSetting('decision_evaluation_sampling_enabled', 'false') === 'true') {
@@ -594,6 +602,9 @@ async function processChannelThroughPipelineInContext(
   const languageInputs = classifierLanguageInputs(candidate, structuredVideos, isEnrichmentPass);
   const classifierInput:RawChannelInput={
     channel_id:candidate.channelId,channel_name:candidate.channelName,description:candidate.description||'',country:creatorCountry || undefined,
+    // Provider ledger attribution: the current job when the caller has one,
+    // otherwise the discovery job that nominated this channel.
+    job_id:options?.jobId||candidate.discoveryJobId,run_id:options?.runId||candidate.queryRunId,
     channel_entity_id:channelEntityId,channel_source_family_id:channelSourceFamilyId,
     location_tag:candidate.locationTag,external_links:candidate.channelLinks||[],external_link_details:structuredExternalLinks,
     // Language inputs resolved above (classifierLanguageInputs): enrichment

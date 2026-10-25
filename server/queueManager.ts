@@ -65,7 +65,7 @@ import './youtubeInnertubeProvider';
 import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator, replayVocabularyForRetry } from './queryIntelligence';
 import { calculateQueryFunnel, countDeferredRawResults, manualSearchContinuationMetrics, type FunnelOutcome, type QueryObservation } from './queryPerformance';
 import { resolveScopeEligibility } from './scopeEligibility';
-import { processChannelThroughPipeline, isTerminalState, applyGate1CountryRejectionToExisting } from './ingestionPipeline';
+import { processChannelThroughPipeline, isTerminalState, applyGate1CountryRejectionToExisting, type PipelineExecutionOptions } from './ingestionPipeline';
 import { evaluateLowAudienceGate } from './lowAudienceGate';
 import { resolveTerminalEnrichmentFailure } from './enrichmentLifecycle';
 import { recordEvidenceActionOutcome } from './voiEvidenceController';
@@ -853,6 +853,7 @@ export async function processNextSearchJob(
         source: DiscoverySource;
         candidate: DiscoveredChannelRaw;
         enrichmentStage?:number;
+        queryRunId?:string;
       };
       const enrichmentStage=Math.min(3,Math.max(1,Number(job.payload.enrichmentStage||1))) as 1|2|3;
       if(investigationId)candidate.investigationId=investigationId;
@@ -866,6 +867,8 @@ export async function processNextSearchJob(
       if (job.payload.probeDeferredDiscovery === true) {
         await processDiscoveredChannel(candidate, targetCountry, source, {
           forceExtraction: job.payload.forceExtraction === true || isRepairEligibleRetry(job),
+          jobId: job.id,
+          runId: typeof job.payload.queryRunId === 'string' ? job.payload.queryRunId : undefined,
         });
         await completeJob(job.id);
         return true;
@@ -1077,7 +1080,7 @@ export async function processNextSearchJob(
           // crashed after persisting the paid enrichment payload.
           await finishQuotaReservation('ENRICH_CHANNEL',job.id,true);
         }
-        const pipelineOutcome=await processChannelThroughPipeline(enriched,targetCountry,source,false,true,{forceExtraction:isRepairEligibleRetry(job)});
+        const pipelineOutcome=await processChannelThroughPipeline(enriched,targetCountry,source,false,true,{forceExtraction:isRepairEligibleRetry(job),jobId:job.id,runId:typeof job.payload.queryRunId==='string'?job.payload.queryRunId:undefined});
         if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SUCCEEDED',resultingStatus:pipelineOutcome.tradingStatus,providerCost:enrichmentQuotaUnits,latencyMs:Date.now()-evidenceStartedAt,reasonCode:pipelineOutcome.tradingStatus==='UNCERTAIN'||pipelineOutcome.tradingStatus==='NEEDS_REVIEW'?'EVIDENCE_DID_NOT_RESOLVE':'DECISION_RESOLVED'}).catch(()=>undefined);
         if(quotaReserved)await finishQuotaReservation('ENRICH_CHANNEL',job.id,true);
         if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:pipelineOutcome.tradingStatus,output:{channelId:pipelineOutcome.channelId,tradingStatus:pipelineOutcome.tradingStatus,countryStatus:pipelineOutcome.countryStatus}});else await completeJob(job.id);
@@ -1666,7 +1669,7 @@ export async function processDiscoveredChannel(
   raw: DiscoveredChannelRaw,
   targetCountry: string,
   source: DiscoverySource,
-  options?: { forceExtraction?: boolean }
+  options?: PipelineExecutionOptions
 ): Promise<ProcessDiscoveredChannelOutcome> {
   return processChannelThroughPipeline(raw, targetCountry, source, false, false, options);
 }
