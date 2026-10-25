@@ -8,7 +8,12 @@
  * Usage (inside the application environment, where DATABASE_URL is set):
  *
  *   MONITOR_ONCE=1 npx tsx scripts/youtubeKeyCapStopMonitor.ts
- *   END_EPOCH=1792998000 ALERT_ONLY=1 npx tsx scripts/youtubeKeyCapStopMonitor.ts
+ *   END_EPOCH=1793036400 MONITOR_SINCE_EPOCH=1792998000 ALERT_ONLY=1 \
+ *     npx tsx scripts/youtubeKeyCapStopMonitor.ts
+ *
+ * MONITOR_SINCE_EPOCH is the reset epoch. It bounds the rolling secondary
+ * signals so quota-blocked jobs from before the reset cannot stop the first
+ * post-reset sample.
  *
  * The monitor is deliberately conservative: if it cannot read the durable
  * counter or the health endpoint twice in a row, it stops rather than assuming
@@ -22,6 +27,7 @@ import { getYouTubeQuotaDay } from '../server/youtubeQuotaDay';
 import { readYouTubeKeyCapRefusalSummary } from '../server/quotaKeyCapRefusals';
 import {
   evaluateDurableKeyCapMonitorSample,
+  monitorSecondaryWindowStart,
   type KeyCapMonitorState,
 } from '../server/youtubeKeyCapStopRule';
 
@@ -32,6 +38,7 @@ const INTERVAL_MS = Math.max(5_000, Number(process.env.YOUTUBE_KEY_CAP_MONITOR_I
 const END_EPOCH = Number(process.env.END_EPOCH) || 0;
 const ALERT_ONLY = process.env.ALERT_ONLY === '1';
 const ONCE = process.env.MONITOR_ONCE === '1';
+const SINCE_EPOCH = Number(process.env.MONITOR_SINCE_EPOCH) || 0;
 const HEALTH_URL = process.env.APP_HEALTH_URL || 'http://127.0.0.1:3000/api/health';
 const MAX_SEARCH_PENDING = Number(process.env.MONITOR_MAX_SEARCH_PENDING) || 75;
 const MAX_ENRICH_PENDING = Number(process.env.MONITOR_MAX_ENRICH_PENDING) || 450;
@@ -108,18 +115,20 @@ async function readHealth(): Promise<{ http: number; ready: boolean }> {
 
 async function readSecondarySignals(): Promise<SecondarySignals> {
   const db = await getDb();
+  const windowStart = monitorSecondaryWindowStart(Date.now(), SINCE_EPOCH);
   const result = await db.query(
     `SELECT
        (SELECT COUNT(*) FROM job_attempts
-         WHERE finished_at > now()-interval '1 hour'
+         WHERE finished_at > $1
            AND error LIKE '%YOUTUBE_KEY_CAP_UNAVAILABLE%')::int AS cap_unavailable,
        ((SELECT COUNT(*) FROM job_attempts
-          WHERE finished_at > now()-interval '1 hour'
+          WHERE finished_at > $1
             AND (error LIKE '%QUOTA_ALLOCATION_EXHAUSTED%'
                  OR error LIKE '%quota allocation is exhausted%'))
         + (SELECT COUNT(*) FROM jobs
-            WHERE updated_at > now()-interval '1 hour'
+            WHERE updated_at > $1
               AND last_error LIKE '%quota allocation is exhausted%'))::int AS quota_exhausted`,
+    [windowStart],
   );
   return {
     capUnavailable: Number(result.rows[0]?.cap_unavailable) || 0,

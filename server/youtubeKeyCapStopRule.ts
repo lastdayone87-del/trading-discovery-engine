@@ -79,6 +79,24 @@ export function evaluateYouTubeKeyCapStopRule(sample: KeyCapStopSample): KeyCapS
   return { stop: false, reason: null, detail };
 }
 
+/**
+ * Lower bound for the rolling secondary signals (cap-unavailable and
+ * quota-exhausted). At a Pacific quota reset, pass the reset epoch so jobs
+ * blocked before the reset are not mistaken for a new post-reset spike. The
+ * normal window is one hour and can never start earlier than that.
+ */
+export function monitorSecondaryWindowStart(
+  nowMs: number,
+  sinceEpochSeconds: number,
+): Date {
+  const oneHourAgo = nowMs - 3_600_000;
+  const sinceMs = Number.isFinite(sinceEpochSeconds) && sinceEpochSeconds > 0
+    ? sinceEpochSeconds * 1000
+    : oneHourAgo;
+  // A clock-skewed future epoch must not hide events; clamp to now.
+  return new Date(Math.min(nowMs, Math.max(oneHourAgo, sinceMs)));
+}
+
 export function initialKeyCapMonitorState(quotaDay: string): KeyCapMonitorState {
   return { quotaDay, capExceeded: 0, stopReason: null, stopAt: null };
 }

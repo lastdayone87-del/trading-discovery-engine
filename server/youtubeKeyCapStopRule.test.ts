@@ -7,6 +7,7 @@ import {
   evaluateDurableKeyCapMonitorSample,
   evaluateYouTubeKeyCapStopRule,
   initialKeyCapMonitorState,
+  monitorSecondaryWindowStart,
 } from './youtubeKeyCapStopRule';
 
 test('corrected stop rule counts both cap codes and keeps the unavailable guard', () => {
@@ -108,4 +109,17 @@ test('Pacific quota reset starts a new day at zero and clears yesterday stop sta
   );
   assert.equal(newDayStop.verdict.stop, true);
   assert.equal(newDayStop.shouldWriteStop, true);
+});
+
+test('secondary-signal window honors the quota-reset epoch and the one-hour floor', () => {
+  const now = Date.parse('2026-10-26T07:05:00.000Z');
+  // Reset at 07:00Z: the first post-reset sample counts only post-reset events.
+  assert.equal(monitorSecondaryWindowStart(now, 1792998000).toISOString(), '2026-10-26T07:00:00.000Z');
+  // An older epoch cannot widen the window beyond one hour.
+  assert.equal(monitorSecondaryWindowStart(now, 1792990000).toISOString(), '2026-10-26T06:05:00.000Z');
+  // Absent/invalid epoch falls back to the normal one-hour window.
+  assert.equal(monitorSecondaryWindowStart(now, 0).toISOString(), '2026-10-26T06:05:00.000Z');
+  assert.equal(monitorSecondaryWindowStart(now, Number.NaN).toISOString(), '2026-10-26T06:05:00.000Z');
+  // A future epoch is clamped to now, never beyond it.
+  assert.equal(monitorSecondaryWindowStart(now, 1792998000 + 3600).toISOString(), '2026-10-26T07:05:00.000Z');
 });
