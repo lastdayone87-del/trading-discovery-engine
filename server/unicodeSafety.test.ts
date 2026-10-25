@@ -13,6 +13,27 @@ function hasUnpairedSurrogate(value: string): boolean {
   return /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(value);
 }
 
+function collectStrings(value: unknown, out: string[] = []): string[] {
+  if (typeof value === 'string') out.push(value);
+  else if (Array.isArray(value)) for (const item of value) collectStrings(item, out);
+  else if (value && typeof value === 'object') {
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      out.push(key);
+      collectStrings(item, out);
+    }
+  }
+  return out;
+}
+
+/** JSON.parse accepts escaped lone surrogates, so parsing alone cannot prove
+ * PostgreSQL will accept the value. Every decoded string must be well formed. */
+function assertWellFormedJson(json: unknown, label: string): void {
+  const parsed = JSON.parse(String(json));
+  for (const value of collectStrings(parsed)) {
+    assert.ok(!hasUnpairedSurrogate(value), `${label} contains an unpaired surrogate: ${JSON.stringify(value)}`);
+  }
+}
+
 test('toWellFormedString replaces only unpaired surrogates', () => {
   assert.equal(toWellFormedString(`a${LONE_HIGH}b`), 'a\uFFFDb');
   assert.equal(toWellFormedString(`a${LONE_LOW}b`), 'a\uFFFDb');
@@ -50,6 +71,7 @@ test('stringifyWellFormedJson emits parseable JSON without surrogate escapes', (
   assert.ok(!/\\udcca|\\ud800/i.test(json));
   assert.ok(json.includes(VALID_PAIR));
   assert.doesNotThrow(() => JSON.parse(json));
+  assertWellFormedJson(json, 'stringifyWellFormedJson');
   assert.ok(!hasUnpairedSurrogate(json));
 });
 
@@ -100,14 +122,18 @@ test('writeChannelUpsert normalizes unpaired surrogates at the database boundary
   const trail = String(captured[14]);
   assert.ok(!/\\udcca/i.test(trail));
   assert.ok(trail.includes('\uFFFD'));
-  assert.doesNotThrow(() => JSON.parse(trail));
-  assert.doesNotThrow(() => JSON.parse(String(captured[18])));
-  assert.doesNotThrow(() => JSON.parse(String(captured[22])));
-  assert.doesNotThrow(() => JSON.parse(String(captured[46])));
+  assertWellFormedJson(trail, 'inspection_trail');
+  assertWellFormedJson(captured[18], 'quality_breakdown');
+  assertWellFormedJson(captured[22], 'trading_relevance_breakdown');
+  assertWellFormedJson(captured[46], 'community_intents');
 });
 
-test('country boundary recovery serializes trails through the Unicode-safe helper', () => {
+test('country boundary recovery serializes every trail write through the Unicode-safe helper', () => {
   const source = readFileSync(new URL('./countryBoundaryRecovery.ts', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /JSON\.stringify\(channel\.inspection_trail\)/);
-  assert.match(source, /stringifyWellFormedJson\(channel\.inspection_trail\)/);
+  // Both the INSERT and UPDATE recovery branches must normalize, not just one.
+  const safeWrites = source.match(/stringifyWellFormedJson\(channel\.inspection_trail\)/g) || [];
+  assert.equal(safeWrites.length, 2);
+  assert.match(source, /INSERT INTO channels[\s\S]{0,1600}stringifyWellFormedJson\(channel\.inspection_trail\)/);
+  assert.match(source, /UPDATE channels SET[\s\S]{0,500}stringifyWellFormedJson\(channel\.inspection_trail\)/);
 });
