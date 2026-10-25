@@ -26,16 +26,15 @@ export interface YouTubeKeyCapSecondarySignals {
 
 export const READ_SECONDARY_SIGNALS_SQL = `
 SELECT
-  (SELECT COUNT(*) FROM job_attempts
-    WHERE finished_at > $1
-      AND error LIKE '%YOUTUBE_KEY_CAP_UNAVAILABLE%')::int AS cap_unavailable,
-  (SELECT COUNT(*) FROM job_attempts
-    WHERE finished_at > $1
-      AND (error LIKE '%QUOTA_ALLOCATION_EXHAUSTED%'
-           OR error LIKE '%YOUTUBE_QUOTA_EXCEEDED%'
-           OR error ILIKE '%quota allocation is exhausted%'
-           OR error ILIKE '%quotaExceeded%'
-           OR error ILIKE '%dailyLimitExceeded%'))::int AS quota_exhausted
+  COUNT(*) FILTER (WHERE error LIKE '%YOUTUBE_KEY_CAP_UNAVAILABLE%')::int AS cap_unavailable,
+  COUNT(*) FILTER (WHERE error LIKE '%QUOTA_ALLOCATION_EXHAUSTED%'
+                      OR error LIKE '%YOUTUBE_QUOTA_EXCEEDED%'
+                      OR error ILIKE '%quota allocation is exhausted%'
+                      OR error ILIKE '%quotaExceeded%'
+                      OR error ILIKE '%dailyLimitExceeded%')::int AS quota_exhausted
+  FROM job_attempts
+ WHERE finished_at > $1
+   AND error IS NOT NULL
 `;
 
 export async function readYouTubeKeyCapSecondarySignals(

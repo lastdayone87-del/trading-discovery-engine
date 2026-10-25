@@ -1008,6 +1008,7 @@ export async function searchYouTubeChannelPage(
   await recordExecutionStage('PROVIDER_ACQUISITION','REACHED',{provider:'youtube',configuredKeys:keyPool.length});
   const acquisition = youtubePoolBackoff.beginAcquisition();
   let quotaExceededCount = 0;
+  let providerQuotaExceededCount = 0;
   let attemptedKeyCount = 0;
 
   try { if (keyPool.length > 0) {
@@ -1055,6 +1056,10 @@ export async function searchYouTubeChannelPage(
         // A probe refusal is a single day-wide bucket, not a key failure.
         if(isProbeQuotaControlError(e))throw e;
         recordProviderFailure(apiKey, e);
+        // Local key-cap refusals are classified as quota exhaustion so the
+        // pool rotates, but they never reached YouTube. Only real provider
+        // quota responses may feed the independent provider-quota stop guard.
+        if (isProviderQuotaFailure(e)) providerQuotaExceededCount++;
         if (isQuotaExceeded(e)) quotaExceededCount++;
         console.warn(`[YouTube API Pool] Key #${currentIndex + 1} fetch error:`, e);
       }
@@ -1064,8 +1069,24 @@ export async function searchYouTubeChannelPage(
     console.warn('[YouTube API Pool] All API keys in pool encountered quotaExceeded or error or returned no results.');
   }
 
-  throw buildYouTubeDiscoveryTerminalError(quotaExceededCount, attemptedKeyCount);
+  throw buildYouTubeDiscoveryTerminalError(providerQuotaExceededCount, attemptedKeyCount);
   } finally { acquisition.release(); }
+}
+
+/**
+ * True only for actual provider quota responses. Local key-cap refusals are
+ * also classified as quota exhaustion by `isQuotaExceeded` so callers rotate
+ * to another key, but they never reached YouTube and must not feed the
+ * independent provider-quota stop guard. Wrapped causes are inspected because
+ * provider calls may preserve the original control error there.
+ */
+export function isProviderQuotaFailure(error: unknown): boolean {
+  if (!isQuotaExceeded(error)) return false;
+  let current: any = error;
+  for (let depth = 0; current && depth < 5; depth++, current = current.cause) {
+    if (isYouTubeKeyCapError(current)) return false;
+  }
+  return true;
 }
 
 /**
@@ -1075,14 +1096,14 @@ export async function searchYouTubeChannelPage(
  * cap monitor could not count the provider quota failures.
  */
 export function buildYouTubeDiscoveryTerminalError(
-  quotaExceededCount: number,
+  providerQuotaExceededCount: number,
   attemptedKeys: number,
 ): Error {
-  const quotaExhausted = attemptedKeys > 0 && quotaExceededCount === attemptedKeys;
+  const quotaExhausted = attemptedKeys > 0 && providerQuotaExceededCount === attemptedKeys;
   const error = new Error(quotaExhausted
     ? 'All configured YouTube API keys reported quota exhaustion for this discovery request.'
     : 'All configured YouTube API keys failed for this discovery request.');
-  if (quotaExceededCount > 0) {
+  if (providerQuotaExceededCount > 0) {
     Object.assign(error, { quotaExceeded: true, providerReasons: ['quotaExceeded'] });
   }
   return error;

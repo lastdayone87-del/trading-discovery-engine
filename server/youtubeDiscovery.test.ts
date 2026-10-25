@@ -4,8 +4,10 @@ import {
   buildYouTubeDiscoveryTerminalError,
   buildYouTubeProvidersCoolingDownError,
   extractDiscoveredChannels,
+  isProviderQuotaFailure,
 } from './youtube';
 import { youtubeProviderCooldown } from './youtubeProviderCooldown';
+import { YouTubeKeyCapExceededError } from './quotaKeyCapShadow';
 import { persistedJobFailureMessage } from './db';
 
 test('video lane extracts unique channels and retains matching video evidence', () => {
@@ -52,6 +54,21 @@ test('discovery terminal error preserves provider quota metadata', () => {
   };
   assert.equal(none.quotaExceeded, undefined);
   assert.equal(none.providerReasons, undefined);
+  assert.equal(persistedJobFailureMessage(none), none.message, 'local refusals are not provider quota');
+});
+
+test('local key-cap refusals do not count as provider quota failures', () => {
+  const localCap = new YouTubeKeyCapExceededError('2026-10-26', 'fp-local', 8_990, 100);
+  assert.equal(isProviderQuotaFailure(localCap), false);
+
+  const wrappedLocalCap = Object.assign(new Error('wrapped admission refusal'), { cause: localCap });
+  assert.equal(isProviderQuotaFailure(wrappedLocalCap), false);
+
+  const providerQuota = Object.assign(new Error('YouTube HTTP 403 (quotaExceeded)'), {
+    quotaExceeded: true,
+  });
+  assert.equal(isProviderQuotaFailure(providerQuota), true);
+  assert.equal(isProviderQuotaFailure(new Error('YouTube HTTP 503')), false);
 });
 
 test('full key-pool quota exhaustion preserves a countable quota signal', () => {

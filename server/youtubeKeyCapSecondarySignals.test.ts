@@ -1,9 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {
-  READ_SECONDARY_SIGNALS_SQL,
-  readYouTubeKeyCapSecondarySignals,
-} from './youtubeKeyCapSecondarySignals';
+import { readYouTubeKeyCapSecondarySignals } from './youtubeKeyCapSecondarySignals';
 
 test('secondary signals use the attempt ledger only and match structured/provider quota codes', async () => {
   let text = '';
@@ -27,7 +24,10 @@ test('secondary signals use the attempt ledger only and match structured/provide
   assert.match(text, /YOUTUBE_QUOTA_EXCEEDED/);
   assert.match(text, /quotaExceeded/);
   assert.match(text, /dailyLimitExceeded/);
-  assert.match(READ_SECONDARY_SIGNALS_SQL, /finished_at > \$1/);
+  assert.match(text, /COUNT\(\*\) FILTER/);
+  assert.equal((text.match(/FROM job_attempts/g) || []).length, 1, 'one scan per sample');
+  assert.match(text, /finished_at > \$1/);
+  assert.match(text, /error IS NOT NULL/);
 });
 
 test('secondary signal reads normalize missing and non-numeric counts to zero', async () => {
