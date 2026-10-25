@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 // The analytics implementation lives in dbCore.ts; db.ts is only the public
-// re-export facade. Reading the facade made this contract silently vacuous.
+// re-export facade. Reading the facade pointed these assertions at a file with
+// no SQL at all, so they failed instead of protecting the query.
 const source = fs.readFileSync(path.join(process.cwd(), 'server/dbCore.ts'), 'utf8');
 
 test('creator-size neighborhood analytics casts JSONB path keys to TEXT', () => {
