@@ -90,6 +90,7 @@ import { createReadinessState, launchAfterReadiness } from './server/startupLife
 import { resolveBuildInfo } from './server/buildInfo';
 import { operationsTelemetrySnapshot } from './server/operationsTelemetry';
 import { getCommunityRetryWorkerHealth } from './server/operationalMaintenanceWorkers';
+import { getOperationalMaintenanceSchedulerHealth } from './server/operationalMaintenanceScheduler';
 import { dryRunCountryBoundaryCohort, enqueueCountryBoundaryCohort, COUNTRY_BOUNDARY_RECOVERY_VERSION } from './server/countryBoundaryRecovery';
 import { browserCapabilitySnapshot, startBrowserCapabilityMonitor } from './server/browserCapability';
 import { assertProductionCountryArchitecture } from './server/productionCountryArchitecture';
@@ -564,7 +565,14 @@ async function startServer() {
     try {
       const queues = await getQueueStatus();
       const quota = await getQuota();
-      res.json({ queues, quota, maintenance: { communityRetry: getCommunityRetryWorkerHealth() } });
+      res.json({
+        queues,
+        quota,
+        maintenance: {
+          communityRetry: getCommunityRetryWorkerHealth(),
+          operational: getOperationalMaintenanceSchedulerHealth()
+        }
+      });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }

@@ -4,7 +4,8 @@ import {
   completeJob,
   failJob,
   finishQuotaReservation,
-  getQueueStatus,
+  getProductionBacklogDepth,
+  getQueueStatusFresh,
   getYouTubeKeyPool,
   heartbeatJob
 } from './db';
@@ -32,8 +33,10 @@ const RECOVERY_MAX_PRODUCTION_BACKLOG = Math.max(
 );
 
 export async function isRecoveryAdmissionOpen(): Promise<boolean> {
-  const queue = await getQueueStatus();
-  const productionBacklog = queue.searchJobs.depth + queue.channelProcessing.depth;
+  // Admission must not use the brief status cache: a production job can arrive
+  // between the cached snapshot and the recovery claim. One aggregate query
+  // keeps the fresh check lightweight.
+  const productionBacklog = await getProductionBacklogDepth();
   const providerKeys = getYouTubeKeyPool();
   const providerPoolCooling = providerKeys.length === 0
     || youtubeProviderCooldown.earliestRetryAtIfAllCooling(providerKeys) !== null;
@@ -123,7 +126,9 @@ function startCommunityRetryWorker(workerId: string): void {
         communityRetryHealth.lastOutcome = 'CLAIMED';
       } else {
         communityRetryHealth.noWork += 1;
-        const admission = (await getQueueStatus()).communityRetry;
+        // The claim attempt just changed queue state; diagnose from a fresh
+        // read rather than the snapshot taken before the claim.
+        const admission = (await getQueueStatusFresh()).communityRetry;
         if (admission.dueBrowserBlocked > 0) communityRetryHealth.lastOutcome = 'DUE_BUT_BROWSER_UNAVAILABLE';
         else if (admission.dueReconciliationBlocked > 0) communityRetryHealth.lastOutcome = 'DUE_BUT_RECONCILIATION_BLOCKED';
         else if (admission.dueClaimable > 0) communityRetryHealth.lastOutcome = 'DUE_BUT_CLAIM_RACE';

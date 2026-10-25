@@ -19,6 +19,16 @@ test('community retry distinguishes due admission blockers from a genuinely empt
   assert.match(workers, /communityRetry/);
 });
 
+test('recovery admission and retry diagnosis bypass the brief queue-status cache', () => {
+  const dbCore = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
+  assert.match(workers, /getProductionBacklogDepth\(\)/);
+  assert.match(workers, /getQueueStatusFresh\(\)\)\.communityRetry/);
+  assert.match(dbCore, /export async function getQueueStatusFresh/);
+  assert.match(dbCore, /export async function getProductionBacklogDepth/);
+  assert.match(dbCore, /COUNT\(\*\)::int AS count FROM jobs WHERE status IN \('PENDING','PROCESSING'\)/);
+  assert.doesNotMatch(workers, /getQueueStatus\(\)/);
+});
+
 test('queue status exposes browser-blocked and claimable due retry counts', () => {
   const dbCore = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
   assert.match(dbCore, /due_browser_blocked/);

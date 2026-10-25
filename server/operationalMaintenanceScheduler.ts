@@ -37,6 +37,9 @@ export interface OperationalMaintenanceSnapshot {
   inFlight: boolean;
   lastTickAt: string | null;
   lastError: string | null;
+  stalled: boolean;
+  runStartedAt: string | null;
+  lastStallAt: string | null;
 }
 
 export interface OperationalMaintenanceScheduler {
@@ -51,6 +54,10 @@ export interface OperationalMaintenanceSchedulerOptions {
   now?: () => number;
   setTimer?: (callback: () => void, delayMs: number) => unknown;
   clearTimer?: (timer: unknown) => void;
+  /** Warn when a single sweep remains in flight longer than this. */
+  watchdogMs?: number;
+  setWatchdog?: (callback: () => void, delayMs: number) => unknown;
+  clearWatchdog?: (timer: unknown) => void;
 }
 
 function errorMessage(error: unknown): string {
@@ -69,15 +76,59 @@ export function createOperationalMaintenanceScheduler(
     return timer;
   });
   const clearTimer = options.clearTimer ?? ((timer: unknown) => clearTimeout(timer as NodeJS.Timeout));
+  const watchdogMs = options.watchdogMs ?? Math.max(intervalMs * 6, 60_000);
+  const setWatchdog = options.setWatchdog ?? ((callback: () => void, delayMs: number) => {
+    const timer = setTimeout(callback, delayMs);
+    timer.unref?.();
+    return timer;
+  });
+  const clearWatchdog = options.clearWatchdog ?? ((timer: unknown) => clearTimeout(timer as NodeJS.Timeout));
 
   let started = false;
   let inFlight: Promise<void> | null = null;
   let timer: unknown = null;
+  let watchdogTimer: unknown = null;
+  let runStartedAtMs: number | null = null;
   let lastStaleChannelLockRecoveryMs: number | null = null;
   let ticks = 0;
   let failures = 0;
   let lastTickAt: string | null = null;
   let lastError: string | null = null;
+  let stalled = false;
+  let lastStallAt: string | null = null;
+
+  const snapshot = (): OperationalMaintenanceSnapshot => ({
+    started,
+    ticks,
+    failures,
+    inFlight: inFlight !== null,
+    lastTickAt,
+    lastError,
+    stalled,
+    runStartedAt: runStartedAtMs === null ? null : new Date(runStartedAtMs).toISOString(),
+    lastStallAt
+  });
+
+  const disarmWatchdog = (): void => {
+    if (watchdogTimer === null) return;
+    clearWatchdog(watchdogTimer);
+    watchdogTimer = null;
+  };
+
+  // The tick timer is only re-armed after a sweep settles, so a hung sweep
+  // would otherwise stop maintenance silently. The watchdog is independent of
+  // the tick timer and keeps warning while the same sweep remains in flight.
+  const armWatchdog = (): void => {
+    if (!started || watchdogTimer !== null) return;
+    watchdogTimer = setWatchdog(() => {
+      watchdogTimer = null;
+      if (!started || inFlight === null) return;
+      stalled = true;
+      lastStallAt = new Date(now()).toISOString();
+      console.error(`[Operational Maintenance] sweep still in flight after ${watchdogMs}ms`, snapshot());
+      armWatchdog();
+    }, watchdogMs);
+  };
 
   const recordFailure = (name: string, error: unknown, log = true): void => {
     failures += 1;
@@ -134,9 +185,17 @@ export function createOperationalMaintenanceScheduler(
     pending = Promise.resolve()
       .then(execute)
       .finally(() => {
-        if (inFlight === pending) inFlight = null;
+        if (inFlight === pending) {
+          inFlight = null;
+          runStartedAtMs = null;
+          stalled = false;
+          disarmWatchdog();
+        }
       });
     inFlight = pending;
+    runStartedAtMs = now();
+    stalled = false;
+    armWatchdog();
     return pending;
   };
 
@@ -157,18 +216,14 @@ export function createOperationalMaintenanceScheduler(
 
   const stop = (): void => {
     started = false;
+    disarmWatchdog();
     if (timer !== null) {
       clearTimer(timer);
       timer = null;
     }
   };
 
-  return {
-    run,
-    start,
-    stop,
-    snapshot: () => ({ started, ticks, failures, inFlight: inFlight !== null, lastTickAt, lastError })
-  };
+  return { run, start, stop, snapshot };
 }
 
 function createDefaultDependencies(): OperationalMaintenanceDependencies {
@@ -215,4 +270,9 @@ const operationalMaintenanceScheduler = createOperationalMaintenanceScheduler(cr
 
 export function startOperationalMaintenanceScheduler(): void {
   operationalMaintenanceScheduler.start();
+}
+
+/** Aggregate health for the queue-status endpoint; contains no job payloads. */
+export function getOperationalMaintenanceSchedulerHealth(): OperationalMaintenanceSnapshot {
+  return operationalMaintenanceScheduler.snapshot();
 }

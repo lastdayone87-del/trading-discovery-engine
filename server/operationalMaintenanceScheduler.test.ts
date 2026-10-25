@@ -52,6 +52,9 @@ test('one maintenance run executes every recovery task in order', async () => {
   assert.equal(snapshot.inFlight, false);
   assert.equal(snapshot.lastError, null);
   assert.equal(snapshot.lastTickAt, new Date(1_000_000).toISOString());
+  assert.equal(snapshot.stalled, false);
+  assert.equal(snapshot.runStartedAt, null);
+  assert.equal(snapshot.lastStallAt, null);
 });
 
 test('one failing task does not suppress the remaining recovery guarantees', async () => {
@@ -90,6 +93,55 @@ test('a failing stale channel lock sweep logs once and still backs off', async (
   assert.match(String(errors[0][0]), /stale_channel_lock_recovery_failed/);
   assert.match(scheduler.snapshot().lastError || '', /stale_channel_lock_recovery: locks failed/);
   assert.deepEqual(calls, ALL_TASKS, 'the remaining recovery tasks still run');
+});
+
+test('a hung sweep is reported by the watchdog and remains visible in health', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const { calls, dependencies } = createDeps();
+  dependencies.recoverStaleChannelLocks = async () => {
+    calls.push('locks');
+    await gate;
+  };
+  const watchdogCallbacks: Array<() => void> = [];
+  const scheduler = createOperationalMaintenanceScheduler(dependencies, {
+    intervalMs: 10,
+    now: () => 7_000_000,
+    setTimer: () => 0,
+    clearTimer: () => undefined,
+    watchdogMs: 100,
+    setWatchdog: callback => {
+      watchdogCallbacks.push(callback);
+      return watchdogCallbacks.length;
+    },
+    clearWatchdog: () => undefined
+  });
+  const errors: unknown[][] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args); };
+  try {
+    scheduler.start();
+    await flush();
+    const pending = scheduler.run();
+    assert.equal(scheduler.snapshot().inFlight, true);
+    assert.equal(scheduler.snapshot().runStartedAt, new Date(7_000_000).toISOString());
+    assert.ok(watchdogCallbacks.length >= 1, 'a watchdog is armed for the sweep');
+
+    watchdogCallbacks[0]();
+    assert.equal(scheduler.snapshot().stalled, true);
+    assert.equal(scheduler.snapshot().lastStallAt, new Date(7_000_000).toISOString());
+    assert.match(String(errors[0][0]), /sweep still in flight/);
+
+    release();
+    await pending;
+    assert.equal(scheduler.snapshot().inFlight, false);
+    assert.equal(scheduler.snapshot().stalled, false);
+    assert.equal(scheduler.snapshot().runStartedAt, null);
+    assert.deepEqual(calls, ALL_TASKS);
+  } finally {
+    console.error = originalError;
+    scheduler.stop();
+  }
 });
 
 test('overlapping runs coalesce into the in-flight sweep', async () => {
@@ -188,4 +240,10 @@ test('maintenance is started exactly once after database readiness', () => {
   const startup = readFileSync(new URL('./startupLifecycle.ts', import.meta.url), 'utf8');
   assert.equal(workers.match(/startOperationalMaintenanceScheduler\(\)/g)?.length, 1);
   assert.match(startup, /markDatabaseReady[\s\S]*startOperationalMaintenanceWorkers\(\)/);
+});
+
+test('maintenance health is exposed on the queue status endpoint', () => {
+  const server = readFileSync(new URL('../server.ts', import.meta.url), 'utf8');
+  assert.match(server, /getOperationalMaintenanceSchedulerHealth/);
+  assert.match(server, /operational: getOperationalMaintenanceSchedulerHealth\(\)/);
 });

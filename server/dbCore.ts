@@ -972,6 +972,23 @@ export async function getQueueStatus(): Promise<QueueStatus> {
   return queueStatusCache.get();
 }
 
+/** Uncached status read for diagnostics that must reflect post-claim state. */
+export async function getQueueStatusFresh(): Promise<QueueStatus> {
+  return loadQueueStatus();
+}
+
+/**
+ * Fresh production-depth read for recovery admission. This deliberately
+ * bypasses the brief status cache: recovery work must not be admitted from a
+ * backlog snapshot taken before newly arrived production jobs. The type set
+ * matches the searchJobs + channelProcessing depths reported by queue status.
+ */
+export async function getProductionBacklogDepth(): Promise<number> {
+  const db=await getDb();
+  const res=await db.query(`SELECT COUNT(*)::int AS count FROM jobs WHERE status IN ('PENDING','PROCESSING') AND type IN ('SEARCH_YOUTUBE','MANUAL_SEARCH_PAGE','AUTONOMOUS_DISCOVERY_CYCLE','PROCESS_CHANNEL','ENRICH_CHANNEL')`);
+  return Number(res.rows[0]?.count||0);
+}
+
 export async function toggleQueuePause(queueName:string,isPaused:boolean):Promise<void>{
   const db=await getDb();
   await db.query('INSERT INTO queue_controls(queue_name,is_paused) VALUES($1,$2) ON CONFLICT(queue_name) DO UPDATE SET is_paused=excluded.is_paused',[queueName,isPaused]);
