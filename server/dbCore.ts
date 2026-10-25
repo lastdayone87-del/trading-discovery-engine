@@ -303,6 +303,22 @@ function normalizeQueryText(value: string): string {
   return value.normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('en');
 }
 
+/**
+ * Migration 157 adopts an index that production already has. If the index is
+ * absent on a populated database, build it concurrently before the
+ * transactional migration loop runs. CREATE INDEX CONCURRENTLY cannot run
+ * inside a transaction, and this call happens before the loop's BEGIN.
+ */
+async function ensureJobsChannelPayloadIndex(client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> }): Promise<void> {
+  const index = await client.query(`SELECT to_regclass('public.idx_jobs_channel_payload') AS oid`);
+  if (index.rows[0]?.oid) return;
+  const jobs = await client.query(`SELECT to_regclass('public.jobs') AS oid`);
+  if (!jobs.rows[0]?.oid) return;
+  const populated = await client.query(`SELECT EXISTS(SELECT 1 FROM public.jobs LIMIT 1) AS populated`);
+  if (!populated.rows[0]?.populated) return;
+  await client.query(`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_channel_payload ON public.jobs USING btree (((payload ->> 'channelId'::text)))`);
+}
+
 export async function runMigrations(): Promise<Array<{ version: number; name: string; applied_at: string }>> {
   const db = pool || new Pool({ connectionString: requireDatabaseUrl(), ssl: process.env.PGSSL === 'disable' ? false : process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined });
   const client = await db.connect();
@@ -317,6 +333,12 @@ export async function runMigrations(): Promise<Array<{ version: number; name: st
     if (!migrationTable.rows[0]?.oid) {
       await client.query(`CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
     }
+    // Migration 157 must never take a write-blocking build on a populated
+    // jobs table. Ensure the index concurrently before the transactional
+    // migration loop; the migration itself only adopts it or verifies an
+    // empty table.
+    const migration157 = await client.query('SELECT 1 FROM schema_migrations WHERE version=157');
+    if (!migration157.rowCount) await ensureJobsChannelPayloadIndex(client);
     const files = fs.readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith('.sql')).sort();
     const versions=new Map<number,string>();
     for(const file of files){const version=Number(file.split('_')[0]);const previous=versions.get(version);if(previous)throw new Error(`Duplicate migration version ${version}: ${previous} and ${file}`);versions.set(version,file);}
