@@ -35,6 +35,7 @@ import {
   extractYouTubeQuarantineInput,
   isYouTubeInputFailure,
   isYouTubePageTokenFailure,
+  isYouTubePermanentInputError,
   isYouTubeQuotaAccountingError,
   normalizeYouTubeQuarantineInput,
   retryYouTubeQuotaAccounting,
@@ -43,6 +44,7 @@ import {
   shouldClearYouTubeSuspension,
   youtubeDeploymentId,
   type YouTubeQuarantineInputKind,
+  YouTubePermanentInputError,
   YouTubeQuotaAccountingError,
 } from './youtubeKeyHealth';
 import { executeProviderCall, ProviderCallError } from './providerResilience';
@@ -228,6 +230,8 @@ export async function fetchYouTubeFeaturedChannels(sourceChannelId: string, maxi
         // budget. Trying another key cannot succeed and would only repeat the
         // same refusal.
         if (isProbeQuotaControlError(error)) throw error;
+        // A permanent invalid input fails identically on every key.
+        if (isYouTubePermanentInputError(error)) throw error;
         recordProviderFailure(apiKey, error);
         if (isQuotaExceeded(error)) quotaExceededCount++;
         if (attempt === providerIndexes.length - 1) {
@@ -252,7 +256,7 @@ export async function fetchYouTubePlaylistChannels(playlistId:string,limit:numbe
     for(let attempt=0;attempt<providerIndexes.length;attempt++){const index=providerIndexes[attempt];let responseAccounted=false;
       try{const url=buildYouTubeApiUrl('playlistItems',keys[index],{part:'snippet',playlistId,maxResults});const response=await youtubeFetch(url,'playlist-items',1,attempt+1,acquisition,'enrichment',keys[index]);await accountYouTubeQuotaResponse(response, 1);responseAccounted=true;const data=await readYouTubeJsonObject(response, 'playlist-items');
         return (data.items||[]).map((item:any)=>({channelId:String(item.snippet?.videoOwnerChannelId||''),channelName:String(item.snippet?.videoOwnerChannelTitle||''),description:String(item.snippet?.description||''),videoTitles:[String(item.snippet?.title||'')],observedAt})).filter((x:PlaylistChannelObservation)=>x.channelId&&x.channelName);
-      }catch(error){if(responseAccounted||isYouTubeQuotaAccountingError(error))throw error;if(isProbeQuotaControlError(error))throw error;recordProviderFailure(keys[index],error);if(isQuotaExceeded(error))quotaExceededCount++;if(attempt===providerIndexes.length-1){acquisition.providerFailed(quotaExceededCount===providerIndexes.length?'QUOTA_EXHAUSTED':'INDETERMINATE');throwIfAllProvidersCoolingDown(keys);throw error;}}
+      }catch(error){if(responseAccounted||isYouTubeQuotaAccountingError(error))throw error;if(isProbeQuotaControlError(error))throw error;if(isYouTubePermanentInputError(error))throw error;recordProviderFailure(keys[index],error);if(isQuotaExceeded(error))quotaExceededCount++;if(attempt===providerIndexes.length-1){acquisition.providerFailed(quotaExceededCount===providerIndexes.length?'QUOTA_EXHAUSTED':'INDETERMINATE');throwIfAllProvidersCoolingDown(keys);throw error;}}
     }throw new Error('All configured YouTube API keys failed for playlist inspection.');
   } finally { acquisition.release(); }
 }
@@ -647,13 +651,19 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
         if(!response.ok){
           // Hold the reservation until reset: a non-2xx request can still have
           // consumed provider quota, and the conservative lease prevents
-          // concurrent retries from over-admitting the allocation.
+          // concurrent retries from over-admitting the allocation. The one
+          // exception is a permanent invalid input (400/404/422 other than a
+          // page token, bad key, suspension, quota, or rate limit): the
+          // provider rejects it before charging, so its exact leases are
+          // released below instead of being stranded until reset.
           trace('before HTTP-error-body-read at server/youtube.ts:135');
           const error=await youtubeHttpError(response,trace);
           trace('after HTTP-error-body-read at server/youtube.ts:135');
           if(dispatchedProviderKey){
             const consumerSuspended=isConsumerSuspended(error);
             const runtimeRateLimited=isYouTubeRateLimited(error);
+            const permanentInput=isYouTubeInputFailure(error)&&!isYouTubePageTokenFailure(error)
+              &&!consumerSuspended&&!isInvalidApiKey(error)&&!isQuotaExceeded(error)&&!runtimeRateLimited;
             // A quota reservation was already written for this dispatch. Do
             // not let the scheduler re-run the whole dispatch closure up to
             // 30 times on raw 429s: each retry would reserve another full
@@ -683,6 +693,20 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
             else if(isYouTubeInputFailure(error) && !isYouTubePageTokenFailure(error)){
               const input=extractYouTubeQuarantineInput(operation,dispatchedUrl);
               if(input) await recordYouTubeInvalidInput(input.kind,input.value,operation,YOUTUBE_INPUT_QUARANTINE_TTL_MS).catch(()=>undefined);
+            }
+            if(permanentInput){
+              // Invalid input is rejected before the provider charges units:
+              // release the exact cap/probe leases so a permanent 404 cannot
+              // strand capacity until the Pacific reset. The shadow-only
+              // observation (when the cap is off) expires on its own and
+              // never gates admission.
+              if(capReservation){
+                try{const pool=await getDb();await settleKeyCapReservation(pool,capReservation);}catch{/* expiry remains the backstop */}
+              }
+              await releaseProbeReservationSafe();
+              const permanentError=new YouTubePermanentInputError(operation,error);
+              Object.assign(permanentError,{providerKey:dispatchedProviderKey,providerFailureRecorded:true});
+              throw permanentError;
             }
           }
           throw error;
@@ -941,6 +965,9 @@ export async function resolveYouTubeLocatorAuthoritatively(identity: string, typ
       } catch (error) {
         // Probe allocation is global for the day; do not rotate keys.
         if (isProbeQuotaControlError(error)) throw error;
+        // A permanent invalid input (deleted handle/video) will fail on every
+        // key; one attempt is the authoritative answer.
+        if (isYouTubePermanentInputError(error)) throw error;
         if (attempt === keys.length - 1) throw error;
       }
     }
@@ -1034,6 +1061,9 @@ export async function searchYouTubeChannelPage(
         if(isYouTubeQuotaAccountingError(e))throw e;
         // A probe refusal is a single day-wide bucket, not a key failure.
         if(isProbeQuotaControlError(e))throw e;
+        // A permanent invalid input (bad query, expired resource) cannot be
+        // fixed by another key.
+        if(isYouTubePermanentInputError(e))throw e;
         recordProviderFailure(apiKey, e);
         if (isQuotaExceeded(e)) quotaExceededCount++;
         console.warn(`[YouTube API Pool] Key #${currentIndex + 1} fetch error:`, e);
@@ -1136,6 +1166,8 @@ export async function fetchRecentVideoDescriptionsWithIds(channelId: string): Pr
       // snippets; a refusal on the primary search is global and must not be
       // retried against every remaining key.
       if(isProbeQuotaControlError(e))throw e;
+      // A deleted/malformed channel returns the same 404/400 on every key.
+      if(isYouTubePermanentInputError(e))throw e;
       recordProviderFailure(apiKey,e);
       if (isQuotaExceeded(e)) quotaExceededCount++;
       console.warn(`[YouTube API] Failed to fetch video descriptions for ${channelId}:`, e);
@@ -1524,6 +1556,10 @@ export async function fetchYouTubeChannelEnrichment(
       // Probe allocation refusals are global for the Pacific day; key
       // failover cannot change the outcome.
       if(isProbeQuotaControlError(error))throw error;
+      // A permanent invalid input (e.g. the uploads playlist no longer
+      // exists) is rejected identically by every key. Stop after the first
+      // answer instead of burning one request per key.
+      if(isYouTubePermanentInputError(error))throw error;
       recordProviderFailure(apiKey,error);
       if (isQuotaExceeded(error)) quotaExceededCount++;
       lastError = error instanceof Error ? error : new Error(String(error));
@@ -1597,6 +1633,9 @@ export async function fetchYouTubeChannelCountryMetadata(channelId: string, fall
       // A probe refusal is a day-wide policy signal. Returning UNAVAILABLE
       // here would hide it and retrying another key cannot succeed.
       if(isProbeQuotaControlError(error))throw error;
+      // This hydration is optional: a permanently invalid channel degrades to
+      // the fallback after one answer instead of rotating through every key.
+      if(isYouTubePermanentInputError(error))return { ...fallback, countryMetadataStatus: 'UNAVAILABLE', countryMetadataCheckedAt: checkedAt };
       recordProviderFailure(keys[index],error);if (isQuotaExceeded(error)) quotaExceededCount++;
     }
   }
