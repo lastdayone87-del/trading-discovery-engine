@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { runChannelInspection } from './inspector';
+import { mergeSampledVideoDescriptions, normalizeSampledVideoDescriptions, runChannelInspection } from './inspector';
 
 const CHANNEL_ID = 'UCzzzzzzzzzzzzzzzzzzzzzz';
 
@@ -97,6 +97,50 @@ test('unmarked short samples retain the legacy fallback loader', async () => {
   assert.equal(loaderCalls, 1);
   assert.deepEqual(result.observedVideoDescriptions, fresh.map(item => item.description));
   assert.equal(result.observedVideoDescriptionsAuthoritative, true);
+});
+
+test('ID-bearing top-up upgrades a text-only authoritative observation', () => {
+  const textOnly = normalizeSampledVideoDescriptions(['same upload text']);
+  const withId = normalizeSampledVideoDescriptions([{ videoId: 'video-1', description: 'same upload text' }]);
+  const merged = mergeSampledVideoDescriptions(textOnly, withId);
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0]?.videoId, 'video-1');
+  // A genuinely distinct video with the same text still votes separately.
+  const twins = mergeSampledVideoDescriptions(
+    normalizeSampledVideoDescriptions([{ videoId: 'video-2', description: 'same upload text' }]),
+    normalizeSampledVideoDescriptions([{ videoId: 'video-3', description: 'same upload text' }]),
+  );
+  assert.equal(twins.length, 2);
+});
+
+test('reused authoritative descriptions record a no-match acquisition observation', async () => {
+  const authoritative = sampled('no invite here');
+  const result = await runChannelInspection({
+    channelId: CHANNEL_ID,
+    channelName: 'Test Channel',
+    channelBio: 'Trading creator',
+    channelLinks: [],
+    videoDescriptions: authoritative.map(item => item.description),
+    videoDescriptionsAuthoritative: true,
+    recentVideoDescriptions: authoritative,
+    creatorLikelyTrading: true,
+    recentVideoDescriptionsLoader: async () => {
+      throw new Error('loader must not run for authoritative input');
+    },
+  });
+  const reused = (result.acquisitionOutcomes || []).filter(
+    outcome => outcome.requestedUrl === `enrichment:channel:${CHANNEL_ID}:recent-video-descriptions`,
+  );
+  assert.equal(reused.length, 1);
+  assert.equal(reused[0]?.outcome, 'INSPECTED_NO_MATCH');
+});
+
+test('Step 3 inspects the authoritative seed and top-up before preloaded snippets', () => {
+  const source = readFileSync(new URL('./inspector.ts', import.meta.url), 'utf8');
+  assert.match(
+    source,
+    /const orderedVideoDescs=authoritativeInspectionDescriptions\.length\?Array\.from\(new Set\(\[\.\.\.channelSampledDescs\(\),\.\.\.videoDescs\]\)\):videoDescs;const descriptionsToInspect=orderedVideoDescs\.slice\(0,5\)/,
+  );
 });
 
 test('queue threading passes provenance and video IDs into Gate 3 inspection', () => {
