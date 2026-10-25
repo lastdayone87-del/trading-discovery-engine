@@ -13,6 +13,7 @@ import { getConfiguredYouTubeKeys, getConfiguredYouTubeProviders } from './youtu
 import { youtubeProviderCooldown, type YouTubeProviderOperationalStatus } from './youtubeProviderCooldown';
 import type { AuditEvent } from './operatorAuth';
 import type { ProviderCallEvent } from './providerResilience';
+import { toWellFormedDeep, stringifyWellFormedJson } from './unicodeSafety';
 import { ProbeQuotaUnavailableError, resolveShadowConfig, settleKeyCapReservation, settleProbeQuotaReservation, settleShadowLeaseWithSavepoint, YouTubeKeyCapUnavailableError, type KeyCapReservationContext, type QuotaSettlementContext } from './quotaKeyCapShadow';
 import { canonicalCountry } from './countryInference';
 import { classifyDiscoveryVisibility } from './discoveryStateVisibility';
@@ -842,6 +843,10 @@ export async function writeChannelUpsert(
   channel: ChannelRecord,
   options?: { preserveDiscordOnUpdate?: boolean },
 ): Promise<void> {
+  // Normalize at the persistence boundary: upstream payloads can carry
+  // unpaired UTF-16 surrogates, which JSON.stringify preserves and PostgreSQL
+  // rejects for json/jsonb columns (and which cannot be encoded as UTF-8 text).
+  channel = toWellFormedDeep(channel);
   // Write-path invariant (final country → final scope_eligibility): always
   // derived from the row's country. A stale stored value must never survive
   // a country attribution change; country, status and confidence flow
@@ -863,16 +868,16 @@ ON CONFLICT(channel_id) DO UPDATE SET
   channel_name=excluded.channel_name,youtube_url=excluded.youtube_url,country=excluded.country,country_status=excluded.country_status,confidence_score=excluded.confidence_score,${preserveDiscordOnConflictSql('discord_status')},${preserveDiscordOnConflictSql('discord_invite')},scan_status=excluded.scan_status,scan_attempts=excluded.scan_attempts,discovery_source=excluded.discovery_source,last_checked=excluded.last_checked,next_check=excluded.next_check,inspection_trail=excluded.inspection_trail,subscriber_count=excluded.subscriber_count,channel_thumbnail_url=excluded.channel_thumbnail_url,quality_score=excluded.quality_score,quality_breakdown=excluded.quality_breakdown,trading_status=excluded.trading_status,trading_confidence_score=excluded.trading_confidence_score,trading_category=excluded.trading_category,trading_relevance_breakdown=excluded.trading_relevance_breakdown,country_metadata_status=excluded.country_metadata_status,country_metadata_checked_at=excluded.country_metadata_checked_at,public_about_status=excluded.public_about_status,public_about_checked_at=excluded.public_about_checked_at,public_about_attempts=excluded.public_about_attempts,latest_upload_at=excluded.latest_upload_at,uploads_last_30_days=excluded.uploads_last_30_days,uploads_last_90_days=excluded.uploads_last_90_days,uploads_last_365_days=excluded.uploads_last_365_days,activity_band=excluded.activity_band,activity_score=excluded.activity_score,activity_observed_at=excluded.activity_observed_at,${preserveDiscordOnConflictSql('discord_discovery_status')},${preserveDiscordOnConflictSql('discord_candidate_locator')},${preserveDiscordOnConflictSql('discord_candidate_id')},${preserveDiscordOnConflictSql('discord_candidate_raw_locator')},${preserveDiscordOnConflictSql('discord_candidate_type')},${preserveDiscordOnConflictSql('discord_resolution_status')},${preserveDiscordOnConflictSql('discord_liveness_status')},${preserveDiscordOnConflictSql('discord_relevance_status')},${preserveDiscordOnConflictSql('discord_validation_status')},scope_eligibility=excluded.scope_eligibility,community_discovery_status=excluded.community_discovery_status,community_intents=excluded.community_intents,${preserveDiscordOnConflictSql('discord_duplicate_owner_channel_id')},quota_origin=channels.quota_origin,updated_at=now()`, [
   channel.channel_id, channel.channel_name, channel.youtube_url, channel.country, channel.country_status, channel.confidence_score || 0,
   channel.discord_status, channel.discord_invite || null, channel.scan_status, channel.scan_attempts || 0, channel.discovery_source,
-  channel.first_seen || new Date().toISOString(), channel.last_checked || null, null, JSON.stringify(channel.inspection_trail || []),
+  channel.first_seen || new Date().toISOString(), channel.last_checked || null, null, stringifyWellFormedJson(channel.inspection_trail || []),
   channel.subscriber_count || null, channel.channel_thumbnail_url || null, channel.quality_score || 0,
-  channel.quality_breakdown ? JSON.stringify(channel.quality_breakdown) : null, channel.trading_status || 'UNCERTAIN',
+  channel.quality_breakdown ? stringifyWellFormedJson(channel.quality_breakdown) : null, channel.trading_status || 'UNCERTAIN',
   channel.trading_confidence_score || 0, channel.trading_category || 'General Trading',
-  channel.trading_relevance_breakdown ? JSON.stringify(channel.trading_relevance_breakdown) : null,
+  channel.trading_relevance_breakdown ? stringifyWellFormedJson(channel.trading_relevance_breakdown) : null,
   channel.country_metadata_status || 'NOT_REQUESTED', channel.country_metadata_checked_at || null,
   channel.public_about_status || 'NOT_ATTEMPTED', channel.public_about_checked_at || null, channel.public_about_attempts || 0,
   channel.latest_upload_at || null, channel.uploads_last_30_days || 0, channel.uploads_last_90_days || 0,
   channel.uploads_last_365_days || 0, channel.activity_band || 'UNKNOWN', channel.activity_score ?? 50,
-  channel.activity_observed_at || null,channel.discord_discovery_status||'NOT_DISCOVERED',channel.discord_candidate_locator||null,channel.discord_candidate_id||null,channel.discord_candidate_raw_locator||null,channel.discord_candidate_type||null,channel.discord_resolution_status||'NOT_ATTEMPTED',channel.discord_liveness_status||'NOT_CHECKED',channel.discord_relevance_status||'NOT_CHECKED',channel.discord_validation_status||'NOT_STARTED',scopeEligibility,channel.community_discovery_status||'NONE',JSON.stringify(channel.community_intents||[]),channel.discord_duplicate_owner_channel_id||null,options?.preserveDiscordOnUpdate===true,persistedOrigin
+  channel.activity_observed_at || null,channel.discord_discovery_status||'NOT_DISCOVERED',channel.discord_candidate_locator||null,channel.discord_candidate_id||null,channel.discord_candidate_raw_locator||null,channel.discord_candidate_type||null,channel.discord_resolution_status||'NOT_ATTEMPTED',channel.discord_liveness_status||'NOT_CHECKED',channel.discord_relevance_status||'NOT_CHECKED',channel.discord_validation_status||'NOT_STARTED',scopeEligibility,channel.community_discovery_status||'NONE',stringifyWellFormedJson(channel.community_intents||[]),channel.discord_duplicate_owner_channel_id||null,options?.preserveDiscordOnUpdate===true,persistedOrigin
   ]);
 }
 
