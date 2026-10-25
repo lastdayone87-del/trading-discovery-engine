@@ -385,5 +385,5 @@ test('persistence contract: channel community state is stored and read back', ()
   assert.match(db, /community_discovery_status: row\.community_discovery_status === 'COMMUNITY_INDICATED_NO_INVITE' \|\| row\.community_discovery_status === 'PAID_COMMUNITY_INDICATED' \? row\.community_discovery_status : 'NONE'/);
   assert.match(db, /community_intents: parseJson\(row\.community_intents, null\)/);
   assert.match(db, /community_discovery_status=excluded\.community_discovery_status,community_intents=excluded\.community_intents/);
-  assert.match(db, /channel\.community_discovery_status\|\|'NONE',JSON\.stringify\(channel\.community_intents\|\|\[\]\)/);
+  assert.match(db, /channel\.community_discovery_status\|\|'NONE',stringifyWellFormedJson\(channel\.community_intents\|\|\[\]\)/);
 });
