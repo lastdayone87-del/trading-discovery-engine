@@ -288,7 +288,25 @@ function availableKeyIndexes(keys: string[]): number[] {
 
 function throwIfAllProvidersCoolingDown(keys: string[]): void {
   const retryAt = youtubeProviderCooldown.earliestRetryAtIfAllCooling(keys);
-  if (retryAt !== null) throw new YouTubeProvidersCoolingDownError(retryAt);
+  if (retryAt !== null) throw buildYouTubeProvidersCoolingDownError(retryAt, keys);
+}
+
+/**
+ * Preserve the countable quota signal when every key is cooling specifically
+ * because its daily quota is exhausted. The all-cooling error is thrown both
+ * after the rotation loop and from `availableKeyIndexes` on later requests, so
+ * without this marker a real full-pool exhaustion storm never reaches the cap
+ * monitor. Mixed cooldowns keep their ordinary retry semantics and metadata.
+ */
+export function buildYouTubeProvidersCoolingDownError(
+  retryAt: number,
+  keys: string[],
+): YouTubeProvidersCoolingDownError {
+  const error = new YouTubeProvidersCoolingDownError(retryAt);
+  if (youtubeProviderCooldown.allDailyQuotaExhausted(keys)) {
+    Object.assign(error, { quotaExceeded: true, providerReasons: ['quotaExceeded'] });
+  }
+  return error;
 }
 
 /** Thrown before dispatch when an input is durably quarantined after repeated
@@ -1009,9 +1027,12 @@ export async function searchYouTubeChannelPage(
   await recordExecutionStage('PROVIDER_ACQUISITION','REACHED',{provider:'youtube',configuredKeys:keyPool.length});
   const acquisition = youtubePoolBackoff.beginAcquisition();
   let quotaExceededCount = 0;
+  let providerQuotaExceededCount = 0;
+  let attemptedKeyCount = 0;
 
   try { if (keyPool.length > 0) {
     const providerIndexes = availableKeyIndexes(keyPool);
+    attemptedKeyCount = providerIndexes.length;
     for (let attempt = 0; attempt < providerIndexes.length; attempt++) {
       const currentIndex = providerIndexes[attempt];
       const apiKey = keyPool[currentIndex];
@@ -1057,6 +1078,10 @@ export async function searchYouTubeChannelPage(
         // fixed by another key.
         if(isYouTubePermanentInputError(e))throw e;
         recordProviderFailure(apiKey, e);
+        // Local key-cap refusals are classified as quota exhaustion so the
+        // pool rotates, but they never reached YouTube. Only real provider
+        // quota responses may feed the independent provider-quota stop guard.
+        if (isProviderQuotaFailure(e)) providerQuotaExceededCount++;
         if (isQuotaExceeded(e)) quotaExceededCount++;
         console.warn(`[YouTube API Pool] Key #${currentIndex + 1} fetch error:`, e);
       }
@@ -1066,8 +1091,44 @@ export async function searchYouTubeChannelPage(
     console.warn('[YouTube API Pool] All API keys in pool encountered quotaExceeded or error or returned no results.');
   }
 
-  throw new Error('All configured YouTube API keys failed for this discovery request.');
+  throw buildYouTubeDiscoveryTerminalError(providerQuotaExceededCount, attemptedKeyCount);
   } finally { acquisition.release(); }
+}
+
+/**
+ * True only for actual provider quota responses. Local key-cap refusals are
+ * also classified as quota exhaustion by `isQuotaExceeded` so callers rotate
+ * to another key, but they never reached YouTube and must not feed the
+ * independent provider-quota stop guard. Wrapped causes are inspected because
+ * provider calls may preserve the original control error there.
+ */
+export function isProviderQuotaFailure(error: unknown): boolean {
+  if (!isQuotaExceeded(error)) return false;
+  let current: any = error;
+  for (let depth = 0; current && depth < 5; depth++, current = current.cause) {
+    if (isYouTubeKeyCapError(current)) return false;
+  }
+  return true;
+}
+
+/**
+ * Preserve a countable provider-quota signal when every discovery key fails.
+ * The per-key errors are swallowed by the rotation loop, so without this
+ * metadata `failJob` would persist only the generic terminal message and the
+ * cap monitor could not count the provider quota failures.
+ */
+export function buildYouTubeDiscoveryTerminalError(
+  providerQuotaExceededCount: number,
+  attemptedKeys: number,
+): Error {
+  const quotaExhausted = attemptedKeys > 0 && providerQuotaExceededCount === attemptedKeys;
+  const error = new Error(quotaExhausted
+    ? 'All configured YouTube API keys reported quota exhaustion for this discovery request.'
+    : 'All configured YouTube API keys failed for this discovery request.');
+  if (providerQuotaExceededCount > 0) {
+    Object.assign(error, { quotaExceeded: true, providerReasons: ['quotaExceeded'] });
+  }
+  return error;
 }
 
 /**

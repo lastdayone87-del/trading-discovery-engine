@@ -334,6 +334,32 @@ async function ensureJobsChannelPayloadIndex(client: { query: (text: string, val
   await client.query(`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_channel_payload ON public.jobs USING btree (((payload ->> 'channelId'::text)))`);
 }
 
+/**
+ * Migration 160 indexes the cap monitor's rolling job_attempts window. An
+ * ordinary CREATE INDEX inside the transactional migration loop would block
+ * attempt writes for the full build on a populated execution-history table.
+ * Build it concurrently before the loop's BEGIN; migration 160 then only
+ * adopts the completed index or verifies an empty table.
+ */
+async function ensureJobAttemptsFinishedErrorIndex(client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> }): Promise<void> {
+  const index = await client.query(`
+    SELECT c.oid, i.indisvalid, i.indisready
+      FROM pg_class c
+      JOIN pg_index i ON i.indexrelid = c.oid
+     WHERE c.oid = to_regclass('public.idx_job_attempts_finished_error')
+  `);
+  const existing = index.rows[0];
+  if (existing?.indisvalid && existing?.indisready) return;
+  if (existing?.oid) {
+    await client.query(`DROP INDEX CONCURRENTLY IF EXISTS public.idx_job_attempts_finished_error`);
+  }
+  const attempts = await client.query(`SELECT to_regclass('public.job_attempts') AS oid`);
+  if (!attempts.rows[0]?.oid) return;
+  const populated = await client.query(`SELECT EXISTS(SELECT 1 FROM public.job_attempts LIMIT 1) AS populated`);
+  if (!populated.rows[0]?.populated) return;
+  await client.query(`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_job_attempts_finished_error ON public.job_attempts (finished_at) WHERE error IS NOT NULL`);
+}
+
 export async function runMigrations(): Promise<Array<{ version: number; name: string; applied_at: string }>> {
   const db = pool || new Pool({ connectionString: requireDatabaseUrl(), ssl: process.env.PGSSL === 'disable' ? false : process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined });
   const client = await db.connect();
@@ -354,6 +380,8 @@ export async function runMigrations(): Promise<Array<{ version: number; name: st
     // empty table.
     const migration157 = await client.query('SELECT 1 FROM schema_migrations WHERE version=157');
     if (!migration157.rowCount) await ensureJobsChannelPayloadIndex(client);
+    const migration160 = await client.query('SELECT 1 FROM schema_migrations WHERE version=160');
+    if (!migration160.rowCount) await ensureJobAttemptsFinishedErrorIndex(client);
     const files = fs.readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith('.sql')).sort();
     const versions=new Map<number,string>();
     for(const file of files){const version=Number(file.split('_')[0]);const previous=versions.get(version);if(previous)throw new Error(`Duplicate migration version ${version}: ${previous} and ${file}`);versions.set(version,file);}

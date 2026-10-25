@@ -13,6 +13,7 @@
     "migrate": "tsx scripts/runMigrations.ts",
     "migrate:sqljs": "tsx scripts/migrateSqljsToPostgres.ts",
     "queue:smoke": "tsx scripts/queueSmokeTest.ts",
+    "youtube-key-cap:monitor": "tsx scripts/youtubeKeyCapStopMonitor.ts",
     "phase3:baseline": "tsx scripts/phase3Baseline.ts",
     "admission:v2-poc": "tsx scripts/evaluateAdmissionV2Offline.ts",
     "phaseb:admission-v2-poc": "tsx scripts/phaseBAdmissionV2Poc.ts",
