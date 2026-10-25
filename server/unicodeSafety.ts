@@ -43,7 +43,10 @@ export function toWellFormedDeep<T>(value: T): T {
   if (value && typeof value === 'object') {
     const prototype = Object.getPrototypeOf(value);
     if (prototype === Object.prototype || prototype === null) {
-      const out: Record<string, unknown> = {};
+      // A null-prototype destination keeps every JSON key as an own data
+      // property. Assigning to a plain {} would treat a parsed "__proto__"
+      // key as a prototype mutation and silently drop that field on output.
+      const out: Record<string, unknown> = Object.create(null);
       for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
         out[toWellFormedString(key)] = toWellFormedDeep(item);
       }

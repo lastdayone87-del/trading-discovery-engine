@@ -52,7 +52,9 @@ test('toWellFormedDeep normalizes nested values and keys without mutating input'
   };
   const safe = toWellFormedDeep(original);
   assert.equal(original[`bad${LONE_HIGH}key`], `text ${LONE_HIGH}`);
-  assert.deepEqual(safe, {
+  // The copy intentionally has a null prototype so JSON keys such as
+  // "__proto__" remain own properties; compare its serialized shape.
+  assert.deepEqual(JSON.parse(JSON.stringify(safe)), {
     'bad\uFFFDkey': 'text \uFFFD',
     nested: [{ value: 'low \uFFFD' }],
     valid: VALID_PAIR,
@@ -60,6 +62,16 @@ test('toWellFormedDeep normalizes nested values and keys without mutating input'
     flag: true,
     empty: null,
   });
+});
+
+test('toWellFormedDeep preserves a parsed __proto__ own key without prototype pollution', () => {
+  const original = JSON.parse('{"__proto__":{"polluted":true},"ok":"value"}') as Record<string, unknown>;
+  const safe = toWellFormedDeep(original);
+  assert.equal(Object.getPrototypeOf(safe), null);
+  assert.deepEqual(Object.keys(safe).sort(), ['__proto__', 'ok']);
+  const roundTripped = JSON.parse(stringifyWellFormedJson(safe)) as Record<string, unknown>;
+  assert.deepEqual(roundTripped, original);
+  assert.equal(({} as Record<string, unknown>).polluted, undefined);
 });
 
 test('stringifyWellFormedJson emits parseable JSON without surrogate escapes', () => {
