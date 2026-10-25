@@ -3392,15 +3392,15 @@ export async function recordNeighborhoodAnalyticsAfterRun(
       ? await db.query(
           `SELECT
              COUNT(DISTINCT no.query_run_id)::int AS total_executions,
-             COALESCE(SUM((no.metadata->'size_band_breakdown'->$2::text->>'attributed_quota')::int), 0)::int AS total_quota,
-             COALESCE(SUM((no.metadata->'size_band_breakdown'->$2::text->>'quality_new_count')::int), 0)::int AS valuable_new,
+             COALESCE(SUM((no.metadata->'size_band_breakdown'->$1::text->>'attributed_quota')::int), 0)::int AS total_quota,
+             COALESCE(SUM((no.metadata->'size_band_breakdown'->$1::text->>'quality_new_count')::int), 0)::int AS valuable_new,
              COALESCE(AVG(no.result_set_overlap), 0)::float AS avg_overlap,
              ARRAY_AGG(DISTINCT dn.source_family) AS sources
            FROM neighborhood_observations no
            JOIN discovery_neighborhoods dn ON dn.neighborhood_key = no.neighborhood_key
            WHERE no.observed_at >= now() - interval '30 days'
-             AND (no.metadata->'size_band_breakdown'->$2::text) IS NOT NULL`,
-          [seg.type, seg.key]
+             AND (no.metadata->'size_band_breakdown'->$1::text) IS NOT NULL`,
+          [seg.key]
         )
       : await db.query(
           `SELECT

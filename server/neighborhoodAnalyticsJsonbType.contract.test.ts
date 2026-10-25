@@ -3,12 +3,27 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const source = fs.readFileSync(path.join(process.cwd(), 'server/db.ts'), 'utf8');
+// The analytics implementation lives in dbCore.ts; db.ts is only the public
+// re-export facade. Reading the facade pointed these assertions at a file with
+// no SQL at all, so they failed instead of protecting the query.
+const source = fs.readFileSync(path.join(process.cwd(), 'server/dbCore.ts'), 'utf8');
 
 test('creator-size neighborhood analytics casts JSONB path keys to TEXT', () => {
-  assert.match(source, /metadata->'size_band_breakdown'->\$2::text->>'attributed_quota'/);
-  assert.match(source, /metadata->'size_band_breakdown'->\$2::text->>'quality_new_count'/);
-  assert.match(source, /metadata->'size_band_breakdown'->\$2::text\) IS NOT NULL/);
+  assert.match(source, /metadata->'size_band_breakdown'->\$1::text->>'attributed_quota'/);
+  assert.match(source, /metadata->'size_band_breakdown'->\$1::text->>'quality_new_count'/);
+  assert.match(source, /metadata->'size_band_breakdown'->\$1::text\) IS NOT NULL/);
+});
+
+test('creator-size query supplies exactly the one parameter it references', () => {
+  const branch = source.slice(
+    source.indexOf("seg.type === 'CREATOR_SIZE'\n      ? await db.query("),
+    source.indexOf(': await db.query(', source.indexOf("seg.type === 'CREATOR_SIZE'\n      ? await db.query(")),
+  );
+  assert.ok(branch.length > 0, 'creator-size analytics query must remain discoverable');
+  // PostgreSQL rejects a parameter with no determinable type: an unreferenced
+  // $1 next to a referenced $2 is exactly the production failure.
+  assert.match(branch, /\[\s*seg\.key\s*\]/);
+  assert.doesNotMatch(branch, /\$2/);
 });
 
 test('dimension neighborhood analytics casts both segment parameters to TEXT', () => {
