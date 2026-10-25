@@ -260,6 +260,57 @@ test('static 404 body: encoded non-refresh http-equiv values do not force a rend
   );
 });
 
+test('static 404 body: quoted http-equiv text cannot hide a real refresh attribute', () => {
+  for (const body of [
+    '<html><head><title>404 Not Found</title><meta data-note=" http-equiv=content-type " http-equiv="refresh" content="0;url=/community"></head><body>Not found</body></html>',
+    '<html><head><title>404 Not Found</title><meta/http-equiv=refresh content="0;url=/community"></head><body>Not found</body></html>',
+  ]) {
+    assert.deepEqual(
+      assessStaticNotFoundBody({ text: body, truncated: false }),
+      { confirmed: false, reason: 'CLIENT_RENDER_SHELL' },
+      body,
+    );
+  }
+});
+
+test('static 404 body: quoted http-equiv text without a real attribute is not a refresh', () => {
+  assert.deepEqual(
+    assessStaticNotFoundBody({
+      text: '<html><head><title>404 Not Found</title><meta data-note=" http-equiv=refresh "></head><body>Not found</body></html>',
+      truncated: false,
+    }),
+    { confirmed: true, reason: 'NO_LINKS_EXPLICIT_NOT_FOUND' },
+  );
+});
+
+test('static 404 body: empty HTML comments cannot hide later links', () => {
+  for (const body of [
+    '<html><head><title>404 Not Found</title></head><body><!--><a href="/join">Join</a><!-- x --></body></html>',
+    '<html><head><title>404 Not Found</title></head><body><!---><a href="/join">Join</a><!-- x --></body></html>',
+    '<html><head><title>404 Not Found</title></head><body><!-- x --!><a href="/join">Join</a><!-- x --></body></html>',
+  ]) {
+    assert.deepEqual(
+      assessStaticNotFoundBody({ text: body, truncated: false }),
+      { confirmed: false, reason: 'HAS_LINKS' },
+      body,
+    );
+  }
+});
+
+test('static 404 body: empty HTML comments do not hide the heading', () => {
+  for (const body of [
+    '<html><head><!--><title>404 Not Found</title></head><body>missing</body></html>',
+    '<html><head><!---><title>404 Not Found</title></head><body>missing</body></html>',
+    '<html><head><title><!-->404 Not Found</title></head><body>missing</body></html>',
+  ]) {
+    assert.deepEqual(
+      assessStaticNotFoundBody({ text: body, truncated: false }),
+      { confirmed: true, reason: 'NO_LINKS_EXPLICIT_NOT_FOUND' },
+      body,
+    );
+  }
+});
+
 test('static 404 body: bot/block markers keep rendered escalation', () => {
   assert.deepEqual(
     assessStaticNotFoundBody({

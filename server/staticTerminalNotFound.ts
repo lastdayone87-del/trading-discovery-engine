@@ -127,9 +127,41 @@ function decodeCharacterReferences(value: string): string {
 }
 
 function metaHttpEquivValue(tagText: string): string | null {
-  const match = /(?:^|\s)http-equiv\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/i.exec(tagText);
-  if (!match) return null;
-  return decodeCharacterReferences(match[1] ?? match[2] ?? match[3] ?? '').trim().toLowerCase();
+  // Walk actual attributes instead of regex-searching the raw tag. A quoted
+  // attribute value may contain the text `http-equiv=...`, and HTML also
+  // accepts a slash after the tag name as an attribute separator
+  // (`<meta/http-equiv=refresh>`); both must be parsed the way a browser does.
+  let index = 1;
+  while (index < tagText.length && /[a-zA-Z0-9:-]/.test(tagText[index])) index++;
+  while (index < tagText.length) {
+    while (index < tagText.length && /[\s/]/.test(tagText[index])) index++;
+    if (index >= tagText.length || tagText[index] === '>') return null;
+    const nameStart = index;
+    while (index < tagText.length && !/[\s/=>]/.test(tagText[index])) index++;
+    const name = tagText.slice(nameStart, index).toLowerCase();
+    while (index < tagText.length && /\s/.test(tagText[index])) index++;
+    let value = '';
+    if (tagText[index] === '=') {
+      index++;
+      while (index < tagText.length && /\s/.test(tagText[index])) index++;
+      const quote = tagText[index];
+      if (quote === '"' || quote === "'") {
+        index++;
+        const valueStart = index;
+        while (index < tagText.length && tagText[index] !== quote) index++;
+        value = tagText.slice(valueStart, index);
+        if (index < tagText.length) index++;
+      } else {
+        const valueStart = index;
+        while (index < tagText.length && !/[\s>]/.test(tagText[index])) index++;
+        value = tagText.slice(valueStart, index);
+      }
+    }
+    if (name === 'http-equiv') {
+      return decodeCharacterReferences(value).trim().toLowerCase();
+    }
+  }
+  return null;
 }
 
 interface TagBounds {
@@ -167,6 +199,22 @@ function skipRawText(source: string, lowerSource: string, from: number, tag: str
   return findTagEnd(source, close + 2 + tag.length);
 }
 
+/**
+ * Return the index of the `>` that closes a comment starting at `start`, or
+ * -1 when it is unterminated. HTML closes `<!-->` and `<!--->` immediately and
+ * accepts `--!>` as well as `-->`; searching only for `-->` can skip past
+ * browser-visible markup and hide a real link.
+ */
+function findCommentEnd(text: string, start: number): number {
+  if (text.startsWith('<!-->', start)) return start + 4;
+  if (text.startsWith('<!--->', start)) return start + 5;
+  const dashEnd = text.indexOf('-->', start + 4);
+  const bangEnd = text.indexOf('--!>', start + 4);
+  if (dashEnd < 0 && bangEnd < 0) return -1;
+  if (bangEnd >= 0 && (dashEnd < 0 || bangEnd < dashEnd)) return bangEnd + 3;
+  return dashEnd + 2;
+}
+
 interface MarkupScan {
   hasLink: boolean;
   hasClientRender: boolean;
@@ -193,9 +241,9 @@ function scanMarkup(text: string, lowerText: string, mode: 'body' | 'title' = 'b
     const lt = text.indexOf('<', index);
     if (lt < 0) break;
     if (text.startsWith('<!--', lt)) {
-      const end = text.indexOf('-->', lt + 4);
+      const end = findCommentEnd(text, lt);
       if (end < 0) return { ...result, uncertain: true };
-      index = end + 3;
+      index = end + 1;
       continue;
     }
     if (text.startsWith('<![CDATA[', lt)) {
@@ -266,9 +314,9 @@ function findOpeningTag(source: string, lowerSource: string, tag: string): { sta
     const lt = source.indexOf('<', index);
     if (lt < 0) return null;
     if (source.startsWith('<!--', lt)) {
-      const end = source.indexOf('-->', lt + 4);
+      const end = findCommentEnd(source, lt);
       if (end < 0) return { start: lt, end: source.length, uncertain: true };
-      index = end + 3;
+      index = end + 1;
       continue;
     }
     if (source.startsWith('<![CDATA[', lt)) {
@@ -316,10 +364,10 @@ function stripHeadingTags(content: string): { text: string; uncertain: boolean }
     }
     text += content.slice(index, lt);
     if (content.startsWith('<!--', lt)) {
-      const end = content.indexOf('-->', lt + 4);
+      const end = findCommentEnd(content, lt);
       if (end < 0) return { text: '', uncertain: true };
       text += ' ';
-      index = end + 3;
+      index = end + 1;
       continue;
     }
     if (content.startsWith('<![CDATA[', lt)) {
