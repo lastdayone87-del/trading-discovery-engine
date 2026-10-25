@@ -259,6 +259,7 @@ test('claim path blocks unreconciled legacy retries until maintenance settles ow
   const source = read('server/communityRecovery.ts');
   assert.match(source, /retryLifecycleVersion: 2/);
   assert.match(source, /j\.payload->>'retryReason' AS retry_reason/);
+  assert.match(source, /retry_job\.retry_reason,/);
   assert.match(source, /priorRetryReason/);
 });
 

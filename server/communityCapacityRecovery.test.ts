@@ -64,6 +64,8 @@ test('capacity-only terminal community retry is reopened immediately and its ret
   assert.deepEqual(enqueued.map(item => item.channelId), ['UC_CAPACITY_ONLY']);
   assert.match(enqueued[0].reasons || '', /ATTEMPT_FREE_CAPACITY_RETRY_REOPENED/);
   assert.equal(enqueued[0].retryReason, 'BROWSER_RUNTIME_UNAVAILABLE', 'browser-runtime attribution survives capacity recovery');
+  const selection = queries.find(query => query.sql.includes('SELECT c.channel_id'))?.sql || '';
+  assert.match(selection, /retry_job\.retry_reason/, 'the outer query must project the lateral retry reason');
   assert.equal(upserts[0].scan_status, 'ENRICHMENT_PENDING');
   assert.equal(upserts[0].discord_validation_status, 'RETRY_PENDING');
   assert.match(upserts[0].inspection_trail.at(-1).details, /ATTEMPT_FREE_CAPACITY_RETRY_REOPENED/);

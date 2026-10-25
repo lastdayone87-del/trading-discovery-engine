@@ -369,6 +369,7 @@ export async function reconcileCommunityAcquisitionRecovery(
   const rows = await db.query(
     `SELECT c.channel_id,
             retry_job.id AS capacity_retry_job_id,
+            retry_job.retry_reason,
             COALESCE(
               retry_job.status='FAILED'
               AND retry_job.last_error LIKE $2,
