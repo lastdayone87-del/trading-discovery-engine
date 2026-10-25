@@ -202,6 +202,13 @@ export function createOperationalMaintenanceScheduler(
   const start = (): void => {
     if (started) return;
     started = true;
+    // A sweep may still be in flight from before stop(). Re-arm its watchdog
+    // rather than starting a second sweep; the original tick will schedule the
+    // next interval once that sweep settles.
+    if (inFlight !== null) {
+      armWatchdog();
+      return;
+    }
     const tick = async (): Promise<void> => {
       try {
         await run();
@@ -237,13 +244,16 @@ function createDefaultDependencies(): OperationalMaintenanceDependencies {
       upsertChannel,
       20,
       Date.now(),
-      (channelId, retryReason) => enqueueCommunityAcquisitionRetry(channelId, {
+      (channelId, reactivationReasonCodes, priorRetryReason) => enqueueCommunityAcquisitionRetry(channelId, {
         attemptFree: true,
         code: COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,
-        reason: retryReason || 'Recovery-triggered community retry',
+        reason: reactivationReasonCodes || 'Recovery-triggered community retry',
         retryAt: undefined,
-        retryReason: retryReason === 'BROWSER_RUNTIME_UNAVAILABLE'
-          ? 'BROWSER_RUNTIME_UNAVAILABLE'
+        // Preserve browser-runtime attribution when reopening a capacity-only
+        // terminal retry; the second callback argument is a list of channel
+        // reactivation reasons, not the failed job's retry reason.
+        retryReason: priorRetryReason === COMMUNITY_RETRY_REASON.BROWSER_RUNTIME_UNAVAILABLE
+          ? COMMUNITY_RETRY_REASON.BROWSER_RUNTIME_UNAVAILABLE
           : COMMUNITY_RETRY_REASON.COMMUNITY_REQUIRED_ACQUISITION_FAILURE
       }, 'RECOVERY')
     ),

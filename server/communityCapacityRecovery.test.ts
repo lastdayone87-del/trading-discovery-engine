@@ -15,7 +15,8 @@ test('capacity-only terminal community retry is reopened immediately and its ret
           rows: [{
             channel_id: 'UC_CAPACITY_ONLY',
             capacity_retry_job_id: 'job-capacity-only',
-            capacity_terminal: true
+            capacity_terminal: true,
+            retry_reason: 'BROWSER_RUNTIME_UNAVAILABLE'
           }]
         };
       }
@@ -47,7 +48,7 @@ test('capacity-only terminal community retry is reopened immediately and its ret
   };
 
   const upserts: any[] = [];
-  const enqueued: string[] = [];
+  const enqueued: Array<{ channelId: string; reasons?: string; retryReason?: string }> = [];
   const now = Date.now() + 120_000;
 
   const recovered = await reconcileCommunityAcquisitionRecovery(
@@ -56,11 +57,13 @@ test('capacity-only terminal community retry is reopened immediately and its ret
     async updated => { upserts.push(updated); },
     20,
     now,
-    async channelId => { enqueued.push(channelId); }
+    async (channelId, reasons, retryReason) => { enqueued.push({ channelId, reasons, retryReason }); }
   );
 
   assert.equal(recovered, 1);
-  assert.deepEqual(enqueued, ['UC_CAPACITY_ONLY']);
+  assert.deepEqual(enqueued.map(item => item.channelId), ['UC_CAPACITY_ONLY']);
+  assert.match(enqueued[0].reasons || '', /ATTEMPT_FREE_CAPACITY_RETRY_REOPENED/);
+  assert.equal(enqueued[0].retryReason, 'BROWSER_RUNTIME_UNAVAILABLE', 'browser-runtime attribution survives capacity recovery');
   assert.equal(upserts[0].scan_status, 'ENRICHMENT_PENDING');
   assert.equal(upserts[0].discord_validation_status, 'RETRY_PENDING');
   assert.match(upserts[0].inspection_trail.at(-1).details, /ATTEMPT_FREE_CAPACITY_RETRY_REOPENED/);

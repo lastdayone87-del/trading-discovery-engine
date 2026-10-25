@@ -144,6 +144,57 @@ test('a hung sweep is reported by the watchdog and remains visible in health', a
   }
 });
 
+test('restarting during an in-flight sweep re-arms its watchdog', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const { calls, dependencies } = createDeps();
+  dependencies.recoverStaleChannelLocks = async () => {
+    calls.push('locks');
+    await gate;
+  };
+  const watchdogs: Array<{ cleared: boolean }> = [];
+  const scheduler = createOperationalMaintenanceScheduler(dependencies, {
+    intervalMs: 10,
+    now: () => 8_000_000,
+    setTimer: () => 0,
+    clearTimer: () => undefined,
+    watchdogMs: 100,
+    setWatchdog: () => {
+      watchdogs.push({ cleared: false });
+      return watchdogs.length;
+    },
+    clearWatchdog: id => {
+      const watchdog = watchdogs[Number(id) - 1];
+      if (watchdog) watchdog.cleared = true;
+    }
+  });
+  try {
+    scheduler.start();
+    await flush();
+    assert.equal(watchdogs.filter(watchdog => !watchdog.cleared).length, 1);
+    const pending = scheduler.run();
+
+    scheduler.stop();
+    assert.equal(watchdogs.filter(watchdog => !watchdog.cleared).length, 0, 'stop disarms the watchdog');
+
+    scheduler.start();
+    assert.equal(
+      watchdogs.filter(watchdog => !watchdog.cleared).length,
+      1,
+      'restart re-arms the watchdog for the sweep that is still in flight'
+    );
+
+    release();
+    await pending;
+    assert.equal(scheduler.snapshot().inFlight, false);
+    assert.equal(scheduler.snapshot().stalled, false);
+    assert.deepEqual(calls, ALL_TASKS);
+  } finally {
+    release();
+    scheduler.stop();
+  }
+});
+
 test('overlapping runs coalesce into the in-flight sweep', async () => {
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });

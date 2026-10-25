@@ -240,6 +240,28 @@ test('legacy selector treats missing or malformed lifecycle versions as legacy a
   assert.doesNotMatch(source, /reconciliationStatus: 'RECONCILIATION_REQUIRED'/);
 });
 
+test('claim path blocks unreconciled legacy retries until maintenance settles ownership', () => {
+  const dbCore = read('server/dbCore.ts');
+  const claim = dbCore.slice(
+    dbCore.indexOf('export async function claimNextJob'),
+    dbCore.indexOf('export async function completeJob')
+  );
+  assert.match(
+    claim,
+    /NOT \(type='RETRY_COMMUNITY_ACQUISITION' AND CASE WHEN btrim\(COALESCE\(payload->>'retryLifecycleVersion',''\)\) ~ '\^\[0-9\]\+\$' THEN btrim\(payload->>'retryLifecycleVersion'\)::numeric ELSE 0 END < 2 AND COALESCE\(payload->>'retryReason',''\) <> 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE'\)/
+  );
+  assert.equal(
+    (claim.match(/END < 2/g) || []).length,
+    2,
+    'both claim candidate queries must block unreconciled legacy retries'
+  );
+
+  const source = read('server/communityRecovery.ts');
+  assert.match(source, /retryLifecycleVersion: 2/);
+  assert.match(source, /j\.payload->>'retryReason' AS retry_reason/);
+  assert.match(source, /priorRetryReason/);
+});
+
 test('reconciliation uses effective surface precedence so completed no-match coverage clears stale failure eligibility', () => {
   const source = read('server/communityRecovery.ts');
   assert.match(source, /SELECT DISTINCT ON \(o\.provenance->>'surface'/);
