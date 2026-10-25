@@ -13,7 +13,9 @@
  *
  * MONITOR_SINCE_EPOCH is the reset epoch. It bounds the rolling secondary
  * signals so quota-blocked jobs from before the reset cannot stop the first
- * post-reset sample. A reset epoch in the future is treated as inactive.
+ * post-reset sample. A reset epoch in the future is treated as inactive. The
+ * start of the current Pacific quota day is always an additional lower bound,
+ * so a fixed epoch cannot carry yesterday's failures into a later day.
  *
  * The monitor is deliberately conservative: if it cannot read the durable
  * counter or the health endpoint twice in a row, it stops rather than assuming
@@ -34,8 +36,10 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { getDb } from '../server/db';
-import { getYouTubeQuotaDay } from '../server/youtubeQuotaDay';
+import { getYouTubeQuotaDay, getYouTubeQuotaDayStartAt } from '../server/youtubeQuotaDay';
 import {
+  KEY_CAP_REFUSAL_EVENT_PRUNE_BATCH,
+  KEY_CAP_REFUSAL_EVENT_PRUNE_MAX_BATCHES,
   KEY_CAP_REFUSAL_EVENT_RETENTION_DAYS,
   logKeyCapRefusalAccountingFailure,
   pruneYouTubeKeyCapRefusalEvents,
@@ -74,7 +78,7 @@ const RETENTION_DAYS = Math.max(
   1,
   Number(process.env.YOUTUBE_KEY_CAP_REFUSAL_RETENTION_DAYS) || KEY_CAP_REFUSAL_EVENT_RETENTION_DAYS,
 );
-const PRUNE_INTERVAL_MS = 24 * 60 * 60_000;
+const PRUNE_INTERVAL_MS = 60 * 60_000;
 
 type MonitorDb = Awaited<ReturnType<typeof getDb>>;
 
@@ -192,10 +196,14 @@ async function readHealth(): Promise<{ http: number; ready: boolean }> {
   }
 }
 
-async function readSecondarySignals(db: MonitorDb, nowMs: number): Promise<SecondarySignals> {
+async function readSecondarySignals(
+  db: MonitorDb,
+  nowMs: number,
+  quotaDayStartMs: number,
+): Promise<SecondarySignals> {
   return readYouTubeKeyCapSecondarySignals(
     db,
-    monitorSecondaryWindowStart(nowMs, SINCE_EPOCH),
+    monitorSecondaryWindowStart(nowMs, SINCE_EPOCH, quotaDayStartMs),
   );
 }
 
@@ -212,7 +220,7 @@ async function sampleOnce(db: MonitorDb, attempt = 0): Promise<MonitorSample> {
   const startedDay = getYouTubeQuotaDay(dbNow);
   const summary = await readYouTubeKeyCapRefusalSummary(db, startedDay);
   const [secondary, queue, health, durableStop] = await Promise.all([
-    readSecondarySignals(db, dbNow.getTime()),
+    readSecondarySignals(db, dbNow.getTime(), getYouTubeQuotaDayStartAt(dbNow)),
     readQueue(db),
     readHealth(),
     readKeyCapMonitorStop(db, startedDay),
@@ -419,7 +427,11 @@ async function main(): Promise<void> {
       lastPruneMs = now.getTime();
       try {
         const deleted = await pruneYouTubeKeyCapRefusalEvents(db, RETENTION_DAYS);
-        if (deleted > 0) appendLog(`${now.toISOString()}|REFUSAL_EVENTS_PRUNED|${deleted}`);
+        if (deleted >= KEY_CAP_REFUSAL_EVENT_PRUNE_BATCH * KEY_CAP_REFUSAL_EVENT_PRUNE_MAX_BATCHES) {
+          appendLog(`${now.toISOString()}|REFUSAL_EVENTS_PRUNE_LIMIT_REACHED|${deleted}`);
+        } else if (deleted > 0) {
+          appendLog(`${now.toISOString()}|REFUSAL_EVENTS_PRUNED|${deleted}`);
+        }
       } catch (error) {
         appendLog(
           `${now.toISOString()}|REFUSAL_EVENTS_PRUNE_FAILED|${String((error as Error)?.message || error).slice(0, 200)}`,

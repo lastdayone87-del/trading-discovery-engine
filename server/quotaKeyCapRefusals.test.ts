@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   KEY_CAP_REFUSAL_EVENT_PRUNE_BATCH,
+  KEY_CAP_REFUSAL_EVENT_PRUNE_MAX_BATCHES,
   KEY_CAP_REFUSAL_EVENT_RETENTION_DAYS,
   PRUNE_KEY_CAP_REFUSAL_EVENTS_SQL,
   RECORD_KEY_CAP_REFUSAL_SQL,
@@ -106,6 +107,7 @@ test('accounting failures emit a structured event instead of disappearing', asyn
 test('event retention is bounded and the counter table is never pruned', async () => {
   assert.equal(KEY_CAP_REFUSAL_EVENT_RETENTION_DAYS, 30);
   assert.equal(KEY_CAP_REFUSAL_EVENT_PRUNE_BATCH, 5_000);
+  assert.equal(KEY_CAP_REFUSAL_EVENT_PRUNE_MAX_BATCHES, 20);
   assert.match(PRUNE_KEY_CAP_REFUSAL_EVENTS_SQL, /DELETE FROM youtube_key_cap_refusal_events/);
   assert.doesNotMatch(PRUNE_KEY_CAP_REFUSAL_EVENTS_SQL, /youtube_key_cap_refusal_counters/);
   assert.match(PRUNE_KEY_CAP_REFUSAL_EVENTS_SQL, /LIMIT \$2/);
@@ -126,6 +128,28 @@ test('event retention is bounded and the counter table is never pruned', async (
   // Invalid retention/batch settings fall back to the safe defaults.
   assert.equal(await pruneYouTubeKeyCapRefusalEvents(client, 0, 0), 7);
   assert.deepEqual(values, [KEY_CAP_REFUSAL_EVENT_RETENTION_DAYS, KEY_CAP_REFUSAL_EVENT_PRUNE_BATCH]);
+});
+
+test('event pruning drains full batches until the backlog is below one batch', async () => {
+  const batchResults = [5_000, 5_000, 5_000, 200];
+  let calls = 0;
+  const client: KeyCapRefusalQueryClient = {
+    query: async () => ({ rows: [], rowCount: batchResults[calls++] ?? 0 }),
+  };
+  assert.equal(await pruneYouTubeKeyCapRefusalEvents(client, 30, 5_000), 15_200);
+  assert.equal(calls, 4);
+});
+
+test('event pruning stops at the bounded batch ceiling', async () => {
+  let calls = 0;
+  const client: KeyCapRefusalQueryClient = {
+    query: async () => {
+      calls += 1;
+      return { rows: [], rowCount: 5_000 };
+    },
+  };
+  assert.equal(await pruneYouTubeKeyCapRefusalEvents(client, 30, 5_000, 3), 15_000);
+  assert.equal(calls, 3);
 });
 
 test('summary and per-key reads normalize bigint strings and empty results', async () => {

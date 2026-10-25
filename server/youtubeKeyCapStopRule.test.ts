@@ -131,6 +131,20 @@ test('secondary-signal window honors the quota-reset epoch and the one-hour floo
   // A future epoch is not active yet: keep the ordinary one-hour window so
   // recent failures remain visible instead of excluding every event.
   assert.equal(monitorSecondaryWindowStart(now, 1792998000 + 3600).toISOString(), '2026-10-26T06:05:00.000Z');
+
+  // The fixed epoch describes the first reset only. A later Pacific day must
+  // also be bounded by that day's start, not just the one-hour window.
+  const nextDayNow = Date.parse('2026-10-27T07:05:00.000Z');
+  const nextDayStart = Date.parse('2026-10-27T07:00:00.000Z');
+  assert.equal(
+    monitorSecondaryWindowStart(nextDayNow, 1792998000, nextDayStart).toISOString(),
+    '2026-10-27T07:00:00.000Z',
+  );
+  // Before the reset the current day's start is older than the one-hour floor.
+  assert.equal(
+    monitorSecondaryWindowStart(now, 1792998000, Date.parse('2026-10-26T07:00:00.000Z')).toISOString(),
+    '2026-10-26T07:00:00.000Z',
+  );
 });
 
 test('stop markers carry the quota day and only stale quota stops auto-clear', () => {

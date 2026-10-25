@@ -88,6 +88,7 @@ export function evaluateYouTubeKeyCapStopRule(sample: KeyCapStopSample): KeyCapS
 export function monitorSecondaryWindowStart(
   nowMs: number,
   sinceEpochSeconds: number,
+  quotaDayStartMs?: number,
 ): Date {
   const oneHourAgo = nowMs - 3_600_000;
   const sinceMs = Number.isFinite(sinceEpochSeconds) && sinceEpochSeconds > 0
@@ -97,7 +98,14 @@ export function monitorSecondaryWindowStart(
   // one-hour window keeps recent failures visible; clamping to `now` would
   // exclude every recorded failure and silently disable both secondary guards.
   const effectiveSince = sinceMs > nowMs ? oneHourAgo : sinceMs;
-  return new Date(Math.max(oneHourAgo, effectiveSince));
+  // The fixed epoch only describes the first reset. On later Pacific days it
+  // is older than the current quota-day start, so failures from the preceding
+  // hour would otherwise be able to stop a fresh day. The day start is a hard
+  // lower bound whenever the database clock provides one.
+  const dayStart = Number.isFinite(quotaDayStartMs) && (quotaDayStartMs as number) <= nowMs
+    ? (quotaDayStartMs as number)
+    : oneHourAgo;
+  return new Date(Math.max(oneHourAgo, effectiveSince, dayStart));
 }
 
 export function initialKeyCapMonitorState(quotaDay: string): KeyCapMonitorState {

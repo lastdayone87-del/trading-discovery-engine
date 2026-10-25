@@ -54,12 +54,15 @@ const QUOTA_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
 export const KEY_CAP_REFUSAL_EVENT_RETENTION_DAYS = 30;
 export const KEY_CAP_REFUSAL_EVENT_PRUNE_BATCH = 5_000;
+export const KEY_CAP_REFUSAL_EVENT_PRUNE_MAX_BATCHES = 20;
 
 /**
  * Keep the idempotency-event table bounded. The counter table is the read
  * model and is never pruned; only event identities older than the retention
  * window are deleted in bounded batches so a cap storm cannot create an
- * unbounded table or a long lock.
+ * unbounded table or a long lock. One call drains up to
+ * `KEY_CAP_REFUSAL_EVENT_PRUNE_MAX_BATCHES` batches, which keeps cleanup
+ * ahead of a sustained refusal rate without holding a single long transaction.
  */
 export const PRUNE_KEY_CAP_REFUSAL_EVENTS_SQL = `
 DELETE FROM youtube_key_cap_refusal_events
@@ -226,6 +229,7 @@ export async function pruneYouTubeKeyCapRefusalEvents(
   client: KeyCapRefusalQueryClient,
   retentionDays: number = KEY_CAP_REFUSAL_EVENT_RETENTION_DAYS,
   batchSize: number = KEY_CAP_REFUSAL_EVENT_PRUNE_BATCH,
+  maxBatches: number = KEY_CAP_REFUSAL_EVENT_PRUNE_MAX_BATCHES,
 ): Promise<number> {
   const days = Number.isSafeInteger(retentionDays) && retentionDays >= 1
     ? retentionDays
@@ -233,8 +237,18 @@ export async function pruneYouTubeKeyCapRefusalEvents(
   const limit = Number.isSafeInteger(batchSize) && batchSize >= 1
     ? batchSize
     : KEY_CAP_REFUSAL_EVENT_PRUNE_BATCH;
-  const result = await client.query(PRUNE_KEY_CAP_REFUSAL_EVENTS_SQL, [days, limit]);
-  return Number(result.rowCount) || 0;
+  const batches = Number.isSafeInteger(maxBatches) && maxBatches >= 1
+    ? maxBatches
+    : KEY_CAP_REFUSAL_EVENT_PRUNE_MAX_BATCHES;
+  let total = 0;
+  for (let batch = 0; batch < batches; batch += 1) {
+    const result = await client.query(PRUNE_KEY_CAP_REFUSAL_EVENTS_SQL, [days, limit]);
+    const deleted = Number(result.rowCount) || 0;
+    total += deleted;
+    // A short batch means the expired backlog is drained.
+    if (deleted < limit) break;
+  }
+  return total;
 }
 
 export async function readYouTubeKeyCapRefusalSummary(
