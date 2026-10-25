@@ -83,12 +83,13 @@ const EXPLICIT_NOT_FOUND_PATTERN =
 // caller keeps rendered escalation instead of guessing what the tag contains.
 const MAX_TAG_CHARS = 2_000;
 const SMALL_BODY_CHARS = 2_048;
-const HEADING_SCAN_CHARS = 16_384;
 const HEADING_TEXT_CHARS = 4_096;
 // Elements whose content is text, not markup. Skipping them keeps JavaScript
 // or CSS containing `<` from being mistaken for unreadable markup. `plaintext`
-// has no closing tag and consumes the rest of the document.
-const RAW_TEXT_TAGS = new Set(['script', 'style', 'textarea', 'title', 'xmp', 'plaintext']);
+// has no closing tag and consumes the rest of the document. `title` is not
+// skipped: in HTML it is RCDATA, but an SVG `<title>` can contain a real
+// `<a>` element, and scanning it only ever keeps rendered escalation.
+const RAW_TEXT_TAGS = new Set(['script', 'style', 'textarea', 'xmp', 'plaintext']);
 const CLIENT_RENDER_TAGS = new Set(['script', 'iframe', 'form', 'object', 'embed']);
 
 interface TagBounds {
@@ -120,9 +121,9 @@ function findTagEnd(source: string, start: number): TagBounds {
   return { end: last, uncertain: true };
 }
 
-function skipRawText(source: string, from: number, tag: string): TagBounds {
+function skipRawText(source: string, lowerSource: string, from: number, tag: string): TagBounds {
   if (tag === 'plaintext') return { end: source.length, uncertain: false };
-  const close = source.toLowerCase().indexOf(`</${tag}`, from);
+  const close = lowerSource.indexOf(`</${tag}`, from);
   if (close < 0) return { end: source.length, uncertain: true };
   return findTagEnd(source, close + 2 + tag.length);
 }
@@ -137,8 +138,11 @@ interface MarkupScan {
  * Linear, bounded tag scan. Unlike the previous regexes, this understands
  * quoted attributes, so `<a title="1 < 2" href="/join">` is still a link.
  * Any tag that cannot be fully checked makes the whole body uncertain.
+ *
+ * `lowerText` is prepared once per assessment so raw-text lookups never
+ * re-lowercase the whole attacker-controlled body for each element.
  */
-function scanMarkup(text: string): MarkupScan {
+function scanMarkup(text: string, lowerText: string): MarkupScan {
   const result: MarkupScan = { hasLink: false, hasClientRender: false, uncertain: false };
   let index = 0;
   while (index < text.length) {
@@ -151,9 +155,12 @@ function scanMarkup(text: string): MarkupScan {
       continue;
     }
     if (text.startsWith('<![CDATA[', lt)) {
-      const end = text.indexOf(']]>', lt + 9);
+      // In text/html this is not a CDATA section; it starts a bogus comment
+      // that ends at the first `>`. Skipping to `]]>` would hide markup the
+      // browser parses after that `>`, including a real anchor.
+      const end = text.indexOf('>', lt + 9);
       if (end < 0) return { ...result, uncertain: true };
-      index = end + 3;
+      index = end + 1;
       continue;
     }
     if (text.startsWith('<!', lt) || text.startsWith('<?', lt)) {
@@ -184,7 +191,7 @@ function scanMarkup(text: string): MarkupScan {
     if (/\son[a-z]+\s*=/i.test(tagText)) result.hasClientRender = true;
     index = bounds.end + 1;
     if (RAW_TEXT_TAGS.has(name)) {
-      const raw = skipRawText(text, index, name);
+      const raw = skipRawText(text, lowerText, index, name);
       if (raw.uncertain) return { ...result, uncertain: true };
       index = raw.end + 1;
     }
@@ -192,7 +199,7 @@ function scanMarkup(text: string): MarkupScan {
   return result;
 }
 
-function findOpeningTag(source: string, tag: string): { start: number; end: number; uncertain: boolean } | null {
+function findOpeningTag(source: string, lowerSource: string, tag: string): { start: number; end: number; uncertain: boolean } | null {
   let index = 0;
   while (index < source.length) {
     const lt = source.indexOf('<', index);
@@ -201,6 +208,13 @@ function findOpeningTag(source: string, tag: string): { start: number; end: numb
       const end = source.indexOf('-->', lt + 4);
       if (end < 0) return { start: lt, end: source.length, uncertain: true };
       index = end + 3;
+      continue;
+    }
+    if (source.startsWith('<![CDATA[', lt)) {
+      // HTML bogus comment: ends at the first `>`, not at `]]>`.
+      const end = source.indexOf('>', lt + 9);
+      if (end < 0) return { start: lt, end: source.length, uncertain: true };
+      index = end + 1;
       continue;
     }
     if (source.startsWith('<!', lt) || source.startsWith('<?', lt) || source[lt + 1] === '/') {
@@ -220,7 +234,7 @@ function findOpeningTag(source: string, tag: string): { start: number; end: numb
     if (name === tag) return { start: lt, end: bounds.end, uncertain: false };
     index = bounds.end + 1;
     if (RAW_TEXT_TAGS.has(name)) {
-      const raw = skipRawText(source, index, name);
+      const raw = skipRawText(source, lowerSource, index, name);
       if (raw.uncertain) return { start: lt, end: raw.end, uncertain: true };
       index = raw.end + 1;
     }
@@ -231,6 +245,7 @@ function findOpeningTag(source: string, tag: string): { start: number; end: numb
 function stripHeadingTags(content: string): { text: string; uncertain: boolean } {
   let text = '';
   let index = 0;
+  const lowerContent = content.toLowerCase();
   while (index < content.length) {
     const lt = content.indexOf('<', index);
     if (lt < 0) {
@@ -243,6 +258,14 @@ function stripHeadingTags(content: string): { text: string; uncertain: boolean }
       if (end < 0) return { text: '', uncertain: true };
       text += ' ';
       index = end + 3;
+      continue;
+    }
+    if (content.startsWith('<![CDATA[', lt)) {
+      // HTML bogus comment: ends at the first `>`, not at `]]>`.
+      const end = content.indexOf('>', lt + 9);
+      if (end < 0) return { text: '', uncertain: true };
+      text += ' ';
+      index = end + 1;
       continue;
     }
     if (content.startsWith('<!', lt) || content.startsWith('<?', lt) || content[lt + 1] === '/') {
@@ -264,7 +287,7 @@ function stripHeadingTags(content: string): { text: string; uncertain: boolean }
     text += ' ';
     index = bounds.end + 1;
     if (RAW_TEXT_TAGS.has(name)) {
-      const raw = skipRawText(content, index, name);
+      const raw = skipRawText(content, lowerContent, index, name);
       if (raw.uncertain) return { text: '', uncertain: true };
       index = raw.end + 1;
     }
@@ -272,17 +295,18 @@ function stripHeadingTags(content: string): { text: string; uncertain: boolean }
   return { text: text.replace(/\s+/g, ' ').trim(), uncertain: false };
 }
 
-function tagText(html: string, tag: string): { text: string; uncertain: boolean } {
-  // Index-based extraction with bounded scans, not a backtracking regex.
-  const source = html.slice(0, HEADING_SCAN_CHARS);
-  const open = findOpeningTag(source, tag);
+function tagText(html: string, lowerHtml: string, tag: string): { text: string; uncertain: boolean } {
+  // Index-based extraction with bounded scans, not a backtracking regex. The
+  // whole (already size-capped) body is scanned so an artificial window cannot
+  // cut a tag in half and falsely report unsafe markup.
+  const open = findOpeningTag(html, lowerHtml, tag);
   if (!open) return { text: '', uncertain: false };
   if (open.uncertain) return { text: '', uncertain: true };
-  const close = source.toLowerCase().indexOf(`</${tag}`, open.end + 1);
+  const close = lowerHtml.indexOf(`</${tag}`, open.end + 1);
   if (close < 0) return { text: '', uncertain: false };
-  const closeEnd = findTagEnd(source, close + 2 + tag.length);
+  const closeEnd = findTagEnd(html, close + 2 + tag.length);
   if (closeEnd.uncertain) return { text: '', uncertain: true };
-  const content = source.slice(open.end + 1, Math.min(close, open.end + 1 + HEADING_TEXT_CHARS));
+  const content = html.slice(open.end + 1, Math.min(close, open.end + 1 + HEADING_TEXT_CHARS));
   const stripped = stripHeadingTags(content);
   return stripped.uncertain ? { text: '', uncertain: true } : { text: stripped.text, uncertain: false };
 }
@@ -309,7 +333,10 @@ export function assessStaticNotFoundBody(input: {
   if (text.includes('\u0000')) return { confirmed: false, reason: 'UNREADABLE' };
   if (hasBlockMarkers(text)) return { confirmed: false, reason: 'BLOCK_MARKERS' };
   if (hasCommunityContent(text)) return { confirmed: false, reason: 'HAS_COMMUNITY_CONTENT' };
-  const markup = scanMarkup(text);
+  // Prepare the lowercase body once; raw-text and heading scans reuse it so a
+  // body with thousands of elements cannot trigger quadratic lowercasing.
+  const lowerText = text.toLowerCase();
+  const markup = scanMarkup(text, lowerText);
   // A tag that could not be fully checked may hide a link, inline handler, or
   // meta refresh. Never confirm absence from partial markup.
   if (markup.uncertain) return { confirmed: false, reason: 'UNSAFE_MARKUP' };
@@ -317,8 +344,8 @@ export function assessStaticNotFoundBody(input: {
   if (markup.hasClientRender) return { confirmed: false, reason: 'CLIENT_RENDER_SHELL' };
   const trimmed = text.trim();
   if (!trimmed) return { confirmed: true, reason: 'EMPTY_BODY' };
-  const title = tagText(text, 'title');
-  const h1 = tagText(text, 'h1');
+  const title = tagText(text, lowerText, 'title');
+  const h1 = tagText(text, lowerText, 'h1');
   if (title.uncertain || h1.uncertain) return { confirmed: false, reason: 'UNSAFE_MARKUP' };
   const heading = `${title.text} ${h1.text}`.trim();
   if (heading && EXPLICIT_NOT_FOUND_PATTERN.test(heading)) {

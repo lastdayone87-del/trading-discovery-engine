@@ -129,6 +129,46 @@ test('static 404 body: attribute text is not treated as visible heading', () => 
   );
 });
 
+test('static 404 body: CDATA-like markup follows HTML bogus-comment rules', () => {
+  // In text/html `<![CDATA[` is a bogus comment ending at the first `>`, so
+  // the anchor after it is browser-visible and must keep rendered escalation.
+  const body =
+    '<html><head><title>404 Not Found</title></head><body><![CDATA[><a href="/community">Join</a>]]></body></html>';
+  assert.deepEqual(
+    assessStaticNotFoundBody({ text: body, truncated: false }),
+    { confirmed: false, reason: 'HAS_LINKS' },
+  );
+});
+
+test('static 404 body: anchors inside an SVG title are links', () => {
+  const body =
+    '<html><head><title>404 Not Found</title></head><body><svg><title><a href="/join">Join</a></title></svg></body></html>';
+  assert.deepEqual(
+    assessStaticNotFoundBody({ text: body, truncated: false }),
+    { confirmed: false, reason: 'HAS_LINKS' },
+  );
+});
+
+test('static 404 body: many raw-text elements stay bounded and do not hide links', () => {
+  const filler = '<style>a{color:red}</style>'.repeat(2_000);
+  const body = `<html><head><title>404 Not Found</title></head><body>${filler}<a href="/join">Join</a></body></html>`;
+  const started = Date.now();
+  const result = assessStaticNotFoundBody({ text: body, truncated: false });
+  const elapsed = Date.now() - started;
+  assert.deepEqual(result, { confirmed: false, reason: 'HAS_LINKS' });
+  assert.ok(elapsed < 2_000, `raw-text scan took ${elapsed}ms`);
+});
+
+test('static 404 body: thousands of title elements stay bounded', () => {
+  const filler = '<TITLE></TITLE>'.repeat(3_000);
+  const body = `<html><head><title>404 Not Found</title></head><body>${filler}</body></html>`;
+  const started = Date.now();
+  const result = assessStaticNotFoundBody({ text: body, truncated: false });
+  const elapsed = Date.now() - started;
+  assert.deepEqual(result, { confirmed: true, reason: 'NO_LINKS_EXPLICIT_NOT_FOUND' });
+  assert.ok(elapsed < 2_000, `title scan took ${elapsed}ms`);
+});
+
 test('static 404 body: community content keeps rendered escalation', () => {
   for (const marker of [
     'https://discord.gg/creator',
