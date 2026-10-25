@@ -38,6 +38,7 @@ import { fingerprintYouTubeKey, projectYouTubeQuotaUsage } from './youtubeQuotaA
 import { sanitizeSchedulingError, type DiscoveryCandidateDiagnosticPatch } from './discoveryTelemetry';
 import { classifyProviderCapacityFailure, classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
 import { decideQueryRunJobLifecycle, type QueryJobLifecycleStatus, type QueryRunLifecycleStatus } from './queryRunJobLifecycle';
+import { createBriefCache } from './briefCache';
 import type { SelectionExperimentObservation } from './querySelectionExperiments';
 import {
   currentOfficialYouTubeQuotaOrigin,
@@ -924,7 +925,7 @@ export async function getExcludedCountries(): Promise<ExcludedCountry[]> { const
 export async function addExcludedCountry(country: ExcludedCountry): Promise<void> { const db=await getDbNoInit().catch(getDb); await db.query('INSERT INTO excluded_countries(country_name,reason) VALUES($1,$2) ON CONFLICT(country_name) DO UPDATE SET reason=excluded.reason',[country.country_name,country.reason]); }
 export async function removeExcludedCountry(countryName: string): Promise<void> { const db=await getDb(); await db.query('DELETE FROM excluded_countries WHERE country_name=$1',[countryName]); }
 
-export async function getQueueStatus(): Promise<QueueStatus> {
+async function loadQueueStatus(): Promise<QueueStatus> {
   const db=await getDb();
   const depths=await db.query(`SELECT type, COUNT(*)::int count FROM jobs WHERE status IN ('PENDING','PROCESSING') GROUP BY type`);
   const controls=await db.query('SELECT queue_name,is_paused FROM queue_controls');
@@ -948,7 +949,53 @@ export async function getQueueStatus(): Promise<QueueStatus> {
   const pendingWork=pending.rows.map(r=>({id:r.id,type:r.type,status:r.status,priority:r.priority||0,ageMs:Math.max(0,now-new Date(r.created_at).getTime()),waitingReason:r.status==='PROCESSING'?'waiting_for_worker':String(r.last_error||'').match(/BROWSER_RUNTIME_UNAVAILABLE/i)?'waiting_for_browser_runtime':new Date(r.run_after).getTime()>now?(String(r.last_error||'').match(/rate.?limit|429/i)?'waiting_for_youtube_rate_limit':String(r.last_error||'').match(/quota|provider.*cool/i)?'waiting_for_quota':'retry_at'):'waiting_for_worker',retryAt:r.status==='PENDING'&&new Date(r.run_after).getTime()>now?iso(r.run_after):null,lastProviderError:r.last_error||null}));
   return { searchJobs:{depth:typeCount(['SEARCH_YOUTUBE','MANUAL_SEARCH_PAGE','AUTONOMOUS_DISCOVERY_CYCLE']),isPaused:!!paused.search_jobs}, channelProcessing:{depth:typeCount(['PROCESS_CHANNEL','ENRICH_CHANNEL']),isPaused:!!paused.channel_processing}, discordValidation:{depth:typeCount(['INSPECT_DISCORD']),isPaused:!!paused.discord_validation}, communityRetry:{duePending,dueBrowserBlocked,dueReconciliationBlocked,dueClaimable:Math.max(0,duePending-dueBrowserBlocked-dueReconciliationBlocked),processing:Number(retry.processing||0),staleProcessing:Number(retry.stale_processing||0),oldestDueAt:iso(retry.oldest_due_at),oldestProcessingAt:iso(retry.oldest_processing_at)},pendingWork };
 }
-export async function toggleQueuePause(queueName:string,isPaused:boolean):Promise<void>{const db=await getDb(); await db.query('INSERT INTO queue_controls(queue_name,is_paused) VALUES($1,$2) ON CONFLICT(queue_name) DO UPDATE SET is_paused=excluded.is_paused',[queueName,isPaused]);}
+
+/**
+ * Queue status is read by every worker tick and by maintenance/admission
+ * checks. Each uncached read issues four queries, including a diagnostic
+ * aggregate over the RETRY_COMMUNITY_ACQUISITION queue. A one-second cache
+ * removes that fan-out while keeping queue pause changes immediate: every
+ * queue-control mutation invalidates the snapshot explicitly.
+ *
+ * The cache is process-local, matching the current single-replica runtime. A
+ * multi-replica deployment would need cross-process invalidation; until then
+ * the TTL bounds any staleness caused by an out-of-band queue-control write.
+ */
+export const QUEUE_STATUS_CACHE_TTL_MS = 1_000;
+const queueStatusCache = createBriefCache(loadQueueStatus, QUEUE_STATUS_CACHE_TTL_MS);
+
+export function invalidateQueueStatusCache(): void {
+  queueStatusCache.invalidate();
+}
+
+export async function getQueueStatus(): Promise<QueueStatus> {
+  return queueStatusCache.get();
+}
+
+/** Uncached status read for diagnostics that must reflect post-claim state. */
+export async function getQueueStatusFresh(): Promise<QueueStatus> {
+  return loadQueueStatus();
+}
+
+/**
+ * Fresh production-depth read for recovery admission. This deliberately
+ * bypasses the brief status cache: recovery work must not be admitted from a
+ * backlog snapshot taken before newly arrived production jobs. The type set
+ * matches the searchJobs + channelProcessing depths reported by queue status.
+ */
+export async function getProductionBacklogDepth(): Promise<number> {
+  const db=await getDb();
+  const res=await db.query(`SELECT COUNT(*)::int AS count FROM jobs WHERE status IN ('PENDING','PROCESSING') AND type IN ('SEARCH_YOUTUBE','MANUAL_SEARCH_PAGE','AUTONOMOUS_DISCOVERY_CYCLE','PROCESS_CHANNEL','ENRICH_CHANNEL')`);
+  return Number(res.rows[0]?.count||0);
+}
+
+export async function toggleQueuePause(queueName:string,isPaused:boolean):Promise<void>{
+  const db=await getDb();
+  await db.query('INSERT INTO queue_controls(queue_name,is_paused) VALUES($1,$2) ON CONFLICT(queue_name) DO UPDATE SET is_paused=excluded.is_paused',[queueName,isPaused]);
+  // Pause/resume must take effect on the next worker tick, not after the cache
+  // TTL. Invalidate only after the write commits.
+  invalidateQueueStatusCache();
+}
 
 export function getYouTubeKeyPool(): string[] { return getConfiguredYouTubeKeys(); }
 /**
@@ -1987,7 +2034,7 @@ export async function claimNextJob(workerId:string,types?:string[],excludedError
     const deniedIds: string[] = [];
     const lockedGuards = new Set<ClaimBudgetGuard>();
     for (;;) {
-      const res=await client.query(`SELECT id,type,payload FROM jobs WHERE status='PENDING' AND run_after<=now() AND ($1::text[] IS NULL OR type=ANY($1)) AND ($2::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND EXISTS (SELECT 1 FROM unnest($2::text[]) pattern WHERE COALESCE(last_error,'') LIKE pattern))) AND ($3::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND COALESCE(payload->>'reconciliationStatus','NONE')=ANY($3::text[]))) AND NOT (id = ANY($4::uuid[])) ORDER BY priority DESC,created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED`,[effectiveTypes||null,excludedErrorPatterns||null,excludedReconciliationStatuses||null,deniedIds]);
+      const res=await client.query(`SELECT id,type,payload FROM jobs WHERE status='PENDING' AND run_after<=now() AND ($1::text[] IS NULL OR type=ANY($1)) AND ($2::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND EXISTS (SELECT 1 FROM unnest($2::text[]) pattern WHERE COALESCE(last_error,'') LIKE pattern))) AND ($3::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND COALESCE(payload->>'reconciliationStatus','NONE')=ANY($3::text[]))) AND NOT (type='RETRY_COMMUNITY_ACQUISITION' AND CASE WHEN btrim(COALESCE(payload->>'retryLifecycleVersion','')) ~ '^[0-9]+$' THEN btrim(payload->>'retryLifecycleVersion')::numeric ELSE 0 END < 2 AND COALESCE(payload->>'retryReason','') <> 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE') AND NOT (id = ANY($4::uuid[])) ORDER BY priority DESC,created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED`,[effectiveTypes||null,excludedErrorPatterns||null,excludedReconciliationStatuses||null,deniedIds]);
       if (!res.rowCount) break;
       const row = res.rows[0];
       const guard = budgetGuards.find(g => g.types.includes(String(row.type)) && (!effectiveTypes || effectiveTypes.some(t => g.types.includes(t))));
@@ -2000,7 +2047,7 @@ export async function claimNextJob(workerId:string,types?:string[],excludedError
       if (verdict.exhausted && effectiveTypes) effectiveTypes = effectiveTypes.filter(t => !guard.types.includes(t));
     }
     if (deniedIds.length && effectiveTypes !== null && !effectiveTypes.length) { await client.query('COMMIT'); return null; }
-    const res=await client.query(`SELECT * FROM jobs WHERE status='PENDING' AND run_after<=now() AND ($1::text[] IS NULL OR type=ANY($1)) AND ($2::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND EXISTS (SELECT 1 FROM unnest($2::text[]) pattern WHERE COALESCE(last_error,'') LIKE pattern))) AND ($3::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND COALESCE(payload->>'reconciliationStatus','NONE')=ANY($3::text[]))) AND NOT (id = ANY($4::uuid[])) ORDER BY priority DESC,created_at ASC FOR UPDATE SKIP LOCKED LIMIT 1`,[effectiveTypes||null,excludedErrorPatterns||null,excludedReconciliationStatuses||null,deniedIds]); if(!res.rowCount){await client.query('COMMIT'); return null;} const job=res.rows[0];const upd=await client.query(`UPDATE jobs SET status='PROCESSING',locked_by=$1,locked_at=now(),attempts=attempts+1,updated_at=now() WHERE id=$2 RETURNING *`,[workerId,job.id]);await client.query(`INSERT INTO job_attempts(job_id,attempt_number,status) VALUES($1,$2,'PROCESSING')`,[job.id,upd.rows[0].attempts]); await client.query('COMMIT');claimed=rowToJob(upd.rows[0]);
+    const res=await client.query(`SELECT * FROM jobs WHERE status='PENDING' AND run_after<=now() AND ($1::text[] IS NULL OR type=ANY($1)) AND ($2::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND EXISTS (SELECT 1 FROM unnest($2::text[]) pattern WHERE COALESCE(last_error,'') LIKE pattern))) AND ($3::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND COALESCE(payload->>'reconciliationStatus','NONE')=ANY($3::text[]))) AND NOT (type='RETRY_COMMUNITY_ACQUISITION' AND CASE WHEN btrim(COALESCE(payload->>'retryLifecycleVersion','')) ~ '^[0-9]+$' THEN btrim(payload->>'retryLifecycleVersion')::numeric ELSE 0 END < 2 AND COALESCE(payload->>'retryReason','') <> 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE') AND NOT (id = ANY($4::uuid[])) ORDER BY priority DESC,created_at ASC FOR UPDATE SKIP LOCKED LIMIT 1`,[effectiveTypes||null,excludedErrorPatterns||null,excludedReconciliationStatuses||null,deniedIds]); if(!res.rowCount){await client.query('COMMIT'); return null;} const job=res.rows[0];const upd=await client.query(`UPDATE jobs SET status='PROCESSING',locked_by=$1,locked_at=now(),attempts=attempts+1,updated_at=now() WHERE id=$2 RETURNING *`,[workerId,job.id]);await client.query(`INSERT INTO job_attempts(job_id,attempt_number,status) VALUES($1,$2,'PROCESSING')`,[job.id,upd.rows[0].attempts]); await client.query('COMMIT');claimed=rowToJob(upd.rows[0]);
     }catch(e){await client.query('ROLLBACK'); throw e;}finally{client.release();}
   // Trace persistence is deliberately outside the claim transaction. The old
   // implementation inserted diagnostic rows before COMMIT, so any trace-only

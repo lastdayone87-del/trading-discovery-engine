@@ -1,5 +1,4 @@
 import { browserCapabilityIsUnavailable } from './browserCapability';
-import { shouldRunStaleChannelLockRecovery } from './staleChannelLockRecovery';
 import {
   getDb,
   enqueueJob,
@@ -8,7 +7,6 @@ import {
   completeJob,
   failJob,
   recoverStaleJobs,
-  recoverStaleChannelLocks,
   getChannelById,
   getQueriesByCountry,
   upsertChannel,
@@ -71,7 +69,7 @@ import { processChannelThroughPipeline, isTerminalState, applyGate1CountryReject
 import { evaluateLowAudienceGate } from './lowAudienceGate';
 import { resolveTerminalEnrichmentFailure } from './enrichmentLifecycle';
 import { recordEvidenceActionOutcome } from './voiEvidenceController';
-import { completeInvestigationStep, failInvestigationStep, heartbeatInvestigationStep, reconcileOrphanInvestigations, recoverStaleInvestigationSteps, startInvestigationStep } from './investigationWorkflow';
+import { completeInvestigationStep, failInvestigationStep, heartbeatInvestigationStep, startInvestigationStep } from './investigationWorkflow';
 import { ChannelRecord, CountryStatus, DiscoverySource, SearchJob, InspectionStep, DiscordStatus } from '../src/types';
 import {
   OfficialYouTubeQuotaFenceError,
@@ -86,8 +84,7 @@ import { createManualSearchSession, getManualSearchSession, recordManualSearchPa
 import { evaluateContinuation } from './continuationPolicy';
 import { evaluateAutonomousQueryAuthority, isScopePromotedRecord } from './autonomousQueryAuthority';
 import { getDiscoveryScope, resolveScopePromotionForScope } from './autonomousDiscovery';
-import { reconcileCommunityAcquisitionRecovery, reconcileLegacyCommunityRetryOwnership, shouldReactivateCommunityRecovery, reactivateCommunityRecovery, projectTerminalCommunityRetryFailure } from './communityRecovery';
-import { projectProviderDeferredEnrichment, reconcileOperationalEnrichmentRecovery } from './operationalEnrichmentRecovery';
+import { shouldReactivateCommunityRecovery, reactivateCommunityRecovery, projectTerminalCommunityRetryFailure } from './communityRecovery';
 import { isProviderDeferredEnrichmentError } from './enrichmentOperationalFailure';
 import { autonomousPageExists, getAutonomousContinuationState, getAutonomousRunMetrics, recordAutonomousPage } from './autonomousPageStore';
 import { recordPassivePage, recordShadowFailure } from './passiveExploration';
@@ -110,7 +107,6 @@ import { shouldUseGeminiFreeSemantic } from './evidenceEngine/providers/GeminiFr
 import { recordExecutionStage, withExecutionTrace } from './executionTrace';
 import { recordNomination } from './candidateAdmission/store';
 import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
-import { triggerPhaseBObservationReconciliation } from './phaseBObservationOutbox';
 import { bumpCommunitySaturationDeferral } from './operationsTelemetry';
 import { canContinueCommunityInspectionAfterDegradedManualClassification } from './manualRecheckPolicy';
 import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_ACQUISITION_REQUIRED, COMMUNITY_RETRY_REASON, FOUND_GAP_RETRYABLE_FAILURE_CLASSES, buildCommunityRetryJobMetadata, isAttemptFreeCommunityFailure, attemptFreeDiscordValidation, retryAtFromUnknown, retryReasonFromError, type CommunityRetryDirective} from './communityRetryPolicy';
@@ -120,11 +116,6 @@ import { admitDiscordCandidates, buildLegacyDiscordCandidate, canonicalDiscordIn
 import { processPendingStagedCandidates } from './candidateStaging';
 
 const WORKER_ID = `worker_${process.pid}`;
-
-/** Last runtime stale-channel-lock sweep started by this process. Worker
- * pools tick every second; this timestamp keeps the sweep on a shared
- * cooldown instead of running unbounded on every claim. */
-let lastStaleChannelLockRecoveryMs: number | null = null;
 
 /**
  * Pushes a new search query job to the Search Jobs Queue.
@@ -630,29 +621,13 @@ export async function processNextSearchJob(
   claimableOverride?: Array<ClaimableSearchJobType>,
   workerId = WORKER_ID
 ): Promise<boolean> {
+  // Claim-critical recovery: release stale PROCESSING locks before attempting
+  // a claim. Every other sweep (channel locks, investigation/community
+  // recovery, provider-deferred projection, operational enrichment recovery,
+  // Phase B reconciliation) runs on the dedicated scheduler interval in
+  // operationalMaintenanceScheduler.ts, so it cannot serialize ahead of every
+  // claim in every pool.
   await recoverStaleJobs();
-  if (shouldRunStaleChannelLockRecovery({ lastRunMs: lastStaleChannelLockRecoveryMs })) {
-    // Stamp before running so a failing sweep backs off for the normal
-    // interval instead of being retried on every worker tick.
-    lastStaleChannelLockRecoveryMs = Date.now();
-    try {
-      await recoverStaleChannelLocks();
-    } catch (error) {
-      // Auxiliary housekeeping: a persistent sweep failure must be visible in
-      // logs without stalling the search claim path on every tick.
-      console.error('stale_channel_lock_recovery_failed', error);
-    }
-  }
-  await recoverStaleInvestigationSteps();
-  await reconcileOrphanInvestigations();
-  await reconcileCommunityAcquisitionRecovery(getDb, getChannelById, upsertChannel, 20, Date.now(), (channelId, retryReason) => enqueueCommunityAcquisitionRetry(channelId, { attemptFree: true, code: COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, reason: retryReason || 'Recovery-triggered community retry', retryAt: undefined, retryReason: retryReason === 'BROWSER_RUNTIME_UNAVAILABLE' ? 'BROWSER_RUNTIME_UNAVAILABLE' : 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE' }, 'RECOVERY'));
-  const legacyCommunityReconciliation = await reconcileLegacyCommunityRetryOwnership(getDb, 250);
-  if (legacyCommunityReconciliation.closedNonCommunity > 0 || legacyCommunityReconciliation.activeCommunity > 0) {
-    console.info(`[Queue Worker] Restored ${legacyCommunityReconciliation.closedNonCommunity} legacy non-community job(s) to completed history; activeCommunity=${legacyCommunityReconciliation.activeCommunity}.`);
-  }
-  await projectProviderDeferredEnrichment(getDb, getChannelById, upsertChannel, 100);
-  await reconcileOperationalEnrichmentRecovery(getDb, getChannelById, upsertChannel, enqueueOperationalEnrichmentRecoveryJob, 20, Date.now());
-  triggerPhaseBObservationReconciliation();
   const qStatus = await getQueueStatus();
   const claimableTypes: string[] = [];
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('SEARCH_YOUTUBE'))) claimableTypes.push('SEARCH_YOUTUBE');
@@ -2598,7 +2573,7 @@ export function operationalEnrichmentRecoveryKey(channelId:string):string{return
 export function buildOperationalEnrichmentRecoveryPayload(channel:Pick<ChannelRecord,'channel_id'|'channel_name'|'youtube_url'|'country'|'discovery_source'|'subscriber_count'|'channel_thumbnail_url'>,reasonCodes:string[]){
   return {channelId:channel.channel_id,targetCountry:channel.country,source:(channel.discovery_source||'recovery') as DiscoverySource,enrichmentStage:1,evidenceAction:'CHANNEL_RECENT_METADATA',candidate:{channelId:channel.channel_id,channelName:channel.channel_name,youtubeUrl:channel.youtube_url,locationTag:channel.country,description:'',videoTitles:[],channelLinks:[],subscriberCount:channel.subscriber_count,channelThumbnailUrl:channel.channel_thumbnail_url,enrichmentStage:1},recoveryReasonCodes:reasonCodes};
 }
-async function enqueueOperationalEnrichmentRecoveryJob(channel:ChannelRecord,reasonCodes:string[],clientOverride?:any):Promise<void>{
+export async function enqueueOperationalEnrichmentRecoveryJob(channel:ChannelRecord,reasonCodes:string[],clientOverride?:any):Promise<void>{
   const job=await enqueueJob('ENRICH_CHANNEL',buildOperationalEnrichmentRecoveryPayload(channel,reasonCodes),{idempotencyKey:operationalEnrichmentRecoveryKey(channel.channel_id),priority:10,maxAttempts:4,clientOverride});
   await (clientOverride||await getDb()).query(`UPDATE jobs SET first_transient_failure_at=NULL WHERE id=$1 AND status='PENDING'`,[job.id]);
 }

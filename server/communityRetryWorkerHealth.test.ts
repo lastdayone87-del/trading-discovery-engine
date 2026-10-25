@@ -19,9 +19,10 @@ test('community retry worker remains a one-second continuously scheduled consume
   assert.match(workers, /schedule\(tick, 1000\)/);
 });
 
-test('queue status exposes only the aggregate community retry worker health readout', () => {
+test('queue status exposes only aggregate worker health readouts', () => {
   assert.match(server, /app\.get\('\/api\/queues\/status'/);
-  assert.match(server, /maintenance: \{ communityRetry: getCommunityRetryWorkerHealth\(\) \}/);
+  assert.match(server, /communityRetry: getCommunityRetryWorkerHealth\(\)/);
+  assert.match(server, /operational: getOperationalMaintenanceSchedulerHealth\(\)/);
   assert.doesNotMatch(server, /res\.json\(.*maintenance.*channelId/);
 });
 

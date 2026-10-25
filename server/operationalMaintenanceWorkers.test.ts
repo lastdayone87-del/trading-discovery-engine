@@ -19,6 +19,16 @@ test('community retry distinguishes due admission blockers from a genuinely empt
   assert.match(workers, /communityRetry/);
 });
 
+test('recovery admission and retry diagnosis bypass the brief queue-status cache', () => {
+  const dbCore = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
+  assert.match(workers, /getProductionBacklogDepth\(\)/);
+  assert.match(workers, /getQueueStatusFresh\(\)\)\.communityRetry/);
+  assert.match(dbCore, /export async function getQueueStatusFresh/);
+  assert.match(dbCore, /export async function getProductionBacklogDepth/);
+  assert.match(dbCore, /COUNT\(\*\)::int AS count FROM jobs WHERE status IN \('PENDING','PROCESSING'\)/);
+  assert.doesNotMatch(workers, /getQueueStatus\(\)/);
+});
+
 test('queue status exposes browser-blocked and claimable due retry counts', () => {
   const dbCore = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
   assert.match(dbCore, /due_browser_blocked/);
@@ -72,6 +82,7 @@ test('maintenance concurrency is bounded and starts after database readiness in 
   assert.match(startup, /if \(isServerRuntime\(\)\) \{[\s\S]*startOperationalMaintenanceWorkers\(\);/);
   assert.match(startup, /markDatabaseReady/);
   assert.match(startup, /Operational maintenance consumers started after database readiness/);
+  assert.equal(workers.match(/startOperationalMaintenanceScheduler\(\)/g)?.length, 1);
 });
 
 test('only the community retry consumer scales; every other family runs exactly one loop', () => {
@@ -95,8 +106,8 @@ test('only the community retry consumer scales; every other family runs exactly 
 });
 
 test('legacy community reconciliation restores completed history without a stale-retry worker pass', () => {
-  const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
-  assert.match(queue, /const legacyCommunityReconciliation = await reconcileLegacyCommunityRetryOwnership/);
-  assert.match(queue, /Restored \$\{legacyCommunityReconciliation\.closedNonCommunity\} legacy non-community job/);
-  assert.doesNotMatch(queue, /reconcilePendingCommunityRetryJobs/);
+  const scheduler = readFileSync(new URL('./operationalMaintenanceScheduler.ts', import.meta.url), 'utf8');
+  assert.match(scheduler, /const legacyCommunityReconciliation = await reconcileLegacyCommunityRetryOwnership/);
+  assert.match(scheduler, /Restored \$\{legacyCommunityReconciliation\.closedNonCommunity\} legacy non-community job/);
+  assert.doesNotMatch(scheduler, /reconcilePendingCommunityRetryJobs/);
 });

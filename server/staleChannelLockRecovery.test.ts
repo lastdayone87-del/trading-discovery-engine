@@ -14,6 +14,7 @@ const migration = readFileSync(new URL('./db/migrations/090_reconcile_stale_chan
 const terminalMigration = readFileSync(new URL('./db/migrations/153_reconcile_channel_locks_on_terminal_jobs.sql', import.meta.url), 'utf8');
 const dbSource = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
 const queueSource = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+const schedulerSource = readFileSync(new URL('./operationalMaintenanceScheduler.ts', import.meta.url), 'utf8');
 
 test('runtime reconciliation only follows PROCESSING to PENDING job releases', () => {
   assert.match(migration, /WHEN \(OLD\.status='PROCESSING' AND NEW\.status='PENDING'\)/);
@@ -80,8 +81,8 @@ test('runtime recovery sweep is throttled and bounded per tick', () => {
   assert.match(dbSource, /LIMIT \(\$2\)::bigint/);
   assert.match(dbSource, /FOR UPDATE SKIP LOCKED/);
   assert.match(dbSource, /STALE_CHANNEL_LOCK_RECOVERY_BATCH_SIZE/);
-  assert.match(queueSource, /shouldRunStaleChannelLockRecovery/);
-  assert.match(queueSource, /lastStaleChannelLockRecoveryMs/);
+  assert.match(schedulerSource, /shouldRunStaleChannelLockRecovery/);
+  assert.match(schedulerSource, /lastStaleChannelLockRecoveryMs/);
 });
 
 test('terminated jobs recover only after the grace period when no live job remains', () => {
@@ -120,17 +121,19 @@ test('runtime recovery is bounded to old LOCKED rows without live ownership', ()
   assert.match(dbSource, /RETURNING c\.channel_id/);
 });
 
-test('worker tick runs channel lock recovery alongside stale job recovery', () => {
-  assert.match(queueSource, /await recoverStaleJobs\(\);[\s\S]*await recoverStaleChannelLocks\(\);/);
+test('claim path recovers stale jobs while the maintenance interval recovers channel locks', () => {
+  assert.match(queueSource, /await recoverStaleJobs\(\);/);
+  assert.doesNotMatch(queueSource, /recoverStaleChannelLocks/);
+  assert.match(schedulerSource, /dependencies\.recoverStaleChannelLocks\(\)/);
 });
 
-test('a failing channel lock sweep is logged, not rethrown into the claim path', () => {
+test('a failing channel lock sweep is isolated in the maintenance interval', () => {
   // The sweep is auxiliary housekeeping: a persistent failure must back off
-  // for the normal interval and continue, or every worker tick would abort
-  // before the job claim for as long as the failure lasts.
-  assert.match(queueSource, /lastStaleChannelLockRecoveryMs = Date\.now\(\);\s*try\s*\{\s*await recoverStaleChannelLocks\(\);\s*\}\s*catch \(error\)\s*\{[\s\S]*?console\.error\('stale_channel_lock_recovery_failed', error\);/);
-  assert.doesNotMatch(queueSource, /lastStaleChannelLockRecoveryMs = null/);
-  assert.doesNotMatch(queueSource, /throw error;[\s\S]{0,120}await recoverStaleInvestigationSteps/);
+  // for the normal interval and continue, or every maintenance tick would
+  // abort the remaining recovery guarantees for as long as the failure lasts.
+  assert.match(schedulerSource, /lastStaleChannelLockRecoveryMs = nowMs;\s*try\s*\{\s*await dependencies\.recoverStaleChannelLocks\(\);\s*\}\s*catch \(error\)\s*\{[\s\S]*?console\.error\('stale_channel_lock_recovery_failed', error\);/);
+  assert.doesNotMatch(schedulerSource, /lastStaleChannelLockRecoveryMs = null/);
+  assert.doesNotMatch(queueSource, /recoverStaleInvestigationSteps/);
 });
 
 test('one-time cleanup is bounded to old LOCKED rows without live ownership', () => {

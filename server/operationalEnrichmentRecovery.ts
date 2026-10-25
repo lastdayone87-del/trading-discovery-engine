@@ -70,12 +70,42 @@ let lastOperationalEnrichmentReconciliationAt = 0;
 // module boolean cannot coordinate across processes.
 let operationalEnrichmentReconciliationInFlight = false;
 
+/** Start-to-start interval for the provider-deferred projection. */
+export const PROVIDER_DEFERRED_PROJECTION_INTERVAL_MS = 60_000;
+// The projection rewrites channel rows one at a time and is not claim-critical.
+// A start-to-start throttle plus single-flight prevents the worker fan-out from
+// repeating the same bounded scan on every tick.
+let lastProviderDeferredProjectionAt = 0;
+let providerDeferredProjectionInFlight = false;
+
 /** Project only machine-owned, provider-blocked terminal rows for truthful dashboard state. */
 export async function projectProviderDeferredEnrichment(
   getDb: () => Promise<any>,
   getChannelById: (id: string) => Promise<ChannelRecord | null>,
   upsertChannel: (channel: ChannelRecord) => Promise<void>,
-  limit = 100
+  limit = 100,
+  now = Date.now()
+): Promise<number> {
+  // Check the in-flight guard before the throttle: a concurrent call must not
+  // start a second scan, and a skipped call must not extend the window.
+  if (providerDeferredProjectionInFlight) return 0;
+  if (now - lastProviderDeferredProjectionAt < PROVIDER_DEFERRED_PROJECTION_INTERVAL_MS) return 0;
+  lastProviderDeferredProjectionAt = now;
+  providerDeferredProjectionInFlight = true;
+  try {
+    return await runProviderDeferredProjection(getDb, getChannelById, upsertChannel, limit);
+  } finally {
+    // Always release, including on query failure, so one transient error
+    // cannot permanently disable the projection for this process.
+    providerDeferredProjectionInFlight = false;
+  }
+}
+
+async function runProviderDeferredProjection(
+  getDb: () => Promise<any>,
+  getChannelById: (id: string) => Promise<ChannelRecord | null>,
+  upsertChannel: (channel: ChannelRecord) => Promise<void>,
+  limit: number
 ): Promise<number> {
   const db = await getDb();
   const rows = await db.query(

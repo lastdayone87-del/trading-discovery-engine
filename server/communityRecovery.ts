@@ -6,7 +6,11 @@ export interface CommunityRecoveryReactivationReason {
   reasonCodes: string[];
 }
 
-export type EnqueueCommunityRecoveryJob = (channelId: string, retryReason?: string) => Promise<void>;
+export type EnqueueCommunityRecoveryJob = (
+  channelId: string,
+  reactivationReasonCodes?: string,
+  priorRetryReason?: string
+) => Promise<void>;
 
 const COMMUNITY_RETRY_SURFACES = new Set([
   'CHANNEL_LINKS', 'CHANNEL_EXTERNAL_LINKS', 'EXTERNAL_LINKS', 'LINKED_WEBSITES', 'CUSTOM_DOMAINS',
@@ -243,6 +247,10 @@ export async function reconcileLegacyCommunityRetryOwnership(
     });
     const nextPayload: Record<string, unknown> = {
       ...payload,
+      // The sweep has now classified ownership. Mark the row as settled so the
+      // claim path can distinguish it from an unreconciled legacy retry and the
+      // sweep does not re-examine the same job every interval.
+      retryLifecycleVersion: 2,
       retryReason: decision.retryReason,
       retrySource: payload.retrySource || 'LEGACY',
       // The original audit payload/history remains intact, but no newer stale
@@ -361,6 +369,7 @@ export async function reconcileCommunityAcquisitionRecovery(
   const rows = await db.query(
     `SELECT c.channel_id,
             retry_job.id AS capacity_retry_job_id,
+            retry_job.retry_reason,
             COALESCE(
               retry_job.status='FAILED'
               AND retry_job.last_error LIKE $2,
@@ -368,7 +377,7 @@ export async function reconcileCommunityAcquisitionRecovery(
             ) AS capacity_terminal
        FROM channels c
        LEFT JOIN LATERAL (
-         SELECT j.id,j.status,j.last_error
+         SELECT j.id,j.status,j.last_error,j.payload->>'retryReason' AS retry_reason
            FROM jobs j
           WHERE j.type='RETRY_COMMUNITY_ACQUISITION'
             AND j.payload->>'channelId'=c.channel_id
@@ -422,7 +431,13 @@ export async function reconcileCommunityAcquisitionRecovery(
           [row.capacity_retry_job_id]
         );
       }
-      if (enqueueRecoveryJob) await enqueueRecoveryJob(channelRecord.channel_id, triggerCheck.reasonCodes.join(','));
+      if (enqueueRecoveryJob) {
+        await enqueueRecoveryJob(
+          channelRecord.channel_id,
+          triggerCheck.reasonCodes.join(','),
+          capacityTerminal ? String(row.retry_reason || '') : undefined
+        );
+      }
     } catch (error) {
       await upsertChannel(channelRecord);
       throw error;

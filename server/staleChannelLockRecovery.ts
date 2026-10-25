@@ -5,9 +5,9 @@ import type { ScanStatus } from '../src/types';
  * covers legacy/search-worker paths that do not carry a per-channel job id. */
 export const STALE_CHANNEL_LOCK_AFTER_MINUTES = 60;
 
-/** Worker ticks run roughly once per second per pool. A shared process-local
- * cooldown keeps the sweep off the hot path while still recovering abandoned
- * locks promptly relative to the 60-minute grace period. */
+/** Maintenance ticks run on a shared interval. A shared process-local cooldown
+ * keeps the sweep off the hot path while still recovering abandoned locks
+ * promptly relative to the 60-minute grace period. */
 export const STALE_CHANNEL_LOCK_RECOVERY_INTERVAL_MS = 30_000;
 
 /** Cap a single sweep so a backlog cannot monopolize a worker tick; the next

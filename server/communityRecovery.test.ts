@@ -240,6 +240,29 @@ test('legacy selector treats missing or malformed lifecycle versions as legacy a
   assert.doesNotMatch(source, /reconciliationStatus: 'RECONCILIATION_REQUIRED'/);
 });
 
+test('claim path blocks unreconciled legacy retries until maintenance settles ownership', () => {
+  const dbCore = read('server/dbCore.ts');
+  const claim = dbCore.slice(
+    dbCore.indexOf('export async function claimNextJob'),
+    dbCore.indexOf('export async function completeJob')
+  );
+  assert.match(
+    claim,
+    /NOT \(type='RETRY_COMMUNITY_ACQUISITION' AND CASE WHEN btrim\(COALESCE\(payload->>'retryLifecycleVersion',''\)\) ~ '\^\[0-9\]\+\$' THEN btrim\(payload->>'retryLifecycleVersion'\)::numeric ELSE 0 END < 2 AND COALESCE\(payload->>'retryReason',''\) <> 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE'\)/
+  );
+  assert.equal(
+    (claim.match(/END < 2/g) || []).length,
+    2,
+    'both claim candidate queries must block unreconciled legacy retries'
+  );
+
+  const source = read('server/communityRecovery.ts');
+  assert.match(source, /retryLifecycleVersion: 2/);
+  assert.match(source, /j\.payload->>'retryReason' AS retry_reason/);
+  assert.match(source, /retry_job\.retry_reason,/);
+  assert.match(source, /priorRetryReason/);
+});
+
 test('reconciliation uses effective surface precedence so completed no-match coverage clears stale failure eligibility', () => {
   const source = read('server/communityRecovery.ts');
   assert.match(source, /SELECT DISTINCT ON \(o\.provenance->>'surface'/);
@@ -276,10 +299,12 @@ test('automatic reconciliation restores the prior failure projection when recove
 test('production ingestion and manual recheck entry points invoke community recovery reactivation', () => {
   const pipeSource = read('server/ingestionPipeline.ts');
   const queueSource = read('server/queueManager.ts');
+  const schedulerSource = read('server/operationalMaintenanceScheduler.ts');
 
   assert.match(pipeSource, /shouldReactivateCommunityRecovery\(existing, candidate, isManualScan\)/);
   assert.match(queueSource, /shouldReactivateCommunityRecovery\(channel, undefined, true\)/);
-  assert.match(queueSource, /reconcileCommunityAcquisitionRecovery\(getDb, getChannelById, upsertChannel, 20, Date\.now\(\),/);
-  assert.match(queueSource, /reconcileLegacyCommunityRetryOwnership\(getDb, 250\)/);
+  assert.match(schedulerSource, /reconcileCommunityAcquisitionRecovery\(\s*getDb,\s*getChannelById,\s*upsertChannel,\s*20,\s*Date\.now\(\),/);
+  assert.match(schedulerSource, /reconcileLegacyCommunityRetryOwnership\(getDb, 250\)/);
   assert.doesNotMatch(queueSource, /reconcilePendingCommunityRetryJobs\(getDb, 100\)/);
+  assert.doesNotMatch(queueSource, /reconcileCommunityAcquisitionRecovery\(/);
 });
