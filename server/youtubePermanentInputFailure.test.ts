@@ -56,11 +56,13 @@ test('youtubeFetch classifies permanent input only after excluding every key-lev
     /const permanentInput=isYouTubeInputFailure\(error\)&&!isYouTubePageTokenFailure\(error\)\s*&&!consumerSuspended&&!isInvalidApiKey\(error\)&&!isQuotaExceeded\(error\)&&!runtimeRateLimited;/,
   );
   const release = fetchBlock.indexOf('if(permanentInput){');
-  const settle = fetchBlock.indexOf('settleKeyCapReservation(pool,capReservation)', release);
-  const probeRelease = fetchBlock.indexOf('releaseProbeReservationSafe()', release);
   const permanentThrow = fetchBlock.indexOf('new YouTubePermanentInputError(operation,error)', release);
-  assert.ok(release >= 0 && settle > release && probeRelease > release && permanentThrow > release,
-    'permanent input must release both exact leases before surfacing');
+  const branch = fetchBlock.slice(release, permanentThrow);
+  assert.ok(release >= 0 && permanentThrow > release, 'permanent input must surface after classification');
+  // Google charges at least one unit even for invalid requests, so the branch
+  // must not release the dispatch leases as if the request were free.
+  assert.doesNotMatch(branch, /settleKeyCapReservation|releaseProbeReservationSafe/);
+  assert.match(branch, /charges at least one unit/);
 });
 
 test('every official key loop stops rotating on permanent input', () => {

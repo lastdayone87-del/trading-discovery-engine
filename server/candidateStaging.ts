@@ -1,6 +1,7 @@
 import { getDb, enqueueJob } from './db';
 import { normalizeYouTubeLocator } from './braveSearch';
 import { resolveYouTubeLocatorAuthoritatively } from './youtube';
+import { isYouTubePermanentInputError } from './youtubeKeyHealth';
 
 export interface PendingStagedCandidate {
   id: string;
@@ -160,7 +161,17 @@ export async function processPendingStagedCandidates(
         if (channelId) { await updateStagedCandidateResolution(cand.id, { resolutionStatus: 'RESOLVED', resolvedChannelId: channelId, validationStatus: 'UNVALIDATED' }, clientOverride); resolved++; }
         else { await enqueueStagedResolution(cand, clientOverride); deferred++; }
         processed++;
-      } catch { await enqueueStagedResolution(cand, clientOverride); deferred++; }
+      } catch (error) {
+        if (isYouTubePermanentInputError(error)) {
+          // A deleted/malformed locator will fail identically on every retry.
+          // Mark the staging candidate terminal instead of re-enqueueing it.
+          await updateStagedCandidateResolution(cand.id, { resolutionStatus: 'FAILED', duplicateRejectionReason: 'AUTHORITATIVE_CHANNEL_RESOLUTION_PERMANENT_INPUT' }, clientOverride);
+          processed++;
+          continue;
+        }
+        await enqueueStagedResolution(cand, clientOverride);
+        deferred++;
+      }
       continue;
     }
 
@@ -170,6 +181,13 @@ export async function processPendingStagedCandidates(
       else { await updateStagedCandidateResolution(cand.id, { resolutionStatus: 'FAILED', duplicateRejectionReason: 'AUTHORITATIVE_CHANNEL_RESOLUTION_EMPTY' }, clientOverride); }
       processed++;
     } catch (error: any) {
+      if (isYouTubePermanentInputError(error)) {
+        // Same terminal rule for direct HANDLE/VIDEO_ID candidates: a deleted
+        // handle or video must not be retried forever through the staging queue.
+        await updateStagedCandidateResolution(cand.id, { resolutionStatus: 'FAILED', duplicateRejectionReason: 'AUTHORITATIVE_CHANNEL_RESOLUTION_PERMANENT_INPUT' }, clientOverride);
+        processed++;
+        continue;
+      }
       await enqueueStagedResolution(cand, clientOverride);
       deferred++;
     }

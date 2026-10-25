@@ -649,13 +649,11 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
         }
         trace(`after HTTP fetch at server/youtube.ts:131 (status=${response.status})`);
         if(!response.ok){
-          // Hold the reservation until reset: a non-2xx request can still have
-          // consumed provider quota, and the conservative lease prevents
-          // concurrent retries from over-admitting the allocation. The one
-          // exception is a permanent invalid input (400/404/422 other than a
-          // page token, bad key, suspension, quota, or rate limit): the
-          // provider rejects it before charging, so its exact leases are
-          // released below instead of being stranded until reset.
+          // Hold the reservation until reset: every request, including an
+          // invalid one, incurs at least one quota unit per Google's quota
+          // calculator. The conservative lease prevents concurrent retries
+          // from over-admitting the allocation; permanent input only stops the
+          // key fan-out, it does not make the dispatch free.
           trace('before HTTP-error-body-read at server/youtube.ts:135');
           const error=await youtubeHttpError(response,trace);
           trace('after HTTP-error-body-read at server/youtube.ts:135');
@@ -695,15 +693,9 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
               if(input) await recordYouTubeInvalidInput(input.kind,input.value,operation,YOUTUBE_INPUT_QUARANTINE_TTL_MS).catch(()=>undefined);
             }
             if(permanentInput){
-              // Invalid input is rejected before the provider charges units:
-              // release the exact cap/probe leases so a permanent 404 cannot
-              // strand capacity until the Pacific reset. The shadow-only
-              // observation (when the cap is off) expires on its own and
-              // never gates admission.
-              if(capReservation){
-                try{const pool=await getDb();await settleKeyCapReservation(pool,capReservation);}catch{/* expiry remains the backstop */}
-              }
-              await releaseProbeReservationSafe();
+              // Google charges at least one unit even for invalid requests, so
+              // the dispatch lease stays conservative until reset. Only the
+              // key fan-out stops: the marker makes every caller terminal.
               const permanentError=new YouTubePermanentInputError(operation,error);
               Object.assign(permanentError,{providerKey:dispatchedProviderKey,providerFailureRecorded:true});
               throw permanentError;
