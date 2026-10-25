@@ -234,6 +234,32 @@ test('static 404 body: client-rendered shells keep rendered escalation', () => {
   }
 });
 
+test('static 404 body: encoded meta refresh values are client-rendered shells', () => {
+  for (const body of [
+    '<html><head><title>404 Not Found</title><meta http-equiv="&#114;efresh" content="0;url=/community"></head><body>Not found</body></html>',
+    '<html><head><title>404 Not Found</title><meta http-equiv="r&#101;fresh" content="0;url=/community"></head><body>Not found</body></html>',
+    '<html><head><title>404 Not Found</title><meta http-equiv="refres&#x68;" content="0;url=/community"></head><body>Not found</body></html>',
+    '<html><head><title>404 Not Found</title><meta http-equiv="&#x52;EFRESH" content="0;url=/community"></head><body>Not found</body></html>',
+    '<html><head><title>404 Not Found</title><meta http-equiv="&NewLine;refresh" content="0;url=/community"></head><body>Not found</body></html>',
+  ]) {
+    assert.deepEqual(
+      assessStaticNotFoundBody({ text: body, truncated: false }),
+      { confirmed: false, reason: 'CLIENT_RENDER_SHELL' },
+      body,
+    );
+  }
+});
+
+test('static 404 body: encoded non-refresh http-equiv values do not force a render', () => {
+  assert.deepEqual(
+    assessStaticNotFoundBody({
+      text: '<html><head><title>404 Not Found</title><meta http-equiv="Content-Type" content="text/html; charset=&quot;utf-8&quot;"></head><body>Not found</body></html>',
+      truncated: false,
+    }),
+    { confirmed: true, reason: 'NO_LINKS_EXPLICIT_NOT_FOUND' },
+  );
+});
+
 test('static 404 body: bot/block markers keep rendered escalation', () => {
   assert.deepEqual(
     assessStaticNotFoundBody({

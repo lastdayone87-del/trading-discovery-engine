@@ -91,6 +91,47 @@ const SMALL_BODY_CHARS = 2_048;
 const RAW_TEXT_TAGS = new Set(['script', 'style', 'textarea', 'xmp']);
 const CLIENT_RENDER_TAGS = new Set(['script', 'iframe', 'form', 'object', 'embed']);
 
+// Browsers decode character references in attribute values, so a refresh
+// directive can be written as `http-equiv="&#114;efresh"`. Decode numeric
+// references and the small named set that can pad an attribute value before
+// comparing the bounded value.
+const NAMED_CHARACTER_REFERENCES: Record<string, string> = {
+  amp: '&',
+  apos: "'",
+  gt: '>',
+  lt: '<',
+  newline: '\n',
+  quot: '"',
+  tab: '\t',
+};
+
+function decodeCharacterReferences(value: string): string {
+  return value.replace(
+    /&(?:#(\d+)|#x([0-9a-f]+)|([a-z][a-z0-9]+));?/gi,
+    (reference, decimal: string | undefined, hexadecimal: string | undefined, named: string | undefined) => {
+      if (decimal) {
+        const codePoint = Number(decimal);
+        return Number.isSafeInteger(codePoint) && codePoint > 0 && codePoint <= 0x10ffff
+          ? String.fromCodePoint(codePoint)
+          : reference;
+      }
+      if (hexadecimal) {
+        const codePoint = Number.parseInt(hexadecimal, 16);
+        return Number.isSafeInteger(codePoint) && codePoint > 0 && codePoint <= 0x10ffff
+          ? String.fromCodePoint(codePoint)
+          : reference;
+      }
+      return NAMED_CHARACTER_REFERENCES[named?.toLowerCase() ?? ''] ?? reference;
+    },
+  );
+}
+
+function metaHttpEquivValue(tagText: string): string | null {
+  const match = /(?:^|\s)http-equiv\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/i.exec(tagText);
+  if (!match) return null;
+  return decodeCharacterReferences(match[1] ?? match[2] ?? match[3] ?? '').trim().toLowerCase();
+}
+
 interface TagBounds {
   end: number;
   uncertain: boolean;
@@ -190,7 +231,7 @@ function scanMarkup(text: string, lowerText: string, mode: 'body' | 'title' = 'b
     const tagText = text.slice(lt, bounds.end + 1);
     if ((name === 'a' || name === 'area') && /\bhref\s*=/i.test(tagText)) result.hasLink = true;
     if (CLIENT_RENDER_TAGS.has(name)) result.hasClientRender = true;
-    if (name === 'meta' && /\bhttp-equiv\s*=\s*["']?refresh/i.test(tagText)) result.hasClientRender = true;
+    if (name === 'meta' && metaHttpEquivValue(tagText) === 'refresh') result.hasClientRender = true;
     if (/\son[a-z]+\s*=/i.test(tagText)) result.hasClientRender = true;
     index = bounds.end + 1;
     if (name === 'plaintext') {
