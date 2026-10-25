@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  KEY_CAP_REFUSAL_EVENT_PRUNE_BATCH,
+  KEY_CAP_REFUSAL_EVENT_RETENTION_DAYS,
+  PRUNE_KEY_CAP_REFUSAL_EVENTS_SQL,
   RECORD_KEY_CAP_REFUSAL_SQL,
+  logKeyCapRefusalAccountingFailure,
+  pruneYouTubeKeyCapRefusalEvents,
   recordYouTubeKeyCapRefusal,
   recordYouTubeKeyCapRefusalSafe,
   readYouTubeKeyCapRefusalKeyCounts,
@@ -56,11 +61,71 @@ test('invalid refusal input is rejected before touching the database', async () 
 });
 
 test('safe recorder swallows database and validation failures', async () => {
-  const broken: KeyCapRefusalQueryClient = {
-    query: async () => { throw new Error('db unavailable'); },
+  const original = console.error;
+  console.error = () => undefined;
+  try {
+    const broken: KeyCapRefusalQueryClient = {
+      query: async () => { throw new Error('db unavailable'); },
+    };
+    assert.equal(await recordYouTubeKeyCapRefusalSafe(broken, input), false);
+    assert.equal(await recordYouTubeKeyCapRefusalSafe(broken, { ...input, capUnits: 0 }), false);
+  } finally {
+    console.error = original;
+  }
+});
+
+test('accounting failures emit a structured event instead of disappearing', async () => {
+  const original = console.error;
+  const lines: string[] = [];
+  console.error = (line?: unknown) => { lines.push(String(line)); };
+  try {
+    const broken: KeyCapRefusalQueryClient = {
+      query: async () => { throw new Error('db unavailable'); },
+    };
+    assert.equal(await recordYouTubeKeyCapRefusalSafe(broken, input), false);
+    logKeyCapRefusalAccountingFailure(new Error('commit failed'), {
+      branch: 'enforced-reservation',
+      quotaDay: '2026-10-20',
+      operationId: 'cap:test:log',
+    });
+  } finally {
+    console.error = original;
+  }
+  assert.equal(lines.length, 2);
+  const safe = JSON.parse(lines[0]);
+  assert.equal(safe.event, 'youtube_key_cap_refusal_accounting_failed');
+  assert.equal(safe.branch, 'safe');
+  assert.equal(safe.quotaDay, '2026-10-20');
+  assert.match(safe.message, /db unavailable/);
+  const shadow = JSON.parse(lines[1]);
+  assert.equal(shadow.branch, 'enforced-reservation');
+  assert.equal(shadow.operationId, 'cap:test:log');
+  assert.match(shadow.message, /commit failed/);
+});
+
+test('event retention is bounded and the counter table is never pruned', async () => {
+  assert.equal(KEY_CAP_REFUSAL_EVENT_RETENTION_DAYS, 30);
+  assert.equal(KEY_CAP_REFUSAL_EVENT_PRUNE_BATCH, 5_000);
+  assert.match(PRUNE_KEY_CAP_REFUSAL_EVENTS_SQL, /DELETE FROM youtube_key_cap_refusal_events/);
+  assert.doesNotMatch(PRUNE_KEY_CAP_REFUSAL_EVENTS_SQL, /youtube_key_cap_refusal_counters/);
+  assert.match(PRUNE_KEY_CAP_REFUSAL_EVENTS_SQL, /LIMIT \$2/);
+
+  let text = '';
+  let values: unknown[] | undefined;
+  const client: KeyCapRefusalQueryClient = {
+    query: async (sql, params) => {
+      text = sql;
+      values = params;
+      return { rows: [], rowCount: 7 };
+    },
   };
-  assert.equal(await recordYouTubeKeyCapRefusalSafe(broken, input), false);
-  assert.equal(await recordYouTubeKeyCapRefusalSafe(broken, { ...input, capUnits: 0 }), false);
+  assert.equal(await pruneYouTubeKeyCapRefusalEvents(client, 30, 1_000), 7);
+  assert.match(text, /DELETE FROM youtube_key_cap_refusal_events/);
+  assert.deepEqual(values, [30, 1_000]);
+
+  // Invalid retention/batch settings fall back to the safe defaults.
+  assert.equal(await pruneYouTubeKeyCapRefusalEvents(client, 0, 0), 7);
+  assert.deepEqual(values, [KEY_CAP_REFUSAL_EVENT_RETENTION_DAYS, KEY_CAP_REFUSAL_EVENT_PRUNE_BATCH]);
 });
 
 test('summary and per-key reads normalize bigint strings and empty results', async () => {

@@ -93,8 +93,11 @@ export function monitorSecondaryWindowStart(
   const sinceMs = Number.isFinite(sinceEpochSeconds) && sinceEpochSeconds > 0
     ? sinceEpochSeconds * 1000
     : oneHourAgo;
-  // A clock-skewed future epoch must not hide events; clamp to now.
-  return new Date(Math.min(nowMs, Math.max(oneHourAgo, sinceMs)));
+  // A reset epoch in the future is not active yet. Falling back to the normal
+  // one-hour window keeps recent failures visible; clamping to `now` would
+  // exclude every recorded failure and silently disable both secondary guards.
+  const effectiveSince = sinceMs > nowMs ? oneHourAgo : sinceMs;
+  return new Date(Math.max(oneHourAgo, effectiveSince));
 }
 
 export function initialKeyCapMonitorState(quotaDay: string): KeyCapMonitorState {
@@ -146,4 +149,101 @@ export function evaluateDurableKeyCapMonitorSample(
     verdict,
     shouldWriteStop: true,
   };
+}
+
+const QUOTA_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+const QUOTA_STOP_REASONS = new Set<KeyCapStopReason>([
+  'CAP_EVENTS',
+  'CAP_UNAVAILABLE',
+  'QUOTA_EXHAUSTED',
+]);
+
+export interface KeyCapStopMarker {
+  reason: string;
+  detail: string;
+  stoppedAt: string;
+  quotaDay: string | null;
+}
+
+/**
+ * Serialize a stop marker. The quota day is part of the marker so a new-day
+ * healthy sample can distinguish yesterday's cap stop from a current stop
+ * without guessing from the timestamp or deleting an unrelated health stop.
+ */
+export function formatKeyCapStopMarker(input: {
+  reason: string;
+  detail: string;
+  at: Date;
+  quotaDay?: string | null;
+}): string {
+  const quotaDay = input.quotaDay && QUOTA_DAY_PATTERN.test(input.quotaDay)
+    ? input.quotaDay
+    : 'unknown';
+  return `STOP|${input.reason}|${input.detail}|${input.at.toISOString()}|quota_day=${quotaDay}\n`;
+}
+
+/**
+ * Parse the fixed marker shape from the right so a detail containing `|`
+ * cannot corrupt the quota day or timestamp. Legacy markers without a quota
+ * day parse with `quotaDay: null` and are never auto-cleared.
+ */
+export function parseKeyCapStopMarker(content: string): KeyCapStopMarker | null {
+  const line = String(content || '').trim();
+  if (!line.startsWith('STOP|')) return null;
+  const parts = line.split('|');
+  if (parts.length < 5) return null;
+  const quotaDayToken = parts[parts.length - 1] || '';
+  if (!quotaDayToken.startsWith('quota_day=')) return null;
+  const stoppedAt = parts[parts.length - 2] || '';
+  const reason = parts[1] || '';
+  const detail = parts.slice(2, -2).join('|');
+  if (!reason || !stoppedAt) return null;
+  return {
+    reason,
+    detail,
+    stoppedAt,
+    quotaDay: quotaDayToken.slice('quota_day='.length) || null,
+  };
+}
+
+export function keyCapStopMarkerQuotaDay(content: string): string | null {
+  return parseKeyCapStopMarker(content)?.quotaDay ?? null;
+}
+
+/**
+ * Only a quota-day cap stop from an earlier day is stale at a new-day healthy
+ * sample. Health, queue, monitor-availability, legacy, current-day, and
+ * malformed markers stay in place so a real fail-closed signal is never
+ * removed by inference.
+ */
+export function shouldClearPriorDayStopMarker(content: string, currentQuotaDay: string): boolean {
+  const marker = parseKeyCapStopMarker(content);
+  if (!marker || !marker.quotaDay) return false;
+  if (!QUOTA_STOP_REASONS.has(marker.reason as KeyCapStopReason)) return false;
+  if (!QUOTA_DAY_PATTERN.test(marker.quotaDay) || !QUOTA_DAY_PATTERN.test(currentQuotaDay)) return false;
+  return marker.quotaDay < currentQuotaDay;
+}
+
+/**
+ * An alert-only observation must not arm enforcement. If a stop was already
+ * persisted by an enforcing run, keep it; otherwise drop the stop fields from
+ * the dedupe state while retaining the durable-count high-water mark.
+ */
+export function stateForAlertOnlySample(
+  state: KeyCapMonitorState,
+  stopAlreadyPersisted: boolean,
+): KeyCapMonitorState {
+  if (stopAlreadyPersisted) return state;
+  return { ...state, stopReason: null, stopAt: null };
+}
+
+/** Whether an enforcing sample should (re)write the stop marker. */
+export function shouldWriteStopMarker(input: {
+  alertOnly: boolean;
+  shouldWriteStop: boolean;
+  markerQuotaDay: string | null;
+  currentQuotaDay: string;
+}): boolean {
+  if (input.alertOnly) return false;
+  return input.shouldWriteStop || input.markerQuotaDay !== input.currentQuotaDay;
 }

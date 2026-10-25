@@ -5,11 +5,16 @@ import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import type { Pool } from 'pg';
 import {
+  pruneYouTubeKeyCapRefusalEvents,
   recordYouTubeKeyCapRefusal,
   recordYouTubeKeyCapRefusalSafe,
   readYouTubeKeyCapRefusalKeyCounts,
   readYouTubeKeyCapRefusalSummary,
 } from './quotaKeyCapRefusals';
+import {
+  readKeyCapMonitorStop,
+  recordKeyCapMonitorStop,
+} from './youtubeKeyCapMonitorStops';
 
 /**
  * Live-database tests for the durable cap-refusal counter. They run ONLY
@@ -39,6 +44,10 @@ const migration158 = readFileSync(
   fileURLToPath(new URL('./db/migrations/158_youtube_key_cap_refusals.sql', import.meta.url)),
   'utf8'
 );
+const migration159 = readFileSync(
+  fileURLToPath(new URL('./db/migrations/159_youtube_key_cap_monitor_stops.sql', import.meta.url)),
+  'utf8'
+);
 
 const runTag = `${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
 const keyFor = (name: string): string => `fp-refusal-${name}-${runTag}`;
@@ -58,8 +67,10 @@ async function ensureSchema(): Promise<void> {
     schemaReady = (async () => {
       pool = new pg.Pool({ connectionString: dedicatedUrl, max: 25 });
       await pool.query(migration158);
+      await pool.query(migration159);
       // Re-applying must be a no-op; the migration is part of the deploy path.
       await pool.query(migration158);
+      await pool.query(migration159);
     })();
   }
   return schemaReady;
@@ -69,6 +80,7 @@ after(async () => {
   if (!pool) return;
   await pool.query('DELETE FROM youtube_key_cap_refusal_events WHERE key_fingerprint LIKE $1', [keyPattern]);
   await pool.query('DELETE FROM youtube_key_cap_refusal_counters WHERE key_fingerprint LIKE $1', [keyPattern]);
+  await pool.query('DELETE FROM youtube_key_cap_monitor_stops WHERE quota_day = $1', ['2026-10-20']);
   await pool.end();
 });
 
@@ -173,6 +185,68 @@ maybe('counter survives a new pool (process restart) and is independent of logs'
   try {
     const keys = await readYouTubeKeyCapRefusalKeyCounts(restarted, '2026-10-20');
     assert.equal(keys.find(item => item.keyFingerprint === key)?.refusals, 1);
+  } finally {
+    await restarted.end();
+  }
+});
+
+maybe('prune removes only expired event identities and leaves counters intact', async () => {
+  await ensureSchema();
+  const key = keyFor('prune');
+  const recentOperation = opFor('prune-recent');
+  const oldOperation = opFor('prune-old');
+  await recordYouTubeKeyCapRefusal(requirePool(), {
+    quotaDay: '2026-10-20',
+    operationId: recentOperation,
+    keyFingerprint: key,
+    projectedUnits: 9000,
+    requestUnits: 100,
+    capUnits: 9000,
+  });
+  await requirePool().query(
+    `INSERT INTO youtube_key_cap_refusal_events
+       (quota_day, operation_id, key_fingerprint, projected_units, request_units, cap_units, created_at)
+     VALUES ($1, $2, $3, 9000, 100, 9000, now() - interval '31 days')`,
+    ['2026-10-20', oldOperation, key],
+  );
+
+  const deleted = await pruneYouTubeKeyCapRefusalEvents(requirePool(), 30, 10_000);
+  assert.ok(deleted >= 1, 'the expired event is pruned');
+  const old = await requirePool().query(
+    'SELECT 1 FROM youtube_key_cap_refusal_events WHERE operation_id = $1',
+    [oldOperation],
+  );
+  assert.equal(old.rowCount, 0);
+  const recent = await requirePool().query(
+    'SELECT 1 FROM youtube_key_cap_refusal_events WHERE operation_id = $1',
+    [recentOperation],
+  );
+  assert.equal(recent.rowCount, 1);
+  const keys = await readYouTubeKeyCapRefusalKeyCounts(requirePool(), '2026-10-20');
+  assert.equal(keys.find(item => item.keyFingerprint === key)?.refusals, 1);
+});
+
+maybe('durable monitor stop survives a new pool and the first stop wins', async () => {
+  await ensureSchema();
+  const first = await recordKeyCapMonitorStop(requirePool(), {
+    quotaDay: '2026-10-20',
+    reason: 'CAP_UNAVAILABLE',
+    detail: 'cap_unavailable=4',
+    at: new Date('2026-10-20T08:00:00.000Z'),
+  });
+  assert.equal(first.reason, 'CAP_UNAVAILABLE');
+  const second = await recordKeyCapMonitorStop(requirePool(), {
+    quotaDay: '2026-10-20',
+    reason: 'QUOTA_EXHAUSTED',
+    detail: 'quota_exhausted=21',
+    at: new Date('2026-10-20T09:00:00.000Z'),
+  });
+  assert.deepEqual(second, first, 'a later stop cannot replace the first durable stop');
+
+  const restarted = new pg.Pool({ connectionString: dedicatedUrl, max: 2 });
+  try {
+    assert.deepEqual(await readKeyCapMonitorStop(restarted, '2026-10-20'), first);
+    assert.equal(await readKeyCapMonitorStop(restarted, '2026-10-21'), null);
   } finally {
     await restarted.end();
   }

@@ -41,6 +41,20 @@ export function parseTransientRetryAgeMs(value:unknown,fallback=6*60*60_000):num
 
 const MAX_TRANSIENT_RETRY_AGE_MS=parseTransientRetryAgeMs(process.env.MAX_TRANSIENT_RETRY_AGE_MS);
 
+/**
+ * Persist the structured failure code alongside the human-readable message.
+ * The cap monitor counts `job_attempts.error`, and several typed errors
+ * (`YouTubeKeyCapUnavailableError`, `ProbeQuotaExceededError`) carry their
+ * safety code only on the object. Prefixing the code keeps the failure ledger
+ * countable without a schema change and without changing the thrown error.
+ */
+export function persistedJobFailureMessage(error:any):string{
+  const message=String(error?.message||error).slice(0,2000);
+  const code=typeof error?.code==='string'?error.code.trim():'';
+  if(!code||message.startsWith(`${code}:`))return message;
+  return `${code}: ${message}`.slice(0,2000);
+}
+
 export function resolveTransientFailureAnchor(error:any,persistedFirstTransientFailureAt:unknown,now=Date.now()):number{
   if(!isRetryableInfrastructureFailure(error))return now;
   const persisted=persistedFirstTransientFailureAt instanceof Date
@@ -57,7 +71,7 @@ export async function failJob(jobId:string,error:any):Promise<JobFailureDisposit
   const now=Date.now();
   const retryableInfrastructure=isRetryableInfrastructureFailure(error);
   const firstFailureAt=resolveTransientFailureAnchor(error,first_transient_failure_at,now);
-  const msg=String(error?.message||error).slice(0,2000);
+  const msg=persistedJobFailureMessage(error);
 
   // Query the authoritative Gemini semantic cooldown from provider_call_events.
   // Each account cools independently: when the deferring error carries its

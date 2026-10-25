@@ -6,8 +6,14 @@ import {
   QUOTA_EXHAUSTED_STOP_THRESHOLD,
   evaluateDurableKeyCapMonitorSample,
   evaluateYouTubeKeyCapStopRule,
+  formatKeyCapStopMarker,
   initialKeyCapMonitorState,
+  keyCapStopMarkerQuotaDay,
   monitorSecondaryWindowStart,
+  parseKeyCapStopMarker,
+  shouldClearPriorDayStopMarker,
+  shouldWriteStopMarker,
+  stateForAlertOnlySample,
 } from './youtubeKeyCapStopRule';
 
 test('corrected stop rule counts both cap codes and keeps the unavailable guard', () => {
@@ -120,6 +126,84 @@ test('secondary-signal window honors the quota-reset epoch and the one-hour floo
   // Absent/invalid epoch falls back to the normal one-hour window.
   assert.equal(monitorSecondaryWindowStart(now, 0).toISOString(), '2026-10-26T06:05:00.000Z');
   assert.equal(monitorSecondaryWindowStart(now, Number.NaN).toISOString(), '2026-10-26T06:05:00.000Z');
-  // A future epoch is clamped to now, never beyond it.
-  assert.equal(monitorSecondaryWindowStart(now, 1792998000 + 3600).toISOString(), '2026-10-26T07:05:00.000Z');
+  // A future epoch is not active yet: keep the ordinary one-hour window so
+  // recent failures remain visible instead of excluding every event.
+  assert.equal(monitorSecondaryWindowStart(now, 1792998000 + 3600).toISOString(), '2026-10-26T06:05:00.000Z');
+});
+
+test('stop markers carry the quota day and only stale quota stops auto-clear', () => {
+  const marker = formatKeyCapStopMarker({
+    reason: 'CAP_EVENTS',
+    detail: 'cap_exceeded=501|combined=501',
+    at: new Date('2026-10-25T20:00:00.000Z'),
+    quotaDay: '2026-10-25',
+  });
+  assert.match(marker, /^STOP\|CAP_EVENTS\|/);
+  const parsed = parseKeyCapStopMarker(marker);
+  assert.deepEqual(parsed, {
+    reason: 'CAP_EVENTS',
+    detail: 'cap_exceeded=501|combined=501',
+    stoppedAt: '2026-10-25T20:00:00.000Z',
+    quotaDay: '2026-10-25',
+  });
+  assert.equal(keyCapStopMarkerQuotaDay(marker), '2026-10-25');
+  assert.equal(shouldClearPriorDayStopMarker(marker, '2026-10-26'), true);
+  assert.equal(shouldClearPriorDayStopMarker(marker, '2026-10-25'), false);
+  assert.equal(shouldClearPriorDayStopMarker(marker, '2026-10-24'), false);
+
+  for (const reason of ['HEALTH_FAILURE', 'QUEUE_GROWTH', 'MONITOR_UNAVAILABLE']) {
+    const nonQuota = formatKeyCapStopMarker({
+      reason,
+      detail: 'detail',
+      at: new Date('2026-10-25T20:00:00.000Z'),
+      quotaDay: '2026-10-25',
+    });
+    assert.equal(shouldClearPriorDayStopMarker(nonQuota, '2026-10-26'), false, reason);
+  }
+
+  // Legacy markers without a day are never auto-cleared; an operator must
+  // inspect them rather than letting a new day erase a fail-closed signal.
+  assert.equal(shouldClearPriorDayStopMarker('STOP|CAP_EVENTS|detail|2026-10-25T20:00:00.000Z', '2026-10-26'), false);
+  assert.equal(shouldClearPriorDayStopMarker('not-a-stop', '2026-10-26'), false);
+});
+
+test('alert-only state never arms a later enforcing run', () => {
+  const stopped = evaluateDurableKeyCapMonitorSample(
+    initialKeyCapMonitorState('2026-10-26'),
+    { quotaDay: '2026-10-26', capExceeded: 501, capUnavailable: 0, quotaExhausted: 0 },
+    new Date('2026-10-26T08:00:00.000Z'),
+  );
+  const alertState = stateForAlertOnlySample(stopped.state, false);
+  assert.equal(alertState.stopReason, null);
+  assert.equal(alertState.stopAt, null);
+  assert.equal(alertState.capExceeded, 501);
+  const preserved = stateForAlertOnlySample(stopped.state, true);
+  assert.equal(preserved.stopReason, 'CAP_EVENTS');
+});
+
+test('stop marker write policy suppresses alert-only and refreshes stale markers', () => {
+  assert.equal(shouldWriteStopMarker({
+    alertOnly: true,
+    shouldWriteStop: true,
+    markerQuotaDay: null,
+    currentQuotaDay: '2026-10-26',
+  }), false);
+  assert.equal(shouldWriteStopMarker({
+    alertOnly: false,
+    shouldWriteStop: true,
+    markerQuotaDay: '2026-10-26',
+    currentQuotaDay: '2026-10-26',
+  }), true);
+  assert.equal(shouldWriteStopMarker({
+    alertOnly: false,
+    shouldWriteStop: false,
+    markerQuotaDay: '2026-10-25',
+    currentQuotaDay: '2026-10-26',
+  }), true);
+  assert.equal(shouldWriteStopMarker({
+    alertOnly: false,
+    shouldWriteStop: false,
+    markerQuotaDay: '2026-10-26',
+    currentQuotaDay: '2026-10-26',
+  }), false);
 });

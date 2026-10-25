@@ -1,7 +1,7 @@
 import { getNextYouTubeQuotaResetAt, getYouTubeQuotaDay, getYouTubeQuotaDayStartAt } from './youtubeQuotaDay';
 import { DEFAULT_YOUTUBE_DAILY_QUOTA_PER_KEY, calculateEffectiveYouTubeBudget } from './quotaPolicy';
 import { getConfiguredYouTubeProviders } from './youtubeKeyPool';
-import { recordYouTubeKeyCapRefusal } from './quotaKeyCapRefusals';
+import { logKeyCapRefusalAccountingFailure, recordYouTubeKeyCapRefusal } from './quotaKeyCapRefusals';
 
 /**
  * Per-key YouTube daily cap accounting: observational shadow mode plus a
@@ -1035,8 +1035,14 @@ export async function reserveEnforcedKeyCap(
           capUnits: ENFORCED_CAP_UNITS,
         });
         await client.query('COMMIT');
-      } catch {
+      } catch (accountingError) {
         await client.query('ROLLBACK').catch(() => undefined);
+        logKeyCapRefusalAccountingFailure(accountingError, {
+          branch: 'enforced-reservation',
+          quotaDay,
+          operationId,
+          keyFingerprint,
+        });
       }
       // The transaction is closed either way; the outer catch must not issue
       // a second ROLLBACK (which would log a warning on every refusal).
@@ -1292,8 +1298,14 @@ export async function reserveProbeQuota(
             capUnits: ENFORCED_CAP_UNITS,
           });
           await client.query('COMMIT');
-        } catch {
+        } catch (accountingError) {
           await client.query('ROLLBACK').catch(() => undefined);
+          logKeyCapRefusalAccountingFailure(accountingError, {
+            branch: 'probe-reservation',
+            quotaDay,
+            operationId,
+            keyFingerprint,
+          });
         }
         transactionClosed = true;
         throw new YouTubeKeyCapExceededError(quotaDay, keyFingerprint, keyProjectedBefore, units);

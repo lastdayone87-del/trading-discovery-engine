@@ -52,6 +52,41 @@ export interface KeyCapRefusalKeyCount {
 
 const QUOTA_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
+export const KEY_CAP_REFUSAL_EVENT_RETENTION_DAYS = 30;
+export const KEY_CAP_REFUSAL_EVENT_PRUNE_BATCH = 5_000;
+
+/**
+ * Keep the idempotency-event table bounded. The counter table is the read
+ * model and is never pruned; only event identities older than the retention
+ * window are deleted in bounded batches so a cap storm cannot create an
+ * unbounded table or a long lock.
+ */
+export const PRUNE_KEY_CAP_REFUSAL_EVENTS_SQL = `
+DELETE FROM youtube_key_cap_refusal_events
+ WHERE id IN (
+   SELECT id
+     FROM youtube_key_cap_refusal_events
+    WHERE created_at < now() - ($1::int * interval '1 day')
+    ORDER BY created_at
+    LIMIT $2
+ )
+`;
+
+export function logKeyCapRefusalAccountingFailure(
+  error: unknown,
+  context: Record<string, unknown> = {},
+): void {
+  try {
+    console.error(JSON.stringify({
+      event: 'youtube_key_cap_refusal_accounting_failed',
+      ...context,
+      message: String((error as Error)?.message || error).slice(0, 300),
+    }));
+  } catch {
+    // Logging must never replace the typed cap verdict.
+  }
+}
+
 /**
  * One statement: insert the dispatch-identity event, and only when that insert
  * was new increment the (quota day, key) counter. A duplicate operation_id
@@ -176,9 +211,30 @@ export async function recordYouTubeKeyCapRefusalSafe(
   try {
     const result = await recordYouTubeKeyCapRefusal(client, input);
     return result.inserted;
-  } catch {
+  } catch (error) {
+    logKeyCapRefusalAccountingFailure(error, {
+      branch: 'safe',
+      quotaDay: String(input.quotaDay || ''),
+      operationId: String(input.operationId || ''),
+      keyFingerprint: String(input.keyFingerprint || ''),
+    });
     return false;
   }
+}
+
+export async function pruneYouTubeKeyCapRefusalEvents(
+  client: KeyCapRefusalQueryClient,
+  retentionDays: number = KEY_CAP_REFUSAL_EVENT_RETENTION_DAYS,
+  batchSize: number = KEY_CAP_REFUSAL_EVENT_PRUNE_BATCH,
+): Promise<number> {
+  const days = Number.isSafeInteger(retentionDays) && retentionDays >= 1
+    ? retentionDays
+    : KEY_CAP_REFUSAL_EVENT_RETENTION_DAYS;
+  const limit = Number.isSafeInteger(batchSize) && batchSize >= 1
+    ? batchSize
+    : KEY_CAP_REFUSAL_EVENT_PRUNE_BATCH;
+  const result = await client.query(PRUNE_KEY_CAP_REFUSAL_EVENTS_SQL, [days, limit]);
+  return Number(result.rowCount) || 0;
 }
 
 export async function readYouTubeKeyCapRefusalSummary(
