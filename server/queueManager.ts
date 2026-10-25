@@ -1923,6 +1923,15 @@ export async function inspectAndValidateChannel(
       channelLinks: rawDetails?.channelLinks || [],
       pinnedComment: rawDetails?.pinnedComment,
       videoDescriptions: rawDetails?.videoDescriptions || [],
+      // Enrichment already acquired the authoritative recent-upload sample.
+      // Carry its provenance and video IDs so Gate 3 can reuse it instead of
+      // repeating the 100-unit recent-videos search.
+      videoDescriptionsAuthoritative: rawDetails?.videoDescriptionsAuthoritative,
+      recentVideoDescriptions: rawDetails?.videoDescriptionsAuthoritative
+        ? (rawDetails.videos?.length
+            ? rawDetails.videos.map(video => ({ videoId: video.id, description: video.description }))
+            : rawDetails.videoDescriptions)
+        : undefined,
       socialLinks: rawDetails?.channelLinks || [],
       youtubeUrl: channel.youtube_url,
       forceLiveFetch: isManualScan || !rawDetails?.description,
