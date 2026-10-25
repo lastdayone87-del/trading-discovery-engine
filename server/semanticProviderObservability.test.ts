@@ -128,12 +128,17 @@ test('every provider writer uses the shared attribution path', () => {
   }
 });
 
-test('the ingestion pipeline maps the active job/run onto the classifier input', () => {
+test('the ingestion pipeline maps the active job/run onto the classifier input and diagnostic', () => {
   const pipeline = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
-  assert.match(pipeline, /job_id:options\?\.jobId\|\|candidate\.discoveryJobId,run_id:options\?\.runId\|\|candidate\.queryRunId/);
+  assert.match(pipeline, /const activeJobId=options\?\.jobId\|\|candidate\.discoveryJobId;/);
+  assert.match(pipeline, /const activeRunId=options\?\.runId\|\|candidate\.queryRunId;/);
+  assert.match(pipeline, /job_id:activeJobId,run_id:activeRunId/);
+  assert.match(pipeline, /jobId:activeJobId,queryRunId:activeRunId/);
   const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
   assert.match(queue, /processChannelThroughPipeline\(enriched[\s\S]{0,240}jobId:job\.id/);
   assert.match(queue, /processDiscoveredChannel\(candidate[\s\S]{0,240}jobId: job\.id/);
+  assert.match(queue, /executeManualSearchPage\([^;]{0,240}job\.id\)/);
+  assert.match(queue, /processDiscoveredChannelContained\(raw, session\.country, 'manual_search', \{ jobId \}\)/);
 });
 
 test('404 model fallback forwards attribution on every retry for all providers', async () => {

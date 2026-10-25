@@ -838,7 +838,7 @@ export async function processNextSearchJob(
         if (!session) throw new Error(`Manual search session ${sessionId} no longer exists.`);
         if (session.status === 'CANCEL_REQUESTED') { await cancelManualSearch(sessionId); await completeJob(job.id); return true; }
         if (session.status !== 'RUNNING') { await completeJob(job.id); return true; }
-        await executeManualSearchPage(sessionId, Number(job.payload.pageNumber), String(job.payload.pageToken || '') || null, Number(job.payload.variantIndex || 0));
+        await executeManualSearchPage(sessionId, Number(job.payload.pageNumber), String(job.payload.pageToken || '') || null, Number(job.payload.variantIndex || 0), job.id);
         await completeJob(job.id);
       } catch (error) {
         throw error;
@@ -1735,7 +1735,7 @@ export async function processDiscoveredChannelContained(
   raw: DiscoveredChannelRaw,
   targetCountry: string,
   source: DiscoverySource,
-  options?: { forceExtraction?: boolean },
+  options?: PipelineExecutionOptions,
 ): Promise<ProcessDiscoveredChannelOutcome | null> {
   try {
     return await processDiscoveredChannel(raw, targetCountry, source, options);
@@ -3103,7 +3103,7 @@ function manualVariants(query: string, vocab?: Awaited<ReturnType<typeof getCoun
   return [...new Set([query, vocab?.native_trading_terminology?.[0] ? `${query} ${vocab.native_trading_terminology[0]}` : '', vocab?.common_content_format_names?.[0] ? `${query} ${vocab.common_content_format_names[0]}` : ''].filter(Boolean))];
 }
 
-async function executeManualSearchPage(sessionId: string, pageNumber: number, pageToken: string | null, variantIndex = 0): Promise<any> {
+async function executeManualSearchPage(sessionId: string, pageNumber: number, pageToken: string | null, variantIndex = 0, jobId?: string): Promise<any> {
   const session = await getManualSearchSession(sessionId);
   if (!session || session.status !== 'RUNNING') return session;
   // A completed observation is the idempotency boundary for retried queue jobs.
@@ -3146,7 +3146,7 @@ async function executeManualSearchPage(sessionId: string, pageNumber: number, pa
         queryGenerationMode:'OPERATOR_DIRECTED',country:session.country,retrievalLane:session.retrievalLane,pageNumber,resultRank:index+1,
         matchedDocument:raw.matchedDocument||{type:'MANUAL'},rawObservation:{channelName:raw.channelName,youtubeUrl:raw.youtubeUrl,sessionId,variantIndex}},'INVESTIGATION_QUEUED');
       raw.nominationId=nomination.id||undefined;
-      const outcome = await processDiscoveredChannelContained(raw, session.country, 'manual_search');
+      const outcome = await processDiscoveredChannelContained(raw, session.country, 'manual_search', { jobId });
       if (!outcome) { deferredIds.add(raw.channelId); continue; }
       if (outcome.wasKnown) knownIds.push(outcome.channelId);
       if (outcome.persisted && outcome.countryStatus !== 'REJECTED') acceptedIds.push(outcome.channelId);

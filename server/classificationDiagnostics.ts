@@ -14,12 +14,19 @@ export interface ProductionClassificationDiagnosticInput {
   observationKey?: string;
 }
 
-function normalize(input: RawChannelInput) {
+export function normalizeProductionDiagnosticInput(input: RawChannelInput) {
+  // job_id/run_id are provider-observability attribution, not classification
+  // evidence. They already have dedicated diagnostic columns. Excluding them
+  // here keeps input_checksum stable when the same channel evidence is
+  // replayed under a different job or query run.
+  const classificationInput = { ...input };
+  delete classificationInput.job_id;
+  delete classificationInput.run_id;
   const stable = {
-    ...input,
-    channel_name: input.channel_name.normalize('NFKC').trim(),
-    description: input.description || '',
-    external_links: [...(input.external_links || [])].sort()
+    ...classificationInput,
+    channel_name: classificationInput.channel_name.normalize('NFKC').trim(),
+    description: classificationInput.description || '',
+    external_links: [...(classificationInput.external_links || [])].sort()
   };
   return {
     ...stable,
@@ -51,7 +58,7 @@ export async function recordProductionClassification(
       diagnostic.queryRunId || null,
       diagnostic.nominationId || null,
       diagnostic.input.enrichment_stage || 0,
-      JSON.stringify(normalize(diagnostic.input)),
+      JSON.stringify(normalizeProductionDiagnosticInput(diagnostic.input)),
       JSON.stringify(diagnostic.decision.evidenceCollection.providers),
       JSON.stringify([
         ...diagnostic.decision.positiveEvidence,

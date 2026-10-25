@@ -600,11 +600,13 @@ async function processChannelThroughPipelineInContext(
   const structuredExternalLinks=(candidate.externalLinkDetails||(candidate.channelLinks||[]).map(url=>({url}))).map(detail=>{let familyId='source_family_id' in detail&&typeof detail.source_family_id==='string'?detail.source_family_id:undefined;if(!familyId)try{familyId=sourceFamilyIdentity({provider:'external-link',canonicalUrl:detail.url}).familyId;}catch{familyId=sourceFamilyIdentity({provider:'external-link',artifactId:entityChecksum(detail.url)}).familyId;}return {...detail,source_family_id:familyId};});
   void observeYouTubeChannelEntity({channelId:candidate.channelId,channelName:candidate.channelName,youtubeUrl:candidate.youtubeUrl,observedAt:now,videos:structuredVideos,externalUrls:structuredExternalLinks.map(detail=>detail.url)}).catch(error=>console.warn(`[EntityResolution] Channel observation failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
   const languageInputs = classifierLanguageInputs(candidate, structuredVideos, isEnrichmentPass);
+  // Resolve attribution once so provider events and the production diagnostic
+  // describe the same active job/run. Candidate provenance remains the fallback.
+  const activeJobId=options?.jobId||candidate.discoveryJobId;
+  const activeRunId=options?.runId||candidate.queryRunId;
   const classifierInput:RawChannelInput={
     channel_id:candidate.channelId,channel_name:candidate.channelName,description:candidate.description||'',country:creatorCountry || undefined,
-    // Provider ledger attribution: the current job when the caller has one,
-    // otherwise the discovery job that nominated this channel.
-    job_id:options?.jobId||candidate.discoveryJobId,run_id:options?.runId||candidate.queryRunId,
+    job_id:activeJobId,run_id:activeRunId,
     channel_entity_id:channelEntityId,channel_source_family_id:channelSourceFamilyId,
     location_tag:candidate.locationTag,external_links:candidate.channelLinks||[],external_link_details:structuredExternalLinks,
     // Language inputs resolved above (classifierLanguageInputs): enrichment
@@ -629,7 +631,7 @@ async function processChannelThroughPipelineInContext(
     const recheckError = manualRecheckDegradedError(productionClassification.decision.evidenceCollection);
     if (recheckError) throw recheckError;
   }
-  const classificationDiagnosticId=await observeProductionDiagnosticReliably({type:'PRODUCTION_DIAGNOSTIC',input:{channelId:candidate.channelId,input:productionClassification.input,decision:productionClassification.decision,jobId:candidate.discoveryJobId,queryRunId:candidate.queryRunId,nominationId:candidate.nominationId}})
+  const classificationDiagnosticId=await observeProductionDiagnosticReliably({type:'PRODUCTION_DIAGNOSTIC',input:{channelId:candidate.channelId,input:productionClassification.input,decision:productionClassification.decision,jobId:activeJobId,queryRunId:activeRunId,nominationId:candidate.nominationId}})
     .catch(error=>{console.warn(`[ClassificationDiagnostics] write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error);return undefined;});
   let tradingVal = productionClassification.result;
   void recordAdmissionShadow({channelId:candidate.channelId,priorState:'NOT_EVALUATED',classificationStatus:productionClassification.decision.status,
