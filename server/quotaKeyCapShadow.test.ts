@@ -607,8 +607,31 @@ test('reserveEnforcedKeyCap boundary: 8999 + 1 admitted, 9000 + 1 typed exceeded
       && error.markSuspension === false
   );
   const deniedTexts = deniedPool.connections[0].queries.map(query => query.text);
-  assert.ok(deniedTexts.includes('ROLLBACK'));
-  assert.ok(!deniedTexts.includes('COMMIT'));
+  assert.ok(deniedTexts.includes('COMMIT'), 'the refusal counter commits before the typed cap error');
+  assert.ok(!deniedTexts.includes('ROLLBACK'), 'the committed refusal must not be rolled back by the outer catch');
+  assert.ok(
+    deniedTexts.some(query => query.includes('INSERT INTO youtube_key_cap_refusal_events')),
+    'the denied dispatch records a durable refusal on the reservation connection',
+  );
+});
+
+test('a refusal-counter failure still throws the typed cap error and rolls back', async () => {
+  const now = new Date('2026-10-16T07:30:00.000Z');
+  const brokenPool = new FakePool(enforcementHandler(9000, {
+    failQuery: 'INSERT INTO youtube_key_cap_refusal_events',
+  }));
+  await assert.rejects(
+    reserveEnforcedKeyCap(
+      { readSetting: enforcedReader, pool: brokenPool },
+      { keyFingerprint: 'fp-counter-fail', operationId: 'op-counter-fail', units: 1, now }
+    ),
+    (error: unknown) => error instanceof YouTubeKeyCapExceededError
+      && error.code === 'YOUTUBE_KEY_CAP_EXCEEDED',
+    'observability failure must not replace the cap verdict',
+  );
+  const texts = brokenPool.connections[0].queries.map(query => query.text);
+  assert.ok(texts.includes('ROLLBACK'));
+  assert.ok(!texts.includes('COMMIT'));
 });
 
 test('enforce reservation failures are typed and fail closed (lock, DB, connect)', async () => {

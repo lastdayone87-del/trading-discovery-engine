@@ -1,6 +1,7 @@
 import { getNextYouTubeQuotaResetAt, getYouTubeQuotaDay, getYouTubeQuotaDayStartAt } from './youtubeQuotaDay';
 import { DEFAULT_YOUTUBE_DAILY_QUOTA_PER_KEY, calculateEffectiveYouTubeBudget } from './quotaPolicy';
 import { getConfiguredYouTubeProviders } from './youtubeKeyPool';
+import { recordYouTubeKeyCapRefusal } from './quotaKeyCapRefusals';
 
 /**
  * Per-key YouTube daily cap accounting: observational shadow mode plus a
@@ -969,6 +970,7 @@ export async function reserveEnforcedKeyCap(
   if (!client) {
     throw capUnavailable('YouTube key cap database connection failed.', { quotaDay, keyFingerprint, operationId });
   }
+  let transactionClosed = false;
   try {
     await client.query('BEGIN');
     await client.query(`SET LOCAL lock_timeout = '${lockTimeoutMs}ms'`);
@@ -1018,6 +1020,27 @@ export async function reserveEnforcedKeyCap(
     const projected = await client.query(PROJECTED_SQL, [quotaDay, keyFingerprint, now]);
     const projectedBefore = Number(projected.rows[0]?.projected_units ?? 0);
     if (!Number.isFinite(projectedBefore) || projectedBefore + units > ENFORCED_CAP_UNITS) {
+      // Record the refusal durably in the same connection before unwinding.
+      // The counter is the monitor's authoritative source and survives log
+      // rotation/restarts. Observability failure must never replace the typed
+      // cap verdict, so a failed insert is rolled back and the cap error is
+      // still thrown.
+      try {
+        await recordYouTubeKeyCapRefusal(client, {
+          quotaDay,
+          operationId,
+          keyFingerprint,
+          projectedUnits: Number.isFinite(projectedBefore) ? projectedBefore : 0,
+          requestUnits: units,
+          capUnits: ENFORCED_CAP_UNITS,
+        });
+        await client.query('COMMIT');
+      } catch {
+        await client.query('ROLLBACK').catch(() => undefined);
+      }
+      // The transaction is closed either way; the outer catch must not issue
+      // a second ROLLBACK (which would log a warning on every refusal).
+      transactionClosed = true;
       throw new YouTubeKeyCapExceededError(quotaDay, keyFingerprint, projectedBefore, units);
     }
     const inserted = await client.query(INSERT_LEASE_SQL, [
@@ -1040,7 +1063,7 @@ export async function reserveEnforcedKeyCap(
     await client.query('COMMIT');
     return { mode: 'enforce', operationId, quotaDay, keyFingerprint, units, projectedBefore };
   } catch (error) {
-    await client.query('ROLLBACK').catch(() => undefined);
+    if (!transactionClosed) await client.query('ROLLBACK').catch(() => undefined);
     if (isYouTubeKeyCapError(error)) throw error;
     throw capUnavailable('YouTube key cap reservation transaction failed.', {
       quotaDay, keyFingerprint, operationId,
@@ -1188,6 +1211,7 @@ export async function reserveProbeQuota(
   if (!client) {
     throw new ProbeQuotaUnavailableError('Probe quota database connection failed.', { quotaDay, operationId });
   }
+  let transactionClosed = false;
   try {
     await client.query('BEGIN');
     await client.query(`SET LOCAL lock_timeout = '${lockTimeoutMs}ms'`);
@@ -1258,6 +1282,20 @@ export async function reserveProbeQuota(
       const keyProjected = await client.query(PROJECTED_SQL, [quotaDay, keyFingerprint, now]);
       const keyProjectedBefore = Number(keyProjected.rows[0]?.projected_units ?? 0);
       if (!Number.isFinite(keyProjectedBefore) || keyProjectedBefore + units > ENFORCED_CAP_UNITS) {
+        try {
+          await recordYouTubeKeyCapRefusal(client, {
+            quotaDay,
+            operationId,
+            keyFingerprint,
+            projectedUnits: Number.isFinite(keyProjectedBefore) ? keyProjectedBefore : 0,
+            requestUnits: units,
+            capUnits: ENFORCED_CAP_UNITS,
+          });
+          await client.query('COMMIT');
+        } catch {
+          await client.query('ROLLBACK').catch(() => undefined);
+        }
+        transactionClosed = true;
         throw new YouTubeKeyCapExceededError(quotaDay, keyFingerprint, keyProjectedBefore, units);
       }
     }
@@ -1278,7 +1316,7 @@ export async function reserveProbeQuota(
     await client.query('COMMIT');
     return { mode: 'probe', operationId, quotaDay, keyFingerprint, units, capUnits, projectedBefore };
   } catch (error) {
-    await client.query('ROLLBACK').catch(() => undefined);
+    if (!transactionClosed) await client.query('ROLLBACK').catch(() => undefined);
     if (isProbeQuotaControlError(error) || isYouTubeKeyCapError(error)) throw error;
     throw new ProbeQuotaUnavailableError('Probe quota reservation transaction failed.', {
       quotaDay, operationId, cause: error,
