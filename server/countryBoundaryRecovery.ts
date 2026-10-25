@@ -1,6 +1,7 @@
 import { getAllChannels, getExcludedCountries, getCountryVocabularies, getDb, enqueueJob, upsertChannel, getChannelById } from './db';
 import { canonicalCountry, inferChannelCountry } from './countryInference';
 import { resolveScopeEligibility } from './scopeEligibility';
+import { stringifyWellFormedJson } from './unicodeSafety';
 import { normalizeCountryName } from './countryExclusionRules';
 import { creatorLevelCountryEvidence } from './countryValidator';
 import type { ChannelRecord, CountryVocabulary } from '../src/types';
@@ -657,14 +658,14 @@ export async function processCountryBoundaryReprocessJob(
         [
           channel.channel_id, channel.channel_name, channel.youtube_url, channel.country, channel.country_status,
           channel.confidence_score, channel.discord_status, channel.scan_status, channel.scan_attempts,
-          channel.discovery_source, channel.first_seen, channel.last_checked, JSON.stringify(channel.inspection_trail),
+          channel.discovery_source, channel.first_seen, channel.last_checked, stringifyWellFormedJson(channel.inspection_trail),
           channel.trading_status, 'NOT_REQUESTED', resolveScopeEligibility(channel.country)
         ]
       );
     } else {
       await client.query(
         `UPDATE channels SET country_status=$1, country=$2, confidence_score=$3, scan_status=$4, last_checked=$5, inspection_trail=$6, scope_eligibility=$7 WHERE channel_id=$8`,
-        [channel.country_status, channel.country, channel.confidence_score, channel.scan_status, channel.last_checked, JSON.stringify(channel.inspection_trail), resolveScopeEligibility(channel.country), channelId]
+        [channel.country_status, channel.country, channel.confidence_score, channel.scan_status, channel.last_checked, stringifyWellFormedJson(channel.inspection_trail), resolveScopeEligibility(channel.country), channelId]
       );
     }
 
