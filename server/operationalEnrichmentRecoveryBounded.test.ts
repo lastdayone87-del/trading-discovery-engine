@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import test, { mock } from 'node:test';
 import { readFileSync } from 'node:fs';
 import { decideJobFailure } from './db';
 import {
@@ -197,4 +197,139 @@ test('reconciliation is a no-op inside the throttle window and without qualifyin
   const throttled = await reconcileOperationalEnrichmentRecovery(getDb, async () => null, async () => undefined, async () => undefined, 20, now + 30_000);
   assert.equal(throttled, 0);
   assert.equal(getDbCalls, 1, 'a call inside the 60s throttle must not touch the database');
+});
+
+test('concurrent reconciliation calls are single-flight and release on completion', async () => {
+  resetOperationsTelemetry();
+  const now = T0 + 1_000_000;
+  let releaseQuery!: () => void;
+  const queryGate = new Promise<void>(resolve => { releaseQuery = resolve; });
+  let signalStarted!: () => void;
+  const started = new Promise<void>(resolve => { signalStarted = resolve; });
+  let selectCalls = 0;
+  const db = {
+    async query(sql: string) {
+      if (sql.includes('SELECT c.channel_id')) {
+        selectCalls++;
+        signalStarted();
+        await queryGate;
+        return { rows: [], rowCount: 0 };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+  };
+  let getDbCalls = 0;
+  const getDb = async () => { getDbCalls++; return db; };
+  const first = reconcileOperationalEnrichmentRecovery(
+    getDb, async () => null, async () => undefined, async () => undefined, 20, now,
+  );
+  await started;
+  // A later caller passes the 60s cooldown check but must still not start a
+  // second scan, and must not acquire a second pool connection.
+  const concurrent = await reconcileOperationalEnrichmentRecovery(
+    getDb, async () => null, async () => undefined, async () => undefined, 20, now + 120_000,
+  );
+  assert.equal(concurrent, 0);
+  assert.equal(selectCalls, 1, 'only one reconciliation scan may be in flight');
+  assert.equal(getDbCalls, 1, 'the concurrent call must not touch the database');
+  releaseQuery();
+  assert.equal(await first, 0);
+  // 120,001ms after the original start: the original scan's cooldown has
+  // expired, but if the skipped call had wrongly extended the cooldown this
+  // call would still be blocked. This distinguishes the two behaviors.
+  const later = await reconcileOperationalEnrichmentRecovery(
+    getDb, async () => null, async () => undefined, async () => undefined, 20, now + 120_001,
+  );
+  assert.equal(later, 0);
+  assert.equal(selectCalls, 2, 'the guard is released after the in-flight call completes');
+});
+
+test('a failed reconciliation releases the single-flight guard', async () => {
+  resetOperationsTelemetry();
+  const now = T0 + 2_000_000;
+  const failingDb = {
+    async query(sql: string) {
+      if (sql.includes('SELECT c.channel_id')) throw new Error('injected scan failure');
+      return { rows: [], rowCount: 0 };
+    },
+  };
+  await assert.rejects(
+    reconcileOperationalEnrichmentRecovery(
+      async () => failingDb, async () => null, async () => undefined, async () => undefined, 20, now,
+    ),
+    /injected scan failure/,
+  );
+  const { db, queries } = mockDb([]);
+  const recovered = await reconcileOperationalEnrichmentRecovery(
+    async () => db, async () => null, async () => undefined, async () => undefined, 20, now + 120_000,
+  );
+  assert.equal(recovered, 0);
+  assert.equal(
+    queries.filter(q => q.sql.includes('SELECT c.channel_id')).length,
+    1,
+    'the next call must run instead of being rejected by a stuck guard',
+  );
+});
+
+test('the single-flight guard does not bypass the existing 60-second cooldown', async () => {
+  resetOperationsTelemetry();
+  const now = T0 + 3_000_000;
+  const { db } = mockDb([]);
+  let getDbCalls = 0;
+  const getDb = async () => { getDbCalls++; return db; };
+  await reconcileOperationalEnrichmentRecovery(
+    getDb, async () => null, async () => undefined, async () => undefined, 20, now,
+  );
+  const throttled = await reconcileOperationalEnrichmentRecovery(
+    getDb, async () => null, async () => undefined, async () => undefined, 20, now + 59_999,
+  );
+  assert.equal(throttled, 0);
+  assert.equal(getDbCalls, 1, 'the cooldown still suppresses a second scan after the guard is released');
+});
+
+test('a scan longer than the cooldown satisfies the start-to-start interval', async () => {
+  resetOperationsTelemetry();
+  const startedAt = T0 + 4_000_000;
+  mock.timers.enable({ apis: ['Date'], now: startedAt });
+  try {
+    let releaseQuery!: () => void;
+    const queryGate = new Promise<void>(resolve => { releaseQuery = resolve; });
+    let signalStarted!: () => void;
+    const started = new Promise<void>(resolve => { signalStarted = resolve; });
+    let selectCalls = 0;
+    const db = {
+      async query(sql: string) {
+        if (sql.includes('SELECT c.channel_id')) {
+          selectCalls++;
+          signalStarted();
+          await queryGate;
+          return { rows: [], rowCount: 0 };
+        }
+        return { rows: [], rowCount: 0 };
+      },
+    };
+    const getDb = async () => db;
+    const first = reconcileOperationalEnrichmentRecovery(
+      getDb, async () => null, async () => undefined, async () => undefined, 20, Date.now(),
+    );
+    await started;
+    // Hold the scan open beyond the 60s window. The contract is start-to-start,
+    // so the scan duration itself satisfies the interval; no extra pause.
+    mock.timers.tick(120_000);
+    releaseQuery();
+    assert.equal(await first, 0);
+    const next = await reconcileOperationalEnrichmentRecovery(
+      getDb, async () => null, async () => undefined, async () => undefined, 20, Date.now(),
+    );
+    assert.equal(next, 0);
+    assert.equal(selectCalls, 2, 'a scan longer than 60s may be followed immediately');
+    // The new start opens a fresh window, so the next call is throttled.
+    const throttled = await reconcileOperationalEnrichmentRecovery(
+      getDb, async () => null, async () => undefined, async () => undefined, 20, Date.now() + 59_999,
+    );
+    assert.equal(throttled, 0);
+    assert.equal(selectCalls, 2, 'the next scan still gets its own 60s start-to-start window');
+  } finally {
+    mock.timers.reset();
+  }
 });
