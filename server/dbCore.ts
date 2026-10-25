@@ -310,8 +310,21 @@ function normalizeQueryText(value: string): string {
  * inside a transaction, and this call happens before the loop's BEGIN.
  */
 async function ensureJobsChannelPayloadIndex(client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> }): Promise<void> {
-  const index = await client.query(`SELECT to_regclass('public.idx_jobs_channel_payload') AS oid`);
-  if (index.rows[0]?.oid) return;
+  // A failed concurrent build can leave an invalid/not-ready catalog entry.
+  // It cannot serve queries, so never treat mere name existence as success.
+  const index = await client.query(`
+    SELECT c.oid, i.indisvalid, i.indisready
+      FROM pg_class c
+      JOIN pg_index i ON i.indexrelid = c.oid
+     WHERE c.oid = to_regclass('public.idx_jobs_channel_payload')
+  `);
+  const existing = index.rows[0];
+  if (existing?.indisvalid && existing?.indisready) return;
+  if (existing?.oid) {
+    // The invalid index is unusable; drop it concurrently (outside the
+    // migration transaction) and rebuild below when the table is populated.
+    await client.query(`DROP INDEX CONCURRENTLY IF EXISTS public.idx_jobs_channel_payload`);
+  }
   const jobs = await client.query(`SELECT to_regclass('public.jobs') AS oid`);
   if (!jobs.rows[0]?.oid) return;
   const populated = await client.query(`SELECT EXISTS(SELECT 1 FROM public.jobs LIMIT 1) AS populated`);

@@ -4,7 +4,8 @@
  * The index existed in production before this migration, so the contract is
  * adoption rather than rebuild: it must target the exact expression the
  * runtime queries use, stay additive-only, and never hold a write-blocking
- * build on a populated jobs table.
+ * build on a populated jobs table. A failed concurrent build must never leave
+ * an invalid index recorded as an applied migration.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -27,7 +28,8 @@ test('migration 157 is present and sorts after migration 156', () => {
 
 test('migration 157 adopts the exact channel-payload index without rebuilding it', () => {
   assert.match(migration, /SET LOCAL lock_timeout = '10s';/);
-  assert.match(migration, /IF to_regclass\('public\.idx_jobs_channel_payload'\) IS NULL THEN/);
+  assert.match(migration, /SELECT c\.oid, i\.indisvalid, i\.indisready/);
+  assert.match(migration, /WHERE c\.oid = to_regclass\('public\.idx_jobs_channel_payload'\)/);
   assert.match(
     migration,
     /CREATE INDEX IF NOT EXISTS idx_jobs_channel_payload\s+ON public\.jobs USING btree \(\(\(payload ->> 'channelId'::text\)\)\);/,
@@ -46,6 +48,12 @@ test('migration 157 fails closed instead of building on a populated table', () =
   assert.match(migration, /IF EXISTS \(SELECT 1 FROM public\.jobs LIMIT 1\) THEN/);
   assert.match(migration, /RAISE EXCEPTION 'jobs is populated and idx_jobs_channel_payload is absent/);
   assert.match(migration, /create it CONCURRENTLY out-of-band before applying migration 157/);
+});
+
+test('migration 157 rejects an invalid or not-ready index instead of recording it', () => {
+  assert.match(migration, /IF index_oid IS NOT NULL AND \(NOT index_valid OR NOT index_ready\) THEN/);
+  assert.match(migration, /RAISE EXCEPTION 'idx_jobs_channel_payload exists but is not valid\/ready/);
+  assert.match(migration, /rebuild it CONCURRENTLY out-of-band before applying migration 157/);
 });
 
 test('migration 157 does not require index ownership for a comment', () => {
@@ -67,6 +75,17 @@ test('the migration runner builds a missing index concurrently before migration 
   assert.ok(
     dbCore.indexOf('await ensureJobsChannelPayloadIndex(client)') < dbCore.indexOf('const files = fs.readdirSync(MIGRATIONS_DIR)'),
     'the concurrent ensure step must run before the transactional migration loop',
+  );
+});
+
+test('the runner repairs an invalid concurrent-build remnant before adopting the index', () => {
+  assert.match(dbCore, /SELECT c\.oid, i\.indisvalid, i\.indisready/);
+  assert.match(dbCore, /if \(existing\?\.indisvalid && existing\?\.indisready\) return;/);
+  assert.match(dbCore, /if \(existing\?\.oid\) \{/);
+  assert.match(dbCore, /DROP INDEX CONCURRENTLY IF EXISTS public\.idx_jobs_channel_payload/);
+  assert.ok(
+    dbCore.indexOf('DROP INDEX CONCURRENTLY IF EXISTS public.idx_jobs_channel_payload') < dbCore.indexOf('CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_channel_payload'),
+    'the invalid remnant must be dropped before the concurrent rebuild',
   );
 });
 
