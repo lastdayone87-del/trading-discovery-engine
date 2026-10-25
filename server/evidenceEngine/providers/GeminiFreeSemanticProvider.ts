@@ -13,9 +13,11 @@ import {
   buildSemanticPrompt,
   hasCreatorLevelSemanticContext,
   parseSemanticResult,
+  semanticObservabilityFields,
   SEMANTIC_FEATURE_VERSION,
   SEMANTIC_PROMPT_VERSION,
   type SemanticModelClient,
+  type SemanticObservabilityContext,
 } from './GeminiSemanticProvider';
 
 /**
@@ -219,13 +221,14 @@ export function defaultClient(
   const deadlinesEnabled = geminiFreeDeadlinesEnabled();
   const persistedCooldownExpiryMs = deps?.persistedCooldownExpiryMs ?? defaultPersistedCooldownExpiryMs;
   return {
-    classify: async (prompt, model) => {
+    classify: async (prompt, model, observability) => {
       const response = await runGeminiFreeRouteFailover(routes, async route => {
         const started = Date.now();
         const controller = new AbortController();
         const timer = deadlinesEnabled ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
         const base = {
           id: randomUUID(), provider: 'gemini-free', operation: 'multilingual-semantic-classification',
+          ...semanticObservabilityFields(observability),
           requestMetadata: { geminiFreeRoute: route.id }, attempt: 1,
           reservedCost: 0, policyVersion: 'provider-resilience-v1',
         };
@@ -291,14 +294,14 @@ export function defaultClient(
   };
 }
 
-async function classifyCandidateWith404Fallback(client: SemanticModelClient, candidatePrompt: string, candidateModel: string, fallbackModel: string) {
+async function classifyCandidateWith404Fallback(client: SemanticModelClient, candidatePrompt: string, candidateModel: string, fallbackModel: string, observability?: SemanticObservabilityContext) {
   try {
-    return { value: await client.classify(candidatePrompt, candidateModel), model: candidateModel, fallbackUsed: false };
+    return { value: await client.classify(candidatePrompt, candidateModel, observability), model: candidateModel, fallbackUsed: false };
   } catch (error) {
     const isModel404 = error instanceof ProviderCallError && error.errorClass === 'PERMANENT_INPUT' && error.status === 404;
     if (!isModel404 || candidateModel === fallbackModel) throw error;
     console.warn('[GeminiFree Semantic] Candidate model returned 404; retrying once with configured adjudicator model.', { candidateModel, fallbackModel });
-    return { value: await client.classify(candidatePrompt, fallbackModel), model: fallbackModel, fallbackUsed: true };
+    return { value: await client.classify(candidatePrompt, fallbackModel, observability), model: fallbackModel, fallbackUsed: true };
   }
 }
 
@@ -319,8 +322,9 @@ export class GeminiFreeSemanticProvider implements EvidenceProvider {
     if (!client) return [];
     const candidateModel = process.env.GEMINI_FREE_CANDIDATE_MODEL || DEFAULT_GEMINI_FREE_CANDIDATE_MODEL;
     const adjudicatorModel = process.env.GEMINI_FREE_ADJUDICATOR_MODEL || DEFAULT_GEMINI_FREE_ADJUDICATOR_MODEL;
+    const observability = { jobId: input.job_id, runId: input.run_id };
     const candidatePrompt = buildSemanticPrompt(input, 'CANDIDATE');
-    const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel);
+    const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel, observability);
     let result = parseSemanticResult(candidate.value);
     let model = candidate.model;
     const fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
@@ -331,7 +335,7 @@ export class GeminiFreeSemanticProvider implements EvidenceProvider {
     // gemini-2.5-flash-lite, and skipping then would silently disable the
     // flag. Decisive results still cost exactly one call (first conditions).
     if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && process.env.GEMINI_FREE_ADJUDICATION_ENABLED === 'true') {
-      result = parseSemanticResult(await client.classify(buildSemanticPrompt(input, 'ADJUDICATION'), adjudicatorModel)); model = adjudicatorModel;
+      result = parseSemanticResult(await client.classify(buildSemanticPrompt(input, 'ADJUDICATION'), adjudicatorModel, observability)); model = adjudicatorModel;
     }
     const calibrated = calibrateSemanticConfidence(result.confidence);
     const abstained = !result.supportedLanguage || result.label === 'AMBIGUOUS' || calibrated < 50 || result.citations.length === 0;

@@ -105,6 +105,10 @@ export interface RawChannelInput {
   channel_id?: string;
   channel_name: string;
   description: string;
+  /** Observability-only attribution copied into provider ledger rows. Never
+   * evidence and never part of the prompt. */
+  job_id?: string;
+  run_id?: string;
   video_titles?: string[];
   video_descriptions?: string[];
   country?: string;
