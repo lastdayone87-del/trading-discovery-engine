@@ -284,7 +284,25 @@ function availableKeyIndexes(keys: string[]): number[] {
 
 function throwIfAllProvidersCoolingDown(keys: string[]): void {
   const retryAt = youtubeProviderCooldown.earliestRetryAtIfAllCooling(keys);
-  if (retryAt !== null) throw new YouTubeProvidersCoolingDownError(retryAt);
+  if (retryAt !== null) throw buildYouTubeProvidersCoolingDownError(retryAt, keys);
+}
+
+/**
+ * Preserve the countable quota signal when every key is cooling specifically
+ * because its daily quota is exhausted. The all-cooling error is thrown both
+ * after the rotation loop and from `availableKeyIndexes` on later requests, so
+ * without this marker a real full-pool exhaustion storm never reaches the cap
+ * monitor. Mixed cooldowns keep their ordinary retry semantics and metadata.
+ */
+export function buildYouTubeProvidersCoolingDownError(
+  retryAt: number,
+  keys: string[],
+): YouTubeProvidersCoolingDownError {
+  const error = new YouTubeProvidersCoolingDownError(retryAt);
+  if (youtubeProviderCooldown.allDailyQuotaExhausted(keys)) {
+    Object.assign(error, { quotaExceeded: true, providerReasons: ['quotaExceeded'] });
+  }
+  return error;
 }
 
 /** Thrown before dispatch when an input is durably quarantined after repeated

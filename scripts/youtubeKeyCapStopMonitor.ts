@@ -335,14 +335,21 @@ async function main(): Promise<void> {
         // The local marker is the immediate fail-closed signal. Write it
         // before the durable insert so a slow database cannot delay the
         // runner's stop, then retry the durable row for several minutes.
-        const markerDay = readStopMarkerDay();
-        if (shouldWriteStopMarker({
-          alertOnly: false,
-          shouldWriteStop: evaluation.shouldWriteStop,
-          markerQuotaDay: markerDay,
-          currentQuotaDay: sample.quotaDay,
-        })) {
-          writeStop(reason, evaluation.verdict.detail, now, sample.quotaDay);
+        // A marker-write failure must not skip the durable insert.
+        try {
+          const markerDay = readStopMarkerDay();
+          if (shouldWriteStopMarker({
+            alertOnly: false,
+            shouldWriteStop: evaluation.shouldWriteStop,
+            markerQuotaDay: markerDay,
+            currentQuotaDay: sample.quotaDay,
+          })) {
+            writeStop(reason, evaluation.verdict.detail, now, sample.quotaDay);
+          }
+        } catch (error) {
+          appendLog(
+            `${now.toISOString()}|STOP_MARKER_FAILED|${reason}|${String((error as Error)?.message || error).slice(0, 200)}`,
+          );
         }
         try {
           await recordKeyCapMonitorStopWithRetry(db, {
@@ -448,9 +455,10 @@ main().catch(error => {
   console.error('youtube-key-cap-stop-monitor failed:', error);
   // Database initialization or an unexpected top-level failure can reject
   // before the sampling loop's two-failure escalation. Leave an immediate
-  // fail-closed marker unless a more specific stop already exists.
+  // fail-closed marker unless a more specific stop already exists. Alert-only
+  // must never write a stop, even when startup itself fails.
   try {
-    if (!existsSync(STOP_FILE)) {
+    if (!ALERT_ONLY && !existsSync(STOP_FILE)) {
       writeStop(
         'MONITOR_UNAVAILABLE',
         `monitor failed: ${String((error as Error)?.message || error).slice(0, 200)}`,

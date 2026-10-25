@@ -1,6 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildYouTubeDiscoveryTerminalError, extractDiscoveredChannels } from './youtube';
+import {
+  buildYouTubeDiscoveryTerminalError,
+  buildYouTubeProvidersCoolingDownError,
+  extractDiscoveredChannels,
+} from './youtube';
+import { youtubeProviderCooldown } from './youtubeProviderCooldown';
+import { persistedJobFailureMessage } from './db';
 
 test('video lane extracts unique channels and retains matching video evidence', () => {
   const results = extractDiscoveredChannels([
@@ -46,6 +52,43 @@ test('discovery terminal error preserves provider quota metadata', () => {
   };
   assert.equal(none.quotaExceeded, undefined);
   assert.equal(none.providerReasons, undefined);
+});
+
+test('full key-pool quota exhaustion preserves a countable quota signal', () => {
+  const keys = ['quota-test-key-a', 'quota-test-key-b'];
+  try {
+    for (const key of keys) youtubeProviderCooldown.failed(key, 'DAILY_QUOTA_EXHAUSTED');
+    const retryAt = youtubeProviderCooldown.earliestRetryAtIfAllCooling(keys);
+    assert.ok(retryAt !== null);
+
+    const error = buildYouTubeProvidersCoolingDownError(retryAt, keys) as Error & {
+      code?: string;
+      quotaExceeded?: boolean;
+      providerReasons?: string[];
+    };
+    assert.equal(error.code, 'YOUTUBE_PROVIDERS_COOLING_DOWN');
+    assert.equal(error.quotaExceeded, true);
+    assert.deepEqual(error.providerReasons, ['quotaExceeded']);
+    assert.match(persistedJobFailureMessage(error), /^YOUTUBE_QUOTA_EXCEEDED: /);
+
+    // A mixed cooldown keeps the ordinary retry metadata and is not counted
+    // as a quota-exhaustion storm.
+    const mixedKeys = ['quota-test-key-c', 'quota-test-key-d'];
+    youtubeProviderCooldown.failed(mixedKeys[0], 'DAILY_QUOTA_EXHAUSTED');
+    youtubeProviderCooldown.failed(mixedKeys[1], 'RATE_LIMITED');
+    try {
+      const mixedRetryAt = youtubeProviderCooldown.earliestRetryAtIfAllCooling(mixedKeys);
+      assert.ok(mixedRetryAt !== null);
+      const mixed = buildYouTubeProvidersCoolingDownError(mixedRetryAt, mixedKeys) as Error & {
+        quotaExceeded?: boolean;
+      };
+      assert.equal(mixed.quotaExceeded, undefined);
+    } finally {
+      for (const key of mixedKeys) youtubeProviderCooldown.succeeded(key);
+    }
+  } finally {
+    for (const key of keys) youtubeProviderCooldown.succeeded(key);
+  }
 });
 
 test('channel lane preserves direct channel discovery behavior', () => {
