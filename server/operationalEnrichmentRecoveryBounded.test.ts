@@ -198,3 +198,88 @@ test('reconciliation is a no-op inside the throttle window and without qualifyin
   assert.equal(throttled, 0);
   assert.equal(getDbCalls, 1, 'a call inside the 60s throttle must not touch the database');
 });
+
+test('concurrent reconciliation calls are single-flight and release on completion', async () => {
+  resetOperationsTelemetry();
+  const now = T0 + 1_000_000;
+  let releaseQuery!: () => void;
+  const queryGate = new Promise<void>(resolve => { releaseQuery = resolve; });
+  let signalStarted!: () => void;
+  const started = new Promise<void>(resolve => { signalStarted = resolve; });
+  let selectCalls = 0;
+  const db = {
+    async query(sql: string) {
+      if (sql.includes('SELECT c.channel_id')) {
+        selectCalls++;
+        signalStarted();
+        await queryGate;
+        return { rows: [], rowCount: 0 };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+  };
+  let getDbCalls = 0;
+  const getDb = async () => { getDbCalls++; return db; };
+  const first = reconcileOperationalEnrichmentRecovery(
+    getDb, async () => null, async () => undefined, async () => undefined, 20, now,
+  );
+  await started;
+  // A later caller passes the 60s cooldown check but must still not start a
+  // second scan, and must not acquire a second pool connection.
+  const concurrent = await reconcileOperationalEnrichmentRecovery(
+    getDb, async () => null, async () => undefined, async () => undefined, 20, now + 120_000,
+  );
+  assert.equal(concurrent, 0);
+  assert.equal(selectCalls, 1, 'only one reconciliation scan may be in flight');
+  assert.equal(getDbCalls, 1, 'the concurrent call must not touch the database');
+  releaseQuery();
+  assert.equal(await first, 0);
+  const later = await reconcileOperationalEnrichmentRecovery(
+    getDb, async () => null, async () => undefined, async () => undefined, 20, now + 240_000,
+  );
+  assert.equal(later, 0);
+  assert.equal(selectCalls, 2, 'the guard is released after the in-flight call completes');
+});
+
+test('a failed reconciliation releases the single-flight guard', async () => {
+  resetOperationsTelemetry();
+  const now = T0 + 2_000_000;
+  const failingDb = {
+    async query(sql: string) {
+      if (sql.includes('SELECT c.channel_id')) throw new Error('injected scan failure');
+      return { rows: [], rowCount: 0 };
+    },
+  };
+  await assert.rejects(
+    reconcileOperationalEnrichmentRecovery(
+      async () => failingDb, async () => null, async () => undefined, async () => undefined, 20, now,
+    ),
+    /injected scan failure/,
+  );
+  const { db, queries } = mockDb([]);
+  const recovered = await reconcileOperationalEnrichmentRecovery(
+    async () => db, async () => null, async () => undefined, async () => undefined, 20, now + 120_000,
+  );
+  assert.equal(recovered, 0);
+  assert.equal(
+    queries.filter(q => q.sql.includes('SELECT c.channel_id')).length,
+    1,
+    'the next call must run instead of being rejected by a stuck guard',
+  );
+});
+
+test('the single-flight guard does not bypass the existing 60-second cooldown', async () => {
+  resetOperationsTelemetry();
+  const now = T0 + 3_000_000;
+  const { db } = mockDb([]);
+  let getDbCalls = 0;
+  const getDb = async () => { getDbCalls++; return db; };
+  await reconcileOperationalEnrichmentRecovery(
+    getDb, async () => null, async () => undefined, async () => undefined, 20, now,
+  );
+  const throttled = await reconcileOperationalEnrichmentRecovery(
+    getDb, async () => null, async () => undefined, async () => undefined, 20, now + 59_999,
+  );
+  assert.equal(throttled, 0);
+  assert.equal(getDbCalls, 1, 'the cooldown still suppresses a second scan after the guard is released');
+});

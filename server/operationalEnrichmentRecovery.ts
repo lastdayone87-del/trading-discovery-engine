@@ -60,6 +60,12 @@ export function reactivateOperationalEnrichment(
 }
 
 let lastOperationalEnrichmentReconciliationAt = 0;
+// Process-local single-flight guard. Production runs one app replica, and all
+// worker loops share this module, so a boolean stops the 15 loops from piling
+// overlapping scans onto the same pool. If the app is ever scaled to multiple
+// replicas or processes this must become a database advisory lock/lease: a
+// module boolean cannot coordinate across processes.
+let operationalEnrichmentReconciliationInFlight = false;
 
 /** Project only machine-owned, provider-blocked terminal rows for truthful dashboard state. */
 export async function projectProviderDeferredEnrichment(
@@ -178,8 +184,37 @@ export async function reconcileOperationalEnrichmentRecovery(
   limit = 20,
   now = Date.now()
 ): Promise<number> {
+  // Check the in-flight guard before the cooldown: a concurrent worker with a
+  // slightly later clock must not start a second scan, and a skipped call must
+  // not extend the cooldown window.
+  if (operationalEnrichmentReconciliationInFlight) return 0;
   if (now - lastOperationalEnrichmentReconciliationAt < 60_000) return 0;
   lastOperationalEnrichmentReconciliationAt = now;
+  operationalEnrichmentReconciliationInFlight = true;
+  try {
+    return await runOperationalEnrichmentReconciliation(
+      getDb,
+      getChannelById,
+      upsertChannel,
+      enqueueRecoveryJob,
+      limit,
+      now
+    );
+  } finally {
+    // Always release, including on query/transaction failure, so one transient
+    // error cannot permanently disable recovery for this process.
+    operationalEnrichmentReconciliationInFlight = false;
+  }
+}
+
+async function runOperationalEnrichmentReconciliation(
+  getDb: () => Promise<any>,
+  getChannelById: (id: string) => Promise<ChannelRecord | null>,
+  upsertChannel: (channel: ChannelRecord) => Promise<void>,
+  enqueueRecoveryJob: EnqueueOperationalEnrichmentRecovery,
+  limit: number,
+  now: number
+): Promise<number> {
   const db = await getDb();
   // The failed-job predicate admits both marked terminal failures and the raw
   // bounded provider-cooling terminal messages persisted before the marker was
