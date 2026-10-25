@@ -35,7 +35,8 @@ export type StaticNotFoundBodyReason =
   | 'TRUNCATED'
   | 'LARGE_BODY'
   | 'BODY_NOT_READ'
-  | 'UNREADABLE';
+  | 'UNREADABLE'
+  | 'UNSAFE_MARKUP';
 
 export interface StaticNotFoundBodyAssessment {
   confirmed: boolean;
@@ -75,30 +76,215 @@ function hasCommunityContent(text: string): boolean {
 }
 const EXPLICIT_NOT_FOUND_PATTERN =
   /\b(?:404|410|not\s+found|page\s+(?:not\s+found|does\s+not\s+exist|doesn't\s+exist|could\s+not\s+be\s+found|cannot\s+be\s+found)|no\s+longer\s+(?:available|exists)|this\s+page\s+is\s+gone)\b/i;
-// Bound tag-attribute scans. The body is attacker-controlled (up to 64 KB);
-// an unbounded `[^>]*` would rescan to end-of-body for every unclosed `<a`,
-// `<meta`, or inline-handler prefix and could block the event loop.
-const ANCHOR_PATTERN = /<(?:a|area)\b[^<>]{0,2000}\bhref\s*=/i;
-// A small shell can still become a soft 404 or redirect once scripts run, or
-// expose content through an embedded frame/form/inline handler. Such bodies
-// are never terminal even when they carry no anchor.
-const CLIENT_RENDER_PATTERN = /<(?:script|iframe|form|object|embed)\b|<meta\b[^<>]{0,2000}\bhttp-equiv\s*=\s*["']?refresh|<[^<>]{1,2000}\son[a-z]+\s*=/i;
+// Bound each tag scan. The body is attacker-controlled (up to 64 KB); an
+// unbounded `[^>]*` would rescan to end-of-body for every unclosed `<a`,
+// `<meta`, or inline-handler prefix and could block the event loop. A tag that
+// cannot be read safely inside the bound is never treated as link-free: the
+// caller keeps rendered escalation instead of guessing what the tag contains.
+const MAX_TAG_CHARS = 2_000;
 const SMALL_BODY_CHARS = 2_048;
 const HEADING_SCAN_CHARS = 16_384;
 const HEADING_TEXT_CHARS = 4_096;
+// Elements whose content is text, not markup. Skipping them keeps JavaScript
+// or CSS containing `<` from being mistaken for unreadable markup. `plaintext`
+// has no closing tag and consumes the rest of the document.
+const RAW_TEXT_TAGS = new Set(['script', 'style', 'textarea', 'title', 'xmp', 'plaintext']);
+const CLIENT_RENDER_TAGS = new Set(['script', 'iframe', 'form', 'object', 'embed']);
 
-function tagText(html: string, tag: string): string {
+interface TagBounds {
+  end: number;
+  uncertain: boolean;
+}
+
+/**
+ * Find the closing `>` of a tag without letting quoted attributes or an
+ * oversized/malformed tag hide later markup. A `<` outside quotes, an
+ * unterminated quote, or a tag longer than MAX_TAG_CHARS is uncertain.
+ */
+function findTagEnd(source: string, start: number): TagBounds {
+  let quote = '';
+  const last = Math.min(source.length - 1, start + MAX_TAG_CHARS);
+  for (let index = start; index <= last; index++) {
+    const char = source[index];
+    if (quote) {
+      if (char === quote) quote = '';
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === '>') return { end: index, uncertain: false };
+    if (char === '<') return { end: index, uncertain: true };
+  }
+  return { end: last, uncertain: true };
+}
+
+function skipRawText(source: string, from: number, tag: string): TagBounds {
+  if (tag === 'plaintext') return { end: source.length, uncertain: false };
+  const close = source.toLowerCase().indexOf(`</${tag}`, from);
+  if (close < 0) return { end: source.length, uncertain: true };
+  return findTagEnd(source, close + 2 + tag.length);
+}
+
+interface MarkupScan {
+  hasLink: boolean;
+  hasClientRender: boolean;
+  uncertain: boolean;
+}
+
+/**
+ * Linear, bounded tag scan. Unlike the previous regexes, this understands
+ * quoted attributes, so `<a title="1 < 2" href="/join">` is still a link.
+ * Any tag that cannot be fully checked makes the whole body uncertain.
+ */
+function scanMarkup(text: string): MarkupScan {
+  const result: MarkupScan = { hasLink: false, hasClientRender: false, uncertain: false };
+  let index = 0;
+  while (index < text.length) {
+    const lt = text.indexOf('<', index);
+    if (lt < 0) break;
+    if (text.startsWith('<!--', lt)) {
+      const end = text.indexOf('-->', lt + 4);
+      if (end < 0) return { ...result, uncertain: true };
+      index = end + 3;
+      continue;
+    }
+    if (text.startsWith('<![CDATA[', lt)) {
+      const end = text.indexOf(']]>', lt + 9);
+      if (end < 0) return { ...result, uncertain: true };
+      index = end + 3;
+      continue;
+    }
+    if (text.startsWith('<!', lt) || text.startsWith('<?', lt)) {
+      const bounds = findTagEnd(text, lt + 2);
+      if (bounds.uncertain) return { ...result, uncertain: true };
+      index = bounds.end + 1;
+      continue;
+    }
+    if (text[lt + 1] === '/') {
+      const bounds = findTagEnd(text, lt + 2);
+      if (bounds.uncertain) return { ...result, uncertain: true };
+      index = bounds.end + 1;
+      continue;
+    }
+    const nameMatch = /^<([a-zA-Z][a-zA-Z0-9:-]*)/.exec(text.slice(lt, Math.min(text.length, lt + 64)));
+    if (!nameMatch) {
+      // A bare `<` followed by text (for example `1 < 2`) is document text.
+      index = lt + 1;
+      continue;
+    }
+    const name = nameMatch[1].toLowerCase();
+    const bounds = findTagEnd(text, lt + 1 + nameMatch[1].length);
+    if (bounds.uncertain) return { ...result, uncertain: true };
+    const tagText = text.slice(lt, bounds.end + 1);
+    if ((name === 'a' || name === 'area') && /\bhref\s*=/i.test(tagText)) result.hasLink = true;
+    if (CLIENT_RENDER_TAGS.has(name)) result.hasClientRender = true;
+    if (name === 'meta' && /\bhttp-equiv\s*=\s*["']?refresh/i.test(tagText)) result.hasClientRender = true;
+    if (/\son[a-z]+\s*=/i.test(tagText)) result.hasClientRender = true;
+    index = bounds.end + 1;
+    if (RAW_TEXT_TAGS.has(name)) {
+      const raw = skipRawText(text, index, name);
+      if (raw.uncertain) return { ...result, uncertain: true };
+      index = raw.end + 1;
+    }
+  }
+  return result;
+}
+
+function findOpeningTag(source: string, tag: string): { start: number; end: number; uncertain: boolean } | null {
+  let index = 0;
+  while (index < source.length) {
+    const lt = source.indexOf('<', index);
+    if (lt < 0) return null;
+    if (source.startsWith('<!--', lt)) {
+      const end = source.indexOf('-->', lt + 4);
+      if (end < 0) return { start: lt, end: source.length, uncertain: true };
+      index = end + 3;
+      continue;
+    }
+    if (source.startsWith('<!', lt) || source.startsWith('<?', lt) || source[lt + 1] === '/') {
+      const bounds = findTagEnd(source, lt + 2);
+      if (bounds.uncertain) return { start: lt, end: bounds.end, uncertain: true };
+      index = bounds.end + 1;
+      continue;
+    }
+    const nameMatch = /^<([a-zA-Z][a-zA-Z0-9:-]*)/.exec(source.slice(lt, Math.min(source.length, lt + 64)));
+    if (!nameMatch) {
+      index = lt + 1;
+      continue;
+    }
+    const name = nameMatch[1].toLowerCase();
+    const bounds = findTagEnd(source, lt + 1 + nameMatch[1].length);
+    if (bounds.uncertain) return { start: lt, end: bounds.end, uncertain: true };
+    if (name === tag) return { start: lt, end: bounds.end, uncertain: false };
+    index = bounds.end + 1;
+    if (RAW_TEXT_TAGS.has(name)) {
+      const raw = skipRawText(source, index, name);
+      if (raw.uncertain) return { start: lt, end: raw.end, uncertain: true };
+      index = raw.end + 1;
+    }
+  }
+  return null;
+}
+
+function stripHeadingTags(content: string): { text: string; uncertain: boolean } {
+  let text = '';
+  let index = 0;
+  while (index < content.length) {
+    const lt = content.indexOf('<', index);
+    if (lt < 0) {
+      text += content.slice(index);
+      break;
+    }
+    text += content.slice(index, lt);
+    if (content.startsWith('<!--', lt)) {
+      const end = content.indexOf('-->', lt + 4);
+      if (end < 0) return { text: '', uncertain: true };
+      text += ' ';
+      index = end + 3;
+      continue;
+    }
+    if (content.startsWith('<!', lt) || content.startsWith('<?', lt) || content[lt + 1] === '/') {
+      const bounds = findTagEnd(content, lt + 2);
+      if (bounds.uncertain) return { text: '', uncertain: true };
+      text += ' ';
+      index = bounds.end + 1;
+      continue;
+    }
+    const nameMatch = /^<([a-zA-Z][a-zA-Z0-9:-]*)/.exec(content.slice(lt, Math.min(content.length, lt + 64)));
+    if (!nameMatch) {
+      text += '<';
+      index = lt + 1;
+      continue;
+    }
+    const name = nameMatch[1].toLowerCase();
+    const bounds = findTagEnd(content, lt + 1 + nameMatch[1].length);
+    if (bounds.uncertain) return { text: '', uncertain: true };
+    text += ' ';
+    index = bounds.end + 1;
+    if (RAW_TEXT_TAGS.has(name)) {
+      const raw = skipRawText(content, index, name);
+      if (raw.uncertain) return { text: '', uncertain: true };
+      index = raw.end + 1;
+    }
+  }
+  return { text: text.replace(/\s+/g, ' ').trim(), uncertain: false };
+}
+
+function tagText(html: string, tag: string): { text: string; uncertain: boolean } {
   // Index-based extraction with bounded scans, not a backtracking regex.
   const source = html.slice(0, HEADING_SCAN_CHARS);
-  const lower = source.toLowerCase();
-  const openMatch = new RegExp(`<${tag}(?=[\\s/>])`, 'i').exec(source);
-  if (!openMatch) return '';
-  const openEnd = lower.indexOf('>', openMatch.index + tag.length + 1);
-  if (openEnd < 0) return '';
-  const close = lower.indexOf(`</${tag}>`, openEnd + 1);
-  if (close < 0) return '';
-  const content = source.slice(openEnd + 1, Math.min(close, openEnd + 1 + HEADING_TEXT_CHARS));
-  return content.replace(/<[^<>]{0,2000}>/g, ' ').replace(/\s+/g, ' ').trim();
+  const open = findOpeningTag(source, tag);
+  if (!open) return { text: '', uncertain: false };
+  if (open.uncertain) return { text: '', uncertain: true };
+  const close = source.toLowerCase().indexOf(`</${tag}`, open.end + 1);
+  if (close < 0) return { text: '', uncertain: false };
+  const closeEnd = findTagEnd(source, close + 2 + tag.length);
+  if (closeEnd.uncertain) return { text: '', uncertain: true };
+  const content = source.slice(open.end + 1, Math.min(close, open.end + 1 + HEADING_TEXT_CHARS));
+  const stripped = stripHeadingTags(content);
+  return stripped.uncertain ? { text: '', uncertain: true } : { text: stripped.text, uncertain: false };
 }
 
 /**
@@ -123,11 +309,18 @@ export function assessStaticNotFoundBody(input: {
   if (text.includes('\u0000')) return { confirmed: false, reason: 'UNREADABLE' };
   if (hasBlockMarkers(text)) return { confirmed: false, reason: 'BLOCK_MARKERS' };
   if (hasCommunityContent(text)) return { confirmed: false, reason: 'HAS_COMMUNITY_CONTENT' };
-  if (ANCHOR_PATTERN.test(text)) return { confirmed: false, reason: 'HAS_LINKS' };
-  if (CLIENT_RENDER_PATTERN.test(text)) return { confirmed: false, reason: 'CLIENT_RENDER_SHELL' };
+  const markup = scanMarkup(text);
+  // A tag that could not be fully checked may hide a link, inline handler, or
+  // meta refresh. Never confirm absence from partial markup.
+  if (markup.uncertain) return { confirmed: false, reason: 'UNSAFE_MARKUP' };
+  if (markup.hasLink) return { confirmed: false, reason: 'HAS_LINKS' };
+  if (markup.hasClientRender) return { confirmed: false, reason: 'CLIENT_RENDER_SHELL' };
   const trimmed = text.trim();
   if (!trimmed) return { confirmed: true, reason: 'EMPTY_BODY' };
-  const heading = `${tagText(text, 'title')} ${tagText(text, 'h1')}`.trim();
+  const title = tagText(text, 'title');
+  const h1 = tagText(text, 'h1');
+  if (title.uncertain || h1.uncertain) return { confirmed: false, reason: 'UNSAFE_MARKUP' };
+  const heading = `${title.text} ${h1.text}`.trim();
   if (heading && EXPLICIT_NOT_FOUND_PATTERN.test(heading)) {
     return { confirmed: true, reason: 'NO_LINKS_EXPLICIT_NOT_FOUND' };
   }

@@ -90,6 +90,45 @@ test('static 404 body: any link keeps rendered escalation', () => {
   }
 });
 
+test('static 404 body: quoted angle brackets never hide a real link', () => {
+  for (const body of [
+    '<html><body><a title="1 < 2" href="/join">Join</a></body></html>',
+    "<html><body><a title='1 > 2' href='/join'>Join</a></body></html>",
+    '<html><body><a data-label="a < b" href="/join">Join</a></body></html>',
+    '<html><body><area title="1 < 2" href="/community"></body></html>',
+  ]) {
+    assert.deepEqual(
+      assessStaticNotFoundBody({ text: body, truncated: false }),
+      { confirmed: false, reason: 'HAS_LINKS' },
+      body,
+    );
+  }
+});
+
+test('static 404 body: tags that cannot be fully checked are never terminal', () => {
+  const oversized = 'x'.repeat(2_500);
+  for (const body of [
+    `<html><body><a ${oversized} href="/join">Join</a></body></html>`,
+    `<html><body><button ${oversized} onclick="location='/community'">Continue</button></body></html>`,
+    `<html><head><meta ${oversized} http-equiv="refresh" content="0;url=/"></head><body>404</body></html>`,
+    `<html><body><h1 ${oversized} title="404">Welcome</h1></body></html>`,
+  ]) {
+    assert.deepEqual(
+      assessStaticNotFoundBody({ text: body, truncated: false }),
+      { confirmed: false, reason: 'UNSAFE_MARKUP' },
+      body.slice(0, 80),
+    );
+  }
+});
+
+test('static 404 body: attribute text is not treated as visible heading', () => {
+  const body = `<html><body><h1 data-label="> 404">Welcome</h1>${'x'.repeat(3_000)}</body></html>`;
+  assert.deepEqual(
+    assessStaticNotFoundBody({ text: body, truncated: false }),
+    { confirmed: false, reason: 'LARGE_BODY' },
+  );
+});
+
 test('static 404 body: community content keeps rendered escalation', () => {
   for (const marker of [
     'https://discord.gg/creator',
