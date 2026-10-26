@@ -203,6 +203,10 @@ CREATE TABLE IF NOT EXISTS native_vocabulary_ai_runs (
   -- second logical call, and a stale RESERVED row is reclaimed by lease.
   response_payload JSONB,
   lease_expires_at TIMESTAMPTZ,
+  -- Fencing token for the worker that currently owns the reservation. A
+  -- reclaimed/replayed reservation rotates the token so a late write from the
+  -- previous worker cannot overwrite the new owner's response or completion.
+  lease_token TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   completed_at TIMESTAMPTZ
 );
@@ -210,6 +214,8 @@ ALTER TABLE native_vocabulary_ai_runs
   ADD COLUMN IF NOT EXISTS response_payload JSONB;
 ALTER TABLE native_vocabulary_ai_runs
   ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
+ALTER TABLE native_vocabulary_ai_runs
+  ADD COLUMN IF NOT EXISTS lease_token TEXT;
 CREATE INDEX IF NOT EXISTS idx_native_vocab_ai_lease
   ON native_vocabulary_ai_runs(status, lease_expires_at)
   WHERE status='RESERVED';

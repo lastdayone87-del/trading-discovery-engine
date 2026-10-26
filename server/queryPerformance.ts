@@ -41,6 +41,12 @@ export interface QueryFunnelMetrics {
    * of summing per-page distinct counts (which double-counts repeat creators).
    */
   cumulativeUniqueCreators?: number;
+  /**
+   * Cumulative unique creators rejected for country through this page in a
+   * run. Like cumulativeUniqueCreators, this prevents repeat sightings across
+   * pages from being subtracted more than once during aggregation.
+   */
+  cumulativeCountryRejected?: number;
   duplicateResults: number;
   knownChannels: number;
   newChannels: number;

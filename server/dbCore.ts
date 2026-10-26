@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { ChannelRecord, CountryVocabulary, ExcludedCountry, QueueStatus, QueryRecord, QueryExecutionLog, ExtractedTermRecord, DiscoverySource } from '../src/types';
 import { INITIAL_COUNTRY_VOCABULARIES, INITIAL_EXCLUDED_COUNTRIES } from '../src/data/initial_countries';
@@ -4167,6 +4168,8 @@ export interface NativeVocabularyAiRunRecord {
   /** Parsed provider output retained for admission replay after a crash. */
   responsePayload: Record<string, unknown> | null;
   leaseExpiresAt: string | null;
+  /** Current reservation owner; null after completion/reclaim. */
+  leaseToken: string | null;
   createdAt: string;
   completedAt: string | null;
 }
@@ -4190,6 +4193,7 @@ function rowToNativeVocabularyAiRun(row: Record<string, unknown>): NativeVocabul
       ? payload as Record<string, unknown>
       : null,
     leaseExpiresAt: iso(row.lease_expires_at),
+    leaseToken: row.lease_token ? String(row.lease_token) : null,
     createdAt: iso(row.created_at) || new Date().toISOString(),
     completedAt: iso(row.completed_at),
   };
@@ -4252,6 +4256,11 @@ export interface NativeVocabularyAiReservation {
   status: NativeVocabularyAiRunStatus;
   reason: string;
   requestId: string;
+  /**
+   * Fencing token owned by this reservation. Response and completion writes
+   * must present it; a stale worker cannot mutate a reclaimed/replayed row.
+   */
+  leaseToken?: string | null;
   /** Parsed output from an interrupted call: replay admission, no provider call. */
   replayPayload?: Record<string, unknown> | null;
   provider?: string | null;
@@ -4282,6 +4291,9 @@ export async function reserveNativeVocabularyAiRun(args: {
   try {
     await client.query('BEGIN');
     await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`native-vocab-ai-budget:${args.budgetDay}`]);
+    // Every admission (including a replay) owns a fresh fencing token. Writes
+    // from an earlier worker whose lease was reclaimed are rejected.
+    const leaseToken = randomUUID();
     let existing = await client.query(`SELECT * FROM native_vocabulary_ai_runs WHERE request_id=$1`, [args.requestId]);
     let existingRow = existing.rows[0] ? rowToNativeVocabularyAiRun(existing.rows[0]) : null;
     if (existingRow?.status === 'RESERVED' && (existingRow.leaseExpiresAt === null || Date.parse(existingRow.leaseExpiresAt) <= Date.now())) {
@@ -4290,7 +4302,7 @@ export async function reserveNativeVocabularyAiRun(args: {
       await client.query(
         `UPDATE native_vocabulary_ai_runs
          SET status='FAILED', actual_cost_microunits=GREATEST(actual_cost_microunits,reserved_cost_microunits),
-             completed_at=now(), lease_expires_at=NULL
+             completed_at=now(), lease_expires_at=NULL, lease_token=NULL
          WHERE request_id=$1 AND status='RESERVED'`,
         [args.requestId],
       );
@@ -4298,12 +4310,22 @@ export async function reserveNativeVocabularyAiRun(args: {
     }
     if (existingRow) {
       if (existingRow.status === 'RESERVED' && existingRow.responsePayload) {
+        // The response is durable, but the previous owner may still be
+        // finishing admission. Rotate the lease so only this replay worker can
+        // write the response/completion; the old worker's token is now stale.
+        await client.query(
+          `UPDATE native_vocabulary_ai_runs
+           SET lease_token=$2, lease_expires_at=now()+($3||' seconds')::interval
+           WHERE request_id=$1 AND status='RESERVED'`,
+          [args.requestId, leaseToken, String(NATIVE_VOCABULARY_AI_LEASE_SECONDS)],
+        );
         await client.query('COMMIT');
         return {
           admitted: false,
           status: 'RESERVED',
           reason: 'REPLAY_RESPONSE',
           requestId: args.requestId,
+          leaseToken,
           replayPayload: existingRow.responsePayload,
           provider: existingRow.provider,
           attempts: existingRow.attempts,
@@ -4317,7 +4339,7 @@ export async function reserveNativeVocabularyAiRun(args: {
     await client.query(
       `UPDATE native_vocabulary_ai_runs
        SET status='FAILED', actual_cost_microunits=GREATEST(actual_cost_microunits,reserved_cost_microunits),
-           completed_at=now(), lease_expires_at=NULL
+           completed_at=now(), lease_expires_at=NULL, lease_token=NULL
        WHERE budget_day=$1 AND status='RESERVED'
          AND (lease_expires_at IS NULL OR lease_expires_at <= now())`,
       [args.budgetDay],
@@ -4326,7 +4348,11 @@ export async function reserveNativeVocabularyAiRun(args: {
       `SELECT
          COUNT(*) FILTER (WHERE status IN ('RESERVED','SUCCEEDED','FAILED'))::int AS global_calls,
          COUNT(*) FILTER (WHERE status IN ('RESERVED','SUCCEEDED','FAILED') AND country=$2)::int AS country_calls,
-         COALESCE(SUM(actual_cost_microunits) FILTER (WHERE status IN ('SUCCEEDED','FAILED')),0)::bigint AS actual_cost,
+         -- Retained actual spend survives a reopen (RESERVED after FAILED), so
+         -- count it regardless of status; only outstanding reservations are
+         -- limited to RESERVED. Filtering actual cost by status would hide the
+         -- earlier charge until the replacement reservation completes.
+         COALESCE(SUM(actual_cost_microunits),0)::bigint AS actual_cost,
          COALESCE(SUM(reserved_cost_microunits) FILTER (WHERE status='RESERVED'),0)::bigint AS outstanding
        FROM native_vocabulary_ai_runs WHERE budget_day=$1`,
       [args.budgetDay, args.country],
@@ -4353,17 +4379,18 @@ export async function reserveNativeVocabularyAiRun(args: {
       return { admitted: false, status: 'BUDGET_SKIPPED', reason: decision.reason, requestId: args.requestId };
     }
     await client.query(
-      `INSERT INTO native_vocabulary_ai_runs(request_id,channel_id,country,metadata_hash,budget_day,status,provider,attempts,reserved_cost_microunits,actual_cost_microunits,lease_expires_at)
-       VALUES($1,$2,$3,$4,$5,'RESERVED',NULL,0,$6,0,now()+($7||' seconds')::interval)
+      `INSERT INTO native_vocabulary_ai_runs(request_id,channel_id,country,metadata_hash,budget_day,status,provider,attempts,reserved_cost_microunits,actual_cost_microunits,lease_expires_at,lease_token)
+       VALUES($1,$2,$3,$4,$5,'RESERVED',NULL,0,$6,0,now()+($7||' seconds')::interval,$8)
        ON CONFLICT(request_id) DO UPDATE SET
          status='RESERVED',provider=NULL,attempts=0,response_payload=NULL,
          reserved_cost_microunits=EXCLUDED.reserved_cost_microunits,
-         lease_expires_at=EXCLUDED.lease_expires_at,completed_at=NULL
+         lease_expires_at=EXCLUDED.lease_expires_at,lease_token=EXCLUDED.lease_token,
+         completed_at=NULL
        WHERE native_vocabulary_ai_runs.status='FAILED'`,
-      [args.requestId, args.channelId, args.country, args.metadataHash, args.budgetDay, policy.reservationMicrounits, String(NATIVE_VOCABULARY_AI_LEASE_SECONDS)],
+      [args.requestId, args.channelId, args.country, args.metadataHash, args.budgetDay, policy.reservationMicrounits, String(NATIVE_VOCABULARY_AI_LEASE_SECONDS), leaseToken],
     );
     await client.query('COMMIT');
-    return { admitted: true, status: 'RESERVED', reason: 'RESERVED', requestId: args.requestId };
+    return { admitted: true, status: 'RESERVED', reason: 'RESERVED', requestId: args.requestId, leaseToken };
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;
@@ -4379,41 +4406,48 @@ export async function reserveNativeVocabularyAiRun(args: {
  */
 export async function recordNativeVocabularyAiResponse(args: {
   requestId: string;
+  leaseToken: string;
   responsePayload: Record<string, unknown>;
   attempts?: number;
-}): Promise<void> {
+}): Promise<boolean> {
   const db = await getDb();
-  await db.query(
+  const result = await db.query(
     `UPDATE native_vocabulary_ai_runs
      SET response_payload=$2::jsonb,
          attempts=GREATEST(attempts,$3),
          lease_expires_at=now()+($4||' seconds')::interval
-     WHERE request_id=$1 AND status='RESERVED'`,
+     WHERE request_id=$1 AND status='RESERVED' AND lease_token=$5
+     RETURNING request_id`,
     [
       args.requestId,
       JSON.stringify(args.responsePayload),
       Math.max(0, Math.trunc(args.attempts || 0)),
       String(NATIVE_VOCABULARY_AI_LEASE_SECONDS),
+      args.leaseToken,
     ],
   );
+  return Boolean(result.rowCount);
 }
 
 export async function completeNativeVocabularyAiRun(args: {
   requestId: string;
+  leaseToken: string;
   status: 'SUCCEEDED' | 'FAILED';
   provider?: string | null;
   attempts?: number;
   actualCostMicrounits?: number;
-}): Promise<void> {
+}): Promise<boolean> {
   const db = await getDb();
-  await db.query(
+  const result = await db.query(
     `UPDATE native_vocabulary_ai_runs
      SET status=$2,provider=$3,attempts=GREATEST(attempts,$4),
          actual_cost_microunits=actual_cost_microunits+$5,
-         completed_at=now(),lease_expires_at=NULL
-     WHERE request_id=$1 AND status='RESERVED'`,
-    [args.requestId, args.status, args.provider || null, Math.max(0, Math.trunc(args.attempts || 0)), Math.max(0, Math.trunc(args.actualCostMicrounits || 0))],
+         completed_at=now(),lease_expires_at=NULL,lease_token=NULL
+     WHERE request_id=$1 AND status='RESERVED' AND lease_token=$6
+     RETURNING request_id`,
+    [args.requestId, args.status, args.provider || null, Math.max(0, Math.trunc(args.attempts || 0)), Math.max(0, Math.trunc(args.actualCostMicrounits || 0)), args.leaseToken],
   );
+  return Boolean(result.rowCount);
 }
 
 export interface QueryRunProgress {

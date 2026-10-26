@@ -150,6 +150,7 @@ export interface AutonomousPageMarginalMetrics {
   marginalNonTradingCreators: number;
   crossPageRepeatCreators: number;
   cumulativeUniqueCreators: number;
+  cumulativeCountryRejected: number;
   cumulativeConfirmedCreators: number;
   cumulativeQualityCreators: number;
   cumulativeNonTradingCreators: number;
@@ -167,7 +168,10 @@ export async function getAutonomousPageMarginalMetrics(runId: string, pageNumber
   const result = await db.query(
     `WITH first_sighting AS (
        SELECT s.channel_id, MIN(s.page_number) AS first_page,
-              BOOL_OR(NOT s.was_known) AS was_new
+              BOOL_OR(NOT s.was_known) AS was_new,
+              -- Outcome at the creator's first sighting: a creator rejected on
+              -- page 1 and seen again on page 3 is still one rejection.
+              (array_agg(s.funnel_outcome ORDER BY s.page_number))[1] AS first_outcome
        FROM channel_sightings s
        WHERE s.query_run_id=$1
        GROUP BY s.channel_id
@@ -185,6 +189,7 @@ export async function getAutonomousPageMarginalMetrics(runId: string, pageNumber
        COUNT(*) FILTER (WHERE fs.first_page=$2 AND c.trading_status IN ('NON_TRADING','HUMAN_REJECTED'))::int AS marginal_non_trading,
        COUNT(*) FILTER (WHERE fs.first_page < $2 AND ps.channel_id IS NOT NULL)::int AS cross_page_repeat,
        COUNT(*) FILTER (WHERE fs.first_page <= $2)::int AS cumulative_unique,
+       COUNT(*) FILTER (WHERE fs.first_page <= $2 AND fs.first_outcome='COUNTRY_REJECTED')::int AS cumulative_country_rejected,
        COUNT(*) FILTER (WHERE fs.first_page <= $2 AND c.trading_status='TRADING_CONFIRMED')::int AS cumulative_confirmed,
        COUNT(*) FILTER (WHERE fs.first_page <= $2 AND c.trading_status='TRADING_CONFIRMED' AND COALESCE(c.quality_score,0)>=55)::int AS cumulative_quality,
        COUNT(*) FILTER (WHERE fs.first_page <= $2 AND c.trading_status IN ('NON_TRADING','HUMAN_REJECTED'))::int AS cumulative_non_trading
@@ -202,6 +207,7 @@ export async function getAutonomousPageMarginalMetrics(runId: string, pageNumber
     marginalNonTradingCreators: Number(row.marginal_non_trading || 0),
     crossPageRepeatCreators: Number(row.cross_page_repeat || 0),
     cumulativeUniqueCreators: Number(row.cumulative_unique || 0),
+    cumulativeCountryRejected: Number(row.cumulative_country_rejected || 0),
     cumulativeConfirmedCreators: Number(row.cumulative_confirmed || 0),
     cumulativeQualityCreators: Number(row.cumulative_quality || 0),
     cumulativeNonTradingCreators: Number(row.cumulative_non_trading || 0),
@@ -428,12 +434,21 @@ export function aggregatePageMetrics(pages: QueryFunnelMetrics[]): QueryFunnelMe
   // distinct counts overlap across pages and cannot be summed. Weighted
   // averages still use per-page distinct counts as their weights.
   let cumulativeDistinct: number | undefined;
+  let cumulativeCountryRejected: number | undefined;
   for (const page of pages) {
     if (page.cumulativeUniqueCreators !== undefined) {
       cumulativeDistinct = Math.max(0, Number(page.cumulativeUniqueCreators) || 0);
     }
+    if (page.cumulativeCountryRejected !== undefined) {
+      cumulativeCountryRejected = Math.max(0, Number(page.cumulativeCountryRejected) || 0);
+    }
   }
   const distinct = cumulativeDistinct ?? weightedDistinct;
+  // A creator repeated on several pages is one distinct result and must also
+  // be one country rejection. The cumulative counter supplies the unique
+  // count for CDL pages; legacy pages without it keep the summed fallback but
+  // are clamped so precision cannot go negative.
+  const countryRejected = Math.min(distinct, cumulativeCountryRejected ?? sum('countryRejected'));
   const evaluated = sum('nonTrading') + sum('uncertain') + sum('needsReview') + sum('tradingConfirmed');
   const weighted = (key: keyof QueryFunnelMetrics) => weightedDistinct ? pages.reduce((n, p) => n + p.distinctResults * Number(p[key] || 0), 0) / weightedDistinct : 0;
   // Scope weighting survives aggregation: pages carrying scope data sum
@@ -449,13 +464,13 @@ export function aggregatePageMetrics(pages: QueryFunnelMetrics[]): QueryFunnelMe
     evaluatedRawResults: sum('evaluatedRawResults'), distinctResults: distinct,
     duplicateResults: sum('duplicateResults'), knownChannels: sum('knownChannels'),
     newChannels: sum('newChannels'), inScopeNewChannels: inScopeAggregate,
-    countryRejected: sum('countryRejected'), nonTrading: sum('nonTrading'),
+    countryRejected, nonTrading: sum('nonTrading'),
     uncertain: sum('uncertain'), needsReview: sum('needsReview'),
     tradingConfirmed: sum('tradingConfirmed'), qualityChannels: sum('qualityChannels'),
     communitiesDiscovered: sum('communitiesDiscovered'),
     averageQualityScore: weighted('averageQualityScore'),
     noveltyRatio: distinct ? sum('newChannels') / distinct : 0,
-    countryPrecision: distinct ? (distinct - sum('countryRejected')) / distinct : 0,
+    countryPrecision: distinct ? (distinct - countryRejected) / distinct : 0,
     tradingPrecision: evaluated ? sum('tradingConfirmed') / evaluated : 0,
     performanceScore: Math.round(weighted('performanceScore')),
   };

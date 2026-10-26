@@ -19,3 +19,29 @@ test('scope weighting survives page aggregation; legacy pages stay neutral',()=>
   assert.equal(cumulative.distinctResults, 14);
   assert.equal(aggregatePageMetrics([legacy(), legacy()]).distinctResults, 16);
 });
+
+test('country rejections are counted once against cumulative unique reach', () => {
+  const page = (overrides: Record<string, unknown>) => ({
+    rawResults: 10, distinctResults: 8, duplicateResults: 2, knownChannels: 1,
+    newChannels: 7, countryRejected: 3, nonTrading: 1, uncertain: 1,
+    needsReview: 1, tradingConfirmed: 4, qualityChannels: 2,
+    communitiesDiscovered: 1, averageQualityScore: 60, noveltyRatio: .875,
+    countryPrecision: .625, tradingPrecision: .57, performanceScore: 60, ...overrides,
+  });
+  const cumulative = aggregatePageMetrics([
+    page({ cumulativeUniqueCreators: 10, cumulativeCountryRejected: 3 }),
+    page({ cumulativeUniqueCreators: 14, cumulativeCountryRejected: 4 }),
+  ]);
+  assert.equal(cumulative.distinctResults, 14);
+  assert.equal(cumulative.countryRejected, 4, 'repeat rejections are not summed');
+  assert.equal(cumulative.countryPrecision, (14 - 4) / 14);
+
+  // Legacy rows have no cumulative rejection count. The fallback sum is
+  // clamped so overlapping pages cannot produce a negative precision.
+  const legacy = aggregatePageMetrics([
+    page({ distinctResults: 1, countryRejected: 2 }),
+    page({ distinctResults: 1, countryRejected: 2 }),
+  ]);
+  assert.equal(legacy.countryRejected, 2);
+  assert.equal(legacy.countryPrecision, 0);
+});

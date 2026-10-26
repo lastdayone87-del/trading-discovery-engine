@@ -917,10 +917,12 @@ Return ONLY a valid JSON object with format:
     // persisted, so a skipped or exhausted budget degrades to rule-only
     // extraction instead of failing the job. Baseline load happens first so a
     // database outage never burns a call slot.
-    let aiRun: { requestId: string; promptChars: number; attempts: number; responseChars: number } | null = null;
+    let aiRun: { requestId: string; leaseToken: string; promptChars: number; attempts: number; responseChars: number } | null = null;
+    // Last provider that actually received a request, for failure attribution.
+    let attemptedProvider: 'GROQ' | 'GEMINI' | null = null;
     // Interrupted call replay: the parsed response is durable, so admission
     // runs again without another provider call or a second budget charge.
-    let replayRun: { requestId: string; payload: Record<string, unknown>; provider: string | null; attempts: number } | null = null;
+    let replayRun: { requestId: string; leaseToken: string; payload: Record<string, unknown>; provider: string | null; attempts: number } | null = null;
     // Every AI call is budgeted, including the legacy quality-gated path when
     // the CDL flags are off. The ledger is the only authorized provider-spend
     // path, so no caller can bypass the daily cap by disabling the new native
@@ -942,10 +944,13 @@ Return ONLY a valid JSON object with format:
       budgetDay,
     });
     if (reservation.admitted) {
-      aiRun = { requestId, promptChars: prompt.length, attempts: 0, responseChars: 0 };
+      if (!reservation.leaseToken) throw new Error('AI_RESERVATION_LEASE_TOKEN_MISSING');
+      aiRun = { requestId, leaseToken: reservation.leaseToken, promptChars: prompt.length, attempts: 0, responseChars: 0 };
     } else if (reservation.reason === 'REPLAY_RESPONSE' && reservation.replayPayload) {
+      if (!reservation.leaseToken) throw new Error('AI_RESERVATION_LEASE_TOKEN_MISSING');
       replayRun = {
         requestId,
+        leaseToken: reservation.leaseToken,
         payload: reservation.replayPayload,
         provider: reservation.provider || null,
         attempts: Math.max(1, reservation.attempts || 1),
@@ -964,6 +969,7 @@ Return ONLY a valid JSON object with format:
       if (!aiRun) return;
       await completeNativeVocabularyAiRun({
         requestId: aiRun.requestId,
+        leaseToken: aiRun.leaseToken,
         status,
         provider,
         attempts: aiRun.attempts,
@@ -978,6 +984,7 @@ Return ONLY a valid JSON object with format:
       if (!replayRun) return;
       await completeNativeVocabularyAiRun({
         requestId: replayRun.requestId,
+        leaseToken: replayRun.leaseToken,
         status,
         provider,
         attempts: replayRun.attempts,
@@ -1000,6 +1007,7 @@ Return ONLY a valid JSON object with format:
             // Actual requests, not logical calls: failover can hit several
             // routes and each attempt must be costed.
             onRequestAttempt: () => {
+              attemptedProvider = 'GROQ';
               if (aiRun) aiRun.attempts += 1;
             },
             validateContent: text => {
@@ -1034,6 +1042,7 @@ Return ONLY a valid JSON object with format:
           // callGeminiSafe retries transient failures; count each real request
           // at the call site so the ledger reflects provider attempts.
           const response = await callGeminiSafe(() => {
+            attemptedProvider = 'GEMINI';
             if (aiRun) aiRun.attempts += 1;
             return executeProviderCall({context:{provider:'gemini',operation:'vocabulary-extraction',requestMetadata:{geminiRoute:resolveGeminiRouteId('gemini-1'),geminiOrg:geminiOrgIdForSlot(process.env,1)}},timeoutMs:Number(process.env.GEMINI_PROVIDER_TIMEOUT_MS||'45000'),enabled:process.env.PROVIDER_DEADLINES_ENABLED==='true',emit:appendProviderCallEvent,call:() => ai.models.generateContent({
               model: 'gemini-3.6-flash',
@@ -1063,7 +1072,7 @@ Return ONLY a valid JSON object with format:
       // recorded after admission persists the parsed terms; the payload is
       // stored first so a persistence retry replays instead of re-calling.
       if (!parsed) {
-        await finishAiRun('FAILED', ((aiRun?.attempts || 0) > 0 ? 'GROQ' : null));
+        await finishAiRun('FAILED', attemptedProvider);
       }
     }
     if (parsed) {
@@ -1079,12 +1088,28 @@ Return ONLY a valid JSON object with format:
         const humanObservation = humanApproved ? 'HUMAN_APPROVED_CHANNEL' as const : 'ENRICHMENT' as const;
         // Within-run dedupe against rule-admitted instruments (see above).
         const deduped = (values: unknown[] | undefined) => excludeRuleAdmittedInstruments(values, ruleObserved);
-        if (aiRun) {
-          await recordNativeVocabularyAiResponse({
-            requestId: aiRun.requestId,
+        // The reservation token fences this worker. If the lease was reclaimed
+        // or another replay worker took ownership, do not persist this stale
+        // worker's admission: the current owner will replay the durable
+        // response. Rule evidence already persisted above is untouched.
+        const reservationOwner = aiRun
+          ? { requestId: aiRun.requestId, leaseToken: aiRun.leaseToken, attempts: aiRun.attempts }
+          : replayRun
+            ? { requestId: replayRun.requestId, leaseToken: replayRun.leaseToken, attempts: replayRun.attempts }
+            : null;
+        if (reservationOwner) {
+          const ownsReservation = await recordNativeVocabularyAiResponse({
+            requestId: reservationOwner.requestId,
+            leaseToken: reservationOwner.leaseToken,
             responsePayload: parsed as Record<string, unknown>,
-            attempts: aiRun.attempts,
+            attempts: reservationOwner.attempts,
           });
+          if (!ownsReservation) {
+            console.warn(
+              `[Vocabulary Extraction] AI reservation ownership lost for channel ${channel.channel_id}; skipping stale admission.`
+            );
+            return getExtractedVocabulary(channel.country);
+          }
         }
         await admitNativeCandidates({
           channel,

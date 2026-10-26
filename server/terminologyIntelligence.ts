@@ -456,6 +456,8 @@ export function evaluateNativeTermPromotion(input: {
   executions: number;
   quotaConsumed: number;
   confirmedTradingCreators: number;
+  /** Fresh confirmed traders for the no-repeat-only bar; shares use the full count. */
+  freshConfirmedTradingCreators?: number;
   nonTradingCreators: number;
   wrongCountryCreators: number;
   needsReviewCreators: number;
@@ -470,6 +472,7 @@ export function evaluateNativeTermPromotion(input: {
   if (!input.novel) {
     return { decision: 'REJECT', reasons: ['not-novel: generics served via curated paths'], metrics: emptyPromotionMetrics() };
   }
+  const freshConfirmedTradingCreators = input.freshConfirmedTradingCreators ?? input.confirmedTradingCreators;
   if (input.executions < NATIVE_PROMOTION_MIN_EXECUTIONS) {
     reasons.push(`insufficient-executions:${input.executions}<${NATIVE_PROMOTION_MIN_EXECUTIONS}`);
   }
@@ -503,7 +506,7 @@ export function evaluateNativeTermPromotion(input: {
   // Verified-trader evidence is required independently of non-trading volume:
   // a trial with zero confirmed trading creators holds for verification even
   // when nothing contradicts it yet (review-only or unattributed outcomes).
-  if (input.confirmedTradingCreators < 1) {
+  if (freshConfirmedTradingCreators < 1) {
     return { decision: 'HOLD', reasons: ['no-verified-traders'], metrics };
   }
   if (metrics.reviewShare > NATIVE_PROMOTION_REVIEW_HOLD_SHARE) {
@@ -556,7 +559,17 @@ export interface LifecycleV2Input {
    * external bucket contributes one unit toward the same trial threshold.
    */
   externalTrialEvidenceScore?: number;
+  /**
+   * Full confirmed-trader count, including repeat sightings. Used for the
+   * wrong-country and review shares so a large confirmed base is not replaced
+   * by the smaller fresh-creator count.
+   */
   confirmedTradingCreators: number;
+  /**
+   * Fresh confirmed traders for the no-repeat-only promotion bar. Defaults to
+   * confirmedTradingCreators; never substitute it into the share denominator.
+   */
+  freshConfirmedTradingCreators?: number;
   nonTradingCreators: number;
   wrongCountryCreators: number;
   needsReviewCreators: number;
@@ -584,6 +597,7 @@ export function decideLifecycleV2(
   input: LifecycleV2Input,
   policy = DEFAULT_TERMINOLOGY_POLICY
 ): LifecycleV2Decision {
+  const freshConfirmedTradingCreators = input.freshConfirmedTradingCreators ?? input.confirmedTradingCreators;
   const totalAttributed =
     input.confirmedTradingCreators + input.nonTradingCreators +
     input.wrongCountryCreators + input.needsReviewCreators;
@@ -598,7 +612,7 @@ export function decideLifecycleV2(
   const externalOnlyBasis = externalEligible && input.nativeCreators === 0;
   const validationBasis = nativeBasis || mixedBasis || externalOnlyBasis;
   const tradingValidNativeBasis =
-    nativeBasis && input.confirmedTradingCreators >= 1 && confirmedShare >= NATIVE_V2_MIN_CONFIRMED_SHARE;
+    nativeBasis && freshConfirmedTradingCreators >= 1 && confirmedShare >= NATIVE_V2_MIN_CONFIRMED_SHARE;
   const externalTrialEvidence = externalOnlyBasis &&
     input.decayedEvidence + Math.max(0, input.externalTrialEvidenceScore ?? 0) >= policy.trialEvidence;
   const nativeTrialEvidence =
@@ -648,6 +662,7 @@ export function decideLifecycleV2(
       executions: input.executions,
       quotaConsumed: input.quotaConsumed,
       confirmedTradingCreators: input.confirmedTradingCreators,
+      freshConfirmedTradingCreators,
       nonTradingCreators: input.nonTradingCreators,
       wrongCountryCreators: input.wrongCountryCreators,
       needsReviewCreators: input.needsReviewCreators,
@@ -718,6 +733,8 @@ export function evaluateNativeTermPromotionV2(input: {
   executions: number;
   quotaConsumed: number;
   confirmedTradingCreators: number;
+  /** Fresh confirmed traders for the no-repeat-only bar; shares use the full count. */
+  freshConfirmedTradingCreators?: number;
   nonTradingCreators: number;
   wrongCountryCreators: number;
   needsReviewCreators: number;
@@ -732,6 +749,7 @@ export function evaluateNativeTermPromotionV2(input: {
   if (input.novel === false) {
     return { decision: 'REJECT', reasons: ['not-novel: generics served via curated paths'], metrics: emptyPromotionMetrics() };
   }
+  const freshConfirmedTradingCreators = input.freshConfirmedTradingCreators ?? input.confirmedTradingCreators;
   const totalAttributed =
     input.confirmedTradingCreators + input.nonTradingCreators +
     input.wrongCountryCreators + input.needsReviewCreators;
@@ -756,7 +774,7 @@ export function evaluateNativeTermPromotionV2(input: {
   if (metrics.reviewShare > NATIVE_V2_DEMOTE_REVIEW_SHARE) {
     return { decision: 'REJECT', reasons: [`review-burden-demote:${metrics.reviewShare.toFixed(2)}`], metrics };
   }
-  if (input.confirmedTradingCreators < 1) reasons.push('no-verified-traders');
+  if (freshConfirmedTradingCreators < 1) reasons.push('no-verified-traders');
   if (metrics.confirmedShare < NATIVE_V2_MIN_CONFIRMED_SHARE) {
     reasons.push(`confirmed-share-below-bar:${metrics.confirmedShare.toFixed(2)}<${NATIVE_V2_MIN_CONFIRMED_SHARE}`);
   }
@@ -1611,7 +1629,8 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
       externalTrialEvidenceScore: external.independentSources,
       externalFamilies: external.families,
       externalReasons: external.reasons,
-      confirmedTradingCreators: freshConfirmed,
+      confirmedTradingCreators: Number(perfRow.confirmed || 0),
+      freshConfirmedTradingCreators: freshConfirmed,
       wrongCountryCreators: Number(perfRow.wrong || 0),
       needsReviewCreators: Number(perfRow.review || 0),
       quotaConsumed: Number(perfRow.quota || 0),
@@ -1626,7 +1645,8 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
       externalSourceCount: external.independentSources,
       externalEligible: external.eligible,
       externalTrialEvidenceScore: external.independentSources,
-      confirmedTradingCreators: freshConfirmed,
+      confirmedTradingCreators: Number(perfRow.confirmed || 0),
+      freshConfirmedTradingCreators: freshConfirmed,
       nonTradingCreators: Number(perfRow.nontrading || 0),
       wrongCountryCreators: Number(perfRow.wrong || 0),
       needsReviewCreators: Number(perfRow.review || 0),
@@ -1696,7 +1716,8 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
       spamConfirmed: quality.spamConfirmed,
       executions: Number(agg.executions || 0),
       quotaConsumed: Number(agg.quota || 0),
-      confirmedTradingCreators: freshConfirmed,
+      confirmedTradingCreators: Number(agg.confirmed || 0),
+      freshConfirmedTradingCreators: freshConfirmed,
       nonTradingCreators: Number(agg.nontrading || 0),
       wrongCountryCreators: Number(agg.wrong || 0),
       needsReviewCreators: Number(agg.review || 0),

@@ -1177,6 +1177,19 @@ test('T9: a 0.30 wrong-country share demotes an existing trial', () => {
   assert.equal(decision.searchEligible, false);
 });
 
+test('T9b: the fresh-creator bar does not distort wrong-country or review shares', () => {
+  // 90 confirmed sightings include repeat creators; only 10 are fresh. The
+  // wrong-country and review shares must use the full 90-creator base, not the
+  // fresh 10, or a useful term is demoted for evidence it did not produce.
+  const decision = decideLifecycleV2({
+    ...baseLifecycle, current: 'SEARCH_TRIAL', decayedEvidence: 6,
+    confirmedTradingCreators: 90, freshConfirmedTradingCreators: 10,
+    wrongCountryCreators: 10, needsReviewCreators: 10,
+  });
+  assert.equal(decision.searchEligible, true);
+  assert.match(decision.reason, /controlled exploration/);
+});
+
 test('T10: a 0.30 review share revokes an existing trial without a new promotion', () => {
   const decision = decideLifecycleV2({
     ...baseLifecycle, current: 'SEARCH_TRIAL', decayedEvidence: 6,
@@ -1902,9 +1915,25 @@ test('R1: transient AI failure retries up to three attempts while rule evidence 
   assert.match(db, /NATIVE_VOCABULARY_AI_LEASE_SECONDS = 15 \* 60/);
   assert.match(db, /reason: 'REPLAY_RESPONSE'/);
   assert.match(db, /actual_cost_microunits=actual_cost_microunits\+\$5/);
+  // Lease fencing: response and completion writes present the admission token,
+  // so a worker whose reservation was reclaimed cannot mutate the replacement.
+  assert.match(db, /lease_token=\$5/);
+  assert.match(db, /lease_token=\$6/);
+  assert.match(db, /lease_token=\$2, lease_expires_at/);
+  assert.match(db, /reason: 'RESERVED', requestId: args\.requestId, leaseToken/);
+  assert.match(db, /args\.leaseToken/);
+  // Retained spend is counted on RESERVED rows too, not hidden until the
+  // replacement reservation completes.
+  assert.match(db, /COALESCE\(SUM\(actual_cost_microunits\),0\)::bigint AS actual_cost/);
+  assert.match(source, /ownsReservation/);
+  assert.match(source, /leaseToken: aiRun\.leaseToken/);
+  assert.match(source, /leaseToken: replayRun\.leaseToken/);
+  assert.match(source, /attemptedProvider = 'GEMINI'/);
+  assert.match(source, /finishAiRun\('FAILED', attemptedProvider\)/);
   const ledgerMigration = migration161();
   assert.match(ledgerMigration, /response_payload JSONB/);
   assert.match(ledgerMigration, /lease_expires_at TIMESTAMPTZ/);
+  assert.match(ledgerMigration, /lease_token TEXT/);
 
   const base = {
     canonicalTermId: 7, channelId: 'ch-1', videoId: 'vid-1', observationType: 'VIDEO_TITLE',
