@@ -15,6 +15,7 @@ import {
   getQueryDemandSignals,
   reserveNativeVocabularyAiRun,
   completeNativeVocabularyAiRun,
+  recordNativeVocabularyAiResponse,
   isRetryableInfrastructureFailure
 } from './db';
 import {
@@ -623,7 +624,13 @@ export async function invokeChannelVocabularyExtraction(
   candidate: ExtractionVideoSource & { description?: string; detectedLanguages?: Array<{ language: string; confidence?: number }> },
   languageContext: ExplicitTerminologyLanguageContext | undefined,
   deps?: { extractVocabulary?: typeof extractVocabularyFromCreator },
-  options?: { promotionEligible?: boolean; persistLegacyTerm?: boolean; aiBudgetEnabled?: boolean }
+  options?: {
+    promotionEligible?: boolean;
+    persistLegacyTerm?: boolean;
+    aiBudgetEnabled?: boolean;
+    queryRunId?: string;
+    queryPageNumber?: number;
+  }
 ): Promise<Array<string | null>> {
   const extractionVideoIds = resolveExtractionVideoIds(candidate);
   const extract = deps?.extractVocabulary ?? extractVocabularyFromCreator;
@@ -713,6 +720,9 @@ export async function admitNativeCandidates(args: {
   promotionEligible?: boolean;
   /** false skips legacy extracted-vocabulary writes (lower-quality creators). */
   persistLegacyTerm?: boolean;
+  /** Autonomous run/page provenance for exact novel-term attribution. */
+  queryRunId?: string;
+  queryPageNumber?: number;
   deps?: NativeAdmissionDeps;
 }): Promise<NativeAdmissionReport> {
   const saveTerm = args.deps?.saveTerm ?? ((country, term, category, channelId) => saveExtractedTerm(country, term, category, channelId));
@@ -740,6 +750,8 @@ export async function admitNativeCandidates(args: {
       language: args.language, locale: args.locale,
       communityFingerprint: args.channel.discord_invite || undefined,
       promotionEligible: args.promotionEligible,
+      queryRunId: args.queryRunId,
+      queryPageNumber: args.queryPageNumber,
       evidence: {
         extractor: args.extractor ?? 'GEMINI', qualityVersion: 'native-v1', literal: true,
         sourceRef: { kind: verdict.located.sourceKind, index: verdict.located.sourceIndex, span: verdict.located.span, videoId: verdict.located.videoId ?? null, sourceHash: verdict.located.sourceHash },
@@ -804,7 +816,14 @@ export async function extractVocabularyFromCreator(
   videoIds?: Array<string | null>,
   origins?: ExtractionSourceOrigins,
   deps?: { isKillSwitchActive?: () => Promise<boolean> },
-  options?: { promotionEligible?: boolean; persistLegacyTerm?: boolean; aiBudgetEnabled?: boolean }
+  options?: {
+    promotionEligible?: boolean;
+    persistLegacyTerm?: boolean;
+    aiBudgetEnabled?: boolean;
+    /** Autonomous run/page provenance for exact novel-term attribution. */
+    queryRunId?: string;
+    queryPageNumber?: number;
+  }
 ): Promise<ExtractedTermRecord[]> {
   const extracted: ExtractedTermRecord[] = [];
 
@@ -901,6 +920,9 @@ Return ONLY a valid JSON object with format:
     // extraction instead of failing the job. Baseline load happens first so a
     // database outage never burns a call slot.
     let aiRun: { requestId: string; promptChars: number; attempts: number; responseChars: number } | null = null;
+    // Interrupted call replay: the parsed response is durable, so admission
+    // runs again without another provider call or a second budget charge.
+    let replayRun: { requestId: string; payload: Record<string, unknown>; provider: string | null; attempts: number } | null = null;
     const budgetDisabled = options?.aiBudgetEnabled === false;
     if (!budgetDisabled) {
       const metadataHash = computeNativeVocabularyMetadataHash([
@@ -921,6 +943,18 @@ Return ONLY a valid JSON object with format:
       });
       if (reservation.admitted) {
         aiRun = { requestId, promptChars: prompt.length, attempts: 0, responseChars: 0 };
+      } else if (reservation.reason === 'REPLAY_RESPONSE' && reservation.replayPayload) {
+        replayRun = {
+          requestId,
+          payload: reservation.replayPayload,
+          provider: reservation.provider || null,
+          attempts: Math.max(1, reservation.attempts || 1),
+        };
+        parsed = replayRun.payload;
+        parsedSource = replayRun.provider === 'GROQ' ? 'GROQ' : 'GEMINI';
+        console.warn(
+          `[Vocabulary Extraction] Replaying stored AI response for channel ${channel.channel_id}; no provider call is repeated.`
+        );
       } else {
         console.warn(
           `[Vocabulary Extraction] AI budget skipped for channel ${channel.channel_id}: ${reservation.reason}. Rule-based evidence retained.`
@@ -941,15 +975,34 @@ Return ONLY a valid JSON object with format:
         }),
       });
     };
+    const finishReplayRun = async (status: 'SUCCEEDED' | 'FAILED', provider: 'GROQ' | 'GEMINI' | null) => {
+      if (!replayRun) return;
+      await completeNativeVocabularyAiRun({
+        requestId: replayRun.requestId,
+        status,
+        provider,
+        attempts: replayRun.attempts,
+        actualCostMicrounits: estimateNativeVocabularyActualCostMicrounits({
+          attempts: replayRun.attempts,
+          promptChars: prompt.length,
+          responseChars: JSON.stringify(replayRun.payload).length,
+        }),
+      });
+    };
     // Groq primary: same prompt, same parser, same admission below. Any
     // Groq failure (no keys, deferral, 429, error) falls through to the
     // unchanged Gemini path; total failure keeps warn-and-skip.
-    if (aiRun || budgetDisabled) {
+    if (!replayRun && (aiRun || budgetDisabled)) {
       try {
         const { runGroqTextCompletion } = await import('./evidenceEngine/providers/GroqSemanticProvider');
         const groqText = await runGroqTextCompletion(
           { prompt },
           {
+            // Actual requests, not logical calls: failover can hit several
+            // routes and each attempt must be costed.
+            onRequestAttempt: () => {
+              if (aiRun) aiRun.attempts += 1;
+            },
             validateContent: text => {
               let candidate: ReturnType<typeof parseNativeVocabularyResponse>;
               try {
@@ -962,7 +1015,6 @@ Return ONLY a valid JSON object with format:
           }
         );
         if (aiRun) {
-          aiRun.attempts += 1;
           aiRun.responseChars += groqText ? groqText.length : 0;
         }
         // Admissibility gate: provider output with no admissible candidate is
@@ -980,19 +1032,22 @@ Return ONLY a valid JSON object with format:
       }
       if (!parsed && ai) {
         try {
-          const response = await callGeminiSafe(() => executeProviderCall({context:{provider:'gemini',operation:'vocabulary-extraction',requestMetadata:{geminiRoute:resolveGeminiRouteId('gemini-1'),geminiOrg:geminiOrgIdForSlot(process.env,1)}},timeoutMs:Number(process.env.GEMINI_PROVIDER_TIMEOUT_MS||'45000'),enabled:process.env.PROVIDER_DEADLINES_ENABLED==='true',emit:appendProviderCallEvent,call:() => ai.models.generateContent({
-            model: 'gemini-3.6-flash',
-            contents: prompt
-          })}));
+          // callGeminiSafe retries transient failures; count each real request
+          // at the call site so the ledger reflects provider attempts.
+          const response = await callGeminiSafe(() => {
+            if (aiRun) aiRun.attempts += 1;
+            return executeProviderCall({context:{provider:'gemini',operation:'vocabulary-extraction',requestMetadata:{geminiRoute:resolveGeminiRouteId('gemini-1'),geminiOrg:geminiOrgIdForSlot(process.env,1)}},timeoutMs:Number(process.env.GEMINI_PROVIDER_TIMEOUT_MS||'45000'),enabled:process.env.PROVIDER_DEADLINES_ENABLED==='true',emit:appendProviderCallEvent,call:() => ai.models.generateContent({
+              model: 'gemini-3.6-flash',
+              contents: prompt
+            })});
+          });
 
           const resText = response.text || '';
           if (aiRun) {
-            aiRun.attempts += 1;
             aiRun.responseChars += resText.length;
           }
           parsed = parseNativeVocabularyResponse(resText);
         } catch (e: any) {
-          if (aiRun) aiRun.attempts += 1;
           const msg = e?.message || String(e);
           const isQuota = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota');
           const is503 = msg.includes('503') || msg.includes('high demand');
@@ -1005,10 +1060,12 @@ Return ONLY a valid JSON object with format:
           }
         }
       }
-      // The logical call is complete once the provider phase ends; admission
-      // failures below are persistence errors and must still surface as job
-      // retries without re-charging the AI budget for this metadata.
-      await finishAiRun(parsed ? 'SUCCEEDED' : 'FAILED', parsed ? parsedSource : ((aiRun?.attempts || 0) > 0 ? 'GROQ' : null));
+      // A provider failure is terminal for this logical call. Success is only
+      // recorded after admission persists the parsed terms; the payload is
+      // stored first so a persistence retry replays instead of re-calling.
+      if (!parsed) {
+        await finishAiRun('FAILED', ((aiRun?.attempts || 0) > 0 ? 'GROQ' : null));
+      }
     }
     if (parsed) {
         // Literal, traceable admission (native-v1 pipeline) via the shared
@@ -1023,6 +1080,13 @@ Return ONLY a valid JSON object with format:
         const humanObservation = humanApproved ? 'HUMAN_APPROVED_CHANNEL' as const : 'ENRICHMENT' as const;
         // Within-run dedupe against rule-admitted instruments (see above).
         const deduped = (values: unknown[] | undefined) => excludeRuleAdmittedInstruments(values, ruleObserved);
+        if (aiRun) {
+          await recordNativeVocabularyAiResponse({
+            requestId: aiRun.requestId,
+            responsePayload: parsed as Record<string, unknown>,
+            attempts: aiRun.attempts,
+          });
+        }
         await admitNativeCandidates({
           channel,
           sources: literalSources,
@@ -1040,7 +1104,11 @@ Return ONLY a valid JSON object with format:
           extractor: parsedSource,
           promotionEligible: options?.promotionEligible,
           persistLegacyTerm: options?.persistLegacyTerm,
+          queryRunId: options?.queryRunId,
+          queryPageNumber: options?.queryPageNumber,
         });
+        if (aiRun) await finishAiRun('SUCCEEDED', parsedSource);
+        if (replayRun) await finishReplayRun('SUCCEEDED', parsedSource);
     }
   }
 
@@ -1253,7 +1321,9 @@ export async function generateCandidateQueriesForCountry(
   // Free signals are candidate vocabulary only. Read stored signals when the
   // flag is on; on a cold country, refresh once (provider failure falls back
   // to terminology + seeds and never fails the cycle).
-  const freeSignalsEnabled = await getAppSetting('free_query_signals_enabled', 'true') === 'true';
+  const cdlEnabled = await getAppSetting('country_discovery_loop_enabled', 'true') === 'true';
+  const freeSignalsEnabled = cdlEnabled
+    && await getAppSetting('free_query_signals_enabled', 'true') === 'true';
   let freeSignalCandidates: FreeSignalQueryCandidate[] = [];
   if (freeSignalsEnabled) {
     let signals = await getStoredFreeQuerySignals(country, { freshOnly: true }).catch(() => []);

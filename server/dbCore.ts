@@ -4164,11 +4164,17 @@ export interface NativeVocabularyAiRunRecord {
   attempts: number;
   reservedCostMicrounits: number;
   actualCostMicrounits: number;
+  /** Parsed provider output retained for admission replay after a crash. */
+  responsePayload: Record<string, unknown> | null;
+  leaseExpiresAt: string | null;
   createdAt: string;
   completedAt: string | null;
 }
 
 function rowToNativeVocabularyAiRun(row: Record<string, unknown>): NativeVocabularyAiRunRecord {
+  const payload = typeof row.response_payload === 'string'
+    ? (() => { try { return JSON.parse(row.response_payload as string); } catch { return null; } })()
+    : row.response_payload;
   return {
     requestId: String(row.request_id),
     channelId: row.channel_id ? String(row.channel_id) : null,
@@ -4180,6 +4186,10 @@ function rowToNativeVocabularyAiRun(row: Record<string, unknown>): NativeVocabul
     attempts: Number(row.attempts || 0),
     reservedCostMicrounits: Number(row.reserved_cost_microunits || 0),
     actualCostMicrounits: Number(row.actual_cost_microunits || 0),
+    responsePayload: payload && typeof payload === 'object' && !Array.isArray(payload)
+      ? payload as Record<string, unknown>
+      : null,
+    leaseExpiresAt: iso(row.lease_expires_at),
     createdAt: iso(row.created_at) || new Date().toISOString(),
     completedAt: iso(row.completed_at),
   };
@@ -4231,10 +4241,33 @@ async function readNativeVocabularyAiBudgetPolicy(client: { query: (sql: string,
   };
 }
 
+/** Reservation lease. Long enough for the bounded Groq pool plus Gemini
+ * fallback, short enough that a crashed worker's call slot is recoverable the
+ * same day. Reclaiming charges the reserved cost as actual spend because the
+ * provider call may already have occurred. */
+export const NATIVE_VOCABULARY_AI_LEASE_SECONDS = 15 * 60;
+
+export interface NativeVocabularyAiReservation {
+  admitted: boolean;
+  status: NativeVocabularyAiRunStatus;
+  reason: string;
+  requestId: string;
+  /** Parsed output from an interrupted call: replay admission, no provider call. */
+  replayPayload?: Record<string, unknown> | null;
+  provider?: string | null;
+  attempts?: number;
+}
+
 /**
  * Reserve one logical AI extraction call. The advisory lock serializes the
  * count/insert across replicas; the request id makes same-day re-ingestion
  * idempotent. A skipped call never consumes budget.
+ *
+ * A RESERVED row carries a lease. Stale reservations are reclaimed as FAILED
+ * with their reserved cost charged as actual spend (the provider call may have
+ * happened), so a crashed worker can neither hold a call slot all day nor
+ * overlap a retry. A fresh RESERVED row that already has a stored response is
+ * replayed without another provider call.
  */
 export async function reserveNativeVocabularyAiRun(args: {
   requestId: string;
@@ -4243,18 +4276,52 @@ export async function reserveNativeVocabularyAiRun(args: {
   metadataHash: string;
   budgetDay: string;
   policy?: Partial<NativeVocabularyAiBudgetPolicy>;
-}): Promise<{ admitted: boolean; status: NativeVocabularyAiRunStatus; reason: string; requestId: string }> {
+}): Promise<NativeVocabularyAiReservation> {
   const db = await getDb();
   const client = await db.connect();
   try {
     await client.query('BEGIN');
     await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`native-vocab-ai-budget:${args.budgetDay}`]);
-    const existing = await client.query(`SELECT * FROM native_vocabulary_ai_runs WHERE request_id=$1`, [args.requestId]);
-    if (existing.rows[0]) {
-      const row = rowToNativeVocabularyAiRun(existing.rows[0]);
-      await client.query('COMMIT');
-      return { admitted: false, status: row.status, reason: `IDEMPOTENT_${row.status}`, requestId: args.requestId };
+    let existing = await client.query(`SELECT * FROM native_vocabulary_ai_runs WHERE request_id=$1`, [args.requestId]);
+    let existingRow = existing.rows[0] ? rowToNativeVocabularyAiRun(existing.rows[0]) : null;
+    if (existingRow?.status === 'RESERVED' && (existingRow.leaseExpiresAt === null || Date.parse(existingRow.leaseExpiresAt) <= Date.now())) {
+      // Reclaim this request's abandoned lease, then re-admit it below. The
+      // reserved cost is retained as actual spend in the ledger row.
+      await client.query(
+        `UPDATE native_vocabulary_ai_runs
+         SET status='FAILED', actual_cost_microunits=GREATEST(actual_cost_microunits,reserved_cost_microunits),
+             completed_at=now(), lease_expires_at=NULL
+         WHERE request_id=$1 AND status='RESERVED'`,
+        [args.requestId],
+      );
+      existingRow = null;
     }
+    if (existingRow) {
+      if (existingRow.status === 'RESERVED' && existingRow.responsePayload) {
+        await client.query('COMMIT');
+        return {
+          admitted: false,
+          status: 'RESERVED',
+          reason: 'REPLAY_RESPONSE',
+          requestId: args.requestId,
+          replayPayload: existingRow.responsePayload,
+          provider: existingRow.provider,
+          attempts: existingRow.attempts,
+        };
+      }
+      await client.query('COMMIT');
+      return { admitted: false, status: existingRow.status, reason: `IDEMPOTENT_${existingRow.status}`, requestId: args.requestId };
+    }
+    // Reclaim every other abandoned reservation for the day before counting
+    // caps: outstanding cost must not include work whose worker is gone.
+    await client.query(
+      `UPDATE native_vocabulary_ai_runs
+       SET status='FAILED', actual_cost_microunits=GREATEST(actual_cost_microunits,reserved_cost_microunits),
+           completed_at=now(), lease_expires_at=NULL
+       WHERE budget_day=$1 AND status='RESERVED'
+         AND (lease_expires_at IS NULL OR lease_expires_at <= now())`,
+      [args.budgetDay],
+    );
     const counts = await client.query(
       `SELECT
          COUNT(*) FILTER (WHERE status IN ('RESERVED','SUCCEEDED','FAILED'))::int AS global_calls,
@@ -4286,9 +4353,14 @@ export async function reserveNativeVocabularyAiRun(args: {
       return { admitted: false, status: 'BUDGET_SKIPPED', reason: decision.reason, requestId: args.requestId };
     }
     await client.query(
-      `INSERT INTO native_vocabulary_ai_runs(request_id,channel_id,country,metadata_hash,budget_day,status,provider,attempts,reserved_cost_microunits,actual_cost_microunits)
-       VALUES($1,$2,$3,$4,$5,'RESERVED',NULL,0,$6,0) ON CONFLICT(request_id) DO NOTHING`,
-      [args.requestId, args.channelId, args.country, args.metadataHash, args.budgetDay, policy.reservationMicrounits],
+      `INSERT INTO native_vocabulary_ai_runs(request_id,channel_id,country,metadata_hash,budget_day,status,provider,attempts,reserved_cost_microunits,actual_cost_microunits,lease_expires_at)
+       VALUES($1,$2,$3,$4,$5,'RESERVED',NULL,0,$6,0,now()+($7||' seconds')::interval)
+       ON CONFLICT(request_id) DO UPDATE SET
+         status='RESERVED',provider=NULL,attempts=0,response_payload=NULL,
+         reserved_cost_microunits=EXCLUDED.reserved_cost_microunits,
+         lease_expires_at=EXCLUDED.lease_expires_at,completed_at=NULL
+       WHERE native_vocabulary_ai_runs.status='FAILED'`,
+      [args.requestId, args.channelId, args.country, args.metadataHash, args.budgetDay, policy.reservationMicrounits, String(NATIVE_VOCABULARY_AI_LEASE_SECONDS)],
     );
     await client.query('COMMIT');
     return { admitted: true, status: 'RESERVED', reason: 'RESERVED', requestId: args.requestId };
@@ -4298,6 +4370,32 @@ export async function reserveNativeVocabularyAiRun(args: {
   } finally {
     client.release();
   }
+}
+
+/**
+ * Store the parsed provider output while the reservation is still open. A
+ * retry that finds this payload replays admission without a second provider
+ * call; the lease is refreshed because persistence work is still in progress.
+ */
+export async function recordNativeVocabularyAiResponse(args: {
+  requestId: string;
+  responsePayload: Record<string, unknown>;
+  attempts?: number;
+}): Promise<void> {
+  const db = await getDb();
+  await db.query(
+    `UPDATE native_vocabulary_ai_runs
+     SET response_payload=$2::jsonb,
+         attempts=GREATEST(attempts,$3),
+         lease_expires_at=now()+($4||' seconds')::interval
+     WHERE request_id=$1 AND status='RESERVED'`,
+    [
+      args.requestId,
+      JSON.stringify(args.responsePayload),
+      Math.max(0, Math.trunc(args.attempts || 0)),
+      String(NATIVE_VOCABULARY_AI_LEASE_SECONDS),
+    ],
+  );
 }
 
 export async function completeNativeVocabularyAiRun(args: {
@@ -4310,7 +4408,9 @@ export async function completeNativeVocabularyAiRun(args: {
   const db = await getDb();
   await db.query(
     `UPDATE native_vocabulary_ai_runs
-     SET status=$2,provider=$3,attempts=$4,actual_cost_microunits=$5,completed_at=now()
+     SET status=$2,provider=$3,attempts=GREATEST(attempts,$4),
+         actual_cost_microunits=actual_cost_microunits+$5,
+         completed_at=now(),lease_expires_at=NULL
      WHERE request_id=$1 AND status='RESERVED'`,
     [args.requestId, args.status, args.provider || null, Math.max(0, Math.trunc(args.attempts || 0)), Math.max(0, Math.trunc(args.actualCostMicrounits || 0))],
   );

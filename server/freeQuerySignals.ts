@@ -236,9 +236,13 @@ export const WIKIMEDIA_USER_AGENT_ENV = 'WIKIMEDIA_USER_AGENT';
 export const WIKIMEDIA_USER_AGENT_FALLBACK =
   'CountryDiscoveryLoop/1.0 (Wikimedia API client; set WIKIMEDIA_USER_AGENT to a real contact URL or email before enabling free_query_signals_enabled)';
 
-export function resolveWikimediaUserAgent(explicit?: string): string {
+export function configuredWikimediaUserAgent(explicit?: string): string | null {
   const configured = String(explicit || process.env[WIKIMEDIA_USER_AGENT_ENV] || '').trim();
-  return configured || WIKIMEDIA_USER_AGENT_FALLBACK;
+  return configured || null;
+}
+
+export function resolveWikimediaUserAgent(explicit?: string): string {
+  return configuredWikimediaUserAgent(explicit) || WIKIMEDIA_USER_AGENT_FALLBACK;
 }
 
 export function resetFreeQuerySignalCacheForTests(): void {
@@ -247,9 +251,13 @@ export function resetFreeQuerySignalCacheForTests(): void {
 }
 
 async function pace(): Promise<void> {
-  const waitMs = Math.max(0, nextRequestAtMs - Date.now());
+  // Reserve the slot synchronously, before any await: concurrent callers must
+  // queue behind each other instead of all reading the same stale timestamp
+  // and firing their requests at once.
+  const slotMs = Math.max(Date.now(), nextRequestAtMs);
+  nextRequestAtMs = slotMs + MIN_INTERVAL_MS;
+  const waitMs = slotMs - Date.now();
   if (waitMs > 0) await new Promise<void>(resolve => setTimeout(resolve, waitMs));
-  nextRequestAtMs = Date.now() + MIN_INTERVAL_MS;
 }
 
 function wikipediaSearchTerm(country: string, language: string): string {
@@ -296,7 +304,18 @@ export async function fetchFreeQuerySignals(args: {
     return { ...cached.result, fromCache: true };
   }
   const fetchImpl = args.fetchImpl || fetch;
-  const userAgent = resolveWikimediaUserAgent(args.userAgent);
+  const userAgent = configuredWikimediaUserAgent(args.userAgent);
+  // Wikimedia's User-Agent policy requires a real contact URL or email. Never
+  // send a placeholder agent: without an operator-configured identity the
+  // remote fetches are skipped and the caller falls back to terminology and
+  // seeds. The health endpoint surfaces the missing prerequisite as a warning.
+  if (!userAgent) {
+    return {
+      signals: [],
+      degraded: true,
+      error: `${WIKIMEDIA_USER_AGENT_ENV} is not configured; remote Wikimedia fetches are skipped to respect the User-Agent policy.`,
+    };
+  }
   const timeoutMs = Math.max(500, Math.min(10_000, args.timeoutMs || 5000));
   const limit = Math.max(1, Math.min(25, Math.trunc(args.limit || 8)));
   const signals: FreeQuerySignal[] = [];
@@ -344,7 +363,15 @@ export async function persistFreeQuerySignals(signals: FreeQuerySignal[]): Promi
     const result = await db.query(
       `INSERT INTO free_query_signals(country,language,signal_surface,normalized_surface,signal_type,provider,provider_signal_id,source_url,metadata,fetched_at,expires_at)
        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-       ON CONFLICT DO NOTHING`,
+       ON CONFLICT (country, normalized_surface, signal_type, provider, (COALESCE(provider_signal_id, '')))
+       DO UPDATE SET
+         language=EXCLUDED.language,
+         signal_surface=EXCLUDED.signal_surface,
+         source_url=EXCLUDED.source_url,
+         metadata=EXCLUDED.metadata,
+         fetched_at=EXCLUDED.fetched_at,
+         expires_at=EXCLUDED.expires_at
+       RETURNING (xmax = 0) AS inserted`,
       [
         canonicalCountry(signal.country), signal.language, signal.surface, signal.normalizedSurface,
         signal.signalType, signal.provider, signal.providerSignalId || null, signal.sourceUrl || null,
@@ -352,7 +379,9 @@ export async function persistFreeQuerySignals(signals: FreeQuerySignal[]): Promi
         signal.expiresAt || null,
       ],
     );
-    inserted += result.rowCount || 0;
+    // Refresh existing signals in place (a stale signal must not stay stale for
+    // its whole TTL), but report only rows this call actually inserted.
+    inserted += (result.rows || []).filter(row => row.inserted === true).length;
   }
   return inserted;
 }

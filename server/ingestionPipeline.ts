@@ -983,6 +983,8 @@ async function processChannelThroughPipelineInContext(
       promotionEligible: extraction.promotionEligible,
       persistLegacyTerm: extraction.persistLegacyTerm,
       aiBudgetEnabled: extraction.nativeExtractionEnabled,
+      queryRunId: options?.runId || candidate.queryRunId,
+      queryPageNumber: candidate.queryPageNumber,
     });
   }
 

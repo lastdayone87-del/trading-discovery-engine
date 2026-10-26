@@ -549,6 +549,13 @@ export interface LifecycleV2Input {
   externalSources: number;
   externalSourceCount?: number;
   externalEligible?: boolean;
+  /**
+   * Trial-evidence units contributed by qualified independent external
+   * sources. External evidence lives outside terminology_observations, so the
+   * native decayed-evidence score cannot represent it; each independent
+   * external bucket contributes one unit toward the same trial threshold.
+   */
+  externalTrialEvidenceScore?: number;
   confirmedTradingCreators: number;
   nonTradingCreators: number;
   wrongCountryCreators: number;
@@ -592,7 +599,8 @@ export function decideLifecycleV2(
   const validationBasis = nativeBasis || mixedBasis || externalOnlyBasis;
   const tradingValidNativeBasis =
     nativeBasis && input.confirmedTradingCreators >= 1 && confirmedShare >= NATIVE_V2_MIN_CONFIRMED_SHARE;
-  const externalTrialEvidence = externalOnlyBasis && input.decayedEvidence >= policy.trialEvidence;
+  const externalTrialEvidence = externalOnlyBasis &&
+    input.decayedEvidence + Math.max(0, input.externalTrialEvidenceScore ?? 0) >= policy.trialEvidence;
   const nativeTrialEvidence =
     (nativeBasis || mixedBasis) &&
     input.decayedEvidence >= policy.trialEvidence &&
@@ -805,7 +813,11 @@ export function evaluateExternalTermEvidence(args: {
     if (surface !== target && !aliasSet.has(surface)) return false;
     if (String(row.sourceFamily).toUpperCase() === 'TREND_SURFACE') return false;
     const observed = Date.parse(row.observedAt);
-    if (!Number.isFinite(observed) || now.getTime() - observed > 30 * 86_400_000) return false;
+    const ageMs = now.getTime() - observed;
+    // Future-dated rows are not fresh corroboration: an age-only check would
+    // let a bad clock or forged timestamp validate a term indefinitely.
+    // Allow only a small skew for clock drift between collectors.
+    if (!Number.isFinite(observed) || ageMs > 30 * 86_400_000 || ageMs < -5 * 60_000) return false;
     return true;
   });
   const targetLanguage = (args.language || '').split('-')[0].toLowerCase();
@@ -985,6 +997,9 @@ export async function observeTerminologyDetailed(args: {
    * computed from current channel state.
    */
   promotionEligible?: boolean;
+  /** Autonomous run/page that produced this observation, for exact novelty attribution. */
+  queryRunId?: string;
+  queryPageNumber?: number;
 }, clientOverride?: Queryable): Promise<TerminologyObservationResult | null> {
   const canonical = args.term.normalize('NFKC').trim().replace(/\s+/gu, ' ');
   const normalized = normalizeTerm(canonical);
@@ -1130,7 +1145,7 @@ export async function observeTerminologyDetailed(args: {
     (channelCountryStatus === null || channelCountryStatus === 'CONFIRMED') &&
     (channelTradingStatus === null || channelTradingStatus === 'TRADING_CONFIRMED')
   );
-  if (!resolvedNativeStatus && args.promotionEligible !== false && nativeStatusEligible) {
+  if (!resolvedNativeStatus && nativeStatusEligible) {
     resolvedNativeStatus = 'NATIVE_OBSERVED';
     resolvedProvenanceFamily = 'CREATOR_METADATA';
   }
@@ -1253,9 +1268,9 @@ export async function observeTerminologyDetailed(args: {
        human_approval_id, human_approved, community_fingerprint, evidence_weight, evidence,
        source_creator_country, target_market_country, locale, is_code_switched,
        native_language, term_language, native_evidence_status, source_provenance_family, code_switch_type,
-       observation_key, promotion_eligible
+       observation_key, promotion_eligible, query_run_id, query_page_number
      )
-     VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+     VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
      ON CONFLICT(observation_key) DO UPDATE SET
        locale=EXCLUDED.locale, is_code_switched=EXCLUDED.is_code_switched,
        native_language=EXCLUDED.native_language, term_language=EXCLUDED.term_language,
@@ -1265,6 +1280,10 @@ export async function observeTerminologyDetailed(args: {
        target_market_country=EXCLUDED.target_market_country,
        code_switch_type=EXCLUDED.code_switch_type,
        promotion_eligible=EXCLUDED.promotion_eligible,
+       -- First attribution wins; a later replay of the same evidence can fill
+       -- provenance that a legacy writer left NULL but never steal it.
+       query_run_id=COALESCE(terminology_observations.query_run_id, EXCLUDED.query_run_id),
+       query_page_number=COALESCE(terminology_observations.query_page_number, EXCLUDED.query_page_number),
        -- Audit trail: the superseded classification is appended to an
        -- in-evidence revision log (no schema change) instead of being lost.
        -- Quality rollups read only top-level keys and are unaffected.
@@ -1322,7 +1341,9 @@ export async function observeTerminologyDetailed(args: {
       resolvedProvenanceFamily,
       codeSwitching.codeSwitchType,
       obsKey,
-      promotionEligible
+      promotionEligible,
+      args.queryRunId || null,
+      Number.isFinite(args.queryPageNumber) ? Math.max(1, Math.trunc(args.queryPageNumber as number)) : null,
     ]
   );
 
@@ -1540,7 +1561,10 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
          AND c.country=$2
          AND o.source_creator_country=$2
          AND o.is_code_switched=false
-         AND (o.term_language=$4 OR $4 IN ('und','') OR o.term_language IN ('und',''))`,
+         -- NULL means the writer did not record a term language; the demotion
+         -- query and migration backfill treat it as eligible, so the aggregate
+         -- must too or v2 promotions can never count legacy native evidence.
+         AND (o.term_language IS NULL OR o.term_language=$4 OR $4 IN ('und','') OR o.term_language IN ('und',''))`,
       [termId, row.country, policy.halfLifeDays, row.language || 'und'],
     );
     const v2Row = ((v2Aggregate.rows || [])[0] || {}) as Record<string, unknown>;
@@ -1554,6 +1578,10 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
       [termId],
     );
     const perfRow = ((perf.rows || [])[0] || {}) as Record<string, unknown>;
+    // confirmed_trading_creators counts repeat sightings too. Bound the v2
+    // promotion input by persisted new creators, exactly like the legacy gate:
+    // repeat-only runs with zero newly verified traders must not promote.
+    const freshConfirmed = Math.min(Number(perfRow.confirmed || 0), Number(perfRow.fresh || 0));
     const nativeCreators = Number(v2Row.native_creators || 0);
     const nativeEvidenceBuckets = Number(v2Row.native_evidence_buckets || nativeCreators);
     row.distinct_creators = nativeCreators;
@@ -1566,9 +1594,10 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
       nativeEvidenceBuckets,
       externalSources: external.independentSources,
       externalEligible: external.eligible,
+      externalTrialEvidenceScore: external.independentSources,
       externalFamilies: external.families,
       externalReasons: external.reasons,
-      confirmedTradingCreators: Number(perfRow.confirmed || 0),
+      confirmedTradingCreators: freshConfirmed,
       wrongCountryCreators: Number(perfRow.wrong || 0),
       needsReviewCreators: Number(perfRow.review || 0),
       quotaConsumed: Number(perfRow.quota || 0),
@@ -1582,7 +1611,8 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
       externalSources: external.independentSources,
       externalSourceCount: external.independentSources,
       externalEligible: external.eligible,
-      confirmedTradingCreators: Number(perfRow.confirmed || 0),
+      externalTrialEvidenceScore: external.independentSources,
+      confirmedTradingCreators: freshConfirmed,
       nonTradingCreators: Number(perfRow.nontrading || 0),
       wrongCountryCreators: Number(perfRow.wrong || 0),
       needsReviewCreators: Number(perfRow.review || 0),

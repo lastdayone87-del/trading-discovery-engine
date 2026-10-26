@@ -225,6 +225,7 @@ export function evaluateContinuationV2(input: ContinuationV2Input): Continuation
     && pageQuality === 0
     && novelCandidateTerms === 0;
   const wrongCountry = clamp(input.countryPrecision) < 0.5
+    && input.newCreators === 0
     && pageConfirmed === 0
     && pageQuality === 0
     && novelCandidateTerms === 0;

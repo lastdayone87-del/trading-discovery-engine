@@ -648,6 +648,11 @@ export async function enqueueChildAndCommitPageReservation(input: {
   maxAttempts?: number;
   idempotencyKey: string;
   clientOverride?: any;
+  /**
+   * Reopen a COMPLETED/FAILED job at this key. Recovery of a deferred page
+   * needs this; normal continuation enqueueing keeps preventReopen behavior.
+   */
+  reopenTerminal?: boolean;
 }): Promise<DurableJob> {
   const runner = input.clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
 
@@ -663,7 +668,7 @@ export async function enqueueChildAndCommitPageReservation(input: {
       maxAttempts: input.maxAttempts ?? 3,
       idempotencyKey: input.idempotencyKey,
       clientOverride: activeRunner,
-      preventReopen: true
+      preventReopen: input.reopenTerminal !== true
     });
 
     // 2. Commit page reservation if pageReservationId was provided

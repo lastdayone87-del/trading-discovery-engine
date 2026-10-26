@@ -46,8 +46,9 @@ export interface CountryDiscoveryHealthInput {
   /** Quota deferrals are the observable outcome of reservation denials. */
   quotaDeferralsRecent?: number;
   quotaDeferralsPrior?: number;
-  duplicateRatioWindows?: { recent: number; prior: number };
-  wrongCountryPrecisionWindows?: { recent: number; prior: number };
+  /** null means the window has no observations and must not be evaluated. */
+  duplicateRatioWindows?: { recent: number | null; prior: number | null };
+  wrongCountryPrecisionWindows?: { recent: number | null; prior: number | null };
   providerErrorRate?: number | null;
   providerTimeoutRate?: number | null;
   providerRateLimitRate?: number | null;
@@ -186,28 +187,41 @@ export function evaluateCountryDiscoveryHealth(
     );
   }
 
+  const measured = (value: number | null | undefined): number | null =>
+    value === null || value === undefined ? null : Math.max(0, Number(value));
+  const windowLabel = (value: number | null): string =>
+    value === null ? 'not measured' : `${(value * 100).toFixed(1)}%`;
+
   const duplicate = input.duplicateRatioWindows;
   if (duplicate) {
-    const recent = Math.max(0, Number(duplicate.recent || 0));
-    const prior = Math.max(0, Number(duplicate.prior || 0));
-    const both = recent >= 0.9 && prior >= 0.9;
-    add(
-      'duplicate_ratio_two_windows',
-      both ? 'FAIL' : recent >= 0.9 || prior >= 0.9 ? 'WARN' : 'PASS',
-      `Duplicate ratio recent ${(recent * 100).toFixed(1)}% / prior ${(prior * 100).toFixed(1)}% (safety cap 90% for two consecutive windows).`,
-    );
+    const recent = measured(duplicate.recent);
+    const prior = measured(duplicate.prior);
+    // An empty window is unknown, not a healthy zero: evaluate only windows
+    // that actually contain observations. A two-window FAIL requires both.
+    if (recent !== null || prior !== null) {
+      const both = recent !== null && prior !== null && recent >= 0.9 && prior >= 0.9;
+      const either = (recent !== null && recent >= 0.9) || (prior !== null && prior >= 0.9);
+      add(
+        'duplicate_ratio_two_windows',
+        both ? 'FAIL' : either ? 'WARN' : 'PASS',
+        `Duplicate ratio recent ${windowLabel(recent)} / prior ${windowLabel(prior)} (safety cap 90% for two consecutive windows).`,
+      );
+    }
   }
 
   const wrongCountry = input.wrongCountryPrecisionWindows;
   if (wrongCountry) {
-    const recent = Math.max(0, Number(wrongCountry.recent || 0));
-    const prior = Math.max(0, Number(wrongCountry.prior || 0));
-    const both = recent < 0.5 && prior < 0.5;
-    add(
-      'wrong_country_two_windows',
-      both ? 'FAIL' : recent < 0.5 || prior < 0.5 ? 'WARN' : 'PASS',
-      `Country precision recent ${(recent * 100).toFixed(1)}% / prior ${(prior * 100).toFixed(1)}% (safety floor 50% for two consecutive windows).`,
-    );
+    const recent = measured(wrongCountry.recent);
+    const prior = measured(wrongCountry.prior);
+    if (recent !== null || prior !== null) {
+      const both = recent !== null && prior !== null && recent < 0.5 && prior < 0.5;
+      const either = (recent !== null && recent < 0.5) || (prior !== null && prior < 0.5);
+      add(
+        'wrong_country_two_windows',
+        both ? 'FAIL' : either ? 'WARN' : 'PASS',
+        `Country precision recent ${windowLabel(recent)} / prior ${windowLabel(prior)} (safety floor 50% for two consecutive windows).`,
+      );
+    }
   }
 
   if (input.aiBudgetSkips !== undefined) {
@@ -339,7 +353,13 @@ export async function gatherCountryDiscoveryHealth(clientOverride?: HealthRunner
               COUNT(*) FILTER (WHERE status='RATE_LIMITED')::int AS rate_limited,
               COUNT(*) FILTER (WHERE status NOT IN ('SUCCESS','TIMEOUT','RATE_LIMITED','CANCELLED'))::int AS errors
        FROM provider_call_events
-       WHERE occurred_at >= now() - interval '1 hour'`,
+       WHERE occurred_at >= now() - interval '1 hour'
+         -- The canary is about discovery search providers only. Unrelated
+         -- Gemini/Groq enrichment failures must not make search look unhealthy.
+         AND (
+           (provider IN ('youtube','youtube-innertube') AND operation='search')
+           OR (provider='brave-search' AND operation='search')
+         )`,
     ),
     runner.query(
       `SELECT COUNT(*)::int AS calls,
@@ -350,10 +370,10 @@ export async function gatherCountryDiscoveryHealth(clientOverride?: HealthRunner
     ),
     runner.query(
       `SELECT
-         COALESCE(AVG(duplicate_ratio) FILTER (WHERE created_at >= now()-interval '24 hours'),0)::float AS duplicate_recent,
-         COALESCE(AVG(duplicate_ratio) FILTER (WHERE created_at >= now()-interval '48 hours' AND created_at < now()-interval '24 hours'),0)::float AS duplicate_prior,
-         COALESCE(AVG(country_precision) FILTER (WHERE created_at >= now()-interval '24 hours'),0)::float AS precision_recent,
-         COALESCE(AVG(country_precision) FILTER (WHERE created_at >= now()-interval '48 hours' AND created_at < now()-interval '24 hours'),0)::float AS precision_prior
+         (AVG(duplicate_ratio) FILTER (WHERE created_at >= now()-interval '24 hours'))::float AS duplicate_recent,
+         (AVG(duplicate_ratio) FILTER (WHERE created_at >= now()-interval '48 hours' AND created_at < now()-interval '24 hours'))::float AS duplicate_prior,
+         (AVG(country_precision) FILTER (WHERE created_at >= now()-interval '24 hours'))::float AS precision_recent,
+         (AVG(country_precision) FILTER (WHERE created_at >= now()-interval '48 hours' AND created_at < now()-interval '24 hours'))::float AS precision_prior
        FROM autonomous_query_page_observations`,
     ),
     runner.query(
@@ -437,12 +457,12 @@ export async function gatherCountryDiscoveryHealth(clientOverride?: HealthRunner
     quotaDeferralsRecent: Number(quotaRow.recent || 0),
     quotaDeferralsPrior: Number(quotaRow.prior || 0),
     duplicateRatioWindows: {
-      recent: Number(safetyRow.duplicate_recent || 0),
-      prior: Number(safetyRow.duplicate_prior || 0),
+      recent: safetyRow.duplicate_recent == null ? null : Number(safetyRow.duplicate_recent),
+      prior: safetyRow.duplicate_prior == null ? null : Number(safetyRow.duplicate_prior),
     },
     wrongCountryPrecisionWindows: {
-      recent: Number(safetyRow.precision_recent || 0),
-      prior: Number(safetyRow.precision_prior || 0),
+      recent: safetyRow.precision_recent == null ? null : Number(safetyRow.precision_recent),
+      prior: safetyRow.precision_prior == null ? null : Number(safetyRow.precision_prior),
     },
     wikimediaUserAgentConfigured: Boolean(String(process.env[WIKIMEDIA_USER_AGENT_ENV] || '').trim()),
   });
@@ -560,7 +580,39 @@ export interface CountryDiscoveryMetrics {
   };
 }
 
+const METRICS_CACHE_TTL_MS = 30_000;
+let metricsCache: { at: number; metrics: CountryDiscoveryMetrics } | null = null;
+let metricsInFlight: Promise<CountryDiscoveryMetrics> | null = null;
+
+/** Tests and diagnostics can clear the short-lived default-path cache. */
+export function resetCountryDiscoveryMetricsCacheForTests(): void {
+  metricsCache = null;
+  metricsInFlight = null;
+}
+
+/**
+ * Metrics are read by dashboards and health checks; a short TTL coalesces
+ * concurrent readers without hiding a material change for more than 30s.
+ * Explicit runners always read live data so tests stay deterministic.
+ */
 export async function gatherCountryDiscoveryMetrics(clientOverride?: HealthRunner): Promise<CountryDiscoveryMetrics> {
+  if (clientOverride) return gatherCountryDiscoveryMetricsUncached(clientOverride);
+  if (metricsCache && Date.now() - metricsCache.at < METRICS_CACHE_TTL_MS) {
+    return metricsCache.metrics;
+  }
+  if (metricsInFlight) return metricsInFlight;
+  metricsInFlight = gatherCountryDiscoveryMetricsUncached()
+    .then(metrics => {
+      metricsCache = { at: Date.now(), metrics };
+      return metrics;
+    })
+    .finally(() => {
+      metricsInFlight = null;
+    });
+  return metricsInFlight;
+}
+
+async function gatherCountryDiscoveryMetricsUncached(clientOverride?: HealthRunner): Promise<CountryDiscoveryMetrics> {
   const runner = clientOverride || (await getDb()) as unknown as HealthRunner;
   const [
     pageRun, pageDecisions, runStopReasons, countries, countryStreaks,

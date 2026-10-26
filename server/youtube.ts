@@ -196,6 +196,8 @@ export interface DiscoveredChannelRaw {
   relationshipProvenance?: RelationshipProvenance;
   nominationId?: string;
   queryRunId?: string;
+  /** Page number within the autonomous run that produced this candidate. */
+  queryPageNumber?: number;
   discoveryJobId?: string;
 }
 export interface PlaylistChannelObservation {channelId:string;channelName:string;description:string;videoTitles:string[];observedAt:string}

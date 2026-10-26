@@ -1290,7 +1290,10 @@ export async function processNextSearchJob(
         const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));
         if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:providerQuotaUnits,dailyBudget:budget,allocationPercent:percent})){
           // A denied page is deferred, never completed or failed: the run keeps
-          // its page number and next-page cursor for the reconciler.
+          // its page number and next-page cursor for the reconciler. Persist
+          // the provider's resume mode first, otherwise a page-1 deferral has
+          // no cursor mode and the reconciler cannot recover it.
+          await updateQueryRunProgress(queryRunId, { resumeMode: resumeModeForProvider(allocatedProvider.providerKey) }).catch(() => undefined);
           await deferAutonomousRunForQuota(queryRunId, 'AUTONOMOUS_QUERY_PAGE quota reservation denied');
           await completeJob(job.id);
           return true;
@@ -1334,6 +1337,7 @@ export async function processNextSearchJob(
           if (!braveProvider && !quotaFreeInnertubeProvider) {
             await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE', autonomousOperationId, false);
           }
+          await updateQueryRunProgress(queryRunId, { resumeMode: resumeModeForProvider(allocatedProvider.providerKey) }).catch(() => undefined);
           await deferAutonomousRunForTime(queryRunId, String(error?.message || INNERTUBE_TIMEOUT_CODE));
           await completeJob(job.id);
           return true;
@@ -1342,6 +1346,7 @@ export async function processNextSearchJob(
           if (!braveProvider && !quotaFreeInnertubeProvider) {
             await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE', autonomousOperationId, false);
           }
+          await updateQueryRunProgress(queryRunId, { resumeMode: resumeModeForProvider(allocatedProvider.providerKey) }).catch(() => undefined);
           await deferAutonomousRunForQuota(queryRunId, String(error?.message || 'QUOTA_ALLOCATION_EXHAUSTED'));
           await completeJob(job.id);
           return true;
@@ -1381,7 +1386,7 @@ export async function processNextSearchJob(
         query,querySemanticClasses:queryRecord?.intent?[queryRecord.intent]:[],queryGenerationMode:queryRecord?.generation_mode,
         country,declaredLanguage:raw.detectedLanguages?.[0]?.language,retrievalLane,searchOrdering,pageNumber,resultRank:index+1,
         matchedDocument:raw.matchedDocument||{type:'UNKNOWN'},rawObservation:{channelName:raw.channelName,youtubeUrl:raw.youtubeUrl,locationTag:raw.locationTag||null}},'INVESTIGATION_QUEUED');
-      raw.nominationId=nomination.id||undefined;raw.queryRunId=queryRunId;raw.discoveryJobId=job.id;
+      raw.nominationId=nomination.id||undefined;raw.queryRunId=queryRunId;raw.queryPageNumber=pageNumber;raw.discoveryJobId=job.id;
       const outcome = await processDiscoveredChannelContained(raw, country, source, { forceExtraction: isRepairEligibleRetry(job) });
       // A sticky-PROBE channel refused by its own allocation is deferred for
       // this run; the rest of the NORMAL page must still be processed. Keep it
@@ -1427,6 +1432,10 @@ export async function processNextSearchJob(
       const minRunPages = Math.max(0, Number(await getAppSetting('autonomous_pagination_min_run_pages', '1')));
       const v2Enabled = await getAppSetting('autonomous_pagination_v2_enabled', 'true') === 'true';
       const enabled = await getAppSetting('autonomous_pagination_enabled', 'true') === 'true';
+      // CDL master switch: turning it off must stop new continuation work
+      // without requiring every pagination sub-flag to be flipped too.
+      const cdlEnabled = await getAppSetting('country_discovery_loop_enabled', 'true') === 'true';
+      const continuationEnabled = enabled && cdlEnabled;
       const providerKey = allocatedProvider.providerKey;
       const providerMaxPages = providerPageCap(providerKey, safetyMaxPages);
       const pageCostUnits = providerQuotaUnits;
@@ -1447,7 +1456,11 @@ export async function processNextSearchJob(
         safetyMaxPages,
         providerMaxPages,
         pageCostUnits,
-        remainingAutonomousQuota: quotaAvailability.remainingAutonomousQuota,
+        // getAutonomousQuotaAvailability subtracts this run's scheduled page
+        // reservation. The run budget below includes the current page in
+        // consumedAfterPage, so add the current page back; otherwise page one
+        // is charged twice and the continuation is underfunded by one page.
+        remainingAutonomousQuota: quotaAvailability.remainingAutonomousQuota + pageCostUnits,
         pendingCountries: activeCountries,
         minRunPages,
         treatmentCapPages,
@@ -1586,7 +1599,7 @@ export async function processNextSearchJob(
         await completeJob(job.id);
         return true;
       }
-      if (enabled && decision.shouldContinue && searchPage?.nextPageToken) {
+      if (continuationEnabled && decision.shouldContinue && searchPage?.nextPageToken) {
         let incPageReservationId: string | undefined;
 
         // Incremental Treatment Page Quota Reservation Boundary
@@ -1731,7 +1744,7 @@ export async function processNextSearchJob(
       // continuation run segment so the remaining work stays eligible.
       if (
         shouldCreateContinuationSegment({
-          paginationEnabled: enabled,
+          paginationEnabled: continuationEnabled,
           usingV2,
           primaryReason: decision.primaryReason,
           bindingBound,
@@ -1912,7 +1925,10 @@ export async function resumeOrphanedAutonomousPages(options: {
   lastAutonomousResumeSweepAt = nowMs;
   const enabled = await getAppSetting('autonomous_pagination_enabled', 'true') === 'true';
   const v2Enabled = await getAppSetting('autonomous_pagination_v2_enabled', 'true') === 'true';
-  if (!enabled || !v2Enabled) {
+  // The CDL master switch stops new continuation work as well as the worker
+  // paths; operators must not need to flip several independent settings.
+  const cdlEnabled = await getAppSetting('country_discovery_loop_enabled', 'true') === 'true';
+  if (!enabled || !v2Enabled || !cdlEnabled) {
     return { swept: true, enqueued: 0, skipped: 0, unavailable: 0 };
   }
   const runs = await listPendingAutonomousRuns(options.limit || 50);
@@ -1960,24 +1976,39 @@ export async function resumeOrphanedAutonomousPages(options: {
       continue;
     }
     const nextPage = Math.max(1, run.pagesCompleted + 1);
-    if (run.resumeMode === 'NONE') {
-      await markQueryRunResumeUnavailable(run.runId, 'RESUME_MODE_NONE');
-      unavailable++;
-      continue;
-    }
-    if ((run.resumeMode === 'TOKEN' || run.resumeMode === 'OFFSET') && !run.nextPageToken) {
-      await markQueryRunResumeUnavailable(run.runId, `RESUME_${run.resumeMode}_TOKEN_MISSING`);
-      unavailable++;
-      continue;
-    }
+    const firstPage = run.pagesCompleted <= 0;
+    // A fresh run uses the scheduling key (search-run:<id>); a continuation
+    // segment child's first page was scheduled under :page:1. Either way page
+    // 1 is recoverable even when no resume mode was persisted yet.
+    const idempotencyKey = firstPage
+      ? (run.nextPageToken ? `search-run:${run.runId}:page:1` : `search-run:${run.runId}`)
+      : `search-run:${run.runId}:page:${nextPage}`;
     if (await autonomousPageExists(run.runId, nextPage)) {
       skipped++;
       continue;
     }
-    const idempotencyKey = `search-run:${run.runId}:page:${nextPage}`;
-    const existingJob = await db.query(`SELECT 1 FROM jobs WHERE idempotency_key=$1`, [idempotencyKey]);
+    // Live work always wins: a queued or in-flight page must never be failed
+    // by the sweep. Completed/failed jobs without an observation fall through
+    // to enqueueJob, which reopens them for the deferred page.
+    const liveKeys = firstPage
+      ? [`search-run:${run.runId}`, `search-run:${run.runId}:page:1`]
+      : [idempotencyKey];
+    const existingJob = await db.query(
+      `SELECT 1 FROM jobs WHERE idempotency_key = ANY($1) AND status IN ('PENDING','PROCESSING')`,
+      [liveKeys],
+    );
     if (existingJob.rowCount) {
       skipped++;
+      continue;
+    }
+    if (!firstPage && run.resumeMode === 'NONE') {
+      await markQueryRunResumeUnavailable(run.runId, 'RESUME_MODE_NONE');
+      unavailable++;
+      continue;
+    }
+    if (!firstPage && (run.resumeMode === 'TOKEN' || run.resumeMode === 'OFFSET') && !run.nextPageToken) {
+      await markQueryRunResumeUnavailable(run.runId, `RESUME_${run.resumeMode}_TOKEN_MISSING`);
+      unavailable++;
       continue;
     }
 
@@ -2002,6 +2033,25 @@ export async function resumeOrphanedAutonomousPages(options: {
       const provider = run.providerAllocationSnapshot
         ? providerSnapshot(run.providerAllocationSnapshot as ProviderAllocation)
         : undefined;
+      // A treatment run's continuation pages were authorized by the worker's
+      // incremental reservation. Recovery must apply the same boundary: a
+      // direct enqueue would bypass a prior cap denial and execute an
+      // unreserved treatment page. Page 1 remains covered by the scheduling
+      // treatment reservation, so only later pages need a new reservation.
+      let incPageReservationId: string | undefined;
+      if (!firstPage && run.retrievalTreatmentOrigin === 'CANARY_TREATMENT') {
+        const incRes = await reserveIncrementalTreatmentPageQuota({
+          queryRunId: run.runId,
+          pageNumber: nextPage,
+          providerQuotaUnits: provider?.costDomain === 'YOUTUBE_INNERTUBE_FREE' ? 0 : 100,
+        });
+        if (!incRes.authorized) {
+          // Stay pending for a later sweep; do not fail the run or bypass caps.
+          skipped++;
+          continue;
+        }
+        incPageReservationId = incRes.pageReservationId;
+      }
       // Trial linkage and frozen experiment windows are scheduling-time
       // payloads. Rehydrate them from run metadata so a resumed page keeps its
       // trial reservation cap, completes its trial, and retrieves the same
@@ -2016,29 +2066,36 @@ export async function resumeOrphanedAutonomousPages(options: {
       const searchWindow = metadata.searchWindow && typeof metadata.searchWindow === 'object'
         ? metadata.searchWindow
         : null;
-      await enqueueJob('SEARCH_YOUTUBE', {
-        query: run.query,
-        country: run.country,
-        source: run.source as DiscoverySource,
+      await enqueueChildAndCommitPageReservation({
+        pageReservationId: incPageReservationId,
         queryRunId: run.runId,
-        queryId: run.queryId,
-        retrievalLane: (run.retrievalLane || 'VIDEO') as RetrievalLane,
-        searchOrdering: (run.searchOrdering || 'RELEVANCE') as import('./searchOrdering').SearchOrdering,
-        pageNumber: nextPage,
-        pageToken,
-        retrievalConfigKey: run.retrievalConfigKey,
-        retrievalTreatmentOrigin: run.retrievalTreatmentOrigin || 'CONTROL',
-        // Preserve the run's original treatment depth. Replacing it with the
-        // run-local page number would shrink a CANARY_TREATMENT cap on resume.
-        requestedPageDepth: run.requestedPageDepth ?? nextPage,
-        ...(provider ? { provider } : {}),
-        ...(trial ? { trial } : {}),
-        ...(selectionExperiment ? { selectionExperiment } : {}),
-        ...(searchWindow ? { searchWindow } : {}),
-      }, {
+        jobType: 'SEARCH_YOUTUBE',
+        jobPayload: {
+          query: run.query,
+          country: run.country,
+          source: run.source as DiscoverySource,
+          queryRunId: run.runId,
+          queryId: run.queryId,
+          retrievalLane: (run.retrievalLane || 'VIDEO') as RetrievalLane,
+          searchOrdering: (run.searchOrdering || 'RELEVANCE') as import('./searchOrdering').SearchOrdering,
+          pageNumber: nextPage,
+          pageToken,
+          retrievalConfigKey: run.retrievalConfigKey,
+          retrievalTreatmentOrigin: run.retrievalTreatmentOrigin || 'CONTROL',
+          // Preserve the run's original treatment depth. Replacing it with the
+          // run-local page number would shrink a CANARY_TREATMENT cap on resume.
+          requestedPageDepth: run.requestedPageDepth ?? nextPage,
+          ...(provider ? { provider } : {}),
+          ...(trial ? { trial } : {}),
+          ...(selectionExperiment ? { selectionExperiment } : {}),
+          ...(searchWindow ? { searchWindow } : {}),
+        },
         priority: AUTONOMOUS_CONTINUATION_JOB_PRIORITY,
         maxAttempts: 3,
         idempotencyKey,
+        // A deferred page whose previous job is COMPLETED/FAILED without a
+        // page observation must be reopened, not silently skipped.
+        reopenTerminal: true,
       });
       const progress = await getQueryRunProgress(run.runId);
       await updateQueryRunProgress(run.runId, {

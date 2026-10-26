@@ -10,4 +10,12 @@ test('scope weighting survives page aggregation; legacy pages stay neutral',()=>
     aggregatePageMetrics([{ ...legacy(), newChannels: 7 }, { ...scoped(2), newChannels: 7 }]).inScopeNewChannels,
     9,
   );
+  // Cumulative unique creators replace the sum of overlapping page
+  // populations; the last measured cumulative value wins.
+  const cumulative = aggregatePageMetrics([
+    { ...legacy(), cumulativeUniqueCreators: 10 },
+    { ...legacy(), cumulativeUniqueCreators: 14 },
+  ]);
+  assert.equal(cumulative.distinctResults, 14);
+  assert.equal(aggregatePageMetrics([legacy(), legacy()]).distinctResults, 16);
 });

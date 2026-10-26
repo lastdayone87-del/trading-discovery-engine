@@ -221,16 +221,12 @@ export async function countNovelCandidateTermsForPage(
 ): Promise<number> {
   const db = await getDb();
   const result = await db.query(
-    `WITH page_channels AS (
-       SELECT DISTINCT channel_id
-       FROM channel_sightings
-       WHERE query_run_id=$1 AND page_number=$2
-     )
-     SELECT COUNT(DISTINCT t.id)::int AS novel_terms
+    `SELECT COUNT(DISTINCT t.id)::int AS novel_terms
      FROM terminology_observations o
      JOIN canonical_trading_terms t ON t.id=o.canonical_term_id
-     JOIN page_channels pc ON pc.channel_id=o.source_channel_id
-     WHERE o.observed_at >= $3
+     WHERE o.query_run_id=$1
+       AND o.query_page_number=$2
+       AND o.observed_at >= $3
        AND COALESCE(t.first_observed_at, t.created_at) >= $3`,
     [runId, Math.max(1, Math.trunc(pageNumber) || 1), since.toISOString()],
   );
@@ -298,8 +294,19 @@ export async function getAutonomousContinuationState(runId: string, pageNumber?:
 
 export async function getAutonomousRunMetrics(runId: string): Promise<QueryFunnelMetrics> {
   const db = await getDb();
-  const r = await db.query('SELECT page_metrics FROM autonomous_query_page_observations WHERE query_run_id=$1 ORDER BY page_number', [runId]);
-  return aggregatePageMetrics(r.rows.map(x => typeof x.page_metrics === 'string' ? JSON.parse(x.page_metrics) : x.page_metrics));
+  const r = await db.query(
+    'SELECT page_metrics, cumulative_unique_creators FROM autonomous_query_page_observations WHERE query_run_id=$1 ORDER BY page_number',
+    [runId],
+  );
+  return aggregatePageMetrics(r.rows.map(row => {
+    const metrics = typeof row.page_metrics === 'string' ? JSON.parse(row.page_metrics) : row.page_metrics;
+    // Attach the persisted cumulative count so aggregation reports the run's
+    // true unique reach instead of the sum of overlapping page populations.
+    const cumulative = row.cumulative_unique_creators === null || row.cumulative_unique_creators === undefined
+      ? undefined
+      : Math.max(0, Number(row.cumulative_unique_creators) || 0);
+    return cumulative === undefined ? metrics : { ...metrics, cumulativeUniqueCreators: cumulative };
+  }));
 }
 
 export interface PendingAutonomousRun {
@@ -352,6 +359,18 @@ export async function listPendingAutonomousRuns(limit = 50): Promise<PendingAuto
      WHERE qr.continuation_status IN ('RUNNING','DEFERRED_QUOTA','DEFERRED_TIME')
        AND qr.status NOT IN ('COMPLETED','FAILED')
        AND (qr.deferred_until IS NULL OR qr.deferred_until <= now())
+       -- A live page job already owns this run. Only PENDING/PROCESSING
+       -- block recovery: a COMPLETED/FAILED job whose page observation is
+       -- missing is a deferred page and must be reopenable.
+       AND NOT EXISTS (
+         SELECT 1 FROM jobs j
+         WHERE j.status IN ('PENDING','PROCESSING')
+           AND (
+             j.idempotency_key = 'search-run:'||qr.id
+             OR j.idempotency_key = 'search-run:'||qr.id||':page:1'
+             OR j.idempotency_key = 'search-run:'||qr.id||':page:'||GREATEST(qr.pages_completed+1,1)
+           )
+       )
      ORDER BY LOWER(qr.country) ASC,
               marginal_utility DESC,
               COALESCE(qr.last_page_at, qr.started_at, qr.scheduled_at) ASC,
@@ -387,9 +406,19 @@ export async function listPendingAutonomousRuns(limit = 50): Promise<PendingAuto
 
 export function aggregatePageMetrics(pages: QueryFunnelMetrics[]): QueryFunnelMetrics {
   const sum = (key: keyof QueryFunnelMetrics) => pages.reduce((n, p) => n + Number(p[key] || 0), 0);
-  const distinct = sum('distinctResults');
+  const weightedDistinct = sum('distinctResults');
+  // The last measured cumulative value is the run's unique reach; per-page
+  // distinct counts overlap across pages and cannot be summed. Weighted
+  // averages still use per-page distinct counts as their weights.
+  let cumulativeDistinct: number | undefined;
+  for (const page of pages) {
+    if (page.cumulativeUniqueCreators !== undefined) {
+      cumulativeDistinct = Math.max(0, Number(page.cumulativeUniqueCreators) || 0);
+    }
+  }
+  const distinct = cumulativeDistinct ?? weightedDistinct;
   const evaluated = sum('nonTrading') + sum('uncertain') + sum('needsReview') + sum('tradingConfirmed');
-  const weighted = (key: keyof QueryFunnelMetrics) => distinct ? pages.reduce((n, p) => n + p.distinctResults * Number(p[key] || 0), 0) / distinct : 0;
+  const weighted = (key: keyof QueryFunnelMetrics) => weightedDistinct ? pages.reduce((n, p) => n + p.distinctResults * Number(p[key] || 0), 0) / weightedDistinct : 0;
   // Scope weighting survives aggregation: pages carrying scope data sum
   // their in-scope counts while legacy pages without the field contribute
   // their full fresh count (neutral handling). The aggregate stays absent

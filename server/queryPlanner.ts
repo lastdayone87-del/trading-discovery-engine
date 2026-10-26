@@ -285,7 +285,9 @@ function freeSignalIntent(signalType: FreeSignalType): QueryIntent {
 export function capDemandSignalCandidates<T>(candidates: T[], count: number): T[] {
   if (!candidates.length) return [];
   const requested = Math.max(1, Math.trunc(count) || 1);
-  return candidates.slice(0, Math.max(1, Math.floor(requested * 0.3)));
+  // Demand signals are supplementary: a small portfolio may have no room for
+  // them. Forcing one candidate violates the 30% share rather than enforcing it.
+  return candidates.slice(0, Math.floor(requested * 0.3));
 }
 
 function countryAtoms(country: string, vocabulary?: CountryVocabulary): SearchAtom[] {

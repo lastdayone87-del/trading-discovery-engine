@@ -30,7 +30,7 @@ import {
 } from './terminologyIntelligence';
 import { admitNativeCandidates, extractVocabularyFromCreator } from './queryIntelligence';
 import { computeObservationKey } from './countryNativeIntelligence';
-import { planDiverseQueries, normalizeQuery } from './queryPlanner';
+import { capDemandSignalCandidates, planDiverseQueries, normalizeQuery } from './queryPlanner';
 import {
   dedupeFreeQuerySignals,
   fetchFreeQuerySignals,
@@ -38,6 +38,7 @@ import {
   parseWikipediaSearchSignals,
   resetFreeQuerySignalCacheForTests,
   resolveWikimediaUserAgent,
+  WIKIMEDIA_USER_AGENT_ENV,
   WIKIMEDIA_USER_AGENT_FALLBACK,
 } from './freeQuerySignals';
 import {
@@ -53,6 +54,9 @@ import {
 import { maybeRunDiscoveryEvidenceExtraction } from './discovery/evidencePipeline';
 import { resolveNativeExtractionEligibility } from './ingestionPipeline';
 import { isTerminologyKillSwitchActive } from './terminologyKillSwitch';
+
+/** Explicit operator identity; Wikimedia policy forbids placeholder agents. */
+const TEST_WIKIMEDIA_USER_AGENT = 'CountryDiscoveryLoop/1.0 (https://ops.example.org; ops@example.org)';
 
 // ---------------------------------------------------------------------------
 // Deterministic fixtures and source readers. The gate is intentionally
@@ -178,6 +182,8 @@ async function observeCase(
 function fakeRefreshRunner(
   rowOverrides: Record<string, unknown> = {},
   v2Overrides: Record<string, unknown> = {},
+  perfOverrides: Record<string, unknown> = {},
+  externalRows: Array<Record<string, unknown>> = [],
 ): FakeRunner {
   const calls: RecordedCall[] = [];
   return {
@@ -213,9 +219,9 @@ function fakeRefreshRunner(
         };
       }
       if (text.includes('normalized_alias')) return { rows: [] };
-      if (text.includes('external_osint_observations')) return { rows: [] };
+      if (text.includes('external_osint_observations')) return { rows: externalRows };
       if (text.includes('terminology_performance WHERE canonical_term_id')) {
-        return { rows: [{ executions: 0, quota: 0, confirmed: 0, nontrading: 0, wrong: 0, review: 0, fresh: 0 }] };
+        return { rows: [{ executions: 0, quota: 0, confirmed: 0, nontrading: 0, wrong: 0, review: 0, fresh: 0, ...perfOverrides }] };
       }
       if (text.includes('FROM terminology_observations') && text.includes('qualityVersion')) {
         return { rows: [{ v1: 0, spam: false, novel: false }] };
@@ -326,15 +332,28 @@ test('A2: repeated free-signal refresh is cache-idempotent and does not refetch'
   }) as unknown as typeof fetch;
   const now = new Date('2026-10-26T00:00:00Z');
   try {
-    const first = await fetchFreeQuerySignals({ country: 'Germany', language: 'de', fetchImpl: fakeFetch, now });
+    const first = await fetchFreeQuerySignals({
+      country: 'Germany', language: 'de', fetchImpl: fakeFetch, userAgent: TEST_WIKIMEDIA_USER_AGENT, now,
+    });
     const second = await fetchFreeQuerySignals({
-      country: 'Germany', language: 'de', fetchImpl: fakeFetch,
+      country: 'Germany', language: 'de', fetchImpl: fakeFetch, userAgent: TEST_WIKIMEDIA_USER_AGENT,
       now: new Date(now.getTime() + 1_000),
     });
     assert.equal(requests, 2);
     assert.equal(second.fromCache, true);
     assert.deepEqual(second.signals, first.signals);
     assert.equal(dedupeFreeQuerySignals(first.signals).length, first.signals.length);
+
+    const source = serverSource('freeQuerySignals.ts');
+    // The pacing slot is reserved synchronously before awaiting; concurrent
+    // callers must queue instead of reading the same stale timestamp.
+    assert.match(source, /const slotMs = Math\.max\(Date\.now\(\), nextRequestAtMs\)/);
+    assert.match(source, /nextRequestAtMs = slotMs \+ MIN_INTERVAL_MS/);
+    // Refresh an existing signal in place so it cannot stay stale for its
+    // whole TTL; count only rows this call inserted.
+    assert.match(source, /ON CONFLICT \(country, normalized_surface, signal_type, provider, \(COALESCE\(provider_signal_id, ''\)\)\)/);
+    assert.match(source, /DO UPDATE SET[\s\S]*?fetched_at=EXCLUDED\.fetched_at/);
+    assert.match(source, /RETURNING \(xmax = 0\) AS inserted/);
   } finally {
     resetFreeQuerySignalCacheForTests();
   }
@@ -408,11 +427,13 @@ test('A5: the free-signal cap preserves creator-observed terminology', () => {
 test('A6: provider rate-limit failure degrades to seeds without failing the cycle', async () => {
   resetFreeQuerySignalCacheForTests();
   const failingFetch = (async () => { throw new Error('HTTP_429'); }) as unknown as typeof fetch;
+  const previousUserAgent = process.env[WIKIMEDIA_USER_AGENT_ENV];
   try {
     const result = await fetchFreeQuerySignals({
       country: 'Germany',
       language: 'de',
       fetchImpl: failingFetch,
+      userAgent: TEST_WIKIMEDIA_USER_AGENT,
       now: new Date('2026-10-26T00:00:00Z'),
     });
     assert.equal(result.degraded, true);
@@ -434,6 +455,7 @@ test('A6: provider rate-limit failure degrades to seeds without failing the cycl
       country: 'Germany',
       language: 'de',
       fetchImpl: recoveringFetch,
+      userAgent: TEST_WIKIMEDIA_USER_AGENT,
       now: new Date('2026-10-26T00:00:01Z'),
     });
     assert.equal(recoveryRequests, 2, 'both providers are retried after a degraded fetch');
@@ -445,10 +467,32 @@ test('A6: provider rate-limit failure degrades to seeds without failing the cycl
     assert.ok(!WIKIMEDIA_USER_AGENT_FALLBACK.includes('example.invalid'));
     assert.match(WIKIMEDIA_USER_AGENT_FALLBACK, /WIKIMEDIA_USER_AGENT/);
     assert.equal(
-      resolveWikimediaUserAgent('CountryDiscoveryLoop/1.0 (https://ops.example.org; ops@example.org)'),
-      'CountryDiscoveryLoop/1.0 (https://ops.example.org; ops@example.org)',
+      resolveWikimediaUserAgent(TEST_WIKIMEDIA_USER_AGENT),
+      TEST_WIKIMEDIA_USER_AGENT,
     );
+
+    // With no operator-configured identity, remote fetches are skipped
+    // entirely: a placeholder UA would violate the Wikimedia policy.
+    resetFreeQuerySignalCacheForTests();
+    delete process.env[WIKIMEDIA_USER_AGENT_ENV];
+    let skippedRequests = 0;
+    const trackingFetch = (async () => {
+      skippedRequests += 1;
+      return { ok: true, json: async () => ({}) } as unknown as Response;
+    }) as unknown as typeof fetch;
+    const skipped = await fetchFreeQuerySignals({
+      country: 'Germany',
+      language: 'de',
+      fetchImpl: trackingFetch,
+      now: new Date('2026-10-26T00:00:02Z'),
+    });
+    assert.equal(skippedRequests, 0, 'no remote call without WIKIMEDIA_USER_AGENT');
+    assert.equal(skipped.degraded, true);
+    assert.equal(skipped.signals.length, 0);
+    assert.match(String(skipped.error), /WIKIMEDIA_USER_AGENT/);
   } finally {
+    if (previousUserAgent === undefined) delete process.env[WIKIMEDIA_USER_AGENT_ENV];
+    else process.env[WIKIMEDIA_USER_AGENT_ENV] = previousUserAgent;
     resetFreeQuerySignalCacheForTests();
   }
   const planned = planDiverseQueries({
@@ -587,6 +631,14 @@ test('P5: a low-precision page with a confirmed creator continues; two consecuti
   assert.equal(third.shouldContinue, false);
   assert.equal(third.primaryReason, 'WRONG_COUNTRY');
   assert.equal(third.streaks.wrongCountry, 2);
+
+  // A low-precision page that still surfaced a new creator is productive, not
+  // wrong-country: the wrong-country streak requires no productive signal.
+  const productiveLowPrecision = evaluateContinuationV2({
+    ...baseV2, countryPrecision: 0.4, newCreators: 1,
+  });
+  assert.equal(productiveLowPrecision.wrongCountry, false);
+  assert.equal(productiveLowPrecision.streaks.wrongCountry, 0);
 });
 
 test('P6: a low-utility page with one new creator continues via the productive floor', () => {
@@ -656,6 +708,14 @@ test('P8: a 300-unit run budget allows at most three 100-unit pages', () => {
   assert.equal(quotaBound.effectiveMaxPages, 2);
   assert.equal(quotaBound.bindingBound, 'RUN_BUDGET');
   assert.ok(quotaBound.effectiveMaxPages * 100 <= 250, 'min_run_pages cannot overspend quota');
+
+  // The run's scheduled page reservation is already subtracted from
+  // remainingAutonomousQuota. Add the current page back so page one is not
+  // charged twice when deriving the continuation budget.
+  assert.match(
+    serverSource('queueManager.ts'),
+    /remainingAutonomousQuota: quotaAvailability\.remainingAutonomousQuota \+ pageCostUnits/,
+  );
 });
 
 test('P9: quota denial defers a productive page without dropping or stopping the run', () => {
@@ -674,10 +734,21 @@ test('P9: quota denial defers a productive page without dropping or stopping the
 
 test('P10: the reconciler enqueues exactly one idempotent child for a missing next page', () => {
   const queue = serverSource('queueManager.ts');
-  assert.match(queue, /const idempotencyKey = `search-run:\$\{run\.runId\}:page:\$\{nextPage\}`/);
-  assert.match(queue, /SELECT 1 FROM jobs WHERE idempotency_key=\$1/);
+  // Page 1 recovers under either scheduling key; later pages use :page:N.
+  assert.match(queue, /const idempotencyKey = firstPage\s*\? \(run\.nextPageToken \? `search-run:\$\{run\.runId\}:page:1` : `search-run:\$\{run\.runId\}`\)\s*: `search-run:\$\{run\.runId\}:page:\$\{nextPage\}`/);
+  // Only live work blocks recovery. COMPLETED/FAILED jobs without a page
+  // observation must fall through and be reopened by enqueueJob.
+  assert.match(queue, /SELECT 1 FROM jobs WHERE idempotency_key = ANY\(\$1\) AND status IN \('PENDING','PROCESSING'\)/);
+  assert.match(queue, /const liveKeys = firstPage\s*\? \[`search-run:\$\{run\.runId\}`, `search-run:\$\{run\.runId\}:page:1`\]\s*: \[idempotencyKey\]/);
   assert.match(queue, /pg_try_advisory_lock\(hashtext\(\$1\)\)/);
   assert.match(queue, /if \(existingJob\.rowCount\) \{[\s\S]*?skipped\+\+;[\s\S]*?continue;/);
+  // A fresh page 1 is recoverable without a persisted resume mode.
+  assert.match(queue, /if \(!firstPage && run\.resumeMode === 'NONE'\) \{/);
+  // Recovery must apply the same treatment-page reservation as the worker and
+  // reopen terminal jobs so a deferred page is never lost.
+  assert.match(queue, /if \(!firstPage && run\.retrievalTreatmentOrigin === 'CANARY_TREATMENT'\) \{[\s\S]*?reserveIncrementalTreatmentPageQuota\(/);
+  assert.match(queue, /enqueueChildAndCommitPageReservation\(\{[\s\S]*?pageReservationId: incPageReservationId/);
+  assert.match(queue, /reopenTerminal: true/);
   assert.match(queue, /priority: AUTONOMOUS_CONTINUATION_JOB_PRIORITY/);
   assert.match(queue, /enqueued\+\+;/);
   // Report §6.7: the reconciler must never resume a run whose country is no
@@ -832,6 +903,19 @@ test('P16: a creator seen on pages 1 and 2 is counted once with a cross-page rep
   assert.match(sql, /MIN\(s\.page_number\) AS first_page/);
   assert.match(sql, /fs\.first_page <= \$2/);
   assert.match(sql, /fs\.first_page < \$2 AND ps\.channel_id IS NOT NULL/);
+  // Run metrics must use the persisted cumulative unique count, not the sum
+  // of overlapping per-page distinct populations.
+  const pageStore = serverSource('autonomousPageStore.ts');
+  assert.match(pageStore, /SELECT page_metrics, cumulative_unique_creators FROM autonomous_query_page_observations/);
+  assert.match(pageStore, /cumulativeUniqueCreators: cumulative/);
+  // Novel-term attribution is exact to the run/page that observed it, not to
+  // any other run that happens to share the channel or time window.
+  assert.match(pageStore, /o\.query_run_id=\$1\s*AND o\.query_page_number=\$2/);
+  assert.match(
+    serverSource('terminologyIntelligence.ts'),
+    /query_run_id=COALESCE\(terminology_observations\.query_run_id, EXCLUDED\.query_run_id\)/,
+  );
+  assert.match(migration161(), /ADD COLUMN IF NOT EXISTS query_run_id TEXT/);
 });
 
 test('P17: the 50-page safety ceiling preserves a resumable linked segment', () => {
@@ -947,7 +1031,7 @@ test('T6: three creators sharing one community fingerprint count as one independ
   assert.equal(decision.searchEligible, false);
 });
 
-test('T7: two independent external sources/families validate; a single source or family does not', () => {
+test('T7: two independent external sources/families validate; a single source or family does not', async () => {
   const now = new Date('2026-10-26T00:00:00Z');
   const two = evaluateExternalTermEvidence({
     term: 'Charttechnik', aliases: [], language: 'de', script: 'LATIN', now,
@@ -967,11 +1051,53 @@ test('T7: two independent external sources/families validate; a single source or
   assert.equal(single.eligible, false);
   assert.ok(single.reasons.includes('INSUFFICIENT_INDEPENDENT_SOURCES'));
 
+  // Future-dated rows are not fresh corroboration: an age-only check would
+  // treat a bad clock or forged timestamp as valid indefinitely.
+  const futureDated = evaluateExternalTermEvidence({
+    term: 'Charttechnik', aliases: [], language: 'de', script: 'LATIN', now,
+    rows: [
+      { sourceId: 's1', sourceFamily: 'NEWS', correlationKey: 'a', observedAt: '2026-10-27T00:00:00Z', confidence: 0.9, reliability: 0.9, relevance: 0.9, surface: 'charttechnik', language: 'de', script: 'LATIN' },
+      { sourceId: 's2', sourceFamily: 'BLOG', correlationKey: 'b', observedAt: '2026-10-27T00:00:00Z', confidence: 0.8, reliability: 0.8, relevance: 0.8, surface: 'Charttechnik', language: 'de', script: 'LATIN' },
+    ],
+  });
+  assert.equal(futureDated.eligible, false);
+  assert.deepEqual(futureDated.reasons, ['NO_MATCHING_LOCAL_SURFACE']);
+
   const decision = decideLifecycleV2({
     ...baseLifecycle, nativeCreators: 0, nativeEvidenceBuckets: 0,
     externalSources: 2, externalSourceCount: 2, externalEligible: true,
   });
   assert.equal(decision.status, 'MULTI_CREATOR_VALIDATED');
+
+  // External evidence is stored outside terminology_observations, so the
+  // native decayed-evidence score is always zero for an external-only term.
+  // Qualified independent external buckets contribute trial units directly;
+  // five buckets reach the same 5-unit trial threshold without native data.
+  const externalRows = Array.from({ length: 5 }, (_, index) => ({
+    source_id: `source-${index + 1}`,
+    source_family: ['NEWS', 'BLOG', 'FORUM', 'SOCIAL', 'VIDEO'][index],
+    correlation_key: `bucket-${index + 1}`,
+    observed_at: new Date().toISOString(),
+    confidence: 0.9,
+    reliability: 0.9,
+    relevance: 0.9,
+    original_surface: 'Charttechnik',
+    language: 'de',
+    script: 'LATIN',
+  }));
+  const externalOnly = fakeRefreshRunner(
+    {
+      canonical_term: 'Charttechnik', lifecycle_status: 'OBSERVED',
+      search_eligible: false, trust_tier: 3, decayed_evidence: 0,
+    },
+    { native_creators: 0, native_evidence_buckets: 0, decayed_evidence: 0 },
+    {},
+    externalRows,
+  );
+  await refreshTerminologyLifecycle(1, undefined, externalOnly as never);
+  const lifecycle = externalOnly.calls.find(call => call.text.startsWith('UPDATE canonical_trading_terms'));
+  assert.equal(lifecycle?.params[1], 'SEARCH_TRIAL');
+  assert.equal(lifecycle?.params[2], true);
 });
 
 test('T8: two native plus one external validates; one native plus one external does not', () => {
@@ -1030,13 +1156,25 @@ test('T12: a coordinated burst holds at three buckets and releases at a fourth',
   assert.equal(released.searchEligible, true);
 });
 
-test('T13: the proven gate promotes with validation, executions, yield, and shares', () => {
+test('T13: the proven gate promotes with validation, executions, yield, and shares', async () => {
   const decision = decideLifecycleV2({
     ...baseLifecycle, decayedEvidence: 6, confirmedTradingCreators: 6,
     executions: 3, decayedYield: 0.30, quotaConsumed: 5000,
   });
   assert.equal(decision.status, 'PROVEN_SEARCH_TERM');
   assert.equal(decision.searchEligible, true);
+
+  // Repeat-only sightings must not promote: bound confirmed traders by the
+  // persisted fresh-creator count, exactly like the legacy gate.
+  const repeatOnly = fakeRefreshRunner(
+    { lifecycle_status: 'OBSERVED', search_eligible: false, trust_tier: 3, decayed_evidence: 6, decayed_yield: 0.3 },
+    { native_creators: 3, native_evidence_buckets: 3, decayed_evidence: 6 },
+    { executions: 3, quota: 5000, confirmed: 6, nontrading: 0, wrong: 0, review: 0, fresh: 0 },
+  );
+  await refreshTerminologyLifecycle(1, undefined, repeatOnly as never);
+  const lifecycle = repeatOnly.calls.find(call => call.text.startsWith('UPDATE canonical_trading_terms'));
+  assert.equal(lifecycle?.params[1], 'MULTI_CREATOR_VALIDATED');
+  assert.equal(lifecycle?.params[2], false);
 });
 
 test('T14: sustained low yield demotes a proven term', () => {
@@ -1071,6 +1209,14 @@ test('T15: a lower-quality creator observation is stored without promotion or le
   assert.equal(observed.length, 1);
   assert.equal(observed[0].promotionEligible, false);
   assert.equal(saved.length, 0, 'legacy extracted_vocabulary is not incremented');
+
+  // Classification is independent of the promotion gate: an ineligible
+  // creator still records NATIVE_OBSERVED provenance, with the eligibility
+  // flag false. Otherwise its evidence would be invisible to the v2 aggregate.
+  const ineligible = await observeCase(confirmedChannel, { promotionEligible: false });
+  assert.equal(ineligible.observation?.params[15], 'NATIVE_OBSERVED');
+  assert.equal(ineligible.observation?.params[19], false);
+
   assert.equal(NATIVE_PROMOTION_MIN_CREATORS, 3);
   assert.equal(NATIVE_PROMOTION_MIN_EXECUTIONS, 3);
   assert.equal(NATIVE_PROMOTION_MIN_YIELD_PER_1000_QUOTA, 1.0);
@@ -1130,6 +1276,9 @@ test('C2: a channel reclassified away from the target clears stale promotion eli
   assert.match(clear.text, /lower\(c\.country\) <> lower\(\$2\)/);
   const lifecycle = runner.calls.find(call => call.text.startsWith('UPDATE canonical_trading_terms'));
   assert.deepEqual(lifecycle?.params, [1, 'CANDIDATE', false, 3]);
+  // NULL term_language means the writer did not record one; the v2 aggregate
+  // must treat it as eligible, matching the demotion query and backfill.
+  assert.match(serverSource('terminologyIntelligence.ts'), /o\.term_language IS NULL OR o\.term_language=\$4/);
 });
 
 test('C3: a LIKELY-country creator remains observation-only and never native promotion evidence', async () => {
@@ -1436,6 +1585,20 @@ test('O2: a failed migration, orphan page, or provider canary makes the deploy g
   assert.equal(wrongCountryWindows.healthy, false);
   assert.equal(wrongCountryWindows.checks.find(check => check.id === 'wrong_country_two_windows')?.status, 'FAIL');
 
+  // An empty window is unknown, not a healthy zero: no check is emitted when
+  // neither window has observations, and one measured window can only WARN.
+  const unmeasured = evaluateCountryDiscoveryHealth(healthyHealthInput({
+    duplicateRatioWindows: { recent: null, prior: null },
+    wrongCountryPrecisionWindows: { recent: null, prior: null },
+  }));
+  assert.equal(unmeasured.checks.some(check => check.id === 'duplicate_ratio_two_windows'), false);
+  assert.equal(unmeasured.checks.some(check => check.id === 'wrong_country_two_windows'), false);
+  const oneMeasured = evaluateCountryDiscoveryHealth(healthyHealthInput({
+    duplicateRatioWindows: { recent: null, prior: 0.95 },
+  }));
+  assert.equal(oneMeasured.checks.find(check => check.id === 'duplicate_ratio_two_windows')?.status, 'WARN');
+  assert.match(String(oneMeasured.checks.find(check => check.id === 'duplicate_ratio_two_windows')?.detail), /not measured/);
+
   const quotaSpike = evaluateCountryDiscoveryHealth(healthyHealthInput({
     quotaDeferralsRecent: 20,
     quotaDeferralsPrior: 2,
@@ -1470,6 +1633,13 @@ test('O2: a failed migration, orphan page, or provider canary makes the deploy g
   }
   assert.match(healthSource, /resolveAutonomousCountries/);
   assert.match(healthSource, /WIKIMEDIA_USER_AGENT_ENV/);
+  // The canary must count discovery search calls only; unrelated Gemini/Groq
+  // telemetry must not make search look unhealthy.
+  assert.match(healthSource, /provider IN \('youtube','youtube-innertube'\) AND operation='search'/);
+  assert.match(healthSource, /provider='brave-search' AND operation='search'/);
+  // Empty windows stay NULL through aggregation and are skipped by evaluator.
+  assert.match(healthSource, /\(AVG\(duplicate_ratio\) FILTER/);
+  assert.match(healthSource, /recent: safetyRow\.duplicate_recent == null \? null/);
 
   const server = serverSource('../server.ts');
   assert.match(server, /app\.get\('\/api\/country-discovery\/health'/);
@@ -1600,6 +1770,13 @@ test('O3: page, run, country, source, provider, AI, and lifecycle metrics are qu
   assert.equal(metrics.lifecycle.wrongCountryShare, 0.05);
   assert.equal(metrics.lifecycle.reviewShare, 0.1);
   assert.ok(!JSON.stringify(metrics).includes('null'), 'required metric fields are non-null');
+
+  // Dashboard/health readers coalesce through a short TTL; explicit runners
+  // (tests, diagnostics) always read live data.
+  const healthSource = serverSource('countryDiscoveryHealth.ts');
+  assert.match(healthSource, /METRICS_CACHE_TTL_MS = 30_000/);
+  assert.match(healthSource, /if \(clientOverride\) return gatherCountryDiscoveryMetricsUncached\(clientOverride\)/);
+  assert.match(healthSource, /resetCountryDiscoveryMetricsCacheForTests/);
 });
 
 test('O4: each kill switch disables only its path and leaves data/rollback intact', async () => {
@@ -1642,6 +1819,21 @@ test('R1: transient AI failure retries up to three attempts while rule evidence 
   const reservationAt = source.indexOf('const reservation = await reserveNativeVocabularyAiRun(');
   assert.ok(ruleHitsAt > 0 && reservationAt > ruleHitsAt, 'rule evidence is durable before the AI reservation');
 
+  // The logical call is not marked successful until admission persists its
+  // terms. The parsed response is durable first, so a persistence retry
+  // replays it without another provider request.
+  assert.match(source, /recordNativeVocabularyAiResponse\(\{/);
+  assert.match(source, /reservation\.reason === 'REPLAY_RESPONSE'/);
+  assert.match(source, /if \(!parsed\) \{\s*await finishAiRun\('FAILED'/);
+  assert.match(source, /onRequestAttempt: \(\) => \{/);
+  const db = serverSource('dbCore.ts');
+  assert.match(db, /NATIVE_VOCABULARY_AI_LEASE_SECONDS = 15 \* 60/);
+  assert.match(db, /reason: 'REPLAY_RESPONSE'/);
+  assert.match(db, /actual_cost_microunits=actual_cost_microunits\+\$5/);
+  const ledgerMigration = migration161();
+  assert.match(ledgerMigration, /response_payload JSONB/);
+  assert.match(ledgerMigration, /lease_expires_at TIMESTAMPTZ/);
+
   const base = {
     canonicalTermId: 7, channelId: 'ch-1', videoId: 'vid-1', observationType: 'VIDEO_TITLE',
     evidence: { qualityVersion: 'native-v1', novel: true, sourceRef: { kind: 'VIDEO_TITLE', index: 0, span: 'Charttechnik', videoId: 'vid-1' } },
@@ -1681,6 +1873,11 @@ test('R3: an optional paid-provider failure cannot block the free-first cycle or
   assert.ok(planned.length > 0);
   assert.ok(planned.every(query => query.metadata.source !== 'DEMAND_SIGNAL'));
   assert.ok(planned.every(query => !(query.metadata.sourceTypes as string[]).includes('DEMAND_SIGNAL')));
+
+  // Demand signals are supplementary: a small portfolio may have no room for
+  // them. Forcing one candidate violates the 30% share instead of enforcing it.
+  assert.deepEqual(capDemandSignalCandidates(['a', 'b', 'c'], 3), []);
+  assert.deepEqual(capDemandSignalCandidates(['a', 'b', 'c'], 4), ['a']);
 
   const migration = migration161();
   assert.match(migration, /\('query_demand_signals_enabled', 'false'\)/);

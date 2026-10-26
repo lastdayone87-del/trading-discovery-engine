@@ -374,6 +374,12 @@ export interface GroqTextCompletionDeps {
    */
   validateContent?: (content: string) => boolean;
   /**
+   * Invoked immediately before each real HTTP request. Failover can try
+   * several routes; callers use this to account actual requests separately
+   * from the single logical call.
+   */
+  onRequestAttempt?: () => void;
+  /**
    * Hard time budget for each telemetry emit inside the adapter. Telemetry is
    * best-effort: a hung provider_call_events write must not stall the internal
    * failover promise (delaying the next route or turning a completed fetch
@@ -507,6 +513,7 @@ export async function runGroqTextCompletion(
         if (Date.now() >= Math.min(deadlineAtMs, attemptDeadlineMs)) {
           throw new ProviderCallError('Groq extraction exceeded its aggregate deadline.', 'TIMEOUT', true);
         }
+        deps?.onRequestAttempt?.();
         const res = await fetchImpl(GROQ_API_BASE_URL, {
         method: 'POST',
         headers: { Authorization: `Bearer ${route.key}`, 'Content-Type': 'application/json' },

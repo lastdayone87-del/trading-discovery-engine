@@ -34,6 +34,13 @@ export interface QueryFunnelMetrics {
   /** rawResults minus deferredResults; zero is safe for legacy rows. */
   evaluatedRawResults?: number;
   distinctResults: number;
+  /**
+   * Cumulative unique creators observed through this page in a run. Optional:
+   * only the autonomous run reader supplies it. When present, aggregation
+   * uses the last page's cumulative value as the run's distinct result instead
+   * of summing per-page distinct counts (which double-counts repeat creators).
+   */
+  cumulativeUniqueCreators?: number;
   duplicateResults: number;
   knownChannels: number;
   newChannels: number;

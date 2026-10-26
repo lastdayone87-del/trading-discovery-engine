@@ -45,6 +45,17 @@ WHERE o.canonical_term_id = t.id
 CREATE INDEX IF NOT EXISTS idx_term_obs_promotion
   ON terminology_observations(canonical_term_id, promotion_eligible);
 
+-- Page provenance for novelty attribution: a term observed while processing a
+-- specific autonomous page belongs to that run/page, never to another run that
+-- happens to share the channel or timestamp window.
+ALTER TABLE terminology_observations
+  ADD COLUMN IF NOT EXISTS query_run_id TEXT;
+ALTER TABLE terminology_observations
+  ADD COLUMN IF NOT EXISTS query_page_number INTEGER;
+CREATE INDEX IF NOT EXISTS idx_term_obs_run_page
+  ON terminology_observations(query_run_id, query_page_number)
+  WHERE query_run_id IS NOT NULL;
+
 -- ---------------------------------------------------------------------------
 -- 2. Page economics and continuation audit
 -- ---------------------------------------------------------------------------
@@ -176,9 +187,21 @@ CREATE TABLE IF NOT EXISTS native_vocabulary_ai_runs (
   attempts INTEGER NOT NULL DEFAULT 0,
   reserved_cost_microunits BIGINT NOT NULL DEFAULT 0,
   actual_cost_microunits BIGINT NOT NULL DEFAULT 0,
+  -- Parsed provider output retained for idempotent admission replay. A retry
+  -- after a persistence failure reuses this payload instead of spending a
+  -- second logical call, and a stale RESERVED row is reclaimed by lease.
+  response_payload JSONB,
+  lease_expires_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   completed_at TIMESTAMPTZ
 );
+ALTER TABLE native_vocabulary_ai_runs
+  ADD COLUMN IF NOT EXISTS response_payload JSONB;
+ALTER TABLE native_vocabulary_ai_runs
+  ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_native_vocab_ai_lease
+  ON native_vocabulary_ai_runs(status, lease_expires_at)
+  WHERE status='RESERVED';
 CREATE INDEX IF NOT EXISTS idx_native_vocab_ai_day_country
   ON native_vocabulary_ai_runs(budget_day, country, status);
 CREATE INDEX IF NOT EXISTS idx_native_vocab_ai_channel
