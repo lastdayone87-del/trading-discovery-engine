@@ -51,7 +51,7 @@ export const YOUTUBE_INNERTUBE_PROVIDER: ProviderAllocation = Object.freeze({
 });
 
 /** InnerTube channel/video search never needs an API key; sessions are quota-free. */
-export const YOUTUBE_INNERTUBE_MAX_PAGES = 3;
+export const YOUTUBE_INNERTUBE_MAX_PAGES = 10;
 /** First-page result count is provider-determined (~20); official pages request up to 25. */
 export const YOUTUBE_INNERTUBE_PAGE_SIZE = 20;
 
@@ -610,14 +610,25 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
     }
     // Page walk: InnerTube continuations belong to a live feed object, so page
     // N is reached by re-running the search and advancing N-1 continuations.
-    // Bounded to YOUTUBE_INNERTUBE_MAX_PAGES (mirrors the autonomous 3-page cap).
+    // Bounded to YOUTUBE_INNERTUBE_MAX_PAGES (10 pages; the autonomous safety
+    // ceiling is higher, so the provider cap is the binding bound here).
     // NOTE on durability: youtubei.js exposes no serializable continuation
     // token, so cross-job pages re-run the search and walk live continuations
     // rather than resuming an opaque cursor. Result churn between jobs can
     // duplicate (absorbed downstream: per-page channelId dedupe, duplicate-
-    // ratio stop, idempotent page records) or skip (bounded to pages 2-3)
-    // results; within one call the walk uses live continuations with no drift.
+    // ratio stop, idempotent page records) or skip (bounded by the provider's
+    // page cap) results; within one call the walk uses live continuations with
+    // no drift.
     // A cursor is therefore a page number, not an equivalent server cursor.
+    //
+    // APPROVED LIMITATION (P14): youtubei.js 18.0.0 resolves a whole feed and
+    // exposes no AbortSignal, cancellation, or partial-feed API. If the 30s
+    // page deadline fires before the requested feed resolves, there are no
+    // page-N results to persist. The provider therefore propagates
+    // INNERTUBE_API_TIMEOUT; the worker keeps every earlier page observation,
+    // marks the run DEFERRED_TIME / TIME_BUDGET_EXHAUSTED, and resumes via
+    // REWALK. It must not fabricate an empty/partial page observation for the
+    // timed-out page.
     const searchType = lane === 'VIDEO' ? 'video' : 'channel';
     let feed = await pacedSearch(session, request.query, searchType, deadlineAtMs);
     for (let walked = 1; walked < pageNumber; walked++) {

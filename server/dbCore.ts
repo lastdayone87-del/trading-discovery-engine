@@ -47,6 +47,13 @@ import {
   isOfficialYouTubeQuotaFenceError,
   persistedQuotaOrigin,
 } from './officialYouTubeQuotaFence';
+import {
+  DEFAULT_NATIVE_VOCABULARY_AI_BUDGET,
+  evaluateNativeVocabularyAiBudget,
+  type NativeVocabularyAiBudgetPolicy,
+  type NativeVocabularyAiBudgetSnapshot,
+  type NativeVocabularyAiRunStatus,
+} from './nativeVocabularyBudget';
 
 const { Pool } = pg;
 const MIGRATIONS_DIR = path.join(process.cwd(), 'server', 'db', 'migrations');
@@ -416,7 +423,7 @@ async function seedDefaults(): Promise<void> {
   }
   const today = new Date().toISOString().split('T')[0];
   await db.query(`INSERT INTO quota_tracker(id,units_used,daily_limit,last_reset) VALUES('youtube',0,10000,$1) ON CONFLICT(id) DO NOTHING`, [today]);
-  for (const v of INITIAL_COUNTRY_VOCABULARIES) await saveCountryVocabulary(v);
+  for (const v of INITIAL_COUNTRY_VOCABULARIES) await seedCountryVocabularyIfMissing(v);
   const excl = await db.query('SELECT COUNT(*)::int AS count FROM excluded_countries');
   if (excl.rows[0].count === 0) {
     for (const e of INITIAL_EXCLUDED_COUNTRIES) await addExcludedCountry(e);
@@ -988,6 +995,28 @@ export async function saveCountryVocabulary(vocab: CountryVocabulary): Promise<v
   const db = await getDbNoInit().catch(getDb);
   await db.query(`INSERT INTO country_vocabularies(country,languages,native_trading_terminology,popular_instruments,local_market_phrases,common_content_format_names) VALUES($1,$2,$3,$4,$5,$6)
     ON CONFLICT(country) DO UPDATE SET languages=excluded.languages,native_trading_terminology=excluded.native_trading_terminology,popular_instruments=excluded.popular_instruments,local_market_phrases=excluded.local_market_phrases,common_content_format_names=excluded.common_content_format_names`, [vocab.country, JSON.stringify(vocab.languages), JSON.stringify(vocab.native_trading_terminology), JSON.stringify(vocab.popular_instruments), JSON.stringify(vocab.local_market_phrases), JSON.stringify(vocab.common_content_format_names)]);
+}
+
+/**
+ * Startup-safe vocabulary seeding. Unlike saveCountryVocabulary (explicit
+ * admin replacement), this never replaces a non-empty learned field: it
+ * inserts missing country rows and fills only empty fields. Learned
+ * vocabulary therefore survives every process restart.
+ */
+export async function seedCountryVocabularyIfMissing(vocab: CountryVocabulary): Promise<void> {
+  const db = await getDbNoInit().catch(getDb);
+  const empty = (column: string) => `(${column} IS NULL OR ${column} = '[]'::jsonb)`;
+  await db.query(
+    `INSERT INTO country_vocabularies(country,languages,native_trading_terminology,popular_instruments,local_market_phrases,common_content_format_names)
+     VALUES($1,$2,$3,$4,$5,$6)
+     ON CONFLICT(country) DO UPDATE SET
+       languages = CASE WHEN ${empty('country_vocabularies.languages')} THEN EXCLUDED.languages ELSE country_vocabularies.languages END,
+       native_trading_terminology = CASE WHEN ${empty('country_vocabularies.native_trading_terminology')} THEN EXCLUDED.native_trading_terminology ELSE country_vocabularies.native_trading_terminology END,
+       popular_instruments = CASE WHEN ${empty('country_vocabularies.popular_instruments')} THEN EXCLUDED.popular_instruments ELSE country_vocabularies.popular_instruments END,
+       local_market_phrases = CASE WHEN ${empty('country_vocabularies.local_market_phrases')} THEN EXCLUDED.local_market_phrases ELSE country_vocabularies.local_market_phrases END,
+       common_content_format_names = CASE WHEN ${empty('country_vocabularies.common_content_format_names')} THEN EXCLUDED.common_content_format_names ELSE country_vocabularies.common_content_format_names END`,
+    [vocab.country, JSON.stringify(vocab.languages), JSON.stringify(vocab.native_trading_terminology), JSON.stringify(vocab.popular_instruments), JSON.stringify(vocab.local_market_phrases), JSON.stringify(vocab.common_content_format_names)],
+  );
 }
 
 export async function getExcludedCountries(): Promise<ExcludedCountry[]> { const db=await getDb(); const res=await db.query('SELECT * FROM excluded_countries ORDER BY country_name'); return res.rows; }
@@ -2924,9 +2953,9 @@ export async function scheduleAutonomousQueryRuns(
       let run;
       try {
         run = await client.query(
-          `INSERT INTO query_runs(query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,quota_reserved,metadata,allocation_origin,retrieval_config_key,retrieval_treatment_origin,provider_key,retrieval_surface,provider_capability,cost_domain,provider_allocation_snapshot)
-           VALUES($1,$2,'automated_query',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id, scheduled_at`,
-          [candidate.query.id,candidate.query.country,candidate.strategy,candidate.reason,retrievalLane,searchOrdering,scheduledProviderUnits,JSON.stringify({...(candidate.query.generation_metadata||{}),...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{}),...experimentMetadata,...trialMetadata}),origin,retrievalConfigKey,treatmentOrigin,allocatedProvider.providerKey,allocatedProvider.retrievalSurface,allocatedProvider.capability,allocatedProvider.costDomain,JSON.stringify(allocatedProvider)]
+          `INSERT INTO query_runs(query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,quota_reserved,metadata,allocation_origin,retrieval_config_key,retrieval_treatment_origin,provider_key,retrieval_surface,provider_capability,cost_domain,provider_allocation_snapshot,requested_page_depth)
+           VALUES($1,$2,'automated_query',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING id, scheduled_at`,
+          [candidate.query.id,candidate.query.country,candidate.strategy,candidate.reason,retrievalLane,searchOrdering,scheduledProviderUnits,JSON.stringify({...(candidate.query.generation_metadata||{}),...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{}),...experimentMetadata,...trialMetadata}),origin,retrievalConfigKey,treatmentOrigin,allocatedProvider.providerKey,allocatedProvider.retrievalSurface,allocatedProvider.capability,allocatedProvider.costDomain,JSON.stringify(allocatedProvider),requestedPageDepth]
         );
       } catch (error) { await failStep('query_run_insert', error); }
       const runId = run.rows[0].id;
@@ -2955,6 +2984,15 @@ export async function scheduleAutonomousQueryRuns(
       // and is present only for TREATMENT arms with an applied window, so
       // recorded propensity/arm state always matches executed retrieval.
       const orderingWindow = candidate.experiment ? resolveScheduledSearchWindow(candidate.experiment.ordering) : undefined;
+      if (orderingWindow) {
+        // Persist the exact window used for this run. An orphan-resumed page
+        // rebuilds its job payload from query_runs.metadata, so dropping the
+        // window here would silently change a frozen experiment's retrieval.
+        await client.query(
+          `UPDATE query_runs SET metadata=jsonb_set(metadata,'{searchWindow}',$2::jsonb) WHERE id=$1`,
+          [runId, JSON.stringify(orderingWindow)],
+        ).catch(async (error: unknown) => { await failStep('benchmark_window_metadata', error); });
+      }
 
       if (canaryReservationId) {
         const committed = await commitRetrievalCanaryReservation(canaryReservationId, runId, client);
@@ -3704,7 +3742,7 @@ export async function completeQueryRun(runId: string, metrics: {
   try {
     await client.query('BEGIN');
     const run = await client.query(
-      `UPDATE query_runs SET status='COMPLETED',raw_results=$2,distinct_results=$3,duplicate_results=$4,
+      `UPDATE query_runs SET status='COMPLETED',continuation_status='COMPLETE',raw_results=$2,distinct_results=$3,duplicate_results=$4,
        known_channels=$5,new_channels=$6,country_rejected=$7,non_trading=$8,uncertain=$9,needs_review=$10,
        trading_confirmed=$11,unique_channels=$12,quality_channels=$13,communities_discovered=$14,quota_used=$15,
        provider_cost_usd=COALESCE($16,provider_cost_usd),
@@ -3911,7 +3949,7 @@ export async function failQueryRun(runId: string, error: unknown, terminal: bool
   const client = await db.connect();
   try {
     await client.query('BEGIN');
-    const run = await client.query(`UPDATE query_runs SET status='FAILED',error=$2,completed_at=now(),
+    const run = await client.query(`UPDATE query_runs SET status='FAILED',continuation_status='FAILED',error=$2,completed_at=now(),
     provider_requests_attempted=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search') WHEN provider_key='youtube-innertube' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube-innertube' AND e.operation='search') ELSE provider_requests_attempted END,
     provider_requests_succeeded=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status='SUCCESS') WHEN provider_key='youtube-innertube' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube-innertube' AND e.operation='search' AND e.status='SUCCESS') ELSE provider_requests_succeeded END,
     provider_requests_failed=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status NOT IN ('SUCCESS','RATE_LIMITED')) WHEN provider_key='youtube-innertube' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube-innertube' AND e.operation='search' AND e.status NOT IN ('SUCCESS','RATE_LIMITED')) ELSE provider_requests_failed END,
@@ -4107,4 +4145,428 @@ export async function finishQuotaReservation(operationType: string, operationId:
      WHERE operation_type=$1 AND operation_id=$2 AND status='RESERVED'`,
     [operationType, operationId, consumed ? 'CONSUMED' : 'RELEASED']
   );
+}
+
+// ---------------------------------------------------------------------------
+// Country Discovery Loop (CDL): AI budget ledger, optional demand signals, and
+// resumable query-run progress. Additive helpers only; legacy callers keep
+// their existing behavior.
+// ---------------------------------------------------------------------------
+
+export interface NativeVocabularyAiRunRecord {
+  requestId: string;
+  channelId: string | null;
+  country: string;
+  metadataHash: string;
+  budgetDay: string;
+  status: NativeVocabularyAiRunStatus;
+  provider: string | null;
+  attempts: number;
+  reservedCostMicrounits: number;
+  actualCostMicrounits: number;
+  createdAt: string;
+  completedAt: string | null;
+}
+
+function rowToNativeVocabularyAiRun(row: Record<string, unknown>): NativeVocabularyAiRunRecord {
+  return {
+    requestId: String(row.request_id),
+    channelId: row.channel_id ? String(row.channel_id) : null,
+    country: String(row.country),
+    metadataHash: String(row.metadata_hash),
+    budgetDay: String(row.budget_day),
+    status: String(row.status) as NativeVocabularyAiRunStatus,
+    provider: row.provider ? String(row.provider) : null,
+    attempts: Number(row.attempts || 0),
+    reservedCostMicrounits: Number(row.reserved_cost_microunits || 0),
+    actualCostMicrounits: Number(row.actual_cost_microunits || 0),
+    createdAt: iso(row.created_at) || new Date().toISOString(),
+    completedAt: iso(row.completed_at),
+  };
+}
+
+export async function getNativeVocabularyAiRun(requestId: string): Promise<NativeVocabularyAiRunRecord | null> {
+  const db = await getDb();
+  const result = await db.query(`SELECT * FROM native_vocabulary_ai_runs WHERE request_id=$1`, [requestId]);
+  return result.rows[0] ? rowToNativeVocabularyAiRun(result.rows[0]) : null;
+}
+
+export async function getNativeVocabularyAiBudgetSnapshot(budgetDay: string, country?: string): Promise<NativeVocabularyAiBudgetSnapshot> {
+  const db = await getDb();
+  const result = await db.query(
+    `SELECT
+       COUNT(*) FILTER (WHERE status IN ('RESERVED','SUCCEEDED','FAILED'))::int AS global_calls,
+       COUNT(*) FILTER (WHERE status IN ('RESERVED','SUCCEEDED','FAILED') AND ($2::text IS NULL OR country=$2))::int AS country_calls,
+       COALESCE(SUM(actual_cost_microunits) FILTER (WHERE status IN ('SUCCEEDED','FAILED')),0)::bigint AS actual_cost,
+       COALESCE(SUM(reserved_cost_microunits) FILTER (WHERE status='RESERVED'),0)::bigint AS outstanding
+     FROM native_vocabulary_ai_runs WHERE budget_day=$1`,
+    [budgetDay, country || null],
+  );
+  const row = result.rows[0] || {};
+  return {
+    globalCalls: Number(row.global_calls || 0),
+    countryCalls: Number(row.country_calls || 0),
+    actualCostMicrounits: Number(row.actual_cost || 0),
+    outstandingReservationMicrounits: Number(row.outstanding || 0),
+  };
+}
+
+async function readNativeVocabularyAiBudgetPolicy(client: { query: (sql: string, params?: any[]) => Promise<any> }): Promise<NativeVocabularyAiBudgetPolicy> {
+  const keys = [
+    'native_vocabulary_ai_daily_calls',
+    'native_vocabulary_ai_country_daily_calls',
+    'native_vocabulary_ai_daily_cost_microunits',
+  ];
+  const result = await client.query(`SELECT setting_key,setting_value FROM app_settings WHERE setting_key = ANY($1)`, [keys]);
+  const values = new Map<string, string>((result.rows || []).map((row: Record<string, unknown>) => [String(row.setting_key), String(row.setting_value)]));
+  const numberOr = (key: string, fallback: number) => {
+    const parsed = Number(values.get(key));
+    return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
+  };
+  return {
+    dailyCalls: numberOr('native_vocabulary_ai_daily_calls', DEFAULT_NATIVE_VOCABULARY_AI_BUDGET.dailyCalls),
+    countryDailyCalls: numberOr('native_vocabulary_ai_country_daily_calls', DEFAULT_NATIVE_VOCABULARY_AI_BUDGET.countryDailyCalls),
+    dailyCostMicrounits: numberOr('native_vocabulary_ai_daily_cost_microunits', DEFAULT_NATIVE_VOCABULARY_AI_BUDGET.dailyCostMicrounits),
+    reservationMicrounits: DEFAULT_NATIVE_VOCABULARY_AI_BUDGET.reservationMicrounits,
+  };
+}
+
+/**
+ * Reserve one logical AI extraction call. The advisory lock serializes the
+ * count/insert across replicas; the request id makes same-day re-ingestion
+ * idempotent. A skipped call never consumes budget.
+ */
+export async function reserveNativeVocabularyAiRun(args: {
+  requestId: string;
+  channelId: string;
+  country: string;
+  metadataHash: string;
+  budgetDay: string;
+  policy?: Partial<NativeVocabularyAiBudgetPolicy>;
+}): Promise<{ admitted: boolean; status: NativeVocabularyAiRunStatus; reason: string; requestId: string }> {
+  const db = await getDb();
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`native-vocab-ai-budget:${args.budgetDay}`]);
+    const existing = await client.query(`SELECT * FROM native_vocabulary_ai_runs WHERE request_id=$1`, [args.requestId]);
+    if (existing.rows[0]) {
+      const row = rowToNativeVocabularyAiRun(existing.rows[0]);
+      await client.query('COMMIT');
+      return { admitted: false, status: row.status, reason: `IDEMPOTENT_${row.status}`, requestId: args.requestId };
+    }
+    const counts = await client.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE status IN ('RESERVED','SUCCEEDED','FAILED'))::int AS global_calls,
+         COUNT(*) FILTER (WHERE status IN ('RESERVED','SUCCEEDED','FAILED') AND country=$2)::int AS country_calls,
+         COALESCE(SUM(actual_cost_microunits) FILTER (WHERE status IN ('SUCCEEDED','FAILED')),0)::bigint AS actual_cost,
+         COALESCE(SUM(reserved_cost_microunits) FILTER (WHERE status='RESERVED'),0)::bigint AS outstanding
+       FROM native_vocabulary_ai_runs WHERE budget_day=$1`,
+      [args.budgetDay, args.country],
+    );
+    const policy = { ...(await readNativeVocabularyAiBudgetPolicy(client)), ...(args.policy || {}) };
+    const row = counts.rows[0] || {};
+    const decision = evaluateNativeVocabularyAiBudget({
+      requestId: args.requestId,
+      snapshot: {
+        globalCalls: Number(row.global_calls || 0),
+        countryCalls: Number(row.country_calls || 0),
+        actualCostMicrounits: Number(row.actual_cost || 0),
+        outstandingReservationMicrounits: Number(row.outstanding || 0),
+      },
+      policy,
+    });
+    if (!decision.admit) {
+      await client.query(
+        `INSERT INTO native_vocabulary_ai_runs(request_id,channel_id,country,metadata_hash,budget_day,status,provider,attempts,reserved_cost_microunits,actual_cost_microunits,completed_at)
+         VALUES($1,$2,$3,$4,$5,'BUDGET_SKIPPED',NULL,0,0,0,now()) ON CONFLICT(request_id) DO NOTHING`,
+        [args.requestId, args.channelId, args.country, args.metadataHash, args.budgetDay],
+      );
+      await client.query('COMMIT');
+      return { admitted: false, status: 'BUDGET_SKIPPED', reason: decision.reason, requestId: args.requestId };
+    }
+    await client.query(
+      `INSERT INTO native_vocabulary_ai_runs(request_id,channel_id,country,metadata_hash,budget_day,status,provider,attempts,reserved_cost_microunits,actual_cost_microunits)
+       VALUES($1,$2,$3,$4,$5,'RESERVED',NULL,0,$6,0) ON CONFLICT(request_id) DO NOTHING`,
+      [args.requestId, args.channelId, args.country, args.metadataHash, args.budgetDay, policy.reservationMicrounits],
+    );
+    await client.query('COMMIT');
+    return { admitted: true, status: 'RESERVED', reason: 'RESERVED', requestId: args.requestId };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function completeNativeVocabularyAiRun(args: {
+  requestId: string;
+  status: 'SUCCEEDED' | 'FAILED';
+  provider?: string | null;
+  attempts?: number;
+  actualCostMicrounits?: number;
+}): Promise<void> {
+  const db = await getDb();
+  await db.query(
+    `UPDATE native_vocabulary_ai_runs
+     SET status=$2,provider=$3,attempts=$4,actual_cost_microunits=$5,completed_at=now()
+     WHERE request_id=$1 AND status='RESERVED'`,
+    [args.requestId, args.status, args.provider || null, Math.max(0, Math.trunc(args.attempts || 0)), Math.max(0, Math.trunc(args.actualCostMicrounits || 0))],
+  );
+}
+
+export interface QueryRunProgress {
+  runId: string;
+  pagesCompleted: number;
+  nextPageToken: string | null;
+  resumeMode: 'TOKEN' | 'REWALK' | 'OFFSET' | 'NONE';
+  runQuotaBudgetUnits: number;
+  runQuotaConsumedUnits: number;
+  continuationStatus: 'RUNNING' | 'DEFERRED_QUOTA' | 'DEFERRED_TIME' | 'COMPLETE' | 'FAILED' | 'RESUME_UNAVAILABLE';
+  deferredUntil: string | null;
+  lastPageAt: string | null;
+  explorationPagesRemaining: number;
+  effectiveMaxPages: number | null;
+  effectiveBindingBound: 'SAFETY' | 'PROVIDER' | 'RUN_BUDGET' | 'TREATMENT' | 'TRIAL' | null;
+  resumeCount: number;
+  resumeRewalkCount: number;
+  continuedFromRunId: string | null;
+  continuedToRunId: string | null;
+  continuationSegment: number;
+}
+
+function rowToQueryRunProgress(row: Record<string, unknown>): QueryRunProgress {
+  return {
+    runId: String(row.id),
+    pagesCompleted: Number(row.pages_completed || 0),
+    nextPageToken: row.next_page_token ? String(row.next_page_token) : null,
+    resumeMode: (String(row.resume_mode || 'NONE') as QueryRunProgress['resumeMode']),
+    runQuotaBudgetUnits: Number(row.run_quota_budget_units || 0),
+    runQuotaConsumedUnits: Number(row.run_quota_consumed_units || 0),
+    continuationStatus: (String(row.continuation_status || 'RUNNING') as QueryRunProgress['continuationStatus']),
+    deferredUntil: iso(row.deferred_until),
+    lastPageAt: iso(row.last_page_at),
+    explorationPagesRemaining: Number(row.exploration_pages_remaining || 0),
+    effectiveMaxPages: row.effective_max_pages == null ? null : Number(row.effective_max_pages),
+    effectiveBindingBound: (row.effective_binding_bound
+      ? String(row.effective_binding_bound)
+      : null) as QueryRunProgress['effectiveBindingBound'],
+    resumeCount: Number(row.resume_count || 0),
+    resumeRewalkCount: Number(row.resume_rewalk_count || 0),
+    continuedFromRunId: row.continued_from_run_id ? String(row.continued_from_run_id) : null,
+    continuedToRunId: row.continued_to_run_id ? String(row.continued_to_run_id) : null,
+    continuationSegment: Number(row.continuation_segment || 0),
+  };
+}
+
+export async function getQueryRunProgress(runId: string): Promise<QueryRunProgress | null> {
+  const db = await getDb();
+  const result = await db.query(`SELECT * FROM query_runs WHERE id=$1`, [runId]);
+  return result.rows[0] ? rowToQueryRunProgress(result.rows[0]) : null;
+}
+
+export async function updateQueryRunProgress(runId: string, patch: Partial<{
+  pagesCompleted: number;
+  nextPageToken: string | null;
+  resumeMode: 'TOKEN' | 'REWALK' | 'OFFSET' | 'NONE';
+  runQuotaBudgetUnits: number;
+  runQuotaConsumedUnits: number;
+  continuationStatus: QueryRunProgress['continuationStatus'];
+  deferredUntil: string | null;
+  lastPageAt: string | null;
+  explorationPagesRemaining: number;
+  effectiveMaxPages: number | null;
+  effectiveBindingBound: QueryRunProgress['effectiveBindingBound'];
+  resumeCount: number;
+  resumeRewalkCount: number;
+}>): Promise<void> {
+  const columns: string[] = [];
+  const values: unknown[] = [];
+  const add = (column: string, value: unknown) => {
+    values.push(value);
+    columns.push(`${column}=$${values.length + 1}`);
+  };
+  if (patch.pagesCompleted !== undefined) add('pages_completed', patch.pagesCompleted);
+  if (patch.nextPageToken !== undefined) add('next_page_token', patch.nextPageToken);
+  if (patch.resumeMode !== undefined) add('resume_mode', patch.resumeMode);
+  if (patch.runQuotaBudgetUnits !== undefined) add('run_quota_budget_units', patch.runQuotaBudgetUnits);
+  if (patch.runQuotaConsumedUnits !== undefined) add('run_quota_consumed_units', patch.runQuotaConsumedUnits);
+  if (patch.continuationStatus !== undefined) add('continuation_status', patch.continuationStatus);
+  if (patch.deferredUntil !== undefined) add('deferred_until', patch.deferredUntil);
+  if (patch.lastPageAt !== undefined) add('last_page_at', patch.lastPageAt);
+  if (patch.explorationPagesRemaining !== undefined) add('exploration_pages_remaining', patch.explorationPagesRemaining);
+  if (patch.effectiveMaxPages !== undefined) add('effective_max_pages', patch.effectiveMaxPages);
+  if (patch.effectiveBindingBound !== undefined) add('effective_binding_bound', patch.effectiveBindingBound);
+  if (patch.resumeCount !== undefined) add('resume_count', patch.resumeCount);
+  if (patch.resumeRewalkCount !== undefined) add('resume_rewalk_count', patch.resumeRewalkCount);
+  if (!columns.length) return;
+  const db = await getDb();
+  await db.query(`UPDATE query_runs SET ${columns.join(',')} WHERE id=$1`, [runId, ...values]);
+}
+
+export async function markQueryRunDeferred(runId: string, status: 'DEFERRED_QUOTA' | 'DEFERRED_TIME', deferredUntil: string): Promise<void> {
+  const db = await getDb();
+  await db.query(
+    `UPDATE query_runs SET continuation_status=$2,deferred_until=$3 WHERE id=$1 AND status NOT IN ('COMPLETED','FAILED')`,
+    [runId, status, deferredUntil],
+  );
+}
+
+export async function markQueryRunResumeUnavailable(runId: string, reason: string): Promise<void> {
+  const db = await getDb();
+  await db.query(
+    `UPDATE query_runs SET continuation_status='RESUME_UNAVAILABLE',error=$2,completed_at=COALESCE(completed_at,now()),status=CASE WHEN status IN ('COMPLETED','FAILED') THEN status ELSE 'FAILED' END WHERE id=$1`,
+    [runId, reason.slice(0, 2000)],
+  );
+}
+
+export interface ContinuationRunSegment {
+  parentRunId: string;
+  childRunId: string;
+  segment: number;
+  nextPageToken: string | null;
+  resumeMode: 'TOKEN' | 'REWALK' | 'OFFSET' | 'NONE';
+}
+
+/**
+ * Linked continuation segment for the hard page ceiling. The parent run
+ * completes truthfully at PAGE_CEILING and the child carries the preserved
+ * provider cursor/mode plus the exploration/trial/depth linkage. The child is
+ * a new run, so it must compute and store its own fair-share quota budget at
+ * its first page (report §6.4); copying the parent's full budget would let the
+ * segment spend the same allocation twice. This is what makes the 50-page
+ * ceiling a safety boundary instead of a dead end.
+ */
+export async function createContinuationRunSegment(args: {
+  parentRunId: string;
+  nextPageToken: string | null;
+  resumeMode: 'TOKEN' | 'REWALK' | 'OFFSET' | 'NONE';
+  explorationPagesRemaining?: number;
+}): Promise<ContinuationRunSegment> {
+  const db = await getDb();
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const parentResult = await client.query(`SELECT * FROM query_runs WHERE id=$1 FOR UPDATE`, [args.parentRunId]);
+    if (!parentResult.rows[0]) throw new Error('QUERY_RUN_NOT_FOUND');
+    const parent = parentResult.rows[0];
+    if (parent.continued_to_run_id) {
+      await client.query('COMMIT');
+      return {
+        parentRunId: args.parentRunId,
+        childRunId: String(parent.continued_to_run_id),
+        segment: Number(parent.continuation_segment || 0) + 1,
+        nextPageToken: args.nextPageToken,
+        resumeMode: args.resumeMode,
+      };
+    }
+    const segment = Number(parent.continuation_segment || 0) + 1;
+    const child = await client.query(
+      `INSERT INTO query_runs(
+         query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,
+         quota_reserved,metadata,allocation_origin,retrieval_config_key,retrieval_treatment_origin,
+         provider_key,retrieval_surface,provider_capability,cost_domain,provider_allocation_snapshot,
+         status,scheduled_at,pages_completed,next_page_token,resume_mode,run_quota_budget_units,
+         run_quota_consumed_units,continuation_status,exploration_pages_remaining,continued_from_run_id,
+         continuation_segment,requested_page_depth
+       )
+       SELECT query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,
+         quota_reserved,metadata,allocation_origin,retrieval_config_key,retrieval_treatment_origin,
+         provider_key,retrieval_surface,provider_capability,cost_domain,provider_allocation_snapshot,
+         'SCHEDULED',now(),0,$2,$3,0,0,'RUNNING',$4,$1,$5,requested_page_depth
+       FROM query_runs WHERE id=$1 RETURNING id`,
+      [
+        args.parentRunId, args.nextPageToken, args.resumeMode,
+        Math.max(0, Math.trunc(args.explorationPagesRemaining || 0)), segment,
+      ],
+    );
+    const childRunId = String(child.rows[0].id);
+    await client.query(
+      `UPDATE query_runs SET status='COMPLETED',continuation_status='COMPLETE',completed_at=now(),
+         next_page_token=$2,resume_mode=$3,continued_to_run_id=$4,last_page_at=COALESCE(last_page_at,now())
+       WHERE id=$1`,
+      [args.parentRunId, args.nextPageToken, args.resumeMode, childRunId],
+    );
+    await client.query('COMMIT');
+    return { parentRunId: args.parentRunId, childRunId, segment, nextPageToken: args.nextPageToken, resumeMode: args.resumeMode };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export interface AutonomousQuotaAvailability {
+  dailyBudget: number;
+  autonomousUnitsUsed: number;
+  autonomousUnitsReserved: number;
+  remainingAutonomousQuota: number;
+}
+
+export async function getAutonomousQuotaAvailability(): Promise<AutonomousQuotaAvailability> {
+  const snapshot = await getAutonomousSchedulingSnapshot();
+  const dailyBudget = getDailyYouTubeQuotaBudget();
+  return {
+    dailyBudget,
+    autonomousUnitsUsed: snapshot.autonomousUnitsUsed,
+    autonomousUnitsReserved: snapshot.autonomousUnitsReserved,
+    remainingAutonomousQuota: Math.max(0, dailyBudget - snapshot.autonomousUnitsUsed - snapshot.autonomousUnitsReserved),
+  };
+}
+
+export interface QueryDemandSignalRecord {
+  country: string;
+  language: string;
+  surface: string;
+  normalizedSurface: string;
+  provider: string;
+  providerSignalId: string | null;
+  demandScore: number;
+  metadata: Record<string, unknown>;
+  observedAt: string;
+  expiresAt: string | null;
+}
+
+export async function getQueryDemandSignals(country: string, freshOnly = true): Promise<QueryDemandSignalRecord[]> {
+  const db = await getDb();
+  const result = await db.query(
+    `SELECT country,language,signal_surface,normalized_surface,provider,provider_signal_id,demand_score,metadata,observed_at,expires_at
+     FROM query_demand_signals WHERE country=$1 AND ($2::boolean IS NOT TRUE OR expires_at IS NULL OR expires_at > now())
+     ORDER BY demand_score DESC, observed_at DESC`,
+    [canonicalCountry(country), freshOnly],
+  );
+  return result.rows.map((row: Record<string, unknown>) => ({
+    country: String(row.country),
+    language: String(row.language || 'und'),
+    surface: String(row.signal_surface),
+    normalizedSurface: String(row.normalized_surface),
+    provider: String(row.provider),
+    providerSignalId: row.provider_signal_id ? String(row.provider_signal_id) : null,
+    demandScore: Number(row.demand_score || 0),
+    metadata: (row.metadata && typeof row.metadata === 'object' ? row.metadata : {}) as Record<string, unknown>,
+    observedAt: iso(row.observed_at) || new Date().toISOString(),
+    expiresAt: iso(row.expires_at),
+  }));
+}
+
+export async function upsertQueryDemandSignals(signals: Array<Omit<QueryDemandSignalRecord, 'observedAt'> & { observedAt?: string }>): Promise<number> {
+  if (!signals.length) return 0;
+  const db = await getDb();
+  let written = 0;
+  for (const signal of signals) {
+    const result = await db.query(
+      `INSERT INTO query_demand_signals(country,language,signal_surface,normalized_surface,provider,provider_signal_id,demand_score,metadata,observed_at,expires_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       ON CONFLICT DO NOTHING`,
+      [
+        canonicalCountry(signal.country), signal.language, signal.surface, signal.normalizedSurface,
+        signal.provider, signal.providerSignalId || null, signal.demandScore,
+        JSON.stringify(signal.metadata || {}), signal.observedAt || new Date().toISOString(), signal.expiresAt || null,
+      ],
+    );
+    written += result.rowCount || 0;
+  }
+  return written;
 }

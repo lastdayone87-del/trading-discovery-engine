@@ -373,6 +373,27 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       };
     }
 
+    // Continuation-first scheduling (CDL §6.9): a country with a pending
+    // deferred page must get its continuation slot before a new query is
+    // started for another country. Run the resume sweep before the queue-depth
+    // snapshot so resumed pages count toward the queue watermark and cannot be
+    // crowded out by fresh-query capacity. The dynamic import avoids the
+    // queueManager -> autonomousDiscovery module cycle. Direct target cycles
+    // keep their on-demand country scope and do not resume other countries.
+    if (!targetCountry) {
+      try {
+        const { resumeOrphanedAutonomousPages } = await import('./queueManager');
+        const resumed = await resumeOrphanedAutonomousPages({ force: true });
+        if (resumed.enqueued > 0) {
+          log(`Continuation-first: resumed ${resumed.enqueued} pending page(s) before new-query scheduling.`);
+        }
+      } catch (error) {
+        // Continuation recovery is best-effort; the maintenance scheduler
+        // retries it and new-query scheduling must not be blocked by it.
+        console.warn('[Autonomous Producer] Continuation resume sweep failed; new-query scheduling continues:', error);
+      }
+    }
+
     // The research controller is an isolated observer/planner. Failure never
     // delays the proven query scheduler, and serving remains separately gated.
     await runPersistentResearchCycle(`autonomous-research:${process.pid}`)

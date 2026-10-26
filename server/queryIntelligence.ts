@@ -12,8 +12,17 @@ import {
   getChannelById,
   upsertChannel,
   getAppSetting,
+  getQueryDemandSignals,
+  reserveNativeVocabularyAiRun,
+  completeNativeVocabularyAiRun,
   isRetryableInfrastructureFailure
 } from './db';
+import {
+  computeNativeVocabularyMetadataHash,
+  computeNativeVocabularyRequestId,
+  estimateNativeVocabularyActualCostMicrounits,
+} from './nativeVocabularyBudget';
+import { getYouTubeQuotaDay } from './youtubeQuotaDay';
 import { assertCountryAllowed } from './countryExclusion';
 import { isTerminologyKillSwitchActive, TERMINOLOGY_KILL_SWITCH_KEY } from './terminologyKillSwitch';
 import { limitRepeatedPrimaryTerms, planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, queriesOutsideCooldown, rotateAwayFromMostRecentIntent, reformulatePollutedQuery } from './queryPlanner';
@@ -27,6 +36,13 @@ import { geminiOrgIdForSlot } from './evidenceEngine/providers/GeminiSemanticPro
 import { appendProviderCallEvent } from './db';
 import { getPublishedOrganicQueryCandidates } from './organicQueryExpansion';
 import { type DiscoveryNeighborhoodDimensions, createNeighborhoodKey } from './discoveryNeighborhood';
+import {
+  freeSignalToQueryCandidates,
+  getStoredFreeQuerySignals,
+  refreshFreeQuerySignalsForCountry,
+  type FreeSignalQueryCandidate,
+} from './freeQuerySignals';
+import type { DemandSignalQueryCandidate } from './queryPlanner';
 
 // AI Client lazy initialization
 let aiClient: GoogleGenAI | null = null;
@@ -606,7 +622,8 @@ export async function invokeChannelVocabularyExtraction(
   channel: ChannelRecord,
   candidate: ExtractionVideoSource & { description?: string; detectedLanguages?: Array<{ language: string; confidence?: number }> },
   languageContext: ExplicitTerminologyLanguageContext | undefined,
-  deps?: { extractVocabulary?: typeof extractVocabularyFromCreator }
+  deps?: { extractVocabulary?: typeof extractVocabularyFromCreator },
+  options?: { promotionEligible?: boolean; persistLegacyTerm?: boolean; aiBudgetEnabled?: boolean }
 ): Promise<Array<string | null>> {
   const extractionVideoIds = resolveExtractionVideoIds(candidate);
   const extract = deps?.extractVocabulary ?? extractVocabularyFromCreator;
@@ -616,7 +633,10 @@ export async function invokeChannelVocabularyExtraction(
     candidate.description ?? '',
     false,
     languageContext,
-    extractionVideoIds
+    extractionVideoIds,
+    undefined,
+    undefined,
+    options
   );
   return extractionVideoIds;
 }
@@ -684,6 +704,15 @@ export async function admitNativeCandidates(args: {
   humanObservation: 'HUMAN_APPROVED_CHANNEL' | 'ENRICHMENT';
   /** Extraction provider recorded on observation evidence (default GEMINI preserves existing callers). */
   extractor?: string;
+  /**
+   * Native promotion eligibility from the caller. false always wins; a true
+   * value still cannot override the current channel gates inside
+   * observeTerminologyDetailed. undefined preserves legacy observation
+   * behavior while the flag is computed from current channel state.
+   */
+  promotionEligible?: boolean;
+  /** false skips legacy extracted-vocabulary writes (lower-quality creators). */
+  persistLegacyTerm?: boolean;
   deps?: NativeAdmissionDeps;
 }): Promise<NativeAdmissionReport> {
   const saveTerm = args.deps?.saveTerm ?? ((country, term, category, channelId) => saveExtractedTerm(country, term, category, channelId));
@@ -710,6 +739,7 @@ export async function admitNativeCandidates(args: {
       channelId: args.channel.channel_id, videoId: verdict.located.videoId ?? undefined, humanApproved: approved,
       language: args.language, locale: args.locale,
       communityFingerprint: args.channel.discord_invite || undefined,
+      promotionEligible: args.promotionEligible,
       evidence: {
         extractor: args.extractor ?? 'GEMINI', qualityVersion: 'native-v1', literal: true,
         sourceRef: { kind: verdict.located.sourceKind, index: verdict.located.sourceIndex, span: verdict.located.span, videoId: verdict.located.videoId ?? null, sourceHash: verdict.located.sourceHash },
@@ -720,6 +750,14 @@ export async function admitNativeCandidates(args: {
     });
     if (observation == null) {
       rejected['observation-failed'] += 1;
+      return;
+    }
+    // Legacy-vocabulary bypass guard: lower-quality or otherwise ineligible
+    // observations never increment extracted_vocabulary, so the planner
+    // cannot serve them through learnedVocabulary without the v2 basis.
+    if (args.persistLegacyTerm === false) {
+      if (observation.observationInserted) admitted += 1;
+      else duplicates += 1;
       return;
     }
     // Occurrence counts advance only on newly persisted evidence. A replayed
@@ -765,7 +803,8 @@ export async function extractVocabularyFromCreator(
   languageContext?: ExplicitTerminologyLanguageContext,
   videoIds?: Array<string | null>,
   origins?: ExtractionSourceOrigins,
-  deps?: { isKillSwitchActive?: () => Promise<boolean> }
+  deps?: { isKillSwitchActive?: () => Promise<boolean> },
+  options?: { promotionEligible?: boolean; persistLegacyTerm?: boolean; aiBudgetEnabled?: boolean }
 ): Promise<ExtractedTermRecord[]> {
   const extracted: ExtractedTermRecord[] = [];
 
@@ -797,9 +836,13 @@ export async function extractVocabularyFromCreator(
   for (const hit of findRuleInstrumentHits(channel.channel_name, videoTitles, description, videoIds, origins)) {
     // Persistence ordering mirrors the AI path: terminology evidence first,
     // extracted-term row only after a valid observation exists.
-    const ruleObservation = await observeTerminologyDetailed({ term: hit.instrument, country: channel.country, termType: 'INSTRUMENT', observationType: humanApproved ? 'HUMAN_APPROVED_CHANNEL' : hit.located.sourceKind, channelId: channel.channel_id, videoId: hit.located.videoId ?? undefined, humanApproved, language: languageContext?.language, locale: languageContext?.locale, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'KNOWN_INSTRUMENT_V1', sourceType: hit.located.sourceKind, qualityVersion: 'native-v1', literal: true, sourceRef: { kind: hit.located.sourceKind, index: hit.located.sourceIndex, span: hit.located.span, videoId: hit.located.videoId ?? null, sourceHash: hit.located.sourceHash }, novel: false, knownAs: `instrument:${hit.instrument}`, generic: true, spamConfirmed: false, spamSignals: [] as string[], sourceSpamSignals: hit.sourceSpamSignals, translationRisk: null } });
+    const ruleObservation = await observeTerminologyDetailed({ term: hit.instrument, country: channel.country, termType: 'INSTRUMENT', observationType: humanApproved ? 'HUMAN_APPROVED_CHANNEL' : hit.located.sourceKind, channelId: channel.channel_id, videoId: hit.located.videoId ?? undefined, humanApproved, language: languageContext?.language, locale: languageContext?.locale, communityFingerprint: channel.discord_invite || undefined, promotionEligible: false, evidence: { extractor: 'KNOWN_INSTRUMENT_V1', sourceType: hit.located.sourceKind, qualityVersion: 'native-v1', literal: true, sourceRef: { kind: hit.located.sourceKind, index: hit.located.sourceIndex, span: hit.located.span, videoId: hit.located.videoId ?? null, sourceHash: hit.located.sourceHash }, novel: false, knownAs: `instrument:${hit.instrument}`, generic: true, spamConfirmed: false, spamSignals: [] as string[], sourceSpamSignals: hit.sourceSpamSignals, translationRisk: null } });
     if (ruleObservation == null) continue;
     ruleObserved.add(normalizeTerm(hit.instrument));
+    // Legacy-vocabulary bypass guard: lower-quality creators still contribute
+    // canonical observations, but never an extracted_vocabulary row the
+    // planner could serve without the v2 evidence gate.
+    if (options?.persistLegacyTerm === false) continue;
     if (ruleObservation.observationInserted) {
       await saveExtractedTerm(channel.country, hit.instrument, 'instrument', channel.channel_id);
     } else {
@@ -852,59 +895,120 @@ Return ONLY a valid JSON object with format:
         language: languageContext?.language,
         ruleObserved,
       });
+    // Daily AI extraction budget: one logical call per channel/metadata/day,
+    // shared by the Groq primary and Gemini fallback. Rule evidence is already
+    // persisted, so a skipped or exhausted budget degrades to rule-only
+    // extraction instead of failing the job. Baseline load happens first so a
+    // database outage never burns a call slot.
+    let aiRun: { requestId: string; promptChars: number; attempts: number; responseChars: number } | null = null;
+    const budgetDisabled = options?.aiBudgetEnabled === false;
+    if (!budgetDisabled) {
+      const metadataHash = computeNativeVocabularyMetadataHash([
+        channel.channel_name,
+        effDesc,
+        ...effTitles,
+        languageContext?.language,
+        languageContext?.locale,
+      ]);
+      const budgetDay = getYouTubeQuotaDay();
+      const requestId = computeNativeVocabularyRequestId({ channelId: channel.channel_id, metadataHash, budgetDay });
+      const reservation = await reserveNativeVocabularyAiRun({
+        requestId,
+        channelId: channel.channel_id,
+        country: channel.country,
+        metadataHash,
+        budgetDay,
+      });
+      if (reservation.admitted) {
+        aiRun = { requestId, promptChars: prompt.length, attempts: 0, responseChars: 0 };
+      } else {
+        console.warn(
+          `[Vocabulary Extraction] AI budget skipped for channel ${channel.channel_id}: ${reservation.reason}. Rule-based evidence retained.`
+        );
+      }
+    }
+    const finishAiRun = async (status: 'SUCCEEDED' | 'FAILED', provider: 'GROQ' | 'GEMINI' | null) => {
+      if (!aiRun) return;
+      await completeNativeVocabularyAiRun({
+        requestId: aiRun.requestId,
+        status,
+        provider,
+        attempts: aiRun.attempts,
+        actualCostMicrounits: estimateNativeVocabularyActualCostMicrounits({
+          attempts: Math.max(1, aiRun.attempts),
+          promptChars: aiRun.promptChars,
+          responseChars: aiRun.responseChars,
+        }),
+      });
+    };
     // Groq primary: same prompt, same parser, same admission below. Any
     // Groq failure (no keys, deferral, 429, error) falls through to the
     // unchanged Gemini path; total failure keeps warn-and-skip.
-    try {
-      const { runGroqTextCompletion } = await import('./evidenceEngine/providers/GroqSemanticProvider');
-      const groqText = await runGroqTextCompletion(
-        { prompt },
-        {
-          validateContent: text => {
-            let candidate: ReturnType<typeof parseNativeVocabularyResponse>;
-            try {
-              candidate = parseNativeVocabularyResponse(text);
-            } catch {
-              return false;
-            }
-            return isAdmissible(candidate);
-          },
-        }
-      );
-      // Admissibility gate: provider output with no admissible candidate is
-      // not a result — the Gemini fallback stays available instead of being
-      // suppressed. Rule exclusion runs INSIDE the gate (not after it), so
-      // instruments the rule pass already admitted cannot suppress fallback
-      // on their own.
-      const groqParsed = groqText ? parseNativeVocabularyResponse(groqText) : undefined;
-      if (isAdmissible(groqParsed)) {
-        parsed = groqParsed;
-        parsedSource = 'GROQ';
-      }
-    } catch (e: any) {
-      console.warn(`[Vocabulary Extraction] Groq attempt skipped for channel ${channel.channel_id}; trying Gemini fallback.`);
-    }
-    if (!parsed && ai) {
+    if (aiRun || budgetDisabled) {
       try {
-        const response = await callGeminiSafe(() => executeProviderCall({context:{provider:'gemini',operation:'vocabulary-extraction',requestMetadata:{geminiRoute:resolveGeminiRouteId('gemini-1'),geminiOrg:geminiOrgIdForSlot(process.env,1)}},timeoutMs:Number(process.env.GEMINI_PROVIDER_TIMEOUT_MS||'45000'),enabled:process.env.PROVIDER_DEADLINES_ENABLED==='true',emit:appendProviderCallEvent,call:() => ai.models.generateContent({
-          model: 'gemini-3.6-flash',
-          contents: prompt
-        })}));
-
-        const resText = response.text || '';
-        parsed = parseNativeVocabularyResponse(resText);
+        const { runGroqTextCompletion } = await import('./evidenceEngine/providers/GroqSemanticProvider');
+        const groqText = await runGroqTextCompletion(
+          { prompt },
+          {
+            validateContent: text => {
+              let candidate: ReturnType<typeof parseNativeVocabularyResponse>;
+              try {
+                candidate = parseNativeVocabularyResponse(text);
+              } catch {
+                return false;
+              }
+              return isAdmissible(candidate);
+            },
+          }
+        );
+        if (aiRun) {
+          aiRun.attempts += 1;
+          aiRun.responseChars += groqText ? groqText.length : 0;
+        }
+        // Admissibility gate: provider output with no admissible candidate is
+        // not a result — the Gemini fallback stays available instead of being
+        // suppressed. Rule exclusion runs INSIDE the gate (not after it), so
+        // instruments the rule pass already admitted cannot suppress fallback
+        // on their own.
+        const groqParsed = groqText ? parseNativeVocabularyResponse(groqText) : undefined;
+        if (isAdmissible(groqParsed)) {
+          parsed = groqParsed;
+          parsedSource = 'GROQ';
+        }
       } catch (e: any) {
-        const msg = e?.message || String(e);
-        const isQuota = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota');
-        const is503 = msg.includes('503') || msg.includes('high demand');
-        if (isQuota) {
-          console.warn(`[Vocabulary Extraction] Gemini API quota limit reached (429) for channel ${channel.channel_id}. Falling back to heuristic vocabulary extraction.`);
-        } else if (is503) {
-          console.warn(`[Vocabulary Extraction] Gemini API temporarily busy (503) for channel ${channel.channel_id}. Heuristic extraction retained.`);
-        } else {
-          console.warn(`[Vocabulary Extraction] Notice for channel ${channel.channel_id}:`, msg.length > 150 ? msg.slice(0, 150) + '...' : msg);
+        console.warn(`[Vocabulary Extraction] Groq attempt skipped for channel ${channel.channel_id}; trying Gemini fallback.`);
+      }
+      if (!parsed && ai) {
+        try {
+          const response = await callGeminiSafe(() => executeProviderCall({context:{provider:'gemini',operation:'vocabulary-extraction',requestMetadata:{geminiRoute:resolveGeminiRouteId('gemini-1'),geminiOrg:geminiOrgIdForSlot(process.env,1)}},timeoutMs:Number(process.env.GEMINI_PROVIDER_TIMEOUT_MS||'45000'),enabled:process.env.PROVIDER_DEADLINES_ENABLED==='true',emit:appendProviderCallEvent,call:() => ai.models.generateContent({
+            model: 'gemini-3.6-flash',
+            contents: prompt
+          })}));
+
+          const resText = response.text || '';
+          if (aiRun) {
+            aiRun.attempts += 1;
+            aiRun.responseChars += resText.length;
+          }
+          parsed = parseNativeVocabularyResponse(resText);
+        } catch (e: any) {
+          if (aiRun) aiRun.attempts += 1;
+          const msg = e?.message || String(e);
+          const isQuota = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota');
+          const is503 = msg.includes('503') || msg.includes('high demand');
+          if (isQuota) {
+            console.warn(`[Vocabulary Extraction] Gemini API quota limit reached (429) for channel ${channel.channel_id}. Falling back to heuristic vocabulary extraction.`);
+          } else if (is503) {
+            console.warn(`[Vocabulary Extraction] Gemini API temporarily busy (503) for channel ${channel.channel_id}. Heuristic extraction retained.`);
+          } else {
+            console.warn(`[Vocabulary Extraction] Notice for channel ${channel.channel_id}:`, msg.length > 150 ? msg.slice(0, 150) + '...' : msg);
+          }
         }
       }
+      // The logical call is complete once the provider phase ends; admission
+      // failures below are persistence errors and must still surface as job
+      // retries without re-charging the AI budget for this metadata.
+      await finishAiRun(parsed ? 'SUCCEEDED' : 'FAILED', parsed ? parsedSource : ((aiRun?.attempts || 0) > 0 ? 'GROQ' : null));
     }
     if (parsed) {
         // Literal, traceable admission (native-v1 pipeline) via the shared
@@ -934,6 +1038,8 @@ Return ONLY a valid JSON object with format:
           humanApproved,
           humanObservation,
           extractor: parsedSource,
+          promotionEligible: options?.promotionEligible,
+          persistLegacyTerm: options?.persistLegacyTerm,
         });
     }
   }
@@ -1144,6 +1250,30 @@ export async function generateCandidateQueriesForCountry(
     getPublishedOrganicQueryCandidates(country)
   ]);
   const countryVocab = vocabs.find(v => v.country.toLowerCase() === country.toLowerCase());
+  // Free signals are candidate vocabulary only. Read stored signals when the
+  // flag is on; on a cold country, refresh once (provider failure falls back
+  // to terminology + seeds and never fails the cycle).
+  const freeSignalsEnabled = await getAppSetting('free_query_signals_enabled', 'true') === 'true';
+  let freeSignalCandidates: FreeSignalQueryCandidate[] = [];
+  if (freeSignalsEnabled) {
+    let signals = await getStoredFreeQuerySignals(country, { freshOnly: true }).catch(() => []);
+    if (!signals.length) {
+      await refreshFreeQuerySignalsForCountry(country, { timeoutMs: 2500 }).catch(() => undefined);
+      signals = await getStoredFreeQuerySignals(country, { freshOnly: true }).catch(() => []);
+    }
+    freeSignalCandidates = freeSignalToQueryCandidates(signals);
+  }
+  // Optional paid demand remains default-off and is only read when the paid
+  // adapter is explicitly enabled. Failure falls back to free signals/seeds.
+  const demandSignalsEnabled = await getAppSetting('query_demand_signals_enabled', 'false') === 'true';
+  const demandSignalCandidates: DemandSignalQueryCandidate[] = demandSignalsEnabled
+    ? (await getQueryDemandSignals(country, true).catch(() => [])).map(signal => ({
+        surface: signal.surface,
+        language: signal.language,
+        demandScore: signal.demandScore,
+        sourceIds: [signal.providerSignalId || `${signal.provider}:${signal.normalizedSurface}`],
+      }))
+    : [];
   const planned = planDiverseQueries({
     country,
     count,
@@ -1152,6 +1282,8 @@ export async function generateCandidateQueriesForCountry(
     existingQueries,
     provenTerminology,
     organicCandidates,
+    freeSignalCandidates,
+    demandSignalCandidates,
     mode,
     scopePromotionBasis: options.scopePromotionBasis
   });

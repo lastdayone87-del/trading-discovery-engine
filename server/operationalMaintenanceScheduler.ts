@@ -10,7 +10,7 @@ import { reconcileCommunityAcquisitionRecovery, reconcileLegacyCommunityRetryOwn
 import { COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_RETRY_REASON } from './communityRetryPolicy';
 import { projectProviderDeferredEnrichment, reconcileOperationalEnrichmentRecovery } from './operationalEnrichmentRecovery';
 import { triggerPhaseBObservationReconciliation } from './phaseBObservationOutbox';
-import { enqueueCommunityAcquisitionRetry, enqueueOperationalEnrichmentRecoveryJob } from './queueManager';
+import { enqueueCommunityAcquisitionRetry, enqueueOperationalEnrichmentRecoveryJob, resumeOrphanedAutonomousPages } from './queueManager';
 
 /**
  * Non-claim-critical maintenance cadence. Worker pools still tick every second
@@ -28,6 +28,7 @@ export interface OperationalMaintenanceDependencies {
   projectProviderDeferredEnrichment(): Promise<unknown>;
   reconcileOperationalEnrichmentRecovery(): Promise<unknown>;
   triggerPhaseBObservationReconciliation(): unknown;
+  resumeOrphanedAutonomousPages(): Promise<unknown>;
 }
 
 export interface OperationalMaintenanceSnapshot {
@@ -174,6 +175,7 @@ export function createOperationalMaintenanceScheduler(
     await isolate('provider_deferred_projection', () => dependencies.projectProviderDeferredEnrichment());
     await isolate('operational_enrichment_recovery', () => dependencies.reconcileOperationalEnrichmentRecovery());
     await isolate('phase_b_observation_reconciliation', () => dependencies.triggerPhaseBObservationReconciliation());
+    await isolate('autonomous_orphan_resume', () => dependencies.resumeOrphanedAutonomousPages());
   };
 
   const run = (): Promise<void> => {
@@ -272,7 +274,8 @@ function createDefaultDependencies(): OperationalMaintenanceDependencies {
       20,
       Date.now()
     ),
-    triggerPhaseBObservationReconciliation: () => triggerPhaseBObservationReconciliation()
+    triggerPhaseBObservationReconciliation: () => triggerPhaseBObservationReconciliation(),
+    resumeOrphanedAutonomousPages: () => resumeOrphanedAutonomousPages()
   };
 }
 

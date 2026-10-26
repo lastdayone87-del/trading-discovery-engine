@@ -15,7 +15,8 @@ const ALL_TASKS = [
   'legacy',
   'projection',
   'enrichment',
-  'phaseb'
+  'phaseb',
+  'resume'
 ];
 
 function createDeps(failAt?: string) {
@@ -32,7 +33,8 @@ function createDeps(failAt?: string) {
     reconcileLegacyCommunityRetryOwnership: make('legacy'),
     projectProviderDeferredEnrichment: make('projection'),
     reconcileOperationalEnrichmentRecovery: make('enrichment'),
-    triggerPhaseBObservationReconciliation: make('phaseb')
+    triggerPhaseBObservationReconciliation: make('phaseb'),
+    resumeOrphanedAutonomousPages: make('resume')
   };
   return { calls, dependencies };
 }
