@@ -1859,12 +1859,18 @@ export interface ContinuationResumePlan<T extends { country: string; runId: stri
  * marginal utility descending, oldest pending age, then run ID. One slot per
  * country per sweep is the stronger form of "no country gets a second before
  * every country gets a first"; the per-country cap remains the hard bound for
- * the deferred backlog. Exported for deterministic tests.
+ * the deferred backlog.
+ *
+ * `maxCountries` bounds how many countries one sweep may schedule. The cursor
+ * advances by the number selected, so when pending countries exceed the sweep
+ * limit every country is still reached within a bounded number of sweeps.
+ * Exported for deterministic tests.
  */
 export function planContinuationResume<T extends { country: string; runId: string; marginalUtility?: number; lastPageAt?: string | null }>(
   runs: T[],
   fairnessCursor: number,
   activeCountries: number,
+  maxCountries = Number.POSITIVE_INFINITY,
 ): ContinuationResumePlan<T> {
   const byCountry = new Map<string, T[]>();
   for (const run of runs) {
@@ -1880,13 +1886,17 @@ export function planContinuationResume<T extends { country: string; runId: strin
   const cursor = Number.isFinite(fairnessCursor) ? Math.max(0, Math.floor(fairnessCursor)) : 0;
   const rotation = cursor % countryOrder.length;
   const rotatedCountries = [...countryOrder.slice(rotation), ...countryOrder.slice(0, rotation)];
+  const countryBudget = Number.isFinite(maxCountries)
+    ? Math.max(0, Math.min(rotatedCountries.length, Math.trunc(maxCountries)))
+    : rotatedCountries.length;
+  const selectedCountries = rotatedCountries.slice(0, countryBudget);
   const age = (run: T) => {
     const parsed = run.lastPageAt ? Date.parse(run.lastPageAt) : Number.NaN;
     return Number.isFinite(parsed) ? parsed : Number.POSITIVE_INFINITY;
   };
   const selected: T[] = [];
   const selectedIds = new Set<string>();
-  for (const country of rotatedCountries) {
+  for (const country of selectedCountries) {
     const candidates = [...(byCountry.get(country) || [])].sort((a, b) =>
       Number(b.marginalUtility || 0) - Number(a.marginalUtility || 0)
       || age(a) - age(b)
@@ -1898,12 +1908,17 @@ export function planContinuationResume<T extends { country: string; runId: strin
     }
   }
   const deferred = runs.filter(run => !selectedIds.has(run.runId));
+  // A partial sweep advances by the number of countries it covered; a full
+  // sweep keeps the original one-country rotation so ordering still varies.
+  const advance = selectedCountries.length >= countryOrder.length
+    ? 1
+    : Math.max(1, selectedCountries.length);
   return {
     selected,
     deferred,
     perCountryCap: Math.ceil(runs.length / Math.max(1, activeCountries)) + 1,
     rotation,
-    nextFairnessCursor: (rotation + 1) % countryOrder.length,
+    nextFairnessCursor: (rotation + advance) % countryOrder.length,
     countryOrder: rotatedCountries,
   };
 }
@@ -1932,15 +1947,19 @@ export async function resumeOrphanedAutonomousPages(options: {
   if (!enabled || !v2Enabled || !cdlEnabled) {
     return { swept: true, enqueued: 0, skipped: 0, unavailable: 0 };
   }
-  const runs = await listPendingAutonomousRuns(options.limit || 50);
+  // The store returns one best candidate per pending country, without a
+  // global row limit, so the fairness cursor can rotate across every country.
+  const runs = await listPendingAutonomousRuns();
   if (!runs.length) return { swept: true, enqueued: 0, skipped: 0, unavailable: 0 };
   // Continuation fairness cursor: rotate countries every sweep so a low-yield
   // country cannot be starved by older high-yield pages. The cursor is
-  // independent of the new-query country cursor.
+  // independent of the new-query country cursor. `limit` bounds countries per
+  // sweep, not rows; the cursor advances by the number covered.
   const fairnessCursor = Math.max(0, Number(await getAppSetting('autonomous_continuation_fairness_cursor', '0')) || 0);
   const activeCountryKeys = await resolveActiveAutonomousCountryKeys();
   const activeCountries = Math.max(1, activeCountryKeys.size);
-  const plan = planContinuationResume(runs, fairnessCursor, activeCountries);
+  const sweepCountryLimit = Math.max(1, Math.min(500, Math.trunc(options.limit || 50) || 50));
+  const plan = planContinuationResume(runs, fairnessCursor, activeCountries, sweepCountryLimit);
   await setAppSetting('autonomous_continuation_fairness_cursor', String(plan.nextFairnessCursor)).catch(() => undefined);
   const orderedRuns = plan.selected;
   const perCountryCap = plan.perCountryCap;

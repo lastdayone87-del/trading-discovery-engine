@@ -809,14 +809,36 @@ test('P10: the reconciler enqueues exactly one idempotent child for a missing ne
   assert.match(queue, /\.\.\.\(searchWindow \? \{ searchWindow \} : \{\}\)/);
   assert.match(serverSource('autonomousPageStore.ts'), /qr\.requested_page_depth/);
   assert.match(serverSource('autonomousPageStore.ts'), /qr\.metadata/);
-  // Rank within each country before the global LIMIT so an early-country
-  // backlog cannot starve later countries out of the fairness rotation.
+  // Return exactly one best candidate per country and let the caller rotate
+  // over the full country set. A global LIMIT here would permanently exclude
+  // alphabetically later countries when pending countries exceed the limit.
   const pageStore = serverSource('autonomousPageStore.ts');
   assert.match(pageStore, /ROW_NUMBER\(\) OVER \(\s*PARTITION BY LOWER\(candidates\.country\)/);
-  assert.match(pageStore, /ORDER BY country_rank ASC,\s*LOWER\(country\) ASC/);
+  assert.match(pageStore, /WHERE country_rank = 1\s+ORDER BY LOWER\(country\) ASC/);
+  assert.ok(!/SELECT \* FROM ranked[\s\S]{0,400}?LIMIT \$1/.test(pageStore), 'no global LIMIT before fairness rotation');
+  assert.match(queue, /listPendingAutonomousRuns\(\)/);
+  assert.match(queue, /planContinuationResume\(runs, fairnessCursor, activeCountries, sweepCountryLimit\)/);
   assert.match(serverSource('dbCore.ts'), /requested_page_depth/);
   assert.match(serverSource('dbCore.ts'), /jsonb_set\(metadata,'\{searchWindow\}'/);
   assert.match(migration161(), /ADD COLUMN IF NOT EXISTS requested_page_depth INTEGER/);
+});
+
+test('P10b: the continuation sweep rotates across every pending country', () => {
+  const countries = ['Austria', 'Belgium', 'Chile', 'Denmark', 'Egypt', 'Finland'];
+  const runs = countries.map(country => ({ country, runId: `${country}-0`, marginalUtility: 0.5 }));
+  const covered: string[] = [];
+  let cursor = 0;
+  for (let sweep = 0; sweep < 3; sweep++) {
+    const plan = planContinuationResume(runs, cursor, countries.length, 2);
+    assert.equal(plan.selected.length, 2);
+    assert.equal(plan.selected.length + plan.deferred.length, runs.length, 'no run is dropped');
+    covered.push(...plan.selected.map(run => run.country));
+    cursor = plan.nextFairnessCursor;
+  }
+  // Three two-country sweeps cover all six countries instead of revisiting
+  // the alphabetically first two.
+  assert.deepEqual(covered, countries);
+  assert.equal(cursor, 0);
 });
 
 test('P11: official YouTube resume uses the durable next-page token without a rewalk', () => {

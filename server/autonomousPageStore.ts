@@ -340,20 +340,20 @@ export interface PendingAutonomousRun {
 }
 
 /**
- * Runs eligible for the orphan reconciler. Rows are grouped by country and
- * ordered within a country by marginal utility descending, then oldest
- * pending age, then run ID. The caller applies the continuation fairness
- * cursor, the one-slot-per-country rule, the per-country cap, and quota
- * admission.
+ * Runs eligible for the orphan reconciler: exactly one best candidate per
+ * country, ordered by country. Rows are ranked within a country by marginal
+ * utility descending, then oldest pending age, then run ID. There is no global
+ * row limit here: a limit applied before the fairness rotation would exclude
+ * alphabetically later countries permanently when the pending-country count
+ * exceeds the limit. The caller rotates over this full country set and applies
+ * the per-sweep country limit, the one-slot-per-country rule, the per-country
+ * cap, and quota admission.
  */
-export async function listPendingAutonomousRuns(limit = 50): Promise<PendingAutonomousRun[]> {
+export async function listPendingAutonomousRuns(): Promise<PendingAutonomousRun[]> {
   const db = await getDb();
   const result = await db.query(
-    // Rank within each country before applying the global LIMIT. A plain
-    // country-ordered LIMIT lets a large backlog in alphabetically early
-    // countries consume every slot, so later countries are never represented
-    // in the fairness rotation. Returning each country's best candidate first
-    // guarantees the reconciler can rotate across all active countries.
+    // Rank within each country, then return only each country's best
+    // candidate. The caller's fairness cursor rotates across every country.
     `WITH candidates AS (
        SELECT qr.id, qr.query_id, ql.query, qr.country, qr.source, qr.pages_completed,
               qr.next_page_token, qr.resume_mode, qr.continuation_status, qr.deferred_until,
@@ -393,13 +393,11 @@ export async function listPendingAutonomousRuns(limit = 50): Promise<PendingAuto
        FROM candidates
      )
      SELECT * FROM ranked
-     ORDER BY country_rank ASC,
-              LOWER(country) ASC,
+     WHERE country_rank = 1
+     ORDER BY LOWER(country) ASC,
               marginal_utility DESC,
               resume_at ASC,
-              id ASC
-     LIMIT $1`,
-    [Math.max(1, Math.min(500, Math.trunc(limit) || 50))],
+              id ASC`,
   );
   return result.rows.map((row: Record<string, unknown>) => ({
     runId: String(row.id),
