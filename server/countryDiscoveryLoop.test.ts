@@ -462,6 +462,49 @@ test('A6: provider rate-limit failure degrades to seeds without failing the cycl
     assert.equal(recovered.degraded, false);
     assert.notEqual(recovered.fromCache, true);
 
+    // A partial failure with an empty result must not be cached either: the
+    // failed provider can recover on the next cycle, and the successful one
+    // may simply have had no matches this time.
+    resetFreeQuerySignalCacheForTests();
+    let partialRequests = 0;
+    const partialFetch = (async (url: string) => {
+      partialRequests += 1;
+      if (String(url).includes('wikipedia.org')) throw new Error('HTTP_500');
+      return { ok: true, json: async () => ({ search: [] }) } as unknown as Response;
+    }) as unknown as typeof fetch;
+    const partial = await fetchFreeQuerySignals({
+      country: 'Germany',
+      language: 'de',
+      fetchImpl: partialFetch,
+      userAgent: TEST_WIKIMEDIA_USER_AGENT,
+      now: new Date('2026-10-26T00:00:01Z'),
+    });
+    assert.equal(partial.degraded, false);
+    assert.equal(partial.signals.length, 0);
+    assert.equal(partialRequests, 2);
+
+    let retryRequests = 0;
+    const retryFetch = (async (url: string) => {
+      retryRequests += 1;
+      if (String(url).includes('wikipedia.org')) {
+        return { ok: true, json: async () => ({ query: { search: [{ title: 'DAX', pageid: 1 }] } }) } as unknown as Response;
+      }
+      return { ok: true, json: async () => ({ search: [{ id: 'Q1', label: 'Charttechnik', aliases: [] }] }) } as unknown as Response;
+    }) as unknown as typeof fetch;
+    const retried = await fetchFreeQuerySignals({
+      country: 'Germany',
+      language: 'de',
+      fetchImpl: retryFetch,
+      userAgent: TEST_WIKIMEDIA_USER_AGENT,
+      now: new Date('2026-10-26T00:00:02Z'),
+    });
+    assert.equal(retryRequests, 2, 'a partial failure with an empty result is retried');
+    assert.ok(retried.signals.length > 0);
+    assert.match(
+      serverSource('freeQuerySignals.ts'),
+      /deduped\.length > 0 \|\| errors\.length === 0/,
+    );
+
     // Wikimedia policy requires a real contact/URL. The fallback names the
     // missing deployment prerequisite rather than embedding a fake address.
     assert.ok(!WIKIMEDIA_USER_AGENT_FALLBACK.includes('example.invalid'));
@@ -766,6 +809,11 @@ test('P10: the reconciler enqueues exactly one idempotent child for a missing ne
   assert.match(queue, /\.\.\.\(searchWindow \? \{ searchWindow \} : \{\}\)/);
   assert.match(serverSource('autonomousPageStore.ts'), /qr\.requested_page_depth/);
   assert.match(serverSource('autonomousPageStore.ts'), /qr\.metadata/);
+  // Rank within each country before the global LIMIT so an early-country
+  // backlog cannot starve later countries out of the fairness rotation.
+  const pageStore = serverSource('autonomousPageStore.ts');
+  assert.match(pageStore, /ROW_NUMBER\(\) OVER \(\s*PARTITION BY LOWER\(candidates\.country\)/);
+  assert.match(pageStore, /ORDER BY country_rank ASC,\s*LOWER\(country\) ASC/);
   assert.match(serverSource('dbCore.ts'), /requested_page_depth/);
   assert.match(serverSource('dbCore.ts'), /jsonb_set\(metadata,'\{searchWindow\}'/);
   assert.match(migration161(), /ADD COLUMN IF NOT EXISTS requested_page_depth INTEGER/);
@@ -1036,17 +1084,17 @@ test('T7: two independent external sources/families validate; a single source or
   const two = evaluateExternalTermEvidence({
     term: 'Charttechnik', aliases: [], language: 'de', script: 'LATIN', now,
     rows: [
-      { sourceId: 's1', sourceFamily: 'NEWS', correlationKey: 'a', observedAt: '2026-10-25T00:00:00Z', confidence: 0.9, reliability: 0.9, relevance: 0.9, surface: 'charttechnik', language: 'de', script: 'LATIN' },
-      { sourceId: 's2', sourceFamily: 'BLOG', correlationKey: 'b', observedAt: '2026-10-25T00:00:00Z', confidence: 0.8, reliability: 0.8, relevance: 0.8, surface: 'Charttechnik', language: 'de', script: 'LATIN' },
+      { sourceId: 's1', sourceFamily: 'PUBLICATION', correlationKey: 'a', observedAt: '2026-10-25T00:00:00Z', confidence: 0.9, reliability: 0.9, relevance: 0.9, surface: 'charttechnik', language: 'de', script: 'LATIN' },
+      { sourceId: 's2', sourceFamily: 'PUBLIC_COMMUNITY', correlationKey: 'b', observedAt: '2026-10-25T00:00:00Z', confidence: 0.8, reliability: 0.8, relevance: 0.8, surface: 'Charttechnik', language: 'de', script: 'LATIN' },
     ],
   });
   assert.equal(two.eligible, true);
   assert.equal(two.independentSources, 2);
-  assert.deepEqual(two.families, ['BLOG', 'NEWS']);
+  assert.deepEqual(two.families, ['PUBLICATION', 'PUBLIC_COMMUNITY']);
 
   const single = evaluateExternalTermEvidence({
     term: 'Charttechnik', aliases: [], language: 'de', script: 'LATIN', now,
-    rows: [{ sourceId: 's1', sourceFamily: 'NEWS', correlationKey: 'a', observedAt: '2026-10-25T00:00:00Z', confidence: 0.9, reliability: 0.9, relevance: 0.9, surface: 'charttechnik', language: 'de', script: 'LATIN' }],
+    rows: [{ sourceId: 's1', sourceFamily: 'PUBLICATION', correlationKey: 'a', observedAt: '2026-10-25T00:00:00Z', confidence: 0.9, reliability: 0.9, relevance: 0.9, surface: 'charttechnik', language: 'de', script: 'LATIN' }],
   });
   assert.equal(single.eligible, false);
   assert.ok(single.reasons.includes('INSUFFICIENT_INDEPENDENT_SOURCES'));
@@ -1056,8 +1104,8 @@ test('T7: two independent external sources/families validate; a single source or
   const futureDated = evaluateExternalTermEvidence({
     term: 'Charttechnik', aliases: [], language: 'de', script: 'LATIN', now,
     rows: [
-      { sourceId: 's1', sourceFamily: 'NEWS', correlationKey: 'a', observedAt: '2026-10-27T00:00:00Z', confidence: 0.9, reliability: 0.9, relevance: 0.9, surface: 'charttechnik', language: 'de', script: 'LATIN' },
-      { sourceId: 's2', sourceFamily: 'BLOG', correlationKey: 'b', observedAt: '2026-10-27T00:00:00Z', confidence: 0.8, reliability: 0.8, relevance: 0.8, surface: 'Charttechnik', language: 'de', script: 'LATIN' },
+      { sourceId: 's1', sourceFamily: 'PUBLICATION', correlationKey: 'a', observedAt: '2026-10-27T00:00:00Z', confidence: 0.9, reliability: 0.9, relevance: 0.9, surface: 'charttechnik', language: 'de', script: 'LATIN' },
+      { sourceId: 's2', sourceFamily: 'PUBLIC_COMMUNITY', correlationKey: 'b', observedAt: '2026-10-27T00:00:00Z', confidence: 0.8, reliability: 0.8, relevance: 0.8, surface: 'Charttechnik', language: 'de', script: 'LATIN' },
     ],
   });
   assert.equal(futureDated.eligible, false);
@@ -1075,7 +1123,7 @@ test('T7: two independent external sources/families validate; a single source or
   // five buckets reach the same 5-unit trial threshold without native data.
   const externalRows = Array.from({ length: 5 }, (_, index) => ({
     source_id: `source-${index + 1}`,
-    source_family: ['NEWS', 'BLOG', 'FORUM', 'SOCIAL', 'VIDEO'][index],
+    source_family: ['PUBLICATION', 'PUBLIC_COMMUNITY', 'EDUCATOR_DIRECTORY', 'BROKER_TERMINOLOGY', 'PUBLICATION'][index],
     correlation_key: `bucket-${index + 1}`,
     observed_at: new Date().toISOString(),
     confidence: 0.9,
@@ -1098,6 +1146,13 @@ test('T7: two independent external sources/families validate; a single source or
   const lifecycle = externalOnly.calls.find(call => call.text.startsWith('UPDATE canonical_trading_terms'));
   assert.equal(lifecycle?.params[1], 'SEARCH_TRIAL');
   assert.equal(lifecycle?.params[2], true);
+  // Corroboration is filtered by the local surface in SQL before the LIMIT;
+  // a country-wide LIMIT in JavaScript could hide valid evidence behind 1,000
+  // newer rows for other terms.
+  const terminology = serverSource('terminologyIntelligence.ts');
+  assert.match(terminology, /lower\(btrim\(regexp_replace\(normalize\(original_surface, NFKC\)/);
+  assert.match(terminology, /ANY\(\$2::text\[\]\)/);
+  assert.match(migration161(), /idx_external_osint_surface_country/);
 });
 
 test('T8: two native plus one external validates; one native plus one external does not', () => {
@@ -1347,6 +1402,15 @@ test('E1: with CDL/v2 flags off, only the existing quality>=55 path remains', ()
     ingestion.indexOf('export interface Inge'),
   );
   assert.ok(!helper.includes('discovery_extraction_enabled'));
+  // The AI ledger is the only authorized provider-spend path. Turning the
+  // native gates off preserves the legacy quality path but must not bypass the
+  // daily cap, so there is no uncharged AI branch left to select.
+  const query = serverSource('queryIntelligence.ts');
+  assert.ok(!query.includes('budgetDisabled'));
+  assert.ok(!query.includes('aiBudgetEnabled'));
+  assert.ok(!ingestion.includes('aiBudgetEnabled'));
+  assert.match(query, /const reservation = await reserveNativeVocabularyAiRun\(/);
+  assert.match(query, /if \(!replayRun && aiRun\) \{/);
 });
 
 test('E2: an active country-valid low-quality trader runs extraction without promotion or legacy vocabulary', () => {
@@ -1640,6 +1704,14 @@ test('O2: a failed migration, orphan page, or provider canary makes the deploy g
   // Empty windows stay NULL through aggregation and are skipped by evaluator.
   assert.match(healthSource, /\(AVG\(duplicate_ratio\) FILTER/);
   assert.match(healthSource, /recent: safetyRow\.duplicate_recent == null \? null/);
+  // Pending age is filtered to pending runs: completed runs must not inflate
+  // the age of an idle country. Official YouTube telemetry and run usage use
+  // different provider names, so the metrics join normalizes them.
+  assert.match(
+    healthSource,
+    /FILTER \(WHERE qr\.continuation_status IN \('RUNNING','DEFERRED_QUOTA','DEFERRED_TIME'\)\),0\)::float AS oldest_pending_age_minutes/,
+  );
+  assert.match(healthSource, /provider_key='youtube-search' THEN 'youtube'/);
 
   const server = serverSource('../server.ts');
   assert.match(server, /app\.get\('\/api\/country-discovery\/health'/);

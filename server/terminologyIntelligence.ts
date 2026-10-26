@@ -1429,14 +1429,28 @@ async function readExternalTermEvidence(
     `SELECT normalized_alias FROM trading_term_aliases WHERE canonical_term_id=$1`,
     [termId],
   ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
-  const rows = await runner.query(
-    `SELECT source_id, source_family, correlation_key, observed_at, confidence, reliability, relevance,
-            original_surface, language, script
-     FROM external_osint_observations
-     WHERE country=$1 AND observed_at >= now() - interval '30 days'
-     ORDER BY observed_at DESC LIMIT 1000`,
-    [term.country],
-  ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
+  // Match the term and its governed aliases in SQL before the LIMIT. Filtering
+  // only in JavaScript after a country-wide LIMIT can drop valid corroboration
+  // when a country has more than 1,000 newer external rows for other terms.
+  // The SQL normalization mirrors normalizeTerm (NFKC, whitespace collapse,
+  // trim, lowercase), so the index remains usable and the JS re-check stays.
+  const targetSurfaces = [...new Set(
+    [term.canonical_term, ...(aliases.rows || []).map(row => row.normalized_alias)]
+      .map(value => normalizeTerm(String(value || '')))
+      .filter(Boolean),
+  )];
+  const rows = targetSurfaces.length === 0
+    ? { rows: [] as Array<Record<string, unknown>> }
+    : await runner.query(
+      `SELECT source_id, source_family, correlation_key, observed_at, confidence, reliability, relevance,
+              original_surface, language, script
+       FROM external_osint_observations
+       WHERE country=$1
+         AND observed_at >= now() - interval '30 days'
+         AND lower(btrim(regexp_replace(normalize(original_surface, NFKC), '[[:space:]]+', ' ', 'g'))) = ANY($2::text[])
+       ORDER BY observed_at DESC LIMIT 1000`,
+      [term.country, targetSurfaces],
+    ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
   return evaluateExternalTermEvidence({
     term: String(term.canonical_term || ''),
     aliases: (aliases.rows || []).map(row => String(row.normalized_alias || '')),

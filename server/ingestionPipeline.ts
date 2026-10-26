@@ -982,7 +982,6 @@ async function processChannelThroughPipelineInContext(
     await invokeChannelVocabularyExtraction(finalChannel, candidate, selectExplicitTerminologyLanguageContext(candidate), undefined, {
       promotionEligible: extraction.promotionEligible,
       persistLegacyTerm: extraction.persistLegacyTerm,
-      aiBudgetEnabled: extraction.nativeExtractionEnabled,
       queryRunId: options?.runId || candidate.queryRunId,
       queryPageNumber: candidate.queryPageNumber,
     });

@@ -56,6 +56,17 @@ CREATE INDEX IF NOT EXISTS idx_term_obs_run_page
   ON terminology_observations(query_run_id, query_page_number)
   WHERE query_run_id IS NOT NULL;
 
+-- External terminology corroboration is looked up by the local surface, not
+-- only by country: filtering a country-wide LIMIT in JavaScript can drop a
+-- term's valid evidence behind 1,000 newer rows for other terms. The
+-- expression mirrors normalizeTerm (NFKC, whitespace collapse, trim, lower).
+CREATE INDEX IF NOT EXISTS idx_external_osint_surface_country
+  ON external_osint_observations(
+    country,
+    lower(btrim(regexp_replace(normalize(original_surface, NFKC), '[[:space:]]+', ' ', 'g'))),
+    observed_at DESC
+  );
+
 -- ---------------------------------------------------------------------------
 -- 2. Page economics and continuation audit
 -- ---------------------------------------------------------------------------

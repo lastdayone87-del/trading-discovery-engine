@@ -343,38 +343,55 @@ export interface PendingAutonomousRun {
 export async function listPendingAutonomousRuns(limit = 50): Promise<PendingAutonomousRun[]> {
   const db = await getDb();
   const result = await db.query(
-    `SELECT qr.id, qr.query_id, ql.query, qr.country, qr.source, qr.pages_completed,
-            qr.next_page_token, qr.resume_mode, qr.continuation_status, qr.deferred_until,
-            qr.last_page_at, qr.exploration_pages_remaining, qr.retrieval_lane,
-            qr.search_ordering, qr.retrieval_config_key, qr.retrieval_treatment_origin,
-            qr.requested_page_depth, qr.metadata, qr.provider_allocation_snapshot,
-            COALESCE((
-              SELECT p.marginal_utility_v2
-              FROM autonomous_query_page_observations p
-              WHERE p.query_run_id=qr.id
-              ORDER BY p.page_number DESC LIMIT 1
-            ),0) AS marginal_utility
-     FROM query_runs qr
-     JOIN query_library ql ON ql.id=qr.query_id
-     WHERE qr.continuation_status IN ('RUNNING','DEFERRED_QUOTA','DEFERRED_TIME')
-       AND qr.status NOT IN ('COMPLETED','FAILED')
-       AND (qr.deferred_until IS NULL OR qr.deferred_until <= now())
-       -- A live page job already owns this run. Only PENDING/PROCESSING
-       -- block recovery: a COMPLETED/FAILED job whose page observation is
-       -- missing is a deferred page and must be reopenable.
-       AND NOT EXISTS (
-         SELECT 1 FROM jobs j
-         WHERE j.status IN ('PENDING','PROCESSING')
-           AND (
-             j.idempotency_key = 'search-run:'||qr.id
-             OR j.idempotency_key = 'search-run:'||qr.id||':page:1'
-             OR j.idempotency_key = 'search-run:'||qr.id||':page:'||GREATEST(qr.pages_completed+1,1)
-           )
-       )
-     ORDER BY LOWER(qr.country) ASC,
+    // Rank within each country before applying the global LIMIT. A plain
+    // country-ordered LIMIT lets a large backlog in alphabetically early
+    // countries consume every slot, so later countries are never represented
+    // in the fairness rotation. Returning each country's best candidate first
+    // guarantees the reconciler can rotate across all active countries.
+    `WITH candidates AS (
+       SELECT qr.id, qr.query_id, ql.query, qr.country, qr.source, qr.pages_completed,
+              qr.next_page_token, qr.resume_mode, qr.continuation_status, qr.deferred_until,
+              qr.last_page_at, qr.exploration_pages_remaining, qr.retrieval_lane,
+              qr.search_ordering, qr.retrieval_config_key, qr.retrieval_treatment_origin,
+              qr.requested_page_depth, qr.metadata, qr.provider_allocation_snapshot,
+              COALESCE(qr.last_page_at, qr.started_at, qr.scheduled_at) AS resume_at,
+              COALESCE((
+                SELECT p.marginal_utility_v2
+                FROM autonomous_query_page_observations p
+                WHERE p.query_run_id=qr.id
+                ORDER BY p.page_number DESC LIMIT 1
+              ),0) AS marginal_utility
+       FROM query_runs qr
+       JOIN query_library ql ON ql.id=qr.query_id
+       WHERE qr.continuation_status IN ('RUNNING','DEFERRED_QUOTA','DEFERRED_TIME')
+         AND qr.status NOT IN ('COMPLETED','FAILED')
+         AND (qr.deferred_until IS NULL OR qr.deferred_until <= now())
+         -- A live page job already owns this run. Only PENDING/PROCESSING
+         -- block recovery: a COMPLETED/FAILED job whose page observation is
+         -- missing is a deferred page and must be reopenable.
+         AND NOT EXISTS (
+           SELECT 1 FROM jobs j
+           WHERE j.status IN ('PENDING','PROCESSING')
+             AND (
+               j.idempotency_key = 'search-run:'||qr.id
+               OR j.idempotency_key = 'search-run:'||qr.id||':page:1'
+               OR j.idempotency_key = 'search-run:'||qr.id||':page:'||GREATEST(qr.pages_completed+1,1)
+             )
+         )
+     ), ranked AS (
+       SELECT candidates.*,
+              ROW_NUMBER() OVER (
+                PARTITION BY LOWER(candidates.country)
+                ORDER BY candidates.marginal_utility DESC, candidates.resume_at ASC, candidates.id ASC
+              ) AS country_rank
+       FROM candidates
+     )
+     SELECT * FROM ranked
+     ORDER BY country_rank ASC,
+              LOWER(country) ASC,
               marginal_utility DESC,
-              COALESCE(qr.last_page_at, qr.started_at, qr.scheduled_at) ASC,
-              qr.id ASC
+              resume_at ASC,
+              id ASC
      LIMIT $1`,
     [Math.max(1, Math.min(500, Math.trunc(limit) || 50))],
   );

@@ -627,7 +627,6 @@ export async function invokeChannelVocabularyExtraction(
   options?: {
     promotionEligible?: boolean;
     persistLegacyTerm?: boolean;
-    aiBudgetEnabled?: boolean;
     queryRunId?: string;
     queryPageNumber?: number;
   }
@@ -819,7 +818,6 @@ export async function extractVocabularyFromCreator(
   options?: {
     promotionEligible?: boolean;
     persistLegacyTerm?: boolean;
-    aiBudgetEnabled?: boolean;
     /** Autonomous run/page provenance for exact novel-term attribution. */
     queryRunId?: string;
     queryPageNumber?: number;
@@ -923,43 +921,44 @@ Return ONLY a valid JSON object with format:
     // Interrupted call replay: the parsed response is durable, so admission
     // runs again without another provider call or a second budget charge.
     let replayRun: { requestId: string; payload: Record<string, unknown>; provider: string | null; attempts: number } | null = null;
-    const budgetDisabled = options?.aiBudgetEnabled === false;
-    if (!budgetDisabled) {
-      const metadataHash = computeNativeVocabularyMetadataHash([
-        channel.channel_name,
-        effDesc,
-        ...effTitles,
-        languageContext?.language,
-        languageContext?.locale,
-      ]);
-      const budgetDay = getYouTubeQuotaDay();
-      const requestId = computeNativeVocabularyRequestId({ channelId: channel.channel_id, metadataHash, budgetDay });
-      const reservation = await reserveNativeVocabularyAiRun({
+    // Every AI call is budgeted, including the legacy quality-gated path when
+    // the CDL flags are off. The ledger is the only authorized provider-spend
+    // path, so no caller can bypass the daily cap by disabling the new native
+    // extraction gates. A skipped/exhausted budget still leaves rule evidence.
+    const metadataHash = computeNativeVocabularyMetadataHash([
+      channel.channel_name,
+      effDesc,
+      ...effTitles,
+      languageContext?.language,
+      languageContext?.locale,
+    ]);
+    const budgetDay = getYouTubeQuotaDay();
+    const requestId = computeNativeVocabularyRequestId({ channelId: channel.channel_id, metadataHash, budgetDay });
+    const reservation = await reserveNativeVocabularyAiRun({
+      requestId,
+      channelId: channel.channel_id,
+      country: channel.country,
+      metadataHash,
+      budgetDay,
+    });
+    if (reservation.admitted) {
+      aiRun = { requestId, promptChars: prompt.length, attempts: 0, responseChars: 0 };
+    } else if (reservation.reason === 'REPLAY_RESPONSE' && reservation.replayPayload) {
+      replayRun = {
         requestId,
-        channelId: channel.channel_id,
-        country: channel.country,
-        metadataHash,
-        budgetDay,
-      });
-      if (reservation.admitted) {
-        aiRun = { requestId, promptChars: prompt.length, attempts: 0, responseChars: 0 };
-      } else if (reservation.reason === 'REPLAY_RESPONSE' && reservation.replayPayload) {
-        replayRun = {
-          requestId,
-          payload: reservation.replayPayload,
-          provider: reservation.provider || null,
-          attempts: Math.max(1, reservation.attempts || 1),
-        };
-        parsed = replayRun.payload;
-        parsedSource = replayRun.provider === 'GROQ' ? 'GROQ' : 'GEMINI';
-        console.warn(
-          `[Vocabulary Extraction] Replaying stored AI response for channel ${channel.channel_id}; no provider call is repeated.`
-        );
-      } else {
-        console.warn(
-          `[Vocabulary Extraction] AI budget skipped for channel ${channel.channel_id}: ${reservation.reason}. Rule-based evidence retained.`
-        );
-      }
+        payload: reservation.replayPayload,
+        provider: reservation.provider || null,
+        attempts: Math.max(1, reservation.attempts || 1),
+      };
+      parsed = replayRun.payload;
+      parsedSource = replayRun.provider === 'GROQ' ? 'GROQ' : 'GEMINI';
+      console.warn(
+        `[Vocabulary Extraction] Replaying stored AI response for channel ${channel.channel_id}; no provider call is repeated.`
+      );
+    } else {
+      console.warn(
+        `[Vocabulary Extraction] AI budget skipped for channel ${channel.channel_id}: ${reservation.reason}. Rule-based evidence retained.`
+      );
     }
     const finishAiRun = async (status: 'SUCCEEDED' | 'FAILED', provider: 'GROQ' | 'GEMINI' | null) => {
       if (!aiRun) return;
@@ -992,7 +991,7 @@ Return ONLY a valid JSON object with format:
     // Groq primary: same prompt, same parser, same admission below. Any
     // Groq failure (no keys, deferral, 429, error) falls through to the
     // unchanged Gemini path; total failure keeps warn-and-skip.
-    if (!replayRun && (aiRun || budgetDisabled)) {
+    if (!replayRun && aiRun) {
       try {
         const { runGroqTextCompletion } = await import('./evidenceEngine/providers/GroqSemanticProvider');
         const groqText = await runGroqTextCompletion(

@@ -693,7 +693,10 @@ async function gatherCountryDiscoveryMetricsUncached(clientOverride?: HealthRunn
               COALESCE(AVG(CASE WHEN p.country_precision < 0.5 THEN 1.0 ELSE 0.0 END),0)::float AS wrong_country_share,
               COALESCE(AVG(p.duplicate_ratio),0)::float AS duplicate_rate,
               COUNT(DISTINCT qr.id) FILTER (WHERE qr.continuation_status IN ('RUNNING','DEFERRED_QUOTA','DEFERRED_TIME'))::int AS pending_continuations,
-              COALESCE(MAX(EXTRACT(EPOCH FROM (now()-COALESCE(qr.last_page_at,qr.started_at,qr.scheduled_at)))/60),0)::float AS oldest_pending_age_minutes
+              -- Age is measured over pending runs only: a completed run must
+              -- not make an idle country look like it has an old continuation.
+              COALESCE(MAX(EXTRACT(EPOCH FROM (now()-COALESCE(qr.last_page_at,qr.started_at,qr.scheduled_at)))/60)
+                FILTER (WHERE qr.continuation_status IN ('RUNNING','DEFERRED_QUOTA','DEFERRED_TIME')),0)::float AS oldest_pending_age_minutes
        FROM query_runs qr
        LEFT JOIN autonomous_query_page_observations p ON p.query_run_id=qr.id
        GROUP BY qr.country ORDER BY qr.country`,
@@ -759,7 +762,12 @@ async function gatherCountryDiscoveryMetricsUncached(clientOverride?: HealthRunn
          WHERE occurred_at >= now()-interval '24 hours'
          GROUP BY provider
        ), usage AS (
-         SELECT COALESCE(provider_key,'UNKNOWN') AS provider,
+         -- Official YouTube runs persist provider_key='youtube-search' while
+         -- provider_call_events uses provider='youtube'. Normalize the run key
+         -- so calls and pages join into one provider row instead of splitting
+         -- into a calls-only row and a pages-only row.
+         SELECT CASE WHEN provider_key='youtube-search' THEN 'youtube'
+                     ELSE COALESCE(provider_key,'UNKNOWN') END AS provider,
                 COALESCE(SUM(pages_completed),0)::int AS pages,
                 COALESCE(SUM(quota_used),0)::int AS quota_units,
                 COALESCE(SUM(provider_cost_usd),0)::float AS provider_cost_usd

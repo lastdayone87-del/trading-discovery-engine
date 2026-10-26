@@ -347,9 +347,13 @@ export async function fetchFreeQuerySignals(args: {
     ...(errors.length ? { error: errors.join('; ') } : {}),
   };
   // A fully degraded fetch is not cached: caching it for 24h would suppress
-  // recovery on the next cycle after a transient outage. Partial results are
-  // still cached because at least one provider supplied usable signals.
-  if (!result.degraded) cache.set(cacheKey, { at: now.getTime(), result });
+  // recovery on the next cycle after a transient outage. A partially failed
+  // fetch with usable signals is cached, but a partially failed fetch with an
+  // empty result is not: the successful provider may simply have had no
+  // matches while the failed one could recover on the next cycle.
+  if (!result.degraded && (deduped.length > 0 || errors.length === 0)) {
+    cache.set(cacheKey, { at: now.getTime(), result });
+  }
   return result;
 }
 
