@@ -340,20 +340,32 @@ export interface PendingAutonomousRun {
 }
 
 /**
- * Runs eligible for the orphan reconciler: exactly one best candidate per
- * country, ordered by country. Rows are ranked within a country by marginal
- * utility descending, then oldest pending age, then run ID. There is no global
- * row limit here: a limit applied before the fairness rotation would exclude
- * alphabetically later countries permanently when the pending-country count
- * exceeds the limit. The caller rotates over this full country set and applies
- * the per-sweep country limit, the one-slot-per-country rule, the per-country
- * cap, and quota admission.
+ * Fallback candidates retained per country. A blocked top run (for example a
+ * treatment page whose incremental reservation was denied) must not prevent
+ * another eligible run in the same country from resuming, so the reconciler
+ * receives a small ranked list per country and tries the next candidate when
+ * one cannot be scheduled. At most one run per country is enqueued per sweep.
  */
-export async function listPendingAutonomousRuns(): Promise<PendingAutonomousRun[]> {
+export const AUTONOMOUS_CONTINUATION_CANDIDATES_PER_COUNTRY = 5;
+
+/**
+ * Runs eligible for the orphan reconciler: up to
+ * `AUTONOMOUS_CONTINUATION_CANDIDATES_PER_COUNTRY` best candidates per
+ * country, ordered by country and within a country by marginal utility
+ * descending, then oldest pending age, then run ID. There is no global row
+ * limit here: a limit applied before the fairness rotation would exclude
+ * alphabetically later countries permanently when the pending-country count
+ * exceeds the limit. The caller rotates over the full country set, bounds the
+ * countries per sweep, and allows at most one successful enqueue per country.
+ */
+export async function listPendingAutonomousRuns(
+  perCountryLimit = AUTONOMOUS_CONTINUATION_CANDIDATES_PER_COUNTRY,
+): Promise<PendingAutonomousRun[]> {
   const db = await getDb();
+  const perCountry = Math.max(1, Math.min(20, Math.trunc(perCountryLimit) || AUTONOMOUS_CONTINUATION_CANDIDATES_PER_COUNTRY));
   const result = await db.query(
-    // Rank within each country, then return only each country's best
-    // candidate. The caller's fairness cursor rotates across every country.
+    // Rank within each country, then retain a small fallback list per country.
+    // The caller's fairness cursor rotates across every country.
     `WITH candidates AS (
        SELECT qr.id, qr.query_id, ql.query, qr.country, qr.source, qr.pages_completed,
               qr.next_page_token, qr.resume_mode, qr.continuation_status, qr.deferred_until,
@@ -393,11 +405,13 @@ export async function listPendingAutonomousRuns(): Promise<PendingAutonomousRun[
        FROM candidates
      )
      SELECT * FROM ranked
-     WHERE country_rank = 1
+     WHERE country_rank <= $1
      ORDER BY LOWER(country) ASC,
+              country_rank ASC,
               marginal_utility DESC,
               resume_at ASC,
               id ASC`,
+    [perCountry],
   );
   return result.rows.map((row: Record<string, unknown>) => ({
     runId: String(row.id),

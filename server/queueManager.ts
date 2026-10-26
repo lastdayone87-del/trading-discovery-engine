@@ -96,6 +96,7 @@ import { getNextYouTubeQuotaResetAt } from './youtubeQuotaDay';
 import { shouldReactivateCommunityRecovery, reactivateCommunityRecovery, projectTerminalCommunityRetryFailure } from './communityRecovery';
 import { isProviderDeferredEnrichmentError } from './enrichmentOperationalFailure';
 import {
+  AUTONOMOUS_CONTINUATION_CANDIDATES_PER_COUNTRY,
   autonomousPageExists,
   countNovelCandidateTermsForPage,
   getAutonomousContinuationState,
@@ -1842,7 +1843,11 @@ export async function processNextSearchJob(
 }
 
 export interface ContinuationResumePlan<T extends { country: string; runId: string; marginalUtility?: number; lastPageAt?: string | null }> {
-  /** At most one run per country, in rotated country order. */
+  /**
+   * Ranked candidates in rotated country order. The default is one run per
+   * country; callers may retain a fallback list per country so a blocked top
+   * candidate can be skipped without starving the country.
+   */
   selected: T[];
   /** Pending runs that stay deferred to a later sweep; never dropped. */
   deferred: T[];
@@ -1864,6 +1869,8 @@ export interface ContinuationResumePlan<T extends { country: string; runId: stri
  * `maxCountries` bounds how many countries one sweep may schedule. The cursor
  * advances by the number selected, so when pending countries exceed the sweep
  * limit every country is still reached within a bounded number of sweeps.
+ * `maxCandidatesPerCountry` retains ranked fallbacks; the reconciler tries
+ * them in order until one enqueues, then skips the rest for that country.
  * Exported for deterministic tests.
  */
 export function planContinuationResume<T extends { country: string; runId: string; marginalUtility?: number; lastPageAt?: string | null }>(
@@ -1871,6 +1878,7 @@ export function planContinuationResume<T extends { country: string; runId: strin
   fairnessCursor: number,
   activeCountries: number,
   maxCountries = Number.POSITIVE_INFINITY,
+  maxCandidatesPerCountry = 1,
 ): ContinuationResumePlan<T> {
   const byCountry = new Map<string, T[]>();
   for (const run of runs) {
@@ -1901,8 +1909,10 @@ export function planContinuationResume<T extends { country: string; runId: strin
       Number(b.marginalUtility || 0) - Number(a.marginalUtility || 0)
       || age(a) - age(b)
       || a.runId.localeCompare(b.runId));
-    const pick = candidates[0];
-    if (pick) {
+    const fallbackCount = Number.isFinite(maxCandidatesPerCountry)
+      ? Math.max(1, Math.trunc(maxCandidatesPerCountry))
+      : candidates.length;
+    for (const pick of candidates.slice(0, fallbackCount)) {
       selected.push(pick);
       selectedIds.add(pick.runId);
     }
@@ -1947,8 +1957,9 @@ export async function resumeOrphanedAutonomousPages(options: {
   if (!enabled || !v2Enabled || !cdlEnabled) {
     return { swept: true, enqueued: 0, skipped: 0, unavailable: 0 };
   }
-  // The store returns one best candidate per pending country, without a
-  // global row limit, so the fairness cursor can rotate across every country.
+  // The store returns a ranked fallback list per pending country, without a
+  // global row limit, so the fairness cursor can rotate across every country
+  // and a blocked top candidate cannot starve another run in that country.
   const runs = await listPendingAutonomousRuns();
   if (!runs.length) return { swept: true, enqueued: 0, skipped: 0, unavailable: 0 };
   // Continuation fairness cursor: rotate countries every sweep so a low-yield
@@ -1959,7 +1970,13 @@ export async function resumeOrphanedAutonomousPages(options: {
   const activeCountryKeys = await resolveActiveAutonomousCountryKeys();
   const activeCountries = Math.max(1, activeCountryKeys.size);
   const sweepCountryLimit = Math.max(1, Math.min(500, Math.trunc(options.limit || 50) || 50));
-  const plan = planContinuationResume(runs, fairnessCursor, activeCountries, sweepCountryLimit);
+  const plan = planContinuationResume(
+    runs,
+    fairnessCursor,
+    activeCountries,
+    sweepCountryLimit,
+    AUTONOMOUS_CONTINUATION_CANDIDATES_PER_COUNTRY,
+  );
   await setAppSetting('autonomous_continuation_fairness_cursor', String(plan.nextFairnessCursor)).catch(() => undefined);
   const orderedRuns = plan.selected;
   const perCountryCap = plan.perCountryCap;

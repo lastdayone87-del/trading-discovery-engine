@@ -24,6 +24,8 @@ import {
   classifyNativeCandidate,
   decideLifecycleV2,
   evaluateExternalTermEvidence,
+  evaluateNativeTermPromotion,
+  evaluateNativeTermPromotionV2,
   getPlannerTerminology,
   observeTerminologyDetailed,
   refreshTerminologyLifecycle,
@@ -809,15 +811,15 @@ test('P10: the reconciler enqueues exactly one idempotent child for a missing ne
   assert.match(queue, /\.\.\.\(searchWindow \? \{ searchWindow \} : \{\}\)/);
   assert.match(serverSource('autonomousPageStore.ts'), /qr\.requested_page_depth/);
   assert.match(serverSource('autonomousPageStore.ts'), /qr\.metadata/);
-  // Return exactly one best candidate per country and let the caller rotate
-  // over the full country set. A global LIMIT here would permanently exclude
+  // Return a ranked fallback list per country and let the caller rotate over
+  // the full country set. A global LIMIT here would permanently exclude
   // alphabetically later countries when pending countries exceed the limit.
   const pageStore = serverSource('autonomousPageStore.ts');
   assert.match(pageStore, /ROW_NUMBER\(\) OVER \(\s*PARTITION BY LOWER\(candidates\.country\)/);
-  assert.match(pageStore, /WHERE country_rank = 1\s+ORDER BY LOWER\(country\) ASC/);
+  assert.match(pageStore, /WHERE country_rank <= \$1\s+ORDER BY LOWER\(country\) ASC,\s*country_rank ASC/);
   assert.ok(!/SELECT \* FROM ranked[\s\S]{0,400}?LIMIT \$1/.test(pageStore), 'no global LIMIT before fairness rotation');
   assert.match(queue, /listPendingAutonomousRuns\(\)/);
-  assert.match(queue, /planContinuationResume\(runs, fairnessCursor, activeCountries, sweepCountryLimit\)/);
+  assert.match(queue, /planContinuationResume\([\s\S]*?AUTONOMOUS_CONTINUATION_CANDIDATES_PER_COUNTRY/);
   assert.match(serverSource('dbCore.ts'), /requested_page_depth/);
   assert.match(serverSource('dbCore.ts'), /jsonb_set\(metadata,'\{searchWindow\}'/);
   assert.match(migration161(), /ADD COLUMN IF NOT EXISTS requested_page_depth INTEGER/);
@@ -839,6 +841,21 @@ test('P10b: the continuation sweep rotates across every pending country', () => 
   // the alphabetically first two.
   assert.deepEqual(covered, countries);
   assert.equal(cursor, 0);
+});
+
+test('P10c: a blocked country candidate falls back to the next ranked run', () => {
+  const runs = [
+    { country: 'Germany', runId: 'g-best', marginalUtility: 0.9 },
+    { country: 'Germany', runId: 'g-fallback', marginalUtility: 0.5 },
+    { country: 'France', runId: 'f-best', marginalUtility: 0.7 },
+  ];
+  const plan = planContinuationResume(runs, 0, 2, 2, 2);
+  assert.deepEqual(plan.selected.map(run => run.runId), ['f-best', 'g-best', 'g-fallback']);
+  // If g-best cannot obtain its treatment reservation, the reconciler can try
+  // g-fallback in the same sweep; after one success the loop skips the rest
+  // of Germany via countriesThisSweep.
+  assert.equal(plan.selected.filter(run => run.country === 'Germany').length, 2);
+  assert.equal(plan.selected.length + plan.deferred.length, runs.length);
 });
 
 test('P11: official YouTube resume uses the durable next-page token without a rewalk', () => {
@@ -1210,6 +1227,33 @@ test('T9b: the fresh-creator bar does not distort wrong-country or review shares
   });
   assert.equal(decision.searchEligible, true);
   assert.match(decision.reason, /controlled exploration/);
+});
+
+test('T9c: repeat sightings do not inflate promotion yield', () => {
+  // Six confirmed sightings include three repeats; only three are fresh. The
+  // fresh yield is 0.6 per 1,000 quota units, below the 1.0 bar, even though
+  // the repeat-inflated count would be 1.2. Shares keep the full base.
+  const v1 = evaluateNativeTermPromotion({
+    novel: true, spamConfirmed: false, executions: 3, quotaConsumed: 5000,
+    confirmedTradingCreators: 6, freshConfirmedTradingCreators: 3,
+    nonTradingCreators: 0, wrongCountryCreators: 0, needsReviewCreators: 0,
+    distinctCreators: 3, distinctCommunities: 2, coordinatedBurst: false,
+  });
+  assert.equal(v1.metrics.yieldPer1000Quota, 0.6);
+  assert.equal(v1.metrics.confirmedShare, 1);
+  assert.equal(v1.decision, 'HOLD');
+  assert.ok(v1.reasons.some(reason => reason.startsWith('yield-below-bar:')));
+
+  const v2 = evaluateNativeTermPromotionV2({
+    novel: true, spamConfirmed: false, executions: 3, quotaConsumed: 5000,
+    confirmedTradingCreators: 6, freshConfirmedTradingCreators: 3,
+    nonTradingCreators: 0, wrongCountryCreators: 0, needsReviewCreators: 0,
+    validationBasis: true, decayedEvidence: 6, decayedYield: 0.5,
+  });
+  assert.equal(v2.metrics.yieldPer1000Quota, 0.6);
+  assert.equal(v2.metrics.confirmedShare, 1);
+  assert.equal(v2.decision, 'HOLD');
+  assert.ok(v2.reasons.some(reason => reason.startsWith('yield-below-bar:')));
 });
 
 test('T10: a 0.30 review share revokes an existing trial without a new promotion', () => {

@@ -490,8 +490,10 @@ export function evaluateNativeTermPromotion(input: {
     input.wrongCountryCreators + input.needsReviewCreators;
   const metrics: NativePromotionMetrics = {
     // Verified-trader yield only: unverified or review-only discoveries can
-    // never satisfy the promotion bar on their own.
-    yieldPer1000Quota: input.quotaConsumed > 0 ? (1000 * input.confirmedTradingCreators) / input.quotaConsumed : 0,
+    // never satisfy the promotion bar on their own. Yield uses fresh
+    // confirmations so repeat sightings of known traders cannot inflate the
+    // per-quota rate; shares keep the full confirmed base.
+    yieldPer1000Quota: input.quotaConsumed > 0 ? (1000 * freshConfirmedTradingCreators) / input.quotaConsumed : 0,
     confirmedShare: totalAttributed > 0 ? input.confirmedTradingCreators / totalAttributed : 0,
     wrongCountryShare: totalAttributed > 0 ? input.wrongCountryCreators / totalAttributed : 0,
     reviewShare: totalAttributed > 0 ? input.needsReviewCreators / totalAttributed : 0,
@@ -754,7 +756,10 @@ export function evaluateNativeTermPromotionV2(input: {
     input.confirmedTradingCreators + input.nonTradingCreators +
     input.wrongCountryCreators + input.needsReviewCreators;
   const metrics: NativePromotionMetrics = {
-    yieldPer1000Quota: input.quotaConsumed > 0 ? (1000 * input.confirmedTradingCreators) / input.quotaConsumed : 0,
+    // Repeat sightings of known traders do not add verified yield per quota.
+    // Shares still use the full confirmed base so a large repeat cohort does
+    // not shrink the denominator.
+    yieldPer1000Quota: input.quotaConsumed > 0 ? (1000 * freshConfirmedTradingCreators) / input.quotaConsumed : 0,
     confirmedShare: totalAttributed > 0 ? input.confirmedTradingCreators / totalAttributed : 0,
     wrongCountryShare: totalAttributed > 0 ? input.wrongCountryCreators / totalAttributed : 0,
     reviewShare: totalAttributed > 0 ? input.needsReviewCreators / totalAttributed : 0,
