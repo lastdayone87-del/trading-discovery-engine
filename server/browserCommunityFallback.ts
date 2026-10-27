@@ -720,6 +720,12 @@ export function isNavigableOnlyControlWindow(
  * progress stops before that control so the next retry can attempt it again.
  * Advancing by clicked+failed would rotate the shared offset past a control
  * whose revealed content was never observed.
+ *
+ * The one exception is a failure on the very first attempted control: stopping
+ * at position zero would freeze every retry on the same window, so a disabled
+ * or hidden first control would permanently block every later control. In
+ * that case the attempted window counts as progress; the failed control stays
+ * an interaction gap and is revisited when the pool rotates back around.
  */
 export function renderedClickOffsetAdvance(
   plan: Pick<ReturnType<typeof partitionRenderedClickTargets>, 'toClick' | 'evaluationWindow' | 'skippedNavigableAnchors'>,
@@ -731,7 +737,14 @@ export function renderedClickOffsetAdvance(
   const failedAt = firstFailedAttempt === undefined
     ? undefined
     : Math.max(0, Math.trunc(firstFailedAttempt) || 0);
-  const examined = failedAt === undefined ? attempted : Math.min(attempted, failedAt);
+  // A failure at the head of the window must not freeze the rotation: no
+  // later control would ever be reached. Treat the attempted window as
+  // progress and let the failed control return when the pool wraps.
+  const examined = failedAt === undefined
+    ? attempted
+    : failedAt === 0
+      ? attempted
+      : Math.min(attempted, failedAt);
   if (examined === 0) {
     return isNavigableOnlyControlWindow(plan, maxClicksPerPage) ? plan.evaluationWindow.length : 0;
   }

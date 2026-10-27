@@ -187,6 +187,32 @@ test('failed controls stop retry rotation before their unexamined content', asyn
   assert.deepEqual(next.toClick.map(target => target.marker), ['oc-fb3', 'oc-fb4', 'oc-fb5', 'oc-fb6']);
 });
 
+test('a failed first control cannot freeze the retry rotation', async () => {
+  const buttons = Array.from({ length: 8 }, (_, index) => renderedButton(index, `oc-hf${index + 1}`));
+  const plan = partitionRenderedClickTargets(buttons, 'https://creator.example/', 4, 0);
+  let attempts = 0;
+  const result = await runRenderedClickLoop({
+    targets: plan.toClick,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    // The first control is disabled/hidden and always fails; the next three
+    // clicks succeed. A position-zero failure must not pin every retry to the
+    // same window.
+    click: async () => { attempts++; return attempts !== 1; },
+    enumerate: async () => ({ controls: buttons, total: buttons.length }),
+    pageUrl: () => 'https://creator.example/',
+  });
+  assert.equal(result.evidenceControlsFailed, 1);
+  assert.equal(result.firstFailedTargetIndex, 0);
+  assert.equal(
+    renderedClickOffsetAdvance(plan, result.evidenceControlsClicked + result.evidenceControlsFailed, 4, result.firstFailedTargetIndex),
+    4,
+    'the attempted window advances instead of freezing at zero',
+  );
+  const next = partitionRenderedClickTargets(buttons, 'https://creator.example/', 4, 4);
+  assert.deepEqual(next.toClick.map(target => target.marker), ['oc-hf5', 'oc-hf6', 'oc-hf7', 'oc-hf8']);
+});
+
 test('shared retry offset advances by the smallest page progress, never the largest', () => {
   // A seed page with 64 navigable anchors advances 64 on its own, while a
   // child page with clickable buttons advances 4. Saving the largest advance
