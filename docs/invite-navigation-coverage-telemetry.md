@@ -45,7 +45,7 @@ none contains a URL, selector, element text, or payload.
 | `controlsStructuralNavigation` | Menu/nav/hamburger/tab/summary/`aria-haspopup`/collapsed-`aria-expanded`/`role=menuitem` controls, including controls inside `<nav>`/`role=navigation|menu|menubar` containers. Classification uses the control's own label/naming text, not its resolved href. |
 | `controlsStructuralHintRejected` | Structural controls the original hint filter would hide. |
 | `controlsStructuralDisclosure` | Structural controls included in the click set because they can reveal content in place (a collapsed disclosure or a menu trigger that does not navigate). |
-| `controlsStructuralUnrecovered` | Structural controls still outside the click set: anchors that navigate to a real document and are owned by the enqueue path. |
+| `controlsStructuralUnrecovered` | Structural controls still outside the click set: anchors that navigate to a real document and are owned by the enqueue path. Diagnostic only; enqueue admission failures are reported through `navigationPolicyExcluded`. |
 | `controlsIconLabelRecovered` | Controls recovered by a label the original filter ignored: `title`, `aria-labelledby`, child `alt`, `data-label`, `data-tooltip`, SVG `<title>`, or capped hidden text. These are included in the click set. |
 | `popupTargets` | Popup/dialog controls that remain unexamined by the click loop and require capture rather than navigation: any non-false `aria-haspopup` value and `target="_blank"` controls without an HTTP(S) href. A `_blank` anchor with a followable HTTP(S) href is reachable by navigation and is not counted; a popup the click loop successfully examined is subtracted. Presence only; no popup capture. |
 | `frameCount` | `iframe`/`frame`/`object`/`embed` elements observed on processed pages (bounded live-collection scan). |
@@ -73,10 +73,10 @@ Existing fields keep their meanings:
 
 1. `UNKNOWN` when no page was processed.
 2. `BOUNDED` when a named ceiling, interaction gap, scroll-cap-still-growing,
-   unrecovered structural navigation, or unresolved terminal request failure
-   was observed. A failed child request can hide a destination, so it is never
-   reported as `COMPLETE`. Icon-label recoveries and structural disclosures are
-   clicked, so they no longer imply an unexamined destination on their own.
+   or unresolved terminal request failure was observed. A failed child request
+   can hide a destination, so it is never reported as `COMPLETE`. Icon-label
+   recoveries and structural disclosures are clicked, so they no longer imply
+   an unexamined destination on their own.
 3. `CONTEXT_UNREACHABLE` when frames, open shadow roots, or unexamined popup
    targets were observed. Popups the click loop successfully examined are not
    context gaps.
@@ -85,10 +85,10 @@ Existing fields keep their meanings:
 5. `COMPLETE` otherwise.
 
 P1.1/P1.2 changed what counts as bounded. Recovered icon-label and structural
-disclosure controls are clicked, so they no longer trigger `BOUNDED`. The
-remaining structural gap is `structuralUnrecovered`: a structural anchor that
-resolves to a different document is owned by the enqueue path, not the click
-set.
+disclosure controls are clicked, so they no longer trigger `BOUNDED`.
+`structuralUnrecovered` is diagnostic only: a structural anchor that resolves
+to a different document is owned by the enqueue path, not the click set, and
+enqueue admission failures are reported separately.
 
 `hint-rejected` and `control-slice` are measured in
 `navigationPolicyExcluded` but are not policy exclusions for this reason.

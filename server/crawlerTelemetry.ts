@@ -134,8 +134,6 @@ export interface RenderedCoverageInput {
   structuralHintRejected?: number;
   iconLabelRecovered?: number;
   unresolvedFailedRequests?: number;
-  /** Structural controls still outside the click set (navigable anchors). */
-  structuralUnrecovered?: number;
   frameCount?: number;
   shadowRootCount?: number;
   popupTargets?: number;
@@ -155,9 +153,8 @@ export function resolveRenderedCoverageReason(input: RenderedCoverageInput): Ren
     || input.interactionGap === true
     || input.scrollCapReachedStillGrowing === true
     || input.contextUnknown === true
-    || count(input.unresolvedFailedRequests) > 0
-    || count(input.structuralUnrecovered) > 0) {    return 'BOUNDED';
-  }
+    || count(input.unresolvedFailedRequests) > 0) {
+    return 'BOUNDED';  }
   if (count(input.frameCount) > 0 || count(input.shadowRootCount) > 0 || count(input.popupTargets) > 0) {
     return 'CONTEXT_UNREACHABLE';
   }

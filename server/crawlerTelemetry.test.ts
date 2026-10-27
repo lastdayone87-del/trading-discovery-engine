@@ -234,7 +234,6 @@ test('coverage reason distinguishes complete, bounded, policy, context, and unkn
     'a terminally failed child request can hide a destination, so it is not COMPLETE',
   );
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, unresolvedFailedRequests: 0 }), 'COMPLETE');
-  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, structuralUnrecovered: 2 }), 'BOUNDED');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, frameCount: 1 }), 'CONTEXT_UNREACHABLE');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, shadowRootCount: 1 }), 'CONTEXT_UNREACHABLE');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, popupTargets: 1 }), 'CONTEXT_UNREACHABLE');
