@@ -8,6 +8,7 @@ import {
   RENDERED_CONTROL_EVALUATION_WINDOW,
   RENDERED_CONTROL_SELECTOR,
   createRenderedRouteGuard,
+  collectRenderedPageContext,
   enumerateRenderedControlNodes,
   installRenderedRouteCloseCleanup,
   isSkippableNavigableAnchorClick,
@@ -221,6 +222,53 @@ test('real DOM: a 64-control page wraps without inventing overflow', { skip: pro
       await page.locator(`[data-oc-control="${target.marker}"]`).click();
     }
     assert.equal(await page.locator('a[href^="https://discord.gg/"]').count(), 0);
+  });
+});
+
+test('real DOM: enumeration separates hint-rejected, structural, icon-label, and popup controls', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><head>
+    <base href="https://creator.example/base/">
+    <title>mixed control fixture</title>
+  </head><body>
+    <a href="/community">Community</a>
+    <button type="button" aria-label="Open menu" aria-haspopup="dialog">Menu</button>
+    <button type="button" title="Join our Discord">
+      <svg width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="8"></circle></svg>
+    </button>
+    <a href="https://discord.gg/example" target="_blank">Community chat</a>
+    <iframe src="about:blank" title="embedded"></iframe>
+    <div id="shadow-host"></div>
+    <script>
+      document.getElementById('shadow-host').attachShadow({ mode: 'open' }).innerHTML = '<span>shadow content</span>';
+    </script>
+  </body></html>`;
+  await withControlPage(html, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(enumeration.total, 4, 'the pre-filter denominator includes every selector-matched control');
+    assert.equal(enumeration.controls.length, 2, 'only community-hint controls remain evidence-bearing');
+    assert.equal(enumeration.hintRejected, 2, 'hint rejection is measured, not silently dropped');
+    assert.equal(enumeration.structuralNavigation, 1, 'the menu/aria-haspopup control is structural navigation');
+    assert.equal(enumeration.structuralHintRejected, 1, 'the structural control would be hidden by the hint filter today');
+    assert.equal(enumeration.iconLabelRecovered, 1, 'title-only icon labels are recoverable in P1.2');
+    assert.equal(enumeration.popupTargets, 1, 'only the dialog control requires popup capture; the href-bearing _blank anchor is navigable');
+
+    const context = await page.evaluate(collectRenderedPageContext);
+    assert.equal(context.frameCount, 1, 'iframe presence is recorded for P1.4');
+    assert.equal(context.shadowRootCount, 1, 'open shadow roots are recorded for P1.4');
+    assert.equal(context.baseHrefPresent, true, 'a document <base href> is recorded for P1.5');
+  });
+});
+
+test('real DOM: an all-hint-matched control set has no hidden structural or popup counts', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  await withControlPage(controlFixtureHtml(8, null), async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(enumeration.total, 8);
+    assert.equal(enumeration.controls.length, 8);
+    assert.equal(enumeration.hintRejected, 0);
+    assert.equal(enumeration.structuralNavigation, 0);
+    assert.equal(enumeration.structuralHintRejected, 0);
+    assert.equal(enumeration.iconLabelRecovered, 0);
+    assert.equal(enumeration.popupTargets, 0);
   });
 });
 
