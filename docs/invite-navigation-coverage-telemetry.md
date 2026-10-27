@@ -3,8 +3,9 @@
 **Status:** Implemented instrumentation. Measurement only; no outcome, retry,
 selection, click, budget, queue, or schema behavior changes.
 **Scope:** Rendered creator-website acquisition (`mode = RENDERED`).
-**Related evidence:** `INVITE_NAVIGATION_ACQUISITION_RECALL_INVESTIGATION_20261027.md`,
-`evidence/audit/P0_3_ACQUISITION_CLASSIFICATION_20261027.md`.
+**Related evidence:** `INVITE_NAVIGATION_ACQUISITION_RECALL_INVESTIGATION_20261027.md`
+and the 2026-10-27 P0.3 production classification report (read-only Coolify
+snapshot; aggregate metrics, not committed to this repository).
 
 ## Why
 
