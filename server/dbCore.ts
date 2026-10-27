@@ -917,9 +917,10 @@ export function overlayLockedDiscordProjection<T extends Partial<ChannelRecord>>
  * A1 targeted last-known-good guard for ordinary (non-classification) writes.
  * A caller may load a channel before a validation commits, then persist its
  * stale snapshot after it. When the locked row still serves a completed, live,
- * validated invite, an ordinary write must not clear it, replace it with a
- * different invite, or (for a retained last-known-good row) erase the
- * uncertainty marker with a stale ACTIVE snapshot. Definitive terminal
+ * validated invite — including a retained last-known-good row whose mutable
+ * status has become UNCERTAIN — an ordinary write must not clear it, replace
+ * it with a different invite, or erase the uncertainty marker with a stale
+ * ACTIVE snapshot. Definitive terminal
  * outcomes (DEAD/NON_TRADING), explicit intentional cleanup, and fresh
  * validation writes still apply. This is deliberately narrower than making
  * `preserveDiscordOnUpdate` the default: the authoritative inspection upsert
@@ -932,7 +933,11 @@ export function shouldRetainLockedDiscordProjection(
   options?:{allowDiscordClear?:boolean;freshDiscordValidation?:boolean},
 ):boolean{
   if(!locked||options?.allowDiscordClear||options?.freshDiscordValidation)return false;
-  if(!hasServingLastKnownGoodDiscordInvite(locked))return false;
+  // A retained last-known-good invite can carry the mutable top-level status
+  // UNCERTAIN after a later status reset (the relevance field keeps the
+  // retention marker). The serving check alone would leave that row exposed to
+  // a stale ordinary snapshot that clears the invite and its evidence.
+  if(!hasServingLastKnownGoodDiscordInvite(locked)&&!hasRetainedLastKnownGoodDiscordInvite(locked))return false;
   if(proposed.discord_status==='DEAD'||proposed.discord_status==='NON_TRADING')return false;
   const proposedInvite=proposed.discord_invite||null;
   const lockedInvite=locked.discord_invite||null;

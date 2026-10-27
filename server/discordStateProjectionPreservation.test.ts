@@ -415,6 +415,35 @@ test('A1 ordinary upsert retains a locked serving invite over a stale clear', ()
   assert.equal(merged.discord_validation_status, 'COMPLETED');
 });
 
+test('A1 ordinary upsert retains a locked UNCERTAIN last-known-good invite over a stale clear', () => {
+  const locked = cbrackn({
+    discord_status: 'UNCERTAIN',
+    discord_relevance_status: 'UNCERTAIN',
+  }) as any;
+  assert.equal(hasServingLastKnownGoodDiscordInvite(locked), false, 'the mutable status is no longer serving');
+  assert.equal(hasRetainedLastKnownGoodDiscordInvite(locked), true, 'the retained marker is still present');
+  const stale = cbrackn({
+    discord_status: 'UNCERTAIN',
+    discord_invite: null,
+    discord_candidate_id: null,
+    discord_candidate_locator: null,
+    discord_candidate_raw_locator: null,
+    discord_candidate_type: null,
+    discord_liveness_status: 'UNCERTAIN',
+    discord_relevance_status: 'NOT_CHECKED',
+    discord_validation_status: 'FAILED_OPERATIONAL',
+    discord_discovery_status: 'DISCOVERED_VALIDATION_FAILED',
+  }) as any;
+
+  assert.equal(shouldRetainLockedDiscordProjection(stale, locked), true);
+  const merged = overlayLockedDiscordProjection(stale, locked);
+  assert.equal(merged.discord_status, 'UNCERTAIN');
+  assert.equal(merged.discord_invite, VALID_URL);
+  assert.equal(merged.discord_candidate_id, validCandidate.candidateId);
+  assert.equal(merged.discord_relevance_status, 'UNCERTAIN');
+  assert.equal(merged.discord_validation_status, 'COMPLETED');
+});
+
 test('A1 definitive terminal writes and explicit cleanup still clear the locked invite', () => {
   const locked = cbrackn() as any;
   const dead = cbrackn({ discord_status: 'DEAD', discord_invite: null, discord_liveness_status: 'DEAD' }) as any;

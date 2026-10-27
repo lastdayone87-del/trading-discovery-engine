@@ -369,11 +369,21 @@ test('gap retries advance only by controls actually examined', () => {
     { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 2, evidenceControlsOffsetAdvance: 100 } },
   ]), { 'https://creator.test/': 64 }, 'a recorded advance is bounded to one evaluation window');
   assert.deepEqual(nextRenderedClickOffsets(undefined, [
+    { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 4, evidenceControlsOffsetAdvance: 8 } },
+    { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 4, evidenceControlsOffsetAdvance: 4 } },
+  ]), { 'https://creator.test/': 4 }, 'duplicate observations of the same seed advance by the smaller progress');
+  assert.deepEqual(nextRenderedClickOffsets(undefined, [
     { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 0, evidenceControlsTotal: 70, evidenceControlsFailed: 0, evidenceControlsNavigableOnly: true, evidenceControlsOffsetAdvance: 64 } },
   ]), { 'https://creator.test/': 64 }, 'an all-navigable window uses its recorded window advance');
   assert.deepEqual(nextRenderedClickOffsets(undefined, [
     { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 0, evidenceControlsTotal: 70, evidenceControlsFailed: 0, evidenceControlsNavigableOnly: true, evidenceControlsOffsetAdvance: 10 } },
   ]), { 'https://creator.test/': 10 }, 'a certified partial navigable window advances only what it examined');
+  assert.deepEqual(nextRenderedClickOffsets({ 'https://creator.test/': 8 }, [
+    { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 4, evidenceControlsOffsetAdvance: 4, evidenceControlsUncertified: true } },
+  ]), { 'https://creator.test/': 8 }, 'an uncertified page blocks click progress from another page in the same crawl');
+  assert.deepEqual(nextRenderedClickOffsets(undefined, [
+    { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 0, evidenceControlsTotal: 70, evidenceControlsFailed: 0, evidenceControlsNavigableOnly: true, evidenceControlsUncertified: true } },
+  ]), {}, 'an uncertified page also blocks a certified navigable window in the same crawl');
   const queue = readSource('queueManager.ts');
   assert.match(queue, /scanAttempts: inspectionClickOffsetForRetry\(channel\.scan_attempts, executionMarker\)/);
   assert.match(queue, /clickOffsets: executionMarker\?\.isRetryOwnedReacquire \? resolveInspectionClickOffsets\(executionMarker\.clickOffsets\) : undefined/);

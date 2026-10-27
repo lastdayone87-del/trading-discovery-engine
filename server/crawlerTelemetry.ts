@@ -242,16 +242,23 @@ export interface CrawlerTelemetry {
   evidenceControlsFailed?: number;
   evidenceControlsSkipped?: number;
   /**
-   * True when a processed page's entire evaluation window contained only
-   * navigable anchors: the window was fully examined with zero clicks, so the
-   * durable retry offset may advance past it. Sparse; absent on rows that
-   * predate instrumentation or when the window had clickable targets.
+   * True when every processed page with controls had an entirely navigable
+   * evaluation window: each window was fully examined with zero clicks, so
+   * the durable retry offset may advance past it. Sparse; absent on rows that
+   * predate instrumentation or when any page had clickable targets.
    */
   evidenceControlsNavigableOnly?: boolean;
   /**
-   * Bounded full-pool positions the durable retry offset should advance:
-   * the position just past the last attempted control, or the examined window
-   * length for an all-navigable window. Sparse; absent on pre-instrumentation
+   * True when a processed page had clickable controls inside its evaluation
+   * window but recorded no progress (deadline, zero budget, detached marker).
+   * The shared per-seed retry offset must not advance while such a window is
+   * unexamined. Sparse; rendered-only.
+   */
+  evidenceControlsUncertified?: boolean;
+  /**
+   * Bounded full-pool positions the durable retry offset should advance: the
+   * smallest per-page progress, so a page with a smaller pool is never rotated
+   * past controls it did not examine. Sparse; absent on pre-instrumentation
    * rows.
    */
   evidenceControlsOffsetAdvance?: number;
@@ -591,6 +598,9 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
       : {}),
     ...(candidate.mode === 'RENDERED' && (candidate as { evidenceControlsNavigableOnly?: unknown }).evidenceControlsNavigableOnly === true
       ? { evidenceControlsNavigableOnly: true }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && (candidate as { evidenceControlsUncertified?: unknown }).evidenceControlsUncertified === true
+      ? { evidenceControlsUncertified: true }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.evidenceControlsOffsetAdvance) > 0
       ? { evidenceControlsOffsetAdvance: number(candidate.evidenceControlsOffsetAdvance) }

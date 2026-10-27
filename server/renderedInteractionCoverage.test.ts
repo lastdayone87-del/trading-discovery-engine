@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { isNavigableOnlyControlWindow, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, resolveRenderedCompletionState, runRenderedClickLoop } from './browserCommunityFallback';
+import { combineRenderedControlOffsetAdvances, isNavigableOnlyControlWindow, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, resolveRenderedCompletionState, runRenderedClickLoop } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -150,6 +150,18 @@ test('retry offsets advance past anchors before clicked controls instead of repe
   assert.equal(renderedClickOffsetAdvance(firstButtonsFirst, 4, 4), 4);
   const secondButtonsFirst = partitionRenderedClickTargets(buttonsFirst, 'https://creator.example/', 4, 4);
   assert.deepEqual(secondButtonsFirst.toClick.map(target => target.marker), ['oc-b5', 'oc-b6', 'oc-b7', 'oc-b8']);
+});
+
+test('shared retry offset advances by the smallest page progress, never the largest', () => {
+  // A seed page with 64 navigable anchors advances 64 on its own, while a
+  // child page with clickable buttons advances 4. Saving the largest advance
+  // would rotate the child's pool back to its first buttons (64 % 64 = 0) and
+  // leave later buttons permanently unclicked.
+  assert.equal(combineRenderedControlOffsetAdvances(undefined, 64), 64);
+  assert.equal(combineRenderedControlOffsetAdvances(64, 4), 4, 'the navigable seed cannot skip the clickable child');
+  assert.equal(combineRenderedControlOffsetAdvances(4, 8), 4, 'a later page never increases the shared advance');
+  assert.equal(combineRenderedControlOffsetAdvances(4, 0), 4, 'a page with no progress does not erase prior progress');
+  assert.equal(combineRenderedControlOffsetAdvances(undefined, 0), undefined, 'no progress stays sparse');
 });
 
 test('revealed controls reserve the click slots for already-queued controls', () => {
@@ -349,6 +361,9 @@ test('rendered control coverage counts overflow and uses stable markers across D
     'the loop re-enumerates after every click, including the final permitted click');
   assert.match(source, /telemetry\.evidenceControlsTotal = evidenceControlsSeen \|\| undefined/);
   assert.match(source, /telemetry\.evidenceControlsSkipped = evidenceControlsSkipped \|\| undefined/);
+  assert.match(source, /combineRenderedControlOffsetAdvances\(\s*evidenceControlsOffsetAdvance,\s*offsetAdvance,?\s*\)/, 'the crawl aggregates per-page progress conservatively');
+  assert.match(source, /evidenceControlsUncertified = true/, 'an unexamined clickable page blocks shared offset advancement');
+  assert.match(source, /telemetry\.evidenceControlsUncertified = evidenceControlsUncertified \|\| undefined/);
 });
 
 test('shared rendered evidence stays fail-closed: gapped/timed-out lenders never enter inventory', () => {

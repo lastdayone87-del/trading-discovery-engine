@@ -160,6 +160,7 @@ export function nextRenderedClickOffsets(
       evidenceControlsTotal?: number;
       evidenceControlsFailed?: number;
       evidenceControlsNavigableOnly?: boolean;
+      evidenceControlsUncertified?: boolean;
       evidenceControlsOffsetAdvance?: number;
     };
   }> | null | undefined,
@@ -175,9 +176,20 @@ export function nextRenderedClickOffsets(
   const windowProgress = new Map<string, number>();
   const uncertifiedZeroClick = new Set<string>();
   const clickCap = Math.max(1, Math.trunc(maxClicksPerPage) || 4);
+  // Crawl-level uncertified evidence blocks every kind of progress for that
+  // seed. The rendered crawl aggregates multiple pages into one outcome, so
+  // this flag is the only way a later page's unexamined clickable window can
+  // stop another page's certified window/click progress from moving the
+  // shared per-seed offset past it.
+  const uncertifiedSeeds = new Set<string>();
+  for (const outcome of outcomes || []) {
+    if (outcome?.telemetry?.evidenceControlsUncertified !== true) continue;
+    const key = normalizeVisitUrl(outcome?.requestedUrl || '');
+    if (key) uncertifiedSeeds.add(key);
+  }
   for (const outcome of outcomes || []) {
     const key = normalizeVisitUrl(outcome?.requestedUrl || '');
-    if (!key) continue;
+    if (!key || uncertifiedSeeds.has(key)) continue;
     const clicks = Math.max(0, Math.trunc(Number(outcome?.telemetry?.clicksStarted)) || 0);
     // The crawler records full-pool positions consumed. Older rows only have
     // the click count, which is still used as a bounded fallback.
@@ -188,7 +200,10 @@ export function nextRenderedClickOffsets(
       const advance = recordedAdvance > 0
         ? Math.min(RENDERED_CONTROL_EVALUATION_WINDOW, recordedAdvance)
         : Math.min(clickCap, clicks);
-      clickProgress.set(key, Math.max(clickProgress.get(key) || 0, advance));
+      // Duplicate observations of the same seed (for example the same URL on
+      // two surfaces) share one offset: take the smaller progress so neither
+      // observation can rotate the other past unexamined controls.
+      clickProgress.set(key, Math.min(clickProgress.get(key) ?? advance, advance));
       continue;
     }
     const total = Math.max(0, Math.trunc(Number(outcome?.telemetry?.evidenceControlsTotal)) || 0);
@@ -200,10 +215,8 @@ export function nextRenderedClickOffsets(
     // controls (deadline/crash/zero budget) is uncertified and must keep the
     // shared per-seed window for a real retry.
     if (total > 0 && failed === 0 && navigableOnly) {
-      windowProgress.set(key, Math.max(windowProgress.get(key) || 0, Math.min(
-        RENDERED_CONTROL_EVALUATION_WINDOW,
-        recordedAdvance || total,
-      )));
+      const advance = Math.min(RENDERED_CONTROL_EVALUATION_WINDOW, recordedAdvance || total);
+      windowProgress.set(key, Math.min(windowProgress.get(key) ?? advance, advance));
     } else if (total > 0 && failed === 0) {
       uncertifiedZeroClick.add(key);
     }

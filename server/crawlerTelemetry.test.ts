@@ -138,18 +138,21 @@ test('safe telemetry round-trips bounded control-offset advances', () => {
     evidenceControlsFailed: 1,
     evidenceControlsSkipped: 60,
     evidenceControlsNavigableOnly: true,
+    evidenceControlsUncertified: true,
     evidenceControlsOffsetAdvance: 8,
   });
   assert.equal(rendered?.evidenceControlsTotal, 70);
   assert.equal(rendered?.evidenceControlsOffsetAdvance, 8);
   assert.equal(rendered?.evidenceControlsNavigableOnly, true);
+  assert.equal(rendered?.evidenceControlsUncertified, true);
 
   const zero = safeCrawlerTelemetry({ mode: 'RENDERED', pagesInspected: 1, evidenceControlsOffsetAdvance: 0 });
   assert.equal(zero?.evidenceControlsOffsetAdvance, undefined, 'a zero advance is sparse, not a stored zero');
   const negative = safeCrawlerTelemetry({ mode: 'RENDERED', pagesInspected: 1, evidenceControlsOffsetAdvance: -4 });
   assert.equal(negative?.evidenceControlsOffsetAdvance, undefined, 'negative advances are dropped');
-  const staticRow = safeCrawlerTelemetry({ mode: 'STATIC', pagesInspected: 1, evidenceControlsOffsetAdvance: 8 });
+  const staticRow = safeCrawlerTelemetry({ mode: 'STATIC', pagesInspected: 1, evidenceControlsOffsetAdvance: 8, evidenceControlsUncertified: true });
   assert.equal(staticRow?.evidenceControlsOffsetAdvance, undefined, 'control offsets are rendered-only');
+  assert.equal(staticRow?.evidenceControlsUncertified, undefined, 'uncertified control windows are rendered-only');
 });
 
 test('safe telemetry drops unknown stage/reason and truncates cause text', () => {

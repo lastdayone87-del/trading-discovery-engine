@@ -74,15 +74,20 @@ export interface BrowserFallbackTelemetry {
   evidenceControlsClicked?: number;
   evidenceControlsFailed?: number;
   evidenceControlsSkipped?: number;
-  /** True when a processed page's entire evaluation window contained only
-   * navigable anchors, so zero clicks were attempted but the window was fully
+  /** True when every processed page with controls had an entirely navigable
+   * evaluation window, so zero clicks were attempted but each window was fully
    * examined. Drives durable retry rotation past an otherwise zero-click
    * window; absent on pre-instrumentation rows. */
   evidenceControlsNavigableOnly?: boolean;
+  /** True when at least one processed page had clickable controls inside its
+   * evaluation window but recorded no progress (deadline, zero click budget,
+   * detached marker). A shared per-seed offset must not advance based on
+   * another page's progress while this page's window is unexamined. Sparse. */
+  evidenceControlsUncertified?: boolean;
   /** Bounded number of full-pool positions the durable retry offset should
-   * advance after this crawl: the position just past the last attempted
-   * control, or the examined window length when the window was all-navigable.
-   * Sparse; absent on pre-instrumentation rows. */
+   * advance after this crawl: the smallest per-page progress, so a page with a
+   * smaller pool is never rotated past controls it did not examine. Sparse;
+   * absent on pre-instrumentation rows. */
   evidenceControlsOffsetAdvance?: number;
   clickFailureClasses: Record<RenderedCrawlerFailureClass, number>;
   /**
@@ -199,9 +204,12 @@ export interface BrowserFallbackResult {
   evidenceControlsClicked?: number;
   evidenceControlsFailed?: number;
   evidenceControlsSkipped?: number;
-  /** True when a processed page's entire evaluation window contained only
-   * navigable anchors; the window was examined with zero clicks. */
+  /** True when every processed page with controls had an entirely navigable
+   * evaluation window; each window was examined with zero clicks. */
   evidenceControlsNavigableOnly?: boolean;
+  /** True when a processed page had clickable controls but no recorded
+   * progress, so the shared seed offset must not advance. */
+  evidenceControlsUncertified?: boolean;
   /** Full-pool positions to advance the durable retry offset (see
    * BrowserFallbackTelemetry.evidenceControlsOffsetAdvance). */
   evidenceControlsOffsetAdvance?: number;
@@ -723,6 +731,24 @@ export function renderedClickOffsetAdvance(
     target === lastAttempted || (Boolean(target.marker) && target.marker === lastAttempted.marker)
   );
   return position >= 0 ? position + 1 : 0;
+}
+
+/**
+ * Combine per-page full-pool advances into one safe shared seed advance.
+ * Every page in a rendered crawl starts from the same durable per-seed
+ * rotation offset, so the crawl may advance only by the smallest progress any
+ * page made: advancing by the largest would rotate a smaller (or equal) page
+ * pool past controls it never examined. A zero page advance contributes no
+ * progress; the caller separately marks an unexamined clickable window as
+ * uncertified so the whole seed stays put.
+ */
+export function combineRenderedControlOffsetAdvances(
+  current: number | undefined,
+  pageAdvance: number,
+): number | undefined {
+  const advance = Math.max(0, Math.trunc(pageAdvance) || 0);
+  if (advance === 0) return current;
+  return current === undefined || current <= 0 ? advance : Math.min(current, advance);
 }
 
 /**
@@ -1651,6 +1677,8 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   let evidenceControlsFailed = 0;
   let evidenceControlsSkipped = 0;
   let evidenceControlsNavigableOnly = false;
+  let evidenceControlsClickableWindow = false;
+  let evidenceControlsUncertified = false;
   let evidenceControlsOffsetAdvance = 0;
   let interactionGap = false;
   const terminalSuccessUrls: string[] = [];
@@ -1912,10 +1940,15 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // with zero clicks. Record that explicitly so the durable retry
             // offset can advance instead of re-reading the same prefix; a
             // deadline or browser failure before the first click must not
-            // advance, because that window was not examined.
+            // advance, because that window was not examined. Track clickable
+            // windows separately: a crawl-wide certificate must never let one
+            // page's navigable window stand in for another page's unexamined
+            // clickable window.
+            const clickableInWindow = Math.max(0, clickPlan.evaluationWindow.length - clickPlan.skippedNavigableAnchors);
             if (isNavigableOnlyControlWindow(clickPlan, limits.maxClicksPerPage)) {
               evidenceControlsNavigableOnly = true;
             }
+            if (clickableInWindow > 0) evidenceControlsClickableWindow = true;
             const countedControlSkips = new Set<string>();
             for (const control of controls) {
               if (control.marker && !clickPlan.toClick.some(target => target.marker === control.marker)
@@ -2004,7 +2037,20 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               clickLoop.evidenceControlsClicked + clickLoop.evidenceControlsFailed,
               limits.maxClicksPerPage,
             );
-            if (offsetAdvance > evidenceControlsOffsetAdvance) evidenceControlsOffsetAdvance = offsetAdvance;
+            if (offsetAdvance > 0) {
+              // Shared per-seed rotation: advance only by the smallest page
+              // progress. A page with 64 navigable anchors must not rotate a
+              // 4-click child page past controls the child never examined.
+              evidenceControlsOffsetAdvance = combineRenderedControlOffsetAdvances(
+                evidenceControlsOffsetAdvance,
+                offsetAdvance,
+              ) ?? 0;
+            } else if (clickableInWindow > 0) {
+              // Clickable controls were inside the window but no progress was
+              // recorded (deadline, zero budget, detached marker). The shared
+              // offset must not move based on another page's progress.
+              evidenceControlsUncertified = true;
+            }
             evidenceControlsSeen += pageControlTotal;
 
             if (Date.now() - startedAt < limits.totalTimeoutMs) {
@@ -2146,7 +2192,8 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         telemetry.evidenceControlsClicked = evidenceControlsClicked || undefined;
         telemetry.evidenceControlsFailed = evidenceControlsFailed || undefined;
         telemetry.evidenceControlsSkipped = evidenceControlsSkipped || undefined;
-        telemetry.evidenceControlsNavigableOnly = evidenceControlsNavigableOnly || undefined;
+        telemetry.evidenceControlsNavigableOnly = (evidenceControlsNavigableOnly && !evidenceControlsClickableWindow) || undefined;
+        telemetry.evidenceControlsUncertified = evidenceControlsUncertified || undefined;
         telemetry.evidenceControlsOffsetAdvance = evidenceControlsOffsetAdvance || undefined;
         return {
           foundInvite:first?.nativeInviteCode||null,
@@ -2178,7 +2225,8 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           evidenceControlsClicked: evidenceControlsClicked || undefined,
           evidenceControlsFailed: evidenceControlsFailed || undefined,
           evidenceControlsSkipped: evidenceControlsSkipped || undefined,
-          evidenceControlsNavigableOnly: evidenceControlsNavigableOnly || undefined,
+          evidenceControlsNavigableOnly: (evidenceControlsNavigableOnly && !evidenceControlsClickableWindow) || undefined,
+          evidenceControlsUncertified: evidenceControlsUncertified || undefined,
           evidenceControlsOffsetAdvance: evidenceControlsOffsetAdvance || undefined,
           interactionGap: interactionGap || undefined,
           requiredSnapshotExpanded: requiredSnapshotExpanded || undefined,
@@ -2196,7 +2244,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         if (causeSnippet) telemetry.launchCauseSnippet=causeSnippet;
         const zeroPageReason=resolveRenderedZeroPageReason({inspectedPages,timedOut:false,saturated:false,browserLaunchFailed,thrown:true,telemetry});
         if (zeroPageReason) telemetry.zeroPageReason=zeroPageReason;
-        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,dropReasons:drops.snapshot(),interactionGap:interactionGap||undefined,evidenceControlsTotal:evidenceControlsSeen||undefined,evidenceControlsClicked:evidenceControlsClicked||undefined,evidenceControlsFailed:evidenceControlsFailed||undefined,evidenceControlsSkipped:evidenceControlsSkipped||undefined,evidenceControlsNavigableOnly:evidenceControlsNavigableOnly||undefined,evidenceControlsOffsetAdvance:evidenceControlsOffsetAdvance||undefined,detail:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
+        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,dropReasons:drops.snapshot(),interactionGap:interactionGap||undefined,evidenceControlsTotal:evidenceControlsSeen||undefined,evidenceControlsClicked:evidenceControlsClicked||undefined,evidenceControlsFailed:evidenceControlsFailed||undefined,evidenceControlsSkipped:evidenceControlsSkipped||undefined,evidenceControlsNavigableOnly:(evidenceControlsNavigableOnly&&!evidenceControlsClickableWindow)||undefined,evidenceControlsUncertified:evidenceControlsUncertified||undefined,evidenceControlsOffsetAdvance:evidenceControlsOffsetAdvance||undefined,detail:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
       } finally {
         // The isolated queue must never outlive its crawl: the lifecycle
         // finalizer drops it on success, failure, and unexpected throws alike
