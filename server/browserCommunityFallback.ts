@@ -562,27 +562,34 @@ export function enumerateRenderedControlNodes(
   pattern: string,
 ): { controls: RenderedControlTarget[]; total: number } {
   const re = new RegExp(pattern, 'i');
-  const hrefOf = (node: Element): string | null => {
+  const matched = nodes.map((node, index) => {
+    const element = node as HTMLElement;
+    const tagName = (element.tagName || '').toLowerCase();
     // HTMLAnchorElement.href is a string; SVGElement.href is an
     // SVGAnimatedString. Reading the attribute keeps both anchor kinds
     // string-safe, and resolving against the document base preserves the
     // absolute-href semantics the click planner expects.
+    //
+    // Keep this inline: Playwright serializes this function into the page.
+    // A named inner function (for example `const hrefOf = ...`) is rewritten
+    // by esbuild's keepNames transform into `__name(...)`, which is not
+    // defined in the browser context and would fail the whole enumeration.
     const property = (node as HTMLAnchorElement).href;
-    if (typeof property === 'string' && property) return property;
-    const raw = node.getAttribute('href')
-      || node.getAttributeNS('http://www.w3.org/1999/xlink', 'href')
-      || '';
-    if (!raw) return null;
-    try {
-      return new URL(raw, node.baseURI || document.baseURI).toString();
-    } catch {
-      return raw;
+    let href: string | null = null;
+    if (typeof property === 'string' && property) {
+      href = property;
+    } else {
+      const raw = node.getAttribute('href')
+        || node.getAttributeNS('http://www.w3.org/1999/xlink', 'href')
+        || '';
+      if (raw) {
+        try {
+          href = new URL(raw, node.baseURI || document.baseURI).toString();
+        } catch {
+          href = raw;
+        }
+      }
     }
-  };
-  const matched = nodes.map((node, index) => {
-    const element = node as HTMLElement;
-    const tagName = (element.tagName || '').toLowerCase();
-    const href = hrefOf(node);
     return {
       index,
       text: `${element.innerText || ''} ${href || ''} ${element.getAttribute('aria-label') || ''}`,
