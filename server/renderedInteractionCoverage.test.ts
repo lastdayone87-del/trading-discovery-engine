@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { combineRenderedControlOffsetAdvances, isNavigableOnlyControlWindow, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, resolveRenderedCompletionState, runRenderedClickLoop } from './browserCommunityFallback';
+import { combineRenderedControlOffsetAdvances, isNavigableOnlyControlWindow, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, resolveRenderedCompletionState, runRenderedClickLoop, type RenderedControlEnumeration } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -43,6 +43,24 @@ const renderedButton = (index: number, marker: string) => ({
   text: 'Join Discord',
   href: null,
   tag: 'button' as const,
+});
+
+/**
+ * Complete P0.2 enumeration shape for loop fixtures. `total` is the pre-filter
+ * denominator; these fixtures are all hint-matched, so hint-rejected and the
+ * structural/icon counters are zero.
+ */
+const renderedEnumeration = (
+  controls: RenderedControlEnumeration['controls'],
+  total = controls.length,
+): RenderedControlEnumeration => ({
+  controls,
+  total,
+  hintRejected: Math.max(0, total - controls.length),
+  structuralNavigation: 0,
+  structuralHintRejected: 0,
+  iconLabelRecovered: 0,
+  popupTargets: 0,
 });
 
 test('an evidence-bearing interaction gap keeps a processed run incomplete and retryable', () => {
@@ -170,7 +188,7 @@ test('failed controls stop retry rotation before their unexamined content', asyn
     deadlineExceeded: () => false,
     // The first two clicks succeed; the third fails; the fourth succeeds.
     click: async () => { attempts++; return attempts !== 3; },
-    enumerate: async () => ({ controls, total: controls.length }),
+    enumerate: async () => renderedEnumeration(controls),
     pageUrl: () => 'https://creator.example/',
   });
   assert.equal(result.evidenceControlsClicked, 3);
@@ -199,7 +217,7 @@ test('a failed first control cannot freeze the retry rotation', async () => {
     // clicks succeed. A position-zero failure must not pin every retry to the
     // same window.
     click: async () => { attempts++; return attempts !== 1; },
-    enumerate: async () => ({ controls: buttons, total: buttons.length }),
+    enumerate: async () => renderedEnumeration(buttons),
     pageUrl: () => 'https://creator.example/',
   });
   assert.equal(result.evidenceControlsFailed, 1);
@@ -277,7 +295,7 @@ test('executing click loop reserves queued slots when a click reveals too many c
     enumerate: async () => {
       enumerations++;
       const controls = [...initial, ...revealed];
-      return { controls, total: controls.length };
+      return renderedEnumeration(controls);
     },
     pageUrl: () => 'https://creator.example/',
   });
@@ -302,7 +320,7 @@ test('executing click loop marks a control revealed by the final permitted click
       enumerations++;
       // The fourth click is the only one that reveals another control.
       const controls = clicks === 4 ? [...initial, finalDisclosure] : initial;
-      return { controls, total: controls.length };
+      return renderedEnumeration(controls);
     },
     pageUrl: () => 'https://creator.example/',
   });
@@ -329,7 +347,7 @@ test('executing click loop counts queued controls left beyond the click cap', as
     maxClicksPerPage: 4,
     deadlineExceeded: () => false,
     click: async () => { clicks++; return true; },
-    enumerate: async () => ({ controls: targets, total: targets.length }),
+    enumerate: async () => renderedEnumeration(targets),
     pageUrl: () => 'https://creator.example/',
   });
   assert.equal(clicks, 4);
@@ -402,11 +420,15 @@ test('zero-candidate interaction gaps stay retryable even with permanent-only li
 
 test('rendered control coverage counts overflow and uses stable markers across DOM mutations', () => {
   const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
-  assert.match(source, /return \{ controls, total: matched\.length \}/, 'the complete matched set is returned with its total');
+  assert.match(source, /return \{\s*controls,\s*total: nodes\.length,/, 'the complete matched set is returned with its pre-filter total');
+  assert.match(source, /hintRejected: Math\.max\(0, nodes\.length - controls\.length\)/, 'hint-rejected is the pre-filter denominator minus matched controls');
+  assert.match(source, /structuralNavigation,/, 'structural navigation controls are counted for P1.1');
+  assert.match(source, /iconLabelRecovered,/, 'icon/label recovery is counted for P1.2');
+  assert.match(source, /popupTargets,/, 'popup targets are counted for P1.3');
   assert.doesNotMatch(source, /matched\.slice\(0, 64\)/, 'enumeration must not truncate before the retry rotation');
   assert.match(source, /RENDERED_CONTROL_EVALUATION_WINDOW = 64/);
   assert.match(source, /const evaluationWindow = rotated\.slice\(0, windowSize\)/, 'the evaluation window is applied after rotating the full matched pool');
-  assert.match(source, /recordControlEnumeration\(firstEnumeration\.total\)/);
+  assert.match(source, /recordControlEnumeration\(firstEnumeration\)/);
   assert.match(source, /data-oc-control/);
   assert.match(source, /partitionRenderedClickTargets\(controls, page\.url\(\), limits\.maxClicksPerPage, limits\.clickOffset\)/, 'the retry offset rotates the full pool before the cap');
   assert.match(source, /const pendingQueuedTargets = Math\.max\(0, clickTargets\.length - clickIndex - 1\)/, 'queued-but-unclicked controls consume the remaining budget');
@@ -427,8 +449,13 @@ test('rendered control coverage counts overflow and uses stable markers across D
   assert.match(source, /telemetry\.evidenceControlsUncertified = evidenceControlsUncertified \|\| undefined/);
   assert.match(source, /clickLoop\.firstFailedTargetIndex/, 'the crawl stops rotation at the first failed control');
   assert.match(source, /if \(pageClickWindowPending\) evidenceControlsUncertified = true/, 'a throw during a clickable page leaves the seed uncertified');
+  assert.match(source, /scrollCapReachedStillGrowing = true/, 'the scroll cap records when the page was still growing');
+  assert.match(source, /page\.evaluate\(collectRenderedPageContext\)/, 'frame/shadow/base-href context is collected per page');
+  assert.match(source, /telemetry\.coverageReason = resolveRenderedCoverageReason\(/, 'the crawl publishes a diagnostic coverage reason');
+  assert.match(source, /telemetry\.controlsEnumeratedTotal = controlsEnumeratedTotal \|\| undefined/, 'pre-filter control totals are persisted');
+  assert.match(source, /telemetry\.navigationPolicyExcluded = /, 'navigation policy exclusions are persisted');
   assert.equal(
-    (source.match(/publishEvidenceControlCertificate\(\);/g) || []).length,
+    (source.match(/publishEvidenceControlCertificate\(/g) || []).length,
     2,
     'both the success and catch paths publish the control certificate to telemetry',
   );
