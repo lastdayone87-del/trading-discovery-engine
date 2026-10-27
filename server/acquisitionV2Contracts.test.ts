@@ -61,6 +61,27 @@ test('v2: required-set discovery uses the enqueue predicate exactly', () => {
   assert.equal(normalizeVisitUrl('not a url'), null);
 });
 
+// P1.5: static link resolution honors the document's first <base href>, so a
+// relative community link is discovered where the page actually points.
+test('v2: required-set discovery resolves relative hrefs against <base href>', () => {
+  const links = discoverRequiredSeedLinks(
+    '<base href="/community/"><a href="join">join the community</a>',
+    PAGE,
+  );
+  assert.deepEqual(links, ['https://creator.example.com/community/join']);
+});
+
+// P1.5: a cross-host base makes relative links resolve off-host; they cannot
+// become same-host required obligations, while absolute same-host links still
+// work.
+test('v2: cross-host <base href> cannot create same-host required links', () => {
+  const links = discoverRequiredSeedLinks(
+    '<base href="https://cdn.example.net/community/"><a href="join">join the community</a><a href="https://creator.example.com/community">c</a>',
+    PAGE,
+  );
+  assert.deepEqual(links, ['https://creator.example.com/community']);
+});
+
 // Seed fan-out: bare/www duplicates collapse; distinct coverage never merges.
 const html = (body: string) =>
   new Response(`<html><body>${body}</body></html>`, { status: 200, headers: { 'content-type': 'text/html' } });
@@ -766,6 +787,55 @@ test('v2 review: shared static roots skip refetch but still acquire children', a
   assert.equal(rootRows.length, 1);
   assert.equal(rootRows[0].sharedEvidenceFrom, 'https://dup.example.com/');
   assert.equal(rootRows[0].telemetry?.pagesInspected, 1);
+});
+
+// P1.5: static navigation must resolve anchors against the document's
+// <base href>, not just the response URL, or a relative invite page is never
+// scanned.
+test('v2 review: static crawl resolves anchors against the document base href', async () => {
+  const fetched: string[] = [];
+  const result = await crawlExternalLinks(
+    ['https://base.example.com/guide'],
+    [],
+    undefined,
+    (async (input) => {
+      const url = String(input);
+      fetched.push(url);
+      if (url === 'https://base.example.com/guide') {
+        return html('<base href="/community/"><a href="join">join the community</a>');
+      }
+      return noInviteHtml();
+    }) as typeof fetch,
+  );
+  assert.ok(
+    result.rootNavigation?.some((item) => item.url === 'https://base.example.com/community/join'),
+    'root navigation resolves the relative join link against <base href>',
+  );
+  assert.ok(
+    fetched.includes('https://base.example.com/community/join'),
+    'the static crawler fetches the base-resolved invite page',
+  );
+});
+
+test('v2 review: static crawl resolves dynamic targets against the document base href', async () => {
+  const fetched: string[] = [];
+  await crawlExternalLinks(
+    ['https://base.example.com/guide'],
+    [],
+    undefined,
+    (async (input) => {
+      const url = String(input);
+      fetched.push(url);
+      if (url === 'https://base.example.com/guide') {
+        return html('<base href="/community/"><div data-href="members">members area</div>');
+      }
+      return noInviteHtml();
+    }) as typeof fetch,
+  );
+  assert.ok(
+    fetched.includes('https://base.example.com/community/members'),
+    'the static crawler fetches the base-resolved dynamic target',
+  );
 });
 
 test('v2 review: shared static root replay carries lender community intent to the borrower', async () => {
