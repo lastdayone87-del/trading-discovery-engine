@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { planRevealedRenderedClickTargets, remainingRenderedClickBudget, resolveRenderedCompletionState, runRenderedClickLoop } from './browserCommunityFallback';
+import { planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, resolveRenderedCompletionState, runRenderedClickLoop } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -63,6 +63,28 @@ test('an evidence-bearing interaction gap keeps a processed run incomplete and r
   });
   assert.equal(clean.complete, true, 'without a gap the processed run still resolves clean');
   assert.equal(clean.retryable, false);
+});
+
+test('the evaluation window rotates over the full matched-control pool so control 65 is reachable', () => {
+  const controls = Array.from({ length: 70 }, (_, index) => renderedButton(index, `oc-${index + 1}`));
+  const firstWindow = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 0);
+  assert.equal(firstWindow.evaluationWindow.length, 64);
+  assert.deepEqual(firstWindow.toClick.map(target => target.marker), ['oc-1', 'oc-2', 'oc-3', 'oc-4']);
+
+  const rotatedWindow = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 64);
+  assert.equal(rotatedWindow.evaluationWindow.length, 64);
+  assert.deepEqual(
+    rotatedWindow.toClick.map(target => target.marker),
+    ['oc-65', 'oc-66', 'oc-67', 'oc-68'],
+    'the durable retry offset reaches controls beyond the first 64',
+  );
+
+  // 64-control regression: a full window still wraps to the first control and
+  // never invents a 65th target.
+  const sixtyFour = controls.slice(0, 64);
+  const wrapped = partitionRenderedClickTargets(sixtyFour, 'https://creator.example/', 4, 64);
+  assert.equal(wrapped.evaluationWindow.length, 64);
+  assert.deepEqual(wrapped.toClick.map(target => target.marker), ['oc-1', 'oc-2', 'oc-3', 'oc-4']);
 });
 
 test('revealed controls reserve the click slots for already-queued controls', () => {
@@ -242,7 +264,10 @@ test('zero-candidate interaction gaps stay retryable even with permanent-only li
 
 test('rendered control coverage counts overflow and uses stable markers across DOM mutations', () => {
   const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
-  assert.match(source, /return \{ controls, total: matched\.length \}/, 'total matches are returned before the 64-item slice');
+  assert.match(source, /return \{ controls, total: matched\.length \}/, 'the complete matched set is returned with its total');
+  assert.doesNotMatch(source, /matched\.slice\(0, 64\)/, 'enumeration must not truncate before the retry rotation');
+  assert.match(source, /RENDERED_CONTROL_EVALUATION_WINDOW = 64/);
+  assert.match(source, /const evaluationWindow = rotated\.slice\(0, windowSize\)/, 'the evaluation window is applied after rotating the full matched pool');
   assert.match(source, /recordControlEnumeration\(firstEnumeration\.total\)/);
   assert.match(source, /data-oc-control/);
   assert.match(source, /partitionRenderedClickTargets\(controls, page\.url\(\), limits\.maxClicksPerPage, limits\.clickOffset\)/, 'the retry offset rotates the full pool before the cap');
@@ -257,6 +282,8 @@ test('rendered control coverage counts overflow and uses stable markers across D
     'queued controls beyond the click cap are counted as skipped');
   assert.match(source, /if \(!input\.deadlineExceeded\(\)\) \{[\s\S]*?const refreshed = await input\.enumerate\(\)/,
     'the loop re-enumerates after every click, including the final permitted click');
+  assert.match(source, /telemetry\.evidenceControlsTotal = evidenceControlsSeen \|\| undefined/);
+  assert.match(source, /telemetry\.evidenceControlsSkipped = evidenceControlsSkipped \|\| undefined/);
 });
 
 test('shared rendered evidence stays fail-closed: gapped/timed-out lenders never enter inventory', () => {

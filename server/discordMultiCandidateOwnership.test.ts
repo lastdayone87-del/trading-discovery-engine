@@ -3,7 +3,7 @@ import test from 'node:test';
 import {crawlExternalLinks as crawlExternalLinksImpl,runChannelInspection as runChannelInspectionImpl} from './inspector';
 import { crawlExternalLinksForTest as crawlExternalLinks, runChannelInspectionForTest as runChannelInspection } from './testCrawlHelpers';
 import {extractDiscordCandidates,mergeDiscordCandidates} from './discordCandidates';
-import {discordCandidateCompositeRank} from './discordOwnershipSelection';
+import {discordCandidateCompositeRank,isUsableDiscordValidation} from './discordOwnershipSelection';
 
 const html=(body:string,url:string)=>{const response=new Response(body,{status:200,headers:{'content-type':'text/html'}});Object.defineProperty(response,'url',{value:url});return response;};
 
@@ -37,12 +37,36 @@ test('ownership sorting keeps direct creator evidence ahead of affiliate-only ev
   assert.equal(merged[0].nativeInviteCode,'creator');assert.equal(merged[0].ownershipStatus,'CREATOR_OWNED');assert.equal(merged.find(candidate=>candidate.nativeInviteCode==='partner')?.ownershipStatus,'THIRD_PARTY');
 });
 
-test('creator ownership outranks a healthier third-party Discord during final selection',()=>{
+test('an ambiguous creator success cannot outrank a genuinely usable third-party invite',()=>{
   const creator=mergeDiscordCandidates(extractDiscordCandidates('https://discord.gg/creator','YOUTUBE_ABOUT','https://youtube.test/channel'))[0];
   const partner=mergeDiscordCandidates(extractDiscordCandidates('https://discord.gg/partner','CREATOR_WEBSITES','https://broker.test/referral/creator'))[0];
-  const creatorAmbiguous={operationalOutcome:'SUCCEEDED',relevanceStatus:'UNCERTAIN',status:'UNCERTAIN'};
-  const partnerActive={operationalOutcome:'SUCCEEDED',relevanceStatus:'TRADING_RELEVANT',status:'ACTIVE'};
-  assert.ok(discordCandidateCompositeRank(creator,creatorAmbiguous)>discordCandidateCompositeRank(partner,partnerActive));
+  const creatorAmbiguous={operationalOutcome:'SUCCEEDED',relevanceStatus:'UNCERTAIN',status:'UNCERTAIN',inviteUrl:null};
+  const partnerActive={operationalOutcome:'SUCCEEDED',relevanceStatus:'TRADING_RELEVANT',status:'ACTIVE',inviteUrl:'https://discord.gg/partner'};
+  assert.ok(discordCandidateCompositeRank(partner,partnerActive)>discordCandidateCompositeRank(creator,creatorAmbiguous));
+});
+
+test('creator ownership remains authoritative when both candidates are genuinely usable',()=>{
+  const creator=mergeDiscordCandidates(extractDiscordCandidates('https://discord.gg/creator','YOUTUBE_ABOUT','https://youtube.test/channel'))[0];
+  const partner=mergeDiscordCandidates(extractDiscordCandidates('https://discord.gg/partner','CREATOR_WEBSITES','https://broker.test/referral/creator'))[0];
+  const creatorActive={operationalOutcome:'SUCCEEDED',relevanceStatus:'TRADING_RELEVANT',status:'ACTIVE',inviteUrl:'https://discord.gg/creator'};
+  const partnerActive={operationalOutcome:'SUCCEEDED',relevanceStatus:'TRADING_RELEVANT',status:'ACTIVE',inviteUrl:'https://discord.gg/partner'};
+  assert.ok(discordCandidateCompositeRank(creator,creatorActive)>discordCandidateCompositeRank(partner,partnerActive));
+});
+
+test('ambiguous success still outranks an operationally unavailable candidate',()=>{
+  const creator=mergeDiscordCandidates(extractDiscordCandidates('https://discord.gg/creator','YOUTUBE_ABOUT','https://youtube.test/channel'))[0];
+  const partner=mergeDiscordCandidates(extractDiscordCandidates('https://discord.gg/partner','CREATOR_WEBSITES','https://broker.test/referral/creator'))[0];
+  const creatorAmbiguous={operationalOutcome:'SUCCEEDED',relevanceStatus:'UNCERTAIN',status:'UNCERTAIN',inviteUrl:null};
+  const partnerTimeout={operationalOutcome:'TIMEOUT',relevanceStatus:'NOT_CHECKED',status:'UNCERTAIN'};
+  assert.ok(discordCandidateCompositeRank(creator,creatorAmbiguous)>discordCandidateCompositeRank(partner,partnerTimeout));
+});
+
+test('usable requires a serving status and a non-null invite when supplied',()=>{
+  assert.equal(isUsableDiscordValidation({operationalOutcome:'SUCCEEDED',status:'ACTIVE',relevanceStatus:'TRADING_RELEVANT',inviteUrl:'https://discord.gg/room'}),true);
+  assert.equal(isUsableDiscordValidation({operationalOutcome:'SUCCEEDED',status:'ACTIVE_LOW_VOLUME',relevanceStatus:'TRADING_RELEVANT'}),true);
+  assert.equal(isUsableDiscordValidation({operationalOutcome:'SUCCEEDED',status:'UNCERTAIN',relevanceStatus:'UNCERTAIN',inviteUrl:null}),false);
+  assert.equal(isUsableDiscordValidation({operationalOutcome:'SUCCEEDED',status:'ACTIVE',relevanceStatus:'TRADING_RELEVANT',inviteUrl:null}),false);
+  assert.equal(isUsableDiscordValidation({operationalOutcome:'CONFIRMED_INVALID',status:'DEAD',relevanceStatus:'NOT_CHECKED',inviteUrl:null}),false);
 });
 
 test('explicit trading context still permits rendered fallback when creator DB lookup is unavailable',async()=>{

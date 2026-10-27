@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { formatFoundAgo } from './relativeTime';
+import { formatFoundAgo, formatLastVerifiedAgo } from './relativeTime';
 
 const now = Date.parse('2026-10-20T18:00:00.000Z');
 
@@ -21,4 +21,12 @@ test('confirmation age is rendered from the supplied timestamp, not channel firs
 
 test('future timestamps clamp instead of producing a negative age', () => {
   assert.equal(formatFoundAgo('2026-10-20T18:05:00.000Z', now), 'Found just now');
+});
+
+test('last-verified age uses the same bounded contract with verification wording', () => {
+  assert.equal(formatLastVerifiedAgo(null, now), null);
+  assert.equal(formatLastVerifiedAgo('not-a-date', now), null);
+  assert.equal(formatLastVerifiedAgo('2026-10-20T17:59:30.000Z', now), 'Verified just now');
+  assert.equal(formatLastVerifiedAgo('2026-10-20T12:00:00.000Z', now), 'Verified 6h ago');
+  assert.equal(formatLastVerifiedAgo('2026-10-15T18:00:00.000Z', now), 'Verified 5d ago');
 });

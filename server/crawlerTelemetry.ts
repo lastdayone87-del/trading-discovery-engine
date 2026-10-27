@@ -229,6 +229,19 @@ export interface CrawlerTelemetry {
   rateLimitedRequests: number;
   hostBackoffsApplied: number;
   /**
+   * Bounded rendered-control coverage certificate (counts only, never
+   * selectors/text/URLs). `Total` is the complete matched-control set on
+   * processed pages; `Skipped` is the subset not examined because of the
+   * 64-control evaluation window or click budget. Sparse: omitted when no
+   * evidence-bearing control was enumerated or the row predates
+   * instrumentation. Persisting these distinguishes 64-overflow from ordinary
+   * click-budget slicing in production.
+   */
+  evidenceControlsTotal?: number;
+  evidenceControlsClicked?: number;
+  evidenceControlsFailed?: number;
+  evidenceControlsSkipped?: number;
+  /**
    * Compact per-crawl drop/stop counters keyed by CRAWL_DROP_REASONS
    * (ints only, taxonomy-bounded to 13 keys — never URLs or payloads).
    * Tells future investigations where candidate URLs were lost. Sparse:
@@ -550,6 +563,18 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
     blockedRequests: number(candidate.blockedRequests),
     rateLimitedRequests: number(candidate.rateLimitedRequests),
     hostBackoffsApplied: number(candidate.hostBackoffsApplied),
+    ...(candidate.mode === 'RENDERED' && number(candidate.evidenceControlsTotal) > 0
+      ? { evidenceControlsTotal: number(candidate.evidenceControlsTotal) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.evidenceControlsClicked) > 0
+      ? { evidenceControlsClicked: number(candidate.evidenceControlsClicked) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.evidenceControlsFailed) > 0
+      ? { evidenceControlsFailed: number(candidate.evidenceControlsFailed) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.evidenceControlsSkipped) > 0
+      ? { evidenceControlsSkipped: number(candidate.evidenceControlsSkipped) }
+      : {}),
     ...(isRenderedLifecycleStage(stage) ? { lastLifecycleStage: stage } : {}),
     ...(isRenderedZeroPageReason(reason) ? { zeroPageReason: reason } : {}),
     ...(cause ? { launchCauseSnippet: cause } : {}),

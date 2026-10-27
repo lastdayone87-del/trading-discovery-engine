@@ -53,6 +53,50 @@ A validation result committed while classification was running therefore wins
 over the stale in-memory snapshot, and non-Discord fields still come from the
 caller. The insert path keeps the caller's defaults.
 
+## A1 last-known-good retention
+
+A provider lookup can succeed operationally while returning no serving invite
+and no usable relevance evidence (`SUCCEEDED` with a null `inviteUrl`,
+`relevanceStatus=UNCERTAIN`, and `status=UNCERTAIN`). That is ambiguity, not
+proof that the previously served invite is invalid. Before this fix the
+ambiguous result projected `UNCERTAIN`/null over a live selection, so a channel
+could stop serving an invite that was never shown to be dead.
+
+The retention invariant is now applied at three enforcement points:
+
+1. **Projection.** An ambiguous successful revalidation retains the current
+   serving invite, `discord_status` (`ACTIVE`/`ACTIVE_LOW_VOLUME`), candidate
+   identity/locator, resolution and discovery state. The existing
+   `discord_relevance_status` is set to `UNCERTAIN` to record that the current
+   revalidation is uncertain; no schema migration is required.
+2. **Startup exclusion audit.** A retained row is exempt from stale-invite
+   cleanup only when it has the full retained evidence (serving invite, live
+   liveness, completed validation, `VALIDATED` discovery, `UNCERTAIN`
+   relevance). `DEAD`/`NON_TRADING` rows and rejected-channel cleanup still
+   clear normally.
+3. **Upsert.** An ordinary stale-snapshot write cannot clear or downgrade a
+   locked row that still serves a completed, live, validated invite. Fresh
+   successful validations, terminal `DEAD`/`NON_TRADING` verdicts, and explicit
+   intentional cleanup (`allowDiscordClear`) still replace the projection.
+
+`rowToChannel` derives two read-only fields: `discord_invite_last_verified_at`
+(the latest successful serving attempt from `discord_check_attempts`) and
+`discord_invite_revalidation_uncertain` (the retained-last-known-good marker).
+The UI labels these rows “Previously verified … · currently uncertain” rather
+than presenting them as freshly validated.
+
+Candidate selection has a matching guard: a `SUCCEEDED` attempt with no usable
+serving invite cannot outrank a genuinely usable candidate solely because of
+its status. Usable means `SUCCEEDED`, `ACTIVE`/`ACTIVE_LOW_VOLUME`, and a
+non-null invite.
+
+Definitive invalidity is unchanged. `CONFIRMED_INVALID` for the same selected
+candidate still projects `DEAD`; `NON_TRADING` still clears the serving
+projection; rejected-channel cleanup still removes stale invites; and an
+explicit audit cleanup bypasses the upsert retention guard. Retention is not a
+substitute for validation and does not alter validation outcomes,
+classification, or attempt-ledger semantics.
+
 ## Regression coverage
 
 `server/discordStateProjectionPreservation.test.ts` covers:
@@ -75,7 +119,18 @@ caller. The insert path keeps the caller's defaults.
 - a classification-only upsert keeping the locked row's Discord projection:
   a stale `ACTIVE` snapshot cannot resurrect a concurrent `DEAD` verdict, and
   a stale `DEAD` snapshot cannot downgrade a newer live projection
-  (`server/channelUpsertDiscordProjection.postgres.test.ts`).
+  (`server/channelUpsertDiscordProjection.postgres.test.ts`);
+- A1 retention: an ambiguous `SUCCEEDED` revalidation keeps the serving invite,
+  status, and candidate identity, records uncertainty in
+  `discord_relevance_status`, and derives the last-verified timestamp from the
+  serving attempt;
+- A1 clearing paths: `CONFIRMED_INVALID`/`DEAD`, `NON_TRADING`, stale-invite
+  audit cleanup, rejected-channel cleanup, and explicit `allowDiscordClear`
+  still clear;
+- A1 candidate selection: an ambiguous successful candidate cannot outrank a
+  usable candidate, while a genuinely usable candidate still wins normally;
+- A1 startup audit: a full-evidence retained `UNCERTAIN` row is exempt, while
+  partial evidence and terminal rows are still cleaned.
 
 ## Separate follow-ups (not changed here)
 

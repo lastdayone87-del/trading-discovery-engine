@@ -77,5 +77,11 @@ test('recent invite sorting is server-side and has a stable channel tie-breaker'
   assert.match(ui, /Recently confirmed/);
   assert.match(ui, /Found time unavailable/);
   assert.match(ui, /formatFoundAgo\(c\.discord_invite_first_validated_at\)/);
+  assert.match(ui, /formatLastVerifiedAgo\(c\.discord_invite_last_verified_at\)/);
+  assert.match(ui, /Previously verified.*currently uncertain/);
+  assert.match(db, /DISCORD_INVITE_LAST_VERIFIED_SQL/);
+  assert.match(db, /operational_outcome='SUCCEEDED'/);
+  assert.match(db, /semantic_status IN \('ACTIVE','ACTIVE_LOW_VOLUME'\)/);
+  assert.match(db, /discord_invite_last_verified_at: iso\(row\.discord_invite_last_verified_at\)/);
   assert.doesNotMatch(ui, /audit checkbox|reviewed marker|unaudited/i);
 });

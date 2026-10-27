@@ -319,6 +319,47 @@ const PAGE_ASSET_INFRASTRUCTURE_HOSTS = [
   'youtubei-att.googleapis.com',
   'gstatic.com',
 ];
+
+/**
+ * Unmistakable asset/CDN hosts that can never serve a creator community page.
+ * These are deliberately host-level only where the entire host is a media or
+ * static-bundle CDN (Meta/Instagram, Twitter, Google avatars, Cloudinary,
+ * imgix, image proxies, WordPress Photon, code CDNs). Social/profile hosts and
+ * invite hosts are NOT listed: `instagram.com`, `x.com`, `discord.gg`, and
+ * `discordapp.com/invite/...` remain eligible. Generic CDNs that can host
+ * entire sites (`cloudfront.net`, `amazonaws.com`) are also deliberately
+ * excluded.
+ */
+const NON_PAGE_ASSET_CDN_HOSTS = [
+  'fbcdn.net',
+  'cdninstagram.com',
+  'twimg.com',
+  'ggpht.com',
+  'googleusercontent.com',
+  'cloudinary.com',
+  'imgix.net',
+  'weserv.nl',
+  'wsrv.nl',
+  'i0.wp.com',
+  'i1.wp.com',
+  'i2.wp.com',
+  'i3.wp.com',
+  'wixstatic.com',
+  'jsdelivr.net',
+  'unpkg.com',
+  'cdnjs.cloudflare.com',
+  'pinimg.com',
+  'licdn.com',
+  'sndcdn.com',
+  'scdn.co',
+  'spotifycdn.com',
+  'tiktokcdn.com',
+  'tiktokcdn-us.com',
+  'substackcdn.com',
+  'cdn.discordapp.com',
+  'media.discordapp.net',
+];
+const ASSET_INFRASTRUCTURE_HOSTS = [...PAGE_ASSET_INFRASTRUCTURE_HOSTS, ...NON_PAGE_ASSET_CDN_HOSTS];
 export function isPageAssetInfrastructureUrl(rawUrl: string): boolean {
   // Scheme-less links get the same https fallback as normalizeExternalUrl so
   // valid creator links (e.g. `example.com/community`) are never dropped;
@@ -329,7 +370,7 @@ export function isPageAssetInfrastructureUrl(rawUrl: string): boolean {
     try {
       const host = new URL(candidate).hostname.toLowerCase().replace(/\.$/, '');
       if (!host) return true;
-      if (PAGE_ASSET_INFRASTRUCTURE_HOSTS.some(entry => host === entry || host.endsWith(`.${entry}`))) return true;
+      if (ASSET_INFRASTRUCTURE_HOSTS.some(entry => host === entry || host.endsWith(`.${entry}`))) return true;
       return false;
     } catch {
       continue;
@@ -366,7 +407,9 @@ export type CrawlAdmissionReasonCode =
   | 'EMPTY_LABEL'
   | 'NON_PUBLIC_ADDRESS'
   | 'ASSET_HOST'
-  | 'RESOURCE_EXTENSION';
+  | 'RESOURCE_EXTENSION'
+  | 'NON_PAGE_PATH'
+  | 'MALFORMED_URL';
 
 export interface CrawlAdmissionDecision {
   eligible: boolean;
@@ -376,8 +419,25 @@ export interface CrawlAdmissionDecision {
 // Page-resource path suffixes that can never be community websites,
 // regardless of host. Mirrors the extraction-time asset-extension filter so
 // stored links cannot bypass it; document/feed types (pdf/rss/xml) are
-// intentionally NOT in this list and stay eligible.
-const RESOURCE_PATH_EXTENSION = /\.(?:js|mjs|css|map|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|eot|mp4|webm|mp3|wav|ogg|avi|mov|zip|gz|rar|7z|exe|dmg)(?:$)/i;
+// intentionally NOT in this list and stay eligible. The extension may be
+// followed by URL punctuation (`?`, `&`, `#`, `/`, quotes, encoded quote) or
+// end the path: template/CDN noise often appends transform parameters without
+// a `?` (for example `card.png&w=1920&q=75`). A dot inside a page slug
+// (`v1.2`, `.js.html`, `using-.js-files`) does not match because the
+// following character is not a delimiter.
+const RESOURCE_PATH_EXTENSION = /\.(?:js|mjs|css|map|png|jpe?g|gif|webp|svg|avif|apng|bmp|tiff?|heic|jfif|ico|woff2?|ttf|otf|eot|mp4|m4v|webm|mp3|m4a|aac|flac|wav|ogg|opus|avi|mov|3gp|zip|gz|rar|7z|exe|dmg)(?=$|[&;,%?"'#/\s])/i;
+
+// Image/thumbnail directories are asset trees, not HTML pages. Matching is
+// segment-anchored (`/images/`, not `images-and-media`) so ordinary page slugs
+// stay eligible.
+const NON_PAGE_PATH_PREFIX = /^\/(?:images?|img|thumbnails?|thumbs?|avatars?|icons?|photos?)\//i;
+
+// Template placeholders and script/quote artifacts emitted by indiscriminate
+// dynamic-attribute extraction (`{{link}}`, `${link}`, `%22%22;`,
+// `d,a.onload=function()%7B...`). Braces, angle brackets, backslashes, double
+// quotes, and control characters cannot appear in a legitimate page path;
+// single quotes are deliberately allowed (`/o'brien-community`).
+const MALFORMED_PATH = /[{}"<>\\\u0000-\u001F\u007F]|(?:^|[\/,;])(?:var|let|const|function)\b|\.(?:onload|onerror|onclick)\s*=|(?:^|[\/,;])(?:this|document|window)\./i;
 
 export function assessCrawlAdmission(rawUrl: string): CrawlAdmissionDecision {
   // Same scheme handling as `normalizeExternalUrl`: scheme-less input gets
@@ -425,8 +485,15 @@ export function assessCrawlAdmission(rawUrl: string): CrawlAdmissionDecision {
   if (isPageAssetInfrastructureUrl(parsed.toString())) {
     return { eligible: false, reasonCode: 'ASSET_HOST' };
   }
-  if (RESOURCE_PATH_EXTENSION.test(decodeResourcePathname(parsed.pathname))) {
+  const decodedPath = decodeResourcePathname(parsed.pathname);
+  if (RESOURCE_PATH_EXTENSION.test(decodedPath)) {
     return { eligible: false, reasonCode: 'RESOURCE_EXTENSION' };
+  }
+  if (NON_PAGE_PATH_PREFIX.test(decodedPath)) {
+    return { eligible: false, reasonCode: 'NON_PAGE_PATH' };
+  }
+  if (MALFORMED_PATH.test(decodedPath)) {
+    return { eligible: false, reasonCode: 'MALFORMED_URL' };
   }
   return { eligible: true, reasonCode: 'ELIGIBLE' };
 }

@@ -19,6 +19,7 @@ import { isYouTubePermanentInputError } from './youtubeKeyHealth';
 import { canonicalCountry } from './countryInference';
 import { classifyDiscoveryVisibility } from './discoveryStateVisibility';
 import { safeCrawlerTelemetry, type CrawlerTelemetry } from './crawlerTelemetry';
+import { hasRetainedLastKnownGoodDiscordInvite, hasServingLastKnownGoodDiscordInvite } from './discordProjection';
 import { validateLedgerInput, type ValidationKind, type ValidationStatus } from './phase3Validation';
 import { browserCapabilityIsUnavailable } from './browserCapability';
 import { STALE_CHANNEL_LOCK_AFTER_MINUTES, STALE_CHANNEL_LOCK_RECOVERY_BATCH_SIZE } from './staleChannelLockRecovery';
@@ -441,6 +442,8 @@ export function rowToChannel(row: any): ChannelRecord {
     discord_status: row.discord_status,
     discord_invite: row.discord_invite || null,
     discord_invite_first_validated_at: iso(row.discord_invite_first_validated_at),
+    discord_invite_last_verified_at: iso(row.discord_invite_last_verified_at),
+    discord_invite_revalidation_uncertain: hasRetainedLastKnownGoodDiscordInvite(row),
     scan_status: row.scan_status,
     scan_attempts: row.scan_attempts || 0,
     discovery_source: row.discovery_source,
@@ -627,6 +630,21 @@ export const DISCORD_INVITE_FIRST_VALIDATED_SQL = `(SELECT dc.first_validated_at
    ORDER BY CASE WHEN dc.candidate_id=channels.discord_candidate_id THEN 0 ELSE 1 END,
             dc.selected DESC,dc.first_validated_at DESC NULLS LAST
    LIMIT 1)`;
+/** Latest successful serving validation of the selected invite. Unlike
+ * `discord_invite_first_validated_at` (earliest confirmation), this answers
+ * "when was the currently served invite last verified?" from the append-only
+ * attempt ledger. A1-retained invites keep their serving attempt timestamp
+ * even after an ambiguous revalidation, so the UI can label them as previously
+ * verified rather than freshly validated. */
+export const DISCORD_INVITE_LAST_VERIFIED_SQL = `(SELECT MAX(a.checked_at)
+    FROM discord_check_attempts a
+   WHERE a.channel_id=channels.channel_id
+     AND a.operational_outcome='SUCCEEDED'
+     AND a.semantic_status IN ('ACTIVE','ACTIVE_LOW_VOLUME')
+     AND (
+       (channels.discord_candidate_id IS NOT NULL AND a.candidate_id=channels.discord_candidate_id)
+       OR lower(COALESCE(a.resolved_locator,a.invite_locator))=lower(COALESCE(channels.discord_candidate_locator,channels.discord_invite))
+     ))`;
 export const RECENT_INVITE_ORDER_SQL = 'discord_invite_first_validated_at DESC NULLS LAST,channel_id DESC';
 // This is the single definition of the operator-visible discovery corpus. Keep
 // both the paginated listing and dashboard aggregates anchored to this policy.
@@ -716,6 +734,7 @@ export async function listChannelsPage(args:ChannelListingFilter&{limit:number;o
     ${DISCORD_SELECTED_INVITE_CONFLICT_SQL} AS discord_selected_invite_conflict,
     (SELECT owner.channel_name FROM channels owner WHERE owner.channel_id=channels.discord_duplicate_owner_channel_id) discord_duplicate_owner_channel_name,
     ${DISCORD_INVITE_FIRST_VALIDATED_SQL} AS discord_invite_first_validated_at,
+    ${DISCORD_INVITE_LAST_VERIFIED_SQL} AS discord_invite_last_verified_at,
     (SELECT COUNT(*)::int FROM discord_candidates dc WHERE dc.channel_id=channels.channel_id) candidate_count,
     COALESCE((SELECT jsonb_agg((to_jsonb(dc) || jsonb_build_object('display_locator', (SELECT COALESCE(a.resolved_locator, a.invite_locator) FROM discord_check_attempts a WHERE a.channel_id=dc.channel_id AND lower(COALESCE(a.resolved_locator, a.invite_locator))=dc.normalized_locator ORDER BY a.checked_at DESC LIMIT 1))) ORDER BY dc.selected DESC,dc.last_checked DESC NULLS LAST,dc.discovered_at) FROM discord_candidates dc WHERE dc.channel_id=channels.channel_id AND dc.candidate_status='VALIDATED' AND dc.validation_status='COMPLETED' AND dc.liveness_status='ACTIVE'),'[]'::jsonb) discord_candidates,
     (SELECT status FROM jobs WHERE type='POST_APPROVAL_ENRICH' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) post_approval_job_status,
@@ -894,6 +913,29 @@ export function overlayLockedDiscordProjection<T extends Partial<ChannelRecord>>
   return merged as T;
 }
 
+/**
+ * A1 targeted last-known-good guard for ordinary (non-classification) writes.
+ * A caller may load a channel before a validation commits, then persist its
+ * stale snapshot after it. When the locked row still serves a completed, live,
+ * validated invite and the proposed write would clear or downgrade that
+ * projection, retain the locked Discord fields. Definitive terminal outcomes
+ * (DEAD/NON_TRADING) and explicit intentional cleanup still apply. This is
+ * deliberately narrower than making `preserveDiscordOnUpdate` the default:
+ * fresh validation writes with a usable invite, and terminal verdicts, must
+ * continue to replace the projection.
+ */
+export function shouldRetainLockedDiscordProjection(
+  proposed:Partial<ChannelRecord>,
+  locked:Partial<ChannelRecord>|null|undefined,
+  options?:{allowDiscordClear?:boolean},
+):boolean{
+  if(!locked||options?.allowDiscordClear)return false;
+  if(!hasServingLastKnownGoodDiscordInvite(locked))return false;
+  if(proposed.discord_status==='DEAD'||proposed.discord_status==='NON_TRADING')return false;
+  return !proposed.discord_invite
+    ||(proposed.discord_status!=='ACTIVE'&&proposed.discord_status!=='ACTIVE_LOW_VOLUME');
+}
+
 type ChannelUpsertClient = { query: (text: string, params?: unknown[]) => Promise<unknown> };
 
 /**
@@ -945,7 +987,7 @@ ON CONFLICT(channel_id) DO UPDATE SET
   ]);
 }
 
-export async function upsertChannel(channel: ChannelRecord, options?: { preserveDiscordOnUpdate?: boolean }): Promise<void> {
+export async function upsertChannel(channel: ChannelRecord, options?: { preserveDiscordOnUpdate?: boolean; allowDiscordClear?: boolean }): Promise<void> {
   const db = await getDb();
   const client = await db.connect();
   try {
@@ -954,13 +996,18 @@ export async function upsertChannel(channel: ChannelRecord, options?: { preserve
       `SELECT quality_score,trading_status,${DISCORD_PROJECTION_WRITE_COLUMNS.join(',')} FROM channels WHERE channel_id=$1 FOR UPDATE`,
       [channel.channel_id]
     );
-    // The row is locked above for this transaction: a classification-only write
+    // The row is locked above for this transaction. A classification-only write
     // must not push its stale Discord snapshot over a validation result that
-    // committed while classification was running.
-    if (options?.preserveDiscordOnUpdate && prior.rowCount) {
-      channel = overlayLockedDiscordProjection(channel, prior.rows[0]);
+    // committed while classification was running. Ordinary writes get the
+    // narrower A1 guard: only a would-be clear/downgrade of a locked
+    // last-known-good serving invite is retained.
+    const locked = prior.rowCount ? prior.rows[0] : null;
+    const preserveDiscord = options?.preserveDiscordOnUpdate === true
+      || shouldRetainLockedDiscordProjection(channel, locked, options);
+    if (preserveDiscord && locked) {
+      channel = overlayLockedDiscordProjection(channel, locked);
     }
-    await writeChannelUpsert(client, channel, options);
+    await writeChannelUpsert(client, channel, { preserveDiscordOnUpdate: preserveDiscord });
     if (prior.rowCount) {
       const before = isQualityCreator(prior.rows[0].trading_status, Number(prior.rows[0].quality_score || 0));
       const after = isQualityCreator(channel.trading_status || 'UNCERTAIN', Number(channel.quality_score || 0));

@@ -57,7 +57,7 @@ import { runChannelInspection, hasProcessedAcquisitionEvidence } from './inspect
 import { hasRetryableCommunityAcquisitionFailure } from './communityRetryPolicy';
 import { applyCommunityIntentEvidence } from './communityIntent';
 import { validateDiscordInvite } from './discordValidator';
-import {canProjectDiscordValidation,hasEstablishedValidatedDiscordSelection,projectDiscordValidation,reconcileDiscordDiscoveryFromInspection} from './discordProjection';
+import {canProjectDiscordValidation,hasEstablishedValidatedDiscordSelection,hasRetainedLastKnownGoodDiscordInvite,projectDiscordValidation,reconcileDiscordDiscoveryFromInspection} from './discordProjection';
 import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, fetchYouTubeChannelCountryMetadata, DiscoveredChannelRaw, RetrievalLane } from './youtube';
 import {buildProviderRequestBaseId,executeAllocatedRetrievalPage,providerSnapshot,YOUTUBE_SEARCH_PROVIDER,type ProviderAllocation} from './providerAwareRetrieval';
 import './braveSearch';
@@ -2149,7 +2149,16 @@ export async function inspectAndValidateChannel(
       if(!selected&&terminalInvalid.length===candidates.filter(candidate=>candidate.nativeInviteCode).length){selected=terminalInvalid[0];selectedCandidate=candidates[0];}
       if(!selected)throw new Error('No resolvable native Discord candidate was available for validation');
       const shouldProjectValidation=canProjectDiscordValidation(channel,selected,selectedCandidate);
-      if(shouldProjectValidation){Object.assign(channel,projectDiscordValidation(channel,selected,selectedCandidate));await selectDiscordCandidate(channel.channel_id,selectedCandidate.candidateId);}
+      if(shouldProjectValidation){
+        // Project first, then select the candidate that the projection actually
+        // serves. A1 retention can keep the previous serving candidate while
+        // the ambiguous winner is a different candidate; selecting the winner
+        // unconditionally would leave `discord_candidates.selected` pointing at
+        // an invite the channel does not serve.
+        const projectedDiscord=projectDiscordValidation(channel,selected,selectedCandidate);
+        Object.assign(channel,projectedDiscord);
+        if(projectedDiscord.discord_candidate_id)await selectDiscordCandidate(channel.channel_id,projectedDiscord.discord_candidate_id);
+      }
       attemptFree=attemptFreeDiscordValidation(selected.operationalOutcome,selected.retryable);
       channel.scan_status=selected.operationalOutcome==='SUCCEEDED'||selected.operationalOutcome==='CONFIRMED_INVALID'?'COMPLETED':'FAILED';
       channel.scan_attempts=selected.operationalOutcome==='SUCCEEDED'||selected.operationalOutcome==='CONFIRMED_INVALID'?0:attemptFree?Math.max(0,channel.scan_attempts):nextChannelScanAttempts(channel.scan_attempts,false);
@@ -2619,6 +2628,12 @@ export interface ExclusionAuditBatchRow {
   discord_invite: string | null;
   scan_status: string;
   cursor_seen: string;
+  /** Retention evidence for A1. Optional so older test doubles and narrow
+   * callers remain valid; production always selects these columns. */
+  discord_liveness_status?: string | null;
+  discord_validation_status?: string | null;
+  discord_discovery_status?: string | null;
+  discord_relevance_status?: string | null;
 }
 export interface ExclusionAuditDb {
   query: (sql: string, params: any[]) => Promise<{ rows: ExclusionAuditBatchRow[]; rowCount: number | null }>;
@@ -2640,7 +2655,7 @@ export async function fetchExclusionAuditBatch(
     ? `country_status = 'REJECTED' AND discord_status IN ('DEAD','NON_TRADING','UNCERTAIN') AND discord_invite IS NOT NULL`
     : `country_status IS DISTINCT FROM 'REJECTED'`;
   const res = await db.query(
-    `SELECT channel_id, channel_name, country, discord_status, discord_invite, scan_status, first_seen::text AS cursor_seen FROM channels WHERE ${statusPredicate} AND ($1::timestamptz IS NULL OR (first_seen, channel_id) < ($1::timestamptz, $2::text)) ORDER BY first_seen DESC, channel_id DESC LIMIT $3`,
+    `SELECT channel_id, channel_name, country, discord_status, discord_invite, scan_status, discord_liveness_status, discord_validation_status, discord_discovery_status, discord_relevance_status, first_seen::text AS cursor_seen FROM channels WHERE ${statusPredicate} AND ($1::timestamptz IS NULL OR (first_seen, channel_id) < ($1::timestamptz, $2::text)) ORDER BY first_seen DESC, channel_id DESC LIMIT $3`,
     [cursor.cursorSeen, cursor.cursorId, limit]
   );
   const rows = res.rows;
@@ -2668,6 +2683,10 @@ export function decideExclusionAuditRowAction(input: {
   discordStatus: unknown;
   discordInvite: unknown;
   scanStatus?: unknown;
+  discordLivenessStatus?: unknown;
+  discordValidationStatus?: unknown;
+  discordDiscoveryStatus?: unknown;
+  discordRelevanceStatus?: unknown;
 }): ExclusionAuditRowAction {
   // The status branch runs first so a fresh REJECTED write is never blocked by
   // a stale invite, matching the pre-batching if/else-if order. Already-
@@ -2676,12 +2695,26 @@ export function decideExclusionAuditRowAction(input: {
   // DEAD/NON_TRADING/UNCERTAIN channel is cleared.
   if (input.validationStatus === 'REJECTED' && !input.alreadyRejected) return 'reject-write';
   if (
-    (input.discordStatus === 'DEAD' ||
-      input.discordStatus === 'NON_TRADING' ||
-      input.discordStatus === 'UNCERTAIN') &&
+    (input.discordStatus === 'DEAD' || input.discordStatus === 'NON_TRADING') &&
     input.discordInvite !== null
   ) {
+    return 'invite-cleanup';
+  }
+  if (input.discordStatus === 'UNCERTAIN' && input.discordInvite !== null) {
     if (!input.alreadyRejected && input.scanStatus === 'NEEDS_REVIEW') return 'none';
+    // A1 last-known-good retention: a retained serving invite may carry the
+    // mutable top-level status UNCERTAIN (for example after a later status
+    // reset). Its completed/live/validated evidence makes it intentionally
+    // retained, not stale. Definitive DEAD/NON_TRADING rows above still clear,
+    // and rejected-cleanup still enforces terminal invite hygiene.
+    if (!input.alreadyRejected && hasRetainedLastKnownGoodDiscordInvite({
+      discord_status: input.discordStatus,
+      discord_invite: input.discordInvite,
+      discord_liveness_status: input.discordLivenessStatus,
+      discord_validation_status: input.discordValidationStatus,
+      discord_discovery_status: input.discordDiscoveryStatus,
+      discord_relevance_status: input.discordRelevanceStatus,
+    })) return 'none';
     return 'invite-cleanup';
   }
   return 'none';
@@ -2731,7 +2764,11 @@ export async function auditExistingChannelsWithExclusionEngine(): Promise<{ tota
             validationStatus: valRes?.status ?? '',
             discordStatus: candidate.discord_status,
             discordInvite: candidate.discord_invite,
-            scanStatus: candidate.scan_status
+            scanStatus: candidate.scan_status,
+            discordLivenessStatus: candidate.discord_liveness_status,
+            discordValidationStatus: candidate.discord_validation_status,
+            discordDiscoveryStatus: candidate.discord_discovery_status,
+            discordRelevanceStatus: candidate.discord_relevance_status
           });
           if (action === 'reject-write') {
             if (!valRes) continue; // unreachable: only non-rejected rows can write a rejection
@@ -2766,7 +2803,10 @@ export async function auditExistingChannelsWithExclusionEngine(): Promise<{ tota
             const channel = await getChannelById(candidate.channel_id);
             if (!channel) continue;
             channel.discord_invite = null;
-            await upsertChannel(channel);
+            // This is an intentional cleanup decision, not a stale snapshot:
+            // bypass the last-known-good upsert guard while still applying the
+            // normal persistence rule.
+            await upsertChannel(channel, { allowDiscordClear: true });
             cleanedInvites++;
           }
         }

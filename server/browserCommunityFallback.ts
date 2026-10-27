@@ -68,6 +68,12 @@ export interface BrowserFallbackTelemetry {
   clicksStarted: number;
   clicksSucceeded: number;
   clicksFailed: number;
+  /** Bounded control-coverage certificate (counts only). Sparse: omitted when
+   * no evidence-bearing control was enumerated. */
+  evidenceControlsTotal?: number;
+  evidenceControlsClicked?: number;
+  evidenceControlsFailed?: number;
+  evidenceControlsSkipped?: number;
   clickFailureClasses: Record<RenderedCrawlerFailureClass, number>;
   /**
    * Additive per-click failure taxonomy (fixed 7 keys; see
@@ -528,6 +534,38 @@ export interface RenderedControlTarget {
   tag?: 'anchor' | 'button' | 'role';
 }
 
+/**
+ * Browser-context enumeration shared by production and the real-DOM fixture.
+ * It must stay self-contained: Playwright serializes this function into the
+ * page, so it may only reference its arguments and browser globals. It returns
+ * the complete matched set (never a prefix slice) so the caller can rotate the
+ * full pool by the durable retry offset before applying the evaluation window.
+ */
+export function enumerateRenderedControlNodes(
+  nodes: Element[],
+  pattern: string,
+): { controls: RenderedControlTarget[]; total: number } {
+  const re = new RegExp(pattern, 'i');
+  const matched = nodes.map((node, index) => {
+    const element = node as HTMLElement;
+    const tagName = (element.tagName || '').toLowerCase();
+    return {
+      index,
+      text: `${element.innerText || ''} ${(node as HTMLAnchorElement).href || ''} ${element.getAttribute('aria-label') || ''}`,
+      href: (node as HTMLAnchorElement).href || null,
+      tag: (tagName === 'a' ? 'anchor' : tagName === 'button' ? 'button' : 'role') as 'anchor' | 'button' | 'role',
+    };
+  }).filter(item => re.test(item.text));
+  const controls = matched.map(item => {
+    const node = nodes[item.index] as HTMLElement;
+    const existing = node.getAttribute('data-oc-control');
+    const marker = existing || `oc-${Date.now().toString(36)}-${item.index}-${Math.random().toString(36).slice(2, 8)}`;
+    if (!existing) node.setAttribute('data-oc-control', marker);
+    return { ...item, marker };
+  });
+  return { controls, total: matched.length };
+}
+
 export function isSkippableNavigableAnchorClick(
   target: Pick<RenderedControlTarget, 'href'>,
   pageUrl: string,
@@ -558,31 +596,40 @@ export function isSkippableNavigableAnchorClick(
   return shouldEnqueueRenderedCommunityLink(absolute.toString());
 }
 
+/** Bounded evaluation window over the complete matched-control set. The window
+ * is rotated by the durable retry offset before the per-page click cap, so a
+ * retry can reach controls beyond the first 64 instead of re-examining the
+ * same prefix forever. */
+export const RENDERED_CONTROL_EVALUATION_WINDOW = 64;
+
 export function partitionRenderedClickTargets(
   controls: RenderedControlTarget[],
   pageUrl: string,
   maxClicks: number,
   offset = 0,
-): { toClick: RenderedControlTarget[]; skippedNavigableAnchors: number } {
+  evaluationWindowSize = RENDERED_CONTROL_EVALUATION_WINDOW,
+): { toClick: RenderedControlTarget[]; skippedNavigableAnchors: number; evaluationWindow: RenderedControlTarget[] } {
+  const cap = Math.max(0, Math.trunc(maxClicks) || 0);
+  const windowSize = Math.max(0, Math.trunc(evaluationWindowSize) || 0);
+  // Rotate the complete matched pool before applying the evaluation window.
+  // Rotating the already-truncated plan would only reorder the same prefix and
+  // leave controls 65+ permanently unreachable.
+  const rawOffset = Math.trunc(offset) || 0;
+  const start = controls.length > 0
+    ? ((rawOffset % controls.length) + controls.length) % controls.length
+    : 0;
+  const rotated = start > 0 ? [...controls.slice(start), ...controls.slice(0, start)] : controls;
+  const evaluationWindow = rotated.slice(0, windowSize);
   const eligible: RenderedControlTarget[] = [];
   let skippedNavigableAnchors = 0;
-  const cap = Math.max(0, Math.trunc(maxClicks) || 0);
-  for (const control of controls) {
+  for (const control of evaluationWindow) {
     if (isSkippableNavigableAnchorClick(control, pageUrl)) {
       skippedNavigableAnchors++;
       continue;
     }
     eligible.push(control);
   }
-  // Rotate the complete eligible pool before applying the per-page cap. This
-  // is what lets a retry reach controls beyond the first click window; rotating
-  // the already-truncated plan would only reorder the same first controls.
-  const rawOffset = Math.trunc(offset) || 0;
-  const start = eligible.length > 0
-    ? ((rawOffset % eligible.length) + eligible.length) % eligible.length
-    : 0;
-  const rotated = start > 0 ? [...eligible.slice(start), ...eligible.slice(0, start)] : eligible;
-  return { toClick: rotated.slice(0, cap), skippedNavigableAnchors };
+  return { toClick: eligible.slice(0, cap), skippedNavigableAnchors, evaluationWindow };
 }
 
 /**
@@ -624,7 +671,10 @@ export function planRevealedRenderedClickTargets(
       .map(target => target.marker)
       .filter((marker): marker is string => Boolean(marker)),
   );
-  const skipped = controls.filter(target => {
+  // Only controls inside this attempt's evaluation window are click-skip
+  // obligations. Controls outside the window are overflow already counted by
+  // the enumeration certificate; returning them here would double-count them.
+  const skipped = plan.evaluationWindow.filter(target => {
     const marker = target.marker;
     return typeof marker === 'string'
       && marker.length > 0
@@ -1740,29 +1790,12 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             }
 
             const enumerateControls = async (): Promise<{ controls: RenderedControlTarget[]; total: number }> =>
-              page.locator(RENDERED_CONTROL_SELECTOR).evaluateAll((nodes, pattern) => {
-                const re = new RegExp(pattern, 'i');
-                // Count the complete matching set before applying the bounded
-                // 64-item pool. Overflow is unexamined content and must stay
-                // visible in the coverage certificate.
-                const matched = nodes.map((node, index) => {
-                  const tagName = ((node as HTMLElement).tagName || '').toLowerCase();
-                  return {index,text:`${(node as HTMLElement).innerText || ''} ${(node as HTMLAnchorElement).href || ''} ${(node as HTMLElement).getAttribute('aria-label') || ''}`,href:(node as HTMLAnchorElement).href || null,tag:(tagName === 'a' ? 'anchor' : tagName === 'button' ? 'button' : 'role') as 'anchor' | 'button' | 'role'};
-                }).filter(item => re.test(item.text));
-                const controls = matched.slice(0, 64).map(item => {
-                  const node = nodes[item.index] as HTMLElement;
-                  const existing = node.getAttribute('data-oc-control');
-                  const marker = existing || `oc-${Date.now().toString(36)}-${item.index}-${Math.random().toString(36).slice(2, 8)}`;
-                  if (!existing) node.setAttribute('data-oc-control', marker);
-                  return { ...item, marker };
-                });
-                return { controls, total: matched.length };
-              }, COMMUNITY_HINTS.source);
+              page.locator(RENDERED_CONTROL_SELECTOR).evaluateAll(enumerateRenderedControlNodes, COMMUNITY_HINTS.source);
             let pageControlTotal = 0;
             let pageControlOverflow = 0;
             const recordControlEnumeration = (total: number): void => {
               pageControlTotal = Math.max(pageControlTotal, total);
-              const overflow = Math.max(0, total - 64);
+              const overflow = Math.max(0, total - RENDERED_CONTROL_EVALUATION_WINDOW);
               if (overflow > pageControlOverflow) {
                 const added = overflow - pageControlOverflow;
                 pageControlOverflow = overflow;
@@ -1787,7 +1820,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 countedControlSkips.add(control.marker);
               }
             }
-            const sliceDropped = Math.max(0, controls.length - clickPlan.toClick.length - clickPlan.skippedNavigableAnchors);
+            // Overflow beyond the evaluation window is already counted by
+            // recordControlEnumeration. This second count covers only controls
+            // inside the window that the click budget could not examine.
+            const sliceDropped = Math.max(0, clickPlan.evaluationWindow.length - clickPlan.toClick.length - clickPlan.skippedNavigableAnchors);
             if (sliceDropped > 0) {
               // Every enumerated control matched the community-evidence filter;
               // dropping one for budget means its content was never examined.
@@ -1991,6 +2027,13 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         }
         if (completion.complete && !pageBudgetExhausted && inspectedPages < limits.maxPages) drops.count('queue-exhausted');
         if (pageBudgetExhausted) drops.count('page-budget');
+        // Persist the bounded control-coverage certificate alongside the
+        // crawler telemetry so production can distinguish 64-overflow from
+        // ordinary click-budget slicing. Counts only; never selectors/text.
+        telemetry.evidenceControlsTotal = evidenceControlsSeen || undefined;
+        telemetry.evidenceControlsClicked = evidenceControlsClicked || undefined;
+        telemetry.evidenceControlsFailed = evidenceControlsFailed || undefined;
+        telemetry.evidenceControlsSkipped = evidenceControlsSkipped || undefined;
         return {
           foundInvite:first?.nativeInviteCode||null,
           foundLocation:first?.sourceUrl,
