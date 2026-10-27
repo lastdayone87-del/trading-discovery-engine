@@ -327,6 +327,12 @@ export interface PendingAutonomousRun {
   continuationStatus: string;
   deferredUntil: string | null;
   lastPageAt: string | null;
+  /**
+   * Age anchor used by the SQL shortlist: last_page_at, else started_at, else
+   * scheduled_at. The reconciler must sort on the same value or its retained
+   * candidates can disagree with the SQL ranking.
+   */
+  resumeAt: string | null;
   explorationPagesRemaining: number;
   retrievalLane: string | null;
   searchOrdering: string | null;
@@ -425,6 +431,7 @@ export async function listPendingAutonomousRuns(
     continuationStatus: String(row.continuation_status || 'RUNNING'),
     deferredUntil: row.deferred_until ? new Date(row.deferred_until as string).toISOString() : null,
     lastPageAt: row.last_page_at ? new Date(row.last_page_at as string).toISOString() : null,
+    resumeAt: row.resume_at ? new Date(row.resume_at as string).toISOString() : null,
     explorationPagesRemaining: Number(row.exploration_pages_remaining || 0),
     retrievalLane: row.retrieval_lane ? String(row.retrieval_lane) : null,
     searchOrdering: row.search_ordering ? String(row.search_ordering) : null,
@@ -478,7 +485,9 @@ export function aggregatePageMetrics(pages: QueryFunnelMetrics[]): QueryFunnelMe
     newChannels: sum('newChannels'), inScopeNewChannels: inScopeAggregate,
     countryRejected, nonTrading: sum('nonTrading'),
     uncertain: sum('uncertain'), needsReview: sum('needsReview'),
-    tradingConfirmed: sum('tradingConfirmed'), qualityChannels: sum('qualityChannels'),
+    tradingConfirmed: sum('tradingConfirmed'),
+    freshTradingConfirmed: sum('freshTradingConfirmed'),
+    qualityChannels: sum('qualityChannels'),
     communitiesDiscovered: sum('communitiesDiscovered'),
     averageQualityScore: weighted('averageQualityScore'),
     noveltyRatio: distinct ? sum('newChannels') / distinct : 0,

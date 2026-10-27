@@ -1455,8 +1455,11 @@ async function readExternalTermEvidence(
   // Match the term and its governed aliases in SQL before the LIMIT. Filtering
   // only in JavaScript after a country-wide LIMIT can drop valid corroboration
   // when a country has more than 1,000 newer external rows for other terms.
-  // The SQL normalization mirrors normalizeTerm (NFKC, whitespace collapse,
-  // trim, lowercase), so the index remains usable and the JS re-check stays.
+  // external_osint_observations.canonical_concept is written by the application
+  // with the same NFKC/whitespace/English-lowercase normalization as
+  // normalizeTerm. Matching that stored value avoids PostgreSQL lower(), whose
+  // case mapping follows the database collation (for example Turkish I) and
+  // can disagree with the JavaScript target surfaces. The JS re-check stays.
   const targetSurfaces = [...new Set(
     [term.canonical_term, ...(aliases.rows || []).map(row => row.normalized_alias)]
       .map(value => normalizeTerm(String(value || '')))
@@ -1470,7 +1473,7 @@ async function readExternalTermEvidence(
        FROM external_osint_observations
        WHERE country=$1
          AND observed_at >= now() - interval '30 days'
-         AND lower(btrim(regexp_replace(normalize(original_surface, NFKC), '[[:space:]]+', ' ', 'g'))) = ANY($2::text[])
+         AND canonical_concept = ANY($2::text[])
        ORDER BY observed_at DESC LIMIT 1000`,
       [term.country, targetSurfaces],
     ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
@@ -1610,15 +1613,15 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
       `SELECT COALESCE(SUM(executions),0)::int executions, COALESCE(SUM(quota_consumed),0)::int quota,
         COALESCE(SUM(confirmed_trading_creators),0)::int confirmed, COALESCE(SUM(non_trading_creators),0)::int nontrading,
         COALESCE(SUM(wrong_country_creators),0)::int wrong, COALESCE(SUM(needs_review_creators),0)::int review,
-        COALESCE(SUM(new_creators),0)::int fresh
+        -- Exact fresh ∩ confirmed count recorded at attribution time. Legacy
+        -- rows predate the column and contribute zero rather than a possibly
+        -- inflated min(confirmed,new), which can describe different creators.
+        COALESCE(SUM(fresh_confirmed_trading_creators),0)::int fresh_confirmed
        FROM terminology_performance WHERE canonical_term_id=$1`,
       [termId],
     );
     const perfRow = ((perf.rows || [])[0] || {}) as Record<string, unknown>;
-    // confirmed_trading_creators counts repeat sightings too. Bound the v2
-    // promotion input by persisted new creators, exactly like the legacy gate:
-    // repeat-only runs with zero newly verified traders must not promote.
-    const freshConfirmed = Math.min(Number(perfRow.confirmed || 0), Number(perfRow.fresh || 0));
+    const freshConfirmed = Number(perfRow.fresh_confirmed || 0);
     const nativeCreators = Number(v2Row.native_creators || 0);
     const nativeEvidenceBuckets = Number(v2Row.native_evidence_buckets || nativeCreators);
     row.distinct_creators = nativeCreators;
@@ -1702,20 +1705,16 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
       `SELECT COALESCE(SUM(executions),0)::int executions, COALESCE(SUM(quota_consumed),0)::int quota,
         COALESCE(SUM(confirmed_trading_creators),0)::int confirmed, COALESCE(SUM(non_trading_creators),0)::int nontrading,
         COALESCE(SUM(wrong_country_creators),0)::int wrong, COALESCE(SUM(needs_review_creators),0)::int review,
-        COALESCE(SUM(new_creators),0)::int fresh
+        COALESCE(SUM(fresh_confirmed_trading_creators),0)::int fresh_confirmed
        FROM terminology_performance WHERE canonical_term_id=$1`,
       [termId]
     );
     const agg = ((perf.rows || [])[0] || {}) as Record<string, unknown>;
-    // Verified-trader bar counts FRESH discoveries only: confirmed_trading_creators
-    // tallies every TRADING_CONFIRMED funnel result including repeat sightings
-    // of already-known traders, so repeat-only runs could clear the bar with
-    // zero newly verified traders. Bounding by persisted new creators (a sound
-    // upper bound — every newly verified trader is a new channel) closes that
-    // without a schema change. No fresh-new breakdown exists per bucket, so
-    // the other buckets keep their stored totals (conservative direction kept:
-    // under-counting fresh confirmations can only HOLD, never wrongly promote).
-    const freshConfirmed = Math.min(Number(agg.confirmed || 0), Number(agg.fresh || 0));
+    // Verified-trader bar counts FRESH discoveries only. The attribution
+    // funnel records the exact persisted-new ∩ trading-confirmed count; the
+    // aggregate counts cannot be combined (min can describe different
+    // creators and let repeat confirmations borrow new non-trader credit).
+    const freshConfirmed = Number(agg.fresh_confirmed || 0);
     const verdict = evaluateNativeTermPromotion({
       novel: quality.novel,
       spamConfirmed: quality.spamConfirmed,
@@ -1831,7 +1830,7 @@ export async function attributeTerminologyPerformance(query: QueryRecord, metric
     // KEY SHARE on the term row). Matches observe/refresh ordering.
     await acquireTerminologyLifecycleLock(Number(row.id), runner);
     const yieldScore = scopeWeightedYield(metrics.distinctResults, metrics.newChannels, metrics.inScopeNewChannels);
-    await runner.query(`INSERT INTO terminology_performance(canonical_term_id,query_id,retrieval_lane,search_ordering,raw_results,unique_creators,new_creators,confirmed_trading_creators,needs_review_creators,non_trading_creators,wrong_country_creators,communities_discovered,quota_consumed,decayed_yield_score) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, [row.id, query.id, String(retrievalLane || metadata.retrievalLane || 'UNKNOWN'), String(searchOrdering || metadata.searchOrdering || 'RELEVANCE'), metrics.rawResults, metrics.distinctResults, metrics.newChannels, metrics.tradingConfirmed, metrics.needsReview, metrics.nonTrading, metrics.countryRejected, metrics.communitiesDiscovered, quotaConsumed, yieldScore]);
+    await runner.query(`INSERT INTO terminology_performance(canonical_term_id,query_id,retrieval_lane,search_ordering,raw_results,unique_creators,new_creators,confirmed_trading_creators,fresh_confirmed_trading_creators,needs_review_creators,non_trading_creators,wrong_country_creators,communities_discovered,quota_consumed,decayed_yield_score) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`, [row.id, query.id, String(retrievalLane || metadata.retrievalLane || 'UNKNOWN'), String(searchOrdering || metadata.searchOrdering || 'RELEVANCE'), metrics.rawResults, metrics.distinctResults, metrics.newChannels, metrics.tradingConfirmed, Math.max(0, Math.trunc(metrics.freshTradingConfirmed || 0)), metrics.needsReview, metrics.nonTrading, metrics.countryRejected, metrics.communitiesDiscovered, quotaConsumed, yieldScore]);
     await refreshTerminologyLifecycle(Number(row.id), DEFAULT_TERMINOLOGY_POLICY, runner);
   }
 }

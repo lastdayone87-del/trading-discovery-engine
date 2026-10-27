@@ -3712,6 +3712,8 @@ export async function completeQueryRun(runId: string, metrics: {
   uncertain: number;
   needsReview: number;
   tradingConfirmed: number;
+  /** Exact fresh ∩ trading-confirmed count; absent on legacy callers. */
+  freshTradingConfirmed?: number;
   uniqueChannels: number;
   qualityChannels: number;
   communitiesDiscovered: number;
@@ -3792,7 +3794,9 @@ export async function completeQueryRun(runId: string, metrics: {
         rawResults: metrics.rawResults, distinctResults: metrics.distinctResults, duplicateResults: metrics.duplicateResults,
         knownChannels: metrics.knownChannels, newChannels: metrics.newChannels, inScopeNewChannels: metrics.inScopeNewChannels, countryRejected: metrics.countryRejected,
         nonTrading: metrics.nonTrading, uncertain: metrics.uncertain, needsReview: metrics.needsReview,
-        tradingConfirmed: metrics.tradingConfirmed, qualityChannels: metrics.qualityChannels,
+        tradingConfirmed: metrics.tradingConfirmed,
+        freshTradingConfirmed: metrics.freshTradingConfirmed ?? 0,
+        qualityChannels: metrics.qualityChannels,
         communitiesDiscovered: metrics.communitiesDiscovered, averageQualityScore: metrics.averageQualityScore || 0,
         noveltyRatio: metrics.distinctResults ? metrics.newChannels / metrics.distinctResults : 0,
         countryPrecision: metrics.distinctResults ? (metrics.distinctResults - metrics.countryRejected) / metrics.distinctResults : 0,
@@ -4211,7 +4215,11 @@ export async function getNativeVocabularyAiBudgetSnapshot(budgetDay: string, cou
     `SELECT
        COUNT(*) FILTER (WHERE status IN ('RESERVED','SUCCEEDED','FAILED'))::int AS global_calls,
        COUNT(*) FILTER (WHERE status IN ('RESERVED','SUCCEEDED','FAILED') AND ($2::text IS NULL OR country=$2))::int AS country_calls,
-       COALESCE(SUM(actual_cost_microunits) FILTER (WHERE status IN ('SUCCEEDED','FAILED')),0)::bigint AS actual_cost,
+       -- Retained actual spend survives a reopen (RESERVED after FAILED), so
+       -- the snapshot must count it regardless of status, exactly like
+       -- admission. Filtering by status would report less spend than the cap
+       -- enforcement used.
+       COALESCE(SUM(actual_cost_microunits),0)::bigint AS actual_cost,
        COALESCE(SUM(reserved_cost_microunits) FILTER (WHERE status='RESERVED'),0)::bigint AS outstanding
      FROM native_vocabulary_ai_runs WHERE budget_day=$1`,
     [budgetDay, country || null],
@@ -4446,6 +4454,30 @@ export async function completeNativeVocabularyAiRun(args: {
      WHERE request_id=$1 AND status='RESERVED' AND lease_token=$6
      RETURNING request_id`,
     [args.requestId, args.status, args.provider || null, Math.max(0, Math.trunc(args.attempts || 0)), Math.max(0, Math.trunc(args.actualCostMicrounits || 0)), args.leaseToken],
+  );
+  return Boolean(result.rowCount);
+}
+
+/**
+ * Release an admitted reservation that never reached a provider (for example
+ * when neither Groq nor Gemini is configured, or every route deferred before
+ * a request). The row remains as a same-day idempotency marker but stops
+ * counting toward the call cap and retains no reservation or actual cost.
+ * The lease token fences a stale worker from releasing a replacement owner.
+ */
+export async function releaseNativeVocabularyAiRun(args: {
+  requestId: string;
+  leaseToken: string;
+}): Promise<boolean> {
+  const db = await getDb();
+  const result = await db.query(
+    `UPDATE native_vocabulary_ai_runs
+     SET status='BUDGET_SKIPPED',provider=NULL,attempts=0,
+         reserved_cost_microunits=0,actual_cost_microunits=0,
+         response_payload=NULL,completed_at=now(),lease_expires_at=NULL,lease_token=NULL
+     WHERE request_id=$1 AND status='RESERVED' AND lease_token=$2
+     RETURNING request_id`,
+    [args.requestId, args.leaseToken],
   );
   return Boolean(result.rowCount);
 }

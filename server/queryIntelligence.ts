@@ -15,6 +15,7 @@ import {
   getQueryDemandSignals,
   reserveNativeVocabularyAiRun,
   completeNativeVocabularyAiRun,
+  releaseNativeVocabularyAiRun,
   recordNativeVocabularyAiResponse,
   isRetryableInfrastructureFailure
 } from './db';
@@ -936,17 +937,29 @@ Return ONLY a valid JSON object with format:
     ]);
     const budgetDay = getYouTubeQuotaDay();
     const requestId = computeNativeVocabularyRequestId({ channelId: channel.channel_id, metadataHash, budgetDay });
-    const reservation = await reserveNativeVocabularyAiRun({
-      requestId,
-      channelId: channel.channel_id,
-      country: channel.country,
-      metadataHash,
-      budgetDay,
-    });
-    if (reservation.admitted) {
+    let reservation: Awaited<ReturnType<typeof reserveNativeVocabularyAiRun>> | null = null;
+    try {
+      reservation = await reserveNativeVocabularyAiRun({
+        requestId,
+        channelId: channel.channel_id,
+        country: channel.country,
+        metadataHash,
+        budgetDay,
+      });
+    } catch (error) {
+      // The rule evidence above is already durable. A ledger outage must not
+      // abort creator ingestion: proceed rule-only with no provider call, so
+      // no unbudgeted AI spend can occur. The job's next attempt retries the
+      // ledger once it is available again.
+      console.warn(
+        `[Vocabulary Extraction] AI budget ledger unavailable for channel ${channel.channel_id}; rule-only extraction retained.`,
+        error instanceof Error ? error.stack || error.message : error,
+      );
+    }
+    if (reservation?.admitted) {
       if (!reservation.leaseToken) throw new Error('AI_RESERVATION_LEASE_TOKEN_MISSING');
       aiRun = { requestId, leaseToken: reservation.leaseToken, promptChars: prompt.length, attempts: 0, responseChars: 0 };
-    } else if (reservation.reason === 'REPLAY_RESPONSE' && reservation.replayPayload) {
+    } else if (reservation?.reason === 'REPLAY_RESPONSE' && reservation.replayPayload) {
       if (!reservation.leaseToken) throw new Error('AI_RESERVATION_LEASE_TOKEN_MISSING');
       replayRun = {
         requestId,
@@ -960,13 +973,20 @@ Return ONLY a valid JSON object with format:
       console.warn(
         `[Vocabulary Extraction] Replaying stored AI response for channel ${channel.channel_id}; no provider call is repeated.`
       );
-    } else {
+    } else if (reservation) {
       console.warn(
         `[Vocabulary Extraction] AI budget skipped for channel ${channel.channel_id}: ${reservation.reason}. Rule-based evidence retained.`
       );
     }
     const finishAiRun = async (status: 'SUCCEEDED' | 'FAILED', provider: 'GROQ' | 'GEMINI' | null) => {
       if (!aiRun) return;
+      if (aiRun.attempts === 0) {
+        // Admitted but no provider request was made (no configured provider,
+        // all routes deferred before a fetch, etc.). Release the unused slot
+        // instead of charging prompt-based cost and consuming a daily call.
+        await releaseNativeVocabularyAiRun({ requestId: aiRun.requestId, leaseToken: aiRun.leaseToken });
+        return;
+      }
       await completeNativeVocabularyAiRun({
         requestId: aiRun.requestId,
         leaseToken: aiRun.leaseToken,

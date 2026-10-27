@@ -145,7 +145,7 @@ function fakeObserveRunner(channel: Record<string, unknown>, termId = 7): FakeRu
         return { rows: [{ v1: 0, spam: false, novel: false }] };
       }
       if (text.includes('FROM terminology_performance WHERE canonical_term_id=$1')) {
-        return { rows: [{ executions: 0, quota: 0, confirmed: 0, nontrading: 0, wrong: 0, review: 0, fresh: 0 }] };
+        return { rows: [{ executions: 0, quota: 0, confirmed: 0, nontrading: 0, wrong: 0, review: 0, fresh_confirmed: 0 }] };
       }
       if (text.startsWith('SELECT event_type, reason FROM')) return { rows: [] };
       return { rows: [] };
@@ -223,7 +223,7 @@ function fakeRefreshRunner(
       if (text.includes('normalized_alias')) return { rows: [] };
       if (text.includes('external_osint_observations')) return { rows: externalRows };
       if (text.includes('terminology_performance WHERE canonical_term_id')) {
-        return { rows: [{ executions: 0, quota: 0, confirmed: 0, nontrading: 0, wrong: 0, review: 0, fresh: 0, ...perfOverrides }] };
+        return { rows: [{ executions: 0, quota: 0, confirmed: 0, nontrading: 0, wrong: 0, review: 0, fresh_confirmed: 0, ...perfOverrides }] };
       }
       if (text.includes('FROM terminology_observations') && text.includes('qualityVersion')) {
         return { rows: [{ v1: 0, spam: false, novel: false }] };
@@ -858,6 +858,23 @@ test('P10c: a blocked country candidate falls back to the next ranked run', () =
   assert.equal(plan.selected.length + plan.deferred.length, runs.length);
 });
 
+test('P10d: the plan ranks by the same resume age as the SQL shortlist', () => {
+  // SQL orders a country by COALESCE(last_page_at, started_at, scheduled_at).
+  // The reconciler must use the same anchor: a run with no lastPageAt but an
+  // older start must rank ahead of a newer last-page run, or a truncated
+  // shortlist can retain the run the SQL ranking would omit.
+  const runs = [
+    { country: 'Germany', runId: 'g-never-paged', marginalUtility: 0.5, lastPageAt: null, resumeAt: '2026-10-01T00:00:00Z' },
+    { country: 'Germany', runId: 'g-recent', marginalUtility: 0.5, lastPageAt: '2026-10-02T00:00:00Z', resumeAt: '2026-10-02T00:00:00Z' },
+  ];
+  const plan = planContinuationResume(runs, 0, 1, 1, 2);
+  assert.deepEqual(plan.selected.map(run => run.runId), ['g-never-paged', 'g-recent']);
+  const pageStore = serverSource('autonomousPageStore.ts');
+  assert.match(pageStore, /COALESCE\(qr\.last_page_at, qr\.started_at, qr\.scheduled_at\) AS resume_at/);
+  assert.match(pageStore, /resumeAt: row\.resume_at \? new Date\(row\.resume_at as string\)\.toISOString\(\) : null/);
+  assert.match(serverSource('queueManager.ts'), /const anchor = run\.resumeAt \?\? run\.lastPageAt/);
+});
+
 test('P11: official YouTube resume uses the durable next-page token without a rewalk', () => {
   assert.equal(resumeModeForProvider('youtube-search'), 'TOKEN');
   const queue = serverSource('queueManager.ts');
@@ -1189,9 +1206,9 @@ test('T7: two independent external sources/families validate; a single source or
   // a country-wide LIMIT in JavaScript could hide valid evidence behind 1,000
   // newer rows for other terms.
   const terminology = serverSource('terminologyIntelligence.ts');
-  assert.match(terminology, /lower\(btrim\(regexp_replace\(normalize\(original_surface, NFKC\)/);
-  assert.match(terminology, /ANY\(\$2::text\[\]\)/);
-  assert.match(migration161(), /idx_external_osint_surface_country/);
+  assert.match(terminology, /AND canonical_concept = ANY\(\$2::text\[\]\)/);
+  assert.ok(!/lower\(btrim\(regexp_replace\(normalize\(original_surface, NFKC\)/.test(terminology), 'SQL surface matching must not depend on database lower() collation');
+  assert.match(migration161(), /idx_external_osint_surface_country[\s\S]*?\(country, canonical_concept, observed_at DESC\)/);
 });
 
 test('T8: two native plus one external validates; one native plus one external does not', () => {
@@ -1303,12 +1320,30 @@ test('T13: the proven gate promotes with validation, executions, yield, and shar
   const repeatOnly = fakeRefreshRunner(
     { lifecycle_status: 'OBSERVED', search_eligible: false, trust_tier: 3, decayed_evidence: 6, decayed_yield: 0.3 },
     { native_creators: 3, native_evidence_buckets: 3, decayed_evidence: 6 },
-    { executions: 3, quota: 5000, confirmed: 6, nontrading: 0, wrong: 0, review: 0, fresh: 0 },
+    { executions: 3, quota: 5000, confirmed: 6, nontrading: 0, wrong: 0, review: 0, fresh_confirmed: 0 },
   );
   await refreshTerminologyLifecycle(1, undefined, repeatOnly as never);
   const lifecycle = repeatOnly.calls.find(call => call.text.startsWith('UPDATE canonical_trading_terms'));
   assert.equal(lifecycle?.params[1], 'MULTI_CREATOR_VALIDATED');
   assert.equal(lifecycle?.params[2], false);
+});
+
+test('T13b: new non-traders cannot lend fresh credit to repeat confirmed traders', async () => {
+  // The aggregate counts alone cannot distinguish this from six fresh
+  // confirmed traders: min(confirmed,new) would be 6 and wrongly promote.
+  // The exact intersection recorded by attribution is zero.
+  const repeatPlusNewNonTraders = fakeRefreshRunner(
+    { lifecycle_status: 'OBSERVED', search_eligible: false, trust_tier: 3, decayed_evidence: 6, decayed_yield: 0.3 },
+    { native_creators: 3, native_evidence_buckets: 3, decayed_evidence: 6 },
+    { executions: 3, quota: 5000, confirmed: 6, nontrading: 6, wrong: 0, review: 0, fresh_confirmed: 0 },
+  );
+  await refreshTerminologyLifecycle(1, undefined, repeatPlusNewNonTraders as never);
+  const lifecycle = repeatPlusNewNonTraders.calls.find(call => call.text.startsWith('UPDATE canonical_trading_terms'));
+  assert.equal(lifecycle?.params[1], 'MULTI_CREATOR_VALIDATED');
+  assert.equal(lifecycle?.params[2], false);
+  const perfQuery = repeatPlusNewNonTraders.calls.find(call => call.text.includes('SUM(fresh_confirmed_trading_creators)'));
+  assert.match(String(perfQuery?.text), /fresh_confirmed_trading_creators/);
+  assert.ok(!/Math\.min\(Number\(perfRow\.confirmed/.test(serverSource('terminologyIntelligence.ts')));
 });
 
 test('T14: sustained low yield demotes a proven term', () => {
@@ -1488,7 +1523,7 @@ test('E1: with CDL/v2 flags off, only the existing quality>=55 path remains', ()
   assert.ok(!query.includes('budgetDisabled'));
   assert.ok(!query.includes('aiBudgetEnabled'));
   assert.ok(!ingestion.includes('aiBudgetEnabled'));
-  assert.match(query, /const reservation = await reserveNativeVocabularyAiRun\(/);
+  assert.match(query, /reservation = await reserveNativeVocabularyAiRun\(/);
   assert.match(query, /if \(!replayRun && aiRun\) \{/);
 });
 
@@ -1516,7 +1551,7 @@ test('E3: the 201st AI call is budget-skipped while rule evidence persists', () 
   const source = serverSource('queryIntelligence.ts');
   assert.match(source, /Rule-based evidence retained/);
   const ruleHitsAt = source.indexOf('for (const hit of findRuleInstrumentHits(');
-  const reservationAt = source.indexOf('const reservation = await reserveNativeVocabularyAiRun(');
+  const reservationAt = source.indexOf('reservation = await reserveNativeVocabularyAiRun(');
   assert.ok(ruleHitsAt > 0 && reservationAt > ruleHitsAt, 'rule evidence is persisted before any AI budget call');
 });
 
@@ -1967,14 +2002,14 @@ test('R1: transient AI failure retries up to three attempts while rule evidence 
   assert.match(source, /e\?\.status === 429/);
   assert.match(source, /errStr\.includes\('RESOURCE_EXHAUSTED'\)/);
   const ruleHitsAt = source.indexOf('for (const hit of findRuleInstrumentHits(');
-  const reservationAt = source.indexOf('const reservation = await reserveNativeVocabularyAiRun(');
+  const reservationAt = source.indexOf('reservation = await reserveNativeVocabularyAiRun(');
   assert.ok(ruleHitsAt > 0 && reservationAt > ruleHitsAt, 'rule evidence is durable before the AI reservation');
 
   // The logical call is not marked successful until admission persists its
   // terms. The parsed response is durable first, so a persistence retry
   // replays it without another provider request.
   assert.match(source, /recordNativeVocabularyAiResponse\(\{/);
-  assert.match(source, /reservation\.reason === 'REPLAY_RESPONSE'/);
+  assert.match(source, /reservation\?\.reason === 'REPLAY_RESPONSE'/);
   assert.match(source, /if \(!parsed\) \{\s*await finishAiRun\('FAILED'/);
   assert.match(source, /onRequestAttempt: \(\) => \{/);
   const db = serverSource('dbCore.ts');
@@ -1989,8 +2024,25 @@ test('R1: transient AI failure retries up to three attempts while rule evidence 
   assert.match(db, /reason: 'RESERVED', requestId: args\.requestId, leaseToken/);
   assert.match(db, /args\.leaseToken/);
   // Retained spend is counted on RESERVED rows too, not hidden until the
-  // replacement reservation completes.
+  // replacement reservation completes. The exported snapshot must use the
+  // same all-status sum as admission, or it reports less spend than the cap.
   assert.match(db, /COALESCE\(SUM\(actual_cost_microunits\),0\)::bigint AS actual_cost/);
+  const snapshotStart = db.indexOf('export async function getNativeVocabularyAiBudgetSnapshot');
+  const snapshotEnd = db.indexOf('async function readNativeVocabularyAiBudgetPolicy');
+  assert.ok(snapshotStart > 0 && snapshotEnd > snapshotStart);
+  const snapshotSource = db.slice(snapshotStart, snapshotEnd);
+  assert.match(snapshotSource, /COALESCE\(SUM\(actual_cost_microunits\),0\)::bigint AS actual_cost/);
+  assert.ok(!/SUM\(actual_cost_microunits\) FILTER/.test(snapshotSource), 'snapshot actual cost must not filter by status');
+  // A reservation with zero provider attempts is released instead of charged
+  // or counted against the daily call cap.
+  assert.match(db, /export async function releaseNativeVocabularyAiRun/);
+  assert.match(db, /status='BUDGET_SKIPPED'/);
+  assert.match(source, /aiRun\.attempts === 0/);
+  assert.match(source, /releaseNativeVocabularyAiRun/);
+  // A ledger outage degrades to rule-only extraction after rule evidence is
+  // already durable; it must not abort creator ingestion.
+  assert.match(source, /AI budget ledger unavailable/);
+  assert.match(source, /try \{\s*reservation = await reserveNativeVocabularyAiRun/);
   assert.match(source, /ownsReservation/);
   assert.match(source, /leaseToken: aiRun\.leaseToken/);
   assert.match(source, /leaseToken: replayRun\.leaseToken/);

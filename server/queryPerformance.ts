@@ -63,6 +63,13 @@ export interface QueryFunnelMetrics {
   uncertain: number;
   needsReview: number;
   tradingConfirmed: number;
+  /**
+   * Exact intersection of persisted NEW creators and TRADING_CONFIRMED
+   * creators for this funnel. Optional for legacy/manual metrics that predate
+   * the field; absent means the intersection is unknown and must not be
+   * inferred from the two aggregate counts.
+   */
+  freshTradingConfirmed?: number;
   qualityChannels: number;
   communitiesDiscovered: number;
   averageQualityScore: number;
@@ -108,6 +115,10 @@ export function calculateQueryFunnel(
   const evaluated = nonTrading + uncertain + needsReview + tradingConfirmed;
   const persisted = values.filter(value => value.persisted);
   const fresh = values.filter(value => value.persisted && !value.wasKnown);
+  // Exact fresh ∩ confirmed intersection. Deriving it from the two aggregate
+  // counts (for example Math.min) lets repeat confirmed traders borrow credit
+  // from new non-traders on the same run.
+  const freshTradingConfirmed = fresh.filter(value => value.funnelOutcome === 'TRADING_CONFIRMED').length;
   const scoped = values.filter(value => value.scopeEligibility !== undefined);
   // Neutral default: with no scope signal anywhere, every fresh channel counts
   // as in-scope (identical to legacy yield). Once scope is observed, IN_SCOPE
@@ -151,6 +162,7 @@ export function calculateQueryFunnel(
     uncertain,
     needsReview,
     tradingConfirmed,
+    freshTradingConfirmed,
     qualityChannels,
     communitiesDiscovered,
     averageQualityScore,

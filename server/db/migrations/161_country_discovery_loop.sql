@@ -58,14 +58,23 @@ CREATE INDEX IF NOT EXISTS idx_term_obs_run_page
 
 -- External terminology corroboration is looked up by the local surface, not
 -- only by country: filtering a country-wide LIMIT in JavaScript can drop a
--- term's valid evidence behind 1,000 newer rows for other terms. The
--- expression mirrors normalizeTerm (NFKC, whitespace collapse, trim, lower).
+-- term's valid evidence behind 1,000 newer rows for other terms. The stored
+-- canonical_concept is application-normalized with the same NFKC, whitespace
+-- collapse, trim, and English lowercase mapping as normalizeTerm. Matching it
+-- avoids PostgreSQL lower(), whose case mapping follows the database collation
+-- (for example Turkish I) and can discard valid observations before the
+-- JavaScript evaluator sees them.
 CREATE INDEX IF NOT EXISTS idx_external_osint_surface_country
-  ON external_osint_observations(
-    country,
-    lower(btrim(regexp_replace(normalize(original_surface, NFKC), '[[:space:]]+', ' ', 'g'))),
-    observed_at DESC
-  );
+  ON external_osint_observations(country, canonical_concept, observed_at DESC);
+
+-- Promotion yield must count creators that are BOTH newly discovered and
+-- trading-confirmed. The aggregate new/confirmed totals can describe different
+-- creators, so min(confirmed,new) is not an upper bound on this intersection.
+-- Attribution records the exact per-run intersection; legacy rows default to
+-- zero (unknown), which can only HOLD a promotion, never inflate one.
+ALTER TABLE terminology_performance
+  ADD COLUMN IF NOT EXISTS fresh_confirmed_trading_creators INTEGER NOT NULL DEFAULT 0
+    CHECK (fresh_confirmed_trading_creators >= 0);
 
 -- ---------------------------------------------------------------------------
 -- 2. Page economics and continuation audit

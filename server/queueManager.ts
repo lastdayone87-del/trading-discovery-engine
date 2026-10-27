@@ -1842,7 +1842,7 @@ export async function processNextSearchJob(
   });
 }
 
-export interface ContinuationResumePlan<T extends { country: string; runId: string; marginalUtility?: number; lastPageAt?: string | null }> {
+export interface ContinuationResumePlan<T extends { country: string; runId: string; marginalUtility?: number; lastPageAt?: string | null; resumeAt?: string | null }> {
   /**
    * Ranked candidates in rotated country order. The default is one run per
    * country; callers may retain a fallback list per country so a blocked top
@@ -1873,7 +1873,7 @@ export interface ContinuationResumePlan<T extends { country: string; runId: stri
  * them in order until one enqueues, then skips the rest for that country.
  * Exported for deterministic tests.
  */
-export function planContinuationResume<T extends { country: string; runId: string; marginalUtility?: number; lastPageAt?: string | null }>(
+export function planContinuationResume<T extends { country: string; runId: string; marginalUtility?: number; lastPageAt?: string | null; resumeAt?: string | null }>(
   runs: T[],
   fairnessCursor: number,
   activeCountries: number,
@@ -1899,7 +1899,12 @@ export function planContinuationResume<T extends { country: string; runId: strin
     : rotatedCountries.length;
   const selectedCountries = rotatedCountries.slice(0, countryBudget);
   const age = (run: T) => {
-    const parsed = run.lastPageAt ? Date.parse(run.lastPageAt) : Number.NaN;
+    // Prefer the SQL age anchor (last_page_at, else started_at, else
+    // scheduled_at) so a truncated country shortlist is ordered exactly like
+    // the query that produced it. lastPageAt remains the fallback for callers
+    // that predate resumeAt.
+    const anchor = run.resumeAt ?? run.lastPageAt;
+    const parsed = anchor ? Date.parse(anchor) : Number.NaN;
     return Number.isFinite(parsed) ? parsed : Number.POSITIVE_INFINITY;
   };
   const selected: T[] = [];
