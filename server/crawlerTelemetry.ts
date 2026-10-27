@@ -134,6 +134,8 @@ export interface RenderedCoverageInput {
   structuralHintRejected?: number;
   iconLabelRecovered?: number;
   unresolvedFailedRequests?: number;
+  /** Structural controls still outside the click set (navigable anchors). */
+  structuralUnrecovered?: number;
   frameCount?: number;
   shadowRootCount?: number;
   popupTargets?: number;
@@ -153,10 +155,8 @@ export function resolveRenderedCoverageReason(input: RenderedCoverageInput): Ren
     || input.interactionGap === true
     || input.scrollCapReachedStillGrowing === true
     || input.contextUnknown === true
-    || count(input.structuralHintRejected) > 0
-    || count(input.iconLabelRecovered) > 0
-    || count(input.unresolvedFailedRequests) > 0) {
-    return 'BOUNDED';
+    || count(input.unresolvedFailedRequests) > 0
+    || count(input.structuralUnrecovered) > 0) {    return 'BOUNDED';
   }
   if (count(input.frameCount) > 0 || count(input.shadowRootCount) > 0 || count(input.popupTargets) > 0) {
     return 'CONTEXT_UNREACHABLE';
@@ -363,19 +363,23 @@ export interface CrawlerTelemetry {
    */
   evidenceControlsOffsetAdvance?: number;
   /**
-   * P0.2 navigation-coverage counters (rendered-only, counts only). The
+   * P1.1/P1.2 navigation-coverage counters (rendered-only, counts only). The
    * pre-filter denominator answers how many controls existed before the
    * community-hint filter; `HintRejected` is the difference. Structural
-   * navigation counts menu/nav/hamburger/aria-haspopup controls that the
-   * hint filter would otherwise hide. Icon-label recovery counts controls
-   * whose only useful label is title/aria-labelledby/child-alt/data-label.
-   * Popup targets counts target=_blank/aria-haspopup=dialog controls. None of
-   * these fields contain selectors, text, or URLs.
+   * navigation counts menu/nav/hamburger/tab/summary/aria-haspopup controls.
+   * `StructuralDisclosure` counts those included in the click set because they
+   * reveal content in place; `StructuralUnrecovered` counts structural
+   * anchors still left to the enqueue path. Icon-label recovery counts
+   * controls whose only useful label is title/aria-labelledby/child-alt/
+   * data-label/SVG title/hidden text. None of these fields contain selectors,
+   * text, or URLs.
    */
   controlsEnumeratedTotal?: number;
   controlsHintRejected?: number;
   controlsStructuralNavigation?: number;
   controlsStructuralHintRejected?: number;
+  controlsStructuralDisclosure?: number;
+  controlsStructuralUnrecovered?: number;
   controlsIconLabelRecovered?: number;
   popupTargets?: number;
   /**
@@ -777,6 +781,12 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.controlsStructuralHintRejected) > 0
       ? { controlsStructuralHintRejected: boundedCount(candidate.controlsStructuralHintRejected) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.controlsStructuralDisclosure) > 0
+      ? { controlsStructuralDisclosure: number(candidate.controlsStructuralDisclosure) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.controlsStructuralUnrecovered) > 0
+      ? { controlsStructuralUnrecovered: number(candidate.controlsStructuralUnrecovered) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.controlsIconLabelRecovered) > 0
       ? { controlsIconLabelRecovered: boundedCount(candidate.controlsIconLabelRecovered) }

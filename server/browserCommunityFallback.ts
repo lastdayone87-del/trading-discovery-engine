@@ -110,6 +110,8 @@ export interface BrowserFallbackTelemetry {
   controlsHintRejected?: number;
   controlsStructuralNavigation?: number;
   controlsStructuralHintRejected?: number;
+  controlsStructuralDisclosure?: number;
+  controlsStructuralUnrecovered?: number;
   controlsIconLabelRecovered?: number;
   popupTargets?: number;
   frameCount?: number;
@@ -626,17 +628,23 @@ export interface RenderedControlTarget {
 }
 
 export interface RenderedControlEnumeration {
-  /** Evidence-bearing controls (the existing community-hint matched set). */
+  /** Evidence-bearing controls: hint-matched, icon-label recovered, or
+   * structural disclosures that can reveal content in place. */
   controls: RenderedControlTarget[];
   /** Pre-filter denominator: every node matched by the shared selector. */
   total: number;
-  /** Nodes excluded by the community-hint filter (total - controls). */
+  /** Nodes excluded by the original community-hint filter (total - baseMatched). */
   hintRejected: number;
-  /** Menu/nav/hamburger/aria-haspopup/role=menuitem controls, matched or not. */
+  /** Menu/nav/hamburger/aria-haspopup/role=menuitem/tab/summary controls. */
   structuralNavigation: number;
-  /** Structural controls the hint filter would hide (P1.1 measurement). */
+  /** Structural controls the original hint filter would hide (P0.2 measurement). */
   structuralHintRejected: number;
-  /** Controls recoverable only via title/aria-labelledby/alt/data-label (P1.2). */
+  /** Structural controls included by P1.1 because they can reveal content in place. */
+  structuralDisclosure: number;
+  /** Structural controls still outside the click set (navigable anchors). */
+  structuralUnrecovered: number;
+  /** Controls recovered only via title/aria-labelledby/alt/data-label/SVG title
+   * or hidden text (P1.2). These are included in `controls`. */
   iconLabelRecovered: number;
   /**
    * Popup/dialog controls that require capture rather than navigation
@@ -676,6 +684,8 @@ export interface RenderedRequestControlTotals {
   hintRejected: number;
   structuralNavigation: number;
   structuralHintRejected: number;
+  structuralDisclosure: number;
+  structuralUnrecovered: number;
   iconLabelRecovered: number;
   popupCount: number;
   frameCount: number;
@@ -697,6 +707,8 @@ export function renderedRequestControlTotalsDelta(
     hintRejected: current.hintRejected - (previous?.hintRejected || 0),
     structuralNavigation: current.structuralNavigation - (previous?.structuralNavigation || 0),
     structuralHintRejected: current.structuralHintRejected - (previous?.structuralHintRejected || 0),
+    structuralDisclosure: current.structuralDisclosure - (previous?.structuralDisclosure || 0),
+    structuralUnrecovered: current.structuralUnrecovered - (previous?.structuralUnrecovered || 0),
     iconLabelRecovered: current.iconLabelRecovered - (previous?.iconLabelRecovered || 0),
     popupCount: current.popupCount - (previous?.popupCount || 0),
     frameCount: current.frameCount - (previous?.frameCount || 0),
@@ -744,18 +756,26 @@ export function resolveUnexaminedPopupTargets(
  * the complete matched set (never a prefix slice) so the caller can rotate the
  * full pool by the durable retry offset before applying the evaluation window.
  *
- * P0.2 is measurement-only: `controls` still uses the original innerText +
- * href + aria-label match, so behavior is unchanged. Structural/icon-label
- * counts tell us what P1.1/P1.2 would recover without enabling them yet.
+ * P1.1/P1.2 recovery: `controls` includes the original community-hint match,
+ * icon-only labels (title/aria-labelledby/child alt/data-label/SVG title/hidden
+ * text), and structural disclosure controls (menu/hamburger/tab/summary/
+ * aria-haspopup/collapsed aria-expanded) that can reveal content in place.
+ * Structural anchors that navigate to a real document stay out of the click
+ * set: the enqueue path owns them, and clicking would replace the document
+ * instead of expanding it. All counts are bounded and selector-derived.
  */
 export function enumerateRenderedControlNodes(
   nodes: Element[],
   pattern: string,
 ): RenderedControlEnumeration {
   const re = new RegExp(pattern, 'i');
-  const matched: RenderedControlTarget[] = [];
+  const hintMatched: RenderedControlTarget[] = [];
+  const disclosures: RenderedControlTarget[] = [];
+  let baseMatchedCount = 0;
   let structuralNavigation = 0;
   let structuralHintRejected = 0;
+  let structuralDisclosure = 0;
+  let structuralUnrecovered = 0;
   let iconLabelRecovered = 0;
   let popupTargets = 0;
   const popupIndices: number[] = [];
@@ -790,7 +810,9 @@ export function enumerateRenderedControlNodes(
     }
     const ariaLabel = element.getAttribute('aria-label') || '';
     const baseText = `${element.innerText || ''} ${href || ''} ${ariaLabel}`;
-    // P1.2 measurement: resolve the labels that the original filter ignores.
+    // P1.2: resolve labels the original filter ignored. `textContent` adds
+    // visually hidden text (innerText omits it) but is capped so a pathological
+    // control cannot turn matching into an unbounded scan.
     let labelledByText = '';
     const labelledBy = element.getAttribute('aria-labelledby') || '';
     if (labelledBy) {
@@ -835,9 +857,15 @@ export function enumerateRenderedControlNodes(
     if (image) childAlt = image.getAttribute('alt') || '';
     const title = element.getAttribute('title') || '';
     const dataLabel = element.getAttribute('data-label') || '';
-    const extendedText = `${baseText} ${title} ${labelledByText} ${childAlt} ${dataLabel}`;
+    const dataTooltip = element.getAttribute('data-tooltip') || '';
+    const svgTitleNode = element.querySelector('svg title');
+    const svgTitle = svgTitleNode && svgTitleNode.textContent ? svgTitleNode.textContent : '';
+    const hiddenText = String(element.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+    const extendedText = `${baseText} ${title} ${labelledByText} ${childAlt} ${dataLabel} ${dataTooltip} ${svgTitle} ${hiddenText}`;
     const baseMatched = re.test(baseText);
     const extendedMatched = re.test(extendedText);
+    const hintMatchedControl = baseMatched || extendedMatched;
+    if (baseMatched) baseMatchedCount++;
     const role = (element.getAttribute('role') || '').toLowerCase();
     const ariaHaspopup = (element.getAttribute('aria-haspopup') || '').trim().toLowerCase();
     // Only the control's own visible label and aria-label may classify it as
@@ -860,7 +888,7 @@ export function enumerateRenderedControlNodes(
     // `aria-expanded` on a normal href-bearing link is an attribute of content
     // navigation, not a disclosure trigger; a href-less link (or a real
     // button/summary) is an interactive surface whose contents stay hidden.
-    const disclosure = tagName === 'summary'
+    const interactiveDisclosure = tagName === 'summary'
       || (element.hasAttribute('aria-expanded') && (tagName !== 'a' || !hasNavigableHref));
     const target = (element.getAttribute('target') || '').trim().toLowerCase();
     // Menu-like labels only. Generic footer/company/about links are not
@@ -871,21 +899,40 @@ export function enumerateRenderedControlNodes(
     // generic title text must not classify ordinary controls.
     const menuLikeLabel = /\b(menu|navigation|nav|hamburger)\b/i;
     const structural = tagName === 'nav'
+      || tagName === 'summary'
       || role === 'menu'
       || role === 'menubar'
       || role === 'menuitem'
       || role === 'navigation'
+      || role === 'tab'
       || (ariaHaspopup !== '' && ariaHaspopup !== 'false')
-      || disclosure
+      || interactiveDisclosure
       || inNavigationContainer
       || menuLikeLabel.test(labelText)
       || menuLikeLabel.test(`${title} ${labelledByText}`);
+    // A structural anchor that resolves to a different document is a page
+    // candidate, not an in-place disclosure. Clicking it would replace the
+    // document and consume the click budget; the enqueue path owns it.
+    let navigatesAway = false;
+    if (tagName === 'a' && typeof href === 'string' && href) {
+      try {
+        const resolved = new URL(href);
+        const documentBase = node.baseURI || document.baseURI;
+        navigatesAway = (resolved.protocol === 'http:' || resolved.protocol === 'https:')
+          && resolved.href.split('#')[0] !== documentBase.split('#')[0];
+      } catch {
+        navigatesAway = true;
+      }
+    }
+    const isDisclosure = structural && !navigatesAway;
     const isPopup = (ariaHaspopup !== '' && ariaHaspopup !== 'false')
       || (target === '_blank' && !hasNavigableHref);
     if (structural) {
       structuralNavigation++;
       if (!baseMatched) structuralHintRejected++;
     }
+    if (isDisclosure) structuralDisclosure++;
+    if (structural && !hintMatchedControl && !isDisclosure) structuralUnrecovered++;
     if (!baseMatched && extendedMatched) iconLabelRecovered++;
     // Only popups that cannot be followed as a normal navigation are a
     // coverage gap. A `target=_blank` anchor with a real href is already
@@ -897,20 +944,26 @@ export function enumerateRenderedControlNodes(
       // accounting; they are marked below but never enter the click set.
       popupIndices.push(index);
     }
-    if (!baseMatched) continue;
-    matched.push({
+    if (!hintMatchedControl && !isDisclosure) continue;
+    const item: RenderedControlTarget = {
       index,
       text: baseText,
       href,
       tag: (tagName === 'a' ? 'anchor' : tagName === 'button' ? 'button' : 'role') as 'anchor' | 'button' | 'role',
       ...(isPopup ? { popup: true } : {}),
-    });
+    };
+    // Hint-matched controls keep priority over generic disclosures so the
+    // bounded click budget spends first on evidence-bearing content. The
+    // disclosure list preserves DOM order for deterministic rotation.
+    if (hintMatchedControl) hintMatched.push(item);
+    else disclosures.push(item);
   }
+  const selected = [...hintMatched, ...disclosures];
   const usedMarkers = new Set<string>();
   const controls: RenderedControlTarget[] = [];
   const markerByIndex = new Map<number, string>();
-  for (let itemIndex = 0; itemIndex < matched.length; itemIndex++) {
-    const item = matched[itemIndex];
+  for (let itemIndex = 0; itemIndex < selected.length; itemIndex++) {
+    const item = selected[itemIndex];
     const node = nodes[item.index] as HTMLElement;
     const existing = node.getAttribute('data-oc-control');
     let marker = existing || `oc-${Date.now().toString(36)}-${item.index}-${Math.random().toString(36).slice(2, 8)}`;
@@ -950,9 +1003,11 @@ export function enumerateRenderedControlNodes(
   return {
     controls,
     total: nodes.length,
-    hintRejected: Math.max(0, nodes.length - controls.length),
+    hintRejected: Math.max(0, nodes.length - baseMatchedCount),
     structuralNavigation,
     structuralHintRejected,
+    structuralDisclosure,
+    structuralUnrecovered,
     iconLabelRecovered,
     popupTargets,
     popupMarkers,
@@ -2103,6 +2158,8 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   let controlsHintRejected = 0;
   let controlsStructuralNavigation = 0;
   let controlsStructuralHintRejected = 0;
+  let controlsStructuralDisclosure = 0;
+  let controlsStructuralUnrecovered = 0;
   let controlsIconLabelRecovered = 0;
   // Crawlee retries a thrown request with a fresh page and fresh page-local
   // counters. Keep the last attempt's contribution per request so a retry
@@ -2161,6 +2218,8 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
     telemetry.controlsHintRejected = controlsHintRejected || undefined;
     telemetry.controlsStructuralNavigation = controlsStructuralNavigation || undefined;
     telemetry.controlsStructuralHintRejected = controlsStructuralHintRejected || undefined;
+    telemetry.controlsStructuralDisclosure = controlsStructuralDisclosure || undefined;
+    telemetry.controlsStructuralUnrecovered = controlsStructuralUnrecovered || undefined;
     telemetry.controlsIconLabelRecovered = controlsIconLabelRecovered || undefined;
     telemetry.popupTargets = popupTargets || undefined;
     telemetry.frameCount = (frameCount + clickDestinationContext.frameCount) || undefined;
@@ -2185,6 +2244,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
       structuralHintRejected: controlsStructuralHintRejected,
       iconLabelRecovered: controlsIconLabelRecovered,
       unresolvedFailedRequests: telemetry.unresolvedFailedRequests,
+      structuralUnrecovered: controlsStructuralUnrecovered,
       // The coverage reason must see the same context the telemetry publishes:
       // a document reached only by a click still has unexamined frames and
       // shadow roots, so it cannot be reported as fully covered.
@@ -2557,6 +2617,8 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             let pageHintRejected = 0;
             let pageStructuralNavigation = 0;
             let pageStructuralHintRejected = 0;
+            let pageStructuralDisclosure = 0;
+            let pageStructuralUnrecovered = 0;
             let pageIconLabelRecovered = 0;
             let pagePopupMarkers = new Set<string>();
             let pageControlOverflow = 0;
@@ -2579,10 +2641,13 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               );
               pageStructuralNavigation = gapCounters.structuralNavigation;
               pageStructuralHintRejected = gapCounters.structuralHintRejected;
+              pageStructuralDisclosure = Math.max(pageStructuralDisclosure, enumeration.structuralDisclosure);
+              pageStructuralUnrecovered = Math.max(pageStructuralUnrecovered, enumeration.structuralUnrecovered);
               pageIconLabelRecovered = gapCounters.iconLabelRecovered;
               pagePopupMarkers = trackRenderedPopupCoverage(pagePopupMarkers, enumeration);
-              // Overflow accounting keeps using the matched pool: P0.2 is
-              // measurement-only and must not change control-slice behavior.
+              // Overflow accounting uses the expanded click set. A disclosure
+              // outside the 64-control window is just as unexamined as a
+              // hint-matched control outside it.
               const overflow = Math.max(0, matchedTotal - RENDERED_CONTROL_EVALUATION_WINDOW);
               if (overflow > pageControlOverflow) {
                 const added = overflow - pageControlOverflow;
@@ -2627,8 +2692,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 baseHrefPresent = baseHrefPresent || merged.baseHrefPresent;
                 return;
               }
-              // Popups that the click loop actually inspected are not an
-              // unexamined context gap. Identity tracking keeps a replacement
+              // Popups that the click loop actually inspected are not an              // unexamined context gap. Identity tracking keeps a replacement
               // popup from being cancelled out by an earlier clicked popup,
               // including when the replacement is hint-rejected.
               const current = {
@@ -2636,6 +2700,8 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 hintRejected: pageHintRejected,
                 structuralNavigation: pageStructuralNavigation,
                 structuralHintRejected: pageStructuralHintRejected,
+                structuralDisclosure: pageStructuralDisclosure,
+                structuralUnrecovered: pageStructuralUnrecovered,
                 iconLabelRecovered: pageIconLabelRecovered,
                 popupCount: resolveUnexaminedPopupTargets(pagePopupMarkers, examinedPopupMarkers),
                 frameCount: pageFrameCount,
@@ -2649,6 +2715,8 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               controlsHintRejected += delta.hintRejected;
               controlsStructuralNavigation += delta.structuralNavigation;
               controlsStructuralHintRejected += delta.structuralHintRejected;
+              controlsStructuralDisclosure += delta.structuralDisclosure;
+              controlsStructuralUnrecovered += delta.structuralUnrecovered;
               controlsIconLabelRecovered += delta.iconLabelRecovered;
               popupTargets += delta.popupCount;
               frameCount += delta.frameCount;

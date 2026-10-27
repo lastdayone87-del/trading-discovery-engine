@@ -219,14 +219,22 @@ test('coverage reason distinguishes complete, bounded, policy, context, and unkn
     'BOUNDED',
     'abandoned context sampling prevents a COMPLETE claim',
   );
-  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, structuralHintRejected: 2 }), 'BOUNDED');
-  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, iconLabelRecovered: 1 }), 'BOUNDED');
   assert.equal(
+    resolveRenderedCoverageReason({ pagesInspected: 1, structuralHintRejected: 2 }),
+    'COMPLETE',
+    'hint-rejected structural disclosures are recovered into the click set by P1.1',
+  );
+  assert.equal(
+    resolveRenderedCoverageReason({ pagesInspected: 1, iconLabelRecovered: 1 }),
+    'COMPLETE',
+    'icon-label recoveries are clicked by P1.2, so they no longer imply an unexamined destination',
+  );  assert.equal(
     resolveRenderedCoverageReason({ pagesInspected: 1, unresolvedFailedRequests: 1 }),
     'BOUNDED',
     'a terminally failed child request can hide a destination, so it is not COMPLETE',
   );
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, unresolvedFailedRequests: 0 }), 'COMPLETE');
+  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, structuralUnrecovered: 2 }), 'BOUNDED');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, frameCount: 1 }), 'CONTEXT_UNREACHABLE');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, shadowRootCount: 1 }), 'CONTEXT_UNREACHABLE');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, popupTargets: 1 }), 'CONTEXT_UNREACHABLE');
@@ -276,6 +284,8 @@ test('safe telemetry round-trips P0.2 navigation-coverage fields on rendered row
     controlsHintRejected: 30,
     controlsStructuralNavigation: 12,
     controlsStructuralHintRejected: 9,
+    controlsStructuralDisclosure: 5,
+    controlsStructuralUnrecovered: 2,
     controlsIconLabelRecovered: 4,
     popupTargets: 3,
     frameCount: 2,
@@ -289,6 +299,8 @@ test('safe telemetry round-trips P0.2 navigation-coverage fields on rendered row
   assert.equal(rendered?.controlsHintRejected, 30);
   assert.equal(rendered?.controlsStructuralNavigation, 12);
   assert.equal(rendered?.controlsStructuralHintRejected, 9);
+  assert.equal(rendered?.controlsStructuralDisclosure, 5);
+  assert.equal(rendered?.controlsStructuralUnrecovered, 2);
   assert.equal(rendered?.controlsIconLabelRecovered, 4);
   assert.equal(rendered?.popupTargets, 3);
   assert.equal(rendered?.frameCount, 2);

@@ -59,6 +59,8 @@ const renderedEnumeration = (
   hintRejected: Math.max(0, total - controls.length),
   structuralNavigation: 0,
   structuralHintRejected: 0,
+  structuralDisclosure: 0,
+  structuralUnrecovered: 0,
   iconLabelRecovered: 0,
   popupTargets: 0,
   popupMarkers: controls.filter(control => control.popup && control.marker).map(control => control.marker as string),
@@ -422,8 +424,10 @@ test('zero-candidate interaction gaps stay retryable even with permanent-only li
 test('rendered control coverage counts overflow and uses stable markers across DOM mutations', () => {
   const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
   assert.match(source, /return \{\s*controls,\s*total: nodes\.length,/, 'the complete matched set is returned with its pre-filter total');
-  assert.match(source, /hintRejected: Math\.max\(0, nodes\.length - controls\.length\)/, 'hint-rejected is the pre-filter denominator minus matched controls');
+  assert.match(source, /hintRejected: Math\.max\(0, nodes\.length - baseMatchedCount\)/, 'hint-rejected stays measured against the original filter');
   assert.match(source, /structuralNavigation,/, 'structural navigation controls are counted for P1.1');
+  assert.match(source, /structuralDisclosure,/, 'in-place structural disclosures are counted for P1.1');
+  assert.match(source, /structuralUnrecovered,/, 'structural controls left to the enqueue path are counted');
   assert.match(source, /iconLabelRecovered,/, 'icon/label recovery is counted for P1.2');
   assert.match(source, /popupTargets,/, 'popup targets are counted for P1.3');
   assert.doesNotMatch(source, /matched\.slice\(0, 64\)/, 'enumeration must not truncate before the retry rotation');
