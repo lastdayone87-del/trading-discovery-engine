@@ -875,6 +875,35 @@ test('P10d: the plan ranks by the same resume age as the SQL shortlist', () => {
   assert.match(serverSource('queueManager.ts'), /const anchor = run\.resumeAt \?\? run\.lastPageAt/);
 });
 
+test('P10e: a treatment-cap denial is deferred, not retried every sweep', () => {
+  const queue = serverSource('queueManager.ts');
+  const reconcilerTreatmentAt = queue.indexOf("run.retrievalTreatmentOrigin === 'CANARY_TREATMENT'");
+  assert.ok(reconcilerTreatmentAt > 0);
+  const denialAt = queue.indexOf('if (!incRes.authorized)', reconcilerTreatmentAt);
+  assert.ok(denialAt > reconcilerTreatmentAt);
+  const denialBlock = queue.slice(denialAt, queue.indexOf('incPageReservationId = incRes.pageReservationId', denialAt));
+  // Daily caps cannot clear before the quota day resets; transient errors get
+  // a short bounded backoff. Either way the run is deferred rather than left
+  // RUNNING with no job, which would retry every sweep and look orphaned.
+  assert.match(denialBlock, /CAP_EXCEEDED\|QUOTA_EXHAUSTED/);
+  assert.match(denialBlock, /deferAutonomousRunForQuota\(run\.runId/);
+  assert.match(denialBlock, /deferAutonomousRunForTime\(run\.runId/);
+});
+
+test('P10f: orphan health ignores runs with a live page job', () => {
+  // The reconciler already treats PENDING/PROCESSING page jobs as non-orphans.
+  // The health query must use the same exclusion, otherwise queue backlog
+  // older than 15 minutes fails orphan_pending_pages and returns 503.
+  const health = serverSource('countryDiscoveryHealth.ts');
+  const orphanQueryStart = health.indexOf('SELECT COUNT(*)::int AS count,');
+  const orphanQueryEnd = health.indexOf('`,', orphanQueryStart);
+  assert.ok(orphanQueryStart > 0 && orphanQueryEnd > orphanQueryStart);
+  const orphanQuery = health.slice(orphanQueryStart, orphanQueryEnd);
+  assert.match(orphanQuery, /NOT EXISTS \(\s*SELECT 1 FROM jobs j/);
+  assert.match(orphanQuery, /j\.status IN \('PENDING','PROCESSING'\)/);
+  assert.match(orphanQuery, /search-run:'\|\|query_runs\.id/);
+});
+
 test('P11: official YouTube resume uses the durable next-page token without a rewalk', () => {
   assert.equal(resumeModeForProvider('youtube-search'), 'TOKEN');
   const queue = serverSource('queueManager.ts');
@@ -2034,9 +2063,17 @@ test('R1: transient AI failure retries up to three attempts while rule evidence 
   assert.match(snapshotSource, /COALESCE\(SUM\(actual_cost_microunits\),0\)::bigint AS actual_cost/);
   assert.ok(!/SUM\(actual_cost_microunits\) FILTER/.test(snapshotSource), 'snapshot actual cost must not filter by status');
   // A reservation with zero provider attempts is released instead of charged
-  // or counted against the daily call cap.
+  // or counted against the daily call cap. A reopened reservation that already
+  // carries actual spend from its expired owner must keep that spend and its
+  // call-cap slot, or later calls can reuse budget that was already spent.
   assert.match(db, /export async function releaseNativeVocabularyAiRun/);
-  assert.match(db, /status='BUDGET_SKIPPED'/);
+  const releaseStart = db.indexOf('export async function releaseNativeVocabularyAiRun');
+  const releaseEnd = db.indexOf('export interface QueryRunProgress', releaseStart);
+  assert.ok(releaseStart > 0 && releaseEnd > releaseStart);
+  const releaseSource = db.slice(releaseStart, releaseEnd);
+  assert.match(releaseSource, /status=CASE WHEN actual_cost_microunits > 0 THEN 'FAILED' ELSE 'BUDGET_SKIPPED' END/);
+  assert.match(releaseSource, /reserved_cost_microunits=0/);
+  assert.ok(!/actual_cost_microunits\s*=\s*0/.test(releaseSource), 'release must preserve retained actual spend');
   assert.match(source, /aiRun\.attempts === 0/);
   assert.match(source, /releaseNativeVocabularyAiRun/);
   // A ledger outage degrades to rule-only extraction after rule evidence is

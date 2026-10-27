@@ -344,6 +344,18 @@ export async function gatherCountryDiscoveryHealth(clientOverride?: HealthRunner
        WHERE continuation_status IN ('RUNNING','DEFERRED_QUOTA','DEFERRED_TIME')
          AND status NOT IN ('COMPLETED','FAILED')
          AND (deferred_until IS NULL OR deferred_until <= now())
+         -- A live page job is queue backlog, not a missing page. The
+         -- reconciler uses the same exclusion; without it a legitimately
+         -- queued continuation older than 15 minutes fails the health route.
+         AND NOT EXISTS (
+           SELECT 1 FROM jobs j
+           WHERE j.status IN ('PENDING','PROCESSING')
+             AND (
+               j.idempotency_key = 'search-run:'||query_runs.id
+               OR j.idempotency_key = 'search-run:'||query_runs.id||':page:1'
+               OR j.idempotency_key = 'search-run:'||query_runs.id||':page:'||GREATEST(pages_completed+1,1)
+             )
+         )
          AND COALESCE(last_page_at,started_at,scheduled_at) < now() - interval '${ORPHAN_AGE_MINUTES} minutes'`,
     ),
     runner.query(

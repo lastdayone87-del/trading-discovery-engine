@@ -4461,8 +4461,13 @@ export async function completeNativeVocabularyAiRun(args: {
 /**
  * Release an admitted reservation that never reached a provider (for example
  * when neither Groq nor Gemini is configured, or every route deferred before
- * a request). The row remains as a same-day idempotency marker but stops
- * counting toward the call cap and retains no reservation or actual cost.
+ * a request). A fresh reservation stops counting toward the call cap and
+ * retains no reservation or actual cost.
+ *
+ * A reopened reservation may already carry actual spend from its expired
+ * owner. That spend and its call-cap slot must survive this release: zeroing
+ * either would let later calls reuse budget that was already spent. Such a
+ * row stays FAILED; only a row with no retained spend becomes BUDGET_SKIPPED.
  * The lease token fences a stale worker from releasing a replacement owner.
  */
 export async function releaseNativeVocabularyAiRun(args: {
@@ -4472,8 +4477,9 @@ export async function releaseNativeVocabularyAiRun(args: {
   const db = await getDb();
   const result = await db.query(
     `UPDATE native_vocabulary_ai_runs
-     SET status='BUDGET_SKIPPED',provider=NULL,attempts=0,
-         reserved_cost_microunits=0,actual_cost_microunits=0,
+     SET status=CASE WHEN actual_cost_microunits > 0 THEN 'FAILED' ELSE 'BUDGET_SKIPPED' END,
+         provider=NULL,attempts=0,
+         reserved_cost_microunits=0,
          response_payload=NULL,completed_at=now(),lease_expires_at=NULL,lease_token=NULL
      WHERE request_id=$1 AND status='RESERVED' AND lease_token=$2
      RETURNING request_id`,

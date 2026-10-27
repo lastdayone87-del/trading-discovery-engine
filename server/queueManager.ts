@@ -2088,7 +2088,16 @@ export async function resumeOrphanedAutonomousPages(options: {
           providerQuotaUnits: provider?.costDomain === 'YOUTUBE_INNERTUBE_FREE' ? 0 : 100,
         });
         if (!incRes.authorized) {
-          // Stay pending for a later sweep; do not fail the run or bypass caps.
+          // Do not fail the run or bypass caps. Daily-cap denials cannot clear
+          // before the quota day resets; transient reservation errors get a
+          // short bounded backoff. Persisting the deferral keeps the run
+          // resumable without retrying the same denied reservation every
+          // sweep or reporting a false orphan after 15 minutes.
+          if (/CAP_EXCEEDED|QUOTA_EXHAUSTED/.test(incRes.reason)) {
+            await deferAutonomousRunForQuota(run.runId, incRes.reason);
+          } else {
+            await deferAutonomousRunForTime(run.runId, incRes.reason);
+          }
           skipped++;
           continue;
         }
