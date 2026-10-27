@@ -163,7 +163,6 @@ test('coverage reason distinguishes complete, bounded, policy, context, and unkn
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, budgetExhausted: true }), 'BOUNDED');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, interactionGap: true }), 'BOUNDED');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, scrollCapReachedStillGrowing: true }), 'BOUNDED');
-  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, structuralUnrecovered: 2 }), 'BOUNDED');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, frameCount: 1 }), 'CONTEXT_UNREACHABLE');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, shadowRootCount: 1 }), 'CONTEXT_UNREACHABLE');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, popupTargets: 1 }), 'CONTEXT_UNREACHABLE');

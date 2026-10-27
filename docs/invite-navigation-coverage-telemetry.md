@@ -45,7 +45,7 @@ none contains a URL, selector, element text, or payload.
 | `controlsStructuralNavigation` | Menu/nav/hamburger/tab/summary/`aria-haspopup`/collapsed-`aria-expanded`/`role=menuitem` controls. |
 | `controlsStructuralHintRejected` | Structural controls the original hint filter would hide. |
 | `controlsStructuralDisclosure` | Structural controls included in the click set because they can reveal content in place. |
-| `controlsStructuralUnrecovered` | Structural controls still outside the click set: anchors that navigate to a real document and are owned by the enqueue path. |
+| `controlsStructuralUnrecovered` | Structural controls still outside the click set: anchors that navigate to a real document and are owned by the enqueue path. Diagnostic only; enqueue admission failures are reported through `navigationPolicyExcluded`. |
 | `controlsIconLabelRecovered` | Controls recovered by a label the original filter ignored: `title`, `aria-labelledby`, child `alt`, `data-label`, `data-tooltip`, SVG `<title>`, or capped hidden text. |
 | `popupTargets` | Popup/dialog controls that require capture rather than navigation: `aria-haspopup="dialog|menu"` and href-less `target="_blank"` controls. A `_blank` anchor with a real href is reachable by navigation and is not counted. Presence only; no popup capture. |
 | `frameCount` | `iframe`/`frame`/`object`/`embed` elements observed on processed pages. |
@@ -72,8 +72,8 @@ Existing fields keep their meanings:
 `resolveRenderedCoverageReason` is intentionally conservative:
 
 1. `UNKNOWN` when no page was processed.
-2. `BOUNDED` when a named ceiling, interaction gap, scroll-cap-still-growing, or
-   `structuralUnrecovered` control was observed.
+2. `BOUNDED` when a named ceiling, interaction gap, or scroll-cap-still-growing
+   was observed.
 3. `CONTEXT_UNREACHABLE` when frames, open shadow roots, or popup targets were
    observed.
 4. `POLICY_EXCLUDED` when `invalid-protocol`, `admission-rejected`,
@@ -81,10 +81,10 @@ Existing fields keep their meanings:
 5. `COMPLETE` otherwise.
 
 P1.1/P1.2 changed what counts as bounded. Recovered icon-label and structural
-disclosure controls are clicked, so they no longer trigger `BOUNDED`. The
-remaining structural gap is `structuralUnrecovered`: a structural anchor that
-resolves to a different document is owned by the enqueue path, not the click
-set.
+disclosure controls are clicked, so they no longer trigger `BOUNDED`.
+`structuralUnrecovered` is diagnostic only: a structural anchor that resolves
+to a different document is owned by the enqueue path, not the click set, and
+enqueue admission failures are reported separately.
 
 `hint-rejected` and `control-slice` are measured in
 `navigationPolicyExcluded` but are not policy exclusions for this reason:

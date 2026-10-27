@@ -1971,7 +1971,6 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
       budgetExhausted,
       interactionGap,
       scrollCapReachedStillGrowing,
-      structuralUnrecovered: controlsStructuralUnrecovered,
       frameCount,
       shadowRootCount,
       popupTargets,

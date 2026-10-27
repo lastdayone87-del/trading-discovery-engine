@@ -128,8 +128,6 @@ export interface RenderedCoverageInput {
   budgetExhausted?: boolean;
   interactionGap?: boolean;
   scrollCapReachedStillGrowing?: boolean;
-  /** Structural controls still outside the click set (navigable anchors). */
-  structuralUnrecovered?: number;
   frameCount?: number;
   shadowRootCount?: number;
   popupTargets?: number;
@@ -147,8 +145,7 @@ export function resolveRenderedCoverageReason(input: RenderedCoverageInput): Ren
     typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
   if (input.budgetExhausted === true
     || input.interactionGap === true
-    || input.scrollCapReachedStillGrowing === true
-    || count(input.structuralUnrecovered) > 0) {
+    || input.scrollCapReachedStillGrowing === true) {
     return 'BOUNDED';
   }
   if (count(input.frameCount) > 0 || count(input.shadowRootCount) > 0 || count(input.popupTargets) > 0) {
