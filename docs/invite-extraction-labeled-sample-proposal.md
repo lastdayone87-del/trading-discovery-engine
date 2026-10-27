@@ -47,11 +47,17 @@ represented.
 | A. Static found | Static inspection `FOUND` with a serving invite | 60 |
 | B. Rendered found | Rendered fallback `FOUND` after static miss | 60 |
 | C. Partial | `PARTIALLY_INSPECTED` with a required gap | 50 |
-| D. 403-only | Latest 7d observations contain 403 and no `FOUND` | 40 |
-| E. 404-only | Latest 7d observations contain 404 and no `FOUND` | 40 |
-| F. 406-only | Latest 7d observations contain 406 and no `FOUND` | 20 |
+| D. 403 (primary) | Latest 7d contains 403 and no `FOUND`; 403 takes precedence over 404/406 | 40 |
+| E. 404 (no 403) | Latest 7d contains 404, no `FOUND`, and no 403 | 40 |
+| F. 406 (no 403/404) | Latest 7d contains 406, no `FOUND`, and no 403/404 | 20 |
 | G. No observation | Eligible surface never successfully inspected | 30 |
 | **Total** | | **300** |
+
+Strata are disjoint: a channel with several 4xx classes is assigned once by
+precedence 403 → 404 → 406, so no channel is counted twice. A channel whose
+only 4xx status is, for example, 410 does not match D–F and belongs in G (no
+successful inspection) or outside the frame if it has another eligible
+observation.
 
 If the frame cannot fill a stratum, reallocate proportionally and document the
 shortfall. Do not silently substitute a different class.
@@ -101,7 +107,11 @@ Report Cohen's κ and the adjudication rate.
 Primary:
 
 - **Channel-level recall** = channels with a labeled invite that the pipeline
-  found / channels with a labeled invite, overall and by stratum.
+  found / channels with a labeled invite, overall and by stratum. The pooled
+  “overall” figure is **sample-weighted**: strata are deliberately oversampled,
+  so it is not a population-level recall estimate. Report population estimates
+  only after post-stratification weighting against frame counts, with the
+  weighting method and design effect documented.
 - **Stage recall**: static-found / rendered-found / interaction-found.
 - **False-negative rate by attributed cause**, with exact binomial 95%
   confidence intervals.
@@ -116,9 +126,11 @@ Secondary:
 
 Report point estimates with confidence intervals; do not present a single
 aggregate recall without the stratum breakdown. With n=300 and roughly 150
-labeled positives, the 95% CI half-width around a 70% recall is about ±5
-percentage points; rarer causes will have wide intervals and must be reported
-as such.
+labeled positives, the 95% CI half-width around a 70% recall is about ±7.3
+percentage points (1.96 × √(0.7 × 0.3 / 150)); rarer causes will have wide
+intervals and must be reported as such. Clustering within site hosts and the
+stratified design can widen these intervals further, so treat them as lower
+bounds unless a design-based interval is computed.
 
 ## 6. Data handling and safety
 

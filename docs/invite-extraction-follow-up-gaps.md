@@ -179,8 +179,9 @@ These were reviewed and intentionally left alone:
 
 ## 13. Out of scope by decision
 
-- D1 >64-control reachability, 70/64-control fixtures, and control telemetry
-  are **implemented** in this remediation.
+- D1 >64-control reachability, 70/64-control fixtures, control telemetry, and
+  anchor-aware durable retry-offset advancement are **implemented** in this
+  remediation.
 - A1 retention and candidate selection are **implemented** in this
   remediation.
 - Non-page/malformed URL filtering is **implemented** in this remediation.

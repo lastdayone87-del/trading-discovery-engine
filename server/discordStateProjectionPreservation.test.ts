@@ -386,6 +386,8 @@ test('pipeline and queue delegate Discord preservation to the shared guards', ()
   assert.match(queue, /const shouldProjectValidation=canProjectDiscordValidation\(channel,selected,selectedCandidate\);/);
   assert.match(queue, /const projectedDiscord=projectDiscordValidation\(channel,selected,selectedCandidate\);/);
   assert.match(queue, /if\(projectedDiscord\.discord_candidate_id\)await selectDiscordCandidate\(channel\.channel_id,projectedDiscord\.discord_candidate_id\);/);
+  assert.match(queue, /discordValidationProjected=true;/);
+  assert.match(queue, /await upsertChannel\(channel,\{freshDiscordValidation:discordValidationProjected\}\);/);
   assert.doesNotMatch(queue, /await selectDiscordCandidate\(channel\.channel_id,selectedCandidate\.candidateId\)/);
   assert.doesNotMatch(queue, /channel\.discord_discovery_status==='VALIDATED'&&\(channel\.discord_status==='ACTIVE'\|\|channel\.discord_status==='DEAD'\)/);
 });
@@ -432,7 +434,42 @@ test('A1 a fresh usable invite replaces the locked projection normally', () => {
     discord_candidate_id: newValidCandidate.candidateId,
     discord_candidate_locator: NEW_VALID_URL,
   }) as any;
-  assert.equal(shouldRetainLockedDiscordProjection(fresh, locked), false);
+  assert.equal(shouldRetainLockedDiscordProjection(fresh, locked, { freshDiscordValidation: true }), false);
+  assert.equal(shouldRetainLockedDiscordProjection(fresh, locked), true, 'an ordinary snapshot cannot replace a serving invite');
+});
+
+test('A1 a fresh validation failure persists its retry-pending evidence', () => {
+  const locked = cbrackn() as any;
+  const failure = cbrackn({
+    discord_status: 'UNCERTAIN',
+    discord_invite: VALID_URL,
+    discord_liveness_status: 'INVALID_OBSERVED',
+    discord_relevance_status: 'NOT_CHECKED',
+    discord_validation_status: 'RETRY_PENDING',
+    discord_discovery_status: 'DISCOVERED_VALIDATION_FAILED',
+  }) as any;
+  assert.equal(
+    shouldRetainLockedDiscordProjection(failure, locked, { freshDiscordValidation: true }),
+    false,
+    'the authoritative validation upsert must write the fresh failure state',
+  );
+});
+
+test('A1 a stale ACTIVE snapshot cannot erase the retained uncertainty marker', () => {
+  const locked = cbrackn({ discord_relevance_status: 'UNCERTAIN' }) as any;
+  const stale = cbrackn({
+    discord_status: 'ACTIVE',
+    discord_invite: VALID_URL,
+    discord_candidate_id: 'stale-candidate',
+    discord_relevance_status: 'TRADING_RELEVANT',
+    discord_liveness_status: 'ACTIVE',
+    discord_validation_status: 'COMPLETED',
+  }) as any;
+  assert.equal(hasRetainedLastKnownGoodDiscordInvite(locked), true);
+  assert.equal(shouldRetainLockedDiscordProjection(stale, locked), true);
+  const merged = overlayLockedDiscordProjection(stale, locked);
+  assert.equal(merged.discord_relevance_status, 'UNCERTAIN');
+  assert.equal(merged.discord_candidate_id, validCandidate.candidateId);
 });
 
 test('classification-only upserts take the locked row Discord projection instead of a stale snapshot', () => {

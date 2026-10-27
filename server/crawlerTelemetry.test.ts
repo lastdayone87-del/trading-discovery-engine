@@ -129,6 +129,29 @@ test('safe telemetry round-trips new diagnostic fields to the ledger', () => {
   assert.equal(telemetry?.workerInstanceId, 'replica-a:123');
 });
 
+test('safe telemetry round-trips bounded control-offset advances', () => {
+  const rendered = safeCrawlerTelemetry({
+    mode: 'RENDERED',
+    pagesInspected: 1,
+    evidenceControlsTotal: 70,
+    evidenceControlsClicked: 4,
+    evidenceControlsFailed: 1,
+    evidenceControlsSkipped: 60,
+    evidenceControlsNavigableOnly: true,
+    evidenceControlsOffsetAdvance: 8,
+  });
+  assert.equal(rendered?.evidenceControlsTotal, 70);
+  assert.equal(rendered?.evidenceControlsOffsetAdvance, 8);
+  assert.equal(rendered?.evidenceControlsNavigableOnly, true);
+
+  const zero = safeCrawlerTelemetry({ mode: 'RENDERED', pagesInspected: 1, evidenceControlsOffsetAdvance: 0 });
+  assert.equal(zero?.evidenceControlsOffsetAdvance, undefined, 'a zero advance is sparse, not a stored zero');
+  const negative = safeCrawlerTelemetry({ mode: 'RENDERED', pagesInspected: 1, evidenceControlsOffsetAdvance: -4 });
+  assert.equal(negative?.evidenceControlsOffsetAdvance, undefined, 'negative advances are dropped');
+  const staticRow = safeCrawlerTelemetry({ mode: 'STATIC', pagesInspected: 1, evidenceControlsOffsetAdvance: 8 });
+  assert.equal(staticRow?.evidenceControlsOffsetAdvance, undefined, 'control offsets are rendered-only');
+});
+
 test('safe telemetry drops unknown stage/reason and truncates cause text', () => {
   const telemetry = safeCrawlerTelemetry({
     mode: 'RENDERED',

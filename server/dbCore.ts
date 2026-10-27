@@ -917,23 +917,33 @@ export function overlayLockedDiscordProjection<T extends Partial<ChannelRecord>>
  * A1 targeted last-known-good guard for ordinary (non-classification) writes.
  * A caller may load a channel before a validation commits, then persist its
  * stale snapshot after it. When the locked row still serves a completed, live,
- * validated invite and the proposed write would clear or downgrade that
- * projection, retain the locked Discord fields. Definitive terminal outcomes
- * (DEAD/NON_TRADING) and explicit intentional cleanup still apply. This is
- * deliberately narrower than making `preserveDiscordOnUpdate` the default:
- * fresh validation writes with a usable invite, and terminal verdicts, must
- * continue to replace the projection.
+ * validated invite, an ordinary write must not clear it, replace it with a
+ * different invite, or (for a retained last-known-good row) erase the
+ * uncertainty marker with a stale ACTIVE snapshot. Definitive terminal
+ * outcomes (DEAD/NON_TRADING), explicit intentional cleanup, and fresh
+ * validation writes still apply. This is deliberately narrower than making
+ * `preserveDiscordOnUpdate` the default: the authoritative inspection upsert
+ * opts into `freshDiscordValidation` so its latest status/evidence always
+ * reaches the row.
  */
 export function shouldRetainLockedDiscordProjection(
   proposed:Partial<ChannelRecord>,
   locked:Partial<ChannelRecord>|null|undefined,
-  options?:{allowDiscordClear?:boolean},
+  options?:{allowDiscordClear?:boolean;freshDiscordValidation?:boolean},
 ):boolean{
-  if(!locked||options?.allowDiscordClear)return false;
+  if(!locked||options?.allowDiscordClear||options?.freshDiscordValidation)return false;
   if(!hasServingLastKnownGoodDiscordInvite(locked))return false;
   if(proposed.discord_status==='DEAD'||proposed.discord_status==='NON_TRADING')return false;
-  return !proposed.discord_invite
-    ||(proposed.discord_status!=='ACTIVE'&&proposed.discord_status!=='ACTIVE_LOW_VOLUME');
+  const proposedInvite=proposed.discord_invite||null;
+  const lockedInvite=locked.discord_invite||null;
+  // No ordinary write may clear or replace a serving invite; only a fresh
+  // validation, a terminal verdict, or explicit cleanup owns that transition.
+  if(!proposedInvite||proposedInvite!==lockedInvite)return true;
+  // Same invite: a stale ACTIVE snapshot would silently overwrite the
+  // retained uncertainty marker and candidate identity. Recovery/reactivation
+  // writes move the row to UNCERTAIN and must still apply.
+  return hasRetainedLastKnownGoodDiscordInvite(locked)
+    &&(proposed.discord_status==='ACTIVE'||proposed.discord_status==='ACTIVE_LOW_VOLUME');
 }
 
 type ChannelUpsertClient = { query: (text: string, params?: unknown[]) => Promise<unknown> };
@@ -987,7 +997,7 @@ ON CONFLICT(channel_id) DO UPDATE SET
   ]);
 }
 
-export async function upsertChannel(channel: ChannelRecord, options?: { preserveDiscordOnUpdate?: boolean; allowDiscordClear?: boolean }): Promise<void> {
+export async function upsertChannel(channel: ChannelRecord, options?: { preserveDiscordOnUpdate?: boolean; allowDiscordClear?: boolean; freshDiscordValidation?: boolean }): Promise<void> {
   const db = await getDb();
   const client = await db.connect();
   try {
@@ -999,8 +1009,10 @@ export async function upsertChannel(channel: ChannelRecord, options?: { preserve
     // The row is locked above for this transaction. A classification-only write
     // must not push its stale Discord snapshot over a validation result that
     // committed while classification was running. Ordinary writes get the
-    // narrower A1 guard: only a would-be clear/downgrade of a locked
-    // last-known-good serving invite is retained.
+    // narrower A1 guard: a stale snapshot cannot clear/replace a serving invite
+    // or erase a retained uncertainty marker. The authoritative inspection
+    // upsert passes `freshDiscordValidation` so fresh validation outcomes
+    // (including operational failures and retry-pending evidence) apply.
     const locked = prior.rowCount ? prior.rows[0] : null;
     const preserveDiscord = options?.preserveDiscordOnUpdate === true
       || shouldRetainLockedDiscordProjection(channel, locked, options);

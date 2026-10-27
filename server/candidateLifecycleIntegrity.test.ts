@@ -337,6 +337,43 @@ test('gap retries advance only by controls actually examined', () => {
   assert.deepEqual(nextRenderedClickOffsets(undefined, [
     { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 9 } },
   ]), { 'https://creator.test/': 4 }, 'multi-page click totals advance at most one page window');
+  assert.deepEqual(nextRenderedClickOffsets(undefined, [
+    { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 0, evidenceControlsTotal: 70, evidenceControlsFailed: 0, evidenceControlsNavigableOnly: true } },
+  ]), { 'https://creator.test/': 64 }, 'a certified all-navigable window advances to controls beyond the first 64');
+  assert.deepEqual(nextRenderedClickOffsets({ 'https://creator.test/': 64 }, [
+    { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 0, evidenceControlsTotal: 70, evidenceControlsFailed: 0, evidenceControlsNavigableOnly: true } },
+  ]), { 'https://creator.test/': 128 }, 'repeated all-navigable retries keep advancing the durable offset');
+  assert.deepEqual(nextRenderedClickOffsets(undefined, [
+    { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 0, evidenceControlsTotal: 64, evidenceControlsFailed: 0, evidenceControlsNavigableOnly: true } },
+  ]), { 'https://creator.test/': 64 }, 'a full 64-control all-navigable window advances one window and wraps cleanly');
+  assert.deepEqual(nextRenderedClickOffsets(undefined, [
+    { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 0, evidenceControlsTotal: 70, evidenceControlsFailed: 0 } },
+  ]), {}, 'an uncertified zero-click window (deadline/crash) keeps the same window');
+  assert.deepEqual(nextRenderedClickOffsets(undefined, [
+    { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 0, evidenceControlsTotal: 70, evidenceControlsFailed: 0, evidenceControlsNavigableOnly: true } },
+    { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 0, evidenceControlsTotal: 10, evidenceControlsFailed: 0 } },
+  ]), {}, 'one uncertified page keeps the shared per-seed window unchanged');
+  assert.deepEqual(nextRenderedClickOffsets(undefined, [
+    { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 0, evidenceControlsTotal: 70, evidenceControlsFailed: 1, evidenceControlsNavigableOnly: true } },
+  ]), {}, 'a failed click keeps the window for a real retry');
+  assert.deepEqual(nextRenderedClickOffsets(undefined, [
+    { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 2, evidenceControlsTotal: 70, evidenceControlsFailed: 1, evidenceControlsNavigableOnly: true } },
+  ]), { 'https://creator.test/': 2 }, 'click progress still wins when another page clicked');
+  assert.deepEqual(nextRenderedClickOffsets(undefined, [
+    { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 4, evidenceControlsOffsetAdvance: 8 } },
+  ]), { 'https://creator.test/': 8 }, 'recorded full-pool positions advance past anchors before clicked controls');
+  assert.deepEqual(nextRenderedClickOffsets({ 'https://creator.test/': 8 }, [
+    { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 4, evidenceControlsOffsetAdvance: 12 } },
+  ]), { 'https://creator.test/': 20 }, 'a later retry adds its recorded positions to the durable offset');
+  assert.deepEqual(nextRenderedClickOffsets(undefined, [
+    { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 2, evidenceControlsOffsetAdvance: 100 } },
+  ]), { 'https://creator.test/': 64 }, 'a recorded advance is bounded to one evaluation window');
+  assert.deepEqual(nextRenderedClickOffsets(undefined, [
+    { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 0, evidenceControlsTotal: 70, evidenceControlsFailed: 0, evidenceControlsNavigableOnly: true, evidenceControlsOffsetAdvance: 64 } },
+  ]), { 'https://creator.test/': 64 }, 'an all-navigable window uses its recorded window advance');
+  assert.deepEqual(nextRenderedClickOffsets(undefined, [
+    { requestedUrl: 'https://creator.test/', telemetry: { clicksStarted: 0, evidenceControlsTotal: 70, evidenceControlsFailed: 0, evidenceControlsNavigableOnly: true, evidenceControlsOffsetAdvance: 10 } },
+  ]), { 'https://creator.test/': 10 }, 'a certified partial navigable window advances only what it examined');
   const queue = readSource('queueManager.ts');
   assert.match(queue, /scanAttempts: inspectionClickOffsetForRetry\(channel\.scan_attempts, executionMarker\)/);
   assert.match(queue, /clickOffsets: executionMarker\?\.isRetryOwnedReacquire \? resolveInspectionClickOffsets\(executionMarker\.clickOffsets\) : undefined/);

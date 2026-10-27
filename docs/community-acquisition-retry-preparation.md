@@ -27,14 +27,19 @@ Deliberate exclusions from the filter:
 - generic CDNs that can host entire sites (`cloudfront.net`, `amazonaws.com`)
   are not filtered;
 - document and feed types (`pdf`, `rss`, `xml`) stay eligible;
-- dots inside page slugs (`v1.2`, `app.js.html`, `using-.js-files`) do not
-  match the resource-extension rule.
+- dots inside page slugs (`v1.2`, `app.js.html`, `using-.js-files`) and
+  dot-named path segments (`/projects/three.js/community`,
+  `/topics/vue.js/discord`) do not match the resource-extension rule;
+- script keywords alone are not malformed: `/files/document.pdf`,
+  `/window.html`, `/let-s-trade-community`, and `/function/community` stay
+  eligible; rejection requires actual declaration/call/assignment syntax.
 
 ### Regression coverage
 
 - `server/crawlAdmissionGate.test.ts`: noise is rejected before fetch or
   observation; legitimate HTML pages, query strings, apostrophes, documents,
-  shorteners, social profiles, and invite hosts still crawl.
+  shorteners, social profiles, invite hosts, script-keyword page slugs, and
+  `.js`-named path segments still crawl.
 - `server/pageAssetFilter.test.ts`: asset/CDN hosts are filtered; profile and
   invite hosts are preserved.
 - `server/communityRetryPolicy.test.ts`: non-page/malformed observations own no

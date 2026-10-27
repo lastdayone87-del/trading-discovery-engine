@@ -420,12 +420,14 @@ export interface CrawlAdmissionDecision {
 // regardless of host. Mirrors the extraction-time asset-extension filter so
 // stored links cannot bypass it; document/feed types (pdf/rss/xml) are
 // intentionally NOT in this list and stay eligible. The extension may be
-// followed by URL punctuation (`?`, `&`, `#`, `/`, quotes, encoded quote) or
-// end the path: template/CDN noise often appends transform parameters without
-// a `?` (for example `card.png&w=1920&q=75`). A dot inside a page slug
-// (`v1.2`, `.js.html`, `using-.js-files`) does not match because the
-// following character is not a delimiter.
-const RESOURCE_PATH_EXTENSION = /\.(?:js|mjs|css|map|png|jpe?g|gif|webp|svg|avif|apng|bmp|tiff?|heic|jfif|ico|woff2?|ttf|otf|eot|mp4|m4v|webm|mp3|m4a|aac|flac|wav|ogg|opus|avi|mov|3gp|zip|gz|rar|7z|exe|dmg)(?=$|[&;,%?"'#/\s])/i;
+// followed by URL punctuation (`?`, `&`, `#`, quotes, encoded quote) or end
+// the path: template/CDN noise often appends transform parameters without a
+// `?` (for example `card.png&w=1920&q=75`). `/`, `,`, and `;` are deliberately
+// NOT terminators: a dot-named path segment can be a legitimate page slug
+// (`/projects/three.js/community`, `/topics/vue.js/discord`). A dot inside a
+// page slug (`v1.2`, `.js.html`, `using-.js-files`) also does not match
+// because the following character is not a delimiter.
+const RESOURCE_PATH_EXTENSION = /\.(?:js|mjs|css|map|png|jpe?g|gif|webp|svg|avif|apng|bmp|tiff?|heic|jfif|ico|woff2?|ttf|otf|eot|mp4|m4v|webm|mp3|m4a|aac|flac|wav|ogg|opus|avi|mov|3gp|zip|gz|rar|7z|exe|dmg)(?=$|[&%?"'#\s])/i;
 
 // Image/thumbnail directories are asset trees, not HTML pages. Matching is
 // segment-anchored (`/images/`, not `images-and-media`) so ordinary page slugs
@@ -436,8 +438,13 @@ const NON_PAGE_PATH_PREFIX = /^\/(?:images?|img|thumbnails?|thumbs?|avatars?|ico
 // dynamic-attribute extraction (`{{link}}`, `${link}`, `%22%22;`,
 // `d,a.onload=function()%7B...`). Braces, angle brackets, backslashes, double
 // quotes, and control characters cannot appear in a legitimate page path;
-// single quotes are deliberately allowed (`/o'brien-community`).
-const MALFORMED_PATH = /[{}"<>\\\u0000-\u001F\u007F]|(?:^|[\/,;])(?:var|let|const|function)\b|\.(?:onload|onerror|onclick)\s*=|(?:^|[\/,;])(?:this|document|window)\./i;
+// single quotes are deliberately allowed (`/o'brien-community`). Script
+// keywords alone are NOT evidence: a path may legitimately contain
+// `/files/document.pdf`, `/window.html`, `/let-s-trade-community`, or
+// `/function/community`. Declarations therefore need keyword + whitespace +
+// identifier, functions need a call/named-function form, and DOM globals need
+// a property followed by assignment/call syntax.
+const MALFORMED_PATH = /[{}"<>\\\u0000-\u001F\u007F]|(?:^|[\/,;])(?:var|let|const)\s+[A-Za-z_$]|(?:^|[\/,;])function\s*(?:\(|[A-Za-z_$][\w$]*\s*\()|\.(?:onload|onerror|onclick)\s*=|(?:^|[\/,;])(?:this|document|window)(?:\.[A-Za-z_$][\w$]*){1,4}\s*[=(]/i;
 
 export function assessCrawlAdmission(rawUrl: string): CrawlAdmissionDecision {
   // Same scheme handling as `normalizeExternalUrl`: scheme-less input gets

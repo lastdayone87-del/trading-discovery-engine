@@ -1850,6 +1850,11 @@ export async function inspectAndValidateChannel(
   let inspection: Awaited<ReturnType<typeof runChannelInspection>> | null = null;
   let retryDirective: CommunityRetryDirective | undefined;
   let attemptFree = false;
+  // Set only when this pass actually projected a fresh validation result onto
+  // the channel. The final upsert may bypass the last-known-good guard only
+  // for that authoritative projection; acquisition-only, NOT_FOUND, and
+  // error paths must keep the ordinary stale-snapshot protection.
+  let discordValidationProjected = false;
   let admittedInspection: typeof inspection;
   try {
     // 1. Re-check Country Validation before Discord scanning
@@ -2157,6 +2162,7 @@ export async function inspectAndValidateChannel(
         // an invite the channel does not serve.
         const projectedDiscord=projectDiscordValidation(channel,selected,selectedCandidate);
         Object.assign(channel,projectedDiscord);
+        discordValidationProjected=true;
         if(projectedDiscord.discord_candidate_id)await selectDiscordCandidate(channel.channel_id,projectedDiscord.discord_candidate_id);
       }
       attemptFree=attemptFreeDiscordValidation(selected.operationalOutcome,selected.retryable);
@@ -2238,7 +2244,13 @@ export async function inspectAndValidateChannel(
     channel.scan_status = 'FAILED';
     if(scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id,retryDirective).catch(error=>console.warn(`[CommunityAcquisition] retry scheduling failed for ${channel.channel_id}:`,error instanceof Error?error.message:error));
   } finally {
-    await upsertChannel(channel);
+    // A projected validation result is authoritative: fresh operational
+    // failures (INVALID_OBSERVED/provider failure/timeout) and successful
+    // replacements must persist instead of being reverted to the locked
+    // last-known-good projection. Acquisition-only, NOT_FOUND, and error
+    // paths did not project a validation result, so they keep the ordinary
+    // stale-snapshot guard.
+    await upsertChannel(channel,{freshDiscordValidation:discordValidationProjected});
   }
   return { debugLog: enableDebug ? finalDebugLog : undefined, inspection, retryDirective };
 }

@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, resolveRenderedCompletionState, runRenderedClickLoop } from './browserCommunityFallback';
+import { isNavigableOnlyControlWindow, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, resolveRenderedCompletionState, runRenderedClickLoop } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -85,6 +85,71 @@ test('the evaluation window rotates over the full matched-control pool so contro
   const wrapped = partitionRenderedClickTargets(sixtyFour, 'https://creator.example/', 4, 64);
   assert.equal(wrapped.evaluationWindow.length, 64);
   assert.deepEqual(wrapped.toClick.map(target => target.marker), ['oc-1', 'oc-2', 'oc-3', 'oc-4']);
+});
+
+test('an all-navigable evaluation window is certified for durable rotation', () => {
+  // A 70-control page whose first window contains only same-host navigable
+  // anchors attempts zero clicks. Without an explicit certificate the durable
+  // offset would never advance and control 65 would be unreachable forever.
+  const anchors = Array.from({ length: 70 }, (_, index) => ({
+    index,
+    marker: `oc-${index + 1}`,
+    text: `Community link ${index + 1}`,
+    href: `https://creator.example/community-${index + 1}`,
+    tag: 'anchor' as const,
+  }));
+  const plan = partitionRenderedClickTargets(anchors, 'https://creator.example/', 4, 0);
+  assert.equal(plan.toClick.length, 0, 'navigable anchors are enqueue-handled, not clicked');
+  assert.equal(plan.skippedNavigableAnchors, 64);
+  assert.equal(isNavigableOnlyControlWindow(plan, 4), true, 'a fully examined navigable window advances the rotation');
+  assert.equal(isNavigableOnlyControlWindow(plan, 0), false, 'a zero click budget did not examine the window');
+  assert.equal(renderedClickOffsetAdvance(plan, 0, 4), 64, 'a certified all-navigable window advances one full window');
+  assert.equal(renderedClickOffsetAdvance(plan, 0, 0), 0, 'a zero click budget never advances the rotation');
+
+  const clickable = partitionRenderedClickTargets(
+    Array.from({ length: 70 }, (_, index) => renderedButton(index, `oc-${index + 1}`)),
+    'https://creator.example/',
+    4,
+    0,
+  );
+  assert.equal(isNavigableOnlyControlWindow(clickable, 4), false, 'a window with clickable controls is not certified as navigable-only');
+  assert.equal(renderedClickOffsetAdvance(clickable, 0, 4), 0, 'an uncertified zero-click window (deadline/crash) must not advance');
+  assert.equal(renderedClickOffsetAdvance(clickable, 2, 4), 2, 'a partial click window advances past the last attempted control');
+});
+
+test('retry offsets advance past anchors before clicked controls instead of repeating them', () => {
+  // Four navigable anchors precede eight buttons. The offset indexes the full
+  // matched pool, so advancing by the raw click count (4) would land back on
+  // button 1; it must advance past the last attempted button (position 7).
+  const anchors = Array.from({ length: 4 }, (_, index) => ({
+    index,
+    marker: `oc-a${index + 1}`,
+    text: `Community link ${index + 1}`,
+    href: `https://creator.example/community-${index + 1}`,
+    tag: 'anchor' as const,
+  }));
+  const buttons = Array.from({ length: 8 }, (_, index) => renderedButton(index + 4, `oc-b${index + 1}`));
+  const controls = [...anchors, ...buttons];
+
+  const first = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 0);
+  assert.deepEqual(first.toClick.map(target => target.marker), ['oc-b1', 'oc-b2', 'oc-b3', 'oc-b4']);
+  assert.equal(renderedClickOffsetAdvance(first, 4, 4), 8, 'the offset lands just past the last clicked control');
+
+  const second = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 8);
+  assert.deepEqual(
+    second.toClick.map(target => target.marker),
+    ['oc-b5', 'oc-b6', 'oc-b7', 'oc-b8'],
+    'the retry examines the next buttons instead of repeating the first four',
+  );
+  assert.equal(renderedClickOffsetAdvance(second, 4, 4), 4, 'the next page-relative advance covers the four attempted buttons');
+
+  // Anchors after the clickable controls do not change the position advance.
+  const buttonsFirst = [...buttons, ...anchors.map((anchor, index) => ({ ...anchor, index: index + 8, marker: `oc-tail-a${index + 1}` }))];
+  const firstButtonsFirst = partitionRenderedClickTargets(buttonsFirst, 'https://creator.example/', 4, 0);
+  assert.deepEqual(firstButtonsFirst.toClick.map(target => target.marker), ['oc-b1', 'oc-b2', 'oc-b3', 'oc-b4']);
+  assert.equal(renderedClickOffsetAdvance(firstButtonsFirst, 4, 4), 4);
+  const secondButtonsFirst = partitionRenderedClickTargets(buttonsFirst, 'https://creator.example/', 4, 4);
+  assert.deepEqual(secondButtonsFirst.toClick.map(target => target.marker), ['oc-b5', 'oc-b6', 'oc-b7', 'oc-b8']);
 });
 
 test('revealed controls reserve the click slots for already-queued controls', () => {

@@ -10,6 +10,7 @@ import {
   createRenderedRouteGuard,
   enumerateRenderedControlNodes,
   installRenderedRouteCloseCleanup,
+  isSkippableNavigableAnchorClick,
   partitionRenderedClickTargets,
   type RenderedRouteGuard,
 } from './browserCommunityFallback';
@@ -103,7 +104,8 @@ const controlFixtureHtml = (count: number, revealAt: number | null): string => {
       const link = document.createElement('a');
       link.href = 'https://discord.gg/revealed-room';
       link.textContent = 'Discord community';
-      document.getElementById('revealed')!.appendChild(link);
+      const revealed = document.getElementById('revealed');
+      if (revealed) revealed.appendChild(link);
     }`;
   return `<!doctype html><html><head><title>control fixture</title></head><body>
     ${controls}
@@ -159,7 +161,7 @@ test('real DOM: control 65 is reachable after rotating the full 70-control pool'
 
     const firstWindow = partitionRenderedClickTargets(firstAttempt.controls, url, 4, 0);
     assert.deepEqual(
-      firstWindow.toClick.map(target => target.text),
+      firstWindow.toClick.map(target => target.text.trim()),
       ['Community link 1', 'Community link 2', 'Community link 3', 'Community link 4'],
     );
     for (const target of firstWindow.toClick) {
@@ -181,7 +183,7 @@ test('real DOM: control 65 is reachable after rotating the full 70-control pool'
     );
     assert.equal(retryWindow.evaluationWindow.length, RENDERED_CONTROL_EVALUATION_WINDOW);
     assert.deepEqual(
-      retryWindow.toClick.map(target => target.text),
+      retryWindow.toClick.map(target => target.text.trim()),
       ['Community link 65', 'Community link 66', 'Community link 67', 'Community link 68'],
       'the durable retry offset reaches controls beyond the first 64',
     );
@@ -202,7 +204,7 @@ test('real DOM: a 64-control page wraps without inventing overflow', { skip: pro
     const wrapped = partitionRenderedClickTargets(enumeration.controls, url, 4, RENDERED_CONTROL_EVALUATION_WINDOW);
     assert.equal(wrapped.evaluationWindow.length, 64, 'a full 64-control page still fits one window');
     assert.deepEqual(
-      wrapped.toClick.map(target => target.text),
+      wrapped.toClick.map(target => target.text.trim()),
       ['Community link 1', 'Community link 2', 'Community link 3', 'Community link 4'],
       'offset 64 wraps to the first control instead of creating a 65th target',
     );
@@ -212,5 +214,45 @@ test('real DOM: a 64-control page wraps without inventing overflow', { skip: pro
       await page.locator(`[data-oc-control="${target.marker}"]`).click();
     }
     assert.equal(await page.locator('a[href^="https://discord.gg/"]').count(), 0);
+  });
+});
+
+test('real DOM: SVG anchors expose a string href and stay navigable', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <svg width="220" height="40" xmlns="http://www.w3.org/2000/svg">
+      <a href="/svg-community" aria-label="Discord community"><text x="0" y="20">Discord community</text></a>
+    </svg>
+  </body></html>`;
+  await withControlPage(html, async (page, url) => {
+    const enumeration = await enumeratePageControls(page);
+    const svg = enumeration.controls.find(target => target.href?.endsWith('/svg-community'));
+    assert.ok(svg, 'the SVG anchor is enumerated');
+    assert.equal(typeof svg.href, 'string', 'SVGAnimatedString must not leak into the target');
+    assert.equal(svg.href, `${url}svg-community`);
+    assert.equal(isSkippableNavigableAnchorClick(svg, url), true, 'the SVG anchor is navigable, not click-only');
+  });
+});
+
+test('real DOM: duplicate existing control markers are made unique', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <button type="button" data-oc-control="duplicate">Community link 1</button>
+    <button type="button" data-oc-control="duplicate">Community link 2</button>
+    <script>
+      window.clicks = [];
+      document.querySelectorAll('button[data-oc-control]').forEach((button, index) => {
+        button.addEventListener('click', () => { window.clicks.push(index); });
+      });
+    </script>
+  </body></html>`;
+  await withControlPage(html, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(enumeration.controls.length, 2);
+    const markers = enumeration.controls.map(target => target.marker);
+    assert.equal(new Set(markers).size, 2, 'duplicate markers must not collapse two controls into one');
+    for (const marker of markers) {
+      assert.equal(await page.locator(`[data-oc-control="${marker}"]`).count(), 1, marker);
+      await page.locator(`[data-oc-control="${marker}"]`).click();
+    }
+    assert.deepEqual(await page.evaluate(() => (window as unknown as { clicks: number[] }).clicks), [0, 1]);
   });
 });

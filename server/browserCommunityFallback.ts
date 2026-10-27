@@ -74,6 +74,16 @@ export interface BrowserFallbackTelemetry {
   evidenceControlsClicked?: number;
   evidenceControlsFailed?: number;
   evidenceControlsSkipped?: number;
+  /** True when a processed page's entire evaluation window contained only
+   * navigable anchors, so zero clicks were attempted but the window was fully
+   * examined. Drives durable retry rotation past an otherwise zero-click
+   * window; absent on pre-instrumentation rows. */
+  evidenceControlsNavigableOnly?: boolean;
+  /** Bounded number of full-pool positions the durable retry offset should
+   * advance after this crawl: the position just past the last attempted
+   * control, or the examined window length when the window was all-navigable.
+   * Sparse; absent on pre-instrumentation rows. */
+  evidenceControlsOffsetAdvance?: number;
   clickFailureClasses: Record<RenderedCrawlerFailureClass, number>;
   /**
    * Additive per-click failure taxonomy (fixed 7 keys; see
@@ -189,6 +199,12 @@ export interface BrowserFallbackResult {
   evidenceControlsClicked?: number;
   evidenceControlsFailed?: number;
   evidenceControlsSkipped?: number;
+  /** True when a processed page's entire evaluation window contained only
+   * navigable anchors; the window was examined with zero clicks. */
+  evidenceControlsNavigableOnly?: boolean;
+  /** Full-pool positions to advance the durable retry offset (see
+   * BrowserFallbackTelemetry.evidenceControlsOffsetAdvance). */
+  evidenceControlsOffsetAdvance?: number;
   /** True when any evidence-bearing control failed or was skipped: coverage
    * is incomplete even if every request succeeded. */
   interactionGap?: boolean;
@@ -546,21 +562,49 @@ export function enumerateRenderedControlNodes(
   pattern: string,
 ): { controls: RenderedControlTarget[]; total: number } {
   const re = new RegExp(pattern, 'i');
+  const hrefOf = (node: Element): string | null => {
+    // HTMLAnchorElement.href is a string; SVGElement.href is an
+    // SVGAnimatedString. Reading the attribute keeps both anchor kinds
+    // string-safe, and resolving against the document base preserves the
+    // absolute-href semantics the click planner expects.
+    const property = (node as HTMLAnchorElement).href;
+    if (typeof property === 'string' && property) return property;
+    const raw = node.getAttribute('href')
+      || node.getAttributeNS('http://www.w3.org/1999/xlink', 'href')
+      || '';
+    if (!raw) return null;
+    try {
+      return new URL(raw, node.baseURI || document.baseURI).toString();
+    } catch {
+      return raw;
+    }
+  };
   const matched = nodes.map((node, index) => {
     const element = node as HTMLElement;
     const tagName = (element.tagName || '').toLowerCase();
+    const href = hrefOf(node);
     return {
       index,
-      text: `${element.innerText || ''} ${(node as HTMLAnchorElement).href || ''} ${element.getAttribute('aria-label') || ''}`,
-      href: (node as HTMLAnchorElement).href || null,
+      text: `${element.innerText || ''} ${href || ''} ${element.getAttribute('aria-label') || ''}`,
+      href,
       tag: (tagName === 'a' ? 'anchor' : tagName === 'button' ? 'button' : 'role') as 'anchor' | 'button' | 'role',
     };
   }).filter(item => re.test(item.text));
+  const usedMarkers = new Set<string>();
   const controls = matched.map(item => {
     const node = nodes[item.index] as HTMLElement;
     const existing = node.getAttribute('data-oc-control');
-    const marker = existing || `oc-${Date.now().toString(36)}-${item.index}-${Math.random().toString(36).slice(2, 8)}`;
-    if (!existing) node.setAttribute('data-oc-control', marker);
+    let marker = existing || `oc-${Date.now().toString(36)}-${item.index}-${Math.random().toString(36).slice(2, 8)}`;
+    let attempt = 0;
+    // A page can repeat an existing marker across controls. Reusing it would
+    // make every duplicate target resolve to the first element, leaving the
+    // others unexamined; assign a unique marker instead.
+    while (usedMarkers.has(marker)) {
+      attempt += 1;
+      marker = `oc-${Date.now().toString(36)}-${item.index}-${attempt}-${Math.random().toString(36).slice(2, 8)}`;
+    }
+    usedMarkers.add(marker);
+    if (existing !== marker) node.setAttribute('data-oc-control', marker);
     return { ...item, marker };
   });
   return { controls, total: matched.length };
@@ -630,6 +674,48 @@ export function partitionRenderedClickTargets(
     eligible.push(control);
   }
   return { toClick: eligible.slice(0, cap), skippedNavigableAnchors, evaluationWindow };
+}
+
+/**
+ * A processed page whose entire evaluation window is navigable anchors has
+ * zero click targets but was fully examined. The durable retry offset may
+ * advance past it. A zero-click window caused by a deadline, crash, or zero
+ * click budget is not certified and must be retried unchanged.
+ */
+export function isNavigableOnlyControlWindow(
+  plan: Pick<ReturnType<typeof partitionRenderedClickTargets>, 'toClick' | 'evaluationWindow' | 'skippedNavigableAnchors'>,
+  maxClicksPerPage: number,
+): boolean {
+  return maxClicksPerPage > 0
+    && plan.toClick.length === 0
+    && plan.evaluationWindow.length > 0
+    && plan.skippedNavigableAnchors === plan.evaluationWindow.length;
+}
+
+/**
+ * Full-pool positions the durable retry offset should advance after a page.
+ * The offset indexes the complete matched-control pool, so advancing by the
+ * raw click count can land back on the same clickable control when navigable
+ * anchors precede it (4 anchors + 8 buttons: both attempts would click buttons
+ * 1-4). Advance just past the last attempted control instead. A fully examined
+ * all-navigable window advances by its window length; an uncertified
+ * zero-click window (deadline/crash/zero budget) does not advance.
+ */
+export function renderedClickOffsetAdvance(
+  plan: Pick<ReturnType<typeof partitionRenderedClickTargets>, 'toClick' | 'evaluationWindow' | 'skippedNavigableAnchors'>,
+  attempts: number,
+  maxClicksPerPage: number,
+): number {
+  const examined = Math.max(0, Math.trunc(attempts) || 0);
+  if (examined === 0) {
+    return isNavigableOnlyControlWindow(plan, maxClicksPerPage) ? plan.evaluationWindow.length : 0;
+  }
+  const lastAttempted = plan.toClick[Math.min(examined, plan.toClick.length) - 1];
+  if (!lastAttempted) return 0;
+  const position = plan.evaluationWindow.findIndex(target =>
+    target === lastAttempted || (Boolean(target.marker) && target.marker === lastAttempted.marker)
+  );
+  return position >= 0 ? position + 1 : 0;
 }
 
 /**
@@ -1557,6 +1643,8 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   let evidenceControlsClicked = 0;
   let evidenceControlsFailed = 0;
   let evidenceControlsSkipped = 0;
+  let evidenceControlsNavigableOnly = false;
+  let evidenceControlsOffsetAdvance = 0;
   let interactionGap = false;
   const terminalSuccessUrls: string[] = [];
   // Per visited page, the same-host community-hint links discovered on it
@@ -1813,6 +1901,14 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // (href-less buttons, fragments, JS links, cross-host targets).
             // Slice accounting covers the remainder beyond clicks and skips.
             const clickPlan = partitionRenderedClickTargets(controls, page.url(), limits.maxClicksPerPage, limits.clickOffset);
+            // A window made entirely of navigable anchors is fully examined
+            // with zero clicks. Record that explicitly so the durable retry
+            // offset can advance instead of re-reading the same prefix; a
+            // deadline or browser failure before the first click must not
+            // advance, because that window was not examined.
+            if (isNavigableOnlyControlWindow(clickPlan, limits.maxClicksPerPage)) {
+              evidenceControlsNavigableOnly = true;
+            }
             const countedControlSkips = new Set<string>();
             for (const control of controls) {
               if (control.marker && !clickPlan.toClick.some(target => target.marker === control.marker)
@@ -1893,6 +1989,15 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               evidenceControlsSkipped += clickLoop.evidenceControlsSkipped;
             }
             if (clickLoop.interactionGap) interactionGap = true;
+            // Persist pool positions, not raw click count: anchors before the
+            // clicked controls must not make the next retry land on the same
+            // clickable prefix.
+            const offsetAdvance = renderedClickOffsetAdvance(
+              clickPlan,
+              clickLoop.evidenceControlsClicked + clickLoop.evidenceControlsFailed,
+              limits.maxClicksPerPage,
+            );
+            if (offsetAdvance > evidenceControlsOffsetAdvance) evidenceControlsOffsetAdvance = offsetAdvance;
             evidenceControlsSeen += pageControlTotal;
 
             if (Date.now() - startedAt < limits.totalTimeoutMs) {
@@ -2034,6 +2139,8 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         telemetry.evidenceControlsClicked = evidenceControlsClicked || undefined;
         telemetry.evidenceControlsFailed = evidenceControlsFailed || undefined;
         telemetry.evidenceControlsSkipped = evidenceControlsSkipped || undefined;
+        telemetry.evidenceControlsNavigableOnly = evidenceControlsNavigableOnly || undefined;
+        telemetry.evidenceControlsOffsetAdvance = evidenceControlsOffsetAdvance || undefined;
         return {
           foundInvite:first?.nativeInviteCode||null,
           foundLocation:first?.sourceUrl,
@@ -2064,6 +2171,8 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           evidenceControlsClicked: evidenceControlsClicked || undefined,
           evidenceControlsFailed: evidenceControlsFailed || undefined,
           evidenceControlsSkipped: evidenceControlsSkipped || undefined,
+          evidenceControlsNavigableOnly: evidenceControlsNavigableOnly || undefined,
+          evidenceControlsOffsetAdvance: evidenceControlsOffsetAdvance || undefined,
           interactionGap: interactionGap || undefined,
           requiredSnapshotExpanded: requiredSnapshotExpanded || undefined,
           detail:candidates.length
@@ -2080,7 +2189,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         if (causeSnippet) telemetry.launchCauseSnippet=causeSnippet;
         const zeroPageReason=resolveRenderedZeroPageReason({inspectedPages,timedOut:false,saturated:false,browserLaunchFailed,thrown:true,telemetry});
         if (zeroPageReason) telemetry.zeroPageReason=zeroPageReason;
-        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,dropReasons:drops.snapshot(),interactionGap:interactionGap||undefined,evidenceControlsTotal:evidenceControlsSeen||undefined,evidenceControlsClicked:evidenceControlsClicked||undefined,evidenceControlsFailed:evidenceControlsFailed||undefined,evidenceControlsSkipped:evidenceControlsSkipped||undefined,detail:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
+        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,dropReasons:drops.snapshot(),interactionGap:interactionGap||undefined,evidenceControlsTotal:evidenceControlsSeen||undefined,evidenceControlsClicked:evidenceControlsClicked||undefined,evidenceControlsFailed:evidenceControlsFailed||undefined,evidenceControlsSkipped:evidenceControlsSkipped||undefined,evidenceControlsNavigableOnly:evidenceControlsNavigableOnly||undefined,evidenceControlsOffsetAdvance:evidenceControlsOffsetAdvance||undefined,detail:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
       } finally {
         // The isolated queue must never outlive its crawl: the lifecycle
         // finalizer drops it on success, failure, and unexpected throws alike

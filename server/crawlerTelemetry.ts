@@ -242,6 +242,20 @@ export interface CrawlerTelemetry {
   evidenceControlsFailed?: number;
   evidenceControlsSkipped?: number;
   /**
+   * True when a processed page's entire evaluation window contained only
+   * navigable anchors: the window was fully examined with zero clicks, so the
+   * durable retry offset may advance past it. Sparse; absent on rows that
+   * predate instrumentation or when the window had clickable targets.
+   */
+  evidenceControlsNavigableOnly?: boolean;
+  /**
+   * Bounded full-pool positions the durable retry offset should advance:
+   * the position just past the last attempted control, or the examined window
+   * length for an all-navigable window. Sparse; absent on pre-instrumentation
+   * rows.
+   */
+  evidenceControlsOffsetAdvance?: number;
+  /**
    * Compact per-crawl drop/stop counters keyed by CRAWL_DROP_REASONS
    * (ints only, taxonomy-bounded to 13 keys — never URLs or payloads).
    * Tells future investigations where candidate URLs were lost. Sparse:
@@ -574,6 +588,12 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.evidenceControlsSkipped) > 0
       ? { evidenceControlsSkipped: number(candidate.evidenceControlsSkipped) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && (candidate as { evidenceControlsNavigableOnly?: unknown }).evidenceControlsNavigableOnly === true
+      ? { evidenceControlsNavigableOnly: true }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.evidenceControlsOffsetAdvance) > 0
+      ? { evidenceControlsOffsetAdvance: number(candidate.evidenceControlsOffsetAdvance) }
       : {}),
     ...(isRenderedLifecycleStage(stage) ? { lastLifecycleStage: stage } : {}),
     ...(isRenderedZeroPageReason(reason) ? { zeroPageReason: reason } : {}),
