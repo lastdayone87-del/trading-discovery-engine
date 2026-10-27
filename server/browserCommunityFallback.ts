@@ -715,13 +715,23 @@ export function isNavigableOnlyControlWindow(
  * 1-4). Advance just past the last attempted control instead. A fully examined
  * all-navigable window advances by its window length; an uncertified
  * zero-click window (deadline/crash/zero budget) does not advance.
+ *
+ * A failed click is not examined coverage: when `firstFailedAttempt` is set,
+ * progress stops before that control so the next retry can attempt it again.
+ * Advancing by clicked+failed would rotate the shared offset past a control
+ * whose revealed content was never observed.
  */
 export function renderedClickOffsetAdvance(
   plan: Pick<ReturnType<typeof partitionRenderedClickTargets>, 'toClick' | 'evaluationWindow' | 'skippedNavigableAnchors'>,
   attempts: number,
   maxClicksPerPage: number,
+  firstFailedAttempt?: number,
 ): number {
-  const examined = Math.max(0, Math.trunc(attempts) || 0);
+  const attempted = Math.max(0, Math.trunc(attempts) || 0);
+  const failedAt = firstFailedAttempt === undefined
+    ? undefined
+    : Math.max(0, Math.trunc(firstFailedAttempt) || 0);
+  const examined = failedAt === undefined ? attempted : Math.min(attempted, failedAt);
   if (examined === 0) {
     return isNavigableOnlyControlWindow(plan, maxClicksPerPage) ? plan.evaluationWindow.length : 0;
   }
@@ -825,6 +835,10 @@ export interface RenderedClickLoopResult {
   evidenceControlsFailed: number;
   evidenceControlsSkipped: number;
   interactionGap: boolean;
+  /** Index (in the click-target queue) of the first control whose click
+   * failed. The durable retry offset must stop at that control, never rotate
+   * past it, because its revealed content was not examined. */
+  firstFailedTargetIndex?: number;
 }
 
 /**
@@ -846,6 +860,7 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
   let evidenceControlsFailed = 0;
   let evidenceControlsSkipped = 0;
   let interactionGap = false;
+  let firstFailedTargetIndex: number | undefined;
   for (let clickIndex = 0; clickIndex < clickTargets.length; clickIndex++) {
     if (clickedThisPage >= input.maxClicksPerPage) {
       // Controls appended by an earlier re-enumeration can remain queued when
@@ -875,6 +890,7 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
     else {
       evidenceControlsFailed++;
       interactionGap = true;
+      if (firstFailedTargetIndex === undefined) firstFailedTargetIndex = clickIndex;
     }
     // A successful click can reveal new evidence-bearing controls (second
     // interaction). Re-enumerate after every click, including the final
@@ -922,7 +938,7 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
       }
     }
   }
-  return { evidenceControlsClicked, evidenceControlsFailed, evidenceControlsSkipped, interactionGap };
+  return { evidenceControlsClicked, evidenceControlsFailed, evidenceControlsSkipped, interactionGap, firstFailedTargetIndex };
 }
 
 /**
@@ -1681,6 +1697,22 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   let evidenceControlsUncertified = false;
   let evidenceControlsOffsetAdvance = 0;
   let interactionGap = false;
+  // True while a page with clickable controls has not yet recorded its
+  // progress. A throw in that window must leave the seed uncertified: the
+  // catch path otherwise loses the per-page guard and the retry offset moves
+  // past controls that were never examined.
+  let pageClickWindowPending = false;
+  // nextRenderedClickOffsets reads only outcome.telemetry, so the certificate
+  // must be published there on every return path (success and catch).
+  const publishEvidenceControlCertificate = (): void => {
+    telemetry.evidenceControlsTotal = evidenceControlsSeen || undefined;
+    telemetry.evidenceControlsClicked = evidenceControlsClicked || undefined;
+    telemetry.evidenceControlsFailed = evidenceControlsFailed || undefined;
+    telemetry.evidenceControlsSkipped = evidenceControlsSkipped || undefined;
+    telemetry.evidenceControlsNavigableOnly = (evidenceControlsNavigableOnly && !evidenceControlsClickableWindow) || undefined;
+    telemetry.evidenceControlsUncertified = evidenceControlsUncertified || undefined;
+    telemetry.evidenceControlsOffsetAdvance = evidenceControlsOffsetAdvance || undefined;
+  };
   const terminalSuccessUrls: string[] = [];
   // Per visited page, the same-host community-hint links discovered on it
   // (same predicate as the enqueue path): lets callers prove required-set
@@ -1948,7 +1980,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             if (isNavigableOnlyControlWindow(clickPlan, limits.maxClicksPerPage)) {
               evidenceControlsNavigableOnly = true;
             }
-            if (clickableInWindow > 0) evidenceControlsClickableWindow = true;
+            if (clickableInWindow > 0) {
+              evidenceControlsClickableWindow = true;
+              pageClickWindowPending = true;
+            }
             const countedControlSkips = new Set<string>();
             for (const control of controls) {
               if (control.marker && !clickPlan.toClick.some(target => target.marker === control.marker)
@@ -2036,6 +2071,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               clickPlan,
               clickLoop.evidenceControlsClicked + clickLoop.evidenceControlsFailed,
               limits.maxClicksPerPage,
+              clickLoop.firstFailedTargetIndex,
             );
             if (offsetAdvance > 0) {
               // Shared per-seed rotation: advance only by the smallest page
@@ -2051,6 +2087,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               // offset must not move based on another page's progress.
               evidenceControlsUncertified = true;
             }
+            pageClickWindowPending = false;
             evidenceControlsSeen += pageControlTotal;
 
             if (Date.now() - startedAt < limits.totalTimeoutMs) {
@@ -2188,13 +2225,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         // Persist the bounded control-coverage certificate alongside the
         // crawler telemetry so production can distinguish 64-overflow from
         // ordinary click-budget slicing. Counts only; never selectors/text.
-        telemetry.evidenceControlsTotal = evidenceControlsSeen || undefined;
-        telemetry.evidenceControlsClicked = evidenceControlsClicked || undefined;
-        telemetry.evidenceControlsFailed = evidenceControlsFailed || undefined;
-        telemetry.evidenceControlsSkipped = evidenceControlsSkipped || undefined;
-        telemetry.evidenceControlsNavigableOnly = (evidenceControlsNavigableOnly && !evidenceControlsClickableWindow) || undefined;
-        telemetry.evidenceControlsUncertified = evidenceControlsUncertified || undefined;
-        telemetry.evidenceControlsOffsetAdvance = evidenceControlsOffsetAdvance || undefined;
+        publishEvidenceControlCertificate();
         return {
           foundInvite:first?.nativeInviteCode||null,
           foundLocation:first?.sourceUrl,
@@ -2244,6 +2275,11 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         if (causeSnippet) telemetry.launchCauseSnippet=causeSnippet;
         const zeroPageReason=resolveRenderedZeroPageReason({inspectedPages,timedOut:false,saturated:false,browserLaunchFailed,thrown:true,telemetry});
         if (zeroPageReason) telemetry.zeroPageReason=zeroPageReason;
+        // A throw while a clickable page was still being examined must leave
+        // the seed uncertified; otherwise the catch result's raw click count
+        // advances the shared offset past that page's unexamined controls.
+        if (pageClickWindowPending) evidenceControlsUncertified = true;
+        publishEvidenceControlCertificate();
         return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,dropReasons:drops.snapshot(),interactionGap:interactionGap||undefined,evidenceControlsTotal:evidenceControlsSeen||undefined,evidenceControlsClicked:evidenceControlsClicked||undefined,evidenceControlsFailed:evidenceControlsFailed||undefined,evidenceControlsSkipped:evidenceControlsSkipped||undefined,evidenceControlsNavigableOnly:(evidenceControlsNavigableOnly&&!evidenceControlsClickableWindow)||undefined,evidenceControlsUncertified:evidenceControlsUncertified||undefined,evidenceControlsOffsetAdvance:evidenceControlsOffsetAdvance||undefined,detail:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
       } finally {
         // The isolated queue must never outlive its crawl: the lifecycle

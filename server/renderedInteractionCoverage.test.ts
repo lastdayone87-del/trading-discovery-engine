@@ -152,6 +152,41 @@ test('retry offsets advance past anchors before clicked controls instead of repe
   assert.deepEqual(secondButtonsFirst.toClick.map(target => target.marker), ['oc-b5', 'oc-b6', 'oc-b7', 'oc-b8']);
 });
 
+test('failed controls stop retry rotation before their unexamined content', async () => {
+  const anchors = Array.from({ length: 4 }, (_, index) => ({
+    index,
+    marker: `oc-fa${index + 1}`,
+    text: `Community link ${index + 1}`,
+    href: `https://creator.example/community-${index + 1}`,
+    tag: 'anchor' as const,
+  }));
+  const buttons = Array.from({ length: 8 }, (_, index) => renderedButton(index + 4, `oc-fb${index + 1}`));
+  const controls = [...anchors, ...buttons];
+  const plan = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 0);
+  let attempts = 0;
+  const result = await runRenderedClickLoop({
+    targets: plan.toClick,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    // The first two clicks succeed; the third fails; the fourth succeeds.
+    click: async () => { attempts++; return attempts !== 3; },
+    enumerate: async () => ({ controls, total: controls.length }),
+    pageUrl: () => 'https://creator.example/',
+  });
+  assert.equal(result.evidenceControlsClicked, 3);
+  assert.equal(result.evidenceControlsFailed, 1);
+  assert.equal(result.firstFailedTargetIndex, 2, 'the failed control is identified by queue position');
+  // Four anchors precede the buttons. The failed button is at full-pool
+  // position 6; the offset must stop there, not move past it to position 7.
+  assert.equal(
+    renderedClickOffsetAdvance(plan, result.evidenceControlsClicked + result.evidenceControlsFailed, 4, result.firstFailedTargetIndex),
+    6,
+    'the next retry starts at the failed control',
+  );
+  const next = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 6);
+  assert.deepEqual(next.toClick.map(target => target.marker), ['oc-fb3', 'oc-fb4', 'oc-fb5', 'oc-fb6']);
+});
+
 test('shared retry offset advances by the smallest page progress, never the largest', () => {
   // A seed page with 64 navigable anchors advances 64 on its own, while a
   // child page with clickable buttons advances 4. Saving the largest advance
@@ -364,6 +399,13 @@ test('rendered control coverage counts overflow and uses stable markers across D
   assert.match(source, /combineRenderedControlOffsetAdvances\(\s*evidenceControlsOffsetAdvance,\s*offsetAdvance,?\s*\)/, 'the crawl aggregates per-page progress conservatively');
   assert.match(source, /evidenceControlsUncertified = true/, 'an unexamined clickable page blocks shared offset advancement');
   assert.match(source, /telemetry\.evidenceControlsUncertified = evidenceControlsUncertified \|\| undefined/);
+  assert.match(source, /clickLoop\.firstFailedTargetIndex/, 'the crawl stops rotation at the first failed control');
+  assert.match(source, /if \(pageClickWindowPending\) evidenceControlsUncertified = true/, 'a throw during a clickable page leaves the seed uncertified');
+  assert.equal(
+    (source.match(/publishEvidenceControlCertificate\(\);/g) || []).length,
+    2,
+    'both the success and catch paths publish the control certificate to telemetry',
+  );
 });
 
 test('shared rendered evidence stays fail-closed: gapped/timed-out lenders never enter inventory', () => {
