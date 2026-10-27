@@ -392,7 +392,9 @@ async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:
       case 'REDIRECT_LOOP':
         return {page:null,observation:{requestedUrl:url,finalUrl:fetched.finalUrl,outcome:'ACQUISITION_FAILED',retryable:false,httpStatus:fetched.status,failureClass:'REDIRECT_LOOP',detail:`Redirect loop detected${target}`}};
       case 'REDIRECT_LIMIT':
-        return {page:null,observation:{requestedUrl:url,finalUrl:fetched.finalUrl,outcome:'ACQUISITION_FAILED',retryable:true,httpStatus:fetched.status,failureClass:'REDIRECT_LIMIT',detail:`Redirect hop limit reached${target}`}};
+        // The hop budget is fixed and the same URL deterministically exhausts
+        // it, so an identical refetch cannot complete. Never own retry work.
+        return {page:null,observation:{requestedUrl:url,finalUrl:fetched.finalUrl,outcome:'ACQUISITION_FAILED',retryable:false,httpStatus:fetched.status,failureClass:'REDIRECT_LIMIT',detail:`Redirect hop limit reached (fixed ${CRAWLER_MAX_REDIRECT_HOPS}-hop budget; identical retry cannot complete)${target}`}};
     }
   }
   if(fetched.redirectRejected){

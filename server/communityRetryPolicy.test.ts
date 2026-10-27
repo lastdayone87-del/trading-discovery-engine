@@ -79,6 +79,18 @@ test('community retry metadata carries only non-empty click-window progress',()=
   assert.deepEqual(progressed.clickOffsets,{'https://creator.test':4});
 });
 
+test('redirect-limit observations never own retry even when a legacy row is retryable',()=>{
+  // The 20-hop redirect budget is fixed, so the same URL fails identically on
+  // refetch. Backlog rows persisted before REDIRECT_LIMIT became non-retryable
+  // must not spend another community attempt.
+  const legacy={surface:'CREATOR_WEBSITES',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'REDIRECT_LIMIT',requestedUrl:'https://example.com/page'};
+  assert.equal(isCommunityRetryableObservation(legacy),false);
+  assert.equal(hasRetryableCommunityAcquisitionFailure([legacy]),false);
+  assert.equal(communityAcquisitionRetryDirective([legacy]),undefined);
+  // Control: an otherwise identical transient failure still owns retry.
+  assert.equal(isCommunityRetryableObservation({...legacy,failureClass:'NETWORK_FAILURE'}),true);
+});
+
 test('required partial coverage preserves retry ownership as recoverable',()=>{
   const partial={surface:'CREATOR_WEBSITES',required:true,outcome:'PARTIALLY_INSPECTED',retryable:true,failureClass:'RENDERED_BUDGET_EXPIRED'};
   assert.equal(isCommunityRetryableObservation(partial),true);
