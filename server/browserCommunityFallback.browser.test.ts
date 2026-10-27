@@ -238,17 +238,47 @@ test('real DOM: enumeration separates hint-rejected, structural, icon-label, and
   await withControlPage(html, async (page) => {
     const enumeration = await enumeratePageControls(page);
     assert.equal(enumeration.total, 4, 'the pre-filter denominator includes every selector-matched control');
-    assert.equal(enumeration.controls.length, 2, 'only community-hint controls remain evidence-bearing');
-    assert.equal(enumeration.hintRejected, 2, 'hint rejection is measured, not silently dropped');
+    assert.equal(enumeration.controls.length, 4, 'hint-matched, icon-label, and structural disclosure controls are all evidence-bearing');
+    assert.equal(enumeration.hintRejected, 2, 'hint rejection is measured against the original filter, not the recovered set');
     assert.equal(enumeration.structuralNavigation, 1, 'the menu/aria-haspopup control is structural navigation');
-    assert.equal(enumeration.structuralHintRejected, 1, 'the structural control would be hidden by the hint filter today');
-    assert.equal(enumeration.iconLabelRecovered, 1, 'title-only icon labels are recoverable in P1.2');
+    assert.equal(enumeration.structuralHintRejected, 1, 'the structural control would be hidden by the original hint filter');
+    assert.equal(enumeration.structuralDisclosure, 1, 'the menu control is included as an in-place disclosure');
+    assert.equal(enumeration.structuralUnrecovered, 0, 'no structural control is left outside the click set');
+    assert.equal(enumeration.iconLabelRecovered, 1, 'title-only icon labels are recovered in P1.2');
     assert.equal(enumeration.popupTargets, 1, 'only the dialog control requires popup capture; the href-bearing _blank anchor is navigable');
 
     const context = await page.evaluate(collectRenderedPageContext);
     assert.equal(context.frameCount, 1, 'iframe presence is recorded for P1.4');
     assert.equal(context.shadowRootCount, 1, 'open shadow roots are recorded for P1.4');
     assert.equal(context.baseHrefPresent, true, 'a document <base href> is recorded for P1.5');
+  });
+});
+
+test('real DOM: a generic hamburger disclosure is clicked and reveals a community link', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <button id="menu" type="button" aria-expanded="false">Menu</button>
+    <div id="panel"></div>
+    <script>
+      document.getElementById('menu').addEventListener('click', () => {
+        document.getElementById('menu').setAttribute('aria-expanded', 'true');
+        document.getElementById('panel').innerHTML = '<a href="https://discord.gg/generic-menu">Join</a>';
+      });
+    </script>
+  </body></html>`;
+  await withControlPage(html, async (page, url) => {
+    const before = await enumeratePageControls(page);
+    assert.equal(before.controls.length, 1, 'the generic menu is the only clickable control');
+    assert.equal(before.structuralDisclosure, 1, 'the collapsed hamburger is a structural disclosure');
+    assert.equal(before.structuralUnrecovered, 0, 'the hamburger is included, not left to the enqueue path');
+    const plan = partitionRenderedClickTargets(before.controls, url, 4, 0);
+    assert.equal(plan.toClick.length, 1);
+    assert.equal(plan.toClick[0]?.text.trim(), 'Menu');
+    await page.locator(`[data-oc-control="${plan.toClick[0]!.marker}"]`).click();
+    const after = await enumeratePageControls(page);
+    const revealed = after.controls.find(target => target.href === 'https://discord.gg/generic-menu');
+    assert.ok(revealed, 'the revealed invite link is enumerated after the disclosure click');
+    const candidates = extractDiscordCandidates(await page.content(), 'CREATOR_WEBSITES', page.url());
+    assert.equal(candidates[0]?.nativeInviteCode, 'generic-menu');
   });
 });
 
@@ -260,6 +290,8 @@ test('real DOM: an all-hint-matched control set has no hidden structural or popu
     assert.equal(enumeration.hintRejected, 0);
     assert.equal(enumeration.structuralNavigation, 0);
     assert.equal(enumeration.structuralHintRejected, 0);
+    assert.equal(enumeration.structuralDisclosure, 0);
+    assert.equal(enumeration.structuralUnrecovered, 0);
     assert.equal(enumeration.iconLabelRecovered, 0);
     assert.equal(enumeration.popupTargets, 0);
   });
