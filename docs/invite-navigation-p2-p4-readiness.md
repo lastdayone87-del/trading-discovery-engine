@@ -11,7 +11,7 @@ production, trailing 7 days) and the navigation investigation plan
 | Item | State | Blocker |
 | --- | --- | --- |
 | P1.1/P1.2 structural recovery | PR #560, default behavior, CI green | merge #559/#560 |
-| P1.5 `<base>` | PR #562, independent, CI green | merge |
+| P1.5 `<base>` | PR #562, independent; verify after latest review fix | merge |
 | P1.6 cross-origin enqueue | PR #565, default OFF | security review + canary + product decision |
 | P1.7 coverage truthfulness | PR #563, stacked on #560 | merge #559/#560/#563 |
 | P1.8 wrappers | design prepared | security review + implementation |
