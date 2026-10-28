@@ -541,6 +541,64 @@ function e2e5ClosedShadow(): FixtureWorld {
   return world;
 }
 
+function e2e5DeclarativeClosedShadow(): FixtureWorld {
+  const world = new FixtureWorld();
+  // The HTML parser consumes the template and attaches a closed root before
+  // any page script runs. The live DOM cannot see the template or the root;
+  // only the raw main-document response scan can report it.
+  world.add(MAIN, '/', {
+    body: page(`
+      <h1>Declarative closed shadow community</h1>
+      <div id="host"><template shadowrootmode="closed">
+        <a href="https://discord.gg/E2E5DECLARATIVE">Discord</a>
+      </template></div>`),
+  });
+  return world;
+}
+
+function e2e5CoopPopup(): FixtureWorld {
+  const world = new FixtureWorld();
+  // A same-origin popup opened from a COOP-isolated document. Chromium can
+  // retain the opener for a same-origin popup, so this fixture exercises the
+  // COOP-header path rather than proving opener severance; the context-level
+  // capture also covers severance when the browser applies it.
+  const coop = { 'Cross-Origin-Opener-Policy': 'same-origin' };
+  world.add(MAIN, '/', {
+    headers: coop,
+    body: page(`
+      <h1>COOP community</h1>
+      <button id="open" aria-label="Community room">Community room</button>
+      <script>
+        document.getElementById('open').addEventListener('click', () => {
+          window.open('/coop-room', '_blank');
+        });
+      </script>`),
+  });
+  world.add(MAIN, '/coop-room', {
+    headers: coop,
+    body: page('<h1>COOP room</h1><a href="https://discord.gg/E2E5COOP">Discord</a>'),
+  });
+  return world;
+}
+
+function e2e5CrossOriginAuthPopup(): FixtureWorld {
+  const world = new FixtureWorld();
+  world.add(MAIN, '/', {
+    body: page(`
+      <h1>OAuth community</h1>
+      <button id="auth" aria-label="Sign in to community">Sign in</button>
+      <script>
+        document.getElementById('auth').addEventListener('click', () => {
+          window.open('http://${HUB}/oauth', '_blank');
+        });
+      </script>`),
+  });
+  world.add(HUB, '/oauth', {
+    body: page('<h1>OAuth provider</h1><a href="https://discord.gg/E2E5OAUTH">Discord</a>'),
+  });
+  return world;
+}
+
 function e2e5Popup(): FixtureWorld {
   const world = new FixtureWorld();
   world.add(MAIN, '/', {
@@ -615,6 +673,30 @@ function e2e6CrossOrigin(): FixtureWorld {
         </script>`),
     });
   }
+  return world;
+}
+
+function e2e6CrossOriginMenu(): FixtureWorld {
+  const world = new FixtureWorld();
+  world.add(MAIN, '/', {
+    body: page(`
+      <h1>Trading creator</h1>
+      <button id="more" aria-expanded="false">More</button>
+      <div id="panel"></div>
+      <script>
+        document.getElementById('more').addEventListener('click', () => {
+          // Path split so only rendered interaction can reveal it.
+          document.getElementById('panel').innerHTML =
+            '<a href="http://${HUB}/comm' + 'unity-menu">Partner site</a>';
+          document.getElementById('more').setAttribute('aria-expanded', 'true');
+        });
+      </script>`),
+  });
+  world.add(HUB, '/community-menu', {
+    body: page(`
+      <h1>Menu hub</h1>
+      <a href="https://discord.gg/E2E6MENU">Discord</a>`),
+  });
   return world;
 }
 
@@ -700,6 +782,24 @@ function e2e9IconButton(): FixtureWorld {
       <script>
         document.getElementById('icon').addEventListener('click', () => {
           const code = 'UNLABELEDBUTTON';
+          document.getElementById('out').innerHTML =
+            '<a href="https://discord.gg/' + code + '">Discord</a>';
+        });
+      </script>`),
+  });
+  return world;
+}
+
+function e2e9HrefLessIconAnchor(): FixtureWorld {
+  const world = new FixtureWorld();
+  world.add(MAIN, '/', {
+    body: page(`
+      <h1>Trading creator</h1>
+      <a id="icon" role="link" aria-label=""><svg width="24" height="24" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/></svg></a>
+      <div id="out"></div>
+      <script>
+        document.getElementById('icon').addEventListener('click', () => {
+          const code = 'UNLABELEDANCHOR';
           document.getElementById('out').innerHTML =
             '<a href="https://discord.gg/' + code + '">Discord</a>';
         });
@@ -846,8 +946,8 @@ test('E2E-5b open shadow-root invite is found or marked context-unreachable', { 
     const cover = coverageOf(result);
     const discovered = result.foundInvite === 'E2E5SHADOW';
     console.log(`E2E_CONTEXT ${JSON.stringify({ scenario: 'E2E-5b', discovered, status: cover.status, coverageReason: cover.coverageReason })}`);
-    assert.ok(discovered || (cover.status === 'PARTIALLY_INSPECTED' && cover.coverageReason === 'CONTEXT_UNREACHABLE'),
-      `E2E-5b: an uninspected open shadow root must be found or explicitly context-unreachable; got ${JSON.stringify(cover)}`);
+    assert.equal(discovered, true,
+      `E2E-5b: the bounded open-shadow traversal must discover the invite; got ${JSON.stringify(cover)}`);
   } finally {
     await world.close();
   }
@@ -859,6 +959,52 @@ test('E2E-5c closed shadow root is never certified as a clean no-link', { skip: 
   try {
     const { result } = await world.inspect(`http://${MAIN}/`);
     assertNotClean('E2E-5c', result);
+  } finally {
+    await world.close();
+  }
+});
+
+test('E2E-5c2 declarative closed shadow root is detected from the raw response', { skip: BROWSER_SKIP, timeout: E2E_TIMEOUT }, async () => {
+  const world = e2e5DeclarativeClosedShadow();
+  await world.start();
+  try {
+    const { result, rendered } = await world.inspect(`http://${MAIN}/`);
+    assertNotClean('E2E-5c2', result);
+    const telemetry = rendered[0]?.telemetry;
+    assert.equal(telemetry?.declarativeClosedShadowRootCount, 1,
+      'the parser-attached closed root is counted from the response body');
+    assert.equal(telemetry?.closedShadowRootCount, undefined,
+      'declarative detection is reported separately from the attachShadow probe');
+    assert.equal(telemetry?.coverageReason, 'CONTEXT_UNREACHABLE',
+      'the closed root can never be certified as a clean absence');
+  } finally {
+    await world.close();
+  }
+});
+
+test('E2E-5f same-origin COOP popup is captured and inspected', { skip: BROWSER_SKIP, timeout: E2E_TIMEOUT }, async () => {
+  const world = e2e5CoopPopup();
+  await world.start();
+  try {
+    const { result, rendered } = await world.inspect(`http://${MAIN}/`);
+    logResult('E2E-5f', result);
+    assert.ok((rendered[0]?.telemetry?.popupCaptured || 0) > 0,
+      'E2E-5f: the COOP popup was not captured');
+    assert.equal(result.foundInvite, 'E2E5COOP',
+      'E2E-5f: the COOP popup was not inspected');
+  } finally {
+    await world.close();
+  }
+});
+
+test('E2E-5g cross-origin auth popup is a policy exclusion, never a clean run', { skip: BROWSER_SKIP, timeout: E2E_TIMEOUT }, async () => {
+  const world = e2e5CrossOriginAuthPopup();
+  await world.start();
+  try {
+    const { result, rendered } = await world.inspect(`http://${MAIN}/`);
+    assertNotClean('E2E-5g', result);
+    assert.ok((rendered[0]?.dropReasons?.['cross-origin-disallowed'] || 0) > 0,
+      'E2E-5g: the cross-origin auth popup must be counted as a policy exclusion');
   } finally {
     await world.close();
   }
@@ -905,12 +1051,30 @@ test('E2E-6b strong cross-origin hub with P1.6 ON is inspected within the cap', 
   const world = e2e6CrossOrigin();
   await world.start();
   try {
-    const { result } = await world.inspect(`http://${MAIN}/`, { crossOriginEnqueue: true });
+    const { result, rendered } = await world.inspect(`http://${MAIN}/`, { crossOriginEnqueue: true });
     logResult('E2E-6b', result);
     const hubRequests = world.proxyRequests.filter(item => item.host === HUB && item.path.startsWith('/community-')).length;
-    assert.ok(hubRequests > 0, 'E2E-6b: no cross-origin hub page was inspected');
-    assert.ok(hubRequests <= 3, `E2E-6b: cross-origin cap exceeded (${hubRequests} hub requests)`);
+    assert.equal(hubRequests, 3, `E2E-6b: expected exactly the three admitted hubs, got ${hubRequests}`);
+    assert.ok((rendered[0]?.dropReasons?.['destination-budget'] || 0) > 0,
+      'E2E-6b: the fourth eligible hub must be reported as a destination-budget gap');
+    assert.equal(rendered[0]?.complete, false,
+      'E2E-6b: a cap hit cannot resolve as complete coverage');
     assert.match(result.foundInvite || '', /^HUB[1-3]$/, 'E2E-6b: a cross-origin hub invite was not found');
+  } finally {
+    await world.close();
+  }
+});
+
+test('E2E-6c cross-origin JavaScript menu is discovered after interaction', { skip: BROWSER_SKIP, timeout: E2E_TIMEOUT }, async () => {
+  const world = e2e6CrossOriginMenu();
+  await world.start();
+  try {
+    const { result } = await world.inspect(`http://${MAIN}/`, { crossOriginEnqueue: true });
+    logResult('E2E-6c', result);
+    const hubRequests = world.proxyRequests.filter(item => item.host === HUB && item.path === '/community-menu').length;
+    assert.ok(hubRequests > 0, 'E2E-6c: the JS-revealed cross-origin menu destination was not inspected');
+    assert.equal(result.foundInvite, 'E2E6MENU',
+      'E2E-6c: the cross-origin menu invite was not found');
   } finally {
     await world.close();
   }
@@ -1102,7 +1266,9 @@ test('E2E-9 false-clean matrix', { skip: BROWSER_SKIP, timeout: 600_000 }, async
     { name: 'js-inserted-generic-link', build: e2e9GenericLink },
     { name: 'target-blank-popup', build: e2e9Popup },
     { name: 'closed-shadow-root', build: e2e9ClosedShadow },
+    { name: 'declarative-closed-shadow-root', build: e2e5DeclarativeClosedShadow },
     { name: 'unlabeled-icon-button', build: e2e9IconButton },
+    { name: 'unlabeled-href-less-anchor', build: e2e9HrefLessIconAnchor },
     { name: 'page-budget', build: e2e4PageBudget },
     { name: 'click-budget', build: e2e4ClickBudget },
     { name: 'scroll-cap', build: e2e4ScrollCap },

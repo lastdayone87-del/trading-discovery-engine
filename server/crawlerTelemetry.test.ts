@@ -166,6 +166,9 @@ test('coverage reason distinguishes complete, bounded, policy, context, and unkn
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, frameCount: 1 }), 'CONTEXT_UNREACHABLE');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, shadowRootCount: 1 }), 'CONTEXT_UNREACHABLE');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, closedShadowRootCount: 1 }), 'CONTEXT_UNREACHABLE');
+  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, declarativeClosedShadowRootCount: 1 }), 'CONTEXT_UNREACHABLE');
+  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, declarativeShadowScanGap: 1 }), 'BOUNDED');
+  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, candidateCapTruncated: 1 }), 'BOUNDED');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, popupTargets: 1 }), 'CONTEXT_UNREACHABLE');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, opaqueInteractiveControls: 1 }), 'CONTEXT_UNREACHABLE');
   assert.equal(
@@ -251,6 +254,9 @@ test('safe telemetry round-trips P0.2 navigation-coverage fields on rendered row
     frameCount: 2,
     shadowRootCount: 1,
     closedShadowRootCount: 1,
+    declarativeClosedShadowRootCount: 2,
+    declarativeShadowScanGap: 1,
+    candidateCapTruncated: 3,
     baseHrefPresent: true,
     scrollCapReachedStillGrowing: true,
     navigationPolicyExcluded: { 'admission-rejected': 5, 'hint-rejected': 30 },
@@ -272,6 +278,9 @@ test('safe telemetry round-trips P0.2 navigation-coverage fields on rendered row
   assert.equal(rendered?.frameCount, 2);
   assert.equal(rendered?.shadowRootCount, 1);
   assert.equal(rendered?.closedShadowRootCount, 1);
+  assert.equal(rendered?.declarativeClosedShadowRootCount, 2);
+  assert.equal(rendered?.declarativeShadowScanGap, 1);
+  assert.equal(rendered?.candidateCapTruncated, 3);
   assert.equal(rendered?.baseHrefPresent, true);
   assert.equal(rendered?.scrollCapReachedStillGrowing, true);
   assert.deepEqual(rendered?.navigationPolicyExcluded, { 'admission-rejected': 5, 'hint-rejected': 30 });

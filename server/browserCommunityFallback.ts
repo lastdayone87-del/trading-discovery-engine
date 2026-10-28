@@ -152,6 +152,20 @@ export interface BrowserFallbackTelemetry {
   shadowRootCount?: number;
   /** Closed shadow roots observed through the bounded attachShadow probe. */
   closedShadowRootCount?: number;
+  /** Declarative closed shadow roots found in a raw main-document response.
+   * The HTML parser removes the `<template shadowrootmode>` node before page
+   * JavaScript or DOM traversal can see it, so these roots are counted from
+   * the response body rather than the live DOM. */
+  declarativeClosedShadowRootCount?: number;
+  /** Main-document responses that could not be scanned for declarative closed
+   * roots (body unavailable or above the bounded scan size). Never a clean
+   * absence: coverage stays partial when this is non-zero. */
+  declarativeShadowScanGap?: number;
+  /** Largest single-collection overflow beyond the bounded per-collector cap
+   * (sampled up to 500). The collector still stops at 500; overflow is
+   * counted so a crowded page cannot silently hide a later destination or
+   * certify complete coverage. */
+  candidateCapTruncated?: number;
   baseHrefPresent?: boolean;
   scrollCapReachedStillGrowing?: boolean;
   navigationPolicyExcluded?: Partial<Record<NavigationPolicyExclusionReason, number>>;
@@ -913,12 +927,16 @@ export function enumerateRenderedControlNodes(
     // structural semantics. It cannot be safely clicked (the icon is opaque),
     // but it also cannot be silently treated as irrelevant: its click handler
     // could reveal an invite. Count it so coverage resolves as context-
-    // unreachable rather than a clean no-match. Anchors without an href are
-    // not interactive targets for this purpose.
+    // unreachable rather than a clean no-match. Href-less anchors (including
+    // `role=link` icon controls) are included: without an href they are not
+    // navigation candidates, so a click is the only way their destination can
+    // be revealed.
     const interactiveControl = tagName === 'button'
       || role === 'button'
       || role === 'tab'
-      || role === 'menuitem';
+      || role === 'menuitem'
+      || (role === 'link' && !hasNavigableHref)
+      || (tagName === 'a' && !hasNavigableHref);
     const hasAccessibleEvidence = extendedText.trim().length > 0;
     if (interactiveControl && !hintMatchedControl && !disclosure && !openSummary && !hasAccessibleEvidence) {
       opaqueInteractiveControls++;
@@ -1022,6 +1040,234 @@ export function installClosedShadowRootInstrumentation(): void {
     }
     return attachShadow.call(this, init);
   };
+}
+
+/**
+ * Browser-side bound for declarative-shadow response scanning. The crawler
+ * already materializes the parsed DOM for extraction; this cap keeps the
+ * additional raw-body read from doubling memory for pathological documents.
+ * A skipped body is counted as a scan gap, never as a clean absence.
+ */
+export const DECLARATIVE_SHADOW_SCAN_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Count declarative closed shadow roots in raw HTML. The parser consumes and
+ * removes `<template shadowrootmode="closed">` during document construction,
+ * so the live DOM cannot reveal these roots. This is deliberately a bounded
+ * markup scan, not a DOM traversal; false positives only make coverage more
+ * conservative, while the explicit response-scan gap prevents false clean
+ * results when a body cannot be scanned.
+ */
+export function countDeclarativeClosedShadowRoots(html: string): number {
+  if (typeof html !== 'string' || !html) return 0;
+  const pattern = /<template\b[^>]*\b(?:shadowrootmode|shadowroot)\s*=\s*(?:"closed"|'closed'|closed)(?=[\s/>])/gi;
+  let count = 0;
+  while (count < 1000 && pattern.exec(html)) count++;
+  return count;
+}
+
+interface DeclarativeShadowPageScan {
+  documents: number;
+  closedRoots: number;
+  gaps: number;
+  pending: Promise<void> | null;
+  settled: boolean;
+  generation: number;
+  observed: boolean;
+}
+
+const DECLARATIVE_SHADOW_SCAN_PAGES = new WeakMap<object, DeclarativeShadowPageScan>();
+
+interface RenderedShadowScanResponseLike {
+  url(): string;
+  status(): number;
+  headers(): Record<string, string>;
+  request(): { resourceType(): string; frame(): unknown };
+  text(): Promise<string>;
+}
+
+interface RenderedShadowScanPageLike {
+  on(event: 'response', listener: (response: RenderedShadowScanResponseLike) => void): void;
+}
+
+/**
+ * Install a per-page main-document response scan before navigation. Called
+ * from preNavigationHooks so the response event is observed even though the
+ * request handler starts only after the document has loaded. The listener is
+ * installed once per page; beginRenderedDeclarativeShadowScan resets the
+ * generation for each navigation so a reused page cannot double count.
+ */
+export function beginRenderedDeclarativeShadowScan(page: RenderedShadowScanPageLike): void {
+  let scan = DECLARATIVE_SHADOW_SCAN_PAGES.get(page as object);
+  if (!scan) {
+    scan = { documents: 0, closedRoots: 0, gaps: 0, pending: null, settled: true, generation: 0, observed: false };
+    DECLARATIVE_SHADOW_SCAN_PAGES.set(page as object, scan);
+    const mainFrame = () => {
+      try { return (page as unknown as { mainFrame(): unknown }).mainFrame(); } catch { return null; }
+    };
+    page.on('response', response => {
+      try {
+        const request = response.request();
+        if (request.resourceType() !== 'document') return;
+        if (request.frame() !== mainFrame()) return;
+        if (!/^https?:/i.test(response.url())) return;
+        const status = response.status();
+        // Redirect/empty responses carry no document body to scan; the final
+        // committed document is the one that matters.
+        if ((status >= 300 && status < 400) || status === 204 || status === 205) return;
+        scan!.observed = true;
+        const declaredLength = Number(response.headers()['content-length']);
+        if (Number.isFinite(declaredLength) && declaredLength > DECLARATIVE_SHADOW_SCAN_MAX_BYTES) {
+          scan!.gaps++;
+          return;
+        }
+        const generation = scan!.generation;
+        scan!.settled = false;
+        scan!.pending = response.text().then(html => {
+          if (scan!.generation !== generation) return;
+          scan!.documents++;
+          scan!.closedRoots += countDeclarativeClosedShadowRoots(html);
+        }).catch(() => {
+          if (scan!.generation === generation) scan!.gaps++;
+        }).finally(() => {
+          if (scan!.generation === generation) {
+            scan!.settled = true;
+            scan!.pending = null;
+          }
+        });
+      } catch {
+        scan!.gaps++;
+      }
+    });
+  }
+  scan.generation++;
+  scan.documents = 0;
+  scan.closedRoots = 0;
+  scan.gaps = 0;
+  scan.pending = null;
+  scan.settled = true;
+  scan.observed = false;
+}
+
+/**
+ * Read the current navigation's declarative-shadow scan. Waiting is bounded:
+ * a response body that is still unavailable after the timeout is a scan gap,
+ * not an assumed empty document.
+ */
+export async function readRenderedDeclarativeShadowScan(
+  page: object,
+  timeoutMs = 1_000,
+): Promise<{ documents: number; closedRoots: number; gaps: number }> {
+  const scan = DECLARATIVE_SHADOW_SCAN_PAGES.get(page);
+  if (!scan) return { documents: 0, closedRoots: 0, gaps: 1 };
+  if (scan.pending) {
+    const pending = scan.pending;
+    await Promise.race([
+      pending,
+      new Promise<void>(resolve => setTimeout(resolve, Math.max(0, timeoutMs))),
+    ]);
+  }
+  const gaps = scan.gaps
+    + (scan.observed ? 0 : 1)
+    + (!scan.settled && scan.pending ? 1 : 0);
+  return { documents: scan.documents, closedRoots: scan.closedRoots, gaps };
+}
+
+export interface RenderedOpenShadowSnapshot {
+  /** Bounded visible/text content from open shadow roots. */
+  text: string;
+  /** Bounded absolute hrefs from anchors inside open shadow roots. */
+  hrefs: string[];
+  /** Number of open roots traversed. */
+  roots: number;
+  /** True when a root, node, href, or character bound stopped traversal. */
+  truncated: boolean;
+}
+
+/**
+ * Bounded open-shadow traversal for invite discovery. Playwright selectors
+ * already pierce open roots for clicking, but `page.content()` does not
+ * serialize them, so a Discord invite placed only inside an open root was
+ * previously missed. This walker visits a bounded number of roots/nodes and
+ * returns text plus anchor hrefs; closed roots stay inaccessible by design.
+ *
+ * Self-contained: Playwright serializes this function into the page.
+ */
+export function collectRenderedOpenShadowContent(): RenderedOpenShadowSnapshot {
+  const maxRoots = 64;
+  const maxNodes = 4_000;
+  const maxChars = 200_000;
+  const maxHrefs = 256;
+  const maxDepth = 4;
+  const textParts: string[] = [];
+  const hrefs: string[] = [];
+  let chars = 0;
+  let nodes = 0;
+  let roots = 0;
+  let truncated = false;
+  const queue: Array<{ root: ShadowRoot; depth: number }> = [];
+  const root = document.body || document.documentElement;
+  if (!root) return { text: '', hrefs, roots, truncated };
+  const lightWalker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+  let lightNode = lightWalker.nextNode();
+  let lightExamined = 0;
+  while (lightNode && lightExamined < 4_000) {
+    lightExamined++;
+    const shadow = (lightNode as HTMLElement).shadowRoot;
+    if (shadow) {
+      if (queue.length < maxRoots) queue.push({ root: shadow, depth: 1 });
+      else truncated = true;
+    }
+    lightNode = lightWalker.nextNode();
+  }
+  while (queue.length && nodes < maxNodes && chars < maxChars) {
+    const entry = queue.shift()!;
+    roots++;
+    const walker = document.createTreeWalker(entry.root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+    let node = walker.nextNode();
+    while (node && nodes < maxNodes && chars < maxChars) {
+      nodes++;
+      if (node.nodeType === Node.TEXT_NODE) {
+        const value = (node.nodeValue || '').replace(/\s+/g, ' ').trim();
+        if (value) {
+          const slice = value.slice(0, Math.max(0, maxChars - chars));
+          if (slice) {
+            textParts.push(slice);
+            chars += slice.length + 1;
+          }
+          if (slice.length < value.length) truncated = true;
+        }
+      } else {
+        const element = node as Element;
+        const nested = (element as HTMLElement).shadowRoot;
+        if (nested) {
+          if (entry.depth < maxDepth && queue.length + roots < maxRoots) {
+            queue.push({ root: nested, depth: entry.depth + 1 });
+          } else {
+            truncated = true;
+          }
+        }
+        const rawHref = element.getAttribute('href')
+          || element.getAttributeNS('http://www.w3.org/1999/xlink', 'href')
+          || '';
+        if (rawHref) {
+          if (hrefs.length >= maxHrefs) {
+            truncated = true;
+          } else {
+            try {
+              hrefs.push(new URL(rawHref, element.baseURI || document.baseURI).toString());
+            } catch {
+              hrefs.push(rawHref);
+            }
+          }
+        }
+      }
+      node = walker.nextNode();
+    }
+    if (node) truncated = true;
+  }
+  if (queue.length) truncated = true;
+  return { text: textParts.join(' ').slice(0, maxChars), hrefs, roots, truncated };
 }
 
 /**
@@ -1161,6 +1407,23 @@ export interface RenderedCrossOriginCandidate {
   text: string;
 }
 
+/**
+ * Bounded collector result. `truncated` counts eligible destinations beyond
+ * the collector limit (up to a bounded 500-candidate overflow sample, so a
+ * pathological page cannot make the diagnostic itself expensive). Callers
+ * must publish any overflow as a coverage gap because those URLs were
+ * discovered but never evaluated or enqueued.
+ */
+export interface RenderedCandidateCollection {
+  candidates: RenderedCrossOriginCandidate[];
+  truncated: number;
+}
+
+/** Stop counting overflow after this many eligible candidates. The collector
+ * already keeps only the first 500; this bound only prevents the diagnostic
+ * scan from growing with an arbitrarily large DOM. */
+const RENDERED_COLLECTOR_OVERFLOW_SAMPLE_MAX = 500;
+
 export interface RenderedCrossOriginEnqueuePlan {
   admitted: string[];
   alreadyVisited: number;
@@ -1184,16 +1447,16 @@ export function collectRenderedCrossOriginCandidates(
   nodes: Element[],
   currentUrl: string,
   limit = 500,
-): RenderedCrossOriginCandidate[] {
+): RenderedCandidateCollection {
   const candidates: RenderedCrossOriginCandidate[] = [];
+  let truncated = 0;
   let currentOrigin = '';
   try {
     currentOrigin = new URL(currentUrl).origin;
   } catch {
-    return candidates;
+    return { candidates, truncated };
   }
   for (const node of nodes) {
-    if (candidates.length >= limit) break;
     const anchor = node as HTMLAnchorElement;
     let target: URL;
     try {
@@ -1203,12 +1466,17 @@ export function collectRenderedCrossOriginCandidates(
     }
     if (target.protocol !== 'http:' && target.protocol !== 'https:') continue;
     if (target.origin === currentOrigin) continue;
+    if (candidates.length >= limit) {
+      if (truncated < RENDERED_COLLECTOR_OVERFLOW_SAMPLE_MAX) truncated++;
+      if (truncated >= RENDERED_COLLECTOR_OVERFLOW_SAMPLE_MAX) break;
+      continue;
+    }
     candidates.push({
       url: target.toString(),
       text: (anchor.textContent || '').trim().slice(0, 200),
     });
   }
-  return candidates;
+  return { candidates, truncated };
 }
 
 /**
@@ -1292,8 +1560,9 @@ export function collectRenderedSameOriginCandidates(
   nodes: Element[],
   currentUrl: string,
   limit = 500,
-): RenderedCrossOriginCandidate[] {
+): RenderedCandidateCollection {
   const candidates: RenderedCrossOriginCandidate[] = [];
+  let truncated = 0;
   let currentOrigin = '';
   let currentIdentity = '';
   try {
@@ -1302,10 +1571,9 @@ export function collectRenderedSameOriginCandidates(
     current.hash = '';
     currentIdentity = current.toString();
   } catch {
-    return candidates;
+    return { candidates, truncated };
   }
   for (const node of nodes) {
-    if (candidates.length >= limit) break;
     const anchor = node as HTMLAnchorElement;
     let target: URL;
     try {
@@ -1317,12 +1585,17 @@ export function collectRenderedSameOriginCandidates(
     if (target.origin !== currentOrigin) continue;
     target.hash = '';
     if (target.toString() === currentIdentity) continue;
+    if (candidates.length >= limit) {
+      if (truncated < RENDERED_COLLECTOR_OVERFLOW_SAMPLE_MAX) truncated++;
+      if (truncated >= RENDERED_COLLECTOR_OVERFLOW_SAMPLE_MAX) break;
+      continue;
+    }
     candidates.push({
       url: target.toString(),
       text: (anchor.textContent || '').trim().slice(0, 200),
     });
   }
-  return candidates;
+  return { candidates, truncated };
 }
 
 export interface RenderedRevealedSameOriginPlan {
@@ -2576,6 +2849,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   let frameCount = 0;
   let shadowRootCount = 0;
   let closedShadowRootCount = 0;
+  let declarativeClosedShadowRootCount = 0;
+  let declarativeShadowScanGap = 0;
+  let candidateCapTruncated = 0;
   let baseHrefPresent = false;
   let scrollCapReachedStillGrowing = false;
   // True while a page with clickable controls has not yet recorded its
@@ -2609,6 +2885,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
     telemetry.frameCount = frameCount || undefined;
     telemetry.shadowRootCount = shadowRootCount || undefined;
     telemetry.closedShadowRootCount = closedShadowRootCount || undefined;
+    telemetry.declarativeClosedShadowRootCount = declarativeClosedShadowRootCount || undefined;
+    telemetry.declarativeShadowScanGap = declarativeShadowScanGap || undefined;
+    telemetry.candidateCapTruncated = candidateCapTruncated || undefined;
     telemetry.baseHrefPresent = baseHrefPresent || undefined;
     telemetry.scrollCapReachedStillGrowing = scrollCapReachedStillGrowing || undefined;
     const dropSnapshot = drops.snapshot();
@@ -2631,6 +2910,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
       frameCount,
       shadowRootCount,
       closedShadowRootCount,
+      declarativeClosedShadowRootCount,
+      declarativeShadowScanGap,
+      candidateCapTruncated,
       // A popup control that was actually clicked is resolved: either its
       // popup destination was captured or its in-place disclosure was
       // inspected. Only unresolved popup triggers remain context gaps.
@@ -2778,6 +3060,12 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // coverage can report an unexamined context instead of certifying
             // a clean absence.
             await page.addInitScript(installClosedShadowRootInstrumentation);
+            // Declarative closed roots are consumed and removed by the HTML
+            // parser, so neither page JavaScript nor the attachShadow wrapper
+            // can see them. Scan the raw main-document response before
+            // navigation; the scan is bounded and a gap is reported rather
+            // than assumed empty.
+            beginRenderedDeclarativeShadowScan(page as unknown as RenderedShadowScanPageLike);
             const context = page.context();
             if (!renderedRouteGuards.has(context)) {
               const guard = createRenderedRouteGuard(context, {
@@ -2832,7 +3120,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // Popups opened by an allowed click are captured rather than
             // leaked or silently ignored. Bounded to 8 per page so a popup
             // storm cannot grow the handler unbounded; overflow popups are
-            // closed and counted as dropped.
+            // closed and counted as dropped. The listener is attached to the
+            // browser context, not the page: COOP-severed auth popups can be
+            // missing from the opener page's `popup` event even though they
+            // are still real destinations in this bounded crawl.
             const pendingPopups: Array<{
               url(): string;
               close(): Promise<void>;
@@ -2853,7 +3144,27 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               }
               pendingPopups.push(popup);
             };
-            (page as unknown as { on?: (event: string, listener: typeof onPopup) => void }).on?.('popup', onPopup);
+            const popupContext = (page as unknown as { context?: () => {
+              on?: (event: string, listener: (candidate: typeof page) => void) => void;
+              off?: (event: string, listener: (candidate: typeof page) => void) => void;
+              pages?: () => Array<typeof page>;
+            } }).context?.();
+            const seenPopupPages = new Set<object>();
+            const onContextPage = (candidate: typeof page) => {
+              if (!candidate || candidate === page || seenPopupPages.has(candidate)) return;
+              seenPopupPages.add(candidate);
+              onPopup(candidate as unknown as Parameters<typeof onPopup>[0]);
+            };
+            popupContext?.on?.('page', onContextPage);
+            // A load-time window.open may commit before the request handler
+            // starts, so the event can be missed. Pick up any already-open
+            // sibling page in this context; the crawl is serialized and
+            // closes it below, so it cannot be an unrelated long-lived tab.
+            const captureSiblingPages = () => {
+              for (const existing of popupContext?.pages?.() || []) onContextPage(existing);
+            };
+            captureSiblingPages();
+            const stopPopupCapture = () => popupContext?.off?.('page', onContextPage);
             try {
             // Snapshot lifetime: candidates are extracted from the FULL page
             // source (never truncated before extraction) and the multi-MB
@@ -2869,6 +3180,20 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 retain(url, url);
                 if (html !== null) {
                   retain(html, url);
+                  // `page.content()` does not serialize shadow trees. Feed a
+                  // bounded open-root snapshot through the same candidate
+                  // extractor so an invite placed only inside an open root is
+                  // discovered; closed roots remain uninspected and are
+                  // reported by the separate closed-root counters.
+                  try {
+                    const shadowSnapshot = await page.evaluate(collectRenderedOpenShadowContent);
+                    if (shadowSnapshot && typeof shadowSnapshot.text === 'string' && shadowSnapshot.text) {
+                      retain(shadowSnapshot.text, url);
+                    }
+                    if (shadowSnapshot && Array.isArray(shadowSnapshot.hrefs) && shadowSnapshot.hrefs.length) {
+                      retain(shadowSnapshot.hrefs.join(' '), url);
+                    }
+                  } catch { /* coverage still reports open roots as context-unreachable */ }
                   try {
                     // Request and final-page identities share one evidence bucket
                     // (see visitIdentityKeys): for a redirected request both
@@ -2908,6 +3233,15 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               closedShadowRootCount += Math.max(0, Math.floor(pageContext.closedShadowRootCount) || 0);
               baseHrefPresent = baseHrefPresent || pageContext.baseHrefPresent === true;
             } catch { /* context counters never break inspection */ }
+            // Declarative closed roots never reach the live DOM, so their
+            // count comes from the bounded raw-response scan installed before
+            // navigation. A body that could not be scanned is a gap that keeps
+            // coverage partial rather than a silent empty result.
+            try {
+              const declarativeScan = await readRenderedDeclarativeShadowScan(page);
+              declarativeClosedShadowRootCount += Math.max(0, Math.floor(declarativeScan.closedRoots) || 0);
+              declarativeShadowScanGap += Math.max(0, Math.floor(declarativeScan.gaps) || 0);
+            } catch { declarativeShadowScanGap++; }
             if (!seedDocumentSeen) {
               seedDocumentSeen = true;
               seedSnapshotUrl = page.url();
@@ -2930,12 +3264,13 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             const initialLinkKeys = new Set<string>();
             let initialLinksCaptured = false;
             try {
-              const initialCandidates = await page.$$eval(
+              const initialCollection = await page.$$eval(
                 'a[href]',
                 collectRenderedSameOriginCandidates,
                 page.url(),
               );
-              for (const candidate of initialCandidates) {
+              if (initialCollection.truncated > 0) candidateCapTruncated = Math.max(candidateCapTruncated, initialCollection.truncated);
+              for (const candidate of initialCollection.candidates) {
                 const key = normalizeVisitUrl(candidate.url);
                 if (key) initialLinkKeys.add(key);
               }
@@ -3091,11 +3426,13 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 // Collection runs even when pursuit is OFF: a discovered
                 // eligible destination that policy/budget did not pursue is a
                 // coverage gap, never a silent discard.
-                candidates = await page.$$eval(
+                const collection = await page.$$eval(
                   'a[href]',
                   collectRenderedCrossOriginCandidates,
                   page.url(),
                 );
+                if (collection.truncated > 0) candidateCapTruncated = Math.max(candidateCapTruncated, collection.truncated);
+                candidates = collection.candidates;
               } catch {
                 // A control may have replaced or detached the document
                 // between the click loop and this pass. Enqueueing nothing is
@@ -3133,6 +3470,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // and are never navigated to. Every popup is closed so it cannot
             // outlive the request or consume an unbudgeted page.
             const drainPopups = async (): Promise<void> => {
+              // Catch a popup whose context page event was delivered after
+              // the click settled (notably COOP-severed popups).
+              captureSiblingPages();
               while (pendingPopups.length) {
                 const popup = pendingPopups.shift()!;
                 let popupUrl = '';
@@ -3261,13 +3601,14 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               // each unvisited destination exactly once).
               let revealedEnqueueAttempted = false;
               try {
-                const revealedCandidates = await page.$$eval(
+                const revealedCollection = await page.$$eval(
                   'a[href]',
                   collectRenderedSameOriginCandidates,
                   page.url(),
                 );
+                if (revealedCollection.truncated > 0) candidateCapTruncated = Math.max(candidateCapTruncated, revealedCollection.truncated);
                 const revealedPlan = planRevealedSameOriginEnqueues({
-                  candidates: revealedCandidates,
+                  candidates: revealedCollection.candidates,
                   currentUrl: page.url(),
                   initialLinks: initialLinkKeys,
                   alreadyVisited: alreadyVisitedSet,
@@ -3374,7 +3715,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // Final drain: no popup may outlive the request or be silently
             // discarded when the interaction handlers finish.
             await drainPopups();
-            (page as unknown as { off?: (event: string, listener: typeof onPopup) => void }).off?.('popup', onPopup);
+            stopPopupCapture();
             // Success is recorded only after the request's full page-processing
             // lifecycle completes (load, scroll traversal, control enumeration,
             // link enqueueing). A later terminal failure propagates before this
@@ -3392,7 +3733,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               // best-effort and never masks the error: classification, the
               // errorHandler accounting above, and retry see attemptError
               // unchanged, and a failed page is never referenced afterwards.
-              (page as unknown as { off?: (event: string, listener: typeof onPopup) => void }).off?.('popup', onPopup);
+              stopPopupCapture();
               for (const popup of pendingPopups.splice(0)) {
                 await popup.close().catch(() => undefined);
               }

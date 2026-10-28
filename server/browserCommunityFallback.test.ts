@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { DEFAULT_BROWSER_FALLBACK_BUDGET, advanceRenderedLifecycleStage, browserCauseSnippet, browserFallbackTelemetrySummary, classifyCrawlCatch, createRenderedRouteGuard, disposeRenderedRouteGuards, installRenderedRouteCloseCleanup, isExpectedRenderedRouteShutdownError, isTelegramPostPermalink, RenderedFallbackGate, renderedFallbackGate, resolveRenderedZeroPageReason, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback, type BrowserFallbackTelemetry, type RenderedRouteLike } from './browserCommunityFallback';
+import { DEFAULT_BROWSER_FALLBACK_BUDGET, advanceRenderedLifecycleStage, beginRenderedDeclarativeShadowScan, browserCauseSnippet, browserFallbackTelemetrySummary, classifyCrawlCatch, countDeclarativeClosedShadowRoots, createRenderedRouteGuard, disposeRenderedRouteGuards, installRenderedRouteCloseCleanup, isExpectedRenderedRouteShutdownError, isTelegramPostPermalink, readRenderedDeclarativeShadowScan, RenderedFallbackGate, renderedFallbackGate, resolveRenderedZeroPageReason, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback, type BrowserFallbackTelemetry, type RenderedRouteLike } from './browserCommunityFallback';
 import { redactCauseSnippet } from './crawlerTelemetry';
 import { classifyRenderedCrawlerFailure, isRenderedNavigationTimeout, renderedCrawlerHostBackoffMs, renderedCrawlerRetryPolicy } from './renderedCrawlerPolicy';
 
@@ -12,6 +12,117 @@ test('browser fallback remains bounded while allowing useful retries', () => {
   assert.equal(DEFAULT_BROWSER_FALLBACK_BUDGET.maxRequestRetries, 3);
   assert.ok(DEFAULT_BROWSER_FALLBACK_BUDGET.maxSessionRotations <= 4);
   assert.ok(DEFAULT_BROWSER_FALLBACK_BUDGET.totalTimeoutMs <= 60_000);
+});
+
+test('declarative closed shadow roots are counted from raw markup without claiming open roots', () => {
+  assert.equal(
+    countDeclarativeClosedShadowRoots('<div><template shadowrootmode="closed"><a href="/room">Room</a></template></div>'),
+    1,
+    'standard closed declarative root is detected',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots("<template shadowrootmode='closed'>x</template>"),
+    1,
+    'single-quoted attribute is detected',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots('<template SHADOWROOTMODE=closed>x</template>'),
+    1,
+    'attribute names and unquoted values are case-insensitive',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots('<template shadowroot="closed">x</template>'),
+    1,
+    'the legacy shadowroot spelling is counted conservatively',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots('<template shadowrootmode="open">x</template>'),
+    0,
+    'open declarative roots are traversable and are not a closed-context gap',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots('<template shadowrootmode="closedx">x</template>'),
+    0,
+    'a value prefix is not a closed root',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots(Array.from({ length: 1200 }, () => '<template shadowrootmode="closed"></template>').join('')),
+    1000,
+    'the markup scan is bounded even for a pathological document',
+  );
+});
+
+test('declarative shadow response scan reports roots, gaps, and per-navigation resets', async () => {
+  type Listener = (response: {
+    url(): string;
+    status(): number;
+    headers(): Record<string, string>;
+    request(): { resourceType(): string; frame(): unknown };
+    text(): Promise<string>;
+  }) => void;
+  const mainFrame = {};
+  let listener: Listener | undefined;
+  const page = {
+    on(_event: 'response', callback: Listener) { listener = callback; },
+    mainFrame() { return mainFrame; },
+  };
+  beginRenderedDeclarativeShadowScan(page);
+  assert.deepEqual(
+    await readRenderedDeclarativeShadowScan(page as object, 0),
+    { documents: 0, closedRoots: 0, gaps: 1 },
+    'a navigation with no observed document response is a scan gap, not an empty document',
+  );
+
+  beginRenderedDeclarativeShadowScan(page);
+  listener!({
+    url: () => 'https://fixture.test/',
+    status: () => 200,
+    headers: () => ({}),
+    request: () => ({ resourceType: () => 'document', frame: () => mainFrame }),
+    text: async () => '<template shadowrootmode="closed"></template>',
+  });
+  assert.deepEqual(
+    await readRenderedDeclarativeShadowScan(page as object, 100),
+    { documents: 1, closedRoots: 1, gaps: 0 },
+  );
+
+  // A second navigation on the same reused page starts from zero; the first
+  // document's root is not carried forward.
+  beginRenderedDeclarativeShadowScan(page);
+  listener!({
+    url: () => 'https://fixture.test/next',
+    status: () => 200,
+    headers: () => ({}),
+    request: () => ({ resourceType: () => 'document', frame: () => mainFrame }),
+    text: async () => '<html><body>no shadow roots</body></html>',
+  });
+  assert.deepEqual(
+    await readRenderedDeclarativeShadowScan(page as object, 100),
+    { documents: 1, closedRoots: 0, gaps: 0 },
+  );
+
+  // A redirect response and a subframe document are not final main-document
+  // bodies and must not create a false gap.
+  beginRenderedDeclarativeShadowScan(page);
+  listener!({
+    url: () => 'https://fixture.test/redirect',
+    status: () => 302,
+    headers: () => ({}),
+    request: () => ({ resourceType: () => 'document', frame: () => mainFrame }),
+    text: async () => '',
+  });
+  listener!({
+    url: () => 'https://fixture.test/frame',
+    status: () => 200,
+    headers: () => ({}),
+    request: () => ({ resourceType: () => 'document', frame: () => ({}) }),
+    text: async () => '<template shadowrootmode="closed"></template>',
+  });
+  assert.deepEqual(
+    await readRenderedDeclarativeShadowScan(page as object, 0),
+    { documents: 0, closedRoots: 0, gaps: 1 },
+    'neither response is a final main-document body',
+  );
 });
 
 test('Telegram message permalinks are not recursively crawled as community surfaces', () => {
