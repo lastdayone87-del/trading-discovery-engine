@@ -430,7 +430,7 @@ test('real DOM: an already-open details summary is not clicked closed', { skip: 
 
 test('real DOM: navigation compares against the document URL, not the effective base', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
   const html = `<!doctype html><html><head><base href="/base/"></head><body>
-    <a href="./">Resources</a>
+    <a role="menuitem" href="./">Resources</a>
     <a href="/#section">Resources</a>
   </body></html>`;
   await withControlPage(html, async (page, url) => {
