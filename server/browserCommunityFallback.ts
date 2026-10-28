@@ -1419,11 +1419,6 @@ export interface RenderedCandidateCollection {
   truncated: number;
 }
 
-/** Stop counting overflow after this many eligible candidates. The collector
- * already keeps only the first 500; this bound only prevents the diagnostic
- * scan from growing with an arbitrarily large DOM. */
-const RENDERED_COLLECTOR_OVERFLOW_SAMPLE_MAX = 500;
-
 export interface RenderedCrossOriginEnqueuePlan {
   admitted: string[];
   alreadyVisited: number;
@@ -1450,6 +1445,10 @@ export function collectRenderedCrossOriginCandidates(
 ): RenderedCandidateCollection {
   const candidates: RenderedCrossOriginCandidate[] = [];
   let truncated = 0;
+  // Bounded overflow sample. Kept inside the browser-context function because
+  // Playwright serializes its source; a module-level constant would not exist
+  // in the page. The collector still keeps only the first `limit` candidates.
+  const overflowSampleMax = 500;
   let currentOrigin = '';
   try {
     currentOrigin = new URL(currentUrl).origin;
@@ -1467,8 +1466,8 @@ export function collectRenderedCrossOriginCandidates(
     if (target.protocol !== 'http:' && target.protocol !== 'https:') continue;
     if (target.origin === currentOrigin) continue;
     if (candidates.length >= limit) {
-      if (truncated < RENDERED_COLLECTOR_OVERFLOW_SAMPLE_MAX) truncated++;
-      if (truncated >= RENDERED_COLLECTOR_OVERFLOW_SAMPLE_MAX) break;
+      if (truncated < overflowSampleMax) truncated++;
+      if (truncated >= overflowSampleMax) break;
       continue;
     }
     candidates.push({
@@ -1563,6 +1562,8 @@ export function collectRenderedSameOriginCandidates(
 ): RenderedCandidateCollection {
   const candidates: RenderedCrossOriginCandidate[] = [];
   let truncated = 0;
+  // Self-contained overflow bound; see the cross-origin collector.
+  const overflowSampleMax = 500;
   let currentOrigin = '';
   let currentIdentity = '';
   try {
@@ -1586,8 +1587,8 @@ export function collectRenderedSameOriginCandidates(
     target.hash = '';
     if (target.toString() === currentIdentity) continue;
     if (candidates.length >= limit) {
-      if (truncated < RENDERED_COLLECTOR_OVERFLOW_SAMPLE_MAX) truncated++;
-      if (truncated >= RENDERED_COLLECTOR_OVERFLOW_SAMPLE_MAX) break;
+      if (truncated < overflowSampleMax) truncated++;
+      if (truncated >= overflowSampleMax) break;
       continue;
     }
     candidates.push({
@@ -3150,6 +3151,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               pages?: () => Array<typeof page>;
             } }).context?.();
             const seenPopupPages = new Set<object>();
+            const preexistingSiblingPages = new Set<object>();
+            for (const existing of popupContext?.pages?.() || []) {
+              if (existing && existing !== page) preexistingSiblingPages.add(existing);
+            }
             const onContextPage = (candidate: typeof page) => {
               if (!candidate || candidate === page || seenPopupPages.has(candidate)) return;
               seenPopupPages.add(candidate);
@@ -3157,11 +3162,20 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             };
             popupContext?.on?.('page', onContextPage);
             // A load-time window.open may commit before the request handler
-            // starts, so the event can be missed. Pick up any already-open
-            // sibling page in this context; the crawl is serialized and
-            // closes it below, so it cannot be an unrelated long-lived tab.
+            // starts, so the event can be missed. Pick up already-open sibling
+            // pages that committed an HTTP(S) document, but never an idle
+            // browser-pool about:blank page: closing that as a "dropped
+            // popup" would make every ordinary crawl look bounded.
             const captureSiblingPages = () => {
-              for (const existing of popupContext?.pages?.() || []) onContextPage(existing);
+              for (const existing of popupContext?.pages?.() || []) {
+                if (!existing || existing === page || seenPopupPages.has(existing)) continue;
+                if (preexistingSiblingPages.has(existing)) {
+                  let existingUrl = '';
+                  try { existingUrl = existing.url(); } catch { /* treat as idle */ }
+                  if (!/^https?:/i.test(existingUrl)) continue;
+                }
+                onContextPage(existing);
+              }
             };
             captureSiblingPages();
             const stopPopupCapture = () => popupContext?.off?.('page', onContextPage);
