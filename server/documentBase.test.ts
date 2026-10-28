@@ -108,6 +108,33 @@ test('base stripping: quoted greater-than signs stay inside the tag', () => {
   );
 });
 
+test('base stripping: markup-looking text in scripts and styles is untouched', () => {
+  const script = '<script>const basePrefix = "<base ";</script><button data-href="/community/">Join</button>';
+  assert.equal(stripBaseElements(script), script, 'script text cannot delete a real control');
+  const style = '<style>.x::after{content:"<base "}</style><a href="join">join</a>';
+  assert.equal(stripBaseElements(style), style, 'style text cannot delete a real control');
+  const comment = '<!-- <base href="/community/"> --><a href="join">join</a>';
+  assert.equal(stripBaseElements(comment), comment, 'comments are not markup');
+  const quoted = '<div data-x="<base href=\'/community/\'>"><a href="join">join</a></div>';
+  assert.equal(stripBaseElements(quoted), quoted, 'quoted attribute text is not markup');
+});
+
+test('base stripping: a real base after raw text is still removed', () => {
+  assert.equal(
+    stripBaseElements('<script>const x = 1;</script><base href="/community/"><button data-href="/community/">Join</button>'),
+    '<script>const x = 1;</script><button data-href="/community/">Join</button>',
+  );
+  assert.equal(
+    stripBaseElements('<SCRIPT>const x = 1;</SCRIPT><BASE href="/community/"><a href="join">join</a>'),
+    '<SCRIPT>const x = 1;</SCRIPT><a href="join">join</a>',
+  );
+  assert.equal(
+    stripBaseElements('<script>const x = 1;</script ><base href="/community/"><a href="join">join</a>'),
+    '<script>const x = 1;</script ><a href="join">join</a>',
+    'a whitespace before the raw-text close tag is still a close tag',
+  );
+});
+
 test('base stripping: repeated unclosed base tags terminate in one pass', () => {
   const malformed = '<base '.repeat(20_000);
   assert.equal(stripBaseElements(malformed), '', 'an unclosed base tag consumes the remainder once');

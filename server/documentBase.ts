@@ -74,54 +74,156 @@ export function resolveDocumentBaseUrl(html: string, finalUrl: string): string {
  * markup. Used before heuristic attribute extraction, which cannot otherwise
  * distinguish a base element's own `href` from a real dynamic target.
  *
- * Single pass over the input: detection is limited to the exact tag name
- * `base` (so `<base-button>` is untouched), and the closing `>` scan respects
- * quoted attribute values. An unclosed base tag consumes the remainder once
- * and ends the scan, so repeated malformed `<base` sequences cannot cause
- * quadratic work.
+ * Context-aware single pass:
+ * - only an actual start tag named exactly `base` is removed (`<base-button>`
+ *   and attribute text are untouched);
+ * - comments, declarations, CDATA, and raw-text element bodies (script, style,
+ *   textarea, title, ...) are skipped so `<base ` inside them cannot delete
+ *   real controls later in the document;
+ * - quoted attribute values may contain `>`;
+ * - an unclosed base tag consumes the remainder once, and each raw-text body
+ *   is scanned once, so malformed repeated input cannot cause quadratic work.
  */
 export function stripBaseElements(html: string): string {
   const source = String(html || '');
   const length = source.length;
-  let output = '';
-  let cursor = 0;
-  let index = 0;
-  const isDelimiter = (code: number): boolean =>
-    code === 0x2f /* / */ || code === 0x3e /* > */ || code === 0x20
-    || code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d;
-  while (index < length) {
-    if (source.charCodeAt(index) !== 0x3c /* < */) {
-      index++;
-      continue;
-    }
-    // Case-insensitive exact "base" prefix.
-    const b = source.charCodeAt(index + 1) | 0x20;
-    const a = source.charCodeAt(index + 2) | 0x20;
-    const s = source.charCodeAt(index + 3) | 0x20;
-    const e = source.charCodeAt(index + 4) | 0x20;
-    const after = source.charCodeAt(index + 5);
-    if (b !== 0x62 || a !== 0x61 || s !== 0x73 || e !== 0x65 || !isDelimiter(after)) {
-      index++;
-      continue;
-    }
-    output += source.slice(cursor, index);
-    let scan = index + 5;
+  const rawTextElements = new Set([
+    'script', 'style', 'textarea', 'title', 'xmp', 'iframe',
+    'noembed', 'noframes', 'noscript', 'plaintext',
+  ]);
+  const isWhitespace = (code: number): boolean =>
+    code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d;
+  const isNameDelimiter = (code: number): boolean =>
+    code === 0x2f || code === 0x3e || isWhitespace(code);
+  const lower = (code: number): number => code >= 0x41 && code <= 0x5a ? code | 0x20 : code;
+  const mask = (code: number): number => code >= 0x41 && code <= 0x5a ? code | 0x20 : code;
+
+  // Index of the first `>` after `from`, ignoring `>` inside quoted attribute
+  // values. Returns `length` when the tag is unclosed.
+  const findTagEnd = (from: number): number => {
     let quote = 0;
-    while (scan < length) {
+    for (let scan = from; scan < length; scan++) {
       const code = source.charCodeAt(scan);
       if (quote) {
         if (code === quote) quote = 0;
       } else if (code === 0x22 || code === 0x27) {
         quote = code;
       } else if (code === 0x3e) {
-        break;
+        return scan + 1;
       }
-      scan++;
     }
-    // Unclosed tag: drop the remainder; nothing after it can be parsed as a
-    // start tag by the heuristic scanner either.
-    cursor = scan < length ? scan + 1 : length;
-    index = cursor;
+    return length;
+  };
+
+  // Find `</name` (ASCII case-insensitive) followed by a tag-name delimiter.
+  const findRawTextClose = (name: string, from: number): number => {
+    if (name === 'plaintext') return length;
+    let search = from;
+    while (search < length) {
+      let found = -1;
+      for (let index = search; index + name.length + 1 < length; index++) {
+        if (source.charCodeAt(index) !== 0x3c) continue;
+        if (source.charCodeAt(index + 1) !== 0x2f) continue;
+        let matches = true;
+        for (let offset = 0; offset < name.length; offset++) {
+          if (mask(source.charCodeAt(index + 2 + offset)) !== name.charCodeAt(offset)) {
+            matches = false;
+            break;
+          }
+        }
+        if (matches && isNameDelimiter(source.charCodeAt(index + 2 + name.length))) {
+          found = index;
+          break;
+        }
+      }
+      if (found < 0) return length;
+      return findTagEnd(found + 2 + name.length);
+    }
+    return length;
+  };
+
+  let output = '';
+  let cursor = 0;
+  let index = 0;
+  while (index < length) {
+    if (source.charCodeAt(index) !== 0x3c /* < */) {
+      index++;
+      continue;
+    }
+    const next = source.charCodeAt(index + 1);
+    if (next === 0x21 /* ! */) {
+      // Comment, CDATA, or declaration. Skip it wholly so markup-looking text
+      // inside cannot be mistaken for a start tag.
+      if (source.startsWith('<!--', index)) {
+        const end = source.indexOf('-->', index + 4);
+        index = end < 0 ? length : end + 3;
+        continue;
+      }
+      if (source.startsWith('<![CDATA[', index)) {
+        const end = source.indexOf(']]>', index + 9);
+        index = end < 0 ? length : end + 3;
+        continue;
+      }
+      let bracketDepth = 0;
+      let quote = 0;
+      let scan = index + 2;
+      for (; scan < length; scan++) {
+        const code = source.charCodeAt(scan);
+        if (quote) {
+          if (code === quote) quote = 0;
+        } else if (code === 0x22 || code === 0x27) {
+          quote = code;
+        } else if (code === 0x5b /* [ */) {
+          bracketDepth++;
+        } else if (code === 0x5d /* ] */ && bracketDepth > 0) {
+          bracketDepth--;
+        } else if (code === 0x3e && bracketDepth === 0) {
+          scan++;
+          break;
+        }
+      }
+      index = scan;
+      continue;
+    }
+    if (next === 0x3f /* ? */) {
+      index = findTagEnd(index + 2);
+      continue;
+    }
+    if (next === 0x2f /* / */) {
+      // Closing tag: skip it. A malformed closing tag is still tag syntax,
+      // not a place where a real start tag begins.
+      index = findTagEnd(index + 2);
+      continue;
+    }
+    if (!(next >= 0x41 && next <= 0x5a) && !(next >= 0x61 && next <= 0x7a)) {
+      index++;
+      continue;
+    }
+    // Read the tag name.
+    let nameEnd = index + 1;
+    while (nameEnd < length) {
+      const code = source.charCodeAt(nameEnd);
+      if (isNameDelimiter(code)) break;
+      nameEnd++;
+    }
+    let name = '';
+    for (let offset = index + 1; offset < nameEnd; offset++) {
+      name += String.fromCharCode(lower(source.charCodeAt(offset)));
+    }
+    const tagEnd = findTagEnd(nameEnd);
+    if (name === 'base') {
+      output += source.slice(cursor, index);
+      cursor = tagEnd;
+      index = tagEnd;
+      continue;
+    }
+    if (rawTextElements.has(name)) {
+      // Raw-text content is not parsed as markup. Skip to the matching close
+      // tag (or EOF for plaintext / an unclosed element).
+      index = findRawTextClose(name, tagEnd);
+      continue;
+    }
+    index = tagEnd;
   }
   return output + source.slice(cursor);
 }
