@@ -669,6 +669,75 @@ test('v2 review: static crawl resolves dynamic targets against the document base
   );
 });
 
+test('v2 review: base-resolved relative Discord anchor is retained without a navigation fetch', async () => {
+  const fetched: string[] = [];
+  const result = await crawlExternalLinks(
+    ['https://base.example.com/guide'],
+    [],
+    undefined,
+    (async (input) => {
+      const url = String(input);
+      fetched.push(url);
+      if (url === 'https://base.example.com/guide') {
+        return new Response(
+          '<html><head><base href="https://discord.gg/"></head><body><a href="Abc123">join</a></body></html>',
+          { status: 200, headers: { 'content-type': 'text/html' } },
+        );
+      }
+      return new Response('forbidden', { status: 403 });
+    }) as typeof fetch,
+  );
+  assert.equal(result.foundInvite, 'Abc123');
+  assert.ok(result.candidates.some((candidate) => candidate.nativeInviteCode === 'Abc123'));
+  assert.equal(
+    fetched.includes('https://discord.gg/Abc123'),
+    false,
+    'the resolved invite is retained from the page, not fetched as navigation',
+  );
+});
+
+test('v2 review: base-resolved relative dynamic Discord target is retained directly', async () => {
+  const result = await crawlExternalLinks(
+    ['https://base.example.com/guide'],
+    [],
+    undefined,
+    (async (input) => {
+      const url = String(input);
+      if (url === 'https://base.example.com/guide') {
+        return new Response(
+          '<html><head><base href="https://discord.gg/"></head><body><div data-href="Dyn123">join</div></body></html>',
+          { status: 200, headers: { 'content-type': 'text/html' } },
+        );
+      }
+      return new Response('forbidden', { status: 403 });
+    }) as typeof fetch,
+  );
+  assert.equal(result.foundInvite, 'Dyn123');
+});
+
+test('v2 review: dynamic-target scan does not queue the base href as a target', async () => {
+  const fetched: string[] = [];
+  await crawlExternalLinks(
+    ['https://base.example.com/guide'],
+    [],
+    undefined,
+    (async (input) => {
+      const url = String(input);
+      fetched.push(url);
+      if (url === 'https://base.example.com/guide') {
+        return html('<base href="community/"><div data-href="members">members area</div>');
+      }
+      return noInviteHtml();
+    }) as typeof fetch,
+  );
+  assert.equal(
+    fetched.includes('https://base.example.com/community/community/'),
+    false,
+    'the base element is a resolution rule, not a navigation target',
+  );
+  assert.ok(fetched.includes('https://base.example.com/community/members'));
+});
+
 test('v2 review: shared static root replay carries lender community intent to the borrower', async () => {
   const lenderIntent = {
     communityPlatform: 'WHOP' as const,
