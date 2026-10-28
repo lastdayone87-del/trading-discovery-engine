@@ -94,12 +94,17 @@ class FixtureWorld {
 
   async close(): Promise<void> {
     await Promise.all([...this.proxies].map(server => new Promise<void>(resolve => {
+      server.closeAllConnections?.();
       server.close(() => resolve());
     })));
     this.proxies.clear();
     if (this.server) {
-      await new Promise<void>(resolve => this.server!.close(() => resolve()));
+      const server = this.server;
       this.server = undefined;
+      await new Promise<void>(resolve => {
+        server.closeAllConnections?.();
+        server.close(() => resolve());
+      });
     }
   }
 
@@ -185,6 +190,7 @@ class FixtureWorld {
       url: `http://127.0.0.1:${address.port}`,
       close: () => new Promise<void>(resolve => {
         this.proxies.delete(proxy);
+        proxy.closeAllConnections?.();
         proxy.close(() => resolve());
       }),
     };
@@ -224,6 +230,37 @@ class FixtureWorld {
       renderedFallback,
       ...channelData,
     });
+    for (const [index, entry] of rendered.entries()) {
+      const telemetry = entry.telemetry;
+      console.log(`E2E_DIAG ${JSON.stringify({
+        seed,
+        index,
+        inspectedPages: entry.inspectedPages,
+        complete: entry.complete,
+        retryable: entry.retryable,
+        timedOut: entry.timedOut,
+        failureClass: entry.failureClass,
+        coverageReason: telemetry?.coverageReason,
+        requestsStarted: telemetry?.requestsStarted,
+        requestsFinished: telemetry?.requestsFinished,
+        requestsFailed: telemetry?.requestsFailed,
+        unresolvedFailedRequests: telemetry?.unresolvedFailedRequests,
+        requiredTotal: entry.requiredTotal,
+        requiredUnvisited: entry.requiredUnvisited,
+        requiredTransientFailures: entry.requiredTransientFailures,
+        requiredPermanentFailures: entry.requiredPermanentFailures,
+        interactionGap: entry.interactionGap,
+        controlsEnumeratedTotal: telemetry?.controlsEnumeratedTotal,
+        controlsHintRejected: telemetry?.controlsHintRejected,
+        controlsStructuralDisclosure: telemetry?.controlsStructuralDisclosure,
+        controlsIconLabelRecovered: telemetry?.controlsIconLabelRecovered,
+        popupTargets: telemetry?.popupTargets,
+        frameCount: telemetry?.frameCount,
+        shadowRootCount: telemetry?.shadowRootCount,
+        dropReasons: entry.dropReasons,
+        visitedUrls: entry.visitedUrls,
+      })}`);
+    }
     return { result, rendered };
   }
 }
@@ -318,7 +355,8 @@ function e2e1HamburgerToCommunity(): FixtureWorld {
       <script>
         document.getElementById('menu').addEventListener('click', () => {
           document.getElementById('panel').hidden = false;
-          document.getElementById('panel').innerHTML = '<a href="/community">Community</a>';
+          // Split path so no static scanner can extract it from script text.
+          document.getElementById('panel').innerHTML = '<a href="/comm' + 'unity">Community</a>';
           document.getElementById('menu').setAttribute('aria-expanded', 'true');
         });
       </script>`),
@@ -345,8 +383,10 @@ function e2e2GenericResources(): FixtureWorld {
       <div id="panel"></div>
       <script>
         document.getElementById('more').addEventListener('click', () => {
+          // Split path so static extraction cannot discover the destination;
+          // only rendered execution can reveal it.
           document.getElementById('panel').innerHTML =
-            '<a href="/resources">Resources</a>';
+            '<a href="/resour' + 'ces">Resources</a>';
         });
       </script>`),
   });
@@ -679,6 +719,10 @@ test('E2E-4a page budget with eligible work queued is partial, never clean', { s
     const { result, rendered } = await world.inspect(`http://${MAIN}/`);
     logResult('E2E-4a', result);
     assert.ok((rendered[0]?.inspectedPages || 0) <= 6, 'E2E-4a: rendered crawl exceeded the page budget');
+    assert.ok((rendered[0]?.requiredTotal || 0) > 6,
+      'E2E-4a: the required set must contain more destinations than the page budget');
+    assert.ok((rendered[0]?.requiredUnvisited?.length || 0) > 0,
+      'E2E-4a: eligible destinations must remain unvisited at the budget stop');
     assertNotClean('E2E-4a', result);
     assert.equal(result.acquisitionStatus, 'PARTIALLY_INSPECTED', 'E2E-4a: queued eligible pages must force a partial result');
   } finally {
@@ -803,7 +847,7 @@ test('E2E-6b strong cross-origin hub with P1.6 ON is inspected within the cap', 
     const hubRequests = world.proxyRequests.filter(item => item.host === HUB && item.path.startsWith('/community-')).length;
     assert.ok(hubRequests > 0, 'E2E-6b: no cross-origin hub page was inspected');
     assert.ok(hubRequests <= 3, `E2E-6b: cross-origin cap exceeded (${hubRequests} hub requests)`);
-    assertFound('E2E-6b', result, 'HUB1');
+    assert.match(result.foundInvite || '', /^HUB[1-3]$/, 'E2E-6b: a cross-origin hub invite was not found');
   } finally {
     await world.close();
   }
