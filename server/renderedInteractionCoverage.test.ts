@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { combineRenderedControlOffsetAdvances, isNavigableOnlyControlWindow, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, resolveRenderedCompletionState, runRenderedClickLoop, type RenderedControlEnumeration } from './browserCommunityFallback';
+import { combineRenderedControlOffsetAdvances, isNavigableOnlyControlWindow, isUnrecoveredStructuralNavigation, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, resolveRenderedCompletionState, runRenderedClickLoop, type RenderedControlEnumeration } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -61,6 +61,7 @@ const renderedEnumeration = (
   structuralHintRejected: 0,
   structuralDisclosure: 0,
   structuralUnrecovered: 0,
+  structuralUnrecoveredHrefs: [],
   iconLabelRecovered: 0,
   popupTargets: 0,
 });
@@ -422,6 +423,92 @@ test('a final click that navigates does not invent a gap', async () => {
   assert.equal(result.evidenceControlsClicked, 1);
   assert.equal(result.evidenceControlsSkipped, 0);
   assert.equal(result.interactionGap, false, 'no original-page control was left unexamined');
+});
+
+test('structural navigation is a coverage gap only when enqueue will not follow it', () => {
+  const pageUrl = 'https://creator.example/';
+  const visited = new Set<string>();
+  assert.equal(
+    isUnrecoveredStructuralNavigation('https://creator.example/resources', pageUrl, visited),
+    true,
+    'same-origin, admissible, hint-rejected: neither clicked nor enqueued',
+  );
+  assert.equal(
+    isUnrecoveredStructuralNavigation('https://creator.example/contact', pageUrl, visited),
+    false,
+    'the enqueue path owns and follows community-hint destinations',
+  );
+  assert.equal(
+    isUnrecoveredStructuralNavigation('https://other.example/resources', pageUrl, visited),
+    false,
+    'cross-origin destinations are represented by the cross-origin policy counter',
+  );
+  assert.equal(
+    isUnrecoveredStructuralNavigation('mailto:creator@example.com', pageUrl, visited),
+    false,
+    'format rejections are not unexamined navigation',
+  );
+  assert.equal(
+    isUnrecoveredStructuralNavigation('https://creator.example/logo.png', pageUrl, visited),
+    false,
+    'asset rejections are not unexamined navigation',
+  );
+  assert.equal(
+    isUnrecoveredStructuralNavigation(
+      'https://creator.example/resources',
+      pageUrl,
+      new Set(['https://creator.example/resources']),
+    ),
+    false,
+    'an already-visited destination was examined',
+  );
+});
+
+test('a same-document query change continues the click loop and reaches revealed controls', async () => {
+  const targets = [renderedButton(0, 'oc-push')];
+  const revealed = renderedButton(1, 'oc-revealed');
+  let url = 'https://creator.example/start';
+  let clicks = 0;
+  let enumerations = 0;
+  const result = await runRenderedClickLoop({
+    targets,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    click: async () => {
+      clicks++;
+      if (clicks === 1) url = 'https://creator.example/start?menu=open';
+      return true;
+    },
+    enumerate: async () => {
+      enumerations++;
+      return renderedEnumeration([...targets, revealed]);
+    },
+    pageUrl: () => url,
+    documentIdentity: async () => 'same-document',
+  });
+  assert.equal(result.evidenceControlsClicked, 2, 'the revealed control is still clicked');
+  assert.equal(result.evidenceControlsSkipped, 0);
+  assert.equal(result.interactionGap, false);
+  assert.equal(enumerations, 2, 'the same document is re-enumerated after the query change');
+});
+
+test('a changed document identity stops the loop even when the URL is unchanged', async () => {
+  const targets = [renderedButton(0, 'oc-identity-1'), renderedButton(1, 'oc-identity-2')];
+  let identity = 'document-1';
+  let enumerations = 0;
+  const result = await runRenderedClickLoop({
+    targets,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    click: async () => { identity = 'document-2'; return true; },
+    enumerate: async () => { enumerations++; return renderedEnumeration(targets); },
+    pageUrl: () => 'https://creator.example/start',
+    documentIdentity: async () => identity,
+  });
+  assert.equal(result.evidenceControlsClicked, 1);
+  assert.equal(result.evidenceControlsSkipped, 1, 'the replaced document leaves the queued control unexamined');
+  assert.equal(result.interactionGap, true);
+  assert.equal(enumerations, 0, 'a replaced document is never re-enumerated as the original page');
 });
 
 test('revealed-control planning rotates with the durable retry offset', () => {
