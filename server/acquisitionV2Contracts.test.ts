@@ -690,6 +690,27 @@ test('v2 review: base-button elements keep their dynamic community targets', asy
   );
 });
 
+test('v2 review: markup-looking script text does not hide a real community control', async () => {
+  const fetched: string[] = [];
+  await crawlExternalLinks(
+    ['https://script.example.com/guide'],
+    [],
+    undefined,
+    (async (input) => {
+      const url = String(input);
+      fetched.push(url);
+      if (url === 'https://script.example.com/guide') {
+        return html('<script>const basePrefix = "<base ";</script><button data-href="/community/join">Join the community</button>');
+      }
+      return noInviteHtml();
+    }) as typeof fetch,
+  );
+  assert.ok(
+    fetched.includes('https://script.example.com/community/join'),
+    'a raw <base string in script text must not delete a real control',
+  );
+});
+
 test('v2 review: a button sharing the base value is not filtered out', async () => {
   const fetched: string[] = [];
   await crawlExternalLinks(
