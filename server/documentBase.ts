@@ -68,3 +68,60 @@ export function resolveDocumentBaseUrl(html: string, finalUrl: string): string {
     return finalUrl;
   }
 }
+
+/**
+ * Remove HTML `<base ...>` start tags from a document without rewriting other
+ * markup. Used before heuristic attribute extraction, which cannot otherwise
+ * distinguish a base element's own `href` from a real dynamic target.
+ *
+ * Single pass over the input: detection is limited to the exact tag name
+ * `base` (so `<base-button>` is untouched), and the closing `>` scan respects
+ * quoted attribute values. An unclosed base tag consumes the remainder once
+ * and ends the scan, so repeated malformed `<base` sequences cannot cause
+ * quadratic work.
+ */
+export function stripBaseElements(html: string): string {
+  const source = String(html || '');
+  const length = source.length;
+  let output = '';
+  let cursor = 0;
+  let index = 0;
+  const isDelimiter = (code: number): boolean =>
+    code === 0x2f /* / */ || code === 0x3e /* > */ || code === 0x20
+    || code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d;
+  while (index < length) {
+    if (source.charCodeAt(index) !== 0x3c /* < */) {
+      index++;
+      continue;
+    }
+    // Case-insensitive exact "base" prefix.
+    const b = source.charCodeAt(index + 1) | 0x20;
+    const a = source.charCodeAt(index + 2) | 0x20;
+    const s = source.charCodeAt(index + 3) | 0x20;
+    const e = source.charCodeAt(index + 4) | 0x20;
+    const after = source.charCodeAt(index + 5);
+    if (b !== 0x62 || a !== 0x61 || s !== 0x73 || e !== 0x65 || !isDelimiter(after)) {
+      index++;
+      continue;
+    }
+    output += source.slice(cursor, index);
+    let scan = index + 5;
+    let quote = 0;
+    while (scan < length) {
+      const code = source.charCodeAt(scan);
+      if (quote) {
+        if (code === quote) quote = 0;
+      } else if (code === 0x22 || code === 0x27) {
+        quote = code;
+      } else if (code === 0x3e) {
+        break;
+      }
+      scan++;
+    }
+    // Unclosed tag: drop the remainder; nothing after it can be parsed as a
+    // start tag by the heuristic scanner either.
+    cursor = scan < length ? scan + 1 : length;
+    index = cursor;
+  }
+  return output + source.slice(cursor);
+}

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { resolveDocumentBaseUrl } from './documentBase';
+import { resolveDocumentBaseUrl, stripBaseElements } from './documentBase';
 
 const PAGE = 'https://creator.example.com/guide';
 
@@ -75,6 +75,42 @@ test('document base: an SVG <base> cannot override the HTML base', () => {
     PAGE,
     'an SVG-only base is ignored',
   );
+});
+
+test('base stripping: only exact base tags are removed', () => {
+  assert.equal(stripBaseElements('<base href="/community/">'), '');
+  assert.equal(stripBaseElements('<BASE href="/community/">'), '');
+  assert.equal(
+    stripBaseElements('<base-button data-href="/community">members</base-button>'),
+    '<base-button data-href="/community">members</base-button>',
+    'a base-prefixed custom element is untouched',
+  );
+  assert.equal(
+    stripBaseElements('<base href="/community/"><button data-href="/community/">Join</button>'),
+    '<button data-href="/community/">Join</button>',
+    'a real target that shares the base value survives',
+  );
+  assert.equal(
+    stripBaseElements('<base href="/community%2F"><a href="join">join</a>'),
+    '<a href="join">join</a>',
+    'encoded base values cannot leak into extraction',
+  );
+});
+
+test('base stripping: quoted greater-than signs stay inside the tag', () => {
+  assert.equal(
+    stripBaseElements('<base href="a>b"><a href="join">join</a>'),
+    '<a href="join">join</a>',
+  );
+  assert.equal(
+    stripBaseElements(`<base href='a>b'><a href="join">join</a>`),
+    '<a href="join">join</a>',
+  );
+});
+
+test('base stripping: repeated unclosed base tags terminate in one pass', () => {
+  const malformed = '<base '.repeat(20_000);
+  assert.equal(stripBaseElements(malformed), '', 'an unclosed base tag consumes the remainder once');
 });
 
 test('document base: query and hash are preserved, and the hash never changes relative resolution', () => {
