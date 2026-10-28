@@ -159,8 +159,10 @@ No purge, deletion, or queue-setting change is authorized.
 
 ## 6. P2.5 — concurrency/capacity
 
-Not proposed in this workstream. P0.3 shows 68.4% rendered saturation and
-18,319 saturated observations, but changing concurrency/budget requires a
+Not proposed in this workstream. P0.3 shows 18,319
+`RENDERED_FALLBACK_SATURATED` observations, or 56.8% of the 32,232 rendered
+observations; the earlier 7-day creator snapshot measured 1,550 of 2,265
+rendered attempts saturated (68.4%). Changing concurrency/budget requires a
 separate capacity approval, load model, canary, and rollback. It is listed here
 only to keep it out of P2.1–P2.4 scope.
 

@@ -146,8 +146,8 @@ by a separate detection/telemetry rule (4.4).
   assume whether the existing enumeration already includes controls inside
   them. The fixture must assert the actual behavior before adding traversal.
 - If locators do not include a control, use a bounded `TreeWalker` that enters
-  open `shadowRoot` trees (depth-first, max 2,000 elements and 100 roots) and
-  returns the same descriptor shape as the main document.
+  open `shadowRoot` trees (depth-first, max 2,000 elements, 25 roots, and depth
+  2) and returns the same descriptor shape as the main document.
 - Store markers on the control element. Playwright's marker locator must
   resolve through the open root; if it cannot, do not invent an index-based
   fallback that can click the wrong element.
