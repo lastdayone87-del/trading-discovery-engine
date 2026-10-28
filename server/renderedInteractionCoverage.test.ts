@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { combineRenderedControlOffsetAdvances, isCrossHostnameStructuralNavigation, isNavigableOnlyControlWindow, isSameSeedDocument, isUnrecoveredStructuralNavigation, mergeRenderedCoverageGapCounters, planRevealedRenderedClickTargets, partitionRenderedClickTargets, reconcileClickDestinationContext, remainingRenderedClickBudget, renderedClickOffsetAdvance, renderedControlOverflowTargets, renderedRequestControlTotalsDelta, resolveRenderedCompletionState, resolveUnexaminedPopupTargets, runRenderedClickLoop, trackRenderedPopupCoverage, type RenderedControlEnumeration, type RenderedRequestControlTotals } from './browserCommunityFallback';
+import { DEFAULT_BROWSER_FALLBACK_BUDGET, MAX_RENDERED_CROSS_ORIGIN_ENQUEUES, combineRenderedControlOffsetAdvances, isCrossHostnameStructuralNavigation, isNavigableOnlyControlWindow, isSameSeedDocument, isUnrecoveredStructuralNavigation, mergeRenderedCoverageGapCounters, planRevealedRenderedClickTargets, partitionRenderedClickTargets, reconcileClickDestinationContext, remainingRenderedClickBudget, renderedClickOffsetAdvance, renderedControlOverflowTargets, renderedRequestControlTotalsDelta, resolveRenderedCompletionState, resolveUnexaminedPopupTargets, runRenderedClickLoop, shouldEnqueueRenderedCrossOriginLink, trackRenderedPopupCoverage, type RenderedControlEnumeration, type RenderedRequestControlTotals } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -696,6 +696,70 @@ test('a seed retry refreshes its own document identity and required links', () =
   assert.match(source, /const seedRequestKey = normalizeVisitUrl\(seedUrl\)/, 'the seed request is identified once for the crawl');
   assert.match(source, /if \(seedRequestKey && normalizeVisitUrl\(request\.url\) === seedRequestKey\)/, 'the snapshot is refreshed for each seed attempt, not only the first');
   assert.match(source, /for \(const link of discoverRequiredSeedLinks\(await page\.content\(\), page\.url\(\)\)\) known\.add\(link\)/, 'retry-discovered links merge with earlier seed links');
+});
+
+test('cross-origin rendered enqueue stays policy- and budget-bounded', () => {
+  const currentUrl = 'https://creator.example/';
+  assert.equal(MAX_RENDERED_CROSS_ORIGIN_ENQUEUES, 3, 'the crawl-wide cap stays small');
+  assert.equal(DEFAULT_BROWSER_FALLBACK_BUDGET.crossOriginEnqueue, undefined, 'P1.6 is opt-in and default OFF');
+  assert.equal(
+    shouldEnqueueRenderedCrossOriginLink({
+      url: 'https://creator.example/community',
+      currentUrl,
+      anchorText: 'Join the community',
+    }),
+    false,
+    'same-origin links stay on the existing same-host hint pass',
+  );
+  assert.equal(
+    shouldEnqueueRenderedCrossOriginLink({
+      url: 'https://linktr.ee/creator',
+      currentUrl,
+      anchorText: 'Links',
+    }),
+    true,
+    'known link-hub hosts are admitted by the shared destination policy',
+  );
+  assert.equal(
+    shouldEnqueueRenderedCrossOriginLink({
+      url: 'https://community.example/join',
+      currentUrl,
+      anchorText: 'Join the private members community',
+    }),
+    true,
+    'strong community evidence can open an unknown host',
+  );
+  assert.equal(
+    shouldEnqueueRenderedCrossOriginLink({
+      url: 'https://random.example/about',
+      currentUrl,
+      anchorText: 'About',
+    }),
+    false,
+    'weak generic labels never open an unknown host',
+  );
+  assert.equal(
+    shouldEnqueueRenderedCrossOriginLink({
+      url: 'https://discord.gg/Abc123',
+      currentUrl,
+      anchorText: 'Discord',
+    }),
+    false,
+    'Discord destinations are invite candidates, not page-budget targets',
+  );
+  assert.equal(
+    shouldEnqueueRenderedCrossOriginLink({
+      url: 'https://169.254.169.254/latest/meta-data/',
+      currentUrl,
+      anchorText: 'Join the community',
+    }),
+    false,
+    'admission-rejected destinations are never enqueued',
+  );
+  assert.equal(
+    shouldEnqueueRenderedCrossOriginLink({ url: 'not a url', currentUrl, anchorText: 'join' }),
+    false,
+  );
 });
 
 test('required-link snapshot follows the seed document across a same-document query change', () => {
