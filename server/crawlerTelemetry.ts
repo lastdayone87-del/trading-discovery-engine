@@ -178,9 +178,13 @@ export function resolveRenderedCoverageReason(input: RenderedCoverageInput): Ren
     return 'CONTEXT_UNREACHABLE';
   }
   const excluded = input.navigationPolicyExcluded || {};
+  // Only destinations the navigation policy deliberately did not pursue are
+  // coverage exclusions. `invalid-protocol` and `admission-rejected` are
+  // format/security rejections (mailto links, assets, private addresses), not
+  // unexamined navigation, and must not turn every ordinary page into a
+  // policy gap. `unrecoveredNavigation` is a structural destination that was
+  // neither clicked nor enqueued, so it is a real unexamined navigation.
   if (input.unrecoveredNavigation === true
-    || count(excluded['invalid-protocol']) > 0
-    || count(excluded['admission-rejected']) > 0
     || count(excluded['cross-origin-disallowed']) > 0
     || count(excluded['destination-budget']) > 0) {
     return 'POLICY_EXCLUDED';

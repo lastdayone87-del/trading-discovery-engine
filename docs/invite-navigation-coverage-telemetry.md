@@ -1,10 +1,11 @@
-# Invite navigation-coverage telemetry and control recovery (P0.2/P1.1/P1.2)
+# Invite navigation-coverage telemetry and control recovery (P0.2/P1.1/P1.2/P1.7)
 
-**Status:** P0.2 instrumentation plus P1.1/P1.2 control recovery. Recovering
-structural and icon-label controls widens the rendered click set and changes
-which unexamined controls make a page retryable; coverage reasons can move from
-`COMPLETE` to `POLICY_EXCLUDED`/`BOUNDED`. Selection, queue, schema, and P1.7
-outcome mapping are unchanged.
+**Status:** P0.2 instrumentation, P1.1/P1.2 control recovery, and P1.7 outcome
+truthfulness. Recovering structural and icon-label controls widens the rendered
+click set and changes which unexamined controls make a page retryable; coverage
+reasons can move from `COMPLETE` to `POLICY_EXCLUDED`/`BOUNDED`. Selection,
+queue, and schema behavior are unchanged; P1.7 maps a non-`COMPLETE` reason to
+outcome, retry, and cache truthfulness.
 **Scope:** Rendered creator-website acquisition (`mode = RENDERED`).
 **Related evidence:** `INVITE_NAVIGATION_ACQUISITION_RECALL_INVESTIGATION_20261027.md`
 and the 2026-10-27 P0.3 production classification report (read-only Coolify
@@ -51,8 +52,8 @@ then re-checks each candidate against the enqueue rule: a same-origin,
 admissible, not-already-visited destination that the community-hint filter
 would follow is inspected separately and is not a gap. When the enqueue path
 does not follow one, the destination was never examined and coverage is
-`POLICY_EXCLUDED`, not `COMPLETE`. P1.7 still owns the mapping from coverage
-reason to `PARTIALLY_INSPECTED`/retry.
+`POLICY_EXCLUDED`, not `COMPLETE`. P1.7 maps that reason to outcome
+truthfulness and retry ownership (see below).
 
 ## Persisted fields
 
@@ -106,6 +107,10 @@ Existing fields keep their meanings:
    when `structuralUnrecovered` recorded an unfollowed structural navigation.
 5. `COMPLETE` otherwise.
 
+`invalid-protocol` and `admission-rejected` are format/security rejections
+(mailto links, assets, private addresses), not unexamined navigation, so they do
+not make an ordinary page a policy gap.
+
 P1.1/P1.2 changed what counts as bounded. Recovered icon-label and structural
 disclosure controls are clicked, so they no longer trigger `BOUNDED`. A
 non-base-matched structural anchor that resolves to a different document is
@@ -134,9 +139,24 @@ path, so they are recorded as `cross-origin-disallowed` in the rendered policy
 ledger. A stronger reason wins over a weaker one (for example, a timeout is
 `BOUNDED` even when frames are present).
 
-The coverage reason itself remains diagnostic. It does not change `complete`,
-`retryable`, `failureClass`, or the acquisition outcome. P1.7 owns that mapping.
-(Retryability is driven by the interaction-gap certificate, not by the reason.)
+## Outcome truthfulness (P1.7)
+
+A non-`COMPLETE` coverage reason is never a clean absence:
+
+- `resolveRenderedCompletionState` sets `complete=false` and carries the
+  fallback's retry ownership. `BOUNDED` (budget, interaction, scroll) is
+  retryable; `POLICY_EXCLUDED` and `CONTEXT_UNREACHABLE` are visible partials
+  without retry ownership.
+- `renderedAcquisitionOutcome` maps the gap to `PARTIALLY_INSPECTED` (or
+  `FOUND` when an invite was retained) with `RENDERED_POLICY_EXCLUDED`,
+  `RENDERED_CONTEXT_UNREACHABLE`, or `RENDERED_PARTIAL_COVERAGE`.
+- Required-link coverage cannot resolve clean while a coverage gap exists.
+- `isSufficientRenderedCoverage` requires `coverageReason` to be absent or
+  `COMPLETE`, so a gapped run never satisfies the site cache. Legacy rows
+  without the field keep their previous behavior.
+- `FOUND_GAP_RETRYABLE_FAILURE_CLASSES` includes
+  `RENDERED_PARTIAL_COVERAGE`; policy/context classes are intentionally absent,
+  so deterministic gaps stay visible without spending retries.
 
 ## Safety and bounds
 
