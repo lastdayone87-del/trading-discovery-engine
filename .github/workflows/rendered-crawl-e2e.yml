@@ -1,0 +1,45 @@
+name: Rendered crawl E2E baseline
+
+# Baseline harness for E2E-1..E2E-9. This workflow is intentionally triggered
+# by pushes to the e2e/* branch namespace and by changes to the harness so the
+# authoritative Linux Chromium run does not depend on opening a pull request.
+on:
+  push:
+    branches:
+      - 'e2e/**'
+  pull_request:
+    paths:
+      - 'server/renderedCrawlE2E.browser.test.ts'
+      - 'server/browserCommunityFallback.ts'
+      - 'server/testCrawlHelpers.ts'
+      - '.github/workflows/rendered-crawl-e2e.yml'
+  workflow_dispatch:
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Install Chromium and Linux browser dependencies
+        run: npx playwright install --with-deps chromium
+      - name: Verify Chromium is installed
+        run: npx playwright install --list
+      - name: TypeScript validation
+        run: npm run lint
+      - name: Full-crawler real-browser E2E baseline
+        run: |
+          set -o pipefail
+          node --import tsx --test server/renderedCrawlE2E.browser.test.ts 2>&1 | tee rendered-crawl-e2e.log
+      - name: Upload baseline log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rendered-crawl-e2e-log
+          path: rendered-crawl-e2e.log
+          if-no-files-found: warn
