@@ -402,7 +402,15 @@ test('real DOM: recovered structural anchors never replace the page and are coun
   </body></html>`;
   await withControlPage(html, async (page, url) => {
     const enumeration = await enumeratePageControls(page);
-    assert.equal(enumeration.structuralUnrecovered, 2, 'both non-base-matched structural anchors are unrecovered navigation');
+    assert.equal(
+      enumeration.structuralUnrecovered,
+      1,
+      'only the hint-recovered structural anchor is a coverage candidate; the ordinary /resources link is not',
+    );
+    assert.deepEqual(
+      enumeration.structuralUnrecoveredHrefs.map(href => new URL(href).pathname),
+      ['/help'],
+    );
     assert.equal(
       enumeration.controls.some(target => target.href?.endsWith('/help')),
       false,
@@ -411,7 +419,7 @@ test('real DOM: recovered structural anchors never replace the page and are coun
     assert.equal(
       enumeration.controls.some(target => target.href?.endsWith('/resources')),
       false,
-      'a menu-like structural anchor is not clicked',
+      'an ordinary structural navigable anchor is not clicked',
     );
     assert.equal(
       enumeration.controls.some(target => target.href?.endsWith('/community')),
@@ -423,6 +431,34 @@ test('real DOM: recovered structural anchors never replace the page and are coun
     const plan = partitionRenderedClickTargets(enumeration.controls, url, 4, 0);
     assert.deepEqual(plan.toClick.map(target => target.text.trim()), ['Menu'], 'only the in-place disclosure is clicked');
     assert.equal(plan.skippedNavigableAnchors, 1, 'the base-matched anchor is enqueue-owned, not clicked');
+  });
+});
+
+test('real DOM: ordinary resources/support/learn-more links are not structural coverage gaps', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <a href="/resources">Resources</a>
+    <a href="/support">Support</a>
+    <a href="/learn-more">Learn more</a>
+    <a href="/contact">Read more</a>
+  </body></html>`;
+  await withControlPage(html, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(
+      enumeration.structuralUnrecovered,
+      0,
+      'ordinary page links are navigation candidates, not structural disclosure gaps',
+    );
+    assert.deepEqual(enumeration.structuralUnrecoveredHrefs, []);
+    assert.equal(
+      enumeration.controls.some(target => target.href?.endsWith('/contact')),
+      true,
+      'the hint-matched /contact link keeps its existing click-set behavior',
+    );
+    assert.equal(
+      enumeration.controls.some(target => target.href?.endsWith('/resources')),
+      false,
+      'a non-hint ordinary link is not clicked',
+    );
   });
 });
 

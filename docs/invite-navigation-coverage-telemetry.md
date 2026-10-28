@@ -34,11 +34,22 @@ Recovered controls that reveal content in place are **not** a coverage gap:
 they are clicked. A non-base-matched structural anchor that navigates to a real
 document is different: clicking it would replace the document and strand the
 remaining menu controls, so the click set excludes it and the enqueue path owns
-it. `structuralUnrecovered` counts those anchors. When the enqueue path does
-not follow one (for example `/resources` fails the community-hint filter), the
-destination was never examined and coverage is `POLICY_EXCLUDED`, not
-`COMPLETE`. P1.7 still owns the mapping from coverage reason to
-`PARTIALLY_INSPECTED`/retry.
+it. `structuralUnrecovered` counts only the subset that represents a real
+unexamined structural destination:
+
+- the anchor has explicit menu semantics (`role=menu|menubar|menuitem|navigation|tab`,
+  `aria-haspopup`, collapsed `aria-expanded="false"`, `summary`, or `nav`), or
+- the anchor was recovered by a hint-bearing label (P1.2).
+
+An ordinary “Learn more”, “Resources”, or “Support” page link is a navigation
+candidate the hint policy deliberately did not pursue, not a structural
+disclosure; it does not mark the crawl policy-excluded. The request handler
+then re-checks each candidate against the enqueue rule: a same-origin,
+admissible, not-already-visited destination that the community-hint filter
+would follow is inspected separately and is not a gap. When the enqueue path
+does not follow one, the destination was never examined and coverage is
+`POLICY_EXCLUDED`, not `COMPLETE`. P1.7 still owns the mapping from coverage
+reason to `PARTIALLY_INSPECTED`/retry.
 
 ## Persisted fields
 
@@ -52,7 +63,7 @@ none contains a URL, selector, element text, or payload.
 | `controlsStructuralNavigation` | Menu/nav/hamburger/tab/summary/`aria-haspopup`/collapsed-`aria-expanded`/`role=menuitem` controls, including controls inside `<nav>`/`role=navigation|menu|menubar` containers. Classification uses the control's own label/naming text, not its resolved href. |
 | `controlsStructuralHintRejected` | Structural controls the original hint filter would hide. |
 | `controlsStructuralDisclosure` | Structural controls included in the click set because they can reveal content in place (a collapsed disclosure or a menu trigger that does not navigate). An already-open `<details>` summary is excluded: its content is already in the DOM and clicking would close it. |
-| `controlsStructuralUnrecovered` | Non-base-matched structural anchors that navigate to a real document and are outside the click set because the enqueue path owns them. If the enqueue path does not follow one, its destination was not examined; this forces `POLICY_EXCLUDED` (unless a stronger reason applies). |
+| `controlsStructuralUnrecovered` | Structural navigable anchors that are outside the click set and that the enqueue path will not follow: explicit menu-semantic or hint-recovered anchors, same-origin, admissible, not already visited, rejected by the community-hint filter. Ordinary “Learn more”/“Resources”/“Support” page links are not counted. If the enqueue path does not follow one, its destination was not examined; this forces `POLICY_EXCLUDED` (unless a stronger reason applies). |
 | `controlsIconLabelRecovered` | Controls recovered by a label the original filter ignored: `title`, `aria-labelledby`, child `alt`, `data-label`, `data-tooltip`, SVG `<title>`, or capped hidden text. These are included in the click set. |
 | `popupTargets` | Popup/dialog controls that remain unexamined by the click loop and require capture rather than navigation: any non-false `aria-haspopup` value and `target="_blank"` controls without an HTTP(S) href. A `_blank` anchor with a followable HTTP(S) href is reachable by navigation and is not counted; a popup the click loop successfully examined is subtracted. Presence only; no popup capture. |
 | `frameCount` | `iframe`/`frame`/`object`/`embed` elements observed on processed pages (bounded live-collection scan). |
@@ -95,10 +106,13 @@ Existing fields keep their meanings:
 P1.1/P1.2 changed what counts as bounded. Recovered icon-label and structural
 disclosure controls are clicked, so they no longer trigger `BOUNDED`. A
 non-base-matched structural anchor that resolves to a different document is
-owned by the enqueue path, not the click set. If the enqueue path rejects it,
-the destination remains unexamined and the run is `POLICY_EXCLUDED`; it must
-not be reported as clean coverage. Base-matched anchors keep their original
-click behavior.
+owned by the enqueue path, not the click set. If the enqueue path rejects a
+real structural destination, the destination remains unexamined and the run is
+`POLICY_EXCLUDED`; it must not be reported as clean coverage. Base-matched
+anchors keep their original click behavior. Ordinary page links that the
+community-hint policy rejects are not structural gaps: they are the same
+out-of-scope navigation the hint filter has always applied, and counting them
+would mark nearly every crawl policy-excluded.
 
 `hint-rejected` and `control-slice` are measured in
 `navigationPolicyExcluded` but are not policy exclusions for this reason.
@@ -106,8 +120,9 @@ click behavior.
 community surface is not unexamined navigation, and `controlsHintRejected` is a
 separate click-control count, not a substitute for it. `control-slice` already
 forces the interaction gap. The narrower `structuralUnrecovered` signal is
-different: it counts only structural navigation anchors whose destination was
-neither clicked nor enqueued, not every URL the hint filter rejected. A stronger
+different: it counts only explicit or hint-recovered structural navigation
+anchors whose destination was neither clicked nor enqueued, not every URL the
+hint filter rejected. A stronger
 reason wins over a weaker one (for example, a timeout is `BOUNDED` even when
 frames are present).
 
@@ -138,7 +153,12 @@ The reason remains diagnostic. It does not change `complete`, `retryable`,
 - A click that changes the document URL stops the click loop and counts the
   remaining queued controls as skipped. A menu handler or `javascript:` link
   cannot silently replace the page and leave later controls looking examined.
-- `collectRenderedPageContext` uses a bounded `TreeWalker` (2,000 elements,  100 shadow roots) and a bounded frame scan over live `getElementsByTagName`
+  The loop distinguishes a real document replacement from a same-document
+  `pushState`/`replaceState` update by comparing `performance.timeOrigin`;
+  history-only query changes continue to re-enumeration so newly revealed
+  controls are still clicked.
+- `collectRenderedPageContext` uses a bounded `TreeWalker` (2,000 elements,
+  100 shadow roots) and a bounded frame scan over live `getElementsByTagName`
   collections (1,000). It never traverses frames or shadow roots. Context
   counters are refreshed after scrolling and after each click so transient
   interaction-revealed frames/shadows are counted. The baseline identity and
@@ -158,8 +178,7 @@ The reason remains diagnostic. It does not change `complete`, `retryable`,
   not persisted as a separate field, so consumers see the reason rather than
   the cause. Counters are aggregated on the page
   error path so an enumerated page is never published as zero.
-- The published denominator and hint-rejected count come from one coherent
-  enumeration snapshot (largest total; first wins ties). Structural and
+- The published denominator and hint-rejected count come from one coherent  enumeration snapshot (largest total; first wins ties). Structural and
   icon-label counters are merged observations: a later, smaller snapshot can
   contribute a control that a click revealed, so they are combined per count
   rather than constrained to the denominator snapshot. A successfully clicked
