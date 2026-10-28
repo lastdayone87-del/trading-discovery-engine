@@ -473,7 +473,11 @@ function e2e4ScrollCap(): FixtureWorld {
       <script>
         let added = 0;
         const timer = setInterval(() => {
-          if (added >= 7) { clearInterval(timer); return; }
+          // Keep growing for the whole scroll budget. A fixed small number of
+          // blocks can stop before the fifth permitted scroll, making the
+          // document look stable and defeating the fixture; the cap is only a
+          // hygiene bound (the interval dies with the page).
+          if (added >= 300) { clearInterval(timer); return; }
           added++;
           const block = document.createElement('div');
           block.style.height = '1200px';
