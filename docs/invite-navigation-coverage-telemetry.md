@@ -156,7 +156,10 @@ The reason remains diagnostic. It does not change `complete`, `retryable`,
   The loop distinguishes a real document replacement from a same-document
   `pushState`/`replaceState` update by comparing `performance.timeOrigin`;
   history-only query changes continue to re-enumeration so newly revealed
-  controls are still clicked.
+  controls are still clicked. The same identity check governs the post-click
+  required-link re-snapshot: a history-only query change still merges newly
+  revealed same-host community links into the seed's required set, while a
+  replaced document never contributes required obligations to the seed.
 - `collectRenderedPageContext` uses a bounded `TreeWalker` (2,000 elements,
   100 shadow roots) and a bounded frame scan over live `getElementsByTagName`
   collections (1,000). It never traverses frames or shadow roots. Context
