@@ -988,7 +988,12 @@ function renderedCoverageGap(rendered:BrowserFallbackResult):{reason:string;fail
     :reason==='CONTEXT_UNREACHABLE'
       ?'RENDERED_CONTEXT_UNREACHABLE'
       :'RENDERED_PARTIAL_COVERAGE';
-  return{reason,failureClass,retryable:rendered.retryable===true};
+  // Retry ownership comes from the coverage reason, not the fallback's
+  // aggregate retryable flag. A permanent required-child failure sets that
+  // flag even when the remaining gap is deterministic (context/policy), and
+  // refetching cannot clear it. Only a BOUNDED budget/interaction/scroll gap
+  // owns recovery here.
+  return{reason,failureClass,retryable:reason==='BOUNDED'};
 }
 
 export function renderedAcquisitionOutcome(rendered:BrowserFallbackResult,renderedProcessed:boolean,renderedCandidates:DiscordCandidate[],requiredGap?:RenderedRequiredGap):{outcome:ExternalAcquisitionStatus;failureClass?:string;gapRetryable?:boolean}{
