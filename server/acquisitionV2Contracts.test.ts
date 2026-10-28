@@ -690,6 +690,27 @@ test('v2 review: base-button elements keep their dynamic community targets', asy
   );
 });
 
+test('v2 review: a button sharing the base value is not filtered out', async () => {
+  const fetched: string[] = [];
+  await crawlExternalLinks(
+    ['https://base.example.com/guide'],
+    [],
+    undefined,
+    (async (input) => {
+      const url = String(input);
+      fetched.push(url);
+      if (url === 'https://base.example.com/guide') {
+        return html('<base href="/community/"><button data-href="/community/">Join</button>');
+      }
+      return noInviteHtml();
+    }) as typeof fetch,
+  );
+  assert.ok(
+    fetched.includes('https://base.example.com/community/'),
+    'removing the base element must not remove a real target with the same value',
+  );
+});
+
 test('v2 review: base-resolved relative Discord anchor is retained without a navigation fetch', async () => {
   const fetched: string[] = [];
   const result = await crawlExternalLinks(
