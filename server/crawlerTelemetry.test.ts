@@ -165,7 +165,24 @@ test('coverage reason distinguishes complete, bounded, policy, context, and unkn
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, scrollCapReachedStillGrowing: true }), 'BOUNDED');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, frameCount: 1 }), 'CONTEXT_UNREACHABLE');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, shadowRootCount: 1 }), 'CONTEXT_UNREACHABLE');
+  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, closedShadowRootCount: 1 }), 'CONTEXT_UNREACHABLE');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, popupTargets: 1 }), 'CONTEXT_UNREACHABLE');
+  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, opaqueInteractiveControls: 1 }), 'CONTEXT_UNREACHABLE');
+  assert.equal(
+    resolveRenderedCoverageReason({ pagesInspected: 1, requiredUnvisited: 2 }),
+    'BOUNDED',
+    'required-but-unvisited work is a bounded traversal gap even when no queue stat proves it',
+  );
+  assert.equal(
+    resolveRenderedCoverageReason({ pagesInspected: 1, popupDestinationsDropped: 1 }),
+    'BOUNDED',
+    'a captured but unvisited same-origin popup is a bounded gap',
+  );
+  assert.equal(
+    resolveRenderedCoverageReason({ pagesInspected: 1, revealedSameOriginDropped: 1 }),
+    'BOUNDED',
+    'an admitted but unvisited revealed link is a bounded gap',
+  );
   assert.equal(
     resolveRenderedCoverageReason({ pagesInspected: 1, navigationPolicyExcluded: { 'admission-rejected': 3 } }),
     'COMPLETE',
@@ -226,8 +243,14 @@ test('safe telemetry round-trips P0.2 navigation-coverage fields on rendered row
     controlsStructuralUnrecovered: 2,
     controlsIconLabelRecovered: 4,
     popupTargets: 3,
+    popupCaptured: 2,
+    popupDestinationsDropped: 1,
+    revealedSameOriginAdmitted: 2,
+    revealedSameOriginDropped: 1,
+    opaqueInteractiveControls: 2,
     frameCount: 2,
     shadowRootCount: 1,
+    closedShadowRootCount: 1,
     baseHrefPresent: true,
     scrollCapReachedStillGrowing: true,
     navigationPolicyExcluded: { 'admission-rejected': 5, 'hint-rejected': 30 },
@@ -241,8 +264,14 @@ test('safe telemetry round-trips P0.2 navigation-coverage fields on rendered row
   assert.equal(rendered?.controlsStructuralUnrecovered, 2);
   assert.equal(rendered?.controlsIconLabelRecovered, 4);
   assert.equal(rendered?.popupTargets, 3);
+  assert.equal(rendered?.popupCaptured, 2);
+  assert.equal(rendered?.popupDestinationsDropped, 1);
+  assert.equal(rendered?.revealedSameOriginAdmitted, 2);
+  assert.equal(rendered?.revealedSameOriginDropped, 1);
+  assert.equal(rendered?.opaqueInteractiveControls, 2);
   assert.equal(rendered?.frameCount, 2);
   assert.equal(rendered?.shadowRootCount, 1);
+  assert.equal(rendered?.closedShadowRootCount, 1);
   assert.equal(rendered?.baseHrefPresent, true);
   assert.equal(rendered?.scrollCapReachedStillGrowing, true);
   assert.deepEqual(rendered?.navigationPolicyExcluded, { 'admission-rejected': 5, 'hint-rejected': 30 });

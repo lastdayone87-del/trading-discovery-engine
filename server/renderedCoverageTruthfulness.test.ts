@@ -111,6 +111,52 @@ test('completion never certifies a non-COMPLETE coverage reason', () => {
   assert.equal(context.retryable, false);
 });
 
+test('required-unvisited work overrides a successful final response and complete flag', () => {
+  const state = resolveRenderedCompletionState({
+    inspectedPages: 6,
+    timedOut: false,
+    telemetry: telemetry('BOUNDED'),
+    pageBudgetExhausted: false,
+    requiredWorkRemaining: true,
+    coverageReason: 'BOUNDED',
+    coverageRetryable: true,
+  });
+  assert.equal(state.complete, false, 'required work still outstanding is never a clean completion');
+  assert.equal(state.retryable, true);
+
+  const outcome = renderedAcquisitionOutcome(
+    rendered({
+      complete: true,
+      requiredTotal: 2,
+      requiredUnvisited: ['https://creator.example.com/community/7'],
+    }),
+    true,
+    [],
+    { unvisited: ['https://creator.example.com/community/7'], transientFailures: [], permanentFailures: [] },
+  );
+  assert.equal(outcome.outcome, 'PARTIALLY_INSPECTED',
+    'a producer-supplied complete flag must not hide an unvisited required destination');
+  assert.equal(outcome.failureClass, 'REQUIRED_UNVISITED_BUDGET_GAP');
+});
+
+test('a genuinely covered run still resolves as a clean absence', () => {
+  const state = resolveRenderedCompletionState({
+    inspectedPages: 2,
+    timedOut: false,
+    telemetry: telemetry('COMPLETE'),
+    requiredWorkRemaining: false,
+    coverageReason: 'COMPLETE',
+    coverageRetryable: false,
+  });
+  assert.equal(state.complete, true);
+  const outcome = renderedAcquisitionOutcome(
+    rendered({ complete: true, requiredTotal: 2, requiredUnvisited: [] }),
+    true,
+    [],
+  );
+  assert.equal(outcome.outcome, 'INSPECTED_NO_MATCH');
+});
+
 test('policy and context gaps become partial outcomes, never clean absence', () => {
   const policy = renderedAcquisitionOutcome(
     rendered({ telemetry: telemetry('POLICY_EXCLUDED') }),

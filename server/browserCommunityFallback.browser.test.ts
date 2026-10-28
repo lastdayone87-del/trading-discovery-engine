@@ -11,6 +11,7 @@ import {
   collectRenderedCrossOriginCandidates,
   collectRenderedPageContext,
   enumerateRenderedControlNodes,
+  installClosedShadowRootInstrumentation,
   installRenderedRouteCloseCleanup,
   isSkippableNavigableAnchorClick,
   partitionRenderedClickTargets,
@@ -124,6 +125,7 @@ const controlFixtureHtml = (count: number, revealAt: number | null): string => {
 async function withControlPage(
   html: string,
   run: (page: Page, url: string) => Promise<void>,
+  prepare?: (page: Page) => Promise<void>,
 ): Promise<void> {
   const { chromium } = await import('playwright');
   let server: http.Server | undefined;
@@ -142,6 +144,7 @@ async function withControlPage(
     const url = `http://127.0.0.1:${address.port}/`;
     browser = await chromium.launch(browserLaunchOptions());
     const page = await browser.newPage();
+    await prepare?.(page);
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     await run(page, url);
   } finally {
@@ -270,7 +273,26 @@ test('real DOM: enumeration separates hint-rejected, structural, icon-label, and
     const context = await page.evaluate(collectRenderedPageContext);
     assert.equal(context.frameCount, 1, 'iframe presence is recorded for P1.4');
     assert.equal(context.shadowRootCount, 1, 'open shadow roots are recorded for P1.4');
+    assert.equal(context.closedShadowRootCount, 0, 'no closed root exists in this fixture');
     assert.equal(context.baseHrefPresent, true, 'a document <base href> is recorded for P1.5');
+  });
+});
+
+test('real DOM: closed shadow roots are detected but never claimed as inspected', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <h1>Closed root</h1><div id="host"></div>
+    <script>
+      const root = document.getElementById('host').attachShadow({ mode: 'closed' });
+      root.innerHTML = '<a href="https://discord.gg/closed">Discord</a>';
+    </script>
+  </body></html>`;
+  await withControlPage(html, async (page) => {
+    const context = await page.evaluate(collectRenderedPageContext);
+    assert.equal(context.closedShadowRootCount, 1, 'the bounded attachShadow probe records the closed root');
+    assert.equal(context.shadowRootCount, 0, 'a closed root is not counted as open/traversable');
+    assert.equal(await page.locator('a[href]').count(), 0, 'closed-root contents stay unreachable by normal DOM queries');
+  }, async (page) => {
+    await page.addInitScript(installClosedShadowRootInstrumentation);
   });
 });
 
@@ -473,6 +495,21 @@ test('real DOM: an all-hint-matched control set has no hidden structural or popu
     assert.equal(enumeration.structuralUnrecovered, 0);
     assert.equal(enumeration.iconLabelRecovered, 0);
     assert.equal(enumeration.popupTargets, 0);
+    assert.equal(enumeration.opaqueInteractiveControls, 0);
+  });
+});
+
+test('real DOM: an icon-only control with no accessible evidence is counted opaque', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <button type="button" id="icon">
+      <svg width="24" height="24" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/></svg>
+    </button>
+  </body></html>`;
+  await withControlPage(html, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(enumeration.total, 1);
+    assert.equal(enumeration.controls.length, 0, 'an opaque control is not blindly added to the click set');
+    assert.equal(enumeration.opaqueInteractiveControls, 1, 'the unexamined control is recorded for truthful coverage');
   });
 });
 

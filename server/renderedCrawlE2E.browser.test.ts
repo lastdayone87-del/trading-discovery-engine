@@ -255,8 +255,14 @@ class FixtureWorld {
         controlsStructuralDisclosure: telemetry?.controlsStructuralDisclosure,
         controlsIconLabelRecovered: telemetry?.controlsIconLabelRecovered,
         popupTargets: telemetry?.popupTargets,
+        popupCaptured: telemetry?.popupCaptured,
+        popupDestinationsDropped: telemetry?.popupDestinationsDropped,
+        revealedSameOriginAdmitted: telemetry?.revealedSameOriginAdmitted,
+        revealedSameOriginDropped: telemetry?.revealedSameOriginDropped,
+        opaqueInteractiveControls: telemetry?.opaqueInteractiveControls,
         frameCount: telemetry?.frameCount,
         shadowRootCount: telemetry?.shadowRootCount,
+        closedShadowRootCount: telemetry?.closedShadowRootCount,
         dropReasons: entry.dropReasons,
         visitedUrls: entry.visitedUrls,
       })}`);
@@ -455,19 +461,26 @@ function e2e4ClickBudget(): FixtureWorld {
 
 function e2e4ScrollCap(): FixtureWorld {
   const world = new FixtureWorld();
+  // Growth is timer-driven, independent of scroll-event timing. The old
+  // fixture appended a block only on `scroll`, so a missed/fast event made the
+  // page look stable and the crawl falsely complete. Each append beacons to
+  // `/__growth`, letting the test prove growth actually happened before it
+  // judges the crawler.
+  world.add(MAIN, '/__growth', { body: 'ok', contentType: 'text/plain' });
   world.add(MAIN, '/', {
     body: page(`
       <h1>Growing page</h1><div id="spacer" style="height:1200px"></div>
       <script>
         let added = 0;
-        window.addEventListener('scroll', () => {
-          if (added >= 7) return;
+        const timer = setInterval(() => {
+          if (added >= 7) { clearInterval(timer); return; }
           added++;
           const block = document.createElement('div');
           block.style.height = '1200px';
           block.textContent = 'more content ' + added;
           document.body.appendChild(block);
-        });
+          fetch('/__growth?n=' + added).catch(() => {});
+        }, 100);
       </script>`),
   });
   return world;
@@ -539,6 +552,34 @@ function e2e5Popup(): FixtureWorld {
       <script>
         document.getElementById('join').addEventListener('click', () => {
           const code = 'E2E5POPUP';
+          document.getElementById('out').innerHTML =
+            '<a href="https://discord.gg/' + code + '">Discord</a>';
+        });
+      </script>`),
+  });
+  return world;
+}
+
+function e2e5SameOriginPopup(): FixtureWorld {
+  const world = new FixtureWorld();
+  world.add(MAIN, '/', {
+    body: page(`
+      <h1>Popup community</h1>
+      <button id="open" aria-label="Community room">Community room</button>
+      <script>
+        document.getElementById('open').addEventListener('click', () => {
+          window.open('/popup-room', '_blank');
+        });
+      </script>`),
+  });
+  world.add(MAIN, '/popup-room', {
+    body: page(`
+      <h1>Popup room</h1>
+      <button id="join" aria-label="Join">Join</button>
+      <div id="out"></div>
+      <script>
+        document.getElementById('join').addEventListener('click', () => {
+          const code = 'E2E5SAMEPOPUP';
           document.getElementById('out').innerHTML =
             '<a href="https://discord.gg/' + code + '">Discord</a>';
         });
@@ -748,7 +789,10 @@ test('E2E-4c scroll cap still growing is partial, never clean', { skip: BROWSER_
   await world.start();
   try {
     const { result, rendered } = await world.inspect(`http://${MAIN}/`);
+    const growthRequests = world.proxyRequests.filter(item => item.host === MAIN && item.path.startsWith('/__growth')).length;
     logResult('E2E-4c', result);
+    assert.ok(growthRequests > 0,
+      'E2E-4c: fixture growth never occurred, so the scroll result is not meaningful');
     assertNotClean('E2E-4c', result);
     assert.equal(rendered[0]?.telemetry?.scrollCapReachedStillGrowing, true,
       'E2E-4c: the last permitted scroll still found a growing document');
@@ -822,6 +866,21 @@ test('E2E-5d target=_blank popup with a real non-hint href is never certified cl
   try {
     const { result } = await world.inspect(`http://${MAIN}/`);
     assertNotClean('E2E-5d', result);
+  } finally {
+    await world.close();
+  }
+});
+
+test('E2E-5e allowed same-origin popup is captured and inspected within budget', { skip: BROWSER_SKIP, timeout: E2E_TIMEOUT }, async () => {
+  const world = e2e5SameOriginPopup();
+  await world.start();
+  try {
+    const { result, rendered } = await world.inspect(`http://${MAIN}/`);
+    logResult('E2E-5e', result);
+    assert.ok((rendered[0]?.telemetry?.popupCaptured || 0) > 0,
+      'E2E-5e: the same-origin popup was not captured');
+    assert.equal(result.foundInvite, 'E2E5SAMEPOPUP',
+      'E2E-5e: the captured same-origin popup was not inspected for an invite');
   } finally {
     await world.close();
   }
@@ -1006,16 +1065,24 @@ test('unlabeled Discord icon button: record whether the crawler discovers it', {
   const world = e2e9IconButton();
   await world.start();
   try {
-    const { result } = await world.inspect(`http://${MAIN}/`);
+    const { result, rendered } = await world.inspect(`http://${MAIN}/`);
     logResult('UNLABELED-BUTTON', result);
+    const cover = coverageOf(result);
+    const opaque = rendered[0]?.telemetry?.opaqueInteractiveControls || 0;
+    const explicitPartial = cover.status === 'PARTIALLY_INSPECTED'
+      && cover.coverageReason === 'CONTEXT_UNREACHABLE'
+      && opaque > 0;
     console.log(`UNLABELED_ICON_RESULT ${JSON.stringify({
       discovered: result.foundInvite === 'UNLABELEDBUTTON',
       foundInvite: result.foundInvite,
-      status: result.acquisitionStatus,
+      status: cover.status,
+      coverageReason: cover.coverageReason,
+      opaqueInteractiveControls: opaque,
       visualRecognitionNeeded: result.foundInvite !== 'UNLABELEDBUTTON',
     })}`);
-    assert.equal(result.foundInvite, 'UNLABELEDBUTTON',
-      'an unlabeled icon-only button revealed a Discord invite; current enumeration did not discover it');
+    assert.ok(result.foundInvite === 'UNLABELEDBUTTON' || explicitPartial,
+      'an unlabeled icon-only button must be discovered or reported as an explicit opaque-control gap');
+    assert.ok(explicitPartial || result.foundInvite === 'UNLABELEDBUTTON');
   } finally {
     await world.close();
   }

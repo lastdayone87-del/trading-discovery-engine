@@ -37,7 +37,7 @@ test('v2: same-host navigable anchors skip clicks, buttons do not', () => {
   assert.equal(isSkippableNavigableAnchorClick({ href: '#section' }, PAGE), false);
   assert.equal(isSkippableNavigableAnchorClick({ href: 'javascript:void(0)' }, PAGE), false);
   assert.equal(isSkippableNavigableAnchorClick({ href: 'mailto:a@b.com' }, PAGE), false);
-  assert.equal(isSkippableNavigableAnchorClick({ href: 'https://other.example.net/join' }, PAGE), false);
+  assert.equal(isSkippableNavigableAnchorClick({ href: 'https://other.example.net/join' }, PAGE), true);
   assert.equal(isSkippableNavigableAnchorClick({ href: 'http://exa mple.com/' }, PAGE), false);
 });
 

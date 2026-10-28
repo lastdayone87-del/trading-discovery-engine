@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { DEFAULT_BROWSER_FALLBACK_BUDGET, MAX_RENDERED_CROSS_ORIGIN_ENQUEUES, combineRenderedControlOffsetAdvances, isNavigableOnlyControlWindow, isSameSeedDocument, isUnrecoveredStructuralNavigation, planRenderedCrossOriginEnqueues, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, resolveRenderedCompletionState, runRenderedClickLoop, shouldEnqueueRenderedCrossOriginLink, type RenderedControlEnumeration } from './browserCommunityFallback';
+import { DEFAULT_BROWSER_FALLBACK_BUDGET, MAX_RENDERED_CROSS_ORIGIN_ENQUEUES, combineRenderedControlOffsetAdvances, isNavigableOnlyControlWindow, isSameSeedDocument, isUnrecoveredStructuralNavigation, planRenderedCrossOriginEnqueues, planRevealedRenderedClickTargets, planRevealedSameOriginEnqueues, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, resolveRenderedCompletionState, runRenderedClickLoop, shouldEnqueueRenderedCrossOriginLink, type RenderedControlEnumeration } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -64,6 +64,7 @@ const renderedEnumeration = (
   structuralUnrecoveredHrefs: [],
   iconLabelRecovered: 0,
   popupTargets: 0,
+  opaqueInteractiveControls: 0,
 });
 
 test('an evidence-bearing interaction gap keeps a processed run incomplete and retryable', () => {
@@ -425,6 +426,40 @@ test('a final click that navigates does not invent a gap', async () => {
   assert.equal(result.interactionGap, false, 'no original-page control was left unexamined');
 });
 
+test('revealed same-origin planner admits only post-interaction generic links', () => {
+  const currentUrl = 'https://creator.example/';
+  const plan = planRevealedSameOriginEnqueues({
+    candidates: [
+      { url: 'https://creator.example/resources', text: 'Resources' },
+      { url: 'https://creator.example/community', text: 'Community' },
+      { url: 'https://creator.example/about', text: 'About' },
+      { url: 'https://other.example/room', text: 'Room' },
+    ],
+    currentUrl,
+    initialLinks: new Set(['https://creator.example/about']),
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(plan.admitted, ['https://creator.example/resources'],
+    'only a newly revealed, admissible, non-hint same-origin link is admitted');
+  assert.equal(plan.hintHandled, 1, 'hint-bearing links stay owned by the existing same-host pass');
+
+  const capped = planRevealedSameOriginEnqueues({
+    candidates: [
+      { url: 'https://creator.example/resources', text: 'Resources' },
+      { url: 'https://creator.example/support', text: 'Support' },
+      { url: 'https://creator.example/explore', text: 'Explore' },
+    ],
+    currentUrl,
+    initialLinks: new Set(),
+    alreadyVisited: new Set(),
+    queued: new Set(),
+    maxEnqueues: 2,
+  });
+  assert.equal(capped.admitted.length, 2);
+  assert.equal(capped.budget, 1, 'revealed-link overflow is counted, never silently discarded');
+});
+
 test('cross-origin planner carries visible anchor text for generic paths', () => {
   const currentUrl = 'https://creator.example/';
   const admitted = planRenderedCrossOriginEnqueues({
@@ -466,6 +501,15 @@ test('cross-origin planner deduplicates, skips visited, and enforces the cap', (
   assert.equal(plan.alreadyVisited, 1);
   assert.equal(plan.duplicate, 1);
   assert.equal(plan.budget, 2);
+
+  const terminal = planRenderedCrossOriginEnqueues({
+    candidates: [{ url: 'https://discord.gg/Abc123', text: 'Discord' }],
+    currentUrl: 'https://creator.example/',
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.equal(terminal.discordDestinations, 1);
+  assert.equal(terminal.disallowed, 0, 'Discord is a terminal invite candidate, not a policy exclusion');
 });
 
 test('cross-origin rendered enqueue stays policy- and budget-bounded', () => {
@@ -693,7 +737,7 @@ test('outcome classifier source contracts: gap outranks clean resolution and nev
   );
   // Required-link coverage never absorbs the gap into a clean absence.
   assert.match(source, /if \(requiredCovered && !interactionGap && !coverageGap\) return \{outcome:'INSPECTED_NO_MATCH'\};/);
-  assert.match(source, /if\(rendered\.complete&&renderedProcessed&&!interactionGap&&!coverageGap\)return\{outcome:'INSPECTED_NO_MATCH'\};/);
+  assert.match(source, /if\(rendered\.complete&&renderedProcessed&&!interactionGap&&!coverageGap&&!gap\)return\{outcome:'INSPECTED_NO_MATCH'\};/);
   // Partial/acquisition-failed runs keep the gap class visible for retry.
   assert.match(source, /failureClass:timeoutClass\|\|interactionClass\|\|'RENDERED_PARTIAL_COVERAGE'/);
 });

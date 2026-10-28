@@ -128,9 +128,22 @@ export interface RenderedCoverageInput {
   budgetExhausted?: boolean;
   interactionGap?: boolean;
   scrollCapReachedStillGrowing?: boolean;
+  /** Required same-host work still outstanding at stop: unvisited members or
+   * transient-failed members a retry could recover. A required gap is a
+   * bounded-traversal statement even when the page counter did not trip. */
+  requiredUnvisited?: number;
   frameCount?: number;
   shadowRootCount?: number;
+  closedShadowRootCount?: number;
   popupTargets?: number;
+  /** Allowed same-origin popup destinations captured but left unvisited by a
+   * budget stop. A bounded traversal gap, never a clean absence. */
+  popupDestinationsDropped?: number;
+  /** Interaction-revealed same-origin destinations admitted but left
+   * unvisited by the page budget/queue cap. */
+  revealedSameOriginDropped?: number;
+  /** Opaque icon-only controls that could not be inspected safely. */
+  opaqueInteractiveControls?: number;
   navigationPolicyExcluded?: Partial<Record<NavigationPolicyExclusionReason, number>>;
   /**
    * A structural navigation anchor was observed but neither clicked (it would
@@ -152,10 +165,17 @@ export function resolveRenderedCoverageReason(input: RenderedCoverageInput): Ren
     typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
   if (input.budgetExhausted === true
     || input.interactionGap === true
-    || input.scrollCapReachedStillGrowing === true) {
+    || input.scrollCapReachedStillGrowing === true
+    || count(input.requiredUnvisited) > 0
+    || count(input.popupDestinationsDropped) > 0
+    || count(input.revealedSameOriginDropped) > 0) {
     return 'BOUNDED';
   }
-  if (count(input.frameCount) > 0 || count(input.shadowRootCount) > 0 || count(input.popupTargets) > 0) {
+  if (count(input.frameCount) > 0
+    || count(input.shadowRootCount) > 0
+    || count(input.closedShadowRootCount) > 0
+    || count(input.popupTargets) > 0
+    || count(input.opaqueInteractiveControls) > 0) {
     return 'CONTEXT_UNREACHABLE';
   }
   const excluded = input.navigationPolicyExcluded || {};
@@ -384,14 +404,21 @@ export interface CrawlerTelemetry {
   controlsStructuralUnrecovered?: number;
   controlsIconLabelRecovered?: number;
   popupTargets?: number;
+  popupCaptured?: number;
+  popupDestinationsDropped?: number;
+  revealedSameOriginAdmitted?: number;
+  revealedSameOriginDropped?: number;
+  opaqueInteractiveControls?: number;
   /**
    * Context counters observed on processed pages. `frameCount` covers
    * iframe/frame/object/embed elements; `shadowRootCount` covers open shadow
-   * roots; `baseHrefPresent` records a document <base href>. These are
-   * diagnostics for P1.3/P1.4/P1.5, not traversal claims.
+   * roots; `closedShadowRootCount` covers closed roots detected by the bounded
+   * attachShadow probe; `baseHrefPresent` records a document <base href>.
+   * These are diagnostics for P1.3/P1.4/P1.5, not traversal claims.
    */
   frameCount?: number;
   shadowRootCount?: number;
+  closedShadowRootCount?: number;
   baseHrefPresent?: boolean;
   /**
    * True when the last permitted scroll iteration still found a growing
@@ -781,11 +808,29 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
     ...(candidate.mode === 'RENDERED' && number(candidate.popupTargets) > 0
       ? { popupTargets: number(candidate.popupTargets) }
       : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.popupCaptured) > 0
+      ? { popupCaptured: number(candidate.popupCaptured) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.popupDestinationsDropped) > 0
+      ? { popupDestinationsDropped: number(candidate.popupDestinationsDropped) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.revealedSameOriginAdmitted) > 0
+      ? { revealedSameOriginAdmitted: number(candidate.revealedSameOriginAdmitted) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.revealedSameOriginDropped) > 0
+      ? { revealedSameOriginDropped: number(candidate.revealedSameOriginDropped) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.opaqueInteractiveControls) > 0
+      ? { opaqueInteractiveControls: number(candidate.opaqueInteractiveControls) }
+      : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.frameCount) > 0
       ? { frameCount: number(candidate.frameCount) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.shadowRootCount) > 0
       ? { shadowRootCount: number(candidate.shadowRootCount) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.closedShadowRootCount) > 0
+      ? { closedShadowRootCount: number(candidate.closedShadowRootCount) }
       : {}),
     ...(candidate.mode === 'RENDERED' && candidate.baseHrefPresent === true
       ? { baseHrefPresent: true }
