@@ -2,6 +2,11 @@
 
 > **Historical snapshot:** This report predates phases 16–21 and the final 2026-08-01 audit. Findings superseded by later implementation are retained for history; use [Final production-readiness review](./architecture/FINAL_PRODUCTION_READINESS_REVIEW.md) for the current decision.
 
+> **Infrastructure correction (2026-10-27):** Production is hosted on
+> **Coolify**, not Railway. Railway references below are stale assumptions and
+> are not the production access path. See
+> [Production infrastructure](./production-infrastructure.md).
+
 Date: 2026-07-29
 
 ## Phase A-F end-to-end validation
@@ -106,10 +111,10 @@ environment documentation and are now listed below. `APP_URL`, `LOG_LEVEL`, and
 
 **NO-GO for an internet-facing production release.** The application builds and its
 deterministic unit suites pass, but this audit did not have a configured production-like
-PostgreSQL database, Railway project, or YouTube/Gemini credentials. Persistence,
-restart, migration, external-channel, and Railway checks therefore still require a
+PostgreSQL database, Coolify application, or YouTube/Gemini credentials. Persistence,
+restart, migration, external-channel, and Coolify checks therefore still require a
 staging rehearsal. In addition, mutation and quota-consuming API routes have no
-authentication, and Railway backups are not configured by this repository.
+authentication, and Coolify backups are not configured by this repository.
 
 ## Architecture and execution flow
 
@@ -131,7 +136,7 @@ authentication, and Railway backups are not configured by this repository.
 
 - PostgreSQL is mandatory; there is no silent SQL.js runtime fallback.
 - SQL migrations are transactional and now protected by a database advisory lock, so
-  concurrent Railway starts cannot race the same migration.
+  concurrent Coolify starts cannot race the same migration.
 - Queue claims use row locks with `SKIP LOCKED`, retry with exponential backoff, and
   recover stale processing locks. Terminal idempotency keys can now be reused while
   pending/processing jobs remain deduplicated.
@@ -152,12 +157,12 @@ authentication, and Railway backups are not configured by this repository.
 
 1. **No API authentication or authorization.** Public callers can launch searches,
    spend API quota, alter country policy/vocabulary, pause workers, run stress tests,
-   and change query state. Put the service behind Railway/private access or implement
+   and change query state. Put the service behind Coolify/private access or implement
    real operator authentication before exposing it publicly.
 2. **No completed staging proof.** Run migration, queue restart, scheduler restart,
-   and real-channel end-to-end checks against a disposable Railway environment.
+   and real-channel end-to-end checks against a disposable Coolify environment.
 3. **Backups are external-only.** The legacy backup endpoint intentionally errors for
-   PostgreSQL. Enable Railway PostgreSQL backups and prove a restore before release.
+   PostgreSQL. Enable Coolify PostgreSQL backups and prove a restore before release.
 
 #### High-priority debt
 
@@ -177,7 +182,7 @@ authentication, and Railway backups are not configured by this repository.
 - Startup deletes stress-test-prefixed channel records. This is deterministic but a
   startup write side effect and should be removed after test-data policy is finalized.
 - PostgreSQL TLS defaults to `rejectUnauthorized: false` in production. Confirm the
-  exact Railway certificate requirements; use verified TLS where supported.
+  exact Coolify certificate requirements; use verified TLS where supported.
 - Quota reservations are transactional for autonomous, enrichment, and manual work;
   production staging still needs to prove reset, expiry, and allocation behavior.
 - External provider calls need explicit timeouts/cancellation and production metrics.
@@ -219,12 +224,12 @@ existing incompatible legacy operation: it returns an error by design.
 
 | Variable | Requirement |
 | --- | --- |
-| `DATABASE_URL` | Required; Railway PostgreSQL connection string. |
+| `DATABASE_URL` | Required; PostgreSQL connection string (Coolify-managed in production). |
 | `YOUTUBE_API_KEY` (plus indexed keys through the configured `YOUTUBE_API_KEY_POOL_SIZE`) | Required for real discovery/enrichment. |
 | `GEMINI_API_KEY` | Required for Gemini semantic evidence; do not use it as a YouTube key. |
 | `NODE_ENV=production` | Required for production static serving/runtime behavior. |
-| `PORT` | Railway injects it; local default is 3000. |
-| `PGSSL` | Leave unset for Railway unless its connection requires another policy; `disable` is local-only. |
+| `PORT` | Set by the hosting platform; local default is 3000. |
+| `PGSSL` | Leave unset for Coolify unless its connection requires another policy; `disable` is local-only. |
 | `LOG_LEVEL` | Documented, although not yet enforced by a structured logger. |
 | `QUERY_INTELLIGENCE_COOLDOWN_MINUTES` | Optional; default 360. |
 | `QUERY_INTELLIGENCE_PRIMARY_TERM_MAX_USES` | Optional; default 2. |
@@ -245,9 +250,9 @@ existing incompatible legacy operation: it returns an error by design.
 `APP_URL` and legacy `DAILY_YOUTUBE_QUOTA_LIMIT` are currently documented but not consumed by
 the audited server runtime. Remove or wire them in a separate, reviewed change.
 
-## Migration and Railway checklist
+## Migration and Coolify checklist
 
-1. Create a separate Railway staging project and PostgreSQL service.
+1. Create a separate Coolify staging project and PostgreSQL service.
 2. Take checksummed copies of the primary and backup SQL.js files; make them immutable.
 3. Set staging environment variables and run `npm install`, `npm run build`, then
    `npm run migrate`.
@@ -262,8 +267,8 @@ the audited server runtime. Remove or wire them in a separate, reviewed change.
    recovery/retry. Repeat for the scheduler and confirm no overlapping cycle.
 8. Exercise query planning, country inference, exclusion, classification, enrichment,
    persistence, and dashboard APIs using real YouTube channel IDs/URLs.
-9. Redeploy and restart Railway; compare PostgreSQL counts and samples before/after.
-10. Enable Railway backups, perform a restore into a new database, and compare counts.
+9. Redeploy and restart Coolify; compare PostgreSQL counts and samples before/after.
+10. Enable Coolify backups, perform a restore into a new database, and compare counts.
 11. Add access control before assigning a public production domain.
 12. Confirm `/api/health`, logs, restart policy, alerts, and production URL.
 
@@ -287,7 +292,7 @@ the audited server runtime. Remove or wire them in a separate, reviewed change.
 - Static source inspection covered routes, persistence, migrations, queue, scheduler,
   query planner, country inference/exclusion, evidence classification, enrichment,
   deployment configuration, and environment usage.
-- Live PostgreSQL/Railway restart and external YouTube/Gemini validations were **not
+- Live PostgreSQL/Coolify restart and external YouTube/Gemini validations were **not
   performed** because this workspace has no configured staging database/project or
   provider credentials. Migration and queue-smoke commands therefore remain mandatory
   release gates in the staging environment.
