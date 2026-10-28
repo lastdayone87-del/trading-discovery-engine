@@ -68,6 +68,14 @@ export interface BrowserFallbackBudget {
    * and every navigation/subrequest is also checked here. Tests inject a
    * deterministic resolver; production defaults to system DNS. */
   resolveHost?: DnsResolver;
+  /**
+   * Test-only seam for the full-crawler browser fixtures. Production callers
+   * must omit this: the default is the production loopback egress proxy,
+   * which pins public DNS and rejects private destinations. Tests inject a
+   * fixture proxy that serves synthetic public hostnames from a local origin
+   * while the route guard and public-destination resolver above stay active.
+   */
+  egressProxyFactory?: () => Promise<BrowserEgressProxy>;
 }
 
 export interface BrowserFallbackTelemetry {
@@ -2421,7 +2429,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         // proxy that resolves once, rejects mixed/private answers, and pins
         // the selected address. This closes the connection-time rebinding gap
         // that a Playwright route handler cannot close.
-        egressProxy = await startBrowserEgressProxy();
+        egressProxy = await (limits.egressProxyFactory || startBrowserEgressProxy)();
         // Chromium resolves independently of the pinned Node fetch. Check every
         // HTTP(S) navigation/subrequest against the same public-destination
         // policy before it leaves the browser. There is deliberately no
