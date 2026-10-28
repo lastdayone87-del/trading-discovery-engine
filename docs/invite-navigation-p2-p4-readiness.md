@@ -284,7 +284,9 @@ No implementation is proposed now.
 
 - **P0.1 labeled sample:** 200–500 stratified creator sites, manual
   adjudication, disjoint strata, propensity-weighted recall with confidence
-  intervals. Needs approval and a written adjudication protocol. Without it,
+  intervals. The draft protocol is
+  `docs/invite-navigation-labeled-sample-protocol.md`; execution still needs
+  approval of sample size, strata, reviewers, and evidence storage. Without it,
   no universal recall claim is possible.
 - **P0.2 telemetry:** implemented in PR #559; required before measuring P1.1,
   P1.3/P1.4, P1.6, and P1.7.
