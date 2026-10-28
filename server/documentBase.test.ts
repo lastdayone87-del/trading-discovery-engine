@@ -62,6 +62,21 @@ test('document base: first base href wins', () => {
   );
 });
 
+test('document base: an SVG <base> cannot override the HTML base', () => {
+  assert.equal(
+    resolveDocumentBaseUrl(
+      '<html><head><svg><base href="/svg/"></svg><base href="/community/"></head><body></body></html>',
+      PAGE,
+    ),
+    'https://creator.example.com/community/',
+  );
+  assert.equal(
+    resolveDocumentBaseUrl('<html><body><svg><base href="/svg/"></svg><a href="join">join</a></body></html>', PAGE),
+    PAGE,
+    'an SVG-only base is ignored',
+  );
+});
+
 test('document base: query and hash are preserved, and the hash never changes relative resolution', () => {
   const base = resolveDocumentBaseUrl('<base href="/community/?ref=1#top">', PAGE);
   assert.equal(base, 'https://creator.example.com/community/?ref=1#top');
