@@ -111,9 +111,10 @@ is currently zero for every dataset available to this workspace.
 
 ## 5. Historical facts that are missing
 
-If the reported Railway inventory reflects the authoritative production store and no
-later backup contains unreported tables, the missing facts are not merely a
-dataset seal. They are:
+The Railway inventory is not the production store, and the Coolify production
+inventory was not inspected, so production contents remain unknown. Independently
+of which database is consulted, the historical facts required for evaluation are
+not merely a dataset seal. They are:
 
 ### Sampling history
 
@@ -211,10 +212,11 @@ prospective shadow-history process above is the only valid path.
 ## Final determination
 
 No creator-level Admission V2 historical evaluation corpus is available to the
-current workspace, and the live production table inventory provided does not show
-one. Staging and externally managed backups could not be verified because no
-read-only access or restored artifact exists here. On the evidence currently
-available, the POC is **not executable**. Its missing prerequisite is real,
+current workspace. The only table inventory provided came from the separate
+Railway database, not Coolify production; the production inventory was never
+inspected and its contents remain unknown. Staging and externally managed
+backups could not be verified because no read-only access or restored artifact
+exists here. On the evidence currently available, the POC is **not executable**. Its missing prerequisite is real,
 propensity-sampled, human-labeled, diagnostic-linked Creator Intelligence and
 coverage history—not another loader implementation and not a translation of the
 older query-candidate evaluation tables.

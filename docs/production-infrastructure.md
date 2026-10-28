@@ -50,10 +50,18 @@ The verified path is:
 4. Wrap every session in `BEGIN TRANSACTION READ ONLY` and set a statement
    timeout.
 
-The role was verified to be non-superuser, unable to create databases or
-schemas, and to have `transaction_read_only = on`. Credentials are supplied
-outside the repository (environment file or secret manager) and must never be
-committed, printed in logs, or pasted into reports.
+The **session** was verified with `current_setting('transaction_read_only') =
+'on'`. The role is non-superuser, cannot create databases or schemas, owns no
+tables, and has no `DELETE` or `TRUNCATE` grants.
+
+The role is **not** SELECT-only: at verification time it held `INSERT` on 4
+tables and `UPDATE` on 1 table. The read-only guarantee therefore comes from
+the explicit `BEGIN TRANSACTION READ ONLY` wrapper, not from the credential.
+Never run a query outside that wrapper. Revoking the residual DML grants is a
+separate, explicitly approved security change.
+
+Credentials are supplied outside the repository (environment file or secret
+manager) and must never be committed, printed in logs, or pasted into reports.
 
 ## What is not the production access path
 
