@@ -669,6 +669,27 @@ test('v2 review: static crawl resolves dynamic targets against the document base
   );
 });
 
+test('v2 review: base-button elements keep their dynamic community targets', async () => {
+  const fetched: string[] = [];
+  await crawlExternalLinks(
+    ['https://base.example.com/guide'],
+    [],
+    undefined,
+    (async (input) => {
+      const url = String(input);
+      fetched.push(url);
+      if (url === 'https://base.example.com/guide') {
+        return html('<base href="community/"><base-button data-href="members">members area</base-button>');
+      }
+      return noInviteHtml();
+    }) as typeof fetch,
+  );
+  assert.ok(
+    fetched.includes('https://base.example.com/community/members'),
+    'a base-prefixed custom element is not mistaken for a base tag',
+  );
+});
+
 test('v2 review: base-resolved relative Discord anchor is retained without a navigation fetch', async () => {
   const fetched: string[] = [];
   const result = await crawlExternalLinks(
