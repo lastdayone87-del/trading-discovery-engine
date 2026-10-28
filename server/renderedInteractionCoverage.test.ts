@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { DEFAULT_BROWSER_FALLBACK_BUDGET, MAX_RENDERED_CROSS_ORIGIN_ENQUEUES, combineRenderedControlOffsetAdvances, isCrossHostnameStructuralNavigation, isNavigableOnlyControlWindow, isSameSeedDocument, isUnrecoveredStructuralNavigation, mergeRenderedCoverageGapCounters, planRevealedRenderedClickTargets, partitionRenderedClickTargets, reconcileClickDestinationContext, remainingRenderedClickBudget, renderedClickOffsetAdvance, renderedControlOverflowTargets, renderedRequestControlTotalsDelta, resolveRenderedCompletionState, resolveUnexaminedPopupTargets, runRenderedClickLoop, shouldEnqueueRenderedCrossOriginLink, trackRenderedPopupCoverage, type RenderedControlEnumeration, type RenderedRequestControlTotals } from './browserCommunityFallback';
+import { DEFAULT_BROWSER_FALLBACK_BUDGET, MAX_RENDERED_CROSS_ORIGIN_ENQUEUES, combineRenderedControlOffsetAdvances, isCrossHostnameStructuralNavigation, isNavigableOnlyControlWindow, isSameSeedDocument, isUnrecoveredStructuralNavigation, mergeRenderedCoverageGapCounters, planRevealedRenderedClickTargets, planRenderedCrossOriginEnqueues, partitionRenderedClickTargets, reconcileClickDestinationContext, remainingRenderedClickBudget, renderedClickOffsetAdvance, renderedControlOverflowTargets, renderedRequestControlTotalsDelta, resolveRenderedCompletionState, resolveUnexaminedPopupTargets, runRenderedClickLoop, shouldEnqueueRenderedCrossOriginLink, trackRenderedPopupCoverage, type RenderedControlEnumeration, type RenderedRequestControlTotals } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -696,6 +696,49 @@ test('a seed retry refreshes its own document identity and required links', () =
   assert.match(source, /const seedRequestKey = normalizeVisitUrl\(seedUrl\)/, 'the seed request is identified once for the crawl');
   assert.match(source, /if \(seedRequestKey && normalizeVisitUrl\(request\.url\) === seedRequestKey\)/, 'the snapshot is refreshed for each seed attempt, not only the first');
   assert.match(source, /for \(const link of discoverRequiredSeedLinks\(await page\.content\(\), page\.url\(\)\)\) known\.add\(link\)/, 'retry-discovered links merge with earlier seed links');
+});
+
+test('cross-origin planner carries visible anchor text for generic paths', () => {
+  const currentUrl = 'https://creator.example/';
+  const admitted = planRenderedCrossOriginEnqueues({
+    candidates: [{ url: 'https://community.example/go', text: 'Join the private members community' }],
+    currentUrl,
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(admitted.admitted, ['https://community.example/go']);
+  assert.equal(admitted.disallowed, 0);
+
+  const noLabel = planRenderedCrossOriginEnqueues({
+    candidates: [{ url: 'https://community.example/go', text: '' }],
+    currentUrl,
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(noLabel.admitted, [], 'a generic path with no visible label is not admitted');
+  assert.equal(noLabel.disallowed, 1);
+});
+
+test('cross-origin planner deduplicates, skips visited, and enforces the cap', () => {
+  const currentUrl = 'https://creator.example/';
+  const plan = planRenderedCrossOriginEnqueues({
+    candidates: [
+      { url: 'https://linktr.ee/creator', text: 'Links' },
+      { url: 'https://linktr.ee/creator', text: 'Links again' },
+      { url: 'https://seen.example/join', text: 'Join the community' },
+      { url: 'https://linktr.ee/other', text: 'Links' },
+      { url: 'https://linktr.ee/third', text: 'Links' },
+      { url: 'https://linktr.ee/fourth', text: 'Links' },
+    ],
+    currentUrl,
+    alreadyVisited: new Set(['https://seen.example/join']),
+    queued: new Set(),
+    maxEnqueues: 2,
+  });
+  assert.deepEqual(plan.admitted, ['https://linktr.ee/creator', 'https://linktr.ee/other']);
+  assert.equal(plan.alreadyVisited, 1);
+  assert.equal(plan.duplicate, 1);
+  assert.equal(plan.budget, 2);
 });
 
 test('cross-origin rendered enqueue stays policy- and budget-bounded', () => {

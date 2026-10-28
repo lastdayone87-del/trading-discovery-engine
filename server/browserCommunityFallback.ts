@@ -1474,6 +1474,79 @@ export function shouldEnqueueRenderedCrossOriginLink(input: {
  * unexamined navigation. Only a same-origin, admissible, not-yet-visited
  * destination that the hint policy rejects is both un-clicked and un-enqueued.
  */
+export interface RenderedCrossOriginCandidate {
+  url: string;
+  text: string;
+}
+
+export interface RenderedCrossOriginEnqueuePlan {
+  admitted: string[];
+  alreadyVisited: number;
+  duplicate: number;
+  budget: number;
+  disallowed: number;
+}
+
+/**
+ * P1.6 planner: pair each discovered URL with its visible anchor text before
+ * the destination policy runs. Crawlee's enqueueLinks only carries hrefs, so
+ * a transformRequestFunction cannot see the label that the policy needs for
+ * generic-path community links. Bounded input, one pass, no mutation of the
+ * caller's visited/queued sets. The caller publishes the counts through the
+ * existing closed drop reasons.
+ */
+export function planRenderedCrossOriginEnqueues(input: {
+  candidates: readonly RenderedCrossOriginCandidate[];
+  currentUrl: string;
+  alreadyVisited: ReadonlySet<string>;
+  queued: ReadonlySet<string>;
+  maxEnqueues?: number;
+}): RenderedCrossOriginEnqueuePlan {
+  const remaining = Math.max(0, Math.min(
+    input.maxEnqueues === undefined ? MAX_RENDERED_CROSS_ORIGIN_ENQUEUES : input.maxEnqueues,
+    MAX_RENDERED_CROSS_ORIGIN_ENQUEUES,
+  ));
+  const plan: RenderedCrossOriginEnqueuePlan = {
+    admitted: [],
+    alreadyVisited: 0,
+    duplicate: 0,
+    budget: 0,
+    disallowed: 0,
+  };
+  const planned = new Set<string>();
+  for (const candidate of input.candidates) {
+    const url = String(candidate.url || '').trim();
+    if (!url) {
+      plan.disallowed++;
+      continue;
+    }
+    const visitKey = normalizeVisitUrl(url) || url;
+    if (input.alreadyVisited.has(visitKey)) {
+      plan.alreadyVisited++;
+      continue;
+    }
+    if (input.queued.has(visitKey) || planned.has(visitKey)) {
+      plan.duplicate++;
+      continue;
+    }
+    if (plan.admitted.length >= remaining) {
+      plan.budget++;
+      continue;
+    }
+    if (!shouldEnqueueRenderedCrossOriginLink({
+      url,
+      currentUrl: input.currentUrl,
+      anchorText: String(candidate.text || ''),
+    })) {
+      plan.disallowed++;
+      continue;
+    }
+    planned.add(visitKey);
+    plan.admitted.push(url);
+  }
+  return plan;
+}
+
 export function isUnrecoveredStructuralNavigation(
   href: string,
   pageUrl: string,
@@ -3468,27 +3541,43 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // (JS-revealed links), so both DOM states contribute; queue
             // dedupe makes repeats free. Hint-rejected double counts across
             // the two passes are bounded diagnostic noise (≤1 extra pass).
-            const admitCrossOriginRequest = (url: string, label: string): boolean => {
-              if (!limits.crossOriginEnqueue) return false;
-              const visitKey = normalizeVisitUrl(url) || url;
-              if (alreadyVisitedSet.has(visitKey) || crossOriginQueued.has(visitKey)) return false;
-              if (crossOriginQueued.size >= MAX_RENDERED_CROSS_ORIGIN_ENQUEUES) {
-                drops.count('destination-budget');
-                return false;
-              }
-              if (!shouldEnqueueRenderedCrossOriginLink({ url, currentUrl: page.url(), anchorText: label })) {
-                drops.count('cross-origin-disallowed');
-                return false;
-              }
-              crossOriginQueued.add(visitKey);
-              return true;
-            };
             const enqueueCrossOrigin = async (): Promise<void> => {
               if (!limits.crossOriginEnqueue || Date.now() - startedAt >= limits.totalTimeoutMs) return;
-              await enqueueLinks({
-                strategy: 'all',
-                transformRequestFunction: req => (admitCrossOriginRequest(req.url, req.label || '') ? req : false),
+              let candidates: RenderedCrossOriginCandidate[] = [];
+              try {
+                // Crawlee's enqueueLinks exposes only hrefs to its transform
+                // hook. Collect the visible label alongside each href so the
+                // destination policy can admit a strong label on a generic
+                // path. Bounded before any policy work.
+                candidates = await page.$$eval('a[href]', (nodes) => nodes
+                  .slice(0, 500)
+                  .map(node => ({
+                    url: (node as HTMLAnchorElement).href || '',
+                    text: (node.textContent || '').trim().slice(0, 200),
+                  }))
+                  .filter(candidate => !!candidate.url));
+              } catch {
+                // A control may have replaced or detached the document
+                // between the click loop and this pass. Enqueueing nothing is
+                // safe; the post-click same-host pass has already run.
+                return;
+              }
+              const plan = planRenderedCrossOriginEnqueues({
+                candidates,
+                currentUrl: page.url(),
+                alreadyVisited: alreadyVisitedSet,
+                queued: crossOriginQueued,
+                maxEnqueues: MAX_RENDERED_CROSS_ORIGIN_ENQUEUES - crossOriginQueued.size,
               });
+              if (plan.alreadyVisited) drops.count('already-visited', plan.alreadyVisited);
+              if (plan.budget) drops.count('destination-budget', plan.budget);
+              if (plan.disallowed) drops.count('cross-origin-disallowed', plan.disallowed);
+              if (!plan.admitted.length) return;
+              for (const url of plan.admitted) {
+                const visitKey = normalizeVisitUrl(url) || url;
+                crossOriginQueued.add(visitKey);
+              }
+              await enqueueLinks({ urls: plan.admitted, strategy: 'all' });
             };
             if (Date.now() - startedAt < limits.totalTimeoutMs) {
               await enqueueLinks({ strategy: 'same-hostname', transformRequestFunction: req => (admitEnqueueRequest(req.url) ? req : false) });
