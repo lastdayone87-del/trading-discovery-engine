@@ -226,6 +226,12 @@ const DETERMINISTICALLY_PERMANENT_FAILURE_CLASSES = new Set([
   // Conclusive permanent block established over bounded identical retries
   // (see permanentBlockDetection.ts): terminal, never owns retry.
   'PERMANENT_ACCESS_BLOCK',
+  // The crawler's redirect budget is fixed (CRAWLER_MAX_REDIRECT_HOPS) and the
+  // same URL deterministically exhausts it, so an identical refetch cannot
+  // complete. Backlog observations persisted with retryable:true before this
+  // became non-retryable must also stop owning retry. The hop cap and per-hop
+  // SSRF checks are unchanged; only retry spend is removed.
+  'REDIRECT_LIMIT',
 ]);
 
 /**
