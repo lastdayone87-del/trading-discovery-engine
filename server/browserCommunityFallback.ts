@@ -1051,6 +1051,44 @@ export interface RenderedCrossOriginEnqueuePlan {
 }
 
 /**
+ * Browser-context collection for the P1.6 cross-origin pass. Self-contained:
+ * Playwright serializes this function into the page. Same-origin and
+ * non-HTTP(S) anchors are discarded before the candidate bound, so a page full
+ * of internal navigation cannot crowd out a later cross-origin community link.
+ * Visible text is carried because Crawlee's enqueueLinks exposes only hrefs.
+ */
+export function collectRenderedCrossOriginCandidates(
+  nodes: Element[],
+  currentUrl: string,
+  limit = 500,
+): RenderedCrossOriginCandidate[] {
+  const candidates: RenderedCrossOriginCandidate[] = [];
+  let currentOrigin = '';
+  try {
+    currentOrigin = new URL(currentUrl).origin;
+  } catch {
+    return candidates;
+  }
+  for (const node of nodes) {
+    if (candidates.length >= limit) break;
+    const anchor = node as HTMLAnchorElement;
+    let target: URL;
+    try {
+      target = new URL(anchor.href || '');
+    } catch {
+      continue;
+    }
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') continue;
+    if (target.origin === currentOrigin) continue;
+    candidates.push({
+      url: target.toString(),
+      text: (anchor.textContent || '').trim().slice(0, 200),
+    });
+  }
+  return candidates;
+}
+
+/**
  * P1.6 planner: pair each discovered URL with its visible anchor text before
  * the destination policy runs. Crawlee's enqueueLinks only carries hrefs, so
  * a transformRequestFunction cannot see the label that the policy needs for
@@ -2673,16 +2711,14 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               let candidates: RenderedCrossOriginCandidate[] = [];
               try {
                 // Crawlee's enqueueLinks exposes only hrefs to its transform
-                // hook. Collect the visible label alongside each href so the
-                // destination policy can admit a strong label on a generic
-                // path. Bounded before any policy work.
-                candidates = await page.$$eval('a[href]', (nodes) => nodes
-                  .slice(0, 500)
-                  .map(node => ({
-                    url: (node as HTMLAnchorElement).href || '',
-                    text: (node.textContent || '').trim().slice(0, 200),
-                  }))
-                  .filter(candidate => !!candidate.url));
+                // hook. Collect bounded href+visible-text pairs, filtering
+                // same-origin/non-HTTP(S) anchors before the bound so internal
+                // navigation cannot hide a cross-origin community link.
+                candidates = await page.$$eval(
+                  'a[href]',
+                  collectRenderedCrossOriginCandidates,
+                  page.url(),
+                );
               } catch {
                 // A control may have replaced or detached the document
                 // between the click loop and this pass. Enqueueing nothing is
