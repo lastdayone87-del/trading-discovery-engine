@@ -374,6 +374,57 @@ test('executing click loop fails closed when post-click re-enumeration throws', 
   assert.equal(result.interactionGap, true, 'unknown disclosures must make coverage incomplete');
 });
 
+test('a click that replaces the document stops the loop and counts remaining controls as skipped', async () => {
+  const targets = [0, 1, 2].map(index => renderedButton(index, `oc-nav-${index}`));
+  let url = 'https://creator.example/start';
+  let enumerations = 0;
+  const result = await runRenderedClickLoop({
+    targets,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    click: async () => { url = 'https://creator.example/replaced'; return true; },
+    enumerate: async () => { enumerations++; return renderedEnumeration(targets); },
+    pageUrl: () => url,
+  });
+  assert.equal(result.evidenceControlsClicked, 1);
+  assert.equal(result.evidenceControlsSkipped, 2, 'old-document controls are unexamined after navigation');
+  assert.equal(result.interactionGap, true, 'navigation away leaves the interaction plan incomplete');
+  assert.equal(enumerations, 0, 'the replaced document is not re-enumerated as the original page');
+});
+
+test('a hash-only change is an in-place disclosure, not document navigation', async () => {
+  const targets = [renderedButton(0, 'oc-hash')];
+  let url = 'https://creator.example/start';
+  let enumerations = 0;
+  const result = await runRenderedClickLoop({
+    targets,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    click: async () => { url = 'https://creator.example/start#menu'; return true; },
+    enumerate: async () => { enumerations++; return renderedEnumeration(targets); },
+    pageUrl: () => url,
+  });
+  assert.equal(result.evidenceControlsSkipped, 0);
+  assert.equal(result.interactionGap, false);
+  assert.equal(enumerations, 1, 'hash-only changes still re-enumerate the same document');
+});
+
+test('a final click that navigates does not invent a gap', async () => {
+  const targets = [renderedButton(0, 'oc-final-nav')];
+  let url = 'https://creator.example/start';
+  const result = await runRenderedClickLoop({
+    targets,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    click: async () => { url = 'https://discord.gg/example'; return true; },
+    enumerate: async () => renderedEnumeration(targets),
+    pageUrl: () => url,
+  });
+  assert.equal(result.evidenceControlsClicked, 1);
+  assert.equal(result.evidenceControlsSkipped, 0);
+  assert.equal(result.interactionGap, false, 'no original-page control was left unexamined');
+});
+
 test('revealed-control planning rotates with the durable retry offset', () => {
   const controls = [
     renderedButton(0, 'oc-a'),

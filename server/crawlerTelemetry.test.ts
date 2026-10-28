@@ -246,6 +246,11 @@ test('coverage reason distinguishes complete, bounded, policy, context, and unkn
     'COMPLETE',
     'hint-rejected is measured separately and is not a policy exclusion by itself',
   );
+  assert.equal(
+    resolveRenderedCoverageReason({ pagesInspected: 1, unrecoveredNavigation: true }),
+    'POLICY_EXCLUDED',
+    'an observed but unfollowed structural navigation is not complete coverage',
+  );
   // Stronger evidence wins: a named ceiling is BOUNDED even when context and
   // policy exclusions are also present.
   assert.equal(

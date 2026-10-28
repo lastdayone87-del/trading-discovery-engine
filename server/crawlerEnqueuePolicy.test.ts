@@ -76,7 +76,7 @@ test('rendered hint vocabulary covers community and paid-platform destinations',
   assert.ok(!COMMUNITY_HINTS.test('https://example.com/blog/market-recap'));
   assert.ok(!COMMUNITY_HINTS.test('https://example.com/pricing'));
   // Interactive control enumeration/click selector is a single shared query.
-  assert.equal(RENDERED_CONTROL_SELECTOR, 'a,button,[role="button"],[role="tab"],summary,[aria-expanded="false"]');
+  assert.equal(RENDERED_CONTROL_SELECTOR, 'a,button,[role="button"],[role="tab"],[role="menuitem"],summary,[aria-expanded="false"],[aria-haspopup]');
 });
 
 test('drop counter tallies taxonomy reasons only', () => {
