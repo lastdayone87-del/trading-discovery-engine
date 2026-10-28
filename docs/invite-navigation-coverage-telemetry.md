@@ -140,8 +140,13 @@ A non-`COMPLETE` coverage reason is never a clean absence:
   `COMPLETE`, so a gapped run never satisfies the site cache. Legacy rows
   without the field keep their previous behavior.
 - `FOUND_GAP_RETRYABLE_FAILURE_CLASSES` includes
-  `RENDERED_PARTIAL_COVERAGE`; policy/context classes are intentionally absent,
-  so deterministic gaps stay visible without spending retries.
+  `RENDERED_PARTIAL_COVERAGE` and `RENDERED_BUDGET_EXPIRED`; policy/context
+  classes are intentionally absent, so deterministic gaps stay visible without
+  spending retries.
+- Retry ownership for a coverage gap is derived from the coverage reason, not
+  the fallback's aggregate `retryable` flag. A permanently blocked required
+  child can set that flag without making a deterministic context or policy gap
+  recoverable; only `BOUNDED` owns retry.
 
 ## Safety and bounds
 

@@ -10,6 +10,7 @@ import {
   type RenderedCoverageReason,
 } from './crawlerTelemetry';
 import { renderedAcquisitionOutcome } from './inspector';
+import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 
 const telemetry = (coverageReason?: RenderedCoverageReason): BrowserFallbackTelemetry => ({
@@ -169,6 +170,48 @@ test('a retained invite keeps its coverage gap visible', () => {
   assert.equal(result.outcome, 'FOUND');
   assert.equal(result.failureClass, 'RENDERED_POLICY_EXCLUDED');
   assert.equal(result.gapRetryable, false);
+});
+
+test('a retained invite with a bounded budget gap uses an accepted retry class', () => {
+  const candidates = [{ nativeInviteCode: 'abc', sourceUrl: 'https://creator.example.com/' }] as never;
+  const result = renderedAcquisitionOutcome(
+    rendered({
+      foundInvite: 'abc',
+      foundLocation: 'https://creator.example.com/',
+      candidates,
+      complete: false,
+      retryable: true,
+      timedOut: true,
+      dropReasons: { 'page-budget': 1 },
+      telemetry: telemetry('BOUNDED'),
+    }),
+    true,
+    candidates,
+  );
+  assert.equal(result.outcome, 'FOUND');
+  assert.equal(result.failureClass, 'RENDERED_BUDGET_EXPIRED');
+  assert.equal(result.gapRetryable, true);
+  assert.ok(
+    FOUND_GAP_RETRYABLE_FAILURE_CLASSES.has(String(result.failureClass)),
+    'the FOUND gap class must be accepted by the shared retry policy',
+  );
+});
+
+test('a permanent child failure does not make a deterministic context gap retryable', () => {
+  const result = renderedAcquisitionOutcome(
+    rendered({
+      complete: false,
+      // unresolvedFailedRequests makes the fallback retryable even though the
+      // context gap itself is deterministic.
+      retryable: true,
+      telemetry: { ...telemetry('CONTEXT_UNREACHABLE'), unresolvedFailedRequests: 1 },
+    }),
+    true,
+    [],
+  );
+  assert.equal(result.outcome, 'PARTIALLY_INSPECTED');
+  assert.equal(result.failureClass, 'RENDERED_CONTEXT_UNREACHABLE');
+  assert.equal(result.gapRetryable, false, 'context traversal limits cannot be cleared by refetching');
 });
 
 test('legacy complete results without coverageReason stay clean', () => {
