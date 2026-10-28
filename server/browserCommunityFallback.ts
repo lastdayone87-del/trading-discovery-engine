@@ -942,6 +942,27 @@ export function isSkippableNavigableAnchorClick(
 }
 
 /**
+ * Whether the current page is still the seed document whose required links
+ * were snapshotted. A same-document history/query update keeps the document
+ * and any links revealed after the update, while a real navigation commits a
+ * new document whose links are enqueue-owned and must not become required
+ * obligations of the seed. Document identity wins when both reads succeed;
+ * normalized URL comparison is the fail-closed fallback.
+ */
+export function isSameSeedDocument(
+  seedIdentity: unknown,
+  currentIdentity: unknown,
+  seedUrl: string,
+  currentUrl: string,
+): boolean {
+  if (seedIdentity !== null && seedIdentity !== undefined
+    && currentIdentity !== null && currentIdentity !== undefined) {
+    return seedIdentity === currentIdentity;
+  }
+  return normalizeVisitUrl(currentUrl) === normalizeVisitUrl(seedUrl);
+}
+
+/**
  * Whether an excluded structural anchor is a real navigation-coverage gap.
  *
  * A structural anchor that navigates away is never clicked. It is not a gap
@@ -2064,6 +2085,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   // seen/clicked/failed/skipped across processed pages, and whether the seed
   // required set grew after scroll/click interactions.
   let seedSnapshotUrl = '';
+  let seedSnapshotIdentity: unknown = null;
   let requiredSnapshotExpanded = false;
   let evidenceControlsSeen = 0;
   let evidenceControlsClicked = 0;
@@ -2363,6 +2385,11 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             if (!seedDocumentSeen) {
               seedDocumentSeen = true;
               seedSnapshotUrl = page.url();
+              // Capture document identity alongside the URL. A menu can
+              // update the query in place (pushState); the URL then differs
+              // even though the seed document, and links revealed after the
+              // update, still belong to the same required set.
+              seedSnapshotIdentity = await page.evaluate(() => performance.timeOrigin).catch(() => null);
               try {
                 seedRequiredLinks = discoverRequiredSeedLinks(await page.content(), page.url());
               } catch {
@@ -2592,7 +2619,13 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             if (seedDocumentSeen) {
               try {
                 const currentUrl = page.url();
-                const sameDocument = normalizeVisitUrl(currentUrl) === normalizeVisitUrl(seedSnapshotUrl);
+                const currentIdentity = await page.evaluate(() => performance.timeOrigin).catch(() => null);
+                const sameDocument = isSameSeedDocument(
+                  seedSnapshotIdentity,
+                  currentIdentity,
+                  seedSnapshotUrl,
+                  currentUrl,
+                );
                 if (sameDocument) {
                   const known = new Set(seedRequiredLinks);
                   let added = 0;

@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { combineRenderedControlOffsetAdvances, isNavigableOnlyControlWindow, isUnrecoveredStructuralNavigation, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, resolveRenderedCompletionState, runRenderedClickLoop, type RenderedControlEnumeration } from './browserCommunityFallback';
+import { combineRenderedControlOffsetAdvances, isNavigableOnlyControlWindow, isSameSeedDocument, isUnrecoveredStructuralNavigation, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, resolveRenderedCompletionState, runRenderedClickLoop, type RenderedControlEnumeration } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -423,6 +423,48 @@ test('a final click that navigates does not invent a gap', async () => {
   assert.equal(result.evidenceControlsClicked, 1);
   assert.equal(result.evidenceControlsSkipped, 0);
   assert.equal(result.interactionGap, false, 'no original-page control was left unexamined');
+});
+
+test('required-link snapshot follows the seed document across a same-document query change', () => {
+  assert.equal(
+    isSameSeedDocument(
+      'document-1',
+      'document-1',
+      'https://creator.example/start',
+      'https://creator.example/start?menu=open',
+    ),
+    true,
+    'a history-only query change keeps the seed document and its newly revealed required links',
+  );
+  assert.equal(
+    isSameSeedDocument(
+      'document-1',
+      'document-2',
+      'https://creator.example/start',
+      'https://creator.example/start',
+    ),
+    false,
+    'a replaced document never contributes required obligations to the seed',
+  );
+  assert.equal(
+    isSameSeedDocument(
+      null,
+      null,
+      'https://creator.example/start',
+      'https://creator.example/start?menu=open',
+    ),
+    false,
+    'identity read failure falls back to the fail-closed URL comparison',
+  );
+  assert.equal(
+    isSameSeedDocument(
+      null,
+      null,
+      'https://creator.example/start',
+      'https://creator.example/start',
+    ),
+    true,
+  );
 });
 
 test('structural navigation is a coverage gap only when enqueue will not follow it', () => {
