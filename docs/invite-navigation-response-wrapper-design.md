@@ -15,7 +15,8 @@ invite are currently rejected or misdecoded:
 - pages whose declared charset is not UTF-8;
 - plain-text and markdown wrappers.
 
-P0.3 measured the opportunity (trailing 7 days, URL observations):
+P0.3 measured the opportunity (trailing 7 days, URL observations; report in
+`docs/evidence/p0_3_acquisition_classification_20261027.md`):
 `UNSUPPORTED_CONTENT_TYPE` 5,830 (4.8%); RSS 663, JavaScript 531, XML 356 +
 304, XHTML 5, markdown 135, plus image/PDF/font classes that are correctly
 rejected assets. HTTP 404 (34,833) dominates status failures; 403 (14,011) and

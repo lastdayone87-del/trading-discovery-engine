@@ -2,8 +2,9 @@
 
 **Status:** preparation only. No P2/P3/P4 behavior, setting, flag, queue,
 schema, concurrency, or production change is implemented or authorized.
-**Evidence base:** `P0_3_ACQUISITION_CLASSIFICATION_20261027.md` (Coolify
-production, trailing 7 days) and the navigation investigation plan
+**Evidence base:** `docs/evidence/p0_3_acquisition_classification_20261027.md`
+(Coolify production, trailing 7 days; reproducible SQL and raw output in the
+same directory) and the navigation investigation plan
 (`INVITE_NAVIGATION_ACQUISITION_RECALL_INVESTIGATION_20261027.md`).
 
 ## 1. Status summary
@@ -229,9 +230,16 @@ No implementation is proposed now.
 2. **Total candidate visibility:** expose `candidate_count` in the row or
    details with an explicit definition (persisted discoveries, including
    unvalidated/rejected).
-3. **Uncertain/non-serving filter:** add a filter for non-validated candidates
-   (for example `UNCERTAIN`, `RETRY_PENDING`, `FAILED_OPERATIONAL`) without
-   mixing them into serving counts.
+3. **Candidate-lifecycle filter:** add a filter over candidate fields, not
+   channel states. The predicate applies to `discord_candidates` rows via
+   `candidate_status`, `validation_status`, and `liveness_status` (for example
+   non-serving means `liveness_status <> 'ACTIVE'`, and
+   `validation_status IN ('NOT_STARTED','RETRY_PENDING','FAILED_OPERATIONAL')`
+   covers untouched/retrying/operationally failed candidates). Channel fields
+   (`discord_status`, `discord_validation_status`,
+   `discord_liveness_status`) remain the existing channel-level filter and
+   must not be reused as candidate predicates. The candidate facet must not
+   change serving counts.
 4. **Validation wording:** rename "Recently confirmed" to "Recently
    validated" or keep the label but state that it means the first successful
    validation, not current liveness.
@@ -279,6 +287,8 @@ No implementation is proposed now.
 - **P0.2 telemetry:** implemented in PR #559; required before measuring P1.1,
   P1.3/P1.4, P1.6, and P1.7.
 - **P0.3 classification:** completed (Coolify read-only, trailing 7 days).
+  Report, SQL, and raw output:
+  `docs/evidence/p0_3_acquisition_classification_20261027.{md,sql,out}`.
 - **P0.4 baseline reconciliation:** the 54-failure full-suite baseline is
   reconciled in the PR #558 verification record; future PRs must report both
   full-suite and targeted counts.

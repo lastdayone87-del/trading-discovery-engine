@@ -215,13 +215,31 @@ P1.4 must split observation from outcome:
 - `framesObserved`, `framesInspected`, `framesPolicyExcluded`,
   `framesUnreadable`
 - `shadowRootsObserved`, `shadowRootsTraversed`, `closedShadowRootsObserved`
-- `popupsObserved`, `popupsInspected`, `popupsUninspected`
+- `popupsObserved`, `popupsInspected`, `popupsUninspected`,
+  `popupsPolicyExcluded`
 
-`COMPLETE` requires `framesObserved == framesInspected +
-framesPolicyExcluded` and `shadowRootsObserved == shadowRootsTraversed` (plus
-the existing page/control/scroll certificates). A policy-excluded frame is not
-a retry owner, but it is visible as `POLICY_EXCLUDED`; an unreadable frame is
-retryable only while the failure is transient.
+Coverage is computed in this order:
+
+1. **`COMPLETE`** requires every observed frame, shadow root, and popup to be
+   inspected: `framesObserved == framesInspected`,
+   `shadowRootsObserved == shadowRootsTraversed`, and
+   `popupsObserved == popupsInspected` (plus the existing page/control/scroll
+   certificates). A policy-excluded frame or popup is *not* inspected, so it
+   can never satisfy these equalities.
+2. **`CONTEXT_UNREACHABLE`** when at least one observed context is neither
+   inspected nor policy-excluded (unreadable/detached frame, cap-hit, or
+   uninspected popup). It keeps retry ownership only while the failure is
+   transient.
+3. **`POLICY_EXCLUDED`** when every observed context is either inspected or
+   policy-excluded, and at least one was policy-excluded. This is a terminal
+   partial: it suppresses `COMPLETE` and visible absence claims, but it does
+   not own a retry.
+
+If a page has both a policy-excluded frame and an unreadable frame, the
+unreadable frame wins for retry ownership (`CONTEXT_UNREACHABLE`), while the
+policy exclusion remains visible in the counters. "No retry needed" and
+"fully inspected" are therefore separate decisions: policy exclusion can close
+retry work without ever producing a clean `COMPLETE`.
 
 ### 4.7 Acceptance tests
 
