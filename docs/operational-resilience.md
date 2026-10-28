@@ -1,5 +1,10 @@
 # Provider-pool and dashboard operational resilience
 
+> **Infrastructure correction (2026-10-27):** Production is hosted on
+> **Coolify**, not Railway. Railway references below are stale assumptions and
+> are not the production access path. See
+> [Production infrastructure](./production-infrastructure.md).
+
 ## YouTube quota exhaustion
 
 Each configured API key represents an independently failover-capable provider.
@@ -43,10 +48,12 @@ modes disproportionate to this hardening task.
 
 ## Dashboard host validation
 
-Vite continues to validate Host headers. The canonical Railway production domain
-is explicitly allowed, and additional trusted domains can be supplied as a
-comma-separated `VITE_ALLOWED_HOSTS` value. Localhost behavior remains Vite's
-default. Rollback is removal of the environment value/code entry; no deployment
-data changes are involved. Note that the built production server serves static
-files through Express, while this allowlist also protects deployments that run the
-Vite middleware path.
+Vite continues to validate Host headers. The configured production dashboard
+hostname is explicitly allowed, and additional trusted domains can be supplied as
+a comma-separated `VITE_ALLOWED_HOSTS` value. The checked-in Railway hostname is
+stale deployment metadata: production is Coolify, and the allowlist should be
+updated in a separate configuration change after the Coolify domain is confirmed.
+Localhost behavior remains Vite's default. Rollback is removal of the environment
+value/code entry; no deployment data changes are involved. Note that the built
+production server serves static files through Express, while this allowlist also
+protects deployments that run the Vite middleware path.
