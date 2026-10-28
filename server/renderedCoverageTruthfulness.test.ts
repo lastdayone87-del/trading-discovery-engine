@@ -214,6 +214,25 @@ test('a permanent child failure does not make a deterministic context gap retrya
   assert.equal(result.gapRetryable, false, 'context traversal limits cannot be cleared by refetching');
 });
 
+test('a transient required-child failure keeps retry ownership despite a deterministic context gap', () => {
+  const result = renderedAcquisitionOutcome(
+    rendered({
+      complete: false,
+      telemetry: telemetry('CONTEXT_UNREACHABLE'),
+    }),
+    true,
+    [],
+    {
+      unvisited: [],
+      transientFailures: ['https://creator.example/child'],
+      permanentFailures: [],
+    },
+  );
+  assert.equal(result.outcome, 'PARTIALLY_INSPECTED');
+  assert.equal(result.failureClass, 'RENDERED_CONTEXT_UNREACHABLE');
+  assert.equal(result.gapRetryable, true, 'the failed child can succeed on refetch even though traversal cannot');
+});
+
 test('legacy complete results without coverageReason stay clean', () => {
   const result = renderedAcquisitionOutcome(
     rendered({ telemetry: telemetry(undefined) }),

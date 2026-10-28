@@ -146,7 +146,9 @@ A non-`COMPLETE` coverage reason is never a clean absence:
 - Retry ownership for a coverage gap is derived from the coverage reason, not
   the fallback's aggregate `retryable` flag. A permanently blocked required
   child can set that flag without making a deterministic context or policy gap
-  recoverable; only `BOUNDED` owns retry.
+  recoverable; only `BOUNDED` owns retry from the gap itself. A separate
+  transient required-child failure still keeps retry ownership, because that
+  page can succeed on refetch even when the traversal limit cannot be cleared.
 
 ## Safety and bounds
 

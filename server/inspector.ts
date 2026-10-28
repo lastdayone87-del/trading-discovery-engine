@@ -1051,8 +1051,11 @@ export function renderedAcquisitionOutcome(rendered:BrowserFallbackResult,render
   // skipped community control still can, and must not be certified clean.
   if (interactionGap) return{outcome:rendered.inspectedPages>0?'PARTIALLY_INSPECTED':'ACQUISITION_FAILED',failureClass:rendered.timedOut?'RENDERED_TIMEOUT':'RENDERED_INTERACTION_GAP',gapRetryable:true};
   // P1.7: a non-COMPLETE navigation-coverage reason is never a clean absence.
-  // Keep the specific failure class and the fallback's retry ownership.
-  if (coverageGap) return{outcome:rendered.inspectedPages>0?'PARTIALLY_INSPECTED':'ACQUISITION_FAILED',failureClass:timeoutClass||coverageGap.failureClass,gapRetryable:coverageGap.retryable};
+  // Keep the specific failure class. A deterministic context/policy gap does
+  // not own retry by itself, but a separate transient required-child failure
+  // still does: the failed page can succeed on refetch even though the
+  // traversal limit cannot be cleared.
+  if (coverageGap) return{outcome:rendered.inspectedPages>0?'PARTIALLY_INSPECTED':'ACQUISITION_FAILED',failureClass:timeoutClass||coverageGap.failureClass,gapRetryable:coverageGap.retryable||hasTransient};
   // Required permanent-only failure (e.g. BLOCKED wall on a required member
   // with no other gap) stays visible but never owns retry work: identical
   // refetch patterns cannot clear access denial.
