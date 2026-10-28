@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { DEFAULT_BROWSER_FALLBACK_BUDGET, MAX_RENDERED_CROSS_ORIGIN_ENQUEUES, combineRenderedControlOffsetAdvances, isNavigableOnlyControlWindow, isSameSeedDocument, isUnrecoveredStructuralNavigation, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, resolveRenderedCompletionState, runRenderedClickLoop, shouldEnqueueRenderedCrossOriginLink, type RenderedControlEnumeration } from './browserCommunityFallback';
+import { DEFAULT_BROWSER_FALLBACK_BUDGET, MAX_RENDERED_CROSS_ORIGIN_ENQUEUES, combineRenderedControlOffsetAdvances, isNavigableOnlyControlWindow, isSameSeedDocument, isUnrecoveredStructuralNavigation, planRenderedCrossOriginEnqueues, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, resolveRenderedCompletionState, runRenderedClickLoop, shouldEnqueueRenderedCrossOriginLink, type RenderedControlEnumeration } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -423,6 +423,49 @@ test('a final click that navigates does not invent a gap', async () => {
   assert.equal(result.evidenceControlsClicked, 1);
   assert.equal(result.evidenceControlsSkipped, 0);
   assert.equal(result.interactionGap, false, 'no original-page control was left unexamined');
+});
+
+test('cross-origin planner carries visible anchor text for generic paths', () => {
+  const currentUrl = 'https://creator.example/';
+  const admitted = planRenderedCrossOriginEnqueues({
+    candidates: [{ url: 'https://community.example/go', text: 'Join the private members community' }],
+    currentUrl,
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(admitted.admitted, ['https://community.example/go']);
+  assert.equal(admitted.disallowed, 0);
+
+  const noLabel = planRenderedCrossOriginEnqueues({
+    candidates: [{ url: 'https://community.example/go', text: '' }],
+    currentUrl,
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(noLabel.admitted, [], 'a generic path with no visible label is not admitted');
+  assert.equal(noLabel.disallowed, 1);
+});
+
+test('cross-origin planner deduplicates, skips visited, and enforces the cap', () => {
+  const currentUrl = 'https://creator.example/';
+  const plan = planRenderedCrossOriginEnqueues({
+    candidates: [
+      { url: 'https://linktr.ee/creator', text: 'Links' },
+      { url: 'https://linktr.ee/creator', text: 'Links again' },
+      { url: 'https://seen.example/join', text: 'Join the community' },
+      { url: 'https://linktr.ee/other', text: 'Links' },
+      { url: 'https://linktr.ee/third', text: 'Links' },
+      { url: 'https://linktr.ee/fourth', text: 'Links' },
+    ],
+    currentUrl,
+    alreadyVisited: new Set(['https://seen.example/join']),
+    queued: new Set(),
+    maxEnqueues: 2,
+  });
+  assert.deepEqual(plan.admitted, ['https://linktr.ee/creator', 'https://linktr.ee/other']);
+  assert.equal(plan.alreadyVisited, 1);
+  assert.equal(plan.duplicate, 1);
+  assert.equal(plan.budget, 2);
 });
 
 test('cross-origin rendered enqueue stays policy- and budget-bounded', () => {
