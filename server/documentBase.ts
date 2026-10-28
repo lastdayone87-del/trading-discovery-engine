@@ -96,7 +96,6 @@ export function stripBaseElements(html: string): string {
   const isNameDelimiter = (code: number): boolean =>
     code === 0x2f || code === 0x3e || isWhitespace(code);
   const lower = (code: number): number => code >= 0x41 && code <= 0x5a ? code | 0x20 : code;
-  const mask = (code: number): number => code >= 0x41 && code <= 0x5a ? code | 0x20 : code;
 
   // Index of the first `>` after `from`, ignoring `>` inside quoted attribute
   // values. Returns `length` when the tag is unclosed.
@@ -116,28 +115,22 @@ export function stripBaseElements(html: string): string {
   };
 
   // Find `</name` (ASCII case-insensitive) followed by a tag-name delimiter.
+  // One forward scan: each near-match advances the cursor by one character.
   const findRawTextClose = (name: string, from: number): number => {
     if (name === 'plaintext') return length;
-    let search = from;
-    while (search < length) {
-      let found = -1;
-      for (let index = search; index + name.length + 1 < length; index++) {
-        if (source.charCodeAt(index) !== 0x3c) continue;
-        if (source.charCodeAt(index + 1) !== 0x2f) continue;
-        let matches = true;
-        for (let offset = 0; offset < name.length; offset++) {
-          if (mask(source.charCodeAt(index + 2 + offset)) !== name.charCodeAt(offset)) {
-            matches = false;
-            break;
-          }
-        }
-        if (matches && isNameDelimiter(source.charCodeAt(index + 2 + name.length))) {
-          found = index;
+    for (let index = from; index + name.length + 1 < length; index++) {
+      if (source.charCodeAt(index) !== 0x3c) continue;
+      if (source.charCodeAt(index + 1) !== 0x2f) continue;
+      let matches = true;
+      for (let offset = 0; offset < name.length; offset++) {
+        if (lower(source.charCodeAt(index + 2 + offset)) !== name.charCodeAt(offset)) {
+          matches = false;
           break;
         }
       }
-      if (found < 0) return length;
-      return findTagEnd(found + 2 + name.length);
+      if (matches && isNameDelimiter(source.charCodeAt(index + 2 + name.length))) {
+        return findTagEnd(index + 2 + name.length);
+      }
     }
     return length;
   };
