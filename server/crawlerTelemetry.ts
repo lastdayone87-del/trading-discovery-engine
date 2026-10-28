@@ -132,6 +132,13 @@ export interface RenderedCoverageInput {
   shadowRootCount?: number;
   popupTargets?: number;
   navigationPolicyExcluded?: Partial<Record<NavigationPolicyExclusionReason, number>>;
+  /**
+   * A structural navigation anchor was observed but neither clicked (it would
+   * replace the document) nor followed through enqueue admission. Its
+   * destination was never examined, so coverage cannot resolve as COMPLETE.
+   * Deterministic: retrying the same page applies the same hint filter.
+   */
+  unrecoveredNavigation?: boolean;
 }
 
 /**
@@ -152,7 +159,8 @@ export function resolveRenderedCoverageReason(input: RenderedCoverageInput): Ren
     return 'CONTEXT_UNREACHABLE';
   }
   const excluded = input.navigationPolicyExcluded || {};
-  if (count(excluded['invalid-protocol']) > 0
+  if (input.unrecoveredNavigation === true
+    || count(excluded['invalid-protocol']) > 0
     || count(excluded['admission-rejected']) > 0
     || count(excluded['cross-origin-disallowed']) > 0
     || count(excluded['destination-budget']) > 0) {

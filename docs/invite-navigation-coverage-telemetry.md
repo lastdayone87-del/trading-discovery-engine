@@ -23,15 +23,22 @@ the measured surfaces to **recover** controls that were previously excluded:
 - **P1.1 structural disclosures.** Menu, nav, hamburger, tab, `summary`,
   `role=menu|menubar|menuitem|navigation|tab`, `aria-haspopup`, collapsed
   `aria-expanded="false"`, and menu-like labels are added to the click set when
-  they can reveal content in place.
+  they can reveal content in place. The shared selector also matches
+  non-button `role="menuitem"` and `aria-haspopup` controls, so they reach the
+  classification logic at all.
 - **P1.2 icon labels.** A control whose only useful label is `title`,
   `aria-labelledby`, a child `img[alt]`, `data-label`, `data-tooltip`, an SVG
-  `<title>`, or capped hidden `textContent` is now matched.
+  `<title>`, or bounded hidden descendant text is now matched.
 
-Recovered controls are **not** a coverage gap: they are clicked. The remaining
-structural gap is `structuralUnrecovered` (structural anchors that navigate to
-a real document and are owned by the enqueue path). P1.7 still owns the mapping
-from coverage reason to `PARTIALLY_INSPECTED`/retry.
+Recovered controls that reveal content in place are **not** a coverage gap:
+they are clicked. A non-base-matched structural anchor that navigates to a real
+document is different: clicking it would replace the document and strand the
+remaining menu controls, so the click set excludes it and the enqueue path owns
+it. `structuralUnrecovered` counts those anchors. When the enqueue path does
+not follow one (for example `/resources` fails the community-hint filter), the
+destination was never examined and coverage is `POLICY_EXCLUDED`, not
+`COMPLETE`. P1.7 still owns the mapping from coverage reason to
+`PARTIALLY_INSPECTED`/retry.
 
 ## Persisted fields
 
@@ -44,8 +51,8 @@ none contains a URL, selector, element text, or payload.
 | `controlsHintRejected` | Controls the original community-hint filter would have excluded (`total - baseMatched`). |
 | `controlsStructuralNavigation` | Menu/nav/hamburger/tab/summary/`aria-haspopup`/collapsed-`aria-expanded`/`role=menuitem` controls. |
 | `controlsStructuralHintRejected` | Structural controls the original hint filter would hide. |
-| `controlsStructuralDisclosure` | Structural controls included in the click set because they can reveal content in place. |
-| `controlsStructuralUnrecovered` | Structural controls still outside the click set: anchors that navigate to a real document and are owned by the enqueue path. Diagnostic only; enqueue admission failures are reported through `navigationPolicyExcluded`. |
+| `controlsStructuralDisclosure` | Structural controls included in the click set because they can reveal content in place. An already-open `<details>` summary is excluded: its content is already in the DOM and clicking would close it. |
+| `controlsStructuralUnrecovered` | Non-base-matched structural anchors that navigate to a real document and are outside the click set because the enqueue path owns them. If the enqueue path does not follow one, its destination was not examined; this forces `POLICY_EXCLUDED` (unless a stronger reason applies). |
 | `controlsIconLabelRecovered` | Controls recovered by a label the original filter ignored: `title`, `aria-labelledby`, child `alt`, `data-label`, `data-tooltip`, SVG `<title>`, or capped hidden text. |
 | `popupTargets` | Popup/dialog controls that require capture rather than navigation: `aria-haspopup="dialog|menu"` and href-less `target="_blank"` controls. A `_blank` anchor with a real href is reachable by navigation and is not counted. Presence only; no popup capture. |
 | `frameCount` | `iframe`/`frame`/`object`/`embed` elements observed on processed pages. |
@@ -77,20 +84,26 @@ Existing fields keep their meanings:
 3. `CONTEXT_UNREACHABLE` when frames, open shadow roots, or popup targets were
    observed.
 4. `POLICY_EXCLUDED` when `invalid-protocol`, `admission-rejected`,
-   `cross-origin-disallowed`, or `destination-budget` exclusions occurred.
+   `cross-origin-disallowed`, or `destination-budget` exclusions occurred, or
+   when `structuralUnrecovered` recorded an unfollowed structural navigation.
 5. `COMPLETE` otherwise.
 
 P1.1/P1.2 changed what counts as bounded. Recovered icon-label and structural
-disclosure controls are clicked, so they no longer trigger `BOUNDED`.
-`structuralUnrecovered` is diagnostic only: a structural anchor that resolves
-to a different document is owned by the enqueue path, not the click set, and
-enqueue admission failures are reported separately.
+disclosure controls are clicked, so they no longer trigger `BOUNDED`. A
+non-base-matched structural anchor that resolves to a different document is
+owned by the enqueue path, not the click set. If the enqueue path rejects it,
+the destination remains unexamined and the run is `POLICY_EXCLUDED`; it must
+not be reported as clean coverage. Base-matched anchors keep their original
+click behavior.
 
 `hint-rejected` and `control-slice` are measured in
 `navigationPolicyExcluded` but are not policy exclusions for this reason:
 `hint-rejected` is already represented by `controlsHintRejected`, and
-`control-slice` already forces the interaction gap. A stronger reason wins over
-a weaker one (for example, a timeout is `BOUNDED` even when frames are present).
+`control-slice` already forces the interaction gap. The narrower
+`structuralUnrecovered` signal is different: it counts only structural
+navigation anchors whose destination was neither clicked nor enqueued, not
+every URL the hint filter rejected. A stronger reason wins over a weaker one
+(for example, a timeout is `BOUNDED` even when frames are present).
 
 The reason remains diagnostic. It does not change `complete`, `retryable`,
 `failureClass`, or the acquisition outcome. P1.7 owns that mapping.
@@ -101,13 +114,21 @@ The reason remains diagnostic. It does not change `complete`, `retryable`,
   serialization and still returns the complete matched set (never a 64-item
   prefix).
 - Structural detection is attribute- and label-based and bounded to the control
-  itself. A structural anchor that navigates to another document is not added
-  to the click set, so a disclosure click cannot replace the document or spend
-  the click budget on navigation.
+  itself. A non-base-matched structural anchor that navigates to another
+  document is not added to the click set, so a disclosure click cannot replace
+  the document or spend the click budget on navigation. Navigation compares
+  the resolved target against the current `document.URL`, not the effective
+  `<base href>`, so an anchor resolving exactly to the base URI is still
+  treated as navigation.
+- An already-open `<details>` summary is not clicked: its content is already
+  enumerated, and clicking would close it and hide controls.
 - Label recovery scans only the control's own `title`, `aria-labelledby`
   references, first child `img[alt]`, `data-label`, `data-tooltip`, SVG
-  `<title>`, and `textContent` capped at 200 characters. It does not scan page
-  text.
+  `<title>`, and a descendant-text walk capped at 200 collected characters
+  (500 text nodes). It does not scan page text.
+- A click that changes the document URL stops the click loop and counts the
+  remaining queued controls as skipped. A menu handler or `javascript:` link
+  cannot silently replace the page and leave later controls looking examined.
 - `collectRenderedPageContext` uses a bounded `TreeWalker` (2,000 elements,
   100 shadow roots) and a bounded frame count (1,000). It never traverses
   frames or shadow roots.
@@ -163,10 +184,11 @@ clean-coverage claim.
   mark a control as structural; the click planner still bounds clicks per page
   and the enqueue path still decides navigation, so a false positive can spend
   click budget but cannot bypass admission.
-- Recovered controls are added after hint-matched controls in DOM order. The
-  64-control evaluation window and the per-page click budget still apply, so a
-  large recovered set can leave controls unexamined; that is reported through
-  the existing overflow/skip counters, not hidden.
+- Original hint matches are clicked first, then icon-label recoveries, then
+  structural disclosures; each group preserves DOM order. The 64-control
+  evaluation window and the per-page click budget still apply, so a large
+  recovered set can leave controls unexamined; that is reported through the
+  existing overflow/skip counters, not hidden.
 - `frameCount` includes advertising/analytics iframes. It is a presence
   counter, not proof that a frame contains navigation or invite evidence.
 - `popupTargets` counts popup/dialog controls that need capture (ARIA

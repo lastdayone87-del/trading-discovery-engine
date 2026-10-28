@@ -267,11 +267,12 @@ export const COMMUNITY_HINTS = /discord|community|join|chat|member|membership|vi
 
 /**
  * Interactive controls that can reveal content only through interaction:
- * links, buttons, ARIA buttons/tabs, native disclosures (`summary`), and
- * collapsed accordion triggers. The selector is shared by enumeration and
- * clicking so locator indexes always refer to the same full query.
+ * links, buttons, ARIA buttons/tabs/menu items, popup triggers, native
+ * disclosures (`summary`), and collapsed accordion triggers. The selector is
+ * shared by enumeration and clicking so locator indexes always refer to the
+ * same full query.
  */
-export const RENDERED_CONTROL_SELECTOR = 'a,button,[role="button"],[role="tab"],summary,[aria-expanded="false"]';
+export const RENDERED_CONTROL_SELECTOR = 'a,button,[role="button"],[role="tab"],[role="menuitem"],summary,[aria-expanded="false"],[aria-haspopup]';
 
 /**
  * Telegram channel pages contain a link for virtually every message. Those
@@ -590,8 +591,9 @@ export interface RenderedControlTarget {
 }
 
 export interface RenderedControlEnumeration {
-  /** Evidence-bearing controls: hint-matched, icon-label recovered, or
-   * structural disclosures that can reveal content in place. */
+  /** Evidence-bearing controls: base hint matches first, then icon-label
+   * recoveries, then structural disclosures that can reveal content in place.
+   * Each group preserves DOM order. */
   controls: RenderedControlTarget[];
   /** Pre-filter denominator: every node matched by the shared selector. */
   total: number;
@@ -603,7 +605,10 @@ export interface RenderedControlEnumeration {
   structuralHintRejected: number;
   /** Structural controls included by P1.1 because they can reveal content in place. */
   structuralDisclosure: number;
-  /** Structural controls still outside the click set (navigable anchors). */
+  /** Structural navigable anchors still outside the click set because they
+   * would replace the document (and are not base hint matches). The enqueue
+   * path owns them; when it rejects the URL, the destination was never
+   * examined and the crawl cannot resolve as COMPLETE. */
   structuralUnrecovered: number;
   /** Controls recovered only via title/aria-labelledby/alt/data-label/SVG title
    * or hidden text (P1.2). These are included in `controls`. */
@@ -628,9 +633,10 @@ export interface RenderedControlEnumeration {
  * icon-only labels (title/aria-labelledby/child alt/data-label/SVG title/hidden
  * text), and structural disclosure controls (menu/hamburger/tab/summary/
  * aria-haspopup/collapsed aria-expanded) that can reveal content in place.
- * Structural anchors that navigate to a real document stay out of the click
- * set: the enqueue path owns them, and clicking would replace the document
- * instead of expanding it. All counts are bounded and selector-derived.
+ * Non-base-matched structural anchors that navigate to a real document stay
+ * out of the click set: the enqueue path owns them, and clicking would replace
+ * the document instead of expanding it. Base matches keep their original click
+ * behavior. All counts are bounded and selector-derived.
  */
 export function enumerateRenderedControlNodes(
   nodes: Element[],
@@ -638,6 +644,7 @@ export function enumerateRenderedControlNodes(
 ): RenderedControlEnumeration {
   const re = new RegExp(pattern, 'i');
   const hintMatched: RenderedControlTarget[] = [];
+  const recovered: RenderedControlTarget[] = [];
   const disclosures: RenderedControlTarget[] = [];
   let baseMatchedCount = 0;
   let structuralNavigation = 0;
@@ -677,28 +684,42 @@ export function enumerateRenderedControlNodes(
     }
     const ariaLabel = element.getAttribute('aria-label') || '';
     const baseText = `${element.innerText || ''} ${href || ''} ${ariaLabel}`;
-    // P1.2: resolve labels the original filter ignored. `textContent` adds
-    // visually hidden text (innerText omits it) but is capped so a pathological
-    // control cannot turn matching into an unbounded scan.
+    // P1.2: resolve labels the original filter ignored. A bounded descendant
+    // text walk adds visually hidden text (innerText omits it) without
+    // materializing a pathological control's entire subtree.
     let labelledByText = '';
     const labelledBy = element.getAttribute('aria-labelledby') || '';
     if (labelledBy) {
       const ids = labelledBy.split(/\s+/);
-      for (let labelIndex = 0; labelIndex < ids.length; labelIndex++) {
+      for (let labelIndex = 0; labelIndex < ids.length && labelledByText.length < 400; labelIndex++) {
         if (!ids[labelIndex]) continue;
         const labelNode = document.getElementById(ids[labelIndex]);
-        if (labelNode && labelNode.textContent) labelledByText += ` ${labelNode.textContent}`;
+        if (labelNode && labelNode.textContent) labelledByText += ` ${labelNode.textContent.slice(0, 200)}`;
       }
     }
     let childAlt = '';
     const image = element.querySelector('img[alt]');
-    if (image) childAlt = image.getAttribute('alt') || '';
-    const title = element.getAttribute('title') || '';
-    const dataLabel = element.getAttribute('data-label') || '';
-    const dataTooltip = element.getAttribute('data-tooltip') || '';
+    if (image) childAlt = (image.getAttribute('alt') || '').slice(0, 200);
+    const title = (element.getAttribute('title') || '').slice(0, 200);
+    const dataLabel = (element.getAttribute('data-label') || '').slice(0, 200);
+    const dataTooltip = (element.getAttribute('data-tooltip') || '').slice(0, 200);
     const svgTitleNode = element.querySelector('svg title');
-    const svgTitle = svgTitleNode && svgTitleNode.textContent ? svgTitleNode.textContent : '';
-    const hiddenText = String(element.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+    const svgTitle = svgTitleNode && svgTitleNode.textContent ? svgTitleNode.textContent.slice(0, 200) : '';
+    // Bounded descendant-text walk. Reading `textContent` and slicing after
+    // the fact still materializes and normalizes the entire subtree; a
+    // pathological menu container could make every enumeration unbounded.
+    // Stop at 200 collected characters (or 500 text nodes as a hard guard).
+    let hiddenText = '';
+    const textWalker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+    let textNode = textWalker.nextNode();
+    let textNodesExamined = 0;
+    while (textNode && hiddenText.length < 200 && textNodesExamined < 500) {
+      textNodesExamined++;
+      const value = textNode.nodeValue || '';
+      if (value) hiddenText += ` ${value}`;
+      textNode = textWalker.nextNode();
+    }
+    hiddenText = hiddenText.replace(/\s+/g, ' ').trim().slice(0, 200);
     const extendedText = `${baseText} ${title} ${labelledByText} ${childAlt} ${dataLabel} ${dataTooltip} ${svgTitle} ${hiddenText}`;
     const baseMatched = re.test(baseText);
     const extendedMatched = re.test(extendedText);
@@ -706,7 +727,12 @@ export function enumerateRenderedControlNodes(
     if (baseMatched) baseMatchedCount++;
     const role = (element.getAttribute('role') || '').toLowerCase();
     const ariaHaspopup = (element.getAttribute('aria-haspopup') || '').toLowerCase();
-    const structural = tagName === 'nav'
+    // An already-open <details> needs no click, and clicking its summary
+    // would close it and hide the controls the crawler should inspect. The
+    // revealed content is already in the DOM and is enumerated normally.
+    const openSummary = tagName === 'summary'
+      && !!(element.parentElement as HTMLDetailsElement | null)?.open;
+    const structuralKind = tagName === 'nav'
       || tagName === 'summary'
       || role === 'menu'
       || role === 'menubar'
@@ -721,27 +747,38 @@ export function enumerateRenderedControlNodes(
       // structural navigation and would make nearly every crawl look
       // policy-bounded.
       || /(^|\b)(menu|navigation|nav|hamburger|resources|support|explore|more)(\b|$)/i.test(extendedText);
+    const structural = structuralKind && !openSummary;
     // A structural anchor that resolves to a different document is a page
     // candidate, not an in-place disclosure. Clicking it would replace the
-    // document and consume the click budget; the enqueue path owns it.
+    // document and consume the click budget; the enqueue path owns it. The
+    // comparison is against the current document URL, not the effective
+    // <base href>: an anchor can resolve exactly to the base URI while still
+    // navigating away from the current document.
     let navigatesAway = false;
     if (tagName === 'a' && typeof href === 'string' && href) {
       try {
         const resolved = new URL(href);
-        const documentBase = node.baseURI || document.baseURI;
+        const current = new URL(document.URL);
+        resolved.hash = '';
+        current.hash = '';
         navigatesAway = (resolved.protocol === 'http:' || resolved.protocol === 'https:')
-          && resolved.href.split('#')[0] !== documentBase.split('#')[0];
+          && resolved.toString() !== current.toString();
       } catch {
         navigatesAway = true;
       }
     }
     const disclosure = structural && !navigatesAway;
-    if (structural) {
+    // Only a non-base-matched structural navigation is unrecovered: a
+    // base-matched anchor keeps its existing click behavior, while a newly
+    // recovered structural anchor must not replace the document before the
+    // remaining menu controls are examined.
+    const unrecoveredStructuralNavigation = structural && navigatesAway && !baseMatched;
+    if (structuralKind) {
       structuralNavigation++;
       if (!baseMatched) structuralHintRejected++;
     }
     if (disclosure) structuralDisclosure++;
-    if (structural && !hintMatchedControl && !disclosure) structuralUnrecovered++;
+    if (unrecoveredStructuralNavigation) structuralUnrecovered++;
     if (!baseMatched && extendedMatched) iconLabelRecovered++;
     const target = (element.getAttribute('target') || '').toLowerCase();
     // Only popups that cannot be followed as a normal navigation are a
@@ -750,20 +787,27 @@ export function enumerateRenderedControlNodes(
     // social link as an unexamined popup.
     const hasNavigableHref = typeof href === 'string' && href.length > 0;
     if (ariaHaspopup === 'dialog' || ariaHaspopup === 'menu' || (target === '_blank' && !hasNavigableHref)) popupTargets++;
+    if (openSummary) continue;
     if (!hintMatchedControl && !disclosure) continue;
+    // A newly recovered structural anchor that navigates away is enqueue-owned
+    // and never clicked: replacing the document would strand the remaining
+    // menu controls. It is counted as unrecovered navigation for coverage.
+    if (unrecoveredStructuralNavigation) continue;
     const item: RenderedControlTarget = {
       index,
       text: baseText,
       href,
       tag: (tagName === 'a' ? 'anchor' : tagName === 'button' ? 'button' : 'role') as 'anchor' | 'button' | 'role',
     };
-    // Hint-matched controls keep priority over generic disclosures so the
-    // bounded click budget spends first on evidence-bearing content. The
-    // disclosure list preserves DOM order for deterministic rotation.
-    if (hintMatchedControl) hintMatched.push(item);
+    // Original hint matches keep absolute priority, then icon-label
+    // recoveries, then generic structural disclosures. Each group preserves
+    // DOM order for deterministic rotation; a recovered control can never
+    // consume the click budget ahead of an existing base match.
+    if (baseMatched) hintMatched.push(item);
+    else if (extendedMatched) recovered.push(item);
     else disclosures.push(item);
   }
-  const selected = [...hintMatched, ...disclosures];
+  const selected = [...hintMatched, ...recovered, ...disclosures];
   const usedMarkers = new Set<string>();
   const controls: RenderedControlTarget[] = [];
   for (let itemIndex = 0; itemIndex < selected.length; itemIndex++) {
@@ -1105,11 +1149,27 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
     }
     const control = clickTargets[clickIndex];
     clickedThisPage++;
+    const urlBeforeClick = input.pageUrl();
     if (await input.click(control)) evidenceControlsClicked++;
     else {
       evidenceControlsFailed++;
       interactionGap = true;
       if (firstFailedTargetIndex === undefined) firstFailedTargetIndex = clickIndex;
+    }
+    // A menu handler or javascript: link can replace the document even when
+    // the control had no navigable href at enumeration time. Remaining queued
+    // targets belong to the old DOM; they cannot be examined, and the new
+    // document must not be re-enumerated as if it were the original page.
+    const urlAfterClick = input.pageUrl();
+    const beforeKey = normalizeVisitUrl(urlBeforeClick) ?? urlBeforeClick;
+    const afterKey = normalizeVisitUrl(urlAfterClick) ?? urlAfterClick;
+    if (beforeKey !== afterKey) {
+      const remaining = clickTargets.length - clickIndex - 1;
+      if (remaining > 0) {
+        evidenceControlsSkipped += remaining;
+        interactionGap = true;
+      }
+      break;
     }
     // A successful click can reveal new evidence-bearing controls (second
     // interaction). Re-enumerate after every click, including the final
@@ -1975,6 +2035,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
       shadowRootCount,
       popupTargets,
       navigationPolicyExcluded: telemetry.navigationPolicyExcluded,
+      unrecoveredNavigation: controlsStructuralUnrecovered > 0,
     });
   };
   const terminalSuccessUrls: string[] = [];
