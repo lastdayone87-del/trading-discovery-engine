@@ -588,6 +588,13 @@ export interface RenderedControlTarget {
    * Never a selector or payload.
    */
   tag?: 'anchor' | 'button' | 'role';
+  /**
+   * Why the control entered the click set. Original hint matches and icon-label
+   * recoveries are evidence-bearing increments; generic structural disclosures
+   * are best-effort opportunism. Only the former make an unclicked control a
+   * retryable interaction gap; an unclicked disclosure stays a diagnostic.
+   */
+  origin?: 'hint' | 'icon' | 'disclosure';
 }
 
 export interface RenderedControlEnumeration {
@@ -833,6 +840,7 @@ export function enumerateRenderedControlNodes(
       text: baseText,
       href,
       tag: (tagName === 'a' ? 'anchor' : tagName === 'button' ? 'button' : 'role') as 'anchor' | 'button' | 'role',
+      origin: baseMatched ? 'hint' : extendedMatched ? 'icon' : 'disclosure',
     };
     // Original hint matches keep absolute priority, then icon-label
     // recoveries, then generic structural disclosures. Each group preserves
@@ -1136,6 +1144,19 @@ export function remainingRenderedClickBudget(
 }
 
 /**
+ * Only an unexamined hint/icon control is evidence-bearing enough to make the
+ * page incomplete. Generic structural disclosures are opportunistic: they are
+ * clicked when budget allows, but an over-budget disclosure does not turn a
+ * common menu/FAQ page into a retryable acquisition gap. Targets without an
+ * origin are legacy evidence controls and stay conservative.
+ */
+export function renderedControlSkipsNeedInteractionGap(
+  targets: Array<Pick<RenderedControlTarget, 'origin'>>,
+): boolean {
+  return targets.some(target => target.origin !== 'disclosure');
+}
+
+/**
  * Plan the controls discovered by re-enumeration after a click. Controls that
  * do not fit the truly remaining budget are returned as skipped coverage
  * obligations, while navigable anchors stay enqueue-handled and are not
@@ -1232,15 +1253,17 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
       // the click cap is reached. They were never examined, so they are skips,
       // not a clean no-match.
       let cappedSkips = 0;
+      const cappedTargets: RenderedControlTarget[] = [];
       for (const target of clickTargets.slice(clickIndex)) {
         const marker = target.marker;
         if (marker && countedSkips.has(marker)) continue;
         if (marker) countedSkips.add(marker);
         cappedSkips++;
+        cappedTargets.push(target);
       }
       if (cappedSkips > 0) {
         evidenceControlsSkipped += cappedSkips;
-        interactionGap = true;
+        if (renderedControlSkipsNeedInteractionGap(cappedTargets)) interactionGap = true;
       }
       break;
     }
@@ -1315,14 +1338,16 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
         // overflow/slice drops are already counted) and make the interaction
         // gap explicit so the page cannot resolve as a clean no-match.
         let freshDropped = 0;
+        const freshDroppedTargets: RenderedControlTarget[] = [];
         for (const target of freshPlan.skipped) {
           if (!target.marker || countedSkips.has(target.marker)) continue;
           countedSkips.add(target.marker);
           freshDropped++;
+          freshDroppedTargets.push(target);
         }
         if (freshDropped > 0) {
           evidenceControlsSkipped += freshDropped;
-          interactionGap = true;
+          if (renderedControlSkipsNeedInteractionGap(freshDroppedTargets)) interactionGap = true;
         }
         for (const target of freshPlan.toClick) {
           if (!target.marker || queuedMarkers.has(target.marker)) continue;
@@ -2495,13 +2520,18 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // Overflow beyond the evaluation window is already counted by
             // recordControlEnumeration. This second count covers only controls
             // inside the window that the click budget could not examine.
-            const sliceDropped = Math.max(0, clickPlan.evaluationWindow.length - clickPlan.toClick.length - clickPlan.skippedNavigableAnchors);
+            const sliceSkippedTargets = clickPlan.evaluationWindow.filter(target =>
+              !clickPlan.toClick.some(planned => planned.marker === target.marker)
+              && !isSkippableNavigableAnchorClick(target, page.url()));
+            const sliceDropped = sliceSkippedTargets.length;
             if (sliceDropped > 0) {
               // Every enumerated control matched the community-evidence filter;
               // dropping one for budget means its content was never examined.
+              // Generic disclosures are opportunistic, so only hint/icon skips
+              // make the page retryable.
               drops.count('control-slice', sliceDropped);
               evidenceControlsSkipped += sliceDropped;
-              interactionGap = true;
+              if (renderedControlSkipsNeedInteractionGap(sliceSkippedTargets)) interactionGap = true;
             }
             // Shared enqueue admission (single rule definition): already-visited
             // exclusion, then the shared crawl admission boundary, then the
