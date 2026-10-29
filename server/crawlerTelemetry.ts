@@ -128,12 +128,17 @@ export interface RenderedCoverageInput {
   budgetExhausted?: boolean;
   interactionGap?: boolean;
   scrollCapReachedStillGrowing?: boolean;
-  structuralHintRejected?: number;
-  iconLabelRecovered?: number;
   frameCount?: number;
   shadowRootCount?: number;
   popupTargets?: number;
   navigationPolicyExcluded?: Partial<Record<NavigationPolicyExclusionReason, number>>;
+  /**
+   * A structural navigation anchor was observed but neither clicked (it would
+   * replace the document) nor followed through enqueue admission. Its
+   * destination was never examined, so coverage cannot resolve as COMPLETE.
+   * Deterministic: retrying the same page applies the same hint filter.
+   */
+  unrecoveredNavigation?: boolean;
 }
 
 /**
@@ -147,16 +152,15 @@ export function resolveRenderedCoverageReason(input: RenderedCoverageInput): Ren
     typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
   if (input.budgetExhausted === true
     || input.interactionGap === true
-    || input.scrollCapReachedStillGrowing === true
-    || count(input.structuralHintRejected) > 0
-    || count(input.iconLabelRecovered) > 0) {
+    || input.scrollCapReachedStillGrowing === true) {
     return 'BOUNDED';
   }
   if (count(input.frameCount) > 0 || count(input.shadowRootCount) > 0 || count(input.popupTargets) > 0) {
     return 'CONTEXT_UNREACHABLE';
   }
   const excluded = input.navigationPolicyExcluded || {};
-  if (count(excluded['invalid-protocol']) > 0
+  if (input.unrecoveredNavigation === true
+    || count(excluded['invalid-protocol']) > 0
     || count(excluded['admission-rejected']) > 0
     || count(excluded['cross-origin-disallowed']) > 0
     || count(excluded['destination-budget']) > 0) {
@@ -357,19 +361,23 @@ export interface CrawlerTelemetry {
    */
   evidenceControlsOffsetAdvance?: number;
   /**
-   * P0.2 navigation-coverage counters (rendered-only, counts only). The
+   * P1.1/P1.2 navigation-coverage counters (rendered-only, counts only). The
    * pre-filter denominator answers how many controls existed before the
    * community-hint filter; `HintRejected` is the difference. Structural
-   * navigation counts menu/nav/hamburger/aria-haspopup controls that the
-   * hint filter would otherwise hide. Icon-label recovery counts controls
-   * whose only useful label is title/aria-labelledby/child-alt/data-label.
-   * Popup targets counts target=_blank/aria-haspopup=dialog controls. None of
-   * these fields contain selectors, text, or URLs.
+   * navigation counts menu/nav/hamburger/tab/summary/aria-haspopup controls.
+   * `StructuralDisclosure` counts those included in the click set because they
+   * reveal content in place; `StructuralUnrecovered` counts structural
+   * anchors still left to the enqueue path. Icon-label recovery counts
+   * controls whose only useful label is title/aria-labelledby/child-alt/
+   * data-label/SVG title/hidden text. None of these fields contain selectors,
+   * text, or URLs.
    */
   controlsEnumeratedTotal?: number;
   controlsHintRejected?: number;
   controlsStructuralNavigation?: number;
   controlsStructuralHintRejected?: number;
+  controlsStructuralDisclosure?: number;
+  controlsStructuralUnrecovered?: number;
   controlsIconLabelRecovered?: number;
   popupTargets?: number;
   /**
@@ -756,6 +764,12 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.controlsStructuralHintRejected) > 0
       ? { controlsStructuralHintRejected: number(candidate.controlsStructuralHintRejected) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.controlsStructuralDisclosure) > 0
+      ? { controlsStructuralDisclosure: number(candidate.controlsStructuralDisclosure) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.controlsStructuralUnrecovered) > 0
+      ? { controlsStructuralUnrecovered: number(candidate.controlsStructuralUnrecovered) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.controlsIconLabelRecovered) > 0
       ? { controlsIconLabelRecovered: number(candidate.controlsIconLabelRecovered) }
