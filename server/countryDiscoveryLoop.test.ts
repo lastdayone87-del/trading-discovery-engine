@@ -361,6 +361,66 @@ test('A2: repeated free-signal refresh is cache-idempotent and does not refetch'
   }
 });
 
+test('A2b: free-signal cache is scoped by normalized limit', async () => {
+  resetFreeQuerySignalCacheForTests();
+  let requests = 0;
+  const fakeFetch = (async (url: string) => {
+    requests += 1;
+    if (String(url).includes('wikipedia.org')) {
+      return {
+        ok: true,
+        json: async () => ({
+          query: {
+            search: [
+              { title: 'DAX', pageid: 1 },
+              { title: 'Börse Frankfurt', pageid: 2 },
+              { title: 'Charttechnik', pageid: 3 },
+              { title: 'Risikomanagement', pageid: 4 },
+            ],
+          },
+        }),
+      } as never;
+    }
+    return {
+      ok: true,
+      json: async () => ({
+        search: [
+          { id: 'Q1', label: 'Handelsstrategie', aliases: [] },
+          { id: 'Q2', label: 'Chartanalyse', aliases: [] },
+          { id: 'Q3', label: 'DAX Futures', aliases: [] },
+          { id: 'Q4', label: 'Börsenhandel', aliases: [] },
+        ],
+      }),
+    } as never;
+  }) as unknown as typeof fetch;
+  const now = new Date('2026-10-26T00:00:00Z');
+  try {
+    const small = await fetchFreeQuerySignals({
+      country: 'Germany', language: 'de', limit: 1,
+      fetchImpl: fakeFetch, userAgent: TEST_WIKIMEDIA_USER_AGENT, now,
+    });
+    assert.equal(requests, 2);
+    assert.equal(small.signals.length, 2, 'limit 1 returns one signal per provider');
+
+    const large = await fetchFreeQuerySignals({
+      country: 'Germany', language: 'de', limit: 8,
+      fetchImpl: fakeFetch, userAgent: TEST_WIKIMEDIA_USER_AGENT, now,
+    });
+    assert.equal(requests, 4, 'a larger limit does not reuse the smaller-limit cache entry');
+    assert.equal(large.signals.length, 8);
+
+    const smallAgain = await fetchFreeQuerySignals({
+      country: 'Germany', language: 'de', limit: 1,
+      fetchImpl: fakeFetch, userAgent: TEST_WIKIMEDIA_USER_AGENT, now,
+    });
+    assert.equal(requests, 4, 'the smaller-limit entry remains independently cacheable');
+    assert.equal(smallAgain.fromCache, true);
+    assert.equal(smallAgain.signals.length, 2, 'the cached result is truncated to its own limit');
+  } finally {
+    resetFreeQuerySignalCacheForTests();
+  }
+});
+
 test('A3: a native term plus a free alias yields one query with both sources attributed', () => {
   const freeSignals = ['Charttechnik', 'Börse Frankfurt', 'DAX Futures', 'Technische Analyse', 'Handelsstrategie', 'Risikomanagement']
     .map((surface, index) => ({

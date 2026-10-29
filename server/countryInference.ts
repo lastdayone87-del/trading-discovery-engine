@@ -1,6 +1,7 @@
 import type { CountryMetadataStatus, CountryStatus, CountryVocabulary, ExcludedCountry } from '../src/types';
 import { SUPPORTED_PRODUCTION_COUNTRIES } from '../src/data/initial_countries';
 import { normalizeCountryName } from './countryExclusionRules';
+import { COUNTRY_ALIASES, countryAliasTarget } from './countryAliases';
 
 export type CountryEvidenceSource =
   | 'OFFICIAL_YOUTUBE_METADATA'
@@ -144,20 +145,6 @@ const CREATOR_EVIDENCE_SOURCES: Set<CountryEvidenceSource> = new Set([
   'NATIVE_LANGUAGE',
   'AGGREGATED_CONTENT_LANGUAGE'
 ]);
-
-const COUNTRY_ALIASES: Record<string, string> = {
-  us: 'United States', usa: 'United States', 'united states of america': 'United States',
-  gb: 'United Kingdom', uk: 'United Kingdom', 'great britain': 'United Kingdom',
-  de: 'Germany', fr: 'France', es: 'Spain', br: 'Brazil', ru: 'Russia', in: 'India',
-  jp: 'Japan', kr: 'South Korea', tr: 'Turkey', sa: 'Saudi Arabia', ae: 'United Arab Emirates',
-  nl: 'Netherlands', it: 'Italy', ca: 'Canada', au: 'Australia', mx: 'Mexico', ch: 'Switzerland', dk: 'Denmark', se: 'Sweden', sg: 'Singapore', nz: 'New Zealand', be: 'Belgium', lu: 'Luxembourg', ie: 'Ireland'
-  ,ng:'Nigeria', pk:'Pakistan', bd:'Bangladesh', np:'Nepal', ke:'Kenya', za:'South Africa', gh:'Ghana',
-  eg:'Egypt', ma:'Morocco', ph:'Philippines', vn:'Vietnam', id:'Indonesia'
-  ,dz:'Algeria', tn:'Tunisia', et:'Ethiopia', tz:'Tanzania', ug:'Uganda', sn:'Senegal', cm:'Cameroon',
-  zw:'Zimbabwe', zm:'Zambia', rw:'Rwanda', ci:'Ivory Coast', mz:'Mozambique', mg:'Madagascar', sd:'Sudan',
-  ao:'Angola', lk:'Sri Lanka', cz:'Czechia', czech:'Czechia', 'czech republic':'Czechia'
-  ,no:'Norway', norge:'Norway'
-};
 
 const COUNTRY_SIGNALS: Record<string, {
   bio: string[]; tlds: string[]; social: string[]; exchanges: string[]; brokers: string[];

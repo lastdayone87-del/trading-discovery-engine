@@ -297,7 +297,10 @@ export async function fetchFreeQuerySignals(args: {
   const language = String(args.language || countrySearchLanguageCandidates(country, [])[0] || 'en')
     .split('-')[0]
     .toLowerCase();
-  const cacheKey = `${country}|${language}`;
+  // The normalized limit is part of the cache identity: a limit-1 response
+  // must never satisfy a later limit-8 request (or vice versa).
+  const limit = Math.max(1, Math.min(25, Math.trunc(args.limit || 8)));
+  const cacheKey = `${country}|${language}|${limit}`;
   const now = args.now || new Date();
   const cached = cache.get(cacheKey);
   if (cached && now.getTime() - cached.at < CACHE_TTL_MS) {
@@ -317,7 +320,6 @@ export async function fetchFreeQuerySignals(args: {
     };
   }
   const timeoutMs = Math.max(500, Math.min(10_000, args.timeoutMs || 5000));
-  const limit = Math.max(1, Math.min(25, Math.trunc(args.limit || 8)));
   const signals: FreeQuerySignal[] = [];
   const errors: string[] = [];
   try {
