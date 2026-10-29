@@ -184,7 +184,7 @@ touched.
 | Attribution | term/relation/family/surface credited | `Q5: quality vector is result-level and attribution carries the full path` | PASS |
 | Portfolio | cold-start countries get candidates; exploration bounded; no infinite generation | `Q4: portfolio budget…`, planner matrix, `NO_ELIGIBLE_QUERY` contract | PASS |
 | PR #557 | 50-page ceiling unchanged; cumulative metrics consumed; no page-sum | isolated worktree integration run | PASS — 275/275 tests; PR #557 head unchanged |
-| Full suite | `npm test`, lint, type-check, build pass; no regressions | see §3 | PASS with baseline-only failures — 3675/3910 pass, 186 skipped, 49 baseline failures identical; type-check PASS; Vite build environment-blocked |
+| Full suite | `npm test`, lint, type-check, build pass; no regressions | see §3 | PASS with baseline-only failures — 3675/3910 pass, 186 skipped, 49 baseline failures identical; type-check PASS; CI build PASS (local Termux Vite blocked, baseline-identical) |
 
 ### 2.2 Q4 selector and quality targets
 
@@ -231,16 +231,18 @@ introduced.
 npm run lint (tsc --noEmit)                       PASS
 npx esbuild server.ts --bundle --platform=node \
   --format=cjs --packages=external --sourcemap     PASS
-npm run build (vite build && esbuild)             BLOCKED — Termux/Android Rollup
-                                                  native addon ERR_DLOPEN_FAILED
-                                                  (baseline identical); esbuild PASS
+npm run build (vite build && esbuild)             PASS in CI (Ubuntu, Node 22)
+local Termux/Android vite build                   BLOCKED — Rollup native addon
+                                                  ERR_DLOPEN_FAILED
+                                                  (baseline identical)
 ```
 
-`vite build` fails in this Termux/Android arm64 environment because the Rollup
-native addon cannot be dlopened (`@rollup/rollup-android-arm64`,
+`vite build` fails in this local Termux/Android arm64 environment because the
+Rollup native addon cannot be dlopened (`@rollup/rollup-android-arm64`,
 `ERR_DLOPEN_FAILED`). The same failure occurs on the untouched baseline
 worktree at `526e37e`, so it is an environment precondition, not a regression
-from this branch. The esbuild server bundle passes.
+from this branch. The server esbuild bundle passes locally, and the PR's CI
+verify jobs ran `npm run build` on Ubuntu with Node 22 and passed.
 
 ### 3.3 Offline selector comparison (100 seeds × 1500 pulls)
 
@@ -363,11 +365,11 @@ consumption and PR #557's own tests remain intact. PR #557 was not modified.
 
 ## 5. Known gaps, blockers and boundaries
 
-1. **Vite build environment.** `npm run build` cannot complete in this
+1. **Local Vite environment.** `npm run build` cannot complete in this local
    Termux/Android environment because the Rollup native addon cannot be
    dlopened; baseline fails identically. The server esbuild bundle and the
-   TypeScript type-check pass. CI or a normal x64/arm64 Linux environment must
-   run the Vite build before merge.
+   TypeScript type-check pass locally, and CI ran the full Vite + esbuild build
+   on Ubuntu/Node 22 successfully. This is no longer a merge blocker.
 2. **Pre-existing test failures.** 49 full-suite failures exist on the
    untouched baseline; this branch neither fixes nor worsens them. They are
    outside this programme.
@@ -386,6 +388,13 @@ consumption and PR #557's own tests remain intact. PR #557 was not modified.
 7. **Held-out set size.** The held-out composition set is deliberately small
    and hand-built. It measures 0 invalid admissions and 100% valid admission in
    this sample; it is not a production-representative estimate.
+8. **Stacked base.** This PR targets `e2e/invite-discovery-remediation`
+   (PR #567's head) so its diff contains only the programme commits. It must be
+   retargeted after PR #567 lands; PR #567 itself was not modified.
+9. **Review-bot configuration.** The `PR Agent review` check fails because its
+   configured Gemini API key is invalid (`API_KEY_INVALID`), and Codex review
+   was unavailable due usage limits. Unit, PostgreSQL, verify and build checks
+   pass. These are external bot/configuration failures, not code failures.
 
 ## 6. Rollback
 
@@ -405,16 +414,19 @@ consumption and PR #557's own tests remain intact. PR #557 was not modified.
 
 ## 7. Merge readiness
 
-Code complete and locally verified. Merge is not performed. Before merge:
+Code complete and locally verified; CI unit, PostgreSQL, verify and build
+checks pass. Merge is not performed. Before merge:
 
-1. CI or a normal Linux environment must run `npm run build` (Vite + esbuild);
-   the local Vite blocker is the Termux/Android Rollup native addon, and the
-   untouched baseline fails identically.
+1. Confirm the stacked base. This PR targets
+   `e2e/invite-discovery-remediation` (PR #567 head) and must be retargeted
+   after PR #567 lands; PR #567 was not modified.
 2. Confirm the PR #557 merge order. The isolated compatibility run passes, but
    the Q0-on-v2 lifecycle edit and the shared import resolution must be kept in
    the merge result.
 3. Treat the 49 pre-existing full-suite failures as baseline, not as new
    regressions, and keep the full-suite failure-name comparison with the merge.
+4. Rerun `PR Agent review` with a valid Gemini API key. Its current failure is
+   an external configuration error; the core CI checks are green.
 
 No merge, deployment, schema migration, production data cleanup or live
 experiment was performed.
