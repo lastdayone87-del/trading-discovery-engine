@@ -84,6 +84,9 @@ const LATIN_COUNTRIES = new Set([
   'United States', 'United Kingdom', 'Canada', 'Australia', 'New Zealand',
   'Ireland', 'France', 'Germany', 'Netherlands', 'Belgium', 'Luxembourg',
   'Switzerland', 'Denmark', 'Sweden', 'Norway',
+  // Supported dormant countries also use Latin script. Omitting them made
+  // their curated native terms fail the script gate once promoted.
+  'Italy', 'Spain',
 ]);
 
 const SCRIPT_PATTERNS: Array<[string, RegExp]> = [
