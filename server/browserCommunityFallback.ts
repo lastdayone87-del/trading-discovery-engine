@@ -1473,6 +1473,14 @@ export function resolveRenderedCompletionState(input: {
    * must stay retryable rather than resolving as a clean absence.
    */
   interactionGap?: boolean;
+  /**
+   * P1.7 coverage truthfulness: a non-COMPLETE navigation-coverage reason is
+   * never a clean absence. `BOUNDED` gaps (budget/interaction/scroll) are
+   * retryable; deterministic policy/context gaps are visible partials but do
+   * not own retry unless a traversal/policy change can alter the outcome.
+   */
+  coverageReason?: RenderedCoverageReason;
+  coverageRetryable?: boolean;
 }): { complete: boolean; retryable: boolean; failureClass: 'NO_PAGE_PROCESSED' | undefined } {
   // Processed means actual successfully inspected page evidence — a request
   // merely starting (admitted but never inspected) is zero-page evidence.
@@ -1500,8 +1508,16 @@ export function resolveRenderedCompletionState(input: {
   // and retryable even when nothing failed.
   const pageBudgetCutoff = input.pageBudgetExhausted === true;
   const interactionIncomplete = input.interactionGap === true;
-  const incomplete = !processed || input.timedOut || terminalFailures > 0 || failedWithNoPages || pageBudgetCutoff || interactionIncomplete;
-  return { complete: !incomplete, retryable: incomplete, failureClass: !processed ? 'NO_PAGE_PROCESSED' : undefined };
+  const baseIncomplete = !processed || input.timedOut || terminalFailures > 0 || failedWithNoPages || pageBudgetCutoff || interactionIncomplete;
+  // A non-COMPLETE coverage reason means a navigation surface was observed
+  // but not examined. It can never certify a clean absence, even when the
+  // required same-host set happened to be covered. Deterministic policy or
+  // context gaps stay visible without owning retry; budget/interaction/scroll
+  // gaps are retryable.
+  const coverageIncomplete = input.coverageReason !== undefined && input.coverageReason !== 'COMPLETE';
+  const incomplete = baseIncomplete || coverageIncomplete;
+  const retryable = baseIncomplete || (coverageIncomplete && input.coverageRetryable !== false);
+  return { complete: !incomplete, retryable, failureClass: !processed ? 'NO_PAGE_PROCESSED' : undefined };
 }
 
 /** Bounded underlying error text: message plus one cause level, redacted, capped. */
@@ -2142,7 +2158,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   let pageClickWindowPending = false;
   // nextRenderedClickOffsets reads only outcome.telemetry, so the certificate
   // must be published there on every return path (success and catch).
-  const publishEvidenceControlCertificate = (budgetExhausted = false): void => {
+  const publishEvidenceControlCertificate = (budgetExhausted = false): RenderedCoverageReason => {
     telemetry.evidenceControlsTotal = evidenceControlsSeen || undefined;
     telemetry.evidenceControlsClicked = evidenceControlsClicked || undefined;
     telemetry.evidenceControlsFailed = evidenceControlsFailed || undefined;
@@ -2182,6 +2198,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
       navigationPolicyExcluded: telemetry.navigationPolicyExcluded,
       unrecoveredNavigation: controlsStructuralUnrecovered > 0,
     });
+    return telemetry.coverageReason;
   };
   const terminalSuccessUrls: string[] = [];
   // Per visited page, the same-host community-hint links discovered on it
@@ -2722,7 +2739,17 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           : pendingEligibleRequests > 0 && reachedPageBudget;
         const timedOut=Date.now()-startedAt>=limits.totalTimeoutMs;
         telemetry.unresolvedFailedRequests=renderedUnresolvedFailureCount(requestTracker);
-        const completion=resolveRenderedCompletionState({inspectedPages,timedOut,telemetry,pageBudgetExhausted,interactionGap});
+        // P1.7: publish the coverage certificate before completion so a
+        // non-COMPLETE navigation surface can never resolve as a clean
+        // absence. Budget/interaction/scroll gaps stay retryable; deterministic
+        // policy/context gaps are visible partials without retry ownership.
+        const coverageReason = publishEvidenceControlCertificate(timedOut || pageBudgetExhausted);
+        // `resolveRenderedCoverageReason` folds timedOut, page-budget and
+        // scroll-cap exhaustion into BOUNDED (with inspected pages), so the
+        // reason is the single source of retry ownership. Zero-page runs are
+        // already incomplete via baseIncomplete.
+        const coverageRetryable = coverageReason === 'BOUNDED';
+        const completion=resolveRenderedCompletionState({inspectedPages,timedOut,telemetry,pageBudgetExhausted,interactionGap,coverageReason,coverageRetryable});
         const noPageProcessed=completion.failureClass==='NO_PAGE_PROCESSED';
         const zeroPageReason=resolveRenderedZeroPageReason({inspectedPages,timedOut,saturated:false,browserLaunchFailed:false,thrown:false,telemetry});
         if (zeroPageReason) telemetry.zeroPageReason=zeroPageReason;
@@ -2776,9 +2803,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         // Persist the bounded control-coverage certificate alongside the
         // crawler telemetry so production can distinguish 64-overflow from
         // ordinary click-budget slicing. Counts only; never selectors/text.
-        // P0.2 adds the coverage-reason certificate; a timeout or page-budget
-        // cutoff is a named ceiling and therefore BOUNDED.
-        publishEvidenceControlCertificate(timedOut || pageBudgetExhausted);
+        // P0.2 adds the coverage-reason certificate; P1.7 consumed it above.
         return {
           foundInvite:first?.nativeInviteCode||null,
           foundLocation:first?.sourceUrl,

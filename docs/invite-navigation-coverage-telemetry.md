@@ -1,7 +1,9 @@
-# Invite navigation-coverage telemetry and control recovery (P0.2/P1.1/P1.2)
+# Invite navigation-coverage telemetry and control recovery (P0.2/P1.1/P1.2/P1.7)
 
-**Status:** P0.2 instrumentation plus P1.1/P1.2 control recovery. No outcome,
-retry, selection, queue, or schema behavior changes.
+**Status:** P0.2 instrumentation, P1.1/P1.2 control recovery, and P1.7 outcome
+truthfulness. No queue or schema behavior changes. Cached rendered-evidence
+reuse now requires `COMPLETE` coverage, so a bounded/context/policy gap is no
+longer reusable as a clean site inspection.
 **Scope:** Rendered creator-website acquisition (`mode = RENDERED`).
 **Related evidence:** `INVITE_NAVIGATION_ACQUISITION_RECALL_INVESTIGATION_20261027.md`
 and the 2026-10-27 P0.3 production classification report (read-only Coolify
@@ -48,8 +50,8 @@ then re-checks each candidate against the enqueue rule: a same-origin,
 admissible, not-already-visited destination that the community-hint filter
 would follow is inspected separately and is not a gap. When the enqueue path
 does not follow one, the destination was never examined and coverage is
-`POLICY_EXCLUDED`, not `COMPLETE`. P1.7 still owns the mapping from coverage
-reason to `PARTIALLY_INSPECTED`/retry.
+`POLICY_EXCLUDED`, not `COMPLETE`. P1.7 maps that reason to outcome
+truthfulness and retry ownership (see below).
 
 ## Persisted fields
 
@@ -94,10 +96,14 @@ Existing fields keep their meanings:
    was observed.
 3. `CONTEXT_UNREACHABLE` when frames, open shadow roots, or popup targets were
    observed.
-4. `POLICY_EXCLUDED` when `invalid-protocol`, `admission-rejected`,
-   `cross-origin-disallowed`, or `destination-budget` exclusions occurred, or
-   when `structuralUnrecovered` recorded an unfollowed structural navigation.
+4. `POLICY_EXCLUDED` when `cross-origin-disallowed` or `destination-budget`
+   exclusions occurred, or when `unrecoveredNavigation` recorded an unfollowed
+   structural navigation.
 5. `COMPLETE` otherwise.
+
+`invalid-protocol` and `admission-rejected` are format/security rejections
+(mailto links, assets, private addresses), not unexamined navigation, so they do
+not make an ordinary page a policy gap.
 
 P1.1/P1.2 changed what counts as bounded. Recovered icon-label and structural
 disclosure controls are clicked, so they no longer trigger `BOUNDED`. A
@@ -120,8 +126,31 @@ clicked nor enqueued, not every URL the hint filter rejected. A stronger
 reason wins over a weaker one (for example, a timeout is `BOUNDED` even when
 frames are present).
 
-The reason remains diagnostic. It does not change `complete`, `retryable`,
-`failureClass`, or the acquisition outcome. P1.7 owns that mapping.
+## Outcome truthfulness (P1.7)
+
+A non-`COMPLETE` coverage reason is never a clean absence:
+
+- `resolveRenderedCompletionState` sets `complete=false` and carries the
+  fallback's retry ownership. `BOUNDED` (budget, interaction, scroll) is
+  retryable; `POLICY_EXCLUDED` and `CONTEXT_UNREACHABLE` are visible partials
+  without retry ownership.
+- `renderedAcquisitionOutcome` maps the gap to `PARTIALLY_INSPECTED` (or
+  `FOUND` when an invite was retained) with `RENDERED_POLICY_EXCLUDED`,
+  `RENDERED_CONTEXT_UNREACHABLE`, or `RENDERED_PARTIAL_COVERAGE`.
+- Required-link coverage cannot resolve clean while a coverage gap exists.
+- `isSufficientRenderedCoverage` requires `coverageReason` to be absent or
+  `COMPLETE`, so a gapped run never satisfies the site cache. Legacy rows
+  without the field keep their previous behavior.
+- `FOUND_GAP_RETRYABLE_FAILURE_CLASSES` includes
+  `RENDERED_PARTIAL_COVERAGE` and `RENDERED_BUDGET_EXPIRED`; policy/context
+  classes are intentionally absent, so deterministic gaps stay visible without
+  spending retries.
+- Retry ownership for a coverage gap is derived from the coverage reason, not
+  the fallback's aggregate `retryable` flag. A permanently blocked required
+  child can set that flag without making a deterministic context or policy gap
+  recoverable; only `BOUNDED` owns retry from the gap itself. A separate
+  transient required-child failure still keeps retry ownership, because that
+  page can succeed on refetch even when the traversal limit cannot be cleared.
 
 ## Safety and bounds
 

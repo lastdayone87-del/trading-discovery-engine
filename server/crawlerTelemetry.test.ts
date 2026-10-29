@@ -168,6 +168,11 @@ test('coverage reason distinguishes complete, bounded, policy, context, and unkn
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, popupTargets: 1 }), 'CONTEXT_UNREACHABLE');
   assert.equal(
     resolveRenderedCoverageReason({ pagesInspected: 1, navigationPolicyExcluded: { 'admission-rejected': 3 } }),
+    'COMPLETE',
+    'format/security rejections are not unexamined navigation',
+  );
+  assert.equal(
+    resolveRenderedCoverageReason({ pagesInspected: 1, navigationPolicyExcluded: { 'cross-origin-disallowed': 3 } }),
     'POLICY_EXCLUDED',
   );
   assert.equal(

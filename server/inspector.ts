@@ -972,7 +972,31 @@ export interface RenderedRequiredGap {
   permanentFailures: string[];
 }
 
-function renderedAcquisitionOutcome(rendered:BrowserFallbackResult,renderedProcessed:boolean,renderedCandidates:DiscordCandidate[],requiredGap?:RenderedRequiredGap):{outcome:ExternalAcquisitionStatus;failureClass?:string;gapRetryable?:boolean}{
+/**
+ * P1.7 coverage-gap classification for outcome truthfulness. A non-COMPLETE
+ * navigation-coverage reason means a surface was observed but not examined.
+ * The run is a partial, never a clean absence. Retry ownership follows the
+ * fallback's own retryable flag: budget/interaction/scroll gaps are
+ * retryable; deterministic policy/context gaps are visible without retry.
+ */
+function renderedCoverageGap(rendered:BrowserFallbackResult):{reason:string;failureClass:string;retryable:boolean}|undefined{
+  if((rendered.inspectedPages||0)<=0)return undefined;
+  const reason=rendered.telemetry?.coverageReason;
+  if(!reason||reason==='COMPLETE')return undefined;
+  const failureClass=reason==='POLICY_EXCLUDED'
+    ?'RENDERED_POLICY_EXCLUDED'
+    :reason==='CONTEXT_UNREACHABLE'
+      ?'RENDERED_CONTEXT_UNREACHABLE'
+      :'RENDERED_PARTIAL_COVERAGE';
+  // Retry ownership comes from the coverage reason, not the fallback's
+  // aggregate retryable flag. A permanent required-child failure sets that
+  // flag even when the remaining gap is deterministic (context/policy), and
+  // refetching cannot clear it. Only a BOUNDED budget/interaction/scroll gap
+  // owns recovery here.
+  return{reason,failureClass,retryable:reason==='BOUNDED'};
+}
+
+export function renderedAcquisitionOutcome(rendered:BrowserFallbackResult,renderedProcessed:boolean,renderedCandidates:DiscordCandidate[],requiredGap?:RenderedRequiredGap):{outcome:ExternalAcquisitionStatus;failureClass?:string;gapRetryable?:boolean}{
   const gap = requiredGap && (rendered.inspectedPages || 0) > 0 ? requiredGap : undefined;
   const hasUnvisited = !!gap && gap.unvisited.length > 0;
   const hasTransient = !!gap && gap.transientFailures.length > 0;
@@ -984,6 +1008,12 @@ function renderedAcquisitionOutcome(rendered:BrowserFallbackResult,renderedProce
   // never resolve as a clean absence and keeps bounded retry alive.
   const interactionGap = rendered.interactionGap === true;
   const interactionClass = interactionGap ? 'RENDERED_INTERACTION_GAP' : undefined;
+  const coverageGap = renderedCoverageGap(rendered);
+  // A timeout is a total-timeout ceiling, not proof of page-budget pressure:
+  // keep RENDERED_BUDGET_EXPIRED only when page-budget drops evidence it,
+  // otherwise attribute the timeout truthfully so it never reads as budget.
+  const pageBudgetCut=(rendered.dropReasons?.['page-budget']||0)>0;
+  const timeoutClass=rendered.timedOut?(pageBudgetCut?'RENDERED_BUDGET_EXPIRED':'RENDERED_TIMEOUT'):undefined;
   // FOUND never erases outstanding required obligations: invites are retained
   // and reported, while a retryable gap keeps bounded recovery alive through
   // the returned gapRetryable flag (consumed by the caller into the
@@ -994,6 +1024,10 @@ function renderedAcquisitionOutcome(rendered:BrowserFallbackResult,renderedProce
     // A retryable interaction gap may hide further invites, so it outranks a
     // permanent-only required failure (which never owns retry work).
     if (interactionGap) return {outcome:'FOUND',failureClass:rendered.timedOut?'RENDERED_TIMEOUT':'RENDERED_INTERACTION_GAP',gapRetryable:true};
+    // A policy/context/budget coverage gap means navigation was not fully
+    // examined even though an invite was retained. Keep the invite and the
+    // visible gap; retry only when the gap is recoverable.
+    if (coverageGap) return {outcome:'FOUND',failureClass:timeoutClass||coverageGap.failureClass,gapRetryable:coverageGap.retryable};
     if (hasPermanentOnly) return {outcome:'FOUND',gapRetryable:false};
     return{outcome:'FOUND'};
   }
@@ -1006,20 +1040,22 @@ function renderedAcquisitionOutcome(rendered:BrowserFallbackResult,renderedProce
   // coverage; legacy results without it keep exact legacy behavior.
   const requiredCovered = rendered.requiredTotal !== undefined && (rendered.inspectedPages || 0) > 0 &&
     !(rendered.requiredUnvisited?.length) && !(rendered.requiredTransientFailures?.length) && !(rendered.requiredPermanentFailures?.length);
-  // Required-link coverage never absorbs an interaction gap: a click-only
-  // control that failed or was skipped could still be holding the invite.
-  if (requiredCovered && !interactionGap) return {outcome:'INSPECTED_NO_MATCH'};
-  if(rendered.complete&&renderedProcessed&&!interactionGap)return{outcome:'INSPECTED_NO_MATCH'};
-  // A timeout is a total-timeout ceiling, not proof of page-budget pressure:
-  // keep RENDERED_BUDGET_EXPIRED only when page-budget drops evidence it,
-  // otherwise attribute the timeout truthfully so it never reads as budget.
-  const pageBudgetCut=(rendered.dropReasons?.['page-budget']||0)>0;
-  const timeoutClass=rendered.timedOut?(pageBudgetCut?'RENDERED_BUDGET_EXPIRED':'RENDERED_TIMEOUT'):undefined;
+  // Required-link coverage never absorbs an interaction or navigation-coverage
+  // gap: a click-only control or an unexamined policy/context surface could
+  // still be holding the invite. Only a genuinely COMPLETE run is clean.
+  if (requiredCovered && !interactionGap && !coverageGap) return {outcome:'INSPECTED_NO_MATCH'};
+  if(rendered.complete&&renderedProcessed&&!interactionGap&&!coverageGap)return{outcome:'INSPECTED_NO_MATCH'};
   if (hasUnvisited) return{outcome:'PARTIALLY_INSPECTED',failureClass:'REQUIRED_UNVISITED_BUDGET_GAP',gapRetryable:true};
   // An unexamined control outranks a permanent-only required failure: the
   // blocked link cannot own retry work, but content hidden behind a failed or
   // skipped community control still can, and must not be certified clean.
   if (interactionGap) return{outcome:rendered.inspectedPages>0?'PARTIALLY_INSPECTED':'ACQUISITION_FAILED',failureClass:rendered.timedOut?'RENDERED_TIMEOUT':'RENDERED_INTERACTION_GAP',gapRetryable:true};
+  // P1.7: a non-COMPLETE navigation-coverage reason is never a clean absence.
+  // Keep the specific failure class. A deterministic context/policy gap does
+  // not own retry by itself, but a separate transient required-child failure
+  // still does: the failed page can succeed on refetch even though the
+  // traversal limit cannot be cleared.
+  if (coverageGap) return{outcome:rendered.inspectedPages>0?'PARTIALLY_INSPECTED':'ACQUISITION_FAILED',failureClass:timeoutClass||coverageGap.failureClass,gapRetryable:coverageGap.retryable||hasTransient};
   // Required permanent-only failure (e.g. BLOCKED wall on a required member
   // with no other gap) stays visible but never owns retry work: identical
   // refetch patterns cannot clear access denial.
@@ -2023,7 +2059,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
     } else if (staticTerminalBarrier) {
       step5Logs.push(`[Terminal barrier] ${item.url} conclusive permanent barrier established statically (${crawlRes.outcome}); no rendered escalation.`);
     }
-    if(!staticTerminalBarrier && !demoteSkipsRender && creatorLikelyTrading&&(crawlRes.outcome!=='FOUND'||!hasCreatorOwned)){const {crawlRenderedCommunitySurface,wasRenderedResultProcessed}=await import('./browserCommunityFallback');const ladderDecision=resolveRenderEscalation({staticOutcome:crawlRes.outcome,creatorLikelyTrading:true,surface:'CREATOR_WEBSITES',hasCreatorOwnedEvidence:crawlRes.outcome==='FOUND'&&hasCreatorOwned});if(ladderOn)step5Logs.push(`[Ladder] render decision for ${item.url}: ${ladderDecision.justification} (${ACQUISITION_LADDER_POLICY_VERSION}).`);const shouldRendered=ladderDecision.escalate;if(shouldRendered){const sharedHit=findRenderedShare(item.url);if(sharedHit){acquisitionOutcomes.push({requestedUrl:item.url,finalUrl:item.url,wrapperUrl:item.wrapperUrl,surface:'CREATOR_WEBSITES',required:false,outcome:sharedHit.candidatesFound>0?'FOUND':'INSPECTED_NO_MATCH',retryable:false,httpStatus:200,detail:`Shared rendered evidence from ${sharedHit.bySeed} (terminal success, no refetch).`,observedAt:now,telemetry:renderedCrawlerTelemetry({inspectedPages:1,clicks:0,complete:true})});step5Logs.push(`[Shared evidence] ${item.url} reuses rendered inspection from ${sharedHit.bySeed}; no refetch.`);await captureSeedSiteInspection(item,seedOutcomeStart,seedCandidateStart,false,seedIntentStart);continue;}const rendered=await (channelData.renderedFallback||crawlRenderedCommunitySurface)(item.url,{alreadyVisited:[...sharedRenderedEvidence.keys()],clickOffset:renderedClickOffsetForSeed(item.url),resolveHost:channelData.destinationResolver}).catch((error:any)=>isolatedRenderedFallback(item.url,error)),renderedProcessed=wasRenderedResultProcessed(rendered),renderedCandidates=normalizedRenderedCandidates(rendered,'CREATOR_WEBSITES',item.url);websiteCandidates.push(...renderedCandidates);const renderedResult=renderedAcquisitionOutcome(rendered,renderedProcessed,renderedCandidates,requiredGapFromRendered(rendered)),renderedOutcome:ExternalAcquisitionStatus=renderedResult.outcome;acquisitionOutcomes.push({requestedUrl:item.url,finalUrl:rendered.foundLocation,wrapperUrl:item.wrapperUrl,surface:'CREATOR_WEBSITES',required:true,outcome:renderedOutcome,retryable:renderedResult.failureClass==='SSRF_BLOCKED'?false:(renderedResult.gapRetryable!==undefined?renderedResult.gapRetryable:(rendered.retryable||!renderedProcessed)),failureClass:renderedResult.failureClass,detail:rendered.detail,observedAt:now,telemetry:renderedCrawlerTelemetry({inspectedPages:rendered.inspectedPages,clicks:rendered.clicks,complete:rendered.complete,timedOut:rendered.timedOut,telemetry:rendered.telemetry,scrollsUsed:rendered.scrolls||0,dropReasons:rendered.dropReasons,experimentAttribution:ladderRenderAttribution})});if(renderedCandidates.length&&renderedResult.gapRetryable!==undefined&&!isAuxiliaryForOutcome(item.url))foundGapSeeds.push({url:item.url,retryable:renderedResult.gapRetryable});recordRenderedEvidence(item.url,rendered,renderedCandidates);step5Logs.push(renderedCandidates.length?`Rendered fallback retained ${renderedCandidates.length} candidate(s).`:rendered.detail);seedRenderedCovered=isSufficientRenderedCoverage({complete:rendered.complete,timedOut:rendered.timedOut,interactionGap:rendered.interactionGap},renderedProcessed);}}
+    if(!staticTerminalBarrier && !demoteSkipsRender && creatorLikelyTrading&&(crawlRes.outcome!=='FOUND'||!hasCreatorOwned)){const {crawlRenderedCommunitySurface,wasRenderedResultProcessed}=await import('./browserCommunityFallback');const ladderDecision=resolveRenderEscalation({staticOutcome:crawlRes.outcome,creatorLikelyTrading:true,surface:'CREATOR_WEBSITES',hasCreatorOwnedEvidence:crawlRes.outcome==='FOUND'&&hasCreatorOwned});if(ladderOn)step5Logs.push(`[Ladder] render decision for ${item.url}: ${ladderDecision.justification} (${ACQUISITION_LADDER_POLICY_VERSION}).`);const shouldRendered=ladderDecision.escalate;if(shouldRendered){const sharedHit=findRenderedShare(item.url);if(sharedHit){acquisitionOutcomes.push({requestedUrl:item.url,finalUrl:item.url,wrapperUrl:item.wrapperUrl,surface:'CREATOR_WEBSITES',required:false,outcome:sharedHit.candidatesFound>0?'FOUND':'INSPECTED_NO_MATCH',retryable:false,httpStatus:200,detail:`Shared rendered evidence from ${sharedHit.bySeed} (terminal success, no refetch).`,observedAt:now,telemetry:renderedCrawlerTelemetry({inspectedPages:1,clicks:0,complete:true})});step5Logs.push(`[Shared evidence] ${item.url} reuses rendered inspection from ${sharedHit.bySeed}; no refetch.`);await captureSeedSiteInspection(item,seedOutcomeStart,seedCandidateStart,false,seedIntentStart);continue;}const rendered=await (channelData.renderedFallback||crawlRenderedCommunitySurface)(item.url,{alreadyVisited:[...sharedRenderedEvidence.keys()],clickOffset:renderedClickOffsetForSeed(item.url),resolveHost:channelData.destinationResolver}).catch((error:any)=>isolatedRenderedFallback(item.url,error)),renderedProcessed=wasRenderedResultProcessed(rendered),renderedCandidates=normalizedRenderedCandidates(rendered,'CREATOR_WEBSITES',item.url);websiteCandidates.push(...renderedCandidates);const renderedResult=renderedAcquisitionOutcome(rendered,renderedProcessed,renderedCandidates,requiredGapFromRendered(rendered)),renderedOutcome:ExternalAcquisitionStatus=renderedResult.outcome;acquisitionOutcomes.push({requestedUrl:item.url,finalUrl:rendered.foundLocation,wrapperUrl:item.wrapperUrl,surface:'CREATOR_WEBSITES',required:true,outcome:renderedOutcome,retryable:renderedResult.failureClass==='SSRF_BLOCKED'?false:(renderedResult.gapRetryable!==undefined?renderedResult.gapRetryable:(rendered.retryable||!renderedProcessed)),failureClass:renderedResult.failureClass,detail:rendered.detail,observedAt:now,telemetry:renderedCrawlerTelemetry({inspectedPages:rendered.inspectedPages,clicks:rendered.clicks,complete:rendered.complete,timedOut:rendered.timedOut,telemetry:rendered.telemetry,scrollsUsed:rendered.scrolls||0,dropReasons:rendered.dropReasons,experimentAttribution:ladderRenderAttribution})});if(renderedCandidates.length&&renderedResult.gapRetryable!==undefined&&!isAuxiliaryForOutcome(item.url))foundGapSeeds.push({url:item.url,retryable:renderedResult.gapRetryable});recordRenderedEvidence(item.url,rendered,renderedCandidates);step5Logs.push(renderedCandidates.length?`Rendered fallback retained ${renderedCandidates.length} candidate(s).`:rendered.detail);seedRenderedCovered=isSufficientRenderedCoverage({complete:rendered.complete,timedOut:rendered.timedOut,interactionGap:rendered.interactionGap,coverageReason:rendered.telemetry?.coverageReason},renderedProcessed);}}
     // Seed-slice relevance tagging (flag-gated): covers rendered + shared-hit
     // observations pushed above so DEMOTE seeds stay non-owning through every
     // acquisition path. Static observations were tagged identically earlier.
