@@ -4,8 +4,9 @@
 schema, concurrency, or production change is implemented or authorized.
 **Evidence base:** `docs/evidence/p0_3_acquisition_classification_20261027.md`
 (Coolify production, trailing 7 days; reproducible SQL and raw output in the
-same directory) and the navigation investigation plan
-(`INVITE_NAVIGATION_ACQUISITION_RECALL_INVESTIGATION_20261027.md`).
+same directory) and the navigation/acquisition investigation report
+[`docs/evidence/invite-navigation-acquisition-recall-investigation-20261027.md`](evidence/invite-navigation-acquisition-recall-investigation-20261027.md)
+(read-only; no credentials, connection details, or raw page content).
 
 ## 1. Status summary
 

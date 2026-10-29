@@ -20,10 +20,14 @@ the sample can start as soon as it is approved.
 
 ## 2. Unit, frame, and window
 
-- **Unit:** one creator site (registrable domain plus its reachable community
-  surfaces), not one URL observation. Multiple channel rows on the same domain
-  collapse to one site; the site inherits the channel with the most recent
-  creator-website observation.
+- **Unit:** one creator site, identified with the crawler's
+  `canonicalSiteIdentity` (`site-identity-v1`), not one URL observation. The
+  identity keeps path-tenant creators distinct (`linktr.ee/trader1` versus
+  `linktr.ee/trader2`), subdomain tenants distinct (`tenant.skool.com`), and
+  private-suffix tenants distinct (`tenant.github.io`); otherwise it collapses
+  to the registrable domain. Multiple channel rows that resolve to the same
+  identity collapse to one site; the site inherits the channel with the most
+  recent creator-website observation.
 - **Frame:** production channels with at least one `CREATOR_WEBSITES`
   observation in the window, using the latest site-level outcome per site.
   Only public creator sites are eligible.
@@ -51,6 +55,17 @@ Total target: **400 sites**. S4 is oversampled because failure is the largest
 production bucket and the main recall opportunity. If a stratum is smaller than
 its target, take the whole stratum and redistribute the remainder to S4, with
 the final counts and weights recorded before adjudication.
+
+**Redirect aliases:** resolve the latest site-level outcome through the
+redirect chain before assigning a stratum. Use
+`canonicalSiteIdentity(requestedUrl, finalUrl)` so a `REDIRECTED` alias joins
+the destination site's identity instead of falling outside S1–S4. If the chain
+is unresolved, leaves the public frame, or ends at a non-HTTP(S)/unparsable
+destination, exclude the alias and count it under `REDIRECT_UNRESOLVED`; it is
+never silently dropped. Any resolved outcome outside the four definitions is
+likewise excluded and counted by reason. After resolution, S1–S4 are disjoint
+and exhaustive for the included frame, and the exclusion counts are recorded
+before adjudication.
 
 **Precision check:** for a recall estimate near 0.70 and n=400, the unweighted
 95% interval is roughly ±4.5 percentage points. Stratification and the
@@ -111,14 +126,23 @@ P_h = sum_{i in sample_h} y_i / n_h
 P   = sum_h (N_h / N) * P_h
 ```
 
-Recall uses the crawler's site-level result for the same site and window:
+Recall uses the crawler's site-level result for the same site and window.
+Weight by the inverse sampling probability within each stratum, not by all
+sites, so recall cannot track the share the crawler marked `FOUND`:
 
 ```
-TP_h = sampled sites with ground truth invite AND crawler FOUND
-FN_h = sampled sites with ground truth invite AND crawler did not find it
-Recall_h = TP_h / (TP_h + FN_h)
-Recall   = sum_h (N_h / N) * Recall_h
+w_h    = N_h / n_h
+TP_h   = sampled sites with ground truth invite AND crawler FOUND
+FN_h   = sampled sites with ground truth invite AND crawler did not find it
+Recall = sum_h (w_h * TP_h) / sum_h (w_h * (TP_h + FN_h))
 ```
+
+A stratum with no ground-truth positives contributes zero to both the
+numerator and the denominator and is reported separately as "no ground-truth
+positives"; it does not define `Recall_h` as 0/0. If the weighted denominator
+is zero, no recall estimate is published. Bootstrap the same weighted ratio
+(10,000 resamples, resampling sites within strata) so the reported interval
+measures the same quantity as the point estimate.
 
 Report:
 

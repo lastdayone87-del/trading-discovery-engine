@@ -31,7 +31,7 @@ This is an **observation-level classification**, not a labeled recall estimate.
 1. **Creator-surface acquisition is still dominated by failure, but the site-level picture is more balanced than the URL-level one.** URL-level creator observations: 120,670 total; 82,106 `ACQUISITION_FAILED` (68.0%), 16,206 `PARTIALLY_INSPECTED` (13.4%), 7,903 `FOUND` (6.5%), 14,455 clean no-match (12.0%). Site-level rows updated in the window: 2,651 total; 1,019 failed (38.4%), 1,054 partial (39.8%), 313 found (11.8%), 45 clean (1.7%), 220 redirected (8.3%).
 2. **Static HTTP failure is the largest single bucket.** 61,648 URL observations are static-fetch failures (51.1% of all creator observations). HTTP 404 accounts for 34,833 of the status-bearing failures, 403 for 14,011, 406 for 1,512, and 429 for 1,199.
 3. **Rendered capacity is the second-largest bucket.** 18,319 observations are `RENDERED_FALLBACK_SATURATED` (15.2% of all creator observations); 18,319 of the 32,232 rendered observations have `zeroPageReason = GATE_SATURATED` (56.8%). This is a capacity/gate problem, not a navigation-pattern problem.
-4. **Rendered clicking is expensive and mostly unsuccessful.** 46,128 clicks started; 18,310 succeeded (39.7%) and 27,861 failed (60.4%). The failure detail is dominated by `overlay_intercepted` (18,397; 67.7% of detailed failures) and `timeout` (7,130; 26.2%). `target_closed` is 1,617 (5.9%).
+4. **Rendered clicking is expensive and mostly unsuccessful.** 46,128 clicks started; the outcome counters record 18,310 succeeded and 27,861 failed, or 46,171 outcomes — 43 more than clicks started. Shares of recorded outcomes are 39.7% succeeded and 60.3% failed; the 43-outcome difference is a source-counter reconciliation gap, so these are descriptive shares, not an exact per-attempt ledger. The failure detail is dominated by `overlay_intercepted` (18,397; 67.7% of detailed failures) and `timeout` (7,130; 26.2%). `target_closed` is 1,617 (5.9%).
 5. **Hint filtering is the dominant navigation loss, but it is also the current safety valve.** `hint-rejected` accounts for 1,951,969 rendered drop events; `control-slice` 250,029; `admission-rejected` 49,937. The hint filter is why generic menus are invisible; the slice/rotation work in PR #558 addresses the second-order loss.
 6. **Host recovery is highly uneven.** High-recovery hosts include `bitunix.com` (95.7%), `fundednext.com` (93.3%), `tradeify.co` (82.6%), `lucidtrading.com` (42.9%), `linktr.ee` (39.7%), and `apextraderfunding.com` (32.9%). Low/zero-recovery hosts include `whop.com` (8.2%), `skool.com` (3.3%), `patreon.com` (0%), `linkedin.com` (0%), `instagram.com` (0%), `twitter.com` (0%), `docs.whop.com` (0%), and `img-v2-prod.whop.com` (0%). This is direct evidence for host-aware retry (P2.1), not a blanket retry increase.
 7. **The retry queue is not starving for due work; it is starving for claims.** 1,599 retry jobs are pending, all 1,599 are due (`run_after <= now()`), all are unlocked, and 1,223 (76.5%) have zero attempts. 812 are `COMMUNITY_REQUIRED_ACQUISITION_FAILURE` and 787 are `BROWSER_RUNTIME_UNAVAILABLE`. In the last 7 days, retry-job attempts were 2,743 failed and 405 completed (87.1% failure). This is a queue/claim/worker-capacity investigation (P2.4/P2.5), not a reason to raise concurrency blindly.
@@ -209,7 +209,7 @@ Deep/query/root pages are the recall surface. Asset/template rows are 4,398 fail
 | 409 | 31 |
 | 502 | 21 |
 | 402 | 13 |
-| other | 33 |
+| other | 41 |
 
 404 dominates. Some of these are genuinely dead child URLs; some are malformed/template URLs. The pattern table separates the latter. 403/406/429 are access/rate classes and are candidates for host-specific handling, not blanket retries.
 
@@ -256,8 +256,9 @@ Snapshot of rendered creator observations:
 | Requests failed | 11,853 |
 | Blocked requests | 68,343 |
 | Clicks started | 46,128 |
-| Clicks succeeded | 18,310 (39.7%) |
-| Clicks failed | 27,861 (60.4%) |
+| Clicks succeeded | 18,310 (39.7% of 46,171 recorded outcomes) |
+| Clicks failed | 27,861 (60.3% of 46,171 recorded outcomes) |
+| Recorded click outcomes | 46,171 (43 more than clicks started; source counters not fully reconciled) |
 | Navigation timeouts | 4,115 |
 | Budget exhausted | 4,794 |
 | Host backoffs applied | 0 |
@@ -271,7 +272,7 @@ Snapshot of rendered creator observations:
 | target_closed | 1,617 | 5.9% |
 | other | 43 | 0.2% |
 
-Overlay interception and timeout are the dominant click failures. This is evidence for P1.1/P1.3/P1.4 work that expands navigation surfaces, but it also warns that adding more click targets without handling overlays/timeouts will mostly add failed clicks. The click budget is already 60% wasted.
+Overlay interception and timeout are the dominant click failures. This is evidence for P1.1/P1.3/P1.4 work that expands navigation surfaces, but it also warns that adding more click targets without handling overlays/timeouts will mostly add failed clicks. About 60% of recorded click outcomes failed (27,861 of 46,171); the 43-outcome gap above means this is a descriptive share, not an exact per-attempt ledger.
 
 ### 6.2 Rendered drop reasons
 
