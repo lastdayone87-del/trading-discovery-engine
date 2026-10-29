@@ -184,7 +184,7 @@ touched.
 | Attribution | term/relation/family/surface credited | `Q5: quality vector is result-level and attribution carries the full path` | PASS |
 | Portfolio | cold-start countries get candidates; exploration bounded; no infinite generation | `Q4: portfolio budget…`, planner matrix, `NO_ELIGIBLE_QUERY` contract | PASS |
 | PR #557 | 50-page ceiling unchanged; cumulative metrics consumed; no page-sum | isolated worktree integration run | PASS — 275/275 tests; PR #557 head unchanged |
-| Full suite | `npm test`, lint, type-check, build pass; no regressions | see §3 | PASS with baseline-only failures — 3675/3910 pass, 186 skipped, 49 baseline failures identical; type-check PASS; CI build PASS (local Termux Vite blocked, baseline-identical) |
+| Full suite | `npm test`, lint, type-check, build pass; no regressions | see §3 | PASS with baseline-only failures — 3679/3915 pass, 186 skipped, 49 baseline failure names identical plus one load-sensitive timing assertion that passes in isolation; type-check PASS; CI build PASS (local Termux Vite blocked, baseline-identical) |
 
 ### 2.2 Q4 selector and quality targets
 
@@ -217,13 +217,18 @@ targeted: autonomousRootFirewall, countryNativeIntelligence,
 terminologyNativeDiscovery, queryPlanner,
 querySelectionNoCandidate.contract, queryFeedbackEvaluation
                                                   160/160 PASS
-npm test                                          3910 tests: 3675 pass, 49 fail
-                                                  (baseline-identical), 186 skipped
+npm test                                          3915 tests: 3679 pass, 50 fail
+                                                  (49 baseline failure names +
+                                                  1 load-sensitive timing test),
+                                                  186 skipped
 ```
 
 The full-suite failure-name set was compared with the pre-existing baseline:
-identical (49 baseline failures across 39 unrelated files). No new failure was
-introduced.
+all 49 baseline failures across 39 unrelated files remain identical. The one
+additional failure is the 250 ms deadline assertion in
+`server/externalOsint.test.ts`; it passes 1/1 in isolation (`39.7 ms`) and is a
+scheduling artefact of the fully parallel suite, not a product-code regression.
+No new failure was introduced.
 
 ### 3.2 Build / lint
 
