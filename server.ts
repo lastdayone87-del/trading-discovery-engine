@@ -20,9 +20,11 @@ import {
   getExtractedVocabulary,
   setQueryCollection,
   purgeSyntheticTestChannels, pruneYouTubeQuotaAccountingOps, pruneSiteInspections, appendOperatorAuditEvent, getOperatorAuditEvents, getProviderOperationalMetrics, getValidationRuns, getReplayReport,
-  listChannelsPage, getChannelListingRevision, getDashboardOperationalSummary, getLegacyCommunityRetryDiagnostics, getCrawlerReliabilityMetrics
+  listChannelsPage, getChannelListingRevision, getDashboardOperationalSummary, getLegacyCommunityRetryDiagnostics, getCrawlerReliabilityMetrics,
+  getQueryQualityDashboardRows, getQueryPortfolioBudgetState
 
 } from './server/db';
+import { buildQueryQualityDashboard } from './server/queryQuality/dashboard';
 import { getExecutionLineageMetrics } from './server/executionLineageMetrics';
 import { inspectPassivePrograms } from './server/passiveExploration';
 import { inspectTopicPilot, updatePilotControl } from './server/topicPilot';
@@ -648,6 +650,22 @@ async function startServer() {
       const limit = parseInt(req.query.limit as string) || 20;
       const logs = await getRecentQueryExecutionLogs(limit);
       res.json(logs);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 17b. Q6 Query Quality Dashboard
+  // Read-only projection of persisted run rewards, admission, selection/stop
+  // reasons and portfolio quota. No new table, no write, no quota spend.
+  app.get('/api/query-intelligence/quality-dashboard', async (req, res) => {
+    try {
+      const country = req.query.country as string | undefined;
+      const [rows, portfolio] = await Promise.all([
+        getQueryQualityDashboardRows(country),
+        getQueryPortfolioBudgetState(),
+      ]);
+      res.json(buildQueryQualityDashboard({ generatedAt: new Date().toISOString(), portfolio, rows }));
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }

@@ -12,7 +12,8 @@ export class CountryKnowledgeProvider implements EvidenceProvider {
     const countryPack = knowledgeContext.countryKnowledge;
     const langPack = knowledgeContext.languageKnowledge;
     const langPacks=knowledgeContext.languageKnowledgePacks||[langPack].filter((pack):pack is NonNullable<typeof pack>=>Boolean(pack));
-    const fieldsFor=(terms:string[])=>(input.evidence_corpus||[]).filter(document=>terms.some(term=>textMatchesTerm(document.text,term))).map(documentRef);
+    // C1a: retrieval provenance is never attributable evidence.
+    const fieldsFor=(terms:string[])=>(input.evidence_corpus||[]).filter(document=>document.field!=='search_match_context'&&terms.some(term=>textMatchesTerm(document.text,term))).map(documentRef);
 
     if (!countryPack && !langPack) {
       return items;

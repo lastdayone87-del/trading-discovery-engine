@@ -218,6 +218,24 @@ export interface VerificationDecision {
     coverageConfidence: number;
     reasonCodes: string[];
   };
+  /** C3 honest reporting. All fields optional for replaying older fixtures. */
+  classificationMethod?: 'DETERMINISTIC_EVIDENCE' | 'SEMANTIC_GEMINI' | 'SEMANTIC_GROQ' | 'SEMANTIC_GEMINI_FREE' | 'HEURISTIC_ONLY' | 'DEGRADED_HEURISTIC';
+  providerCoverage?: number;
+  evidenceCount?: number;
+  recognitionState?: string;
+  semanticPolicy?: string;
+  semanticSkippedReason?: string | null;
+  composition?: {
+    focus: string;
+    observedFamilies: number;
+    tradingFamilies: number;
+    alternativeFamilies: number;
+    tradingCoverage: number;
+    alternativeCoverage: number;
+    temporalCoverage: string;
+    nonTitleTierAFamilies: number;
+    reasons: string[];
+  };
 }
 
 export type ProviderAvailability = 'AVAILABLE' | 'NOT_APPLICABLE' | 'UNAVAILABLE' | 'FAILED';

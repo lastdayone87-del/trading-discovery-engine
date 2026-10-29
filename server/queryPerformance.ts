@@ -1,9 +1,29 @@
 import type { QueryCollection } from '../src/types';
+import { canPromoteToProven } from './queryQuality/accounting';
 
 export type FunnelOutcome = 'COUNTRY_REJECTED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW' | 'TRADING_CONFIRMED';
 
 /** Authoritative production threshold for a trading-confirmed creator to count as quality. */
 export const QUALITY_CREATOR_SCORE_THRESHOLD = 55;
+
+/** Promotion needs at least two completed runs and a positive LCB. */
+export const PROVEN_MIN_COMPLETED_RUNS = 2;
+/**
+ * Promotion threshold for the 5th-percentile Gamma-Poisson rate, expressed in
+ * globally new confirmed creators per 100 quota units. Selection uses the
+ * optimistic mean + c*SD index; promotion deliberately uses this LCB.
+ */
+export const PROVEN_LCB_THRESHOLD = 0.5;
+
+export interface QueryPromotionGuard {
+  completedRuns: number;
+  lcb: number;
+  newConfirmedCreators: number;
+  duplicateRatio?: number;
+  invalidQueryRate?: number;
+  minRuns?: number;
+  threshold?: number;
+}
 
 export function isQualityCreator(funnelOutcome: string, qualityScore: number): boolean {
   return funnelOutcome === 'TRADING_CONFIRMED' && qualityScore >= QUALITY_CREATOR_SCORE_THRESHOLD;
@@ -208,10 +228,32 @@ export function isSeverelyContaminatedQuery(metrics: QueryFunnelMetrics): boolea
   return contaminationRatio >= 0.8 && metrics.tradingPrecision <= 0.1 && metrics.qualityChannels === 0;
 }
 
-export function selectQueryCollection(current: QueryCollection, priorRuns: number, metrics: QueryFunnelMetrics): QueryCollection {
+export function selectQueryCollection(
+  current: QueryCollection,
+  priorRuns: number,
+  metrics: QueryFunnelMetrics,
+  guard?: QueryPromotionGuard,
+): QueryCollection {
   const totalRuns = priorRuns + 1;
   if (isSeverelyContaminatedQuery(metrics)) return 'REJECTED';
-  if (metrics.performanceScore >= 60) return 'PROVEN';
+  if (metrics.performanceScore >= 60) {
+    // A zero-confirm run can never establish PROVEN, even when the legacy
+    // blended score is high (novelty/community alone are not yield).
+    if (metrics.tradingConfirmed <= 0) return 'EXPERIMENTAL';
+    if (guard) {
+      const promotion = canPromoteToProven({
+        completedRuns: guard.completedRuns,
+        minRuns: guard.minRuns ?? PROVEN_MIN_COMPLETED_RUNS,
+        lcb: guard.lcb,
+        threshold: guard.threshold ?? PROVEN_LCB_THRESHOLD,
+        newConfirmedCreators: guard.newConfirmedCreators,
+        duplicateRatio: guard.duplicateRatio ?? ratio(metrics.duplicateResults, metrics.rawResults || 1),
+        invalidQueryRate: guard.invalidQueryRate ?? 0,
+      });
+      if (!promotion.eligible) return 'EXPERIMENTAL';
+    }
+    return 'PROVEN';
+  }
   if (metrics.performanceScore < 25 && totalRuns >= 2) return 'REJECTED';
   return current === 'REJECTED' ? 'REJECTED' : 'EXPERIMENTAL';
 }

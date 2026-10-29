@@ -13,20 +13,44 @@ import { ConfigurableWeightedStrategy } from './scoringEngine';
 import { evaluateClassificationStages } from './stagedClassification';
 import { buildCanonicalEvidenceCorpus, validateEvidenceProvenance } from './canonicalEvidencePlane';
 import { contentLanguagePacks } from './multilingualTerminology';
+import { buildContextualComposition, isThinRetrievalComposition } from './contextualComposition';
+import { assessRecognitionState } from './recognitionState';
+import type { ContextualCompositionReport } from './contextualComposition';
+import type { RecognitionAssessment } from './recognitionState';
 
 function safeProviderFailureReasonCodes(err: any, timeout: boolean): string[] {
   const errorClass = String(err?.errorClass || '');
-  const primary = timeout || errorClass === 'TIMEOUT' ? 'PROVIDER_TIMEOUT'
+  const status = Number(err?.status || err?.code || 0);
+  // C4 error taxonomy: auth/permission/model failures are distinct from a
+  // generic permanent input failure so operators can route them correctly.
+  const taxonomy = status === 401 ? 'PROVIDER_AUTH_FAILED'
+    : status === 403 ? 'PROVIDER_PERMISSION_DENIED'
+    : status === 404 ? 'PROVIDER_MODEL_NOT_FOUND'
+    : null;
+  const primary = taxonomy || (timeout || errorClass === 'TIMEOUT' ? 'PROVIDER_TIMEOUT'
     : errorClass === 'RATE_LIMIT' ? 'PROVIDER_RATE_LIMIT'
     : errorClass === 'PERMANENT_INPUT' ? 'PROVIDER_PERMANENT_INPUT'
     : errorClass === 'CANCELLED' ? 'PROVIDER_CANCELLED'
     : errorClass === 'CREDENTIALS_EXHAUSTED' ? 'PROVIDER_CREDENTIALS_EXHAUSTED'
     : errorClass === 'TRANSIENT' ? 'PROVIDER_TRANSIENT_FAILURE'
-    : 'PROVIDER_EXECUTION_FAILED';
+    : 'PROVIDER_EXECUTION_FAILED');
   const providerReasons = Array.isArray(err?.providerReasons)
     ? err.providerReasons.map(String).filter((value: string) => /^[A-Z0-9_.:-]{1,80}$/.test(value)).slice(0, 6)
     : [];
   return [primary, ...providerReasons.filter((value: string) => value !== primary)];
+}
+
+function deadlineRace<T>(promise: Promise<T>, deadlineAtMs: number | undefined): Promise<T> {
+  if (deadlineAtMs == null || !Number.isFinite(deadlineAtMs)) return promise;
+  const remainingMs = deadlineAtMs - Date.now();
+  if (remainingMs <= 0) {
+    return Promise.reject(Object.assign(new Error('Semantic attempt deadline exceeded.'), { errorClass: 'TIMEOUT', retryable: true }));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(Object.assign(new Error('Semantic attempt deadline exceeded.'), { errorClass: 'TIMEOUT', retryable: true })), remainingMs);
+    timer.unref?.();
+    promise.then(value => { clearTimeout(timer); resolve(value); }, error => { clearTimeout(timer); reject(error); });
+  });
 }
 
 const SEMANTIC_PROVIDER_NAMES = ['gemini_semantic', 'groq_semantic', 'gemini_free_semantic'] as const;
@@ -78,13 +102,19 @@ type SemanticChainResult = {
 export async function executeSemanticChain(
   candidates: EvidenceProvider[],
   input: RawChannelInput,
-  knowledgeContext: LayeredKnowledgeContext
+  knowledgeContext: LayeredKnowledgeContext,
+  options: { deadlineAtMs?: number; attemptTimeoutMs?: number } = {}
 ): Promise<SemanticChainResult> {
   const items: EvidenceItem[] = [];
   const reports: SemanticChainResult['reports'] = [];
   let priorFailed = false;
   for (const provider of candidates) {
     const started = Date.now();
+    if (options.deadlineAtMs != null && Date.now() >= options.deadlineAtMs) {
+      reports.push({ provider: provider.name, availability: 'UNAVAILABLE', evidenceCount: 0,
+        outcome: 'SUPPRESSED_BY_POLICY', reasonCodes: ['SEMANTIC_CHAIN_DEADLINE_EXCEEDED'], durationMs: 0 });
+      continue;
+    }
     const declared = provider.availability?.(input) || { availability: 'AVAILABLE' as const };
     if (declared.availability === 'NOT_APPLICABLE') {
       reports.push({ provider: provider.name, availability: 'NOT_APPLICABLE', evidenceCount: 0,
@@ -97,7 +127,10 @@ export async function executeSemanticChain(
       continue;
     }
     try {
-      const collected = await provider.collectEvidence(input, knowledgeContext);
+      const attemptDeadline = options.attemptTimeoutMs != null
+        ? Math.min(options.deadlineAtMs ?? Number.POSITIVE_INFINITY, Date.now() + options.attemptTimeoutMs)
+        : options.deadlineAtMs;
+      const collected = await deadlineRace(provider.collectEvidence(input, knowledgeContext), attemptDeadline);
       const abstention = collected.find(item => item.category === 'SEMANTIC_ABSTENTION');
       const semanticReasons = abstention?.provenance?.semantic?.reasonCodes || [];
       const unsupported = semanticReasons.some(code => /UNSUPPORTED_LANGUAGE|LANGUAGE.*UNSUPPORTED/.test(code));
@@ -117,7 +150,8 @@ export async function executeSemanticChain(
       reports.push({ provider: provider.name, availability: 'FAILED', evidenceCount: 0,
         outcome: timeout ? 'FAILED_TIMEOUT' : 'FAILED_PROVIDER',
         reasonCodes: safeProviderFailureReasonCodes(err, timeout),
-        reason: `Provider failure (${String(err?.errorClass || 'UNKNOWN')}).`, durationMs: Date.now() - started,
+        reason: `Provider failure (${String(err?.errorClass || 'UNKNOWN')})${err?.errorClass ? '' : `: ${String(err?.message || err).slice(0, 240)}`}.`,
+        durationMs: Date.now() - started,
         ...(failedOrg ? { orgId: failedOrg } : {}) });
       priorFailed = true;
     }
@@ -157,6 +191,10 @@ export class EvidenceBasedTradingEngine {
     const routedCodes=contentLanguagePacks(input,knowledgeContext).map(pack=>pack.languageCode);
     knowledgeContext.languageKnowledgePacks=[...new Map([...(knowledgeContext.languageKnowledgePacks||[]),...routedCodes.map(code=>LANGUAGE_KNOWLEDGE_PACKS[code]).filter(Boolean)].map(pack=>[pack.languageCode,pack])).values()];
 
+    // C5 composition is deterministic and computed before any provider runs,
+    // so C6 can skip semantic work for decisive/query-only candidates.
+    const composition = buildContextualComposition(input, knowledgeContext);
+
     // Collect evidence from all independent providers in parallel. Semantic
     // routing is resolved per evaluation (not at construction) so
     // SEMANTIC_PROVIDER / SEMANTIC_PROVIDER_FORCE_GEMINI take effect without
@@ -186,7 +224,8 @@ export class EvidenceBasedTradingEngine {
           .filter(name => name !== semanticPrimary.name)
           .map(name => name === 'groq_semantic' ? new GroqSemanticProvider() : new GeminiFreeSemanticProvider())]
       : [];
-    const providerPromises = deterministicProviders.map(async provider => {
+
+    const runProvider = async (provider: EvidenceProvider) => {
       const started = Date.now();
       const declared = provider.availability?.(input) || { availability: 'AVAILABLE' as const };
       if (declared.availability !== 'AVAILABLE') {
@@ -209,16 +248,88 @@ export class EvidenceBasedTradingEngine {
         return { items: [] as EvidenceItem[], report: { provider: provider.name, availability: 'FAILED' as const, evidenceCount: 0,
           outcome:timeout?'FAILED_TIMEOUT' as const:'FAILED_PROVIDER' as const,
           reasonCodes:safeProviderFailureReasonCodes(err,timeout),
-          reason:`Provider failure (${errorClass}).`,durationMs:Date.now()-started } };
+          reason:`Provider failure (${errorClass})${err?.errorClass ? '' : `: ${String(err?.message || err).slice(0,240)}`}.`,durationMs:Date.now()-started } };
       }
+    };
+
+    const buildCollection = (results: Array<{ items: EvidenceItem[]; report: EvidenceCollectionReport['providers'][number] }>, evidence: EvidenceItem[]): EvidenceCollectionReport => {
+      const provenanceErrors=validateEvidenceProvenance(evidence);
+      const fieldsPresent = [
+        input.channel_name?.trim() && 'channel_name', input.description?.trim() && 'description',
+        input.video_titles?.length && 'video_titles', input.video_descriptions?.length && 'video_descriptions',
+        input.external_links?.length && 'external_links', input.location_tag?.trim() && 'location_tag', input.discord_invite && 'discord_invite'
+        , input.playlists?.length && 'playlists', input.detected_languages?.length && 'detected_languages'
+        , input.transcript_excerpts?.length && 'transcript_excerpts', input.visual_evidence?.length && 'visual_evidence'
+        , input.pinned_comment?.trim() && 'pinned_comment', input.activity_metadata && 'activity_metadata'
+      ].filter(Boolean) as string[];
+      const sparseMetadata = !input.description?.trim() && !(input.video_titles?.length) && !(input.video_descriptions?.length) && !(input.external_links?.length);
+      const degraded = results.some(result => result.report.availability === 'FAILED');
+      const explicitNegative = evidence.some(item => item.polarity === 'NEGATIVE' && item.category !== 'MULTI_VIDEO_CONSISTENCY');
+      const substantiveEvidence=evidence.some(item=>item.rawMatches.length>0&&item.category!=='SEMANTIC_ABSTENTION');
+      // Terminal negative decisions require creator-level coverage or independent
+      // underlying observations. Multiple providers interpreting the same document
+      // remain one observation and cannot manufacture rejection sufficiency.
+      const negativeFields=evidence.filter(item=>item.polarity==='NEGATIVE').flatMap(item=>item.provenance?.fields||[]);
+      const negativeObservationKeys=new Set(negativeFields.map(field=>field.sourceFamilyId||`${field.field}:${field.sourceId||field.index||''}`));
+      const negativeSourceFamilies=new Set(negativeFields.map(field=>field.sourceFamilyId).filter((value):value is string=>!!value));
+      const creatorLevelCoverage=(input.description?.trim().length||0)>=40&&negativeFields.some(field=>field.field==='channel_bio');
+      const independentNegativeSupport=negativeObservationKeys.size>=2&&(negativeSourceFamilies.size>=2||new Set(negativeFields.map(field=>field.field==='video_title'||field.field==='video_description'?`video:${field.sourceId||field.index}`:field.field)).size>=2);
+      const terminalNegativeSufficiency={status:creatorLevelCoverage||independentNegativeSupport?'SUFFICIENT' as const:'INSUFFICIENT' as const,creatorLevelCoverage,independentSourceFamilies:negativeSourceFamilies.size,independentObservations:negativeObservationKeys.size,reasonCodes:creatorLevelCoverage?['CREATOR_LEVEL_NEGATIVE_COVERAGE']:independentNegativeSupport?['INDEPENDENT_NEGATIVE_SUPPORT']:['TERMINAL_NEGATIVE_EVIDENCE_INSUFFICIENT']};
+      // C3: provider coverage, a populated field or a long bio never suffices
+      // on its own. Only a real evidence item, or an explicit creator-level
+      // negative, can make the collection SUFFICIENT.
+      const sufficiency = fieldsPresent.length === 0 ? 'MISSING' : (substantiveEvidence || (explicitNegative && terminalNegativeSufficiency.status === 'SUFFICIENT')) ? 'SUFFICIENT' : 'INSUFFICIENT';
+      const reasonCodes = [
+        sparseMetadata && 'SPARSE_METADATA', degraded && 'PROVIDER_COVERAGE_DEGRADED',
+        sufficiency === 'MISSING' && 'NO_CLASSIFIABLE_METADATA',
+        sufficiency === 'INSUFFICIENT' && 'INSUFFICIENT_CLASSIFICATION_EVIDENCE',
+        sufficiency === 'INSUFFICIENT' && degraded && 'DEGRADED_INSUFFICIENT',
+        isThinRetrievalComposition(input, composition) && 'THIN_RETRIEVAL_CONTEXT',
+        ...provenanceErrors
+      ].filter(Boolean) as string[];
+      return { sufficiency, sparseMetadata, degraded, fieldsPresent, reasonCodes, providers: results.map(result => result.report), terminalNegativeSufficiency };
+    };
+
+    const deterministicResults = await Promise.all(deterministicProviders.map(runProvider));
+    const preliminaryEvidence = deterministicResults.flatMap(result => result.items);
+    const preliminaryCollection = buildCollection(deterministicResults, preliminaryEvidence);
+    const preliminaryStages = evaluateClassificationStages(input, preliminaryEvidence, preliminaryCollection, composition);
+    const hasCreatorContext = Boolean(
+      input.description?.trim() || input.video_titles?.length || input.video_descriptions?.length
+      || input.external_links?.length || input.playlists?.length || input.transcript_excerpts?.length
+      || input.pinned_comment?.trim() || input.discord_invite || input.activity_metadata || input.visual_evidence?.length
+    );
+    const preliminaryRecognition = assessRecognitionState({
+      composition,
+      evidence: preliminaryEvidence,
+      collection: preliminaryCollection,
+      lifecycleAction: preliminaryStages.lifecycleAction,
+      semanticAvailable: semanticChain.length > 0,
+      hasCreatorContext,
+      staged: preliminaryStages,
     });
 
-    const [deterministicResults, semanticResult] = await Promise.all([
-      Promise.all(providerPromises),
-      semanticPrimary
-        ? executeSemanticChain(semanticChain, input, knowledgeContext)
-        : Promise.resolve({ items: [] as EvidenceItem[], reports: [] as SemanticChainResult['reports'] }),
-    ]);
+    let semanticResult: SemanticChainResult = { items: [], reports: [] };
+    const shouldRunSemantic = semanticChain.length > 0
+      && preliminaryRecognition.semanticPolicy !== 'SKIP'
+      && preliminaryRecognition.semanticPolicy !== 'NONE';
+    if (shouldRunSemantic) {
+      // C4 bounded semantic mechanics: deterministic evidence has already
+      // decided everything decisive; ambiguous candidates get a short race.
+      // Stage 0 recognition uses a 2.5s aggregate / 2s attempt budget.
+      const stage0 = Number(input.enrichment_stage || 0) === 0;
+      const aggregateBudgetMs = Number(process.env.SEMANTIC_CHAIN_DEADLINE_MS || (stage0 ? 2500 : 15000));
+      const attemptBudgetMs = Number(process.env.SEMANTIC_ATTEMPT_TIMEOUT_MS || (stage0 ? 2000 : 10000));
+      semanticResult = await executeSemanticChain(semanticChain, input, knowledgeContext, {
+        deadlineAtMs: Date.now() + Math.max(1, aggregateBudgetMs),
+        attemptTimeoutMs: Math.max(1, attemptBudgetMs),
+      });
+    } else {
+      semanticResult.reports = preliminaryRecognition.semanticSkippedReason
+        ? [{ provider: semanticChain[0]?.name || 'gemini_semantic', availability: 'UNAVAILABLE', evidenceCount: 0, outcome: 'SUPPRESSED_BY_POLICY', reasonCodes: [preliminaryRecognition.semanticSkippedReason] }]
+        : [];
+    }
+
     // Flatten chain attempts into the providers ledger: only the winning
     // (last) report carries items; every attempt stays visible for
     // provenance, metrics, and recovery decisions.
@@ -230,43 +341,18 @@ export class EvidenceBasedTradingEngine {
       })),
     ];
     const allEvidence = providerResults.flatMap(result => result.items);
-    const provenanceErrors=validateEvidenceProvenance(allEvidence);
-    const fieldsPresent = [
-      input.channel_name?.trim() && 'channel_name', input.description?.trim() && 'description',
-      input.video_titles?.length && 'video_titles', input.video_descriptions?.length && 'video_descriptions',
-      input.external_links?.length && 'external_links', input.location_tag?.trim() && 'location_tag', input.discord_invite && 'discord_invite'
-      , input.playlists?.length && 'playlists', input.detected_languages?.length && 'detected_languages'
-      , input.transcript_excerpts?.length && 'transcript_excerpts', input.visual_evidence?.length && 'visual_evidence'
-      , input.pinned_comment?.trim() && 'pinned_comment', input.activity_metadata && 'activity_metadata'
-    ].filter(Boolean) as string[];
-    const sparseMetadata = !input.description?.trim() && !(input.video_titles?.length) && !(input.video_descriptions?.length) && !(input.external_links?.length);
-    // Optional, explicitly unavailable corroborators remain observable but do not
-    // invalidate independently sufficient evidence. Runtime failures still fail
-    // the availability gate conservatively.
-    const degraded = providerResults.some(result => result.report.availability === 'FAILED');
-    const explicitNegative = allEvidence.some(item => item.polarity === 'NEGATIVE' && item.category !== 'MULTI_VIDEO_CONSISTENCY');
-    const hasSubstantiveContext = (input.description?.trim().length || 0) >= 40 || (input.video_titles?.length || 0) >= 2 || (input.external_links?.length || 0) > 0 || (input.playlists?.length || 0) > 0 || (input.transcript_excerpts?.length || 0) > 0;
-    const substantiveEvidence=allEvidence.some(item=>item.rawMatches.length>0&&item.category!=='SEMANTIC_ABSTENTION');
-    const sufficiency = fieldsPresent.length === 0 ? 'MISSING' : (substantiveEvidence || explicitNegative || hasSubstantiveContext) ? 'SUFFICIENT' : 'INSUFFICIENT';
-    // Terminal negative decisions require creator-level coverage or independent
-    // underlying observations. Multiple providers interpreting the same document
-    // remain one observation and cannot manufacture rejection sufficiency.
-    const negativeFields=allEvidence.filter(item=>item.polarity==='NEGATIVE').flatMap(item=>item.provenance?.fields||[]);
-    const negativeObservationKeys=new Set(negativeFields.map(field=>field.sourceFamilyId||`${field.field}:${field.sourceId||field.index||''}`));
-    const negativeSourceFamilies=new Set(negativeFields.map(field=>field.sourceFamilyId).filter((value):value is string=>!!value));
-    const creatorLevelCoverage=(input.description?.trim().length||0)>=40&&negativeFields.some(field=>field.field==='channel_bio');
-    const independentNegativeSupport=negativeObservationKeys.size>=2&&(negativeSourceFamilies.size>=2||new Set(negativeFields.map(field=>field.field==='video_title'||field.field==='video_description'?`video:${field.sourceId||field.index}`:field.field)).size>=2);
-    const terminalNegativeSufficiency={status:creatorLevelCoverage||independentNegativeSupport?'SUFFICIENT' as const:'INSUFFICIENT' as const,creatorLevelCoverage,independentSourceFamilies:negativeSourceFamilies.size,independentObservations:negativeObservationKeys.size,reasonCodes:creatorLevelCoverage?['CREATOR_LEVEL_NEGATIVE_COVERAGE']:independentNegativeSupport?['INDEPENDENT_NEGATIVE_SUPPORT']:['TERMINAL_NEGATIVE_EVIDENCE_INSUFFICIENT']};
-    const reasonCodes = [
-      sparseMetadata && 'SPARSE_METADATA', degraded && 'PROVIDER_COVERAGE_DEGRADED',
-      sufficiency === 'MISSING' && 'NO_CLASSIFIABLE_METADATA', sufficiency === 'INSUFFICIENT' && 'INSUFFICIENT_CLASSIFICATION_EVIDENCE'
-      , ...provenanceErrors
-    ].filter(Boolean) as string[];
-    const collection: EvidenceCollectionReport = { sufficiency, sparseMetadata, degraded, fieldsPresent, reasonCodes, providers: providerResults.map(result => result.report),terminalNegativeSufficiency };
-
-    // Evaluate decision deterministically via Scoring Strategy
-    const stages = evaluateClassificationStages(input, allEvidence, collection);
-    return this.decisionStrategy.evaluateDecision(allEvidence, knowledgeContext, country, collection, stages);
+    const collection = buildCollection(providerResults, allEvidence);
+    const stages = evaluateClassificationStages(input, allEvidence, collection, composition);
+    const recognition = assessRecognitionState({
+      composition,
+      evidence: allEvidence,
+      collection,
+      lifecycleAction: stages.lifecycleAction,
+      semanticAvailable: semanticChain.length > 0,
+      hasCreatorContext,
+      staged: stages,
+    });
+    return this.decisionStrategy.evaluateDecision(allEvidence, knowledgeContext, country, collection, stages, composition, recognition);
   }
 }
 

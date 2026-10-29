@@ -18,7 +18,8 @@ export class MultilingualContextProvider implements EvidenceProvider {
     const hasCreatorTradingPractice = execution.length > 0 || education.length > 0;
     const items: EvidenceItem[] = [];
     const now = new Date().toISOString();
-    const fieldsFor=(terms:string[])=>(input.evidence_corpus||[]).filter(document=>terms.some(term=>matchedTerms(document.text,[term]).length>0)).map(documentRef);
+    // C1a: retrieval provenance is never attributable evidence.
+    const fieldsFor=(terms:string[])=>(input.evidence_corpus||[]).filter(document=>document.field!=='search_match_context'&&terms.some(term=>matchedTerms(document.text,[term]).length>0)).map(documentRef);
 
     if (hasCreatorTradingPractice) {
       const matches = [...execution, ...education];

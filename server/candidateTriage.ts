@@ -24,7 +24,12 @@ const HIGH_SPECIFICITY_TRADING_SIGNALS: Array<[string, RegExp]> = [
   ['TECHNICAL_METHOD', /\b(technical\s*analysis|price\s*action|order\s*flow|footprint|market\s*structure|volume\s*profile|liquidity\s*sweep|fair\s*value\s*gap|smart\s*money|ict\b|smc\b)\b/iu],
   ['TRADING_VENUE_OR_PROGRAM', /\b(fx\s*trading|futures?\s*trading|options?\s*trading|cfd\s*trading|spread\s*betting|prop\s*firm|funded\s*trader)\b/iu],
   ['LOCAL_TECHNICAL_ANALYSIS', /\b(analyse\s*technique|analisi\s*tecnica|an[aá]lisis\s*t[eé]cnico|technische\s*analyse|teknisk\s*analys|teknisk\s*analyse|b[oö]rsen?analyse|beursanalyse|aktiehandel|daghandel|futuros\s*trading|opciones\s*trading)\b/iu],
-  ['JAPANESE_TRADING', /(トレード|デイトレード|先物取引|テクニカル分析|板読み|オーダーフロー)/u]
+  ['JAPANESE_TRADING', /(トレード|デイトレード|先物取引|テクニカル分析|板読み|オーダーフロー)/u],
+  // C1b precision-first Latin-market lexicon. Generic "market"/"trade" is
+  // deliberately absent: a shared Latin script does not make an unrelated
+  // creator a trading hypothesis. These are high-specificity finance terms in
+  // production market languages.
+  ['LATIN_MARKET_FINANCE', /\b(b[oö]rse|boerse|bourse|beurs|aandelen|aktien|aktiehandel|aksjer|aksjehandel|osakkeet|osakekaupank[aä]ynti|børs|borsen|gielda|giełda|borsa|bolsa|mercado\s*de\s*valores|investir\s*en\s*bourse|analyse\s*technique|analisi\s*tecnica|an[aá]lisis\s*t[eé]cnico|handelsplan|risikomanagement|risikostyring|riskhantering|risicomanagement|piano\s*di\s*trading|plan\s*de\s*trading|plan\s*de\s*inversi[oó]n)\b/iu]
 ];
 
 /**
@@ -53,6 +58,31 @@ const HARD_NON_TRADING_SIGNALS: Array<[string, RegExp]> = [
 const SOFT_NON_TRADING_SIGNALS: Array<[string, RegExp]> = [
   ['GENERAL_VLOG', /\b(vlog|vlogging|prank|pranks|unboxing|reaction\s*video)\b/iu]
 ];
+
+/**
+ * C1b Unicode-script coverage test. Requires at least two letters from one of
+ * the scripts the cheap lexical router does not model. Mathematical
+ * Alphanumeric Symbols (U+1D400-U+1D7FF) are decorative, not a script, and
+ * must not turn an emoji/symbol surface into a covered candidate.
+ */
+const NON_LATIN_SCRIPT_PATTERNS: RegExp[] = [
+  /\p{Script=Han}/u, /\p{Script=Hiragana}/u, /\p{Script=Katakana}/u,
+  /\p{Script=Hangul}/u, /\p{Script=Arabic}/u, /\p{Script=Cyrillic}/u,
+  /\p{Script=Hebrew}/u, /\p{Script=Thai}/u, /\p{Script=Devanagari}/u,
+  /\p{Script=Bengali}/u, /\p{Script=Tamil}/u, /\p{Script=Telugu}/u,
+  /\p{Script=Malayalam}/u, /\p{Script=Gujarati}/u, /\p{Script=Gurmukhi}/u,
+  /\p{Script=Sinhala}/u, /\p{Script=Khmer}/u, /\p{Script=Lao}/u,
+  /\p{Script=Myanmar}/u, /\p{Script=Georgian}/u, /\p{Script=Armenian}/u,
+  /\p{Script=Ethiopic}/u,
+];
+
+export function hasCoveredNonLatinScript(value: string): boolean {
+  const normalized = String(value || '').normalize('NFKC').replace(/[\u{1D400}-\u{1D7FF}]/gu, ' ');
+  return NON_LATIN_SCRIPT_PATTERNS.some(pattern => {
+    const matches = normalized.match(new RegExp(pattern.source, 'gu')) || [];
+    return matches.length >= 2;
+  });
+}
 
 function staleMatchedVideo(candidate: DiscoveredChannelRaw, now = Date.now()): boolean {
   if (candidate.matchedDocument?.type !== 'VIDEO' || !candidate.matchedDocument.publishedAt) return false;
@@ -133,6 +163,8 @@ export function triageAutonomousSearchCandidate(
       disposition: 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS',
       reasonCodes: [
         highSpecificity.length ? 'CONFLICTING_RETRIEVAL_DOMAINS' : 'EXPLICIT_NON_TRADING_DOMAIN_DETECTED',
+        // Retained compatibility alias for existing audit consumers/tests.
+        'EXPLICIT_NON_TRADING_SIGNAL_DETECTED',
         'DO_NOT_SPEND_ENRICHMENT_QUOTA'
       ],
       matchedSignals: [...hardNegative, ...highSpecificity, ...marketContext]
@@ -142,7 +174,11 @@ export function triageAutonomousSearchCandidate(
   if (highSpecificity.length) {
     return {
       disposition: 'PLAUSIBLE_TRADING_HYPOTHESIS',
-      reasonCodes: ['RETRIEVAL_DOCUMENT_HAS_HIGH_SPECIFICITY_TRADING_SIGNAL'],
+      reasonCodes: [
+        'RETRIEVAL_DOCUMENT_HAS_HIGH_SPECIFICITY_TRADING_SIGNAL',
+        // Retained compatibility alias for existing audit consumers/tests.
+        'RETRIEVAL_DOCUMENT_HAS_EXPLICIT_TRADING_SIGNAL'
+      ],
       matchedSignals: [...highSpecificity, ...marketContext]
     };
   }
@@ -158,18 +194,23 @@ export function triageAutonomousSearchCandidate(
     };
   }
 
+  // C1b: a single broad market word or soft format cue is still ambiguous.
+  // The retrieval document is provenance, not evidence, so it cannot by
+  // itself authorize enrichment spend. Covered non-Latin scripts keep the
+  // conservative route because this cheap router cannot classify them.
   if (marketContext.length || softNegative.length) {
     return {
       disposition: 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS',
-      reasonCodes: ['AMBIGUOUS_RETRIEVAL_CONTEXT', 'DO_NOT_SPEND_ENRICHMENT_QUOTA'],
+      reasonCodes: [
+        'AMBIGUOUS_RETRIEVAL_CONTEXT',
+        'ROUTE_TO_UNCERTAIN',
+        'DO_NOT_SPEND_ENRICHMENT_QUOTA'
+      ],
       matchedSignals: [...marketContext, ...softNegative]
     };
   }
 
-  // Do not auto-withhold scripts for which this cheap lexical router has weak
-  // coverage. They may still be legitimate creators in a supported market and
-  // can receive one bounded enrichment pass rather than a false-negative stop.
-  if (/[^\u0000-\u024F]/u.test(retrievalText)) {
+  if (hasCoveredNonLatinScript(retrievalText)) {
     return {
       disposition: 'PLAUSIBLE_TRADING_HYPOTHESIS',
       reasonCodes: ['NON_LATIN_ROUTING_COVERAGE_CONSERVATIVE_PASS'],
