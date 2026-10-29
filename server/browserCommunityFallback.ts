@@ -2714,7 +2714,11 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         // absence. Budget/interaction/scroll gaps stay retryable; deterministic
         // policy/context gaps are visible partials without retry ownership.
         const coverageReason = publishEvidenceControlCertificate(timedOut || pageBudgetExhausted);
-        const coverageRetryable = interactionGap || timedOut || pageBudgetExhausted || scrollCapReachedStillGrowing || coverageReason === 'BOUNDED';
+        // `resolveRenderedCoverageReason` folds timedOut, page-budget and
+        // scroll-cap exhaustion into BOUNDED (with inspected pages), so the
+        // reason is the single source of retry ownership. Zero-page runs are
+        // already incomplete via baseIncomplete.
+        const coverageRetryable = coverageReason === 'BOUNDED';
         const completion=resolveRenderedCompletionState({inspectedPages,timedOut,telemetry,pageBudgetExhausted,interactionGap,coverageReason,coverageRetryable});
         const noPageProcessed=completion.failureClass==='NO_PAGE_PROCESSED';
         const zeroPageReason=resolveRenderedZeroPageReason({inspectedPages,timedOut,saturated:false,browserLaunchFailed:false,thrown:false,telemetry});

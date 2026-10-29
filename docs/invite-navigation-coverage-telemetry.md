@@ -1,7 +1,9 @@
 # Invite navigation-coverage telemetry and control recovery (P0.2/P1.1/P1.2/P1.7)
 
 **Status:** P0.2 instrumentation, P1.1/P1.2 control recovery, and P1.7 outcome
-truthfulness. No selection, queue, or schema behavior changes.
+truthfulness. No queue or schema behavior changes. Cached rendered-evidence
+reuse now requires `COMPLETE` coverage, so a bounded/context/policy gap is no
+longer reusable as a clean site inspection.
 **Scope:** Rendered creator-website acquisition (`mode = RENDERED`).
 **Related evidence:** `INVITE_NAVIGATION_ACQUISITION_RECALL_INVESTIGATION_20261027.md`
 and the 2026-10-27 P0.3 production classification report (read-only Coolify
