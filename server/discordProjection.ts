@@ -181,15 +181,29 @@ export function hasRetainedLastKnownGoodDiscordInvite(
  * candidate identity, so an older/different candidate cannot donate terminality.
  *
  * A1 last-known-good invariant: an ambiguous successful revalidation must not
- * clear a serving invite. The retained projection keeps the serving invite,
- * status, and candidate identity (Option A), while the existing relevance
- * field records that the current revalidation is uncertain. The ambiguous
- * attempt itself remains in the append-only attempt ledger; validation
- * outcomes and classification are unchanged. `CONFIRMED_INVALID` and
- * `NON_TRADING` results still replace the projection normally. */
-export function projectDiscordValidation(current:ChannelRecord,validation:DiscordValidationResult,candidate:DiscordCandidate):DiscordProjection{
+ * clear a serving or already-retained last-known-good invite. The retained
+ * projection keeps the serving invite, status, and candidate identity (Option
+ * A), while the existing relevance field records that the current revalidation
+ * is uncertain. The ambiguous attempt itself remains in the append-only
+ * attempt ledger; validation outcomes and classification are unchanged.
+ * `CONFIRMED_INVALID` and `NON_TRADING` results still replace the projection
+ * normally, and a confirmed-invalid result for the currently served candidate
+ * in the same scan suppresses retention even when another candidate's result
+ * was ambiguous. */
+export function projectDiscordValidation(
+  current:ChannelRecord,
+  validation:DiscordValidationResult,
+  candidate:DiscordCandidate,
+  options?:{currentCandidateConfirmedInvalid?:boolean},
+):DiscordProjection{
   const effective=applyCreatorAssociationToDiscordValidation(current,validation,candidate);
-  if(isAmbiguousSuccessfulDiscordValidation(effective)&&hasServingLastKnownGoodDiscordInvite(current)){
+  // Retention is only safe while the currently served candidate is still
+  // credible. A confirmed-invalid result for that same candidate in this scan
+  // is definitive evidence that the retained invite must not keep serving,
+  // even if a different candidate's lookup was merely ambiguous.
+  const canRetainAmbiguous=!options?.currentCandidateConfirmedInvalid
+    &&(hasServingLastKnownGoodDiscordInvite(current)||hasRetainedLastKnownGoodDiscordInvite(current));
+  if(isAmbiguousSuccessfulDiscordValidation(effective)&&canRetainAmbiguous){
     return {
       discord_status:current.discord_status,
       discord_invite:current.discord_invite??null,

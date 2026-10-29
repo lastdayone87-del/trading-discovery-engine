@@ -57,7 +57,7 @@ import { runChannelInspection, hasProcessedAcquisitionEvidence } from './inspect
 import { hasRetryableCommunityAcquisitionFailure } from './communityRetryPolicy';
 import { applyCommunityIntentEvidence } from './communityIntent';
 import { validateDiscordInvite } from './discordValidator';
-import {canProjectDiscordValidation,hasEstablishedValidatedDiscordSelection,hasRetainedLastKnownGoodDiscordInvite,projectDiscordValidation,reconcileDiscordDiscoveryFromInspection} from './discordProjection';
+import {canProjectDiscordValidation,hasEstablishedValidatedDiscordSelection,hasRetainedLastKnownGoodDiscordInvite,isSameSelectedDiscordCandidate,projectDiscordValidation,reconcileDiscordDiscoveryFromInspection} from './discordProjection';
 import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, fetchYouTubeChannelCountryMetadata, DiscoveredChannelRaw, RetrievalLane } from './youtube';
 import {buildProviderRequestBaseId,executeAllocatedRetrievalPage,providerSnapshot,YOUTUBE_SEARCH_PROVIDER,type ProviderAllocation} from './providerAwareRetrieval';
 import './braveSearch';
@@ -2123,7 +2123,7 @@ export async function inspectAndValidateChannel(
       // community is found. A live-but-ambiguous or live-but-non-trading first
       // invite is a fallback, not a reason to suppress a stronger later invite.
       let selected:Awaited<ReturnType<typeof validateDiscordInvite>>|null=null,selectedCandidate= candidates[0],selectedRank=-1;
-      const terminalInvalid:Array<Awaited<ReturnType<typeof validateDiscordInvite>>>=[];
+      const terminalInvalid:Array<{validation:Awaited<ReturnType<typeof validateDiscordInvite>>;candidate:typeof selectedCandidate}>=[];
       for(const candidate of candidates){
         if(!candidate.nativeInviteCode)continue;
         const locator=candidate.normalizedLocator||`https://discord.gg/${candidate.nativeInviteCode}`;
@@ -2147,12 +2147,16 @@ export async function inspectAndValidateChannel(
           priorProviderFailureObservations
         });
         await appendDiscordCheckAttempts(channel.channel_id,validation.candidateInviteUrl,validation.status,validation.attempts,{candidateId:candidate.candidateId,rawLocator:candidate.rawLocator,locatorType:candidate.locatorType,resolvedLocator:validation.candidateInviteUrl,sourceSurface:candidate.sourceSurface,sourceUrl:candidate.sourceUrl});
-        if(validation.operationalOutcome==='CONFIRMED_INVALID'){terminalInvalid.push(validation);continue;}
+        if(validation.operationalOutcome==='CONFIRMED_INVALID'){terminalInvalid.push({validation,candidate});continue;}
         const rank=discordCandidateCompositeRank(candidate,validation);
         if(rank>selectedRank){selected=validation;selectedCandidate=candidate;selectedRank=rank;}
       }
-      if(!selected&&terminalInvalid.length===candidates.filter(candidate=>candidate.nativeInviteCode).length){selected=terminalInvalid[0];selectedCandidate=candidates[0];}
+      if(!selected&&terminalInvalid.length===candidates.filter(candidate=>candidate.nativeInviteCode).length){selected=terminalInvalid[0].validation;selectedCandidate=terminalInvalid[0].candidate;}
       if(!selected)throw new Error('No resolvable native Discord candidate was available for validation');
+      // The projection may retain the currently served invite when this scan's
+      // winner is ambiguous. That is only valid if the current candidate was
+      // not itself confirmed invalid earlier in this same scan.
+      const currentCandidateConfirmedInvalid=terminalInvalid.some(entry=>isSameSelectedDiscordCandidate(channel,entry.candidate));
       const shouldProjectValidation=canProjectDiscordValidation(channel,selected,selectedCandidate);
       if(shouldProjectValidation){
         // Project first, then select the candidate that the projection actually
@@ -2160,7 +2164,7 @@ export async function inspectAndValidateChannel(
         // the ambiguous winner is a different candidate; selecting the winner
         // unconditionally would leave `discord_candidates.selected` pointing at
         // an invite the channel does not serve.
-        const projectedDiscord=projectDiscordValidation(channel,selected,selectedCandidate);
+        const projectedDiscord=projectDiscordValidation(channel,selected,selectedCandidate,{currentCandidateConfirmedInvalid});
         Object.assign(channel,projectedDiscord);
         discordValidationProjected=true;
         if(projectedDiscord.discord_candidate_id)await selectDiscordCandidate(channel.channel_id,projectedDiscord.discord_candidate_id);
