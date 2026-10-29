@@ -1,5 +1,5 @@
 import type { QueryRecord } from '../src/types';
-import { isRetrievalOrientedQuery } from './queryPlanner';
+import { isBareShortTicker, isRetrievalOrientedQuery } from './queryPlanner';
 import { RETRIEVAL_SPECIFICITY_POLICY_VERSION } from './retrievalSpecificity';
 
 export const AUTONOMOUS_QUERY_AUTHORITY_POLICY_VERSION = 'autonomous-query-authority-v2';
@@ -66,6 +66,36 @@ function isScopePromotedAnchor(
   return true;
 }
 
+/**
+ * Narrow execution-time authority for free-signal bootstrap queries.
+ *
+ * Free Wikipedia/Wikidata surfaces are candidate vocabulary, never governed
+ * evidence, so their own specificity is MODIFIER_ONLY. The planner emits a
+ * standalone free surface only for a country with no authorized anchor and
+ * only when the assembled query passes the same retrieval-shape gate as every
+ * other candidate. This check re-verifies that exact shape at execution time:
+ * one free-signal atom, concrete instrument or method class, current policy
+ * provenance, and no bare short ticker. It cannot authorize anchored templates,
+ * mixed/learned queries, or any surface the planner would reject.
+ */
+function isFreeSignalStandaloneAuthorized(
+  query: QueryRecord,
+  metadata: Record<string, any>,
+  atoms: Array<Record<string, any>>,
+): boolean {
+  if (String(metadata.queryTemplate || '') !== 'FREE_SIGNAL_STANDALONE') return false;
+  if (metadata.source !== 'FREE_SIGNAL') return false;
+  if (!Array.isArray(metadata.sourceTypes) || metadata.sourceTypes.length !== 1 || metadata.sourceTypes[0] !== 'FREE_SIGNAL') return false;
+  if (atoms.length !== 1) return false;
+  const atom = atoms[0];
+  if (!atom || String(atom.origin || '') !== 'FREE_SIGNAL') return false;
+  if (Number(atom.tier) !== 3) return false;
+  if (!['INSTRUMENT', 'METHOD'].includes(String(atom.type || '').toUpperCase())) return false;
+  if (atom.retrievalPolicy?.policyVersion !== RETRIEVAL_SPECIFICITY_POLICY_VERSION) return false;
+  if (isBareShortTicker(query.query)) return false;
+  return true;
+}
+
 function metadataOf(query: QueryRecord): Record<string, any> {
   const raw = (query as QueryRecord & { generation_metadata?: unknown }).generation_metadata;
   if (!raw) return {};
@@ -121,7 +151,7 @@ export function evaluateAutonomousQueryAuthority(
   if (specificity.policyVersion !== RETRIEVAL_SPECIFICITY_POLICY_VERSION) {
     return { eligible: false, reasonCodes: ['STALE_RETRIEVAL_POLICY_VERSION'], retrievalPolicyVersion: String(specificity.policyVersion || '') };
   }
-  if (!['STANDALONE', 'ANCHOR_ONLY'].includes(String(specificity.eligibility)) && !isScopePromotedAnchor(metadata, atoms, options.scopePromotionActive)) {
+  if (!['STANDALONE', 'ANCHOR_ONLY'].includes(String(specificity.eligibility)) && !isScopePromotedAnchor(metadata, atoms, options.scopePromotionActive) && !isFreeSignalStandaloneAuthorized(query, metadata, atoms)) {
     return { eligible: false, reasonCodes: ['PRIMARY_ATOM_NOT_AUTHORIZED_FOR_RETRIEVAL'], retrievalPolicyVersion: specificity.policyVersion };
   }
 
@@ -129,7 +159,7 @@ export function evaluateAutonomousQueryAuthority(
     const staleAtom = atoms.find(atom => atom.retrievalPolicy?.policyVersion !== RETRIEVAL_SPECIFICITY_POLICY_VERSION);
     if (staleAtom) return { eligible: false, reasonCodes: ['ATOM_POLICY_PROVENANCE_STALE'], retrievalPolicyVersion: specificity.policyVersion };
     const anchor = atoms[0]?.retrievalPolicy?.eligibility;
-    if (!['STANDALONE', 'ANCHOR_ONLY'].includes(String(anchor)) && !isScopePromotedAnchor(metadata, atoms, options.scopePromotionActive)) {
+    if (!['STANDALONE', 'ANCHOR_ONLY'].includes(String(anchor)) && !isScopePromotedAnchor(metadata, atoms, options.scopePromotionActive) && !isFreeSignalStandaloneAuthorized(query, metadata, atoms)) {
       return { eligible: false, reasonCodes: ['QUERY_ANCHOR_NOT_CURRENTLY_AUTHORIZED'], retrievalPolicyVersion: specificity.policyVersion };
     }
 

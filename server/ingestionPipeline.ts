@@ -970,8 +970,10 @@ async function processChannelThroughPipelineInContext(
     tradingStatus: finalChannel.trading_status,
   });
 
-  // Candidate-corpus shadow path: unchanged, quality-gated only.
-  if (extraction.termHarvestEnabled) {
+  // Candidate-corpus shadow path: unchanged, quality-gated only. Operator
+  // rechecks are not autonomous corpus evidence: their observations stay in
+  // the channel/terminology audit trail and must not feed AUTONOMOUS lineage.
+  if (extraction.termHarvestEnabled && !isManualScan) {
     await enqueueTermHarvest({channelId:finalChannel.channel_id,text:[candidate.description,...candidate.videoTitles].filter(Boolean).join('\n'),lineage:'AUTONOMOUS'});
   }
 

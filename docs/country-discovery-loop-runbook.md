@@ -52,7 +52,7 @@ Both routes are operator routes requiring the `country-discovery.read` action:
 | `migration_161` | Migration 161 is recorded. | `FAIL` means the migration did not apply. |
 | `required_schema` | Required CDL tables/columns exist. | `FAIL` lists missing schema. |
 | `youtube_hard_cap` | `youtube_key_daily_cap_enforced=true`. | `FAIL` means the hard cap is not enforced. |
-| `orphaned_pending_pages` | Pending pages older than 15 minutes. | `WARN` when any are due; inspect the reconciler. |
+| `orphan_pending_pages` | Pending pages older than 15 minutes. | `FAIL` when any are due; inspect the reconciler. |
 | `provider_canary` | Recent provider telemetry success rate (no active probe). | `FAIL` below 50% success. |
 | `provider_spike` | Recent error/timeout/rate-limit rates. | `WARN` at 10%, `FAIL` at 25%. |
 | `quota_reservation_failures` | Quota deferrals above the prior-hour baseline (the observable outcome of reservation denials). | `WARN` on a spike. |
@@ -94,7 +94,7 @@ minutes). The producer cycle also calls the reconciler with `force: true` before
 non-direct-target cycles, so a deferred continuation is scheduled before new-query work. Continuation jobs
 use priority 25 versus priority 20 for new queries.
 
-If `orphaned_pending_pages` warns:
+If `orphan_pending_pages` reports `FAIL` (the route returns 503):
 
 1. Confirm `continuation_status` is `RUNNING`, `DEFERRED_QUOTA`, or `DEFERRED_TIME` and `deferred_until` is
    due.

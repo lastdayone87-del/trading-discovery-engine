@@ -236,9 +236,26 @@ export const WIKIMEDIA_USER_AGENT_ENV = 'WIKIMEDIA_USER_AGENT';
 export const WIKIMEDIA_USER_AGENT_FALLBACK =
   'CountryDiscoveryLoop/1.0 (Wikimedia API client; set WIKIMEDIA_USER_AGENT to a real contact URL or email before enabling free_query_signals_enabled)';
 
+/**
+ * Wikimedia's policy requires a real contact channel, not merely a nonempty
+ * string. A placeholder such as the env-var name itself is not a contact and
+ * must fail the prerequisite rather than silently authorize remote fetches.
+ */
+export function isContactBearingWikimediaUserAgent(value: string | null | undefined): boolean {
+  const configured = String(value || '').trim();
+  if (!configured) return false;
+  const email = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i;
+  const url = /\bhttps?:\/\/[^\s()<>]+/i;
+  if (!email.test(configured) && !url.test(configured)) return false;
+  // Reserved/example hosts are documentation placeholders, not a reachable
+  // operator contact.
+  if (/https?:\/\/(?:example\.(?:invalid|test)|localhost|127\.0\.0\.1)\b/i.test(configured)) return false;
+  return true;
+}
+
 export function configuredWikimediaUserAgent(explicit?: string): string | null {
   const configured = String(explicit || process.env[WIKIMEDIA_USER_AGENT_ENV] || '').trim();
-  return configured || null;
+  return isContactBearingWikimediaUserAgent(configured) ? configured : null;
 }
 
 export function resolveWikimediaUserAgent(explicit?: string): string {
@@ -260,13 +277,24 @@ async function pace(): Promise<void> {
   if (waitMs > 0) await new Promise<void>(resolve => setTimeout(resolve, waitMs));
 }
 
-function wikipediaSearchTerm(country: string, language: string): string {
+/**
+ * Localized search text always carries the country name. Without it, Germany,
+ * Austria, and Switzerland would all query the same generic "Börse Handel"
+ * and their results would be mislabeled as country-scoped signals. Languages
+ * without a localized finance phrase fall back to an English query (and an
+ * English host) rather than mixing English text with a non-English language
+ * parameter.
+ */
+function wikipediaSearchTerm(country: string, language: string): { term: string; language: string } {
   const local: Record<string, string> = {
     de: 'Börse Handel', fr: 'bourse trading', es: 'bolsa trading', it: 'borsa trading',
     nl: 'beurs handel', sv: 'börs handel', da: 'børs handel', no: 'børs handel',
     ja: '株式 トレード', zh: '股票 交易', ko: '주식 거래', ar: 'تداول الأسهم',
   };
-  return local[language] || `${country} trading`;
+  const localized = local[language];
+  return localized
+    ? { term: `${country} ${localized}`, language }
+    : { term: `${country} trading`, language: 'en' };
 }
 
 async function fetchJson(url: string, fetchImpl: typeof fetch, timeoutMs: number, userAgent: string): Promise<unknown> {
@@ -324,17 +352,19 @@ export async function fetchFreeQuerySignals(args: {
   const errors: string[] = [];
   try {
     await pace();
-    const wikiUrl = `https://${language}.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(wikipediaSearchTerm(country, language))}&srlimit=${limit}&format=json&origin=*`;
+    const wikipediaSearch = wikipediaSearchTerm(country, language);
+    const wikiUrl = `https://${wikipediaSearch.language}.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(wikipediaSearch.term)}&srlimit=${limit}&format=json&origin=*`;
     const payload = await fetchJson(wikiUrl, fetchImpl, timeoutMs, userAgent);
-    signals.push(...parseWikipediaSearchSignals(payload, { country, language, limit }));
+    signals.push(...parseWikipediaSearchSignals(payload, { country, language: wikipediaSearch.language, limit }));
   } catch (error) {
     errors.push(`WIKIPEDIA:${error instanceof Error ? error.message : String(error)}`);
   }
   try {
     await pace();
-    const wikidataUrl = `https://www.wikidata.org/w/api.php?action=wbsearchentities&search=${encodeURIComponent(`${country} trading`)}&language=${encodeURIComponent(language)}&uselang=${encodeURIComponent(language)}&limit=${limit}&format=json&origin=*`;
+    const wikidataSearch = wikipediaSearchTerm(country, language);
+    const wikidataUrl = `https://www.wikidata.org/w/api.php?action=wbsearchentities&search=${encodeURIComponent(wikidataSearch.term)}&language=${encodeURIComponent(wikidataSearch.language)}&uselang=${encodeURIComponent(wikidataSearch.language)}&limit=${limit}&format=json&origin=*`;
     const payload = await fetchJson(wikidataUrl, fetchImpl, timeoutMs, userAgent);
-    signals.push(...parseWikidataSearchSignals(payload, { country, language, limit }));
+    signals.push(...parseWikidataSearchSignals(payload, { country, language: wikidataSearch.language, limit }));
   } catch (error) {
     errors.push(`WIKIDATA:${error instanceof Error ? error.message : String(error)}`);
   }

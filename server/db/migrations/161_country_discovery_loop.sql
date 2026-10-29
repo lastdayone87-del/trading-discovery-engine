@@ -302,8 +302,11 @@ INSERT INTO app_settings(setting_key, setting_value) VALUES
   ('query_demand_signals_enabled', 'false')
 ON CONFLICT(setting_key) DO NOTHING;
 
--- Raise only the legacy seeded page ceiling (10) to the approved hard safety
--- bound (50). An explicit operator value above 10 is preserved exactly.
+-- Raise the legacy seeded page ceiling (10) to the approved hard safety bound
+-- (50). app_settings has no provenance column, so an operator-set value of
+-- exactly 10 is indistinguishable from the seeded default and is raised too;
+-- this is the explicitly accepted one-time PR #557 trade-off. Every other
+-- configured value (including values below or above 10) is preserved exactly.
 UPDATE app_settings
 SET setting_value = '50'
 WHERE setting_key = 'autonomous_pagination_max_pages'

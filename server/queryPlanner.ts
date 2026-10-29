@@ -469,9 +469,9 @@ export function planDiverseQueries(args: {
       && isRetrievalOrientedQuery(args.country, `${item.term} ${freeAtom.term}`));
     if (anchor) return [{ atoms: [anchor, freeAtom], template: 'ANCHOR_FREE_SIGNAL' as const, freeSignal: candidate }];
     // Bootstrap-only: a free surface may stand alone only when no authorized
-    // creator-observed anchor exists at all. It still must pass the same
-    // retrieval-shape gate as every other query.
-    if (!hasAuthorizedAnchor && isRetrievalOrientedQuery(args.country, freeAtom.term)) {
+    // creator-observed anchor exists at all, its semantic class is concrete,
+    // and it still passes the same retrieval-shape gate as every other query.
+    if (!hasAuthorizedAnchor && (freeAtom.type === 'INSTRUMENT' || freeAtom.type === 'METHOD') && isRetrievalOrientedQuery(args.country, freeAtom.term)) {
       return [{ atoms: [freeAtom], template: 'FREE_SIGNAL_STANDALONE' as const, freeSignal: candidate }];
     }
     return [];
@@ -510,16 +510,28 @@ export function planDiverseQueries(args: {
 
   candidates.sort((a, b) => (intentUsage.get(a.atoms[0].intent) || 0) - (intentUsage.get(b.atoms[0].intent) || 0));
 
+  // Creator-observed candidates must not be pushed past the final `count`
+  // limit by free signals, seeds, or other filler. Reserve one portfolio slot
+  // for each creator-derived candidate still ahead in the ordering; deferred
+  // filler is retried after the first pass when a reserved candidate fails a
+  // gate, so the portfolio is not underfilled.
+  const CREATOR_DERIVED_TEMPLATES = new Set(['ANCHOR_LEARNED', 'ORGANIC_STANDALONE', 'ANCHOR_ORGANIC']);
+  const isCreatorDerived = (candidate: (typeof candidates)[number]) => CREATOR_DERIVED_TEMPLATES.has(candidate.template);
+  const creatorRemainingAfter = new Array<number>(candidates.length + 1).fill(0);
+  for (let index = candidates.length - 1; index >= 0; index -= 1) {
+    creatorRemainingAfter[index] = creatorRemainingAfter[index + 1] + (isCreatorDerived(candidates[index]) ? 1 : 0);
+  }
+
   const planned: PlannedQuery[] = [];
   let tier3Used = 0;
-  for (const candidate of candidates) {
-    if (planned.length >= count) break;
+  const trySelect = (candidate: (typeof candidates)[number]): void => {
+    if (planned.length >= count) return;
     const query = candidate.atoms.map(item => item.term).join(' ');
     const normalized = normalizeQuery(query);
     const hasTier3 = candidate.atoms.some(item => item.tier === 3);
     const globalContext = candidate.organic ? { ...candidate.organic.languageCapability.context, governed: true } : undefined;
-    if (blocked.has(normalized) || generated.has(normalized) || !isRetrievalOrientedQuery(args.country, query, globalContext)) continue;
-    if (hasTier3 && tier3Used >= Math.ceil(count / 5)) continue;
+    if (blocked.has(normalized) || generated.has(normalized) || !isRetrievalOrientedQuery(args.country, query, globalContext)) return;
+    if (hasTier3 && tier3Used >= Math.ceil(count / 5)) return;
     if (hasTier3) tier3Used++;
     const tiers = [...new Set(candidate.atoms.map(item => item.tier))] as QueryKnowledgeTier[];
     const primary = candidate.atoms[0];
@@ -638,6 +650,23 @@ export function planDiverseQueries(args: {
       }
     });
     generated.add(normalized);
+  };
+
+  const deferred: Array<(typeof candidates)[number]> = [];
+  for (let index = 0; index < candidates.length; index += 1) {
+    if (planned.length >= count) break;
+    const candidate = candidates[index];
+    if (!isCreatorDerived(candidate) && planned.length + creatorRemainingAfter[index + 1] >= count) {
+      deferred.push(candidate);
+      continue;
+    }
+    trySelect(candidate);
+  }
+  // A reserved creator candidate may fail a gate (blocked, duplicate, tier
+  // cap). Fill any remaining slots with the deferrals in their original order.
+  for (const candidate of deferred) {
+    if (planned.length >= count) break;
+    trySelect(candidate);
   }
   return planned;
 }

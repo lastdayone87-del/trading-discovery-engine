@@ -456,7 +456,13 @@ export function aggregatePageMetrics(pages: QueryFunnelMetrics[]): QueryFunnelMe
   let cumulativeCountryRejected: number | undefined;
   for (const page of pages) {
     if (page.cumulativeUniqueCreators !== undefined) {
-      cumulativeDistinct = Math.max(0, Number(page.cumulativeUniqueCreators) || 0);
+      const value = Math.max(0, Number(page.cumulativeUniqueCreators) || 0);
+      // Migration 161 defaults historical rows to 0. Zero is never a valid
+      // cumulative reach once a run has seen creators, and a zero-result page
+      // must not erase an earlier cumulative. Treat it as an unbackfilled
+      // legacy default; the per-page fallback below stays authoritative when
+      // every row is zero.
+      if (value > 0) cumulativeDistinct = value;
     }
     if (page.cumulativeCountryRejected !== undefined) {
       cumulativeCountryRejected = Math.max(0, Number(page.cumulativeCountryRejected) || 0);

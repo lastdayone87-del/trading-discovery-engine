@@ -4417,20 +4417,23 @@ export async function recordNativeVocabularyAiResponse(args: {
   leaseToken: string;
   responsePayload: Record<string, unknown>;
   attempts?: number;
+  provider?: string | null;
 }): Promise<boolean> {
   const db = await getDb();
   const result = await db.query(
     `UPDATE native_vocabulary_ai_runs
      SET response_payload=$2::jsonb,
+         provider=COALESCE($5,provider),
          attempts=GREATEST(attempts,$3),
          lease_expires_at=now()+($4||' seconds')::interval
-     WHERE request_id=$1 AND status='RESERVED' AND lease_token=$5
+     WHERE request_id=$1 AND status='RESERVED' AND lease_token=$6
      RETURNING request_id`,
     [
       args.requestId,
       JSON.stringify(args.responsePayload),
       Math.max(0, Math.trunc(args.attempts || 0)),
       String(NATIVE_VOCABULARY_AI_LEASE_SECONDS),
+      args.provider || null,
       args.leaseToken,
     ],
   );

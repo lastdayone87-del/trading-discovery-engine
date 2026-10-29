@@ -40,6 +40,7 @@ import {
   parseWikipediaSearchSignals,
   resetFreeQuerySignalCacheForTests,
   resolveWikimediaUserAgent,
+  isContactBearingWikimediaUserAgent,
   WIKIMEDIA_USER_AGENT_ENV,
   WIKIMEDIA_USER_AGENT_FALLBACK,
 } from './freeQuerySignals';
@@ -50,6 +51,7 @@ import {
 } from './nativeVocabularyBudget';
 import {
   evaluateCountryDiscoveryHealth,
+  gatherCountryDiscoveryHealth,
   gatherCountryDiscoveryMetrics,
   type CountryDiscoveryHealthInput,
 } from './countryDiscoveryHealth';
@@ -186,6 +188,7 @@ function fakeRefreshRunner(
   v2Overrides: Record<string, unknown> = {},
   perfOverrides: Record<string, unknown> = {},
   externalRows: Array<Record<string, unknown>> = [],
+  qualityOverrides: Record<string, unknown> = {},
 ): FakeRunner {
   const calls: RecordedCall[] = [];
   return {
@@ -226,10 +229,10 @@ function fakeRefreshRunner(
         return { rows: [{ executions: 0, quota: 0, confirmed: 0, nontrading: 0, wrong: 0, review: 0, fresh_confirmed: 0, ...perfOverrides }] };
       }
       if (text.includes('FROM terminology_observations') && text.includes('qualityVersion')) {
-        return { rows: [{ v1: 0, spam: false, novel: false }] };
+        return { rows: [{ v1: 0, spam: false, novel: false, ...qualityOverrides }] };
       }
       if (text.includes('FROM terminology_observations') && text.includes('novel')) {
-        return { rows: [{ v1: 0, spam: false, novel: false }] };
+        return { rows: [{ v1: 0, spam: false, novel: false, ...qualityOverrides }] };
       }
       if (text.startsWith('UPDATE canonical_trading_terms')) return { rows: [] };
       if (text.startsWith('INSERT INTO terminology_lifecycle_events')) return { rows: [] };
@@ -325,8 +328,10 @@ test('A1: Wikipedia/Wikidata aliases stay scoped to the configured country and l
 test('A2: repeated free-signal refresh is cache-idempotent and does not refetch', async () => {
   resetFreeQuerySignalCacheForTests();
   let requests = 0;
+  const urls: string[] = [];
   const fakeFetch = (async (url: string) => {
     requests += 1;
+    urls.push(String(url));
     if (String(url).includes('wikipedia.org')) {
       return { ok: true, json: async () => ({ query: { search: [{ title: 'DAX', pageid: 1 }] } }) } as never;
     }
@@ -345,6 +350,34 @@ test('A2: repeated free-signal refresh is cache-idempotent and does not refetch'
     assert.equal(second.fromCache, true);
     assert.deepEqual(second.signals, first.signals);
     assert.equal(dedupeFreeQuerySignals(first.signals).length, first.signals.length);
+
+    // Localized text must carry both the selected language and the country;
+    // English text must never be sent with a non-English language parameter.
+    const wikiUrl = new URL(urls[0]);
+    const wikidataUrl = new URL(urls[1]);
+    assert.equal(wikiUrl.host, 'de.wikipedia.org');
+    assert.equal(wikiUrl.searchParams.get('srsearch'), 'Germany Börse Handel');
+    assert.equal(wikidataUrl.searchParams.get('search'), 'Germany Börse Handel');
+    assert.equal(wikidataUrl.searchParams.get('language'), 'de');
+    assert.equal(wikidataUrl.searchParams.get('uselang'), 'de');
+
+    await fetchFreeQuerySignals({
+      country: 'Austria', language: 'de', fetchImpl: fakeFetch, userAgent: TEST_WIKIMEDIA_USER_AGENT, now,
+    });
+    assert.notEqual(
+      new URL(urls[2]).searchParams.get('srsearch'),
+      wikiUrl.searchParams.get('srsearch'),
+      'country-specific context prevents identical generic searches',
+    );
+
+    await fetchFreeQuerySignals({
+      country: 'Germany', language: 'pt', fetchImpl: fakeFetch, userAgent: TEST_WIKIMEDIA_USER_AGENT, now,
+    });
+    const fallbackWiki = new URL(urls[4]);
+    const fallbackWikidata = new URL(urls[5]);
+    assert.equal(fallbackWiki.host, 'en.wikipedia.org');
+    assert.equal(fallbackWiki.searchParams.get('srsearch'), 'Germany trading');
+    assert.equal(fallbackWikidata.searchParams.get('language'), 'en', 'unlocalized fallback uses an English query');
 
     const source = serverSource('freeQuerySignals.ts');
     // The pacing slot is reserved synchronously before awaiting; concurrent
@@ -486,6 +519,34 @@ test('A5: the free-signal cap preserves creator-observed terminology', () => {
   assert.ok(!/promotion_eligible\s*=/.test(freeSource), 'free signals never assign promotion eligibility');
 });
 
+test('A5b: a full portfolio cannot push creator-derived candidates out with free signals', () => {
+  const freeSignals = ['Charttechnik', 'Börse Frankfurt', 'DAX Futures', 'Technische Analyse', 'Handelsstrategie', 'Risikomanagement']
+    .map((surface, index) => ({
+      surface,
+      signalType: 'METHOD' as const,
+      country: 'Germany',
+      language: 'de',
+      provider: 'WIKIPEDIA' as const,
+      sourceIds: [`wikipedia:${index}`],
+    }));
+  const creatorTerms = ['Charttechnik', 'Handelsstrategie', 'Risikomanagement'].map((term, index) => ({
+    id: index + 1, term, score: 0.9, lifecycle: 'SEARCH_TRIAL' as const,
+  }));
+  const planned = planDiverseQueries({
+    country: 'Germany',
+    count: 3,
+    learnedVocabulary: [],
+    existingQueries: [],
+    provenTerminology: creatorTerms,
+    freeSignalCandidates: freeSignals,
+  });
+  const sourceTypes = (query: typeof planned[number]) => query.metadata.sourceTypes as string[];
+  assert.equal(planned.filter(query => sourceTypes(query).includes('TERMINOLOGY')).length, 3,
+    'every requested slot is available to creator-derived terminology');
+  assert.equal(planned.filter(query => sourceTypes(query).includes('FREE_SIGNAL')).length, 0,
+    'free signals do not displace creator-derived candidates');
+});
+
 test('A6: provider rate-limit failure degrades to seeds without failing the cycle', async () => {
   resetFreeQuerySignalCacheForTests();
   const failingFetch = (async () => { throw new Error('HTTP_429'); }) as unknown as typeof fetch;
@@ -575,6 +636,12 @@ test('A6: provider rate-limit failure degrades to seeds without failing the cycl
       resolveWikimediaUserAgent(TEST_WIKIMEDIA_USER_AGENT),
       TEST_WIKIMEDIA_USER_AGENT,
     );
+    assert.equal(isContactBearingWikimediaUserAgent(TEST_WIKIMEDIA_USER_AGENT), true);
+    assert.equal(isContactBearingWikimediaUserAgent('ops@example.org'), true);
+    assert.equal(isContactBearingWikimediaUserAgent('WIKIMEDIA_USER_AGENT'), false);
+    assert.equal(isContactBearingWikimediaUserAgent('CountryDiscoveryLoop/1.0'), false);
+    assert.equal(isContactBearingWikimediaUserAgent('https://example.invalid/contact'), false);
+    assert.equal(resolveWikimediaUserAgent('WIKIMEDIA_USER_AGENT'), WIKIMEDIA_USER_AGENT_FALLBACK);
 
     // With no operator-configured identity, remote fetches are skipped
     // entirely: a placeholder UA would violate the Wikimedia policy.
@@ -691,6 +758,25 @@ test('P2: one grace page, restart-safe streak reconstruction, reset by a product
   assert.ok(page4.reasonCodes.includes('CONSECUTIVE_LOW_YIELD'));
 });
 
+test('P2b: pre-v2 legacy rows never invent v2 streaks', () => {
+  const legacy = {
+    marginalUtility: 0,
+    reasonCodes: ['DUPLICATE_HEAVY', 'WRONG_COUNTRY', 'ZERO_CONFIRMED_VALUE'],
+    continuationDecisionV2: {},
+  };
+  assert.deepEqual(countTrailingContinuationStreaks([legacy]), {
+    lowValue: 0, duplicateHeavy: 0, wrongCountry: 0,
+  });
+
+  const newestV2 = evaluateContinuationV2(lowValuePage);
+  const mixed = countTrailingContinuationStreaks([
+    { marginalUtility: newestV2.marginalUtility, reasonCodes: newestV2.reasonCodes, continuationDecisionV2: newestV2 },
+    { marginalUtility: 0.4, reasonCodes: ['CONTINUE_PRODUCTIVE'], continuationDecisionV2: {} },
+  ]);
+  assert.deepEqual(mixed, { lowValue: 1, duplicateHeavy: 0, wrongCountry: 0 },
+    'reconstruction stops at the first legacy page');
+});
+
 test('P3: duplicate-heavy ratio alone does not stop a page with new creators', () => {
   const decision = evaluateContinuationV2({ ...baseV2, duplicateRatio: 0.92, newCreators: 2 });
   assert.equal(decision.shouldContinue, true);
@@ -788,11 +874,11 @@ test('P8: a 300-unit run budget allows at most three 100-unit pages', () => {
   assert.equal(stop.shouldContinue, false);
   assert.equal(stop.primaryReason, 'RUN_BUDGET_EXHAUSTED');
 
-  // min_run_pages cannot override a smaller treatment/trial cap or the
-  // quota-derived budget. The old guard checked only safety/provider.
+  // An independent treatment/trial cap or the quota-derived budget still wins;
+  // there is no per-run page floor that could renew a capped reservation.
   const treatmentBound = computeEffectivePageBudget({
     safetyMaxPages: 50, providerMaxPages: 10, pageCostUnits: 100,
-    remainingAutonomousQuota: 1000, pendingCountries: 1, minRunPages: 5,
+    remainingAutonomousQuota: 1000, pendingCountries: 1,
     treatmentCapPages: 2,
   });
   assert.equal(treatmentBound.effectiveMaxPages, 2);
@@ -800,7 +886,7 @@ test('P8: a 300-unit run budget allows at most three 100-unit pages', () => {
 
   const trialBound = computeEffectivePageBudget({
     safetyMaxPages: 50, providerMaxPages: 10, pageCostUnits: 100,
-    remainingAutonomousQuota: 1000, pendingCountries: 1, minRunPages: 5,
+    remainingAutonomousQuota: 1000, pendingCountries: 1,
     trialContinuationCap: 1,
   });
   assert.equal(trialBound.effectiveMaxPages, 1);
@@ -808,11 +894,11 @@ test('P8: a 300-unit run budget allows at most three 100-unit pages', () => {
 
   const quotaBound = computeEffectivePageBudget({
     safetyMaxPages: 50, providerMaxPages: 10, pageCostUnits: 100,
-    remainingAutonomousQuota: 250, pendingCountries: 1, minRunPages: 5,
+    remainingAutonomousQuota: 250, pendingCountries: 1,
   });
   assert.equal(quotaBound.effectiveMaxPages, 2);
   assert.equal(quotaBound.bindingBound, 'RUN_BUDGET');
-  assert.ok(quotaBound.effectiveMaxPages * 100 <= 250, 'min_run_pages cannot overspend quota');
+  assert.ok(quotaBound.effectiveMaxPages * 100 <= 250, 'the run cannot overspend quota');
 
   // The run's scheduled page reservation is already subtracted from
   // remainingAutonomousQuota. Add the current page back so page one is not
@@ -821,6 +907,30 @@ test('P8: a 300-unit run budget allows at most three 100-unit pages', () => {
     serverSource('queueManager.ts'),
     /remainingAutonomousQuota: quotaAvailability\.remainingAutonomousQuota \+ pageCostUnits/,
   );
+});
+
+test('P8b: equal treatment/trial caps win ties so segmentation cannot renew them', () => {
+  const safetyTie = computeEffectivePageBudget({
+    safetyMaxPages: 2, providerMaxPages: 10, pageCostUnits: 100,
+    remainingAutonomousQuota: 1000, pendingCountries: 1, treatmentCapPages: 2,
+  });
+  assert.equal(safetyTie.effectiveMaxPages, 2);
+  assert.equal(safetyTie.bindingBound, 'TREATMENT');
+
+  const trialTie = computeEffectivePageBudget({
+    safetyMaxPages: 2, providerMaxPages: 10, pageCostUnits: 100,
+    remainingAutonomousQuota: 1000, pendingCountries: 1, trialContinuationCap: 2,
+  });
+  assert.equal(trialTie.effectiveMaxPages, 2);
+  assert.equal(trialTie.bindingBound, 'TRIAL');
+
+  const allTie = computeEffectivePageBudget({
+    safetyMaxPages: 2, providerMaxPages: 10, pageCostUnits: 100,
+    remainingAutonomousQuota: 1000, pendingCountries: 1,
+    treatmentCapPages: 2, trialContinuationCap: 2,
+  });
+  assert.equal(allTie.effectiveMaxPages, 2);
+  assert.equal(allTie.bindingBound, 'TRIAL', 'the most specific allocation cap wins');
 });
 
 test('P9: quota denial defers a productive page without dropping or stopping the run', () => {
@@ -1028,20 +1138,14 @@ test('P15: pending pages across all active countries share quota fairly under th
   assert.equal(budget.effectiveMaxPages, 1);
   assert.equal(budget.bindingBound, 'RUN_BUDGET');
 
-  // A configured minimum cannot hand one country more than its fair share:
-  // the quota bound wins even when safety/provider would allow more pages.
-  const minRunBudget = computeEffectivePageBudget({
-    safetyMaxPages: 50,
-    providerMaxPages: 10,
-    pageCostUnits: 100,
-    remainingAutonomousQuota: 1600,
-    pendingCountries: 16,
-    minRunPages: 5,
-  });
-  assert.equal(minRunBudget.runQuotaBudgetUnits, 100);
-  assert.equal(minRunBudget.effectiveMaxPages, 1);
-  assert.equal(minRunBudget.bindingBound, 'RUN_BUDGET');
-  assert.ok(minRunBudget.effectiveMaxPages * 100 <= minRunBudget.runQuotaBudgetUnits);
+  // There is no per-run minimum that could hand one country more than its
+  // fair share: the quota allocation is derived solely from the remaining
+  // budget and the number of pending countries. A dead min_run_pages knob was
+  // removed rather than revived, because raising it here would starve others.
+  const queue = serverSource('queueManager.ts');
+  assert.doesNotMatch(queue, /autonomous_pagination_min_run_pages/);
+  const policy = serverSource('continuationPolicy.ts');
+  assert.doesNotMatch(policy, /minRunPages/);
 
   const countries = [...new Set(
     SUPPORTED_PRODUCTION_COUNTRIES
@@ -1399,7 +1503,7 @@ test('T12: a coordinated burst holds at three buckets and releases at a fourth',
 test('T13: the proven gate promotes with validation, executions, yield, and shares', async () => {
   const decision = decideLifecycleV2({
     ...baseLifecycle, decayedEvidence: 6, confirmedTradingCreators: 6,
-    executions: 3, decayedYield: 0.30, quotaConsumed: 5000,
+    executions: 3, decayedYield: 0.30, quotaConsumed: 5000, nativeNovel: true,
   });
   assert.equal(decision.status, 'PROVEN_SEARCH_TERM');
   assert.equal(decision.searchEligible, true);
@@ -1415,6 +1519,38 @@ test('T13: the proven gate promotes with validation, executions, yield, and shar
   const lifecycle = repeatOnly.calls.find(call => call.text.startsWith('UPDATE canonical_trading_terms'));
   assert.equal(lifecycle?.params[1], 'MULTI_CREATOR_VALIDATED');
   assert.equal(lifecycle?.params[2], false);
+});
+
+test('T13c: native promotion requires an affirmative novelty verdict', async () => {
+  const perf = { executions: 3, quota: 5000, confirmed: 6, nontrading: 0, wrong: 0, review: 0, fresh_confirmed: 6 };
+  const noQuality = fakeRefreshRunner(
+    { lifecycle_status: 'OBSERVED', search_eligible: false, trust_tier: 3, decayed_evidence: 6, decayed_yield: 0.3 },
+    { native_creators: 3, native_evidence_buckets: 3, decayed_evidence: 6 },
+    perf,
+  );
+  await refreshTerminologyLifecycle(1, undefined, noQuality as never);
+  const blocked = noQuality.calls.find(call => call.text.startsWith('UPDATE canonical_trading_terms'));
+  assert.equal(blocked?.params[1], 'SEARCH_TRIAL', 'missing native quality evidence cannot prove a term');
+  assert.equal(blocked?.params[2], true);
+
+  const affirmative = fakeRefreshRunner(
+    { lifecycle_status: 'OBSERVED', search_eligible: false, trust_tier: 3, decayed_evidence: 6, decayed_yield: 0.3 },
+    { native_creators: 3, native_evidence_buckets: 3, decayed_evidence: 6 },
+    perf,
+    [],
+    { v1: 3, spam: false, novel: true },
+  );
+  await refreshTerminologyLifecycle(1, undefined, affirmative as never);
+  const promoted = affirmative.calls.find(call => call.text.startsWith('UPDATE canonical_trading_terms'));
+  assert.equal(promoted?.params[1], 'PROVEN_SEARCH_TERM');
+  assert.equal(promoted?.params[2], true);
+
+  const spamDecision = decideLifecycleV2({
+    ...baseLifecycle, decayedEvidence: 6, confirmedTradingCreators: 6,
+    executions: 3, decayedYield: 0.30, quotaConsumed: 5000,
+    nativeNovel: true, spamConfirmed: true,
+  });
+  assert.notEqual(spamDecision.status, 'PROVEN_SEARCH_TERM', 'spam-confirmed native evidence can never prove a term');
 });
 
 test('T13b: new non-traders cannot lend fresh credit to repeat confirmed traders', async () => {
@@ -1836,6 +1972,19 @@ test('O2: a failed migration, orphan page, or provider canary makes the deploy g
   assert.equal(canary.healthy, false);
   assert.equal(canary.checks.find(check => check.id === 'provider_canary')?.status, 'FAIL');
 
+  const invalidScope = evaluateCountryDiscoveryHealth(healthyHealthInput({
+    settings: { ...healthySettings(), query_intelligence_discovery_scope: 'SELECTED' },
+  }));
+  assert.equal(invalidScope.healthy, false, 'an invalid persisted scope stops scheduling and must fail health');
+  assert.equal(invalidScope.checks.find(check => check.id === 'discovery_scope')?.status, 'FAIL');
+  assert.match(invalidScope.checks.find(check => check.id === 'discovery_scope')?.detail || '', /GLOBAL or SELECTED_COUNTRIES/);
+
+  const invalidSelection = evaluateCountryDiscoveryHealth(healthyHealthInput({
+    settings: { ...healthySettings(), query_intelligence_discovery_scope: 'SELECTED_COUNTRIES', query_intelligence_selected_countries: '{not-json' },
+  }));
+  assert.equal(invalidSelection.healthy, false);
+  assert.equal(invalidSelection.checks.find(check => check.id === 'discovery_scope')?.status, 'FAIL');
+
   const providerSpike = evaluateCountryDiscoveryHealth(healthyHealthInput({ providerErrorRate: 0.3 }));
   assert.equal(providerSpike.healthy, false);
   assert.equal(providerSpike.checks.find(check => check.id === 'provider_spike')?.status, 'FAIL');
@@ -1900,6 +2049,7 @@ test('O2: a failed migration, orphan page, or provider canary makes the deploy g
   }
   assert.match(healthSource, /resolveAutonomousCountries/);
   assert.match(healthSource, /WIKIMEDIA_USER_AGENT_ENV/);
+  assert.match(healthSource, /isContactBearingWikimediaUserAgent/, 'a placeholder agent must not pass the prerequisite');
   // The canary must count discovery search calls only; unrelated Gemini/Groq
   // telemetry must not make search look unhealthy.
   assert.match(healthSource, /provider IN \('youtube','youtube-innertube'\) AND operation='search'/);
@@ -1919,6 +2069,25 @@ test('O2: a failed migration, orphan page, or provider canary makes the deploy g
   const server = serverSource('../server.ts');
   assert.match(server, /app\.get\('\/api\/country-discovery\/health'/);
   assert.match(server, /res\.status\(report\.healthy \? 200 : 503\)\.json\(report\)/);
+});
+
+test('O2b: missing migration/schema is reported without querying dependent tables', async () => {
+  const calls: string[] = [];
+  const runner = {
+    query: async (text: string) => {
+      calls.push(text);
+      if (text.includes('FROM app_settings')) return { rows: [] };
+      if (text.includes('schema_migrations')) return { rows: [] };
+      if (text.includes('information_schema.columns')) return { rows: [] };
+      throw new Error(`unexpected dependent query: ${text.slice(0, 60)}`);
+    },
+  };
+  const report = await gatherCountryDiscoveryHealth(runner as never);
+  assert.equal(report.status, 'UNHEALTHY');
+  assert.equal(report.checks.find(check => check.id === 'migration_161')?.status, 'FAIL');
+  assert.equal(report.checks.find(check => check.id === 'required_schema')?.status, 'FAIL');
+  assert.equal(calls.some(text => /FROM query_runs|FROM native_vocabulary_ai_runs|FROM autonomous_query_page_observations|FROM provider_call_events/.test(text)), false,
+    'dependent queries must not run before schema readiness is established');
 });
 
 test('O3: page, run, country, source, provider, AI, and lifecycle metrics are queryable without nulls', async () => {
@@ -2098,16 +2267,18 @@ test('R1: transient AI failure retries up to three attempts while rule evidence 
   // terms. The parsed response is durable first, so a persistence retry
   // replays it without another provider request.
   assert.match(source, /recordNativeVocabularyAiResponse\(\{/);
+  assert.match(source, /provider: parsedSource,/);
   assert.match(source, /reservation\?\.reason === 'REPLAY_RESPONSE'/);
   assert.match(source, /if \(!parsed\) \{\s*await finishAiRun\('FAILED'/);
   assert.match(source, /onRequestAttempt: \(\) => \{/);
   const db = serverSource('dbCore.ts');
   assert.match(db, /NATIVE_VOCABULARY_AI_LEASE_SECONDS = 15 \* 60/);
   assert.match(db, /reason: 'REPLAY_RESPONSE'/);
+  assert.match(db, /provider=COALESCE\(\$5,provider\)/, 'the provider is durable with the response');
+  assert.match(db, /provider: existingRow\.provider/, 'replay restores the recorded provider');
   assert.match(db, /actual_cost_microunits=actual_cost_microunits\+\$5/);
   // Lease fencing: response and completion writes present the admission token,
   // so a worker whose reservation was reclaimed cannot mutate the replacement.
-  assert.match(db, /lease_token=\$5/);
   assert.match(db, /lease_token=\$6/);
   assert.match(db, /lease_token=\$2, lease_expires_at/);
   assert.match(db, /reason: 'RESERVED', requestId: args\.requestId, leaseToken/);

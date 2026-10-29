@@ -1,7 +1,7 @@
 import { getDb } from './db';
 import { getYouTubeQuotaDay } from './youtubeQuotaDay';
-import { resolveAutonomousCountries } from './autonomousDiscovery';
-import { WIKIMEDIA_USER_AGENT_ENV } from './freeQuerySignals';
+import { parseDiscoveryScopeMode, parseDiscoveryScopeSelection, resolveAutonomousCountries } from './autonomousDiscovery';
+import { isContactBearingWikimediaUserAgent, WIKIMEDIA_USER_AGENT_ENV } from './freeQuerySignals';
 
 /**
  * Country Discovery Loop health and observability.
@@ -136,6 +136,29 @@ export function evaluateCountryDiscoveryHealth(
     hardCap === 'true'
       ? 'youtube_key_daily_cap_enforced=true; the global hard cap is authoritative.'
       : `youtube_key_daily_cap_enforced is ${hardCap === undefined ? 'missing' : `'${hardCap}'`}; the hard cap must remain true.`,
+  );
+
+  // The scheduler and queue worker parse both scope values strictly and fail
+  // closed. Health must use the same parsers: silently collapsing an invalid
+  // mode to GLOBAL would return 200 while scheduling is actually stopped.
+  let scopeError: string | null = null;
+  try {
+    parseDiscoveryScopeMode(input.settings.query_intelligence_discovery_scope ?? 'GLOBAL');
+  } catch {
+    scopeError = `query_intelligence_discovery_scope is '${input.settings.query_intelligence_discovery_scope}' (expected GLOBAL or SELECTED_COUNTRIES).`;
+  }
+  if (!scopeError) {
+    try {
+      parseDiscoveryScopeSelection(input.settings.query_intelligence_selected_countries ?? '[]');
+    } catch {
+      scopeError = 'query_intelligence_selected_countries is malformed JSON or not an array of country names.';
+    }
+  }
+  add(
+    'discovery_scope',
+    scopeError ? 'FAIL' : 'PASS',
+    scopeError
+      || `Discovery scope ${input.settings.query_intelligence_discovery_scope || 'GLOBAL'} is valid.`,
   );
 
   add(
@@ -327,90 +350,106 @@ export async function gatherCountryDiscoveryHealth(clientOverride?: HealthRunner
       : String(row.setting_value);
   }
 
-  const [migration, schema, orphans, provider, ai, safety, quotaDeferrals, vocab, excluded, recentCountries] = await Promise.all([
-    runner.query(`SELECT 1 FROM schema_migrations WHERE version=161`),
-    runner.query(
-      `SELECT table_name, column_name FROM information_schema.columns
-       WHERE table_schema='public' AND table_name = ANY($1) AND column_name = ANY($2)`,
-      [
-        [...new Set(CDL_REQUIRED_SCHEMA.map(([table]) => table))],
-        [...new Set(CDL_REQUIRED_SCHEMA.map(([, column]) => column))],
-      ],
-    ),
-    runner.query(
-      `SELECT COUNT(*)::int AS count,
-              COALESCE(MAX(EXTRACT(EPOCH FROM (now()-COALESCE(last_page_at,started_at,scheduled_at)))/60),0)::float AS oldest_minutes
-       FROM query_runs
-       WHERE continuation_status IN ('RUNNING','DEFERRED_QUOTA','DEFERRED_TIME')
-         AND status NOT IN ('COMPLETED','FAILED')
-         AND (deferred_until IS NULL OR deferred_until <= now())
-         -- A live page job is queue backlog, not a missing page. The
-         -- reconciler uses the same exclusion; without it a legitimately
-         -- queued continuation older than 15 minutes fails the health route.
-         AND NOT EXISTS (
-           SELECT 1 FROM jobs j
-           WHERE j.status IN ('PENDING','PROCESSING')
-             AND (
-               j.idempotency_key = 'search-run:'||query_runs.id
-               OR j.idempotency_key = 'search-run:'||query_runs.id||':page:1'
-               OR j.idempotency_key = 'search-run:'||query_runs.id||':page:'||GREATEST(pages_completed+1,1)
-             )
-         )
-         AND COALESCE(last_page_at,started_at,scheduled_at) < now() - interval '${ORPHAN_AGE_MINUTES} minutes'`,
-    ),
-    runner.query(
-      `SELECT COUNT(*)::int AS calls,
-              COUNT(*) FILTER (WHERE status='SUCCESS')::int AS successes,
-              COUNT(*) FILTER (WHERE status='TIMEOUT')::int AS timeouts,
-              COUNT(*) FILTER (WHERE status='RATE_LIMITED')::int AS rate_limited,
-              COUNT(*) FILTER (WHERE status NOT IN ('SUCCESS','TIMEOUT','RATE_LIMITED','CANCELLED'))::int AS errors
-       FROM provider_call_events
-       WHERE occurred_at >= now() - interval '1 hour'
-         -- The canary is about discovery search providers only. Unrelated
-         -- Gemini/Groq enrichment failures must not make search look unhealthy.
-         AND (
-           (provider IN ('youtube','youtube-innertube') AND operation='search')
-           OR (provider='brave-search' AND operation='search')
-         )`,
-    ),
-    runner.query(
-      `SELECT COUNT(*)::int AS calls,
-              COUNT(*) FILTER (WHERE status='BUDGET_SKIPPED')::int AS budget_skips,
-              COALESCE(SUM(actual_cost_microunits),0)::bigint AS actual_cost
-       FROM native_vocabulary_ai_runs WHERE budget_day=$1`,
-      [getYouTubeQuotaDay()],
-    ),
-    runner.query(
-      `SELECT
-         (AVG(duplicate_ratio) FILTER (WHERE created_at >= now()-interval '24 hours'))::float AS duplicate_recent,
-         (AVG(duplicate_ratio) FILTER (WHERE created_at >= now()-interval '48 hours' AND created_at < now()-interval '24 hours'))::float AS duplicate_prior,
-         (AVG(country_precision) FILTER (WHERE created_at >= now()-interval '24 hours'))::float AS precision_recent,
-         (AVG(country_precision) FILTER (WHERE created_at >= now()-interval '48 hours' AND created_at < now()-interval '24 hours'))::float AS precision_prior
-       FROM autonomous_query_page_observations`,
-    ),
-    runner.query(
-      `SELECT
-         COUNT(*) FILTER (WHERE COALESCE(last_page_at,started_at,scheduled_at) >= now()-interval '1 hour')::int AS recent,
-         COUNT(*) FILTER (WHERE COALESCE(last_page_at,started_at,scheduled_at) >= now()-interval '2 hours'
-                            AND COALESCE(last_page_at,started_at,scheduled_at) < now()-interval '1 hour')::int AS prior
-       FROM query_runs WHERE continuation_status='DEFERRED_QUOTA'`,
-    ),
-    runner.query(`SELECT country FROM country_vocabularies`),
-    runner.query(`SELECT country_name FROM excluded_countries`),
-    runner.query(
-      `SELECT DISTINCT qr.country
-       FROM query_runs qr
-       JOIN autonomous_query_page_observations p ON p.query_run_id=qr.id
-       WHERE p.created_at >= now()-interval '24 hours'`,
-    ),
-  ]);
-
+  // Schema evidence is a prerequisite, not a peer: dependent queries reference
+  // migration-161 tables, so running them concurrently would reject the whole
+  // report before the evaluator can say which schema is missing.
+  const migration = await runner.query(`SELECT 1 FROM schema_migrations WHERE version=161`);
+  const schema = await runner.query(
+    `SELECT table_name, column_name FROM information_schema.columns
+     WHERE table_schema='public' AND table_name = ANY($1) AND column_name = ANY($2)`,
+    [
+      [...new Set(CDL_REQUIRED_SCHEMA.map(([table]) => table))],
+      [...new Set(CDL_REQUIRED_SCHEMA.map(([, column]) => column))],
+    ],
+  );
   const present = new Set(
     (schema.rows || []).map(row => `${String(row.table_name)}.${String(row.column_name)}`),
   );
   const missingSchema = CDL_REQUIRED_SCHEMA
     .filter(([table, column]) => !present.has(`${table}.${column}`))
     .map(([table, column]) => `${table}.${column}`);
+  const migrationApplied = (migration.rows || []).length > 0;
+  const schemaReady = migrationApplied && missingSchema.length === 0;
+
+  const empty = { rows: [] as Array<Record<string, unknown>> };
+  let orphans = empty;
+  let provider = empty;
+  let ai = empty;
+  let safety = empty;
+  let quotaDeferrals = empty;
+  let vocab = empty;
+  let excluded = empty;
+  let recentCountries = empty;
+  if (schemaReady) {
+    [orphans, provider, ai, safety, quotaDeferrals, vocab, excluded, recentCountries] = await Promise.all([
+      runner.query(
+        `SELECT COUNT(*)::int AS count,
+                COALESCE(MAX(EXTRACT(EPOCH FROM (now()-COALESCE(last_page_at,started_at,scheduled_at)))/60),0)::float AS oldest_minutes
+         FROM query_runs
+         WHERE continuation_status IN ('RUNNING','DEFERRED_QUOTA','DEFERRED_TIME')
+           AND status NOT IN ('COMPLETED','FAILED')
+           AND (deferred_until IS NULL OR deferred_until <= now())
+           -- A live page job is queue backlog, not a missing page. The
+           -- reconciler uses the same exclusion; without it a legitimately
+           -- queued continuation older than 15 minutes fails the health route.
+           AND NOT EXISTS (
+             SELECT 1 FROM jobs j
+             WHERE j.status IN ('PENDING','PROCESSING')
+               AND (
+                 j.idempotency_key = 'search-run:'||query_runs.id
+                 OR j.idempotency_key = 'search-run:'||query_runs.id||':page:1'
+                 OR j.idempotency_key = 'search-run:'||query_runs.id||':page:'||GREATEST(pages_completed+1,1)
+               )
+           )
+           AND COALESCE(last_page_at,started_at,scheduled_at) < now() - interval '${ORPHAN_AGE_MINUTES} minutes'`,
+      ),
+      runner.query(
+        `SELECT COUNT(*)::int AS calls,
+                COUNT(*) FILTER (WHERE status='SUCCESS')::int AS successes,
+                COUNT(*) FILTER (WHERE status='TIMEOUT')::int AS timeouts,
+                COUNT(*) FILTER (WHERE status='RATE_LIMITED')::int AS rate_limited,
+                COUNT(*) FILTER (WHERE status NOT IN ('SUCCESS','TIMEOUT','RATE_LIMITED','CANCELLED'))::int AS errors
+         FROM provider_call_events
+         WHERE occurred_at >= now() - interval '1 hour'
+           -- The canary is about discovery search providers only. Unrelated
+           -- Gemini/Groq enrichment failures must not make search look unhealthy.
+           AND (
+             (provider IN ('youtube','youtube-innertube') AND operation='search')
+             OR (provider='brave-search' AND operation='search')
+           )`,
+      ),
+      runner.query(
+        `SELECT COUNT(*)::int AS calls,
+                COUNT(*) FILTER (WHERE status='BUDGET_SKIPPED')::int AS budget_skips,
+                COALESCE(SUM(actual_cost_microunits),0)::bigint AS actual_cost
+         FROM native_vocabulary_ai_runs WHERE budget_day=$1`,
+        [getYouTubeQuotaDay()],
+      ),
+      runner.query(
+        `SELECT
+           (AVG(duplicate_ratio) FILTER (WHERE created_at >= now()-interval '24 hours'))::float AS duplicate_recent,
+           (AVG(duplicate_ratio) FILTER (WHERE created_at >= now()-interval '48 hours' AND created_at < now()-interval '24 hours'))::float AS duplicate_prior,
+           (AVG(country_precision) FILTER (WHERE created_at >= now()-interval '24 hours'))::float AS precision_recent,
+           (AVG(country_precision) FILTER (WHERE created_at >= now()-interval '48 hours' AND created_at < now()-interval '24 hours'))::float AS precision_prior
+         FROM autonomous_query_page_observations`,
+      ),
+      runner.query(
+        `SELECT
+           COUNT(*) FILTER (WHERE COALESCE(last_page_at,started_at,scheduled_at) >= now()-interval '1 hour')::int AS recent,
+           COUNT(*) FILTER (WHERE COALESCE(last_page_at,started_at,scheduled_at) >= now()-interval '2 hours'
+                              AND COALESCE(last_page_at,started_at,scheduled_at) < now()-interval '1 hour')::int AS prior
+         FROM query_runs WHERE continuation_status='DEFERRED_QUOTA'`,
+      ),
+      runner.query(`SELECT country FROM country_vocabularies`),
+      runner.query(`SELECT country_name FROM excluded_countries`),
+      runner.query(
+        `SELECT DISTINCT qr.country
+         FROM query_runs qr
+         JOIN autonomous_query_page_observations p ON p.query_run_id=qr.id
+         WHERE p.created_at >= now()-interval '24 hours'`,
+      ),
+    ]);
+  }
 
   const providerRow = (provider.rows || [])[0] || {};
   const providerCalls = Number(providerRow.calls || 0);
@@ -425,14 +464,16 @@ export async function gatherCountryDiscoveryHealth(clientOverride?: HealthRunner
   const safetyRow = (safety.rows || [])[0] || {};
   const quotaRow = (quotaDeferrals.rows || [])[0] || {};
 
-  const scope = settings.query_intelligence_discovery_scope === 'SELECTED_COUNTRIES'
-    ? 'SELECTED_COUNTRIES' as const
-    : 'GLOBAL' as const;
+  // Invalid persisted scope values are surfaced as a FAIL check by the pure
+  // evaluator. Keep the country list computation bounded here (GLOBAL/[]) so
+  // the health endpoint still returns its diagnostic report rather than a 500.
+  let scope: 'GLOBAL' | 'SELECTED_COUNTRIES' = 'GLOBAL';
   let selectedCountries: string[] = [];
   try {
-    const parsed = JSON.parse(settings.query_intelligence_selected_countries || '[]');
-    if (Array.isArray(parsed)) selectedCountries = parsed.filter((value): value is string => typeof value === 'string');
+    scope = parseDiscoveryScopeMode(settings.query_intelligence_discovery_scope ?? 'GLOBAL');
+    selectedCountries = parseDiscoveryScopeSelection(settings.query_intelligence_selected_countries ?? '[]');
   } catch {
+    scope = 'GLOBAL';
     selectedCountries = [];
   }
   const activeCountries = resolveAutonomousCountries(
@@ -449,7 +490,7 @@ export async function gatherCountryDiscoveryHealth(clientOverride?: HealthRunner
     .length;
 
   return evaluateCountryDiscoveryHealth({
-    migrationApplied: (migration.rows || []).length > 0,
+    migrationApplied,
     missingSchema,
     settings,
     orphanPendingPages: Number(((orphans.rows || [])[0] || {}).count || 0),
@@ -476,7 +517,7 @@ export async function gatherCountryDiscoveryHealth(clientOverride?: HealthRunner
       recent: safetyRow.precision_recent == null ? null : Number(safetyRow.precision_recent),
       prior: safetyRow.precision_prior == null ? null : Number(safetyRow.precision_prior),
     },
-    wikimediaUserAgentConfigured: Boolean(String(process.env[WIKIMEDIA_USER_AGENT_ENV] || '').trim()),
+    wikimediaUserAgentConfigured: isContactBearingWikimediaUserAgent(process.env[WIKIMEDIA_USER_AGENT_ENV]),
   });
 }
 

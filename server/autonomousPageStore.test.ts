@@ -18,6 +18,30 @@ test('scope weighting survives page aggregation; legacy pages stay neutral',()=>
   ]);
   assert.equal(cumulative.distinctResults, 14);
   assert.equal(aggregatePageMetrics([legacy(), legacy()]).distinctResults, 16);
+  // Migration default 0 is not a measured cumulative reach: positive page
+  // results must keep the per-page fallback until a real cumulative is stored.
+  assert.equal(
+    aggregatePageMetrics([
+      { ...legacy(), cumulativeUniqueCreators: 0 },
+      { ...legacy(), cumulativeUniqueCreators: 0 },
+    ]).distinctResults,
+    16,
+  );
+  assert.equal(
+    aggregatePageMetrics([
+      { ...legacy(), cumulativeUniqueCreators: 14 },
+      { ...legacy(), cumulativeUniqueCreators: 0 },
+    ]).distinctResults,
+    14,
+  );
+  assert.equal(
+    aggregatePageMetrics([
+      { ...legacy(), cumulativeUniqueCreators: 14 },
+      { ...legacy(), distinctResults: 0, cumulativeUniqueCreators: 0 },
+    ]).distinctResults,
+    14,
+    'a zero-result legacy page cannot erase an earlier cumulative reach',
+  );
 });
 
 test('country rejections are counted once against cumulative unique reach', () => {

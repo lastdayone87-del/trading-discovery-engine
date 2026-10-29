@@ -286,6 +286,15 @@ test('the claim path keeps only claim-critical stale-job recovery', () => {
   assert.ok(recoveryAt >= 0, 'stale job recovery stays in the claim path');
   assert.ok(statusAt > recoveryAt, 'queue status is read after claim-critical recovery');
   assert.ok(claimAt > statusAt, 'the claim still follows recovery and queue status');
+
+  // The auto-resume sweep is scheduler-only. A whole-file name scan cannot
+  // assert this because the function definition itself contains the name, so
+  // inspect only the processNextSearchJob body.
+  const claimBodyStart = queue.indexOf('export async function processNextSearchJob');
+  assert.ok(claimBodyStart >= 0, 'claim path function is present');
+  const claimBodyEnd = queue.indexOf('\nexport ', claimBodyStart + 1);
+  const claimBody = queue.slice(claimBodyStart, claimBodyEnd > claimBodyStart ? claimBodyEnd : undefined);
+  assert.doesNotMatch(claimBody, /resumeOrphanedAutonomousPages/, 'the auto-resume sweep must not run inside the claim path');
 });
 
 test('maintenance is started exactly once after database readiness', () => {

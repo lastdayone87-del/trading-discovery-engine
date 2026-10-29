@@ -362,6 +362,12 @@ export function countTrailingContinuationStreaks(
   let duplicateActive = true;
   let wrongActive = true;
   for (const row of rows) {
+    // A pre-v2 row carries `{}` (the migration default) rather than a v2
+    // decision. Its v1 reason codes were not evaluated with v2 streak
+    // semantics, so stop at the first such row instead of inventing a v2
+    // low-value/duplicate/wrong-country streak from them. Rows without the
+    // field (older callers/tests) keep the reason-code reconstruction path.
+    if (row.continuationDecisionV2 !== undefined && !parseContinuationDecisionV2(row.continuationDecisionV2)) break;
     const codes = new Set(Array.isArray(row.reasonCodes) ? row.reasonCodes : []);
     if ([...codes].some(code => TRANSPARENT_V2_CODES.has(code))) continue;
     const productive = [...codes].some(code => PRODUCTIVE_V2_CODES.has(code));
@@ -396,7 +402,6 @@ export interface EffectivePageBudgetInput {
   remainingAutonomousQuota: number;
   /** Active countries with a new-query turn or a pending continuation. */
   pendingCountries: number;
-  minRunPages?: number;
   treatmentCapPages?: number | null;
   trialContinuationCap?: number | null;
 }
@@ -412,6 +417,8 @@ export interface EffectivePageBudget {
  * Four independent bounds: hard safety ceiling, provider cap, fair-share quota
  * budget, and any treatment/trial reservation. The fair-share budget is fixed
  * at the run's first page and does not shrink when another country appears.
+ * There is deliberately no per-run page minimum: a fair-share floor that let
+ * one country take extra pages would starve the other pending countries.
  */
 export function computeEffectivePageBudget(input: EffectivePageBudgetInput): EffectivePageBudget {
   const safety = Math.max(1, Math.trunc(input.safetyMaxPages) || 1);
@@ -439,30 +446,14 @@ export function computeEffectivePageBudget(input: EffectivePageBudgetInput): Eff
   }
   let effective = bounds[0];
   for (const candidate of bounds.slice(1)) {
-    if (candidate.pages < effective.pages) effective = candidate;
-  }
-  const minRunPages = Math.max(0, Math.trunc(input.minRunPages || 0));
-  if (minRunPages > effective.pages && quotaPages > 0) {
-    // min_run_pages prevents a zero-page run; it may raise the budget only when
-    // every independent bound (safety, provider, quota, treatment, trial) can
-    // fund the requested minimum. It must never override a smaller
-    // treatment/trial cap or let the run outspend its fair-share quota.
-    const canFundFirstPage = pageCost === 0 || remaining >= pageCost;
-    const treatmentCap = input.treatmentCapPages != null
-      ? Math.max(1, Math.trunc(input.treatmentCapPages) || 1)
-      : Number.POSITIVE_INFINITY;
-    const trialCap = input.trialContinuationCap != null
-      ? Math.max(1, Math.trunc(input.trialContinuationCap) || 1)
-      : Number.POSITIVE_INFINITY;
+    // Treatment/trial caps win ties. Otherwise an equal safety/provider/quota
+    // bound would leave bindingBound as SAFETY, and the segmenter would renew
+    // the same allocation cap with a fresh run quota instead of ending.
     if (
-      canFundFirstPage
-      && minRunPages <= safety
-      && minRunPages <= provider
-      && minRunPages <= quotaPages
-      && minRunPages <= treatmentCap
-      && minRunPages <= trialCap
+      candidate.pages < effective.pages
+      || (candidate.pages === effective.pages && (candidate.bound === 'TREATMENT' || candidate.bound === 'TRIAL'))
     ) {
-      effective = { bound: effective.bound, pages: minRunPages };
+      effective = candidate;
     }
   }
   return {

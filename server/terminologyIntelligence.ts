@@ -580,6 +580,15 @@ export interface LifecycleV2Input {
   quotaConsumed: number;
   /** Coordinated-burst flag; three buckets hold until a fourth independent bucket. */
   coordinatedBurst?: boolean;
+  /**
+   * Native-v1 novelty verdict for the native evidence backing this basis.
+   * Fail-closed when absent: legacy native rows promoted by migration 161 do
+   * not carry a quality marker, so `null` is reserved for external-only
+   * validation where no native novelty claim exists.
+   */
+  nativeNovel?: boolean | null;
+  /** Native-v1 spam verdict; only an explicit true blocks promotion. */
+  spamConfirmed?: boolean;
 }
 
 export interface LifecycleV2Decision {
@@ -658,9 +667,16 @@ export function decideLifecycleV2(
     };
   }
   if (validationBasis) {
+    // Novelty/spam are native-v1 quality verdicts. Any native contribution
+    // (native or mixed basis) must carry an affirmative novelty verdict; a
+    // missing marker is treated as non-novel rather than skipping the check.
+    // External-only validation has no native novelty claim, so null remains
+    // the explicit skip for that case.
+    const nativeQuality = (nativeBasis || mixedBasis)
+      ? { novel: input.nativeNovel ?? false, spamConfirmed: input.spamConfirmed === true }
+      : { novel: null, spamConfirmed: false };
     const verdict = evaluateNativeTermPromotionV2({
-      novel: null,
-      spamConfirmed: false,
+      ...nativeQuality,
       executions: input.executions,
       quotaConsumed: input.quotaConsumed,
       confirmedTradingCreators: input.confirmedTradingCreators,
@@ -1547,6 +1563,9 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
   const row = result.rows[0];
   let decision = decideLifecycle({ current: row.lifecycle_status, decayedEvidence: row.decayed_evidence, distinctCreators: row.distinct_creators, distinctCommunities: row.distinct_communities, executions: row.executions, decayedYield: row.decayed_yield, termType: row.term_type }, policy);
   let v2Snapshot: Record<string, unknown> | null = null;
+  // Shared quality rollup for the v2 promotion decision and the later trial
+  // gate. Per-term serialization makes one read sufficient.
+  let cachedQuality: NativeQualityRollup | null = null;
   if (v2Enabled) {
     // C2 current-state reconciliation. A channel reclassified away from the
     // term's country (or no longer CONFIRMED / TRADING_CONFIRMED / quality>=55,
@@ -1622,6 +1641,8 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
     );
     const perfRow = ((perf.rows || [])[0] || {}) as Record<string, unknown>;
     const freshConfirmed = Number(perfRow.fresh_confirmed || 0);
+    const v2Quality = await readNativeQualityEvidence(termId, runner, NATIVE_QUALITY_ROLLUP_V2_SQL);
+    cachedQuality = v2Quality;
     const nativeCreators = Number(v2Row.native_creators || 0);
     const nativeEvidenceBuckets = Number(v2Row.native_evidence_buckets || nativeCreators);
     row.distinct_creators = nativeCreators;
@@ -1661,6 +1682,8 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
       executions: Number(perfRow.executions || 0),
       decayedYield: Number(row.decayed_yield || 0),
       quotaConsumed: Number(perfRow.quota || 0),
+      nativeNovel: v2Quality.v1Observations > 0 ? v2Quality.novel : false,
+      spamConfirmed: v2Quality.spamConfirmed,
     }, policy);
   }
   // Native quality gate: applies whenever the term carries new-pipeline
@@ -1685,9 +1708,9 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
   // the aggregate read is skipped (identical outcome, no wasted query). A
   // PROVEN legacy decision always sets searchEligible, so the PROVEN cap
   // below never faces a skipped read.
-  const quality = (enteringEligibility || row.search_eligible)
+  const quality: NativeQualityRollup = cachedQuality ?? ((enteringEligibility || row.search_eligible)
     ? await readNativeQualityEvidence(termId, runner, v2Enabled ? NATIVE_QUALITY_ROLLUP_V2_SQL : NATIVE_QUALITY_ROLLUP_SQL)
-    : { v1Observations: 0, spamConfirmed: false, novel: false };
+    : { v1Observations: 0, spamConfirmed: false, novel: false });
   // Native PROVEN gate: the legacy lifecycle must not automatically mark a
   // native-v1 term PROVEN on executions/yield alone (scopeWeightedYield counts
   // in-scope channels regardless of trading outcome). Promotion to PROVEN

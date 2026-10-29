@@ -1430,7 +1430,6 @@ export async function processNextSearchJob(
       const maxDuplicate = Math.max(1, Number(await getAppSetting('autonomous_pagination_max_duplicate_pages', '2')));
       const maxWrongCountry = Math.max(1, Number(await getAppSetting('autonomous_pagination_max_wrong_country_pages', '2')));
       const explorationSetting = Math.max(0, Number(await getAppSetting('autonomous_pagination_exploration_pages', '1')));
-      const minRunPages = Math.max(0, Number(await getAppSetting('autonomous_pagination_min_run_pages', '1')));
       const v2Enabled = await getAppSetting('autonomous_pagination_v2_enabled', 'true') === 'true';
       const enabled = await getAppSetting('autonomous_pagination_enabled', 'true') === 'true';
       // CDL master switch: turning it off must stop new continuation work
@@ -1463,7 +1462,6 @@ export async function processNextSearchJob(
         // is charged twice and the continuation is underfunded by one page.
         remainingAutonomousQuota: quotaAvailability.remainingAutonomousQuota + pageCostUnits,
         pendingCountries: activeCountries,
-        minRunPages,
         treatmentCapPages,
         trialContinuationCap: trialCapPages,
       });

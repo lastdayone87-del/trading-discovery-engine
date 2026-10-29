@@ -1123,6 +1123,9 @@ Return ONLY a valid JSON object with format:
             leaseToken: reservationOwner.leaseToken,
             responsePayload: parsed as Record<string, unknown>,
             attempts: reservationOwner.attempts,
+            // Persist provenance with the response. A crash before completion
+            // must replay the same provider instead of defaulting to Gemini.
+            provider: parsedSource,
           });
           if (!ownsReservation) {
             console.warn(
