@@ -360,6 +360,59 @@ test('executing click loop counts queued controls left beyond the click cap', as
   assert.equal(result.interactionGap, true);
 });
 
+test('over-budget generic disclosures do not make an otherwise clean page retryable', async () => {
+  const controls = Array.from({ length: 5 }, (_, index) => ({
+    ...renderedButton(index, `oc-disclosure-${index}`),
+    text: 'Open menu',
+    origin: 'disclosure' as const,
+  }));
+  let clicks = 0;
+  const result = await runRenderedClickLoop({
+    targets: controls,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    click: async () => { clicks++; return true; },
+    enumerate: async () => renderedEnumeration(controls),
+    pageUrl: () => 'https://creator.example/',
+  });
+  assert.equal(clicks, 4, 'disclosures still consume available click budget');
+  assert.equal(result.evidenceControlsSkipped, 1);
+  assert.equal(result.interactionGap, false, 'an unclicked generic disclosure is opportunistic, not a retryable gap');
+});
+
+test('an unclicked hint/icon control still makes the page retryable', async () => {
+  const controls = [
+    { ...renderedButton(0, 'oc-hint'), origin: 'hint' as const },
+    ...Array.from({ length: 4 }, (_, index) => ({
+      ...renderedButton(index + 1, `oc-disclosure-${index}`),
+      text: 'Open menu',
+      origin: 'disclosure' as const,
+    })),
+  ];
+  const result = await runRenderedClickLoop({
+    targets: controls,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    click: async () => true,
+    enumerate: async () => renderedEnumeration(controls),
+    pageUrl: () => 'https://creator.example/',
+  });
+  assert.equal(result.evidenceControlsSkipped, 1);
+  assert.equal(result.interactionGap, false, 'the skipped control is only a disclosure');
+
+  const fiveHints = controls.map((control, index) => ({ ...control, marker: `oc-hint-${index}`, origin: 'hint' as const }));
+  const hinted = await runRenderedClickLoop({
+    targets: fiveHints,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    click: async () => true,
+    enumerate: async () => renderedEnumeration(fiveHints),
+    pageUrl: () => 'https://creator.example/',
+  });
+  assert.equal(hinted.evidenceControlsSkipped, 1);
+  assert.equal(hinted.interactionGap, true, 'an unclicked evidence control remains a retryable gap');
+});
+
 test('executing click loop fails closed when post-click re-enumeration throws', async () => {
   const result = await runRenderedClickLoop({
     targets: [renderedButton(0, 'oc-detached')],
@@ -621,6 +674,9 @@ test('rendered control coverage counts overflow and uses stable markers across D
   assert.match(source, /(?:const\s+)?clickLoop = await runRenderedClickLoop\(\{[\s\S]*?enumerate: enumerateControls,[\s\S]*?onEnumerated: recordControlEnumeration,?\s*\}\);/, 'the handler executes the extracted loop after every click');
   assert.doesNotMatch(source, /clickedThisPage < limits\.maxClicksPerPage && Date\.now\(\) - startedAt < limits\.totalTimeoutMs\) \{/, 'the old final-click guard must not return');
   assert.match(source, /freshDropped\+\+/, 're-enumerated controls beyond the remaining budget are counted as skipped');
+  assert.match(source, /const sliceSkippedTargets = clickPlan\.evaluationWindow\.filter/, 'slice accounting identifies the skipped targets');
+  assert.match(source, /renderedControlSkipsNeedInteractionGap\(sliceSkippedTargets\)/, 'only hint/icon skips make the initial plan retryable');
+  assert.match(source, /origin: baseMatched \? 'hint' : extendedMatched \? 'icon' : 'disclosure'/, 'enumeration records why a control entered the click set');
   assert.match(source, /drops\.count\('control-slice', clickLoop\.evidenceControlsSkipped\)/, 'revealed-control slices are recorded');
   assert.match(source, /interactionGap:interactionGap\|\|undefined/, 'throw paths retain the interaction gap');
   assert.match(source, /if \(clickedThisPage >= input\.maxClicksPerPage\) \{[\s\S]*?clickTargets\.slice\(clickIndex\)/,
