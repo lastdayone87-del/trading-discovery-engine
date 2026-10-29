@@ -1,11 +1,14 @@
 # Invite navigation-coverage telemetry and control recovery (P0.2/P1.1/P1.2/P1.7)
 
 **Status:** P0.2 instrumentation, P1.1/P1.2 control recovery, and P1.7 outcome
+**Status:** P0.2 instrumentation, P1.1/P1.2 control recovery, and P1.7 outcome
 truthfulness. Recovering structural and icon-label controls widens the rendered
 click set and changes which unexamined controls make a page retryable; coverage
-reasons can move from `COMPLETE` to `POLICY_EXCLUDED`/`BOUNDED`. Selection,
-queue, and schema behavior are unchanged; P1.7 maps a non-`COMPLETE` reason to
-outcome, retry, and cache truthfulness.
+reasons can move from `COMPLETE` to `POLICY_EXCLUDED`/`BOUNDED`. No queue or
+schema behavior changes. P1.7 maps a non-`COMPLETE` reason to outcome and retry
+truthfulness, and cached rendered-evidence reuse now requires `COMPLETE`
+coverage, so a bounded/context/policy gap is no longer reusable as a clean site
+inspection.
 **Scope:** Rendered creator-website acquisition (`mode = RENDERED`).
 **Related evidence:** `INVITE_NAVIGATION_ACQUISITION_RECALL_INVESTIGATION_20261027.md`
 and the 2026-10-27 P0.3 production classification report (read-only Coolify
