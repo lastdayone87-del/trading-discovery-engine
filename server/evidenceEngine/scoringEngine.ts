@@ -21,6 +21,14 @@ export class ConfigurableWeightedStrategy {
     this.config = { ...getScoringConfig(), ...customConfig };
   }
 
+  /** Policy thresholds consumed by the C6 pre-semantic recognition gate. */
+  public policyConfig(): { minimumPositiveWeightTrading: number; minimumTradingScore: number } {
+    return {
+      minimumPositiveWeightTrading: this.config.minPositiveWeightTrading,
+      minimumTradingScore: this.config.minVerifiedTradingScore,
+    };
+  }
+
   public evaluateDecision(
     evidenceItems: EvidenceItem[],
     knowledgeContext: LayeredKnowledgeContext,

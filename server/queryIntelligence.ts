@@ -14,6 +14,9 @@ import {
   getAppSetting,
   getQueryQualityRunRows,
   getQueryPortfolioBudgetState,
+  getQueryQuotaSpendRows,
+  getQueryFailureStates,
+  getQueryRunReward,
   isRetryableInfrastructureFailure
 } from './db';
 import { assertCountryAllowed } from './countryExclusion';
@@ -27,6 +30,7 @@ import {
   SELECTOR_C,
   computePosterior,
   decayArmCounts,
+  decayWeight,
   empiricalPrior,
   promotionQualityScore,
 } from './queryQuality/posterior';
@@ -1206,7 +1210,11 @@ async function buildSelectorPool(
     primaryUsage.set(key, (primaryUsage.get(key) || 0) + 1);
   }
 
-  const qualityRows = await getQueryQualityRunRows(country);
+  const [qualityRows, spendRows, failureStates] = await Promise.all([
+    getQueryQualityRunRows(country),
+    getQueryQuotaSpendRows(country),
+    getQueryFailureStates(country),
+  ]);
   const rowsByQuery = new Map<number, Array<{ confirmed: number; quality: number; quotaUnits: number; ageDays: number }>>();
   for (const row of qualityRows) {
     if (!(row.quotaUnits > 0)) continue;
@@ -1220,13 +1228,31 @@ async function buildSelectorPool(
   }
   const prior = empiricalPrior([...countsById.values()], 0.05, 2);
 
+  // Share accounting covers every query in the country's accounting window,
+  // not only the survivors of cooldown/intent rotation. Otherwise a cooling
+  // query's spend disappears and a sibling from the same family/source can
+  // exceed the cap. Pending/reserved runs are included at their reserved
+  // weight so committed quota cannot be bypassed before completion.
+  const spendById = new Map<number, number>();
+  for (const row of spendRows) {
+    spendById.set(row.queryId, (spendById.get(row.queryId) || 0) + row.quotaUnits * decayWeight(row.ageDays, DECAY_HALF_LIFE_DAYS));
+  }
+  const failureByQuery = new Map(failureStates.map(state => [state.queryId, state]));
+  const historyFor = (query: QueryRecord) => queries
+    .filter(other => other.id !== query.id)
+    .map(other => {
+      const aliasOf = other.generation_metadata?.aliasOf;
+      return { query: other.query, country: other.country, ...(typeof aliasOf === 'string' ? { aliasOf } : {}) };
+    });
+
   const admissions = new Map<number, QueryRecordAdmission>();
   let eligible: QueryRecord[] = [];
   for (const query of queries) {
-    const admissionInfo = revalidateQueryRecordAdmission(query, { now: options.nowIso });
+    const admissionInfo = revalidateQueryRecordAdmission(query, { now: options.nowIso, history: historyFor(query) });
     admissions.set(query.id, admissionInfo);
     if (!admissionInfo.eligible) continue;
     if (admissionInfo.admission.tier === 'SPECULATIVE') continue;
+    const failure = failureByQuery.get(query.id);
     const selectable = isQuerySelectable({
       record: query,
       now: options.nowIso,
@@ -1234,6 +1260,8 @@ async function buildSelectorPool(
       admission: admissionInfo.admission,
       primaryTermUses: primaryUsage.get(primaryKey(query.primary_term)) || 0,
       maxPrimaryUses: options.maxPrimaryUses,
+      consecutiveFailures: failure?.consecutiveFailures,
+      backoffUntil: failure?.backoffUntil,
     });
     if (!selectable.selectable) continue;
     eligible.push(query);
@@ -1247,20 +1275,28 @@ async function buildSelectorPool(
   const sourceQuota = new Map<string, number>();
   const candidates: SelectorCandidate[] = [];
   let totalQuota = 0;
+  for (const query of queries) {
+    const admissionInfo = admissions.get(query.id);
+    const counts = countsById.get(query.id) || emptyArmCounts();
+    const spend = spendById.get(query.id) ?? counts.quotaUnits;
+    totalQuota += spend;
+    const admission = admissionInfo?.admission;
+    const family = admission?.compositionFamily
+      || (typeof query.generation_metadata?.compositionFamily === 'string' ? query.generation_metadata.compositionFamily : 'family:UNKNOWN');
+    familyQuota.set(family, (familyQuota.get(family) || 0) + spend);
+    const source = admission?.source || 'UNKNOWN';
+    sourceQuota.set(source, (sourceQuota.get(source) || 0) + spend);
+  }
   for (const query of eligible) {
     const admissionInfo = admissions.get(query.id);
     const counts = countsById.get(query.id) || emptyArmCounts();
     const candidate = buildSelectorCandidate(query, admissionInfo, admissionInfo?.admission, counts);
     candidates.push(candidate);
-    totalQuota += counts.quotaUnits;
-    familyQuota.set(candidate.compositionFamily, (familyQuota.get(candidate.compositionFamily) || 0) + counts.quotaUnits);
-    const source = candidate.admission?.source || 'UNKNOWN';
-    sourceQuota.set(source, (sourceQuota.get(source) || 0) + counts.quotaUnits);
   }
-  // Shares are measured against the larger of observed candidate spend and
-  // one day of quota. Comparing only against candidate history would make a
-  // homogeneous pool 100% of its own family/source and cap every candidate
-  // forever, even when the family has spent a tiny fraction of the day.
+  // Shares are measured against the larger of observed spend and one day of
+  // quota. Comparing only against query history would make a homogeneous pool
+  // 100% of its own family/source and cap every candidate forever, even when
+  // the family has spent a tiny fraction of the day.
   const budget = await getQueryPortfolioBudgetState();
   const shareBase = Math.max(1, totalQuota, budget.dailyQuotaUnits);
   const share = (rows: Map<string, number>, key: string): number => (rows.get(key) || 0) / shareBase;
@@ -1508,7 +1544,7 @@ export async function constructCountryNativeAllocationQuery(args: {
 export async function evaluateQueryPerformance(
   queryRecord: QueryRecord,
   metrics: QueryFunnelMetrics,
-  attribution: { retrievalLane?: string; searchOrdering?: string; quotaConsumed?: number; persist?: boolean } = {}
+  attribution: { retrievalLane?: string; searchOrdering?: string; quotaConsumed?: number; queryRunId?: string; persist?: boolean } = {}
 ): Promise<{ performanceScore: number; newCollection: QueryCollection; summary: string }> {
   const performanceScore = metrics.performanceScore;
   // Q4c promotion guard: PROVEN is a lower-confidence-bound decision over
@@ -1520,9 +1556,16 @@ export async function evaluateQueryPerformance(
   if (performanceScore >= 60) {
     const priorRows = (await getQueryQualityRunRows(queryRecord.country))
       .filter(row => row.queryId === queryRecord.id);
+    // Use the run's own sighting truth: confirmed/quality are intersections
+    // of persisted, globally-new, non-rejected, confirmed channels. The
+    // aggregate counters can independently contain known confirmed traders
+    // and new uncertain channels; min() would invent overlap that never
+    // existed and could promote a zero-new-confirmation run.
+    const currentReward = attribution.queryRunId
+      ? await getQueryRunReward(attribution.queryRunId)
+      : { confirmed: Math.min(metrics.tradingConfirmed, metrics.newChannels), quality: Math.min(metrics.qualityChannels, metrics.newChannels) };
     const currentRun = {
-      confirmed: Math.min(metrics.tradingConfirmed, metrics.newChannels),
-      quality: Math.min(metrics.qualityChannels, metrics.newChannels),
+      ...currentReward,
       quotaUnits: Math.max(0, attribution.quotaConsumed || 0) / 100,
       ageDays: 0,
     };
@@ -1532,7 +1575,9 @@ export async function evaluateQueryPerformance(
       completedRuns: counts.runs,
       lcb: promotionQualityScore(posterior),
       newConfirmedCreators: counts.confirmed,
-      duplicateRatio: metrics.rawResults > 0 ? metrics.duplicateResults / metrics.rawResults : 0,
+      duplicateRatio: (metrics.evaluatedRawResults ?? metrics.rawResults) > 0
+        ? metrics.duplicateResults / (metrics.evaluatedRawResults ?? metrics.rawResults)
+        : 0,
       invalidQueryRate: 0,
       threshold: PROVEN_LCB_THRESHOLD,
       minRuns: PROVEN_MIN_COMPLETED_RUNS,

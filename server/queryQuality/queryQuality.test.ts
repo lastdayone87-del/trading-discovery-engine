@@ -28,11 +28,13 @@ import {
 } from './profiles';
 import { computePosterior, empiricalPrior, PORTFOLIO_RATIO, SELECTOR_C } from './posterior';
 import { selectHierarchicalUcb, portfolioBudget } from './selector';
-import { isQuerySelectable } from './lifecycle';
+import { deriveQueryFailureState, isQuerySelectable } from './lifecycle';
 import { buildQueryQualityVector, buildAttribution, canPromoteToProven } from './accounting';
 import { selectQueryCollection } from '../queryPerformance';
 import { buildQueryQualityDashboard } from './dashboard';
 import { compareSelectors } from './simulator';
+import { verifyFrozenBenchmarkVersions } from '../benchmarkPreregV1';
+import { AUTONOMOUS_QUERY_AUTHORITY_POLICY_VERSION } from '../autonomousQueryAuthority';
 import type { SelectorCandidate, SelectorContext, QueryAdmission } from './types';
 import { buildCanonicalEvidenceCorpus } from '../evidenceEngine/canonicalEvidencePlane';
 import {
@@ -270,6 +272,58 @@ test('Q4: portfolio budget is bounded to the 10–20% band and triggers coverage
   assert.ok(decision.reasonCodes.includes('PORTFOLIO_BUDGET_RESERVED'));
 });
 
+test('Q4: exhausted portfolio budget cannot be exceeded by coverage or cold-start branches', () => {
+  const cold = candidate(1, 'family:A', 0, 0);
+  const coverageDebt = { coverageCells: ['de', 'de-new'], coveredCells: ['de'] };
+  const exhausted = selectHierarchicalUcb([cold], selectorContext({ portfolioUnitsUsed: 15, ...coverageDebt }));
+  assert.equal(exhausted.strategy, 'NO_ELIGIBLE_QUERY');
+  assert.equal(exhausted.queryId, null);
+  assert.ok(exhausted.reasonCodes.includes('PORTFOLIO_BUDGET_EXHAUSTED'));
+  assert.ok(exhausted.reasonCodes.includes('FAIL_CLOSED'));
+
+  const coldStartExhausted = selectHierarchicalUcb([cold], selectorContext({ portfolioUnitsUsed: 15 }));
+  assert.equal(coldStartExhausted.strategy, 'NO_ELIGIBLE_QUERY');
+  assert.ok(coldStartExhausted.reasonCodes.includes('PORTFOLIO_BUDGET_EXHAUSTED'));
+
+  const remaining = selectHierarchicalUcb([cold], selectorContext({ portfolioUnitsUsed: 14, ...coverageDebt }));
+  assert.equal(remaining.strategy, 'UCB_PORTFOLIO');
+  assert.ok(remaining.queryId);
+});
+
+test('Q3: derived consecutive failures drive lifecycle backoff; provider failures are exempt', () => {
+  const now = new Date('2026-01-01T00:20:00.000Z');
+  const failed = (completedAt: string, failureKind: string) => ({ status: 'FAILED', completedAt, failureKind });
+  const state = deriveQueryFailureState([
+    failed('2026-01-01T00:10:00.000Z', 'INVALID_QUERY'),
+    failed('2026-01-01T00:05:00.000Z', 'INVALID_QUERY'),
+    { status: 'COMPLETED', completedAt: '2026-01-01T00:00:00.000Z', failureKind: null },
+  ], now);
+  assert.equal(state.consecutiveFailures, 2);
+  assert.equal(state.backoffUntil, '2026-01-01T00:25:00.000Z');
+  const blocked = isQuerySelectable({
+    record: { id: 1, query: 'q', collection: 'EXPERIMENTAL', status: 'ACTIVE', last_executed: null },
+    now: now.toISOString(),
+    cooldownMinutes: 0,
+    consecutiveFailures: state.consecutiveFailures,
+    backoffUntil: state.backoffUntil,
+  });
+  assert.ok(blocked.reasonCodes.includes('FAILURE_BACKOFF_ACTIVE'));
+
+  assert.deepEqual(deriveQueryFailureState([
+    failed('2026-01-01T00:10:00.000Z', 'PROVIDER_FAILURE'),
+    failed('2026-01-01T00:05:00.000Z', 'INVALID_QUERY'),
+  ], now), { consecutiveFailures: 0, backoffUntil: null });
+  assert.deepEqual(deriveQueryFailureState([
+    { status: 'COMPLETED', completedAt: '2026-01-01T00:10:00.000Z', failureKind: null },
+    failed('2026-01-01T00:05:00.000Z', 'INVALID_QUERY'),
+  ], now), { consecutiveFailures: 0, backoffUntil: null });
+  assert.deepEqual(deriveQueryFailureState([
+    failed('2026-01-01T00:10:00.000Z', 'INVALID_QUERY'),
+    failed('2026-01-01T00:05:00.000Z', 'INVALID_QUERY'),
+    failed('2026-01-01T00:00:00.000Z', 'INVALID_QUERY'),
+  ], now), { consecutiveFailures: 3, backoffUntil: '2026-01-01T00:25:00.000Z' });
+});
+
 test('Q3/Q4: lifecycle gates reject REJECTED, cooldown, same-tick and speculative candidates', () => {
   const base = {
     id: 1,
@@ -331,6 +385,18 @@ test('Q5: quality vector is result-level and attribution carries the full path',
   assert.equal(vector.confirmedNewCreatorsPer100Quota, 1.5);
   assert.equal(vector.qualityNewCreatorsPer100Quota, 1);
   assert.equal(vector.duplicateRatio, 0.4);
+  // Deferred results were never evaluated and must not dilute the duplicate
+  // share: 5 duplicates of 15 evaluated results, not of 20 raw results.
+  const deferred = buildQueryQualityVector({
+    rawResults: 20,
+    distinctResults: 10,
+    duplicateResults: 5,
+    newChannels: 7,
+    newConfirmedCreators: 3,
+    newQualityCreators: 2,
+    quotaUsed: 200,
+  });
+  assert.equal(deferred.duplicateRatio, 5 / 15);
   const attribution = buildAttribution({
     termSense: 'order flow',
     relation: 'ANCHOR_MODIFIER',
@@ -385,6 +451,69 @@ test('Q6: dashboard counts only accounted vectors and reports missing data hones
   assert.equal(dashboard.selection.stopReasonCoverage, 0.5);
   assert.equal(dashboard.portfolio.withinBudget, true);
   assert.deepEqual(dashboard.selection.stopReasons[0], { reason: 'MAX_PAGES_REACHED', count: 1 });
+});
+
+test('Q6: zero-quota runs are separate, stop coverage is completed-only, compatibility markers are not rejections', () => {
+  const zeroQuota = buildQueryQualityVector({
+    rawResults: 5, distinctResults: 5, newChannels: 2, newConfirmedCreators: 2,
+    newQualityCreators: 1, quotaUsed: 0,
+  });
+  const healthy = buildQueryQualityVector({
+    rawResults: 10, distinctResults: 10, newChannels: 2, newConfirmedCreators: 1,
+    newQualityCreators: 1, quotaUsed: 100,
+  });
+  const dashboard = buildQueryQualityDashboard({
+    generatedAt: '2026-01-01T00:00:00.000Z',
+    portfolio: { dailyQuotaUnits: 100, portfolioUnitsReserved: 15, portfolioUnitsUsed: 1 },
+    rows: [
+      { runId: 'zero', queryId: 1, query: 'free query', country: 'Germany', status: 'COMPLETED', selectionStrategy: 'COLD_START_GENERATION', selectionReason: 'selected', stopReason: 'MAX_PAGES_REACHED', quotaUsed: 0, qualityVector: zeroQuota },
+      { runId: 'healthy', queryId: 2, query: 'day trading', country: 'Germany', status: 'COMPLETED', selectionStrategy: 'UCB_EXPLOITATION', selectionReason: 'selected', stopReason: 'MAX_PAGES_REACHED', quotaUsed: 100, qualityVector: healthy, admission: { eligible: true, reasonCodes: [], tier: 'LICENSED_UNSEEN' } },
+      { runId: 'marker', queryId: 3, query: 'legacy', country: 'Germany', status: 'COMPLETED', selectionStrategy: 'UCB_EXPLOITATION', selectionReason: 'selected', quotaUsed: 100, qualityVector: null, admission: { eligible: false, reasonCodes: ['LEGACY_UNSCOPED_ADMISSION_COMPATIBILITY'] } },
+      { runId: 'rejected', queryId: 4, query: 'CAC 40', country: 'Germany', status: 'COMPLETED', selectionStrategy: 'UCB_EXPLOITATION', selectionReason: 'selected', stopReason: 'COUNTRY_REJECTED', quotaUsed: 100, qualityVector: null, admission: { eligible: false, reasonCodes: ['SPECULATIVE_EVIDENCE_ONLY', 'LEGACY_UNSCOPED_ADMISSION_COMPATIBILITY'] } },
+      // A pending row can carry a stale stop reason; coverage is over completed rows only.
+      { runId: 'pending', queryId: 5, query: 'pending', country: 'Germany', status: 'RUNNING', selectionStrategy: 'UCB_PORTFOLIO', selectionReason: 'selected', stopReason: 'MAX_PAGES_REACHED', quotaUsed: 0, qualityVector: null },
+    ],
+  });
+  assert.equal(dashboard.totals.accountedRuns, 2);
+  assert.equal(dashboard.totals.rewardEligibleRuns, 1);
+  assert.equal(dashboard.totals.zeroQuotaRuns, 1);
+  assert.equal(dashboard.totals.newConfirmedCreators, 1);
+  assert.equal(dashboard.totals.quotaUnits, 1);
+  assert.equal(dashboard.selection.stopReasons.find(item => item.reason === 'MAX_PAGES_REACHED')?.count, 2);
+  assert.equal(dashboard.selection.stopReasons.find(item => item.reason === 'COUNTRY_REJECTED')?.count, 1);
+  assert.equal(dashboard.selection.stopReasonCoverage, 3 / 4);
+  assert.deepEqual(dashboard.selection.admissionRejections, [{ reason: 'SPECULATIVE_EVIDENCE_ONLY', count: 1 }]);
+});
+
+test('Q8: frozen benchmark guard requires authority v3 and rejects v2 drift', () => {
+  assert.equal(AUTONOMOUS_QUERY_AUTHORITY_POLICY_VERSION, 'autonomous-query-authority-v3');
+  assert.doesNotThrow(() => verifyFrozenBenchmarkVersions());
+  assert.throws(
+    () => verifyFrozenBenchmarkVersions({ autonomousQueryAuthority: 'autonomous-query-authority-v2' }),
+    /BENCHMARK_PREREG_VERSION_DRIFT: .*autonomousQueryAuthority/,
+  );
+});
+
+test('Q5/Q6: production wiring uses accounting-window spend, derived failure state and run-level reward', () => {
+  const intelligence = readFileSync(join(__dirname, '..', 'queryIntelligence.ts'), 'utf8');
+  assert.match(intelligence, /getQueryQuotaSpendRows\(country\)/);
+  assert.match(intelligence, /getQueryFailureStates\(country\)/);
+  assert.match(intelligence, /getQueryRunReward\(attribution\.queryRunId\)/);
+  assert.match(intelligence, /consecutiveFailures: failure\?\.consecutiveFailures/);
+  // Share totals must be seeded from every query in the accounting window,
+  // before the eligible-only candidate projection.
+  const spendStart = intelligence.indexOf('Share accounting covers every query');
+  const eligibleStart = intelligence.indexOf('for (const query of eligible) {');
+  assert.ok(spendStart > 0);
+  assert.ok(eligibleStart > spendStart);
+
+  const dbCore = readFileSync(join(__dirname, '..', 'dbCore.ts'), 'utf8');
+  assert.match(dbCore, /selection_strategy IN \('UCB_PORTFOLIO','UCB1_EXPLORATION','COLD_START_GENERATION'\)/);
+  assert.match(dbCore, /SELECT query,country,generation_metadata FROM query_library/);
+  assert.match(dbCore, /\{history,now:new Date\(\)\.toISOString\(\)\}/);
+
+  const queueManager = readFileSync(join(__dirname, '..', 'queueManager.ts'), 'utf8');
+  assert.match(queueManager, /queryRunId, persist: false/);
 });
 
 test('Q6: portfolio over-budget is conspicuous, not hidden', () => {

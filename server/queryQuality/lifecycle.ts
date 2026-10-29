@@ -66,6 +66,33 @@ export function isQuerySelectable(input: SelectabilityInput): SelectabilityDecis
   return { selectable: reasons.length === 0, reasonCodes: [...new Set(reasons)] };
 }
 
+export interface QueryFailureStateRow {
+  status: string;
+  completedAt: string | null;
+  failureKind: string | null;
+}
+
+/**
+ * Derive the consecutive-failure streak from completed/failed run history
+ * (newest first). A successful run resets the streak; provider failures are
+ * infrastructure, not query-quality evidence, and break it without counting.
+ */
+export function deriveQueryFailureState(
+  rows: QueryFailureStateRow[],
+  now = new Date(),
+): { consecutiveFailures: number; backoffUntil: string | null } {
+  let consecutiveFailures = 0;
+  let backoffUntil: string | null = null;
+  for (const row of rows) {
+    if (row.status !== 'FAILED') break;
+    const decision = classifyQueryBackoff(row.failureKind || undefined, row.completedAt ? new Date(row.completedAt) : now);
+    if (decision.failures === 0) break;
+    consecutiveFailures += decision.failures;
+    if (!backoffUntil) backoffUntil = decision.backoffUntil;
+  }
+  return { consecutiveFailures, backoffUntil };
+}
+
 export function classifyQueryBackoff(failureKind: string | undefined, now = new Date()): { failures: 0 | 1 | 2 | 3; backoffUntil: string | null; reasonCodes: string[] } {
   if (!failureKind) return { failures: 0, backoffUntil: null, reasonCodes: [] };
   if (failureKind === 'PROVIDER_FAILURE' || failureKind === 'PROVIDER_CAPACITY') {

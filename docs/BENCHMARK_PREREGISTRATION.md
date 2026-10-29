@@ -3,6 +3,14 @@
 **Status: PREREGISTRATION ONLY — no benchmark has been executed under this specification.**
 **Do not modify this document after benchmark execution begins. Any change requires a new spec version.**
 
+**Pre-execution revision 2026-10-29 (before any benchmark execution):** the
+autonomous query authority constant advanced from `autonomous-query-authority-v2`
+to `autonomous-query-authority-v3` as part of the Q0–Q8 query-quality admission
+program. No benchmark run, observation or execution record existed under v2, so
+this is a pre-execution correction rather than a post-execution amendment. The
+spec version and every other frozen value are unchanged; `verifyFrozenBenchmarkVersions()`
+now requires v3 and continues to fail closed on any other drift.
+
 - Benchmark specification version: `benchmark-preregistration-v1`
 - Engine base commit (merged main after PR #492): `4b49e0c01ac53eebf0080fae29bd6aaabb803cfc`
   (`4b49e0c Merge pull request #492 from lastdayone87-del/feat/engine-completion`)
@@ -29,7 +37,7 @@
 | LLM Assist (P-E) | `llm-assist-v1` | `server/llmAssist.ts:25` |
 | Graph expansion policy (P3) | `graph-expansion-v1`, `GRAPH_MAX_DEPTH=2`, `GRAPH_MAX_FANOUT=10` | `server/graphExpansionPolicy.ts:12-14` |
 | Relationship canary | `relationship-canary-v1`, `MAX_SEEDS=10`, `MAX_DEPTH=2`, `MAX_FANOUT=10`, `MAX_DEPTH2_PARENTS=5`, `MAX_CHANNELS_PER_RUN=150`, `ESTIMATED_DOWNSTREAM_UNITS=305` | `server/relationshipCanary.ts:31-48` |
-| Autonomous query authority | `autonomous-query-authority-v2` | `server/autonomousQueryAuthority.ts:5` |
+| Autonomous query authority | `autonomous-query-authority-v3` | `server/autonomousQueryAuthority.ts:6` |
 | Candidate triage | `candidate-triage-v4-contextual-admission` | `server/candidateTriage.ts:6` |
 | DB migrations | 137 files, latest `137_domain_memory.sql` | `server/db/migrations/` |
 | Assignment/hash | sha256 hex slice `(0,8)` mod 10000; no separate salt field exists — assignment identity/version inputs = `policyVersion + experimentId + opportunityKey` (see §6) | `server/querySelectionExperiments.ts:137-139`, `server/retrievalExperiment.ts:114-117` |

@@ -80,7 +80,7 @@ export class VideoMetadataProvider implements EvidenceProvider {
     }
 
     let tradingFocusedCount = 0;
-    const tierASignals = new Set<string>();
+    const tierASignalVideos = new Map<string, Set<number>>();
     const matchedInstrumentsInVideos: string[] = [];
     const matchedPlatformsInVideos: string[] = [];
     const matchedConceptsInVideos: string[] = [];
@@ -93,7 +93,11 @@ export class VideoMetadataProvider implements EvidenceProvider {
       const isTrading = isTradingFocusedText(combo, knowledgeContext) || isExplicitCreatorTradingText(combo, knowledgeContext);
       if (!isTrading) continue;
       tradingFocusedCount++;
-      for (const signal of matchedTierATradingSignals(combo, knowledgeContext)) tierASignals.add(signal);
+      for (const signal of matchedTierATradingSignals(combo, knowledgeContext)) {
+        const videos = tierASignalVideos.get(signal) || new Set<number>();
+        videos.add(i);
+        tierASignalVideos.set(signal, videos);
+      }
 
       // C2: a video is trading-focused at most once, and specific evidence is
       // only attributed to videos whose text met the corrected predicate.
@@ -125,13 +129,24 @@ export class VideoMetadataProvider implements EvidenceProvider {
     }
 
     const consistencyRatio = tradingFocusedCount / titles.length;
-    const distinctContextualSignals = matchedInstrumentsInVideos.length + matchedPlatformsInVideos.length + matchedConceptsInVideos.length;
+    // A term can appear in more than one knowledge list (e.g. DeFi is both an
+    // instrument and an English concept); count the normalized union.
+    const normalizedSignalKey = (term: string) => term.normalize('NFKC').toLocaleLowerCase('und');
+    const distinctContextualSignals = new Set([
+      ...matchedInstrumentsInVideos,
+      ...matchedPlatformsInVideos,
+      ...matchedConceptsInVideos,
+    ].map(normalizedSignalKey)).size;
+    // Tier A corroboration must come from more than one video. One title that
+    // matches two categories (e.g. "Trading strategy") cannot establish
+    // multi-video consistency by itself.
+    const tierASignalsAcrossVideos = [...tierASignalVideos.values()].filter(videos => videos.size >= 2).length;
     // C2 aggregation: a repeated generic phrase is one signal, and a single
     // video cannot establish consistency. Require at least three videos and
-    // either two distinct Tier A signals or a high consistency ratio with
-    // distinct contextual signals.
+    // either two Tier A signals corroborated across videos or a high
+    // consistency ratio with distinct contextual signals.
     const consistencyEligible = titles.length >= 3
-      && (tierASignals.size >= 2 || (consistencyRatio >= 0.6 && distinctContextualSignals >= 2));
+      && (tierASignalsAcrossVideos >= 2 || (consistencyRatio >= 0.6 && distinctContextualSignals >= 2));
 
     // 1. Multi-Video Consistency Evidence
     if (consistencyEligible) {

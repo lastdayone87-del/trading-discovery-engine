@@ -94,13 +94,20 @@ function capReason(candidate: SelectorCandidate, context: SelectorContext): stri
   return null;
 }
 
+function portfolioBudgetRemaining(context: SelectorContext): number {
+  const reserved = Math.max(0, context.totalDailyQuotaUnits * context.portfolioRatio);
+  return Math.max(0, reserved - Math.max(0, context.portfolioUnitsUsed));
+}
+
 function portfolioNeeded(context: SelectorContext): boolean {
+  // The portfolio is a bounded, reserved floor. Coverage debt may not spend
+  // beyond that floor; when it is exhausted, explicit fail-closed replaces
+  // further exploration.
+  if (portfolioBudgetRemaining(context) <= 0) return false;
   const cells = context.coverageCells || [];
   const covered = new Set(context.coveredCells || []);
   const coverageDeficit = cells.some(cell => !covered.has(cell));
-  const reserved = Math.max(0, context.totalDailyQuotaUnits * context.portfolioRatio);
-  const belowFloor = context.portfolioUnitsUsed < reserved;
-  return coverageDeficit || belowFloor;
+  return coverageDeficit || context.portfolioUnitsUsed < Math.max(0, context.totalDailyQuotaUnits * context.portfolioRatio);
 }
 
 function deterministicTieBreak(a: CandidateScore, b: CandidateScore, context: SelectorContext): number {
@@ -189,10 +196,26 @@ export function selectHierarchicalUcb(candidates: SelectorCandidate[], context: 
     chosen = [...mature].sort((a, b) => deterministicTieBreak(a, b, context))[0];
     strategy = 'UCB_EXPLOITATION';
     reasonCodes = ['POSTERIOR_MEAN_PLUS_C_SD', 'MATURE_SAMPLE'];
-  } else {
+  } else if (portfolioBudgetRemaining(context) > 0) {
     chosen = [...scored].sort((a, b) => deterministicTieBreak(a, b, context))[0];
     strategy = 'UCB_PORTFOLIO';
     reasonCodes = ['COLD_START_PRIOR', 'MINIMUM_SAMPLE_NOT_MET'];
+  } else {
+    // No mature candidate and no reserved exploration budget left. Refuse to
+    // spend quota on an unproven arm rather than inventing an unbounded
+    // exploration branch; the caller may generate a new governed candidate.
+    return {
+      ...base,
+      strategy: 'NO_ELIGIBLE_QUERY',
+      reason: 'The bounded portfolio budget is exhausted and no candidate has reached the minimum sample.',
+      queryId: null,
+      query: null,
+      index: null,
+      posterior: null,
+      tier: null,
+      compositionFamily: null,
+      reasonCodes: ['PORTFOLIO_BUDGET_EXHAUSTED', 'FAIL_CLOSED'],
+    };
   }
 
   const cap = capReason(chosen.candidate, context);

@@ -40,14 +40,22 @@ function safeProviderFailureReasonCodes(err: any, timeout: boolean): string[] {
   return [primary, ...providerReasons.filter((value: string) => value !== primary)];
 }
 
-function deadlineRace<T>(promise: Promise<T>, deadlineAtMs: number | undefined): Promise<T> {
+function deadlineRace<T>(promise: Promise<T>, deadlineAtMs: number | undefined, onTimeout?: () => void): Promise<T> {
   if (deadlineAtMs == null || !Number.isFinite(deadlineAtMs)) return promise;
+  const timeoutError = () => Object.assign(new Error('Semantic attempt deadline exceeded.'), { errorClass: 'TIMEOUT', retryable: true });
   const remainingMs = deadlineAtMs - Date.now();
   if (remainingMs <= 0) {
-    return Promise.reject(Object.assign(new Error('Semantic attempt deadline exceeded.'), { errorClass: 'TIMEOUT', retryable: true }));
+    onTimeout?.();
+    return Promise.reject(timeoutError());
   }
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(Object.assign(new Error('Semantic attempt deadline exceeded.'), { errorClass: 'TIMEOUT', retryable: true })), remainingMs);
+    const timer = setTimeout(() => {
+      // The provider may continue running for the full provider deadline
+      // unless it receives the cancellation. Abort it before starting the
+      // fallback so a timed-out request cannot keep spending quota.
+      onTimeout?.();
+      reject(timeoutError());
+    }, remainingMs);
     timer.unref?.();
     promise.then(value => { clearTimeout(timer); resolve(value); }, error => { clearTimeout(timer); reject(error); });
   });
@@ -130,7 +138,12 @@ export async function executeSemanticChain(
       const attemptDeadline = options.attemptTimeoutMs != null
         ? Math.min(options.deadlineAtMs ?? Number.POSITIVE_INFINITY, Date.now() + options.attemptTimeoutMs)
         : options.deadlineAtMs;
-      const collected = await deadlineRace(provider.collectEvidence(input, knowledgeContext), attemptDeadline);
+      const attemptController = new AbortController();
+      const collected = await deadlineRace(
+        provider.collectEvidence(input, knowledgeContext, attemptController.signal),
+        attemptDeadline,
+        () => attemptController.abort(Object.assign(new Error('Semantic attempt deadline exceeded.'), { errorClass: 'TIMEOUT', retryable: true })),
+      );
       const abstention = collected.find(item => item.category === 'SEMANTIC_ABSTENTION');
       const semanticReasons = abstention?.provenance?.semantic?.reasonCodes || [];
       const unsupported = semanticReasons.some(code => /UNSUPPORTED_LANGUAGE|LANGUAGE.*UNSUPPORTED/.test(code));
@@ -225,6 +238,12 @@ export class EvidenceBasedTradingEngine {
           .map(name => name === 'groq_semantic' ? new GroqSemanticProvider() : new GeminiFreeSemanticProvider())]
       : [];
 
+    // A provider object in the chain is not proof of configuration: the
+    // default Gemini provider remains present without an API key.
+    const semanticAvailable = semanticChain.some(provider =>
+      (provider.availability?.(input) || { availability: 'AVAILABLE' as const }).availability === 'AVAILABLE');
+    const decisionConfig = this.decisionStrategy.policyConfig();
+
     const runProvider = async (provider: EvidenceProvider) => {
       const started = Date.now();
       const declared = provider.availability?.(input) || { availability: 'AVAILABLE' as const };
@@ -304,13 +323,15 @@ export class EvidenceBasedTradingEngine {
       evidence: preliminaryEvidence,
       collection: preliminaryCollection,
       lifecycleAction: preliminaryStages.lifecycleAction,
-      semanticAvailable: semanticChain.length > 0,
+      semanticAvailable,
       hasCreatorContext,
       staged: preliminaryStages,
+      minimumPositiveWeightTrading: decisionConfig.minimumPositiveWeightTrading,
+      minimumTradingScore: decisionConfig.minimumTradingScore,
     });
 
     let semanticResult: SemanticChainResult = { items: [], reports: [] };
-    const shouldRunSemantic = semanticChain.length > 0
+    const shouldRunSemantic = semanticAvailable
       && preliminaryRecognition.semanticPolicy !== 'SKIP'
       && preliminaryRecognition.semanticPolicy !== 'NONE';
     if (shouldRunSemantic) {
@@ -323,6 +344,22 @@ export class EvidenceBasedTradingEngine {
       semanticResult = await executeSemanticChain(semanticChain, input, knowledgeContext, {
         deadlineAtMs: Date.now() + Math.max(1, aggregateBudgetMs),
         attemptTimeoutMs: Math.max(1, attemptBudgetMs),
+      });
+    } else if (!semanticAvailable && semanticChain.length > 0) {
+      // Configuration absence is not a policy skip. Keep each provider
+      // visible with its declared state so operators can distinguish an
+      // unconfigured chain from a deterministic decision or provider failure.
+      semanticResult.reports = semanticChain.map(provider => {
+        const declared = provider.availability?.(input) || { availability: 'AVAILABLE' as const };
+        const notApplicable = declared.availability === 'NOT_APPLICABLE';
+        return {
+          provider: provider.name,
+          availability: notApplicable ? 'NOT_APPLICABLE' as const : 'UNAVAILABLE' as const,
+          evidenceCount: 0,
+          outcome: notApplicable ? 'NOT_APPLICABLE' as const : 'UNAVAILABLE_CONFIGURATION' as const,
+          reasonCodes: [notApplicable ? 'PROVIDER_INPUT_NOT_APPLICABLE' : 'PROVIDER_CONFIGURATION_UNAVAILABLE'],
+          reason: (declared as { reason?: string }).reason,
+        };
       });
     } else {
       semanticResult.reports = preliminaryRecognition.semanticSkippedReason
@@ -348,9 +385,11 @@ export class EvidenceBasedTradingEngine {
       evidence: allEvidence,
       collection,
       lifecycleAction: stages.lifecycleAction,
-      semanticAvailable: semanticChain.length > 0,
+      semanticAvailable,
       hasCreatorContext,
       staged: stages,
+      minimumPositiveWeightTrading: decisionConfig.minimumPositiveWeightTrading,
+      minimumTradingScore: decisionConfig.minimumTradingScore,
     });
     return this.decisionStrategy.evaluateDecision(allEvidence, knowledgeContext, country, collection, stages, composition, recognition);
   }

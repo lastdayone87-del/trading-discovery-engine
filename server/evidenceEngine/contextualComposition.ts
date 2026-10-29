@@ -1,4 +1,5 @@
 import type { EvidenceFieldRef, EvidenceFieldType, LayeredKnowledgeContext, RawChannelInput } from './types';
+import { creatorOwnedEvidenceCorpus } from './canonicalEvidencePlane';
 import { textMatchesTerm } from './utils/textMatching';
 
 /**
@@ -55,7 +56,10 @@ const TIER_A_PATTERNS: Array<[string, RegExp]> = [
   ['DAY_TRADING', /\b(day\s*trading|day\s*trade|intraday|scalp(?:ing|er)|swing\s*trading)\b/iu],
   ['FUTURES_FOREX_TRADING', /\b(futures?\s*trading|forex\s*trading|fx\s*trading|options?\s*trading|commodit(?:y|ies)\s*trading|prop\s*firm|funded\s*trader|funded\s*account)\b/iu],
   ['ORDER_FLOW', /\b(order\s*flow|volume\s*profile|market\s*structure|price\s*action|liquidity\s*sweep|fair\s*value\s*gap|order\s*block|smart\s*money\s*concepts?|break\s*of\s*structure|footprint\s*chart|delta\s*divergence)\b/iu],
-  ['EXECUTION', /\b(live\s*trading|trading\s*live|trade\s*review|trade\s*setup|risk\s*management|position\s*sizing|trading\s*journal|backtest(?:ing)?|trading\s*strategy|execution)\b/iu],
+  // Bare `execution`/`risk management` are workplace/legal terms too. They
+  // only count when the surface itself supplies financial context (for
+  // example "London session execution" or "trading risk management").
+  ['EXECUTION', /\b(live\s*trading|trading\s*live|trade\s*review|trade\s*setup|position\s*sizing|trading\s*journal|backtest(?:ing)?|trading\s*strategy|(?:session|trade|trading|market|order)\s+execution|execution\s+(?:strategy|desk|venue)|(?:trade|trading|position|portfolio|market)\s+risk\s+management)\b/iu],
   ['NATIVE_METHOD', /(analyse\s*technique|analisi\s*tecnica|an[aá]lisis\s*t[eé]cnico|technische\s*analyse|teknisk\s*analys|teknisk\s*analyse|b[oö]rsen?analyse|beursanalyse|aktiehandel|daghandel|trading\s*futures|futuros\s*trading|opciones\s*trading|strategia\s*(?:di\s*)?trading|plan\s*(?:de\s*)?trading|piano\s*(?:di\s*)?trading|gestione\s*della\s*posizione|gestion\s*de\s*la\s*position|positionsverwaltung|トレード|デイトレード|先物取引|テクニカル分析|板読み|オーダーフロー)/iu],
   // C5 multilingual education/execution vocabulary. These are the same
   // governed language-pack phrases used by the deterministic providers; they
@@ -132,7 +136,9 @@ const COMPOSITION_FIELDS: ReadonlySet<EvidenceFieldType> = new Set<EvidenceField
 ]);
 
 export function creatorOwnedDocuments(input: RawChannelInput): CompositionDocument[] {
-  return (input.evidence_corpus || [])
+  // Use the canonical creator-owned view so retrieval provenance
+  // (`search_match_context`) can never become a composition family.
+  return creatorOwnedEvidenceCorpus(input)
     .filter(document => COMPOSITION_FIELDS.has(document.field))
     .map(document => ({
       field: document.field,

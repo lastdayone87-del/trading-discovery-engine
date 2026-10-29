@@ -102,8 +102,16 @@ function asSource(metadata: Record<string, any>): QuerySource {
   if (metadata.countryNativeAllocation) return 'COUNTRY_VOCABULARY';
   if (metadata.scopePromoted === true) return 'COUNTRY_VOCABULARY';
   if (String(metadata.generationMode || '') === 'COLD_START') return 'COLD_START';
-  if (String(metadata.source || '') === 'PERSISTENT_RESEARCH') return 'PERSISTENT_RESEARCH';
-  if (String(metadata.source || '') === 'PR557') return 'PR557';
+  if (metadata.manual === true || metadata.manualQuery === true) return 'MANUAL';
+  // Atom provenance is also an explicit producer declaration. A record whose
+  // metadata names MANUAL or country-vocabulary atoms must not fall through to
+  // CURATED (which would suppress the learned-semantics requirement).
+  const atomOrigins = (Array.isArray(metadata.atoms) ? metadata.atoms : [])
+    .map((atom: Record<string, unknown>) => String(atom?.origin || atom?.provenance || '').toUpperCase());
+  if (atomOrigins.includes('MANUAL')) return 'MANUAL';
+  if (atomOrigins.some(origin => origin === 'COUNTRY_VOCABULARY' || origin === 'COUNTRY_NATIVE')) return 'COUNTRY_VOCABULARY';
+  const declared = String(metadata.querySource || metadata.source || '').toUpperCase();
+  if (declared in QUERY_SOURCE_REGISTRY && declared !== 'CURATED') return declared as QuerySource;
   return 'CURATED';
 }
 

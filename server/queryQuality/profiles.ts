@@ -111,15 +111,21 @@ export const COUNTRY_MARKET_PROFILES: Record<string, CountryMarketProfile> = Obj
 );
 
 export function getCountryMarketProfile(country: string): CountryMarketProfile {
+  // Unknown countries must fail closed. An English/Latn fallback would let a
+  // country outside the production registry pass language and market checks.
   return COUNTRY_MARKET_PROFILES[country] || {
     country,
-    languages: ['en'],
-    scripts: ['Latn'],
-    markets: ['UNKNOWN'],
+    languages: [],
+    scripts: [],
+    markets: [],
     instruments: [],
     primaryMarket: 'UNKNOWN',
     productionConfigured: false,
   };
+}
+
+export function isRegisteredCountry(country: string): boolean {
+  return Object.prototype.hasOwnProperty.call(COUNTRY_MARKET_PROFILES, country);
 }
 
 export function isProductionConfiguredCountry(country: string): boolean {

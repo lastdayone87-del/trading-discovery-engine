@@ -1,3 +1,4 @@
+import { rewardRate } from './accounting';
 import type { QueryQualityVector } from './types';
 
 /**
@@ -60,8 +61,14 @@ export interface QueryQualityDashboard {
     pendingRuns: number;
     failedRuns: number;
     accountedRuns: number;
-    /** Accounted runs whose vector is eligible for reward (not degraded/failed). */
+    /** Accounted runs whose vector is eligible for reward (not degraded/failed/zero-quota). */
     rewardEligibleRuns: number;
+    /**
+     * Accounted, non-degraded/non-failed runs that spent no quota. They are
+     * reported separately so free-provider confirmations cannot be read as
+     * quota yield.
+     */
+    zeroQuotaRuns: number;
     unaccountedCompletedRuns: number;
     newConfirmedCreators: number;
     newQualityCreators: number;
@@ -148,7 +155,13 @@ export function buildQueryQualityDashboard(input: {
   const accounted = rows.filter(row => row.accounted);
   // Provider failure is not zero yield. A degraded/failed run remains visible
   // as accounted but never enters reward totals or the zero-confirm share.
-  const rewardEligible = accounted.filter(row => !row.qualityVector!.providerDegraded && !row.qualityVector!.failedRun);
+  // Zero-quota runs are likewise ineligible: they cannot contribute creators
+  // to a per-100-quota rate they never paid for.
+  const rewardEligible = accounted.filter(row => rewardRate(row.qualityVector!).eligible);
+  const zeroQuotaRuns = accounted.filter(row => {
+    const vector = row.qualityVector!;
+    return !vector.providerDegraded && !vector.failedRun && vector.quotaUsed <= 0;
+  }).length;
 
   let newConfirmedCreators = 0;
   let newQualityCreators = 0;
@@ -176,16 +189,25 @@ export function buildQueryQualityDashboard(input: {
   const admissionTiers: Record<string, number> = {};
   const compositionFamilies: Record<string, number> = {};
   const stopReasons: Record<string, number> = {};
-  let rowsWithStopReason = 0;
+  let completedRowsWithStopReason = 0;
+  const nonRejectionMarkers = new Set(['LEGACY_UNSCOPED_ADMISSION_COMPATIBILITY']);
   for (const row of rows) {
     increment(strategies, row.selectionStrategy);
-    if (row.stopReason) {
-      increment(stopReasons, row.stopReason);
-      rowsWithStopReason++;
+    if (row.status === 'COMPLETED') {
+      if (row.stopReason) {
+        increment(stopReasons, row.stopReason);
+        completedRowsWithStopReason++;
+      }
+      // Rejections are only meaningful for an ineligible admission. Informational
+      // markers (e.g. legacy compatibility/backfill) are not rejections.
+      if (row.admission?.eligible === false) {
+        for (const reason of row.admission.reasonCodes || []) {
+          if (!nonRejectionMarkers.has(reason)) increment(admissionRejections, reason);
+        }
+      }
     }
     if (row.admission?.tier) increment(admissionTiers, row.admission.tier);
     if (row.admission?.compositionFamily) increment(compositionFamilies, row.admission.compositionFamily);
-    for (const reason of row.admission?.reasonCodes || []) increment(admissionRejections, reason);
   }
 
   const dailyQuotaUnits = Math.max(0, safe(input.portfolio.dailyQuotaUnits));
@@ -211,6 +233,7 @@ export function buildQueryQualityDashboard(input: {
       failedRuns: failed.length,
       accountedRuns: accounted.length,
       rewardEligibleRuns: rewardEligible.length,
+      zeroQuotaRuns,
       unaccountedCompletedRuns: completed.length - accounted.length,
       newConfirmedCreators,
       newQualityCreators,
@@ -226,7 +249,7 @@ export function buildQueryQualityDashboard(input: {
     selection: {
       strategies,
       stopReasons: topCounts(stopReasons),
-      stopReasonCoverage: completed.length > 0 ? rowsWithStopReason / completed.length : 0,
+      stopReasonCoverage: completed.length > 0 ? completedRowsWithStopReason / completed.length : 0,
       admissionRejections: topCounts(admissionRejections),
       admissionTiers,
       compositionFamilies,

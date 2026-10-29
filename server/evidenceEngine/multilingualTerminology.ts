@@ -141,7 +141,9 @@ export function isTradingFocusedText(text: string, context: LayeredKnowledgeCont
   const hasInstrument = instruments.some(term => textMatchesTerm(normalized, term));
   // Explicit financial-market context is a second dimension, not a trading
   // verdict by itself: it must accompany a method/education/execution term.
-  const hasFinancialMarketContext = /\b(stocks?|equities|shares?|crypto(?:currencies)?|bitcoin|ethereum|forex|futures?|options?|commodit(?:y|ies)|markets?|brokers?|exchanges?|portfolio|bourse|börse|boerse|bolsa|borsa|beurs|aktien|aandelen|aksjer|osakkeet|azioni|acciones|actions|titres)\b/iu.test(normalized)
+  // A bare "market" is not financial context ("technical analysis of the
+  // housing market"). Require an explicit financial-market phrase.
+  const hasFinancialMarketContext = /\b(stocks?|equities|shares?|crypto(?:currencies)?|bitcoin|ethereum|forex|futures?|options?|commodit(?:y|ies)|(?:stock|equity|financial|capital|forex|crypto|futures?|options?|bond|commodit(?:y|ies))\s+markets?|brokers?|exchanges?|portfolio|bourse|börse|boerse|bolsa|borsa|beurs|aktien|aandelen|aksjer|osakkeet|azioni|acciones|actions|titres)\b/iu.test(normalized)
     || /(株式|株|仮想通貨|為替|先物|بورصة|الأسهم|股票|交易)/u.test(normalized);
   if (isTierATradingText(normalized, context)) return true;
   const conceptual = hasExecution || hasEducation || hasMethodology;

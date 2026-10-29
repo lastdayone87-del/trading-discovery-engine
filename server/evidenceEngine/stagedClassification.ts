@@ -155,8 +155,13 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   const corroborated = compositionCorroborates && (explicitCreatorStatementConfirms || repeatedCreatorIndependent || (corroborating.length > 0 && (repeated || independentObservations || ((sources.size >= 2 || independentDimensions.size >= 2)&&independence.independentFamilyCount>=2))));
   const corroborationEvidence = repeatedCreatorIndependent ? [...corroborating, ...repeatedCreatorHypothesis] : corroborating;
   const weakVideoTerminologyOnly = positive.length > 0 && positive.every(isWeakVideoTerminologyEvidence);
+  const corroborationReason = explicitCreatorStatementConfirms
+    ? 'EXPLICIT_CREATOR_TRADING_STATEMENT_SATISFIED'
+    : repeatedCreatorIndependent
+      ? 'REPEATED_VIDEO_SOURCE_FAMILY_INDEPENDENCE_SATISFIED'
+      : 'SOURCE_FAMILY_INDEPENDENCE_SATISFIED';
   const corroboration = corroborated
-    ? result('CORROBORATION', 'PASS', [repeatedCreatorIndependent ? 'REPEATED_VIDEO_SOURCE_FAMILY_INDEPENDENCE_SATISFIED' : 'SOURCE_FAMILY_INDEPENDENCE_SATISFIED'], corroborationEvidence, { sources: sources.size, fields: observations.size, sourceFamilies:Math.max(independence.independentFamilyCount,repeatedIndependence.independentFamilyCount),sourceEntities:Math.max(independence.independentEntityCount,repeatedIndependence.independentEntityCount),dimensions: independentDimensions.size, repeatedVideos: repeated, repeatedCreatorIndependent })
+    ? result('CORROBORATION', 'PASS', [corroborationReason], corroborationEvidence, { sources: sources.size, fields: observations.size, sourceFamilies:Math.max(independence.independentFamilyCount,repeatedIndependence.independentFamilyCount),sourceEntities:Math.max(independence.independentEntityCount,repeatedIndependence.independentEntityCount),dimensions: independentDimensions.size, repeatedVideos: repeated, repeatedCreatorIndependent })
     : result('CORROBORATION', 'ABSTAIN', [weakVideoTerminologyOnly?'WEAK_VIDEO_TERMINOLOGY_ONLY':corroborating.length&&independence.independentFamilyCount<2?'SOURCE_FAMILY_INDEPENDENCE_REQUIRED':'CORROBORATION_REQUIRED'], corroborating, { sources: sources.size, fields: observations.size, sourceFamilies:independence.independentFamilyCount,sourceEntities:independence.independentEntityCount,dimensions: independentDimensions.size, repeatedVideos: repeated, repeatedCreatorIndependent });
   const compositionAlternativeDominant = composition?.focus === 'ALTERNATIVE_DOMINANT' && terminalNegativeSufficient && materiallyDominant;
   // Only retrieval-only composition blocks a terminal negative. A neutral or

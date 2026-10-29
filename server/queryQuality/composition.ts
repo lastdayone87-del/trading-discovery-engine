@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { isSearchableTradingTerm, type SearchabilityTermType } from '../terminologySearchability';
-import { getCountryMarketProfile } from './profiles';
+import { getCountryMarketProfile, isRegisteredCountry } from './profiles';
 import type {
   CountryMarketProfile,
   QueryAdmission,
@@ -208,6 +208,7 @@ export function evaluateQueryComposition(candidate: QueryCandidate, context: Com
   const normalized = normalizeCompositionTerm(candidate.query);
   const tokens = queryCompositionTokens(normalized);
 
+  if (!isRegisteredCountry(candidate.country)) reasons.push('UNSUPPORTED_COUNTRY');
   if (!normalized || tokens.length === 0) reasons.push('EMPTY_QUERY');
   if (tokens.length > 3) reasons.push('TOO_MANY_TOKENS');
   if (normalized.length > 40) reasons.push('TOO_LONG');
@@ -220,10 +221,13 @@ export function evaluateQueryComposition(candidate: QueryCandidate, context: Com
   // Market/language isolation: an atom may travel only inside its own
   // country/language profile unless it is explicitly global and script
   // compatible. No country-specific exceptions.
+  if (candidate.market && !profile.markets.includes(candidate.market)) reasons.push('MARKET_MISMATCH');
   for (const atom of candidate.atoms) {
     if (atom.sense.country !== candidate.country && atom.sense.country !== 'GLOBAL') reasons.push('CROSS_COUNTRY_ATOM');
     if (!profile.languages.includes(atom.sense.language)) reasons.push('LANGUAGE_MISMATCH');
     if (!profile.languages.includes(candidate.language)) reasons.push('LANGUAGE_MISMATCH');
+    if (atom.sense.market && !profile.markets.includes(atom.sense.market)) reasons.push('MARKET_MISMATCH');
+    if (atom.sense.market && candidate.market && atom.sense.market !== candidate.market) reasons.push('CROSS_MARKET_ATOM');
     const gate = gateAtom(atom);
     if (!gate.eligible) reasons.push(...gate.reasons.map(reason => `TERM_${reason.toUpperCase().replace(/-/g, '_')}`));
   }

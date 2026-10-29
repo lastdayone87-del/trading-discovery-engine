@@ -1435,7 +1435,7 @@ export async function processNextSearchJob(
         });
       }
       const quotaConsumed=providerCostUsd>0||allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE'?0:pageNumber*100;
-      const performance = await evaluateQueryPerformance(queryRecord, finalMetrics, { retrievalLane, searchOrdering, quotaConsumed, persist: false });
+      const performance = await evaluateQueryPerformance(queryRecord, finalMetrics, { retrievalLane, searchOrdering, quotaConsumed, queryRunId, persist: false });
       // Worker wall-time split (observability only, persisted in
       // performance_details): quota-wait vs retrieval vs per-channel
       // processing vs total worker time. Never affects scoring or behavior.

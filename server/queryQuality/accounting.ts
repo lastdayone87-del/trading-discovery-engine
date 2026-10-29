@@ -57,7 +57,9 @@ export function buildQueryQualityVector(input: RunAccountingInput): QueryQuality
     quotaUnits,
     confirmedNewCreatorsPer100Quota: quotaUnits > 0 ? newConfirmedCreators / quotaUnits : 0,
     qualityNewCreatorsPer100Quota: quotaUnits > 0 ? newQualityCreators / quotaUnits : 0,
-    duplicateRatio: ratio(duplicateResults, rawResults || distinctResults + duplicateResults),
+    // Deferred provider results stay in rawResults but were never evaluated;
+    // the duplicate share is over evaluated results only.
+    duplicateRatio: ratio(duplicateResults, distinctResults + duplicateResults),
     semanticOverlapRatio: ratio(safe(input.semanticOverlapResults), distinctResults),
     invalidQueryRate: input.invalidQuery ? 1 : 0,
     zeroResultRate: rawResults === 0 ? 1 : 0,

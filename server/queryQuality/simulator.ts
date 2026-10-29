@@ -279,7 +279,17 @@ function chooseArm(
   portfolio: boolean,
   c: number,
 ): SimArm {
-  const scored = arms.map(arm => ({ arm, posterior: computePosterior(armCounts(arm), prior, hierarchyFor(arm, aggregates), c) }));
+  const scored = arms.map(arm => ({
+    arm,
+    posterior: computePosterior(
+      armCounts(arm),
+      prior,
+      // `independent_ts` is the no-pooling comparator: every arm is estimated
+      // against the shared prior alone, not the family/country hierarchy.
+      selector === 'independent_ts' ? { total: zeroCounts() } : hierarchyFor(arm, aggregates),
+      c,
+    ),
+  }));
   if (portfolio) {
     return [...scored].sort((a, b) => {
       const aPriority = a.posterior.sd * (1 + 1 / (1 + a.posterior.mean));

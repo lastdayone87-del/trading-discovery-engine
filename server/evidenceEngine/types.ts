@@ -222,17 +222,17 @@ export interface VerificationDecision {
   classificationMethod?: 'DETERMINISTIC_EVIDENCE' | 'SEMANTIC_GEMINI' | 'SEMANTIC_GROQ' | 'SEMANTIC_GEMINI_FREE' | 'HEURISTIC_ONLY' | 'DEGRADED_HEURISTIC';
   providerCoverage?: number;
   evidenceCount?: number;
-  recognitionState?: string;
-  semanticPolicy?: string;
+  recognitionState?: 'DECISIVE_TRADING' | 'DECISIVE_NON_TRADING' | 'AMBIGUOUS_CONFLICT' | 'AMBIGUOUS_THIN' | 'QUERY_ONLY' | 'PROVIDER_DEGRADED' | 'INSUFFICIENT';
+  semanticPolicy?: 'SKIP' | 'BOUNDED_WAIT' | 'ENRICH' | 'NONE';
   semanticSkippedReason?: string | null;
   composition?: {
-    focus: string;
+    focus: 'TRADING_DOMINANT' | 'ALTERNATIVE_DOMINANT' | 'MIXED' | 'INSUFFICIENT_COVERAGE' | 'QUERY_ONLY';
     observedFamilies: number;
     tradingFamilies: number;
     alternativeFamilies: number;
     tradingCoverage: number;
     alternativeCoverage: number;
-    temporalCoverage: string;
+    temporalCoverage: 'KNOWN' | 'UNKNOWN';
     nonTitleTierAFamilies: number;
     reasons: string[];
   };
@@ -300,7 +300,7 @@ export interface StagedClassificationReport {
 
 export interface EvidenceProvider {
   name: EvidenceSourceType;
-  collectEvidence(input: RawChannelInput, knowledgeContext: LayeredKnowledgeContext): Promise<EvidenceItem[]>;
+  collectEvidence(input: RawChannelInput, knowledgeContext: LayeredKnowledgeContext, signal?: AbortSignal): Promise<EvidenceItem[]>;
   availability?(input: RawChannelInput): { availability: Exclude<ProviderAvailability, 'FAILED'>; reason?: string };
 }
 export type {EvidenceProviderV2,EvidenceDocumentObservation,EvidenceAssertionObservation,EvidenceCoverageSnapshot} from './documentTypes';

@@ -5,6 +5,7 @@ import type {
   StagedClassificationReport,
 } from './types';
 import type { ContextualCompositionReport } from './contextualComposition';
+import { compositionConfirmsTrading, evaluateDecisionScoreBoundary } from './decisionPolicy';
 
 /**
  * C6 deterministic recognition state.
@@ -60,6 +61,9 @@ export interface RecognitionAssessmentInput {
   /** True when at least one creator-owned (non-retrieval) field exists. */
   hasCreatorContext: boolean;
   staged?: StagedClassificationReport;
+  /** Engine policy threshold; defaults mirror the production scoring config. */
+  minimumPositiveWeightTrading?: number;
+  minimumTradingScore?: number;
 }
 
 const stage = (report: StagedClassificationReport | undefined, name: string) =>
@@ -87,9 +91,25 @@ export function assessRecognitionState(input: RecognitionAssessmentInput): Recog
   const candidate = stage(input.staged, 'CANDIDATE_DETECTION');
   const corroboration = stage(input.staged, 'CORROBORATION');
   const terminalNegative = collection.terminalNegativeSufficiency?.status === 'SUFFICIENT';
+  // Mirror the scoring engine's threshold selection exactly. The final policy
+  // still owns confirmation; this only prevents C6 from skipping semantic
+  // work for a candidate the policy would not confirm.
+  const hasMethodologyConcept = positive.some(item => item.category === 'METHODOLOGY_CONCEPT' || item.category === 'TERMINOLOGY');
+  const hasHighReliabilityMatch = positive.some(item => item.reliability === 'VERY_HIGH');
+  const hasPlatformOrPropFirm = positive.some(item => item.category === 'PLATFORM_BROKER_PROPFIRM' || item.category === 'EXTERNAL_RESOURCE');
+  const minimumPositiveWeight = (hasMethodologyConcept || hasHighReliabilityMatch || hasPlatformOrPropFirm)
+    ? 15
+    : (input.minimumPositiveWeightTrading ?? 20);
+  const weightedBoundary = evaluateDecisionScoreBoundary(
+    evidence,
+    minimumPositiveWeight,
+    input.minimumTradingScore ?? 65,
+  );
   const decisiveTrading = composition.focus === 'TRADING_DOMINANT'
     && input.lifecycleAction === 'CONFIRM'
     && substantivePositive
+    && weightedBoundary.satisfied
+    && compositionConfirmsTrading(composition)
     && composition.nonTitleTierAFamilies >= 1
     && !composition.explicitCreatorAlternative;
   const decisiveNonTrading = composition.focus === 'ALTERNATIVE_DOMINANT'

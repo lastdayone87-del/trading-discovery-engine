@@ -36,10 +36,25 @@ export function compositionConfirmsTrading(composition:ContextualCompositionRepo
 const clamp=(n:number)=>Math.max(0,Math.min(100,n));
 export function calibrateDecisionScore(raw:number):number{const n=clamp(raw);if(n<25)return Math.round(n*.8);if(n<50)return Math.round(20+(n-25)*.9);if(n<65)return Math.round(43+(n-50)*.8);if(n<80)return Math.round(55+(n-65)*1.4);return Math.round(Math.min(96,76+(n-80)));}
 
-function isWeakVideoTerminologyEvidence(item:EvidenceItem):boolean{
+export function isWeakVideoTerminologyEvidence(item:EvidenceItem):boolean{
   if(item.polarity!=='POSITIVE'||item.category!=='TERMINOLOGY') return false;
   const fields=item.provenance?.fields||[];
   return fields.length>0&&fields.every(field=>field.field==='video_title');
+}
+
+/**
+ * The exact substantive-weight/score boundary used by the terminal policy.
+ * Shared with C6 recognition so a state cannot be labelled decisive unless the
+ * final decision policy would also accept confirmation.
+ */
+export function evaluateDecisionScoreBoundary(evidence:EvidenceItem[],minimumPositiveWeight:number,minimumTradingScore:number):{positiveWeight:number;negativeWeight:number;substantivePositiveWeight:number;raw:number;satisfied:boolean}{
+  const positive=evidence.filter(item=>item.polarity==='POSITIVE'&&item.rawMatches.length);
+  const negative=evidence.filter(item=>item.polarity==='NEGATIVE');
+  const positiveWeight=positive.reduce((sum,item)=>sum+Math.abs(item.finalWeight),0);
+  const negativeWeight=negative.reduce((sum,item)=>sum+Math.abs(item.finalWeight),0);
+  const substantivePositiveWeight=positive.filter(item=>!isWeakVideoTerminologyEvidence(item)).reduce((sum,item)=>sum+Math.abs(item.finalWeight),0);
+  const raw=clamp(50+positiveWeight-negativeWeight);
+  return {positiveWeight,negativeWeight,substantivePositiveWeight,raw,satisfied:substantivePositiveWeight>=minimumPositiveWeight&&raw>=minimumTradingScore};
 }
 
 export function hasCreatorLevelUnrelatedAttribution(items:EvidenceItem[]):boolean{
@@ -118,8 +133,9 @@ function qualifiesDominantAttributedContradiction(evidence:EvidenceItem[],collec
 
 export function evaluateUnifiedDecisionPolicy(input:UnifiedDecisionPolicyInput):UnifiedDecisionPolicyResult{
   const positive=input.evidence.filter(item=>item.polarity==='POSITIVE'&&item.rawMatches.length),negative=input.evidence.filter(item=>item.polarity==='NEGATIVE');
-  const positiveWeight=positive.reduce((sum,item)=>sum+Math.abs(item.finalWeight),0),substantivePositiveWeight=positive.filter(item=>!isWeakVideoTerminologyEvidence(item)).reduce((sum,item)=>sum+Math.abs(item.finalWeight),0),negativeWeight=negative.reduce((sum,item)=>sum+Math.abs(item.finalWeight),0);
-  const raw=clamp(50+positiveWeight-negativeWeight),tradingProbability=calibrateDecisionScore(raw),nonTradingProbability=calibrateDecisionScore(100-raw);
+  const boundary=evaluateDecisionScoreBoundary(input.evidence,input.minimumPositiveWeight,input.minimumTradingScore);
+  const positiveWeight=boundary.positiveWeight,substantivePositiveWeight=boundary.substantivePositiveWeight,negativeWeight=boundary.negativeWeight;
+  const raw=boundary.raw,tradingProbability=calibrateDecisionScore(raw),nonTradingProbability=calibrateDecisionScore(100-raw);
   const substantiveProviders=input.collection.providers.filter(provider=>provider.outcome==='EXECUTED_WITH_EVIDENCE').length;
   const documentFamilies=new Set(positive.flatMap(item=>item.provenance?.fields||[]).map(field=>field.sourceFamilyId||`${field.field}:${field.sourceId||field.index||''}`)).size;
   const coverageConfidence=input.collection.sufficiency==='MISSING'?0:input.collection.sufficiency==='INSUFFICIENT'?30:Math.min(100,55+Math.min(20,substantiveProviders*5)+Math.min(25,documentFamilies*5));
@@ -127,7 +143,7 @@ export function evaluateUnifiedDecisionPolicy(input:UnifiedDecisionPolicyInput):
   const independentCreatorField=hasIndependentCreatorOwnedPositiveField(positive);
   const compositionOk=input.composition?compositionConfirmsTrading(input.composition):true;
   const recognitionAllowsConfirmation=!input.recognition||input.recognition.state==='DECISIVE_TRADING';
-  const positiveBoundary=substantivePositiveWeight>=input.minimumPositiveWeight&&raw>=input.minimumTradingScore;
+  const positiveBoundary=boundary.satisfied;
   const semanticUnrelatedTerminal=qualifiesSemanticUnrelatedTerminalReject(input.evidence,input.collection);
   const dominantAttributedContradiction=qualifiesDominantAttributedContradiction(input.evidence,input.collection);
   if(input.lifecycleAction==='CONFIRM'&&positiveBoundary&&independentCreatorField&&compositionOk&&recognitionAllowsConfirmation){status='TRADING_CONFIRMED';reasons.push('CALIBRATED_SUPPORT_AND_INDEPENDENCE_SATISFIED');}

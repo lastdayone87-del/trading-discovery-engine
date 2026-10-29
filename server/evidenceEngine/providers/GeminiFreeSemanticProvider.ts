@@ -221,10 +221,13 @@ export function defaultClient(
   const deadlinesEnabled = geminiFreeDeadlinesEnabled();
   const persistedCooldownExpiryMs = deps?.persistedCooldownExpiryMs ?? defaultPersistedCooldownExpiryMs;
   return {
-    classify: async (prompt, model, observability) => {
+    classify: async (prompt, model, observability, signal) => {
       const response = await runGeminiFreeRouteFailover(routes, async route => {
         const started = Date.now();
         const controller = new AbortController();
+        const abortFromCaller = () => controller.abort(signal?.reason);
+        if (signal?.aborted) controller.abort(signal.reason);
+        else signal?.addEventListener('abort', abortFromCaller, { once: true });
         const timer = deadlinesEnabled ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
         const base = {
           id: randomUUID(), provider: 'gemini-free', operation: 'multilingual-semantic-classification',
@@ -287,6 +290,7 @@ export function defaultClient(
           throw typed;
         } finally {
           if (timer) clearTimeout(timer);
+          signal?.removeEventListener('abort', abortFromCaller);
         }
       });
       return response;
@@ -294,14 +298,14 @@ export function defaultClient(
   };
 }
 
-async function classifyCandidateWith404Fallback(client: SemanticModelClient, candidatePrompt: string, candidateModel: string, fallbackModel: string, observability?: SemanticObservabilityContext) {
+async function classifyCandidateWith404Fallback(client: SemanticModelClient, candidatePrompt: string, candidateModel: string, fallbackModel: string, observability?: SemanticObservabilityContext, signal?: AbortSignal) {
   try {
-    return { value: await client.classify(candidatePrompt, candidateModel, observability), model: candidateModel, fallbackUsed: false };
+    return { value: await client.classify(candidatePrompt, candidateModel, observability, signal), model: candidateModel, fallbackUsed: false };
   } catch (error) {
     const isModel404 = error instanceof ProviderCallError && error.errorClass === 'PERMANENT_INPUT' && error.status === 404;
     if (!isModel404 || candidateModel === fallbackModel) throw error;
     console.warn('[GeminiFree Semantic] Candidate model returned 404; retrying once with configured adjudicator model.', { candidateModel, fallbackModel });
-    return { value: await client.classify(candidatePrompt, fallbackModel, observability), model: fallbackModel, fallbackUsed: true };
+    return { value: await client.classify(candidatePrompt, fallbackModel, observability, signal), model: fallbackModel, fallbackUsed: true };
   }
 }
 
@@ -317,14 +321,14 @@ export class GeminiFreeSemanticProvider implements EvidenceProvider {
     return { availability: 'AVAILABLE' as const };
   }
 
-  async collectEvidence(input: RawChannelInput, _knowledge: LayeredKnowledgeContext): Promise<EvidenceItem[]> {
+  async collectEvidence(input: RawChannelInput, _knowledge: LayeredKnowledgeContext, signal?: AbortSignal): Promise<EvidenceItem[]> {
     const client = this.client();
     if (!client) return [];
     const candidateModel = process.env.GEMINI_FREE_CANDIDATE_MODEL || DEFAULT_GEMINI_FREE_CANDIDATE_MODEL;
     const adjudicatorModel = process.env.GEMINI_FREE_ADJUDICATOR_MODEL || DEFAULT_GEMINI_FREE_ADJUDICATOR_MODEL;
     const observability = { jobId: input.job_id, runId: input.run_id };
     const candidatePrompt = buildSemanticPrompt(input, 'CANDIDATE');
-    const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel, observability);
+    const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel, observability, signal);
     let result = parseSemanticResult(candidate.value);
     let model = candidate.model;
     const fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
@@ -335,7 +339,7 @@ export class GeminiFreeSemanticProvider implements EvidenceProvider {
     // gemini-2.5-flash-lite, and skipping then would silently disable the
     // flag. Decisive results still cost exactly one call (first conditions).
     if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && process.env.GEMINI_FREE_ADJUDICATION_ENABLED === 'true') {
-      result = parseSemanticResult(await client.classify(buildSemanticPrompt(input, 'ADJUDICATION'), adjudicatorModel, observability)); model = adjudicatorModel;
+      result = parseSemanticResult(await client.classify(buildSemanticPrompt(input, 'ADJUDICATION'), adjudicatorModel, observability, signal)); model = adjudicatorModel;
     }
     const calibrated = calibrateSemanticConfidence(result.confidence);
     const abstained = !result.supportedLanguage || result.label === 'AMBIGUOUS' || calibrated < 50 || result.citations.length === 0;
