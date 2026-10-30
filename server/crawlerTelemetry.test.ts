@@ -83,6 +83,43 @@ test('safe telemetry rejects malformed mode and clamps malformed counters', () =
   assert.equal(telemetry?.redirectsFollowed, 2);
   assert.equal(telemetry?.clicksFailed, 0);
   assert.equal(telemetry?.budgetExhausted, true);
+  const capped = safeCrawlerTelemetry({
+    mode: 'RENDERED',
+    pagesInspected: 1,
+    controlsEnumeratedTotal: 5_000_000,
+    popupTargets: Number.MAX_SAFE_INTEGER,
+    frameCount: 1_000_001,
+    coverageReason: 'BOUNDED',
+  });
+  assert.equal(capped?.controlsEnumeratedTotal, 999999, 'P0.2 counters use the same hard cap as other taxonomy counters');
+  assert.equal(capped?.popupTargets, 999999);
+  assert.equal(capped?.frameCount, 999999);
+});
+
+test('rendered telemetry strips invalid spread-carried coverage values', () => {
+  const dirty = renderedCrawlerTelemetry({
+    inspectedPages: 1,
+    clicks: 0,
+    complete: true,
+    telemetry: {
+      navigationPolicyExcluded: { 'not-a-reason': 3 } as never,
+      coverageReason: 'PARTIAL' as never,
+    },
+  });
+  assert.equal(dirty.navigationPolicyExcluded, undefined, 'an invalid exclusion map must not survive the spread');
+  assert.equal(dirty.coverageReason, undefined, 'an invalid coverage reason must not survive the spread');
+
+  const clean = renderedCrawlerTelemetry({
+    inspectedPages: 1,
+    clicks: 0,
+    complete: true,
+    telemetry: {
+      navigationPolicyExcluded: { 'admission-rejected': 2, 'not-a-reason': 9 } as never,
+      coverageReason: 'BOUNDED',
+    },
+  });
+  assert.deepEqual(clean.navigationPolicyExcluded, { 'admission-rejected': 2 });
+  assert.equal(clean.coverageReason, 'BOUNDED');
 });
 
 test('worker instance id is stable per process and identifies host and pid', () => {
@@ -165,6 +202,12 @@ test('coverage reason distinguishes complete, bounded, policy, context, and unkn
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, scrollCapReachedStillGrowing: true }), 'BOUNDED');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, structuralHintRejected: 2 }), 'BOUNDED');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, iconLabelRecovered: 1 }), 'BOUNDED');
+  assert.equal(
+    resolveRenderedCoverageReason({ pagesInspected: 1, unresolvedFailedRequests: 1 }),
+    'BOUNDED',
+    'a terminally failed child request can hide a destination, so it is not COMPLETE',
+  );
+  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, unresolvedFailedRequests: 0 }), 'COMPLETE');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, frameCount: 1 }), 'CONTEXT_UNREACHABLE');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, shadowRootCount: 1 }), 'CONTEXT_UNREACHABLE');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, popupTargets: 1 }), 'CONTEXT_UNREACHABLE');

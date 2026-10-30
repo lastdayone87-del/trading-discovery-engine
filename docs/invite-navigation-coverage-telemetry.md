@@ -31,11 +31,11 @@ none contains a URL, selector, element text, or payload.
 | --- | --- |
 | `controlsEnumeratedTotal` | Selector-matched controls before the community-hint filter. |
 | `controlsHintRejected` | Controls excluded by the community-hint filter (`total - matched`). |
-| `controlsStructuralNavigation` | Menu/nav/hamburger/`aria-haspopup`/`aria-expanded`/`role=menuitem` controls. |
+| `controlsStructuralNavigation` | Menu/nav/hamburger/`aria-haspopup`/`aria-expanded`/`role=menuitem` controls, including controls inside `<nav>`/`role=navigation|menu|menubar` containers. Classification uses the control's own label/naming text, not its resolved href. |
 | `controlsStructuralHintRejected` | Structural controls the hint filter would hide today. |
 | `controlsIconLabelRecovered` | Controls whose useful label is only `title`, `aria-labelledby`, child `alt`, or `data-label`. |
-| `popupTargets` | Popup/dialog controls that require capture rather than navigation: `aria-haspopup="dialog|menu"` and href-less `target="_blank"` controls. A `_blank` anchor with a real href is reachable by navigation and is not counted. Presence only; no popup capture. |
-| `frameCount` | `iframe`/`frame`/`object`/`embed` elements observed on processed pages. |
+| `popupTargets` | Popup/dialog controls that remain unexamined by the click loop and require capture rather than navigation: any non-false `aria-haspopup` value and `target="_blank"` controls without an HTTP(S) href. A `_blank` anchor with a followable HTTP(S) href is reachable by navigation and is not counted; a popup the click loop successfully examined is subtracted. Presence only; no popup capture. |
+| `frameCount` | `iframe`/`frame`/`object`/`embed` elements observed on processed pages (bounded live-collection scan). |
 | `shadowRootCount` | Open shadow roots observed on processed pages. Presence only; no traversal. |
 | `baseHrefPresent` | A document `<base href>` was observed. |
 | `scrollCapReachedStillGrowing` | The last permitted scroll iteration still found a growing document. |
@@ -58,9 +58,12 @@ Existing fields keep their semantics:
 
 1. `UNKNOWN` when no page was processed.
 2. `BOUNDED` when a named ceiling, interaction gap, scroll-cap-still-growing,
-   structural hint rejection, or icon-label recovery was observed.
-3. `CONTEXT_UNREACHABLE` when frames, open shadow roots, or popup targets were
-   observed.
+   structural hint rejection, icon-label recovery, or unresolved terminal
+   request failure was observed. A failed child request can hide a destination,
+   so it is never reported as `COMPLETE`.
+3. `CONTEXT_UNREACHABLE` when frames, open shadow roots, or unexamined popup
+   targets were observed. Popups the click loop successfully examined are not
+   context gaps.
 4. `POLICY_EXCLUDED` when `invalid-protocol`, `admission-rejected`,
    `cross-origin-disallowed`, or `destination-budget` exclusions occurred.
 5. `COMPLETE` otherwise.
@@ -83,8 +86,15 @@ The reason is diagnostic in P0.2. It does not change `complete`, `retryable`,
   references, first child `img[alt]`, and `data-label`. It does not read page
   text or hidden content.
 - `collectRenderedPageContext` uses a bounded `TreeWalker` (2,000 elements,
-  100 shadow roots) and a bounded frame count (1,000). It never traverses
-  frames or shadow roots.
+  100 shadow roots) and a bounded frame scan over live `getElementsByTagName`
+  collections (1,000). It never traverses frames or shadow roots. Context
+  counters are refreshed after scrolling and after same-document clicks so
+  interaction-revealed frames/shadows are counted, and aggregated on the page
+  error path so an enumerated page is never published as zero.
+- Per-page P0.2 counters come from one coherent enumeration snapshot (largest
+  total; first wins ties), so the published denominator, hint-rejected, and
+  structural counts cannot contradict each other. A successfully clicked popup
+  is excluded from the unexamined-context count.
 - The persistence boundary (`safeCrawlerTelemetry`) re-sanitizes every field:
   closed taxonomies, positive integers, fixed caps, rendered-only placement.
 - No migration is required; the fields live in the existing
@@ -126,8 +136,10 @@ ORDER BY 2 DESC;
 COMMIT;
 ```
 
-`(absent)` rows predate P0.2 or are static rows; it is not a clean-coverage
-claim.
+`(absent)` rows are rendered rows that predate P0.2 or lack a stored
+`coverageReason` (for example, malformed direct telemetry). Static rows are
+excluded by the `mode = RENDERED` filter, so they cannot appear as `(absent)`.
+It is not a clean-coverage claim.
 
 ## Limits
 

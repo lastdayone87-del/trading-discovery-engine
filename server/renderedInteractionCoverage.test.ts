@@ -461,6 +461,19 @@ test('rendered control coverage counts overflow and uses stable markers across D
   );
 });
 
+test('P0.2 coverage counters stay coherent, bounded, and preserved on error paths', () => {
+  const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
+  assert.match(source, /if \(!pageSnapshotRecorded \|\| enumeration\.total > pageControlsEnumeratedTotal\) \{[\s\S]*?pageHintRejected = enumeration\.hintRejected/, 'the denominator and hint-rejected counts come from one enumeration snapshot');
+  assert.match(source, /aggregatePageCountersOnError\?\.\(\)/, 'the handler catch preserves counters from an already-enumerated page');
+  assert.match(source, /if \(pageCountersAggregated\) return;/, 'the error and success aggregations cannot double-count a page');
+  assert.match(source, /await recordPageContext\(\);\s*\/\/ Page-end aggregation/, 'context counters refresh after the click loop');
+  assert.match(source, /Math\.max\(0, pagePopupTargets - examinedPopups\)/, 'popups examined by the click loop are not reported as unexamined context');
+  assert.match(source, /document\.getElementsByTagName\(frameTags\[tagIndex\]\)/, 'frame counting uses live collections instead of materializing every match');
+  assert.doesNotMatch(source, /querySelectorAll\('iframe,frame,object,embed'\)/, 'the unbounded materializing frame query is gone');
+  assert.match(source, /const labelText = /, 'structural classification uses the control own label text');
+  assert.doesNotMatch(source, /resources\|support\|explore\|more/, 'generic content words no longer classify a control as structural navigation');
+});
+
 test('shared rendered evidence stays fail-closed: gapped/timed-out lenders never enter inventory', () => {
   const source = readFileSync(fileURLToPath(new URL('./inspector.ts', import.meta.url)), 'utf8');
   assert.match(

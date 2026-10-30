@@ -130,6 +130,7 @@ export interface RenderedCoverageInput {
   scrollCapReachedStillGrowing?: boolean;
   structuralHintRejected?: number;
   iconLabelRecovered?: number;
+  unresolvedFailedRequests?: number;
   frameCount?: number;
   shadowRootCount?: number;
   popupTargets?: number;
@@ -149,7 +150,8 @@ export function resolveRenderedCoverageReason(input: RenderedCoverageInput): Ren
     || input.interactionGap === true
     || input.scrollCapReachedStillGrowing === true
     || count(input.structuralHintRejected) > 0
-    || count(input.iconLabelRecovered) > 0) {
+    || count(input.iconLabelRecovered) > 0
+    || count(input.unresolvedFailedRequests) > 0) {
     return 'BOUNDED';
   }
   if (count(input.frameCount) > 0 || count(input.shadowRootCount) > 0 || count(input.popupTargets) > 0) {
@@ -548,8 +550,17 @@ export function renderedCrawlerTelemetry(input: {
     ?? (input.timedOut ? 'total-timeout' as const : undefined);
   // A spread-carried ceiling/budget flag could only ever be stale (inner
   // telemetry never owns the ceiling decision), so both are stripped before
-  // the derived values below are set.
-  const { ceiling: _staleCeiling, budgetExhausted: _staleExhausted, ...restTelemetry } = (input.telemetry || {}) as Partial<CrawlerTelemetry>;
+  // the derived values below are set. Coverage fields are stripped as well:
+  // adding them back only after a taxonomy check must never leave an invalid
+  // spread-carried value in the returned object (direct readers do not go
+  // through the persistence sanitizer).
+  const {
+    ceiling: _staleCeiling,
+    budgetExhausted: _staleExhausted,
+    navigationPolicyExcluded: staleNavigationPolicyExcluded,
+    coverageReason: staleCoverageReason,
+    ...restTelemetry
+  } = (input.telemetry || {}) as Partial<CrawlerTelemetry>;
   void _staleCeiling;
   void _staleExhausted;
   return {
@@ -565,10 +576,10 @@ export function renderedCrawlerTelemetry(input: {
     mode: 'RENDERED',
     ...(Object.keys(sanitizeDropReasons(input.dropReasons)).length ? { dropReasons: sanitizeDropReasons(input.dropReasons) } : {}),
     ...(sanitizeScrollsUsed(input.scrollsUsed) > 0 ? { scrollsUsed: sanitizeScrollsUsed(input.scrollsUsed) } : {}),
-    ...(Object.keys(sanitizeNavigationPolicyExcluded(restTelemetry.navigationPolicyExcluded)).length
-      ? { navigationPolicyExcluded: sanitizeNavigationPolicyExcluded(restTelemetry.navigationPolicyExcluded) }
+    ...(Object.keys(sanitizeNavigationPolicyExcluded(staleNavigationPolicyExcluded)).length
+      ? { navigationPolicyExcluded: sanitizeNavigationPolicyExcluded(staleNavigationPolicyExcluded) }
       : {}),
-    ...(isRenderedCoverageReason(restTelemetry.coverageReason) ? { coverageReason: restTelemetry.coverageReason } : {}),
+    ...(isRenderedCoverageReason(staleCoverageReason) ? { coverageReason: staleCoverageReason } : {}),
     ...(sanitizeExperimentAttribution(input.experimentAttribution) ? { experimentAttribution: sanitizeExperimentAttribution(input.experimentAttribution)! } : {}),
   };
 }
@@ -675,7 +686,7 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
   if (!input || typeof input !== 'object') return undefined;
   const candidate = input as Partial<CrawlerTelemetry>;
   if (candidate.mode !== 'STATIC' && candidate.mode !== 'RENDERED') return undefined;
-  const number = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+  const number = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? Math.min(999999, Math.max(0, Math.floor(value))) : 0;
   // Bounded sanitized string: collapsed whitespace, capped length. Non-string
   // input yields undefined so malformed persisted rows cannot smuggle text.
   const text = (value: unknown, max: number): string | undefined => {

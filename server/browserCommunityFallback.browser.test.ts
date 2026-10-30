@@ -252,6 +252,39 @@ test('real DOM: enumeration separates hint-rejected, structural, icon-label, and
   });
 });
 
+test('real DOM: navigation ancestors and generic labels classify structural controls without URL noise', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <nav>
+      <a href="/products">Products</a>
+      <a href="/support">Support</a>
+    </nav>
+    <a href="/footer-support">Support</a>
+    <a href="/more">More</a>
+    <button type="button" aria-label="Open menu" aria-haspopup="true">Menu</button>
+    <a href="/account" aria-expanded="false">Account</a>
+    <button type="button" aria-expanded="false">Filters</button>
+    <a href="javascript:void(0)" target="_blank">Chat</a>
+    <a href="/community" target="_blank">Community</a>
+    <button type="button" aria-label="Join community" aria-haspopup="dialog">Join community</button>
+  </body></html>`;
+  await withControlPage(html, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(enumeration.total, 10);
+    assert.equal(enumeration.controls.length, 3, 'only the hint-matched controls remain evidence-bearing');
+    assert.equal(
+      enumeration.structuralNavigation,
+      5,
+      'the two nav links, the menu trigger, the disclosure button, and the dialog trigger are structural; footer Support/More and a href-bearing aria-expanded link are not',
+    );
+    assert.equal(enumeration.structuralHintRejected, 4, 'nav links and disclosure triggers hidden by the hint filter are measured');
+    assert.equal(
+      enumeration.popupTargets,
+      3,
+      'aria-haspopup=true/dialog and a non-HTTP(S) _blank target are popups; a navigable _blank anchor is not',
+    );
+  });
+});
+
 test('real DOM: an all-hint-matched control set has no hidden structural or popup counts', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
   await withControlPage(controlFixtureHtml(8, null), async (page) => {
     const enumeration = await enumeratePageControls(page);
