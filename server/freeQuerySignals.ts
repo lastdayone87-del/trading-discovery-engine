@@ -1,5 +1,5 @@
 import { getDb } from './db';
-import { canonicalCountry } from './countryInference';
+import { canonicalCountry, countryIdentityTerms } from './countryInference';
 import { countrySearchLanguageCandidates } from './countrySearchHints';
 
 /**
@@ -126,7 +126,23 @@ export function parseWikipediaSearchSignals(
  * Parse a Wikidata `wbsearchentities` response. Labels and aliases are
  * accepted only when literally present; descriptions are metadata, never a
  * query surface. A translated/English description cannot create a local term.
+ *
+ * `wbsearchentities` is a generic label/alias prefix search, so the same
+ * `Börse`/`stock exchange` query returns entities from every market. An entity
+ * is kept only when its label, aliases, or description mentions the requesting
+ * country's name/aliases, one of its exchanges, or a known city. This is a
+ * fail-closed identity filter: generic results are never stored under a
+ * country they do not identify.
  */
+function textMentionsCountryIdentity(text: string, terms: string[]): boolean {
+  if (!text) return false;
+  const normalized = text.normalize('NFKC').toLocaleLowerCase('en');
+  return terms.some(term => {
+    const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(^|[^\\p{L}\\p{N}])${escaped}(?=$|[^\\p{L}\\p{N}])`, 'u').test(normalized);
+  });
+}
+
 export function parseWikidataSearchSignals(
   payload: unknown,
   args: { country: string; language: string; limit?: number },
@@ -136,20 +152,31 @@ export function parseWikidataSearchSignals(
   const country = canonicalCountry(args.country);
   const language = String(args.language || 'en').split('-')[0].toLowerCase();
   const limit = Math.max(1, Math.min(50, Math.trunc(args.limit || 10)));
+  const identityTerms = countryIdentityTerms(country);
   const out: FreeQuerySignal[] = [];
   for (const row of rows.slice(0, limit)) {
     if (!row || typeof row !== 'object') continue;
     const id = (row as { id?: unknown }).id;
     const label = (row as { label?: unknown }).label;
+    const description = (row as { description?: unknown }).description;
     const aliases = (row as { aliases?: unknown }).aliases;
     const surfaces: string[] = [];
+    const aliasValues: string[] = [];
     if (typeof label === 'string' && isUsableSurface(label)) surfaces.push(label);
     if (Array.isArray(aliases)) {
       for (const alias of aliases) {
         const value = typeof alias === 'string' ? alias : (alias as { value?: unknown } | null)?.value;
-        if (typeof value === 'string' && isUsableSurface(value)) surfaces.push(value);
+        if (typeof value !== 'string') continue;
+        aliasValues.push(value);
+        if (isUsableSurface(value)) surfaces.push(value);
       }
     }
+    const identityText = [
+      typeof label === 'string' ? label : '',
+      typeof description === 'string' ? description : '',
+      ...aliasValues,
+    ].filter(Boolean).join(' ');
+    if (!textMentionsCountryIdentity(identityText, identityTerms)) continue;
     for (const surface of [...new Set(surfaces.map(s => s.normalize('NFKC').trim().replace(/\s+/gu, ' ')))]) {
       out.push({
         country,
@@ -161,7 +188,7 @@ export function parseWikidataSearchSignals(
         providerSignalId: providerSignalId('WIKIDATA', id),
         sourceUrl: typeof id === 'string' ? `https://www.wikidata.org/wiki/${encodeURIComponent(id)}` : null,
         metadata: {
-          description: typeof (row as { description?: unknown }).description === 'string' ? (row as { description: string }).description : null,
+          description: typeof description === 'string' ? description : null,
         },
       });
     }

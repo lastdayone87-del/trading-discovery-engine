@@ -314,15 +314,36 @@ test('A1: Wikipedia/Wikidata aliases stay scoped to the configured country and l
 
   const wikidata = parseWikidataSearchSignals({
     search: [
-      { id: 'Q1', label: 'Charttechnik', aliases: [{ value: 'Chartanalyse' }], description: 'German term' },
+      { id: 'Q1', label: 'Börse Frankfurt', aliases: [{ value: 'Frankfurter Wertpapierbörse' }], description: 'Börse in Frankfurt am Main' },
       { id: 'Q2', label: 'Trading', aliases: [] },
     ],
   }, { country: 'Germany', language: 'de' });
   assert.deepEqual(
     wikidata.map(signal => [signal.country, signal.language, signal.surface]),
-    [['Germany', 'de', 'Charttechnik'], ['Germany', 'de', 'Chartanalyse']],
+    [['Germany', 'de', 'Börse Frankfurt'], ['Germany', 'de', 'Frankfurter Wertpapierbörse']],
   );
   assert.ok([...wiki, ...wikidata].every(signal => signal.country === 'Germany'));
+});
+
+test('A1b: Wikidata entities are scoped to the requesting country', () => {
+  const payload = {
+    search: [
+      { id: 'Q-DE', label: 'Börse Frankfurt', description: 'Börse in Frankfurt am Main' },
+      { id: 'Q-CH', label: 'SIX Swiss Exchange', description: 'stock exchange in Switzerland' },
+      { id: 'Q-UK', label: 'London Stock Exchange', description: 'stock exchange in London, United Kingdom' },
+      { id: 'Q-US', label: 'New York Stock Exchange', aliases: ['NYSE'], description: 'American stock exchange in New York City' },
+      { id: 'Q-IN', label: 'National Stock Exchange of India', description: 'stock exchange in India' },
+    ],
+  };
+  const surfacesFor = (country: string) => parseWikidataSearchSignals(payload, { country, language: 'en' })
+    .map(signal => signal.surface);
+  assert.deepEqual(surfacesFor('Germany'), ['Börse Frankfurt']);
+  assert.deepEqual(surfacesFor('Switzerland'), ['SIX Swiss Exchange']);
+  assert.deepEqual(surfacesFor('United Kingdom'), ['London Stock Exchange']);
+  assert.deepEqual(surfacesFor('United States'), ['New York Stock Exchange', 'NYSE']);
+  assert.deepEqual(surfacesFor('India'), ['National Stock Exchange of India']);
+  assert.notDeepEqual(surfacesFor('Germany'), surfacesFor('Switzerland'));
+  assert.notDeepEqual(surfacesFor('United States'), surfacesFor('India'));
 });
 
 test('A2: repeated free-signal refresh is cache-idempotent and does not refetch', async () => {
@@ -335,7 +356,7 @@ test('A2: repeated free-signal refresh is cache-idempotent and does not refetch'
     if (String(url).includes('wikipedia.org')) {
       return { ok: true, json: async () => ({ query: { search: [{ title: 'DAX', pageid: 1 }] } }) } as never;
     }
-    return { ok: true, json: async () => ({ search: [{ id: 'Q1', label: 'Charttechnik', aliases: [] }] }) } as never;
+    return { ok: true, json: async () => ({ search: [{ id: 'Q1', label: 'Xetra', description: 'Börse in Frankfurt, Germany', aliases: [] }] }) } as never;
   }) as unknown as typeof fetch;
   const now = new Date('2026-10-26T00:00:00Z');
   try {
@@ -418,10 +439,10 @@ test('A2b: free-signal cache is scoped by normalized limit', async () => {
       ok: true,
       json: async () => ({
         search: [
-          { id: 'Q1', label: 'Handelsstrategie', aliases: [] },
-          { id: 'Q2', label: 'Chartanalyse', aliases: [] },
-          { id: 'Q3', label: 'DAX Futures', aliases: [] },
-          { id: 'Q4', label: 'Börsenhandel', aliases: [] },
+          { id: 'Q1', label: 'Xetra', description: 'Börse in Frankfurt, Germany', aliases: [] },
+          { id: 'Q2', label: 'Börse Frankfurt', description: 'Börse in Frankfurt am Main', aliases: [] },
+          { id: 'Q3', label: 'DAX Futures', description: 'DAX futures market in Germany', aliases: [] },
+          { id: 'Q4', label: 'Börsenhandel', description: 'Börsenhandel in Deutschland', aliases: [] },
         ],
       }),
     } as never;

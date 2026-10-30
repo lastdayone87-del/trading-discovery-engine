@@ -234,6 +234,35 @@ export function countryIsoAlias(value: string): string | null {
 }
 
 /**
+ * Normalized identity terms that bind an external entity to a country:
+ * canonical name, alias spellings, localized country names from the creator
+ * bio vocabulary, exchange names, and known cities. Used to reject generic
+ * search results that belong to another market. Short aliases are omitted so
+ * two-letter codes cannot match inside unrelated words.
+ */
+export function countryIdentityTerms(value: string): string[] {
+  const country = canonicalCountry(value);
+  const terms = new Set<string>();
+  const add = (term: unknown) => {
+    if (typeof term !== 'string') return;
+    const normalized = normalizeCountryName(term);
+    if (normalized.length >= 3) terms.add(normalized);
+  };
+  add(country);
+  for (const [alias, target] of Object.entries(COUNTRY_ALIASES)) {
+    if (canonicalCountry(target) === country) add(alias);
+  }
+  const signals = Object.hasOwn(COUNTRY_SIGNALS, country) ? COUNTRY_SIGNALS[country] : undefined;
+  if (signals) {
+    signals.bio.forEach(add);
+    signals.exchanges.forEach(add);
+    signals.social.forEach(add);
+    signals.addresses.forEach(add);
+  }
+  return [...terms];
+}
+
+/**
  * Alias spellings (as stored in COUNTRY_ALIASES keys) that canonicalize to a
  * supported production country. Single source for scope-eligibility alias
  * coverage: the runtime resolver, the migration guard test, and registry
