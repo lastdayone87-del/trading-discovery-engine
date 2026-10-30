@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { combineRenderedControlOffsetAdvances, isNavigableOnlyControlWindow, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, resolveRenderedCompletionState, runRenderedClickLoop, type RenderedControlEnumeration } from './browserCommunityFallback';
+import { combineRenderedControlOffsetAdvances, isNavigableOnlyControlWindow, mergeRenderedCoverageGapCounters, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, resolveRenderedCompletionState, runRenderedClickLoop, type RenderedControlEnumeration } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -433,7 +433,7 @@ test('rendered control coverage counts overflow and uses stable markers across D
   assert.match(source, /partitionRenderedClickTargets\(controls, page\.url\(\), limits\.maxClicksPerPage, limits\.clickOffset\)/, 'the retry offset rotates the full pool before the cap');
   assert.match(source, /const pendingQueuedTargets = Math\.max\(0, clickTargets\.length - clickIndex - 1\)/, 'queued-but-unclicked controls consume the remaining budget');
   assert.match(source, /const freshPlan = planRevealedRenderedClickTargets\(\s*unqueued,\s*input\.pageUrl\(\),\s*input\.maxClicksPerPage,\s*clickedThisPage,\s*pendingQueuedTargets,\s*input\.clickOffset,?\s*\)/, 'revealed controls are planned against the truly remaining slots and retry offset');
-  assert.match(source, /const clickLoop = await runRenderedClickLoop\(\{[\s\S]*?enumerate: enumerateControls,[\s\S]*?onEnumerated: recordControlEnumeration,?\s*\}\);/, 'the handler executes the extracted loop after every click');
+  assert.match(source, /(?:const\s+)?clickLoop = await runRenderedClickLoop\(\{[\s\S]*?enumerate: enumerateControls,[\s\S]*?onEnumerated: recordControlEnumeration,?\s*\}\);/, 'the handler executes the extracted loop after every click');
   assert.doesNotMatch(source, /clickedThisPage < limits\.maxClicksPerPage && Date\.now\(\) - startedAt < limits\.totalTimeoutMs\) \{/, 'the old final-click guard must not return');
   assert.match(source, /freshDropped\+\+/, 're-enumerated controls beyond the remaining budget are counted as skipped');
   assert.match(source, /drops\.count\('control-slice', clickLoop\.evidenceControlsSkipped\)/, 'revealed-control slices are recorded');
@@ -470,8 +470,33 @@ test('P0.2 coverage counters stay coherent, bounded, and preserved on error path
   assert.match(source, /Math\.max\(0, pagePopupTargets - examinedPopups\)/, 'popups examined by the click loop are not reported as unexamined context');
   assert.match(source, /document\.getElementsByTagName\(frameTags\[tagIndex\]\)/, 'frame counting uses live collections instead of materializing every match');
   assert.doesNotMatch(source, /querySelectorAll\('iframe,frame,object,embed'\)/, 'the unbounded materializing frame query is gone');
-  assert.match(source, /const labelText = /, 'structural classification uses the control own label text');
+  assert.match(source, /const labelText = `\$\{element\.innerText \|\| ''\} \$\{ariaLabel\}`/, 'structural classification uses only the control own visible text and aria-label');
+  assert.doesNotMatch(source, /const labelText = `\$\{element\.innerText \|\| ''\} \$\{ariaLabel\} \$\{title\}/, 'title text cannot classify a control as structural navigation');
   assert.doesNotMatch(source, /resources\|support\|explore\|more/, 'generic content words no longer classify a control as structural navigation');
+  const aggregateRegistration = source.indexOf('aggregatePageCountersOnError = aggregatePageControlCounters;');
+  const scrollLoop = source.indexOf('for (let i = 0; i < limits.maxScrollsPerPage; i++)');
+  assert.ok(aggregateRegistration !== -1 && scrollLoop !== -1, 'the error aggregator and scroll loop both exist');
+  assert.ok(aggregateRegistration < scrollLoop, 'the error aggregator is registered before scrolling so a scroll throw keeps measured context counts');
+  assert.match(source, /mergeRenderedCoverageGapCounters\(/, 'later enumerations merge their coverage-gap observations');
+  assert.match(source, /pageStructuralHintRejected = gapCounters\.structuralHintRejected/, 'a later smaller enumeration cannot discard a structural coverage gap');
+  assert.match(source, /popupWindowsThisClick\.size === 0/, 'a click that opened a new window is not treated as an examined popup');
+  assert.match(source, /clickPageContext\?\.off\?\.\('page', onPopupWindow\)/, 'the popup listener does not outlive the click loop');
+});
+
+test('coverage-gap counters accumulate across later, smaller enumerations', () => {
+  const first = mergeRenderedCoverageGapCounters(
+    { structuralNavigation: 0, structuralHintRejected: 0, iconLabelRecovered: 0, popupTargets: 0 },
+    { structuralNavigation: 0, structuralHintRejected: 0, iconLabelRecovered: 0, popupTargets: 1 },
+  );
+  assert.deepEqual(first, { structuralNavigation: 0, structuralHintRejected: 0, iconLabelRecovered: 0, popupTargets: 1 });
+  const second = mergeRenderedCoverageGapCounters(first, {
+    structuralNavigation: 1, structuralHintRejected: 1, iconLabelRecovered: 2, popupTargets: 0,
+  });
+  assert.deepEqual(
+    second,
+    { structuralNavigation: 1, structuralHintRejected: 1, iconLabelRecovered: 2, popupTargets: 1 },
+    'a menu trigger revealed by a click is counted even though the refreshed set is smaller',
+  );
 });
 
 test('shared rendered evidence stays fail-closed: gapped/timed-out lenders never enter inventory', () => {

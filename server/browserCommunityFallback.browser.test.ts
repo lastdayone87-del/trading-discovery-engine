@@ -196,6 +196,30 @@ test('real DOM: control 65 is reachable after rotating the full 70-control pool'
   });
 });
 
+test('real DOM: structural classification uses visible text and aria-label only', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><head><title>label fixture</title></head><body>
+    <a href="/support" title="Site menu">Support</a>
+    <button aria-labelledby="menu-heading"><span aria-hidden="true">≡</span></button>
+    <span id="menu-heading">Main menu</span>
+    <button aria-label="Open menu">☰</button>
+    <a href="/tools" role="menuitem">Tools</a>
+  </body></html>`;
+  await withControlPage(html, async page => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(
+      enumeration.structuralNavigation,
+      2,
+      'aria-label menu and role=menuitem are structural; title and aria-labelledby text are not',
+    );
+    assert.equal(
+      enumeration.structuralHintRejected,
+      2,
+      'the visible Support link is hint-matched, and aria-labelledby text cannot force a generic control into the structural gap',
+    );
+    assert.equal(enumeration.iconLabelRecovered, 1, 'aria-labelledby still contributes to icon-label recovery measurement');
+  });
+});
+
 test('real DOM: a 64-control page wraps without inventing overflow', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
   await withControlPage(controlFixtureHtml(64, null), async (page, url) => {
     const enumeration = await enumeratePageControls(page);
