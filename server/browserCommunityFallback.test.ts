@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { DEFAULT_BROWSER_FALLBACK_BUDGET, DECLARATIVE_SHADOW_SCAN_MAX_BYTES, advanceRenderedLifecycleStage, beginRenderedDeclarativeShadowScan, browserCauseSnippet, browserFallbackTelemetrySummary, classifyCrawlCatch, classifyRenderedPopupDestination, countDeclarativeClosedShadowRoots, createRenderedRouteGuard, disposeRenderedRouteGuards, installRenderedRouteCloseCleanup, isExpectedRenderedRouteShutdownError, isTelegramPostPermalink, readRenderedDeclarativeShadowScan, RenderedFallbackGate, renderedFallbackGate, resolveRenderedZeroPageReason, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback, shouldSkipPreexistingSiblingPage, type BrowserFallbackTelemetry, type RenderedRouteLike } from './browserCommunityFallback';
+import { DEFAULT_BROWSER_FALLBACK_BUDGET, DECLARATIVE_SHADOW_SCAN_MAX_BYTES, advanceRenderedLifecycleStage, beginRenderedDeclarativeShadowScan, browserCauseSnippet, browserFallbackTelemetrySummary, classifyCrawlCatch, classifyRenderedPopupDestination, countDeclarativeClosedShadowRoots, createRenderedRouteGuard, disposeRenderedRouteGuards, installRenderedRouteCloseCleanup, isExpectedRenderedRouteShutdownError, isTelegramPostPermalink, mergeRenderedPageContextCounts, readRenderedDeclarativeShadowScan, RenderedFallbackGate, renderedFallbackGate, resolveRenderedZeroPageReason, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback, shouldSkipPreexistingSiblingPage, sumRenderedPageContextCounts, type BrowserFallbackTelemetry, type RenderedRouteLike } from './browserCommunityFallback';
 import { redactCauseSnippet } from './crawlerTelemetry';
 import { classifyRenderedCrawlerFailure, isRenderedNavigationTimeout, renderedCrawlerHostBackoffMs, renderedCrawlerRetryPolicy } from './renderedCrawlerPolicy';
 
@@ -59,6 +59,41 @@ test('declarative closed shadow roots are counted from raw markup without claimi
     countDeclarativeClosedShadowRoots(Array.from({ length: 1200 }, () => '<template shadowrootmode="closed"></template>').join('')),
     1000,
     'the markup scan is bounded even for a pathological document',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots('<template id="x"shadowrootmode="closed">x</template>'),
+    1,
+    'an attribute immediately after a closing quote is still an attribute boundary',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots('<template id="x"shadowrootmode="closed"/>'),
+    1,
+    'a self-closing start tag still counts its closed declaration',
+  );
+  const malformed = '<template '.repeat(131_072);
+  const malformedStart = Date.now();
+  assert.equal(countDeclarativeClosedShadowRoots(malformed), 0, 'an unterminated start tag yields no closed root');
+  assert.ok(Date.now() - malformedStart < 1_000, 'an unterminated template tag scan is linear, not quadratic');
+});
+
+test('per-document context counters keep maxima and sum every inspected document', () => {
+  const first = mergeRenderedPageContextCounts(undefined, {
+    frameCount: 2, shadowRootCount: 3, closedShadowRootCount: 0, baseHrefPresent: false,
+  });
+  assert.deepEqual(first, { frameCount: 2, shadowRootCount: 3, closedShadowRootCount: 0, baseHrefPresent: false });
+  const merged = mergeRenderedPageContextCounts(first, {
+    frameCount: 1, shadowRootCount: 5, closedShadowRootCount: 4, baseHrefPresent: true,
+  });
+  assert.deepEqual(
+    merged,
+    { frameCount: 2, shadowRootCount: 5, closedShadowRootCount: 4, baseHrefPresent: true },
+    'a later smaller snapshot cannot erase contexts already observed in the same document',
+  );
+  const clickedDocument = { frameCount: 1, shadowRootCount: 0, closedShadowRootCount: 2, baseHrefPresent: false };
+  assert.deepEqual(
+    sumRenderedPageContextCounts([first, clickedDocument]),
+    { frameCount: 3, shadowRootCount: 3, closedShadowRootCount: 2, baseHrefPresent: false },
+    'a click-navigated document contributes its own contexts instead of being dropped',
   );
 });
 
@@ -186,6 +221,26 @@ test('popup destinations are classified before policy exclusion or discard', () 
     classifyRenderedPopupDestination('https://discord.gg/InviteCode', pageUrl),
     'discord',
     'a direct Discord invite opened by window.open is terminal evidence',
+  );
+  assert.equal(
+    classifyRenderedPopupDestination('https://discord.com/invite/InviteCode', pageUrl),
+    'discord',
+    'the discord.com/invite form is also terminal evidence',
+  );
+  assert.equal(
+    classifyRenderedPopupDestination('https://discord.com/', pageUrl),
+    'cross-origin',
+    'a generic Discord-host page has no invite in its URL and stays unexamined',
+  );
+  assert.equal(
+    classifyRenderedPopupDestination('https://discord.com/channels/1/2', pageUrl),
+    'cross-origin',
+    'a Discord channel view is not terminal invite evidence',
+  );
+  assert.equal(
+    classifyRenderedPopupDestination('https://discord.gg/', pageUrl),
+    'cross-origin',
+    'a Discord host without an extractable code is not terminal evidence',
   );
   assert.equal(classifyRenderedPopupDestination('https://creator.example/room', pageUrl), 'same-origin');
   assert.equal(classifyRenderedPopupDestination('https://other.example/room', pageUrl), 'cross-origin');

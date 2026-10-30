@@ -834,8 +834,28 @@ test('interaction-revealed links are captured per click and context counters ref
     /declarativeScan\.closedRoots\) \|\| 0\) - lastDeclarativeClosedRoots/,
     'declarative-root re-reads add only the delta, never double count',
   );
-  assert.match(source, /pageContextByDocument\.set\(key, \{/, 'live context counters are maxed per document');
+  assert.match(source, /pageContextByDocument\.set\(\s*key,\s*mergeRenderedPageContextCounts/, 'live context counters are maxed per document');
+  assert.doesNotMatch(
+    source,
+    /isSameSeedDocument\(pageDocumentIdentity, currentIdentity, pageDocumentUrl, currentUrl\)/,
+    'a click-navigated document is recorded instead of being dropped by the original-document guard',
+  );
+  assert.match(
+    source,
+    /await attemptRenderedControlClick[\s\S]{0,1600}?await recordPageContext\(\);/,
+    'each click captures the document it navigated to before the next click',
+  );
   assert.match(source, /retain\(popupUrl, page\.url\(\)\)/, 'a direct Discord popup URL is retained as terminal evidence');
+  assert.match(
+    source,
+    /isDiscordDestinationUrl\(popupUrl\) && extractDiscordCandidates\(popupUrl\)\.length > 0/,
+    'only URLs with an extractable Discord invite are terminal evidence',
+  );
+  assert.match(
+    source,
+    /genericDiscordPopup = kind !== 'discord' && isDiscordDestinationUrl\(popupUrl\)/,
+    'a generic Discord-host popup is inspected before being counted as unexamined',
+  );
   assert.match(source, /shouldSkipPreexistingSiblingPage\(existingUrl, probe\)/, 'blank siblings are classified before being skipped');
   assert.match(source, /popupContent = await popup\.content\(\)/, 'document.write content in a blank popup is inspected before closing');
 });

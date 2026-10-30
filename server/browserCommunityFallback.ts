@@ -394,10 +394,12 @@ export function classifyRenderedPopupDestination(
     return 'uninspectable';
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return 'uninspectable';
-  // Discord destinations are terminal invite candidates. A popup that opens
-  // one directly must be retained as evidence, not discarded as an unexamined
-  // cross-origin page.
-  if (isDiscordDestinationUrl(popupUrl)) return 'discord';
+  // Only a Discord URL that yields an extractable invite is terminal evidence.
+  // A generic Discord-host page (homepage, login, channel view) carries no
+  // invite in its URL; treating it as captured would hide the invite its
+  // document might contain. Let it fall through to the ordinary origin and
+  // admission classification so it stays an unexamined destination.
+  if (isDiscordDestinationUrl(popupUrl) && extractDiscordCandidates(popupUrl).length > 0) return 'discord';
   // Security/format rejection is more precise than origin: a private or
   // non-public target is never an eligible navigation surface.
   if (!assessCrawlAdmission(popupUrl).eligible) return 'admission-rejected';
@@ -1101,6 +1103,9 @@ export function installClosedShadowRootInstrumentation(): void {
  */
 export const DECLARATIVE_SHADOW_SCAN_MAX_BYTES = 8 * 1024 * 1024;
 
+const isMarkupWhitespace = (code: number): boolean =>
+  code === 32 || code === 9 || code === 10 || code === 12 || code === 13;
+
 /**
  * Count declarative closed shadow roots in raw HTML. The parser consumes and
  * removes `<template shadowrootmode="closed">` during document construction,
@@ -1108,19 +1113,76 @@ export const DECLARATIVE_SHADOW_SCAN_MAX_BYTES = 8 * 1024 * 1024;
  * markup scan, not a DOM traversal; false positives only make coverage more
  * conservative, while the explicit response-scan gap prevents false clean
  * results when a body cannot be scanned.
+ *
+ * The scan is single-pass: a backtracking regex over crawl-controlled markup
+ * can degrade to quadratic time when a `<template` start tag never
+ * terminates. Attribute boundaries follow HTML rules, so an attribute
+ * immediately after a closing quote (`id="x"shadowrootmode="closed"`) is still
+ * recognized, and a `>` inside a quoted value never ends the tag early.
  */
 export function countDeclarativeClosedShadowRoots(html: string): number {
   if (typeof html !== 'string' || !html) return 0;
-  // Match a complete `<template ...>` start tag while respecting quoted
-  // attribute values: a `>` inside `title="Guests > 10"` must not end the
-  // tag early. The previous `[^>]*` scan stopped there and missed a valid
-  // `shadowrootmode="closed"` that Chromium still attaches.
-  const tagPattern = /<template\b((?:[^>"']|"[^"]*"|'[^']*')*)>/gi;
-  const attributePattern = /(?:^|\s)(?:shadowrootmode|shadowroot)\s*=\s*(?:"closed"|'closed'|closed)(?=\s|\/|$)/i;
+  const opener = /<template/gi;
   let count = 0;
-  let tag: RegExpExecArray | null;
-  while (count < 1000 && (tag = tagPattern.exec(html))) {
-    if (attributePattern.test(tag[1])) count++;
+  let match: RegExpExecArray | null;
+  while (count < 1000 && (match = opener.exec(html))) {
+    let i = match.index + '<template'.length;
+    const boundary = i < html.length ? html.charCodeAt(i) : -1;
+    // `<templatex>` is not the template element. Continue after the name so
+    // a later real `<template` is still found without rescanning this one.
+    if (boundary !== -1 && !isMarkupWhitespace(boundary) && boundary !== 47 && boundary !== 62) {
+      opener.lastIndex = i;
+      continue;
+    }
+    let closedShadowRoot = false;
+    let terminated = false;
+    while (i < html.length) {
+      while (i < html.length && isMarkupWhitespace(html.charCodeAt(i))) i++;
+      if (i >= html.length) break;
+      const code = html.charCodeAt(i);
+      if (code === 62) { i++; terminated = true; break; }
+      if (code === 47) { i++; continue; }
+      const nameStart = i;
+      while (i < html.length) {
+        const nameCode = html.charCodeAt(i);
+        if (isMarkupWhitespace(nameCode) || nameCode === 61 || nameCode === 62 || nameCode === 47
+          || nameCode === 34 || nameCode === 39) break;
+        i++;
+      }
+      if (i === nameStart) { i++; continue; }
+      const attributeName = html.slice(nameStart, i).toLowerCase();
+      while (i < html.length && isMarkupWhitespace(html.charCodeAt(i))) i++;
+      let valueStart = i;
+      let valueEnd = i;
+      if (i < html.length && html.charCodeAt(i) === 61) {
+        i++;
+        while (i < html.length && isMarkupWhitespace(html.charCodeAt(i))) i++;
+        const quote = i < html.length ? html.charCodeAt(i) : -1;
+        if (quote === 34 || quote === 39) {
+          i++;
+          valueStart = i;
+          while (i < html.length && html.charCodeAt(i) !== quote) i++;
+          valueEnd = i;
+          if (i < html.length) i++;
+        } else {
+          valueStart = i;
+          while (i < html.length) {
+            const valueCode = html.charCodeAt(i);
+            if (isMarkupWhitespace(valueCode) || valueCode === 62) break;
+            i++;
+          }
+          valueEnd = i;
+        }
+      }
+      if (attributeName === 'shadowrootmode' || attributeName === 'shadowroot') {
+        let value = html.slice(valueStart, valueEnd).toLowerCase();
+        if (value.endsWith('/')) value = value.slice(0, -1);
+        if (value === 'closed') closedShadowRoot = true;
+      }
+    }
+    if (!terminated) break;
+    if (closedShadowRoot) count++;
+    opener.lastIndex = i;
   }
   return count;
 }
@@ -1376,6 +1438,48 @@ export function collectRenderedPageContext(): RenderedPageContextCounts {
     closedShadowRootCount,
     baseHrefPresent: !!document.querySelector('base[href]'),
   };
+}
+
+/**
+ * Per-document maxima. Interactions can reveal contexts incrementally, and a
+ * later snapshot may be smaller than an earlier one (the closed-root probe is
+ * cumulative, but frame/shadow counts are live), so never overwrite a larger
+ * observation with a smaller one.
+ */
+export function mergeRenderedPageContextCounts(
+  prior: RenderedPageContextCounts | undefined,
+  next: Partial<RenderedPageContextCounts> | null | undefined,
+): RenderedPageContextCounts {
+  const count = (value: unknown): number => Math.max(0, Math.floor(Number(value)) || 0);
+  return {
+    frameCount: Math.max(prior?.frameCount || 0, count(next?.frameCount)),
+    shadowRootCount: Math.max(prior?.shadowRootCount || 0, count(next?.shadowRootCount)),
+    closedShadowRootCount: Math.max(prior?.closedShadowRootCount || 0, count(next?.closedShadowRootCount)),
+    baseHrefPresent: (prior?.baseHrefPresent || false) || next?.baseHrefPresent === true,
+  };
+}
+
+/**
+ * Crawl counters sum per-document maxima, so a click that navigates to another
+ * document contributes its contexts instead of replacing the original page's.
+ */
+export function sumRenderedPageContextCounts(
+  values: Iterable<RenderedPageContextCounts>,
+): RenderedPageContextCounts {
+  const total: RenderedPageContextCounts = {
+    frameCount: 0,
+    shadowRootCount: 0,
+    closedShadowRootCount: 0,
+    baseHrefPresent: false,
+  };
+  const count = (value: unknown): number => Math.max(0, Math.floor(Number(value)) || 0);
+  for (const value of values) {
+    total.frameCount += count(value.frameCount);
+    total.shadowRootCount += count(value.shadowRootCount);
+    total.closedShadowRootCount += count(value.closedShadowRootCount);
+    total.baseHrefPresent = total.baseHrefPresent || value.baseHrefPresent === true;
+  }
+  return total;
 }
 
 export function isSkippableNavigableAnchorClick(
@@ -3354,41 +3458,29 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             inspectedPages++;
             telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'PAGE_PROCESSED');
             // P0.2 context counters: structural presence only, refreshed after
-            // scrolling and same-document interactions so frames, shadow roots,
-            // and closed roots created by a disclosure are not missed. Counts
-            // are maxed per document (the attachShadow probe is cumulative) and
-            // summed across documents; a click that navigates to a new document
-            // is not attributed to the original page's counters. Diagnostics
-            // only: they never alter selection, clicking, or outcome. A page
-            // that navigated away or closed between a probe must not fail the
-            // crawl.
-            const pageDocumentUrl = page.url();
-            const pageDocumentIdentity = await page.evaluate(() => performance.timeOrigin).catch(() => null);
-            const pageContextByDocument = new Map<string, {
-              frameCount: number;
-              shadowRootCount: number;
-              closedShadowRootCount: number;
-              baseHrefPresent: boolean;
-            }>();
+            // scrolling, after every click, and after the click loop so frames,
+            // shadow roots, and closed roots created by a disclosure are not
+            // missed. Counts are maxed per document (the attachShadow probe is
+            // cumulative) and summed across documents. A click can navigate the
+            // same page object to a new document without enqueueing it as a
+            // separate request; keying by document identity records every
+            // inspected document instead of dropping all but the original.
+            // Diagnostics only: they never alter selection, clicking, or
+            // outcome. A page that navigated away or closed between a probe
+            // must not fail the crawl.
+            const pageContextByDocument = new Map<string, RenderedPageContextCounts>();
             const recordPageContext = async (): Promise<void> => {
               try {
                 const currentUrl = page.url();
                 const currentIdentity = await page.evaluate(() => performance.timeOrigin).catch(() => null);
-                if (!isSameSeedDocument(pageDocumentIdentity, currentIdentity, pageDocumentUrl, currentUrl)) return;
                 const pageContext = await page.evaluate(collectRenderedPageContext);
                 const key = currentIdentity !== null && currentIdentity !== undefined
                   ? String(currentIdentity)
                   : (normalizeVisitUrl(currentUrl) || currentUrl);
-                const prior = pageContextByDocument.get(key);
-                pageContextByDocument.set(key, {
-                  frameCount: Math.max(prior?.frameCount || 0, Math.max(0, Math.floor(pageContext.frameCount) || 0)),
-                  shadowRootCount: Math.max(prior?.shadowRootCount || 0, Math.max(0, Math.floor(pageContext.shadowRootCount) || 0)),
-                  closedShadowRootCount: Math.max(
-                    prior?.closedShadowRootCount || 0,
-                    Math.max(0, Math.floor(pageContext.closedShadowRootCount) || 0),
-                  ),
-                  baseHrefPresent: (prior?.baseHrefPresent || false) || pageContext.baseHrefPresent === true,
-                });
+                pageContextByDocument.set(
+                  key,
+                  mergeRenderedPageContextCounts(pageContextByDocument.get(key), pageContext),
+                );
               } catch { /* context counters never break inspection */ }
             };
             await recordPageContext();
@@ -3758,11 +3850,14 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 } catch { /* about:blank or already closed */ }
                 const kind = classifyRenderedPopupDestination(popupUrl, page.url());
                 // A blank popup can still hold document.write() markup with an
-                // invite. Read it as evidence before closing; it remains an
-                // uninspectable navigation surface (a coverage gap), but its
-                // contents are no longer silently lost.
+                // invite. A generic Discord-host page is not terminal evidence
+                // either: its URL has no invite, so inspect its document for
+                // invite markup before treating the destination as unexamined.
+                // In both cases the popup remains an unexamined navigation
+                // surface, but its contents are no longer silently lost.
+                const genericDiscordPopup = kind !== 'discord' && isDiscordDestinationUrl(popupUrl);
                 let popupContent = '';
-                if (kind === 'uninspectable' && popup.content) {
+                if ((kind === 'uninspectable' || genericDiscordPopup) && popup.content) {
                   try { popupContent = await popup.content(); } catch { /* best effort */ }
                 }
                 await popup.close().catch(() => undefined);
@@ -3836,6 +3931,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                   telemetry,
                   onClicked: () => { clicks++; },
                 }));
+                // A click may commit a new document and inspect it in place.
+                // Capture its frames/shadow roots before the next click can
+                // navigate away again.
+                await recordPageContext();
                 await drainPopups();
                 // Preserve a newly revealed destination before the next click
                 // replaces the panel that contains it.
@@ -3913,20 +4012,11 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // processed page exposed. Context counters are maxed per document
             // and summed here; closed roots found after the interaction pass
             // are included without double counting.
-            let pageFrameCount = 0;
-            let pageShadowRootCount = 0;
-            let pageClosedShadowRootCount = 0;
-            let pageBaseHrefPresent = false;
-            for (const context of pageContextByDocument.values()) {
-              pageFrameCount += context.frameCount;
-              pageShadowRootCount += context.shadowRootCount;
-              pageClosedShadowRootCount += context.closedShadowRootCount;
-              pageBaseHrefPresent = pageBaseHrefPresent || context.baseHrefPresent;
-            }
-            frameCount += pageFrameCount;
-            shadowRootCount += pageShadowRootCount;
-            closedShadowRootCount += pageClosedShadowRootCount;
-            baseHrefPresent = baseHrefPresent || pageBaseHrefPresent;
+            const pageContextTotals = sumRenderedPageContextCounts(pageContextByDocument.values());
+            frameCount += pageContextTotals.frameCount;
+            shadowRootCount += pageContextTotals.shadowRootCount;
+            closedShadowRootCount += pageContextTotals.closedShadowRootCount;
+            baseHrefPresent = baseHrefPresent || pageContextTotals.baseHrefPresent;
             controlsEnumeratedTotal += pageControlsEnumeratedTotal;
             controlsHintRejected += pageHintRejected;
             controlsStructuralNavigation += pageStructuralNavigation;
