@@ -19,6 +19,7 @@ import {
   evaluateQueryComposition,
   isSemanticDuplicate,
   resolveCompositionTier,
+  selectionHistoryFor,
   semanticQueryKey,
 } from './composition';
 import {
@@ -27,15 +28,15 @@ import {
   PRODUCTION_CONFIGURED_ACTIVE_COUNTRIES,
 } from './profiles';
 import { computePosterior, empiricalPrior, PORTFOLIO_RATIO, SELECTOR_C } from './posterior';
-import { selectHierarchicalUcb, portfolioBudget } from './selector';
+import { selectHierarchicalUcb, portfolioBudget, buildHierarchy } from './selector';
 import { deriveQueryFailureState, isQuerySelectable } from './lifecycle';
-import { buildQueryQualityVector, buildAttribution, canPromoteToProven } from './accounting';
+import { buildQueryQualityVector, buildAttribution, canPromoteToProven, isRewardEligibleQuota } from './accounting';
 import { selectQueryCollection } from '../queryPerformance';
 import { buildQueryQualityDashboard } from './dashboard';
 import { compareSelectors } from './simulator';
 import { verifyFrozenBenchmarkVersions } from '../benchmarkPreregV1';
 import { AUTONOMOUS_QUERY_AUTHORITY_POLICY_VERSION } from '../autonomousQueryAuthority';
-import type { SelectorCandidate, SelectorContext, QueryAdmission } from './types';
+import type { SelectorCandidate, SelectorContext, QueryAdmission, QuerySource } from './types';
 import { buildCanonicalEvidenceCorpus } from '../evidenceEngine/canonicalEvidencePlane';
 import {
   buildContextualComposition,
@@ -290,6 +291,94 @@ test('Q4: exhausted portfolio budget cannot be exceeded by coverage or cold-star
   assert.ok(remaining.queryId);
 });
 
+test('Q4: share caps are achievable for homogeneous and balanced pools', () => {
+  const sourced = (id: number, family: string, source: QuerySource) => {
+    const base = candidate(id, family);
+    return { ...base, admission: { ...base.admission!, source } };
+  };
+
+  // A single family/source has a 1.0 share; the configured caps must not turn
+  // that into a permanent NO_ELIGIBLE_QUERY.
+  const singleFamily = selectHierarchicalUcb([sourced(1, 'family:A', 'CURATED')], selectorContext({
+    familyShare: { 'family:A': 1 },
+    sourceShare: { CURATED: 1 },
+  }));
+  assert.equal(singleFamily.strategy, 'UCB_EXPLOITATION');
+  assert.equal(singleFamily.queryId, 1);
+
+  // Two families at exactly 50/50 are at the effective cap, not over it.
+  const balanced = selectHierarchicalUcb([sourced(1, 'family:A', 'CURATED'), sourced(2, 'family:B', 'CURATED')], selectorContext({
+    familyShare: { 'family:A': 0.5, 'family:B': 0.5 },
+    sourceShare: { CURATED: 1 },
+  }));
+  assert.ok(balanced.queryId, 'a balanced two-family pool must still select');
+
+  // A genuinely dominant family remains capped when a viable alternative
+  // exists, so the fix does not silently disable diversity.
+  const dominant = selectHierarchicalUcb([sourced(1, 'family:A', 'CURATED'), sourced(2, 'family:B', 'CURATED')], selectorContext({
+    familyShare: { 'family:A': 0.9, 'family:B': 0.1 },
+    sourceShare: { CURATED: 1 },
+  }));
+  assert.equal(dominant.queryId, 2, 'the uncapped alternative family is selected');
+
+  // L-shaped split (family A source X, family A source Y, family B source X):
+  // every candidate is over one cap, but selection relaxes the weakest cap
+  // instead of halting forever.
+  const lShape = selectHierarchicalUcb([
+    sourced(1, 'family:A', 'CURATED'),
+    sourced(2, 'family:A', 'LEARNED_TERMINOLOGY'),
+    sourced(3, 'family:B', 'CURATED'),
+  ], selectorContext({
+    familyShare: { 'family:A': 0.7, 'family:B': 0.3 },
+    sourceShare: { CURATED: 0.7, LEARNED_TERMINOLOGY: 0.3 },
+  }));
+  assert.equal(lShape.strategy, 'UCB_EXPLOITATION');
+  assert.equal(lShape.queryId, 2, 'the only candidate under the source cap is selected');
+});
+
+test('Q4: hierarchy pools history from rows that are not executable this call', () => {
+  const target = { ...candidate(9, 'family:A', 0, 0), counts: { confirmed: 0, quality: 0, quotaUnits: 0, runs: 0 } };
+  // A sibling from the same family/country/market/language ran well but is
+  // cooling down, so it is absent from the executable candidate set.
+  const sibling = {
+    ...candidate(8, 'family:A', 4, 4),
+    counts: { confirmed: 4, quality: 2, quotaUnits: 2, runs: 4 },
+  };
+  const prior = { mean: 0.05, strength: 2 };
+  const hierarchy = buildHierarchy([target, sibling]);
+  const withHistory = selectHierarchicalUcb([target], selectorContext({
+    prior,
+    hierarchy,
+    portfolioUnitsUsed: 0,
+  }));
+  const withoutHistory = selectHierarchicalUcb([target], selectorContext({
+    prior,
+    portfolioUnitsUsed: 0,
+  }));
+  assert.ok(withHistory.posterior);
+  assert.ok(withoutHistory.posterior);
+  assert.ok(
+    withHistory.posterior.mean > withoutHistory.posterior.mean + 0.5,
+    'the sibling family history must inform the new surface prior',
+  );
+  // The candidate's own counts are removed from each stratum, so history
+  // belongs to the rest of the accounting window, not to the arm itself.
+  const expected = computePosterior(target.counts, prior, {
+    total: sibling.counts,
+    family: sibling.counts,
+    country: sibling.counts,
+    market: sibling.counts,
+    language: sibling.counts,
+  }, SELECTOR_C, 4);
+  assert.ok(Math.abs(withHistory.posterior.mean - expected.mean) < 1e-12);
+});
+
+test('Q5: zero-quota runs are excluded from the promotion denominator', () => {
+  assert.equal(isRewardEligibleQuota(0), false);
+  assert.equal(isRewardEligibleQuota(0.5), true);
+  assert.equal(isRewardEligibleQuota(Number.NaN), false);
+});
+
 test('Q3: derived consecutive failures drive lifecycle backoff; provider failures are exempt', () => {
   const now = new Date('2026-01-01T00:20:00.000Z');
   const failed = (completedAt: string, failureKind: string) => ({ status: 'FAILED', completedAt, failureKind });
@@ -309,8 +398,26 @@ test('Q3: derived consecutive failures drive lifecycle backoff; provider failure
   });
   assert.ok(blocked.reasonCodes.includes('FAILURE_BACKOFF_ACTIVE'));
 
+  // Three or more failures are a timed backoff, not a permanent ban: once the
+  // persisted backoff ends the query is selectable again and can reset its
+  // streak with a successful run.
+  const recovered = isQuerySelectable({
+    record: { id: 1, query: 'q', collection: 'EXPERIMENTAL', status: 'ACTIVE', last_executed: null },
+    now: '2026-01-01T00:25:01.000Z',
+    cooldownMinutes: 0,
+    consecutiveFailures: 5,
+    backoffUntil: '2026-01-01T00:25:00.000Z',
+  });
+  assert.equal(recovered.selectable, true);
+  assert.deepEqual(recovered.reasonCodes, []);
+
   assert.deepEqual(deriveQueryFailureState([
     failed('2026-01-01T00:10:00.000Z', 'PROVIDER_FAILURE'),
+    failed('2026-01-01T00:05:00.000Z', 'INVALID_QUERY'),
+  ], now), { consecutiveFailures: 0, backoffUntil: null });
+  // A vanished job row is orchestration state, not query-quality evidence.
+  assert.deepEqual(deriveQueryFailureState([
+    failed('2026-01-01T00:10:00.000Z', 'ORPHANED_FAILED_JOB_STATE'),
     failed('2026-01-01T00:05:00.000Z', 'INVALID_QUERY'),
   ], now), { consecutiveFailures: 0, backoffUntil: null });
   assert.deepEqual(deriveQueryFailureState([
@@ -322,6 +429,16 @@ test('Q3: derived consecutive failures drive lifecycle backoff; provider failure
     failed('2026-01-01T00:05:00.000Z', 'INVALID_QUERY'),
     failed('2026-01-01T00:00:00.000Z', 'INVALID_QUERY'),
   ], now), { consecutiveFailures: 3, backoffUntil: '2026-01-01T00:25:00.000Z' });
+
+  const exhausted = isQuerySelectable({
+    record: { id: 1, query: 'q', collection: 'EXPERIMENTAL', status: 'ACTIVE', last_executed: null },
+    now: now.toISOString(),
+    cooldownMinutes: 0,
+    consecutiveFailures: 3,
+    backoffUntil: '2026-01-01T00:25:00.000Z',
+  });
+  assert.ok(exhausted.reasonCodes.includes('FAILURE_BACKOFF_ACTIVE'));
+  assert.ok(!exhausted.reasonCodes.includes('REPEATED_FAILURE_BACKOFF'));
 });
 
 test('Q3/Q4: lifecycle gates reject REJECTED, cooldown, same-tick and speculative candidates', () => {
@@ -500,6 +617,12 @@ test('Q5/Q6: production wiring uses accounting-window spend, derived failure sta
   assert.match(intelligence, /getQueryFailureStates\(country\)/);
   assert.match(intelligence, /getQueryRunReward\(attribution\.queryRunId\)/);
   assert.match(intelligence, /consecutiveFailures: failure\?\.consecutiveFailures/);
+  // Promotion and hierarchy learning use the same eligibility as serving and
+  // the dashboard: zero-quota runs cannot supply samples or strata.
+  assert.match(intelligence, /isRewardEligibleQuota\(row\.quotaUnits\)/);
+  assert.match(intelligence, /isRewardEligibleQuota\(currentRun\.quotaUnits\)/);
+  assert.match(intelligence, /buildHierarchy\(hierarchyCandidates\)/);
+  assert.match(intelligence, /hierarchy,\n\s+coverageCells,/);
   // Share totals must be seeded from every query in the accounting window,
   // before the eligible-only candidate projection.
   const spendStart = intelligence.indexOf('Share accounting covers every query');
@@ -827,6 +950,34 @@ test('Q2: exact, reordered, alias and near-duplicate compositions are suppressed
   assert.equal(isSemanticDuplicate('DAX day trading futures live', [
     { query: 'DAX day trading futures', country: 'France' },
   ], 'Germany'), false);
+});
+
+test('Q2: mutually duplicate persisted rows have one stable selection winner', () => {
+  const rows = [
+    { id: 41, query: 'DAX day trading', country: 'Germany' },
+    { id: 42, query: 'trading day DAX', country: 'Germany' },
+  ];
+  const record = (query: string) => heldOutRecord('Germany', query, [
+    { term: 'DAX', type: 'INSTRUMENT' }, { term: 'day trading', type: 'METHOD' },
+  ], { relation: 'COMPACT_PAIR' });
+  const rawHistory = (id: number) => rows
+    .filter(row => row.id !== id)
+    .map(row => ({ query: row.query, country: row.country }));
+
+  // Both persisted rows suppress each other without the stable-winner rule.
+  assert.ok(admitQueryRecord(record('DAX day trading'), { history: rawHistory(41) }).reasonCodes.includes('SEMANTIC_DUPLICATE'));
+  assert.ok(admitQueryRecord(record('trading day DAX'), { history: rawHistory(42) }).reasonCodes.includes('SEMANTIC_DUPLICATE'));
+
+  // The lowest id wins; the loser still sees the winner and stays rejected.
+  const winner = admitQueryRecord(record('DAX day trading'), { history: selectionHistoryFor(rows[0], rows) });
+  assert.equal(winner.eligible, true);
+  const loser = admitQueryRecord(record('trading day DAX'), { history: selectionHistoryFor(rows[1], rows) });
+  assert.equal(loser.eligible, false);
+  assert.ok(loser.reasonCodes.includes('SEMANTIC_DUPLICATE'));
+
+  // Input order from the database is not trusted to define the winner.
+  assert.deepEqual(selectionHistoryFor(rows[0], [...rows].reverse()), []);
+  assert.deepEqual(selectionHistoryFor(rows[1], [...rows].reverse()), [{ query: 'DAX day trading', country: 'Germany' }]);
 });
 
 test('Q2: cross-country and cross-language atoms are rejected unless explicitly global', () => {

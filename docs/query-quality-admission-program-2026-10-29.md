@@ -82,8 +82,12 @@ touched.
   hard gates.
 - `posterior.ts`: 30-day decayed Gamma–Poisson hierarchy with empirical-Bayes
   log-rate partial pooling (global 0.20, family 0.35, country 0.20, market
-  0.15, language 0.10), cap 4.0, minimum sample 2. Pooling rates rather than
-  raw counts avoids a globally strong family crowding out every country.
+  0.15, language 0.10), cap 4.0, minimum sample 2. Stratum totals are built
+  from every query in the accounting window, including cooling-down, rotated,
+  share-capped and otherwise unselectable rows, so a new surface inherits its
+  family/country/market/language history even when its siblings cannot run this
+  call. Pooling rates rather than raw counts avoids a globally strong family
+  crowding out every country.
 - `selector.ts`: deterministic hierarchical UCB,
   `index = min(cap, mean + c × SD)`, `c = 2.0`, 15% bounded portfolio. No
   `Math.random`, no least-executed-first, no unscored fallback. Every decision
@@ -91,9 +95,11 @@ touched.
 - `queryIntelligence.selectNextQueryForCountry` now builds a candidate pool from
   admitted rows, excludes `SPECULATIVE`, re-admits generated candidates, keeps
   the deterministic intent rotation as a filter, applies family/source caps
-  against `max(candidate spend, daily quota)`, and returns `NO_ELIGIBLE_QUERY`
-  instead of an unscored fallback. The 16-country scheduler owns global country
-  rotation, so the per-country cap is 1 per call.
+  against `max(candidate spend, daily quota)` with an achievable `1/n` floor and
+  a bounded family-then-source relaxation when the caps would block every
+  candidate, and returns `NO_ELIGIBLE_QUERY` only when no admitted candidate
+  remains. The 16-country scheduler owns global country rotation, so the
+  per-country cap is 1 per call.
 - New truthful strategies are `UCB_EXPLOITATION`, `UCB_PORTFOLIO`,
   `COLD_START_GENERATION` and `NEIGHBORHOOD_TARGETED`; `selectionStrategy`
   remains string-compatible downstream.
@@ -119,6 +125,9 @@ touched.
 - `getQueryQualityRunRows` excludes provider-failed runs and
   `country_outcome='REJECTED'` sightings.
 - `rewardRate` excludes failed runs, provider-degraded runs and zero-quota runs.
+  Promotion and hierarchy learning use the same rule: a zero-quota (free or
+  paid-provider) run cannot supply a promotion sample or stratum count for a
+  per-100-quota rate it never paid for.
 
 ### Q6 — operator surface
 
@@ -200,9 +209,9 @@ touched.
 | Hierarchy | new surface inherits family prior; no cross-country leakage | posterior hierarchy tests + isolation tests | PASS |
 | Cold start | all 16 countries get valid candidates; cold-start recorded | 123/123 planner matrix; `COLD_START_GENERATION` | PASS |
 | Exploration | 10–20% (default 15%); per-country floor; family/query/source caps | `Q4: portfolio budget…`; selector cap fixtures | PASS |
-| Non-domination | no family/query/source over cap | selector `capReason` hard filter + cap fixture | PASS |
+| Non-domination | no family/query/source over the active cap; caps relax only when they would block every candidate | selector cap filter + cap fixtures | PASS |
 | Non-stationarity | decayed counts; halved yield demoted | 30-day decay + non-stationary simulator | PASS |
-| Duplicate | semantic duplicates suppressed before quota; duplicate-heavy demoted | duplicate tests + `DUPLICATE_SATURATED` promotion guard | PASS |
+| Duplicate | semantic duplicates suppressed before quota; one stable winner per persisted duplicate group; duplicate-heavy demoted | duplicate tests + `DUPLICATE_SATURATED` promotion guard | PASS |
 | Offline comparison | 100 seeds × 8 scenarios; report yield, coverage, zero-yield, distinct arms, top-10/HHI, max family/country share | §3.3 | PASS (structural, not causal) |
 
 ## 3. Validation results
@@ -257,7 +266,9 @@ or two surfaces per family, hierarchical true rates, finite shared creator
 pools, 100/200/300 quota units, a common 15% portfolio and a common 15% family
 share cap. The 15% family cap is a common stress-test constraint for every
 selector, not the serving default; serving caps are configured separately and
-measured against `max(candidate spend, daily quota units)`. The simulator is
+measured against `max(candidate spend, daily quota units)`, with an achievable
+`1/n` floor and a bounded relaxation when every candidate would otherwise be
+capped. The simulator is
 deterministic and offline; it is not a serving path and not causal evidence.
 
 | Scenario | Selector | Yield /100 | Coverage | Zero-yield | Distinct arms | Top-10 share | Max family | Max country |

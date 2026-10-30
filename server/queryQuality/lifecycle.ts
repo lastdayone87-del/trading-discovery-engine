@@ -17,6 +17,11 @@ export interface SelectabilityInput {
   /** Recent normalized primary-term uses, including this query's history. */
   primaryTermUses?: number;
   maxPrimaryUses?: number;
+  /**
+   * Consecutive terminal query failures. Advisory diagnostics only: the
+   * time-bounded `backoffUntil` is the selectability gate, so a long streak
+   * can never become an un-clearable ban.
+   */
   consecutiveFailures?: number;
   backoffUntil?: string | null;
 }
@@ -34,6 +39,10 @@ const SEARCHABLE_COLLECTIONS = new Set(['PROVEN', 'EXPERIMENTAL']);
  * failure backoff are hard gates rather than score penalties. `REJECTED`
  * rows are never selectable, and a newly generated/just-executed query cannot
  * be re-executed in the same tick.
+ *
+ * A failure streak is a backoff, never a permanent ban: the persisted
+ * `backoffUntil` is bounded, and the next attempt either succeeds (resetting
+ * the streak) or fails again (persisting a new backoff).
  */
 export function isQuerySelectable(input: SelectabilityInput): SelectabilityDecision {
   const reasons: string[] = [];
@@ -61,7 +70,6 @@ export function isQuerySelectable(input: SelectabilityInput): SelectabilityDecis
   if (input.maxPrimaryUses !== undefined && (input.primaryTermUses || 0) >= input.maxPrimaryUses) {
     reasons.push('PRIMARY_TERM_DIVERSITY_CAP');
   }
-  if ((input.consecutiveFailures || 0) >= 3) reasons.push('REPEATED_FAILURE_BACKOFF');
 
   return { selectable: reasons.length === 0, reasonCodes: [...new Set(reasons)] };
 }
@@ -95,8 +103,10 @@ export function deriveQueryFailureState(
 
 export function classifyQueryBackoff(failureKind: string | undefined, now = new Date()): { failures: 0 | 1 | 2 | 3; backoffUntil: string | null; reasonCodes: string[] } {
   if (!failureKind) return { failures: 0, backoffUntil: null, reasonCodes: [] };
-  if (failureKind === 'PROVIDER_FAILURE' || failureKind === 'PROVIDER_CAPACITY') {
-    // Provider failure is not query negative quality: no query backoff.
+  if (failureKind === 'PROVIDER_FAILURE' || failureKind === 'PROVIDER_CAPACITY' || failureKind === 'ORPHANED_FAILED_JOB_STATE') {
+    // Provider/orchestration failure is not query negative quality: no query
+    // backoff. A job row that vanished is infrastructure state, not a signal
+    // that the query text itself is bad.
     return { failures: 0, backoffUntil: null, reasonCodes: ['PROVIDER_FAILURE_EXEMPT'] };
   }
   return {

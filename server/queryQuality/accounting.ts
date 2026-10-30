@@ -88,6 +88,16 @@ export function rewardRate(vector: QueryQualityVector): { eligible: boolean; rat
   return { eligible: true, rate: vector.confirmedNewCreatorsPer100Quota, reasonCodes: [] };
 }
 
+/**
+ * Promotion and hierarchy learning use the same reward denominator as serving
+ * and the dashboard. A zero-quota (Innertube or paid-provider) run cannot
+ * contribute creators to a per-100-quota rate it never paid for, so it must not
+ * supply a promotion sample either.
+ */
+export function isRewardEligibleQuota(quotaUnits: number): boolean {
+  return Number.isFinite(quotaUnits) && quotaUnits > 0;
+}
+
 /** Promotion/contamination guard: zero-confirm can never be PROVEN. */
 export function canPromoteToProven(input: {
   completedRuns: number;

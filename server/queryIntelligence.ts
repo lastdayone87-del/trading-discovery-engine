@@ -23,6 +23,8 @@ import { assertCountryAllowed } from './countryExclusion';
 import { isTerminologyKillSwitchActive, TERMINOLOGY_KILL_SWITCH_KEY } from './terminologyKillSwitch';
 import { planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, rotateAwayFromMostRecentIntent, reformulatePollutedQuery } from './queryPlanner';
 import { revalidateQueryRecordAdmission, type QueryRecordAdmission } from './queryQuality/admission';
+import { isRewardEligibleQuota } from './queryQuality/accounting';
+import { selectionHistoryFor } from './queryQuality/composition';
 import {
   DECAY_HALF_LIFE_DAYS,
   MAX_SELECTION_INDEX,
@@ -34,7 +36,7 @@ import {
   empiricalPrior,
   promotionQualityScore,
 } from './queryQuality/posterior';
-import { coverageCellFor, portfolioBudget, selectHierarchicalUcb } from './queryQuality/selector';
+import { coverageCellFor, portfolioBudget, buildHierarchy, selectHierarchicalUcb } from './queryQuality/selector';
 import { isQuerySelectable } from './queryQuality/lifecycle';
 import { getCountryMarketProfile } from './queryQuality/profiles';
 import type { DecayedArmCounts, SelectorCandidate, SelectorContext, SelectorDecision } from './queryQuality/types';
@@ -1238,12 +1240,25 @@ async function buildSelectorPool(
     spendById.set(row.queryId, (spendById.get(row.queryId) || 0) + row.quotaUnits * decayWeight(row.ageDays, DECAY_HALF_LIFE_DAYS));
   }
   const failureByQuery = new Map(failureStates.map(state => [state.queryId, state]));
-  const historyFor = (query: QueryRecord) => queries
-    .filter(other => other.id !== query.id)
-    .map(other => {
-      const aliasOf = other.generation_metadata?.aliasOf;
-      return { query: other.query, country: other.country, ...(typeof aliasOf === 'string' ? { aliasOf } : {}) };
-    });
+  // A persisted row can be a losing duplicate of an older row. Keep the
+  // deterministic oldest row as the group's winner and omit higher-id
+  // duplicates from its history; otherwise mutually duplicate rows suppress
+  // each other and neither can ever be selected. Losing rows still see the
+  // winner and remain rejected.
+  const historyEntries = queries.map(query => {
+    const aliasOf = query.generation_metadata?.aliasOf;
+    return {
+      id: query.id,
+      query: query.query,
+      country: query.country,
+      ...(typeof aliasOf === 'string' ? { aliasOf } : {}),
+    };
+  });
+  const historyEntryById = new Map(historyEntries.map(entry => [entry.id, entry]));
+  const historyFor = (query: QueryRecord) => {
+    const entry = historyEntryById.get(query.id) || { id: query.id, query: query.query, country: query.country };
+    return selectionHistoryFor(entry, historyEntries);
+  };
 
   const admissions = new Map<number, QueryRecordAdmission>();
   let eligible: QueryRecord[] = [];
@@ -1273,6 +1288,7 @@ async function buildSelectorPool(
 
   const familyQuota = new Map<string, number>();
   const sourceQuota = new Map<string, number>();
+  const hierarchyCandidates: SelectorCandidate[] = [];
   const candidates: SelectorCandidate[] = [];
   let totalQuota = 0;
   for (const query of queries) {
@@ -1286,6 +1302,10 @@ async function buildSelectorPool(
     familyQuota.set(family, (familyQuota.get(family) || 0) + spend);
     const source = admission?.source || 'UNKNOWN';
     sourceQuota.set(source, (sourceQuota.get(source) || 0) + spend);
+    // Hierarchy history covers every query in the accounting window, not only
+    // the executable survivors. A cooling-down or share-capped sibling still
+    // informs its family/country/market/language prior for the next surface.
+    hierarchyCandidates.push(buildSelectorCandidate(query, admissionInfo, admission, counts));
   }
   for (const query of eligible) {
     const admissionInfo = admissions.get(query.id);
@@ -1302,6 +1322,7 @@ async function buildSelectorPool(
   const share = (rows: Map<string, number>, key: string): number => (rows.get(key) || 0) / shareBase;
   const familyShare = Object.fromEntries([...familyQuota.keys()].map(key => [key, share(familyQuota, key)]));
   const sourceShare = Object.fromEntries([...sourceQuota.keys()].map(key => [key, share(sourceQuota, key)]));
+  const hierarchy = buildHierarchy(hierarchyCandidates);
   const coverageCells = [...new Set(candidates.map(coverageCellFor))];
   const coveredCells = [...new Set(candidates.filter(candidate => candidate.counts.runs > 0).map(coverageCellFor))];
   const context: SelectorContext = {
@@ -1325,6 +1346,7 @@ async function buildSelectorPool(
     sourceCap: options.sourceCap,
     prior,
     halfLifeDays: DECAY_HALF_LIFE_DAYS,
+    hierarchy,
     coverageCells,
     coveredCells,
   };
@@ -1555,7 +1577,7 @@ export async function evaluateQueryPerformance(
   let promotionGuard: QueryPromotionGuard | undefined;
   if (performanceScore >= 60) {
     const priorRows = (await getQueryQualityRunRows(queryRecord.country))
-      .filter(row => row.queryId === queryRecord.id);
+      .filter(row => row.queryId === queryRecord.id && isRewardEligibleQuota(row.quotaUnits));
     // Use the run's own sighting truth: confirmed/quality are intersections
     // of persisted, globally-new, non-rejected, confirmed channels. The
     // aggregate counters can independently contain known confirmed traders
@@ -1569,7 +1591,13 @@ export async function evaluateQueryPerformance(
       quotaUnits: Math.max(0, attribution.quotaConsumed || 0) / 100,
       ageDays: 0,
     };
-    const counts = decayArmCounts([...priorRows, currentRun], DECAY_HALF_LIFE_DAYS);
+    // Zero-quota runs are excluded from serving history, hierarchy learning
+    // and the dashboard reward rate. They must not supply a promotion sample:
+    // otherwise a free run could raise the per-100-quota LCB to PROVEN.
+    const promotionRows = isRewardEligibleQuota(currentRun.quotaUnits)
+      ? [...priorRows, currentRun]
+      : priorRows;
+    const counts = decayArmCounts(promotionRows, DECAY_HALF_LIFE_DAYS);
     const posterior = computePosterior(counts, empiricalPrior([counts], 0.05, 2), {}, SELECTOR_C, MAX_SELECTION_INDEX);
     promotionGuard = {
       completedRuns: counts.runs,

@@ -12,6 +12,7 @@ import {
 import type {
   ArmPosterior,
   DecayedArmCounts,
+  SelectionHierarchy,
   SelectorCandidate,
   SelectorContext,
   SelectorDecision,
@@ -39,13 +40,7 @@ export function coverageCellFor(candidate: SelectorCandidate): string {
   return [candidate.country, candidate.language, candidate.market, candidate.compositionFamily].join('|');
 }
 
-export function buildHierarchy(candidates: SelectorCandidate[]): {
-  total: DecayedArmCounts;
-  family: Record<string, DecayedArmCounts>;
-  country: Record<string, DecayedArmCounts>;
-  market: Record<string, DecayedArmCounts>;
-  language: Record<string, DecayedArmCounts>;
-} {
+export function buildHierarchy(candidates: SelectorCandidate[]): SelectionHierarchy {
   const total = emptyCounts();
   const family: Record<string, DecayedArmCounts> = {};
   const country: Record<string, DecayedArmCounts> = {};
@@ -85,12 +80,15 @@ function shareOf(share: Record<string, number>, key: string): number {
 }
 
 function capReason(candidate: SelectorCandidate, context: SelectorContext): string | null {
-  if (shareOf(context.familyShare, candidate.compositionFamily) >= context.familyCap) return 'FAMILY_SHARE_CAP';
-  if (shareOf(context.countryShare, candidate.country) >= context.countryCap) return 'COUNTRY_SHARE_CAP';
+  // A share exactly at its cap is at the limit, not over it. This matters for
+  // balanced pools: two equally sized families are both exactly 1/2, which
+  // must remain selectable when the effective cap is 1/2.
+  if (shareOf(context.familyShare, candidate.compositionFamily) > context.familyCap) return 'FAMILY_SHARE_CAP';
+  if (shareOf(context.countryShare, candidate.country) > context.countryCap) return 'COUNTRY_SHARE_CAP';
   // Source share is keyed by the source recorded in admission; direct
   // candidates without admission are treated as the conservative "UNKNOWN".
   const source = candidate.admission?.source || 'UNKNOWN';
-  if (shareOf(context.sourceShare, source) >= context.sourceCap) return 'SOURCE_SHARE_CAP';
+  if (shareOf(context.sourceShare, source) > context.sourceCap) return 'SOURCE_SHARE_CAP';
   return null;
 }
 
@@ -122,19 +120,67 @@ function deterministicTieBreak(a: CandidateScore, b: CandidateScore, context: Se
  * Deterministic hierarchical, cost-aware UCB selection.
  *
  * - `selectionIndex = posterior mean + c * posterior SD`, capped.
- * - Cooldown/admission/caps are hard filters (callers pass the already
- *   selectable pool and current admissions).
+ * - Cooldown/admission are hard filters; family/source share caps are
+ *   diversity preferences that relax (family first, then source) only when
+ *   they would otherwise leave no selectable candidate.
  * - A bounded portfolio covers cold starts, unseen valid compositions and
  *   coverage deficits; it is a reserved floor, not a random branch.
  * - No Math.random, no least-executed-first, no unscored fallback.
  */
 export function selectHierarchicalUcb(candidates: SelectorCandidate[], context: SelectorContext): SelectorDecision {
   const c = Number.isFinite(context.c) ? context.c : SELECTOR_C;
-  const eligible = candidates.filter(candidate =>
+  const admitted = candidates.filter(candidate =>
     (!candidate.admission || candidate.admission.eligible)
     && candidate.collection !== 'REJECTED'
-    && capReason(candidate, context) === null
   );
+  // A homogeneous pool (one family or one source) has a share of 1.0, and an
+  // evenly split pool has shares of exactly 1/n. Without a floor of 1/n the
+  // configured 0.45/0.60 caps exclude every candidate forever once spend is
+  // normalized against the accounting base. The floor cannot make a diverse
+  // pool over-spend: it only guarantees the cap is achievable by the families
+  // and sources that actually have admitted candidates.
+  const familyCount = new Set(admitted.map(candidate => candidate.compositionFamily)).size;
+  const sourceCount = new Set(admitted.map(candidate => candidate.admission?.source || 'UNKNOWN')).size;
+  const familyCap = familyCount > 0 ? Math.max(context.familyCap, 1 / familyCount) : context.familyCap;
+  const sourceCap = sourceCount > 0 ? Math.max(context.sourceCap, 1 / sourceCount) : context.sourceCap;
+  const capped = (
+    familyCapValue: number,
+    sourceCapValue: number,
+  ): SelectorCandidate[] => {
+    const cappedContext = { ...context, familyCap: familyCapValue, sourceCap: sourceCapValue };
+    return admitted.filter(candidate => capReason(candidate, cappedContext) === null);
+  };
+  let activeFamilyCap = familyCap;
+  let activeSourceCap = sourceCap;
+  let eligible = capped(activeFamilyCap, activeSourceCap);
+  // Family and source caps are diversity preferences, not a permanent halt.
+  // An L-shaped spend split (for example family A source X, family A source Y,
+  // family B source X) can still leave every candidate over one of the two
+  // caps even when each cap is individually achievable. Relax family first,
+  // then source, then both, so selection always proceeds while the strongest
+  // cap that leaves work available remains in force.
+  if (eligible.length === 0 && admitted.length > 0) {
+    const familyRelaxed = capped(Number.POSITIVE_INFINITY, activeSourceCap);
+    if (familyRelaxed.length > 0) {
+      eligible = familyRelaxed;
+      activeFamilyCap = Number.POSITIVE_INFINITY;
+    }
+  }
+  if (eligible.length === 0 && admitted.length > 0) {
+    const sourceRelaxed = capped(activeFamilyCap, Number.POSITIVE_INFINITY);
+    if (sourceRelaxed.length > 0) {
+      eligible = sourceRelaxed;
+      activeSourceCap = Number.POSITIVE_INFINITY;
+    }
+  }
+  if (eligible.length === 0 && admitted.length > 0) {
+    eligible = capped(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
+    activeFamilyCap = Number.POSITIVE_INFINITY;
+    activeSourceCap = Number.POSITIVE_INFINITY;
+  }
+  // Keep the effective caps used for filtering in the context so the final
+  // fail-closed guard below cannot disagree with the selected pool.
+  context = { ...context, familyCap: activeFamilyCap, sourceCap: activeSourceCap };
   const base: Omit<SelectorDecision, 'strategy' | 'reason' | 'queryId' | 'query' | 'index' | 'posterior' | 'tier' | 'compositionFamily' | 'reasonCodes'> = {
     version: SELECTOR_POLICY_VERSION,
     country: context.country,
@@ -164,7 +210,7 @@ export function selectHierarchicalUcb(candidates: SelectorCandidate[], context: 
     };
   }
 
-  const hierarchy = buildHierarchy(eligible);
+  const hierarchy = context.hierarchy ?? buildHierarchy(eligible);
   const scored: CandidateScore[] = eligible.map(candidate => {
     const posterior = computePosterior(candidate.counts, context.prior, hierarchyFor(candidate, hierarchy), c, context.maxIndex ?? MAX_SELECTION_INDEX);
     return { candidate, posterior, index: Math.min(context.maxIndex ?? MAX_SELECTION_INDEX, posterior.ucb), coverageCell: coverageCellFor(candidate) };

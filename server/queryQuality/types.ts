@@ -130,6 +130,20 @@ export interface DecayedArmCounts {
   runs: number;
 }
 
+/**
+ * Decayed stratum totals for empirical-Bayes partial pooling. Built from every
+ * query in the country's accounting window, including cooling-down, rotated,
+ * share-capped and otherwise unselectable rows, so a new surface inherits its
+ * family/country/market/language history instead of the general prior.
+ */
+export interface SelectionHierarchy {
+  total: DecayedArmCounts;
+  family: Record<string, DecayedArmCounts>;
+  country: Record<string, DecayedArmCounts>;
+  market: Record<string, DecayedArmCounts>;
+  language: Record<string, DecayedArmCounts>;
+}
+
 export interface HierarchicalPrior {
   /** Weak global rate prior (creators per 100 quota). */
   mean: number;
@@ -181,6 +195,11 @@ export interface SelectorContext {
   sourceCap: number;
   prior: HierarchicalPrior;
   halfLifeDays: number;
+  /**
+   * Stratum totals over every query in the accounting window. When absent the
+   * selector falls back to the executable candidate set (unit-test callers).
+   */
+  hierarchy?: SelectionHierarchy;
   /** Country x language x market x term-class x family coverage matrix. */
   coverageCells?: string[];
   coveredCells?: string[];

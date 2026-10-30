@@ -65,6 +65,41 @@ export function isSemanticDuplicate(query: string, history: Array<{ query: strin
   });
 }
 
+export interface SelectionHistoryRecord {
+  id: number;
+  query: string;
+  country: string;
+  aliasOf?: string;
+}
+
+/**
+ * Duplicate-suppression history for an already-persisted query.
+ *
+ * Producers persist a row even when admission marks it SEMANTIC_DUPLICATE (the
+ * row stays for audit), so two mutually duplicate rows can both exist. Passing
+ * every other row makes them suppress each other forever. The deterministic
+ * lowest-id row of a duplicate group is the stable winner: higher-id duplicate
+ * rows are omitted from that winner's history, while the losing rows still see
+ * the winner and stay rejected.
+ */
+export function selectionHistoryFor(
+  query: SelectionHistoryRecord,
+  all: SelectionHistoryRecord[],
+): Array<{ query: string; country: string; aliasOf?: string }> {
+  const history: Array<{ query: string; country: string; aliasOf?: string }> = [];
+  for (const other of all) {
+    if (other.id === query.id) continue;
+    const entry = {
+      query: other.query,
+      country: other.country,
+      ...(other.aliasOf ? { aliasOf: other.aliasOf } : {}),
+    };
+    if (other.id > query.id && isSemanticDuplicate(query.query, [entry], query.country)) continue;
+    history.push(entry);
+  }
+  return history;
+}
+
 /**
  * Q0 applies to learned/extracted terminology. Curated, country-vocabulary and
  * organic surfaces are already admitted by their producer contract (Q1
