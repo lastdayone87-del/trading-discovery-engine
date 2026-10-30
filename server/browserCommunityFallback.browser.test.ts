@@ -203,17 +203,18 @@ test('real DOM: structural classification uses visible text and aria-label only'
     <span id="menu-heading">Main menu</span>
     <button aria-label="Open menu">☰</button>
     <a href="/tools" role="menuitem">Tools</a>
+    <div role="menu"><a href="/products">Products</a></div>
   </body></html>`;
   await withControlPage(html, async page => {
     const enumeration = await enumeratePageControls(page);
     assert.equal(
       enumeration.structuralNavigation,
-      2,
-      'aria-label menu and role=menuitem are structural; title and aria-labelledby text are not',
+      3,
+      'aria-label menu, role=menuitem, and a descendant of role=menu are structural; title and aria-labelledby text are not',
     );
     assert.equal(
       enumeration.structuralHintRejected,
-      2,
+      3,
       'the visible Support link is hint-matched, and aria-labelledby text cannot force a generic control into the structural gap',
     );
     assert.equal(enumeration.iconLabelRecovered, 1, 'aria-labelledby still contributes to icon-label recovery measurement');
