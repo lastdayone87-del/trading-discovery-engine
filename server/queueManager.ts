@@ -2124,6 +2124,7 @@ export async function inspectAndValidateChannel(
       // invite is a fallback, not a reason to suppress a stronger later invite.
       let selected:Awaited<ReturnType<typeof validateDiscordInvite>>|null=null,selectedCandidate= candidates[0],selectedRank=-1;
       const terminalInvalid:Array<{validation:Awaited<ReturnType<typeof validateDiscordInvite>>;candidate:typeof selectedCandidate}>=[];
+      let currentCandidateNonTrading=false;
       for(const candidate of candidates){
         if(!candidate.nativeInviteCode)continue;
         const locator=candidate.normalizedLocator||`https://discord.gg/${candidate.nativeInviteCode}`;
@@ -2148,6 +2149,7 @@ export async function inspectAndValidateChannel(
         });
         await appendDiscordCheckAttempts(channel.channel_id,validation.candidateInviteUrl,validation.status,validation.attempts,{candidateId:candidate.candidateId,rawLocator:candidate.rawLocator,locatorType:candidate.locatorType,resolvedLocator:validation.candidateInviteUrl,sourceSurface:candidate.sourceSurface,sourceUrl:candidate.sourceUrl});
         if(validation.operationalOutcome==='CONFIRMED_INVALID'){terminalInvalid.push({validation,candidate});continue;}
+        if(validation.operationalOutcome==='SUCCEEDED'&&validation.status==='NON_TRADING'&&isSameSelectedDiscordCandidate(channel,candidate))currentCandidateNonTrading=true;
         const rank=discordCandidateCompositeRank(candidate,validation);
         if(rank>selectedRank){selected=validation;selectedCandidate=candidate;selectedRank=rank;}
       }
@@ -2155,8 +2157,10 @@ export async function inspectAndValidateChannel(
       if(!selected)throw new Error('No resolvable native Discord candidate was available for validation');
       // The projection may retain the currently served invite when this scan's
       // winner is ambiguous. That is only valid if the current candidate was
-      // not itself confirmed invalid earlier in this same scan.
-      const currentCandidateConfirmedInvalid=terminalInvalid.some(entry=>isSameSelectedDiscordCandidate(channel,entry.candidate));
+      // not itself definitively rejected (confirmed invalid or non-trading)
+      // earlier in this same scan.
+      const currentCandidateRejected=currentCandidateNonTrading
+        ||terminalInvalid.some(entry=>isSameSelectedDiscordCandidate(channel,entry.candidate));
       const shouldProjectValidation=canProjectDiscordValidation(channel,selected,selectedCandidate);
       if(shouldProjectValidation){
         // Project first, then select the candidate that the projection actually
@@ -2164,7 +2168,7 @@ export async function inspectAndValidateChannel(
         // the ambiguous winner is a different candidate; selecting the winner
         // unconditionally would leave `discord_candidates.selected` pointing at
         // an invite the channel does not serve.
-        const projectedDiscord=projectDiscordValidation(channel,selected,selectedCandidate,{currentCandidateConfirmedInvalid});
+        const projectedDiscord=projectDiscordValidation(channel,selected,selectedCandidate,{currentCandidateRejected});
         Object.assign(channel,projectedDiscord);
         discordValidationProjected=true;
         if(projectedDiscord.discord_candidate_id)await selectDiscordCandidate(channel.channel_id,projectedDiscord.discord_candidate_id);

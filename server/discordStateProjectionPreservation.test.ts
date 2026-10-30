@@ -312,9 +312,31 @@ test('A1 ambiguous success cannot retain a candidate confirmed invalid in the sa
   });
 
   assert.equal(hasServingLastKnownGoodDiscordInvite(channel), true);
-  Object.assign(channel, projectDiscordValidation(channel, ambiguous, ambiguousCandidate, { currentCandidateConfirmedInvalid: true }));
+  Object.assign(channel, projectDiscordValidation(channel, ambiguous, ambiguousCandidate, { currentCandidateRejected: true }));
 
   assert.equal(channel.discord_invite, null, 'the confirmed-invalid invite must not keep serving');
+  assert.equal(channel.discord_status, 'UNCERTAIN');
+  assert.equal(channel.discord_candidate_id, ambiguousCandidate.candidateId);
+  assert.equal(channel.discord_relevance_status, 'UNCERTAIN');
+});
+
+test('A1 ambiguous success cannot retain a candidate confirmed non-trading in the same scan', () => {
+  const channel = cbrackn() as any;
+  const ambiguousCandidate = candidateFor('ambigOther');
+  const ambiguous = validation({
+    status: 'UNCERTAIN',
+    inviteUrl: null,
+    candidateInviteUrl: 'https://discord.gg/ambigOther',
+    operationalOutcome: 'SUCCEEDED',
+    livenessStatus: 'ACTIVE',
+    relevanceStatus: 'UNCERTAIN',
+    validationStatus: 'SUCCEEDED',
+  });
+
+  assert.equal(hasServingLastKnownGoodDiscordInvite(channel), true);
+  Object.assign(channel, projectDiscordValidation(channel, ambiguous, ambiguousCandidate, { currentCandidateRejected: true }));
+
+  assert.equal(channel.discord_invite, null, 'a non-trading current invite must not keep serving');
   assert.equal(channel.discord_status, 'UNCERTAIN');
   assert.equal(channel.discord_candidate_id, ambiguousCandidate.candidateId);
   assert.equal(channel.discord_relevance_status, 'UNCERTAIN');
@@ -433,8 +455,8 @@ test('pipeline and queue delegate Discord preservation to the shared guards', ()
   assert.doesNotMatch(pipeline, /withheldChannel\.discord_invite=preservedDiscordState\?\.discord_invite\?\?null/);
 
   assert.match(queue, /const shouldProjectValidation=canProjectDiscordValidation\(channel,selected,selectedCandidate\);/);
-  assert.match(queue, /const currentCandidateConfirmedInvalid=terminalInvalid\.some\(entry=>isSameSelectedDiscordCandidate\(channel,entry\.candidate\)\);/);
-  assert.match(queue, /const projectedDiscord=projectDiscordValidation\(channel,selected,selectedCandidate,\{currentCandidateConfirmedInvalid\}\);/);
+  assert.match(queue, /const currentCandidateRejected=currentCandidateNonTrading\s*\|\|terminalInvalid\.some\(entry=>isSameSelectedDiscordCandidate\(channel,entry\.candidate\)\);/);
+  assert.match(queue, /const projectedDiscord=projectDiscordValidation\(channel,selected,selectedCandidate,\{currentCandidateRejected\}\);/);
   assert.match(queue, /if\(projectedDiscord\.discord_candidate_id\)await selectDiscordCandidate\(channel\.channel_id,projectedDiscord\.discord_candidate_id\);/);
   assert.match(queue, /discordValidationProjected=true;/);
   assert.match(queue, /await upsertChannel\(channel,\{freshDiscordValidation:discordValidationProjected\}\);/);

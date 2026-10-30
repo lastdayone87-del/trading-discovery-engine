@@ -194,14 +194,15 @@ export function projectDiscordValidation(
   current:ChannelRecord,
   validation:DiscordValidationResult,
   candidate:DiscordCandidate,
-  options?:{currentCandidateConfirmedInvalid?:boolean},
+  options?:{currentCandidateRejected?:boolean},
 ):DiscordProjection{
   const effective=applyCreatorAssociationToDiscordValidation(current,validation,candidate);
   // Retention is only safe while the currently served candidate is still
   // credible. A confirmed-invalid result for that same candidate in this scan
   // is definitive evidence that the retained invite must not keep serving,
-  // even if a different candidate's lookup was merely ambiguous.
-  const canRetainAmbiguous=!options?.currentCandidateConfirmedInvalid
+  // even if a different candidate's lookup was merely ambiguous. A
+  // non-trading result for the same candidate is equally terminal.
+  const canRetainAmbiguous=!options?.currentCandidateRejected
     &&(hasServingLastKnownGoodDiscordInvite(current)||hasRetainedLastKnownGoodDiscordInvite(current));
   if(isAmbiguousSuccessfulDiscordValidation(effective)&&canRetainAmbiguous){
     return {
