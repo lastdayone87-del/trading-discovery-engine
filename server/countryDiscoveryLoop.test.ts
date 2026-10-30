@@ -357,7 +357,7 @@ test('A2: repeated free-signal refresh is cache-idempotent and does not refetch'
     const wikidataUrl = new URL(urls[1]);
     assert.equal(wikiUrl.host, 'de.wikipedia.org');
     assert.equal(wikiUrl.searchParams.get('srsearch'), 'Germany Börse Handel');
-    assert.equal(wikidataUrl.searchParams.get('search'), 'Germany Börse Handel');
+    assert.equal(wikidataUrl.searchParams.get('search'), 'Börse');
     assert.equal(wikidataUrl.searchParams.get('language'), 'de');
     assert.equal(wikidataUrl.searchParams.get('uselang'), 'de');
 
@@ -775,6 +775,25 @@ test('P2b: pre-v2 legacy rows never invent v2 streaks', () => {
   ]);
   assert.deepEqual(mixed, { lowValue: 1, duplicateHeavy: 0, wrongCountry: 0 },
     'reconstruction stops at the first legacy page');
+});
+
+test('P2c: exploration continuation is not a productive page and cannot reset the low-value stop', () => {
+  assert.deepEqual(
+    countTrailingContinuationStreaks([
+      { reasonCodes: ['CONTINUE_EXPLORATION', 'ZERO_CONFIRMED_VALUE'] },
+      { reasonCodes: ['CONTINUE_GRACE'] },
+    ]),
+    { lowValue: 2, duplicateHeavy: 0, wrongCountry: 0 },
+  );
+  const secondLowExplorationPage = evaluateContinuationV2({
+    ...lowValuePage,
+    pageNumber: 2,
+    priorLowValueStreak: 1,
+    explorationPagesRemaining: 5,
+    queryMode: 'EXPLORATION',
+  });
+  assert.equal(secondLowExplorationPage.shouldContinue, false);
+  assert.equal(secondLowExplorationPage.primaryReason, 'MARGINAL_VALUE_LOW');
 });
 
 test('P3: duplicate-heavy ratio alone does not stop a page with new creators', () => {
@@ -1200,6 +1219,15 @@ test('P16: a creator seen on pages 1 and 2 is counted once with a cross-page rep
   assert.match(sql, /MIN\(s\.page_number\) AS first_page/);
   assert.match(sql, /fs\.first_page <= \$2/);
   assert.match(sql, /fs\.first_page < \$2 AND ps\.channel_id IS NOT NULL/);
+  // A fresh but unpersisted (for example country-rejected) candidate is not
+  // productive: only a persisted first sighting can extend the run.
+  assert.match(sql, /BOOL_OR\(s\.persisted AND NOT s\.was_known\) AS was_new/);
+  const { getAutonomousContinuationState } = await import('./autonomousPageStore');
+  await getAutonomousContinuationState('run-1', 3, runner as never);
+  const streakCall = runner.calls.find(call => call.text.includes('page_number < $2'));
+  assert.ok(streakCall, 'continuation state reads persisted page observations');
+  assert.deepEqual(streakCall.params, ['run-1', 3]);
+  assert.match(streakCall.text, /WHERE query_run_id=\$1 AND page_number < \$2/);
   // Run metrics must use the persisted cumulative unique count, not the sum
   // of overlapping per-page distinct populations.
   const pageStore = serverSource('autonomousPageStore.ts');
@@ -1255,6 +1283,21 @@ test('P17: the 50-page safety ceiling preserves a resumable linked segment', () 
   const segmentFn = dbCore.slice(segmentFnStart, segmentFnEnd);
   assert.doesNotMatch(segmentFn, /runQuotaBudgetUnits/);
   assert.match(segmentFn, /'SCHEDULED',now\(\),0,\$2,\$3,0,0,'RUNNING',\$4,\$1,\$5,requested_page_depth/);
+  // The parent stays active until its real completion. Marking it COMPLETED
+  // inside segment creation would make completeQueryRun a silent no-op and
+  // permanently strand the child when enqueue later fails.
+  assert.doesNotMatch(segmentFn, /status='COMPLETED'/);
+  assert.match(dbCore, /export async function setQueryRunJobId/);
+  // Create/link -> enqueue -> persist child job_id -> complete parent. A
+  // transient enqueue failure must leave the parent retryable instead of
+  // losing the continuation behind an immutable completed row.
+  const segmentCall = queue.indexOf('const segment = await createContinuationRunSegment({');
+  const childEnqueue = queue.indexOf('const childJob = await enqueueJob(', segmentCall);
+  const childJobLink = queue.indexOf('await setQueryRunJobId(segment.childRunId, childJob.id)', childEnqueue);
+  const parentComplete = queue.indexOf('await completeQueryRun(queryRunId, {', childJobLink);
+  assert.ok(segmentCall > 0 && childEnqueue > segmentCall, 'child is enqueued after creation');
+  assert.ok(childJobLink > childEnqueue && parentComplete > childJobLink, 'parent completes last');
+  assert.match(queue, /idempotencyKey: `search-run:\$\{segment\.childRunId\}:page:1`/);
   assert.match(dbCore, /continued_from_run_id/);
   assert.match(dbCore, /continued_to_run_id/);
   assert.match(dbCore, /continuation_segment/);
@@ -1263,6 +1306,29 @@ test('P17: the 50-page safety ceiling preserves a resumable linked segment', () 
   const migration = migration161();
   assert.match(migration, /ADD COLUMN IF NOT EXISTS effective_binding_bound TEXT/);
   assert.match(migration, /effective_binding_bound IN \('SAFETY', 'PROVIDER', 'RUN_BUDGET', 'TREATMENT', 'TRIAL'\)/);
+});
+
+test('P18: migration 161 allows only continuation metadata to change on a completed run', () => {
+  const migration = migration161();
+  const triggerAt = migration.indexOf('CREATE OR REPLACE FUNCTION reject_completed_query_run_mutation');
+  const backfillAt = migration.indexOf('UPDATE query_runs', triggerAt);
+  assert.ok(triggerAt > 0 && backfillAt > triggerAt, 'allowlist must be installed before the completed-row backfill');
+  assert.match(migration, /continuation_columns CONSTANT text\[\] := ARRAY\[/);
+  for (const column of [
+    'continuation_status', 'deferred_until', 'last_page_at', 'exploration_pages_remaining',
+    'effective_max_pages', 'effective_binding_bound', 'resume_count', 'resume_rewalk_count',
+    'continued_from_run_id', 'continued_to_run_id', 'continuation_segment',
+    'next_page_token', 'resume_mode',
+  ]) {
+    assert.ok(migration.includes(`'${column}'`), `${column} must be on the continuation allowlist`);
+  }
+  assert.match(
+    migration,
+    /to_jsonb\(OLD\) - continuation_columns\) IS DISTINCT FROM \(to_jsonb\(NEW\) - continuation_columns\)/,
+    'any non-continuation column change must still raise',
+  );
+  assert.match(migration, /IF TG_OP = 'DELETE' THEN[\s\S]*?RAISE EXCEPTION 'completed query_runs are immutable'/,
+    'deleting a completed run stays forbidden');
 });
 
 // ---------------------------------------------------------------------------
@@ -1402,6 +1468,24 @@ test('T7: two independent external sources/families validate; a single source or
   assert.match(terminology, /AND canonical_concept = ANY\(\$2::text\[\]\)/);
   assert.ok(!/lower\(btrim\(regexp_replace\(normalize\(original_surface, NFKC\)/.test(terminology), 'SQL surface matching must not depend on database lower() collation');
   assert.match(migration161(), /idx_external_osint_surface_country[\s\S]*?\(country, canonical_concept, observed_at DESC\)/);
+});
+
+test('T7b: an undetermined target language fails closed for external corroboration', () => {
+  const now = new Date('2026-10-26T00:00:00Z');
+  const rows = [
+    { sourceId: 's1', sourceFamily: 'PUBLICATION', correlationKey: 'a', observedAt: '2026-10-25T00:00:00Z', confidence: 0.9, reliability: 0.9, relevance: 0.9, surface: 'Charttechnik', language: 'de', script: 'LATIN' },
+    { sourceId: 's2', sourceFamily: 'PUBLIC_COMMUNITY', correlationKey: 'b', observedAt: '2026-10-25T00:00:00Z', confidence: 0.8, reliability: 0.8, relevance: 0.8, surface: 'Charttechnik', language: 'de', script: 'LATIN' },
+  ];
+  for (const language of [undefined, null, '', 'und', 'UND']) {
+    const result = evaluateExternalTermEvidence({
+      term: 'Charttechnik', aliases: [], language, script: 'LATIN', rows, now,
+    });
+    assert.equal(result.eligible, false, `language ${String(language)} must not match by default`);
+    assert.deepEqual(result.reasons, ['NO_MATCHING_LOCAL_SURFACE']);
+  }
+  assert.equal(evaluateExternalTermEvidence({
+    term: 'Charttechnik', aliases: [], language: 'de', script: 'LATIN', rows, now,
+  }).eligible, true);
 });
 
 test('T8: two native plus one external validates; one native plus one external does not', () => {
@@ -1809,6 +1893,22 @@ test('E5: identical creator metadata re-ingested is one logical AI request with 
   assert.equal(skipped.reason, 'IDEMPOTENT_SUCCEEDED');
 });
 
+test('E5b: an expired reservation with a stored response replays before any paid re-admission', () => {
+  const dbCore = serverSource('dbCore.ts');
+  const start = dbCore.indexOf('export async function reserveNativeVocabularyAiRun');
+  const end = dbCore.indexOf('\nexport ', start + 10);
+  const fn = dbCore.slice(start, end > start ? end : undefined);
+  const replayAt = fn.indexOf("existingRow?.status === 'RESERVED' && existingRow.responsePayload");
+  const reclaimAt = fn.indexOf("existingRow?.status === 'RESERVED' && (existingRow.leaseExpiresAt");
+  assert.ok(replayAt > 0, 'stored-response replay branch must exist');
+  assert.ok(reclaimAt > replayAt, 'expiry reclaim must not run before the replay check');
+  assert.match(fn.slice(replayAt, reclaimAt), /replayPayload: existingRow\.responsePayload/);
+  assert.match(fn.slice(replayAt, reclaimAt), /reason: 'REPLAY_RESPONSE'/);
+  // The replay rotates the fencing lease but never clears the durable output.
+  assert.match(fn.slice(replayAt, reclaimAt), /SET lease_token=\$2, lease_expires_at=/);
+  assert.doesNotMatch(fn.slice(replayAt, reclaimAt), /response_payload=NULL/);
+});
+
 test('E6: absent/OFF discovery_extraction_enabled never invokes the staging pipeline', async () => {
   const summary = await maybeRunDiscoveryEvidenceExtraction(
     { channelId: 'ch-1', fallbackCountry: 'Germany' },
@@ -1848,13 +1948,26 @@ test('Q1: every configured active country gets a turn and unselected dormant cou
 
 test('Q2: a deferred continuation is scheduled before a new query', () => {
   const producer = serverSource('autonomousDiscovery.ts');
-  const resumeAt = producer.indexOf('resumeOrphanedAutonomousPages({ force: true })');
   const snapshotAt = producer.indexOf('const snapshot = await reconcileYouTubeQuotaRolloverAndGetAutonomousSnapshot(now)');
-  assert.ok(resumeAt > 0 && snapshotAt > resumeAt, 'resume sweep runs before the queue snapshot');
+  const resumeAt = producer.indexOf('resumeOrphanedAutonomousPages({ force: true, maxEnqueued: headroom })');
+  const capacityAt = producer.indexOf('const calculatedCapacity = calculateDiscoveryCapacity({');
+  assert.ok(snapshotAt > 0 && resumeAt > snapshotAt && capacityAt > resumeAt,
+    'the reconciled snapshot precedes the resume sweep, which precedes capacity');
+  assert.match(producer, /const headroom = Math\.max\(0, config\.targetQueueDepth - snapshot\.queueDepth\)/);
+  // Resumed pages must count toward the queue watermark used by capacity, or
+  // a full continuation sweep could still be crowded out by fresh queries.
+  assert.match(producer, /currentQueueDepth: snapshot\.queueDepth \+ resumedPages/);
+  assert.doesNotMatch(producer, /getAutonomousSchedulingSnapshot/);
   assert.ok(AUTONOMOUS_CONTINUATION_JOB_PRIORITY > AUTONOMOUS_NEW_QUERY_JOB_PRIORITY);
   const plan = planContinuationResume([{ country: 'Germany', runId: 'g1' }], 0, 15);
   assert.deepEqual(plan.selected.map(run => run.runId), ['g1']);
+  // Queue headroom bounds the forced sweep. At most one page is enqueued per
+  // selected country, so a zero-headroom sweep must select nothing.
+  assert.deepEqual(planContinuationResume([{ country: 'Germany', runId: 'g1' }], 0, 15, 0).selected, []);
   const queue = serverSource('queueManager.ts');
+  assert.match(queue, /maxEnqueued\?: number/);
+  assert.match(queue, /const maxEnqueued = options\.maxEnqueued === undefined/);
+  assert.match(queue, /Math\.min\(sweepCountryLimit, maxEnqueued\)/);
   assert.match(queue, /priority: AUTONOMOUS_CONTINUATION_JOB_PRIORITY/);
   assert.match(queue, /priority: source === 'manual_search' \? 100 : AUTONOMOUS_NEW_QUERY_JOB_PRIORITY/);
 });
@@ -2028,8 +2141,9 @@ test('O2: a failed migration, orphan page, or provider canary makes the deploy g
   assert.equal(aiSkips.checks.find(check => check.id === 'ai_budget_skips')?.status, 'WARN');
 
   const uaMissing = evaluateCountryDiscoveryHealth(healthyHealthInput({ wikimediaUserAgentConfigured: false }));
-  assert.equal(uaMissing.status, 'DEGRADED');
-  assert.equal(uaMissing.checks.find(check => check.id === 'wikimedia_user_agent')?.status, 'WARN');
+  assert.equal(uaMissing.status, 'UNHEALTHY');
+  assert.equal(uaMissing.healthy, false);
+  assert.equal(uaMissing.checks.find(check => check.id === 'wikimedia_user_agent')?.status, 'FAIL');
 
   const coverage = evaluateCountryDiscoveryHealth(healthyHealthInput({ activeCountriesWithoutPage: 1 }));
   assert.equal(coverage.status, 'DEGRADED');
@@ -2065,6 +2179,12 @@ test('O2: a failed migration, orphan page, or provider canary makes the deploy g
     /FILTER \(WHERE qr\.continuation_status IN \('RUNNING','DEFERRED_QUOTA','DEFERRED_TIME'\)\),0\)::float AS oldest_pending_age_minutes/,
   );
   assert.match(healthSource, /provider_key='youtube-search' THEN 'youtube'/);
+  // Provider telemetry and run usage must describe the same 24-hour window;
+  // lifetime usage next to a 24h call count makes the cost/pages ratios lie.
+  const usageStart = healthSource.indexOf('), usage AS (');
+  const usageEnd = healthSource.indexOf('GROUP BY 1', usageStart);
+  assert.ok(usageStart > 0 && usageEnd > usageStart);
+  assert.match(healthSource.slice(usageStart, usageEnd), /scheduled_at >= now\(\)-interval '24 hours'/);
 
   const server = serverSource('../server.ts');
   assert.match(server, /app\.get\('\/api\/country-discovery\/health'/);
@@ -2383,4 +2503,24 @@ test('R3: an optional paid-provider failure cannot block the free-first cycle or
     'paid signal read has no quota/provider side effect',
   );
   assert.ok(!serverSource('queueManager.ts').includes('query_demand_signals'));
+});
+
+test('R4: demand-signal ingestion refreshes mutable score and expiry on the identity row', () => {
+  const dbCore = serverSource('dbCore.ts');
+  const start = dbCore.indexOf('export async function upsertQueryDemandSignals');
+  const end = dbCore.indexOf('\nexport ', start + 10);
+  const fn = dbCore.slice(start, end > start ? end : undefined);
+  assert.match(fn, /ON CONFLICT \(country, normalized_surface, provider, \(COALESCE\(provider_signal_id, ''\)\)\)/);
+  assert.match(fn, /DO UPDATE SET/);
+  for (const assignment of [
+    'language=EXCLUDED.language',
+    'signal_surface=EXCLUDED.signal_surface',
+    'demand_score=EXCLUDED.demand_score',
+    'metadata=EXCLUDED.metadata',
+    'observed_at=EXCLUDED.observed_at',
+    'expires_at=EXCLUDED.expires_at',
+  ]) {
+    assert.ok(fn.includes(assignment), `${assignment} must be refreshed`);
+  }
+  assert.doesNotMatch(fn, /ON CONFLICT DO NOTHING/);
 });

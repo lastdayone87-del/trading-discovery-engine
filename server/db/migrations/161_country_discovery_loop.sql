@@ -171,6 +171,45 @@ ALTER TABLE query_runs
 ALTER TABLE query_runs
   VALIDATE CONSTRAINT chk_query_runs_continuation_status;
 
+-- Migration 066 froze every completed query_run. Continuation state is
+-- bookkeeping that must remain writable after completion: this backfill
+-- normalizes terminal rows and the runtime links a completed parent to its
+-- continuation child. Replace the trigger function with an explicit
+-- continuation-metadata allowlist; every metric, status, timestamp, and
+-- provider column stays immutable. DELETE remains forbidden.
+CREATE OR REPLACE FUNCTION reject_completed_query_run_mutation() RETURNS trigger AS $$
+DECLARE
+  continuation_columns CONSTANT text[] := ARRAY[
+    'continuation_status',
+    'deferred_until',
+    'last_page_at',
+    'exploration_pages_remaining',
+    'effective_max_pages',
+    'effective_binding_bound',
+    'requested_page_depth',
+    'resume_count',
+    'resume_rewalk_count',
+    'continued_from_run_id',
+    'continued_to_run_id',
+    'continuation_segment',
+    'next_page_token',
+    'resume_mode'
+  ];
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    IF OLD.status = 'COMPLETED' THEN
+      RAISE EXCEPTION 'completed query_runs are immutable';
+    END IF;
+    RETURN OLD;
+  END IF;
+  IF OLD.status = 'COMPLETED'
+     AND (to_jsonb(OLD) - continuation_columns) IS DISTINCT FROM (to_jsonb(NEW) - continuation_columns) THEN
+    RAISE EXCEPTION 'completed query_runs are immutable';
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
 -- Existing terminal runs keep truthful continuation state. Idempotent by
 -- construction: the CASE is stable for already-normalized rows.
 UPDATE query_runs

@@ -278,6 +278,24 @@ async function pace(): Promise<void> {
 }
 
 /**
+ * `wbsearchentities` matches entity labels/aliases, not Wikipedia full text.
+ * A composite "Country finance-phrase" therefore matches nothing. Search a
+ * localized label-shaped market term instead; the country remains attached by
+ * the parser/caller, and these surfaces are candidate vocabulary only.
+ */
+function wikidataSearchTerm(language: string): { term: string; language: string } {
+  const local: Record<string, string> = {
+    de: 'Börse', fr: 'Bourse', es: 'Bolsa', it: 'Borsa',
+    nl: 'Beurs', sv: 'Börs', da: 'Børs', no: 'Børs',
+    ja: '証券取引所', zh: '证券交易所', ko: '증권거래소', ar: 'بورصة',
+  };
+  const localized = local[language];
+  return localized
+    ? { term: localized, language }
+    : { term: 'stock exchange', language: 'en' };
+}
+
+/**
  * Localized search text always carries the country name. Without it, Germany,
  * Austria, and Switzerland would all query the same generic "Börse Handel"
  * and their results would be mislabeled as country-scoped signals. Languages
@@ -361,7 +379,7 @@ export async function fetchFreeQuerySignals(args: {
   }
   try {
     await pace();
-    const wikidataSearch = wikipediaSearchTerm(country, language);
+    const wikidataSearch = wikidataSearchTerm(language);
     const wikidataUrl = `https://www.wikidata.org/w/api.php?action=wbsearchentities&search=${encodeURIComponent(wikidataSearch.term)}&language=${encodeURIComponent(wikidataSearch.language)}&uselang=${encodeURIComponent(wikidataSearch.language)}&limit=${limit}&format=json&origin=*`;
     const payload = await fetchJson(wikidataUrl, fetchImpl, timeoutMs, userAgent);
     signals.push(...parseWikidataSearchSignals(payload, { country, language: wikidataSearch.language, limit }));

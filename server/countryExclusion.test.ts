@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { findCountryExclusion, normalizeCountryName } from './countryExclusionRules';
+import { countryAliasTarget } from './countryAliases';
 import { assertCountryAllowed, getCountryExclusion, shouldBlockEnrichClaimForCountry } from './countryExclusion';
 import { buildOperationalEnrichmentRecoveryPayload } from './queueManager';
 import type { DiscoverySource } from '../src/types';
@@ -55,6 +56,13 @@ test('resolves non-ISO alias spellings through the shared identity map', () => {
     reason: 'x'
   });
   assert.equal(findCountryExclusion('Atlantis', [{ country_name: 'Germany', reason: 'x' }]), null);
+});
+
+test('alias lookup fails closed for inherited object properties', () => {
+  for (const key of ['constructor', 'tostring', 'valueof', '__proto__', 'hasownproperty']) {
+    assert.equal(countryAliasTarget(key), null, `${key} must not resolve through Object.prototype`);
+    assert.equal(findCountryExclusion(key, exclusions), null);
+  }
 });
 
 test('ENRICH claim gate accepts an alias-form exclusion match for the same country', () => {

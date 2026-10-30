@@ -168,7 +168,10 @@ export async function getAutonomousPageMarginalMetrics(runId: string, pageNumber
   const result = await db.query(
     `WITH first_sighting AS (
        SELECT s.channel_id, MIN(s.page_number) AS first_page,
-              BOOL_OR(NOT s.was_known) AS was_new,
+              -- Productivity requires a persisted fresh creator. An unseen
+              -- country-rejected candidate was never catalogued and must not
+              -- excuse a low-value or wrong-country page from stopping.
+              BOOL_OR(s.persisted AND NOT s.was_known) AS was_new,
               -- Outcome at the creator's first sighting: a creator rejected on
               -- page 1 and seen again on page 3 is still one rejection.
               (array_agg(s.funnel_outcome ORDER BY s.page_number))[1] AS first_outcome
@@ -259,11 +262,16 @@ export interface AutonomousContinuationState {
 export async function getAutonomousContinuationState(runId: string, pageNumber?: number, clientOverride?: PageStoreRunner): Promise<AutonomousContinuationState> {
   const db = clientOverride || await getDb();
   const targetPage = Math.max(1, pageNumber || 1);
+  // Streaks describe pages *before* the page being evaluated. Including the
+  // current page would double-count a persisted decision when a page job is
+  // retried and could stop the run before page+1 is queued.
   const [pagesRes, marginal] = await Promise.all([
     db.query(
       `SELECT distinct_creator_count,marginal_utility,decision_reason_codes,continuation_decision_v2
-       FROM autonomous_query_page_observations WHERE query_run_id=$1 ORDER BY page_number DESC`,
-      [runId],
+       FROM autonomous_query_page_observations
+       WHERE query_run_id=$1 AND page_number < $2
+       ORDER BY page_number DESC`,
+      [runId, targetPage],
     ),
     getAutonomousPageMarginalMetrics(runId, targetPage, db),
   ]);

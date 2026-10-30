@@ -263,12 +263,12 @@ export function evaluateCountryDiscoveryHealth(
     const freeSignalsOn = input.settings.free_query_signals_enabled === 'true';
     add(
       'wikimedia_user_agent',
-      !freeSignalsOn || input.wikimediaUserAgentConfigured ? 'PASS' : 'WARN',
+      !freeSignalsOn || input.wikimediaUserAgentConfigured ? 'PASS' : 'FAIL',
       !freeSignalsOn
         ? 'Free-signal enrichment is disabled; the Wikimedia User-Agent prerequisite is dormant.'
         : input.wikimediaUserAgentConfigured
           ? `${WIKIMEDIA_USER_AGENT_ENV} is configured for Wikimedia API etiquette.`
-          : `${WIKIMEDIA_USER_AGENT_ENV} is not set. Free-signal legal/ToS review requires a real contact URL or email; set ${WIKIMEDIA_USER_AGENT_ENV} or descope free signals from this release.`,
+          : `${WIKIMEDIA_USER_AGENT_ENV} is not set. Free-signal enrichment is enabled but all remote Wikimedia fetches are skipped; set ${WIKIMEDIA_USER_AGENT_ENV} or disable free signals.`,
     );
   }
 
@@ -824,7 +824,9 @@ async function gatherCountryDiscoveryMetricsUncached(clientOverride?: HealthRunn
                 COALESCE(SUM(pages_completed),0)::int AS pages,
                 COALESCE(SUM(quota_used),0)::int AS quota_units,
                 COALESCE(SUM(provider_cost_usd),0)::float AS provider_cost_usd
-         FROM query_runs GROUP BY 1
+         FROM query_runs
+         WHERE scheduled_at >= now()-interval '24 hours'
+         GROUP BY 1
        )
        SELECT COALESCE(t.provider,u.provider) AS provider,
               COALESCE(t.calls,0)::int AS calls,

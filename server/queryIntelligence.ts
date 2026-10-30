@@ -1030,6 +1030,11 @@ Return ONLY a valid JSON object with format:
               attemptedProvider = 'GROQ';
               if (aiRun) aiRun.attempts += 1;
             },
+            // Cost the raw output of every attempt, including content that
+            // fails validation or is retried on another route.
+            onResponseText: text => {
+              if (aiRun) aiRun.responseChars += text.length;
+            },
             validateContent: text => {
               let candidate: ReturnType<typeof parseNativeVocabularyResponse>;
               try {
@@ -1041,9 +1046,9 @@ Return ONLY a valid JSON object with format:
             },
           }
         );
-        if (aiRun) {
-          aiRun.responseChars += groqText ? groqText.length : 0;
-        }
+        // responseChars is accumulated by onResponseText so rejected and
+        // retried provider responses are charged too. The returned text must
+        // not be added again or successful calls would be double-counted.
         // Admissibility gate: provider output with no admissible candidate is
         // not a result — the Gemini fallback stays available instead of being
         // suppressed. Rule exclusion runs INSIDE the gate (not after it), so

@@ -47,6 +47,7 @@ import {
   markQueryRunDeferred,
   markQueryRunResumeUnavailable,
   createContinuationRunSegment,
+  setQueryRunJobId,
   markCommunityInspectionStarted,
   markSiteInspectionsClaimed,
   markSiteInspectionsDiscarded,
@@ -1701,6 +1702,52 @@ export async function processNextSearchJob(
       // performance_details): quota-wait vs retrieval vs per-channel
       // processing vs total worker time. Never affects scoring or behavior.
       const latencyBreakdownMs = buildSearchLatencyBreakdownMs(searchWorkerStartMs, searchQuotaWaitMs, searchRetrievalGrossMs, searchTopUpWaitMs, channelLoopStartMs, channelLoopEndMs, Date.now());
+      // The page ceiling is a safety boundary, not a dead end. When the safety
+      // ceiling (never a provider/treatment/trial cap) is reached while the
+      // provider still exposes a next page, create and enqueue a linked
+      // continuation segment BEFORE completing the parent. If creation or
+      // enqueue fails, the job retry can recover the child instead of losing
+      // the continuation behind an immutable COMPLETED parent.
+      if (
+        shouldCreateContinuationSegment({
+          paginationEnabled: continuationEnabled,
+          usingV2,
+          primaryReason: decision.primaryReason,
+          bindingBound,
+          hasNextPage: Boolean(searchPage?.nextPageToken),
+        })
+      ) {
+        // The child is a new run: it computes and persists its own fair-share
+        // quota budget on its first page. Passing the parent's full budget here
+        // would let the segment spend the same fair-share allocation twice.
+        const segment = await createContinuationRunSegment({
+          parentRunId: queryRunId,
+          nextPageToken: searchPage!.nextPageToken!,
+          resumeMode: resumeModeForProvider(providerKey),
+          explorationPagesRemaining: decisionV2.explorationPagesRemaining,
+        });
+        const childJob = await enqueueJob('SEARCH_YOUTUBE', {
+          ...job.payload,
+          queryRunId: segment.childRunId,
+          pageNumber: 1,
+          pageToken: searchPage!.nextPageToken!,
+        }, {
+          priority: AUTONOMOUS_CONTINUATION_JOB_PRIORITY,
+          maxAttempts: 3,
+          idempotencyKey: `search-run:${segment.childRunId}:page:1`,
+        });
+        await setQueryRunJobId(segment.childRunId, childJob.id);
+        console.log(JSON.stringify({
+          event: 'autonomous_page_ceiling_continuation',
+          parentRunId: queryRunId,
+          childRunId: segment.childRunId,
+          childJobId: childJob.id,
+          segment: segment.segment,
+          pageNumber,
+          resumeMode: segment.resumeMode,
+          timestamp: new Date().toISOString(),
+        }));
+      }
       await completeQueryRun(queryRunId, {
         ...finalMetrics,
         uniqueChannels: finalMetrics.newChannels,
@@ -1736,49 +1783,6 @@ export async function processNextSearchJob(
       if (neighborhoodInfo && retrievalConfigKey) {
         await recomputeNeighborhoodRetrievalEvidence(neighborhoodInfo.neighborhood_key, retrievalConfigKey)
           .catch(err => console.warn('[RetrievalPolicyEvidence] Post-run evidence recomputation error:', err));
-      }
-
-      // The page ceiling is a safety boundary, not a dead end. When the safety
-      // ceiling (never a provider/treatment/trial cap) is reached while the
-      // provider still exposes a next page, preserve the cursor in a linked
-      // continuation run segment so the remaining work stays eligible.
-      if (
-        shouldCreateContinuationSegment({
-          paginationEnabled: continuationEnabled,
-          usingV2,
-          primaryReason: decision.primaryReason,
-          bindingBound,
-          hasNextPage: Boolean(searchPage?.nextPageToken),
-        })
-      ) {
-        // The child is a new run: it computes and persists its own fair-share
-        // quota budget on its first page. Passing the parent's full budget here
-        // would let the segment spend the same fair-share allocation twice.
-        const segment = await createContinuationRunSegment({
-          parentRunId: queryRunId,
-          nextPageToken: searchPage!.nextPageToken!,
-          resumeMode: resumeModeForProvider(providerKey),
-          explorationPagesRemaining: decisionV2.explorationPagesRemaining,
-        });
-        await enqueueJob('SEARCH_YOUTUBE', {
-          ...job.payload,
-          queryRunId: segment.childRunId,
-          pageNumber: 1,
-          pageToken: searchPage!.nextPageToken!,
-        }, {
-          priority: AUTONOMOUS_CONTINUATION_JOB_PRIORITY,
-          maxAttempts: 3,
-          idempotencyKey: `search-run:${segment.childRunId}:page:1`,
-        });
-        console.log(JSON.stringify({
-          event: 'autonomous_page_ceiling_continuation',
-          parentRunId: queryRunId,
-          childRunId: segment.childRunId,
-          segment: segment.segment,
-          pageNumber,
-          resumeMode: segment.resumeMode,
-          timestamp: new Date().toISOString(),
-        }));
       }
     }
     await completeJob(job.id);
@@ -1945,6 +1949,8 @@ export function planContinuationResume<T extends { country: string; runId: strin
 export async function resumeOrphanedAutonomousPages(options: {
   force?: boolean;
   limit?: number;
+  /** Maximum new page jobs this sweep may enqueue (queue headroom). */
+  maxEnqueued?: number;
   now?: Date;
 } = {}): Promise<{ swept: boolean; enqueued: number; skipped: number; unavailable: number }> {
   const nowMs = (options.now || new Date()).getTime();
@@ -1973,11 +1979,20 @@ export async function resumeOrphanedAutonomousPages(options: {
   const activeCountryKeys = await resolveActiveAutonomousCountryKeys();
   const activeCountries = Math.max(1, activeCountryKeys.size);
   const sweepCountryLimit = Math.max(1, Math.min(500, Math.trunc(options.limit || 50) || 50));
+  // The forced producer sweep runs before queue-depth admission. Bound it by
+  // the available headroom so recovery itself cannot overshoot the target
+  // queue depth. At most one page is enqueued per selected country.
+  const maxEnqueued = options.maxEnqueued === undefined
+    ? Number.POSITIVE_INFINITY
+    : Math.max(0, Math.trunc(options.maxEnqueued) || 0);
+  const boundedCountryLimit = Number.isFinite(maxEnqueued)
+    ? Math.min(sweepCountryLimit, maxEnqueued)
+    : sweepCountryLimit;
   const plan = planContinuationResume(
     runs,
     fairnessCursor,
     activeCountries,
-    sweepCountryLimit,
+    boundedCountryLimit,
     AUTONOMOUS_CONTINUATION_CANDIDATES_PER_COUNTRY,
   );
   await setAppSetting('autonomous_continuation_fairness_cursor', String(plan.nextFairnessCursor)).catch(() => undefined);

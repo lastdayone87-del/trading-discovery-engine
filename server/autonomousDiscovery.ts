@@ -373,19 +373,41 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       };
     }
 
+    // The research controller is an isolated observer/planner. Failure never
+    // delays the proven query scheduler, and serving remains separately gated.
+    await runPersistentResearchCycle(`autonomous-research:${process.pid}`)
+      .catch(error => console.warn('[PersistentResearch] Planning cycle failed; legacy query scheduling continues:', error));
+
+    // Reconcile the Pacific quota day first: this snapshot is the single source
+    // of queue depth and quota usage for the cycle, and its quota-deferred
+    // wakeups must be visible to the continuation sweep below.
+    const now = new Date();
+    const snapshot = await reconcileYouTubeQuotaRolloverAndGetAutonomousSnapshot(now);
+    if (snapshot.awakenedQuotaDeferredJobs > 0) {
+      log(`Pacific quota-day rollover reactivated ${snapshot.awakenedQuotaDeferredJobs} quota-deferred job(s).`);
+    }
+
     // Continuation-first scheduling (CDL §6.9): a country with a pending
     // deferred page must get its continuation slot before a new query is
-    // started for another country. Run the resume sweep before the queue-depth
-    // snapshot so resumed pages count toward the queue watermark and cannot be
-    // crowded out by fresh-query capacity. The dynamic import avoids the
+    // started for another country. The sweep is bounded by the reconciled
+    // queue headroom, and its enqueues are added to the depth used by capacity
+    // below so resumed pages count toward the watermark and cannot be crowded
+    // out by fresh-query capacity. The dynamic import avoids the
     // queueManager -> autonomousDiscovery module cycle. Direct target cycles
     // keep their on-demand country scope and do not resume other countries.
+    const config = await getDiscoveryConfig();
+    let resumedPages = 0;
     if (!targetCountry) {
       try {
         const { resumeOrphanedAutonomousPages } = await import('./queueManager');
-        const resumed = await resumeOrphanedAutonomousPages({ force: true });
-        if (resumed.enqueued > 0) {
-          log(`Continuation-first: resumed ${resumed.enqueued} pending page(s) before new-query scheduling.`);
+        // Forced recovery must respect the same target queue depth as new
+        // queries; otherwise a single sweep can enqueue up to 50 pages into a
+        // queue that is already full.
+        const headroom = Math.max(0, config.targetQueueDepth - snapshot.queueDepth);
+        const resumed = await resumeOrphanedAutonomousPages({ force: true, maxEnqueued: headroom });
+        resumedPages = resumed.enqueued;
+        if (resumedPages > 0) {
+          log(`Continuation-first: resumed ${resumedPages} pending page(s) before new-query scheduling.`);
         }
       } catch (error) {
         // Continuation recovery is best-effort; the maintenance scheduler
@@ -394,21 +416,10 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       }
     }
 
-    // The research controller is an isolated observer/planner. Failure never
-    // delays the proven query scheduler, and serving remains separately gated.
-    await runPersistentResearchCycle(`autonomous-research:${process.pid}`)
-      .catch(error => console.warn('[PersistentResearch] Planning cycle failed; legacy query scheduling continues:', error));
-
-    const config = await getDiscoveryConfig();
-    const now = new Date();
-    const snapshot = await reconcileYouTubeQuotaRolloverAndGetAutonomousSnapshot(now);
-    if (snapshot.awakenedQuotaDeferredJobs > 0) {
-      log(`Pacific quota-day rollover reactivated ${snapshot.awakenedQuotaDeferredJobs} quota-deferred job(s).`);
-    }
     const calculatedCapacity = calculateDiscoveryCapacity({
       batchSize: config.batchSize,
       targetQueueDepth: config.targetQueueDepth,
-      currentQueueDepth: snapshot.queueDepth,
+      currentQueueDepth: snapshot.queueDepth + resumedPages,
       dailyBudget: config.dailyQuotaBudget,
       allocationPercent: config.autonomousQuotaPercent,
       unitsUsed: snapshot.autonomousUnitsUsed,

@@ -175,8 +175,10 @@ const TRANSPARENT_V2_CODES = new Set<string>([
 ]);
 
 const PRODUCTIVE_V2_CODES = new Set<string>([
+  // Exploration itself is a continuation reason, not evidence of a productive
+  // page. Counting it as productive made an all-zero exploration page reset
+  // the low-value streak and bypass the safety stop.
   'CONTINUE_PRODUCTIVE',
-  'CONTINUE_EXPLORATION',
 ]);
 
 /**

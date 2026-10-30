@@ -4304,6 +4304,32 @@ export async function reserveNativeVocabularyAiRun(args: {
     const leaseToken = randomUUID();
     let existing = await client.query(`SELECT * FROM native_vocabulary_ai_runs WHERE request_id=$1`, [args.requestId]);
     let existingRow = existing.rows[0] ? rowToNativeVocabularyAiRun(existing.rows[0]) : null;
+    // A stored response is authoritative even after the lease expired. The
+    // provider call already happened, so reclaiming the row as FAILED and
+    // re-admitting it below would clear response_payload and buy the same
+    // output twice. Rotate the lease and replay the durable payload instead.
+    if (existingRow?.status === 'RESERVED' && existingRow.responsePayload) {
+      // The response is durable, but the previous owner may still be
+      // finishing admission. Rotate the lease so only this replay worker can
+      // write the response/completion; the old worker's token is now stale.
+      await client.query(
+        `UPDATE native_vocabulary_ai_runs
+         SET lease_token=$2, lease_expires_at=now()+($3||' seconds')::interval
+         WHERE request_id=$1 AND status='RESERVED'`,
+        [args.requestId, leaseToken, String(NATIVE_VOCABULARY_AI_LEASE_SECONDS)],
+      );
+      await client.query('COMMIT');
+      return {
+        admitted: false,
+        status: 'RESERVED',
+        reason: 'REPLAY_RESPONSE',
+        requestId: args.requestId,
+        leaseToken,
+        replayPayload: existingRow.responsePayload,
+        provider: existingRow.provider,
+        attempts: existingRow.attempts,
+      };
+    }
     if (existingRow?.status === 'RESERVED' && (existingRow.leaseExpiresAt === null || Date.parse(existingRow.leaseExpiresAt) <= Date.now())) {
       // Reclaim this request's abandoned lease, then re-admit it below. The
       // reserved cost is retained as actual spend in the ledger row.
@@ -4317,28 +4343,6 @@ export async function reserveNativeVocabularyAiRun(args: {
       existingRow = null;
     }
     if (existingRow) {
-      if (existingRow.status === 'RESERVED' && existingRow.responsePayload) {
-        // The response is durable, but the previous owner may still be
-        // finishing admission. Rotate the lease so only this replay worker can
-        // write the response/completion; the old worker's token is now stale.
-        await client.query(
-          `UPDATE native_vocabulary_ai_runs
-           SET lease_token=$2, lease_expires_at=now()+($3||' seconds')::interval
-           WHERE request_id=$1 AND status='RESERVED'`,
-          [args.requestId, leaseToken, String(NATIVE_VOCABULARY_AI_LEASE_SECONDS)],
-        );
-        await client.query('COMMIT');
-        return {
-          admitted: false,
-          status: 'RESERVED',
-          reason: 'REPLAY_RESPONSE',
-          requestId: args.requestId,
-          leaseToken,
-          replayPayload: existingRow.responsePayload,
-          provider: existingRow.provider,
-          attempts: existingRow.attempts,
-        };
-      }
       await client.query('COMMIT');
       return { admitted: false, status: existingRow.status, reason: `IDEMPOTENT_${existingRow.status}`, requestId: args.requestId };
     }
@@ -4612,6 +4616,11 @@ export interface ContinuationRunSegment {
  * its first page (report §6.4); copying the parent's full budget would let the
  * segment spend the same allocation twice. This is what makes the 50-page
  * ceiling a safety boundary instead of a dead end.
+ *
+ * The child is created and linked while the parent is still active. The
+ * caller enqueues the child job and only then completes the parent, so a
+ * transient create/enqueue failure leaves the parent retryable instead of
+ * permanently dropping the continuation.
  */
 export async function createContinuationRunSegment(args: {
   parentRunId: string;
@@ -4657,9 +4666,12 @@ export async function createContinuationRunSegment(args: {
       ],
     );
     const childRunId = String(child.rows[0].id);
+    // Link while the parent is still active. completeQueryRun() owns the
+    // parent's terminal status and metrics, so this transaction must not mark
+    // it COMPLETED (doing so would make the later completion a silent no-op).
     await client.query(
-      `UPDATE query_runs SET status='COMPLETED',continuation_status='COMPLETE',completed_at=now(),
-         next_page_token=$2,resume_mode=$3,continued_to_run_id=$4,last_page_at=COALESCE(last_page_at,now())
+      `UPDATE query_runs SET next_page_token=$2,resume_mode=$3,continued_to_run_id=$4,
+         last_page_at=COALESCE(last_page_at,now())
        WHERE id=$1`,
       [args.parentRunId, args.nextPageToken, args.resumeMode, childRunId],
     );
@@ -4671,6 +4683,12 @@ export async function createContinuationRunSegment(args: {
   } finally {
     client.release();
   }
+}
+
+/** Persist the durable job that currently owns a query_run. */
+export async function setQueryRunJobId(runId: string, jobId: string): Promise<void> {
+  const db = await getDb();
+  await db.query('UPDATE query_runs SET job_id=$2 WHERE id=$1', [runId, jobId]);
 }
 
 export interface AutonomousQuotaAvailability {
@@ -4730,11 +4748,21 @@ export async function upsertQueryDemandSignals(signals: Array<Omit<QueryDemandSi
   if (!signals.length) return 0;
   const db = await getDb();
   let written = 0;
+  // Refresh the full mutable payload on the identity index. DO NOTHING left a
+  // stale score/expiry in place forever, so a recovered provider signal could
+  // never displace the degraded row that shared its identity.
   for (const signal of signals) {
     const result = await db.query(
       `INSERT INTO query_demand_signals(country,language,signal_surface,normalized_surface,provider,provider_signal_id,demand_score,metadata,observed_at,expires_at)
        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-       ON CONFLICT DO NOTHING`,
+       ON CONFLICT (country, normalized_surface, provider, (COALESCE(provider_signal_id, '')))
+       DO UPDATE SET
+         language=EXCLUDED.language,
+         signal_surface=EXCLUDED.signal_surface,
+         demand_score=EXCLUDED.demand_score,
+         metadata=EXCLUDED.metadata,
+         observed_at=EXCLUDED.observed_at,
+         expires_at=EXCLUDED.expires_at`,
       [
         canonicalCountry(signal.country), signal.language, signal.surface, signal.normalizedSurface,
         signal.provider, signal.providerSignalId || null, signal.demandScore,

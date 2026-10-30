@@ -1,6 +1,6 @@
 import type { CountryMetadataStatus, CountryStatus, CountryVocabulary, ExcludedCountry } from '../src/types';
 import { SUPPORTED_PRODUCTION_COUNTRIES } from '../src/data/initial_countries';
-import { normalizeCountryName } from './countryExclusionRules';
+import { findCountryExclusion, normalizeCountryName } from './countryExclusionRules';
 import { COUNTRY_ALIASES, countryAliasTarget } from './countryAliases';
 
 export type CountryEvidenceSource =
@@ -742,7 +742,7 @@ export function assessChannelCountry(
       const aggregated = aggregateContentLanguage(input.videoDescriptions || [], input.playlists || []);
       if (aggregated) {
         const isLiveExcluded = (country: string): boolean =>
-          exclusions.some(item => normalizeCountryName(item.country_name) === normalizeCountryName(country));
+          findCountryExclusion(country, exclusions) !== null;
         // Language-only rejection requires every candidate country currently
         // excluded. If any set member is not excluded, emit nothing.
         if (aggregated.countries.every(isLiveExcluded)) {
@@ -766,7 +766,7 @@ export function assessChannelCountry(
             priority: 0,
             detectedCountry: representative,
             confidence: aggregated.confidence,
-            reasoning: `${representative} is excluded by policy: ${(exclusions.find(item => normalizeCountryName(item.country_name) === normalizeCountryName(representative))?.reason) || 'Excluded by policy'}.`
+            reasoning: `${representative} is excluded by policy: ${findCountryExclusion(representative, exclusions)?.reason || 'Excluded by policy'}.`
           };
           return {
             discoveryCountry,
@@ -812,7 +812,7 @@ export function assessChannelCountry(
   const [detectedCreatorCountry, topConfidence] = ranked[0];
   const conflict = ranked.length > 1 && ranked[1][1] === topConfidence;
   const confidence = conflict ? Math.min(49, topConfidence) : topConfidence;
-  const excluded = exclusions.find(item => normalizeCountryName(item.country_name) === normalizeCountryName(detectedCreatorCountry));
+  const excluded = findCountryExclusion(detectedCreatorCountry, exclusions);
   // Hard-exclusion authority additionally requires at least one decisive item
   // stronger than a bare mention: a passing country-name mention in a bio is
   // not domicile and can never independently justify REJECT_EXCLUDED, while

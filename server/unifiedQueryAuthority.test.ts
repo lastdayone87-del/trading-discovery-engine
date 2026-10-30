@@ -39,6 +39,10 @@ test('evaluateAutonomousQueryAuthority requires valid retrieval specificity prov
 });
 
 test('free-signal standalone bootstrap carries a narrow execution-time authority path', () => {
+  // Planner-shape fixture only: Nigeria has no curated anchors, which is the
+  // exact no-anchor path that can emit FREE_SIGNAL_STANDALONE. Execution
+  // authority is asserted below against a supported production market so this
+  // test never endorses admission for an excluded/unregistered country.
   const planned = planDiverseQueries({
     country: 'Nigeria',
     count: 1,
@@ -53,7 +57,7 @@ test('free-signal standalone bootstrap carries a narrow execution-time authority
   assert.equal(planned[0].metadata.queryTemplate, 'FREE_SIGNAL_STANDALONE');
 
   const base: QueryRecord = {
-    id: 1, query: planned[0].query, country: 'Nigeria', collection: 'EXPERIMENTAL',
+    id: 1, query: planned[0].query, country: 'Germany', collection: 'EXPERIMENTAL',
     intent: planned[0].intent, times_executed: 0, total_channels_found: 0,
     unique_channels_found: 0, quality_channels_found: 0, community_channels_found: 0,
     avg_quality_score: 0, performance_score: 0, created_at: new Date().toISOString(),
@@ -80,16 +84,17 @@ test('free-signal standalone bootstrap carries a narrow execution-time authority
 
 test('free-signal standalone planning excludes ambiguous market/entity surfaces', () => {
   const planned = planDiverseQueries({
-    country: 'Nigeria',
-    count: 1,
+    country: 'Germany',
+    count: 4,
     learnedVocabulary: [],
     existingQueries: [],
     freeSignalCandidates: [{
-      surface: 'Lagos Stock Exchange', signalType: 'EXCHANGE', country: 'Nigeria', language: 'en',
+      surface: 'Frankfurt Stock Exchange', signalType: 'EXCHANGE', country: 'Germany', language: 'en',
       provider: 'WIKIPEDIA', sourceIds: ['wikipedia:2'],
     }],
   });
-  assert.equal(planned.length, 0);
+  assert.ok(planned.length > 0, 'a supported country still plans normal seed queries');
+  assert.ok(planned.every(query => query.metadata.queryTemplate !== 'FREE_SIGNAL_STANDALONE'));
 });
 
 test('queueManager enforces execution-time query authority revalidation and handles missing provenance', () => {

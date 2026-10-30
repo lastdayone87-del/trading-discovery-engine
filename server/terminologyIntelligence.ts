@@ -860,9 +860,12 @@ export function evaluateExternalTermEvidence(args: {
     return true;
   });
   const targetLanguage = (args.language || '').split('-')[0].toLowerCase();
+  // Unknown/undetermined language fails closed: matching homographs across
+  // languages are not evidence that this is the local surface. Corroboration
+  // must be same-language as the target term.
   const languageMatched = targetLanguage && targetLanguage !== 'und'
     ? matching.filter(row => String(row.language || '').split('-')[0].toLowerCase() === targetLanguage)
-    : matching;
+    : [];
   const targetScript = (args.script || '').toUpperCase();
   const scriptMatched = targetScript && targetScript !== 'ZYYY'
     ? languageMatched.filter(row => String(row.script || '').toUpperCase() === targetScript)

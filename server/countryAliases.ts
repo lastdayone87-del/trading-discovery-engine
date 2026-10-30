@@ -6,7 +6,7 @@
  * Keys are normalized spellings (see `normalizeCountryName`); values are the
  * canonical country names used by `COUNTRY_SIGNALS` and the exclusion list.
  */
-export const COUNTRY_ALIASES: Record<string, string> = {
+const ALIAS_ENTRIES: Record<string, string> = {
   us: 'United States', usa: 'United States', 'united states of america': 'United States',
   gb: 'United Kingdom', uk: 'United Kingdom', 'great britain': 'United Kingdom',
   de: 'Germany', fr: 'France', es: 'Spain', br: 'Brazil', ru: 'Russia', in: 'India',
@@ -20,7 +20,17 @@ export const COUNTRY_ALIASES: Record<string, string> = {
   ,no:'Norway', norge:'Norway'
 };
 
+/**
+ * Null-prototype lookup map. A plain object literal inherits Object.prototype,
+ * so malformed keys such as `constructor` would resolve to an inherited
+ * function instead of a miss. Country identity must fail closed for every
+ * value outside the explicit alias vocabulary.
+ */
+export const COUNTRY_ALIASES: Record<string, string> = Object.freeze(
+  Object.assign(Object.create(null) as Record<string, string>, ALIAS_ENTRIES),
+);
+
 /** Canonical target for an alias spelling, or null when the value is not an alias. */
 export function countryAliasTarget(normalized: string): string | null {
-  return COUNTRY_ALIASES[normalized] ?? null;
+  return Object.hasOwn(COUNTRY_ALIASES, normalized) ? COUNTRY_ALIASES[normalized] : null;
 }
