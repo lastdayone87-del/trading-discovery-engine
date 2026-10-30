@@ -4,18 +4,27 @@ import { admitOrganicQueryCandidates, type OrganicQueryCandidate } from './organ
 import { assessLanguageCapability, type GlobalLanguageContext } from './globalLanguageModel';
 import {evaluateRetrievalSpecificity,type RetrievalSpecificityDecision} from './retrievalSpecificity';
 import { countrySearchLanguageCandidates, normalizeLanguageCode } from './countrySearchHints';
+import { capFreeSignalCandidates, type FreeSignalQueryCandidate, type FreeSignalType } from './freeQuerySignals';
 
 export type QueryKnowledgeTier = 1 | 2 | 3;
 export type QueryGenerationMode = 'EXPLORATION' | 'EXPLOITATION' | 'COLD_START';
 export type SearchAtomType = 'INSTRUMENT' | 'METHOD' | 'MARKET' | 'FORMAT' | 'LEARNED' | 'CONCEPT' | 'ENTITY' | 'TOPIC' | 'NEIGHBORHOOD' | 'COVERAGE';
+export type QueryCandidateSource = 'TERMINOLOGY' | 'FREE_SIGNAL' | 'SEED' | 'MIXED' | 'DEMAND_SIGNAL';
 
 export interface SearchAtom {
   term: string;
   type: SearchAtomType;
   intent: QueryIntent;
   tier: QueryKnowledgeTier;
-  origin: 'CURATED' | 'COUNTRY_VOCABULARY' | 'LEARNED' | 'ORGANIC';
+  origin: 'CURATED' | 'COUNTRY_VOCABULARY' | 'LEARNED' | 'ORGANIC' | 'FREE_SIGNAL' | 'DEMAND_SIGNAL';
   retrievalPolicy:RetrievalSpecificityDecision;
+}
+
+export interface DemandSignalQueryCandidate {
+  surface: string;
+  language: string;
+  demandScore: number;
+  sourceIds: string[];
 }
 
 export interface PlannedQuery {
@@ -243,6 +252,44 @@ function atom(term: string, type: SearchAtomType, intent: QueryIntent, tier: Que
     retrievalPolicy:evaluateRetrievalSpecificity({semanticClass:type,governed:origin==='CURATED'||origin==='ORGANIC'}) };
 }
 
+function freeSignalAtomType(signalType: FreeSignalType): SearchAtomType {
+  switch (signalType) {
+    case 'INSTRUMENT': return 'INSTRUMENT';
+    case 'MARKET':
+    case 'EXCHANGE': return 'MARKET';
+    case 'METHOD': return 'METHOD';
+    case 'FORMAT': return 'FORMAT';
+    case 'REGULATOR':
+    case 'ALIAS':
+    case 'ENTITY':
+    default: return 'ENTITY';
+  }
+}
+
+function freeSignalIntent(signalType: FreeSignalType): QueryIntent {
+  switch (signalType) {
+    case 'INSTRUMENT': return 'market_analysis';
+    case 'METHOD': return 'strategy';
+    case 'MARKET':
+    case 'EXCHANGE': return 'session_analysis';
+    case 'FORMAT': return 'education';
+    default: return 'market_analysis';
+  }
+}
+
+/**
+ * Paid demand is optional and default-off. When it is ever enabled, only 30%
+ * of a country's portfolio may be demand-only; the remainder must come from
+ * terminology, free signals, and seeds. This is a ranking cap, never evidence.
+ */
+export function capDemandSignalCandidates<T>(candidates: T[], count: number): T[] {
+  if (!candidates.length) return [];
+  const requested = Math.max(1, Math.trunc(count) || 1);
+  // Demand signals are supplementary: a small portfolio may have no room for
+  // them. Forcing one candidate violates the 30% share rather than enforcing it.
+  return candidates.slice(0, Math.floor(requested * 0.3));
+}
+
 function countryAtoms(country: string, vocabulary?: CountryVocabulary): SearchAtom[] {
   const curated = (COUNTRY_SEARCH_ATOMS[country] || []).map(([term, type, intent]) => atom(term, type, intent, 1, 'CURATED'));
   const vocabularyAtoms = [
@@ -269,6 +316,10 @@ export function planDiverseQueries(args: {
   existingQueries: QueryRecord[];
   provenTerminology?: ProvenTerminologyAtom[];
   organicCandidates?: OrganicQueryCandidate[];
+  /** Wikipedia/Wikidata aliases and entities (candidate vocabulary only). */
+  freeSignalCandidates?: FreeSignalQueryCandidate[];
+  /** Optional paid demand surfaces. Only supplied when the paid adapter is enabled. */
+  demandSignalCandidates?: DemandSignalQueryCandidate[];
   mode?: QueryGenerationMode;
   /**
    * Persistent-scope promotion basis. Set when the country was explicitly
@@ -293,7 +344,23 @@ export function planDiverseQueries(args: {
   const supportedLanguages = countrySearchLanguageCandidates(args.country, args.countryVocabulary?.languages || []);
   const intentUsage = new Map<QueryIntent, number>();
   args.existingQueries.forEach(query => intentUsage.set(query.intent, (intentUsage.get(query.intent) || 0) + 1));
-  const candidates: Array<{ atoms: SearchAtom[]; template: 'SINGLE_ATOM' | 'COMPACT_PAIR' | 'INSTRUMENT_MARKET' | 'MARKET_INSTRUMENT' | 'METHOD_INSTRUMENT' | 'ANCHOR_LEARNED' | 'ORGANIC_STANDALONE' | 'ANCHOR_ORGANIC'; organic?: ReturnType<typeof admitOrganicQueryCandidates>[number] }> = anchors.filter(searchAtom=>searchAtom.retrievalPolicy.eligibility==='STANDALONE'||searchAtom.retrievalPolicy.eligibility==='ANCHOR_ONLY').map(searchAtom => ({ atoms: [searchAtom], template: 'SINGLE_ATOM' }));
+  type FreePlanCandidate = {
+    atoms: SearchAtom[];
+    template: 'ANCHOR_FREE_SIGNAL' | 'FREE_SIGNAL_STANDALONE';
+    freeSignal: FreeSignalQueryCandidate;
+  };
+  type DemandPlanCandidate = {
+    atoms: SearchAtom[];
+    template: 'ANCHOR_DEMAND_SIGNAL' | 'DEMAND_SIGNAL_STANDALONE';
+    demand: DemandSignalQueryCandidate;
+  };
+  const candidates: Array<{
+    atoms: SearchAtom[];
+    template: 'SINGLE_ATOM' | 'COMPACT_PAIR' | 'INSTRUMENT_MARKET' | 'MARKET_INSTRUMENT' | 'METHOD_INSTRUMENT' | 'ANCHOR_LEARNED' | 'ORGANIC_STANDALONE' | 'ANCHOR_ORGANIC' | 'ANCHOR_FREE_SIGNAL' | 'FREE_SIGNAL_STANDALONE' | 'ANCHOR_DEMAND_SIGNAL' | 'DEMAND_SIGNAL_STANDALONE';
+    organic?: ReturnType<typeof admitOrganicQueryCandidates>[number];
+    freeSignal?: FreeSignalQueryCandidate;
+    demand?: DemandSignalQueryCandidate;
+  }> = anchors.filter(searchAtom=>searchAtom.retrievalPolicy.eligibility==='STANDALONE'||searchAtom.retrievalPolicy.eligibility==='ANCHOR_ONLY').map(searchAtom => ({ atoms: [searchAtom], template: 'SINGLE_ATOM' }));
 
   // Only combine semantically compatible atoms: a concrete instrument/market
   // anchor plus one trading method. Formats and unrelated concepts never mix.
@@ -385,22 +452,115 @@ export function planDiverseQueries(args: {
     return anchor ? [{ atoms: [anchor, organicAtom], template: 'ANCHOR_ORGANIC' as const, organic: candidate }] : [];
   });
   candidates.splice(Math.min(2, candidates.length), 0, ...organicCandidates);
+
+  // Free signals are candidate vocabulary only: they may bootstrap a country
+  // with no creator evidence, but they can never crowd out creator-observed
+  // terminology (capFreeSignalCandidates reserves the portfolio majority for
+  // existing candidates). They never write an observation or lifecycle row.
+  const provenBySurface = new Map<string, ProvenTerminologyAtom>();
+  for (const term of args.provenTerminology || []) provenBySurface.set(normalizeQuery(term.term), term);
+  const freeSignalPlanCandidates = (args.freeSignalCandidates || []).flatMap<FreePlanCandidate>(candidate => {
+    const surface = candidate.surface.normalize('NFKC').trim().replace(/\s+/g, ' ');
+    if (!surface) return [];
+    const freeAtom = atom(surface, freeSignalAtomType(candidate.signalType), freeSignalIntent(candidate.signalType), 3, 'FREE_SIGNAL');
+    if (!isRetrievalOrientedQuery(args.country, freeAtom.term) && !isBareShortTicker(freeAtom.term)) return [];
+    const anchor = pairingAnchors.find(item =>
+      ['STANDALONE', 'ANCHOR_ONLY'].includes(item.retrievalPolicy.eligibility)
+      && isRetrievalOrientedQuery(args.country, `${item.term} ${freeAtom.term}`));
+    if (anchor) return [{ atoms: [anchor, freeAtom], template: 'ANCHOR_FREE_SIGNAL' as const, freeSignal: candidate }];
+    // Bootstrap-only: a free surface may stand alone only when no authorized
+    // creator-observed anchor exists at all, its semantic class is concrete,
+    // and it still passes the same retrieval-shape gate as every other query.
+    if (!hasAuthorizedAnchor && (freeAtom.type === 'INSTRUMENT' || freeAtom.type === 'METHOD') && isRetrievalOrientedQuery(args.country, freeAtom.term)) {
+      return [{ atoms: [freeAtom], template: 'FREE_SIGNAL_STANDALONE' as const, freeSignal: candidate }];
+    }
+    return [];
+  });
+  const cappedFreeSignalCandidates = capFreeSignalCandidates(
+    freeSignalPlanCandidates,
+    count,
+    Math.min(count, candidates.length),
+  );
+  candidates.splice(Math.min(1, candidates.length), 0, ...cappedFreeSignalCandidates);
+
+  // Optional paid demand signals. The caller only supplies these when the
+  // paid adapter is enabled; the 30% demand-only cap keeps them subordinate
+  // to terminology, free signals, and seeds.
+  const demandPlanCandidates = (args.demandSignalCandidates || []).flatMap<DemandPlanCandidate>(candidate => {
+    const surface = candidate.surface.normalize('NFKC').trim().replace(/\s+/g, ' ');
+    if (!surface) return [];
+    const demandAtom = atom(surface, 'ENTITY', 'market_analysis', 3, 'DEMAND_SIGNAL');
+    const anchor = pairingAnchors.find(item =>
+      ['STANDALONE', 'ANCHOR_ONLY'].includes(item.retrievalPolicy.eligibility)
+      && isRetrievalOrientedQuery(args.country, `${item.term} ${demandAtom.term}`));
+    if (anchor) return [{ atoms: [anchor, demandAtom], template: 'ANCHOR_DEMAND_SIGNAL' as const, demand: candidate }];
+    if (!hasAuthorizedAnchor && isRetrievalOrientedQuery(args.country, demandAtom.term)) {
+      return [{ atoms: [demandAtom], template: 'DEMAND_SIGNAL_STANDALONE' as const, demand: candidate }];
+    }
+    return [];
+  });
+  // Only demand-ONLY queries consume the 30% cap. An anchored demand surface
+  // is a MIXED query (local anchor + demand modifier), not a demand-only one.
+  const cappedStandaloneDemand = capDemandSignalCandidates(
+    demandPlanCandidates.filter(candidate => candidate.template === 'DEMAND_SIGNAL_STANDALONE'),
+    count,
+  );
+  const anchoredDemand = demandPlanCandidates.filter(candidate => candidate.template === 'ANCHOR_DEMAND_SIGNAL');
+  candidates.splice(Math.min(2, candidates.length), 0, ...anchoredDemand, ...cappedStandaloneDemand);
+
   candidates.sort((a, b) => (intentUsage.get(a.atoms[0].intent) || 0) - (intentUsage.get(b.atoms[0].intent) || 0));
+
+  // Creator-observed candidates must not be pushed past the final `count`
+  // limit by free signals, seeds, or other filler. Reserve one portfolio slot
+  // for each creator-derived candidate still ahead in the ordering; deferred
+  // filler is retried after the first pass when a reserved candidate fails a
+  // gate, so the portfolio is not underfilled.
+  const CREATOR_DERIVED_TEMPLATES = new Set(['ANCHOR_LEARNED', 'ORGANIC_STANDALONE', 'ANCHOR_ORGANIC']);
+  const isCreatorDerived = (candidate: (typeof candidates)[number]) => CREATOR_DERIVED_TEMPLATES.has(candidate.template);
+  const creatorRemainingAfter = new Array<number>(candidates.length + 1).fill(0);
+  for (let index = candidates.length - 1; index >= 0; index -= 1) {
+    creatorRemainingAfter[index] = creatorRemainingAfter[index + 1] + (isCreatorDerived(candidates[index]) ? 1 : 0);
+  }
 
   const planned: PlannedQuery[] = [];
   let tier3Used = 0;
-  for (const candidate of candidates) {
-    if (planned.length >= count) break;
+  const trySelect = (candidate: (typeof candidates)[number]): void => {
+    if (planned.length >= count) return;
     const query = candidate.atoms.map(item => item.term).join(' ');
     const normalized = normalizeQuery(query);
     const hasTier3 = candidate.atoms.some(item => item.tier === 3);
     const globalContext = candidate.organic ? { ...candidate.organic.languageCapability.context, governed: true } : undefined;
-    if (blocked.has(normalized) || generated.has(normalized) || !isRetrievalOrientedQuery(args.country, query, globalContext)) continue;
-    if (hasTier3 && tier3Used >= Math.ceil(count / 5)) continue;
+    if (blocked.has(normalized) || generated.has(normalized) || !isRetrievalOrientedQuery(args.country, query, globalContext)) return;
+    if (hasTier3 && tier3Used >= Math.ceil(count / 5)) return;
     if (hasTier3) tier3Used++;
     const tiers = [...new Set(candidate.atoms.map(item => item.tier))] as QueryKnowledgeTier[];
     const primary = candidate.atoms[0];
     const preferredLanguage = supportedLanguages.length ? supportedLanguages[planned.length % supportedLanguages.length] : undefined;
+    const freeSignalTerminology = candidate.freeSignal
+      ? provenBySurface.get(normalizeQuery(candidate.freeSignal.surface))
+      : undefined;
+    const atomSourceTypes = candidate.atoms.map(item =>
+      item.origin === 'LEARNED' ? 'TERMINOLOGY' as const
+        : item.origin === 'FREE_SIGNAL' ? 'FREE_SIGNAL' as const
+        : item.origin === 'DEMAND_SIGNAL' ? 'DEMAND_SIGNAL' as const
+        : 'SEED' as const);
+    let sourceTypes: QueryCandidateSource[] = candidate.organic
+      ? ['TERMINOLOGY']
+      : [...new Set(atomSourceTypes)];
+    if (candidate.freeSignal) {
+      sourceTypes = [...new Set([
+        ...sourceTypes,
+        'FREE_SIGNAL' as const,
+        ...(freeSignalTerminology ? ['TERMINOLOGY' as const] : []),
+      ])];
+    }
+    if (candidate.demand) {
+      sourceTypes = [...new Set([...sourceTypes, 'DEMAND_SIGNAL' as const])];
+    }
+    const demandOnly = candidate.template === 'DEMAND_SIGNAL_STANDALONE';
+    const candidateSource: QueryCandidateSource = sourceTypes.length > 1
+      ? 'MIXED'
+      : sourceTypes[0];
     // Marker consumed by the execution-time authority gate: a promoted anchor
     // acts as anchor only inside this paired template, by operator selection.
     const scopePromotedAnchor = !hasAuthorizedAnchor && promotedAnchors.includes(primary);
@@ -424,7 +584,15 @@ export function planDiverseQueries(args: {
             ? `Combined one compact Tier 1 local anchor with constrained Tier ${candidate.atoms[1].tier} learned vocabulary.`
             : candidate.template === 'ORGANIC_STANDALONE'
               ? `Selected a published proven ${candidate.organic!.sourceType.toLowerCase()} surface with governed concept identity.`
-              : `Combined a local control anchor with a quota-limited governed ${candidate.organic!.sourceType.toLowerCase()} trial surface.`,
+              : candidate.template === 'ANCHOR_ORGANIC'
+                ? `Combined a local control anchor with a quota-limited governed ${candidate.organic!.sourceType.toLowerCase()} trial surface.`
+              : candidate.template === 'ANCHOR_FREE_SIGNAL'
+                ? 'Combined a local retrieval anchor with a free Wikipedia/Wikidata candidate surface.'
+              : candidate.template === 'FREE_SIGNAL_STANDALONE'
+                ? 'Selected a free Wikipedia/Wikidata candidate surface to bootstrap a country with no creator-observed anchor.'
+              : candidate.template === 'ANCHOR_DEMAND_SIGNAL'
+                ? 'Combined a local retrieval anchor with an optional paid demand signal.'
+                : 'Selected an optional paid demand signal to bootstrap a country with no creator-observed anchor.',
       discoveryObjective: OBJECTIVES[primary.intent] || 'Find relevant trading creators using authentic local search vocabulary.',
       metadata: {
         country: args.country,
@@ -432,6 +600,19 @@ export function planDiverseQueries(args: {
         retrievalOptimized: true,
         tokenCount: queryTokenCount(query),
         scriptValidated: true,
+        source: candidateSource,
+        sourceTypes,
+        policyVersion: 'cdl-free-first-v1',
+        demandOnly,
+        ...(candidate.freeSignal ? {
+          freeSignalIds: candidate.freeSignal.sourceIds,
+          freeSignalType: candidate.freeSignal.signalType,
+          language: candidate.freeSignal.language,
+        } : {}),
+        ...(candidate.demand ? {
+          demandSignalIds: candidate.demand.sourceIds,
+          demandScore: candidate.demand.demandScore,
+        } : {}),
         ...(scopePromotedAnchor ? { scopePromoted: true, promotionBasis: args.scopePromotionBasis } : {}),
         retrievalSpecificity:{policyVersion:primary.retrievalPolicy.policyVersion,eligibility:primary.retrievalPolicy.eligibility,specificity:primary.retrievalPolicy.specificity,ambiguity:primary.retrievalPolicy.ambiguity,reasonCodes:primary.retrievalPolicy.reasonCodes},
         atoms: candidate.atoms.map((item, position) => ({ ...item, role: position === 0 ? 'ANCHOR' : 'MODIFIER', position })),
@@ -444,14 +625,18 @@ export function planDiverseQueries(args: {
           selectedLanguage: preferredLanguage,
           ordinal: planned.length + 1
         } : undefined,
-        terminologyId: provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))?.id,
+        terminologyId: provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))?.id ?? freeSignalTerminology?.id,
         terminologyLifecycle: provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))?.lifecycle,
         terminologyDecayedYield: provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))?.score,
         selectionEvidence: provenByTerm.has(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))
           ? `Canonical term ${provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))!.id} ranked by time-decayed production yield.`
-          : candidate.organic
-            ? `${candidate.organic.eligibilityReason}; independently corroborated by ${new Set(candidate.organic.independentSourceIds).size} sources.`
-            : 'Curated or constrained legacy evidence.',
+          : candidate.freeSignal
+            ? `Free-signal candidate from ${candidate.freeSignal.provider} (${candidate.freeSignal.sourceIds.join(', ')}); candidate vocabulary only, never evidence.`
+            : candidate.demand
+              ? `Optional paid demand surface (${candidate.demand.sourceIds.join(', ')}); ranking aid only, never evidence.`
+            : candidate.organic
+              ? `${candidate.organic.eligibilityReason}; independently corroborated by ${new Set(candidate.organic.independentSourceIds).size} sources.`
+              : 'Curated or constrained legacy evidence.',
         organicProvenance: candidate.organic ? {
           candidateId: candidate.organic.candidateId, conceptId: candidate.organic.conceptId,
           sourceType: candidate.organic.sourceType, sourceRefs: candidate.organic.sourceRefs,
@@ -465,6 +650,23 @@ export function planDiverseQueries(args: {
       }
     });
     generated.add(normalized);
+  };
+
+  const deferred: Array<(typeof candidates)[number]> = [];
+  for (let index = 0; index < candidates.length; index += 1) {
+    if (planned.length >= count) break;
+    const candidate = candidates[index];
+    if (!isCreatorDerived(candidate) && planned.length + creatorRemainingAfter[index + 1] >= count) {
+      deferred.push(candidate);
+      continue;
+    }
+    trySelect(candidate);
+  }
+  // A reserved creator candidate may fail a gate (blocked, duplicate, tier
+  // cap). Fill any remaining slots with the deferrals in their original order.
+  for (const candidate of deferred) {
+    if (planned.length >= count) break;
+    trySelect(candidate);
   }
   return planned;
 }

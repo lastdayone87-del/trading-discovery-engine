@@ -1,6 +1,7 @@
 import type { CountryMetadataStatus, CountryStatus, CountryVocabulary, ExcludedCountry } from '../src/types';
 import { SUPPORTED_PRODUCTION_COUNTRIES } from '../src/data/initial_countries';
-import { normalizeCountryName } from './countryExclusionRules';
+import { findCountryExclusion, normalizeCountryName } from './countryExclusionRules';
+import { COUNTRY_ALIASES, countryAliasTarget } from './countryAliases';
 
 export type CountryEvidenceSource =
   | 'OFFICIAL_YOUTUBE_METADATA'
@@ -145,20 +146,6 @@ const CREATOR_EVIDENCE_SOURCES: Set<CountryEvidenceSource> = new Set([
   'AGGREGATED_CONTENT_LANGUAGE'
 ]);
 
-const COUNTRY_ALIASES: Record<string, string> = {
-  us: 'United States', usa: 'United States', 'united states of america': 'United States',
-  gb: 'United Kingdom', uk: 'United Kingdom', 'great britain': 'United Kingdom',
-  de: 'Germany', fr: 'France', es: 'Spain', br: 'Brazil', ru: 'Russia', in: 'India',
-  jp: 'Japan', kr: 'South Korea', tr: 'Turkey', sa: 'Saudi Arabia', ae: 'United Arab Emirates',
-  nl: 'Netherlands', it: 'Italy', ca: 'Canada', au: 'Australia', mx: 'Mexico', ch: 'Switzerland', dk: 'Denmark', se: 'Sweden', sg: 'Singapore', nz: 'New Zealand', be: 'Belgium', lu: 'Luxembourg', ie: 'Ireland'
-  ,ng:'Nigeria', pk:'Pakistan', bd:'Bangladesh', np:'Nepal', ke:'Kenya', za:'South Africa', gh:'Ghana',
-  eg:'Egypt', ma:'Morocco', ph:'Philippines', vn:'Vietnam', id:'Indonesia'
-  ,dz:'Algeria', tn:'Tunisia', et:'Ethiopia', tz:'Tanzania', ug:'Uganda', sn:'Senegal', cm:'Cameroon',
-  zw:'Zimbabwe', zm:'Zambia', rw:'Rwanda', ci:'Ivory Coast', mz:'Mozambique', mg:'Madagascar', sd:'Sudan',
-  ao:'Angola', lk:'Sri Lanka', cz:'Czechia', czech:'Czechia', 'czech republic':'Czechia'
-  ,no:'Norway', norge:'Norway'
-};
-
 const COUNTRY_SIGNALS: Record<string, {
   bio: string[]; tlds: string[]; social: string[]; exchanges: string[]; brokers: string[];
   phones: string[]; addresses: string[]; language: string[];
@@ -244,6 +231,38 @@ export function countryIsoAlias(value: string): string | null {
     key.length === 2 && canonicalCountry(country) === canonical
   )?.[0];
   return alias ? alias.toUpperCase() : null;
+}
+
+/**
+ * Normalized identity terms that bind an external entity to a country:
+ * canonical name, alias spellings, localized country names from the creator
+ * bio vocabulary, exchange names, and known cities. Used to reject generic
+ * search results that belong to another market. Two-letter Latin aliases are
+ * omitted so ISO codes cannot match inside unrelated words. A two-character
+ * CJK/Hangul name is a complete local word, not an abbreviation, so those
+ * scripts keep short terms.
+ */
+export function countryIdentityTerms(value: string): string[] {
+  const country = canonicalCountry(value);
+  const terms = new Set<string>();
+  const add = (term: unknown) => {
+    if (typeof term !== 'string') return;
+    const normalized = normalizeCountryName(term);
+    const minLength = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(normalized) ? 2 : 3;
+    if (normalized.length >= minLength) terms.add(normalized);
+  };
+  add(country);
+  for (const [alias, target] of Object.entries(COUNTRY_ALIASES)) {
+    if (canonicalCountry(target) === country) add(alias);
+  }
+  const signals = Object.hasOwn(COUNTRY_SIGNALS, country) ? COUNTRY_SIGNALS[country] : undefined;
+  if (signals) {
+    signals.bio.forEach(add);
+    signals.exchanges.forEach(add);
+    signals.social.forEach(add);
+    signals.addresses.forEach(add);
+  }
+  return [...terms];
 }
 
 /**
@@ -755,7 +774,7 @@ export function assessChannelCountry(
       const aggregated = aggregateContentLanguage(input.videoDescriptions || [], input.playlists || []);
       if (aggregated) {
         const isLiveExcluded = (country: string): boolean =>
-          exclusions.some(item => normalizeCountryName(item.country_name) === normalizeCountryName(country));
+          findCountryExclusion(country, exclusions) !== null;
         // Language-only rejection requires every candidate country currently
         // excluded. If any set member is not excluded, emit nothing.
         if (aggregated.countries.every(isLiveExcluded)) {
@@ -779,7 +798,7 @@ export function assessChannelCountry(
             priority: 0,
             detectedCountry: representative,
             confidence: aggregated.confidence,
-            reasoning: `${representative} is excluded by policy: ${(exclusions.find(item => normalizeCountryName(item.country_name) === normalizeCountryName(representative))?.reason) || 'Excluded by policy'}.`
+            reasoning: `${representative} is excluded by policy: ${findCountryExclusion(representative, exclusions)?.reason || 'Excluded by policy'}.`
           };
           return {
             discoveryCountry,
@@ -825,7 +844,7 @@ export function assessChannelCountry(
   const [detectedCreatorCountry, topConfidence] = ranked[0];
   const conflict = ranked.length > 1 && ranked[1][1] === topConfidence;
   const confidence = conflict ? Math.min(49, topConfidence) : topConfidence;
-  const excluded = exclusions.find(item => normalizeCountryName(item.country_name) === normalizeCountryName(detectedCreatorCountry));
+  const excluded = findCountryExclusion(detectedCreatorCountry, exclusions);
   // Hard-exclusion authority additionally requires at least one decisive item
   // stronger than a bare mention: a passing country-name mention in a bio is
   // not domicile and can never independently justify REJECT_EXCLUDED, while

@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { findCountryExclusion, normalizeCountryName } from './countryExclusionRules';
-import { assertCountryAllowed, getCountryExclusion } from './countryExclusion';
+import { countryAliasTarget } from './countryAliases';
+import { assertCountryAllowed, getCountryExclusion, shouldBlockEnrichClaimForCountry } from './countryExclusion';
 import { buildOperationalEnrichmentRecoveryPayload } from './queueManager';
 import type { DiscoverySource } from '../src/types';
 
@@ -23,6 +24,52 @@ test('matches a configured exclusion after normalization', () => {
 
 test('does not reject a country absent from the configured list', () => {
   assert.equal(findCountryExclusion('Germany', exclusions), null);
+});
+
+test('matches an ISO alias to the exclusion stored under the canonical name', () => {
+  const aliasExclusions = [{ country_name: 'Germany', reason: 'Operator exclusion' }];
+  assert.deepEqual(findCountryExclusion('DE', aliasExclusions), {
+    country: 'Germany',
+    reason: 'Operator exclusion'
+  });
+  assert.deepEqual(findCountryExclusion(' de ', aliasExclusions), {
+    country: 'Germany',
+    reason: 'Operator exclusion'
+  });
+});
+
+test('matches a canonical name to the exclusion stored under an ISO alias', () => {
+  const aliasExclusions = [{ country_name: 'DE', reason: 'Operator exclusion' }];
+  assert.deepEqual(findCountryExclusion('Germany', aliasExclusions), {
+    country: 'DE',
+    reason: 'Operator exclusion'
+  });
+});
+
+test('resolves non-ISO alias spellings through the shared identity map', () => {
+  assert.deepEqual(findCountryExclusion('USA', [{ country_name: 'United States', reason: 'x' }]), {
+    country: 'United States',
+    reason: 'x'
+  });
+  assert.deepEqual(findCountryExclusion('czech republic', [{ country_name: 'Czechia', reason: 'x' }]), {
+    country: 'Czechia',
+    reason: 'x'
+  });
+  assert.equal(findCountryExclusion('Atlantis', [{ country_name: 'Germany', reason: 'x' }]), null);
+});
+
+test('alias lookup fails closed for inherited object properties', () => {
+  for (const key of ['constructor', 'tostring', 'valueof', '__proto__', 'hasownproperty']) {
+    assert.equal(countryAliasTarget(key), null, `${key} must not resolve through Object.prototype`);
+    assert.equal(findCountryExclusion(key, exclusions), null);
+  }
+});
+
+test('ENRICH claim gate accepts an alias-form exclusion match for the same country', () => {
+  const exclusion = findCountryExclusion('Germany', [{ country_name: 'DE', reason: 'Operator exclusion' }]);
+  assert.ok(exclusion);
+  assert.deepEqual(shouldBlockEnrichClaimForCountry('CONFIRMED', 'Germany', exclusion), exclusion);
+  assert.equal(shouldBlockEnrichClaimForCountry('CONFIRMED', 'France', exclusion), null);
 });
 
 test('null, undefined, and empty country input normalize to empty without throwing', () => {

@@ -173,6 +173,17 @@ test('Vietnamese 10/10, 9/10 and 8/10 reject; 7/10 processes', () => {
   assert.notEqual(seven.countryStatus, 'REJECTED');
 });
 
+test('Vietnamese aggregate rejects through an alias-form exclusion row', () => {
+  const alias = assess(
+    { videoDescriptions: descriptions(VI, 10) },
+    [{ country_name: 'VN', reason: 'alias exclusion' }],
+  );
+  assert.equal(alias.countryStatus, 'REJECTED');
+  assert.equal(alias.gateDisposition, 'REJECT_EXCLUDED');
+  assert.equal(alias.detectedCreatorCountry, 'Vietnam');
+  assert.equal(alias.decisiveEvidence[0]?.source, 'AGGREGATED_CONTENT_LANGUAGE');
+});
+
 test('below-minimum samples never reject regardless of share', () => {
   assert.notEqual(assess({ videoDescriptions: [VI, VI, VI, VI] }).countryStatus, 'REJECTED');
   assert.notEqual(assess({ videoDescriptions: [VI, VI, VI, VI, VI] }).countryStatus, 'REJECTED');

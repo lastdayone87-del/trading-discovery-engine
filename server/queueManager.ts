@@ -40,6 +40,14 @@ import {
   countDiscordProviderFailureObservations,
   appendExternalAcquisitionObservations,
   getNeighborhoodForQueryRun,
+  getExcludedCountries,
+  getAutonomousQuotaAvailability,
+  getQueryRunProgress,
+  updateQueryRunProgress,
+  markQueryRunDeferred,
+  markQueryRunResumeUnavailable,
+  createContinuationRunSegment,
+  setQueryRunJobId,
   markCommunityInspectionStarted,
   markSiteInspectionsClaimed,
   markSiteInspectionsDiscarded,
@@ -63,7 +71,7 @@ import {buildProviderRequestBaseId,executeAllocatedRetrievalPage,providerSnapsho
 import './braveSearch';
 import './youtubeInnertubeProvider';
 import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator, replayVocabularyForRetry } from './queryIntelligence';
-import { calculateQueryFunnel, countDeferredRawResults, manualSearchContinuationMetrics, type FunnelOutcome, type QueryObservation } from './queryPerformance';
+import { calculateQueryFunnel, countDeferredRawResults, manualSearchContinuationMetrics, type FunnelOutcome, type QueryFunnelMetrics, type QueryObservation } from './queryPerformance';
 import { resolveScopeEligibility } from './scopeEligibility';
 import { processChannelThroughPipeline, isTerminalState, applyGate1CountryRejectionToExisting, type PipelineExecutionOptions } from './ingestionPipeline';
 import { evaluateLowAudienceGate } from './lowAudienceGate';
@@ -81,12 +89,24 @@ import { isProbeQuotaControlError } from './quotaKeyCapShadow';
 import { assertCountryAllowed, ExcludedCountryError, getCountryExclusion, shouldBlockEnrichClaimForCountry } from './countryExclusion';
 import { randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
-import { evaluateContinuation } from './continuationPolicy';
+import { computeEffectivePageBudget, evaluateContinuation, evaluateContinuationV2, planPersistedPageRecovery, resumeModeForProvider, shouldCreateContinuationSegment, type ContinuationDecisionV2, type ContinuationResumeMode } from './continuationPolicy';
 import { evaluateAutonomousQueryAuthority, isScopePromotedRecord } from './autonomousQueryAuthority';
-import { getDiscoveryScope, resolveScopePromotionForScope } from './autonomousDiscovery';
+import { getDiscoveryScope, resolveAutonomousCountries, resolveScopePromotionForScope } from './autonomousDiscovery';
+import { YOUTUBE_INNERTUBE_MAX_PAGES, INNERTUBE_TIMEOUT_CODE } from './youtubeInnertubeProvider';
+import { getNextYouTubeQuotaResetAt } from './youtubeQuotaDay';
 import { shouldReactivateCommunityRecovery, reactivateCommunityRecovery, projectTerminalCommunityRetryFailure } from './communityRecovery';
 import { isProviderDeferredEnrichmentError } from './enrichmentOperationalFailure';
-import { autonomousPageExists, getAutonomousContinuationState, getAutonomousRunMetrics, recordAutonomousPage } from './autonomousPageStore';
+import {
+  AUTONOMOUS_CONTINUATION_CANDIDATES_PER_COUNTRY,
+  autonomousPageExists,
+  countNovelCandidateTermsForPage,
+  getAutonomousContinuationState,
+  getAutonomousPageMarginalMetrics,
+  getAutonomousPageObservation,
+  getAutonomousRunMetrics,
+  listPendingAutonomousRuns,
+  recordAutonomousPage,
+} from './autonomousPageStore';
 import { recordPassivePage, recordShadowFailure } from './passiveExploration';
 import { enqueueTermHarvest, processTermHarvestJob, readCorpusBudgetForUpdate } from './candidateCorpus';
 import { selectExplicitTerminologyLanguageContext, type ExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
@@ -118,6 +138,17 @@ import { processPendingStagedCandidates } from './candidateStaging';
 const WORKER_ID = `worker_${process.pid}`;
 
 /**
+ * Continuation-first scheduling priority. Deferred page continuations are
+ * already-admitted work for a country that earned a slot; they must be
+ * claimed before a brand-new query for another country. Job claiming orders
+ * by priority DESC, so the continuation priority is strictly higher than the
+ * new-query priority (20, see addSearchJob) while staying below operator
+ * manual searches (100).
+ */
+export const AUTONOMOUS_NEW_QUERY_JOB_PRIORITY = 20;
+export const AUTONOMOUS_CONTINUATION_JOB_PRIORITY = 25;
+
+/**
  * Pushes a new search query job to the Search Jobs Queue.
  */
 export interface JobProvenance { actorId: string; requestId?: string }
@@ -130,7 +161,7 @@ export async function addSearchJob(query: string, country: string, source: Disco
     { query, country, source, provenance, catalogPin, traceId:provenance.requestId, queryId },
     {
       idempotencyKey: `search:${source}:${country.toLowerCase()}:${query.toLowerCase()}`,
-      priority: source === 'manual_search' ? 100 : 20
+      priority: source === 'manual_search' ? 100 : AUTONOMOUS_NEW_QUERY_JOB_PRIORITY
     }
   );
   await recordExecutionStage('QUEUE_PERSISTENCE','REACHED',{jobId:job.id,type:'SEARCH_YOUTUBE',source},provenance.requestId);
@@ -491,6 +522,348 @@ export function buildSearchLatencyBreakdownMs(searchWorkerStartMs: number, searc
   };
 }
 
+interface AutonomousRunFinalizationArgs {
+  job: { id: string; payload: any };
+  workerId: string;
+  queryRunId: string;
+  queryId?: number;
+  query: string;
+  country: string;
+  pageNumber: number;
+  retrievalLane: RetrievalLane;
+  searchOrdering: import('./searchOrdering').SearchOrdering;
+  retrievalConfigKey?: string | null;
+  pageMetrics: QueryFunnelMetrics;
+  allocatedProvider: ProviderAllocation;
+  providerCostUsd: number;
+  searchWorkerStartMs: number;
+  searchQuotaWaitMs: number;
+  searchRetrievalGrossMs: number;
+  searchTopUpWaitMs: number;
+  channelLoopStartMs: number;
+  channelLoopEndMs: number;
+  trial?: { trialId?: string } | null;
+  nextPageToken: string | null;
+  createContinuation: boolean;
+  continuationExplorationPagesRemaining: number;
+  continuationResumeMode: ContinuationResumeMode;
+}
+
+/**
+ * Complete one autonomous search run from its persisted pages. Shared by the
+ * normal worker path and the saved-page retry replay so the parent's final
+ * counts, provider telemetry, query learning and linked child handoff cannot
+ * drift between the two entry points.
+ */
+async function finalizeAutonomousSearchRun(args: AutonomousRunFinalizationArgs): Promise<void> {
+  const finalMetrics = await getAutonomousRunMetrics(args.queryRunId);
+  let providerCostUsd = Math.max(0, Number(args.providerCostUsd) || 0);
+  let providerRequestsAttempted = 0;
+  let providerRequestsSucceeded = 0;
+  let providerRequestsFailed = 0;
+  let providerRateLimited = 0;
+  let providerPagesRetrieved = 0;
+  if (args.job.payload.provider?.costDomain === 'BRAVE_SEARCH_API') {
+    const providerTotals = await (await getDb()).query(`SELECT provider_cost_usd,provider_requests_attempted,provider_requests_succeeded,provider_requests_failed,provider_rate_limited,provider_pages_retrieved FROM query_runs WHERE id=$1`, [args.queryRunId]);
+    const totals = providerTotals.rows[0] || {};
+    providerCostUsd = Number(totals.provider_cost_usd || providerCostUsd);
+    providerRequestsAttempted = Number(totals.provider_requests_attempted || 0);
+    providerRequestsSucceeded = Number(totals.provider_requests_succeeded || 0);
+    providerRequestsFailed = Number(totals.provider_requests_failed || 0);
+    providerRateLimited = Number(totals.provider_rate_limited || 0);
+    providerPagesRetrieved = Number(totals.provider_pages_retrieved || 0);
+  }
+  let providerRunOutcome: ProviderRunOutcome | undefined;
+  if (args.allocatedProvider.providerKey === 'youtube-innertube') {
+    const providerCounts = await (await getDb()).query(`SELECT COUNT(*)::int AS attempted, COUNT(*) FILTER (WHERE status='SUCCESS')::int AS succeeded, COUNT(*) FILTER (WHERE status NOT IN ('SUCCESS','RATE_LIMITED'))::int AS failed, COUNT(*) FILTER (WHERE status='RATE_LIMITED')::int AS rate_limited FROM provider_call_events WHERE run_id=$1::text AND provider='youtube-innertube' AND operation='search'`, [args.queryRunId]);
+    const counts = providerCounts.rows[0] || {};
+    providerRequestsAttempted = Number(counts.attempted || 0);
+    providerRequestsSucceeded = Number(counts.succeeded || 0);
+    providerRequestsFailed = Number(counts.failed || 0);
+    providerRateLimited = Number(counts.rate_limited || 0);
+    providerPagesRetrieved = providerRequestsSucceeded;
+    providerRunOutcome = resolveInnertubeRunOutcome({
+      rawResults: finalMetrics.rawResults,
+      providerRequestsAttempted,
+      providerRequestsSucceeded,
+      providerRequestsFailed,
+      providerRateLimited,
+    });
+  } else if (args.allocatedProvider.providerKey !== 'brave-search') {
+    const providerCounts = await (await getDb()).query(`SELECT COUNT(*)::int AS attempted, COUNT(*) FILTER (WHERE status='SUCCESS')::int AS succeeded, COUNT(*) FILTER (WHERE status NOT IN ('SUCCESS','RATE_LIMITED'))::int AS failed, COUNT(*) FILTER (WHERE status='RATE_LIMITED')::int AS rate_limited FROM provider_call_events WHERE run_id=$1::text AND provider='youtube' AND operation='search'`, [args.queryRunId]);
+    const counts = providerCounts.rows[0] || {};
+    providerRequestsAttempted = Number(counts.attempted || 0);
+    providerRequestsSucceeded = Number(counts.succeeded || 0);
+    providerRequestsFailed = Number(counts.failed || 0);
+    providerRateLimited = Number(counts.rate_limited || 0);
+    providerPagesRetrieved = providerRequestsSucceeded;
+    providerRunOutcome = classifyProviderRunOutcome({
+      rawResults: finalMetrics.rawResults,
+      providerRequestsAttempted,
+      providerRequestsSucceeded,
+      providerRequestsFailed,
+      providerRateLimited,
+    });
+  } else {
+    providerRunOutcome = classifyProviderRunOutcome({
+      rawResults: finalMetrics.rawResults,
+      providerRequestsAttempted,
+      providerRequestsSucceeded,
+      providerRequestsFailed,
+      providerRateLimited,
+    });
+  }
+  const quotaConsumed = providerCostUsd > 0 || args.allocatedProvider.costDomain === 'YOUTUBE_INNERTUBE_FREE' ? 0 : args.pageNumber * 100;
+  const queryRecord = args.queryId ? await getQueryById(args.queryId) : null;
+  const performance = queryRecord
+    ? await evaluateQueryPerformance(queryRecord, finalMetrics, {
+      retrievalLane: args.retrievalLane,
+      searchOrdering: args.searchOrdering,
+      quotaConsumed,
+      persist: false,
+    })
+    : { performanceScore: 0, newCollection: undefined as 'PROVEN' | 'EXPERIMENTAL' | 'REJECTED' | undefined };
+  const latencyBreakdownMs = buildSearchLatencyBreakdownMs(
+    args.searchWorkerStartMs, args.searchQuotaWaitMs, args.searchRetrievalGrossMs,
+    args.searchTopUpWaitMs, args.channelLoopStartMs, args.channelLoopEndMs, Date.now(),
+  );
+  if (args.createContinuation && args.nextPageToken) {
+    // The child is a new run: it computes and persists its own fair-share
+    // quota budget on its first page. Passing the parent's full budget here
+    // would let the segment spend the same fair-share allocation twice.
+    const segment = await createContinuationRunSegment({
+      parentRunId: args.queryRunId,
+      nextPageToken: args.nextPageToken,
+      resumeMode: args.continuationResumeMode,
+      explorationPagesRemaining: args.continuationExplorationPagesRemaining,
+    });
+    const childJob = await enqueueJob('SEARCH_YOUTUBE', {
+      ...args.job.payload,
+      queryRunId: segment.childRunId,
+      pageNumber: 1,
+      pageToken: args.nextPageToken,
+    }, {
+      priority: AUTONOMOUS_CONTINUATION_JOB_PRIORITY,
+      maxAttempts: 3,
+      idempotencyKey: `search-run:${segment.childRunId}:page:1`,
+    });
+    await setQueryRunJobId(segment.childRunId, childJob.id);
+    console.log(JSON.stringify({
+      event: 'autonomous_page_ceiling_continuation',
+      parentRunId: args.queryRunId,
+      childRunId: segment.childRunId,
+      childJobId: childJob.id,
+      segment: segment.segment,
+      pageNumber: args.pageNumber,
+      resumeMode: segment.resumeMode,
+      timestamp: new Date().toISOString(),
+    }));
+  }
+  await completeQueryRun(args.queryRunId, {
+    ...finalMetrics,
+    uniqueChannels: finalMetrics.newChannels,
+    qualityChannels: finalMetrics.qualityChannels,
+    communitiesDiscovered: finalMetrics.communitiesDiscovered,
+    quotaUsed: quotaConsumed,
+    providerCostUsd,
+    providerRequestsAttempted,
+    providerRequestsSucceeded,
+    providerRequestsFailed,
+    providerRateLimited,
+    providerPagesRetrieved,
+    providerRunOutcome,
+    averageQualityScore: finalMetrics.averageQualityScore,
+    performanceScore: performance.performanceScore,
+    newCollection: performance.newCollection,
+    latencyBreakdownMs,
+    // Opt-in trial linkage recorded on the job payload at schedule time.
+    // Absent on every legacy run.
+    ...(typeof args.trial?.trialId === 'string' && args.trial.trialId ? { trialCompletion: { trialId: args.trial.trialId } } : {}),
+  });
+  if (args.queryId) {
+    await addQueryExecutionLog({
+      query_run_id: args.queryRunId,
+      query_id: args.queryId, query: args.query, country: args.country, executed_at: new Date().toISOString(),
+      channels_discovered: finalMetrics.distinctResults, unique_new_channels: finalMetrics.newChannels,
+      quality_creators_discovered: finalMetrics.qualityChannels, communities_discovered: finalMetrics.communitiesDiscovered,
+      cycle_quality_score: performance.performanceScore,
+      logs: [`Durable autonomous ${args.retrievalLane} lane run ${args.queryRunId} completed by ${args.workerId} via ${args.allocatedProvider.costDomain === 'YOUTUBE_INNERTUBE_FREE' ? 'YOUTUBE_INNERTUBE_FREE' : 'YOUTUBE_DATA_API'}.`, `Provider outcome: ${providerRunOutcome || 'UNAVAILABLE'}`, `Funnel: ${JSON.stringify(args.pageMetrics)}`],
+    });
+  }
+  const neighborhoodInfo = await getNeighborhoodForQueryRun(args.queryRunId);
+  if (neighborhoodInfo && args.retrievalConfigKey) {
+    await recomputeNeighborhoodRetrievalEvidence(neighborhoodInfo.neighborhood_key, args.retrievalConfigKey)
+      .catch(err => console.warn('[RetrievalPolicyEvidence] Post-run evidence recomputation error:', err));
+  }
+}
+
+interface PersistedPageRecoveryArgs {
+  job: { id: string; payload: any };
+  workerId: string;
+  queryRunId: string;
+  pageNumber: number;
+  query: string;
+  country: string;
+  queryId?: number;
+  retrievalLane: RetrievalLane;
+  searchOrdering: import('./searchOrdering').SearchOrdering;
+  retrievalConfigKey?: string | null;
+}
+
+/**
+ * Complete a parent whose safety-ceiling child was already linked. The child
+ * owns the remaining cursor and is scheduled as its own run; the parent must
+ * still persist its final page counts instead of staying RUNNING forever.
+ */
+async function finalizeLinkedAutonomousParent(run: {
+  runId: string;
+  queryId: number;
+  query: string;
+  country: string;
+  pagesCompleted: number;
+  nextPageToken: string | null;
+  resumeMode: ContinuationResumeMode;
+  explorationPagesRemaining: number;
+  retrievalLane: string | null;
+  searchOrdering: string | null;
+  retrievalConfigKey: string | null;
+  runMetadata: Record<string, unknown> | null;
+  providerAllocationSnapshot: unknown;
+}): Promise<void> {
+  const observation = run.pagesCompleted > 0
+    ? await getAutonomousPageObservation(run.runId, run.pagesCompleted)
+    : null;
+  const metadata = run.runMetadata || {};
+  const trial = metadata.trial && typeof metadata.trial === 'object'
+    ? metadata.trial as { trialId?: string }
+    : null;
+  const allocatedProvider = run.providerAllocationSnapshot
+    ? providerSnapshot(run.providerAllocationSnapshot as ProviderAllocation)
+    : YOUTUBE_SEARCH_PROVIDER;
+  await finalizeAutonomousSearchRun({
+    job: { id: '', payload: { provider: run.providerAllocationSnapshot || undefined, trial } },
+    workerId: 'autonomous-reconciler',
+    queryRunId: run.runId,
+    queryId: run.queryId,
+    query: run.query,
+    country: run.country,
+    pageNumber: run.pagesCompleted,
+    retrievalLane: (run.retrievalLane || 'VIDEO') as RetrievalLane,
+    searchOrdering: (run.searchOrdering || 'RELEVANCE') as import('./searchOrdering').SearchOrdering,
+    retrievalConfigKey: run.retrievalConfigKey,
+    pageMetrics: observation?.pageMetrics || ({} as QueryFunnelMetrics),
+    allocatedProvider,
+    providerCostUsd: observation?.providerPageCostUsd || 0,
+    searchWorkerStartMs: Date.now() - (observation?.elapsedMs || 0),
+    searchQuotaWaitMs: 0,
+    searchRetrievalGrossMs: observation?.retrievalMs || 0,
+    searchTopUpWaitMs: 0,
+    channelLoopStartMs: Date.now() - (observation?.processingMs || 0),
+    channelLoopEndMs: Date.now(),
+    trial,
+    nextPageToken: run.nextPageToken,
+    createContinuation: false,
+    continuationExplorationPagesRemaining: run.explorationPagesRemaining,
+    continuationResumeMode: run.resumeMode,
+  });
+}
+
+/**
+ * Replay the post-page handoff for a page that is already durable. The retry
+ * must never re-execute the provider page, but it must finish the parent or
+ * ensure its linked child instead of exiting at the page-exists guard.
+ */
+async function recoverPersistedAutonomousPage(args: PersistedPageRecoveryArgs): Promise<void> {
+  const progress = await getQueryRunProgress(args.queryRunId);
+  if (!progress) return;
+  const observation = await getAutonomousPageObservation(args.queryRunId, args.pageNumber);
+  const [paginationSetting, cdlSetting] = await Promise.all([
+    getAppSetting('autonomous_pagination_enabled', 'true'),
+    getAppSetting('country_discovery_loop_enabled', 'true'),
+  ]);
+  const paginationEnabled = paginationSetting === 'true' && cdlSetting === 'true';
+  const action = planPersistedPageRecovery({
+    pageNumber: args.pageNumber,
+    pagesCompleted: progress.pagesCompleted,
+    continuationStatus: progress.continuationStatus,
+    continuedToRunId: progress.continuedToRunId,
+    nextPageToken: progress.nextPageToken,
+    resumeMode: progress.resumeMode,
+    explorationPagesRemaining: progress.explorationPagesRemaining,
+    effectiveBindingBound: progress.effectiveBindingBound,
+    paginationEnabled,
+    observation: observation ? {
+      pageNumber: observation.pageNumber,
+      nextPageToken: observation.nextPageToken,
+      shouldContinue: observation.shouldContinue,
+      primaryReason: observation.primaryReason,
+      resumeMode: observation.resumeMode,
+      continuationDecisionV2: observation.continuationDecisionV2,
+    } : null,
+  });
+  if (action.kind === 'NONE') return;
+  if (action.kind === 'DEFER') {
+    if (action.reason === 'QUOTA') await deferAutonomousRunForQuota(args.queryRunId, 'PERSISTED_PAGE_RECOVERY');
+    else await deferAutonomousRunForTime(args.queryRunId, 'PERSISTED_PAGE_RECOVERY');
+    return;
+  }
+  let nextPageToken = observation?.nextPageToken || progress.nextPageToken;
+  let resumeMode: ContinuationResumeMode = progress.resumeMode !== 'NONE' ? progress.resumeMode : (observation?.resumeMode || 'NONE');
+  let explorationPagesRemaining = progress.explorationPagesRemaining;
+  let createContinuation = false;
+  if (action.kind === 'ENSURE_CHILD') {
+    const child = await getQueryRunProgress(action.childRunId);
+    const childNeedsJob = Boolean(child) && !['COMPLETE', 'FAILED', 'RESUME_UNAVAILABLE', 'DEFERRED_QUOTA', 'DEFERRED_TIME'].includes(child!.continuationStatus);
+    const childToken = action.nextPageToken || child?.nextPageToken || null;
+    if (childNeedsJob) {
+      const childJob = await enqueueJob('SEARCH_YOUTUBE', {
+        ...args.job.payload,
+        queryRunId: action.childRunId,
+        pageNumber: 1,
+        pageToken: childToken,
+      }, {
+        priority: AUTONOMOUS_CONTINUATION_JOB_PRIORITY,
+        maxAttempts: 3,
+        idempotencyKey: `search-run:${action.childRunId}:page:1`,
+      });
+      await setQueryRunJobId(action.childRunId, childJob.id);
+    }
+    nextPageToken = childToken;
+    resumeMode = action.resumeMode;
+  } else if (action.kind === 'CREATE_CHILD') {
+    createContinuation = true;
+    nextPageToken = action.nextPageToken;
+    resumeMode = action.resumeMode;
+    explorationPagesRemaining = action.explorationPagesRemaining;
+  }
+  await finalizeAutonomousSearchRun({
+    job: args.job,
+    workerId: args.workerId,
+    queryRunId: args.queryRunId,
+    queryId: args.queryId,
+    query: args.query,
+    country: args.country,
+    pageNumber: args.pageNumber,
+    retrievalLane: args.retrievalLane,
+    searchOrdering: args.searchOrdering,
+    retrievalConfigKey: args.retrievalConfigKey,
+    pageMetrics: observation?.pageMetrics || ({} as QueryFunnelMetrics),
+    allocatedProvider: providerSnapshot(args.job.payload.provider || YOUTUBE_SEARCH_PROVIDER),
+    providerCostUsd: observation?.providerPageCostUsd || 0,
+    searchWorkerStartMs: Date.now() - (observation?.elapsedMs || 0),
+    searchQuotaWaitMs: 0,
+    searchRetrievalGrossMs: observation?.retrievalMs || 0,
+    searchTopUpWaitMs: 0,
+    channelLoopStartMs: Date.now() - (observation?.processingMs || 0),
+    channelLoopEndMs: Date.now(),
+    trial: args.job.payload.trial || null,
+    nextPageToken,
+    createContinuation,
+    continuationExplorationPagesRemaining: explorationPagesRemaining,
+    continuationResumeMode: resumeMode,
+  });
+}
+
 /**
  * Durable job types claimable through processNextSearchJob overrides.
  * RELATIONSHIP_CANARY_EXPANSION rides the existing SEARCH pool (same YouTube
@@ -498,6 +871,72 @@ export function buildSearchLatencyBreakdownMs(searchWorkerStartMs: number, searc
  * new worker architecture is required for continuous canary consumption.
  */
 export type ClaimableSearchJobType = 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'RESOLVE_STAGED_CANDIDATE' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'RETRY_COMMUNITY_ACQUISITION' | 'TERM_HARVEST' | 'SCORE_CANDIDATES' | 'AI_ADJUDICATE_CANDIDATE' | 'PROPOSE_CONCEPT_RESOLUTION' | 'OFFLINE_CANDIDATE_EVALUATION' | 'INSPECT_PLAYLIST' | 'INSPECT_FEATURED_CHANNELS' | 'PERSISTENT_RESEARCH_EXTERNAL_PROVIDER' | 'COUNTRY_BOUNDARY_REPROCESS' | 'RELATIONSHIP_CANARY_EXPANSION';
+
+const AUTONOMOUS_TIME_DEFER_MS = 5 * 60_000;
+let lastAutonomousResumeSweepAt = 0;
+
+/** Persist a resumable quota deferral. The run is not completed and the
+ * next-page cursor is retained on the run/page rows. */
+async function deferAutonomousRunForQuota(runId: string, reason: string): Promise<void> {
+  const deferredUntil = new Date(getNextYouTubeQuotaResetAt()).toISOString();
+  await markQueryRunDeferred(runId, 'DEFERRED_QUOTA', deferredUntil);
+  console.log(JSON.stringify({
+    event: 'autonomous_run_deferred_quota',
+    runId,
+    deferredUntil,
+    reason: reason.slice(0, 300),
+    timestamp: new Date().toISOString(),
+  }));
+}
+
+async function deferAutonomousRunForTime(runId: string, reason: string): Promise<void> {
+  const deferredUntil = new Date(Date.now() + AUTONOMOUS_TIME_DEFER_MS).toISOString();
+  await markQueryRunDeferred(runId, 'DEFERRED_TIME', deferredUntil);
+  console.log(JSON.stringify({
+    event: 'autonomous_run_deferred_time',
+    runId,
+    deferredUntil,
+    reason: reason.slice(0, 300),
+    timestamp: new Date().toISOString(),
+  }));
+}
+
+/**
+ * Normalized keys for the configured active autonomous sweep scope. The
+ * reconciler uses this to enforce report §6.7: it never resumes a run whose
+ * country left the active scope (scope narrowing, dormancy, or exclusion), even
+ * when the run still carries a valid provider cursor.
+ */
+async function resolveActiveAutonomousCountryKeys(): Promise<Set<string>> {
+  const [vocabs, excluded, scope] = await Promise.all([
+    getCountryVocabularies(),
+    getExcludedCountries(),
+    getDiscoveryScope(),
+  ]);
+  const countries = resolveAutonomousCountries(
+    vocabs.map(vocab => vocab.country),
+    excluded.map(item => item.country_name),
+    scope.selectedCountries,
+    scope.scope,
+  );
+  return new Set(countries.map(country => country.normalize('NFKC').trim().toLocaleLowerCase('en')));
+}
+
+function autonomousCountryKey(country: string): string {
+  return country.normalize('NFKC').trim().toLocaleLowerCase('en');
+}
+
+/** Count the configured active countries for fair-share quota budgeting. */
+async function countActiveAutonomousCountries(): Promise<number> {
+  return Math.max(1, (await resolveActiveAutonomousCountryKeys()).size);
+}
+
+function providerPageCap(providerKey: string, safetyMaxPages: number): number {
+  if (providerKey === 'youtube-innertube') return YOUTUBE_INNERTUBE_MAX_PAGES;
+  if (providerKey === 'brave-search') return Math.max(1, Number(process.env.BRAVE_MAX_OFFSET || 9) + 1);
+  return safetyMaxPages;
+}
+
 
 /**
  * Atomic daily-budget guards evaluated inside the claim transaction (see
@@ -1156,7 +1595,14 @@ export async function processNextSearchJob(
       const started = await startQueryRun(queryRunId);
       if (!started) { await completeJob(job.id); return true; }
     }
-    if (queryRunId && pageNumber > 1 && await autonomousPageExists(queryRunId,pageNumber)) { await completeJob(job.id); return true; }
+    if (queryRunId && await autonomousPageExists(queryRunId,pageNumber)) {
+      // The page is already durable: never pay for it again. Replay the
+      // post-page handoff so a failure after the observation committed cannot
+      // strand the parent or its linked continuation child.
+      await recoverPersistedAutonomousPage({ job, workerId, queryRunId, pageNumber, query, country, queryId, retrievalLane, searchOrdering, retrievalConfigKey });
+      await completeJob(job.id);
+      return true;
+    }
 
     const autonomousOperationId=queryRunId?`${queryRunId}:${pageNumber}`:'';
     let providerQuotaUnits = 0;
@@ -1194,7 +1640,16 @@ export async function processNextSearchJob(
         providerQuotaUnits=100;
         const budget=getDailyYouTubeQuotaBudget();
         const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));
-        if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:providerQuotaUnits,dailyBudget:budget,allocationPercent:percent}))throw new QuotaAllocationExhaustedError('AUTONOMOUS');
+        if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:providerQuotaUnits,dailyBudget:budget,allocationPercent:percent})){
+          // A denied page is deferred, never completed or failed: the run keeps
+          // its page number and next-page cursor for the reconciler. Persist
+          // the provider's resume mode first, otherwise a page-1 deferral has
+          // no cursor mode and the reconciler cannot recover it.
+          await updateQueryRunProgress(queryRunId, { resumeMode: resumeModeForProvider(allocatedProvider.providerKey) }).catch(() => undefined);
+          await deferAutonomousRunForQuota(queryRunId, 'AUTONOMOUS_QUERY_PAGE quota reservation denied');
+          await completeJob(job.id);
+          return true;
+        }
       }
       searchQuotaWaitMs += Date.now() - quotaWaitStartMs;
       try {
@@ -1223,6 +1678,31 @@ export async function processNextSearchJob(
           await (await getDb()).query(`UPDATE query_runs SET provider_cost_usd=provider_cost_usd+$2,provider_pricing_version=$3,provider_requests_attempted=provider_requests_attempted+1,provider_requests_succeeded=provider_requests_succeeded+1,provider_pages_retrieved=provider_pages_retrieved+1 WHERE id=$1`,[queryRunId,providerCostUsd,providerPricingVersion]);
         } else if(!quotaFreeInnertubeProvider) await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE',autonomousOperationId,true);
       } catch (error:any) {
+        if (queryRunId && String(error?.code || '').toUpperCase() === INNERTUBE_TIMEOUT_CODE) {
+          // The page deadline is resumable: no page observation is written,
+          // the run keeps its page number/token, and the reconciler retries
+          // after the short time deferral instead of failing the whole run.
+          // APPROVED LIMITATION (P14): youtubei.js exposes no partial feed, so
+          // a timed-out page-N cannot be persisted; earlier pages remain
+          // durable and the run resumes via REWALK. Never write a fabricated
+          // empty observation for the timed-out page.
+          if (!braveProvider && !quotaFreeInnertubeProvider) {
+            await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE', autonomousOperationId, false);
+          }
+          await updateQueryRunProgress(queryRunId, { resumeMode: resumeModeForProvider(allocatedProvider.providerKey) }).catch(() => undefined);
+          await deferAutonomousRunForTime(queryRunId, String(error?.message || INNERTUBE_TIMEOUT_CODE));
+          await completeJob(job.id);
+          return true;
+        }
+        if (queryRunId && error instanceof QuotaAllocationExhaustedError) {
+          if (!braveProvider && !quotaFreeInnertubeProvider) {
+            await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE', autonomousOperationId, false);
+          }
+          await updateQueryRunProgress(queryRunId, { resumeMode: resumeModeForProvider(allocatedProvider.providerKey) }).catch(() => undefined);
+          await deferAutonomousRunForQuota(queryRunId, String(error?.message || 'QUOTA_ALLOCATION_EXHAUSTED'));
+          await completeJob(job.id);
+          return true;
+        }
         if(braveProvider){
           const rateLimited=String(error?.code||'').toUpperCase()==='BRAVE_API_RATE_LIMIT_429';
           if(rateLimited)providerRateLimited=1; else providerRequestsFailed=1;
@@ -1258,7 +1738,7 @@ export async function processNextSearchJob(
         query,querySemanticClasses:queryRecord?.intent?[queryRecord.intent]:[],queryGenerationMode:queryRecord?.generation_mode,
         country,declaredLanguage:raw.detectedLanguages?.[0]?.language,retrievalLane,searchOrdering,pageNumber,resultRank:index+1,
         matchedDocument:raw.matchedDocument||{type:'UNKNOWN'},rawObservation:{channelName:raw.channelName,youtubeUrl:raw.youtubeUrl,locationTag:raw.locationTag||null}},'INVESTIGATION_QUEUED');
-      raw.nominationId=nomination.id||undefined;raw.queryRunId=queryRunId;raw.discoveryJobId=job.id;
+      raw.nominationId=nomination.id||undefined;raw.queryRunId=queryRunId;raw.queryPageNumber=pageNumber;raw.discoveryJobId=job.id;
       const outcome = await processDiscoveredChannelContained(raw, country, source, { forceExtraction: isRepairEligibleRetry(job) });
       // A sticky-PROBE channel refused by its own allocation is deferred for
       // this run; the rest of the NORMAL page must still be processed. Keep it
@@ -1296,27 +1776,119 @@ export async function processNextSearchJob(
       if (!queryRecord) throw new Error(`Query ${queryId} no longer exists for run ${queryRunId}.`);
       const metrics = calculateQueryFunnel(searchPage?.rawResultCount ?? extracted.length, observations, deferredResults);
       await recordQueryRunSightings(queryRunId, queryId, sightings.map(s=>({...s,pageNumber})));
-      const globalMaxPages = Math.max(1, Number(await getAppSetting('autonomous_pagination_max_pages', '3')));
-      const maxPages = retrievalTreatmentOrigin === 'CANARY_TREATMENT'
-        ? Math.min(requestedPageDepth ?? 1, globalMaxPages)
-        : globalMaxPages;
+      const safetyMaxPages = Math.max(1, Number(await getAppSetting('autonomous_pagination_max_pages', '50')));
+      const maxLow = Math.max(1, Number(await getAppSetting('autonomous_pagination_max_low_yield_pages', '2')));
+      const maxDuplicate = Math.max(1, Number(await getAppSetting('autonomous_pagination_max_duplicate_pages', '2')));
+      const maxWrongCountry = Math.max(1, Number(await getAppSetting('autonomous_pagination_max_wrong_country_pages', '2')));
+      const explorationSetting = Math.max(0, Number(await getAppSetting('autonomous_pagination_exploration_pages', '1')));
+      const v2Enabled = await getAppSetting('autonomous_pagination_v2_enabled', 'true') === 'true';
+      const enabled = await getAppSetting('autonomous_pagination_enabled', 'true') === 'true';
+      // CDL master switch: turning it off must stop new continuation work
+      // without requiring every pagination sub-flag to be flipped too.
+      const cdlEnabled = await getAppSetting('country_discovery_loop_enabled', 'true') === 'true';
+      const continuationEnabled = enabled && cdlEnabled;
+      const providerKey = allocatedProvider.providerKey;
+      const providerMaxPages = providerPageCap(providerKey, safetyMaxPages);
+      const pageCostUnits = providerQuotaUnits;
+      const treatmentCapPages = retrievalTreatmentOrigin === 'CANARY_TREATMENT'
+        ? Math.min(requestedPageDepth ?? 1, safetyMaxPages)
+        : null;
       // Opt-in trial budget bound: trial-linked execution cannot outspend
       // its reservation (100 units/page official methodology unchanged).
       // Free providers spend nothing and need no bound. Absent on legacy.
       const trialQuotaReserved = typeof trial?.quotaReserved === 'number' ? trial.quotaReserved : null;
-      const trialBoundedMaxPages = trial?.trialId && trialQuotaReserved !== null && providerQuotaUnits > 0
-        ? trialContinuationCap(maxPages, trialQuotaReserved)
-        : maxPages;
-      const maxLow = Math.max(1, Number(await getAppSetting('autonomous_pagination_max_low_yield_pages', '2')));
+      const trialCapPages = trial?.trialId && trialQuotaReserved !== null && pageCostUnits > 0
+        ? trialContinuationCap(safetyMaxPages, trialQuotaReserved)
+        : null;
+      const progress = await getQueryRunProgress(queryRunId);
+      const activeCountries = await countActiveAutonomousCountries();
+      const quotaAvailability = await getAutonomousQuotaAvailability();
+      const budget = computeEffectivePageBudget({
+        safetyMaxPages,
+        providerMaxPages,
+        pageCostUnits,
+        // getAutonomousQuotaAvailability subtracts this run's scheduled page
+        // reservation. The run budget below includes the current page in
+        // consumedAfterPage, so add the current page back; otherwise page one
+        // is charged twice and the continuation is underfunded by one page.
+        remainingAutonomousQuota: quotaAvailability.remainingAutonomousQuota + pageCostUnits,
+        pendingCountries: activeCountries,
+        treatmentCapPages,
+        trialContinuationCap: trialCapPages,
+      });
+      const storedEffectiveMaxPages = progress?.effectiveMaxPages || 0;
+      const effectiveMaxPages = storedEffectiveMaxPages || budget.effectiveMaxPages;
+      const runQuotaBudgetUnits = progress?.runQuotaBudgetUnits || budget.runQuotaBudgetUnits;
+      const explorationPagesRemaining = storedEffectiveMaxPages
+        ? Math.max(0, progress?.explorationPagesRemaining || 0)
+        : explorationSetting;
+      // The first-page bound is authoritative for the run. Recomputing it from
+      // live quota would let a mid-run quota change mislabel a stored safety
+      // ceiling as RUN_BUDGET (and skip the linked continuation segment).
+      const bindingBound = storedEffectiveMaxPages
+        ? (progress?.effectiveBindingBound || budget.bindingBound)
+        : budget.bindingBound;
+      if (!storedEffectiveMaxPages) {
+        await updateQueryRunProgress(queryRunId, {
+          effectiveMaxPages,
+          effectiveBindingBound: bindingBound,
+          runQuotaBudgetUnits,
+          explorationPagesRemaining,
+          resumeMode: resumeModeForProvider(providerKey),
+        });
+      }
       const prior = await getAutonomousContinuationState(queryRunId, pageNumber);
+      const marginal = await getAutonomousPageMarginalMetrics(queryRunId, pageNumber);
+      const novelCandidateTerms = await countNovelCandidateTermsForPage(
+        queryRunId,
+        pageNumber,
+        new Date(searchWorkerStartMs),
+      );
       const evaluatedRawResults = metrics.evaluatedRawResults ?? metrics.rawResults;
       const duplicateRatio = evaluatedRawResults > 0
         ? metrics.duplicateResults / evaluatedRawResults
         : metrics.deferredResults ? 0 : 1;
-      const decision = evaluateContinuation({
-        pageNumber, maxPages: trialBoundedMaxPages, hasNextPage: !!searchPage?.nextPageToken,
+      const consumedAfterPage = (progress?.runQuotaConsumedUnits || 0) + providerQuotaUnits;
+      const nextPageQuotaAdmitted = pageCostUnits === 0
+        ? true
+        : runQuotaBudgetUnits > 0 && consumedAfterPage + pageCostUnits <= runQuotaBudgetUnits;
+      const runBudgetExhausted = pageCostUnits > 0
+        && (runQuotaBudgetUnits <= 0 || consumedAfterPage + pageCostUnits > runQuotaBudgetUnits);
+      const decisionV2 = evaluateContinuationV2({
+        pageNumber,
+        effectiveMaxPages,
+        ceilingBound: bindingBound,
+        hasNextPage: !!searchPage?.nextPageToken,
+        providerExhausted: (providerKey === 'youtube-innertube' || providerKey === 'brave-search')
+          && !searchPage?.nextPageToken
+          && pageNumber >= providerMaxPages,
         distinctCreators: metrics.distinctResults,
-        cumulativeDistinctCreators: prior.cumulativeDistinctCreators + metrics.distinctResults,
+        cumulativeDistinctCreators: marginal.cumulativeUniqueCreators,
+        newCreators: marginal.marginalNewCreators,
+        pageConfirmedCreators: marginal.marginalConfirmedCreators,
+        pageQualityCreators: marginal.marginalQualityCreators,
+        pageNonTradingCreators: marginal.marginalNonTradingCreators,
+        novelCandidateTerms,
+        countryPrecision: metrics.countryPrecision,
+        communityDiversity: metrics.tradingConfirmed ? metrics.communitiesDiscovered / metrics.tradingConfirmed : 0,
+        duplicateRatio,
+        priorLowValueStreak: prior.v2Streaks.lowValue,
+        priorDuplicateHeavyStreak: prior.v2Streaks.duplicateHeavy,
+        priorWrongCountryStreak: prior.v2Streaks.wrongCountry,
+        maxLowValuePages: maxLow,
+        maxDuplicateHeavyPages: maxDuplicate,
+        maxWrongCountryPages: maxWrongCountry,
+        explorationPagesRemaining,
+        queryMode: (queryRecord as { generation_mode?: 'EXPLORATION' | 'EXPLOITATION' | 'COLD_START' }).generation_mode,
+        deferredOnly: observations.length === 0 && deferredResults > 0,
+        nextPageQuotaAdmitted,
+        runBudgetExhausted,
+      });
+      const legacyDecision = v2Enabled ? null : evaluateContinuation({
+        pageNumber, maxPages: Math.min(effectiveMaxPages, treatmentCapPages ?? effectiveMaxPages, trialCapPages ?? effectiveMaxPages),
+        hasNextPage: !!searchPage?.nextPageToken,
+        distinctCreators: metrics.distinctResults,
+        cumulativeDistinctCreators: prior.cumulativeDistinctCreators,
         newCreators: metrics.newChannels, confirmedCreators: metrics.tradingConfirmed,
         qualityConfirmedCreators: metrics.qualityChannels,
         delayedConfirmedCreators: prior.delayedConfirmedCreators,
@@ -1327,10 +1899,14 @@ export async function processNextSearchJob(
         duplicateRatio,
         consecutiveLowYieldPages: prior.consecutiveLowYieldPages,
         maxConsecutiveLowYieldPages: maxLow,
-        deferredOnly: observations.length === 0 && deferredResults > 0
+        deferredOnly: observations.length === 0 && deferredResults > 0,
       });
-      const enabled = await getAppSetting('autonomous_pagination_enabled', 'true') === 'true';
-      const stoppingReason = decision.shouldContinue ? null : decision.primaryReason;
+      const decision = v2Enabled ? decisionV2 : legacyDecision!;
+      const usingV2 = v2Enabled;
+      const deferDecision = usingV2 && decisionV2.defer;
+      const stoppingReason = deferDecision
+        ? decisionV2.primaryReason
+        : decision.shouldContinue ? null : decision.primaryReason;
       const pageObservation = {
         queryRunId, pageNumber, inputPageToken: pageToken, nextPageToken: searchPage?.nextPageToken || null,
         retrievalLane, searchOrdering, rawResultCount: metrics.rawResults,
@@ -1341,12 +1917,40 @@ export async function processNextSearchJob(
         communityDiversity: metrics.tradingConfirmed ? metrics.communitiesDiscovered / metrics.tradingConfirmed : 0,
         noveltyRatio: metrics.noveltyRatio,
         duplicateRatio,
-        quotaUnits: providerQuotaUnits, decision, stoppingReason, pageMetrics: metrics,
-        retrievalConfigKey, retrievalTreatmentOrigin
+        quotaUnits: providerQuotaUnits, decision, stoppingReason,
+        pageMetrics: { ...metrics, cumulativeCountryRejected: marginal.cumulativeCountryRejected },
+        retrievalConfigKey, retrievalTreatmentOrigin,
+        elapsedMs: Date.now() - searchWorkerStartMs,
+        retrievalMs: searchRetrievalGrossMs,
+        processingMs: channelLoopEndMs - channelLoopStartMs,
+        marginalNewCreators: marginal.marginalNewCreators,
+        marginalConfirmedCreators: marginal.marginalConfirmedCreators,
+        marginalQualityCreators: marginal.marginalQualityCreators,
+        marginalNonTradingCreators: marginal.marginalNonTradingCreators,
+        novelCandidateTerms,
+        crossPageRepeatCreators: marginal.crossPageRepeatCreators,
+        cumulativeUniqueCreators: marginal.cumulativeUniqueCreators,
+        providerPageCostUnits: providerQuotaUnits,
+        providerPageCostUsd: providerCostUsd,
+        relevance: {
+          countryPrecision: metrics.countryPrecision,
+          tradingPrecision: metrics.tradingPrecision,
+          qualityShare: metrics.distinctResults ? metrics.qualityChannels / metrics.distinctResults : 0,
+        },
+        marginalUtilityV2: usingV2 ? decisionV2.marginalUtility : decision.marginalUtility,
+        continuationDecisionV2: usingV2 ? decisionV2 : null,
+        resumeMode: resumeModeForProvider(providerKey),
+        deferredReason: usingV2 ? decisionV2.deferReason : null,
       };
       await recordAutonomousPage(pageObservation);
       try{await recordPassivePage({query,jobId:job.id,observation:pageObservation});}catch(shadowError){console.error('[Phase 5 shadow] Passive page write failed.',shadowError);await recordShadowFailure({queryRunId,jobId:job.id,stage:'PAGE_OUTCOME',error:shadowError}).catch(()=>undefined);}
-      if (enabled && decision.shouldContinue && searchPage?.nextPageToken) {
+      if (deferDecision) {
+        if (decisionV2.deferReason === 'QUOTA') await deferAutonomousRunForQuota(queryRunId, decisionV2.primaryReason);
+        else await deferAutonomousRunForTime(queryRunId, decisionV2.primaryReason);
+        await completeJob(job.id);
+        return true;
+      }
+      if (continuationEnabled && decision.shouldContinue && searchPage?.nextPageToken) {
         let incPageReservationId: string | undefined;
 
         // Incremental Treatment Page Quota Reservation Boundary
@@ -1360,6 +1964,14 @@ export async function processNextSearchJob(
           incPageReservationId = incRes.pageReservationId;
         }
 
+        await updateQueryRunProgress(queryRunId, {
+          nextPageToken: searchPage.nextPageToken,
+          resumeMode: resumeModeForProvider(providerKey),
+          continuationStatus: 'RUNNING',
+          lastPageAt: new Date().toISOString(),
+          explorationPagesRemaining: usingV2 ? decisionV2.explorationPagesRemaining : explorationPagesRemaining,
+        });
+
         // Atomic child job enqueue + page reservation commit
         await enqueueChildAndCommitPageReservation({
           pageReservationId: incPageReservationId,
@@ -1370,7 +1982,7 @@ export async function processNextSearchJob(
             pageNumber: pageNumber + 1,
             pageToken: searchPage.nextPageToken
           },
-          priority: 20,
+          priority: AUTONOMOUS_CONTINUATION_JOB_PRIORITY,
           maxAttempts: 3,
           idempotencyKey: `search-run:${queryRunId}:page:${pageNumber + 1}`
         });
@@ -1378,104 +1990,30 @@ export async function processNextSearchJob(
         await completeJob(job.id);
         return true;
       }
-      const finalMetrics=await getAutonomousRunMetrics(queryRunId);
-      if (job.payload.provider?.costDomain === 'BRAVE_SEARCH_API') {
-        const providerTotals = await (await getDb()).query(`SELECT provider_cost_usd,provider_requests_attempted,provider_requests_succeeded,provider_requests_failed,provider_rate_limited,provider_pages_retrieved FROM query_runs WHERE id=$1`, [queryRunId]);
-        const totals = providerTotals.rows[0] || {};
-        providerCostUsd = Number(totals.provider_cost_usd || providerCostUsd);
-        providerRequestsAttempted = Number(totals.provider_requests_attempted || providerRequestsAttempted);
-        providerRequestsSucceeded = Number(totals.provider_requests_succeeded || providerRequestsSucceeded);
-        providerRequestsFailed = Number(totals.provider_requests_failed || providerRequestsFailed);
-        providerRateLimited = Number(totals.provider_rate_limited || providerRateLimited);
-        providerPagesRetrieved = Number(totals.provider_pages_retrieved || providerPagesRetrieved);
-      }
-      let providerRunOutcome: ProviderRunOutcome | undefined;
-      if (allocatedProvider.providerKey === 'youtube-innertube' && queryRunId) {
-        // InnerTube telemetry lives under its own provider name so the
-        // official provider's run stats stay pure; same outcome math.
-        // Checked BEFORE the official branch: the official predicate below
-        // (`!== 'brave-search'`) also matches innertube and would otherwise
-        // shadow this branch and zero out real InnerTube counts.
-        const providerCounts = await (await getDb()).query(`SELECT COUNT(*)::int AS attempted, COUNT(*) FILTER (WHERE status='SUCCESS')::int AS succeeded, COUNT(*) FILTER (WHERE status NOT IN ('SUCCESS','RATE_LIMITED'))::int AS failed, COUNT(*) FILTER (WHERE status='RATE_LIMITED')::int AS rate_limited FROM provider_call_events WHERE run_id=$1::text AND provider='youtube-innertube' AND operation='search'`, [queryRunId]);
-        const counts = providerCounts.rows[0] || {};
-        providerRequestsAttempted = Number(counts.attempted || 0);
-        providerRequestsSucceeded = Number(counts.succeeded || 0);
-        providerRequestsFailed = Number(counts.failed || 0);
-        providerRateLimited = Number(counts.rate_limited || 0);
-        providerPagesRetrieved = providerRequestsSucceeded;
-        providerRunOutcome = resolveInnertubeRunOutcome({
-          rawResults: finalMetrics.rawResults,
-          providerRequestsAttempted,
-          providerRequestsSucceeded,
-          providerRequestsFailed,
-          providerRateLimited
-        });
-      } else if (allocatedProvider.providerKey !== 'brave-search' && queryRunId) {
-        const providerCounts = await (await getDb()).query(`SELECT COUNT(*)::int AS attempted, COUNT(*) FILTER (WHERE status='SUCCESS')::int AS succeeded, COUNT(*) FILTER (WHERE status NOT IN ('SUCCESS','RATE_LIMITED'))::int AS failed, COUNT(*) FILTER (WHERE status='RATE_LIMITED')::int AS rate_limited FROM provider_call_events WHERE run_id=$1::text AND provider='youtube' AND operation='search'`, [queryRunId]);
-        const counts = providerCounts.rows[0] || {};
-        providerRequestsAttempted = Number(counts.attempted || 0);
-        providerRequestsSucceeded = Number(counts.succeeded || 0);
-        providerRequestsFailed = Number(counts.failed || 0);
-        providerRateLimited = Number(counts.rate_limited || 0);
-        providerPagesRetrieved = providerRequestsSucceeded;
-        providerRunOutcome = classifyProviderRunOutcome({
-          rawResults: finalMetrics.rawResults,
-          providerRequestsAttempted,
-          providerRequestsSucceeded,
-          providerRequestsFailed,
-          providerRateLimited
-        });
-      } else if (allocatedProvider.providerKey === 'brave-search') {
-        providerRunOutcome = classifyProviderRunOutcome({
-          rawResults: finalMetrics.rawResults,
-          providerRequestsAttempted,
-          providerRequestsSucceeded,
-          providerRequestsFailed,
-          providerRateLimited
-        });
-      }
-      const quotaConsumed=providerCostUsd>0||allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE'?0:pageNumber*100;
-      const performance = await evaluateQueryPerformance(queryRecord, finalMetrics, { retrievalLane, searchOrdering, quotaConsumed, persist: false });
-      // Worker wall-time split (observability only, persisted in
-      // performance_details): quota-wait vs retrieval vs per-channel
-      // processing vs total worker time. Never affects scoring or behavior.
-      const latencyBreakdownMs = buildSearchLatencyBreakdownMs(searchWorkerStartMs, searchQuotaWaitMs, searchRetrievalGrossMs, searchTopUpWaitMs, channelLoopStartMs, channelLoopEndMs, Date.now());
-      await completeQueryRun(queryRunId, {
-        ...finalMetrics,
-        uniqueChannels: finalMetrics.newChannels,
-        qualityChannels: finalMetrics.qualityChannels,
-        communitiesDiscovered: finalMetrics.communitiesDiscovered,
-        quotaUsed: quotaConsumed,
+      await finalizeAutonomousSearchRun({
+        job, workerId, queryRunId, queryId, query, country, pageNumber,
+        retrievalLane, searchOrdering, retrievalConfigKey,
+        pageMetrics: metrics,
+        allocatedProvider,
         providerCostUsd,
-        providerRequestsAttempted,
-        providerRequestsSucceeded,
-        providerRequestsFailed,
-        providerRateLimited,
-        providerPagesRetrieved,
-        providerRunOutcome,
-        averageQualityScore: finalMetrics.averageQualityScore,
-        performanceScore: performance.performanceScore,
-        newCollection: performance.newCollection,
-        latencyBreakdownMs,
-        // Opt-in trial linkage recorded on the job payload at schedule time.
-        // Absent on every legacy run.
-        ...(typeof trial?.trialId === 'string' && trial.trialId ? { trialCompletion: { trialId: trial.trialId } } : {})
+        searchWorkerStartMs,
+        searchQuotaWaitMs,
+        searchRetrievalGrossMs,
+        searchTopUpWaitMs,
+        channelLoopStartMs,
+        channelLoopEndMs,
+        trial,
+        nextPageToken: searchPage?.nextPageToken || null,
+        createContinuation: shouldCreateContinuationSegment({
+          paginationEnabled: continuationEnabled,
+          usingV2,
+          primaryReason: decision.primaryReason,
+          bindingBound,
+          hasNextPage: Boolean(searchPage?.nextPageToken),
+        }),
+        continuationExplorationPagesRemaining: usingV2 ? decisionV2.explorationPagesRemaining : explorationPagesRemaining,
+        continuationResumeMode: resumeModeForProvider(providerKey),
       });
-      await addQueryExecutionLog({
-        query_run_id: queryRunId,
-        query_id: queryId, query, country, executed_at: new Date().toISOString(),
-        channels_discovered: finalMetrics.distinctResults, unique_new_channels: finalMetrics.newChannels,
-        quality_creators_discovered: finalMetrics.qualityChannels, communities_discovered: finalMetrics.communitiesDiscovered,
-        cycle_quality_score: performance.performanceScore,
-        logs: [`Durable autonomous ${retrievalLane} lane run ${queryRunId} completed by ${workerId} via ${allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE'?'YOUTUBE_INNERTUBE_FREE':'YOUTUBE_DATA_API'}.`, `Provider outcome: ${providerRunOutcome || 'UNAVAILABLE'}`, `Funnel: ${JSON.stringify(metrics)}`]
-      });
-
-      // Post-run idempotent recomputation of derived evidence aggregate
-      const neighborhoodInfo = await getNeighborhoodForQueryRun(queryRunId);
-      if (neighborhoodInfo && retrievalConfigKey) {
-        await recomputeNeighborhoodRetrievalEvidence(neighborhoodInfo.neighborhood_key, retrievalConfigKey)
-          .catch(err => console.warn('[RetrievalPolicyEvidence] Post-run evidence recomputation error:', err));
-      }
     }
     await completeJob(job.id);
     return true;
@@ -1534,6 +2072,362 @@ export async function processNextSearchJob(
     clearInterval(heartbeat);
   }
   });
+}
+
+export interface ContinuationResumePlan<T extends { country: string; runId: string; marginalUtility?: number; lastPageAt?: string | null; resumeAt?: string | null }> {
+  /**
+   * Ranked candidates in rotated country order. The default is one run per
+   * country; callers may retain a fallback list per country so a blocked top
+   * candidate can be skipped without starving the country.
+   */
+  selected: T[];
+  /** Pending runs that stay deferred to a later sweep; never dropped. */
+  deferred: T[];
+  /** ceil(totalPendingContinuations / activeCountries) + 1. */
+  perCountryCap: number;
+  rotation: number;
+  nextFairnessCursor: number;
+  countryOrder: string[];
+}
+
+/**
+ * Pure continuation fairness policy (CDL §6.9): rotate countries by the
+ * persisted continuation cursor, then give each country one slot ordered by
+ * marginal utility descending, oldest pending age, then run ID. One slot per
+ * country per sweep is the stronger form of "no country gets a second before
+ * every country gets a first"; the per-country cap remains the hard bound for
+ * the deferred backlog.
+ *
+ * `maxCountries` bounds how many countries one sweep may schedule. The cursor
+ * advances by the number selected, so when pending countries exceed the sweep
+ * limit every country is still reached within a bounded number of sweeps.
+ * `maxCandidatesPerCountry` retains ranked fallbacks; the reconciler tries
+ * them in order until one enqueues, then skips the rest for that country.
+ * Exported for deterministic tests.
+ */
+export function planContinuationResume<T extends { country: string; runId: string; marginalUtility?: number; lastPageAt?: string | null; resumeAt?: string | null }>(
+  runs: T[],
+  fairnessCursor: number,
+  activeCountries: number,
+  maxCountries = Number.POSITIVE_INFINITY,
+  maxCandidatesPerCountry = 1,
+): ContinuationResumePlan<T> {
+  const byCountry = new Map<string, T[]>();
+  for (const run of runs) {
+    const key = run.country.toLowerCase();
+    const bucket = byCountry.get(key);
+    if (bucket) bucket.push(run);
+    else byCountry.set(key, [run]);
+  }
+  const countryOrder = [...byCountry.keys()].sort((a, b) => a.localeCompare(b));
+  if (!countryOrder.length) {
+    return { selected: [], deferred: [], perCountryCap: 0, rotation: 0, nextFairnessCursor: 0, countryOrder: [] };
+  }
+  const cursor = Number.isFinite(fairnessCursor) ? Math.max(0, Math.floor(fairnessCursor)) : 0;
+  const rotation = cursor % countryOrder.length;
+  const rotatedCountries = [...countryOrder.slice(rotation), ...countryOrder.slice(0, rotation)];
+  const countryBudget = Number.isFinite(maxCountries)
+    ? Math.max(0, Math.min(rotatedCountries.length, Math.trunc(maxCountries)))
+    : rotatedCountries.length;
+  const selectedCountries = rotatedCountries.slice(0, countryBudget);
+  const age = (run: T) => {
+    // Prefer the SQL age anchor (last_page_at, else started_at, else
+    // scheduled_at) so a truncated country shortlist is ordered exactly like
+    // the query that produced it. lastPageAt remains the fallback for callers
+    // that predate resumeAt.
+    const anchor = run.resumeAt ?? run.lastPageAt;
+    const parsed = anchor ? Date.parse(anchor) : Number.NaN;
+    return Number.isFinite(parsed) ? parsed : Number.POSITIVE_INFINITY;
+  };
+  const selected: T[] = [];
+  const selectedIds = new Set<string>();
+  for (const country of selectedCountries) {
+    const candidates = [...(byCountry.get(country) || [])].sort((a, b) =>
+      Number(b.marginalUtility || 0) - Number(a.marginalUtility || 0)
+      || age(a) - age(b)
+      || a.runId.localeCompare(b.runId));
+    const fallbackCount = Number.isFinite(maxCandidatesPerCountry)
+      ? Math.max(1, Math.trunc(maxCandidatesPerCountry))
+      : candidates.length;
+    for (const pick of candidates.slice(0, fallbackCount)) {
+      selected.push(pick);
+      selectedIds.add(pick.runId);
+    }
+  }
+  const deferred = runs.filter(run => !selectedIds.has(run.runId));
+  // A partial sweep advances by the number of countries it covered; a full
+  // sweep keeps the original one-country rotation so ordering still varies.
+  const advance = selectedCountries.length >= countryOrder.length
+    ? 1
+    : Math.max(1, selectedCountries.length);
+  return {
+    selected,
+    deferred,
+    perCountryCap: Math.ceil(runs.length / Math.max(1, activeCountries)) + 1,
+    rotation,
+    nextFairnessCursor: (rotation + advance) % countryOrder.length,
+    countryOrder: rotatedCountries,
+  };
+}
+
+/**
+ * Orphan reconciler for resumable autonomous runs. Enqueues exactly one
+ * missing next-page job per eligible run, at most one continuation per country
+ * per sweep, under a per-run advisory lock. Never bypasses quota admission:
+ * the worker's normal reservation gate still applies to the resumed page.
+ */
+export async function resumeOrphanedAutonomousPages(options: {
+  force?: boolean;
+  limit?: number;
+  /** Maximum new page jobs this sweep may enqueue (queue headroom). */
+  maxEnqueued?: number;
+  now?: Date;
+} = {}): Promise<{ swept: boolean; enqueued: number; skipped: number; unavailable: number }> {
+  const nowMs = (options.now || new Date()).getTime();
+  if (!options.force && nowMs - lastAutonomousResumeSweepAt < 5 * 60_000) {
+    return { swept: false, enqueued: 0, skipped: 0, unavailable: 0 };
+  }
+  lastAutonomousResumeSweepAt = nowMs;
+  const enabled = await getAppSetting('autonomous_pagination_enabled', 'true') === 'true';
+  const v2Enabled = await getAppSetting('autonomous_pagination_v2_enabled', 'true') === 'true';
+  // The CDL master switch stops new continuation work as well as the worker
+  // paths; operators must not need to flip several independent settings.
+  const cdlEnabled = await getAppSetting('country_discovery_loop_enabled', 'true') === 'true';
+  if (!enabled || !v2Enabled || !cdlEnabled) {
+    return { swept: true, enqueued: 0, skipped: 0, unavailable: 0 };
+  }
+  // The store returns a ranked fallback list per pending country, without a
+  // global row limit, so the fairness cursor can rotate across every country
+  // and a blocked top candidate cannot starve another run in that country.
+  const runs = await listPendingAutonomousRuns();
+  if (!runs.length) return { swept: true, enqueued: 0, skipped: 0, unavailable: 0 };
+  // Continuation fairness cursor: rotate countries every sweep so a low-yield
+  // country cannot be starved by older high-yield pages. The cursor is
+  // independent of the new-query country cursor. `limit` bounds countries per
+  // sweep, not rows; the cursor advances by the number covered.
+  const fairnessCursor = Math.max(0, Number(await getAppSetting('autonomous_continuation_fairness_cursor', '0')) || 0);
+  const activeCountryKeys = await resolveActiveAutonomousCountryKeys();
+  const activeCountries = Math.max(1, activeCountryKeys.size);
+  const sweepCountryLimit = Math.max(1, Math.min(500, Math.trunc(options.limit || 50) || 50));
+  // The forced producer sweep runs before queue-depth admission. Bound it by
+  // the available headroom so recovery itself cannot overshoot the target
+  // queue depth. At most one page is enqueued per selected country.
+  const maxEnqueued = options.maxEnqueued === undefined
+    ? Number.POSITIVE_INFINITY
+    : Math.max(0, Math.trunc(options.maxEnqueued) || 0);
+  const boundedCountryLimit = Number.isFinite(maxEnqueued)
+    ? Math.min(sweepCountryLimit, maxEnqueued)
+    : sweepCountryLimit;
+  const plan = planContinuationResume(
+    runs,
+    fairnessCursor,
+    activeCountries,
+    boundedCountryLimit,
+    AUTONOMOUS_CONTINUATION_CANDIDATES_PER_COUNTRY,
+  );
+  await setAppSetting('autonomous_continuation_fairness_cursor', String(plan.nextFairnessCursor)).catch(() => undefined);
+  const orderedRuns = plan.selected;
+  const perCountryCap = plan.perCountryCap;
+  const grantsByCountry = new Map<string, number>();
+  const countriesThisSweep = new Set<string>();
+  const db = await getDb();
+  let enqueued = 0;
+  let skipped = 0;
+  let unavailable = 0;
+
+  for (const run of orderedRuns) {
+    const countryKey = autonomousCountryKey(run.country);
+    if (countriesThisSweep.has(countryKey)) {
+      skipped++;
+      continue;
+    }
+    const grants = grantsByCountry.get(countryKey) || 0;
+    if (grants >= perCountryCap) {
+      skipped++;
+      continue;
+    }
+    const exclusion = await getCountryExclusion(run.country);
+    if (exclusion) {
+      await markQueryRunResumeUnavailable(run.runId, `COUNTRY_EXCLUDED:${exclusion.reason}`);
+      unavailable++;
+      continue;
+    }
+    if (!activeCountryKeys.has(countryKey)) {
+      // Report §6.7: never resume a run whose country left the active scope,
+      // even when its provider cursor is still valid. Marking it unavailable
+      // is truthful and keeps it out of pending-continuation metrics.
+      await markQueryRunResumeUnavailable(run.runId, 'COUNTRY_INACTIVE');
+      unavailable++;
+      continue;
+    }
+    if (run.continuedToRunId) {
+      // The linked child owns the remaining cursor and is scheduled as its own
+      // run. Scheduling pagesCompleted+1 for the parent would search the same
+      // cursor through both runs, so only the parent's final counts are
+      // repaired here.
+      await finalizeLinkedAutonomousParent(run);
+      skipped++;
+      continue;
+    }
+    const nextPage = Math.max(1, run.pagesCompleted + 1);
+    const firstPage = run.pagesCompleted <= 0;
+    // A fresh run uses the scheduling key (search-run:<id>); a continuation
+    // segment child's first page was scheduled under :page:1. Either way page
+    // 1 is recoverable even when no resume mode was persisted yet.
+    const idempotencyKey = firstPage
+      ? (run.nextPageToken ? `search-run:${run.runId}:page:1` : `search-run:${run.runId}`)
+      : `search-run:${run.runId}:page:${nextPage}`;
+    if (await autonomousPageExists(run.runId, nextPage)) {
+      skipped++;
+      continue;
+    }
+    // Live work always wins: a queued or in-flight page must never be failed
+    // by the sweep. Completed/failed jobs without an observation fall through
+    // to enqueueJob, which reopens them for the deferred page.
+    const liveKeys = firstPage
+      ? [`search-run:${run.runId}`, `search-run:${run.runId}:page:1`]
+      : [idempotencyKey];
+    const existingJob = await db.query(
+      `SELECT 1 FROM jobs WHERE idempotency_key = ANY($1) AND status IN ('PENDING','PROCESSING')`,
+      [liveKeys],
+    );
+    if (existingJob.rowCount) {
+      skipped++;
+      continue;
+    }
+    if (!firstPage && run.resumeMode === 'NONE') {
+      await markQueryRunResumeUnavailable(run.runId, 'RESUME_MODE_NONE');
+      unavailable++;
+      continue;
+    }
+    if (!firstPage && (run.resumeMode === 'TOKEN' || run.resumeMode === 'OFFSET') && !run.nextPageToken) {
+      await markQueryRunResumeUnavailable(run.runId, `RESUME_${run.resumeMode}_TOKEN_MISSING`);
+      unavailable++;
+      continue;
+    }
+
+    const client = await db.connect();
+    let locked = false;
+    try {
+      const lock = await client.query(`SELECT pg_try_advisory_lock(hashtext($1)) AS locked`, [`autonomous-resume:${run.runId}`]);
+      locked = lock.rows[0]?.locked === true;
+      if (!locked) {
+        skipped++;
+        continue;
+      }
+      // REWALK has no serializable provider cursor: next_page_token stores the
+      // absolute provider page (for example "11" on a segment child whose first
+      // page is page 1). Prefer it over the run-local page number, otherwise an
+      // orphaned segment child would rewalk from page 1 and re-record pages the
+      // parent already consumed. Fall back to the run-local number only when a
+      // legacy row has no stored token.
+      const pageToken = run.resumeMode === 'REWALK'
+        ? (run.nextPageToken || String(nextPage))
+        : run.nextPageToken;
+      const provider = run.providerAllocationSnapshot
+        ? providerSnapshot(run.providerAllocationSnapshot as ProviderAllocation)
+        : undefined;
+      // A treatment run's continuation pages were authorized by the worker's
+      // incremental reservation. Recovery must apply the same boundary: a
+      // direct enqueue would bypass a prior cap denial and execute an
+      // unreserved treatment page. Page 1 remains covered by the scheduling
+      // treatment reservation, so only later pages need a new reservation.
+      let incPageReservationId: string | undefined;
+      if (!firstPage && run.retrievalTreatmentOrigin === 'CANARY_TREATMENT') {
+        const incRes = await reserveIncrementalTreatmentPageQuota({
+          queryRunId: run.runId,
+          pageNumber: nextPage,
+          providerQuotaUnits: provider?.costDomain === 'YOUTUBE_INNERTUBE_FREE' ? 0 : 100,
+        });
+        if (!incRes.authorized) {
+          // Do not fail the run or bypass caps. Daily-cap denials cannot clear
+          // before the quota day resets; transient reservation errors get a
+          // short bounded backoff. Persisting the deferral keeps the run
+          // resumable without retrying the same denied reservation every
+          // sweep or reporting a false orphan after 15 minutes.
+          if (/CAP_EXCEEDED|QUOTA_EXHAUSTED/.test(incRes.reason)) {
+            await deferAutonomousRunForQuota(run.runId, incRes.reason);
+          } else {
+            await deferAutonomousRunForTime(run.runId, incRes.reason);
+          }
+          skipped++;
+          continue;
+        }
+        incPageReservationId = incRes.pageReservationId;
+      }
+      // Trial linkage and frozen experiment windows are scheduling-time
+      // payloads. Rehydrate them from run metadata so a resumed page keeps its
+      // trial reservation cap, completes its trial, and retrieves the same
+      // published-date window as the original run.
+      const metadata = run.runMetadata || {};
+      const trial = metadata.trial && typeof metadata.trial === 'object'
+        ? metadata.trial as { trialId?: string; trialKey?: string; proposalId?: string; quotaReserved?: number; status?: string }
+        : null;
+      const selectionExperiment = metadata.selectionExperiment && typeof metadata.selectionExperiment === 'object'
+        ? metadata.selectionExperiment
+        : null;
+      const searchWindow = metadata.searchWindow && typeof metadata.searchWindow === 'object'
+        ? metadata.searchWindow
+        : null;
+      await enqueueChildAndCommitPageReservation({
+        pageReservationId: incPageReservationId,
+        queryRunId: run.runId,
+        jobType: 'SEARCH_YOUTUBE',
+        jobPayload: {
+          query: run.query,
+          country: run.country,
+          source: run.source as DiscoverySource,
+          queryRunId: run.runId,
+          queryId: run.queryId,
+          retrievalLane: (run.retrievalLane || 'VIDEO') as RetrievalLane,
+          searchOrdering: (run.searchOrdering || 'RELEVANCE') as import('./searchOrdering').SearchOrdering,
+          pageNumber: nextPage,
+          pageToken,
+          retrievalConfigKey: run.retrievalConfigKey,
+          retrievalTreatmentOrigin: run.retrievalTreatmentOrigin || 'CONTROL',
+          // Preserve the run's original treatment depth. Replacing it with the
+          // run-local page number would shrink a CANARY_TREATMENT cap on resume.
+          requestedPageDepth: run.requestedPageDepth ?? nextPage,
+          ...(provider ? { provider } : {}),
+          ...(trial ? { trial } : {}),
+          ...(selectionExperiment ? { selectionExperiment } : {}),
+          ...(searchWindow ? { searchWindow } : {}),
+        },
+        priority: AUTONOMOUS_CONTINUATION_JOB_PRIORITY,
+        maxAttempts: 3,
+        idempotencyKey,
+        // A deferred page whose previous job is COMPLETED/FAILED without a
+        // page observation must be reopened, not silently skipped.
+        reopenTerminal: true,
+      });
+      const progress = await getQueryRunProgress(run.runId);
+      await updateQueryRunProgress(run.runId, {
+        nextPageToken: run.nextPageToken,
+        resumeMode: run.resumeMode,
+        continuationStatus: 'RUNNING',
+        lastPageAt: new Date(nowMs).toISOString(),
+        resumeCount: (progress?.resumeCount || 0) + 1,
+        resumeRewalkCount: (progress?.resumeRewalkCount || 0) + (run.resumeMode === 'REWALK' ? 1 : 0),
+      });
+      enqueued++;
+      grantsByCountry.set(countryKey, grants + 1);
+      countriesThisSweep.add(countryKey);
+      console.log(JSON.stringify({
+        event: 'autonomous_orphan_resumed',
+        runId: run.runId,
+        country: run.country,
+        pageNumber: nextPage,
+        resumeMode: run.resumeMode,
+        timestamp: new Date(nowMs).toISOString(),
+      }));
+    } finally {
+      if (locked) {
+        await client.query(`SELECT pg_advisory_unlock(hashtext($1))`, [`autonomous-resume:${run.runId}`]).catch(() => undefined);
+      }
+      client.release();
+    }
+  }
+  return { swept: true, enqueued, skipped, unavailable };
 }
 
 export interface ProcessDiscoveredChannelOutcome {
