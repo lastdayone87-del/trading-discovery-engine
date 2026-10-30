@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { DEFAULT_BROWSER_FALLBACK_BUDGET, advanceRenderedLifecycleStage, beginRenderedDeclarativeShadowScan, browserCauseSnippet, browserFallbackTelemetrySummary, classifyCrawlCatch, countDeclarativeClosedShadowRoots, createRenderedRouteGuard, disposeRenderedRouteGuards, installRenderedRouteCloseCleanup, isExpectedRenderedRouteShutdownError, isTelegramPostPermalink, readRenderedDeclarativeShadowScan, RenderedFallbackGate, renderedFallbackGate, resolveRenderedZeroPageReason, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback, type BrowserFallbackTelemetry, type RenderedRouteLike } from './browserCommunityFallback';
+import { DEFAULT_BROWSER_FALLBACK_BUDGET, DECLARATIVE_SHADOW_SCAN_MAX_BYTES, advanceRenderedLifecycleStage, beginRenderedDeclarativeShadowScan, browserCauseSnippet, browserFallbackTelemetrySummary, classifyCrawlCatch, classifyRenderedPopupDestination, countDeclarativeClosedShadowRoots, createRenderedRouteGuard, disposeRenderedRouteGuards, installRenderedRouteCloseCleanup, isExpectedRenderedRouteShutdownError, isTelegramPostPermalink, readRenderedDeclarativeShadowScan, RenderedFallbackGate, renderedFallbackGate, resolveRenderedZeroPageReason, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback, shouldSkipPreexistingSiblingPage, type BrowserFallbackTelemetry, type RenderedRouteLike } from './browserCommunityFallback';
 import { redactCauseSnippet } from './crawlerTelemetry';
 import { classifyRenderedCrawlerFailure, isRenderedNavigationTimeout, renderedCrawlerHostBackoffMs, renderedCrawlerRetryPolicy } from './renderedCrawlerPolicy';
 
@@ -34,6 +34,16 @@ test('declarative closed shadow roots are counted from raw markup without claimi
     countDeclarativeClosedShadowRoots('<template shadowroot="closed">x</template>'),
     1,
     'the legacy shadowroot spelling is counted conservatively',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots('<template title="Guests > 10" shadowrootmode="closed">x</template>'),
+    1,
+    'a quoted attribute containing > does not hide a later closed declaration',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots("<template data-note='a > b' shadowrootmode='closed'>x</template>"),
+    1,
+    'single-quoted values with > are respected',
   );
   assert.equal(
     countDeclarativeClosedShadowRoots('<template shadowrootmode="open">x</template>'),
@@ -77,7 +87,7 @@ test('declarative shadow response scan reports roots, gaps, and per-navigation r
   listener!({
     url: () => 'https://fixture.test/',
     status: () => 200,
-    headers: () => ({}),
+    headers: () => ({ 'content-length': '60' }),
     request: () => ({ resourceType: () => 'document', frame: () => mainFrame }),
     text: async () => '<template shadowrootmode="closed"></template>',
   });
@@ -92,7 +102,7 @@ test('declarative shadow response scan reports roots, gaps, and per-navigation r
   listener!({
     url: () => 'https://fixture.test/next',
     status: () => 200,
-    headers: () => ({}),
+    headers: () => ({ 'content-length': '48' }),
     request: () => ({ resourceType: () => 'document', frame: () => mainFrame }),
     text: async () => '<html><body>no shadow roots</body></html>',
   });
@@ -123,6 +133,71 @@ test('declarative shadow response scan reports roots, gaps, and per-navigation r
     { documents: 0, closedRoots: 0, gaps: 1 },
     'neither response is a final main-document body',
   );
+});
+
+test('declarative shadow scan never reads a body whose decoded size cannot be bounded', async () => {
+  type Listener = (response: {
+    url(): string;
+    status(): number;
+    headers(): Record<string, string>;
+    request(): { resourceType(): string; frame(): unknown };
+    text(): Promise<string>;
+  }) => void;
+  const mainFrame = {};
+  let listener: Listener | undefined;
+  const page = {
+    on(_event: 'response', callback: Listener) { listener = callback; },
+    mainFrame() { return mainFrame; },
+  };
+  let textReads = 0;
+  const emit = (headers: Record<string, string>) => listener!({
+    url: () => 'https://fixture.test/',
+    status: () => 200,
+    headers: () => headers,
+    request: () => ({ resourceType: () => 'document', frame: () => mainFrame }),
+    text: async () => { textReads++; return '<template shadowrootmode="closed"></template>'; },
+  });
+
+  beginRenderedDeclarativeShadowScan(page);
+  emit({});
+  assert.deepEqual(
+    await readRenderedDeclarativeShadowScan(page as object, 0),
+    { documents: 0, closedRoots: 0, gaps: 1 },
+    'a chunked response without content-length is an explicit scan gap',
+  );
+  assert.equal(textReads, 0, 'the unbounded body was never materialized');
+
+  beginRenderedDeclarativeShadowScan(page);
+  emit({ 'content-length': '60', 'content-encoding': 'gzip' });
+  assert.equal((await readRenderedDeclarativeShadowScan(page as object, 0)).gaps, 1);
+  assert.equal(textReads, 0, 'a compressed body cannot be bounded by its compressed length');
+
+  beginRenderedDeclarativeShadowScan(page);
+  emit({ 'content-length': String(DECLARATIVE_SHADOW_SCAN_MAX_BYTES + 1) });
+  assert.equal((await readRenderedDeclarativeShadowScan(page as object, 0)).gaps, 1);
+  assert.equal(textReads, 0, 'an over-cap declared body is skipped before reading');
+});
+
+test('popup destinations are classified before policy exclusion or discard', () => {
+  const pageUrl = 'https://creator.example/';
+  assert.equal(classifyRenderedPopupDestination('about:blank', pageUrl), 'uninspectable');
+  assert.equal(classifyRenderedPopupDestination('chrome-error://chromewebdata/', pageUrl), 'uninspectable');
+  assert.equal(
+    classifyRenderedPopupDestination('https://discord.gg/InviteCode', pageUrl),
+    'discord',
+    'a direct Discord invite opened by window.open is terminal evidence',
+  );
+  assert.equal(classifyRenderedPopupDestination('https://creator.example/room', pageUrl), 'same-origin');
+  assert.equal(classifyRenderedPopupDestination('https://other.example/room', pageUrl), 'cross-origin');
+  assert.equal(classifyRenderedPopupDestination('http://127.0.0.1/private', pageUrl), 'admission-rejected');
+});
+
+test('idle pool pages are skipped but real load-time blank popups are captured', () => {
+  assert.equal(shouldSkipPreexistingSiblingPage('https://creator.example/room', null), false, 'committed HTTP(S) siblings are real');
+  assert.equal(shouldSkipPreexistingSiblingPage('about:blank', { hasOpener: false, hasContent: false }), true, 'an empty opener-less pool page is idle');
+  assert.equal(shouldSkipPreexistingSiblingPage('about:blank', { hasOpener: true, hasContent: false }), false, 'an opener proves a real popup');
+  assert.equal(shouldSkipPreexistingSiblingPage('about:blank', { hasOpener: false, hasContent: true }), false, 'document.write content proves a real popup');
+  assert.equal(shouldSkipPreexistingSiblingPage('about:blank', null), true, 'an unreadable blank page is treated as idle, never closed as a gap');
 });
 
 test('Telegram message permalinks are not recursively crawled as community surfaces', () => {

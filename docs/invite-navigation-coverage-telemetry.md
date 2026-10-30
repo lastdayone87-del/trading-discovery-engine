@@ -186,14 +186,29 @@ A non-`COMPLETE` coverage reason is never a clean absence:
   replaced document never contributes required obligations to the seed.
 - `collectRenderedPageContext` uses a bounded `TreeWalker` (2,000 elements,
   100 shadow roots) and a bounded frame count (1,000). The counter itself does
-  not traverse frames or shadow roots.
+  not traverse frames or shadow roots. It is re-read after scrolling and after
+  the click loop; counts are maxed per document (the `attachShadow` probe is
+  cumulative) and summed across documents, so a closed root created by a
+  disclosure is reported without double counting.
 - Open shadow traversal is a separate bounded walker (`64` roots, `4,000`
   nodes, `200,000` characters, `256` hrefs, depth `4`). It reads only same-
   document text and anchor attributes; it never fetches, clicks, or crosses
   into a frame. Closed roots remain inaccessible and are counted instead.
 - Declarative closed roots are detected by a raw main-document response scan
-  capped at `8 MiB` per body and `1,000` roots. A body that cannot be read is
-  a `declarativeShadowScanGap` (`BOUNDED`), never an assumed clean document.
+  capped at `8 MiB` per body and `1,000` roots. Only an uncompressed body with a
+  declared length at or below the cap is read; a chunked/compressed body whose
+  decoded size cannot be bounded, an over-cap body, or an unreadable body is a
+  `declarativeShadowScanGap` (`BOUNDED`), never an assumed clean document. The
+  scan is re-read after interactions and only deltas are added.
+- Popups opened by a click are drained per click. A blank sibling is probed for
+  an opener or `document.write` content before being skipped as browser-pool
+  idle state; a direct Discord popup URL is retained as terminal evidence and
+  excluded from the cross-origin policy counter. Uninspectable popups remain a
+  coverage gap.
+- Interaction-revealed same-origin links are captured after each click, keyed
+  by document identity, so a later click cannot erase an earlier panel's
+  destination. A clicked-to document establishes its own static baseline;
+  original-document links are never compared against it.
 - Both navigation collectors retain their existing `500`-candidate bound.
   Overflow is sampled up to `500` additional eligible candidates and published
   as `candidateCapTruncated` instead of disappearing; the flag forces

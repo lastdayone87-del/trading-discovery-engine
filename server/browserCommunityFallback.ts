@@ -356,6 +356,57 @@ export function isDiscordDestinationUrl(rawUrl: string): boolean {
   }
 }
 
+/**
+ * A pre-existing sibling page can be either an idle browser-pool page or a
+ * real popup that loaded before the request handler attached its listener.
+ * HTTP(S) siblings are always real destinations. An `about:blank` sibling is
+ * real only when it still has an opener or has been populated by
+ * `document.write`; an empty, opener-less page is pool idle state and closing
+ * it would manufacture a coverage gap on every ordinary crawl.
+ */
+export function shouldSkipPreexistingSiblingPage(
+  url: string,
+  probe: { hasOpener?: boolean; hasContent?: boolean } | null,
+): boolean {
+  if (/^https?:/i.test(url)) return false;
+  if (!probe) return true;
+  if (probe.hasOpener === true) return false;
+  return probe.hasContent !== true;
+}
+
+/** Closed taxonomy for how a popup URL is handled by the bounded drain. */
+export type RenderedPopupDestinationKind =
+  | 'uninspectable'
+  | 'discord'
+  | 'cross-origin'
+  | 'admission-rejected'
+  | 'same-origin';
+
+export function classifyRenderedPopupDestination(
+  popupUrl: string,
+  pageUrl: string,
+): RenderedPopupDestinationKind {
+  if (!popupUrl || popupUrl === 'about:blank') return 'uninspectable';
+  let parsed: URL;
+  try {
+    parsed = new URL(popupUrl);
+  } catch {
+    return 'uninspectable';
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return 'uninspectable';
+  // Discord destinations are terminal invite candidates. A popup that opens
+  // one directly must be retained as evidence, not discarded as an unexamined
+  // cross-origin page.
+  if (isDiscordDestinationUrl(popupUrl)) return 'discord';
+  // Security/format rejection is more precise than origin: a private or
+  // non-public target is never an eligible navigation surface.
+  if (!assessCrawlAdmission(popupUrl).eligible) return 'admission-rejected';
+  let pageOrigin = '';
+  try { pageOrigin = new URL(pageUrl).origin; } catch { pageOrigin = ''; }
+  if (parsed.origin !== pageOrigin) return 'cross-origin';
+  return 'same-origin';
+}
+
 export const COMMUNITY_HINTS = /discord|community|join|chat|member|membership|vip|group|private|trading.?room|links?|social|contact|about|whop|skool|circle|patreon|premium|paid|subscribe|signals?|mentor|access/i;
 
 /**
@@ -1060,9 +1111,17 @@ export const DECLARATIVE_SHADOW_SCAN_MAX_BYTES = 8 * 1024 * 1024;
  */
 export function countDeclarativeClosedShadowRoots(html: string): number {
   if (typeof html !== 'string' || !html) return 0;
-  const pattern = /<template\b[^>]*\b(?:shadowrootmode|shadowroot)\s*=\s*(?:"closed"|'closed'|closed)(?=[\s/>])/gi;
+  // Match a complete `<template ...>` start tag while respecting quoted
+  // attribute values: a `>` inside `title="Guests > 10"` must not end the
+  // tag early. The previous `[^>]*` scan stopped there and missed a valid
+  // `shadowrootmode="closed"` that Chromium still attaches.
+  const tagPattern = /<template\b((?:[^>"']|"[^"]*"|'[^']*')*)>/gi;
+  const attributePattern = /(?:^|\s)(?:shadowrootmode|shadowroot)\s*=\s*(?:"closed"|'closed'|closed)(?=\s|\/|$)/i;
   let count = 0;
-  while (count < 1000 && pattern.exec(html)) count++;
+  let tag: RegExpExecArray | null;
+  while (count < 1000 && (tag = tagPattern.exec(html))) {
+    if (attributePattern.test(tag[1])) count++;
+  }
   return count;
 }
 
@@ -1116,8 +1175,18 @@ export function beginRenderedDeclarativeShadowScan(page: RenderedShadowScanPageL
         // committed document is the one that matters.
         if ((status >= 300 && status < 400) || status === 204 || status === 205) return;
         scan!.observed = true;
-        const declaredLength = Number(response.headers()['content-length']);
-        if (Number.isFinite(declaredLength) && declaredLength > DECLARATIVE_SHADOW_SCAN_MAX_BYTES) {
+        const headers = response.headers();
+        const declaredLength = Number(headers['content-length']);
+        const contentEncoding = String(headers['content-encoding'] || '').trim().toLowerCase();
+        // Read only bodies whose decoded size is provably bounded. A chunked
+        // response has no content-length, and a compressed response's declared
+        // length is the compressed size, not the decoded size. Playwright's
+        // text() has no byte cap, so reading either would let a pathological
+        // document allocate unbounded crawler memory. Report a scan gap instead
+        // of assuming an empty body.
+        if (!Number.isFinite(declaredLength) || declaredLength < 0
+          || declaredLength > DECLARATIVE_SHADOW_SCAN_MAX_BYTES
+          || (contentEncoding !== '' && contentEncoding !== 'identity')) {
           scan!.gaps++;
           return;
         }
@@ -1125,6 +1194,13 @@ export function beginRenderedDeclarativeShadowScan(page: RenderedShadowScanPageL
         scan!.settled = false;
         scan!.pending = response.text().then(html => {
           if (scan!.generation !== generation) return;
+          // Defend against a server that under-declares its body. The read has
+          // already allocated by this point, but the count must not claim a
+          // complete scan of a body beyond the configured bound.
+          if (Buffer.byteLength(html, 'utf8') > DECLARATIVE_SHADOW_SCAN_MAX_BYTES) {
+            scan!.gaps++;
+            return;
+          }
           scan!.documents++;
           scan!.closedRoots += countDeclarativeClosedShadowRoots(html);
         }).catch(() => {
@@ -1424,7 +1500,18 @@ export interface RenderedCrossOriginEnqueuePlan {
   alreadyVisited: number;
   duplicate: number;
   budget: number;
-  disallowed: number;
+  /**
+   * Outbound destinations the community-evidence policy rejected. They are
+   * not eligible community destinations, so they are diagnostic only and must
+   * never turn an otherwise complete run into a policy exclusion.
+   */
+  irrelevant: number;
+  /**
+   * Destinations that passed community evidence but failed the shared crawl
+   * admission boundary (format/security). Also diagnostic only: they are not
+   * unexamined navigation surfaces.
+   */
+  admissionRejected: number;
   /** Discord destinations are terminal invite candidates, not unexamined
    * navigation; they are retained from href/text and never counted as a
    * policy exclusion. */
@@ -1502,14 +1589,15 @@ export function planRenderedCrossOriginEnqueues(input: {
     alreadyVisited: 0,
     duplicate: 0,
     budget: 0,
-    disallowed: 0,
+    irrelevant: 0,
+    admissionRejected: 0,
     discordDestinations: 0,
   };
   const planned = new Set<string>();
   for (const candidate of input.candidates) {
     const url = String(candidate.url || '').trim();
     if (!url) {
-      plan.disallowed++;
+      plan.irrelevant++;
       continue;
     }
     const visitKey = normalizeVisitUrl(url) || url;
@@ -1527,16 +1615,32 @@ export function planRenderedCrossOriginEnqueues(input: {
       plan.discordDestinations++;
       continue;
     }
+    // Same-origin links are owned by the existing same-host hint pass and the
+    // interaction-revealed pass; this planner must not admit them.
+    try {
+      if (new URL(url).origin === new URL(input.currentUrl).origin) {
+        plan.irrelevant++;
+        continue;
+      }
+    } catch {
+      plan.admissionRejected++;
+      continue;
+    }
     // Policy first: only an eligible community destination consumes or
     // reports the bounded hub cap. Weak/generic outbound links are policy
     // rejections, not budget exclusions, so they must not crowd out a later
     // eligible destination.
-    if (!shouldEnqueueRenderedCrossOriginLink({
+    const decision = shouldFollowDestination({
       url,
       currentUrl: input.currentUrl,
       anchorText: String(candidate.text || ''),
-    })) {
-      plan.disallowed++;
+    });
+    if (!decision.eligible) {
+      // Keep unrelated links and admission/security rejections out of the
+      // coverage exclusion counter: neither is an eligible community
+      // destination left unvisited by the pursuit policy.
+      if (decision.reason === 'admission-rejected') plan.admissionRejected++;
+      else plan.irrelevant++;
       continue;
     }
     if (plan.admitted.length >= remaining) {
@@ -3128,6 +3232,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             const pendingPopups: Array<{
               url(): string;
               close(): Promise<void>;
+              content?(): Promise<string>;
               waitForURL?(
                 url: (target: URL) => boolean,
                 options?: { timeout?: number },
@@ -3136,6 +3241,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             const onPopup = (popup: {
               url(): string;
               close(): Promise<void>;
+              content?(): Promise<string>;
               waitForURL?(url: (target: URL) => boolean, options?: { timeout?: number }): Promise<unknown>;
             }) => {
               if (pendingPopups.length >= 8) {
@@ -3163,21 +3269,34 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             popupContext?.on?.('page', onContextPage);
             // A load-time window.open may commit before the request handler
             // starts, so the event can be missed. Pick up already-open sibling
-            // pages that committed an HTTP(S) document, but never an idle
-            // browser-pool about:blank page: closing that as a "dropped
-            // popup" would make every ordinary crawl look bounded.
-            const captureSiblingPages = () => {
+            // pages, but distinguish a real popup from an idle browser-pool
+            // `about:blank` page: closing pool idle state as a "dropped popup"
+            // would make every ordinary crawl look bounded, while skipping a
+            // real load-time popup would let a clean result hide its contents.
+            const captureSiblingPages = async (): Promise<void> => {
               for (const existing of popupContext?.pages?.() || []) {
                 if (!existing || existing === page || seenPopupPages.has(existing)) continue;
                 if (preexistingSiblingPages.has(existing)) {
                   let existingUrl = '';
                   try { existingUrl = existing.url(); } catch { /* treat as idle */ }
-                  if (!/^https?:/i.test(existingUrl)) continue;
+                  if (!/^https?:/i.test(existingUrl)) {
+                    let probe: { hasOpener?: boolean; hasContent?: boolean } | null = null;
+                    try {
+                      probe = await existing.evaluate(() => {
+                        const popupWindow = window as unknown as { opener?: unknown };
+                        const body = document.body;
+                        const hasContent = !!body && (body.childElementCount > 0
+                          || (body.textContent || '').trim().length > 0);
+                        return { hasOpener: !!popupWindow.opener, hasContent };
+                      });
+                    } catch { probe = null; }
+                    if (shouldSkipPreexistingSiblingPage(existingUrl, probe)) continue;
+                  }
                 }
                 onContextPage(existing);
               }
             };
-            captureSiblingPages();
+            await captureSiblingPages();
             const stopPopupCapture = () => popupContext?.off?.('page', onContextPage);
             try {
             // Snapshot lifetime: candidates are extracted from the FULL page
@@ -3234,28 +3353,76 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             await inspect();
             inspectedPages++;
             telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'PAGE_PROCESSED');
-            // P0.2 context counters: structural presence only, collected once
-            // per processed page. They are diagnostics for P1.3-P1.5 (popup,
-            // frame/shadow traversal, base-href resolution) and never alter
-            // selection, clicking, outcome, or retry behavior. A page that
-            // navigated away or closed between inspection and this probe must
-            // not fail the crawl for telemetry.
-            try {
-              const pageContext = await page.evaluate(collectRenderedPageContext);
-              frameCount += Math.max(0, Math.floor(pageContext.frameCount) || 0);
-              shadowRootCount += Math.max(0, Math.floor(pageContext.shadowRootCount) || 0);
-              closedShadowRootCount += Math.max(0, Math.floor(pageContext.closedShadowRootCount) || 0);
-              baseHrefPresent = baseHrefPresent || pageContext.baseHrefPresent === true;
-            } catch { /* context counters never break inspection */ }
+            // P0.2 context counters: structural presence only, refreshed after
+            // scrolling and same-document interactions so frames, shadow roots,
+            // and closed roots created by a disclosure are not missed. Counts
+            // are maxed per document (the attachShadow probe is cumulative) and
+            // summed across documents; a click that navigates to a new document
+            // is not attributed to the original page's counters. Diagnostics
+            // only: they never alter selection, clicking, or outcome. A page
+            // that navigated away or closed between a probe must not fail the
+            // crawl.
+            const pageDocumentUrl = page.url();
+            const pageDocumentIdentity = await page.evaluate(() => performance.timeOrigin).catch(() => null);
+            const pageContextByDocument = new Map<string, {
+              frameCount: number;
+              shadowRootCount: number;
+              closedShadowRootCount: number;
+              baseHrefPresent: boolean;
+            }>();
+            const recordPageContext = async (): Promise<void> => {
+              try {
+                const currentUrl = page.url();
+                const currentIdentity = await page.evaluate(() => performance.timeOrigin).catch(() => null);
+                if (!isSameSeedDocument(pageDocumentIdentity, currentIdentity, pageDocumentUrl, currentUrl)) return;
+                const pageContext = await page.evaluate(collectRenderedPageContext);
+                const key = currentIdentity !== null && currentIdentity !== undefined
+                  ? String(currentIdentity)
+                  : (normalizeVisitUrl(currentUrl) || currentUrl);
+                const prior = pageContextByDocument.get(key);
+                pageContextByDocument.set(key, {
+                  frameCount: Math.max(prior?.frameCount || 0, Math.max(0, Math.floor(pageContext.frameCount) || 0)),
+                  shadowRootCount: Math.max(prior?.shadowRootCount || 0, Math.max(0, Math.floor(pageContext.shadowRootCount) || 0)),
+                  closedShadowRootCount: Math.max(
+                    prior?.closedShadowRootCount || 0,
+                    Math.max(0, Math.floor(pageContext.closedShadowRootCount) || 0),
+                  ),
+                  baseHrefPresent: (prior?.baseHrefPresent || false) || pageContext.baseHrefPresent === true,
+                });
+              } catch { /* context counters never break inspection */ }
+            };
+            await recordPageContext();
             // Declarative closed roots never reach the live DOM, so their
             // count comes from the bounded raw-response scan installed before
-            // navigation. A body that could not be scanned is a gap that keeps
-            // coverage partial rather than a silent empty result.
-            try {
-              const declarativeScan = await readRenderedDeclarativeShadowScan(page);
-              declarativeClosedShadowRootCount += Math.max(0, Math.floor(declarativeScan.closedRoots) || 0);
-              declarativeShadowScanGap += Math.max(0, Math.floor(declarativeScan.gaps) || 0);
-            } catch { declarativeShadowScanGap++; }
+            // navigation. Re-read after interactions because a click can
+            // navigate to a document whose response the same listener sees;
+            // only the delta is added, so the initial document is never
+            // double-counted. A body that could not be bounded is a gap that
+            // keeps coverage partial rather than a silent empty result.
+            let lastDeclarativeClosedRoots = 0;
+            let lastDeclarativeGaps = 0;
+            const recordDeclarativeShadowScan = async (): Promise<void> => {
+              try {
+                const declarativeScan = await readRenderedDeclarativeShadowScan(page);
+                declarativeClosedShadowRootCount += Math.max(
+                  0,
+                  Math.max(0, Math.floor(declarativeScan.closedRoots) || 0) - lastDeclarativeClosedRoots,
+                );
+                declarativeShadowScanGap += Math.max(
+                  0,
+                  Math.max(0, Math.floor(declarativeScan.gaps) || 0) - lastDeclarativeGaps,
+                );
+                lastDeclarativeClosedRoots = Math.max(
+                  lastDeclarativeClosedRoots,
+                  Math.max(0, Math.floor(declarativeScan.closedRoots) || 0),
+                );
+                lastDeclarativeGaps = Math.max(
+                  lastDeclarativeGaps,
+                  Math.max(0, Math.floor(declarativeScan.gaps) || 0),
+                );
+              } catch { declarativeShadowScanGap++; }
+            };
+            await recordDeclarativeShadowScan();
             if (!seedDocumentSeen) {
               seedDocumentSeen = true;
               seedSnapshotUrl = page.url();
@@ -3270,26 +3437,106 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 seedRequiredLinks = [];
               }
             }
-            // Pre-interaction same-origin anchor snapshot. Only links absent
-            // from this snapshot are "revealed by interaction"; static generic
-            // links remain subject to the ordinary hint policy. The snapshot is
-            // taken before scrolling so scroll-revealed navigation is also
-            // treated as interaction evidence.
-            const initialLinkKeys = new Set<string>();
+            // Pre-interaction same-origin anchor baseline, keyed by document
+            // identity. Only links absent from the current document's baseline
+            // are "revealed by interaction"; static generic links remain
+            // subject to the ordinary hint policy. A click that navigates to a
+            // new document gets its own baseline, so its static links are not
+            // mistaken for links revealed by the original page.
+            const linkBaselines = new Map<string, Set<string>>();
+            const documentBaselineKey = (identity: unknown, url: string): string =>
+              identity !== null && identity !== undefined
+                ? String(identity)
+                : (normalizeVisitUrl(url) || url);
             let initialLinksCaptured = false;
             try {
+              const identity = await page.evaluate(() => performance.timeOrigin).catch(() => null);
+              const baselineKey = documentBaselineKey(identity, page.url());
               const initialCollection = await page.$$eval(
                 'a[href]',
                 collectRenderedSameOriginCandidates,
                 page.url(),
               );
               if (initialCollection.truncated > 0) candidateCapTruncated = Math.max(candidateCapTruncated, initialCollection.truncated);
+              const baseline = new Set<string>();
               for (const candidate of initialCollection.candidates) {
                 const key = normalizeVisitUrl(candidate.url);
-                if (key) initialLinkKeys.add(key);
+                if (key) baseline.add(key);
               }
+              linkBaselines.set(baselineKey, baseline);
               initialLinksCaptured = true;
             } catch { /* fail closed below if interactions occurred */ }
+            let revealedScanFailed = false;
+            // Capture destinations inserted by one interaction before a later
+            // interaction replaces the panel that contained them. Runs after
+            // every click and once more after the loop for scroll-revealed
+            // links. Each document's baseline records every candidate already
+            // considered, so repeated passes neither re-admit nor re-count it.
+            const captureRevealedSameOrigin = async (): Promise<void> => {
+              if (!initialLinksCaptured || Date.now() - startedAt >= limits.totalTimeoutMs) return;
+              let currentUrl = '';
+              let baselineKey = '';
+              let revealedCollection: RenderedCandidateCollection;
+              try {
+                currentUrl = page.url();
+                const identity = await page.evaluate(() => performance.timeOrigin).catch(() => null);
+                baselineKey = documentBaselineKey(identity, currentUrl);
+                revealedCollection = await page.$$eval(
+                  'a[href]',
+                  collectRenderedSameOriginCandidates,
+                  currentUrl,
+                );
+              } catch {
+                revealedScanFailed = true;
+                return;
+              }
+              if (revealedCollection.truncated > 0) {
+                candidateCapTruncated = Math.max(candidateCapTruncated, revealedCollection.truncated);
+              }
+              let baseline = linkBaselines.get(baselineKey);
+              if (!baseline) {
+                // First observation of a document reached by a click. Its
+                // current links are static relative to that document and must
+                // not consume the remaining page budget.
+                baseline = new Set<string>();
+                linkBaselines.set(baselineKey, baseline);
+                for (const candidate of revealedCollection.candidates) {
+                  const key = normalizeVisitUrl(candidate.url);
+                  if (key) baseline.add(key);
+                }
+                return;
+              }
+              const revealedPlan = planRevealedSameOriginEnqueues({
+                candidates: revealedCollection.candidates,
+                currentUrl,
+                initialLinks: baseline,
+                alreadyVisited: alreadyVisitedSet,
+                queued: revealedQueued,
+                // Reuse the existing page budget: no new crawl-wide cap.
+                maxEnqueues: Math.max(0, limits.maxPages - inspectedPages),
+              });
+              // Mark every candidate as considered even when it was rejected:
+              // a later pass must not re-count the same budget loss.
+              for (const candidate of revealedCollection.candidates) {
+                const key = normalizeVisitUrl(candidate.url);
+                if (key) baseline.add(key);
+              }
+              if (revealedPlan.alreadyVisited) drops.count('already-visited', revealedPlan.alreadyVisited);
+              if (revealedPlan.admissionRejected) drops.count('admission-rejected', revealedPlan.admissionRejected);
+              if (revealedPlan.budget > 0) revealedSameOriginDropped += revealedPlan.budget;
+              if (!revealedPlan.admitted.length) return;
+              for (const url of revealedPlan.admitted) {
+                const key = normalizeVisitUrl(url) || url;
+                revealedQueued.add(key);
+              }
+              revealedSameOriginAdmitted += revealedPlan.admitted.length;
+              try {
+                await enqueueLinks({ urls: revealedPlan.admitted, strategy: 'all' });
+              } catch {
+                // Keys are already recorded; post-run resolution accounts for
+                // every destination that was never inspected.
+              }
+            };
 
             for (let i = 0; i < limits.maxScrollsPerPage; i++) {
               if (Date.now() - startedAt >= limits.totalTimeoutMs) break;
@@ -3304,6 +3551,8 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               // unexamined remainder makes the run partial.
               if (i === limits.maxScrollsPerPage - 1) scrollCapReachedStillGrowing = true;
             }
+            // Scrolling can reveal lazy frames or shadow hosts.
+            await recordPageContext();
 
             const enumerateControls = async (): Promise<RenderedControlEnumeration> =>
               page.locator(RENDERED_CONTROL_SELECTOR).evaluateAll(enumerateRenderedControlNodes, COMMUNITY_HINTS.source);
@@ -3461,7 +3710,12 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 maxEnqueues: MAX_RENDERED_CROSS_ORIGIN_ENQUEUES - crossOriginQueued.size,
               });
               if (plan.alreadyVisited) drops.count('already-visited', plan.alreadyVisited);
-              if (plan.disallowed) drops.count('cross-origin-disallowed', plan.disallowed);
+              // Unrelated/vendor links and format/security rejections are not
+              // unexamined community navigation. Count them diagnostically so
+              // an ordinary page with a privacy link can still resolve as a
+              // clean absence.
+              if (plan.irrelevant) drops.count('hint-rejected', plan.irrelevant);
+              if (plan.admissionRejected) drops.count('admission-rejected', plan.admissionRejected);
               if (!limits.crossOriginEnqueue) {
                 // Opt-in pursuit is OFF: every eligible destination (including
                 // those beyond the cap) is a deliberate policy exclusion. This
@@ -3486,7 +3740,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             const drainPopups = async (): Promise<void> => {
               // Catch a popup whose context page event was delivered after
               // the click settled (notably COOP-severed popups).
-              captureSiblingPages();
+              await captureSiblingPages();
               while (pendingPopups.length) {
                 const popup = pendingPopups.shift()!;
                 let popupUrl = '';
@@ -3502,39 +3756,41 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                   ).catch(() => undefined);
                   popupUrl = popup.url();
                 } catch { /* about:blank or already closed */ }
+                const kind = classifyRenderedPopupDestination(popupUrl, page.url());
+                // A blank popup can still hold document.write() markup with an
+                // invite. Read it as evidence before closing; it remains an
+                // uninspectable navigation surface (a coverage gap), but its
+                // contents are no longer silently lost.
+                let popupContent = '';
+                if (kind === 'uninspectable' && popup.content) {
+                  try { popupContent = await popup.content(); } catch { /* best effort */ }
+                }
                 await popup.close().catch(() => undefined);
-                if (!popupUrl || popupUrl === 'about:blank') {
+                if (popupContent) retain(popupContent, page.url());
+                if (kind === 'uninspectable') {
                   // A popup that never committed a navigable URL cannot be
                   // classified. It is still an unexamined interaction surface.
                   popupDestinationsDropped++;
                   continue;
                 }
-                let parsed: URL;
-                try {
-                  parsed = new URL(popupUrl);
-                } catch {
-                  popupDestinationsDropped++;
-                  continue;
-                }
-                if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-                  // chrome-error:// (blocked/failed popup navigation) and other
-                  // non-HTTP schemes must not resolve as a clean popup capture.
-                  popupDestinationsDropped++;
+                if (kind === 'discord') {
+                  // The popup opened a direct Discord invite. The URL is
+                  // terminal evidence; never discard it as a policy exclusion
+                  // or consume a bounded page request to re-open it.
+                  retain(popupUrl, page.url());
+                  popupCaptured++;
                   continue;
                 }
                 const key = normalizeVisitUrl(popupUrl) || popupUrl;
                 if (alreadyVisitedSet.has(key) || popupQueued.has(key) || crossOriginQueued.has(key) || revealedQueued.has(key)) continue;
-                const popupOrigin = (() => {
-                  try { return new URL(page.url()).origin; } catch { return ''; }
-                })();
-                if (parsed.origin !== popupOrigin) {
+                if (kind === 'cross-origin') {
                   // The popup opened, but its cross-origin content was never
                   // inspected. Record the policy exclusion; never navigate to
                   // it here.
                   drops.count('cross-origin-disallowed');
                   continue;
                 }
-                if (!assessCrawlAdmission(popupUrl).eligible) {
+                if (kind === 'admission-rejected') {
                   drops.count('admission-rejected');
                   continue;
                 }
@@ -3581,6 +3837,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                   onClicked: () => { clicks++; },
                 }));
                 await drainPopups();
+                // Preserve a newly revealed destination before the next click
+                // replaces the panel that contains it.
+                await captureRevealedSameOrigin();
                 if (clickOutcome.ok && control.popup) popupTargetsResolved++;
                 return clickOutcome.ok;
               },
@@ -3603,52 +3862,22 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // Safety net for a popup whose window.open fired after the last
             // per-click drain (for example a short-delayed handler).
             if (pendingPopups.length) await drainPopups();
+            // Interaction can create closed roots or navigate to a document
+            // whose declarative root the response listener has now observed.
+            await recordPageContext();
+            await recordDeclarativeShadowScan();
             // Interaction-revealed same-origin admission. Links that did not
-            // exist in the pre-interaction snapshot and carry no community
-            // hint (for example a JS-inserted `/resources` path) are still
-            // legitimate navigation: the page deliberately revealed them.
-            // Static generic links stay subject to the hint policy.
-            if (initialLinksCaptured && Date.now() - startedAt < limits.totalTimeoutMs) {
-              // Distinguishes "enumeration/planning failed before any key was
-              // recorded" (a single bounded gap) from "enqueue threw after the
-              // admitted keys were recorded" (post-run resolution accounts for
-              // each unvisited destination exactly once).
-              let revealedEnqueueAttempted = false;
-              try {
-                const revealedCollection = await page.$$eval(
-                  'a[href]',
-                  collectRenderedSameOriginCandidates,
-                  page.url(),
-                );
-                if (revealedCollection.truncated > 0) candidateCapTruncated = Math.max(candidateCapTruncated, revealedCollection.truncated);
-                const revealedPlan = planRevealedSameOriginEnqueues({
-                  candidates: revealedCollection.candidates,
-                  currentUrl: page.url(),
-                  initialLinks: initialLinkKeys,
-                  alreadyVisited: alreadyVisitedSet,
-                  queued: revealedQueued,
-                  // Reuse the existing page budget: no new crawl-wide cap.
-                  maxEnqueues: Math.max(0, limits.maxPages - inspectedPages),
-                });
-                if (revealedPlan.alreadyVisited) drops.count('already-visited', revealedPlan.alreadyVisited);
-                if (revealedPlan.admissionRejected) drops.count('admission-rejected', revealedPlan.admissionRejected);
-                if (revealedPlan.budget > 0) revealedSameOriginDropped += revealedPlan.budget;
-                if (revealedPlan.admitted.length > 0) {
-                  for (const url of revealedPlan.admitted) {
-                    const key = normalizeVisitUrl(url) || url;
-                    revealedQueued.add(key);
-                  }
-                  revealedSameOriginAdmitted += revealedPlan.admitted.length;
-                  revealedEnqueueAttempted = true;
-                  await enqueueLinks({ urls: revealedPlan.admitted, strategy: 'all' });
-                }
-              } catch {
-                // The post-interaction document could not be enumerated; a
-                // revealed destination may exist. Never certify clean. When
-                // keys were already recorded, post-run resolution owns the
-                // per-destination accounting instead of double counting here.
-                if (!revealedEnqueueAttempted) revealedSameOriginDropped++;
-              }
+            // exist in the current document's pre-interaction baseline and
+            // carry no community hint (for example a JS-inserted `/resources`
+            // path) are still legitimate navigation: the page deliberately
+            // revealed them. Per-click passes already captured panels that a
+            // later click replaced; this final pass catches scroll-revealed
+            // links and the last click's additions.
+            await captureRevealedSameOrigin();
+            if (revealedScanFailed) {
+              // An interaction surface existed but could not be enumerated;
+              // a revealed destination may exist. Never certify clean.
+              revealedSameOriginDropped++;
             } else if (!initialLinksCaptured && clickLoop.evidenceControlsClicked > 0) {
               // No trustworthy pre-interaction baseline: any link the clicks
               // revealed cannot be distinguished from static navigation.
@@ -3681,7 +3910,23 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             evidenceControlsSeen += pageControlTotal;
             // Page-end aggregation. Counts are crawl totals, not per-page
             // maxima, so a multi-page crawl reports the sum of what each
-            // processed page exposed.
+            // processed page exposed. Context counters are maxed per document
+            // and summed here; closed roots found after the interaction pass
+            // are included without double counting.
+            let pageFrameCount = 0;
+            let pageShadowRootCount = 0;
+            let pageClosedShadowRootCount = 0;
+            let pageBaseHrefPresent = false;
+            for (const context of pageContextByDocument.values()) {
+              pageFrameCount += context.frameCount;
+              pageShadowRootCount += context.shadowRootCount;
+              pageClosedShadowRootCount += context.closedShadowRootCount;
+              pageBaseHrefPresent = pageBaseHrefPresent || context.baseHrefPresent;
+            }
+            frameCount += pageFrameCount;
+            shadowRootCount += pageShadowRootCount;
+            closedShadowRootCount += pageClosedShadowRootCount;
+            baseHrefPresent = baseHrefPresent || pageBaseHrefPresent;
             controlsEnumeratedTotal += pageControlsEnumeratedTotal;
             controlsHintRejected += pageHintRejected;
             controlsStructuralNavigation += pageStructuralNavigation;

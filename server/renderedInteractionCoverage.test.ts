@@ -469,7 +469,7 @@ test('cross-origin planner carries visible anchor text for generic paths', () =>
     queued: new Set(),
   });
   assert.deepEqual(admitted.admitted, ['https://community.example/go']);
-  assert.equal(admitted.disallowed, 0);
+  assert.equal(admitted.irrelevant, 0);
 
   const noLabel = planRenderedCrossOriginEnqueues({
     candidates: [{ url: 'https://community.example/go', text: '' }],
@@ -478,7 +478,9 @@ test('cross-origin planner carries visible anchor text for generic paths', () =>
     queued: new Set(),
   });
   assert.deepEqual(noLabel.admitted, [], 'a generic path with no visible label is not admitted');
-  assert.equal(noLabel.disallowed, 1);
+  assert.equal(noLabel.irrelevant, 1, 'an unrelated outbound link is diagnostic, never a coverage exclusion');
+  assert.equal(noLabel.admissionRejected, 0);
+  assert.equal(noLabel.budget, 0);
 });
 
 test('cross-origin planner deduplicates, skips visited, and enforces the cap', () => {
@@ -509,7 +511,21 @@ test('cross-origin planner deduplicates, skips visited, and enforces the cap', (
     queued: new Set(),
   });
   assert.equal(terminal.discordDestinations, 1);
-  assert.equal(terminal.disallowed, 0, 'Discord is a terminal invite candidate, not a policy exclusion');
+  assert.equal(terminal.irrelevant, 0, 'Discord is a terminal invite candidate, not a policy exclusion');
+  assert.equal(terminal.admissionRejected, 0);
+
+  const rejected = planRenderedCrossOriginEnqueues({
+    candidates: [
+      { url: 'http://127.0.0.1/private', text: 'Join the private community' },
+      { url: 'https://outside.test/privacy', text: 'Privacy policy' },
+    ],
+    currentUrl: 'https://creator.example/',
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.equal(rejected.admissionRejected, 1, 'format/security rejections are not eligible destinations');
+  assert.equal(rejected.irrelevant, 1, 'an unrelated vendor link is not an eligible destination');
+  assert.equal(rejected.budget, 0);
 });
 
 test('cross-origin rendered enqueue stays policy- and budget-bounded', () => {
@@ -794,6 +810,34 @@ test('rendered control coverage counts overflow and uses stable markers across D
     2,
     'both the success and catch paths publish the control certificate to telemetry',
   );
+});
+
+test('interaction-revealed links are captured per click and context counters refresh after interactions', () => {
+  const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
+  assert.match(
+    source,
+    /click: async control => \{[\s\S]*?await captureRevealedSameOrigin\(\);[\s\S]*?return clickOutcome\.ok;/,
+    'new same-origin destinations are captured after every click, before the next click can replace them',
+  );
+  assert.match(
+    source,
+    /await captureRevealedSameOrigin\(\);\s*if \(revealedScanFailed\)/,
+    'the post-loop pass captures scroll-revealed links and reports a failed scan as a gap',
+  );
+  assert.match(source, /const linkBaselines = new Map<string, Set<string>>\(\)/);
+  assert.match(source, /baselineKey = documentBaselineKey\(identity, currentUrl\)/, 'link comparisons are scoped to the current document identity');
+  assert.match(source, /if \(!baseline\) \{[\s\S]*?linkBaselines\.set\(baselineKey, baseline\);[\s\S]*?return;/, 'a clicked-to document establishes its own static baseline');
+  assert.match(source, /await recordPageContext\(\);\s*await recordDeclarativeShadowScan\(\);/, 'context counters refresh after the click loop');
+  assert.match(source, /await recordPageContext\(\);/, 'context counters also refresh after scrolling');
+  assert.match(
+    source,
+    /declarativeScan\.closedRoots\) \|\| 0\) - lastDeclarativeClosedRoots/,
+    'declarative-root re-reads add only the delta, never double count',
+  );
+  assert.match(source, /pageContextByDocument\.set\(key, \{/, 'live context counters are maxed per document');
+  assert.match(source, /retain\(popupUrl, page\.url\(\)\)/, 'a direct Discord popup URL is retained as terminal evidence');
+  assert.match(source, /shouldSkipPreexistingSiblingPage\(existingUrl, probe\)/, 'blank siblings are classified before being skipped');
+  assert.match(source, /popupContent = await popup\.content\(\)/, 'document.write content in a blank popup is inspected before closing');
 });
 
 test('shared rendered evidence stays fail-closed: gapped/timed-out lenders never enter inventory', () => {
