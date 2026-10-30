@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import { evaluateClassificationStages, isThinRetrievalInputRequiringHydration } from './stagedClassification';
 import { evaluateUnifiedDecisionPolicy } from './decisionPolicy';
 import { calibrateSemanticConfidence } from './semanticCalibration';
+import { buildContextualComposition } from './contextualComposition';
+import { buildCanonicalEvidenceCorpus } from './canonicalEvidencePlane';
+import type { ContextualCompositionReport } from './contextualComposition';
 import type { EvidenceCollectionReport, EvidenceItem } from './types';
 
 function semanticUnrelated(): EvidenceItem {
@@ -76,8 +79,8 @@ const hydratedInput = {
   videos: [{ title: 'USD/CHF Price Forecast Today' }]
 };
 
-function decide(input: any, evidence: EvidenceItem[], collection = sufficientCollection()) {
-  const stages = evaluateClassificationStages(input, evidence, collection);
+function decide(input: any, evidence: EvidenceItem[], collection = sufficientCollection(), composition?: ContextualCompositionReport) {
+  const stages = evaluateClassificationStages(input, evidence, collection, composition);
   return {
     stages,
     decision: evaluateUnifiedDecisionPolicy({
@@ -201,4 +204,87 @@ test('thin input with affirmative positives keeps REVIEW (never forced to ENRICH
   assert.equal(corroboration?.disposition, 'PASS');
   assert.equal(stages.lifecycleAction, 'REVIEW');
   assert.equal(decision.status, 'UNCERTAIN');
+});
+
+function retrievalOnlyInput() {
+  const input: any = {
+    channel_name: 'Harborlight Media',
+    description: '',
+    video_titles: [] as string[],
+    videos: [] as Array<{ title: string }>,
+    enrichment_stage: 0,
+    search_match_context: { type: 'VIDEO' as const, title: 'USD/CHF Price Forecast Today', locator: 'youtube:video:l7thcsSpOeQ' }
+  };
+  input.evidence_corpus = buildCanonicalEvidenceCorpus(input);
+  return input;
+}
+
+function affirmativeEvidence(): EvidenceItem[] {
+  return [
+    positiveItem('pos-1', 'TERMINOLOGY', 'channel_bio', 'fam-bio', 20),
+    positiveItem('pos-2', 'INSTRUMENT', 'external_link_domain', 'fam-link', 18)
+  ];
+}
+
+function mixedNegative(): EvidenceItem {
+  return {
+    id: 'hype-negative',
+    source: 'channel_metadata',
+    polarity: 'NEGATIVE',
+    category: 'HYPE_SPECULATION',
+    fact: 'promotional language without domain evidence',
+    rawMatches: [],
+    confidence: 70,
+    reliability: 'MEDIUM',
+    reliabilityMultiplier: 1,
+    rawWeight: 30,
+    finalWeight: -30,
+    timestamp: new Date(0).toISOString(),
+    provenance: {
+      provider: 'channel_metadata',
+      type: 'HYPE_SPECULATION',
+      matchedTerm: 'moon',
+      sourceRef: 'deterministic:channel_metadata',
+      fields: [{ field: 'channel_bio', sourceId: 'about' }]
+    }
+  } as EvidenceItem;
+}
+
+test('query-only composition preserves affirmative REVIEW and never confirms', () => {
+  const input = retrievalOnlyInput();
+  const composition = buildContextualComposition(input);
+  assert.equal(composition.focus, 'QUERY_ONLY');
+
+  // Candidate and corroboration both pass with no contradiction: base routing
+  // would CONFIRM, but a retrieval-only composition must stop at REVIEW.
+  const { stages, decision } = decide(input, affirmativeEvidence(), sufficientCollection(), composition);
+  assert.equal(stages.stages.find(stage => stage.stage === 'CANDIDATE_DETECTION')?.disposition, 'PASS');
+  assert.equal(stages.stages.find(stage => stage.stage === 'CORROBORATION')?.disposition, 'PASS');
+  assert.equal(stages.lifecycleAction, 'REVIEW');
+  assert.equal(decision.status, 'UNCERTAIN');
+
+  // The mixed-evidence ABSTAIN route already produces REVIEW; query-only
+  // routing must preserve it instead of overwriting it with ENRICH.
+  const abstained = decide(input, [...affirmativeEvidence(), mixedNegative()], sufficientCollection(), composition);
+  assert.equal(abstained.stages.stages.find(stage => stage.stage === 'CONTRADICTION')?.disposition, 'ABSTAIN');
+  assert.equal(abstained.stages.lifecycleAction, 'REVIEW');
+  assert.equal(abstained.decision.status, 'UNCERTAIN');
+});
+
+test('insufficient coverage preserves affirmative REVIEW and a supported terminal REJECT', () => {
+  const input = { ...retrievalOnlyInput(), search_match_context: undefined };
+  const composition = buildContextualComposition(input);
+  assert.equal(composition.focus, 'INSUFFICIENT_COVERAGE');
+
+  const affirmative = decide(input, affirmativeEvidence(), sufficientCollection(), composition);
+  assert.equal(affirmative.stages.lifecycleAction, 'REVIEW');
+  assert.equal(affirmative.decision.status, 'UNCERTAIN');
+
+  const terminalNegative = decide(input, [semanticUnrelated()], sufficientCollection(), composition);
+  assert.equal(terminalNegative.stages.stages.find(stage => stage.stage === 'CONTRADICTION')?.disposition, 'FAIL');
+  assert.equal(terminalNegative.stages.lifecycleAction, 'REJECT');
+  assert.equal(terminalNegative.decision.status, 'NON_TRADING');
+
+  const noAffirmative = decide(input, [], sufficientCollection(), composition);
+  assert.equal(noAffirmative.stages.lifecycleAction, 'ENRICH');
 });

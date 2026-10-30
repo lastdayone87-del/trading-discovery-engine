@@ -152,7 +152,12 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
     && composition.nonTitleTierAFamilies >= 1
     && composition.tradingFamilies >= 2
   );
-  const corroborated = compositionCorroborates && (explicitCreatorStatementConfirms || repeatedCreatorIndependent || (corroborating.length > 0 && (repeated || independentObservations || ((sources.size >= 2 || independentDimensions.size >= 2)&&independence.independentFamilyCount>=2))));
+  // Thin compositions cannot confirm, but they must not erase independent
+  // evidence-based corroboration: the lifecycle routing below preserves it at
+  // REVIEW (never CONFIRM) while a supported terminal negative still rejects.
+  const thinCompositionAllowsCorroboration = composition?.focus === 'QUERY_ONLY'
+    || composition?.focus === 'INSUFFICIENT_COVERAGE';
+  const corroborated = (compositionCorroborates || thinCompositionAllowsCorroboration) && (explicitCreatorStatementConfirms || repeatedCreatorIndependent || (corroborating.length > 0 && (repeated || independentObservations || ((sources.size >= 2 || independentDimensions.size >= 2)&&independence.independentFamilyCount>=2))));
   const corroborationEvidence = repeatedCreatorIndependent ? [...corroborating, ...repeatedCreatorHypothesis] : corroborating;
   const weakVideoTerminologyOnly = positive.length > 0 && positive.every(isWeakVideoTerminologyEvidence);
   const corroborationReason = explicitCreatorStatementConfirms
@@ -186,11 +191,16 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   else if (contradiction.disposition === 'ABSTAIN') lifecycleAction = candidate.disposition==='PASS'&&corroboration.disposition==='PASS'?'REVIEW':'ENRICH';
   else if (candidate.disposition === 'PASS' && corroboration.disposition === 'PASS') lifecycleAction = 'CONFIRM';
   if (composition) {
-    // C5/C6 routing: a query-only or thin composition cannot confirm or
-    // reject; an alternative-dominant composition with creator-level negative
-    // evidence is the explicit non-trading path; a mixed composition abstains.
-    if (composition.focus === 'QUERY_ONLY') lifecycleAction = 'ENRICH';
-    else if (composition.focus === 'INSUFFICIENT_COVERAGE') lifecycleAction = lifecycleAction === 'REJECT' ? 'REJECT' : 'ENRICH';
+    // C5/C6 routing: a query-only or thin composition cannot confirm; an
+    // alternative-dominant composition with creator-level negative evidence is
+    // the explicit non-trading path; a mixed composition abstains. An
+    // affirmative candidate + corroboration pair that already routed to REVIEW
+    // must stay in human review instead of being pushed back to ENRICH just
+    // because coverage is thin. A supported creator-owned terminal negative
+    // still rejects under insufficient coverage.
+    const affirmativeCandidate = candidate.disposition === 'PASS' && corroboration.disposition === 'PASS';
+    if (composition.focus === 'QUERY_ONLY') lifecycleAction = affirmativeCandidate ? 'REVIEW' : 'ENRICH';
+    else if (composition.focus === 'INSUFFICIENT_COVERAGE') lifecycleAction = lifecycleAction === 'REJECT' ? 'REJECT' : affirmativeCandidate ? 'REVIEW' : 'ENRICH';
     else if (composition.focus === 'ALTERNATIVE_DOMINANT') lifecycleAction = contradiction.disposition === 'FAIL' ? 'REJECT' : 'ENRICH';
     else if (composition.focus === 'MIXED' && lifecycleAction === 'CONFIRM') lifecycleAction = 'REVIEW';
     else if (composition.focus === 'TRADING_DOMINANT' && lifecycleAction === 'CONFIRM' && !compositionCorroborates) lifecycleAction = 'REVIEW';
