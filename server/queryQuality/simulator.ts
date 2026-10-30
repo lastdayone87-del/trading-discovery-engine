@@ -304,12 +304,17 @@ function chooseArm(
       return bIndex - aIndex || a.arm.id - b.arm.id;
     })[0].arm;
   }
-  if (selector === 'independent_ts') {
-    return [...scored].sort((a, b) => thompsonSample(b.posterior, rng) - thompsonSample(a.posterior, rng))[0].arm;
-  }
-  if (selector === 'hierarchical_ts') {
-    // Same Gamma–Poisson posterior and hierarchy as UCB; only the choice rule differs.
-    return [...scored].sort((a, b) => thompsonSample(b.posterior, rng) - thompsonSample(a.posterior, rng))[0].arm;
+  if (selector === 'independent_ts' || selector === 'hierarchical_ts') {
+    // Draw exactly one Thompson sample per arm, then sort the fixed draws.
+    // Sampling inside the comparator makes the result depend on comparison
+    // order and gives an arm no stable score within a decision.
+    const sampled = scored.map(item => ({
+      item,
+      sample: thompsonSample(item.posterior, rng),
+    }));
+    return sampled
+      .sort((a, b) => b.sample - a.sample || a.item.arm.id - b.item.arm.id)[0]
+      .item.arm;
   }
   return [...scored].sort((a, b) => b.posterior.ucb - a.posterior.ucb || a.arm.id - b.arm.id)[0].arm;
 }

@@ -678,6 +678,10 @@ test('Q8: corrected hierarchical TS is an offline comparator and UCB c=2 is non-
   }
   const source = readFileSync(join(__dirname, 'simulator.ts'), 'utf8');
   assert.ok(source.includes('offline selector comparison'));
+  // Thompson arms must be sampled once per decision, before sorting. Sampling
+  // inside a comparator makes the winner depend on comparison order.
+  assert.doesNotMatch(source, /sort\(\(a, b\) => thompsonSample\(/);
+  assert.match(source, /const sampled = scored\.map\(item => \(\{[\s\S]*?sample: thompsonSample\(item\.posterior, rng\)/);
 });
 
 function rawInput(overrides: Partial<RawChannelInput>): RawChannelInput {
