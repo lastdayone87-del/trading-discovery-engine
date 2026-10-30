@@ -71,7 +71,7 @@ import {buildProviderRequestBaseId,executeAllocatedRetrievalPage,providerSnapsho
 import './braveSearch';
 import './youtubeInnertubeProvider';
 import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator, replayVocabularyForRetry } from './queryIntelligence';
-import { calculateQueryFunnel, countDeferredRawResults, manualSearchContinuationMetrics, type FunnelOutcome, type QueryObservation } from './queryPerformance';
+import { calculateQueryFunnel, countDeferredRawResults, manualSearchContinuationMetrics, type FunnelOutcome, type QueryFunnelMetrics, type QueryObservation } from './queryPerformance';
 import { resolveScopeEligibility } from './scopeEligibility';
 import { processChannelThroughPipeline, isTerminalState, applyGate1CountryRejectionToExisting, type PipelineExecutionOptions } from './ingestionPipeline';
 import { evaluateLowAudienceGate } from './lowAudienceGate';
@@ -89,7 +89,7 @@ import { isProbeQuotaControlError } from './quotaKeyCapShadow';
 import { assertCountryAllowed, ExcludedCountryError, getCountryExclusion, shouldBlockEnrichClaimForCountry } from './countryExclusion';
 import { randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
-import { computeEffectivePageBudget, evaluateContinuation, evaluateContinuationV2, resumeModeForProvider, shouldCreateContinuationSegment, type ContinuationDecisionV2 } from './continuationPolicy';
+import { computeEffectivePageBudget, evaluateContinuation, evaluateContinuationV2, planPersistedPageRecovery, resumeModeForProvider, shouldCreateContinuationSegment, type ContinuationDecisionV2, type ContinuationResumeMode } from './continuationPolicy';
 import { evaluateAutonomousQueryAuthority, isScopePromotedRecord } from './autonomousQueryAuthority';
 import { getDiscoveryScope, resolveAutonomousCountries, resolveScopePromotionForScope } from './autonomousDiscovery';
 import { YOUTUBE_INNERTUBE_MAX_PAGES, INNERTUBE_TIMEOUT_CODE } from './youtubeInnertubeProvider';
@@ -102,6 +102,7 @@ import {
   countNovelCandidateTermsForPage,
   getAutonomousContinuationState,
   getAutonomousPageMarginalMetrics,
+  getAutonomousPageObservation,
   getAutonomousRunMetrics,
   listPendingAutonomousRuns,
   recordAutonomousPage,
@@ -519,6 +520,348 @@ export function buildSearchLatencyBreakdownMs(searchWorkerStartMs: number, searc
     retrievalMs: Math.max(0, searchRetrievalGrossMs - searchTopUpWaitMs),
     channelProcessingMs: channelLoopEndMs - channelLoopStartMs,
   };
+}
+
+interface AutonomousRunFinalizationArgs {
+  job: { id: string; payload: any };
+  workerId: string;
+  queryRunId: string;
+  queryId?: number;
+  query: string;
+  country: string;
+  pageNumber: number;
+  retrievalLane: RetrievalLane;
+  searchOrdering: import('./searchOrdering').SearchOrdering;
+  retrievalConfigKey?: string | null;
+  pageMetrics: QueryFunnelMetrics;
+  allocatedProvider: ProviderAllocation;
+  providerCostUsd: number;
+  searchWorkerStartMs: number;
+  searchQuotaWaitMs: number;
+  searchRetrievalGrossMs: number;
+  searchTopUpWaitMs: number;
+  channelLoopStartMs: number;
+  channelLoopEndMs: number;
+  trial?: { trialId?: string } | null;
+  nextPageToken: string | null;
+  createContinuation: boolean;
+  continuationExplorationPagesRemaining: number;
+  continuationResumeMode: ContinuationResumeMode;
+}
+
+/**
+ * Complete one autonomous search run from its persisted pages. Shared by the
+ * normal worker path and the saved-page retry replay so the parent's final
+ * counts, provider telemetry, query learning and linked child handoff cannot
+ * drift between the two entry points.
+ */
+async function finalizeAutonomousSearchRun(args: AutonomousRunFinalizationArgs): Promise<void> {
+  const finalMetrics = await getAutonomousRunMetrics(args.queryRunId);
+  let providerCostUsd = Math.max(0, Number(args.providerCostUsd) || 0);
+  let providerRequestsAttempted = 0;
+  let providerRequestsSucceeded = 0;
+  let providerRequestsFailed = 0;
+  let providerRateLimited = 0;
+  let providerPagesRetrieved = 0;
+  if (args.job.payload.provider?.costDomain === 'BRAVE_SEARCH_API') {
+    const providerTotals = await (await getDb()).query(`SELECT provider_cost_usd,provider_requests_attempted,provider_requests_succeeded,provider_requests_failed,provider_rate_limited,provider_pages_retrieved FROM query_runs WHERE id=$1`, [args.queryRunId]);
+    const totals = providerTotals.rows[0] || {};
+    providerCostUsd = Number(totals.provider_cost_usd || providerCostUsd);
+    providerRequestsAttempted = Number(totals.provider_requests_attempted || 0);
+    providerRequestsSucceeded = Number(totals.provider_requests_succeeded || 0);
+    providerRequestsFailed = Number(totals.provider_requests_failed || 0);
+    providerRateLimited = Number(totals.provider_rate_limited || 0);
+    providerPagesRetrieved = Number(totals.provider_pages_retrieved || 0);
+  }
+  let providerRunOutcome: ProviderRunOutcome | undefined;
+  if (args.allocatedProvider.providerKey === 'youtube-innertube') {
+    const providerCounts = await (await getDb()).query(`SELECT COUNT(*)::int AS attempted, COUNT(*) FILTER (WHERE status='SUCCESS')::int AS succeeded, COUNT(*) FILTER (WHERE status NOT IN ('SUCCESS','RATE_LIMITED'))::int AS failed, COUNT(*) FILTER (WHERE status='RATE_LIMITED')::int AS rate_limited FROM provider_call_events WHERE run_id=$1::text AND provider='youtube-innertube' AND operation='search'`, [args.queryRunId]);
+    const counts = providerCounts.rows[0] || {};
+    providerRequestsAttempted = Number(counts.attempted || 0);
+    providerRequestsSucceeded = Number(counts.succeeded || 0);
+    providerRequestsFailed = Number(counts.failed || 0);
+    providerRateLimited = Number(counts.rate_limited || 0);
+    providerPagesRetrieved = providerRequestsSucceeded;
+    providerRunOutcome = resolveInnertubeRunOutcome({
+      rawResults: finalMetrics.rawResults,
+      providerRequestsAttempted,
+      providerRequestsSucceeded,
+      providerRequestsFailed,
+      providerRateLimited,
+    });
+  } else if (args.allocatedProvider.providerKey !== 'brave-search') {
+    const providerCounts = await (await getDb()).query(`SELECT COUNT(*)::int AS attempted, COUNT(*) FILTER (WHERE status='SUCCESS')::int AS succeeded, COUNT(*) FILTER (WHERE status NOT IN ('SUCCESS','RATE_LIMITED'))::int AS failed, COUNT(*) FILTER (WHERE status='RATE_LIMITED')::int AS rate_limited FROM provider_call_events WHERE run_id=$1::text AND provider='youtube' AND operation='search'`, [args.queryRunId]);
+    const counts = providerCounts.rows[0] || {};
+    providerRequestsAttempted = Number(counts.attempted || 0);
+    providerRequestsSucceeded = Number(counts.succeeded || 0);
+    providerRequestsFailed = Number(counts.failed || 0);
+    providerRateLimited = Number(counts.rate_limited || 0);
+    providerPagesRetrieved = providerRequestsSucceeded;
+    providerRunOutcome = classifyProviderRunOutcome({
+      rawResults: finalMetrics.rawResults,
+      providerRequestsAttempted,
+      providerRequestsSucceeded,
+      providerRequestsFailed,
+      providerRateLimited,
+    });
+  } else {
+    providerRunOutcome = classifyProviderRunOutcome({
+      rawResults: finalMetrics.rawResults,
+      providerRequestsAttempted,
+      providerRequestsSucceeded,
+      providerRequestsFailed,
+      providerRateLimited,
+    });
+  }
+  const quotaConsumed = providerCostUsd > 0 || args.allocatedProvider.costDomain === 'YOUTUBE_INNERTUBE_FREE' ? 0 : args.pageNumber * 100;
+  const queryRecord = args.queryId ? await getQueryById(args.queryId) : null;
+  const performance = queryRecord
+    ? await evaluateQueryPerformance(queryRecord, finalMetrics, {
+      retrievalLane: args.retrievalLane,
+      searchOrdering: args.searchOrdering,
+      quotaConsumed,
+      persist: false,
+    })
+    : { performanceScore: 0, newCollection: undefined as 'PROVEN' | 'EXPERIMENTAL' | 'REJECTED' | undefined };
+  const latencyBreakdownMs = buildSearchLatencyBreakdownMs(
+    args.searchWorkerStartMs, args.searchQuotaWaitMs, args.searchRetrievalGrossMs,
+    args.searchTopUpWaitMs, args.channelLoopStartMs, args.channelLoopEndMs, Date.now(),
+  );
+  if (args.createContinuation && args.nextPageToken) {
+    // The child is a new run: it computes and persists its own fair-share
+    // quota budget on its first page. Passing the parent's full budget here
+    // would let the segment spend the same fair-share allocation twice.
+    const segment = await createContinuationRunSegment({
+      parentRunId: args.queryRunId,
+      nextPageToken: args.nextPageToken,
+      resumeMode: args.continuationResumeMode,
+      explorationPagesRemaining: args.continuationExplorationPagesRemaining,
+    });
+    const childJob = await enqueueJob('SEARCH_YOUTUBE', {
+      ...args.job.payload,
+      queryRunId: segment.childRunId,
+      pageNumber: 1,
+      pageToken: args.nextPageToken,
+    }, {
+      priority: AUTONOMOUS_CONTINUATION_JOB_PRIORITY,
+      maxAttempts: 3,
+      idempotencyKey: `search-run:${segment.childRunId}:page:1`,
+    });
+    await setQueryRunJobId(segment.childRunId, childJob.id);
+    console.log(JSON.stringify({
+      event: 'autonomous_page_ceiling_continuation',
+      parentRunId: args.queryRunId,
+      childRunId: segment.childRunId,
+      childJobId: childJob.id,
+      segment: segment.segment,
+      pageNumber: args.pageNumber,
+      resumeMode: segment.resumeMode,
+      timestamp: new Date().toISOString(),
+    }));
+  }
+  await completeQueryRun(args.queryRunId, {
+    ...finalMetrics,
+    uniqueChannels: finalMetrics.newChannels,
+    qualityChannels: finalMetrics.qualityChannels,
+    communitiesDiscovered: finalMetrics.communitiesDiscovered,
+    quotaUsed: quotaConsumed,
+    providerCostUsd,
+    providerRequestsAttempted,
+    providerRequestsSucceeded,
+    providerRequestsFailed,
+    providerRateLimited,
+    providerPagesRetrieved,
+    providerRunOutcome,
+    averageQualityScore: finalMetrics.averageQualityScore,
+    performanceScore: performance.performanceScore,
+    newCollection: performance.newCollection,
+    latencyBreakdownMs,
+    // Opt-in trial linkage recorded on the job payload at schedule time.
+    // Absent on every legacy run.
+    ...(typeof args.trial?.trialId === 'string' && args.trial.trialId ? { trialCompletion: { trialId: args.trial.trialId } } : {}),
+  });
+  if (args.queryId) {
+    await addQueryExecutionLog({
+      query_run_id: args.queryRunId,
+      query_id: args.queryId, query: args.query, country: args.country, executed_at: new Date().toISOString(),
+      channels_discovered: finalMetrics.distinctResults, unique_new_channels: finalMetrics.newChannels,
+      quality_creators_discovered: finalMetrics.qualityChannels, communities_discovered: finalMetrics.communitiesDiscovered,
+      cycle_quality_score: performance.performanceScore,
+      logs: [`Durable autonomous ${args.retrievalLane} lane run ${args.queryRunId} completed by ${args.workerId} via ${args.allocatedProvider.costDomain === 'YOUTUBE_INNERTUBE_FREE' ? 'YOUTUBE_INNERTUBE_FREE' : 'YOUTUBE_DATA_API'}.`, `Provider outcome: ${providerRunOutcome || 'UNAVAILABLE'}`, `Funnel: ${JSON.stringify(args.pageMetrics)}`],
+    });
+  }
+  const neighborhoodInfo = await getNeighborhoodForQueryRun(args.queryRunId);
+  if (neighborhoodInfo && args.retrievalConfigKey) {
+    await recomputeNeighborhoodRetrievalEvidence(neighborhoodInfo.neighborhood_key, args.retrievalConfigKey)
+      .catch(err => console.warn('[RetrievalPolicyEvidence] Post-run evidence recomputation error:', err));
+  }
+}
+
+interface PersistedPageRecoveryArgs {
+  job: { id: string; payload: any };
+  workerId: string;
+  queryRunId: string;
+  pageNumber: number;
+  query: string;
+  country: string;
+  queryId?: number;
+  retrievalLane: RetrievalLane;
+  searchOrdering: import('./searchOrdering').SearchOrdering;
+  retrievalConfigKey?: string | null;
+}
+
+/**
+ * Complete a parent whose safety-ceiling child was already linked. The child
+ * owns the remaining cursor and is scheduled as its own run; the parent must
+ * still persist its final page counts instead of staying RUNNING forever.
+ */
+async function finalizeLinkedAutonomousParent(run: {
+  runId: string;
+  queryId: number;
+  query: string;
+  country: string;
+  pagesCompleted: number;
+  nextPageToken: string | null;
+  resumeMode: ContinuationResumeMode;
+  explorationPagesRemaining: number;
+  retrievalLane: string | null;
+  searchOrdering: string | null;
+  retrievalConfigKey: string | null;
+  runMetadata: Record<string, unknown> | null;
+  providerAllocationSnapshot: unknown;
+}): Promise<void> {
+  const observation = run.pagesCompleted > 0
+    ? await getAutonomousPageObservation(run.runId, run.pagesCompleted)
+    : null;
+  const metadata = run.runMetadata || {};
+  const trial = metadata.trial && typeof metadata.trial === 'object'
+    ? metadata.trial as { trialId?: string }
+    : null;
+  const allocatedProvider = run.providerAllocationSnapshot
+    ? providerSnapshot(run.providerAllocationSnapshot as ProviderAllocation)
+    : YOUTUBE_SEARCH_PROVIDER;
+  await finalizeAutonomousSearchRun({
+    job: { id: '', payload: { provider: run.providerAllocationSnapshot || undefined, trial } },
+    workerId: 'autonomous-reconciler',
+    queryRunId: run.runId,
+    queryId: run.queryId,
+    query: run.query,
+    country: run.country,
+    pageNumber: run.pagesCompleted,
+    retrievalLane: (run.retrievalLane || 'VIDEO') as RetrievalLane,
+    searchOrdering: (run.searchOrdering || 'RELEVANCE') as import('./searchOrdering').SearchOrdering,
+    retrievalConfigKey: run.retrievalConfigKey,
+    pageMetrics: observation?.pageMetrics || ({} as QueryFunnelMetrics),
+    allocatedProvider,
+    providerCostUsd: observation?.providerPageCostUsd || 0,
+    searchWorkerStartMs: Date.now() - (observation?.elapsedMs || 0),
+    searchQuotaWaitMs: 0,
+    searchRetrievalGrossMs: observation?.retrievalMs || 0,
+    searchTopUpWaitMs: 0,
+    channelLoopStartMs: Date.now() - (observation?.processingMs || 0),
+    channelLoopEndMs: Date.now(),
+    trial,
+    nextPageToken: run.nextPageToken,
+    createContinuation: false,
+    continuationExplorationPagesRemaining: run.explorationPagesRemaining,
+    continuationResumeMode: run.resumeMode,
+  });
+}
+
+/**
+ * Replay the post-page handoff for a page that is already durable. The retry
+ * must never re-execute the provider page, but it must finish the parent or
+ * ensure its linked child instead of exiting at the page-exists guard.
+ */
+async function recoverPersistedAutonomousPage(args: PersistedPageRecoveryArgs): Promise<void> {
+  const progress = await getQueryRunProgress(args.queryRunId);
+  if (!progress) return;
+  const observation = await getAutonomousPageObservation(args.queryRunId, args.pageNumber);
+  const [paginationSetting, cdlSetting] = await Promise.all([
+    getAppSetting('autonomous_pagination_enabled', 'true'),
+    getAppSetting('country_discovery_loop_enabled', 'true'),
+  ]);
+  const paginationEnabled = paginationSetting === 'true' && cdlSetting === 'true';
+  const action = planPersistedPageRecovery({
+    pageNumber: args.pageNumber,
+    pagesCompleted: progress.pagesCompleted,
+    continuationStatus: progress.continuationStatus,
+    continuedToRunId: progress.continuedToRunId,
+    nextPageToken: progress.nextPageToken,
+    resumeMode: progress.resumeMode,
+    explorationPagesRemaining: progress.explorationPagesRemaining,
+    effectiveBindingBound: progress.effectiveBindingBound,
+    paginationEnabled,
+    observation: observation ? {
+      pageNumber: observation.pageNumber,
+      nextPageToken: observation.nextPageToken,
+      shouldContinue: observation.shouldContinue,
+      primaryReason: observation.primaryReason,
+      resumeMode: observation.resumeMode,
+      continuationDecisionV2: observation.continuationDecisionV2,
+    } : null,
+  });
+  if (action.kind === 'NONE') return;
+  if (action.kind === 'DEFER') {
+    if (action.reason === 'QUOTA') await deferAutonomousRunForQuota(args.queryRunId, 'PERSISTED_PAGE_RECOVERY');
+    else await deferAutonomousRunForTime(args.queryRunId, 'PERSISTED_PAGE_RECOVERY');
+    return;
+  }
+  let nextPageToken = observation?.nextPageToken || progress.nextPageToken;
+  let resumeMode: ContinuationResumeMode = progress.resumeMode !== 'NONE' ? progress.resumeMode : (observation?.resumeMode || 'NONE');
+  let explorationPagesRemaining = progress.explorationPagesRemaining;
+  let createContinuation = false;
+  if (action.kind === 'ENSURE_CHILD') {
+    const child = await getQueryRunProgress(action.childRunId);
+    const childNeedsJob = Boolean(child) && !['COMPLETE', 'FAILED', 'RESUME_UNAVAILABLE', 'DEFERRED_QUOTA', 'DEFERRED_TIME'].includes(child!.continuationStatus);
+    const childToken = action.nextPageToken || child?.nextPageToken || null;
+    if (childNeedsJob) {
+      const childJob = await enqueueJob('SEARCH_YOUTUBE', {
+        ...args.job.payload,
+        queryRunId: action.childRunId,
+        pageNumber: 1,
+        pageToken: childToken,
+      }, {
+        priority: AUTONOMOUS_CONTINUATION_JOB_PRIORITY,
+        maxAttempts: 3,
+        idempotencyKey: `search-run:${action.childRunId}:page:1`,
+      });
+      await setQueryRunJobId(action.childRunId, childJob.id);
+    }
+    nextPageToken = childToken;
+    resumeMode = action.resumeMode;
+  } else if (action.kind === 'CREATE_CHILD') {
+    createContinuation = true;
+    nextPageToken = action.nextPageToken;
+    resumeMode = action.resumeMode;
+    explorationPagesRemaining = action.explorationPagesRemaining;
+  }
+  await finalizeAutonomousSearchRun({
+    job: args.job,
+    workerId: args.workerId,
+    queryRunId: args.queryRunId,
+    queryId: args.queryId,
+    query: args.query,
+    country: args.country,
+    pageNumber: args.pageNumber,
+    retrievalLane: args.retrievalLane,
+    searchOrdering: args.searchOrdering,
+    retrievalConfigKey: args.retrievalConfigKey,
+    pageMetrics: observation?.pageMetrics || ({} as QueryFunnelMetrics),
+    allocatedProvider: providerSnapshot(args.job.payload.provider || YOUTUBE_SEARCH_PROVIDER),
+    providerCostUsd: observation?.providerPageCostUsd || 0,
+    searchWorkerStartMs: Date.now() - (observation?.elapsedMs || 0),
+    searchQuotaWaitMs: 0,
+    searchRetrievalGrossMs: observation?.retrievalMs || 0,
+    searchTopUpWaitMs: 0,
+    channelLoopStartMs: Date.now() - (observation?.processingMs || 0),
+    channelLoopEndMs: Date.now(),
+    trial: args.job.payload.trial || null,
+    nextPageToken,
+    createContinuation,
+    continuationExplorationPagesRemaining: explorationPagesRemaining,
+    continuationResumeMode: resumeMode,
+  });
 }
 
 /**
@@ -1252,7 +1595,14 @@ export async function processNextSearchJob(
       const started = await startQueryRun(queryRunId);
       if (!started) { await completeJob(job.id); return true; }
     }
-    if (queryRunId && pageNumber > 1 && await autonomousPageExists(queryRunId,pageNumber)) { await completeJob(job.id); return true; }
+    if (queryRunId && await autonomousPageExists(queryRunId,pageNumber)) {
+      // The page is already durable: never pay for it again. Replay the
+      // post-page handoff so a failure after the observation committed cannot
+      // strand the parent or its linked continuation child.
+      await recoverPersistedAutonomousPage({ job, workerId, queryRunId, pageNumber, query, country, queryId, retrievalLane, searchOrdering, retrievalConfigKey });
+      await completeJob(job.id);
+      return true;
+    }
 
     const autonomousOperationId=queryRunId?`${queryRunId}:${pageNumber}`:'';
     let providerQuotaUnits = 0;
@@ -1640,150 +1990,30 @@ export async function processNextSearchJob(
         await completeJob(job.id);
         return true;
       }
-      const finalMetrics=await getAutonomousRunMetrics(queryRunId);
-      if (job.payload.provider?.costDomain === 'BRAVE_SEARCH_API') {
-        const providerTotals = await (await getDb()).query(`SELECT provider_cost_usd,provider_requests_attempted,provider_requests_succeeded,provider_requests_failed,provider_rate_limited,provider_pages_retrieved FROM query_runs WHERE id=$1`, [queryRunId]);
-        const totals = providerTotals.rows[0] || {};
-        providerCostUsd = Number(totals.provider_cost_usd || providerCostUsd);
-        providerRequestsAttempted = Number(totals.provider_requests_attempted || providerRequestsAttempted);
-        providerRequestsSucceeded = Number(totals.provider_requests_succeeded || providerRequestsSucceeded);
-        providerRequestsFailed = Number(totals.provider_requests_failed || providerRequestsFailed);
-        providerRateLimited = Number(totals.provider_rate_limited || providerRateLimited);
-        providerPagesRetrieved = Number(totals.provider_pages_retrieved || providerPagesRetrieved);
-      }
-      let providerRunOutcome: ProviderRunOutcome | undefined;
-      if (allocatedProvider.providerKey === 'youtube-innertube' && queryRunId) {
-        // InnerTube telemetry lives under its own provider name so the
-        // official provider's run stats stay pure; same outcome math.
-        // Checked BEFORE the official branch: the official predicate below
-        // (`!== 'brave-search'`) also matches innertube and would otherwise
-        // shadow this branch and zero out real InnerTube counts.
-        const providerCounts = await (await getDb()).query(`SELECT COUNT(*)::int AS attempted, COUNT(*) FILTER (WHERE status='SUCCESS')::int AS succeeded, COUNT(*) FILTER (WHERE status NOT IN ('SUCCESS','RATE_LIMITED'))::int AS failed, COUNT(*) FILTER (WHERE status='RATE_LIMITED')::int AS rate_limited FROM provider_call_events WHERE run_id=$1::text AND provider='youtube-innertube' AND operation='search'`, [queryRunId]);
-        const counts = providerCounts.rows[0] || {};
-        providerRequestsAttempted = Number(counts.attempted || 0);
-        providerRequestsSucceeded = Number(counts.succeeded || 0);
-        providerRequestsFailed = Number(counts.failed || 0);
-        providerRateLimited = Number(counts.rate_limited || 0);
-        providerPagesRetrieved = providerRequestsSucceeded;
-        providerRunOutcome = resolveInnertubeRunOutcome({
-          rawResults: finalMetrics.rawResults,
-          providerRequestsAttempted,
-          providerRequestsSucceeded,
-          providerRequestsFailed,
-          providerRateLimited
-        });
-      } else if (allocatedProvider.providerKey !== 'brave-search' && queryRunId) {
-        const providerCounts = await (await getDb()).query(`SELECT COUNT(*)::int AS attempted, COUNT(*) FILTER (WHERE status='SUCCESS')::int AS succeeded, COUNT(*) FILTER (WHERE status NOT IN ('SUCCESS','RATE_LIMITED'))::int AS failed, COUNT(*) FILTER (WHERE status='RATE_LIMITED')::int AS rate_limited FROM provider_call_events WHERE run_id=$1::text AND provider='youtube' AND operation='search'`, [queryRunId]);
-        const counts = providerCounts.rows[0] || {};
-        providerRequestsAttempted = Number(counts.attempted || 0);
-        providerRequestsSucceeded = Number(counts.succeeded || 0);
-        providerRequestsFailed = Number(counts.failed || 0);
-        providerRateLimited = Number(counts.rate_limited || 0);
-        providerPagesRetrieved = providerRequestsSucceeded;
-        providerRunOutcome = classifyProviderRunOutcome({
-          rawResults: finalMetrics.rawResults,
-          providerRequestsAttempted,
-          providerRequestsSucceeded,
-          providerRequestsFailed,
-          providerRateLimited
-        });
-      } else if (allocatedProvider.providerKey === 'brave-search') {
-        providerRunOutcome = classifyProviderRunOutcome({
-          rawResults: finalMetrics.rawResults,
-          providerRequestsAttempted,
-          providerRequestsSucceeded,
-          providerRequestsFailed,
-          providerRateLimited
-        });
-      }
-      const quotaConsumed=providerCostUsd>0||allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE'?0:pageNumber*100;
-      const performance = await evaluateQueryPerformance(queryRecord, finalMetrics, { retrievalLane, searchOrdering, quotaConsumed, persist: false });
-      // Worker wall-time split (observability only, persisted in
-      // performance_details): quota-wait vs retrieval vs per-channel
-      // processing vs total worker time. Never affects scoring or behavior.
-      const latencyBreakdownMs = buildSearchLatencyBreakdownMs(searchWorkerStartMs, searchQuotaWaitMs, searchRetrievalGrossMs, searchTopUpWaitMs, channelLoopStartMs, channelLoopEndMs, Date.now());
-      // The page ceiling is a safety boundary, not a dead end. When the safety
-      // ceiling (never a provider/treatment/trial cap) is reached while the
-      // provider still exposes a next page, create and enqueue a linked
-      // continuation segment BEFORE completing the parent. If creation or
-      // enqueue fails, the job retry can recover the child instead of losing
-      // the continuation behind an immutable COMPLETED parent.
-      if (
-        shouldCreateContinuationSegment({
+      await finalizeAutonomousSearchRun({
+        job, workerId, queryRunId, queryId, query, country, pageNumber,
+        retrievalLane, searchOrdering, retrievalConfigKey,
+        pageMetrics: metrics,
+        allocatedProvider,
+        providerCostUsd,
+        searchWorkerStartMs,
+        searchQuotaWaitMs,
+        searchRetrievalGrossMs,
+        searchTopUpWaitMs,
+        channelLoopStartMs,
+        channelLoopEndMs,
+        trial,
+        nextPageToken: searchPage?.nextPageToken || null,
+        createContinuation: shouldCreateContinuationSegment({
           paginationEnabled: continuationEnabled,
           usingV2,
           primaryReason: decision.primaryReason,
           bindingBound,
           hasNextPage: Boolean(searchPage?.nextPageToken),
-        })
-      ) {
-        // The child is a new run: it computes and persists its own fair-share
-        // quota budget on its first page. Passing the parent's full budget here
-        // would let the segment spend the same fair-share allocation twice.
-        const segment = await createContinuationRunSegment({
-          parentRunId: queryRunId,
-          nextPageToken: searchPage!.nextPageToken!,
-          resumeMode: resumeModeForProvider(providerKey),
-          explorationPagesRemaining: decisionV2.explorationPagesRemaining,
-        });
-        const childJob = await enqueueJob('SEARCH_YOUTUBE', {
-          ...job.payload,
-          queryRunId: segment.childRunId,
-          pageNumber: 1,
-          pageToken: searchPage!.nextPageToken!,
-        }, {
-          priority: AUTONOMOUS_CONTINUATION_JOB_PRIORITY,
-          maxAttempts: 3,
-          idempotencyKey: `search-run:${segment.childRunId}:page:1`,
-        });
-        await setQueryRunJobId(segment.childRunId, childJob.id);
-        console.log(JSON.stringify({
-          event: 'autonomous_page_ceiling_continuation',
-          parentRunId: queryRunId,
-          childRunId: segment.childRunId,
-          childJobId: childJob.id,
-          segment: segment.segment,
-          pageNumber,
-          resumeMode: segment.resumeMode,
-          timestamp: new Date().toISOString(),
-        }));
-      }
-      await completeQueryRun(queryRunId, {
-        ...finalMetrics,
-        uniqueChannels: finalMetrics.newChannels,
-        qualityChannels: finalMetrics.qualityChannels,
-        communitiesDiscovered: finalMetrics.communitiesDiscovered,
-        quotaUsed: quotaConsumed,
-        providerCostUsd,
-        providerRequestsAttempted,
-        providerRequestsSucceeded,
-        providerRequestsFailed,
-        providerRateLimited,
-        providerPagesRetrieved,
-        providerRunOutcome,
-        averageQualityScore: finalMetrics.averageQualityScore,
-        performanceScore: performance.performanceScore,
-        newCollection: performance.newCollection,
-        latencyBreakdownMs,
-        // Opt-in trial linkage recorded on the job payload at schedule time.
-        // Absent on every legacy run.
-        ...(typeof trial?.trialId === 'string' && trial.trialId ? { trialCompletion: { trialId: trial.trialId } } : {})
+        }),
+        continuationExplorationPagesRemaining: usingV2 ? decisionV2.explorationPagesRemaining : explorationPagesRemaining,
+        continuationResumeMode: resumeModeForProvider(providerKey),
       });
-      await addQueryExecutionLog({
-        query_run_id: queryRunId,
-        query_id: queryId, query, country, executed_at: new Date().toISOString(),
-        channels_discovered: finalMetrics.distinctResults, unique_new_channels: finalMetrics.newChannels,
-        quality_creators_discovered: finalMetrics.qualityChannels, communities_discovered: finalMetrics.communitiesDiscovered,
-        cycle_quality_score: performance.performanceScore,
-        logs: [`Durable autonomous ${retrievalLane} lane run ${queryRunId} completed by ${workerId} via ${allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE'?'YOUTUBE_INNERTUBE_FREE':'YOUTUBE_DATA_API'}.`, `Provider outcome: ${providerRunOutcome || 'UNAVAILABLE'}`, `Funnel: ${JSON.stringify(metrics)}`]
-      });
-
-      // Post-run idempotent recomputation of derived evidence aggregate
-      const neighborhoodInfo = await getNeighborhoodForQueryRun(queryRunId);
-      if (neighborhoodInfo && retrievalConfigKey) {
-        await recomputeNeighborhoodRetrievalEvidence(neighborhoodInfo.neighborhood_key, retrievalConfigKey)
-          .catch(err => console.warn('[RetrievalPolicyEvidence] Post-run evidence recomputation error:', err));
-      }
     }
     await completeJob(job.id);
     return true;
@@ -2028,6 +2258,15 @@ export async function resumeOrphanedAutonomousPages(options: {
       // is truthful and keeps it out of pending-continuation metrics.
       await markQueryRunResumeUnavailable(run.runId, 'COUNTRY_INACTIVE');
       unavailable++;
+      continue;
+    }
+    if (run.continuedToRunId) {
+      // The linked child owns the remaining cursor and is scheduled as its own
+      // run. Scheduling pagesCompleted+1 for the parent would search the same
+      // cursor through both runs, so only the parent's final counts are
+      // repaired here.
+      await finalizeLinkedAutonomousParent(run);
+      skipped++;
       continue;
     }
     const nextPage = Math.max(1, run.pagesCompleted + 1);

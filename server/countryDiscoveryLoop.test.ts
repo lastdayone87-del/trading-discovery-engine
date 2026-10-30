@@ -16,6 +16,7 @@ import {
   planContinuationResume,
 } from './queueManager';
 import { resolveAutonomousCountries } from './autonomousDiscovery';
+import { countryIdentityTerms } from './countryInference';
 import {
   NATIVE_PROMOTION_MIN_CREATORS,
   NATIVE_PROMOTION_MIN_EXECUTIONS,
@@ -344,6 +345,70 @@ test('A1b: Wikidata entities are scoped to the requesting country', () => {
   assert.deepEqual(surfacesFor('India'), ['National Stock Exchange of India']);
   assert.notDeepEqual(surfacesFor('Germany'), surfacesFor('Switzerland'));
   assert.notDeepEqual(surfacesFor('United States'), surfacesFor('India'));
+});
+
+test('A1c: Wikidata identity filtering scans past the accepted-limit window', () => {
+  const unrelated = Array.from({ length: 12 }, (_, index) => ({
+    id: `Q-U${index}`, label: `Market ${index}`, description: 'stock exchange in another market',
+  }));
+  const payload = {
+    search: [
+      ...unrelated,
+      { id: 'Q-JP', label: '名古屋証券取引所', description: '日本の証券取引所', aliases: ['Nagoya Stock Exchange'] },
+    ],
+  };
+  const japan = parseWikidataSearchSignals(payload, { country: 'Japan', language: 'ja', limit: 2 });
+  assert.deepEqual(japan.map(signal => signal.surface), ['名古屋証券取引所', 'Nagoya Stock Exchange']);
+  assert.ok(japan.every(signal => signal.country === 'Japan'));
+});
+
+test('A1d: short CJK identity terms match Japanese prose without word boundaries', () => {
+  const terms = countryIdentityTerms('Japan');
+  for (const term of ['日本', '東京', '大阪']) assert.ok(terms.includes(term), `${term} must survive normalization`);
+  const german = countryIdentityTerms('Germany');
+  assert.equal(german.includes('de'), false, 'ISO codes stay excluded');
+  const payload = {
+    search: [
+      { id: 'Q-JP', label: '名古屋証券取引所', description: '日本の証券取引所' },
+      { id: 'Q-DE', label: 'Frankfurter Wertpapierbörse', description: 'Börse in Frankfurt' },
+    ],
+  };
+  assert.deepEqual(
+    parseWikidataSearchSignals(payload, { country: 'Japan', language: 'ja' }).map(signal => signal.surface),
+    ['名古屋証券取引所'],
+  );
+});
+
+test('A1e: Wikidata fetch requests a wider candidate window than the accepted limit', async () => {
+  resetFreeQuerySignalCacheForTests();
+  const urls: string[] = [];
+  const unrelated = Array.from({ length: 12 }, (_, index) => ({
+    id: `Q-U${index}`, label: `Market ${index}`, description: 'stock exchange in another market',
+  }));
+  const fakeFetch = (async (url: string) => {
+    urls.push(String(url));
+    if (String(url).includes('wikipedia.org')) {
+      return { ok: true, json: async () => ({ query: { search: [] } }) } as never;
+    }
+    return {
+      ok: true,
+      json: async () => ({
+        search: [...unrelated, { id: 'Q-JP', label: '名古屋証券取引所', description: '日本の証券取引所' }],
+      }),
+    } as never;
+  }) as unknown as typeof fetch;
+  const now = new Date('2026-10-26T00:00:00Z');
+  try {
+    const result = await fetchFreeQuerySignals({
+      country: 'Japan', language: 'ja', limit: 4,
+      fetchImpl: fakeFetch, userAgent: TEST_WIKIMEDIA_USER_AGENT, now,
+    });
+    const wikidataUrl = new URL(urls[1]);
+    assert.ok(Number(wikidataUrl.searchParams.get('limit')) > 4, 'request a broader candidate window');
+    assert.ok(result.signals.some(signal => signal.surface === '名古屋証券取引所'));
+  } finally {
+    resetFreeQuerySignalCacheForTests();
+  }
 });
 
 test('A2: repeated free-signal refresh is cache-idempotent and does not refetch', async () => {
@@ -1283,8 +1348,8 @@ test('P17: the 50-page safety ceiling preserves a resumable linked segment', () 
   const queue = serverSource('queueManager.ts');
   assert.match(queue, /shouldCreateContinuationSegment\(\{/);
   assert.match(queue, /const segment = await createContinuationRunSegment\(\{/);
-  assert.match(queue, /nextPageToken: searchPage!\.nextPageToken!/);
-  assert.match(queue, /queryRunId: segment\.childRunId,[\s\S]*?pageNumber: 1,[\s\S]*?pageToken: searchPage!\.nextPageToken!/);
+  assert.match(queue, /nextPageToken: args\.nextPageToken,/);
+  assert.match(queue, /createContinuationRunSegment\(\{[\s\S]*?parentRunId: args\.queryRunId,[\s\S]*?nextPageToken: args\.nextPageToken,/);
   // The first-page binding bound is persisted and reused. Recomputing it from
   // live quota could relabel a stored SAFETY ceiling as RUN_BUDGET after a
   // mid-run quota change, which would silently skip the linked segment.
@@ -1315,7 +1380,7 @@ test('P17: the 50-page safety ceiling preserves a resumable linked segment', () 
   const segmentCall = queue.indexOf('const segment = await createContinuationRunSegment({');
   const childEnqueue = queue.indexOf('const childJob = await enqueueJob(', segmentCall);
   const childJobLink = queue.indexOf('await setQueryRunJobId(segment.childRunId, childJob.id)', childEnqueue);
-  const parentComplete = queue.indexOf('await completeQueryRun(queryRunId, {', childJobLink);
+  const parentComplete = queue.indexOf('await completeQueryRun(args.queryRunId, {', childJobLink);
   assert.ok(segmentCall > 0 && childEnqueue > segmentCall, 'child is enqueued after creation');
   assert.ok(childJobLink > childEnqueue && parentComplete > childJobLink, 'parent completes last');
   assert.match(queue, /idempotencyKey: `search-run:\$\{segment\.childRunId\}:page:1`/);
@@ -2544,4 +2609,41 @@ test('R4: demand-signal ingestion refreshes mutable score and expiry on the iden
     assert.ok(fn.includes(assignment), `${assignment} must be refreshed`);
   }
   assert.doesNotMatch(fn, /ON CONFLICT DO NOTHING/);
+});
+
+test('P19: a saved page replays its child handoff and parent completion on retry', () => {
+  const queue = serverSource('queueManager.ts');
+  const pageStore = serverSource('autonomousPageStore.ts');
+  // The old guard exited before any handoff whenever the page was durable.
+  assert.doesNotMatch(queue, /pageNumber > 1 && await autonomousPageExists/);
+  const guardAt = queue.indexOf('if (queryRunId && await autonomousPageExists(queryRunId,pageNumber))');
+  assert.ok(guardAt > 0, 'retry guard must recognise every durable page');
+  const guardEnd = queue.indexOf('return true;', guardAt);
+  assert.ok(guardEnd > guardAt);
+  assert.match(queue.slice(guardAt, guardEnd), /recoverPersistedAutonomousPage\(/);
+  // Recovery must replay from the persisted observation instead of paying for
+  // the page again, and must keep create -> enqueue -> link -> complete order.
+  assert.match(pageStore, /export async function getAutonomousPageObservation/);
+  assert.match(pageStore, /continuation_decision_v2/);
+  assert.match(queue, /planPersistedPageRecovery\(\{/);
+  assert.match(queue, /getAutonomousPageObservation\(args\.queryRunId, args\.pageNumber\)/);
+  assert.match(queue, /case 'ENSURE_CHILD'|action\.kind === 'ENSURE_CHILD'/);
+  assert.match(queue, /idempotencyKey: `search-run:\$\{action\.childRunId\}:page:1`/);
+  assert.match(queue, /createContinuationRunSegment\(\{/);
+  assert.match(queue, /const childJob = await enqueueJob\('SEARCH_YOUTUBE'/);
+  assert.match(queue, /await setQueryRunJobId\(segment\.childRunId, childJob\.id\)/);
+  assert.match(queue, /createContinuation: shouldCreateContinuationSegment/);
+  assert.match(queue, /await completeQueryRun\(args\.queryRunId/);
+  // The reconciler must never schedule the parent's next cursor when a linked
+  // child owns it; it repairs the parent's final counts instead.
+  assert.match(pageStore, /qr\.continued_to_run_id/);
+  assert.match(pageStore, /continuedToRunId: row\.continued_to_run_id/);
+  assert.match(queue, /if \(run\.continuedToRunId\)/);
+  const linkedStart = queue.indexOf('if (run.continuedToRunId)');
+  const linkedEnd = queue.indexOf('const nextPage = Math.max(1, run.pagesCompleted + 1);', linkedStart);
+  assert.ok(linkedStart > 0 && linkedEnd > linkedStart);
+  const linkedBlock = queue.slice(linkedStart, linkedEnd);
+  assert.match(linkedBlock, /await finalizeLinkedAutonomousParent\(run\)/);
+  assert.match(linkedBlock, /continue;/);
+  assert.doesNotMatch(linkedBlock, /enqueueChildAndCommitPageReservation/);
 });

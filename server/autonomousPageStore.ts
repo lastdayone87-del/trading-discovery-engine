@@ -142,6 +142,59 @@ export async function autonomousPageExists(runId: string, pageNumber: number): P
   return !!r.rowCount;
 }
 
+export interface PersistedAutonomousPage {
+  pageNumber: number;
+  nextPageToken: string | null;
+  shouldContinue: boolean;
+  primaryReason: string;
+  continuationDecisionV2: ContinuationDecisionV2 | null;
+  pageMetrics: QueryFunnelMetrics;
+  resumeMode: 'TOKEN' | 'REWALK' | 'OFFSET' | 'NONE';
+  elapsedMs: number;
+  retrievalMs: number;
+  processingMs: number;
+  providerPageCostUnits: number;
+  providerPageCostUsd: number;
+}
+
+/**
+ * Re-read the durable post-page decision. A saved page is the retry point of
+ * no return: re-running it would spend quota and double-count sightings, so a
+ * retry replays the handoff from this record instead of the provider.
+ */
+export async function getAutonomousPageObservation(runId: string, pageNumber: number): Promise<PersistedAutonomousPage | null> {
+  const db = await getDb();
+  const r = await db.query(
+    `SELECT page_number,next_page_token,should_continue,primary_reason,continuation_decision_v2,
+            page_metrics,resume_mode,elapsed_ms,retrieval_ms,processing_ms,
+            provider_page_cost_units,provider_page_cost_usd
+     FROM autonomous_query_page_observations
+     WHERE query_run_id=$1 AND page_number=$2`,
+    [runId, pageNumber],
+  );
+  const row = r.rows[0];
+  if (!row) return null;
+  const parse = <T>(value: unknown, fallback: T): T => {
+    if (value === null || value === undefined) return fallback;
+    if (typeof value !== 'string') return value as T;
+    try { return JSON.parse(value) as T; } catch { return fallback; }
+  };
+  return {
+    pageNumber: Number(row.page_number),
+    nextPageToken: row.next_page_token ? String(row.next_page_token) : null,
+    shouldContinue: row.should_continue === true,
+    primaryReason: String(row.primary_reason || ''),
+    continuationDecisionV2: parseContinuationDecisionV2(parse<unknown>(row.continuation_decision_v2, null)),
+    pageMetrics: parse<QueryFunnelMetrics>(row.page_metrics, {} as QueryFunnelMetrics),
+    resumeMode: String(row.resume_mode || 'NONE') as PersistedAutonomousPage['resumeMode'],
+    elapsedMs: Math.max(0, Number(row.elapsed_ms || 0)),
+    retrievalMs: Math.max(0, Number(row.retrieval_ms || 0)),
+    processingMs: Math.max(0, Number(row.processing_ms || 0)),
+    providerPageCostUnits: Math.max(0, Number(row.provider_page_cost_units || 0)),
+    providerPageCostUsd: Math.max(0, Number(row.provider_page_cost_usd || 0)),
+  };
+}
+
 export interface AutonomousPageMarginalMetrics {
   pageDistinctCreators: number;
   marginalNewCreators: number;
@@ -333,6 +386,12 @@ export interface PendingAutonomousRun {
   nextPageToken: string | null;
   resumeMode: 'TOKEN' | 'REWALK' | 'OFFSET' | 'NONE';
   continuationStatus: string;
+  /**
+   * The linked child owns the next cursor. A parent with this set must never
+   * be resumed as if it still owned its cursor; the reconciler only repairs
+   * the child handoff and finalizes the parent.
+   */
+  continuedToRunId: string | null;
   deferredUntil: string | null;
   lastPageAt: string | null;
   /**
@@ -383,6 +442,7 @@ export async function listPendingAutonomousRuns(
     `WITH candidates AS (
        SELECT qr.id, qr.query_id, ql.query, qr.country, qr.source, qr.pages_completed,
               qr.next_page_token, qr.resume_mode, qr.continuation_status, qr.deferred_until,
+              qr.continued_to_run_id,
               qr.last_page_at, qr.exploration_pages_remaining, qr.retrieval_lane,
               qr.search_ordering, qr.retrieval_config_key, qr.retrieval_treatment_origin,
               qr.requested_page_depth, qr.metadata, qr.provider_allocation_snapshot,
@@ -437,6 +497,7 @@ export async function listPendingAutonomousRuns(
     nextPageToken: row.next_page_token ? String(row.next_page_token) : null,
     resumeMode: String(row.resume_mode || 'NONE') as PendingAutonomousRun['resumeMode'],
     continuationStatus: String(row.continuation_status || 'RUNNING'),
+    continuedToRunId: row.continued_to_run_id ? String(row.continued_to_run_id) : null,
     deferredUntil: row.deferred_until ? new Date(row.deferred_until as string).toISOString() : null,
     lastPageAt: row.last_page_at ? new Date(row.last_page_at as string).toISOString() : null,
     resumeAt: row.resume_at ? new Date(row.resume_at as string).toISOString() : null,

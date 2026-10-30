@@ -123,6 +123,13 @@ export function parseWikipediaSearchSignals(
 }
 
 /**
+ * Scripts that do not delimit words with spaces. A two-character local name
+ * such as 日本/東京/서울 is a complete word, so the Latin-oriented three
+ * character floor and word-boundary matcher cannot be used for them.
+ */
+const UNSPACED_SCRIPT = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+
+/**
  * Parse a Wikidata `wbsearchentities` response. Labels and aliases are
  * accepted only when literally present; descriptions are metadata, never a
  * query surface. A translated/English description cannot create a local term.
@@ -138,6 +145,10 @@ function textMentionsCountryIdentity(text: string, terms: string[]): boolean {
   if (!text) return false;
   const normalized = text.normalize('NFKC').toLocaleLowerCase('en');
   return terms.some(term => {
+    // Japanese/Chinese/Korean prose has no word boundaries. A substring match
+    // is the only correct matcher for these scripts: 日本の証券取引所 must
+    // match 日本 even though no separator surrounds it.
+    if (UNSPACED_SCRIPT.test(term)) return normalized.includes(term);
     const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     return new RegExp(`(^|[^\\p{L}\\p{N}])${escaped}(?=$|[^\\p{L}\\p{N}])`, 'u').test(normalized);
   });
@@ -154,7 +165,12 @@ export function parseWikidataSearchSignals(
   const limit = Math.max(1, Math.min(50, Math.trunc(args.limit || 10)));
   const identityTerms = countryIdentityTerms(country);
   const out: FreeQuerySignal[] = [];
-  for (const row of rows.slice(0, limit)) {
+  // Iterate the full provider candidate window, not just the first `limit`
+  // rows: the identity filter runs after the generic label/alias search, so
+  // unrelated markets may occupy the head of the response. Accept at most
+  // `limit` signals.
+  for (const row of rows) {
+    if (out.length >= limit) break;
     if (!row || typeof row !== 'object') continue;
     const id = (row as { id?: unknown }).id;
     const label = (row as { label?: unknown }).label;
@@ -178,6 +194,7 @@ export function parseWikidataSearchSignals(
     ].filter(Boolean).join(' ');
     if (!textMentionsCountryIdentity(identityText, identityTerms)) continue;
     for (const surface of [...new Set(surfaces.map(s => s.normalize('NFKC').trim().replace(/\s+/gu, ' ')))]) {
+      if (out.length >= limit) break;
       out.push({
         country,
         language,
@@ -407,7 +424,12 @@ export async function fetchFreeQuerySignals(args: {
   try {
     await pace();
     const wikidataSearch = wikidataSearchTerm(language);
-    const wikidataUrl = `https://www.wikidata.org/w/api.php?action=wbsearchentities&search=${encodeURIComponent(wikidataSearch.term)}&language=${encodeURIComponent(wikidataSearch.language)}&uselang=${encodeURIComponent(wikidataSearch.language)}&limit=${limit}&format=json&origin=*`;
+    // wbsearchentities is a generic label/alias prefix search; the identity
+    // filter runs afterwards. Request a wider candidate window than the
+    // accepted limit so a relevant entity ranked behind other markets is not
+    // silently lost. The provider caps this parameter at 50.
+    const candidateLimit = Math.min(50, Math.max(limit, limit * 4));
+    const wikidataUrl = `https://www.wikidata.org/w/api.php?action=wbsearchentities&search=${encodeURIComponent(wikidataSearch.term)}&language=${encodeURIComponent(wikidataSearch.language)}&uselang=${encodeURIComponent(wikidataSearch.language)}&limit=${candidateLimit}&format=json&origin=*`;
     const payload = await fetchJson(wikidataUrl, fetchImpl, timeoutMs, userAgent);
     signals.push(...parseWikidataSearchSignals(payload, { country, language: wikidataSearch.language, limit }));
   } catch (error) {

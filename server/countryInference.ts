@@ -237,8 +237,10 @@ export function countryIsoAlias(value: string): string | null {
  * Normalized identity terms that bind an external entity to a country:
  * canonical name, alias spellings, localized country names from the creator
  * bio vocabulary, exchange names, and known cities. Used to reject generic
- * search results that belong to another market. Short aliases are omitted so
- * two-letter codes cannot match inside unrelated words.
+ * search results that belong to another market. Two-letter Latin aliases are
+ * omitted so ISO codes cannot match inside unrelated words. A two-character
+ * CJK/Hangul name is a complete local word, not an abbreviation, so those
+ * scripts keep short terms.
  */
 export function countryIdentityTerms(value: string): string[] {
   const country = canonicalCountry(value);
@@ -246,7 +248,8 @@ export function countryIdentityTerms(value: string): string[] {
   const add = (term: unknown) => {
     if (typeof term !== 'string') return;
     const normalized = normalizeCountryName(term);
-    if (normalized.length >= 3) terms.add(normalized);
+    const minLength = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(normalized) ? 2 : 3;
+    if (normalized.length >= minLength) terms.add(normalized);
   };
   add(country);
   for (const [alias, target] of Object.entries(COUNTRY_ALIASES)) {

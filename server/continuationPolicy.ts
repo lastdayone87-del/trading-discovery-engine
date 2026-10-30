@@ -495,3 +495,88 @@ export function shouldCreateContinuationSegment(args: {
     && args.bindingBound === 'SAFETY'
     && args.hasNextPage === true;
 }
+
+/**
+ * A page observation is the retry point of no return: the provider page was
+ * already paid for, so its post-page handoff must be replayed from durable
+ * state instead of re-executing the page. The planner distinguishes the only
+ * outcomes that can leave a run stranded after the observation commits:
+ * a linked child whose job was never enqueued, a safety-ceiling child that
+ * was never created, a persisted deferral, and a terminal page whose parent
+ * completion did not run. An ordinary next-page continuation is deliberately
+ * left to the reconciler, which owns treatment reservations and the run's
+ * next cursor.
+ */
+export type PersistedPageRecoveryAction =
+  | { kind: 'NONE' }
+  | { kind: 'DEFER'; reason: 'QUOTA' | 'TIME' }
+  | { kind: 'CREATE_CHILD'; nextPageToken: string; resumeMode: ContinuationResumeMode; explorationPagesRemaining: number }
+  | { kind: 'ENSURE_CHILD'; childRunId: string; nextPageToken: string | null; resumeMode: ContinuationResumeMode }
+  | { kind: 'FINALIZE' };
+
+export interface PersistedPageRecoveryInput {
+  pageNumber: number;
+  pagesCompleted: number;
+  continuationStatus: string;
+  continuedToRunId: string | null;
+  nextPageToken: string | null;
+  resumeMode: ContinuationResumeMode;
+  explorationPagesRemaining: number;
+  effectiveBindingBound: 'SAFETY' | 'PROVIDER' | 'RUN_BUDGET' | 'TREATMENT' | 'TRIAL' | null;
+  paginationEnabled: boolean;
+  observation: {
+    pageNumber: number;
+    nextPageToken: string | null;
+    shouldContinue: boolean;
+    primaryReason: string;
+    resumeMode: ContinuationResumeMode;
+    continuationDecisionV2: ContinuationDecisionV2 | null;
+  } | null;
+}
+
+export function planPersistedPageRecovery(input: PersistedPageRecoveryInput): PersistedPageRecoveryAction {
+  // A terminal or already-deferred run owns its state. A retry of an earlier
+  // page must never overwrite that newer state.
+  if (['COMPLETE', 'FAILED', 'RESUME_UNAVAILABLE', 'DEFERRED_QUOTA', 'DEFERRED_TIME'].includes(input.continuationStatus)) {
+    return { kind: 'NONE' };
+  }
+  const observation = input.observation;
+  if (!observation || observation.pageNumber !== input.pageNumber) return { kind: 'NONE' };
+  if (input.pagesCompleted > input.pageNumber) return { kind: 'NONE' };
+
+  const resumeMode = input.resumeMode !== 'NONE' ? input.resumeMode : observation.resumeMode;
+  if (input.continuedToRunId) {
+    return {
+      kind: 'ENSURE_CHILD',
+      childRunId: input.continuedToRunId,
+      nextPageToken: input.nextPageToken || observation.nextPageToken,
+      resumeMode,
+    };
+  }
+  const deferred = observation.continuationDecisionV2;
+  if (deferred?.defer && deferred.deferReason) {
+    return { kind: 'DEFER', reason: deferred.deferReason };
+  }
+  const nextPageToken = observation.nextPageToken || input.nextPageToken;
+  if (nextPageToken && shouldCreateContinuationSegment({
+    paginationEnabled: input.paginationEnabled,
+    usingV2: Boolean(observation.continuationDecisionV2),
+    primaryReason: observation.primaryReason,
+    bindingBound: input.effectiveBindingBound || '',
+    hasNextPage: true,
+  })) {
+    return {
+      kind: 'CREATE_CHILD',
+      nextPageToken,
+      resumeMode,
+      explorationPagesRemaining: Math.max(0, observation.continuationDecisionV2?.explorationPagesRemaining ?? input.explorationPagesRemaining),
+    };
+  }
+  // A productive page with a next cursor is a normal continuation. The
+  // reconciler re-enqueues it from the durable cursor and owns any treatment
+  // reservation, so the retry must not complete the run early.
+  if (input.paginationEnabled && observation.shouldContinue && nextPageToken) {
+    return { kind: 'NONE' };
+  }
+  return { kind: 'FINALIZE' };
+}
