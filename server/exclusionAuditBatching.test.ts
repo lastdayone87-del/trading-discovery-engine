@@ -200,6 +200,17 @@ test('review-pending rows retain their invite for the pending review decision', 
     decideExclusionAuditRowAction({ alreadyRejected: false, validationStatus: 'UNCERTAIN', discordStatus: 'UNCERTAIN', discordInvite: 'https://discord.gg/retained', scanStatus: 'NEEDS_REVIEW' }),
     'none'
   );
+  // Review-pending retention is status-independent: a DEAD or NON_TRADING row
+  // withheld for review keeps its invite until the review resolves. Only a
+  // completed/rejected row proceeds to terminal cleanup.
+  assert.equal(
+    decideExclusionAuditRowAction({ alreadyRejected: false, validationStatus: 'UNCERTAIN', discordStatus: 'DEAD', discordInvite: 'https://discord.gg/retained', scanStatus: 'NEEDS_REVIEW' }),
+    'none'
+  );
+  assert.equal(
+    decideExclusionAuditRowAction({ alreadyRejected: false, validationStatus: 'UNCERTAIN', discordStatus: 'NON_TRADING', discordInvite: 'https://discord.gg/retained', scanStatus: 'NEEDS_REVIEW' }),
+    'none'
+  );
   // The same row shape outside review is still a stale invite.
   assert.equal(
     decideExclusionAuditRowAction({ alreadyRejected: false, validationStatus: 'UNCERTAIN', discordStatus: 'UNCERTAIN', discordInvite: 'https://discord.gg/retained', scanStatus: 'COMPLETED' }),

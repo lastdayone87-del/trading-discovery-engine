@@ -2714,6 +2714,21 @@ export function decideExclusionAuditRowAction(input: {
   // persistence rule still applies to them: an invite on a
   // DEAD/NON_TRADING/UNCERTAIN channel is cleared.
   if (input.validationStatus === 'REJECTED' && !input.alreadyRejected) return 'reject-write';
+  // A channel explicitly withheld for human review keeps its invite until the
+  // review resolves, for every cleanup-eligible status. This is the documented
+  // review-only retention behavior and is independent of A1 last-known-good
+  // retention: a review-pending DEAD/NON_TRADING row is still review evidence,
+  // while rejected-cleanup remains terminal and still enforces hygiene.
+  if (
+    !input.alreadyRejected &&
+    input.scanStatus === 'NEEDS_REVIEW' &&
+    input.discordInvite !== null &&
+    (input.discordStatus === 'DEAD' ||
+      input.discordStatus === 'NON_TRADING' ||
+      input.discordStatus === 'UNCERTAIN')
+  ) {
+    return 'none';
+  }
   if (
     (input.discordStatus === 'DEAD' || input.discordStatus === 'NON_TRADING') &&
     input.discordInvite !== null
@@ -2721,7 +2736,6 @@ export function decideExclusionAuditRowAction(input: {
     return 'invite-cleanup';
   }
   if (input.discordStatus === 'UNCERTAIN' && input.discordInvite !== null) {
-    if (!input.alreadyRejected && input.scanStatus === 'NEEDS_REVIEW') return 'none';
     // A1 last-known-good retention: a retained serving invite may carry the
     // mutable top-level status UNCERTAIN (for example after a later status
     // reset). Its completed/live/validated evidence makes it intentionally
