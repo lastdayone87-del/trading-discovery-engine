@@ -382,6 +382,21 @@ export type RenderedPopupDestinationKind =
   | 'admission-rejected'
   | 'same-origin';
 
+/**
+ * Evidence source for markup read out of a popup document. A committed popup
+ * is its own source: crediting its markup to the opener can make a third-party
+ * invite look creator-owned on a branded creator site. A blank popup has no
+ * URL; its `document.write()` markup was authored by the opener, which is the
+ * only available source.
+ */
+export function popupMarkupEvidenceSourceUrl(
+  kind: RenderedPopupDestinationKind,
+  popupUrl: string,
+  openerUrl: string,
+): string {
+  return kind === 'uninspectable' ? openerUrl : popupUrl;
+}
+
 export function classifyRenderedPopupDestination(
   popupUrl: string,
   pageUrl: string,
@@ -1106,6 +1121,43 @@ export const DECLARATIVE_SHADOW_SCAN_MAX_BYTES = 8 * 1024 * 1024;
 const isMarkupWhitespace = (code: number): boolean =>
   code === 32 || code === 9 || code === 10 || code === 12 || code === 13;
 
+/** HTML raw-text/RCDATA elements whose contents are text, not markup. */
+const NON_MARKUP_ELEMENT_NAMES = ['script', 'style', 'textarea', 'title'];
+
+const tagBoundary = (code: number): boolean =>
+  code === -1 || isMarkupWhitespace(code) || code === 47 || code === 62;
+
+/** True when `index` points at `<name` followed by an HTML tag boundary. */
+function startsTagAt(html: string, index: number, name: string): boolean {
+  if (index + 1 + name.length > html.length) return false;
+  if (html.charCodeAt(index) !== 60) return false;
+  if (html.slice(index + 1, index + 1 + name.length).toLowerCase() !== name) return false;
+  return tagBoundary(index + 1 + name.length < html.length ? html.charCodeAt(index + 1 + name.length) : -1);
+}
+
+/**
+ * Return the index after the closing tag of a raw-text element, or the end of
+ * the document when it is unterminated. Scanning from `<` to `<` is linear in
+ * the skipped region; the tag-name comparison is bounded by the short name.
+ */
+function skipNonMarkupElement(html: string, start: number): number {
+  const tag = NON_MARKUP_ELEMENT_NAMES.find(name => startsTagAt(html, start, name));
+  if (!tag) return start;
+  let cursor = start + 1 + tag.length;
+  while (cursor < html.length) {
+    const next = html.indexOf('<', cursor);
+    if (next === -1) return html.length;
+    if (html.charCodeAt(next + 1) === 47
+      && html.slice(next + 2, next + 2 + tag.length).toLowerCase() === tag) {
+      const end = next + 2 + tag.length;
+      const boundary = end < html.length ? html.charCodeAt(end) : -1;
+      if (tagBoundary(boundary)) return end;
+    }
+    cursor = next + 1;
+  }
+  return html.length;
+}
+
 /**
  * Count declarative closed shadow roots in raw HTML. The parser consumes and
  * removes `<template shadowrootmode="closed">` during document construction,
@@ -1119,59 +1171,74 @@ const isMarkupWhitespace = (code: number): boolean =>
  * terminates. Attribute boundaries follow HTML rules, so an attribute
  * immediately after a closing quote (`id="x"shadowrootmode="closed"`) is still
  * recognized, and a `>` inside a quoted value never ends the tag early.
+ * Script/style/textarea/title contents and comments are skipped so a
+ * `<template` string inside them cannot hide or fabricate a real root.
  */
 export function countDeclarativeClosedShadowRoots(html: string): number {
   if (typeof html !== 'string' || !html) return 0;
-  const opener = /<template/gi;
   let count = 0;
-  let match: RegExpExecArray | null;
-  while (count < 1000 && (match = opener.exec(html))) {
-    let i = match.index + '<template'.length;
-    const boundary = i < html.length ? html.charCodeAt(i) : -1;
-    // `<templatex>` is not the template element. Continue after the name so
-    // a later real `<template` is still found without rescanning this one.
-    if (boundary !== -1 && !isMarkupWhitespace(boundary) && boundary !== 47 && boundary !== 62) {
-      opener.lastIndex = i;
+  let i = 0;
+  while (i < html.length && count < 1000) {
+    const next = html.indexOf('<', i);
+    if (next === -1) break;
+    i = next;
+    // Comments are not markup; a template-looking string inside one is inert.
+    if (html.startsWith('<!--', i)) {
+      const end = html.indexOf('-->', i + 4);
+      if (end === -1) break;
+      i = end + 3;
       continue;
     }
+    const afterRawText = skipNonMarkupElement(html, i);
+    if (afterRawText !== i) {
+      i = afterRawText;
+      continue;
+    }
+    // `<templatex>` is not the template element. Continue after the name so
+    // a later real `<template` is still found without rescanning this one.
+    if (!startsTagAt(html, i, 'template')) {
+      i++;
+      continue;
+    }
+    let cursor = i + '<template'.length;
     let closedShadowRoot = false;
     let terminated = false;
-    while (i < html.length) {
-      while (i < html.length && isMarkupWhitespace(html.charCodeAt(i))) i++;
-      if (i >= html.length) break;
-      const code = html.charCodeAt(i);
-      if (code === 62) { i++; terminated = true; break; }
-      if (code === 47) { i++; continue; }
-      const nameStart = i;
-      while (i < html.length) {
-        const nameCode = html.charCodeAt(i);
+    while (cursor < html.length) {
+      while (cursor < html.length && isMarkupWhitespace(html.charCodeAt(cursor))) cursor++;
+      if (cursor >= html.length) break;
+      const code = html.charCodeAt(cursor);
+      if (code === 62) { cursor++; terminated = true; break; }
+      if (code === 47) { cursor++; continue; }
+      const nameStart = cursor;
+      while (cursor < html.length) {
+        const nameCode = html.charCodeAt(cursor);
         if (isMarkupWhitespace(nameCode) || nameCode === 61 || nameCode === 62 || nameCode === 47
           || nameCode === 34 || nameCode === 39) break;
-        i++;
+        cursor++;
       }
-      if (i === nameStart) { i++; continue; }
-      const attributeName = html.slice(nameStart, i).toLowerCase();
-      while (i < html.length && isMarkupWhitespace(html.charCodeAt(i))) i++;
-      let valueStart = i;
-      let valueEnd = i;
-      if (i < html.length && html.charCodeAt(i) === 61) {
-        i++;
-        while (i < html.length && isMarkupWhitespace(html.charCodeAt(i))) i++;
-        const quote = i < html.length ? html.charCodeAt(i) : -1;
+      if (cursor === nameStart) { cursor++; continue; }
+      const attributeName = html.slice(nameStart, cursor).toLowerCase();
+      while (cursor < html.length && isMarkupWhitespace(html.charCodeAt(cursor))) cursor++;
+      let valueStart = cursor;
+      let valueEnd = cursor;
+      if (cursor < html.length && html.charCodeAt(cursor) === 61) {
+        cursor++;
+        while (cursor < html.length && isMarkupWhitespace(html.charCodeAt(cursor))) cursor++;
+        const quote = cursor < html.length ? html.charCodeAt(cursor) : -1;
         if (quote === 34 || quote === 39) {
-          i++;
-          valueStart = i;
-          while (i < html.length && html.charCodeAt(i) !== quote) i++;
-          valueEnd = i;
-          if (i < html.length) i++;
+          cursor++;
+          valueStart = cursor;
+          while (cursor < html.length && html.charCodeAt(cursor) !== quote) cursor++;
+          valueEnd = cursor;
+          if (cursor < html.length) cursor++;
         } else {
-          valueStart = i;
-          while (i < html.length) {
-            const valueCode = html.charCodeAt(i);
+          valueStart = cursor;
+          while (cursor < html.length) {
+            const valueCode = html.charCodeAt(cursor);
             if (isMarkupWhitespace(valueCode) || valueCode === 62) break;
-            i++;
+            cursor++;
           }
-          valueEnd = i;
+          valueEnd = cursor;
         }
       }
       if (attributeName === 'shadowrootmode' || attributeName === 'shadowroot') {
@@ -1182,7 +1249,7 @@ export function countDeclarativeClosedShadowRoots(html: string): number {
     }
     if (!terminated) break;
     if (closedShadowRoot) count++;
-    opener.lastIndex = i;
+    i = cursor;
   }
   return count;
 }
@@ -1239,16 +1306,12 @@ export function beginRenderedDeclarativeShadowScan(page: RenderedShadowScanPageL
         scan!.observed = true;
         const headers = response.headers();
         const declaredLength = Number(headers['content-length']);
-        const contentEncoding = String(headers['content-encoding'] || '').trim().toLowerCase();
-        // Read only bodies whose decoded size is provably bounded. A chunked
-        // response has no content-length, and a compressed response's declared
-        // length is the compressed size, not the decoded size. Playwright's
-        // text() has no byte cap, so reading either would let a pathological
-        // document allocate unbounded crawler memory. Report a scan gap instead
-        // of assuming an empty body.
-        if (!Number.isFinite(declaredLength) || declaredLength < 0
-          || declaredLength > DECLARATIVE_SHADOW_SCAN_MAX_BYTES
-          || (contentEncoding !== '' && contentEncoding !== 'identity')) {
+        // A declared length above the cap is the only pre-read rejection. A
+        // chunked response has no content-length, and a compressed response's
+        // declared length is its compressed size; treating those as gaps made
+        // ordinary gzip/br/chunked pages permanently BOUNDED and retryable.
+        // Read them and enforce the same cap on the decoded text below.
+        if (declaredLength < 0 || declaredLength > DECLARATIVE_SHADOW_SCAN_MAX_BYTES) {
           scan!.gaps++;
           return;
         }
@@ -3861,7 +3924,12 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                   try { popupContent = await popup.content(); } catch { /* best effort */ }
                 }
                 await popup.close().catch(() => undefined);
-                if (popupContent) retain(popupContent, page.url());
+                if (popupContent) {
+                  retain(
+                    popupContent,
+                    popupMarkupEvidenceSourceUrl(kind, popupUrl, page.url()),
+                  );
+                }
                 if (kind === 'uninspectable') {
                   // A popup that never committed a navigable URL cannot be
                   // classified. It is still an unexamined interaction surface.
