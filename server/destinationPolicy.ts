@@ -26,11 +26,12 @@ const LINK_HUB_HOSTS = [
   'lnk.bio',
 ];
 
-const COMMUNITY_PLATFORM_HOSTS = [
-  'skool.com',
-  'whop.com',
-  'circle.so',
-  'patreon.com',
+/**
+ * Discord destinations are terminal invite candidates. Shared with the
+ * rendered cross-origin pass so its "never enqueue a Discord page" exclusion
+ * cannot drift from the community-platform classification here.
+ */
+export const DISCORD_DESTINATION_HOSTS = [
   'discord.gg',
   'discord.com',
   'discordapp.com',
@@ -39,6 +40,14 @@ const COMMUNITY_PLATFORM_HOSTS = [
   'discord.me',
   'discord.io',
   'disboard.org',
+];
+
+const COMMUNITY_PLATFORM_HOSTS = [
+  'skool.com',
+  'whop.com',
+  'circle.so',
+  'patreon.com',
+  ...DISCORD_DESTINATION_HOSTS,
 ];
 
 /**

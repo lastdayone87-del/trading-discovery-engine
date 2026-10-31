@@ -1,6 +1,6 @@
 import * as cheerio from 'cheerio';
 import { assessCrawlAdmission } from './communitySurfacePolicy';
-import { shouldFollowDestination } from './destinationPolicy';
+import { shouldFollowDestination, DISCORD_DESTINATION_HOSTS } from './destinationPolicy';
 import { assessPublicDestination, type DnsResolver } from './publicDestination';
 import { candidateFromNativeInvite, extractDiscordCandidates, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
 import { browserLaunchOptions, classifyBrowserFailure, isBrowserRuntimeFailure, markBrowserCapabilityReady, markBrowserCapabilityUnavailable, withBrowserRuntimeLease, type BrowserFailureClass } from './browserCapability';
@@ -333,21 +333,11 @@ export const MAX_RENDERED_CROSS_ORIGIN_ENQUEUES = 3;
 
 /** Discord destinations are terminal invite candidates, already extracted by
  * the page scan; enqueueing them would spend navigation budget on a page the
- * crawler does not need to inspect. */
-const DISCORD_DESTINATION_HOSTS = [
-  'discord.gg',
-  'discord.com',
-  'discordapp.com',
-  'discord.app',
-  'dsc.gg',
-  'discord.me',
-  'discord.io',
-  'disboard.org',
-];
-
+ * crawler does not need to inspect. The host list lives in destinationPolicy so
+ * the exclusion and the community-platform classification cannot drift. */
 export function isDiscordDestinationUrl(rawUrl: string): boolean {
   try {
-    const host = new URL(rawUrl).hostname.toLowerCase().replace(/^www\./, '');
+    const host = new URL(rawUrl).hostname.toLowerCase().replace(/^www\./, '').replace(/\.$/, '');
     return DISCORD_DESTINATION_HOSTS.some(entry => host === entry || host.endsWith(`.${entry}`));
   } catch {
     return false;
@@ -3653,14 +3643,23 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // (JS-revealed links), so both DOM states contribute; queue
             // dedupe makes repeats free. Hint-rejected double counts across
             // the two passes are bounded diagnostic noise (≤1 extra pass).
+            const collectCrossOriginCandidates = async (): Promise<RenderedCrossOriginCandidate[]> =>
+              page.$$eval('a[href]', collectRenderedCrossOriginCandidates, page.url())
+                .catch(() => [] as RenderedCrossOriginCandidate[]);
+            let preClickCrossOriginCandidates: RenderedCrossOriginCandidate[] = [];
             const enqueueCrossOrigin = async (): Promise<void> => {
               if (!limits.crossOriginEnqueue || Date.now() - startedAt >= limits.totalTimeoutMs) return;
+              // Post-click candidates are collected against the current document
+              // and merged with the pre-click snapshot, so a click that replaced
+              // the document loses neither set. Both were captured before this
+              // submission, which runs only after the post-click same-host pass.
+              const postClickCandidates = await collectCrossOriginCandidates();
               await enqueueRenderedCrossOriginPass({
                 // Crawlee's enqueueLinks exposes only hrefs to its transform
                 // hook. Collect bounded href+visible-text pairs, filtering
                 // same-origin/non-HTTP(S) anchors before the bound so internal
                 // navigation cannot hide a cross-origin community link.
-                collect: () => page.$$eval('a[href]', collectRenderedCrossOriginCandidates, page.url()),
+                collect: async () => [...preClickCrossOriginCandidates, ...postClickCandidates],
                 currentUrl: page.url(),
                 alreadyVisited: renderedCrossOriginVisitedIdentities(alreadyVisitedSet, terminalSuccessUrls),
                 queued: crossOriginQueued,
@@ -3672,10 +3671,14 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             if (Date.now() - startedAt < limits.totalTimeoutMs) {
               await enqueueLinks({ strategy: 'same-hostname', transformRequestFunction: req => (admitEnqueueRequest(req.url) ? req : false) });
             }
-            // P1.6: opt-in, bounded cross-origin pass. Runs after the
-            // same-host pass so required links are queued first, and again
-            // after interactions to include JS-revealed destinations.
-            await enqueueCrossOrigin();
+            // P1.6: opt-in, bounded cross-origin pass. The anchors are captured
+            // before any click can replace the document, but submission is
+            // deferred until after the post-click same-host pass so optional
+            // destinations never take queue positions ahead of JS-revealed
+            // required links.
+            if (limits.crossOriginEnqueue) {
+              preClickCrossOriginCandidates = await collectCrossOriginCandidates();
+            }
 
             // A popup control that opens a new window has not been examined:
             // the post-click inspect() re-reads the original page only. Track
