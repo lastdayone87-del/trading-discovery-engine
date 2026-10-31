@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { DEFAULT_BROWSER_FALLBACK_BUDGET, DECLARATIVE_SHADOW_SCAN_MAX_BYTES, advanceRenderedLifecycleStage, beginRenderedDeclarativeShadowScan, browserCauseSnippet, browserFallbackTelemetrySummary, classifyCrawlCatch, classifyRenderedPopupDestination, countDeclarativeClosedShadowRoots, createRenderedRouteGuard, disposeRenderedRouteGuards, installRenderedRouteCloseCleanup, isExpectedRenderedRouteShutdownError, isTelegramPostPermalink, mergeRenderedPageContextCounts, popupMarkupEvidenceSourceUrl, readRenderedDeclarativeShadowScan, RenderedFallbackGate, renderedFallbackGate, resolveRenderedZeroPageReason, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback, shouldSkipPreexistingSiblingPage, sumRenderedPageContextCounts, type BrowserFallbackTelemetry, type RenderedRouteLike } from './browserCommunityFallback';
+import { DEFAULT_BROWSER_FALLBACK_BUDGET, DECLARATIVE_SHADOW_SCAN_MAX_BYTES, advanceRenderedLifecycleStage, beginRenderedDeclarativeShadowScan, browserCauseSnippet, browserFallbackTelemetrySummary, classifyCrawlCatch, classifyRenderedPopupDestination, countDeclarativeClosedShadowRoots, createRenderedRouteGuard, disposeRenderedRouteGuards, installRenderedRouteCloseCleanup, isExpectedRenderedRouteShutdownError, isTelegramPostPermalink, mergeRenderedPageContextCounts, popupMarkupEvidenceSourceUrl, readRenderedDeclarativeShadowScan, renderedPopupWaitTimeoutMs, RenderedFallbackGate, renderedFallbackGate, resolveRenderedZeroPageReason, retainSkippableAnchorEvidence, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback, shouldSkipPreexistingSiblingPage, sumRenderedPageContextCounts, type BrowserFallbackTelemetry, type RenderedRouteLike } from './browserCommunityFallback';
 import { inferDiscordOwnership, makeDiscordCandidate } from './discordCandidates';
 import { redactCauseSnippet } from './crawlerTelemetry';
 import { classifyRenderedCrawlerFailure, isRenderedNavigationTimeout, renderedCrawlerHostBackoffMs, renderedCrawlerRetryPolicy } from './renderedCrawlerPolicy';
@@ -931,3 +931,73 @@ test('disposeRenderedRouteGuards handles repeated and already-closed contexts', 
   assert.equal(calls, 1);
 });
 
+
+test('declarative shadow scan awaits every main-document body in a generation', async () => {
+  type Listener = (response: {
+    url(): string;
+    status(): number;
+    headers(): Record<string, string>;
+    request(): { resourceType(): string; frame(): unknown };
+    text(): Promise<string>;
+  }) => void;
+  const mainFrame = {};
+  let listener: Listener | undefined;
+  const page = {
+    on(_event: 'response', callback: Listener) { listener = callback; },
+    mainFrame() { return mainFrame; },
+  };
+  beginRenderedDeclarativeShadowScan(page);
+  const pendingBodies: Array<(html: string) => void> = [];
+  const emit = () => listener!({
+    url: () => 'https://fixture.test/redirected',
+    status: () => 200,
+    headers: () => ({}),
+    request: () => ({ resourceType: () => 'document', frame: () => mainFrame }),
+    text: () => new Promise<string>(resolve => { pendingBodies.push(resolve); }),
+  });
+  // A JS redirect/location.replace can emit two main-document responses in
+  // one generation. Both bodies must be awaited and counted.
+  emit();
+  emit();
+  pendingBodies[0]('<template shadowrootmode="closed"></template>');
+  await new Promise<void>(resolve => setImmediate(resolve));
+  let settled = false;
+  const read = readRenderedDeclarativeShadowScan(page as object, 500).then(result => {
+    settled = true;
+    return result;
+  });
+  await new Promise<void>(resolve => setTimeout(resolve, 25));
+  assert.equal(settled, false, 'the read must wait for the second in-flight body');
+  pendingBodies[1]('<template shadowrootmode="closed"></template><template shadowrootmode="closed"></template>');
+  assert.deepEqual(await read, { documents: 2, closedRoots: 3, gaps: 0 });
+});
+
+test('popup URL waits are capped by the remaining crawl budget', () => {
+  assert.equal(renderedPopupWaitTimeoutMs(5_000), 1_500);
+  assert.equal(renderedPopupWaitTimeoutMs(400), 400);
+  assert.equal(renderedPopupWaitTimeoutMs(0), 0);
+  assert.equal(renderedPopupWaitTimeoutMs(-1), 0);
+  assert.equal(renderedPopupWaitTimeoutMs(Number.NaN), 0);
+});
+
+test('skipped navigable anchors retain live text and href before exclusion', () => {
+  const retained: Array<[string, string]> = [];
+  const count = retainSkippableAnchorEvidence([
+    { text: 'Join Discord', href: 'https://discord.gg/INVITE' },
+    { text: 'Resources', href: 'https://creator.example/resources' },
+    { text: 'Community', href: 'https://creator.example/community' },
+    { text: 'Button without href', href: null },
+  ], 'https://creator.example/', (text, url) => { retained.push([text, url]); });
+  assert.equal(count, 2, 'only the cross-origin and same-origin hint-owned anchors are click-skipped');
+  assert.deepEqual(retained, [
+    ['Join Discord https://discord.gg/INVITE', 'https://creator.example/'],
+    ['Community https://creator.example/community', 'https://creator.example/'],
+  ]);
+});
+
+test('initial baseline overflow is not misreported as coverage truncation', () => {
+  const source = fs.readFileSync(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /initialCollection\.truncated[^\n]*candidateCapTruncated/);
+  assert.match(source, /revealedCollection\.truncated[\s\S]{0,120}candidateCapTruncated/);
+  assert.match(source, /shadowSnapshot\.truncated\) interactionGap = true/);
+});

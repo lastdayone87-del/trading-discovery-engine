@@ -424,6 +424,20 @@ export function classifyRenderedPopupDestination(
   return 'same-origin';
 }
 
+/**
+ * Popup URL waits are bounded by both their own 1.5s cap and the crawl
+ * deadline. Draining up to eight popups sequentially must never extend the
+ * request handler past `totalTimeoutMs`.
+ */
+export function renderedPopupWaitTimeoutMs(
+  remainingCrawlMs: number,
+  capMs = 1_500,
+): number {
+  const cap = Number.isFinite(capMs) ? Math.max(0, Math.floor(capMs)) : 0;
+  const remaining = Number.isFinite(remainingCrawlMs) ? Math.max(0, Math.floor(remainingCrawlMs)) : 0;
+  return Math.min(cap, remaining);
+}
+
 export const COMMUNITY_HINTS = /discord|community|join|chat|member|membership|vip|group|private|trading.?room|links?|social|contact|about|whop|skool|circle|patreon|premium|paid|subscribe|signals?|mentor|access/i;
 
 /**
@@ -1006,7 +1020,21 @@ export function enumerateRenderedControlNodes(
       || (role === 'link' && !hasNavigableHref)
       || (tagName === 'a' && !hasNavigableHref);
     const hasAccessibleEvidence = extendedText.trim().length > 0;
-    if (interactiveControl && !hintMatchedControl && !disclosure && !openSummary && !hasAccessibleEvidence) {
+    // Hidden, disabled, and zero-box widgets are not interaction surfaces: a
+    // hidden template menu, a disabled carousel arrow, or a bare
+    // `<a name="top"></a>` fragment target cannot reveal an invite. Hash/id
+    // anchors on legacy and markdown-generated pages have no rendered box, so
+    // counting them would turn an ordinary clean page into CONTEXT_UNREACHABLE.
+    const style = window.getComputedStyle(element);
+    const renderedBox = typeof element.getClientRects === 'function' && element.getClientRects().length > 0;
+    const hiddenControl = !renderedBox
+      || (element as HTMLElement).hidden
+      || element.getAttribute('aria-hidden') === 'true'
+      || style.display === 'none'
+      || style.visibility === 'hidden';
+    const disabledControl = (element as HTMLButtonElement).disabled === true
+      || element.getAttribute('aria-disabled') === 'true';
+    if (interactiveControl && !hiddenControl && !disabledControl && !hintMatchedControl && !disclosure && !openSummary && !hasAccessibleEvidence) {
       opaqueInteractiveControls++;
     }
     if (openSummary) continue;
@@ -1292,8 +1320,10 @@ interface DeclarativeShadowPageScan {
   documents: number;
   closedRoots: number;
   gaps: number;
-  pending: Promise<void> | null;
-  settled: boolean;
+  /** Every in-flight main-document body read in this generation. A JS
+   * redirect can emit more than one; awaiting only the latest would silently
+   * drop the other body's closed roots. */
+  pending: Set<Promise<void>>;
   generation: number;
   observed: boolean;
 }
@@ -1322,7 +1352,7 @@ interface RenderedShadowScanPageLike {
 export function beginRenderedDeclarativeShadowScan(page: RenderedShadowScanPageLike): void {
   let scan = DECLARATIVE_SHADOW_SCAN_PAGES.get(page as object);
   if (!scan) {
-    scan = { documents: 0, closedRoots: 0, gaps: 0, pending: null, settled: true, generation: 0, observed: false };
+    scan = { documents: 0, closedRoots: 0, gaps: 0, pending: new Set(), generation: 0, observed: false };
     DECLARATIVE_SHADOW_SCAN_PAGES.set(page as object, scan);
     const mainFrame = () => {
       try { return (page as unknown as { mainFrame(): unknown }).mainFrame(); } catch { return null; }
@@ -1350,8 +1380,8 @@ export function beginRenderedDeclarativeShadowScan(page: RenderedShadowScanPageL
           return;
         }
         const generation = scan!.generation;
-        scan!.settled = false;
-        scan!.pending = response.text().then(html => {
+        const pendingSet = scan!.pending;
+        const bodyRead = response.text().then(html => {
           if (scan!.generation !== generation) return;
           // Defend against a server that under-declares its body. The read has
           // already allocated by this point, but the count must not claim a
@@ -1365,11 +1395,13 @@ export function beginRenderedDeclarativeShadowScan(page: RenderedShadowScanPageL
         }).catch(() => {
           if (scan!.generation === generation) scan!.gaps++;
         }).finally(() => {
-          if (scan!.generation === generation) {
-            scan!.settled = true;
-            scan!.pending = null;
-          }
+          // Remove only this body read. A later response in the same
+          // generation keeps its own promise pending; clearing the whole
+          // pending state here would let readRenderedDeclarativeShadowScan
+          // return without awaiting it.
+          pendingSet.delete(bodyRead);
         });
+        pendingSet.add(bodyRead);
       } catch {
         scan!.gaps++;
       }
@@ -1379,8 +1411,9 @@ export function beginRenderedDeclarativeShadowScan(page: RenderedShadowScanPageL
   scan.documents = 0;
   scan.closedRoots = 0;
   scan.gaps = 0;
-  scan.pending = null;
-  scan.settled = true;
+  // Old generation promises delete from their captured set only; a new
+  // navigation starts with a clean in-flight set.
+  scan.pending = new Set();
   scan.observed = false;
 }
 
@@ -1395,16 +1428,15 @@ export async function readRenderedDeclarativeShadowScan(
 ): Promise<{ documents: number; closedRoots: number; gaps: number }> {
   const scan = DECLARATIVE_SHADOW_SCAN_PAGES.get(page);
   if (!scan) return { documents: 0, closedRoots: 0, gaps: 1 };
-  if (scan.pending) {
-    const pending = scan.pending;
+  if (scan.pending.size > 0) {
     await Promise.race([
-      pending,
+      Promise.all([...scan.pending]),
       new Promise<void>(resolve => setTimeout(resolve, Math.max(0, timeoutMs))),
     ]);
   }
   const gaps = scan.gaps
     + (scan.observed ? 0 : 1)
-    + (!scan.settled && scan.pending ? 1 : 0);
+    + (scan.pending.size > 0 ? 1 : 0);
   return { documents: scan.documents, closedRoots: scan.closedRoots, gaps };
 }
 
@@ -1455,6 +1487,9 @@ export function collectRenderedOpenShadowContent(): RenderedOpenShadowSnapshot {
     }
     lightNode = lightWalker.nextNode();
   }
+  // A host beyond the light-DOM bound was never examined. Report it as a
+  // partial snapshot so the caller can never certify a clean absence.
+  if (lightNode) truncated = true;
   while (queue.length && nodes < maxNodes && chars < maxChars) {
     const entry = queue.shift()!;
     roots++;
@@ -1613,6 +1648,27 @@ export function isSkippableNavigableAnchorClick(
   // the enqueue rule would reject must still be clicked, otherwise it is
   // neither clicked nor enqueued and discovery could be lost.
   return shouldEnqueueRenderedCommunityLink(absolute.toString());
+}
+
+/**
+ * Retain the live text+href of every anchor excluded from clicking. Page
+ * content snapshots can predate a JS-inserted invite, and a skipped anchor is
+ * never passed through attemptRenderedControlClick, so this is the only place
+ * that late DOM state reaches candidate extraction. Returns the number of
+ * anchors retained (bounded by the caller's enumerated control set).
+ */
+export function retainSkippableAnchorEvidence(
+  controls: readonly Pick<RenderedControlTarget, 'text' | 'href'>[],
+  pageUrl: string,
+  retain: (text: string, pageUrl: string) => void,
+): number {
+  let retained = 0;
+  for (const control of controls) {
+    if (!isSkippableNavigableAnchorClick(control, pageUrl)) continue;
+    retain(`${control.text} ${control.href || ''}`, pageUrl);
+    retained++;
+  }
+  return retained;
 }
 
 /**
@@ -3431,13 +3487,18 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // missing from the opener page's `popup` event even though they
             // are still real destinations in this bounded crawl.
             const pendingPopups: Array<{
-              url(): string;
-              close(): Promise<void>;
-              content?(): Promise<string>;
-              waitForURL?(
-                url: (target: URL) => boolean,
-                options?: { timeout?: number },
-              ): Promise<unknown>;
+              popup: {
+                url(): string;
+                close(): Promise<void>;
+                content?(): Promise<string>;
+                waitForURL?(
+                  url: (target: URL) => boolean,
+                  options?: { timeout?: number },
+                ): Promise<unknown>;
+              };
+              /** Opener URL captured when the popup was observed, before any
+               * same-click navigation can replace `page.url()`. */
+              openerUrl: string;
             }> = [];
             const onPopup = (popup: {
               url(): string;
@@ -3450,7 +3511,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 void popup.close().catch(() => undefined);
                 return;
               }
-              pendingPopups.push(popup);
+              let openerUrl = '';
+              try { openerUrl = page.url(); } catch { openerUrl = request.url; }
+              pendingPopups.push({ popup, openerUrl });
             };
             const popupContext = (page as unknown as { context?: () => {
               on?: (event: string, listener: (candidate: typeof page) => void) => void;
@@ -3527,6 +3590,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                     if (shadowSnapshot && Array.isArray(shadowSnapshot.hrefs) && shadowSnapshot.hrefs.length) {
                       retain(shadowSnapshot.hrefs.join(' '), url);
                     }
+                    // A bounded open-root walk that stopped early may hide a
+                    // host (and its invite) beyond the bound. Mark the run
+                    // incomplete instead of claiming a clean absence.
+                    if (shadowSnapshot && shadowSnapshot.truncated) interactionGap = true;
                   } catch { /* coverage still reports open roots as context-unreachable */ }
                   try {
                     // Request and final-page identities share one evidence bucket
@@ -3646,7 +3713,12 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 collectRenderedSameOriginCandidates,
                 page.url(),
               );
-              if (initialCollection.truncated > 0) candidateCapTruncated = Math.max(candidateCapTruncated, initialCollection.truncated);
+              // This snapshot is only a comparison baseline for "revealed by
+              // interaction". Its overflow bound does not drop a destination
+              // from pursuit: the hint pass and the later revealed-link pass
+              // each collect their own bounded set. Treating baseline overflow
+              // as coverage truncation made any page with >500 internal links
+              // permanently BOUNDED even when nothing was left unexamined.
               const baseline = new Set<string>();
               for (const candidate of initialCollection.candidates) {
                 const key = normalizeVisitUrl(candidate.url);
@@ -3803,6 +3875,13 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             const firstEnumeration = await enumerateControls();
             recordControlEnumeration(firstEnumeration);
             const controls = firstEnumeration.controls;
+            // A navigable anchor is excluded from clicks because either the
+            // enqueue policy owns it (same-origin hint match) or it is
+            // cross-origin and must never navigate the document. Its live
+            // text+href can postdate the last page.content() snapshot, so
+            // retain it here before the click planner drops it; otherwise a
+            // JS-inserted direct Discord/invite href would be lost entirely.
+            retainSkippableAnchorEvidence(controls, page.url(), retain);
             // Navigable same-host anchors are already discovered through
             // enqueueLinks and Discord-scanned before any click, so the click
             // budget is reserved for controls that only a click can act on
@@ -3931,21 +4010,28 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               // the click settled (notably COOP-severed popups).
               await captureSiblingPages();
               while (pendingPopups.length) {
-                const popup = pendingPopups.shift()!;
+                const { popup, openerUrl } = pendingPopups.shift()!;
                 let popupUrl = '';
                 try {
                   // Wait for the popup to commit an HTTP(S) document. A popup
                   // can be observed at `about:blank` before its navigation
                   // starts; reading too early would turn a real destination
-                  // into a false "unclassifiable" drop. The wait is bounded so
-                  // a blocked/blank popup still resolves as an honest gap.
-                  await popup.waitForURL?.(
-                    target => target.protocol === 'http:' || target.protocol === 'https:',
-                    { timeout: 1_500 },
-                  ).catch(() => undefined);
+                  // into a false "unclassifiable" drop. The wait is bounded by
+                  // both the popup cap and the remaining crawl budget so a
+                  // queue of pending popups cannot outlive the request.
+                  const popupWaitMs = renderedPopupWaitTimeoutMs(limits.totalTimeoutMs - (Date.now() - startedAt));
+                  if (popupWaitMs > 0) {
+                    await popup.waitForURL?.(
+                      target => target.protocol === 'http:' || target.protocol === 'https:',
+                      { timeout: popupWaitMs },
+                    ).catch(() => undefined);
+                  }
                   popupUrl = popup.url();
                 } catch { /* about:blank or already closed */ }
-                const kind = classifyRenderedPopupDestination(popupUrl, page.url());
+                // Classify against the opener URL captured when the popup was
+                // observed: the same click may have navigated the opener away,
+                // and `page.url()` now names a different origin.
+                const kind = classifyRenderedPopupDestination(popupUrl, openerUrl);
                 // A blank popup can still hold document.write() markup with an
                 // invite. A generic Discord-host page is not terminal evidence
                 // either: its URL has no invite, so inspect its document for
@@ -3961,7 +4047,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 if (popupContent) {
                   retain(
                     popupContent,
-                    popupMarkupEvidenceSourceUrl(kind, popupUrl, page.url()),
+                    popupMarkupEvidenceSourceUrl(kind, popupUrl, openerUrl),
                   );
                 }
                 if (kind === 'uninspectable') {
@@ -3974,7 +4060,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                   // The popup opened a direct Discord invite. The URL is
                   // terminal evidence; never discard it as a policy exclusion
                   // or consume a bounded page request to re-open it.
-                  retain(popupUrl, page.url());
+                  retain(popupUrl, openerUrl);
                   popupCaptured++;
                   continue;
                 }
@@ -4185,7 +4271,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               // errorHandler accounting above, and retry see attemptError
               // unchanged, and a failed page is never referenced afterwards.
               stopPopupCapture();
-              for (const popup of pendingPopups.splice(0)) {
+              for (const { popup } of pendingPopups.splice(0)) {
                 await popup.close().catch(() => undefined);
               }
               await page.close().catch(() => undefined);

@@ -650,6 +650,29 @@ function e2e5SameOriginPopup(): FixtureWorld {
   return world;
 }
 
+function e2e5PopupOpenerNavigates(): FixtureWorld {
+  const world = new FixtureWorld();
+  // The same click opens a same-origin popup and navigates the opener to a
+  // different origin. Popup classification must use the origin captured when
+  // the popup was observed, not the opener's post-click URL.
+  world.add(MAIN, '/', {
+    body: page(`
+      <h1>Popup community</h1>
+      <button id="open" aria-label="Community room">Community room</button>
+      <script>
+        document.getElementById('open').addEventListener('click', () => {
+          window.open('/popup-room', '_blank');
+          window.location.href = 'http://${HUB}/away';
+        });
+      </script>`),
+  });
+  world.add(MAIN, '/popup-room', {
+    body: page('<h1>Popup room</h1><a href="https://discord.gg/E2E5OPENERNAV">Discord</a>'),
+  });
+  world.add(HUB, '/away', { body: page('<h1>Away</h1>') });
+  return world;
+}
+
 function e2e6CrossOrigin(): FixtureWorld {
   const world = new FixtureWorld();
   // Deliberately non-hint anchor text: the destination path carries the
@@ -1031,6 +1054,21 @@ test('E2E-5e allowed same-origin popup is captured and inspected within budget',
       'E2E-5e: the same-origin popup was not captured');
     assert.equal(result.foundInvite, 'E2E5SAMEPOPUP',
       'E2E-5e: the captured same-origin popup was not inspected for an invite');
+  } finally {
+    await world.close();
+  }
+});
+
+test('E2E-5h same-click opener navigation does not reclassify its popup', { skip: BROWSER_SKIP, timeout: E2E_TIMEOUT }, async () => {
+  const world = e2e5PopupOpenerNavigates();
+  await world.start();
+  try {
+    const { result, rendered } = await world.inspect(`http://${MAIN}/`);
+    logResult('E2E-5h', result);
+    assert.ok((rendered[0]?.telemetry?.popupCaptured || 0) > 0,
+      'E2E-5h: the popup must be captured using its opener-time origin');
+    assert.equal(result.foundInvite, 'E2E5OPENERNAV',
+      'E2E-5h: the same-origin popup was dropped after the opener navigated away');
   } finally {
     await world.close();
   }

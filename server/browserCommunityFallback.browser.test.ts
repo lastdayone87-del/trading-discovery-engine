@@ -615,3 +615,37 @@ test('real DOM: duplicate existing control markers are made unique', { skip: pro
     assert.deepEqual(await page.evaluate(() => (window as unknown as { clicks: number[] }).clicks), [0, 1]);
   });
 });
+
+test('real DOM: empty fragment anchors and hidden/disabled widgets are not opaque controls', { skip: process.platform === 'android', timeout: 30_000 }, async () => {
+  await withControlPage(`<!doctype html><html><head><title>opaque fixture</title></head><body>
+    <a name="top"></a>
+    <a id="section"></a>
+    <button hidden><svg width="10" height="10"></svg></button>
+    <button disabled><svg width="10" height="10"></svg></button>
+    <div style="display:none"><button><svg width="10" height="10"></svg></button></div>
+    <button id="visible-icon"><svg width="10" height="10"></svg></button>
+  </body></html>`, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(enumeration.opaqueInteractiveControls, 1,
+      'only the rendered, enabled icon-only control is an unexamined interaction surface');
+  });
+});
+
+test('real DOM: open-shadow walker reports truncation past its light-DOM bound', { skip: process.platform === 'android', timeout: 30_000 }, async () => {
+  await withControlPage('<!doctype html><html><body><div id="fill"></div></body></html>', async (page) => {
+    await page.evaluate(() => {
+      const fill = document.getElementById('fill');
+      if (!fill) return;
+      const fragment = document.createDocumentFragment();
+      for (let index = 0; index < 4_001; index++) fragment.appendChild(document.createElement('div'));
+      fill.appendChild(fragment);
+      const host = document.createElement('div');
+      document.body.appendChild(host);
+      const root = host.attachShadow({ mode: 'open' });
+      root.innerHTML = '<a href="https://discord.gg/DEEP">Discord</a>';
+    });
+    const snapshot = await page.evaluate(collectRenderedOpenShadowContent);
+    assert.equal(snapshot.truncated, true,
+      'a host beyond the light-DOM bound must make the snapshot partial');
+  });
+});

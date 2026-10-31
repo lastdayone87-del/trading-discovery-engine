@@ -845,7 +845,12 @@ test('interaction-revealed links are captured per click and context counters ref
     /await attemptRenderedControlClick[\s\S]{0,1600}?await recordPageContext\(\);/,
     'each click captures the document it navigated to before the next click',
   );
-  assert.match(source, /retain\(popupUrl, page\.url\(\)\)/, 'a direct Discord popup URL is retained as terminal evidence');
+  assert.match(source, /retain\(popupUrl, openerUrl\)/, 'a direct Discord popup URL is retained as terminal evidence');
+  assert.match(
+    source,
+    /classifyRenderedPopupDestination\(popupUrl, openerUrl\)/,
+    'popup origin is resolved against the opener URL captured when the popup was observed',
+  );
   assert.match(
     source,
     /isDiscordDestinationUrl\(popupUrl\) && extractDiscordCandidates\(popupUrl\)\.length > 0/,
