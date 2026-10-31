@@ -207,7 +207,7 @@ test('real DOM: structural classification uses visible text and aria-label only'
   const html = `<!doctype html><html><head><title>label fixture</title></head><body>
     <a href="/support" title="Site menu">Support</a>
     <button aria-labelledby="menu-heading"><span aria-hidden="true">≡</span></button>
-    <span id="menu-heading">Main menu</span>
+    <span id="menu-heading">Community menu</span>
     <button aria-label="Open menu">☰</button>
     <a href="/tools" role="menuitem">Tools</a>
     <div role="menu"><a href="/products">Products</a></div>
@@ -216,13 +216,13 @@ test('real DOM: structural classification uses visible text and aria-label only'
     const enumeration = await enumeratePageControls(page);
     assert.equal(
       enumeration.structuralNavigation,
-      3,
-      'aria-label menu, role=menuitem, and a descendant of role=menu are structural; title and aria-labelledby text are not',
+      5,
+      'title/aria-labelledby menu names, aria-label menu, role=menuitem, and a descendant of role=menu are structural',
     );
     assert.equal(
       enumeration.structuralHintRejected,
-      3,
-      'the visible Support link is hint-matched, and aria-labelledby text cannot force a generic control into the structural gap',
+      5,
+      'none of these structural controls is hint-matched; menu-like names alone do not make them clickable evidence',
     );
     assert.equal(enumeration.iconLabelRecovered, 1, 'aria-labelledby still contributes to icon-label recovery measurement');
   });
@@ -276,6 +276,19 @@ test('real DOM: enumeration separates hint-rejected, structural, icon-label, and
     assert.equal(enumeration.structuralHintRejected, 1, 'the structural control would be hidden by the hint filter today');
     assert.equal(enumeration.iconLabelRecovered, 1, 'title-only icon labels are recoverable in P1.2');
     assert.equal(enumeration.popupTargets, 1, 'only the dialog control requires popup capture; the href-bearing _blank anchor is navigable');
+    assert.equal(enumeration.popupMarkers.length, 1, 'the hint-rejected popup is identity-tracked too');
+    assert.equal(
+      enumeration.controls.some(control => control.marker === enumeration.popupMarkers[0]),
+      false,
+      'tracking a hint-rejected popup does not add it to the click set',
+    );
+    const repeat = await enumeratePageControls(page);
+    assert.deepEqual(repeat.popupMarkers, enumeration.popupMarkers, 'popup identity is stable across enumerations');
+    assert.equal(
+      await page.locator(`[data-oc-control="${enumeration.popupMarkers[0]}"]`).count(),
+      1,
+      'the popup marker belongs to exactly one element',
+    );
 
     const context = await page.evaluate(collectRenderedPageContext);
     assert.equal(context.frameCount, 1, 'iframe presence is recorded for P1.4');

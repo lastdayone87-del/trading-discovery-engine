@@ -613,25 +613,63 @@ export interface RenderedControlEnumeration {
    * `aria-haspopup=dialog|menu` and href-less `_blank` controls are.
    */
   popupTargets: number;
+  /**
+   * Stable markers for every popup control, including hint-rejected popups
+   * that are absent from `controls`. Identity tracking uses these markers so
+   * a replacement popup cannot be cancelled by an earlier popup's click.
+   */
+  popupMarkers: string[];
 }
 
 /**
  * Coverage-gap observations are monotonic across re-enumerations. A later
  * snapshot can be smaller (a clicked community button is replaced by a menu
- * trigger) yet reveal a structural/icon/popup control the first snapshot did
- * not contain. Max each gap counter independently of the denominator snapshot,
- * so a new gap can never be discarded for being in a smaller control set.
+ * trigger) yet reveal a structural/icon control the first snapshot did not
+ * contain. Max each gap counter independently of the denominator snapshot, so
+ * a new gap can never be discarded for being in a smaller control set.
  */
 export function mergeRenderedCoverageGapCounters(
-  prior: Pick<RenderedControlEnumeration, 'structuralNavigation' | 'structuralHintRejected' | 'iconLabelRecovered' | 'popupTargets'>,
-  next: Pick<RenderedControlEnumeration, 'structuralNavigation' | 'structuralHintRejected' | 'iconLabelRecovered' | 'popupTargets'>,
-): Pick<RenderedControlEnumeration, 'structuralNavigation' | 'structuralHintRejected' | 'iconLabelRecovered' | 'popupTargets'> {
+  prior: Pick<RenderedControlEnumeration, 'structuralNavigation' | 'structuralHintRejected' | 'iconLabelRecovered'>,
+  next: Pick<RenderedControlEnumeration, 'structuralNavigation' | 'structuralHintRejected' | 'iconLabelRecovered'>,
+): Pick<RenderedControlEnumeration, 'structuralNavigation' | 'structuralHintRejected' | 'iconLabelRecovered'> {
   return {
     structuralNavigation: Math.max(prior.structuralNavigation, next.structuralNavigation),
     structuralHintRejected: Math.max(prior.structuralHintRejected, next.structuralHintRejected),
     iconLabelRecovered: Math.max(prior.iconLabelRecovered, next.iconLabelRecovered),
-    popupTargets: Math.max(prior.popupTargets, next.popupTargets),
   };
+}
+
+/**
+ * Popup coverage is identity-based, not count-based. A popup that is clicked
+ * inline has been examined; a popup that opened a new window has not. Tracking
+ * the stable marker of every observed popup, including hint-rejected ones,
+ * means a replacement cannot be cancelled out by an earlier popup's click, and
+ * re-observing the same popup during scrolling does not inflate the count.
+ */
+export function trackRenderedPopupCoverage(
+  prior: ReadonlySet<string>,
+  enumeration: Pick<RenderedControlEnumeration, 'popupMarkers'>,
+): Set<string> {
+  const observedMarkers = new Set(prior);
+  for (const marker of enumeration.popupMarkers) observedMarkers.add(marker);
+  return observedMarkers;
+}
+
+/**
+ * Popups observed by an enumeration but never examined by the click loop.
+ * Only a successfully clicked inline disclosure removes a marker; a popup
+ * that opened a new window remains unexamined, and hint-rejected popups are
+ * always unexamined because they are never clicked.
+ */
+export function resolveUnexaminedPopupTargets(
+  observedMarkers: ReadonlySet<string>,
+  examinedMarkers: ReadonlySet<string>,
+): number {
+  let unexamined = 0;
+  for (const marker of observedMarkers) {
+    if (!examinedMarkers.has(marker)) unexamined++;
+  }
+  return unexamined;
 }
 
 /**
@@ -655,6 +693,7 @@ export function enumerateRenderedControlNodes(
   let structuralHintRejected = 0;
   let iconLabelRecovered = 0;
   let popupTargets = 0;
+  const popupIndices: number[] = [];
   for (let index = 0; index < nodes.length; index++) {
     const node = nodes[index];
     const element = node as HTMLElement;
@@ -730,6 +769,13 @@ export function enumerateRenderedControlNodes(
     const disclosure = tagName === 'summary'
       || (element.hasAttribute('aria-expanded') && (tagName !== 'a' || !hasNavigableHref));
     const target = (element.getAttribute('target') || '').trim().toLowerCase();
+    // Menu-like labels only. Generic footer/company/about links are not
+    // structural navigation and would make nearly every crawl look
+    // policy-bounded. Title/aria-labelledby are included only for this
+    // menu-shaped test: an icon-only "Main menu" button outside a navigation
+    // container is a real coverage gap even though it is not clicked, while
+    // generic title text must not classify ordinary controls.
+    const menuLikeLabel = /\b(menu|navigation|nav|hamburger)\b/i;
     const structural = tagName === 'nav'
       || role === 'menu'
       || role === 'menubar'
@@ -738,10 +784,8 @@ export function enumerateRenderedControlNodes(
       || (ariaHaspopup !== '' && ariaHaspopup !== 'false')
       || disclosure
       || inNavigationContainer
-      // Menu-like labels only. Generic footer/company/about links are not
-      // structural navigation and would make nearly every crawl look
-      // policy-bounded.
-      || /\b(menu|navigation|nav|hamburger)\b/i.test(labelText);
+      || menuLikeLabel.test(labelText)
+      || menuLikeLabel.test(`${title} ${labelledByText}`);
     const isPopup = (ariaHaspopup !== '' && ariaHaspopup !== 'false')
       || (target === '_blank' && !hasNavigableHref);
     if (structural) {
@@ -753,7 +797,12 @@ export function enumerateRenderedControlNodes(
     // coverage gap. A `target=_blank` anchor with a real href is already
     // reachable through that href; counting it would mark nearly every
     // social link as an unexamined popup.
-    if (isPopup) popupTargets++;
+    if (isPopup) {
+      popupTargets++;
+      // Hint-rejected popups still need a stable identity for coverage
+      // accounting; they are marked below but never enter the click set.
+      popupIndices.push(index);
+    }
     if (!baseMatched) continue;
     matched.push({
       index,
@@ -765,6 +814,7 @@ export function enumerateRenderedControlNodes(
   }
   const usedMarkers = new Set<string>();
   const controls: RenderedControlTarget[] = [];
+  const markerByIndex = new Map<number, string>();
   for (let itemIndex = 0; itemIndex < matched.length; itemIndex++) {
     const item = matched[itemIndex];
     const node = nodes[item.index] as HTMLElement;
@@ -780,7 +830,28 @@ export function enumerateRenderedControlNodes(
     }
     usedMarkers.add(marker);
     if (existing !== marker) node.setAttribute('data-oc-control', marker);
+    markerByIndex.set(item.index, marker);
     controls.push({ ...item, marker });
+  }
+  const popupMarkers: string[] = [];
+  for (let popupIndex = 0; popupIndex < popupIndices.length; popupIndex++) {
+    const index = popupIndices[popupIndex];
+    const matchedMarker = markerByIndex.get(index);
+    if (matchedMarker) {
+      popupMarkers.push(matchedMarker);
+      continue;
+    }
+    const node = nodes[index] as HTMLElement;
+    const existing = node.getAttribute('data-oc-control');
+    let marker = existing || `oc-popup-${Date.now().toString(36)}-${index}-${Math.random().toString(36).slice(2, 8)}`;
+    let attempt = 0;
+    while (usedMarkers.has(marker)) {
+      attempt += 1;
+      marker = `oc-popup-${Date.now().toString(36)}-${index}-${attempt}-${Math.random().toString(36).slice(2, 8)}`;
+    }
+    usedMarkers.add(marker);
+    if (existing !== marker) node.setAttribute('data-oc-control', marker);
+    popupMarkers.push(marker);
   }
   return {
     controls,
@@ -790,6 +861,7 @@ export function enumerateRenderedControlNodes(
     structuralHintRejected,
     iconLabelRecovered,
     popupTargets,
+    popupMarkers,
   };
 }
 
@@ -2248,10 +2320,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             let pageStructuralNavigation = 0;
             let pageStructuralHintRejected = 0;
             let pageIconLabelRecovered = 0;
-            let pagePopupTargets = 0;
+            let pagePopupMarkers = new Set<string>();
             let pageControlOverflow = 0;
-            const pagePopupControlMarkers = new Set<string>();
-            const clickedPopupMarkers = new Set<string>();
+            const examinedPopupMarkers = new Set<string>();
             const recordControlEnumeration = (enumeration: RenderedControlEnumeration): void => {
               const matchedTotal = enumeration.controls.length;
               pageControlTotal = Math.max(pageControlTotal, matchedTotal);
@@ -2265,17 +2336,13 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                   structuralNavigation: pageStructuralNavigation,
                   structuralHintRejected: pageStructuralHintRejected,
                   iconLabelRecovered: pageIconLabelRecovered,
-                  popupTargets: pagePopupTargets,
                 },
                 enumeration,
               );
               pageStructuralNavigation = gapCounters.structuralNavigation;
               pageStructuralHintRejected = gapCounters.structuralHintRejected;
               pageIconLabelRecovered = gapCounters.iconLabelRecovered;
-              pagePopupTargets = gapCounters.popupTargets;
-              for (const control of enumeration.controls) {
-                if (control.popup && control.marker) pagePopupControlMarkers.add(control.marker);
-              }
+              pagePopupMarkers = trackRenderedPopupCoverage(pagePopupMarkers, enumeration);
               // Overflow accounting keeps using the matched pool: P0.2 is
               // measurement-only and must not change control-slice behavior.
               const overflow = Math.max(0, matchedTotal - RENDERED_CONTROL_EVALUATION_WINDOW);
@@ -2301,14 +2368,11 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               controlsStructuralNavigation += pageStructuralNavigation;
               controlsStructuralHintRejected += pageStructuralHintRejected;
               controlsIconLabelRecovered += pageIconLabelRecovered;
-              let examinedPopups = 0;
-              for (const marker of pagePopupControlMarkers) {
-                if (clickedPopupMarkers.has(marker)) examinedPopups++;
-              }
               // Popups that the click loop actually inspected are not an
-              // unexamined context gap; only the remainder (including
-              // hint-rejected popups that were never clickable) counts.
-              popupTargets += Math.max(0, pagePopupTargets - examinedPopups);
+              // unexamined context gap. Identity tracking keeps a replacement
+              // popup from being cancelled out by an earlier clicked popup,
+              // including when the replacement is hint-rejected.
+              popupTargets += resolveUnexaminedPopupTargets(pagePopupMarkers, examinedPopupMarkers);
               frameCount += pageFrameCount;
               shadowRootCount += pageShadowRootCount;
               baseHrefPresent = baseHrefPresent || pageBaseHrefPresent;
@@ -2440,7 +2504,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                     onClicked: () => { clicks++; },
                   }));
                   if (clickOutcome.ok && control.popup && control.marker && popupWindowsThisClick.size === 0) {
-                    clickedPopupMarkers.add(control.marker);
+                    examinedPopupMarkers.add(control.marker);
                   }
                   return clickOutcome.ok;
                 },
