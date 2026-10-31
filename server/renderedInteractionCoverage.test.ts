@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { DEFAULT_BROWSER_FALLBACK_BUDGET, MAX_RENDERED_CROSS_ORIGIN_ENQUEUES, combineRenderedControlOffsetAdvances, isNavigableOnlyControlWindow, isSameSeedDocument, isUnrecoveredStructuralNavigation, planRenderedCrossOriginEnqueues, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, resolveRenderedCompletionState, runRenderedClickLoop, shouldEnqueueRenderedCrossOriginLink, type RenderedControlEnumeration } from './browserCommunityFallback';
+import { DEFAULT_BROWSER_FALLBACK_BUDGET, MAX_RENDERED_CROSS_ORIGIN_ENQUEUES, combineRenderedControlOffsetAdvances, enqueueRenderedCrossOriginPass, isNavigableOnlyControlWindow, isSameSeedDocument, isUnrecoveredStructuralNavigation, planRenderedCrossOriginEnqueues, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, resolveRenderedCompletionState, runRenderedClickLoop, shouldEnqueueRenderedCrossOriginLink, type RenderedControlEnumeration } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -466,6 +466,58 @@ test('cross-origin planner deduplicates, skips visited, and enforces the cap', (
   assert.equal(plan.alreadyVisited, 1);
   assert.equal(plan.duplicate, 1);
   assert.equal(plan.budget, 2);
+});
+
+test('cross-origin enqueue pass enforces the crawl-wide cap and carries visible text', async () => {
+  const queued = new Set<string>();
+  const batches: string[][] = [];
+  const drops = new Map<string, number>();
+  const run = (candidates: { url: string; text: string }[], currentUrl: string) =>
+    enqueueRenderedCrossOriginPass({
+      collect: async () => candidates,
+      currentUrl,
+      alreadyVisited: new Set(),
+      queued,
+      maxEnqueues: MAX_RENDERED_CROSS_ORIGIN_ENQUEUES - queued.size,
+      enqueue: async urls => { batches.push(urls); },
+      countDrop: (reason, count) => drops.set(reason, (drops.get(reason) || 0) + count),
+    });
+  // An unknown host at `/` is admitted only by its visible community text, so
+  // this also proves the collected label reaches the destination policy.
+  await run([
+    { url: 'https://linktr.ee/creator', text: 'Links' },
+    { url: 'https://community.example/', text: 'Join the private members community' },
+  ], 'https://creator.example/');
+  // The second page repeats one destination, adds a third, then a fourth.
+  // The cap is crawl-wide, so the fourth is never passed to enqueue.
+  await run([
+    { url: 'https://linktr.ee/creator', text: 'Links again' },
+    { url: 'https://linktr.ee/third', text: 'Links' },
+    { url: 'https://linktr.ee/fourth', text: 'Links' },
+    { url: 'https://discord.gg/Abc123', text: 'Discord' },
+  ], 'https://creator.example/page-2');
+  assert.deepEqual(batches, [
+    ['https://linktr.ee/creator', 'https://community.example/'],
+    ['https://linktr.ee/third'],
+  ]);
+  assert.equal(queued.size, 3, 'the crawl-wide queued set stops at three destinations');
+  assert.equal(drops.get('destination-budget'), 1, 'the fourth cross-origin destination is not queued');
+  assert.equal(drops.get('cross-origin-disallowed') ?? 0, 0, 'the Discord invite is silently excluded');
+});
+
+test('Discord destinations do not consume cross-origin budget or policy drops', () => {
+  const plan = planRenderedCrossOriginEnqueues({
+    candidates: [
+      { url: 'https://discord.gg/Abc123', text: 'Discord' },
+      { url: 'https://linktr.ee/creator', text: 'Links' },
+    ],
+    currentUrl: 'https://creator.example/',
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(plan.admitted, ['https://linktr.ee/creator']);
+  assert.equal(plan.disallowed, 0);
+  assert.equal(plan.budget, 0);
 });
 
 test('cross-origin rendered enqueue stays policy- and budget-bounded', () => {

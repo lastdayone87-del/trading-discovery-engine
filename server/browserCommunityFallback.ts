@@ -294,6 +294,15 @@ const DISCORD_DESTINATION_HOSTS = [
   'disboard.org',
 ];
 
+export function isDiscordDestinationUrl(rawUrl: string): boolean {
+  try {
+    const host = new URL(rawUrl).hostname.toLowerCase().replace(/^www\./, '');
+    return DISCORD_DESTINATION_HOSTS.some(entry => host === entry || host.endsWith(`.${entry}`));
+  } catch {
+    return false;
+  }
+}
+
 export const COMMUNITY_HINTS = /discord|community|join|chat|member|membership|vip|group|private|trading.?room|links?|social|contact|about|whop|skool|circle|patreon|premium|paid|subscribe|signals?|mentor|access/i;
 
 /**
@@ -1026,10 +1035,7 @@ export function shouldEnqueueRenderedCrossOriginLink(input: {
     return false;
   }
   if (target.origin === current.origin) return false;
-  const host = target.hostname.toLowerCase().replace(/^www\./, '');
-  if (DISCORD_DESTINATION_HOSTS.some(entry => host === entry || host.endsWith(`.${entry}`))) {
-    return false;
-  }
+  if (isDiscordDestinationUrl(target.toString())) return false;
   return shouldFollowDestination({
     url: target.toString(),
     currentUrl: current.toString(),
@@ -1121,6 +1127,10 @@ export function planRenderedCrossOriginEnqueues(input: {
       plan.disallowed++;
       continue;
     }
+    // Discord destinations are terminal invite evidence retained by the page
+    // scan, not navigation surfaces. Skip them before accounting so they
+    // cannot consume the cross-origin cap or inflate policy-drop telemetry.
+    if (isDiscordDestinationUrl(url)) continue;
     const visitKey = normalizeVisitUrl(url) || url;
     if (input.alreadyVisited.has(visitKey)) {
       plan.alreadyVisited++;
@@ -1146,6 +1156,48 @@ export function planRenderedCrossOriginEnqueues(input: {
     plan.admitted.push(url);
   }
   return plan;
+}
+
+/**
+ * P1.6 enqueue pass. Extracted from the request handler so the crawl-wide cap,
+ * duplicate handling across pages/passes, visible-label plumbing, and the
+ * actual `enqueue` call are exercised without a cross-origin network fixture.
+ * The caller owns the queued set: it must contain every URL already enqueued
+ * by earlier passes, which is what makes the cap crawl-wide.
+ */
+export async function enqueueRenderedCrossOriginPass(input: {
+  collect: () => Promise<RenderedCrossOriginCandidate[]>;
+  currentUrl: string;
+  alreadyVisited: ReadonlySet<string>;
+  queued: Set<string>;
+  maxEnqueues?: number;
+  enqueue: (urls: string[]) => Promise<void>;
+  countDrop: (reason: 'already-visited' | 'destination-budget' | 'cross-origin-disallowed', count: number) => void;
+}): Promise<void> {
+  let candidates: RenderedCrossOriginCandidate[] = [];
+  try {
+    candidates = await input.collect();
+  } catch {
+    // A control may have replaced or detached the document between the click
+    // loop and this pass. Enqueueing nothing is safe; the post-click same-host
+    // pass has already run.
+    return;
+  }
+  const plan = planRenderedCrossOriginEnqueues({
+    candidates,
+    currentUrl: input.currentUrl,
+    alreadyVisited: input.alreadyVisited,
+    queued: input.queued,
+    maxEnqueues: input.maxEnqueues,
+  });
+  if (plan.alreadyVisited) input.countDrop('already-visited', plan.alreadyVisited);
+  if (plan.budget) input.countDrop('destination-budget', plan.budget);
+  if (plan.disallowed) input.countDrop('cross-origin-disallowed', plan.disallowed);
+  if (!plan.admitted.length) return;
+  for (const url of plan.admitted) {
+    input.queued.add(normalizeVisitUrl(url) || url);
+  }
+  await input.enqueue(plan.admitted);
 }
 
 export function isUnrecoveredStructuralNavigation(
@@ -2708,39 +2760,19 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // the two passes are bounded diagnostic noise (≤1 extra pass).
             const enqueueCrossOrigin = async (): Promise<void> => {
               if (!limits.crossOriginEnqueue || Date.now() - startedAt >= limits.totalTimeoutMs) return;
-              let candidates: RenderedCrossOriginCandidate[] = [];
-              try {
+              await enqueueRenderedCrossOriginPass({
                 // Crawlee's enqueueLinks exposes only hrefs to its transform
                 // hook. Collect bounded href+visible-text pairs, filtering
                 // same-origin/non-HTTP(S) anchors before the bound so internal
                 // navigation cannot hide a cross-origin community link.
-                candidates = await page.$$eval(
-                  'a[href]',
-                  collectRenderedCrossOriginCandidates,
-                  page.url(),
-                );
-              } catch {
-                // A control may have replaced or detached the document
-                // between the click loop and this pass. Enqueueing nothing is
-                // safe; the post-click same-host pass has already run.
-                return;
-              }
-              const plan = planRenderedCrossOriginEnqueues({
-                candidates,
+                collect: () => page.$$eval('a[href]', collectRenderedCrossOriginCandidates, page.url()),
                 currentUrl: page.url(),
                 alreadyVisited: alreadyVisitedSet,
                 queued: crossOriginQueued,
                 maxEnqueues: MAX_RENDERED_CROSS_ORIGIN_ENQUEUES - crossOriginQueued.size,
+                enqueue: async urls => { await enqueueLinks({ urls, strategy: 'all' }); },
+                countDrop: (reason, count) => drops.count(reason, count),
               });
-              if (plan.alreadyVisited) drops.count('already-visited', plan.alreadyVisited);
-              if (plan.budget) drops.count('destination-budget', plan.budget);
-              if (plan.disallowed) drops.count('cross-origin-disallowed', plan.disallowed);
-              if (!plan.admitted.length) return;
-              for (const url of plan.admitted) {
-                const visitKey = normalizeVisitUrl(url) || url;
-                crossOriginQueued.add(visitKey);
-              }
-              await enqueueLinks({ urls: plan.admitted, strategy: 'all' });
             };
             if (Date.now() - startedAt < limits.totalTimeoutMs) {
               await enqueueLinks({ strategy: 'same-hostname', transformRequestFunction: req => (admitEnqueueRequest(req.url) ? req : false) });
