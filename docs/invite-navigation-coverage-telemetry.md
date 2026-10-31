@@ -91,10 +91,14 @@ The reason is diagnostic in P0.2. It does not change `complete`, `retryable`,
   counters are refreshed after scrolling and after same-document clicks so
   interaction-revealed frames/shadows are counted, and aggregated on the page
   error path so an enumerated page is never published as zero.
-- Per-page P0.2 counters come from one coherent enumeration snapshot (largest
-  total; first wins ties), so the published denominator, hint-rejected, and
-  structural counts cannot contradict each other. A successfully clicked popup
-  is excluded from the unexamined-context count.
+- The published denominator and hint-rejected count come from one coherent
+  enumeration snapshot (largest total; first wins ties). Structural and
+  icon-label counters are merged observations: a later, smaller snapshot can
+  contribute a control that a click revealed, so they are combined per count
+  rather than constrained to the denominator snapshot. A successfully clicked
+  popup is excluded from the unexamined-context count. Each Crawlee retry
+  replaces its request's previous-attempt observation instead of adding the
+  same request to the crawl totals twice.
 - The persistence boundary (`safeCrawlerTelemetry`) re-sanitizes every field:
   closed taxonomies, positive integers, fixed caps, rendered-only placement.
 - No migration is required; the fields live in the existing
@@ -111,12 +115,18 @@ BEGIN TRANSACTION READ ONLY;
 SET LOCAL statement_timeout = '30s';
 
 -- How much navigation was hidden by the hint filter in the last day?
+-- Guard every JSON counter: a legacy or malformed row must not abort the
+-- whole aggregate, and no matching rows must read as zero rather than NULL.
 SELECT
   count(*) AS rendered_observations,
-  sum((provenance->'crawlerTelemetry'->>'controlsEnumeratedTotal')::int) AS enumerated,
-  sum((provenance->'crawlerTelemetry'->>'controlsHintRejected')::int) AS hint_rejected,
-  sum((provenance->'crawlerTelemetry'->>'controlsStructuralHintRejected')::int) AS structural_hint_rejected,
-  sum((provenance->'crawlerTelemetry'->>'controlsIconLabelRecovered')::int) AS icon_label_recovered
+  coalesce(sum(CASE WHEN (provenance->'crawlerTelemetry'->>'controlsEnumeratedTotal') ~ '^[0-9]+$'
+    THEN (provenance->'crawlerTelemetry'->>'controlsEnumeratedTotal')::bigint ELSE 0 END), 0) AS enumerated,
+  coalesce(sum(CASE WHEN (provenance->'crawlerTelemetry'->>'controlsHintRejected') ~ '^[0-9]+$'
+    THEN (provenance->'crawlerTelemetry'->>'controlsHintRejected')::bigint ELSE 0 END), 0) AS hint_rejected,
+  coalesce(sum(CASE WHEN (provenance->'crawlerTelemetry'->>'controlsStructuralHintRejected') ~ '^[0-9]+$'
+    THEN (provenance->'crawlerTelemetry'->>'controlsStructuralHintRejected')::bigint ELSE 0 END), 0) AS structural_hint_rejected,
+  coalesce(sum(CASE WHEN (provenance->'crawlerTelemetry'->>'controlsIconLabelRecovered') ~ '^[0-9]+$'
+    THEN (provenance->'crawlerTelemetry'->>'controlsIconLabelRecovered')::bigint ELSE 0 END), 0) AS icon_label_recovered
 FROM external_acquisition_observations
 WHERE observed_at > now() - interval '1 day'
   AND provenance->>'surface' = 'CREATOR_WEBSITES'

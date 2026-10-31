@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { combineRenderedControlOffsetAdvances, isNavigableOnlyControlWindow, mergeRenderedCoverageGapCounters, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, resolveRenderedCompletionState, resolveUnexaminedPopupTargets, runRenderedClickLoop, trackRenderedPopupCoverage, type RenderedControlEnumeration } from './browserCommunityFallback';
+import { combineRenderedControlOffsetAdvances, isNavigableOnlyControlWindow, mergeRenderedCoverageGapCounters, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, renderedRequestControlTotalsDelta, resolveRenderedCompletionState, resolveUnexaminedPopupTargets, runRenderedClickLoop, trackRenderedPopupCoverage, type RenderedControlEnumeration, type RenderedRequestControlTotals } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -469,7 +469,10 @@ test('P0.2 coverage counters stay coherent, bounded, and preserved on error path
   assert.match(source, /if \(pageCountersAggregated\) return;/, 'the error and success aggregations cannot double-count a page');
   assert.match(source, /await recordPageContext\(\);\s*\/\/ Page-end aggregation/, 'context counters refresh after the click loop');
   assert.match(source, /pagePopupMarkers = trackRenderedPopupCoverage\(pagePopupMarkers, enumeration\)/, 'popup identities are tracked across every enumeration');
-  assert.match(source, /popupTargets \+= resolveUnexaminedPopupTargets\(pagePopupMarkers, examinedPopupMarkers\)/, 'only popups actually examined are excluded; a replacement cannot be cancelled by an earlier click');
+  assert.match(source, /popupCount: resolveUnexaminedPopupTargets\(pagePopupMarkers, examinedPopupMarkers\)/, 'only popups actually examined are excluded; a replacement cannot be cancelled by an earlier click');
+  assert.match(source, /popupTargets \+= delta\.popupCount/, 'the same-request retry delta adjusts the popup contribution');
+  assert.match(source, /pageControlTotalsByRequest\.set\(requestKey, current\)/, 'a retried request replaces its last-attempt counters');
+  assert.match(source, /if \(pageClickWindowPending\) evidenceControlsUncertified = true;/, 'a thrown handler certifies a pending click window before Crawlee retries');
   assert.match(source, /document\.getElementsByTagName\(frameTags\[tagIndex\]\)/, 'frame counting uses live collections instead of materializing every match');
   assert.doesNotMatch(source, /querySelectorAll\('iframe,frame,object,embed'\)/, 'the unbounded materializing frame query is gone');
   assert.match(source, /const labelText = `\$\{element\.innerText \|\| ''\} \$\{ariaLabel\}`/, 'structural classification uses only the control own visible text and aria-label');
@@ -518,12 +521,45 @@ test('popup coverage tracks identities so a replacement cannot be cancelled by a
   );
 });
 
+test('a retried request replaces its previous-attempt counters instead of double counting', () => {
+  const attempt = (enumerated: number, popupCount: number): RenderedRequestControlTotals => ({
+    enumerated,
+    hintRejected: 1,
+    structuralNavigation: 2,
+    structuralHintRejected: 1,
+    iconLabelRecovered: 1,
+    popupCount,
+    frameCount: 1,
+    shadowRootCount: 1,
+    baseHrefPresent: false,
+  });
+  const first = renderedRequestControlTotalsDelta(undefined, attempt(5, 2));
+  assert.equal(first.enumerated, 5, 'the first attempt contributes its full observation');
+  assert.equal(first.popupCount, 2);
+
+  const retry = renderedRequestControlTotalsDelta(attempt(5, 2), attempt(5, 2));
+  assert.deepEqual(retry, {
+    enumerated: 0,
+    hintRejected: 0,
+    structuralNavigation: 0,
+    structuralHintRejected: 0,
+    iconLabelRecovered: 0,
+    popupCount: 0,
+    frameCount: 0,
+    shadowRootCount: 0,
+  }, 'an identical retry adds nothing to crawl totals');
+
+  const changed = renderedRequestControlTotalsDelta(attempt(5, 2), attempt(7, 1));
+  assert.equal(changed.enumerated, 2, 'only the latest attempt delta is added');
+  assert.equal(changed.popupCount, -1, 'an examined popup adjusts the previous contribution downward');
+});
+
 test('popup coverage counts each popup once and keeps window-opening popups unexamined', () => {
   let tracked = new Set<string>();
   // The same static popup is observed on every scroll/enumeration pass.
   tracked = trackRenderedPopupCoverage(tracked, { popupMarkers: ['popup-a'] });
   tracked = trackRenderedPopupCoverage(tracked, { popupMarkers: ['popup-a'] });
-  assert.equal(resolveUnexaminedPopupTargets(tracked, new Set()), 1, 're-observation does not inflate the count');
+  assert.equal(tracked.size, 1, 're-observation does not duplicate the popup identity');
   assert.equal(
     resolveUnexaminedPopupTargets(tracked, new Set()),
     1,

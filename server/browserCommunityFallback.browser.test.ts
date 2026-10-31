@@ -203,7 +203,7 @@ test('real DOM: control 65 is reachable after rotating the full 70-control pool'
   });
 });
 
-test('real DOM: structural classification uses visible text and aria-label only', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+test('real DOM: structural classification accepts titles, labelledby references, roles, and menu containers', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
   const html = `<!doctype html><html><head><title>label fixture</title></head><body>
     <a href="/support" title="Site menu">Support</a>
     <button aria-labelledby="menu-heading"><span aria-hidden="true">≡</span></button>

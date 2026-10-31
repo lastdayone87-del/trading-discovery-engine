@@ -639,6 +639,39 @@ export function mergeRenderedCoverageGapCounters(
   };
 }
 
+export interface RenderedRequestControlTotals {
+  enumerated: number;
+  hintRejected: number;
+  structuralNavigation: number;
+  structuralHintRejected: number;
+  iconLabelRecovered: number;
+  popupCount: number;
+  frameCount: number;
+  shadowRootCount: number;
+  baseHrefPresent: boolean;
+}
+
+/**
+ * Difference between two attempts of the same request. Crawlee retries a
+ * thrown request with fresh page-local counters, so the crawl totals must add
+ * only the delta from the latest attempt instead of the whole attempt again.
+ */
+export function renderedRequestControlTotalsDelta(
+  previous: RenderedRequestControlTotals | undefined,
+  current: RenderedRequestControlTotals,
+): Omit<RenderedRequestControlTotals, 'baseHrefPresent'> {
+  return {
+    enumerated: current.enumerated - (previous?.enumerated || 0),
+    hintRejected: current.hintRejected - (previous?.hintRejected || 0),
+    structuralNavigation: current.structuralNavigation - (previous?.structuralNavigation || 0),
+    structuralHintRejected: current.structuralHintRejected - (previous?.structuralHintRejected || 0),
+    iconLabelRecovered: current.iconLabelRecovered - (previous?.iconLabelRecovered || 0),
+    popupCount: current.popupCount - (previous?.popupCount || 0),
+    frameCount: current.frameCount - (previous?.frameCount || 0),
+    shadowRootCount: current.shadowRootCount - (previous?.shadowRootCount || 0),
+  };
+}
+
 /**
  * Popup coverage is identity-based, not count-based. A popup that is clicked
  * inline has been examined; a popup that opened a new window has not. Tracking
@@ -729,11 +762,18 @@ export function enumerateRenderedControlNodes(
     let labelledByText = '';
     const labelledBy = element.getAttribute('aria-labelledby') || '';
     if (labelledBy) {
-      const ids = labelledBy.split(/\s+/);
+      // Bounded label recovery: a hostile page can name thousands of
+      // references or point at a huge element, so cap both the referenced
+      // elements and the text collected per control.
+      const ids = labelledBy.split(/\s+/).slice(0, 16);
       for (let labelIndex = 0; labelIndex < ids.length; labelIndex++) {
-        if (!ids[labelIndex]) continue;
+        if (!ids[labelIndex] || labelledByText.length >= 200) continue;
         const labelNode = document.getElementById(ids[labelIndex]);
-        if (labelNode && labelNode.textContent) labelledByText += ` ${labelNode.textContent}`;
+        const text = labelNode?.textContent || '';
+        const remaining = 200 - labelledByText.length;
+        if (text && remaining > 0) {
+          labelledByText += ` ${text.length > remaining ? text.slice(0, remaining) : text}`;
+        }
       }
     }
     let childAlt = '';
@@ -2000,6 +2040,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   let controlsStructuralNavigation = 0;
   let controlsStructuralHintRejected = 0;
   let controlsIconLabelRecovered = 0;
+  // Crawlee retries a thrown request with a fresh page and fresh page-local
+  // counters. Keep the last attempt's contribution per request so a retry
+  // replaces it instead of adding the same request to crawl totals twice.
+  const pageControlTotalsByRequest = new Map<string, RenderedRequestControlTotals>();
   let popupTargets = 0;
   let frameCount = 0;
   let shadowRootCount = 0;
@@ -2363,19 +2407,34 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             const aggregatePageControlCounters = (): void => {
               if (pageCountersAggregated) return;
               pageCountersAggregated = true;
-              controlsEnumeratedTotal += pageControlsEnumeratedTotal;
-              controlsHintRejected += pageHintRejected;
-              controlsStructuralNavigation += pageStructuralNavigation;
-              controlsStructuralHintRejected += pageStructuralHintRejected;
-              controlsIconLabelRecovered += pageIconLabelRecovered;
+              const requestKey = request.url;
+              const previous = pageControlTotalsByRequest.get(requestKey);
               // Popups that the click loop actually inspected are not an
               // unexamined context gap. Identity tracking keeps a replacement
               // popup from being cancelled out by an earlier clicked popup,
               // including when the replacement is hint-rejected.
-              popupTargets += resolveUnexaminedPopupTargets(pagePopupMarkers, examinedPopupMarkers);
-              frameCount += pageFrameCount;
-              shadowRootCount += pageShadowRootCount;
-              baseHrefPresent = baseHrefPresent || pageBaseHrefPresent;
+              const current = {
+                enumerated: pageControlsEnumeratedTotal,
+                hintRejected: pageHintRejected,
+                structuralNavigation: pageStructuralNavigation,
+                structuralHintRejected: pageStructuralHintRejected,
+                iconLabelRecovered: pageIconLabelRecovered,
+                popupCount: resolveUnexaminedPopupTargets(pagePopupMarkers, examinedPopupMarkers),
+                frameCount: pageFrameCount,
+                shadowRootCount: pageShadowRootCount,
+                baseHrefPresent: pageBaseHrefPresent,
+              };
+              pageControlTotalsByRequest.set(requestKey, current);
+              const delta = renderedRequestControlTotalsDelta(previous, current);
+              controlsEnumeratedTotal += delta.enumerated;
+              controlsHintRejected += delta.hintRejected;
+              controlsStructuralNavigation += delta.structuralNavigation;
+              controlsStructuralHintRejected += delta.structuralHintRejected;
+              controlsIconLabelRecovered += delta.iconLabelRecovered;
+              popupTargets += delta.popupCount;
+              frameCount += delta.frameCount;
+              shadowRootCount += delta.shadowRootCount;
+              baseHrefPresent = baseHrefPresent || current.baseHrefPresent;
             };
             aggregatePageCountersOnError = aggregatePageControlCounters;
 
@@ -2596,8 +2655,15 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             } catch (attemptError) {
               // Preserve P0.2 counts for a page that was already enumerated
               // before a later enqueue/click throw. The aggregation is
-              // idempotent, so a normal-path page cannot be counted twice.
+              // idempotent per attempt, and the per-request replacement above
+              // makes a Crawlee retry overwrite this attempt instead of
+              // counting it twice.
               aggregatePageCountersOnError?.();
+              // Crawlee retries a thrown handler with a fresh page. If the
+              // click window was still pending, that attempt did not examine
+              // its controls; the crawl-wide catch may never run when a retry
+              // later succeeds, so certify the gap here.
+              if (pageClickWindowPending) evidenceControlsUncertified = true;
               // Release only the failed page; Crawlee still classifies the
               // original error and retries with a fresh page per
               // maxRequestRetries/maxSessionRotations. The close is
