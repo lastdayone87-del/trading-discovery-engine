@@ -140,14 +140,18 @@ usually an error page, and scanning it can produce stale or soft-404 invites.
 
 ## 10. `pinnedComment`
 
-**Confirmed behavior:** `pinnedComment` is passed into `runChannelInspection`
-but never used for invite extraction; there is no persisted column/table and 0
-job payloads mention it.
+**Confirmed behavior:** `pinnedComment` is harvested into the canonical
+evidence plane as a `PINNED_COMMENT` document (`server/discovery/evidenceExtraction.ts`
+and `server/evidenceEngine/documentProjection.ts`), but it is never used for
+invite extraction and has no invite-extraction mapping or provenance. There is
+no dedicated persisted column for it and 0 job payloads reference it as an
+invite source.
 
 **Evidence:** dormant in the observed population.
 
-**Why not changed:** no population to recover. Implementing it requires a
-provenance and persistence decision, not just extraction.
+**Why not changed:** there is no population to recover, and closing the gap
+needs an invite-extraction mapping/provenance decision for the already-persisted
+document, not new persistence.
 
 ## 11. Encoded invite-code alphabet beyond `%2D`
 

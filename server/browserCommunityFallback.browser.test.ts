@@ -190,7 +190,14 @@ test('real DOM: control 65 is reachable after rotating the full 70-control pool'
 
     await page.locator(`[data-oc-control="${retryWindow.toClick[0].marker}"]`).click();
     assert.equal(await page.locator('a[href="https://discord.gg/revealed-room"]').count(), 1);
-    const candidates = extractDiscordCandidates(await page.content(), 'CREATOR_WEBSITES', page.url());
+    // Scan the revealed fragment, not `page.content()`: the fixture's inline
+    // handler already contains the invite URL, so a whole-document scan would
+    // pass even if the click had revealed nothing.
+    const candidates = extractDiscordCandidates(
+      await page.locator('#revealed').innerHTML(),
+      'CREATOR_WEBSITES',
+      page.url(),
+    );
     assert.equal(candidates[0]?.nativeInviteCode, 'revealed-room');
   });
 });

@@ -291,4 +291,45 @@ maybe('recently confirmed invites are ordered, filtered, paginated, and backfill
   assert.equal(byCandidate.get('candidate-failureonly'), null);
 });
 
+maybe('last-verified correlates with the served invite, including association-promoted attempts', async t => {
+  const db = await getDb();
+  const suffix = `${Date.now()}_${process.pid}`;
+  const channelId = `${PREFIX}last-verified-${suffix}`;
+  const cleanup = async () => {
+    await db.query(`DELETE FROM channels WHERE channel_id=$1`, [channelId]).catch(() => undefined);
+  };
+  await cleanup();
+  t.after(cleanup);
+  const code = `lv${suffix.replace(/[^a-z0-9]/gi, '').toLowerCase()}`;
+  const served = `https://discord.gg/${code}`;
+  const other = `https://discord.gg/other${code}`;
+  await db.query(
+    `INSERT INTO channels(
+      channel_id,channel_name,youtube_url,country,country_status,discord_status,discord_invite,
+      discord_candidate_id,discord_candidate_locator,scan_status,discovery_source,first_seen,
+      trading_status,subscriber_count,discord_validation_status,discord_liveness_status,
+      discord_discovery_status,discord_relevance_status
+    ) VALUES($1,$2,$3,'Germany','CONFIRMED','ACTIVE',$4,'candidate-other',$5,'COMPLETED','automated_query',now(),
+      'TRADING_CONFIRMED','1000','COMPLETED','ACTIVE','VALIDATED','TRADING_RELEVANT')`,
+    [channelId, channelId, `https://youtube.test/${channelId}`, served, other],
+  );
+  // A newer successful attempt for a candidate the row no longer serves must
+  // not donate its timestamp to the retained invite.
+  await appendDiscordCheckAttempts(channelId, other, 'ACTIVE', [{
+    attemptNumber: 1, operationalOutcome: 'SUCCEEDED', retryable: false, reason: 'ok', checkedAt: '2026-10-03T00:00:00.000Z',
+  }], { candidateId: 'candidate-other', resolvedLocator: other, locatorType: 'NATIVE_INVITE' });
+  // The served invite was validated as an association-promoted UNCERTAIN
+  // attempt (no serving invite at attempt time) and serves as ACTIVE.
+  await appendDiscordCheckAttempts(channelId, served, 'UNCERTAIN', [{
+    attemptNumber: 1, operationalOutcome: 'SUCCEEDED', retryable: false, reason: 'sparse metadata', checkedAt: '2026-10-02T00:00:00.000Z',
+  }], { candidateId: `candidate-served`, resolvedLocator: served, locatorType: 'NATIVE_INVITE' });
+
+  const row = await getChannelById(channelId);
+  assert.equal(
+    row?.discord_invite_last_verified_at,
+    '2026-10-02T00:00:00.000Z',
+    'the served invite supplies the timestamp, not a newer attempt for another candidate',
+  );
+});
+
 after(async () => { if (enabled) (await getDb()).end(); });

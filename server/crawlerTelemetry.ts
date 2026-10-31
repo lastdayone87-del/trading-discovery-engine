@@ -536,6 +536,12 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
   const candidate = input as Partial<CrawlerTelemetry>;
   if (candidate.mode !== 'STATIC' && candidate.mode !== 'RENDERED') return undefined;
   const number = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+  // Established persisted-counter ceiling (same bound as drop reasons, scrolls,
+  // and experiment attribution). The control offset indexes the rotated
+  // 64-control evaluation window, so a larger persisted value is malformed.
+  const MAX_TELEMETRY_COUNTER = 999999;
+  const MAX_EVIDENCE_CONTROL_OFFSET = 64;
+  const boundedCount = (value: unknown) => Math.min(MAX_TELEMETRY_COUNTER, number(value));
   // Bounded sanitized string: collapsed whitespace, capped length. Non-string
   // input yields undefined so malformed persisted rows cannot smuggle text.
   const text = (value: unknown, max: number): string | undefined => {
@@ -585,16 +591,16 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
     rateLimitedRequests: number(candidate.rateLimitedRequests),
     hostBackoffsApplied: number(candidate.hostBackoffsApplied),
     ...(candidate.mode === 'RENDERED' && number(candidate.evidenceControlsTotal) > 0
-      ? { evidenceControlsTotal: number(candidate.evidenceControlsTotal) }
+      ? { evidenceControlsTotal: boundedCount(candidate.evidenceControlsTotal) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.evidenceControlsClicked) > 0
-      ? { evidenceControlsClicked: number(candidate.evidenceControlsClicked) }
+      ? { evidenceControlsClicked: boundedCount(candidate.evidenceControlsClicked) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.evidenceControlsFailed) > 0
-      ? { evidenceControlsFailed: number(candidate.evidenceControlsFailed) }
+      ? { evidenceControlsFailed: boundedCount(candidate.evidenceControlsFailed) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.evidenceControlsSkipped) > 0
-      ? { evidenceControlsSkipped: number(candidate.evidenceControlsSkipped) }
+      ? { evidenceControlsSkipped: boundedCount(candidate.evidenceControlsSkipped) }
       : {}),
     ...(candidate.mode === 'RENDERED' && (candidate as { evidenceControlsNavigableOnly?: unknown }).evidenceControlsNavigableOnly === true
       ? { evidenceControlsNavigableOnly: true }
@@ -603,7 +609,7 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
       ? { evidenceControlsUncertified: true }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.evidenceControlsOffsetAdvance) > 0
-      ? { evidenceControlsOffsetAdvance: number(candidate.evidenceControlsOffsetAdvance) }
+      ? { evidenceControlsOffsetAdvance: Math.min(MAX_EVIDENCE_CONTROL_OFFSET, boundedCount(candidate.evidenceControlsOffsetAdvance)) }
       : {}),
     ...(isRenderedLifecycleStage(stage) ? { lastLifecycleStage: stage } : {}),
     ...(isRenderedZeroPageReason(reason) ? { zeroPageReason: reason } : {}),

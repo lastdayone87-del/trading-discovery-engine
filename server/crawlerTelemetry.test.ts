@@ -150,6 +150,20 @@ test('safe telemetry round-trips bounded control-offset advances', () => {
   assert.equal(zero?.evidenceControlsOffsetAdvance, undefined, 'a zero advance is sparse, not a stored zero');
   const negative = safeCrawlerTelemetry({ mode: 'RENDERED', pagesInspected: 1, evidenceControlsOffsetAdvance: -4 });
   assert.equal(negative?.evidenceControlsOffsetAdvance, undefined, 'negative advances are dropped');
+  const oversized = safeCrawlerTelemetry({
+    mode: 'RENDERED',
+    pagesInspected: 1,
+    evidenceControlsTotal: Number.MAX_SAFE_INTEGER,
+    evidenceControlsClicked: 1e12,
+    evidenceControlsFailed: 1e12,
+    evidenceControlsSkipped: 1e12,
+    evidenceControlsOffsetAdvance: 10_000,
+  });
+  assert.equal(oversized?.evidenceControlsTotal, 999999, 'aggregate control counts use the persisted counter bound');
+  assert.equal(oversized?.evidenceControlsClicked, 999999);
+  assert.equal(oversized?.evidenceControlsFailed, 999999);
+  assert.equal(oversized?.evidenceControlsSkipped, 999999);
+  assert.equal(oversized?.evidenceControlsOffsetAdvance, 64, 'the offset cannot index past the 64-control evaluation window');
   const staticRow = safeCrawlerTelemetry({ mode: 'STATIC', pagesInspected: 1, evidenceControlsOffsetAdvance: 8, evidenceControlsUncertified: true });
   assert.equal(staticRow?.evidenceControlsOffsetAdvance, undefined, 'control offsets are rendered-only');
   assert.equal(staticRow?.evidenceControlsUncertified, undefined, 'uncertified control windows are rendered-only');

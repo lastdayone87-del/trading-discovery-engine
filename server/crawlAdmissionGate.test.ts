@@ -147,6 +147,13 @@ test('R6: valid dotted trading and community domains remain eligible', () => {
     'https://g.co/',
     'https://takeprofittrader.com/?referralCode=BRANDON',
     'https://oiltradingacademy.com/day-trading-guide',
+    // Encoded spaces are ordinary slug separators, not a script declaration.
+    'https://creator.example.com/Let%20Me%20Trade',
+    'https://creator.example.com/learn/let%20me%20trade',
+    // A directory named `images` can still hold an HTML community page.
+    'https://creator.example.com/images/community',
+    // Only the Cloudinary delivery host is asset-only.
+    'https://cloudinary.com/documentation',
   ]) {
     assert.deepEqual(assessCrawlAdmission(raw), { eligible: true, reasonCode: 'ELIGIBLE' }, raw);
     assert.ok(normalizeExternalUrl(raw), `normalize must admit: ${raw}`);
@@ -215,6 +222,9 @@ test('R6: asset and resource URLs are rejected on every admission path', async (
 test('R6: non-page and malformed URL noise is rejected before fetch or enqueue', async () => {
   const cases: Array<[string, string]> = [
     ['https://takeprofittrader.com/%7B%7Blink%7D%7D', 'MALFORMED_URL'],
+    // A malformed escape must not shield the well-formed artifacts around it.
+    ['https://takeprofittrader.com/%7B%7Blink%7D%7D%ZZ', 'MALFORMED_URL'],
+    ['https://creator.example.com/%76ar%20x=1', 'MALFORMED_URL'],
     ['https://creator.example.com/${link}', 'MALFORMED_URL'],
     ['https://hftcode.com/d,a.onload=function()%7Bthis.media=%22all%22...', 'MALFORMED_URL'],
     ['https://www.tradingview.com/social-network/%22%22;', 'MALFORMED_URL'],
@@ -228,7 +238,8 @@ test('R6: non-page and malformed URL noise is rejected before fetch or enqueue',
     ['https://fundednext.com/images/join-community/discord-card.png&w=1920&q=75%22/', 'RESOURCE_EXTENSION'],
     ['https://creator.example.com/card.avif', 'RESOURCE_EXTENSION'],
     ['https://creator.example.com/img.png?w=100', 'RESOURCE_EXTENSION'],
-    ['https://linktr.ee/images/creator/avatar', 'NON_PAGE_PATH'],
+    ['https://linktr.ee/images', 'NON_PAGE_PATH'],
+    ['https://linktr.ee/images/', 'NON_PAGE_PATH'],
     ['https://scontent-lhr8-1.xx.fbcdn.net/v/t1.6435-9/abc.jpg', 'ASSET_HOST'],
     ['https://res.cloudinary.com/demo/image/upload/sample.jpg', 'ASSET_HOST'],
     ['https://i0.wp.com/example.com/image.png', 'ASSET_HOST'],

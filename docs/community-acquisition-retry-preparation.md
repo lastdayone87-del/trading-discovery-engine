@@ -1,8 +1,9 @@
 # Community acquisition retry — implemented filter and prepared improvements
 
 **Date:** 2026-10-27
-**Scope:** Remediation of the approved retry/acquisition items from
-`INVITE_EXTRACTION_CONSOLIDATED_REPORT_20261027.md` §3 and §5.
+**Scope:** Remediation of the approved retry/acquisition items for invite
+discovery. The originating consolidated report is not stored in this
+repository; each claim below is verified by the in-repo code and tests it names.
 **Status:** Non-page/malformed URL filter implemented. Host-aware policy,
 long-attempt cap, and queue re-dating are investigation/preparation only. No
 concurrency, queue, budget, or setting change is included.
@@ -16,7 +17,7 @@ the shared `assessCrawlAdmission` boundary, before fetch or enqueue:
 |---|---|---|
 | `MALFORMED_URL` | Template placeholders, script/quote artifacts, control characters, embedded JS | `/%7B%7Blink%7D%7D`, `${link}`, `d,a.onload=function()%7B...`, `/%22%22;` |
 | `RESOURCE_EXTENSION` | Image, video, audio, font, script, archive, and executable suffixes, including encoded forms and transform parameters | `card.png&w=1920&q=75`, `app%2Ejs`, `hero.avif`, `clip.webm` |
-| `NON_PAGE_PATH` | Segment-anchored image/thumbnail/avatar directories | `/images/join-community/...`, `/thumbnails/...` |
+| `NON_PAGE_PATH` | A bare image/thumbnail/avatar directory root (deeper paths can be real community pages, so they stay eligible) | `/images`, `/images/`, `/thumbnails` |
 | `ASSET_HOST` | Hosts that can only serve page assets (YouTube/Meta/Twitter image CDNs, image proxies, code CDNs) | `fbcdn.net`, `cdninstagram.com`, `twimg.com`, `res.cloudinary.com`, `i0.wp.com`, `cdn.jsdelivr.net` |
 
 Deliberate exclusions from the filter:
@@ -31,8 +32,9 @@ Deliberate exclusions from the filter:
   dot-named path segments (`/projects/three.js/community`,
   `/topics/vue.js/discord`) do not match the resource-extension rule;
 - script keywords alone are not malformed: `/files/document.pdf`,
-  `/window.html`, `/let-s-trade-community`, and `/function/community` stay
-  eligible; rejection requires actual declaration/call/assignment syntax.
+  `/window.html`, `/let-s-trade-community`, `/Let%20Me%20Trade`, and
+  `/function/community` stay eligible; rejection requires actual
+  declaration/call/assignment syntax.
 
 ### Regression coverage
 

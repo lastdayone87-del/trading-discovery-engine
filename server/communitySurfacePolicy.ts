@@ -336,7 +336,10 @@ const NON_PAGE_ASSET_CDN_HOSTS = [
   'twimg.com',
   'ggpht.com',
   'googleusercontent.com',
-  'cloudinary.com',
+  // Only the media-delivery host is asset-only. `cloudinary.com` itself serves
+  // HTML (marketing/docs), so a host-suffix match on the parent would drop
+  // real pages and every unrelated subdomain before crawling.
+  'res.cloudinary.com',
   'imgix.net',
   'weserv.nl',
   'wsrv.nl',
@@ -429,10 +432,12 @@ export interface CrawlAdmissionDecision {
 // because the following character is not a delimiter.
 const RESOURCE_PATH_EXTENSION = /\.(?:js|mjs|css|map|png|jpe?g|gif|webp|svg|avif|apng|bmp|tiff?|heic|jfif|ico|woff2?|ttf|otf|eot|mp4|m4v|webm|mp3|m4a|aac|flac|wav|ogg|opus|avi|mov|3gp|zip|gz|rar|7z|exe|dmg)(?=$|[&%?"'#\s])/i;
 
-// Image/thumbnail directories are asset trees, not HTML pages. Matching is
-// segment-anchored (`/images/`, not `images-and-media`) so ordinary page slugs
-// stay eligible.
-const NON_PAGE_PATH_PREFIX = /^\/(?:images?|img|thumbnails?|thumbs?|avatars?|icons?|photos?)\//i;
+// A bare image/thumbnail directory root is an asset tree, not an HTML page.
+// Deeper paths are NOT rejected on the directory name alone: `/images/community`
+// can be a real community page, and dropping it before the fetch is a recall
+// loss that outweighs the crawl cost of an extensionless asset. Asset files
+// below the directory are still caught by RESOURCE_PATH_EXTENSION.
+const NON_PAGE_ASSET_DIRECTORY_ROOT = /^\/(?:images?|img|thumbnails?|thumbs?|avatars?|icons?|photos?)\/?$/i;
 
 // Template placeholders and script/quote artifacts emitted by indiscriminate
 // dynamic-attribute extraction (`{{link}}`, `${link}`, `%22%22;`,
@@ -442,9 +447,11 @@ const NON_PAGE_PATH_PREFIX = /^\/(?:images?|img|thumbnails?|thumbs?|avatars?|ico
 // keywords alone are NOT evidence: a path may legitimately contain
 // `/files/document.pdf`, `/window.html`, `/let-s-trade-community`, or
 // `/function/community`. Declarations therefore need keyword + whitespace +
-// identifier, functions need a call/named-function form, and DOM globals need
-// a property followed by assignment/call syntax.
-const MALFORMED_PATH = /[{}"<>\\\u0000-\u001F\u007F]|(?:^|[\/,;])(?:var|let|const)\s+[A-Za-z_$]|(?:^|[\/,;])function\s*(?:\(|[A-Za-z_$][\w$]*\s*\()|\.(?:onload|onerror|onclick)\s*=|(?:^|[\/,;])(?:this|document|window)(?:\.[A-Za-z_$][\w$]*){1,4}\s*[=(]/i;
+// identifier + a declaration terminator (`=`, `;`, or end), which keeps an
+// ordinary encoded slug such as `/Let%20Me%20Trade` (decoded `Let Me Trade`)
+// eligible. Functions need a call/named-function form, and DOM globals need a
+// property followed by assignment/call syntax.
+const MALFORMED_PATH = /[{}"<>\\\u0000-\u001F\u007F]|(?:^|[\/,;])(?:var|let|const)\s+[A-Za-z_$][\w$]*\s*(?:=|;|$)|(?:^|[\/,;])function\s*(?:\(|[A-Za-z_$][\w$]*\s*\()|\.(?:onload|onerror|onclick)\s*=|(?:^|[\/,;])(?:this|document|window)(?:\.[A-Za-z_$][\w$]*){1,4}\s*[=(]/i;
 
 export function assessCrawlAdmission(rawUrl: string): CrawlAdmissionDecision {
   // Same scheme handling as `normalizeExternalUrl`: scheme-less input gets
@@ -496,7 +503,7 @@ export function assessCrawlAdmission(rawUrl: string): CrawlAdmissionDecision {
   if (RESOURCE_PATH_EXTENSION.test(decodedPath)) {
     return { eligible: false, reasonCode: 'RESOURCE_EXTENSION' };
   }
-  if (NON_PAGE_PATH_PREFIX.test(decodedPath)) {
+  if (NON_PAGE_ASSET_DIRECTORY_ROOT.test(decodedPath)) {
     return { eligible: false, reasonCode: 'NON_PAGE_PATH' };
   }
   if (MALFORMED_PATH.test(decodedPath)) {
@@ -521,6 +528,13 @@ function decodeResourcePathname(pathname: string): string {
       if (decoded === current) break;
       current = decoded;
     } catch {
+      // A single malformed escape must not disable decoding for the
+      // well-formed escapes around it: `/%7B%7Blink%7D%7D%ZZ` would otherwise
+      // keep its encoded braces and bypass the artifact check. Decode the
+      // valid runs and leave the malformed escape literal.
+      current = current.replace(/(?:%[0-9a-fA-F]{2})+/g, run => {
+        try { return decodeURIComponent(run); } catch { return run; }
+      });
       break;
     }
   }

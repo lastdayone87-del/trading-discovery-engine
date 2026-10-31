@@ -70,8 +70,17 @@ maybe('classification-only upserts never overwrite a newer Discord projection', 
   assert.equal(live?.discord_status, 'ACTIVE');
   assert.equal(live?.discord_invite, 'https://discord.gg/newroom');
 
-  // Plain callers keep the historical full-row write semantics.
+  // A plain caller carrying a stale DEAD snapshot cannot clear the newer live
+  // projection either: its terminal status may predate the validation that
+  // just committed. Only the authoritative validation write or explicit
+  // cleanup owns that transition.
   await upsertChannel({ ...stale, discord_status: 'DEAD', discord_invite: null });
+  const retained = await getChannelById(channelId);
+  assert.equal(retained?.discord_status, 'ACTIVE');
+  assert.equal(retained?.discord_invite, 'https://discord.gg/newroom');
+
+  // Explicit intentional cleanup still applies the terminal projection.
+  await upsertChannel({ ...stale, discord_status: 'DEAD', discord_invite: null }, { allowDiscordClear: true });
   const overwritten = await getChannelById(channelId);
   assert.equal(overwritten?.discord_status, 'DEAD');
   assert.equal(overwritten?.discord_invite, null);

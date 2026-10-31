@@ -53,12 +53,13 @@ test('creator ownership remains authoritative when both candidates are genuinely
   assert.ok(discordCandidateCompositeRank(creator,creatorActive)>discordCandidateCompositeRank(partner,partnerActive));
 });
 
-test('ambiguous success still outranks an operationally unavailable candidate',()=>{
+test('ambiguous success still outranks an operationally unavailable result for the same candidate',()=>{
   const creator=mergeDiscordCandidates(extractDiscordCandidates('https://discord.gg/creator','YOUTUBE_ABOUT','https://youtube.test/channel'))[0];
-  const partner=mergeDiscordCandidates(extractDiscordCandidates('https://discord.gg/partner','CREATOR_WEBSITES','https://broker.test/referral/creator'))[0];
   const creatorAmbiguous={operationalOutcome:'SUCCEEDED',relevanceStatus:'UNCERTAIN',status:'UNCERTAIN',inviteUrl:null};
-  const partnerTimeout={operationalOutcome:'TIMEOUT',relevanceStatus:'NOT_CHECKED',status:'UNCERTAIN'};
-  assert.ok(discordCandidateCompositeRank(creator,creatorAmbiguous)>discordCandidateCompositeRank(partner,partnerTimeout));
+  const creatorTimeout={operationalOutcome:'TIMEOUT',relevanceStatus:'NOT_CHECKED',status:'UNCERTAIN'};
+  // Hold candidate ownership constant so this isolates validation ranking; a
+  // third-party candidate would already lose on ownership alone.
+  assert.ok(discordCandidateCompositeRank(creator,creatorAmbiguous)>discordCandidateCompositeRank(creator,creatorTimeout));
 });
 
 test('usable requires a serving status and a non-null invite when supplied',()=>{

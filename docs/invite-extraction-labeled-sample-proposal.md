@@ -46,18 +46,23 @@ represented.
 |---|---|---:|
 | A. Static found | Static inspection `FOUND` with a serving invite | 60 |
 | B. Rendered found | Rendered fallback `FOUND` after static miss | 60 |
-| C. Partial | `PARTIALLY_INSPECTED` with a required gap | 50 |
+| C. Partial | `PARTIALLY_INSPECTED` with a required gap and no `FOUND` | 50 |
 | D. 403 (primary) | Latest 7d contains 403 and no `FOUND`; 403 takes precedence over 404/406 | 40 |
 | E. 404 (no 403) | Latest 7d contains 404, no `FOUND`, and no 403 | 40 |
 | F. 406 (no 403/404) | Latest 7d contains 406, no `FOUND`, and no 403/404 | 20 |
 | G. No observation | Eligible surface never successfully inspected | 30 |
 | **Total** | | **300** |
 
-Strata are disjoint: a channel with several 4xx classes is assigned once by
-precedence 403 → 404 → 406, so no channel is counted twice. A channel whose
-only 4xx status is, for example, 410 does not match D–F and belongs in G (no
-successful inspection) or outside the frame if it has another eligible
-observation.
+Strata are disjoint. A channel with several candidate URLs (for example one
+static hit and one rendered hit) is assigned to exactly one stratum by a single
+precedence evaluated at the frozen snapshot: **A → B → C → D → E → F → G**.
+`FOUND` always outranks `PARTIALLY_INSPECTED`, so a partial acquisition that
+also found an invite is A or B, never C, and C requires no `FOUND`. Within the
+4xx group a channel with several classes is assigned once by precedence
+403 → 404 → 406, so no channel is counted twice. A channel whose only 4xx
+status is, for example, 410 does not match D–F and belongs in G (no successful
+inspection) or outside the frame if it has another eligible observation. Store
+the assigned stratum, and the rule that produced it, in the manifest.
 
 If the frame cannot fill a stratum, reallocate proportionally and document the
 shortfall. Do not silently substitute a different class.
@@ -82,9 +87,11 @@ Report Cohen's κ and the adjudication rate.
 
 ## 4. Procedure
 
-1. **Freeze the sampling frame.** Export channel ids, strata, and the latest
-   observed URL per channel from the read-only replica. Record the snapshot
-   timestamp and query text.
+1. **Freeze the sampling frame.** Export channel ids and the latest observed
+   URL per channel from the read-only replica. Record the snapshot timestamp
+   and query text. Keep the stratum assignment (and the pipeline outcome that
+   produced it) in a separate manifest unavailable to labelers, so the export
+   handed to a labeler contains only the channel id and inspection URL(s).
 2. **Select and de-duplicate.** Randomly select within each stratum; exclude
    channels already labeled in a prior sample; cap multiple channels per site
    host to reduce clustering (for example ≤5 per host).
@@ -112,7 +119,15 @@ Primary:
   so it is not a population-level recall estimate. Report population estimates
   only after post-stratification weighting against frame counts, with the
   weighting method and design effect documented.
-- **Stage recall**: static-found / rendered-found / interaction-found.
+- **Stage recall**: the share of found positives recovered at each stage, with
+  one mutually exclusive stage per found channel. Numerator = sampled channels
+  whose labeled invite was first recovered at that stage (static-found, else
+  rendered-found, else interaction-found). Denominator = sampled channels with a
+  labeled invite that the pipeline found. Each found channel is attributed to
+  exactly its earliest recovering stage, so the three shares sum to 100%. This
+  is a stage-attribution share of found positives, not population recall; a
+  channel that the pipeline missed is counted only in channel-level recall and
+  the false-negative table.
 - **False-negative rate by attributed cause**, with exact binomial 95%
   confidence intervals.
 
@@ -126,11 +141,13 @@ Secondary:
 
 Report point estimates with confidence intervals; do not present a single
 aggregate recall without the stratum breakdown. With n=300 and roughly 150
-labeled positives, the 95% CI half-width around a 70% recall is about ±7.3
-percentage points (1.96 × √(0.7 × 0.3 / 150)); rarer causes will have wide
-intervals and must be reported as such. Clustering within site hosts and the
-stratified design can widen these intervals further, so treat them as lower
-bounds unless a design-based interval is computed.
+labeled positives, 1.96 × √(0.7 × 0.3 / 150) is about ±7.3 percentage points.
+That binomial figure is a **planning approximation only**: it assumes
+independent simple-random positives, which the stratified and host-capped
+sample is not, and stratification can narrow while host clustering widens the
+true interval. Do not present it as a bound. Reported uncertainty must come from
+a design-based (stratified/cluster-aware) interval, and rarer causes will have
+wide intervals that must be reported as such.
 
 ## 6. Data handling and safety
 

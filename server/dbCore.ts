@@ -635,16 +635,32 @@ export const DISCORD_INVITE_FIRST_VALIDATED_SQL = `(SELECT dc.first_validated_at
  * "when was the currently served invite last verified?" from the append-only
  * attempt ledger. A1-retained invites keep their serving attempt timestamp
  * even after an ambiguous revalidation, so the UI can label them as previously
- * verified rather than freshly validated. */
-export const DISCORD_INVITE_LAST_VERIFIED_SQL = `(SELECT MAX(a.checked_at)
+ * verified rather than freshly validated.
+ *
+ * Correlated against the invite the row actually serves, never candidate
+ * identity: a retained older invite can coexist with candidate fields that
+ * moved on, and a locator/id match on the current candidate could donate a
+ * different candidate's successful timestamp. A creator-association promotion
+ * turns an `UNCERTAIN` attempt into a serving `ACTIVE` invite after the attempt
+ * row is written; the channel's `TRADING_RELEVANT` marker identifies that
+ * effective serving state, so the promoted attempt still supplies the
+ * timestamp. When the served invite has no successful ledger row the column is
+ * NULL (explicitly unavailable), never another candidate's date.
+ *
+ * Parameterized by table alias so `/api/channels/:id` (alias `c`) can project
+ * the same expression as the listing query (alias `channels`). */
+export const discordInviteLastVerifiedSql = (alias = 'channels'): string => `(SELECT MAX(a.checked_at)
     FROM discord_check_attempts a
-   WHERE a.channel_id=channels.channel_id
+   WHERE a.channel_id=${alias}.channel_id
      AND a.operational_outcome='SUCCEEDED'
-     AND a.semantic_status IN ('ACTIVE','ACTIVE_LOW_VOLUME')
      AND (
-       (channels.discord_candidate_id IS NOT NULL AND a.candidate_id=channels.discord_candidate_id)
-       OR lower(COALESCE(a.resolved_locator,a.invite_locator))=lower(COALESCE(channels.discord_candidate_locator,channels.discord_invite))
-     ))`;
+       a.semantic_status IN ('ACTIVE','ACTIVE_LOW_VOLUME')
+       OR (a.semantic_status='UNCERTAIN' AND ${alias}.discord_relevance_status='TRADING_RELEVANT')
+     )
+     AND ${alias}.discord_invite IS NOT NULL
+     AND lower(COALESCE(a.resolved_locator,a.invite_locator))=lower(${alias}.discord_invite)
+   )`;
+export const DISCORD_INVITE_LAST_VERIFIED_SQL = discordInviteLastVerifiedSql();
 export const RECENT_INVITE_ORDER_SQL = 'discord_invite_first_validated_at DESC NULLS LAST,channel_id DESC';
 // This is the single definition of the operator-visible discovery corpus. Keep
 // both the paginated listing and dashboard aggregates anchored to this policy.
@@ -877,6 +893,7 @@ export async function getChannelById(channelId: string): Promise<ChannelRecord |
   const db = await getDb();
   const res = await db.query(`SELECT c.*,
     ${DISCORD_SELECTED_INVITE_CONFLICT_SQL} AS discord_selected_invite_conflict,
+    ${discordInviteLastVerifiedSql('c')} AS discord_invite_last_verified_at,
     (SELECT owner.channel_name FROM channels owner WHERE owner.channel_id=c.discord_duplicate_owner_channel_id) discord_duplicate_owner_channel_name,
     (SELECT COUNT(*)::int FROM discord_candidates dc WHERE dc.channel_id=c.channel_id) candidate_count
     FROM channels c WHERE c.channel_id=$1`, [channelId]);
@@ -920,12 +937,13 @@ export function overlayLockedDiscordProjection<T extends Partial<ChannelRecord>>
  * validated invite — including a retained last-known-good row whose mutable
  * status has become UNCERTAIN — an ordinary write must not clear it, replace
  * it with a different invite, or erase the uncertainty marker with a stale
- * ACTIVE snapshot. Definitive terminal
- * outcomes (DEAD/NON_TRADING), explicit intentional cleanup, and fresh
- * validation writes still apply. This is deliberately narrower than making
- * `preserveDiscordOnUpdate` the default: the authoritative inspection upsert
- * opts into `freshDiscordValidation` so its latest status/evidence always
- * reaches the row.
+ * ACTIVE snapshot. A stale snapshot cannot prove a terminal verdict either: its
+ * `DEAD`/`NON_TRADING` status may predate the validation that just committed.
+ * Only a fresh validation write (including a genuine `CONFIRMED_INVALID`
+ * projection) or explicit intentional cleanup may bypass the guard. This is
+ * deliberately narrower than making `preserveDiscordOnUpdate` the default: the
+ * authoritative inspection upsert opts into `freshDiscordValidation` so its
+ * latest status/evidence always reaches the row.
  */
 export function shouldRetainLockedDiscordProjection(
   proposed:Partial<ChannelRecord>,
@@ -938,7 +956,11 @@ export function shouldRetainLockedDiscordProjection(
   // retention marker). The serving check alone would leave that row exposed to
   // a stale ordinary snapshot that clears the invite and its evidence.
   if(!hasServingLastKnownGoodDiscordInvite(locked)&&!hasRetainedLastKnownGoodDiscordInvite(locked))return false;
-  if(proposed.discord_status==='DEAD'||proposed.discord_status==='NON_TRADING')return false;
+  // A stale ordinary snapshot cannot prove a terminal verdict either: its
+  // DEAD/NON_TRADING status may predate the validation that just committed.
+  // Genuine terminal transitions arrive through the fresh-validation or
+  // explicit-cleanup options handled above.
+  if(proposed.discord_status==='DEAD'||proposed.discord_status==='NON_TRADING')return true;
   const proposedInvite=proposed.discord_invite||null;
   const lockedInvite=locked.discord_invite||null;
   // No ordinary write may clear or replace a serving invite; only a fresh

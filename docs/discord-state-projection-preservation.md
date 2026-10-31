@@ -73,11 +73,14 @@ The retention invariant is now applied at three enforcement points:
    cleanup only when it has the full retained evidence (serving invite, live
    liveness, completed validation, `VALIDATED` discovery, `UNCERTAIN`
    relevance). `DEAD`/`NON_TRADING` rows and rejected-channel cleanup still
-   clear normally.
+   clear normally, except that a `NEEDS_REVIEW` row keeps its invite until the
+   review resolves (the existing review hold).
 3. **Upsert.** An ordinary stale-snapshot write cannot clear or downgrade a
-   locked row that still serves a completed, live, validated invite. Fresh
-   successful validations, terminal `DEAD`/`NON_TRADING` verdicts, and explicit
-   intentional cleanup (`allowDiscordClear`) still replace the projection.
+   locked row that still serves a completed, live, validated invite, and it
+   cannot assert a terminal `DEAD`/`NON_TRADING` verdict over that invite either.
+   Fresh validation writes (including a genuine terminal projection) and
+   explicit intentional cleanup (`allowDiscordClear`) still replace the
+   projection.
 
 `rowToChannel` derives two read-only fields: `discord_invite_last_verified_at`
 (the latest successful serving attempt from `discord_check_attempts`) and

@@ -9,6 +9,7 @@ import {
   hasRetainedLastKnownGoodDiscordInvite,
   hasServingLastKnownGoodDiscordInvite,
   isAmbiguousSuccessfulDiscordValidation,
+  isSameSelectedDiscordCandidate,
   projectDiscordValidation,
   projectTradingReclassificationDiscordState,
   reconcileDiscordDiscoveryFromInspection,
@@ -312,7 +313,23 @@ test('A1 ambiguous success cannot retain a candidate confirmed invalid in the sa
   });
 
   assert.equal(hasServingLastKnownGoodDiscordInvite(channel), true);
-  Object.assign(channel, projectDiscordValidation(channel, ambiguous, ambiguousCandidate, { currentCandidateRejected: true }));
+  // Production derives the flag from the scan's terminal-invalid entries via
+  // the shared candidate identity, rather than passing `true` unconditionally.
+  const terminalInvalid = [{
+    validation: validation({
+      status: 'DEAD',
+      inviteUrl: null,
+      candidateInviteUrl: VALID_URL,
+      operationalOutcome: 'CONFIRMED_INVALID',
+      livenessStatus: 'DEAD',
+      relevanceStatus: 'NOT_CHECKED',
+      validationStatus: 'COMPLETED',
+    }),
+    candidate: validCandidate,
+  }];
+  const currentCandidateRejected = terminalInvalid.some(entry => isSameSelectedDiscordCandidate(channel, entry.candidate));
+  assert.equal(currentCandidateRejected, true, 'the retained candidate is detected as terminal-invalid');
+  Object.assign(channel, projectDiscordValidation(channel, ambiguous, ambiguousCandidate, { currentCandidateRejected }));
 
   assert.equal(channel.discord_invite, null, 'the confirmed-invalid invite must not keep serving');
   assert.equal(channel.discord_status, 'UNCERTAIN');
@@ -334,7 +351,21 @@ test('A1 ambiguous success cannot retain a candidate confirmed non-trading in th
   });
 
   assert.equal(hasServingLastKnownGoodDiscordInvite(channel), true);
-  Object.assign(channel, projectDiscordValidation(channel, ambiguous, ambiguousCandidate, { currentCandidateRejected: true }));
+  // Non-trading is detected from the same-scan semantic result for the
+  // retained candidate (queueManager's `currentCandidateNonTrading`).
+  const sameScanNonTrading = validation({
+    status: 'NON_TRADING',
+    inviteUrl: null,
+    candidateInviteUrl: VALID_URL,
+    operationalOutcome: 'SUCCEEDED',
+    livenessStatus: 'ACTIVE',
+    relevanceStatus: 'NON_TRADING',
+    validationStatus: 'SUCCEEDED',
+  });
+  const currentCandidateNonTrading = sameScanNonTrading.status === 'NON_TRADING'
+    && isSameSelectedDiscordCandidate(channel, validCandidate);
+  assert.equal(currentCandidateNonTrading, true, 'the retained candidate is detected as non-trading');
+  Object.assign(channel, projectDiscordValidation(channel, ambiguous, ambiguousCandidate, { currentCandidateRejected: currentCandidateNonTrading }));
 
   assert.equal(channel.discord_invite, null, 'a non-trading current invite must not keep serving');
   assert.equal(channel.discord_status, 'UNCERTAIN');
@@ -516,14 +547,21 @@ test('A1 ordinary upsert retains a locked UNCERTAIN last-known-good invite over 
   assert.equal(merged.discord_validation_status, 'COMPLETED');
 });
 
-test('A1 definitive terminal writes and explicit cleanup still clear the locked invite', () => {
+test('A1 ordinary terminal snapshots cannot clear a locked invite; fresh validation or cleanup can', () => {
   const locked = cbrackn() as any;
   const dead = cbrackn({ discord_status: 'DEAD', discord_invite: null, discord_liveness_status: 'DEAD' }) as any;
   const nonTrading = cbrackn({ discord_status: 'NON_TRADING', discord_invite: null }) as any;
+  const sameInviteDead = cbrackn({ discord_status: 'DEAD', discord_invite: VALID_URL, discord_liveness_status: 'DEAD' }) as any;
   const staleClear = cbrackn({ discord_status: 'UNCERTAIN', discord_invite: null }) as any;
 
-  assert.equal(shouldRetainLockedDiscordProjection(dead, locked), false);
-  assert.equal(shouldRetainLockedDiscordProjection(nonTrading, locked), false);
+  // A snapshot loaded before a validation committed may itself carry a
+  // terminal status. It is not proof about the invite that now serves.
+  assert.equal(shouldRetainLockedDiscordProjection(dead, locked), true);
+  assert.equal(shouldRetainLockedDiscordProjection(nonTrading, locked), true);
+  assert.equal(shouldRetainLockedDiscordProjection(sameInviteDead, locked), true);
+  // The authoritative validation write and intentional cleanup still apply.
+  assert.equal(shouldRetainLockedDiscordProjection(dead, locked, { freshDiscordValidation: true }), false);
+  assert.equal(shouldRetainLockedDiscordProjection(nonTrading, locked, { allowDiscordClear: true }), false);
   assert.equal(shouldRetainLockedDiscordProjection(staleClear, locked, { allowDiscordClear: true }), false);
 });
 
