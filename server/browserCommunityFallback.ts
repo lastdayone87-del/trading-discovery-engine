@@ -1631,10 +1631,32 @@ export async function enqueueRenderedCrossOriginPass(input: {
   if (plan.budget) input.countDrop('destination-budget', plan.budget);
   if (plan.disallowed) input.countDrop('cross-origin-disallowed', plan.disallowed);
   if (!plan.admitted.length) return;
+  // Commit the cap identities only after the submission succeeds. A failed
+  // enqueue throws out of the request handler; Crawlee then retries the page
+  // with this same crawl-wide set. Recording the URLs before the await would
+  // make the retry classify them as duplicates and never resubmit them. A
+  // partial submission is safe to replay: Crawlee's request queue dedupes
+  // already-queued unique keys.
+  await input.enqueue(plan.admitted);
   for (const url of plan.admitted) {
     input.queued.add(normalizeVisitUrl(url) || url);
   }
-  await input.enqueue(plan.admitted);
+}
+
+/**
+ * Identities the cross-origin planner must not re-enqueue: externally supplied
+ * already-visited URLs plus every request/final-page identity this crawl has
+ * terminally inspected. Without the final identity, a queued shortcut that
+ * redirects to a destination later linked directly would spend a second page
+ * slot inspecting the same page.
+ */
+export function renderedCrossOriginVisitedIdentities(
+  alreadyVisited: ReadonlySet<string>,
+  terminalSuccessUrls: Iterable<string>,
+): ReadonlySet<string> {
+  const inspected = [...terminalSuccessUrls];
+  if (!inspected.length) return alreadyVisited;
+  return new Set([...alreadyVisited, ...inspected]);
 }
 
 export function isUnrecoveredStructuralNavigation(
@@ -3640,7 +3662,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 // navigation cannot hide a cross-origin community link.
                 collect: () => page.$$eval('a[href]', collectRenderedCrossOriginCandidates, page.url()),
                 currentUrl: page.url(),
-                alreadyVisited: alreadyVisitedSet,
+                alreadyVisited: renderedCrossOriginVisitedIdentities(alreadyVisitedSet, terminalSuccessUrls),
                 queued: crossOriginQueued,
                 maxEnqueues: MAX_RENDERED_CROSS_ORIGIN_ENQUEUES - crossOriginQueued.size,
                 enqueue: async urls => { await enqueueLinks({ urls, strategy: 'all' }); },
