@@ -411,7 +411,6 @@ export type CrawlAdmissionReasonCode =
   | 'NON_PUBLIC_ADDRESS'
   | 'ASSET_HOST'
   | 'RESOURCE_EXTENSION'
-  | 'NON_PAGE_PATH'
   | 'MALFORMED_URL';
 
 export interface CrawlAdmissionDecision {
@@ -432,12 +431,12 @@ export interface CrawlAdmissionDecision {
 // because the following character is not a delimiter.
 const RESOURCE_PATH_EXTENSION = /\.(?:js|mjs|css|map|png|jpe?g|gif|webp|svg|avif|apng|bmp|tiff?|heic|jfif|ico|woff2?|ttf|otf|eot|mp4|m4v|webm|mp3|m4a|aac|flac|wav|ogg|opus|avi|mov|3gp|zip|gz|rar|7z|exe|dmg)(?=$|[&%?"'#\s])/i;
 
-// A bare image/thumbnail directory root is an asset tree, not an HTML page.
-// Deeper paths are NOT rejected on the directory name alone: `/images/community`
-// can be a real community page, and dropping it before the fetch is a recall
-// loss that outweighs the crawl cost of an extensionless asset. Asset files
-// below the directory are still caught by RESOURCE_PATH_EXTENSION.
-const NON_PAGE_ASSET_DIRECTORY_ROOT = /^\/(?:images?|img|thumbnails?|thumbs?|avatars?|icons?|photos?)\/?$/i;
+// Asset-like directory names are NOT evidence of an asset. `/images` can be a
+// real page (and `/bit.ly/icons`/`t.me/photos` are ordinary routes), while an
+// extensionless asset costs at most one fetch. Dropping a possible page before
+// the fetch is a recall loss, so rejection requires provable asset shape:
+// `RESOURCE_PATH_EXTENSION` for asset files and `ASSET_HOST` for asset-only
+// hosts. Deeper paths under `/images/...` are likewise not rejected by name.
 
 // Template placeholders and script/quote artifacts emitted by indiscriminate
 // dynamic-attribute extraction (`{{link}}`, `${link}`, `%22%22;`,
@@ -502,9 +501,6 @@ export function assessCrawlAdmission(rawUrl: string): CrawlAdmissionDecision {
   const decodedPath = decodeResourcePathname(parsed.pathname);
   if (RESOURCE_PATH_EXTENSION.test(decodedPath)) {
     return { eligible: false, reasonCode: 'RESOURCE_EXTENSION' };
-  }
-  if (NON_PAGE_ASSET_DIRECTORY_ROOT.test(decodedPath)) {
-    return { eligible: false, reasonCode: 'NON_PAGE_PATH' };
   }
   if (MALFORMED_PATH.test(decodedPath)) {
     return { eligible: false, reasonCode: 'MALFORMED_URL' };

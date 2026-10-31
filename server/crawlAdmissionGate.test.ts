@@ -150,8 +150,13 @@ test('R6: valid dotted trading and community domains remain eligible', () => {
     // Encoded spaces are ordinary slug separators, not a script declaration.
     'https://creator.example.com/Let%20Me%20Trade',
     'https://creator.example.com/learn/let%20me%20trade',
-    // A directory named `images` can still hold an HTML community page.
+    // A directory named `images` can still hold an HTML community page; a bare
+    // asset-like root is not proof of an asset either.
+    'https://creator.example.com/images',
+    'https://creator.example.com/images/',
     'https://creator.example.com/images/community',
+    'https://t.me/photos',
+    'https://bit.ly/icons',
     // Only the Cloudinary delivery host is asset-only.
     'https://cloudinary.com/documentation',
   ]) {
@@ -238,8 +243,6 @@ test('R6: non-page and malformed URL noise is rejected before fetch or enqueue',
     ['https://fundednext.com/images/join-community/discord-card.png&w=1920&q=75%22/', 'RESOURCE_EXTENSION'],
     ['https://creator.example.com/card.avif', 'RESOURCE_EXTENSION'],
     ['https://creator.example.com/img.png?w=100', 'RESOURCE_EXTENSION'],
-    ['https://linktr.ee/images', 'NON_PAGE_PATH'],
-    ['https://linktr.ee/images/', 'NON_PAGE_PATH'],
     ['https://scontent-lhr8-1.xx.fbcdn.net/v/t1.6435-9/abc.jpg', 'ASSET_HOST'],
     ['https://res.cloudinary.com/demo/image/upload/sample.jpg', 'ASSET_HOST'],
     ['https://i0.wp.com/example.com/image.png', 'ASSET_HOST'],

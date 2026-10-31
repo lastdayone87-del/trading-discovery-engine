@@ -65,13 +65,17 @@ test('non-page and malformed observations own no retry, while legitimate pages k
     'https://takeprofittrader.com/%7B%7Blink%7D%7D',
     'https://www.tradingview.com/social-network/%22%22;',
     'https://fundednext.com/images/join-community/discord-card.png&w=1920&q=75%22/',
-    'https://linktr.ee/images',
     'https://res.cloudinary.com/demo/image/upload/sample.jpg',
   ]) assert.equal(isCommunityRetryableObservation(failure(requestedUrl) as never),false,requestedUrl);
   assert.equal(isCommunityRetryableObservation(failure('https://creator.example.com/community/join') as never),true);
-  // A deeper path under an asset-like directory can be a real page, so it
-  // keeps retry ownership instead of being dropped by the directory name.
-  assert.equal(isCommunityRetryableObservation(failure('https://linktr.ee/images/community') as never),true);
+  // An asset-like path name alone can be a real page, so it keeps retry
+  // ownership instead of being dropped by the directory name.
+  for (const requestedUrl of [
+    'https://linktr.ee/images',
+    'https://linktr.ee/images/',
+    'https://linktr.ee/images/community',
+    'https://bit.ly/icons',
+  ]) assert.equal(isCommunityRetryableObservation(failure(requestedUrl) as never),true,requestedUrl);
 });
 
 test('provider capacity errors are attempt-free while invalid observation remains meaningful',()=>{

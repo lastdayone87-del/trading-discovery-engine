@@ -8,16 +8,16 @@ repository; each claim below is verified by the in-repo code and tests it names.
 long-attempt cap, and queue re-dating are investigation/preparation only. No
 concurrency, queue, budget, or setting change is included.
 
-## 1. Implemented: non-page/malformed URL filter
+## 1. Implemented: malformed/asset URL filter
 
-`server/communitySurfacePolicy.ts` now rejects non-page and malformed URLs at
-the shared `assessCrawlAdmission` boundary, before fetch or enqueue:
+`server/communitySurfacePolicy.ts` now rejects malformed URLs, asset files, and
+asset-only hosts at the shared `assessCrawlAdmission` boundary, before fetch or
+enqueue:
 
 | Reason code | What it rejects | Examples |
 |---|---|---|
 | `MALFORMED_URL` | Template placeholders, script/quote artifacts, control characters, embedded JS | `/%7B%7Blink%7D%7D`, `${link}`, `d,a.onload=function()%7B...`, `/%22%22;` |
 | `RESOURCE_EXTENSION` | Image, video, audio, font, script, archive, and executable suffixes, including encoded forms and transform parameters | `card.png&w=1920&q=75`, `app%2Ejs`, `hero.avif`, `clip.webm` |
-| `NON_PAGE_PATH` | A bare image/thumbnail/avatar directory root (deeper paths can be real community pages, so they stay eligible) | `/images`, `/images/`, `/thumbnails` |
 | `ASSET_HOST` | Hosts that can only serve page assets (YouTube/Meta/Twitter image CDNs, image proxies, code CDNs) | `fbcdn.net`, `cdninstagram.com`, `twimg.com`, `res.cloudinary.com`, `i0.wp.com`, `cdn.jsdelivr.net` |
 
 Deliberate exclusions from the filter:
@@ -25,6 +25,10 @@ Deliberate exclusions from the filter:
 - social/profile and invite hosts stay eligible (`instagram.com`, `x.com`,
   `t.me`, `discord.gg`, `discord.com/invite`, `discordapp.com/invite`);
 - link hubs and shorteners stay eligible (`linktr.ee`, `bit.ly`, `beacons.ai`);
+- asset-like path names alone are not evidence of an asset: `/images`,
+  `/images/`, `/thumbs`, `/bit.ly/icons`, and `t.me/photos` stay eligible,
+  because an extensionless path can be a real page; rejection requires an
+  asset file extension or an asset-only host;
 - generic CDNs that can host entire sites (`cloudfront.net`, `amazonaws.com`)
   are not filtered;
 - document and feed types (`pdf`, `rss`, `xml`) stay eligible;
@@ -40,8 +44,9 @@ Deliberate exclusions from the filter:
 
 - `server/crawlAdmissionGate.test.ts`: noise is rejected before fetch or
   observation; legitimate HTML pages, query strings, apostrophes, documents,
-  shorteners, social profiles, invite hosts, script-keyword page slugs, and
-  `.js`-named path segments still crawl.
+  shorteners, social profiles, invite hosts, script-keyword page slugs,
+  asset-like directory roots (`/images`, `/images/`), and `.js`-named path
+  segments still crawl.
 - `server/pageAssetFilter.test.ts`: asset/CDN hosts are filtered; profile and
   invite hosts are preserved.
 - `server/communityRetryPolicy.test.ts`: non-page/malformed observations own no
