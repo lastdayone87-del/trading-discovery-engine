@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { DEFAULT_BROWSER_FALLBACK_BUDGET, MAX_RENDERED_CROSS_ORIGIN_ENQUEUES, combineRenderedControlOffsetAdvances, enqueueRenderedCrossOriginPass, isNavigableOnlyControlWindow, isSameSeedDocument, isUnrecoveredStructuralNavigation, planRenderedCrossOriginEnqueues, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, resolveRenderedCompletionState, runRenderedClickLoop, shouldEnqueueRenderedCrossOriginLink, type RenderedControlEnumeration } from './browserCommunityFallback';
+import { DEFAULT_BROWSER_FALLBACK_BUDGET, MAX_RENDERED_CROSS_ORIGIN_ENQUEUES, combineRenderedControlOffsetAdvances, enqueueRenderedCrossOriginPass, isNavigableOnlyControlWindow, isSameSeedDocument, isUnrecoveredStructuralNavigation, planRenderedCrossOriginEnqueues, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, renderedCrossOriginVisitedIdentities, resolveRenderedCompletionState, runRenderedClickLoop, shouldEnqueueRenderedCrossOriginLink, type RenderedControlEnumeration } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -812,4 +812,63 @@ test('shared rendered evidence stays fail-closed: gapped/timed-out lenders never
     'only complete, non-timed-out, gapless rendered runs are reusable',
   );
   assert.match(source, /const rec=recs&&recs\[0\];if\(!rec\|\|rec\.complete!==true\)return null;/);
+});
+
+test('a failed cross-origin enqueue releases its cap identities for the retry', async () => {
+  const queued = new Set<string>();
+  const batches: string[][] = [];
+  let fail = true;
+  const run = () => enqueueRenderedCrossOriginPass({
+    collect: async () => [
+      { url: 'https://linktr.ee/creator', text: 'Links' },
+      { url: 'https://community.example/', text: 'Join the private members community' },
+    ],
+    currentUrl: 'https://creator.example/',
+    alreadyVisited: new Set(),
+    queued,
+    maxEnqueues: MAX_RENDERED_CROSS_ORIGIN_ENQUEUES - queued.size,
+    enqueue: async urls => {
+      if (fail) throw new Error('enqueue unavailable');
+      batches.push(urls);
+    },
+    countDrop: () => undefined,
+  });
+  await assert.rejects(run, /enqueue unavailable/);
+  assert.equal(queued.size, 0, 'a failed submission must not consume crawl-wide cap identities');
+  fail = false;
+  await run();
+  assert.deepEqual(batches, [
+    ['https://linktr.ee/creator', 'https://community.example/'],
+  ], 'the Crawlee page retry resubmits the same planned destinations');
+  assert.equal(queued.size, 2);
+});
+
+test('cross-origin admission dedupes terminally inspected request and final identities', () => {
+  const base = new Set(['https://seen.example/join']);
+  assert.equal(
+    renderedCrossOriginVisitedIdentities(base, []),
+    base,
+    'with no inspected identities the caller set is reused unchanged',
+  );
+  const combined = renderedCrossOriginVisitedIdentities(base, [
+    'https://hub.example/shortcut',
+    'https://hub.example/community',
+  ]);
+  assert.deepEqual([...combined], [
+    'https://seen.example/join',
+    'https://hub.example/shortcut',
+    'https://hub.example/community',
+  ]);
+  const plan = planRenderedCrossOriginEnqueues({
+    candidates: [
+      { url: 'https://hub.example/community', text: 'Join the community' },
+      { url: 'https://hub.example/other', text: 'Join the community' },
+    ],
+    currentUrl: 'https://creator.example/',
+    alreadyVisited: combined,
+    queued: new Set(),
+  });
+  assert.deepEqual(plan.admitted, ['https://hub.example/other'],
+    'a destination already inspected through its redirect target is not refetched');
+  assert.equal(plan.alreadyVisited, 1);
 });
