@@ -148,10 +148,13 @@ Primary:
 - **Projection/persistence loss**: reported separately, not folded into the
   three stage shares. Numerator = sampled channels whose labeled invite was
   recovered by extraction but is not the serving invite on the stored channel
-  row (or is absent from the attempt ledger). Denominator = sampled channels
-  whose labeled invite was recovered by extraction. Attribute a case here only
-  when the attempt ledger records the recovery and the projection/persistence
-  boundary is observed; otherwise keep the miss in “unknown”.
+  row, **or** whose invite is absent from the attempt ledger despite separate
+  evidence of extraction (a stored observation/candidate record or captured
+  extraction artifact). Denominator = sampled channels whose labeled invite was
+  recovered by extraction. Attribute a case with the attempt ledger when the row
+  exists; when it is missing, require that independent extraction evidence — a
+  missing ledger row alone is not evidence of extraction and stays in
+  “unknown”.
 - **False-negative rate by attributed cause**, with design-based
   (stratified/host-aware) 95% intervals. Exact binomial intervals may be shown
   per stratum only as descriptive approximations, never as the pooled
