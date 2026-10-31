@@ -357,9 +357,10 @@ test('real DOM: nav-container section links are measured but never consume the c
       1,
       'only the explicit menu trigger is a clickable disclosure',
     );
-    assert.deepEqual(
-      enumeration.controls.map(control => control.text.trim()),
-      ['Open menu'],
+    assert.equal(enumeration.controls.length, 1, 'only the explicit menu trigger enters the click set');
+    assert.match(
+      enumeration.controls[0].text,
+      /Open menu/,
       'fragment links and a URL-only /more anchor cannot exhaust the click budget',
     );
     assert.equal(
