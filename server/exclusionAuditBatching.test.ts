@@ -96,6 +96,10 @@ test('batch SQL uses exact-text cursor, tie-breaker, and narrow columns', async 
   assert.match(sql, /ORDER BY first_seen DESC, channel_id DESC/);
   assert.match(sql, /country_status IS DISTINCT FROM 'REJECTED'/);
   assert.match(sql, /scan_status/, 'the audit decision needs review-pending state');
+  assert.match(sql, /discord_liveness_status/);
+  assert.match(sql, /discord_validation_status/);
+  assert.match(sql, /discord_discovery_status/);
+  assert.match(sql, /discord_relevance_status/);
   assert.doesNotMatch(sql, /SELECT \*/);
 });
 
@@ -143,6 +147,31 @@ test('already-REJECTED rows with stale invites take invite-cleanup, status prese
   );
 });
 
+test('A1 retained last-known-good invites survive the startup audit while UNCERTAIN', () => {
+  const retained = {
+    alreadyRejected: false,
+    validationStatus: 'UNCERTAIN',
+    discordStatus: 'UNCERTAIN',
+    discordInvite: 'https://discord.gg/retained',
+    scanStatus: 'COMPLETED',
+    discordLivenessStatus: 'ACTIVE',
+    discordValidationStatus: 'COMPLETED',
+    discordDiscoveryStatus: 'VALIDATED',
+    discordRelevanceStatus: 'UNCERTAIN',
+  };
+  assert.equal(decideExclusionAuditRowAction(retained), 'none');
+  // Definitive invalidity and legitimate non-trading cleanup still clear.
+  assert.equal(decideExclusionAuditRowAction({ ...retained, discordStatus: 'DEAD' }), 'invite-cleanup');
+  assert.equal(decideExclusionAuditRowAction({ ...retained, discordStatus: 'NON_TRADING' }), 'invite-cleanup');
+  // Rejected channels are terminal: rejection cleanup still enforces hygiene.
+  assert.equal(decideExclusionAuditRowAction({ ...retained, alreadyRejected: true }), 'invite-cleanup');
+  // Retention requires the full evidence, not just the status.
+  assert.equal(decideExclusionAuditRowAction({ ...retained, discordValidationStatus: 'FAILED_OPERATIONAL' }), 'invite-cleanup');
+  assert.equal(decideExclusionAuditRowAction({ ...retained, discordLivenessStatus: 'UNCERTAIN' }), 'invite-cleanup');
+  assert.equal(decideExclusionAuditRowAction({ ...retained, discordDiscoveryStatus: 'DISCOVERED_VALIDATION_FAILED' }), 'invite-cleanup');
+  assert.equal(decideExclusionAuditRowAction({ ...retained, discordRelevanceStatus: 'TRADING_RELEVANT' }), 'invite-cleanup');
+});
+
 test('non-rejected country audit behavior is unchanged', () => {
   assert.equal(
     decideExclusionAuditRowAction({ alreadyRejected: false, validationStatus: 'REJECTED', discordStatus: 'ACTIVE', discordInvite: null }),
@@ -169,6 +198,17 @@ test('review-pending rows retain their invite for the pending review decision', 
   // resumes without another inspection.
   assert.equal(
     decideExclusionAuditRowAction({ alreadyRejected: false, validationStatus: 'UNCERTAIN', discordStatus: 'UNCERTAIN', discordInvite: 'https://discord.gg/retained', scanStatus: 'NEEDS_REVIEW' }),
+    'none'
+  );
+  // Review-pending retention is status-independent: a DEAD or NON_TRADING row
+  // withheld for review keeps its invite until the review resolves. Only a
+  // completed/rejected row proceeds to terminal cleanup.
+  assert.equal(
+    decideExclusionAuditRowAction({ alreadyRejected: false, validationStatus: 'UNCERTAIN', discordStatus: 'DEAD', discordInvite: 'https://discord.gg/retained', scanStatus: 'NEEDS_REVIEW' }),
+    'none'
+  );
+  assert.equal(
+    decideExclusionAuditRowAction({ alreadyRejected: false, validationStatus: 'UNCERTAIN', discordStatus: 'NON_TRADING', discordInvite: 'https://discord.gg/retained', scanStatus: 'NEEDS_REVIEW' }),
     'none'
   );
   // The same row shape outside review is still a stale invite.

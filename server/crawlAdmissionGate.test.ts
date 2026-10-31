@@ -147,6 +147,18 @@ test('R6: valid dotted trading and community domains remain eligible', () => {
     'https://g.co/',
     'https://takeprofittrader.com/?referralCode=BRANDON',
     'https://oiltradingacademy.com/day-trading-guide',
+    // Encoded spaces are ordinary slug separators, not a script declaration.
+    'https://creator.example.com/Let%20Me%20Trade',
+    'https://creator.example.com/learn/let%20me%20trade',
+    // A directory named `images` can still hold an HTML community page; a bare
+    // asset-like root is not proof of an asset either.
+    'https://creator.example.com/images',
+    'https://creator.example.com/images/',
+    'https://creator.example.com/images/community',
+    'https://t.me/photos',
+    'https://bit.ly/icons',
+    // Only the Cloudinary delivery host is asset-only.
+    'https://cloudinary.com/documentation',
   ]) {
     assert.deepEqual(assessCrawlAdmission(raw), { eligible: true, reasonCode: 'ELIGIBLE' }, raw);
     assert.ok(normalizeExternalUrl(raw), `normalize must admit: ${raw}`);
@@ -208,6 +220,94 @@ test('R6: asset and resource URLs are rejected on every admission path', async (
   assert.ok(fetched.every((url) => !url.includes('ytimg.com')), 'asset seed must never be fetched');
   assert.ok(!result.observations.some((item) => item.requestedUrl.includes('ytimg.com')));
   assert.ok(logDetails.some((line) => line.includes('Admission rejected (ASSET_HOST)')));
+});
+
+// 6b. Non-page/malformed noise from indiscriminate dynamic-attribute
+// extraction is rejected at the same shared boundary, before fetch/enqueue.
+test('R6: non-page and malformed URL noise is rejected before fetch or enqueue', async () => {
+  const cases: Array<[string, string]> = [
+    ['https://takeprofittrader.com/%7B%7Blink%7D%7D', 'MALFORMED_URL'],
+    // A malformed escape must not shield the well-formed artifacts around it,
+    // including escapes exposed only after the fallback decoding pass.
+    ['https://takeprofittrader.com/%7B%7Blink%7D%7D%ZZ', 'MALFORMED_URL'],
+    ['https://creator.example.com/%257B%257Blink%257D%257D%ZZ', 'MALFORMED_URL'],
+    ['https://creator.example.com/%252Ejs%ZZ', 'RESOURCE_EXTENSION'],
+    ['https://creator.example.com/%76ar%20x=1', 'MALFORMED_URL'],
+    ['https://creator.example.com/${link}', 'MALFORMED_URL'],
+    ['https://hftcode.com/d,a.onload=function()%7Bthis.media=%22all%22...', 'MALFORMED_URL'],
+    ['https://www.tradingview.com/social-network/%22%22;', 'MALFORMED_URL'],
+    ['https://creator.example.com/var%20x=1', 'MALFORMED_URL'],
+    ['https://creator.example.com/let%20x=1', 'MALFORMED_URL'],
+    ['https://creator.example.com/const%20x=1', 'MALFORMED_URL'],
+    ['https://creator.example.com/function()%20return', 'MALFORMED_URL'],
+    ['https://creator.example.com/document.write(1)', 'MALFORMED_URL'],
+    ['https://creator.example.com/window.location=https://evil.test', 'MALFORMED_URL'],
+    ['https://creator.example.com/this.media=all', 'MALFORMED_URL'],
+    ['https://fundednext.com/images/join-community/discord-card.png&w=1920&q=75%22/', 'RESOURCE_EXTENSION'],
+    ['https://creator.example.com/card.avif', 'RESOURCE_EXTENSION'],
+    ['https://creator.example.com/img.png?w=100', 'RESOURCE_EXTENSION'],
+    ['https://scontent-lhr8-1.xx.fbcdn.net/v/t1.6435-9/abc.jpg', 'ASSET_HOST'],
+    ['https://res.cloudinary.com/demo/image/upload/sample.jpg', 'ASSET_HOST'],
+    ['https://i0.wp.com/example.com/image.png', 'ASSET_HOST'],
+    ['https://images.weserv.nl/?url=example.com/image.png', 'ASSET_HOST'],
+    ['https://cdn.jsdelivr.net/npm/pkg/dist/app.js', 'ASSET_HOST'],
+  ];
+  for (const [raw, reasonCode] of cases) {
+    assert.deepEqual(assessCrawlAdmission(raw), { eligible: false, reasonCode }, raw);
+    assert.equal(normalizeExternalUrl(raw), null, `normalize must reject: ${raw}`);
+  }
+
+  // Direct crawler path: noise is skipped without a fetch or observation.
+  const logDetails: string[] = [];
+  const fetched: string[] = [];
+  const result = await crawlExternalLinks(
+    ['https://takeprofittrader.com/%7B%7Blink%7D%7D', 'https://creator.example.com/community'],
+    logDetails,
+    undefined,
+    (async (input) => {
+      fetched.push(String(input));
+      return noInviteHtml();
+    }) as typeof fetch,
+  );
+  assert.ok(!fetched.some((url) => url.includes('takeprofittrader.com')), 'malformed seed must never be fetched');
+  assert.ok(!result.observations.some((item) => item.requestedUrl.includes('takeprofittrader.com')));
+  assert.ok(logDetails.some((line) => line.includes('Admission rejected (MALFORMED_URL)')));
+  assert.ok(fetched.some((url) => url.includes('creator.example.com/community')), 'legitimate page still crawls');
+});
+
+// 6c. The filter must never drop legitimate HTML pages or valid community
+// links. Dots in slugs, image words in page names, query parameters, apostrophes,
+// document types, shorteners, social profiles, and invite hosts stay eligible.
+test('R6: legitimate HTML pages and community links survive the non-page filter', () => {
+  const valid = [
+    'https://creator.example.com/community/join',
+    'https://creator.example.com/blog/v1.2/getting-started',
+    'https://creator.example.com/gallery?w=1920&q=75',
+    'https://creator.example.com/app.js.html',
+    'https://creator.example.com/blog/using-.js-files',
+    'https://creator.example.com/images-and-media',
+    "https://creator.example.com/o'brien-community",
+    'https://creator.example.com/search?q=%22quoted%22',
+    'https://creator.example.com/report.pdf',
+    'https://creator.example.com/files/document.pdf',
+    'https://creator.example.com/window.html',
+    'https://creator.example.com/let-s-trade-community',
+    'https://creator.example.com/function/community',
+    'https://creator.example.com/var/log',
+    'https://creator.example.com/projects/three.js/community',
+    'https://creator.example.com/topics/vue.js/discord',
+    'https://linktr.ee/creator',
+    'https://bit.ly/creator',
+    'https://www.tradingview.com/u/creator/',
+    'https://t.me/tradingroom',
+    'https://www.instagram.com/creator/',
+    'https://x.com/creator',
+    'https://discord.com/invite/abc123',
+    'https://discordapp.com/invite/abc123',
+  ];
+  for (const raw of valid) {
+    assert.deepEqual(assessCrawlAdmission(raw), { eligible: true, reasonCode: 'ELIGIBLE' }, raw);
+  }
 });
 
 // 7. Ambiguous commercial pages stay eligible (approved R6 scope: no broad

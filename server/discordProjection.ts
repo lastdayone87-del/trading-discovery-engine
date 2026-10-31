@@ -125,10 +125,102 @@ export function applyCreatorAssociationToDiscordValidation(
   };
 }
 
+/**
+ * A provider lookup can succeed operationally while returning no serving
+ * invite and no usable relevance evidence (for example, a live guild whose
+ * trading relevance cannot be established). That is ambiguity, not proof the
+ * previously served invite is invalid. Definitive invalidity is a separate
+ * operational outcome (`CONFIRMED_INVALID`); a non-trading classification is a
+ * separate semantic status.
+ */
+export function isAmbiguousSuccessfulDiscordValidation(
+  validation:Pick<DiscordValidationResult,'operationalOutcome'|'inviteUrl'|'relevanceStatus'|'status'>
+):boolean{
+  return validation.operationalOutcome==='SUCCEEDED'
+    && !validation.inviteUrl
+    && validation.relevanceStatus==='UNCERTAIN'
+    && validation.status==='UNCERTAIN';
+}
+
+/** True only when the row is currently serving a completed, live, validated
+ * invite. Legacy rows without the separated evidence columns are excluded:
+ * retention must not invent last-known-good status for an unvalidated invite. */
+export function hasServingLastKnownGoodDiscordInvite(
+  channel:{
+    discord_status?:unknown;discord_invite?:unknown;discord_liveness_status?:unknown;
+    discord_validation_status?:unknown;discord_discovery_status?:unknown;
+  }
+):boolean{
+  return Boolean(channel.discord_invite)
+    && (channel.discord_status==='ACTIVE'||channel.discord_status==='ACTIVE_LOW_VOLUME')
+    && channel.discord_liveness_status==='ACTIVE'
+    && (channel.discord_validation_status==='COMPLETED'||channel.discord_validation_status==='SUCCEEDED')
+    && channel.discord_discovery_status==='VALIDATED';
+}
+
+/** Evidence that the stored invite is a retained last-known-good projection,
+ * including when a later mutable status reset has left the row UNCERTAIN. The
+ * current relevance marker is the retention signal; liveness/validation/
+ * discovery must still show that the invite was genuinely verified. Definitive
+ * invalidity (`DEAD`) and non-trading cleanup are deliberately excluded. */
+export function hasRetainedLastKnownGoodDiscordInvite(
+  channel:{
+    discord_status?:unknown;discord_invite?:unknown;discord_liveness_status?:unknown;
+    discord_validation_status?:unknown;discord_discovery_status?:unknown;discord_relevance_status?:unknown;
+  }
+):boolean{
+  return Boolean(channel.discord_invite)
+    && (channel.discord_status==='ACTIVE'||channel.discord_status==='ACTIVE_LOW_VOLUME'||channel.discord_status==='UNCERTAIN')
+    && channel.discord_liveness_status==='ACTIVE'
+    && (channel.discord_validation_status==='COMPLETED'||channel.discord_validation_status==='SUCCEEDED')
+    && channel.discord_discovery_status==='VALIDATED'
+    && channel.discord_relevance_status==='UNCERTAIN';
+}
+
 /** Pure compatibility reducer. A validation result is scoped to one stable
- * candidate identity, so an older/different candidate cannot donate terminality. */
-export function projectDiscordValidation(current:ChannelRecord,validation:DiscordValidationResult,candidate:DiscordCandidate):DiscordProjection{
+ * candidate identity, so an older/different candidate cannot donate terminality.
+ *
+ * A1 last-known-good invariant: an ambiguous successful revalidation must not
+ * clear a serving or already-retained last-known-good invite. The retained
+ * projection keeps the serving invite, status, and candidate identity (Option
+ * A), while the existing relevance field records that the current revalidation
+ * is uncertain. The ambiguous attempt itself remains in the append-only
+ * attempt ledger; validation outcomes and classification are unchanged.
+ * `CONFIRMED_INVALID` and `NON_TRADING` results still replace the projection
+ * normally, and a confirmed-invalid result for the currently served candidate
+ * in the same scan suppresses retention even when another candidate's result
+ * was ambiguous. */
+export function projectDiscordValidation(
+  current:ChannelRecord,
+  validation:DiscordValidationResult,
+  candidate:DiscordCandidate,
+  options?:{currentCandidateRejected?:boolean},
+):DiscordProjection{
   const effective=applyCreatorAssociationToDiscordValidation(current,validation,candidate);
+  // Retention is only safe while the currently served candidate is still
+  // credible. A confirmed-invalid result for that same candidate in this scan
+  // is definitive evidence that the retained invite must not keep serving,
+  // even if a different candidate's lookup was merely ambiguous. A
+  // non-trading result for the same candidate is equally terminal.
+  const canRetainAmbiguous=!options?.currentCandidateRejected
+    &&(hasServingLastKnownGoodDiscordInvite(current)||hasRetainedLastKnownGoodDiscordInvite(current));
+  if(isAmbiguousSuccessfulDiscordValidation(effective)&&canRetainAmbiguous){
+    return {
+      discord_status:current.discord_status,
+      discord_invite:current.discord_invite??null,
+      discord_candidate_locator:current.discord_candidate_locator??null,
+      discord_candidate_id:current.discord_candidate_id??null,
+      discord_candidate_raw_locator:current.discord_candidate_raw_locator??null,
+      discord_candidate_type:current.discord_candidate_type??null,
+      discord_resolution_status:current.discord_resolution_status??'RESOLVED',
+      discord_liveness_status:current.discord_liveness_status??'ACTIVE',
+      // Existing-state marker: the invite remains the last verified serving
+      // invite, but its current relevance is not freshly established.
+      discord_relevance_status:'UNCERTAIN',
+      discord_validation_status:current.discord_validation_status??'COMPLETED',
+      discord_discovery_status:'VALIDATED'
+    };
+  }
   const preserveServingInvite=effective.operationalOutcome!=='SUCCEEDED'&&effective.operationalOutcome!=='CONFIRMED_INVALID';
   return {
     discord_status:effective.status,

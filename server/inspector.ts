@@ -11,7 +11,7 @@ import { fetchRecentVideoDescriptionsWithIds, type RecentVideoDescription } from
 import {candidateFromNativeInvite,extractDiscordCandidates,makeDiscordCandidate,mergeDiscordCandidates,type DiscordCandidate} from './discordCandidates';
 import { bumpRepeatFailureHistoryOutage, bumpRepeatFailureSkip } from './operationsTelemetry';
 import type { BrowserFallbackResult } from './browserCommunityFallback';
-import { normalizeVisitUrl, type BrowserFallbackBudget } from './browserCommunityFallback';
+import { RENDERED_CONTROL_EVALUATION_WINDOW, normalizeVisitUrl, type BrowserFallbackBudget } from './browserCommunityFallback';
 import { parseAboutPageMetadataFromHtml } from './youtubePublicAbout';
 import {effectiveAcquisitionOutcomes,hasMessagingBridgeEvidence,isDiscordCommunityAcquisitionSurface,isDotlessHostnameUrl,isMessagingPreviewUrl,isAuxiliaryTriageCandidate,isAuxiliaryForOutcome,acquisitionOwnershipUrl,isPageAssetInfrastructureUrl,rankCommunitySurfaces,scoreCommunitySurface,assessCrawlAdmission,recoverTruncatedQueryToRoot,isPossiblyTruncatedPath} from './communitySurfacePolicy';
 import { isAcquisitionLadderEnabled, resolveRenderEscalation, selectSameSiteSitemapSeedCandidates, selectStructuredNavigationCandidates, MAX_LADDER_SITEMAP_SEEDS, MAX_LADDER_PROFILE_RUNS_PER_INSPECTION, ACQUISITION_LADDER_POLICY_VERSION } from './acquisitionLadder';
@@ -143,14 +143,27 @@ export type ExternalAcquisitionStatus='FOUND'|'INSPECTED_NO_MATCH'|'PARTIALLY_IN
 export type AcquisitionSurface='YOUTUBE_ABOUT'|'RECENT_VIDEO_DESCRIPTIONS'|'CHANNEL_EXTERNAL_LINKS'|'CREATOR_WEBSITES'|'SOCIAL_PROFILES'|'DISCORD_VALIDATION';
 export interface ExternalAcquisitionObservation {requestedUrl:string;finalUrl?:string;wrapperUrl?:string;surface:AcquisitionSurface;required:boolean;outcome:ExternalAcquisitionStatus;retryable:boolean;httpStatus?:number;failureClass?:string;retryAt?:number;detail:string;observedAt:string;telemetry?:CrawlerTelemetry;rootUrl?:string;/** Body-level confirmation from the bounded static 404/410 probe. This is not a skip: the whole seed predicate must also pass. */staticNotFoundBodyConfirmed?:boolean;staticNotFoundBodyReason?:string;/** True only when rendered escalation was actually skipped for this seed; persisted provenance for post-deploy measurement. The observation itself stays FAILED/non-retryable. */staticTerminalNotFound?:boolean;staticTerminalNotFoundReason?:string;/** Lender seed URL when this row references shared same-inspection evidence instead of a direct fetch. The lender inspected the bytes; this row carries no page counters of its own. */sharedEvidenceFrom?:string}
 
-/** Advance per-seed click-window progress only by controls this inspection
- * actually started clicking. A failed/zero-page run contributes nothing, so a
- * retry reuses the same window instead of skipping it. Progress per seed is
+/** Advance per-seed click-window progress by work this inspection actually
+ * examined. A failed click or a zero-page run contributes nothing, so a retry
+ * reuses the same window instead of skipping it. A processed page whose whole
+ * evaluation window was navigable anchors starts zero clicks but still
+ * examined the window; without progress, every retry would re-examine the same
+ * prefix and controls beyond it would never be reachable. Progress per seed is
  * capped at one page budget: telemetry aggregates pages, and every page starts
- * at the same rotation offset, so summing page clicks would over-advance. */
+ * at the same rotation offset, so summing page work would over-advance. */
 export function nextRenderedClickOffsets(
   previous: Record<string, number> | null | undefined,
-  outcomes: Array<{ requestedUrl?: string; telemetry?: { clicksStarted?: number } }> | null | undefined,
+  outcomes: Array<{
+    requestedUrl?: string;
+    telemetry?: {
+      clicksStarted?: number;
+      evidenceControlsTotal?: number;
+      evidenceControlsFailed?: number;
+      evidenceControlsNavigableOnly?: boolean;
+      evidenceControlsUncertified?: boolean;
+      evidenceControlsOffsetAdvance?: number;
+    };
+  }> | null | undefined,
   maxClicksPerPage = 4,
 ): Record<string, number> {
   const next = new Map<string, number>();
@@ -159,16 +172,65 @@ export function nextRenderedClickOffsets(
     const offset = Math.max(0, Math.trunc(Number(value)) || 0);
     if (key && offset > 0) next.set(key, offset);
   }
-  const observed = new Map<string, number>();
+  const clickProgress = new Map<string, number>();
+  const windowProgress = new Map<string, number>();
+  const uncertifiedZeroClick = new Set<string>();
+  const clickCap = Math.max(1, Math.trunc(maxClicksPerPage) || 4);
+  // Crawl-level uncertified evidence blocks every kind of progress for that
+  // seed. The rendered crawl aggregates multiple pages into one outcome, so
+  // this flag is the only way a later page's unexamined clickable window can
+  // stop another page's certified window/click progress from moving the
+  // shared per-seed offset past it.
+  const uncertifiedSeeds = new Set<string>();
+  for (const outcome of outcomes || []) {
+    if (outcome?.telemetry?.evidenceControlsUncertified !== true) continue;
+    const key = normalizeVisitUrl(outcome?.requestedUrl || '');
+    if (key) uncertifiedSeeds.add(key);
+  }
   for (const outcome of outcomes || []) {
     const key = normalizeVisitUrl(outcome?.requestedUrl || '');
-    if (!key) continue;
+    if (!key || uncertifiedSeeds.has(key)) continue;
     const clicks = Math.max(0, Math.trunc(Number(outcome?.telemetry?.clicksStarted)) || 0);
-    if (clicks > 0) observed.set(key, Math.max(observed.get(key) || 0, clicks));
+    // The crawler records full-pool positions consumed. Older rows only have
+    // the click count, which is still used as a bounded fallback.
+    const recordedAdvance = Math.max(0, Math.trunc(Number(outcome?.telemetry?.evidenceControlsOffsetAdvance)) || 0);
+    if (clicks > 0) {
+      // Recorded positions are already page-bounded. Legacy rows fall back to
+      // the old one-window click cap.
+      const advance = recordedAdvance > 0
+        ? Math.min(RENDERED_CONTROL_EVALUATION_WINDOW, recordedAdvance)
+        : Math.min(clickCap, clicks);
+      // Duplicate observations of the same seed (for example the same URL on
+      // two surfaces) share one offset: take the smaller progress so neither
+      // observation can rotate the other past unexamined controls.
+      clickProgress.set(key, Math.min(clickProgress.get(key) ?? advance, advance));
+      continue;
+    }
+    const total = Math.max(0, Math.trunc(Number(outcome?.telemetry?.evidenceControlsTotal)) || 0);
+    const failed = Math.max(0, Math.trunc(Number(outcome?.telemetry?.evidenceControlsFailed)) || 0);
+    const navigableOnly = outcome?.telemetry?.evidenceControlsNavigableOnly === true;
+    // A click failure keeps the window for a real retry. Only a page that
+    // explicitly certified an all-navigable window (fully examined, zero
+    // clicks) advances the rotation. A zero-click page with clickable
+    // controls (deadline/crash/zero budget) is uncertified and must keep the
+    // shared per-seed window for a real retry.
+    if (total > 0 && failed === 0 && navigableOnly) {
+      const advance = Math.min(RENDERED_CONTROL_EVALUATION_WINDOW, recordedAdvance || total);
+      windowProgress.set(key, Math.min(windowProgress.get(key) ?? advance, advance));
+    } else if (total > 0 && failed === 0) {
+      uncertifiedZeroClick.add(key);
+    }
   }
-  const windowSize = Math.max(1, Math.trunc(maxClicksPerPage) || 4);
-  for (const [key, clicks] of observed) {
-    next.set(key, (next.get(key) || 0) + Math.min(windowSize, clicks));
+  for (const [key, advance] of clickProgress) {
+    next.set(key, (next.get(key) || 0) + advance);
+  }
+  for (const [key, advance] of windowProgress) {
+    // A page that also clicked advances by the click budget above; the shared
+    // per-seed offset must not jump a full window past that page's next
+    // clickable controls. An uncertified zero-click page likewise keeps the
+    // window unchanged.
+    if (clickProgress.has(key) || uncertifiedZeroClick.has(key)) continue;
+    next.set(key, (next.get(key) || 0) + advance);
   }
   return Object.fromEntries([...next].filter(([, offset]) => offset > 0));
 }

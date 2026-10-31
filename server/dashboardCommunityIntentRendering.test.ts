@@ -466,6 +466,27 @@ test('found age stays visible above an expandable duplicate-owner summary', asyn
   assert.match(html, /Second invite owned elsewhere/);
 });
 
+test('A1 retained invite is labeled previously verified but currently uncertain', async () => {
+  const retained = channel({
+    channel_id: 'UC_retained',
+    channel_name: 'Retained Creator',
+    discord_status: 'ACTIVE',
+    discord_invite: 'https://discord.gg/retained-room',
+    discord_invite_first_validated_at: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(),
+    discord_invite_last_verified_at: new Date(Date.now() - 9 * 60 * 60 * 1000).toISOString(),
+    discord_invite_revalidation_uncertain: true,
+    discord_liveness_status: 'ACTIVE',
+    discord_relevance_status: 'UNCERTAIN',
+    discord_validation_status: 'COMPLETED',
+    discord_discovery_status: 'VALIDATED',
+  });
+  const html = await renderChannels([retained]);
+  assert.match(html, /data-testid="discord-last-verified"/);
+  assert.match(html, /Previously verified 9h ago · currently uncertain/);
+  assert.match(html, /last-known-good, not freshly validated/);
+  assert.match(html, /data-testid="discord-found-age"/);
+});
+
 test('duplicate owner name falls back to the loaded owner row and links to that row', async () => {
   const owner = channel({ channel_id: 'UC_owner_other', channel_name: 'OFM' });
   const duplicate = channel({

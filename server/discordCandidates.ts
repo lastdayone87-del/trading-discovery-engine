@@ -84,7 +84,12 @@ const INVITE_CODE_CAPTURE='([A-Za-z0-9_-]{2,128})(?![A-Za-z0-9_-])';
 /** Decode the bounded obfuscation forms that still name a real invite:
  * escaped slashes/colons/percent forms, numeric HTML entities, zero-width
  * format characters, and bracketed dot separators (`discord[.]gg`). Only
- * Discord-shaped tokens are rewritten; arbitrary text is never transformed. */
+ * Discord-shaped tokens are rewritten; arbitrary text is never transformed.
+ * `%2D` is decoded because hyphen is part of the invite-code alphabet: without
+ * it, a URL such as `discord.gg/abc%2D123` is captured as the truncated code
+ * `abc`. Hyphen is not a host/path boundary character, so this cannot create a
+ * new host match, and plain string replacement cannot throw on malformed
+ * percent sequences (unlike decodeURIComponent). */
 export function decodeInviteObfuscation(text:string):string{
   return String(text||'')
     .replace(/[\u200B-\u200D\uFEFF\u2060]/g,'')
@@ -93,6 +98,8 @@ export function decodeInviteObfuscation(text:string):string{
     .replace(/\\u0026/gi,'&')
     .replace(/%2f/gi,'/')
     .replace(/%3a/gi,':')
+    .replace(/%2d/gi,'-')
+    .replace(/%26/gi,'&')
     .replace(/&#x0*2e;|&#0*46;/gi,'.')
     .replace(/&#x0*3a;|&#0*58;/gi,':')
     .replace(/&#x0*2f;|&#0*47;/gi,'/')

@@ -18,14 +18,25 @@ export function discordValidationRank(validation:{operationalOutcome?:string;rel
   return 0;
 }
 
+/** A `SUCCEEDED` lookup is not automatically usable: it can be operationally
+ * successful while returning no serving invite and no relevance evidence
+ * (status/relevance `UNCERTAIN`). Such an ambiguous result must not outrank a
+ * candidate that actually serves a live invite. When a caller supplies an
+ * invite URL, a null/empty value is likewise not usable. */
+export function isUsableDiscordValidation(validation:{operationalOutcome?:string;relevanceStatus?:string;status?:string;inviteUrl?:string|null}):boolean{
+  if(validation.operationalOutcome!=='SUCCEEDED')return false;
+  if(validation.status!=='ACTIVE'&&validation.status!=='ACTIVE_LOW_VOLUME')return false;
+  return validation.inviteUrl===undefined||Boolean(validation.inviteUrl);
+}
+
 /** Ownership is the primary selection dimension. Health/relevance ranks only
  * candidates within the same ownership tier, so an active partner community
  * cannot replace a creator-owned candidate merely because it validates first. */
-export function discordCandidateCompositeRank(candidate:DiscordCandidate,validation:{operationalOutcome?:string;relevanceStatus?:string;status?:string}):number{
-  // A usable validation always outranks an operationally unavailable or
-  // invalid candidate. Ownership remains authoritative within the same
-  // validation tier, so a healthy partner still cannot replace a healthy
-  // creator-owned community.
-  const usable=validation.operationalOutcome==='SUCCEEDED'?10000:0;
+export function discordCandidateCompositeRank(candidate:DiscordCandidate,validation:{operationalOutcome?:string;relevanceStatus?:string;status?:string;inviteUrl?:string|null}):number{
+  // A genuinely usable validation always outranks an operationally
+  // unavailable, invalid, or ambiguous candidate. Ownership remains
+  // authoritative within the same usability tier, so a healthy partner still
+  // cannot replace a healthy creator-owned community.
+  const usable=isUsableDiscordValidation(validation)?10000:0;
   return usable+discordOwnershipRank(candidate)*1000+discordValidationRank(validation);
 }
