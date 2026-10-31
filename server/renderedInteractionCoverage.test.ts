@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { combineRenderedControlOffsetAdvances, isNavigableOnlyControlWindow, mergeRenderedCoverageGapCounters, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, resolveRenderedCompletionState, runRenderedClickLoop, type RenderedControlEnumeration } from './browserCommunityFallback';
+import { combineRenderedControlOffsetAdvances, isNavigableOnlyControlWindow, mergeRenderedCoverageGapCounters, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, resolveRenderedCompletionState, resolveUnexaminedPopupTargets, runRenderedClickLoop, trackRenderedPopupCoverage, type RenderedControlEnumeration } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -61,6 +61,7 @@ const renderedEnumeration = (
   structuralHintRejected: 0,
   iconLabelRecovered: 0,
   popupTargets: 0,
+  popupMarkers: controls.filter(control => control.popup && control.marker).map(control => control.marker as string),
 });
 
 test('an evidence-bearing interaction gap keeps a processed run incomplete and retryable', () => {
@@ -467,7 +468,8 @@ test('P0.2 coverage counters stay coherent, bounded, and preserved on error path
   assert.match(source, /aggregatePageCountersOnError\?\.\(\)/, 'the handler catch preserves counters from an already-enumerated page');
   assert.match(source, /if \(pageCountersAggregated\) return;/, 'the error and success aggregations cannot double-count a page');
   assert.match(source, /await recordPageContext\(\);\s*\/\/ Page-end aggregation/, 'context counters refresh after the click loop');
-  assert.match(source, /Math\.max\(0, pagePopupTargets - examinedPopups\)/, 'popups examined by the click loop are not reported as unexamined context');
+  assert.match(source, /pagePopupMarkers = trackRenderedPopupCoverage\(pagePopupMarkers, enumeration\)/, 'popup identities are tracked across every enumeration');
+  assert.match(source, /popupTargets \+= resolveUnexaminedPopupTargets\(pagePopupMarkers, examinedPopupMarkers\)/, 'only popups actually examined are excluded; a replacement cannot be cancelled by an earlier click');
   assert.match(source, /document\.getElementsByTagName\(frameTags\[tagIndex\]\)/, 'frame counting uses live collections instead of materializing every match');
   assert.doesNotMatch(source, /querySelectorAll\('iframe,frame,object,embed'\)/, 'the unbounded materializing frame query is gone');
   assert.match(source, /const labelText = `\$\{element\.innerText \|\| ''\} \$\{ariaLabel\}`/, 'structural classification uses only the control own visible text and aria-label');
@@ -485,17 +487,52 @@ test('P0.2 coverage counters stay coherent, bounded, and preserved on error path
 
 test('coverage-gap counters accumulate across later, smaller enumerations', () => {
   const first = mergeRenderedCoverageGapCounters(
-    { structuralNavigation: 0, structuralHintRejected: 0, iconLabelRecovered: 0, popupTargets: 0 },
-    { structuralNavigation: 0, structuralHintRejected: 0, iconLabelRecovered: 0, popupTargets: 1 },
+    { structuralNavigation: 0, structuralHintRejected: 0, iconLabelRecovered: 0 },
+    { structuralNavigation: 0, structuralHintRejected: 0, iconLabelRecovered: 1 },
   );
-  assert.deepEqual(first, { structuralNavigation: 0, structuralHintRejected: 0, iconLabelRecovered: 0, popupTargets: 1 });
+  assert.deepEqual(first, { structuralNavigation: 0, structuralHintRejected: 0, iconLabelRecovered: 1 });
   const second = mergeRenderedCoverageGapCounters(first, {
-    structuralNavigation: 1, structuralHintRejected: 1, iconLabelRecovered: 2, popupTargets: 0,
+    structuralNavigation: 1, structuralHintRejected: 1, iconLabelRecovered: 0,
   });
   assert.deepEqual(
     second,
-    { structuralNavigation: 1, structuralHintRejected: 1, iconLabelRecovered: 2, popupTargets: 1 },
+    { structuralNavigation: 1, structuralHintRejected: 1, iconLabelRecovered: 1 },
     'a menu trigger revealed by a click is counted even though the refreshed set is smaller',
+  );
+});
+
+test('popup coverage tracks identities so a replacement cannot be cancelled by a prior click', () => {
+  const tracked = trackRenderedPopupCoverage(new Set<string>(), { popupMarkers: ['popup-a'] });
+  assert.equal(
+    resolveUnexaminedPopupTargets(tracked, new Set(['popup-a'])),
+    0,
+    'an inline-examined popup is not a coverage gap',
+  );
+  // Clicking popup A replaces it with a hint-rejected popup B. B has its own
+  // marker, so A's click cannot cancel B out even in a same-sized snapshot.
+  const replacement = trackRenderedPopupCoverage(tracked, { popupMarkers: ['popup-b'] });
+  assert.equal(
+    resolveUnexaminedPopupTargets(replacement, new Set(['popup-a'])),
+    1,
+    'a hint-rejected replacement popup remains unexamined even though the old popup was clicked',
+  );
+});
+
+test('popup coverage counts each popup once and keeps window-opening popups unexamined', () => {
+  let tracked = new Set<string>();
+  // The same static popup is observed on every scroll/enumeration pass.
+  tracked = trackRenderedPopupCoverage(tracked, { popupMarkers: ['popup-a'] });
+  tracked = trackRenderedPopupCoverage(tracked, { popupMarkers: ['popup-a'] });
+  assert.equal(resolveUnexaminedPopupTargets(tracked, new Set()), 1, 're-observation does not inflate the count');
+  assert.equal(
+    resolveUnexaminedPopupTargets(tracked, new Set()),
+    1,
+    'a click that opened a new window did not examine the popup',
+  );
+  assert.equal(
+    resolveUnexaminedPopupTargets(tracked, new Set(['popup-a'])),
+    0,
+    'an inline click examines the matched popup',
   );
 });
 
