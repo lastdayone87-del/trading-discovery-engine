@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { DEFAULT_BROWSER_FALLBACK_BUDGET, advanceRenderedLifecycleStage, browserCauseSnippet, browserFallbackTelemetrySummary, classifyCrawlCatch, createRenderedRouteGuard, disposeRenderedRouteGuards, installRenderedRouteCloseCleanup, isExpectedRenderedRouteShutdownError, isTelegramPostPermalink, RenderedFallbackGate, renderedFallbackGate, resolveRenderedZeroPageReason, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback, type BrowserFallbackTelemetry, type RenderedRouteLike } from './browserCommunityFallback';
+import { DEFAULT_BROWSER_FALLBACK_BUDGET, advanceRenderedLifecycleStage, browserCauseSnippet, browserFallbackTelemetrySummary, classifyCrawlCatch, createRenderedRouteGuard, disposeRenderedRouteGuards, installRenderedRouteCloseCleanup, isDiscordDestinationUrl, isExpectedRenderedRouteShutdownError, isTelegramPostPermalink, RenderedFallbackGate, renderedFallbackGate, resolveRenderedZeroPageReason, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback, type BrowserFallbackTelemetry, type RenderedRouteLike } from './browserCommunityFallback';
 import { redactCauseSnippet } from './crawlerTelemetry';
 import { classifyRenderedCrawlerFailure, isRenderedNavigationTimeout, renderedCrawlerHostBackoffMs, renderedCrawlerRetryPolicy } from './renderedCrawlerPolicy';
 
@@ -583,3 +583,30 @@ test('disposeRenderedRouteGuards handles repeated and already-closed contexts', 
   assert.equal(calls, 1);
 });
 
+
+
+test('Discord destination exclusion is not bypassed by a trailing-dot host', () => {
+  assert.equal(isDiscordDestinationUrl('https://discord.gg/Abc123'), true);
+  assert.equal(isDiscordDestinationUrl('https://discord.gg./Abc123'), true,
+    'a DNS-equivalent trailing-dot host is still a Discord destination');
+  assert.equal(isDiscordDestinationUrl('https://www.discord.com./invite/Abc123'), true);
+  assert.equal(isDiscordDestinationUrl('https://canary.discord.gg./Abc123'), true);
+  assert.equal(isDiscordDestinationUrl('https://linktr.ee/creator'), false);
+  assert.equal(isDiscordDestinationUrl('https://notdiscord.gg.example/Abc123'), false,
+    'a lookalike suffix is not a Discord host');
+});
+
+test('cross-origin submission is deferred until after the post-click same-host pass', () => {
+  const source = fs.readFileSync(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8');
+  const clickLoop = source.indexOf('const clickLoop = await runRenderedClickLoop');
+  const capture = source.indexOf('preClickCrossOriginCandidates = await collectCrossOriginCandidates()');
+  const submissions = [...source.matchAll(/await enqueueCrossOrigin\(\)/g)].map(match => match.index!);
+  assert.ok(clickLoop > 0 && capture > 0 && capture < clickLoop,
+    'pre-click anchors are captured before any click can replace the document');
+  assert.equal(submissions.length, 1, 'there is exactly one cross-origin submission');
+  assert.ok(submissions[0] > clickLoop,
+    'the optional pass is submitted only after the click loop and post-click same-host pass');
+  const postClickSameHost = source.lastIndexOf("strategy:'same-hostname'");
+  assert.ok(postClickSameHost > clickLoop && postClickSameHost < submissions[0],
+    'JS-revealed required same-host links are queued before optional cross-origin pages');
+});
