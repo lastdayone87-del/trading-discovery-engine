@@ -1008,7 +1008,10 @@ function renderedAcquisitionOutcome(rendered:BrowserFallbackResult,renderedProce
     !(rendered.requiredUnvisited?.length) && !(rendered.requiredTransientFailures?.length) && !(rendered.requiredPermanentFailures?.length);
   // Required-link coverage never absorbs an interaction gap: a click-only
   // control that failed or was skipped could still be holding the invite.
-  if (requiredCovered && !interactionGap) return {outcome:'INSPECTED_NO_MATCH'};
+  // `gapRetryable: false` is explicit: optional cross-origin work that is
+  // still queued or failed must not make this clean negative retryable (and
+  // shorten its site-inspection cache from 30 days to 24 hours).
+  if (requiredCovered && !interactionGap) return {outcome:'INSPECTED_NO_MATCH',gapRetryable:false};
   if(rendered.complete&&renderedProcessed&&!interactionGap)return{outcome:'INSPECTED_NO_MATCH'};
   // A timeout is a total-timeout ceiling, not proof of page-budget pressure:
   // keep RENDERED_BUDGET_EXPIRED only when page-budget drops evidence it,

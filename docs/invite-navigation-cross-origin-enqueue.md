@@ -22,7 +22,8 @@ the following hold:
 
 1. It is not same-origin. Same-origin links keep the existing community-hint
    enqueue rule, so enabling P1.6 cannot broaden same-host navigation.
-2. It is not already visited or already queued by this pass.
+2. It is not already visited or already queued by an earlier cross-origin pass
+   in this crawl.
 3. The crawl-wide cross-origin cap
    (`MAX_RENDERED_CROSS_ORIGIN_ENQUEUES = 3`) has room. A skip is counted as
    `destination-budget`.
@@ -33,9 +34,10 @@ the following hold:
    candidates extracted from the page; enqueueing them would spend page budget
    on a surface the crawler does not need to inspect.
 
-The pass runs after the same-host pass and again after interactions, so
-required same-host links are queued first and JS-revealed link-hub targets are
-still captured.
+The pass captures cross-origin anchors before interactions, so a click that
+replaces the document cannot hide them, but submits only after the post-click
+same-host pass. Optional destinations therefore never take queue positions
+ahead of JS-revealed required same-host links.
 
 ## Policy and safety boundary
 

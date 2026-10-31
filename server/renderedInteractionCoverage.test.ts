@@ -743,8 +743,9 @@ test('outcome classifier source contracts: gap outranks clean resolution and nev
     source,
     /if \(interactionGap\) return \{outcome:'FOUND',failureClass:rendered\.timedOut\?'RENDERED_TIMEOUT':'RENDERED_INTERACTION_GAP',gapRetryable:true\};/,
   );
-  // Required-link coverage never absorbs the gap into a clean absence.
-  assert.match(source, /if \(requiredCovered && !interactionGap\) return \{outcome:'INSPECTED_NO_MATCH'\};/);
+  // Required-link coverage never absorbs the gap into a clean absence. The
+  // explicit false keeps optional cross-origin work from owning retry/cache.
+  assert.match(source, /if \(requiredCovered && !interactionGap\) return \{outcome:'INSPECTED_NO_MATCH',gapRetryable:false\};/);
   assert.match(source, /if\(rendered\.complete&&renderedProcessed&&!interactionGap\)return\{outcome:'INSPECTED_NO_MATCH'\};/);
   // Partial/acquisition-failed runs keep the gap class visible for retry.
   assert.match(source, /failureClass:timeoutClass\|\|interactionClass\|\|'RENDERED_PARTIAL_COVERAGE'/);
