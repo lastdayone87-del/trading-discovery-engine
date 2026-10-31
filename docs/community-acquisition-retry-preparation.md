@@ -49,7 +49,7 @@ Deliberate exclusions from the filter:
   segments still crawl.
 - `server/pageAssetFilter.test.ts`: asset/CDN hosts are filtered; profile and
   invite hosts are preserved.
-- `server/communityRetryPolicy.test.ts`: non-page/malformed observations own no
+- `server/communityRetryPolicy.test.ts`: malformed/asset observations own no
   retry, while a legitimate page failure remains retryable.
 
 **Expected effect (not yet measured in production):** up to 1,022
