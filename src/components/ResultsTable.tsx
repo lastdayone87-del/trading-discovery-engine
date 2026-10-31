@@ -5,7 +5,7 @@ import { ChannelRecord, ReviewQueueItem } from '../types';
 import { communityIntentDisplay } from './communityIntentDisplay';
 import { ExternalLink, RefreshCw, Eye, Copy, Check, Search, CheckCircle2, XCircle, ShieldAlert, X, ChevronRight } from 'lucide-react';
 import { responseError, submitReviewDecision } from '../reviewDecision';
-import { formatFoundAgo } from '../utils/relativeTime';
+import { formatFoundAgo, formatLastVerifiedAgo } from '../utils/relativeTime';
 import { isConfirmedDiscordInvite } from '../discordInviteView';
 
 interface Props {
@@ -364,6 +364,8 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
               ) : (
                 filteredChannels.map(c => {
                   const foundAge = formatFoundAgo(c.discord_invite_first_validated_at);
+                  const lastVerifiedAge = formatLastVerifiedAgo(c.discord_invite_last_verified_at);
+                  const revalidationUncertain = Boolean(c.discord_invite_revalidation_uncertain);
                   const retryReconciliationRequired = c.community_retry_job_reconciliation_status === 'RECONCILIATION_REQUIRED';
                   const retryReconciliationReason = c.community_retry_job_reconciliation_reason || 'Legacy community retry was reclassified by the governed reconciliation pass.';
                   const automaticRetryActive = !retryReconciliationRequired && (c.community_retry_job_status === 'PENDING' || c.community_retry_job_status === 'PROCESSING');
@@ -616,6 +618,22 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                               : 'No trustworthy successful validation timestamp is recorded for this invite.'}
                           >
                             {foundAge || 'Found time unavailable'}
+                          </div>
+                        )}
+
+                        {c.discord_invite && (lastVerifiedAge || revalidationUncertain) && (
+                          <div
+                            data-testid="discord-last-verified"
+                            className={`mt-0.5 ${revalidationUncertain ? 'font-medium text-amber-700 dark:text-amber-400' : 'font-medium text-sky-700 dark:text-sky-400'}`}
+                            title={revalidationUncertain
+                              ? `Previously verified but currently uncertain: ${c.discord_invite_last_verified_at ? `last successful serving validation ${new Date(c.discord_invite_last_verified_at).toLocaleString()}` : 'no serving-validation timestamp is available'}. The invite is retained as last-known-good, not freshly validated.`
+                              : c.discord_invite_last_verified_at
+                                ? `Last successful serving validation: ${new Date(c.discord_invite_last_verified_at).toLocaleString()}`
+                                : 'No successful serving-validation timestamp is recorded for this invite.'}
+                          >
+                            {revalidationUncertain
+                              ? `Previously verified${lastVerifiedAge ? ` ${lastVerifiedAge.replace(/^Verified /, '')}` : ''} · currently uncertain`
+                              : lastVerifiedAge}
                           </div>
                         )}
 

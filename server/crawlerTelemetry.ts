@@ -229,6 +229,40 @@ export interface CrawlerTelemetry {
   rateLimitedRequests: number;
   hostBackoffsApplied: number;
   /**
+   * Bounded rendered-control coverage certificate (counts only, never
+   * selectors/text/URLs). `Total` is the complete matched-control set on
+   * processed pages; `Skipped` is the subset not examined because of the
+   * 64-control evaluation window or click budget. Sparse: omitted when no
+   * evidence-bearing control was enumerated or the row predates
+   * instrumentation. Persisting these distinguishes 64-overflow from ordinary
+   * click-budget slicing in production.
+   */
+  evidenceControlsTotal?: number;
+  evidenceControlsClicked?: number;
+  evidenceControlsFailed?: number;
+  evidenceControlsSkipped?: number;
+  /**
+   * True when every processed page with controls had an entirely navigable
+   * evaluation window: each window was fully examined with zero clicks, so
+   * the durable retry offset may advance past it. Sparse; absent on rows that
+   * predate instrumentation or when any page had clickable targets.
+   */
+  evidenceControlsNavigableOnly?: boolean;
+  /**
+   * True when a processed page had clickable controls inside its evaluation
+   * window but recorded no progress (deadline, zero budget, detached marker).
+   * The shared per-seed retry offset must not advance while such a window is
+   * unexamined. Sparse; rendered-only.
+   */
+  evidenceControlsUncertified?: boolean;
+  /**
+   * Bounded full-pool positions the durable retry offset should advance: the
+   * smallest per-page progress, so a page with a smaller pool is never rotated
+   * past controls it did not examine. Sparse; absent on pre-instrumentation
+   * rows.
+   */
+  evidenceControlsOffsetAdvance?: number;
+  /**
    * Compact per-crawl drop/stop counters keyed by CRAWL_DROP_REASONS
    * (ints only, taxonomy-bounded to 13 keys — never URLs or payloads).
    * Tells future investigations where candidate URLs were lost. Sparse:
@@ -502,6 +536,12 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
   const candidate = input as Partial<CrawlerTelemetry>;
   if (candidate.mode !== 'STATIC' && candidate.mode !== 'RENDERED') return undefined;
   const number = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+  // Established persisted-counter ceiling (same bound as drop reasons, scrolls,
+  // and experiment attribution). The control offset indexes the rotated
+  // 64-control evaluation window, so a larger persisted value is malformed.
+  const MAX_TELEMETRY_COUNTER = 999999;
+  const MAX_EVIDENCE_CONTROL_OFFSET = 64;
+  const boundedCount = (value: unknown) => Math.min(MAX_TELEMETRY_COUNTER, number(value));
   // Bounded sanitized string: collapsed whitespace, capped length. Non-string
   // input yields undefined so malformed persisted rows cannot smuggle text.
   const text = (value: unknown, max: number): string | undefined => {
@@ -550,6 +590,27 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
     blockedRequests: number(candidate.blockedRequests),
     rateLimitedRequests: number(candidate.rateLimitedRequests),
     hostBackoffsApplied: number(candidate.hostBackoffsApplied),
+    ...(candidate.mode === 'RENDERED' && number(candidate.evidenceControlsTotal) > 0
+      ? { evidenceControlsTotal: boundedCount(candidate.evidenceControlsTotal) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.evidenceControlsClicked) > 0
+      ? { evidenceControlsClicked: boundedCount(candidate.evidenceControlsClicked) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.evidenceControlsFailed) > 0
+      ? { evidenceControlsFailed: boundedCount(candidate.evidenceControlsFailed) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.evidenceControlsSkipped) > 0
+      ? { evidenceControlsSkipped: boundedCount(candidate.evidenceControlsSkipped) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && (candidate as { evidenceControlsNavigableOnly?: unknown }).evidenceControlsNavigableOnly === true
+      ? { evidenceControlsNavigableOnly: true }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && (candidate as { evidenceControlsUncertified?: unknown }).evidenceControlsUncertified === true
+      ? { evidenceControlsUncertified: true }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.evidenceControlsOffsetAdvance) > 0
+      ? { evidenceControlsOffsetAdvance: Math.min(MAX_EVIDENCE_CONTROL_OFFSET, boundedCount(candidate.evidenceControlsOffsetAdvance)) }
+      : {}),
     ...(isRenderedLifecycleStage(stage) ? { lastLifecycleStage: stage } : {}),
     ...(isRenderedZeroPageReason(reason) ? { zeroPageReason: reason } : {}),
     ...(cause ? { launchCauseSnippet: cause } : {}),

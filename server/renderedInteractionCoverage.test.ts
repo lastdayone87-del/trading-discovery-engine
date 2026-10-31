@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { planRevealedRenderedClickTargets, remainingRenderedClickBudget, resolveRenderedCompletionState, runRenderedClickLoop } from './browserCommunityFallback';
+import { combineRenderedControlOffsetAdvances, isNavigableOnlyControlWindow, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, resolveRenderedCompletionState, runRenderedClickLoop } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -63,6 +63,166 @@ test('an evidence-bearing interaction gap keeps a processed run incomplete and r
   });
   assert.equal(clean.complete, true, 'without a gap the processed run still resolves clean');
   assert.equal(clean.retryable, false);
+});
+
+test('the evaluation window rotates over the full matched-control pool so control 65 is reachable', () => {
+  const controls = Array.from({ length: 70 }, (_, index) => renderedButton(index, `oc-${index + 1}`));
+  const firstWindow = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 0);
+  assert.equal(firstWindow.evaluationWindow.length, 64);
+  assert.deepEqual(firstWindow.toClick.map(target => target.marker), ['oc-1', 'oc-2', 'oc-3', 'oc-4']);
+
+  const rotatedWindow = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 64);
+  assert.equal(rotatedWindow.evaluationWindow.length, 64);
+  assert.deepEqual(
+    rotatedWindow.toClick.map(target => target.marker),
+    ['oc-65', 'oc-66', 'oc-67', 'oc-68'],
+    'the durable retry offset reaches controls beyond the first 64',
+  );
+
+  // 64-control regression: a full window still wraps to the first control and
+  // never invents a 65th target.
+  const sixtyFour = controls.slice(0, 64);
+  const wrapped = partitionRenderedClickTargets(sixtyFour, 'https://creator.example/', 4, 64);
+  assert.equal(wrapped.evaluationWindow.length, 64);
+  assert.deepEqual(wrapped.toClick.map(target => target.marker), ['oc-1', 'oc-2', 'oc-3', 'oc-4']);
+});
+
+test('an all-navigable evaluation window is certified for durable rotation', () => {
+  // A 70-control page whose first window contains only same-host navigable
+  // anchors attempts zero clicks. Without an explicit certificate the durable
+  // offset would never advance and control 65 would be unreachable forever.
+  const anchors = Array.from({ length: 70 }, (_, index) => ({
+    index,
+    marker: `oc-${index + 1}`,
+    text: `Community link ${index + 1}`,
+    href: `https://creator.example/community-${index + 1}`,
+    tag: 'anchor' as const,
+  }));
+  const plan = partitionRenderedClickTargets(anchors, 'https://creator.example/', 4, 0);
+  assert.equal(plan.toClick.length, 0, 'navigable anchors are enqueue-handled, not clicked');
+  assert.equal(plan.skippedNavigableAnchors, 64);
+  assert.equal(isNavigableOnlyControlWindow(plan, 4), true, 'a fully examined navigable window advances the rotation');
+  assert.equal(isNavigableOnlyControlWindow(plan, 0), false, 'a zero click budget did not examine the window');
+  assert.equal(renderedClickOffsetAdvance(plan, 0, 4), 64, 'a certified all-navigable window advances one full window');
+  assert.equal(renderedClickOffsetAdvance(plan, 0, 0), 0, 'a zero click budget never advances the rotation');
+
+  const clickable = partitionRenderedClickTargets(
+    Array.from({ length: 70 }, (_, index) => renderedButton(index, `oc-${index + 1}`)),
+    'https://creator.example/',
+    4,
+    0,
+  );
+  assert.equal(isNavigableOnlyControlWindow(clickable, 4), false, 'a window with clickable controls is not certified as navigable-only');
+  assert.equal(renderedClickOffsetAdvance(clickable, 0, 4), 0, 'an uncertified zero-click window (deadline/crash) must not advance');
+  assert.equal(renderedClickOffsetAdvance(clickable, 2, 4), 2, 'a partial click window advances past the last attempted control');
+});
+
+test('retry offsets advance past anchors before clicked controls instead of repeating them', () => {
+  // Four navigable anchors precede eight buttons. The offset indexes the full
+  // matched pool, so advancing by the raw click count (4) would land back on
+  // button 1; it must advance past the last attempted button (position 7).
+  const anchors = Array.from({ length: 4 }, (_, index) => ({
+    index,
+    marker: `oc-a${index + 1}`,
+    text: `Community link ${index + 1}`,
+    href: `https://creator.example/community-${index + 1}`,
+    tag: 'anchor' as const,
+  }));
+  const buttons = Array.from({ length: 8 }, (_, index) => renderedButton(index + 4, `oc-b${index + 1}`));
+  const controls = [...anchors, ...buttons];
+
+  const first = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 0);
+  assert.deepEqual(first.toClick.map(target => target.marker), ['oc-b1', 'oc-b2', 'oc-b3', 'oc-b4']);
+  assert.equal(renderedClickOffsetAdvance(first, 4, 4), 8, 'the offset lands just past the last clicked control');
+
+  const second = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 8);
+  assert.deepEqual(
+    second.toClick.map(target => target.marker),
+    ['oc-b5', 'oc-b6', 'oc-b7', 'oc-b8'],
+    'the retry examines the next buttons instead of repeating the first four',
+  );
+  assert.equal(renderedClickOffsetAdvance(second, 4, 4), 4, 'the next page-relative advance covers the four attempted buttons');
+
+  // Anchors after the clickable controls do not change the position advance.
+  const buttonsFirst = [...buttons, ...anchors.map((anchor, index) => ({ ...anchor, index: index + 8, marker: `oc-tail-a${index + 1}` }))];
+  const firstButtonsFirst = partitionRenderedClickTargets(buttonsFirst, 'https://creator.example/', 4, 0);
+  assert.deepEqual(firstButtonsFirst.toClick.map(target => target.marker), ['oc-b1', 'oc-b2', 'oc-b3', 'oc-b4']);
+  assert.equal(renderedClickOffsetAdvance(firstButtonsFirst, 4, 4), 4);
+  const secondButtonsFirst = partitionRenderedClickTargets(buttonsFirst, 'https://creator.example/', 4, 4);
+  assert.deepEqual(secondButtonsFirst.toClick.map(target => target.marker), ['oc-b5', 'oc-b6', 'oc-b7', 'oc-b8']);
+});
+
+test('failed controls stop retry rotation before their unexamined content', async () => {
+  const anchors = Array.from({ length: 4 }, (_, index) => ({
+    index,
+    marker: `oc-fa${index + 1}`,
+    text: `Community link ${index + 1}`,
+    href: `https://creator.example/community-${index + 1}`,
+    tag: 'anchor' as const,
+  }));
+  const buttons = Array.from({ length: 8 }, (_, index) => renderedButton(index + 4, `oc-fb${index + 1}`));
+  const controls = [...anchors, ...buttons];
+  const plan = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 0);
+  let attempts = 0;
+  const result = await runRenderedClickLoop({
+    targets: plan.toClick,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    // The first two clicks succeed; the third fails; the fourth succeeds.
+    click: async () => { attempts++; return attempts !== 3; },
+    enumerate: async () => ({ controls, total: controls.length }),
+    pageUrl: () => 'https://creator.example/',
+  });
+  assert.equal(result.evidenceControlsClicked, 3);
+  assert.equal(result.evidenceControlsFailed, 1);
+  assert.equal(result.firstFailedTargetIndex, 2, 'the failed control is identified by queue position');
+  // Four anchors precede the buttons. The failed button is at full-pool
+  // position 6; the offset must stop there, not move past it to position 7.
+  assert.equal(
+    renderedClickOffsetAdvance(plan, result.evidenceControlsClicked + result.evidenceControlsFailed, 4, result.firstFailedTargetIndex),
+    6,
+    'the next retry starts at the failed control',
+  );
+  const next = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 6);
+  assert.deepEqual(next.toClick.map(target => target.marker), ['oc-fb3', 'oc-fb4', 'oc-fb5', 'oc-fb6']);
+});
+
+test('a failed first control cannot freeze the retry rotation', async () => {
+  const buttons = Array.from({ length: 8 }, (_, index) => renderedButton(index, `oc-hf${index + 1}`));
+  const plan = partitionRenderedClickTargets(buttons, 'https://creator.example/', 4, 0);
+  let attempts = 0;
+  const result = await runRenderedClickLoop({
+    targets: plan.toClick,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    // The first control is disabled/hidden and always fails; the next three
+    // clicks succeed. A position-zero failure must not pin every retry to the
+    // same window.
+    click: async () => { attempts++; return attempts !== 1; },
+    enumerate: async () => ({ controls: buttons, total: buttons.length }),
+    pageUrl: () => 'https://creator.example/',
+  });
+  assert.equal(result.evidenceControlsFailed, 1);
+  assert.equal(result.firstFailedTargetIndex, 0);
+  assert.equal(
+    renderedClickOffsetAdvance(plan, result.evidenceControlsClicked + result.evidenceControlsFailed, 4, result.firstFailedTargetIndex),
+    4,
+    'the attempted window advances instead of freezing at zero',
+  );
+  const next = partitionRenderedClickTargets(buttons, 'https://creator.example/', 4, 4);
+  assert.deepEqual(next.toClick.map(target => target.marker), ['oc-hf5', 'oc-hf6', 'oc-hf7', 'oc-hf8']);
+});
+
+test('shared retry offset advances by the smallest page progress, never the largest', () => {
+  // A seed page with 64 navigable anchors advances 64 on its own, while a
+  // child page with clickable buttons advances 4. Saving the largest advance
+  // would rotate the child's pool back to its first buttons (64 % 64 = 0) and
+  // leave later buttons permanently unclicked.
+  assert.equal(combineRenderedControlOffsetAdvances(undefined, 64), 64);
+  assert.equal(combineRenderedControlOffsetAdvances(64, 4), 4, 'the navigable seed cannot skip the clickable child');
+  assert.equal(combineRenderedControlOffsetAdvances(4, 8), 4, 'a later page never increases the shared advance');
+  assert.equal(combineRenderedControlOffsetAdvances(4, 0), 4, 'a page with no progress does not erase prior progress');
+  assert.equal(combineRenderedControlOffsetAdvances(undefined, 0), undefined, 'no progress stays sparse');
 });
 
 test('revealed controls reserve the click slots for already-queued controls', () => {
@@ -242,7 +402,10 @@ test('zero-candidate interaction gaps stay retryable even with permanent-only li
 
 test('rendered control coverage counts overflow and uses stable markers across DOM mutations', () => {
   const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
-  assert.match(source, /return \{ controls, total: matched\.length \}/, 'total matches are returned before the 64-item slice');
+  assert.match(source, /return \{ controls, total: matched\.length \}/, 'the complete matched set is returned with its total');
+  assert.doesNotMatch(source, /matched\.slice\(0, 64\)/, 'enumeration must not truncate before the retry rotation');
+  assert.match(source, /RENDERED_CONTROL_EVALUATION_WINDOW = 64/);
+  assert.match(source, /const evaluationWindow = rotated\.slice\(0, windowSize\)/, 'the evaluation window is applied after rotating the full matched pool');
   assert.match(source, /recordControlEnumeration\(firstEnumeration\.total\)/);
   assert.match(source, /data-oc-control/);
   assert.match(source, /partitionRenderedClickTargets\(controls, page\.url\(\), limits\.maxClicksPerPage, limits\.clickOffset\)/, 'the retry offset rotates the full pool before the cap');
@@ -257,6 +420,18 @@ test('rendered control coverage counts overflow and uses stable markers across D
     'queued controls beyond the click cap are counted as skipped');
   assert.match(source, /if \(!input\.deadlineExceeded\(\)\) \{[\s\S]*?const refreshed = await input\.enumerate\(\)/,
     'the loop re-enumerates after every click, including the final permitted click');
+  assert.match(source, /telemetry\.evidenceControlsTotal = evidenceControlsSeen \|\| undefined/);
+  assert.match(source, /telemetry\.evidenceControlsSkipped = evidenceControlsSkipped \|\| undefined/);
+  assert.match(source, /combineRenderedControlOffsetAdvances\(\s*evidenceControlsOffsetAdvance,\s*offsetAdvance,?\s*\)/, 'the crawl aggregates per-page progress conservatively');
+  assert.match(source, /evidenceControlsUncertified = true/, 'an unexamined clickable page blocks shared offset advancement');
+  assert.match(source, /telemetry\.evidenceControlsUncertified = evidenceControlsUncertified \|\| undefined/);
+  assert.match(source, /clickLoop\.firstFailedTargetIndex/, 'the crawl stops rotation at the first failed control');
+  assert.match(source, /if \(pageClickWindowPending\) evidenceControlsUncertified = true/, 'a throw during a clickable page leaves the seed uncertified');
+  assert.equal(
+    (source.match(/publishEvidenceControlCertificate\(\);/g) || []).length,
+    2,
+    'both the success and catch paths publish the control certificate to telemetry',
+  );
 });
 
 test('shared rendered evidence stays fail-closed: gapped/timed-out lenders never enter inventory', () => {

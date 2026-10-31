@@ -77,5 +77,26 @@ test('recent invite sorting is server-side and has a stable channel tie-breaker'
   assert.match(ui, /Recently confirmed/);
   assert.match(ui, /Found time unavailable/);
   assert.match(ui, /formatFoundAgo\(c\.discord_invite_first_validated_at\)/);
+  assert.match(ui, /formatLastVerifiedAgo\(c\.discord_invite_last_verified_at\)/);
+  assert.match(ui, /Previously verified.*currently uncertain/);
+  assert.match(db, /DISCORD_INVITE_LAST_VERIFIED_SQL/);
+  // Pin the projection at both SELECT sites, not just the constant definition:
+  // a regression that drops the field from either endpoint must fail here.
+  assert.match(db, /\$\{DISCORD_INVITE_LAST_VERIFIED_SQL\} AS discord_invite_last_verified_at/);
+  assert.match(db, /\$\{discordInviteLastVerifiedSql\('c'\)\} AS discord_invite_last_verified_at/);
+  assert.match(db, /operational_outcome='SUCCEEDED'/);
+  // NON_TRADING successes count: the confirmed view explicitly permits a
+  // NON_TRADING row with a serving invite, so its live check still dates it.
+  assert.match(db, /semantic_status IN \('ACTIVE','ACTIVE_LOW_VOLUME','NON_TRADING'\)/);
+  // The timestamp must describe the invite that is actually served: an older
+  // retained invite coexisting with newer candidate fields cannot inherit a
+  // different candidate's successful attempt. The correlation is on the served
+  // invite alone — no candidate-id branch.
+  assert.match(db, /AND lower\(COALESCE\(a\.resolved_locator,a\.invite_locator\)\)=lower\(\$\{alias\}\.discord_invite\)/);
+  assert.doesNotMatch(db, /a\.candidate_id=\$\{alias\}\.discord_candidate_id/);
+  // Creator-association promotion records the attempt as UNCERTAIN, then serves
+  // it as ACTIVE; the channel marker identifies that effective verification.
+  assert.match(db, /a\.semantic_status='UNCERTAIN' AND \$\{alias\}\.discord_relevance_status='TRADING_RELEVANT'/);
+  assert.match(db, /discord_invite_last_verified_at: iso\(row\.discord_invite_last_verified_at\)/);
   assert.doesNotMatch(ui, /audit checkbox|reviewed marker|unaudited/i);
 });

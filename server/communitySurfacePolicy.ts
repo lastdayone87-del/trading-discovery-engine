@@ -319,6 +319,50 @@ const PAGE_ASSET_INFRASTRUCTURE_HOSTS = [
   'youtubei-att.googleapis.com',
   'gstatic.com',
 ];
+
+/**
+ * Unmistakable asset/CDN hosts that can never serve a creator community page.
+ * These are deliberately host-level only where the entire host is a media or
+ * static-bundle CDN (Meta/Instagram, Twitter, Google avatars, Cloudinary,
+ * imgix, image proxies, WordPress Photon, code CDNs). Social/profile hosts and
+ * invite hosts are NOT listed: `instagram.com`, `x.com`, `discord.gg`, and
+ * `discordapp.com/invite/...` remain eligible. Generic CDNs that can host
+ * entire sites (`cloudfront.net`, `amazonaws.com`) are also deliberately
+ * excluded.
+ */
+const NON_PAGE_ASSET_CDN_HOSTS = [
+  'fbcdn.net',
+  'cdninstagram.com',
+  'twimg.com',
+  'ggpht.com',
+  'googleusercontent.com',
+  // Only the media-delivery host is asset-only. `cloudinary.com` itself serves
+  // HTML (marketing/docs), so a host-suffix match on the parent would drop
+  // real pages and every unrelated subdomain before crawling.
+  'res.cloudinary.com',
+  'imgix.net',
+  'weserv.nl',
+  'wsrv.nl',
+  'i0.wp.com',
+  'i1.wp.com',
+  'i2.wp.com',
+  'i3.wp.com',
+  'wixstatic.com',
+  'jsdelivr.net',
+  'unpkg.com',
+  'cdnjs.cloudflare.com',
+  'pinimg.com',
+  'licdn.com',
+  'sndcdn.com',
+  'scdn.co',
+  'spotifycdn.com',
+  'tiktokcdn.com',
+  'tiktokcdn-us.com',
+  'substackcdn.com',
+  'cdn.discordapp.com',
+  'media.discordapp.net',
+];
+const ASSET_INFRASTRUCTURE_HOSTS = [...PAGE_ASSET_INFRASTRUCTURE_HOSTS, ...NON_PAGE_ASSET_CDN_HOSTS];
 export function isPageAssetInfrastructureUrl(rawUrl: string): boolean {
   // Scheme-less links get the same https fallback as normalizeExternalUrl so
   // valid creator links (e.g. `example.com/community`) are never dropped;
@@ -329,7 +373,7 @@ export function isPageAssetInfrastructureUrl(rawUrl: string): boolean {
     try {
       const host = new URL(candidate).hostname.toLowerCase().replace(/\.$/, '');
       if (!host) return true;
-      if (PAGE_ASSET_INFRASTRUCTURE_HOSTS.some(entry => host === entry || host.endsWith(`.${entry}`))) return true;
+      if (ASSET_INFRASTRUCTURE_HOSTS.some(entry => host === entry || host.endsWith(`.${entry}`))) return true;
       return false;
     } catch {
       continue;
@@ -366,7 +410,8 @@ export type CrawlAdmissionReasonCode =
   | 'EMPTY_LABEL'
   | 'NON_PUBLIC_ADDRESS'
   | 'ASSET_HOST'
-  | 'RESOURCE_EXTENSION';
+  | 'RESOURCE_EXTENSION'
+  | 'MALFORMED_URL';
 
 export interface CrawlAdmissionDecision {
   eligible: boolean;
@@ -376,8 +421,36 @@ export interface CrawlAdmissionDecision {
 // Page-resource path suffixes that can never be community websites,
 // regardless of host. Mirrors the extraction-time asset-extension filter so
 // stored links cannot bypass it; document/feed types (pdf/rss/xml) are
-// intentionally NOT in this list and stay eligible.
-const RESOURCE_PATH_EXTENSION = /\.(?:js|mjs|css|map|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|eot|mp4|webm|mp3|wav|ogg|avi|mov|zip|gz|rar|7z|exe|dmg)(?:$)/i;
+// intentionally NOT in this list and stay eligible. The extension may be
+// followed by URL punctuation (`?`, `&`, `#`, quotes, encoded quote) or end
+// the path: template/CDN noise often appends transform parameters without a
+// `?` (for example `card.png&w=1920&q=75`). `/`, `,`, and `;` are deliberately
+// NOT terminators: a dot-named path segment can be a legitimate page slug
+// (`/projects/three.js/community`, `/topics/vue.js/discord`). A dot inside a
+// page slug (`v1.2`, `.js.html`, `using-.js-files`) also does not match
+// because the following character is not a delimiter.
+const RESOURCE_PATH_EXTENSION = /\.(?:js|mjs|css|map|png|jpe?g|gif|webp|svg|avif|apng|bmp|tiff?|heic|jfif|ico|woff2?|ttf|otf|eot|mp4|m4v|webm|mp3|m4a|aac|flac|wav|ogg|opus|avi|mov|3gp|zip|gz|rar|7z|exe|dmg)(?=$|[&%?"'#\s])/i;
+
+// Asset-like directory names are NOT evidence of an asset. `/images` can be a
+// real page (and `/bit.ly/icons`/`t.me/photos` are ordinary routes), while an
+// extensionless asset costs at most one fetch. Dropping a possible page before
+// the fetch is a recall loss, so rejection requires provable asset shape:
+// `RESOURCE_PATH_EXTENSION` for asset files and `ASSET_HOST` for asset-only
+// hosts. Deeper paths under `/images/...` are likewise not rejected by name.
+
+// Template placeholders and script/quote artifacts emitted by indiscriminate
+// dynamic-attribute extraction (`{{link}}`, `${link}`, `%22%22;`,
+// `d,a.onload=function()%7B...`). Braces, angle brackets, backslashes, double
+// quotes, and control characters cannot appear in a legitimate page path;
+// single quotes are deliberately allowed (`/o'brien-community`). Script
+// keywords alone are NOT evidence: a path may legitimately contain
+// `/files/document.pdf`, `/window.html`, `/let-s-trade-community`, or
+// `/function/community`. Declarations therefore need keyword + whitespace +
+// identifier + a declaration terminator (`=`, `;`, or end), which keeps an
+// ordinary encoded slug such as `/Let%20Me%20Trade` (decoded `Let Me Trade`)
+// eligible. Functions need a call/named-function form, and DOM globals need a
+// property followed by assignment/call syntax.
+const MALFORMED_PATH = /[{}"<>\\\u0000-\u001F\u007F]|(?:^|[\/,;])(?:var|let|const)\s+[A-Za-z_$][\w$]*\s*(?:=|;|$)|(?:^|[\/,;])function\s*(?:\(|[A-Za-z_$][\w$]*\s*\()|\.(?:onload|onerror|onclick)\s*=|(?:^|[\/,;])(?:this|document|window)(?:\.[A-Za-z_$][\w$]*){1,4}\s*[=(]/i;
 
 export function assessCrawlAdmission(rawUrl: string): CrawlAdmissionDecision {
   // Same scheme handling as `normalizeExternalUrl`: scheme-less input gets
@@ -425,8 +498,12 @@ export function assessCrawlAdmission(rawUrl: string): CrawlAdmissionDecision {
   if (isPageAssetInfrastructureUrl(parsed.toString())) {
     return { eligible: false, reasonCode: 'ASSET_HOST' };
   }
-  if (RESOURCE_PATH_EXTENSION.test(decodeResourcePathname(parsed.pathname))) {
+  const decodedPath = decodeResourcePathname(parsed.pathname);
+  if (RESOURCE_PATH_EXTENSION.test(decodedPath)) {
     return { eligible: false, reasonCode: 'RESOURCE_EXTENSION' };
+  }
+  if (MALFORMED_PATH.test(decodedPath)) {
+    return { eligible: false, reasonCode: 'MALFORMED_URL' };
   }
   return { eligible: true, reasonCode: 'ELIGIBLE' };
 }
@@ -447,7 +524,17 @@ function decodeResourcePathname(pathname: string): string {
       if (decoded === current) break;
       current = decoded;
     } catch {
-      break;
+      // A single malformed escape must not disable decoding for the
+      // well-formed escapes around it: `/%7B%7Blink%7D%7D%ZZ` would otherwise
+      // keep its encoded braces and bypass the artifact check. Decode the
+      // valid runs, leave the malformed escape literal, and continue the
+      // bounded loop so escapes exposed by that pass are decoded too:
+      // `/%252Ejs%ZZ` -> `/%2Ejs%ZZ` -> `/.js%ZZ`.
+      const decodedRuns = current.replace(/(?:%[0-9a-fA-F]{2})+/g, run => {
+        try { return decodeURIComponent(run); } catch { return run; }
+      });
+      if (decodedRuns === current) break;
+      current = decodedRuns;
     }
   }
   return current;

@@ -30,6 +30,41 @@ test('dotless single-label hosts are rejected by admission, not asset-filtered',
   assert.equal(isPageAssetInfrastructureUrl('https://g/'), false);
 });
 
+test('media/CDN hosts are filtered while profile and invite hosts stay eligible', () => {
+  for (const raw of [
+    'https://scontent-lhr8-1.xx.fbcdn.net/v/t1.6435-9/abc.jpg',
+    'https://scontent.cdninstagram.com/v/t51/abc.jpg',
+    'https://pbs.twimg.com/media/abc.jpg',
+    'https://yt3.ggpht.com/abc',
+    'https://lh3.googleusercontent.com/abc',
+    'https://res.cloudinary.com/demo/image/upload/sample.jpg',
+    'https://creator.imgix.net/hero.jpg',
+    'https://images.weserv.nl/?url=example.com/image.png',
+    'https://i0.wp.com/example.com/image.png',
+    'https://static.wixstatic.com/media/abc.png',
+    'https://cdn.jsdelivr.net/npm/pkg/dist/app.js',
+    'https://unpkg.com/pkg/dist/app.js',
+    'https://cdnjs.cloudflare.com/ajax/libs/pkg/app.js',
+    'https://i.pinimg.com/abc.jpg',
+    'https://media.licdn.com/dms/image/abc.jpg',
+    'https://i.scdn.co/image/abc',
+    'https://p16-sign.tiktokcdn.com/abc~tplv.jpg',
+    'https://substackcdn.com/image/fetch/abc.png',
+    'https://cdn.discordapp.com/attachments/1/2/file.png',
+    'https://media.discordapp.net/attachments/1/2/file.png',
+  ]) assert.equal(isPageAssetInfrastructureUrl(raw), true, raw);
+  for (const raw of [
+    'https://www.instagram.com/creator/',
+    'https://x.com/creator',
+    'https://discord.com/invite/abc123',
+    'https://discordapp.com/invite/abc123',
+    'https://discord.gg/abc123',
+    'https://t.me/tradingroom',
+    'https://linktr.ee/creator',
+    'https://example.com/community',
+  ]) assert.equal(isPageAssetInfrastructureUrl(raw), false, raw);
+});
+
 test('public-about extraction filters asset URLs so they cannot become crawl seeds', () => {
   const html = `<html><head></head><body><script>ytInitialData = {"a":{"urlEndpoint":{"url":"https://i.ytimg.com/vi/abc/hqdefault.jpg"}},"b":{"urlEndpoint":{"url":"https://www.kiss.com/"}},"c":{"channelExternalLinkViewModel":{"link":{"content":"https://kiki.com/shop"}}}};</script><a href="https://schema.org/Person">x</a><a href="https://t.me/tradingroom">join</a></body></html>`;
   const parsed = parseYouTubeChannelAboutFromHtml(html, {});

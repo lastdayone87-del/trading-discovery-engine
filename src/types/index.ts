@@ -180,6 +180,14 @@ export interface ChannelRecord {
    * trustworthy confirmation timestamp exists. Never derived from first_seen
    * or enrichment time. */
   discord_invite_first_validated_at?: string | null;
+  /** Latest successful serving validation of the selected invite, computed
+   * read-only from the append-only check-attempt ledger. Null when no serving
+   * attempt is recorded; never derived from first_seen or enrichment time. */
+  discord_invite_last_verified_at?: string | null;
+  /** Read-only: the invite is retained as last-known-good while the current
+   * revalidation is uncertain. It was previously verified, but is not a fresh
+   * validation of current relevance. */
+  discord_invite_revalidation_uncertain?: boolean;
   discord_discovery_status?: DiscordDiscoveryStatus;
   discord_candidate_locator?: string | null;
   discord_candidate_id?: string | null;
