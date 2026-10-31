@@ -1466,11 +1466,16 @@ export function collectRenderedOpenShadowContent(): RenderedOpenShadowSnapshot {
   const maxChars = 200_000;
   const maxHrefs = 256;
   const maxDepth = 4;
+  // Light-DOM host discovery bound. It is deliberately far above ordinary
+  // page sizes: a lower bound made every page with a few thousand elements a
+  // permanent interaction gap even when it had no shadow DOM at all.
+  const maxLightElements = 50_000;
   const textParts: string[] = [];
   const hrefs: string[] = [];
   let chars = 0;
   let nodes = 0;
   let roots = 0;
+  let hostsSeen = 0;
   let truncated = false;
   const queue: Array<{ root: ShadowRoot; depth: number }> = [];
   const root = document.body || document.documentElement;
@@ -1478,18 +1483,21 @@ export function collectRenderedOpenShadowContent(): RenderedOpenShadowSnapshot {
   const lightWalker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
   let lightNode = lightWalker.nextNode();
   let lightExamined = 0;
-  while (lightNode && lightExamined < 4_000) {
+  while (lightNode && lightExamined < maxLightElements) {
     lightExamined++;
     const shadow = (lightNode as HTMLElement).shadowRoot;
     if (shadow) {
+      hostsSeen++;
       if (queue.length < maxRoots) queue.push({ root: shadow, depth: 1 });
       else truncated = true;
     }
     lightNode = lightWalker.nextNode();
   }
-  // A host beyond the light-DOM bound was never examined. Report it as a
-  // partial snapshot so the caller can never certify a clean absence.
-  if (lightNode) truncated = true;
+  // A cut-short walk can hide further hosts beyond the bound, but only report
+  // a partial snapshot when at least one host was already found. Flagging a
+  // host-free page solely for its element count would make large ordinary
+  // pages permanently incomplete; their light DOM was still invite-scanned.
+  if (lightNode && hostsSeen > 0) truncated = true;
   while (queue.length && nodes < maxNodes && chars < maxChars) {
     const entry = queue.shift()!;
     roots++;

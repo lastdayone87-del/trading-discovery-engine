@@ -631,21 +631,38 @@ test('real DOM: empty fragment anchors and hidden/disabled widgets are not opaqu
   });
 });
 
-test('real DOM: open-shadow walker reports truncation past its light-DOM bound', { skip: process.platform === 'android', timeout: 30_000 }, async () => {
+test('real DOM: open-shadow walker reports truncation only when a seen host may be hidden', { skip: process.platform === 'android', timeout: 30_000 }, async () => {
+  await withControlPage('<!doctype html><html><body><div id="fill"></div></body></html>', async (page) => {
+    await page.evaluate(() => {
+      // Put a host first, then enough light-DOM elements to cut the walk
+      // short. The seen host means more roots may be hidden beyond the bound.
+      const host = document.createElement('div');
+      document.body.insertBefore(host, document.getElementById('fill'));
+      const root = host.attachShadow({ mode: 'open' });
+      root.innerHTML = '<a href="https://discord.gg/DEEP">Discord</a>';
+      const fill = document.getElementById('fill');
+      if (!fill) return;
+      const fragment = document.createDocumentFragment();
+      for (let index = 0; index < 50_001; index++) fragment.appendChild(document.createElement('div'));
+      fill.appendChild(fragment);
+    });
+    const snapshot = await page.evaluate(collectRenderedOpenShadowContent);
+    assert.equal(snapshot.truncated, true,
+      'a cut-short walk after a seen host must make the snapshot partial');
+  });
+});
+
+test('real DOM: a large host-free page is not a permanent interaction gap', { skip: process.platform === 'android', timeout: 30_000 }, async () => {
   await withControlPage('<!doctype html><html><body><div id="fill"></div></body></html>', async (page) => {
     await page.evaluate(() => {
       const fill = document.getElementById('fill');
       if (!fill) return;
       const fragment = document.createDocumentFragment();
-      for (let index = 0; index < 4_001; index++) fragment.appendChild(document.createElement('div'));
+      for (let index = 0; index < 50_001; index++) fragment.appendChild(document.createElement('div'));
       fill.appendChild(fragment);
-      const host = document.createElement('div');
-      document.body.appendChild(host);
-      const root = host.attachShadow({ mode: 'open' });
-      root.innerHTML = '<a href="https://discord.gg/DEEP">Discord</a>';
     });
     const snapshot = await page.evaluate(collectRenderedOpenShadowContent);
-    assert.equal(snapshot.truncated, true,
-      'a host beyond the light-DOM bound must make the snapshot partial');
+    assert.equal(snapshot.truncated, false,
+      'an ordinary large page without shadow roots can still resolve as a clean absence');
   });
 });
