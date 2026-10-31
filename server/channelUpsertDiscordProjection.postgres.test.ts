@@ -79,16 +79,15 @@ maybe('classification-only upserts never overwrite a newer Discord projection', 
   assert.equal(retained?.discord_status, 'ACTIVE');
   assert.equal(retained?.discord_invite, 'https://discord.gg/newroom');
 
-  // Gate 2's fresh terminal classification passes `allowDiscordClear`, so the
-  // locked serving invite is intentionally cleared. The channel was rejected on
-  // trading evidence (the Discord crawler did not run), so the DB invariant
-  // records untouched Discord state (UNCERTAIN), not a fabricated NON_TRADING
-  // inspection.
+  // Gate 2 now writes the normalized shape (UNCERTAIN + untouched state). This
+  // fixture keeps the legacy NON_TRADING input on purpose: the DB invariant must
+  // still normalize it, clear the invite, and never persist a fabricated
+  // NON_TRADING Discord inspection.
   await upsertChannel({
     ...stale,
     trading_status: 'NON_TRADING',
     scan_status: 'SKIPPED_NON_TRADING',
-    discord_status: 'UNCERTAIN',
+    discord_status: 'NON_TRADING',
     discord_invite: null,
   }, { allowDiscordClear: true });
   const overwritten = await getChannelById(channelId);
