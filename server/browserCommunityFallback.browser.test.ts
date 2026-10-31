@@ -8,6 +8,7 @@ import {
   RENDERED_CONTROL_EVALUATION_WINDOW,
   RENDERED_CONTROL_SELECTOR,
   createRenderedRouteGuard,
+  collectRenderedPageContext,
   enumerateRenderedControlNodes,
   installRenderedRouteCloseCleanup,
   isSkippableNavigableAnchorClick,
@@ -195,6 +196,31 @@ test('real DOM: control 65 is reachable after rotating the full 70-control pool'
   });
 });
 
+test('real DOM: structural classification uses visible text and aria-label only', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><head><title>label fixture</title></head><body>
+    <a href="/support" title="Site menu">Support</a>
+    <button aria-labelledby="menu-heading"><span aria-hidden="true">≡</span></button>
+    <span id="menu-heading">Community menu</span>
+    <button aria-label="Open menu">☰</button>
+    <a href="/tools" role="menuitem">Tools</a>
+    <div role="menu"><a href="/products">Products</a></div>
+  </body></html>`;
+  await withControlPage(html, async page => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(
+      enumeration.structuralNavigation,
+      5,
+      'title/aria-labelledby menu names, aria-label menu, role=menuitem, and a descendant of role=menu are structural',
+    );
+    assert.equal(
+      enumeration.structuralHintRejected,
+      5,
+      'none of these structural controls is hint-matched; menu-like names alone do not make them clickable evidence',
+    );
+    assert.equal(enumeration.iconLabelRecovered, 1, 'aria-labelledby still contributes to icon-label recovery measurement');
+  });
+});
+
 test('real DOM: a 64-control page wraps without inventing overflow', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
   await withControlPage(controlFixtureHtml(64, null), async (page, url) => {
     const enumeration = await enumeratePageControls(page);
@@ -214,6 +240,99 @@ test('real DOM: a 64-control page wraps without inventing overflow', { skip: pro
       await page.locator(`[data-oc-control="${target.marker}"]`).click();
     }
     assert.equal(await page.locator('a[href^="https://discord.gg/"]').count(), 0);
+  });
+});
+
+test('real DOM: enumeration separates hint-rejected, structural, icon-label, and popup controls', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><head>
+    <base href="https://creator.example/base/">
+    <title>mixed control fixture</title>
+  </head><body>
+    <a href="/community">Community</a>
+    <button type="button" aria-label="Open menu" aria-haspopup="dialog">Menu</button>
+    <button type="button" title="Join our Discord">
+      <svg width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="8"></circle></svg>
+    </button>
+    <a href="https://discord.gg/example" target="_blank">Community chat</a>
+    <iframe src="about:blank" title="embedded"></iframe>
+    <div id="shadow-host"></div>
+    <script>
+      document.getElementById('shadow-host').attachShadow({ mode: 'open' }).innerHTML = '<span>shadow content</span>';
+    </script>
+  </body></html>`;
+  await withControlPage(html, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(enumeration.total, 4, 'the pre-filter denominator includes every selector-matched control');
+    assert.equal(enumeration.controls.length, 2, 'only community-hint controls remain evidence-bearing');
+    assert.equal(enumeration.hintRejected, 2, 'hint rejection is measured, not silently dropped');
+    assert.equal(enumeration.structuralNavigation, 1, 'the menu/aria-haspopup control is structural navigation');
+    assert.equal(enumeration.structuralHintRejected, 1, 'the structural control would be hidden by the hint filter today');
+    assert.equal(enumeration.iconLabelRecovered, 1, 'title-only icon labels are recoverable in P1.2');
+    assert.equal(enumeration.popupTargets, 1, 'only the dialog control requires popup capture; the href-bearing _blank anchor is navigable');
+    assert.equal(enumeration.popupMarkers.length, 1, 'the hint-rejected popup is identity-tracked too');
+    assert.equal(
+      enumeration.controls.some(control => control.marker === enumeration.popupMarkers[0]),
+      false,
+      'tracking a hint-rejected popup does not add it to the click set',
+    );
+    const repeat = await enumeratePageControls(page);
+    assert.deepEqual(repeat.popupMarkers, enumeration.popupMarkers, 'popup identity is stable across enumerations');
+    assert.equal(
+      await page.locator(`[data-oc-control="${enumeration.popupMarkers[0]}"]`).count(),
+      1,
+      'the popup marker belongs to exactly one element',
+    );
+
+    const context = await page.evaluate(collectRenderedPageContext);
+    assert.equal(context.frameCount, 1, 'iframe presence is recorded for P1.4');
+    assert.equal(context.shadowRootCount, 1, 'open shadow roots are recorded for P1.4');
+    assert.equal(context.baseHrefPresent, true, 'a document <base href> is recorded for P1.5');
+  });
+});
+
+test('real DOM: navigation ancestors and generic labels classify structural controls without URL noise', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <nav>
+      <a href="/products">Products</a>
+      <a href="/support">Support</a>
+    </nav>
+    <a href="/footer-support">Support</a>
+    <a href="/more">More</a>
+    <button type="button" aria-label="Open menu" aria-haspopup="true">Menu</button>
+    <a href="/account" aria-expanded="false">Account</a>
+    <button type="button" aria-expanded="false">Filters</button>
+    <a href="javascript:void(0)" target="_blank">Chat</a>
+    <a href="/community" target="_blank">Community</a>
+    <button type="button" aria-label="Join community" aria-haspopup="dialog">Join community</button>
+  </body></html>`;
+  await withControlPage(html, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(enumeration.total, 10);
+    assert.equal(enumeration.controls.length, 3, 'only the hint-matched controls remain evidence-bearing');
+    assert.equal(
+      enumeration.structuralNavigation,
+      5,
+      'the two nav links, the menu trigger, the disclosure button, and the dialog trigger are structural; footer Support/More and a href-bearing aria-expanded link are not',
+    );
+    assert.equal(enumeration.structuralHintRejected, 4, 'nav links and disclosure triggers hidden by the hint filter are measured');
+    assert.equal(
+      enumeration.popupTargets,
+      3,
+      'aria-haspopup=true/dialog and a non-HTTP(S) _blank target are popups; a navigable _blank anchor is not',
+    );
+  });
+});
+
+test('real DOM: an all-hint-matched control set has no hidden structural or popup counts', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  await withControlPage(controlFixtureHtml(8, null), async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(enumeration.total, 8);
+    assert.equal(enumeration.controls.length, 8);
+    assert.equal(enumeration.hintRejected, 0);
+    assert.equal(enumeration.structuralNavigation, 0);
+    assert.equal(enumeration.structuralHintRejected, 0);
+    assert.equal(enumeration.iconLabelRecovered, 0);
+    assert.equal(enumeration.popupTargets, 0);
   });
 });
 
