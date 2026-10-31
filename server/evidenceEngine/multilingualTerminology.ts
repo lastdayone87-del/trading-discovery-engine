@@ -1,5 +1,6 @@
 import type { LayeredKnowledgeContext, RawChannelInput } from './types';
 import { textMatchesTerm } from './utils/textMatching';
+import { isTierATradingText, tierATradingSignals } from './contextualComposition';
 import { SUPPORTED_PRODUCTION_COUNTRIES } from '../../src/data/initial_countries';
 
 /** Backward-compatible export backed by the single production-country registry. */
@@ -99,13 +100,17 @@ export const MULTILINGUAL_CLASSIFICATION_PACKS: Record<MultilingualClassificatio
   }
 };
 
+/**
+ * C1a retrieval firewall: only creator-owned corpus documents contribute to
+ * text. `search_match_context` is retrieval provenance, not creator evidence.
+ */
 export function completeChannelText(input: RawChannelInput): string {
-  return (input.evidence_corpus?.map(document=>document.text) || [input.channel_name, input.description, ...(input.video_titles || []), ...(input.video_descriptions || []), input.location_tag, ...(input.external_links || [])]).filter(Boolean).join(' ');
+  return (input.evidence_corpus?.filter(document => document.field !== 'search_match_context').map(document=>document.text) || [input.channel_name, input.description, ...(input.video_titles || []), ...(input.video_descriptions || []), input.location_tag, ...(input.external_links || [])]).filter(Boolean).join(' ');
 }
 
 /** Select languages from actual field content and declared field hints, not country alone. */
 export function contentLanguagePacks(input:RawChannelInput,context:LayeredKnowledgeContext):MultilingualClassificationPack[]{
-  const text=completeChannelText(input),hinted=new Set([...(input.detected_languages||[]).filter(item=>(item.confidence??100)>=50).map(item=>item.language.toLocaleLowerCase('und').split('-')[0]),...(input.evidence_corpus||[]).map(item=>item.language?.toLocaleLowerCase('und').split('-')[0]).filter((x):x is string=>Boolean(x))]);
+  const text=completeChannelText(input),hinted=new Set([...(input.detected_languages||[]).filter(item=>(item.confidence??100)>=50).map(item=>item.language.toLocaleLowerCase('und').split('-')[0]),...(input.evidence_corpus||[]).filter(item=>item.field!=='search_match_context').map(item=>item.language?.toLocaleLowerCase('und').split('-')[0]).filter((x):x is string=>Boolean(x))]);
   const configured=(context.languageKnowledgePacks||[context.languageKnowledge]).map(item=>item?.languageCode).filter((x):x is string=>Boolean(x));
   const contentMatched=Object.values(MULTILINGUAL_CLASSIFICATION_PACKS).filter(pack=>[...pack.executionTerms,...pack.educationalTerms,...pack.businessNewsTerms,...pack.genericFinanceTerms,...pack.hypeTerms,...pack.motivationTerms].some(term=>textMatchesTerm(text,term))).map(pack=>pack.languageCode);
   const codes=[...new Set([...configured,...hinted,...contentMatched])];
@@ -116,13 +121,37 @@ export function matchedTerms(text: string, terms: string[]): string[] {
   return terms.filter(term => textMatchesTerm(text, term));
 }
 
+/**
+ * C2 predicate correction. "Technical analysis" and the other generic
+ * concepts used to be sufficient on their own, which let Formula 1,
+ * engineering and generic commentary confirm as trading. A text is now
+ * trading-focused only when it contains a high-specificity Tier A signal, or
+ * a method/education/execution term together with a second independent
+ * dimension (instrument, execution, platform/prop firm, or an explicit
+ * financial-market context).
+ */
 export function isTradingFocusedText(text: string, context: LayeredKnowledgeContext): boolean {
-  const languagePacks = contentLanguagePacks({channel_name:'',description:text},context);
-  const hasExecution = languagePacks.some(pack => matchedTerms(text, pack.executionTerms).length > 0);
-  const hasEducation = languagePacks.some(pack => matchedTerms(text, pack.educationalTerms).length > 0);
-  const hasMethodology = context.globalAdvancedConcepts.some(term => textMatchesTerm(text, term));
-  const hasPlatform = context.globalPlatformsPropFirms.some(term => textMatchesTerm(text, term));
+  const normalized = String(text || '').normalize('NFKC');
+  const languagePacks = contentLanguagePacks({channel_name:'',description:normalized},context);
+  const hasExecution = languagePacks.some(pack => matchedTerms(normalized, pack.executionTerms).length > 0);
+  const hasEducation = languagePacks.some(pack => matchedTerms(normalized, pack.educationalTerms).length > 0);
+  const hasMethodology = context.globalAdvancedConcepts.some(term => textMatchesTerm(normalized, term));
+  const hasPlatform = context.globalPlatformsPropFirms.some(term => textMatchesTerm(normalized, term));
   const instruments = [...context.globalInstruments, ...(context.countryKnowledge?.popularInstruments || [])];
-  const hasInstrument = instruments.some(term => textMatchesTerm(text, term));
-  return hasExecution || hasEducation || hasMethodology || hasPlatform || (hasInstrument && (hasExecution || hasEducation));
+  const hasInstrument = instruments.some(term => textMatchesTerm(normalized, term));
+  // Explicit financial-market context is a second dimension, not a trading
+  // verdict by itself: it must accompany a method/education/execution term.
+  // A bare "market" is not financial context ("technical analysis of the
+  // housing market"). Require an explicit financial-market phrase.
+  const hasFinancialMarketContext = /\b(stocks?|equities|shares?|crypto(?:currencies)?|bitcoin|ethereum|forex|futures?|options?|commodit(?:y|ies)|(?:stock|equity|financial|capital|forex|crypto|futures?|options?|bond|commodit(?:y|ies))\s+markets?|brokers?|exchanges?|portfolio|bourse|börse|boerse|bolsa|borsa|beurs|aktien|aandelen|aksjer|osakkeet|azioni|acciones|actions|titres)\b/iu.test(normalized)
+    || /(株式|株|仮想通貨|為替|先物|بورصة|الأسهم|股票|交易)/u.test(normalized);
+  if (isTierATradingText(normalized, context)) return true;
+  const conceptual = hasExecution || hasEducation || hasMethodology;
+  const secondDimension = hasExecution || hasInstrument || hasPlatform || hasFinancialMarketContext;
+  return conceptual && secondDimension;
+}
+
+/** Known Tier A signals, used for C2 aggregation (distinct signals, not repeats). */
+export function matchedTierATradingSignals(text: string, context?: LayeredKnowledgeContext): string[] {
+  return tierATradingSignals(String(text || '').normalize('NFKC'), context);
 }

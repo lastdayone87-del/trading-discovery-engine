@@ -5,6 +5,7 @@ import type {
 import { isSemanticClassificationSource } from './types';
 import { collapseSourceIndependentObservations } from '../entityResolution';
 import { dedupeWeightByFieldGroup, hasCreatorLevelUnrelatedAttribution } from './decisionPolicy';
+import type { ContextualCompositionReport } from './contextualComposition';
 
 export const STAGED_CLASSIFICATION_VERSION = '3.2.1';
 
@@ -98,7 +99,7 @@ function hasCreatorLevelSemanticUnrelatedCandidate(negative: EvidenceItem[], col
   return semanticUnrelated.length>0&&hasCreatorLevelUnrelatedAttribution(semanticUnrelated);
 }
 
-export function evaluateClassificationStages(input: RawChannelInput, evidence: EvidenceItem[], collection: EvidenceCollectionReport): StagedClassificationReport {
+export function evaluateClassificationStages(input: RawChannelInput, evidence: EvidenceItem[], collection: EvidenceCollectionReport, composition?: ContextualCompositionReport): StagedClassificationReport {
   const positive = evidence.filter(item => item.polarity === 'POSITIVE' && item.rawMatches.length > 0);
   const negative = evidence.filter(item => item.polarity === 'NEGATIVE');
   const semantic = positive.filter(item => isSemanticClassificationSource(item.source) || item.category === 'METHODOLOGY_CONCEPT' || item.category === 'TERMINOLOGY' || item.category === 'INSTRUMENT');
@@ -132,14 +133,50 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
     ? result('CANDIDATE_DETECTION', 'PASS', [semantic.length > 0 ? 'SEMANTIC_CANDIDATE_FOUND' : 'REPEATED_INDEPENDENT_TRADING_UPLOADS'], candidateEvidence, { candidateSignals: candidateEvidence.length, repeatedIndependentFamilies: repeatedIndependence.independentFamilyCount })
     : result('CANDIDATE_DETECTION', 'ABSTAIN', ['NO_SEMANTIC_OR_REPEATED_CREATOR_CANDIDATE'], [], { candidateSignals: 0, repeatedIndependentFamilies: repeatedIndependence.independentFamilyCount });
   const independentObservations=independence.independentFamilyCount>=2 && observations.size>=2 && (observationFamilies.size>=2 || attributableFields.filter(f=>f.field==='video_title'||f.field==='video_description').length>=2);
-  const corroborated = repeatedCreatorIndependent || (corroborating.length > 0 && (repeated || independentObservations || ((sources.size >= 2 || independentDimensions.size >= 2)&&independence.independentFamilyCount>=2)));
+  // C5 confirmation gate: the channel title is a name prior, never an
+  // observed family. Confirmation needs a dominant trading composition with
+  // a non-title Tier A family and either two observed trading families or an
+  // explicit creator-level trading statement. Legacy callers without a
+  // composition keep the pre-C5 stage behaviour.
+  const explicitCreatorStatementConfirms = Boolean(composition
+    && composition.focus === 'TRADING_DOMINANT'
+    && composition.explicitCreatorTrading
+    && !composition.explicitCreatorAlternative
+    && composition.alternativeCoverage < 0.34
+    && composition.nonTitleTierAFamilies >= 1);
+  const compositionCorroborates = !composition || explicitCreatorStatementConfirms || (
+    composition.focus === 'TRADING_DOMINANT'
+    && composition.alternativeCoverage < 0.34
+    && !composition.explicitCreatorAlternative
+    && composition.tradingCoverage >= 0.5
+    && composition.nonTitleTierAFamilies >= 1
+    && composition.tradingFamilies >= 2
+  );
+  // Thin compositions cannot confirm, but they must not erase independent
+  // evidence-based corroboration: the lifecycle routing below preserves it at
+  // REVIEW (never CONFIRM) while a supported terminal negative still rejects.
+  const thinCompositionAllowsCorroboration = composition?.focus === 'QUERY_ONLY'
+    || composition?.focus === 'INSUFFICIENT_COVERAGE';
+  const corroborated = (compositionCorroborates || thinCompositionAllowsCorroboration) && (explicitCreatorStatementConfirms || repeatedCreatorIndependent || (corroborating.length > 0 && (repeated || independentObservations || ((sources.size >= 2 || independentDimensions.size >= 2)&&independence.independentFamilyCount>=2))));
   const corroborationEvidence = repeatedCreatorIndependent ? [...corroborating, ...repeatedCreatorHypothesis] : corroborating;
   const weakVideoTerminologyOnly = positive.length > 0 && positive.every(isWeakVideoTerminologyEvidence);
+  const corroborationReason = explicitCreatorStatementConfirms
+    ? 'EXPLICIT_CREATOR_TRADING_STATEMENT_SATISFIED'
+    : repeatedCreatorIndependent
+      ? 'REPEATED_VIDEO_SOURCE_FAMILY_INDEPENDENCE_SATISFIED'
+      : 'SOURCE_FAMILY_INDEPENDENCE_SATISFIED';
   const corroboration = corroborated
-    ? result('CORROBORATION', 'PASS', [repeatedCreatorIndependent ? 'REPEATED_VIDEO_SOURCE_FAMILY_INDEPENDENCE_SATISFIED' : 'SOURCE_FAMILY_INDEPENDENCE_SATISFIED'], corroborationEvidence, { sources: sources.size, fields: observations.size, sourceFamilies:Math.max(independence.independentFamilyCount,repeatedIndependence.independentFamilyCount),sourceEntities:Math.max(independence.independentEntityCount,repeatedIndependence.independentEntityCount),dimensions: independentDimensions.size, repeatedVideos: repeated, repeatedCreatorIndependent })
+    ? result('CORROBORATION', 'PASS', [corroborationReason], corroborationEvidence, { sources: sources.size, fields: observations.size, sourceFamilies:Math.max(independence.independentFamilyCount,repeatedIndependence.independentFamilyCount),sourceEntities:Math.max(independence.independentEntityCount,repeatedIndependence.independentEntityCount),dimensions: independentDimensions.size, repeatedVideos: repeated, repeatedCreatorIndependent })
     : result('CORROBORATION', 'ABSTAIN', [weakVideoTerminologyOnly?'WEAK_VIDEO_TERMINOLOGY_ONLY':corroborating.length&&independence.independentFamilyCount<2?'SOURCE_FAMILY_INDEPENDENCE_REQUIRED':'CORROBORATION_REQUIRED'], corroborating, { sources: sources.size, fields: observations.size, sourceFamilies:independence.independentFamilyCount,sourceEntities:independence.independentEntityCount,dimensions: independentDimensions.size, repeatedVideos: repeated, repeatedCreatorIndependent });
-  const contradiction = semanticUnrelatedCandidate || dominantContradiction
-    ? (isThinRetrievalInputRequiringHydration(input)
+  const compositionAlternativeDominant = composition?.focus === 'ALTERNATIVE_DOMINANT' && terminalNegativeSufficient && materiallyDominant;
+  // Only retrieval-only composition blocks a terminal negative. A neutral or
+  // thin creator-owned composition can still reject when independent
+  // creator-owned negative observations are sufficient.
+  const compositionQueryOnly = composition?.focus === 'QUERY_ONLY';
+  const contradiction = semanticUnrelatedCandidate || dominantContradiction || compositionAlternativeDominant
+    ? (compositionAlternativeDominant
+      ? result('CONTRADICTION','FAIL',['ALTERNATIVE_DOMINANT_CREATOR_LEVEL_NEGATIVE'],negative,{negativeWeight,positiveWeight,terminalNegativeWeight})
+      : isThinRetrievalInputRequiringHydration(input) || compositionQueryOnly
       ? result('CONTRADICTION','ABSTAIN',['THIN_RETRIEVAL_INPUT_REQUIRES_HYDRATION'],negative,{negativeWeight,positiveWeight,terminalNegativeWeight,independentNegativeObservations:collection.terminalNegativeSufficiency?.independentObservations||0,independentNegativeSourceFamilies:collection.terminalNegativeSufficiency?.independentSourceFamilies||0})
       : semanticUnrelatedCandidate
         ? result('CONTRADICTION','FAIL',['CREATOR_LEVEL_SEMANTIC_UNRELATED_CANDIDATE'],negative,{negativeWeight,positiveWeight,terminalNegativeWeight})
@@ -153,6 +190,21 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   else if (contradiction.disposition === 'FAIL') lifecycleAction = 'REJECT';
   else if (contradiction.disposition === 'ABSTAIN') lifecycleAction = candidate.disposition==='PASS'&&corroboration.disposition==='PASS'?'REVIEW':'ENRICH';
   else if (candidate.disposition === 'PASS' && corroboration.disposition === 'PASS') lifecycleAction = 'CONFIRM';
+  if (composition) {
+    // C5/C6 routing: a query-only or thin composition cannot confirm; an
+    // alternative-dominant composition with creator-level negative evidence is
+    // the explicit non-trading path; a mixed composition abstains. An
+    // affirmative candidate + corroboration pair that already routed to REVIEW
+    // must stay in human review instead of being pushed back to ENRICH just
+    // because coverage is thin. A supported creator-owned terminal negative
+    // still rejects under insufficient coverage.
+    const affirmativeCandidate = candidate.disposition === 'PASS' && corroboration.disposition === 'PASS';
+    if (composition.focus === 'QUERY_ONLY') lifecycleAction = affirmativeCandidate ? 'REVIEW' : 'ENRICH';
+    else if (composition.focus === 'INSUFFICIENT_COVERAGE') lifecycleAction = lifecycleAction === 'REJECT' ? 'REJECT' : affirmativeCandidate ? 'REVIEW' : 'ENRICH';
+    else if (composition.focus === 'ALTERNATIVE_DOMINANT') lifecycleAction = contradiction.disposition === 'FAIL' ? 'REJECT' : 'ENRICH';
+    else if (composition.focus === 'MIXED' && lifecycleAction === 'CONFIRM') lifecycleAction = 'REVIEW';
+    else if (composition.focus === 'TRADING_DOMINANT' && lifecycleAction === 'CONFIRM' && !compositionCorroborates) lifecycleAction = 'REVIEW';
+  }
   const lifecycle = result('LIFECYCLE', 'PASS', [`ROUTE_${lifecycleAction}`], [], { action: lifecycleAction });
   return { pipelineVersion: STAGED_CLASSIFICATION_VERSION, stages: [availability, candidate, corroboration, contradiction, lifecycle], lifecycleAction };
 }

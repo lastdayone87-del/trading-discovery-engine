@@ -237,7 +237,7 @@ export function verifyFrozenBenchmarkVersions(
     llmAssist: 'llm-assist-v1',
     graphExpansion: 'graph-expansion-v1',
     relationshipCanary: 'relationship-canary-v1',
-    autonomousQueryAuthority: 'autonomous-query-authority-v2',
+    autonomousQueryAuthority: 'autonomous-query-authority-v3',
     candidateTriage: 'candidate-triage-v4-contextual-admission',
   };
   const mismatches = Object.keys(frozen).filter(key => live[key] !== frozen[key]);

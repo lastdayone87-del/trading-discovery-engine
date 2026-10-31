@@ -1,13 +1,18 @@
 import type { QueryRecord } from '../src/types';
 import { isRetrievalOrientedQuery } from './queryPlanner';
 import { RETRIEVAL_SPECIFICITY_POLICY_VERSION } from './retrievalSpecificity';
+import { revalidateQueryRecordAdmission } from './queryQuality/admission';
 
-export const AUTONOMOUS_QUERY_AUTHORITY_POLICY_VERSION = 'autonomous-query-authority-v2';
+export const AUTONOMOUS_QUERY_AUTHORITY_POLICY_VERSION = 'autonomous-query-authority-v3';
 
 export interface AutonomousQueryAuthorityDecision {
   eligible: boolean;
   reasonCodes: string[];
   retrievalPolicyVersion?: string;
+  admissionHash?: string;
+  admissionTier?: string;
+  compositionFamily?: string;
+  admissionReasonCodes?: string[];
 }
 
 const EXPLICIT_STANDALONE_METHOD_CONTEXT = /\b(trading|trader|day\s*trading|swing\s*trading|forex|futures?|options?|spread\s*betting|prop\s*firm|funded\s*trader|analyse\s*technique|analisi\s*tecnica|an[aá]lisis\s*t[eé]cnico|technische\s*analyse|teknisk\s*analys|teknisk\s*analyse|b[oö]rsen?analyse\s+schweiz|futures\s*handel|trading\s*psychology)\b/iu;
@@ -146,6 +151,34 @@ export function evaluateAutonomousQueryAuthority(
     return { eligible: false, reasonCodes: ['COMPOUND_QUERY_ATOM_PROVENANCE_MISSING'], retrievalPolicyVersion: specificity.policyVersion };
   }
 
-  reasons.push('CURRENT_RETRIEVAL_POLICY_SATISFIED', 'EXECUTION_TIME_REVALIDATION_PASSED');
-  return { eligible: true, reasonCodes: reasons, retrievalPolicyVersion: specificity.policyVersion };
+  // Q2d execution-time admission gate: the stored admission is re-derived and
+  // revalidated immediately before quota spend. Policy/registry drift,
+  // composition drift and an ineligible tier all fail closed here.
+  const admission = revalidateQueryRecordAdmission(query, { now: new Date().toISOString() });
+  if (!admission.eligible) {
+    return {
+      eligible: false,
+      reasonCodes: [
+        ...reasons,
+        ...admission.reasonCodes.map(code => `QUERY_ADMISSION_${code}`),
+        'QUERY_ADMISSION_REJECTED',
+      ],
+      retrievalPolicyVersion: specificity.policyVersion,
+      admissionHash: admission.admission.candidateHash,
+      admissionTier: admission.admission.tier,
+      compositionFamily: admission.admission.compositionFamily,
+      admissionReasonCodes: admission.reasonCodes,
+    };
+  }
+
+  reasons.push('CURRENT_RETRIEVAL_POLICY_SATISFIED', 'EXECUTION_TIME_REVALIDATION_PASSED', 'QUERY_ADMISSION_CURRENT');
+  return {
+    eligible: true,
+    reasonCodes: reasons,
+    retrievalPolicyVersion: specificity.policyVersion,
+    admissionHash: admission.admission.candidateHash,
+    admissionTier: admission.admission.tier,
+    compositionFamily: admission.admission.compositionFamily,
+    admissionReasonCodes: admission.reasonCodes,
+  };
 }

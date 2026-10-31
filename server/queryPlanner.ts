@@ -4,6 +4,7 @@ import { admitOrganicQueryCandidates, type OrganicQueryCandidate } from './organ
 import { assessLanguageCapability, type GlobalLanguageContext } from './globalLanguageModel';
 import {evaluateRetrievalSpecificity,type RetrievalSpecificityDecision} from './retrievalSpecificity';
 import { countrySearchLanguageCandidates, normalizeLanguageCode } from './countrySearchHints';
+import { isSearchableTradingTerm } from './terminologySearchability';
 
 export type QueryKnowledgeTier = 1 | 2 | 3;
 export type QueryGenerationMode = 'EXPLORATION' | 'EXPLOITATION' | 'COLD_START';
@@ -353,10 +354,22 @@ export function planDiverseQueries(args: {
     .filter(candidate => isRetrievalOrientedQuery(args.country, candidate.atoms.map(item => item.term).join(' ')));
   candidates.push(...methodInstrumentPairs);
 
-  const proven = (args.provenTerminology || []).map(term => ({
-    atom: atom(term.term, 'LEARNED', 'strategy', term.lifecycle === 'PROVEN_SEARCH_TERM' ? 1 : 2, 'LEARNED'),
-    terminology: term
-  }));
+  // Q0d defence-in-depth: the same pure searchability gate applies to the
+  // canonical PROVEN/TRIAL path and to the legacy tier-2 extracted-vocabulary
+  // path, so a directly seeded bad row or a second-creator legacy promotion
+  // can never become a planner atom.
+  const terminatedByGate: Array<{ term: string; path: 'CANONICAL' | 'LEGACY'; reasons: string[] }> = [];
+  const gateLearnedTerm = (term: string, termType: string | undefined, path: 'CANONICAL' | 'LEGACY') => {
+    const gate = isSearchableTradingTerm({ term, termType, country: args.country });
+    if (!gate.eligible) terminatedByGate.push({ term, path, reasons: gate.reasons });
+    return gate.eligible;
+  };
+  const proven = (args.provenTerminology || [])
+    .filter(term => gateLearnedTerm(term.term, term.lifecycle === 'PROVEN_SEARCH_TERM' ? 'TERMINOLOGY' : 'TERMINOLOGY', 'CANONICAL'))
+    .map(term => ({
+      atom: atom(term.term, 'LEARNED', 'strategy', term.lifecycle === 'PROVEN_SEARCH_TERM' ? 1 : 2, 'LEARNED'),
+      terminology: term
+    }));
   const provenByTerm = new Map(proven.map(item => [normalizeQuery(item.atom.term), item.terminology]));
   // Legacy extracted vocabulary is not the governed terminology lifecycle. Only
   // terms independently validated by at least two confirmed creators may remain
@@ -365,6 +378,7 @@ export function planDiverseQueries(args: {
   const legacyLearned = args.learnedVocabulary
     .filter(term => term.trust_tier === 2 && (term.validation_count || 0) >= 2)
     .filter(term => !proven.some(item => normalizeQuery(item.atom.term) === normalizeQuery(term.term)))
+    .filter(term => gateLearnedTerm(term.term, term.category?.toUpperCase(), 'LEGACY'))
     .map(term => ({ atom: atom(term.term, 'LEARNED', 'strategy', term.trust_tier === 2 ? 2 : 3, 'LEARNED'), terminology: undefined }));
   const learnedCandidates = [...proven, ...legacyLearned].flatMap(({ atom: learnedAtom, terminology }, index) => {
     const rotated = [...anchors.slice(index), ...anchors.slice(0, index)];
@@ -447,6 +461,7 @@ export function planDiverseQueries(args: {
         terminologyId: provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))?.id,
         terminologyLifecycle: provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))?.lifecycle,
         terminologyDecayedYield: provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))?.score,
+        ...(terminatedByGate.length ? { terminologyGate: { policy: 'terminology-searchability-v1', suppressed: terminatedByGate } } : {}),
         selectionEvidence: provenByTerm.has(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))
           ? `Canonical term ${provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))!.id} ranked by time-decayed production yield.`
           : candidate.organic

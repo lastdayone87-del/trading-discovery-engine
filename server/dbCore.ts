@@ -35,6 +35,11 @@ import { calculateSegmentHealthFromHistory, classifyCreatorSizeBand, type Segmen
 import { updateNeighborhoodFrontierStatePostRun } from './discoveryFrontierState';
 import { calculateQueryFunnel, isQualityCreator, QUALITY_CREATOR_SCORE_THRESHOLD, type QueryFunnelMetrics } from './queryPerformance';
 import { attributeTerminologyPerformance } from './terminologyIntelligence';
+import { admitQueryRecord, parseGenerationMetadata, withQueryAdmission } from './queryQuality/admission';
+import { deriveQueryFailureState, type QueryFailureStateRow } from './queryQuality/lifecycle';
+import { buildAttribution, buildQueryQualityVector } from './queryQuality/accounting';
+import type { QueryQualityDashboardRunInput } from './queryQuality/dashboard';
+import type { QueryAdmission } from './queryQuality/types';
 import type { NativeEvidenceStatus, SourceProvenanceFamily } from './countryNativeIntelligence';
 import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, providerSnapshotFromRegistryRow, isShadowBraveCanaryAllowed, rotateActiveProviderRow, applyDateOrderingProviderGuard, ledgerProviderToRegistryKey, providerCooldownObservationWindowSecs, type ProviderAllocation } from './providerAwareRetrieval';
 import { fingerprintYouTubeKey, projectYouTubeQuotaUsage } from './youtubeQuotaAttribution';
@@ -1347,8 +1352,66 @@ export async function getSchemaInfo(): Promise<{currentVersion:number;migrations
 export function rowToQuery(r:any):QueryRecord{return {id:r.id,query:r.query,country:r.country,collection:r.collection,intent:r.intent,times_executed:r.times_executed||0,last_executed:iso(r.last_executed),total_channels_found:r.total_channels_found||0,unique_channels_found:r.unique_channels_found||0,quality_channels_found:r.quality_channels_found||0,community_channels_found:r.community_channels_found||0,avg_quality_score:r.avg_quality_score||0,performance_score:r.performance_score||0,created_at:iso(r.created_at)||new Date().toISOString(),status:r.status||'ACTIVE',knowledge_tiers:r.knowledge_tiers||[1],generation_mode:r.generation_mode||'LEGACY',generation_reason:r.generation_reason||'Legacy query',discovery_objective:r.discovery_objective||'Discover relevant trading creators.',primary_term:r.primary_term||undefined,generation_metadata:parseJson(r.generation_metadata,{}),reserved_until:iso(r.reserved_until),next_eligible_at:iso(r.next_eligible_at)} as QueryRecord;}
 export async function getAllQueries():Promise<QueryRecord[]>{const db=await getDb(); const res=await db.query('SELECT * FROM query_library ORDER BY performance_score DESC,times_executed DESC'); return res.rows.map(rowToQuery);}
 export async function getQueriesByCountry(country:string):Promise<QueryRecord[]>{const db=await getDb(); const res=await db.query(`SELECT * FROM query_library WHERE LOWER(country)=LOWER($1) AND status='ACTIVE' ORDER BY performance_score DESC,times_executed ASC`,[country]); return res.rows.map(rowToQuery);}
+
+/** Q5 per-run reward rows. Global newness and quality are read from
+ * sighting-level truth, never from query_library cumulative counters. */
+export interface QueryQualityRunRow{queryId:number;confirmed:number;quality:number;quotaUnits:number;ageDays:number;}
+export async function getQueryQualityRunRows(country?:string):Promise<QueryQualityRunRow[]>{const db=await getDb();const res=await db.query(`SELECT qr.query_id,EXTRACT(EPOCH FROM (now()-qr.completed_at))/86400.0 AS age_days,COALESCE(s.confirmed,0)::int AS confirmed,COALESCE(s.quality,0)::int AS quality,GREATEST(0,qr.quota_used)::float/100.0 AS quota_units FROM query_runs qr LEFT JOIN LATERAL (SELECT COUNT(DISTINCT cs.channel_id) FILTER (WHERE cs.persisted AND NOT cs.was_known AND cs.country_outcome<>'REJECTED' AND cs.funnel_outcome='TRADING_CONFIRMED')::int AS confirmed,COUNT(DISTINCT cs.channel_id) FILTER (WHERE cs.persisted AND NOT cs.was_known AND cs.country_outcome<>'REJECTED' AND cs.funnel_outcome='TRADING_CONFIRMED' AND c.quality_score>=${QUALITY_CREATOR_SCORE_THRESHOLD})::int AS quality FROM channel_sightings cs LEFT JOIN channels c ON c.channel_id=cs.channel_id WHERE cs.query_run_id=qr.id) s ON true WHERE qr.status='COMPLETED' AND qr.query_id IS NOT NULL AND qr.completed_at IS NOT NULL AND qr.completed_at>now()-interval '180 days' AND COALESCE((qr.performance_details->>'providerRequestsFailed')::int,0)=0 AND COALESCE(qr.performance_details->>'providerRunOutcome','') NOT LIKE 'FAILED%' AND ($1::text IS NULL OR LOWER(qr.country)=LOWER($1)) ORDER BY qr.completed_at DESC`,[country||null]);return res.rows.map((r:any)=>({queryId:Number(r.query_id),confirmed:Number(r.confirmed||0),quality:Number(r.quality||0),quotaUnits:Number(r.quota_units||0),ageDays:Number(r.age_days||0)}));}
+/**
+ * All attributable quota spend in the accounting window, including runs that
+ * are still scheduled/running and runs excluded from reward by a provider
+ * failure. Share caps must see every family/source spend, including queries
+ * that are currently cooling down or otherwise unselectable.
+ */
+export interface QueryQuotaSpendRow{queryId:number;quotaUnits:number;ageDays:number;}
+export async function getQueryQuotaSpendRows(country?:string):Promise<QueryQuotaSpendRow[]>{
+  const db=await getDb();
+  const res=await db.query(`SELECT query_id,GREATEST(0,GREATEST(quota_reserved,quota_used))::float/100.0 AS quota_units,EXTRACT(EPOCH FROM (now()-COALESCE(completed_at,scheduled_at)))/86400.0 AS age_days FROM query_runs WHERE query_id IS NOT NULL AND status IN ('SCHEDULED','RUNNING','RETRYING','COMPLETED') AND COALESCE(completed_at,scheduled_at)>now()-interval '180 days' AND ($1::text IS NULL OR LOWER(country)=LOWER($1))`,[country||null]);
+  return res.rows.map((r:any)=>({queryId:Number(r.query_id),quotaUnits:Number(r.quota_units||0),ageDays:Math.max(0,Number(r.age_days||0))}));
+}
+/** Consecutive terminal query failures, newest first, with provider failures exempt. */
+export interface QueryFailureState{queryId:number;consecutiveFailures:number;backoffUntil:string|null;}
+export async function getQueryFailureStates(country?:string):Promise<QueryFailureState[]>{
+  const db=await getDb();
+  const res=await db.query(`SELECT query_id,status,completed_at,COALESCE(performance_details->>'failureKind','') AS failure_kind FROM (SELECT query_id,status,completed_at,performance_details,ROW_NUMBER() OVER (PARTITION BY query_id ORDER BY completed_at DESC) AS rn FROM query_runs WHERE query_id IS NOT NULL AND status IN ('COMPLETED','FAILED') AND completed_at IS NOT NULL AND ($1::text IS NULL OR LOWER(country)=LOWER($1))) ordered WHERE rn<=10 ORDER BY query_id,completed_at DESC`,[country||null]);
+  const grouped=new Map<number,QueryFailureStateRow[]>();
+  for(const row of res.rows){
+    const queryId=Number(row.query_id);
+    const list=grouped.get(queryId)||[];
+    list.push({status:String(row.status||''),completedAt:iso(row.completed_at),failureKind:row.failure_kind?String(row.failure_kind):null});
+    grouped.set(queryId,list);
+  }
+  return [...grouped.entries()].map(([queryId,rows])=>({queryId,...deriveQueryFailureState(rows)}));
+}
+/** Current-run reward truth, matching getQueryQualityRunRows' sighting definition. */
+export async function getQueryRunReward(runId:string):Promise<{confirmed:number;quality:number}>{
+  const db=await getDb();
+  const res=await db.query(`SELECT COUNT(DISTINCT cs.channel_id) FILTER (WHERE cs.persisted AND NOT cs.was_known AND cs.country_outcome<>'REJECTED' AND cs.funnel_outcome='TRADING_CONFIRMED')::int AS confirmed,COUNT(DISTINCT cs.channel_id) FILTER (WHERE cs.persisted AND NOT cs.was_known AND cs.country_outcome<>'REJECTED' AND cs.funnel_outcome='TRADING_CONFIRMED' AND c.quality_score>=${QUALITY_CREATOR_SCORE_THRESHOLD})::int AS quality FROM channel_sightings cs LEFT JOIN channels c ON c.channel_id=cs.channel_id WHERE cs.query_run_id=$1`,[runId]);
+  return {confirmed:Number(res.rows[0]?.confirmed||0),quality:Number(res.rows[0]?.quality||0)};
+}
+export async function getQueryPortfolioBudgetState(country?:string):Promise<{portfolioUnitsUsed:number;dailyQuotaUnits:number;portfolioUnitsReserved:number}>{const db=await getDb();const [quota,used]=await Promise.all([db.query(`SELECT daily_limit FROM quota_tracker WHERE id='youtube'`),db.query(`SELECT COALESCE(SUM(GREATEST(quota_reserved,quota_used)),0)::float/100.0 AS units FROM query_runs WHERE scheduled_at>=date_trunc('day',now() AT TIME ZONE 'UTC') AND status IN ('SCHEDULED','RUNNING','RETRYING','COMPLETED') AND (selection_strategy IN ('UCB_PORTFOLIO','UCB1_EXPLORATION','COLD_START_GENERATION') OR selection_reason LIKE 'Bounded portfolio%') AND ($1::text IS NULL OR LOWER(country)=LOWER($1))`,[country||null])]);const dailyQuotaUnits=Math.max(1,Number(quota.rows[0]?.daily_limit||10000)/100);const portfolioUnitsUsed=Math.max(0,Number(used.rows[0]?.units||0));return {portfolioUnitsUsed,dailyQuotaUnits,portfolioUnitsReserved:dailyQuotaUnits*0.15};}
+/** Q6 read-only projection over query runs + stored attribution JSONB. */
+export async function getQueryQualityDashboardRows(country?:string,limit=200):Promise<QueryQualityDashboardRunInput[]>{const db=await getDb();const res=await db.query(`SELECT qr.id::text AS run_id,qr.query_id,COALESCE(ql.query,'') AS query,qr.country,qr.status,qr.selection_strategy,qr.selection_reason,qr.quota_used,qr.completed_at,qr.performance_details,COALESCE(a.metrics,'{}'::jsonb) AS metrics,COALESCE(qr.metadata,'{}'::jsonb) AS run_metadata,(SELECT apo.stopping_reason FROM autonomous_query_page_observations apo WHERE apo.query_run_id=qr.id ORDER BY apo.page_number DESC LIMIT 1) AS stop_reason FROM query_runs qr LEFT JOIN query_library ql ON ql.id=qr.query_id LEFT JOIN query_run_accounting_attributions a ON a.query_run_id=qr.id WHERE ($1::text IS NULL OR LOWER(qr.country)=LOWER($1)) ORDER BY qr.scheduled_at DESC LIMIT $2`,[country||null,Math.max(1,Math.min(500,Math.floor(limit)))]);return res.rows.map((r:any)=>{const metrics=parseJson<Record<string,any>>(r.metrics,{});const metadata=parseGenerationMetadata(r.run_metadata);const admission=metadata.queryAdmission||null;return {runId:String(r.run_id||''),queryId:Number(r.query_id||0),query:String(r.query||''),country:String(r.country||''),status:String(r.status||''),selectionStrategy:String(r.selection_strategy||'UNKNOWN'),selectionReason:String(r.selection_reason||''),stopReason:r.stop_reason?String(r.stop_reason):null,quotaUsed:Number(r.quota_used||0),completedAt:iso(r.completed_at),performanceScore:Number(r.performance_details?.performanceScore||metrics.performanceScore||0),qualityVector:metrics.qualityVector||null,admission:admission?{tier:admission.tier,compositionFamily:admission.compositionFamily,reasonCodes:Array.isArray(admission.reasonCodes)?admission.reasonCodes:[],source:admission.source,eligible:admission.eligible}:null};});}
 export async function getQueryByText(queryText:string):Promise<QueryRecord|null>{const db=await getDb(); const res=await db.query('SELECT * FROM query_library WHERE LOWER(query)=LOWER($1)',[queryText.trim()]); return res.rows[0]?rowToQuery(res.rows[0]):null;}
-export async function upsertQueryRecord(record:{query:string;country:string;collection:'PROVEN'|'EXPERIMENTAL'|'REJECTED';intent:string;knowledgeTiers?:number[];generationMode?:string;generationReason?:string;discoveryObjective?:string;primaryTerm?:string;generationMetadata?:Record<string,unknown>;}):Promise<QueryRecord>{const db=await getDb(); const query=record.query.normalize('NFKC').trim().replace(/\s+/g,' '); const res=await db.query(`INSERT INTO query_library(query,normalized_query,country,collection,intent,knowledge_tiers,generation_mode,generation_reason,discovery_objective,primary_term,generation_metadata,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now()) ON CONFLICT(country,normalized_query) DO UPDATE SET query=excluded.query,collection=excluded.collection,intent=excluded.intent,knowledge_tiers=excluded.knowledge_tiers,generation_mode=excluded.generation_mode,generation_reason=excluded.generation_reason,discovery_objective=excluded.discovery_objective,primary_term=excluded.primary_term,generation_metadata=excluded.generation_metadata RETURNING *`,[query,normalizeQueryText(query),record.country,record.collection,record.intent,record.knowledgeTiers||[1],record.generationMode||'LEGACY',record.generationReason||'Legacy query',record.discoveryObjective||'Discover relevant trading creators.',record.primaryTerm||null,JSON.stringify(record.generationMetadata||{})]); return rowToQuery(res.rows[0]);}
+export async function upsertQueryRecord(record:{query:string;country:string;collection:'PROVEN'|'EXPERIMENTAL'|'REJECTED';intent:string;knowledgeTiers?:number[];generationMode?:string;generationReason?:string;discoveryObjective?:string;primaryTerm?:string;generationMetadata?:Record<string,unknown>;}):Promise<QueryRecord>{
+  const db=await getDb();
+  const query=record.query.normalize('NFKC').trim().replace(/\s+/g,' ');
+  const normalized=normalizeQueryText(query);
+  const admissionMetadata=parseGenerationMetadata(record.generationMetadata as Record<string,unknown>||{});
+  // Country-scoped duplicate suppression compares against every other row,
+  // including cooling/rejected rows. The current row is excluded so an
+  // in-place update never rejects itself.
+  const historyResult=await db.query(`SELECT query,country,generation_metadata FROM query_library WHERE LOWER(country)=LOWER($1) AND normalized_query<>$2`,[record.country,normalized]);
+  const history=historyResult.rows.map((row:any)=>{
+    const metadata=parseGenerationMetadata(row.generation_metadata);
+    const aliasOf=typeof metadata.aliasOf==='string'?metadata.aliasOf:undefined;
+    return {query:String(row.query||''),country:String(row.country||''),...(aliasOf?{aliasOf}:{})};
+  }).filter(item=>item.query);
+  const admission=admitQueryRecord({query,country:record.country,primary_term:record.primaryTerm,generation_metadata:admissionMetadata},{history,now:new Date().toISOString()});
+  const generationMetadata=withQueryAdmission(admissionMetadata,admission.admission);
+  const res=await db.query(`INSERT INTO query_library(query,normalized_query,country,collection,intent,knowledge_tiers,generation_mode,generation_reason,discovery_objective,primary_term,generation_metadata,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now()) ON CONFLICT(country,normalized_query) DO UPDATE SET query=excluded.query,collection=excluded.collection,intent=excluded.intent,knowledge_tiers=excluded.knowledge_tiers,generation_mode=excluded.generation_mode,generation_reason=excluded.generation_reason,discovery_objective=excluded.discovery_objective,primary_term=excluded.primary_term,generation_metadata=excluded.generation_metadata RETURNING *`,[query,normalized,record.country,record.collection,record.intent,record.knowledgeTiers||[1],record.generationMode||'LEGACY',record.generationReason||'Legacy query',record.discoveryObjective||'Discover relevant trading creators.',record.primaryTerm||null,JSON.stringify(generationMetadata)]);
+  return rowToQuery(res.rows[0]);
+}
 export async function updateQueryExecutionStats(queryId:number,stats:{totalChannelsFound:number;uniqueChannelsFound:number;qualityChannelsFound:number;communityChannelsFound:number;avgQualityScore:number;performanceScore:number;newCollection?:'PROVEN'|'EXPERIMENTAL'|'REJECTED';}):Promise<void>{const db=await getDb(); await db.query(`UPDATE query_library SET times_executed=times_executed+1,last_executed=now(),total_channels_found=total_channels_found+$1,unique_channels_found=unique_channels_found+$2,quality_channels_found=quality_channels_found+$3,community_channels_found=community_channels_found+$4,avg_quality_score=ROUND(((avg_quality_score*times_executed)+$5)/(times_executed+1)),performance_score=$6,collection=COALESCE($7,collection) WHERE id=$8`,[stats.totalChannelsFound,stats.uniqueChannelsFound,stats.qualityChannelsFound,stats.communityChannelsFound,stats.avgQualityScore,stats.performanceScore,stats.newCollection||null,queryId]);}
 export async function setQueryCollection(queryId:number,collection:'PROVEN'|'EXPERIMENTAL'|'REJECTED'):Promise<void>{const db=await getDb(); await db.query('UPDATE query_library SET collection=$1 WHERE id=$2',[collection,queryId]);}
 export async function addQueryExecutionLog(log:{query_id?:number;query_run_id?:string;query:string;country:string;executed_at:string;channels_discovered:number;unique_new_channels:number;quality_creators_discovered:number;communities_discovered:number;cycle_quality_score:number;logs?:string[];}):Promise<void>{const db=await getDb(); await db.query(`INSERT INTO query_execution_logs(query_run_id,query_id,query,country,executed_at,channels_discovered,unique_new_channels,quality_creators_discovered,communities_discovered,cycle_quality_score,logs) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(query_run_id) WHERE query_run_id IS NOT NULL DO NOTHING`,[log.query_run_id||null,log.query_id||null,log.query,log.country,log.executed_at,log.channels_discovered,log.unique_new_channels,log.quality_creators_discovered,log.communities_discovered,log.cycle_quality_score,JSON.stringify(log.logs||[])]);}
@@ -3813,7 +3876,50 @@ export async function completeQueryRun(runId: string, metrics: {
       await appendOutcomeWith(client,{eventKey:`query-run:${runId}:funnel:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_FUNNEL_RECORDED',verificationStatus:'PROVISIONAL',sourceEventKey:`query-run:${runId}:selected:v1`,queryId:run.rows[0].query_id,queryRunId:runId,jobId:row.job_id,country:row.country,retrievalLane:row.retrieval_lane,eventTime:iso(row.completed_at)!,payload:{...metrics}});
       await attributeCompletedCountryNativeRun(client,runId,metrics);
       await attributeCompletedExternalOsintRun(client,runId,metrics);
-      const attributionMetrics: QueryFunnelMetrics = {
+      // Q5 reward truth is result-level, not a page-local or cumulative
+      // counter: globally new (never seen before), persisted, confirmed
+      // creators attributed to this run, plus the quality subset.
+      const sightingTruth = await client.query(
+        `SELECT COUNT(DISTINCT s.channel_id) FILTER (
+           WHERE s.persisted AND NOT s.was_known AND s.country_outcome<>'REJECTED' AND s.funnel_outcome='TRADING_CONFIRMED')::int AS confirmed_new,
+         COUNT(DISTINCT s.channel_id) FILTER (
+           WHERE s.persisted AND NOT s.was_known AND s.country_outcome<>'REJECTED' AND s.funnel_outcome='TRADING_CONFIRMED'
+             AND c.quality_score>=${QUALITY_CREATOR_SCORE_THRESHOLD})::int AS quality_new
+         FROM channel_sightings s LEFT JOIN channels c ON c.channel_id=s.channel_id
+         WHERE s.query_run_id=$1`, [runId]
+      );
+      const newConfirmedCreators = Number(sightingTruth.rows[0]?.confirmed_new || 0);
+      const newQualityCreators = Number(sightingTruth.rows[0]?.quality_new || 0);
+      const qualityVector = buildQueryQualityVector({
+        rawResults: metrics.rawResults,
+        distinctResults: metrics.distinctResults,
+        duplicateResults: metrics.duplicateResults,
+        knownChannels: metrics.knownChannels,
+        newChannels: metrics.newChannels,
+        newConfirmedCreators,
+        newQualityCreators,
+        countryRejected: metrics.countryRejected,
+        tradingConfirmed: metrics.tradingConfirmed,
+        qualityChannels: metrics.qualityChannels,
+        quotaUsed: metrics.quotaUsed,
+        providerDegraded: (metrics.providerRequestsFailed || 0) > 0 || metrics.providerRunOutcome === 'FAILED_ALL_PROVIDERS',
+        failed: false,
+        targetMarketConfirmed: Math.max(0, metrics.distinctResults - metrics.countryRejected),
+        languageMatchedConfirmed: newConfirmedCreators,
+      });
+      const generationMetadata = parseGenerationMetadata(row.generation_metadata);
+      const admission = generationMetadata.queryAdmission as QueryAdmission | undefined;
+      const attribution = buildAttribution({
+        termSense: String(row.primary_term || row.query || row.query_id || ''),
+        relation: String(generationMetadata.queryTemplate || 'SURFACE'),
+        compositionFamily: admission?.compositionFamily || 'family:UNKNOWN',
+        surface: String(row.query || ''),
+        country: String(row.country || ''),
+        market: admission?.market || 'UNKNOWN',
+        language: admission?.language || 'und',
+        vector: qualityVector,
+      });
+      const attributionMetrics: QueryFunnelMetrics & { qualityVector: typeof qualityVector; attribution: typeof attribution } = {
         rawResults: metrics.rawResults, distinctResults: metrics.distinctResults, duplicateResults: metrics.duplicateResults,
         knownChannels: metrics.knownChannels, newChannels: metrics.newChannels, inScopeNewChannels: metrics.inScopeNewChannels, countryRejected: metrics.countryRejected,
         nonTrading: metrics.nonTrading, uncertain: metrics.uncertain, needsReview: metrics.needsReview,
@@ -3822,7 +3928,9 @@ export async function completeQueryRun(runId: string, metrics: {
         noveltyRatio: metrics.distinctResults ? metrics.newChannels / metrics.distinctResults : 0,
         countryPrecision: metrics.distinctResults ? (metrics.distinctResults - metrics.countryRejected) / metrics.distinctResults : 0,
         tradingPrecision: (metrics.nonTrading + metrics.uncertain + metrics.needsReview + metrics.tradingConfirmed) ? metrics.tradingConfirmed / (metrics.nonTrading + metrics.uncertain + metrics.needsReview + metrics.tradingConfirmed) : 0,
-        performanceScore: metrics.performanceScore || 0
+        performanceScore: metrics.performanceScore || 0,
+        qualityVector,
+        attribution,
       };
       const marker = await client.query(`INSERT INTO query_run_accounting_attributions(query_run_id,query_id,attribution_version,performance_score,metrics) VALUES($1,$2,'query-run-accounting-v1',$3,$4) ON CONFLICT(query_run_id) DO NOTHING RETURNING query_run_id`, [runId, run.rows[0].query_id, metrics.performanceScore || 0, JSON.stringify(attributionMetrics)]);
       if (marker.rowCount) {

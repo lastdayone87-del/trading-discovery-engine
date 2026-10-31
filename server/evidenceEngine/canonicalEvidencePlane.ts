@@ -3,6 +3,34 @@ import type { EvidenceFieldRef, EvidenceFieldType, RawChannelInput } from './typ
 
 export const CANONICAL_EVIDENCE_SCHEMA_VERSION = 'canonical-evidence-v2';
 
+/**
+ * Fields that describe the creator's own output. `search_match_context` is
+ * deliberately absent: it is retrieval provenance (how the channel was found),
+ * not creator evidence, and must never contribute to classification.
+ */
+export const CREATOR_OWNED_EVIDENCE_FIELDS: ReadonlySet<EvidenceFieldType> = new Set<EvidenceFieldType>([
+  'channel_title',
+  'channel_bio',
+  'video_title',
+  'video_description',
+  'playlist_name',
+  'playlist_description',
+  'transcript_excerpt',
+  'external_link_label',
+  'external_link_domain',
+  'location',
+  'language',
+  'discord_invite',
+  'pinned_comment',
+  'activity_metadata',
+  'visual_evidence',
+]);
+
+/** A creator-owned view of the canonical corpus for provider input. */
+export function creatorOwnedEvidenceCorpus(input: RawChannelInput): CanonicalEvidenceDocument[] {
+  return (input.evidence_corpus || []).filter(document => CREATOR_OWNED_EVIDENCE_FIELDS.has(document.field));
+}
+
 export interface CanonicalEvidenceDocument {
   id: string;
   field: EvidenceFieldType;

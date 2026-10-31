@@ -68,12 +68,22 @@ export async function classifyTradingRelevanceDetailed(
     reasoningLogs.push(`[-EVIDENCE] (${neg.source} / ${neg.reliability}): ${neg.fact}${provSuffix}`);
   }
 
+  const semanticServed = !!decision.geminiSemanticSummary || String(decision.classificationMethod || '').startsWith('SEMANTIC_');
+  const classificationMethod: TradingRelevanceBreakdown['classification_method'] = semanticServed
+    ? 'AI_SEMANTIC_CLASSIFIER'
+    : decision.classificationMethod === 'DETERMINISTIC_EVIDENCE'
+      ? 'DETERMINISTIC_EVIDENCE'
+      : decision.classificationMethod === 'DEGRADED_HEURISTIC'
+        ? 'DEGRADED_HEURISTIC'
+        : 'HEURISTIC_ONLY';
+  const noEvidence = decision.positiveEvidence.length === 0 && decision.negativeEvidence.length === 0;
   const breakdown: TradingRelevanceBreakdown = {
     stage_a_score: Math.round(decision.totalPositiveWeight),
     consistency_ratio: decision.multiVideoConsistencyRatio,
-    ai_reviewed: !!decision.geminiSemanticSummary,
+    ai_reviewed: semanticServed,
     fast_heuristic_status: decision.status === 'TRADING_CONFIRMED' ? 'FAST_ACCEPT' : decision.status === 'NON_TRADING' ? 'FAST_REJECT' : 'UNCERTAIN',
-    classification_method: 'AI_SEMANTIC_CLASSIFIER',
+    classification_method: classificationMethod,
+    confidence_basis: semanticServed ? 'CALIBRATED' : noEvidence ? 'NEUTRAL_PRIOR' : 'HEURISTIC',
     ai_model: decision.geminiSemanticSummary?.modelUsed || decision.versions.geminiModelVersion,
     ai_prompt_payload: decision.geminiSemanticSummary ? JSON.stringify(decision.geminiSemanticSummary) : undefined,
     ai_raw_response: decision.geminiSemanticSummary ? decision.geminiSemanticSummary.reason : undefined,

@@ -11,6 +11,8 @@ import { evaluateClassificationStages } from './stagedClassification';
 import { ENGINE_VERSIONS, getScoringConfig } from './config';
 import { TradingCategory } from '../../src/types';
 import { evaluateUnifiedDecisionPolicy, UNIFIED_DECISION_POLICY_VERSION } from './decisionPolicy';
+import type { ContextualCompositionReport } from './contextualComposition';
+import type { RecognitionAssessment } from './recognitionState';
 
 export class ConfigurableWeightedStrategy {
   private config: ScoringEngineConfig;
@@ -19,12 +21,22 @@ export class ConfigurableWeightedStrategy {
     this.config = { ...getScoringConfig(), ...customConfig };
   }
 
+  /** Policy thresholds consumed by the C6 pre-semantic recognition gate. */
+  public policyConfig(): { minimumPositiveWeightTrading: number; minimumTradingScore: number } {
+    return {
+      minimumPositiveWeightTrading: this.config.minPositiveWeightTrading,
+      minimumTradingScore: this.config.minVerifiedTradingScore,
+    };
+  }
+
   public evaluateDecision(
     evidenceItems: EvidenceItem[],
     knowledgeContext: LayeredKnowledgeContext,
     country: string,
     evidenceCollection: EvidenceCollectionReport = { sufficiency: 'SUFFICIENT', sparseMetadata: false, degraded: false, fieldsPresent: [], reasonCodes: [], providers: [] },
-    stagedClassification?: StagedClassificationReport
+    stagedClassification?: StagedClassificationReport,
+    composition?: ContextualCompositionReport,
+    recognition?: RecognitionAssessment
   ): VerificationDecision {
     const now = new Date().toISOString();
     const stages = stagedClassification || evaluateClassificationStages({ channel_name: '', description: '' }, evidenceItems, evidenceCollection);
@@ -66,7 +78,7 @@ export class ConfigurableWeightedStrategy {
     const hasMethodologyConcept = positiveItems.some(i => i.category === 'METHODOLOGY_CONCEPT' || i.category === 'TERMINOLOGY');
 
     const policyMinimum=(hasMethodologyConcept||hasHighReliabilityMatch||hasPlatformOrPropFirm)?15:this.config.minPositiveWeightTrading;
-    const policy=evaluateUnifiedDecisionPolicy({evidence:evidenceItems,collection:evidenceCollection,lifecycleAction:stages.lifecycleAction,minimumPositiveWeight:policyMinimum,minimumTradingScore:this.config.minVerifiedTradingScore});
+    const policy=evaluateUnifiedDecisionPolicy({evidence:evidenceItems,collection:evidenceCollection,lifecycleAction:stages.lifecycleAction,minimumPositiveWeight:policyMinimum,minimumTradingScore:this.config.minVerifiedTradingScore,composition,recognition});
     status=policy.status;confidenceScore=policy.confidenceScore;
     if(status==='TRADING_CONFIRMED')justifications.push('DECISION: VERIFIED_TRADING. Calibrated support and independent corroboration satisfied.');
     else if(status==='NON_TRADING')justifications.push('DECISION: VERIFIED_NON_TRADING. Explicit negative-domain evidence forms a dominant attributed contradiction.');
@@ -99,6 +111,17 @@ export class ConfigurableWeightedStrategy {
       };
     }
 
+    const providerCoverage = evidenceCollection.providers.filter(provider => provider.availability === 'AVAILABLE').length;
+    const evidenceCount = evidenceItems.filter(item => item.rawMatches.length > 0 && item.category !== 'SEMANTIC_ABSTENTION').length;
+    const classificationMethod: VerificationDecision['classificationMethod'] = semanticItem
+      ? semanticItem.source === 'groq_semantic' ? 'SEMANTIC_GROQ'
+        : semanticItem.source === 'gemini_free_semantic' ? 'SEMANTIC_GEMINI_FREE' : 'SEMANTIC_GEMINI'
+      : recognition && (recognition.state === 'DECISIVE_TRADING' || recognition.state === 'DECISIVE_NON_TRADING')
+        ? 'DETERMINISTIC_EVIDENCE'
+        : evidenceCollection.degraded || evidenceCollection.sufficiency !== 'SUFFICIENT'
+          ? 'DEGRADED_HEURISTIC'
+          : 'HEURISTIC_ONLY';
+
     return {
       status,
       confidenceScore,
@@ -120,7 +143,24 @@ export class ConfigurableWeightedStrategy {
       evidenceCollection,
       stagedClassification: stages,
       timestamp: now,
-      decisionPolicy:{version:UNIFIED_DECISION_POLICY_VERSION,tradingProbability:policy.tradingProbability,nonTradingProbability:policy.nonTradingProbability,coverageConfidence:policy.coverageConfidence,reasonCodes:policy.reasonCodes}
+      decisionPolicy:{version:UNIFIED_DECISION_POLICY_VERSION,tradingProbability:policy.tradingProbability,nonTradingProbability:policy.nonTradingProbability,coverageConfidence:policy.coverageConfidence,reasonCodes:policy.reasonCodes},
+      classificationMethod,
+      providerCoverage,
+      evidenceCount,
+      recognitionState: recognition?.state,
+      semanticPolicy: recognition?.semanticPolicy,
+      semanticSkippedReason: recognition?.semanticSkippedReason ?? null,
+      composition: composition ? {
+        focus: composition.focus,
+        observedFamilies: composition.observedFamilies,
+        tradingFamilies: composition.tradingFamilies,
+        alternativeFamilies: composition.alternativeFamilies,
+        tradingCoverage: composition.tradingCoverage,
+        alternativeCoverage: composition.alternativeCoverage,
+        temporalCoverage: composition.temporalCoverage,
+        nonTitleTierAFamilies: composition.nonTitleTierAFamilies,
+        reasons: composition.reasonCodes
+      } : undefined
     };
   }
 
