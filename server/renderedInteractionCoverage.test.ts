@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { combineRenderedControlOffsetAdvances, isCrossOriginStructuralNavigation, isNavigableOnlyControlWindow, isSameSeedDocument, isUnrecoveredStructuralNavigation, mergeRenderedCoverageGapCounters, planRevealedRenderedClickTargets, partitionRenderedClickTargets, reconcileClickDestinationContext, remainingRenderedClickBudget, renderedClickOffsetAdvance, renderedControlOverflowTargets, renderedRequestControlTotalsDelta, resolveRenderedCompletionState, resolveUnexaminedPopupTargets, runRenderedClickLoop, trackRenderedPopupCoverage, type RenderedControlEnumeration, type RenderedRequestControlTotals } from './browserCommunityFallback';
+import { combineRenderedControlOffsetAdvances, isCrossHostnameStructuralNavigation, isNavigableOnlyControlWindow, isSameSeedDocument, isUnrecoveredStructuralNavigation, mergeRenderedCoverageGapCounters, planRevealedRenderedClickTargets, partitionRenderedClickTargets, reconcileClickDestinationContext, remainingRenderedClickBudget, renderedClickOffsetAdvance, renderedControlOverflowTargets, renderedRequestControlTotalsDelta, resolveRenderedCompletionState, resolveUnexaminedPopupTargets, runRenderedClickLoop, trackRenderedPopupCoverage, type RenderedControlEnumeration, type RenderedRequestControlTotals } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -610,21 +610,31 @@ test('structural navigation is a coverage gap only when enqueue will not follow 
   );
 });
 
-test('cross-origin structural anchors are classified for the rendered policy ledger', () => {
+test('cross-hostname structural anchors are classified for the rendered policy ledger', () => {
   assert.equal(
-    isCrossOriginStructuralNavigation('https://other.example/resources', 'https://creator.example/'),
+    isCrossHostnameStructuralNavigation('https://other.example/resources', 'https://creator.example/'),
     true,
   );
   assert.equal(
-    isCrossOriginStructuralNavigation('https://creator.example/resources', 'https://creator.example/start'),
+    isCrossHostnameStructuralNavigation('https://creator.example/resources', 'https://creator.example/start'),
     false,
   );
   assert.equal(
-    isCrossOriginStructuralNavigation('mailto:creator@example.com', 'https://creator.example/'),
+    isCrossHostnameStructuralNavigation('http://creator.example/resources', 'https://creator.example/'),
     false,
-    'format rejections are not cross-origin navigation',
+    'the same-hostname enqueue strategy follows a scheme switch',
   );
-  assert.equal(isCrossOriginStructuralNavigation('', 'https://creator.example/'), false);
+  assert.equal(
+    isCrossHostnameStructuralNavigation('https://creator.example:8443/resources', 'https://creator.example/'),
+    false,
+    'the same-hostname enqueue strategy ignores the port',
+  );
+  assert.equal(
+    isCrossHostnameStructuralNavigation('mailto:creator@example.com', 'https://creator.example/'),
+    false,
+    'format rejections are not cross-hostname navigation',
+  );
+  assert.equal(isCrossHostnameStructuralNavigation('', 'https://creator.example/'), false);
 });
 
 test('overflow targets follow the durable rotation and expose only unexamined controls', () => {
@@ -867,6 +877,8 @@ test('a retried request replaces its previous-attempt counters instead of double
     hintRejected: 1,
     structuralNavigation: 2,
     structuralHintRejected: 1,
+    structuralDisclosure: 1,
+    structuralUnrecovered: 1,
     iconLabelRecovered: 1,
     popupCount,
     frameCount: 1,
@@ -883,6 +895,8 @@ test('a retried request replaces its previous-attempt counters instead of double
     hintRejected: 0,
     structuralNavigation: 0,
     structuralHintRejected: 0,
+    structuralDisclosure: 0,
+    structuralUnrecovered: 0,
     iconLabelRecovered: 0,
     popupCount: 0,
     frameCount: 0,

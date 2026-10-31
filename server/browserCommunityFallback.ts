@@ -874,7 +874,7 @@ export function enumerateRenderedControlNodes(
           }
         }
       }
-    }    }
+    }
     let childAlt = '';
     const image = element.querySelector('img[alt]');
     if (image) childAlt = (image.getAttribute('alt') || '').slice(0, 200);
@@ -1191,12 +1191,12 @@ export function isSameSeedDocument(
 }
 
 /**
- * True when a structural href resolves to a different HTTP(S) origin. The
- * same-hostname rendered enqueue path never follows such a destination, so the
- * handler records it in the rendered policy ledger instead of the unrecovered
- * navigation gap.
+ * True when a structural href resolves to a different hostname. The rendered
+ * enqueue path uses Crawlee's `same-hostname` strategy, which follows HTTP and
+ * HTTPS (and any port) on the same hostname, so origin comparison would
+ * mislabel an admissible scheme/port switch as cross-origin.
  */
-export function isCrossOriginStructuralNavigation(href: string, pageUrl: string): boolean {
+export function isCrossHostnameStructuralNavigation(href: string, pageUrl: string): boolean {
   const raw = (href || '').trim();
   if (!raw) return false;
   let page: URL;
@@ -1208,7 +1208,7 @@ export function isCrossOriginStructuralNavigation(href: string, pageUrl: string)
     return false;
   }
   if (absolute.protocol !== 'http:' && absolute.protocol !== 'https:') return false;
-  return absolute.origin !== page.origin;
+  return absolute.hostname.toLowerCase() !== page.hostname.toLowerCase();
 }
 
 /**
@@ -1238,7 +1238,7 @@ export function isUnrecoveredStructuralNavigation(
   if (absolute.protocol !== 'http:' && absolute.protocol !== 'https:') return false;
   // Cross-origin destinations are recorded in the rendered policy ledger by
   // the handler (`cross-origin-disallowed`); they are not enqueue-owned.
-  if (isCrossOriginStructuralNavigation(raw, pageUrl)) return false;
+  if (isCrossHostnameStructuralNavigation(raw, pageUrl)) return false;
   const visitKey = normalizeVisitUrl(absolute.toString());
   if (visitKey && alreadyVisited.has(visitKey)) return false;
   if (!assessCrawlAdmission(absolute.toString()).eligible) return false;
@@ -2898,7 +2898,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               let unrecoveredRejected = 0;
               let newCrossOrigin = 0;
               for (const href of enumeration.structuralUnrecoveredHrefs) {
-                if (isCrossOriginStructuralNavigation(href, page.url())) {
+                if (isCrossHostnameStructuralNavigation(href, page.url())) {
                   const key = href.trim();
                   if (key && !pageCrossOriginHrefs.has(key)) {
                     pageCrossOriginHrefs.add(key);
@@ -2973,8 +2973,8 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 baseHrefPresent = baseHrefPresent || merged.baseHrefPresent;
                 return;
               }
-              // Popups that the click loop actually inspected are not an              // unexamined context gap. Identity tracking keeps a replacement
-              // popup from being cancelled out by an earlier clicked popup,
+              // Popups that the click loop actually inspected are not an
+              // unexamined context gap. Identity tracking keeps a replacement              // popup from being cancelled out by an earlier clicked popup,
               // including when the replacement is hint-rejected.
               const current = {
                 enumerated: pageControlsEnumeratedTotal,
