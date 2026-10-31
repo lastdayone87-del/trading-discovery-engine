@@ -317,13 +317,13 @@ test('real DOM: navigation ancestors and generic labels classify structural cont
   await withControlPage(html, async (page) => {
     const enumeration = await enumeratePageControls(page);
     assert.equal(enumeration.total, 10);
-    assert.equal(enumeration.controls.length, 6, 'three hint-matched controls plus three in-place disclosures remain evidence-bearing');
+    assert.equal(enumeration.controls.length, 5, 'three hint-matched controls plus the two hint-rejected in-place disclosures remain evidence-bearing');
     assert.equal(
       enumeration.structuralNavigation,
-      7,
-      'nav ancestors and menu-like labels classify the two nav links, footer Support/More, the menu trigger, the disclosure button, and the dialog trigger as structural measurement',
+      8,
+      'nav ancestors and menu-like labels classify the two nav links, footer Support/More, the menu trigger, the filters disclosure, the /account link, and the dialog trigger as structural measurement',
     );
-    assert.equal(enumeration.structuralHintRejected, 6, 'every structural control except the hint-matched dialog trigger is hidden by the original hint filter');
+    assert.equal(enumeration.structuralHintRejected, 7, 'every structural control except the hint-matched dialog trigger is hidden by the original hint filter');
     assert.equal(enumeration.structuralDisclosure, 3, 'the menu, disclosure, and dialog triggers reveal content in place');
     assert.equal(enumeration.structuralUnrecovered, 1, 'only the explicitly menu-semantic /account anchor is an unrecovered navigation gap; ordinary nav links are enqueue-owned page candidates');
     assert.equal(
