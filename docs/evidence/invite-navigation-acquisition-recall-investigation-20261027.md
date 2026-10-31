@@ -421,7 +421,7 @@ The new admission filter rejects file extensions, template tokens, CDN/proxy art
 
 #### A4. 404 is mostly dead — root re-seed is a hypothesis, not a proven lever
 
-404 had 3,237 bad URLs, 61 later `FOUND` (1.9%), 369 same-channel successes (11.4%); static was the more common first recovery (43 vs 19). 525 sites had a 404 and no clean/found outcome; 283 of those had a 200 root, 76 a 404 root, 263 unobserved. Root re-seed/sitemap probing is plausible but unproven; current 404-only conversion is 0 by construction.
+404 had 3,237 bad URLs, 61 later `FOUND` (1.9%), 369 same-channel successes (11.4%); static was the more common first recovery (43 vs 19). 525 sites had a 404 and no clean/found outcome. Of the 404-only sites, 283 had a 200 root — the sizing basis for P2.3 below — and 76 had a 404 root. Root observation was unavailable for the remaining sites. The root-status counts come from a separate root-observation query and are not a partition of the 525-site outcome count, so they must not be summed with it. Root re-seed/sitemap probing is plausible but unproven; current 404-only conversion is 0 by construction.
 
 #### A5. 406 is concentrated and recoverable — `linktr.ee` page-level retry
 
