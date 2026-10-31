@@ -46,23 +46,28 @@ represented.
 |---|---|---:|
 | A. Static found | Static inspection `FOUND` with a serving invite | 60 |
 | B. Rendered found | Rendered fallback `FOUND` after static miss | 60 |
-| C. Partial | `PARTIALLY_INSPECTED` with a required gap and no `FOUND` | 50 |
-| D. 403 (primary) | Latest 7d contains 403 and no `FOUND`; 403 takes precedence over 404/406 | 40 |
-| E. 404 (no 403) | Latest 7d contains 404, no `FOUND`, and no 403 | 40 |
-| F. 406 (no 403/404) | Latest 7d contains 406, no `FOUND`, and no 403/404 | 20 |
-| G. No observation | Eligible surface never successfully inspected | 30 |
+| C. Partial | `PARTIALLY_INSPECTED` with a required gap and no `FOUND` | 40 |
+| D. 403 (primary) | Latest 7d contains 403 and no `FOUND`; 403 takes precedence over 404/406 | 30 |
+| E. 404 (no 403) | Latest 7d contains 404, no `FOUND`, and no 403 | 30 |
+| F. 406 (no 403/404) | Latest 7d contains 406, no `FOUND`, and no 403/404 | 15 |
+| H. Clean no-match | `INSPECTED_NO_MATCH`, no `FOUND`, no required gap, and no 403/404/406 in the latest 7d | 40 |
+| G. No observation | Eligible surface never successfully inspected | 25 |
 | **Total** | | **300** |
 
 Strata are disjoint. A channel with several candidate URLs (for example one
 static hit and one rendered hit) is assigned to exactly one stratum by a single
-precedence evaluated at the frozen snapshot: **A → B → C → D → E → F → G**.
+precedence evaluated at the frozen snapshot: **A → B → C → D → E → F → H → G**.
 `FOUND` always outranks `PARTIALLY_INSPECTED`, so a partial acquisition that
-also found an invite is A or B, never C, and C requires no `FOUND`. Within the
-4xx group a channel with several classes is assigned once by precedence
-403 → 404 → 406, so no channel is counted twice. A channel whose only 4xx
-status is, for example, 410 does not match D–F and belongs in G (no successful
-inspection) or outside the frame if it has another eligible observation. Store
-the assigned stratum, and the rule that produced it, in the manifest.
+also found an invite is A or B, never C, and C requires no `FOUND`. H is the
+successfully inspected, clean no-match stratum; a channel with any 403/404/406
+signal in the latest 7d is assigned to D–F first. Without H, clean misses —
+the cases most likely to reveal an extraction gap — would match no stratum.
+Within the 4xx group a channel with several classes is assigned once by
+precedence 403 → 404 → 406, so no channel is counted twice. A channel whose
+only 4xx status is, for example, 410 does not match D–F: it belongs in H when
+it also has a successful `INSPECTED_NO_MATCH` observation, and otherwise in G
+(no successful inspection). Store the assigned stratum, and the rule that
+produced it, in the manifest.
 
 If the frame cannot fill a stratum, reallocate proportionally and document the
 shortfall. Do not silently substitute a different class.
@@ -87,14 +92,21 @@ Report Cohen's κ and the adjudication rate.
 
 ## 4. Procedure
 
-1. **Freeze the sampling frame.** Export channel ids and the latest observed
-   URL per channel from the read-only replica. Record the snapshot timestamp
-   and query text. Keep the stratum assignment (and the pipeline outcome that
-   produced it) in a separate manifest unavailable to labelers, so the export
-   handed to a labeler contains only the channel id and inspection URL(s).
+1. **Freeze the sampling frame.** Export channel ids and **all eligible
+   candidate URLs** for each channel, with provenance (source field, discovery
+   mode, first/last observed at, and which observation is the latest) from the
+   read-only replica. Labeling only the latest URL would hide a discoverable
+   invite on another candidate surface and manufacture false negatives. Record
+   the snapshot timestamp and query text. Keep the stratum assignment (and the
+   pipeline outcome that produced it) in a separate manifest unavailable to
+   labelers, so the export handed to a labeler contains only the channel id and
+   inspection URLs with their provenance.
 2. **Select and de-duplicate.** Randomly select within each stratum; exclude
    channels already labeled in a prior sample; cap multiple channels per site
-   host to reduce clustering (for example ≤5 per host).
+   host to reduce clustering (for example ≤5 per host). Record the selected
+   host and the realized host-level inclusion probability in the manifest: the
+   cap changes selection probability within a stratum, so weights cannot rely
+   on stratum counts alone.
 3. **Capture evidence.** For each channel, record the URL(s) to inspect, the
    HTTP status, content type, whether the page is static/rendered, and the
    pipeline's stored outcome **after** the blind label is recorded.
@@ -113,21 +125,33 @@ Report Cohen's κ and the adjudication rate.
 
 Primary:
 
-- **Channel-level recall** = channels with a labeled invite that the pipeline
-  found / channels with a labeled invite, overall and by stratum. The pooled
-  “overall” figure is **sample-weighted**: strata are deliberately oversampled,
-  so it is not a population-level recall estimate. Report population estimates
-  only after post-stratification weighting against frame counts, with the
-  weighting method and design effect documented.
-- **Stage recall**: the share of found positives recovered at each stage, with
-  one mutually exclusive stage per found channel. Numerator = sampled channels
-  whose labeled invite was first recovered at that stage (static-found, else
-  rendered-found, else interaction-found). Denominator = sampled channels with a
-  labeled invite that the pipeline found. Each found channel is attributed to
-  exactly its earliest recovering stage, so the three shares sum to 100%. This
-  is a stage-attribution share of found positives, not population recall; a
-  channel that the pipeline missed is counted only in channel-level recall and
-  the false-negative table.
+- **Channel-level recall** = channels whose labeled creator-owned invite the
+  pipeline found / channels with a labeled invite, overall and by stratum.
+  “Found” means the pipeline produced a pipeline candidate for the **same
+  invite** (exact code) or the **same guild** (same server, different code).
+  A different-guild or sponsor invite found in its place is a miss for recall
+  and a false positive for precision; it is never counted in the numerator.
+  The pooled “overall” figure is **sample-weighted**: strata are deliberately
+  oversampled, so it is not a population-level recall estimate. Report
+  population estimates only after post-stratification weighting against frame
+  counts **and the host-cap inclusion probabilities recorded at selection**,
+  with the weighting method and design effect documented.
+- **Stage recall**: the share of found positives recovered at each extraction
+  stage, with one mutually exclusive stage per found channel. Numerator =
+  sampled channels whose labeled invite was first recovered at that stage
+  (static-found, else rendered-found, else interaction-found). Denominator =
+  sampled channels with a labeled invite that the pipeline found. Each found
+  channel is attributed to exactly its earliest recovering stage, so the three
+  shares sum to 100%. This is a stage-attribution share of found positives, not
+  population recall; a channel that the pipeline missed is counted only in
+  channel-level recall and the false-negative table.
+- **Projection/persistence loss**: reported separately, not folded into the
+  three stage shares. Numerator = sampled channels whose labeled invite was
+  recovered by extraction but is not the serving invite on the stored channel
+  row (or is absent from the attempt ledger). Denominator = sampled channels
+  whose labeled invite was recovered by extraction. Attribute a case here only
+  when the attempt ledger records the recovery and the projection/persistence
+  boundary is observed; otherwise keep the miss in “unknown”.
 - **False-negative rate by attributed cause**, with design-based
   (stratified/host-aware) 95% intervals. Exact binomial intervals may be shown
   per stratum only as descriptive approximations, never as the pooled

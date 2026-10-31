@@ -3,7 +3,10 @@
 **Date:** 2026-10-27
 **Scope:** Remediation of the approved retry/acquisition items for invite
 discovery. The originating consolidated report is not stored in this
-repository; each claim below is verified by the in-repo code and tests it names.
+repository. Code and test claims below name the in-repo files that verify them.
+The production counts and timings are an external, one-off read-only analysis
+of a 7-day window ending on or before 2026-10-27; their source queries are not
+stored here and those figures are not reproducible from this repository.
 **Status:** Non-page/malformed URL filter implemented. Host-aware policy,
 long-attempt cap, and queue re-dating are investigation/preparation only. No
 concurrency, queue, budget, or setting change is included.
@@ -171,7 +174,8 @@ UPDATE jobs
 - true backlog age is masked (p50 48.5h, max 453.5h using `retryObservedAt`);
 - capacity-deferred jobs move to the back of the FIFO every 5 hours;
 - 1,087 jobs “created today” include 913 with an earlier `retryObservedAt`;
-  823 differ by >11h and 608 by <30m.
+  823 of those 913 differ by >11h, while a separate cut of the 1,087 shows 608
+  with <30m. The two cuts use different denominators and are not additive.
 
 ### Assessment
 

@@ -130,8 +130,9 @@ parser path and entity/XXE safety review.
 
 ## 9. Non-2xx bodies
 
-**Confirmed behavior:** non-2xx bodies are read for block-marker probing but
-never scanned for invites.
+**Confirmed behavior:** 401/403 bodies are read for block-marker probing, and
+seed 404/410 bodies may be read for terminal not-found probing; neither is
+scanned for invites.
 
 **Evidence:** 11 body-confirmed 404s/7d.
 

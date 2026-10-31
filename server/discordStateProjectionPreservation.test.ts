@@ -419,7 +419,7 @@ test('dashboard count, active filter, recent-confirmed filter, and selected cand
     { includeRejected: false, diagnosticsOnly: false, discordStatus: 'ACTIVE', recentInvites: true },
   );
   assert.match(where.where, /discord_status=\$1/);
-  assert.match(where.where, /NOT \(EXISTS \(/, 'recent-confirmed view excludes selected invites owned elsewhere');
+  assert.match(where.where, /NOT \(EXISTS \(\s*SELECT 1 FROM discord_invite_registry owner[\s\S]*owner\.first_channel_id <> channel_id\s*\)\)/, 'recent-confirmed view excludes selected invites owned elsewhere');
   assert.deepEqual(where.values, ['ACTIVE']);
   assert.match(CONFIRMED_DISCORD_INVITE_SQL, /discord_validation_status IN \('SUCCEEDED','COMPLETED'\)/);
   assert.match(CONFIRMED_DISCORD_INVITE_SQL, /discord_liveness_status='ACTIVE'/);

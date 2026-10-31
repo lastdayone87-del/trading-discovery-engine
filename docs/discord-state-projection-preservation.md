@@ -65,7 +65,8 @@ could stop serving an invite that was never shown to be dead.
 The retention invariant is now applied at three enforcement points:
 
 1. **Projection.** An ambiguous successful revalidation retains the current
-   serving invite, `discord_status` (`ACTIVE`/`ACTIVE_LOW_VOLUME`), candidate
+   serving invite, `discord_status` (`ACTIVE`/`ACTIVE_LOW_VOLUME`, or
+   `UNCERTAIN` when the row was already reset to that status), candidate
    identity/locator, resolution and discovery state. The existing
    `discord_relevance_status` is set to `UNCERTAIN` to record that the current
    revalidation is uncertain; no schema migration is required.
@@ -102,7 +103,8 @@ classification, or attempt-ledger semantics.
 
 ## Regression coverage
 
-`server/discordStateProjectionPreservation.test.ts` covers:
+`server/discordStateProjectionPreservation.test.ts` covers (other suites are
+cited where they own the assertion):
 
 - the real `aHJH5Zuxgb` → `UNCERTAIN` → `RuhggKuW` sequence;
 - a validated `ACTIVE` invite surviving trading reclassification;
@@ -124,9 +126,12 @@ classification, or attempt-ledger semantics.
   a stale `DEAD` snapshot cannot downgrade a newer live projection
   (`server/channelUpsertDiscordProjection.postgres.test.ts`);
 - A1 retention: an ambiguous `SUCCEEDED` revalidation keeps the serving invite,
-  status, and candidate identity, records uncertainty in
-  `discord_relevance_status`, and derives the last-verified timestamp from the
-  serving attempt;
+  status, and candidate identity and records uncertainty in
+  `discord_relevance_status`
+  (`server/discordStateProjectionPreservation.test.ts`);
+- last-verified timestamp correlation uses the served locator and includes
+  association-promoted `UNCERTAIN` and `NON_TRADING` successes
+  (`server/recentDiscordInvites.postgres.test.ts`);
 - A1 clearing paths: `CONFIRMED_INVALID`/`DEAD`, `NON_TRADING`, stale-invite
   audit cleanup, rejected-channel cleanup, and explicit `allowDiscordClear`
   still clear;
