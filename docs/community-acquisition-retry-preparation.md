@@ -46,7 +46,8 @@ Deliberate exclusions from the filter:
   observation; legitimate HTML pages, query strings, apostrophes, documents,
   shorteners, social profiles, invite hosts, script-keyword page slugs,
   asset-like directory roots (`/images`, `/images/`), and `.js`-named path
-  segments still crawl.
+  segments still pass admission and normalization. (The same file asserts the
+  direct-crawler fetch/enqueue skip for rejected noise.)
 - `server/pageAssetFilter.test.ts`: asset/CDN hosts are filtered; profile and
   invite hosts are preserved.
 - `server/communityRetryPolicy.test.ts`: malformed/asset observations own no

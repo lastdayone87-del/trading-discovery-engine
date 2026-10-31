@@ -128,8 +128,10 @@ Primary:
   is a stage-attribution share of found positives, not population recall; a
   channel that the pipeline missed is counted only in channel-level recall and
   the false-negative table.
-- **False-negative rate by attributed cause**, with exact binomial 95%
-  confidence intervals.
+- **False-negative rate by attributed cause**, with design-based
+  (stratified/host-aware) 95% intervals. Exact binomial intervals may be shown
+  per stratum only as descriptive approximations, never as the pooled
+  precision.
 
 Secondary:
 

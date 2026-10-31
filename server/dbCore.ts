@@ -644,8 +644,11 @@ export const DISCORD_INVITE_FIRST_VALIDATED_SQL = `(SELECT dc.first_validated_at
  * turns an `UNCERTAIN` attempt into a serving `ACTIVE` invite after the attempt
  * row is written; the channel's `TRADING_RELEVANT` marker identifies that
  * effective serving state, so the promoted attempt still supplies the
- * timestamp. When the served invite has no successful ledger row the column is
- * NULL (explicitly unavailable), never another candidate's date.
+ * timestamp. `NON_TRADING` successes count too: the confirmed-invite view
+ * explicitly permits a `NON_TRADING` row with a serving invite, and the label
+ * answers "verified live", not "verified as trading". When the served invite
+ * has no successful ledger row the column is NULL (explicitly unavailable),
+ * never another candidate's date.
  *
  * Parameterized by table alias so `/api/channels/:id` (alias `c`) can project
  * the same expression as the listing query (alias `channels`). */
@@ -654,7 +657,7 @@ export const discordInviteLastVerifiedSql = (alias = 'channels'): string => `(SE
    WHERE a.channel_id=${alias}.channel_id
      AND a.operational_outcome='SUCCEEDED'
      AND (
-       a.semantic_status IN ('ACTIVE','ACTIVE_LOW_VOLUME')
+       a.semantic_status IN ('ACTIVE','ACTIVE_LOW_VOLUME','NON_TRADING')
        OR (a.semantic_status='UNCERTAIN' AND ${alias}.discord_relevance_status='TRADING_RELEVANT')
      )
      AND ${alias}.discord_invite IS NOT NULL

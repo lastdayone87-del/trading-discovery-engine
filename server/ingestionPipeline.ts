@@ -693,7 +693,11 @@ async function processChannelThroughPipelineInContext(
     nonTradingChannel.last_checked = now;
     applyCandidateObservability(nonTradingChannel, candidate);
 
-    await upsertChannel(nonTradingChannel);
+    // Gate 2 is a fresh terminal classification, not a stale ordinary snapshot:
+    // it must be allowed to clear a previously serving Discord invite. Without
+    // this explicit option the locked-row retention guard would keep the old
+    // ACTIVE projection while the row's trading status becomes NON_TRADING.
+    await upsertChannel(nonTradingChannel, { allowDiscordClear: true });
 
     return {
       channelId: candidate.channelId,

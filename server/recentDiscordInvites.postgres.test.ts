@@ -332,4 +332,36 @@ maybe('last-verified correlates with the served invite, including association-pr
   );
 });
 
+maybe('a confirmed NON_TRADING row gets a last-verified date from its successful live check', async t => {
+  const db = await getDb();
+  const suffix = `${Date.now()}_${process.pid}`;
+  const channelId = `${PREFIX}last-verified-nontrading-${suffix}`;
+  const cleanup = async () => {
+    await db.query(`DELETE FROM channels WHERE channel_id=$1`, [channelId]).catch(() => undefined);
+  };
+  await cleanup();
+  t.after(cleanup);
+  const code = `nt${suffix.replace(/[^a-z0-9]/gi, '').toLowerCase()}`;
+  const served = `https://discord.gg/${code}`;
+  await db.query(
+    `INSERT INTO channels(
+      channel_id,channel_name,youtube_url,country,country_status,discord_status,discord_invite,
+      scan_status,discovery_source,first_seen,trading_status,subscriber_count,
+      discord_validation_status,discord_liveness_status,discord_discovery_status,discord_relevance_status
+    ) VALUES($1,$2,$3,'Germany','CONFIRMED','NON_TRADING',$4,'COMPLETED','automated_query',now(),
+      'TRADING_CONFIRMED','1000','COMPLETED','ACTIVE','VALIDATED','NON_TRADING')`,
+    [channelId, channelId, `https://youtube.test/${channelId}`, served],
+  );
+  await appendDiscordCheckAttempts(channelId, served, 'NON_TRADING', [{
+    attemptNumber: 1, operationalOutcome: 'SUCCEEDED', retryable: false, reason: 'non-trading guild', checkedAt: '2026-10-04T00:00:00.000Z',
+  }], { candidateId: 'candidate-nontrading', resolvedLocator: served, locatorType: 'NATIVE_INVITE' });
+
+  const row = await getChannelById(channelId);
+  assert.equal(
+    row?.discord_invite_last_verified_at,
+    '2026-10-04T00:00:00.000Z',
+    'a permitted NON_TRADING serving row still reports when its invite was verified live',
+  );
+});
+
 after(async () => { if (enabled) (await getDb()).end(); });

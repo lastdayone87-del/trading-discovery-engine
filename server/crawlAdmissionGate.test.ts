@@ -227,8 +227,11 @@ test('R6: asset and resource URLs are rejected on every admission path', async (
 test('R6: non-page and malformed URL noise is rejected before fetch or enqueue', async () => {
   const cases: Array<[string, string]> = [
     ['https://takeprofittrader.com/%7B%7Blink%7D%7D', 'MALFORMED_URL'],
-    // A malformed escape must not shield the well-formed artifacts around it.
+    // A malformed escape must not shield the well-formed artifacts around it,
+    // including escapes exposed only after the fallback decoding pass.
     ['https://takeprofittrader.com/%7B%7Blink%7D%7D%ZZ', 'MALFORMED_URL'],
+    ['https://creator.example.com/%257B%257Blink%257D%257D%ZZ', 'MALFORMED_URL'],
+    ['https://creator.example.com/%252Ejs%ZZ', 'RESOURCE_EXTENSION'],
     ['https://creator.example.com/%76ar%20x=1', 'MALFORMED_URL'],
     ['https://creator.example.com/${link}', 'MALFORMED_URL'],
     ['https://hftcode.com/d,a.onload=function()%7Bthis.media=%22all%22...', 'MALFORMED_URL'],

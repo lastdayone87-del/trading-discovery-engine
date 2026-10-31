@@ -85,7 +85,9 @@ test('recent invite sorting is server-side and has a stable channel tie-breaker'
   assert.match(db, /\$\{DISCORD_INVITE_LAST_VERIFIED_SQL\} AS discord_invite_last_verified_at/);
   assert.match(db, /\$\{discordInviteLastVerifiedSql\('c'\)\} AS discord_invite_last_verified_at/);
   assert.match(db, /operational_outcome='SUCCEEDED'/);
-  assert.match(db, /semantic_status IN \('ACTIVE','ACTIVE_LOW_VOLUME'\)/);
+  // NON_TRADING successes count: the confirmed view explicitly permits a
+  // NON_TRADING row with a serving invite, so its live check still dates it.
+  assert.match(db, /semantic_status IN \('ACTIVE','ACTIVE_LOW_VOLUME','NON_TRADING'\)/);
   // The timestamp must describe the invite that is actually served: an older
   // retained invite coexisting with newer candidate fields cannot inherit a
   // different candidate's successful attempt. The correlation is on the served

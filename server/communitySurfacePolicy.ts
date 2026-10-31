@@ -527,11 +527,14 @@ function decodeResourcePathname(pathname: string): string {
       // A single malformed escape must not disable decoding for the
       // well-formed escapes around it: `/%7B%7Blink%7D%7D%ZZ` would otherwise
       // keep its encoded braces and bypass the artifact check. Decode the
-      // valid runs and leave the malformed escape literal.
-      current = current.replace(/(?:%[0-9a-fA-F]{2})+/g, run => {
+      // valid runs, leave the malformed escape literal, and continue the
+      // bounded loop so escapes exposed by that pass are decoded too:
+      // `/%252Ejs%ZZ` -> `/%2Ejs%ZZ` -> `/.js%ZZ`.
+      const decodedRuns = current.replace(/(?:%[0-9a-fA-F]{2})+/g, run => {
         try { return decodeURIComponent(run); } catch { return run; }
       });
-      break;
+      if (decodedRuns === current) break;
+      current = decodedRuns;
     }
   }
   return current;

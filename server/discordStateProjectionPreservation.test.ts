@@ -484,6 +484,10 @@ test('pipeline and queue delegate Discord preservation to the shared guards', ()
   assert.doesNotMatch(pipeline, /uncertainChannel\.discord_status = 'UNCERTAIN';/);
   assert.match(pipeline, /Object\.assign\(withheldChannel,projectTradingReclassificationDiscordState\(withheldChannel\)\)/);
   assert.doesNotMatch(pipeline, /withheldChannel\.discord_invite=preservedDiscordState\?\.discord_invite\?\?null/);
+  // Gate 2 is a fresh terminal classification, not a stale snapshot: it must
+  // explicitly bypass the locked-row retention guard or a rejected channel
+  // would keep serving its old invite.
+  assert.match(pipeline, /await upsertChannel\(nonTradingChannel, \{ allowDiscordClear: true \}\);/);
 
   assert.match(queue, /const shouldProjectValidation=canProjectDiscordValidation\(channel,selected,selectedCandidate\);/);
   assert.match(queue, /const currentCandidateRejected=currentCandidateNonTrading\s*\|\|terminalInvalid\.some\(entry=>isSameSelectedDiscordCandidate\(channel,entry\.candidate\)\);/);
