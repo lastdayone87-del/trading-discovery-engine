@@ -334,6 +334,42 @@ test('real DOM: navigation ancestors and generic labels classify structural cont
   });
 });
 
+test('real DOM: nav-container section links are measured but never consume the click budget', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <nav>
+      <a href="#section-1">Section 1</a>
+      <a href="#section-2">Section 2</a>
+      <a href="#section-3">Section 3</a>
+      <a href="#section-4">Section 4</a>
+      <button type="button" aria-haspopup="menu" aria-label="Open menu">Menu</button>
+    </nav>
+    <a href="/more"></a>
+  </body></html>`;
+  await withControlPage(html, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(
+      enumeration.structuralNavigation,
+      5,
+      'nav-container membership is still measured for the TOC links',
+    );
+    assert.equal(
+      enumeration.structuralDisclosure,
+      1,
+      'only the explicit menu trigger is a clickable disclosure',
+    );
+    assert.deepEqual(
+      enumeration.controls.map(control => control.text.trim()),
+      ['Open menu'],
+      'fragment links and a URL-only /more anchor cannot exhaust the click budget',
+    );
+    assert.equal(
+      enumeration.structuralUnrecovered,
+      0,
+      'a same-document fragment link is not an unexamined navigation destination',
+    );
+  });
+});
+
 test('real DOM: a generic hamburger disclosure is clicked and reveals a community link', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
   const html = `<!doctype html><html><body>
     <button id="menu" type="button" aria-expanded="false">Menu</button>

@@ -347,6 +347,26 @@ test('safe telemetry round-trips P0.2 navigation-coverage fields on rendered row
   assert.equal(staticRow?.coverageReason, undefined);
 });
 
+test('safe telemetry clamps oversized structural counters to the persisted bound', () => {
+  const oversized = safeCrawlerTelemetry({
+    mode: 'RENDERED',
+    pagesInspected: 1,
+    controlsStructuralDisclosure: 5_000_000,
+    controlsStructuralUnrecovered: 2_500_000.9,
+  });
+  assert.equal(oversized?.controlsStructuralDisclosure, 999999);
+  assert.equal(oversized?.controlsStructuralUnrecovered, 999999);
+
+  const malformed = safeCrawlerTelemetry({
+    mode: 'RENDERED',
+    pagesInspected: 1,
+    controlsStructuralDisclosure: Number.POSITIVE_INFINITY,
+    controlsStructuralUnrecovered: '4',
+  });
+  assert.equal(malformed?.controlsStructuralDisclosure, undefined);
+  assert.equal(malformed?.controlsStructuralUnrecovered, undefined);
+});
+
 test('safe telemetry drops unknown stage/reason and truncates cause text', () => {
   const telemetry = safeCrawlerTelemetry({
     mode: 'RENDERED',

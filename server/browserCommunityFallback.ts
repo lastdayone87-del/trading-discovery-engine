@@ -660,6 +660,8 @@ export interface RenderedControlEnumeration {
   /** Bounded hrefs backing `structuralUnrecovered`, used by the request
    * handler to exclude destinations the enqueue path actually follows. */
   structuralUnrecoveredHrefs: string[];
+  /** At least one candidate was observed after the bounded href sample filled. */
+  structuralUnrecoveredOverflow: boolean;
   /** Controls recovered only via title/aria-labelledby/alt/data-label/SVG title
    * or hidden text (P1.2). These are included in `controls`. */
   iconLabelRecovered: number;
@@ -796,6 +798,7 @@ export function enumerateRenderedControlNodes(
   let structuralDisclosure = 0;
   let structuralUnrecovered = 0;
   const structuralUnrecoveredHrefs: string[] = [];
+  let structuralUnrecoveredOverflow = false;
   let iconLabelRecovered = 0;
   let popupTargets = 0;
   const popupIndices: number[] = [];
@@ -891,10 +894,16 @@ export function enumerateRenderedControlNodes(
     while (textNode && hiddenText.length < 200 && textNodesExamined < 500) {
       textNodesExamined++;
       const value = textNode.nodeValue || '';
-      if (value) hiddenText += ` ${value}`;
+      const remaining = 200 - hiddenText.length;
+      if (value && remaining > 0) hiddenText += ` ${value.length > remaining ? value.slice(0, remaining) : value}`;
       textNode = textWalker.nextNode();
     }
     hiddenText = hiddenText.replace(/\s+/g, ' ').trim().slice(0, 200);
+    // Hint matching may use the resolved href (an icon-only anchor can be
+    // identified by its destination alone), but structural classification
+    // must not: a `/more` or `#support` URL is not a menu label.
+    const labelText = `${element.innerText || ''} ${ariaLabel}`;
+    const structuralText = `${labelText} ${title} ${labelledByText} ${childAlt} ${dataLabel} ${dataTooltip} ${svgTitle} ${hiddenText}`;
     const extendedText = `${baseText} ${title} ${labelledByText} ${childAlt} ${dataLabel} ${dataTooltip} ${svgTitle} ${hiddenText}`;
     const baseMatched = re.test(baseText);
     const extendedMatched = re.test(extendedText);
@@ -912,30 +921,6 @@ export function enumerateRenderedControlNodes(
     // revealed content is already in the DOM and is enumerated normally.
     const openSummary = tagName === 'summary'
       && !!(element.parentElement as HTMLDetailsElement | null)?.open;
-    // A control inside a real navigation/menu container is navigation even
-    // when its own label is generic (`Products`) and it carries no menu role.
-    // That is measurement only: it classifies the control as structural, but
-    // only explicit semantics or a hint-recovered label make a navigable
-    // anchor an unrecovered coverage gap.
-    const inNavigationContainer = !!element.closest(
-      'nav, [role="navigation"], [role="menu"], [role="menubar"]',
-    );
-    const structuralKind = tagName === 'nav'
-      || tagName === 'summary'
-      || role === 'menu'
-      || role === 'menubar'
-      || role === 'menuitem'
-      || role === 'navigation'
-      || role === 'tab'
-      || (ariaHaspopup !== '' && ariaHaspopup !== 'false')
-      // Only a collapsed disclosure needs a click; an already-expanded
-      // control's content is in the DOM and will be enumerated normally.
-      || element.getAttribute('aria-expanded') === 'false'
-      // Menu-like labels only. Generic footer/company/about links are not
-      // structural navigation and would make nearly every crawl look
-      // policy-bounded.
-      || /(^|\b)(menu|navigation|nav|hamburger|resources|support|explore|more)(\b|$)/i.test(extendedText)
-      || inNavigationContainer;
     // Explicit menu semantics are evidence that a navigable anchor is a menu
     // item/trigger rather than an ordinary page link. Label-only matches are
     // still treated as disclosures when they cannot navigate (a button), but
@@ -950,6 +935,18 @@ export function enumerateRenderedControlNodes(
       || role === 'tab'
       || (ariaHaspopup !== '' && ariaHaspopup !== 'false')
       || element.getAttribute('aria-expanded') === 'false';
+    // Menu-like labels only. Generic footer/company/about links are not
+    // structural navigation and would make nearly every crawl look
+    // policy-bounded. The label text excludes the resolved href.
+    const menuLikeLabel = /(^|\b)(menu|navigation|nav|hamburger|resources|support|explore|more)(\b|$)/i.test(structuralText);
+    // A control inside a real navigation/menu container is navigation even
+    // when its own label is generic (`Products`) and it carries no menu role.
+    // That is measurement only: a section/TOC link inside <nav> must not
+    // consume the click budget ahead of a real menu trigger.
+    const inNavigationContainer = !!element.closest(
+      'nav, [role="navigation"], [role="menu"], [role="menubar"]',
+    );
+    const structuralKind = explicitStructural || menuLikeLabel || inNavigationContainer;
     const structural = structuralKind && !openSummary;
     // A structural anchor that resolves to a different document is a page
     // candidate, not an in-place disclosure. Clicking it would replace the
@@ -970,7 +967,7 @@ export function enumerateRenderedControlNodes(
         navigatesAway = true;
       }
     }
-    const isDisclosure = structural && !navigatesAway;
+    const isDisclosure = structural && !navigatesAway && (explicitStructural || menuLikeLabel);
     // A non-base-matched structural anchor that navigates away is never
     // clicked: replacing the document would strand the remaining menu
     // controls, and the enqueue path owns the destination. It is a coverage
@@ -993,9 +990,11 @@ export function enumerateRenderedControlNodes(
       structuralUnrecovered++;
       // Bounded: coverage only needs to know that at least one unexamined
       // structural destination exists, and the request handler re-checks a
-      // bounded set against enqueue admission.
-      if (typeof href === 'string' && href && structuralUnrecoveredHrefs.length < 64) {
-        structuralUnrecoveredHrefs.push(href);
+      // bounded set against enqueue admission. Overflow is recorded so a
+      // candidate beyond the sample cannot silently disappear.
+      if (typeof href === 'string' && href) {
+        if (structuralUnrecoveredHrefs.length < 64) structuralUnrecoveredHrefs.push(href);
+        else structuralUnrecoveredOverflow = true;
       }
     }
     if (!baseMatched && extendedMatched) iconLabelRecovered++;
@@ -1083,6 +1082,7 @@ export function enumerateRenderedControlNodes(
     structuralDisclosure,
     structuralUnrecovered,
     structuralUnrecoveredHrefs,
+    structuralUnrecoveredOverflow,
     iconLabelRecovered,
     popupTargets,
     popupMarkers,
@@ -1191,21 +1191,12 @@ export function isSameSeedDocument(
 }
 
 /**
- * Whether an excluded structural anchor is a real navigation-coverage gap.
- *
- * A structural anchor that navigates away is never clicked. It is not a gap
- * when the enqueue path owns and follows it (same-origin, admissible, not
- * already visited, community-hint match), because that destination is
- * inspected separately. Cross-origin destinations are governed by the
- * cross-origin policy counter, and format/security rejections are not
- * unexamined navigation. Only a same-origin, admissible, not-yet-visited
- * destination that the hint policy rejects is both un-clicked and un-enqueued.
+ * True when a structural href resolves to a different HTTP(S) origin. The
+ * same-hostname rendered enqueue path never follows such a destination, so the
+ * handler records it in the rendered policy ledger instead of the unrecovered
+ * navigation gap.
  */
-export function isUnrecoveredStructuralNavigation(
-  href: string,
-  pageUrl: string,
-  alreadyVisited: ReadonlySet<string>,
-): boolean {
+export function isCrossOriginStructuralNavigation(href: string, pageUrl: string): boolean {
   const raw = (href || '').trim();
   if (!raw) return false;
   let page: URL;
@@ -1217,9 +1208,37 @@ export function isUnrecoveredStructuralNavigation(
     return false;
   }
   if (absolute.protocol !== 'http:' && absolute.protocol !== 'https:') return false;
-  // Cross-origin destinations are already represented by the
-  // cross-origin-disallowed policy counter; they are not enqueue-owned.
-  if (absolute.origin !== page.origin) return false;
+  return absolute.origin !== page.origin;
+}
+
+/**
+ * Whether an excluded structural anchor is a real navigation-coverage gap.
+ *
+ * A structural anchor that navigates away is never clicked. It is not a gap
+ * when the enqueue path owns and follows it (same-origin, admissible, not
+ * already visited, community-hint match), because that destination is
+ * inspected separately. Cross-origin destinations are recorded by the
+ * cross-origin policy counter, and format/security rejections are not
+ * unexamined navigation. Only a same-origin, admissible, not-yet-visited
+ * destination that the hint policy rejects is both un-clicked and un-enqueued.
+ */
+export function isUnrecoveredStructuralNavigation(
+  href: string,
+  pageUrl: string,
+  alreadyVisited: ReadonlySet<string>,
+): boolean {
+  const raw = (href || '').trim();
+  if (!raw) return false;
+  let absolute: URL;
+  try {
+    absolute = new URL(raw, pageUrl);
+  } catch {
+    return false;
+  }
+  if (absolute.protocol !== 'http:' && absolute.protocol !== 'https:') return false;
+  // Cross-origin destinations are recorded in the rendered policy ledger by
+  // the handler (`cross-origin-disallowed`); they are not enqueue-owned.
+  if (isCrossOriginStructuralNavigation(raw, pageUrl)) return false;
   const visitKey = normalizeVisitUrl(absolute.toString());
   if (visitKey && alreadyVisited.has(visitKey)) return false;
   if (!assessCrawlAdmission(absolute.toString()).eligible) return false;
@@ -1261,6 +1280,25 @@ export function partitionRenderedClickTargets(
     eligible.push(control);
   }
   return { toClick: eligible.slice(0, cap), skippedNavigableAnchors, evaluationWindow };
+}
+
+/**
+ * Controls outside the bounded evaluation window for this page, using the
+ * same rotation as `partitionRenderedClickTargets`. These are the controls that
+ * were not examined, so their origins decide whether the overflow is a real
+ * coverage gap or only opportunistic disclosures.
+ */
+export function renderedControlOverflowTargets(
+  controls: RenderedControlTarget[],
+  offset = 0,
+  evaluationWindowSize = RENDERED_CONTROL_EVALUATION_WINDOW,
+): RenderedControlTarget[] {
+  const windowSize = Math.max(0, Math.trunc(evaluationWindowSize) || 0);
+  if (controls.length <= windowSize) return [];
+  const rawOffset = Math.trunc(offset) || 0;
+  const start = ((rawOffset % controls.length) + controls.length) % controls.length;
+  const rotated = start > 0 ? [...controls.slice(start), ...controls.slice(0, start)] : controls;
+  return rotated.slice(windowSize);
 }
 
 /**
@@ -1526,10 +1564,13 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
       // navigation during the read fails closed because the URL changed.
     }
     if (documentReplaced) {
-      const remaining = clickTargets.length - clickIndex - 1;
-      if (remaining > 0) {
-        evidenceControlsSkipped += remaining;
-        interactionGap = true;
+      const remainingTargets = clickTargets.slice(clickIndex + 1);
+      if (remainingTargets.length > 0) {
+        evidenceControlsSkipped += remainingTargets.length;
+        // A replaced document strands the remaining queued targets. Only an
+        // unexamined hint/icon control is evidence-bearing; disclosure-only
+        // leftovers stay opportunistic instead of making the page retryable.
+        if (renderedControlSkipsNeedInteractionGap(remainingTargets)) interactionGap = true;
       }
       break;
     }
@@ -2679,6 +2720,11 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             for (const identity of visitIdentityKeys(request.url, page.url())) {
               inspectedDocumentKeys.add(identity);
             }
+            // This document has now been inspected: a structural link back to
+            // it is not an unexamined destination, and enqueue must not refetch
+            // it merely because it was absent from the caller-supplied set.
+            const inspectedVisitKey = normalizeVisitUrl(page.url());
+            if (inspectedVisitKey) alreadyVisitedSet.add(inspectedVisitKey);
             telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'PAGE_PROCESSED');
             // P0.2 context counters: structural presence only, refreshed after
             // scrolling and same-document DOM-changing clicks so frames/shadow
@@ -2820,6 +2866,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             let pageIconLabelRecovered = 0;
             let pagePopupMarkers = new Set<string>();
             let pageControlOverflow = 0;
+            // Cross-origin structural candidates per page, deduplicated so a
+            // re-enumeration cannot inflate the policy counter.
+            const pageCrossOriginHrefs = new Set<string>();
             const examinedPopupMarkers = new Set<string>();
             const recordControlEnumeration = (enumeration: RenderedControlEnumeration): void => {
               const matchedTotal = enumeration.controls.length;
@@ -2842,26 +2891,52 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               pageStructuralDisclosure = Math.max(pageStructuralDisclosure, enumeration.structuralDisclosure);
               // Raw browser-side candidates become coverage gaps only when the
               // enqueue path will not follow the destination. An admitted
-              // same-origin community link is inspected separately, and a
-              // cross-origin or format/security rejection is represented by
-              // its own policy counter, not by this gap.
-              const unrecoveredRejected = enumeration.structuralUnrecoveredHrefs
-                .filter(href => isUnrecoveredStructuralNavigation(href, page.url(), alreadyVisitedSet))
-                .length;
+              // same-origin community link is inspected separately; a
+              // cross-origin anchor cannot be followed by the same-hostname
+              // enqueue path, so it is recorded in the rendered policy ledger
+              // instead of silently resolving as COMPLETE.
+              let unrecoveredRejected = 0;
+              let newCrossOrigin = 0;
+              for (const href of enumeration.structuralUnrecoveredHrefs) {
+                if (isCrossOriginStructuralNavigation(href, page.url())) {
+                  const key = href.trim();
+                  if (key && !pageCrossOriginHrefs.has(key)) {
+                    pageCrossOriginHrefs.add(key);
+                    newCrossOrigin++;
+                  }
+                  continue;
+                }
+                if (isUnrecoveredStructuralNavigation(href, page.url(), alreadyVisitedSet)) {
+                  unrecoveredRejected++;
+                }
+              }
+              if (newCrossOrigin > 0) drops.count('cross-origin-disallowed', newCrossOrigin);
+              // The href sample is bounded, so a candidate beyond it was never
+              // checked against admission. Fail closed instead of letting the
+              // sample size decide that the crawl is complete.
+              if (enumeration.structuralUnrecoveredOverflow) unrecoveredRejected = Math.max(1, unrecoveredRejected);
               pageStructuralUnrecovered = Math.max(pageStructuralUnrecovered, unrecoveredRejected);
               pageIconLabelRecovered = gapCounters.iconLabelRecovered;
               pagePopupMarkers = trackRenderedPopupCoverage(pagePopupMarkers, enumeration);
-              // Overflow accounting uses the expanded click set. A disclosure
-              // outside the 64-control window is just as unexamined as a
-              // hint-matched control outside it.
-              const overflow = Math.max(0, matchedTotal - RENDERED_CONTROL_EVALUATION_WINDOW);
+              // Overflow accounting uses the expanded click set. The
+              // unexamined overflow is origin-gated: an unclicked generic
+              // disclosure stays opportunistic, while an unexamined hint/icon
+              // control makes the page retryable.
+              const overflowTargets = renderedControlOverflowTargets(
+                enumeration.controls,
+                limits.clickOffset,
+              );
+              const overflow = overflowTargets.length;
               if (overflow > pageControlOverflow) {
                 const added = overflow - pageControlOverflow;
                 pageControlOverflow = overflow;
                 drops.count('control-slice', added);
                 evidenceControlsSkipped += added;
-                interactionGap = true;
               }
+              // Evaluate origins on every enumeration: a later DOM change can
+              // rotate a hint/icon control into the unexamined window even when
+              // the overflow count itself did not grow.
+              if (renderedControlSkipsNeedInteractionGap(overflowTargets)) interactionGap = true;
             };
             // Page counters are local until this aggregation. Aggregate once
             // at the normal end of the page and once on the error path below.

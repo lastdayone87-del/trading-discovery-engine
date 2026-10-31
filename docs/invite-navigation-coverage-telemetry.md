@@ -118,13 +118,18 @@ would mark nearly every crawl policy-excluded.
 `navigationPolicyExcluded` but are not policy exclusions for this reason.
 `hint-rejected` is an intended filter decision: a link that does not match the
 community surface is not unexamined navigation, and `controlsHintRejected` is a
-separate click-control count, not a substitute for it. `control-slice` already
-forces the interaction gap. The narrower `structuralUnrecovered` signal is
-different: it counts only explicit or hint-recovered structural navigation
-anchors whose destination was neither clicked nor enqueued, not every URL the
-hint filter rejected. A stronger
-reason wins over a weaker one (for example, a timeout is `BOUNDED` even when
-frames are present).
+separate click-control count, not a substitute for it. `control-slice` is
+origin-gated: only an unexamined hint/icon control forces the interaction gap,
+while an over-budget generic disclosure stays opportunistic. The narrower
+`structuralUnrecovered` signal is different: it counts only explicit-menu or
+hint-recovered structural navigation anchors whose destination was neither
+clicked, enqueued, nor already inspected, not every URL the hint filter
+rejected. Its href evidence is a bounded sample; if candidates remain beyond the
+sample the signal fails closed rather than reporting clean coverage.
+Cross-origin structural anchors cannot be followed by the same-hostname enqueue
+path, so they are recorded as `cross-origin-disallowed` in the rendered policy
+ledger. A stronger reason wins over a weaker one (for example, a timeout is
+`BOUNDED` even when frames are present).
 
 The reason remains diagnostic. It does not change `complete`, `retryable`,
 `failureClass`, or the acquisition outcome. P1.7 owns that mapping.
@@ -135,24 +140,35 @@ The reason remains diagnostic. It does not change `complete`, `retryable`,
   serialization and still returns the complete matched set (never a 64-item
   prefix).
 - Structural detection is attribute- and label-based and bounded to the control
-  itself. A non-base-matched structural anchor that navigates to another
-  document is not added to the click set, so a disclosure click cannot replace
-  the document or spend the click budget on navigation. Navigation compares
-  the resolved target against the current `document.URL`, not the effective
-  `<base href>`, so an anchor resolving exactly to the base URI is still
-  treated as navigation.
+  itself. `structuralKind` is measured from explicit semantics (`nav`,
+  `summary`, menu roles, `aria-haspopup`, collapsed `aria-expanded`), a
+  menu-like label, or membership in a `<nav>`/menu container. Container
+  membership is measurement only: only explicit semantics or a menu-like label
+  make a control a clickable disclosure, so ordinary section/TOC fragment
+  links cannot exhaust the click budget ahead of the invite menu. Structural
+  classification never reads the resolved href; hint/icon matching may still
+  use it as destination evidence. A non-base-matched structural anchor that
+  navigates to another document is not added to the click set, so a disclosure
+  click cannot replace the document or spend the click budget on navigation.
+  Navigation compares the resolved target against the current `document.URL`,
+  not the effective `<base href>`, so an anchor resolving exactly to the base
+  URI is still treated as navigation.
 - An already-open `<details>` summary is not clicked: its content is already
   enumerated, and clicking would close it and hide controls.
 - Label recovery scans only the control's own `title`, `aria-labelledby`
-  references, first child `img[alt]`, `data-label`, `data-tooltip`, SVG
+  references, any descendant `img[alt]`, `data-label`, `data-tooltip`, SVG
   `<title>`, and a bounded descendant-text walk capped at 200 collected
-  characters (500 text nodes). It does not scan page text. At most 16
+  characters (500 text nodes); each appended value is sliced to the remaining
+  budget before concatenation. It does not scan page text. At most 16
   `aria-labelledby` id tokens are extracted without splitting the full
   attribute, and referenced labels are walked as text nodes (512 nodes, 200
-  characters) rather than materializing a subtree.
-- A click that changes the document URL stops the click loop and counts the
-  remaining queued controls as skipped. A menu handler or `javascript:` link
-  cannot silently replace the page and leave later controls looking examined.
+  characters) rather than materializing a subtree.- A click that changes the document URL stops the click loop and counts the
+  remaining queued controls as skipped. Only remaining hint/icon controls make
+  that outcome an interaction gap; disclosure-only leftovers stay
+  opportunistic. A menu handler or `javascript:` link cannot silently replace
+  the page and leave later controls looking examined. Inspected pages are
+  added to the crawl's visited set, so a structural link back to a completed
+  page is not counted as an unexamined destination.
   The loop distinguishes a real document replacement from a same-document
   `pushState`/`replaceState` update by comparing `performance.timeOrigin`;
   history-only query changes continue to re-enumeration so newly revealed

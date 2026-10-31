@@ -788,10 +788,10 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
       ? { controlsStructuralHintRejected: boundedCount(candidate.controlsStructuralHintRejected) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.controlsStructuralDisclosure) > 0
-      ? { controlsStructuralDisclosure: number(candidate.controlsStructuralDisclosure) }
+      ? { controlsStructuralDisclosure: boundedCount(candidate.controlsStructuralDisclosure) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.controlsStructuralUnrecovered) > 0
-      ? { controlsStructuralUnrecovered: number(candidate.controlsStructuralUnrecovered) }
+      ? { controlsStructuralUnrecovered: boundedCount(candidate.controlsStructuralUnrecovered) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.controlsIconLabelRecovered) > 0
       ? { controlsIconLabelRecovered: boundedCount(candidate.controlsIconLabelRecovered) }
