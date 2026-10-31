@@ -1,0 +1,57 @@
+# Durable rendered-retry history and multi-writer contention. Scratch-only
+# postgres:17 service; no production resources are referenced or contacted.
+name: Rendered retry PostgreSQL
+
+on:
+  pull_request:
+    paths:
+      - 'server/communityRetryClickOffsets.postgres.test.ts'
+      - 'server/siteInspectionCache.postgres.test.ts'
+      - 'server/queueManager.ts'
+      - 'server/dbCore.ts'
+      - 'server/siteInspectionCache.ts'
+      - 'server/communityRetryPolicy.ts'
+      - 'server/db/migrations/**'
+      - 'scripts/runMigrations.ts'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
+      - '.github/workflows/rendered-retry-pg.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pg-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: rendered_retry_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d rendered_retry_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/rendered_retry_test
+      PGSSL: disable
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Apply migrations to isolated test database
+        run: npx tsx scripts/runMigrations.ts
+      - name: Durable retry click-offset and multi-writer PostgreSQL tests
+        run: node --import tsx --test server/communityRetryClickOffsets.postgres.test.ts server/siteInspectionCache.postgres.test.ts

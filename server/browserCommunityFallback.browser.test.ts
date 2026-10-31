@@ -9,8 +9,11 @@ import {
   RENDERED_CONTROL_SELECTOR,
   createRenderedRouteGuard,
   collectRenderedCrossOriginCandidates,
+  collectRenderedOpenShadowContent,
   collectRenderedPageContext,
+  collectRenderedSameOriginCandidates,
   enumerateRenderedControlNodes,
+  installClosedShadowRootInstrumentation,
   installRenderedRouteCloseCleanup,
   isSkippableNavigableAnchorClick,
   partitionRenderedClickTargets,
@@ -124,6 +127,7 @@ const controlFixtureHtml = (count: number, revealAt: number | null): string => {
 async function withControlPage(
   html: string,
   run: (page: Page, url: string) => Promise<void>,
+  prepare?: (page: Page) => Promise<void>,
 ): Promise<void> {
   const { chromium } = await import('playwright');
   let server: http.Server | undefined;
@@ -142,6 +146,7 @@ async function withControlPage(
     const url = `http://127.0.0.1:${address.port}/`;
     browser = await chromium.launch(browserLaunchOptions());
     const page = await browser.newPage();
+    await prepare?.(page);
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     await run(page, url);
   } finally {
@@ -219,6 +224,66 @@ test('real DOM: a 64-control page wraps without inventing overflow', { skip: pro
   });
 });
 
+test('real DOM: collector cap reports eligible overflow for both directions', { skip: process.platform === 'android', timeout: 120_000 }, async () => {
+  const crossLinks = Array.from({ length: 501 }, (_, index) =>
+    `<a href="https://hub.example/room-${index + 1}">Partner site ${index + 1}</a>`,
+  ).join('');
+  await withControlPage(`<!doctype html><html><body>${crossLinks}</body></html>`, async (page, url) => {
+    const cross = await page.$$eval('a[href]', collectRenderedCrossOriginCandidates, url);
+    assert.equal(cross.candidates.length, 500, 'the cross-origin collector keeps its bounded prefix');
+    assert.equal(cross.truncated, 1, 'the 501st eligible cross-origin destination is reported, not silently lost');
+  });
+  const sameLinks = Array.from({ length: 501 }, (_, index) =>
+    `<a href="/room-${index + 1}">Community room ${index + 1}</a>`,
+  ).join('');
+  await withControlPage(`<!doctype html><html><body>${sameLinks}</body></html>`, async (page, url) => {
+    const same = await page.$$eval('a[href]', collectRenderedSameOriginCandidates, url);
+    assert.equal(same.candidates.length, 500, 'the same-origin collector keeps its bounded prefix');
+    assert.equal(same.truncated, 1, 'the 501st eligible same-origin destination is reported, not silently lost');
+  });
+});
+
+test('real DOM: href-less icon anchors are opaque, labeled or href-bearing anchors are not', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <a id="opaque" role="link" aria-label=""><svg width="24" height="24" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/></svg></a>
+    <a id="labeled" role="link">Community</a>
+    <a id="href-icon" href="/partner" aria-label=""><svg width="24" height="24" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/></svg></a>
+  </body></html>`;
+  await withControlPage(html, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(enumeration.total, 3, 'all three anchors match the shared selector');
+    assert.equal(enumeration.opaqueInteractiveControls, 1, 'only the unlabeled href-less anchor is opaque');
+    assert.equal(enumeration.controls.length, 1, 'the labeled href-less anchor remains clickable evidence');
+    assert.equal(enumeration.controls[0]?.text.trim(), 'Community');
+  });
+});
+
+test('real DOM: open shadow content is traversed for discovery and click-through', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <div id="host"></div>
+    <script>
+      const root = document.getElementById('host').attachShadow({ mode: 'open' });
+      root.innerHTML = '<button id="menu" aria-expanded="false">Menu</button><div id="panel"></div>';
+      root.getElementById('menu').addEventListener('click', () => {
+        root.getElementById('panel').innerHTML = '<a href="https://discord.gg/open-shadow">Discord</a>';
+      });
+    </script>
+  </body></html>`;
+  await withControlPage(html, async (page, url) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(enumeration.controls.length, 1, 'the shadow control is enumerated through Playwright selectors');
+    assert.equal(enumeration.structuralDisclosure, 1, 'the shadow menu is an in-place disclosure');
+    const plan = partitionRenderedClickTargets(enumeration.controls, url, 4, 0);
+    assert.equal(plan.toClick.length, 1);
+    await page.locator(`[data-oc-control="${plan.toClick[0]!.marker}"]`).click();
+    const snapshot = await page.evaluate(collectRenderedOpenShadowContent);
+    assert.equal(snapshot.roots, 1, 'one open root was traversed');
+    assert.ok(snapshot.hrefs.includes('https://discord.gg/open-shadow'), 'the revealed shadow link is captured');
+    const candidates = extractDiscordCandidates(snapshot.hrefs.join(' '), 'CREATOR_WEBSITES', url);
+    assert.equal(candidates[0]?.nativeInviteCode, 'open-shadow');
+  });
+});
+
 test('real DOM: same-origin anchors cannot crowd out a cross-origin candidate', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
   const internal = Array.from({ length: 500 }, (_, index) =>
     `<a href="/internal/${index + 1}">Internal page ${index + 1}</a>`,
@@ -229,12 +294,13 @@ test('real DOM: same-origin anchors cannot crowd out a cross-origin candidate', 
     <a href="https://linktr.ee/creator">Join the members community</a>
   </body></html>`;
   await withControlPage(html, async (page, url) => {
-    const candidates = await page.$$eval('a[href]', collectRenderedCrossOriginCandidates, url);
+    const collection = await page.$$eval('a[href]', collectRenderedCrossOriginCandidates, url);
     assert.deepEqual(
-      candidates,
+      collection.candidates,
       [{ url: 'https://linktr.ee/creator', text: 'Join the members community' }],
       'the cross-origin link survives 500 preceding internal anchors',
     );
+    assert.equal(collection.truncated, 0, 'same-origin anchors do not consume the cross-origin collector bound');
   });
 });
 
@@ -270,7 +336,26 @@ test('real DOM: enumeration separates hint-rejected, structural, icon-label, and
     const context = await page.evaluate(collectRenderedPageContext);
     assert.equal(context.frameCount, 1, 'iframe presence is recorded for P1.4');
     assert.equal(context.shadowRootCount, 1, 'open shadow roots are recorded for P1.4');
+    assert.equal(context.closedShadowRootCount, 0, 'no closed root exists in this fixture');
     assert.equal(context.baseHrefPresent, true, 'a document <base href> is recorded for P1.5');
+  });
+});
+
+test('real DOM: closed shadow roots are detected but never claimed as inspected', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <h1>Closed root</h1><div id="host"></div>
+    <script>
+      const root = document.getElementById('host').attachShadow({ mode: 'closed' });
+      root.innerHTML = '<a href="https://discord.gg/closed">Discord</a>';
+    </script>
+  </body></html>`;
+  await withControlPage(html, async (page) => {
+    const context = await page.evaluate(collectRenderedPageContext);
+    assert.equal(context.closedShadowRootCount, 1, 'the bounded attachShadow probe records the closed root');
+    assert.equal(context.shadowRootCount, 0, 'a closed root is not counted as open/traversable');
+    assert.equal(await page.locator('a[href]').count(), 0, 'closed-root contents stay unreachable by normal DOM queries');
+  }, async (page) => {
+    await page.addInitScript(installClosedShadowRootInstrumentation);
   });
 });
 
@@ -473,6 +558,21 @@ test('real DOM: an all-hint-matched control set has no hidden structural or popu
     assert.equal(enumeration.structuralUnrecovered, 0);
     assert.equal(enumeration.iconLabelRecovered, 0);
     assert.equal(enumeration.popupTargets, 0);
+    assert.equal(enumeration.opaqueInteractiveControls, 0);
+  });
+});
+
+test('real DOM: an icon-only control with no accessible evidence is counted opaque', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <button type="button" id="icon">
+      <svg width="24" height="24" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/></svg>
+    </button>
+  </body></html>`;
+  await withControlPage(html, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(enumeration.total, 1);
+    assert.equal(enumeration.controls.length, 0, 'an opaque control is not blindly added to the click set');
+    assert.equal(enumeration.opaqueInteractiveControls, 1, 'the unexamined control is recorded for truthful coverage');
   });
 });
 
@@ -513,5 +613,56 @@ test('real DOM: duplicate existing control markers are made unique', { skip: pro
       await page.locator(`[data-oc-control="${marker}"]`).click();
     }
     assert.deepEqual(await page.evaluate(() => (window as unknown as { clicks: number[] }).clicks), [0, 1]);
+  });
+});
+
+test('real DOM: empty fragment anchors and hidden/disabled widgets are not opaque controls', { skip: process.platform === 'android', timeout: 30_000 }, async () => {
+  await withControlPage(`<!doctype html><html><head><title>opaque fixture</title></head><body>
+    <a name="top"></a>
+    <a id="section"></a>
+    <button hidden><svg width="10" height="10"></svg></button>
+    <button disabled><svg width="10" height="10"></svg></button>
+    <div style="display:none"><button><svg width="10" height="10"></svg></button></div>
+    <button id="visible-icon"><svg width="10" height="10"></svg></button>
+  </body></html>`, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(enumeration.opaqueInteractiveControls, 1,
+      'only the rendered, enabled icon-only control is an unexamined interaction surface');
+  });
+});
+
+test('real DOM: open-shadow walker reports truncation only when a seen host may be hidden', { skip: process.platform === 'android', timeout: 30_000 }, async () => {
+  await withControlPage('<!doctype html><html><body><div id="fill"></div></body></html>', async (page) => {
+    await page.evaluate(() => {
+      // Put a host first, then enough light-DOM elements to cut the walk
+      // short. The seen host means more roots may be hidden beyond the bound.
+      const host = document.createElement('div');
+      document.body.insertBefore(host, document.getElementById('fill'));
+      const root = host.attachShadow({ mode: 'open' });
+      root.innerHTML = '<a href="https://discord.gg/DEEP">Discord</a>';
+      const fill = document.getElementById('fill');
+      if (!fill) return;
+      const fragment = document.createDocumentFragment();
+      for (let index = 0; index < 50_001; index++) fragment.appendChild(document.createElement('div'));
+      fill.appendChild(fragment);
+    });
+    const snapshot = await page.evaluate(collectRenderedOpenShadowContent);
+    assert.equal(snapshot.truncated, true,
+      'a cut-short walk after a seen host must make the snapshot partial');
+  });
+});
+
+test('real DOM: a large host-free page is not a permanent interaction gap', { skip: process.platform === 'android', timeout: 30_000 }, async () => {
+  await withControlPage('<!doctype html><html><body><div id="fill"></div></body></html>', async (page) => {
+    await page.evaluate(() => {
+      const fill = document.getElementById('fill');
+      if (!fill) return;
+      const fragment = document.createDocumentFragment();
+      for (let index = 0; index < 50_001; index++) fragment.appendChild(document.createElement('div'));
+      fill.appendChild(fragment);
+    });
+    const snapshot = await page.evaluate(collectRenderedOpenShadowContent);
+    assert.equal(snapshot.truncated, false,
+      'an ordinary large page without shadow roots can still resolve as a clean absence');
   });
 });

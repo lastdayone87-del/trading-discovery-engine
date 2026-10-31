@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { DEFAULT_BROWSER_FALLBACK_BUDGET, advanceRenderedLifecycleStage, browserCauseSnippet, browserFallbackTelemetrySummary, classifyCrawlCatch, createRenderedRouteGuard, disposeRenderedRouteGuards, installRenderedRouteCloseCleanup, isExpectedRenderedRouteShutdownError, isTelegramPostPermalink, RenderedFallbackGate, renderedFallbackGate, resolveRenderedZeroPageReason, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback, type BrowserFallbackTelemetry, type RenderedRouteLike } from './browserCommunityFallback';
+import { DEFAULT_BROWSER_FALLBACK_BUDGET, DECLARATIVE_SHADOW_SCAN_MAX_BYTES, advanceRenderedLifecycleStage, beginRenderedDeclarativeShadowScan, browserCauseSnippet, browserFallbackTelemetrySummary, classifyCrawlCatch, classifyRenderedPopupDestination, countDeclarativeClosedShadowRoots, createRenderedRouteGuard, disposeRenderedRouteGuards, installRenderedRouteCloseCleanup, isExpectedRenderedRouteShutdownError, isTelegramPostPermalink, mergeRenderedPageContextCounts, popupMarkupEvidenceSourceUrl, readRenderedDeclarativeShadowScan, renderedPopupWaitTimeoutMs, RenderedFallbackGate, renderedFallbackGate, resolveRenderedZeroPageReason, retainSkippableAnchorEvidence, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback, shouldSkipPreexistingSiblingPage, sumRenderedPageContextCounts, type BrowserFallbackTelemetry, type RenderedRouteLike } from './browserCommunityFallback';
+import { inferDiscordOwnership, makeDiscordCandidate } from './discordCandidates';
 import { redactCauseSnippet } from './crawlerTelemetry';
 import { classifyRenderedCrawlerFailure, isRenderedNavigationTimeout, renderedCrawlerHostBackoffMs, renderedCrawlerRetryPolicy } from './renderedCrawlerPolicy';
 
@@ -12,6 +13,353 @@ test('browser fallback remains bounded while allowing useful retries', () => {
   assert.equal(DEFAULT_BROWSER_FALLBACK_BUDGET.maxRequestRetries, 3);
   assert.ok(DEFAULT_BROWSER_FALLBACK_BUDGET.maxSessionRotations <= 4);
   assert.ok(DEFAULT_BROWSER_FALLBACK_BUDGET.totalTimeoutMs <= 60_000);
+});
+
+test('declarative closed shadow roots are counted from raw markup without claiming open roots', () => {
+  assert.equal(
+    countDeclarativeClosedShadowRoots('<div><template shadowrootmode="closed"><a href="/room">Room</a></template></div>'),
+    1,
+    'standard closed declarative root is detected',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots("<template shadowrootmode='closed'>x</template>"),
+    1,
+    'single-quoted attribute is detected',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots('<template SHADOWROOTMODE=closed>x</template>'),
+    1,
+    'attribute names and unquoted values are case-insensitive',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots('<template shadowroot="closed">x</template>'),
+    1,
+    'the legacy shadowroot spelling is counted conservatively',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots('<template title="Guests > 10" shadowrootmode="closed">x</template>'),
+    1,
+    'a quoted attribute containing > does not hide a later closed declaration',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots("<template data-note='a > b' shadowrootmode='closed'>x</template>"),
+    1,
+    'single-quoted values with > are respected',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots('<template shadowrootmode="open">x</template>'),
+    0,
+    'open declarative roots are traversable and are not a closed-context gap',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots('<template shadowrootmode="closedx">x</template>'),
+    0,
+    'a value prefix is not a closed root',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots(Array.from({ length: 1200 }, () => '<template shadowrootmode="closed"></template>').join('')),
+    1000,
+    'the markup scan is bounded even for a pathological document',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots('<template id="x"shadowrootmode="closed">x</template>'),
+    1,
+    'an attribute immediately after a closing quote is still an attribute boundary',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots('<template id="x"shadowrootmode="closed"/>'),
+    1,
+    'a self-closing start tag still counts its closed declaration',
+  );
+  const malformed = '<template '.repeat(131_072);
+  const malformedStart = Date.now();
+  assert.equal(countDeclarativeClosedShadowRoots(malformed), 0, 'an unterminated start tag yields no closed root');
+  assert.ok(Date.now() - malformedStart < 1_000, 'an unterminated template tag scan is linear, not quadratic');
+
+  // Raw text and comments are not markup. A template-looking string in a
+  // script must neither fabricate a root nor hide a real closed root later.
+  assert.equal(
+    countDeclarativeClosedShadowRoots(
+      `<script>const fragment = "<template data-x='";</script><div><template shadowrootmode="closed"><span>hidden</span></template></div>`,
+    ),
+    1,
+    'a template string in a script cannot hide a later real closed root',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots(
+      '<script>const x = "<template shadowrootmode=\\"closed\\">";</script><p>no root</p>',
+    ),
+    0,
+    'a template string inside a script is not a root',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots(
+      '<!-- <template shadowrootmode="closed"></template> --><template shadowrootmode="closed"></template>',
+    ),
+    1,
+    'a template inside a comment is inert but a real root is still counted',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots(
+      '<style>.x::before{content:"<template shadowrootmode=closed>"}</style><template shadowrootmode="closed"></template>',
+    ),
+    1,
+    'style text is skipped without losing the real root',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots(
+      '<div data-note="<script>"><template shadowrootmode="closed"><span>hidden</span></template></div>',
+    ),
+    1,
+    'a raw-text tag name inside a quoted attribute cannot hide a later real root',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots(
+      '<div data-note="<template shadowrootmode=\'closed\'>"></div><p>no root</p>',
+    ),
+    0,
+    'a template start tag inside a quoted attribute is inert',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots(
+      '<scriptx><template shadowrootmode="closed"></template></scriptx>',
+    ),
+    1,
+    'a script-prefixed element is not raw text; its template child is real markup',
+  );
+});
+
+test('per-document context counters keep maxima and sum every inspected document', () => {
+  const first = mergeRenderedPageContextCounts(undefined, {
+    frameCount: 2, shadowRootCount: 3, closedShadowRootCount: 0, baseHrefPresent: false,
+  });
+  assert.deepEqual(first, { frameCount: 2, shadowRootCount: 3, closedShadowRootCount: 0, baseHrefPresent: false });
+  const merged = mergeRenderedPageContextCounts(first, {
+    frameCount: 1, shadowRootCount: 5, closedShadowRootCount: 4, baseHrefPresent: true,
+  });
+  assert.deepEqual(
+    merged,
+    { frameCount: 2, shadowRootCount: 5, closedShadowRootCount: 4, baseHrefPresent: true },
+    'a later smaller snapshot cannot erase contexts already observed in the same document',
+  );
+  const clickedDocument = { frameCount: 1, shadowRootCount: 0, closedShadowRootCount: 2, baseHrefPresent: false };
+  assert.deepEqual(
+    sumRenderedPageContextCounts([first, clickedDocument]),
+    { frameCount: 3, shadowRootCount: 3, closedShadowRootCount: 2, baseHrefPresent: false },
+    'a click-navigated document contributes its own contexts instead of being dropped',
+  );
+});
+
+test('declarative shadow response scan reports roots, gaps, and per-navigation resets', async () => {
+  type Listener = (response: {
+    url(): string;
+    status(): number;
+    headers(): Record<string, string>;
+    request(): { resourceType(): string; frame(): unknown };
+    text(): Promise<string>;
+  }) => void;
+  const mainFrame = {};
+  let listener: Listener | undefined;
+  const page = {
+    on(_event: 'response', callback: Listener) { listener = callback; },
+    mainFrame() { return mainFrame; },
+  };
+  beginRenderedDeclarativeShadowScan(page);
+  assert.deepEqual(
+    await readRenderedDeclarativeShadowScan(page as object, 0),
+    { documents: 0, closedRoots: 0, gaps: 1 },
+    'a navigation with no observed document response is a scan gap, not an empty document',
+  );
+
+  beginRenderedDeclarativeShadowScan(page);
+  listener!({
+    url: () => 'https://fixture.test/',
+    status: () => 200,
+    headers: () => ({ 'content-length': '60' }),
+    request: () => ({ resourceType: () => 'document', frame: () => mainFrame }),
+    text: async () => '<template shadowrootmode="closed"></template>',
+  });
+  assert.deepEqual(
+    await readRenderedDeclarativeShadowScan(page as object, 100),
+    { documents: 1, closedRoots: 1, gaps: 0 },
+  );
+
+  // A second navigation on the same reused page starts from zero; the first
+  // document's root is not carried forward.
+  beginRenderedDeclarativeShadowScan(page);
+  listener!({
+    url: () => 'https://fixture.test/next',
+    status: () => 200,
+    headers: () => ({ 'content-length': '48' }),
+    request: () => ({ resourceType: () => 'document', frame: () => mainFrame }),
+    text: async () => '<html><body>no shadow roots</body></html>',
+  });
+  assert.deepEqual(
+    await readRenderedDeclarativeShadowScan(page as object, 100),
+    { documents: 1, closedRoots: 0, gaps: 0 },
+  );
+
+  // A redirect response and a subframe document are not final main-document
+  // bodies and must not create a false gap.
+  beginRenderedDeclarativeShadowScan(page);
+  listener!({
+    url: () => 'https://fixture.test/redirect',
+    status: () => 302,
+    headers: () => ({}),
+    request: () => ({ resourceType: () => 'document', frame: () => mainFrame }),
+    text: async () => '',
+  });
+  listener!({
+    url: () => 'https://fixture.test/frame',
+    status: () => 200,
+    headers: () => ({}),
+    request: () => ({ resourceType: () => 'document', frame: () => ({}) }),
+    text: async () => '<template shadowrootmode="closed"></template>',
+  });
+  assert.deepEqual(
+    await readRenderedDeclarativeShadowScan(page as object, 0),
+    { documents: 0, closedRoots: 0, gaps: 1 },
+    'neither response is a final main-document body',
+  );
+});
+
+test('declarative shadow scan bounds decoded bodies without gapping ordinary encodings', async () => {
+  type Listener = (response: {
+    url(): string;
+    status(): number;
+    headers(): Record<string, string>;
+    request(): { resourceType(): string; frame(): unknown };
+    text(): Promise<string>;
+  }) => void;
+  const mainFrame = {};
+  let listener: Listener | undefined;
+  const page = {
+    on(_event: 'response', callback: Listener) { listener = callback; },
+    mainFrame() { return mainFrame; },
+  };
+  let textReads = 0;
+  let body = '<template shadowrootmode="closed"></template>';
+  const emit = (headers: Record<string, string>) => listener!({
+    url: () => 'https://fixture.test/',
+    status: () => 200,
+    headers: () => headers,
+    request: () => ({ resourceType: () => 'document', frame: () => mainFrame }),
+    text: async () => { textReads++; return body; },
+  });
+
+  // Chunked / HTTP2 responses have no content-length. Their decoded body is
+  // read and bounded after decoding; treating them as gaps made every such
+  // page BOUNDED and retryable.
+  beginRenderedDeclarativeShadowScan(page);
+  emit({});
+  assert.deepEqual(
+    await readRenderedDeclarativeShadowScan(page as object, 0),
+    { documents: 1, closedRoots: 1, gaps: 0 },
+    'a chunked response is scanned, not an automatic gap',
+  );
+  assert.equal(textReads, 1);
+
+  // A compressed response declares the compressed size, not the decoded size.
+  beginRenderedDeclarativeShadowScan(page);
+  emit({ 'content-length': '60', 'content-encoding': 'gzip' });
+  assert.deepEqual(
+    await readRenderedDeclarativeShadowScan(page as object, 0),
+    { documents: 1, closedRoots: 1, gaps: 0 },
+    'a gzip/brotli body is scanned after decoding',
+  );
+  assert.equal(textReads, 2);
+
+  beginRenderedDeclarativeShadowScan(page);
+  emit({ 'content-length': String(DECLARATIVE_SHADOW_SCAN_MAX_BYTES + 1) });
+  assert.equal((await readRenderedDeclarativeShadowScan(page as object, 0)).gaps, 1);
+  assert.equal(textReads, 2, 'an over-cap declared body is skipped before reading');
+
+  // A server can under-declare (or omit) the length. The decoded size is
+  // checked before the document is claimed scanned.
+  beginRenderedDeclarativeShadowScan(page);
+  body = 'x'.repeat(DECLARATIVE_SHADOW_SCAN_MAX_BYTES + 1);
+  emit({ 'content-length': '60' });
+  assert.deepEqual(
+    await readRenderedDeclarativeShadowScan(page as object, 0),
+    { documents: 0, closedRoots: 0, gaps: 1 },
+    'a decoded body above the cap is a gap even when the declared length is small',
+  );
+  assert.equal(textReads, 3);
+});
+
+test('popup destinations are classified before policy exclusion or discard', () => {
+  const pageUrl = 'https://creator.example/';
+  assert.equal(classifyRenderedPopupDestination('about:blank', pageUrl), 'uninspectable');
+  assert.equal(classifyRenderedPopupDestination('chrome-error://chromewebdata/', pageUrl), 'uninspectable');
+  assert.equal(
+    classifyRenderedPopupDestination('https://discord.gg/InviteCode', pageUrl),
+    'discord',
+    'a direct Discord invite opened by window.open is terminal evidence',
+  );
+  assert.equal(
+    classifyRenderedPopupDestination('https://discord.com/invite/InviteCode', pageUrl),
+    'discord',
+    'the discord.com/invite form is also terminal evidence',
+  );
+  assert.equal(
+    classifyRenderedPopupDestination('https://discord.com/', pageUrl),
+    'cross-origin',
+    'a generic Discord-host page has no invite in its URL and stays unexamined',
+  );
+  assert.equal(
+    classifyRenderedPopupDestination('https://discord.com/channels/1/2', pageUrl),
+    'cross-origin',
+    'a Discord channel view is not terminal invite evidence',
+  );
+  assert.equal(
+    classifyRenderedPopupDestination('https://discord.gg/', pageUrl),
+    'cross-origin',
+    'a Discord host without an extractable code is not terminal evidence',
+  );
+  assert.equal(classifyRenderedPopupDestination('https://creator.example/room', pageUrl), 'same-origin');
+  assert.equal(classifyRenderedPopupDestination('https://other.example/room', pageUrl), 'cross-origin');
+  assert.equal(classifyRenderedPopupDestination('http://127.0.0.1/private', pageUrl), 'admission-rejected');
+});
+
+test('popup markup is attributed to the popup URL, not the branded opener', () => {
+  const openerUrl = 'https://atlasfx.io/';
+  const popupUrl = 'https://discord.com/channels/1/2';
+  const sourceUrl = popupMarkupEvidenceSourceUrl('cross-origin', popupUrl, openerUrl);
+  assert.equal(sourceUrl, popupUrl, 'a committed popup document is its own evidence source');
+
+  const candidate = (url: string) => makeDiscordCandidate({
+    locatorType: 'NATIVE_INVITE',
+    sourceSurface: 'CREATOR_WEBSITES',
+    rawLocator: 'https://discord.gg/third-party',
+    nativeInviteCode: 'third-party',
+    normalizedLocator: 'https://discord.gg/third-party',
+    sourceUrl: url,
+    extractionConfidence: 'EXPLICIT',
+  });
+  const identity = { creatorName: 'Atlas Fx', creatorWebsiteHosts: ['atlasfx.io'] };
+  assert.notEqual(
+    inferDiscordOwnership(candidate(sourceUrl), identity).ownershipStatus,
+    'CREATOR_OWNED',
+    'an invite in a generic Discord popup cannot inherit the opener brand',
+  );
+  assert.equal(
+    inferDiscordOwnership(candidate(openerUrl), identity).ownershipStatus,
+    'CREATOR_OWNED',
+    'the old opener attribution is what produced the false creator-owned classification',
+  );
+  assert.equal(
+    popupMarkupEvidenceSourceUrl('uninspectable', 'about:blank', openerUrl),
+    openerUrl,
+    'a document.write popup has no URL, so its markup remains attributed to the opener',
+  );
+});
+
+test('idle pool pages are skipped but real load-time blank popups are captured', () => {
+  assert.equal(shouldSkipPreexistingSiblingPage('https://creator.example/room', null), false, 'committed HTTP(S) siblings are real');
+  assert.equal(shouldSkipPreexistingSiblingPage('about:blank', { hasOpener: false, hasContent: false }), true, 'an empty opener-less pool page is idle');
+  assert.equal(shouldSkipPreexistingSiblingPage('about:blank', { hasOpener: true, hasContent: false }), false, 'an opener proves a real popup');
+  assert.equal(shouldSkipPreexistingSiblingPage('about:blank', { hasOpener: false, hasContent: true }), false, 'document.write content proves a real popup');
+  assert.equal(shouldSkipPreexistingSiblingPage('about:blank', null), true, 'an unreadable blank page is treated as idle, never closed as a gap');
 });
 
 test('Telegram message permalinks are not recursively crawled as community surfaces', () => {
@@ -583,3 +931,73 @@ test('disposeRenderedRouteGuards handles repeated and already-closed contexts', 
   assert.equal(calls, 1);
 });
 
+
+test('declarative shadow scan awaits every main-document body in a generation', async () => {
+  type Listener = (response: {
+    url(): string;
+    status(): number;
+    headers(): Record<string, string>;
+    request(): { resourceType(): string; frame(): unknown };
+    text(): Promise<string>;
+  }) => void;
+  const mainFrame = {};
+  let listener: Listener | undefined;
+  const page = {
+    on(_event: 'response', callback: Listener) { listener = callback; },
+    mainFrame() { return mainFrame; },
+  };
+  beginRenderedDeclarativeShadowScan(page);
+  const pendingBodies: Array<(html: string) => void> = [];
+  const emit = () => listener!({
+    url: () => 'https://fixture.test/redirected',
+    status: () => 200,
+    headers: () => ({}),
+    request: () => ({ resourceType: () => 'document', frame: () => mainFrame }),
+    text: () => new Promise<string>(resolve => { pendingBodies.push(resolve); }),
+  });
+  // A JS redirect/location.replace can emit two main-document responses in
+  // one generation. Both bodies must be awaited and counted.
+  emit();
+  emit();
+  pendingBodies[0]('<template shadowrootmode="closed"></template>');
+  await new Promise<void>(resolve => setImmediate(resolve));
+  let settled = false;
+  const read = readRenderedDeclarativeShadowScan(page as object, 500).then(result => {
+    settled = true;
+    return result;
+  });
+  await new Promise<void>(resolve => setTimeout(resolve, 25));
+  assert.equal(settled, false, 'the read must wait for the second in-flight body');
+  pendingBodies[1]('<template shadowrootmode="closed"></template><template shadowrootmode="closed"></template>');
+  assert.deepEqual(await read, { documents: 2, closedRoots: 3, gaps: 0 });
+});
+
+test('popup URL waits are capped by the remaining crawl budget', () => {
+  assert.equal(renderedPopupWaitTimeoutMs(5_000), 1_500);
+  assert.equal(renderedPopupWaitTimeoutMs(400), 400);
+  assert.equal(renderedPopupWaitTimeoutMs(0), 0);
+  assert.equal(renderedPopupWaitTimeoutMs(-1), 0);
+  assert.equal(renderedPopupWaitTimeoutMs(Number.NaN), 0);
+});
+
+test('skipped navigable anchors retain live text and href before exclusion', () => {
+  const retained: Array<[string, string]> = [];
+  const count = retainSkippableAnchorEvidence([
+    { text: 'Join Discord', href: 'https://discord.gg/INVITE' },
+    { text: 'Resources', href: 'https://creator.example/resources' },
+    { text: 'Community', href: 'https://creator.example/community' },
+    { text: 'Button without href', href: null },
+  ], 'https://creator.example/', (text, url) => { retained.push([text, url]); });
+  assert.equal(count, 2, 'only the cross-origin and same-origin hint-owned anchors are click-skipped');
+  assert.deepEqual(retained, [
+    ['Join Discord https://discord.gg/INVITE', 'https://creator.example/'],
+    ['Community https://creator.example/community', 'https://creator.example/'],
+  ]);
+});
+
+test('initial baseline overflow is not misreported as coverage truncation', () => {
+  const source = fs.readFileSync(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /initialCollection\.truncated[^\n]*candidateCapTruncated/);
+  assert.match(source, /revealedCollection\.truncated[\s\S]{0,120}candidateCapTruncated/);
+  assert.match(source, /shadowSnapshot\.truncated\) interactionGap = true/);
+});
