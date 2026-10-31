@@ -763,28 +763,28 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
       ? { evidenceControlsOffsetAdvance: Math.min(MAX_EVIDENCE_CONTROL_OFFSET, boundedCount(candidate.evidenceControlsOffsetAdvance)) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.controlsEnumeratedTotal) > 0
-      ? { controlsEnumeratedTotal: number(candidate.controlsEnumeratedTotal) }
+      ? { controlsEnumeratedTotal: boundedCount(candidate.controlsEnumeratedTotal) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.controlsHintRejected) > 0
-      ? { controlsHintRejected: number(candidate.controlsHintRejected) }
+      ? { controlsHintRejected: boundedCount(candidate.controlsHintRejected) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.controlsStructuralNavigation) > 0
-      ? { controlsStructuralNavigation: number(candidate.controlsStructuralNavigation) }
+      ? { controlsStructuralNavigation: boundedCount(candidate.controlsStructuralNavigation) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.controlsStructuralHintRejected) > 0
-      ? { controlsStructuralHintRejected: number(candidate.controlsStructuralHintRejected) }
+      ? { controlsStructuralHintRejected: boundedCount(candidate.controlsStructuralHintRejected) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.controlsIconLabelRecovered) > 0
-      ? { controlsIconLabelRecovered: number(candidate.controlsIconLabelRecovered) }
+      ? { controlsIconLabelRecovered: boundedCount(candidate.controlsIconLabelRecovered) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.popupTargets) > 0
-      ? { popupTargets: number(candidate.popupTargets) }
+      ? { popupTargets: boundedCount(candidate.popupTargets) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.frameCount) > 0
-      ? { frameCount: number(candidate.frameCount) }
+      ? { frameCount: boundedCount(candidate.frameCount) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.shadowRootCount) > 0
-      ? { shadowRootCount: number(candidate.shadowRootCount) }
+      ? { shadowRootCount: boundedCount(candidate.shadowRootCount) }
       : {}),
     ...(candidate.mode === 'RENDERED' && candidate.baseHrefPresent === true
       ? { baseHrefPresent: true }
