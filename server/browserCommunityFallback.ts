@@ -1136,6 +1136,34 @@ function startsTagAt(html: string, index: number, name: string): boolean {
 }
 
 /**
+ * Return the index after an ordinary tag's closing `>`, ignoring `>` and `<`
+ * characters inside quoted attribute values. Attribute values are the only
+ * place where a markup-looking string is not itself an element start; without
+ * this skip, `<div data-note="<script>">` would look like raw text and could
+ * hide a real declarative root that follows it.
+ */
+function skipTag(html: string, start: number): number {
+  let cursor = start + 1;
+  let quote = -1;
+  while (cursor < html.length) {
+    const code = html.charCodeAt(cursor);
+    if (quote !== -1) {
+      if (code === quote) quote = -1;
+      cursor++;
+      continue;
+    }
+    if (code === 34 || code === 39) {
+      quote = code;
+      cursor++;
+      continue;
+    }
+    if (code === 62) return cursor + 1;
+    cursor++;
+  }
+  return html.length;
+}
+
+/**
  * Return the index after the closing tag of a raw-text element, or the end of
  * the document when it is unterminated. Scanning from `<` to `<` is linear in
  * the skipped region; the tag-name comparison is bounded by the short name.
@@ -1197,7 +1225,13 @@ export function countDeclarativeClosedShadowRoots(html: string): number {
     // `<templatex>` is not the template element. Continue after the name so
     // a later real `<template` is still found without rescanning this one.
     if (!startsTagAt(html, i, 'template')) {
-      i++;
+      const nextCode = i + 1 < html.length ? html.charCodeAt(i + 1) : -1;
+      const tagStart = (nextCode >= 65 && nextCode <= 90)
+        || (nextCode >= 97 && nextCode <= 122)
+        || nextCode === 47 || nextCode === 33 || nextCode === 63;
+      // A `<` inside a quoted attribute is text, not a raw-text element start.
+      // Skip genuine tags as a unit so the next candidate is real markup.
+      i = tagStart ? skipTag(html, i) : i + 1;
       continue;
     }
     let cursor = i + '<template'.length;

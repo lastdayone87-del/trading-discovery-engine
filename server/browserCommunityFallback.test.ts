@@ -108,6 +108,20 @@ test('declarative closed shadow roots are counted from raw markup without claimi
   );
   assert.equal(
     countDeclarativeClosedShadowRoots(
+      '<div data-note="<script>"><template shadowrootmode="closed"><span>hidden</span></template></div>',
+    ),
+    1,
+    'a raw-text tag name inside a quoted attribute cannot hide a later real root',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots(
+      '<div data-note="<template shadowrootmode=\'closed\'>"></div><p>no root</p>',
+    ),
+    0,
+    'a template start tag inside a quoted attribute is inert',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots(
       '<scriptx><template shadowrootmode="closed"></template></scriptx>',
     ),
     1,
