@@ -80,19 +80,23 @@ maybe('classification-only upserts never overwrite a newer Discord projection', 
   assert.equal(retained?.discord_invite, 'https://discord.gg/newroom');
 
   // Gate 2's fresh terminal classification passes `allowDiscordClear`, so the
-  // locked serving invite is intentionally cleared with the NON_TRADING verdict.
+  // locked serving invite is intentionally cleared. The channel was rejected on
+  // trading evidence (the Discord crawler did not run), so the DB invariant
+  // records untouched Discord state (UNCERTAIN), not a fabricated NON_TRADING
+  // inspection.
   await upsertChannel({
     ...stale,
     trading_status: 'NON_TRADING',
     scan_status: 'SKIPPED_NON_TRADING',
-    discord_status: 'NON_TRADING',
+    discord_status: 'UNCERTAIN',
     discord_invite: null,
   }, { allowDiscordClear: true });
   const overwritten = await getChannelById(channelId);
-  assert.equal(overwritten?.discord_status, 'NON_TRADING');
+  assert.equal(overwritten?.discord_status, 'UNCERTAIN');
   assert.equal(overwritten?.discord_invite, null);
   assert.equal(overwritten?.trading_status, 'NON_TRADING');
   assert.equal(overwritten?.scan_status, 'SKIPPED_NON_TRADING');
+  assert.equal(overwritten?.discord_validation_status, 'NOT_STARTED');
 });
 
 maybe('classification-only upsert preserves a Discord row inserted between its read and write', async t => {
