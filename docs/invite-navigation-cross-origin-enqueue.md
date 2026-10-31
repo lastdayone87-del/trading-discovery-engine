@@ -61,9 +61,26 @@ requires:
 2. a canary with measured cross-origin yield, page-budget consumption, and
    failure/retry attribution;
 3. a product decision that link-hub/community destinations are in scope for
-   rendered acquisition.
+   rendered acquisition;
+4. click-plan ownership: an admitted destination must not also be clicked
+   (see “Known pre-enablement blocker” below).
 
 Until those approvals exist, only tests may enable the option.
+
+## Known pre-enablement blocker: click-plan ownership
+
+`partitionRenderedClickTargets` still treats a cross-origin anchor as
+click-only unless its href is same-origin. When the option is enabled, an
+admitted cross-origin destination is enqueued and should be enqueue-owned, but
+the click plan can also click it. A click that navigates the seed away marks
+the remaining seed controls skipped and can make coverage incomplete.
+
+This must be fixed before enablement: thread the crawl-wide
+`crossOriginQueued` set, including destinations revealed after a click, into
+initial and post-click click planning so an admitted destination is never both
+enqueued and clicked. It is not changed here because the option is default OFF
+and the fix changes interaction ordering; it is part of the enablement gate and
+requires the canary/browser validation below.
 
 ## Validation
 
