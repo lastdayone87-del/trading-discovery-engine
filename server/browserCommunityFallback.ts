@@ -912,9 +912,16 @@ export function enumerateRenderedControlNodes(
     // revealed content is already in the DOM and is enumerated normally.
     const openSummary = tagName === 'summary'
       && !!(element.parentElement as HTMLDetailsElement | null)?.open;
+    // A control inside a real navigation/menu container is navigation even
+    // when its own label is generic (`Products`) and it carries no menu role.
+    // That is measurement only: it classifies the control as structural, but
+    // only explicit semantics or a hint-recovered label make a navigable
+    // anchor an unrecovered coverage gap.
+    const inNavigationContainer = !!element.closest(
+      'nav, [role="navigation"], [role="menu"], [role="menubar"]',
+    );
     const structuralKind = tagName === 'nav'
       || tagName === 'summary'
-
       || role === 'menu'
       || role === 'menubar'
       || role === 'menuitem'
@@ -927,7 +934,8 @@ export function enumerateRenderedControlNodes(
       // Menu-like labels only. Generic footer/company/about links are not
       // structural navigation and would make nearly every crawl look
       // policy-bounded.
-      || /(^|\b)(menu|navigation|nav|hamburger|resources|support|explore|more)(\b|$)/i.test(extendedText);
+      || /(^|\b)(menu|navigation|nav|hamburger|resources|support|explore|more)(\b|$)/i.test(extendedText)
+      || inNavigationContainer;
     // Explicit menu semantics are evidence that a navigable anchor is a menu
     // item/trigger rather than an ordinary page link. Label-only matches are
     // still treated as disclosures when they cannot navigate (a button), but
