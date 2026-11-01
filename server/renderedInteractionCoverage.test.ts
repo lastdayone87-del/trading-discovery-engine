@@ -555,7 +555,7 @@ test('only terminal success satisfies required coverage', () => {
   assert.doesNotMatch(source, /alreadyVisitedSet\.add\(inspectedVisitKey\)/, 'a merely inspected page never becomes shared successful evidence');
   assert.match(source, /structuralVisitedKeys\.add\(inspectedVisitKey\)/, 'the inspected page still counts for structural-navigation deduplication');
   assert.match(source, /for \(const identity of terminalSuccessUrls\)[\s\S]{0,160}?sharedCoveredKeys\.add\(key\)/, 'required coverage borrows only terminal-success identities');
-  assert.match(source, /renderedTerminalSuccessIdentities\(\{[\s\S]{0,260}?documentReplacedByClick: clickLoop\.documentReplaced,/, 'a click-committed replacement document is not borrowed as terminal success');
+  assert.match(source, /renderedTerminalSuccessIdentities\(\{[\s\S]{0,260}?inspectedDocumentUrl: clickLoop\.processedDocumentUrl,[\s\S]{0,200}?documentReplacedByClick: clickLoop\.documentReplaced,/, 'a click-committed replacement document is not borrowed as terminal success, while same-document updates are kept');
   assert.match(source, /classifyRequiredCoverage\(\{[\s\S]{0,200}?sharedCoveredKeys,/, 'classification receives only terminal-success shared evidence');
 });
 
@@ -711,6 +711,33 @@ test('a same-document query change continues the click loop and reaches revealed
   assert.equal(result.evidenceControlsSkipped, 0);
   assert.equal(result.interactionGap, false);
   assert.equal(enumerations, 2, 'the same document is re-enumerated after the query change');
+});
+
+test('a later replacement keeps the last processed URL as inspected evidence', async () => {
+  const targets = [renderedButton(0, 'oc-push'), renderedButton(1, 'oc-nav')];
+  let url = 'https://creator.example/start';
+  let clicks = 0;
+  const result = await runRenderedClickLoop({
+    targets,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    click: async () => {
+      clicks++;
+      url = clicks === 1
+        ? 'https://creator.example/start?menu=open'
+        : 'https://creator.example/community';
+      return true;
+    },
+    enumerate: async () => renderedEnumeration(targets),
+    pageUrl: () => url,
+    documentIdentity: async () => (url.includes('community') ? 'document-2' : 'document-1'),
+  });
+  assert.equal(result.documentReplaced, true);
+  assert.equal(
+    result.processedDocumentUrl,
+    'https://creator.example/start?menu=open',
+    'the same-document update before the replacement remains inspected evidence',
+  );
 });
 
 test('a changed document identity stops the loop even when the URL is unchanged', async () => {

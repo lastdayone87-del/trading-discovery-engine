@@ -1506,6 +1506,10 @@ export interface RenderedClickLoopResult {
    * page was never enumerated or clicked, so it is not terminal-success
    * evidence for required coverage. */
   documentReplaced: boolean;
+  /** The last URL of the document the loop actually processed. Same-document
+   * history updates advance it; a click that commits a new document leaves it
+   * at the last URL of the replaced document. */
+  processedDocumentUrl: string;
   /** Index (in the click-target queue) of the first control whose click
    * failed. The durable retry offset must stop at that control, never rotate
    * past it, because its revealed content was not examined. */
@@ -1532,6 +1536,7 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
   let evidenceControlsSkipped = 0;
   let interactionGap = false;
   let documentReplaced = false;
+  let processedDocumentUrl = input.pageUrl();
   let firstFailedTargetIndex: number | undefined;
   for (let clickIndex = 0; clickIndex < clickTargets.length; clickIndex++) {
     if (clickedThisPage >= input.maxClicksPerPage) {
@@ -1607,6 +1612,10 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
       }
       break;
     }
+    // Same-document history updates keep the processed document, so its latest
+    // URL stays valid terminal-success evidence. The assignment sits after the
+    // replacement branch so a committed navigation cannot overwrite it.
+    processedDocumentUrl = urlAfterClick;
     // A successful click can reveal new evidence-bearing controls (second
     // interaction). Re-enumerate after every click, including the final
     // allowed one: controls revealed by the last click are still unexamined,
@@ -1655,7 +1664,7 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
       }
     }
   }
-  return { evidenceControlsClicked, evidenceControlsFailed, evidenceControlsSkipped, interactionGap, documentReplaced, firstFailedTargetIndex };
+  return { evidenceControlsClicked, evidenceControlsFailed, evidenceControlsSkipped, interactionGap, documentReplaced, processedDocumentUrl, firstFailedTargetIndex };
 }
 
 /**
@@ -3162,10 +3171,6 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               if (candidate && candidate !== page) popupWindowsThisClick.add(candidate);
             };
             clickPageContext?.on?.('page', onPopupWindow);
-            // The document the click loop starts on is the one whose controls
-            // are enumerated. A click that commits a new document must not let
-            // that replacement URL be borrowed as terminal-success coverage.
-            const documentUrlBeforeClicks = page.url();
             let clickLoop: Awaited<ReturnType<typeof runRenderedClickLoop>>;
             try {
               clickLoop = await runRenderedClickLoop({
@@ -3296,7 +3301,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // its replacement must prove itself through its own request.
             for (const identity of renderedTerminalSuccessIdentities({
               requestUrl: request.url,
-              inspectedDocumentUrl: documentUrlBeforeClicks,
+              inspectedDocumentUrl: clickLoop.processedDocumentUrl,
               finalDocumentUrl: page.url(),
               documentReplacedByClick: clickLoop.documentReplaced,
             })) {
