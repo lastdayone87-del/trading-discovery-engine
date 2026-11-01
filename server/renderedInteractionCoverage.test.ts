@@ -110,6 +110,74 @@ test('the evaluation window rotates over the full matched-control pool so contro
   assert.deepEqual(wrapped.toClick.map(target => target.marker), ['oc-1', 'oc-2', 'oc-3', 'oc-4']);
 });
 
+test('retry rotation never starts on a hidden control ahead of its disclosure', () => {
+  // Enumeration order: three community controls, the menu summary, then the
+  // hidden invite it reveals. Rotation offsets index the flat pool, so offset
+  // 4 lands exactly on the hidden invite.
+  const controls = [
+    renderedButton(0, 'oc-b1'),
+    renderedButton(1, 'oc-b2'),
+    renderedButton(2, 'oc-b3'),
+    { index: 3, marker: 'oc-menu', text: 'Menu', href: null, tag: 'button' as const },
+    { index: 4, marker: 'oc-invite', text: 'Discord', href: null, tag: 'button' as const, hidden: true, afterMarker: 'oc-menu' },
+  ];
+  for (let offset = 0; offset < controls.length; offset++) {
+    const plan = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, offset);
+    const markers = plan.toClick.map(target => target.marker);
+    const inviteAt = markers.indexOf('oc-invite');
+    if (inviteAt === -1) continue;
+    assert.equal(
+      markers.indexOf('oc-menu') >= 0 && markers.indexOf('oc-menu') < inviteAt,
+      true,
+      `offset ${offset} replays the disclosure before the control it reveals`,
+    );
+  }
+
+  const boundary = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 4);
+  assert.deepEqual(
+    boundary.toClick.map(target => target.marker),
+    ['oc-menu', 'oc-invite', 'oc-b1', 'oc-b2'],
+    'a boundary that lands on the hidden control rewinds to its summary and still spends the cap',
+  );
+
+  // Successive retries advance through the pool instead of repeating the same
+  // window, so a control skipped by one cap is examined later.
+  const attempted = new Set<string>();
+  let offset = 0;
+  for (let attempt = 0; attempt < controls.length * 2; attempt++) {
+    const plan = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, offset);
+    for (const target of plan.toClick) if (target.marker) attempted.add(target.marker);
+    offset += renderedClickOffsetAdvance(plan, plan.toClick.length, 4);
+  }
+  assert.equal(attempted.has('oc-b3'), true, 'later retries reach the control skipped by the first cap');
+  assert.equal(attempted.has('oc-invite'), true, 'later retries reach the hidden invite');
+});
+
+test('a hidden invite beyond the initial click cap is reached by the retry rotation', () => {
+  const controls = [
+    renderedButton(0, 'oc-b1'),
+    renderedButton(1, 'oc-b2'),
+    renderedButton(2, 'oc-b3'),
+    { index: 3, marker: 'oc-menu', text: 'Menu', href: null, tag: 'button' as const },
+    { index: 4, marker: 'oc-invite', text: 'Discord', href: null, tag: 'button' as const, hidden: true, afterMarker: 'oc-menu' },
+  ];
+  const first = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 0);
+  assert.deepEqual(first.toClick.map(target => target.marker), ['oc-b1', 'oc-b2', 'oc-b3', 'oc-menu']);
+  assert.equal(first.toClick.some(target => target.marker === 'oc-invite'), false, 'the invite is beyond the first cap');
+  assert.equal(
+    first.evaluationWindow.some(target => target.marker === 'oc-invite'),
+    true,
+    'the invite is inside the evaluation window, so it is deferred rather than lost',
+  );
+
+  const retry = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 4);
+  assert.equal(
+    retry.toClick.some(target => target.marker === 'oc-invite'),
+    true,
+    'the next retry opens the menu and clicks the invite it reveals',
+  );
+});
+
 test('an all-navigable evaluation window is certified for durable rotation', () => {
   // A 70-control page whose first window contains only same-host navigable
   // anchors attempts zero clicks. Without an explicit certificate the durable
@@ -915,6 +983,8 @@ test('hidden controls wait for the disclosure that reveals them', () => {
   assert.match(source, /if \(hidden && revealer\) \{/, 'a hidden control records the disclosure that reveals it');
   assert.match(source, /revealerIndexByIndex\.set\(index, revealerIndex\);/, 'the revealer is tracked by control index');
   assert.match(source, /const pending = hiddenAfter\.get\(revealerIndex\);/, 'hidden controls are grouped under their revealing control');
+  assert.match(source, /const afterMarker = revealerIndex === undefined \? undefined : markerByIndex\.get\(revealerIndex\);/, 'each hidden control carries the marker of its revealer into retry planning');
+  assert.match(source, /rewindRotationToDisclosure\(controls, start\);/, 'retry rotation rewinds a boundary that lands on a hidden control to its disclosure');
   assert.match(source, /const stack = \(hiddenAfter\.get\(root\.index\) \|\| \[\]\)\.slice\(\)\.reverse\(\);/, 'hidden controls follow their revealer, depth-first for nested disclosures');
   assert.match(source, /roots\.push\(\.\.\.trailingHidden\);/, 'a hidden control with no known revealer is still queued last');
   assert.doesNotMatch(source, /isVisible/, 'the click loop keeps its bounded actionability wait instead of a one-shot visibility probe');

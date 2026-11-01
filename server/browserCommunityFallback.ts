@@ -661,6 +661,13 @@ export interface RenderedControlTarget {
    * and consume budget before the disclosure that reveals it has run.
    */
   hidden?: boolean;
+  /**
+   * Marker of the disclosure that reveals this hidden control. Retry rotation
+   * may start in the middle of the pool, so the planner re-attaches a hidden
+   * control to its revealer instead of clicking it while its menu is closed.
+   * Never serialized to telemetry.
+   */
+  afterMarker?: string;
 }
 
 export interface RenderedControlEnumeration {
@@ -1151,7 +1158,12 @@ export function enumerateRenderedControlNodes(
     usedMarkers.add(marker);
     if (existing !== marker) node.setAttribute('data-oc-control', marker);
     markerByIndex.set(item.index, marker);
-    controls.push({ ...item, marker });
+    // The revealer is always earlier in `selected`, so its marker already
+    // exists. A hidden control with no revealer in the click set keeps the
+    // enumeration-time trailing position and has no dependency to replay.
+    const revealerIndex = item.hidden ? revealerIndexByIndex.get(item.index) : undefined;
+    const afterMarker = revealerIndex === undefined ? undefined : markerByIndex.get(revealerIndex);
+    controls.push({ ...item, marker, ...(afterMarker ? { afterMarker } : {}) });
   }
   const popupMarkers: string[] = [];
   for (let popupIndex = 0; popupIndex < popupIndices.length; popupIndex++) {
@@ -1368,7 +1380,8 @@ export function partitionRenderedClickTargets(
   const start = controls.length > 0
     ? ((rawOffset % controls.length) + controls.length) % controls.length
     : 0;
-  const rotated = start > 0 ? [...controls.slice(start), ...controls.slice(0, start)] : controls;
+  const rotationStart = rewindRotationToDisclosure(controls, start);
+  const rotated = rotationStart > 0 ? [...controls.slice(rotationStart), ...controls.slice(0, rotationStart)] : controls;
   const evaluationWindow = rotated.slice(0, windowSize);
   const eligible: RenderedControlTarget[] = [];
   let skippedNavigableAnchors = 0;
@@ -1397,7 +1410,8 @@ export function renderedControlOverflowTargets(
   if (controls.length <= windowSize) return [];
   const rawOffset = Math.trunc(offset) || 0;
   const start = ((rawOffset % controls.length) + controls.length) % controls.length;
-  const rotated = start > 0 ? [...controls.slice(start), ...controls.slice(0, start)] : controls;
+  const rotationStart = rewindRotationToDisclosure(controls, start);
+  const rotated = rotationStart > 0 ? [...controls.slice(rotationStart), ...controls.slice(0, rotationStart)] : controls;
   return rotated.slice(windowSize);
 }
 
@@ -1467,6 +1481,32 @@ export function renderedClickOffsetAdvance(
 }
 
 /**
+ * Rewind a rotation boundary that lands inside a disclosure unit. Retry
+ * rotation is applied to the flat control pool, so an offset can land on a
+ * hidden control and put it ahead of the closed menu summary that reveals it.
+ * Rewinding to that summary replays the prerequisite first; the unit stays
+ * atomic and the remaining offsets still advance through the rest of the pool
+ * (the advance is measured from the rotated window, so no position is skipped
+ * forever). A hidden control whose revealer is outside this pool has no
+ * dependency to replay and keeps the plain rotation.
+ */
+function rewindRotationToDisclosure(
+  controls: RenderedControlTarget[],
+  start: number,
+): number {
+  let rotationStart = start;
+  for (let rewind = 0; rewind < controls.length; rewind++) {
+    const control = controls[rotationStart];
+    if (!control || !control.hidden || !control.afterMarker) break;
+    const revealerIndex = controls.findIndex(candidate => candidate.marker === control.afterMarker);
+    if (revealerIndex < 0 || revealerIndex === rotationStart) break;
+    rotationStart = revealerIndex;
+  }
+  return rotationStart;
+}
+
+/**
+ * Combine per-page full-pool advances into one safe shared seed advance./**
  * Combine per-page full-pool advances into one safe shared seed advance.
  * Every page in a rendered crawl starts from the same durable per-seed
  * rotation offset, so the crawl may advance only by the smallest progress any
