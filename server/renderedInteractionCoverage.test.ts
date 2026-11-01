@@ -682,11 +682,12 @@ test('a final click that navigates does not invent a gap', async () => {
 
 test('only terminal success satisfies required coverage', () => {
   const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
-  assert.match(source, /inspectedPageKeys\.add\(inspectedVisitKey\)/, 'an inspected page is tracked separately from caller-supplied visited evidence');
-  assert.doesNotMatch(source, /alreadyVisitedSet\.add\(inspectedVisitKey\)/, 'a merely inspected page never becomes shared successful evidence');
-  assert.match(source, /structuralVisitedKeys\.add\(inspectedVisitKey\)/, 'the inspected page still counts for structural-navigation deduplication');
+  assert.doesNotMatch(source, /inspectedPageKeys/, 'there is no write-only inspected-page set');
+  assert.doesNotMatch(source, /alreadyVisitedSet\.add\(/, 'a merely inspected page never becomes shared successful evidence');
+  assert.match(source, /const inspectedIdentities = visitIdentityKeys\(request\.url, page\.url\(\)\)/, 'both the request URL and the final URL identify the inspected document');
+  assert.match(source, /for \(const identity of inspectedIdentities\) \{\s*structuralVisitedKeys\.add\(identity\)/, 'both redirect identities count for structural-navigation deduplication');
   assert.match(source, /for \(const identity of terminalSuccessUrls\)[\s\S]{0,160}?sharedCoveredKeys\.add\(key\)/, 'required coverage borrows only terminal-success identities');
-  assert.match(source, /renderedTerminalSuccessIdentities\(\{[\s\S]{0,260}?inspectedDocumentUrl: clickLoop\.processedDocumentUrl,[\s\S]{0,200}?documentReplacedByClick: clickLoop\.documentReplaced,/, 'a click-committed replacement document is not borrowed as terminal success, while same-document updates are kept');
+  assert.match(source, /renderedTerminalSuccessIdentities\(\{[\s\S]{0,300}?initialDocumentUrl: clickLoop\.initialDocumentUrl,[\s\S]{0,300}?inspectedDocumentUrl: clickLoop\.processedDocumentUrl,[\s\S]{0,300}?documentReplacedByClick: clickLoop\.documentReplaced,/, 'the start document and the last processed URL are evidence, while a click-committed replacement is not');
   assert.match(source, /classifyRequiredCoverage\(\{[\s\S]{0,200}?sharedCoveredKeys,/, 'classification receives only terminal-success shared evidence');
 });
 
@@ -806,14 +807,25 @@ test('cross-hostname structural anchors are classified for the rendered policy l
 });
 
 test('overflow targets follow the durable rotation and expose only unexamined controls', () => {
+  const pageUrl = 'https://creator.example/';
   const controls = Array.from({ length: 6 }, (_, index) => renderedButton(index, `oc-${index}`));
-  assert.deepEqual(renderedControlOverflowTargets(controls, 0, 4).map(c => c.marker), ['oc-4', 'oc-5']);
+  assert.deepEqual(renderedControlOverflowTargets(controls, pageUrl, 0, 4).map(c => c.marker), ['oc-4', 'oc-5']);
   assert.deepEqual(
-    renderedControlOverflowTargets(controls, 4, 4).map(c => c.marker),
+    renderedControlOverflowTargets(controls, pageUrl, 4, 4).map(c => c.marker),
     ['oc-2', 'oc-3'],
     'the unexamined set rotates with the durable offset',
   );
-  assert.deepEqual(renderedControlOverflowTargets(controls.slice(0, 4), 0, 4), [], 'a page inside the window has no overflow');
+  assert.deepEqual(renderedControlOverflowTargets(controls.slice(0, 4), pageUrl, 0, 4), [], 'a page inside the window has no overflow');
+  const withNavigable = [
+    ...Array.from({ length: 4 }, (_, index) => renderedButton(index, `oc-${index}`)),
+    { index: 4, marker: 'oc-community', text: 'Community', href: 'https://creator.example/community', tag: 'anchor' as const },
+    renderedButton(5, 'oc-menu'),
+  ];
+  assert.deepEqual(
+    renderedControlOverflowTargets(withNavigable, pageUrl, 0, 4).map(c => c.marker),
+    ['oc-menu'],
+    'a navigable anchor owned by the enqueue path is not an unexamined overflow control',
+  );
 });
 
 test('a same-document query change continues the click loop and reaches revealed controls', async () => {
@@ -865,6 +877,11 @@ test('a later replacement keeps the last processed URL as inspected evidence', a
   });
   assert.equal(result.documentReplaced, true);
   assert.equal(
+    result.initialDocumentUrl,
+    'https://creator.example/start',
+    'the document URL at loop start is retained across a history update',
+  );
+  assert.equal(
     result.processedDocumentUrl,
     'https://creator.example/start?menu=open',
     'the same-document update before the replacement remains inspected evidence',
@@ -888,6 +905,34 @@ test('a changed document identity stops the loop even when the URL is unchanged'
   assert.equal(result.evidenceControlsSkipped, 1, 'the replaced document leaves the queued control unexamined');
   assert.equal(result.interactionGap, true);
   assert.equal(enumerations, 0, 'a replaced document is never re-enumerated as the original page');
+});
+
+test('an unreadable document identity stops the loop instead of trusting an unchanged URL', async () => {
+  const targets = [renderedButton(0, 'oc-identity-1'), renderedButton(1, 'oc-identity-2')];
+  let reads = 0;
+  let enumerations = 0;
+  const result = await runRenderedClickLoop({
+    targets,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    click: async () => true,
+    enumerate: async () => { enumerations++; return renderedEnumeration(targets); },
+    pageUrl: () => 'https://creator.example/start',
+    // The before-read succeeds, the after-read rejects. The URL is unchanged,
+    // so URL comparison cannot distinguish a same-document update from a
+    // same-URL reload; the loop must fail closed.
+    documentIdentity: async () => {
+      reads++;
+      if (reads === 1) return 'document-1';
+      throw new Error('execution context destroyed');
+    },
+  });
+  assert.equal(result.documentReplaced, true, 'unreadable identity cannot prove document continuity');
+  assert.equal(result.evidenceControlsClicked, 1);
+  assert.equal(result.evidenceControlsSkipped, 1, 'the queued control on the unverified document is unexamined');
+  assert.equal(result.interactionGap, true);
+  assert.equal(result.processedDocumentUrl, 'https://creator.example/start');
+  assert.equal(enumerations, 0, 'a possibly replaced document is not re-enumerated as the original page');
 });
 
 test('revealed-control planning rotates with the durable retry offset', () => {
@@ -982,7 +1027,7 @@ test('rendered control coverage counts overflow and uses stable markers across D
   assert.match(source, /reconcileClickDestinationContext\(\{[\s\S]{0,160}?observations: clickDestinationContextByKey,[\s\S]{0,120}?inspectedKeys: inspectedDocumentKeys,/, 'click-only context is reconciled against inspected documents at publish time');
   assert.match(source, /if \(input\.inspectedKeys\.has\(key\)\) continue;/, 'a destination its own request inspected is not counted twice');
   assert.match(source, /frameCount: frameCount \+ clickDestinationContext\.frameCount,[\s\S]{0,200}?shadowRootCount: shadowRootCount \+ clickDestinationContext\.shadowRootCount,/, 'the coverage reason sees the same click-only context that telemetry publishes');
-  assert.match(source, /for \(const identity of visitIdentityKeys\(request\.url, page\.url\(\)\)\) \{\s*inspectedDocumentKeys\.add\(identity\);/, 'every request records the document it actually inspected');
+  assert.match(source, /const inspectedIdentities = visitIdentityKeys\(request\.url, page\.url\(\)\);\s*for \(const identity of inspectedIdentities\) \{\s*inspectedDocumentKeys\.add\(identity\);/, 'every request records the document it actually inspected');
   assert.match(source, /page\.evaluate\(collectRenderedPageContext\)/, 'frame/shadow/base-href context is collected per page');
   assert.match(source, /telemetry\.coverageReason = resolveRenderedCoverageReason\(/, 'the crawl publishes a diagnostic coverage reason');
   assert.match(source, /telemetry\.controlsEnumeratedTotal = controlsEnumeratedTotal \|\| undefined/, 'pre-filter control totals are persisted');
@@ -1021,6 +1066,10 @@ test('P0.2 coverage counters stay coherent, bounded, and preserved on error path
   assert.match(source, /document\.getElementsByTagName\(frameTags\[tagIndex\]\)/, 'frame counting uses live collections instead of materializing every match');
   assert.doesNotMatch(source, /querySelectorAll\('iframe,frame,object,embed'\)/, 'the unbounded materializing frame query is gone');
   assert.match(source, /const extendedText = `\$\{baseText\} \$\{title\} \$\{labelledByText\} \$\{childAlt\} \$\{dataLabel\} \$\{dataTooltip\} \$\{svgTitle\} \$\{hiddenText\}`/, 'structural classification reads the control own text plus bounded label attributes');
+  assert.doesNotMatch(source, /svgTitleNode\.textContent/, 'SVG title text is never materialized in full');
+  assert.match(source, /const svgTitleWalker = document\.createTreeWalker\(svgTitleNode, NodeFilter\.SHOW_TEXT\)/, 'the SVG title read is bounded like the other label sources');
+  assert.match(source, /const ariaHaspopup = \(element\.getAttribute\('aria-haspopup'\) \|\| ''\)\.trim\(\)\.toLowerCase\(\);/, 'padded aria-haspopup values are normalized before structural and popup checks');
+  assert.match(source, /drops\.countUnique\('cross-origin-disallowed', key\)/, 'each cross-origin structural destination is counted once per crawl, not once per page or retry');
   assert.match(source, /const unrecoveredStructuralNavigation = excludedStructuralNavigation\s*&& \(explicitStructural \|\| extendedMatched\)/, 'only explicit menu semantics or a hint-recovered label turn a navigable anchor into a coverage gap');
   assert.doesNotMatch(source, /const labelText = `\$\{element\.innerText \|\| ''\} \$\{ariaLabel\} \$\{title\}/, 'title text alone cannot be the only classification input');
   const aggregateRegistration = source.indexOf('aggregatePageCountersOnError = aggregatePageControlCounters;');
@@ -1037,7 +1086,7 @@ test('hidden controls wait for the disclosure that reveals them', () => {
   const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
   assert.match(source, /for \(let ancestor = element\.parentElement; ancestor; ancestor = ancestor\.parentElement\) \{/, 'every closed <details> ancestor is considered, not only the nearest one');
   assert.match(source, /ancestor\.tagName\.toLowerCase\(\) !== 'details' \|\| ancestor\.hasAttribute\('open'\)/, 'only closed details ancestors hide their content');
-  assert.match(source, /if \(summary === element\) continue;/, 'an element that is itself the revealing summary is not hidden by its own details');
+  assert.match(source, /if \(summary && summary\.contains\(element\)\) continue;/, 'a summary and everything inside it stay visible while its details is closed');
   assert.match(
     source,
     /const hidden = hiddenByClosedDetails\s*\|\| element\.getClientRects\(\)\.length === 0\s*\|\| getComputedStyle\(element\)\.visibility === 'hidden';/,

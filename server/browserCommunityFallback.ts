@@ -352,23 +352,31 @@ export function reconcileClickDestinationContext(input: {
 
 /**
  * Terminal-success identities for one processed request. The request URL is
- * always evidence. The final document URL is evidence only when the document
- * that finished the handler is the document that was processed: a redirect
- * commits before inspection, so both identities were inspected, while a
- * click-triggered navigation replaces the document after the click loop stops
- * and leaves the replacement's controls unexamined. That URL must be proven by
- * its own successful request instead of being borrowed as shared coverage.
+ * always evidence. The document URL where processing started is evidence even
+ * if a same-document history update or a later click replacement changed the
+ * URL: that document was inspected. The final document URL is evidence only
+ * when the document that finished the handler is the document that was
+ * processed: a redirect commits before inspection, so both identities were
+ * inspected, while a click-triggered navigation replaces the document after
+ * the click loop stops and leaves the replacement's controls unexamined. That
+ * URL must be proven by its own successful request instead of being borrowed
+ * as shared coverage.
  */
 export function renderedTerminalSuccessIdentities(input: {
   requestUrl: string;
+  initialDocumentUrl: string;
   inspectedDocumentUrl: string;
   finalDocumentUrl: string;
   documentReplacedByClick: boolean;
 }): string[] {
-  return visitIdentityKeys(
-    input.requestUrl,
-    input.documentReplacedByClick ? input.inspectedDocumentUrl : input.finalDocumentUrl,
-  );
+  const processedUrl = input.documentReplacedByClick
+    ? input.inspectedDocumentUrl
+    : input.finalDocumentUrl;
+  const keys = visitIdentityKeys(input.requestUrl, input.initialDocumentUrl);
+  for (const key of visitIdentityKeys(input.requestUrl, processedUrl)) {
+    if (!keys.includes(key)) keys.push(key);
+  }
+  return keys;
 }
 
 /**
@@ -860,7 +868,9 @@ export function enumerateRenderedControlNodes(
     for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
       if (ancestor.tagName.toLowerCase() !== 'details' || ancestor.hasAttribute('open')) continue;
       const summary = ancestor.querySelector(':scope > summary');
-      if (summary === element) continue;
+      // The summary itself and everything inside it stay rendered while the
+      // details is closed; only its siblings are hidden.
+      if (summary && summary.contains(element)) continue;
       hiddenByClosedDetails = true;
       // The nearest closed details is the disclosure the crawler must click
       // first; an outer one only reveals this summary, not the content.
@@ -949,7 +959,22 @@ export function enumerateRenderedControlNodes(
     const dataLabel = (element.getAttribute('data-label') || '').slice(0, 200);
     const dataTooltip = (element.getAttribute('data-tooltip') || '').slice(0, 200);
     const svgTitleNode = element.querySelector('svg title');
-    const svgTitle = svgTitleNode && svgTitleNode.textContent ? svgTitleNode.textContent.slice(0, 200) : '';
+    // Bounded title read: `textContent` materializes the entire subtree, and
+    // a hostile SVG title can be arbitrarily large. Walk at most 500 text
+    // nodes and collect at most 200 characters, as the other label sources do.
+    let svgTitle = '';
+    if (svgTitleNode) {
+      const svgTitleWalker = document.createTreeWalker(svgTitleNode, NodeFilter.SHOW_TEXT);
+      let svgTitleText = svgTitleWalker.nextNode();
+      let svgTitleNodes = 0;
+      while (svgTitleText && svgTitle.length < 200 && svgTitleNodes < 500) {
+        svgTitleNodes++;
+        const value = svgTitleText.nodeValue || '';
+        const remaining = 200 - svgTitle.length;
+        if (value && remaining > 0) svgTitle += value.length > remaining ? value.slice(0, remaining) : value;
+        svgTitleText = svgTitleWalker.nextNode();
+      }
+    }
     // Bounded descendant-text walk. Reading `textContent` and slicing after
     // the fact still materializes and normalizes the entire subtree; a
     // pathological menu container could make every enumeration unbounded.
@@ -979,7 +1004,7 @@ export function enumerateRenderedControlNodes(
     const hintMatchedControl = baseMatched || extendedMatched;
     if (baseMatched) baseMatchedCount++;
     const role = (element.getAttribute('role') || '').toLowerCase();
-    const ariaHaspopup = (element.getAttribute('aria-haspopup') || '').toLowerCase();
+    const ariaHaspopup = (element.getAttribute('aria-haspopup') || '').trim().toLowerCase();
     // HTTP(S) is the only destination the enqueue path can follow. A
     // `javascript:` or other scheme is click-only and must not make a
     // `target=_blank` control look like a normal navigable link.
@@ -1404,13 +1429,19 @@ export function partitionRenderedClickTargets(
  */
 export function renderedControlOverflowTargets(
   controls: RenderedControlTarget[],
+  pageUrl: string,
   offset = 0,
   evaluationWindowSize = RENDERED_CONTROL_EVALUATION_WINDOW,
 ): RenderedControlTarget[] {
   const windowSize = Math.max(0, Math.trunc(evaluationWindowSize) || 0);
   if (controls.length <= windowSize) return [];
   const { ordered } = planRenderedClickRotation(controls, offset);
-  return ordered.slice(windowSize);
+  // Mirror the click planner: a navigable anchor the enqueue path owns is not
+  // a click obligation, so it is not an unexamined control when it falls
+  // outside the evaluation window. Only the remaining targets are overflow.
+  return ordered
+    .slice(windowSize)
+    .filter(target => !isSkippableNavigableAnchorClick(target, pageUrl));
 }
 
 /**
@@ -1649,6 +1680,10 @@ export interface RenderedClickLoopResult {
    * history updates advance it; a click that commits a new document leaves it
    * at the last URL of the replaced document. */
   processedDocumentUrl: string;
+  /** The document URL when the loop started, before any same-document update.
+   * It was still the inspected document when a later history update or click
+   * replacement changed `processedDocumentUrl`. */
+  initialDocumentUrl: string;
   /** Index (in the click-target queue) of the first control whose click
    * failed. The durable retry offset must stop at that control, never rotate
    * past it, because its revealed content was not examined. */
@@ -1675,7 +1710,8 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
   let evidenceControlsSkipped = 0;
   let interactionGap = false;
   let documentReplaced = false;
-  let processedDocumentUrl = input.pageUrl();
+  const initialDocumentUrl = input.pageUrl();
+  let processedDocumentUrl = initialDocumentUrl;
   let firstFailedTargetIndex: number | undefined;
   for (let clickIndex = 0; clickIndex < clickTargets.length; clickIndex++) {
     if (clickedThisPage >= input.maxClicksPerPage) {
@@ -1735,9 +1771,13 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
       if (identityBeforeClick !== null && identityBeforeClick !== undefined
         && identityAfterClick !== null && identityAfterClick !== undefined) {
         replacedThisClick = identityBeforeClick !== identityAfterClick;
+      } else {
+        // An unreadable identity cannot establish document continuity. A
+        // same-URL reload would look exactly like a same-document update, so
+        // fail closed: stop the old plan instead of clicking stale controls
+        // on a replacement document.
+        replacedThisClick = true;
       }
-      // If either identity read failed, fall back to the URL comparison. A
-      // navigation during the read fails closed because the URL changed.
     }
     if (replacedThisClick) {
       documentReplaced = true;
@@ -1803,7 +1843,7 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
       }
     }
   }
-  return { evidenceControlsClicked, evidenceControlsFailed, evidenceControlsSkipped, interactionGap, documentReplaced, processedDocumentUrl, firstFailedTargetIndex };
+  return { evidenceControlsClicked, evidenceControlsFailed, evidenceControlsSkipped, interactionGap, documentReplaced, processedDocumentUrl, initialDocumentUrl, firstFailedTargetIndex };
 }
 
 /**
@@ -2554,8 +2594,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   let seedSnapshotUrl = '';
   let seedSnapshotIdentity: unknown = null;
   // The seed request may be retried with a fresh page/document. The identity
-  // and initial required-link snapshot are refreshed for each seed attempt,
-  // while child pages never replace them.
+  // and URL are refreshed for each seed attempt, while child pages never
+  // replace them. Required links accumulate across attempts: a destination
+  // seen on a failed attempt stays an obligation instead of disappearing.
   const seedRequestKey = normalizeVisitUrl(seedUrl);
   let requiredSnapshotExpanded = false;
   let evidenceControlsSeen = 0;
@@ -2687,7 +2728,6 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   // Pages read during this crawl are used only for navigation deduplication
   // (a structural link back to them is not an unexamined destination). They
   // become successful coverage evidence only after the full handler succeeds.
-  const inspectedPageKeys = new Set<string>();
   const structuralVisitedKeys = new Set(alreadyVisitedSet);
   const discovered:DiscordCandidate[]=[];
   const hostKey = (rawUrl: string): string => {
@@ -2906,16 +2946,16 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // Record the document this request actually inspected (the request
             // URL plus any redirect target) so a click that merely lands on it
             // later is not attributed twice.
-            for (const identity of visitIdentityKeys(request.url, page.url())) {
+            const inspectedIdentities = visitIdentityKeys(request.url, page.url());
+            for (const identity of inspectedIdentities) {
               inspectedDocumentKeys.add(identity);
             }
-            // This document has now been inspected: a structural link back to
-            // it is not an unexamined destination, and enqueue must not refetch
-            // it merely because it was absent from the caller-supplied set.
-            const inspectedVisitKey = normalizeVisitUrl(page.url());
-            if (inspectedVisitKey) {
-              inspectedPageKeys.add(inspectedVisitKey);
-              structuralVisitedKeys.add(inspectedVisitKey);
+            // A redirect makes the request URL and the final landing URL the
+            // same inspected destination. Record both for structural
+            // deduplication: a menu link back to the original request URL is
+            // not an unexamined destination (it redirects to this document).
+            for (const identity of inspectedIdentities) {
+              structuralVisitedKeys.add(identity);
             }
             telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'PAGE_PROCESSED');
             // P0.2 context counters: structural presence only, refreshed after
@@ -3021,7 +3061,8 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               }
             };
             flushPageContextProbesOnError = flushPageContextProbes;
-            if (seedRequestKey && normalizeVisitUrl(request.url) === seedRequestKey) {              seedDocumentSeen = true;
+            if (seedRequestKey && normalizeVisitUrl(request.url) === seedRequestKey) {
+              seedDocumentSeen = true;
               seedSnapshotUrl = page.url();
               // Capture document identity alongside the URL. A menu can
               // update the query in place (pushState); the URL then differs
@@ -3062,9 +3103,6 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             let pageIconLabelRecovered = 0;
             let pagePopupMarkers = new Set<string>();
             let pageControlOverflow = 0;
-            // Cross-origin structural candidates per page, deduplicated so a
-            // re-enumeration cannot inflate the policy counter.
-            const pageCrossOriginHrefs = new Set<string>();
             const examinedPopupMarkers = new Set<string>();
             const recordControlEnumeration = (enumeration: RenderedControlEnumeration): void => {
               const matchedTotal = enumeration.controls.length;
@@ -3092,21 +3130,19 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               // enqueue path, so it is recorded in the rendered policy ledger
               // instead of silently resolving as COMPLETE.
               let unrecoveredRejected = 0;
-              let newCrossOrigin = 0;
               for (const href of enumeration.structuralUnrecoveredHrefs) {
                 if (isCrossHostnameStructuralNavigation(href, page.url())) {
-                  const key = href.trim();
-                  if (key && !pageCrossOriginHrefs.has(key)) {
-                    pageCrossOriginHrefs.add(key);
-                    newCrossOrigin++;
-                  }
+                  // Count each excluded destination once per crawl, matching
+                  // the static inspector. A shared header/footer link would
+                  // otherwise inflate the ledger on every page and retry.
+                  const key = normalizeVisitUrl(href) || href.trim();
+                  if (key) drops.countUnique('cross-origin-disallowed', key);
                   continue;
                 }
                 if (isUnrecoveredStructuralNavigation(href, page.url(), structuralVisitedKeys)) {
                   unrecoveredRejected++;
                 }
               }
-              if (newCrossOrigin > 0) drops.count('cross-origin-disallowed', newCrossOrigin);
               // The href sample is bounded, so a candidate beyond it was never
               // checked against admission. Fail closed instead of letting the
               // sample size decide that the crawl is complete.
@@ -3120,6 +3156,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               // control makes the page retryable.
               const overflowTargets = renderedControlOverflowTargets(
                 enumeration.controls,
+                page.url(),
                 limits.clickOffset,
               );
               const overflow = overflowTargets.length;
@@ -3170,7 +3207,8 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 return;
               }
               // Popups that the click loop actually inspected are not an
-              // unexamined context gap. Identity tracking keeps a replacement              // popup from being cancelled out by an earlier clicked popup,
+              // unexamined context gap. Identity tracking keeps a replacement
+              // popup from being cancelled out by an earlier clicked popup,
               // including when the replacement is hint-rejected.
               const current = {
                 enumerated: pageControlsEnumeratedTotal,
@@ -3439,6 +3477,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // its replacement must prove itself through its own request.
             for (const identity of renderedTerminalSuccessIdentities({
               requestUrl: request.url,
+              initialDocumentUrl: clickLoop.initialDocumentUrl,
               inspectedDocumentUrl: clickLoop.processedDocumentUrl,
               finalDocumentUrl: page.url(),
               documentReplacedByClick: clickLoop.documentReplaced,

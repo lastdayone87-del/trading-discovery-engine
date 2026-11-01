@@ -414,6 +414,7 @@ test('v2 review: terminal success prefers the inspected document over a click re
   assert.deepEqual(
     renderedTerminalSuccessIdentities({
       requestUrl: 'https://redir.example.com/go',
+      initialDocumentUrl: 'https://redir.example.com/go',
       inspectedDocumentUrl: 'https://redir.example.com/go',
       finalDocumentUrl: 'https://redir.example.com/landing',
       documentReplacedByClick: false,
@@ -424,6 +425,7 @@ test('v2 review: terminal success prefers the inspected document over a click re
   assert.deepEqual(
     renderedTerminalSuccessIdentities({
       requestUrl: 'https://creator.example.com/',
+      initialDocumentUrl: 'https://creator.example.com/',
       inspectedDocumentUrl: 'https://creator.example.com/',
       finalDocumentUrl: 'https://creator.example.com/community',
       documentReplacedByClick: true,
@@ -434,6 +436,7 @@ test('v2 review: terminal success prefers the inspected document over a click re
   assert.deepEqual(
     renderedTerminalSuccessIdentities({
       requestUrl: 'https://creator.example.com/go',
+      initialDocumentUrl: 'https://creator.example.com/landing',
       inspectedDocumentUrl: 'https://creator.example.com/landing',
       finalDocumentUrl: 'https://creator.example.com/community',
       documentReplacedByClick: true,
@@ -443,7 +446,23 @@ test('v2 review: terminal success prefers the inspected document over a click re
   );
   assert.deepEqual(
     renderedTerminalSuccessIdentities({
+      requestUrl: 'https://creator.example.com/menu',
+      initialDocumentUrl: 'https://creator.example.com/landing',
+      inspectedDocumentUrl: 'https://creator.example.com/landing?menu=open',
+      finalDocumentUrl: 'https://creator.example.com/community',
+      documentReplacedByClick: true,
+    }),
+    [
+      'https://creator.example.com/menu',
+      'https://creator.example.com/landing',
+      'https://creator.example.com/landing?menu=open',
+    ],
+    'the redirect landing URL stays inspected evidence after a history update and click replacement',
+  );
+  assert.deepEqual(
+    renderedTerminalSuccessIdentities({
       requestUrl: 'https://creator.example.com/',
+      initialDocumentUrl: 'https://creator.example.com/',
       inspectedDocumentUrl: 'https://creator.example.com/',
       finalDocumentUrl: 'https://creator.example.com/community',
       documentReplacedByClick: false,
@@ -459,6 +478,7 @@ test('v2 review: terminal success prefers the inspected document over a click re
       ],
       succeededKeys: renderedTerminalSuccessIdentities({
         requestUrl: 'https://creator.example.com/',
+        initialDocumentUrl: 'https://creator.example.com/',
         inspectedDocumentUrl: 'https://creator.example.com/',
         finalDocumentUrl: 'https://creator.example.com/community',
         documentReplacedByClick: true,

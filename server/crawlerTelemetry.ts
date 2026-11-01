@@ -131,7 +131,18 @@ export interface RenderedCoverageInput {
   /** Context sampling was abandoned for at least one page (no trustworthy
    * document identity), so unreached frames/shadow roots cannot be ruled out. */
   contextUnknown?: boolean;
+  /**
+   * @deprecated Measurement-only. Reported in `controlsStructuralHintRejected`
+   * but intentionally not consulted by `resolveRenderedCoverageReason`:
+   * structural disclosures are now clicked, so hint rejection alone is not an
+   * unexamined destination.
+   */
   structuralHintRejected?: number;
+  /**
+   * @deprecated Measurement-only. Reported in `controlsIconLabelRecovered` but
+   * intentionally not consulted by `resolveRenderedCoverageReason`:
+   * icon-label controls are now clicked, so recovery alone is not a gap.
+   */
   iconLabelRecovered?: number;
   unresolvedFailedRequests?: number;
   frameCount?: number;
@@ -161,7 +172,8 @@ export function resolveRenderedCoverageReason(input: RenderedCoverageInput): Ren
     || input.scrollCapReachedStillGrowing === true
     || input.contextUnknown === true
     || count(input.unresolvedFailedRequests) > 0) {
-    return 'BOUNDED';  }
+    return 'BOUNDED';
+  }
   if (count(input.frameCount) > 0 || count(input.shadowRootCount) > 0 || count(input.popupTargets) > 0) {
     return 'CONTEXT_UNREACHABLE';
   }

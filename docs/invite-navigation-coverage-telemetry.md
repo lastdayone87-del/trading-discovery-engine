@@ -1,7 +1,10 @@
 # Invite navigation-coverage telemetry and control recovery (P0.2/P1.1/P1.2)
 
-**Status:** P0.2 instrumentation plus P1.1/P1.2 control recovery. No outcome,
-retry, selection, queue, or schema behavior changes.
+**Status:** P0.2 instrumentation plus P1.1/P1.2 control recovery. Recovering
+structural and icon-label controls widens the rendered click set and changes
+which unexamined controls make a page retryable; coverage reasons can move from
+`COMPLETE` to `POLICY_EXCLUDED`/`BOUNDED`. Selection, queue, schema, and P1.7
+outcome mapping are unchanged.
 **Scope:** Rendered creator-website acquisition (`mode = RENDERED`).
 **Related evidence:** `INVITE_NAVIGATION_ACQUISITION_RECALL_INVESTIGATION_20261027.md`
 and the 2026-10-27 P0.3 production classification report (read-only Coolify
@@ -131,8 +134,9 @@ path, so they are recorded as `cross-origin-disallowed` in the rendered policy
 ledger. A stronger reason wins over a weaker one (for example, a timeout is
 `BOUNDED` even when frames are present).
 
-The reason remains diagnostic. It does not change `complete`, `retryable`,
-`failureClass`, or the acquisition outcome. P1.7 owns that mapping.
+The coverage reason itself remains diagnostic. It does not change `complete`,
+`retryable`, `failureClass`, or the acquisition outcome. P1.7 owns that mapping.
+(Retryability is driven by the interaction-gap certificate, not by the reason.)
 
 ## Safety and bounds
 
@@ -179,8 +183,10 @@ The reason remains diagnostic. It does not change `complete`, `retryable`,
   required-link re-snapshot: a history-only query change still merges newly
   revealed same-host community links into the seed's required set, while a
   replaced document never contributes required obligations to the seed. The
-  identity and initial link snapshot are refreshed for each seed attempt, so a
-  Crawlee retry compares its own document rather than the failed attempt's.
+  identity and URL are refreshed for each seed attempt, so a Crawlee retry
+  compares its own document rather than the failed attempt's. Required links
+  accumulate across attempts: a destination observed on a failed attempt stays
+  an obligation instead of disappearing with that attempt's document.
 - `collectRenderedPageContext` uses a bounded `TreeWalker` (2,000 elements,
   100 shadow roots) and a bounded frame scan over live `getElementsByTagName`
   collections (1,000). It never traverses frames or shadow roots. Context

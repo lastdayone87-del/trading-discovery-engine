@@ -593,6 +593,45 @@ test('real DOM: hidden controls are queued after the disclosure that reveals the
   });
 });
 
+test('real DOM: a control inside a summary stays visible while its details is closed', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <details>
+      <summary>Menu <a href="/community">Community</a></summary>
+      <a href="/discord">Join Discord</a>
+    </details>
+  </body></html>`;
+  await withControlPage(html, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    const summary = enumeration.controls.find(target => target.index === 0);
+    const insideSummary = enumeration.controls.find(target => target.index === 1);
+    const insideClosedContent = enumeration.controls.find(target => target.index === 2);
+    assert.equal(summary?.hidden !== true, true, 'the summary is visible');
+    assert.equal(
+      insideSummary?.hidden !== true,
+      true,
+      'a link inside the summary is rendered even while the details is closed',
+    );
+    assert.equal(
+      insideClosedContent?.hidden,
+      true,
+      'a control in the closed content is still deferred until the summary runs',
+    );
+  });
+});
+
+test('real DOM: padded aria-haspopup=false is neither structural nor a popup', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <a href="/products" aria-haspopup="false ">Products</a>
+  </body></html>`;
+  await withControlPage(html, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(enumeration.total, 1, 'the attribute still selects the control for measurement');
+    assert.equal(enumeration.controls.length, 0, 'an ordinary link is not added to the click set');
+    assert.equal(enumeration.structuralNavigation, 0, 'padded false is not menu semantics');
+    assert.equal(enumeration.popupTargets, 0, 'padded false is not a popup');
+  });
+});
+
 test('real DOM: nested closed details hides inner summaries and their content', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
   const html = `<!doctype html><html><body>
     <details>
