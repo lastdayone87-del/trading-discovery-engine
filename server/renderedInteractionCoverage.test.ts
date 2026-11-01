@@ -139,11 +139,11 @@ test('retry rotation never starts on a hidden control ahead of its disclosure', 
     ['oc-menu', 'oc-invite', 'oc-b1', 'oc-b2'],
     'a boundary that lands on the hidden control rewinds to its summary and still spends the cap',
   );
-  assert.equal(boundary.rotationRewind, 1, 'the rewind distance is reported to the offset accounting');
+  assert.equal(boundary.rotationReplay, 1, 'the replay prefix is reported to the offset accounting');
   assert.equal(
     renderedClickOffsetAdvance(boundary, boundary.toClick.length, 4),
     3,
-    'the advance is measured from the rewound start, not the original offset',
+    'the advance is measured from the saved offset, so only new progress counts',
   );
 
   // Successive retries advance through the pool instead of repeating the same
@@ -182,6 +182,38 @@ test('rewinding a disclosure does not skip the controls after the original offse
     ['oc-b6', 'oc-b1', 'oc-b2', 'oc-b3'],
     'the retry resumes at the control after the last examined pool position',
   );
+});
+
+test('a menu larger than the click cap does not freeze the retry rotation', () => {
+  // Greptile: pool [summary, H1..H5] with a four-click cap. Replaying the
+  // whole menu unit every retry would examine the same prefix and advance 0,
+  // leaving H4/H5 (and any invite behind them) unreachable.
+  const controls = [
+    { index: 0, marker: 'oc-menu', text: 'Menu', href: null, tag: 'button' as const },
+    ...Array.from({ length: 5 }, (_, index) => ({
+      index: index + 1,
+      marker: `oc-h${index + 1}`,
+      text: 'Discord',
+      href: null,
+      tag: 'button' as const,
+      hidden: true,
+      afterMarker: 'oc-menu',
+    })),
+  ];
+  const clicked = new Set<string>();
+  let offset = 0;
+  let stalledAttempts = 0;
+  for (let attempt = 0; attempt < controls.length; attempt++) {
+    const plan = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, offset);
+    for (const target of plan.toClick) if (target.marker) clicked.add(target.marker);
+    const advance = renderedClickOffsetAdvance(plan, plan.toClick.length, 4);
+    if (plan.toClick.length > 0 && advance === 0) stalledAttempts++;
+    offset += advance;
+  }
+  assert.equal(stalledAttempts, 0, 'a retry that clicked controls always advances');
+  for (let index = 1; index <= 5; index++) {
+    assert.equal(clicked.has(`oc-h${index}`), true, `hidden control H${index} is reached by a retry`);
+  }
 });
 
 test('a hidden invite beyond the initial click cap is reached by the retry rotation', () => {
@@ -916,7 +948,7 @@ test('rendered control coverage counts overflow and uses stable markers across D
   assert.match(source, /popupTargets,/, 'popup targets are counted for P1.3');
   assert.doesNotMatch(source, /matched\.slice\(0, 64\)/, 'enumeration must not truncate before the retry rotation');
   assert.match(source, /RENDERED_CONTROL_EVALUATION_WINDOW = 64/);
-  assert.match(source, /const evaluationWindow = rotated\.slice\(0, windowSize\)/, 'the evaluation window is applied after rotating the full matched pool');
+  assert.match(source, /const evaluationWindow = ordered\.slice\(0, windowSize\)/, 'the evaluation window is applied after rotating the full matched pool');
   assert.match(source, /recordControlEnumeration\(firstEnumeration\)/);
   assert.match(source, /data-oc-control/);
   assert.match(source, /partitionRenderedClickTargets\(controls, page\.url\(\), limits\.maxClicksPerPage, limits\.clickOffset\)/, 'the retry offset rotates the full pool before the cap');
@@ -1015,7 +1047,7 @@ test('hidden controls wait for the disclosure that reveals them', () => {
   assert.match(source, /revealerIndexByIndex\.set\(index, revealerIndex\);/, 'the revealer is tracked by control index');
   assert.match(source, /const pending = hiddenAfter\.get\(revealerIndex\);/, 'hidden controls are grouped under their revealing control');
   assert.match(source, /const afterMarker = revealerIndex === undefined \? undefined : markerByIndex\.get\(revealerIndex\);/, 'each hidden control carries the marker of its revealer into retry planning');
-  assert.match(source, /rewindRotationToDisclosure\(controls, start\);/, 'retry rotation rewinds a boundary that lands on a hidden control to its disclosure');
+  assert.match(source, /planRenderedClickRotation\(controls, offset\);/, 'retry rotation replays only the revealer chain for a boundary that lands on a hidden control');
   assert.match(source, /const stack = \(hiddenAfter\.get\(root\.index\) \|\| \[\]\)\.slice\(\)\.reverse\(\);/, 'hidden controls follow their revealer, depth-first for nested disclosures');
   assert.match(source, /roots\.push\(\.\.\.trailingHidden\);/, 'a hidden control with no known revealer is still queued last');
   assert.doesNotMatch(source, /isVisible/, 'the click loop keeps its bounded actionability wait instead of a one-shot visibility probe');

@@ -1370,19 +1370,15 @@ export function partitionRenderedClickTargets(
   maxClicks: number,
   offset = 0,
   evaluationWindowSize = RENDERED_CONTROL_EVALUATION_WINDOW,
-): { toClick: RenderedControlTarget[]; skippedNavigableAnchors: number; evaluationWindow: RenderedControlTarget[]; rotationRewind: number } {
+): { toClick: RenderedControlTarget[]; skippedNavigableAnchors: number; evaluationWindow: RenderedControlTarget[]; rotationReplay: number } {
   const cap = Math.max(0, Math.trunc(maxClicks) || 0);
   const windowSize = Math.max(0, Math.trunc(evaluationWindowSize) || 0);
   // Rotate the complete matched pool before applying the evaluation window.
   // Rotating the already-truncated plan would only reorder the same prefix and
-  // leave controls 65+ permanently unreachable.
-  const rawOffset = Math.trunc(offset) || 0;
-  const start = controls.length > 0
-    ? ((rawOffset % controls.length) + controls.length) % controls.length
-    : 0;
-  const rotationStart = rewindRotationToDisclosure(controls, start);
-  const rotated = rotationStart > 0 ? [...controls.slice(rotationStart), ...controls.slice(0, rotationStart)] : controls;
-  const evaluationWindow = rotated.slice(0, windowSize);
+  // leave controls 65+ permanently unreachable. A rotation boundary that lands
+  // on a hidden control replays only its revealer chain first.
+  const { ordered, replay } = planRenderedClickRotation(controls, offset);
+  const evaluationWindow = ordered.slice(0, windowSize);
   const eligible: RenderedControlTarget[] = [];
   let skippedNavigableAnchors = 0;
   for (const control of evaluationWindow) {
@@ -1396,7 +1392,7 @@ export function partitionRenderedClickTargets(
     toClick: eligible.slice(0, cap),
     skippedNavigableAnchors,
     evaluationWindow,
-    rotationRewind: start - rotationStart,
+    rotationReplay: replay,
   };
 }
 
@@ -1413,11 +1409,8 @@ export function renderedControlOverflowTargets(
 ): RenderedControlTarget[] {
   const windowSize = Math.max(0, Math.trunc(evaluationWindowSize) || 0);
   if (controls.length <= windowSize) return [];
-  const rawOffset = Math.trunc(offset) || 0;
-  const start = ((rawOffset % controls.length) + controls.length) % controls.length;
-  const rotationStart = rewindRotationToDisclosure(controls, start);
-  const rotated = rotationStart > 0 ? [...controls.slice(rotationStart), ...controls.slice(0, rotationStart)] : controls;
-  return rotated.slice(windowSize);
+  const { ordered } = planRenderedClickRotation(controls, offset);
+  return ordered.slice(windowSize);
 }
 
 /**
@@ -1457,7 +1450,7 @@ export function isNavigableOnlyControlWindow(
  * an interaction gap and is revisited when the pool rotates back around.
  */
 export function renderedClickOffsetAdvance(
-  plan: Pick<ReturnType<typeof partitionRenderedClickTargets>, 'toClick' | 'evaluationWindow' | 'skippedNavigableAnchors' | 'rotationRewind'>,
+  plan: Pick<ReturnType<typeof partitionRenderedClickTargets>, 'toClick' | 'evaluationWindow' | 'skippedNavigableAnchors' | 'rotationReplay'>,
   attempts: number,
   maxClicksPerPage: number,
   firstFailedAttempt?: number,
@@ -1474,14 +1467,13 @@ export function renderedClickOffsetAdvance(
     : failedAt === 0
       ? attempted
       : Math.min(attempted, failedAt);
-  // The plan may have rewound the rotation to replay a disclosure that opens
-  // a hidden control. The returned value is added to the original offset, so
-  // subtract that rewind: otherwise the next retry skips the controls between
-  // the rewound start and the original one.
-  const rewind = Math.max(0, Math.trunc(plan.rotationRewind) || 0);
+  // The plan may replay a disclosure before the saved offset. The returned
+  // value is added to that offset, so progress counts only controls after the
+  // replay prefix; replayed controls never advance the rotation.
+  const replay = Math.max(0, Math.trunc(plan.rotationReplay) || 0);
   if (examined === 0) {
     return isNavigableOnlyControlWindow(plan, maxClicksPerPage)
-      ? Math.max(0, plan.evaluationWindow.length - rewind)
+      ? Math.max(0, plan.evaluationWindow.length - replay)
       : 0;
   }
   const lastAttempted = plan.toClick[Math.min(examined, plan.toClick.length) - 1];
@@ -1489,33 +1481,51 @@ export function renderedClickOffsetAdvance(
   const position = plan.evaluationWindow.findIndex(target =>
     target === lastAttempted || (Boolean(target.marker) && target.marker === lastAttempted.marker)
   );
-  return position >= 0 ? Math.max(0, position + 1 - rewind) : 0;
+  return position >= replay ? position - replay + 1 : 0;
 }
 
 /**
- * Rewind a rotation boundary that lands inside a disclosure unit. Retry
- * rotation is applied to the flat control pool, so an offset can land on a
- * hidden control and put it ahead of the closed menu summary that reveals it.
- * Rewinding to that summary replays the prerequisite first; the unit stays
- * atomic and the remaining offsets still advance through the rest of the pool:
- * the rewind distance is reported back to `renderedClickOffsetAdvance` so the
- * next offset is measured from the rewound start. A hidden control whose
- * revealer is outside this pool has no dependency to replay and keeps the
- * plain rotation.
+ * Build the control order for one attempt from a durable rotation offset.
+ * The saved position is where the previous attempt stopped, so a hidden
+ * control there needs the disclosure that reveals it replayed first. Only
+ * that revealer chain is prepended (outermost first for nested disclosures);
+ * the attempt then resumes at the saved position, skipping the hidden children
+ * between the revealer and it because the attempt that advanced the offset
+ * already examined them. Replaying those children instead would starve later
+ * ones whenever they fill the click cap.
+ *
+ * `replay` is the length of that prefix: progress is measured from the saved
+ * position, not from the replayed controls.
  */
-function rewindRotationToDisclosure(
+function planRenderedClickRotation(
   controls: RenderedControlTarget[],
-  start: number,
-): number {
-  let rotationStart = start;
-  for (let rewind = 0; rewind < controls.length; rewind++) {
-    const control = controls[rotationStart];
+  offset: number,
+): { ordered: RenderedControlTarget[]; replay: number } {
+  const length = controls.length;
+  if (length === 0) return { ordered: [], replay: 0 };
+  const start = ((Math.trunc(offset) || 0) % length + length) % length;
+  const chain: number[] = [];
+  let cursor = start;
+  for (let step = 0; step < length; step++) {
+    const control = controls[cursor];
     if (!control || !control.hidden || !control.afterMarker) break;
-    const revealerIndex = controls.findIndex(candidate => candidate.marker === control.afterMarker);
-    if (revealerIndex < 0 || revealerIndex === rotationStart) break;
-    rotationStart = revealerIndex;
+    const revealer = controls.findIndex(candidate => candidate.marker === control.afterMarker);
+    if (revealer < 0 || revealer === cursor || chain.indexOf(revealer) !== -1) break;
+    chain.push(revealer);
+    cursor = revealer;
   }
-  return rotationStart;
+  const prefixIndices = chain.slice().reverse();
+  const prefixSet = new Set(prefixIndices);
+  const ordered: RenderedControlTarget[] = [];
+  for (let prefixIndex = 0; prefixIndex < prefixIndices.length; prefixIndex++) {
+    ordered.push(controls[prefixIndices[prefixIndex]]);
+  }
+  for (let step = 0; step < length; step++) {
+    const index = (start + step) % length;
+    if (prefixSet.has(index)) continue;
+    ordered.push(controls[index]);
+  }
+  return { ordered, replay: prefixIndices.length };
 }
 
 /**
