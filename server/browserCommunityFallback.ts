@@ -315,22 +315,6 @@ export function visitIdentityKeys(requestUrl: string, finalUrl: string): string[
   return keys;
 }
 
-/**
- * A click that commits a new document can expose frames or shadow roots that
- * only that click saw. Count its context only when the destination is not
- * admitted as its own request (which samples it separately) and was not
- * already inspected by an earlier request (which already counted it).
- */
-export function shouldSampleClickDestinationContext(input: {
-  destinationKey: string | null;
-  admittedKeys: ReadonlySet<string>;
-  visitedKeys: ReadonlySet<string>;
-}): boolean {
-  if (!input.destinationKey) return false;
-  return !input.admittedKeys.has(input.destinationKey)
-    && !input.visitedKeys.has(input.destinationKey);
-}
-
 /** Context observed on a document reached only by a click. */
 export interface ClickDestinationContext {
   frameCount: number;
@@ -340,12 +324,14 @@ export interface ClickDestinationContext {
 
 /**
  * Context seen through a click that committed a new document is attributed
- * only when no request inspected that document as its own page. A destination
- * can be clicked before the link pass admits it (the click loop runs first),
- * so adding its context at click time would count the same frames and shadow
- * roots again when its own request runs. Observations are keyed by visit
- * identity and reconciled against every document this crawl actually
- * inspected. Pure and unit-tested.
+ * only when no request inspected that document as its own page. Admission is
+ * deliberately not consulted: `enqueueLinks` can accept a URL that Crawlee
+ * then never inspects (max-requests cutoff, later failure), and inspection is
+ * the only proof that the destination's context was actually counted
+ * elsewhere. A destination can also be clicked before the link pass admits it,
+ * so adding its context at click time would double the crawl totals when its
+ * own request runs. Observations are keyed by visit identity and reconciled
+ * against every document this crawl actually inspected. Pure and unit-tested.
  */
 export function reconcileClickDestinationContext(input: {
   observations: ReadonlyMap<string, ClickDestinationContext>;
@@ -2127,9 +2113,6 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   // flag left by an earlier capped attempt. The crawl-wide boolean is derived
   // from the latest attempt per request when telemetry is published.
   const pageScrollCapByRequest = new Map<string, boolean>();
-  // URLs admitted for enqueue are inspected by their own request, so a click
-  // that lands on one must not also count its context here.
-  const admittedEnqueueKeys = new Set<string>();
   // Context seen through a click that committed a new document, keyed by
   // destination identity. It is reconciled at publish time against every
   // document this crawl actually inspected: the link pass runs after the click
@@ -2202,8 +2185,11 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
       structuralHintRejected: controlsStructuralHintRejected,
       iconLabelRecovered: controlsIconLabelRecovered,
       unresolvedFailedRequests: telemetry.unresolvedFailedRequests,
-      frameCount,
-      shadowRootCount,
+      // The coverage reason must see the same context the telemetry publishes:
+      // a document reached only by a click still has unexamined frames and
+      // shadow roots, so it cannot be reported as fully covered.
+      frameCount: frameCount + clickDestinationContext.frameCount,
+      shadowRootCount: shadowRootCount + clickDestinationContext.shadowRootCount,
       popupTargets,
       navigationPolicyExcluded: telemetry.navigationPolicyExcluded,
     });
@@ -2500,22 +2486,16 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 if (!sameDocument && !sameUrl) {
                   // A click can commit a document that is never enqueued (for
                   // example a hint-matched control whose destination is
-                  // hint-free). Its frames, shadow roots, and base href were
-                  // inspected but would otherwise never be sampled. Record them
-                  // by destination and reconcile at publish time, so a
-                  // destination the link pass admits later is not counted here
-                  // and again by its own request.
-                  if (shouldSampleClickDestinationContext({
-                    destinationKey: normalizeVisitUrl(page.url()),
-                    admittedKeys: admittedEnqueueKeys,
-                    visitedKeys: alreadyVisitedSet,
-                  })) {
-                    recordClickDestinationContext(page.url(), {
-                      frameCount: pageContext.frameCount,
-                      shadowRootCount: pageContext.shadowRootCount,
-                      baseHrefPresent: pageContext.baseHrefPresent === true,
-                    });
-                  }
+                  // hint-free), and an enqueued destination may still never be
+                  // inspected (max-requests cutoff, later failure). Record the
+                  // context by destination unconditionally; publish-time
+                  // reconciliation drops it only when a request actually
+                  // inspected that document and counted the same context.
+                  recordClickDestinationContext(page.url(), {
+                    frameCount: pageContext.frameCount,
+                    shadowRootCount: pageContext.shadowRootCount,
+                    baseHrefPresent: pageContext.baseHrefPresent === true,
+                  });
                   return;
                 }
                 pageFrameCount = Math.max(pageFrameCount, Math.max(0, Math.floor(pageContext.frameCount) || 0));
@@ -2749,11 +2729,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 drops.count('admission-rejected');
                 return false;
               }
-              if (shouldEnqueueRenderedCommunityLink(url)) {
-                const admittedKey = normalizeVisitUrl(url);
-                if (admittedKey) admittedEnqueueKeys.add(admittedKey);
-                return true;
-              }
+              if (shouldEnqueueRenderedCommunityLink(url)) return true;
               drops.count('hint-rejected');
               return false;
             };
