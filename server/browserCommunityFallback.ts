@@ -316,6 +316,22 @@ export function visitIdentityKeys(requestUrl: string, finalUrl: string): string[
 }
 
 /**
+ * A click that commits a new document can expose frames or shadow roots that
+ * only that click saw. Count its context only when the destination is not
+ * admitted as its own request (which samples it separately) and was not
+ * already inspected by an earlier request (which already counted it).
+ */
+export function shouldSampleClickDestinationContext(input: {
+  destinationKey: string | null;
+  admittedKeys: ReadonlySet<string>;
+  visitedKeys: ReadonlySet<string>;
+}): boolean {
+  if (!input.destinationKey) return false;
+  return !input.admittedKeys.has(input.destinationKey)
+    && !input.visitedKeys.has(input.destinationKey);
+}
+
+/**
  * Normalized identity for visit-set matching (shared-evidence registry and
  * already-visited exclusion): scheme + lowercased host + non-default port +
  * pathname (trailing slash trimmed) + verbatim query. Same rule both sides
@@ -2076,6 +2092,14 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   // counters. Keep the last attempt's contribution per request so a retry
   // replaces it instead of adding the same request to crawl totals twice.
   const pageControlTotalsByRequest = new Map<string, RenderedRequestControlTotals>();
+  // Scroll-cap growth is an observation of one attempt, not of the request
+  // forever: a successful retry that scrolls to a stable page must clear a
+  // flag left by an earlier capped attempt. The crawl-wide boolean is derived
+  // from the latest attempt per request when telemetry is published.
+  const pageScrollCapByRequest = new Map<string, boolean>();
+  // URLs admitted for enqueue are inspected by their own request, so a click
+  // that lands on one must not also count its context here.
+  const admittedEnqueueKeys = new Set<string>();
   let popupTargets = 0;
   let frameCount = 0;
   let shadowRootCount = 0;
@@ -2095,6 +2119,11 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   // nextRenderedClickOffsets reads only outcome.telemetry, so the certificate
   // must be published there on every return path (success and catch).
   const publishEvidenceControlCertificate = (budgetExhausted = false): void => {
+    // Derive crawl-wide context flags from each request's latest attempt so a
+    // successful retry replaces a stale capped/base-href observation instead
+    // of inheriting it from a failed attempt.
+    baseHrefPresent = [...pageControlTotalsByRequest.values()].some(entry => entry.baseHrefPresent === true);
+    scrollCapReachedStillGrowing = [...pageScrollCapByRequest.values()].some(Boolean);
     telemetry.evidenceControlsTotal = evidenceControlsSeen || undefined;
     telemetry.evidenceControlsClicked = evidenceControlsClicked || undefined;
     telemetry.evidenceControlsFailed = evidenceControlsFailed || undefined;
@@ -2354,6 +2383,12 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // Page evidence counts only after the required extraction actually
             // succeeds: a throw here leaves zero processed evidence (finding:
             // failed extraction must never claim a page).
+            // Capture the URL that this request is about to inspect before
+            // `inspect()` can yield to a navigation. The identity captured
+            // with the baseline counts is the primary guard; this URL is the
+            // conservative fallback when no identity is available, so it must
+            // describe the document the request started from.
+            const pageDocumentUrl = page.url();
             await inspect();
             inspectedPages++;
             telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'PAGE_PROCESSED');
@@ -2366,7 +2401,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             let pageFrameCount = 0;
             let pageShadowRootCount = 0;
             let pageBaseHrefPresent = false;
-            const pageDocumentUrl = page.url();
+            let pageScrollCapThisAttempt = false;
             // Capture the inspected document's identity and its context counts
             // in one evaluation before any counter sample. The identity is
             // what tells a same-document `pushState`/`replaceState` (identity
@@ -2403,7 +2438,24 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 // A same-document pushState path/query change and a same-URL
                 // reload both belong to this inspection. Only a new document
                 // at a different URL is another request's context.
-                if (!sameDocument && !sameUrl) return;
+                if (!sameDocument && !sameUrl) {
+                  // A click can commit a document that is never enqueued (for
+                  // example a hint-matched control whose destination is
+                  // hint-free). Its frames, shadow roots, and base href were
+                  // inspected but would otherwise never be sampled. Count them
+                  // here only when the destination will not be sampled by its
+                  // own request and was not already inspected.
+                  if (shouldSampleClickDestinationContext({
+                    destinationKey: normalizeVisitUrl(page.url()),
+                    admittedKeys: admittedEnqueueKeys,
+                    visitedKeys: alreadyVisitedSet,
+                  })) {
+                    pageFrameCount = Math.max(pageFrameCount, Math.max(0, Math.floor(pageContext.frameCount) || 0));
+                    pageShadowRootCount = Math.max(pageShadowRootCount, Math.max(0, Math.floor(pageContext.shadowRootCount) || 0));
+                    pageBaseHrefPresent = pageBaseHrefPresent || pageContext.baseHrefPresent === true;
+                  }
+                  return;
+                }
                 pageFrameCount = Math.max(pageFrameCount, Math.max(0, Math.floor(pageContext.frameCount) || 0));
                 pageShadowRootCount = Math.max(pageShadowRootCount, Math.max(0, Math.floor(pageContext.shadowRootCount) || 0));
                 pageBaseHrefPresent = pageBaseHrefPresent || pageContext.baseHrefPresent === true;
@@ -2523,6 +2575,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                   baseHrefPresent: previous.baseHrefPresent || pageBaseHrefPresent,
                 };
                 pageControlTotalsByRequest.set(requestKey, merged);
+                pageScrollCapByRequest.set(
+                  requestKey,
+                  (pageScrollCapByRequest.get(requestKey) ?? false) || pageScrollCapThisAttempt,
+                );
                 const contextDelta = renderedRequestControlTotalsDelta(previous, merged);
                 frameCount += contextDelta.frameCount;
                 shadowRootCount += contextDelta.shadowRootCount;
@@ -2545,6 +2601,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 baseHrefPresent: pageBaseHrefPresent,
               };
               pageControlTotalsByRequest.set(requestKey, current);
+              pageScrollCapByRequest.set(requestKey, pageScrollCapThisAttempt);
               const delta = renderedRequestControlTotalsDelta(previous, current);
               controlsEnumeratedTotal += delta.enumerated;
               controlsHintRejected += delta.hintRejected;
@@ -2569,7 +2626,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               // iteration: the scroll cap, not page stability, ended
               // inspection. P0.2 records the fact; P1.7 decides whether the
               // unexamined remainder makes the run partial.
-              if (i === limits.maxScrollsPerPage - 1) scrollCapReachedStillGrowing = true;
+              if (i === limits.maxScrollsPerPage - 1) pageScrollCapThisAttempt = true;
             }
             // Scrolling can reveal lazy iframes or shadow hosts.
             await recordPageContext();
@@ -2630,7 +2687,11 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 drops.count('admission-rejected');
                 return false;
               }
-              if (shouldEnqueueRenderedCommunityLink(url)) return true;
+              if (shouldEnqueueRenderedCommunityLink(url)) {
+                const admittedKey = normalizeVisitUrl(url);
+                if (admittedKey) admittedEnqueueKeys.add(admittedKey);
+                return true;
+              }
               drops.count('hint-rejected');
               return false;
             };

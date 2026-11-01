@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { combineRenderedControlOffsetAdvances, isNavigableOnlyControlWindow, mergeRenderedCoverageGapCounters, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, renderedRequestControlTotalsDelta, resolveRenderedCompletionState, resolveUnexaminedPopupTargets, runRenderedClickLoop, trackRenderedPopupCoverage, type RenderedControlEnumeration, type RenderedRequestControlTotals } from './browserCommunityFallback';
+import { combineRenderedControlOffsetAdvances, isNavigableOnlyControlWindow, mergeRenderedCoverageGapCounters, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, renderedRequestControlTotalsDelta, resolveRenderedCompletionState, resolveUnexaminedPopupTargets, runRenderedClickLoop, shouldSampleClickDestinationContext, trackRenderedPopupCoverage, type RenderedControlEnumeration, type RenderedRequestControlTotals } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -450,7 +450,11 @@ test('rendered control coverage counts overflow and uses stable markers across D
   assert.match(source, /telemetry\.evidenceControlsUncertified = \(evidenceControlsUncertified \|\| uncertifiedRequestKeys\.size > 0\) \|\| undefined/);
   assert.match(source, /clickLoop\.firstFailedTargetIndex/, 'the crawl stops rotation at the first failed control');
   assert.match(source, /if \(pageClickWindowPending\) evidenceControlsUncertified = true/, 'a throw during a clickable page leaves the seed uncertified');
-  assert.match(source, /scrollCapReachedStillGrowing = true/, 'the scroll cap records when the page was still growing');
+  assert.match(source, /if \(i === limits\.maxScrollsPerPage - 1\) pageScrollCapThisAttempt = true/, 'the scroll cap records when the page was still growing');
+  assert.match(source, /pageScrollCapByRequest\.set\(requestKey, pageScrollCapThisAttempt\)/, 'scroll-cap growth is stored per request attempt');
+  assert.match(source, /scrollCapReachedStillGrowing = \[\.\.\.pageScrollCapByRequest\.values\(\)\]\.some\(Boolean\)/, 'a successful retry replaces the stale scroll-cap flag');
+  assert.match(source, /baseHrefPresent = \[\.\.\.pageControlTotalsByRequest\.values\(\)\]\.some\(entry => entry\.baseHrefPresent === true\)/, 'base-href presence reflects the latest attempt per request');
+  assert.match(source, /shouldSampleClickDestinationContext\(\{[\s\S]{0,220}?admittedKeys: admittedEnqueueKeys,[\s\S]{0,120}?visitedKeys: alreadyVisitedSet,/, 'a clicked destination that is never enqueued still contributes its context');
   assert.match(source, /page\.evaluate\(collectRenderedPageContext\)/, 'frame/shadow/base-href context is collected per page');
   assert.match(source, /telemetry\.coverageReason = resolveRenderedCoverageReason\(/, 'the crawl publishes a diagnostic coverage reason');
   assert.match(source, /telemetry\.controlsEnumeratedTotal = controlsEnumeratedTotal \|\| undefined/, 'pre-filter control totals are persisted');
@@ -479,8 +483,8 @@ test('P0.2 coverage counters stay coherent, bounded, and preserved on error path
   assert.match(source, /const capMs = Math\.max\(0, Math\.min\(250, remainingMs\)\);/, 'probe flushing has a short cap bounded by the remaining crawl budget');
   assert.match(source, /contextMeasurementAbandoned = true;/, 'abandoned context sampling is recorded at crawl level');
   assert.match(source, /contextUnknown: contextMeasurementAbandoned/, 'abandoned context sampling prevents a COMPLETE coverage reason');
-  assert.match(source, /const sameDocument = pageDocumentIdentity !== null && currentIdentity !== null[\s\S]{0,260}?currentIdentity === pageDocumentIdentity[\s\S]{0,500}?if \(!sameDocument && !sameUrl\) return;/, 'the identity comparison gates the guard that permits counter updates');
-  assert.match(source, /if \(!sameDocument && !sameUrl\) return;/, 'a same-URL reload still records revealed contexts');
+  assert.match(source, /const sameDocument = pageDocumentIdentity !== null && currentIdentity !== null[\s\S]{0,260}?currentIdentity === pageDocumentIdentity/, 'the identity comparison gates the guard that permits counter updates');
+  assert.match(source, /if \(!sameDocument && !sameUrl\) \{[\s\S]{0,1200}?shouldSampleClickDestinationContext\([\s\S]{0,1600}?return;/, 'a click-reached destination contributes context but never leaks another document into the request counters');
   assert.match(source, /pagePopupMarkers = trackRenderedPopupCoverage\(pagePopupMarkers, enumeration\)/, 'popup identities are tracked across every enumeration');
   assert.match(source, /popupCount: resolveUnexaminedPopupTargets\(pagePopupMarkers, examinedPopupMarkers\)/, 'only popups actually examined are excluded; a replacement cannot be cancelled by an earlier click');
   assert.match(source, /popupTargets \+= delta\.popupCount/, 'the same-request retry delta adjusts the popup contribution');
@@ -577,6 +581,43 @@ test('label recovery stays bounded before allocating id lists or subtree text', 
   assert.match(source, /labelledByText\.length < 200/, 'collection stops at 200 characters');
   assert.match(source, /labelledByText \+= pendingSeparator \+ \(text\.length > remaining \? text\.slice\(0, remaining\) : text\)/, 'adjacent text nodes concatenate without splitting a word');
   assert.match(source, /let pendingSeparator = labelledByText\.length > 0 \? ' ' : '';/, 'a separator is added once per referenced label');
+});
+
+test('a clicked destination contributes context only when no request will sample it', () => {
+  const admitted = new Set(['https://creator.example/community']);
+  const visited = new Set(['https://creator.example/']);
+  assert.equal(
+    shouldSampleClickDestinationContext({
+      destinationKey: 'https://creator.example/landing',
+      admittedKeys: admitted,
+      visitedKeys: visited,
+    }),
+    true,
+    'a hint-free click destination is never enqueued, so its context must be counted here',
+  );
+  assert.equal(
+    shouldSampleClickDestinationContext({
+      destinationKey: 'https://creator.example/community',
+      admittedKeys: admitted,
+      visitedKeys: visited,
+    }),
+    false,
+    'an admitted destination is sampled by its own request',
+  );
+  assert.equal(
+    shouldSampleClickDestinationContext({
+      destinationKey: 'https://creator.example/',
+      admittedKeys: admitted,
+      visitedKeys: visited,
+    }),
+    false,
+    'an already-inspected destination was counted by the earlier request',
+  );
+  assert.equal(
+    shouldSampleClickDestinationContext({ destinationKey: null, admittedKeys: admitted, visitedKeys: visited }),
+    false,
+    'an unparsable destination cannot be attributed',
+  );
 });
 
 test('a retried request clears its own uncertified click window', () => {

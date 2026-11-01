@@ -69,9 +69,11 @@ Existing fields keep their semantics:
 5. `COMPLETE` otherwise.
 
 `hint-rejected` and `control-slice` are measured in
-`navigationPolicyExcluded` but are not policy exclusions for this reason:
-`hint-rejected` is already represented by `controlsHintRejected`, and
-`control-slice` already forces the interaction gap. A stronger reason wins over
+`navigationPolicyExcluded` but are not policy exclusions for this reason.
+`hint-rejected` is an intended filter decision: a link that does not match the
+community surface is not unexamined navigation, and `controlsHintRejected` is a
+separate click-control count, not a substitute for it. `control-slice` already
+forces the interaction gap. A stronger reason wins over
 a weaker one (for example, a timeout is `BOUNDED` even when frames are present).
 
 The reason is diagnostic in P0.2. It does not change `complete`, `retryable`,
