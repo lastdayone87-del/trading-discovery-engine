@@ -71,6 +71,106 @@ export function isCeilingKind(value: unknown): value is CeilingKind {
   return typeof value === 'string' && (CEILING_KINDS as readonly string[]).includes(value);
 }
 
+/**
+ * Closed taxonomy for navigation exclusions recorded alongside rendered
+ * telemetry. These are counts only, never URLs/selectors/text. The first four
+ * are policy exclusions that can hide an unexamined destination; the last two
+ * are click/selection exclusions already represented by the interaction
+ * certificate and are retained here so the persisted record is self-contained.
+ */
+export const NAVIGATION_POLICY_EXCLUSION_REASONS = [
+  'invalid-protocol',
+  'admission-rejected',
+  'cross-origin-disallowed',
+  'destination-budget',
+  'control-slice',
+  'hint-rejected',
+] as const;
+export type NavigationPolicyExclusionReason = typeof NAVIGATION_POLICY_EXCLUSION_REASONS[number];
+export function isNavigationPolicyExclusionReason(value: unknown): value is NavigationPolicyExclusionReason {
+  return typeof value === 'string' && (NAVIGATION_POLICY_EXCLUSION_REASONS as readonly string[]).includes(value);
+}
+
+/** Bounded, taxonomy-checked navigation-exclusion counters. */
+export function sanitizeNavigationPolicyExcluded(
+  input: unknown,
+): Partial<Record<NavigationPolicyExclusionReason, number>> {
+  const excluded: Partial<Record<NavigationPolicyExclusionReason, number>> = {};
+  if (input && typeof input === 'object') {
+    for (const [key, value] of Object.entries(input)) {
+      if (isNavigationPolicyExclusionReason(key) && typeof value === 'number' && Number.isFinite(value) && value > 0) {
+        excluded[key] = Math.min(999999, Math.floor(value));
+      }
+    }
+  }
+  return excluded;
+}
+
+/**
+ * Diagnostic coverage certificate for rendered rows. It is deliberately
+ * separate from outcome/retry semantics: P0.2 measures, P1.7 decides when a
+ * bounded/policy/context reason must become PARTIALLY_INSPECTED.
+ */
+export const RENDERED_COVERAGE_REASONS = [
+  'COMPLETE',
+  'BOUNDED',
+  'POLICY_EXCLUDED',
+  'CONTEXT_UNREACHABLE',
+  'UNKNOWN',
+] as const;
+export type RenderedCoverageReason = typeof RENDERED_COVERAGE_REASONS[number];
+export function isRenderedCoverageReason(value: unknown): value is RenderedCoverageReason {
+  return typeof value === 'string' && (RENDERED_COVERAGE_REASONS as readonly string[]).includes(value);
+}
+
+export interface RenderedCoverageInput {
+  pagesInspected: number;
+  budgetExhausted?: boolean;
+  interactionGap?: boolean;
+  scrollCapReachedStillGrowing?: boolean;
+  /** Context sampling was abandoned for at least one page (no trustworthy
+   * document identity), so unreached frames/shadow roots cannot be ruled out. */
+  contextUnknown?: boolean;
+  structuralHintRejected?: number;
+  iconLabelRecovered?: number;
+  unresolvedFailedRequests?: number;
+  frameCount?: number;
+  shadowRootCount?: number;
+  popupTargets?: number;
+  navigationPolicyExcluded?: Partial<Record<NavigationPolicyExclusionReason, number>>;
+}
+
+/**
+ * Precedence is intentional: a named ceiling or an unexamined interaction is
+ * a stronger statement than a policy/context exclusion, and zero processed
+ * pages is always UNKNOWN rather than COMPLETE.
+ */
+export function resolveRenderedCoverageReason(input: RenderedCoverageInput): RenderedCoverageReason {
+  if (!(Number(input.pagesInspected) > 0)) return 'UNKNOWN';
+  const count = (value: unknown): number =>
+    typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+  if (input.budgetExhausted === true
+    || input.interactionGap === true
+    || input.scrollCapReachedStillGrowing === true
+    || input.contextUnknown === true
+    || count(input.structuralHintRejected) > 0
+    || count(input.iconLabelRecovered) > 0
+    || count(input.unresolvedFailedRequests) > 0) {
+    return 'BOUNDED';
+  }
+  if (count(input.frameCount) > 0 || count(input.shadowRootCount) > 0 || count(input.popupTargets) > 0) {
+    return 'CONTEXT_UNREACHABLE';
+  }
+  const excluded = input.navigationPolicyExcluded || {};
+  if (count(excluded['invalid-protocol']) > 0
+    || count(excluded['admission-rejected']) > 0
+    || count(excluded['cross-origin-disallowed']) > 0
+    || count(excluded['destination-budget']) > 0) {
+    return 'POLICY_EXCLUDED';
+  }
+  return 'COMPLETE';
+}
+
 /** Shared taxonomy/bound enforcement for drop counters, used both when
  * telemetry objects are constructed and when ledger rows are persisted, so
  * direct in-process consumers never receive invalid reason keys or
@@ -263,6 +363,48 @@ export interface CrawlerTelemetry {
    */
   evidenceControlsOffsetAdvance?: number;
   /**
+   * P0.2 navigation-coverage counters (rendered-only, counts only). The
+   * pre-filter denominator answers how many controls existed before the
+   * community-hint filter; `HintRejected` is the difference. Structural
+   * navigation counts menu/nav/hamburger/aria-haspopup controls that the
+   * hint filter would otherwise hide. Icon-label recovery counts controls
+   * whose only useful label is title/aria-labelledby/child-alt/data-label.
+   * Popup targets counts target=_blank/aria-haspopup=dialog controls. None of
+   * these fields contain selectors, text, or URLs.
+   */
+  controlsEnumeratedTotal?: number;
+  controlsHintRejected?: number;
+  controlsStructuralNavigation?: number;
+  controlsStructuralHintRejected?: number;
+  controlsIconLabelRecovered?: number;
+  popupTargets?: number;
+  /**
+   * Context counters observed on processed pages. `frameCount` covers
+   * iframe/frame/object/embed elements; `shadowRootCount` covers open shadow
+   * roots; `baseHrefPresent` records a document <base href>. These are
+   * diagnostics for P1.3/P1.4/P1.5, not traversal claims.
+   */
+  frameCount?: number;
+  shadowRootCount?: number;
+  baseHrefPresent?: boolean;
+  /**
+   * True when the last permitted scroll iteration still found a growing
+   * document. Distinguishes "page stopped growing" from "cap hit while
+   * content was still arriving" for P1.7 truthfulness.
+   */
+  scrollCapReachedStillGrowing?: boolean;
+  /**
+   * Explicit policy-exclusion counters. `dropReasons` remains the canonical
+   * enqueue/selection ledger; this field makes the navigation-relevant subset
+   * available to coverage consumers without re-parsing drop keys.
+   */
+  navigationPolicyExcluded?: Partial<Record<NavigationPolicyExclusionReason, number>>;
+  /**
+   * Diagnostic coverage reason (see resolveRenderedCoverageReason). P0.2 only
+   * records it; P1.7 decides when it changes the acquisition outcome.
+   */
+  coverageReason?: RenderedCoverageReason;
+  /**
    * Compact per-crawl drop/stop counters keyed by CRAWL_DROP_REASONS
    * (ints only, taxonomy-bounded to 13 keys — never URLs or payloads).
    * Tells future investigations where candidate URLs were lost. Sparse:
@@ -412,8 +554,17 @@ export function renderedCrawlerTelemetry(input: {
     ?? (input.timedOut ? 'total-timeout' as const : undefined);
   // A spread-carried ceiling/budget flag could only ever be stale (inner
   // telemetry never owns the ceiling decision), so both are stripped before
-  // the derived values below are set.
-  const { ceiling: _staleCeiling, budgetExhausted: _staleExhausted, ...restTelemetry } = (input.telemetry || {}) as Partial<CrawlerTelemetry>;
+  // the derived values below are set. Coverage fields are stripped as well:
+  // adding them back only after a taxonomy check must never leave an invalid
+  // spread-carried value in the returned object (direct readers do not go
+  // through the persistence sanitizer).
+  const {
+    ceiling: _staleCeiling,
+    budgetExhausted: _staleExhausted,
+    navigationPolicyExcluded: staleNavigationPolicyExcluded,
+    coverageReason: staleCoverageReason,
+    ...restTelemetry
+  } = (input.telemetry || {}) as Partial<CrawlerTelemetry>;
   void _staleCeiling;
   void _staleExhausted;
   return {
@@ -429,6 +580,10 @@ export function renderedCrawlerTelemetry(input: {
     mode: 'RENDERED',
     ...(Object.keys(sanitizeDropReasons(input.dropReasons)).length ? { dropReasons: sanitizeDropReasons(input.dropReasons) } : {}),
     ...(sanitizeScrollsUsed(input.scrollsUsed) > 0 ? { scrollsUsed: sanitizeScrollsUsed(input.scrollsUsed) } : {}),
+    ...(Object.keys(sanitizeNavigationPolicyExcluded(staleNavigationPolicyExcluded)).length
+      ? { navigationPolicyExcluded: sanitizeNavigationPolicyExcluded(staleNavigationPolicyExcluded) }
+      : {}),
+    ...(isRenderedCoverageReason(staleCoverageReason) ? { coverageReason: staleCoverageReason } : {}),
     ...(sanitizeExperimentAttribution(input.experimentAttribution) ? { experimentAttribution: sanitizeExperimentAttribution(input.experimentAttribution)! } : {}),
   };
 }
@@ -610,6 +765,42 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.evidenceControlsOffsetAdvance) > 0
       ? { evidenceControlsOffsetAdvance: Math.min(MAX_EVIDENCE_CONTROL_OFFSET, boundedCount(candidate.evidenceControlsOffsetAdvance)) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.controlsEnumeratedTotal) > 0
+      ? { controlsEnumeratedTotal: boundedCount(candidate.controlsEnumeratedTotal) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.controlsHintRejected) > 0
+      ? { controlsHintRejected: boundedCount(candidate.controlsHintRejected) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.controlsStructuralNavigation) > 0
+      ? { controlsStructuralNavigation: boundedCount(candidate.controlsStructuralNavigation) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.controlsStructuralHintRejected) > 0
+      ? { controlsStructuralHintRejected: boundedCount(candidate.controlsStructuralHintRejected) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.controlsIconLabelRecovered) > 0
+      ? { controlsIconLabelRecovered: boundedCount(candidate.controlsIconLabelRecovered) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.popupTargets) > 0
+      ? { popupTargets: boundedCount(candidate.popupTargets) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.frameCount) > 0
+      ? { frameCount: boundedCount(candidate.frameCount) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.shadowRootCount) > 0
+      ? { shadowRootCount: boundedCount(candidate.shadowRootCount) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && candidate.baseHrefPresent === true
+      ? { baseHrefPresent: true }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && candidate.scrollCapReachedStillGrowing === true
+      ? { scrollCapReachedStillGrowing: true }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && Object.keys(sanitizeNavigationPolicyExcluded(candidate.navigationPolicyExcluded)).length
+      ? { navigationPolicyExcluded: sanitizeNavigationPolicyExcluded(candidate.navigationPolicyExcluded) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && isRenderedCoverageReason(candidate.coverageReason)
+      ? { coverageReason: candidate.coverageReason }
       : {}),
     ...(isRenderedLifecycleStage(stage) ? { lastLifecycleStage: stage } : {}),
     ...(isRenderedZeroPageReason(reason) ? { zeroPageReason: reason } : {}),

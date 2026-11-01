@@ -4,8 +4,20 @@ import { assessPublicDestination, type DnsResolver } from './publicDestination';
 import { candidateFromNativeInvite, extractDiscordCandidates, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
 import { browserLaunchOptions, classifyBrowserFailure, isBrowserRuntimeFailure, markBrowserCapabilityReady, markBrowserCapabilityUnavailable, withBrowserRuntimeLease, type BrowserFailureClass } from './browserCapability';
 import { startBrowserEgressProxy, type BrowserEgressProxy } from './browserEgressProxy';
-import type { RenderedLifecycleStage, RenderedZeroPageReason, CrawlDropReason } from './crawlerTelemetry';
-import { redactCauseSnippet, createDropCounter } from './crawlerTelemetry';
+import type {
+  RenderedLifecycleStage,
+  RenderedZeroPageReason,
+  CrawlDropReason,
+  NavigationPolicyExclusionReason,
+  RenderedCoverageReason,
+} from './crawlerTelemetry';
+import {
+  redactCauseSnippet,
+  createDropCounter,
+  resolveRenderedCoverageReason,
+  sanitizeNavigationPolicyExcluded,
+  NAVIGATION_POLICY_EXCLUSION_REASONS,
+} from './crawlerTelemetry';
 import { normalizeVisitUrl } from './visitUrl';
 import {
   DEFAULT_RENDERED_MAX_REQUEST_RETRIES,
@@ -89,6 +101,23 @@ export interface BrowserFallbackTelemetry {
    * smaller pool is never rotated past controls it did not examine. Sparse;
    * absent on pre-instrumentation rows. */
   evidenceControlsOffsetAdvance?: number;
+  /**
+   * P0.2 navigation-coverage counters (counts only, no selectors/text/URLs).
+   * `controlsEnumeratedTotal` is the pre-filter denominator; the difference
+   * from the evidence-bearing matched set is `controlsHintRejected`.
+   */
+  controlsEnumeratedTotal?: number;
+  controlsHintRejected?: number;
+  controlsStructuralNavigation?: number;
+  controlsStructuralHintRejected?: number;
+  controlsIconLabelRecovered?: number;
+  popupTargets?: number;
+  frameCount?: number;
+  shadowRootCount?: number;
+  baseHrefPresent?: boolean;
+  scrollCapReachedStillGrowing?: boolean;
+  navigationPolicyExcluded?: Partial<Record<NavigationPolicyExclusionReason, number>>;
+  coverageReason?: RenderedCoverageReason;
   clickFailureClasses: Record<RenderedCrawlerFailureClass, number>;
   /**
    * Additive per-click failure taxonomy (fixed 7 keys; see
@@ -284,6 +313,38 @@ export function visitIdentityKeys(requestUrl: string, finalUrl: string): string[
     if (fallback && !keys.includes(fallback)) keys.push(fallback);
   }
   return keys;
+}
+
+/** Context observed on a document reached only by a click. */
+export interface ClickDestinationContext {
+  frameCount: number;
+  shadowRootCount: number;
+  baseHrefPresent: boolean;
+}
+
+/**
+ * Context seen through a click that committed a new document is attributed
+ * only when no request inspected that document as its own page. Admission is
+ * deliberately not consulted: `enqueueLinks` can accept a URL that Crawlee
+ * then never inspects (max-requests cutoff, later failure), and inspection is
+ * the only proof that the destination's context was actually counted
+ * elsewhere. A destination can also be clicked before the link pass admits it,
+ * so adding its context at click time would double the crawl totals when its
+ * own request runs. Observations are keyed by visit identity and reconciled
+ * against every document this crawl actually inspected. Pure and unit-tested.
+ */
+export function reconcileClickDestinationContext(input: {
+  observations: ReadonlyMap<string, ClickDestinationContext>;
+  inspectedKeys: ReadonlySet<string>;
+}): ClickDestinationContext {
+  const reconciled: ClickDestinationContext = { frameCount: 0, shadowRootCount: 0, baseHrefPresent: false };
+  for (const [key, observed] of input.observations) {
+    if (input.inspectedKeys.has(key)) continue;
+    reconciled.frameCount += observed.frameCount;
+    reconciled.shadowRootCount += observed.shadowRootCount;
+    reconciled.baseHrefPresent = reconciled.baseHrefPresent || observed.baseHrefPresent;
+  }
+  return reconciled;
 }
 
 /**
@@ -556,6 +617,124 @@ export interface RenderedControlTarget {
    * Never a selector or payload.
    */
   tag?: 'anchor' | 'button' | 'role';
+  /**
+   * True when this matched control is a popup/disclosure that requires
+   * capture rather than navigation. Lets the caller exclude successfully
+   * examined popups from the unexamined-context count. Never serialized.
+   */
+  popup?: boolean;
+}
+
+export interface RenderedControlEnumeration {
+  /** Evidence-bearing controls (the existing community-hint matched set). */
+  controls: RenderedControlTarget[];
+  /** Pre-filter denominator: every node matched by the shared selector. */
+  total: number;
+  /** Nodes excluded by the community-hint filter (total - controls). */
+  hintRejected: number;
+  /** Menu/nav/hamburger/aria-haspopup/role=menuitem controls, matched or not. */
+  structuralNavigation: number;
+  /** Structural controls the hint filter would hide (P1.1 measurement). */
+  structuralHintRejected: number;
+  /** Controls recoverable only via title/aria-labelledby/alt/data-label (P1.2). */
+  iconLabelRecovered: number;
+  /**
+   * Popup/dialog controls that require capture rather than navigation
+   * (P1.3 measurement). A `target=_blank` anchor with a real href is already
+   * reachable by enqueueing that href and is not counted here; only
+   * `aria-haspopup=dialog|menu` and href-less `_blank` controls are.
+   */
+  popupTargets: number;
+  /**
+   * Stable markers for every popup control, including hint-rejected popups
+   * that are absent from `controls`. Identity tracking uses these markers so
+   * a replacement popup cannot be cancelled by an earlier popup's click.
+   */
+  popupMarkers: string[];
+}
+
+/**
+ * Coverage-gap observations are monotonic across re-enumerations. A later
+ * snapshot can be smaller (a clicked community button is replaced by a menu
+ * trigger) yet reveal a structural/icon control the first snapshot did not
+ * contain. Max each gap counter independently of the denominator snapshot, so
+ * a new gap can never be discarded for being in a smaller control set.
+ */
+export function mergeRenderedCoverageGapCounters(
+  prior: Pick<RenderedControlEnumeration, 'structuralNavigation' | 'structuralHintRejected' | 'iconLabelRecovered'>,
+  next: Pick<RenderedControlEnumeration, 'structuralNavigation' | 'structuralHintRejected' | 'iconLabelRecovered'>,
+): Pick<RenderedControlEnumeration, 'structuralNavigation' | 'structuralHintRejected' | 'iconLabelRecovered'> {
+  return {
+    structuralNavigation: Math.max(prior.structuralNavigation, next.structuralNavigation),
+    structuralHintRejected: Math.max(prior.structuralHintRejected, next.structuralHintRejected),
+    iconLabelRecovered: Math.max(prior.iconLabelRecovered, next.iconLabelRecovered),
+  };
+}
+
+export interface RenderedRequestControlTotals {
+  enumerated: number;
+  hintRejected: number;
+  structuralNavigation: number;
+  structuralHintRejected: number;
+  iconLabelRecovered: number;
+  popupCount: number;
+  frameCount: number;
+  shadowRootCount: number;
+  baseHrefPresent: boolean;
+}
+
+/**
+ * Difference between two attempts of the same request. Crawlee retries a
+ * thrown request with fresh page-local counters, so the crawl totals must add
+ * only the delta from the latest attempt instead of the whole attempt again.
+ */
+export function renderedRequestControlTotalsDelta(
+  previous: RenderedRequestControlTotals | undefined,
+  current: RenderedRequestControlTotals,
+): Omit<RenderedRequestControlTotals, 'baseHrefPresent'> {
+  return {
+    enumerated: current.enumerated - (previous?.enumerated || 0),
+    hintRejected: current.hintRejected - (previous?.hintRejected || 0),
+    structuralNavigation: current.structuralNavigation - (previous?.structuralNavigation || 0),
+    structuralHintRejected: current.structuralHintRejected - (previous?.structuralHintRejected || 0),
+    iconLabelRecovered: current.iconLabelRecovered - (previous?.iconLabelRecovered || 0),
+    popupCount: current.popupCount - (previous?.popupCount || 0),
+    frameCount: current.frameCount - (previous?.frameCount || 0),
+    shadowRootCount: current.shadowRootCount - (previous?.shadowRootCount || 0),
+  };
+}
+
+/**
+ * Popup coverage is identity-based, not count-based. A popup that is clicked
+ * inline has been examined; a popup that opened a new window has not. Tracking
+ * the stable marker of every observed popup, including hint-rejected ones,
+ * means a replacement cannot be cancelled out by an earlier popup's click, and
+ * re-observing the same popup during scrolling does not inflate the count.
+ */
+export function trackRenderedPopupCoverage(
+  prior: ReadonlySet<string>,
+  enumeration: Pick<RenderedControlEnumeration, 'popupMarkers'>,
+): Set<string> {
+  const observedMarkers = new Set(prior);
+  for (const marker of enumeration.popupMarkers) observedMarkers.add(marker);
+  return observedMarkers;
+}
+
+/**
+ * Popups observed by an enumeration but never examined by the click loop.
+ * Only a successfully clicked inline disclosure removes a marker; a popup
+ * that opened a new window remains unexamined, and hint-rejected popups are
+ * always unexamined because they are never clicked.
+ */
+export function resolveUnexaminedPopupTargets(
+  observedMarkers: ReadonlySet<string>,
+  examinedMarkers: ReadonlySet<string>,
+): number {
+  let unexamined = 0;
+  for (const marker of observedMarkers) {
+    if (!examinedMarkers.has(marker)) unexamined++;
+  }
+  return unexamined;
 }
 
 /**
@@ -564,13 +743,24 @@ export interface RenderedControlTarget {
  * page, so it may only reference its arguments and browser globals. It returns
  * the complete matched set (never a prefix slice) so the caller can rotate the
  * full pool by the durable retry offset before applying the evaluation window.
+ *
+ * P0.2 is measurement-only: `controls` still uses the original innerText +
+ * href + aria-label match, so behavior is unchanged. Structural/icon-label
+ * counts tell us what P1.1/P1.2 would recover without enabling them yet.
  */
 export function enumerateRenderedControlNodes(
   nodes: Element[],
   pattern: string,
-): { controls: RenderedControlTarget[]; total: number } {
+): RenderedControlEnumeration {
   const re = new RegExp(pattern, 'i');
-  const matched = nodes.map((node, index) => {
+  const matched: RenderedControlTarget[] = [];
+  let structuralNavigation = 0;
+  let structuralHintRejected = 0;
+  let iconLabelRecovered = 0;
+  let popupTargets = 0;
+  const popupIndices: number[] = [];
+  for (let index = 0; index < nodes.length; index++) {
+    const node = nodes[index];
     const element = node as HTMLElement;
     const tagName = (element.tagName || '').toLowerCase();
     // HTMLAnchorElement.href is a string; SVGElement.href is an
@@ -598,15 +788,129 @@ export function enumerateRenderedControlNodes(
         }
       }
     }
-    return {
+    const ariaLabel = element.getAttribute('aria-label') || '';
+    const baseText = `${element.innerText || ''} ${href || ''} ${ariaLabel}`;
+    // P1.2 measurement: resolve the labels that the original filter ignores.
+    let labelledByText = '';
+    const labelledBy = element.getAttribute('aria-labelledby') || '';
+    if (labelledBy) {
+      // Bounded label recovery: a hostile page can name thousands of
+      // references or point at a huge element. Extract at most 16 id tokens
+      // without splitting the whole attribute, then walk at most 512 text
+      // nodes while collecting at most 200 characters, so neither the id list
+      // nor a referenced subtree is materialized in full.
+      let scanIndex = 0;
+      let idCount = 0;
+      let visitedLabelNodes = 0;
+      while (scanIndex < labelledBy.length && idCount < 16) {
+        while (scanIndex < labelledBy.length && /\s/.test(labelledBy.charAt(scanIndex))) scanIndex++;
+        const idStart = scanIndex;
+        while (scanIndex < labelledBy.length && !/\s/.test(labelledBy.charAt(scanIndex))) scanIndex++;
+        if (scanIndex === idStart) break;
+        idCount++;
+        if (labelledByText.length >= 200) continue;
+        const labelNode = document.getElementById(labelledBy.slice(idStart, scanIndex));
+        if (!labelNode) continue;
+        const walker = document.createTreeWalker(labelNode, NodeFilter.SHOW_TEXT);
+        // Join text nodes inside one referenced element exactly as
+        // textContent did; an injected per-node separator would split a word
+        // such as `Dis<strong>cord</strong>`. A separator is added once per
+        // referenced label so two short labels do not merge into one word.
+        let pendingSeparator = labelledByText.length > 0 ? ' ' : '';
+        while (visitedLabelNodes < 512 && labelledByText.length < 200) {
+          const textNode = walker.nextNode();
+          if (!textNode) break;
+          visitedLabelNodes++;
+          const text = textNode.nodeValue || '';
+          const remaining = 200 - labelledByText.length - pendingSeparator.length;
+          if (text && remaining > 0) {
+            labelledByText += pendingSeparator + (text.length > remaining ? text.slice(0, remaining) : text);
+            pendingSeparator = '';
+          }
+        }
+      }
+    }
+    let childAlt = '';
+    const image = element.querySelector('img[alt]');
+    if (image) childAlt = image.getAttribute('alt') || '';
+    const title = element.getAttribute('title') || '';
+    const dataLabel = element.getAttribute('data-label') || '';
+    const extendedText = `${baseText} ${title} ${labelledByText} ${childAlt} ${dataLabel}`;
+    const baseMatched = re.test(baseText);
+    const extendedMatched = re.test(extendedText);
+    const role = (element.getAttribute('role') || '').toLowerCase();
+    const ariaHaspopup = (element.getAttribute('aria-haspopup') || '').trim().toLowerCase();
+    // Only the control's own visible label and aria-label may classify it as
+    // navigation. Including the resolved href made ordinary `/support`,
+    // `/resources`, or `/more` destinations structural; title and
+    // aria-labelledby can describe external content (a section heading, a
+    // tooltip) rather than this control, so they stay in `extendedText` for
+    // icon-label recovery only.
+    const labelText = `${element.innerText || ''} ${ariaLabel}`;
+    // HTTP(S) is the only destination the enqueue path can follow. A
+    // `javascript:` or other scheme is click-only and must not make a
+    // `target=_blank` control look like a normal navigable link.
+    const hasNavigableHref = typeof href === 'string' && /^https?:\/\//i.test(href);
+    // A control inside a real navigation/menu container is navigation even
+    // when its own label is generic (`Products`). The container itself is not
+    // in the click selector, so inspect ancestors on the enumerated control.
+    const inNavigationContainer = !!element.closest(
+      'nav,[role="navigation"],[role="menu"],[role="menubar"]',
+    );
+    // `aria-expanded` on a normal href-bearing link is an attribute of content
+    // navigation, not a disclosure trigger; a href-less link (or a real
+    // button/summary) is an interactive surface whose contents stay hidden.
+    const disclosure = tagName === 'summary'
+      || (element.hasAttribute('aria-expanded') && (tagName !== 'a' || !hasNavigableHref));
+    const target = (element.getAttribute('target') || '').trim().toLowerCase();
+    // Menu-like labels only. Generic footer/company/about links are not
+    // structural navigation and would make nearly every crawl look
+    // policy-bounded. Title/aria-labelledby are included only for this
+    // menu-shaped test: an icon-only "Main menu" button outside a navigation
+    // container is a real coverage gap even though it is not clicked, while
+    // generic title text must not classify ordinary controls.
+    const menuLikeLabel = /\b(menu|navigation|nav|hamburger)\b/i;
+    const structural = tagName === 'nav'
+      || role === 'menu'
+      || role === 'menubar'
+      || role === 'menuitem'
+      || role === 'navigation'
+      || (ariaHaspopup !== '' && ariaHaspopup !== 'false')
+      || disclosure
+      || inNavigationContainer
+      || menuLikeLabel.test(labelText)
+      || menuLikeLabel.test(`${title} ${labelledByText}`);
+    const isPopup = (ariaHaspopup !== '' && ariaHaspopup !== 'false')
+      || (target === '_blank' && !hasNavigableHref);
+    if (structural) {
+      structuralNavigation++;
+      if (!baseMatched) structuralHintRejected++;
+    }
+    if (!baseMatched && extendedMatched) iconLabelRecovered++;
+    // Only popups that cannot be followed as a normal navigation are a
+    // coverage gap. A `target=_blank` anchor with a real href is already
+    // reachable through that href; counting it would mark nearly every
+    // social link as an unexamined popup.
+    if (isPopup) {
+      popupTargets++;
+      // Hint-rejected popups still need a stable identity for coverage
+      // accounting; they are marked below but never enter the click set.
+      popupIndices.push(index);
+    }
+    if (!baseMatched) continue;
+    matched.push({
       index,
-      text: `${element.innerText || ''} ${href || ''} ${element.getAttribute('aria-label') || ''}`,
+      text: baseText,
       href,
       tag: (tagName === 'a' ? 'anchor' : tagName === 'button' ? 'button' : 'role') as 'anchor' | 'button' | 'role',
-    };
-  }).filter(item => re.test(item.text));
+      ...(isPopup ? { popup: true } : {}),
+    });
+  }
   const usedMarkers = new Set<string>();
-  const controls = matched.map(item => {
+  const controls: RenderedControlTarget[] = [];
+  const markerByIndex = new Map<number, string>();
+  for (let itemIndex = 0; itemIndex < matched.length; itemIndex++) {
+    const item = matched[itemIndex];
     const node = nodes[item.index] as HTMLElement;
     const existing = node.getAttribute('data-oc-control');
     let marker = existing || `oc-${Date.now().toString(36)}-${item.index}-${Math.random().toString(36).slice(2, 8)}`;
@@ -620,9 +924,89 @@ export function enumerateRenderedControlNodes(
     }
     usedMarkers.add(marker);
     if (existing !== marker) node.setAttribute('data-oc-control', marker);
-    return { ...item, marker };
-  });
-  return { controls, total: matched.length };
+    markerByIndex.set(item.index, marker);
+    controls.push({ ...item, marker });
+  }
+  const popupMarkers: string[] = [];
+  for (let popupIndex = 0; popupIndex < popupIndices.length; popupIndex++) {
+    const index = popupIndices[popupIndex];
+    const matchedMarker = markerByIndex.get(index);
+    if (matchedMarker) {
+      popupMarkers.push(matchedMarker);
+      continue;
+    }
+    const node = nodes[index] as HTMLElement;
+    const existing = node.getAttribute('data-oc-control');
+    let marker = existing || `oc-popup-${Date.now().toString(36)}-${index}-${Math.random().toString(36).slice(2, 8)}`;
+    let attempt = 0;
+    while (usedMarkers.has(marker)) {
+      attempt += 1;
+      marker = `oc-popup-${Date.now().toString(36)}-${index}-${attempt}-${Math.random().toString(36).slice(2, 8)}`;
+    }
+    usedMarkers.add(marker);
+    if (existing !== marker) node.setAttribute('data-oc-control', marker);
+    popupMarkers.push(marker);
+  }
+  return {
+    controls,
+    total: nodes.length,
+    hintRejected: Math.max(0, nodes.length - controls.length),
+    structuralNavigation,
+    structuralHintRejected,
+    iconLabelRecovered,
+    popupTargets,
+    popupMarkers,
+  };
+}
+
+export interface RenderedPageContextCounts {
+  frameCount: number;
+  shadowRootCount: number;
+  baseHrefPresent: boolean;
+  /** Document identity (`performance.timeOrigin`) used only to tell a
+   * same-document URL update from a real navigation; never persisted. */
+  documentTimeOrigin?: number | null;
+}
+
+/**
+ * Browser-context page counters for P0.2/P1.3-P1.5. Self-contained because
+ * Playwright serializes it into the page. Bounded so a pathological DOM cannot
+ * turn telemetry collection into an unbounded scan.
+ */
+export function collectRenderedPageContext(): RenderedPageContextCounts {
+  // Live HTMLCollections avoid materializing every frame element before the
+  // cap is applied; a pathological document must not tokenize its whole DOM
+  // just to count a bounded handful of embeds.
+  let frameCount = 0;
+  const frameTags = ['iframe', 'frame', 'object', 'embed'];
+  for (let tagIndex = 0; tagIndex < frameTags.length; tagIndex++) {
+    frameCount += document.getElementsByTagName(frameTags[tagIndex]).length;
+    if (frameCount >= 1000) { frameCount = 1000; break; }
+  }
+  let shadowRootCount = 0;
+  // TreeWalker keeps the scan bounded without materializing every element in
+  // a huge document. Only light-DOM hosts are visited; open shadow roots are
+  // counted, not traversed (P1.4 owns traversal).
+  const root = document.body || document.documentElement;
+  if (root) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+    let examined = 0;
+    let node = walker.nextNode();
+    while (node && examined < 2000 && shadowRootCount < 100) {
+      examined++;
+      if ((node as HTMLElement).shadowRoot) shadowRootCount++;
+      node = walker.nextNode();
+    }
+  }
+  const timeOrigin = typeof performance !== 'undefined' && Number.isFinite(performance.timeOrigin)
+    ? performance.timeOrigin
+    : null;
+  return {
+    frameCount,
+    shadowRootCount,
+    baseHrefPresent: !!document.querySelector('base[href]'),
+    documentTimeOrigin: timeOrigin,
+  };
 }
 
 export function isSkippableNavigableAnchorClick(
@@ -831,7 +1215,7 @@ export interface RenderedClickLoopInput {
   maxClicksPerPage: number;
   deadlineExceeded: () => boolean;
   click: (target: RenderedControlTarget) => Promise<boolean>;
-  enumerate: () => Promise<{ controls: RenderedControlTarget[]; total: number }>;
+  enumerate: () => Promise<RenderedControlEnumeration>;
   pageUrl: () => string;
   /** Durable per-seed retry rotation, shared with the initial click plan so a
    * retry does not repeatedly select the same DOM-order subset of controls
@@ -840,7 +1224,7 @@ export interface RenderedClickLoopInput {
   /** Markers already accounted as skipped by the initial plan. Mutated so
    * re-enumerations cannot double-count them. */
   countedSkips?: Set<string>;
-  onEnumerated?: (total: number) => void;
+  onEnumerated?: (enumeration: RenderedControlEnumeration) => void;
 }
 
 export interface RenderedClickLoopResult {
@@ -914,7 +1298,7 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
     if (!input.deadlineExceeded()) {
       try {
         const refreshed = await input.enumerate();
-        input.onEnumerated?.(refreshed.total);
+        input.onEnumerated?.(refreshed);
         const unqueued = refreshed.controls.filter(target => target.marker && !queuedMarkers.has(target.marker));
         const pendingQueuedTargets = Math.max(0, clickTargets.length - clickIndex - 1);
         const freshPlan = planRevealedRenderedClickTargets(
@@ -1710,21 +2094,105 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   let evidenceControlsUncertified = false;
   let evidenceControlsOffsetAdvance = 0;
   let interactionGap = false;
+  // True when a page could not be measured because no trustworthy document
+  // identity was available; the coverage reason must not claim COMPLETE.
+  let contextMeasurementAbandoned = false;
+  // P0.2 navigation-coverage counters. They are measurement-only: nothing in
+  // this crawl reads them back into selection or outcome decisions.
+  let controlsEnumeratedTotal = 0;
+  let controlsHintRejected = 0;
+  let controlsStructuralNavigation = 0;
+  let controlsStructuralHintRejected = 0;
+  let controlsIconLabelRecovered = 0;
+  // Crawlee retries a thrown request with a fresh page and fresh page-local
+  // counters. Keep the last attempt's contribution per request so a retry
+  // replaces it instead of adding the same request to crawl totals twice.
+  const pageControlTotalsByRequest = new Map<string, RenderedRequestControlTotals>();
+  // Scroll-cap growth is an observation of one attempt, not of the request
+  // forever: a successful retry that scrolls to a stable page must clear a
+  // flag left by an earlier capped attempt. The crawl-wide boolean is derived
+  // from the latest attempt per request when telemetry is published.
+  const pageScrollCapByRequest = new Map<string, boolean>();
+  // Context seen through a click that committed a new document, keyed by
+  // destination identity. It is reconciled at publish time against every
+  // document this crawl actually inspected: the link pass runs after the click
+  // loop, so a clicked destination can still be admitted and inspected as its
+  // own request, and counting it here as well would double the crawl totals.
+  const clickDestinationContextByKey = new Map<string, ClickDestinationContext>();
+  const inspectedDocumentKeys = new Set<string>();
+  let popupTargets = 0;
+  let frameCount = 0;
+  let shadowRootCount = 0;
+  let baseHrefPresent = false;
+  let scrollCapReachedStillGrowing = false;
   // True while a page with clickable controls has not yet recorded its
   // progress. A throw in that window must leave the seed uncertified: the
   // catch path otherwise loses the per-page guard and the retry offset moves
   // past controls that were never examined.
   let pageClickWindowPending = false;
+  // Uncertified click windows are tracked per request. Crawlee retries a
+  // thrown attempt with a fresh page, and that retry re-examines the same
+  // request from scratch; clearing its mark on entry keeps a recovered retry
+  // from blocking the offset forever, while another page's unexamined window
+  // still blocks shared progress.
+  const uncertifiedRequestKeys = new Set<string>();
   // nextRenderedClickOffsets reads only outcome.telemetry, so the certificate
   // must be published there on every return path (success and catch).
-  const publishEvidenceControlCertificate = (): void => {
+  const publishEvidenceControlCertificate = (budgetExhausted = false): void => {
+    // Derive crawl-wide context flags from each request's latest attempt so a
+    // successful retry replaces a stale capped/base-href observation instead
+    // of inheriting it from a failed attempt.
+    baseHrefPresent = [...pageControlTotalsByRequest.values()].some(entry => entry.baseHrefPresent === true);
+    scrollCapReachedStillGrowing = [...pageScrollCapByRequest.values()].some(Boolean);
+    // A clicked destination that its own request later inspects is already in
+    // the totals; only the remaining click-only observations are added.
+    const clickDestinationContext = reconcileClickDestinationContext({
+      observations: clickDestinationContextByKey,
+      inspectedKeys: inspectedDocumentKeys,
+    });
     telemetry.evidenceControlsTotal = evidenceControlsSeen || undefined;
     telemetry.evidenceControlsClicked = evidenceControlsClicked || undefined;
     telemetry.evidenceControlsFailed = evidenceControlsFailed || undefined;
     telemetry.evidenceControlsSkipped = evidenceControlsSkipped || undefined;
     telemetry.evidenceControlsNavigableOnly = (evidenceControlsNavigableOnly && !evidenceControlsClickableWindow) || undefined;
-    telemetry.evidenceControlsUncertified = evidenceControlsUncertified || undefined;
+    telemetry.evidenceControlsUncertified = (evidenceControlsUncertified || uncertifiedRequestKeys.size > 0) || undefined;
     telemetry.evidenceControlsOffsetAdvance = evidenceControlsOffsetAdvance || undefined;
+    telemetry.controlsEnumeratedTotal = controlsEnumeratedTotal || undefined;
+    telemetry.controlsHintRejected = controlsHintRejected || undefined;
+    telemetry.controlsStructuralNavigation = controlsStructuralNavigation || undefined;
+    telemetry.controlsStructuralHintRejected = controlsStructuralHintRejected || undefined;
+    telemetry.controlsIconLabelRecovered = controlsIconLabelRecovered || undefined;
+    telemetry.popupTargets = popupTargets || undefined;
+    telemetry.frameCount = (frameCount + clickDestinationContext.frameCount) || undefined;
+    telemetry.shadowRootCount = (shadowRootCount + clickDestinationContext.shadowRootCount) || undefined;
+    telemetry.baseHrefPresent = (baseHrefPresent || clickDestinationContext.baseHrefPresent) || undefined;
+    telemetry.scrollCapReachedStillGrowing = scrollCapReachedStillGrowing || undefined;
+    const dropSnapshot = drops.snapshot();
+    const excluded: Partial<Record<NavigationPolicyExclusionReason, number>> = {};
+    for (const reason of NAVIGATION_POLICY_EXCLUSION_REASONS) {
+      const count = dropSnapshot[reason];
+      if (count && count > 0) excluded[reason] = count;
+    }
+    telemetry.navigationPolicyExcluded = Object.keys(sanitizeNavigationPolicyExcluded(excluded)).length
+      ? sanitizeNavigationPolicyExcluded(excluded)
+      : undefined;
+    telemetry.coverageReason = resolveRenderedCoverageReason({
+      pagesInspected: inspectedPages,
+      budgetExhausted,
+      interactionGap,
+      scrollCapReachedStillGrowing,
+      contextUnknown: contextMeasurementAbandoned,
+      structuralHintRejected: controlsStructuralHintRejected,
+      iconLabelRecovered: controlsIconLabelRecovered,
+      unresolvedFailedRequests: telemetry.unresolvedFailedRequests,
+      // The coverage reason must see the same context the telemetry publishes:
+      // a document reached only by a click still has unexamined frames and
+      // shadow roots, so it cannot be reported as fully covered.
+      frameCount: frameCount + clickDestinationContext.frameCount,
+      shadowRootCount: shadowRootCount + clickDestinationContext.shadowRootCount,
+      popupTargets,
+      navigationPolicyExcluded: telemetry.navigationPolicyExcluded,
+    });
   };
   const terminalSuccessUrls: string[] = [];
   // Per visited page, the same-host community-hint links discovered on it
@@ -1897,6 +2365,15 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             await waitForHostBackoff(request.url, remainingMs);
             if (Date.now() - startedAt >= limits.totalTimeoutMs) return;
             telemetry.requestsStarted++;
+            // A retry replaces the failed attempt's uncertified mark: this
+            // attempt re-examines the page from its first control.
+            uncertifiedRequestKeys.delete(request.url);
+            // Assigned once the per-page P0.2 counters exist; the catch path
+            // calls it to preserve counts from an already-enumerated page.
+            let aggregatePageCountersOnError: (() => void) | undefined;
+            // Exposed to the handler catch so queued probes are incorporated
+            // before counters from an enumerated page are aggregated.
+            let flushPageContextProbesOnError: (() => Promise<void>) | undefined;
             try {
             // Snapshot lifetime: candidates are extracted from the FULL page
             // source (never truncated before extraction) and the multi-MB
@@ -1935,9 +2412,124 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // Page evidence counts only after the required extraction actually
             // succeeds: a throw here leaves zero processed evidence (finding:
             // failed extraction must never claim a page).
+            // Capture the URL that this request is about to inspect before
+            // `inspect()` can yield to a navigation. The identity captured
+            // with the baseline counts is the primary guard; this URL is the
+            // conservative fallback when no identity is available, so it must
+            // describe the document the request started from.
+            const pageDocumentUrl = page.url();
             await inspect();
             inspectedPages++;
+            // Record the document this request actually inspected (the request
+            // URL plus any redirect target) so a click that merely lands on it
+            // later is not attributed twice.
+            for (const identity of visitIdentityKeys(request.url, page.url())) {
+              inspectedDocumentKeys.add(identity);
+            }
             telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'PAGE_PROCESSED');
+            // P0.2 context counters: structural presence only, refreshed after
+            // scrolling and same-document DOM-changing clicks so frames/shadow
+            // roots revealed by interaction are not missed. They are
+            // diagnostics for P1.3-P1.5 and never alter selection, clicking,
+            // outcome, or retry behavior. A page that navigated away or closed
+            // between inspection and a probe must not fail the crawl.
+            let pageFrameCount = 0;
+            let pageShadowRootCount = 0;
+            let pageBaseHrefPresent = false;
+            let pageScrollCapThisAttempt = false;
+            // Capture the inspected document's identity and its context counts
+            // in one evaluation before any counter sample. The identity is
+            // what tells a same-document `pushState`/`replaceState` (identity
+            // unchanged) from a real navigation (identity changed); taking it
+            // up front means a URL update during a probe is never mistaken for
+            // a replacement, and a later probe can never redefine the
+            // document whose counters we accept.
+            let pageDocumentIdentity: number | null | undefined;
+            let pageContextAbandoned = false;
+            const initialPageContext = await page.evaluate(collectRenderedPageContext).catch(() => null);
+            if (initialPageContext) {
+              pageDocumentIdentity = initialPageContext.documentTimeOrigin ?? null;
+              pageFrameCount = Math.max(0, Math.floor(initialPageContext.frameCount) || 0);
+              pageShadowRootCount = Math.max(0, Math.floor(initialPageContext.shadowRootCount) || 0);
+              pageBaseHrefPresent = initialPageContext.baseHrefPresent === true;
+            } else {
+              // Without a baseline identity, a later sample could describe a
+              // different document; skip context measurement for this request
+              // rather than attribute another document's counters to it. The
+              // crawl-level flag keeps the coverage reason from claiming
+              // COMPLETE when context was never measured.
+              pageContextAbandoned = true;
+              contextMeasurementAbandoned = true;
+            }
+            const recordClickDestinationContext = (destinationUrl: string, observation: ClickDestinationContext): void => {
+              const key = normalizeVisitUrl(destinationUrl);
+              if (!key) return;
+              const previous = clickDestinationContextByKey.get(key);
+              clickDestinationContextByKey.set(key, {
+                frameCount: Math.max(previous?.frameCount ?? 0, Math.max(0, Math.floor(observation.frameCount) || 0)),
+                shadowRootCount: Math.max(previous?.shadowRootCount ?? 0, Math.max(0, Math.floor(observation.shadowRootCount) || 0)),
+                baseHrefPresent: previous?.baseHrefPresent === true || observation.baseHrefPresent === true,
+              });
+            };
+            const recordPageContext = async (): Promise<void> => {
+              if (pageContextAbandoned) return;
+              try {
+                const pageContext = await page.evaluate(collectRenderedPageContext);
+                const currentIdentity = pageContext.documentTimeOrigin ?? null;
+                const sameUrl = normalizeVisitUrl(page.url()) === normalizeVisitUrl(pageDocumentUrl);
+                const sameDocument = pageDocumentIdentity !== null && currentIdentity !== null
+                  ? currentIdentity === pageDocumentIdentity
+                  : sameUrl;
+                // A same-document pushState path/query change and a same-URL
+                // reload both belong to this inspection. Only a new document
+                // at a different URL is another request's context.
+                if (!sameDocument && !sameUrl) {
+                  // A click can commit a document that is never enqueued (for
+                  // example a hint-matched control whose destination is
+                  // hint-free), and an enqueued destination may still never be
+                  // inspected (max-requests cutoff, later failure). Record the
+                  // context by destination unconditionally; publish-time
+                  // reconciliation drops it only when a request actually
+                  // inspected that document and counted the same context.
+                  recordClickDestinationContext(page.url(), {
+                    frameCount: pageContext.frameCount,
+                    shadowRootCount: pageContext.shadowRootCount,
+                    baseHrefPresent: pageContext.baseHrefPresent === true,
+                  });
+                  return;
+                }
+                pageFrameCount = Math.max(pageFrameCount, Math.max(0, Math.floor(pageContext.frameCount) || 0));
+                pageShadowRootCount = Math.max(pageShadowRootCount, Math.max(0, Math.floor(pageContext.shadowRootCount) || 0));
+                pageBaseHrefPresent = pageBaseHrefPresent || pageContext.baseHrefPresent === true;
+              } catch { /* context counters never break inspection */ }
+            };
+            // Per-click probes must never delay the next click. Queue them and
+            // flush before page-end aggregation, so measurement cannot consume
+            // the shared click budget or change click sequencing.
+            const pendingContextProbes: Array<Promise<void>> = [];
+            const queuePageContextProbe = (): void => {
+              pendingContextProbes.push(recordPageContext());
+            };
+            const flushPageContextProbes = async (): Promise<void> => {
+              const pending = pendingContextProbes.splice(0);
+              if (!pending.length) return;
+              // Measurement must never extend the request lifecycle: wait at
+              // most a short cap and never beyond the remaining crawl budget.
+              // Samples still pending at the cap are dropped.
+              const remainingMs = limits.totalTimeoutMs - (Date.now() - startedAt);
+              const capMs = Math.max(0, Math.min(250, remainingMs));
+              if (capMs === 0) return;
+              let timer: ReturnType<typeof setTimeout> | undefined;
+              try {
+                await Promise.race([
+                  Promise.allSettled(pending),
+                  new Promise<void>(resolve => { timer = setTimeout(resolve, capMs); }),
+                ]);
+              } finally {
+                if (timer) clearTimeout(timer);
+              }
+            };
+            flushPageContextProbesOnError = flushPageContextProbes;
             if (!seedDocumentSeen) {
               seedDocumentSeen = true;
               seedSnapshotUrl = page.url();
@@ -1948,22 +2540,50 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               }
             }
 
-            for (let i = 0; i < limits.maxScrollsPerPage; i++) {
-              if (Date.now() - startedAt >= limits.totalTimeoutMs) break;
-              const before = await page.evaluate(() => document.body?.scrollHeight || 0);
-              await page.evaluate(() => window.scrollTo(0, document.body?.scrollHeight || 0));
-              await page.waitForTimeout(500); scrolls++; await inspect();
-              const after = await page.evaluate(() => document.body?.scrollHeight || 0);
-              if (after <= before) break;
-            }
-
-            const enumerateControls = async (): Promise<{ controls: RenderedControlTarget[]; total: number }> =>
+            const enumerateControls = async (): Promise<RenderedControlEnumeration> =>
               page.locator(RENDERED_CONTROL_SELECTOR).evaluateAll(enumerateRenderedControlNodes, COMMUNITY_HINTS.source);
+            // Per-page P0.2 denominators come from one coherent enumeration
+            // snapshot (largest total; first wins ties) so the total and
+            // hint-rejected arithmetic always describes the same snapshot.
+            // Coverage-gap observations are maxed across every enumeration:
+            // a later, smaller snapshot can reveal the structural/icon/popup
+            // control that replaced a clicked community button. `pageControlTotal`
+            // stays the independently maxed evidence-bearing (hint-matched)
+            // count so the existing interaction certificate keeps its exact
+            // semantics.
             let pageControlTotal = 0;
+            let pageControlsEnumeratedTotal = 0;
+            let pageSnapshotRecorded = false;
+            let pageHintRejected = 0;
+            let pageStructuralNavigation = 0;
+            let pageStructuralHintRejected = 0;
+            let pageIconLabelRecovered = 0;
+            let pagePopupMarkers = new Set<string>();
             let pageControlOverflow = 0;
-            const recordControlEnumeration = (total: number): void => {
-              pageControlTotal = Math.max(pageControlTotal, total);
-              const overflow = Math.max(0, total - RENDERED_CONTROL_EVALUATION_WINDOW);
+            const examinedPopupMarkers = new Set<string>();
+            const recordControlEnumeration = (enumeration: RenderedControlEnumeration): void => {
+              const matchedTotal = enumeration.controls.length;
+              pageControlTotal = Math.max(pageControlTotal, matchedTotal);
+              if (!pageSnapshotRecorded || enumeration.total > pageControlsEnumeratedTotal) {
+                pageSnapshotRecorded = true;
+                pageControlsEnumeratedTotal = enumeration.total;
+                pageHintRejected = enumeration.hintRejected;
+              }
+              const gapCounters = mergeRenderedCoverageGapCounters(
+                {
+                  structuralNavigation: pageStructuralNavigation,
+                  structuralHintRejected: pageStructuralHintRejected,
+                  iconLabelRecovered: pageIconLabelRecovered,
+                },
+                enumeration,
+              );
+              pageStructuralNavigation = gapCounters.structuralNavigation;
+              pageStructuralHintRejected = gapCounters.structuralHintRejected;
+              pageIconLabelRecovered = gapCounters.iconLabelRecovered;
+              pagePopupMarkers = trackRenderedPopupCoverage(pagePopupMarkers, enumeration);
+              // Overflow accounting keeps using the matched pool: P0.2 is
+              // measurement-only and must not change control-slice behavior.
+              const overflow = Math.max(0, matchedTotal - RENDERED_CONTROL_EVALUATION_WINDOW);
               if (overflow > pageControlOverflow) {
                 const added = overflow - pageControlOverflow;
                 pageControlOverflow = overflow;
@@ -1972,8 +2592,89 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 interactionGap = true;
               }
             };
+            // Page counters are local until this aggregation. Aggregate once
+            // at the normal end of the page and once on the error path below.
+            // The error hook is registered before scrolling so a throw during
+            // a scroll read still publishes the context counts already
+            // measured for this page.
+            let pageCountersAggregated = false;
+            const aggregatePageControlCounters = (): void => {
+              if (pageCountersAggregated) return;
+              pageCountersAggregated = true;
+              const requestKey = request.url;
+              const previous = pageControlTotalsByRequest.get(requestKey);
+              // A Crawlee retry can throw during scrolling or before its first
+              // enumeration, leaving every control counter at zero. Replacing
+              // a fully enumerated earlier attempt with those zeros would
+              // subtract its real coverage from the crawl totals, so keep the
+              // earlier control observation. Context counters are measured
+              // independently of enumeration, so merge those per field.
+              if (previous && !pageSnapshotRecorded) {
+                const merged = {
+                  ...previous,
+                  frameCount: Math.max(previous.frameCount || 0, pageFrameCount),
+                  shadowRootCount: Math.max(previous.shadowRootCount || 0, pageShadowRootCount),
+                  baseHrefPresent: previous.baseHrefPresent || pageBaseHrefPresent,
+                };
+                pageControlTotalsByRequest.set(requestKey, merged);
+                pageScrollCapByRequest.set(
+                  requestKey,
+                  (pageScrollCapByRequest.get(requestKey) ?? false) || pageScrollCapThisAttempt,
+                );
+                const contextDelta = renderedRequestControlTotalsDelta(previous, merged);
+                frameCount += contextDelta.frameCount;
+                shadowRootCount += contextDelta.shadowRootCount;
+                baseHrefPresent = baseHrefPresent || merged.baseHrefPresent;
+                return;
+              }
+              // Popups that the click loop actually inspected are not an
+              // unexamined context gap. Identity tracking keeps a replacement
+              // popup from being cancelled out by an earlier clicked popup,
+              // including when the replacement is hint-rejected.
+              const current = {
+                enumerated: pageControlsEnumeratedTotal,
+                hintRejected: pageHintRejected,
+                structuralNavigation: pageStructuralNavigation,
+                structuralHintRejected: pageStructuralHintRejected,
+                iconLabelRecovered: pageIconLabelRecovered,
+                popupCount: resolveUnexaminedPopupTargets(pagePopupMarkers, examinedPopupMarkers),
+                frameCount: pageFrameCount,
+                shadowRootCount: pageShadowRootCount,
+                baseHrefPresent: pageBaseHrefPresent,
+              };
+              pageControlTotalsByRequest.set(requestKey, current);
+              pageScrollCapByRequest.set(requestKey, pageScrollCapThisAttempt);
+              const delta = renderedRequestControlTotalsDelta(previous, current);
+              controlsEnumeratedTotal += delta.enumerated;
+              controlsHintRejected += delta.hintRejected;
+              controlsStructuralNavigation += delta.structuralNavigation;
+              controlsStructuralHintRejected += delta.structuralHintRejected;
+              controlsIconLabelRecovered += delta.iconLabelRecovered;
+              popupTargets += delta.popupCount;
+              frameCount += delta.frameCount;
+              shadowRootCount += delta.shadowRootCount;
+              baseHrefPresent = baseHrefPresent || current.baseHrefPresent;
+            };
+            aggregatePageCountersOnError = aggregatePageControlCounters;
+
+            for (let i = 0; i < limits.maxScrollsPerPage; i++) {
+              if (Date.now() - startedAt >= limits.totalTimeoutMs) break;
+              const before = await page.evaluate(() => document.body?.scrollHeight || 0);
+              await page.evaluate(() => window.scrollTo(0, document.body?.scrollHeight || 0));
+              await page.waitForTimeout(500); scrolls++; await inspect();
+              const after = await page.evaluate(() => document.body?.scrollHeight || 0);
+              if (after <= before) break;
+              // The document was still growing on the last permitted
+              // iteration: the scroll cap, not page stability, ended
+              // inspection. P0.2 records the fact; P1.7 decides whether the
+              // unexamined remainder makes the run partial.
+              if (i === limits.maxScrollsPerPage - 1) pageScrollCapThisAttempt = true;
+            }
+            // Scrolling can reveal lazy iframes or shadow hosts.
+            await recordPageContext();
+
             const firstEnumeration = await enumerateControls();
-            recordControlEnumeration(firstEnumeration.total);
+            recordControlEnumeration(firstEnumeration);
             const controls = firstEnumeration.controls;
             // Navigable same-host anchors are already discovered through
             // enqueueLinks and Discord-scanned before any click, so the click
@@ -2043,33 +2744,63 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               await enqueueLinks({ strategy: 'same-hostname', transformRequestFunction: req => (admitEnqueueRequest(req.url) ? req : false) });
             }
 
-            const clickLoop = await runRenderedClickLoop({
-              targets: clickPlan.toClick,
-              maxClicksPerPage: limits.maxClicksPerPage,
-              deadlineExceeded: () => Date.now() - startedAt >= limits.totalTimeoutMs,
-              click: async control => {
-                // Stable marker first: positional nth() indexes are invalidated
-                // when an earlier disclosure changes the selector membership.
-                const locator = control.marker
-                  ? page.locator(`[data-oc-control="${control.marker.replace(/"/g, '\\"')}"]`).first()
-                  : page.locator(RENDERED_CONTROL_SELECTOR).nth(control.index);
-                const clickOutcome = await attemptRenderedControlClick(createRenderedControlClickDeps({
-                  locator: locator as unknown as RenderedClickEndpoint,
-                  page: page as unknown as RenderedClickSettler,
-                  control,
-                  retain,
-                  inspect,
-                  telemetry,
-                  onClicked: () => { clicks++; },
-                }));
-                return clickOutcome.ok;
-              },
-              enumerate: enumerateControls,
-              pageUrl: () => page.url(),
-              clickOffset: limits.clickOffset,
-              countedSkips: countedControlSkips,
-              onEnumerated: recordControlEnumeration,
-            });
+            // A popup control that opens a new window has not been examined:
+            // the post-click inspect() re-reads the original page only. Track
+            // context page creation per click and resolve a popup target only
+            // when no new window opened (an in-page disclosure/menu).
+            const clickPageContext = (page as unknown as {
+              context?: () => {
+                on?: (event: string, listener: (candidate: unknown) => void) => void;
+                off?: (event: string, listener: (candidate: unknown) => void) => void;
+              };
+            }).context?.();
+            const popupWindowsThisClick = new Set<unknown>();
+            const onPopupWindow = (candidate: unknown) => {
+              if (candidate && candidate !== page) popupWindowsThisClick.add(candidate);
+            };
+            clickPageContext?.on?.('page', onPopupWindow);
+            let clickLoop: Awaited<ReturnType<typeof runRenderedClickLoop>>;
+            try {
+              clickLoop = await runRenderedClickLoop({
+                targets: clickPlan.toClick,
+                maxClicksPerPage: limits.maxClicksPerPage,
+                deadlineExceeded: () => Date.now() - startedAt >= limits.totalTimeoutMs,
+                click: async control => {
+                  popupWindowsThisClick.clear();
+                  // Stable marker first: positional nth() indexes are invalidated
+                  // when an earlier disclosure changes the selector membership.
+                  const locator = control.marker
+                    ? page.locator(`[data-oc-control="${control.marker.replace(/"/g, '\\"')}"]`).first()
+                    : page.locator(RENDERED_CONTROL_SELECTOR).nth(control.index);
+                  const clickOutcome = await attemptRenderedControlClick(createRenderedControlClickDeps({
+                    locator: locator as unknown as RenderedClickEndpoint,
+                    page: page as unknown as RenderedClickSettler,
+                    control,
+                    retain,
+                    inspect,
+                    telemetry,
+                    onClicked: () => { clicks++; },
+                  }));
+                  // Queue a context sample immediately after the click before
+                  // the next click can remove or replace the document, but do
+                  // not await it: telemetry must not consume the click budget.
+                  // The per-page counters are max-monotonic, so a transient
+                  // iframe or shadow root still counts.
+                  queuePageContextProbe();
+                  if (clickOutcome.ok && control.popup && control.marker && popupWindowsThisClick.size === 0) {
+                    examinedPopupMarkers.add(control.marker);
+                  }
+                  return clickOutcome.ok;
+                },
+                enumerate: enumerateControls,
+                pageUrl: () => page.url(),
+                clickOffset: limits.clickOffset,
+                countedSkips: countedControlSkips,
+                onEnumerated: recordControlEnumeration,
+              });
+            } finally {
+              clickPageContext?.off?.('page', onPopupWindow);
+            }
             evidenceControlsClicked += clickLoop.evidenceControlsClicked;
             evidenceControlsFailed += clickLoop.evidenceControlsFailed;
             if (clickLoop.evidenceControlsSkipped > 0) {
@@ -2098,10 +2829,17 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               // Clickable controls were inside the window but no progress was
               // recorded (deadline, zero budget, detached marker). The shared
               // offset must not move based on another page's progress.
-              evidenceControlsUncertified = true;
+              uncertifiedRequestKeys.add(request.url);
             }
             pageClickWindowPending = false;
             evidenceControlsSeen += pageControlTotal;
+            // A disclosure click can reveal lazy frames or shadow hosts.
+            await flushPageContextProbes();
+            await recordPageContext();
+            // Page-end aggregation for P0.2. Counts are crawl totals, not
+            // per-page maxima, so a multi-page crawl reports the sum of what
+            // each processed page exposed.
+            aggregatePageControlCounters();
 
             if (Date.now() - startedAt < limits.totalTimeoutMs) {
               await enqueueLinks({strategy:'same-hostname',transformRequestFunction:req=>(admitEnqueueRequest(req.url)?req:false)});
@@ -2141,6 +2879,19 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               if (!terminalSuccessUrls.includes(identity)) terminalSuccessUrls.push(identity);
             }
             } catch (attemptError) {
+              // Preserve P0.2 counts for a page that was already enumerated
+              // before a later enqueue/click throw. The aggregation is
+              // idempotent per attempt, and the per-request replacement above
+              // makes a Crawlee retry overwrite this attempt instead of
+              // counting it twice.
+              await flushPageContextProbesOnError?.();
+              aggregatePageCountersOnError?.();
+              // Crawlee retries a thrown handler with a fresh page. If the
+              // click window was still pending, that attempt did not examine
+              // its controls; the crawl-wide catch may never run when a retry
+              // later succeeds, so certify the gap here. The retry clears this
+              // per-request mark when it re-enters the handler.
+              if (pageClickWindowPending) uncertifiedRequestKeys.add(request.url);
               // Release only the failed page; Crawlee still classifies the
               // original error and retries with a fresh page per
               // maxRequestRetries/maxSessionRotations. The close is
@@ -2238,7 +2989,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         // Persist the bounded control-coverage certificate alongside the
         // crawler telemetry so production can distinguish 64-overflow from
         // ordinary click-budget slicing. Counts only; never selectors/text.
-        publishEvidenceControlCertificate();
+        // P0.2 adds the coverage-reason certificate; a timeout or page-budget
+        // cutoff is a named ceiling and therefore BOUNDED.
+        publishEvidenceControlCertificate(timedOut || pageBudgetExhausted);
         return {
           foundInvite:first?.nativeInviteCode||null,
           foundLocation:first?.sourceUrl,
@@ -2270,7 +3023,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           evidenceControlsFailed: evidenceControlsFailed || undefined,
           evidenceControlsSkipped: evidenceControlsSkipped || undefined,
           evidenceControlsNavigableOnly: (evidenceControlsNavigableOnly && !evidenceControlsClickableWindow) || undefined,
-          evidenceControlsUncertified: evidenceControlsUncertified || undefined,
+          evidenceControlsUncertified: (evidenceControlsUncertified || uncertifiedRequestKeys.size > 0) || undefined,
           evidenceControlsOffsetAdvance: evidenceControlsOffsetAdvance || undefined,
           interactionGap: interactionGap || undefined,
           requiredSnapshotExpanded: requiredSnapshotExpanded || undefined,
@@ -2292,8 +3045,11 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         // the seed uncertified; otherwise the catch result's raw click count
         // advances the shared offset past that page's unexamined controls.
         if (pageClickWindowPending) evidenceControlsUncertified = true;
-        publishEvidenceControlCertificate();
-        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,dropReasons:drops.snapshot(),interactionGap:interactionGap||undefined,evidenceControlsTotal:evidenceControlsSeen||undefined,evidenceControlsClicked:evidenceControlsClicked||undefined,evidenceControlsFailed:evidenceControlsFailed||undefined,evidenceControlsSkipped:evidenceControlsSkipped||undefined,evidenceControlsNavigableOnly:(evidenceControlsNavigableOnly&&!evidenceControlsClickableWindow)||undefined,evidenceControlsUncertified:evidenceControlsUncertified||undefined,evidenceControlsOffsetAdvance:evidenceControlsOffsetAdvance||undefined,detail:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
+        // A thrown crawl is never complete coverage. When pages were
+        // processed the reason is BOUNDED (an abort cut the remaining
+        // navigation); zero pages resolves to UNKNOWN.
+        publishEvidenceControlCertificate(true);
+        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,dropReasons:drops.snapshot(),interactionGap:interactionGap||undefined,evidenceControlsTotal:evidenceControlsSeen||undefined,evidenceControlsClicked:evidenceControlsClicked||undefined,evidenceControlsFailed:evidenceControlsFailed||undefined,evidenceControlsSkipped:evidenceControlsSkipped||undefined,evidenceControlsNavigableOnly:(evidenceControlsNavigableOnly&&!evidenceControlsClickableWindow)||undefined,evidenceControlsUncertified:(evidenceControlsUncertified||uncertifiedRequestKeys.size>0)||undefined,evidenceControlsOffsetAdvance:evidenceControlsOffsetAdvance||undefined,detail:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
       } finally {
         // The isolated queue must never outlive its crawl: the lifecycle
         // finalizer drops it on success, failure, and unexpected throws alike
@@ -2333,6 +3089,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
     if (causeSnippet) telemetry.launchCauseSnippet=causeSnippet;
     const zeroPageReason=resolveRenderedZeroPageReason({inspectedPages,timedOut:false,saturated,browserLaunchFailed,telemetry});
     if (zeroPageReason) telemetry.zeroPageReason=zeroPageReason;
+    // P0.2 diagnostic: a gate/browser rejection processed no page, so coverage
+    // is unknown rather than complete. P1.7 owns any outcome consequence.
+    telemetry.coverageReason = resolveRenderedCoverageReason({ pagesInspected: 0 });
     return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,detail:saturated?`Rendered acquisition deferred because the process-wide browser launch gate is saturated; ${browserFallbackTelemetrySummary(telemetry)}`:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
   }
 }
