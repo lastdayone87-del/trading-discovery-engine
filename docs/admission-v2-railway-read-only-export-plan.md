@@ -1,11 +1,17 @@
-# Admission V2 Railway read-only export and restore plan
+# Admission V2 production read-only export and restore plan
 
-**Prepared:** 2026-08-09  
+**Prepared:** 2026-08-09 (host label corrected 2026-10-27)
 **Scope:** operational plan only  
 **Permitted source operations:** metadata reads, `SELECT`, consistent logical dump,
 or provider-managed backup restore  
 **Prohibited:** production migrations, application startup against production,
 feature/settings changes, writes, backfills, synthetic labels, and serving changes
+
+> **Infrastructure correction (2026-10-27):** Production is hosted on
+> **Coolify**, not Railway. This file keeps its historical name so existing
+> links do not break, but its instructions now refer to Coolify. Railway is not
+> the production access path. See
+> [Production infrastructure](./production-infrastructure.md).
 
 ## 1. Objective and stop conditions
 
@@ -33,12 +39,12 @@ Use four separate identities:
 
 | Identity | Minimum privilege | Must not have |
 | --- | --- | --- |
-| Railway backup operator | Create/restore a backup into a new service | Application deployment or data-edit access unless separately required |
+| Coolify backup operator | Create/restore a backup into a new service | Application deployment or data-edit access unless separately required |
 | Source inventory/export role | `CONNECT`, schema `USAGE`, and `SELECT` on required tables; read-only default | `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, DDL, ownership, replication administration |
 | Isolated restore owner | Create the evaluator database and restore objects | Any route or credential to production |
 | Admission evaluator role | `CONNECT`, schema `USAGE`, `SELECT`; read-only default | Object ownership, DDL/DML, provider secrets, production API credentials |
 
-Use a new isolated Railway project/environment or a separately controlled
+Use a new isolated Coolify project/environment or a separately controlled
 PostgreSQL instance. It must not share application services, workers, cron jobs,
 queues, public routes, or environment-variable groups with production. Egress
 should be disabled except for the operator's administration path. Never deploy the
@@ -50,7 +56,7 @@ application server or worker to it; only invoke the offline CLI.
 
 For production, staging, each read replica, and each restored backup, record:
 
-- Railway project, environment, PostgreSQL service, and backup/restore timestamp;
+- Coolify project, environment, PostgreSQL service, and backup/restore timestamp;
 - database host fingerprint without credentials, database name, PostgreSQL
   version, and current database time;
 - application release/commit associated with the data period;
@@ -58,7 +64,7 @@ For production, staging, each read replica, and each restored backup, record:
 - operator, ticket/change reference, and investigation timestamp.
 
 Do not paste connection URLs into tickets or shell history. Use a temporary
-`PGPASSFILE` with mode `0600`, a secret manager, or Railway variable injection.
+`PGPASSFILE` with mode `0600`, a secret manager, or Coolify variable injection.
 
 ### A2. Confirm the session is read-only
 
@@ -211,7 +217,7 @@ not prove effective sample size; the POC will calculate it from the recorded
 inclusion probabilities and requires at least 30 genuine creators and at least 30
 baseline false-positive non-trading creators for its central assessment.
 
-## 5. Phase C — preferred Railway backup restore
+## 5. Phase C — preferred Coolify backup restore
 
 Provider-managed restoration is preferred because it minimizes load on the live
 primary and preserves a database-wide point-in-time image.
@@ -230,9 +236,9 @@ primary and preserves a database-wide point-in-time image.
    checksum with the source inventory. A backup from before dataset creation is
    unusable even if it contains underlying observations.
 
-Railway dashboard labels and backup capabilities can vary by plan and current
+Coolify dashboard labels and backup capabilities can vary by plan and current
 product version. Before execution, the operator must follow the currently published
-Railway backup/restore procedure and retain the provider's restore completion
+Coolify backup/restore procedure and retain the provider's restore completion
 record. The safety invariants above remain mandatory regardless of UI workflow.
 
 ## 6. Phase D — fallback consistent logical export

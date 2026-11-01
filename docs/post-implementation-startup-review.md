@@ -1,5 +1,10 @@
 # Post-implementation startup and provider-resilience review
 
+> **Infrastructure correction (2026-10-27):** Production is hosted on
+> **Coolify**, not Railway. Railway references below are stale assumptions and
+> are not the production access path. See
+> [Production infrastructure](./production-infrastructure.md).
+
 ## Scope and root cause
 
 This review covers HTTP startup, `/api/health`, the autonomous producer, durable
@@ -49,7 +54,7 @@ semantics independently.
 ## Rollout considerations
 
 1. Deploy normally and wait for `/api/health` to report HTTP 200, `ready`, and
-   `database: ready`. The process binds before database initialization so Railway
+   `database: ready`. The process binds before database initialization so Coolify
    can observe it, but returns HTTP 503 until PostgreSQL connectivity, migrations,
    defaults, and queue controls have been verified. The startup log records the
    schema version and channel count from that same configured database.
