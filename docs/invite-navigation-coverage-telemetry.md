@@ -3,11 +3,12 @@
 **Status:** P0.2 instrumentation, P1.1/P1.2 control recovery, and P1.7 outcome
 truthfulness. Recovering structural and icon-label controls widens the rendered
 click set and changes which unexamined controls make a page retryable; coverage
-reasons can move from `COMPLETE` to `POLICY_EXCLUDED`/`BOUNDED`. No queue or
-schema behavior changes. P1.7 maps a non-`COMPLETE` reason to outcome and retry
-truthfulness, and cached rendered-evidence reuse now requires `COMPLETE`
-coverage, so a bounded/context/policy gap is no longer reusable as a clean site
-inspection.
+reasons can move from `COMPLETE` to `POLICY_EXCLUDED`/`BOUNDED`. No schema
+changes; retry ownership stays on the existing bounded queue path. P1.7 maps a
+non-`COMPLETE` reason to outcome and retry truthfulness, and
+`isSufficientRenderedCoverage` now requires `COMPLETE`, so a
+bounded/context/policy gap is never recorded as clean rendered coverage. Site
+evidence reuse keeps its existing TTL policy (24h for retryable/partial rows).
 **Scope:** Rendered creator-website acquisition (`mode = RENDERED`).
 **Related evidence:** `INVITE_NAVIGATION_ACQUISITION_RECALL_INVESTIGATION_20261027.md`
 and the 2026-10-27 P0.3 production classification report (read-only Coolify
@@ -104,9 +105,9 @@ Existing fields keep their meanings:
 3. `CONTEXT_UNREACHABLE` when frames, open shadow roots, or unexamined popup
    targets were observed. Popups the click loop successfully examined are not
    context gaps.
-4. `POLICY_EXCLUDED` when `invalid-protocol`, `admission-rejected`,
-   `cross-origin-disallowed`, or `destination-budget` exclusions occurred, or
-   when `structuralUnrecovered` recorded an unfollowed structural navigation.
+4. `POLICY_EXCLUDED` when `cross-origin-disallowed` or `destination-budget`
+   exclusions occurred, or when `structuralUnrecovered` recorded an unfollowed
+   structural navigation.
 5. `COMPLETE` otherwise.
 
 `invalid-protocol` and `admission-rejected` are format/security rejections
