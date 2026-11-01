@@ -529,6 +529,13 @@ test('a final click that navigates does not invent a gap', async () => {
   assert.equal(result.interactionGap, false, 'no original-page control was left unexamined');
 });
 
+test('a seed retry refreshes its own document identity and required links', () => {
+  const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
+  assert.match(source, /const seedRequestKey = normalizeVisitUrl\(seedUrl\)/, 'the seed request is identified once for the crawl');
+  assert.match(source, /if \(seedRequestKey && normalizeVisitUrl\(request\.url\) === seedRequestKey\)/, 'the snapshot is refreshed for each seed attempt, not only the first');
+  assert.match(source, /for \(const link of discoverRequiredSeedLinks\(await page\.content\(\), page\.url\(\)\)\) known\.add\(link\)/, 'retry-discovered links merge with earlier seed links');
+});
+
 test('required-link snapshot follows the seed document across a same-document query change', () => {
   assert.equal(
     isSameSeedDocument(

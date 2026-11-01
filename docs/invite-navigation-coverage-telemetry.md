@@ -175,7 +175,9 @@ The reason remains diagnostic. It does not change `complete`, `retryable`,
   controls are still clicked. The same identity check governs the post-click
   required-link re-snapshot: a history-only query change still merges newly
   revealed same-host community links into the seed's required set, while a
-  replaced document never contributes required obligations to the seed.
+  replaced document never contributes required obligations to the seed. The
+  identity and initial link snapshot are refreshed for each seed attempt, so a
+  Crawlee retry compares its own document rather than the failed attempt's.
 - `collectRenderedPageContext` uses a bounded `TreeWalker` (2,000 elements,
   100 shadow roots) and a bounded frame scan over live `getElementsByTagName`
   collections (1,000). It never traverses frames or shadow roots. Context
@@ -197,8 +199,8 @@ The reason remains diagnostic. It does not change `complete`, `retryable`,
   not persisted as a separate field, so consumers see the reason rather than
   the cause. Counters are aggregated on the page
   error path so an enumerated page is never published as zero.
-- The published denominator and hint-rejected count come from one coherent  enumeration snapshot (largest total; first wins ties). Structural and
-  icon-label counters are merged observations: a later, smaller snapshot can
+- The published denominator and hint-rejected count come from one coherent
+  enumeration snapshot (largest total; first wins ties). Structural and  icon-label counters are merged observations: a later, smaller snapshot can
   contribute a control that a click revealed, so they are combined per count
   rather than constrained to the denominator snapshot. A successfully clicked
   popup is excluded from the unexamined-context count. Each Crawlee retry

@@ -2374,6 +2374,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   // required set grew after scroll/click interactions.
   let seedSnapshotUrl = '';
   let seedSnapshotIdentity: unknown = null;
+  // The seed request may be retried with a fresh page/document. The identity
+  // and initial required-link snapshot are refreshed for each seed attempt,
+  // while child pages never replace them.
+  const seedRequestKey = normalizeVisitUrl(seedUrl);
   let requiredSnapshotExpanded = false;
   let evidenceControlsSeen = 0;
   let evidenceControlsClicked = 0;
@@ -2831,18 +2835,22 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               }
             };
             flushPageContextProbesOnError = flushPageContextProbes;
-            if (!seedDocumentSeen) {
-              seedDocumentSeen = true;
+            if (seedRequestKey && normalizeVisitUrl(request.url) === seedRequestKey) {              seedDocumentSeen = true;
               seedSnapshotUrl = page.url();
               // Capture document identity alongside the URL. A menu can
               // update the query in place (pushState); the URL then differs
               // even though the seed document, and links revealed after the
-              // update, still belong to the same required set.
+              // update, still belong to the same required set. Refresh both
+              // per seed attempt: a Crawlee retry gets a fresh document whose
+              // new timeOrigin must not be compared with the failed attempt's
+              // identity.
               seedSnapshotIdentity = await page.evaluate(() => performance.timeOrigin).catch(() => null);
               try {
-                seedRequiredLinks = discoverRequiredSeedLinks(await page.content(), page.url());
+                const known = new Set(seedRequiredLinks);
+                for (const link of discoverRequiredSeedLinks(await page.content(), page.url())) known.add(link);
+                seedRequiredLinks = [...known];
               } catch {
-                seedRequiredLinks = [];
+                // Keep links discovered on an earlier attempt.
               }
             }
 
