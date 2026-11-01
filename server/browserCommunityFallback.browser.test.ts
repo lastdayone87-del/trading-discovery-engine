@@ -553,11 +553,16 @@ test('real DOM: hidden controls are queued after the disclosure that reveals the
         <svg width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="8"></circle></svg>
       </button>
     </details>
+    <details>
+      <summary>Resources</summary>
+      <a href="/resources-page">Page</a>
+    </details>
   </body></html>`;
   await withControlPage(html, async (page) => {
     const enumeration = await enumeratePageControls(page);
     const summaryIndex = enumeration.controls.findIndex(target => target.index === 0);
     const buttonIndex = enumeration.controls.findIndex(target => target.index === 1);
+    const unrelatedIndex = enumeration.controls.findIndex(target => target.index === 2);
     assert.equal(summaryIndex >= 0, true, 'the closed summary is clickable');
     assert.equal(buttonIndex >= 0, true, 'the icon-only control inside the closed menu is recovered');
     assert.equal(
@@ -576,9 +581,49 @@ test('real DOM: hidden controls are queued after the disclosure that reveals the
       'the summary is visible even while the details is closed',
     );
     assert.equal(
-      summaryIndex < buttonIndex,
+      buttonIndex,
+      summaryIndex + 1,
+      'a hidden control is queued right after the disclosure that reveals it, before unrelated visible controls',
+    );
+    assert.equal(
+      buttonIndex < unrelatedIndex,
       true,
-      'a hidden control is deferred until the disclosure that reveals it has run',
+      'an unrelated disclosure cannot exhaust the click budget before the revealed control is tried',
+    );
+  });
+});
+
+test('real DOM: nested closed details hides inner summaries and their content', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <details>
+      <summary>More</summary>
+      <details>
+        <summary>Menu</summary>
+        <button type="button" title="Discord">
+          <svg width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="8"></circle></svg>
+        </button>
+      </details>
+    </details>
+  </body></html>`;
+  await withControlPage(html, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    const outerIndex = enumeration.controls.findIndex(target => target.index === 0);
+    const innerIndex = enumeration.controls.findIndex(target => target.index === 1);
+    const buttonIndex = enumeration.controls.findIndex(target => target.index === 2);
+    assert.equal(outerIndex >= 0, true, 'the outer summary is clickable');
+    assert.equal(innerIndex >= 0, true, 'the inner summary is enumerated');
+    assert.equal(buttonIndex >= 0, true, 'the icon-only control inside the nested menu is recovered');
+    assert.notEqual(enumeration.controls[outerIndex]?.hidden, true, 'the outer summary is visible');
+    assert.equal(
+      enumeration.controls[innerIndex]?.hidden,
+      true,
+      'an inner summary is hidden while the outer details is closed',
+    );
+    assert.equal(enumeration.controls[buttonIndex]?.hidden, true, 'the nested control is hidden');
+    assert.equal(
+      outerIndex < innerIndex && innerIndex < buttonIndex,
+      true,
+      'the outer disclosure runs first, then the inner one, then the control it reveals',
     );
   });
 });

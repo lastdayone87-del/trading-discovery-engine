@@ -830,6 +830,11 @@ export function enumerateRenderedControlNodes(
   let iconLabelRecovered = 0;
   let popupTargets = 0;
   const popupIndices: number[] = [];
+  // Hidden controls are queued immediately after the disclosure that reveals
+  // them, so unrelated visible controls cannot exhaust the click budget first.
+  const revealerIndexByIndex = new Map<number, number>();
+  const indexByNode = new Map<Element, number>();
+  for (let nodeIndex = 0; nodeIndex < nodes.length; nodeIndex++) indexByNode.set(nodes[nodeIndex], nodeIndex);
   for (let index = 0; index < nodes.length; index++) {
     const node = nodes[index];
     const element = node as HTMLElement;
@@ -837,15 +842,30 @@ export function enumerateRenderedControlNodes(
     // A control is hidden when it has no layout box, when computed
     // `visibility` hides it, or when a closed <details> ancestor hides it.
     // Some engines still report a layout box for closed-details content, so
-    // the ancestor check is authoritative. The planner queues hidden controls
-    // after visible ones so a disclosure can reveal them before they are
-    // attempted; the click attempt itself remains a bounded wait, so a menu
-    // that reveals the control late is still clicked.
-    const closedDetails = element.closest('details:not([open])');
-    const closedDetailsSummary = closedDetails ? closedDetails.querySelector(':scope > summary') : null;
-    const hidden = (closedDetails !== null && element !== closedDetailsSummary)
+    // the ancestor check is authoritative. Every closed ancestor matters: an
+    // inner summary is still hidden while an outer <details> is closed. The
+    // outermost closed details is the disclosure that ultimately reveals the
+    // control, so hidden controls can be queued right after it.
+    //
+    // Keep this inline: Playwright serializes this function into the page.
+    let hiddenByClosedDetails = false;
+    let revealer: Element | null = null;
+    for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
+      if (ancestor.tagName.toLowerCase() !== 'details' || ancestor.hasAttribute('open')) continue;
+      const summary = ancestor.querySelector(':scope > summary');
+      if (summary === element) continue;
+      hiddenByClosedDetails = true;
+      // The nearest closed details is the disclosure the crawler must click
+      // first; an outer one only reveals this summary, not the content.
+      if (revealer === null) revealer = summary;
+    }
+    const hidden = hiddenByClosedDetails
       || element.getClientRects().length === 0
       || getComputedStyle(element).visibility === 'hidden';
+    if (hidden && revealer) {
+      const revealerIndex = indexByNode.get(revealer);
+      if (revealerIndex !== undefined) revealerIndexByIndex.set(index, revealerIndex);
+    }
     // HTMLAnchorElement.href is a string; SVGElement.href is an
     // SVGAnimatedString. Reading the attribute keeps both anchor kinds
     // string-safe, and resolving against the document base preserves the
@@ -1075,14 +1095,43 @@ export function enumerateRenderedControlNodes(
     else disclosures.push(item);
   }
   const grouped = [...hintMatched, ...recovered, ...disclosures];
-  // Controls with no layout box cannot be clicked yet. Queue them after every
-  // visible control so the disclosure that reveals them runs first: clicking
-  // a hidden button timeouts and, because the marker is already queued, the
-  // now-visible control would never be retried even with spare click budget.
-  const selected = [
-    ...grouped.filter(item => !item.hidden),
-    ...grouped.filter(item => item.hidden),
-  ];
+  // Controls with no layout box cannot be clicked yet. Queue each hidden
+  // control immediately after the disclosure that reveals it (the nearest
+  // closed <details> summary, nested disclosures first), so that disclosure
+  // runs first without putting unrelated visible controls in front of the
+  // content it reveals. A hidden control with no known revealer in this click
+  // set goes last. Clicking a control while its menu is still closed would
+  // time out, and because its marker is already queued, the now-visible
+  // control would never be retried even with spare click budget.
+  const hiddenAfter = new Map<number, RenderedControlTarget[]>();
+  const trailingHidden: RenderedControlTarget[] = [];
+  for (const item of grouped) {
+    if (!item.hidden) continue;
+    const revealerIndex = revealerIndexByIndex.get(item.index);
+    if (revealerIndex === undefined) {
+      trailingHidden.push(item);
+      continue;
+    }
+    const pending = hiddenAfter.get(revealerIndex);
+    if (pending) pending.push(item);
+    else hiddenAfter.set(revealerIndex, [item]);
+  }
+  const selected: RenderedControlTarget[] = [];
+  const roots: RenderedControlTarget[] = [];
+  for (const item of grouped) if (!item.hidden) roots.push(item);
+  roots.push(...trailingHidden);
+  for (const root of roots) {
+    selected.push(root);
+    // Depth-first: a revealed disclosure's own content follows it, so a
+    // nested closed <details> is opened before the control it contains.
+    const stack = (hiddenAfter.get(root.index) || []).slice().reverse();
+    while (stack.length > 0) {
+      const child = stack.pop() as RenderedControlTarget;
+      selected.push(child);
+      const nested = hiddenAfter.get(child.index);
+      if (nested) for (let nestedIndex = nested.length - 1; nestedIndex >= 0; nestedIndex--) stack.push(nested[nestedIndex]);
+    }
+  }
   const usedMarkers = new Set<string>();
   const controls: RenderedControlTarget[] = [];
   const markerByIndex = new Map<number, string>();

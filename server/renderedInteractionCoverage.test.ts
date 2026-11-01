@@ -904,18 +904,25 @@ test('P0.2 coverage counters stay coherent, bounded, and preserved on error path
 
 test('hidden controls wait for the disclosure that reveals them', () => {
   const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
-  assert.match(source, /const closedDetails = element\.closest\('details:not\(\[open\]\)'\);/, 'closed <details> content is detected from its ancestor');
-  assert.match(source, /const hidden = \(closedDetails !== null && element !== closedDetailsSummary\)[\s\S]{0,160}?getComputedStyle\(element\)\.visibility === 'hidden';/, 'a control with no layout box, no computed visibility, or a closed details ancestor is marked hidden');
-  assert.doesNotMatch(source, /isVisible/, 'the click loop keeps its bounded actionability wait instead of a one-shot visibility probe');
-  assert.match(source, /\.\.\.\(hidden \? \{ hidden: true \} : \{\}\),/, 'the hidden mark travels with the enumerated control');
+  assert.match(source, /for \(let ancestor = element\.parentElement; ancestor; ancestor = ancestor\.parentElement\) \{/, 'every closed <details> ancestor is considered, not only the nearest one');
+  assert.match(source, /ancestor\.tagName\.toLowerCase\(\) !== 'details' \|\| ancestor\.hasAttribute\('open'\)/, 'only closed details ancestors hide their content');
+  assert.match(source, /if \(summary === element\) continue;/, 'an element that is itself the revealing summary is not hidden by its own details');
   assert.match(
     source,
-    /\.\.\.grouped\.filter\(item => !item\.hidden\),[\s\S]{0,120}?\.\.\.grouped\.filter\(item => item\.hidden\),/,
-    'visible controls are queued before hidden ones so a disclosure runs before the content it reveals',
+    /const hidden = hiddenByClosedDetails\s*\|\| element\.getClientRects\(\)\.length === 0\s*\|\| getComputedStyle\(element\)\.visibility === 'hidden';/,
+    'a control with no layout box, no computed visibility, or a closed details ancestor is marked hidden',
   );
+  assert.match(source, /if \(hidden && revealer\) \{/, 'a hidden control records the disclosure that reveals it');
+  assert.match(source, /revealerIndexByIndex\.set\(index, revealerIndex\);/, 'the revealer is tracked by control index');
+  assert.match(source, /const pending = hiddenAfter\.get\(revealerIndex\);/, 'hidden controls are grouped under their revealing control');
+  assert.match(source, /const stack = \(hiddenAfter\.get\(root\.index\) \|\| \[\]\)\.slice\(\)\.reverse\(\);/, 'hidden controls follow their revealer, depth-first for nested disclosures');
+  assert.match(source, /roots\.push\(\.\.\.trailingHidden\);/, 'a hidden control with no known revealer is still queued last');
+  assert.doesNotMatch(source, /isVisible/, 'the click loop keeps its bounded actionability wait instead of a one-shot visibility probe');
+  assert.match(source, /\.\.\.\(hidden \? \{ hidden: true \} : \{\}\),/, 'the hidden mark travels with the enumerated control');
 });
 
-test('coverage-gap counters accumulate across later, smaller enumerations', () => {  const first = mergeRenderedCoverageGapCounters(
+test('coverage-gap counters accumulate across later, smaller enumerations', () => {
+  const first = mergeRenderedCoverageGapCounters(
     { structuralNavigation: 0, structuralHintRejected: 0, iconLabelRecovered: 0 },
     { structuralNavigation: 0, structuralHintRejected: 0, iconLabelRecovered: 1 },
   );
