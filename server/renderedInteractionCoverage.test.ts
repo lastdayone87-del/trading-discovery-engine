@@ -477,6 +477,8 @@ test('P0.2 coverage counters stay coherent, bounded, and preserved on error path
   assert.match(source, /pageDocumentIdentity = initialPageContext\.documentTimeOrigin \?\? null;/, 'the baseline identity comes from that first evaluation');
   assert.doesNotMatch(source, /pageDocumentIdentity = currentIdentity;/, 'a later probe never redefines the inspected document');
   assert.match(source, /const capMs = Math\.max\(0, Math\.min\(250, remainingMs\)\);/, 'probe flushing has a short cap bounded by the remaining crawl budget');
+  assert.match(source, /contextMeasurementAbandoned = true;/, 'abandoned context sampling is recorded at crawl level');
+  assert.match(source, /contextUnknown: contextMeasurementAbandoned/, 'abandoned context sampling prevents a COMPLETE coverage reason');
   assert.match(source, /const sameDocument = pageDocumentIdentity !== null && currentIdentity !== null[\s\S]{0,260}?currentIdentity === pageDocumentIdentity[\s\S]{0,500}?if \(!sameDocument && !sameUrl\) return;/, 'the identity comparison gates the guard that permits counter updates');
   assert.match(source, /if \(!sameDocument && !sameUrl\) return;/, 'a same-URL reload still records revealed contexts');
   assert.match(source, /pagePopupMarkers = trackRenderedPopupCoverage\(pagePopupMarkers, enumeration\)/, 'popup identities are tracked across every enumeration');

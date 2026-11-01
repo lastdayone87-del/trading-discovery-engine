@@ -2062,6 +2062,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   let evidenceControlsUncertified = false;
   let evidenceControlsOffsetAdvance = 0;
   let interactionGap = false;
+  // True when a page could not be measured because no trustworthy document
+  // identity was available; the coverage reason must not claim COMPLETE.
+  let contextMeasurementAbandoned = false;
   // P0.2 navigation-coverage counters. They are measurement-only: nothing in
   // this crawl reads them back into selection or outcome decisions.
   let controlsEnumeratedTotal = 0;
@@ -2123,6 +2126,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
       budgetExhausted,
       interactionGap,
       scrollCapReachedStillGrowing,
+      contextUnknown: contextMeasurementAbandoned,
       structuralHintRejected: controlsStructuralHintRejected,
       iconLabelRecovered: controlsIconLabelRecovered,
       unresolvedFailedRequests: telemetry.unresolvedFailedRequests,
@@ -2381,8 +2385,11 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             } else {
               // Without a baseline identity, a later sample could describe a
               // different document; skip context measurement for this request
-              // rather than attribute another document's counters to it.
+              // rather than attribute another document's counters to it. The
+              // crawl-level flag keeps the coverage reason from claiming
+              // COMPLETE when context was never measured.
               pageContextAbandoned = true;
+              contextMeasurementAbandoned = true;
             }
             const recordPageContext = async (): Promise<void> => {
               if (pageContextAbandoned) return;

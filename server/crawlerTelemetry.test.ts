@@ -214,6 +214,11 @@ test('coverage reason distinguishes complete, bounded, policy, context, and unkn
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, budgetExhausted: true }), 'BOUNDED');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, interactionGap: true }), 'BOUNDED');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, scrollCapReachedStillGrowing: true }), 'BOUNDED');
+  assert.equal(
+    resolveRenderedCoverageReason({ pagesInspected: 1, contextUnknown: true }),
+    'BOUNDED',
+    'abandoned context sampling prevents a COMPLETE claim',
+  );
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, structuralHintRejected: 2 }), 'BOUNDED');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, iconLabelRecovered: 1 }), 'BOUNDED');
   assert.equal(

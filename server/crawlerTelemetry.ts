@@ -128,6 +128,9 @@ export interface RenderedCoverageInput {
   budgetExhausted?: boolean;
   interactionGap?: boolean;
   scrollCapReachedStillGrowing?: boolean;
+  /** Context sampling was abandoned for at least one page (no trustworthy
+   * document identity), so unreached frames/shadow roots cannot be ruled out. */
+  contextUnknown?: boolean;
   structuralHintRejected?: number;
   iconLabelRecovered?: number;
   unresolvedFailedRequests?: number;
@@ -149,6 +152,7 @@ export function resolveRenderedCoverageReason(input: RenderedCoverageInput): Ren
   if (input.budgetExhausted === true
     || input.interactionGap === true
     || input.scrollCapReachedStillGrowing === true
+    || input.contextUnknown === true
     || count(input.structuralHintRejected) > 0
     || count(input.iconLabelRecovered) > 0
     || count(input.unresolvedFailedRequests) > 0) {
