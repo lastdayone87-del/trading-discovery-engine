@@ -268,8 +268,8 @@ test('database-backed: preventReopen=true preserves PENDING, PROCESSING, COMPLET
 
   // 5. Verify ordinary callers without preventReopen still reopen COMPLETED/FAILED jobs
   const reopenCall = await enqueueJob('SEARCH_YOUTUBE', { queryRunId: 'run_db_test_1', pageNumber: 2 }, {
-    priority: 20,
-    maxAttempts: 3,
+    priority: 25,
+    maxAttempts: 5,
     idempotencyKey,
     clientOverride: client,
     preventReopen: false
@@ -277,6 +277,9 @@ test('database-backed: preventReopen=true preserves PENDING, PROCESSING, COMPLET
   assert.equal(reopenCall.id, job1.id);
   assert.equal(reopenCall.status, 'PENDING');
   assert.equal(reopenCall.attempts, 0);
+  const reopenedRow = db.exec(`SELECT priority, max_attempts FROM jobs WHERE id = '${job1.id}'`)[0].values[0];
+  assert.equal(Number(reopenedRow[0]), 25, 'reopen applies the recovery request priority');
+  assert.equal(Number(reopenedRow[1]), 5, 'reopen applies the recovery request attempt budget');
   assert.equal((reopenCall as any).completed_at ?? null, null);
 });
 

@@ -1,5 +1,5 @@
 import { getExcludedCountries } from './db';
-import { CountryExclusionMatch, findCountryExclusion, normalizeCountryName } from './countryExclusionRules';
+import { CountryExclusionMatch, countryIdentityKey, findCountryExclusion } from './countryExclusionRules';
 
 export { findCountryExclusion, normalizeCountryName } from './countryExclusionRules';
 
@@ -40,8 +40,10 @@ export function shouldBlockEnrichClaimForCountry(
   if (typeof country !== 'string' || !country.trim()) return null;
   if (!exclusion) return null;
   // Defense in depth: the match must belong to this country. A stale or
-  // mismatched lookup result must never block the wrong country.
-  if (normalizeCountryName(exclusion.country) !== normalizeCountryName(country)) return null;
+  // mismatched lookup result must never block the wrong country. Compare
+  // canonical identities so an alias row (`DE`) still guards its full-name
+  // claim (`Germany`).
+  if (countryIdentityKey(exclusion.country) !== countryIdentityKey(country)) return null;
   return exclusion;
 }
 

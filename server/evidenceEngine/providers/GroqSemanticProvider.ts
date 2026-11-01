@@ -374,6 +374,18 @@ export interface GroqTextCompletionDeps {
    */
   validateContent?: (content: string) => boolean;
   /**
+   * Invoked immediately before each real HTTP request. Failover can try
+   * several routes; callers use this to account actual requests separately
+   * from the single logical call.
+   */
+  onRequestAttempt?: () => void;
+  /**
+   * Invoked with the provider's text content for every response, before any
+   * JSON/admissibility validation. Failed or retried attempts are still
+   * billable output and must reach the caller's cost ledger.
+   */
+  onResponseText?: (content: string) => void;
+  /**
    * Hard time budget for each telemetry emit inside the adapter. Telemetry is
    * best-effort: a hung provider_call_events write must not stall the internal
    * failover promise (delaying the next route or turning a completed fetch
@@ -507,6 +519,7 @@ export async function runGroqTextCompletion(
         if (Date.now() >= Math.min(deadlineAtMs, attemptDeadlineMs)) {
           throw new ProviderCallError('Groq extraction exceeded its aggregate deadline.', 'TIMEOUT', true);
         }
+        deps?.onRequestAttempt?.();
         const res = await fetchImpl(GROQ_API_BASE_URL, {
         method: 'POST',
         headers: { Authorization: `Bearer ${route.key}`, 'Content-Type': 'application/json' },
@@ -535,6 +548,10 @@ export async function runGroqTextCompletion(
           status: res.status,
         });
       }
+      // Account every content response before validation. A rejected or
+      // malformed completion still consumed provider output, so it belongs in
+      // the same budget ledger as the final successful call.
+      deps?.onResponseText?.(content);
       // Content must parse as JSON (mirroring the caller's parser). All
       // content failures below are non-retryable within the pool: an empty,
       // braceless, or malformed-but-complete completion repeats identically

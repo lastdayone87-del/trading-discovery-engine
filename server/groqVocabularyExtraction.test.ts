@@ -326,6 +326,65 @@ test('telemetry failures never mask the provider error', async () => {
   }
 });
 
+test('provider text is ledgered before content validation, including rejected and malformed output', async () => {
+  const saved = saveGroqEnv();
+  try {
+    withEnv({ GROQ_API_KEY: 'test-key-ledger' }, 'org-ledger');
+    const rejected = '{"terminology":[]}';
+    const seenRejected: string[] = [];
+    await assert.rejects(
+      runGroqTextCompletion(
+        { prompt: 'extract' },
+        {
+          fetchImpl: stubFetch(async () => envelope(rejected)),
+          emit: async () => undefined,
+          persistedCooldownExpiryMs: async () => undefined,
+          minIntervalMs: 0,
+          validateContent: () => false,
+          onResponseText: text => seenRejected.push(text),
+        }
+      )
+    );
+    assert.deepEqual(seenRejected, [rejected], 'a content-rejected response is still billable output');
+
+    const malformed = 'this is not json';
+    const seenMalformed: string[] = [];
+    await assert.rejects(
+      runGroqTextCompletion(
+        { prompt: 'extract' },
+        {
+          fetchImpl: stubFetch(async () => envelope(malformed)),
+          emit: async () => undefined,
+          persistedCooldownExpiryMs: async () => undefined,
+          minIntervalMs: 0,
+          onResponseText: text => seenMalformed.push(text),
+        }
+      )
+    );
+    assert.deepEqual(seenMalformed, [malformed], 'malformed content still consumed provider output');
+
+    const accepted = '{"terminology":["Charttechnik"]}';
+    const seenAccepted: string[] = [];
+    const text = await runGroqTextCompletion(
+      { prompt: 'extract' },
+      {
+        fetchImpl: stubFetch(async () => envelope(accepted)),
+        emit: async () => undefined,
+        persistedCooldownExpiryMs: async () => undefined,
+        minIntervalMs: 0,
+        validateContent: () => true,
+        onResponseText: value => seenAccepted.push(value),
+      }
+    );
+    assert.equal(text, accepted);
+    assert.deepEqual(seenAccepted, [accepted]);
+  } finally {
+    restoreGroqEnv(saved);
+    resetGroqCooldownForTests();
+    resetGroqVocabularyPacingForTests();
+  }
+});
+
 test('empty message content is transient; auth-shaped failures never crash', async () => {
   const saved = saveGroqEnv();
   try {

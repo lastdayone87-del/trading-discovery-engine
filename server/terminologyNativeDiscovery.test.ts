@@ -677,7 +677,7 @@ function fakeRunner(scenarios: {
   aggregates: Record<string, unknown>;
   quality: { v1: number; spam: boolean; novel: boolean };
   latestEvent?: Record<string, unknown> | null;
-  performance?: { executions: number; quota: number; confirmed: number; nontrading: number; wrong: number; review: number; fresh?: number };
+  performance?: { executions: number; quota: number; confirmed: number; nontrading: number; wrong: number; review: number; freshConfirmed?: number };
 }): { query: (text: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }>; calls: RecordedCall[] } {
   const calls: RecordedCall[] = [];
   return {
@@ -688,8 +688,8 @@ function fakeRunner(scenarios: {
         return { rows: [{ v1: scenarios.quality.v1, spam: scenarios.quality.spam, novel: scenarios.quality.novel }] };
       }
       if (text.includes('FROM terminology_performance WHERE canonical_term_id=$1')) {
-        const perf = scenarios.performance ?? { executions: 0, quota: 0, confirmed: 0, nontrading: 0, wrong: 0, review: 0, fresh: 0 };
-        return { rows: [{ executions: perf.executions, quota: perf.quota, confirmed: perf.confirmed, nontrading: perf.nontrading, wrong: perf.wrong, review: perf.review, fresh: perf.fresh }] };
+        const perf = scenarios.performance ?? { executions: 0, quota: 0, confirmed: 0, nontrading: 0, wrong: 0, review: 0, freshConfirmed: 0 };
+        return { rows: [{ executions: perf.executions, quota: perf.quota, confirmed: perf.confirmed, nontrading: perf.nontrading, wrong: perf.wrong, review: perf.review, fresh_confirmed: perf.freshConfirmed ?? 0 }] };
       }
       if (text.startsWith('SELECT event_type, reason FROM')) {
         return { rows: scenarios.latestEvent ? [scenarios.latestEvent] : [] };
@@ -1242,7 +1242,7 @@ test('native term without verified traders is capped at trial, never proven', as
     // Row below trial: the legacy decision would promote straight to PROVEN.
     aggregates: { ...provenAggregates(), lifecycle_status: 'OBSERVED', search_eligible: false },
     quality: { v1: 1, spam: false, novel: true },
-    performance: { executions: 5, quota: 2000, confirmed: 0, nontrading: 1, wrong: 0, review: 1, fresh: 4 },
+    performance: { executions: 5, quota: 2000, confirmed: 0, nontrading: 1, wrong: 0, review: 1, freshConfirmed: 0 },
   });
   await refreshTerminologyLifecycle(42, undefined, runner as never);
   const updates = runner.calls.filter(call => call.text.startsWith('UPDATE canonical_trading_terms'));
@@ -1275,7 +1275,7 @@ test('repeat-only confirmations cannot clear the verified-trader bar', async () 
   const runner = fakeRunner({
     aggregates: { ...provenAggregates(), lifecycle_status: 'OBSERVED', search_eligible: false },
     quality: { v1: 1, spam: false, novel: true },
-    performance: { executions: 5, quota: 2000, confirmed: 12, nontrading: 0, wrong: 0, review: 0, fresh: 0 },
+    performance: { executions: 5, quota: 2000, confirmed: 12, nontrading: 0, wrong: 0, review: 0, freshConfirmed: 0 },
   });
   await refreshTerminologyLifecycle(42, undefined, runner as never);
   const updates = runner.calls.filter(call => call.text.startsWith('UPDATE canonical_trading_terms'));
@@ -1290,7 +1290,7 @@ test('native term with verified traders still reaches proven', async () => {
   const runner = fakeRunner({
     aggregates: provenAggregates(),
     quality: { v1: 1, spam: false, novel: true },
-    performance: { executions: 5, quota: 2000, confirmed: 12, nontrading: 0, wrong: 0, review: 0, fresh: 12 },
+    performance: { executions: 5, quota: 2000, confirmed: 12, nontrading: 0, wrong: 0, review: 0, freshConfirmed: 12 },
   });
   await refreshTerminologyLifecycle(42, undefined, runner as never);
   const updates = runner.calls.filter(call => call.text.startsWith('UPDATE canonical_trading_terms'));

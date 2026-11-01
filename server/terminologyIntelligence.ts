@@ -456,6 +456,8 @@ export function evaluateNativeTermPromotion(input: {
   executions: number;
   quotaConsumed: number;
   confirmedTradingCreators: number;
+  /** Fresh confirmed traders for the no-repeat-only bar; shares use the full count. */
+  freshConfirmedTradingCreators?: number;
   nonTradingCreators: number;
   wrongCountryCreators: number;
   needsReviewCreators: number;
@@ -470,6 +472,7 @@ export function evaluateNativeTermPromotion(input: {
   if (!input.novel) {
     return { decision: 'REJECT', reasons: ['not-novel: generics served via curated paths'], metrics: emptyPromotionMetrics() };
   }
+  const freshConfirmedTradingCreators = input.freshConfirmedTradingCreators ?? input.confirmedTradingCreators;
   if (input.executions < NATIVE_PROMOTION_MIN_EXECUTIONS) {
     reasons.push(`insufficient-executions:${input.executions}<${NATIVE_PROMOTION_MIN_EXECUTIONS}`);
   }
@@ -487,8 +490,10 @@ export function evaluateNativeTermPromotion(input: {
     input.wrongCountryCreators + input.needsReviewCreators;
   const metrics: NativePromotionMetrics = {
     // Verified-trader yield only: unverified or review-only discoveries can
-    // never satisfy the promotion bar on their own.
-    yieldPer1000Quota: input.quotaConsumed > 0 ? (1000 * input.confirmedTradingCreators) / input.quotaConsumed : 0,
+    // never satisfy the promotion bar on their own. Yield uses fresh
+    // confirmations so repeat sightings of known traders cannot inflate the
+    // per-quota rate; shares keep the full confirmed base.
+    yieldPer1000Quota: input.quotaConsumed > 0 ? (1000 * freshConfirmedTradingCreators) / input.quotaConsumed : 0,
     confirmedShare: totalAttributed > 0 ? input.confirmedTradingCreators / totalAttributed : 0,
     wrongCountryShare: totalAttributed > 0 ? input.wrongCountryCreators / totalAttributed : 0,
     reviewShare: totalAttributed > 0 ? input.needsReviewCreators / totalAttributed : 0,
@@ -503,7 +508,7 @@ export function evaluateNativeTermPromotion(input: {
   // Verified-trader evidence is required independently of non-trading volume:
   // a trial with zero confirmed trading creators holds for verification even
   // when nothing contradicts it yet (review-only or unattributed outcomes).
-  if (input.confirmedTradingCreators < 1) {
+  if (freshConfirmedTradingCreators < 1) {
     return { decision: 'HOLD', reasons: ['no-verified-traders'], metrics };
   }
   if (metrics.reviewShare > NATIVE_PROMOTION_REVIEW_HOLD_SHARE) {
@@ -517,6 +522,382 @@ export function evaluateNativeTermPromotion(input: {
 
 function emptyPromotionMetrics(): NativePromotionMetrics {
   return { yieldPer1000Quota: 0, confirmedShare: 0, wrongCountryShare: 0, reviewShare: 0 };
+}
+
+// ---------------------------------------------------------------------------
+// Native evidence v2: lifecycle and promotion policy
+// ---------------------------------------------------------------------------
+
+export const NATIVE_V2_MAX_WRONG_COUNTRY_SHARE = 0.25;
+export const NATIVE_V2_NO_PROVEN_WRONG_COUNTRY_SHARE = 0.10;
+export const NATIVE_V2_REVOKE_TRIAL_REVIEW_SHARE = 0.25;
+export const NATIVE_V2_NO_PROVEN_REVIEW_SHARE = 0.20;
+export const NATIVE_V2_DEMOTE_REVIEW_SHARE = 0.40;
+export const NATIVE_V2_MIN_CONFIRMED_SHARE = 0.50;
+
+export interface LifecycleV2Input {
+  current: TerminologyLifecycle;
+  termType: TerminologyTermType;
+  decayedEvidence: number;
+  nativeCreators: number;
+  /**
+   * Native independence buckets: creators grouped by a non-null community
+   * fingerprint, or by creator when no fingerprint exists. Three copies of the
+   * same community count as one bucket, not three creators (T6).
+   */
+  nativeEvidenceBuckets?: number;
+  /**
+   * Distinct external independence buckets. `externalEligible` is true only
+   * when at least two independent sources from at least two families match
+   * the local surface (the evaluateExternalTermEvidence contract).
+   */
+  externalSources: number;
+  externalSourceCount?: number;
+  externalEligible?: boolean;
+  /**
+   * Trial-evidence units contributed by qualified independent external
+   * sources. External evidence lives outside terminology_observations, so the
+   * native decayed-evidence score cannot represent it; each independent
+   * external bucket contributes one unit toward the same trial threshold.
+   */
+  externalTrialEvidenceScore?: number;
+  /**
+   * Full confirmed-trader count, including repeat sightings. Used for the
+   * wrong-country and review shares so a large confirmed base is not replaced
+   * by the smaller fresh-creator count.
+   */
+  confirmedTradingCreators: number;
+  /**
+   * Fresh confirmed traders for the no-repeat-only promotion bar. Defaults to
+   * confirmedTradingCreators; never substitute it into the share denominator.
+   */
+  freshConfirmedTradingCreators?: number;
+  nonTradingCreators: number;
+  wrongCountryCreators: number;
+  needsReviewCreators: number;
+  executions: number;
+  decayedYield: number;
+  quotaConsumed: number;
+  /** Coordinated-burst flag; three buckets hold until a fourth independent bucket. */
+  coordinatedBurst?: boolean;
+  /**
+   * Native-v1 novelty verdict for the native evidence backing this basis.
+   * Fail-closed when absent: legacy native rows promoted by migration 161 do
+   * not carry a quality marker, so `null` is reserved for external-only
+   * validation where no native novelty claim exists.
+   */
+  nativeNovel?: boolean | null;
+  /** Native-v1 spam verdict; only an explicit true blocks promotion. */
+  spamConfirmed?: boolean;
+}
+
+export interface LifecycleV2Decision {
+  status: TerminologyLifecycle;
+  searchEligible: boolean;
+  reason: string;
+}
+
+/**
+ * V2 lifecycle policy: Discord communities are no longer a promotion gate.
+ * Independence comes from promotion-eligible native creators or independently
+ * corroborated external evidence. The PROVEN bar reuses
+ * evaluateNativeTermPromotionV2, so wrong-country and review-burden caps are
+ * applied before any promotion. Pure; refresh persists the result.
+ */
+export function decideLifecycleV2(
+  input: LifecycleV2Input,
+  policy = DEFAULT_TERMINOLOGY_POLICY
+): LifecycleV2Decision {
+  const freshConfirmedTradingCreators = input.freshConfirmedTradingCreators ?? input.confirmedTradingCreators;
+  const totalAttributed =
+    input.confirmedTradingCreators + input.nonTradingCreators +
+    input.wrongCountryCreators + input.needsReviewCreators;
+  const confirmedShare = totalAttributed > 0 ? input.confirmedTradingCreators / totalAttributed : 0;
+  const wrongCountryShare = totalAttributed > 0 ? input.wrongCountryCreators / totalAttributed : 0;
+  const reviewShare = totalAttributed > 0 ? input.needsReviewCreators / totalAttributed : 0;
+  const nativeBuckets = Math.max(0, input.nativeEvidenceBuckets ?? input.nativeCreators);
+  const externalSourceCount = Math.max(0, input.externalSourceCount ?? input.externalSources);
+  const externalEligible = input.externalEligible ?? externalSourceCount >= 2;
+  const nativeBasis = nativeBuckets >= policy.validationCreators;
+  const mixedBasis = nativeBuckets >= 2 && externalSourceCount >= 1;
+  const externalOnlyBasis = externalEligible && input.nativeCreators === 0;
+  const validationBasis = nativeBasis || mixedBasis || externalOnlyBasis;
+  const tradingValidNativeBasis =
+    nativeBasis && freshConfirmedTradingCreators >= 1 && confirmedShare >= NATIVE_V2_MIN_CONFIRMED_SHARE;
+  const externalTrialEvidence = externalOnlyBasis &&
+    input.decayedEvidence + Math.max(0, input.externalTrialEvidenceScore ?? 0) >= policy.trialEvidence;
+  const nativeTrialEvidence =
+    (nativeBasis || mixedBasis) &&
+    input.decayedEvidence >= policy.trialEvidence &&
+    tradingValidNativeBasis;
+  const trialEvidence = externalTrialEvidence || nativeTrialEvidence;
+
+  if (input.executions >= policy.demotionExecutions && input.decayedYield < policy.demotionYield) {
+    return { status: 'DEMOTED', searchEligible: false, reason: 'Sustained production yield fell below the configured demotion threshold.' };
+  }
+  if (input.termType === 'BRAND') {
+    return {
+      status: input.decayedEvidence >= policy.observedEvidence ? 'OBSERVED' : 'CANDIDATE',
+      searchEligible: false,
+      reason: 'Branding evidence is retained but cannot automatically become a search term.',
+    };
+  }
+  if (wrongCountryShare > NATIVE_V2_MAX_WRONG_COUNTRY_SHARE) {
+    return {
+      status: 'DEMOTED',
+      searchEligible: false,
+      reason: `Wrong-country share ${wrongCountryShare.toFixed(2)} exceeds the ${NATIVE_V2_MAX_WRONG_COUNTRY_SHARE} cap; trial revoked until new independent evidence clears the gates.`,
+    };
+  }
+  if (reviewShare > NATIVE_V2_DEMOTE_REVIEW_SHARE) {
+    return {
+      status: 'DEMOTED',
+      searchEligible: false,
+      reason: `Review burden ${reviewShare.toFixed(2)} exceeds the ${NATIVE_V2_DEMOTE_REVIEW_SHARE} demotion cap.`,
+    };
+  }
+  // Coordinated bursts need a fourth independent bucket before they can leave
+  // HOLD. Three buckets (the minimum validation basis) are not enough when the
+  // evidence looks coordinated.
+  if (validationBasis && input.coordinatedBurst === true && nativeBuckets < 4) {
+    return {
+      status: 'MULTI_CREATOR_VALIDATED',
+      searchEligible: false,
+      reason: `Coordinated burst with ${nativeBuckets} independence bucket(s); holding until a fourth independent bucket is observed.`,
+    };
+  }
+  if (validationBasis) {
+    // Novelty/spam are native-v1 quality verdicts. Any native contribution
+    // (native or mixed basis) must carry an affirmative novelty verdict; a
+    // missing marker is treated as non-novel rather than skipping the check.
+    // External-only validation has no native novelty claim, so null remains
+    // the explicit skip for that case.
+    const nativeQuality = (nativeBasis || mixedBasis)
+      ? { novel: input.nativeNovel ?? false, spamConfirmed: input.spamConfirmed === true }
+      : { novel: null, spamConfirmed: false };
+    const verdict = evaluateNativeTermPromotionV2({
+      ...nativeQuality,
+      executions: input.executions,
+      quotaConsumed: input.quotaConsumed,
+      confirmedTradingCreators: input.confirmedTradingCreators,
+      freshConfirmedTradingCreators,
+      nonTradingCreators: input.nonTradingCreators,
+      wrongCountryCreators: input.wrongCountryCreators,
+      needsReviewCreators: input.needsReviewCreators,
+      validationBasis,
+      decayedEvidence: input.decayedEvidence,
+      decayedYield: input.decayedYield,
+    });
+    if (verdict.decision === 'PROMOTE') {
+      return { status: 'PROVEN_SEARCH_TERM', searchEligible: true, reason: verdict.reasons.join('; ') };
+    }
+  }
+  if (reviewShare > NATIVE_V2_REVOKE_TRIAL_REVIEW_SHARE) {
+    return {
+      status: validationBasis ? 'MULTI_CREATOR_VALIDATED' : 'OBSERVED',
+      searchEligible: false,
+      reason: `Review burden ${reviewShare.toFixed(2)} exceeds the ${NATIVE_V2_REVOKE_TRIAL_REVIEW_SHARE} trial-revocation cap.`,
+    };
+  }
+  if (validationBasis && trialEvidence) {
+    return {
+      status: 'SEARCH_TRIAL',
+      searchEligible: true,
+      reason: externalOnlyBasis
+        ? 'Independently corroborated external evidence qualifies the term for controlled exploration.'
+        : 'Independent native creators and trading-valid evidence qualify the term for controlled exploration.',
+    };
+  }
+  // Existing search eligibility is not revoked merely because a fresh
+  // confirmed-trader share check would fail to promote a new trial. The term
+  // stays on trial (search-eligible) until a yield, wrong-country, or review
+  // cap explicitly demotes/revokes it (T11). New trials still need the full
+  // trading-valid basis.
+  if (
+    validationBasis &&
+    (input.current === 'SEARCH_TRIAL' || input.current === 'PROVEN_SEARCH_TERM') &&
+    input.decayedEvidence >= policy.trialEvidence &&
+    confirmedShare < NATIVE_V2_MIN_CONFIRMED_SHARE
+  ) {
+    return {
+      status: 'SEARCH_TRIAL',
+      searchEligible: true,
+      reason: `Existing trial retained; confirmed-trader share ${confirmedShare.toFixed(2)} is below the new-promotion bar.`,
+    };
+  }
+  if (validationBasis) {
+    return {
+      status: 'MULTI_CREATOR_VALIDATED',
+      searchEligible: false,
+      reason: 'Independent validation basis met; trial evidence or trading-valid native evidence is still insufficient.',
+    };
+  }
+  if (input.nativeCreators >= 1 || input.externalSources >= 1 || input.decayedEvidence >= policy.observedEvidence) {
+    return { status: 'OBSERVED', searchEligible: false, reason: 'Durable normalized evidence has been observed.' };
+  }
+  return { status: 'CANDIDATE', searchEligible: false, reason: 'Evidence remains below the observation threshold.' };
+}
+
+/**
+ * V2 promotion bar. Extends the native-v1 dimensions with the tightened
+ * wrong-country and review-burden caps, and replaces the Discord-community
+ * gate with a caller-supplied validation basis (native creators or external
+ * corroboration). Novelty is skipped only when `novel === null`, which is the
+ * external-only case with no native-v1 quality evidence.
+ */
+export function evaluateNativeTermPromotionV2(input: {
+  novel: boolean | null;
+  spamConfirmed: boolean;
+  executions: number;
+  quotaConsumed: number;
+  confirmedTradingCreators: number;
+  /** Fresh confirmed traders for the no-repeat-only bar; shares use the full count. */
+  freshConfirmedTradingCreators?: number;
+  nonTradingCreators: number;
+  wrongCountryCreators: number;
+  needsReviewCreators: number;
+  validationBasis: boolean;
+  decayedEvidence: number;
+  decayedYield: number;
+}): { decision: 'PROMOTE' | 'HOLD' | 'REJECT'; reasons: string[]; metrics: NativePromotionMetrics } {
+  const reasons: string[] = [];
+  if (input.spamConfirmed) {
+    return { decision: 'REJECT', reasons: ['spam-confirmed'], metrics: emptyPromotionMetrics() };
+  }
+  if (input.novel === false) {
+    return { decision: 'REJECT', reasons: ['not-novel: generics served via curated paths'], metrics: emptyPromotionMetrics() };
+  }
+  const freshConfirmedTradingCreators = input.freshConfirmedTradingCreators ?? input.confirmedTradingCreators;
+  const totalAttributed =
+    input.confirmedTradingCreators + input.nonTradingCreators +
+    input.wrongCountryCreators + input.needsReviewCreators;
+  const metrics: NativePromotionMetrics = {
+    // Repeat sightings of known traders do not add verified yield per quota.
+    // Shares still use the full confirmed base so a large repeat cohort does
+    // not shrink the denominator.
+    yieldPer1000Quota: input.quotaConsumed > 0 ? (1000 * freshConfirmedTradingCreators) / input.quotaConsumed : 0,
+    confirmedShare: totalAttributed > 0 ? input.confirmedTradingCreators / totalAttributed : 0,
+    wrongCountryShare: totalAttributed > 0 ? input.wrongCountryCreators / totalAttributed : 0,
+    reviewShare: totalAttributed > 0 ? input.needsReviewCreators / totalAttributed : 0,
+  };
+  if (!input.validationBasis) reasons.push('insufficient-independent-evidence');
+  if (input.executions < NATIVE_PROMOTION_MIN_EXECUTIONS) {
+    reasons.push(`insufficient-executions:${input.executions}<${NATIVE_PROMOTION_MIN_EXECUTIONS}`);
+  }
+  if (input.quotaConsumed <= 0) reasons.push('no-quota-basis');
+  if (input.decayedYield < 0.28) reasons.push(`decayed-yield-below-bar:${input.decayedYield.toFixed(2)}<0.28`);
+  if (metrics.yieldPer1000Quota < NATIVE_PROMOTION_MIN_YIELD_PER_1000_QUOTA) {
+    reasons.push(`yield-below-bar:${metrics.yieldPer1000Quota.toFixed(2)}`);
+  }
+  if (metrics.wrongCountryShare > NATIVE_V2_MAX_WRONG_COUNTRY_SHARE) {
+    return { decision: 'REJECT', reasons: [`wrong-country-share:${metrics.wrongCountryShare.toFixed(2)}`], metrics };
+  }
+  if (metrics.reviewShare > NATIVE_V2_DEMOTE_REVIEW_SHARE) {
+    return { decision: 'REJECT', reasons: [`review-burden-demote:${metrics.reviewShare.toFixed(2)}`], metrics };
+  }
+  if (freshConfirmedTradingCreators < 1) reasons.push('no-verified-traders');
+  if (metrics.confirmedShare < NATIVE_V2_MIN_CONFIRMED_SHARE) {
+    reasons.push(`confirmed-share-below-bar:${metrics.confirmedShare.toFixed(2)}<${NATIVE_V2_MIN_CONFIRMED_SHARE}`);
+  }
+  if (metrics.wrongCountryShare > NATIVE_V2_NO_PROVEN_WRONG_COUNTRY_SHARE) {
+    reasons.push(`wrong-country-share-no-proven:${metrics.wrongCountryShare.toFixed(2)}`);
+  }
+  if (metrics.reviewShare > NATIVE_V2_NO_PROVEN_REVIEW_SHARE) {
+    reasons.push(`review-burden-no-proven:${metrics.reviewShare.toFixed(2)}`);
+  }
+  if (reasons.length > 0) return { decision: 'HOLD', reasons, metrics };
+  return { decision: 'PROMOTE', reasons: ['meets-native-v2-promotion-bar'], metrics };
+}
+
+export interface ExternalTermEvidenceRow {
+  sourceId: string;
+  sourceFamily: string;
+  correlationKey?: string | null;
+  observedAt: string;
+  confidence: number;
+  reliability: number;
+  relevance: number;
+  surface: string;
+  language: string;
+  script: string;
+}
+
+export interface ExternalTermEvidenceResult {
+  eligible: boolean;
+  independentSources: number;
+  families: string[];
+  reasons: string[];
+}
+
+/**
+ * External corroboration for a local term. Only the term's normalized local
+ * surface or a governed alias matches — an English canonical_concept alone
+ * never promotes a local-language term. TREND_SURFACE is excluded, and the
+ * strength/freshness/script criteria mirror aggregateOsintEvidence.
+ */
+export function evaluateExternalTermEvidence(args: {
+  term: string;
+  aliases: string[];
+  language?: string | null;
+  script?: string | null;
+  rows: ExternalTermEvidenceRow[];
+  now?: Date;
+}): ExternalTermEvidenceResult {
+  const target = normalizeTerm(args.term);
+  const aliasSet = new Set(args.aliases.map(normalizeTerm));
+  const now = args.now || new Date();
+  const reasons: string[] = [];
+  const matching = args.rows.filter(row => {
+    const surface = normalizeTerm(row.surface);
+    if (surface !== target && !aliasSet.has(surface)) return false;
+    if (String(row.sourceFamily).toUpperCase() === 'TREND_SURFACE') return false;
+    const observed = Date.parse(row.observedAt);
+    const ageMs = now.getTime() - observed;
+    // Future-dated rows are not fresh corroboration: an age-only check would
+    // let a bad clock or forged timestamp validate a term indefinitely.
+    // Allow only a small skew for clock drift between collectors.
+    if (!Number.isFinite(observed) || ageMs > 30 * 86_400_000 || ageMs < -5 * 60_000) return false;
+    return true;
+  });
+  const targetLanguage = (args.language || '').split('-')[0].toLowerCase();
+  // Unknown/undetermined language fails closed: matching homographs across
+  // languages are not evidence that this is the local surface. Corroboration
+  // must be same-language as the target term.
+  const languageMatched = targetLanguage && targetLanguage !== 'und'
+    ? matching.filter(row => String(row.language || '').split('-')[0].toLowerCase() === targetLanguage)
+    : [];
+  const targetScript = (args.script || '').toUpperCase();
+  const scriptMatched = targetScript && targetScript !== 'ZYYY'
+    ? languageMatched.filter(row => String(row.script || '').toUpperCase() === targetScript)
+    : languageMatched;
+  if (scriptMatched.length === 0) {
+    return { eligible: false, independentSources: 0, families: [], reasons: ['NO_MATCHING_LOCAL_SURFACE'] };
+  }
+  const scripts = new Set(scriptMatched.map(row => String(row.script || '').toUpperCase()));
+  if (scripts.size !== 1) reasons.push('SCRIPT_CONFLICT');
+  const buckets = new Map<string, Set<string>>();
+  const families = new Set<string>();
+  let weightedSum = 0;
+  for (const row of scriptMatched) {
+    const key = row.correlationKey?.trim().toLowerCase() || `source:${row.sourceId.trim().toLowerCase()}`;
+    const bucket = buckets.get(key) || new Set<string>();
+    bucket.add(row.sourceId.trim().toLowerCase());
+    buckets.set(key, bucket);
+    families.add(String(row.sourceFamily).toUpperCase());
+    weightedSum += Math.min(1, Math.max(0, row.confidence))
+      * Math.min(1, Math.max(0, row.reliability))
+      * Math.min(1, Math.max(0, row.relevance));
+  }
+  const weighted = weightedSum / scriptMatched.length;
+  if (buckets.size < 2) reasons.push('INSUFFICIENT_INDEPENDENT_SOURCES');
+  if (families.size < 2) reasons.push('INSUFFICIENT_SOURCE_FAMILIES');
+  if (weighted < 0.55) reasons.push('INSUFFICIENT_EVIDENCE_STRENGTH');
+  return {
+    eligible: reasons.length === 0,
+    independentSources: buckets.size,
+    families: [...families].sort(),
+    reasons,
+  };
 }
 
 export interface NativeQualityRollup {
@@ -587,11 +968,15 @@ export const NATIVE_QUALITY_ROLLUP_SQL =
     ), false) AS novel
    FROM terminology_observations WHERE canonical_term_id=$1 AND evidence->>'qualityVersion'='native-v1'`;
 
+/** V2 quality rollup counts only promotion-eligible observations. */
+export const NATIVE_QUALITY_ROLLUP_V2_SQL = `${NATIVE_QUALITY_ROLLUP_SQL} AND promotion_eligible=true`;
+
 export async function readNativeQualityEvidence(
   termId: number,
-  runner: Queryable
+  runner: Queryable,
+  sql: string = NATIVE_QUALITY_ROLLUP_SQL
 ): Promise<NativeQualityRollup> {
-  const result = await runner.query(NATIVE_QUALITY_ROLLUP_SQL, [termId]);
+  const result = await runner.query(sql, [termId]);
   const row = ((result.rows || [])[0] || {}) as Record<string, unknown>;
   return {
     v1Observations: Number(row.v1 || 0),
@@ -647,6 +1032,16 @@ export async function observeTerminologyDetailed(args: {
   nativeEvidenceStatus?: NativeEvidenceStatus | null;
   sourceProvenanceFamily?: SourceProvenanceFamily | null;
   sourceEvidenceId?: string;
+  /**
+   * Native v2 promotion eligibility supplied by the extraction caller. false
+   * always wins; true still cannot override a failing current channel gate.
+   * undefined preserves legacy observation behavior while the flag is
+   * computed from current channel state.
+   */
+  promotionEligible?: boolean;
+  /** Autonomous run/page that produced this observation, for exact novelty attribution. */
+  queryRunId?: string;
+  queryPageNumber?: number;
 }, clientOverride?: Queryable): Promise<TerminologyObservationResult | null> {
   const canonical = args.term.normalize('NFKC').trim().replace(/\s+/gu, ' ');
   const normalized = normalizeTerm(canonical);
@@ -742,15 +1137,36 @@ export async function observeTerminologyDetailed(args: {
   // 2. Resolve native creator/locale evidence status
   let resolvedCreatorCountry: string | null = args.sourceCreatorCountry ? canonicalCountry(args.sourceCreatorCountry) : null;
   let resolvedMarketCountry: string | null = args.targetMarketCountry ? canonicalCountry(args.targetMarketCountry) : null;
+  let channelCountryStatus: string | null = null;
+  let channelTradingStatus: string | null = null;
+  let channelQualityScore = 0;
 
   if (!resolvedCreatorCountry && args.channelId) {
     const channelRes = await runner.query(
-      `SELECT country FROM channels WHERE channel_id = $1`,
+      `SELECT country, country_status, trading_status, quality_score FROM channels WHERE channel_id = $1`,
       [args.channelId]
     ).catch(() => ({ rows: [] }));
 
-    if (channelRes.rows && channelRes.rows[0] && channelRes.rows[0].country) {
-      resolvedCreatorCountry = canonicalCountry(String(channelRes.rows[0].country));
+    if (channelRes.rows && channelRes.rows[0]) {
+      const channelRow = channelRes.rows[0] as Record<string, unknown>;
+      if (channelRow.country) resolvedCreatorCountry = canonicalCountry(String(channelRow.country));
+      channelCountryStatus = channelRow.country_status ? String(channelRow.country_status) : null;
+      channelTradingStatus = channelRow.trading_status ? String(channelRow.trading_status) : null;
+      channelQualityScore = Number(channelRow.quality_score || 0);
+    }
+  } else if (args.channelId) {
+    // Country was supplied explicitly; current channel gates still have to be
+    // re-validated, so read the status/quality columns (never trust the caller
+    // for promotion eligibility).
+    const channelRes = await runner.query(
+      `SELECT country_status, trading_status, quality_score FROM channels WHERE channel_id = $1`,
+      [args.channelId]
+    ).catch(() => ({ rows: [] }));
+    if (channelRes.rows && channelRes.rows[0]) {
+      const channelRow = channelRes.rows[0] as Record<string, unknown>;
+      channelCountryStatus = channelRow.country_status ? String(channelRow.country_status) : null;
+      channelTradingStatus = channelRow.trading_status ? String(channelRow.trading_status) : null;
+      channelQualityScore = Number(channelRow.quality_score || 0);
     }
   }
 
@@ -759,10 +1175,35 @@ export async function observeTerminologyDetailed(args: {
 
   const sameCountryCreator = Boolean(resolvedCreatorCountry && resolvedCreatorCountry === country);
   const termLanguageMatchesContext = contextLang !== 'und' && codeSwitching.termLanguage === contextLang;
-  if (!resolvedNativeStatus && sameCountryCreator && termLanguageMatchesContext) {
+  // NATIVE_OBSERVED is an observation-classification fact (same country +
+  // matching language), not a promotion fact. Existing callers that do not
+  // supply a channel row keep legacy observation behavior; when a current
+  // channel row exists, a LIKELY/UNCERTAIN country or unconfirmed trader
+  // remains observation-only and is never mistaken for native evidence
+  // (CDL §7.1).
+  const nativeStatusEligible = Boolean(
+    sameCountryCreator &&
+    termLanguageMatchesContext &&
+    (channelCountryStatus === null || channelCountryStatus === 'CONFIRMED') &&
+    (channelTradingStatus === null || channelTradingStatus === 'TRADING_CONFIRMED')
+  );
+  if (!resolvedNativeStatus && nativeStatusEligible) {
     resolvedNativeStatus = 'NATIVE_OBSERVED';
     resolvedProvenanceFamily = 'CREATOR_METADATA';
   }
+  // Promotion eligibility is a conjunction: the caller may only narrow the
+  // current channel gate, never widen it. A stale caller true cannot survive
+  // reclassification, quality decay, country drift, or code switching.
+  const channelEligible = Boolean(
+    args.channelId &&
+    nativeStatusEligible &&
+    channelCountryStatus === 'CONFIRMED' &&
+    channelTradingStatus === 'TRADING_CONFIRMED' &&
+    channelQualityScore >= 55
+  );
+  const promotionEligible = Boolean(args.promotionEligible ?? channelEligible)
+    && channelEligible
+    && resolvedNativeStatus === 'NATIVE_OBSERVED';
 
   // 3. Compute deterministic observation key for single-write idempotency.
   // Classification outcomes are excluded from identity (see
@@ -869,9 +1310,9 @@ export async function observeTerminologyDetailed(args: {
        human_approval_id, human_approved, community_fingerprint, evidence_weight, evidence,
        source_creator_country, target_market_country, locale, is_code_switched,
        native_language, term_language, native_evidence_status, source_provenance_family, code_switch_type,
-       observation_key
+       observation_key, promotion_eligible, query_run_id, query_page_number
      )
-     VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+     VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
      ON CONFLICT(observation_key) DO UPDATE SET
        locale=EXCLUDED.locale, is_code_switched=EXCLUDED.is_code_switched,
        native_language=EXCLUDED.native_language, term_language=EXCLUDED.term_language,
@@ -880,6 +1321,11 @@ export async function observeTerminologyDetailed(args: {
        source_creator_country=EXCLUDED.source_creator_country,
        target_market_country=EXCLUDED.target_market_country,
        code_switch_type=EXCLUDED.code_switch_type,
+       promotion_eligible=EXCLUDED.promotion_eligible,
+       -- First attribution wins; a later replay of the same evidence can fill
+       -- provenance that a legacy writer left NULL but never steal it.
+       query_run_id=COALESCE(terminology_observations.query_run_id, EXCLUDED.query_run_id),
+       query_page_number=COALESCE(terminology_observations.query_page_number, EXCLUDED.query_page_number),
        -- Audit trail: the superseded classification is appended to an
        -- in-evidence revision log (no schema change) instead of being lost.
        -- Quality rollups read only top-level keys and are unaffected.
@@ -888,6 +1334,7 @@ export async function observeTerminologyDetailed(args: {
            'observed_at', terminology_observations.observed_at,
            'native_evidence_status', terminology_observations.native_evidence_status,
            'source_provenance_family', terminology_observations.source_provenance_family,
+           'promotion_eligible', terminology_observations.promotion_eligible,
            'term_language', terminology_observations.term_language,
            'locale', terminology_observations.locale,
            -- Complete prior evidence payload (minus nested revisions) so the
@@ -901,6 +1348,7 @@ export async function observeTerminologyDetailed(args: {
      -- revision log grows only on genuine reclassification.
      WHERE terminology_observations.native_evidence_status IS DISTINCT FROM EXCLUDED.native_evidence_status
         OR terminology_observations.source_provenance_family IS DISTINCT FROM EXCLUDED.source_provenance_family
+        OR terminology_observations.promotion_eligible IS DISTINCT FROM EXCLUDED.promotion_eligible
         OR terminology_observations.term_language IS DISTINCT FROM EXCLUDED.term_language
         OR terminology_observations.is_code_switched IS DISTINCT FROM EXCLUDED.is_code_switched
         OR terminology_observations.code_switch_type IS DISTINCT FROM EXCLUDED.code_switch_type
@@ -934,7 +1382,10 @@ export async function observeTerminologyDetailed(args: {
       resolvedNativeStatus,           // NATIVE_OBSERVED | BOOTSTRAP_SEED | TRANSLATED_SEED | NULL
       resolvedProvenanceFamily,
       codeSwitching.codeSwitchType,
-      obsKey
+      obsKey,
+      promotionEligible,
+      args.queryRunId || null,
+      Number.isFinite(args.queryPageNumber) ? Math.max(1, Math.trunc(args.queryPageNumber as number)) : null,
     ]
   );
 
@@ -996,6 +1447,75 @@ export async function addTerminologyAlias(canonicalTermId: number, alias: string
  * E2E staging proof passes — so the gate and the first native-v1 writes
  * always land on a single-version fleet.
  */
+async function readCdlTerminologyFlags(runner: Queryable): Promise<{ cdl: boolean; v2: boolean }> {
+  const result = await runner.query(
+    `SELECT setting_key, setting_value FROM app_settings WHERE setting_key = ANY($1)`,
+    [['country_discovery_loop_enabled', 'native_evidence_promotion_v2_enabled']],
+  ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
+  const values = new Map<string, string>((result.rows || []).map((row: Record<string, unknown>) => [
+    String(row.setting_key),
+    String(row.setting_value),
+  ]));
+  return {
+    cdl: values.get('country_discovery_loop_enabled') === 'true',
+    v2: values.get('native_evidence_promotion_v2_enabled') === 'true',
+  };
+}
+
+async function readExternalTermEvidence(
+  runner: Queryable,
+  termId: number,
+  term: Record<string, unknown>
+): Promise<ExternalTermEvidenceResult> {
+  const aliases = await runner.query(
+    `SELECT normalized_alias FROM trading_term_aliases WHERE canonical_term_id=$1`,
+    [termId],
+  ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
+  // Match the term and its governed aliases in SQL before the LIMIT. Filtering
+  // only in JavaScript after a country-wide LIMIT can drop valid corroboration
+  // when a country has more than 1,000 newer external rows for other terms.
+  // external_osint_observations.canonical_concept is written by the application
+  // with the same NFKC/whitespace/English-lowercase normalization as
+  // normalizeTerm. Matching that stored value avoids PostgreSQL lower(), whose
+  // case mapping follows the database collation (for example Turkish I) and
+  // can disagree with the JavaScript target surfaces. The JS re-check stays.
+  const targetSurfaces = [...new Set(
+    [term.canonical_term, ...(aliases.rows || []).map(row => row.normalized_alias)]
+      .map(value => normalizeTerm(String(value || '')))
+      .filter(Boolean),
+  )];
+  const rows = targetSurfaces.length === 0
+    ? { rows: [] as Array<Record<string, unknown>> }
+    : await runner.query(
+      `SELECT source_id, source_family, correlation_key, observed_at, confidence, reliability, relevance,
+              original_surface, language, script
+       FROM external_osint_observations
+       WHERE country=$1
+         AND observed_at >= now() - interval '30 days'
+         AND canonical_concept = ANY($2::text[])
+       ORDER BY observed_at DESC LIMIT 1000`,
+      [term.country, targetSurfaces],
+    ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
+  return evaluateExternalTermEvidence({
+    term: String(term.canonical_term || ''),
+    aliases: (aliases.rows || []).map(row => String(row.normalized_alias || '')),
+    language: term.language ? String(term.language) : null,
+    script: term.script ? String(term.script) : null,
+    rows: (rows.rows || []).map(row => ({
+      sourceId: String(row.source_id || ''),
+      sourceFamily: String(row.source_family || ''),
+      correlationKey: row.correlation_key ? String(row.correlation_key) : null,
+      observedAt: String(row.observed_at || ''),
+      confidence: Number(row.confidence || 0),
+      reliability: Number(row.reliability || 0),
+      relevance: Number(row.relevance || 0),
+      surface: String(row.original_surface || ''),
+      language: String(row.language || ''),
+      script: String(row.script || ''),
+    })),
+  });
+}
+
 export async function refreshTerminologyLifecycle(termId: number, policy = DEFAULT_TERMINOLOGY_POLICY, clientOverride?: Queryable): Promise<void> {
   const runner = clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
   if (!runner) return;
@@ -1033,6 +1553,8 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
   // namespace, one lock per refresh, always acquired first) serializes with
   // neither hazard. Namespace follows the codebase hashtext($1) convention.
   await runner.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`terminology-lifecycle:${termId}`]);
+  const flags = await readCdlTerminologyFlags(runner);
+  const v2Enabled = flags.cdl && flags.v2;
   const result = await runner.query(`SELECT t.*, COALESCE(o.distinct_creators,0)::int distinct_creators, COALESCE(o.distinct_communities,0)::int distinct_communities,
     COALESCE(o.human_approved,0)::int human_approved, COALESCE(o.decayed_evidence,0)::float decayed_evidence,
     COALESCE(p.executions,0)::int executions, COALESCE(p.decayed_yield,0)::float decayed_yield
@@ -1042,7 +1564,131 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
     LEFT JOIN LATERAL (SELECT COALESCE(SUM(executions),0) executions, COALESCE(SUM(decayed_yield_score*executions)/NULLIF(SUM(executions),0),0) decayed_yield FROM terminology_performance WHERE canonical_term_id=t.id) p ON true WHERE t.id=$1`, [termId, policy.halfLifeDays]);
   if (!result.rows[0]) return;
   const row = result.rows[0];
-  const decision = decideLifecycle({ current: row.lifecycle_status, decayedEvidence: row.decayed_evidence, distinctCreators: row.distinct_creators, distinctCommunities: row.distinct_communities, executions: row.executions, decayedYield: row.decayed_yield, termType: row.term_type }, policy);
+  let decision = decideLifecycle({ current: row.lifecycle_status, decayedEvidence: row.decayed_evidence, distinctCreators: row.distinct_creators, distinctCommunities: row.distinct_communities, executions: row.executions, decayedYield: row.decayed_yield, termType: row.term_type }, policy);
+  let v2Snapshot: Record<string, unknown> | null = null;
+  // Shared quality rollup for the v2 promotion decision and the later trial
+  // gate. Per-term serialization makes one read sufficient.
+  let cachedQuality: NativeQualityRollup | null = null;
+  if (v2Enabled) {
+    // C2 current-state reconciliation. A channel reclassified away from the
+    // term's country (or no longer CONFIRMED / TRADING_CONFIRMED / quality>=55,
+    // or no longer a native literal observation) must not leave a historical
+    // promotion_eligible=true flag behind. The aggregate below already
+    // re-validates current state and excludes these rows; clearing the stored
+    // flag keeps audit/projection truth consistent and prevents a later
+    // flag-only read from treating stale evidence as promotable. This is
+    // idempotent (the predicate is false once cleared).
+    await runner.query(
+      `UPDATE terminology_observations o
+       SET promotion_eligible=false
+       FROM channels c
+       WHERE o.canonical_term_id=$1
+         AND o.promotion_eligible=true
+         AND c.channel_id=o.source_channel_id
+         AND (
+           c.country_status IS DISTINCT FROM 'CONFIRMED'
+           OR c.trading_status IS DISTINCT FROM 'TRADING_CONFIRMED'
+           OR COALESCE(c.quality_score,0) < 55
+           OR c.country IS NULL
+           OR lower(c.country) <> lower($2)
+           OR o.source_creator_country IS NULL
+           OR lower(o.source_creator_country) <> lower($2)
+           OR o.native_evidence_status IS DISTINCT FROM 'NATIVE_OBSERVED'
+           OR o.source_provenance_family IS DISTINCT FROM 'CREATOR_METADATA'
+           OR o.is_code_switched=true
+           OR (
+             o.term_language IS NOT NULL
+             AND o.term_language NOT IN ('und','')
+             AND lower(o.term_language) <> lower($3)
+           )
+         )`,
+      [termId, row.country, row.language || 'und'],
+    );
+    const v2Aggregate = await runner.query(
+      `SELECT
+         COUNT(DISTINCT o.source_channel_id) FILTER (WHERE o.source_channel_id IS NOT NULL)::int AS native_creators,
+         COUNT(DISTINCT COALESCE(NULLIF(o.community_fingerprint,''), o.source_channel_id)) FILTER (WHERE o.source_channel_id IS NOT NULL)::int AS native_evidence_buckets,
+         COUNT(DISTINCT o.community_fingerprint) FILTER (WHERE o.community_fingerprint IS NOT NULL)::int AS distinct_communities,
+         COUNT(DISTINCT o.source_channel_id) FILTER (WHERE o.human_approved)::int AS human_approved,
+         COALESCE(SUM(o.evidence_weight * power(0.5, EXTRACT(EPOCH FROM (now()-o.observed_at))/86400/$3)),0)::float AS decayed_evidence
+       FROM terminology_observations o
+       JOIN channels c ON c.channel_id = o.source_channel_id
+       WHERE o.canonical_term_id=$1
+         AND o.promotion_eligible=true
+         AND o.native_evidence_status='NATIVE_OBSERVED'
+         AND o.source_provenance_family='CREATOR_METADATA'
+         AND c.country_status='CONFIRMED'
+         AND c.trading_status='TRADING_CONFIRMED'
+         AND COALESCE(c.quality_score,0)>=55
+         AND c.country=$2
+         AND o.source_creator_country=$2
+         AND o.is_code_switched=false
+         -- NULL means the writer did not record a term language; the demotion
+         -- query and migration backfill treat it as eligible, so the aggregate
+         -- must too or v2 promotions can never count legacy native evidence.
+         AND (o.term_language IS NULL OR o.term_language=$4 OR $4 IN ('und','') OR o.term_language IN ('und',''))`,
+      [termId, row.country, policy.halfLifeDays, row.language || 'und'],
+    );
+    const v2Row = ((v2Aggregate.rows || [])[0] || {}) as Record<string, unknown>;
+    const external = await readExternalTermEvidence(runner, termId, row as Record<string, unknown>);
+    const perf = await runner.query(
+      `SELECT COALESCE(SUM(executions),0)::int executions, COALESCE(SUM(quota_consumed),0)::int quota,
+        COALESCE(SUM(confirmed_trading_creators),0)::int confirmed, COALESCE(SUM(non_trading_creators),0)::int nontrading,
+        COALESCE(SUM(wrong_country_creators),0)::int wrong, COALESCE(SUM(needs_review_creators),0)::int review,
+        -- Exact fresh ∩ confirmed count recorded at attribution time. Legacy
+        -- rows predate the column and contribute zero rather than a possibly
+        -- inflated min(confirmed,new), which can describe different creators.
+        COALESCE(SUM(fresh_confirmed_trading_creators),0)::int fresh_confirmed
+       FROM terminology_performance WHERE canonical_term_id=$1`,
+      [termId],
+    );
+    const perfRow = ((perf.rows || [])[0] || {}) as Record<string, unknown>;
+    const freshConfirmed = Number(perfRow.fresh_confirmed || 0);
+    const v2Quality = await readNativeQualityEvidence(termId, runner, NATIVE_QUALITY_ROLLUP_V2_SQL);
+    cachedQuality = v2Quality;
+    const nativeCreators = Number(v2Row.native_creators || 0);
+    const nativeEvidenceBuckets = Number(v2Row.native_evidence_buckets || nativeCreators);
+    row.distinct_creators = nativeCreators;
+    row.distinct_communities = Number(v2Row.distinct_communities || 0);
+    row.human_approved = Number(v2Row.human_approved || 0);
+    row.decayed_evidence = Number(v2Row.decayed_evidence || 0);
+    row.executions = Number(perfRow.executions || row.executions || 0);
+    v2Snapshot = {
+      nativeCreators,
+      nativeEvidenceBuckets,
+      externalSources: external.independentSources,
+      externalEligible: external.eligible,
+      externalTrialEvidenceScore: external.independentSources,
+      externalFamilies: external.families,
+      externalReasons: external.reasons,
+      confirmedTradingCreators: Number(perfRow.confirmed || 0),
+      freshConfirmedTradingCreators: freshConfirmed,
+      wrongCountryCreators: Number(perfRow.wrong || 0),
+      needsReviewCreators: Number(perfRow.review || 0),
+      quotaConsumed: Number(perfRow.quota || 0),
+    };
+    decision = decideLifecycleV2({
+      current: row.lifecycle_status,
+      termType: row.term_type,
+      decayedEvidence: row.decayed_evidence,
+      nativeCreators,
+      nativeEvidenceBuckets,
+      externalSources: external.independentSources,
+      externalSourceCount: external.independentSources,
+      externalEligible: external.eligible,
+      externalTrialEvidenceScore: external.independentSources,
+      confirmedTradingCreators: Number(perfRow.confirmed || 0),
+      freshConfirmedTradingCreators: freshConfirmed,
+      nonTradingCreators: Number(perfRow.nontrading || 0),
+      wrongCountryCreators: Number(perfRow.wrong || 0),
+      needsReviewCreators: Number(perfRow.review || 0),
+      executions: Number(perfRow.executions || 0),
+      decayedYield: Number(row.decayed_yield || 0),
+      quotaConsumed: Number(perfRow.quota || 0),
+      nativeNovel: v2Quality.v1Observations > 0 ? v2Quality.novel : false,
+      spamConfirmed: v2Quality.spamConfirmed,
+    }, policy);
+  }
   // Native quality gate: applies whenever the term carries new-pipeline
   // (qualityVersion) evidence, whether entering eligibility or already
   // eligible. Legacy-only terms take the legacy path below byte-identically.
@@ -1065,9 +1711,9 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
   // the aggregate read is skipped (identical outcome, no wasted query). A
   // PROVEN legacy decision always sets searchEligible, so the PROVEN cap
   // below never faces a skipped read.
-  const quality = (enteringEligibility || row.search_eligible)
-    ? await readNativeQualityEvidence(termId, runner)
-    : { v1Observations: 0, spamConfirmed: false, novel: false };
+  const quality: NativeQualityRollup = cachedQuality ?? ((enteringEligibility || row.search_eligible)
+    ? await readNativeQualityEvidence(termId, runner, v2Enabled ? NATIVE_QUALITY_ROLLUP_V2_SQL : NATIVE_QUALITY_ROLLUP_SQL)
+    : { v1Observations: 0, spamConfirmed: false, novel: false });
   // Native PROVEN gate: the legacy lifecycle must not automatically mark a
   // native-v1 term PROVEN on executions/yield alone (scopeWeightedYield counts
   // in-scope channels regardless of trading outcome). Promotion to PROVEN
@@ -1080,31 +1726,28 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
   // New promotions only: an already-PROVEN row keeps its status (and trust
   // tier) even when current performance would not clear the bar fresh —
   // downgrades stay exclusively yield-driven via DEMOTED.
-  if (decision.status === 'PROVEN_SEARCH_TERM' && row.lifecycle_status !== 'PROVEN_SEARCH_TERM' && quality.v1Observations > 0) {
+  if (!v2Enabled && decision.status === 'PROVEN_SEARCH_TERM' && row.lifecycle_status !== 'PROVEN_SEARCH_TERM' && quality.v1Observations > 0) {
     const perf = await runner.query(
       `SELECT COALESCE(SUM(executions),0)::int executions, COALESCE(SUM(quota_consumed),0)::int quota,
         COALESCE(SUM(confirmed_trading_creators),0)::int confirmed, COALESCE(SUM(non_trading_creators),0)::int nontrading,
         COALESCE(SUM(wrong_country_creators),0)::int wrong, COALESCE(SUM(needs_review_creators),0)::int review,
-        COALESCE(SUM(new_creators),0)::int fresh
+        COALESCE(SUM(fresh_confirmed_trading_creators),0)::int fresh_confirmed
        FROM terminology_performance WHERE canonical_term_id=$1`,
       [termId]
     );
     const agg = ((perf.rows || [])[0] || {}) as Record<string, unknown>;
-    // Verified-trader bar counts FRESH discoveries only: confirmed_trading_creators
-    // tallies every TRADING_CONFIRMED funnel result including repeat sightings
-    // of already-known traders, so repeat-only runs could clear the bar with
-    // zero newly verified traders. Bounding by persisted new creators (a sound
-    // upper bound — every newly verified trader is a new channel) closes that
-    // without a schema change. No fresh-new breakdown exists per bucket, so
-    // the other buckets keep their stored totals (conservative direction kept:
-    // under-counting fresh confirmations can only HOLD, never wrongly promote).
-    const freshConfirmed = Math.min(Number(agg.confirmed || 0), Number(agg.fresh || 0));
+    // Verified-trader bar counts FRESH discoveries only. The attribution
+    // funnel records the exact persisted-new ∩ trading-confirmed count; the
+    // aggregate counts cannot be combined (min can describe different
+    // creators and let repeat confirmations borrow new non-trader credit).
+    const freshConfirmed = Number(agg.fresh_confirmed || 0);
     const verdict = evaluateNativeTermPromotion({
       novel: quality.novel,
       spamConfirmed: quality.spamConfirmed,
       executions: Number(agg.executions || 0),
       quotaConsumed: Number(agg.quota || 0),
-      confirmedTradingCreators: freshConfirmed,
+      confirmedTradingCreators: Number(agg.confirmed || 0),
+      freshConfirmedTradingCreators: freshConfirmed,
       nonTradingCreators: Number(agg.nontrading || 0),
       wrongCountryCreators: Number(agg.wrong || 0),
       needsReviewCreators: Number(agg.review || 0),
@@ -1155,7 +1798,7 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
         if (!(lastEvent.event_type === eventType && lastEvent.reason === blockReason)) {
           await runner.query(
             `INSERT INTO terminology_lifecycle_events(canonical_term_id,from_status,to_status,event_type,reason,evidence_snapshot) VALUES($1,$2,$3,$4,$5,$6)`,
-            [termId, row.lifecycle_status, eventTo, eventType, blockReason, JSON.stringify({ v1Observations: quality.v1Observations, novel: quality.novel, spamConfirmed: quality.spamConfirmed })]
+            [termId, row.lifecycle_status, eventTo, eventType, blockReason, JSON.stringify({ v1Observations: quality.v1Observations, novel: quality.novel, spamConfirmed: quality.spamConfirmed, ...(v2Snapshot || {}) })]
           );
         }
       }
@@ -1163,7 +1806,7 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
   }
   if (!qualityBlocked && (effectiveDecision.status !== row.lifecycle_status || effectiveDecision.searchEligible !== row.search_eligible)) {
     await runner.query('UPDATE canonical_trading_terms SET lifecycle_status=$2,search_eligible=$3,trust_tier=$4 WHERE id=$1', [termId, effectiveDecision.status, effectiveDecision.searchEligible, effectiveDecision.status === 'PROVEN_SEARCH_TERM' ? 1 : effectiveDecision.searchEligible ? 2 : 3]);
-    await runner.query(`INSERT INTO terminology_lifecycle_events(canonical_term_id,from_status,to_status,event_type,reason,evidence_snapshot) VALUES($1,$2,$3,$4,$5,$6)`, [termId, row.lifecycle_status, effectiveDecision.status, effectiveDecision.status === 'DEMOTED' ? 'DEMOTION' : 'PROMOTION', effectiveDecision.reason, JSON.stringify({ distinctCreators: row.distinct_creators, distinctCommunities: row.distinct_communities, executions: row.executions, decayedEvidence: row.decayed_evidence, decayedYield: row.decayed_yield })]);
+    await runner.query(`INSERT INTO terminology_lifecycle_events(canonical_term_id,from_status,to_status,event_type,reason,evidence_snapshot) VALUES($1,$2,$3,$4,$5,$6)`, [termId, row.lifecycle_status, effectiveDecision.status, effectiveDecision.status === 'DEMOTED' ? 'DEMOTION' : 'PROMOTION', effectiveDecision.reason, JSON.stringify({ distinctCreators: row.distinct_creators, distinctCommunities: row.distinct_communities, executions: row.executions, decayedEvidence: row.decayed_evidence, decayedYield: row.decayed_yield, ...(v2Snapshot || {}) })]);
   }
   // The snapshot records the persisted lifecycle state: when the quality
   // gate blocks a transition, decision.status was never applied.
@@ -1213,7 +1856,7 @@ export async function attributeTerminologyPerformance(query: QueryRecord, metric
     // KEY SHARE on the term row). Matches observe/refresh ordering.
     await acquireTerminologyLifecycleLock(Number(row.id), runner);
     const yieldScore = scopeWeightedYield(metrics.distinctResults, metrics.newChannels, metrics.inScopeNewChannels);
-    await runner.query(`INSERT INTO terminology_performance(canonical_term_id,query_id,retrieval_lane,search_ordering,raw_results,unique_creators,new_creators,confirmed_trading_creators,needs_review_creators,non_trading_creators,wrong_country_creators,communities_discovered,quota_consumed,decayed_yield_score) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, [row.id, query.id, String(retrievalLane || metadata.retrievalLane || 'UNKNOWN'), String(searchOrdering || metadata.searchOrdering || 'RELEVANCE'), metrics.rawResults, metrics.distinctResults, metrics.newChannels, metrics.tradingConfirmed, metrics.needsReview, metrics.nonTrading, metrics.countryRejected, metrics.communitiesDiscovered, quotaConsumed, yieldScore]);
+    await runner.query(`INSERT INTO terminology_performance(canonical_term_id,query_id,retrieval_lane,search_ordering,raw_results,unique_creators,new_creators,confirmed_trading_creators,fresh_confirmed_trading_creators,needs_review_creators,non_trading_creators,wrong_country_creators,communities_discovered,quota_consumed,decayed_yield_score) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`, [row.id, query.id, String(retrievalLane || metadata.retrievalLane || 'UNKNOWN'), String(searchOrdering || metadata.searchOrdering || 'RELEVANCE'), metrics.rawResults, metrics.distinctResults, metrics.newChannels, metrics.tradingConfirmed, Math.max(0, Math.trunc(metrics.freshTradingConfirmed || 0)), metrics.needsReview, metrics.nonTrading, metrics.countryRejected, metrics.communitiesDiscovered, quotaConsumed, yieldScore]);
     await refreshTerminologyLifecycle(Number(row.id), DEFAULT_TERMINOLOGY_POLICY, runner);
   }
 }

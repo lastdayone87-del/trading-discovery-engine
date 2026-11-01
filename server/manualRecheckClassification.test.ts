@@ -28,6 +28,14 @@ test('manual recheck may continue community inspection only through the explicit
   assert.match(recheck, /MANUAL_RESCAN_COMMUNITY_INCOMPLETE/);
 });
 
+test('manual recheck does not enqueue autonomous corpus harvests', () => {
+  assert.match(
+    ingestion,
+    /if \(extraction\.termHarvestEnabled && !isManualScan\) \{\s*await enqueueTermHarvest\(\{channelId:finalChannel\.channel_id,[\s\S]*?lineage:'AUTONOMOUS'\}\);/,
+    'operator-triggered rechecks must not enter AUTONOMOUS corpus lineage',
+  );
+});
+
 test('manual recheck preserves existing classification when fresh YouTube acquisition fails', () => {
   const acquisition = recheck.indexOf('fetchYouTubeChannelEnrichment');
   const pipeline = recheck.indexOf('processChannelThroughPipeline');

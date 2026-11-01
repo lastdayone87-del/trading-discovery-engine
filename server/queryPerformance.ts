@@ -34,6 +34,19 @@ export interface QueryFunnelMetrics {
   /** rawResults minus deferredResults; zero is safe for legacy rows. */
   evaluatedRawResults?: number;
   distinctResults: number;
+  /**
+   * Cumulative unique creators observed through this page in a run. Optional:
+   * only the autonomous run reader supplies it. When present, aggregation
+   * uses the last page's cumulative value as the run's distinct result instead
+   * of summing per-page distinct counts (which double-counts repeat creators).
+   */
+  cumulativeUniqueCreators?: number;
+  /**
+   * Cumulative unique creators rejected for country through this page in a
+   * run. Like cumulativeUniqueCreators, this prevents repeat sightings across
+   * pages from being subtracted more than once during aggregation.
+   */
+  cumulativeCountryRejected?: number;
   duplicateResults: number;
   knownChannels: number;
   newChannels: number;
@@ -50,6 +63,13 @@ export interface QueryFunnelMetrics {
   uncertain: number;
   needsReview: number;
   tradingConfirmed: number;
+  /**
+   * Exact intersection of persisted NEW creators and TRADING_CONFIRMED
+   * creators for this funnel. Optional for legacy/manual metrics that predate
+   * the field; absent means the intersection is unknown and must not be
+   * inferred from the two aggregate counts.
+   */
+  freshTradingConfirmed?: number;
   qualityChannels: number;
   communitiesDiscovered: number;
   averageQualityScore: number;
@@ -95,6 +115,10 @@ export function calculateQueryFunnel(
   const evaluated = nonTrading + uncertain + needsReview + tradingConfirmed;
   const persisted = values.filter(value => value.persisted);
   const fresh = values.filter(value => value.persisted && !value.wasKnown);
+  // Exact fresh ∩ confirmed intersection. Deriving it from the two aggregate
+  // counts (for example Math.min) lets repeat confirmed traders borrow credit
+  // from new non-traders on the same run.
+  const freshTradingConfirmed = fresh.filter(value => value.funnelOutcome === 'TRADING_CONFIRMED').length;
   const scoped = values.filter(value => value.scopeEligibility !== undefined);
   // Neutral default: with no scope signal anywhere, every fresh channel counts
   // as in-scope (identical to legacy yield). Once scope is observed, IN_SCOPE
@@ -138,6 +162,7 @@ export function calculateQueryFunnel(
     uncertain,
     needsReview,
     tradingConfirmed,
+    freshTradingConfirmed,
     qualityChannels,
     communitiesDiscovered,
     averageQualityScore,

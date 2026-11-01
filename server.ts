@@ -91,6 +91,7 @@ import { resolveBuildInfo } from './server/buildInfo';
 import { operationsTelemetrySnapshot } from './server/operationsTelemetry';
 import { getCommunityRetryWorkerHealth } from './server/operationalMaintenanceWorkers';
 import { getOperationalMaintenanceSchedulerHealth } from './server/operationalMaintenanceScheduler';
+import { gatherCountryDiscoveryHealth, gatherCountryDiscoveryMetrics } from './server/countryDiscoveryHealth';
 import { dryRunCountryBoundaryCohort, enqueueCountryBoundaryCohort, COUNTRY_BOUNDARY_RECOVERY_VERSION } from './server/countryBoundaryRecovery';
 import { browserCapabilitySnapshot, startBrowserCapabilityMonitor } from './server/browserCapability';
 import { assertProductionCountryArchitecture } from './server/productionCountryArchitecture';
@@ -283,6 +284,37 @@ async function startServer() {
   app.get('/api/health', (_req, res) => {
     const state = readiness.snapshot();
     res.status(state.readiness === 'ready' ? 200 : 503).json(state);
+  });
+
+  // Country Discovery Loop deploy gate and operating metrics. The health route
+  // returns 503 for any FAIL check (missing migration/schema, hard-cap change,
+  // stale orphaned continuations, failing provider telemetry, paid demand on),
+  // so a deploy cannot partially activate the loop. Kill switches are WARN:
+  // they are intentional operator controls, not deployment failures.
+  app.get('/api/country-discovery/health', async (_req, res) => {
+    try {
+      const report = await gatherCountryDiscoveryHealth();
+      res.status(report.healthy ? 200 : 503).json(report);
+    } catch (err: any) {
+      res.status(503).json({
+        healthy: false,
+        status: 'UNHEALTHY',
+        checkedAt: new Date().toISOString(),
+        checks: [{ id: 'health_query', status: 'FAIL', detail: err?.message || 'Country Discovery health query failed.' }],
+      });
+    }
+  });
+
+  app.get('/api/country-discovery/metrics', async (_req, res) => {
+    try {
+      res.json(await gatherCountryDiscoveryMetrics());
+    } catch (err: any) {
+      res.status(500).json({
+        error: err?.message || 'Country Discovery metrics unavailable.',
+        code: 'COUNTRY_DISCOVERY_METRICS_FAILED',
+        requestId: _req.requestId,
+      });
+    }
   });
 
   // Build identity + process-local operations telemetry (Phase 0 observability).
