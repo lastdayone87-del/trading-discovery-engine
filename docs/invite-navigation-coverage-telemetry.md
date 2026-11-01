@@ -90,7 +90,7 @@ The reason is diagnostic in P0.2. It does not change `complete`, `retryable`,
 - `collectRenderedPageContext` uses a bounded `TreeWalker` (2,000 elements,
   100 shadow roots) and a bounded frame scan over live `getElementsByTagName`
   collections (1,000). It never traverses frames or shadow roots. Context
-  counters are refreshed after scrolling and after same-document clicks so
+  counters are refreshed after scrolling and after each click so transient
   interaction-revealed frames/shadows are counted, and aggregated on the page
   error path so an enumerated page is never published as zero.
 - The published denominator and hint-rejected count come from one coherent

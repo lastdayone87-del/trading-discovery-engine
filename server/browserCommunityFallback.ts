@@ -2593,6 +2593,11 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                     telemetry,
                     onClicked: () => { clicks++; },
                   }));
+                  // Capture contexts revealed by this click before the next
+                  // click can remove them or replace the document. The
+                  // per-page counters are max-monotonic, so a transient iframe
+                  // or shadow root still counts.
+                  await recordPageContext();
                   if (clickOutcome.ok && control.popup && control.marker && popupWindowsThisClick.size === 0) {
                     examinedPopupMarkers.add(control.marker);
                   }
