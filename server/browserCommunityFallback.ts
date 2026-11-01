@@ -2523,7 +2523,6 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
       structuralHintRejected: controlsStructuralHintRejected,
       iconLabelRecovered: controlsIconLabelRecovered,
       unresolvedFailedRequests: telemetry.unresolvedFailedRequests,
-      structuralUnrecovered: controlsStructuralUnrecovered,
       // The coverage reason must see the same context the telemetry publishes:
       // a document reached only by a click still has unexamined frames and
       // shadow roots, so it cannot be reported as fully covered.
