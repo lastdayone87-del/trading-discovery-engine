@@ -200,7 +200,8 @@ The reason remains diagnostic. It does not change `complete`, `retryable`,
   the cause. Counters are aggregated on the page
   error path so an enumerated page is never published as zero.
 - The published denominator and hint-rejected count come from one coherent
-  enumeration snapshot (largest total; first wins ties). Structural and  icon-label counters are merged observations: a later, smaller snapshot can
+  enumeration snapshot (largest total; first wins ties). Structural and
+  icon-label counters are merged observations: a later, smaller snapshot can
   contribute a control that a click revealed, so they are combined per count
   rather than constrained to the denominator snapshot. A successfully clicked
   popup is excluded from the unexamined-context count. Each Crawlee retry

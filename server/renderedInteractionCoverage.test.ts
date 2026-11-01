@@ -529,6 +529,15 @@ test('a final click that navigates does not invent a gap', async () => {
   assert.equal(result.interactionGap, false, 'no original-page control was left unexamined');
 });
 
+test('only terminal success satisfies required coverage', () => {
+  const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
+  assert.match(source, /inspectedPageKeys\.add\(inspectedVisitKey\)/, 'an inspected page is tracked separately from caller-supplied visited evidence');
+  assert.doesNotMatch(source, /alreadyVisitedSet\.add\(inspectedVisitKey\)/, 'a merely inspected page never becomes shared successful evidence');
+  assert.match(source, /structuralVisitedKeys\.add\(inspectedVisitKey\)/, 'the inspected page still counts for structural-navigation deduplication');
+  assert.match(source, /for \(const identity of terminalSuccessUrls\)[\s\S]{0,160}?sharedCoveredKeys\.add\(key\)/, 'required coverage borrows only terminal-success identities');
+  assert.match(source, /classifyRequiredCoverage\(\{[\s\S]{0,200}?sharedCoveredKeys,/, 'classification receives only terminal-success shared evidence');
+});
+
 test('a seed retry refreshes its own document identity and required links', () => {
   const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
   assert.match(source, /const seedRequestKey = normalizeVisitUrl\(seedUrl\)/, 'the seed request is identified once for the crawl');

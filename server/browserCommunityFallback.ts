@@ -2506,6 +2506,11 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
       .map(normalizeVisitUrl)
       .filter((key): key is string => typeof key === 'string' && key.length > 0),
   );
+  // Pages read during this crawl are used only for navigation deduplication
+  // (a structural link back to them is not an unexamined destination). They
+  // become successful coverage evidence only after the full handler succeeds.
+  const inspectedPageKeys = new Set<string>();
+  const structuralVisitedKeys = new Set(alreadyVisitedSet);
   const discovered:DiscordCandidate[]=[];
   const hostKey = (rawUrl: string): string => {
     try { return new URL(rawUrl).hostname.toLowerCase().replace(/^www\\./, '') || 'unknown'; }
@@ -2730,7 +2735,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // it is not an unexamined destination, and enqueue must not refetch
             // it merely because it was absent from the caller-supplied set.
             const inspectedVisitKey = normalizeVisitUrl(page.url());
-            if (inspectedVisitKey) alreadyVisitedSet.add(inspectedVisitKey);
+            if (inspectedVisitKey) {
+              inspectedPageKeys.add(inspectedVisitKey);
+              structuralVisitedKeys.add(inspectedVisitKey);
+            }
             telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'PAGE_PROCESSED');
             // P0.2 context counters: structural presence only, refreshed after
             // scrolling and same-document DOM-changing clicks so frames/shadow
@@ -2916,7 +2924,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                   }
                   continue;
                 }
-                if (isUnrecoveredStructuralNavigation(href, page.url(), alreadyVisitedSet)) {
+                if (isUnrecoveredStructuralNavigation(href, page.url(), structuralVisitedKeys)) {
                   unrecoveredRejected++;
                 }
               }
@@ -3347,11 +3355,20 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               .filter((key): key is string => typeof key === 'string' && key.length > 0),
           );
           requiredTotal = requiredKeys.size;
+          // Only terminal-success evidence may satisfy the required set:
+          // caller-supplied visited keys plus this run's successful request and
+          // final-page identities. A page that was merely read before its
+          // request failed stays unvisited.
+          const sharedCoveredKeys = new Set<string>(alreadyVisitedSet);
+          for (const identity of terminalSuccessUrls) {
+            const key = normalizeVisitUrl(identity);
+            if (key) sharedCoveredKeys.add(key);
+          }
           const classified = classifyRequiredCoverage({
             requiredKeys,
             succeededKeys,
             failedClassesByKey: failedByKey,
-            sharedCoveredKeys: alreadyVisitedSet,
+            sharedCoveredKeys,
           });
           requiredUnvisited.push(...classified.unvisited);
           requiredTransientFailures.push(...classified.transientFailures);
