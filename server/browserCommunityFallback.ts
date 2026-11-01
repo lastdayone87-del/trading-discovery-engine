@@ -331,6 +331,36 @@ export function shouldSampleClickDestinationContext(input: {
     && !input.visitedKeys.has(input.destinationKey);
 }
 
+/** Context observed on a document reached only by a click. */
+export interface ClickDestinationContext {
+  frameCount: number;
+  shadowRootCount: number;
+  baseHrefPresent: boolean;
+}
+
+/**
+ * Context seen through a click that committed a new document is attributed
+ * only when no request inspected that document as its own page. A destination
+ * can be clicked before the link pass admits it (the click loop runs first),
+ * so adding its context at click time would count the same frames and shadow
+ * roots again when its own request runs. Observations are keyed by visit
+ * identity and reconciled against every document this crawl actually
+ * inspected. Pure and unit-tested.
+ */
+export function reconcileClickDestinationContext(input: {
+  observations: ReadonlyMap<string, ClickDestinationContext>;
+  inspectedKeys: ReadonlySet<string>;
+}): ClickDestinationContext {
+  const reconciled: ClickDestinationContext = { frameCount: 0, shadowRootCount: 0, baseHrefPresent: false };
+  for (const [key, observed] of input.observations) {
+    if (input.inspectedKeys.has(key)) continue;
+    reconciled.frameCount += observed.frameCount;
+    reconciled.shadowRootCount += observed.shadowRootCount;
+    reconciled.baseHrefPresent = reconciled.baseHrefPresent || observed.baseHrefPresent;
+  }
+  return reconciled;
+}
+
 /**
  * Normalized identity for visit-set matching (shared-evidence registry and
  * already-visited exclusion): scheme + lowercased host + non-default port +
@@ -2100,6 +2130,13 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   // URLs admitted for enqueue are inspected by their own request, so a click
   // that lands on one must not also count its context here.
   const admittedEnqueueKeys = new Set<string>();
+  // Context seen through a click that committed a new document, keyed by
+  // destination identity. It is reconciled at publish time against every
+  // document this crawl actually inspected: the link pass runs after the click
+  // loop, so a clicked destination can still be admitted and inspected as its
+  // own request, and counting it here as well would double the crawl totals.
+  const clickDestinationContextByKey = new Map<string, ClickDestinationContext>();
+  const inspectedDocumentKeys = new Set<string>();
   let popupTargets = 0;
   let frameCount = 0;
   let shadowRootCount = 0;
@@ -2124,6 +2161,12 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
     // of inheriting it from a failed attempt.
     baseHrefPresent = [...pageControlTotalsByRequest.values()].some(entry => entry.baseHrefPresent === true);
     scrollCapReachedStillGrowing = [...pageScrollCapByRequest.values()].some(Boolean);
+    // A clicked destination that its own request later inspects is already in
+    // the totals; only the remaining click-only observations are added.
+    const clickDestinationContext = reconcileClickDestinationContext({
+      observations: clickDestinationContextByKey,
+      inspectedKeys: inspectedDocumentKeys,
+    });
     telemetry.evidenceControlsTotal = evidenceControlsSeen || undefined;
     telemetry.evidenceControlsClicked = evidenceControlsClicked || undefined;
     telemetry.evidenceControlsFailed = evidenceControlsFailed || undefined;
@@ -2137,9 +2180,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
     telemetry.controlsStructuralHintRejected = controlsStructuralHintRejected || undefined;
     telemetry.controlsIconLabelRecovered = controlsIconLabelRecovered || undefined;
     telemetry.popupTargets = popupTargets || undefined;
-    telemetry.frameCount = frameCount || undefined;
-    telemetry.shadowRootCount = shadowRootCount || undefined;
-    telemetry.baseHrefPresent = baseHrefPresent || undefined;
+    telemetry.frameCount = (frameCount + clickDestinationContext.frameCount) || undefined;
+    telemetry.shadowRootCount = (shadowRootCount + clickDestinationContext.shadowRootCount) || undefined;
+    telemetry.baseHrefPresent = (baseHrefPresent || clickDestinationContext.baseHrefPresent) || undefined;
     telemetry.scrollCapReachedStillGrowing = scrollCapReachedStillGrowing || undefined;
     const dropSnapshot = drops.snapshot();
     const excluded: Partial<Record<NavigationPolicyExclusionReason, number>> = {};
@@ -2391,6 +2434,12 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             const pageDocumentUrl = page.url();
             await inspect();
             inspectedPages++;
+            // Record the document this request actually inspected (the request
+            // URL plus any redirect target) so a click that merely lands on it
+            // later is not attributed twice.
+            for (const identity of visitIdentityKeys(request.url, page.url())) {
+              inspectedDocumentKeys.add(identity);
+            }
             telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'PAGE_PROCESSED');
             // P0.2 context counters: structural presence only, refreshed after
             // scrolling and same-document DOM-changing clicks so frames/shadow
@@ -2426,6 +2475,16 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               pageContextAbandoned = true;
               contextMeasurementAbandoned = true;
             }
+            const recordClickDestinationContext = (destinationUrl: string, observation: ClickDestinationContext): void => {
+              const key = normalizeVisitUrl(destinationUrl);
+              if (!key) return;
+              const previous = clickDestinationContextByKey.get(key);
+              clickDestinationContextByKey.set(key, {
+                frameCount: Math.max(previous?.frameCount ?? 0, Math.max(0, Math.floor(observation.frameCount) || 0)),
+                shadowRootCount: Math.max(previous?.shadowRootCount ?? 0, Math.max(0, Math.floor(observation.shadowRootCount) || 0)),
+                baseHrefPresent: previous?.baseHrefPresent === true || observation.baseHrefPresent === true,
+              });
+            };
             const recordPageContext = async (): Promise<void> => {
               if (pageContextAbandoned) return;
               try {
@@ -2442,17 +2501,20 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                   // A click can commit a document that is never enqueued (for
                   // example a hint-matched control whose destination is
                   // hint-free). Its frames, shadow roots, and base href were
-                  // inspected but would otherwise never be sampled. Count them
-                  // here only when the destination will not be sampled by its
-                  // own request and was not already inspected.
+                  // inspected but would otherwise never be sampled. Record them
+                  // by destination and reconcile at publish time, so a
+                  // destination the link pass admits later is not counted here
+                  // and again by its own request.
                   if (shouldSampleClickDestinationContext({
                     destinationKey: normalizeVisitUrl(page.url()),
                     admittedKeys: admittedEnqueueKeys,
                     visitedKeys: alreadyVisitedSet,
                   })) {
-                    pageFrameCount = Math.max(pageFrameCount, Math.max(0, Math.floor(pageContext.frameCount) || 0));
-                    pageShadowRootCount = Math.max(pageShadowRootCount, Math.max(0, Math.floor(pageContext.shadowRootCount) || 0));
-                    pageBaseHrefPresent = pageBaseHrefPresent || pageContext.baseHrefPresent === true;
+                    recordClickDestinationContext(page.url(), {
+                      frameCount: pageContext.frameCount,
+                      shadowRootCount: pageContext.shadowRootCount,
+                      baseHrefPresent: pageContext.baseHrefPresent === true,
+                    });
                   }
                   return;
                 }

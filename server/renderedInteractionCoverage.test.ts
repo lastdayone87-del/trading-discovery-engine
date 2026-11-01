@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { combineRenderedControlOffsetAdvances, isNavigableOnlyControlWindow, mergeRenderedCoverageGapCounters, planRevealedRenderedClickTargets, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, renderedRequestControlTotalsDelta, resolveRenderedCompletionState, resolveUnexaminedPopupTargets, runRenderedClickLoop, shouldSampleClickDestinationContext, trackRenderedPopupCoverage, type RenderedControlEnumeration, type RenderedRequestControlTotals } from './browserCommunityFallback';
+import { combineRenderedControlOffsetAdvances, isNavigableOnlyControlWindow, mergeRenderedCoverageGapCounters, planRevealedRenderedClickTargets, partitionRenderedClickTargets, reconcileClickDestinationContext, remainingRenderedClickBudget, renderedClickOffsetAdvance, renderedRequestControlTotalsDelta, resolveRenderedCompletionState, resolveUnexaminedPopupTargets, runRenderedClickLoop, shouldSampleClickDestinationContext, trackRenderedPopupCoverage, type RenderedControlEnumeration, type RenderedRequestControlTotals } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -455,6 +455,10 @@ test('rendered control coverage counts overflow and uses stable markers across D
   assert.match(source, /scrollCapReachedStillGrowing = \[\.\.\.pageScrollCapByRequest\.values\(\)\]\.some\(Boolean\)/, 'a successful retry replaces the stale scroll-cap flag');
   assert.match(source, /baseHrefPresent = \[\.\.\.pageControlTotalsByRequest\.values\(\)\]\.some\(entry => entry\.baseHrefPresent === true\)/, 'base-href presence reflects the latest attempt per request');
   assert.match(source, /shouldSampleClickDestinationContext\(\{[\s\S]{0,220}?admittedKeys: admittedEnqueueKeys,[\s\S]{0,120}?visitedKeys: alreadyVisitedSet,/, 'a clicked destination that is never enqueued still contributes its context');
+  assert.match(source, /recordClickDestinationContext\(page\.url\(\), \{/, 'a clicked destination is observed by identity instead of mutating the request counters');
+  assert.match(source, /reconcileClickDestinationContext\(\{[\s\S]{0,160}?observations: clickDestinationContextByKey,[\s\S]{0,120}?inspectedKeys: inspectedDocumentKeys,/, 'click-only context is reconciled against inspected documents at publish time');
+  assert.match(source, /if \(input\.inspectedKeys\.has\(key\)\) continue;/, 'a destination its own request inspected is not counted twice');
+  assert.match(source, /for \(const identity of visitIdentityKeys\(request\.url, page\.url\(\)\)\) \{\s*inspectedDocumentKeys\.add\(identity\);/, 'every request records the document it actually inspected');
   assert.match(source, /page\.evaluate\(collectRenderedPageContext\)/, 'frame/shadow/base-href context is collected per page');
   assert.match(source, /telemetry\.coverageReason = resolveRenderedCoverageReason\(/, 'the crawl publishes a diagnostic coverage reason');
   assert.match(source, /telemetry\.controlsEnumeratedTotal = controlsEnumeratedTotal \|\| undefined/, 'pre-filter control totals are persisted');
@@ -617,6 +621,28 @@ test('a clicked destination contributes context only when no request will sample
     shouldSampleClickDestinationContext({ destinationKey: null, admittedKeys: admitted, visitedKeys: visited }),
     false,
     'an unparsable destination cannot be attributed',
+  );
+});
+
+test('a clicked destination that its own request inspects is not counted twice', () => {
+  const observations = new Map([
+    ['https://creator.example/community', { frameCount: 2, shadowRootCount: 1, baseHrefPresent: false }],
+    ['https://creator.example/landing', { frameCount: 1, shadowRootCount: 0, baseHrefPresent: true }],
+  ]);
+  const inspected = new Set(['https://creator.example/community']);
+  const reconciled = reconcileClickDestinationContext({ observations, inspectedKeys: inspected });
+  assert.equal(reconciled.frameCount, 1, 'the admitted destination is counted by its own request, not by the click');
+  assert.equal(reconciled.shadowRootCount, 0, 'the admitted destination cannot inflate shadow-root totals');
+  assert.equal(reconciled.baseHrefPresent, true, 'the click-only destination still contributes its base href');
+  assert.deepEqual(
+    reconcileClickDestinationContext({ observations, inspectedKeys: new Set() }),
+    { frameCount: 3, shadowRootCount: 1, baseHrefPresent: true },
+    'every observation counts when no request inspected the destination',
+  );
+  assert.deepEqual(
+    reconcileClickDestinationContext({ observations, inspectedKeys: new Set(observations.keys()) }),
+    { frameCount: 0, shadowRootCount: 0, baseHrefPresent: false },
+    'a fully inspected destination set leaves nothing to add',
   );
 });
 
