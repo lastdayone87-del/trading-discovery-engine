@@ -8,6 +8,7 @@ import {
   discoverRequiredSeedLinks,
   normalizeVisitUrl,
   visitIdentityKeys,
+  renderedTerminalSuccessIdentities,
   classifyRequiredCoverage,
   resolveRenderedCompletionState,
 } from './browserCommunityFallback';
@@ -405,6 +406,68 @@ test('v2 review: visit identities unify request and final page evidence', () => 
     'https://redir.example.com/landing',
   ]);
   assert.ok(visitIdentityKeys('', '').length === 0);
+});
+
+// REVIEW: a click that commits a new document must not lend that unexamined
+// document terminal-success coverage; redirects still cover both identities.
+test('v2 review: terminal success prefers the inspected document over a click replacement', () => {
+  assert.deepEqual(
+    renderedTerminalSuccessIdentities({
+      requestUrl: 'https://redir.example.com/go',
+      inspectedDocumentUrl: 'https://redir.example.com/go',
+      finalDocumentUrl: 'https://redir.example.com/landing',
+      documentReplacedByClick: false,
+    }),
+    ['https://redir.example.com/go', 'https://redir.example.com/landing'],
+    'a redirect commits before inspection, so both identities are terminal success',
+  );
+  assert.deepEqual(
+    renderedTerminalSuccessIdentities({
+      requestUrl: 'https://creator.example.com/',
+      inspectedDocumentUrl: 'https://creator.example.com/',
+      finalDocumentUrl: 'https://creator.example.com/community',
+      documentReplacedByClick: true,
+    }),
+    ['https://creator.example.com/'],
+    'a click replacement was never enumerated, so its URL is not borrowed coverage',
+  );
+  assert.deepEqual(
+    renderedTerminalSuccessIdentities({
+      requestUrl: 'https://creator.example.com/go',
+      inspectedDocumentUrl: 'https://creator.example.com/landing',
+      finalDocumentUrl: 'https://creator.example.com/community',
+      documentReplacedByClick: true,
+    }),
+    ['https://creator.example.com/go', 'https://creator.example.com/landing'],
+    'the redirect target was inspected even when a later click replaced it',
+  );
+  assert.deepEqual(
+    renderedTerminalSuccessIdentities({
+      requestUrl: 'https://creator.example.com/',
+      inspectedDocumentUrl: 'https://creator.example.com/',
+      finalDocumentUrl: 'https://creator.example.com/community',
+      documentReplacedByClick: false,
+    }),
+    ['https://creator.example.com/', 'https://creator.example.com/community'],
+    'a same-document history update keeps the processed document and its new identity',
+  );
+  assert.deepEqual(
+    classifyRequiredCoverage({
+      requiredKeys: [
+        'https://creator.example.com/',
+        'https://creator.example.com/community',
+      ],
+      succeededKeys: renderedTerminalSuccessIdentities({
+        requestUrl: 'https://creator.example.com/',
+        inspectedDocumentUrl: 'https://creator.example.com/',
+        finalDocumentUrl: 'https://creator.example.com/community',
+        documentReplacedByClick: true,
+      }),
+      failedClassesByKey: {},
+    }).unvisited,
+    ['https://creator.example.com/community'],
+    'an unexamined click replacement stays a required gap instead of resolving clean',
+  );
 });
 
 // REVIEW: shared-covered members satisfy required items; fresh terminal

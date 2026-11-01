@@ -555,6 +555,7 @@ test('only terminal success satisfies required coverage', () => {
   assert.doesNotMatch(source, /alreadyVisitedSet\.add\(inspectedVisitKey\)/, 'a merely inspected page never becomes shared successful evidence');
   assert.match(source, /structuralVisitedKeys\.add\(inspectedVisitKey\)/, 'the inspected page still counts for structural-navigation deduplication');
   assert.match(source, /for \(const identity of terminalSuccessUrls\)[\s\S]{0,160}?sharedCoveredKeys\.add\(key\)/, 'required coverage borrows only terminal-success identities');
+  assert.match(source, /renderedTerminalSuccessIdentities\(\{[\s\S]{0,260}?documentReplacedByClick: clickLoop\.documentReplaced,/, 'a click-committed replacement document is not borrowed as terminal success');
   assert.match(source, /classifyRequiredCoverage\(\{[\s\S]{0,200}?sharedCoveredKeys,/, 'classification receives only terminal-success shared evidence');
 });
 

@@ -351,6 +351,27 @@ export function reconcileClickDestinationContext(input: {
 }
 
 /**
+ * Terminal-success identities for one processed request. The request URL is
+ * always evidence. The final document URL is evidence only when the document
+ * that finished the handler is the document that was processed: a redirect
+ * commits before inspection, so both identities were inspected, while a
+ * click-triggered navigation replaces the document after the click loop stops
+ * and leaves the replacement's controls unexamined. That URL must be proven by
+ * its own successful request instead of being borrowed as shared coverage.
+ */
+export function renderedTerminalSuccessIdentities(input: {
+  requestUrl: string;
+  inspectedDocumentUrl: string;
+  finalDocumentUrl: string;
+  documentReplacedByClick: boolean;
+}): string[] {
+  return visitIdentityKeys(
+    input.requestUrl,
+    input.documentReplacedByClick ? input.inspectedDocumentUrl : input.finalDocumentUrl,
+  );
+}
+
+/**
  * Normalized identity for visit-set matching (shared-evidence registry and
  * already-visited exclusion): scheme + lowercased host + non-default port +
  * pathname (trailing slash trimmed) + verbatim query. Same rule both sides
@@ -1481,6 +1502,10 @@ export interface RenderedClickLoopResult {
   evidenceControlsFailed: number;
   evidenceControlsSkipped: number;
   interactionGap: boolean;
+  /** A click committed a new document and stopped the loop. The replacement
+   * page was never enumerated or clicked, so it is not terminal-success
+   * evidence for required coverage. */
+  documentReplaced: boolean;
   /** Index (in the click-target queue) of the first control whose click
    * failed. The durable retry offset must stop at that control, never rotate
    * past it, because its revealed content was not examined. */
@@ -1506,6 +1531,7 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
   let evidenceControlsFailed = 0;
   let evidenceControlsSkipped = 0;
   let interactionGap = false;
+  let documentReplaced = false;
   let firstFailedTargetIndex: number | undefined;
   for (let clickIndex = 0; clickIndex < clickTargets.length; clickIndex++) {
     if (clickedThisPage >= input.maxClicksPerPage) {
@@ -1559,17 +1585,18 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
     const beforeKey = normalizeVisitUrl(urlBeforeClick) ?? urlBeforeClick;
     const afterKey = normalizeVisitUrl(urlAfterClick) ?? urlAfterClick;
     const urlChanged = beforeKey !== afterKey;
-    let documentReplaced = urlChanged;
+    let replacedThisClick = urlChanged;
     if (input.documentIdentity) {
       const identityAfterClick = await input.documentIdentity().catch(() => null);
       if (identityBeforeClick !== null && identityBeforeClick !== undefined
         && identityAfterClick !== null && identityAfterClick !== undefined) {
-        documentReplaced = identityBeforeClick !== identityAfterClick;
+        replacedThisClick = identityBeforeClick !== identityAfterClick;
       }
       // If either identity read failed, fall back to the URL comparison. A
       // navigation during the read fails closed because the URL changed.
     }
-    if (documentReplaced) {
+    if (replacedThisClick) {
+      documentReplaced = true;
       const remainingTargets = clickTargets.slice(clickIndex + 1);
       if (remainingTargets.length > 0) {
         evidenceControlsSkipped += remainingTargets.length;
@@ -1628,7 +1655,7 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
       }
     }
   }
-  return { evidenceControlsClicked, evidenceControlsFailed, evidenceControlsSkipped, interactionGap, firstFailedTargetIndex };
+  return { evidenceControlsClicked, evidenceControlsFailed, evidenceControlsSkipped, interactionGap, documentReplaced, firstFailedTargetIndex };
 }
 
 /**
@@ -3135,6 +3162,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               if (candidate && candidate !== page) popupWindowsThisClick.add(candidate);
             };
             clickPageContext?.on?.('page', onPopupWindow);
+            // The document the click loop starts on is the one whose controls
+            // are enumerated. A click that commits a new document must not let
+            // that replacement URL be borrowed as terminal-success coverage.
+            const documentUrlBeforeClicks = page.url();
             let clickLoop: Awaited<ReturnType<typeof runRenderedClickLoop>>;
             try {
               clickLoop = await runRenderedClickLoop({
@@ -3260,7 +3291,15 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // success resolves an earlier failure (retry recovery). Click
             // handling owns no marks: clicks never affect terminal accounting.
             markRenderedRequestSucceeded(requestTracker, request.url);
-            for (const identity of visitIdentityKeys(request.url, page.url())) {
+            // A click-committed replacement document was never enumerated or
+            // clicked. Borrow only the document the loop actually processed;
+            // its replacement must prove itself through its own request.
+            for (const identity of renderedTerminalSuccessIdentities({
+              requestUrl: request.url,
+              inspectedDocumentUrl: documentUrlBeforeClicks,
+              finalDocumentUrl: page.url(),
+              documentReplacedByClick: clickLoop.documentReplaced,
+            })) {
               if (!terminalSuccessUrls.includes(identity)) terminalSuccessUrls.push(identity);
             }
             } catch (attemptError) {
