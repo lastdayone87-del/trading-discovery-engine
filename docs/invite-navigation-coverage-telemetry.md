@@ -235,7 +235,8 @@ SELECT
   coalesce(sum(CASE WHEN (provenance->'crawlerTelemetry'->>'controlsStructuralUnrecovered') ~ '^[0-9]+$'
     THEN (provenance->'crawlerTelemetry'->>'controlsStructuralUnrecovered')::bigint ELSE 0 END), 0) AS structural_unrecovered,
   coalesce(sum(CASE WHEN (provenance->'crawlerTelemetry'->>'controlsIconLabelRecovered') ~ '^[0-9]+$'
-    THEN (provenance->'crawlerTelemetry'->>'controlsIconLabelRecovered')::bigint ELSE 0 END), 0) AS icon_label_recoveredFROM external_acquisition_observations
+    THEN (provenance->'crawlerTelemetry'->>'controlsIconLabelRecovered')::bigint ELSE 0 END), 0) AS icon_label_recovered
+FROM external_acquisition_observations
 WHERE observed_at > now() - interval '1 day'
   AND provenance->>'surface' = 'CREATOR_WEBSITES'
   AND provenance->'crawlerTelemetry'->>'mode' = 'RENDERED';
