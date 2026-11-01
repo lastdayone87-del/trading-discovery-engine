@@ -654,6 +654,13 @@ export interface RenderedControlTarget {
    * retryable interaction gap; an unclicked disclosure stays a diagnostic.
    */
   origin?: 'hint' | 'icon' | 'disclosure';
+  /**
+   * True when the control had no layout box at enumeration (for example a
+   * button inside a closed `<details>`). A hidden control is queued after
+   * every visible one in its priority group: clicking it first can time out
+   * and consume budget before the disclosure that reveals it has run.
+   */
+  hidden?: boolean;
 }
 
 export interface RenderedControlEnumeration {
@@ -827,6 +834,11 @@ export function enumerateRenderedControlNodes(
     const node = nodes[index];
     const element = node as HTMLElement;
     const tagName = (element.tagName || '').toLowerCase();
+    // No layout box means the control is not clickable yet: closed <details>
+    // content, display:none menus, and similar hidden subtrees. The planner
+    // queues hidden controls after visible ones so a disclosure can reveal
+    // them before they are attempted.
+    const hidden = element.getClientRects().length === 0;
     // HTMLAnchorElement.href is a string; SVGElement.href is an
     // SVGAnimatedString. Reading the attribute keeps both anchor kinds
     // string-safe, and resolving against the document base preserves the
@@ -1044,6 +1056,7 @@ export function enumerateRenderedControlNodes(
       href,
       tag: (tagName === 'a' ? 'anchor' : tagName === 'button' ? 'button' : 'role') as 'anchor' | 'button' | 'role',
       ...(isPopup ? { popup: true } : {}),
+      ...(hidden ? { hidden: true } : {}),
       origin: baseMatched ? 'hint' : extendedMatched ? 'icon' : 'disclosure',
     };
     // Original hint matches keep absolute priority, then icon-label
@@ -1054,7 +1067,15 @@ export function enumerateRenderedControlNodes(
     else if (extendedMatched) recovered.push(item);
     else disclosures.push(item);
   }
-  const selected = [...hintMatched, ...recovered, ...disclosures];
+  const grouped = [...hintMatched, ...recovered, ...disclosures];
+  // Controls with no layout box cannot be clicked yet. Queue them after every
+  // visible control so the disclosure that reveals them runs first: clicking
+  // a hidden button timeouts and, because the marker is already queued, the
+  // now-visible control would never be retried even with spare click budget.
+  const selected = [
+    ...grouped.filter(item => !item.hidden),
+    ...grouped.filter(item => item.hidden),
+  ];
   const usedMarkers = new Set<string>();
   const controls: RenderedControlTarget[] = [];
   const markerByIndex = new Map<number, string>();

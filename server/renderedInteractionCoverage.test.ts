@@ -902,8 +902,18 @@ test('P0.2 coverage counters stay coherent, bounded, and preserved on error path
   assert.match(source, /clickPageContext\?\.off\?\.\('page', onPopupWindow\)/, 'the popup listener does not outlive the click loop');
 });
 
-test('coverage-gap counters accumulate across later, smaller enumerations', () => {
-  const first = mergeRenderedCoverageGapCounters(
+test('hidden controls wait for the disclosure that reveals them', () => {
+  const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
+  assert.match(source, /const hidden = element\.getClientRects\(\)\.length === 0;/, 'a control with no layout box is marked hidden at enumeration');
+  assert.match(source, /\.\.\.\(hidden \? \{ hidden: true \} : \{\}\),/, 'the hidden mark travels with the enumerated control');
+  assert.match(
+    source,
+    /\.\.\.grouped\.filter\(item => !item\.hidden\),[\s\S]{0,120}?\.\.\.grouped\.filter\(item => item\.hidden\),/,
+    'visible controls are queued before hidden ones so a disclosure runs before the content it reveals',
+  );
+});
+
+test('coverage-gap counters accumulate across later, smaller enumerations', () => {  const first = mergeRenderedCoverageGapCounters(
     { structuralNavigation: 0, structuralHintRejected: 0, iconLabelRecovered: 0 },
     { structuralNavigation: 0, structuralHintRejected: 0, iconLabelRecovered: 1 },
   );

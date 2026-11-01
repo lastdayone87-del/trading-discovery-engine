@@ -545,6 +545,27 @@ test('real DOM: an already-open details summary is not clicked closed', { skip: 
   });
 });
 
+test('real DOM: hidden controls are queued after the disclosure that reveals them', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <details>
+      <summary>Menu</summary>
+      <button type="button" title="Discord">Join</button>
+    </details>
+  </body></html>`;
+  await withControlPage(html, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    const summaryIndex = enumeration.controls.findIndex(target => target.text.trim() === 'Menu');
+    const iconIndex = enumeration.controls.findIndex(target => target.text.trim() === 'Join');
+    assert.equal(summaryIndex >= 0, true, 'the closed summary is clickable');
+    assert.equal(iconIndex >= 0, true, 'the icon-labelled control inside the closed menu is recovered');
+    assert.equal(
+      summaryIndex < iconIndex,
+      true,
+      'a control with no layout box is deferred until the disclosure that reveals it has run',
+    );
+  });
+});
+
 test('real DOM: navigation compares against the document URL, not the effective base', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
   const html = `<!doctype html><html><head><base href="/base/"></head><body>
     <a role="menuitem" href="./">Resources</a>
