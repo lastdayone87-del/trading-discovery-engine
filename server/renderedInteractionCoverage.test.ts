@@ -465,13 +465,15 @@ test('rendered control coverage counts overflow and uses stable markers across D
 test('P0.2 coverage counters stay coherent, bounded, and preserved on error paths', () => {
   const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
   assert.match(source, /if \(!pageSnapshotRecorded \|\| enumeration\.total > pageControlsEnumeratedTotal\) \{[\s\S]*?pageHintRejected = enumeration\.hintRejected/, 'the denominator and hint-rejected counts come from one enumeration snapshot');
+  assert.match(source, /if \(previous && !pageSnapshotRecorded\) \{\s*baseHrefPresent = baseHrefPresent \|\| pageBaseHrefPresent;\s*return;\s*\}/, 'a retry that never enumerated keeps the earlier attempt\'s observation');
   assert.match(source, /aggregatePageCountersOnError\?\.\(\)/, 'the handler catch preserves counters from an already-enumerated page');
   assert.match(source, /if \(pageCountersAggregated\) return;/, 'the error and success aggregations cannot double-count a page');
   assert.match(source, /await recordPageContext\(\);\s*\/\/ Page-end aggregation/, 'context counters refresh after the click loop');
   assert.match(source, /const clickOutcome = await attemptRenderedControlClick[\s\S]{0,1200}?\n\s+queuePageContextProbe\(\);\n\s+if \(clickOutcome\.ok/, 'a context sample is queued after each click before the next can replace the DOM');
   assert.match(source, /const pendingContextProbes: Array<Promise<void>> = \[\];/, 'per-click probes are not awaited on the click path');
   assert.match(source, /await flushPageContextProbes\(\);\s*\n\s*await recordPageContext\(\);/, 'pending samples are flushed before page-end aggregation');
-  assert.match(source, /pageDocumentIdentity !== null && currentIdentity !== null[\s\S]{0,200}?currentIdentity === pageDocumentIdentity/, 'a same-document URL change still records revealed contexts');
+  assert.match(source, /if \(!sameUrl\) \{\s*pageContextAbandoned = true;\s*return;\s*\}[\s\S]{0,80}?pageDocumentIdentity = currentIdentity;/, 'a baseline sample taken after the page left its URL is discarded');
+  assert.match(source, /const sameDocument = pageDocumentIdentity !== null && currentIdentity !== null[\s\S]{0,260}?currentIdentity === pageDocumentIdentity[\s\S]{0,500}?if \(!sameDocument && !sameUrl\) return;/, 'the identity comparison gates the guard that permits counter updates');
   assert.match(source, /if \(!sameDocument && !sameUrl\) return;/, 'a same-URL reload still records revealed contexts');
   assert.match(source, /pagePopupMarkers = trackRenderedPopupCoverage\(pagePopupMarkers, enumeration\)/, 'popup identities are tracked across every enumeration');
   assert.match(source, /popupCount: resolveUnexaminedPopupTargets\(pagePopupMarkers, examinedPopupMarkers\)/, 'only popups actually examined are excluded; a replacement cannot be cancelled by an earlier click');

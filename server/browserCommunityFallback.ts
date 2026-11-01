@@ -2368,12 +2368,25 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // query change must still record frames/shadow roots revealed by
             // the click, while a real navigation belongs to another request.
             let pageDocumentIdentity: number | null | undefined;
+            // Set when the page left the inspected URL before its baseline
+            // sample. The document that responded belongs to another request,
+            // so its counters cannot be attributed to this one.
+            let pageContextAbandoned = false;
             const recordPageContext = async (): Promise<void> => {
+              if (pageContextAbandoned) return;
               try {
                 const pageContext = await page.evaluate(collectRenderedPageContext);
                 const currentIdentity = pageContext.documentTimeOrigin ?? null;
                 const sameUrl = normalizeVisitUrl(page.url()) === normalizeVisitUrl(pageDocumentUrl);
                 if (pageDocumentIdentity === undefined) {
+                  // The baseline sample defines the inspected document. A
+                  // navigation between `page.url()` and this probe means the
+                  // counters describe a different document, so stop measuring
+                  // this request rather than attributing them here.
+                  if (!sameUrl) {
+                    pageContextAbandoned = true;
+                    return;
+                  }
                   pageDocumentIdentity = currentIdentity;
                 } else {
                   const sameDocument = pageDocumentIdentity !== null && currentIdentity !== null
@@ -2475,6 +2488,15 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               pageCountersAggregated = true;
               const requestKey = request.url;
               const previous = pageControlTotalsByRequest.get(requestKey);
+              // A Crawlee retry can throw during scrolling or before its first
+              // enumeration, leaving every counter at zero. Replacing a fully
+              // enumerated earlier attempt with those zeros would subtract its
+              // real coverage from the crawl totals, so keep the earlier
+              // observation instead.
+              if (previous && !pageSnapshotRecorded) {
+                baseHrefPresent = baseHrefPresent || pageBaseHrefPresent;
+                return;
+              }
               // Popups that the click loop actually inspected are not an
               // unexamined context gap. Identity tracking keeps a replacement
               // popup from being cancelled out by an earlier clicked popup,
