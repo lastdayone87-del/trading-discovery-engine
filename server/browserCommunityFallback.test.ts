@@ -598,7 +598,7 @@ test('Discord destination exclusion is not bypassed by a trailing-dot host', () 
 
 test('cross-origin submission is deferred until after the post-click same-host pass', () => {
   const source = fs.readFileSync(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8');
-  const clickLoop = source.indexOf('const clickLoop = await runRenderedClickLoop');
+  const clickLoop = source.indexOf('let clickLoop: Awaited<ReturnType<typeof runRenderedClickLoop>>;');
   const capture = source.indexOf('preClickCrossOriginCandidates = await collectCrossOriginCandidates()');
   const submissions = [...source.matchAll(/await enqueueCrossOrigin\(\)/g)].map(match => match.index!);
   assert.ok(clickLoop > 0 && capture > 0 && capture < clickLoop,
