@@ -139,6 +139,12 @@ test('retry rotation never starts on a hidden control ahead of its disclosure', 
     ['oc-menu', 'oc-invite', 'oc-b1', 'oc-b2'],
     'a boundary that lands on the hidden control rewinds to its summary and still spends the cap',
   );
+  assert.equal(boundary.rotationRewind, 1, 'the rewind distance is reported to the offset accounting');
+  assert.equal(
+    renderedClickOffsetAdvance(boundary, boundary.toClick.length, 4),
+    3,
+    'the advance is measured from the rewound start, not the original offset',
+  );
 
   // Successive retries advance through the pool instead of repeating the same
   // window, so a control skipped by one cap is examined later.
@@ -151,6 +157,31 @@ test('retry rotation never starts on a hidden control ahead of its disclosure', 
   }
   assert.equal(attempted.has('oc-b3'), true, 'later retries reach the control skipped by the first cap');
   assert.equal(attempted.has('oc-invite'), true, 'later retries reach the hidden invite');
+});
+
+test('rewinding a disclosure does not skip the controls after the original offset', () => {
+  // Greptile: pool [B1, B2, B3, menu, hidden, B4, B5, B6]. Offset 4 rewinds to
+  // the menu, so the advance must land on B6 (7), not wrap back to B1 (8).
+  const controls = [
+    renderedButton(0, 'oc-b1'),
+    renderedButton(1, 'oc-b2'),
+    renderedButton(2, 'oc-b3'),
+    { index: 3, marker: 'oc-menu', text: 'Menu', href: null, tag: 'button' as const },
+    { index: 4, marker: 'oc-hidden', text: 'Discord', href: null, tag: 'button' as const, hidden: true, afterMarker: 'oc-menu' },
+    renderedButton(5, 'oc-b4'),
+    renderedButton(6, 'oc-b5'),
+    renderedButton(7, 'oc-b6'),
+  ];
+  const boundary = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 4);
+  assert.deepEqual(boundary.toClick.map(target => target.marker), ['oc-menu', 'oc-hidden', 'oc-b4', 'oc-b5']);
+  const advance = renderedClickOffsetAdvance(boundary, 4, 4);
+  assert.equal(advance, 3, 'the advance excludes the rewind so the next offset is 7, not 8');
+  const next = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 4 + advance);
+  assert.deepEqual(
+    next.toClick.map(target => target.marker),
+    ['oc-b6', 'oc-b1', 'oc-b2', 'oc-b3'],
+    'the retry resumes at the control after the last examined pool position',
+  );
 });
 
 test('a hidden invite beyond the initial click cap is reached by the retry rotation', () => {

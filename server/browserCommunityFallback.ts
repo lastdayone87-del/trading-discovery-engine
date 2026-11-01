@@ -1370,7 +1370,7 @@ export function partitionRenderedClickTargets(
   maxClicks: number,
   offset = 0,
   evaluationWindowSize = RENDERED_CONTROL_EVALUATION_WINDOW,
-): { toClick: RenderedControlTarget[]; skippedNavigableAnchors: number; evaluationWindow: RenderedControlTarget[] } {
+): { toClick: RenderedControlTarget[]; skippedNavigableAnchors: number; evaluationWindow: RenderedControlTarget[]; rotationRewind: number } {
   const cap = Math.max(0, Math.trunc(maxClicks) || 0);
   const windowSize = Math.max(0, Math.trunc(evaluationWindowSize) || 0);
   // Rotate the complete matched pool before applying the evaluation window.
@@ -1392,7 +1392,12 @@ export function partitionRenderedClickTargets(
     }
     eligible.push(control);
   }
-  return { toClick: eligible.slice(0, cap), skippedNavigableAnchors, evaluationWindow };
+  return {
+    toClick: eligible.slice(0, cap),
+    skippedNavigableAnchors,
+    evaluationWindow,
+    rotationRewind: start - rotationStart,
+  };
 }
 
 /**
@@ -1452,7 +1457,7 @@ export function isNavigableOnlyControlWindow(
  * an interaction gap and is revisited when the pool rotates back around.
  */
 export function renderedClickOffsetAdvance(
-  plan: Pick<ReturnType<typeof partitionRenderedClickTargets>, 'toClick' | 'evaluationWindow' | 'skippedNavigableAnchors'>,
+  plan: Pick<ReturnType<typeof partitionRenderedClickTargets>, 'toClick' | 'evaluationWindow' | 'skippedNavigableAnchors' | 'rotationRewind'>,
   attempts: number,
   maxClicksPerPage: number,
   firstFailedAttempt?: number,
@@ -1469,15 +1474,22 @@ export function renderedClickOffsetAdvance(
     : failedAt === 0
       ? attempted
       : Math.min(attempted, failedAt);
+  // The plan may have rewound the rotation to replay a disclosure that opens
+  // a hidden control. The returned value is added to the original offset, so
+  // subtract that rewind: otherwise the next retry skips the controls between
+  // the rewound start and the original one.
+  const rewind = Math.max(0, Math.trunc(plan.rotationRewind) || 0);
   if (examined === 0) {
-    return isNavigableOnlyControlWindow(plan, maxClicksPerPage) ? plan.evaluationWindow.length : 0;
+    return isNavigableOnlyControlWindow(plan, maxClicksPerPage)
+      ? Math.max(0, plan.evaluationWindow.length - rewind)
+      : 0;
   }
   const lastAttempted = plan.toClick[Math.min(examined, plan.toClick.length) - 1];
   if (!lastAttempted) return 0;
   const position = plan.evaluationWindow.findIndex(target =>
     target === lastAttempted || (Boolean(target.marker) && target.marker === lastAttempted.marker)
   );
-  return position >= 0 ? position + 1 : 0;
+  return position >= 0 ? Math.max(0, position + 1 - rewind) : 0;
 }
 
 /**
@@ -1485,10 +1497,11 @@ export function renderedClickOffsetAdvance(
  * rotation is applied to the flat control pool, so an offset can land on a
  * hidden control and put it ahead of the closed menu summary that reveals it.
  * Rewinding to that summary replays the prerequisite first; the unit stays
- * atomic and the remaining offsets still advance through the rest of the pool
- * (the advance is measured from the rotated window, so no position is skipped
- * forever). A hidden control whose revealer is outside this pool has no
- * dependency to replay and keeps the plain rotation.
+ * atomic and the remaining offsets still advance through the rest of the pool:
+ * the rewind distance is reported back to `renderedClickOffsetAdvance` so the
+ * next offset is measured from the rewound start. A hidden control whose
+ * revealer is outside this pool has no dependency to replay and keeps the
+ * plain rotation.
  */
 function rewindRotationToDisclosure(
   controls: RenderedControlTarget[],
@@ -1506,7 +1519,6 @@ function rewindRotationToDisclosure(
 }
 
 /**
- * Combine per-page full-pool advances into one safe shared seed advance./**
  * Combine per-page full-pool advances into one safe shared seed advance.
  * Every page in a rendered crawl starts from the same durable per-seed
  * rotation offset, so the crawl may advance only by the smallest progress any
