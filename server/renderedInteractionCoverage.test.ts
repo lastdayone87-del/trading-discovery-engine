@@ -562,6 +562,8 @@ test('label recovery stays bounded before allocating id lists or subtree text', 
   assert.match(source, /document\.createTreeWalker\(labelNode, NodeFilter\.SHOW_TEXT\)/, 'referenced labels are walked as bounded text nodes');
   assert.match(source, /visitedLabelNodes < 512/, 'the text walk has a fixed node ceiling');
   assert.match(source, /labelledByText\.length < 200/, 'collection stops at 200 characters');
+  assert.match(source, /labelledByText \+= pendingSeparator \+ \(text\.length > remaining \? text\.slice\(0, remaining\) : text\)/, 'adjacent text nodes concatenate without splitting a word');
+  assert.match(source, /let pendingSeparator = labelledByText\.length > 0 \? ' ' : '';/, 'a separator is added once per referenced label');
 });
 
 test('a retried request clears its own uncertified click window', () => {

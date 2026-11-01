@@ -780,14 +780,20 @@ export function enumerateRenderedControlNodes(
         const labelNode = document.getElementById(labelledBy.slice(idStart, scanIndex));
         if (!labelNode) continue;
         const walker = document.createTreeWalker(labelNode, NodeFilter.SHOW_TEXT);
+        // Join text nodes inside one referenced element exactly as
+        // textContent did; an injected per-node separator would split a word
+        // such as `Dis<strong>cord</strong>`. A separator is added once per
+        // referenced label so two short labels do not merge into one word.
+        let pendingSeparator = labelledByText.length > 0 ? ' ' : '';
         while (visitedLabelNodes < 512 && labelledByText.length < 200) {
           const textNode = walker.nextNode();
           if (!textNode) break;
           visitedLabelNodes++;
           const text = textNode.nodeValue || '';
-          const remaining = 200 - labelledByText.length;
+          const remaining = 200 - labelledByText.length - pendingSeparator.length;
           if (text && remaining > 0) {
-            labelledByText += ` ${text.length > remaining ? text.slice(0, remaining) : text}`;
+            labelledByText += pendingSeparator + (text.length > remaining ? text.slice(0, remaining) : text);
+            pendingSeparator = '';
           }
         }
       }
