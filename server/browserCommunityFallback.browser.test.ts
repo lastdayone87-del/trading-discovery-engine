@@ -549,7 +549,9 @@ test('real DOM: hidden controls are queued after the disclosure that reveals the
   const html = `<!doctype html><html><body>
     <details>
       <summary>Menu</summary>
-      <button type="button" title="Discord">Join</button>
+      <button type="button" title="Discord">
+        <svg width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="8"></circle></svg>
+      </button>
     </details>
   </body></html>`;
   await withControlPage(html, async (page) => {
@@ -557,7 +559,12 @@ test('real DOM: hidden controls are queued after the disclosure that reveals the
     const summaryIndex = enumeration.controls.findIndex(target => target.index === 0);
     const buttonIndex = enumeration.controls.findIndex(target => target.index === 1);
     assert.equal(summaryIndex >= 0, true, 'the closed summary is clickable');
-    assert.equal(buttonIndex >= 0, true, 'the icon-labelled control inside the closed menu is recovered');
+    assert.equal(buttonIndex >= 0, true, 'the icon-only control inside the closed menu is recovered');
+    assert.equal(
+      enumeration.controls[buttonIndex]?.origin,
+      'icon',
+      'the hidden control matched only through its title, not through visible text',
+    );
     assert.equal(
       enumeration.controls[buttonIndex]?.hidden,
       true,
