@@ -918,6 +918,7 @@ test('label recovery stays bounded before allocating id lists or subtree text', 
   assert.match(source, /labelledByText\.length < 200/, 'collection stops at 200 characters');
   assert.match(source, /labelledByText \+= pendingSeparator \+ \(text\.length > remaining \? text\.slice\(0, remaining\) : text\)/, 'adjacent text nodes concatenate without splitting a word');
   assert.match(source, /let pendingSeparator = labelledByText\.length > 0 \? ' ' : '';/, 'a separator is added once per referenced label');
+  assert.match(source, /hiddenText \+= value\.length > remaining \? value\.slice\(0, remaining\) : value;/, 'descendant text nodes concatenate without splitting a word');
 });
 
 test('a clicked destination that its own request inspects is not counted twice', () => {

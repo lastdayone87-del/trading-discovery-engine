@@ -895,7 +895,9 @@ export function enumerateRenderedControlNodes(
       textNodesExamined++;
       const value = textNode.nodeValue || '';
       const remaining = 200 - hiddenText.length;
-      if (value && remaining > 0) hiddenText += ` ${value.length > remaining ? value.slice(0, remaining) : value}`;
+      // Concatenate adjacent text nodes without an injected separator: a
+      // word split by markup (`Dis<strong>cord</strong>`) must stay intact.
+      if (value && remaining > 0) hiddenText += value.length > remaining ? value.slice(0, remaining) : value;
       textNode = textWalker.nextNode();
     }
     hiddenText = hiddenText.replace(/\s+/g, ' ').trim().slice(0, 200);
