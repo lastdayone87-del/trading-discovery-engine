@@ -447,7 +447,7 @@ test('rendered control coverage counts overflow and uses stable markers across D
   assert.match(source, /telemetry\.evidenceControlsSkipped = evidenceControlsSkipped \|\| undefined/);
   assert.match(source, /combineRenderedControlOffsetAdvances\(\s*evidenceControlsOffsetAdvance,\s*offsetAdvance,?\s*\)/, 'the crawl aggregates per-page progress conservatively');
   assert.match(source, /evidenceControlsUncertified = true/, 'an unexamined clickable page blocks shared offset advancement');
-  assert.match(source, /telemetry\.evidenceControlsUncertified = evidenceControlsUncertified \|\| undefined/);
+  assert.match(source, /telemetry\.evidenceControlsUncertified = \(evidenceControlsUncertified \|\| uncertifiedRequestKeys\.size > 0\) \|\| undefined/);
   assert.match(source, /clickLoop\.firstFailedTargetIndex/, 'the crawl stops rotation at the first failed control');
   assert.match(source, /if \(pageClickWindowPending\) evidenceControlsUncertified = true/, 'a throw during a clickable page leaves the seed uncertified');
   assert.match(source, /scrollCapReachedStillGrowing = true/, 'the scroll cap records when the page was still growing');
@@ -552,6 +552,23 @@ test('a retried request replaces its previous-attempt counters instead of double
   const changed = renderedRequestControlTotalsDelta(attempt(5, 2), attempt(7, 1));
   assert.equal(changed.enumerated, 2, 'only the latest attempt delta is added');
   assert.equal(changed.popupCount, -1, 'an examined popup adjusts the previous contribution downward');
+});
+
+test('label recovery stays bounded before allocating id lists or subtree text', () => {
+  const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
+  assert.doesNotMatch(source, /labelledBy\.split\(/, 'the whole aria-labelledby attribute is never split into an id array');
+  assert.match(source, /idCount < 16/, 'at most 16 id tokens are extracted');
+  assert.doesNotMatch(source, /labelNode\?\.textContent/, 'a referenced subtree is never materialized as full text');
+  assert.match(source, /document\.createTreeWalker\(labelNode, NodeFilter\.SHOW_TEXT\)/, 'referenced labels are walked as bounded text nodes');
+  assert.match(source, /visitedLabelNodes < 512/, 'the text walk has a fixed node ceiling');
+  assert.match(source, /labelledByText\.length < 200/, 'collection stops at 200 characters');
+});
+
+test('a retried request clears its own uncertified click window', () => {
+  const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
+  assert.match(source, /uncertifiedRequestKeys\.delete\(request\.url\)/, 'a fresh attempt clears the request mark before re-examining');
+  assert.match(source, /if \(pageClickWindowPending\) uncertifiedRequestKeys\.add\(request\.url\)/, 'a pending window is certified per request, not crawl-wide');
+  assert.match(source, /telemetry\.evidenceControlsUncertified = \(evidenceControlsUncertified \|\| uncertifiedRequestKeys\.size > 0\)/, 'the published certificate reflects the remaining per-request marks');
 });
 
 test('popup coverage counts each popup once and keeps window-opening popups unexamined', () => {

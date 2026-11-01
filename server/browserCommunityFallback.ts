@@ -763,16 +763,32 @@ export function enumerateRenderedControlNodes(
     const labelledBy = element.getAttribute('aria-labelledby') || '';
     if (labelledBy) {
       // Bounded label recovery: a hostile page can name thousands of
-      // references or point at a huge element, so cap both the referenced
-      // elements and the text collected per control.
-      const ids = labelledBy.split(/\s+/).slice(0, 16);
-      for (let labelIndex = 0; labelIndex < ids.length; labelIndex++) {
-        if (!ids[labelIndex] || labelledByText.length >= 200) continue;
-        const labelNode = document.getElementById(ids[labelIndex]);
-        const text = labelNode?.textContent || '';
-        const remaining = 200 - labelledByText.length;
-        if (text && remaining > 0) {
-          labelledByText += ` ${text.length > remaining ? text.slice(0, remaining) : text}`;
+      // references or point at a huge element. Extract at most 16 id tokens
+      // without splitting the whole attribute, then walk at most 512 text
+      // nodes while collecting at most 200 characters, so neither the id list
+      // nor a referenced subtree is materialized in full.
+      let scanIndex = 0;
+      let idCount = 0;
+      let visitedLabelNodes = 0;
+      while (scanIndex < labelledBy.length && idCount < 16) {
+        while (scanIndex < labelledBy.length && /\s/.test(labelledBy.charAt(scanIndex))) scanIndex++;
+        const idStart = scanIndex;
+        while (scanIndex < labelledBy.length && !/\s/.test(labelledBy.charAt(scanIndex))) scanIndex++;
+        if (scanIndex === idStart) break;
+        idCount++;
+        if (labelledByText.length >= 200) continue;
+        const labelNode = document.getElementById(labelledBy.slice(idStart, scanIndex));
+        if (!labelNode) continue;
+        const walker = document.createTreeWalker(labelNode, NodeFilter.SHOW_TEXT);
+        while (visitedLabelNodes < 512 && labelledByText.length < 200) {
+          const textNode = walker.nextNode();
+          if (!textNode) break;
+          visitedLabelNodes++;
+          const text = textNode.nodeValue || '';
+          const remaining = 200 - labelledByText.length;
+          if (text && remaining > 0) {
+            labelledByText += ` ${text.length > remaining ? text.slice(0, remaining) : text}`;
+          }
         }
       }
     }
@@ -2054,6 +2070,12 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   // catch path otherwise loses the per-page guard and the retry offset moves
   // past controls that were never examined.
   let pageClickWindowPending = false;
+  // Uncertified click windows are tracked per request. Crawlee retries a
+  // thrown attempt with a fresh page, and that retry re-examines the same
+  // request from scratch; clearing its mark on entry keeps a recovered retry
+  // from blocking the offset forever, while another page's unexamined window
+  // still blocks shared progress.
+  const uncertifiedRequestKeys = new Set<string>();
   // nextRenderedClickOffsets reads only outcome.telemetry, so the certificate
   // must be published there on every return path (success and catch).
   const publishEvidenceControlCertificate = (budgetExhausted = false): void => {
@@ -2062,7 +2084,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
     telemetry.evidenceControlsFailed = evidenceControlsFailed || undefined;
     telemetry.evidenceControlsSkipped = evidenceControlsSkipped || undefined;
     telemetry.evidenceControlsNavigableOnly = (evidenceControlsNavigableOnly && !evidenceControlsClickableWindow) || undefined;
-    telemetry.evidenceControlsUncertified = evidenceControlsUncertified || undefined;
+    telemetry.evidenceControlsUncertified = (evidenceControlsUncertified || uncertifiedRequestKeys.size > 0) || undefined;
     telemetry.evidenceControlsOffsetAdvance = evidenceControlsOffsetAdvance || undefined;
     telemetry.controlsEnumeratedTotal = controlsEnumeratedTotal || undefined;
     telemetry.controlsHintRejected = controlsHintRejected || undefined;
@@ -2268,6 +2290,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             await waitForHostBackoff(request.url, remainingMs);
             if (Date.now() - startedAt >= limits.totalTimeoutMs) return;
             telemetry.requestsStarted++;
+            // A retry replaces the failed attempt's uncertified mark: this
+            // attempt re-examines the page from its first control.
+            uncertifiedRequestKeys.delete(request.url);
             // Assigned once the per-page P0.2 counters exist; the catch path
             // calls it to preserve counts from an already-enumerated page.
             let aggregatePageCountersOnError: (() => void) | undefined;
@@ -2604,7 +2629,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               // Clickable controls were inside the window but no progress was
               // recorded (deadline, zero budget, detached marker). The shared
               // offset must not move based on another page's progress.
-              evidenceControlsUncertified = true;
+              uncertifiedRequestKeys.add(request.url);
             }
             pageClickWindowPending = false;
             evidenceControlsSeen += pageControlTotal;
@@ -2662,8 +2687,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               // Crawlee retries a thrown handler with a fresh page. If the
               // click window was still pending, that attempt did not examine
               // its controls; the crawl-wide catch may never run when a retry
-              // later succeeds, so certify the gap here.
-              if (pageClickWindowPending) evidenceControlsUncertified = true;
+              // later succeeds, so certify the gap here. The retry clears this
+              // per-request mark when it re-enters the handler.
+              if (pageClickWindowPending) uncertifiedRequestKeys.add(request.url);
               // Release only the failed page; Crawlee still classifies the
               // original error and retries with a fresh page per
               // maxRequestRetries/maxSessionRotations. The close is
@@ -2795,7 +2821,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           evidenceControlsFailed: evidenceControlsFailed || undefined,
           evidenceControlsSkipped: evidenceControlsSkipped || undefined,
           evidenceControlsNavigableOnly: (evidenceControlsNavigableOnly && !evidenceControlsClickableWindow) || undefined,
-          evidenceControlsUncertified: evidenceControlsUncertified || undefined,
+          evidenceControlsUncertified: (evidenceControlsUncertified || uncertifiedRequestKeys.size > 0) || undefined,
           evidenceControlsOffsetAdvance: evidenceControlsOffsetAdvance || undefined,
           interactionGap: interactionGap || undefined,
           requiredSnapshotExpanded: requiredSnapshotExpanded || undefined,
@@ -2821,7 +2847,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         // processed the reason is BOUNDED (an abort cut the remaining
         // navigation); zero pages resolves to UNKNOWN.
         publishEvidenceControlCertificate(true);
-        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,dropReasons:drops.snapshot(),interactionGap:interactionGap||undefined,evidenceControlsTotal:evidenceControlsSeen||undefined,evidenceControlsClicked:evidenceControlsClicked||undefined,evidenceControlsFailed:evidenceControlsFailed||undefined,evidenceControlsSkipped:evidenceControlsSkipped||undefined,evidenceControlsNavigableOnly:(evidenceControlsNavigableOnly&&!evidenceControlsClickableWindow)||undefined,evidenceControlsUncertified:evidenceControlsUncertified||undefined,evidenceControlsOffsetAdvance:evidenceControlsOffsetAdvance||undefined,detail:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
+        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,dropReasons:drops.snapshot(),interactionGap:interactionGap||undefined,evidenceControlsTotal:evidenceControlsSeen||undefined,evidenceControlsClicked:evidenceControlsClicked||undefined,evidenceControlsFailed:evidenceControlsFailed||undefined,evidenceControlsSkipped:evidenceControlsSkipped||undefined,evidenceControlsNavigableOnly:(evidenceControlsNavigableOnly&&!evidenceControlsClickableWindow)||undefined,evidenceControlsUncertified:(evidenceControlsUncertified||uncertifiedRequestKeys.size>0)||undefined,evidenceControlsOffsetAdvance:evidenceControlsOffsetAdvance||undefined,detail:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
       } finally {
         // The isolated queue must never outlive its crawl: the lifecycle
         // finalizer drops it on success, failure, and unexpected throws alike

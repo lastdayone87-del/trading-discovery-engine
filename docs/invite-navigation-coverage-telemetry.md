@@ -84,7 +84,9 @@ The reason is diagnostic in P0.2. It does not change `complete`, `retryable`,
   prefix).
 - Label recovery scans only the control's own `title`, `aria-labelledby`
   references, first child `img[alt]`, and `data-label`. It does not read page
-  text or hidden content.
+  text or hidden content. At most 16 `aria-labelledby` id tokens are extracted
+  without splitting the full attribute, and referenced labels are walked as
+  text nodes (512 nodes, 200 characters) rather than materializing a subtree.
 - `collectRenderedPageContext` uses a bounded `TreeWalker` (2,000 elements,
   100 shadow roots) and a bounded frame scan over live `getElementsByTagName`
   collections (1,000). It never traverses frames or shadow roots. Context
