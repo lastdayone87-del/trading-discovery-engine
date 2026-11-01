@@ -554,14 +554,24 @@ test('real DOM: hidden controls are queued after the disclosure that reveals the
   </body></html>`;
   await withControlPage(html, async (page) => {
     const enumeration = await enumeratePageControls(page);
-    const summaryIndex = enumeration.controls.findIndex(target => target.text.trim() === 'Menu');
-    const iconIndex = enumeration.controls.findIndex(target => target.text.trim() === 'Join');
+    const summaryIndex = enumeration.controls.findIndex(target => target.index === 0);
+    const buttonIndex = enumeration.controls.findIndex(target => target.index === 1);
     assert.equal(summaryIndex >= 0, true, 'the closed summary is clickable');
-    assert.equal(iconIndex >= 0, true, 'the icon-labelled control inside the closed menu is recovered');
+    assert.equal(buttonIndex >= 0, true, 'the icon-labelled control inside the closed menu is recovered');
     assert.equal(
-      summaryIndex < iconIndex,
+      enumeration.controls[buttonIndex]?.hidden,
       true,
-      'a control with no layout box is deferred until the disclosure that reveals it has run',
+      'a control with no layout box is marked hidden at enumeration',
+    );
+    assert.notEqual(
+      enumeration.controls[summaryIndex]?.hidden,
+      true,
+      'the summary is visible even while the details is closed',
+    );
+    assert.equal(
+      summaryIndex < buttonIndex,
+      true,
+      'a hidden control is deferred until the disclosure that reveals it has run',
     );
   });
 });
