@@ -931,6 +931,9 @@ export interface RenderedPageContextCounts {
   frameCount: number;
   shadowRootCount: number;
   baseHrefPresent: boolean;
+  /** Document identity (`performance.timeOrigin`) used only to tell a
+   * same-document URL update from a real navigation; never persisted. */
+  documentTimeOrigin?: number | null;
 }
 
 /**
@@ -963,10 +966,14 @@ export function collectRenderedPageContext(): RenderedPageContextCounts {
       node = walker.nextNode();
     }
   }
+  const timeOrigin = typeof performance !== 'undefined' && Number.isFinite(performance.timeOrigin)
+    ? performance.timeOrigin
+    : null;
   return {
     frameCount,
     shadowRootCount,
     baseHrefPresent: !!document.querySelector('base[href]'),
+    documentTimeOrigin: timeOrigin,
   };
 }
 
@@ -2353,18 +2360,42 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             let pageShadowRootCount = 0;
             let pageBaseHrefPresent = false;
             const pageDocumentUrl = page.url();
+            // The document identity, not the URL, decides whether a context
+            // sample belongs to this page: a same-document `pushState` path or
+            // query change must still record frames/shadow roots revealed by
+            // the click, while a real navigation belongs to another request.
+            let pageDocumentIdentity: number | null | undefined;
             const recordPageContext = async (): Promise<void> => {
               try {
-                const current = page.url();
-                // A click may navigate to another document; its context belongs
-                // to that request (which is enqueued/inspected separately), not
-                // to this page's reveal measurement.
-                if (normalizeVisitUrl(current) !== normalizeVisitUrl(pageDocumentUrl)) return;
                 const pageContext = await page.evaluate(collectRenderedPageContext);
+                const currentIdentity = pageContext.documentTimeOrigin ?? null;
+                if (pageDocumentIdentity === undefined) {
+                  pageDocumentIdentity = currentIdentity;
+                } else {
+                  const sameDocument = pageDocumentIdentity !== null && currentIdentity !== null
+                    ? currentIdentity === pageDocumentIdentity
+                    : normalizeVisitUrl(page.url()) === normalizeVisitUrl(pageDocumentUrl);
+                  if (!sameDocument) return;
+                }
                 pageFrameCount = Math.max(pageFrameCount, Math.max(0, Math.floor(pageContext.frameCount) || 0));
                 pageShadowRootCount = Math.max(pageShadowRootCount, Math.max(0, Math.floor(pageContext.shadowRootCount) || 0));
                 pageBaseHrefPresent = pageBaseHrefPresent || pageContext.baseHrefPresent === true;
               } catch { /* context counters never break inspection */ }
+            };
+            // Keep an awaited probe off the click deadline: reserve a small
+            // independent budget and cap the wait so telemetry can never
+            // consume the time the next control needs.
+            const recordPageContextWithin = async (budgetMs: number): Promise<void> => {
+              if (limits.totalTimeoutMs - (Date.now() - startedAt) <= budgetMs) return;
+              let timer: ReturnType<typeof setTimeout> | undefined;
+              try {
+                await Promise.race([
+                  recordPageContext(),
+                  new Promise<void>(resolve => { timer = setTimeout(resolve, budgetMs); }),
+                ]);
+              } finally {
+                if (timer) clearTimeout(timer);
+              }
             };
             await recordPageContext();
             if (!seedDocumentSeen) {
@@ -2596,8 +2627,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                   // Capture contexts revealed by this click before the next
                   // click can remove them or replace the document. The
                   // per-page counters are max-monotonic, so a transient iframe
-                  // or shadow root still counts.
-                  await recordPageContext();
+                  // or shadow root still counts. The probe has its own small
+                  // budget so it cannot starve the next click.
+                  await recordPageContextWithin(250);
                   if (clickOutcome.ok && control.popup && control.marker && popupWindowsThisClick.size === 0) {
                     examinedPopupMarkers.add(control.marker);
                   }

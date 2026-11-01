@@ -91,7 +91,11 @@ The reason is diagnostic in P0.2. It does not change `complete`, `retryable`,
   100 shadow roots) and a bounded frame scan over live `getElementsByTagName`
   collections (1,000). It never traverses frames or shadow roots. Context
   counters are refreshed after scrolling and after each click so transient
-  interaction-revealed frames/shadows are counted, and aggregated on the page
+  interaction-revealed frames/shadows are counted. The per-click probe uses
+  document identity, not the URL, so a same-document path/query update still
+  records it; the probe is capped at 250 ms and skipped when less than 250 ms
+  of crawl budget remains, so measurement cannot starve a click. Counters are
+  aggregated on the page
   error path so an enumerated page is never published as zero.
 - The published denominator and hint-rejected count come from one coherent
   enumeration snapshot (largest total; first wins ties). Structural and
