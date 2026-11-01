@@ -605,9 +605,11 @@ test('real DOM: a control inside a summary stays visible while its details is cl
     const summary = enumeration.controls.find(target => target.index === 0);
     const insideSummary = enumeration.controls.find(target => target.index === 1);
     const insideClosedContent = enumeration.controls.find(target => target.index === 2);
-    assert.equal(summary?.hidden !== true, true, 'the summary is visible');
+    assert.ok(summary, 'the summary is present in the click set');
+    assert.ok(insideSummary, 'the link inside the summary is present in the click set');
+    assert.equal(summary.hidden !== true, true, 'the summary is visible');
     assert.equal(
-      insideSummary?.hidden !== true,
+      insideSummary.hidden !== true,
       true,
       'a link inside the summary is rendered even while the details is closed',
     );
