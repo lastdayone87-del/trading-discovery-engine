@@ -96,8 +96,11 @@ The reason is diagnostic in P0.2. It does not change `complete`, `retryable`,
   pending probes are flushed before page-end aggregation. A sample counts when
   either the document identity or the URL still matches this page, so a
   same-document path/query update and a same-URL reload are both recorded while
-  a real navigation to another URL is left to its own request. Counters are
-  aggregated on the page
+  a real navigation to another URL is left to its own request. A baseline
+  sample taken after the page already left the inspected URL is discarded, and
+  a retry that throws before its first enumeration keeps the earlier attempt's
+  observation instead of replacing it with zeros. Counters are aggregated on
+  the page
   error path so an enumerated page is never published as zero.
 - The published denominator and hint-rejected count come from one coherent
   enumeration snapshot (largest total; first wins ties). Structural and
