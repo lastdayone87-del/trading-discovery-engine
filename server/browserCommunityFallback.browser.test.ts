@@ -394,7 +394,7 @@ test('real DOM: a generic hamburger disclosure is clicked and reveals a communit
     const after = await enumeratePageControls(page);
     const revealed = after.controls.find(target => target.href === 'https://discord.gg/generic-menu');
     assert.ok(revealed, 'the revealed invite link is enumerated after the disclosure click');
-    const candidates = extractDiscordCandidates(await page.content(), 'CREATOR_WEBSITES', page.url());
+    const candidates = extractDiscordCandidates(await page.locator('#panel').innerHTML(), 'CREATOR_WEBSITES', page.url());
     assert.equal(candidates[0]?.nativeInviteCode, 'generic-menu');
   });
 });

@@ -66,7 +66,7 @@ none contains a URL, selector, element text, or payload.
 | `controlsStructuralNavigation` | Menu/nav/hamburger/tab/summary/`aria-haspopup`/collapsed-`aria-expanded`/`role=menuitem` controls, including controls inside `<nav>`/`role=navigation|menu|menubar` containers. Classification uses the control's own label/naming text, not its resolved href. |
 | `controlsStructuralHintRejected` | Structural controls the original hint filter would hide. |
 | `controlsStructuralDisclosure` | Structural controls included in the click set because they can reveal content in place (a collapsed disclosure or a menu trigger that does not navigate). An already-open `<details>` summary is excluded: its content is already in the DOM and clicking would close it. |
-| `controlsStructuralUnrecovered` | Structural navigable anchors that are outside the click set and that the enqueue path will not follow: explicit menu-semantic or hint-recovered anchors, same-origin, admissible, not already visited, rejected by the community-hint filter. Ordinary “Learn more”/“Resources”/“Support” page links are not counted. If the enqueue path does not follow one, its destination was not examined; this forces `POLICY_EXCLUDED` (unless a stronger reason applies). |
+| `controlsStructuralUnrecovered` | Structural navigable anchors that are outside the click set and that the enqueue path will not follow: explicit menu-semantic or hint-recovered anchors, same-origin, admissible, not already visited, rejected by the community-hint filter. Ordinary “Learn more”/“Resources”/“Support” page links are not counted. If the enqueue path does not follow one, its destination was not examined; this forces `POLICY_EXCLUDED` (unless a stronger reason applies). The href sample is bounded at 64: when candidates remain beyond it, the count records at least one unrecovered destination fail-closed without proving each candidate's classification, so treat it as a lower bound in that case. |
 | `controlsIconLabelRecovered` | Controls recovered by a label the original filter ignored: `title`, `aria-labelledby`, child `alt`, `data-label`, `data-tooltip`, SVG `<title>`, or capped hidden text. These are included in the click set. |
 | `popupTargets` | Popup/dialog controls that remain unexamined by the click loop and require capture rather than navigation: any non-false `aria-haspopup` value and `target="_blank"` controls without an HTTP(S) href. A `_blank` anchor with a followable HTTP(S) href is reachable by navigation and is not counted; a popup the click loop successfully examined is subtracted. Presence only; no popup capture. |
 | `frameCount` | `iframe`/`frame`/`object`/`embed` elements observed on processed pages (bounded live-collection scan). |
@@ -143,8 +143,8 @@ The coverage reason itself remains diagnostic. It does not change `complete`,
 - `enumerateRenderedControlNodes` remains self-contained for Playwright
   serialization and still returns the complete matched set (never a 64-item
   prefix).
-- Structural detection is attribute- and label-based and bounded to the control
-  itself. `structuralKind` is measured from explicit semantics (`nav`,
+- Structural detection is attribute- and label-based plus ancestor container
+  semantics, and bounded to those sources. `structuralKind` is measured from explicit semantics (`nav`,
   `summary`, menu roles, `aria-haspopup`, collapsed `aria-expanded`), a
   menu-like label, or membership in a `<nav>`/menu container. Container
   membership is measurement only: only explicit semantics or a menu-like label
@@ -234,19 +234,21 @@ SET LOCAL statement_timeout = '30s';
 -- How much navigation was hidden by the hint filter in the last day?
 -- Guard every JSON counter: a legacy or malformed row must not abort the
 -- whole aggregate, and no matching rows must read as zero rather than NULL.
+-- The digit bound (18) prevents a pathological long numeric string from
+-- overflowing the bigint cast.
 SELECT
   count(*) AS rendered_observations,
-  coalesce(sum(CASE WHEN (provenance->'crawlerTelemetry'->>'controlsEnumeratedTotal') ~ '^[0-9]+$'
+  coalesce(sum(CASE WHEN (provenance->'crawlerTelemetry'->>'controlsEnumeratedTotal') ~ '^[0-9]{1,18}$'
     THEN (provenance->'crawlerTelemetry'->>'controlsEnumeratedTotal')::bigint ELSE 0 END), 0) AS enumerated,
-  coalesce(sum(CASE WHEN (provenance->'crawlerTelemetry'->>'controlsHintRejected') ~ '^[0-9]+$'
+  coalesce(sum(CASE WHEN (provenance->'crawlerTelemetry'->>'controlsHintRejected') ~ '^[0-9]{1,18}$'
     THEN (provenance->'crawlerTelemetry'->>'controlsHintRejected')::bigint ELSE 0 END), 0) AS hint_rejected,
-  coalesce(sum(CASE WHEN (provenance->'crawlerTelemetry'->>'controlsStructuralHintRejected') ~ '^[0-9]+$'
+  coalesce(sum(CASE WHEN (provenance->'crawlerTelemetry'->>'controlsStructuralHintRejected') ~ '^[0-9]{1,18}$'
     THEN (provenance->'crawlerTelemetry'->>'controlsStructuralHintRejected')::bigint ELSE 0 END), 0) AS structural_hint_rejected,
-  coalesce(sum(CASE WHEN (provenance->'crawlerTelemetry'->>'controlsStructuralDisclosure') ~ '^[0-9]+$'
+  coalesce(sum(CASE WHEN (provenance->'crawlerTelemetry'->>'controlsStructuralDisclosure') ~ '^[0-9]{1,18}$'
     THEN (provenance->'crawlerTelemetry'->>'controlsStructuralDisclosure')::bigint ELSE 0 END), 0) AS structural_disclosure,
-  coalesce(sum(CASE WHEN (provenance->'crawlerTelemetry'->>'controlsStructuralUnrecovered') ~ '^[0-9]+$'
+  coalesce(sum(CASE WHEN (provenance->'crawlerTelemetry'->>'controlsStructuralUnrecovered') ~ '^[0-9]{1,18}$'
     THEN (provenance->'crawlerTelemetry'->>'controlsStructuralUnrecovered')::bigint ELSE 0 END), 0) AS structural_unrecovered,
-  coalesce(sum(CASE WHEN (provenance->'crawlerTelemetry'->>'controlsIconLabelRecovered') ~ '^[0-9]+$'
+  coalesce(sum(CASE WHEN (provenance->'crawlerTelemetry'->>'controlsIconLabelRecovered') ~ '^[0-9]{1,18}$'
     THEN (provenance->'crawlerTelemetry'->>'controlsIconLabelRecovered')::bigint ELSE 0 END), 0) AS icon_label_recovered
 FROM external_acquisition_observations
 WHERE observed_at > now() - interval '1 day'
@@ -279,10 +281,12 @@ are excluded by the `mode = RENDERED` filter, so they cannot appear as
   and the enqueue path still decides navigation, so a false positive can spend
   click budget but cannot bypass admission.
 - Original hint matches are clicked first, then icon-label recoveries, then
-  structural disclosures; each group preserves DOM order. The 64-control
-  evaluation window and the per-page click budget still apply, so a large
-  recovered set can leave controls unexamined; that is reported through the
-  existing overflow/skip counters, not hidden.
+  structural disclosures; each group preserves DOM order. A hidden control is
+  the exception: it is queued immediately after the disclosure that reveals it,
+  even when its origin is hint/icon, because clicking it before that disclosure
+  would time out. The 64-control evaluation window and the per-page click budget
+  still apply, so a large recovered set can leave controls unexamined; that is
+  reported through the existing overflow/skip counters, not hidden.
 - `frameCount` includes advertising/analytics iframes. It is a presence
   counter, not proof that a frame contains navigation or invite evidence.
 - `popupTargets` counts popup/dialog controls that need capture (ARIA
