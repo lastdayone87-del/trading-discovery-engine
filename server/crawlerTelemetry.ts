@@ -131,13 +131,31 @@ export interface RenderedCoverageInput {
   /** Context sampling was abandoned for at least one page (no trustworthy
    * document identity), so unreached frames/shadow roots cannot be ruled out. */
   contextUnknown?: boolean;
+  /**
+   * @deprecated Measurement-only. Reported in `controlsStructuralHintRejected`
+   * but intentionally not consulted by `resolveRenderedCoverageReason`:
+   * structural disclosures are now clicked, so hint rejection alone is not an
+   * unexamined destination.
+   */
   structuralHintRejected?: number;
+  /**
+   * @deprecated Measurement-only. Reported in `controlsIconLabelRecovered` but
+   * intentionally not consulted by `resolveRenderedCoverageReason`:
+   * icon-label controls are now clicked, so recovery alone is not a gap.
+   */
   iconLabelRecovered?: number;
   unresolvedFailedRequests?: number;
   frameCount?: number;
   shadowRootCount?: number;
   popupTargets?: number;
   navigationPolicyExcluded?: Partial<Record<NavigationPolicyExclusionReason, number>>;
+  /**
+   * A structural navigation anchor was observed but neither clicked (it would
+   * replace the document) nor followed through enqueue admission. Its
+   * destination was never examined, so coverage cannot resolve as COMPLETE.
+   * Deterministic: retrying the same page applies the same hint filter.
+   */
+  unrecoveredNavigation?: boolean;
 }
 
 /**
@@ -153,8 +171,6 @@ export function resolveRenderedCoverageReason(input: RenderedCoverageInput): Ren
     || input.interactionGap === true
     || input.scrollCapReachedStillGrowing === true
     || input.contextUnknown === true
-    || count(input.structuralHintRejected) > 0
-    || count(input.iconLabelRecovered) > 0
     || count(input.unresolvedFailedRequests) > 0) {
     return 'BOUNDED';
   }
@@ -162,7 +178,8 @@ export function resolveRenderedCoverageReason(input: RenderedCoverageInput): Ren
     return 'CONTEXT_UNREACHABLE';
   }
   const excluded = input.navigationPolicyExcluded || {};
-  if (count(excluded['invalid-protocol']) > 0
+  if (input.unrecoveredNavigation === true
+    || count(excluded['invalid-protocol']) > 0
     || count(excluded['admission-rejected']) > 0
     || count(excluded['cross-origin-disallowed']) > 0
     || count(excluded['destination-budget']) > 0) {
@@ -363,19 +380,23 @@ export interface CrawlerTelemetry {
    */
   evidenceControlsOffsetAdvance?: number;
   /**
-   * P0.2 navigation-coverage counters (rendered-only, counts only). The
+   * P1.1/P1.2 navigation-coverage counters (rendered-only, counts only). The
    * pre-filter denominator answers how many controls existed before the
    * community-hint filter; `HintRejected` is the difference. Structural
-   * navigation counts menu/nav/hamburger/aria-haspopup controls that the
-   * hint filter would otherwise hide. Icon-label recovery counts controls
-   * whose only useful label is title/aria-labelledby/child-alt/data-label.
-   * Popup targets counts target=_blank/aria-haspopup=dialog controls. None of
-   * these fields contain selectors, text, or URLs.
+   * navigation counts menu/nav/hamburger/tab/summary/aria-haspopup controls.
+   * `StructuralDisclosure` counts those included in the click set because they
+   * reveal content in place; `StructuralUnrecovered` counts structural
+   * anchors still left to the enqueue path. Icon-label recovery counts
+   * controls whose only useful label is title/aria-labelledby/child-alt/
+   * data-label/SVG title/hidden text. None of these fields contain selectors,
+   * text, or URLs.
    */
   controlsEnumeratedTotal?: number;
   controlsHintRejected?: number;
   controlsStructuralNavigation?: number;
   controlsStructuralHintRejected?: number;
+  controlsStructuralDisclosure?: number;
+  controlsStructuralUnrecovered?: number;
   controlsIconLabelRecovered?: number;
   popupTargets?: number;
   /**
@@ -777,6 +798,12 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.controlsStructuralHintRejected) > 0
       ? { controlsStructuralHintRejected: boundedCount(candidate.controlsStructuralHintRejected) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.controlsStructuralDisclosure) > 0
+      ? { controlsStructuralDisclosure: boundedCount(candidate.controlsStructuralDisclosure) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.controlsStructuralUnrecovered) > 0
+      ? { controlsStructuralUnrecovered: boundedCount(candidate.controlsStructuralUnrecovered) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.controlsIconLabelRecovered) > 0
       ? { controlsIconLabelRecovered: boundedCount(candidate.controlsIconLabelRecovered) }

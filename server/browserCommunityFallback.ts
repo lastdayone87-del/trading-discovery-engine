@@ -110,6 +110,8 @@ export interface BrowserFallbackTelemetry {
   controlsHintRejected?: number;
   controlsStructuralNavigation?: number;
   controlsStructuralHintRejected?: number;
+  controlsStructuralDisclosure?: number;
+  controlsStructuralUnrecovered?: number;
   controlsIconLabelRecovered?: number;
   popupTargets?: number;
   frameCount?: number;
@@ -265,11 +267,12 @@ export const COMMUNITY_HINTS = /discord|community|join|chat|member|membership|vi
 
 /**
  * Interactive controls that can reveal content only through interaction:
- * links, buttons, ARIA buttons/tabs, native disclosures (`summary`), and
- * collapsed accordion triggers. The selector is shared by enumeration and
- * clicking so locator indexes always refer to the same full query.
+ * links, buttons, ARIA buttons/tabs/menu items, popup triggers, native
+ * disclosures (`summary`), and collapsed accordion triggers. The selector is
+ * shared by enumeration and clicking so locator indexes always refer to the
+ * same full query.
  */
-export const RENDERED_CONTROL_SELECTOR = 'a,button,[role="button"],[role="tab"],summary,[aria-expanded="false"]';
+export const RENDERED_CONTROL_SELECTOR = 'a,button,[role="button"],[role="tab"],[role="menuitem"],summary,[aria-expanded="false"],[aria-haspopup]';
 
 /**
  * Telegram channel pages contain a link for virtually every message. Those
@@ -345,6 +348,35 @@ export function reconcileClickDestinationContext(input: {
     reconciled.baseHrefPresent = reconciled.baseHrefPresent || observed.baseHrefPresent;
   }
   return reconciled;
+}
+
+/**
+ * Terminal-success identities for one processed request. The request URL is
+ * always evidence. The document URL where processing started is evidence even
+ * if a same-document history update or a later click replacement changed the
+ * URL: that document was inspected. The final document URL is evidence only
+ * when the document that finished the handler is the document that was
+ * processed: a redirect commits before inspection, so both identities were
+ * inspected, while a click-triggered navigation replaces the document after
+ * the click loop stops and leaves the replacement's controls unexamined. That
+ * URL must be proven by its own successful request instead of being borrowed
+ * as shared coverage.
+ */
+export function renderedTerminalSuccessIdentities(input: {
+  requestUrl: string;
+  initialDocumentUrl: string;
+  inspectedDocumentUrl: string;
+  finalDocumentUrl: string;
+  documentReplacedByClick: boolean;
+}): string[] {
+  const processedUrl = input.documentReplacedByClick
+    ? input.inspectedDocumentUrl
+    : input.finalDocumentUrl;
+  const keys = visitIdentityKeys(input.requestUrl, input.initialDocumentUrl);
+  for (const key of visitIdentityKeys(input.requestUrl, processedUrl)) {
+    if (!keys.includes(key)) keys.push(key);
+  }
+  return keys;
 }
 
 /**
@@ -623,20 +655,58 @@ export interface RenderedControlTarget {
    * examined popups from the unexamined-context count. Never serialized.
    */
   popup?: boolean;
+  /**
+   * Why the control entered the click set. Original hint matches and icon-label
+   * recoveries are evidence-bearing increments; generic structural disclosures
+   * are best-effort opportunism. Only the former make an unclicked control a
+   * retryable interaction gap; an unclicked disclosure stays a diagnostic.
+   */
+  origin?: 'hint' | 'icon' | 'disclosure';
+  /**
+   * True when the control had no layout box at enumeration (for example a
+   * button inside a closed `<details>`). A hidden control is queued after
+   * every visible one in its priority group: clicking it first can time out
+   * and consume budget before the disclosure that reveals it has run.
+   */
+  hidden?: boolean;
+  /**
+   * Marker of the disclosure that reveals this hidden control. Retry rotation
+   * may start in the middle of the pool, so the planner re-attaches a hidden
+   * control to its revealer instead of clicking it while its menu is closed.
+   * Never serialized to telemetry.
+   */
+  afterMarker?: string;
 }
 
 export interface RenderedControlEnumeration {
-  /** Evidence-bearing controls (the existing community-hint matched set). */
+  /** Evidence-bearing controls: base hint matches first, then icon-label
+   * recoveries, then structural disclosures that can reveal content in place.
+   * Each group preserves DOM order. */
   controls: RenderedControlTarget[];
   /** Pre-filter denominator: every node matched by the shared selector. */
   total: number;
-  /** Nodes excluded by the community-hint filter (total - controls). */
+  /** Nodes excluded by the original community-hint filter (total - baseMatched). */
   hintRejected: number;
-  /** Menu/nav/hamburger/aria-haspopup/role=menuitem controls, matched or not. */
+  /** Menu/nav/hamburger/aria-haspopup/role=menuitem/tab/summary controls. */
   structuralNavigation: number;
-  /** Structural controls the hint filter would hide (P1.1 measurement). */
+  /** Structural controls the original hint filter would hide (P0.2 measurement). */
   structuralHintRejected: number;
-  /** Controls recoverable only via title/aria-labelledby/alt/data-label (P1.2). */
+  /** Structural controls included by P1.1 because they can reveal content in place. */
+  structuralDisclosure: number;
+  /** Structural navigable anchors still outside the click set because they
+   * would replace the document (and are not base hint matches). The enqueue
+   * path owns them; when it rejects the URL, the destination was never
+   * examined and the crawl cannot resolve as COMPLETE. This is the raw
+   * browser-side candidate count; the request handler filters it through the
+   * enqueue admission rule before publishing coverage. */
+  structuralUnrecovered: number;
+  /** Bounded hrefs backing `structuralUnrecovered`, used by the request
+   * handler to exclude destinations the enqueue path actually follows. */
+  structuralUnrecoveredHrefs: string[];
+  /** At least one candidate was observed after the bounded href sample filled. */
+  structuralUnrecoveredOverflow: boolean;
+  /** Controls recovered only via title/aria-labelledby/alt/data-label/SVG title
+   * or hidden text (P1.2). These are included in `controls`. */
   iconLabelRecovered: number;
   /**
    * Popup/dialog controls that require capture rather than navigation
@@ -676,6 +746,8 @@ export interface RenderedRequestControlTotals {
   hintRejected: number;
   structuralNavigation: number;
   structuralHintRejected: number;
+  structuralDisclosure: number;
+  structuralUnrecovered: number;
   iconLabelRecovered: number;
   popupCount: number;
   frameCount: number;
@@ -697,6 +769,8 @@ export function renderedRequestControlTotalsDelta(
     hintRejected: current.hintRejected - (previous?.hintRejected || 0),
     structuralNavigation: current.structuralNavigation - (previous?.structuralNavigation || 0),
     structuralHintRejected: current.structuralHintRejected - (previous?.structuralHintRejected || 0),
+    structuralDisclosure: current.structuralDisclosure - (previous?.structuralDisclosure || 0),
+    structuralUnrecovered: current.structuralUnrecovered - (previous?.structuralUnrecovered || 0),
     iconLabelRecovered: current.iconLabelRecovered - (previous?.iconLabelRecovered || 0),
     popupCount: current.popupCount - (previous?.popupCount || 0),
     frameCount: current.frameCount - (previous?.frameCount || 0),
@@ -744,25 +818,71 @@ export function resolveUnexaminedPopupTargets(
  * the complete matched set (never a prefix slice) so the caller can rotate the
  * full pool by the durable retry offset before applying the evaluation window.
  *
- * P0.2 is measurement-only: `controls` still uses the original innerText +
- * href + aria-label match, so behavior is unchanged. Structural/icon-label
- * counts tell us what P1.1/P1.2 would recover without enabling them yet.
+ * P1.1/P1.2 recovery: `controls` includes the original community-hint match,
+ * icon-only labels (title/aria-labelledby/child alt/data-label/SVG title/hidden
+ * text), and structural disclosure controls (menu/hamburger/tab/summary/
+ * aria-haspopup/collapsed aria-expanded) that can reveal content in place.
+ * Non-base-matched structural anchors that navigate to a real document stay
+ * out of the click set: the enqueue path owns them, and clicking would replace
+ * the document instead of expanding it. Base matches keep their original click
+ * behavior. All counts are bounded and selector-derived.
  */
 export function enumerateRenderedControlNodes(
   nodes: Element[],
   pattern: string,
 ): RenderedControlEnumeration {
   const re = new RegExp(pattern, 'i');
-  const matched: RenderedControlTarget[] = [];
+  const hintMatched: RenderedControlTarget[] = [];
+  const recovered: RenderedControlTarget[] = [];
+  const disclosures: RenderedControlTarget[] = [];
+  let baseMatchedCount = 0;
   let structuralNavigation = 0;
   let structuralHintRejected = 0;
+  let structuralDisclosure = 0;
+  let structuralUnrecovered = 0;
+  const structuralUnrecoveredHrefs: string[] = [];
+  let structuralUnrecoveredOverflow = false;
   let iconLabelRecovered = 0;
   let popupTargets = 0;
   const popupIndices: number[] = [];
+  // Hidden controls are queued immediately after the disclosure that reveals
+  // them, so unrelated visible controls cannot exhaust the click budget first.
+  const revealerIndexByIndex = new Map<number, number>();
+  const indexByNode = new Map<Element, number>();
+  for (let nodeIndex = 0; nodeIndex < nodes.length; nodeIndex++) indexByNode.set(nodes[nodeIndex], nodeIndex);
   for (let index = 0; index < nodes.length; index++) {
     const node = nodes[index];
     const element = node as HTMLElement;
     const tagName = (element.tagName || '').toLowerCase();
+    // A control is hidden when it has no layout box, when computed
+    // `visibility` hides it, or when a closed <details> ancestor hides it.
+    // Some engines still report a layout box for closed-details content, so
+    // the ancestor check is authoritative. Every closed ancestor matters: an
+    // inner summary is still hidden while an outer <details> is closed. The
+    // outermost closed details is the disclosure that ultimately reveals the
+    // control, so hidden controls can be queued right after it.
+    //
+    // Keep this inline: Playwright serializes this function into the page.
+    let hiddenByClosedDetails = false;
+    let revealer: Element | null = null;
+    for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
+      if (ancestor.tagName.toLowerCase() !== 'details' || ancestor.hasAttribute('open')) continue;
+      const summary = ancestor.querySelector(':scope > summary');
+      // The summary itself and everything inside it stay rendered while the
+      // details is closed; only its siblings are hidden.
+      if (summary && summary.contains(element)) continue;
+      hiddenByClosedDetails = true;
+      // The nearest closed details is the disclosure the crawler must click
+      // first; an outer one only reveals this summary, not the content.
+      if (revealer === null) revealer = summary;
+    }
+    const hidden = hiddenByClosedDetails
+      || element.getClientRects().length === 0
+      || getComputedStyle(element).visibility === 'hidden';
+    if (hidden && revealer) {
+      const revealerIndex = indexByNode.get(revealer);
+      if (revealerIndex !== undefined) revealerIndexByIndex.set(index, revealerIndex);
+    }
     // HTMLAnchorElement.href is a string; SVGElement.href is an
     // SVGAnimatedString. Reading the attribute keeps both anchor kinds
     // string-safe, and resolving against the document base preserves the
@@ -790,7 +910,9 @@ export function enumerateRenderedControlNodes(
     }
     const ariaLabel = element.getAttribute('aria-label') || '';
     const baseText = `${element.innerText || ''} ${href || ''} ${ariaLabel}`;
-    // P1.2 measurement: resolve the labels that the original filter ignores.
+    // P1.2: resolve labels the original filter ignored. A bounded descendant
+    // text walk adds visually hidden text (innerText omits it) without
+    // materializing a pathological control's entire subtree.
     let labelledByText = '';
     const labelledBy = element.getAttribute('aria-labelledby') || '';
     if (labelledBy) {
@@ -832,59 +954,142 @@ export function enumerateRenderedControlNodes(
     }
     let childAlt = '';
     const image = element.querySelector('img[alt]');
-    if (image) childAlt = image.getAttribute('alt') || '';
-    const title = element.getAttribute('title') || '';
-    const dataLabel = element.getAttribute('data-label') || '';
-    const extendedText = `${baseText} ${title} ${labelledByText} ${childAlt} ${dataLabel}`;
+    if (image) childAlt = (image.getAttribute('alt') || '').slice(0, 200);
+    const title = (element.getAttribute('title') || '').slice(0, 200);
+    const dataLabel = (element.getAttribute('data-label') || '').slice(0, 200);
+    const dataTooltip = (element.getAttribute('data-tooltip') || '').slice(0, 200);
+    const svgTitleNode = element.querySelector('svg title');
+    // Bounded title read: `textContent` materializes the entire subtree, and
+    // a hostile SVG title can be arbitrarily large. Walk at most 500 text
+    // nodes and collect at most 200 characters, as the other label sources do.
+    let svgTitle = '';
+    if (svgTitleNode) {
+      const svgTitleWalker = document.createTreeWalker(svgTitleNode, NodeFilter.SHOW_TEXT);
+      let svgTitleText = svgTitleWalker.nextNode();
+      let svgTitleNodes = 0;
+      while (svgTitleText && svgTitle.length < 200 && svgTitleNodes < 500) {
+        svgTitleNodes++;
+        const value = svgTitleText.nodeValue || '';
+        const remaining = 200 - svgTitle.length;
+        if (value && remaining > 0) svgTitle += value.length > remaining ? value.slice(0, remaining) : value;
+        svgTitleText = svgTitleWalker.nextNode();
+      }
+    }
+    // Bounded descendant-text walk. Reading `textContent` and slicing after
+    // the fact still materializes and normalizes the entire subtree; a
+    // pathological menu container could make every enumeration unbounded.
+    // Stop at 200 collected characters (or 500 text nodes as a hard guard).
+    let hiddenText = '';
+    const textWalker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+    let textNode = textWalker.nextNode();
+    let textNodesExamined = 0;
+    while (textNode && hiddenText.length < 200 && textNodesExamined < 500) {
+      textNodesExamined++;
+      const value = textNode.nodeValue || '';
+      const remaining = 200 - hiddenText.length;
+      // Concatenate adjacent text nodes without an injected separator: a
+      // word split by markup (`Dis<strong>cord</strong>`) must stay intact.
+      if (value && remaining > 0) hiddenText += value.length > remaining ? value.slice(0, remaining) : value;
+      textNode = textWalker.nextNode();
+    }
+    hiddenText = hiddenText.replace(/\s+/g, ' ').trim().slice(0, 200);
+    // Hint matching may use the resolved href (an icon-only anchor can be
+    // identified by its destination alone), but structural classification
+    // must not: a `/more` or `#support` URL is not a menu label.
+    const labelText = `${element.innerText || ''} ${ariaLabel}`;
+    const structuralText = `${labelText} ${title} ${labelledByText} ${childAlt} ${dataLabel} ${dataTooltip} ${svgTitle} ${hiddenText}`;
+    const extendedText = `${baseText} ${title} ${labelledByText} ${childAlt} ${dataLabel} ${dataTooltip} ${svgTitle} ${hiddenText}`;
     const baseMatched = re.test(baseText);
     const extendedMatched = re.test(extendedText);
+    const hintMatchedControl = baseMatched || extendedMatched;
+    if (baseMatched) baseMatchedCount++;
     const role = (element.getAttribute('role') || '').toLowerCase();
     const ariaHaspopup = (element.getAttribute('aria-haspopup') || '').trim().toLowerCase();
-    // Only the control's own visible label and aria-label may classify it as
-    // navigation. Including the resolved href made ordinary `/support`,
-    // `/resources`, or `/more` destinations structural; title and
-    // aria-labelledby can describe external content (a section heading, a
-    // tooltip) rather than this control, so they stay in `extendedText` for
-    // icon-label recovery only.
-    const labelText = `${element.innerText || ''} ${ariaLabel}`;
     // HTTP(S) is the only destination the enqueue path can follow. A
     // `javascript:` or other scheme is click-only and must not make a
     // `target=_blank` control look like a normal navigable link.
     const hasNavigableHref = typeof href === 'string' && /^https?:\/\//i.test(href);
-    // A control inside a real navigation/menu container is navigation even
-    // when its own label is generic (`Products`). The container itself is not
-    // in the click selector, so inspect ancestors on the enumerated control.
-    const inNavigationContainer = !!element.closest(
-      'nav,[role="navigation"],[role="menu"],[role="menubar"]',
-    );
-    // `aria-expanded` on a normal href-bearing link is an attribute of content
-    // navigation, not a disclosure trigger; a href-less link (or a real
-    // button/summary) is an interactive surface whose contents stay hidden.
-    const disclosure = tagName === 'summary'
-      || (element.hasAttribute('aria-expanded') && (tagName !== 'a' || !hasNavigableHref));
     const target = (element.getAttribute('target') || '').trim().toLowerCase();
-    // Menu-like labels only. Generic footer/company/about links are not
-    // structural navigation and would make nearly every crawl look
-    // policy-bounded. Title/aria-labelledby are included only for this
-    // menu-shaped test: an icon-only "Main menu" button outside a navigation
-    // container is a real coverage gap even though it is not clicked, while
-    // generic title text must not classify ordinary controls.
-    const menuLikeLabel = /\b(menu|navigation|nav|hamburger)\b/i;
-    const structural = tagName === 'nav'
+    // An already-open <details> needs no click, and clicking its summary
+    // would close it and hide the controls the crawler should inspect. The
+    // revealed content is already in the DOM and is enumerated normally.
+    const openSummary = tagName === 'summary'
+      && !!(element.parentElement as HTMLDetailsElement | null)?.open;
+    // Explicit menu semantics are evidence that a navigable anchor is a menu
+    // item/trigger rather than an ordinary page link. Label-only matches are
+    // still treated as disclosures when they cannot navigate (a button), but
+    // they do not turn an ordinary "Learn more"/"Resources" anchor into a
+    // navigation-coverage gap.
+    const explicitStructural = tagName === 'nav'
+      || tagName === 'summary'
       || role === 'menu'
       || role === 'menubar'
       || role === 'menuitem'
       || role === 'navigation'
+      || role === 'tab'
       || (ariaHaspopup !== '' && ariaHaspopup !== 'false')
-      || disclosure
-      || inNavigationContainer
-      || menuLikeLabel.test(labelText)
-      || menuLikeLabel.test(`${title} ${labelledByText}`);
+      || element.getAttribute('aria-expanded') === 'false';
+    // Menu-like labels only. Generic footer/company/about links are not
+    // structural navigation and would make nearly every crawl look
+    // policy-bounded. The label text excludes the resolved href.
+    const menuLikeLabel = /(^|\b)(menu|navigation|nav|hamburger|resources|support|explore|more)(\b|$)/i.test(structuralText);
+    // A control inside a real navigation/menu container is navigation even
+    // when its own label is generic (`Products`) and it carries no menu role.
+    // That is measurement only: a section/TOC link inside <nav> must not
+    // consume the click budget ahead of a real menu trigger.
+    const inNavigationContainer = !!element.closest(
+      'nav, [role="navigation"], [role="menu"], [role="menubar"]',
+    );
+    const structuralKind = explicitStructural || menuLikeLabel || inNavigationContainer;
+    const structural = structuralKind && !openSummary;
+    // A structural anchor that resolves to a different document is a page
+    // candidate, not an in-place disclosure. Clicking it would replace the
+    // document and consume the click budget; the enqueue path owns it. The
+    // comparison is against the current document URL, not the effective
+    // <base href>: an anchor can resolve exactly to the base URI while still
+    // navigating away from the current document.
+    let navigatesAway = false;
+    if (tagName === 'a' && typeof href === 'string' && href) {
+      try {
+        const resolved = new URL(href);
+        const current = new URL(document.URL);
+        resolved.hash = '';
+        current.hash = '';
+        navigatesAway = (resolved.protocol === 'http:' || resolved.protocol === 'https:')
+          && resolved.toString() !== current.toString();
+      } catch {
+        navigatesAway = true;
+      }
+    }
+    const isDisclosure = structural && !navigatesAway && (explicitStructural || menuLikeLabel);
+    // A non-base-matched structural anchor that navigates away is never
+    // clicked: replacing the document would strand the remaining menu
+    // controls, and the enqueue path owns the destination. It is a coverage
+    // gap only when the anchor is explicitly menu-like (role/haspopup/
+    // collapsed state) or was recovered by a hint-bearing label. An ordinary
+    // "Learn more"/"Resources"/"Support" page link is a navigation candidate
+    // the hint policy deliberately did not pursue, not a structural
+    // disclosure, so it must not mark nearly every crawl policy-excluded.
+    const excludedStructuralNavigation = structural && navigatesAway && !baseMatched;
+    const unrecoveredStructuralNavigation = excludedStructuralNavigation
+      && (explicitStructural || extendedMatched);
     const isPopup = (ariaHaspopup !== '' && ariaHaspopup !== 'false')
       || (target === '_blank' && !hasNavigableHref);
-    if (structural) {
+    if (structuralKind) {
       structuralNavigation++;
       if (!baseMatched) structuralHintRejected++;
+    }
+    if (isDisclosure) structuralDisclosure++;
+    if (unrecoveredStructuralNavigation) {
+      structuralUnrecovered++;
+      // Bounded: coverage only needs to know that at least one unexamined
+      // structural destination exists, and the request handler re-checks a
+      // bounded set against enqueue admission. Overflow is recorded so a
+      // candidate beyond the sample cannot silently disappear.
+      if (typeof href === 'string' && href) {
+        if (structuralUnrecoveredHrefs.length < 64) structuralUnrecoveredHrefs.push(href);
+        else structuralUnrecoveredOverflow = true;
+      }
     }
     if (!baseMatched && extendedMatched) iconLabelRecovered++;
     // Only popups that cannot be followed as a normal navigation are a
@@ -897,20 +1102,73 @@ export function enumerateRenderedControlNodes(
       // accounting; they are marked below but never enter the click set.
       popupIndices.push(index);
     }
-    if (!baseMatched) continue;
-    matched.push({
+    if (openSummary) continue;
+    if (!hintMatchedControl && !isDisclosure) continue;
+    // A structural anchor that navigates away is enqueue-owned and never
+    // clicked: replacing the document would strand the remaining menu
+    // controls. Only the subset that represents a real unexamined structural
+    // destination is counted as unrecovered navigation for coverage.
+    if (excludedStructuralNavigation) continue;
+    const item: RenderedControlTarget = {
       index,
       text: baseText,
       href,
       tag: (tagName === 'a' ? 'anchor' : tagName === 'button' ? 'button' : 'role') as 'anchor' | 'button' | 'role',
       ...(isPopup ? { popup: true } : {}),
-    });
+      ...(hidden ? { hidden: true } : {}),
+      origin: baseMatched ? 'hint' : extendedMatched ? 'icon' : 'disclosure',
+    };
+    // Original hint matches keep absolute priority, then icon-label
+    // recoveries, then generic structural disclosures. Each group preserves
+    // DOM order for deterministic rotation; a recovered control can never
+    // consume the click budget ahead of an existing base match.
+    if (baseMatched) hintMatched.push(item);
+    else if (extendedMatched) recovered.push(item);
+    else disclosures.push(item);
+  }
+  const grouped = [...hintMatched, ...recovered, ...disclosures];
+  // Controls with no layout box cannot be clicked yet. Queue each hidden
+  // control immediately after the disclosure that reveals it (the nearest
+  // closed <details> summary, nested disclosures first), so that disclosure
+  // runs first without putting unrelated visible controls in front of the
+  // content it reveals. A hidden control with no known revealer in this click
+  // set goes last. Clicking a control while its menu is still closed would
+  // time out, and because its marker is already queued, the now-visible
+  // control would never be retried even with spare click budget.
+  const hiddenAfter = new Map<number, RenderedControlTarget[]>();
+  const trailingHidden: RenderedControlTarget[] = [];
+  for (const item of grouped) {
+    if (!item.hidden) continue;
+    const revealerIndex = revealerIndexByIndex.get(item.index);
+    if (revealerIndex === undefined) {
+      trailingHidden.push(item);
+      continue;
+    }
+    const pending = hiddenAfter.get(revealerIndex);
+    if (pending) pending.push(item);
+    else hiddenAfter.set(revealerIndex, [item]);
+  }
+  const selected: RenderedControlTarget[] = [];
+  const roots: RenderedControlTarget[] = [];
+  for (const item of grouped) if (!item.hidden) roots.push(item);
+  roots.push(...trailingHidden);
+  for (const root of roots) {
+    selected.push(root);
+    // Depth-first: a revealed disclosure's own content follows it, so a
+    // nested closed <details> is opened before the control it contains.
+    const stack = (hiddenAfter.get(root.index) || []).slice().reverse();
+    while (stack.length > 0) {
+      const child = stack.pop() as RenderedControlTarget;
+      selected.push(child);
+      const nested = hiddenAfter.get(child.index);
+      if (nested) for (let nestedIndex = nested.length - 1; nestedIndex >= 0; nestedIndex--) stack.push(nested[nestedIndex]);
+    }
   }
   const usedMarkers = new Set<string>();
   const controls: RenderedControlTarget[] = [];
   const markerByIndex = new Map<number, string>();
-  for (let itemIndex = 0; itemIndex < matched.length; itemIndex++) {
-    const item = matched[itemIndex];
+  for (let itemIndex = 0; itemIndex < selected.length; itemIndex++) {
+    const item = selected[itemIndex];
     const node = nodes[item.index] as HTMLElement;
     const existing = node.getAttribute('data-oc-control');
     let marker = existing || `oc-${Date.now().toString(36)}-${item.index}-${Math.random().toString(36).slice(2, 8)}`;
@@ -925,7 +1183,12 @@ export function enumerateRenderedControlNodes(
     usedMarkers.add(marker);
     if (existing !== marker) node.setAttribute('data-oc-control', marker);
     markerByIndex.set(item.index, marker);
-    controls.push({ ...item, marker });
+    // The revealer is always earlier in `selected`, so its marker already
+    // exists. A hidden control with no revealer in the click set keeps the
+    // enumeration-time trailing position and has no dependency to replay.
+    const revealerIndex = item.hidden ? revealerIndexByIndex.get(item.index) : undefined;
+    const afterMarker = revealerIndex === undefined ? undefined : markerByIndex.get(revealerIndex);
+    controls.push({ ...item, marker, ...(afterMarker ? { afterMarker } : {}) });
   }
   const popupMarkers: string[] = [];
   for (let popupIndex = 0; popupIndex < popupIndices.length; popupIndex++) {
@@ -950,9 +1213,13 @@ export function enumerateRenderedControlNodes(
   return {
     controls,
     total: nodes.length,
-    hintRejected: Math.max(0, nodes.length - controls.length),
+    hintRejected: Math.max(0, nodes.length - baseMatchedCount),
     structuralNavigation,
     structuralHintRejected,
+    structuralDisclosure,
+    structuralUnrecovered,
+    structuralUnrecoveredHrefs,
+    structuralUnrecoveredOverflow,
     iconLabelRecovered,
     popupTargets,
     popupMarkers,
@@ -1039,6 +1306,83 @@ export function isSkippableNavigableAnchorClick(
   return shouldEnqueueRenderedCommunityLink(absolute.toString());
 }
 
+/**
+ * Whether the current page is still the seed document whose required links
+ * were snapshotted. A same-document history/query update keeps the document
+ * and any links revealed after the update, while a real navigation commits a
+ * new document whose links are enqueue-owned and must not become required
+ * obligations of the seed. Document identity wins when both reads succeed;
+ * normalized URL comparison is the fail-closed fallback.
+ */
+export function isSameSeedDocument(
+  seedIdentity: unknown,
+  currentIdentity: unknown,
+  seedUrl: string,
+  currentUrl: string,
+): boolean {
+  if (seedIdentity !== null && seedIdentity !== undefined
+    && currentIdentity !== null && currentIdentity !== undefined) {
+    return seedIdentity === currentIdentity;
+  }
+  return normalizeVisitUrl(currentUrl) === normalizeVisitUrl(seedUrl);
+}
+
+/**
+ * True when a structural href resolves to a different hostname. The rendered
+ * enqueue path uses Crawlee's `same-hostname` strategy, which follows HTTP and
+ * HTTPS (and any port) on the same hostname, so origin comparison would
+ * mislabel an admissible scheme/port switch as cross-origin.
+ */
+export function isCrossHostnameStructuralNavigation(href: string, pageUrl: string): boolean {
+  const raw = (href || '').trim();
+  if (!raw) return false;
+  let page: URL;
+  let absolute: URL;
+  try {
+    page = new URL(pageUrl);
+    absolute = new URL(raw, pageUrl);
+  } catch {
+    return false;
+  }
+  if (absolute.protocol !== 'http:' && absolute.protocol !== 'https:') return false;
+  return absolute.hostname.toLowerCase() !== page.hostname.toLowerCase();
+}
+
+/**
+ * Whether an excluded structural anchor is a real navigation-coverage gap.
+ *
+ * A structural anchor that navigates away is never clicked. It is not a gap
+ * when the enqueue path owns and follows it (same-origin, admissible, not
+ * already visited, community-hint match), because that destination is
+ * inspected separately. Cross-origin destinations are recorded by the
+ * cross-origin policy counter, and format/security rejections are not
+ * unexamined navigation. Only a same-origin, admissible, not-yet-visited
+ * destination that the hint policy rejects is both un-clicked and un-enqueued.
+ */
+export function isUnrecoveredStructuralNavigation(
+  href: string,
+  pageUrl: string,
+  alreadyVisited: ReadonlySet<string>,
+): boolean {
+  const raw = (href || '').trim();
+  if (!raw) return false;
+  let absolute: URL;
+  try {
+    absolute = new URL(raw, pageUrl);
+  } catch {
+    return false;
+  }
+  if (absolute.protocol !== 'http:' && absolute.protocol !== 'https:') return false;
+  // Cross-origin destinations are recorded in the rendered policy ledger by
+  // the handler (`cross-origin-disallowed`); they are not enqueue-owned.
+  if (isCrossHostnameStructuralNavigation(raw, pageUrl)) return false;
+  const visitKey = normalizeVisitUrl(absolute.toString());
+  if (visitKey && alreadyVisited.has(visitKey)) return false;
+  if (!assessCrawlAdmission(absolute.toString()).eligible) return false;
+  if (shouldEnqueueRenderedCommunityLink(absolute.toString())) return false;
+  return true;
+}
+
 /** Bounded evaluation window over the complete matched-control set. The window
  * is rotated by the durable retry offset before the per-page click cap, so a
  * retry can reach controls beyond the first 64 instead of re-examining the
@@ -1051,18 +1395,15 @@ export function partitionRenderedClickTargets(
   maxClicks: number,
   offset = 0,
   evaluationWindowSize = RENDERED_CONTROL_EVALUATION_WINDOW,
-): { toClick: RenderedControlTarget[]; skippedNavigableAnchors: number; evaluationWindow: RenderedControlTarget[] } {
+): { toClick: RenderedControlTarget[]; skippedNavigableAnchors: number; evaluationWindow: RenderedControlTarget[]; rotationReplay: number } {
   const cap = Math.max(0, Math.trunc(maxClicks) || 0);
   const windowSize = Math.max(0, Math.trunc(evaluationWindowSize) || 0);
   // Rotate the complete matched pool before applying the evaluation window.
   // Rotating the already-truncated plan would only reorder the same prefix and
-  // leave controls 65+ permanently unreachable.
-  const rawOffset = Math.trunc(offset) || 0;
-  const start = controls.length > 0
-    ? ((rawOffset % controls.length) + controls.length) % controls.length
-    : 0;
-  const rotated = start > 0 ? [...controls.slice(start), ...controls.slice(0, start)] : controls;
-  const evaluationWindow = rotated.slice(0, windowSize);
+  // leave controls 65+ permanently unreachable. A rotation boundary that lands
+  // on a hidden control replays only its revealer chain first.
+  const { ordered, replay } = planRenderedClickRotation(controls, offset);
+  const evaluationWindow = ordered.slice(0, windowSize);
   const eligible: RenderedControlTarget[] = [];
   let skippedNavigableAnchors = 0;
   for (const control of evaluationWindow) {
@@ -1072,7 +1413,35 @@ export function partitionRenderedClickTargets(
     }
     eligible.push(control);
   }
-  return { toClick: eligible.slice(0, cap), skippedNavigableAnchors, evaluationWindow };
+  return {
+    toClick: eligible.slice(0, cap),
+    skippedNavigableAnchors,
+    evaluationWindow,
+    rotationReplay: replay,
+  };
+}
+
+/**
+ * Controls outside the bounded evaluation window for this page, using the
+ * same rotation as `partitionRenderedClickTargets`. These are the controls that
+ * were not examined, so their origins decide whether the overflow is a real
+ * coverage gap or only opportunistic disclosures.
+ */
+export function renderedControlOverflowTargets(
+  controls: RenderedControlTarget[],
+  pageUrl: string,
+  offset = 0,
+  evaluationWindowSize = RENDERED_CONTROL_EVALUATION_WINDOW,
+): RenderedControlTarget[] {
+  const windowSize = Math.max(0, Math.trunc(evaluationWindowSize) || 0);
+  if (controls.length <= windowSize) return [];
+  const { ordered } = planRenderedClickRotation(controls, offset);
+  // Mirror the click planner: a navigable anchor the enqueue path owns is not
+  // a click obligation, so it is not an unexamined control when it falls
+  // outside the evaluation window. Only the remaining targets are overflow.
+  return ordered
+    .slice(windowSize)
+    .filter(target => !isSkippableNavigableAnchorClick(target, pageUrl));
 }
 
 /**
@@ -1112,7 +1481,7 @@ export function isNavigableOnlyControlWindow(
  * an interaction gap and is revisited when the pool rotates back around.
  */
 export function renderedClickOffsetAdvance(
-  plan: Pick<ReturnType<typeof partitionRenderedClickTargets>, 'toClick' | 'evaluationWindow' | 'skippedNavigableAnchors'>,
+  plan: Pick<ReturnType<typeof partitionRenderedClickTargets>, 'toClick' | 'evaluationWindow' | 'skippedNavigableAnchors' | 'rotationReplay'>,
   attempts: number,
   maxClicksPerPage: number,
   firstFailedAttempt?: number,
@@ -1129,15 +1498,65 @@ export function renderedClickOffsetAdvance(
     : failedAt === 0
       ? attempted
       : Math.min(attempted, failedAt);
+  // The plan may replay a disclosure before the saved offset. The returned
+  // value is added to that offset, so progress counts only controls after the
+  // replay prefix; replayed controls never advance the rotation.
+  const replay = Math.max(0, Math.trunc(plan.rotationReplay) || 0);
   if (examined === 0) {
-    return isNavigableOnlyControlWindow(plan, maxClicksPerPage) ? plan.evaluationWindow.length : 0;
+    return isNavigableOnlyControlWindow(plan, maxClicksPerPage)
+      ? Math.max(0, plan.evaluationWindow.length - replay)
+      : 0;
   }
   const lastAttempted = plan.toClick[Math.min(examined, plan.toClick.length) - 1];
   if (!lastAttempted) return 0;
   const position = plan.evaluationWindow.findIndex(target =>
     target === lastAttempted || (Boolean(target.marker) && target.marker === lastAttempted.marker)
   );
-  return position >= 0 ? position + 1 : 0;
+  return position >= replay ? position - replay + 1 : 0;
+}
+
+/**
+ * Build the control order for one attempt from a durable rotation offset.
+ * The saved position is where the previous attempt stopped, so a hidden
+ * control there needs the disclosure that reveals it replayed first. Only
+ * that revealer chain is prepended (outermost first for nested disclosures);
+ * the attempt then resumes at the saved position, skipping the hidden children
+ * between the revealer and it because the attempt that advanced the offset
+ * already examined them. Replaying those children instead would starve later
+ * ones whenever they fill the click cap.
+ *
+ * `replay` is the length of that prefix: progress is measured from the saved
+ * position, not from the replayed controls.
+ */
+function planRenderedClickRotation(
+  controls: RenderedControlTarget[],
+  offset: number,
+): { ordered: RenderedControlTarget[]; replay: number } {
+  const length = controls.length;
+  if (length === 0) return { ordered: [], replay: 0 };
+  const start = ((Math.trunc(offset) || 0) % length + length) % length;
+  const chain: number[] = [];
+  let cursor = start;
+  for (let step = 0; step < length; step++) {
+    const control = controls[cursor];
+    if (!control || !control.hidden || !control.afterMarker) break;
+    const revealer = controls.findIndex(candidate => candidate.marker === control.afterMarker);
+    if (revealer < 0 || revealer === cursor || chain.indexOf(revealer) !== -1) break;
+    chain.push(revealer);
+    cursor = revealer;
+  }
+  const prefixIndices = chain.slice().reverse();
+  const prefixSet = new Set(prefixIndices);
+  const ordered: RenderedControlTarget[] = [];
+  for (let prefixIndex = 0; prefixIndex < prefixIndices.length; prefixIndex++) {
+    ordered.push(controls[prefixIndices[prefixIndex]]);
+  }
+  for (let step = 0; step < length; step++) {
+    const index = (start + step) % length;
+    if (prefixSet.has(index)) continue;
+    ordered.push(controls[index]);
+  }
+  return { ordered, replay: prefixIndices.length };
 }
 
 /**
@@ -1173,6 +1592,19 @@ export function remainingRenderedClickBudget(
   const clicked = Math.max(0, Math.trunc(clickedThisPage) || 0);
   const pending = Math.max(0, Math.trunc(pendingQueuedTargets) || 0);
   return Math.max(0, cap - clicked - pending);
+}
+
+/**
+ * Only an unexamined hint/icon control is evidence-bearing enough to make the
+ * page incomplete. Generic structural disclosures are opportunistic: they are
+ * clicked when budget allows, but an over-budget disclosure does not turn a
+ * common menu/FAQ page into a retryable acquisition gap. Targets without an
+ * origin are legacy evidence controls and stay conservative.
+ */
+export function renderedControlSkipsNeedInteractionGap(
+  targets: Array<Pick<RenderedControlTarget, 'origin'>>,
+): boolean {
+  return targets.some(target => target.origin !== 'disclosure');
 }
 
 /**
@@ -1217,6 +1649,14 @@ export interface RenderedClickLoopInput {
   click: (target: RenderedControlTarget) => Promise<boolean>;
   enumerate: () => Promise<RenderedControlEnumeration>;
   pageUrl: () => string;
+  /**
+   * Stable identity for the current document, used to distinguish a real
+   * navigation from a same-document history/query update (`pushState`,
+   * `replaceState`). Production passes `performance.timeOrigin`, which
+   * survives same-document URL changes and changes after a new document
+   * commits. When omitted, URL comparison is used (legacy behavior).
+   */
+  documentIdentity?: () => Promise<unknown>;
   /** Durable per-seed retry rotation, shared with the initial click plan so a
    * retry does not repeatedly select the same DOM-order subset of controls
    * revealed by a previous click. */
@@ -1232,6 +1672,18 @@ export interface RenderedClickLoopResult {
   evidenceControlsFailed: number;
   evidenceControlsSkipped: number;
   interactionGap: boolean;
+  /** A click committed a new document and stopped the loop. The replacement
+   * page was never enumerated or clicked, so it is not terminal-success
+   * evidence for required coverage. */
+  documentReplaced: boolean;
+  /** The last URL of the document the loop actually processed. Same-document
+   * history updates advance it; a click that commits a new document leaves it
+   * at the last URL of the replaced document. */
+  processedDocumentUrl: string;
+  /** The document URL when the loop started, before any same-document update.
+   * It was still the inspected document when a later history update or click
+   * replacement changed `processedDocumentUrl`. */
+  initialDocumentUrl: string;
   /** Index (in the click-target queue) of the first control whose click
    * failed. The durable retry offset must stop at that control, never rotate
    * past it, because its revealed content was not examined. */
@@ -1257,6 +1709,9 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
   let evidenceControlsFailed = 0;
   let evidenceControlsSkipped = 0;
   let interactionGap = false;
+  let documentReplaced = false;
+  const initialDocumentUrl = input.pageUrl();
+  let processedDocumentUrl = initialDocumentUrl;
   let firstFailedTargetIndex: number | undefined;
   for (let clickIndex = 0; clickIndex < clickTargets.length; clickIndex++) {
     if (clickedThisPage >= input.maxClicksPerPage) {
@@ -1264,15 +1719,17 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
       // the click cap is reached. They were never examined, so they are skips,
       // not a clean no-match.
       let cappedSkips = 0;
+      const cappedTargets: RenderedControlTarget[] = [];
       for (const target of clickTargets.slice(clickIndex)) {
         const marker = target.marker;
         if (marker && countedSkips.has(marker)) continue;
         if (marker) countedSkips.add(marker);
         cappedSkips++;
+        cappedTargets.push(target);
       }
       if (cappedSkips > 0) {
         evidenceControlsSkipped += cappedSkips;
-        interactionGap = true;
+        if (renderedControlSkipsNeedInteractionGap(cappedTargets)) interactionGap = true;
       }
       break;
     }
@@ -1283,12 +1740,61 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
     }
     const control = clickTargets[clickIndex];
     clickedThisPage++;
+    const urlBeforeClick = input.pageUrl();
+    const identityBeforeClick = input.documentIdentity
+      ? await input.documentIdentity().catch(() => null)
+      : undefined;
     if (await input.click(control)) evidenceControlsClicked++;
     else {
       evidenceControlsFailed++;
-      interactionGap = true;
+      // A failed generic disclosure is opportunistic: a hidden mobile menu
+      // timing out does not itself mean a community destination went
+      // unexamined. Failed hint/icon controls are evidence-bearing and keep
+      // the page retryable.
+      if (renderedControlSkipsNeedInteractionGap([control])) interactionGap = true;
       if (firstFailedTargetIndex === undefined) firstFailedTargetIndex = clickIndex;
     }
+    // A menu handler or javascript: link can replace the document even when
+    // the control had no navigable href at enumeration time. Remaining queued
+    // targets belong to the old DOM; they cannot be examined, and the new
+    // document must not be re-enumerated as if it were the original page.
+    // A same-document history/query update (`pushState`) keeps the document
+    // and its controls, so it must continue to re-enumeration instead of
+    // abandoning live controls.
+    const urlAfterClick = input.pageUrl();
+    const beforeKey = normalizeVisitUrl(urlBeforeClick) ?? urlBeforeClick;
+    const afterKey = normalizeVisitUrl(urlAfterClick) ?? urlAfterClick;
+    const urlChanged = beforeKey !== afterKey;
+    let replacedThisClick = urlChanged;
+    if (input.documentIdentity) {
+      const identityAfterClick = await input.documentIdentity().catch(() => null);
+      if (identityBeforeClick !== null && identityBeforeClick !== undefined
+        && identityAfterClick !== null && identityAfterClick !== undefined) {
+        replacedThisClick = identityBeforeClick !== identityAfterClick;
+      } else {
+        // An unreadable identity cannot establish document continuity. A
+        // same-URL reload would look exactly like a same-document update, so
+        // fail closed: stop the old plan instead of clicking stale controls
+        // on a replacement document.
+        replacedThisClick = true;
+      }
+    }
+    if (replacedThisClick) {
+      documentReplaced = true;
+      const remainingTargets = clickTargets.slice(clickIndex + 1);
+      if (remainingTargets.length > 0) {
+        evidenceControlsSkipped += remainingTargets.length;
+        // A replaced document strands the remaining queued targets. Only an
+        // unexamined hint/icon control is evidence-bearing; disclosure-only
+        // leftovers stay opportunistic instead of making the page retryable.
+        if (renderedControlSkipsNeedInteractionGap(remainingTargets)) interactionGap = true;
+      }
+      break;
+    }
+    // Same-document history updates keep the processed document, so its latest
+    // URL stays valid terminal-success evidence. The assignment sits after the
+    // replacement branch so a committed navigation cannot overwrite it.
+    processedDocumentUrl = urlAfterClick;
     // A successful click can reveal new evidence-bearing controls (second
     // interaction). Re-enumerate after every click, including the final
     // allowed one: controls revealed by the last click are still unexamined,
@@ -1314,14 +1820,16 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
         // overflow/slice drops are already counted) and make the interaction
         // gap explicit so the page cannot resolve as a clean no-match.
         let freshDropped = 0;
+        const freshDroppedTargets: RenderedControlTarget[] = [];
         for (const target of freshPlan.skipped) {
           if (!target.marker || countedSkips.has(target.marker)) continue;
           countedSkips.add(target.marker);
           freshDropped++;
+          freshDroppedTargets.push(target);
         }
         if (freshDropped > 0) {
           evidenceControlsSkipped += freshDropped;
-          interactionGap = true;
+          if (renderedControlSkipsNeedInteractionGap(freshDroppedTargets)) interactionGap = true;
         }
         for (const target of freshPlan.toClick) {
           if (!target.marker || queuedMarkers.has(target.marker)) continue;
@@ -1335,7 +1843,7 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
       }
     }
   }
-  return { evidenceControlsClicked, evidenceControlsFailed, evidenceControlsSkipped, interactionGap, firstFailedTargetIndex };
+  return { evidenceControlsClicked, evidenceControlsFailed, evidenceControlsSkipped, interactionGap, documentReplaced, processedDocumentUrl, initialDocumentUrl, firstFailedTargetIndex };
 }
 
 /**
@@ -2084,6 +2592,12 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   // seen/clicked/failed/skipped across processed pages, and whether the seed
   // required set grew after scroll/click interactions.
   let seedSnapshotUrl = '';
+  let seedSnapshotIdentity: unknown = null;
+  // The seed request may be retried with a fresh page/document. The identity
+  // and URL are refreshed for each seed attempt, while child pages never
+  // replace them. Required links accumulate across attempts: a destination
+  // seen on a failed attempt stays an obligation instead of disappearing.
+  const seedRequestKey = normalizeVisitUrl(seedUrl);
   let requiredSnapshotExpanded = false;
   let evidenceControlsSeen = 0;
   let evidenceControlsClicked = 0;
@@ -2103,6 +2617,8 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   let controlsHintRejected = 0;
   let controlsStructuralNavigation = 0;
   let controlsStructuralHintRejected = 0;
+  let controlsStructuralDisclosure = 0;
+  let controlsStructuralUnrecovered = 0;
   let controlsIconLabelRecovered = 0;
   // Crawlee retries a thrown request with a fresh page and fresh page-local
   // counters. Keep the last attempt's contribution per request so a retry
@@ -2161,6 +2677,8 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
     telemetry.controlsHintRejected = controlsHintRejected || undefined;
     telemetry.controlsStructuralNavigation = controlsStructuralNavigation || undefined;
     telemetry.controlsStructuralHintRejected = controlsStructuralHintRejected || undefined;
+    telemetry.controlsStructuralDisclosure = controlsStructuralDisclosure || undefined;
+    telemetry.controlsStructuralUnrecovered = controlsStructuralUnrecovered || undefined;
     telemetry.controlsIconLabelRecovered = controlsIconLabelRecovered || undefined;
     telemetry.popupTargets = popupTargets || undefined;
     telemetry.frameCount = (frameCount + clickDestinationContext.frameCount) || undefined;
@@ -2192,6 +2710,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
       shadowRootCount: shadowRootCount + clickDestinationContext.shadowRootCount,
       popupTargets,
       navigationPolicyExcluded: telemetry.navigationPolicyExcluded,
+      unrecoveredNavigation: controlsStructuralUnrecovered > 0,
     });
   };
   const terminalSuccessUrls: string[] = [];
@@ -2206,6 +2725,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
       .map(normalizeVisitUrl)
       .filter((key): key is string => typeof key === 'string' && key.length > 0),
   );
+  // Pages read during this crawl are used only for navigation deduplication
+  // (a structural link back to them is not an unexamined destination). They
+  // become successful coverage evidence only after the full handler succeeds.
+  const structuralVisitedKeys = new Set(alreadyVisitedSet);
   const discovered:DiscordCandidate[]=[];
   const hostKey = (rawUrl: string): string => {
     try { return new URL(rawUrl).hostname.toLowerCase().replace(/^www\\./, '') || 'unknown'; }
@@ -2423,8 +2946,16 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // Record the document this request actually inspected (the request
             // URL plus any redirect target) so a click that merely lands on it
             // later is not attributed twice.
-            for (const identity of visitIdentityKeys(request.url, page.url())) {
+            const inspectedIdentities = visitIdentityKeys(request.url, page.url());
+            for (const identity of inspectedIdentities) {
               inspectedDocumentKeys.add(identity);
+            }
+            // A redirect makes the request URL and the final landing URL the
+            // same inspected destination. Record both for structural
+            // deduplication: a menu link back to the original request URL is
+            // not an unexamined destination (it redirects to this document).
+            for (const identity of inspectedIdentities) {
+              structuralVisitedKeys.add(identity);
             }
             telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'PAGE_PROCESSED');
             // P0.2 context counters: structural presence only, refreshed after
@@ -2530,13 +3061,23 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               }
             };
             flushPageContextProbesOnError = flushPageContextProbes;
-            if (!seedDocumentSeen) {
+            if (seedRequestKey && normalizeVisitUrl(request.url) === seedRequestKey) {
               seedDocumentSeen = true;
               seedSnapshotUrl = page.url();
+              // Capture document identity alongside the URL. A menu can
+              // update the query in place (pushState); the URL then differs
+              // even though the seed document, and links revealed after the
+              // update, still belong to the same required set. Refresh both
+              // per seed attempt: a Crawlee retry gets a fresh document whose
+              // new timeOrigin must not be compared with the failed attempt's
+              // identity.
+              seedSnapshotIdentity = await page.evaluate(() => performance.timeOrigin).catch(() => null);
               try {
-                seedRequiredLinks = discoverRequiredSeedLinks(await page.content(), page.url());
+                const known = new Set(seedRequiredLinks);
+                for (const link of discoverRequiredSeedLinks(await page.content(), page.url())) known.add(link);
+                seedRequiredLinks = [...known];
               } catch {
-                seedRequiredLinks = [];
+                // Keep links discovered on an earlier attempt.
               }
             }
 
@@ -2557,6 +3098,8 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             let pageHintRejected = 0;
             let pageStructuralNavigation = 0;
             let pageStructuralHintRejected = 0;
+            let pageStructuralDisclosure = 0;
+            let pageStructuralUnrecovered = 0;
             let pageIconLabelRecovered = 0;
             let pagePopupMarkers = new Set<string>();
             let pageControlOverflow = 0;
@@ -2579,18 +3122,54 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               );
               pageStructuralNavigation = gapCounters.structuralNavigation;
               pageStructuralHintRejected = gapCounters.structuralHintRejected;
+              pageStructuralDisclosure = Math.max(pageStructuralDisclosure, enumeration.structuralDisclosure);
+              // Raw browser-side candidates become coverage gaps only when the
+              // enqueue path will not follow the destination. An admitted
+              // same-origin community link is inspected separately; a
+              // cross-origin anchor cannot be followed by the same-hostname
+              // enqueue path, so it is recorded in the rendered policy ledger
+              // instead of silently resolving as COMPLETE.
+              let unrecoveredRejected = 0;
+              for (const href of enumeration.structuralUnrecoveredHrefs) {
+                if (isCrossHostnameStructuralNavigation(href, page.url())) {
+                  // Count each excluded destination once per crawl, matching
+                  // the static inspector. A shared header/footer link would
+                  // otherwise inflate the ledger on every page and retry.
+                  const key = normalizeVisitUrl(href) || href.trim();
+                  if (key) drops.countUnique('cross-origin-disallowed', key);
+                  continue;
+                }
+                if (isUnrecoveredStructuralNavigation(href, page.url(), structuralVisitedKeys)) {
+                  unrecoveredRejected++;
+                }
+              }
+              // The href sample is bounded, so a candidate beyond it was never
+              // checked against admission. Fail closed instead of letting the
+              // sample size decide that the crawl is complete.
+              if (enumeration.structuralUnrecoveredOverflow) unrecoveredRejected = Math.max(1, unrecoveredRejected);
+              pageStructuralUnrecovered = Math.max(pageStructuralUnrecovered, unrecoveredRejected);
               pageIconLabelRecovered = gapCounters.iconLabelRecovered;
               pagePopupMarkers = trackRenderedPopupCoverage(pagePopupMarkers, enumeration);
-              // Overflow accounting keeps using the matched pool: P0.2 is
-              // measurement-only and must not change control-slice behavior.
-              const overflow = Math.max(0, matchedTotal - RENDERED_CONTROL_EVALUATION_WINDOW);
+              // Overflow accounting uses the expanded click set. The
+              // unexamined overflow is origin-gated: an unclicked generic
+              // disclosure stays opportunistic, while an unexamined hint/icon
+              // control makes the page retryable.
+              const overflowTargets = renderedControlOverflowTargets(
+                enumeration.controls,
+                page.url(),
+                limits.clickOffset,
+              );
+              const overflow = overflowTargets.length;
               if (overflow > pageControlOverflow) {
                 const added = overflow - pageControlOverflow;
                 pageControlOverflow = overflow;
                 drops.count('control-slice', added);
                 evidenceControlsSkipped += added;
-                interactionGap = true;
               }
+              // Evaluate origins on every enumeration: a later DOM change can
+              // rotate a hint/icon control into the unexamined window even when
+              // the overflow count itself did not grow.
+              if (renderedControlSkipsNeedInteractionGap(overflowTargets)) interactionGap = true;
             };
             // Page counters are local until this aggregation. Aggregate once
             // at the normal end of the page and once on the error path below.
@@ -2636,6 +3215,8 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 hintRejected: pageHintRejected,
                 structuralNavigation: pageStructuralNavigation,
                 structuralHintRejected: pageStructuralHintRejected,
+                structuralDisclosure: pageStructuralDisclosure,
+                structuralUnrecovered: pageStructuralUnrecovered,
                 iconLabelRecovered: pageIconLabelRecovered,
                 popupCount: resolveUnexaminedPopupTargets(pagePopupMarkers, examinedPopupMarkers),
                 frameCount: pageFrameCount,
@@ -2649,6 +3230,8 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               controlsHintRejected += delta.hintRejected;
               controlsStructuralNavigation += delta.structuralNavigation;
               controlsStructuralHintRejected += delta.structuralHintRejected;
+              controlsStructuralDisclosure += delta.structuralDisclosure;
+              controlsStructuralUnrecovered += delta.structuralUnrecovered;
               controlsIconLabelRecovered += delta.iconLabelRecovered;
               popupTargets += delta.popupCount;
               frameCount += delta.frameCount;
@@ -2708,13 +3291,18 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // Overflow beyond the evaluation window is already counted by
             // recordControlEnumeration. This second count covers only controls
             // inside the window that the click budget could not examine.
-            const sliceDropped = Math.max(0, clickPlan.evaluationWindow.length - clickPlan.toClick.length - clickPlan.skippedNavigableAnchors);
+            const sliceSkippedTargets = clickPlan.evaluationWindow.filter(target =>
+              !clickPlan.toClick.some(planned => planned.marker === target.marker)
+              && !isSkippableNavigableAnchorClick(target, page.url()));
+            const sliceDropped = sliceSkippedTargets.length;
             if (sliceDropped > 0) {
               // Every enumerated control matched the community-evidence filter;
               // dropping one for budget means its content was never examined.
+              // Generic disclosures are opportunistic, so only hint/icon skips
+              // make the page retryable.
               drops.count('control-slice', sliceDropped);
               evidenceControlsSkipped += sliceDropped;
-              interactionGap = true;
+              if (renderedControlSkipsNeedInteractionGap(sliceSkippedTargets)) interactionGap = true;
             }
             // Shared enqueue admission (single rule definition): already-visited
             // exclusion, then the shared crawl admission boundary, then the
@@ -2794,6 +3382,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 },
                 enumerate: enumerateControls,
                 pageUrl: () => page.url(),
+                // Same-document history updates keep performance.timeOrigin;
+                // a real navigation commits a new document and changes it.
+                documentIdentity: () => page.evaluate(() => performance.timeOrigin),
                 clickOffset: limits.clickOffset,
                 countedSkips: countedControlSkips,
                 onEnumerated: recordControlEnumeration,
@@ -2855,7 +3446,13 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             if (seedDocumentSeen) {
               try {
                 const currentUrl = page.url();
-                const sameDocument = normalizeVisitUrl(currentUrl) === normalizeVisitUrl(seedSnapshotUrl);
+                const currentIdentity = await page.evaluate(() => performance.timeOrigin).catch(() => null);
+                const sameDocument = isSameSeedDocument(
+                  seedSnapshotIdentity,
+                  currentIdentity,
+                  seedSnapshotUrl,
+                  currentUrl,
+                );
                 if (sameDocument) {
                   const known = new Set(seedRequiredLinks);
                   let added = 0;
@@ -2875,7 +3472,16 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // success resolves an earlier failure (retry recovery). Click
             // handling owns no marks: clicks never affect terminal accounting.
             markRenderedRequestSucceeded(requestTracker, request.url);
-            for (const identity of visitIdentityKeys(request.url, page.url())) {
+            // A click-committed replacement document was never enumerated or
+            // clicked. Borrow only the document the loop actually processed;
+            // its replacement must prove itself through its own request.
+            for (const identity of renderedTerminalSuccessIdentities({
+              requestUrl: request.url,
+              initialDocumentUrl: clickLoop.initialDocumentUrl,
+              inspectedDocumentUrl: clickLoop.processedDocumentUrl,
+              finalDocumentUrl: page.url(),
+              documentReplacedByClick: clickLoop.documentReplaced,
+            })) {
               if (!terminalSuccessUrls.includes(identity)) terminalSuccessUrls.push(identity);
             }
             } catch (attemptError) {
@@ -2974,11 +3580,20 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               .filter((key): key is string => typeof key === 'string' && key.length > 0),
           );
           requiredTotal = requiredKeys.size;
+          // Only terminal-success evidence may satisfy the required set:
+          // caller-supplied visited keys plus this run's successful request and
+          // final-page identities. A page that was merely read before its
+          // request failed stays unvisited.
+          const sharedCoveredKeys = new Set<string>(alreadyVisitedSet);
+          for (const identity of terminalSuccessUrls) {
+            const key = normalizeVisitUrl(identity);
+            if (key) sharedCoveredKeys.add(key);
+          }
           const classified = classifyRequiredCoverage({
             requiredKeys,
             succeededKeys,
             failedClassesByKey: failedByKey,
-            sharedCoveredKeys: alreadyVisitedSet,
+            sharedCoveredKeys,
           });
           requiredUnvisited.push(...classified.unvisited);
           requiredTransientFailures.push(...classified.transientFailures);

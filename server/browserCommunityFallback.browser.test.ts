@@ -270,17 +270,19 @@ test('real DOM: enumeration separates hint-rejected, structural, icon-label, and
   await withControlPage(html, async (page) => {
     const enumeration = await enumeratePageControls(page);
     assert.equal(enumeration.total, 4, 'the pre-filter denominator includes every selector-matched control');
-    assert.equal(enumeration.controls.length, 2, 'only community-hint controls remain evidence-bearing');
-    assert.equal(enumeration.hintRejected, 2, 'hint rejection is measured, not silently dropped');
+    assert.equal(enumeration.controls.length, 4, 'hint-matched, icon-label, and structural disclosure controls are all evidence-bearing');
+    assert.equal(enumeration.hintRejected, 2, 'hint rejection is measured against the original filter, not the recovered set');
     assert.equal(enumeration.structuralNavigation, 1, 'the menu/aria-haspopup control is structural navigation');
-    assert.equal(enumeration.structuralHintRejected, 1, 'the structural control would be hidden by the hint filter today');
-    assert.equal(enumeration.iconLabelRecovered, 1, 'title-only icon labels are recoverable in P1.2');
+    assert.equal(enumeration.structuralHintRejected, 1, 'the structural control would be hidden by the original hint filter');
+    assert.equal(enumeration.structuralDisclosure, 1, 'the menu control is included as an in-place disclosure');
+    assert.equal(enumeration.structuralUnrecovered, 0, 'no structural control is left outside the click set');
+    assert.equal(enumeration.iconLabelRecovered, 1, 'title-only icon labels are recovered in P1.2');
     assert.equal(enumeration.popupTargets, 1, 'only the dialog control requires popup capture; the href-bearing _blank anchor is navigable');
     assert.equal(enumeration.popupMarkers.length, 1, 'the hint-rejected popup is identity-tracked too');
     assert.equal(
       enumeration.controls.some(control => control.marker === enumeration.popupMarkers[0]),
-      false,
-      'tracking a hint-rejected popup does not add it to the click set',
+      true,
+      'a menu/dialog trigger is clickable as an in-place disclosure even when the hint filter rejected it',
     );
     const repeat = await enumeratePageControls(page);
     assert.deepEqual(repeat.popupMarkers, enumeration.popupMarkers, 'popup identity is stable across enumerations');
@@ -315,18 +317,368 @@ test('real DOM: navigation ancestors and generic labels classify structural cont
   await withControlPage(html, async (page) => {
     const enumeration = await enumeratePageControls(page);
     assert.equal(enumeration.total, 10);
-    assert.equal(enumeration.controls.length, 3, 'only the hint-matched controls remain evidence-bearing');
+    assert.equal(enumeration.controls.length, 5, 'three hint-matched controls plus the two hint-rejected in-place disclosures remain evidence-bearing');
     assert.equal(
       enumeration.structuralNavigation,
-      5,
-      'the two nav links, the menu trigger, the disclosure button, and the dialog trigger are structural; footer Support/More and a href-bearing aria-expanded link are not',
+      8,
+      'nav ancestors and menu-like labels classify the two nav links, footer Support/More, the menu trigger, the filters disclosure, the /account link, and the dialog trigger as structural measurement',
     );
-    assert.equal(enumeration.structuralHintRejected, 4, 'nav links and disclosure triggers hidden by the hint filter are measured');
+    assert.equal(enumeration.structuralHintRejected, 7, 'every structural control except the hint-matched dialog trigger is hidden by the original hint filter');
+    assert.equal(enumeration.structuralDisclosure, 3, 'the menu, disclosure, and dialog triggers reveal content in place');
+    assert.equal(enumeration.structuralUnrecovered, 1, 'only the explicitly menu-semantic /account anchor is an unrecovered navigation gap; ordinary nav links are enqueue-owned page candidates');
     assert.equal(
       enumeration.popupTargets,
       3,
       'aria-haspopup=true/dialog and a non-HTTP(S) _blank target are popups; a navigable _blank anchor is not',
     );
+  });
+});
+
+test('real DOM: nav-container section links are measured but never consume the click budget', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <nav>
+      <a href="#section-1">Section 1</a>
+      <a href="#section-2">Section 2</a>
+      <a href="#section-3">Section 3</a>
+      <a href="#section-4">Section 4</a>
+      <button type="button" aria-haspopup="menu" aria-label="Open menu">Menu</button>
+    </nav>
+    <a href="/more"></a>
+  </body></html>`;
+  await withControlPage(html, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(
+      enumeration.structuralNavigation,
+      5,
+      'nav-container membership is still measured for the TOC links',
+    );
+    assert.equal(
+      enumeration.structuralDisclosure,
+      1,
+      'only the explicit menu trigger is a clickable disclosure',
+    );
+    assert.equal(enumeration.controls.length, 1, 'only the explicit menu trigger enters the click set');
+    assert.match(
+      enumeration.controls[0].text,
+      /Open menu/,
+      'fragment links and a URL-only /more anchor cannot exhaust the click budget',
+    );
+    assert.equal(
+      enumeration.structuralUnrecovered,
+      0,
+      'a same-document fragment link is not an unexamined navigation destination',
+    );
+  });
+});
+
+test('real DOM: a generic hamburger disclosure is clicked and reveals a community link', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <button id="menu" type="button" aria-expanded="false">Menu</button>
+    <div id="panel"></div>
+    <script>
+      document.getElementById('menu').addEventListener('click', () => {
+        document.getElementById('menu').setAttribute('aria-expanded', 'true');
+        document.getElementById('panel').innerHTML = '<a href="https://discord.gg/generic-menu">Join</a>';
+      });
+    </script>
+  </body></html>`;
+  await withControlPage(html, async (page, url) => {
+    const before = await enumeratePageControls(page);
+    assert.equal(before.controls.length, 1, 'the generic menu is the only clickable control');
+    assert.equal(before.structuralDisclosure, 1, 'the collapsed hamburger is a structural disclosure');
+    assert.equal(before.structuralUnrecovered, 0, 'the hamburger is included, not left to the enqueue path');
+    const plan = partitionRenderedClickTargets(before.controls, url, 4, 0);
+    assert.equal(plan.toClick.length, 1);
+    assert.equal(plan.toClick[0]?.text.trim(), 'Menu');
+    await page.locator(`[data-oc-control="${plan.toClick[0]!.marker}"]`).click();
+    const after = await enumeratePageControls(page);
+    const revealed = after.controls.find(target => target.href === 'https://discord.gg/generic-menu');
+    assert.ok(revealed, 'the revealed invite link is enumerated after the disclosure click');
+    const candidates = extractDiscordCandidates(await page.locator('#panel').innerHTML(), 'CREATOR_WEBSITES', page.url());
+    assert.equal(candidates[0]?.nativeInviteCode, 'generic-menu');
+  });
+});
+
+test('real DOM: non-button menuitem and aria-haspopup controls are enumerated and clickable', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <div role="menuitem" id="menuitem" tabindex="0">Community</div>
+    <div aria-haspopup="menu" id="haspopup" tabindex="0">More</div>
+    <div id="panel-menuitem"></div>
+    <div id="panel-haspopup"></div>
+    <script>
+      document.getElementById('menuitem').addEventListener('click', () => {
+        document.getElementById('panel-menuitem').innerHTML = '<a href="https://discord.gg/menuitem-room">Join</a>';
+      });
+      document.getElementById('haspopup').addEventListener('click', () => {
+        document.getElementById('panel-haspopup').innerHTML = '<a href="https://discord.gg/haspopup-room">Join</a>';
+      });
+    </script>
+  </body></html>`;
+  await withControlPage(html, async (page, url) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(enumeration.total, 2, 'both non-button controls match the shared selector');
+    assert.equal(enumeration.controls.length, 2, 'both are evidence-bearing disclosures');
+    assert.equal(enumeration.structuralNavigation, 2);
+    assert.equal(enumeration.structuralDisclosure, 2);
+    const plan = partitionRenderedClickTargets(enumeration.controls, url, 4, 0);
+    assert.equal(plan.toClick.length, 2);
+    for (const target of plan.toClick) {
+      await page.locator(`[data-oc-control="${target.marker}"]`).click();
+    }
+    assert.equal(await page.locator('a[href="https://discord.gg/menuitem-room"]').count(), 1);
+    assert.equal(await page.locator('a[href="https://discord.gg/haspopup-room"]').count(), 1);
+  });
+});
+
+test('real DOM: recovered structural anchors never replace the page and are counted unrecovered', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <button type="button" id="menu" aria-expanded="false">Menu</button>
+    <a href="/community">Community</a>
+    <a href="/help" title="Community support">Help</a>
+    <a href="/resources">Resources</a>
+  </body></html>`;
+  await withControlPage(html, async (page, url) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(
+      enumeration.structuralUnrecovered,
+      1,
+      'only the hint-recovered structural anchor is a coverage candidate; the ordinary /resources link is not',
+    );
+    assert.deepEqual(
+      enumeration.structuralUnrecoveredHrefs.map(href => new URL(href).pathname),
+      ['/help'],
+    );
+    assert.equal(
+      enumeration.controls.some(target => target.href?.endsWith('/help')),
+      false,
+      'a label-recovered structural anchor is not clicked',
+    );
+    assert.equal(
+      enumeration.controls.some(target => target.href?.endsWith('/resources')),
+      false,
+      'an ordinary structural navigable anchor is not clicked',
+    );
+    assert.equal(
+      enumeration.controls.some(target => target.href?.endsWith('/community')),
+      true,
+      'a base-matched navigable anchor keeps its existing enqueue-owned click-set behavior',
+    );
+    // Base matches lead, even when a disclosure appears earlier in the DOM.
+    assert.equal(enumeration.controls[0]?.href?.endsWith('/community'), true);
+    const plan = partitionRenderedClickTargets(enumeration.controls, url, 4, 0);
+    assert.deepEqual(plan.toClick.map(target => target.text.trim()), ['Menu'], 'only the in-place disclosure is clicked');
+    assert.equal(plan.skippedNavigableAnchors, 1, 'the base-matched anchor is enqueue-owned, not clicked');
+  });
+});
+
+test('real DOM: ordinary resources/support/learn-more links are not structural coverage gaps', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <a href="/resources">Resources</a>
+    <a href="/support">Support</a>
+    <a href="/learn-more">Learn more</a>
+    <a href="/contact">Read more</a>
+  </body></html>`;
+  await withControlPage(html, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(
+      enumeration.structuralUnrecovered,
+      0,
+      'ordinary page links are navigation candidates, not structural disclosure gaps',
+    );
+    assert.deepEqual(enumeration.structuralUnrecoveredHrefs, []);
+    assert.equal(
+      enumeration.controls.some(target => target.href?.endsWith('/contact')),
+      true,
+      'the hint-matched /contact link keeps its existing click-set behavior',
+    );
+    assert.equal(
+      enumeration.controls.some(target => target.href?.endsWith('/resources')),
+      false,
+      'a non-hint ordinary link is not clicked',
+    );
+  });
+});
+
+test('real DOM: base matches outrank icon-label recoveries and disclosures', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <button type="button" title="Join our Discord">
+      <svg width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="8"></circle></svg>
+    </button>
+    <div aria-haspopup="menu" tabindex="0">More</div>
+    <a href="/community">Community</a>
+  </body></html>`;
+  await withControlPage(html, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(enumeration.controls.length, 3);
+    assert.deepEqual(
+      enumeration.controls.map(target => target.index),
+      [2, 0, 1],
+      'base match first, then the icon-label recovery, then the disclosure',
+    );
+  });
+});
+
+test('real DOM: an already-open details summary is not clicked closed', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <details open>
+      <summary>Community</summary>
+      <a href="/open-details">Details</a>
+    </details>
+    <details>
+      <summary>Resources</summary>
+      <a href="/closed-details">Details</a>
+    </details>
+  </body></html>`;
+  await withControlPage(html, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(
+      enumeration.controls.some(target => target.text.trim() === 'Community'),
+      false,
+      'the open summary is not in the click set',
+    );
+    assert.equal(
+      enumeration.controls.some(target => target.text.trim() === 'Resources'),
+      true,
+      'the collapsed summary remains an in-place disclosure',
+    );
+    assert.equal(enumeration.structuralDisclosure, 1);
+  });
+});
+
+test('real DOM: hidden controls are queued after the disclosure that reveals them', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <details>
+      <summary>Menu</summary>
+      <button type="button" title="Discord">
+        <svg width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="8"></circle></svg>
+      </button>
+    </details>
+    <details>
+      <summary>Resources</summary>
+      <a href="/resources-page">Page</a>
+    </details>
+  </body></html>`;
+  await withControlPage(html, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    const summaryIndex = enumeration.controls.findIndex(target => target.index === 0);
+    const buttonIndex = enumeration.controls.findIndex(target => target.index === 1);
+    const unrelatedIndex = enumeration.controls.findIndex(target => target.index === 2);
+    assert.equal(summaryIndex >= 0, true, 'the closed summary is clickable');
+    assert.equal(buttonIndex >= 0, true, 'the icon-only control inside the closed menu is recovered');
+    assert.equal(
+      enumeration.controls[buttonIndex]?.origin,
+      'icon',
+      'the hidden control matched only through its title, not through visible text',
+    );
+    assert.equal(
+      enumeration.controls[buttonIndex]?.hidden,
+      true,
+      'a control with no layout box is marked hidden at enumeration',
+    );
+    assert.notEqual(
+      enumeration.controls[summaryIndex]?.hidden,
+      true,
+      'the summary is visible even while the details is closed',
+    );
+    assert.equal(
+      buttonIndex,
+      summaryIndex + 1,
+      'a hidden control is queued right after the disclosure that reveals it, before unrelated visible controls',
+    );
+    assert.equal(
+      buttonIndex < unrelatedIndex,
+      true,
+      'an unrelated disclosure cannot exhaust the click budget before the revealed control is tried',
+    );
+  });
+});
+
+test('real DOM: a control inside a summary stays visible while its details is closed', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <details>
+      <summary>Menu <a href="/community">Community</a></summary>
+      <a href="/discord">Join Discord</a>
+    </details>
+  </body></html>`;
+  await withControlPage(html, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    const summary = enumeration.controls.find(target => target.index === 0);
+    const insideSummary = enumeration.controls.find(target => target.index === 1);
+    const insideClosedContent = enumeration.controls.find(target => target.index === 2);
+    assert.ok(summary, 'the summary is present in the click set');
+    assert.ok(insideSummary, 'the link inside the summary is present in the click set');
+    assert.equal(summary.hidden !== true, true, 'the summary is visible');
+    assert.equal(
+      insideSummary.hidden !== true,
+      true,
+      'a link inside the summary is rendered even while the details is closed',
+    );
+    assert.equal(
+      insideClosedContent?.hidden,
+      true,
+      'a control in the closed content is still deferred until the summary runs',
+    );
+  });
+});
+
+test('real DOM: padded aria-haspopup=false is neither structural nor a popup', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <a href="/products" aria-haspopup="false ">Products</a>
+  </body></html>`;
+  await withControlPage(html, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(enumeration.total, 1, 'the attribute still selects the control for measurement');
+    assert.equal(enumeration.controls.length, 0, 'an ordinary link is not added to the click set');
+    assert.equal(enumeration.structuralNavigation, 0, 'padded false is not menu semantics');
+    assert.equal(enumeration.popupTargets, 0, 'padded false is not a popup');
+  });
+});
+
+test('real DOM: nested closed details hides inner summaries and their content', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <details>
+      <summary>More</summary>
+      <details>
+        <summary>Menu</summary>
+        <button type="button" title="Discord">
+          <svg width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="8"></circle></svg>
+        </button>
+      </details>
+    </details>
+  </body></html>`;
+  await withControlPage(html, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    const outerIndex = enumeration.controls.findIndex(target => target.index === 0);
+    const innerIndex = enumeration.controls.findIndex(target => target.index === 1);
+    const buttonIndex = enumeration.controls.findIndex(target => target.index === 2);
+    assert.equal(outerIndex >= 0, true, 'the outer summary is clickable');
+    assert.equal(innerIndex >= 0, true, 'the inner summary is enumerated');
+    assert.equal(buttonIndex >= 0, true, 'the icon-only control inside the nested menu is recovered');
+    assert.notEqual(enumeration.controls[outerIndex]?.hidden, true, 'the outer summary is visible');
+    assert.equal(
+      enumeration.controls[innerIndex]?.hidden,
+      true,
+      'an inner summary is hidden while the outer details is closed',
+    );
+    assert.equal(enumeration.controls[buttonIndex]?.hidden, true, 'the nested control is hidden');
+    assert.equal(
+      outerIndex < innerIndex && innerIndex < buttonIndex,
+      true,
+      'the outer disclosure runs first, then the inner one, then the control it reveals',
+    );
+  });
+});
+
+test('real DOM: navigation compares against the document URL, not the effective base', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><head><base href="/base/"></head><body>
+    <a role="menuitem" href="./">Resources</a>
+    <a href="/#section">Resources</a>
+  </body></html>`;
+  await withControlPage(html, async (page, url) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(enumeration.structuralUnrecovered, 1, 'an anchor resolving to the base URI still navigates away from the document URL');
+    assert.equal(enumeration.controls.length, 1);
+    assert.equal(enumeration.controls[0]?.href, `${url}#section`, 'the fragment-only anchor remains an in-place disclosure');
   });
 });
 
@@ -338,6 +690,8 @@ test('real DOM: an all-hint-matched control set has no hidden structural or popu
     assert.equal(enumeration.hintRejected, 0);
     assert.equal(enumeration.structuralNavigation, 0);
     assert.equal(enumeration.structuralHintRejected, 0);
+    assert.equal(enumeration.structuralDisclosure, 0);
+    assert.equal(enumeration.structuralUnrecovered, 0);
     assert.equal(enumeration.iconLabelRecovered, 0);
     assert.equal(enumeration.popupTargets, 0);
   });
