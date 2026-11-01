@@ -255,6 +255,31 @@ export function effectiveAcquisitionOutcomes<T extends AcquisitionObservationLik
         };
       }
     }
+    // A retained static FOUND row must not hide the retry ownership of a
+    // same-URL rendered partial. FOUND still wins the effective outcome, but
+    // the rendered gap is unexamined navigation: carry its retryable failure
+    // class onto the FOUND row so the retry directive sees the gap instead of
+    // the clean static row alone. Plain FOUND rows (no gap) stay unchanged.
+    if (winner.item.outcome === 'FOUND' && !(winner.item as { failureClass?: unknown }).failureClass) {
+      const retryableGap = entries.find((entry) => {
+        const candidate = entry.item as { failureClass?: unknown; retryable?: unknown };
+        return entry.index > winner.index
+          && entry.item.outcome === 'PARTIALLY_INSPECTED'
+          && candidate.retryable === true
+          && typeof candidate.failureClass === 'string'
+          && candidate.failureClass.length > 0;
+      });
+      if (retryableGap) {
+        return {
+          item: {
+            ...winner.item,
+            retryable: true,
+            failureClass: (retryableGap.item as { failureClass?: unknown }).failureClass,
+          } as T,
+          index: winner.index,
+        };
+      }
+    }
     return winner;
   };
 

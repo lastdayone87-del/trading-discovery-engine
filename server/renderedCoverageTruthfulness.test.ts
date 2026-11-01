@@ -131,13 +131,77 @@ test('policy and context gaps become partial outcomes, never clean absence', () 
   assert.equal(context.gapRetryable, false);
 
   const bounded = renderedAcquisitionOutcome(
-    rendered({ complete: false, retryable: true, telemetry: telemetry('BOUNDED') }),
+    rendered({
+      complete: false,
+      retryable: true,
+      coverageGapRetryable: true,
+      dropReasons: { 'page-budget': 1 },
+      telemetry: telemetry('BOUNDED'),
+    }),
     true,
     [],
   );
   assert.equal(bounded.outcome, 'PARTIALLY_INSPECTED');
   assert.equal(bounded.failureClass, 'RENDERED_PARTIAL_COVERAGE');
   assert.equal(bounded.gapRetryable, true);
+});
+
+test('a permanent-only required failure alone does not own retry (BOUNDED)', () => {
+  // `resolveRenderedCoverageReason` reports BOUNDED for any unresolved failed
+  // request, including a permanently blocked required child. That child cannot
+  // clear on refetch, so the gap must stay visible without spending retries.
+  const permanentGap = {
+    unvisited: [],
+    transientFailures: [],
+    permanentFailures: ['https://creator.example/blocked'],
+  };
+  for (const candidates of [[], [{ nativeInviteCode: 'abc', sourceUrl: 'https://creator.example/' }] as never]) {
+    const result = renderedAcquisitionOutcome(
+      rendered({
+        complete: false,
+        retryable: true,
+        coverageGapRetryable: false,
+        telemetry: { ...telemetry('BOUNDED'), unresolvedFailedRequests: 1 },
+      }),
+      true,
+      candidates as never,
+      permanentGap,
+    );
+    assert.equal(result.outcome, candidates.length ? 'FOUND' : 'PARTIALLY_INSPECTED');
+    assert.equal(result.failureClass, 'RENDERED_PARTIAL_COVERAGE');
+    assert.equal(result.gapRetryable, false, 'a permanently blocked child cannot own retry');
+  }
+});
+
+test('a fixed scroll ceiling does not own retry (BOUNDED)', () => {
+  const result = renderedAcquisitionOutcome(
+    rendered({
+      complete: false,
+      retryable: true,
+      coverageGapRetryable: false,
+      telemetry: { ...telemetry('BOUNDED'), scrollCapReachedStillGrowing: true },
+    }),
+    true,
+    [],
+  );
+  assert.equal(result.outcome, 'PARTIALLY_INSPECTED');
+  assert.equal(result.gapRetryable, false, 'the same fixed ceiling reproduces the identical stop');
+});
+
+test('a page-budget cutoff keeps retry ownership (BOUNDED)', () => {
+  const result = renderedAcquisitionOutcome(
+    rendered({
+      complete: false,
+      retryable: true,
+      dropReasons: { 'page-budget': 2 },
+      telemetry: telemetry('BOUNDED'),
+    }),
+    true,
+    [],
+  );
+  assert.equal(result.outcome, 'PARTIALLY_INSPECTED');
+  assert.equal(result.failureClass, 'RENDERED_PARTIAL_COVERAGE');
+  assert.equal(result.gapRetryable, true);
 });
 
 test('required coverage does not hide a navigation-policy gap', () => {

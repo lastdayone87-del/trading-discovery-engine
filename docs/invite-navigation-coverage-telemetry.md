@@ -1,7 +1,6 @@
 # Invite navigation-coverage telemetry and control recovery (P0.2/P1.1/P1.2/P1.7)
 
 **Status:** P0.2 instrumentation, P1.1/P1.2 control recovery, and P1.7 outcome
-**Status:** P0.2 instrumentation, P1.1/P1.2 control recovery, and P1.7 outcome
 truthfulness. Recovering structural and icon-label controls widens the rendered
 click set and changes which unexamined controls make a page retryable; coverage
 reasons can move from `COMPLETE` to `POLICY_EXCLUDED`/`BOUNDED`. No queue or
@@ -146,9 +145,13 @@ ledger. A stronger reason wins over a weaker one (for example, a timeout is
 
 A non-`COMPLETE` coverage reason is never a clean absence:
 
-- `resolveRenderedCompletionState` sets `complete=false` and carries the
-  fallback's retry ownership. `BOUNDED` (budget, interaction, scroll) is
-  retryable; `POLICY_EXCLUDED` and `CONTEXT_UNREACHABLE` are visible partials
+- `resolveRenderedCompletionState` sets `complete=false` while preserving the
+  pre-coverage `queueComplete` traversal verdict (terminal stop attribution
+  stays independent of the coverage reason). Retry ownership is derived from
+  the specific bounded causes a refetch can change: wall-clock timeout,
+  page-budget cutoff, interaction gap, or abandoned context sampling. A fixed
+  scroll ceiling reproduces the identical stop and is not retryable on its
+  own; `POLICY_EXCLUDED` and `CONTEXT_UNREACHABLE` are visible partials
   without retry ownership.
 - `renderedAcquisitionOutcome` maps the gap to `PARTIALLY_INSPECTED` (or
   `FOUND` when an invite was retained) with `RENDERED_POLICY_EXCLUDED`,
@@ -161,12 +164,15 @@ A non-`COMPLETE` coverage reason is never a clean absence:
   `RENDERED_PARTIAL_COVERAGE` and `RENDERED_BUDGET_EXPIRED`; policy/context
   classes are intentionally absent, so deterministic gaps stay visible without
   spending retries.
-- Retry ownership for a coverage gap is derived from the coverage reason, not
-  the fallback's aggregate `retryable` flag. A permanently blocked required
-  child can set that flag without making a deterministic context or policy gap
-  recoverable; only `BOUNDED` owns retry from the gap itself. A separate
-  transient required-child failure still keeps retry ownership, because that
-  page can succeed on refetch even when the traversal limit cannot be cleared.
+- Retry ownership for a coverage gap is derived from the recoverable bounded
+  causes, not the coverage reason alone and not the fallback's aggregate
+  `retryable` flag. A permanently blocked required child can set both without
+  making the gap recoverable, and a fixed scroll ceiling stops at the same
+  point every time. A separate transient required-child failure still keeps
+  retry ownership, because that page can succeed on refetch even when the
+  traversal limit cannot be cleared. Consecutive identical timeout and
+  budget-expired tails (`RENDERED_TIMEOUT`, `REQUIRED_UNVISITED_BUDGET_GAP`,
+  `RENDERED_BUDGET_EXPIRED`) are suppressed after the exhaustion threshold.
 
 ## Safety and bounds
 

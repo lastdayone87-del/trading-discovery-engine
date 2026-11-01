@@ -564,6 +564,45 @@ test('v2 review: required permanent failure owns no retry', async () => {
   assert.equal(result.retryDirective, undefined);
 });
 
+// REVIEW: budget-expired tails are suppressed after the exhaustion threshold.
+test('v2 review: repeated budget-expired tails stop owning retries', async () => {
+  const seed = 'https://budgettailed.example.com/';
+  const observedAt = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
+  const result = await runChannelInspection({
+    channelId: 'v2-budget-tail',
+    channelName: 'Budget Tail Channel',
+    channelBio: 'Trading notes',
+    siteInspectionStore: makeIsolatedStore(),
+    channelLinks: [seed],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: (async () => noInviteHtml()) as typeof fetch,
+    renderedFallback: (async (seedUrl: string): Promise<BrowserFallbackResult> => ({
+      foundInvite: null,
+      foundLocation: seedUrl,
+      candidates: [],
+      inspectedPages: 2,
+      scrolls: 0,
+      clicks: 0,
+      complete: false,
+      retryable: true,
+      timedOut: true,
+      dropReasons: { 'page-budget': 1 },
+      coverageGapRetryable: true,
+      telemetry: { coverageReason: 'BOUNDED', unresolvedFailedRequests: 0 } as never,
+      detail: 'Rendered acquisition budget expired before coverage completed',
+    })),
+    urlFailureHistoryLoader: (async () => [
+      { requestedUrl: seed, failureClass: 'RENDERED_BUDGET_EXPIRED', outcome: 'PARTIALLY_INSPECTED', observedAt: observedAt(2) },
+      { requestedUrl: seed, failureClass: 'RENDERED_BUDGET_EXPIRED', outcome: 'PARTIALLY_INSPECTED', observedAt: observedAt(1) },
+    ]) as never,
+  });
+  assert.ok(
+    (result.retrySuppressedUrls || []).some((url) => url.includes('budgettailed.example.com')),
+    'two prior identical budget tails must suppress the next retry',
+  );
+});
+
 // REVIEW: FOUND rows carrying gap classes accumulate tails; plain FOUND breaks them.
 test('v2 review: FOUND+gap history accumulates, plain FOUND breaks the tail', () => {
   const at = (day: number) => new Date(Date.UTC(2026, 9, day, 12)).toISOString();

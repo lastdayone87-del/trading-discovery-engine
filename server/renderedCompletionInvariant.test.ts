@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import {
   createRenderedRequestTracker,
@@ -960,4 +961,38 @@ test('IPv6 literal failure remains eligible for rendered retry', async () => {
   assert.equal(renderedCalls, 1);
   assert.ok(result.retryDirective, 'genuine IPv6 failure must own a retry');
   assert.notEqual(result.acquisitionStatus, 'INSPECTED_NO_MATCH');
+});
+
+// P1.7 truthfulness: the coverage reason must not erase terminal stop
+// attribution, and retry ownership follows recoverable causes, not BOUNDED.
+test('coverage gaps keep queueComplete while withholding clean completion', () => {
+  const policyGap = resolveRenderedCompletionState({
+    inspectedPages: 2,
+    timedOut: false,
+    telemetry: { ...zeroTelemetry(), requestsStarted: 2, requestsFinished: 2 },
+    coverageReason: 'POLICY_EXCLUDED',
+    coverageRetryable: false,
+  });
+  assert.equal(policyGap.complete, false);
+  assert.equal(policyGap.queueComplete, true, 'the crawl still ran out of links below the budget');
+  assert.equal(policyGap.retryable, false);
+
+  const scrollGap = resolveRenderedCompletionState({
+    inspectedPages: 2,
+    timedOut: false,
+    telemetry: { ...zeroTelemetry(), requestsStarted: 2, requestsFinished: 2 },
+    coverageReason: 'BOUNDED',
+    coverageRetryable: false,
+  });
+  assert.equal(scrollGap.complete, false);
+  assert.equal(scrollGap.queueComplete, true);
+  assert.equal(scrollGap.retryable, false, 'a fixed scroll ceiling cannot be cleared by refetching');
+});
+
+test('rendered detail names a coverage gap instead of reporting completion', async () => {
+  const source = readFileSync(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8');
+  assert.ok(
+    source.includes("coverageReason&&coverageReason!=='COMPLETE')?`Rendered acquisition incomplete: navigation coverage ${coverageReason}"),
+    'a non-COMPLETE coverage reason must never fall through to the completed detail',
+  );
 });

@@ -163,6 +163,10 @@ test('rendered control-slice, hint-reject, scroll, and stop accounting are wired
   assert.ok(source.includes("drops.count('hint-rejected')"));
   assert.ok(source.includes("drops.count('page-budget')"));
   assert.ok(source.includes("drops.count('queue-exhausted')"));
+  assert.ok(
+    source.includes('if (completion.queueComplete && !pageBudgetExhausted'),
+    'terminal queue-exhausted attribution must not depend on the coverage reason',
+  );
   assert.ok(source.includes('dropReasons:drops.snapshot()'));
   const inspector = readFileSync(new URL('./inspector.ts', import.meta.url), 'utf8');
   assert.ok(inspector.includes('scrollsUsed:rendered.scrolls'));

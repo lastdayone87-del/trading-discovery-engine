@@ -190,6 +190,16 @@ export interface BrowserFallbackResult {
    */
   timedOut?: boolean;
   /**
+   * P1.7 precise retry ownership for a non-COMPLETE coverage reason. True only
+   * when a refetch can change the gap (wall-clock timeout, page-budget cutoff,
+   * interaction gap, abandoned context sampling). False/absent when the gap is
+   * reproducible as-is: a fixed scroll ceiling, deterministic policy/context
+   * exclusion, or a permanently failed child that made the reason BOUNDED.
+   * Outcome classification uses this instead of the aggregate `retryable`
+   * flag, which permanent child failures can also set.
+   */
+  coverageGapRetryable?: boolean;
+  /**
    * Browser-gate saturation is capacity, not a launch defect: it is typed
    * alongside (not inside) BrowserFailureClass so retry accounting can defer
    * it attempt-free without tripping browser-capability health marking.
@@ -1957,13 +1967,14 @@ export function resolveRenderedCompletionState(input: {
   interactionGap?: boolean;
   /**
    * P1.7 coverage truthfulness: a non-COMPLETE navigation-coverage reason is
-   * never a clean absence. `BOUNDED` gaps (budget/interaction/scroll) are
-   * retryable; deterministic policy/context gaps are visible partials but do
-   * not own retry unless a traversal/policy change can alter the outcome.
+   * never a clean absence. Only causes a refetch can change own retry
+   * (timeout, page budget, interaction, abandoned context sampling); a fixed
+   * scroll ceiling and deterministic policy/context gaps are visible partials
+   * without retry.
    */
   coverageReason?: RenderedCoverageReason;
   coverageRetryable?: boolean;
-}): { complete: boolean; retryable: boolean; failureClass: 'NO_PAGE_PROCESSED' | undefined } {
+}): { complete: boolean; queueComplete: boolean; retryable: boolean; failureClass: 'NO_PAGE_PROCESSED' | undefined } {
   // Processed means actual successfully inspected page evidence — a request
   // merely starting (admitted but never inspected) is zero-page evidence.
   const processed = input.inspectedPages > 0;
@@ -1999,7 +2010,10 @@ export function resolveRenderedCompletionState(input: {
   const coverageIncomplete = input.coverageReason !== undefined && input.coverageReason !== 'COMPLETE';
   const incomplete = baseIncomplete || coverageIncomplete;
   const retryable = baseIncomplete || (coverageIncomplete && input.coverageRetryable !== false);
-  return { complete: !incomplete, retryable, failureClass: !processed ? 'NO_PAGE_PROCESSED' : undefined };
+  // `queueComplete` keeps the pre-coverage traversal verdict available so the
+  // terminal stop attribution ("ran out of enqueueable links") does not
+  // disappear merely because a policy/context surface was unexamined.
+  return { complete: !incomplete, queueComplete: !baseIncomplete, retryable, failureClass: !processed ? 'NO_PAGE_PROCESSED' : undefined };
 }
 
 /** Bounded underlying error text: message plus one cause level, redacted, capped. */
@@ -3563,11 +3577,13 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         // absence. Budget/interaction/scroll gaps stay retryable; deterministic
         // policy/context gaps are visible partials without retry ownership.
         const coverageReason = publishEvidenceControlCertificate(timedOut || pageBudgetExhausted);
-        // `resolveRenderedCoverageReason` folds timedOut, page-budget and
-        // scroll-cap exhaustion into BOUNDED (with inspected pages), so the
-        // reason is the single source of retry ownership. Zero-page runs are
-        // already incomplete via baseIncomplete.
-        const coverageRetryable = coverageReason === 'BOUNDED';
+        // Retry ownership is derived from the specific bounded causes a
+        // refetch can change, not from BOUNDED alone. A fixed scroll ceiling
+        // reproduces the identical stop, and a permanently failed child can
+        // make the reason BOUNDED without making it recoverable. Zero-page
+        // runs are already incomplete via baseIncomplete.
+        const coverageGapRetryable = timedOut || pageBudgetExhausted || interactionGap || contextMeasurementAbandoned;
+        const coverageRetryable = coverageReason === 'BOUNDED' && coverageGapRetryable;
         const completion=resolveRenderedCompletionState({inspectedPages,timedOut,telemetry,pageBudgetExhausted,interactionGap,coverageReason,coverageRetryable});
         const noPageProcessed=completion.failureClass==='NO_PAGE_PROCESSED';
         const zeroPageReason=resolveRenderedZeroPageReason({inspectedPages,timedOut,saturated:false,browserLaunchFailed:false,thrown:false,telemetry});
@@ -3626,7 +3642,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           requiredTransientFailures.push(...classified.transientFailures);
           requiredPermanentFailures.push(...classified.permanentFailures);
         }
-        if (completion.complete && !pageBudgetExhausted && inspectedPages < limits.maxPages) drops.count('queue-exhausted');
+        if (completion.queueComplete && !pageBudgetExhausted && inspectedPages < limits.maxPages) drops.count('queue-exhausted');
         if (pageBudgetExhausted) drops.count('page-budget');
         // Persist the bounded control-coverage certificate alongside the
         // crawler telemetry so production can distinguish 64-overflow from
@@ -3640,6 +3656,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           complete:completion.complete,
           retryable:completion.retryable,
           timedOut,
+          coverageGapRetryable,
           failureClass:completion.failureClass,
           telemetry,
           dropReasons:drops.snapshot(),
@@ -3669,7 +3686,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           requiredSnapshotExpanded: requiredSnapshotExpanded || undefined,
           detail:candidates.length
             ? `Rendered fallback retained ${candidates.length} distinct Discord candidate(s) across ${inspectedPages} page(s); ${telemetry.requestsFailed} request(s) failed within the bounded crawl; ${browserFallbackTelemetrySummary(telemetry)}`
-            : timedOut?`Rendered acquisition budget expired before coverage completed; ${browserFallbackTelemetrySummary(telemetry)}`:telemetry.unresolvedFailedRequests>0?`Rendered acquisition incomplete: ${telemetry.unresolvedFailedRequests} request(s) terminally failed within the bounded crawl; ${browserFallbackTelemetrySummary(telemetry)}`:noPageProcessed?`Rendered acquisition incomplete: no page was processed (NO_PAGE_PROCESSED); ${browserFallbackTelemetrySummary(telemetry)}`:interactionGap?`Rendered acquisition incomplete: ${evidenceControlsFailed} evidence-bearing control click(s) failed and ${evidenceControlsSkipped} were skipped by the control budget; coverage is not complete; ${browserFallbackTelemetrySummary(telemetry)}`:`Rendered acquisition completed across ${inspectedPages} page(s) without an invite; ${browserFallbackTelemetrySummary(telemetry)}`,
+            : timedOut?`Rendered acquisition budget expired before coverage completed; ${browserFallbackTelemetrySummary(telemetry)}`:telemetry.unresolvedFailedRequests>0?`Rendered acquisition incomplete: ${telemetry.unresolvedFailedRequests} request(s) terminally failed within the bounded crawl; ${browserFallbackTelemetrySummary(telemetry)}`:noPageProcessed?`Rendered acquisition incomplete: no page was processed (NO_PAGE_PROCESSED); ${browserFallbackTelemetrySummary(telemetry)}`:interactionGap?`Rendered acquisition incomplete: ${evidenceControlsFailed} evidence-bearing control click(s) failed and ${evidenceControlsSkipped} were skipped by the control budget; coverage is not complete; ${browserFallbackTelemetrySummary(telemetry)}`:(coverageReason&&coverageReason!=='COMPLETE')?`Rendered acquisition incomplete: navigation coverage ${coverageReason}; ${browserFallbackTelemetrySummary(telemetry)}`:`Rendered acquisition completed across ${inspectedPages} page(s) without an invite; ${browserFallbackTelemetrySummary(telemetry)}`,
         };
       } catch (error:any) {
         const candidates=mergeDiscordCandidates(discovered);
@@ -3689,7 +3706,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         // processed the reason is BOUNDED (an abort cut the remaining
         // navigation); zero pages resolves to UNKNOWN.
         publishEvidenceControlCertificate(true);
-        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,dropReasons:drops.snapshot(),interactionGap:interactionGap||undefined,evidenceControlsTotal:evidenceControlsSeen||undefined,evidenceControlsClicked:evidenceControlsClicked||undefined,evidenceControlsFailed:evidenceControlsFailed||undefined,evidenceControlsSkipped:evidenceControlsSkipped||undefined,evidenceControlsNavigableOnly:(evidenceControlsNavigableOnly&&!evidenceControlsClickableWindow)||undefined,evidenceControlsUncertified:(evidenceControlsUncertified||uncertifiedRequestKeys.size>0)||undefined,evidenceControlsOffsetAdvance:evidenceControlsOffsetAdvance||undefined,detail:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
+        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,coverageGapRetryable:true,failureClass,telemetry,dropReasons:drops.snapshot(),interactionGap:interactionGap||undefined,evidenceControlsTotal:evidenceControlsSeen||undefined,evidenceControlsClicked:evidenceControlsClicked||undefined,evidenceControlsFailed:evidenceControlsFailed||undefined,evidenceControlsSkipped:evidenceControlsSkipped||undefined,evidenceControlsNavigableOnly:(evidenceControlsNavigableOnly&&!evidenceControlsClickableWindow)||undefined,evidenceControlsUncertified:(evidenceControlsUncertified||uncertifiedRequestKeys.size>0)||undefined,evidenceControlsOffsetAdvance:evidenceControlsOffsetAdvance||undefined,detail:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
       } finally {
         // The isolated queue must never outlive its crawl: the lifecycle
         // finalizer drops it on success, failure, and unexpected throws alike
