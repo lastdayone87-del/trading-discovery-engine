@@ -902,30 +902,11 @@ test('P0.2 coverage counters stay coherent, bounded, and preserved on error path
   assert.match(source, /clickPageContext\?\.off\?\.\('page', onPopupWindow\)/, 'the popup listener does not outlive the click loop');
 });
 
-test('a control hidden by an earlier click is skipped instead of timing out', async () => {
-  const clicked: string[] = [];
-  const result = await runRenderedClickLoop({
-    targets: [renderedButton(0, 'oc-hidden'), renderedButton(1, 'oc-visible')],
-    maxClicksPerPage: 1,
-    deadlineExceeded: () => false,
-    isVisible: async target => target.marker !== 'oc-hidden',
-    click: async target => {
-      clicked.push(String(target.marker));
-      return true;
-    },
-    enumerate: async () => renderedEnumeration([]),
-    pageUrl: () => 'https://creator.example/',
-  });
-  assert.deepEqual(clicked, ['oc-visible'], 'the remaining budget goes to a control that can still be clicked');
-  assert.equal(result.evidenceControlsClicked, 1);
-  assert.equal(result.evidenceControlsSkipped, 1, 'the hidden control is an unexamined skip, not a failed click');
-  assert.equal(result.evidenceControlsFailed, 0, 'no actionability timeout is spent on a hidden control');
-  assert.equal(result.interactionGap, true, 'an unexamined hint/icon control keeps the page incomplete');
-});
-
 test('hidden controls wait for the disclosure that reveals them', () => {
   const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
-  assert.match(source, /const hidden = element\.getClientRects\(\)\.length === 0[\s\S]{0,120}?getComputedStyle\(element\)\.visibility === 'hidden';/, 'a control with no layout box or no computed visibility is marked hidden');
+  assert.match(source, /const closedDetails = element\.closest\('details:not\(\[open\]\)'\);/, 'closed <details> content is detected from its ancestor');
+  assert.match(source, /const hidden = \(closedDetails !== null && element !== closedDetailsSummary\)[\s\S]{0,160}?getComputedStyle\(element\)\.visibility === 'hidden';/, 'a control with no layout box, no computed visibility, or a closed details ancestor is marked hidden');
+  assert.doesNotMatch(source, /isVisible/, 'the click loop keeps its bounded actionability wait instead of a one-shot visibility probe');
   assert.match(source, /\.\.\.\(hidden \? \{ hidden: true \} : \{\}\),/, 'the hidden mark travels with the enumerated control');
   assert.match(
     source,

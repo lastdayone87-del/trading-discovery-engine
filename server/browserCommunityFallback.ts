@@ -834,11 +834,17 @@ export function enumerateRenderedControlNodes(
     const node = nodes[index];
     const element = node as HTMLElement;
     const tagName = (element.tagName || '').toLowerCase();
-    // No layout box, or computed `visibility:hidden`, means the control is not
-    // clickable yet: closed <details> content, display:none menus, and
-    // visibility-hidden overlays. The planner queues hidden controls after
-    // visible ones so a disclosure can reveal them before they are attempted.
-    const hidden = element.getClientRects().length === 0
+    // A control is hidden when it has no layout box, when computed
+    // `visibility` hides it, or when a closed <details> ancestor hides it.
+    // Some engines still report a layout box for closed-details content, so
+    // the ancestor check is authoritative. The planner queues hidden controls
+    // after visible ones so a disclosure can reveal them before they are
+    // attempted; the click attempt itself remains a bounded wait, so a menu
+    // that reveals the control late is still clicked.
+    const closedDetails = element.closest('details:not([open])');
+    const closedDetailsSummary = closedDetails ? closedDetails.querySelector(':scope > summary') : null;
+    const hidden = (closedDetails !== null && element !== closedDetailsSummary)
+      || element.getClientRects().length === 0
       || getComputedStyle(element).visibility === 'hidden';
     // HTMLAnchorElement.href is a string; SVGElement.href is an
     // SVGAnimatedString. Reading the attribute keeps both anchor kinds
@@ -1499,14 +1505,6 @@ export interface RenderedClickLoopInput {
   maxClicksPerPage: number;
   deadlineExceeded: () => boolean;
   click: (target: RenderedControlTarget) => Promise<boolean>;
-  /**
-   * Whether the control is still visible. An earlier click can hide a control
-   * that was visible when it was queued (for example a sibling click that
-   * closes its menu). Clicking it would spend the click budget on an
-   * actionability timeout and, because its marker is already queued, it would
-   * never be retried. Omitted callers keep the legacy behavior.
-   */
-  isVisible?: (target: RenderedControlTarget) => Promise<boolean>;
   enumerate: () => Promise<RenderedControlEnumeration>;
   pageUrl: () => string;
   /**
@@ -1594,15 +1592,6 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
       break;
     }
     const control = clickTargets[clickIndex];
-    // A click can close or hide a control that was visible when it was queued.
-    // Do not spend the click budget on an actionability timeout for a control
-    // that cannot be clicked now; account it as an unexamined skip and let the
-    // remaining budget go to controls that are still reachable.
-    if (input.isVisible && !(await input.isVisible(control).catch(() => true))) {
-      evidenceControlsSkipped++;
-      if (renderedControlSkipsNeedInteractionGap([control])) interactionGap = true;
-      continue;
-    }
     clickedThisPage++;
     const urlBeforeClick = input.pageUrl();
     const identityBeforeClick = input.documentIdentity
@@ -3243,12 +3232,6 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                   return clickOutcome.ok;
                 },
                 enumerate: enumerateControls,
-                isVisible: async control => {
-                  const locator = control.marker
-                    ? page.locator(`[data-oc-control="${control.marker.replace(/"/g, '\\"')}"]`).first()
-                    : page.locator(RENDERED_CONTROL_SELECTOR).nth(control.index);
-                  return locator.isVisible().catch(() => true);
-                },
                 pageUrl: () => page.url(),
                 // Same-document history updates keep performance.timeOrigin;
                 // a real navigation commits a new document and changes it.
