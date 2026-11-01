@@ -465,14 +465,18 @@ test('rendered control coverage counts overflow and uses stable markers across D
 test('P0.2 coverage counters stay coherent, bounded, and preserved on error paths', () => {
   const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
   assert.match(source, /if \(!pageSnapshotRecorded \|\| enumeration\.total > pageControlsEnumeratedTotal\) \{[\s\S]*?pageHintRejected = enumeration\.hintRejected/, 'the denominator and hint-rejected counts come from one enumeration snapshot');
-  assert.match(source, /if \(previous && !pageSnapshotRecorded\) \{\s*baseHrefPresent = baseHrefPresent \|\| pageBaseHrefPresent;\s*return;\s*\}/, 'a retry that never enumerated keeps the earlier attempt\'s observation');
+  assert.match(source, /if \(previous && !pageSnapshotRecorded\) \{[\s\S]{0,1400}?Math\.max\(previous\.frameCount \|\| 0, pageFrameCount\)[\s\S]{0,800}?return;/, 'a retry that never enumerated keeps the earlier control snapshot and merges its context counts');
   assert.match(source, /aggregatePageCountersOnError\?\.\(\)/, 'the handler catch preserves counters from an already-enumerated page');
   assert.match(source, /if \(pageCountersAggregated\) return;/, 'the error and success aggregations cannot double-count a page');
   assert.match(source, /await recordPageContext\(\);\s*\/\/ Page-end aggregation/, 'context counters refresh after the click loop');
   assert.match(source, /const clickOutcome = await attemptRenderedControlClick[\s\S]{0,1200}?\n\s+queuePageContextProbe\(\);\n\s+if \(clickOutcome\.ok/, 'a context sample is queued after each click before the next can replace the DOM');
   assert.match(source, /const pendingContextProbes: Array<Promise<void>> = \[\];/, 'per-click probes are not awaited on the click path');
   assert.match(source, /await flushPageContextProbes\(\);\s*\n\s*await recordPageContext\(\);/, 'pending samples are flushed before page-end aggregation');
-  assert.match(source, /if \(!sameUrl\) \{\s*pageContextAbandoned = true;\s*return;\s*\}[\s\S]{0,80}?pageDocumentIdentity = currentIdentity;/, 'a baseline sample taken after the page left its URL is discarded');
+  assert.match(source, /await flushPageContextProbesOnError\?\.\(\);/, 'pending samples are flushed before error aggregation');
+  assert.match(source, /const initialPageContext = await page\.evaluate\(collectRenderedPageContext\)\.catch\(\(\) => null\);/, 'the baseline identity and context counts are captured together before any counter sample');
+  assert.match(source, /pageDocumentIdentity = initialPageContext\.documentTimeOrigin \?\? null;/, 'the baseline identity comes from that first evaluation');
+  assert.doesNotMatch(source, /pageDocumentIdentity = currentIdentity;/, 'a later probe never redefines the inspected document');
+  assert.match(source, /const capMs = Math\.max\(0, Math\.min\(250, remainingMs\)\);/, 'probe flushing has a short cap bounded by the remaining crawl budget');
   assert.match(source, /const sameDocument = pageDocumentIdentity !== null && currentIdentity !== null[\s\S]{0,260}?currentIdentity === pageDocumentIdentity[\s\S]{0,500}?if \(!sameDocument && !sameUrl\) return;/, 'the identity comparison gates the guard that permits counter updates');
   assert.match(source, /if \(!sameDocument && !sameUrl\) return;/, 'a same-URL reload still records revealed contexts');
   assert.match(source, /pagePopupMarkers = trackRenderedPopupCoverage\(pagePopupMarkers, enumeration\)/, 'popup identities are tracked across every enumeration');

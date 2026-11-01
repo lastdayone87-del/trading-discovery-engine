@@ -2363,40 +2363,40 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             let pageShadowRootCount = 0;
             let pageBaseHrefPresent = false;
             const pageDocumentUrl = page.url();
-            // The document identity, not the URL, decides whether a context
-            // sample belongs to this page: a same-document `pushState` path or
-            // query change must still record frames/shadow roots revealed by
-            // the click, while a real navigation belongs to another request.
+            // Capture the inspected document's identity and its context counts
+            // in one evaluation before any counter sample. The identity is
+            // what tells a same-document `pushState`/`replaceState` (identity
+            // unchanged) from a real navigation (identity changed); taking it
+            // up front means a URL update during a probe is never mistaken for
+            // a replacement, and a later probe can never redefine the
+            // document whose counters we accept.
             let pageDocumentIdentity: number | null | undefined;
-            // Set when the page left the inspected URL before its baseline
-            // sample. The document that responded belongs to another request,
-            // so its counters cannot be attributed to this one.
             let pageContextAbandoned = false;
+            const initialPageContext = await page.evaluate(collectRenderedPageContext).catch(() => null);
+            if (initialPageContext) {
+              pageDocumentIdentity = initialPageContext.documentTimeOrigin ?? null;
+              pageFrameCount = Math.max(0, Math.floor(initialPageContext.frameCount) || 0);
+              pageShadowRootCount = Math.max(0, Math.floor(initialPageContext.shadowRootCount) || 0);
+              pageBaseHrefPresent = initialPageContext.baseHrefPresent === true;
+            } else {
+              // Without a baseline identity, a later sample could describe a
+              // different document; skip context measurement for this request
+              // rather than attribute another document's counters to it.
+              pageContextAbandoned = true;
+            }
             const recordPageContext = async (): Promise<void> => {
               if (pageContextAbandoned) return;
               try {
                 const pageContext = await page.evaluate(collectRenderedPageContext);
                 const currentIdentity = pageContext.documentTimeOrigin ?? null;
                 const sameUrl = normalizeVisitUrl(page.url()) === normalizeVisitUrl(pageDocumentUrl);
-                if (pageDocumentIdentity === undefined) {
-                  // The baseline sample defines the inspected document. A
-                  // navigation between `page.url()` and this probe means the
-                  // counters describe a different document, so stop measuring
-                  // this request rather than attributing them here.
-                  if (!sameUrl) {
-                    pageContextAbandoned = true;
-                    return;
-                  }
-                  pageDocumentIdentity = currentIdentity;
-                } else {
-                  const sameDocument = pageDocumentIdentity !== null && currentIdentity !== null
-                    ? currentIdentity === pageDocumentIdentity
-                    : sameUrl;
-                  // A same-document pushState path/query change and a same-URL
-                  // reload both belong to this inspection. Only a new document
-                  // at a different URL is another request's context.
-                  if (!sameDocument && !sameUrl) return;
-                }
+                const sameDocument = pageDocumentIdentity !== null && currentIdentity !== null
+                  ? currentIdentity === pageDocumentIdentity
+                  : sameUrl;
+                // A same-document pushState path/query change and a same-URL
+                // reload both belong to this inspection. Only a new document
+                // at a different URL is another request's context.
+                if (!sameDocument && !sameUrl) return;
                 pageFrameCount = Math.max(pageFrameCount, Math.max(0, Math.floor(pageContext.frameCount) || 0));
                 pageShadowRootCount = Math.max(pageShadowRootCount, Math.max(0, Math.floor(pageContext.shadowRootCount) || 0));
                 pageBaseHrefPresent = pageBaseHrefPresent || pageContext.baseHrefPresent === true;
@@ -2411,10 +2411,24 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             };
             const flushPageContextProbes = async (): Promise<void> => {
               const pending = pendingContextProbes.splice(0);
-              await Promise.all(pending);
+              if (!pending.length) return;
+              // Measurement must never extend the request lifecycle: wait at
+              // most a short cap and never beyond the remaining crawl budget.
+              // Samples still pending at the cap are dropped.
+              const remainingMs = limits.totalTimeoutMs - (Date.now() - startedAt);
+              const capMs = Math.max(0, Math.min(250, remainingMs));
+              if (capMs === 0) return;
+              let timer: ReturnType<typeof setTimeout> | undefined;
+              try {
+                await Promise.race([
+                  Promise.allSettled(pending),
+                  new Promise<void>(resolve => { timer = setTimeout(resolve, capMs); }),
+                ]);
+              } finally {
+                if (timer) clearTimeout(timer);
+              }
             };
             flushPageContextProbesOnError = flushPageContextProbes;
-            await recordPageContext();
             if (!seedDocumentSeen) {
               seedDocumentSeen = true;
               seedSnapshotUrl = page.url();
@@ -2489,12 +2503,23 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               const requestKey = request.url;
               const previous = pageControlTotalsByRequest.get(requestKey);
               // A Crawlee retry can throw during scrolling or before its first
-              // enumeration, leaving every counter at zero. Replacing a fully
-              // enumerated earlier attempt with those zeros would subtract its
-              // real coverage from the crawl totals, so keep the earlier
-              // observation instead.
+              // enumeration, leaving every control counter at zero. Replacing
+              // a fully enumerated earlier attempt with those zeros would
+              // subtract its real coverage from the crawl totals, so keep the
+              // earlier control observation. Context counters are measured
+              // independently of enumeration, so merge those per field.
               if (previous && !pageSnapshotRecorded) {
-                baseHrefPresent = baseHrefPresent || pageBaseHrefPresent;
+                const merged = {
+                  ...previous,
+                  frameCount: Math.max(previous.frameCount || 0, pageFrameCount),
+                  shadowRootCount: Math.max(previous.shadowRootCount || 0, pageShadowRootCount),
+                  baseHrefPresent: previous.baseHrefPresent || pageBaseHrefPresent,
+                };
+                pageControlTotalsByRequest.set(requestKey, merged);
+                const contextDelta = renderedRequestControlTotalsDelta(previous, merged);
+                frameCount += contextDelta.frameCount;
+                shadowRootCount += contextDelta.shadowRootCount;
+                baseHrefPresent = baseHrefPresent || merged.baseHrefPresent;
                 return;
               }
               // Popups that the click loop actually inspected are not an

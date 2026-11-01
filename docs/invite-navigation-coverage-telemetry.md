@@ -91,16 +91,18 @@ The reason is diagnostic in P0.2. It does not change `complete`, `retryable`,
   100 shadow roots) and a bounded frame scan over live `getElementsByTagName`
   collections (1,000). It never traverses frames or shadow roots. Context
   counters are refreshed after scrolling and after each click so transient
-  interaction-revealed frames/shadows are counted. A per-click probe is
-  queued without awaiting it, so telemetry never delays the next click, and
-  pending probes are flushed before page-end aggregation. A sample counts when
-  either the document identity or the URL still matches this page, so a
-  same-document path/query update and a same-URL reload are both recorded while
-  a real navigation to another URL is left to its own request. A baseline
-  sample taken after the page already left the inspected URL is discarded, and
-  a retry that throws before its first enumeration keeps the earlier attempt's
-  observation instead of replacing it with zeros. Counters are aggregated on
-  the page
+  interaction-revealed frames/shadows are counted. The baseline identity and
+  counts are captured together in one evaluation before any counter sample, so
+  a URL update during a probe is not mistaken for a replacement; a sample
+  counts when either the document identity or the URL still matches this page.
+  A same-document path/query update and a same-URL reload are both recorded,
+  while a real navigation to another URL is left to its own request. A
+  per-click probe is queued without awaiting it, so telemetry never delays the
+  next click; pending probes are flushed at page end under a 250 ms cap that
+  never exceeds the remaining crawl budget, and unfinished samples are
+  dropped. A retry that throws before its first enumeration keeps the earlier
+  control observation and merges context counts per field rather than
+  replacing them with zeros. Counters are aggregated on the page
   error path so an enumerated page is never published as zero.
 - The published denominator and hint-rejected count come from one coherent
   enumeration snapshot (largest total; first wins ties). Structural and
