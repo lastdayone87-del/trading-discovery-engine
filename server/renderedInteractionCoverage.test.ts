@@ -465,7 +465,7 @@ test('rendered control coverage counts overflow and uses stable markers across D
 test('P0.2 coverage counters stay coherent, bounded, and preserved on error paths', () => {
   const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
   assert.match(source, /if \(!pageSnapshotRecorded \|\| enumeration\.total > pageControlsEnumeratedTotal\) \{[\s\S]*?pageHintRejected = enumeration\.hintRejected/, 'the denominator and hint-rejected counts come from one enumeration snapshot');
-  assert.match(source, /if \(previous && !pageSnapshotRecorded\) \{[\s\S]{0,1400}?Math\.max\(previous\.frameCount \|\| 0, pageFrameCount\)[\s\S]{0,800}?return;/, 'a retry that never enumerated keeps the earlier control snapshot and merges its context counts');
+  assert.match(source, /if \(previous && !pageSnapshotRecorded\) \{[\s\S]{0,1400}?frameCount: Math\.max\(previous\.frameCount \|\| 0, pageFrameCount\),[\s\S]{0,200}?shadowRootCount: Math\.max\(previous\.shadowRootCount \|\| 0, pageShadowRootCount\),[\s\S]{0,200}?baseHrefPresent: previous\.baseHrefPresent \|\| pageBaseHrefPresent,[\s\S]{0,900}?return;/, 'a retry that never enumerated keeps the earlier control snapshot and merges every context count');
   assert.match(source, /aggregatePageCountersOnError\?\.\(\)/, 'the handler catch preserves counters from an already-enumerated page');
   assert.match(source, /if \(pageCountersAggregated\) return;/, 'the error and success aggregations cannot double-count a page');
   assert.match(source, /await recordPageContext\(\);\s*\/\/ Page-end aggregation/, 'context counters refresh after the click loop');

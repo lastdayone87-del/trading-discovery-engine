@@ -103,9 +103,10 @@ The reason is diagnostic in P0.2. It does not change `complete`, `retryable`,
   dropped. A retry that throws before its first enumeration keeps the earlier
   control observation and merges context counts per field rather than
   replacing them with zeros. If a page cannot be measured because no
-  trustworthy document identity was available, the crawl records
-  `contextUnknown` and the coverage reason is `BOUNDED`, never `COMPLETE`.
-  Counters are aggregated on the page
+  trustworthy document identity was available, the internal resolver input
+  `contextUnknown` forces `coverageReason: BOUNDED`, never `COMPLETE`. It is
+  not persisted as a separate field, so consumers see the reason rather than
+  the cause. Counters are aggregated on the page
   error path so an enumerated page is never published as zero.
 - The published denominator and hint-rejected count come from one coherent
   enumeration snapshot (largest total; first wins ties). Structural and
