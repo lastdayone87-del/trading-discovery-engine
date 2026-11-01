@@ -2309,6 +2309,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // Assigned once the per-page P0.2 counters exist; the catch path
             // calls it to preserve counts from an already-enumerated page.
             let aggregatePageCountersOnError: (() => void) | undefined;
+            // Exposed to the handler catch so queued probes are incorporated
+            // before counters from an enumerated page are aggregated.
+            let flushPageContextProbesOnError: (() => Promise<void>) | undefined;
             try {
             // Snapshot lifetime: candidates are extracted from the FULL page
             // source (never truncated before extraction) and the multi-MB
@@ -2369,34 +2372,35 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               try {
                 const pageContext = await page.evaluate(collectRenderedPageContext);
                 const currentIdentity = pageContext.documentTimeOrigin ?? null;
+                const sameUrl = normalizeVisitUrl(page.url()) === normalizeVisitUrl(pageDocumentUrl);
                 if (pageDocumentIdentity === undefined) {
                   pageDocumentIdentity = currentIdentity;
                 } else {
                   const sameDocument = pageDocumentIdentity !== null && currentIdentity !== null
                     ? currentIdentity === pageDocumentIdentity
-                    : normalizeVisitUrl(page.url()) === normalizeVisitUrl(pageDocumentUrl);
-                  if (!sameDocument) return;
+                    : sameUrl;
+                  // A same-document pushState path/query change and a same-URL
+                  // reload both belong to this inspection. Only a new document
+                  // at a different URL is another request's context.
+                  if (!sameDocument && !sameUrl) return;
                 }
                 pageFrameCount = Math.max(pageFrameCount, Math.max(0, Math.floor(pageContext.frameCount) || 0));
                 pageShadowRootCount = Math.max(pageShadowRootCount, Math.max(0, Math.floor(pageContext.shadowRootCount) || 0));
                 pageBaseHrefPresent = pageBaseHrefPresent || pageContext.baseHrefPresent === true;
               } catch { /* context counters never break inspection */ }
             };
-            // Keep an awaited probe off the click deadline: reserve a small
-            // independent budget and cap the wait so telemetry can never
-            // consume the time the next control needs.
-            const recordPageContextWithin = async (budgetMs: number): Promise<void> => {
-              if (limits.totalTimeoutMs - (Date.now() - startedAt) <= budgetMs) return;
-              let timer: ReturnType<typeof setTimeout> | undefined;
-              try {
-                await Promise.race([
-                  recordPageContext(),
-                  new Promise<void>(resolve => { timer = setTimeout(resolve, budgetMs); }),
-                ]);
-              } finally {
-                if (timer) clearTimeout(timer);
-              }
+            // Per-click probes must never delay the next click. Queue them and
+            // flush before page-end aggregation, so measurement cannot consume
+            // the shared click budget or change click sequencing.
+            const pendingContextProbes: Array<Promise<void>> = [];
+            const queuePageContextProbe = (): void => {
+              pendingContextProbes.push(recordPageContext());
             };
+            const flushPageContextProbes = async (): Promise<void> => {
+              const pending = pendingContextProbes.splice(0);
+              await Promise.all(pending);
+            };
+            flushPageContextProbesOnError = flushPageContextProbes;
             await recordPageContext();
             if (!seedDocumentSeen) {
               seedDocumentSeen = true;
@@ -2624,12 +2628,12 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                     telemetry,
                     onClicked: () => { clicks++; },
                   }));
-                  // Capture contexts revealed by this click before the next
-                  // click can remove them or replace the document. The
-                  // per-page counters are max-monotonic, so a transient iframe
-                  // or shadow root still counts. The probe has its own small
-                  // budget so it cannot starve the next click.
-                  await recordPageContextWithin(250);
+                  // Queue a context sample immediately after the click before
+                  // the next click can remove or replace the document, but do
+                  // not await it: telemetry must not consume the click budget.
+                  // The per-page counters are max-monotonic, so a transient
+                  // iframe or shadow root still counts.
+                  queuePageContextProbe();
                   if (clickOutcome.ok && control.popup && control.marker && popupWindowsThisClick.size === 0) {
                     examinedPopupMarkers.add(control.marker);
                   }
@@ -2677,6 +2681,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             pageClickWindowPending = false;
             evidenceControlsSeen += pageControlTotal;
             // A disclosure click can reveal lazy frames or shadow hosts.
+            await flushPageContextProbes();
             await recordPageContext();
             // Page-end aggregation for P0.2. Counts are crawl totals, not
             // per-page maxima, so a multi-page crawl reports the sum of what
@@ -2726,6 +2731,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               // idempotent per attempt, and the per-request replacement above
               // makes a Crawlee retry overwrite this attempt instead of
               // counting it twice.
+              await flushPageContextProbesOnError?.();
               aggregatePageCountersOnError?.();
               // Crawlee retries a thrown handler with a fresh page. If the
               // click window was still pending, that attempt did not examine

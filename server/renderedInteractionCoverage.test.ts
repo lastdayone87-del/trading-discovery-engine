@@ -468,9 +468,11 @@ test('P0.2 coverage counters stay coherent, bounded, and preserved on error path
   assert.match(source, /aggregatePageCountersOnError\?\.\(\)/, 'the handler catch preserves counters from an already-enumerated page');
   assert.match(source, /if \(pageCountersAggregated\) return;/, 'the error and success aggregations cannot double-count a page');
   assert.match(source, /await recordPageContext\(\);\s*\/\/ Page-end aggregation/, 'context counters refresh after the click loop');
-  assert.match(source, /const clickOutcome = await attemptRenderedControlClick[\s\S]{0,1200}?\n\s+await recordPageContextWithin\(250\);\n\s+if \(clickOutcome\.ok/, 'context counters refresh after each click before the next can replace the DOM');
-  assert.match(source, /if \(limits\.totalTimeoutMs - \(Date\.now\(\) - startedAt\) <= budgetMs\) return;/, 'the per-click probe reserves its own budget');
+  assert.match(source, /const clickOutcome = await attemptRenderedControlClick[\s\S]{0,1200}?\n\s+queuePageContextProbe\(\);\n\s+if \(clickOutcome\.ok/, 'a context sample is queued after each click before the next can replace the DOM');
+  assert.match(source, /const pendingContextProbes: Array<Promise<void>> = \[\];/, 'per-click probes are not awaited on the click path');
+  assert.match(source, /await flushPageContextProbes\(\);\s*\n\s*await recordPageContext\(\);/, 'pending samples are flushed before page-end aggregation');
   assert.match(source, /pageDocumentIdentity !== null && currentIdentity !== null[\s\S]{0,200}?currentIdentity === pageDocumentIdentity/, 'a same-document URL change still records revealed contexts');
+  assert.match(source, /if \(!sameDocument && !sameUrl\) return;/, 'a same-URL reload still records revealed contexts');
   assert.match(source, /pagePopupMarkers = trackRenderedPopupCoverage\(pagePopupMarkers, enumeration\)/, 'popup identities are tracked across every enumeration');
   assert.match(source, /popupCount: resolveUnexaminedPopupTargets\(pagePopupMarkers, examinedPopupMarkers\)/, 'only popups actually examined are excluded; a replacement cannot be cancelled by an earlier click');
   assert.match(source, /popupTargets \+= delta\.popupCount/, 'the same-request retry delta adjusts the popup contribution');
