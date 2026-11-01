@@ -162,10 +162,13 @@ The reason remains diagnostic. It does not change `complete`, `retryable`,
   budget before concatenation. It does not scan page text. At most 16
   `aria-labelledby` id tokens are extracted without splitting the full
   attribute, and referenced labels are walked as text nodes (512 nodes, 200
-  characters) rather than materializing a subtree.- A click that changes the document URL stops the click loop and counts the
+  characters) rather than materializing a subtree.
+- A click that changes the document URL stops the click loop and counts the
   remaining queued controls as skipped. Only remaining hint/icon controls make
   that outcome an interaction gap; disclosure-only leftovers stay
-  opportunistic. A menu handler or `javascript:` link cannot silently replace
+  opportunistic. A failed click follows the same rule: a failed hint/icon
+  control is evidence-bearing and keeps the page retryable, while a failed
+  generic disclosure remains diagnostic. A menu handler or `javascript:` link cannot silently replace
   the page and leave later controls looking examined. Inspected pages are
   added to the crawl's visited set, so a structural link back to a completed
   page is not counted as an unexamined destination.

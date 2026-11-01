@@ -1541,7 +1541,11 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
     if (await input.click(control)) evidenceControlsClicked++;
     else {
       evidenceControlsFailed++;
-      interactionGap = true;
+      // A failed generic disclosure is opportunistic: a hidden mobile menu
+      // timing out does not itself mean a community destination went
+      // unexamined. Failed hint/icon controls are evidence-bearing and keep
+      // the page retryable.
+      if (renderedControlSkipsNeedInteractionGap([control])) interactionGap = true;
       if (firstFailedTargetIndex === undefined) firstFailedTargetIndex = clickIndex;
     }
     // A menu handler or javascript: link can replace the document even when

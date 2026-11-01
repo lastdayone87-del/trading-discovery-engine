@@ -381,6 +381,26 @@ test('over-budget generic disclosures do not make an otherwise clean page retrya
   assert.equal(result.interactionGap, false, 'an unclicked generic disclosure is opportunistic, not a retryable gap');
 });
 
+test('a failed generic disclosure stays diagnostic while failed evidence controls keep the gap', async () => {
+  const run = async (control: ReturnType<typeof renderedButton> & { origin: 'hint' | 'icon' | 'disclosure' }) =>
+    runRenderedClickLoop({
+      targets: [control],
+      maxClicksPerPage: 4,
+      deadlineExceeded: () => false,
+      click: async () => false,
+      enumerate: async () => renderedEnumeration([control]),
+      pageUrl: () => 'https://creator.example/',
+    });
+  const disclosure = await run({ ...renderedButton(0, 'oc-menu'), text: 'Open menu', origin: 'disclosure' });
+  assert.equal(disclosure.evidenceControlsFailed, 1);
+  assert.equal(disclosure.interactionGap, false, 'a failed generic disclosure is opportunistic, not a retryable gap');
+  for (const origin of ['hint', 'icon'] as const) {
+    const result = await run({ ...renderedButton(0, `oc-${origin}`), origin });
+    assert.equal(result.evidenceControlsFailed, 1);
+    assert.equal(result.interactionGap, true, `a failed ${origin} control remains a retryable gap`);
+  }
+});
+
 test('an unclicked hint/icon control still makes the page retryable', async () => {
   const controls = [
     { ...renderedButton(0, 'oc-hint'), origin: 'hint' as const },
