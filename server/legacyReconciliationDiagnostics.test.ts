@@ -21,6 +21,14 @@ test('legacy reconciliation diagnostic is protected, read-only, and aggregate-on
   assert.doesNotMatch(diagnostic, /\(j\.payload->>'retryLifecycleVersion'\)::int/);
   assert.doesNotMatch(diagnostic, /o\.surface/);
   assert.match(diagnostic, /o\.provenance->>'surface' AS surface/);
+  // Ownership diagnostics must match the sweep's class exclusion: a legacy
+  // redirect-limit row persisted with retryable=true is not a retry owner.
+  assert.match(diagnostic, /o\.failure_class/);
+  assert.equal(
+    (diagnostic.match(/COALESCE\(effective\.failure_class,''\) <> 'REDIRECT_LIMIT'/g) || []).length,
+    2,
+    'both ownership diagnostics exclude redirect-limit failures',
+  );
   assert.match(diagnostic, /WHEN 'INSPECTION' THEN 'INSPECTION'/);
   assert.match(diagnostic, /WHEN 'RECOVERY' THEN 'RECOVERY'/);
   assert.match(diagnostic, /WHEN 'LEGACY' THEN 'LEGACY'/);

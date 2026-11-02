@@ -832,7 +832,7 @@ export async function getLegacyCommunityRetryDiagnostics(legacyBefore='2026-08-2
              EXISTS(
                SELECT 1 FROM (
                  SELECT DISTINCT ON (o.provenance->>'surface',lower(rtrim(COALESCE(o.requested_url,''),'/')))
-                        o.provenance->>'surface' AS surface,o.outcome,o.retryable,COALESCE(o.provenance->>'required','false') AS required
+                        o.provenance->>'surface' AS surface,o.outcome,o.retryable,o.failure_class,COALESCE(o.provenance->>'required','false') AS required
                    FROM external_acquisition_observations o
                   WHERE o.channel_id=j.payload->>'channelId'
                     AND o.observed_at >= COALESCE(c.last_checked,now()) - interval '5 minutes'
@@ -842,12 +842,13 @@ export async function getLegacyCommunityRetryDiagnostics(legacyBefore='2026-08-2
                            o.observed_at DESC
                ) effective
               WHERE effective.required='true' AND effective.outcome='ACQUISITION_FAILED' AND effective.retryable=true
+                AND COALESCE(effective.failure_class,'') <> 'REDIRECT_LIMIT'
                 AND effective.surface IN('CHANNEL_LINKS','EXTERNAL_LINKS','LINKED_WEBSITES','CUSTOM_DOMAINS','SOCIAL_PROFILES','SOCIAL_BIO')
              ) AS has_community_failure,
              EXISTS(
                SELECT 1 FROM (
                  SELECT DISTINCT ON (o.provenance->>'surface',lower(rtrim(COALESCE(o.requested_url,''),'/')))
-                        o.provenance->>'surface' AS surface,o.outcome,o.retryable,COALESCE(o.provenance->>'required','false') AS required
+                        o.provenance->>'surface' AS surface,o.outcome,o.retryable,o.failure_class,COALESCE(o.provenance->>'required','false') AS required
                    FROM external_acquisition_observations o
                   WHERE o.channel_id=j.payload->>'channelId'
                     AND o.observed_at >= COALESCE(c.last_checked,now()) - interval '5 minutes'
@@ -857,6 +858,7 @@ export async function getLegacyCommunityRetryDiagnostics(legacyBefore='2026-08-2
                            o.observed_at DESC
                ) effective
               WHERE effective.required='true' AND effective.outcome='ACQUISITION_FAILED' AND effective.retryable=true
+                AND COALESCE(effective.failure_class,'') <> 'REDIRECT_LIMIT'
                 AND effective.surface IN('YOUTUBE_ABOUT','RECENT_VIDEO_DESCRIPTIONS')
              ) AS has_upstream_failure
         FROM jobs j JOIN channels c ON c.channel_id=j.payload->>'channelId'
