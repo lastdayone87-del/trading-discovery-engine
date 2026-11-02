@@ -337,7 +337,7 @@ test('real DOM: enumeration separates hint-rejected, structural, icon-label, and
     const sameTabAnchor = enumeration.controls.find(control => control.text.includes('Community') && control.href?.endsWith('/community'));
     assert.equal(sameTabAnchor?.newContext, false, 'an ordinary same-tab anchor is not a new-context control');
     const popupControl = enumeration.controls.find(control => control.text.includes('Open menu'));
-    assert.equal(popupControl?.newContext, true, 'an aria-haspopup control opens a new context');
+    assert.equal(popupControl?.newContext, false, 'aria-haspopup describes an in-page menu/dialog, not a new browsing context');
 
     const context = await page.evaluate(collectRenderedPageContext);
     assert.equal(context.frameCount, 1, 'iframe presence is recorded for P1.4');

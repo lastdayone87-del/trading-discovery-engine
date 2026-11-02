@@ -234,10 +234,11 @@ A non-`COMPLETE` coverage reason is never a clean absence:
   page has more eligible hubs than remaining enqueue slots, the over-cap hubs
   stay in the click set instead of being treated as enqueue-owned. That
   click path only applies when the click can inspect in place: a cross-origin
-  `target=_blank`/`aria-haspopup` destination opens a popup whose content is
-  policy-dropped, so it stays enqueue-owned and is reported as a
-  `destination-budget` (or `cross-origin-disallowed`) gap instead of being
-  clicked for a discarded request.
+  `target=_blank` destination opens a popup whose content is policy-dropped, so
+  it stays enqueue-owned and is reported as a `destination-budget` (or
+  `cross-origin-disallowed`) gap instead of being clicked for a discarded
+  request. `aria-haspopup` is not treated as a new context because it can
+  describe an in-page menu/dialog that reveals content without navigating.
 - The persistence boundary (`safeCrawlerTelemetry`) re-sanitizes every field:
   closed taxonomies, positive integers, fixed caps, rendered-only placement.
 - No migration is required; the fields live in the existing

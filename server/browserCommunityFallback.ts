@@ -779,11 +779,13 @@ export interface RenderedControlTarget {
   popup?: boolean;
   /**
    * True when activating the control opens a new browsing context
-   * (`target=_blank` or `aria-haspopup`). Distinct from `popup`, which only
-   * marks controls that cannot be followed as a normal navigation. The click
-   * planner needs this to know whether a click inspects in place or opens a
-   * popup: a cross-origin popup is never navigated to, so clicking one cannot
-   * discover its content.
+   * (`target=_blank`). Distinct from `popup`, which only marks controls that
+   * cannot be followed as a normal navigation. The click planner needs this to
+   * know whether a click inspects in place or opens a popup: a cross-origin
+   * popup is never navigated to, so clicking one cannot discover its content.
+   * `aria-haspopup` is deliberately excluded: it can describe an in-page
+   * menu/dialog whose handler reveals content without navigating, so treating
+   * it as a new context would skip a real discovery path.
    */
   newContext?: boolean;
 }
@@ -1077,7 +1079,11 @@ export function enumerateRenderedControlNodes(
       // exact: only controls that contributed an unresolved popup count can
       // resolve one. The popup listener captures every popup regardless.
       popup: ariaHaspopup === 'dialog' || ariaHaspopup === 'menu' || (target === '_blank' && !hasNavigableHref),
-      newContext: target === '_blank' || ariaHaspopup === 'dialog' || ariaHaspopup === 'menu',
+      // `aria-haspopup` describes an in-page menu/dialog, not a new browsing
+      // context: its handler can reveal the invite in the current document, so
+      // it must stay clickable. Only `target=_blank` is known to open a popup
+      // whose cross-origin content the click path never inspects.
+      newContext: target === '_blank',
     };
     // Original hint matches keep absolute priority, then icon-label
     // recoveries, then generic structural disclosures. Each group preserves
