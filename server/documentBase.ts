@@ -117,15 +117,29 @@ export function stripBaseElements(html: string): string {
     'noembed', 'noframes', 'noscript', 'plaintext',
   ]);
   // HTML integration points: their children are parsed as HTML even though the
-  // element itself is in foreign (SVG/MathML) content.
-  const htmlIntegrationPoints = new Set([
-    'foreignobject', 'mi', 'mo', 'mn', 'ms', 'mtext',
-  ]);
+  // element itself is in foreign (SVG/MathML) content. `foreignObject` only
+  // applies in SVG; the MathML text integration points and `annotation-xml`
+  // only apply in MathML.
+  const svgHtmlIntegrationPoints = new Set(['foreignobject']);
+  const mathmlHtmlIntegrationPoints = new Set(['mi', 'mo', 'mn', 'ms', 'mtext']);
   const isWhitespace = (code: number): boolean =>
     code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d;
   const isNameDelimiter = (code: number): boolean =>
     code === 0x2f || code === 0x3e || isWhitespace(code);
   const lower = (code: number): number => code >= 0x41 && code <= 0x5a ? code | 0x20 : code;
+
+  // MathML `annotation-xml` is an HTML integration point only when its
+  // `encoding` attribute is `text/html` or `application/xhtml+xml`
+  // (ASCII case-insensitive). Otherwise its descendants stay foreign, so a
+  // `<base data-href>` string inside a script there is a real element.
+  const annotationXmlIsHtml = (from: number, to: number): boolean => {
+    const match = /(?:^|[\s/])encoding\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(
+      source.slice(from, Math.max(from, to)),
+    );
+    if (!match) return false;
+    const value = trimHtmlWhitespace(match[1] ?? match[2] ?? match[3] ?? '').toLowerCase();
+    return value === 'text/html' || value === 'application/xhtml+xml';
+  };
 
   // Index of the first `>` that ends the tag starting at `from`, ignoring `>`
   // inside quoted attribute values. Only a quote that opens a value (after `=`)
@@ -304,12 +318,26 @@ export function stripBaseElements(html: string): string {
       continue;
     }
     // Raw-text element names are only raw text in HTML content; a foreign
-    // <plaintext> must not hide the rest of the document. `<foreignObject>`
-    // and MathML text integration points switch their children back to HTML,
-    // so a script there is raw text again.
+    // <plaintext> must not hide the rest of the document. The matching HTML
+    // integration point switches their children back to HTML, so a script
+    // there is raw text again.
     const selfClosing = isSelfClosingTag(tagEnd);
     const opensForeign = inHtmlContent && (name === 'svg' || name === 'math');
-    const opensHtml = !inHtmlContent && htmlIntegrationPoints.has(name);
+    let foreignRoot: 'svg' | 'math' | '' = '';
+    if (!inHtmlContent) {
+      for (let frame = contextStack.length - 1; frame >= 0; frame--) {
+        const frameName = contextStack[frame].name;
+        if (frameName === 'svg' || frameName === 'math') {
+          foreignRoot = frameName;
+          break;
+        }
+      }
+    }
+    const opensHtml = (foreignRoot === 'svg' && svgHtmlIntegrationPoints.has(name))
+      || (foreignRoot === 'math' && (
+        mathmlHtmlIntegrationPoints.has(name)
+        || (name === 'annotation-xml' && annotationXmlIsHtml(nameEnd, tagEnd - 1))
+      ));
     if (!selfClosing && (opensForeign || opensHtml)) {
       contextStack.push({ name, previous: inHtmlContent });
       inHtmlContent = opensHtml;

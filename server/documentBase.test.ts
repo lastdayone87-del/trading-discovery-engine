@@ -258,6 +258,36 @@ test('base stripping: foreignObject descendants are HTML content', () => {
   );
 });
 
+test('base stripping: annotation-xml integrates only with an HTML encoding', () => {
+  const script = '<script>const x = \'<base data-href="/community/join">\';</script>';
+  for (const encoding of ['text/html', 'TEXT/HTML', 'application/xhtml+xml']) {
+    assert.equal(
+      stripBaseElements(
+        `<math><annotation-xml encoding="${encoding}">${script}</annotation-xml></math><base href="/community/"><a href="join">join</a>`,
+      ),
+      `<math><annotation-xml encoding="${encoding}">${script}</annotation-xml></math><a href="join">join</a>`,
+      `script text is preserved for encoding="${encoding}"`,
+    );
+  }
+  assert.equal(
+    stripBaseElements(
+      '<math><annotation-xml encoding="text/plain"><script><base data-href="/x/"></script></annotation-xml></math>',
+    ),
+    '<math><annotation-xml encoding="text/plain"><script></script></annotation-xml></math>',
+    'a non-HTML encoding stays foreign, so the base-shaped element is stripped',
+  );
+  assert.equal(
+    stripBaseElements('<math><annotation-xml><script><base data-href="/x/"></script></annotation-xml></math>'),
+    '<math><annotation-xml><script></script></annotation-xml></math>',
+    'a missing encoding stays foreign',
+  );
+  assert.equal(
+    stripBaseElements('<math><foreignObject><script><base data-href="/x/"></script></foreignObject></math>'),
+    '<math><foreignObject><script></script></foreignObject></math>',
+    'foreignObject is an integration point only in SVG',
+  );
+});
+
 test('base stripping: CDATA is only a section in foreign content', () => {
   assert.equal(
     stripBaseElements('<![CDATA[x]]><base href="/community/"><a href="join">join</a>'),
