@@ -288,6 +288,51 @@ test('base stripping: annotation-xml integrates only with an HTML encoding', () 
   );
 });
 
+test('base stripping: annotation-xml encoding cannot be spoofed by another attribute', () => {
+  assert.equal(
+    stripBaseElements(
+      '<math><annotation-xml title="x encoding=\'text/html\'" encoding="text/plain"><script><base data-href="/x/"></script></annotation-xml></math>',
+    ),
+    '<math><annotation-xml title="x encoding=\'text/html\'" encoding="text/plain"><script></script></annotation-xml></math>',
+    'a lookalike encoding inside an earlier value does not win over the real attribute',
+  );
+  assert.equal(
+    stripBaseElements(
+      '<math><annotation-xml encoding="text/plain" title="encoding=\'text/html\'"><script><base data-href="/x/"></script></annotation-xml></math>',
+    ),
+    '<math><annotation-xml encoding="text/plain" title="encoding=\'text/html\'"><script></script></annotation-xml></math>',
+    'a spoof after the real attribute does not override it',
+  );
+  assert.equal(
+    stripBaseElements(
+      '<math><annotation-xml title="encoding=\'text/plain\'" encoding="text/html"><script>const x = \'<base data-href="/x/">\';</script></annotation-xml></math>',
+    ),
+    '<math><annotation-xml title="encoding=\'text/plain\'" encoding="text/html"><script>const x = \'<base data-href="/x/">\';</script></annotation-xml></math>',
+    'a spoof before the real HTML encoding does not suppress it',
+  );
+  assert.equal(
+    stripBaseElements(
+      '<math><annotation-xml encoding="text/plain" encoding="text/html"><script><base data-href="/x/"></script></annotation-xml></math>',
+    ),
+    '<math><annotation-xml encoding="text/plain" encoding="text/html"><script></script></annotation-xml></math>',
+    'the first encoding attribute wins, as in the HTML parser',
+  );
+  assert.equal(
+    stripBaseElements(
+      '<math><annotation-xml encoding=text/html><script>const x = \'<base data-href="/x/">\';</script></annotation-xml></math>',
+    ),
+    '<math><annotation-xml encoding=text/html><script>const x = \'<base data-href="/x/">\';</script></annotation-xml></math>',
+    'an unquoted HTML encoding is accepted',
+  );
+  assert.equal(
+    stripBaseElements(
+      '<math><annotation-xml title="a>b" encoding="text/html"><script>const x = \'<base data-href="/x/">\';</script></annotation-xml></math>',
+    ),
+    '<math><annotation-xml title="a>b" encoding="text/html"><script>const x = \'<base data-href="/x/">\';</script></annotation-xml></math>',
+    'a quoted greater-than before encoding does not truncate attribute parsing',
+  );
+});
+
 test('base stripping: CDATA is only a section in foreign content', () => {
   assert.equal(
     stripBaseElements('<![CDATA[x]]><base href="/community/"><a href="join">join</a>'),

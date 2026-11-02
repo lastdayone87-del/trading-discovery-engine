@@ -128,17 +128,54 @@ export function stripBaseElements(html: string): string {
     code === 0x2f || code === 0x3e || isWhitespace(code);
   const lower = (code: number): number => code >= 0x41 && code <= 0x5a ? code | 0x20 : code;
 
-  // MathML `annotation-xml` is an HTML integration point only when its
+  // MathML `annotation-xml` is an HTML integration point only when its real
   // `encoding` attribute is `text/html` or `application/xhtml+xml`
-  // (ASCII case-insensitive). Otherwise its descendants stay foreign, so a
-  // `<base data-href>` string inside a script there is a real element.
+  // (ASCII case-insensitive). Walk the tag's attributes rather than searching
+  // its raw text: a lookalike `encoding=` inside another attribute's quoted
+  // value must not spoof the switch. The first `encoding` attribute wins, as in
+  // the HTML parser.
   const annotationXmlIsHtml = (from: number, to: number): boolean => {
-    const match = /(?:^|[\s/])encoding\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(
-      source.slice(from, Math.max(from, to)),
-    );
-    if (!match) return false;
-    const value = trimHtmlWhitespace(match[1] ?? match[2] ?? match[3] ?? '').toLowerCase();
-    return value === 'text/html' || value === 'application/xhtml+xml';
+    let index = from;
+    while (index < to) {
+      let code = source.charCodeAt(index);
+      if (isHtmlWhitespace(code) || code === 0x2f /* / */) {
+        index++;
+        continue;
+      }
+      const nameStart = index;
+      while (index < to) {
+        code = source.charCodeAt(index);
+        if (isHtmlWhitespace(code) || code === 0x2f || code === 0x3d || code === 0x3e) break;
+        index++;
+      }
+      const attributeName = source.slice(nameStart, index).toLowerCase();
+      while (index < to && isHtmlWhitespace(source.charCodeAt(index))) index++;
+      let value = '';
+      if (source.charCodeAt(index) === 0x3d /* = */) {
+        index++;
+        while (index < to && isHtmlWhitespace(source.charCodeAt(index))) index++;
+        const quote = source.charCodeAt(index);
+        if (quote === 0x22 || quote === 0x27) {
+          const valueStart = ++index;
+          while (index < to && source.charCodeAt(index) !== quote) index++;
+          value = source.slice(valueStart, index);
+          if (index < to) index++;
+        } else {
+          const valueStart = index;
+          while (index < to) {
+            const valueCode = source.charCodeAt(index);
+            if (isHtmlWhitespace(valueCode) || valueCode === 0x3e) break;
+            index++;
+          }
+          value = source.slice(valueStart, index);
+        }
+      }
+      if (attributeName === 'encoding') {
+        const normalized = trimHtmlWhitespace(value).toLowerCase();
+        return normalized === 'text/html' || normalized === 'application/xhtml+xml';
+      }
+    }
+    return false;
   };
 
   // Index of the first `>` that ends the tag starting at `from`, ignoring `>`
