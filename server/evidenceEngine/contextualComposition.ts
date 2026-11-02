@@ -186,7 +186,11 @@ export function buildContextualComposition(
   let nonTitleTierAFamilies = 0;
   let explicitCreatorTrading = false;
   let explicitCreatorAlternative = false;
-  const temporalKnown = documents.some(document => Boolean(document.publishedAt));
+  // Presence is not knowledge: a non-empty but unparseable timestamp would
+  // otherwise mark temporal coverage KNOWN and skip the missing-evidence gap.
+  const temporalKnown = documents.some(document =>
+    typeof document.publishedAt === 'string' && Number.isFinite(Date.parse(document.publishedAt))
+  );
   const familyClassifications: ContextualCompositionReport['familyClassifications'] = [];
 
   for (const [sourceFamilyId, familyDocuments] of byFamily) {

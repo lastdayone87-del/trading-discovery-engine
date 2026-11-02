@@ -49,7 +49,7 @@ interface QualityDashboardRun {
     newQualityCreators: number;
     confirmedNewCreatorsPer100Quota: number;
     quotaUnits: number;
-    targetMarketPrecision: number;
+    targetMarketPrecision: number | null;
     duplicateRatio: number;
     providerDegraded: boolean;
   } | null;
@@ -60,7 +60,7 @@ interface QualityDashboard {
   version: string;
   generatedAt: string;
   portfolio: { dailyQuotaUnits: number; portfolioRatio: number; portfolioUnitsReserved: number; portfolioUnitsUsed: number; portfolioShareUsed: number; withinBudget: boolean };
-  totals: { runs: number; completedRuns: number; pendingRuns: number; failedRuns: number; accountedRuns: number; unaccountedCompletedRuns: number; newConfirmedCreators: number; newQualityCreators: number; quotaUnits: number; confirmedNewCreatorsPer100Quota: number; zeroConfirmRuns: number; zeroConfirmShare: number; targetMarketPrecision: number; duplicateRatio: number; providerDegradedRuns: number };
+  totals: { runs: number; completedRuns: number; pendingRuns: number; failedRuns: number; accountedRuns: number; unaccountedCompletedRuns: number; newConfirmedCreators: number; newQualityCreators: number; quotaUnits: number; confirmedNewCreatorsPer100Quota: number; zeroConfirmRuns: number; zeroConfirmShare: number; targetMarketPrecision: number | null; duplicateRatio: number; providerDegradedRuns: number };
   selection: { strategies: Record<string, number>; stopReasons: Array<{ reason: string; count: number }>; stopReasonCoverage: number; admissionRejections: Array<{ reason: string; count: number }>; admissionTiers: Record<string, number>; compositionFamilies: Record<string, number> };
   rows: QualityDashboardRun[];
 }
@@ -71,6 +71,9 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
   const [terminology, setTerminology] = useState<CanonicalTradingTerm[]>([]);
   const [logs, setLogs] = useState<QueryExecutionLog[]>([]);
   const [qualityDashboard, setQualityDashboard] = useState<QualityDashboard | null>(null);
+  // A failed dashboard request must surface as an error with retry, not leave
+  // the tab on its loading message forever (apiFetch resolves on 4xx/5xx).
+  const [qualityDashboardError, setQualityDashboardError] = useState<string | null>(null);
   const [status, setStatus] = useState<{
     isRunning: boolean;
     isPaused?: boolean;
@@ -121,22 +124,47 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
       ]);
 
       if (requestId !== fetchSequence.current) return;
-      const [lib, vocab, terminologyData, logData, statusData, scopeData, quality] = await Promise.all([
+      const [lib, vocab, terminologyData, logData, statusData, scopeData] = await Promise.all([
         libRes.ok ? libRes.json() : null,
         vocabRes.ok ? vocabRes.json() : null,
         terminologyRes.ok ? terminologyRes.json() : null,
         logRes.ok ? logRes.json() : null,
         statusRes.ok ? statusRes.json() : null,
         scopeRes.ok ? scopeRes.json() : null,
-        qualityRes.ok ? qualityRes.json() : null,
       ]);
+      // The quality projection carries its own error state: apiFetch resolves
+      // on HTTP 4xx/5xx, so checking `ok` alone would silently drop the error.
+      let quality: QualityDashboard | null = null;
+      let qualityError: string | null = null;
+      if (qualityRes.ok) {
+        try {
+          quality = await qualityRes.json();
+        } catch {
+          qualityError = 'The query-quality projection returned an unreadable response.';
+        }
+      } else {
+        let detail: string | null = null;
+        try {
+          const body = await qualityRes.json();
+          if (body && typeof body.error === 'string') detail = body.error;
+        } catch {
+          // Non-JSON error bodies fall back to the HTTP status below.
+        }
+        qualityError = detail
+          || `The query-quality projection failed (${qualityRes.status}${qualityRes.statusText ? ` ${qualityRes.statusText}` : ''}).`;
+      }
       // Parsing is asynchronous too; re-check before committing the batch.
       if (requestId !== fetchSequence.current) return;
       if (lib) setQueries(lib);
       if (vocab) setExtractedVocabulary(vocab);
       if (terminologyData) setTerminology(terminologyData);
       if (logData) setLogs(logData);
-      if (quality) setQualityDashboard(quality);
+      if (quality) {
+        setQualityDashboard(quality);
+        setQualityDashboardError(null);
+      } else {
+        setQualityDashboardError(qualityError);
+      }
       if (statusData) setStatus(statusData);
       if (scopeData) {
         setScopeMode(scopeData.scope || 'GLOBAL');
@@ -145,6 +173,9 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
     } catch (err) {
       if (requestId !== fetchSequence.current) return;
       console.error('Error fetching Query Intelligence data:', err);
+      setQualityDashboardError(
+        err instanceof Error ? err.message : 'Unable to reach the query-intelligence API.'
+      );
     }
   };
 
@@ -152,6 +183,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
     // The old projection belongs to the previous country filter. Clear it so
     // stale figures are never shown while the new dashboard request loads.
     setQualityDashboard(null);
+    setQualityDashboardError(null);
     fetchData();
     const interval = setInterval(fetchData, 10000); // refresh every 10s
     return () => clearInterval(interval);
@@ -753,11 +785,29 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
         {activeSubTab === 'quality' && (
           <div className="space-y-4">
             {!qualityDashboard ? (
-              <div className="p-8 text-center text-slate-400 dark:text-slate-500 border border-dashed border-slate-200 dark:border-slate-800 rounded-2xl">
-                Loading the query-quality projection…
-              </div>
+              qualityDashboardError ? (
+                <div className="p-8 text-center border border-dashed border-rose-300 dark:border-rose-800 rounded-2xl space-y-3">
+                  <p className="text-sm font-bold text-rose-600 dark:text-rose-400">Could not load the query-quality projection.</p>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">{qualityDashboardError}</p>
+                  <button
+                    onClick={() => fetchData()}
+                    className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs rounded-xl shadow-lg transition-all cursor-pointer"
+                  >
+                    Retry
+                  </button>
+                </div>
+              ) : (
+                <div className="p-8 text-center text-slate-400 dark:text-slate-500 border border-dashed border-slate-200 dark:border-slate-800 rounded-2xl">
+                  Loading the query-quality projection…
+                </div>
+              )
             ) : (
               <>
+                {qualityDashboardError && (
+                  <div className="p-3 text-xs bg-rose-50 dark:bg-rose-900/20 border border-rose-200 dark:border-rose-800 rounded-xl text-rose-700 dark:text-rose-300">
+                    Showing the last successful projection. Refresh failed: {qualityDashboardError}
+                  </div>
+                )}
                 <p className="text-xs text-slate-500 dark:text-slate-400">
                   Result-level reward is <strong>globally new, in-scope, target-market confirmed creators per 100 quota</strong>.
                   Completed runs without a persisted quality vector are reported as unaccounted, never as zero yield. Admission
@@ -770,7 +820,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
                     { label: 'New confirmed creators', value: qualityDashboard.totals.newConfirmedCreators, tone: 'text-emerald-600 dark:text-emerald-400' },
                     { label: 'New quality creators', value: qualityDashboard.totals.newQualityCreators, tone: 'text-indigo-600 dark:text-indigo-400' },
                     { label: 'Zero-confirm share', value: `${Math.round(qualityDashboard.totals.zeroConfirmShare * 100)}%`, tone: 'text-amber-600 dark:text-amber-400' },
-                    { label: 'Target-market precision', value: `${Math.round(qualityDashboard.totals.targetMarketPrecision * 100)}%`, tone: 'text-slate-900 dark:text-white' },
+                    { label: 'Target-market precision', value: qualityDashboard.totals.targetMarketPrecision === null ? 'unknown' : `${Math.round(qualityDashboard.totals.targetMarketPrecision * 100)}%`, tone: 'text-slate-900 dark:text-white' },
                     { label: 'Duplicate ratio', value: `${Math.round(qualityDashboard.totals.duplicateRatio * 100)}%`, tone: 'text-slate-900 dark:text-white' },
                     { label: 'Accounted runs', value: `${qualityDashboard.totals.accountedRuns}/${qualityDashboard.totals.completedRuns}`, tone: 'text-slate-900 dark:text-white' },
                     { label: 'Provider-degraded runs', value: qualityDashboard.totals.providerDegradedRuns, tone: 'text-rose-600 dark:text-rose-400' },

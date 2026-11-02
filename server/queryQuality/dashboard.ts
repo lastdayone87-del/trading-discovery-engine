@@ -77,7 +77,8 @@ export interface QueryQualityDashboard {
     qualityNewCreatorsPer100Quota: number;
     zeroConfirmRuns: number;
     zeroConfirmShare: number;
-    targetMarketPrecision: number;
+    /** Null when no reward-eligible run measured target-market membership. */
+    targetMarketPrecision: number | null;
     duplicateRatio: number;
     providerDegradedRuns: number;
   };
@@ -128,8 +129,12 @@ function normalizeVector(value: Partial<QueryQualityVector> | null | undefined):
     semanticOverlapRatio: safe(value.semanticOverlapRatio),
     invalidQueryRate: safe(value.invalidQueryRate),
     zeroResultRate: safe(value.zeroResultRate),
-    targetMarketPrecision: safe(value.targetMarketPrecision),
-    languageMatchRate: safe(value.languageMatchRate),
+    targetMarketPrecision: value.targetMarketPrecision === null || value.targetMarketPrecision === undefined
+      ? null
+      : safe(value.targetMarketPrecision),
+    languageMatchRate: value.languageMatchRate === null || value.languageMatchRate === undefined
+      ? null
+      : safe(value.languageMatchRate),
     providerDegraded: value.providerDegraded === true,
     failedRun: value.failedRun === true,
   };
@@ -168,6 +173,7 @@ export function buildQueryQualityDashboard(input: {
   let quotaUnits = 0;
   let distinctResults = 0;
   let weightedTargetPrecision = 0;
+  let targetPrecisionResults = 0;
   let duplicateResults = 0;
   let evaluatedResults = 0;
   let zeroConfirmRuns = 0;
@@ -177,7 +183,10 @@ export function buildQueryQualityDashboard(input: {
     newQualityCreators += vector.newQualityCreators;
     quotaUnits += vector.quotaUnits;
     distinctResults += vector.distinctResults;
-    weightedTargetPrecision += vector.targetMarketPrecision * vector.distinctResults;
+    if (vector.targetMarketPrecision !== null) {
+      weightedTargetPrecision += vector.targetMarketPrecision * vector.distinctResults;
+      targetPrecisionResults += vector.distinctResults;
+    }
     // The stored ratio is duplicates / (distinct + duplicates). Reconstruct
     // the evaluated counts so the portfolio ratio matches the source metric;
     // weighting by distinct results alone understates the duplicate share.
@@ -252,7 +261,7 @@ export function buildQueryQualityDashboard(input: {
       qualityNewCreatorsPer100Quota: effectiveQuotaUnits > 0 ? newQualityCreators / effectiveQuotaUnits : 0,
       zeroConfirmRuns,
       zeroConfirmShare: rewardEligible.length > 0 ? zeroConfirmRuns / rewardEligible.length : 0,
-      targetMarketPrecision: distinctResults > 0 ? weightedTargetPrecision / distinctResults : 0,
+      targetMarketPrecision: targetPrecisionResults > 0 ? weightedTargetPrecision / targetPrecisionResults : null,
       duplicateRatio: evaluatedResults > 0 ? duplicateResults / evaluatedResults : 0,
       providerDegradedRuns,
     },

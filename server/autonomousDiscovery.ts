@@ -24,7 +24,7 @@ import {
   type SelectionExperimentRequest,
 } from './querySelectionExperiments';
 import { calculateDiscoveryCapacity } from './discoverySchedulerPolicy';
-import { getAllocatedResearchQuery, markResearchActionQueued } from './persistentResearch';
+import { getAllocatedResearchQuery, markResearchActionQueued, rejectResearchAction } from './persistentResearch';
 import { runPersistentResearchCycle } from './persistentResearchController';
 import { creatorIntelligenceChecksum } from './creatorIntelligence/contracts';
 import { bindCreatorCanaryQueryRun, type CreatorCanaryAssignment } from './creatorIntelligence/canary';
@@ -717,6 +717,13 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         }
         await setQueryCollection(selected.queryRecord.id, 'REJECTED')
           .catch(error => console.warn('[Autonomous Producer] Failed to quarantine unsafe query:', error));
+        // A rejected research allocation must not keep holding its slot until
+        // expiry; otherwise the same inadmissible query is materialized and
+        // rejected again on the next cycle.
+        if (research) {
+          await rejectResearchAction(research.actionId, `Query authority rejected query: ${queryAuthority.reasonCodes.join(', ')}`)
+            .catch(error => console.warn('[Autonomous Producer] Failed to settle rejected research action:', error));
+        }
         candidateDiagnostic = { ...candidateDiagnostic, disposition: 'SKIPPED', reasonCode: 'QUERY_INTELLIGENCE_AUTHORITY_REJECTED', schedulingOutcome: 'NOT_REACHED' };
         recordCandidateDiagnostic(candidateDiagnostic);
         continue;

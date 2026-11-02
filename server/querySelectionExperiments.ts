@@ -47,6 +47,7 @@ import {
   rotateAwayFromMostRecentIntent,
 } from './queryPlanner';
 import { selectNextQueryForCountry } from './queryIntelligence';
+import { revalidateQueryRecordAdmission } from './queryQuality/admission';
 import { getQueriesByCountry, getAppSetting } from './db';
 import type { QueryRecord } from '../src/types';
 
@@ -909,6 +910,12 @@ export async function selectExperimentalQueryForCountry(
   const queries = (await getQueriesByCountry(country)).filter(query => reservableFilter(query, now));
   let eligible = limitRepeatedPrimaryTerms(queriesOutsideCooldown(queries, now, cooldownMinutes), queries, now, cooldownMinutes, maxPrimaryUses);
   eligible = rotateAwayFromMostRecentIntent(eligible, queries);
+  // The experiment pool must obey the same execution-time admission gate as
+  // the scheduler. Without this, a treatment arm can win on a speculative or
+  // otherwise stale row that evaluateAutonomousQueryAuthority then rejects,
+  // burning the opportunity and marking the query REJECTED.
+  const nowIso = now.toISOString();
+  eligible = eligible.filter(query => revalidateQueryRecordAdmission(query, { now: nowIso }).eligible);
   eligible = [...eligible].sort((a, b) => a.id - b.id);
   if (!eligible.length) {
     const base = await delegateLegacy();

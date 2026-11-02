@@ -158,8 +158,10 @@ function typedAtoms(metadata: Record<string, any>, record: QueryRecordAdmissionI
   }
   // Compatibility path for pre-admission rows: the stored query itself is the
   // atom. It still has to pass the same Q0/Q1/Q2 gates; this is a migration
-  // bridge, not an exemption.
-  const term = String(metadata.localTier1Term || record.primary_term || record.query || '').normalize('NFKC').trim();
+  // bridge, not an exemption. Use the full query, not `primary_term`: a legacy
+  // row like `CAC 40 trading` carries its trading context only in the query,
+  // and judging the bare primary term alone would reject it at run time.
+  const term = String(record.query || '').normalize('NFKC').trim();
   return term ? [{
     term,
     role: 'ANCHOR',

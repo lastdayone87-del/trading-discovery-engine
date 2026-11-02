@@ -12,7 +12,7 @@ import {
   getChannelById,
   upsertChannel,
   getAppSetting,
-  getQueryQualityRunRows,
+  getQueryQualityDecayedCounts,
   getQueryPortfolioBudgetState,
   getQueryQuotaSpendRows,
   getQueryFailureStates,
@@ -30,8 +30,8 @@ import {
   MAX_SELECTION_INDEX,
   MIN_SELECTION_SAMPLE,
   SELECTOR_C,
+  boundedPortfolioRatio,
   computePosterior,
-  decayArmCounts,
   decayWeight,
   empiricalPrior,
   promotionQualityScore,
@@ -1034,7 +1034,7 @@ export async function selectNextQueryForCountry(
   // The retired UCB1 formula's explorationRatio is replaced by the bounded
   // portfolio ratio. Keeping the name visible documents the policy migration
   // for audit consumers while no random exploration remains in serving.
-  const configuredPortfolioRatio = Math.min(0.20, Math.max(0.10, Number(await getAppSetting('query_intelligence_portfolio_ratio', process.env.QUERY_INTELLIGENCE_PORTFOLIO_RATIO || '0.15')) || 0.15));
+  const configuredPortfolioRatio = boundedPortfolioRatio(await getAppSetting('query_intelligence_portfolio_ratio', process.env.QUERY_INTELLIGENCE_PORTFOLIO_RATIO || '0.15'));
   const portfolioRatio = portfolioBudget(1, configuredPortfolioRatio).ratio;
   const familyCap = Math.min(1, Math.max(0.1, Number(await getAppSetting('query_intelligence_family_share_cap', process.env.QUERY_INTELLIGENCE_FAMILY_SHARE_CAP || '0.45')) || 0.45));
   const sourceCap = Math.min(1, Math.max(0.1, Number(await getAppSetting('query_intelligence_source_share_cap', process.env.QUERY_INTELLIGENCE_SOURCE_SHARE_CAP || '0.60')) || 0.60));
@@ -1212,21 +1212,20 @@ async function buildSelectorPool(
     primaryUsage.set(key, (primaryUsage.get(key) || 0) + 1);
   }
 
-  const [qualityRows, spendRows, failureStates] = await Promise.all([
-    getQueryQualityRunRows(country),
+  // The decayed sums are aggregated in SQL (one row per query, not per run):
+  // selection is on the scheduler hot path and must not scale with 180 days of
+  // run history. Zero-quota and provider-failed runs are excluded in the same
+  // aggregate, matching the serving/dashboard reward definition.
+  const [qualityCounts, spendRows, failureStates] = await Promise.all([
+    getQueryQualityDecayedCounts(country, undefined, DECAY_HALF_LIFE_DAYS),
     getQueryQuotaSpendRows(country),
     getQueryFailureStates(country),
   ]);
-  const rowsByQuery = new Map<number, Array<{ confirmed: number; quality: number; quotaUnits: number; ageDays: number }>>();
-  for (const row of qualityRows) {
-    if (!(row.quotaUnits > 0)) continue;
-    const list = rowsByQuery.get(row.queryId) || [];
-    list.push(row);
-    rowsByQuery.set(row.queryId, list);
-  }
-  const countsById = new Map<number, DecayedArmCounts>();
+  const countsById = new Map<number, DecayedArmCounts>(
+    qualityCounts.map(row => [row.queryId, row.counts]),
+  );
   for (const query of queries) {
-    countsById.set(query.id, decayArmCounts(rowsByQuery.get(query.id) || [], DECAY_HALF_LIFE_DAYS));
+    if (!countsById.has(query.id)) countsById.set(query.id, emptyArmCounts());
   }
   const prior = empiricalPrior([...countsById.values()], 0.05, 2);
 
@@ -1574,7 +1573,16 @@ export async function constructCountryNativeAllocationQuery(args: {
 export async function evaluateQueryPerformance(
   queryRecord: QueryRecord,
   metrics: QueryFunnelMetrics,
-  attribution: { retrievalLane?: string; searchOrdering?: string; quotaConsumed?: number; queryRunId?: string; persist?: boolean } = {}
+  attribution: {
+    retrievalLane?: string;
+    searchOrdering?: string;
+    quotaConsumed?: number;
+    queryRunId?: string;
+    persist?: boolean;
+    /** Provider degradation for this run; excluded from promotion evidence. */
+    providerRequestsFailed?: number;
+    providerRunOutcome?: string | null;
+  } = {}
 ): Promise<{ performanceScore: number; newCollection: QueryCollection; summary: string }> {
   const performanceScore = metrics.performanceScore;
   // Q4c promotion guard: PROVEN is a lower-confidence-bound decision over
@@ -1584,8 +1592,21 @@ export async function evaluateQueryPerformance(
   // and the in-flight metrics are added as the newest observation.
   let promotionGuard: QueryPromotionGuard | undefined;
   if (performanceScore >= 60) {
-    const priorRows = (await getQueryQualityRunRows(queryRecord.country))
-      .filter(row => row.queryId === queryRecord.id && isRewardEligibleQuota(row.quotaUnits));
+    // One aggregated read per country (a row per query id, not per run). The
+    // query's own prior is kept separate from every other arm so the promotion
+    // confidence bound is shrunk toward a genuinely peer-derived rate instead
+    // of counting the query's own yield twice.
+    const decayedByQuery = await getQueryQualityDecayedCounts(queryRecord.country, undefined, DECAY_HALF_LIFE_DAYS);
+    const ownPrior = decayedByQuery.find(row => row.queryId === queryRecord.id)?.counts || emptyArmCounts();
+    const peerArms = decayedByQuery
+      .filter(row => row.queryId !== queryRecord.id)
+      .map(row => row.counts);
+    const peerTotal = peerArms.reduce((total, arm) => ({
+      confirmed: total.confirmed + arm.confirmed,
+      quality: total.quality + arm.quality,
+      quotaUnits: total.quotaUnits + arm.quotaUnits,
+      runs: total.runs + arm.runs,
+    }), emptyArmCounts());
     // Use the run's own sighting truth: confirmed/quality are intersections
     // of persisted, globally-new, non-rejected, confirmed channels. The
     // aggregate counters can independently contain known confirmed traders
@@ -1602,11 +1623,30 @@ export async function evaluateQueryPerformance(
     // Zero-quota runs are excluded from serving history, hierarchy learning
     // and the dashboard reward rate. They must not supply a promotion sample:
     // otherwise a free run could raise the per-100-quota LCB to PROVEN.
-    const promotionRows = isRewardEligibleQuota(currentRun.quotaUnits)
-      ? [...priorRows, currentRun]
-      : priorRows;
-    const counts = decayArmCounts(promotionRows, DECAY_HALF_LIFE_DAYS);
-    const posterior = computePosterior(counts, empiricalPrior([counts], 0.05, 2), {}, SELECTOR_C, MAX_SELECTION_INDEX);
+    // A partially provider-degraded run is excluded for the same reason:
+    // completed-run reward reads and accounting already drop it, so letting it
+    // prove the query would promote from evidence the dashboard cannot see.
+    const providerFailed = Number(attribution.providerRequestsFailed || 0) > 0
+      || /^FAILED/i.test(String(attribution.providerRunOutcome || ''));
+    const includeCurrentRun = isRewardEligibleQuota(currentRun.quotaUnits) && !providerFailed;
+    const counts = includeCurrentRun
+      ? {
+          confirmed: ownPrior.confirmed + currentRun.confirmed,
+          quality: ownPrior.quality + currentRun.quality,
+          quotaUnits: ownPrior.quotaUnits + currentRun.quotaUnits,
+          runs: ownPrior.runs + 1,
+        }
+      : ownPrior;
+    const prior = empiricalPrior(peerArms, 0.05, 2);
+    // computePosterior subtracts the arm's own counts from the supplied total
+    // stratum, so include this arm to leave only peers in the hierarchy.
+    const totalStratum = {
+      confirmed: peerTotal.confirmed + counts.confirmed,
+      quality: peerTotal.quality + counts.quality,
+      quotaUnits: peerTotal.quotaUnits + counts.quotaUnits,
+      runs: peerTotal.runs + counts.runs,
+    };
+    const posterior = computePosterior(counts, prior, { total: totalStratum }, SELECTOR_C, MAX_SELECTION_INDEX);
     promotionGuard = {
       completedRuns: counts.runs,
       lcb: promotionQualityScore(posterior),

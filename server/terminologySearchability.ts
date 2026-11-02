@@ -1,4 +1,5 @@
 import {
+  COUNTRY_KNOWLEDGE_PACKS,
   GLOBAL_ADVANCED_CONCEPTS,
   GLOBAL_INSTRUMENTS,
   GLOBAL_PLATFORMS_BROKERS_PROPFIRMS,
@@ -159,6 +160,13 @@ function buildTradingSemantics(): Set<string> {
   for (const pack of Object.values(LANGUAGE_KNOWLEDGE_PACKS)) {
     pack.positiveTerms.forEach(add);
     pack.commonPhrases.forEach(add);
+  }
+  // Country knowledge packs are curated, reviewed terminology (for example
+  // `Börsenanalyse`). They are part of the governed lexicon even when the
+  // broader language pack does not repeat them; omitting them demoted an
+  // already-promoted native term on its next lifecycle refresh.
+  for (const pack of Object.values(COUNTRY_KNOWLEDGE_PACKS)) {
+    (pack.nativeTradingTerminology || []).forEach(add);
   }
   return out;
 }

@@ -18,8 +18,10 @@ export interface RunAccountingInput {
   quotaUsed?: number;
   providerDegraded?: boolean;
   failed?: boolean;
-  targetMarketConfirmed?: number;
-  languageMatchedConfirmed?: number;
+  /** Distinct results whose country matched the target market; null = unmeasured. */
+  targetMarketConfirmed?: number | null;
+  /** Distinct results whose language matched; null = unmeasured. */
+  languageMatchedConfirmed?: number | null;
   semanticOverlapResults?: number;
   invalidQuery?: boolean;
 }
@@ -45,7 +47,6 @@ export function buildQueryQualityVector(input: RunAccountingInput): QueryQuality
   const quotaUsed = safe(input.quotaUsed);
   const quotaUnits = quotaUsed / 100;
   const duplicateResults = safe(input.duplicateResults);
-  const countryRejected = safe(input.countryRejected);
   return {
     version: QUERY_QUALITY_VECTOR_VERSION,
     rawResults,
@@ -63,18 +64,15 @@ export function buildQueryQualityVector(input: RunAccountingInput): QueryQuality
     semanticOverlapRatio: ratio(safe(input.semanticOverlapResults), distinctResults),
     invalidQueryRate: input.invalidQuery ? 1 : 0,
     zeroResultRate: rawResults === 0 ? 1 : 0,
-    // An explicit zero is a measurement, not a missing value. Only an absent
-    // input falls back to the conservative aggregate proxy.
-    targetMarketPrecision: ratio(
-      input.targetMarketConfirmed === undefined
-        ? Math.max(0, distinctResults - countryRejected)
-        : safe(input.targetMarketConfirmed),
-      distinctResults,
-    ),
-    languageMatchRate: ratio(
-      input.languageMatchedConfirmed === undefined ? newConfirmedCreators : safe(input.languageMatchedConfirmed),
-      newConfirmedCreators || distinctResults,
-    ),
+    // An explicit zero is a measurement, not a missing value. Absent input is
+    // unmeasured, so report null rather than inventing a proxy that makes the
+    // rate look better than the evidence supports.
+    targetMarketPrecision: input.targetMarketConfirmed === undefined || input.targetMarketConfirmed === null
+      ? null
+      : ratio(safe(input.targetMarketConfirmed), distinctResults),
+    languageMatchRate: input.languageMatchedConfirmed === undefined || input.languageMatchedConfirmed === null
+      ? null
+      : ratio(safe(input.languageMatchedConfirmed), newConfirmedCreators || distinctResults),
     providerDegraded: input.providerDegraded === true,
     failedRun: input.failed === true,
   };

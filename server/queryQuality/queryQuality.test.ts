@@ -32,10 +32,12 @@ import { selectHierarchicalUcb, portfolioBudget, buildHierarchy } from './select
 import { deriveQueryFailureState, isQuerySelectable } from './lifecycle';
 import { buildQueryQualityVector, buildAttribution, canPromoteToProven, isRewardEligibleQuota } from './accounting';
 import { selectQueryCollection } from '../queryPerformance';
+import { decideLifecycle } from '../terminologyIntelligence';
 import { buildQueryQualityDashboard } from './dashboard';
 import { compareSelectors, currentUcb1Index, portfolioPullAdmitted } from './simulator';
 import { verifyFrozenBenchmarkVersions } from '../benchmarkPreregV1';
 import { AUTONOMOUS_QUERY_AUTHORITY_POLICY_VERSION } from '../autonomousQueryAuthority';
+import { CANDIDATE_TRIAGE_POLICY_VERSION } from '../candidateTriage';
 import type { SelectorCandidate, SelectorContext, QueryAdmission, QuerySource } from './types';
 import { buildCanonicalEvidenceCorpus } from '../evidenceEngine/canonicalEvidencePlane';
 import {
@@ -85,6 +87,46 @@ test('Q0: curated/country-vocabulary provenance bypasses only the semantic lexic
   });
   assert.equal(learned.eligible, false);
   assert.ok(learned.reasonCodes.some(reason => reason.includes('NO_LETTERS') || reason.includes('TOO_SHORT')));
+});
+
+test('Q0: curated country-knowledge terms stay searchable and PROVEN across refresh', () => {
+  // `Börsenanalyse` is curated country knowledge, not a phrase from the global
+  // or language packs. It must not be demoted on the next lifecycle refresh.
+  const gate = isSearchableTradingTerm({
+    term: 'Börsenanalyse',
+    termType: 'TERMINOLOGY',
+    country: 'Germany',
+    language: 'de',
+  });
+  assert.equal(gate.eligible, true);
+  const decision = decideLifecycle({
+    current: 'PROVEN_SEARCH_TERM',
+    decayedEvidence: 10,
+    distinctCreators: 5,
+    distinctCommunities: 3,
+    executions: 6,
+    decayedYield: 0.6,
+    termType: 'TERMINOLOGY',
+    term: 'Börsenanalyse',
+    country: 'Germany',
+    language: 'de',
+  });
+  assert.equal(decision.status, 'PROVEN_SEARCH_TERM');
+  assert.equal(decision.searchEligible, true);
+});
+
+test('Q2: legacy compound rows are admitted on the full query, not the bare primary term', () => {
+  // A pre-admission row carries its trading context in `query`; judging the
+  // bare `primary_term` made `CAC 40 trading` speculative and got it rejected
+  // at run time.
+  const decision = admitQueryRecord({
+    query: 'CAC 40 trading',
+    country: 'France',
+    primary_term: 'CAC 40',
+    generation_metadata: {},
+  });
+  assert.equal(decision.eligible, true);
+  assert.notEqual(decision.admission.tier, 'SPECULATIVE');
 });
 
 test('Q2: every planned query for all 16 production countries is admitted (123/123)', () => {
@@ -289,6 +331,29 @@ test('Q4: exhausted portfolio budget cannot be exceeded by coverage or cold-star
   const remaining = selectHierarchicalUcb([cold], selectorContext({ portfolioUnitsUsed: 14, ...coverageDebt }));
   assert.equal(remaining.strategy, 'UCB_PORTFOLIO');
   assert.ok(remaining.queryId);
+});
+
+test('Q4: a mature proven pool exploits even while portfolio budget remains', () => {
+  // Production never supplies attestations, so the old `tier !== ATTESTED_EXACT`
+  // test put every mature query in the portfolio pool and let high-variance
+  // arms win indefinitely. Mature arms without coverage debt must exploit.
+  const mature = [candidate(1, 'family:A', 4, 4), candidate(2, 'family:B', 4, 2)];
+  const decision = selectHierarchicalUcb(mature, selectorContext({
+    portfolioUnitsUsed: 0,
+    coverageCells: ['Germany|de|DE_EQUITIES|family:A'],
+    coveredCells: ['Germany|de|DE_EQUITIES|family:A'],
+  }));
+  assert.equal(decision.strategy, 'UCB_EXPLOITATION');
+  assert.ok(decision.queryId);
+
+  // Coverage debt is still an explicit portfolio reason, even for a mature arm:
+  // the arm occupying the uncovered cell remains portfolio-eligible.
+  const coverageDebt = selectHierarchicalUcb([candidate(1, 'family:B', 4, 4)], selectorContext({
+    portfolioUnitsUsed: 0,
+    coverageCells: ['Germany|de|DE_EQUITIES|family:B'],
+    coveredCells: ['Germany|de|DE_EQUITIES|family:A'],
+  }));
+  assert.equal(coverageDebt.strategy, 'UCB_PORTFOLIO');
 });
 
 test('Q4: share caps are achievable for homogeneous and balanced pools', () => {
@@ -568,6 +633,26 @@ test('Q6: dashboard counts only accounted vectors and reports missing data hones
   assert.equal(dashboard.selection.stopReasonCoverage, 0.5);
   assert.equal(dashboard.portfolio.withinBudget, true);
   assert.deepEqual(dashboard.selection.stopReasons[0], { reason: 'MAX_PAGES_REACHED', count: 1 });
+  assert.equal(dashboard.totals.targetMarketPrecision, 1);
+});
+
+test('Q6: unmeasured market/language metrics report unknown, never 100%', () => {
+  const vector = buildQueryQualityVector({
+    rawResults: 10, distinctResults: 10, newChannels: 4, newConfirmedCreators: 2,
+    newQualityCreators: 1, quotaUsed: 100,
+  });
+  assert.equal(vector.targetMarketPrecision, null);
+  assert.equal(vector.languageMatchRate, null);
+  const dashboard = buildQueryQualityDashboard({
+    generatedAt: '2026-01-01T00:00:00.000Z',
+    portfolio: { dailyQuotaUnits: 100, portfolioUnitsReserved: 15, portfolioUnitsUsed: 12 },
+    rows: [{
+      runId: 'run-unmeasured', queryId: 1, query: 'day trading', country: 'Germany', status: 'COMPLETED',
+      selectionStrategy: 'UCB_EXPLOITATION', selectionReason: 'selected', quotaUsed: 100,
+      completedAt: '2026-01-01T00:00:00.000Z', qualityVector: vector, admission: null,
+    }],
+  });
+  assert.equal(dashboard.totals.targetMarketPrecision, null);
 });
 
 test('Q6: zero-quota runs are separate, stop coverage is completed-only, compatibility markers are not rejections', () => {
@@ -602,9 +687,14 @@ test('Q6: zero-quota runs are separate, stop coverage is completed-only, compati
   assert.deepEqual(dashboard.selection.admissionRejections, [{ reason: 'SPECULATIVE_EVIDENCE_ONLY', count: 1 }]);
 });
 
-test('Q8: frozen benchmark guard requires authority v3 and rejects v2 drift', () => {
+test('Q8: frozen benchmark guard requires authority v3 and triage v5, rejects older drift', () => {
   assert.equal(AUTONOMOUS_QUERY_AUTHORITY_POLICY_VERSION, 'autonomous-query-authority-v3');
+  assert.equal(CANDIDATE_TRIAGE_POLICY_VERSION, 'candidate-triage-v5-latin-market-finance');
   assert.doesNotThrow(() => verifyFrozenBenchmarkVersions());
+  assert.throws(
+    () => verifyFrozenBenchmarkVersions({ candidateTriage: 'candidate-triage-v4-contextual-admission' }),
+    /BENCHMARK_PREREG_VERSION_DRIFT: .*candidateTriage/,
+  );
   assert.throws(
     () => verifyFrozenBenchmarkVersions({ autonomousQueryAuthority: 'autonomous-query-authority-v2' }),
     /BENCHMARK_PREREG_VERSION_DRIFT: .*autonomousQueryAuthority/,
@@ -618,9 +708,13 @@ test('Q5/Q6: production wiring uses accounting-window spend, derived failure sta
   assert.match(intelligence, /getQueryRunReward\(attribution\.queryRunId\)/);
   assert.match(intelligence, /consecutiveFailures: failure\?\.consecutiveFailures/);
   // Promotion and hierarchy learning use the same eligibility as serving and
-  // the dashboard: zero-quota runs cannot supply samples or strata.
-  assert.match(intelligence, /isRewardEligibleQuota\(row\.quotaUnits\)/);
+  // the dashboard: zero-quota runs cannot supply samples or strata, and the
+  // promotion prior must come from peers rather than the arm's own data.
   assert.match(intelligence, /isRewardEligibleQuota\(currentRun\.quotaUnits\)/);
+  assert.match(intelligence, /getQueryQualityDecayedCounts\(country, undefined, DECAY_HALF_LIFE_DAYS\)/);
+  assert.match(intelligence, /getQueryQualityDecayedCounts\(queryRecord\.country, undefined, DECAY_HALF_LIFE_DAYS\)/);
+  assert.match(intelligence, /const prior = empiricalPrior\(peerArms/);
+  assert.match(intelligence, /providerRequestsFailed \|\| 0\) > 0/);
   assert.match(intelligence, /buildHierarchy\(hierarchyCandidates\)/);
   assert.match(intelligence, /hierarchy,\n\s+coverageCells,/);
   // Share totals must be seeded from every query in the accounting window,
@@ -634,6 +728,32 @@ test('Q5/Q6: production wiring uses accounting-window spend, derived failure sta
   assert.match(dbCore, /selection_strategy IN \('UCB_PORTFOLIO','UCB1_EXPLORATION','COLD_START_GENERATION'\)/);
   assert.match(dbCore, /SELECT query,country,generation_metadata FROM query_library/);
   assert.match(dbCore, /\{history,now:new Date\(\)\.toISOString\(\)\}/);
+  // Hot-path history is aggregated in SQL (one row per query), decayed there,
+  // and can be narrowed to a single query id.
+  assert.match(dbCore, /export async function getQueryQualityDecayedCounts/);
+  assert.match(dbCore, /power\(0\.5::float8/);
+  assert.match(dbCore, /GROUP BY qr\.query_id/);
+  assert.match(dbCore, /\$3::int IS NULL OR qr\.query_id=\$3/);
+  // The dashboard must use the configured bounded ratio, not a hard-coded 15%.
+  assert.match(dbCore, /portfolioUnitsReserved:dailyQuotaUnits\*boundedPortfolioRatio\(configuredRatio\)/);
+  // Measured target-market truth and an explicit unknown language metric.
+  assert.match(dbCore, /COUNT\(DISTINCT s\.channel_id\) FILTER \(\s*WHERE s\.country_outcome IN \('CONFIRMED','LIKELY'\)\)/);
+  assert.match(dbCore, /languageMatchedConfirmed: null/);
+
+  const experiments = readFileSync(join(__dirname, '..', 'querySelectionExperiments.ts'), 'utf8');
+  assert.match(experiments, /revalidateQueryRecordAdmission\(query, \{ now: nowIso \}\)\.eligible/);
+
+  const persistentResearch = readFileSync(join(__dirname, '..', 'persistentResearch.ts'), 'utf8');
+  assert.match(persistentResearch, /export async function rejectResearchAction/);
+  assert.match(persistentResearch, /revalidateQueryRecordAdmission\(queryRecord/);
+
+  const autonomousDiscovery = readFileSync(join(__dirname, '..', 'autonomousDiscovery.ts'), 'utf8');
+  assert.match(autonomousDiscovery, /if \(research\) \{\s*await rejectResearchAction\(/);
+
+  const engine = readFileSync(join(__dirname, '..', '..', 'src', 'components', 'QueryIntelligenceEngine.tsx'), 'utf8');
+  assert.match(engine, /qualityDashboardError/);
+  assert.match(engine, /setQualityDashboardError/);
+  assert.match(engine, />\s*Retry\s*</);
 
   const queueManager = readFileSync(join(__dirname, '..', 'queueManager.ts'), 'utf8');
   assert.match(queueManager, /queryRunId, persist: false/);
@@ -729,6 +849,22 @@ test('C5: title-only and retrieval-only inputs never confirm; alternative compos
   });
   assert.equal(nonTrading.state, 'DECISIVE_NON_TRADING');
   assert.equal(nonTrading.semanticPolicy, 'SKIP');
+});
+
+test('C5: only parseable publish dates count as known temporal coverage', () => {
+  const malformed = rawInput({
+    channel_name: 'Alpha Trading',
+    description: 'Day trading, order flow and risk management education.',
+    videos: [{ id: 'bad-date', title: 'Order flow trading setup', published_at: 'not-a-date' }],
+  });
+  assert.equal(buildContextualComposition(malformed).temporalCoverage, 'UNKNOWN');
+
+  const valid = rawInput({
+    channel_name: 'Alpha Trading',
+    description: 'Day trading, order flow and risk management education.',
+    videos: [{ id: 'good-date', title: 'Order flow trading setup', published_at: '2026-01-01T00:00:00.000Z' }],
+  });
+  assert.equal(buildContextualComposition(valid).temporalCoverage, 'KNOWN');
 });
 
 test('C5/C6: explicit creator trading statement confirms; recognition state is deterministic', () => {
@@ -1097,7 +1233,7 @@ test('Q3/Q4: rejected and admission-ineligible candidates never reach quota', ()
   }).selectable, false);
 });
 
-test('Q5: explicit zero market/language counts are honest measurements, not missing data', () => {
+test('Q5: explicit market/language counts are honest; absent input is unknown, not a proxy', () => {
   const measured = buildQueryQualityVector({
     rawResults: 10, distinctResults: 10, newChannels: 3, newConfirmedCreators: 2,
     newQualityCreators: 1, quotaUsed: 100, targetMarketConfirmed: 0, languageMatchedConfirmed: 0,
@@ -1105,12 +1241,14 @@ test('Q5: explicit zero market/language counts are honest measurements, not miss
   assert.equal(measured.targetMarketPrecision, 0);
   assert.equal(measured.languageMatchRate, 0);
 
-  const proxied = buildQueryQualityVector({
+  // Unmeasured metrics must not be filled with invented proxies (0.8 and
+  // 100% respectively) that make the run look better than the evidence.
+  const unmeasured = buildQueryQualityVector({
     rawResults: 10, distinctResults: 10, duplicateResults: 0, newChannels: 3, newConfirmedCreators: 2,
     newQualityCreators: 1, quotaUsed: 100, countryRejected: 2,
   });
-  assert.equal(proxied.targetMarketPrecision, 0.8);
-  assert.equal(proxied.languageMatchRate, 1);
+  assert.equal(unmeasured.targetMarketPrecision, null);
+  assert.equal(unmeasured.languageMatchRate, null);
 });
 
 

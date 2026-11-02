@@ -663,7 +663,7 @@ async function startServer() {
       const country = req.query.country as string | undefined;
       const [rows, portfolio] = await Promise.all([
         getQueryQualityDashboardRows(country),
-        getQueryPortfolioBudgetState(),
+        getQueryPortfolioBudgetState(country),
       ]);
       res.json(buildQueryQualityDashboard({ generatedAt: new Date().toISOString(), portfolio, rows }));
     } catch (err: any) {

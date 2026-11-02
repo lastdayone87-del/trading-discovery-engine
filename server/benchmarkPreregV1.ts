@@ -238,7 +238,7 @@ export function verifyFrozenBenchmarkVersions(
     graphExpansion: 'graph-expansion-v1',
     relationshipCanary: 'relationship-canary-v1',
     autonomousQueryAuthority: 'autonomous-query-authority-v3',
-    candidateTriage: 'candidate-triage-v4-contextual-admission',
+    candidateTriage: 'candidate-triage-v5-latin-market-finance',
   };
   const mismatches = Object.keys(frozen).filter(key => live[key] !== frozen[key]);
   if (BENCHMARK_PREREG_ORDERING_WINDOW_DAYS !== 90) {

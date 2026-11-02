@@ -3,7 +3,10 @@ import type { VerificationDecision } from './evidenceEngine';
 import type { DiscoveredChannelRaw } from './youtube';
 import { uncoveredFailedProviders } from './enrichmentOperationalFailure';
 
-export const CANDIDATE_TRIAGE_POLICY_VERSION = 'candidate-triage-v4-contextual-admission';
+// v5 adds the precision-first Latin-market finance lexicon. The version must
+// move with any triage decision change so the frozen benchmark gate detects
+// drift instead of silently accepting different candidate admissions.
+export const CANDIDATE_TRIAGE_POLICY_VERSION = 'candidate-triage-v5-latin-market-finance';
 
 export type SearchCandidateTriageDisposition = 'PLAUSIBLE_TRADING_HYPOTHESIS' | 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS' | 'NOT_APPLICABLE';
 
@@ -33,7 +36,9 @@ const HIGH_SPECIFICITY_TRADING_SIGNALS: Array<[string, RegExp]> = [
   // must not admit an unrelated creator before the soft-negative check.
   // `borsa di <anything>` also matches ordinary Italian ("borsa di studio",
   // scholarship), so only named exchanges qualify as a high-specificity signal.
-  ['LATIN_MARKET_FINANCE', /\b(b[oö]rse|boerse|bourse|beurs|aandelen|aktien|aktiehandel|aksjer|aksjehandel|osakkeet|osakekaupank[aä]ynti|børs|borsen|gielda|giełda|bolsa\s+de\s+valores|borsa\s+italiana|borsa\s+di\s+(?:milano|tokyo|londra|new\s+york|francoforte|parigi|madrid|zurigo|hong\s+kong)|mercado\s*de\s*valores|investir\s*en\s*bourse|analyse\s*technique|analisi\s*tecnica|an[aá]lisis\s*t[eé]cnico|handelsplan|risikomanagement|risikostyring|riskhantering|risicomanagement|piano\s*di\s*trading|plan\s*de\s*trading|plan\s*de\s*inversi[oó]n)\b/iu]
+  // Bare French `bourse` (scholarship, purse) and Dutch `beurs` (trade fair,
+  // purse) are equally ambiguous, so only qualified market phrases qualify.
+  ['LATIN_MARKET_FINANCE', /\b(b[oö]rse|boerse|aandelen|aktien|aktiehandel|aksjer|aksjehandel|osakkeet|osakekaupank[aä]ynti|børs|borsen|gielda|giełda|bolsa\s+de\s+valores|borsa\s+italiana|borsa\s+di\s+(?:milano|tokyo|londra|new\s+york|francoforte|parigi|madrid|zurigo|hong\s+kong)|mercado\s*de\s*valores|investir\s*en\s*bourse|bourse\s+(?:en\s*ligne|de\s*paris|de\s*bruxelles|de\s*luxembourg|de(?:s)?\s*valeurs?)|analyse\s*boursi[eè]re|cours\s*de\s*bourse|march[eé]\s*boursier|trading\s*boursier|beurs\s*(?:analyse|handel|nieuws|beleggen|strategie|video'?s?)|aandelenbeurs|effectenbeurs|beursbeleggen|beurshandel|analyse\s*technique|analisi\s*tecnica|an[aá]lisis\s*t[eé]cnico|handelsplan|risikomanagement|risikostyring|riskhantering|risicomanagement|piano\s*di\s*trading|plan\s*de\s*trading|plan\s*de\s*inversi[oó]n)\b/iu]
 ];
 
 /**

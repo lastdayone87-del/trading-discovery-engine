@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import {
+  boundedPortfolioRatio,
   computePosterior,
   MAX_SELECTION_INDEX,
   MIN_SELECTION_SAMPLE,
@@ -226,10 +227,15 @@ export function selectHierarchicalUcb(candidates: SelectorCandidate[], context: 
   });
 
   const mature = scored.filter(item => item.candidate.counts.runs >= (context.minSample ?? MIN_SELECTION_SAMPLE));
+  // The portfolio is the exploration floor for immature arms and explicit
+  // coverage debt. Testing `tier !== ATTESTED_EXACT` made every query
+  // portfolio-eligible because production never supplies attestations, so a
+  // mature proven query could lose to a high-variance arm while budget
+  // remained. Maturity and coverage, not the unreachable attestation tier,
+  // decide what still needs exploration.
   const portfolioPool = scored.filter(item =>
-    item.candidate.tier !== 'ATTESTED_EXACT'
-    || item.candidate.counts.runs < (context.minSample ?? MIN_SELECTION_SAMPLE)
-    || (context.coverageCells || []).includes(item.coverageCell) && !(context.coveredCells || []).includes(item.coverageCell)
+    item.candidate.counts.runs < (context.minSample ?? MIN_SELECTION_SAMPLE)
+    || ((context.coverageCells || []).includes(item.coverageCell) && !(context.coveredCells || []).includes(item.coverageCell))
   );
 
   let chosen: CandidateScore;
@@ -305,6 +311,6 @@ export function selectHierarchicalUcb(candidates: SelectorCandidate[], context: 
 }
 
 export function portfolioBudget(totalDailyQuotaUnits: number, ratio = PORTFOLIO_RATIO): { units: number; ratio: number } {
-  const bounded = Math.min(0.20, Math.max(0.10, ratio));
+  const bounded = boundedPortfolioRatio(ratio);
   return { units: Math.max(0, totalDailyQuotaUnits) * bounded, ratio: bounded };
 }

@@ -102,8 +102,10 @@ export interface QueryQualityVector {
   semanticOverlapRatio: number;
   invalidQueryRate: number;
   zeroResultRate: number;
-  targetMarketPrecision: number;
-  languageMatchRate: number;
+  /** Null when the run did not measure target-market membership. */
+  targetMarketPrecision: number | null;
+  /** Null when the run did not measure language matching; never a proxy. */
+  languageMatchRate: number | null;
   providerDegraded: boolean;
   failedRun: boolean;
 }

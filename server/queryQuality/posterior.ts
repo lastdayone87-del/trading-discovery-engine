@@ -4,6 +4,16 @@ export const QUERY_POSTERIOR_VERSION = 'gamma-poisson-hierarchy-v1';
 export const SELECTOR_POLICY_VERSION = 'hierarchical-ucb-v1';
 export const SELECTOR_C = 2.0;
 export const PORTFOLIO_RATIO = 0.15;
+export const PORTFOLIO_MIN_RATIO = 0.10;
+export const PORTFOLIO_MAX_RATIO = 0.20;
+
+/** Clamp a configured portfolio share to the documented 10–20% band. */
+export function boundedPortfolioRatio(value: unknown): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0
+    ? Math.min(PORTFOLIO_MAX_RATIO, Math.max(PORTFOLIO_MIN_RATIO, parsed))
+    : PORTFOLIO_RATIO;
+}
 export const DECAY_HALF_LIFE_DAYS = 30;
 export const MIN_SELECTION_SAMPLE = 2;
 export const MAX_SELECTION_INDEX = 4.0;
