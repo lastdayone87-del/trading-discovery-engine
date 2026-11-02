@@ -47,6 +47,7 @@ import {
   rotateAwayFromMostRecentIntent,
 } from './queryPlanner';
 import { selectNextQueryForCountry } from './queryIntelligence';
+import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
 import { getQueriesByCountry, getAppSetting } from './db';
 import type { QueryRecord } from '../src/types';
 
@@ -908,6 +909,16 @@ export async function selectExperimentalQueryForCountry(
   // deterministic pool order (id ascending) so arm indexes are replay-stable.
   const queries = (await getQueriesByCountry(country)).filter(query => reservableFilter(query, now));
   let eligible = limitRepeatedPrimaryTerms(queriesOutsideCooldown(queries, now, cooldownMinutes), queries, now, cooldownMinutes, maxPrimaryUses);
+  // The experiment pool must obey the exact authority gate the scheduler runs
+  // immediately before execution, including retrieval provenance and the live
+  // scope-promotion decision. Apply it before intent rotation: filtering after
+  // rotation can discard every admission-valid treatment candidate and
+  // silently serve a control fallback. An admission-only check was weaker
+  // than execution authority, so a stale or missing retrieval provenance could
+  // still win the arm and consume the opportunity.
+  eligible = eligible.filter(query => evaluateAutonomousQueryAuthority(query, {
+    scopePromotionActive: options.scopePromotionBasis != null,
+  }).eligible);
   eligible = rotateAwayFromMostRecentIntent(eligible, queries);
   eligible = [...eligible].sort((a, b) => a.id - b.id);
   if (!eligible.length) {

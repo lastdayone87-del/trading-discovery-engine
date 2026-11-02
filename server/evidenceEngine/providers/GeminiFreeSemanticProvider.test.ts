@@ -430,3 +430,28 @@ test('a stalled cooldown lookup terminates inside the classify timeout', async (
     clearGeminiFreeSdkCacheForTests();
   }
 });
+
+test('caller cancellation stops free Gemini route failover before another key', async () => {
+  const controller = new AbortController();
+  const calls: string[] = [];
+  await assert.rejects(runGeminiFreeRouteFailover(
+    [{ id: 'gemini-free-1', key: 'hidden-a' }, { id: 'gemini-free-2', key: 'hidden-b' }],
+    async route => {
+      calls.push(route.id);
+      controller.abort();
+      throw new ProviderCallError('cancelled', 'CANCELLED', true);
+    },
+    { signal: controller.signal },
+  ), (error: any) => error instanceof ProviderCallError && error.errorClass === 'CANCELLED');
+  assert.deepEqual(calls, ['gemini-free-1']);
+});
+
+test('an already-aborted free Gemini caller starts no route', async () => {
+  let calls = 0;
+  await assert.rejects(runGeminiFreeRouteFailover(
+    [{ id: 'gemini-free-1', key: 'hidden-a' }],
+    async () => { calls++; return {}; },
+    { signal: AbortSignal.abort() },
+  ), (error: any) => error instanceof ProviderCallError && error.errorClass === 'CANCELLED');
+  assert.equal(calls, 0);
+});

@@ -99,13 +99,26 @@ function geminiFreeCooldownDeferredError(remainingMs: number): ProviderCallError
   );
 }
 
-export async function runGeminiFreeRouteFailover<T>(routes: GeminiFreeRoute[], call: (route: GeminiFreeRoute) => Promise<T>): Promise<T> {
+export interface GeminiFreeRouteFailoverOptions {
+  /** Caller cancellation: no route may start after this signal aborts. */
+  signal?: AbortSignal;
+}
+
+function geminiFreeFailoverCancelled(signal?: AbortSignal): ProviderCallError {
+  return new ProviderCallError('Free Gemini route failover cancelled by caller.', 'CANCELLED', true, { cause: signal?.reason });
+}
+
+export async function runGeminiFreeRouteFailover<T>(routes: GeminiFreeRoute[], call: (route: GeminiFreeRoute) => Promise<T>, opts?: GeminiFreeRouteFailoverOptions): Promise<T> {
   let lastError: unknown;
   for (const route of routes) {
+    if (opts?.signal?.aborted) throw geminiFreeFailoverCancelled(opts.signal);
     try {
       return await call(route);
     } catch (error) {
       lastError = error;
+      // The caller already abandoned this evaluation; do not advance to
+      // another key (or emit further timeout telemetry) for it.
+      if (opts?.signal?.aborted) throw error;
       // Free-tier rate limits are project-level, not key-level: failing over
       // to another key after a 429 would multiply the burst. Failover remains
       // for other retryable failures such as transient transport errors.
@@ -221,11 +234,18 @@ export function defaultClient(
   const deadlinesEnabled = geminiFreeDeadlinesEnabled();
   const persistedCooldownExpiryMs = deps?.persistedCooldownExpiryMs ?? defaultPersistedCooldownExpiryMs;
   return {
-    classify: async (prompt, model, observability) => {
+    classify: async (prompt, model, observability, signal) => {
       const response = await runGeminiFreeRouteFailover(routes, async route => {
         const started = Date.now();
         const controller = new AbortController();
-        const timer = deadlinesEnabled ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
+        const abortFromCaller = () => controller.abort(signal?.reason);
+        if (signal?.aborted) controller.abort(signal.reason);
+        else signal?.addEventListener('abort', abortFromCaller, { once: true });
+        // Track why the controller aborted: only a deadline expiry is a
+        // TIMEOUT. A caller cancellation must stay CANCELLED in telemetry and
+        // provider reports instead of masquerading as a slow provider.
+        let deadlineExpired = false;
+        const timer = deadlinesEnabled ? setTimeout(() => { deadlineExpired = true; controller.abort(); }, timeoutMs) : undefined;
         const base = {
           id: randomUUID(), provider: 'gemini-free', operation: 'multilingual-semantic-classification',
           ...semanticObservabilityFields(observability),
@@ -264,9 +284,13 @@ export function defaultClient(
           return parsed;
         } catch (error) {
           const aborted = controller.signal.aborted;
-          const typed = aborted
-            ? new ProviderCallError(`Free Gemini call exceeded ${timeoutMs}ms deadline.`, 'TIMEOUT', true, { cause: error })
-            : classifyProviderError(error);
+          const typed = error instanceof ProviderCallError && error.errorClass === 'TIMEOUT'
+            ? error
+            : aborted
+              ? deadlineExpired
+                ? new ProviderCallError(`Free Gemini call exceeded ${timeoutMs}ms deadline.`, 'TIMEOUT', true, { cause: error })
+                : geminiFreeFailoverCancelled(signal)
+              : classifyProviderError(error);
           if (!aborted && typed.errorClass === 'RATE_LIMIT' && (error as { geminiFreeCooldownDeferred?: unknown })?.geminiFreeCooldownDeferred !== true) {
             geminiFreeCooldownUntilMs = Date.now() + geminiFreeRateLimitCooldownMs();
           }
@@ -287,21 +311,22 @@ export function defaultClient(
           throw typed;
         } finally {
           if (timer) clearTimeout(timer);
+          signal?.removeEventListener('abort', abortFromCaller);
         }
-      });
+      }, { signal });
       return response;
     },
   };
 }
 
-async function classifyCandidateWith404Fallback(client: SemanticModelClient, candidatePrompt: string, candidateModel: string, fallbackModel: string, observability?: SemanticObservabilityContext) {
+async function classifyCandidateWith404Fallback(client: SemanticModelClient, candidatePrompt: string, candidateModel: string, fallbackModel: string, observability?: SemanticObservabilityContext, signal?: AbortSignal) {
   try {
-    return { value: await client.classify(candidatePrompt, candidateModel, observability), model: candidateModel, fallbackUsed: false };
+    return { value: await client.classify(candidatePrompt, candidateModel, observability, signal), model: candidateModel, fallbackUsed: false };
   } catch (error) {
     const isModel404 = error instanceof ProviderCallError && error.errorClass === 'PERMANENT_INPUT' && error.status === 404;
     if (!isModel404 || candidateModel === fallbackModel) throw error;
     console.warn('[GeminiFree Semantic] Candidate model returned 404; retrying once with configured adjudicator model.', { candidateModel, fallbackModel });
-    return { value: await client.classify(candidatePrompt, fallbackModel, observability), model: fallbackModel, fallbackUsed: true };
+    return { value: await client.classify(candidatePrompt, fallbackModel, observability, signal), model: fallbackModel, fallbackUsed: true };
   }
 }
 
@@ -317,14 +342,14 @@ export class GeminiFreeSemanticProvider implements EvidenceProvider {
     return { availability: 'AVAILABLE' as const };
   }
 
-  async collectEvidence(input: RawChannelInput, _knowledge: LayeredKnowledgeContext): Promise<EvidenceItem[]> {
+  async collectEvidence(input: RawChannelInput, _knowledge: LayeredKnowledgeContext, signal?: AbortSignal): Promise<EvidenceItem[]> {
     const client = this.client();
     if (!client) return [];
     const candidateModel = process.env.GEMINI_FREE_CANDIDATE_MODEL || DEFAULT_GEMINI_FREE_CANDIDATE_MODEL;
     const adjudicatorModel = process.env.GEMINI_FREE_ADJUDICATOR_MODEL || DEFAULT_GEMINI_FREE_ADJUDICATOR_MODEL;
     const observability = { jobId: input.job_id, runId: input.run_id };
     const candidatePrompt = buildSemanticPrompt(input, 'CANDIDATE');
-    const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel, observability);
+    const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel, observability, signal);
     let result = parseSemanticResult(candidate.value);
     let model = candidate.model;
     const fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
@@ -335,7 +360,7 @@ export class GeminiFreeSemanticProvider implements EvidenceProvider {
     // gemini-2.5-flash-lite, and skipping then would silently disable the
     // flag. Decisive results still cost exactly one call (first conditions).
     if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && process.env.GEMINI_FREE_ADJUDICATION_ENABLED === 'true') {
-      result = parseSemanticResult(await client.classify(buildSemanticPrompt(input, 'ADJUDICATION'), adjudicatorModel, observability)); model = adjudicatorModel;
+      result = parseSemanticResult(await client.classify(buildSemanticPrompt(input, 'ADJUDICATION'), adjudicatorModel, observability, signal)); model = adjudicatorModel;
     }
     const calibrated = calibrateSemanticConfidence(result.confidence);
     const abstained = !result.supportedLanguage || result.label === 'AMBIGUOUS' || calibrated < 50 || result.citations.length === 0;

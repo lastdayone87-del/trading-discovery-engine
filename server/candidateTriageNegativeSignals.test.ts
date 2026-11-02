@@ -40,3 +40,36 @@ test('candidate triage admits explicit trading candidates', () => {
   assert.equal(result.disposition, 'PLAUSIBLE_TRADING_HYPOTHESIS');
   assert.ok(result.reasonCodes.includes('RETRIEVAL_DOCUMENT_HAS_EXPLICIT_TRADING_SIGNAL'));
 });
+
+test('candidate triage does not treat "borsa di studio" as a market signal', () => {
+  const result = triageAutonomousSearchCandidate(candidate('Borsa di studio per studenti italiani'), 'automated_query', false);
+  assert.notEqual(result.disposition, 'PLAUSIBLE_TRADING_HYPOTHESIS');
+  assert.ok(!result.matchedSignals.includes('LATIN_MARKET_FINANCE'));
+});
+
+test('candidate triage still recognizes named Italian exchanges', () => {
+  const result = triageAutonomousSearchCandidate(candidate('Borsa di Milano analisi tecnica'), 'automated_query', false);
+  assert.equal(result.disposition, 'PLAUSIBLE_TRADING_HYPOTHESIS');
+});
+
+test('candidate triage does not treat bare French "bourse" or Dutch "beurs" as market signals', () => {
+  const french = triageAutonomousSearchCandidate(candidate("Bourse d'études pour étudiants français"), 'automated_query', false);
+  assert.notEqual(french.disposition, 'PLAUSIBLE_TRADING_HYPOTHESIS');
+  assert.ok(!french.matchedSignals.includes('LATIN_MARKET_FINANCE'));
+
+  const dutch = triageAutonomousSearchCandidate(candidate('Beurs met tweedehands boeken en curiosa'), 'automated_query', false);
+  assert.notEqual(dutch.disposition, 'PLAUSIBLE_TRADING_HYPOTHESIS');
+  assert.ok(!dutch.matchedSignals.includes('LATIN_MARKET_FINANCE'));
+});
+
+test('candidate triage still recognizes qualified French and Dutch market phrases', () => {
+  const french = triageAutonomousSearchCandidate(candidate('Analyse boursière du CAC 40'), 'automated_query', false);
+  assert.equal(french.disposition, 'PLAUSIBLE_TRADING_HYPOTHESIS');
+  assert.ok(french.matchedSignals.includes('LATIN_MARKET_FINANCE'));
+
+  // No `aandelen`: this must pass only because the qualified Dutch `beurs`
+  // phrase is recognized, so removing that matcher fails the test.
+  const dutch = triageAutonomousSearchCandidate(candidate('Beurs analyse en nieuws'), 'automated_query', false);
+  assert.equal(dutch.disposition, 'PLAUSIBLE_TRADING_HYPOTHESIS');
+  assert.ok(dutch.matchedSignals.includes('LATIN_MARKET_FINANCE'));
+});

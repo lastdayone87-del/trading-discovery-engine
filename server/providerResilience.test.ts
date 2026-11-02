@@ -35,3 +35,16 @@ test('Gemini capacity queries are route-scoped while legacy events remain on rou
   assert.match(source,/COALESCE\(request_metadata->>'geminiRoute',\$1\)=\$1/);
   assert.match(source,/COALESCE\(request_metadata->>'geminiRoute',\$2\)=\$2/);
 });
+
+test('an already-aborted caller never starts a provider call',async()=>{
+  let called=0;
+  const controller=new AbortController(); controller.abort();
+  await assert.rejects(executeProviderCall({
+    context:{provider:'fake',operation:'read'},
+    timeoutMs:50,
+    signal:controller.signal,
+    call:async()=>{called++;return {ok:true}},
+    emit:async()=>undefined,
+  }),(error:any)=>error instanceof ProviderCallError&&error.errorClass==='CANCELLED');
+  assert.equal(called,0);
+});
