@@ -319,6 +319,13 @@ test('base stripping: annotation-xml encoding cannot be spoofed by another attri
   );
   assert.equal(
     stripBaseElements(
+      '<math><annotation-xml title="encoding=\'text&#x2F;html\'" encoding="text/plain"><script><base data-href="/x/"></script></annotation-xml></math>',
+    ),
+    '<math><annotation-xml title="encoding=\'text&#x2F;html\'" encoding="text/plain"><script></script></annotation-xml></math>',
+    'an entity-encoded lookalike inside another value still does not win',
+  );
+  assert.equal(
+    stripBaseElements(
       '<math><annotation-xml encoding=text/html><script>const x = \'<base data-href="/x/">\';</script></annotation-xml></math>',
     ),
     '<math><annotation-xml encoding=text/html><script>const x = \'<base data-href="/x/">\';</script></annotation-xml></math>',
@@ -330,6 +337,26 @@ test('base stripping: annotation-xml encoding cannot be spoofed by another attri
     ),
     '<math><annotation-xml title="a>b" encoding="text/html"><script>const x = \'<base data-href="/x/">\';</script></annotation-xml></math>',
     'a quoted greater-than before encoding does not truncate attribute parsing',
+  );
+});
+
+test('base stripping: annotation-xml encoding character references are decoded', () => {
+  const script = '<script>const x = \'<base data-href="/community/join">\';</script>';
+  for (const encoding of ['text&#x2F;html', 'text&#47;html', 'text&sol;html', '&#116;ext/html', 'APPLICATION&#x2F;XHTML+XML']) {
+    assert.equal(
+      stripBaseElements(
+        `<math><annotation-xml encoding="${encoding}">${script}</annotation-xml></math><base href="/community/"><a href="join">join</a>`,
+      ),
+      `<math><annotation-xml encoding="${encoding}">${script}</annotation-xml></math><a href="join">join</a>`,
+      `encoding="${encoding}" decodes to an HTML MIME type`,
+    );
+  }
+  assert.equal(
+    stripBaseElements(
+      '<math><annotation-xml encoding=" text/html "><script><base data-href="/x/"></script></annotation-xml></math>',
+    ),
+    '<math><annotation-xml encoding=" text/html "><script></script></annotation-xml></math>',
+    'surrounding whitespace prevents the match, as in the HTML parser',
   );
 });
 

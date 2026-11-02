@@ -21,6 +21,23 @@ function trimHtmlWhitespace(value: string): string {
 }
 
 /**
+ * Decode character references the way the HTML parser does before a value is
+ * compared. Entity-encoded MIME types such as `text&#x2F;html`, `text&#47;html`,
+ * `text&sol;html`, or `&#116;ext/html` all mean `text/html` to a browser.
+ * Values without `&` are returned unchanged; the fragment parse only runs for
+ * attribute values that can contain a reference.
+ */
+function decodeAttributeValue(value: string): string {
+  if (!value.includes('&')) return value;
+  try {
+    const escaped = value.replace(/"/g, '&quot;');
+    return cheerio.load(`<i data-v="${escaped}"></i>`)('i').attr('data-v') ?? value;
+  } catch {
+    return value;
+  }
+}
+
+/**
  * First `<base href>` in the HTML namespace, or an empty string.
  *
  * HTML only honors base elements in the HTML namespace; an earlier SVG
@@ -171,7 +188,10 @@ export function stripBaseElements(html: string): string {
         }
       }
       if (attributeName === 'encoding') {
-        const normalized = trimHtmlWhitespace(value).toLowerCase();
+        // Match the decoded value exactly: an ASCII case-insensitive match,
+        // without trimming, as the HTML parser does. `encoding=" text/html "`
+        // stays foreign.
+        const normalized = decodeAttributeValue(value).toLowerCase();
         return normalized === 'text/html' || normalized === 'application/xhtml+xml';
       }
     }
