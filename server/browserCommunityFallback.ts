@@ -1,5 +1,5 @@
 import * as cheerio from 'cheerio';
-import { resolveDocumentBaseUrl } from './documentBase';
+import { resolveDocumentBaseUrlFromRoot } from './documentBase';
 import { assessCrawlAdmission } from './communitySurfacePolicy';
 import { shouldFollowDestination, DISCORD_DESTINATION_HOSTS } from './destinationPolicy';
 import { assessPublicDestination, type DnsResolver } from './publicDestination';
@@ -580,9 +580,14 @@ export function discoverRequiredSeedLinks(seedHtml: string, seedUrl: string): st
     return [];
   }
   let hrefs: string[];
-  const documentBase = resolveDocumentBaseUrl(String(seedHtml || ''), seedUrl);
+  let $: cheerio.CheerioAPI;
   try {
-    const $ = cheerio.load(String(seedHtml || ''));
+    $ = cheerio.load(String(seedHtml || ''));
+  } catch {
+    return [];
+  }
+  const documentBase = resolveDocumentBaseUrlFromRoot($, seedUrl);
+  try {
     hrefs = $('a[href]')
       .map((_, el) => String($(el).attr('href') || '').trim())
       .get()

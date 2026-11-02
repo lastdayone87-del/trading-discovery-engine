@@ -2,6 +2,24 @@ import * as cheerio from 'cheerio';
 
 const HTML_NAMESPACE = 'http://www.w3.org/1999/xhtml';
 
+function isHtmlWhitespace(code: number): boolean {
+  return code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d || code === 0x20;
+}
+
+/**
+ * Trim only the ASCII whitespace HTML strips from URLs. `String.prototype.trim`
+ * also removes characters such as U+00A0 that URL parsing keeps, which would
+ * resolve a base like `"\u00a0/community/"` to a different directory than a
+ * browser does.
+ */
+function trimHtmlWhitespace(value: string): string {
+  let start = 0;
+  let end = value.length;
+  while (start < end && isHtmlWhitespace(value.charCodeAt(start))) start++;
+  while (end > start && isHtmlWhitespace(value.charCodeAt(end - 1))) end--;
+  return value.slice(start, end);
+}
+
 /**
  * First `<base href>` in the HTML namespace, or an empty string.
  *
@@ -18,7 +36,7 @@ function firstHtmlBaseHref($: cheerio.CheerioAPI): string {
     const namespace = (element as { namespace?: string }).namespace;
     if (namespace && namespace !== HTML_NAMESPACE) return;
     found = true;
-    href = String($(element).attr('href') || '').trim();
+    href = trimHtmlWhitespace(String($(element).attr('href') || ''));
     return false;
   });
   return href;
@@ -78,12 +96,16 @@ export function resolveDocumentBaseUrl(html: string, finalUrl: string): string {
  * - only an actual start tag named exactly `base` is removed (`<base-button>`
  *   and attribute text are untouched); foreign `<base>` elements are removed
  *   too because their href is still not a navigation target;
- * - comments (including `--!>` and abrupt closings), declarations, CDATA, and
- *   HTML-namespace raw-text element bodies (script, style, textarea, title,
- *   ...) are skipped so `<base ` inside them cannot delete real controls later
- *   in the document; foreign raw-text-named elements are not treated as HTML
- *   raw text;
- * - quoted attribute values may contain `>`;
+ * - comments (including `--!>` and abrupt closings), declarations, CDATA in
+ *   foreign content, and HTML raw-text element bodies (script, style, textarea,
+ *   title, ...) are skipped so `<base ` inside them cannot delete real controls
+ *   later in the document;
+ * - content stays foreign inside SVG/MathML (`<svg><plaintext>` is not an HTML
+ *   raw-text body), but `<foreignObject>` and MathML text integration points
+ *   switch their descendants back to HTML, so a `<script>` inside them is raw
+ *   text again;
+ * - quoted attribute values may contain `>`, but a quote inside an unquoted
+ *   value does not;
  * - an unclosed base tag consumes the remainder once, and each raw-text body
  *   is scanned once, so malformed repeated input cannot cause quadratic work.
  */
@@ -94,22 +116,52 @@ export function stripBaseElements(html: string): string {
     'script', 'style', 'textarea', 'title', 'xmp', 'iframe',
     'noembed', 'noframes', 'noscript', 'plaintext',
   ]);
+  // HTML integration points: their children are parsed as HTML even though the
+  // element itself is in foreign (SVG/MathML) content.
+  const htmlIntegrationPoints = new Set([
+    'foreignobject', 'mi', 'mo', 'mn', 'ms', 'mtext',
+  ]);
   const isWhitespace = (code: number): boolean =>
     code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d;
   const isNameDelimiter = (code: number): boolean =>
     code === 0x2f || code === 0x3e || isWhitespace(code);
   const lower = (code: number): number => code >= 0x41 && code <= 0x5a ? code | 0x20 : code;
 
-  // Index of the first `>` after `from`, ignoring `>` inside quoted attribute
-  // values. Returns `length` when the tag is unclosed.
+  // Index of the first `>` that ends the tag starting at `from`, ignoring `>`
+  // inside quoted attribute values. Only a quote that opens a value (after `=`)
+  // starts a quoted value: a stray quote in an unquoted value (`href=a'b`) is
+  // an ordinary character and must not keep the scanner in quote mode past a
+  // following real tag. Returns `length` when the tag is unclosed.
   const findTagEnd = (from: number): number => {
     let quote = 0;
+    // 0 = before an attribute name, 1 = before an attribute value (`=` seen),
+    // 2 = inside an unquoted attribute value.
+    let state: 0 | 1 | 2 = 0;
     for (let scan = from; scan < length; scan++) {
       const code = source.charCodeAt(scan);
       if (quote) {
         if (code === quote) quote = 0;
-      } else if (code === 0x22 || code === 0x27) {
-        quote = code;
+        continue;
+      }
+      if (state === 1) {
+        if (isHtmlWhitespace(code)) continue;
+        if (code === 0x22 || code === 0x27) {
+          quote = code;
+          state = 0;
+        } else if (code === 0x3e) {
+          return scan + 1;
+        } else {
+          state = 2;
+        }
+        continue;
+      }
+      if (state === 2) {
+        if (code === 0x3e) return scan + 1;
+        if (isHtmlWhitespace(code)) state = 0;
+        continue;
+      }
+      if (code === 0x3d /* = */) {
+        state = 1;
       } else if (code === 0x3e) {
         return scan + 1;
       }
@@ -129,7 +181,9 @@ export function stripBaseElements(html: string): string {
       const after = source.charCodeAt(dash + 2);
       if (after === 0x3e) return dash + 3;
       if (after === 0x21 && source.charCodeAt(dash + 3) === 0x3e) return dash + 4;
-      scan = dash + 2;
+      // Advance one character, not two: runs of dashes (`<!-- --->`) overlap,
+      // and skipping the shared dash misses the real comment ending.
+      scan = dash + 1;
     }
   };
 
@@ -168,10 +222,14 @@ export function stripBaseElements(html: string): string {
   let output = '';
   let cursor = 0;
   let index = 0;
-  // Foreign-content depth (`svg`/`math`). Raw-text element names are only raw
-  // text in the HTML namespace: `<svg><plaintext>` is a foreign element, not
-  // an HTML plaintext body, so it must not skip the rest of the document.
-  const foreignStack: string[] = [];
+  // HTML content versus foreign (SVG/MathML) content. Raw-text element names
+  // are only raw text in HTML content, and CDATA sections are only recognized
+  // in foreign content. `<svg><plaintext>` is a foreign element, not an HTML
+  // plaintext body, so it must not skip the rest of the document.
+  let inHtmlContent = true;
+  // Context-changing elements only (`svg`, `math`, and HTML integration
+  // points); each frame restores the outer context when it closes.
+  const contextStack: Array<{ name: string; previous: boolean }> = [];
   while (index < length) {
     if (source.charCodeAt(index) !== 0x3c /* < */) {
       index++;
@@ -185,7 +243,10 @@ export function stripBaseElements(html: string): string {
         index = skipComment(index + 4);
         continue;
       }
-      if (source.startsWith('<![CDATA[', index)) {
+      if (!inHtmlContent && source.startsWith('<![CDATA[', index)) {
+        // CDATA sections exist only in foreign content. In HTML content the
+        // same text is a bogus comment that ends at the first `>`, so treating
+        // it as CDATA there would swallow a following real <base>.
         const end = source.indexOf(']]>', index + 9);
         index = end < 0 ? length : end + 3;
         continue;
@@ -212,8 +273,8 @@ export function stripBaseElements(html: string): string {
       for (let offset = index + 2; offset < nameEnd; offset++) {
         closeName += String.fromCharCode(lower(source.charCodeAt(offset)));
       }
-      if ((closeName === 'svg' || closeName === 'math') && foreignStack[foreignStack.length - 1] === closeName) {
-        foreignStack.pop();
+      if (contextStack.length > 0 && contextStack[contextStack.length - 1].name === closeName) {
+        inHtmlContent = contextStack.pop()!.previous;
       }
       index = findTagEnd(nameEnd);
       continue;
@@ -242,12 +303,18 @@ export function stripBaseElements(html: string): string {
       index = tagEnd;
       continue;
     }
-    // Raw-text element names are only raw text in the HTML namespace; a
-    // foreign <plaintext> must not hide the rest of the document.
-    if ((name === 'svg' || name === 'math') && !isSelfClosingTag(tagEnd)) {
-      foreignStack.push(name);
+    // Raw-text element names are only raw text in HTML content; a foreign
+    // <plaintext> must not hide the rest of the document. `<foreignObject>`
+    // and MathML text integration points switch their children back to HTML,
+    // so a script there is raw text again.
+    const selfClosing = isSelfClosingTag(tagEnd);
+    const opensForeign = inHtmlContent && (name === 'svg' || name === 'math');
+    const opensHtml = !inHtmlContent && htmlIntegrationPoints.has(name);
+    if (!selfClosing && (opensForeign || opensHtml)) {
+      contextStack.push({ name, previous: inHtmlContent });
+      inHtmlContent = opensHtml;
     }
-    if (foreignStack.length === 0 && rawTextElements.has(name)) {
+    if (inHtmlContent && rawTextElements.has(name)) {
       // Raw-text content is not parsed as markup. Skip to the matching close
       // tag (or EOF for plaintext / an unclosed element).
       index = findRawTextClose(name, tagEnd);

@@ -838,6 +838,43 @@ test('v2 review: static crawl resolves dynamic targets against the document base
   );
 });
 
+test('v2 review: cross-host <base href> cannot make a static crawl fetch off-host', async () => {
+  const fetched: string[] = [];
+  const result = await crawlExternalLinks(
+    ['https://base.example.com/guide'],
+    [],
+    undefined,
+    (async (input) => {
+      const url = String(input);
+      fetched.push(url);
+      if (url === 'https://base.example.com/guide') {
+        // The cross-host base must not become a target itself, and ordinary
+        // relative links resolve off-host with no community evidence, so the
+        // existing cross-origin policy rejects them.
+        return html(
+          '<base href="https://cdn.example.net/guide/">' +
+            '<a href="page">docs</a>' +
+            '<div data-href="article">article</div>' +
+            '<a href="https://base.example.com/community">c</a>',
+        );
+      }
+      return noInviteHtml();
+    }) as typeof fetch,
+  );
+  assert.ok(
+    !fetched.some((url) => url.includes('cdn.example.net')),
+    'relative anchors and dynamic targets resolve off-host and are not fetched',
+  );
+  assert.ok(
+    !result.rootNavigation?.some((item) => item.url.includes('cdn.example.net')),
+    'no off-host navigation candidate is enqueued',
+  );
+  assert.ok(
+    fetched.includes('https://base.example.com/community'),
+    'an absolute same-host link still works under a cross-host base',
+  );
+});
+
 test('v2 review: base-button elements keep their dynamic community targets', async () => {
   const fetched: string[] = [];
   await crawlExternalLinks(

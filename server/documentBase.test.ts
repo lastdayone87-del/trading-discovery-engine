@@ -184,6 +184,93 @@ test('base stripping: repeated unclosed base tags terminate in one pass', () => 
   assert.equal(stripBaseElements(malformed), '', 'an unclosed base tag consumes the remainder once');
 });
 
+test('document base: only ASCII whitespace is trimmed from the href', () => {
+  // HTML strips ASCII whitespace from a URL, but not U+00A0. Trimming with
+  // String.prototype.trim would silently move the base to a different path.
+  assert.equal(
+    resolveDocumentBaseUrl('<base href="  /community/  ">', PAGE),
+    'https://creator.example.com/community/',
+    'leading and trailing ASCII whitespace is ignored',
+  );
+  assert.equal(
+    resolveDocumentBaseUrl('<base href="\u00a0/community/">', PAGE),
+    new URL('\u00a0/community/', PAGE).toString(),
+    'a leading non-breaking space is preserved exactly as URL parsing sees it',
+  );
+  assert.equal(
+    resolveDocumentBaseUrl('<base href="\u00a0/community/">', PAGE),
+    'https://creator.example.com/%C2%A0/community/',
+  );
+});
+
+test('base stripping: a quote inside an unquoted value does not hide a real base', () => {
+  assert.equal(
+    stripBaseElements('<base href=a\'b><a href="join">join</a>'),
+    '<a href="join">join</a>',
+    'a stray apostrophe in an unquoted value does not start a quoted value',
+  );
+  assert.equal(
+    stripBaseElements('<base href=a"b><a href="join">join</a>'),
+    '<a href="join">join</a>',
+    'a stray double quote in an unquoted value does not start a quoted value',
+  );
+  assert.equal(
+    stripBaseElements('<base href=/community/ data-x=\'a>b\'><a href="join">join</a>'),
+    '<a href="join">join</a>',
+    'a real quoted value still protects a greater-than sign',
+  );
+});
+
+test('base stripping: overlapping comment endings cannot hide a real base', () => {
+  assert.equal(
+    stripBaseElements('<!-- ---><base href="/community/"><a href="join">join</a>'),
+    '<!-- ---><a href="join">join</a>',
+    'a run of dashes still ends at its last -->',
+  );
+  assert.equal(
+    stripBaseElements('<!-- ---!><base href="/community/"><a href="join">join</a>'),
+    '<!-- ---!><a href="join">join</a>',
+    'a run of dashes still ends at its last --!>',
+  );
+});
+
+test('base stripping: foreignObject descendants are HTML content', () => {
+  const page =
+    '<svg><foreignObject><script>const x = "<base ";</script><button data-href="/community/">Join</button></foreignObject></svg><base href="/community/"><a href="join">join</a>';
+  assert.equal(
+    stripBaseElements(page),
+    '<svg><foreignObject><script>const x = "<base ";</script><button data-href="/community/">Join</button></foreignObject></svg><a href="join">join</a>',
+    'a script inside foreignObject is raw text, and a later real base is still stripped',
+  );
+  assert.equal(
+    stripBaseElements(
+      '<math><mtext><script>const x = "<base ";</script></mtext></math><base href="/community/"><a href="join">join</a>',
+    ),
+    '<math><mtext><script>const x = "<base ";</script></mtext></math><a href="join">join</a>',
+    'MathML text integration points are HTML content too',
+  );
+  assert.equal(
+    stripBaseElements(
+      '<svg><foreignObject><svg><script><base href="/inner/"></script></svg></foreignObject><base href="/outer/"></svg>',
+    ),
+    '<svg><foreignObject><svg><script></script></svg></foreignObject></svg>',
+    'a nested SVG inside foreignObject is foreign content again',
+  );
+});
+
+test('base stripping: CDATA is only a section in foreign content', () => {
+  assert.equal(
+    stripBaseElements('<![CDATA[x]]><base href="/community/"><a href="join">join</a>'),
+    '<![CDATA[x]]><a href="join">join</a>',
+    'in HTML content CDATA is a bogus comment ending at the first greater-than',
+  );
+  assert.equal(
+    stripBaseElements('<svg><![CDATA[<base href="/inner/">]]></svg><base href="/outer/"><a href="join">join</a>'),
+    '<svg><![CDATA[<base href="/inner/">]]></svg><a href="join">join</a>',
+    'a foreign CDATA section is skipped and a later real base is stripped',
+  );
+});
+
 test('document base: query and hash are preserved, and the hash never changes relative resolution', () => {
   const base = resolveDocumentBaseUrl('<base href="/community/?ref=1#top">', PAGE);
   assert.equal(base, 'https://creator.example.com/community/?ref=1#top');
