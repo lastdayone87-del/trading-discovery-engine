@@ -310,6 +310,13 @@ export interface BrowserFallbackResult {
    * revealed only after the initial snapshot). Diagnostic, never a gap by
    * itself: newly revealed links classify normally in required coverage. */
   requiredSnapshotExpanded?: boolean;
+  /**
+   * Number of optional cross-origin destinations actually enqueued by this
+   * crawl. Absent when P1.6 is off or nothing was admitted. Outcome
+   * classification only withholds retry from a clean required-covered result
+   * when this is non-zero, so flag-off behavior is unchanged.
+   */
+  crossOriginEnqueued?: number;
 }
 
 export const DEFAULT_BROWSER_FALLBACK_BUDGET: BrowserFallbackBudget = {
@@ -1594,9 +1601,13 @@ export function planRenderedCrossOriginEnqueues(input: {
   const planned = new Set<string>();
   // The pre-click and post-click snapshots overlap: merge them by URL before
   // accounting so an anchor present in both is not counted twice in drop
-  // telemetry (canary monitoring reads these counters). The first occurrence
-  // wins, which preserves the pre-click discovery origin.
-  const seenCandidates = new Set<string>();
+  // telemetry (canary monitoring reads these counters). All labels for a URL
+  // are kept and evaluated together: a weak first anchor ("About") must not
+  // hide a later community label ("Club") for the same destination. The first
+  // occurrence wins for ordering and therefore preserves the pre-click
+  // discovery origin.
+  const grouped = new Map<string, { url: string; labels: string[]; sourceUrl?: string }>();
+  const order: string[] = [];
   for (const candidate of input.candidates) {
     const url = String(candidate.url || '').trim();
     if (!url) {
@@ -1604,8 +1615,22 @@ export function planRenderedCrossOriginEnqueues(input: {
       continue;
     }
     const visitKey = normalizeVisitUrl(url) || url;
-    if (seenCandidates.has(visitKey)) continue;
-    seenCandidates.add(visitKey);
+    const existing = grouped.get(visitKey);
+    if (existing) {
+      const label = String(candidate.text || '').trim();
+      if (label) existing.labels.push(label);
+      continue;
+    }
+    grouped.set(visitKey, {
+      url,
+      labels: String(candidate.text || '').trim() ? [String(candidate.text || '').trim()] : [],
+      sourceUrl: candidate.sourceUrl,
+    });
+    order.push(visitKey);
+  }
+  for (const visitKey of order) {
+    const candidate = grouped.get(visitKey)!;
+    const url = candidate.url;
     // Native invite URLs are terminal evidence retained by the page scan, not
     // navigation surfaces. Skip only those before accounting: redirect
     // shorteners and directory pages carry no native code, so they must pass
@@ -1629,7 +1654,7 @@ export function planRenderedCrossOriginEnqueues(input: {
       // click that navigates to another page must not retroactively make the
       // pre-click snapshot's cross-origin links look same-origin.
       currentUrl: String(candidate.sourceUrl || input.currentUrl),
-      anchorText: String(candidate.text || ''),
+      anchorText: candidate.labels.join(' '),
     })) {
       plan.disallowed++;
       continue;
@@ -3099,6 +3124,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   // separately from alreadyVisitedSet: an enqueued destination is not yet
   // inspected, so it must not satisfy required coverage.
   const crossOriginQueued = new Set<string>();
+  // Count of optional cross-origin requests actually submitted. Used only to
+  // scope the clean-negative retry suppression to runs where P1.6 admitted
+  // work, so flag-off retry/cache behavior is unchanged.
+  let crossOriginEnqueued = 0;
   const discovered:DiscordCandidate[]=[];
   const hostKey = (rawUrl: string): string => {
     try { return new URL(rawUrl).hostname.toLowerCase().replace(/^www\\./, '') || 'unknown'; }
@@ -3258,6 +3287,12 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             await waitForHostBackoff(request.url, remainingMs);
             if (Date.now() - startedAt >= limits.totalTimeoutMs) return;
             telemetry.requestsStarted++;
+            // A P1.6 cross-origin request is optional third-party evidence.
+            // Its own same-host hint passes are skipped: otherwise an admitted
+            // link hub or platform page could enqueue an uncapped number of
+            // its own hint links, consuming maxPages beyond the crawl-wide
+            // cross-origin cap. Its bounded cross-origin pass still runs.
+            const crossOriginRequest = (request.userData as { crossOrigin?: unknown } | undefined)?.crossOrigin === true;
             // A retry replaces the failed attempt's uncertified mark: this
             // attempt re-examines the page from its first control.
             uncertifiedRequestKeys.delete(request.url);
@@ -3719,11 +3754,17 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 alreadyVisited: renderedCrossOriginVisitedIdentities(alreadyVisitedSet, terminalSuccessUrls),
                 queued: crossOriginQueued,
                 maxEnqueues: MAX_RENDERED_CROSS_ORIGIN_ENQUEUES - crossOriginQueued.size,
-                enqueue: async urls => { await enqueueLinks({ urls, strategy: 'all' }); },
+                enqueue: async urls => {
+                  // Tag optional third-party pages so their handler skips the
+                  // uncapped same-host hint passes (the crawl-wide cap bounds
+                  // the whole optional branch, not just the first hop).
+                  await enqueueLinks({ urls, strategy: 'all', userData: { crossOrigin: true } });
+                  crossOriginEnqueued += urls.length;
+                },
                 countDrop: (reason, count) => drops.count(reason, count),
               });
             };
-            if (Date.now() - startedAt < limits.totalTimeoutMs) {
+            if (!crossOriginRequest && Date.now() - startedAt < limits.totalTimeoutMs) {
               await enqueueLinks({ strategy: 'same-hostname', transformRequestFunction: req => (admitEnqueueRequest(req.url) ? req : false) });
             }
             // P1.6: opt-in, bounded cross-origin pass. The anchors are captured
@@ -3835,7 +3876,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // each processed page exposed.
             aggregatePageControlCounters();
 
-            if (Date.now() - startedAt < limits.totalTimeoutMs) {
+            if (!crossOriginRequest && Date.now() - startedAt < limits.totalTimeoutMs) {
               await enqueueLinks({strategy:'same-hostname',transformRequestFunction:req=>(admitEnqueueRequest(req.url)?req:false)});
             }
             await enqueueCrossOrigin();
@@ -4033,6 +4074,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           failureClass:completion.failureClass,
           telemetry,
           dropReasons:drops.snapshot(),
+          crossOriginEnqueued: crossOriginEnqueued || undefined,
           visitedUrls: terminalSuccessUrls.length ? [...terminalSuccessUrls] : undefined,
           pageHintLinks: (() => {
             const record: Record<string, string[]> = {};

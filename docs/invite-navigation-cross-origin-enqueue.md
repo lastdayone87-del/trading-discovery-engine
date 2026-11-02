@@ -43,10 +43,17 @@ replaces the document cannot hide them, but submits only after the post-click
 same-host pass. Each candidate keeps the page URL where it was observed, so a
 click that navigates elsewhere cannot retroactively make the pre-click
 snapshot's cross-origin links look same-origin. The merged pre/post-click
-snapshots are deduplicated by URL before accounting, so an anchor present in
-both states is never counted twice in drop telemetry. Optional destinations
-therefore never take queue positions ahead of JS-revealed required same-host
-links.
+snapshots are deduplicated by URL before accounting (all labels for a URL are
+evaluated together, so a weak first anchor cannot hide a later community
+label), so an anchor present in both states is never counted twice in drop
+telemetry. Optional destinations therefore never take queue positions ahead of
+JS-revealed required same-host links.
+
+Admitted third-party pages are tagged (`userData.crossOrigin = true`) and skip
+their own same-host hint passes when their handler runs. Their bounded
+cross-origin pass still runs, so the crawl-wide cap bounds the whole optional
+branch rather than only the first hop; an admitted link hub cannot enqueue an
+uncapped set of its own hint links and consume `maxPages`.
 
 ## Policy and safety boundary
 
@@ -54,7 +61,13 @@ links.
   admission (scheme/host/resource/SSRF checks), known link-hub/community hosts,
   strong community evidence, and the weak-label rejection stay in force.
 - The cap is per rendered crawl, not per page, so a page with many external
-  links cannot consume the full `maxPages` budget.
+  links cannot consume the full `maxPages` budget. Third-party pages do not
+  fan out through the same-host hint pass, so their child pages cannot bypass
+  the cap either.
+- A clean required-covered negative is explicitly non-retryable only when the
+  run actually admitted cross-origin work (`crossOriginEnqueued > 0`). With
+  P1.6 off, the previous `rendered.retryable || !renderedProcessed` fallback
+  and the 30-day cache behavior are unchanged.
 - Cross-origin destinations are optional evidence. They never become seed
   `required` obligations, which remain same-host community-hint links only.
 - The browser route guard and loopback egress proxy still enforce public

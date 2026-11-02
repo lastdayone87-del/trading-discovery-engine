@@ -769,6 +769,20 @@ test('cross-origin planner keeps each snapshot origin for its candidates', () =>
   assert.equal(withoutOrigin.disallowed, 1);
 });
 
+test('a later strong label admits a URL whose first anchor is weak', () => {
+  const plan = planRenderedCrossOriginEnqueues({
+    candidates: [
+      { url: 'https://outside.example/go', text: 'About', sourceUrl: 'https://creator.example/' },
+      { url: 'https://outside.example/go', text: 'Club', sourceUrl: 'https://creator.example/home' },
+    ],
+    currentUrl: 'https://creator.example/home',
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(plan.admitted, ['https://outside.example/go'], 'the later community label must not be masked');
+  assert.equal(plan.disallowed, 0, 'the destination is decided once, using all labels');
+});
+
 test('merged pre/post-click snapshots count each URL once', () => {
   const plan = planRenderedCrossOriginEnqueues({
     candidates: [
@@ -1201,10 +1215,12 @@ test('outcome classifier source contracts: gap outranks clean resolution and nev
     source,
     /if \(interactionGap\) return \{outcome:'FOUND',failureClass:rendered\.timedOut\?'RENDERED_TIMEOUT':'RENDERED_INTERACTION_GAP',gapRetryable:true\};/,
   );
-  // Required-link coverage never absorbs the gap into a clean absence. The
-  // explicit false keeps optional cross-origin work from owning retry/cache.
-  assert.match(source, /if \(requiredCovered && !interactionGap && !coverageGap\) return \{outcome:'INSPECTED_NO_MATCH',gapRetryable:false\};/);
-  assert.match(source, /if\(rendered\.complete&&renderedProcessed&&!interactionGap&&!coverageGap\)return\{outcome:'INSPECTED_NO_MATCH',gapRetryable:false\};/);
+  // Required-link coverage never absorbs the gap into a clean absence, and the
+  // explicit false is scoped to runs that actually admitted optional
+  // cross-origin work, so flag-off retry/cache behavior is unchanged.
+  assert.match(source, /if \(requiredCovered && !interactionGap && !coverageGap\) return \{outcome:'INSPECTED_NO_MATCH',\.\.\.cleanRetryableOverride\};/);
+  assert.match(source, /if\(rendered\.complete&&renderedProcessed&&!interactionGap&&!coverageGap\)return\{outcome:'INSPECTED_NO_MATCH',\.\.\.cleanRetryableOverride\};/);
+  assert.match(source, /const optionalCrossOriginWork = \(rendered\.crossOriginEnqueued \|\| 0\) > 0;/);
   // Partial/acquisition-failed runs keep the gap class visible for retry.
   assert.match(source, /failureClass:timeoutClass\|\|interactionClass\|\|'RENDERED_PARTIAL_COVERAGE'/);
 });

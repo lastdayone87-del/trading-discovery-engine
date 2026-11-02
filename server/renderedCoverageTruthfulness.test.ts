@@ -331,6 +331,29 @@ test('a transient required-child failure keeps retry ownership in a resolver BOU
   assert.equal(result.gapRetryable, true, 'the failed child can succeed on refetch even though traversal cannot');
 });
 
+test('clean required coverage keeps legacy retryability unless cross-origin work was admitted', () => {
+  const covered = {
+    complete: true,
+    retryable: true,
+    requiredTotal: 1,
+    requiredUnvisited: [],
+    requiredTransientFailures: [],
+    requiredPermanentFailures: [],
+  };
+  // P1.6 off: no admitted cross-origin work reaches the classifier, so the
+  // caller's legacy `rendered.retryable || !renderedProcessed` fallback stays
+  // in force and a transient same-host remainder can still own retry.
+  const legacy = renderedAcquisitionOutcome(rendered(covered), true, []);
+  assert.equal(legacy.outcome, 'INSPECTED_NO_MATCH');
+  assert.equal(legacy.gapRetryable, undefined, 'flag-off behavior must not be narrowed');
+
+  // P1.6 on with admitted optional pages: their pending/failed work must not
+  // make the clean negative retryable or shorten its site-cache TTL.
+  const optional = renderedAcquisitionOutcome(rendered({ ...covered, crossOriginEnqueued: 2 }), true, []);
+  assert.equal(optional.outcome, 'INSPECTED_NO_MATCH');
+  assert.equal(optional.gapRetryable, false);
+});
+
 test('legacy complete results without coverageReason stay clean', () => {
   const result = renderedAcquisitionOutcome(
     rendered({ telemetry: telemetry(undefined) }),

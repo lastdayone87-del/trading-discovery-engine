@@ -613,6 +613,24 @@ test('only native Discord invite URLs are excluded from cross-origin navigation'
   assert.equal(isNativeDiscordInviteUrl('https://notdiscord.gg.example/Abc123'), false);
 });
 
+test('cross-origin requests are tagged and skip uncapped same-host fan-out', () => {
+  const source = fs.readFileSync(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8');
+  assert.ok(
+    source.includes("userData: { crossOrigin: true }"),
+    'optional third-party requests must be identifiable in the handler',
+  );
+  assert.match(
+    source,
+    /const crossOriginRequest = \(request\.userData as \{ crossOrigin\?: unknown \} \| undefined\)\?\.crossOrigin === true;/,
+  );
+  const guardedPasses = [...source.matchAll(/if \(!crossOriginRequest && Date\.now\(\) - startedAt < limits\.totalTimeoutMs\)/g)];
+  assert.equal(
+    guardedPasses.length,
+    2,
+    'both same-host hint passes must be skipped for optional third-party pages',
+  );
+});
+
 test('cross-origin submission is deferred until after the post-click same-host pass', () => {
   const source = fs.readFileSync(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8');
   const clickLoop = source.indexOf('let clickLoop: Awaited<ReturnType<typeof runRenderedClickLoop>>;');
