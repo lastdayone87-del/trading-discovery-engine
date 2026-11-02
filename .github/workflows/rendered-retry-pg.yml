@@ -9,6 +9,7 @@ on:
       - 'server/siteInspectionCache.postgres.test.ts'
       - 'server/queueManager.ts'
       - 'server/dbCore.ts'
+      - 'server/db.ts'
       - 'server/siteInspectionCache.ts'
       - 'server/communityRetryPolicy.ts'
       - 'server/db/migrations/**'

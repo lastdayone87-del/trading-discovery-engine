@@ -139,7 +139,12 @@ export interface RenderedCoverageInput {
   declarativeClosedShadowRootCount?: number;
   /** Main-document responses whose raw body could not be scanned. */
   declarativeShadowScanGap?: number;
-  /** Eligible destinations beyond the bounded collector limit. */
+  /**
+   * Community-relevant destinations beyond the bounded collector limit.
+   * Cross-origin overflow is policy-filtered (plus direct Discord invites) so
+   * unrelated vendor links cannot force BOUNDED; same-origin overflow is
+   * pre-admission.
+   */
   candidateCapTruncated?: number;
   popupTargets?: number;
   /** Allowed same-origin popup destinations captured but left unvisited by a
@@ -433,7 +438,12 @@ export interface CrawlerTelemetry {
   closedShadowRootCount?: number;
   declarativeClosedShadowRootCount?: number;
   declarativeShadowScanGap?: number;
-  /** Eligible destinations beyond the bounded collector limit. */
+  /**
+   * Community-relevant destinations beyond the bounded collector limit.
+   * Cross-origin overflow is policy-filtered (plus direct Discord invites) so
+   * unrelated vendor links cannot force BOUNDED; same-origin overflow is
+   * pre-admission.
+   */
   candidateCapTruncated?: number;
   baseHrefPresent?: boolean;
   /**

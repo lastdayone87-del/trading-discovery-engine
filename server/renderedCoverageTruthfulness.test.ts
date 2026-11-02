@@ -115,14 +115,14 @@ test('required-unvisited work overrides a successful final response and complete
   const state = resolveRenderedCompletionState({
     inspectedPages: 6,
     timedOut: false,
-    telemetry: telemetry('BOUNDED'),
+    telemetry: telemetry('COMPLETE'),
     pageBudgetExhausted: false,
     requiredWorkRemaining: true,
-    coverageReason: 'BOUNDED',
-    coverageRetryable: true,
+    coverageReason: 'COMPLETE',
+    coverageRetryable: false,
   });
   assert.equal(state.complete, false, 'required work still outstanding is never a clean completion');
-  assert.equal(state.retryable, true);
+  assert.equal(state.retryable, true, 'outstanding required work retries even when coverage itself is complete');
 
   const outcome = renderedAcquisitionOutcome(
     rendered({

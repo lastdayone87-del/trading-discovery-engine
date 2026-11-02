@@ -332,6 +332,12 @@ test('real DOM: enumeration separates hint-rejected, structural, icon-label, and
     assert.equal(enumeration.structuralUnrecovered, 0, 'no structural control is left outside the click set');
     assert.equal(enumeration.iconLabelRecovered, 1, 'title-only icon labels are recovered in P1.2');
     assert.equal(enumeration.popupTargets, 1, 'only the dialog control requires popup capture; the href-bearing _blank anchor is navigable');
+    const blankAnchor = enumeration.controls.find(control => control.href?.includes('discord.gg/example'));
+    assert.equal(blankAnchor?.newContext, true, 'a target=_blank anchor opens a new context even when its href is navigable');
+    const sameTabAnchor = enumeration.controls.find(control => control.text.includes('Community') && control.href?.endsWith('/community'));
+    assert.equal(sameTabAnchor?.newContext, false, 'an ordinary same-tab anchor is not a new-context control');
+    const popupControl = enumeration.controls.find(control => control.text.includes('Open menu'));
+    assert.equal(popupControl?.newContext, false, 'aria-haspopup describes an in-page menu/dialog, not a new browsing context');
 
     const context = await page.evaluate(collectRenderedPageContext);
     assert.equal(context.frameCount, 1, 'iframe presence is recorded for P1.4');
@@ -613,5 +619,78 @@ test('real DOM: duplicate existing control markers are made unique', { skip: pro
       await page.locator(`[data-oc-control="${marker}"]`).click();
     }
     assert.deepEqual(await page.evaluate(() => (window as unknown as { clicks: number[] }).clicks), [0, 1]);
+  });
+});
+
+test('real DOM: empty fragment anchors and hidden/disabled widgets are not opaque controls', { skip: process.platform === 'android', timeout: 30_000 }, async () => {
+  await withControlPage(`<!doctype html><html><head><title>opaque fixture</title></head><body>
+    <a name="top"></a>
+    <a id="section"></a>
+    <button hidden><svg width="10" height="10"></svg></button>
+    <button disabled><svg width="10" height="10"></svg></button>
+    <div style="display:none"><button><svg width="10" height="10"></svg></button></div>
+    <button id="visible-icon"><svg width="10" height="10"></svg></button>
+  </body></html>`, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(enumeration.opaqueInteractiveControls, 1,
+      'only the rendered, enabled icon-only control is an unexamined interaction surface');
+  });
+});
+
+test('real DOM: open-shadow walker reports truncation when the light-DOM walk is cut short', { skip: process.platform === 'android', timeout: 30_000 }, async () => {
+  await withControlPage('<!doctype html><html><body><div id="fill"></div></body></html>', async (page) => {
+    await page.evaluate(() => {
+      // Put a host first, then enough light-DOM elements to cut the walk
+      // short. The seen host means more roots may be hidden beyond the bound.
+      const host = document.createElement('div');
+      document.body.insertBefore(host, document.getElementById('fill'));
+      const root = host.attachShadow({ mode: 'open' });
+      root.innerHTML = '<a href="https://discord.gg/DEEP">Discord</a>';
+      const fill = document.getElementById('fill');
+      if (!fill) return;
+      const fragment = document.createDocumentFragment();
+      for (let index = 0; index < 50_001; index++) fragment.appendChild(document.createElement('div'));
+      fill.appendChild(fragment);
+    });
+    const snapshot = await page.evaluate(collectRenderedOpenShadowContent);
+    assert.equal(snapshot.truncated, true,
+      'a cut-short walk after a seen host must make the snapshot partial');
+  });
+});
+
+test('real DOM: a large page cut short is never certified host-free', { skip: process.platform === 'android', timeout: 30_000 }, async () => {
+  await withControlPage('<!doctype html><html><body><div id="fill"></div></body></html>', async (page) => {
+    await page.evaluate(() => {
+      const fill = document.getElementById('fill');
+      if (!fill) return;
+      const fragment = document.createDocumentFragment();
+      for (let index = 0; index < 50_001; index++) fragment.appendChild(document.createElement('div'));
+      fill.appendChild(fragment);
+    });
+    const snapshot = await page.evaluate(collectRenderedOpenShadowContent);
+    assert.equal(snapshot.truncated, true,
+      'the first shadow host can appear beyond the element bound, so an ordinary large page is partial, not a clean absence');
+  });
+});
+
+test('real DOM: the only shadow host after the element bound still reports a gap', { skip: process.platform === 'android', timeout: 30_000 }, async () => {
+  await withControlPage('<!doctype html><html><body><div id="fill"></div></body></html>', async (page) => {
+    await page.evaluate(() => {
+      const fill = document.getElementById('fill');
+      if (!fill) return;
+      const fragment = document.createDocumentFragment();
+      for (let index = 0; index < 50_001; index++) fragment.appendChild(document.createElement('div'));
+      fill.appendChild(fragment);
+      // First (and only) host sits after the 50,000-element discovery bound,
+      // and its invite exists only in the open root. page.content() cannot see
+      // it, so the walker must report truncation rather than clean absence.
+      const host = document.createElement('div');
+      document.body.appendChild(host);
+      host.attachShadow({ mode: 'open' }).innerHTML = '<a href="https://discord.gg/LATE-BOUND">Late invite</a>';
+    });
+    const snapshot = await page.evaluate(collectRenderedOpenShadowContent);
+    assert.equal(snapshot.truncated, true, 'host discovery stopped before the document ended');
+    assert.equal(snapshot.hrefs.some(href => href.includes('LATE-BOUND')), false,
+      'the post-bound invite is not read; the truncation flag is what keeps coverage honest');
   });
 });
