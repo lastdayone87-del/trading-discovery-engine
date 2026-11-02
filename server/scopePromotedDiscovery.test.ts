@@ -84,10 +84,12 @@ for (const country of DORMANT_FIVE) {
   });
 }
 
-test('anchor-less countries stay dormant without selection, sweep once promoted', () => {
-  // Synthetic anchor-less registry entry (no curated atoms exist for it):
-  // without promotion cold start must plan nothing; with promotion it must
-  // plan paired, authority-eligible queries and never a bare standalone.
+test('anchor-less countries stay dormant without selection; promoted pairs still fail closed outside the registry', () => {
+  // Synthetic anchor-less entry (no curated atoms exist for it): without
+  // promotion cold start must plan nothing; with promotion it must plan paired
+  // queries and never a bare standalone. Q0 admission separately rejects
+  // countries outside the supported registry, so a synthetic country can never
+  // pass execution-time authority merely by carrying a promotion marker.
   const vocab: CountryVocabulary = {
     country: 'Testland',
     languages: ['Testish'],
@@ -117,15 +119,18 @@ test('anchor-less countries stay dormant without selection, sweep once promoted'
     const decision = evaluateAutonomousQueryAuthority(
       asQueryRecord(candidate.query, 'Testland', candidate.metadata as Record<string, unknown>)
     );
-    assert.equal(decision.eligible, true, `promoted "${candidate.query}" must pass authority (${decision.reasonCodes.join(',')})`);
+    assert.equal(decision.eligible, false, `synthetic "${candidate.query}" must fail closed outside the registry`);
+    assert.ok(decision.reasonCodes.includes('QUERY_ADMISSION_UNSUPPORTED_COUNTRY'), decision.reasonCodes.join(','));
   }
 });
 
-test('ticker-only anchor-less countries sweep once promoted (pairable short tickers)', () => {
+test('ticker-only anchor-less countries plan pairable promoted pairs but fail closed outside the registry', () => {
   // Regression: the promoted-anchor filter tested the bare ticker alone and
   // rejected it, so a country whose only vocabulary instrument is a short
   // ticker planned nothing even when selected. Tickers stay pairable (as in
   // countryAtoms); the assembled pair still passes the retrieval-shape gate.
+  // The synthetic country itself remains inadmissible because Q0 requires a
+  // supported registry entry.
   const vocab: CountryVocabulary = {
     country: 'Tickland',
     languages: ['Tickish'],
@@ -156,7 +161,8 @@ test('ticker-only anchor-less countries sweep once promoted (pairable short tick
       asQueryRecord(candidate.query, 'Tickland', candidate.metadata as Record<string, unknown>),
       { scopePromotionActive: true },
     );
-    assert.equal(decision.eligible, true, `promoted "${candidate.query}" must pass authority (${decision.reasonCodes.join(',')})`);
+    assert.equal(decision.eligible, false, `synthetic "${candidate.query}" must fail closed outside the registry`);
+    assert.ok(decision.reasonCodes.includes('QUERY_ADMISSION_UNSUPPORTED_COUNTRY'), decision.reasonCodes.join(','));
   }
 });
 

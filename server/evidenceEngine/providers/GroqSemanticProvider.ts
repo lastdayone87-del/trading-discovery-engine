@@ -210,6 +210,12 @@ export interface GroqRouteFailoverOptions {
    */
   deadlineAtMs?: number;
   nowMs?: () => number;
+  /** Caller cancellation: no route may start after this signal aborts. */
+  signal?: AbortSignal;
+}
+
+function groqFailoverCancelled(signal?: AbortSignal): ProviderCallError {
+  return new ProviderCallError('Groq route failover cancelled by caller.', 'CANCELLED', true, { cause: signal?.reason });
 }
 
 export async function runGroqRouteFailover<T>(
@@ -226,6 +232,7 @@ export async function runGroqRouteFailover<T>(
     (a, b) => Number(isCooling(groqRouteOrg(a))) - Number(isCooling(groqRouteOrg(b))),
   );
   for (const route of ordered) {
+    if (opts?.signal?.aborted) throw groqFailoverCancelled(opts.signal);
     if (opts?.deadlineAtMs !== undefined && (opts?.nowMs ?? Date.now)() >= opts.deadlineAtMs) {
       throw lastError || new ProviderCallError('Groq route pool aggregate deadline exhausted.', 'TIMEOUT', true);
     }
@@ -244,6 +251,9 @@ export async function runGroqRouteFailover<T>(
       return await call(route);
     } catch (error) {
       lastError = error;
+      // Caller cancellation is terminal: keep retries for provider timeouts,
+      // but never spend another org's quota on an abandoned evaluation.
+      if (opts?.signal?.aborted) throw error;
       if (error instanceof ProviderCallError && error.errorClass === 'RATE_LIMIT') {
         const failedOrg = failedGroqOrg(error, route);
         // Same-org routes share one quota pool: mark them all tried so the
@@ -681,11 +691,18 @@ export function defaultClient(
   const timeoutMs = groqTimeoutMs();
   const deadlinesEnabled = groqDeadlinesEnabled();
   const persistedCooldownExpiryMs = deps?.persistedCooldownExpiryMs ?? defaultPersistedCooldownExpiryMs;
-  return { classify: async (prompt, model, observability) => {
+  return { classify: async (prompt, model, observability, signal) => {
     const response = await runGroqRouteFailover(routes, async route => {
       const started = Date.now();
       const controller = new AbortController();
-      const timer = deadlinesEnabled ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
+      const abortFromCaller = () => controller.abort(signal?.reason);
+      if (signal?.aborted) controller.abort(signal.reason);
+      else signal?.addEventListener('abort', abortFromCaller, { once: true });
+      // Track why the controller aborted: only a deadline expiry is a
+      // TIMEOUT. A caller cancellation must stay CANCELLED in telemetry and
+      // provider reports instead of masquerading as a slow provider.
+      let deadlineExpired = false;
+      const timer = deadlinesEnabled ? setTimeout(() => { deadlineExpired = true; controller.abort(); }, timeoutMs) : undefined;
       const orgId = groqRouteOrg(route);
       const base = {
         id: randomUUID(), provider: 'groq', operation: 'multilingual-semantic-classification',
@@ -764,9 +781,13 @@ export function defaultClient(
         return parsedContent;
       } catch (error) {
         const aborted = controller.signal.aborted;
-        const typed = aborted
-          ? new ProviderCallError(`Groq call exceeded ${timeoutMs}ms deadline.`, 'TIMEOUT', true, { cause: error })
-          : classifyProviderError(error);
+        const typed = error instanceof ProviderCallError && error.errorClass === 'TIMEOUT'
+          ? error
+          : aborted
+            ? deadlineExpired
+              ? new ProviderCallError(`Groq call exceeded ${timeoutMs}ms deadline.`, 'TIMEOUT', true, { cause: error })
+              : groqFailoverCancelled(signal)
+            : classifyProviderError(error);
         if (!aborted && typed.errorClass === 'RATE_LIMIT' && (error as { groqCooldownDeferred?: unknown })?.groqCooldownDeferred !== true) {
           // Genuine provider 429: arm only this organization's cooldown. The
           // deferred sentinel above is excluded so short-circuits never
@@ -797,20 +818,21 @@ export function defaultClient(
         throw typed;
       } finally {
         if (timer) clearTimeout(timer);
+        signal?.removeEventListener('abort', abortFromCaller);
       }
-    }, { isOrgCooling: orgId => groqOrgCooldownRemainingMs(orgId) > 0 });
+    }, { isOrgCooling: orgId => groqOrgCooldownRemainingMs(orgId) > 0, signal });
     return response;
   }};
 }
 
-async function classifyCandidateWith404Fallback(client: SemanticModelClient, candidatePrompt: string, candidateModel: string, fallbackModel: string, observability?: SemanticObservabilityContext) {
+async function classifyCandidateWith404Fallback(client: SemanticModelClient, candidatePrompt: string, candidateModel: string, fallbackModel: string, observability?: SemanticObservabilityContext, signal?: AbortSignal) {
   try {
-    return { value: await client.classify(candidatePrompt, candidateModel, observability), model: candidateModel, fallbackUsed: false };
+    return { value: await client.classify(candidatePrompt, candidateModel, observability, signal), model: candidateModel, fallbackUsed: false };
   } catch (error) {
     const isModel404 = error instanceof ProviderCallError && error.errorClass === 'PERMANENT_INPUT' && error.status === 404;
     if (!isModel404 || candidateModel === fallbackModel) throw error;
     console.warn('[Groq Semantic] Candidate model returned 404; retrying once with configured adjudicator model.', { candidateModel, fallbackModel });
-    return { value: await client.classify(candidatePrompt, fallbackModel, observability), model: fallbackModel, fallbackUsed: true };
+    return { value: await client.classify(candidatePrompt, fallbackModel, observability, signal), model: fallbackModel, fallbackUsed: true };
   }
 }
 
@@ -883,14 +905,14 @@ export class GroqSemanticProvider implements EvidenceProvider {
     return { availability: 'AVAILABLE' as const };
   }
 
-  async collectEvidence(input: RawChannelInput, _knowledge: LayeredKnowledgeContext): Promise<EvidenceItem[]> {
+  async collectEvidence(input: RawChannelInput, _knowledge: LayeredKnowledgeContext, signal?: AbortSignal): Promise<EvidenceItem[]> {
     const client = this.client();
     if (!client) return [];
     const candidateModel = process.env.GROQ_CANDIDATE_MODEL || DEFAULT_GROQ_CANDIDATE_MODEL;
     const adjudicatorModel = process.env.GROQ_ADJUDICATOR_MODEL || DEFAULT_GROQ_ADJUDICATOR_MODEL;
     const observability = { jobId: input.job_id, runId: input.run_id };
     const candidatePrompt = buildSemanticPrompt(input, 'CANDIDATE');
-    const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel, observability);
+    const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel, observability, signal);
     let result = parseSemanticResult(candidate.value);
     let model = candidate.model;
     const fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
@@ -905,15 +927,19 @@ export class GroqSemanticProvider implements EvidenceProvider {
     let repairedCitations: SemanticModelResult['citations'] | null = null;
     if (isDecisiveButUncited(result)) {
       try {
-        const repaired = parseSemanticResult(await client.classify(buildCitationRepairPrompt(candidatePrompt, result, candidateDocumentRefs(input)), model, observability));
+        const repaired = parseSemanticResult(await client.classify(buildCitationRepairPrompt(candidatePrompt, result, candidateDocumentRefs(input)), model, observability, signal));
         const retained = retainSuppliedCitations(repaired.citations, candidateDocumentRefs(input));
         if (retained.length > 0) {
           result = { ...result, citations: retained };
           repairedCitations = retained;
           repairUsed = true;
         }
-      } catch {
-        // Repair is best-effort: keep the original result, which abstains.
+      } catch (error) {
+        // Repair is best-effort, but cancellation is not a repair failure:
+        // propagate it so canceled work is not reported as a completed
+        // abstention.
+        if (signal?.aborted) throw error;
+        // Keep the original result, which abstains.
       }
     }
     // The repair code marks only results that survive to evidence
@@ -926,7 +952,7 @@ export class GroqSemanticProvider implements EvidenceProvider {
     // on model-name inequality, so identical candidate/adjudicator defaults
     // still adjudicate low-confidence results.
     if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && process.env.MULTILINGUAL_ADJUDICATION_ENABLED === 'true' && !candidate.fallbackUsed) {
-      result = parseSemanticResult(await client.classify(buildSemanticPrompt(input, 'ADJUDICATION'), adjudicatorModel, observability)); model = adjudicatorModel;
+      result = parseSemanticResult(await client.classify(buildSemanticPrompt(input, 'ADJUDICATION'), adjudicatorModel, observability, signal)); model = adjudicatorModel;
     }
     const calibrated = calibrateSemanticConfidence(result.confidence);
     const abstained = !result.supportedLanguage || result.label === 'AMBIGUOUS' || calibrated < 50 || result.citations.length === 0;

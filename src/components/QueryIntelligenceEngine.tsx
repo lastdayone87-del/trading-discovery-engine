@@ -1,5 +1,5 @@
 import { apiFetch } from '../apiClient';
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { QueryRecord, QueryExecutionLog, ExtractedTermRecord, CountryVocabulary, CanonicalTradingTerm } from '../types';
 import { SUPPORTED_DORMANT_COUNTRIES } from '../data/initial_countries';
 import {
@@ -32,11 +32,49 @@ interface Props {
   onManualCycleTriggered?: () => void;
 }
 
+interface QualityDashboardRun {
+  runId: string;
+  queryId: number;
+  query: string;
+  country: string;
+  status: string;
+  selectionStrategy: string;
+  selectionReason: string;
+  stopReason?: string | null;
+  quotaUsed: number;
+  completedAt?: string | null;
+  accounted: boolean;
+  qualityVector: {
+    newConfirmedCreators: number;
+    newQualityCreators: number;
+    confirmedNewCreatorsPer100Quota: number;
+    quotaUnits: number;
+    targetMarketPrecision: number | null;
+    duplicateRatio: number;
+    providerDegraded: boolean;
+  } | null;
+  admission?: { tier?: string; compositionFamily?: string; reasonCodes?: string[]; source?: string; eligible?: boolean } | null;
+}
+
+interface QualityDashboard {
+  version: string;
+  generatedAt: string;
+  portfolio: { dailyQuotaUnits: number; portfolioRatio: number; portfolioUnitsReserved: number; portfolioUnitsUsed: number; countryUnitsUsed: number | null; portfolioShareUsed: number; withinBudget: boolean };
+  totals: { runs: number; completedRuns: number; pendingRuns: number; failedRuns: number; accountedRuns: number; unaccountedCompletedRuns: number; newConfirmedCreators: number; newQualityCreators: number; quotaUnits: number; confirmedNewCreatorsPer100Quota: number; zeroConfirmRuns: number; zeroConfirmShare: number; targetMarketPrecision: number | null; duplicateRatio: number; providerDegradedRuns: number };
+  selection: { strategies: Record<string, number>; stopReasons: Array<{ reason: string; count: number }>; stopReasonCoverage: number; admissionRejections: Array<{ reason: string; count: number }>; admissionTiers: Record<string, number>; compositionFamilies: Record<string, number> };
+  rows: QualityDashboardRun[];
+}
+
 export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }) => {
   const [queries, setQueries] = useState<QueryRecord[]>([]);
   const [extractedVocabulary, setExtractedVocabulary] = useState<ExtractedTermRecord[]>([]);
   const [terminology, setTerminology] = useState<CanonicalTradingTerm[]>([]);
   const [logs, setLogs] = useState<QueryExecutionLog[]>([]);
+  const [qualityDashboardState, setQualityDashboard] = useState<QualityDashboard | null>(null);
+  const [qualityDashboardCountry, setQualityDashboardCountry] = useState<string | null>(null);
+  // A failed dashboard request must surface as an error with retry, not leave
+  // the tab on its loading message forever (apiFetch resolves on 4xx/5xx).
+  const [qualityDashboardError, setQualityDashboardError] = useState<string | null>(null);
   const [status, setStatus] = useState<{
     isRunning: boolean;
     isPaused?: boolean;
@@ -52,11 +90,15 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
   }>({ isRunning: false, isPaused: false, scope: 'GLOBAL', selectedCountries: [] });
 
   const [selectedCountry, setSelectedCountry] = useState<string>('All');
+  // Only expose a projection that belongs to the active filter. The effect
+  // that clears it runs after the country-change render, so gating the view
+  // on the country it was loaded for prevents a one-frame stale country view.
+  const qualityDashboard = qualityDashboardCountry === selectedCountry ? qualityDashboardState : null;
   const [selectedCollection, setSelectedCollection] = useState<string>('ALL');
   const [isCycleRunning, setIsCycleRunning] = useState(false);
   const [isPauseToggling, setIsPauseToggling] = useState(false);
   const [isGeneratingCandidates, setIsGeneratingCandidates] = useState(false);
-  const [activeSubTab, setActiveSubTab] = useState<'library' | 'vocabulary' | 'logs' | 'settings'>('library');
+  const [activeSubTab, setActiveSubTab] = useState<'library' | 'vocabulary' | 'quality' | 'logs' | 'settings'>('library');
 
   // Discovery Scope State
   const [scopeMode, setScopeMode] = useState<'GLOBAL' | 'SELECTED_COUNTRIES'>('GLOBAL');
@@ -65,41 +107,101 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
   const [isSavingScope, setIsSavingScope] = useState(false);
   const [scopeSaveMessage, setScopeSaveMessage] = useState<string | null>(null);
 
+  // Only the latest fetch may commit state. A slower response for a
+  // previously selected country must never overwrite the current filter.
+  const fetchSequence = useRef(0);
+
   // Fetch data
   const fetchData = async () => {
+    const requestId = ++fetchSequence.current;
     try {
-      const [libRes, vocabRes, terminologyRes, logRes, statusRes, scopeRes] = await Promise.all([
-        apiFetch('/api/query-intelligence/library'),
-        apiFetch('/api/query-intelligence/vocabulary'),
-        apiFetch('/api/query-intelligence/terminology'),
-        apiFetch('/api/query-intelligence/logs'),
-        apiFetch('/api/query-intelligence/status'),
-        apiFetch('/api/query-intelligence/scope')
+      const qualityUrl = selectedCountry === 'All'
+        ? '/api/query-intelligence/quality-dashboard'
+        : `/api/query-intelligence/quality-dashboard?country=${encodeURIComponent(selectedCountry)}`;
+      // Isolate every request: a network failure in an unrelated projection
+      // must not discard a healthy quality response and show the wrong error.
+      const [libRes, vocabRes, terminologyRes, logRes, statusRes, scopeRes, qualityRes] = await Promise.all([
+        apiFetch('/api/query-intelligence/library').catch(() => null),
+        apiFetch('/api/query-intelligence/vocabulary').catch(() => null),
+        apiFetch('/api/query-intelligence/terminology').catch(() => null),
+        apiFetch('/api/query-intelligence/logs').catch(() => null),
+        apiFetch('/api/query-intelligence/status').catch(() => null),
+        apiFetch('/api/query-intelligence/scope').catch(() => null),
+        apiFetch(qualityUrl).catch(() => null)
       ]);
 
-      if (libRes.ok) setQueries(await libRes.json());
-      if (vocabRes.ok) setExtractedVocabulary(await vocabRes.json());
-      if (terminologyRes.ok) setTerminology(await terminologyRes.json());
-      if (logRes.ok) setLogs(await logRes.json());
-      if (statusRes.ok) {
-        const statusData = await statusRes.json();
-        setStatus(statusData);
+      if (requestId !== fetchSequence.current) return;
+      const read = (response: Response | null) => response?.ok
+        ? response.json().catch(() => null)
+        : Promise.resolve(null);
+      const [lib, vocab, terminologyData, logData, statusData, scopeData] = await Promise.all([
+        read(libRes),
+        read(vocabRes),
+        read(terminologyRes),
+        read(logRes),
+        read(statusRes),
+        read(scopeRes),
+      ]);
+      // The quality projection carries its own error state: apiFetch resolves
+      // on HTTP 4xx/5xx, so checking `ok` alone would silently drop the error.
+      let quality: QualityDashboard | null = null;
+      let qualityError: string | null = null;
+      if (!qualityRes) {
+        qualityError = 'Unable to reach the query-quality projection.';
+      } else if (qualityRes.ok) {
+        try {
+          quality = await qualityRes.json();
+        } catch {
+          qualityError = 'The query-quality projection returned an unreadable response.';
+        }
+      } else {
+        let detail: string | null = null;
+        try {
+          const body = await qualityRes.json();
+          if (body && typeof body.error === 'string') detail = body.error;
+        } catch {
+          // Non-JSON error bodies fall back to the HTTP status below.
+        }
+        qualityError = detail
+          || `The query-quality projection failed (${qualityRes.status}${qualityRes.statusText ? ` ${qualityRes.statusText}` : ''}).`;
       }
-      if (scopeRes.ok) {
-        const scopeData = await scopeRes.json();
+      // Parsing is asynchronous too; re-check before committing the batch.
+      if (requestId !== fetchSequence.current) return;
+      if (lib) setQueries(lib);
+      if (vocab) setExtractedVocabulary(vocab);
+      if (terminologyData) setTerminology(terminologyData);
+      if (logData) setLogs(logData);
+      if (quality) {
+        setQualityDashboard(quality);
+        setQualityDashboardCountry(selectedCountry);
+        setQualityDashboardError(null);
+      } else {
+        setQualityDashboardError(qualityError);
+      }
+      if (statusData) setStatus(statusData);
+      if (scopeData) {
         setScopeMode(scopeData.scope || 'GLOBAL');
         setScopeCountries(scopeData.selectedCountries || []);
       }
     } catch (err) {
+      if (requestId !== fetchSequence.current) return;
       console.error('Error fetching Query Intelligence data:', err);
+      setQualityDashboardError(
+        err instanceof Error ? err.message : 'Unable to reach the query-intelligence API.'
+      );
     }
   };
 
   useEffect(() => {
+    // The old projection belongs to the previous country filter. Clear it so
+    // stale figures are never shown while the new dashboard request loads.
+    setQualityDashboard(null);
+    setQualityDashboardCountry(null);
+    setQualityDashboardError(null);
     fetchData();
     const interval = setInterval(fetchData, 10000); // refresh every 10s
     return () => clearInterval(interval);
-  }, []);
+  }, [selectedCountry]);
 
   // Handle Pause / Resume toggle
   const handleTogglePause = async () => {
@@ -503,6 +605,18 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
             </button>
 
             <button
+              onClick={() => setActiveSubTab('quality')}
+              className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${
+                activeSubTab === 'quality'
+                  ? 'bg-indigo-600 text-white shadow-xs'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+              }`}
+            >
+              <TrendingUp className="w-3.5 h-3.5" />
+              <span>Quality &amp; Admission</span>
+            </button>
+
+            <button
               onClick={() => setActiveSubTab('logs')}
               className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${
                 activeSubTab === 'logs'
@@ -681,7 +795,149 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
           </div>
         )}
 
-        {/* --- SUB-TAB 3: DISCOVERY CYCLE LOGS --- */}
+        {/* --- SUB-TAB 3: QUALITY & ADMISSION (Q6) --- */}
+        {activeSubTab === 'quality' && (
+          <div className="space-y-4">
+            {!qualityDashboard ? (
+              qualityDashboardError ? (
+                <div className="p-8 text-center border border-dashed border-rose-300 dark:border-rose-800 rounded-2xl space-y-3">
+                  <p className="text-sm font-bold text-rose-600 dark:text-rose-400">Could not load the query-quality projection.</p>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">{qualityDashboardError}</p>
+                  <button
+                    onClick={() => fetchData()}
+                    className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs rounded-xl shadow-lg transition-all cursor-pointer"
+                  >
+                    Retry
+                  </button>
+                </div>
+              ) : (
+                <div className="p-8 text-center text-slate-400 dark:text-slate-500 border border-dashed border-slate-200 dark:border-slate-800 rounded-2xl">
+                  Loading the query-quality projection…
+                </div>
+              )
+            ) : (
+              <>
+                {qualityDashboardError && (
+                  <div className="p-3 text-xs bg-rose-50 dark:bg-rose-900/20 border border-rose-200 dark:border-rose-800 rounded-xl text-rose-700 dark:text-rose-300">
+                    Showing the last successful projection. Refresh failed: {qualityDashboardError}
+                  </div>
+                )}
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  Result-level reward is <strong>globally new, in-scope, target-market confirmed creators per 100 quota</strong>.
+                  Completed runs without a persisted quality vector are reported as unaccounted, never as zero yield. Admission
+                  reasons come from the stored admission; stop reasons come from the persisted page observation.
+                </p>
+
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                  {[
+                    { label: 'Confirmed / 100 quota', value: qualityDashboard.totals.confirmedNewCreatorsPer100Quota.toFixed(2), tone: 'text-emerald-600 dark:text-emerald-400' },
+                    { label: 'New confirmed creators', value: qualityDashboard.totals.newConfirmedCreators, tone: 'text-emerald-600 dark:text-emerald-400' },
+                    { label: 'New quality creators', value: qualityDashboard.totals.newQualityCreators, tone: 'text-indigo-600 dark:text-indigo-400' },
+                    { label: 'Zero-confirm share', value: `${Math.round(qualityDashboard.totals.zeroConfirmShare * 100)}%`, tone: 'text-amber-600 dark:text-amber-400' },
+                    { label: 'Target-market precision', value: qualityDashboard.totals.targetMarketPrecision === null ? 'unknown' : `${Math.round(qualityDashboard.totals.targetMarketPrecision * 100)}%`, tone: 'text-slate-900 dark:text-white' },
+                    { label: 'Duplicate ratio', value: `${Math.round(qualityDashboard.totals.duplicateRatio * 100)}%`, tone: 'text-slate-900 dark:text-white' },
+                    { label: 'Accounted runs', value: `${qualityDashboard.totals.accountedRuns}/${qualityDashboard.totals.completedRuns}`, tone: 'text-slate-900 dark:text-white' },
+                    { label: 'Provider-degraded runs', value: qualityDashboard.totals.providerDegradedRuns, tone: 'text-rose-600 dark:text-rose-400' },
+                    // The budget decision is shared across countries. Show the
+                    // selected country's own spend separately rather than
+                    // comparing it with the global reservation.
+                    ...(qualityDashboard.portfolio.countryUnitsUsed == null ? [] : [{
+                      label: 'Selected-country portfolio units',
+                      value: qualityDashboard.portfolio.countryUnitsUsed.toFixed(2),
+                      tone: 'text-slate-900 dark:text-white',
+                    }]),
+                  ].map(card => (
+                    <div key={card.label} className="p-3 bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700/70 rounded-xl">
+                      <div className="text-[10px] uppercase tracking-wider font-bold text-slate-500 dark:text-slate-400">{card.label}</div>
+                      <div className={`text-lg font-black font-mono ${card.tone}`}>{card.value}</div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-3 text-xs">
+                  <div className="p-3.5 bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700/70 rounded-xl space-y-1.5">
+                    <div className="font-bold text-slate-800 dark:text-slate-200">Portfolio quota</div>
+                    <div className="flex justify-between text-slate-500 dark:text-slate-400"><span>Daily quota units</span><span className="font-mono">{qualityDashboard.portfolio.dailyQuotaUnits.toFixed(0)}</span></div>
+                    <div className="flex justify-between text-slate-500 dark:text-slate-400"><span>Portfolio reserve</span><span className="font-mono">{qualityDashboard.portfolio.portfolioUnitsReserved.toFixed(1)} ({Math.round(qualityDashboard.portfolio.portfolioRatio * 100)}%)</span></div>
+                    <div className="flex justify-between text-slate-500 dark:text-slate-400"><span>Portfolio spent</span><span className="font-mono">{qualityDashboard.portfolio.portfolioUnitsUsed.toFixed(1)}</span></div>
+                    <div className={`font-bold ${qualityDashboard.portfolio.withinBudget ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>
+                      {qualityDashboard.portfolio.withinBudget ? 'Within reserved exploration budget' : 'Exploration budget exceeded'}
+                    </div>
+                  </div>
+
+                  <div className="p-3.5 bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700/70 rounded-xl space-y-1.5">
+                    <div className="font-bold text-slate-800 dark:text-slate-200">Selection strategies</div>
+                    {Object.entries(qualityDashboard.selection.strategies).length === 0 ? (
+                      <div className="text-slate-400">No runs yet.</div>
+                    ) : Object.entries(qualityDashboard.selection.strategies).map(([strategy, count]) => (
+                      <div key={strategy} className="flex justify-between text-slate-500 dark:text-slate-400"><span className="font-mono">{strategy}</span><span className="font-mono font-bold">{count}</span></div>
+                    ))}
+                  </div>
+
+                  <div className="p-3.5 bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700/70 rounded-xl space-y-1.5">
+                    <div className="font-bold text-slate-800 dark:text-slate-200">Stop &amp; admission reasons</div>
+                    {qualityDashboard.selection.stopReasons.length === 0 ? (
+                      <div className="text-slate-400">No persisted stop reason yet.</div>
+                    ) : qualityDashboard.selection.stopReasons.slice(0, 4).map(item => (
+                      <div key={`stop-${item.reason}`} className="flex justify-between text-slate-500 dark:text-slate-400"><span className="truncate pr-2" title={item.reason}>{item.reason}</span><span className="font-mono font-bold">{item.count}</span></div>
+                    ))}
+                    {qualityDashboard.selection.admissionRejections.slice(0, 4).map(item => (
+                      <div key={`adm-${item.reason}`} className="flex justify-between text-amber-600 dark:text-amber-400"><span className="truncate pr-2" title={item.reason}>{item.reason}</span><span className="font-mono font-bold">{item.count}</span></div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="overflow-x-auto rounded-xl border border-slate-200 dark:border-slate-800">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead className="bg-slate-50 dark:bg-slate-800/80 text-slate-600 dark:text-slate-300 font-extrabold uppercase tracking-wider">
+                      <tr>
+                        <th className="p-3">Query / Country</th>
+                        <th className="p-3">Status</th>
+                        <th className="p-3">Strategy</th>
+                        <th className="p-3">Admission</th>
+                        <th className="p-3 text-center">Confirmed / 100</th>
+                        <th className="p-3">Stop reason</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 dark:divide-slate-800 text-slate-700 dark:text-slate-300">
+                      {qualityDashboard.rows.length === 0 ? (
+                        <tr><td colSpan={6} className="p-8 text-center text-slate-400">No query runs recorded yet.</td></tr>
+                      ) : qualityDashboard.rows.slice(0, 50).map(run => (
+                        <tr key={run.runId} className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40">
+                          <td className="p-3">
+                            <div className="font-mono font-semibold text-slate-900 dark:text-white">{run.query || `#${run.queryId}`}</div>
+                            <div className="text-[10px] text-slate-500">{run.country}</div>
+                          </td>
+                          <td className="p-3">
+                            <span className={`px-2 py-0.5 text-[10px] font-bold rounded-md ${
+                              run.status === 'COMPLETED' ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
+                                : run.status === 'FAILED' ? 'bg-rose-100 text-rose-800 dark:bg-rose-950 dark:text-rose-300'
+                                  : 'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300'
+                            }`}>{run.status}</span>
+                            {run.status === 'COMPLETED' && !run.accounted && <div className="text-[10px] text-amber-600 mt-1">unaccounted</div>}
+                          </td>
+                          <td className="p-3 font-mono text-[11px]">{run.selectionStrategy}</td>
+                          <td className="p-3 text-[10px]">
+                            <div className="font-mono">{run.admission?.tier || 'NO ADMISSION'}</div>
+                            <div className="text-slate-500 truncate max-w-[180px]" title={run.admission?.compositionFamily || ''}>{run.admission?.compositionFamily || '—'}</div>
+                          </td>
+                          <td className="p-3 text-center font-mono font-bold">
+                            {run.accounted ? run.qualityVector!.confirmedNewCreatorsPer100Quota.toFixed(2) : '—'}
+                          </td>
+                          <td className="p-3 text-[10px] text-slate-500 max-w-[220px] truncate" title={run.stopReason || run.selectionReason}>
+                            {run.stopReason || '—'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* --- SUB-TAB 4: DISCOVERY CYCLE LOGS --- */}
         {activeSubTab === 'logs' && (
           <div className="space-y-3">
             <p className="text-xs text-slate-500 dark:text-slate-400">

@@ -50,7 +50,33 @@ export async function getAutonomousContinuationState(runId:string, pageNumber?: 
     delayedQualityCreators: Number(delayed.delayed_quality || 0)
   };
 }
-export async function getAutonomousRunMetrics(runId:string):Promise<QueryFunnelMetrics>{const db=await getDb();const r=await db.query('SELECT page_metrics FROM autonomous_query_page_observations WHERE query_run_id=$1 ORDER BY page_number',[runId]);return aggregatePageMetrics(r.rows.map(x=>typeof x.page_metrics==='string'?JSON.parse(x.page_metrics):x.page_metrics));}
+export async function getAutonomousRunMetrics(runId:string):Promise<QueryFunnelMetrics>{
+  const db=await getDb();
+  // Page metrics count distinct creators per page. Summing them overcounts a
+  // channel that appears on several pages, while the reward numerator is
+  // run-wide distinct. Read the run-wide denominator from the same durable
+  // sighting set so the ratio cannot be diluted by cross-page repeats.
+  const [r,sightings]=await Promise.all([
+    db.query('SELECT page_metrics FROM autonomous_query_page_observations WHERE query_run_id=$1 ORDER BY page_number',[runId]),
+    db.query(`SELECT COUNT(DISTINCT channel_id)::int AS distinct_creators,
+      COUNT(DISTINCT channel_id) FILTER (WHERE country_outcome='REJECTED')::int AS country_rejected
+      FROM channel_sightings WHERE query_run_id=$1`,[runId]),
+  ]);
+  const metrics=aggregatePageMetrics(r.rows.map(x=>typeof x.page_metrics==='string'?JSON.parse(x.page_metrics):x.page_metrics));
+  const distinct=Number(sightings.rows[0]?.distinct_creators||0);
+  if(!distinct||distinct===metrics.distinctResults)return metrics;
+  const rejected=Math.min(distinct,Number(sightings.rows[0]?.country_rejected||0));
+  return {
+    ...metrics,
+    distinctResults:distinct,
+    // Keep the rejected count on the same run-wide distinct set as the
+    // denominator: the page sum double-counts cross-page repeats, and
+    // completeQueryRun recomputes precision from these two fields.
+    countryRejected:rejected,
+    noveltyRatio:metrics.newChannels/distinct,
+    countryPrecision:(distinct-rejected)/distinct,
+  };
+}
 
 export function aggregatePageMetrics(pages:QueryFunnelMetrics[]):QueryFunnelMetrics {
   const sum=(key:keyof QueryFunnelMetrics)=>pages.reduce((n,p)=>n+Number(p[key]||0),0);

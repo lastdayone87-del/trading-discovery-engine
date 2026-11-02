@@ -3,11 +3,30 @@
 **Status: PREREGISTRATION ONLY — no benchmark has been executed under this specification.**
 **Do not modify this document after benchmark execution begins. Any change requires a new spec version.**
 
+**Pre-execution revisions (before any benchmark execution):** the
+autonomous query authority constant advanced from `autonomous-query-authority-v2`
+to `autonomous-query-authority-v3` on 2026-10-29 as part of the Q0–Q8
+query-quality admission program, and candidate triage advanced from
+`candidate-triage-v4-contextual-admission` to
+`candidate-triage-v5-latin-market-finance` on 2026-11-02 when the
+precision-first Latin-market signal was added. No benchmark run, observation or
+execution record existed under the earlier values, so these are pre-execution
+corrections rather than post-execution amendments. The same program also
+advanced the serving query selector from the legacy UCB1 branch to
+`hierarchical-ucb-v1` (`query-portfolio-v1`); the UCB1 material in §2 therefore
+describes the frozen experiment control arm, not the new serving path. The spec
+version is unchanged; `verifyFrozenBenchmarkVersions()` now requires v3 and v5
+and continues to fail closed on any other drift.
+
 - Benchmark specification version: `benchmark-preregistration-v1`
 - Engine base commit (merged main after PR #492): `4b49e0c01ac53eebf0080fae29bd6aaabb803cfc`
   (`4b49e0c Merge pull request #492 from lastdayone87-del/feat/engine-completion`)
-- Scope: describes what is actually implemented and executable at the base commit. No imagined future system.
-- Prohibitions during preparation (observed): no benchmark run, no new mechanisms, no tuning, no threshold/prior/weight/horizon/cut/feed/provider/eligibility/assignment changes, no UCB1 changes, no production behavior changes, no global enablement of experimental mechanisms.
+- Pre-execution delta: the revision note above. The frozen system under test is
+  the base commit plus exactly that authority-policy revision (and the Q0–Q8
+  admission program it names); no other system change is in scope.
+- Scope: describes what is actually implemented and executable at the base
+  commit plus the pre-execution delta above. No imagined future system.
+- Prohibitions during preparation (observed): no benchmark run, no new mechanisms, no tuning, no threshold/prior/weight/horizon/cut/feed/provider/eligibility/assignment changes, no changes to the frozen UCB1 control arm, no production behavior changes outside the pre-execution delta, no global enablement of experimental mechanisms.
 
 ## 1. Frozen system under test
 
@@ -29,8 +48,8 @@
 | LLM Assist (P-E) | `llm-assist-v1` | `server/llmAssist.ts:25` |
 | Graph expansion policy (P3) | `graph-expansion-v1`, `GRAPH_MAX_DEPTH=2`, `GRAPH_MAX_FANOUT=10` | `server/graphExpansionPolicy.ts:12-14` |
 | Relationship canary | `relationship-canary-v1`, `MAX_SEEDS=10`, `MAX_DEPTH=2`, `MAX_FANOUT=10`, `MAX_DEPTH2_PARENTS=5`, `MAX_CHANNELS_PER_RUN=150`, `ESTIMATED_DOWNSTREAM_UNITS=305` | `server/relationshipCanary.ts:31-48` |
-| Autonomous query authority | `autonomous-query-authority-v2` | `server/autonomousQueryAuthority.ts:5` |
-| Candidate triage | `candidate-triage-v4-contextual-admission` | `server/candidateTriage.ts:6` |
+| Autonomous query authority | `autonomous-query-authority-v3` (pre-execution revision; `4b49e0c` contains v2) | `server/autonomousQueryAuthority.ts:6` |
+| Candidate triage | `candidate-triage-v5-latin-market-finance` (pre-execution revision) | `server/candidateTriage.ts:9` |
 | DB migrations | 137 files, latest `137_domain_memory.sql` | `server/db/migrations/` |
 | Assignment/hash | sha256 hex slice `(0,8)` mod 10000; no separate salt field exists — assignment identity/version inputs = `policyVersion + experimentId + opportunityKey` (see §6) | `server/querySelectionExperiments.ts:137-139`, `server/retrievalExperiment.ts:114-117` |
 | Feature-gate states | All benchmark-relevant experimental gates default OFF/false/0 (see §3 table); UCB1 control has no gate | §3 |
@@ -41,7 +60,12 @@ Configuration hash method (record at execution, before first observation): `sha2
 
 PR lineage incorporated in base: #486 (frontier P0–P6 testability scaffolding), #488 (adaptive evidence acquisition), #491 (experiment wiring/measurement: pure selection-experiment core, scheduling→execution wiring, benchmark access routes, P-D experiment gate, observation attribution), #492 (engine completion: P3 depth-2 policy evaluation in canary loop shadow-only, P5 adapter registry + gated runner with stubs staying stubs and no fetch loop, P5/P-D/P-E execution-path completion shadow-only default-off, Greptile P1/P2 guards).
 
-## 2. Control (UCB1, unchanged)
+## 2. Control arm (UCB1, frozen experiment control)
+
+The Q0–Q8 program moved the serving selection path
+(`selectNextQueryForCountry`) to the hierarchical UCB selector; the UCB1
+parameters below remain the frozen control arm of the selection experiment.
+No benchmark run, observation or execution record exists under either path.
 
 Implementation: `server/queryIntelligence.ts:selectNextQueryForCountry` (`304-475`); scoring block `359-379`.
 
@@ -234,7 +258,7 @@ Gaps identified (not invented around): no dedicated `benchmark_spec_version` / `
 
 ## 15. Reproducibility contract
 
-A result is reproducible from: engine commit `4b49e0c01ac53eebf0080fae29bd6aaabb803cfc` + spec `benchmark-preregistration-v1` + mechanism versions (§1) + frozen pool snapshot hash (record at execution) + assignment versions + frozen experimentIds and basis points (§3A) + configuration hash + provider versions + provenance records (§12).
+A result is reproducible from: engine commit `4b49e0c01ac53eebf0080fae29bd6aaabb803cfc` + the pre-execution authority revision documented above + spec `benchmark-preregistration-v1` + mechanism versions (§1) + frozen pool snapshot hash (record at execution) + assignment versions + frozen experimentIds and basis points (§3A) + configuration hash + provider versions + provenance records (§12).
 
 Missing pieces today (filled deterministically at execution, not chosen then): pool snapshot export + hash; config-hash dump; provider registry snapshot. The experimentIds, basis points, arms, priors, weights, and window rule are already frozen in §3A — they are not execution-time choices. No result may be declared reproducible without the execution-record items.
 
