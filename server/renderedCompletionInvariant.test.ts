@@ -1019,6 +1019,11 @@ test('rendered detail names a coverage gap instead of reporting completion', () 
     /^Rendered acquisition completed across 2 page\(s\) without an invite; /,
     'legacy results without a reason keep their wording',
   );
+  assert.match(
+    resolveRenderedFallbackDetail({ ...base, candidatesFound: 1, coverageReason: 'BOUNDED' }),
+    /^Rendered fallback retained 1 distinct Discord candidate\(s\) across 2 page\(s\); navigation coverage BOUNDED; /,
+    'a retained invite must still name the unexamined coverage surface',
+  );
   // Branch order: a named stop outranks the coverage-reason branch.
   assert.match(
     resolveRenderedFallbackDetail({ ...base, timedOut: true, coverageReason: 'BOUNDED' }),

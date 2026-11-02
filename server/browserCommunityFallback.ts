@@ -193,7 +193,12 @@ export function resolveRenderedFallbackDetail(input: {
 }): string {
   const summary = browserFallbackTelemetrySummary(input.telemetry);
   if (input.candidatesFound > 0) {
-    return `Rendered fallback retained ${input.candidatesFound} distinct Discord candidate(s) across ${input.inspectedPages} page(s); ${input.telemetry.requestsFailed} request(s) failed within the bounded crawl; ${summary}`;
+    // A retained invite does not make the run clean: keep the unexamined
+    // navigation surface visible in the same detail line.
+    const coverageGap = input.coverageReason !== undefined && input.coverageReason !== 'COMPLETE'
+      ? `; navigation coverage ${input.coverageReason}`
+      : '';
+    return `Rendered fallback retained ${input.candidatesFound} distinct Discord candidate(s) across ${input.inspectedPages} page(s)${coverageGap}; ${input.telemetry.requestsFailed} request(s) failed within the bounded crawl; ${summary}`;
   }
   if (input.timedOut) return `Rendered acquisition budget expired before coverage completed; ${summary}`;
   if (input.telemetry.unresolvedFailedRequests > 0) {
