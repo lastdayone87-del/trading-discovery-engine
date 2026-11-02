@@ -107,6 +107,15 @@ const ageMs = (lastObservedAt: string | null, nowMs: number): number | null => {
  * original crawl's clock and the next borrower recrawls. */
 export function isSiteInspectionReusable(row: CachedSiteInspection | null | undefined, nowMs: number = Date.now()): boolean {
   if (!row || !row.siteIdentity) return false;
+  // A redirect-limit failure inspected no page and deliberately owns no retry
+  // work, so an identical static refetch cannot complete. It is still
+  // incomplete coverage, not a conclusive fact about the destination: a later
+  // inspection must be able to recrawl and reach the normal rendered-
+  // escalation decision (a browser can follow JS/meta navigation the static
+  // follower never saw). Keep the pre-existing 24h window instead of letting
+  // the non-retryable bit promote it to the 30-day clean TTL.
+  const redirectLimitIncomplete = row.outcome === 'ACQUISITION_FAILED'
+    && row.failureClass === 'REDIRECT_LIMIT';
   // A country-rejected crawl discarded this channel's unclaimed candidates
   // without admitting them. Its FOUND observations are still fresh, but they
   // must not become borrowed coverage for an allowed creator: the invite is
@@ -132,9 +141,9 @@ export function isSiteInspectionReusable(row: CachedSiteInspection | null | unde
   if (age === null) return false;
   // Trust-level TTL (E4): retryable rows and partial-coverage rows keep the
   // short 24h window regardless of outcome — retryable negatives,
-  // interaction-gap FOUND rows, and unresolved required gaps must never pin
-  // 30-day "freshness" to incomplete coverage.
-  if (row.retryable === true || row.outcome === 'PARTIALLY_INSPECTED') {
+  // interaction-gap FOUND rows, unresolved required gaps, and redirect-limit
+  // failures must never pin 30-day "freshness" to incomplete coverage.
+  if (row.retryable === true || row.outcome === 'PARTIALLY_INSPECTED' || redirectLimitIncomplete) {
     return age <= SITE_INSPECTION_RETRYABLE_FAILURE_TTL_MS;
   }
   return age <= SITE_INSPECTION_FRESH_TTL_MS;

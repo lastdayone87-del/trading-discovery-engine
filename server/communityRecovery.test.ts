@@ -273,6 +273,15 @@ test('reconciliation uses effective surface precedence so completed no-match cov
   assert.match(source, /WHEN 'PARTIALLY_INSPECTED' THEN 1/);
   assert.match(source, /AND effective\.outcome='ACQUISITION_FAILED'/);
   assert.match(source, /effective\.surface IN\('CHANNEL_EXTERNAL_LINKS','CREATOR_WEBSITES','SOCIAL_PROFILES'/);
+  // Legacy rows persisted before REDIRECT_LIMIT became non-retryable still
+  // carry retryable=true. The sweep must not resurrect a job for them, or the
+  // job runs once more despite the TS predicate excluding the class.
+  assert.match(source, /o\.failure_class/);
+  assert.equal(
+    (source.match(/COALESCE\(effective\.failure_class,''\) <> 'REDIRECT_LIMIT'/g) || []).length,
+    2,
+    'both legacy ownership queries exclude redirect-limit failures',
+  );
   assert.doesNotMatch(source, /DELETE FROM external_acquisition_observations/);
 });
 
