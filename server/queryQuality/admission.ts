@@ -138,17 +138,28 @@ function typedAtoms(metadata: Record<string, any>, record: QueryRecordAdmissionI
   // not get this path.
   const countryNativeOverride = Boolean(metadata.countryNativeAllocation?.decisionId || metadata.countryNativeAllocation?.proposalId);
   const atoms = raw
-    .map((atom, index) => ({
-      term: String(atom.term || '').normalize('NFKC').trim(),
-      role: String(atom.role || (index === 0 ? 'ANCHOR' : 'MODIFIER')).toUpperCase() === 'ANCHOR' ? 'ANCHOR' as const : 'MODIFIER' as const,
-      type: ATOM_TYPE[String(atom.type || '').toUpperCase()] || 'TERMINOLOGY',
-      provenance: countryNativeOverride ? 'COUNTRY_VOCABULARY' : String(atom.origin || source),
-      // Preserve explicit atom scoping when a producer supplies it. Planner
-      // atoms normally omit these fields and inherit the candidate country.
-      country: typeof atom.country === 'string' && atom.country.trim() ? atom.country.trim() : undefined,
-      language: typeof atom.language === 'string' && atom.language.trim() ? atom.language.trim() : language,
-      market,
-    }))
+    .map((atom, index) => {
+      const declaredOrigin = String(atom.origin || '');
+      // The compatibility bridge is assigned only by the zero-atom fallback
+      // below. Provenance is a free-form producer string, so a normal atom
+      // must never be able to opt itself into the legacy token allowance.
+      const atomProvenance = countryNativeOverride
+        ? 'COUNTRY_VOCABULARY'
+        : declaredOrigin && declaredOrigin.toUpperCase() !== 'LEGACY_COMPATIBILITY'
+          ? declaredOrigin
+          : source;
+      return {
+        term: String(atom.term || '').normalize('NFKC').trim(),
+        role: String(atom.role || (index === 0 ? 'ANCHOR' : 'MODIFIER')).toUpperCase() === 'ANCHOR' ? 'ANCHOR' as const : 'MODIFIER' as const,
+        type: ATOM_TYPE[String(atom.type || '').toUpperCase()] || 'TERMINOLOGY',
+        provenance: atomProvenance,
+        // Preserve explicit atom scoping when a producer supplies it. Planner
+        // atoms normally omit these fields and inherit the candidate country.
+        country: typeof atom.country === 'string' && atom.country.trim() ? atom.country.trim() : undefined,
+        language: typeof atom.language === 'string' && atom.language.trim() ? atom.language.trim() : language,
+        market,
+      };
+    })
     .filter(atom => atom.term.length > 0);
   if (atoms.length > 0) {
     // The planner's first atom is always the anchor. Preserve that invariant

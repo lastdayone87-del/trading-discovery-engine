@@ -3109,6 +3109,37 @@ export async function scheduleAutonomousQueryRuns(
       // Quota-free providers (YouTube.js/InnerTube) reserve 0 official units;
       // the official YouTube path keeps its 100-unit page reservation.
       const scheduledProviderUnits = allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE' ? 0 : 100;
+
+      // Selection is an advisory snapshot, so the first page's portfolio
+      // reservation is enforced again here, atomically with the run insert.
+      // Without this, two concurrent selectors could both observe one
+      // remaining unit and reserve 100 units each. The advisory lock is the
+      // same one continuation pages use, so first and later pages share one
+      // budget. Quota-free runs spend no official units and skip the check.
+      const portfolioRunStrategy = ['UCB_PORTFOLIO','UCB1_EXPLORATION','COLD_START_GENERATION'].includes(String(candidate.strategy))
+        || String(candidate.reason || '').startsWith('Bounded portfolio');
+      if (portfolioRunStrategy && scheduledProviderUnits > 0) {
+        await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, ['query-portfolio-budget']);
+        const [portfolioQuota, portfolioUsed, portfolioRatioSetting] = await Promise.all([
+          client.query(`SELECT daily_limit FROM quota_tracker WHERE id='youtube'`),
+          client.query(PORTFOLIO_UNITS_SQL),
+          client.query(`SELECT setting_value FROM app_settings WHERE setting_key='query_intelligence_portfolio_ratio'`),
+        ]);
+        const dailyQuotaUnits = Math.max(1, Number(portfolioQuota.rows[0]?.daily_limit || 10000) / 100);
+        const portfolioUnitsReserved = dailyQuotaUnits * boundedPortfolioRatio(
+          portfolioRatioSetting.rows[0]?.setting_value ?? process.env.QUERY_INTELLIGENCE_PORTFOLIO_RATIO ?? '0.15',
+        );
+        const portfolioUnitsUsed = Math.max(0, Number(portfolioUsed.rows[0]?.units || 0));
+        if (!portfolioContinuationAllowed({ portfolioUnitsUsed, portfolioUnitsReserved, nextPageUnits: scheduledProviderUnits / 100 })) {
+          if (canaryReservationId) {
+            await releaseRetrievalCanaryReservation(canaryReservationId, 'PORTFOLIO_BUDGET_EXHAUSTED', client);
+          }
+          await client.query(`UPDATE query_library SET reserved_at=NULL,reserved_until=NULL,reserved_by=NULL WHERE id=$1`, [candidate.query.id]);
+          flushDiagnostic({ selectedQueryId: candidate.query.id, provider: { providerKey: allocatedProvider.providerKey, capability: allocatedProvider.capability, quotaDomain: allocatedProvider.costDomain }, reservationOutcome: 'SKIPPED', reservationReasonCode: 'PORTFOLIO_BUDGET_EXHAUSTED', disposition: 'SKIPPED', reasonCode: 'PORTFOLIO_BUDGET_EXHAUSTED' });
+          continue;
+        }
+      }
+
       // Opt-in canary-trial initiation. The existing gate (kill switch, caps,
       // protections) stays fail-closed inside initiateCanaryTrial; a rejection
       // or error here is recorded on the run but never fails scheduling.

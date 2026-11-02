@@ -76,16 +76,16 @@ const ambiguousRecognition = (): RecognitionAssessment => ({
   reasonCodes: [],
   composition: {
     focus: 'MIXED',
-    observedFamilies: 1,
-    tradingFamilies: 0,
+    observedFamilies: 2,
+    tradingFamilies: 1,
     alternativeFamilies: 1,
     neutralFamilies: 0,
-    tradingCoverage: 0,
-    alternativeCoverage: 1,
+    tradingCoverage: 0.5,
+    alternativeCoverage: 0.5,
     temporalCoverage: 'KNOWN',
     nonTitleTierAFamilies: 0,
     explicitCreatorTrading: false,
-    explicitCreatorAlternative: true,
+    explicitCreatorAlternative: false,
   },
 });
 

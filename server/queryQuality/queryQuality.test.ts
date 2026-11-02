@@ -180,6 +180,37 @@ test('Q2: legacy rows longer than three query tokens keep admission within a bou
   assert.ok(overlong.reasonCodes.includes('TERM_TOO_MANY_TOKENS'));
 });
 
+test('Q2: producer provenance cannot opt into the legacy token allowance', () => {
+  // `origin` is free-form producer metadata. Only the zero-atom compatibility
+  // fallback may claim LEGACY_COMPATIBILITY; a normal atom that supplies it
+  // must still obey the three-token composition limit.
+  const forged = admitQueryRecord({
+    query: 'CAC 40 trading pour débutants',
+    country: 'France',
+    primary_term: 'CAC 40',
+    generation_metadata: {
+      atoms: [{ term: 'CAC 40 trading pour débutants', role: 'ANCHOR', type: 'TERMINOLOGY', origin: 'LEGACY_COMPATIBILITY' }],
+    },
+  });
+  assert.equal(forged.eligible, false);
+  assert.ok(forged.reasonCodes.includes('TOO_MANY_TOKENS'));
+});
+
+test('Q2: a mixed candidate cannot borrow the legacy composition limit', () => {
+  const mixed = buildQueryCandidate({
+    query: 'CAC 40 trading pour débutants bourse',
+    country: 'France',
+    atoms: [
+      { term: 'CAC 40 trading pour débutants', role: 'ANCHOR', type: 'TERMINOLOGY', provenance: 'LEGACY_COMPATIBILITY' },
+      { term: 'bourse', role: 'MODIFIER', type: 'TERMINOLOGY', provenance: 'CURATED' },
+    ],
+    source: 'CURATED',
+  });
+  const decision = evaluateQueryComposition(mixed);
+  assert.equal(decision.eligible, false);
+  assert.ok(decision.reasonCodes.includes('TOO_MANY_TOKENS'));
+});
+
 test('Q2: every planned query for all 16 production countries is admitted (123/123)', () => {
   let total = 0;
   let admitted = 0;
@@ -1398,6 +1429,13 @@ test('Q4: continuation is authorized page by page against the shared portfolio f
   assert.match(queue, /reservePortfolioContinuationPage\(\{/);
   assert.match(queue, /pageNumber: pageNumber \+ 1/);
   assert.match(queue, /Number\.isFinite\(configuredMaxPages\)/);
+  const dbCore = readFileSync(join(__dirname, '..', 'dbCore.ts'), 'utf8');
+  // The first page is checked atomically at the scheduling boundary, under
+  // the same lock as continuation pages, so concurrent selectors cannot both
+  // spend the last unit.
+  assert.match(dbCore, /const portfolioRunStrategy = \[/);
+  assert.match(dbCore, /nextPageUnits: scheduledProviderUnits \/ 100/);
+  assert.match(dbCore, /reservationReasonCode: 'PORTFOLIO_BUDGET_EXHAUSTED'/);
 });
 
 test('Q4: simulator portfolio admission is quota-weighted, not pull-weighted', () => {

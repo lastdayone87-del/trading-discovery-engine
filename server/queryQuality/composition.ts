@@ -245,7 +245,11 @@ export function evaluateQueryComposition(candidate: QueryCandidate, context: Com
   const reasons: string[] = [];
   const normalized = normalizeCompositionTerm(candidate.query);
   const tokens = queryCompositionTokens(normalized);
-  const legacyCompatibility = candidate.atoms.some(atom => atom.provenance === 'LEGACY_COMPATIBILITY');
+  // The legacy bridge is exactly one whole-query atom. A mixed candidate that
+  // happens to carry a marked atom must not inherit the extended limit.
+  const legacyCompatibility = candidate.atoms.length === 1
+    && candidate.atoms[0].provenance === 'LEGACY_COMPATIBILITY'
+    && normalizeCompositionTerm(candidate.atoms[0].term) === normalized;
 
   if (!isRegisteredCountry(candidate.country)) reasons.push('UNSUPPORTED_COUNTRY');
   if (!normalized || tokens.length === 0) reasons.push('EMPTY_QUERY');
