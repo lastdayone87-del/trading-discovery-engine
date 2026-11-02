@@ -113,7 +113,9 @@ export const COUNTRY_MARKET_PROFILES: Record<string, CountryMarketProfile> = Obj
 export function getCountryMarketProfile(country: string): CountryMarketProfile {
   // Unknown countries must fail closed. An English/Latn fallback would let a
   // country outside the production registry pass language and market checks.
-  return COUNTRY_MARKET_PROFILES[country] || {
+  // `Object.hasOwn` also prevents prototype keys such as "constructor" from
+  // resolving to inherited Object.prototype members.
+  return Object.hasOwn(COUNTRY_MARKET_PROFILES, country) ? COUNTRY_MARKET_PROFILES[country] : {
     country,
     languages: [],
     scripts: [],

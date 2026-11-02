@@ -110,7 +110,10 @@ function scriptsOf(value: string): Set<string> {
   const out = new Set<string>();
   for (const char of normalize(value)) {
     if (!/\p{L}/u.test(char)) continue;
-    out.add(SCRIPT_PATTERNS.find(([, pattern]) => pattern.test(char))?.[0] || 'Zyyy');
+    // An unclassified letter must not be treated as Common: `Zyyy` is
+    // accepted by every configured script profile. `Zzzz` (unknown) fails
+    // closed in scriptCompatible.
+    out.add(SCRIPT_PATTERNS.find(([, pattern]) => pattern.test(char))?.[0] || 'Zzzz');
   }
   return out;
 }
@@ -222,7 +225,9 @@ export function isSearchableTradingTerm(input: SearchabilityInput): Searchabilit
   const add = (reason: string) => { if (!reasons.includes(reason)) reasons.push(reason); };
   const termType = String(input.termType || 'TERMINOLOGY').toUpperCase();
 
-  if (MATH_ALPHANUMERIC.test(normalizedTerm) || letters.length === 0) add('no-letters');
+  // Math-alphanumeric characters fold to ASCII under NFKC, so the raw input
+  // must be checked: `𝕗𝕠𝕣𝕖𝕩` must not become `forex`.
+  if (MATH_ALPHANUMERIC.test(String(input.term || '')) || letters.length === 0) add('no-letters');
   if ([...normalizedTerm].length < 2) add('too-short');
   if (termType === 'BRAND') add('brand');
   if (!['TERMINOLOGY', 'INSTRUMENT', 'PHRASE', 'FORMAT', 'BRAND'].includes(termType)) add('ineligible-type');

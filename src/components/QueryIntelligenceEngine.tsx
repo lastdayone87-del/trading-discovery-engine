@@ -1,5 +1,5 @@
 import { apiFetch } from '../apiClient';
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { QueryRecord, QueryExecutionLog, ExtractedTermRecord, CountryVocabulary, CanonicalTradingTerm } from '../types';
 import { SUPPORTED_DORMANT_COUNTRIES } from '../data/initial_countries';
 import {
@@ -99,8 +99,13 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
   const [isSavingScope, setIsSavingScope] = useState(false);
   const [scopeSaveMessage, setScopeSaveMessage] = useState<string | null>(null);
 
+  // Only the latest fetch may commit state. A slower response for a
+  // previously selected country must never overwrite the current filter.
+  const fetchSequence = useRef(0);
+
   // Fetch data
   const fetchData = async () => {
+    const requestId = ++fetchSequence.current;
     try {
       const qualityUrl = selectedCountry === 'All'
         ? '/api/query-intelligence/quality-dashboard'
@@ -115,26 +120,38 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
         apiFetch(qualityUrl)
       ]);
 
-      if (libRes.ok) setQueries(await libRes.json());
-      if (vocabRes.ok) setExtractedVocabulary(await vocabRes.json());
-      if (terminologyRes.ok) setTerminology(await terminologyRes.json());
-      if (logRes.ok) setLogs(await logRes.json());
-      if (qualityRes.ok) setQualityDashboard(await qualityRes.json());
-      if (statusRes.ok) {
-        const statusData = await statusRes.json();
-        setStatus(statusData);
-      }
-      if (scopeRes.ok) {
-        const scopeData = await scopeRes.json();
+      if (requestId !== fetchSequence.current) return;
+      const [lib, vocab, terminologyData, logData, statusData, scopeData, quality] = await Promise.all([
+        libRes.ok ? libRes.json() : null,
+        vocabRes.ok ? vocabRes.json() : null,
+        terminologyRes.ok ? terminologyRes.json() : null,
+        logRes.ok ? logRes.json() : null,
+        statusRes.ok ? statusRes.json() : null,
+        scopeRes.ok ? scopeRes.json() : null,
+        qualityRes.ok ? qualityRes.json() : null,
+      ]);
+      // Parsing is asynchronous too; re-check before committing the batch.
+      if (requestId !== fetchSequence.current) return;
+      if (lib) setQueries(lib);
+      if (vocab) setExtractedVocabulary(vocab);
+      if (terminologyData) setTerminology(terminologyData);
+      if (logData) setLogs(logData);
+      if (quality) setQualityDashboard(quality);
+      if (statusData) setStatus(statusData);
+      if (scopeData) {
         setScopeMode(scopeData.scope || 'GLOBAL');
         setScopeCountries(scopeData.selectedCountries || []);
       }
     } catch (err) {
+      if (requestId !== fetchSequence.current) return;
       console.error('Error fetching Query Intelligence data:', err);
     }
   };
 
   useEffect(() => {
+    // The old projection belongs to the previous country filter. Clear it so
+    // stale figures are never shown while the new dashboard request loads.
+    setQualityDashboard(null);
     fetchData();
     const interval = setInterval(fetchData, 10000); // refresh every 10s
     return () => clearInterval(interval);

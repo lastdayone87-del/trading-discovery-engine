@@ -18,6 +18,17 @@ import { assessRecognitionState } from './recognitionState';
 import type { ContextualCompositionReport } from './contextualComposition';
 import type { RecognitionAssessment } from './recognitionState';
 
+/**
+ * Parse a positive finite millisecond budget. Non-numeric, zero/negative and
+ * non-finite values fall back to the stage default instead of producing NaN,
+ * which `deadlineRace` would treat as an unbounded deadline.
+ */
+function semanticBudgetMs(value: string | undefined, fallback: number): number {
+  if (value === undefined || value.trim() === '') return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 function safeProviderFailureReasonCodes(err: any, timeout: boolean): string[] {
   const errorClass = String(err?.errorClass || '');
   const status = Number(err?.status || err?.code || 0);
@@ -339,8 +350,8 @@ export class EvidenceBasedTradingEngine {
       // decided everything decisive; ambiguous candidates get a short race.
       // Stage 0 recognition uses a 2.5s aggregate / 2s attempt budget.
       const stage0 = Number(input.enrichment_stage || 0) === 0;
-      const aggregateBudgetMs = Number(process.env.SEMANTIC_CHAIN_DEADLINE_MS || (stage0 ? 2500 : 15000));
-      const attemptBudgetMs = Number(process.env.SEMANTIC_ATTEMPT_TIMEOUT_MS || (stage0 ? 2000 : 10000));
+      const aggregateBudgetMs = semanticBudgetMs(process.env.SEMANTIC_CHAIN_DEADLINE_MS, stage0 ? 2500 : 15000);
+      const attemptBudgetMs = semanticBudgetMs(process.env.SEMANTIC_ATTEMPT_TIMEOUT_MS, stage0 ? 2000 : 10000);
       semanticResult = await executeSemanticChain(semanticChain, input, knowledgeContext, {
         deadlineAtMs: Date.now() + Math.max(1, aggregateBudgetMs),
         attemptTimeoutMs: Math.max(1, attemptBudgetMs),
@@ -386,6 +397,7 @@ export class EvidenceBasedTradingEngine {
       collection,
       lifecycleAction: stages.lifecycleAction,
       semanticAvailable,
+      semanticAttempted: shouldRunSemantic,
       hasCreatorContext,
       staged: stages,
       minimumPositiveWeightTrading: decisionConfig.minimumPositiveWeightTrading,

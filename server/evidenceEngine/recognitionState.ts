@@ -58,6 +58,12 @@ export interface RecognitionAssessmentInput {
   lifecycleAction: LifecycleAction;
   /** True when semantic providers are configured/available for this evaluation. */
   semanticAvailable: boolean;
+  /**
+   * True when the semantic chain was actually attempted for this evaluation.
+   * The final post-provider assessment must not claim semantic was skipped
+   * when the provider ran and its evidence contributed to a decisive result.
+   */
+  semanticAttempted?: boolean;
   /** True when at least one creator-owned (non-retrieval) field exists. */
   hasCreatorContext: boolean;
   staged?: StagedClassificationReport;
@@ -124,12 +130,15 @@ export function assessRecognitionState(input: RecognitionAssessmentInput): Recog
   if (decisiveTrading) {
     state = 'DECISIVE_TRADING';
     semanticPolicy = 'SKIP';
-    semanticSkippedReason = 'SEMANTIC_SKIPPED_DETERMINISTIC_DECISIVE';
+    // Only a pre-provider assessment can assert semantic was skipped. After
+    // the chain ran, the same decisive state is semantic-assisted and must not
+    // claim `SEMANTIC_SKIPPED_DETERMINISTIC_DECISIVE`.
+    semanticSkippedReason = input.semanticAttempted ? null : 'SEMANTIC_SKIPPED_DETERMINISTIC_DECISIVE';
     reasons.push('TRADING_DOMINANT_WITH_NON_TITLE_TIER_A', 'WEIGHTED_THRESHOLD_SATISFIED');
   } else if (decisiveNonTrading) {
     state = 'DECISIVE_NON_TRADING';
     semanticPolicy = 'SKIP';
-    semanticSkippedReason = 'SEMANTIC_SKIPPED_DETERMINISTIC_DECISIVE';
+    semanticSkippedReason = input.semanticAttempted ? null : 'SEMANTIC_SKIPPED_DETERMINISTIC_DECISIVE';
     reasons.push('ALTERNATIVE_DOMINANT_WITH_CREATOR_LEVEL_NEGATIVE');
   } else if (composition.focus === 'QUERY_ONLY') {
     state = 'QUERY_ONLY';
@@ -195,14 +204,4 @@ export function assessRecognitionState(input: RecognitionAssessmentInput): Recog
       explicitCreatorAlternative: composition.explicitCreatorAlternative,
     },
   };
-}
-
-/** Composition-aware replacement for "any substantive positive". */
-export function hasIndependentTradingHypothesisFromComposition(
-  composition: ContextualCompositionReport,
-  assessment: RecognitionAssessment,
-): boolean {
-  if (assessment.state === 'DECISIVE_TRADING') return true;
-  if (composition.focus === 'MIXED' && composition.nonTitleTierAFamilies >= 1) return true;
-  return false;
 }

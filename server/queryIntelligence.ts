@@ -1365,10 +1365,18 @@ function buildSelectionResult(
   const ucb = decision?.index ?? pool.decision.index;
   if (ucb != null) selected = { ...selected, ucb_score: Number(ucb.toFixed(4)) };
   if (!selected) return null;
+  const selector = decision ?? pool.decision;
+  // The portfolio budget read matches persisted selection_reason by this
+  // marker. Targeted/fallback shapes keep their own strategy label but still
+  // spend reserved portfolio units when the selector chose a portfolio arm;
+  // preserve the marker so the daily cap accounts for that spend.
+  const portfolioMarker = selector.strategy === 'UCB_PORTFOLIO' && strategy !== 'UCB_PORTFOLIO'
+    ? 'Bounded portfolio: '
+    : '';
   return { queryRecord: selected,
     selectionStrategy: strategy,
-    reason,
-    selector: decision ?? pool.decision,
+    reason: `${portfolioMarker}${reason}`,
+    selector,
     admission: admissionInfo ? {
       hash: admissionInfo.admission.candidateHash,
       tier: admissionInfo.admission.tier,

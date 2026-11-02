@@ -37,20 +37,25 @@ export function isExplicitCreatorTradingText(text: string, context: LayeredKnowl
     .filter(term => !GENERIC_TRADING_TERM.test(term.trim()));
   const hasLanguageTradingSignal = languagePositiveTerms.some(term => textMatchesTerm(normalized, term));
   const hasCountryTradingSignal = (context.countryKnowledge?.nativeTradingTerminology || []).some(term => textMatchesTerm(normalized, term));
-  const hasTierASignal = matchedTierATradingSignals(normalized, context).length > 0;
+  const hasTierASignal = matchedTierATradingSignals(normalized, context).some(signal => signal !== 'KNOWN_METHOD');
   const hasFinancialQualifier = FINANCIAL_QUALIFIER_PATTERN.test(normalized) || TRADER_DOMAIN_PHRASE.test(normalized);
+  // Generic methods such as "candlestick" or "chart patterns" are not trading
+  // evidence on their own ("candlestick making tutorial"). They only count
+  // alongside an independent financial/market dimension.
+  const hasMethodContext = hasExplicitFinancialLiteral || hasKnownPlatform || hasLanguageTradingSignal
+    || hasCountryTradingSignal || hasFinancialQualifier;
 
   // Generic uses of the word "trading" are ambiguous. When the same text is
   // clearly about cards, game items, or skins, only explicit financial-market
   // evidence may override the exclusion. Broad language-pack terms such as the
   // literal word "trading" are intentionally not sufficient for that override.
   if (unrelatedTradingUsage.test(normalized)) {
-    return hasExplicitFinancialLiteral || hasKnownMethod || hasKnownPlatform || hasCountryTradingSignal;
+    return hasExplicitFinancialLiteral || hasKnownPlatform || hasCountryTradingSignal;
   }
 
   return hasTierASignal
     || hasExplicitFinancialLiteral
-    || hasKnownMethod
+    || (hasKnownMethod && hasMethodContext)
     || hasKnownPlatform
     || hasLanguageTradingSignal
     || hasCountryTradingSignal
@@ -80,6 +85,7 @@ export class VideoMetadataProvider implements EvidenceProvider {
     }
 
     let tradingFocusedCount = 0;
+    const tradingVideoIndexes = new Set<number>();
     const tierASignalVideos = new Map<string, Set<number>>();
     const matchedInstrumentsInVideos: string[] = [];
     const matchedPlatformsInVideos: string[] = [];
@@ -93,6 +99,7 @@ export class VideoMetadataProvider implements EvidenceProvider {
       const isTrading = isTradingFocusedText(combo, knowledgeContext) || isExplicitCreatorTradingText(combo, knowledgeContext);
       if (!isTrading) continue;
       tradingFocusedCount++;
+      tradingVideoIndexes.add(i);
       for (const signal of matchedTierATradingSignals(combo, knowledgeContext)) {
         const videos = tierASignalVideos.get(signal) || new Set<number>();
         videos.add(i);
@@ -193,7 +200,7 @@ export class VideoMetadataProvider implements EvidenceProvider {
           type: 'INSTRUMENT',
           matchedTerm: matchedInstrumentsInVideos.join(', '),
           sourceRef: 'Sample Video Titles & Descriptions',
-          fields:titles.flatMap((title,index)=>matchedInstrumentsInVideos.some(term=>textMatchesTerm(`${title} ${descriptions[index]||''}`,term))?[videoRef(index)]:[])
+          fields:titles.flatMap((title,index)=>tradingVideoIndexes.has(index)&&matchedInstrumentsInVideos.some(term=>textMatchesTerm(`${title} ${descriptions[index]||''}`,term))?[videoRef(index)]:[])
         },
         timestamp: now
       });
@@ -218,7 +225,7 @@ export class VideoMetadataProvider implements EvidenceProvider {
           type: 'PLATFORM_BROKER_PROPFIRM',
           matchedTerm: matchedPlatformsInVideos.join(', '),
           sourceRef: 'Sample Video Titles & Descriptions',
-          fields:titles.flatMap((title,index)=>matchedPlatformsInVideos.some(term=>textMatchesTerm(`${title} ${descriptions[index]||''}`,term))?[videoRef(index)]:[])
+          fields:titles.flatMap((title,index)=>tradingVideoIndexes.has(index)&&matchedPlatformsInVideos.some(term=>textMatchesTerm(`${title} ${descriptions[index]||''}`,term))?[videoRef(index)]:[])
         },
         timestamp: now
       });
@@ -243,7 +250,7 @@ export class VideoMetadataProvider implements EvidenceProvider {
           type: 'METHODOLOGY_CONCEPT',
           matchedTerm: matchedConceptsInVideos.join(', '),
           sourceRef: 'Sample Video Titles & Descriptions',
-          fields:titles.flatMap((title,index)=>matchedConceptsInVideos.some(term=>textMatchesTerm(`${title} ${descriptions[index]||''}`,term))?[videoRef(index)]:[])
+          fields:titles.flatMap((title,index)=>tradingVideoIndexes.has(index)&&matchedConceptsInVideos.some(term=>textMatchesTerm(`${title} ${descriptions[index]||''}`,term))?[videoRef(index)]:[])
         },
         timestamp: now
       });

@@ -1158,10 +1158,12 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
         qualityBlocked = true;
         const demoteFollows = row.search_eligible && effectiveDecision.status === 'DEMOTED';
         // event_type is CHECK-constrained to PROMOTION/DEMOTION/ELIGIBILITY_CHANGE.
-        const blockReason = row.search_eligible && effectiveDecision.searchEligible && !demoteFollows
+        const blockReason = (row.search_eligible && effectiveDecision.searchEligible && !demoteFollows
           ? `quality-gate revoked eligibility: ${entry.reasons.join('; ')}`
-          : `quality-gate blocked trial entry: ${entry.reasons.join('; ')}`;
-        const eventType = demoteFollows ? 'DEMOTION' : 'ELIGIBILITY_CHANGE';
+          : `quality-gate blocked trial entry: ${entry.reasons.join('; ')}`)
+          + (gateRevokesExistingEligibility && gate ? `; term-shape-ineligible: ${gate.reasons.join(', ')}` : '');
+        // A Q0 gate revocation is an eligibility change, not a yield demotion.
+        const eventType = gateRevokesExistingEligibility ? 'ELIGIBILITY_CHANGE' : demoteFollows ? 'DEMOTION' : 'ELIGIBILITY_CHANGE';
         // Persist the effective status (which may include a Q0 gate demotion),
         // never the superseded legacy decision, so the row and event agree.
         const eventTo = demoteFollows ? effectiveDecision.status : row.lifecycle_status;
@@ -1188,29 +1190,16 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
         if (!(lastEvent.event_type === eventType && lastEvent.reason === blockReason)) {
           await runner.query(
             `INSERT INTO terminology_lifecycle_events(canonical_term_id,from_status,to_status,event_type,reason,evidence_snapshot) VALUES($1,$2,$3,$4,$5,$6)`,
-            [termId, row.lifecycle_status, eventTo, eventType, blockReason, JSON.stringify({ v1Observations: quality.v1Observations, novel: quality.novel, spamConfirmed: quality.spamConfirmed })]
-          );
+            [termId, row.lifecycle_status, eventTo, eventType, blockReason, JSON.stringify({ v1Observations: quality.v1Observations, novel: quality.novel, spamConfirmed: quality.spamConfirmed, ...(gateRevokesExistingEligibility && gate ? { searchabilityVersion: gate.version, searchabilityReasons: gate.reasons, searchabilityShape: gate.shape } : {}) })]);
         }
       }
     }
   }
-  if (gateRevokesExistingEligibility && gate) {
-    const gateReason = effectiveDecision.reason;
-    const latest = await runner.query(
-      `SELECT event_type, reason FROM terminology_lifecycle_events WHERE canonical_term_id=$1 ORDER BY id DESC LIMIT 1`,
-      [termId]
-    );
-    const lastEvent = ((latest.rows || [])[0] || {}) as Record<string, unknown>;
-    if (!(lastEvent.event_type === 'ELIGIBILITY_CHANGE' && lastEvent.reason === gateReason)) {
-      await runner.query(
-        `INSERT INTO terminology_lifecycle_events(canonical_term_id,from_status,to_status,event_type,reason,evidence_snapshot) VALUES($1,$2,$3,$4,$5,$6)`,
-        [termId, row.lifecycle_status, effectiveDecision.status, 'ELIGIBILITY_CHANGE', gateReason, JSON.stringify({ searchabilityVersion: gate.version, reasons: gate.reasons, shape: gate.shape, distinctCreators: row.distinct_creators, distinctCommunities: row.distinct_communities, decayedEvidence: row.decayed_evidence })]
-      );
-    }
-  }
   if (!qualityBlocked && (effectiveDecision.status !== row.lifecycle_status || effectiveDecision.searchEligible !== row.search_eligible)) {
+    const gateEvidenced = gateRevokesExistingEligibility && gate;
+    const eventType = gateEvidenced ? 'ELIGIBILITY_CHANGE' : effectiveDecision.status === 'DEMOTED' ? 'DEMOTION' : 'PROMOTION';
     await runner.query('UPDATE canonical_trading_terms SET lifecycle_status=$2,search_eligible=$3,trust_tier=$4 WHERE id=$1', [termId, effectiveDecision.status, effectiveDecision.searchEligible, effectiveDecision.status === 'PROVEN_SEARCH_TERM' ? 1 : effectiveDecision.searchEligible ? 2 : 3]);
-    await runner.query(`INSERT INTO terminology_lifecycle_events(canonical_term_id,from_status,to_status,event_type,reason,evidence_snapshot) VALUES($1,$2,$3,$4,$5,$6)`, [termId, row.lifecycle_status, effectiveDecision.status, effectiveDecision.status === 'DEMOTED' ? 'DEMOTION' : 'PROMOTION', effectiveDecision.reason, JSON.stringify({ distinctCreators: row.distinct_creators, distinctCommunities: row.distinct_communities, executions: row.executions, decayedEvidence: row.decayed_evidence, decayedYield: row.decayed_yield })]);
+    await runner.query(`INSERT INTO terminology_lifecycle_events(canonical_term_id,from_status,to_status,event_type,reason,evidence_snapshot) VALUES($1,$2,$3,$4,$5,$6)`, [termId, row.lifecycle_status, effectiveDecision.status, eventType, effectiveDecision.reason, JSON.stringify({ distinctCreators: row.distinct_creators, distinctCommunities: row.distinct_communities, executions: row.executions, decayedEvidence: row.decayed_evidence, decayedYield: row.decayed_yield, ...(gateEvidenced && gate ? { searchabilityVersion: gate.version, searchabilityReasons: gate.reasons, searchabilityShape: gate.shape } : {}) })]);
   }
   // The snapshot records the persisted lifecycle state: when the quality
   // gate blocks a transition, decision.status was never applied.

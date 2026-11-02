@@ -210,6 +210,12 @@ export interface GroqRouteFailoverOptions {
    */
   deadlineAtMs?: number;
   nowMs?: () => number;
+  /** Caller cancellation: no route may start after this signal aborts. */
+  signal?: AbortSignal;
+}
+
+function groqFailoverCancelled(signal?: AbortSignal): ProviderCallError {
+  return new ProviderCallError('Groq route failover cancelled by caller.', 'CANCELLED', true, { cause: signal?.reason });
 }
 
 export async function runGroqRouteFailover<T>(
@@ -226,6 +232,7 @@ export async function runGroqRouteFailover<T>(
     (a, b) => Number(isCooling(groqRouteOrg(a))) - Number(isCooling(groqRouteOrg(b))),
   );
   for (const route of ordered) {
+    if (opts?.signal?.aborted) throw groqFailoverCancelled(opts.signal);
     if (opts?.deadlineAtMs !== undefined && (opts?.nowMs ?? Date.now)() >= opts.deadlineAtMs) {
       throw lastError || new ProviderCallError('Groq route pool aggregate deadline exhausted.', 'TIMEOUT', true);
     }
@@ -244,6 +251,9 @@ export async function runGroqRouteFailover<T>(
       return await call(route);
     } catch (error) {
       lastError = error;
+      // Caller cancellation is terminal: keep retries for provider timeouts,
+      // but never spend another org's quota on an abandoned evaluation.
+      if (opts?.signal?.aborted) throw error;
       if (error instanceof ProviderCallError && error.errorClass === 'RATE_LIMIT') {
         const failedOrg = failedGroqOrg(error, route);
         // Same-org routes share one quota pool: mark them all tried so the
@@ -802,7 +812,7 @@ export function defaultClient(
         if (timer) clearTimeout(timer);
         signal?.removeEventListener('abort', abortFromCaller);
       }
-    }, { isOrgCooling: orgId => groqOrgCooldownRemainingMs(orgId) > 0 });
+    }, { isOrgCooling: orgId => groqOrgCooldownRemainingMs(orgId) > 0, signal });
     return response;
   }};
 }

@@ -106,7 +106,7 @@ export function selectionHistoryFor(
  * retrieval specificity plus country registry); they still have to pass the
  * shape, script, CTA and term-type checks, but not the semantic lexicon match.
  */
-const GOVERNED_LICENSED_PROVENANCE = /(?:CURATED|COUNTRY_VOCABULARY|ORGANIC|PERSISTENT_RESEARCH|PR557|MANUAL)/iu;
+const GOVERNED_LICENSED_PROVENANCE = /^(?:CURATED|COUNTRY_VOCABULARY|ORGANIC|PERSISTENT_RESEARCH|PR557|MANUAL)$/iu;
 
 function gateTypeFor(type: TermSense['type']): SearchabilityTermType {
   if (type === 'INSTRUMENT') return 'INSTRUMENT';
@@ -319,10 +319,25 @@ export function revalidateAdmission(
   context: CompositionContext = {},
 ): QueryAdmission {
   const fresh = admitQueryCandidate(currentCandidate, context);
+  // `SEMANTIC_DUPLICATE` depends on history that the execution-time gate does
+  // not load. Without a history argument, re-admitting would silently erase a
+  // stored duplicate rejection; preserve it (fail closed) until a caller
+  // explicitly rechecks against current history.
+  const storedDuplicateRejected = stored.eligible === false
+    && (stored.reasonCodes || []).includes('SEMANTIC_DUPLICATE');
+  const historyChecked = context.history !== undefined;
+  const preserveDuplicateRejection = storedDuplicateRejected && !historyChecked;
   const drift = fresh.candidateHash !== stored.candidateHash
     || stored.eligible !== fresh.eligible
     || Object.entries(fresh.policyVersions).some(([key, version]) => stored.policyVersions[key] !== version);
-  return drift
-    ? { ...fresh, reasonCodes: [...new Set([...fresh.reasonCodes, 'STALE_ADMISSION_REVALIDATED'])] }
-    : { ...stored, admittedAt: fresh.admittedAt };
+  if (!drift && !preserveDuplicateRejection) return { ...stored, admittedAt: fresh.admittedAt };
+  return {
+    ...fresh,
+    eligible: fresh.eligible && !preserveDuplicateRejection,
+    reasonCodes: [...new Set([
+      ...fresh.reasonCodes,
+      ...(preserveDuplicateRejection ? ['SEMANTIC_DUPLICATE'] : []),
+      'STALE_ADMISSION_REVALIDATED',
+    ])],
+  };
 }

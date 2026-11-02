@@ -95,11 +95,14 @@ export function parseGenerationMetadata(value: Record<string, unknown> | string 
 }
 
 function asSource(metadata: Record<string, any>): QuerySource {
+  // An explicit governed country-native allocation is an override: its rows
+  // reuse the ANCHOR_LEARNED shape but their spend belongs to the native
+  // vocabulary source, not learned terminology.
+  if (metadata.countryNativeAllocation) return 'COUNTRY_VOCABULARY';
   const template = String(metadata.queryTemplate || '');
   if (TEMPLATE_SOURCE[template]) return TEMPLATE_SOURCE[template];
   if (metadata.organicProvenance) return 'ORGANIC';
   if (metadata.learnedTerm) return 'LEARNED_TERMINOLOGY';
-  if (metadata.countryNativeAllocation) return 'COUNTRY_VOCABULARY';
   if (metadata.scopePromoted === true) return 'COUNTRY_VOCABULARY';
   if (String(metadata.generationMode || '') === 'COLD_START') return 'COLD_START';
   if (metadata.manual === true || metadata.manualQuery === true) return 'MANUAL';

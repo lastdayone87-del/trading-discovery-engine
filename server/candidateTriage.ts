@@ -31,7 +31,9 @@ const HIGH_SPECIFICITY_TRADING_SIGNALS: Array<[string, RegExp]> = [
   // production market languages.
   // Bare `bolsa`/`borsa` are ordinary words (handbag, stock exchange) and
   // must not admit an unrelated creator before the soft-negative check.
-  ['LATIN_MARKET_FINANCE', /\b(b[oö]rse|boerse|bourse|beurs|aandelen|aktien|aktiehandel|aksjer|aksjehandel|osakkeet|osakekaupank[aä]ynti|børs|borsen|gielda|giełda|bolsa\s+de\s+valores|borsa\s+italiana|borsa\s+di\s+[a-zà-ÿ]+|mercado\s*de\s*valores|investir\s*en\s*bourse|analyse\s*technique|analisi\s*tecnica|an[aá]lisis\s*t[eé]cnico|handelsplan|risikomanagement|risikostyring|riskhantering|risicomanagement|piano\s*di\s*trading|plan\s*de\s*trading|plan\s*de\s*inversi[oó]n)\b/iu]
+  // `borsa di <anything>` also matches ordinary Italian ("borsa di studio",
+  // scholarship), so only named exchanges qualify as a high-specificity signal.
+  ['LATIN_MARKET_FINANCE', /\b(b[oö]rse|boerse|bourse|beurs|aandelen|aktien|aktiehandel|aksjer|aksjehandel|osakkeet|osakekaupank[aä]ynti|børs|borsen|gielda|giełda|bolsa\s+de\s+valores|borsa\s+italiana|borsa\s+di\s+(?:milano|tokyo|londra|new\s+york|francoforte|parigi|madrid|zurigo|hong\s+kong)|mercado\s*de\s*valores|investir\s*en\s*bourse|analyse\s*technique|analisi\s*tecnica|an[aá]lisis\s*t[eé]cnico|handelsplan|risikomanagement|risikostyring|riskhantering|risicomanagement|piano\s*di\s*trading|plan\s*de\s*trading|plan\s*de\s*inversi[oó]n)\b/iu]
 ];
 
 /**

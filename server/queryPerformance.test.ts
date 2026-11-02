@@ -203,3 +203,23 @@ test('scope weighting stays neutral when no observation carries scope', () => {
   assert.equal(metrics.newChannels, 2);
   assert.equal(metrics.inScopeNewChannels, 2);
 });
+
+test('promotion guard uses evaluated raw results for duplicate saturation', () => {
+  const metrics = calculateQueryFunnel(10, [
+    { channelId: 'a', wasKnown: false, persisted: true, funnelOutcome: 'TRADING_CONFIRMED', qualityScore: 80, hasCommunity: false },
+    { channelId: 'b', wasKnown: false, persisted: true, funnelOutcome: 'TRADING_CONFIRMED', qualityScore: 80, hasCommunity: false },
+  ], 5);
+  // Four of five evaluated raw results were duplicates; deferred results must
+  // not dilute the denominator.
+  metrics.duplicateResults = 4;
+  metrics.performanceScore = 70;
+  assert.equal(metrics.evaluatedRawResults, 5);
+  assert.equal(selectQueryCollection('EXPERIMENTAL', 3, metrics, {
+    completedRuns: 3,
+    minRuns: 2,
+    lcb: 0.9,
+    threshold: 0.5,
+    newConfirmedCreators: 2,
+    invalidQueryRate: 0,
+  }), 'EXPERIMENTAL');
+});

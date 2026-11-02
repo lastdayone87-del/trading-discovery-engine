@@ -10,6 +10,9 @@ export type QueryKnowledgeTier = 1 | 2 | 3;
 export type QueryGenerationMode = 'EXPLORATION' | 'EXPLOITATION' | 'COLD_START';
 export type SearchAtomType = 'INSTRUMENT' | 'METHOD' | 'MARKET' | 'FORMAT' | 'LEARNED' | 'CONCEPT' | 'ENTITY' | 'TOPIC' | 'NEIGHBORHOOD' | 'COVERAGE';
 
+/** Per-query cap for the repeated searchability-gate audit snapshot. */
+const PLANNER_GATE_METADATA_LIMIT = 20;
+
 export interface SearchAtom {
   term: string;
   type: SearchAtomType;
@@ -461,7 +464,17 @@ export function planDiverseQueries(args: {
         terminologyId: provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))?.id,
         terminologyLifecycle: provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))?.lifecycle,
         terminologyDecayedYield: provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))?.score,
-        ...(terminatedByGate.length ? { terminologyGate: { policy: 'terminology-searchability-v1', suppressed: terminatedByGate } } : {}),
+        ...(terminatedByGate.length ? {
+          terminologyGate: {
+            policy: 'terminology-searchability-v1',
+            suppressedCount: terminatedByGate.length,
+            // Cap the per-query audit copy: the same planning-run list is
+            // repeated in every planned query's metadata, so an unbounded
+            // vocabulary would multiply JSONB size and write volume.
+            suppressed: terminatedByGate.slice(0, PLANNER_GATE_METADATA_LIMIT),
+            ...(terminatedByGate.length > PLANNER_GATE_METADATA_LIMIT ? { suppressedTruncated: true } : {}),
+          },
+        } : {}),
         selectionEvidence: provenByTerm.has(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))
           ? `Canonical term ${provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))!.id} ranked by time-decayed production yield.`
           : candidate.organic

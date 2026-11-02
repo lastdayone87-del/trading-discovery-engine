@@ -247,7 +247,9 @@ export function selectQueryCollection(
         lcb: guard.lcb,
         threshold: guard.threshold ?? PROVEN_LCB_THRESHOLD,
         newConfirmedCreators: guard.newConfirmedCreators,
-        duplicateRatio: guard.duplicateRatio ?? ratio(metrics.duplicateResults, metrics.rawResults || 1),
+        // Deferred results were never evaluated and do not belong in the
+        // duplicate denominator (the same accounting the funnel uses).
+        duplicateRatio: guard.duplicateRatio ?? ratio(metrics.duplicateResults, (metrics.evaluatedRawResults ?? metrics.rawResults) || 1),
         invalidQueryRate: guard.invalidQueryRate ?? 0,
       });
       if (!promotion.eligible) return 'EXPERIMENTAL';

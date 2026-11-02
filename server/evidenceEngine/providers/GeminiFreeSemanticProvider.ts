@@ -99,13 +99,26 @@ function geminiFreeCooldownDeferredError(remainingMs: number): ProviderCallError
   );
 }
 
-export async function runGeminiFreeRouteFailover<T>(routes: GeminiFreeRoute[], call: (route: GeminiFreeRoute) => Promise<T>): Promise<T> {
+export interface GeminiFreeRouteFailoverOptions {
+  /** Caller cancellation: no route may start after this signal aborts. */
+  signal?: AbortSignal;
+}
+
+function geminiFreeFailoverCancelled(signal?: AbortSignal): ProviderCallError {
+  return new ProviderCallError('Free Gemini route failover cancelled by caller.', 'CANCELLED', true, { cause: signal?.reason });
+}
+
+export async function runGeminiFreeRouteFailover<T>(routes: GeminiFreeRoute[], call: (route: GeminiFreeRoute) => Promise<T>, opts?: GeminiFreeRouteFailoverOptions): Promise<T> {
   let lastError: unknown;
   for (const route of routes) {
+    if (opts?.signal?.aborted) throw geminiFreeFailoverCancelled(opts.signal);
     try {
       return await call(route);
     } catch (error) {
       lastError = error;
+      // The caller already abandoned this evaluation; do not advance to
+      // another key (or emit further timeout telemetry) for it.
+      if (opts?.signal?.aborted) throw error;
       // Free-tier rate limits are project-level, not key-level: failing over
       // to another key after a 429 would multiply the burst. Failover remains
       // for other retryable failures such as transient transport errors.
@@ -292,7 +305,7 @@ export function defaultClient(
           if (timer) clearTimeout(timer);
           signal?.removeEventListener('abort', abortFromCaller);
         }
-      });
+      }, { signal });
       return response;
     },
   };

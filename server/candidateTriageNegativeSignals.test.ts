@@ -40,3 +40,14 @@ test('candidate triage admits explicit trading candidates', () => {
   assert.equal(result.disposition, 'PLAUSIBLE_TRADING_HYPOTHESIS');
   assert.ok(result.reasonCodes.includes('RETRIEVAL_DOCUMENT_HAS_EXPLICIT_TRADING_SIGNAL'));
 });
+
+test('candidate triage does not treat "borsa di studio" as a market signal', () => {
+  const result = triageAutonomousSearchCandidate(candidate('Borsa di studio per studenti italiani'), 'automated_query', false);
+  assert.notEqual(result.disposition, 'PLAUSIBLE_TRADING_HYPOTHESIS');
+  assert.ok(!result.matchedSignals.includes('LATIN_MARKET_FINANCE'));
+});
+
+test('candidate triage still recognizes named Italian exchanges', () => {
+  const result = triageAutonomousSearchCandidate(candidate('Borsa di Milano analisi tecnica'), 'automated_query', false);
+  assert.equal(result.disposition, 'PLAUSIBLE_TRADING_HYPOTHESIS');
+});

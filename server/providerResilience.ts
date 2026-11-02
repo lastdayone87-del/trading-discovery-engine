@@ -377,6 +377,10 @@ function safeProviderReasons(values?:string[]):string[]{
 }
 
 export async function executeProviderCall<T>(args:{context:ProviderCallContext; timeoutMs:number; enabled?:boolean; signal?:AbortSignal; call:(signal:AbortSignal)=>Promise<T>; emit:ProviderEventSink; trace?:(stage:string)=>void}):Promise<T>{
+  // An already-aborted caller must never start a billable request. Without
+  // this check the abort listener is installed after the fact, so downstream
+  // route failover can issue further calls for an abandoned evaluation.
+  if(args.signal?.aborted)throw new ProviderCallError('Provider call was cancelled before execution.','CANCELLED',true,{cause:args.signal.reason});
   const started=Date.now(), id=randomUUID(), controller=new AbortController();
   const base={id,provider:args.context.provider,operation:args.context.operation,requestId:args.context.requestId,runId:args.context.runId,jobId:args.context.jobId,requestMetadata:args.context.requestMetadata,attempt:args.context.attempt||1,reservedCost:args.context.reservedCost||0,policyVersion:args.context.policyVersion||'provider-resilience-v1'};
   let capacityLease:GeminiCapacityLease|undefined;

@@ -235,12 +235,14 @@ export function buildContextualComposition(
   } else if (alternativeFamilies >= 2 && alternativeCoverage >= 0.6 && tradingCoverage <= 0.2) {
     focus = 'ALTERNATIVE_DOMINANT';
     reasons.push('ALTERNATIVE_COVERAGE_DOMINANT');
+  } else if (recentAlternativeFamilies > recentTradingFamilies && alternativeFamilies > 0 && tradingFamilies > 0) {
+    // Must precede the generic mixed branch: both families exist, but the
+    // recency signal is the more specific explanation and should be retained.
+    focus = 'MIXED';
+    reasons.push('RECENT_ALTERNATIVE_OUTPUT_CONFLICTS_WITH_TRADING_HISTORY');
   } else if ((tradingFamilies > 0 && alternativeFamilies > 0)) {
     focus = 'MIXED';
     reasons.push('TRADING_AND_ALTERNATIVE_CONFLICT');
-  } else if (recentAlternativeFamilies > recentTradingFamilies && alternativeFamilies > 0 && tradingFamilies > 0) {
-    focus = 'MIXED';
-    reasons.push('RECENT_ALTERNATIVE_OUTPUT_CONFLICTS_WITH_TRADING_HISTORY');
   } else {
     focus = 'INSUFFICIENT_COVERAGE';
     reasons.push('INSUFFICIENT_INDEPENDENT_TRADING_COVERAGE');

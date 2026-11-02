@@ -83,7 +83,9 @@ export async function classifyTradingRelevanceDetailed(
     ai_reviewed: semanticServed,
     fast_heuristic_status: decision.status === 'TRADING_CONFIRMED' ? 'FAST_ACCEPT' : decision.status === 'NON_TRADING' ? 'FAST_REJECT' : 'UNCERTAIN',
     classification_method: classificationMethod,
-    confidence_basis: semanticServed ? 'CALIBRATED' : noEvidence ? 'NEUTRAL_PRIOR' : 'HEURISTIC',
+    // Every non-empty assessment is scored by the unified decision policy,
+    // which returns a calibrated probability regardless of semantic serving.
+    confidence_basis: noEvidence ? 'NEUTRAL_PRIOR' : 'CALIBRATED',
     ai_model: decision.geminiSemanticSummary?.modelUsed || decision.versions.geminiModelVersion,
     ai_prompt_payload: decision.geminiSemanticSummary ? JSON.stringify(decision.geminiSemanticSummary) : undefined,
     ai_raw_response: decision.geminiSemanticSummary ? decision.geminiSemanticSummary.reason : undefined,

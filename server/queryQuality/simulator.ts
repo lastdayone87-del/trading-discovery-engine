@@ -270,6 +270,34 @@ function priorFor(aggregates: SimulationAggregates): HierarchicalPrior {
   return empiricalPrior([aggregates.total], 0.05, 2);
 }
 
+/**
+ * Portfolio admission is quota-weighted, not pull-weighted. The first pull is
+ * always admitted so the reserved floor can start; afterwards the projected
+ * cumulative portfolio spend may not exceed the configured share of projected
+ * cumulative spend. Exported for regression tests.
+ */
+export function portfolioPullAdmitted(input: {
+  portfolioQuotaUnits: number;
+  totalQuota: number;
+  quotaUnits: number;
+  portfolioRatio: number;
+}): boolean {
+  if (input.portfolioQuotaUnits === 0) return true;
+  const projectedQuota = input.totalQuota + input.quotaUnits;
+  return input.portfolioQuotaUnits + input.quotaUnits <= projectedQuota * input.portfolioRatio;
+}
+
+/**
+ * Retired production UCB1 index: normalized performance score plus the 0.8
+ * exploration term over portfolio-wide executions. Exported so the simulator
+ * baseline can be checked against the frozen formula.
+ */
+export function currentUcb1Index(lastRate: number, pulls: number, totalRuns: number): number {
+  const totalExecutions = Math.max(1, totalRuns);
+  const explorationBasis = Math.log(totalExecutions + 1);
+  return Math.min(1, Math.max(0, lastRate)) + 0.8 * Math.sqrt(explorationBasis / (pulls + 1));
+}
+
 function chooseArm(
   selector: SimulatedSelector,
   arms: SimArm[],
@@ -298,11 +326,15 @@ function chooseArm(
     })[0].arm;
   }
   if (selector === 'current_ucb1') {
-    return [...scored].sort((a, b) => {
-      const aIndex = a.arm.lastRate + 0.8 * Math.sqrt(Math.log(a.arm.pulls + 2) / (a.arm.pulls + 1));
-      const bIndex = b.arm.lastRate + 0.8 * Math.sqrt(Math.log(b.arm.pulls + 2) / (b.arm.pulls + 1));
-      return bIndex - aIndex || a.arm.id - b.arm.id;
-    })[0].arm;
+    // Reproduce the retired production UCB1 index: normalized last-run score
+    // plus an exploration bonus using the portfolio-wide execution count.
+    // `lastRate` is this simulator's normalized performance-score proxy
+    // (production `performance_score / 100`), so clamp it to the same [0,1]
+    // axis instead of letting raw yield dominate the exploration term.
+    return [...scored].sort((a, b) =>
+      currentUcb1Index(b.arm.lastRate, b.arm.pulls, aggregates.total.runs)
+      - currentUcb1Index(a.arm.lastRate, a.arm.pulls, aggregates.total.runs)
+      || a.arm.id - b.arm.id)[0].arm;
   }
   if (selector === 'independent_ts' || selector === 'hierarchical_ts') {
     // Draw exactly one Thompson sample per arm, then sort the fixed draws.
@@ -333,15 +365,22 @@ export function runSelectorSimulation(config: SimulationConfig, selector: Simula
   const selectedArms = new Map<number, number>();
   const familyPulls = new Map<number, number>();
   const countryPulls = new Map<number, number>();
-  let portfolioPulls = 0;
+  let portfolioQuotaUnits = 0;
 
   for (let step = 0; step < pulls; step++) {
     const countryIndex = step % world.length;
     const country = world[countryIndex];
     if (!country.arms.length) continue;
     const quotaUnits = quotas[Math.floor(rng() * quotas.length)] / 100;
-    const portfolio = portfolioPulls < pulls * portfolioRatio;
-    if (portfolio) portfolioPulls++;
+    // The portfolio floor is a quota share, not a pull-count share: a
+    // 300-result pull costs three times a 100-result pull.
+    const portfolio = portfolioPullAdmitted({
+      portfolioQuotaUnits,
+      totalQuota,
+      quotaUnits,
+      portfolioRatio,
+    });
+    if (portfolio) portfolioQuotaUnits += quotaUnits;
     if (!config.portfolioRatio && country.cursor < country.arms.length) {
       // Cold-start coverage: each country gets its first arm before index play.
       country.cursor++;

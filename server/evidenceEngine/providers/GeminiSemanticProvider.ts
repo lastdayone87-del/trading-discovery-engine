@@ -127,6 +127,12 @@ export interface GeminiRouteFailoverOptions {
    * Same-account 429s never spill regardless of this predicate.
    */
   isOrgCooling?: (orgId: string) => boolean;
+  /** Caller cancellation: no route may start after this signal aborts. */
+  signal?: AbortSignal;
+}
+
+function failoverCancelled(signal?: AbortSignal): ProviderCallError {
+  return new ProviderCallError('Provider failover cancelled by caller.', 'CANCELLED', true, { cause: signal?.reason });
 }
 
 function failedGeminiOrg(error: unknown, route: GeminiRoute): string {
@@ -149,6 +155,7 @@ export async function runGeminiRouteFailover<T>(
     (a, b) => Number(isCooling(geminiRouteOrg(a))) - Number(isCooling(geminiRouteOrg(b))),
   );
   for (const route of ordered) {
+    if (opts?.signal?.aborted) throw failoverCancelled(opts.signal);
     // A 429 marks its whole account tried (see catch below), so this
     // head-pick always lands on the next eligible independent account — a
     // same-account sibling of an exhausted account is never retried.
@@ -158,6 +165,9 @@ export async function runGeminiRouteFailover<T>(
       return await call(route);
     } catch (error) {
       lastError = error;
+      // The caller already abandoned this evaluation: retrying another route
+      // would spend quota for a result nobody will read.
+      if (opts?.signal?.aborted) throw error;
       if (error instanceof ProviderCallError && error.errorClass === 'RATE_LIMIT') {
         const failedOrg = failedGeminiOrg(error, route);
         // Same-account routes share one quota pool: mark them all tried so
@@ -239,7 +249,7 @@ function defaultClient(): SemanticModelClient | undefined {
         }
         throw error;
       }
-    }, { isOrgCooling: orgId => coolingOrgs.has(orgId) });
+    }, { isOrgCooling: orgId => coolingOrgs.has(orgId), signal });
     return JSON.parse(response.text || '{}');
   }};
 }

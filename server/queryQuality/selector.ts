@@ -97,11 +97,20 @@ function portfolioBudgetRemaining(context: SelectorContext): number {
   return Math.max(0, reserved - Math.max(0, context.portfolioUnitsUsed));
 }
 
+/** One official-provider run reserves 100 quota units = 1 normalized unit. */
+const PORTFOLIO_RUN_RESERVATION_UNITS = 1;
+
+function hasPortfolioReservation(context: SelectorContext): boolean {
+  // A positive fractional remainder cannot cover the next official-provider
+  // reservation, so it must fail closed instead of overshooting the cap.
+  return portfolioBudgetRemaining(context) >= PORTFOLIO_RUN_RESERVATION_UNITS;
+}
+
 function portfolioNeeded(context: SelectorContext): boolean {
   // The portfolio is a bounded, reserved floor. Coverage debt may not spend
   // beyond that floor; when it is exhausted, explicit fail-closed replaces
   // further exploration.
-  if (portfolioBudgetRemaining(context) <= 0) return false;
+  if (!hasPortfolioReservation(context)) return false;
   const cells = context.coverageCells || [];
   const covered = new Set(context.coveredCells || []);
   const coverageDeficit = cells.some(cell => !covered.has(cell));
@@ -242,7 +251,7 @@ export function selectHierarchicalUcb(candidates: SelectorCandidate[], context: 
     chosen = [...mature].sort((a, b) => deterministicTieBreak(a, b, context))[0];
     strategy = 'UCB_EXPLOITATION';
     reasonCodes = ['POSTERIOR_MEAN_PLUS_C_SD', 'MATURE_SAMPLE'];
-  } else if (portfolioBudgetRemaining(context) > 0) {
+  } else if (hasPortfolioReservation(context)) {
     chosen = [...scored].sort((a, b) => deterministicTieBreak(a, b, context))[0];
     strategy = 'UCB_PORTFOLIO';
     reasonCodes = ['COLD_START_PRIOR', 'MINIMUM_SAMPLE_NOT_MET'];

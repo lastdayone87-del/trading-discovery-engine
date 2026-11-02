@@ -14,7 +14,11 @@ now requires v3 and continues to fail closed on any other drift.
 - Benchmark specification version: `benchmark-preregistration-v1`
 - Engine base commit (merged main after PR #492): `4b49e0c01ac53eebf0080fae29bd6aaabb803cfc`
   (`4b49e0c Merge pull request #492 from lastdayone87-del/feat/engine-completion`)
-- Scope: describes what is actually implemented and executable at the base commit. No imagined future system.
+- Pre-execution delta: the revision note above. The frozen system under test is
+  the base commit plus exactly that authority-policy revision (and the Q0–Q8
+  admission program it names); no other system change is in scope.
+- Scope: describes what is actually implemented and executable at the base
+  commit plus the pre-execution delta above. No imagined future system.
 - Prohibitions during preparation (observed): no benchmark run, no new mechanisms, no tuning, no threshold/prior/weight/horizon/cut/feed/provider/eligibility/assignment changes, no UCB1 changes, no production behavior changes, no global enablement of experimental mechanisms.
 
 ## 1. Frozen system under test
@@ -37,7 +41,7 @@ now requires v3 and continues to fail closed on any other drift.
 | LLM Assist (P-E) | `llm-assist-v1` | `server/llmAssist.ts:25` |
 | Graph expansion policy (P3) | `graph-expansion-v1`, `GRAPH_MAX_DEPTH=2`, `GRAPH_MAX_FANOUT=10` | `server/graphExpansionPolicy.ts:12-14` |
 | Relationship canary | `relationship-canary-v1`, `MAX_SEEDS=10`, `MAX_DEPTH=2`, `MAX_FANOUT=10`, `MAX_DEPTH2_PARENTS=5`, `MAX_CHANNELS_PER_RUN=150`, `ESTIMATED_DOWNSTREAM_UNITS=305` | `server/relationshipCanary.ts:31-48` |
-| Autonomous query authority | `autonomous-query-authority-v3` | `server/autonomousQueryAuthority.ts:6` |
+| Autonomous query authority | `autonomous-query-authority-v3` (pre-execution revision; `4b49e0c` contains v2) | `server/autonomousQueryAuthority.ts:6` |
 | Candidate triage | `candidate-triage-v4-contextual-admission` | `server/candidateTriage.ts:6` |
 | DB migrations | 137 files, latest `137_domain_memory.sql` | `server/db/migrations/` |
 | Assignment/hash | sha256 hex slice `(0,8)` mod 10000; no separate salt field exists — assignment identity/version inputs = `policyVersion + experimentId + opportunityKey` (see §6) | `server/querySelectionExperiments.ts:137-139`, `server/retrievalExperiment.ts:114-117` |
@@ -242,7 +246,7 @@ Gaps identified (not invented around): no dedicated `benchmark_spec_version` / `
 
 ## 15. Reproducibility contract
 
-A result is reproducible from: engine commit `4b49e0c01ac53eebf0080fae29bd6aaabb803cfc` + spec `benchmark-preregistration-v1` + mechanism versions (§1) + frozen pool snapshot hash (record at execution) + assignment versions + frozen experimentIds and basis points (§3A) + configuration hash + provider versions + provenance records (§12).
+A result is reproducible from: engine commit `4b49e0c01ac53eebf0080fae29bd6aaabb803cfc` + the pre-execution authority revision documented above + spec `benchmark-preregistration-v1` + mechanism versions (§1) + frozen pool snapshot hash (record at execution) + assignment versions + frozen experimentIds and basis points (§3A) + configuration hash + provider versions + provenance records (§12).
 
 Missing pieces today (filled deterministically at execution, not chosen then): pool snapshot export + hash; config-hash dump; provider registry snapshot. The experimentIds, basis points, arms, priors, weights, and window rule are already frozen in §3A — they are not execution-time choices. No result may be declared reproducible without the execution-record items.
 

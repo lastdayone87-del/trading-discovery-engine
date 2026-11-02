@@ -33,7 +33,7 @@ import { deriveQueryFailureState, isQuerySelectable } from './lifecycle';
 import { buildQueryQualityVector, buildAttribution, canPromoteToProven, isRewardEligibleQuota } from './accounting';
 import { selectQueryCollection } from '../queryPerformance';
 import { buildQueryQualityDashboard } from './dashboard';
-import { compareSelectors } from './simulator';
+import { compareSelectors, currentUcb1Index, portfolioPullAdmitted } from './simulator';
 import { verifyFrozenBenchmarkVersions } from '../benchmarkPreregV1';
 import { AUTONOMOUS_QUERY_AUTHORITY_POLICY_VERSION } from '../autonomousQueryAuthority';
 import type { SelectorCandidate, SelectorContext, QueryAdmission, QuerySource } from './types';
@@ -1115,3 +1115,143 @@ test('Q5: explicit zero market/language counts are honest measurements, not miss
 
 
 
+
+test('Q1: prototype country keys fail closed instead of returning Object.prototype members', () => {
+  const fallback = getCountryMarketProfile('constructor');
+  assert.equal(fallback.country, 'constructor');
+  assert.deepEqual(fallback.languages, []);
+  assert.deepEqual(fallback.markets, []);
+  assert.equal(fallback.primaryMarket, 'UNKNOWN');
+  // The fallback must be a usable profile shape, not `Function`.
+  assert.ok(Array.isArray(fallback.languages));
+});
+
+test('Q4: a fractional portfolio remainder cannot cover the next official run', () => {
+  const cold = candidate(1, 'family:A', 0, 0);
+  const belowReservation = selectHierarchicalUcb([cold], selectorContext({ portfolioUnitsUsed: 14.5 }));
+  assert.equal(belowReservation.strategy, 'NO_ELIGIBLE_QUERY');
+  assert.equal(belowReservation.queryId, null);
+  assert.ok(belowReservation.reasonCodes.includes('PORTFOLIO_BUDGET_EXHAUSTED'));
+
+  const exactReservation = selectHierarchicalUcb([cold], selectorContext({ portfolioUnitsUsed: 14 }));
+  assert.equal(exactReservation.strategy, 'UCB_PORTFOLIO');
+  assert.equal(exactReservation.queryId, 1);
+});
+
+test('Q4: simulator portfolio admission is quota-weighted, not pull-weighted', () => {
+  assert.equal(portfolioPullAdmitted({ portfolioQuotaUnits: 0, totalQuota: 0, quotaUnits: 3, portfolioRatio: 0.15 }), true);
+  // 14 of 100 units used; a 3-unit pull projects 17/103 > 15%.
+  assert.equal(portfolioPullAdmitted({ portfolioQuotaUnits: 14, totalQuota: 100, quotaUnits: 3, portfolioRatio: 0.15 }), false);
+  // 14 of 100 used; a 1-unit pull projects 15/101 <= 15%.
+  assert.equal(portfolioPullAdmitted({ portfolioQuotaUnits: 14, totalQuota: 100, quotaUnits: 1, portfolioRatio: 0.15 }), true);
+});
+
+test('Q4: simulator UCB1 baseline clamps the normalized score and uses portfolio-wide executions', () => {
+  assert.equal(currentUcb1Index(100, 0, 1), 1 + 0.8 * Math.sqrt(Math.log(2)));
+  assert.equal(currentUcb1Index(0.5, 3, 9), 0.5 + 0.8 * Math.sqrt(Math.log(10) / 4));
+  assert.ok(currentUcb1Index(0.5, 3, 9) < currentUcb1Index(0.5, 3, 90));
+});
+
+test('Q6: dashboard duplicate share is aggregated over evaluated result counts', () => {
+  const first = buildQueryQualityVector({
+    rawResults: 10, distinctResults: 5, duplicateResults: 5,
+    newConfirmedCreators: 1, quotaUsed: 100,
+  });
+  const second = buildQueryQualityVector({
+    rawResults: 10, distinctResults: 9, duplicateResults: 1,
+    newConfirmedCreators: 1, quotaUsed: 100,
+  });
+  const dashboard = buildQueryQualityDashboard({
+    generatedAt: '2026-01-01T00:00:00.000Z',
+    portfolio: { dailyQuotaUnits: 100, portfolioUnitsReserved: 15, portfolioUnitsUsed: 2 },
+    rows: [
+      { runId: 'a', queryId: 1, query: 'a', country: 'Germany', status: 'COMPLETED', selectionStrategy: 'UCB_EXPLOITATION', selectionReason: 'selected', quotaUsed: 100, qualityVector: first },
+      { runId: 'b', queryId: 2, query: 'b', country: 'Germany', status: 'COMPLETED', selectionStrategy: 'UCB_EXPLOITATION', selectionReason: 'selected', quotaUsed: 100, qualityVector: second },
+    ],
+  });
+  // (5 + 1) duplicates / (10 + 10) evaluated = 0.30. Weighting by distinct
+  // results would report 0.243.
+  assert.ok(Math.abs(dashboard.totals.duplicateRatio - 0.3) < 1e-12);
+});
+
+test('Q2: country-native allocations keep their explicit source despite ANCHOR_LEARNED', () => {
+  const result = admitQueryRecord({
+    query: 'DAX day trading',
+    country: 'Germany',
+    primary_term: 'DAX',
+    generation_metadata: {
+      queryTemplate: 'ANCHOR_LEARNED',
+      learnedTerm: 'day trading',
+      countryNativeAllocation: { decisionId: 'decision-1', proposalId: 'proposal-1' },
+      atoms: [
+        { term: 'DAX', type: 'INSTRUMENT', origin: 'CURATED' },
+        { term: 'day trading', type: 'METHOD', origin: 'LEARNED' },
+      ],
+    },
+  });
+  assert.equal(result.admission.source, 'COUNTRY_VOCABULARY');
+});
+
+test('Q0: malformed provenance cannot bypass trading-semantics admission', () => {
+  const record = (origin: string) => admitQueryRecord({
+    query: 'Wetterbericht',
+    country: 'Germany',
+    primary_term: 'Wetterbericht',
+    generation_metadata: { queryTemplate: 'SINGLE_ATOM', atoms: [{ term: 'Wetterbericht', type: 'TERMINOLOGY', origin }] },
+  });
+  assert.equal(record('CURATED').eligible, true);
+  for (const origin of ['NOT_CURATED', 'UNCURATED', 'LEARNED']) {
+    const result = record(origin);
+    assert.equal(result.eligible, false, origin);
+    assert.ok(result.reasonCodes.includes('TERM_NO_TRADING_SEMANTICS'), origin);
+  }
+});
+
+test('Q2d: a stored SEMANTIC_DUPLICATE rejection survives revalidation without history', () => {
+  const record = {
+    query: 'DAX day trading',
+    country: 'Germany',
+    primary_term: 'DAX',
+    generation_metadata: {
+      queryTemplate: 'ANCHOR_LEARNED',
+      atoms: [
+        { term: 'DAX', type: 'INSTRUMENT', origin: 'CURATED' },
+        { term: 'day trading', type: 'METHOD', origin: 'CURATED' },
+      ],
+    },
+  };
+  const stored = admitQueryRecord(record, { history: [{ query: 'trading DAX day', country: 'Germany' }] });
+  assert.equal(stored.eligible, false);
+  assert.ok(stored.reasonCodes.includes('SEMANTIC_DUPLICATE'));
+
+  // Execution-time authority has no history: preserving the stored rejection
+  // is the fail-closed behavior.
+  const unchecked = revalidateQueryRecordAdmission({
+    ...record,
+    generation_metadata: withQueryAdmission(record.generation_metadata, stored.admission),
+  });
+  assert.equal(unchecked.eligible, false);
+  assert.ok(unchecked.reasonCodes.includes('SEMANTIC_DUPLICATE'));
+
+  // An explicit current history recheck may release the row.
+  const rechecked = revalidateQueryRecordAdmission({
+    ...record,
+    generation_metadata: withQueryAdmission(record.generation_metadata, stored.admission),
+  }, { history: [] });
+  assert.equal(rechecked.eligible, true);
+  assert.ok(!rechecked.reasonCodes.includes('SEMANTIC_DUPLICATE'));
+});
+
+test('C5: recency-specific mixed composition keeps its distinct reason', () => {
+  const composition = buildContextualComposition({
+    channel_name: 'Fixture',
+    description: '',
+    evidence_corpus: [
+      { field: 'video_title', text: 'day trading strategy', sourceFamilyId: 'trading', publishedAt: '2024-01-01T00:00:00.000Z' },
+      { field: 'video_title', text: 'makeup tutorial', sourceFamilyId: 'beauty', publishedAt: '2025-12-01T00:00:00.000Z' },
+    ],
+  } as RawChannelInput, undefined, new Date('2026-01-01T00:00:00.000Z'));
+  assert.equal(composition.focus, 'MIXED');
+  assert.ok(composition.reasonCodes.includes('RECENT_ALTERNATIVE_OUTPUT_CONFLICTS_WITH_TRADING_HISTORY'));
+  assert.ok(!composition.reasonCodes.includes('TRADING_AND_ALTERNATIVE_CONFLICT'));
+});

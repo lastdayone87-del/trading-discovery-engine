@@ -168,7 +168,8 @@ export function buildQueryQualityDashboard(input: {
   let quotaUnits = 0;
   let distinctResults = 0;
   let weightedTargetPrecision = 0;
-  let weightedDuplicateRatio = 0;
+  let duplicateResults = 0;
+  let evaluatedResults = 0;
   let zeroConfirmRuns = 0;
   for (const row of rewardEligible) {
     const vector = row.qualityVector!;
@@ -177,7 +178,16 @@ export function buildQueryQualityDashboard(input: {
     quotaUnits += vector.quotaUnits;
     distinctResults += vector.distinctResults;
     weightedTargetPrecision += vector.targetMarketPrecision * vector.distinctResults;
-    weightedDuplicateRatio += vector.duplicateRatio * vector.distinctResults;
+    // The stored ratio is duplicates / (distinct + duplicates). Reconstruct
+    // the evaluated counts so the portfolio ratio matches the source metric;
+    // weighting by distinct results alone understates the duplicate share.
+    const duplicateRatio = Math.min(1, vector.duplicateRatio);
+    const evaluated = duplicateRatio >= 1
+      ? vector.rawResults
+      : vector.distinctResults / (1 - duplicateRatio);
+    const boundedEvaluated = Number.isFinite(evaluated) ? evaluated : 0;
+    evaluatedResults += boundedEvaluated;
+    duplicateResults += Math.max(0, boundedEvaluated - vector.distinctResults);
     if (vector.newConfirmedCreators === 0) zeroConfirmRuns++;
   }
   // Degradation is an operator diagnostic over all accounted runs, including
@@ -243,7 +253,7 @@ export function buildQueryQualityDashboard(input: {
       zeroConfirmRuns,
       zeroConfirmShare: rewardEligible.length > 0 ? zeroConfirmRuns / rewardEligible.length : 0,
       targetMarketPrecision: distinctResults > 0 ? weightedTargetPrecision / distinctResults : 0,
-      duplicateRatio: distinctResults > 0 ? weightedDuplicateRatio / distinctResults : 0,
+      duplicateRatio: evaluatedResults > 0 ? duplicateResults / evaluatedResults : 0,
       providerDegradedRuns,
     },
     selection: {
