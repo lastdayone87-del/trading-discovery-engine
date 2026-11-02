@@ -1436,6 +1436,8 @@ test('Q4: continuation is authorized page by page against the shared portfolio f
   assert.match(dbCore, /const portfolioRunStrategy = \[/);
   assert.match(dbCore, /nextPageUnits: scheduledProviderUnits \/ 100/);
   assert.match(dbCore, /reservationReasonCode: 'PORTFOLIO_BUDGET_EXHAUSTED'/);
+  // The skip must settle any frontier allocation in the same transaction.
+  assert.match(dbCore, /releaseAllocationDecision\(candidate\.frontierDecisionId, 'PORTFOLIO_BUDGET_EXHAUSTED', client\)/);
 });
 
 test('Q4: simulator portfolio admission is quota-weighted, not pull-weighted', () => {

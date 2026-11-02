@@ -3134,6 +3134,15 @@ export async function scheduleAutonomousQueryRuns(
           if (canaryReservationId) {
             await releaseRetrievalCanaryReservation(canaryReservationId, 'PORTFOLIO_BUDGET_EXHAUSTED', client);
           }
+          // Release the frontier allocation in this transaction, not after it
+          // commits. The caller also retries the release, but a crash between
+          // commit and that call must not strand a reserved decision.
+          if (candidate.frontierDecisionId) {
+            const { releaseAllocationDecision } = await import('./discoveryFrontierAllocator');
+            if (!await releaseAllocationDecision(candidate.frontierDecisionId, 'PORTFOLIO_BUDGET_EXHAUSTED', client)) {
+              throw new Error('FRONTIER_ALLOCATION_RELEASE_FAILED');
+            }
+          }
           await client.query(`UPDATE query_library SET reserved_at=NULL,reserved_until=NULL,reserved_by=NULL WHERE id=$1`, [candidate.query.id]);
           flushDiagnostic({ selectedQueryId: candidate.query.id, provider: { providerKey: allocatedProvider.providerKey, capability: allocatedProvider.capability, quotaDomain: allocatedProvider.costDomain }, reservationOutcome: 'SKIPPED', reservationReasonCode: 'PORTFOLIO_BUDGET_EXHAUSTED', disposition: 'SKIPPED', reasonCode: 'PORTFOLIO_BUDGET_EXHAUSTED' });
           continue;
