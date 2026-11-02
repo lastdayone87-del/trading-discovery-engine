@@ -4136,69 +4136,6 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               crossOriginQueued.has(visitKey)
               || revealedQueued.has(visitKey)
               || popupQueued.has(visitKey);
-            // A navigable anchor is excluded from clicks because either the
-            // enqueue policy owns it (same-origin hint match) or it is
-            // cross-origin and must never navigate the document. Its live
-            // text+href can postdate the last page.content() snapshot, so
-            // retain it here before the click planner drops it; otherwise a
-            // JS-inserted direct Discord/invite href would be lost entirely.
-            retainSkippableAnchorEvidence(controls, page.url(), retain, {
-              crossOriginPursued: crossOriginPursuitActive(),
-              queuedDestinations: isQueuedDestination,
-            });
-            // Navigable same-host anchors are already discovered through
-            // enqueueLinks and Discord-scanned before any click, so the click
-            // budget is reserved for controls that only a click can act on
-            // (href-less buttons, fragments, JS links, cross-host targets).
-            // Slice accounting covers the remainder beyond clicks and skips.
-            const clickPlan = partitionRenderedClickTargets(
-              controls,
-              page.url(),
-              limits.maxClicksPerPage,
-              limits.clickOffset,
-              undefined,
-              {
-                crossOriginPursued: crossOriginPursuitActive(),
-                queuedDestinations: isQueuedDestination,
-              },
-            );
-            // A window made entirely of navigable anchors is fully examined
-            // with zero clicks. Record that explicitly so the durable retry
-            // offset can advance instead of re-reading the same prefix; a
-            // deadline or browser failure before the first click must not
-            // advance, because that window was not examined. Track clickable
-            // windows separately: a crawl-wide certificate must never let one
-            // page's navigable window stand in for another page's unexamined
-            // clickable window.
-            const clickableInWindow = Math.max(0, clickPlan.evaluationWindow.length - clickPlan.skippedNavigableAnchors);
-            if (isNavigableOnlyControlWindow(clickPlan, limits.maxClicksPerPage)) {
-              evidenceControlsNavigableOnly = true;
-            }
-            if (clickableInWindow > 0) {
-              evidenceControlsClickableWindow = true;
-              pageClickWindowPending = true;
-            }
-            const countedControlSkips = new Set<string>();
-            for (const control of controls) {
-              if (control.marker && !clickPlan.toClick.some(target => target.marker === control.marker)
-                && !isSkippableNavigableAnchorClick(control, page.url(), {
-                  crossOriginPursued: crossOriginPursuitActive(),
-                  queuedDestinations: isQueuedDestination,
-                })) {
-                countedControlSkips.add(control.marker);
-              }
-            }
-            // Overflow beyond the evaluation window is already counted by
-            // recordControlEnumeration. This second count covers only controls
-            // inside the window that the click budget could not examine.
-            const sliceDropped = Math.max(0, clickPlan.evaluationWindow.length - clickPlan.toClick.length - clickPlan.skippedNavigableAnchors);
-            if (sliceDropped > 0) {
-              // Every enumerated control matched the community-evidence filter;
-              // dropping one for budget means its content was never examined.
-              drops.count('control-slice', sliceDropped);
-              evidenceControlsSkipped += sliceDropped;
-              interactionGap = true;
-            }
             // Shared enqueue admission (single rule definition): already-visited
             // exclusion, then the shared crawl admission boundary, then the
             // community-hint filter. Used by both enqueue passes below.
@@ -4427,6 +4364,69 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // after interactions to include JS-revealed destinations.
             await enqueueCrossOrigin();
 
+            // A navigable anchor is excluded from clicks because either the
+            // enqueue policy owns it (same-origin hint match) or it is
+            // cross-origin and must never navigate the document. Its live
+            // text+href can postdate the last page.content() snapshot, so
+            // retain it here before the click planner drops it; otherwise a
+            // JS-inserted direct Discord/invite href would be lost entirely.
+            retainSkippableAnchorEvidence(controls, page.url(), retain, {
+              crossOriginPursued: crossOriginPursuitActive(),
+              queuedDestinations: isQueuedDestination,
+            });
+            // Navigable same-host anchors are already discovered through
+            // enqueueLinks and Discord-scanned before any click, so the click
+            // budget is reserved for controls that only a click can act on
+            // (href-less buttons, fragments, JS links, cross-host targets).
+            // Slice accounting covers the remainder beyond clicks and skips.
+            const clickPlan = partitionRenderedClickTargets(
+              controls,
+              page.url(),
+              limits.maxClicksPerPage,
+              limits.clickOffset,
+              undefined,
+              {
+                crossOriginPursued: crossOriginPursuitActive(),
+                queuedDestinations: isQueuedDestination,
+              },
+            );
+            // A window made entirely of navigable anchors is fully examined
+            // with zero clicks. Record that explicitly so the durable retry
+            // offset can advance instead of re-reading the same prefix; a
+            // deadline or browser failure before the first click must not
+            // advance, because that window was not examined. Track clickable
+            // windows separately: a crawl-wide certificate must never let one
+            // page's navigable window stand in for another page's unexamined
+            // clickable window.
+            const clickableInWindow = Math.max(0, clickPlan.evaluationWindow.length - clickPlan.skippedNavigableAnchors);
+            if (isNavigableOnlyControlWindow(clickPlan, limits.maxClicksPerPage)) {
+              evidenceControlsNavigableOnly = true;
+            }
+            if (clickableInWindow > 0) {
+              evidenceControlsClickableWindow = true;
+              pageClickWindowPending = true;
+            }
+            const countedControlSkips = new Set<string>();
+            for (const control of controls) {
+              if (control.marker && !clickPlan.toClick.some(target => target.marker === control.marker)
+                && !isSkippableNavigableAnchorClick(control, page.url(), {
+                  crossOriginPursued: crossOriginPursuitActive(),
+                  queuedDestinations: isQueuedDestination,
+                })) {
+                countedControlSkips.add(control.marker);
+              }
+            }
+            // Overflow beyond the evaluation window is already counted by
+            // recordControlEnumeration. This second count covers only controls
+            // inside the window that the click budget could not examine.
+            const sliceDropped = Math.max(0, clickPlan.evaluationWindow.length - clickPlan.toClick.length - clickPlan.skippedNavigableAnchors);
+            if (sliceDropped > 0) {
+              // Every enumerated control matched the community-evidence filter;
+              // dropping one for budget means its content was never examined.
+              drops.count('control-slice', sliceDropped);
+              evidenceControlsSkipped += sliceDropped;
+              interactionGap = true;
+            }
             const clickLoop = await runRenderedClickLoop({
               targets: clickPlan.toClick,
               maxClicksPerPage: limits.maxClicksPerPage,

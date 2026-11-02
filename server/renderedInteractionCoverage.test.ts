@@ -621,6 +621,49 @@ test('an already-queued cross-origin hub is never clicked after re-enumeration',
   assert.equal(result.evidenceControlsSkipped, 0, 'the queued hub is covered by the enqueue pass, not an unexamined click gap');
 });
 
+test('over-cap cross-origin hubs stay clickable after the enqueue pass fills the cap', () => {
+  // The page has five eligible hubs but only three enqueue slots. The enqueue
+  // pass owns three; the remaining two must stay in the click plan. Building
+  // the click plan before the enqueue pass would mark all five as enqueue-owned
+  // and leave the over-cap hubs neither queued nor clicked.
+  const currentUrl = 'https://creator.example/';
+  const hubs = Array.from({ length: 5 }, (_, index) => ({
+    url: `https://linktr.ee/creator-${index}`,
+    text: 'All my links',
+  }));
+  const queued = new Set<string>();
+  const enqueuePlan = planRenderedCrossOriginEnqueues({
+    candidates: hubs,
+    currentUrl,
+    alreadyVisited: new Set(),
+    queued,
+    maxEnqueues: MAX_RENDERED_CROSS_ORIGIN_ENQUEUES,
+  });
+  assert.deepEqual(enqueuePlan.admitted, hubs.slice(0, 3).map(hub => hub.url));
+  for (const url of enqueuePlan.admitted) queued.add(url);
+  assert.equal(queued.size, MAX_RENDERED_CROSS_ORIGIN_ENQUEUES);
+  const pursuitActive = queued.size < MAX_RENDERED_CROSS_ORIGIN_ENQUEUES;
+  assert.equal(pursuitActive, false, 'the cap is exhausted after admission');
+
+  const controls = hubs.map((hub, index) => ({
+    index,
+    marker: `oc-hub-${index}`,
+    text: hub.text,
+    href: hub.url,
+    tag: 'anchor' as const,
+  }));
+  const clickPlan = partitionRenderedClickTargets(controls, currentUrl, 5, 0, undefined, {
+    crossOriginPursued: pursuitActive,
+    queuedDestinations: queued,
+  });
+  assert.deepEqual(
+    clickPlan.toClick.map(target => target.href),
+    hubs.slice(3).map(hub => hub.url),
+    'hubs beyond the enqueue cap remain clickable while queued hubs stay enqueue-owned',
+  );
+  assert.equal(clickPlan.skippedNavigableAnchors, 3);
+});
+
 test('cross-origin rendered enqueue stays policy- and budget-bounded', () => {
   const currentUrl = 'https://creator.example/';
   assert.equal(MAX_RENDERED_CROSS_ORIGIN_ENQUEUES, 3, 'the crawl-wide cap stays small');
@@ -875,6 +918,12 @@ test('rendered control coverage counts overflow and uses stable markers across D
   assert.match(source, /recordControlEnumeration\(firstEnumeration\)/);
   assert.match(source, /data-oc-control/);
   assert.match(source, /partitionRenderedClickTargets\(\s*controls,\s*page\.url\(\),\s*limits\.maxClicksPerPage,\s*limits\.clickOffset,\s*undefined,\s*\{\s*crossOriginPursued: crossOriginPursuitActive\(\),\s*queuedDestinations: isQueuedDestination,\s*\},\s*\)/, 'the retry offset rotates the full pool before the cap and excludes queued destinations');
+  const enqueueCrossOriginPos = source.indexOf('await enqueueCrossOrigin();');
+  const clickPlanPos = source.indexOf('const clickPlan = partitionRenderedClickTargets(');
+  assert.ok(
+    enqueueCrossOriginPos !== -1 && clickPlanPos !== -1 && enqueueCrossOriginPos < clickPlanPos,
+    'the initial cross-origin pass fills the queue before the click plan decides which hubs are enqueue-owned',
+  );
   assert.match(source, /const pendingQueuedTargets = Math\.max\(0, clickTargets\.length - clickIndex - 1\)/, 'queued-but-unclicked controls consume the remaining budget');
   assert.match(source, /const freshPlan = planRevealedRenderedClickTargets\(\s*unqueued,\s*input\.pageUrl\(\),\s*input\.maxClicksPerPage,\s*clickedThisPage,\s*pendingQueuedTargets,\s*input\.clickOffset,\s*\{\s*crossOriginPursued: input\.crossOriginPursued,\s*queuedDestinations: input\.queuedDestinations,?\s*\},?\s*\)/, 'revealed controls are planned against the truly remaining slots and retry offset');
   assert.match(source, /const clickLoop = await runRenderedClickLoop\(\{[\s\S]*?enumerate: enumerateControls,[\s\S]*?onEnumerated: recordControlEnumeration,?\s*\}\);/, 'the handler executes the extracted loop after every click');

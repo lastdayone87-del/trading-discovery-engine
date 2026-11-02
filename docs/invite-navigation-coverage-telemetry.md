@@ -230,6 +230,9 @@ A non-`COMPLETE` coverage reason is never a clean absence:
   document with no interaction stays clean. The revealed pass also subtracts
   already-queued requests from the remaining page budget, and a destination
   already enqueued by another pass is never clicked again on re-enumeration.
+  The initial cross-origin pass runs before the click plan is built, so when a
+  page has more eligible hubs than remaining enqueue slots, the over-cap hubs
+  stay in the click set instead of being treated as enqueue-owned.
 - The persistence boundary (`safeCrawlerTelemetry`) re-sanitizes every field:
   closed taxonomies, positive integers, fixed caps, rendered-only placement.
 - No migration is required; the fields live in the existing
