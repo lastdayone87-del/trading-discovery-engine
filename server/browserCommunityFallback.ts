@@ -1,4 +1,5 @@
 import * as cheerio from 'cheerio';
+import { resolveDocumentBaseUrlFromRoot } from './documentBase';
 import { assessCrawlAdmission } from './communitySurfacePolicy';
 import { shouldFollowDestination, DISCORD_DESTINATION_HOSTS } from './destinationPolicy';
 import { assessPublicDestination, type DnsResolver } from './publicDestination';
@@ -579,8 +580,14 @@ export function discoverRequiredSeedLinks(seedHtml: string, seedUrl: string): st
     return [];
   }
   let hrefs: string[];
+  let $: cheerio.CheerioAPI;
   try {
-    const $ = cheerio.load(String(seedHtml || ''));
+    $ = cheerio.load(String(seedHtml || ''));
+  } catch {
+    return [];
+  }
+  const documentBase = resolveDocumentBaseUrlFromRoot($, seedUrl);
+  try {
     hrefs = $('a[href]')
       .map((_, el) => String($(el).attr('href') || '').trim())
       .get()
@@ -593,7 +600,7 @@ export function discoverRequiredSeedLinks(seedHtml: string, seedUrl: string): st
   for (const raw of hrefs) {
     let absolute: URL;
     try {
-      absolute = new URL(raw, seedUrl);
+      absolute = new URL(raw, documentBase);
     } catch {
       continue;
     }
