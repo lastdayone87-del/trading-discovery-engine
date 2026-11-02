@@ -43,10 +43,10 @@ replaces the document cannot hide them, but submits only after the post-click
 same-host pass. Each candidate keeps the page URL where it was observed, so a
 click that navigates elsewhere cannot retroactively make the pre-click
 snapshot's cross-origin links look same-origin. The merged pre/post-click
-snapshots are deduplicated by URL before accounting (all labels for a URL are
-evaluated together, so a weak first anchor cannot hide a later community
-label), so an anchor present in both states is never counted twice in drop
-telemetry. Optional destinations therefore never take queue positions ahead of
+snapshots are deduplicated by normalized visit URL before accounting (all
+labels sharing a normalized URL are evaluated together, so a weak first anchor
+cannot hide a later community label), so an anchor present in both states is
+never counted twice in drop telemetry. Optional destinations therefore never take queue positions ahead of
 JS-revealed required same-host links.
 
 Admitted third-party pages are tagged (`userData.crossOrigin = true`) and skip
