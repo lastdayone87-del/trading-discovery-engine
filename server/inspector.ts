@@ -1623,11 +1623,15 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
     return true;
   };
   // Lender gate (fail closed): only complete, non-timed-out rendered runs
-  // without an interaction gap may enter the shared inventory. A truncated or
-  // interaction-gapped lender would let a later borrower skip rendering based
-  // on coverage that never existed — the exact class of leak this gate closes.
-  const recordRenderedEvidence=(seedUrl:string,rendered:{visitedUrls?:string[];pageHintLinks?:Record<string,string[]>;inspectedPages?:number;complete?:boolean;timedOut?:boolean;interactionGap?:boolean},candidates:{sourceUrl?:string}[]):void=>{
+  // without an interaction gap and with absent/COMPLETE navigation coverage may
+  // enter the shared inventory. A truncated, interaction-gapped, or
+  // policy/context/budget-gapped lender would let a later borrower skip
+  // rendering based on coverage that never existed — the exact class of leak
+  // this gate closes. Absent keeps legacy producers that predate P0.2.
+  const recordRenderedEvidence=(seedUrl:string,rendered:{visitedUrls?:string[];pageHintLinks?:Record<string,string[]>;inspectedPages?:number;complete?:boolean;timedOut?:boolean;interactionGap?:boolean;telemetry?:{coverageReason?:unknown}},candidates:{sourceUrl?:string}[]):void=>{
     if(rendered.complete!==true||rendered.timedOut===true||rendered.interactionGap===true)return;
+    const lenderReason=rendered.telemetry?.coverageReason;
+    if(lenderReason!==undefined&&lenderReason!=='COMPLETE')return;
     const hintIndex=rendered.pageHintLinks||{};
     for(const raw of rendered.visitedUrls||[]){const key=normalizeVisitUrl(raw);if(!key)continue;const found=candidates.filter(c=>normalizeVisitUrl(c.sourceUrl||'')===key).length;const list=sharedRenderedEvidence.get(key)||[];if(!list.some(r=>r.bySeed===seedUrl))list.push({bySeed:seedUrl,pages:1,candidatesFound:found,hintLinks:[...(hintIndex[key]||[])],complete:true});sharedRenderedEvidence.set(key,list);}
   };

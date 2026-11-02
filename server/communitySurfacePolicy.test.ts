@@ -203,13 +203,28 @@ test('a later clean FOUND supersedes an earlier retryable partial', () => {
   assert.equal((effective[0] as { retryable?: unknown }).retryable, false);
 });
 
-test('a retained static FOUND stays clean when the rendered gap is permanent', () => {
+test('a retained static FOUND keeps a deterministic rendered gap visible without retry', () => {
   const effective = effectiveAcquisitionOutcomes([
     { requestedUrl: 'https://creator.example.com/', surface: 'CREATOR_WEBSITES', outcome: 'FOUND', required: true, retryable: false, telemetry: { pagesInspected: 1, requestsStarted: 1, redirectsFollowed: 0 } },
     { requestedUrl: 'https://creator.example.com/', surface: 'CREATOR_WEBSITES', outcome: 'PARTIALLY_INSPECTED', required: true, retryable: false, failureClass: 'RENDERED_POLICY_EXCLUDED', telemetry: { pagesInspected: 1, requestsStarted: 3, redirectsFollowed: 0 } },
   ] as never);
   assert.equal(effective.length, 1);
   assert.equal(effective[0].outcome, 'FOUND');
-  assert.equal((effective[0] as { failureClass?: unknown }).failureClass, undefined);
+  assert.equal(
+    (effective[0] as { failureClass?: unknown }).failureClass,
+    'RENDERED_POLICY_EXCLUDED',
+    'deterministic coverage metadata must stay visible on the effective FOUND',
+  );
+  assert.equal((effective[0] as { retryable?: unknown }).retryable, false);
+});
+
+test('a retained static FOUND keeps context-gap metadata visible without retry', () => {
+  const effective = effectiveAcquisitionOutcomes([
+    { requestedUrl: 'https://creator.example.com/', surface: 'CREATOR_WEBSITES', outcome: 'FOUND', required: true, retryable: false, telemetry: { pagesInspected: 1, requestsStarted: 1, redirectsFollowed: 0 } },
+    { requestedUrl: 'https://creator.example.com/', surface: 'CREATOR_WEBSITES', outcome: 'PARTIALLY_INSPECTED', required: true, retryable: false, failureClass: 'RENDERED_CONTEXT_UNREACHABLE', telemetry: { pagesInspected: 1, requestsStarted: 3, redirectsFollowed: 0 } },
+  ] as never);
+  assert.equal(effective.length, 1);
+  assert.equal(effective[0].outcome, 'FOUND');
+  assert.equal((effective[0] as { failureClass?: unknown }).failureClass, 'RENDERED_CONTEXT_UNREACHABLE');
   assert.equal((effective[0] as { retryable?: unknown }).retryable, false);
 });

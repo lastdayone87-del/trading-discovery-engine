@@ -255,26 +255,28 @@ export function effectiveAcquisitionOutcomes<T extends AcquisitionObservationLik
         };
       }
     }
-    // A retained static FOUND row must not hide the retry ownership of a
-    // same-URL rendered partial. FOUND still wins the effective outcome, but
-    // the rendered gap is unexamined navigation: carry its retryable failure
-    // class onto the FOUND row so the retry directive sees the gap instead of
-    // the clean static row alone. Plain FOUND rows (no gap) stay unchanged.
+    // A retained static FOUND row must not hide a later same-URL rendered gap.
+    // FOUND still wins the effective outcome, but the rendered gap is
+    // unexamined navigation: carry its failure class and retry ownership onto
+    // the FOUND row so effective reporting does not present incomplete
+    // navigation as clean. A deterministic policy/context gap keeps its class
+    // with retryable=false; a bounded gap keeps bounded recovery. An earlier
+    // partial is already superseded by the later FOUND and is never revived.
     if (winner.item.outcome === 'FOUND' && !(winner.item as { failureClass?: unknown }).failureClass) {
-      const retryableGap = entries.find((entry) => {
-        const candidate = entry.item as { failureClass?: unknown; retryable?: unknown };
+      const laterGap = entries.find((entry) => {
+        const candidate = entry.item as { failureClass?: unknown };
         return entry.index > winner.index
           && entry.item.outcome === 'PARTIALLY_INSPECTED'
-          && candidate.retryable === true
           && typeof candidate.failureClass === 'string'
           && candidate.failureClass.length > 0;
       });
-      if (retryableGap) {
+      if (laterGap) {
+        const gap = laterGap.item as { failureClass?: unknown; retryable?: unknown };
         return {
           item: {
             ...winner.item,
-            retryable: true,
-            failureClass: (retryableGap.item as { failureClass?: unknown }).failureClass,
+            retryable: gap.retryable === true,
+            failureClass: gap.failureClass,
           } as T,
           index: winner.index,
         };

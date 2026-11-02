@@ -173,6 +173,42 @@ export function browserFallbackTelemetrySummary(telemetry: BrowserFallbackTeleme
   return extras.length ? `${base.slice(0, -1)},${extras.join(',')}}` : base;
 }
 
+/**
+ * Human-readable result detail for a completed rendered crawl. Extracted so
+ * the branch order is testable directly: the most specific stop (retained
+ * candidates, timeout, terminal failure, zero pages, interaction gap, coverage
+ * reason) always wins, and a non-COMPLETE coverage reason can never fall
+ * through to the "completed ... without an invite" wording.
+ */
+export function resolveRenderedFallbackDetail(input: {
+  candidatesFound: number;
+  inspectedPages: number;
+  timedOut: boolean;
+  telemetry: BrowserFallbackTelemetry;
+  noPageProcessed: boolean;
+  interactionGap: boolean;
+  evidenceControlsFailed: number;
+  evidenceControlsSkipped: number;
+  coverageReason?: RenderedCoverageReason;
+}): string {
+  const summary = browserFallbackTelemetrySummary(input.telemetry);
+  if (input.candidatesFound > 0) {
+    return `Rendered fallback retained ${input.candidatesFound} distinct Discord candidate(s) across ${input.inspectedPages} page(s); ${input.telemetry.requestsFailed} request(s) failed within the bounded crawl; ${summary}`;
+  }
+  if (input.timedOut) return `Rendered acquisition budget expired before coverage completed; ${summary}`;
+  if (input.telemetry.unresolvedFailedRequests > 0) {
+    return `Rendered acquisition incomplete: ${input.telemetry.unresolvedFailedRequests} request(s) terminally failed within the bounded crawl; ${summary}`;
+  }
+  if (input.noPageProcessed) return `Rendered acquisition incomplete: no page was processed (NO_PAGE_PROCESSED); ${summary}`;
+  if (input.interactionGap) {
+    return `Rendered acquisition incomplete: ${input.evidenceControlsFailed} evidence-bearing control click(s) failed and ${input.evidenceControlsSkipped} were skipped by the control budget; coverage is not complete; ${summary}`;
+  }
+  if (input.coverageReason !== undefined && input.coverageReason !== 'COMPLETE') {
+    return `Rendered acquisition incomplete: navigation coverage ${input.coverageReason}; ${summary}`;
+  }
+  return `Rendered acquisition completed across ${input.inspectedPages} page(s) without an invite; ${summary}`;
+}
+
 export interface BrowserFallbackResult {
   foundInvite: string | null;
   foundLocation?: string;
@@ -3684,9 +3720,17 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           evidenceControlsOffsetAdvance: evidenceControlsOffsetAdvance || undefined,
           interactionGap: interactionGap || undefined,
           requiredSnapshotExpanded: requiredSnapshotExpanded || undefined,
-          detail:candidates.length
-            ? `Rendered fallback retained ${candidates.length} distinct Discord candidate(s) across ${inspectedPages} page(s); ${telemetry.requestsFailed} request(s) failed within the bounded crawl; ${browserFallbackTelemetrySummary(telemetry)}`
-            : timedOut?`Rendered acquisition budget expired before coverage completed; ${browserFallbackTelemetrySummary(telemetry)}`:telemetry.unresolvedFailedRequests>0?`Rendered acquisition incomplete: ${telemetry.unresolvedFailedRequests} request(s) terminally failed within the bounded crawl; ${browserFallbackTelemetrySummary(telemetry)}`:noPageProcessed?`Rendered acquisition incomplete: no page was processed (NO_PAGE_PROCESSED); ${browserFallbackTelemetrySummary(telemetry)}`:interactionGap?`Rendered acquisition incomplete: ${evidenceControlsFailed} evidence-bearing control click(s) failed and ${evidenceControlsSkipped} were skipped by the control budget; coverage is not complete; ${browserFallbackTelemetrySummary(telemetry)}`:(coverageReason&&coverageReason!=='COMPLETE')?`Rendered acquisition incomplete: navigation coverage ${coverageReason}; ${browserFallbackTelemetrySummary(telemetry)}`:`Rendered acquisition completed across ${inspectedPages} page(s) without an invite; ${browserFallbackTelemetrySummary(telemetry)}`,
+          detail:resolveRenderedFallbackDetail({
+            candidatesFound:candidates.length,
+            inspectedPages,
+            timedOut,
+            telemetry,
+            noPageProcessed,
+            interactionGap,
+            evidenceControlsFailed,
+            evidenceControlsSkipped,
+            coverageReason,
+          }),
         };
       } catch (error:any) {
         const candidates=mergeDiscordCandidates(discovered);

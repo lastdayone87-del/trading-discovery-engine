@@ -261,14 +261,40 @@ test('a retained invite with a bounded budget gap uses an accepted retry class',
   );
 });
 
-test('a permanent child failure does not make a deterministic context gap retryable', () => {
+test('resolver BOUNDED takes precedence over a context gap', () => {
+  // Production resolves a failed child request to BOUNDED before the
+  // frame/shadow/popup context reason, so the classification must be exercised
+  // with the reason the resolver actually produces.
+  const reason = resolveRenderedCoverageReason({
+    pagesInspected: 1,
+    frameCount: 1,
+    unresolvedFailedRequests: 1,
+  });
+  assert.equal(reason, 'BOUNDED');
   const result = renderedAcquisitionOutcome(
     rendered({
       complete: false,
-      // unresolvedFailedRequests makes the fallback retryable even though the
-      // context gap itself is deterministic.
       retryable: true,
-      telemetry: { ...telemetry('CONTEXT_UNREACHABLE'), unresolvedFailedRequests: 1 },
+      coverageGapRetryable: false,
+      telemetry: { ...telemetry(reason), frameCount: 1, unresolvedFailedRequests: 1 },
+    }),
+    true,
+    [],
+  );
+  assert.equal(result.outcome, 'PARTIALLY_INSPECTED');
+  assert.equal(result.failureClass, 'RENDERED_PARTIAL_COVERAGE');
+  assert.equal(result.gapRetryable, false, 'a permanent child refusal cannot be cleared by refetching');
+});
+
+test('a context-only gap resolves as CONTEXT_UNREACHABLE without retry', () => {
+  const reason = resolveRenderedCoverageReason({ pagesInspected: 1, frameCount: 1 });
+  assert.equal(reason, 'CONTEXT_UNREACHABLE');
+  const result = renderedAcquisitionOutcome(
+    rendered({
+      complete: false,
+      retryable: true,
+      coverageGapRetryable: false,
+      telemetry: { ...telemetry(reason), frameCount: 1 },
     }),
     true,
     [],
@@ -278,11 +304,19 @@ test('a permanent child failure does not make a deterministic context gap retrya
   assert.equal(result.gapRetryable, false, 'context traversal limits cannot be cleared by refetching');
 });
 
-test('a transient required-child failure keeps retry ownership despite a deterministic context gap', () => {
+test('a transient required-child failure keeps retry ownership in a resolver BOUNDED gap', () => {
+  const reason = resolveRenderedCoverageReason({
+    pagesInspected: 1,
+    frameCount: 1,
+    unresolvedFailedRequests: 1,
+  });
+  assert.equal(reason, 'BOUNDED');
   const result = renderedAcquisitionOutcome(
     rendered({
       complete: false,
-      telemetry: telemetry('CONTEXT_UNREACHABLE'),
+      retryable: true,
+      coverageGapRetryable: false,
+      telemetry: { ...telemetry(reason), frameCount: 1, unresolvedFailedRequests: 1 },
     }),
     true,
     [],
@@ -293,7 +327,7 @@ test('a transient required-child failure keeps retry ownership despite a determi
     },
   );
   assert.equal(result.outcome, 'PARTIALLY_INSPECTED');
-  assert.equal(result.failureClass, 'RENDERED_CONTEXT_UNREACHABLE');
+  assert.equal(result.failureClass, 'RENDERED_PARTIAL_COVERAGE');
   assert.equal(result.gapRetryable, true, 'the failed child can succeed on refetch even though traversal cannot');
 });
 
