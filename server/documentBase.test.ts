@@ -119,6 +119,50 @@ test('base stripping: markup-looking text in scripts and styles is untouched', (
   assert.equal(stripBaseElements(quoted), quoted, 'quoted attribute text is not markup');
 });
 
+test('base stripping: spec comment closings cannot hide a real base', () => {
+  assert.equal(
+    stripBaseElements('<!-- note --!><base href="/community/"><a href="join">join</a>'),
+    '<!-- note --!><a href="join">join</a>',
+    '--!> closes a comment',
+  );
+  assert.equal(
+    stripBaseElements('<!--><base href="/community/"><a href="join">join</a>'),
+    '<!--><a href="join">join</a>',
+    '<!--> is an abrupt empty comment',
+  );
+  assert.equal(
+    stripBaseElements('<!---><base href="/community/"><a href="join">join</a>'),
+    '<!---><a href="join">join</a>',
+    '<!---> is an abrupt comment',
+  );
+});
+
+test('base stripping: foreign raw-text names do not swallow the document', () => {
+  assert.equal(
+    stripBaseElements('<svg><plaintext><base href="/community/"></svg><a href="join">join</a>'),
+    '<svg><plaintext></svg><a href="join">join</a>',
+    'plaintext in the SVG namespace is not an HTML raw-text body',
+  );
+  assert.equal(
+    stripBaseElements('<math><plaintext></math><base href="/community/"><a href="join">join</a>'),
+    '<math><plaintext></math><a href="join">join</a>',
+    'math content is foreign too, and a later HTML base is still stripped',
+  );
+});
+
+test('base stripping: bogus declarations end at the first greater-than', () => {
+  assert.equal(
+    stripBaseElements('<!bogus[><base href="/community/"><a href="join">join</a>'),
+    '<!bogus[><a href="join">join</a>',
+    'brackets do not extend a bogus comment',
+  );
+  assert.equal(
+    stripBaseElements('<?bogus "><base href="/community/"><a href="join">join</a>'),
+    '<?bogus "><a href="join">join</a>',
+    'quotes do not extend a processing instruction',
+  );
+});
+
 test('base stripping: a real base after raw text is still removed', () => {
   assert.equal(
     stripBaseElements('<script>const x = 1;</script><base href="/community/"><button data-href="/community/">Join</button>'),

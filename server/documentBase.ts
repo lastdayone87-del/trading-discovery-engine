@@ -76,10 +76,13 @@ export function resolveDocumentBaseUrl(html: string, finalUrl: string): string {
  *
  * Context-aware single pass:
  * - only an actual start tag named exactly `base` is removed (`<base-button>`
- *   and attribute text are untouched);
- * - comments, declarations, CDATA, and raw-text element bodies (script, style,
- *   textarea, title, ...) are skipped so `<base ` inside them cannot delete
- *   real controls later in the document;
+ *   and attribute text are untouched); foreign `<base>` elements are removed
+ *   too because their href is still not a navigation target;
+ * - comments (including `--!>` and abrupt closings), declarations, CDATA, and
+ *   HTML-namespace raw-text element bodies (script, style, textarea, title,
+ *   ...) are skipped so `<base ` inside them cannot delete real controls later
+ *   in the document; foreign raw-text-named elements are not treated as HTML
+ *   raw text;
  * - quoted attribute values may contain `>`;
  * - an unclosed base tag consumes the remainder once, and each raw-text body
  *   is scanned once, so malformed repeated input cannot cause quadratic work.
@@ -114,6 +117,33 @@ export function stripBaseElements(html: string): string {
     return length;
   };
 
+  // HTML comments end at `-->`, at the spec's alternate `--!>`, or abruptly
+  // after `<!-->` / `<!--->`. Searching only for `-->` would skip past those
+  // closings and leave a following real <base> in the extracted markup.
+  const skipComment = (from: number): number => {
+    if (source.charCodeAt(from) === 0x3e) return from + 1;
+    if (source.charCodeAt(from) === 0x2d && source.charCodeAt(from + 1) === 0x3e) return from + 2;
+    for (let scan = from; ;) {
+      const dash = source.indexOf('--', scan);
+      if (dash < 0) return length;
+      const after = source.charCodeAt(dash + 2);
+      if (after === 0x3e) return dash + 3;
+      if (after === 0x21 && source.charCodeAt(dash + 3) === 0x3e) return dash + 4;
+      scan = dash + 2;
+    }
+  };
+
+  // A start tag is self-closing when its last non-whitespace character before
+  // `>` is `/`. Used to avoid leaving an unmatched <svg> on the foreign stack.
+  const isSelfClosingTag = (tagEnd: number): boolean => {
+    for (let scan = tagEnd - 2; scan > 0; scan--) {
+      const code = source.charCodeAt(scan);
+      if (isWhitespace(code)) continue;
+      return code === 0x2f;
+    }
+    return false;
+  };
+
   // Find `</name` (ASCII case-insensitive) followed by a tag-name delimiter.
   // One forward scan: each near-match advances the cursor by one character.
   const findRawTextClose = (name: string, from: number): number => {
@@ -138,6 +168,10 @@ export function stripBaseElements(html: string): string {
   let output = '';
   let cursor = 0;
   let index = 0;
+  // Foreign-content depth (`svg`/`math`). Raw-text element names are only raw
+  // text in the HTML namespace: `<svg><plaintext>` is a foreign element, not
+  // an HTML plaintext body, so it must not skip the rest of the document.
+  const foreignStack: string[] = [];
   while (index < length) {
     if (source.charCodeAt(index) !== 0x3c /* < */) {
       index++;
@@ -148,8 +182,7 @@ export function stripBaseElements(html: string): string {
       // Comment, CDATA, or declaration. Skip it wholly so markup-looking text
       // inside cannot be mistaken for a start tag.
       if (source.startsWith('<!--', index)) {
-        const end = source.indexOf('-->', index + 4);
-        index = end < 0 ? length : end + 3;
+        index = skipComment(index + 4);
         continue;
       }
       if (source.startsWith('<![CDATA[', index)) {
@@ -157,35 +190,32 @@ export function stripBaseElements(html: string): string {
         index = end < 0 ? length : end + 3;
         continue;
       }
-      let bracketDepth = 0;
-      let quote = 0;
-      let scan = index + 2;
-      for (; scan < length; scan++) {
-        const code = source.charCodeAt(scan);
-        if (quote) {
-          if (code === quote) quote = 0;
-        } else if (code === 0x22 || code === 0x27) {
-          quote = code;
-        } else if (code === 0x5b /* [ */) {
-          bracketDepth++;
-        } else if (code === 0x5d /* ] */ && bracketDepth > 0) {
-          bracketDepth--;
-        } else if (code === 0x3e && bracketDepth === 0) {
-          scan++;
-          break;
-        }
-      }
-      index = scan;
+      // Bogus comment / doctype: HTML terminates at the first `>`; quotes and
+      // brackets do not extend it. Tracking them made `<!bogus[>` swallow a
+      // following real <base>.
+      const end = source.indexOf('>', index + 2);
+      index = end < 0 ? length : end + 1;
       continue;
     }
     if (next === 0x3f /* ? */) {
-      index = findTagEnd(index + 2);
+      // Processing instructions are bogus comments in HTML: first `>` wins.
+      const end = source.indexOf('>', index + 2);
+      index = end < 0 ? length : end + 1;
       continue;
     }
     if (next === 0x2f /* / */) {
       // Closing tag: skip it. A malformed closing tag is still tag syntax,
       // not a place where a real start tag begins.
-      index = findTagEnd(index + 2);
+      let nameEnd = index + 2;
+      while (nameEnd < length && !isNameDelimiter(source.charCodeAt(nameEnd))) nameEnd++;
+      let closeName = '';
+      for (let offset = index + 2; offset < nameEnd; offset++) {
+        closeName += String.fromCharCode(lower(source.charCodeAt(offset)));
+      }
+      if ((closeName === 'svg' || closeName === 'math') && foreignStack[foreignStack.length - 1] === closeName) {
+        foreignStack.pop();
+      }
+      index = findTagEnd(nameEnd);
       continue;
     }
     if (!(next >= 0x41 && next <= 0x5a) && !(next >= 0x61 && next <= 0x7a)) {
@@ -205,12 +235,19 @@ export function stripBaseElements(html: string): string {
     }
     const tagEnd = findTagEnd(nameEnd);
     if (name === 'base') {
+      // Foreign <base> elements are stripped too: their href is still not a
+      // navigation target for the dynamic extractor.
       output += source.slice(cursor, index);
       cursor = tagEnd;
       index = tagEnd;
       continue;
     }
-    if (rawTextElements.has(name)) {
+    // Raw-text element names are only raw text in the HTML namespace; a
+    // foreign <plaintext> must not hide the rest of the document.
+    if ((name === 'svg' || name === 'math') && !isSelfClosingTag(tagEnd)) {
+      foreignStack.push(name);
+    }
+    if (foreignStack.length === 0 && rawTextElements.has(name)) {
       // Raw-text content is not parsed as markup. Skip to the matching close
       // tag (or EOF for plaintext / an unclosed element).
       index = findRawTextClose(name, tagEnd);
