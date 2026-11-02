@@ -69,6 +69,10 @@ export async function getAutonomousRunMetrics(runId:string):Promise<QueryFunnelM
   return {
     ...metrics,
     distinctResults:distinct,
+    // Keep the rejected count on the same run-wide distinct set as the
+    // denominator: the page sum double-counts cross-page repeats, and
+    // completeQueryRun recomputes precision from these two fields.
+    countryRejected:rejected,
     noveltyRatio:metrics.newChannels/distinct,
     countryPrecision:(distinct-rejected)/distinct,
   };

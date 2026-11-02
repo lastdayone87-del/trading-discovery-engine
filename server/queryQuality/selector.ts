@@ -102,12 +102,12 @@ function portfolioBudgetRemaining(context: SelectorContext): number {
 const PORTFOLIO_RUN_RESERVATION_UNITS = 1;
 
 function hasPortfolioReservation(context: SelectorContext): boolean {
-  // A portfolio run may continue for several pages, so the first-page
-  // reservation alone can overshoot the floor. Require the full worst-case
-  // run cost; a fractional remainder then fails closed instead of admitting a
-  // run that exhausts the budget after page one.
-  const required = Math.max(PORTFOLIO_RUN_RESERVATION_UNITS, Number(context.portfolioRunUnits) || PORTFOLIO_RUN_RESERVATION_UNITS);
-  return portfolioBudgetRemaining(context) >= required;
+  // Selection only needs the first official page. Continuation pages are
+  // authorized one at a time against the same budget (see
+  // reservePortfolioContinuationPage), so requiring the pagination ceiling up
+  // front would starve cold-start countries whenever that ceiling exceeds the
+  // 15% portfolio floor.
+  return portfolioBudgetRemaining(context) >= PORTFOLIO_RUN_RESERVATION_UNITS;
 }
 
 function portfolioNeeded(context: SelectorContext): boolean {

@@ -188,13 +188,6 @@ export interface SelectorContext {
   portfolioRatio: number;
   totalDailyQuotaUnits: number;
   portfolioUnitsUsed: number;
-  /**
-   * Worst-case normalized quota a single portfolio run can consume
-   * (`autonomous_pagination_max_pages`, one unit per official page). The
-   * reservation check must cover every page the run may request, not only the
-   * first one. Defaults to one unit for unit-test callers.
-   */
-  portfolioRunUnits?: number;
   familyShare: Record<string, number>;
   familyCap: number;
   queryCap: number;

@@ -14,6 +14,31 @@ export function boundedPortfolioRatio(value: unknown): number {
     ? Math.min(PORTFOLIO_MAX_RATIO, Math.max(PORTFOLIO_MIN_RATIO, parsed))
     : PORTFOLIO_RATIO;
 }
+
+/** One official-provider page reserves 100 quota units = 1 normalized unit. */
+export const PORTFOLIO_PAGE_UNITS = 1;
+
+/**
+ * Continuation is authorized one page at a time against the shared portfolio
+ * floor. Selecting a run only needs the first page; requiring the pagination
+ * ceiling up front would make cold-start countries ineligible whenever that
+ * ceiling exceeds the reservation. Non-finite or non-positive inputs fail
+ * closed, so a malformed setting can never open the budget.
+ */
+export function portfolioContinuationAllowed(input: {
+  portfolioUnitsUsed: number;
+  portfolioUnitsReserved: number;
+  nextPageUnits?: number;
+}): boolean {
+  const used = Number(input.portfolioUnitsUsed);
+  const reserved = Number(input.portfolioUnitsReserved);
+  const page = Number(input.nextPageUnits ?? PORTFOLIO_PAGE_UNITS);
+  if (!Number.isFinite(used) || !Number.isFinite(reserved) || !Number.isFinite(page)) return false;
+  if (used < 0 || reserved < 0 || page <= 0) return false;
+  // Tolerate binary float artefacts in quota/100 conversions without
+  // admitting a page that genuinely exceeds the remaining floor.
+  return used + page <= reserved + 1e-9;
+}
 export const DECAY_HALF_LIFE_DAYS = 30;
 export const MIN_SELECTION_SAMPLE = 2;
 export const MAX_SELECTION_INDEX = 4.0;

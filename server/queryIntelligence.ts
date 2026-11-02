@@ -1038,13 +1038,10 @@ export async function selectNextQueryForCountry(
   const portfolioRatio = portfolioBudget(1, configuredPortfolioRatio).ratio;
   const familyCap = Math.min(1, Math.max(0.1, Number(await getAppSetting('query_intelligence_family_share_cap', process.env.QUERY_INTELLIGENCE_FAMILY_SHARE_CAP || '0.45')) || 0.45));
   const sourceCap = Math.min(1, Math.max(0.1, Number(await getAppSetting('query_intelligence_source_share_cap', process.env.QUERY_INTELLIGENCE_SOURCE_SHARE_CAP || '0.60')) || 0.60));
-  // A portfolio run may request several official pages; reserve the full
-  // worst-case page cost, not just the pre-run snapshot's first page.
-  const portfolioRunUnits = Math.max(1, Number(await getAppSetting('autonomous_pagination_max_pages', '3')) || 3);
 
   const loadQueries = async (): Promise<QueryRecord[]> => getQueriesByCountry(country);
   const loadPool = async (queries: QueryRecord[]): Promise<SelectorPool> =>
-    buildSelectorPool(country, queries, { now, cooldownMinutes, maxPrimaryUses, nowIso, portfolioRatio, familyCap, sourceCap, portfolioRunUnits });
+    buildSelectorPool(country, queries, { now, cooldownMinutes, maxPrimaryUses, nowIso, portfolioRatio, familyCap, sourceCap });
 
   let allQueries = await loadQueries();
   if (allQueries.length === 0) {
@@ -1204,7 +1201,6 @@ async function buildSelectorPool(
     portfolioRatio: number;
     familyCap: number;
     sourceCap: number;
-    portfolioRunUnits: number;
   },
 ): Promise<SelectorPool> {
   const recentCutoff = options.now.getTime() - options.cooldownMinutes * 60_000;
@@ -1337,7 +1333,6 @@ async function buildSelectorPool(
     portfolioRatio: options.portfolioRatio,
     totalDailyQuotaUnits: budget.dailyQuotaUnits,
     portfolioUnitsUsed: budget.portfolioUnitsUsed,
-    portfolioRunUnits: options.portfolioRunUnits,
     familyShare,
     familyCap: options.familyCap,
     queryCap: 1,

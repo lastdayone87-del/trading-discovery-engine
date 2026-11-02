@@ -23,6 +23,15 @@ import { MULTILINGUAL_CLASSIFICATION_PACKS } from './evidenceEngine/multilingual
  */
 export const TERMINOLOGY_SEARCHABILITY_VERSION = 'terminology-searchability-v1';
 
+/**
+ * Pre-admission query rows predate atomized composition, so the whole stored
+ * query is their only atom. They still need the semantic, script and shape
+ * gates, but the 3-token atom limit would reject every legacy query of four
+ * or more words even when its trading context is valid. The compatibility
+ * bridge therefore allows a bounded longer surface; new atoms never use it.
+ */
+export const LEGACY_COMPATIBILITY_TOKEN_LIMIT = 8;
+
 export type SearchabilityTermType = 'TERMINOLOGY' | 'INSTRUMENT' | 'PHRASE' | 'FORMAT' | 'BRAND' | string;
 
 export interface SearchabilityInput {
@@ -38,6 +47,12 @@ export interface SearchabilityInput {
    * the semantic lexicon match.
    */
   requireTradingSemantics?: boolean;
+  /**
+   * Set only for the legacy whole-query compatibility atom. It raises the
+   * atom token ceiling to LEGACY_COMPATIBILITY_TOKEN_LIMIT; it does not
+   * relax any semantic, script or shape gate.
+   */
+  allowExtendedTokens?: boolean;
 }
 
 export interface SearchabilityShape {
@@ -197,6 +212,9 @@ const LANGUAGE_TRADING_SEMANTICS = (() => {
  * not an automatic promotion path for arbitrary unknown terms.
  */
 const REVIEWED_LANGUAGE_SEMANTICS: Record<string, string[]> = {
+  // English is the universal retrieval language, so these reviewed phrases
+  // must stay eligible for every English query surface.
+  en: ['liquidity zone', 'liquidity zones'],
   de: ['liquiditätszone', 'liquiditätszonen', 'charttechnik', 'chartanalyse'],
   ja: ['トレード', 'デイトレード', 'オーダーフロー'],
 };
@@ -307,7 +325,7 @@ export function isSearchableTradingTerm(input: SearchabilityInput): Searchabilit
   if (contentTokens.length > 0 && contentTokens.every(token => CTA_TOKENS.has(token))) add('cta-only');
   if (contentTokens.length > 0 && contentTokens.every(token => CTA_TOKENS.has(token) || FORMAT_TOKENS.has(token))) add('format-only');
   if (lowerTokens.length > 0 && lowerTokens.every(token => STOPWORDS.has(token))) add('stopword-only');
-  if (termTokens.length > 3) add('too-many-tokens');
+  if (termTokens.length > (input.allowExtendedTokens ? LEGACY_COMPATIBILITY_TOKEN_LIMIT : 3)) add('too-many-tokens');
   if (input.requireTradingSemantics !== false
     && !hasGovernedTradingSemantics(normalizedTerm, { country: input.country, language: input.language })) add('no-trading-semantics');
 

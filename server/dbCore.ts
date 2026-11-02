@@ -38,7 +38,7 @@ import { attributeTerminologyPerformance } from './terminologyIntelligence';
 import { admitQueryRecord, parseGenerationMetadata, withQueryAdmission } from './queryQuality/admission';
 import { deriveQueryFailureState, type QueryFailureStateRow } from './queryQuality/lifecycle';
 import { buildAttribution, buildQueryQualityVector } from './queryQuality/accounting';
-import { boundedPortfolioRatio, DECAY_HALF_LIFE_DAYS } from './queryQuality/posterior';
+import { boundedPortfolioRatio, DECAY_HALF_LIFE_DAYS, portfolioContinuationAllowed } from './queryQuality/posterior';
 import type { QueryQualityDashboardRunInput } from './queryQuality/dashboard';
 import type { QueryAdmission } from './queryQuality/types';
 import type { NativeEvidenceStatus, SourceProvenanceFamily } from './countryNativeIntelligence';
@@ -1433,6 +1433,75 @@ export async function getQueryPortfolioBudgetState(country?:string):Promise<{por
     portfolioUnitsReserved:dailyQuotaUnits*boundedPortfolioRatio(configuredRatio),
     ...(country?{countryUnitsUsed:Math.max(0,Number(countryUsed.rows[0]?.units||0))}:{}),
   };
+}
+
+/**
+ * Authorize one more official page for a portfolio-selected run.
+ *
+ * Selection reserves the first page; every continuation page must clear the
+ * same shared portfolio floor before it is enqueued. The check and the
+ * reservation increment run under one advisory lock so two workers cannot
+ * both spend the last unit. The reservation is addressed by target page
+ * number, which makes a retried continuation idempotent instead of
+ * over-reserving the run.
+ *
+ * Quota-free providers spend no official units and are always allowed.
+ */
+export async function reservePortfolioContinuationPage(input: {
+  queryRunId: string;
+  pageNumber: number;
+  providerQuotaUnits: number;
+}): Promise<{authorized:boolean;reason:string}> {
+  const pageUnits = Number(input.providerQuotaUnits);
+  if (!Number.isFinite(pageUnits) || pageUnits <= 0) return {authorized:true,reason:'NO_OFFICIAL_QUOTA'};
+  if (!Number.isFinite(input.pageNumber) || input.pageNumber < 1) return {authorized:false,reason:'INVALID_PAGE_NUMBER'};
+  const db=await getDb();
+  const client=await db.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`,['query-portfolio-budget']);
+    const run=await client.query(`SELECT selection_strategy,selection_reason,quota_reserved,quota_used FROM query_runs WHERE id=$1 FOR UPDATE`,[input.queryRunId]);
+    if(!run.rowCount){await client.query('ROLLBACK');return {authorized:false,reason:'QUERY_RUN_NOT_FOUND'};}
+    const row=run.rows[0];
+    const strategy=String(row.selection_strategy||'');
+    const selectionReason=String(row.selection_reason||'');
+    const portfolioRun=['UCB_PORTFOLIO','UCB1_EXPLORATION','COLD_START_GENERATION'].includes(strategy)
+      || selectionReason.startsWith('Bounded portfolio');
+    if(!portfolioRun){await client.query('COMMIT');return {authorized:true,reason:'NOT_PORTFOLIO_RUN'};}
+
+    const targetReserved=Math.max(0,input.pageNumber*pageUnits);
+    const currentReserved=Math.max(0,Number(row.quota_reserved||0),Number(row.quota_used||0));
+    if(currentReserved>=targetReserved){
+      // This page was already authorized (job retry or duplicate delivery).
+      await client.query('COMMIT');
+      return {authorized:true,reason:'ALREADY_RESERVED'};
+    }
+
+    const [quota,used,configuredRatio]=await Promise.all([
+      client.query(`SELECT daily_limit FROM quota_tracker WHERE id='youtube'`),
+      client.query(PORTFOLIO_UNITS_SQL),
+      client.query(`SELECT setting_value FROM app_settings WHERE setting_key='query_intelligence_portfolio_ratio'`),
+    ]);
+    const dailyQuotaUnits=Math.max(1,Number(quota.rows[0]?.daily_limit||10000)/100);
+    const portfolioUnitsReserved=dailyQuotaUnits*boundedPortfolioRatio(
+      configuredRatio.rows[0]?.setting_value ?? process.env.QUERY_INTELLIGENCE_PORTFOLIO_RATIO ?? '0.15',
+    );
+    const portfolioUnitsUsed=Math.max(0,Number(used.rows[0]?.units||0));
+    const additionalUnits=(targetReserved-currentReserved)/100;
+    if(!portfolioContinuationAllowed({portfolioUnitsUsed,portfolioUnitsReserved,nextPageUnits:additionalUnits})){
+      await client.query('ROLLBACK');
+      return {authorized:false,reason:'PORTFOLIO_BUDGET_EXHAUSTED'};
+    }
+    await client.query(`UPDATE query_runs SET quota_reserved=GREATEST(COALESCE(quota_reserved,0),COALESCE(quota_used,0),$2) WHERE id=$1`,[input.queryRunId,targetReserved]);
+    await client.query('COMMIT');
+    return {authorized:true,reason:'RESERVED'};
+  } catch(error) {
+    await client.query('ROLLBACK').catch(()=>undefined);
+    console.warn('[QueryPortfolio] Failed to reserve continuation page:',error);
+    return {authorized:false,reason:'RESERVATION_FAILED'};
+  } finally {
+    client.release();
+  }
 }
 /** Q6 read-only projection over query runs + stored attribution JSONB. */
 export async function getQueryQualityDashboardRows(country?:string,limit=200):Promise<QueryQualityDashboardRunInput[]>{const db=await getDb();const res=await db.query(`SELECT qr.id::text AS run_id,qr.query_id,COALESCE(ql.query,'') AS query,qr.country,qr.status,qr.selection_strategy,qr.selection_reason,qr.quota_used,qr.completed_at,qr.performance_details,COALESCE(a.metrics,'{}'::jsonb) AS metrics,COALESCE(qr.metadata,'{}'::jsonb) AS run_metadata,(SELECT apo.stopping_reason FROM autonomous_query_page_observations apo WHERE apo.query_run_id=qr.id ORDER BY apo.page_number DESC LIMIT 1) AS stop_reason FROM query_runs qr LEFT JOIN query_library ql ON ql.id=qr.query_id LEFT JOIN query_run_accounting_attributions a ON a.query_run_id=qr.id WHERE ($1::text IS NULL OR LOWER(qr.country)=LOWER($1)) ORDER BY qr.scheduled_at DESC LIMIT $2`,[country||null,Math.max(1,Math.min(500,Math.floor(limit)))]);return res.rows.map((r:any)=>{const metrics=parseJson<Record<string,any>>(r.metrics,{});const metadata=parseGenerationMetadata(r.run_metadata);const admission=metadata.queryAdmission||null;return {runId:String(r.run_id||''),queryId:Number(r.query_id||0),query:String(r.query||''),country:String(r.country||''),status:String(r.status||''),selectionStrategy:String(r.selection_strategy||'UNKNOWN'),selectionReason:String(r.selection_reason||''),stopReason:r.stop_reason?String(r.stop_reason):null,quotaUsed:Number(r.quota_used||0),completedAt:iso(r.completed_at),performanceScore:Number(r.performance_details?.performanceScore||metrics.performanceScore||0),qualityVector:metrics.qualityVector||null,admission:admission?{tier:admission.tier,compositionFamily:admission.compositionFamily,reasonCodes:Array.isArray(admission.reasonCodes)?admission.reasonCodes:[],source:admission.source,eligible:admission.eligible}:null};});}

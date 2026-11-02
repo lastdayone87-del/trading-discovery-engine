@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { isSearchableTradingTerm, type SearchabilityTermType } from '../terminologySearchability';
+import { isSearchableTradingTerm, LEGACY_COMPATIBILITY_TOKEN_LIMIT, type SearchabilityTermType } from '../terminologySearchability';
 import { getCountryMarketProfile, isRegisteredCountry } from './profiles';
 import type {
   CountryMarketProfile,
@@ -125,6 +125,9 @@ function gateAtom(atom: QueryAtom): ReturnType<typeof isSearchableTradingTerm> {
     country: atom.sense.country,
     language: atom.sense.language,
     requireTradingSemantics: requiresTradingSemantics(atom.provenance),
+    // The legacy bridge uses the stored query as one atom; it may be longer
+    // than a normal atom without becoming an unbounded term.
+    allowExtendedTokens: atom.provenance === 'LEGACY_COMPATIBILITY',
   });
 }
 
@@ -242,10 +245,11 @@ export function evaluateQueryComposition(candidate: QueryCandidate, context: Com
   const reasons: string[] = [];
   const normalized = normalizeCompositionTerm(candidate.query);
   const tokens = queryCompositionTokens(normalized);
+  const legacyCompatibility = candidate.atoms.some(atom => atom.provenance === 'LEGACY_COMPATIBILITY');
 
   if (!isRegisteredCountry(candidate.country)) reasons.push('UNSUPPORTED_COUNTRY');
   if (!normalized || tokens.length === 0) reasons.push('EMPTY_QUERY');
-  if (tokens.length > 3) reasons.push('TOO_MANY_TOKENS');
+  if (tokens.length > (legacyCompatibility ? LEGACY_COMPATIBILITY_TOKEN_LIMIT : 3)) reasons.push('TOO_MANY_TOKENS');
   if (normalized.length > 40) reasons.push('TOO_LONG');
   if (tokens.length === 1 && BARE_SHORT_TICKER.test(tokens[0])) reasons.push('BARE_SHORT_TICKER');
   if (candidate.atoms.length === 0) reasons.push('NO_TYPED_ATOMS');

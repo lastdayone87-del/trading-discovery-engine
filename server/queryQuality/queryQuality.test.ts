@@ -27,7 +27,7 @@ import {
   getCountryMarketProfile,
   PRODUCTION_CONFIGURED_ACTIVE_COUNTRIES,
 } from './profiles';
-import { computePosterior, empiricalPrior, PORTFOLIO_RATIO, SELECTOR_C } from './posterior';
+import { computePosterior, empiricalPrior, PORTFOLIO_RATIO, SELECTOR_C, portfolioContinuationAllowed } from './posterior';
 import { selectHierarchicalUcb, portfolioBudget, buildHierarchy } from './selector';
 import { deriveQueryFailureState, isQuerySelectable } from './lifecycle';
 import { buildQueryQualityVector, buildAttribution, canPromoteToProven, isRewardEligibleQuota } from './accounting';
@@ -129,6 +129,18 @@ test('Q0: Common-script letters in Japanese terms do not fail the script gate', 
   assert.ok(wrongLanguage.reasons.includes('no-trading-semantics'));
 });
 
+test('Q2: reviewed English liquidity-zone phrases keep search eligibility', () => {
+  // These are governed reviewed phrases that are absent from the global lists
+  // and language packs; dropping them evicted already-learned terms.
+  for (const term of ['liquidity zone', 'liquidity zones']) {
+    const gate = isSearchableTradingTerm({ term, termType: 'TERMINOLOGY', country: 'United States', language: 'en' });
+    assert.equal(gate.eligible, true, `${term}: ${gate.reasons.join(', ')}`);
+  }
+  // English phrases stay admissible as the universal retrieval language.
+  const noDeclaredLanguage = isSearchableTradingTerm({ term: 'liquidity zones', termType: 'TERMINOLOGY', country: 'Germany' });
+  assert.equal(noDeclaredLanguage.eligible, true, noDeclaredLanguage.reasons.join(', '));
+});
+
 test('Q2: legacy compound rows are admitted on the full query, not the bare primary term', () => {
   // A pre-admission row carries its trading context in `query`; judging the
   // bare `primary_term` made `CAC 40 trading` speculative and got it rejected
@@ -141,6 +153,31 @@ test('Q2: legacy compound rows are admitted on the full query, not the bare prim
   });
   assert.equal(decision.eligible, true);
   assert.notEqual(decision.admission.tier, 'SPECULATIVE');
+});
+
+test('Q2: legacy rows longer than three query tokens keep admission within a bounded limit', () => {
+  // The compatibility atom is the whole stored query, not a normal atom. The
+  // 3-token atom ceiling must not reject every pre-admission row of four or
+  // more words when the query itself carries governed trading semantics.
+  const legacy = admitQueryRecord({
+    query: 'CAC 40 trading pour débutants',
+    country: 'France',
+    primary_term: 'CAC 40',
+    generation_metadata: {},
+  });
+  assert.equal(legacy.eligible, true, legacy.reasonCodes.join(','));
+  assert.ok(!legacy.reasonCodes.includes('TOO_MANY_TOKENS'));
+  assert.ok(!legacy.reasonCodes.includes('TERM_TOO_MANY_TOKENS'));
+
+  // The bridge is still bounded: an arbitrarily long legacy query fails.
+  const overlong = admitQueryRecord({
+    query: 'CAC 40 trading pour les débutants français en bourse aujourd hui',
+    country: 'France',
+    primary_term: 'CAC 40',
+    generation_metadata: {},
+  });
+  assert.equal(overlong.eligible, false);
+  assert.ok(overlong.reasonCodes.includes('TERM_TOO_MANY_TOKENS'));
 });
 
 test('Q2: every planned query for all 16 production countries is admitted (123/123)', () => {
@@ -1340,14 +1377,27 @@ test('Q4: a fractional portfolio remainder cannot cover the next official run', 
   const exactReservation = selectHierarchicalUcb([cold], selectorContext({ portfolioUnitsUsed: 14 }));
   assert.equal(exactReservation.strategy, 'UCB_PORTFOLIO');
   assert.equal(exactReservation.queryId, 1);
+});
 
-  // A run may continue for several pages, so the remaining budget must cover
-  // the worst-case run cost, not only the first page's one unit.
-  const multiPageFits = selectHierarchicalUcb([cold], selectorContext({ portfolioUnitsUsed: 12, portfolioRunUnits: 3 }));
-  assert.equal(multiPageFits.strategy, 'UCB_PORTFOLIO');
-  const multiPageOverflows = selectHierarchicalUcb([cold], selectorContext({ portfolioUnitsUsed: 13, portfolioRunUnits: 3 }));
-  assert.equal(multiPageOverflows.strategy, 'NO_ELIGIBLE_QUERY');
-  assert.ok(multiPageOverflows.reasonCodes.includes('PORTFOLIO_BUDGET_EXHAUSTED'));
+test('Q4: continuation is authorized page by page against the shared portfolio floor', () => {
+  // A pagination ceiling larger than the whole portfolio floor must not make
+  // cold-start selection impossible: one remaining unit is enough to select.
+  assert.equal(portfolioContinuationAllowed({ portfolioUnitsUsed: 14, portfolioUnitsReserved: 15 }), true);
+  assert.equal(portfolioContinuationAllowed({ portfolioUnitsUsed: 15, portfolioUnitsReserved: 15 }), false);
+  // Fractional artifacts from quota/100 conversion stay admissible.
+  assert.equal(portfolioContinuationAllowed({ portfolioUnitsUsed: 14.0000000001, portfolioUnitsReserved: 15 }), true);
+  // Malformed input fails closed instead of opening the budget.
+  assert.equal(portfolioContinuationAllowed({ portfolioUnitsUsed: Number.NaN, portfolioUnitsReserved: 15 }), false);
+  assert.equal(portfolioContinuationAllowed({ portfolioUnitsUsed: 0, portfolioUnitsReserved: Number.POSITIVE_INFINITY }), false);
+  assert.equal(portfolioContinuationAllowed({ portfolioUnitsUsed: 0, portfolioUnitsReserved: 15, nextPageUnits: 0 }), false);
+
+  const selector = readFileSync(join(__dirname, 'selector.ts'), 'utf8');
+  // The pagination ceiling is not a selection input any more.
+  assert.ok(!selector.includes('portfolioRunUnits'));
+  const queue = readFileSync(join(__dirname, '..', 'queueManager.ts'), 'utf8');
+  assert.match(queue, /reservePortfolioContinuationPage\(\{/);
+  assert.match(queue, /pageNumber: pageNumber \+ 1/);
+  assert.match(queue, /Number\.isFinite\(configuredMaxPages\)/);
 });
 
 test('Q4: simulator portfolio admission is quota-weighted, not pull-weighted', () => {

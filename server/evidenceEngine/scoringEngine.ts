@@ -121,7 +121,13 @@ export class ConfigurableWeightedStrategy {
           ? 'DETERMINISTIC_EVIDENCE'
           : evidenceCollection.degraded || evidenceCollection.sufficiency !== 'SUFFICIENT'
             ? 'DEGRADED_HEURISTIC'
-            : 'HEURISTIC_ONLY'
+            // Recognition can stay non-decisive while the unified policy
+            // still returns a terminal status (for example a dominant
+            // attributed contradiction on REJECT). A terminal decision is not
+            // heuristic solely because the recognition object abstained.
+            : status !== 'UNCERTAIN'
+              ? 'DETERMINISTIC_EVIDENCE'
+              : 'HEURISTIC_ONLY'
         // Callers may omit the optional recognition report. A decisive
         // deterministic decision over sufficient evidence must not then be
         // mislabeled HEURISTIC_ONLY just because no recognition object exists.
