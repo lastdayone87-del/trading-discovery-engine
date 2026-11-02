@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { DEFAULT_BROWSER_FALLBACK_BUDGET, DECLARATIVE_SHADOW_SCAN_MAX_BYTES, advanceRenderedLifecycleStage, beginRenderedDeclarativeShadowScan, browserCauseSnippet, browserFallbackTelemetrySummary, buildRenderedLinkBaseline, classifyCrawlCatch, classifyRenderedPopupDestination, countDeclarativeClosedShadowRoots, createRenderedRouteGuard, disposeRenderedRouteGuards, installRenderedRouteCloseCleanup, isExpectedRenderedRouteShutdownError, isTelegramPostPermalink, mergeRenderedPageContextCounts, planRevealedSameOriginEnqueues, popupMarkupEvidenceSourceUrl, readRenderedDeclarativeShadowScan, renderedPopupWaitTimeoutMs, RenderedFallbackGate, renderedFallbackGate, resolveRenderedZeroPageReason, retainSkippableAnchorEvidence, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback, shouldSkipPreexistingSiblingPage, sumRenderedPageContextCounts, type BrowserFallbackTelemetry, type RenderedRouteLike } from './browserCommunityFallback';
+import { DEFAULT_BROWSER_FALLBACK_BUDGET, DECLARATIVE_SHADOW_SCAN_MAX_BYTES, advanceRenderedLifecycleStage, beginRenderedDeclarativeShadowScan, browserCauseSnippet, browserFallbackTelemetrySummary, buildRenderedLinkBaseline, classifyCrawlCatch, classifyRenderedPopupDestination, collectRenderedCrossOriginCandidates, countDeclarativeClosedShadowRoots, createRenderedRouteGuard, disposeRenderedRouteGuards, installRenderedRouteCloseCleanup, isExpectedRenderedRouteShutdownError, isTelegramPostPermalink, mergeRenderedPageContextCounts, planRevealedSameOriginEnqueues, popupMarkupEvidenceSourceUrl, readRenderedDeclarativeShadowScan, renderedPopupWaitTimeoutMs, RenderedFallbackGate, renderedFallbackGate, resolveRenderedZeroPageReason, retainSkippableAnchorEvidence, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback, shouldRecordSaturatedBaselineGap, shouldSkipPreexistingSiblingPage, sumRenderedPageContextCounts, type BrowserFallbackTelemetry, type RenderedRouteLike } from './browserCommunityFallback';
 import { inferDiscordOwnership, makeDiscordCandidate } from './discordCandidates';
 import { redactCauseSnippet } from './crawlerTelemetry';
 import { classifyRenderedCrawlerFailure, isRenderedNavigationTimeout, renderedCrawlerHostBackoffMs, renderedCrawlerRetryPolicy } from './renderedCrawlerPolicy';
@@ -1055,4 +1055,73 @@ test('a saturated same-origin baseline never admits or counts overflow as reveal
     baselineSaturated: unsaturated.saturated,
   });
   assert.deepEqual(admitted.admitted, ['https://creator.example/inserted-after-click']);
+});
+
+test('a saturated baseline records one coverage gap only after a real interaction', () => {
+  const baseline = buildRenderedLinkBaseline({
+    candidates: Array.from({ length: 500 }, (_, index) => ({
+      url: `https://creator.example/static-${index}`,
+      text: `Static ${index}`,
+    })),
+    overflowCandidates: [{ url: 'https://creator.example/overflow', text: 'Overflow' }],
+    truncated: 1,
+  });
+  assert.equal(baseline.saturated, true);
+  const recorded = new Set<string>();
+  assert.equal(
+    shouldRecordSaturatedBaselineGap(baseline, false, recorded, 'doc-a'),
+    false,
+    'static overflow with no interaction still resolves cleanly',
+  );
+  assert.equal(
+    shouldRecordSaturatedBaselineGap(baseline, true, recorded, 'doc-a'),
+    true,
+    'an interaction may have revealed a destination the saturated baseline cannot distinguish',
+  );
+  recorded.add('doc-a');
+  assert.equal(
+    shouldRecordSaturatedBaselineGap(baseline, true, recorded, 'doc-a'),
+    false,
+    'the ambiguity is reported once per document, not once per click',
+  );
+  assert.equal(
+    shouldRecordSaturatedBaselineGap(baseline, true, recorded, 'doc-b'),
+    true,
+    'a later clicked-to document is accounted independently',
+  );
+  assert.equal(
+    shouldRecordSaturatedBaselineGap({ links: new Set(), saturated: false }, true, recorded, 'doc-c'),
+    false,
+    'an unsaturated baseline classifies revealed links normally and needs no gap',
+  );
+});
+
+test('a filled cross-origin overflow sample is never treated as fully classified', () => {
+  const node = (href: string) => ({
+    href,
+    textContent: 'Outbound',
+  }) as unknown as Element;
+  const url = 'https://creator.example/';
+  // 500 same-origin anchors are filtered before the bound. 500 cross-origin
+  // anchors fill the collection, then 500 more fill the overflow sample. The
+  // final anchor fills the sample exactly, so every anchor was classified.
+  const exact = [
+    ...Array.from({ length: 500 }, (_, index) => node(`https://creator.example/${index}`)),
+    ...Array.from({ length: 1000 }, (_, index) => node(`https://outside.test/${index}`)),
+  ];
+  const exactCollection = collectRenderedCrossOriginCandidates(exact, url);
+  assert.equal(exactCollection.candidates.length, 500);
+  assert.equal(exactCollection.overflowCandidates.length, 500);
+  assert.equal(exactCollection.overflowSampleFilled, false, 'a page ending at the sample bound is fully classified');
+
+  // 500 collected + 500 sampled + one more anchor: the final anchor was never
+  // classified, so an all-vendor sample still cannot certify a clean absence.
+  const truncated = [
+    ...Array.from({ length: 500 }, (_, index) => node(`https://creator.example/${index}`)),
+    ...Array.from({ length: 1001 }, (_, index) => node(`https://outside.test/${index}`)),
+  ];
+  const truncatedCollection = collectRenderedCrossOriginCandidates(truncated, url);
+  assert.equal(truncatedCollection.candidates.length, 500);
+  assert.equal(truncatedCollection.overflowCandidates.length, 500);
+  assert.equal(truncatedCollection.overflowSampleFilled, true, 'the unclassified remainder keeps coverage partial');
 });

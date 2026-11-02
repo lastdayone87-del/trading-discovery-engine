@@ -1641,10 +1641,24 @@ export function sumRenderedPageContextCounts(
   return total;
 }
 
+export interface RenderedAnchorClickSkipOptions {
+  /** True while the bounded cross-origin pass will pursue eligible
+   * destinations. Cross-host anchors are then enqueue-owned, not clicked. */
+  crossOriginPursued?: boolean;
+  /**
+   * Normalized destinations already enqueued by the cross-origin/popup/reveal
+   * passes. A re-enumeration must not turn an already-queued hub into a click:
+   * the click would navigate to a page the crawl already owns and spend the
+   * remaining control budget on a duplicate fetch. A callback lets callers
+   * expose live queues that grow while the click loop runs.
+   */
+  queuedDestinations?: ReadonlySet<string> | ((normalizedUrl: string) => boolean);
+}
+
 export function isSkippableNavigableAnchorClick(
   target: Pick<RenderedControlTarget, 'href'> & { text?: string },
   pageUrl: string,
-  options: { crossOriginPursued?: boolean } = {},
+  options: RenderedAnchorClickSkipOptions = {},
 ): boolean {
   const href = (target.href || '').trim();
   if (!href) return false;
@@ -1665,6 +1679,15 @@ export function isSkippableNavigableAnchorClick(
   // Fragment-only navigation stays on the same document: clicking may reveal
   // content, so it is never skipped.
   if (withoutHash(absolute) === withoutHash(page)) return false;
+  // A destination already enqueued (cross-origin hub, popup, or revealed
+  // same-origin link) is owned by that pass. Clicking it would navigate to a
+  // page the crawl already fetches, duplicating work and spending the control
+  // budget on a destination whose content is already covered.
+  const visitKey = normalizeVisitUrl(absolute.toString());
+  if (visitKey) {
+    const queued = options.queuedDestinations;
+    if (typeof queued === 'function' ? queued(visitKey) : queued?.has(visitKey)) return true;
+  }
   if (absolute.origin !== page.origin) {
     // A direct invite URL is terminal evidence already retained from its
     // text+href; opening it adds no discovery and spends the page budget.
@@ -1701,7 +1724,7 @@ export function retainSkippableAnchorEvidence(
   controls: readonly Pick<RenderedControlTarget, 'text' | 'href'>[],
   pageUrl: string,
   retain: (text: string, pageUrl: string) => void,
-  options: { crossOriginPursued?: boolean } = {},
+  options: RenderedAnchorClickSkipOptions = {},
 ): number {
   let retained = 0;
   for (const control of controls) {
@@ -1828,6 +1851,12 @@ export interface RenderedCandidateCollection {
    */
   overflowCandidates: RenderedCrossOriginCandidate[];
   truncated: number;
+  /**
+   * True when the bounded overflow sample was filled. Anchors after the sample
+   * were never classified, so even an all-irrelevant sample cannot prove that
+   * no eligible community destination remains.
+   */
+  overflowSampleFilled?: boolean;
 }
 
 export interface RenderedLinkBaseline {
@@ -1849,6 +1878,23 @@ export function buildRenderedLinkBaseline(collection: RenderedCandidateCollectio
     if (key) links.add(key);
   }
   return { links, saturated: collection.truncated > 0 };
+}
+
+/**
+ * A saturated baseline cannot tell static overflow from links an interaction
+ * revealed. When an interaction actually occurred on that document, one
+ * coverage gap is warranted (once per document): otherwise a menu-revealed
+ * generic destination could be certified absent. A document with no
+ * interaction stays clean, so a page with 500+ static links does not become
+ * permanently `BOUNDED`.
+ */
+export function shouldRecordSaturatedBaselineGap(
+  baseline: RenderedLinkBaseline,
+  interactionOccurred: boolean,
+  recordedDocuments: ReadonlySet<string>,
+  documentKey: string,
+): boolean {
+  return baseline.saturated && interactionOccurred && !recordedDocuments.has(documentKey);
 }
 
 export interface RenderedCrossOriginEnqueuePlan {
@@ -1893,13 +1939,15 @@ export function collectRenderedCrossOriginCandidates(
   // Playwright serializes its source; a module-level constant would not exist
   // in the page. The collector still keeps only the first `limit` candidates.
   const overflowSampleMax = 500;
+  let overflowSampleFilled = false;
   let currentOrigin = '';
   try {
     currentOrigin = new URL(currentUrl).origin;
   } catch {
-    return { candidates, overflowCandidates, truncated };
+    return { candidates, overflowCandidates, truncated, overflowSampleFilled };
   }
-  for (const node of nodes) {
+  for (let nodeIndex = 0; nodeIndex < nodes.length; nodeIndex++) {
+    const node = nodes[nodeIndex];
     const anchor = node as HTMLAnchorElement;
     let target: URL;
     try {
@@ -1916,16 +1964,25 @@ export function collectRenderedCrossOriginCandidates(
           url: target.toString(),
           text: (anchor.textContent || '').trim().slice(0, 200),
         });
+        if (truncated >= overflowSampleMax) {
+          // The sample is full. Only a page ending here is fully classified;
+          // otherwise later anchors were never examined.
+          overflowSampleFilled = nodeIndex < nodes.length - 1;
+          if (overflowSampleFilled) break;
+        }
+        continue;
       }
-      if (truncated >= overflowSampleMax) break;
-      continue;
+      // The sample filled on an earlier anchor; this anchor (and any after
+      // it) was never classified.
+      overflowSampleFilled = true;
+      break;
     }
     candidates.push({
       url: target.toString(),
       text: (anchor.textContent || '').trim().slice(0, 200),
     });
   }
-  return { candidates, overflowCandidates, truncated };
+  return { candidates, overflowCandidates, truncated, overflowSampleFilled };
 }
 
 /**
@@ -2035,6 +2092,7 @@ export function collectRenderedSameOriginCandidates(
   let truncated = 0;
   // Self-contained overflow bound; see the cross-origin collector.
   const overflowSampleMax = 500;
+  let overflowSampleFilled = false;
   let currentOrigin = '';
   let currentIdentity = '';
   try {
@@ -2043,9 +2101,10 @@ export function collectRenderedSameOriginCandidates(
     current.hash = '';
     currentIdentity = current.toString();
   } catch {
-    return { candidates, overflowCandidates, truncated };
+    return { candidates, overflowCandidates, truncated, overflowSampleFilled };
   }
-  for (const node of nodes) {
+  for (let nodeIndex = 0; nodeIndex < nodes.length; nodeIndex++) {
+    const node = nodes[nodeIndex];
     const anchor = node as HTMLAnchorElement;
     let target: URL;
     try {
@@ -2064,16 +2123,25 @@ export function collectRenderedSameOriginCandidates(
           url: target.toString(),
           text: (anchor.textContent || '').trim().slice(0, 200),
         });
+        if (truncated >= overflowSampleMax) {
+          // The sample is full. Only a page ending here is fully classified;
+          // otherwise later anchors were never examined.
+          overflowSampleFilled = nodeIndex < nodes.length - 1;
+          if (overflowSampleFilled) break;
+        }
+        continue;
       }
-      if (truncated >= overflowSampleMax) break;
-      continue;
+      // The sample filled on an earlier anchor; this anchor (and any after
+      // it) was never classified.
+      overflowSampleFilled = true;
+      break;
     }
     candidates.push({
       url: target.toString(),
       text: (anchor.textContent || '').trim().slice(0, 200),
     });
   }
-  return { candidates, overflowCandidates, truncated };
+  return { candidates, overflowCandidates, truncated, overflowSampleFilled };
 }
 
 export interface RenderedRevealedSameOriginPlan {
@@ -2204,7 +2272,7 @@ export function partitionRenderedClickTargets(
   maxClicks: number,
   offset = 0,
   evaluationWindowSize = RENDERED_CONTROL_EVALUATION_WINDOW,
-  options: { crossOriginPursued?: boolean } = {},
+  options: RenderedAnchorClickSkipOptions = {},
 ): { toClick: RenderedControlTarget[]; skippedNavigableAnchors: number; evaluationWindow: RenderedControlTarget[] } {
   const cap = Math.max(0, Math.trunc(maxClicks) || 0);
   const windowSize = Math.max(0, Math.trunc(evaluationWindowSize) || 0);
@@ -2343,7 +2411,7 @@ export function planRevealedRenderedClickTargets(
   clickedThisPage: number,
   pendingQueuedTargets: number,
   offset = 0,
-  options: { crossOriginPursued?: boolean } = {},
+  options: RenderedAnchorClickSkipOptions = {},
 ): { toClick: RenderedControlTarget[]; skipped: RenderedControlTarget[]; remainingClickBudget: number } {
   const remainingClickBudget = remainingRenderedClickBudget(maxClicks, clickedThisPage, pendingQueuedTargets);
   const plan = partitionRenderedClickTargets(controls, pageUrl, remainingClickBudget, offset, undefined, options);
@@ -2387,6 +2455,10 @@ export interface RenderedClickLoopInput {
   /** True while the bounded cross-origin pass will pursue eligible
    * destinations. Cross-host anchors are then enqueue-owned, not clicked. */
   crossOriginPursued?: boolean;
+  /** Live view of destinations already enqueued by the cross-origin/popup/
+   * reveal passes. Re-enumeration must not click a destination the crawl
+   * already owns. */
+  queuedDestinations?: RenderedAnchorClickSkipOptions['queuedDestinations'];
   /** Markers already accounted as skipped by the initial plan. Mutated so
    * re-enumerations cannot double-count them. */
   countedSkips?: Set<string>;
@@ -2507,7 +2579,10 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
           clickedThisPage,
           pendingQueuedTargets,
           input.clickOffset,
-          { crossOriginPursued: input.crossOriginPursued },
+          {
+            crossOriginPursued: input.crossOriginPursued,
+            queuedDestinations: input.queuedDestinations,
+          },
         );
         // Newly revealed controls that do not fit the remaining click budget
         // were never examined. Count only genuinely new skips (initial
@@ -3844,6 +3919,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 : (normalizeVisitUrl(url) || url);
             let initialLinksCaptured = false;
             let revealedScanFailed = false;
+            // A saturated baseline cannot tell static overflow from links a
+            // menu/panel revealed. Report the ambiguity once per document when
+            // an interaction occurred, instead of certifying a clean absence.
+            const saturatedBaselineGapDocuments = new Set<string>();
             const captureBaseline = async (): Promise<void> => {
               try {
                 const identity = await page.evaluate(() => performance.timeOrigin).catch(() => null);
@@ -3868,7 +3947,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // every click and once more after the loop for click-revealed
             // links. Each document's baseline records every candidate already
             // considered, so repeated passes neither re-admit nor re-count it.
-            const captureRevealedSameOrigin = async (): Promise<void> => {
+            const captureRevealedSameOrigin = async (interactionOccurred: boolean): Promise<void> => {
               if (!initialLinksCaptured || Date.now() - startedAt >= limits.totalTimeoutMs) return;
               let currentUrl = '';
               let baselineKey = '';
@@ -3899,7 +3978,19 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 // interaction-revealed links cannot be distinguished.
                 // Admitting the overflow would spend the page budget on
                 // static navigation; hint-bearing links are still owned by
-                // the same-host hint pass. Do not count this as a gap.
+                // the same-host hint pass. But an interaction did happen: a
+                // generic destination it revealed (for example `/resources`)
+                // is genuinely unexchanged and the overflow bound cannot rule
+                // it out, so coverage must stay partial (once per document).
+                if (shouldRecordSaturatedBaselineGap(
+                  baseline,
+                  interactionOccurred,
+                  saturatedBaselineGapDocuments,
+                  baselineKey,
+                )) {
+                  saturatedBaselineGapDocuments.add(baselineKey);
+                  revealedSameOriginDropped++;
+                }
                 return;
               }
               if (revealedCollection.truncated > 0) {
@@ -4037,6 +4128,14 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             const crossOriginPursuitActive = (): boolean =>
               limits.crossOriginEnqueue === true
               && crossOriginQueued.size < MAX_RENDERED_CROSS_ORIGIN_ENQUEUES;
+            // A destination already enqueued by another pass is never clicked.
+            // The sets are live: `enqueueCrossOrigin`/`drainPopups` fill them
+            // before and during the click loop, and re-enumeration would
+            // otherwise turn a queued hub into a duplicate navigation.
+            const isQueuedDestination = (visitKey: string): boolean =>
+              crossOriginQueued.has(visitKey)
+              || revealedQueued.has(visitKey)
+              || popupQueued.has(visitKey);
             // A navigable anchor is excluded from clicks because either the
             // enqueue policy owns it (same-origin hint match) or it is
             // cross-origin and must never navigate the document. Its live
@@ -4045,6 +4144,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // JS-inserted direct Discord/invite href would be lost entirely.
             retainSkippableAnchorEvidence(controls, page.url(), retain, {
               crossOriginPursued: crossOriginPursuitActive(),
+              queuedDestinations: isQueuedDestination,
             });
             // Navigable same-host anchors are already discovered through
             // enqueueLinks and Discord-scanned before any click, so the click
@@ -4057,7 +4157,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               limits.maxClicksPerPage,
               limits.clickOffset,
               undefined,
-              { crossOriginPursued: crossOriginPursuitActive() },
+              {
+                crossOriginPursued: crossOriginPursuitActive(),
+                queuedDestinations: isQueuedDestination,
+              },
             );
             // A window made entirely of navigable anchors is fully examined
             // with zero clicks. Record that explicitly so the durable retry
@@ -4080,6 +4183,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               if (control.marker && !clickPlan.toClick.some(target => target.marker === control.marker)
                 && !isSkippableNavigableAnchorClick(control, page.url(), {
                   crossOriginPursued: crossOriginPursuitActive(),
+                  queuedDestinations: isQueuedDestination,
                 })) {
                 countedControlSkips.add(control.marker);
               }
@@ -4171,14 +4275,20 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                   collection.overflowCandidates,
                   page.url(),
                 );
-                if (overflowEligible > 0) {
-                  if (!limits.crossOriginEnqueue) {
-                    // Pursuit is OFF, so these eligible destinations are a
-                    // deliberate policy exclusion rather than a collector gap.
+                if (!limits.crossOriginEnqueue) {
+                  // Pursuit is OFF, so any eligible destination is a
+                  // deliberate policy exclusion rather than a collector gap.
+                  if (overflowEligible > 0) {
                     drops.count('cross-origin-disallowed', overflowEligible);
-                  } else {
-                    candidateCapTruncated = Math.max(candidateCapTruncated, overflowEligible);
                   }
+                } else if (overflowEligible > 0) {
+                  candidateCapTruncated = Math.max(candidateCapTruncated, overflowEligible);
+                } else if (collection.overflowSampleFilled === true) {
+                  // The sample itself was exhausted: later anchors were never
+                  // classified, so an all-irrelevant sample cannot prove that
+                  // no eligible community destination remains. Keep coverage
+                  // partial instead of certifying a clean absence.
+                  candidateCapTruncated = Math.max(candidateCapTruncated, 1);
                 }
                 candidates = collection.candidates;
               } catch {
@@ -4342,8 +4452,11 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 await recordPageContext();
                 await drainPopups();
                 // Preserve a newly revealed destination before the next click
-                // replaces the panel that contains it.
-                await captureRevealedSameOrigin();
+                // replaces the panel that contains it. This is the only pass
+                // that reports a saturated-baseline gap: it runs on the
+                // document where the interaction actually happened, while the
+                // post-loop pass may be looking at a click-navigated document.
+                await captureRevealedSameOrigin(true);
                 if (clickOutcome.ok && control.popup) popupTargetsResolved++;
                 return clickOutcome.ok;
               },
@@ -4354,6 +4467,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               documentIdentity: () => page.evaluate(() => performance.timeOrigin),
               clickOffset: limits.clickOffset,
               crossOriginPursued: crossOriginPursuitActive(),
+              queuedDestinations: isQueuedDestination,
               countedSkips: countedControlSkips,
               onEnumerated: recordControlEnumeration,
             });
@@ -4377,8 +4491,11 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // path) are still legitimate navigation: the page deliberately
             // revealed them. Per-click passes already captured panels that a
             // later click replaced; this final pass catches scroll-revealed
-            // links and the last click's additions.
-            await captureRevealedSameOrigin();
+            // links and the last click's additions. Per-click passes already
+            // recorded any saturated-baseline gap on the interacted document;
+            // this final pass must not attribute that interaction to a
+            // click-navigated document.
+            await captureRevealedSameOrigin(false);
             if (revealedScanFailed) {
               // An interaction surface existed but could not be enumerated;
               // a revealed destination may exist. Never certify clean.

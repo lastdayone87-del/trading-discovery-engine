@@ -980,7 +980,10 @@ test('v2 review: scheduler and worker wiring call sites are pinned', () => {
     /const enqueueSameHostHints = async \(\): Promise<void> => \{[\s\S]*?strategy: 'same-hostname'/,
     'the shared helper keeps the same-hostname enqueue rule',
   );
-  const enqueuePos = fallback.indexOf('await enqueueSameHostHints();');
+  const enqueuePos = fallback.indexOf(
+    'await enqueueSameHostHints();',
+    fallback.indexOf('const drainPopups = async'),
+  );
   const clickPos = fallback.indexOf('const clickLoop = await runRenderedClickLoop({');
   const postClickEnqueuePos = fallback.indexOf('await enqueueSameHostHints();', clickPos);
   assert.ok(enqueuePos !== -1 && clickPos !== -1 && enqueuePos < clickPos, 'anchors enqueue before navigating clicks');

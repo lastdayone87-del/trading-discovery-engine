@@ -73,7 +73,7 @@ none contains a URL, selector, element text, or payload.
 | `closedShadowRootCount` | Closed roots detected by the bounded `attachShadow` probe. Never traversed. |
 | `declarativeClosedShadowRootCount` | Parser-attached closed roots found by scanning the raw main-document response. The parser removes the `<template shadowrootmode="closed">` node, so the live DOM cannot report these roots. |
 | `declarativeShadowScanGap` | Main-document responses whose raw body was unavailable, above the bounded scan size, or not scanned in time. A non-zero value keeps coverage partial. |
-| `candidateCapTruncated` | Largest single-collection overflow beyond the 500-item per-collector bound (sampled up to 500). Cross-origin overflow is counted only for destinations the community/destination policy would pursue (plus direct Discord invites); same-origin overflow is counted before admission and visited/duplicate filtering. The collector still stops at the existing bound; overflow is counted so it cannot be a silent loss. |
+| `candidateCapTruncated` | Largest single-collection overflow beyond the 500-item per-collector bound (sampled up to 500). Cross-origin overflow is counted only for destinations the community/destination policy would pursue (plus direct Discord invites). Same-origin overflow is raw collector overflow: it is counted before admission and before visited/duplicate filtering, and only when the baseline is not saturated. A full overflow sample with anchors remaining that could not be classified also counts here, so coverage cannot resolve as a clean absence. The collector still stops at the existing bound; overflow is counted so it cannot be a silent loss. |
 | `baseHrefPresent` | A document `<base href>` was observed. |
 | `scrollCapReachedStillGrowing` | The last permitted scroll iteration still found a growing document. |
 | `navigationPolicyExcluded` | Counts by `invalid-protocol`, `admission-rejected`, `cross-origin-disallowed`, `destination-budget`, `control-slice`, `hint-rejected`. |
@@ -213,15 +213,23 @@ A non-`COMPLETE` coverage reason is never a clean absence:
   Overflow is sampled up to `500` additional candidates and published as
   `candidateCapTruncated` instead of disappearing; cross-origin overflow is
   counted only after destination-policy filtering, so unrelated vendor links
-  cannot force `BOUNDED`, while same-origin overflow is counted before
-  admission. No navigation limit value changed.
+  cannot force `BOUNDED`, while same-origin overflow is raw collector overflow
+  counted before admission. Same-origin overflow is not counted when the
+  baseline is saturated; an interaction on that document instead records one
+  `revealedSameOriginDropped` gap. When the overflow sample itself is filled
+  and anchors remain unclassified, coverage stays partial even if the sample
+  contains only irrelevant links. No navigation limit value changed.
 - The interaction-revealed same-origin baseline is captured after the scroll
   loop, not before it, so infinite-scroll links are static relative to the
   inspected page rather than "revealed by interaction". A saturated baseline
   (collector overflow) admits nothing: static overflow cannot be distinguished
   from revealed links, and the same-host hint pass still owns hint-bearing
-  destinations. The revealed pass also subtracts already-queued requests from
-  the remaining page budget.
+  destinations. However, when an interaction actually occurred on that
+  document, the ambiguity is recorded once as a `revealedSameOriginDropped`
+  gap, so a menu-revealed generic destination cannot be certified absent; a
+  document with no interaction stays clean. The revealed pass also subtracts
+  already-queued requests from the remaining page budget, and a destination
+  already enqueued by another pass is never clicked again on re-enumeration.
 - The persistence boundary (`safeCrawlerTelemetry`) re-sanitizes every field:
   closed taxonomies, positive integers, fixed caps, rendered-only placement.
 - No migration is required; the fields live in the existing
