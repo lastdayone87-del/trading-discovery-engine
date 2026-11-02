@@ -264,8 +264,24 @@ test('real DOM: same-origin anchors cannot crowd out a cross-origin candidate', 
     const candidates = await page.$$eval('a[href]', collectRenderedCrossOriginCandidates, url);
     assert.deepEqual(
       candidates,
-      [{ url: 'https://linktr.ee/creator', text: 'Join the members community' }],
+      [{ url: 'https://linktr.ee/creator', text: 'Join the members community', sourceUrl: url }],
       'the cross-origin link survives 500 preceding internal anchors',
+    );
+  });
+});
+
+test('real DOM: SVG anchors keep their community link', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  const html = `<!doctype html><html><body>
+    <svg width="200" height="40" viewBox="0 0 200 40" xmlns="http://www.w3.org/2000/svg">
+      <a href="https://linktr.ee/creator"><text x="0" y="20">Club</text></a>
+    </svg>
+  </body></html>`;
+  await withControlPage(html, async (page, url) => {
+    const candidates = await page.$$eval('a[href]', collectRenderedCrossOriginCandidates, url);
+    assert.deepEqual(
+      candidates,
+      [{ url: 'https://linktr.ee/creator', text: 'Club', sourceUrl: url }],
+      'an SVG anchor must not be dropped by the string-href assumption',
     );
   });
 });

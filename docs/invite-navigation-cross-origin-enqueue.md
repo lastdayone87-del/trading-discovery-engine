@@ -30,14 +30,23 @@ the following hold:
 4. `shouldEnqueueRenderedCrossOriginLink` returns true: the shared
    `shouldFollowDestination` policy must admit the target. Admission-rejected
    and weak/generic destinations are counted as `cross-origin-disallowed`.
-5. It is not a Discord destination. Discord links are terminal invite
-   candidates extracted from the page; enqueueing them would spend page budget
-   on a surface the crawler does not need to inspect.
+5. It is not a native Discord invite URL (`discord.gg/code`,
+   `discord.com|discordapp.com|discord.app/invite/code`). Those are terminal
+   candidates already extracted from the page, so enqueueing them would spend
+   page budget on a surface the crawler does not need to inspect. Redirect
+   shorteners (`dsc.gg`, `discord.me`, `discord.io`) and directory pages
+   (`disboard.org`) carry no native code, so they pass through the destination
+   policy and remain navigable.
 
 The pass captures cross-origin anchors before interactions, so a click that
 replaces the document cannot hide them, but submits only after the post-click
-same-host pass. Optional destinations therefore never take queue positions
-ahead of JS-revealed required same-host links.
+same-host pass. Each candidate keeps the page URL where it was observed, so a
+click that navigates elsewhere cannot retroactively make the pre-click
+snapshot's cross-origin links look same-origin. The merged pre/post-click
+snapshots are deduplicated by URL before accounting, so an anchor present in
+both states is never counted twice in drop telemetry. Optional destinations
+therefore never take queue positions ahead of JS-revealed required same-host
+links.
 
 ## Policy and safety boundary
 
@@ -87,9 +96,10 @@ requires the canary/browser validation below.
 ## Validation
 
 - Pure policy tests cover same-origin rejection, known link hub, strong
-  community evidence, weak-label rejection, Discord exclusion,
-  admission-rejected targets, malformed URLs, the cap constant, and the
-  default-OFF budget.
+  community evidence, weak-label rejection, native-invite-only Discord
+  exclusion, redirect/directory Discord admission, per-snapshot origin
+  retention, merged-snapshot deduplication, admission-rejected targets,
+  malformed URLs, the cap constant, and the default-OFF budget.
 - `npx tsc --noEmit`: pass.
 - Targeted rendered/fallback suite: 67/67 pass.
 

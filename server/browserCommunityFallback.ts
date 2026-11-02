@@ -344,6 +344,36 @@ export function isDiscordDestinationUrl(rawUrl: string): boolean {
   }
 }
 
+/** Hosts whose `/code` and `/invite/code` paths the page scan retains as
+ * native invite evidence. Redirect shorteners (`dsc.gg`, `discord.me`,
+ * `discord.io`) and directory pages (`disboard.org`) are deliberately absent:
+ * the scan keeps them only as unresolved locators, so they still need a
+ * navigation surface to resolve the invite. */
+const NATIVE_DISCORD_INVITE_HOSTS = new Set(['discord.gg', 'discord.com', 'discordapp.com', 'discord.app']);
+const DISCORD_INVITE_CODE_PATH = /^\/[A-Za-z0-9_-]{2,128}\/?$/;
+const DISCORD_INVITE_PATH = /^\/invite\/[A-Za-z0-9_-]{2,128}\/?$/;
+
+/**
+ * Whether a Discord URL is a native invite the page scan already retained as
+ * terminal evidence. Only these may be skipped by the cross-origin pass; a
+ * redirect shortener or directory page must pass the destination policy so a
+ * JS-added "Visit server" link can still resolve to an invite.
+ */
+export function isNativeDiscordInviteUrl(rawUrl: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+  const host = parsed.hostname.toLowerCase().replace(/^www\./, '').replace(/\.$/, '');
+  const match = [...NATIVE_DISCORD_INVITE_HOSTS].find(entry => host === entry || host.endsWith(`.${entry}`));
+  if (!match) return false;
+  return match === 'discord.gg'
+    ? DISCORD_INVITE_CODE_PATH.test(parsed.pathname)
+    : DISCORD_INVITE_PATH.test(parsed.pathname);
+}
+
 export const COMMUNITY_HINTS = /discord|community|join|chat|member|membership|vip|group|private|trading.?room|links?|social|contact|about|whop|skool|circle|patreon|premium|paid|subscribe|signals?|mentor|access/i;
 
 /**
@@ -1451,7 +1481,7 @@ export function shouldEnqueueRenderedCrossOriginLink(input: {
     return false;
   }
   if (target.origin === current.origin) return false;
-  if (isDiscordDestinationUrl(target.toString())) return false;
+  if (isNativeDiscordInviteUrl(target.toString())) return false;
   return shouldFollowDestination({
     url: target.toString(),
     currentUrl: current.toString(),
@@ -1473,6 +1503,13 @@ export function shouldEnqueueRenderedCrossOriginLink(input: {
 export interface RenderedCrossOriginCandidate {
   url: string;
   text: string;
+  /**
+   * Page URL where the anchor was observed. The pre-click snapshot keeps the
+   * original document origin even when a later click navigates away; without
+   * it, the post-click URL would wrongly classify the earlier snapshot's
+   * candidates as same-origin.
+   */
+  sourceUrl?: string;
 }
 
 export interface RenderedCrossOriginEnqueuePlan {
@@ -1505,9 +1542,15 @@ export function collectRenderedCrossOriginCandidates(
   for (const node of nodes) {
     if (candidates.length >= limit) break;
     const anchor = node as HTMLAnchorElement;
+    // SVG anchors expose `href` as an `SVGAnimatedString`, so read the string
+    // attribute first and resolve it against the document base URL. Falling
+    // straight through to `anchor.href` would throw for SVG and silently drop
+    // a real community link.
+    const attrHref = typeof anchor.getAttribute === 'function' ? (anchor.getAttribute('href') || '') : '';
+    const rawHref = attrHref || (typeof anchor.href === 'string' ? anchor.href : '');
     let target: URL;
     try {
-      target = new URL(anchor.href || '');
+      target = new URL(rawHref, document.baseURI);
     } catch {
       continue;
     }
@@ -1516,6 +1559,7 @@ export function collectRenderedCrossOriginCandidates(
     candidates.push({
       url: target.toString(),
       text: (anchor.textContent || '').trim().slice(0, 200),
+      sourceUrl: currentUrl,
     });
   }
   return candidates;
@@ -1548,17 +1592,25 @@ export function planRenderedCrossOriginEnqueues(input: {
     disallowed: 0,
   };
   const planned = new Set<string>();
+  // The pre-click and post-click snapshots overlap: merge them by URL before
+  // accounting so an anchor present in both is not counted twice in drop
+  // telemetry (canary monitoring reads these counters). The first occurrence
+  // wins, which preserves the pre-click discovery origin.
+  const seenCandidates = new Set<string>();
   for (const candidate of input.candidates) {
     const url = String(candidate.url || '').trim();
     if (!url) {
       plan.disallowed++;
       continue;
     }
-    // Discord destinations are terminal invite evidence retained by the page
-    // scan, not navigation surfaces. Skip them before accounting so they
-    // cannot consume the cross-origin cap or inflate policy-drop telemetry.
-    if (isDiscordDestinationUrl(url)) continue;
     const visitKey = normalizeVisitUrl(url) || url;
+    if (seenCandidates.has(visitKey)) continue;
+    seenCandidates.add(visitKey);
+    // Native invite URLs are terminal evidence retained by the page scan, not
+    // navigation surfaces. Skip only those before accounting: redirect
+    // shorteners and directory pages carry no native code, so they must pass
+    // the destination policy to be resolved through a click/enqueue.
+    if (isNativeDiscordInviteUrl(url)) continue;
     if (input.alreadyVisited.has(visitKey)) {
       plan.alreadyVisited++;
       continue;
@@ -1573,7 +1625,10 @@ export function planRenderedCrossOriginEnqueues(input: {
     }
     if (!shouldEnqueueRenderedCrossOriginLink({
       url,
-      currentUrl: input.currentUrl,
+      // Each candidate keeps the origin of the document that produced it. A
+      // click that navigates to another page must not retroactively make the
+      // pre-click snapshot's cross-origin links look same-origin.
+      currentUrl: String(candidate.sourceUrl || input.currentUrl),
       anchorText: String(candidate.text || ''),
     })) {
       plan.disallowed++;
