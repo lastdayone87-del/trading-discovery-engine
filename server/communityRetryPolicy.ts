@@ -245,6 +245,9 @@ export const STATIC_BUDGET_GAP_FAILURE_CLASS = 'STATIC_BUDGET_GAP';
 export const FOUND_GAP_RETRYABLE_FAILURE_CLASSES = new Set([
   'REQUIRED_UNVISITED_BUDGET_GAP',
   'RENDERED_TIMEOUT',
+  // Page-budget exhaustion with eligible requests still queued: the retained
+  // invite is kept while the unchecked pages own bounded recovery.
+  'RENDERED_BUDGET_EXPIRED',
   'RENDERED_PARTIAL_COVERAGE',
   // Interaction gap: invite(s) retained but an evidence-bearing control
   // (join button/tab/accordion) failed or was skipped, so content was never

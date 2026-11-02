@@ -6,6 +6,7 @@ import {
   markRenderedRequestSucceeded,
   renderedUnresolvedFailureCount,
   resolveRenderedCompletionState,
+  resolveRenderedFallbackDetail,
   terminalUnresolvedFailures,
   wasRenderedResultProcessed,
   type BrowserFallbackTelemetry,
@@ -960,4 +961,76 @@ test('IPv6 literal failure remains eligible for rendered retry', async () => {
   assert.equal(renderedCalls, 1);
   assert.ok(result.retryDirective, 'genuine IPv6 failure must own a retry');
   assert.notEqual(result.acquisitionStatus, 'INSPECTED_NO_MATCH');
+});
+
+// P1.7 truthfulness: the coverage reason must not erase terminal stop
+// attribution, and retry ownership follows recoverable causes, not BOUNDED.
+test('coverage gaps keep queueComplete while withholding clean completion', () => {
+  const policyGap = resolveRenderedCompletionState({
+    inspectedPages: 2,
+    timedOut: false,
+    telemetry: { ...zeroTelemetry(), requestsStarted: 2, requestsFinished: 2 },
+    coverageReason: 'POLICY_EXCLUDED',
+    coverageRetryable: false,
+  });
+  assert.equal(policyGap.complete, false);
+  assert.equal(policyGap.queueComplete, true, 'the crawl still ran out of links below the budget');
+  assert.equal(policyGap.retryable, false);
+
+  const scrollGap = resolveRenderedCompletionState({
+    inspectedPages: 2,
+    timedOut: false,
+    telemetry: { ...zeroTelemetry(), requestsStarted: 2, requestsFinished: 2 },
+    coverageReason: 'BOUNDED',
+    coverageRetryable: false,
+  });
+  assert.equal(scrollGap.complete, false);
+  assert.equal(scrollGap.queueComplete, true);
+  assert.equal(scrollGap.retryable, false, 'a fixed scroll ceiling cannot be cleared by refetching');
+});
+
+test('rendered detail names a coverage gap instead of reporting completion', () => {
+  const base = {
+    candidatesFound: 0,
+    inspectedPages: 2,
+    timedOut: false,
+    telemetry: { ...zeroTelemetry(), requestsStarted: 2, requestsFinished: 2 },
+    noPageProcessed: false,
+    interactionGap: false,
+    evidenceControlsFailed: 0,
+    evidenceControlsSkipped: 0,
+  };
+  assert.match(
+    resolveRenderedFallbackDetail({ ...base, coverageReason: 'POLICY_EXCLUDED' }),
+    /^Rendered acquisition incomplete: navigation coverage POLICY_EXCLUDED; /,
+    'a deterministic coverage gap must never read as a completed crawl',
+  );
+  assert.match(
+    resolveRenderedFallbackDetail({ ...base, coverageReason: 'BOUNDED' }),
+    /^Rendered acquisition incomplete: navigation coverage BOUNDED; /,
+  );
+  assert.match(
+    resolveRenderedFallbackDetail({ ...base, coverageReason: 'COMPLETE' }),
+    /^Rendered acquisition completed across 2 page\(s\) without an invite; /,
+    'only COMPLETE coverage reports completion',
+  );
+  assert.match(
+    resolveRenderedFallbackDetail({ ...base, coverageReason: undefined }),
+    /^Rendered acquisition completed across 2 page\(s\) without an invite; /,
+    'legacy results without a reason keep their wording',
+  );
+  assert.match(
+    resolveRenderedFallbackDetail({ ...base, candidatesFound: 1, coverageReason: 'BOUNDED' }),
+    /^Rendered fallback retained 1 distinct Discord candidate\(s\) across 2 page\(s\); navigation coverage BOUNDED; /,
+    'a retained invite must still name the unexamined coverage surface',
+  );
+  // Branch order: a named stop outranks the coverage-reason branch.
+  assert.match(
+    resolveRenderedFallbackDetail({ ...base, timedOut: true, coverageReason: 'BOUNDED' }),
+    /^Rendered acquisition budget expired before coverage completed; /,
+  );
+  assert.match(
+    resolveRenderedFallbackDetail({ ...base, interactionGap: true, evidenceControlsFailed: 1, coverageReason: 'BOUNDED' }),
+    /^Rendered acquisition incomplete: 1 evidence-bearing control click\(s\) failed/,
+  );
 });

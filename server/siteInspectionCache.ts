@@ -273,10 +273,14 @@ export function rootCoverageTerminal(rootYield: number, truncated: boolean): 'FO
  * Retryable partial results stay retryable through the row's own retryable
  * flag, not through this bit. */
 export function isSufficientRenderedCoverage(
-  rendered: { complete?: unknown; timedOut?: unknown; interactionGap?: unknown },
+  rendered: { complete?: unknown; timedOut?: unknown; interactionGap?: unknown; coverageReason?: unknown },
   processed: boolean,
 ): boolean {
-  return processed === true && rendered.complete === true && rendered.timedOut !== true && rendered.interactionGap !== true;
+  // A non-COMPLETE coverage reason is never sufficient even if an older
+  // producer left complete=true: the navigation surface was observed but not
+  // examined. Undefined preserves legacy producers that predate P0.2.
+  const coverageComplete = rendered.coverageReason === undefined || rendered.coverageReason === 'COMPLETE';
+  return processed === true && rendered.complete === true && rendered.timedOut !== true && rendered.interactionGap !== true && coverageComplete;
 }
 
 /** Normalized page key for coverage checks: scheme plus lowercased host

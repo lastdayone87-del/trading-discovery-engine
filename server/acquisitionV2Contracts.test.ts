@@ -328,6 +328,53 @@ test('v2: fully covered seeds reuse rendered evidence without refetch', async ()
   assert.ok(JSON.stringify(result.steps || []).includes('[Shared evidence] https://share.example.com/shared reuses rendered inspection'));
 });
 
+// A complete-looking lender with a non-COMPLETE coverage reason must never be
+// reused as clean rendered evidence: the borrower re-renders instead.
+test('v2: a coverage-gapped lender does not feed shared rendered evidence', async () => {
+  const renderedCalls: string[] = [];
+  const lender = 'https://lender.example.com/';
+  const borrower = 'https://borrower.example.com/';
+  const result = await runChannelInspection({
+    channelId: 'v2-gapped-lender',
+    channelName: 'Gapped Lender Channel',
+    channelBio: 'Trading notes',
+    siteInspectionStore: makeIsolatedStore(),
+    channelLinks: [lender, borrower],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: (async (input) => {
+      const url = String(input);
+      if (url === lender) return html(`<a href="${borrower}">community hub</a>`);
+      return noInviteHtml();
+    }) as typeof fetch,
+    renderedFallback: (async (seedUrl: string): Promise<BrowserFallbackResult> => {
+      renderedCalls.push(seedUrl);
+      return {
+        foundInvite: null,
+        foundLocation: seedUrl,
+        candidates: [],
+        inspectedPages: seedUrl === lender ? 2 : 1,
+        scrolls: 0,
+        clicks: 0,
+        complete: true,
+        retryable: false,
+        timedOut: false,
+        telemetry: { coverageReason: seedUrl === lender ? 'POLICY_EXCLUDED' : 'COMPLETE' } as never,
+        detail: 'rendered run',
+        visitedUrls: seedUrl === lender ? [lender, borrower] : [seedUrl],
+        requiredTotal: seedUrl === lender ? 2 : 1,
+        pageHintLinks: seedUrl === lender ? { [lender]: [borrower] } : undefined,
+      };
+    }),
+  });
+  assert.ok(renderedCalls.includes(lender));
+  assert.ok(renderedCalls.includes(borrower), 'a coverage-gapped lender must not be reused');
+  assert.ok(
+    !JSON.stringify(result.steps || []).includes('[Shared evidence]'),
+    'no shared-evidence reuse may be recorded from a gapped lender',
+  );
+});
+
 // Consecutive-tail helper covers budget-gap tails identically to timeouts.
 test('v2: Skool-shaped healthy timeout with required coverage resolves sufficient', async () => {
   const result = await runChannelInspection({
@@ -562,6 +609,45 @@ test('v2 review: required permanent failure owns no retry', async () => {
   assert.ok(permObs, 'permanent required failure stays visible');
   assert.equal(permObs?.retryable, false);
   assert.equal(result.retryDirective, undefined);
+});
+
+// REVIEW: budget-expired tails are suppressed after the exhaustion threshold.
+test('v2 review: repeated budget-expired tails stop owning retries', async () => {
+  const seed = 'https://budgettailed.example.com/';
+  const observedAt = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
+  const result = await runChannelInspection({
+    channelId: 'v2-budget-tail',
+    channelName: 'Budget Tail Channel',
+    channelBio: 'Trading notes',
+    siteInspectionStore: makeIsolatedStore(),
+    channelLinks: [seed],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: (async () => noInviteHtml()) as typeof fetch,
+    renderedFallback: (async (seedUrl: string): Promise<BrowserFallbackResult> => ({
+      foundInvite: null,
+      foundLocation: seedUrl,
+      candidates: [],
+      inspectedPages: 2,
+      scrolls: 0,
+      clicks: 0,
+      complete: false,
+      retryable: true,
+      timedOut: true,
+      dropReasons: { 'page-budget': 1 },
+      coverageGapRetryable: true,
+      telemetry: { coverageReason: 'BOUNDED', unresolvedFailedRequests: 0 } as never,
+      detail: 'Rendered acquisition budget expired before coverage completed',
+    })),
+    urlFailureHistoryLoader: (async () => [
+      { requestedUrl: seed, failureClass: 'RENDERED_BUDGET_EXPIRED', outcome: 'PARTIALLY_INSPECTED', observedAt: observedAt(2) },
+      { requestedUrl: seed, failureClass: 'RENDERED_BUDGET_EXPIRED', outcome: 'PARTIALLY_INSPECTED', observedAt: observedAt(1) },
+    ]) as never,
+  });
+  assert.ok(
+    (result.retrySuppressedUrls || []).some((url) => url.includes('budgettailed.example.com')),
+    'two prior identical budget tails must suppress the next retry',
+  );
 });
 
 // REVIEW: FOUND rows carrying gap classes accumulate tails; plain FOUND breaks them.
