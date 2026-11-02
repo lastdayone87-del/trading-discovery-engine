@@ -861,7 +861,7 @@ export async function selectExperimentalQueryForCountry(
         experimentId: orderingExperimentId,
         assignment: controlAssignment,
         eligibility: 'SELECTION_EXPERIMENT_NOT_REQUESTED',
-        reason: 'No selection experiment requested: UCB1 selection unchanged; ordering dimension evaluated independently.',
+        reason: 'No selection experiment requested: serving selector unchanged; ordering dimension evaluated independently.',
         opportunityKey: options.opportunityKey,
         thompsonPrior: { alpha0: 1, beta0: 1 },
         contextualWeights: { value: 0.5, exploration: 0.35, cost: 0.1 },
@@ -897,7 +897,7 @@ export async function selectExperimentalQueryForCountry(
       reason: base.reason,
       experiment: buildSelectionExperimentObservation({
         ...envelopeBase,
-        reason: 'Control arm: UCB1 selection unchanged.',
+        reason: 'Control arm: serving selector unchanged.',
         benchmarkOpportunityId: benchmarkOpportunityIdForScope(experiment?.benchmark ?? null, base.queryRecord.id, experiment),
         poolQueryIds: [],
         winner: null,
@@ -905,8 +905,10 @@ export async function selectExperimentalQueryForCountry(
       }),
     };
   }
-  // Treatment: same eligibility pipeline as control (cooldown/diversity/intent),
-  // deterministic pool order (id ascending) so arm indexes are replay-stable.
+  // Treatment: the control eligibility pipeline (cooldown/diversity/intent)
+  // plus the execution-authority gate, deterministic pool order (id ascending)
+  // so arm indexes are replay-stable. This population difference is explicit:
+  // treatment can only select queries that would actually be allowed to run.
   const queries = (await getQueriesByCountry(country)).filter(query => reservableFilter(query, now));
   let eligible = limitRepeatedPrimaryTerms(queriesOutsideCooldown(queries, now, cooldownMinutes), queries, now, cooldownMinutes, maxPrimaryUses);
   // The experiment pool must obey the exact authority gate the scheduler runs
@@ -930,7 +932,7 @@ export async function selectExperimentalQueryForCountry(
       reason: base.reason,
       experiment: buildSelectionExperimentObservation({
         ...envelopeBase,
-        reason: 'Requested treatment arm but the eligible pool was empty; served UCB1 fallback.',
+        reason: 'Requested treatment arm but the eligible pool was empty; served control fallback.',
         benchmarkOpportunityId: benchmarkOpportunityIdForScope(experiment?.benchmark ?? null, base.queryRecord.id, experiment),
         poolQueryIds: [],
         winner: null,

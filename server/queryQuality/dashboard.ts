@@ -47,6 +47,10 @@ export interface QueryQualityDashboardRun extends QueryQualityDashboardRunInput 
 export interface QueryQualityDashboard {
   version: string;
   generatedAt: string;
+  /** Maximum runs included in this projection. */
+  rowLimit: number;
+  /** True when the read hit the row limit, so totals are a window not all time. */
+  truncated: boolean;
   portfolio: {
     dailyQuotaUnits: number;
     portfolioRatio: number;
@@ -120,6 +124,7 @@ function normalizeVector(value: Partial<QueryQualityVector> | null | undefined):
   return {
     version: String(value.version),
     rawResults: safe(value.rawResults),
+    evaluatedRawResults: safe(value.evaluatedRawResults),
     distinctResults: safe(value.distinctResults),
     newChannels: safe(value.newChannels),
     newConfirmedCreators: safe(value.newConfirmedCreators),
@@ -191,14 +196,16 @@ export function buildQueryQualityDashboard(input: {
       weightedTargetPrecision += vector.targetMarketPrecision * vector.distinctResults;
       targetPrecisionResults += vector.distinctResults;
     }
-    // The stored ratio is duplicates / (distinct + duplicates). Reconstruct
-    // the evaluated counts so the portfolio ratio matches the source metric;
-    // weighting by distinct results alone understates the duplicate share.
+    // Prefer the persisted evaluated count. Older vectors predate the field;
+    // reconstruct it from the duplicate ratio so both shapes use the same
+    // denominator as the source metric.
     const duplicateRatio = Math.min(1, vector.duplicateRatio);
-    const evaluated = duplicateRatio >= 1
-      ? vector.rawResults
-      : vector.distinctResults / (1 - duplicateRatio);
-    const boundedEvaluated = Number.isFinite(evaluated) ? evaluated : 0;
+    const storedEvaluated = safe(vector.evaluatedRawResults);
+    const boundedEvaluated = storedEvaluated > 0
+      ? storedEvaluated
+      : duplicateRatio >= 1
+        ? vector.rawResults
+        : vector.distinctResults / (1 - duplicateRatio);
     evaluatedResults += boundedEvaluated;
     duplicateResults += Math.max(0, boundedEvaluated - vector.distinctResults);
     if (vector.newConfirmedCreators === 0) zeroConfirmRuns++;
@@ -237,11 +244,16 @@ export function buildQueryQualityDashboard(input: {
   const portfolioUnitsUsed = safe(input.portfolio.portfolioUnitsUsed);
   const countryUnitsUsed = input.portfolio.countryUnitsUsed === undefined ? null : safe(input.portfolio.countryUnitsUsed);
   const portfolioUnitsReserved = safe(input.portfolio.portfolioUnitsReserved);
-  const effectiveQuotaUnits = quotaUnits || accounted.reduce((sum, row) => sum + safe(row.qualityVector?.quotaUsed) / 100, 0);
+  // Rates use reward-eligible spend only. Falling back to every accounted run
+  // would make the denominator include degraded/failed spend that the
+  // numerator explicitly excludes.
+  const effectiveQuotaUnits = quotaUnits;
 
   return {
     version: QUERY_QUALITY_DASHBOARD_VERSION,
     generatedAt: input.generatedAt,
+    rowLimit: QUERY_QUALITY_DASHBOARD_MAX_ROWS,
+    truncated: rows.length >= QUERY_QUALITY_DASHBOARD_MAX_ROWS,
     portfolio: {
       dailyQuotaUnits,
       portfolioRatio: dailyQuotaUnits > 0 ? portfolioUnitsReserved / dailyQuotaUnits : 0,

@@ -38,7 +38,7 @@ const HIGH_SPECIFICITY_TRADING_SIGNALS: Array<[string, RegExp]> = [
   // scholarship), so only named exchanges qualify as a high-specificity signal.
   // Bare French `bourse` (scholarship, purse) and Dutch `beurs` (trade fair,
   // purse) are equally ambiguous, so only qualified market phrases qualify.
-  ['LATIN_MARKET_FINANCE', /\b(b[oö]rse|boerse|aandelen|aktien|aktiehandel|aksjer|aksjehandel|osakkeet|osakekaupank[aä]ynti|børs|borsen|gielda|giełda|bolsa\s+de\s+valores|borsa\s+italiana|borsa\s+di\s+(?:milano|tokyo|londra|new\s+york|francoforte|parigi|madrid|zurigo|hong\s+kong)|mercado\s*de\s*valores|investir\s*en\s*bourse|bourse\s+(?:en\s*ligne|de\s*paris|de\s*bruxelles|de\s*luxembourg|de(?:s)?\s*valeurs?)|analyse\s*boursi[eè]re|cours\s*de\s*bourse|march[eé]\s*boursier|trading\s*boursier|beurs\s*(?:analyse|handel|nieuws|beleggen|strategie|video'?s?)|aandelenbeurs|effectenbeurs|beursbeleggen|beurshandel|analyse\s*technique|analisi\s*tecnica|an[aá]lisis\s*t[eé]cnico|handelsplan|risikomanagement|risikostyring|riskhantering|risicomanagement|piano\s*di\s*trading|plan\s*de\s*trading|plan\s*de\s*inversi[oó]n)\b/iu]
+  ['LATIN_MARKET_FINANCE', /\b(börse|aandelen|aktien|aktiehandel|aksjer|aksjehandel|osakkeet|osakekaupank[aä]ynti|børs|borsen|gielda|giełda|bolsa\s+de\s+valores|borsa\s+italiana|borsa\s+di\s+(?:milano|tokyo|londra|new\s+york|francoforte|parigi|madrid|zurigo|hong\s+kong)|mercado\s*de\s*valores|investir\s*en\s*bourse|bourse\s+(?:en\s*ligne|de\s*paris|de\s*bruxelles|de\s*luxembourg|de(?:s)?\s*valeurs?)|analyse\s*boursi[eè]re|cours\s*de\s*bourse|march[eé]\s*boursier|trading\s*boursier|beurs\s*(?:analyse|handel|nieuws|beleggen|strategie|video'?s?)|aandelenbeurs|effectenbeurs|beursbeleggen|beurshandel|analyse\s*technique|analisi\s*tecnica|an[aá]lisis\s*t[eé]cnico|piano\s*di\s*trading|plan\s*de\s*trading|plan\s*de\s*inversi[oó]n)\b/iu]
 ];
 
 /**
@@ -78,6 +78,7 @@ const NON_LATIN_SCRIPT_PATTERNS: RegExp[] = [
   /\p{Script=Han}/u, /\p{Script=Hiragana}/u, /\p{Script=Katakana}/u,
   /\p{Script=Hangul}/u, /\p{Script=Arabic}/u, /\p{Script=Cyrillic}/u,
   /\p{Script=Hebrew}/u, /\p{Script=Thai}/u, /\p{Script=Devanagari}/u,
+  /\p{Script=Greek}/u, /\p{Script=Kannada}/u,
   /\p{Script=Bengali}/u, /\p{Script=Tamil}/u, /\p{Script=Telugu}/u,
   /\p{Script=Malayalam}/u, /\p{Script=Gujarati}/u, /\p{Script=Gurmukhi}/u,
   /\p{Script=Sinhala}/u, /\p{Script=Khmer}/u, /\p{Script=Lao}/u,

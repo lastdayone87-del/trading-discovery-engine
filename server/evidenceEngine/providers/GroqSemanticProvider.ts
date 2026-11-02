@@ -8,6 +8,7 @@ import {
   type ProviderCallEvent,
 } from '../../providerResilience';
 import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../semanticCalibration';
+import { abortedByDeadline } from './abortReason';
 import type { EvidenceCategory, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import {
   buildSemanticPrompt,
@@ -232,7 +233,12 @@ export async function runGroqRouteFailover<T>(
     (a, b) => Number(isCooling(groqRouteOrg(a))) - Number(isCooling(groqRouteOrg(b))),
   );
   for (const route of ordered) {
-    if (opts?.signal?.aborted) throw groqFailoverCancelled(opts.signal);
+    if (opts?.signal?.aborted) {
+      if (abortedByDeadline(opts.signal)) {
+        throw new ProviderCallError('Groq route failover deadline exhausted.', 'TIMEOUT', true, { cause: opts.signal.reason });
+      }
+      throw groqFailoverCancelled(opts.signal);
+    }
     if (opts?.deadlineAtMs !== undefined && (opts?.nowMs ?? Date.now)() >= opts.deadlineAtMs) {
       throw lastError || new ProviderCallError('Groq route pool aggregate deadline exhausted.', 'TIMEOUT', true);
     }
@@ -781,10 +787,11 @@ export function defaultClient(
         return parsedContent;
       } catch (error) {
         const aborted = controller.signal.aborted;
+        const callerTimedOut = (controller.signal.reason as { errorClass?: string } | undefined)?.errorClass === 'TIMEOUT';
         const typed = error instanceof ProviderCallError && error.errorClass === 'TIMEOUT'
           ? error
           : aborted
-            ? deadlineExpired
+            ? (deadlineExpired || callerTimedOut)
               ? new ProviderCallError(`Groq call exceeded ${timeoutMs}ms deadline.`, 'TIMEOUT', true, { cause: error })
               : groqFailoverCancelled(signal)
             : classifyProviderError(error);

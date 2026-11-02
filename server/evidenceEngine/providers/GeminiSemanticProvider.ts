@@ -4,6 +4,7 @@ import { executeProviderCall, getGeminiOrgSemanticCooldownExpiry, ProviderCallEr
 import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../semanticCalibration';
 import type { EvidenceCategory, EvidenceFieldRef, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import { documentRef } from '../canonicalEvidencePlane';
+import { abortedByDeadline } from './abortReason';
 
 export const SEMANTIC_PROMPT_VERSION = 'priority2-multilingual-structured-1';
 export const SEMANTIC_FEATURE_VERSION = 'field-aware-evidence-1';
@@ -155,7 +156,12 @@ export async function runGeminiRouteFailover<T>(
     (a, b) => Number(isCooling(geminiRouteOrg(a))) - Number(isCooling(geminiRouteOrg(b))),
   );
   for (const route of ordered) {
-    if (opts?.signal?.aborted) throw failoverCancelled(opts.signal);
+    if (opts?.signal?.aborted) {
+      if (abortedByDeadline(opts.signal)) {
+        throw new ProviderCallError('Gemini route failover deadline exhausted.', 'TIMEOUT', true, { cause: opts.signal.reason });
+      }
+      throw failoverCancelled(opts.signal);
+    }
     // A 429 marks its whole account tried (see catch below), so this
     // head-pick always lands on the next eligible independent account — a
     // same-account sibling of an exhausted account is never retried.
@@ -221,6 +227,15 @@ function defaultClient(): SemanticModelClient | undefined {
     return created;
   };
   return { classify: async (prompt, model, observability, signal) => {
+    // Caller already aborted: do not read the per-org cooldown ledger (one
+    // provider_call_events query per org) only to throw afterwards.
+    if (signal?.aborted) {
+      const reasonClass = (signal.reason as { errorClass?: string } | undefined)?.errorClass;
+      if (reasonClass === 'TIMEOUT') {
+        throw new ProviderCallError('Gemini semantic call exceeded its deadline.', 'TIMEOUT', true, { cause: signal.reason });
+      }
+      throw failoverCancelled(signal);
+    }
     // Enter through a healthy account: accounts already cooling in the
     // persisted ledger are deprioritized before any API call path, so a
     // cooling account's sibling is never pointlessly deferred. Single-org

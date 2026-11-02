@@ -6,10 +6,11 @@
 **Plan:** `/tmp/opencode/QUERY_QUALITY_FINAL_PLAN_20261029.md`
 **Specification:** `/tmp/opencode/TRADING_DISCOVERY_RECOGNITION_REVISION_20261028.md`
 
-**Status:** implemented and tested locally. Not merged, not deployed, no schema
-change, no production data change, no live experiment. PR #557 was tested
-read-only in an isolated worktree and remains unmodified; PR #567 was not
-touched.
+**Status:** implemented and tested locally. Merged into
+`e2e/invite-discovery-remediation` by PR #568; promoted to `main` by PR #569
+(open, not merged, not deployed). No schema change, no production data change,
+no live experiment. PR #557 was tested read-only in an isolated worktree and
+remains unmodified; PR #567 was not touched.
 
 ## 1. What changed
 
@@ -188,7 +189,7 @@ touched.
 | Revalidation | policy/term/registry change invalidates stale admission | `Q2d: stale admission policy/registry drift…`, autonomous authority tests | PASS |
 | Manual/persistent/PR #557 | routed through admission; override audited | source registry + single-writer static test | PASS |
 | Terminology lifecycle | ineligible terms never `SEARCH_TRIAL`/`PROVEN`; evidence retained | Q0 fixtures + `terminologyNativeDiscovery` / `autonomousRootFirewall` suites | PASS |
-| Quality scorecard | every run emits vector; zero-confirm not `PROVEN`; `UNCERTAIN` not contamination | `Q5`, `Q4c`, `isContaminatedRun` contract tests | PASS |
+| Quality scorecard | every run emits vector; zero-confirm not `PROVEN`; `UNCERTAIN` not contamination | `Q5`, `Q4c`, `isSeverelyContaminatedQuery` contract tests (delegates to `isContaminatedRun`) | PASS |
 | Verified/proxy separation | online provisional reward; no second authority | `queryFeedbackEvaluation` contract tests | PASS |
 | Attribution | term/relation/family/surface credited | `Q5: quality vector is result-level and attribution carries the full path` | PASS |
 | Portfolio | cold-start countries get candidates; exploration bounded; no infinite generation | `Q4: portfolio budget…`, planner matrix, `NO_ELIGIBLE_QUERY` contract | PASS |
@@ -233,11 +234,12 @@ npm test                                          3915 tests: 3679 pass, 50 fail
 ```
 
 The full-suite failure-name set was compared with the pre-existing baseline:
-all 49 baseline failures across 39 unrelated files remain identical. The one
-additional failure is the 250 ms deadline assertion in
+all 49 baseline failures across 39 unrelated files remain identical. One
+additional failure appeared: the 250 ms deadline assertion in
 `server/externalOsint.test.ts`; it passes 1/1 in isolation (`39.7 ms`) and is a
-scheduling artefact of the fully parallel suite, not a product-code regression.
-No new failure was introduced.
+scheduling artefact of the fully parallel suite. This matrix therefore shows
+one extra, load-sensitive failure rather than proving a product regression; it
+does not establish that no failure was introduced.
 
 ### 3.2 Build / lint
 
@@ -404,9 +406,8 @@ consumption and PR #557's own tests remain intact. PR #557 was not modified.
 7. **Held-out set size.** The held-out composition set is deliberately small
    and hand-built. It measures 0 invalid admissions and 100% valid admission in
    this sample; it is not a production-representative estimate.
-8. **Stacked base.** This PR targets `e2e/invite-discovery-remediation`
-   (PR #567's head) so its diff contains only the programme commits. It must be
-   retargeted after PR #567 lands; PR #567 itself was not modified.
+8. **Base branch.** This change is cherry-picked onto `main`; no stacked-base
+   retarget is required. PR #567 and the crawler-stack branch were not modified.
 9. **Review-bot configuration.** The `PR Agent review` check fails because its
    configured Gemini API key is invalid (`API_KEY_INVALID`), and Codex review
    was unavailable due usage limits. Unit, PostgreSQL, verify and build checks

@@ -34,6 +34,12 @@ export interface SimulationConfig {
   pulls: number;
   countries?: number;
   portfolioRatio?: number;
+  /**
+   * Projected daily capacity used as the quota-share denominator before the
+   * simulation has observed enough spend. Without it the first pull would be
+   * 100% of projected spend and the quota-share policy would be meaningless.
+   */
+  dailyQuotaUnits?: number;
   c?: number;
 }
 
@@ -51,6 +57,8 @@ interface SimArm {
   quotaUnits: number;
   pulls: number;
   lastRate: number;
+  /** Pull index through which the selection counts have been decayed. */
+  decayStep: number;
 }
 
 interface CountrySimState {
@@ -146,6 +154,7 @@ function buildWorld(config: SimulationConfig, seed: number): CountrySimState[] {
           quotaUnits: 0,
           pulls: 0,
           lastRate: 0,
+          decayStep: 0,
         });
       }
     }
@@ -256,6 +265,35 @@ function recordAggregateDelta(aggregates: SimulationAggregates, arm: SimArm, del
   addAggregate(aggregates.total, delta);
 }
 
+/** Exponential forgetting for the non-stationary scenario. */
+function decayAggregateCounts(counts: DecayedArmCounts, factor: number): void {
+  counts.confirmed *= factor;
+  counts.quality *= factor;
+  counts.quotaUnits *= factor;
+  counts.runs *= factor;
+}
+
+function decayAggregates(aggregates: SimulationAggregates, factor: number): void {
+  for (const map of [aggregates.family, aggregates.country, aggregates.market, aggregates.language]) {
+    for (const counts of map.values()) decayAggregateCounts(counts, factor);
+  }
+  decayAggregateCounts(aggregates.total, factor);
+}
+
+/**
+ * Lazy per-arm decay. Arms in other countries are not touched every step, so
+ * catch up by the elapsed pull distance when their turn arrives. The
+ * hierarchy totals are decayed once per step and therefore stay consistent.
+ */
+function decayArmCounts(arm: SimArm, step: number, halfLifePulls: number): void {
+  if (step <= arm.decayStep) return;
+  const factor = Math.pow(0.5, (step - arm.decayStep) / halfLifePulls);
+  arm.confirmed *= factor;
+  arm.quotaUnits *= factor;
+  arm.pulls *= factor;
+  arm.decayStep = step;
+}
+
 function hierarchyFor(arm: SimArm, aggregates: SimulationAggregates): HierarchyCounts {
   return {
     total: aggregates.total,
@@ -271,19 +309,24 @@ function priorFor(aggregates: SimulationAggregates): HierarchicalPrior {
 }
 
 /**
- * Portfolio admission is quota-weighted, not pull-weighted. The first pull is
- * always admitted so the reserved floor can start; afterwards the projected
+ * Portfolio admission is quota-weighted, not pull-weighted. The projected
  * cumulative portfolio spend may not exceed the configured share of projected
- * cumulative spend. Exported for regression tests.
+ * cumulative spend. Before the simulation has observed spend, the denominator
+ * is the projected daily capacity so the first pull is still bounded by the
+ * quota share instead of being admitted at 100% of one pull.
  */
 export function portfolioPullAdmitted(input: {
   portfolioQuotaUnits: number;
   totalQuota: number;
   quotaUnits: number;
   portfolioRatio: number;
+  /** Projected capacity used while cumulative observed spend is smaller. */
+  baselineQuotaUnits?: number;
 }): boolean {
-  if (input.portfolioQuotaUnits === 0) return true;
-  const projectedQuota = input.totalQuota + input.quotaUnits;
+  const projectedQuota = Math.max(
+    input.totalQuota + input.quotaUnits,
+    Math.max(0, input.baselineQuotaUnits ?? 0),
+  );
   return input.portfolioQuotaUnits + input.quotaUnits <= projectedQuota * input.portfolioRatio;
 }
 
@@ -356,8 +399,11 @@ export function runSelectorSimulation(config: SimulationConfig, selector: Simula
   const world = buildWorld(config, config.seeds);
   const aggregates = buildAggregates(world);
   const portfolioRatio = Math.min(0.20, Math.max(0.10, config.portfolioRatio ?? 0.15));
+  const baselineQuotaUnits = Math.max(0, config.dailyQuotaUnits ?? 100);
+  const stationary = scenarioParameters(config.scenario).stationary;
   const c = config.c ?? SELECTOR_C;
   const pulls = Math.max(1, config.pulls);
+  const decayHalfLifePulls = Math.max(10, Math.floor(pulls * 0.1));
   const quotas = [100, 200, 300];
   let totalConfirmed = 0;
   let totalQuota = 0;
@@ -371,6 +417,13 @@ export function runSelectorSimulation(config: SimulationConfig, selector: Simula
     const countryIndex = step % world.length;
     const country = world[countryIndex];
     if (!country.arms.length) continue;
+    // Serving applies the decay half-life continuously. Without it the
+    // non-stationary scenario would keep every pre-shift observation forever
+    // and could not validate adaptation after the rate change.
+    if (!stationary && step > 0) {
+      decayAggregates(aggregates, Math.pow(0.5, 1 / decayHalfLifePulls));
+      for (const arm of country.arms) decayArmCounts(arm, step, decayHalfLifePulls);
+    }
     const quotaUnits = quotas[Math.floor(rng() * quotas.length)] / 100;
     // The portfolio floor is a quota share, not a pull-count share: a
     // 300-result pull costs three times a 100-result pull.
@@ -379,17 +432,25 @@ export function runSelectorSimulation(config: SimulationConfig, selector: Simula
       totalQuota,
       quotaUnits,
       portfolioRatio,
+      baselineQuotaUnits,
     });
     if (portfolio) portfolioQuotaUnits += quotaUnits;
-    if (!config.portfolioRatio && country.cursor < country.arms.length) {
-      // Cold-start coverage: each country gets its first arm before index play.
-      country.cursor++;
-    }
+    // Cold-start coverage: each country's first arm is forced before index
+    // play. The cursor is read here, not merely advanced, so the comment and
+    // behavior agree.
+    const coldStartArm = !config.portfolioRatio && country.cursor === 0
+      ? country.arms[0]
+      : null;
+    if (coldStartArm) country.cursor = 1;
     // Family concentration is a common hard filter, matching the tested
-    // portfolio cap. If every family is at the cap (a tiny-world edge case),
-    // relax to the full country pool rather than skipping the slot.
-    const uncapped = country.arms.filter(arm => (familyPulls.get(arm.family) || 0) / Math.max(1, step) < SIM_FAMILY_SHARE_CAP);
-    const arm = chooseArm(selector, uncapped.length ? uncapped : country.arms, aggregates, priorFor(aggregates), rng, portfolio, c);
+    // portfolio cap. The check includes the pending pull so a family just
+    // below the cap cannot be selected and push the realized share above it.
+    // If every family would exceed the cap (a tiny-world edge case), relax to
+    // the full country pool rather than skipping the slot.
+    const uncapped = country.arms.filter(arm =>
+      ((familyPulls.get(arm.family) || 0) + 1) / Math.max(1, step + 1) <= SIM_FAMILY_SHARE_CAP);
+    const arm = coldStartArm
+      || chooseArm(selector, uncapped.length ? uncapped : country.arms, aggregates, priorFor(aggregates), rng, portfolio, c);
     const effectiveLambda = !scenarioParameters(config.scenario).stationary && step > pulls * 0.6 && arm.shiftRate != null
       ? arm.shiftRate
       : arm.lambda;

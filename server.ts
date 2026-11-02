@@ -24,7 +24,7 @@ import {
   getQueryQualityDashboardRows, getQueryPortfolioBudgetState
 
 } from './server/db';
-import { buildQueryQualityDashboard } from './server/queryQuality/dashboard';
+import { buildQueryQualityDashboard, QUERY_QUALITY_DASHBOARD_MAX_ROWS } from './server/queryQuality/dashboard';
 import { getExecutionLineageMetrics } from './server/executionLineageMetrics';
 import { inspectPassivePrograms } from './server/passiveExploration';
 import { inspectTopicPilot, updatePilotControl } from './server/topicPilot';
@@ -662,7 +662,7 @@ async function startServer() {
     try {
       const country = req.query.country as string | undefined;
       const [rows, portfolio] = await Promise.all([
-        getQueryQualityDashboardRows(country),
+        getQueryQualityDashboardRows(country, QUERY_QUALITY_DASHBOARD_MAX_ROWS),
         getQueryPortfolioBudgetState(country),
       ]);
       res.json(buildQueryQualityDashboard({ generatedAt: new Date().toISOString(), portfolio, rows }));

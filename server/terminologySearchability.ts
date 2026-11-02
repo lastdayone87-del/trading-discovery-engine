@@ -256,8 +256,11 @@ export function hasGovernedTradingSemantics(
   const country = context.country && context.country !== 'GLOBAL' ? context.country : '';
   if (!country && !language) {
     // No context: keep the legacy broad lexicon so callers that predate the
-    // context-aware gate do not lose valid trading terms.
+    // context-aware gate do not lose valid trading terms. Reviewed language
+    // surfaces are part of that lexicon too; the English branch otherwise
+    // cannot admit phrases such as `liquidity zone`.
     LANGUAGE_TRADING_SEMANTICS.forEach(values => values.forEach(value => out.add(value)));
+    Object.values(REVIEWED_LANGUAGE_SEMANTICS).forEach(values => values.forEach(value => addPhrase(out, value)));
     COUNTRY_NATIVE_SEMANTICS.forEach(values => values.forEach(value => out.add(value)));
   } else {
     // English is the universal retrieval language: an English trading phrase
@@ -293,8 +296,9 @@ function scriptCompatible(country: string | null | undefined, scripts: Set<strin
   const configured = COUNTRY_SCRIPTS[country];
   if (configured) return [...scripts].every(script => script === 'Zyyy' || configured.has(script));
   if (LATIN_COUNTRIES.has(country)) return [...scripts].every(script => script === 'Zyyy' || script === 'Latn');
-  // Unsupported/unknown country: do not manufacture a false negative.
-  return languages.length === 0 || languages.includes('und');
+  // Unsupported/unknown country: script compatibility alone must not reject
+  // the term. Country authorization is enforced separately by the registry.
+  return true;
 }
 
 /**

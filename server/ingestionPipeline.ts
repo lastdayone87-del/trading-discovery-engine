@@ -20,6 +20,7 @@ import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageC
 import { enqueueTermHarvest } from './candidateCorpus';
 import { resolveUncertainLifecycle } from './enrichmentLifecycle';
 import {ConfigurableWeightedStrategy,evaluateClassificationStages,type EvidenceCollectionReport,type RawChannelInput} from './evidenceEngine';
+import { buildContextualComposition } from './evidenceEngine/contextualComposition';
 import { observeProductionDiagnosticReliably, observeRetrievalAssignmentReliably } from './phaseBObservationOutbox';
 import { buildDecisionEvaluationSamplingPolicy } from './decisionEvaluationSamplingPolicy';
 import { ACTIONS, deriveVitalityScheduling, planAndRecordEvidenceAction, type EvidenceActionType, type EvidenceActionPlan } from './voiEvidenceController';
@@ -646,7 +647,7 @@ async function processChannelThroughPipelineInContext(
       const evidence=[...productionClassification.decision.positiveEvidence,...productionClassification.decision.negativeEvidence,...shadow.evidence];
       const governedReports=shadow.evidence.map(item=>item.source).filter((source,index,all)=>all.indexOf(source)===index).map(provider=>({provider,availability:'AVAILABLE' as const,evidenceCount:shadow.evidence.filter(item=>item.source===provider).length,outcome:'EXECUTED_WITH_EVIDENCE' as const,reasonCodes:['GOVERNED_PRODUCTION_EVIDENCE_TRANSPORTED']}));
       const collection:EvidenceCollectionReport={...productionClassification.decision.evidenceCollection,providers:[...productionClassification.decision.evidenceCollection.providers,...governedReports]};
-      const stages=evaluateClassificationStages(productionClassification.input,evidence,collection);
+      const stages=evaluateClassificationStages(productionClassification.input,evidence,collection,buildContextualComposition(productionClassification.input));
       const governedDecision=new ConfigurableWeightedStrategy().evaluateDecision(evidence,{globalInstruments:[],globalPlatformsPropFirms:[],globalAdvancedConcepts:[],globalNegativeTerms:[]},creatorCountry || undefined,collection,stages);
       tradingVal={...tradingVal,status:governedDecision.status,confidenceScore:governedDecision.confidenceScore,category:governedDecision.category,breakdown:{...tradingVal.breakdown,reasoning:[...(tradingVal.breakdown.reasoning||[]),...governedDecision.mathematicalJustification.split(' | '),'GOVERNED ROLLOUT: evidence traversed the production staged classifier; no decision bypass was used.']}};
     }

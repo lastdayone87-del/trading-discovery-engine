@@ -48,8 +48,9 @@ test('candidate triage does not treat "borsa di studio" as a market signal', () 
 });
 
 test('candidate triage still recognizes named Italian exchanges', () => {
-  const result = triageAutonomousSearchCandidate(candidate('Borsa di Milano analisi tecnica'), 'automated_query', false);
+  const result = triageAutonomousSearchCandidate(candidate('Borsa di Milano'), 'automated_query', false);
   assert.equal(result.disposition, 'PLAUSIBLE_TRADING_HYPOTHESIS');
+  assert.ok(result.matchedSignals.includes('LATIN_MARKET_FINANCE'));
 });
 
 test('candidate triage does not treat bare French "bourse" or Dutch "beurs" as market signals', () => {

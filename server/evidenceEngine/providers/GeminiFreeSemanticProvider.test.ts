@@ -455,3 +455,14 @@ test('an already-aborted free Gemini caller starts no route', async () => {
   ), (error: any) => error instanceof ProviderCallError && error.errorClass === 'CANCELLED');
   assert.equal(calls, 0);
 });
+
+test('an already-expired free Gemini caller is a TIMEOUT, not a cancellation', async () => {
+  let calls = 0;
+  const deadline = Object.assign(new Error('deadline'), { errorClass: 'TIMEOUT', retryable: true });
+  await assert.rejects(runGeminiFreeRouteFailover(
+    [{ id: 'gemini-free-1', key: 'hidden-a' }],
+    async () => { calls++; return {}; },
+    { signal: AbortSignal.abort(deadline) },
+  ), (error: any) => error instanceof ProviderCallError && error.errorClass === 'TIMEOUT');
+  assert.equal(calls, 0);
+});

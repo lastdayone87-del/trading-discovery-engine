@@ -19,10 +19,8 @@ export const CREATOR_OWNED_EVIDENCE_FIELDS: ReadonlySet<EvidenceFieldType> = new
   'external_link_label',
   'external_link_domain',
   'location',
-  'language',
   'discord_invite',
   'pinned_comment',
-  'activity_metadata',
   'visual_evidence',
 ]);
 

@@ -1299,9 +1299,11 @@ export async function processNextSearchJob(
       await recordQueryRunSightings(queryRunId, queryId, sightings.map(s=>({...s,pageNumber})));
       const configuredMaxPages = Number(await getAppSetting('autonomous_pagination_max_pages', '3'));
       // A malformed setting must not become an unbounded (or NaN) page
-      // ceiling. Fall back to the documented three-page default.
-      const globalMaxPages = Number.isFinite(configuredMaxPages) && configuredMaxPages >= 1
-        ? Math.floor(configuredMaxPages)
+      // ceiling. Fall back to the documented three-page default; finite
+      // values below one clamp to a single page rather than silently
+      // becoming the default.
+      const globalMaxPages = Number.isFinite(configuredMaxPages)
+        ? Math.max(1, Math.floor(configuredMaxPages))
         : 3;
       const maxPages = retrievalTreatmentOrigin === 'CANARY_TREATMENT'
         ? Math.min(requestedPageDepth ?? 1, globalMaxPages)
@@ -1369,18 +1371,56 @@ export async function processNextSearchJob(
         // Continuation is bounded page by page against the shared portfolio
         // floor. Selection only reserved the first page, so the budget check
         // must happen here rather than forcing the pagination ceiling into
-        // the pre-run reservation.
-        const portfolioPage = await reservePortfolioContinuationPage({
-          queryRunId,
-          pageNumber: pageNumber + 1,
-          providerQuotaUnits: allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE' ? 0 : 100,
-        });
+        // the pre-run reservation. The reservation update and child enqueue
+        // share one transaction: a failed enqueue must not leave committed
+        // quota that consumes portfolio budget during retries.
+        const continuationDb = await getDb();
+        const continuationClient = await continuationDb.connect();
+        let portfolioPage: { authorized: boolean; reason: string };
+        try {
+          await continuationClient.query('BEGIN');
+          portfolioPage = await reservePortfolioContinuationPage({
+            queryRunId,
+            pageNumber: pageNumber + 1,
+            providerQuotaUnits: allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE' ? 0 : 100,
+            clientOverride: continuationClient,
+          });
+          if (portfolioPage.authorized) {
+            await enqueueChildAndCommitPageReservation({
+              pageReservationId: incPageReservationId,
+              queryRunId,
+              jobType: 'SEARCH_YOUTUBE',
+              jobPayload: {
+                ...job.payload,
+                pageNumber: pageNumber + 1,
+                pageToken: searchPage.nextPageToken
+              },
+              priority: 20,
+              maxAttempts: 3,
+              idempotencyKey: `search-run:${queryRunId}:page:${pageNumber + 1}`,
+              clientOverride: continuationClient,
+            });
+            await continuationClient.query('COMMIT');
+          } else {
+            await continuationClient.query('ROLLBACK');
+          }
+        } catch (error) {
+          await continuationClient.query('ROLLBACK').catch(() => undefined);
+          throw error;
+        } finally {
+          continuationClient.release();
+        }
         if (!portfolioPage.authorized) {
           if (incPageReservationId) {
             await releaseIncrementalTreatmentPageReservation(incPageReservationId, queryRunId)
               .catch(error => console.warn('[Phase 9 Continuation] Failed to release treatment page reservation after portfolio denial:', error));
           }
           console.log(`[Phase 9 Continuation] Portfolio continuation denied for run ${queryRunId}: ${portfolioPage.reason}`);
+          if (portfolioPage.reason !== 'PORTFOLIO_BUDGET_EXHAUSTED') {
+            // A reservation error is retryable. Completing the run here would
+            // mislabel a transient database failure as budget exhaustion.
+            throw new Error(`Continuation reservation failed: ${portfolioPage.reason}`);
+          }
           await (await getDb()).query(
             `UPDATE autonomous_query_page_observations SET stopping_reason=$3 WHERE query_run_id=$1 AND page_number=$2`,
             [queryRunId, pageNumber, 'PORTFOLIO_BUDGET_EXHAUSTED'],
@@ -1388,21 +1428,6 @@ export async function processNextSearchJob(
           // Fall through to finalization: the run stops cleanly with the
           // pages it was authorized to execute.
         } else {
-          // Atomic child job enqueue + page reservation commit
-          await enqueueChildAndCommitPageReservation({
-            pageReservationId: incPageReservationId,
-            queryRunId,
-            jobType: 'SEARCH_YOUTUBE',
-            jobPayload: {
-              ...job.payload,
-              pageNumber: pageNumber + 1,
-              pageToken: searchPage.nextPageToken
-            },
-            priority: 20,
-            maxAttempts: 3,
-            idempotencyKey: `search-run:${queryRunId}:page:${pageNumber + 1}`
-          });
-
           await completeJob(job.id);
           return true;
         }

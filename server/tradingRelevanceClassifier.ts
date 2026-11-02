@@ -76,7 +76,9 @@ export async function classifyTradingRelevanceDetailed(
       : decision.classificationMethod === 'DEGRADED_HEURISTIC'
         ? 'DEGRADED_HEURISTIC'
         : 'HEURISTIC_ONLY';
-  const noEvidence = decision.positiveEvidence.length === 0 && decision.negativeEvidence.length === 0;
+  const noEvidence = decision.evidenceCount !== undefined
+    ? decision.evidenceCount === 0
+    : [...decision.positiveEvidence, ...decision.negativeEvidence].every(item => item.category === 'SEMANTIC_ABSTENTION');
   const breakdown: TradingRelevanceBreakdown = {
     stage_a_score: Math.round(decision.totalPositiveWeight),
     consistency_ratio: decision.multiVideoConsistencyRatio,

@@ -11,7 +11,7 @@ export interface UnifiedDecisionPolicyInput {evidence:EvidenceItem[];collection:
 export interface UnifiedDecisionPolicyResult {status:'TRADING_CONFIRMED'|'NON_TRADING'|'UNCERTAIN';confidenceScore:number;tradingProbability:number;nonTradingProbability:number;coverageConfidence:number;reasonCodes:string[]}
 
 /** C2: a channel title is a name prior, never independent confirmation. */
-function hasIndependentCreatorOwnedPositiveField(items:EvidenceItem[]):boolean{
+export function hasIndependentCreatorOwnedPositiveField(items:EvidenceItem[]):boolean{
   return items.some(item=>item.polarity==='POSITIVE'&&(item.provenance?.fields||[]).some(field=>field.field!=='channel_title'&&field.field!=='search_match_context'&&Boolean(field.field)));
 }
 
@@ -155,10 +155,13 @@ export function evaluateUnifiedDecisionPolicy(input:UnifiedDecisionPolicyInput):
     if(input.lifecycleAction==='CONFIRM'&&!recognitionAllowsConfirmation)reasons.push('RECOGNITION_STATE_NOT_DECISIVE_TRADING');
     reasons.push(input.lifecycleAction==='ENRICH'?'EVIDENCE_COVERAGE_INCOMPLETE':input.lifecycleAction==='REVIEW'?'SELECTIVE_POLICY_ABSTAINED':positive.length>0&&substantivePositiveWeight<input.minimumPositiveWeight?'SUBSTANTIVE_POSITIVE_EVIDENCE_REQUIRED':'SCORE_BOUNDARY_NOT_SATISFIED');
   }
-  // C3: no status floors. For a terminal status confidenceScore is the
-  // calibrated probability of that status; for UNCERTAIN it is clamped to the
-  // ambiguous band so the surface never reports a decisive confidence for an
-  // undecided outcome. `tradingProbability` remains the raw calibrated value.
-  const confidenceScore=status==='TRADING_CONFIRMED'?tradingProbability:status==='NON_TRADING'?nonTradingProbability:Math.min(79,Math.max(23,tradingProbability));
+  // `confidenceScore` is persisted as the channel's trading confidence, not as
+  // "probability of the reported status". Keep it on the trading scale so a
+  // NON_TRADING decision cannot store a high trading score and a confirmed
+  // channel cannot fall below the >=80 consumer gate. For UNCERTAIN it is
+  // clamped to the ambiguous band so the surface never reports a decisive
+  // confidence for an undecided outcome. `tradingProbability` remains the raw
+  // calibrated value.
+  const confidenceScore=status==='TRADING_CONFIRMED'?Math.max(82,tradingProbability):status==='NON_TRADING'?Math.min(22,100-nonTradingProbability):Math.min(79,Math.max(23,tradingProbability));
   return {status,confidenceScore,tradingProbability,nonTradingProbability,coverageConfidence,reasonCodes:reasons};
 }

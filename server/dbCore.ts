@@ -1384,7 +1384,7 @@ export async function getQueriesByCountry(country:string):Promise<QueryRecord[]>
 /** Q5 per-run reward rows. Global newness and quality are read from
  * sighting-level truth, never from query_library cumulative counters. */
 export interface QueryQualityRunRow{queryId:number;confirmed:number;quality:number;quotaUnits:number;ageDays:number;}
-export async function getQueryQualityRunRows(country?:string):Promise<QueryQualityRunRow[]>{const db=await getDb();const res=await db.query(`SELECT qr.query_id,EXTRACT(EPOCH FROM (now()-qr.completed_at))/86400.0 AS age_days,COALESCE(s.confirmed,0)::int AS confirmed,COALESCE(s.quality,0)::int AS quality,GREATEST(0,qr.quota_used)::float/100.0 AS quota_units FROM query_runs qr LEFT JOIN LATERAL (SELECT COUNT(DISTINCT cs.channel_id) FILTER (WHERE cs.persisted AND NOT cs.was_known AND cs.country_outcome IN ('CONFIRMED','LIKELY') AND cs.funnel_outcome='TRADING_CONFIRMED')::int AS confirmed,COUNT(DISTINCT cs.channel_id) FILTER (WHERE cs.persisted AND NOT cs.was_known AND cs.country_outcome IN ('CONFIRMED','LIKELY') AND cs.funnel_outcome='TRADING_CONFIRMED' AND c.quality_score>=${QUALITY_CREATOR_SCORE_THRESHOLD})::int AS quality FROM channel_sightings cs LEFT JOIN channels c ON c.channel_id=cs.channel_id WHERE cs.query_run_id=qr.id) s ON true WHERE qr.status='COMPLETED' AND qr.query_id IS NOT NULL AND qr.completed_at IS NOT NULL AND qr.completed_at>now()-interval '180 days' AND COALESCE((qr.performance_details->>'providerRequestsFailed')::int,0)=0 AND (COALESCE(qr.performance_details->>'providerRunOutcome','') = '' OR qr.performance_details->>'providerRunOutcome' LIKE 'SUCCESS%') AND ($1::text IS NULL OR LOWER(qr.country)=LOWER($1)) ORDER BY qr.completed_at DESC`,[country||null]);return res.rows.map((r:any)=>({queryId:Number(r.query_id),confirmed:Number(r.confirmed||0),quality:Number(r.quality||0),quotaUnits:Number(r.quota_units||0),ageDays:Number(r.age_days||0)}));}
+export async function getQueryQualityRunRows(country?:string):Promise<QueryQualityRunRow[]>{const db=await getDb();const res=await db.query(`SELECT qr.query_id,EXTRACT(EPOCH FROM (now()-qr.completed_at))/86400.0 AS age_days,COALESCE(s.confirmed,0)::int AS confirmed,COALESCE(s.quality,0)::int AS quality,GREATEST(0,qr.quota_used)::float/100.0 AS quota_units FROM query_runs qr LEFT JOIN LATERAL (SELECT COUNT(DISTINCT cs.channel_id) FILTER (WHERE cs.persisted AND NOT cs.was_known AND cs.country_outcome IN ('CONFIRMED','LIKELY') AND cs.funnel_outcome='TRADING_CONFIRMED')::int AS confirmed,COUNT(DISTINCT cs.channel_id) FILTER (WHERE cs.persisted AND NOT cs.was_known AND cs.country_outcome IN ('CONFIRMED','LIKELY') AND cs.funnel_outcome='TRADING_CONFIRMED' AND c.quality_score>=${QUALITY_CREATOR_SCORE_THRESHOLD})::int AS quality FROM channel_sightings cs LEFT JOIN channels c ON c.channel_id=cs.channel_id WHERE cs.query_run_id=qr.id) s ON true WHERE qr.status='COMPLETED' AND qr.query_id IS NOT NULL AND qr.completed_at IS NOT NULL AND qr.completed_at>now()-interval '180 days' AND COALESCE((qr.performance_details->>'providerRequestsFailed')::int,0)=0 AND COALESCE((qr.performance_details->>'providerRateLimited')::int,0)=0 AND (COALESCE(qr.performance_details->>'providerRunOutcome','') = '' OR qr.performance_details->>'providerRunOutcome' LIKE 'SUCCESS%') AND ($1::text IS NULL OR LOWER(qr.country)=LOWER($1)) ORDER BY qr.completed_at DESC`,[country||null]);return res.rows.map((r:any)=>({queryId:Number(r.query_id),confirmed:Number(r.confirmed||0),quality:Number(r.quality||0),quotaUnits:Number(r.quota_units||0),ageDays:Number(r.age_days||0)}));}
 /**
  * Decayed reward counts aggregated in SQL. Selection runs on the scheduler hot
  * path, so reading one row per completed run over 180 days (each with a
@@ -1397,7 +1397,7 @@ export interface QueryQualityDecayedCounts{queryId:number;counts:{confirmed:numb
 export async function getQueryQualityDecayedCounts(country?:string,queryId?:number,halfLifeDays=30):Promise<QueryQualityDecayedCounts[]>{
   const db=await getDb();
   const halfLife=Number.isFinite(halfLifeDays)&&halfLifeDays>0?halfLifeDays:30;
-  const res=await db.query(`SELECT qr.query_id,SUM(COALESCE(s.confirmed,0)*power(0.5::float8,GREATEST(0,EXTRACT(EPOCH FROM (now()-qr.completed_at))/86400.0)/$2::float8))::float8 AS confirmed,SUM(COALESCE(s.quality,0)*power(0.5::float8,GREATEST(0,EXTRACT(EPOCH FROM (now()-qr.completed_at))/86400.0)/$2::float8))::float8 AS quality,SUM((GREATEST(0,qr.quota_used)::float8/100.0)*power(0.5::float8,GREATEST(0,EXTRACT(EPOCH FROM (now()-qr.completed_at))/86400.0)/$2::float8))::float8 AS quota_units,COUNT(*)::int AS runs FROM query_runs qr LEFT JOIN LATERAL (SELECT COUNT(DISTINCT cs.channel_id) FILTER (WHERE cs.persisted AND NOT cs.was_known AND cs.country_outcome IN ('CONFIRMED','LIKELY') AND cs.funnel_outcome='TRADING_CONFIRMED')::int AS confirmed,COUNT(DISTINCT cs.channel_id) FILTER (WHERE cs.persisted AND NOT cs.was_known AND cs.country_outcome IN ('CONFIRMED','LIKELY') AND cs.funnel_outcome='TRADING_CONFIRMED' AND c.quality_score>=${QUALITY_CREATOR_SCORE_THRESHOLD})::int AS quality FROM channel_sightings cs LEFT JOIN channels c ON c.channel_id=cs.channel_id WHERE cs.query_run_id=qr.id) s ON true WHERE qr.status='COMPLETED' AND qr.query_id IS NOT NULL AND qr.completed_at IS NOT NULL AND qr.completed_at>now()-interval '180 days' AND COALESCE((qr.performance_details->>'providerRequestsFailed')::int,0)=0 AND (COALESCE(qr.performance_details->>'providerRunOutcome','') = '' OR qr.performance_details->>'providerRunOutcome' LIKE 'SUCCESS%') AND GREATEST(0,qr.quota_used)>0 AND ($1::text IS NULL OR LOWER(qr.country)=LOWER($1)) AND ($3::int IS NULL OR qr.query_id=$3) GROUP BY qr.query_id`,[country||null,halfLife,queryId??null]);
+  const res=await db.query(`SELECT qr.query_id,SUM(COALESCE(s.confirmed,0)*power(0.5::float8,GREATEST(0,EXTRACT(EPOCH FROM (now()-qr.completed_at))/86400.0)/$2::float8))::float8 AS confirmed,SUM(COALESCE(s.quality,0)*power(0.5::float8,GREATEST(0,EXTRACT(EPOCH FROM (now()-qr.completed_at))/86400.0)/$2::float8))::float8 AS quality,SUM((GREATEST(0,qr.quota_used)::float8/100.0)*power(0.5::float8,GREATEST(0,EXTRACT(EPOCH FROM (now()-qr.completed_at))/86400.0)/$2::float8))::float8 AS quota_units,COUNT(*)::int AS runs FROM query_runs qr LEFT JOIN LATERAL (SELECT COUNT(DISTINCT cs.channel_id) FILTER (WHERE cs.persisted AND NOT cs.was_known AND cs.country_outcome IN ('CONFIRMED','LIKELY') AND cs.funnel_outcome='TRADING_CONFIRMED')::int AS confirmed,COUNT(DISTINCT cs.channel_id) FILTER (WHERE cs.persisted AND NOT cs.was_known AND cs.country_outcome IN ('CONFIRMED','LIKELY') AND cs.funnel_outcome='TRADING_CONFIRMED' AND c.quality_score>=${QUALITY_CREATOR_SCORE_THRESHOLD})::int AS quality FROM channel_sightings cs LEFT JOIN channels c ON c.channel_id=cs.channel_id WHERE cs.query_run_id=qr.id) s ON true WHERE qr.status='COMPLETED' AND qr.query_id IS NOT NULL AND qr.completed_at IS NOT NULL AND qr.completed_at>now()-interval '180 days' AND COALESCE((qr.performance_details->>'providerRequestsFailed')::int,0)=0 AND COALESCE((qr.performance_details->>'providerRateLimited')::int,0)=0 AND (COALESCE(qr.performance_details->>'providerRunOutcome','') = '' OR qr.performance_details->>'providerRunOutcome' LIKE 'SUCCESS%') AND GREATEST(0,qr.quota_used)>0 AND ($1::text IS NULL OR LOWER(qr.country)=LOWER($1)) AND ($3::int IS NULL OR qr.query_id=$3) GROUP BY qr.query_id`,[country||null,halfLife,queryId??null]);
   return res.rows.map((r:any)=>({queryId:Number(r.query_id),counts:{confirmed:Number(r.confirmed||0),quality:Number(r.quality||0),quotaUnits:Number(r.quota_units||0),runs:Number(r.runs||0)}}));
 }
 /**
@@ -1409,8 +1409,15 @@ export async function getQueryQualityDecayedCounts(country?:string,queryId?:numb
 export interface QueryQuotaSpendRow{queryId:number;quotaUnits:number;ageDays:number;}
 export async function getQueryQuotaSpendRows(country?:string):Promise<QueryQuotaSpendRow[]>{
   const db=await getDb();
-  const res=await db.query(`SELECT query_id,GREATEST(0,GREATEST(quota_reserved,quota_used))::float/100.0 AS quota_units,EXTRACT(EPOCH FROM (now()-COALESCE(completed_at,scheduled_at)))/86400.0 AS age_days FROM query_runs WHERE query_id IS NOT NULL AND status IN ('SCHEDULED','RUNNING','RETRYING','COMPLETED') AND COALESCE(completed_at,scheduled_at)>now()-interval '180 days' AND ($1::text IS NULL OR LOWER(country)=LOWER($1))`,[country||null]);
+  const res=await db.query(`SELECT query_id,GREATEST(0,GREATEST(quota_reserved,quota_used))::float/100.0 AS quota_units,EXTRACT(EPOCH FROM (now()-COALESCE(completed_at,scheduled_at)))/86400.0 AS age_days FROM query_runs WHERE query_id IS NOT NULL AND status IN ('SCHEDULED','RUNNING','RETRYING','COMPLETED','FAILED') AND COALESCE(completed_at,scheduled_at)>now()-interval '180 days' AND ($1::text IS NULL OR LOWER(country)=LOWER($1))`,[country||null]);
   return res.rows.map((r:any)=>({queryId:Number(r.query_id),quotaUnits:Number(r.quota_units||0),ageDays:Math.max(0,Number(r.age_days||0))}));
+}
+/** In-flight (scheduled/running/retrying) uses per primary term. */
+export interface QueryPrimaryTermUsageRow{primaryTerm:string;uses:number;}
+export async function getInFlightPrimaryTermUsage(country:string|undefined,sinceIso:string):Promise<QueryPrimaryTermUsageRow[]>{
+  const db=await getDb();
+  const res=await db.query(`SELECT ql.primary_term,COUNT(*)::int AS uses FROM query_runs qr JOIN query_library ql ON ql.id=qr.query_id WHERE qr.query_id IS NOT NULL AND qr.status IN ('SCHEDULED','RUNNING','RETRYING') AND COALESCE(qr.scheduled_at,now()) >= $2 AND ql.primary_term IS NOT NULL AND btrim(ql.primary_term)<>'' AND ($1::text IS NULL OR LOWER(qr.country)=LOWER($1)) GROUP BY ql.primary_term`,[country||null,sinceIso]);
+  return res.rows.map((r:any)=>({primaryTerm:String(r.primary_term),uses:Number(r.uses||0)}));
 }
 /** Consecutive terminal query failures, newest first, with provider failures exempt. */
 export interface QueryFailureState{queryId:number;consecutiveFailures:number;backoffUntil:string|null;}
@@ -1432,7 +1439,7 @@ export async function getQueryRunReward(runId:string):Promise<{confirmed:number;
   const res=await db.query(`SELECT COUNT(DISTINCT cs.channel_id) FILTER (WHERE cs.persisted AND NOT cs.was_known AND cs.country_outcome IN ('CONFIRMED','LIKELY') AND cs.funnel_outcome='TRADING_CONFIRMED')::int AS confirmed,COUNT(DISTINCT cs.channel_id) FILTER (WHERE cs.persisted AND NOT cs.was_known AND cs.country_outcome IN ('CONFIRMED','LIKELY') AND cs.funnel_outcome='TRADING_CONFIRMED' AND c.quality_score>=${QUALITY_CREATOR_SCORE_THRESHOLD})::int AS quality FROM channel_sightings cs LEFT JOIN channels c ON c.channel_id=cs.channel_id WHERE cs.query_run_id=$1`,[runId]);
   return {confirmed:Number(res.rows[0]?.confirmed||0),quality:Number(res.rows[0]?.quality||0)};
 }
-const PORTFOLIO_UNITS_SQL=`SELECT COALESCE(SUM(GREATEST(quota_reserved,quota_used)),0)::float/100.0 AS units FROM query_runs WHERE scheduled_at>=date_trunc('day',now() AT TIME ZONE 'UTC') AND status IN ('SCHEDULED','RUNNING','RETRYING','COMPLETED') AND (selection_strategy IN ('UCB_PORTFOLIO','UCB1_EXPLORATION','COLD_START_GENERATION') OR selection_reason LIKE 'Bounded portfolio%')`;
+const PORTFOLIO_UNITS_SQL=`SELECT COALESCE(SUM(GREATEST(quota_reserved,quota_used)),0)::float/100.0 AS units FROM query_runs WHERE scheduled_at>=date_trunc('day',now() AT TIME ZONE 'UTC') AND status IN ('SCHEDULED','RUNNING','RETRYING','COMPLETED','FAILED') AND (selection_strategy IN ('UCB_PORTFOLIO','UCB1_EXPLORATION','COLD_START_GENERATION') OR selection_reason LIKE 'Bounded portfolio%')`;
 /**
  * Shared portfolio budget plus an optional country breakdown. The budget the
  * selector enforces is global; a country-filtered total must never be
@@ -1478,29 +1485,36 @@ export async function reservePortfolioContinuationPage(input: {
   queryRunId: string;
   pageNumber: number;
   providerQuotaUnits: number;
+  /**
+   * When supplied, the caller owns the transaction: this function neither
+   * begins, commits, rolls back, nor releases. The queue uses this to commit
+   * the page reservation atomically with the child-job enqueue.
+   */
+  clientOverride?: any;
 }): Promise<{authorized:boolean;reason:string}> {
   const pageUnits = Number(input.providerQuotaUnits);
   if (!Number.isFinite(pageUnits) || pageUnits <= 0) return {authorized:true,reason:'NO_OFFICIAL_QUOTA'};
   if (!Number.isFinite(input.pageNumber) || input.pageNumber < 1) return {authorized:false,reason:'INVALID_PAGE_NUMBER'};
   const db=await getDb();
-  const client=await db.connect();
+  const client=input.clientOverride||await db.connect();
+  const ownsTransaction=!input.clientOverride;
   try {
-    await client.query('BEGIN');
+    if (ownsTransaction) await client.query('BEGIN');
     await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`,['query-portfolio-budget']);
     const run=await client.query(`SELECT selection_strategy,selection_reason,quota_reserved,quota_used FROM query_runs WHERE id=$1 FOR UPDATE`,[input.queryRunId]);
-    if(!run.rowCount){await client.query('ROLLBACK');return {authorized:false,reason:'QUERY_RUN_NOT_FOUND'};}
+    if(!run.rowCount){if(ownsTransaction)await client.query('ROLLBACK');return {authorized:false,reason:'QUERY_RUN_NOT_FOUND'};}
     const row=run.rows[0];
     const strategy=String(row.selection_strategy||'');
     const selectionReason=String(row.selection_reason||'');
     const portfolioRun=['UCB_PORTFOLIO','UCB1_EXPLORATION','COLD_START_GENERATION'].includes(strategy)
       || selectionReason.startsWith('Bounded portfolio');
-    if(!portfolioRun){await client.query('COMMIT');return {authorized:true,reason:'NOT_PORTFOLIO_RUN'};}
+    if(!portfolioRun){if(ownsTransaction)await client.query('COMMIT');return {authorized:true,reason:'NOT_PORTFOLIO_RUN'};}
 
     const targetReserved=Math.max(0,input.pageNumber*pageUnits);
     const currentReserved=Math.max(0,Number(row.quota_reserved||0),Number(row.quota_used||0));
     if(currentReserved>=targetReserved){
       // This page was already authorized (job retry or duplicate delivery).
-      await client.query('COMMIT');
+      if(ownsTransaction)await client.query('COMMIT');
       return {authorized:true,reason:'ALREADY_RESERVED'};
     }
 
@@ -1516,37 +1530,41 @@ export async function reservePortfolioContinuationPage(input: {
     const portfolioUnitsUsed=Math.max(0,Number(used.rows[0]?.units||0));
     const additionalUnits=(targetReserved-currentReserved)/100;
     if(!portfolioContinuationAllowed({portfolioUnitsUsed,portfolioUnitsReserved,nextPageUnits:additionalUnits})){
-      await client.query('ROLLBACK');
+      if(ownsTransaction)await client.query('ROLLBACK');
       return {authorized:false,reason:'PORTFOLIO_BUDGET_EXHAUSTED'};
     }
     await client.query(`UPDATE query_runs SET quota_reserved=GREATEST(COALESCE(quota_reserved,0),COALESCE(quota_used,0),$2) WHERE id=$1`,[input.queryRunId,targetReserved]);
-    await client.query('COMMIT');
+    if(ownsTransaction)await client.query('COMMIT');
     return {authorized:true,reason:'RESERVED'};
   } catch(error) {
-    await client.query('ROLLBACK').catch(()=>undefined);
+    if(ownsTransaction)await client.query('ROLLBACK').catch(()=>undefined);
     console.warn('[QueryPortfolio] Failed to reserve continuation page:',error);
     return {authorized:false,reason:'RESERVATION_FAILED'};
   } finally {
-    client.release();
+    if(ownsTransaction) client.release();
   }
 }
 /** Q6 read-only projection over query runs + stored attribution JSONB. */
 export async function getQueryQualityDashboardRows(country?:string,limit=200):Promise<QueryQualityDashboardRunInput[]>{const db=await getDb();const res=await db.query(`SELECT qr.id::text AS run_id,qr.query_id,COALESCE(ql.query,'') AS query,qr.country,qr.status,qr.selection_strategy,qr.selection_reason,qr.quota_used,qr.completed_at,qr.performance_details,COALESCE(a.metrics,'{}'::jsonb) AS metrics,COALESCE(qr.metadata,'{}'::jsonb) AS run_metadata,(SELECT apo.stopping_reason FROM autonomous_query_page_observations apo WHERE apo.query_run_id=qr.id ORDER BY apo.page_number DESC LIMIT 1) AS stop_reason FROM query_runs qr LEFT JOIN query_library ql ON ql.id=qr.query_id LEFT JOIN query_run_accounting_attributions a ON a.query_run_id=qr.id WHERE ($1::text IS NULL OR LOWER(qr.country)=LOWER($1)) ORDER BY qr.scheduled_at DESC LIMIT $2`,[country||null,Math.max(1,Math.min(500,Math.floor(limit)))]);return res.rows.map((r:any)=>{const metrics=parseJson<Record<string,any>>(r.metrics,{});const metadata=parseGenerationMetadata(r.run_metadata);const admission=metadata.queryAdmission||null;return {runId:String(r.run_id||''),queryId:Number(r.query_id||0),query:String(r.query||''),country:String(r.country||''),status:String(r.status||''),selectionStrategy:String(r.selection_strategy||'UNKNOWN'),selectionReason:String(r.selection_reason||''),stopReason:r.stop_reason?String(r.stop_reason):null,quotaUsed:Number(r.quota_used||0),completedAt:iso(r.completed_at),performanceScore:Number(r.performance_details?.performanceScore||metrics.performanceScore||0),qualityVector:metrics.qualityVector||null,admission:admission?{tier:admission.tier,compositionFamily:admission.compositionFamily,reasonCodes:Array.isArray(admission.reasonCodes)?admission.reasonCodes:[],source:admission.source,eligible:admission.eligible}:null};});}
 export async function getQueryByText(queryText:string):Promise<QueryRecord|null>{const db=await getDb(); const res=await db.query('SELECT * FROM query_library WHERE LOWER(query)=LOWER($1)',[queryText.trim()]); return res.rows[0]?rowToQuery(res.rows[0]):null;}
-export async function upsertQueryRecord(record:{query:string;country:string;collection:'PROVEN'|'EXPERIMENTAL'|'REJECTED';intent:string;knowledgeTiers?:number[];generationMode?:string;generationReason?:string;discoveryObjective?:string;primaryTerm?:string;generationMetadata?:Record<string,unknown>;}):Promise<QueryRecord>{
+export interface QueryDuplicateHistoryItem {query:string;country:string;aliasOf?:string;}
+export async function upsertQueryRecord(record:{query:string;country:string;collection:'PROVEN'|'EXPERIMENTAL'|'REJECTED';intent:string;knowledgeTiers?:number[];generationMode?:string;generationReason?:string;discoveryObjective?:string;primaryTerm?:string;generationMetadata?:Record<string,unknown>;},options:{/** Still-current same-country rows, preloaded by a batch producer. */history?:QueryDuplicateHistoryItem[]}={}):Promise<QueryRecord>{
   const db=await getDb();
   const query=record.query.normalize('NFKC').trim().replace(/\s+/g,' ');
   const normalized=normalizeQueryText(query);
   const admissionMetadata=parseGenerationMetadata(record.generationMetadata as Record<string,unknown>||{});
   // Country-scoped duplicate suppression compares against every other row,
   // including cooling/rejected rows. The current row is excluded so an
-  // in-place update never rejects itself.
-  const historyResult=await db.query(`SELECT query,country,generation_metadata FROM query_library WHERE LOWER(country)=LOWER($1) AND normalized_query<>$2`,[record.country,normalized]);
-  const history=historyResult.rows.map((row:any)=>{
-    const metadata=parseGenerationMetadata(row.generation_metadata);
-    const aliasOf=typeof metadata.aliasOf==='string'?metadata.aliasOf:undefined;
-    return {query:String(row.query||''),country:String(row.country||''),...(aliasOf?{aliasOf}:{})};
-  }).filter(item=>item.query);
+  // in-place update never rejects itself. Batch producers pass the history
+  // once instead of rescanning the whole country per candidate.
+  const history=(options.history
+    ? options.history
+    : (await db.query(`SELECT query,country,generation_metadata FROM query_library WHERE LOWER(country)=LOWER($1) AND normalized_query<>$2`,[record.country,normalized])).rows.map((row:any)=>{
+        const metadata=parseGenerationMetadata(row.generation_metadata);
+        const aliasOf=typeof metadata.aliasOf==='string'?metadata.aliasOf:undefined;
+        return {query:String(row.query||''),country:String(row.country||''),...(aliasOf?{aliasOf}:{})};
+      })
+  ).filter((item:QueryDuplicateHistoryItem)=>item.query&&normalizeQueryText(item.query)!==normalized);
   const admission=admitQueryRecord({query,country:record.country,primary_term:record.primaryTerm,generation_metadata:admissionMetadata},{history,now:new Date().toISOString()});
   const generationMetadata=withQueryAdmission(admissionMetadata,admission.admission);
   const res=await db.query(`INSERT INTO query_library(query,normalized_query,country,collection,intent,knowledge_tiers,generation_mode,generation_reason,discovery_objective,primary_term,generation_metadata,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now()) ON CONFLICT(country,normalized_query) DO UPDATE SET query=excluded.query,collection=excluded.collection,intent=excluded.intent,knowledge_tiers=excluded.knowledge_tiers,generation_mode=excluded.generation_mode,generation_reason=excluded.generation_reason,discovery_objective=excluded.discovery_objective,primary_term=excluded.primary_term,generation_metadata=excluded.generation_metadata RETURNING *`,[query,normalized,record.country,record.collection,record.intent,record.knowledgeTiers||[1],record.generationMode||'LEGACY',record.generationReason||'Legacy query',record.discoveryObjective||'Discover relevant trading creators.',record.primaryTerm||null,JSON.stringify(generationMetadata)]);
@@ -4064,15 +4082,12 @@ export async function completeQueryRun(runId: string, metrics: {
            WHERE s.persisted AND NOT s.was_known AND s.country_outcome IN ('CONFIRMED','LIKELY') AND s.funnel_outcome='TRADING_CONFIRMED')::int AS confirmed_new,
          COUNT(DISTINCT s.channel_id) FILTER (
            WHERE s.persisted AND NOT s.was_known AND s.country_outcome IN ('CONFIRMED','LIKELY') AND s.funnel_outcome='TRADING_CONFIRMED'
-             AND c.quality_score>=${QUALITY_CREATOR_SCORE_THRESHOLD})::int AS quality_new,
-         COUNT(DISTINCT s.channel_id) FILTER (
-           WHERE s.country_outcome IN ('CONFIRMED','LIKELY'))::int AS target_market_matched
+             AND c.quality_score>=${QUALITY_CREATOR_SCORE_THRESHOLD})::int AS quality_new
          FROM channel_sightings s LEFT JOIN channels c ON c.channel_id=s.channel_id
          WHERE s.query_run_id=$1`, [runId]
       );
       const newConfirmedCreators = Number(sightingTruth.rows[0]?.confirmed_new || 0);
       const newQualityCreators = Number(sightingTruth.rows[0]?.quality_new || 0);
-      const targetMarketConfirmed = Number(sightingTruth.rows[0]?.target_market_matched || 0);
       const qualityVector = buildQueryQualityVector({
         rawResults: metrics.rawResults,
         distinctResults: metrics.distinctResults,
@@ -4089,13 +4104,11 @@ export async function completeQueryRun(runId: string, metrics: {
         // provider failure and must not become an eligible reward sample.
         providerDegraded: (metrics.providerRequestsFailed || 0) > 0
           || (metrics.providerRateLimited || 0) > 0
-          || (!!metrics.providerRunOutcome && !/^SUCCESS_/.test(String(metrics.providerRunOutcome))),
+          || (!!metrics.providerRunOutcome && !/^SUCCESS(?:_|$)/.test(String(metrics.providerRunOutcome))),
         failed: false,
-        // Measured from sighting country outcomes, not from the aggregate
-        // "distinct minus rejected" proxy that also counted non-trading,
-        // uncertain and review results. Language matching is not measured by
-        // this pipeline, so it stays unknown instead of defaulting to 100%.
-        targetMarketConfirmed,
+        // Target-market precision treats only an explicit country rejection as
+        // a miss; UNCERTAIN and unresolved results stay neutral.
+        targetMarketConfirmed: Math.max(0, metrics.distinctResults - metrics.countryRejected),
         languageMatchedConfirmed: null,
       });
       const generationMetadata = parseGenerationMetadata(row.generation_metadata);

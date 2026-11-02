@@ -26,6 +26,10 @@ const GENERIC_TRADING_TERM = /^(trading|trader|trade|market analysis|risk manage
 export function isExplicitCreatorTradingText(text: string, context: LayeredKnowledgeContext): boolean {
   const normalized = text.normalize('NFKC');
   const unrelatedTradingUsage = /\b(trading\s*cards?|card\s*trading|pok[eé]mon|yugioh|steam\s*trading|skin\s*trading|sports?\s*card)\b/iu;
+  // "Trader Joe's" is a grocery brand, not a trading creator. Excluding the
+  // brand avoids both the generic-literal path and the "of Trader" domain
+  // phrase path ("Best of Trader Joe's").
+  const traderJoes = /\btrader\s+joe'?s?\b/iu.test(normalized);
   const genericTradingLiteral = /\b(trading|trader)\b/iu;
   const explicitFinancialTradingLiteral = /\b(day\s*trad(?:e|ing)|swing\s*trad(?:e|ing)|intraday|scalp(?:ing|er)|forex|fx\s*trading|futures?|options?|0dte|prop\s*firm|funded\s*trader|stocks?|equities|shares?|crypto|bitcoin|ethereum|btc|eth|nasdaq|s&p\s*500|sp500)\b/iu;
   const nativeTradingLiteral = /(トレード|デイトレード|先物|株式取引|تداول|交易|交易策略|交易计划)/u;
@@ -42,6 +46,10 @@ export function isExplicitCreatorTradingText(text: string, context: LayeredKnowl
   const hasCountryTradingSignal = (context.countryKnowledge?.nativeTradingTerminology || []).some(term => textMatchesTerm(normalized, term));
   const hasTierASignal = matchedTierATradingSignals(normalized, context).some(signal => signal !== 'KNOWN_METHOD');
   const hasFinancialQualifier = FINANCIAL_QUALIFIER_PATTERN.test(normalized) || TRADER_DOMAIN_PHRASE.test(normalized);
+  // "Trader Joe's" is a grocery brand, not a trading creator. Excluding the
+  // brand before any other signal avoids both the generic-literal path and
+  // the "of Trader" domain phrase path ("Best of Trader Joe's").
+  if (traderJoes) return hasExplicitFinancialLiteral || hasCountryTradingSignal;
   // Generic methods such as "candlestick", "chart patterns", "risk management"
   // or "market analysis" are not trading evidence on their own
   // ("candlestick making tutorial", "workplace risk management"). They count
@@ -143,6 +151,7 @@ export class VideoMetadataProvider implements EvidenceProvider {
         }
       }
       for (const langTerm of (knowledgeContext.languageKnowledgePacks||[knowledgeContext.languageKnowledge]).flatMap(pack=>pack?.positiveTerms||[])) {
+        if (GENERIC_TRADING_TERM.test(langTerm.trim())) continue;
         if (textMatchesTerm(combo, langTerm)) {
           pushUniqueMatch(matchedConceptsInVideos, langTerm);
         }

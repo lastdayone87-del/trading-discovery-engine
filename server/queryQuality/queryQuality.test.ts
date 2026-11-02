@@ -15,6 +15,7 @@ import {
 } from './admission';
 import {
   buildQueryCandidate,
+  candidateHash,
   compositionFamilyFor,
   evaluateQueryComposition,
   isSemanticDuplicate,
@@ -34,7 +35,7 @@ import { buildQueryQualityVector, buildAttribution, canPromoteToProven, isReward
 import { selectQueryCollection } from '../queryPerformance';
 import { decideLifecycle } from '../terminologyIntelligence';
 import { buildQueryQualityDashboard } from './dashboard';
-import { compareSelectors, currentUcb1Index, portfolioPullAdmitted } from './simulator';
+import { compareSelectors, currentUcb1Index, portfolioPullAdmitted, runSelectorSimulation } from './simulator';
 import { verifyFrozenBenchmarkVersions } from '../benchmarkPreregV1';
 import { AUTONOMOUS_QUERY_AUTHORITY_POLICY_VERSION } from '../autonomousQueryAuthority';
 import { CANDIDATE_TRIAGE_POLICY_VERSION } from '../candidateTriage';
@@ -808,6 +809,15 @@ test('Q5/Q6: production wiring uses accounting-window spend, derived failure sta
   const intelligence = readFileSync(join(__dirname, '..', 'queryIntelligence.ts'), 'utf8');
   assert.match(intelligence, /getQueryQuotaSpendRows\(country\)/);
   assert.match(intelligence, /getQueryFailureStates\(country\)/);
+  // A failed terminal run can still retain quota_reserved/quota_used. Both
+  // spend reads must include it or the selector can re-spend consumed budget.
+  const dbCore = readFileSync(join(__dirname, '..', 'dbCore.ts'), 'utf8');
+  const spendQuery = dbCore.slice(
+    dbCore.indexOf('export async function getQueryQuotaSpendRows'),
+    dbCore.indexOf('/** In-flight (scheduled/running/retrying) uses per primary term. */'),
+  );
+  assert.match(spendQuery, /status IN \('SCHEDULED','RUNNING','RETRYING','COMPLETED','FAILED'\)/);
+  assert.match(dbCore, /const PORTFOLIO_UNITS_SQL=.*status IN \('SCHEDULED','RUNNING','RETRYING','COMPLETED','FAILED'\)/);
   assert.match(intelligence, /getQueryRunReward\(attribution\.queryRunId\)/);
   assert.match(intelligence, /consecutiveFailures: failure\?\.consecutiveFailures/);
   // Promotion and hierarchy learning use the same eligibility as serving and
@@ -827,7 +837,6 @@ test('Q5/Q6: production wiring uses accounting-window spend, derived failure sta
   assert.ok(spendStart > 0);
   assert.ok(eligibleStart > spendStart);
 
-  const dbCore = readFileSync(join(__dirname, '..', 'dbCore.ts'), 'utf8');
   assert.match(dbCore, /selection_strategy IN \('UCB_PORTFOLIO','UCB1_EXPLORATION','COLD_START_GENERATION'\)/);
   assert.match(dbCore, /SELECT query,country,generation_metadata FROM query_library/);
   assert.match(dbCore, /\{history,now:new Date\(\)\.toISOString\(\)\}/);
@@ -840,7 +849,9 @@ test('Q5/Q6: production wiring uses accounting-window spend, derived failure sta
   // The dashboard must use the configured bounded ratio, not a hard-coded 15%.
   assert.match(dbCore, /portfolioUnitsReserved:dailyQuotaUnits\*boundedPortfolioRatio\(configuredRatio\)/);
   // Measured target-market truth and an explicit unknown language metric.
-  assert.match(dbCore, /COUNT\(DISTINCT s\.channel_id\) FILTER \(\s*WHERE s\.country_outcome IN \('CONFIRMED','LIKELY'\)\)/);
+  // The filter also requires persistence/novelty, so allow those predicates
+  // before the target-market check instead of pinning the exact clause order.
+  assert.match(dbCore, /COUNT\(DISTINCT s\.channel_id\) FILTER \(\s*WHERE s\.persisted AND NOT s\.was_known AND s\.country_outcome IN \('CONFIRMED','LIKELY'\)/);
   assert.match(dbCore, /languageMatchedConfirmed: null/);
   // Reward is in-scope only: UNCERTAIN/no-country sightings may not earn
   // credit even when they pass the general funnel as TRADING_CONFIRMED.
@@ -934,6 +945,24 @@ function rawInput(overrides: Partial<RawChannelInput>): RawChannelInput {
   input.evidence_corpus = buildCanonicalEvidenceCorpus(input);
   return input;
 }
+
+test('C5: future-dated uploads are never counted as recent evidence', () => {
+  const now = new Date('2026-01-01T00:00:00.000Z');
+  const input = rawInput({
+    channel_name: 'Day Trading Pro',
+    description: 'Day trading education with risk management.',
+    videos: [
+      { id: 'past', title: 'Day trading setup', published_at: '2025-12-01T00:00:00.000Z' },
+      { id: 'future', title: 'Day trading review', published_at: '2030-01-01T00:00:00.000Z' },
+    ],
+  });
+  const composition = buildContextualComposition(input, undefined, now);
+  const familyId = (text: string) => input.evidence_corpus!.find(document => document.text === text)!.sourceFamilyId;
+  const byId = new Map(composition.familyClassifications.map(family => [family.sourceFamilyId, family.recent]));
+  assert.equal(byId.get(familyId('Day trading setup')), true);
+  assert.equal(byId.get(familyId('Day trading review')), false);
+  assert.equal(composition.recentTradingFamilies, 1);
+});
 
 test('C5: title-only and retrieval-only inputs never confirm; alternative composition rejects', () => {
   const titleOnly = rawInput({ channel_name: 'Day Trading Pro', description: '' });
@@ -1194,6 +1223,24 @@ test('Q2: tier resolution derives ATTESTED_EXACT, LICENSED_UNSEEN and SPECULATIV
   assert.equal(resolveCompositionTier(speculative, {}), 'SPECULATIVE');
 });
 
+test('Q2: a source- or provenance-only change invalidates the admission hash', () => {
+  const make = (source: QuerySource, provenance: 'CURATED' | 'LEARNED') => buildQueryCandidate({
+    query: 'DAX day trading',
+    country: 'Germany',
+    source,
+    atoms: [
+      { term: 'DAX', type: 'INSTRUMENT', provenance },
+      { term: 'day trading', type: 'CONCEPT', provenance },
+    ],
+    relation: 'COMPACT_PAIR',
+  });
+  const baseline = make('CURATED', 'CURATED');
+  const sourceChanged = make('LEARNED_TERMINOLOGY', 'CURATED');
+  const provenanceChanged = make('CURATED', 'LEARNED');
+  assert.notEqual(candidateHash(baseline), candidateHash(sourceChanged));
+  assert.notEqual(candidateHash(baseline), candidateHash(provenanceChanged));
+});
+
 test('Q2: exact, reordered, alias and near-duplicate compositions are suppressed; cross-country is not deduped', () => {
   const record = heldOutRecord('Germany', 'DAX day trading', [
     { term: 'DAX', type: 'INSTRUMENT' }, { term: 'day trading', type: 'METHOD' },
@@ -1310,6 +1357,33 @@ test('Q2: query_library writes go only through the admission chokepoint', () => 
   assert.deepEqual(writers, ['db.legacy.ts', 'dbCore.ts']);
   const legacyImporters = files.filter(file => /from\s+['"]\.\/db\.legacy['"]/u.test(readFileSync(file, 'utf8')));
   assert.deepEqual(legacyImporters, [], 'db.legacy must stay unreachable');
+
+  // The writer list alone would still pass if dbCore gained a second direct
+  // INSERT outside upsertQueryRecord. Locate every insert and require it to
+  // sit in the one function that admits first and persists the admission.
+  const dbCoreSource = readFileSync(join(serverDir, 'dbCore.ts'), 'utf8');
+  const insertOffsets = [...dbCoreSource.matchAll(/INSERT\s+INTO\s+query_library/giu)].map(match => match.index ?? -1);
+  assert.equal(insertOffsets.length, 1, 'dbCore must have exactly one query_library insert site');
+  const functionStart = dbCoreSource.lastIndexOf('export async function', insertOffsets[0]);
+  const functionEnd = dbCoreSource.indexOf('\nexport ', insertOffsets[0]);
+  const writerBody = dbCoreSource.slice(functionStart, functionEnd === -1 ? undefined : functionEnd);
+  assert.match(writerBody, /export async function upsertQueryRecord/);
+  assert.match(writerBody, /admitQueryRecord\(/);
+  assert.match(writerBody, /withQueryAdmission\(/);
+});
+
+test('Q6: batch query generation loads country history once, not per candidate', () => {
+  const dbCore = readFileSync(join(__dirname, '..', 'dbCore.ts'), 'utf8');
+  assert.match(dbCore, /history\?:QueryDuplicateHistoryItem\[\]/);
+  assert.match(dbCore, /options\.history/);
+  const intelligence = readFileSync(join(__dirname, '..', 'queryIntelligence.ts'), 'utf8');
+  const start = intelligence.indexOf('export async function generateCandidateQueriesForCountry');
+  const end = intelligence.indexOf('\nexport async function', start + 1);
+  assert.ok(start >= 0 && end > start);
+  const batch = intelligence.slice(start, end);
+  assert.match(batch, /const history = existingQueries\.map/);
+  assert.match(batch, /\}, \{ history \}\)/);
+  assert.match(batch, /history\.push\(/);
 });
 
 test('Q6: provider-degraded and failed runs stay visible but never enter reward totals', () => {
@@ -1340,6 +1414,9 @@ test('Q6: provider-degraded and failed runs stay visible but never enter reward 
   assert.equal(dashboard.totals.providerDegradedRuns, 1);
   assert.equal(dashboard.totals.unaccountedCompletedRuns, 1);
   assert.equal(dashboard.totals.newConfirmedCreators, 2);
+  // Only the healthy run's quota is a reward denominator; degraded/failed
+  // spend must not make them look like zero-yield eligible runs.
+  assert.equal(dashboard.totals.quotaUnits, 1);
   assert.equal(dashboard.totals.zeroConfirmRuns, 0);
   assert.equal(dashboard.totals.zeroConfirmShare, 0);
   // Degraded rows are still listed, not hidden, and remain accounted.
@@ -1441,7 +1518,10 @@ test('Q4: continuation is authorized page by page against the shared portfolio f
 });
 
 test('Q4: simulator portfolio admission is quota-weighted, not pull-weighted', () => {
-  assert.equal(portfolioPullAdmitted({ portfolioQuotaUnits: 0, totalQuota: 0, quotaUnits: 3, portfolioRatio: 0.15 }), true);
+  // A first pull is bounded by the projected daily capacity, not admitted at
+  // 100% of its own spend.
+  assert.equal(portfolioPullAdmitted({ portfolioQuotaUnits: 0, totalQuota: 0, quotaUnits: 3, portfolioRatio: 0.15 }), false);
+  assert.equal(portfolioPullAdmitted({ portfolioQuotaUnits: 0, totalQuota: 0, quotaUnits: 3, portfolioRatio: 0.15, baselineQuotaUnits: 100 }), true);
   // 14 of 100 units used; a 3-unit pull projects 17/103 > 15%.
   assert.equal(portfolioPullAdmitted({ portfolioQuotaUnits: 14, totalQuota: 100, quotaUnits: 3, portfolioRatio: 0.15 }), false);
   // 14 of 100 used; a 1-unit pull projects 15/101 <= 15%.
@@ -1452,6 +1532,30 @@ test('Q4: simulator UCB1 baseline clamps the normalized score and uses portfolio
   assert.equal(currentUcb1Index(100, 0, 1), 1 + 0.8 * Math.sqrt(Math.log(2)));
   assert.equal(currentUcb1Index(0.5, 3, 9), 0.5 + 0.8 * Math.sqrt(Math.log(10) / 4));
   assert.ok(currentUcb1Index(0.5, 3, 9) < currentUcb1Index(0.5, 3, 90));
+});
+
+test('Q8: simulator cold-start cursor forces each country before index play', () => {
+  // One pull per country: the cursor, not posterior/index play, must choose
+  // the arm, so every country contributes exactly its first arm.
+  const metrics = runSelectorSimulation({ scenario: 'cold_start', seeds: 3, pulls: 16 }, 'hierarchical_ucb_c2');
+  assert.equal(metrics.coverage, 16);
+  assert.equal(metrics.distinctArms, 16);
+  const source = readFileSync(join(__dirname, 'simulator.ts'), 'utf8');
+  assert.match(source, /const coldStartArm = !config\.portfolioRatio && country\.cursor === 0/);
+  assert.match(source, /if \(coldStartArm\) country\.cursor = 1/);
+  assert.match(source, /const arm = coldStartArm\s*\|\| chooseArm\(/);
+});
+
+test('Q8: non-stationary simulator decays arm and hierarchy counts lazily', () => {
+  const source = readFileSync(join(__dirname, 'simulator.ts'), 'utf8');
+  assert.match(source, /const decayHalfLifePulls = Math\.max\(10, Math\.floor\(pulls \* 0\.1\)\)/);
+  assert.match(source, /if \(!stationary && step > 0\) \{[\s\S]*?decayAggregates\(aggregates, Math\.pow\(0\.5, 1 \/ decayHalfLifePulls\)\)/);
+  assert.match(source, /for \(const arm of country\.arms\) decayArmCounts\(arm, step, decayHalfLifePulls\)/);
+  // Arms are decayed lazily when their country is visited, never twice for the
+  // same step; hierarchy totals are decayed once per step.
+  assert.match(source, /function decayArmCounts\([\s\S]*?if \(step <= arm\.decayStep\) return;[\s\S]*?arm\.decayStep = step;/);
+  const metrics = runSelectorSimulation({ scenario: 'non_stationary', seeds: 3, pulls: 64 }, 'hierarchical_ucb_c2');
+  assert.equal(metrics.coverage, 16);
 });
 
 test('Q6: dashboard duplicate share is aggregated over evaluated result counts', () => {
@@ -1507,6 +1611,27 @@ test('Q0: malformed provenance cannot bypass trading-semantics admission', () =>
     assert.equal(result.eligible, false, origin);
     assert.ok(result.reasonCodes.includes('TERM_NO_TRADING_SEMANTICS'), origin);
   }
+});
+
+test('Q0: an unlabeled row cannot claim the CURATED semantics exemption', () => {
+  const result = admitQueryRecord({
+    query: 'Wetterbericht',
+    country: 'Germany',
+    primary_term: 'Wetterbericht',
+    generation_metadata: { queryTemplate: 'SINGLE_ATOM' },
+  });
+  assert.equal(result.admission.source, 'LEARNED_TERMINOLOGY');
+  assert.equal(result.eligible, false);
+  assert.ok(result.reasonCodes.includes('TERM_NO_TRADING_SEMANTICS'));
+});
+
+test('Q2: registered but dormant countries cannot reach selection', () => {
+  const dormant = heldOutRecord('Italy', 'FTSE MIB day trading', [
+    { term: 'FTSE MIB', type: 'INSTRUMENT' }, { term: 'day trading', type: 'METHOD' },
+  ], { relation: 'COMPACT_PAIR' });
+  const decision = admitQueryRecord(dormant);
+  assert.equal(decision.eligible, false);
+  assert.ok(decision.reasonCodes.includes('COUNTRY_NOT_PRODUCTION_CONFIGURED'));
 });
 
 test('Q2d: a stored SEMANTIC_DUPLICATE rejection survives revalidation without history', () => {

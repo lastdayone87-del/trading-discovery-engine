@@ -1283,28 +1283,24 @@ export async function getPlannerTerminology(country: string, clientOverride?: Qu
   if (await isActive()) return [];
   // Q0d defence-in-depth: a promoted row that fails the pure gate is never
   // returned, even before the separately approved production data cleanup.
-  // The gate runs in JS, so page through rows until 50 eligible terms are
-  // collected (or the scan bound is reached) instead of letting ineligible
-  // legacy rows consume a pre-filter LIMIT.
-  const PLANNER_PAGE_SIZE = 100;
+  // The gate runs in JS, so read one bounded snapshot of the strongest rows
+  // and filter it. OFFSET paging is intentionally avoided: concurrent
+  // performance updates can move rows between pages, skipping eligible terms
+  // and returning fewer than the planner's 50-term target.
   const PLANNER_MAX_SCAN = 1000;
   const terms: Array<{ id: number; term: string; score: number; lifecycle: 'SEARCH_TRIAL' | 'PROVEN_SEARCH_TERM' }> = [];
   const seenTermIds = new Set<number>();
-  for (let offset = 0; offset < PLANNER_MAX_SCAN && terms.length < 50; offset += PLANNER_PAGE_SIZE) {
-    const result = await runner.query(`SELECT t.id,t.canonical_term term,t.lifecycle_status,t.term_type,t.country,t.language,COALESCE(AVG(p.decayed_yield_score),0)::float score FROM canonical_trading_terms t LEFT JOIN terminology_performance p ON p.canonical_term_id=t.id WHERE t.country=$1 AND t.search_eligible=true AND t.lifecycle_status IN ('SEARCH_TRIAL','PROVEN_SEARCH_TERM') GROUP BY t.id ORDER BY score DESC,t.last_observed_at DESC NULLS LAST,t.id ASC LIMIT $2 OFFSET $3`, [canonicalCountry(country), PLANNER_PAGE_SIZE, offset]);
-    if (result.rows.length === 0) break;
-    for (const row of result.rows) {
-      if (terms.length >= 50) break;
-      const id = Number(row.id);
-      // A stable total order also guarantees non-overlapping pages; the id
-      // guard keeps a malformed/legacy page from emitting the same term twice.
-      if (seenTermIds.has(id)) continue;
-      if (isSearchableTradingTerm({ term: row.term, termType: row.term_type, country: row.country, language: row.language }).eligible) {
-        seenTermIds.add(id);
-        terms.push({ id, term: row.term, score: Number(row.score), lifecycle: row.lifecycle_status as 'SEARCH_TRIAL' | 'PROVEN_SEARCH_TERM' });
-      }
+  const result = await runner.query(`SELECT t.id,t.canonical_term term,t.lifecycle_status,t.term_type,t.country,t.language,COALESCE(AVG(p.decayed_yield_score),0)::float score FROM canonical_trading_terms t LEFT JOIN terminology_performance p ON p.canonical_term_id=t.id WHERE t.country=$1 AND t.search_eligible=true AND t.lifecycle_status IN ('SEARCH_TRIAL','PROVEN_SEARCH_TERM') GROUP BY t.id ORDER BY score DESC,t.last_observed_at DESC NULLS LAST,t.id ASC LIMIT $2`, [canonicalCountry(country), PLANNER_MAX_SCAN]);
+  for (const row of result.rows) {
+    if (terms.length >= 50) break;
+    const id = Number(row.id);
+    // The id guard keeps a malformed/legacy duplicate row from emitting the
+    // same term twice.
+    if (seenTermIds.has(id)) continue;
+    if (isSearchableTradingTerm({ term: row.term, termType: row.term_type, country: row.country, language: row.language }).eligible) {
+      seenTermIds.add(id);
+      terms.push({ id, term: row.term, score: Number(row.score), lifecycle: row.lifecycle_status as 'SEARCH_TRIAL' | 'PROVEN_SEARCH_TERM' });
     }
-    if (result.rows.length < PLANNER_PAGE_SIZE) break;
   }
   return terms;
 }

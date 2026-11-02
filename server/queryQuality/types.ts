@@ -90,6 +90,8 @@ export interface QueryAdmission {
 export interface QueryQualityVector {
   version: string;
   rawResults: number;
+  /** Provider results actually evaluated; excludes deferred results. */
+  evaluatedRawResults: number;
   distinctResults: number;
   newChannels: number;
   newConfirmedCreators: number;

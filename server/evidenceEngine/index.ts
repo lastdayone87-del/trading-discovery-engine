@@ -56,6 +56,10 @@ function deadlineRace<T>(promise: Promise<T>, deadlineAtMs: number | undefined, 
   const timeoutError = () => Object.assign(new Error('Semantic attempt deadline exceeded.'), { errorClass: 'TIMEOUT', retryable: true });
   const remainingMs = deadlineAtMs - Date.now();
   if (remainingMs <= 0) {
+    // The caller still receives a timeout, but the provider promise may start
+    // or reject later (for example after the abort we are about to give it).
+    // Subscribe to it so a late rejection is never unhandled.
+    promise.catch(() => {});
     onTimeout?.();
     return Promise.reject(timeoutError());
   }

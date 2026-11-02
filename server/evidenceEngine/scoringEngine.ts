@@ -117,7 +117,7 @@ export class ConfigurableWeightedStrategy {
       ? semanticItem.source === 'groq_semantic' ? 'SEMANTIC_GROQ'
         : semanticItem.source === 'gemini_free_semantic' ? 'SEMANTIC_GEMINI_FREE' : 'SEMANTIC_GEMINI'
       : recognition
-        ? (recognition.state === 'DECISIVE_TRADING' || recognition.state === 'DECISIVE_NON_TRADING')
+        ? ((recognition.state === 'DECISIVE_TRADING' || recognition.state === 'DECISIVE_NON_TRADING') && status !== 'UNCERTAIN')
           ? 'DETERMINISTIC_EVIDENCE'
           : evidenceCollection.degraded || evidenceCollection.sufficiency !== 'SUFFICIENT'
             ? 'DEGRADED_HEURISTIC'

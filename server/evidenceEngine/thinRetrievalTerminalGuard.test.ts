@@ -272,7 +272,15 @@ test('query-only composition preserves affirmative REVIEW and never confirms', (
 });
 
 test('insufficient coverage preserves affirmative REVIEW and a supported terminal REJECT', () => {
-  const input = { ...retrievalOnlyInput(), search_match_context: undefined };
+  // An authoritative creator bio is present, so a terminal creator-level
+  // rejection is supportable even though the overall composition is still
+  // thin. An empty description would rely on the mocked collection alone.
+  const input = {
+    ...retrievalOnlyInput(),
+    description: 'Independent media channel covering general interest topics and community news.',
+    search_match_context: undefined,
+  };
+  input.evidence_corpus = buildCanonicalEvidenceCorpus(input);
   const composition = buildContextualComposition(input);
   assert.equal(composition.focus, 'INSUFFICIENT_COVERAGE');
 

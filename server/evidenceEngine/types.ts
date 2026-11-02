@@ -220,6 +220,7 @@ export interface VerificationDecision {
   };
   /** C3 honest reporting. All fields optional for replaying older fixtures. */
   classificationMethod?: 'DETERMINISTIC_EVIDENCE' | 'SEMANTIC_GEMINI' | 'SEMANTIC_GROQ' | 'SEMANTIC_GEMINI_FREE' | 'HEURISTIC_ONLY' | 'DEGRADED_HEURISTIC';
+  /** Count of providers whose availability is `AVAILABLE`. Not a 0-1 ratio. */
   providerCoverage?: number;
   evidenceCount?: number;
   recognitionState?: 'DECISIVE_TRADING' | 'DECISIVE_NON_TRADING' | 'AMBIGUOUS_CONFLICT' | 'AMBIGUOUS_THIN' | 'QUERY_ONLY' | 'PROVIDER_DEGRADED' | 'INSUFFICIENT';

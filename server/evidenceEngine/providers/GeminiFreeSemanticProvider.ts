@@ -8,6 +8,7 @@ import {
   type ProviderCallEvent,
 } from '../../providerResilience';
 import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../semanticCalibration';
+import { abortedByDeadline } from './abortReason';
 import type { EvidenceCategory, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import {
   buildSemanticPrompt,
@@ -111,7 +112,12 @@ function geminiFreeFailoverCancelled(signal?: AbortSignal): ProviderCallError {
 export async function runGeminiFreeRouteFailover<T>(routes: GeminiFreeRoute[], call: (route: GeminiFreeRoute) => Promise<T>, opts?: GeminiFreeRouteFailoverOptions): Promise<T> {
   let lastError: unknown;
   for (const route of routes) {
-    if (opts?.signal?.aborted) throw geminiFreeFailoverCancelled(opts.signal);
+    if (opts?.signal?.aborted) {
+      if (abortedByDeadline(opts.signal)) {
+        throw new ProviderCallError('Free Gemini route failover deadline exhausted.', 'TIMEOUT', true, { cause: opts.signal.reason });
+      }
+      throw geminiFreeFailoverCancelled(opts.signal);
+    }
     try {
       return await call(route);
     } catch (error) {
@@ -284,10 +290,11 @@ export function defaultClient(
           return parsed;
         } catch (error) {
           const aborted = controller.signal.aborted;
+          const callerTimedOut = (controller.signal.reason as { errorClass?: string } | undefined)?.errorClass === 'TIMEOUT';
           const typed = error instanceof ProviderCallError && error.errorClass === 'TIMEOUT'
             ? error
             : aborted
-              ? deadlineExpired
+              ? (deadlineExpired || callerTimedOut)
                 ? new ProviderCallError(`Free Gemini call exceeded ${timeoutMs}ms deadline.`, 'TIMEOUT', true, { cause: error })
                 : geminiFreeFailoverCancelled(signal)
               : classifyProviderError(error);

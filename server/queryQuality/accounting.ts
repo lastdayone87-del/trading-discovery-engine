@@ -50,6 +50,9 @@ export function buildQueryQualityVector(input: RunAccountingInput): QueryQuality
   return {
     version: QUERY_QUALITY_VECTOR_VERSION,
     rawResults,
+    // Evaluated = distinct creators + within-page duplicates. Deferred
+    // provider results stay in rawResults but were never evaluated.
+    evaluatedRawResults: distinctResults + duplicateResults,
     distinctResults,
     newChannels,
     newConfirmedCreators,
@@ -72,7 +75,7 @@ export function buildQueryQualityVector(input: RunAccountingInput): QueryQuality
       : ratio(safe(input.targetMarketConfirmed), distinctResults),
     languageMatchRate: input.languageMatchedConfirmed === undefined || input.languageMatchedConfirmed === null
       ? null
-      : ratio(safe(input.languageMatchedConfirmed), newConfirmedCreators || distinctResults),
+      : ratio(safe(input.languageMatchedConfirmed), distinctResults),
     providerDegraded: input.providerDegraded === true,
     failedRun: input.failed === true,
   };

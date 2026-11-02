@@ -16,13 +16,14 @@ import {
   getQueryPortfolioBudgetState,
   getQueryQuotaSpendRows,
   getQueryFailureStates,
+  getInFlightPrimaryTermUsage,
   getQueryRunReward,
   isRetryableInfrastructureFailure
 } from './db';
 import { assertCountryAllowed } from './countryExclusion';
 import { isTerminologyKillSwitchActive, TERMINOLOGY_KILL_SWITCH_KEY } from './terminologyKillSwitch';
 import { planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, rotateAwayFromMostRecentIntent, reformulatePollutedQuery } from './queryPlanner';
-import { revalidateQueryRecordAdmission, type QueryRecordAdmission } from './queryQuality/admission';
+import { revalidateQueryRecordAdmission, withQueryAdmission, type QueryRecordAdmission } from './queryQuality/admission';
 import { isRewardEligibleQuota } from './queryQuality/accounting';
 import { selectionHistoryFor } from './queryQuality/composition';
 import {
@@ -1216,11 +1217,19 @@ async function buildSelectorPool(
   // selection is on the scheduler hot path and must not scale with 180 days of
   // run history. Zero-quota and provider-failed runs are excluded in the same
   // aggregate, matching the serving/dashboard reward definition.
-  const [qualityCounts, spendRows, failureStates] = await Promise.all([
+  const [qualityCounts, spendRows, failureStates, inFlightPrimary] = await Promise.all([
     getQueryQualityDecayedCounts(country, undefined, DECAY_HALF_LIFE_DAYS),
     getQueryQuotaSpendRows(country),
     getQueryFailureStates(country),
+    getInFlightPrimaryTermUsage(country, new Date(recentCutoff).toISOString()),
   ]);
+  // A selection that has been scheduled but has not executed yet does not have
+  // a `last_executed` timestamp. Count those in-flight uses too, otherwise a
+  // primary term can be selected repeatedly before any run completes.
+  for (const row of inFlightPrimary) {
+    const key = primaryKey(row.primaryTerm);
+    primaryUsage.set(key, (primaryUsage.get(key) || 0) + row.uses);
+  }
   const countsById = new Map<number, DecayedArmCounts>(
     qualityCounts.map(row => [row.queryId, row.counts]),
   );
@@ -1364,6 +1373,15 @@ function buildSelectionResult(
   const ucb = decision?.index ?? pool.decision.index;
   if (ucb != null) selected = { ...selected, ucb_score: Number(ucb.toFixed(4)) };
   if (!selected) return null;
+  // Execution revalidates the persisted admission without this selector's
+  // country history. Return the history-adjusted admission so the scheduled
+  // run does not quarantine a winner the selector just proved eligible.
+  if (admissionInfo) {
+    selected = {
+      ...selected,
+      generation_metadata: withQueryAdmission(selected.generation_metadata, admissionInfo.admission),
+    };
+  }
   const selector = decision ?? pool.decision;
   // The portfolio budget read matches persisted selection_reason by this
   // marker. Targeted/fallback shapes keep their own strategy label but still
@@ -1417,6 +1435,16 @@ export async function generateCandidateQueriesForCountry(
     scopePromotionBasis: options.scopePromotionBasis
   });
   const newQueries: QueryRecord[] = [];
+  // One country history read for the batch. Without this every planned
+  // candidate rescans every same-country row to rebuild duplicate history.
+  const history = existingQueries.map(query => {
+    const aliasOf = query.generation_metadata?.aliasOf;
+    return {
+      query: query.query,
+      country: query.country,
+      ...(typeof aliasOf === 'string' ? { aliasOf } : {}),
+    };
+  });
   for (const candidate of planned) {
     const record = await upsertQueryRecord({
       query: candidate.query,
@@ -1429,6 +1457,12 @@ export async function generateCandidateQueriesForCountry(
       discoveryObjective: candidate.discoveryObjective,
       primaryTerm: candidate.primaryTerm,
       generationMetadata: candidate.metadata
+    }, { history });
+    const aliasOf = candidate.metadata?.aliasOf;
+    history.push({
+      query: record.query,
+      country: record.country,
+      ...(typeof aliasOf === 'string' ? { aliasOf } : {}),
     });
     newQueries.push(record);
   }
@@ -1614,7 +1648,7 @@ export async function evaluateQueryPerformance(
     // existed and could promote a zero-new-confirmation run.
     const currentReward = attribution.queryRunId
       ? await getQueryRunReward(attribution.queryRunId)
-      : { confirmed: Math.min(metrics.tradingConfirmed, metrics.newChannels), quality: Math.min(metrics.qualityChannels, metrics.newChannels) };
+      : { confirmed: 0, quality: 0 };
     const currentRun = {
       ...currentReward,
       quotaUnits: Math.max(0, attribution.quotaConsumed || 0) / 100,
@@ -1632,8 +1666,10 @@ export async function evaluateQueryPerformance(
     // legacy rows eligible; an explicit SUCCESS outcome stays eligible.
     const providerOutcome = String(attribution.providerRunOutcome || '');
     const providerFailed = Number(attribution.providerRequestsFailed || 0) > 0
-      || (providerOutcome !== '' && !/^SUCCESS_/.test(providerOutcome));
-    const includeCurrentRun = isRewardEligibleQuota(currentRun.quotaUnits) && !providerFailed;
+      || (providerOutcome !== '' && !/^SUCCESS(?:_|$)/.test(providerOutcome));
+    // Sighting-level truth requires the run id. Without it the funnel counters
+    // are not country-qualified, so the run cannot prove a promotion.
+    const includeCurrentRun = Boolean(attribution.queryRunId) && isRewardEligibleQuota(currentRun.quotaUnits) && !providerFailed;
     const counts = includeCurrentRun
       ? {
           confirmed: ownPrior.confirmed + currentRun.confirmed,

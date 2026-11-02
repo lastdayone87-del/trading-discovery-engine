@@ -48,10 +48,12 @@ interface QualityDashboardRun {
     newConfirmedCreators: number;
     newQualityCreators: number;
     confirmedNewCreatorsPer100Quota: number;
+    quotaUsed: number;
     quotaUnits: number;
     targetMarketPrecision: number | null;
     duplicateRatio: number;
     providerDegraded: boolean;
+    failedRun: boolean;
   } | null;
   admission?: { tier?: string; compositionFamily?: string; reasonCodes?: string[]; source?: string; eligible?: boolean } | null;
 }
@@ -107,17 +109,25 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
   const [isSavingScope, setIsSavingScope] = useState(false);
   const [scopeSaveMessage, setScopeSaveMessage] = useState<string | null>(null);
 
-  // Only the latest fetch may commit state. A slower response for a
-  // previously selected country must never overwrite the current filter.
+  // Only the latest fetch may commit non-quality state. A slower response for
+  // a previously selected country must never overwrite the current filter.
   const fetchSequence = useRef(0);
+  // The quality projection polls on the same 10s tick as the full fetch. Give
+  // it its own sequence so a slow full fetch cannot discard every quality
+  // response, while still letting a newer quality request win.
+  const qualitySequence = useRef(0);
+  const selectedCountryRef = useRef(selectedCountry);
+  selectedCountryRef.current = selectedCountry;
 
   // Fetch data
   const fetchData = async () => {
     const requestId = ++fetchSequence.current;
+    const qualityRequestId = ++qualitySequence.current;
+    const requestCountry = selectedCountry;
     try {
-      const qualityUrl = selectedCountry === 'All'
+      const qualityUrl = requestCountry === 'All'
         ? '/api/query-intelligence/quality-dashboard'
-        : `/api/query-intelligence/quality-dashboard?country=${encodeURIComponent(selectedCountry)}`;
+        : `/api/query-intelligence/quality-dashboard?country=${encodeURIComponent(requestCountry)}`;
       // Isolate every request: a network failure in an unrelated projection
       // must not discard a healthy quality response and show the wrong error.
       const [libRes, vocabRes, terminologyRes, logRes, statusRes, scopeRes, qualityRes] = await Promise.all([
@@ -130,18 +140,6 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
         apiFetch(qualityUrl).catch(() => null)
       ]);
 
-      if (requestId !== fetchSequence.current) return;
-      const read = (response: Response | null) => response?.ok
-        ? response.json().catch(() => null)
-        : Promise.resolve(null);
-      const [lib, vocab, terminologyData, logData, statusData, scopeData] = await Promise.all([
-        read(libRes),
-        read(vocabRes),
-        read(terminologyRes),
-        read(logRes),
-        read(statusRes),
-        read(scopeRes),
-      ]);
       // The quality projection carries its own error state: apiFetch resolves
       // on HTTP 4xx/5xx, so checking `ok` alone would silently drop the error.
       let quality: QualityDashboard | null = null;
@@ -165,19 +163,37 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
         qualityError = detail
           || `The query-quality projection failed (${qualityRes.status}${qualityRes.statusText ? ` ${qualityRes.statusText}` : ''}).`;
       }
+      // Quality commits independently of the full-fetch sequence. A stale
+      // country response still loses: both its request sequence and the live
+      // selected country must match.
+      if (qualityRequestId === qualitySequence.current && requestCountry === selectedCountryRef.current) {
+        if (quality) {
+          setQualityDashboard(quality);
+          setQualityDashboardCountry(requestCountry);
+          setQualityDashboardError(null);
+        } else {
+          setQualityDashboardError(qualityError);
+        }
+      }
+
+      if (requestId !== fetchSequence.current) return;
+      const read = (response: Response | null) => response?.ok
+        ? response.json().catch(() => null)
+        : Promise.resolve(null);
+      const [lib, vocab, terminologyData, logData, statusData, scopeData] = await Promise.all([
+        read(libRes),
+        read(vocabRes),
+        read(terminologyRes),
+        read(logRes),
+        read(statusRes),
+        read(scopeRes),
+      ]);
       // Parsing is asynchronous too; re-check before committing the batch.
       if (requestId !== fetchSequence.current) return;
       if (lib) setQueries(lib);
       if (vocab) setExtractedVocabulary(vocab);
       if (terminologyData) setTerminology(terminologyData);
       if (logData) setLogs(logData);
-      if (quality) {
-        setQualityDashboard(quality);
-        setQualityDashboardCountry(selectedCountry);
-        setQualityDashboardError(null);
-      } else {
-        setQualityDashboardError(qualityError);
-      }
       if (statusData) setStatus(statusData);
       if (scopeData) {
         setScopeMode(scopeData.scope || 'GLOBAL');
@@ -922,7 +938,9 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
                             <div className="text-slate-500 truncate max-w-[180px]" title={run.admission?.compositionFamily || ''}>{run.admission?.compositionFamily || '—'}</div>
                           </td>
                           <td className="p-3 text-center font-mono font-bold">
-                            {run.accounted ? run.qualityVector!.confirmedNewCreatorsPer100Quota.toFixed(2) : '—'}
+                            {run.accounted && run.qualityVector && !run.qualityVector.failedRun && !run.qualityVector.providerDegraded && run.qualityVector.quotaUsed > 0
+                              ? run.qualityVector.confirmedNewCreatorsPer100Quota.toFixed(2)
+                              : '—'}
                           </td>
                           <td className="p-3 text-[10px] text-slate-500 max-w-[220px] truncate" title={run.stopReason || run.selectionReason}>
                             {run.stopReason || '—'}

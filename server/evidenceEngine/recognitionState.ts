@@ -5,7 +5,7 @@ import type {
   StagedClassificationReport,
 } from './types';
 import type { ContextualCompositionReport } from './contextualComposition';
-import { compositionConfirmsTrading, evaluateDecisionScoreBoundary } from './decisionPolicy';
+import { compositionConfirmsTrading, evaluateDecisionScoreBoundary, hasIndependentCreatorOwnedPositiveField } from './decisionPolicy';
 
 /**
  * C6 deterministic recognition state.
@@ -117,7 +117,8 @@ export function assessRecognitionState(input: RecognitionAssessmentInput): Recog
     && weightedBoundary.satisfied
     && compositionConfirmsTrading(composition)
     && composition.nonTitleTierAFamilies >= 1
-    && !composition.explicitCreatorAlternative;
+    && !composition.explicitCreatorAlternative
+    && hasIndependentCreatorOwnedPositiveField(positive);
   const decisiveNonTrading = composition.focus === 'ALTERNATIVE_DOMINANT'
     && input.lifecycleAction === 'REJECT'
     && composition.explicitCreatorAlternative

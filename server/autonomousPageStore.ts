@@ -66,9 +66,13 @@ export async function getAutonomousRunMetrics(runId:string):Promise<QueryFunnelM
   const distinct=Number(sightings.rows[0]?.distinct_creators||0);
   if(!distinct||distinct===metrics.distinctResults)return metrics;
   const rejected=Math.min(distinct,Number(sightings.rows[0]?.country_rejected||0));
+  const evaluatedRawResults=Number(metrics.evaluatedRawResults ?? Math.max(0,metrics.rawResults-metrics.deferredResults));
   return {
     ...metrics,
     distinctResults:distinct,
+    // The page sum only counts duplicates inside each page. Recompute from the
+    // run-wide evaluated total so creators repeated across pages are counted.
+    duplicateResults:Math.max(0,evaluatedRawResults-distinct),
     // Keep the rejected count on the same run-wide distinct set as the
     // denominator: the page sum double-counts cross-page repeats, and
     // completeQueryRun recomputes precision from these two fields.

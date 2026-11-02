@@ -57,7 +57,7 @@ const LANGUAGE_BY_COUNTRY: Record<string, string[]> = {
   Denmark: ['da'],
   Sweden: ['sv'],
   Norway: ['no'],
-  Singapore: ['en', 'ms', 'zh'],
+  Singapore: ['en', 'ms', 'zh', 'ta'],
   Italy: ['it'],
   Japan: ['ja'],
   Spain: ['es'],
@@ -66,7 +66,7 @@ const LANGUAGE_BY_COUNTRY: Record<string, string[]> = {
 
 const SCRIPT_BY_LANGUAGE: Record<string, string> = {
   en: 'Latn', fr: 'Latn', de: 'Latn', nl: 'Latn', lb: 'Latn', da: 'Latn', sv: 'Latn',
-  no: 'Latn', it: 'Latn', es: 'Latn', ms: 'Latn', ja: 'Jpan', zh: 'Hani', ar: 'Arab',
+  no: 'Latn', it: 'Latn', es: 'Latn', ms: 'Latn', ja: 'Jpan', zh: 'Hani', ar: 'Arab', ta: 'Taml',
 };
 
 const PRIMARY_MARKET: Record<string, string> = {

@@ -143,11 +143,18 @@ export function isTradingFocusedText(text: string, context: LayeredKnowledgeCont
   // verdict by itself: it must accompany a method/education/execution term.
   // A bare "market" is not financial context ("technical analysis of the
   // housing market"). Require an explicit financial-market phrase.
-  const hasFinancialMarketContext = /\b(stocks?|equities|shares?|crypto(?:currencies)?|bitcoin|ethereum|forex|futures?|options?|commodit(?:y|ies)|(?:stock|equity|financial|capital|forex|crypto|futures?|options?|bond|commodit(?:y|ies))\s+markets?|brokers?|exchanges?|portfolio|bourse|börse|boerse|bolsa|borsa|beurs|aktien|aandelen|aksjer|osakkeet|azioni|acciones|actions|titres)\b/iu.test(normalized)
-    || /(株式|株|仮想通貨|為替|先物|بورصة|الأسهم|股票|交易)/u.test(normalized);
-  if (tierATradingSignals(normalized, context).some(signal => signal !== 'KNOWN_METHOD')) return true;
-  const conceptual = hasExecution || hasEducation || hasMethodology;
-  const secondDimension = hasExecution || hasInstrument || hasPlatform || hasFinancialMarketContext;
+  const hasFinancialMarketContext = /\b(trad(?:e|ing|er|en)|stocks?|equities|crypto(?:currencies)?|bitcoin|ethereum|forex|commodit(?:y|ies)|(?:stock|equity|financial|capital|forex|crypto|futures?|options?|bond|commodit(?:y|ies))\s+markets?|brokers?|bourse|börse|boerse|bolsa|borsa|beurs|aktien|aandelen|aksjer|osakkeet|azioni|acciones|actions|titres|handelsplan|tradingdagboek|orderboek)\b/iu.test(normalized)
+    || /(株式|株|仮想通貨|為替|先物|トレード|取引|投資|板読み|注文|日経|بورصة|الأسهم|股票|交易)/u.test(normalized);
+  const signals = tierATradingSignals(normalized, context);
+  // Generic method/education vocabulary only qualifies alongside a second,
+  // independent dimension. Treating every Tier A match as decisive made
+  // "analyse technique" and "gestion du risque" sufficient on their own.
+  const genericSignals = new Set(['KNOWN_METHOD', 'NATIVE_METHOD', 'NATIVE_EDUCATION']);
+  if (signals.some(signal => !genericSignals.has(signal))) return true;
+  const conceptual = hasExecution || hasEducation || hasMethodology || signals.length > 0;
+  // Method/education/execution words are all the same dimension. The second
+  // dimension must be an instrument, platform, or explicit market context.
+  const secondDimension = hasInstrument || hasPlatform || hasFinancialMarketContext;
   return conceptual && secondDimension;
 }
 

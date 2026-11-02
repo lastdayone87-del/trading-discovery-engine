@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { isSearchableTradingTerm, LEGACY_COMPATIBILITY_TOKEN_LIMIT, type SearchabilityTermType } from '../terminologySearchability';
-import { getCountryMarketProfile, isRegisteredCountry } from './profiles';
+import { getCountryMarketProfile, isProductionConfiguredCountry, isRegisteredCountry } from './profiles';
 import type {
   CountryMarketProfile,
   QueryAdmission,
@@ -163,6 +163,8 @@ export interface BuildCandidateInput {
   source: QueryCandidate['source'];
   relation?: string;
   compositionFamily?: string;
+  /** Only the internal zero-atom migration bridge may use the legacy token allowance. */
+  allowLegacyCompatibility?: boolean;
 }
 
 /** Build a typed candidate from producer atoms, before any admission call. */
@@ -185,7 +187,9 @@ export function buildQueryCandidate(input: BuildCandidateInput): QueryCandidate 
       type: atom.type || 'TERMINOLOGY',
       attestationIds: [],
     },
-    provenance: atom.provenance || input.source,
+    provenance: atom.provenance && (atom.provenance.toUpperCase() !== 'LEGACY_COMPATIBILITY' || input.allowLegacyCompatibility)
+      ? atom.provenance
+      : input.source,
   }));
   const tier = resolveCompositionTier({
     query: input.query,
@@ -224,7 +228,20 @@ export function candidateHash(candidate: QueryCandidate): string {
     country: candidate.country,
     language: candidate.language,
     market: candidate.market,
-    atoms: candidate.atoms.map(atom => ({ term: atom.sense.normalizedTerm, role: atom.role, type: atom.sense.type })),
+    relation: candidate.relation,
+    source: candidate.source,
+    primaryTerm: candidate.primaryTerm,
+    atoms: candidate.atoms.map(atom => ({
+      term: atom.sense.normalizedTerm,
+      role: atom.role,
+      type: atom.sense.type,
+      provenance: atom.provenance,
+      country: atom.sense.country,
+      language: atom.sense.language,
+      market: atom.sense.market,
+      instrumentClass: atom.sense.instrumentClass,
+      attestationIds: [...atom.sense.attestationIds].sort(),
+    })),
     tier: candidate.tier,
     family: candidate.compositionFamily,
   })).digest('hex').slice(0, 24);
@@ -252,6 +269,12 @@ export function evaluateQueryComposition(candidate: QueryCandidate, context: Com
     && normalizeCompositionTerm(candidate.atoms[0].term) === normalized;
 
   if (!isRegisteredCountry(candidate.country)) reasons.push('UNSUPPORTED_COUNTRY');
+  // Registration only proves the country is known to the fixture. Dormant
+  // markets (for example Italy, Japan, Spain and the UAE) must not reach
+  // selection and spend quota unless production explicitly configures them.
+  if (isRegisteredCountry(candidate.country) && !isProductionConfiguredCountry(candidate.country)) {
+    reasons.push('COUNTRY_NOT_PRODUCTION_CONFIGURED');
+  }
   if (!normalized || tokens.length === 0) reasons.push('EMPTY_QUERY');
   if (tokens.length > (legacyCompatibility ? LEGACY_COMPATIBILITY_TOKEN_LIMIT : 3)) reasons.push('TOO_MANY_TOKENS');
   if (normalized.length > 40) reasons.push('TOO_LONG');

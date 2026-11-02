@@ -1,5 +1,5 @@
 import type { QueryCollection } from '../src/types';
-import { canPromoteToProven } from './queryQuality/accounting';
+import { canPromoteToProven, isContaminatedRun } from './queryQuality/accounting';
 
 export type FunnelOutcome = 'COUNTRY_REJECTED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW' | 'TRADING_CONFIRMED';
 
@@ -221,11 +221,24 @@ export function manualSearchContinuationMetrics(input: {
  * based only on observed retrieval outcomes.
  */
 export function isSeverelyContaminatedQuery(metrics: QueryFunnelMetrics): boolean {
-  const evaluated = metrics.nonTrading + metrics.uncertain + metrics.needsReview + metrics.tradingConfirmed;
-  if (metrics.distinctResults < 8 || evaluated < 8) return false;
-  const unresolvedOrNonTrading = metrics.nonTrading + metrics.uncertain + metrics.needsReview;
-  const contaminationRatio = ratio(unresolvedOrNonTrading, evaluated);
-  return contaminationRatio >= 0.8 && metrics.tradingPrecision <= 0.1 && metrics.qualityChannels === 0;
+  const evaluated = metrics.distinctResults;
+  if (evaluated < 8) return false;
+  // Reuse the recalibrated contamination guard: UNCERTAIN and NEEDS_REVIEW
+  // are not evidence of a bad query; only explicit non-trading share,
+  // wrong-country results, or duplicate saturation contaminate it. Keep the
+  // original yield guard so a query that still produces quality creators is
+  // not quarantined solely for a high explicit non-trading share.
+  const contaminated = isContaminatedRun({
+    wrongCountry: ratio(metrics.countryRejected, evaluated) >= 0.8,
+    duplicateRatio: ratio(
+      metrics.duplicateResults,
+      metrics.evaluatedRawResults ?? Math.max(1, metrics.rawResults),
+    ),
+    nonTrading: metrics.nonTrading,
+    evaluated,
+  });
+  if (!contaminated) return false;
+  return metrics.tradingPrecision <= 0.1 && metrics.qualityChannels === 0;
 }
 
 export function selectQueryCollection(

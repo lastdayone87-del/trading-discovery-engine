@@ -76,8 +76,24 @@ export function tierATradingSignals(text: string, context?: LayeredKnowledgeCont
   return [...new Set(signals)];
 }
 
+/** Generic method/education signals that need independent financial context. */
+const GENERIC_TIER_A_SIGNALS: ReadonlySet<string> = new Set(['KNOWN_METHOD', 'NATIVE_METHOD', 'NATIVE_EDUCATION']);
+
+/**
+ * Explicit financial context. Generic workplace/education vocabulary such as
+ * `gestion du risque`, `point d'entrée` or `riskhantering` is used outside
+ * trading too, so those signals only count when the document also names a
+ * financial market, instrument, or trading activity.
+ */
+const FINANCIAL_CONTEXT_PATTERN = /\b(trad(?:e|ing|er|en)|stocks?|equit(?:y|ies)|crypto(?:currenc(?:y|ies))?|bitcoin|ethereum|forex|commodit(?:y|ies)|brokers?|bourse|börse|boerse|bolsa|borsa|beurs|aktien|aandelen|aksjer|osakkeet|azioni|acciones|titres|handelsplan|tradingdagboek|orderboek|finan(?:ce|cial)|invest(?:ing|ment)?|(?:stock|equity|financial|capital|forex|crypto|futures?|options?|bond|commodit(?:y|ies))\s+markets?)\b/iu;
+const FINANCIAL_CONTEXT_CJK_PATTERN = /(株式|株|仮想通貨|為替|先物|トレード|取引|投資|板読み|注文|日経|بورصة|الأسهم|股票|交易)/u;
+
 export function isTierATradingText(text: string, context?: LayeredKnowledgeContext): boolean {
-  return tierATradingSignals(text, context).length > 0;
+  const normalized = String(text || '').normalize('NFKC');
+  const signals = tierATradingSignals(normalized, context);
+  if (signals.length === 0) return false;
+  if (signals.some(signal => !GENERIC_TIER_A_SIGNALS.has(signal))) return true;
+  return FINANCIAL_CONTEXT_PATTERN.test(normalized) || FINANCIAL_CONTEXT_CJK_PATTERN.test(normalized);
 }
 
 /** Format/generic words that never establish trading by themselves. */
@@ -171,7 +187,10 @@ function publishedTimestamp(publishedAt: string | undefined): number | undefined
 function isRecent(publishedAt: string | undefined, now: Date): boolean {
   const timestamp = publishedTimestamp(publishedAt);
   if (timestamp === undefined) return false;
-  return now.getTime() - timestamp <= 365 * 86_400_000;
+  const ageMs = now.getTime() - timestamp;
+  // A future-dated document is not "recent published evidence": clamp the age
+  // to zero so it cannot create a false recency conflict reason.
+  return ageMs >= 0 && ageMs <= 365 * 86_400_000;
 }
 
 /**
@@ -241,9 +260,9 @@ export function buildContextualComposition(
   let focus: CreatorFocus;
 
   if (observedFamilies === 0) {
-    // Retrieval provenance alone is QUERY_ONLY. A creator-owned title with no
-    // other observed family is thin coverage, not query-only: the title is a
-    // name prior and the channel still has creator-owned input to evaluate.
+    // Retrieval provenance with no observed creator-owned family is QUERY_ONLY,
+    // even when a channel title exists: the title is a name prior, not an
+    // observed family, and cannot turn a search hit into creator evidence.
     focus = input.search_match_context ? 'QUERY_ONLY' : 'INSUFFICIENT_COVERAGE';
     reasons.push(input.search_match_context ? 'NO_CREATOR_OWNED_OBSERVED_FAMILY' : 'INSUFFICIENT_INDEPENDENT_TRADING_COVERAGE');
   } else if (explicitCreatorTrading && !explicitCreatorAlternative && alternativeCoverage < 0.34) {

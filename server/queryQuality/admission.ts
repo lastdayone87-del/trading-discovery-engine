@@ -114,8 +114,11 @@ function asSource(metadata: Record<string, any>): QuerySource {
   if (atomOrigins.includes('MANUAL')) return 'MANUAL';
   if (atomOrigins.some(origin => origin === 'COUNTRY_VOCABULARY' || origin === 'COUNTRY_NATIVE')) return 'COUNTRY_VOCABULARY';
   const declared = String(metadata.querySource || metadata.source || '').toUpperCase();
-  if (declared in QUERY_SOURCE_REGISTRY && declared !== 'CURATED') return declared as QuerySource;
-  return 'CURATED';
+  if (declared in QUERY_SOURCE_REGISTRY) return declared as QuerySource;
+  // An unlabeled row is not evidence of curation. CURATED is a licensed
+  // provenance that suppresses the trading-semantics requirement, so fail
+  // closed to the source that still requires it.
+  return 'LEARNED_TERMINOLOGY';
 }
 
 function preferredLanguage(metadata: Record<string, any>, country: string): string {
@@ -202,6 +205,7 @@ export function candidateFromQueryRecord(
     source,
     relation,
     compositionFamily: typeof metadata.compositionFamily === 'string' ? metadata.compositionFamily : undefined,
+    allowLegacyCompatibility: !Array.isArray(metadata.atoms) || metadata.atoms.length === 0,
   });
   // Fall back to the record's own primary term when the metadata did not
   // provide the anchor (keeps attribution stable across legacy rows).

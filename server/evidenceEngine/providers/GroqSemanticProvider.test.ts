@@ -1001,7 +1001,7 @@ test('caller cancellation stops Groq route failover before another org', async (
   const controller = new AbortController();
   const calls: string[] = [];
   await assert.rejects(runGroqRouteFailover(
-    [{ id: 'groq-1', key: 'hidden-a' }, { id: 'groq-2', key: 'hidden-b' }],
+    [{ id: 'groq-1', key: 'hidden-a', orgId: 'org-a' }, { id: 'groq-2', key: 'hidden-b', orgId: 'org-b' }],
     async route => {
       calls.push(route.id);
       controller.abort();
@@ -1019,5 +1019,16 @@ test('an already-aborted Groq caller starts no route', async () => {
     async () => { calls++; return {}; },
     { signal: AbortSignal.abort() },
   ), (error: any) => error instanceof ProviderCallError && error.errorClass === 'CANCELLED');
+  assert.equal(calls, 0);
+});
+
+test('an already-expired Groq caller is a TIMEOUT, not a cancellation', async () => {
+  let calls = 0;
+  const deadline = Object.assign(new Error('deadline'), { errorClass: 'TIMEOUT', retryable: true });
+  await assert.rejects(runGroqRouteFailover(
+    [{ id: 'groq-1', key: 'hidden-a' }],
+    async () => { calls++; return {}; },
+    { signal: AbortSignal.abort(deadline) },
+  ), (error: any) => error instanceof ProviderCallError && error.errorClass === 'TIMEOUT');
   assert.equal(calls, 0);
 });
