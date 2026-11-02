@@ -148,10 +148,29 @@ export function creatorOwnedDocuments(input: RawChannelInput): CompositionDocume
     }));
 }
 
+/**
+ * Strict ISO-calendar timestamp. `Date.parse` normalizes impossible dates
+ * (`2024-02-31` becomes March 2), so presence alone cannot prove temporal
+ * coverage. Only a real YYYY-MM-DD day in an ISO-shaped value counts.
+ */
+function publishedTimestamp(publishedAt: string | undefined): number | undefined {
+  if (!publishedAt) return undefined;
+  const value = String(publishedAt).trim();
+  const match = /^(\d{4})-(\d{2})-(\d{2})(?:$|[T ])/.exec(value);
+  if (!match) return undefined;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (month < 1 || month > 12 || day < 1) return undefined;
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  if (day > daysInMonth) return undefined;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : undefined;
+}
+
 function isRecent(publishedAt: string | undefined, now: Date): boolean {
-  if (!publishedAt) return false;
-  const timestamp = Date.parse(publishedAt);
-  if (!Number.isFinite(timestamp)) return false;
+  const timestamp = publishedTimestamp(publishedAt);
+  if (timestamp === undefined) return false;
   return now.getTime() - timestamp <= 365 * 86_400_000;
 }
 
@@ -189,7 +208,7 @@ export function buildContextualComposition(
   // Presence is not knowledge: a non-empty but unparseable timestamp would
   // otherwise mark temporal coverage KNOWN and skip the missing-evidence gap.
   const temporalKnown = documents.some(document =>
-    typeof document.publishedAt === 'string' && Number.isFinite(Date.parse(document.publishedAt))
+    typeof document.publishedAt === 'string' && publishedTimestamp(document.publishedAt) !== undefined
   );
   const familyClassifications: ContextualCompositionReport['familyClassifications'] = [];
 

@@ -115,6 +115,20 @@ test('Q0: curated country-knowledge terms stay searchable and PROVEN across refr
   assert.equal(decision.searchEligible, true);
 });
 
+test('Q0: Common-script letters in Japanese terms do not fail the script gate', () => {
+  // U+30FC (katakana-hiragana prolonged sound mark) is a Common-script letter.
+  // Mapping it to Zzzz made every term containing it script-incompatible and
+  // stripped already-learned Japanese terms of search eligibility.
+  for (const term of ['トレード', 'デイトレード', 'オーダーフロー']) {
+    const gate = isSearchableTradingTerm({ term, termType: 'TERMINOLOGY', country: 'Japan', language: 'ja' });
+    assert.equal(gate.eligible, true, `${term}: ${gate.reasons.join(', ')}`);
+  }
+  // The same German/English vocabulary remains ineligible for Japan: country
+  // knowledge is language-scoped, not flattened into a global semantic set.
+  const wrongLanguage = isSearchableTradingTerm({ term: 'Börsenanalyse', termType: 'TERMINOLOGY', country: 'Japan', language: 'ja' });
+  assert.ok(wrongLanguage.reasons.includes('no-trading-semantics'));
+});
+
 test('Q2: legacy compound rows are admitted on the full query, not the bare primary term', () => {
   // A pre-admission row carries its trading context in `query`; judging the
   // bare `primary_term` made `CAC 40 trading` speculative and got it rejected
@@ -636,6 +650,27 @@ test('Q6: dashboard counts only accounted vectors and reports missing data hones
   assert.equal(dashboard.totals.targetMarketPrecision, 1);
 });
 
+test('Q6: a selected country reports its own spend without replacing the shared budget decision', () => {
+  const shared = buildQueryQualityDashboard({
+    generatedAt: '2026-01-01T00:00:00.000Z',
+    portfolio: { dailyQuotaUnits: 100, portfolioUnitsReserved: 15, portfolioUnitsUsed: 20, countryUnitsUsed: 2 },
+    rows: [],
+  });
+  // The shared reservation is authoritative: other countries already spent
+  // past it even though this country only used 2 units.
+  assert.equal(shared.portfolio.portfolioUnitsUsed, 20);
+  assert.equal(shared.portfolio.countryUnitsUsed, 2);
+  assert.equal(shared.portfolio.withinBudget, false);
+
+  const withoutCountry = buildQueryQualityDashboard({
+    generatedAt: '2026-01-01T00:00:00.000Z',
+    portfolio: { dailyQuotaUnits: 100, portfolioUnitsReserved: 15, portfolioUnitsUsed: 2 },
+    rows: [],
+  });
+  assert.equal(withoutCountry.portfolio.countryUnitsUsed, null);
+  assert.equal(withoutCountry.portfolio.withinBudget, true);
+});
+
 test('Q6: unmeasured market/language metrics report unknown, never 100%', () => {
   const vector = buildQueryQualityVector({
     rawResults: 10, distinctResults: 10, newChannels: 4, newConfirmedCreators: 2,
@@ -739,21 +774,43 @@ test('Q5/Q6: production wiring uses accounting-window spend, derived failure sta
   // Measured target-market truth and an explicit unknown language metric.
   assert.match(dbCore, /COUNT\(DISTINCT s\.channel_id\) FILTER \(\s*WHERE s\.country_outcome IN \('CONFIRMED','LIKELY'\)\)/);
   assert.match(dbCore, /languageMatchedConfirmed: null/);
+  // Reward is in-scope only: UNCERTAIN/no-country sightings may not earn
+  // credit even when they pass the general funnel as TRADING_CONFIRMED.
+  assert.ok(!dbCore.includes("country_outcome<>'REJECTED'"));
+  assert.match(dbCore, /persisted AND NOT cs\.was_known AND cs\.country_outcome IN \('CONFIRMED','LIKELY'\) AND cs\.funnel_outcome='TRADING_CONFIRMED'/);
+  assert.match(dbCore, /persisted AND NOT s\.was_known AND s\.country_outcome IN \('CONFIRMED','LIKELY'\) AND s\.funnel_outcome='TRADING_CONFIRMED'/);
+  // Rate-limit-only recovered runs are partial retrievals too: only an absent
+  // outcome (legacy) or an explicit SUCCESS outcome may enter reward history.
+  assert.match(dbCore, /COALESCE\(qr\.performance_details->>'providerRunOutcome',''\) = '' OR qr\.performance_details->>'providerRunOutcome' LIKE 'SUCCESS%'/);
+  assert.match(dbCore, /\(metrics\.providerRateLimited \|\| 0\) > 0/);
 
   const experiments = readFileSync(join(__dirname, '..', 'querySelectionExperiments.ts'), 'utf8');
-  assert.match(experiments, /revalidateQueryRecordAdmission\(query, \{ now: nowIso \}\)\.eligible/);
+  // The experiment pool obeys the exact execution-time authority gate, and it
+  // is applied before intent rotation so a rejected treatment candidate cannot
+  // consume the opportunity or silently fall back to control.
+  const authorityIndex = experiments.indexOf('evaluateAutonomousQueryAuthority(query, {');
+  const rotationIndex = experiments.indexOf('rotateAwayFromMostRecentIntent(eligible, queries)');
+  assert.ok(authorityIndex >= 0, 'experiment pool must run the execution authority gate');
+  assert.ok(rotationIndex > authorityIndex, 'authority gate must run before intent rotation');
 
   const persistentResearch = readFileSync(join(__dirname, '..', 'persistentResearch.ts'), 'utf8');
   assert.match(persistentResearch, /export async function rejectResearchAction/);
   assert.match(persistentResearch, /revalidateQueryRecordAdmission\(queryRecord/);
+  // Rejection is owner-scoped so a stale caller cannot settle a reservation
+  // that another worker now holds.
+  assert.match(persistentResearch, /reserved_by=\$3/);
+  assert.match(persistentResearch, /return \{actionId:action\.id,queryRecord,reservationOwner:owner\}/);
 
   const autonomousDiscovery = readFileSync(join(__dirname, '..', 'autonomousDiscovery.ts'), 'utf8');
   assert.match(autonomousDiscovery, /if \(research\) \{\s*await rejectResearchAction\(/);
+  assert.match(autonomousDiscovery, /research\.reservationOwner/);
 
   const engine = readFileSync(join(__dirname, '..', '..', 'src', 'components', 'QueryIntelligenceEngine.tsx'), 'utf8');
   assert.match(engine, /qualityDashboardError/);
   assert.match(engine, /setQualityDashboardError/);
   assert.match(engine, />\s*Retry\s*</);
+  // One failed sibling projection must not discard a healthy quality response.
+  assert.match(engine, /apiFetch\(qualityUrl\)\.catch\(\(\) => null\)/);
 
   const queueManager = readFileSync(join(__dirname, '..', 'queueManager.ts'), 'utf8');
   assert.match(queueManager, /queryRunId, persist: false/);
@@ -858,6 +915,15 @@ test('C5: only parseable publish dates count as known temporal coverage', () => 
     videos: [{ id: 'bad-date', title: 'Order flow trading setup', published_at: 'not-a-date' }],
   });
   assert.equal(buildContextualComposition(malformed).temporalCoverage, 'UNKNOWN');
+
+  // A syntactically ISO-shaped but impossible calendar day must not count.
+  // Date.parse normalizes 2024-02-31 to March 2, so presence alone is unsafe.
+  const impossible = rawInput({
+    channel_name: 'Alpha Trading',
+    description: 'Day trading, order flow and risk management education.',
+    videos: [{ id: 'impossible-date', title: 'Order flow trading setup', published_at: '2024-02-31T00:00:00.000Z' }],
+  });
+  assert.equal(buildContextualComposition(impossible).temporalCoverage, 'UNKNOWN');
 
   const valid = rawInput({
     channel_name: 'Alpha Trading',
@@ -1274,6 +1340,14 @@ test('Q4: a fractional portfolio remainder cannot cover the next official run', 
   const exactReservation = selectHierarchicalUcb([cold], selectorContext({ portfolioUnitsUsed: 14 }));
   assert.equal(exactReservation.strategy, 'UCB_PORTFOLIO');
   assert.equal(exactReservation.queryId, 1);
+
+  // A run may continue for several pages, so the remaining budget must cover
+  // the worst-case run cost, not only the first page's one unit.
+  const multiPageFits = selectHierarchicalUcb([cold], selectorContext({ portfolioUnitsUsed: 12, portfolioRunUnits: 3 }));
+  assert.equal(multiPageFits.strategy, 'UCB_PORTFOLIO');
+  const multiPageOverflows = selectHierarchicalUcb([cold], selectorContext({ portfolioUnitsUsed: 13, portfolioRunUnits: 3 }));
+  assert.equal(multiPageOverflows.strategy, 'NO_ELIGIBLE_QUERY');
+  assert.ok(multiPageOverflows.reasonCodes.includes('PORTFOLIO_BUDGET_EXHAUSTED'));
 });
 
 test('Q4: simulator portfolio admission is quota-weighted, not pull-weighted', () => {

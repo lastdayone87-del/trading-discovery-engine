@@ -47,7 +47,7 @@ import {
   rotateAwayFromMostRecentIntent,
 } from './queryPlanner';
 import { selectNextQueryForCountry } from './queryIntelligence';
-import { revalidateQueryRecordAdmission } from './queryQuality/admission';
+import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
 import { getQueriesByCountry, getAppSetting } from './db';
 import type { QueryRecord } from '../src/types';
 
@@ -909,13 +909,17 @@ export async function selectExperimentalQueryForCountry(
   // deterministic pool order (id ascending) so arm indexes are replay-stable.
   const queries = (await getQueriesByCountry(country)).filter(query => reservableFilter(query, now));
   let eligible = limitRepeatedPrimaryTerms(queriesOutsideCooldown(queries, now, cooldownMinutes), queries, now, cooldownMinutes, maxPrimaryUses);
+  // The experiment pool must obey the exact authority gate the scheduler runs
+  // immediately before execution, including retrieval provenance and the live
+  // scope-promotion decision. Apply it before intent rotation: filtering after
+  // rotation can discard every admission-valid treatment candidate and
+  // silently serve a control fallback. An admission-only check was weaker
+  // than execution authority, so a stale or missing retrieval provenance could
+  // still win the arm and consume the opportunity.
+  eligible = eligible.filter(query => evaluateAutonomousQueryAuthority(query, {
+    scopePromotionActive: options.scopePromotionBasis != null,
+  }).eligible);
   eligible = rotateAwayFromMostRecentIntent(eligible, queries);
-  // The experiment pool must obey the same execution-time admission gate as
-  // the scheduler. Without this, a treatment arm can win on a speculative or
-  // otherwise stale row that evaluateAutonomousQueryAuthority then rejects,
-  // burning the opportunity and marking the query REJECTED.
-  const nowIso = now.toISOString();
-  eligible = eligible.filter(query => revalidateQueryRecordAdmission(query, { now: nowIso }).eligible);
   eligible = [...eligible].sort((a, b) => a.id - b.id);
   if (!eligible.length) {
     const base = await delegateLegacy();

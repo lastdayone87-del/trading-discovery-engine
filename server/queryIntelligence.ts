@@ -1038,10 +1038,13 @@ export async function selectNextQueryForCountry(
   const portfolioRatio = portfolioBudget(1, configuredPortfolioRatio).ratio;
   const familyCap = Math.min(1, Math.max(0.1, Number(await getAppSetting('query_intelligence_family_share_cap', process.env.QUERY_INTELLIGENCE_FAMILY_SHARE_CAP || '0.45')) || 0.45));
   const sourceCap = Math.min(1, Math.max(0.1, Number(await getAppSetting('query_intelligence_source_share_cap', process.env.QUERY_INTELLIGENCE_SOURCE_SHARE_CAP || '0.60')) || 0.60));
+  // A portfolio run may request several official pages; reserve the full
+  // worst-case page cost, not just the pre-run snapshot's first page.
+  const portfolioRunUnits = Math.max(1, Number(await getAppSetting('autonomous_pagination_max_pages', '3')) || 3);
 
   const loadQueries = async (): Promise<QueryRecord[]> => getQueriesByCountry(country);
   const loadPool = async (queries: QueryRecord[]): Promise<SelectorPool> =>
-    buildSelectorPool(country, queries, { now, cooldownMinutes, maxPrimaryUses, nowIso, portfolioRatio, familyCap, sourceCap });
+    buildSelectorPool(country, queries, { now, cooldownMinutes, maxPrimaryUses, nowIso, portfolioRatio, familyCap, sourceCap, portfolioRunUnits });
 
   let allQueries = await loadQueries();
   if (allQueries.length === 0) {
@@ -1201,6 +1204,7 @@ async function buildSelectorPool(
     portfolioRatio: number;
     familyCap: number;
     sourceCap: number;
+    portfolioRunUnits: number;
   },
 ): Promise<SelectorPool> {
   const recentCutoff = options.now.getTime() - options.cooldownMinutes * 60_000;
@@ -1333,6 +1337,7 @@ async function buildSelectorPool(
     portfolioRatio: options.portfolioRatio,
     totalDailyQuotaUnits: budget.dailyQuotaUnits,
     portfolioUnitsUsed: budget.portfolioUnitsUsed,
+    portfolioRunUnits: options.portfolioRunUnits,
     familyShare,
     familyCap: options.familyCap,
     queryCap: 1,
@@ -1626,8 +1631,13 @@ export async function evaluateQueryPerformance(
     // A partially provider-degraded run is excluded for the same reason:
     // completed-run reward reads and accounting already drop it, so letting it
     // prove the query would promote from evidence the dashboard cannot see.
+    // Exclude every non-success outcome, not only hard failures: a
+    // rate-limit-only recovered run is still a partially retrieved sample and
+    // is dropped from completed-run reward history. An absent outcome keeps
+    // legacy rows eligible; an explicit SUCCESS outcome stays eligible.
+    const providerOutcome = String(attribution.providerRunOutcome || '');
     const providerFailed = Number(attribution.providerRequestsFailed || 0) > 0
-      || /^FAILED/i.test(String(attribution.providerRunOutcome || ''));
+      || (providerOutcome !== '' && !/^SUCCESS_/.test(providerOutcome));
     const includeCurrentRun = isRewardEligibleQuota(currentRun.quotaUnits) && !providerFailed;
     const counts = includeCurrentRun
       ? {

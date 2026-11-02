@@ -18,7 +18,10 @@ import { isTradingFocusedText, matchedTierATradingSignals } from '../multilingua
  */
 const FINANCIAL_QUALIFIER_PATTERN = /\b(strateg(?:y|ies|ia|ie|i[ae]?)|analysis|analys[ei]?|analisi|analyse|setup|setups|market|markets|mercato|mercati|marche|march[eé]s|markt|markten|sessione|session|séance|sitzung|apertura|opening|ouvert|live|chart|charts|grafico|graphique|chartanalyse|risk|risiko|risque|rischio|riesgo|position|posizione|position|portfolio|portefeuille|journal|routine|mentality|mindset|course|corso|cours|kurs|lezione|leçon|lesson|signal|segnali|señales|signaux|outlook|forecast|previsione|previsi[oó]n|prognose|price|prezzo|prix|preis|entry|ingresso|entrée|einstieg|exit|uscita|sortie|ausstieg)\b/iu;
 const TRADER_DOMAIN_PHRASE = /\b(?:del|della|da|di|per|come|of|for|as)\s+trad(?:er|ing)\b/iu;
-const GENERIC_TRADING_TERM = /^(trading|trader|trade)$/i;
+// Language packs list useful generic phrases, but they are ordinary words on
+// their own ("workplace risk management", "housing market analysis"). They
+// must not qualify a creator without trading context.
+const GENERIC_TRADING_TERM = /^(trading|trader|trade|market analysis|risk management|technical analysis)$/i;
 
 export function isExplicitCreatorTradingText(text: string, context: LayeredKnowledgeContext): boolean {
   const normalized = text.normalize('NFKC');
@@ -39,11 +42,14 @@ export function isExplicitCreatorTradingText(text: string, context: LayeredKnowl
   const hasCountryTradingSignal = (context.countryKnowledge?.nativeTradingTerminology || []).some(term => textMatchesTerm(normalized, term));
   const hasTierASignal = matchedTierATradingSignals(normalized, context).some(signal => signal !== 'KNOWN_METHOD');
   const hasFinancialQualifier = FINANCIAL_QUALIFIER_PATTERN.test(normalized) || TRADER_DOMAIN_PHRASE.test(normalized);
-  // Generic methods such as "candlestick" or "chart patterns" are not trading
-  // evidence on their own ("candlestick making tutorial"). They only count
-  // alongside an independent financial/market dimension.
+  // Generic methods such as "candlestick", "chart patterns", "risk management"
+  // or "market analysis" are not trading evidence on their own
+  // ("candlestick making tutorial", "workplace risk management"). They count
+  // only alongside an independent financial/market dimension. Do not let the
+  // broad qualifier pattern satisfy this check: "risk management" would then
+  // supply its own qualifier ("risk") and qualify itself.
   const hasMethodContext = hasExplicitFinancialLiteral || hasKnownPlatform || hasLanguageTradingSignal
-    || hasCountryTradingSignal || hasFinancialQualifier;
+    || hasCountryTradingSignal;
 
   // Generic uses of the word "trading" are ambiguous. When the same text is
   // clearly about cards, game items, or skins, only explicit financial-market
@@ -78,7 +84,20 @@ export class VideoMetadataProvider implements EvidenceProvider {
     const titles = input.video_titles || [];
     const descriptions = input.video_descriptions || [];
     const now = new Date().toISOString();
-    const videoRef=(index:number)=>({field:'video_title' as const,index,sourceId:input.videos?.[index]?.id,publishedAt:input.videos?.[index]?.published_at,sourceFamilyId:input.videos?.[index]?.source_family_id,sourceEntityId:input.videos?.[index]?.source_entity_id||input.channel_entity_id});
+    const videoRef=(index:number,field:'video_title'|'video_description'='video_title')=>({field,index,sourceId:input.videos?.[index]?.id,publishedAt:input.videos?.[index]?.published_at,sourceFamilyId:input.videos?.[index]?.source_family_id,sourceEntityId:input.videos?.[index]?.source_entity_id||input.channel_entity_id});
+    // Provenance must point at the document that actually matched: a term
+    // found only in a video description is description evidence, not a title
+    // match. A cross-boundary match (title + description joined) falls back to
+    // the title reference used before field-level attribution.
+    const matchRefs=(index:number,terms:string[])=>{
+      const title=titles[index]||'';
+      const desc=descriptions[index]||'';
+      const refs=[
+        ...(terms.some(term=>textMatchesTerm(title,term))?[videoRef(index,'video_title')]:[]),
+        ...(desc&&terms.some(term=>textMatchesTerm(desc,term))?[videoRef(index,'video_description')]:[]),
+      ];
+      return refs.length?refs:terms.some(term=>textMatchesTerm(`${title} ${desc}`,term))?[videoRef(index,'video_title')]:[];
+    };
 
     if (titles.length === 0) {
       return items;
@@ -200,7 +219,7 @@ export class VideoMetadataProvider implements EvidenceProvider {
           type: 'INSTRUMENT',
           matchedTerm: matchedInstrumentsInVideos.join(', '),
           sourceRef: 'Sample Video Titles & Descriptions',
-          fields:titles.flatMap((title,index)=>tradingVideoIndexes.has(index)&&matchedInstrumentsInVideos.some(term=>textMatchesTerm(`${title} ${descriptions[index]||''}`,term))?[videoRef(index)]:[])
+          fields:titles.flatMap((_title,index)=>tradingVideoIndexes.has(index)?matchRefs(index,matchedInstrumentsInVideos):[])
         },
         timestamp: now
       });
@@ -225,7 +244,7 @@ export class VideoMetadataProvider implements EvidenceProvider {
           type: 'PLATFORM_BROKER_PROPFIRM',
           matchedTerm: matchedPlatformsInVideos.join(', '),
           sourceRef: 'Sample Video Titles & Descriptions',
-          fields:titles.flatMap((title,index)=>tradingVideoIndexes.has(index)&&matchedPlatformsInVideos.some(term=>textMatchesTerm(`${title} ${descriptions[index]||''}`,term))?[videoRef(index)]:[])
+          fields:titles.flatMap((_title,index)=>tradingVideoIndexes.has(index)?matchRefs(index,matchedPlatformsInVideos):[])
         },
         timestamp: now
       });
@@ -250,7 +269,7 @@ export class VideoMetadataProvider implements EvidenceProvider {
           type: 'METHODOLOGY_CONCEPT',
           matchedTerm: matchedConceptsInVideos.join(', '),
           sourceRef: 'Sample Video Titles & Descriptions',
-          fields:titles.flatMap((title,index)=>tradingVideoIndexes.has(index)&&matchedConceptsInVideos.some(term=>textMatchesTerm(`${title} ${descriptions[index]||''}`,term))?[videoRef(index)]:[])
+          fields:titles.flatMap((_title,index)=>tradingVideoIndexes.has(index)?matchRefs(index,matchedConceptsInVideos):[])
         },
         timestamp: now
       });

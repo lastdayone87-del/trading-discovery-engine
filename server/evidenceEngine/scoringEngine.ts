@@ -116,11 +116,20 @@ export class ConfigurableWeightedStrategy {
     const classificationMethod: VerificationDecision['classificationMethod'] = semanticItem
       ? semanticItem.source === 'groq_semantic' ? 'SEMANTIC_GROQ'
         : semanticItem.source === 'gemini_free_semantic' ? 'SEMANTIC_GEMINI_FREE' : 'SEMANTIC_GEMINI'
-      : recognition && (recognition.state === 'DECISIVE_TRADING' || recognition.state === 'DECISIVE_NON_TRADING')
-        ? 'DETERMINISTIC_EVIDENCE'
+      : recognition
+        ? (recognition.state === 'DECISIVE_TRADING' || recognition.state === 'DECISIVE_NON_TRADING')
+          ? 'DETERMINISTIC_EVIDENCE'
+          : evidenceCollection.degraded || evidenceCollection.sufficiency !== 'SUFFICIENT'
+            ? 'DEGRADED_HEURISTIC'
+            : 'HEURISTIC_ONLY'
+        // Callers may omit the optional recognition report. A decisive
+        // deterministic decision over sufficient evidence must not then be
+        // mislabeled HEURISTIC_ONLY just because no recognition object exists.
         : evidenceCollection.degraded || evidenceCollection.sufficiency !== 'SUFFICIENT'
           ? 'DEGRADED_HEURISTIC'
-          : 'HEURISTIC_ONLY';
+          : status !== 'UNCERTAIN'
+            ? 'DETERMINISTIC_EVIDENCE'
+            : 'HEURISTIC_ONLY';
 
     return {
       status,

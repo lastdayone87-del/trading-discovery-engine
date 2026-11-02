@@ -51,7 +51,10 @@ export interface QueryQualityDashboard {
     dailyQuotaUnits: number;
     portfolioRatio: number;
     portfolioUnitsReserved: number;
+    /** Authoritative shared (all-country) budget usage. */
     portfolioUnitsUsed: number;
+    /** Usage attributed to the selected country filter, if one was applied. */
+    countryUnitsUsed: number | null;
     portfolioShareUsed: number;
     withinBudget: boolean;
   };
@@ -146,6 +149,7 @@ export function buildQueryQualityDashboard(input: {
     dailyQuotaUnits: number;
     portfolioUnitsReserved: number;
     portfolioUnitsUsed: number;
+    countryUnitsUsed?: number;
   };
   rows: QueryQualityDashboardRunInput[];
 }): QueryQualityDashboard {
@@ -231,6 +235,7 @@ export function buildQueryQualityDashboard(input: {
 
   const dailyQuotaUnits = Math.max(0, safe(input.portfolio.dailyQuotaUnits));
   const portfolioUnitsUsed = safe(input.portfolio.portfolioUnitsUsed);
+  const countryUnitsUsed = input.portfolio.countryUnitsUsed === undefined ? null : safe(input.portfolio.countryUnitsUsed);
   const portfolioUnitsReserved = safe(input.portfolio.portfolioUnitsReserved);
   const effectiveQuotaUnits = quotaUnits || accounted.reduce((sum, row) => sum + safe(row.qualityVector?.quotaUsed) / 100, 0);
 
@@ -242,6 +247,7 @@ export function buildQueryQualityDashboard(input: {
       portfolioRatio: dailyQuotaUnits > 0 ? portfolioUnitsReserved / dailyQuotaUnits : 0,
       portfolioUnitsReserved,
       portfolioUnitsUsed,
+      countryUnitsUsed,
       portfolioShareUsed: dailyQuotaUnits > 0 ? portfolioUnitsUsed / dailyQuotaUnits : 0,
       withinBudget: portfolioUnitsUsed <= portfolioUnitsReserved + 1e-9,
     },

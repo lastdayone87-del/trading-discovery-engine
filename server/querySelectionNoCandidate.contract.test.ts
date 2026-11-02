@@ -9,7 +9,9 @@ const autonomousDiscovery = readFileSync(fileURLToPath(new URL('./autonomousDisc
 test('query selection returns null when cold-start or exploration generation yields no candidate', () => {
   assert.match(queryIntelligence, /reason: string;\n\} \| null> \{/);
   assert.match(queryIntelligence, /const selected = generated\[0\];\n    if \(!selected\) return null;/g);
-  assert.match(queryIntelligence, /if \(!selected\) return null;\n(?:.*\n)*?  return \{ queryRecord: selected/);
+  // Bind the null check to the cold-start branch: a wildcard that crosses
+  // function/file boundaries would pass on an unrelated check.
+  assert.match(queryIntelligence, /const selected = generated\[0\];\n    if \(!selected\) return null;\n    \/\/ Generated rows are reloaded[\s\S]*?return buildSelectionResult\(admitted, pool, 'COLD_START_GENERATION'/);
 });
 
 test('autonomous discovery records no-eligible-query and does not enter authority or scheduling paths', () => {

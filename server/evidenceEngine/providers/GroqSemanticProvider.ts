@@ -698,7 +698,11 @@ export function defaultClient(
       const abortFromCaller = () => controller.abort(signal?.reason);
       if (signal?.aborted) controller.abort(signal.reason);
       else signal?.addEventListener('abort', abortFromCaller, { once: true });
-      const timer = deadlinesEnabled ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
+      // Track why the controller aborted: only a deadline expiry is a
+      // TIMEOUT. A caller cancellation must stay CANCELLED in telemetry and
+      // provider reports instead of masquerading as a slow provider.
+      let deadlineExpired = false;
+      const timer = deadlinesEnabled ? setTimeout(() => { deadlineExpired = true; controller.abort(); }, timeoutMs) : undefined;
       const orgId = groqRouteOrg(route);
       const base = {
         id: randomUUID(), provider: 'groq', operation: 'multilingual-semantic-classification',
@@ -777,9 +781,13 @@ export function defaultClient(
         return parsedContent;
       } catch (error) {
         const aborted = controller.signal.aborted;
-        const typed = aborted
-          ? new ProviderCallError(`Groq call exceeded ${timeoutMs}ms deadline.`, 'TIMEOUT', true, { cause: error })
-          : classifyProviderError(error);
+        const typed = error instanceof ProviderCallError && error.errorClass === 'TIMEOUT'
+          ? error
+          : aborted
+            ? deadlineExpired
+              ? new ProviderCallError(`Groq call exceeded ${timeoutMs}ms deadline.`, 'TIMEOUT', true, { cause: error })
+              : groqFailoverCancelled(signal)
+            : classifyProviderError(error);
         if (!aborted && typed.errorClass === 'RATE_LIMIT' && (error as { groqCooldownDeferred?: unknown })?.groqCooldownDeferred !== true) {
           // Genuine provider 429: arm only this organization's cooldown. The
           // deferred sentinel above is excluded so short-circuits never
@@ -926,8 +934,12 @@ export class GroqSemanticProvider implements EvidenceProvider {
           repairedCitations = retained;
           repairUsed = true;
         }
-      } catch {
-        // Repair is best-effort: keep the original result, which abstains.
+      } catch (error) {
+        // Repair is best-effort, but cancellation is not a repair failure:
+        // propagate it so canceled work is not reported as a completed
+        // abstention.
+        if (signal?.aborted) throw error;
+        // Keep the original result, which abstains.
       }
     }
     // The repair code marks only results that survive to evidence

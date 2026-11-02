@@ -498,7 +498,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         console.warn('[CreatorIntelligence] Search allocation authority unavailable; legacy Query Intelligence fallback continues:', error instanceof Error ? error.message : error);
       }
 
-      let research: { actionId: string; queryRecord: any } | null = null;
+      let research: { actionId: string; queryRecord: any; reservationOwner: string } | null = null;
       // Persistent Research runs ONLY on the control/legacy path when frontier allocation is NOT authorized
       // and no benchmark-designated scope is active (benchmark attempts must
       // never schedule unrelated research work as a designated observation).
@@ -721,7 +721,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         // expiry; otherwise the same inadmissible query is materialized and
         // rejected again on the next cycle.
         if (research) {
-          await rejectResearchAction(research.actionId, `Query authority rejected query: ${queryAuthority.reasonCodes.join(', ')}`)
+          await rejectResearchAction(research.actionId, `Query authority rejected query: ${queryAuthority.reasonCodes.join(', ')}`, research.reservationOwner)
             .catch(error => console.warn('[Autonomous Producer] Failed to settle rejected research action:', error));
         }
         candidateDiagnostic = { ...candidateDiagnostic, disposition: 'SKIPPED', reasonCode: 'QUERY_INTELLIGENCE_AUTHORITY_REJECTED', schedulingOutcome: 'NOT_REACHED' };

@@ -155,8 +155,10 @@ export function evaluateUnifiedDecisionPolicy(input:UnifiedDecisionPolicyInput):
     if(input.lifecycleAction==='CONFIRM'&&!recognitionAllowsConfirmation)reasons.push('RECOGNITION_STATE_NOT_DECISIVE_TRADING');
     reasons.push(input.lifecycleAction==='ENRICH'?'EVIDENCE_COVERAGE_INCOMPLETE':input.lifecycleAction==='REVIEW'?'SELECTIVE_POLICY_ABSTAINED':positive.length>0&&substantivePositiveWeight<input.minimumPositiveWeight?'SUBSTANTIVE_POSITIVE_EVIDENCE_REQUIRED':'SCORE_BOUNDARY_NOT_SATISFIED');
   }
-  // C3: no status floors. confidenceScore is the calibrated probability; the
-  // display layer labels heuristic/calibrated/neutral separately.
+  // C3: no status floors. For a terminal status confidenceScore is the
+  // calibrated probability of that status; for UNCERTAIN it is clamped to the
+  // ambiguous band so the surface never reports a decisive confidence for an
+  // undecided outcome. `tradingProbability` remains the raw calibrated value.
   const confidenceScore=status==='TRADING_CONFIRMED'?tradingProbability:status==='NON_TRADING'?nonTradingProbability:Math.min(79,Math.max(23,tradingProbability));
   return {status,confidenceScore,tradingProbability,nonTradingProbability,coverageConfidence,reasonCodes:reasons};
 }

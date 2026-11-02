@@ -67,7 +67,9 @@ test('candidate triage still recognizes qualified French and Dutch market phrase
   assert.equal(french.disposition, 'PLAUSIBLE_TRADING_HYPOTHESIS');
   assert.ok(french.matchedSignals.includes('LATIN_MARKET_FINANCE'));
 
-  const dutch = triageAutonomousSearchCandidate(candidate('Beurs analyse voor aandelen en opties'), 'automated_query', false);
+  // No `aandelen`: this must pass only because the qualified Dutch `beurs`
+  // phrase is recognized, so removing that matcher fails the test.
+  const dutch = triageAutonomousSearchCandidate(candidate('Beurs analyse en nieuws'), 'automated_query', false);
   assert.equal(dutch.disposition, 'PLAUSIBLE_TRADING_HYPOTHESIS');
   assert.ok(dutch.matchedSignals.includes('LATIN_MARKET_FINANCE'));
 });

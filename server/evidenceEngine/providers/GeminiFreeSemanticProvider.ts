@@ -241,7 +241,11 @@ export function defaultClient(
         const abortFromCaller = () => controller.abort(signal?.reason);
         if (signal?.aborted) controller.abort(signal.reason);
         else signal?.addEventListener('abort', abortFromCaller, { once: true });
-        const timer = deadlinesEnabled ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
+        // Track why the controller aborted: only a deadline expiry is a
+        // TIMEOUT. A caller cancellation must stay CANCELLED in telemetry and
+        // provider reports instead of masquerading as a slow provider.
+        let deadlineExpired = false;
+        const timer = deadlinesEnabled ? setTimeout(() => { deadlineExpired = true; controller.abort(); }, timeoutMs) : undefined;
         const base = {
           id: randomUUID(), provider: 'gemini-free', operation: 'multilingual-semantic-classification',
           ...semanticObservabilityFields(observability),
@@ -280,9 +284,13 @@ export function defaultClient(
           return parsed;
         } catch (error) {
           const aborted = controller.signal.aborted;
-          const typed = aborted
-            ? new ProviderCallError(`Free Gemini call exceeded ${timeoutMs}ms deadline.`, 'TIMEOUT', true, { cause: error })
-            : classifyProviderError(error);
+          const typed = error instanceof ProviderCallError && error.errorClass === 'TIMEOUT'
+            ? error
+            : aborted
+              ? deadlineExpired
+                ? new ProviderCallError(`Free Gemini call exceeded ${timeoutMs}ms deadline.`, 'TIMEOUT', true, { cause: error })
+                : geminiFreeFailoverCancelled(signal)
+              : classifyProviderError(error);
           if (!aborted && typed.errorClass === 'RATE_LIMIT' && (error as { geminiFreeCooldownDeferred?: unknown })?.geminiFreeCooldownDeferred !== true) {
             geminiFreeCooldownUntilMs = Date.now() + geminiFreeRateLimitCooldownMs();
           }

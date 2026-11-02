@@ -59,7 +59,7 @@ interface QualityDashboardRun {
 interface QualityDashboard {
   version: string;
   generatedAt: string;
-  portfolio: { dailyQuotaUnits: number; portfolioRatio: number; portfolioUnitsReserved: number; portfolioUnitsUsed: number; portfolioShareUsed: number; withinBudget: boolean };
+  portfolio: { dailyQuotaUnits: number; portfolioRatio: number; portfolioUnitsReserved: number; portfolioUnitsUsed: number; countryUnitsUsed: number | null; portfolioShareUsed: number; withinBudget: boolean };
   totals: { runs: number; completedRuns: number; pendingRuns: number; failedRuns: number; accountedRuns: number; unaccountedCompletedRuns: number; newConfirmedCreators: number; newQualityCreators: number; quotaUnits: number; confirmedNewCreatorsPer100Quota: number; zeroConfirmRuns: number; zeroConfirmShare: number; targetMarketPrecision: number | null; duplicateRatio: number; providerDegradedRuns: number };
   selection: { strategies: Record<string, number>; stopReasons: Array<{ reason: string; count: number }>; stopReasonCoverage: number; admissionRejections: Array<{ reason: string; count: number }>; admissionTiers: Record<string, number>; compositionFamilies: Record<string, number> };
   rows: QualityDashboardRun[];
@@ -70,7 +70,8 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
   const [extractedVocabulary, setExtractedVocabulary] = useState<ExtractedTermRecord[]>([]);
   const [terminology, setTerminology] = useState<CanonicalTradingTerm[]>([]);
   const [logs, setLogs] = useState<QueryExecutionLog[]>([]);
-  const [qualityDashboard, setQualityDashboard] = useState<QualityDashboard | null>(null);
+  const [qualityDashboardState, setQualityDashboard] = useState<QualityDashboard | null>(null);
+  const [qualityDashboardCountry, setQualityDashboardCountry] = useState<string | null>(null);
   // A failed dashboard request must surface as an error with retry, not leave
   // the tab on its loading message forever (apiFetch resolves on 4xx/5xx).
   const [qualityDashboardError, setQualityDashboardError] = useState<string | null>(null);
@@ -89,6 +90,10 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
   }>({ isRunning: false, isPaused: false, scope: 'GLOBAL', selectedCountries: [] });
 
   const [selectedCountry, setSelectedCountry] = useState<string>('All');
+  // Only expose a projection that belongs to the active filter. The effect
+  // that clears it runs after the country-change render, so gating the view
+  // on the country it was loaded for prevents a one-frame stale country view.
+  const qualityDashboard = qualityDashboardCountry === selectedCountry ? qualityDashboardState : null;
   const [selectedCollection, setSelectedCollection] = useState<string>('ALL');
   const [isCycleRunning, setIsCycleRunning] = useState(false);
   const [isPauseToggling, setIsPauseToggling] = useState(false);
@@ -113,30 +118,37 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
       const qualityUrl = selectedCountry === 'All'
         ? '/api/query-intelligence/quality-dashboard'
         : `/api/query-intelligence/quality-dashboard?country=${encodeURIComponent(selectedCountry)}`;
+      // Isolate every request: a network failure in an unrelated projection
+      // must not discard a healthy quality response and show the wrong error.
       const [libRes, vocabRes, terminologyRes, logRes, statusRes, scopeRes, qualityRes] = await Promise.all([
-        apiFetch('/api/query-intelligence/library'),
-        apiFetch('/api/query-intelligence/vocabulary'),
-        apiFetch('/api/query-intelligence/terminology'),
-        apiFetch('/api/query-intelligence/logs'),
-        apiFetch('/api/query-intelligence/status'),
-        apiFetch('/api/query-intelligence/scope'),
-        apiFetch(qualityUrl)
+        apiFetch('/api/query-intelligence/library').catch(() => null),
+        apiFetch('/api/query-intelligence/vocabulary').catch(() => null),
+        apiFetch('/api/query-intelligence/terminology').catch(() => null),
+        apiFetch('/api/query-intelligence/logs').catch(() => null),
+        apiFetch('/api/query-intelligence/status').catch(() => null),
+        apiFetch('/api/query-intelligence/scope').catch(() => null),
+        apiFetch(qualityUrl).catch(() => null)
       ]);
 
       if (requestId !== fetchSequence.current) return;
+      const read = (response: Response | null) => response?.ok
+        ? response.json().catch(() => null)
+        : Promise.resolve(null);
       const [lib, vocab, terminologyData, logData, statusData, scopeData] = await Promise.all([
-        libRes.ok ? libRes.json() : null,
-        vocabRes.ok ? vocabRes.json() : null,
-        terminologyRes.ok ? terminologyRes.json() : null,
-        logRes.ok ? logRes.json() : null,
-        statusRes.ok ? statusRes.json() : null,
-        scopeRes.ok ? scopeRes.json() : null,
+        read(libRes),
+        read(vocabRes),
+        read(terminologyRes),
+        read(logRes),
+        read(statusRes),
+        read(scopeRes),
       ]);
       // The quality projection carries its own error state: apiFetch resolves
       // on HTTP 4xx/5xx, so checking `ok` alone would silently drop the error.
       let quality: QualityDashboard | null = null;
       let qualityError: string | null = null;
-      if (qualityRes.ok) {
+      if (!qualityRes) {
+        qualityError = 'Unable to reach the query-quality projection.';
+      } else if (qualityRes.ok) {
         try {
           quality = await qualityRes.json();
         } catch {
@@ -161,6 +173,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
       if (logData) setLogs(logData);
       if (quality) {
         setQualityDashboard(quality);
+        setQualityDashboardCountry(selectedCountry);
         setQualityDashboardError(null);
       } else {
         setQualityDashboardError(qualityError);
@@ -183,6 +196,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
     // The old projection belongs to the previous country filter. Clear it so
     // stale figures are never shown while the new dashboard request loads.
     setQualityDashboard(null);
+    setQualityDashboardCountry(null);
     setQualityDashboardError(null);
     fetchData();
     const interval = setInterval(fetchData, 10000); // refresh every 10s
@@ -824,6 +838,14 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
                     { label: 'Duplicate ratio', value: `${Math.round(qualityDashboard.totals.duplicateRatio * 100)}%`, tone: 'text-slate-900 dark:text-white' },
                     { label: 'Accounted runs', value: `${qualityDashboard.totals.accountedRuns}/${qualityDashboard.totals.completedRuns}`, tone: 'text-slate-900 dark:text-white' },
                     { label: 'Provider-degraded runs', value: qualityDashboard.totals.providerDegradedRuns, tone: 'text-rose-600 dark:text-rose-400' },
+                    // The budget decision is shared across countries. Show the
+                    // selected country's own spend separately rather than
+                    // comparing it with the global reservation.
+                    ...(qualityDashboard.portfolio.countryUnitsUsed == null ? [] : [{
+                      label: 'Selected-country portfolio units',
+                      value: qualityDashboard.portfolio.countryUnitsUsed.toFixed(2),
+                      tone: 'text-slate-900 dark:text-white',
+                    }]),
                   ].map(card => (
                     <div key={card.label} className="p-3 bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700/70 rounded-xl">
                       <div className="text-[10px] uppercase tracking-wider font-bold text-slate-500 dark:text-slate-400">{card.label}</div>

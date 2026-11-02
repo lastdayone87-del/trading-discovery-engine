@@ -55,6 +55,17 @@ test('explicit creator-owned trading titles count as trading-focused after enric
   assert.equal(decision.status, 'TRADING_CONFIRMED');
 });
 
+test('a generic method cannot supply its own financial qualifier', () => {
+  const context = getLayeredKnowledgeContext('United States');
+  // "risk management" contains "risk" and "market analysis" contains both
+  // "market" and "analysis"; neither may qualify itself as trading.
+  assert.equal(isExplicitCreatorTradingText('Workplace risk management', context), false);
+  assert.equal(isExplicitCreatorTradingText('Housing market analysis', context), false);
+  // An independent financial dimension still qualifies the method.
+  assert.equal(isExplicitCreatorTradingText('Trading risk management', context), true);
+  assert.equal(isExplicitCreatorTradingText('Forex market analysis', context), true);
+});
+
 test('trading-card usage does not become financial trading evidence', async () => {
   const context = getLayeredKnowledgeContext('United States');
   assert.equal(isExplicitCreatorTradingText('Pokemon trading cards opening and grading', context), false);

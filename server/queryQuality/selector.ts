@@ -98,13 +98,16 @@ function portfolioBudgetRemaining(context: SelectorContext): number {
   return Math.max(0, reserved - Math.max(0, context.portfolioUnitsUsed));
 }
 
-/** One official-provider run reserves 100 quota units = 1 normalized unit. */
+/** One official-provider page reserves 100 quota units = 1 normalized unit. */
 const PORTFOLIO_RUN_RESERVATION_UNITS = 1;
 
 function hasPortfolioReservation(context: SelectorContext): boolean {
-  // A positive fractional remainder cannot cover the next official-provider
-  // reservation, so it must fail closed instead of overshooting the cap.
-  return portfolioBudgetRemaining(context) >= PORTFOLIO_RUN_RESERVATION_UNITS;
+  // A portfolio run may continue for several pages, so the first-page
+  // reservation alone can overshoot the floor. Require the full worst-case
+  // run cost; a fractional remainder then fails closed instead of admitting a
+  // run that exhausts the budget after page one.
+  const required = Math.max(PORTFOLIO_RUN_RESERVATION_UNITS, Number(context.portfolioRunUnits) || PORTFOLIO_RUN_RESERVATION_UNITS);
+  return portfolioBudgetRemaining(context) >= required;
 }
 
 function portfolioNeeded(context: SelectorContext): boolean {

@@ -111,10 +111,16 @@ function scriptsOf(value: string): Set<string> {
   const out = new Set<string>();
   for (const char of normalize(value)) {
     if (!/\p{L}/u.test(char)) continue;
-    // An unclassified letter must not be treated as Common: `Zyyy` is
-    // accepted by every configured script profile. `Zzzz` (unknown) fails
+    const script = SCRIPT_PATTERNS.find(([, pattern]) => pattern.test(char))?.[0];
+    if (script) {
+      out.add(script);
+      continue;
+    }
+    // Common/Inherited letters are script extenders, not unknowns: U+30FC
+    // (the katakana-hiragana prolonged sound mark) is a Common letter used in
+    // `トレード`. Treat only genuinely unknown scripts as `Zzzz` so they fail
     // closed in scriptCompatible.
-    out.add(SCRIPT_PATTERNS.find(([, pattern]) => pattern.test(char))?.[0] || 'Zzzz');
+    out.add(/[\p{Script=Common}\p{Script=Inherited}]/u.test(char) ? 'Zyyy' : 'Zzzz');
   }
   return out;
 }
@@ -143,65 +149,119 @@ function phraseKey(value: string): string {
  */
 const AMBIGUOUS_STANDALONE_SEMANTICS = new Set(['es']);
 
-function buildTradingSemantics(): Set<string> {
+function addPhrase(out: Set<string>, value: string | undefined | null): void {
+  const key = phraseKey(String(value || ''));
+  if (key && !AMBIGUOUS_STANDALONE_SEMANTICS.has(key)) out.add(key);
+}
+
+/**
+ * Market-independent governed vocabulary. Country/language-owned terminology
+ * is deliberately kept out of this set: `Börsenanalyse` is German trading
+ * vocabulary, not a global token that may admit a Japanese or French surface.
+ */
+const GLOBAL_TRADING_SEMANTICS = (() => {
   const out = new Set<string>();
-  const add = (value: string | undefined | null) => {
-    const key = phraseKey(String(value || ''));
-    if (key && !AMBIGUOUS_STANDALONE_SEMANTICS.has(key)) out.add(key);
+  GLOBAL_INSTRUMENTS.forEach(value => addPhrase(out, value));
+  GLOBAL_ADVANCED_CONCEPTS.forEach(value => addPhrase(out, value));
+  GLOBAL_PLATFORMS_BROKERS_PROPFIRMS.forEach(value => addPhrase(out, value));
+  ['p2p', 'peer-to-peer'].forEach(value => addPhrase(out, value));
+  return out;
+})();
+
+function addLanguageSemantics(out: Set<string>, language: string | undefined | null): void {
+  const code = String(language || '').toLocaleLowerCase('und').split('-')[0];
+  if (!code) return;
+  for (const semantic of LANGUAGE_TRADING_SEMANTICS.get(code) || []) out.add(semantic);
+  for (const semantic of REVIEWED_LANGUAGE_SEMANTICS[code] || []) addPhrase(out, semantic);
+}
+
+const LANGUAGE_TRADING_SEMANTICS = (() => {
+  const out = new Map<string, Set<string>>();
+  const add = (code: string, values: string[]) => {
+    const set = out.get(code) || new Set<string>();
+    values.forEach(value => addPhrase(set, value));
+    out.set(code, set);
   };
-  GLOBAL_INSTRUMENTS.forEach(add);
-  GLOBAL_ADVANCED_CONCEPTS.forEach(add);
-  GLOBAL_PLATFORMS_BROKERS_PROPFIRMS.forEach(add);
   for (const pack of Object.values(MULTILINGUAL_CLASSIFICATION_PACKS)) {
-    pack.executionTerms.forEach(add);
-    pack.educationalTerms.forEach(add);
-    pack.businessNewsTerms.forEach(add);
+    add(pack.languageCode, [...pack.executionTerms, ...pack.educationalTerms, ...pack.businessNewsTerms]);
   }
   for (const pack of Object.values(LANGUAGE_KNOWLEDGE_PACKS)) {
-    pack.positiveTerms.forEach(add);
-    pack.commonPhrases.forEach(add);
-  }
-  // Country knowledge packs are curated, reviewed terminology (for example
-  // `Börsenanalyse`). They are part of the governed lexicon even when the
-  // broader language pack does not repeat them; omitting them demoted an
-  // already-promoted native term on its next lifecycle refresh.
-  for (const pack of Object.values(COUNTRY_KNOWLEDGE_PACKS)) {
-    (pack.nativeTradingTerminology || []).forEach(add);
+    add(pack.languageCode, [...pack.positiveTerms, ...pack.commonPhrases]);
   }
   return out;
-}
+})();
 
 /**
  * Reviewed vocabulary additions that are genuinely trading-specific but are
  * not yet present in every language pack. These are still governed phrases,
  * not an automatic promotion path for arbitrary unknown terms.
  */
-const REVIEWED_TRADING_SEMANTICS = [
-  'liquiditätszone',
-  'liquiditätszonen',
-  'liquidity zone',
-  'liquidity zones',
-  'charttechnik',
-  'chartanalyse',
-  'p2p',
-  'peer-to-peer',
-];
+const REVIEWED_LANGUAGE_SEMANTICS: Record<string, string[]> = {
+  de: ['liquiditätszone', 'liquiditätszonen', 'charttechnik', 'chartanalyse'],
+  ja: ['トレード', 'デイトレード', 'オーダーフロー'],
+};
 
-const TRADING_SEMANTICS = new Set([
-  ...buildTradingSemantics(),
-  ...REVIEWED_TRADING_SEMANTICS.map(phraseKey),
-]);
+const COUNTRY_NATIVE_SEMANTICS = new Map<string, Set<string>>(
+  Object.entries(COUNTRY_KNOWLEDGE_PACKS).map(([country, pack]) => {
+    const set = new Set<string>();
+    (pack.nativeTradingTerminology || []).forEach(value => addPhrase(set, value));
+    return [country, set];
+  }),
+);
+
+const COUNTRY_LANGUAGES = new Map<string, string[]>(
+  Object.entries(COUNTRY_KNOWLEDGE_PACKS).map(([country, pack]) => [
+    country,
+    [...new Set([pack.primaryLanguage, ...(pack.languageCodes || [])].filter((code): code is string => Boolean(code)))],
+  ]),
+);
 
 /**
  * True when the term contains a governed trading semantic token/phrase.
  * Matching is token/phrase bounded: `live` alone does not match `live trading`,
  * and `ES` does not match inside `heroes`.
+ *
+ * With a country/language context, only global vocabulary plus that language
+ * (and the country's own reviewed terms) is admitted. Country knowledge packs
+ * are scoped by their declared language rather than flattened into a global
+ * set, so a German term cannot become searchable for Japan. Calls without
+ * context retain the broad legacy lexicon.
  */
-export function hasGovernedTradingSemantics(term: string): boolean {
+export function hasGovernedTradingSemantics(
+  term: string,
+  context: { country?: string | null; language?: string | null } = {},
+): boolean {
   const key = phraseKey(term);
   if (!key) return false;
+  const out = new Set(GLOBAL_TRADING_SEMANTICS);
+  const language = context.language ? String(context.language).toLocaleLowerCase('und').split('-')[0] : '';
+  const country = context.country && context.country !== 'GLOBAL' ? context.country : '';
+  if (!country && !language) {
+    // No context: keep the legacy broad lexicon so callers that predate the
+    // context-aware gate do not lose valid trading terms.
+    LANGUAGE_TRADING_SEMANTICS.forEach(values => values.forEach(value => out.add(value)));
+    COUNTRY_NATIVE_SEMANTICS.forEach(values => values.forEach(value => out.add(value)));
+  } else {
+    // English is the universal retrieval language: an English trading phrase
+    // is a valid surface for any market even when the row did not declare a
+    // language (legacy compound rows). Other language packs stay scoped.
+    addLanguageSemantics(out, 'en');
+    if (language) addLanguageSemantics(out, language);
+    if (country) {
+      (COUNTRY_NATIVE_SEMANTICS.get(country) || []).forEach(value => out.add(value));
+      (COUNTRY_LANGUAGES.get(country) || []).forEach(code => addLanguageSemantics(out, code));
+    }
+    // A reviewed native term travels with its language (for example the
+    // German `Börsenanalyse` curated under Luxembourg), not with every country.
+    if (language) {
+      for (const [candidate, languages] of COUNTRY_LANGUAGES) {
+        if (!languages.includes(language)) continue;
+        (COUNTRY_NATIVE_SEMANTICS.get(candidate) || []).forEach(value => out.add(value));
+      }
+    }
+  }
   const padded = ` ${key} `;
-  for (const semantic of TRADING_SEMANTICS) {
+  for (const semantic of out) {
     if (semantic === key) return true;
     if (padded.includes(` ${semantic} `)) return true;
   }
@@ -248,7 +308,8 @@ export function isSearchableTradingTerm(input: SearchabilityInput): Searchabilit
   if (contentTokens.length > 0 && contentTokens.every(token => CTA_TOKENS.has(token) || FORMAT_TOKENS.has(token))) add('format-only');
   if (lowerTokens.length > 0 && lowerTokens.every(token => STOPWORDS.has(token))) add('stopword-only');
   if (termTokens.length > 3) add('too-many-tokens');
-  if (input.requireTradingSemantics !== false && !hasGovernedTradingSemantics(normalizedTerm)) add('no-trading-semantics');
+  if (input.requireTradingSemantics !== false
+    && !hasGovernedTradingSemantics(normalizedTerm, { country: input.country, language: input.language })) add('no-trading-semantics');
 
   const languages = input.language ? [input.language.toLocaleLowerCase('und').split('-')[0]] : [];
   if (!scriptCompatible(input.country, scripts, languages)) add('script-incompatible');
