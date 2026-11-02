@@ -777,6 +777,15 @@ export interface RenderedControlTarget {
    * haspopup control). Popups opened by an allowed click are captured and
    * inspected within the bounded crawl budget. */
   popup?: boolean;
+  /**
+   * True when activating the control opens a new browsing context
+   * (`target=_blank` or `aria-haspopup`). Distinct from `popup`, which only
+   * marks controls that cannot be followed as a normal navigation. The click
+   * planner needs this to know whether a click inspects in place or opens a
+   * popup: a cross-origin popup is never navigated to, so clicking one cannot
+   * discover its content.
+   */
+  newContext?: boolean;
 }
 
 export interface RenderedControlEnumeration {
@@ -1068,6 +1077,7 @@ export function enumerateRenderedControlNodes(
       // exact: only controls that contributed an unresolved popup count can
       // resolve one. The popup listener captures every popup regardless.
       popup: ariaHaspopup === 'dialog' || ariaHaspopup === 'menu' || (target === '_blank' && !hasNavigableHref),
+      newContext: target === '_blank' || ariaHaspopup === 'dialog' || ariaHaspopup === 'menu',
     };
     // Original hint matches keep absolute priority, then icon-label
     // recoveries, then generic structural disclosures. Each group preserves
@@ -1656,7 +1666,7 @@ export interface RenderedAnchorClickSkipOptions {
 }
 
 export function isSkippableNavigableAnchorClick(
-  target: Pick<RenderedControlTarget, 'href'> & { text?: string },
+  target: Pick<RenderedControlTarget, 'href'> & { text?: string; newContext?: boolean },
   pageUrl: string,
   options: RenderedAnchorClickSkipOptions = {},
 ): boolean {
@@ -1701,6 +1711,14 @@ export function isSkippableNavigableAnchorClick(
     // community/aggregator destination is then the only remaining discovery
     // path (for example linktr.ee/beacons hubs), so keep it in the click set.
     // Unrelated formats, security rejections, and vendor links stay skipped.
+    if (target.newContext) {
+      // A cross-origin destination that opens a new browsing context is
+      // captured as a popup and policy-dropped without inspecting its
+      // content. Clicking it would spend the click budget and issue a request
+      // whose response is discarded, so it is never a discovery path. The
+      // enqueue budget/policy accounting owns the destination instead.
+      return true;
+    }
     return !shouldEnqueueRenderedCrossOriginLink({
       url: absolute.toString(),
       currentUrl: page.toString(),

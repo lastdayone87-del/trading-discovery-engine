@@ -332,6 +332,12 @@ test('real DOM: enumeration separates hint-rejected, structural, icon-label, and
     assert.equal(enumeration.structuralUnrecovered, 0, 'no structural control is left outside the click set');
     assert.equal(enumeration.iconLabelRecovered, 1, 'title-only icon labels are recovered in P1.2');
     assert.equal(enumeration.popupTargets, 1, 'only the dialog control requires popup capture; the href-bearing _blank anchor is navigable');
+    const blankAnchor = enumeration.controls.find(control => control.href?.includes('discord.gg/example'));
+    assert.equal(blankAnchor?.newContext, true, 'a target=_blank anchor opens a new context even when its href is navigable');
+    const sameTabAnchor = enumeration.controls.find(control => control.text.includes('Community') && control.href?.endsWith('/community'));
+    assert.equal(sameTabAnchor?.newContext, false, 'an ordinary same-tab anchor is not a new-context control');
+    const popupControl = enumeration.controls.find(control => control.text.includes('Open menu'));
+    assert.equal(popupControl?.newContext, true, 'an aria-haspopup control opens a new context');
 
     const context = await page.evaluate(collectRenderedPageContext);
     assert.equal(context.frameCount, 1, 'iframe presence is recorded for P1.4');

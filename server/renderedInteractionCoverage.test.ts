@@ -580,6 +580,11 @@ test('cross-origin clicks are skipped only while the destination pass pursues th
     true,
     'omitting the option preserves the legacy cross-host skip for unaffected callers',
   );
+  assert.equal(
+    isSkippableNavigableAnchorClick({ ...aggregator, newContext: true }, pageUrl, { crossOriginPursued: false }),
+    true,
+    'a cross-origin hub that opens a popup cannot be inspected by a click: cross-origin popups are policy-dropped, so the enqueue budget owns it',
+  );
 });
 
 test('an already-queued cross-origin hub is never clicked after re-enumeration', async () => {
