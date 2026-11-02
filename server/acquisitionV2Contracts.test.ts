@@ -37,7 +37,7 @@ test('v2: same-host navigable anchors skip clicks, buttons do not', () => {
   assert.equal(isSkippableNavigableAnchorClick({ href: '#section' }, PAGE), false);
   assert.equal(isSkippableNavigableAnchorClick({ href: 'javascript:void(0)' }, PAGE), false);
   assert.equal(isSkippableNavigableAnchorClick({ href: 'mailto:a@b.com' }, PAGE), false);
-  assert.equal(isSkippableNavigableAnchorClick({ href: 'https://other.example.net/join' }, PAGE), false);
+  assert.equal(isSkippableNavigableAnchorClick({ href: 'https://other.example.net/join' }, PAGE), true);
   assert.equal(isSkippableNavigableAnchorClick({ href: 'http://exa mple.com/' }, PAGE), false);
 });
 
@@ -975,9 +975,17 @@ test('v2 review: scheduler and worker wiring call sites are pinned', () => {
   const fallback = readFileSync(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8');
   // Capture the original page's anchors before any control click can navigate
   // the document away; the post-click enqueue then covers JS-revealed links.
-  const enqueuePos = fallback.indexOf("await enqueueLinks({ strategy: 'same-hostname'");
+  assert.match(
+    fallback,
+    /const enqueueSameHostHints = async \(\): Promise<void> => \{[\s\S]*?strategy: 'same-hostname'/,
+    'the shared helper keeps the same-hostname enqueue rule',
+  );
+  const enqueuePos = fallback.indexOf(
+    'await enqueueSameHostHints();',
+    fallback.indexOf('const drainPopups = async'),
+  );
   const clickPos = fallback.indexOf('const clickLoop = await runRenderedClickLoop({');
-  const postClickEnqueuePos = fallback.indexOf("await enqueueLinks({strategy:'same-hostname'", clickPos);
+  const postClickEnqueuePos = fallback.indexOf('await enqueueSameHostHints();', clickPos);
   assert.ok(enqueuePos !== -1 && clickPos !== -1 && enqueuePos < clickPos, 'anchors enqueue before navigating clicks');
   assert.ok(postClickEnqueuePos > clickPos, 'JS-revealed anchors enqueue after clicks');
 });

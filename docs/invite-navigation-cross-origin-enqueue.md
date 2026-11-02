@@ -26,9 +26,11 @@ the following hold:
 3. The crawl-wide cross-origin cap
    (`MAX_RENDERED_CROSS_ORIGIN_ENQUEUES = 3`) has room. A skip is counted as
    `destination-budget`.
-4. `shouldEnqueueRenderedCrossOriginLink` returns true: the shared
-   `shouldFollowDestination` policy must admit the target. Admission-rejected
-   and weak/generic destinations are counted as `cross-origin-disallowed`.
+4. `shouldFollowDestination` admits the target: the shared policy must return
+   `eligible`. Unrelated outbound links are counted as `hint-rejected` and
+   admission/security rejections as `admission-rejected`; neither is a coverage
+   exclusion. Only an eligible community destination the pursuit policy leaves
+   unvisited is counted as `cross-origin-disallowed`.
 5. It is not a Discord destination. Discord links are terminal invite
    candidates extracted from the page; enqueueing them would spend page budget
    on a surface the crawler does not need to inspect.

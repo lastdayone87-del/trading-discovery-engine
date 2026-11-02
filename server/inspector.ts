@@ -1057,7 +1057,7 @@ export function renderedAcquisitionOutcome(rendered:BrowserFallbackResult,render
   // gap: a click-only control or an unexamined policy/context surface could
   // still be holding the invite. Only a genuinely COMPLETE run is clean.
   if (requiredCovered && !interactionGap && !coverageGap) return {outcome:'INSPECTED_NO_MATCH'};
-  if(rendered.complete&&renderedProcessed&&!interactionGap&&!coverageGap)return{outcome:'INSPECTED_NO_MATCH'};
+  if(rendered.complete&&renderedProcessed&&!interactionGap&&!coverageGap&&!gap)return{outcome:'INSPECTED_NO_MATCH'};
   if (hasUnvisited) return{outcome:'PARTIALLY_INSPECTED',failureClass:'REQUIRED_UNVISITED_BUDGET_GAP',gapRetryable:true};
   // An unexamined control outranks a permanent-only required failure: the
   // blocked link cannot own retry work, but content hidden behind a failed or
