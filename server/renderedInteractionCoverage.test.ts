@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { combineRenderedControlOffsetAdvances, isCrossHostnameStructuralNavigation, isNavigableOnlyControlWindow, isSameSeedDocument, isUnrecoveredStructuralNavigation, mergeRenderedCoverageGapCounters, planRevealedRenderedClickTargets, partitionRenderedClickTargets, reconcileClickDestinationContext, remainingRenderedClickBudget, renderedClickOffsetAdvance, renderedControlOverflowTargets, renderedRequestControlTotalsDelta, resolveRenderedCompletionState, resolveUnexaminedPopupTargets, runRenderedClickLoop, trackRenderedPopupCoverage, type RenderedControlEnumeration, type RenderedRequestControlTotals } from './browserCommunityFallback';
+import { DEFAULT_BROWSER_FALLBACK_BUDGET, MAX_RENDERED_CROSS_ORIGIN_ENQUEUES, combineRenderedControlOffsetAdvances, enqueueRenderedCrossOriginPass, isCrossHostnameStructuralNavigation, isNavigableOnlyControlWindow, isSameSeedDocument, isUnrecoveredStructuralNavigation, mergeRenderedCoverageGapCounters, planRevealedRenderedClickTargets, planRenderedCrossOriginEnqueues, partitionRenderedClickTargets, reconcileClickDestinationContext, remainingRenderedClickBudget, renderedClickOffsetAdvance, renderedControlOverflowTargets, renderedCrossOriginVisitedIdentities, renderedRequestControlTotalsDelta, resolveRenderedCompletionState, resolveUnexaminedPopupTargets, runRenderedClickLoop, shouldEnqueueRenderedCrossOriginLink, trackRenderedPopupCoverage, type RenderedControlEnumeration, type RenderedRequestControlTotals } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -698,6 +698,255 @@ test('a seed retry refreshes its own document identity and required links', () =
   assert.match(source, /for \(const link of discoverRequiredSeedLinks\(await page\.content\(\), page\.url\(\)\)\) known\.add\(link\)/, 'retry-discovered links merge with earlier seed links');
 });
 
+test('cross-origin planner carries visible anchor text for generic paths', () => {
+  const currentUrl = 'https://creator.example/';
+  const admitted = planRenderedCrossOriginEnqueues({
+    candidates: [{ url: 'https://community.example/go', text: 'Join the private members community' }],
+    currentUrl,
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(admitted.admitted, ['https://community.example/go']);
+  assert.equal(admitted.disallowed, 0);
+
+  const noLabel = planRenderedCrossOriginEnqueues({
+    candidates: [{ url: 'https://community.example/go', text: '' }],
+    currentUrl,
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(noLabel.admitted, [], 'a generic path with no visible label is not admitted');
+  assert.equal(noLabel.disallowed, 1);
+});
+
+test('cross-origin planner deduplicates, skips visited, and enforces the cap', () => {
+  const currentUrl = 'https://creator.example/';
+  const plan = planRenderedCrossOriginEnqueues({
+    candidates: [
+      { url: 'https://linktr.ee/creator', text: 'Links' },
+      { url: 'https://linktr.ee/creator', text: 'Links again' },
+      { url: 'https://seen.example/join', text: 'Join the community' },
+      { url: 'https://linktr.ee/other', text: 'Links' },
+      { url: 'https://linktr.ee/third', text: 'Links' },
+      { url: 'https://linktr.ee/fourth', text: 'Links' },
+    ],
+    currentUrl,
+    alreadyVisited: new Set(['https://seen.example/join']),
+    queued: new Set(),
+    maxEnqueues: 2,
+  });
+  assert.deepEqual(plan.admitted, ['https://linktr.ee/creator', 'https://linktr.ee/other']);
+  assert.equal(plan.alreadyVisited, 1);
+  assert.equal(plan.duplicate, 0, 'a URL repeated inside one merged snapshot is deduped, not counted as a queue duplicate');
+  assert.equal(plan.budget, 2);
+});
+
+test('cross-origin planner keeps each snapshot origin for its candidates', () => {
+  // The seed page listed hub.example/community; a click then navigated to
+  // hub.example/home. The saved pre-click link must stay eligible against the
+  // origin that produced it.
+  const candidates = [
+    { url: 'https://hub.example/community', text: 'Join the community', sourceUrl: 'https://seed.example/' },
+  ];
+  const plan = planRenderedCrossOriginEnqueues({
+    candidates,
+    currentUrl: 'https://hub.example/home',
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(plan.admitted, ['https://hub.example/community']);
+  assert.equal(plan.disallowed, 0);
+
+  // Without the snapshot origin, the post-click URL classifies the same link
+  // as same-origin and silently drops it.
+  const withoutOrigin = planRenderedCrossOriginEnqueues({
+    candidates: [{ url: 'https://hub.example/community', text: 'Join the community' }],
+    currentUrl: 'https://hub.example/home',
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(withoutOrigin.admitted, []);
+  assert.equal(withoutOrigin.disallowed, 1);
+});
+
+test('a later strong label admits a URL whose first anchor is weak', () => {
+  const plan = planRenderedCrossOriginEnqueues({
+    candidates: [
+      { url: 'https://outside.example/go', text: 'About', sourceUrl: 'https://creator.example/' },
+      { url: 'https://outside.example/go', text: 'Club', sourceUrl: 'https://creator.example/home' },
+    ],
+    currentUrl: 'https://creator.example/home',
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(plan.admitted, ['https://outside.example/go'], 'the later community label must not be masked');
+  assert.equal(plan.disallowed, 0, 'the destination is decided once, using all labels');
+});
+
+test('merged pre/post-click snapshots count each URL once', () => {
+  const plan = planRenderedCrossOriginEnqueues({
+    candidates: [
+      { url: 'https://outside.example/prices', text: 'Prices', sourceUrl: 'https://creator.example/' },
+      { url: 'https://outside.example/prices', text: 'Prices', sourceUrl: 'https://creator.example/home' },
+      { url: 'https://seen.example/join', text: 'Join the community', sourceUrl: 'https://creator.example/' },
+      { url: 'https://seen.example/join', text: 'Join the community', sourceUrl: 'https://creator.example/home' },
+    ],
+    currentUrl: 'https://creator.example/home',
+    alreadyVisited: new Set(['https://seen.example/join']),
+    queued: new Set(),
+  });
+  assert.equal(plan.disallowed, 1, 'a disallowed URL present in both snapshots is counted once');
+  assert.equal(plan.alreadyVisited, 1, 'an already-visited URL present in both snapshots is counted once');
+});
+
+test('redirect and directory Discord pages still pass the destination policy', () => {
+  const plan = planRenderedCrossOriginEnqueues({
+    candidates: [
+      { url: 'https://discord.gg/Abc123', text: 'Discord' },
+      { url: 'https://discord.com/invite/Abc123', text: 'Discord' },
+      { url: 'https://dsc.gg/creator', text: 'Visit the Discord server' },
+      { url: 'https://discord.me/creator', text: 'Visit the Discord server' },
+      { url: 'https://discord.io/creator', text: 'Visit the Discord server' },
+      { url: 'https://disboard.org/server/123', text: 'Visit the Discord server' },
+    ],
+    currentUrl: 'https://creator.example/',
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(plan.admitted, [
+    'https://dsc.gg/creator',
+    'https://discord.me/creator',
+    'https://discord.io/creator',
+  ]);
+  assert.equal(plan.disallowed, 0);
+  assert.equal(plan.budget, 1, 'the cap is still crawl-wide; the directory page is only budget-limited');
+
+  const directory = planRenderedCrossOriginEnqueues({
+    candidates: [{ url: 'https://disboard.org/server/123', text: 'Visit the Discord server' }],
+    currentUrl: 'https://creator.example/',
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(directory.admitted, ['https://disboard.org/server/123']);
+  assert.equal(directory.disallowed, 0);
+});
+
+test('cross-origin enqueue pass enforces the crawl-wide cap and carries visible text', async () => {
+  const queued = new Set<string>();
+  const batches: string[][] = [];
+  const drops = new Map<string, number>();
+  const run = (candidates: { url: string; text: string }[], currentUrl: string) =>
+    enqueueRenderedCrossOriginPass({
+      collect: async () => candidates,
+      currentUrl,
+      alreadyVisited: new Set(),
+      queued,
+      maxEnqueues: MAX_RENDERED_CROSS_ORIGIN_ENQUEUES - queued.size,
+      enqueue: async urls => { batches.push(urls); },
+      countDrop: (reason, count) => drops.set(reason, (drops.get(reason) || 0) + count),
+    });
+  // An unknown host at `/` is admitted only by its visible community text, so
+  // this also proves the collected label reaches the destination policy.
+  await run([
+    { url: 'https://linktr.ee/creator', text: 'Links' },
+    { url: 'https://community.example/', text: 'Join the private members community' },
+  ], 'https://creator.example/');
+  // The second page repeats one destination, adds a third, then a fourth.
+  // The cap is crawl-wide, so the fourth is never passed to enqueue.
+  await run([
+    { url: 'https://linktr.ee/creator', text: 'Links again' },
+    { url: 'https://linktr.ee/third', text: 'Links' },
+    { url: 'https://linktr.ee/fourth', text: 'Links' },
+    { url: 'https://discord.gg/Abc123', text: 'Discord' },
+  ], 'https://creator.example/page-2');
+  assert.deepEqual(batches, [
+    ['https://linktr.ee/creator', 'https://community.example/'],
+    ['https://linktr.ee/third'],
+  ]);
+  assert.equal(queued.size, 3, 'the crawl-wide queued set stops at three destinations');
+  assert.equal(drops.get('destination-budget'), 1, 'the fourth cross-origin destination is not queued');
+  assert.equal(drops.get('cross-origin-disallowed') ?? 0, 0, 'the Discord invite is silently excluded');
+});
+
+test('Discord destinations do not consume cross-origin budget or policy drops', () => {
+  const plan = planRenderedCrossOriginEnqueues({
+    candidates: [
+      { url: 'https://discord.gg/Abc123', text: 'Discord' },
+      { url: 'https://linktr.ee/creator', text: 'Links' },
+    ],
+    currentUrl: 'https://creator.example/',
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(plan.admitted, ['https://linktr.ee/creator']);
+  assert.equal(plan.disallowed, 0);
+  assert.equal(plan.budget, 0);
+});
+
+test('cross-origin rendered enqueue stays policy- and budget-bounded', () => {
+  const currentUrl = 'https://creator.example/';
+  assert.equal(MAX_RENDERED_CROSS_ORIGIN_ENQUEUES, 3, 'the crawl-wide cap stays small');
+  assert.equal(DEFAULT_BROWSER_FALLBACK_BUDGET.crossOriginEnqueue, undefined, 'P1.6 is opt-in and default OFF');
+  assert.equal(
+    shouldEnqueueRenderedCrossOriginLink({
+      url: 'https://creator.example/community',
+      currentUrl,
+      anchorText: 'Join the community',
+    }),
+    false,
+    'same-origin links stay on the existing same-host hint pass',
+  );
+  assert.equal(
+    shouldEnqueueRenderedCrossOriginLink({
+      url: 'https://linktr.ee/creator',
+      currentUrl,
+      anchorText: 'Links',
+    }),
+    true,
+    'known link-hub hosts are admitted by the shared destination policy',
+  );
+  assert.equal(
+    shouldEnqueueRenderedCrossOriginLink({
+      url: 'https://community.example/join',
+      currentUrl,
+      anchorText: 'Join the private members community',
+    }),
+    true,
+    'strong community evidence can open an unknown host',
+  );
+  assert.equal(
+    shouldEnqueueRenderedCrossOriginLink({
+      url: 'https://random.example/about',
+      currentUrl,
+      anchorText: 'About',
+    }),
+    false,
+    'weak generic labels never open an unknown host',
+  );
+  assert.equal(
+    shouldEnqueueRenderedCrossOriginLink({
+      url: 'https://discord.gg/Abc123',
+      currentUrl,
+      anchorText: 'Discord',
+    }),
+    false,
+    'Discord destinations are invite candidates, not page-budget targets',
+  );
+  assert.equal(
+    shouldEnqueueRenderedCrossOriginLink({
+      url: 'https://169.254.169.254/latest/meta-data/',
+      currentUrl,
+      anchorText: 'Join the community',
+    }),
+    false,
+    'admission-rejected destinations are never enqueued',
+  );
+  assert.equal(
+    shouldEnqueueRenderedCrossOriginLink({ url: 'not a url', currentUrl, anchorText: 'join' }),
+    false,
+  );
+});
+
 test('required-link snapshot follows the seed document across a same-document query change', () => {
   assert.equal(
     isSameSeedDocument(
@@ -966,9 +1215,12 @@ test('outcome classifier source contracts: gap outranks clean resolution and nev
     source,
     /if \(interactionGap\) return \{outcome:'FOUND',failureClass:rendered\.timedOut\?'RENDERED_TIMEOUT':'RENDERED_INTERACTION_GAP',gapRetryable:true\};/,
   );
-  // Required-link coverage never absorbs the gap into a clean absence.
-  assert.match(source, /if \(requiredCovered && !interactionGap && !coverageGap\) return \{outcome:'INSPECTED_NO_MATCH'\};/);
-  assert.match(source, /if\(rendered\.complete&&renderedProcessed&&!interactionGap&&!coverageGap\)return\{outcome:'INSPECTED_NO_MATCH'\};/);
+  // Required-link coverage never absorbs the gap into a clean absence, and the
+  // explicit false is scoped to runs that actually admitted optional
+  // cross-origin work, so flag-off retry/cache behavior is unchanged.
+  assert.match(source, /if \(requiredCovered && !interactionGap && !coverageGap\) return \{outcome:'INSPECTED_NO_MATCH',\.\.\.cleanRetryableOverride\};/);
+  assert.match(source, /if\(rendered\.complete&&renderedProcessed&&!interactionGap&&!coverageGap\)return\{outcome:'INSPECTED_NO_MATCH',\.\.\.cleanRetryableOverride\};/);
+  assert.match(source, /const optionalCrossOriginWork = \(rendered\.crossOriginEnqueued \|\| 0\) > 0;/);
   // Partial/acquisition-failed runs keep the gap class visible for retry.
   assert.match(source, /failureClass:timeoutClass\|\|interactionClass\|\|'RENDERED_PARTIAL_COVERAGE'/);
 });
@@ -1241,4 +1493,63 @@ test('shared rendered evidence stays fail-closed: gapped/timed-out lenders never
     'only complete, non-timed-out, gapless rendered runs are reusable',
   );
   assert.match(source, /const rec=recs&&recs\[0\];if\(!rec\|\|rec\.complete!==true\)return null;/);
+});
+
+test('a failed cross-origin enqueue releases its cap identities for the retry', async () => {
+  const queued = new Set<string>();
+  const batches: string[][] = [];
+  let fail = true;
+  const run = () => enqueueRenderedCrossOriginPass({
+    collect: async () => [
+      { url: 'https://linktr.ee/creator', text: 'Links' },
+      { url: 'https://community.example/', text: 'Join the private members community' },
+    ],
+    currentUrl: 'https://creator.example/',
+    alreadyVisited: new Set(),
+    queued,
+    maxEnqueues: MAX_RENDERED_CROSS_ORIGIN_ENQUEUES - queued.size,
+    enqueue: async urls => {
+      if (fail) throw new Error('enqueue unavailable');
+      batches.push(urls);
+    },
+    countDrop: () => undefined,
+  });
+  await assert.rejects(run, /enqueue unavailable/);
+  assert.equal(queued.size, 0, 'a failed submission must not consume crawl-wide cap identities');
+  fail = false;
+  await run();
+  assert.deepEqual(batches, [
+    ['https://linktr.ee/creator', 'https://community.example/'],
+  ], 'the Crawlee page retry resubmits the same planned destinations');
+  assert.equal(queued.size, 2);
+});
+
+test('cross-origin admission dedupes terminally inspected request and final identities', () => {
+  const base = new Set(['https://seen.example/join']);
+  assert.equal(
+    renderedCrossOriginVisitedIdentities(base, []),
+    base,
+    'with no inspected identities the caller set is reused unchanged',
+  );
+  const combined = renderedCrossOriginVisitedIdentities(base, [
+    'https://hub.example/shortcut',
+    'https://hub.example/community',
+  ]);
+  assert.deepEqual([...combined], [
+    'https://seen.example/join',
+    'https://hub.example/shortcut',
+    'https://hub.example/community',
+  ]);
+  const plan = planRenderedCrossOriginEnqueues({
+    candidates: [
+      { url: 'https://hub.example/community', text: 'Join the community' },
+      { url: 'https://hub.example/other', text: 'Join the community' },
+    ],
+    currentUrl: 'https://creator.example/',
+    alreadyVisited: combined,
+    queued: new Set(),
+  });
+  assert.deepEqual(plan.admitted, ['https://hub.example/other'],
+    'a destination already inspected through its redirect target is not refetched');
+  assert.equal(plan.alreadyVisited, 1);
 });

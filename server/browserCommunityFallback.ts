@@ -1,5 +1,6 @@
 import * as cheerio from 'cheerio';
 import { assessCrawlAdmission } from './communitySurfacePolicy';
+import { shouldFollowDestination, DISCORD_DESTINATION_HOSTS } from './destinationPolicy';
 import { assessPublicDestination, type DnsResolver } from './publicDestination';
 import { candidateFromNativeInvite, extractDiscordCandidates, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
 import { browserLaunchOptions, classifyBrowserFailure, isBrowserRuntimeFailure, markBrowserCapabilityReady, markBrowserCapabilityUnavailable, withBrowserRuntimeLease, type BrowserFailureClass } from './browserCapability';
@@ -54,6 +55,13 @@ export interface BrowserFallbackBudget {
    * Stable across a single page; callers may seed from scan attempts so a
    * retry can examine controls beyond the first budget window. */
   clickOffset?: number;
+  /**
+   * P1.6 (default OFF): allow rendered navigation to enqueue cross-origin
+   * destinations that pass the shared destination policy. The pass is bounded
+   * crawl-wide by MAX_RENDERED_CROSS_ORIGIN_ENQUEUES; same-origin enqueue
+   * behavior is unchanged. Enable only after security review and a canary.
+   */
+  crossOriginEnqueue?: boolean;
   /** Optional resolver for the rendered-tier public-destination guard. The
    * browser path is defense-in-depth: static SSRF blocks must never escalate,
    * and every navigation/subrequest is also checked here. Tests inject a
@@ -302,6 +310,13 @@ export interface BrowserFallbackResult {
    * revealed only after the initial snapshot). Diagnostic, never a gap by
    * itself: newly revealed links classify normally in required coverage. */
   requiredSnapshotExpanded?: boolean;
+  /**
+   * Number of optional cross-origin destinations actually enqueued by this
+   * crawl. Absent when P1.6 is off or nothing was admitted. Outcome
+   * classification only withholds retry from a clean required-covered result
+   * when this is non-zero, so flag-off behavior is unchanged.
+   */
+  crossOriginEnqueued?: number;
 }
 
 export const DEFAULT_BROWSER_FALLBACK_BUDGET: BrowserFallbackBudget = {
@@ -313,6 +328,58 @@ export const DEFAULT_BROWSER_FALLBACK_BUDGET: BrowserFallbackBudget = {
   navigationTimeoutMs: 15_000,
   totalTimeoutMs: 60_000,
 };
+
+/**
+ * P1.6 crawl-wide cap on cross-origin pages enqueued by the rendered tier.
+ * Same-host required links keep the remaining page budget; cross-origin
+ * destinations are optional link-hub/community evidence, never required
+ * obligations. Kept small so one page with many external links cannot consume
+ * the whole rendered crawl.
+ */
+export const MAX_RENDERED_CROSS_ORIGIN_ENQUEUES = 3;
+
+/** Discord destinations are terminal invite candidates, already extracted by
+ * the page scan; enqueueing them would spend navigation budget on a page the
+ * crawler does not need to inspect. The host list lives in destinationPolicy so
+ * the exclusion and the community-platform classification cannot drift. */
+export function isDiscordDestinationUrl(rawUrl: string): boolean {
+  try {
+    const host = new URL(rawUrl).hostname.toLowerCase().replace(/^www\./, '').replace(/\.$/, '');
+    return DISCORD_DESTINATION_HOSTS.some(entry => host === entry || host.endsWith(`.${entry}`));
+  } catch {
+    return false;
+  }
+}
+
+/** Hosts whose `/code` and `/invite/code` paths the page scan retains as
+ * native invite evidence. Redirect shorteners (`dsc.gg`, `discord.me`,
+ * `discord.io`) and directory pages (`disboard.org`) are deliberately absent:
+ * the scan keeps them only as unresolved locators, so they still need a
+ * navigation surface to resolve the invite. */
+const NATIVE_DISCORD_INVITE_HOSTS = new Set(['discord.gg', 'discord.com', 'discordapp.com', 'discord.app']);
+const DISCORD_INVITE_CODE_PATH = /^\/[A-Za-z0-9_-]{2,128}\/?$/;
+const DISCORD_INVITE_PATH = /^\/invite\/[A-Za-z0-9_-]{2,128}\/?$/;
+
+/**
+ * Whether a Discord URL is a native invite the page scan already retained as
+ * terminal evidence. Only these may be skipped by the cross-origin pass; a
+ * redirect shortener or directory page must pass the destination policy so a
+ * JS-added "Visit server" link can still resolve to an invite.
+ */
+export function isNativeDiscordInviteUrl(rawUrl: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+  const host = parsed.hostname.toLowerCase().replace(/^www\./, '').replace(/\.$/, '');
+  const match = [...NATIVE_DISCORD_INVITE_HOSTS].find(entry => host === entry || host.endsWith(`.${entry}`));
+  if (!match) return false;
+  return match === 'discord.gg'
+    ? DISCORD_INVITE_CODE_PATH.test(parsed.pathname)
+    : DISCORD_INVITE_PATH.test(parsed.pathname);
+}
 
 export const COMMUNITY_HINTS = /discord|community|join|chat|member|membership|vip|group|private|trading.?room|links?|social|contact|about|whop|skool|circle|patreon|premium|paid|subscribe|signals?|mentor|access/i;
 
@@ -1400,6 +1467,36 @@ export function isCrossHostnameStructuralNavigation(href: string, pageUrl: strin
 }
 
 /**
+ * P1.6: decide whether an enqueue candidate is a cross-origin destination the
+ * shared destination policy admits. Same-origin candidates are handled by the
+ * existing same-host hint pass and are deliberately rejected here. Discord
+ * destinations are invite candidates, not navigation surfaces, so they stay
+ * out of the rendered page budget. Admission failures and weak/generic labels
+ * never open a new host.
+ */
+export function shouldEnqueueRenderedCrossOriginLink(input: {
+  url: string;
+  currentUrl: string;
+  anchorText?: string;
+}): boolean {
+  let current: URL;
+  let target: URL;
+  try {
+    current = new URL(input.currentUrl);
+    target = new URL(input.url);
+  } catch {
+    return false;
+  }
+  if (target.origin === current.origin) return false;
+  if (isNativeDiscordInviteUrl(target.toString())) return false;
+  return shouldFollowDestination({
+    url: target.toString(),
+    currentUrl: current.toString(),
+    anchorText: input.anchorText || '',
+  }).eligible;
+}
+
+/**
  * Whether an excluded structural anchor is a real navigation-coverage gap.
  *
  * A structural anchor that navigates away is never clicked. It is not a gap
@@ -1410,6 +1507,228 @@ export function isCrossHostnameStructuralNavigation(href: string, pageUrl: strin
  * unexamined navigation. Only a same-origin, admissible, not-yet-visited
  * destination that the hint policy rejects is both un-clicked and un-enqueued.
  */
+export interface RenderedCrossOriginCandidate {
+  url: string;
+  text: string;
+  /**
+   * Page URL where the anchor was observed. The pre-click snapshot keeps the
+   * original document origin even when a later click navigates away; without
+   * it, the post-click URL would wrongly classify the earlier snapshot's
+   * candidates as same-origin.
+   */
+  sourceUrl?: string;
+}
+
+export interface RenderedCrossOriginEnqueuePlan {
+  admitted: string[];
+  alreadyVisited: number;
+  duplicate: number;
+  budget: number;
+  disallowed: number;
+}
+
+/**
+ * Browser-context collection for the P1.6 cross-origin pass. Self-contained:
+ * Playwright serializes this function into the page. Same-origin and
+ * non-HTTP(S) anchors are discarded before the candidate bound, so a page full
+ * of internal navigation cannot crowd out a later cross-origin community link.
+ * Visible text is carried because Crawlee's enqueueLinks exposes only hrefs.
+ */
+export function collectRenderedCrossOriginCandidates(
+  nodes: Element[],
+  currentUrl: string,
+  limit = 500,
+): RenderedCrossOriginCandidate[] {
+  const candidates: RenderedCrossOriginCandidate[] = [];
+  let currentOrigin = '';
+  try {
+    currentOrigin = new URL(currentUrl).origin;
+  } catch {
+    return candidates;
+  }
+  for (const node of nodes) {
+    if (candidates.length >= limit) break;
+    const anchor = node as HTMLAnchorElement;
+    // SVG anchors expose `href` as an `SVGAnimatedString`, so read the string
+    // attribute first and resolve it against the document base URL. Falling
+    // straight through to `anchor.href` would throw for SVG and silently drop
+    // a real community link.
+    const attrHref = typeof anchor.getAttribute === 'function' ? (anchor.getAttribute('href') || '') : '';
+    const rawHref = attrHref || (typeof anchor.href === 'string' ? anchor.href : '');
+    let target: URL;
+    try {
+      target = new URL(rawHref, document.baseURI);
+    } catch {
+      continue;
+    }
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') continue;
+    if (target.origin === currentOrigin) continue;
+    candidates.push({
+      url: target.toString(),
+      text: (anchor.textContent || '').trim().slice(0, 200),
+      sourceUrl: currentUrl,
+    });
+  }
+  return candidates;
+}
+
+/**
+ * P1.6 planner: pair each discovered URL with its visible anchor text before
+ * the destination policy runs. Crawlee's enqueueLinks only carries hrefs, so
+ * a transformRequestFunction cannot see the label that the policy needs for
+ * generic-path community links. Bounded input, one pass, no mutation of the
+ * caller's visited/queued sets. The caller publishes the counts through the
+ * existing closed drop reasons.
+ */
+export function planRenderedCrossOriginEnqueues(input: {
+  candidates: readonly RenderedCrossOriginCandidate[];
+  currentUrl: string;
+  alreadyVisited: ReadonlySet<string>;
+  queued: ReadonlySet<string>;
+  maxEnqueues?: number;
+}): RenderedCrossOriginEnqueuePlan {
+  const remaining = Math.max(0, Math.min(
+    input.maxEnqueues === undefined ? MAX_RENDERED_CROSS_ORIGIN_ENQUEUES : input.maxEnqueues,
+    MAX_RENDERED_CROSS_ORIGIN_ENQUEUES,
+  ));
+  const plan: RenderedCrossOriginEnqueuePlan = {
+    admitted: [],
+    alreadyVisited: 0,
+    duplicate: 0,
+    budget: 0,
+    disallowed: 0,
+  };
+  const planned = new Set<string>();
+  // The pre-click and post-click snapshots overlap: merge them by URL before
+  // accounting so an anchor present in both is not counted twice in drop
+  // telemetry (canary monitoring reads these counters). All labels for a URL
+  // are kept and evaluated together: a weak first anchor ("About") must not
+  // hide a later community label ("Club") for the same destination. The first
+  // occurrence wins for ordering and therefore preserves the pre-click
+  // discovery origin.
+  const grouped = new Map<string, { url: string; labels: string[]; sourceUrl?: string }>();
+  const order: string[] = [];
+  for (const candidate of input.candidates) {
+    const url = String(candidate.url || '').trim();
+    if (!url) {
+      plan.disallowed++;
+      continue;
+    }
+    const visitKey = normalizeVisitUrl(url) || url;
+    const existing = grouped.get(visitKey);
+    if (existing) {
+      const label = String(candidate.text || '').trim();
+      if (label) existing.labels.push(label);
+      continue;
+    }
+    grouped.set(visitKey, {
+      url,
+      labels: String(candidate.text || '').trim() ? [String(candidate.text || '').trim()] : [],
+      sourceUrl: candidate.sourceUrl,
+    });
+    order.push(visitKey);
+  }
+  for (const visitKey of order) {
+    const candidate = grouped.get(visitKey)!;
+    const url = candidate.url;
+    // Native invite URLs are terminal evidence retained by the page scan, not
+    // navigation surfaces. Skip only those before accounting: redirect
+    // shorteners and directory pages carry no native code, so they must pass
+    // the destination policy to be resolved through a click/enqueue.
+    if (isNativeDiscordInviteUrl(url)) continue;
+    if (input.alreadyVisited.has(visitKey)) {
+      plan.alreadyVisited++;
+      continue;
+    }
+    if (input.queued.has(visitKey) || planned.has(visitKey)) {
+      plan.duplicate++;
+      continue;
+    }
+    if (plan.admitted.length >= remaining) {
+      plan.budget++;
+      continue;
+    }
+    if (!shouldEnqueueRenderedCrossOriginLink({
+      url,
+      // Each candidate keeps the origin of the document that produced it. A
+      // click that navigates to another page must not retroactively make the
+      // pre-click snapshot's cross-origin links look same-origin.
+      currentUrl: String(candidate.sourceUrl || input.currentUrl),
+      anchorText: candidate.labels.join(' '),
+    })) {
+      plan.disallowed++;
+      continue;
+    }
+    planned.add(visitKey);
+    plan.admitted.push(url);
+  }
+  return plan;
+}
+
+/**
+ * P1.6 enqueue pass. Extracted from the request handler so the crawl-wide cap,
+ * duplicate handling across pages/passes, visible-label plumbing, and the
+ * actual `enqueue` call are exercised without a cross-origin network fixture.
+ * The caller owns the queued set: it must contain every URL already enqueued
+ * by earlier passes, which is what makes the cap crawl-wide.
+ */
+export async function enqueueRenderedCrossOriginPass(input: {
+  collect: () => Promise<RenderedCrossOriginCandidate[]>;
+  currentUrl: string;
+  alreadyVisited: ReadonlySet<string>;
+  queued: Set<string>;
+  maxEnqueues?: number;
+  enqueue: (urls: string[]) => Promise<void>;
+  countDrop: (reason: 'already-visited' | 'destination-budget' | 'cross-origin-disallowed', count: number) => void;
+}): Promise<void> {
+  let candidates: RenderedCrossOriginCandidate[] = [];
+  try {
+    candidates = await input.collect();
+  } catch {
+    // A control may have replaced or detached the document between the click
+    // loop and this pass. Enqueueing nothing is safe; the post-click same-host
+    // pass has already run.
+    return;
+  }
+  const plan = planRenderedCrossOriginEnqueues({
+    candidates,
+    currentUrl: input.currentUrl,
+    alreadyVisited: input.alreadyVisited,
+    queued: input.queued,
+    maxEnqueues: input.maxEnqueues,
+  });
+  if (plan.alreadyVisited) input.countDrop('already-visited', plan.alreadyVisited);
+  if (plan.budget) input.countDrop('destination-budget', plan.budget);
+  if (plan.disallowed) input.countDrop('cross-origin-disallowed', plan.disallowed);
+  if (!plan.admitted.length) return;
+  // Commit the cap identities only after the submission succeeds. A failed
+  // enqueue throws out of the request handler; Crawlee then retries the page
+  // with this same crawl-wide set. Recording the URLs before the await would
+  // make the retry classify them as duplicates and never resubmit them. A
+  // partial submission is safe to replay: Crawlee's request queue dedupes
+  // already-queued unique keys.
+  await input.enqueue(plan.admitted);
+  for (const url of plan.admitted) {
+    input.queued.add(normalizeVisitUrl(url) || url);
+  }
+}
+
+/**
+ * Identities the cross-origin planner must not re-enqueue: externally supplied
+ * already-visited URLs plus every request/final-page identity this crawl has
+ * terminally inspected. Without the final identity, a queued shortcut that
+ * redirects to a destination later linked directly would spend a second page
+ * slot inspecting the same page.
+ */
+export function renderedCrossOriginVisitedIdentities(
+  alreadyVisited: ReadonlySet<string>,
+  terminalSuccessUrls: Iterable<string>,
+): ReadonlySet<string> {
+  const inspected = [...terminalSuccessUrls];
+  if (!inspected.length) return alreadyVisited;
+  return new Set([...alreadyVisited, ...inspected]);
+}
+
 export function isUnrecoveredStructuralNavigation(
   href: string,
   pageUrl: string,
@@ -2801,6 +3120,14 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   // (a structural link back to them is not an unexamined destination). They
   // become successful coverage evidence only after the full handler succeeds.
   const structuralVisitedKeys = new Set(alreadyVisitedSet);
+  // P1.6 cross-origin enqueue identities, bounded crawl-wide. Stored
+  // separately from alreadyVisitedSet: an enqueued destination is not yet
+  // inspected, so it must not satisfy required coverage.
+  const crossOriginQueued = new Set<string>();
+  // Count of optional cross-origin requests actually submitted. Used only to
+  // scope the clean-negative retry suppression to runs where P1.6 admitted
+  // work, so flag-off retry/cache behavior is unchanged.
+  let crossOriginEnqueued = 0;
   const discovered:DiscordCandidate[]=[];
   const hostKey = (rawUrl: string): string => {
     try { return new URL(rawUrl).hostname.toLowerCase().replace(/^www\\./, '') || 'unknown'; }
@@ -2960,6 +3287,12 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             await waitForHostBackoff(request.url, remainingMs);
             if (Date.now() - startedAt >= limits.totalTimeoutMs) return;
             telemetry.requestsStarted++;
+            // A P1.6 cross-origin request is optional third-party evidence.
+            // Its own same-host hint passes are skipped: otherwise an admitted
+            // link hub or platform page could enqueue an uncapped number of
+            // its own hint links, consuming maxPages beyond the crawl-wide
+            // cross-origin cap. Its bounded cross-origin pass still runs.
+            const crossOriginRequest = (request.userData as { crossOrigin?: unknown } | undefined)?.crossOrigin === true;
             // A retry replaces the failed attempt's uncertified mark: this
             // attempt re-examines the page from its first control.
             uncertifiedRequestKeys.delete(request.url);
@@ -3400,8 +3733,47 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // (JS-revealed links), so both DOM states contribute; queue
             // dedupe makes repeats free. Hint-rejected double counts across
             // the two passes are bounded diagnostic noise (≤1 extra pass).
-            if (Date.now() - startedAt < limits.totalTimeoutMs) {
+            const collectCrossOriginCandidates = async (): Promise<RenderedCrossOriginCandidate[]> =>
+              page.$$eval('a[href]', collectRenderedCrossOriginCandidates, page.url())
+                .catch(() => [] as RenderedCrossOriginCandidate[]);
+            let preClickCrossOriginCandidates: RenderedCrossOriginCandidate[] = [];
+            const enqueueCrossOrigin = async (): Promise<void> => {
+              if (!limits.crossOriginEnqueue || Date.now() - startedAt >= limits.totalTimeoutMs) return;
+              // Post-click candidates are collected against the current document
+              // and merged with the pre-click snapshot, so a click that replaced
+              // the document loses neither set. Both were captured before this
+              // submission, which runs only after the post-click same-host pass.
+              const postClickCandidates = await collectCrossOriginCandidates();
+              await enqueueRenderedCrossOriginPass({
+                // Crawlee's enqueueLinks exposes only hrefs to its transform
+                // hook. Collect bounded href+visible-text pairs, filtering
+                // same-origin/non-HTTP(S) anchors before the bound so internal
+                // navigation cannot hide a cross-origin community link.
+                collect: async () => [...preClickCrossOriginCandidates, ...postClickCandidates],
+                currentUrl: page.url(),
+                alreadyVisited: renderedCrossOriginVisitedIdentities(alreadyVisitedSet, terminalSuccessUrls),
+                queued: crossOriginQueued,
+                maxEnqueues: MAX_RENDERED_CROSS_ORIGIN_ENQUEUES - crossOriginQueued.size,
+                enqueue: async urls => {
+                  // Tag optional third-party pages so their handler skips the
+                  // uncapped same-host hint passes (the crawl-wide cap bounds
+                  // the whole optional branch, not just the first hop).
+                  await enqueueLinks({ urls, strategy: 'all', userData: { crossOrigin: true } });
+                  crossOriginEnqueued += urls.length;
+                },
+                countDrop: (reason, count) => drops.count(reason, count),
+              });
+            };
+            if (!crossOriginRequest && Date.now() - startedAt < limits.totalTimeoutMs) {
               await enqueueLinks({ strategy: 'same-hostname', transformRequestFunction: req => (admitEnqueueRequest(req.url) ? req : false) });
+            }
+            // P1.6: opt-in, bounded cross-origin pass. The anchors are captured
+            // before any click can replace the document, but submission is
+            // deferred until after the post-click same-host pass so optional
+            // destinations never take queue positions ahead of JS-revealed
+            // required links.
+            if (limits.crossOriginEnqueue) {
+              preClickCrossOriginCandidates = await collectCrossOriginCandidates();
             }
 
             // A popup control that opens a new window has not been examined:
@@ -3504,9 +3876,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // each processed page exposed.
             aggregatePageControlCounters();
 
-            if (Date.now() - startedAt < limits.totalTimeoutMs) {
+            if (!crossOriginRequest && Date.now() - startedAt < limits.totalTimeoutMs) {
               await enqueueLinks({strategy:'same-hostname',transformRequestFunction:req=>(admitEnqueueRequest(req.url)?req:false)});
             }
+            await enqueueCrossOrigin();
             // Required-set re-snapshot (coverage certificate): links revealed by
             // scrolling or by the click passes are obligations too. Recompute
             // the seed document's same-host community-hint links after all
@@ -3701,6 +4074,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           failureClass:completion.failureClass,
           telemetry,
           dropReasons:drops.snapshot(),
+          crossOriginEnqueued: crossOriginEnqueued || undefined,
           visitedUrls: terminalSuccessUrls.length ? [...terminalSuccessUrls] : undefined,
           pageHintLinks: (() => {
             const record: Record<string, string[]> = {};

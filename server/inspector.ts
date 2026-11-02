@@ -1048,8 +1048,15 @@ export function renderedAcquisitionOutcome(rendered:BrowserFallbackResult,render
   // Required-link coverage never absorbs an interaction or navigation-coverage
   // gap: a click-only control or an unexamined policy/context surface could
   // still be holding the invite. Only a genuinely COMPLETE run is clean.
-  if (requiredCovered && !interactionGap && !coverageGap) return {outcome:'INSPECTED_NO_MATCH'};
-  if(rendered.complete&&renderedProcessed&&!interactionGap&&!coverageGap)return{outcome:'INSPECTED_NO_MATCH'};
+  // Optional P1.6 cross-origin work that is still queued or failed must not
+  // make a clean negative retryable (or shorten its site-inspection cache from
+  // 30 days to 24 hours), so retry is withheld only when the producer recorded
+  // admitted cross-origin work. With the flag off the legacy fallback
+  // (`rendered.retryable || !renderedProcessed`) is preserved exactly.
+  const optionalCrossOriginWork = (rendered.crossOriginEnqueued || 0) > 0;
+  const cleanRetryableOverride = optionalCrossOriginWork ? { gapRetryable: false } : {};
+  if (requiredCovered && !interactionGap && !coverageGap) return {outcome:'INSPECTED_NO_MATCH',...cleanRetryableOverride};
+  if(rendered.complete&&renderedProcessed&&!interactionGap&&!coverageGap)return{outcome:'INSPECTED_NO_MATCH',...cleanRetryableOverride};
   if (hasUnvisited) return{outcome:'PARTIALLY_INSPECTED',failureClass:'REQUIRED_UNVISITED_BUDGET_GAP',gapRetryable:true};
   // An unexamined control outranks a permanent-only required failure: the
   // blocked link cannot own retry work, but content hidden behind a failed or
