@@ -975,9 +975,14 @@ test('v2 review: scheduler and worker wiring call sites are pinned', () => {
   const fallback = readFileSync(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8');
   // Capture the original page's anchors before any control click can navigate
   // the document away; the post-click enqueue then covers JS-revealed links.
-  const enqueuePos = fallback.indexOf("await enqueueLinks({ strategy: 'same-hostname'");
+  assert.match(
+    fallback,
+    /const enqueueSameHostHints = async \(\): Promise<void> => \{[\s\S]*?strategy: 'same-hostname'/,
+    'the shared helper keeps the same-hostname enqueue rule',
+  );
+  const enqueuePos = fallback.indexOf('await enqueueSameHostHints();');
   const clickPos = fallback.indexOf('const clickLoop = await runRenderedClickLoop({');
-  const postClickEnqueuePos = fallback.indexOf("await enqueueLinks({strategy:'same-hostname'", clickPos);
+  const postClickEnqueuePos = fallback.indexOf('await enqueueSameHostHints();', clickPos);
   assert.ok(enqueuePos !== -1 && clickPos !== -1 && enqueuePos < clickPos, 'anchors enqueue before navigating clicks');
   assert.ok(postClickEnqueuePos > clickPos, 'JS-revealed anchors enqueue after clicks');
 });

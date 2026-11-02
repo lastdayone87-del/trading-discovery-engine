@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { DEFAULT_BROWSER_FALLBACK_BUDGET, MAX_RENDERED_CROSS_ORIGIN_ENQUEUES, combineRenderedControlOffsetAdvances, isNavigableOnlyControlWindow, isSameSeedDocument, isUnrecoveredStructuralNavigation, planRenderedCrossOriginEnqueues, planRevealedRenderedClickTargets, planRevealedSameOriginEnqueues, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, resolveRenderedCompletionState, runRenderedClickLoop, shouldEnqueueRenderedCrossOriginLink, type RenderedControlEnumeration } from './browserCommunityFallback';
+import { DEFAULT_BROWSER_FALLBACK_BUDGET, MAX_RENDERED_CROSS_ORIGIN_ENQUEUES, combineRenderedControlOffsetAdvances, countPursuableRenderedOverflow, isNavigableOnlyControlWindow, isSameSeedDocument, isSkippableNavigableAnchorClick, isUnrecoveredStructuralNavigation, planRenderedCrossOriginEnqueues, planRevealedRenderedClickTargets, planRevealedSameOriginEnqueues, partitionRenderedClickTargets, remainingRenderedClickBudget, renderedClickOffsetAdvance, resolveRenderedCompletionState, runRenderedClickLoop, shouldEnqueueRenderedCrossOriginLink, type RenderedControlEnumeration } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -528,6 +528,60 @@ test('cross-origin planner deduplicates, skips visited, and enforces the cap', (
   assert.equal(rejected.budget, 0);
 });
 
+test('collector overflow counts only policy-pursuable destinations', () => {
+  const currentUrl = 'https://creator.example/';
+  const overflow = [
+    { url: 'https://outside.test/privacy', text: 'Privacy policy' },
+    { url: 'https://outside.test/sponsor', text: 'Sponsored partner' },
+    { url: 'https://linktr.ee/creator', text: 'All my links' },
+    { url: 'https://discord.gg/Abc123', text: 'Join Discord' },
+    { url: 'https://discord.com/users/123456789', text: 'Discord profile' },
+    { url: 'https://creator.example/community', text: 'Join the community' },
+  ];
+  assert.equal(
+    countPursuableRenderedOverflow(overflow, currentUrl),
+    2,
+    'only the aggregator hub and the direct Discord invite stay unexamined navigation',
+  );
+  assert.equal(
+    countPursuableRenderedOverflow([{ url: 'https://outside.test/privacy', text: 'Privacy policy' }], currentUrl),
+    0,
+    'a page of unrelated vendor links must not become BOUNDED through collector overflow',
+  );
+});
+
+test('cross-origin clicks are skipped only while the destination pass pursues them', () => {
+  const pageUrl = 'https://creator.example/';
+  const aggregator = { href: 'https://linktr.ee/creator', text: 'All my links' };
+  const vendor = { href: 'https://outside.test/privacy', text: 'Privacy policy' };
+  const discord = { href: 'https://discord.gg/Abc123', text: 'Join Discord' };
+  assert.equal(
+    isSkippableNavigableAnchorClick(aggregator, pageUrl, { crossOriginPursued: true }),
+    true,
+    'the bounded cross-origin pass owns eligible anchors while it has budget',
+  );
+  assert.equal(
+    isSkippableNavigableAnchorClick(aggregator, pageUrl, { crossOriginPursued: false }),
+    false,
+    'with pursuit OFF or its cap exhausted, clicking the aggregator is the only remaining discovery path',
+  );
+  assert.equal(
+    isSkippableNavigableAnchorClick(vendor, pageUrl, { crossOriginPursued: false }),
+    true,
+    'policy-irrelevant vendor links stay skipped even without pursuit',
+  );
+  assert.equal(
+    isSkippableNavigableAnchorClick(discord, pageUrl, { crossOriginPursued: false }),
+    true,
+    'a direct Discord invite is terminal evidence and is never clicked',
+  );
+  assert.equal(
+    isSkippableNavigableAnchorClick(aggregator, pageUrl),
+    true,
+    'omitting the option preserves the legacy cross-host skip for unaffected callers',
+  );
+});
+
 test('cross-origin rendered enqueue stays policy- and budget-bounded', () => {
   const currentUrl = 'https://creator.example/';
   assert.equal(MAX_RENDERED_CROSS_ORIGIN_ENQUEUES, 3, 'the crawl-wide cap stays small');
@@ -781,9 +835,9 @@ test('rendered control coverage counts overflow and uses stable markers across D
   assert.match(source, /const evaluationWindow = rotated\.slice\(0, windowSize\)/, 'the evaluation window is applied after rotating the full matched pool');
   assert.match(source, /recordControlEnumeration\(firstEnumeration\)/);
   assert.match(source, /data-oc-control/);
-  assert.match(source, /partitionRenderedClickTargets\(controls, page\.url\(\), limits\.maxClicksPerPage, limits\.clickOffset\)/, 'the retry offset rotates the full pool before the cap');
+  assert.match(source, /partitionRenderedClickTargets\(\s*controls,\s*page\.url\(\),\s*limits\.maxClicksPerPage,\s*limits\.clickOffset,\s*undefined,\s*\{ crossOriginPursued: crossOriginPursuitActive\(\) \},\s*\)/, 'the retry offset rotates the full pool before the cap');
   assert.match(source, /const pendingQueuedTargets = Math\.max\(0, clickTargets\.length - clickIndex - 1\)/, 'queued-but-unclicked controls consume the remaining budget');
-  assert.match(source, /const freshPlan = planRevealedRenderedClickTargets\(\s*unqueued,\s*input\.pageUrl\(\),\s*input\.maxClicksPerPage,\s*clickedThisPage,\s*pendingQueuedTargets,\s*input\.clickOffset,?\s*\)/, 'revealed controls are planned against the truly remaining slots and retry offset');
+  assert.match(source, /const freshPlan = planRevealedRenderedClickTargets\(\s*unqueued,\s*input\.pageUrl\(\),\s*input\.maxClicksPerPage,\s*clickedThisPage,\s*pendingQueuedTargets,\s*input\.clickOffset,\s*\{ crossOriginPursued: [^\n]+ \},?\s*\)/, 'revealed controls are planned against the truly remaining slots and retry offset');
   assert.match(source, /const clickLoop = await runRenderedClickLoop\(\{[\s\S]*?enumerate: enumerateControls,[\s\S]*?onEnumerated: recordControlEnumeration,?\s*\}\);/, 'the handler executes the extracted loop after every click');
   assert.doesNotMatch(source, /clickedThisPage < limits\.maxClicksPerPage && Date\.now\(\) - startedAt < limits\.totalTimeoutMs\) \{/, 'the old final-click guard must not return');
   assert.match(source, /freshDropped\+\+/, 're-enumerated controls beyond the remaining budget are counted as skipped');
@@ -816,7 +870,7 @@ test('interaction-revealed links are captured per click and context counters ref
   const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
   assert.match(
     source,
-    /click: async control => \{[\s\S]*?await captureRevealedSameOrigin\(\);[\s\S]*?return clickOutcome\.ok;/,
+    /click: async control => \{[\s\S]*?const clickOutcome = await attemptRenderedControlClick[\s\S]*?await captureRevealedSameOrigin\(\);[\s\S]*?return clickOutcome\.ok;/,
     'new same-origin destinations are captured after every click, before the next click can replace them',
   );
   assert.match(
@@ -824,9 +878,10 @@ test('interaction-revealed links are captured per click and context counters ref
     /await captureRevealedSameOrigin\(\);\s*if \(revealedScanFailed\)/,
     'the post-loop pass captures scroll-revealed links and reports a failed scan as a gap',
   );
-  assert.match(source, /const linkBaselines = new Map<string, Set<string>>\(\)/);
+  assert.match(source, /const linkBaselines = new Map<string, RenderedLinkBaseline>\(\)/);
   assert.match(source, /baselineKey = documentBaselineKey\(identity, currentUrl\)/, 'link comparisons are scoped to the current document identity');
-  assert.match(source, /if \(!baseline\) \{[\s\S]*?linkBaselines\.set\(baselineKey, baseline\);[\s\S]*?return;/, 'a clicked-to document establishes its own static baseline');
+  assert.match(source, /if \(!baseline\) \{[\s\S]*?linkBaselines\.set\(baselineKey, buildRenderedLinkBaseline\(revealedCollection\)\);[\s\S]*?return;/, 'a clicked-to document establishes its own static baseline');
+  assert.match(source, /for \(let i = 0; i < limits\.maxScrollsPerPage[\s\S]*?await captureBaseline\(\);/, 'the baseline is captured after the scroll loop');
   assert.match(source, /await recordPageContext\(\);\s*await recordDeclarativeShadowScan\(\);/, 'context counters refresh after the click loop');
   assert.match(source, /await recordPageContext\(\);/, 'context counters also refresh after scrolling');
   assert.match(

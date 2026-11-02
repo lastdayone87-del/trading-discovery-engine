@@ -305,14 +305,48 @@ test('safe telemetry round-trips P0.2 navigation-coverage fields on rendered row
     mode: 'STATIC',
     pagesInspected: 1,
     controlsEnumeratedTotal: 5,
+    controlsHintRejected: 2,
+    controlsStructuralNavigation: 1,
+    controlsStructuralHintRejected: 1,
+    controlsStructuralDisclosure: 1,
+    controlsStructuralUnrecovered: 1,
+    controlsIconLabelRecovered: 1,
+    popupTargets: 1,
+    popupCaptured: 1,
+    popupDestinationsDropped: 1,
+    revealedSameOriginAdmitted: 1,
+    revealedSameOriginDropped: 1,
+    opaqueInteractiveControls: 1,
     frameCount: 1,
+    shadowRootCount: 1,
+    closedShadowRootCount: 1,
+    declarativeClosedShadowRootCount: 1,
+    declarativeShadowScanGap: 1,
+    candidateCapTruncated: 1,
     baseHrefPresent: true,
     scrollCapReachedStillGrowing: true,
     navigationPolicyExcluded: { 'admission-rejected': 1 },
     coverageReason: 'COMPLETE',
   });
   assert.equal(staticRow?.controlsEnumeratedTotal, undefined);
+  assert.equal(staticRow?.controlsHintRejected, undefined);
+  assert.equal(staticRow?.controlsStructuralNavigation, undefined);
+  assert.equal(staticRow?.controlsStructuralHintRejected, undefined);
+  assert.equal(staticRow?.controlsStructuralDisclosure, undefined);
+  assert.equal(staticRow?.controlsStructuralUnrecovered, undefined);
+  assert.equal(staticRow?.controlsIconLabelRecovered, undefined);
+  assert.equal(staticRow?.popupTargets, undefined);
+  assert.equal(staticRow?.popupCaptured, undefined);
+  assert.equal(staticRow?.popupDestinationsDropped, undefined);
+  assert.equal(staticRow?.revealedSameOriginAdmitted, undefined);
+  assert.equal(staticRow?.revealedSameOriginDropped, undefined);
+  assert.equal(staticRow?.opaqueInteractiveControls, undefined);
   assert.equal(staticRow?.frameCount, undefined);
+  assert.equal(staticRow?.shadowRootCount, undefined);
+  assert.equal(staticRow?.closedShadowRootCount, undefined);
+  assert.equal(staticRow?.declarativeClosedShadowRootCount, undefined);
+  assert.equal(staticRow?.declarativeShadowScanGap, undefined);
+  assert.equal(staticRow?.candidateCapTruncated, undefined);
   assert.equal(staticRow?.baseHrefPresent, undefined);
   assert.equal(staticRow?.scrollCapReachedStillGrowing, undefined);
   assert.equal(staticRow?.navigationPolicyExcluded, undefined);

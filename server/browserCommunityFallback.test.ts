@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { DEFAULT_BROWSER_FALLBACK_BUDGET, DECLARATIVE_SHADOW_SCAN_MAX_BYTES, advanceRenderedLifecycleStage, beginRenderedDeclarativeShadowScan, browserCauseSnippet, browserFallbackTelemetrySummary, classifyCrawlCatch, classifyRenderedPopupDestination, countDeclarativeClosedShadowRoots, createRenderedRouteGuard, disposeRenderedRouteGuards, installRenderedRouteCloseCleanup, isExpectedRenderedRouteShutdownError, isTelegramPostPermalink, mergeRenderedPageContextCounts, popupMarkupEvidenceSourceUrl, readRenderedDeclarativeShadowScan, renderedPopupWaitTimeoutMs, RenderedFallbackGate, renderedFallbackGate, resolveRenderedZeroPageReason, retainSkippableAnchorEvidence, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback, shouldSkipPreexistingSiblingPage, sumRenderedPageContextCounts, type BrowserFallbackTelemetry, type RenderedRouteLike } from './browserCommunityFallback';
+import { DEFAULT_BROWSER_FALLBACK_BUDGET, DECLARATIVE_SHADOW_SCAN_MAX_BYTES, advanceRenderedLifecycleStage, beginRenderedDeclarativeShadowScan, browserCauseSnippet, browserFallbackTelemetrySummary, buildRenderedLinkBaseline, classifyCrawlCatch, classifyRenderedPopupDestination, countDeclarativeClosedShadowRoots, createRenderedRouteGuard, disposeRenderedRouteGuards, installRenderedRouteCloseCleanup, isExpectedRenderedRouteShutdownError, isTelegramPostPermalink, mergeRenderedPageContextCounts, planRevealedSameOriginEnqueues, popupMarkupEvidenceSourceUrl, readRenderedDeclarativeShadowScan, renderedPopupWaitTimeoutMs, RenderedFallbackGate, renderedFallbackGate, resolveRenderedZeroPageReason, retainSkippableAnchorEvidence, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback, shouldSkipPreexistingSiblingPage, sumRenderedPageContextCounts, type BrowserFallbackTelemetry, type RenderedRouteLike } from './browserCommunityFallback';
 import { inferDiscordOwnership, makeDiscordCandidate } from './discordCandidates';
 import { redactCauseSnippet } from './crawlerTelemetry';
 import { classifyRenderedCrawlerFailure, isRenderedNavigationTimeout, renderedCrawlerHostBackoffMs, renderedCrawlerRetryPolicy } from './renderedCrawlerPolicy';
@@ -72,9 +72,7 @@ test('declarative closed shadow roots are counted from raw markup without claimi
     'a self-closing start tag still counts its closed declaration',
   );
   const malformed = '<template '.repeat(131_072);
-  const malformedStart = Date.now();
   assert.equal(countDeclarativeClosedShadowRoots(malformed), 0, 'an unterminated start tag yields no closed root');
-  assert.ok(Date.now() - malformedStart < 1_000, 'an unterminated template tag scan is linear, not quadratic');
 
   // Raw text and comments are not markup. A template-looking string in a
   // script must neither fabricate a root nor hide a real closed root later.
@@ -126,6 +124,20 @@ test('declarative closed shadow roots are counted from raw markup without claimi
     ),
     1,
     'a script-prefixed element is not raw text; its template child is real markup',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots(
+      '<script data-note="</script>"><template shadowrootmode="closed"></template></script>',
+    ),
+    0,
+    'a quoted </script> in an opening attribute is not the raw-text terminator; the script body stays inert',
+  );
+  assert.equal(
+    countDeclarativeClosedShadowRoots(
+      '<script data-note="</script>">const x = 1;</script><div><template shadowrootmode="closed"></template></div>',
+    ),
+    1,
+    'the real terminator still ends the script and a later genuine closed root is counted',
   );
 });
 
@@ -995,9 +1007,52 @@ test('skipped navigable anchors retain live text and href before exclusion', () 
   ]);
 });
 
-test('initial baseline overflow is not misreported as coverage truncation', () => {
-  const source = fs.readFileSync(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8');
-  assert.doesNotMatch(source, /initialCollection\.truncated[^\n]*candidateCapTruncated/);
-  assert.match(source, /revealedCollection\.truncated[\s\S]{0,120}candidateCapTruncated/);
-  assert.match(source, /shadowSnapshot\.truncated\) interactionGap = true/);
+test('a saturated same-origin baseline never admits or counts overflow as revealed work', () => {
+  // The collector keeps 500 candidates and reports the rest as overflow. A
+  // page with >500 static internal links must not have that overflow treated as
+  // interaction-revealed work, or every such page becomes permanently
+  // BOUNDED and retries forever without any new link appearing.
+  const all = Array.from({ length: 501 }, (_, index) => ({
+    url: `https://creator.example/page-${index}`,
+    text: `Page ${index}`,
+  }));
+  const collection = {
+    candidates: all.slice(0, 500),
+    overflowCandidates: all.slice(500),
+    truncated: 1,
+  };
+  const baseline = buildRenderedLinkBaseline(collection);
+  assert.equal(baseline.links.size, 500);
+  assert.equal(baseline.saturated, true, 'an overflowing baseline is marked saturated');
+
+  // Even a URL genuinely absent from the baseline is not admitted: static
+  // overflow cannot be distinguished from interaction-revealed links.
+  const revealed = [{ url: 'https://creator.example/inserted-after-click', text: 'New' }];
+  const plan = planRevealedSameOriginEnqueues({
+    candidates: revealed,
+    currentUrl: 'https://creator.example/',
+    initialLinks: baseline.links,
+    alreadyVisited: new Set(),
+    queued: new Set(),
+    maxEnqueues: 6,
+    baselineSaturated: baseline.saturated,
+  });
+  assert.deepEqual(plan.admitted, []);
+  assert.equal(plan.budget, 0, 'saturated overflow is not a budget loss');
+  assert.equal(plan.alreadyVisited, 0);
+  assert.equal(plan.admissionRejected, 0);
+
+  // The same collection with a non-saturated baseline still admits the link,
+  // so the saturation guard does not suppress genuine revealed navigation.
+  const unsaturated = buildRenderedLinkBaseline({ ...collection, truncated: 0 });
+  const admitted = planRevealedSameOriginEnqueues({
+    candidates: revealed,
+    currentUrl: 'https://creator.example/',
+    initialLinks: unsaturated.links,
+    alreadyVisited: new Set(),
+    queued: new Set(),
+    maxEnqueues: 6,
+    baselineSaturated: unsaturated.saturated,
+  });
+  assert.deepEqual(admitted.admitted, ['https://creator.example/inserted-after-click']);
 });

@@ -631,7 +631,7 @@ test('real DOM: empty fragment anchors and hidden/disabled widgets are not opaqu
   });
 });
 
-test('real DOM: open-shadow walker reports truncation only when a seen host may be hidden', { skip: process.platform === 'android', timeout: 30_000 }, async () => {
+test('real DOM: open-shadow walker reports truncation when the light-DOM walk is cut short', { skip: process.platform === 'android', timeout: 30_000 }, async () => {
   await withControlPage('<!doctype html><html><body><div id="fill"></div></body></html>', async (page) => {
     await page.evaluate(() => {
       // Put a host first, then enough light-DOM elements to cut the walk
@@ -652,7 +652,7 @@ test('real DOM: open-shadow walker reports truncation only when a seen host may 
   });
 });
 
-test('real DOM: a large host-free page is not a permanent interaction gap', { skip: process.platform === 'android', timeout: 30_000 }, async () => {
+test('real DOM: a large page cut short is never certified host-free', { skip: process.platform === 'android', timeout: 30_000 }, async () => {
   await withControlPage('<!doctype html><html><body><div id="fill"></div></body></html>', async (page) => {
     await page.evaluate(() => {
       const fill = document.getElementById('fill');
@@ -662,7 +662,29 @@ test('real DOM: a large host-free page is not a permanent interaction gap', { sk
       fill.appendChild(fragment);
     });
     const snapshot = await page.evaluate(collectRenderedOpenShadowContent);
-    assert.equal(snapshot.truncated, false,
-      'an ordinary large page without shadow roots can still resolve as a clean absence');
+    assert.equal(snapshot.truncated, true,
+      'the first shadow host can appear beyond the element bound, so an ordinary large page is partial, not a clean absence');
+  });
+});
+
+test('real DOM: the only shadow host after the element bound still reports a gap', { skip: process.platform === 'android', timeout: 30_000 }, async () => {
+  await withControlPage('<!doctype html><html><body><div id="fill"></div></body></html>', async (page) => {
+    await page.evaluate(() => {
+      const fill = document.getElementById('fill');
+      if (!fill) return;
+      const fragment = document.createDocumentFragment();
+      for (let index = 0; index < 50_001; index++) fragment.appendChild(document.createElement('div'));
+      fill.appendChild(fragment);
+      // First (and only) host sits after the 50,000-element discovery bound,
+      // and its invite exists only in the open root. page.content() cannot see
+      // it, so the walker must report truncation rather than clean absence.
+      const host = document.createElement('div');
+      document.body.appendChild(host);
+      host.attachShadow({ mode: 'open' }).innerHTML = '<a href="https://discord.gg/LATE-BOUND">Late invite</a>';
+    });
+    const snapshot = await page.evaluate(collectRenderedOpenShadowContent);
+    assert.equal(snapshot.truncated, true, 'host discovery stopped before the document ended');
+    assert.equal(snapshot.hrefs.some(href => href.includes('LATE-BOUND')), false,
+      'the post-bound invite is not read; the truncation flag is what keeps coverage honest');
   });
 });
