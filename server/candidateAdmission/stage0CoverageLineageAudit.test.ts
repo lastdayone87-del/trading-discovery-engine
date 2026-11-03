@@ -44,3 +44,10 @@ test('audit source is read-only and exact-diagnostic recovery is diagnostic-scop
   assert.match(source, /servingAuthority: false/);
   assert.match(source, /automaticPromotion: false/);
 });
+
+test('operator-visible lineage SQL compares canonical country identity on both operands', () => {
+  const source = readFileSync(new URL('./stage0CoverageLineageAudit.ts', import.meta.url), 'utf8');
+  assert.match(source, /countryIdentitySql\('excluded\.country_name'\)/);
+  assert.match(source, /countryIdentitySql\('channels\.country'\)/);
+  assert.doesNotMatch(source, /regexp_replace\(trim\(excluded\.country_name\)/);
+});

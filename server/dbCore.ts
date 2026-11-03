@@ -4825,11 +4825,14 @@ export async function reserveNativeVocabularyAiRun(args: {
     }
     // Reclaim every other abandoned reservation for the day before counting
     // caps: outstanding cost must not include work whose worker is gone.
+    // Rows that already hold a stored provider response are excluded: that
+    // response is durable output for a *different* request id, and marking it
+    // FAILED would discard a paid call that its own retry can still replay.
     await client.query(
       `UPDATE native_vocabulary_ai_runs
        SET status='FAILED', actual_cost_microunits=GREATEST(actual_cost_microunits,reserved_cost_microunits),
            completed_at=now(), lease_expires_at=NULL, lease_token=NULL
-       WHERE budget_day=$1 AND status='RESERVED'
+       WHERE budget_day=$1 AND status='RESERVED' AND response_payload IS NULL
          AND (lease_expires_at IS NULL OR lease_expires_at <= now())`,
       [args.budgetDay],
     );
@@ -5084,9 +5087,20 @@ export async function markQueryRunDeferred(runId: string, status: 'DEFERRED_QUOT
 
 export async function markQueryRunResumeUnavailable(runId: string, reason: string): Promise<void> {
   const db = await getDb();
+  const current = await db.query(`SELECT status FROM query_runs WHERE id=$1`, [runId]);
+  const status = String(current.rows[0]?.status || '');
+  // Terminal runs own their outcome. A stale reconciler candidate must never
+  // relabel a completed run or overwrite a genuine failure.
+  if (status === 'COMPLETED' || status === 'FAILED') return;
+  const message = reason.slice(0, 2000);
+  // Reuse the terminal-failure path so the query reservation, quota
+  // reservation, accounting attribution, and best-effort observation capture
+  // all run exactly as they do for a provider failure.
+  await failQueryRun(runId, new Error(message), true);
   await db.query(
-    `UPDATE query_runs SET continuation_status='RESUME_UNAVAILABLE',error=$2,completed_at=COALESCE(completed_at,now()),status=CASE WHEN status IN ('COMPLETED','FAILED') THEN status ELSE 'FAILED' END WHERE id=$1`,
-    [runId, reason.slice(0, 2000)],
+    `UPDATE query_runs SET continuation_status='RESUME_UNAVAILABLE',error=$2
+     WHERE id=$1 AND status='FAILED' AND continuation_status='FAILED' AND error=$2`,
+    [runId, message],
   );
 }
 

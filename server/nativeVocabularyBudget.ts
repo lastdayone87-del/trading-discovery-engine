@@ -125,7 +125,10 @@ export function estimateNativeVocabularyActualCostMicrounits(args: {
   const inputTokens = Math.ceil(Math.max(0, args.promptChars) / 4);
   const outputTokens = Math.ceil(Math.max(0, args.responseChars) / 4);
   // Small-model order of magnitude: $0.10/M input, $0.40/M output, converted
-  // to microunits ($1 = 1,000,000 microunits). Provider attempts multiply.
-  const perAttempt = inputTokens * 0.1 + outputTokens * 0.4;
-  return Math.max(0, Math.ceil(perAttempt * attempts));
+  // to microunits ($1 = 1,000,000 microunits). Each attempt re-sends the
+  // prompt, but `responseChars` already aggregates every provider response,
+  // so only input cost is multiplied by attempts.
+  const inputCost = inputTokens * 0.1 * attempts;
+  const outputCost = outputTokens * 0.4;
+  return Math.max(0, Math.ceil(inputCost + outputCost));
 }

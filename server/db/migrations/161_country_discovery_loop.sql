@@ -35,7 +35,8 @@ WHERE o.canonical_term_id = t.id
   AND COALESCE(c.quality_score, 0) >= 55
   AND c.country IS NOT NULL
   AND lower(c.country) = lower(t.country)
-  AND (o.source_creator_country IS NULL OR lower(o.source_creator_country) = lower(t.country))
+  AND o.source_creator_country IS NOT NULL
+  AND lower(o.source_creator_country) = lower(t.country)
   AND (o.target_market_country IS NULL OR lower(o.target_market_country) = lower(t.country))
   AND (o.native_evidence_status IS NULL OR o.native_evidence_status = 'NATIVE_OBSERVED')
   AND (o.source_provenance_family IS NULL OR o.source_provenance_family = 'CREATOR_METADATA')
@@ -222,6 +223,21 @@ WHERE continuation_status IS NULL
    OR continuation_status = ''
    OR (status = 'COMPLETED' AND continuation_status <> 'COMPLETE')
    OR (status = 'FAILED' AND continuation_status <> 'FAILED');
+
+-- Legacy non-terminal runs predate continuation tracking and therefore only
+-- carry the new column default ('RUNNING'). A run with no PENDING/PROCESSING
+-- job has no execution owner; leaving it RUNNING makes the resume scanner
+-- treat stale rows as live continuations. RESUME_UNAVAILABLE is the truthful
+-- terminal state and keeps them out of the pending-continuation indexes.
+UPDATE query_runs qr
+SET continuation_status = 'RESUME_UNAVAILABLE'
+WHERE qr.status IN ('SCHEDULED', 'RUNNING', 'RETRYING')
+  AND qr.continuation_status = 'RUNNING'
+  AND NOT EXISTS (
+    SELECT 1 FROM jobs j
+    WHERE j.id = qr.job_id
+      AND j.status IN ('PENDING', 'PROCESSING')
+  );
 
 CREATE INDEX IF NOT EXISTS idx_query_runs_resume_pending
   ON query_runs(continuation_status, deferred_until, last_page_at)

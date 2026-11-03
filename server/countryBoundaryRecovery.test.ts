@@ -273,10 +273,14 @@ test('TEST G: Dashboard projection SQL filters out excluded countries and non-re
   assert.match(OPERATOR_VISIBLE_CHANNEL_SQL, /country_status <> 'REJECTED'/);
   assert.match(OPERATOR_VISIBLE_CHANNEL_SQL, /NOT EXISTS[\s\S]+FROM excluded_countries/);
   // The listing predicate must use the same alias identity as
-  // findCountryExclusion, so an operator exclusion stored as `DE` hides a
-  // channel stored as `Germany` (and vice versa).
-  assert.match(OPERATOR_VISIBLE_CHANNEL_SQL, /CASE[\s\S]+WHEN 'de' THEN 'germany'/);
-  assert.match(OPERATOR_VISIBLE_CHANNEL_SQL, /CASE[\s\S]+WHEN 'de' THEN 'germany'[\s\S]+channels\.country/);
+  // findCountryExclusion on BOTH operands, so an operator exclusion stored as
+  // `DE` hides a channel stored as `Germany` (and vice versa).
+  const operands = OPERATOR_VISIBLE_CHANNEL_SQL.split(/\s=\s/);
+  assert.equal(operands.length, 2, 'the exclusion predicate must compare two identity expressions');
+  assert.match(operands[0], /excluded\.country_name/);
+  assert.match(operands[1], /channels\.country/);
+  assert.match(operands[0], /CASE[\s\S]+WHEN 'de' THEN 'germany'/);
+  assert.match(operands[1], /CASE[\s\S]+WHEN 'de' THEN 'germany'/);
 });
 
 const postgresUrl = process.env.COUNTRY_BOUNDARY_TEST_DATABASE_URL;

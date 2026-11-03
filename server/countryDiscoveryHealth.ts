@@ -52,6 +52,8 @@ export interface CountryDiscoveryHealthInput {
   providerErrorRate?: number | null;
   providerTimeoutRate?: number | null;
   providerRateLimitRate?: number | null;
+  /** Provider calls backing the rates; low samples must not fail the gate. */
+  providerCalls?: number;
   wikimediaUserAgentConfigured?: boolean;
 }
 
@@ -190,10 +192,16 @@ export function evaluateCountryDiscoveryHealth(
     const timeoutRate = Math.max(0, Number(input.providerTimeoutRate || 0));
     const rateLimitRate = Math.max(0, Number(input.providerRateLimitRate || 0));
     const worst = Math.max(errorRate, timeoutRate, rateLimitRate);
+    // A single failed call is a 100% rate. Rates below the minimum sample are
+    // advisory only: a low-volume spike degrades the report instead of
+    // declaring the deployment unhealthy.
+    const calls = input.providerCalls == null ? null : Math.max(0, Number(input.providerCalls) || 0);
+    const lowSample = calls != null && calls < 10;
     add(
       'provider_spike',
-      worst >= 0.25 ? 'FAIL' : worst >= 0.1 ? 'WARN' : 'PASS',
-      `Provider error/timeout/rate-limit rates: ${(errorRate * 100).toFixed(1)}% / ${(timeoutRate * 100).toFixed(1)}% / ${(rateLimitRate * 100).toFixed(1)}%.`,
+      worst >= 0.25 && !lowSample ? 'FAIL' : worst >= 0.1 ? 'WARN' : 'PASS',
+      `Provider error/timeout/rate-limit rates: ${(errorRate * 100).toFixed(1)}% / ${(timeoutRate * 100).toFixed(1)}% / ${(rateLimitRate * 100).toFixed(1)}%.`
+        + (lowSample ? ` Only ${calls} call(s) in the window; rate thresholds are advisory.` : ''),
     );
   }
 
@@ -502,6 +510,7 @@ export async function gatherCountryDiscoveryHealth(clientOverride?: HealthRunner
     providerErrorRate,
     providerTimeoutRate,
     providerRateLimitRate,
+    providerCalls,
     aiActualCostMicrounits: Number(aiRow.actual_cost || 0),
     aiBudgetMicrounits: aiBudget,
     aiBudgetSkips: Number(aiRow.budget_skips || 0),

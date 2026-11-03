@@ -70,7 +70,7 @@ function isUsableSurface(value: string): boolean {
 
 function classifySurface(surface: string): FreeSignalType {
   const normalized = normalizeFreeSignalSurface(surface);
-  if (/(exchange|börse|bourse|bolsa|beurs| بورصة)/iu.test(surface)) return 'EXCHANGE';
+  if (/(exchange|börse|bourse|bolsa|beurs|بورصة)/iu.test(surface)) return 'EXCHANGE';
   if (/(regulator|commission|authority|regulier|regulador|aufsicht)/iu.test(surface)) return 'REGULATOR';
   if (/(futures|options|forex|index|indices|aktie|acao|ação|action|titre|anleihe|obligation|etf)/iu.test(surface)) return 'INSTRUMENT';
   if (/(market|marché|markt|mercado|mercat|session)/iu.test(surface)) return 'MARKET';
@@ -528,6 +528,14 @@ export async function refreshFreeQuerySignalsForCountry(country: string, options
   userAgent?: string;
 } = {}): Promise<FreeSignalFetchResult> {
   const result = await fetchFreeQuerySignals({ country, ...options });
-  if (result.signals.length) await persistFreeQuerySignals(result.signals).catch(() => 0);
+  if (result.signals.length) {
+    await persistFreeQuerySignals(result.signals).catch(error => {
+      // A persistence failure leaves the stored signal set empty for this
+      // country. Surface it in logs instead of silently pretending the
+      // provider returned nothing.
+      console.warn(`[FreeQuerySignals] Failed to persist ${result.signals.length} signal(s) for ${country}:`, error);
+      return 0;
+    });
+  }
   return result;
 }

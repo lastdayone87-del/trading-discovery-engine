@@ -10,6 +10,7 @@ import { isSearchableTradingTerm } from '../terminologySearchability';
 import {
   QUERY_SOURCE_REGISTRY,
   admitQueryRecord,
+  candidateFromQueryRecord,
   revalidateQueryRecordAdmission,
   withQueryAdmission,
 } from './admission';
@@ -2071,4 +2072,29 @@ test('C5: recency-specific mixed composition keeps its distinct reason', () => {
   assert.equal(composition.focus, 'MIXED');
   assert.ok(composition.reasonCodes.includes('RECENT_ALTERNATIVE_OUTPUT_CONFLICTS_WITH_TRADING_HISTORY'));
   assert.ok(!composition.reasonCodes.includes('TRADING_AND_ALTERNATIVE_CONFLICT'));
+});
+
+test('Q2: CDL anchored bootstrap templates admit without granting PR557 provenance', () => {
+  const record = (template: string, origin: 'FREE_SIGNAL' | 'DEMAND_SIGNAL', modifier: string) => ({
+    query: `order flow ${modifier}`,
+    country: 'Germany',
+    primary_term: 'order flow',
+    generation_metadata: {
+      queryTemplate: template,
+      atoms: [
+        { term: 'order flow', type: 'METHOD', origin: 'CURATED', role: 'ANCHOR' },
+        { term: modifier, type: 'CONCEPT', origin, role: 'MODIFIER' },
+      ],
+    },
+  });
+
+  for (const [template, origin, modifier] of [
+    ['ANCHOR_FREE_SIGNAL', 'FREE_SIGNAL', 'Börse Frankfurt'],
+    ['ANCHOR_DEMAND_SIGNAL', 'DEMAND_SIGNAL', 'Frankfurt trading desk'],
+  ] as const) {
+    const candidate = candidateFromQueryRecord(record(template, origin, modifier));
+    assert.equal(candidate.relation, 'ANCHOR_MODIFIER', `${template} needs a licensed anchor relation`);
+    assert.equal(candidate.atoms[1]?.provenance, origin, 'bootstrap atoms keep their own provenance');
+    assert.notEqual(candidate.atoms[1]?.provenance, 'PR557', 'candidate vocabulary must still pass the semantic lexicon');
+  }
 });

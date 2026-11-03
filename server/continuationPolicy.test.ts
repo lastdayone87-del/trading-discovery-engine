@@ -67,10 +67,12 @@ test('persisted-page recovery replays the handoff instead of re-running the page
   });
   assert.equal(productive.kind, 'NONE');
   // Terminal rows must not leave a parent cursor behind: recovery would read
-  // the stale token and resurrect a finished run.
+  // the stale token and resurrect a finished run. Keep a non-null top-level
+  // cursor while the observation has none; finalization must not carry or
+  // reuse the stale token.
   const terminal = planPersistedPageRecovery({
     ...base,
-    nextPageToken: null,
+    nextPageToken: 'stale-top-level-token',
     observation: {
       ...observation,
       nextPageToken: null,
@@ -79,5 +81,5 @@ test('persisted-page recovery replays the handoff instead of re-running the page
       continuationDecisionV2: decision('NO_NEXT_PAGE', false),
     },
   });
-  assert.equal(terminal.kind, 'FINALIZE');
+  assert.deepEqual(terminal, { kind: 'FINALIZE' });
 });

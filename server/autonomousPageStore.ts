@@ -205,7 +205,8 @@ export async function getAutonomousRunMetrics(runId: string): Promise<QueryFunne
       'SELECT page_metrics, cumulative_unique_creators FROM autonomous_query_page_observations WHERE query_run_id=$1 ORDER BY page_number',
       [runId],
     ),
-    db.query(`SELECT COUNT(DISTINCT channel_id)::int AS distinct_creators,
+    db.query(`SELECT COUNT(*)::int AS sightings,
+      COUNT(DISTINCT channel_id)::int AS distinct_creators,
       COUNT(DISTINCT channel_id) FILTER (WHERE country_outcome='REJECTED')::int AS country_rejected
       FROM channel_sightings WHERE query_run_id=$1`, [runId]),
   ]);
@@ -219,8 +220,12 @@ export async function getAutonomousRunMetrics(runId: string): Promise<QueryFunne
       : Math.max(0, Number(row.cumulative_unique_creators) || 0);
     return cumulative === undefined ? pageMetrics : { ...pageMetrics, cumulativeUniqueCreators: cumulative };
   }));
+  const sightingCount = Number(sightings.rows[0]?.sightings || 0);
+  // No run-wide sightings means there is nothing more authoritative than the
+  // per-page sum. When sightings exist, always recompute: cross-page repeats
+  // change duplicateResults even when the distinct total happens to match.
+  if (!sightingCount) return metrics;
   const distinct = Number(sightings.rows[0]?.distinct_creators || 0);
-  if (!distinct || distinct === metrics.distinctResults) return metrics;
   const rejected = Math.min(distinct, Number(sightings.rows[0]?.country_rejected || 0));
   const evaluatedRawResults = Number(metrics.evaluatedRawResults ?? Math.max(0, metrics.rawResults - metrics.deferredResults));
   return {
@@ -233,8 +238,8 @@ export async function getAutonomousRunMetrics(runId: string): Promise<QueryFunne
     // denominator: the page sum double-counts cross-page repeats, and
     // completeQueryRun recomputes precision from these two fields.
     countryRejected: rejected,
-    noveltyRatio: metrics.newChannels / distinct,
-    countryPrecision: (distinct - rejected) / distinct,
+    noveltyRatio: distinct ? metrics.newChannels / distinct : metrics.noveltyRatio,
+    countryPrecision: distinct ? (distinct - rejected) / distinct : metrics.countryPrecision,
   };
 }
 

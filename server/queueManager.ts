@@ -91,7 +91,7 @@ import { assertCountryAllowed, ExcludedCountryError, getCountryExclusion, should
 import { randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
 import { computeEffectivePageBudget, evaluateContinuation, evaluateContinuationV2, planPersistedPageRecovery, resumeModeForProvider, shouldCreateContinuationSegment, type ContinuationDecisionV2, type ContinuationResumeMode } from './continuationPolicy';
-import { evaluateAutonomousQueryAuthority, isScopePromotedRecord } from './autonomousQueryAuthority';
+import { evaluateAutonomousQueryAuthority, isDemandSignalRecord, isScopePromotedRecord } from './autonomousQueryAuthority';
 import { getDiscoveryScope, resolveAutonomousCountries, resolveDiscoveryTargetQueueDepth, resolveScopePromotionForScope } from './autonomousDiscovery';
 import { getAutonomousQueueDepth } from './quotaRolloverReconciliation';
 import { YOUTUBE_INNERTUBE_MAX_PAGES, INNERTUBE_TIMEOUT_CODE } from './youtubeInnertubeProvider';
@@ -1578,8 +1578,14 @@ export async function processNextSearchJob(
           scopePromotionActive =
             resolveScopePromotionForScope(liveScope, country) != null;
         }
+        // Paid demand is a live kill switch: a row queued while the adapter
+        // was enabled must be withheld once the operator disables it.
+        const demandSignalsEnabled = isDemandSignalRecord(authorityQueryRecord)
+          ? await getAppSetting('query_demand_signals_enabled', 'false') === 'true'
+          : undefined;
         const queryAuthority = evaluateAutonomousQueryAuthority(authorityQueryRecord, {
           scopePromotionActive,
+          demandSignalsEnabled,
         });
         if (!queryAuthority.eligible) {
           console.log(`[Unified Query Authority] Withheld automated search job ${job.id} for "${query}" (${country}) before spending YouTube quota: ${queryAuthority.reasonCodes.join(', ')}.`);
@@ -1783,12 +1789,12 @@ export async function processNextSearchJob(
       await recordQueryRunSightings(queryRunId, queryId, sightings.map(s=>({...s,pageNumber})));
       const configuredMaxPages = Number(await getAppSetting('autonomous_pagination_max_pages', '50'));
       // A malformed setting must not become an unbounded (or NaN) page
-      // ceiling. Fall back to the documented three-page default; finite
-      // values below one clamp to a single page rather than silently
+      // ceiling. Fall back to the same 50-page default the migration seeds;
+      // finite values below one clamp to a single page rather than silently
       // becoming the default.
       const safetyMaxPages = Number.isFinite(configuredMaxPages)
         ? Math.max(1, Math.floor(configuredMaxPages))
-        : 3;
+        : 50;
       const maxLow = Math.max(1, Number(await getAppSetting('autonomous_pagination_max_low_yield_pages', '2')));
       const maxDuplicate = Math.max(1, Number(await getAppSetting('autonomous_pagination_max_duplicate_pages', '2')));
       const maxWrongCountry = Math.max(1, Number(await getAppSetting('autonomous_pagination_max_wrong_country_pages', '2')));
@@ -2264,7 +2270,11 @@ export async function resumeOrphanedAutonomousPages(options: {
   // The CDL master switch stops new continuation work as well as the worker
   // paths; operators must not need to flip several independent settings.
   const cdlEnabled = await getAppSetting('country_discovery_loop_enabled', 'true') === 'true';
-  if (!enabled || !cdlEnabled) {
+  // The maintenance sweep is a producer like any other: an operator pause must
+  // stop it too, otherwise the tick keeps buying provider pages while Query
+  // Intelligence is paused.
+  const paused = await getAppSetting('query_intelligence_paused', 'false') === 'true';
+  if (!enabled || !cdlEnabled || paused) {
     return { swept: true, enqueued: 0, skipped: 0, unavailable: 0 };
   }
   // The store returns a ranked fallback list per pending country, without a
@@ -2370,6 +2380,18 @@ export async function resumeOrphanedAutonomousPages(options: {
       skipped++;
       continue;
     }
+    // A terminal page has no next-page token by design. Validating resume
+    // tokens before reading the observation misclassifies it as unresumable
+    // (TOKEN/OFFSET) or synthesizes a page past the provider end (REWALK), so
+    // finalize it from the durable observation instead.
+    if (!firstPage) {
+      const lastObservation = await getAutonomousPageObservation(run.runId, run.pagesCompleted);
+      if (lastObservation && lastObservation.shouldContinue === false) {
+        await finalizeLinkedAutonomousParent(run);
+        skipped++;
+        continue;
+      }
+    }
     if (!firstPage && run.resumeMode === 'NONE') {
       await markQueryRunResumeUnavailable(run.runId, 'RESUME_MODE_NONE');
       unavailable++;
@@ -2444,37 +2466,88 @@ export async function resumeOrphanedAutonomousPages(options: {
       const searchWindow = metadata.searchWindow && typeof metadata.searchWindow === 'object'
         ? metadata.searchWindow
         : null;
-      await enqueueChildAndCommitPageReservation({
-        pageReservationId: incPageReservationId,
-        queryRunId: run.runId,
-        jobType: 'SEARCH_YOUTUBE',
-        jobPayload: {
-          query: run.query,
-          country: run.country,
-          source: run.source as DiscoverySource,
-          queryRunId: run.runId,
-          queryId: run.queryId,
-          retrievalLane: (run.retrievalLane || 'VIDEO') as RetrievalLane,
-          searchOrdering: (run.searchOrdering || 'RELEVANCE') as import('./searchOrdering').SearchOrdering,
-          pageNumber: nextPage,
-          pageToken,
-          retrievalConfigKey: run.retrievalConfigKey,
-          retrievalTreatmentOrigin: run.retrievalTreatmentOrigin || 'CONTROL',
-          // Preserve the run's original treatment depth. Replacing it with the
-          // run-local page number would shrink a CANARY_TREATMENT cap on resume.
-          requestedPageDepth: run.requestedPageDepth ?? nextPage,
-          ...(provider ? { provider } : {}),
-          ...(trial ? { trial } : {}),
-          ...(selectionExperiment ? { selectionExperiment } : {}),
-          ...(searchWindow ? { searchWindow } : {}),
-        },
-        priority: AUTONOMOUS_CONTINUATION_JOB_PRIORITY,
-        maxAttempts: 3,
-        idempotencyKey,
-        // A deferred page whose previous job is COMPLETED/FAILED without a
-        // page observation must be reopened, not silently skipped.
-        reopenTerminal: true,
-      });
+      // Recovery must pass the same shared-portfolio boundary as the worker's
+      // continuation path: only the first page was covered by the scheduling
+      // reservation, so every recovered later page needs its own reservation.
+      const providerQuotaUnits = provider?.costDomain === 'YOUTUBE_INNERTUBE_FREE' ? 0 : 100;
+      let portfolioPage: { authorized: boolean; reason: string } = { authorized: true, reason: 'FIRST_PAGE' };
+      let pageCommitted = false;
+      try {
+        await client.query('BEGIN');
+        if (!firstPage) {
+          portfolioPage = await reservePortfolioContinuationPage({
+            queryRunId: run.runId,
+            pageNumber: nextPage,
+            providerQuotaUnits,
+            clientOverride: client,
+          });
+        }
+        if (portfolioPage.authorized) {
+          await enqueueChildAndCommitPageReservation({
+            pageReservationId: incPageReservationId,
+            queryRunId: run.runId,
+            jobType: 'SEARCH_YOUTUBE',
+            jobPayload: {
+              query: run.query,
+              country: run.country,
+              source: run.source as DiscoverySource,
+              queryRunId: run.runId,
+              queryId: run.queryId,
+              retrievalLane: (run.retrievalLane || 'VIDEO') as RetrievalLane,
+              searchOrdering: (run.searchOrdering || 'RELEVANCE') as import('./searchOrdering').SearchOrdering,
+              pageNumber: nextPage,
+              pageToken,
+              retrievalConfigKey: run.retrievalConfigKey,
+              retrievalTreatmentOrigin: run.retrievalTreatmentOrigin || 'CONTROL',
+              // Preserve the run's original treatment depth. Replacing it with
+              // the run-local page number would shrink a CANARY_TREATMENT cap
+              // on resume.
+              requestedPageDepth: run.requestedPageDepth ?? nextPage,
+              ...(provider ? { provider } : {}),
+              ...(trial ? { trial } : {}),
+              ...(selectionExperiment ? { selectionExperiment } : {}),
+              ...(searchWindow ? { searchWindow } : {}),
+            },
+            priority: AUTONOMOUS_CONTINUATION_JOB_PRIORITY,
+            maxAttempts: 3,
+            idempotencyKey,
+            clientOverride: client,
+            // A deferred page whose previous job is COMPLETED/FAILED without a
+            // page observation must be reopened, not silently skipped.
+            reopenTerminal: true,
+          });
+          await client.query('COMMIT');
+          pageCommitted = true;
+        } else {
+          await client.query('ROLLBACK');
+        }
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => undefined);
+        if (incPageReservationId && !pageCommitted) {
+          await releaseIncrementalTreatmentPageReservation(incPageReservationId, run.runId)
+            .catch(releaseError => console.warn('[Autonomous Resume] Failed to release treatment page reservation after rollback:', releaseError));
+        }
+        throw error;
+      }
+      if (!portfolioPage.authorized) {
+        if (incPageReservationId) {
+          await releaseIncrementalTreatmentPageReservation(incPageReservationId, run.runId)
+            .catch(releaseError => console.warn('[Autonomous Resume] Failed to release treatment page reservation after portfolio denial:', releaseError));
+        }
+        if (portfolioPage.reason !== 'PORTFOLIO_BUDGET_EXHAUSTED') {
+          // A reservation error is retryable. Failing the run here would
+          // mislabel a transient database failure as budget exhaustion.
+          throw new Error(`Continuation reservation failed: ${portfolioPage.reason}`);
+        }
+        await db.query(
+          `UPDATE autonomous_query_page_observations SET stopping_reason=$3 WHERE query_run_id=$1 AND page_number=$2`,
+          [run.runId, run.pagesCompleted, 'PORTFOLIO_BUDGET_EXHAUSTED'],
+        ).catch(error => console.warn('[Autonomous Resume] Failed to record portfolio stop reason:', error));
+        // Stop the run cleanly with the pages it was authorized to execute.
+        await finalizeLinkedAutonomousParent(run);
+        skipped++;
+        continue;
+      }
       const progress = await getQueryRunProgress(run.runId);
       await updateQueryRunProgress(run.runId, {
         nextPageToken: run.nextPageToken,

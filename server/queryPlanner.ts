@@ -556,6 +556,9 @@ export function planDiverseQueries(args: {
     const freeSignalTerminology = candidate.freeSignal
       ? provenBySurface.get(normalizeQuery(candidate.freeSignal.surface))
       : undefined;
+    const learnedTerminology = provenByTerm.get(
+      normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''),
+    );
     const atomSourceTypes = candidate.atoms.map(item =>
       item.origin === 'LEARNED' ? 'TERMINOLOGY' as const
         : item.origin === 'FREE_SIGNAL' ? 'FREE_SIGNAL' as const
@@ -648,9 +651,12 @@ export function planDiverseQueries(args: {
           selectedLanguage: preferredLanguage,
           ordinal: planned.length + 1
         } : undefined,
-        terminologyId: provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))?.id ?? freeSignalTerminology?.id,
-        terminologyLifecycle: provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))?.lifecycle,
-        terminologyDecayedYield: provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))?.score,
+        terminologyId: learnedTerminology?.id ?? freeSignalTerminology?.id,
+        // The lifecycle and yield must come from the same source as the id.
+        // Otherwise a free-signal query can be attributed to a proven term by
+        // id while appearing to have no lifecycle at all.
+        terminologyLifecycle: learnedTerminology?.lifecycle ?? freeSignalTerminology?.lifecycle,
+        terminologyDecayedYield: learnedTerminology?.score ?? freeSignalTerminology?.score,
         ...(terminatedByGate.length ? {
           terminologyGate: {
             policy: 'terminology-searchability-v1',

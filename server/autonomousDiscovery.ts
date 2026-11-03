@@ -15,6 +15,7 @@ import {
 } from './db';
 import { SUPPORTED_DORMANT_COUNTRIES, SUPPORTED_PRODUCTION_COUNTRIES } from '../src/data/initial_countries';
 import { assertCountryAllowed } from './countryExclusion';
+import { countryIdentityKey } from './countryExclusionRules';
 import { authorizeCountryNativeAllocationQuery, selectNextQueryForCountry } from './queryIntelligence';
 import {
   selectExperimentalQueryForCountry,
@@ -29,7 +30,7 @@ import { runPersistentResearchCycle } from './persistentResearchController';
 import { creatorIntelligenceChecksum } from './creatorIntelligence/contracts';
 import { bindCreatorCanaryQueryRun, type CreatorCanaryAssignment } from './creatorIntelligence/canary';
 import { allocateCreatorSearchAuthority } from './creatorIntelligence/authority';
-import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
+import { evaluateAutonomousQueryAuthority, isDemandSignalRecord } from './autonomousQueryAuthority';
 import {
   type GeographicAllocationIntent,
   evaluateShadowFrontierAllocation,
@@ -181,11 +182,15 @@ export function resolveAutonomousCountries(
       country.normalize('NFKC').trim().toLocaleLowerCase('en'),
     ),
   );
-  const excluded = new Set(excludedNames.map(country => country.toLowerCase()));
+  // Exclusions are matched by canonical identity (`DE` == `Germany`), the
+  // same vocabulary used by findCountryExclusion and the operator-visible SQL.
+  // A literal comparison here would keep scheduling a country that every
+  // later execution gate rejects.
+  const excluded = new Set(excludedNames.map(countryIdentityKey));
   const selectedScope = new Set(selectedCountries.map(country => country.toLowerCase()));
   let countries = vocabCountries.filter(country =>
     supported.has(country.normalize('NFKC').trim().toLocaleLowerCase('en')) &&
-    !excluded.has(country.toLowerCase()),
+    !excluded.has(countryIdentityKey(country)),
   );
   if (scope === 'SELECTED_COUNTRIES' && selectedScope.size > 0) {
     countries = countries.filter(country => selectedScope.has(country.toLowerCase()));
@@ -203,7 +208,7 @@ export function resolveAutonomousCountries(
   // nothing here (in addition to the assertCountryAllowed gates at cycle
   // entry and in the worker), so no caller can sweep it by requesting it
   // directly.
-  if (targetCountry) countries = excluded.has(targetCountry.toLowerCase()) ? [] : [targetCountry];
+  if (targetCountry) countries = excluded.has(countryIdentityKey(targetCountry)) ? [] : [targetCountry];
   return countries;
 }
 
@@ -402,6 +407,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
     // sweep refreshes it because enqueues commit incrementally before a throw.
     let queueDepth = snapshot.queueDepth;
     let continuationSweepFailed = false;
+    let queueDepthRefreshFailed = false;
     if (!targetCountry) {
       try {
         const { resumeOrphanedAutonomousPages } = await import('./queueManager');
@@ -428,6 +434,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
           // If occupancy cannot be re-read, conservatively treat the cycle as
           // full instead of scheduling fresh queries past the watermark.
           console.warn('[Autonomous Producer] Queue depth refresh failed; skipping fresh-query scheduling this cycle:', refreshError);
+          queueDepthRefreshFailed = true;
           queueDepth = Math.max(snapshot.queueDepth, config.targetQueueDepth);
           resumedPages = 0;
         }
@@ -461,7 +468,9 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         queuedCount: resumedPages, queueDepth,
         remainingAutonomousQuota: Math.max(0, Math.floor(config.dailyQuotaBudget * config.autonomousQuotaPercent / 100) - snapshot.autonomousUnitsUsed - snapshot.autonomousUnitsReserved),
         summary: continuationSweepFailed
-          ? 'No fresh work scheduled: the continuation sweep failed and queue occupancy was conservatively treated as full.'
+          ? queueDepthRefreshFailed
+            ? 'No fresh work scheduled: the continuation sweep failed and queue occupancy could not be refreshed, so the cycle was conservatively treated as full.'
+            : 'No fresh work scheduled: the continuation sweep failed and the refreshed queue/quota capacity is exhausted.'
           : resumedPages > 0
             ? `No fresh work scheduled: resumed ${resumedPages} continuation page(s) and queue/quota capacity is exhausted.`
             : 'No work scheduled: queue target or paced autonomous quota capacity is exhausted.', diagnostics
@@ -755,8 +764,12 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       // Every query source is revalidated immediately before scheduling. Stored
       // PROVEN/EXPERIMENTAL queries and research allocations are not grandfathered
       // across retrieval-policy upgrades.
+      const demandSignalsEnabled = isDemandSignalRecord(selected.queryRecord)
+        ? await getAppSetting('query_demand_signals_enabled', 'false') === 'true'
+        : undefined;
       const queryAuthority = evaluateAutonomousQueryAuthority(selected.queryRecord, {
         scopePromotionActive: scopePromotionBasis != null,
+        demandSignalsEnabled,
       });
       candidateDiagnostic = { ...candidateDiagnostic, selectedQueryId: selected.queryRecord.id, authorityOutcome: queryAuthority.eligible ? 'ELIGIBLE' : 'REJECTED', authorityReasonCodes: queryAuthority.reasonCodes };
       diagnostics.candidatesSelected++;

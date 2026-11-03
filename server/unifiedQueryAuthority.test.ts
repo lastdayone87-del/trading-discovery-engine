@@ -180,18 +180,21 @@ test('demand-signal standalone bootstrap carries a narrow execution-time authori
 });
 
 test('free-signal standalone planning excludes ambiguous market/entity surfaces', () => {
+  // Nigeria has no curated anchors, so this is the exact anchorless path that
+  // could emit a standalone candidate. An exchange surface is modifier-only
+  // (market/entity), so it must not be admitted as either template.
   const planned = planDiverseQueries({
-    country: 'Germany',
+    country: 'Nigeria',
     count: 4,
     learnedVocabulary: [],
     existingQueries: [],
     freeSignalCandidates: [{
-      surface: 'Frankfurt Stock Exchange', signalType: 'EXCHANGE', country: 'Germany', language: 'en',
+      surface: 'Frankfurt Stock Exchange', signalType: 'EXCHANGE', country: 'Nigeria', language: 'en',
       provider: 'WIKIPEDIA', sourceIds: ['wikipedia:2'],
     }],
   });
-  assert.ok(planned.length > 0, 'a supported country still plans normal seed queries');
-  assert.ok(planned.every(query => query.metadata.queryTemplate !== 'FREE_SIGNAL_STANDALONE'));
+  assert.ok(planned.every(query => !query.query.toLowerCase().includes('frankfurt')));
+  assert.ok(planned.every(query => !['FREE_SIGNAL_STANDALONE', 'ANCHOR_FREE_SIGNAL'].includes(String(query.metadata.queryTemplate))));
 });
 
 test('queueManager enforces execution-time query authority revalidation and handles missing provenance', () => {

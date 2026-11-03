@@ -117,7 +117,13 @@ function isDemandSignalStandaloneAuthorized(
   query: QueryRecord,
   metadata: Record<string, any>,
   atoms: Array<Record<string, any>>,
+  demandSignalsEnabled?: boolean,
 ): boolean {
+  // The paid-demand switch is authoritative even for rows already stored and
+  // queued: disabling demand must stop the next execution, not just new
+  // planning. Callers with access to settings pass the live value; undefined
+  // keeps the pure authority helper usable in benchmark/replay contexts.
+  if (demandSignalsEnabled === false) return false;
   if (String(metadata.queryTemplate || '') !== 'DEMAND_SIGNAL_STANDALONE') return false;
   if (metadata.source !== 'DEMAND_SIGNAL') return false;
   if (!Array.isArray(metadata.sourceTypes) || metadata.sourceTypes.length !== 1 || metadata.sourceTypes[0] !== 'DEMAND_SIGNAL') return false;
@@ -129,6 +135,13 @@ function isDemandSignalStandaloneAuthorized(
   if (atom.retrievalPolicy?.policyVersion !== RETRIEVAL_SPECIFICITY_POLICY_VERSION) return false;
   if (isBareShortTicker(query.query)) return false;
   return true;
+}
+
+/** True when a stored row needs the paid-demand execution exception. */
+export function isDemandSignalRecord(query: QueryRecord): boolean {
+  const metadata = metadataOf(query);
+  return String(metadata.queryTemplate || '').toUpperCase() === 'DEMAND_SIGNAL_STANDALONE'
+    || String(metadata.source || '').toUpperCase() === 'DEMAND_SIGNAL';
 }
 
 function metadataOf(query: QueryRecord): Record<string, any> {
@@ -171,7 +184,7 @@ export function isScopePromotedRecord(metadata: unknown): boolean {
  */
 export function evaluateAutonomousQueryAuthority(
   query: QueryRecord,
-  options: { scopePromotionActive?: boolean } = {},
+  options: { scopePromotionActive?: boolean; demandSignalsEnabled?: boolean } = {},
 ): AutonomousQueryAuthorityDecision {
   const reasons: string[] = [];
   if (query.collection === 'REJECTED') return { eligible: false, reasonCodes: ['QUERY_ALREADY_REJECTED'] };
@@ -190,7 +203,7 @@ export function evaluateAutonomousQueryAuthority(
     !['STANDALONE', 'ANCHOR_ONLY'].includes(String(specificity.eligibility))
     && !isScopePromotedAnchor(metadata, atoms, options.scopePromotionActive)
     && !isFreeSignalStandaloneAuthorized(query, metadata, atoms)
-    && !isDemandSignalStandaloneAuthorized(query, metadata, atoms)
+    && !isDemandSignalStandaloneAuthorized(query, metadata, atoms, options.demandSignalsEnabled)
   ) {
     return { eligible: false, reasonCodes: ['PRIMARY_ATOM_NOT_AUTHORIZED_FOR_RETRIEVAL'], retrievalPolicyVersion: specificity.policyVersion };
   }
@@ -203,7 +216,7 @@ export function evaluateAutonomousQueryAuthority(
       !['STANDALONE', 'ANCHOR_ONLY'].includes(String(anchor))
       && !isScopePromotedAnchor(metadata, atoms, options.scopePromotionActive)
       && !isFreeSignalStandaloneAuthorized(query, metadata, atoms)
-      && !isDemandSignalStandaloneAuthorized(query, metadata, atoms)
+      && !isDemandSignalStandaloneAuthorized(query, metadata, atoms, options.demandSignalsEnabled)
     ) {
       return { eligible: false, reasonCodes: ['QUERY_ANCHOR_NOT_CURRENTLY_AUTHORIZED'], retrievalPolicyVersion: specificity.policyVersion };
     }

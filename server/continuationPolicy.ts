@@ -310,11 +310,9 @@ export function evaluateContinuationV2(input: ContinuationV2Input): Continuation
   // actionable reason must win so operators see why the run stopped: duplicate
   // and wrong-country stops take precedence over the generic low-value stop.
   if (streaks.duplicateHeavy >= Math.max(1, input.maxDuplicateHeavyPages)) {
-    reasonCodes.push('DUPLICATE_HEAVY');
     return finish(false, 'DUPLICATE_HEAVY');
   }
   if (streaks.wrongCountry >= Math.max(1, input.maxWrongCountryPages)) {
-    reasonCodes.push('WRONG_COUNTRY');
     return finish(false, 'WRONG_COUNTRY');
   }
   if (streaks.lowValue >= Math.max(1, input.maxLowValuePages)) {

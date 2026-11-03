@@ -48,6 +48,7 @@ import {
 import {
   computeNativeVocabularyMetadataHash,
   computeNativeVocabularyRequestId,
+  estimateNativeVocabularyActualCostMicrounits,
   evaluateNativeVocabularyAiBudget,
 } from './nativeVocabularyBudget';
 import {
@@ -912,6 +913,11 @@ test('P4: two consecutive duplicate-heavy pages without any productive signal st
   assert.equal(second.shouldContinue, false);
   assert.equal(second.primaryReason, 'DUPLICATE_HEAVY', 'specific stop wins over generic low value');
   assert.equal(second.streaks.duplicateHeavy, 2);
+  assert.equal(
+    second.reasonCodes.filter(code => code === 'DUPLICATE_HEAVY').length,
+    1,
+    'the primary stop reason must not be pushed twice',
+  );
 });
 
 test('P5: a low-precision page with a confirmed creator continues; two consecutive wrong-country pages stop', () => {
@@ -934,6 +940,11 @@ test('P5: a low-precision page with a confirmed creator continues; two consecuti
   assert.equal(third.shouldContinue, false);
   assert.equal(third.primaryReason, 'WRONG_COUNTRY');
   assert.equal(third.streaks.wrongCountry, 2);
+  assert.equal(
+    third.reasonCodes.filter(code => code === 'WRONG_COUNTRY').length,
+    1,
+    'the primary stop reason must not be pushed twice',
+  );
 
   // A low-precision page that still surfaced a new creator is productive, not
   // wrong-country: the wrong-country streak requires no productive signal.
@@ -1638,13 +1649,35 @@ test('T8: two native plus one external validates; one native plus one external d
   const mixedTrial = decideLifecycleV2({
     ...baseLifecycle,
     nativeCreators: 2, nativeEvidenceBuckets: 2,
-    decayedEvidence: 2,
+    decayedEvidence: 2, nativeNovel: true,
     externalSources: 3, externalSourceCount: 3, externalEligible: true,
     externalTrialEvidenceScore: 3,
     confirmedTradingCreators: 1, freshConfirmedTradingCreators: 1,
   });
   assert.equal(mixedTrial.status, 'SEARCH_TRIAL');
   assert.equal(mixedTrial.searchEligible, true);
+
+  // The mixed path is a native plus external claim: without an affirmative
+  // native novelty verdict it must not enter a search trial.
+  const unverifiedMixedTrial = decideLifecycleV2({
+    ...baseLifecycle,
+    nativeCreators: 2, nativeEvidenceBuckets: 2,
+    decayedEvidence: 2,
+    externalSources: 3, externalSourceCount: 3, externalEligible: true,
+    externalTrialEvidenceScore: 3,
+    confirmedTradingCreators: 1, freshConfirmedTradingCreators: 1,
+  });
+  assert.equal(unverifiedMixedTrial.searchEligible, false);
+
+  const spamMixedTrial = decideLifecycleV2({
+    ...baseLifecycle,
+    nativeCreators: 2, nativeEvidenceBuckets: 2,
+    decayedEvidence: 2, nativeNovel: true, spamConfirmed: true,
+    externalSources: 3, externalSourceCount: 3, externalEligible: true,
+    externalTrialEvidenceScore: 3,
+    confirmedTradingCreators: 1, freshConfirmedTradingCreators: 1,
+  });
+  assert.equal(spamMixedTrial.searchEligible, false);
 
   const unqualifiedExternal = decideLifecycleV2({
     ...baseLifecycle,
@@ -1698,7 +1731,7 @@ test('T9c: repeat sightings do not inflate promotion yield', () => {
     novel: true, spamConfirmed: false, executions: 3, quotaConsumed: 5000,
     confirmedTradingCreators: 6, freshConfirmedTradingCreators: 3,
     nonTradingCreators: 0, wrongCountryCreators: 0, needsReviewCreators: 0,
-    validationBasis: true, decayedEvidence: 6, decayedYield: 0.5,
+    validationBasis: true, decayedYield: 0.5,
   });
   assert.equal(v2.metrics.yieldPer1000Quota, 0.6);
   assert.equal(v2.metrics.confirmedShare, 1);
@@ -2268,9 +2301,17 @@ test('O2: a failed migration, orphan page, or provider canary makes the deploy g
   assert.equal(invalidSelection.healthy, false);
   assert.equal(invalidSelection.checks.find(check => check.id === 'discovery_scope')?.status, 'FAIL');
 
-  const providerSpike = evaluateCountryDiscoveryHealth(healthyHealthInput({ providerErrorRate: 0.3 }));
+  const providerSpike = evaluateCountryDiscoveryHealth(healthyHealthInput({ providerErrorRate: 0.3, providerCalls: 100 }));
   assert.equal(providerSpike.healthy, false);
   assert.equal(providerSpike.checks.find(check => check.id === 'provider_spike')?.status, 'FAIL');
+
+  // A single failed call is a 100% rate. Under ten calls the spike is
+  // advisory, so a low-volume window cannot declare the deployment unhealthy.
+  const lowSampleSpike = evaluateCountryDiscoveryHealth(healthyHealthInput({ providerErrorRate: 0.3, providerCalls: 3 }));
+  assert.equal(lowSampleSpike.healthy, true);
+  const lowSampleCheck = lowSampleSpike.checks.find(check => check.id === 'provider_spike');
+  assert.equal(lowSampleCheck?.status, 'WARN');
+  assert.match(lowSampleCheck?.detail || '', /Only 3 call\(s\)/);
 
   const duplicateWindows = evaluateCountryDiscoveryHealth(healthyHealthInput({
     duplicateRatioWindows: { recent: 0.95, prior: 0.92 },
@@ -2675,7 +2716,13 @@ test('R3: an optional paid-provider failure cannot block the free-first cycle or
     !/tryReserveQuota\(|fetch\(|reserveProviderRequest\(|settleProviderRequest\(|searchYouTube/.test(block),
     'paid signal read has no quota/provider side effect',
   );
-  assert.ok(!serverSource('queueManager.ts').includes('query_demand_signals'));
+  // The execution gate reads the same kill switch so a row queued while the
+  // adapter was enabled is withheld once the operator disables it. This is a
+  // settings read only; the paid adapter itself is never invoked here.
+  const queue = serverSource('queueManager.ts');
+  assert.match(queue, /getAppSetting\('query_demand_signals_enabled', 'false'\)/);
+  assert.match(queue, /isDemandSignalRecord\(authorityQueryRecord\)/);
+  assert.match(queue, /demandSignalsEnabled,/);
 });
 
 test('R4: demand-signal ingestion refreshes mutable score and expiry on the identity row', () => {
@@ -2733,4 +2780,150 @@ test('P19: a saved page replays its child handoff and parent completion on retry
   assert.match(linkedBlock, /await finalizeLinkedAutonomousParent\(run\)/);
   assert.match(linkedBlock, /continue;/);
   assert.doesNotMatch(linkedBlock, /enqueueChildAndCommitPageReservation/);
+});
+
+// ---------------------------------------------------------------------------
+// R. Round-2 review regressions
+// ---------------------------------------------------------------------------
+
+test('R1: ambiguous bare country tokens and social handles are not identity terms', () => {
+  const sudan = countryIdentityTerms('Sudan');
+  assert.equal(sudan.includes('sudan'), false, 'bare `sudan` also matches South Sudan');
+  assert.ok(sudan.includes('sudanese trader'));
+
+  const korea = countryIdentityTerms('South Korea');
+  assert.equal(korea.includes('korea'), false, 'bare `korea` also matches North Korea');
+  assert.ok(korea.includes('south korea'));
+
+  const inference = serverSource('countryInference.ts');
+  assert.doesNotMatch(inference, /signals\.social\.forEach/, 'social handles are generic tokens, not identity terms');
+});
+
+test('R2: only repeated provider attempts multiply input cost', () => {
+  const one = estimateNativeVocabularyActualCostMicrounits({ attempts: 1, promptChars: 400, responseChars: 400 });
+  const three = estimateNativeVocabularyActualCostMicrounits({ attempts: 3, promptChars: 400, responseChars: 400 });
+  // 100 input tokens * $0.10/M and 100 output tokens * $0.40/M, converted to
+  // microunits: 10 + 40 = 50. Retries re-send the prompt (3 * 10) but the
+  // aggregated response is charged once.
+  assert.equal(one, 50);
+  assert.equal(three, 70);
+});
+
+test('R3: canonical country identity is used for autonomous exclusions', () => {
+  const countries = resolveAutonomousCountries(['Germany'], ['DE'], [], 'GLOBAL');
+  assert.equal(countries.includes('Germany'), false, 'an ISO-code exclusion must remove the canonical country');
+});
+
+test('R4: AI reservation reclaim keeps durable provider responses', () => {
+  const dbCore = serverSource('dbCore.ts');
+  const start = dbCore.indexOf('export async function reserveNativeVocabularyAiRun');
+  const end = dbCore.indexOf('\nexport ', start + 10);
+  const fn = dbCore.slice(start, end > start ? end : undefined);
+  assert.match(
+    fn,
+    /WHERE budget_day=\$1 AND status='RESERVED' AND response_payload IS NULL/,
+    'a response-bearing row belongs to a different request and can still replay',
+  );
+});
+
+test('R5: resume-unavailable reuses terminal cleanup and never relabels a terminal run', () => {
+  const dbCore = serverSource('dbCore.ts');
+  const start = dbCore.indexOf('export async function markQueryRunResumeUnavailable');
+  const end = dbCore.indexOf('\nexport ', start + 10);
+  const fn = dbCore.slice(start, end > start ? end : undefined);
+  assert.match(fn, /SELECT status FROM query_runs WHERE id=\$1/);
+  assert.match(fn, /if \(status === 'COMPLETED' \|\| status === 'FAILED'\) return;/);
+  const failAt = fn.indexOf('await failQueryRun(runId, new Error(message), true)');
+  const relabelAt = fn.indexOf("SET continuation_status='RESUME_UNAVAILABLE'");
+  assert.ok(failAt > 0 && relabelAt > failAt, 'terminal cleanup must run before the truthful relabel');
+  assert.match(
+    fn,
+    /status='FAILED' AND continuation_status='FAILED' AND error=\$2/,
+    'the relabel must stay scoped to the run this call just failed',
+  );
+});
+
+test('R6: orphan sweep respects the pause, finalizes terminal pages before token validation, and reserves recovered pages', () => {
+  const queue = serverSource('queueManager.ts');
+  const start = queue.indexOf('export async function resumeOrphanedAutonomousPages');
+  assert.ok(start > 0);
+  const sweep = queue.slice(start);
+
+  const pausedAt = sweep.indexOf("getAppSetting('query_intelligence_paused', 'false')");
+  const gateAt = sweep.indexOf('if (!enabled || !cdlEnabled || paused)');
+  assert.ok(pausedAt > 0 && gateAt > pausedAt, 'the pause must be read and enforced before any sweep work');
+
+  const terminalAt = sweep.indexOf('lastObservation.shouldContinue === false');
+  const resumeModeAt = sweep.indexOf("run.resumeMode === 'NONE'");
+  const tokenAt = sweep.indexOf("run.resumeMode === 'TOKEN' || run.resumeMode === 'OFFSET'");
+  assert.ok(
+    terminalAt > 0 && terminalAt < resumeModeAt && terminalAt < tokenAt,
+    'a terminal observation must be finalized before token/resume-mode validation',
+  );
+  const finalizeAt = sweep.indexOf('await finalizeLinkedAutonomousParent(run)', terminalAt);
+  assert.ok(finalizeAt > terminalAt && finalizeAt < resumeModeAt);
+
+  const reserveAt = sweep.indexOf('portfolioPage = await reservePortfolioContinuationPage({');
+  assert.ok(reserveAt > tokenAt, 'the recovered page reservation must cover later pages, not page 1');
+  assert.match(sweep.slice(reserveAt - 500, reserveAt), /if \(!firstPage\)/);
+  assert.match(sweep.slice(reserveAt, reserveAt + 5000), /clientOverride: client/);
+  assert.match(
+    sweep.slice(reserveAt, reserveAt + 8000),
+    /releaseIncrementalTreatmentPageReservation/,
+    'a rolled-back/denied recovered page must release its treatment reservation',
+  );
+});
+
+test('R7: migration backfills require matching creator country and normalize ownerless runs', () => {
+  const migration = migration161();
+  assert.match(
+    migration,
+    /o\.source_creator_country IS NOT NULL\s+AND lower\(o\.source_creator_country\) = lower\(t\.country\)/,
+    'an unknown creator country cannot prove native eligibility',
+  );
+  assert.match(
+    migration,
+    /SET continuation_status = 'RESUME_UNAVAILABLE'[\s\S]*?status IN \('SCHEDULED', 'RUNNING', 'RETRYING'\)[\s\S]*?j\.status IN \('PENDING', 'PROCESSING'\)/,
+    'legacy non-terminal runs without a live job must stop looking resumable',
+  );
+});
+
+test('R8: the three extraction flags are read in one settings query', () => {
+  const ingestion = serverSource('ingestionPipeline.ts');
+  assert.match(ingestion, /WHERE setting_key = ANY\(\$1\)/);
+  assert.match(
+    ingestion,
+    /'country_discovery_loop_enabled', 'native_vocabulary_extraction_enabled', 'native_evidence_promotion_v2_enabled'/,
+  );
+  assert.ok(!/getAppSetting\('country_discovery_loop_enabled', 'true'\)\.then/.test(ingestion));
+});
+
+test('R9: Arabic exchange surfaces classify as EXCHANGE', () => {
+  const signals = parseWikipediaSearchSignals(
+    { query: { search: [{ title: 'بورصة', snippet: 'بورصة مصرية', pageid: 1 }] } },
+    { country: 'Egypt', language: 'ar' },
+  );
+  assert.equal(signals[0]?.surface, 'بورصة');
+  assert.equal(signals[0]?.signalType, 'EXCHANGE');
+});
+
+test('R10: external eligibility defaults closed and PROVEN cannot skip trial evidence', () => {
+  const fallback = decideLifecycleV2({
+    ...baseLifecycle, nativeCreators: 0, nativeEvidenceBuckets: 0,
+    externalSources: 2, externalSourceCount: 2, externalEligible: undefined,
+    decayedEvidence: 6, confirmedTradingCreators: 2, freshConfirmedTradingCreators: 2,
+    executions: 3, decayedYield: 0.30, quotaConsumed: 5000, nativeNovel: true,
+  });
+  assert.notEqual(fallback.status, 'PROVEN_SEARCH_TERM');
+  assert.equal(fallback.searchEligible, false);
+
+  const noTrialEvidence = decideLifecycleV2({
+    ...baseLifecycle, decayedEvidence: 4, confirmedTradingCreators: 6,
+    executions: 3, decayedYield: 0.30, quotaConsumed: 5000, nativeNovel: true,
+  });
+  assert.notEqual(
+    noTrialEvidence.status,
+    'PROVEN_SEARCH_TERM',
+    'PROVEN must still clear the trial evidence threshold',
+  );
 });

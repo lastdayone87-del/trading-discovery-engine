@@ -58,9 +58,10 @@ Both routes are operator routes requiring the `country-discovery.read` action:
 | `migration_161` | Migration 161 is recorded. | `FAIL` means the migration did not apply. |
 | `required_schema` | Required CDL tables/columns exist. | `FAIL` lists missing schema. |
 | `youtube_hard_cap` | `youtube_key_daily_cap_enforced=true`. | `FAIL` means the hard cap is not enforced. |
+| `discovery_scope` | `query_intelligence_discovery_scope` and `query_intelligence_selected_countries` parse under the strict runtime parsers. | `FAIL` for an invalid mode or unparseable selected-country list. |
 | `orphan_pending_pages` | Pending pages older than 15 minutes. | `FAIL` when any are due; inspect the reconciler. |
 | `provider_canary` | Recent provider telemetry success rate (no active probe). | `FAIL` below 50% success. |
-| `provider_spike` | Recent error/timeout/rate-limit rates. | `WARN` at 10%, `FAIL` at 25%. |
+| `provider_spike` | Recent error/timeout/rate-limit rates. | `WARN` at 10%, `FAIL` at 25% once the window has at least 10 calls; smaller samples are advisory `WARN` only. |
 | `quota_reservation_failures` | Quota deferrals above the prior-hour baseline (the observable outcome of reservation denials). | `WARN` on a spike. |
 | `duplicate_ratio_two_windows` | Duplicate ratio for two consecutive 24-hour windows. | `WARN` in one window, `FAIL` in both at >=90%. |
 | `wrong_country_two_windows` | Country precision for two consecutive windows. | `WARN` in one window, `FAIL` in both below 50%. |
@@ -73,8 +74,11 @@ Both routes are operator routes requiring the `country-discovery.read` action:
 | `wikimedia_pageviews_off` | Optional pageviews prior stays off. | `WARN` only if enabled. |
 
 Kill switches are advisory in the health report: an operator may intentionally disable one, which degrades
-the report but does not declare the deployment broken. Migration/schema/cap/canary failures are deploy
-failures.
+the report but does not declare the deployment broken. Any `FAIL` makes the route return `503`. Current
+`FAIL` checks are `migration_161`, `required_schema`, `youtube_hard_cap`, `discovery_scope`,
+`orphan_pending_pages`, `provider_canary`, `provider_spike` (on a sufficient sample),
+`duplicate_ratio_two_windows`, `wrong_country_two_windows`, `ai_daily_cost`, `wikimedia_user_agent`, and
+`paid_demand_off`.
 
 ## 3. Kill switches
 

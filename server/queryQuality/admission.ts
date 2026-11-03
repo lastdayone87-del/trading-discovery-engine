@@ -48,6 +48,11 @@ const TEMPLATE_RELATION: Record<string, string> = {
   METHOD_INSTRUMENT: 'METHOD_INSTRUMENT',
   ANCHOR_LEARNED: 'ANCHOR_LEARNED',
   ANCHOR_ORGANIC: 'ANCHOR_ORGANIC',
+  // Anchored CDL bootstrap surfaces are an authorized anchor plus one
+  // candidate modifier. Without a licensed relation the two-atom shape is
+  // rejected before the rest of the admission gates can evaluate it.
+  ANCHOR_FREE_SIGNAL: 'ANCHOR_MODIFIER',
+  ANCHOR_DEMAND_SIGNAL: 'ANCHOR_MODIFIER',
 };
 
 const TEMPLATE_SOURCE: Record<string, QuerySource> = {
@@ -59,22 +64,6 @@ const TEMPLATE_SOURCE: Record<string, QuerySource> = {
   ANCHOR_DEMAND_SIGNAL: 'DEMAND_SIGNAL',
   DEMAND_SIGNAL_STANDALONE: 'DEMAND_SIGNAL',
 };
-
-/**
- * PR #557 bootstrap templates. Their free/demand atoms are candidate
- * vocabulary produced by the CDL planner, not learned terminology: the
- * planner has already applied retrieval-shape, language and bootstrap-share
- * gates. Treating those atoms as `PR557` provenance grants the same
- * producer-authorized semantics exemption as every other PR #557 surface
- * without weakening the lexicon for arbitrary FREE_SIGNAL/DEMAND_SIGNAL
- * origin strings outside these templates.
- */
-const CDL_BOOTSTRAP_TEMPLATES = new Set([
-  'ANCHOR_FREE_SIGNAL',
-  'FREE_SIGNAL_STANDALONE',
-  'ANCHOR_DEMAND_SIGNAL',
-  'DEMAND_SIGNAL_STANDALONE',
-]);
 
 const ATOM_TYPE: Record<string, TermSense['type']> = {
   INSTRUMENT: 'INSTRUMENT',
@@ -175,7 +164,6 @@ function typedAtoms(metadata: Record<string, any>, record: QueryRecordAdmissionI
   const anchorAuthorized = ['STANDALONE', 'ANCHOR_ONLY'].includes(String(declaredAnchor?.retrievalPolicy?.eligibility || '').toUpperCase());
   const allocatedNativeSurface = String(metadata.learnedTerm || '').normalize('NFKC').trim().toLocaleLowerCase('en');
   const countryNativeOverride = hasAllocationLineage && anchorAuthorized && allocatedNativeSurface.length > 0;
-  const cdlBootstrapTemplate = CDL_BOOTSTRAP_TEMPLATES.has(String(metadata.queryTemplate || '').toUpperCase());
   const atoms = raw
     .map((atom, index) => {
       const declaredOrigin = String(atom.origin || '');
@@ -185,15 +173,15 @@ function typedAtoms(metadata: Record<string, any>, record: QueryRecordAdmissionI
       const normalizedTerm = String(atom.term || '').normalize('NFKC').trim();
       const isApprovedNativeSurface = countryNativeOverride
         && normalizedTerm.toLocaleLowerCase('en') === allocatedNativeSurface;
-      const isCdlBootstrapAtom = cdlBootstrapTemplate
-        && ['FREE_SIGNAL', 'DEMAND_SIGNAL'].includes(declaredOrigin.toUpperCase());
+      // Free/demand bootstrap atoms keep their own provenance. Mapping them to
+      // PR557 would grant the Q0 trading-semantics exemption to candidate
+      // Wikipedia/Wikidata vocabulary, which the admission program explicitly
+      // forbids: those surfaces still have to pass the semantic lexicon.
       const atomProvenance = isApprovedNativeSurface
         ? 'COUNTRY_VOCABULARY'
-        : isCdlBootstrapAtom
-          ? 'PR557'
-          : declaredOrigin && declaredOrigin.toUpperCase() !== 'LEGACY_COMPATIBILITY'
-            ? declaredOrigin
-            : source;
+        : declaredOrigin && declaredOrigin.toUpperCase() !== 'LEGACY_COMPATIBILITY'
+          ? declaredOrigin
+          : source;
       return {
         term: normalizedTerm,
         role: String(atom.role || (index === 0 ? 'ANCHOR' : 'MODIFIER')).toUpperCase() === 'ANCHOR' ? 'ANCHOR' as const : 'MODIFIER' as const,

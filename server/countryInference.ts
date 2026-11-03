@@ -234,13 +234,24 @@ export function countryIsoAlias(value: string): string | null {
 }
 
 /**
+ * Bare terms that also name a neighboring jurisdiction. A Wikidata result for
+ * South Sudan contains the whole word `sudan`, and North Korea contains
+ * `korea`; keeping those terms would file the wrong market under the
+ * requesting country. Those countries must match a more specific identity
+ * term instead.
+ */
+const AMBIGUOUS_IDENTITY_TERMS = new Set(['korea', 'sudan']);
+
+/**
  * Normalized identity terms that bind an external entity to a country:
  * canonical name, alias spellings, localized country names from the creator
  * bio vocabulary, exchange names, and known cities. Used to reject generic
  * search results that belong to another market. Two-letter Latin aliases are
  * omitted so ISO codes cannot match inside unrelated words. A two-character
  * CJK/Hangul name is a complete local word, not an abbreviation, so those
- * scripts keep short terms.
+ * scripts keep short terms. Social handles are deliberately not identity
+ * terms: they are generic tokens (`korea`, city nicknames) that match
+ * neighboring markets and add no evidence beyond the fields above.
  */
 export function countryIdentityTerms(value: string): string[] {
   const country = canonicalCountry(value);
@@ -259,9 +270,9 @@ export function countryIdentityTerms(value: string): string[] {
   if (signals) {
     signals.bio.forEach(add);
     signals.exchanges.forEach(add);
-    signals.social.forEach(add);
     signals.addresses.forEach(add);
   }
+  for (const ambiguous of AMBIGUOUS_IDENTITY_TERMS) terms.delete(ambiguous);
   return [...terms];
 }
 

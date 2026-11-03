@@ -662,7 +662,9 @@ export async function enqueueChildAndCommitPageReservation(input: {
   try {
     if (client) await activeRunner.query('BEGIN');
 
-    // 1. Enqueue child job inside transaction with preventReopen: true
+    // 1. Enqueue child job inside transaction. preventReopen defaults to true
+    // and is disabled only when the caller explicitly asks to reopen a
+    // terminal job for a recovered deferred page.
     const childJob = await enqueueJob(input.jobType, input.jobPayload, {
       priority: input.priority ?? 20,
       maxAttempts: input.maxAttempts ?? 3,

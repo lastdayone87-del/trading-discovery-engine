@@ -13,7 +13,8 @@ import {
   upsertChannel,
   enqueueJob,
   getQuota,
-  getAppSetting
+  getAppSetting,
+  getDb
 } from './db';
 import { calculateCreatorQualityScore, extractVocabularyFromCreator, invokeChannelVocabularyExtraction, replayVocabularyForRetry, resolveExtractionVideoIds } from './queryIntelligence';
 import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
@@ -983,13 +984,19 @@ async function processChannelThroughPipelineInContext(
   // also admit country-valid CONFIRMED + TRADING_CONFIRMED creators below the
   // quality bar. Those lower-quality observations are promotion-ineligible
   // and never write legacy extracted_vocabulary rows.
-  // Independent settings: one concurrent read avoids three serial round trips
-  // on the successful-ingestion path.
-  const [cdlEnabled, nativeExtractionFlagEnabled, promotionV2Enabled] = await Promise.all([
-    getAppSetting('country_discovery_loop_enabled', 'true').then(value => value === 'true'),
-    getAppSetting('native_vocabulary_extraction_enabled', 'true').then(value => value === 'true'),
-    getAppSetting('native_evidence_promotion_v2_enabled', 'true').then(value => value === 'true'),
-  ]);
+  // Independent settings: one query and one round trip avoids three serial
+  // setting reads on the successful-ingestion path.
+  const extractionSettings = await (await getDb()).query(
+    `SELECT setting_key,setting_value FROM app_settings WHERE setting_key = ANY($1)`,
+    [['country_discovery_loop_enabled', 'native_vocabulary_extraction_enabled', 'native_evidence_promotion_v2_enabled']],
+  );
+  const extractionValues = new Map<string, string>((extractionSettings.rows || []).map(
+    (row: Record<string, unknown>) => [String(row.setting_key), String(row.setting_value)],
+  ));
+  const extractionFlag = (key: string): boolean => (extractionValues.get(key) ?? 'true') === 'true';
+  const cdlEnabled = extractionFlag('country_discovery_loop_enabled');
+  const nativeExtractionFlagEnabled = extractionFlag('native_vocabulary_extraction_enabled');
+  const promotionV2Enabled = extractionFlag('native_evidence_promotion_v2_enabled');
   const extraction = resolveNativeExtractionEligibility({
     cdlEnabled,
     nativeExtractionFlagEnabled,

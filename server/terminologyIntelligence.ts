@@ -630,7 +630,10 @@ export function decideLifecycleV2(
   const reviewShare = totalAttributed > 0 ? input.needsReviewCreators / totalAttributed : 0;
   const nativeBuckets = Math.max(0, input.nativeEvidenceBuckets ?? input.nativeCreators);
   const externalSourceCount = Math.max(0, input.externalSourceCount ?? input.externalSources);
-  const externalEligible = input.externalEligible ?? externalSourceCount >= 2;
+  // The caller's evaluator is the only authority on family-diverse
+  // corroboration. A raw bucket count cannot prove two sources belong to
+  // different families, so an absent verdict fails closed.
+  const externalEligible = input.externalEligible ?? false;
   const nativeBasis = nativeBuckets >= policy.validationCreators;
   const mixedBasis = nativeBuckets >= 2 && externalSourceCount >= 1;
   const externalOnlyBasis = externalEligible && input.nativeCreators === 0;
@@ -642,6 +645,7 @@ export function decideLifecycleV2(
   // external units as well. Requiring the native-only three-bucket basis here
   // would leave every mixed term permanently non-search-eligible.
   const mixedTrialEvidence = mixedBasis && externalEligible &&
+    input.nativeNovel === true && input.spamConfirmed !== true &&
     input.decayedEvidence + Math.max(0, input.externalTrialEvidenceScore ?? 0) >= policy.trialEvidence &&
     freshConfirmedTradingCreators >= 1 && confirmedShare >= NATIVE_V2_MIN_CONFIRMED_SHARE;
   const externalTrialEvidence = externalOnlyBasis &&
@@ -705,10 +709,12 @@ export function decideLifecycleV2(
       wrongCountryCreators: input.wrongCountryCreators,
       needsReviewCreators: input.needsReviewCreators,
       validationBasis,
-      decayedEvidence: input.decayedEvidence,
       decayedYield: input.decayedYield,
     });
-    if (verdict.decision === 'PROMOTE') {
+    // PROVEN is a promotion beyond the trial bar: a term cannot skip the
+    // evidence threshold that SEARCH_TRIAL requires. This also keeps a mixed
+    // term with uncorroborated external evidence from proving directly.
+    if (verdict.decision === 'PROMOTE' && trialEvidence) {
       return { status: 'PROVEN_SEARCH_TERM', searchEligible: true, reason: verdict.reasons.join('; ') };
     }
   }
@@ -779,7 +785,6 @@ export function evaluateNativeTermPromotionV2(input: {
   wrongCountryCreators: number;
   needsReviewCreators: number;
   validationBasis: boolean;
-  decayedEvidence: number;
   decayedYield: number;
 }): { decision: 'PROMOTE' | 'HOLD' | 'REJECT'; reasons: string[]; metrics: NativePromotionMetrics } {
   const reasons: string[] = [];

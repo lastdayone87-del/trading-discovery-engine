@@ -78,5 +78,16 @@ test('run-wide metrics keep the rejected count on the same distinct set as the d
   // Whitespace-tolerant: this branch pretty-prints the returned object, while
   // the contract is the value identity, not the exact formatting.
   assert.match(source,/countryRejected:\s*rejected,/);
-  assert.match(source,/countryPrecision:\s*\(distinct\s*-\s*rejected\)\s*\/\s*distinct/);
+  assert.match(source,/countryPrecision:\s*distinct\s*\?\s*\(distinct\s*-\s*rejected\)\s*\/\s*distinct/);
+});
+test('run-wide sightings recompute duplicate metrics even when the distinct total matches',()=>{
+  const source=readFileSync(join(dirname(fileURLToPath(import.meta.url)),'autonomousPageStore.ts'),'utf8');
+  // Cross-page repeats change duplicateResults even when the run-wide distinct
+  // total happens to equal the per-page sum, so the recompute cannot be
+  // gated on the distinct count changing.
+  assert.match(source,/COUNT\(\*\)::int AS sightings/);
+  assert.match(source,/const sightingCount = Number\(sightings\.rows\[0\]\?\.sightings \|\| 0\)/);
+  assert.match(source,/if \(!sightingCount\) return metrics;/);
+  assert.ok(!source.includes('distinct === metrics.distinctResults'));
+  assert.match(source,/duplicateResults:\s*Math\.max\(0, evaluatedRawResults - distinct\)/);
 });

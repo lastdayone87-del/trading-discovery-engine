@@ -29,9 +29,11 @@ test('manual recheck may continue community inspection only through the explicit
 });
 
 test('manual recheck does not enqueue autonomous corpus harvests', () => {
+  const guardedBlock = /if \(extraction\.termHarvestEnabled && !isManualScan\) \{([\s\S]*?)\n  \}/.exec(ingestion);
+  assert.ok(guardedBlock, 'the guarded harvest block must exist');
   assert.match(
-    ingestion,
-    /if \(extraction\.termHarvestEnabled && !isManualScan\) \{\s*await enqueueTermHarvest\(\{channelId:finalChannel\.channel_id,[\s\S]*?lineage:'AUTONOMOUS'\}\);/,
+    guardedBlock[1],
+    /await enqueueTermHarvest\(\{channelId:finalChannel\.channel_id,[\s\S]*?lineage:'AUTONOMOUS'\}\);/,
     'operator-triggered rechecks must not enter AUTONOMOUS corpus lineage',
   );
 });

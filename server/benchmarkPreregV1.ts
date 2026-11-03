@@ -761,7 +761,7 @@ export const BENCHMARK_PREREG_DRIFT_KNOBS: Array<{ setting: string; env: string;
   { setting: 'discovery_autonomous_quota_percent', env: 'DISCOVERY_AUTONOMOUS_QUOTA_PERCENT', fallback: '70' },
   { setting: 'discovery_video_lane_percent', env: 'DISCOVERY_VIDEO_LANE_PERCENT', fallback: '70' },
   { setting: 'discovery_date_ordering_video_percent', env: 'DISCOVERY_DATE_ORDERING_VIDEO_PERCENT', fallback: '10' },
-  { setting: 'autonomous_pagination_max_pages', env: 'AUTONOMOUS_PAGINATION_MAX_PAGES', fallback: '3' },
+  { setting: 'autonomous_pagination_max_pages', env: 'AUTONOMOUS_PAGINATION_MAX_PAGES', fallback: '50' },
   { setting: 'autonomous_pagination_max_low_yield_pages', env: 'AUTONOMOUS_PAGINATION_MAX_LOW_YIELD_PAGES', fallback: '2' },
 ];
 
