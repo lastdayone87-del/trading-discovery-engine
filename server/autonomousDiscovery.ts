@@ -24,7 +24,7 @@ import {
   type SelectionExperimentRequest,
 } from './querySelectionExperiments';
 import { calculateDiscoveryCapacity } from './discoverySchedulerPolicy';
-import { getAllocatedResearchQuery, markResearchActionQueued } from './persistentResearch';
+import { getAllocatedResearchQuery, markResearchActionQueued, rejectResearchAction } from './persistentResearch';
 import { runPersistentResearchCycle } from './persistentResearchController';
 import { creatorIntelligenceChecksum } from './creatorIntelligence/contracts';
 import { bindCreatorCanaryQueryRun, type CreatorCanaryAssignment } from './creatorIntelligence/canary';
@@ -530,7 +530,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         console.warn('[CreatorIntelligence] Search allocation authority unavailable; legacy Query Intelligence fallback continues:', error instanceof Error ? error.message : error);
       }
 
-      let research: { actionId: string; queryRecord: any } | null = null;
+      let research: { actionId: string; queryRecord: any; reservationOwner: string } | null = null;
       // Persistent Research runs ONLY on the control/legacy path when frontier allocation is NOT authorized
       // and no benchmark-designated scope is active (benchmark attempts must
       // never schedule unrelated research work as a designated observation).
@@ -538,7 +538,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         research = await getAllocatedResearchQuery(country);
       }
 
-      let selected: { queryRecord: any; selectionStrategy: any; reason: string };
+      let selected: { queryRecord: any; selectionStrategy: any; reason: string; quotaFreeRequired?: boolean };
       // Experiment envelope for the scheduled run, if an opt-in selection
       // experiment served this attempt. Null on every legacy path (targeted,
       // research, native, or no experiment requested).
@@ -658,7 +658,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
           // Opt-in experimental selection substitutes the UCB1 call at this
           // legacy site only. A null experimental result propagates as-is to
           // the existing skip path below (never re-runs legacy selection).
-          let fallbackSelection: { queryRecord: any; selectionStrategy: any; reason: string } | null;
+          let fallbackSelection: { queryRecord: any; selectionStrategy: any; reason: string; quotaFreeRequired?: boolean } | null;
           let fallbackExperiment: SelectionExperimentObservation | null = null;
           if (normalizedExperiment) {
             const experimental = await selectExperimentalQueryForCountry(legacyCountry, normalizedExperiment, { opportunityKey: `${opportunityKey}:fallback`, scopePromotionBasis });
@@ -688,7 +688,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         }
       } else {
         // Same opt-in substitution as the fallback site above.
-        let legacySelection: { queryRecord: any; selectionStrategy: any; reason: string } | null;
+        let legacySelection: { queryRecord: any; selectionStrategy: any; reason: string; quotaFreeRequired?: boolean } | null;
         let legacyExperiment: SelectionExperimentObservation | null = null;
         if (normalizedExperiment) {
           const experimental = await selectExperimentalQueryForCountry(country, normalizedExperiment, { opportunityKey: `${opportunityKey}:legacy`, scopePromotionBasis });
@@ -749,6 +749,13 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         }
         await setQueryCollection(selected.queryRecord.id, 'REJECTED')
           .catch(error => console.warn('[Autonomous Producer] Failed to quarantine unsafe query:', error));
+        // A rejected research allocation must not keep holding its slot until
+        // expiry; otherwise the same inadmissible query is materialized and
+        // rejected again on the next cycle.
+        if (research) {
+          await rejectResearchAction(research.actionId, `Query authority rejected query: ${queryAuthority.reasonCodes.join(', ')}`, research.reservationOwner)
+            .catch(error => console.warn('[Autonomous Producer] Failed to settle rejected research action:', error));
+        }
         candidateDiagnostic = { ...candidateDiagnostic, disposition: 'SKIPPED', reasonCode: 'QUERY_INTELLIGENCE_AUTHORITY_REJECTED', schedulingOutcome: 'NOT_REACHED' };
         recordCandidateDiagnostic(candidateDiagnostic);
         continue;
@@ -769,6 +776,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         query: selected.queryRecord,
         strategy: selected.selectionStrategy,
         reason: `${selected.reason} Execution authority: ${queryAuthority.reasonCodes.join(', ')}.`,
+        quotaFreeRequired: selected.quotaFreeRequired === true,
         allocationOrigin: frontierAllocationInfo?.authorized ? 'FRONTIER_CANARY' : 'LEGACY',
         frontierDecisionId: frontierAllocationInfo?.authorized ? frontierAllocationInfo.decision?.decisionId : undefined,
         targetNeighborhoodDimensions: frontierAllocationInfo?.authorized ? frontierAllocationInfo.targetNeighborhoodDimensions : undefined,

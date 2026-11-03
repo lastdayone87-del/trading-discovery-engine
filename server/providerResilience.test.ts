@@ -3,6 +3,7 @@ import { executeProviderCall, classifyProviderError, ProviderCallError, decideGe
 
 test('successful calls emit bounded, payload-free cost telemetry',async()=>{const events:ProviderCallEvent[]=[];const result=await executeProviderCall({context:{provider:'fake',operation:'read',actualCost:3,requestId:'r',runId:'run-1',jobId:'job-1',requestMetadata:{regionCode:'FR',relevanceLanguage:'fr'},attempt:2},timeoutMs:50,call:async()=>({secret:'not logged'}),emit:async e=>{events.push(e)}});assert.equal(result.secret,'not logged');assert.equal(events[0].status,'SUCCESS');assert.equal(events[0].actualCost,3);assert.equal(events[0].requestId,'r');assert.equal(events[0].runId,'run-1');assert.equal(events[0].jobId,'job-1');assert.deepEqual(events[0].requestMetadata,{regionCode:'FR',relevanceLanguage:'fr'});assert.equal(events[0].attempt,2);assert.equal(JSON.stringify(events).includes('not logged'),false)});
 test('deadline aborts a fake provider and produces a retryable typed timeout',async()=>{const events:ProviderCallEvent[]=[];await assert.rejects(executeProviderCall({context:{provider:'fake',operation:'hang'},timeoutMs:10,call:signal=>new Promise((_r,reject)=>signal.addEventListener('abort',()=>reject(new Error('aborted')))),emit:async e=>{events.push(e)}}),(e:any)=>e instanceof ProviderCallError&&e.errorClass==='TIMEOUT'&&e.retryable);assert.equal(events[0].status,'TIMEOUT')});
+test('a caller-supplied TIMEOUT abort keeps its class instead of collapsing to CANCELLED',async()=>{const events:ProviderCallEvent[]=[];const controller=new AbortController();await assert.rejects(executeProviderCall({context:{provider:'fake',operation:'read'},timeoutMs:500,signal:controller.signal,call:signal=>new Promise((_resolve,reject)=>{signal.addEventListener('abort',()=>reject(new Error('caller aborted')));controller.abort({errorClass:'TIMEOUT'});}),emit:async event=>{events.push(event)}}),(error:any)=>error instanceof ProviderCallError&&error.errorClass==='TIMEOUT'&&error.retryable);assert.equal(events[0].status,'TIMEOUT')});
 test('rate-limit classification preserves provider diagnostics',()=>{const source=Object.assign(new Error('YouTube HTTP 429 RESOURCE_EXHAUSTED (RATE_LIMIT_EXCEEDED)'),{status:429,quotaExceeded:false,providerReasons:['RATE_LIMIT_EXCEEDED']});const error=classifyProviderError(source);assert.equal(error.status,429);assert.equal(error.quotaExceeded,false);assert.deepEqual(error.providerReasons,['RATE_LIMIT_EXCEEDED']);assert.equal(error.cause,source)});
 test('permanent input classification preserves safe status metadata',()=>{const source=Object.assign(new Error('bad request'),{status:400,providerReasons:['INVALID_ARGUMENT']});const error=classifyProviderError(source);assert.equal(error.errorClass,'PERMANENT_INPUT');assert.equal(error.status,400);assert.deepEqual(error.providerReasons,['INVALID_ARGUMENT']);assert.equal(error.retryable,false)});
 test('cancellation and retry classes are deterministic',()=>{assert.equal(classifyProviderError(Object.assign(new Error('x'),{status:429})).errorClass,'RATE_LIMIT');assert.equal(classifyProviderError(Object.assign(new Error('x'),{status:400})).retryable,false);assert.equal(classifyProviderError(Object.assign(new Error('x'),{status:503})).errorClass,'TRANSIENT')});
@@ -34,4 +35,17 @@ test('Gemini capacity queries are route-scoped while legacy events remain on rou
   const source=readFileSync('server/providerResilience.ts','utf8');
   assert.match(source,/COALESCE\(request_metadata->>'geminiRoute',\$1\)=\$1/);
   assert.match(source,/COALESCE\(request_metadata->>'geminiRoute',\$2\)=\$2/);
+});
+
+test('an already-aborted caller never starts a provider call',async()=>{
+  let called=0;
+  const controller=new AbortController(); controller.abort();
+  await assert.rejects(executeProviderCall({
+    context:{provider:'fake',operation:'read'},
+    timeoutMs:50,
+    signal:controller.signal,
+    call:async()=>{called++;return {ok:true}},
+    emit:async()=>undefined,
+  }),(error:any)=>error instanceof ProviderCallError&&error.errorClass==='CANCELLED');
+  assert.equal(called,0);
 });

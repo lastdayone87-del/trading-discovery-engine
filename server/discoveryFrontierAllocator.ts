@@ -760,7 +760,7 @@ export async function evaluateFrontierCanaryAllocation(input: {
 
     // Quota-free providers (YouTube.js/InnerTube) reserve 0 official units at
     // every frontier accounting site below; the official path keeps 100.
-    const providerQuotaUnits = allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE' ? 0 : estimatedQuota;
+    const providerQuotaUnits = allocatedProvider.costDomain==='YOUTUBE_DATA_API' ? estimatedQuota : 0;
 
     // A process can die after Phase 8 reserves but before the scheduling transaction.
     // Expire those orphaned reservations under the allocation authority lock.

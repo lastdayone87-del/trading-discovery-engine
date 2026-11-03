@@ -47,6 +47,7 @@ import {
   rotateAwayFromMostRecentIntent,
 } from './queryPlanner';
 import { selectNextQueryForCountry } from './queryIntelligence';
+import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
 import { getQueriesByCountry, getAppSetting } from './db';
 import type { QueryRecord } from '../src/types';
 
@@ -807,6 +808,8 @@ export async function selectExperimentalQueryForCountry(
   queryRecord: QueryRecord;
   selectionStrategy: string;
   reason: string;
+  /** Scheduling must allocate a registry-backed quota-free provider. */
+  quotaFreeRequired?: boolean;
   experiment: SelectionExperimentObservation | null;
 } | null> {
   const now = new Date();
@@ -842,7 +845,12 @@ export async function selectExperimentalQueryForCountry(
     // eligible query yields no candidate — never a cycle-failing exception
     // merely because the experimental wrapper is active.
     if (!base) return null;
-    return { queryRecord: base.queryRecord, selectionStrategy: base.selectionStrategy, reason: base.reason };
+    return {
+      queryRecord: base.queryRecord,
+      selectionStrategy: base.selectionStrategy,
+      reason: base.reason,
+      quotaFreeRequired: base.quotaFreeRequired,
+    };
   };
   if (!selection || !eligibility.eligible) {
     const base = await delegateLegacy();
@@ -860,7 +868,7 @@ export async function selectExperimentalQueryForCountry(
         experimentId: orderingExperimentId,
         assignment: controlAssignment,
         eligibility: 'SELECTION_EXPERIMENT_NOT_REQUESTED',
-        reason: 'No selection experiment requested: UCB1 selection unchanged; ordering dimension evaluated independently.',
+        reason: 'No selection experiment requested: serving selector unchanged; ordering dimension evaluated independently.',
         opportunityKey: options.opportunityKey,
         thompsonPrior: { alpha0: 1, beta0: 1 },
         contextualWeights: { value: 0.5, exploration: 0.35, cost: 0.1 },
@@ -894,9 +902,10 @@ export async function selectExperimentalQueryForCountry(
       queryRecord: base.queryRecord,
       selectionStrategy: base.selectionStrategy,
       reason: base.reason,
+      quotaFreeRequired: base.quotaFreeRequired,
       experiment: buildSelectionExperimentObservation({
         ...envelopeBase,
-        reason: 'Control arm: UCB1 selection unchanged.',
+        reason: 'Control arm: serving selector unchanged.',
         benchmarkOpportunityId: benchmarkOpportunityIdForScope(experiment?.benchmark ?? null, base.queryRecord.id, experiment),
         poolQueryIds: [],
         winner: null,
@@ -904,10 +913,22 @@ export async function selectExperimentalQueryForCountry(
       }),
     };
   }
-  // Treatment: same eligibility pipeline as control (cooldown/diversity/intent),
-  // deterministic pool order (id ascending) so arm indexes are replay-stable.
+  // Treatment: the control eligibility pipeline (cooldown/diversity/intent)
+  // plus the execution-authority gate, deterministic pool order (id ascending)
+  // so arm indexes are replay-stable. This population difference is explicit:
+  // treatment can only select queries that would actually be allowed to run.
   const queries = (await getQueriesByCountry(country)).filter(query => reservableFilter(query, now));
   let eligible = limitRepeatedPrimaryTerms(queriesOutsideCooldown(queries, now, cooldownMinutes), queries, now, cooldownMinutes, maxPrimaryUses);
+  // The experiment pool must obey the exact authority gate the scheduler runs
+  // immediately before execution, including retrieval provenance and the live
+  // scope-promotion decision. Apply it before intent rotation: filtering after
+  // rotation can discard every admission-valid treatment candidate and
+  // silently serve a control fallback. An admission-only check was weaker
+  // than execution authority, so a stale or missing retrieval provenance could
+  // still win the arm and consume the opportunity.
+  eligible = eligible.filter(query => evaluateAutonomousQueryAuthority(query, {
+    scopePromotionActive: options.scopePromotionBasis != null,
+  }).eligible);
   eligible = rotateAwayFromMostRecentIntent(eligible, queries);
   eligible = [...eligible].sort((a, b) => a.id - b.id);
   if (!eligible.length) {
@@ -917,9 +938,10 @@ export async function selectExperimentalQueryForCountry(
       queryRecord: base.queryRecord,
       selectionStrategy: base.selectionStrategy,
       reason: base.reason,
+      quotaFreeRequired: base.quotaFreeRequired,
       experiment: buildSelectionExperimentObservation({
         ...envelopeBase,
-        reason: 'Requested treatment arm but the eligible pool was empty; served UCB1 fallback.',
+        reason: 'Requested treatment arm but the eligible pool was empty; served control fallback.',
         benchmarkOpportunityId: benchmarkOpportunityIdForScope(experiment?.benchmark ?? null, base.queryRecord.id, experiment),
         poolQueryIds: [],
         winner: null,

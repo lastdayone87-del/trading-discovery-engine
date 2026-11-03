@@ -8,6 +8,7 @@ import {
   discoverRequiredSeedLinks,
   normalizeVisitUrl,
   visitIdentityKeys,
+  renderedTerminalSuccessIdentities,
   classifyRequiredCoverage,
   resolveRenderedCompletionState,
 } from './browserCommunityFallback';
@@ -58,6 +59,27 @@ test('v2: required-set discovery uses the enqueue predicate exactly', () => {
   assert.ok(!links.some((url) => url.includes('logo.png')));
   assert.equal(normalizeVisitUrl('https://Example.COM/a/'), 'https://example.com/a');
   assert.equal(normalizeVisitUrl('not a url'), null);
+});
+
+// P1.5: static link resolution honors the document's first <base href>, so a
+// relative community link is discovered where the page actually points.
+test('v2: required-set discovery resolves relative hrefs against <base href>', () => {
+  const links = discoverRequiredSeedLinks(
+    '<base href="/community/"><a href="join">join the community</a>',
+    PAGE,
+  );
+  assert.deepEqual(links, ['https://creator.example.com/community/join']);
+});
+
+// P1.5: a cross-host base makes relative links resolve off-host; they cannot
+// become same-host required obligations, while absolute same-host links still
+// work.
+test('v2: cross-host <base href> cannot create same-host required links', () => {
+  const links = discoverRequiredSeedLinks(
+    '<base href="https://cdn.example.net/community/"><a href="join">join the community</a><a href="https://creator.example.com/community">c</a>',
+    PAGE,
+  );
+  assert.deepEqual(links, ['https://creator.example.com/community']);
 });
 
 // Seed fan-out: bare/www duplicates collapse; distinct coverage never merges.
@@ -327,6 +349,53 @@ test('v2: fully covered seeds reuse rendered evidence without refetch', async ()
   assert.ok(JSON.stringify(result.steps || []).includes('[Shared evidence] https://share.example.com/shared reuses rendered inspection'));
 });
 
+// A complete-looking lender with a non-COMPLETE coverage reason must never be
+// reused as clean rendered evidence: the borrower re-renders instead.
+test('v2: a coverage-gapped lender does not feed shared rendered evidence', async () => {
+  const renderedCalls: string[] = [];
+  const lender = 'https://lender.example.com/';
+  const borrower = 'https://borrower.example.com/';
+  const result = await runChannelInspection({
+    channelId: 'v2-gapped-lender',
+    channelName: 'Gapped Lender Channel',
+    channelBio: 'Trading notes',
+    siteInspectionStore: makeIsolatedStore(),
+    channelLinks: [lender, borrower],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: (async (input) => {
+      const url = String(input);
+      if (url === lender) return html(`<a href="${borrower}">community hub</a>`);
+      return noInviteHtml();
+    }) as typeof fetch,
+    renderedFallback: (async (seedUrl: string): Promise<BrowserFallbackResult> => {
+      renderedCalls.push(seedUrl);
+      return {
+        foundInvite: null,
+        foundLocation: seedUrl,
+        candidates: [],
+        inspectedPages: seedUrl === lender ? 2 : 1,
+        scrolls: 0,
+        clicks: 0,
+        complete: true,
+        retryable: false,
+        timedOut: false,
+        telemetry: { coverageReason: seedUrl === lender ? 'POLICY_EXCLUDED' : 'COMPLETE' } as never,
+        detail: 'rendered run',
+        visitedUrls: seedUrl === lender ? [lender, borrower] : [seedUrl],
+        requiredTotal: seedUrl === lender ? 2 : 1,
+        pageHintLinks: seedUrl === lender ? { [lender]: [borrower] } : undefined,
+      };
+    }),
+  });
+  assert.ok(renderedCalls.includes(lender));
+  assert.ok(renderedCalls.includes(borrower), 'a coverage-gapped lender must not be reused');
+  assert.ok(
+    !JSON.stringify(result.steps || []).includes('[Shared evidence]'),
+    'no shared-evidence reuse may be recorded from a gapped lender',
+  );
+});
+
 // Consecutive-tail helper covers budget-gap tails identically to timeouts.
 test('v2: Skool-shaped healthy timeout with required coverage resolves sufficient', async () => {
   const result = await runChannelInspection({
@@ -407,6 +476,88 @@ test('v2 review: visit identities unify request and final page evidence', () => 
   assert.ok(visitIdentityKeys('', '').length === 0);
 });
 
+// REVIEW: a click that commits a new document must not lend that unexamined
+// document terminal-success coverage; redirects still cover both identities.
+test('v2 review: terminal success prefers the inspected document over a click replacement', () => {
+  assert.deepEqual(
+    renderedTerminalSuccessIdentities({
+      requestUrl: 'https://redir.example.com/go',
+      initialDocumentUrl: 'https://redir.example.com/go',
+      inspectedDocumentUrl: 'https://redir.example.com/go',
+      finalDocumentUrl: 'https://redir.example.com/landing',
+      documentReplacedByClick: false,
+    }),
+    ['https://redir.example.com/go', 'https://redir.example.com/landing'],
+    'a redirect commits before inspection, so both identities are terminal success',
+  );
+  assert.deepEqual(
+    renderedTerminalSuccessIdentities({
+      requestUrl: 'https://creator.example.com/',
+      initialDocumentUrl: 'https://creator.example.com/',
+      inspectedDocumentUrl: 'https://creator.example.com/',
+      finalDocumentUrl: 'https://creator.example.com/community',
+      documentReplacedByClick: true,
+    }),
+    ['https://creator.example.com/'],
+    'a click replacement was never enumerated, so its URL is not borrowed coverage',
+  );
+  assert.deepEqual(
+    renderedTerminalSuccessIdentities({
+      requestUrl: 'https://creator.example.com/go',
+      initialDocumentUrl: 'https://creator.example.com/landing',
+      inspectedDocumentUrl: 'https://creator.example.com/landing',
+      finalDocumentUrl: 'https://creator.example.com/community',
+      documentReplacedByClick: true,
+    }),
+    ['https://creator.example.com/go', 'https://creator.example.com/landing'],
+    'the redirect target was inspected even when a later click replaced it',
+  );
+  assert.deepEqual(
+    renderedTerminalSuccessIdentities({
+      requestUrl: 'https://creator.example.com/menu',
+      initialDocumentUrl: 'https://creator.example.com/landing',
+      inspectedDocumentUrl: 'https://creator.example.com/landing?menu=open',
+      finalDocumentUrl: 'https://creator.example.com/community',
+      documentReplacedByClick: true,
+    }),
+    [
+      'https://creator.example.com/menu',
+      'https://creator.example.com/landing',
+      'https://creator.example.com/landing?menu=open',
+    ],
+    'the redirect landing URL stays inspected evidence after a history update and click replacement',
+  );
+  assert.deepEqual(
+    renderedTerminalSuccessIdentities({
+      requestUrl: 'https://creator.example.com/',
+      initialDocumentUrl: 'https://creator.example.com/',
+      inspectedDocumentUrl: 'https://creator.example.com/',
+      finalDocumentUrl: 'https://creator.example.com/community',
+      documentReplacedByClick: false,
+    }),
+    ['https://creator.example.com/', 'https://creator.example.com/community'],
+    'a same-document history update keeps the processed document and its new identity',
+  );
+  assert.deepEqual(
+    classifyRequiredCoverage({
+      requiredKeys: [
+        'https://creator.example.com/',
+        'https://creator.example.com/community',
+      ],
+      succeededKeys: renderedTerminalSuccessIdentities({
+        requestUrl: 'https://creator.example.com/',
+        initialDocumentUrl: 'https://creator.example.com/',
+        inspectedDocumentUrl: 'https://creator.example.com/',
+        finalDocumentUrl: 'https://creator.example.com/community',
+        documentReplacedByClick: true,
+      }),
+      failedClassesByKey: {},
+    }).unvisited,
+    ['https://creator.example.com/community'],
+    'an unexamined click replacement stays a required gap instead of resolving clean',
+  );
+});
+
 // REVIEW: shared-covered members satisfy required items; fresh terminal
 // failures always win over borrowed success.
 test('v2 review: coverage classifier honors shared evidence without hiding fresh failures', () => {
@@ -479,6 +630,45 @@ test('v2 review: required permanent failure owns no retry', async () => {
   assert.ok(permObs, 'permanent required failure stays visible');
   assert.equal(permObs?.retryable, false);
   assert.equal(result.retryDirective, undefined);
+});
+
+// REVIEW: budget-expired tails are suppressed after the exhaustion threshold.
+test('v2 review: repeated budget-expired tails stop owning retries', async () => {
+  const seed = 'https://budgettailed.example.com/';
+  const observedAt = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
+  const result = await runChannelInspection({
+    channelId: 'v2-budget-tail',
+    channelName: 'Budget Tail Channel',
+    channelBio: 'Trading notes',
+    siteInspectionStore: makeIsolatedStore(),
+    channelLinks: [seed],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: (async () => noInviteHtml()) as typeof fetch,
+    renderedFallback: (async (seedUrl: string): Promise<BrowserFallbackResult> => ({
+      foundInvite: null,
+      foundLocation: seedUrl,
+      candidates: [],
+      inspectedPages: 2,
+      scrolls: 0,
+      clicks: 0,
+      complete: false,
+      retryable: true,
+      timedOut: true,
+      dropReasons: { 'page-budget': 1 },
+      coverageGapRetryable: true,
+      telemetry: { coverageReason: 'BOUNDED', unresolvedFailedRequests: 0 } as never,
+      detail: 'Rendered acquisition budget expired before coverage completed',
+    })),
+    urlFailureHistoryLoader: (async () => [
+      { requestedUrl: seed, failureClass: 'RENDERED_BUDGET_EXPIRED', outcome: 'PARTIALLY_INSPECTED', observedAt: observedAt(2) },
+      { requestedUrl: seed, failureClass: 'RENDERED_BUDGET_EXPIRED', outcome: 'PARTIALLY_INSPECTED', observedAt: observedAt(1) },
+    ]) as never,
+  });
+  assert.ok(
+    (result.retrySuppressedUrls || []).some((url) => url.includes('budgettailed.example.com')),
+    'two prior identical budget tails must suppress the next retry',
+  );
 });
 
 // REVIEW: FOUND rows carrying gap classes accumulate tails; plain FOUND breaks them.
@@ -597,6 +787,224 @@ test('v2 review: shared static roots skip refetch but still acquire children', a
   assert.equal(rootRows.length, 1);
   assert.equal(rootRows[0].sharedEvidenceFrom, 'https://dup.example.com/');
   assert.equal(rootRows[0].telemetry?.pagesInspected, 1);
+});
+
+// P1.5: static navigation must resolve anchors against the document's
+// <base href>, not just the response URL, or a relative invite page is never
+// scanned.
+test('v2 review: static crawl resolves anchors against the document base href', async () => {
+  const fetched: string[] = [];
+  const result = await crawlExternalLinks(
+    ['https://base.example.com/guide'],
+    [],
+    undefined,
+    (async (input) => {
+      const url = String(input);
+      fetched.push(url);
+      if (url === 'https://base.example.com/guide') {
+        return html('<base href="/community/"><a href="join">join the community</a>');
+      }
+      return noInviteHtml();
+    }) as typeof fetch,
+  );
+  assert.ok(
+    result.rootNavigation?.some((item) => item.url === 'https://base.example.com/community/join'),
+    'root navigation resolves the relative join link against <base href>',
+  );
+  assert.ok(
+    fetched.includes('https://base.example.com/community/join'),
+    'the static crawler fetches the base-resolved invite page',
+  );
+});
+
+test('v2 review: static crawl resolves dynamic targets against the document base href', async () => {
+  const fetched: string[] = [];
+  await crawlExternalLinks(
+    ['https://base.example.com/guide'],
+    [],
+    undefined,
+    (async (input) => {
+      const url = String(input);
+      fetched.push(url);
+      if (url === 'https://base.example.com/guide') {
+        return html('<base href="/community/"><div data-href="members">members area</div>');
+      }
+      return noInviteHtml();
+    }) as typeof fetch,
+  );
+  assert.ok(
+    fetched.includes('https://base.example.com/community/members'),
+    'the static crawler fetches the base-resolved dynamic target',
+  );
+});
+
+test('v2 review: cross-host <base href> cannot make a static crawl fetch off-host', async () => {
+  const fetched: string[] = [];
+  const result = await crawlExternalLinks(
+    ['https://base.example.com/guide'],
+    [],
+    undefined,
+    (async (input) => {
+      const url = String(input);
+      fetched.push(url);
+      if (url === 'https://base.example.com/guide') {
+        // The cross-host base must not become a target itself, and ordinary
+        // relative links resolve off-host with no community evidence, so the
+        // existing cross-origin policy rejects them.
+        return html(
+          '<base href="https://cdn.example.net/guide/">' +
+            '<a href="page">docs</a>' +
+            '<div data-href="article">article</div>' +
+            '<a href="https://base.example.com/community">c</a>',
+        );
+      }
+      return noInviteHtml();
+    }) as typeof fetch,
+  );
+  assert.ok(
+    !fetched.some((url) => url.includes('cdn.example.net')),
+    'relative anchors and dynamic targets resolve off-host and are not fetched',
+  );
+  assert.ok(
+    !result.rootNavigation?.some((item) => item.url.includes('cdn.example.net')),
+    'no off-host navigation candidate is enqueued',
+  );
+  assert.ok(
+    fetched.includes('https://base.example.com/community'),
+    'an absolute same-host link still works under a cross-host base',
+  );
+});
+
+test('v2 review: base-button elements keep their dynamic community targets', async () => {
+  const fetched: string[] = [];
+  await crawlExternalLinks(
+    ['https://base.example.com/guide'],
+    [],
+    undefined,
+    (async (input) => {
+      const url = String(input);
+      fetched.push(url);
+      if (url === 'https://base.example.com/guide') {
+        return html('<base href="community/"><base-button data-href="members">members area</base-button>');
+      }
+      return noInviteHtml();
+    }) as typeof fetch,
+  );
+  assert.ok(
+    fetched.includes('https://base.example.com/community/members'),
+    'a base-prefixed custom element is not mistaken for a base tag',
+  );
+});
+
+test('v2 review: markup-looking script text does not hide a real community control', async () => {
+  const fetched: string[] = [];
+  await crawlExternalLinks(
+    ['https://script.example.com/guide'],
+    [],
+    undefined,
+    (async (input) => {
+      const url = String(input);
+      fetched.push(url);
+      if (url === 'https://script.example.com/guide') {
+        return html('<script>const basePrefix = "<base ";</script><button data-href="/community/join">Join the community</button>');
+      }
+      return noInviteHtml();
+    }) as typeof fetch,
+  );
+  assert.ok(
+    fetched.includes('https://script.example.com/community/join'),
+    'a raw <base string in script text must not delete a real control',
+  );
+});
+
+test('v2 review: a button sharing the base value is not filtered out', async () => {
+  const fetched: string[] = [];
+  await crawlExternalLinks(
+    ['https://base.example.com/guide'],
+    [],
+    undefined,
+    (async (input) => {
+      const url = String(input);
+      fetched.push(url);
+      if (url === 'https://base.example.com/guide') {
+        return html('<base href="/community/"><button data-href="/community/">Join</button>');
+      }
+      return noInviteHtml();
+    }) as typeof fetch,
+  );
+  assert.ok(
+    fetched.includes('https://base.example.com/community/'),
+    'removing the base element must not remove a real target with the same value',
+  );
+});
+
+test('v2 review: base-resolved relative Discord anchor is retained without a navigation fetch', async () => {
+  const fetched: string[] = [];
+  const result = await crawlExternalLinks(
+    ['https://base.example.com/guide'],
+    [],
+    undefined,
+    (async (input) => {
+      const url = String(input);
+      fetched.push(url);
+      if (url === 'https://base.example.com/guide') {
+        return new Response(
+          '<html><head><base href="https://discord.gg/"></head><body><a href="Abc123">join</a></body></html>',
+          { status: 200, headers: { 'content-type': 'text/html' } },
+        );
+      }
+      return new Response('forbidden', { status: 403 });
+    }) as typeof fetch,
+  );
+  assert.equal(result.foundInvite, 'Abc123');
+  assert.ok(result.candidates.some((candidate) => candidate.nativeInviteCode === 'Abc123'));
+  assert.equal(
+    fetched.includes('https://discord.gg/Abc123'),
+    false,
+    'the resolved invite is retained from the page, not fetched as navigation',
+  );
+});
+
+test('v2 review: base-resolved relative dynamic Discord target is retained directly', async () => {
+  const result = await crawlExternalLinks(
+    ['https://base.example.com/guide'],
+    [],
+    undefined,
+    (async (input) => {
+      const url = String(input);
+      if (url === 'https://base.example.com/guide') {
+        return new Response(
+          '<html><head><base href="https://discord.gg/"></head><body><div data-href="Dyn123">join</div></body></html>',
+          { status: 200, headers: { 'content-type': 'text/html' } },
+        );
+      }
+      return new Response('forbidden', { status: 403 });
+    }) as typeof fetch,
+  );
+  assert.equal(result.foundInvite, 'Dyn123');
+});
+
+test('v2 review: dynamic-target scan does not queue the base href as a target', async () => {
+  const fetched: string[] = [];
+  await crawlExternalLinks(
+    ['https://base.example.com/guide'],
+    [],
+    undefined,
+    (async (input) => {
+      const url = String(input);
+      fetched.push(url);
+      if (url === 'https://base.example.com/guide') {
+        return html('<base href="community/"><div data-href="members">members area</div>');
+      }
+      return noInviteHtml();
+    }) as typeof fetch,
+  );
+  assert.equal(
+    fetched.includes('https://base.example.com/community/community/'),
+    false,
+    'the base element is a resolution rule, not a navigation target',
+  );
+  assert.ok(fetched.includes('https://base.example.com/community/members'));
 });
 
 test('v2 review: shared static root replay carries lender community intent to the borrower', async () => {
@@ -774,7 +1182,9 @@ test('v2 review: scheduler and worker wiring call sites are pinned', () => {
   // Capture the original page's anchors before any control click can navigate
   // the document away; the post-click enqueue then covers JS-revealed links.
   const enqueuePos = fallback.indexOf("await enqueueLinks({ strategy: 'same-hostname'");
-  const clickPos = fallback.indexOf('const clickLoop = await runRenderedClickLoop({');
+  // The click loop is wrapped in try/finally so the popup listener is always
+  // removed; the assignment is therefore not a `const` declaration.
+  const clickPos = fallback.indexOf('clickLoop = await runRenderedClickLoop({');
   const postClickEnqueuePos = fallback.indexOf("await enqueueLinks({strategy:'same-hostname'", clickPos);
   assert.ok(enqueuePos !== -1 && clickPos !== -1 && enqueuePos < clickPos, 'anchors enqueue before navigating clicks');
   assert.ok(postClickEnqueuePos > clickPos, 'JS-revealed anchors enqueue after clicks');

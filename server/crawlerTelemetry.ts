@@ -71,6 +71,127 @@ export function isCeilingKind(value: unknown): value is CeilingKind {
   return typeof value === 'string' && (CEILING_KINDS as readonly string[]).includes(value);
 }
 
+/**
+ * Closed taxonomy for navigation exclusions recorded alongside rendered
+ * telemetry. These are counts only, never URLs/selectors/text. The first four
+ * are policy exclusions that can hide an unexamined destination; the last two
+ * are click/selection exclusions already represented by the interaction
+ * certificate and are retained here so the persisted record is self-contained.
+ */
+export const NAVIGATION_POLICY_EXCLUSION_REASONS = [
+  'invalid-protocol',
+  'admission-rejected',
+  'cross-origin-disallowed',
+  'destination-budget',
+  'control-slice',
+  'hint-rejected',
+] as const;
+export type NavigationPolicyExclusionReason = typeof NAVIGATION_POLICY_EXCLUSION_REASONS[number];
+export function isNavigationPolicyExclusionReason(value: unknown): value is NavigationPolicyExclusionReason {
+  return typeof value === 'string' && (NAVIGATION_POLICY_EXCLUSION_REASONS as readonly string[]).includes(value);
+}
+
+/** Bounded, taxonomy-checked navigation-exclusion counters. */
+export function sanitizeNavigationPolicyExcluded(
+  input: unknown,
+): Partial<Record<NavigationPolicyExclusionReason, number>> {
+  const excluded: Partial<Record<NavigationPolicyExclusionReason, number>> = {};
+  if (input && typeof input === 'object') {
+    for (const [key, value] of Object.entries(input)) {
+      if (isNavigationPolicyExclusionReason(key) && typeof value === 'number' && Number.isFinite(value) && value > 0) {
+        excluded[key] = Math.min(999999, Math.floor(value));
+      }
+    }
+  }
+  return excluded;
+}
+
+/**
+ * Diagnostic coverage certificate for rendered rows. It is deliberately
+ * separate from outcome/retry semantics: P0.2 measures, P1.7 decides when a
+ * bounded/policy/context reason must become PARTIALLY_INSPECTED.
+ */
+export const RENDERED_COVERAGE_REASONS = [
+  'COMPLETE',
+  'BOUNDED',
+  'POLICY_EXCLUDED',
+  'CONTEXT_UNREACHABLE',
+  'UNKNOWN',
+] as const;
+export type RenderedCoverageReason = typeof RENDERED_COVERAGE_REASONS[number];
+export function isRenderedCoverageReason(value: unknown): value is RenderedCoverageReason {
+  return typeof value === 'string' && (RENDERED_COVERAGE_REASONS as readonly string[]).includes(value);
+}
+
+export interface RenderedCoverageInput {
+  pagesInspected: number;
+  budgetExhausted?: boolean;
+  interactionGap?: boolean;
+  scrollCapReachedStillGrowing?: boolean;
+  /** Context sampling was abandoned for at least one page (no trustworthy
+   * document identity), so unreached frames/shadow roots cannot be ruled out. */
+  contextUnknown?: boolean;
+  /**
+   * @deprecated Measurement-only. Reported in `controlsStructuralHintRejected`
+   * but intentionally not consulted by `resolveRenderedCoverageReason`:
+   * structural disclosures are now clicked, so hint rejection alone is not an
+   * unexamined destination.
+   */
+  structuralHintRejected?: number;
+  /**
+   * @deprecated Measurement-only. Reported in `controlsIconLabelRecovered` but
+   * intentionally not consulted by `resolveRenderedCoverageReason`:
+   * icon-label controls are now clicked, so recovery alone is not a gap.
+   */
+  iconLabelRecovered?: number;
+  unresolvedFailedRequests?: number;
+  frameCount?: number;
+  shadowRootCount?: number;
+  popupTargets?: number;
+  navigationPolicyExcluded?: Partial<Record<NavigationPolicyExclusionReason, number>>;
+  /**
+   * A structural navigation anchor was observed but neither clicked (it would
+   * replace the document) nor followed through enqueue admission. Its
+   * destination was never examined, so coverage cannot resolve as COMPLETE.
+   * Deterministic: retrying the same page applies the same hint filter.
+   */
+  unrecoveredNavigation?: boolean;
+}
+
+/**
+ * Precedence is intentional: a named ceiling or an unexamined interaction is
+ * a stronger statement than a policy/context exclusion, and zero processed
+ * pages is always UNKNOWN rather than COMPLETE.
+ */
+export function resolveRenderedCoverageReason(input: RenderedCoverageInput): RenderedCoverageReason {
+  if (!(Number(input.pagesInspected) > 0)) return 'UNKNOWN';
+  const count = (value: unknown): number =>
+    typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+  if (input.budgetExhausted === true
+    || input.interactionGap === true
+    || input.scrollCapReachedStillGrowing === true
+    || input.contextUnknown === true
+    || count(input.unresolvedFailedRequests) > 0) {
+    return 'BOUNDED';
+  }
+  if (count(input.frameCount) > 0 || count(input.shadowRootCount) > 0 || count(input.popupTargets) > 0) {
+    return 'CONTEXT_UNREACHABLE';
+  }
+  const excluded = input.navigationPolicyExcluded || {};
+  // Only destinations the navigation policy deliberately did not pursue are
+  // coverage exclusions. `invalid-protocol` and `admission-rejected` are
+  // format/security rejections (mailto links, assets, private addresses), not
+  // unexamined navigation, and must not turn every ordinary page into a
+  // policy gap. `unrecoveredNavigation` is a structural destination that was
+  // neither clicked nor enqueued, so it is a real unexamined navigation.
+  if (input.unrecoveredNavigation === true
+    || count(excluded['cross-origin-disallowed']) > 0
+    || count(excluded['destination-budget']) > 0) {
+    return 'POLICY_EXCLUDED';
+  }
+  return 'COMPLETE';
+}
+
 /** Shared taxonomy/bound enforcement for drop counters, used both when
  * telemetry objects are constructed and when ledger rows are persisted, so
  * direct in-process consumers never receive invalid reason keys or
@@ -229,6 +350,86 @@ export interface CrawlerTelemetry {
   rateLimitedRequests: number;
   hostBackoffsApplied: number;
   /**
+   * Bounded rendered-control coverage certificate (counts only, never
+   * selectors/text/URLs). `Total` is the complete matched-control set on
+   * processed pages; `Skipped` is the subset not examined because of the
+   * 64-control evaluation window or click budget. Sparse: omitted when no
+   * evidence-bearing control was enumerated or the row predates
+   * instrumentation. Persisting these distinguishes 64-overflow from ordinary
+   * click-budget slicing in production.
+   */
+  evidenceControlsTotal?: number;
+  evidenceControlsClicked?: number;
+  evidenceControlsFailed?: number;
+  evidenceControlsSkipped?: number;
+  /**
+   * True when every processed page with controls had an entirely navigable
+   * evaluation window: each window was fully examined with zero clicks, so
+   * the durable retry offset may advance past it. Sparse; absent on rows that
+   * predate instrumentation or when any page had clickable targets.
+   */
+  evidenceControlsNavigableOnly?: boolean;
+  /**
+   * True when a processed page had clickable controls inside its evaluation
+   * window but recorded no progress (deadline, zero budget, detached marker).
+   * The shared per-seed retry offset must not advance while such a window is
+   * unexamined. Sparse; rendered-only.
+   */
+  evidenceControlsUncertified?: boolean;
+  /**
+   * Bounded full-pool positions the durable retry offset should advance: the
+   * smallest per-page progress, so a page with a smaller pool is never rotated
+   * past controls it did not examine. Sparse; absent on pre-instrumentation
+   * rows.
+   */
+  evidenceControlsOffsetAdvance?: number;
+  /**
+   * P1.1/P1.2 navigation-coverage counters (rendered-only, counts only). The
+   * pre-filter denominator answers how many controls existed before the
+   * community-hint filter; `HintRejected` is the difference. Structural
+   * navigation counts menu/nav/hamburger/tab/summary/aria-haspopup controls.
+   * `StructuralDisclosure` counts those included in the click set because they
+   * reveal content in place; `StructuralUnrecovered` counts structural
+   * anchors still left to the enqueue path. Icon-label recovery counts
+   * controls whose only useful label is title/aria-labelledby/child-alt/
+   * data-label/SVG title/hidden text. None of these fields contain selectors,
+   * text, or URLs.
+   */
+  controlsEnumeratedTotal?: number;
+  controlsHintRejected?: number;
+  controlsStructuralNavigation?: number;
+  controlsStructuralHintRejected?: number;
+  controlsStructuralDisclosure?: number;
+  controlsStructuralUnrecovered?: number;
+  controlsIconLabelRecovered?: number;
+  popupTargets?: number;
+  /**
+   * Context counters observed on processed pages. `frameCount` covers
+   * iframe/frame/object/embed elements; `shadowRootCount` covers open shadow
+   * roots; `baseHrefPresent` records a document <base href>. These are
+   * diagnostics for P1.3/P1.4/P1.5, not traversal claims.
+   */
+  frameCount?: number;
+  shadowRootCount?: number;
+  baseHrefPresent?: boolean;
+  /**
+   * True when the last permitted scroll iteration still found a growing
+   * document. Distinguishes "page stopped growing" from "cap hit while
+   * content was still arriving" for P1.7 truthfulness.
+   */
+  scrollCapReachedStillGrowing?: boolean;
+  /**
+   * Explicit policy-exclusion counters. `dropReasons` remains the canonical
+   * enqueue/selection ledger; this field makes the navigation-relevant subset
+   * available to coverage consumers without re-parsing drop keys.
+   */
+  navigationPolicyExcluded?: Partial<Record<NavigationPolicyExclusionReason, number>>;
+  /**
+   * Diagnostic coverage reason (see resolveRenderedCoverageReason). P0.2 only
+   * records it; P1.7 decides when it changes the acquisition outcome.
+   */
+  coverageReason?: RenderedCoverageReason;
+  /**
    * Compact per-crawl drop/stop counters keyed by CRAWL_DROP_REASONS
    * (ints only, taxonomy-bounded to 13 keys — never URLs or payloads).
    * Tells future investigations where candidate URLs were lost. Sparse:
@@ -378,8 +579,17 @@ export function renderedCrawlerTelemetry(input: {
     ?? (input.timedOut ? 'total-timeout' as const : undefined);
   // A spread-carried ceiling/budget flag could only ever be stale (inner
   // telemetry never owns the ceiling decision), so both are stripped before
-  // the derived values below are set.
-  const { ceiling: _staleCeiling, budgetExhausted: _staleExhausted, ...restTelemetry } = (input.telemetry || {}) as Partial<CrawlerTelemetry>;
+  // the derived values below are set. Coverage fields are stripped as well:
+  // adding them back only after a taxonomy check must never leave an invalid
+  // spread-carried value in the returned object (direct readers do not go
+  // through the persistence sanitizer).
+  const {
+    ceiling: _staleCeiling,
+    budgetExhausted: _staleExhausted,
+    navigationPolicyExcluded: staleNavigationPolicyExcluded,
+    coverageReason: staleCoverageReason,
+    ...restTelemetry
+  } = (input.telemetry || {}) as Partial<CrawlerTelemetry>;
   void _staleCeiling;
   void _staleExhausted;
   return {
@@ -395,6 +605,10 @@ export function renderedCrawlerTelemetry(input: {
     mode: 'RENDERED',
     ...(Object.keys(sanitizeDropReasons(input.dropReasons)).length ? { dropReasons: sanitizeDropReasons(input.dropReasons) } : {}),
     ...(sanitizeScrollsUsed(input.scrollsUsed) > 0 ? { scrollsUsed: sanitizeScrollsUsed(input.scrollsUsed) } : {}),
+    ...(Object.keys(sanitizeNavigationPolicyExcluded(staleNavigationPolicyExcluded)).length
+      ? { navigationPolicyExcluded: sanitizeNavigationPolicyExcluded(staleNavigationPolicyExcluded) }
+      : {}),
+    ...(isRenderedCoverageReason(staleCoverageReason) ? { coverageReason: staleCoverageReason } : {}),
     ...(sanitizeExperimentAttribution(input.experimentAttribution) ? { experimentAttribution: sanitizeExperimentAttribution(input.experimentAttribution)! } : {}),
   };
 }
@@ -502,6 +716,12 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
   const candidate = input as Partial<CrawlerTelemetry>;
   if (candidate.mode !== 'STATIC' && candidate.mode !== 'RENDERED') return undefined;
   const number = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+  // Established persisted-counter ceiling (same bound as drop reasons, scrolls,
+  // and experiment attribution). The control offset indexes the rotated
+  // 64-control evaluation window, so a larger persisted value is malformed.
+  const MAX_TELEMETRY_COUNTER = 999999;
+  const MAX_EVIDENCE_CONTROL_OFFSET = 64;
+  const boundedCount = (value: unknown) => Math.min(MAX_TELEMETRY_COUNTER, number(value));
   // Bounded sanitized string: collapsed whitespace, capped length. Non-string
   // input yields undefined so malformed persisted rows cannot smuggle text.
   const text = (value: unknown, max: number): string | undefined => {
@@ -550,6 +770,69 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
     blockedRequests: number(candidate.blockedRequests),
     rateLimitedRequests: number(candidate.rateLimitedRequests),
     hostBackoffsApplied: number(candidate.hostBackoffsApplied),
+    ...(candidate.mode === 'RENDERED' && number(candidate.evidenceControlsTotal) > 0
+      ? { evidenceControlsTotal: boundedCount(candidate.evidenceControlsTotal) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.evidenceControlsClicked) > 0
+      ? { evidenceControlsClicked: boundedCount(candidate.evidenceControlsClicked) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.evidenceControlsFailed) > 0
+      ? { evidenceControlsFailed: boundedCount(candidate.evidenceControlsFailed) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.evidenceControlsSkipped) > 0
+      ? { evidenceControlsSkipped: boundedCount(candidate.evidenceControlsSkipped) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && (candidate as { evidenceControlsNavigableOnly?: unknown }).evidenceControlsNavigableOnly === true
+      ? { evidenceControlsNavigableOnly: true }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && (candidate as { evidenceControlsUncertified?: unknown }).evidenceControlsUncertified === true
+      ? { evidenceControlsUncertified: true }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.evidenceControlsOffsetAdvance) > 0
+      ? { evidenceControlsOffsetAdvance: Math.min(MAX_EVIDENCE_CONTROL_OFFSET, boundedCount(candidate.evidenceControlsOffsetAdvance)) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.controlsEnumeratedTotal) > 0
+      ? { controlsEnumeratedTotal: boundedCount(candidate.controlsEnumeratedTotal) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.controlsHintRejected) > 0
+      ? { controlsHintRejected: boundedCount(candidate.controlsHintRejected) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.controlsStructuralNavigation) > 0
+      ? { controlsStructuralNavigation: boundedCount(candidate.controlsStructuralNavigation) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.controlsStructuralHintRejected) > 0
+      ? { controlsStructuralHintRejected: boundedCount(candidate.controlsStructuralHintRejected) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.controlsStructuralDisclosure) > 0
+      ? { controlsStructuralDisclosure: boundedCount(candidate.controlsStructuralDisclosure) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.controlsStructuralUnrecovered) > 0
+      ? { controlsStructuralUnrecovered: boundedCount(candidate.controlsStructuralUnrecovered) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.controlsIconLabelRecovered) > 0
+      ? { controlsIconLabelRecovered: boundedCount(candidate.controlsIconLabelRecovered) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.popupTargets) > 0
+      ? { popupTargets: boundedCount(candidate.popupTargets) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.frameCount) > 0
+      ? { frameCount: boundedCount(candidate.frameCount) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && number(candidate.shadowRootCount) > 0
+      ? { shadowRootCount: boundedCount(candidate.shadowRootCount) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && candidate.baseHrefPresent === true
+      ? { baseHrefPresent: true }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && candidate.scrollCapReachedStillGrowing === true
+      ? { scrollCapReachedStillGrowing: true }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && Object.keys(sanitizeNavigationPolicyExcluded(candidate.navigationPolicyExcluded)).length
+      ? { navigationPolicyExcluded: sanitizeNavigationPolicyExcluded(candidate.navigationPolicyExcluded) }
+      : {}),
+    ...(candidate.mode === 'RENDERED' && isRenderedCoverageReason(candidate.coverageReason)
+      ? { coverageReason: candidate.coverageReason }
+      : {}),
     ...(isRenderedLifecycleStage(stage) ? { lastLifecycleStage: stage } : {}),
     ...(isRenderedZeroPageReason(reason) ? { zeroPageReason: reason } : {}),
     ...(cause ? { launchCauseSnippet: cause } : {}),

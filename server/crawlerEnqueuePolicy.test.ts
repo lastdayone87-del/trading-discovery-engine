@@ -76,7 +76,7 @@ test('rendered hint vocabulary covers community and paid-platform destinations',
   assert.ok(!COMMUNITY_HINTS.test('https://example.com/blog/market-recap'));
   assert.ok(!COMMUNITY_HINTS.test('https://example.com/pricing'));
   // Interactive control enumeration/click selector is a single shared query.
-  assert.equal(RENDERED_CONTROL_SELECTOR, 'a,button,[role="button"],[role="tab"],summary,[aria-expanded="false"]');
+  assert.equal(RENDERED_CONTROL_SELECTOR, 'a,button,[role="button"],[role="tab"],[role="menuitem"],summary,[aria-expanded="false"],[aria-haspopup]');
 });
 
 test('drop counter tallies taxonomy reasons only', () => {
@@ -163,6 +163,12 @@ test('rendered control-slice, hint-reject, scroll, and stop accounting are wired
   assert.ok(source.includes("drops.count('hint-rejected')"));
   assert.ok(source.includes("drops.count('page-budget')"));
   assert.ok(source.includes("drops.count('queue-exhausted')"));
+  assert.ok(
+    source.includes(
+      "if (completion.queueComplete && !pageBudgetExhausted && inspectedPages < limits.maxPages) drops.count('queue-exhausted');",
+    ),
+    'terminal queue-exhausted attribution must depend only on the pre-coverage traversal verdict',
+  );
   assert.ok(source.includes('dropReasons:drops.snapshot()'));
   const inspector = readFileSync(new URL('./inspector.ts', import.meta.url), 'utf8');
   assert.ok(inspector.includes('scrollsUsed:rendered.scrolls'));

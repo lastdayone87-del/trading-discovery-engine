@@ -122,7 +122,7 @@ test('startup audit restores Discord cleanup for rejected rows in a bounded pass
   // Scope the persistence assertion to the cleanup branch: the reject-write
   // branch also calls upsertChannel(channel), so an unscoped match would pass
   // even if invite cleanup stopped persisting.
-  assert.match(fn.slice(cleanupStart, cleanupEnd), /await upsertChannel\(channel\)/);
+  assert.match(fn.slice(cleanupStart, cleanupEnd), /await upsertChannel\(channel, \{ allowDiscordClear: true \}\)/);
 });
 
 test('live non-terminal replacement keeps country and scope consistent', async () => {

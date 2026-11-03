@@ -101,7 +101,9 @@ export interface TradingRelevanceBreakdown {
   consistency_ratio: number;
   ai_reviewed: boolean;
   fast_heuristic_status?: 'FAST_ACCEPT' | 'FAST_REJECT' | 'UNCERTAIN';
-  classification_method?: 'FAST_HEURISTIC_ACCEPT' | 'FAST_HEURISTIC_REJECT' | 'AI_SEMANTIC_CLASSIFIER';
+  classification_method?: 'FAST_HEURISTIC_ACCEPT' | 'FAST_HEURISTIC_REJECT' | 'AI_SEMANTIC_CLASSIFIER' | 'DETERMINISTIC_EVIDENCE' | 'HEURISTIC_ONLY' | 'DEGRADED_HEURISTIC';
+  /** C3 display basis: never present a neutral prior as a measured score. */
+  confidence_basis?: 'CALIBRATED' | 'NEUTRAL_PRIOR' | 'HEURISTIC' | 'NONE';
   ai_prompt_payload?: string;
   ai_raw_response?: string;
   ai_model?: string;
@@ -180,6 +182,14 @@ export interface ChannelRecord {
    * trustworthy confirmation timestamp exists. Never derived from first_seen
    * or enrichment time. */
   discord_invite_first_validated_at?: string | null;
+  /** Latest successful serving validation of the selected invite, computed
+   * read-only from the append-only check-attempt ledger. Null when no serving
+   * attempt is recorded; never derived from first_seen or enrichment time. */
+  discord_invite_last_verified_at?: string | null;
+  /** Read-only: the invite is retained as last-known-good while the current
+   * revalidation is uncertain. It was previously verified, but is not a fresh
+   * validation of current relevance. */
+  discord_invite_revalidation_uncertain?: boolean;
   discord_discovery_status?: DiscordDiscoveryStatus;
   discord_candidate_locator?: string | null;
   discord_candidate_id?: string | null;

@@ -19,7 +19,10 @@ import { calculateCreatorQualityScore, extractVocabularyFromCreator, invokeChann
 import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { enqueueTermHarvest } from './candidateCorpus';
 import { resolveUncertainLifecycle } from './enrichmentLifecycle';
-import {ConfigurableWeightedStrategy,evaluateClassificationStages,type EvidenceCollectionReport,type RawChannelInput} from './evidenceEngine';
+import {ConfigurableWeightedStrategy,evaluateClassificationStages,buildCanonicalEvidenceCorpus,getLayeredKnowledgeContext,type EvidenceCollectionReport,type RawChannelInput} from './evidenceEngine';
+import { buildContextualComposition } from './evidenceEngine/contextualComposition';
+import { contentLanguagePacks } from './evidenceEngine/multilingualTerminology';
+import { LANGUAGE_KNOWLEDGE_PACKS } from './evidenceEngine/knowledgePacks';
 import { observeProductionDiagnosticReliably, observeRetrievalAssignmentReliably } from './phaseBObservationOutbox';
 import { buildDecisionEvaluationSamplingPolicy } from './decisionEvaluationSamplingPolicy';
 import { ACTIONS, deriveVitalityScheduling, planAndRecordEvidenceAction, type EvidenceActionType, type EvidenceActionPlan } from './voiEvidenceController';
@@ -703,7 +706,18 @@ async function processChannelThroughPipelineInContext(
       const evidence=[...productionClassification.decision.positiveEvidence,...productionClassification.decision.negativeEvidence,...shadow.evidence];
       const governedReports=shadow.evidence.map(item=>item.source).filter((source,index,all)=>all.indexOf(source)===index).map(provider=>({provider,availability:'AVAILABLE' as const,evidenceCount:shadow.evidence.filter(item=>item.source===provider).length,outcome:'EXECUTED_WITH_EVIDENCE' as const,reasonCodes:['GOVERNED_PRODUCTION_EVIDENCE_TRANSPORTED']}));
       const collection:EvidenceCollectionReport={...productionClassification.decision.evidenceCollection,providers:[...productionClassification.decision.evidenceCollection.providers,...governedReports]};
-      const stages=evaluateClassificationStages(productionClassification.input,evidence,collection);
+      // evaluateChannel builds a corpus on a local copy, so the caller's input
+      // never carries one. Rebuild it here and pass the same knowledge context
+      // the production evaluator used; otherwise every governed composition is
+      // empty and the creator's own content is ignored.
+      const governedInput: RawChannelInput = { ...productionClassification.input, evidence_corpus: buildCanonicalEvidenceCorpus(productionClassification.input) };
+      const governedContext = getLayeredKnowledgeContext(governedInput.country || 'UNKNOWN');
+      const governedCodes = contentLanguagePacks(governedInput, governedContext).map(pack => pack.languageCode);
+      governedContext.languageKnowledgePacks = [...new Map([
+        ...(governedContext.languageKnowledgePacks || []),
+        ...governedCodes.map(code => LANGUAGE_KNOWLEDGE_PACKS[code]).filter(Boolean),
+      ].map(pack => [pack.languageCode, pack])).values()];
+      const stages=evaluateClassificationStages(governedInput,evidence,collection,buildContextualComposition(governedInput,governedContext));
       const governedDecision=new ConfigurableWeightedStrategy().evaluateDecision(evidence,{globalInstruments:[],globalPlatformsPropFirms:[],globalAdvancedConcepts:[],globalNegativeTerms:[]},creatorCountry || undefined,collection,stages);
       tradingVal={...tradingVal,status:governedDecision.status,confidenceScore:governedDecision.confidenceScore,category:governedDecision.category,breakdown:{...tradingVal.breakdown,reasoning:[...(tradingVal.breakdown.reasoning||[]),...governedDecision.mathematicalJustification.split(' | '),'GOVERNED ROLLOUT: evidence traversed the production staged classifier; no decision bypass was used.']}};
     }
@@ -721,7 +735,7 @@ async function processChannelThroughPipelineInContext(
       country: creatorCountry,
       country_status: countryVal.status,
       confidence_score: countryVal.score,
-      discord_status: 'NON_TRADING',
+      discord_status: 'UNCERTAIN',
       discord_invite: null,
       scan_status: 'SKIPPED_NON_TRADING',
       scan_attempts: 0,
@@ -745,12 +759,25 @@ async function processChannelThroughPipelineInContext(
     nonTradingChannel.trading_category = tradingVal.category;
     nonTradingChannel.trading_relevance_breakdown = tradingVal.breakdown;
     nonTradingChannel.scan_status = 'SKIPPED_NON_TRADING';
-    nonTradingChannel.discord_status = 'NON_TRADING';
+    // The Discord crawler did not run for this trading-classification skip, so
+    // the honest persisted Discord state is "untouched", not NON_TRADING. The
+    // database trigger `normalize_upstream_skipped_discord_state` enforces the
+    // same shape; mirror it here so the returned record matches what is stored.
+    nonTradingChannel.discord_status = 'UNCERTAIN';
     nonTradingChannel.discord_invite = null;
+    nonTradingChannel.discord_discovery_status = 'NOT_DISCOVERED';
+    nonTradingChannel.discord_resolution_status = 'NOT_ATTEMPTED';
+    nonTradingChannel.discord_liveness_status = 'NOT_CHECKED';
+    nonTradingChannel.discord_relevance_status = 'NOT_CHECKED';
+    nonTradingChannel.discord_validation_status = 'NOT_STARTED';
     nonTradingChannel.last_checked = now;
     applyCandidateObservability(nonTradingChannel, candidate);
 
-    await upsertChannel(nonTradingChannel);
+    // Gate 2 is a fresh terminal classification, not a stale ordinary snapshot:
+    // it must be allowed to clear a previously serving Discord invite. Without
+    // this explicit option the locked-row retention guard would keep the old
+    // ACTIVE projection while the row's trading status becomes NON_TRADING.
+    await upsertChannel(nonTradingChannel, { allowDiscordClear: true });
 
     return {
       channelId: candidate.channelId,
@@ -760,7 +787,7 @@ async function processChannelThroughPipelineInContext(
       persisted: true,
       countryStatus: countryVal.status,
       tradingStatus: 'NON_TRADING',
-      discordStatus: 'NON_TRADING',
+      discordStatus: 'UNCERTAIN',
       discordInvite: null,
       channelRecord: nonTradingChannel
     };

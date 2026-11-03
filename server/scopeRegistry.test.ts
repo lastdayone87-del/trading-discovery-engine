@@ -284,7 +284,7 @@ test('channel upsert derives scope from the row country and reads no stored valu
     'upsert must never read a stored eligibility value',
   );
   const upsert = source.slice(upsertStart, upsertStart + 6000);
-  assert.match(upsert, /writeChannelUpsert\(client, channel, options\)/);
+  assert.match(upsert, /writeChannelUpsert\(client, channel, \{ preserveDiscordOnUpdate: preserveDiscord \}\)/);
 });
 
 test('dormant exclusion yields to explicit scope selection, never to silence', async () => {

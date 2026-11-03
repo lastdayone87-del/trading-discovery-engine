@@ -66,6 +66,18 @@ test('reuse matrix: fresh hits borrow, expired and malformed rows recrawl', () =
     true,
     'non-retryable failure follows the freshness TTL',
   );
+  // A redirect-limit row is non-retryable (an identical static refetch cannot
+  // complete) but it inspected no page, so it must not pin 30-day freshness:
+  // after the 24h window a later inspection recrawls and can still reach the
+  // rendered-escalation decision a fresh crawl would make.
+  const redirectLimit = (observedHoursAgo: number) => row({
+    outcome: 'ACQUISITION_FAILED',
+    retryable: false,
+    failureClass: 'REDIRECT_LIMIT',
+    lastObservedAt: hoursAgo(observedHoursAgo),
+  });
+  assert.equal(isSiteInspectionReusable(redirectLimit(23), NOW), true, 'redirect-limit borrows within 24h');
+  assert.equal(isSiteInspectionReusable(redirectLimit(25), NOW), false, 'redirect-limit recrawls after 24h');
   assert.equal(
     isSiteInspectionReusable(row({ outcome: 'PARTIALLY_INSPECTED', lastObservedAt: hoursAgo(1) }), NOW),
     true,

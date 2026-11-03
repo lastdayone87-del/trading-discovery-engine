@@ -87,7 +87,10 @@ test('provider failures are observable degradation and never become negative evi
   assert.equal(decision.status, 'UNCERTAIN');
   assert.equal(decision.evidenceCollection.degraded, true);
   assert.equal(decision.evidenceCollection.providers[0].availability, 'FAILED');
-  assert.match(decision.evidenceCollection.providers[0].reason || '', /synthetic provider outage/);
+  // The report exposes the failure class but never the raw provider/SDK
+  // message, which can carry request details (that message stays on the log).
+  assert.match(decision.evidenceCollection.providers[0].reason || '', /Provider failure/);
+  assert.equal((decision.evidenceCollection.providers[0].reason || '').includes('synthetic provider outage'), false);
   assert.equal(decision.negativeEvidence.length, 0);
 });
 

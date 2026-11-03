@@ -85,7 +85,7 @@ test('queue compatibility projection keeps failed acquisition uncertain and obse
   assert.match(queue,/acquisitionStatus==='ACQUISITION_FAILED'\|\|inspection\.acquisitionStatus==='PARTIALLY_INSPECTED'/);
   assert.match(queue,/channel\.discord_status='UNCERTAIN'/);assert.match(queue,/channel\.scan_status='FAILED'/);
   assert.doesNotMatch(queue,/appendDiscordCheckAttempts[\s\S]{0,300}\.catch/);assert.match(queue,/appendExternalAcquisitionObservations[\s\S]+\.catch/);
-  assert.match(queue,/projectDiscordValidation\(channel,selected,selectedCandidate\)/);assert.match(queue,/DISCOVERED_VALIDATION_FAILED/);
+  assert.match(queue,/projectDiscordValidation\(channel,selected,selectedCandidate(?:,|\))/);assert.match(queue,/DISCOVERED_VALIDATION_FAILED/);
   assert.match(diagnostics,/persistClassificationEvidenceBundle/);
 });
 

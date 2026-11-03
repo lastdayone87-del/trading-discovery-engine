@@ -226,6 +226,12 @@ const DETERMINISTICALLY_PERMANENT_FAILURE_CLASSES = new Set([
   // Conclusive permanent block established over bounded identical retries
   // (see permanentBlockDetection.ts): terminal, never owns retry.
   'PERMANENT_ACCESS_BLOCK',
+  // The crawler's redirect budget is fixed (CRAWLER_MAX_REDIRECT_HOPS) and the
+  // same URL deterministically exhausts it, so an identical refetch cannot
+  // complete. Backlog observations persisted with retryable:true before this
+  // became non-retryable must also stop owning retry. The hop cap and per-hop
+  // SSRF checks are unchanged; only retry spend is removed.
+  'REDIRECT_LIMIT',
 ]);
 
 /**
@@ -245,6 +251,9 @@ export const STATIC_BUDGET_GAP_FAILURE_CLASS = 'STATIC_BUDGET_GAP';
 export const FOUND_GAP_RETRYABLE_FAILURE_CLASSES = new Set([
   'REQUIRED_UNVISITED_BUDGET_GAP',
   'RENDERED_TIMEOUT',
+  // Page-budget exhaustion with eligible requests still queued: the retained
+  // invite is kept while the unchecked pages own bounded recovery.
+  'RENDERED_BUDGET_EXPIRED',
   'RENDERED_PARTIAL_COVERAGE',
   // Interaction gap: invite(s) retained but an evidence-bearing control
   // (join button/tab/accordion) failed or was skipped, so content was never

@@ -3,11 +3,37 @@
 **Status: PREREGISTRATION ONLY — no benchmark has been executed under this specification.**
 **Do not modify this document after benchmark execution begins. Any change requires a new spec version.**
 
+**Pre-execution revisions (before any benchmark execution):** the
+autonomous query authority constant advanced from `autonomous-query-authority-v2`
+to `autonomous-query-authority-v3` on 2026-10-29 as part of the Q0–Q8
+query-quality admission program, and candidate triage advanced from
+`candidate-triage-v4-contextual-admission` to
+`candidate-triage-v5-latin-market-finance` on 2026-11-02 when the
+precision-first Latin-market signal was added. No benchmark run, observation or
+execution record existed under the earlier values, so these are pre-execution
+corrections rather than post-execution amendments. The same program also
+advanced the serving query selector from the legacy UCB1 branch to
+`hierarchical-ucb-v1` (`query-portfolio-v1`). Because no benchmark has run, the
+control arm is revised with it: CONTROL is the current serving selector, and
+the retired UCB1 formula is retained only as the offline simulator comparator.
+The same pre-execution revision includes the quota-free exploration fallback:
+when the official portfolio floor is exhausted, an `ACTIVE` free
+`SEARCH_YOUTUBE` row may serve the least-attempted immature arm on RELEVANCE
+ordering, and scheduling is restricted to free rows and fails closed rather
+than falling back to the official provider. No benchmark run, observation or
+execution record existed before any of these revisions. The spec version is
+unchanged; `verifyFrozenBenchmarkVersions()` now requires
+v3 and v5 and continues to fail closed on any other drift.
+
 - Benchmark specification version: `benchmark-preregistration-v1`
 - Engine base commit (merged main after PR #492): `4b49e0c01ac53eebf0080fae29bd6aaabb803cfc`
   (`4b49e0c Merge pull request #492 from lastdayone87-del/feat/engine-completion`)
-- Scope: describes what is actually implemented and executable at the base commit. No imagined future system.
-- Prohibitions during preparation (observed): no benchmark run, no new mechanisms, no tuning, no threshold/prior/weight/horizon/cut/feed/provider/eligibility/assignment changes, no UCB1 changes, no production behavior changes, no global enablement of experimental mechanisms.
+- Pre-execution delta: the revision note above. The frozen system under test is
+  the base commit plus exactly that authority-policy revision (and the Q0–Q8
+  admission program it names); no other system change is in scope.
+- Scope: describes what is actually implemented and executable at the base
+  commit plus the pre-execution delta above. No imagined future system.
+- Prohibitions during preparation (observed): no benchmark run, no new mechanisms, no tuning, no threshold/prior/weight/horizon/cut/feed/provider/eligibility/assignment changes, no changes to the frozen serving-selector control arm, no production behavior changes outside the pre-execution delta, no global enablement of experimental mechanisms.
 
 ## 1. Frozen system under test
 
@@ -29,11 +55,11 @@
 | LLM Assist (P-E) | `llm-assist-v1` | `server/llmAssist.ts:25` |
 | Graph expansion policy (P3) | `graph-expansion-v1`, `GRAPH_MAX_DEPTH=2`, `GRAPH_MAX_FANOUT=10` | `server/graphExpansionPolicy.ts:12-14` |
 | Relationship canary | `relationship-canary-v1`, `MAX_SEEDS=10`, `MAX_DEPTH=2`, `MAX_FANOUT=10`, `MAX_DEPTH2_PARENTS=5`, `MAX_CHANNELS_PER_RUN=150`, `ESTIMATED_DOWNSTREAM_UNITS=305` | `server/relationshipCanary.ts:31-48` |
-| Autonomous query authority | `autonomous-query-authority-v2` | `server/autonomousQueryAuthority.ts:5` |
-| Candidate triage | `candidate-triage-v4-contextual-admission` | `server/candidateTriage.ts:6` |
+| Autonomous query authority | `autonomous-query-authority-v3` (pre-execution revision; `4b49e0c` contains v2) | `server/autonomousQueryAuthority.ts:6` |
+| Candidate triage | `candidate-triage-v5-latin-market-finance` (pre-execution revision) | `server/candidateTriage.ts:9` |
 | DB migrations | 137 files, latest `137_domain_memory.sql` | `server/db/migrations/` |
 | Assignment/hash | sha256 hex slice `(0,8)` mod 10000; no separate salt field exists — assignment identity/version inputs = `policyVersion + experimentId + opportunityKey` (see §6) | `server/querySelectionExperiments.ts:137-139`, `server/retrievalExperiment.ts:114-117` |
-| Feature-gate states | All benchmark-relevant experimental gates default OFF/false/0 (see §3 table); UCB1 control has no gate | §3 |
+| Feature-gate states | All benchmark-relevant experimental gates default OFF/false/0 (see §3 table); the serving-selector control has no gate | §3 |
 | Provider versions/config | YouTube official + Innertube-free + Brave direct/OSINT providers via registry; quota domains enforced at reservation; no provider version bump in this spec | `server/dbCore.ts:1829-1834`, `server/queueManager.ts:597-643`, `server/braveSearch.ts:22-25` |
 | Acquisition/evidence pipeline | Existing crawl ceilings bind; P-A/P-B/P-C bounds are caps, never targets | `server/siteProfiler.ts`, `server/acquisitionLadder.ts`, `server/frontierManager.ts` |
 
@@ -41,28 +67,44 @@ Configuration hash method (record at execution, before first observation): `sha2
 
 PR lineage incorporated in base: #486 (frontier P0–P6 testability scaffolding), #488 (adaptive evidence acquisition), #491 (experiment wiring/measurement: pure selection-experiment core, scheduling→execution wiring, benchmark access routes, P-D experiment gate, observation attribution), #492 (engine completion: P3 depth-2 policy evaluation in canary loop shadow-only, P5 adapter registry + gated runner with stubs staying stubs and no fetch loop, P5/P-D/P-E execution-path completion shadow-only default-off, Greptile P1/P2 guards).
 
-## 2. Control (UCB1, unchanged)
+## 2. Control arm (serving selector, frozen experiment control)
 
-Implementation: `server/queryIntelligence.ts:selectNextQueryForCountry` (`304-475`); scoring block `359-379`.
+The Q0–Q8 program moved the serving selection path
+(`selectNextQueryForCountry`) to the hierarchical UCB selector
+(`hierarchical-ucb-v1`, `query-portfolio-v1`). With no benchmark executed under
+the earlier definition, the pre-execution revision above makes that serving
+path the frozen CONTROL arm of the selection experiment. CONTROL therefore
+runs the same hierarchical selector as production and is never served by the
+treatment arms.
+
+The UCB1 parameters listed under “retired formula” below are retained only as
+the offline simulator comparator (`server/queryQuality/simulator.ts`,
+`currentUcb1Index`). They are not the experiment control.
+
+Implementation: `server/queryIntelligence.ts:selectNextQueryForCountry`; hierarchical selector `server/queryQuality/selector.ts`.
 
 Frozen control parameters (literals):
 
-- Exploration constant: `explorationConst = 0.8`, hardcoded (`queryIntelligence.ts:368`); term `0.8 * sqrt(log(totalExecutions+1) / (times_executed+1))` (`:369`); score `max(0, normPerformance + ucbTerm)`, `normPerformance = performance_score/100` (`:365-370`); stored `ucb_score = round(ucbScore*100)/100` (`:374`); descending sort (`:379`).
-- Stochastic exploration gate: `explorationRatio` default `'0.4'`, clamp `[0.1,0.9]` (`:330`); `isExploration = Math.random() < explorationRatio` (`:452`); exploration branch filters `collection==='EXPERIMENTAL'`, sorts `times_executed ASC, ucb_score DESC` (`:456-463`).
-- Cold start: empty query set → `generateCandidateQueriesForCountry(country,4,'COLD_START')`, strategy `COLD_START_GENERATION` (`:333-342`); empty eligible set → 4 `EXPLORATION` candidates, strategy `UCB1_EXPLORATION` (`:348-357`); generator default `count=3`, upserts `collection:'EXPERIMENTAL'` (`:482-525`).
-- Eligibility gates (pre-UCB): `collection!=='REJECTED'`, `reserved_until`/`next_eligible_at` null or past (`:321-327`); cooldown `query_intelligence_query_cooldown_minutes`, default `'360'`, `max(1,…)` (`:328`); primary-term cap `query_intelligence_primary_term_max_uses`, default `'2'` (`:329`); `queriesOutsideCooldown` + `limitRepeatedPrimaryTerms` + `rotateAwayFromMostRecentIntent` (`queryPlanner.ts:117-138`); authority reject → `REJECTED` + skip (`autonomousDiscovery.ts:601-620`, rules `autonomousQueryAuthority.ts:107-151`); batch diversity guard (`autonomousDiscovery.ts:622-632`); reservation `reserved_until=now()+20min`, zero-rows skip (`dbCore.ts:1852-1866`); provider must be `ACTIVE/ACTIVE_GLOBAL/CANARY` (+`SHADOW` only explicit Brave canary) (`dbCore.ts:1829-1834`).
+- Selector versions: `SELECTOR_POLICY_VERSION='hierarchical-ucb-v1'` (`posterior.ts:4`) and `QUERY_PORTFOLIO_VERSION='query-portfolio-v1'` (`selector.ts:22`); `verifyFrozenBenchmarkVersions()` fails closed if either changes.
+- Exploration constant: `SELECTOR_C=2.0` (`posterior.ts:5`); index `mean + c*sd`, capped at `MAX_SELECTION_INDEX=4.0`; `hierarchical_ucb_c1` (c=1.0) is a calibration comparator, not the control.
+- Prior/hierarchy: `QUERY_POSTERIOR_VERSION='gamma-poisson-hierarchy-v1'`; partial-pooling weights `global 0.20 / family 0.35 / country 0.20 / market 0.15 / language 0.10`; smoothing `2.0`; decay half-life `30` days; `MIN_SELECTION_SAMPLE=2`.
+- Portfolio floor: `PORTFOLIO_RATIO=0.15`, clamped to `[0.10,0.20]`; `PORTFOLIO_PAGE_UNITS=1` (100 quota units = 1 normalized unit).
+- Quota-free exploration: when the official portfolio floor has no remaining page but the allocation registry exposes an `ACTIVE` `SEARCH_YOUTUBE` row with `quota_domain='YOUTUBE_INNERTUBE_FREE'`, the selector may choose the deterministic least-attempted immature arm (lifetime `query_library.times_executed`, then normal high-uncertainty/low-yield ordering) with reason code `QUOTA_FREE_EXPLORATION`. This capability is read directly from `discovery_provider_registry` (the same rows ordinary allocation rotates over), never from an environment flag or prior run outcome. Selection carries a `quotaFreeRequired` requirement into scheduling; provider rotation is then restricted to free rows and fails closed (`QUOTA_FREE_PROVIDER_UNAVAILABLE`, `QUOTA_FREE_PROVIDER_REQUIRED`, `QUOTA_FREE_PROVIDER_CANNOT_SERVE_DATE_ORDERING`, `QUOTA_FREE_PROVIDER_CANNOT_SERVE_ORDERING_WINDOW`) instead of falling back to the official provider. Quota-free candidates are pinned to RELEVANCE before the ordering draw because InnerTube cannot serve DATE, and a quota-free run assigned a windowed ordering treatment fails closed because InnerTube cannot apply `publishedAfter`/`publishedBefore` either; persisting it would record a treatment that executed unwindowed. The exhausted portfolio floor still blocks official/paid exploration at scheduling: for portfolio-labelled strategies the first-page reservation re-check runs whenever the allocated provider consumes official units, and is skipped for any zero-unit provider (`YOUTUBE_INNERTUBE_FREE` and other zero-unit costs). Zero-quota runs remain excluded from quota-normalized reward, promotion samples and maturity counts in the serving selector; the lifetime execution counter only rotates free attempts across immature arms. That exclusion does not drop a benchmark observation from the §8 denominators: the frozen Thompson/Contextual observation map still reads lifetime `query_library` counters as attempt/uncertainty features, and §8 counts completed or terminal-failed attributed observations regardless of provider cost, with quota cost reported separately.
+- Admission: Q0–Q8 `revalidateQueryRecordAdmission` gates (shape, script, CTA, country, tier) before index play.
+- Retired UCB1 formula (offline simulator comparator only; not the control): `currentUcb1Index` (`server/queryQuality/simulator.ts:348-351`) adds `0.8 * sqrt(log(max(1,totalRuns)+1) / (pulls+1))` to `lastRate` clamped to `[0,1]`, using the portfolio-wide execution count; it is not persisted or used by the serving selector.
+- Eligibility gates (pre-selector): `collection!=='REJECTED'`, `reserved_until`/`next_eligible_at` null or past (`:321-327`); cooldown `query_intelligence_query_cooldown_minutes`, default `'360'`, `max(1,…)` (`:328`); primary-term cap `query_intelligence_primary_term_max_uses`, default `'2'` (`:329`); `queriesOutsideCooldown` + `limitRepeatedPrimaryTerms` + `rotateAwayFromMostRecentIntent` (`queryPlanner.ts:117-138`); authority reject → `REJECTED` + skip (`autonomousDiscovery.ts:601-620`, rules `autonomousQueryAuthority.ts:107-151`); batch diversity guard (`autonomousDiscovery.ts:622-632`); reservation `reserved_until=now()+20min`, zero-rows skip (`dbCore.ts:1852-1866`); provider must be `ACTIVE/ACTIVE_GLOBAL/CANARY` (+`SHADOW` only explicit Brave canary) (`dbCore.ts:1829-1834`).
 - Quota/cost: per-key `YOUTUBE_DAILY_QUOTA_PER_KEY||'10000'` (`dbCore.ts:651`); autonomous share default `70`, range `[1,100]` (`autonomousDiscovery.ts:100-108`); capacity `min(batchSize, max(0,target-current))` (`discoverySchedulerPolicy.ts:29-37`); execution reserves 100 units `AUTONOMOUS_QUERY_PAGE` (`queueManager.ts:615-618`); `YOUTUBE_INNERTUBE_FREE` reserves nothing; Brave uses provider-request ledger (`:602-634`); `quotaConsumed = providerCostUsd>0 || INNERTUBE_FREE ? 0 : pageNumber*100` (`:824`); pagination caps `autonomous_pagination_max_pages='3'`, `autonomous_pagination_max_low_yield_pages='2'` (`:691-702`).
 - Allocation semantics: control `allocationOrigin='LEGACY'`, no frontier decision id/dimensions (`autonomousDiscovery.ts:633-658`); provider rotation stable per `scheduled:${query.id}:${country}` (`dbCore.ts:1787-1822`); lane/ordering deficit allocator, video-lane target 70 (`retrievalLanes.ts:4-6`, default `discovery_video_lane_percent`), ordering `CHANNEL=>RELEVANCE`, video date target `max(configured '10', recency floor '60')` (`searchOrdering.ts:15-27`).
 - Attribution semantics: `completeQueryRun` sets `COMPLETED/quota_used/provider_*/performance_details`, idempotent `query_run_accounting_attributions` (`attribution_version='query-run-accounting-v1'`), updates `query_library` + `query_execution_logs` + terminology attribution (`dbCore.ts:2841-2903`); funnel→score `100*(0.30 tradingPrecision + 0.25 noveltyRatio + 0.20 qualityYield + 0.15 countryPrecision + 0.10 communityYield)` (`queryPerformance.ts:90-96`); quality = `TRADING_CONFIRMED && score>=55` (`:6-10`); promotion `>=60=>PROVEN`, `<25 && runs>=2=>REJECTED` (`:135-141`).
 - Neighborhood: dimensions/key/checksum/mapping (`discoveryNeighborhood.ts:6-67,99-150`); control targeted branch `NEIGHBORHOOD_TARGETED` with miss→generate→`planFrontierTargetedQuery` fallback (`queryIntelligence.ts:386-449`; `queryPlanner.ts:145-175`).
 
-UCB1 was not modified while preparing this specification.
+The retired UCB1 formula was not modified while preparing this specification; it is comparator-only.
 
 ## 3. Experimental arms (as implemented at base)
 
 Admission models differ per mechanism. The benchmark treatment for each category is explicit:
 
-1. Request-level deterministic experiment assignment (benchmark-randomized): Thompson, Contextual, P2 ordering — assignment by frozen hash construction (§6) using the frozen experiment identity (§3A). Absent `experiment` in a request → legacy UCB1 byte-identical path (not a benchmark observation).
+1. Request-level deterministic experiment assignment (benchmark-randomized): Thompson, Contextual, P2 ordering — assignment by frozen hash construction (§6) using the frozen experiment identity (§3A). Absent `experiment` in a request → legacy serving-selector path byte-identical (not a benchmark observation).
 2. Feature-gated deterministic mechanisms (NOT benchmark-randomized; remain default-off): P-A, P-B, P-C — no benchmark treatment arm; benchmark runs with gates as frozen in §3A (off unless the frozen config says otherwise).
 3. Approval + feature-gated mechanism (NOT benchmark-randomized): P-D serving influence — no serving arm until human-approved snapshot + flag admission exist (none exists at base); benchmark treatment is snapshot-production metrics only.
 4. Shadow-only mechanisms (record-only by construction): P3 policy evaluation, P2 shadow recommendation, P5 registry/gates, P-E gateway/fallbacks, P-D snapshot production — benchmark treatment is eligibility/reason-code/fallback rates only, never efficacy claims.
@@ -87,7 +129,7 @@ Chosen deterministically from the spec version and code defaults — not from ex
 
 | Arm / mechanism | Implementation / version | Eligibility | Assignment | Gates (default) | Caps / quota | Failure handling | Eligible observation |
 |---|---|---|---|---|---|---|---|
-| Thompson sampling (selection) | `querySelectionExperiments.ts:53-55,462`, `allocationChallengers.ts:27,123-127` (`allocation-challenger-v1`); prior defaults `alpha0=1,beta0=1` | Valid request: non-empty `experimentId`, arms ⊆ {THOMPSON,CONTEXTUAL}, basis `0..10000` int, finite priors/weights (`:158-182`); pool = reservable + cooldown/diversity/intent gates, id-asc (`:581-589,705-708`); observation map `successes=floor(quality_channels_found)`, `failures=max(0,floor(times_executed)-successes)` (`:24-33,407-432`) | `shaBucket(VERSION:experimentId:opportunityKey)`, `bucket>=basis→CONTROL`; else `enabledArms[shaBucket(…:arm) % n]`, propensity `floor(basis/n)`, control propensity `10000-basis` (`:305-330`); no `Math.random` | No app_settings gate; opt-in request only; `query_intelligence_paused` pauses all (`autonomousDiscovery.ts:110-111`) | basis `0..10000`; trial `maxQuota 1..100 default 100`, `pageDepth>=1 default 1` (`:237-244`); downstream trial pageDepthCap `min(1,…)` (`discoveryFrontierTrials.ts:335`); daily canary cap 500 (`:153,163`) | Invalid→400; empty pool→UCB1 fallback with reason `Requested treatment arm but the eligible pool was empty; served UCB1 fallback` (`:709-723`); `OPPORTUNITY_KEY_REQUIRED`; `NO_ARMS`/`INVALID_ARM_COUNTS`/`INVALID_PRIOR` throws | Served query record with persisted `selectionExperiment` envelope + `selectionStrategy=THOMPSON` |
+| Thompson sampling (selection) | `querySelectionExperiments.ts:53-55,462`, `allocationChallengers.ts:27,123-127` (`allocation-challenger-v1`); prior defaults `alpha0=1,beta0=1` | Valid request: non-empty `experimentId`, arms ⊆ {THOMPSON,CONTEXTUAL}, basis `0..10000` int, finite priors/weights (`:158-182`); pool = reservable + cooldown/diversity/intent gates + execution-authority gate (incl. live scope promotion), id-asc (`querySelectionExperiments.ts:912-925`; `autonomousQueryAuthority.ts:112`); observation map `successes=floor(quality_channels_found)`, `failures=max(0,floor(times_executed)-successes)` (`:24-33,407-432`) | `shaBucket(VERSION:experimentId:opportunityKey)`, `bucket>=basis→CONTROL`; else `enabledArms[shaBucket(…:arm) % n]`, propensity `floor(basis/n)`, control propensity `10000-basis` (`:305-330`); no `Math.random` | No app_settings gate; opt-in request only; `query_intelligence_paused` pauses all (`autonomousDiscovery.ts:110-111`) | basis `0..10000`; trial `maxQuota 1..100 default 100`, `pageDepth>=1 default 1` (`:237-244`); downstream trial pageDepthCap `min(1,…)` (`discoveryFrontierTrials.ts:335`); daily canary cap 500 (`:153,163`) | Invalid→400; empty pool→serving-selector fallback with reason `Requested treatment arm but the eligible pool was empty; served control fallback` (`:709-723`); `OPPORTUNITY_KEY_REQUIRED`; `NO_ARMS`/`INVALID_ARM_COUNTS`/`INVALID_PRIOR` throws | Served query record with persisted `selectionExperiment` envelope + `selectionStrategy=THOMPSON` |
 | Contextual challenger (selection) | Same core; scorer `contextualArmScore` defaults `value 0.5, exploration 0.35, cost 0.1` (`allocationChallengers.ts:156-160`); features `expectedValue=(performance_score)/100`, `uncertainty=1/(times_executed+1)`, `coverageGap`, `cost=1` | Same as Thompson | Same bucket/arm-pick mechanism | Same as Thompson | Same as Thompson | `INVALID_ARM_FEATURES` throws; otherwise same as Thompson | Same with `selectionStrategy=CONTEXTUAL` |
 | P2 windowed retrieval/order | `retrieval-experiment-v1` (`retrievalExperiment.ts:13`); bounds RFC3339 full-datetime (`:31`); treatment needs ≥1 valid bound + non-empty experimentId (`:44-72`) | Ordering request valid: basis int `0..10000`, non-empty id chain, window re-validated (`querySelectionExperiments.ts:184-233`); independent of selection dimension (`:623-636`) | Independent bucket `sha256(VERSION:opportunityKey)%10000`, `bucket<basis→TREATMENT`, propensity basis / `10000-basis` (`retrievalExperiment.ts:114-143`) | Opt-in `experiment.ordering` only; absent→legacy byte-identical (`:629-636,648`) | Date-range only; execution pagination/trial caps apply (`queueManager.ts:691-701`, `discoveryFrontierTrials.ts:553-558`) | Route-invalid→400; execution-time invalid→`null` → unwindowed fetch (`retrievalExperiment.ts:86-104` via `queueManager.ts:624`); only TREATMENT+valid window persists `searchWindow` (`dbCore.ts:2094-2095,2176`) | `SEARCH_YOUTUBE` job carrying `searchWindow{publishedAfter?,publishedBefore?,experimentId}` executed via `executeAllocatedRetrievalPage` |
 | P3 graph-depth-2 | `graph-expansion-v1` (`graphExpansionPolicy.ts:12`), `RELATIONSHIP_CANARY_VERSION` (`relationshipCanary.ts:31`); wrapper `evaluateGraphDepth2ForCanaryTarget` (`:241-268`) | Fail-closed: canaryEnabled; numeric sanity; `parentDepth==1`; fanout int ≥1; `independentFamilies>=2`; not saturated (`overlap>=0.85 && known>=0.85`) (`graphExpansionPolicy.ts:43-73`); caller passes `independentFamilies:0` → always `GRAPH_INSUFFICIENT_INDEPENDENCE` until family signals exist (`relationshipCanary.ts:234-238`); payload `seeds 1..10, maxDepth 1..2, maxFanout 1..10, maxChannels 1..150` (`:73-109`) | No randomization; deterministic `proposalKey=sha256(VERSION:parent:edgeKind:2:i…)[0:32]` (`graphExpansionPolicy.ts:122-125`) | `graph_depth2_experiment_enabled` default `'false'` (`:917-918`); parent canary `relationship_canary_enabled` default `'false'`, kill switch default `'true'`, quota pct default `'1'` clamp `1..10` (`:140-148`); live = enabled && killSwitch!==true | Fanout cap 10; depth2 parents 5; channels/run 150; earmark 305 units | Ineligible→`{eligible:false,proposals:[]}` record-only (`:259-261`); builder throws `GRAPH_DEPTH2_NOT_ELIGIBLE/INVALID_PARENT/…` (`:108-113`); execution failures classified (`:305-312`), guards break/return without spend | Record-only `rawObservation.graphDepth2Policy{eligible,reasonCode,proposalCount,firstProposalKey,policyVersion}` (`:971`); fetches are existing canary `expandFeatured(depth:2)` under canary caps, never gated by P3 outcome (`:934-977`). **Shadow-only. The P3 graph-depth-2 policy decision is shadow-only. Existing relationship-canary depth-2 traversal is not a P3 treatment and its traversal outcomes must not be attributed to P3 efficacy.** |
@@ -130,13 +172,17 @@ No frozen corpus/snapshot exists at preregistration time. Pool construction is f
 - Ordering: `bucket = shaBucket(f"{RETRIEVAL_EXPERIMENT_VERSION}:{opportunityKey}")`; note the ordering construction embeds no experimentId (implemented as `VERSION:opportunityKey`); the frozen `experimentId=benchmark-prereg-v1-ordering` travels as the window `experimentId` attribution field, not as a hash input. With frozen `treatmentBasisPoints=5000`: `bucket<5000 → TREATMENT p=5000` else `CONTROL p=5000` (`retrievalExperiment.ts:114-143`).
 - Assignment identity/version inputs (no separate salt field exists in the implementation): the hash is constructed directly from the experiment policy/version string, the experimentId where applicable (selection only), and the opportunityKey, exactly as written above. Frozen versions: `query-selection-experiment-v1` + `benchmark-prereg-v1-selection`; `retrieval-experiment-v1` (+ window `experimentId=benchmark-prereg-v1-ordering` as attribution). Same eligible input + same frozen inputs → same assignment (no `Math.random` on assignment paths).
 - Arm probabilities: frozen by §3A (`5000` control / `2500`+`2500` selection treatments; `5000`/`5000` ordering); recorded per observation as `propensityBasisPoints`.
-- Stratification: none implemented — explicitly none. Eligibility checks precede assignment; retries are new assignment draws under the same `benchmarkOpportunityId` (reservation/authority gates re-evaluated, draw recorded per attempt); duplicate observations deduped by channel/run keys; failed assignments (invalid request) → 400 with nothing scheduled; unavailable treatment (empty pool) → documented UCB1 fallback, `servedArm=CONTROL`.
+- Stratification: none implemented — explicitly none. Eligibility checks precede assignment; retries are new assignment draws under the same `benchmarkOpportunityId` (reservation/authority gates re-evaluated, draw recorded per attempt); duplicate observations deduped by channel/run keys; failed assignments (invalid request) → 400 with nothing scheduled; unavailable treatment (empty pool) → documented serving-selector fallback, `servedArm=CONTROL`.
 
 ## 7. Parameter table (from code/config — nothing tuned)
 
 | Parameter | Frozen value | Source |
 |---|---|---|
-| UCB1 exploration constant | `0.8` hardcoded | `queryIntelligence.ts:368` |
+| Hierarchical selector policy | `hierarchical-ucb-v1` (frozen) | `server/queryQuality/posterior.ts:4` |
+| Query portfolio policy | `query-portfolio-v1` (frozen) | `server/queryQuality/selector.ts:22` |
+| Selector exploration constant | `c=2.0`; index cap `4.0` | `server/queryQuality/posterior.ts:5` |
+| Portfolio share | `0.15`, clamp `[0.10,0.20]`; 1 page = 1 unit | `server/queryQuality/posterior.ts:6-8,11-16,19` |
+| UCB1 exploration constant (retired; offline comparator only) | `0.8` hardcoded | `server/queryQuality/simulator.ts:currentUcb1Index` |
 | Exploration ratio | default `'0.4'`, clamp `[0.1,0.9]` | `queryIntelligence.ts:330` |
 | Query cooldown minutes | default `'360'`, `max(1,…)` | `queryIntelligence.ts:328` |
 | Primary-term max uses | default `'2'`, `max(1,…)` | `queryIntelligence.ts:329` |
@@ -197,7 +243,7 @@ No benchmark-N power contract exists in the repository — this is stated explic
 | Event | Frozen handling |
 |---|---|
 | Invalid experiment request | Route 400, nothing scheduled |
-| Empty treatment pool | UCB1 fallback, `servedArm=CONTROL`, reason recorded |
+| Empty treatment pool | Serving-selector fallback, `servedArm=CONTROL`, reason recorded |
 | Invalid window (legacy/non-frozen path only) | Execution unwindowed (`resolveExecutionSearchWindow→null`), control attribution. Does NOT apply to the frozen benchmark ordering experiment: there, a malformed request/window is rejected by validation (`INVALID_ORDERING_EXPERIMENT`, nothing scheduled); a valid but divergent caller-supplied window is ignored and overwritten with the immutable 90-day window derived from stored `scheduled_at`; the executed frozen TREATMENT window is therefore always the derived window — it must never become an unwindowed benchmark treatment. |
 | Trial initiation failure | `NOT_INITIATED`, scheduling proceeds |
 | Provider failure/timeout/quota/network/malformed | Run `FAILED` with classified code; counts in arm denominator; quota settled (`finishQuotaReservation(false)`); no silent retry beyond coded policy |
@@ -220,7 +266,7 @@ Gaps identified (not invented around): no dedicated `benchmark_spec_version` / `
 
 ## 13. Analysis rules (frozen)
 
-- Primary comparison: each executable treatment arm vs UCB1 control on primary outcome (quality yield), at query-run aggregation, with arm denominators = eligible attributed observations and propensities reported.
+- Primary comparison: each executable treatment arm vs the serving-selector control on primary outcome (quality yield), at query-run aggregation, with arm denominators = eligible attributed observations and propensities reported.
 - Secondary comparisons: same structure for secondary metrics; P2 ordering arm compared on retrieval/window measures + funnel outcomes; shadow mechanisms summarized descriptively (rates + reason codes), never as efficacy claims.
 - No post-hoc method selection: descriptive arm rates with denominators + propensity sums; any interval/statistical method must be the one contractually required by the repo — none is, so none is claimed here. A future approved analysis addendum may specify one before execution without touching this spec's outcomes.
 - Repeated observations: same opportunity re-eligible only via gates; each attributed run is one observation; channel-level dedup within run.
@@ -228,19 +274,19 @@ Gaps identified (not invented around): no dedicated `benchmark_spec_version` / `
 
 ## 14. Production safety
 
-- UCB1 remains the production control. Experimental mechanisms stay non-authoritative until benchmark completion + evaluation.
+- The hierarchical serving selector remains the production control. Experimental mechanisms stay non-authoritative until benchmark completion + evaluation.
 - No global feature gate enabled for this specification. All experimental defaults remain OFF/false/0. Kill switches (`frontier_trials_enabled` missing=false, `relationship_canary_kill_switch` default true, per-arm basis-0 CONTROL) and quotas/caps (§7) remain intact.
-- Benchmark preparation changed no production allocation/scoring behavior: UCB1 is untouched, legacy/non-benchmark paths execute byte-identically, and all experimental gates remain default-off. Beyond the preregistration document, PR #493 contains only benchmark-support wiring/measurement scoped to frozen benchmark identities (enumerated in §18) — no tuning, no threshold/parameter changes, no global enablement.
+- Benchmark preparation changed no production allocation/scoring behavior: the hierarchical serving selector is the frozen control, legacy/non-benchmark paths execute byte-identically, and all experimental gates remain default-off. Beyond the preregistration document, PR #493 contains only benchmark-support wiring/measurement scoped to frozen benchmark identities (enumerated in §18) — no tuning, no threshold/parameter changes, no global enablement.
 
 ## 15. Reproducibility contract
 
-A result is reproducible from: engine commit `4b49e0c01ac53eebf0080fae29bd6aaabb803cfc` + spec `benchmark-preregistration-v1` + mechanism versions (§1) + frozen pool snapshot hash (record at execution) + assignment versions + frozen experimentIds and basis points (§3A) + configuration hash + provider versions + provenance records (§12).
+A result is reproducible from: engine commit `4b49e0c01ac53eebf0080fae29bd6aaabb803cfc` + the pre-execution authority revision documented above + spec `benchmark-preregistration-v1` + mechanism versions (§1) + frozen pool snapshot hash (record at execution) + assignment versions + frozen experimentIds and basis points (§3A) + configuration hash + provider versions + provenance records (§12).
 
 Missing pieces today (filled deterministically at execution, not chosen then): pool snapshot export + hash; config-hash dump; provider registry snapshot. The experimentIds, basis points, arms, priors, weights, and window rule are already frozen in §3A — they are not execution-time choices. No result may be declared reproducible without the execution-record items.
 
 ## 16. Required file
 
-This document: `docs/BENCHMARK_PREREGISTRATION.md` (new file). Historical benchmark documents were not modified to agree with it. Mechanism classes distinguished per §3: (1) request-level randomized (Thompson, Contextual, P2 ordering) with frozen identity in §3A; (2) feature-gated deterministic (P-A, P-B, P-C; off during benchmark); (3) approval + feature-gated (P-D serving; no arm); (4) shadow-only (P3 policy evaluation, P2 shadow recommendation, P5 registry/gates, P-E gateway/fallbacks, P-D snapshot production); (5) genuinely blocked (§4); plus control (§2 UCB1).
+This document: `docs/BENCHMARK_PREREGISTRATION.md` (new file). Historical benchmark documents were not modified to agree with it. Mechanism classes distinguished per §3: (1) request-level randomized (Thompson, Contextual, P2 ordering) with frozen identity in §3A; (2) feature-gated deterministic (P-A, P-B, P-C; off during benchmark); (3) approval + feature-gated (P-D serving; no arm); (4) shadow-only (P3 policy evaluation, P2 shadow recommendation, P5 registry/gates, P-E gateway/fallbacks, P-D snapshot production); (5) genuinely blocked (§4); plus control (§2 serving selector).
 
 ## 17. Validation before freezing (no benchmark run)
 
@@ -253,13 +299,13 @@ This document: `docs/BENCHMARK_PREREGISTRATION.md` (new file). Historical benchm
   - `node --import tsx --test server/relationshipCanary.test.ts`
   - `node --import tsx --test server/benchmarkPreregFindings.contract.test.ts`
   - `npx tsc --noEmit` (full-project typecheck)
-- Confirmed no production mechanism enabled or tuned, no frozen benchmark parameter changed, UCB1 unchanged (verified by diff inspection; see §18 for the exact file list).
+- Confirmed no production mechanism enabled or tuned, no frozen benchmark parameter changed, serving-selector control unchanged (verified by diff inspection; see §18 for the exact file list).
 
 ## 18. Git workflow
 
 - Branch: `docs/frozen-benchmark-preregistration` from `4b49e0c` (pushed, PR opened, NOT merged).
 - Commits: the preregistration document (`docs/BENCHMARK_PREREGISTRATION.md`) plus benchmark-support wiring/measurement that enforces it, all scoped to frozen benchmark identities with legacy paths byte-identical:
-  - `server/querySelectionExperiments.ts` — frozen benchmark identity constants, scheduled_at-derived P2 window enforcement, pre-selection pool-scope request field, configuration-gated opportunity identity, schedule-authoritative ordering resolver; no UCB1 or assignment-math changes.
+  - `server/querySelectionExperiments.ts` — frozen benchmark identity constants, scheduled_at-derived P2 window enforcement, pre-selection pool-scope request field, configuration-gated opportunity identity, schedule-authoritative ordering resolver; no serving-selector or assignment-math changes.
   - `server/dbCore.ts` — schedule path derives the frozen P2 window from stored `query_runs.scheduled_at` (`INSERT ... RETURNING id, scheduled_at`) and records zero-funnel accounting attributions for terminally failed runs (without touching `query_library` aggregates); non-benchmark scheduling unchanged.
   - `server/relationshipCanary.ts` — per-target P3 shadow decision records on the run summary/attempt log; traversal and admission ungated (still record-only).
   - Tests only: `server/querySelectionExperiments.test.ts`, `server/relationshipCanary.test.ts`, `server/benchmarkPreregFindings.contract.test.ts` (new).

@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { planRevealedRenderedClickTargets, remainingRenderedClickBudget, resolveRenderedCompletionState, runRenderedClickLoop } from './browserCommunityFallback';
+import { DEFAULT_BROWSER_FALLBACK_BUDGET, MAX_RENDERED_CROSS_ORIGIN_ENQUEUES, combineRenderedControlOffsetAdvances, enqueueRenderedCrossOriginPass, isCrossHostnameStructuralNavigation, isNavigableOnlyControlWindow, isSameSeedDocument, isUnrecoveredStructuralNavigation, mergeRenderedCoverageGapCounters, planRevealedRenderedClickTargets, planRenderedCrossOriginEnqueues, partitionRenderedClickTargets, reconcileClickDestinationContext, remainingRenderedClickBudget, renderedClickOffsetAdvance, renderedControlOverflowTargets, renderedCrossOriginVisitedIdentities, renderedRequestControlTotalsDelta, resolveRenderedCompletionState, resolveUnexaminedPopupTargets, runRenderedClickLoop, shouldEnqueueRenderedCrossOriginLink, trackRenderedPopupCoverage, type RenderedControlEnumeration, type RenderedRequestControlTotals } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -45,6 +45,29 @@ const renderedButton = (index: number, marker: string) => ({
   tag: 'button' as const,
 });
 
+/**
+ * Complete P0.2 enumeration shape for loop fixtures. `total` is the pre-filter
+ * denominator; these fixtures are all hint-matched, so hint-rejected and the
+ * structural/icon counters are zero.
+ */
+const renderedEnumeration = (
+  controls: RenderedControlEnumeration['controls'],
+  total = controls.length,
+): RenderedControlEnumeration => ({
+  controls,
+  total,
+  hintRejected: Math.max(0, total - controls.length),
+  structuralNavigation: 0,
+  structuralHintRejected: 0,
+  structuralDisclosure: 0,
+  structuralUnrecovered: 0,
+  structuralUnrecoveredHrefs: [],
+  structuralUnrecoveredOverflow: false,
+  iconLabelRecovered: 0,
+  popupTargets: 0,
+  popupMarkers: controls.filter(control => control.popup && control.marker).map(control => control.marker as string),
+});
+
 test('an evidence-bearing interaction gap keeps a processed run incomplete and retryable', () => {
   const gapped = resolveRenderedCompletionState({
     inspectedPages: 1,
@@ -63,6 +86,297 @@ test('an evidence-bearing interaction gap keeps a processed run incomplete and r
   });
   assert.equal(clean.complete, true, 'without a gap the processed run still resolves clean');
   assert.equal(clean.retryable, false);
+});
+
+test('the evaluation window rotates over the full matched-control pool so control 65 is reachable', () => {
+  const controls = Array.from({ length: 70 }, (_, index) => renderedButton(index, `oc-${index + 1}`));
+  const firstWindow = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 0);
+  assert.equal(firstWindow.evaluationWindow.length, 64);
+  assert.deepEqual(firstWindow.toClick.map(target => target.marker), ['oc-1', 'oc-2', 'oc-3', 'oc-4']);
+
+  const rotatedWindow = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 64);
+  assert.equal(rotatedWindow.evaluationWindow.length, 64);
+  assert.deepEqual(
+    rotatedWindow.toClick.map(target => target.marker),
+    ['oc-65', 'oc-66', 'oc-67', 'oc-68'],
+    'the durable retry offset reaches controls beyond the first 64',
+  );
+
+  // 64-control regression: a full window still wraps to the first control and
+  // never invents a 65th target.
+  const sixtyFour = controls.slice(0, 64);
+  const wrapped = partitionRenderedClickTargets(sixtyFour, 'https://creator.example/', 4, 64);
+  assert.equal(wrapped.evaluationWindow.length, 64);
+  assert.deepEqual(wrapped.toClick.map(target => target.marker), ['oc-1', 'oc-2', 'oc-3', 'oc-4']);
+});
+
+test('retry rotation never starts on a hidden control ahead of its disclosure', () => {
+  // Enumeration order: three community controls, the menu summary, then the
+  // hidden invite it reveals. Rotation offsets index the flat pool, so offset
+  // 4 lands exactly on the hidden invite.
+  const controls = [
+    renderedButton(0, 'oc-b1'),
+    renderedButton(1, 'oc-b2'),
+    renderedButton(2, 'oc-b3'),
+    { index: 3, marker: 'oc-menu', text: 'Menu', href: null, tag: 'button' as const },
+    { index: 4, marker: 'oc-invite', text: 'Discord', href: null, tag: 'button' as const, hidden: true, afterMarker: 'oc-menu' },
+  ];
+  for (let offset = 0; offset < controls.length; offset++) {
+    const plan = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, offset);
+    const markers = plan.toClick.map(target => target.marker);
+    const inviteAt = markers.indexOf('oc-invite');
+    if (inviteAt === -1) continue;
+    assert.equal(
+      markers.indexOf('oc-menu') >= 0 && markers.indexOf('oc-menu') < inviteAt,
+      true,
+      `offset ${offset} replays the disclosure before the control it reveals`,
+    );
+  }
+
+  const boundary = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 4);
+  assert.deepEqual(
+    boundary.toClick.map(target => target.marker),
+    ['oc-menu', 'oc-invite', 'oc-b1', 'oc-b2'],
+    'a boundary that lands on the hidden control rewinds to its summary and still spends the cap',
+  );
+  assert.equal(boundary.rotationReplay, 1, 'the replay prefix is reported to the offset accounting');
+  assert.equal(
+    renderedClickOffsetAdvance(boundary, boundary.toClick.length, 4),
+    3,
+    'the advance is measured from the saved offset, so only new progress counts',
+  );
+
+  // Successive retries advance through the pool instead of repeating the same
+  // window, so a control skipped by one cap is examined later.
+  const attempted = new Set<string>();
+  let offset = 0;
+  for (let attempt = 0; attempt < controls.length * 2; attempt++) {
+    const plan = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, offset);
+    for (const target of plan.toClick) if (target.marker) attempted.add(target.marker);
+    offset += renderedClickOffsetAdvance(plan, plan.toClick.length, 4);
+  }
+  assert.equal(attempted.has('oc-b3'), true, 'later retries reach the control skipped by the first cap');
+  assert.equal(attempted.has('oc-invite'), true, 'later retries reach the hidden invite');
+});
+
+test('rewinding a disclosure does not skip the controls after the original offset', () => {
+  // Greptile: pool [B1, B2, B3, menu, hidden, B4, B5, B6]. Offset 4 rewinds to
+  // the menu, so the advance must land on B6 (7), not wrap back to B1 (8).
+  const controls = [
+    renderedButton(0, 'oc-b1'),
+    renderedButton(1, 'oc-b2'),
+    renderedButton(2, 'oc-b3'),
+    { index: 3, marker: 'oc-menu', text: 'Menu', href: null, tag: 'button' as const },
+    { index: 4, marker: 'oc-hidden', text: 'Discord', href: null, tag: 'button' as const, hidden: true, afterMarker: 'oc-menu' },
+    renderedButton(5, 'oc-b4'),
+    renderedButton(6, 'oc-b5'),
+    renderedButton(7, 'oc-b6'),
+  ];
+  const boundary = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 4);
+  assert.deepEqual(boundary.toClick.map(target => target.marker), ['oc-menu', 'oc-hidden', 'oc-b4', 'oc-b5']);
+  const advance = renderedClickOffsetAdvance(boundary, 4, 4);
+  assert.equal(advance, 3, 'the advance excludes the rewind so the next offset is 7, not 8');
+  const next = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 4 + advance);
+  assert.deepEqual(
+    next.toClick.map(target => target.marker),
+    ['oc-b6', 'oc-b1', 'oc-b2', 'oc-b3'],
+    'the retry resumes at the control after the last examined pool position',
+  );
+});
+
+test('a menu larger than the click cap does not freeze the retry rotation', () => {
+  // Greptile: pool [summary, H1..H5] with a four-click cap. Replaying the
+  // whole menu unit every retry would examine the same prefix and advance 0,
+  // leaving H4/H5 (and any invite behind them) unreachable.
+  const controls = [
+    { index: 0, marker: 'oc-menu', text: 'Menu', href: null, tag: 'button' as const },
+    ...Array.from({ length: 5 }, (_, index) => ({
+      index: index + 1,
+      marker: `oc-h${index + 1}`,
+      text: 'Discord',
+      href: null,
+      tag: 'button' as const,
+      hidden: true,
+      afterMarker: 'oc-menu',
+    })),
+  ];
+  const clicked = new Set<string>();
+  let offset = 0;
+  let stalledAttempts = 0;
+  for (let attempt = 0; attempt < controls.length; attempt++) {
+    const plan = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, offset);
+    for (const target of plan.toClick) if (target.marker) clicked.add(target.marker);
+    const advance = renderedClickOffsetAdvance(plan, plan.toClick.length, 4);
+    if (plan.toClick.length > 0 && advance === 0) stalledAttempts++;
+    offset += advance;
+  }
+  assert.equal(stalledAttempts, 0, 'a retry that clicked controls always advances');
+  for (let index = 1; index <= 5; index++) {
+    assert.equal(clicked.has(`oc-h${index}`), true, `hidden control H${index} is reached by a retry`);
+  }
+});
+
+test('a hidden invite beyond the initial click cap is reached by the retry rotation', () => {
+  const controls = [
+    renderedButton(0, 'oc-b1'),
+    renderedButton(1, 'oc-b2'),
+    renderedButton(2, 'oc-b3'),
+    { index: 3, marker: 'oc-menu', text: 'Menu', href: null, tag: 'button' as const },
+    { index: 4, marker: 'oc-invite', text: 'Discord', href: null, tag: 'button' as const, hidden: true, afterMarker: 'oc-menu' },
+  ];
+  const first = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 0);
+  assert.deepEqual(first.toClick.map(target => target.marker), ['oc-b1', 'oc-b2', 'oc-b3', 'oc-menu']);
+  assert.equal(first.toClick.some(target => target.marker === 'oc-invite'), false, 'the invite is beyond the first cap');
+  assert.equal(
+    first.evaluationWindow.some(target => target.marker === 'oc-invite'),
+    true,
+    'the invite is inside the evaluation window, so it is deferred rather than lost',
+  );
+
+  const retry = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 4);
+  assert.equal(
+    retry.toClick.some(target => target.marker === 'oc-invite'),
+    true,
+    'the next retry opens the menu and clicks the invite it reveals',
+  );
+});
+
+test('an all-navigable evaluation window is certified for durable rotation', () => {
+  // A 70-control page whose first window contains only same-host navigable
+  // anchors attempts zero clicks. Without an explicit certificate the durable
+  // offset would never advance and control 65 would be unreachable forever.
+  const anchors = Array.from({ length: 70 }, (_, index) => ({
+    index,
+    marker: `oc-${index + 1}`,
+    text: `Community link ${index + 1}`,
+    href: `https://creator.example/community-${index + 1}`,
+    tag: 'anchor' as const,
+  }));
+  const plan = partitionRenderedClickTargets(anchors, 'https://creator.example/', 4, 0);
+  assert.equal(plan.toClick.length, 0, 'navigable anchors are enqueue-handled, not clicked');
+  assert.equal(plan.skippedNavigableAnchors, 64);
+  assert.equal(isNavigableOnlyControlWindow(plan, 4), true, 'a fully examined navigable window advances the rotation');
+  assert.equal(isNavigableOnlyControlWindow(plan, 0), false, 'a zero click budget did not examine the window');
+  assert.equal(renderedClickOffsetAdvance(plan, 0, 4), 64, 'a certified all-navigable window advances one full window');
+  assert.equal(renderedClickOffsetAdvance(plan, 0, 0), 0, 'a zero click budget never advances the rotation');
+
+  const clickable = partitionRenderedClickTargets(
+    Array.from({ length: 70 }, (_, index) => renderedButton(index, `oc-${index + 1}`)),
+    'https://creator.example/',
+    4,
+    0,
+  );
+  assert.equal(isNavigableOnlyControlWindow(clickable, 4), false, 'a window with clickable controls is not certified as navigable-only');
+  assert.equal(renderedClickOffsetAdvance(clickable, 0, 4), 0, 'an uncertified zero-click window (deadline/crash) must not advance');
+  assert.equal(renderedClickOffsetAdvance(clickable, 2, 4), 2, 'a partial click window advances past the last attempted control');
+});
+
+test('retry offsets advance past anchors before clicked controls instead of repeating them', () => {
+  // Four navigable anchors precede eight buttons. The offset indexes the full
+  // matched pool, so advancing by the raw click count (4) would land back on
+  // button 1; it must advance past the last attempted button (position 7).
+  const anchors = Array.from({ length: 4 }, (_, index) => ({
+    index,
+    marker: `oc-a${index + 1}`,
+    text: `Community link ${index + 1}`,
+    href: `https://creator.example/community-${index + 1}`,
+    tag: 'anchor' as const,
+  }));
+  const buttons = Array.from({ length: 8 }, (_, index) => renderedButton(index + 4, `oc-b${index + 1}`));
+  const controls = [...anchors, ...buttons];
+
+  const first = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 0);
+  assert.deepEqual(first.toClick.map(target => target.marker), ['oc-b1', 'oc-b2', 'oc-b3', 'oc-b4']);
+  assert.equal(renderedClickOffsetAdvance(first, 4, 4), 8, 'the offset lands just past the last clicked control');
+
+  const second = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 8);
+  assert.deepEqual(
+    second.toClick.map(target => target.marker),
+    ['oc-b5', 'oc-b6', 'oc-b7', 'oc-b8'],
+    'the retry examines the next buttons instead of repeating the first four',
+  );
+  assert.equal(renderedClickOffsetAdvance(second, 4, 4), 4, 'the next page-relative advance covers the four attempted buttons');
+
+  // Anchors after the clickable controls do not change the position advance.
+  const buttonsFirst = [...buttons, ...anchors.map((anchor, index) => ({ ...anchor, index: index + 8, marker: `oc-tail-a${index + 1}` }))];
+  const firstButtonsFirst = partitionRenderedClickTargets(buttonsFirst, 'https://creator.example/', 4, 0);
+  assert.deepEqual(firstButtonsFirst.toClick.map(target => target.marker), ['oc-b1', 'oc-b2', 'oc-b3', 'oc-b4']);
+  assert.equal(renderedClickOffsetAdvance(firstButtonsFirst, 4, 4), 4);
+  const secondButtonsFirst = partitionRenderedClickTargets(buttonsFirst, 'https://creator.example/', 4, 4);
+  assert.deepEqual(secondButtonsFirst.toClick.map(target => target.marker), ['oc-b5', 'oc-b6', 'oc-b7', 'oc-b8']);
+});
+
+test('failed controls stop retry rotation before their unexamined content', async () => {
+  const anchors = Array.from({ length: 4 }, (_, index) => ({
+    index,
+    marker: `oc-fa${index + 1}`,
+    text: `Community link ${index + 1}`,
+    href: `https://creator.example/community-${index + 1}`,
+    tag: 'anchor' as const,
+  }));
+  const buttons = Array.from({ length: 8 }, (_, index) => renderedButton(index + 4, `oc-fb${index + 1}`));
+  const controls = [...anchors, ...buttons];
+  const plan = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 0);
+  let attempts = 0;
+  const result = await runRenderedClickLoop({
+    targets: plan.toClick,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    // The first two clicks succeed; the third fails; the fourth succeeds.
+    click: async () => { attempts++; return attempts !== 3; },
+    enumerate: async () => renderedEnumeration(controls),
+    pageUrl: () => 'https://creator.example/',
+  });
+  assert.equal(result.evidenceControlsClicked, 3);
+  assert.equal(result.evidenceControlsFailed, 1);
+  assert.equal(result.firstFailedTargetIndex, 2, 'the failed control is identified by queue position');
+  // Four anchors precede the buttons. The failed button is at full-pool
+  // position 6; the offset must stop there, not move past it to position 7.
+  assert.equal(
+    renderedClickOffsetAdvance(plan, result.evidenceControlsClicked + result.evidenceControlsFailed, 4, result.firstFailedTargetIndex),
+    6,
+    'the next retry starts at the failed control',
+  );
+  const next = partitionRenderedClickTargets(controls, 'https://creator.example/', 4, 6);
+  assert.deepEqual(next.toClick.map(target => target.marker), ['oc-fb3', 'oc-fb4', 'oc-fb5', 'oc-fb6']);
+});
+
+test('a failed first control cannot freeze the retry rotation', async () => {
+  const buttons = Array.from({ length: 8 }, (_, index) => renderedButton(index, `oc-hf${index + 1}`));
+  const plan = partitionRenderedClickTargets(buttons, 'https://creator.example/', 4, 0);
+  let attempts = 0;
+  const result = await runRenderedClickLoop({
+    targets: plan.toClick,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    // The first control is disabled/hidden and always fails; the next three
+    // clicks succeed. A position-zero failure must not pin every retry to the
+    // same window.
+    click: async () => { attempts++; return attempts !== 1; },
+    enumerate: async () => renderedEnumeration(buttons),
+    pageUrl: () => 'https://creator.example/',
+  });
+  assert.equal(result.evidenceControlsFailed, 1);
+  assert.equal(result.firstFailedTargetIndex, 0);
+  assert.equal(
+    renderedClickOffsetAdvance(plan, result.evidenceControlsClicked + result.evidenceControlsFailed, 4, result.firstFailedTargetIndex),
+    4,
+    'the attempted window advances instead of freezing at zero',
+  );
+  const next = partitionRenderedClickTargets(buttons, 'https://creator.example/', 4, 4);
+  assert.deepEqual(next.toClick.map(target => target.marker), ['oc-hf5', 'oc-hf6', 'oc-hf7', 'oc-hf8']);
+});
+
+test('shared retry offset advances by the smallest page progress, never the largest', () => {
+  // A seed page with 64 navigable anchors advances 64 on its own, while a
+  // child page with clickable buttons advances 4. Saving the largest advance
+  // would rotate the child's pool back to its first buttons (64 % 64 = 0) and
+  // leave later buttons permanently unclicked.
+  assert.equal(combineRenderedControlOffsetAdvances(undefined, 64), 64);
+  assert.equal(combineRenderedControlOffsetAdvances(64, 4), 4, 'the navigable seed cannot skip the clickable child');
+  assert.equal(combineRenderedControlOffsetAdvances(4, 8), 4, 'a later page never increases the shared advance');
+  assert.equal(combineRenderedControlOffsetAdvances(4, 0), 4, 'a page with no progress does not erase prior progress');
+  assert.equal(combineRenderedControlOffsetAdvances(undefined, 0), undefined, 'no progress stays sparse');
 });
 
 test('revealed controls reserve the click slots for already-queued controls', () => {
@@ -117,7 +431,7 @@ test('executing click loop reserves queued slots when a click reveals too many c
     enumerate: async () => {
       enumerations++;
       const controls = [...initial, ...revealed];
-      return { controls, total: controls.length };
+      return renderedEnumeration(controls);
     },
     pageUrl: () => 'https://creator.example/',
   });
@@ -142,7 +456,7 @@ test('executing click loop marks a control revealed by the final permitted click
       enumerations++;
       // The fourth click is the only one that reveals another control.
       const controls = clicks === 4 ? [...initial, finalDisclosure] : initial;
-      return { controls, total: controls.length };
+      return renderedEnumeration(controls);
     },
     pageUrl: () => 'https://creator.example/',
   });
@@ -169,13 +483,135 @@ test('executing click loop counts queued controls left beyond the click cap', as
     maxClicksPerPage: 4,
     deadlineExceeded: () => false,
     click: async () => { clicks++; return true; },
-    enumerate: async () => ({ controls: targets, total: targets.length }),
+    enumerate: async () => renderedEnumeration(targets),
     pageUrl: () => 'https://creator.example/',
   });
   assert.equal(clicks, 4);
   assert.equal(result.evidenceControlsClicked, 4);
   assert.equal(result.evidenceControlsSkipped, 1, 'the fifth queued control is a coverage gap');
   assert.equal(result.interactionGap, true);
+});
+
+test('over-budget generic disclosures do not make an otherwise clean page retryable', async () => {
+  const controls = Array.from({ length: 5 }, (_, index) => ({
+    ...renderedButton(index, `oc-disclosure-${index}`),
+    text: 'Open menu',
+    origin: 'disclosure' as const,
+  }));
+  let clicks = 0;
+  const result = await runRenderedClickLoop({
+    targets: controls,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    click: async () => { clicks++; return true; },
+    enumerate: async () => renderedEnumeration(controls),
+    pageUrl: () => 'https://creator.example/',
+  });
+  assert.equal(clicks, 4, 'disclosures still consume available click budget');
+  assert.equal(result.evidenceControlsSkipped, 1);
+  assert.equal(result.interactionGap, false, 'an unclicked generic disclosure is opportunistic, not a retryable gap');
+});
+
+test('a failed generic disclosure stays diagnostic while failed evidence controls keep the gap', async () => {
+  const run = async (control: ReturnType<typeof renderedButton> & { origin: 'hint' | 'icon' | 'disclosure' }) =>
+    runRenderedClickLoop({
+      targets: [control],
+      maxClicksPerPage: 4,
+      deadlineExceeded: () => false,
+      click: async () => false,
+      enumerate: async () => renderedEnumeration([control]),
+      pageUrl: () => 'https://creator.example/',
+    });
+  const disclosure = await run({ ...renderedButton(0, 'oc-menu'), text: 'Open menu', origin: 'disclosure' });
+  assert.equal(disclosure.evidenceControlsFailed, 1);
+  assert.equal(disclosure.interactionGap, false, 'a failed generic disclosure is opportunistic, not a retryable gap');
+  for (const origin of ['hint', 'icon'] as const) {
+    const result = await run({ ...renderedButton(0, `oc-${origin}`), origin });
+    assert.equal(result.evidenceControlsFailed, 1);
+    assert.equal(result.interactionGap, true, `a failed ${origin} control remains a retryable gap`);
+  }
+});
+
+test('an unclicked hint/icon control still makes the page retryable', async () => {
+  const controls = [
+    { ...renderedButton(0, 'oc-hint'), origin: 'hint' as const },
+    ...Array.from({ length: 4 }, (_, index) => ({
+      ...renderedButton(index + 1, `oc-disclosure-${index}`),
+      text: 'Open menu',
+      origin: 'disclosure' as const,
+    })),
+  ];
+  const result = await runRenderedClickLoop({
+    targets: controls,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    click: async () => true,
+    enumerate: async () => renderedEnumeration(controls),
+    pageUrl: () => 'https://creator.example/',
+  });
+  assert.equal(result.evidenceControlsSkipped, 1);
+  assert.equal(result.interactionGap, false, 'the skipped control is only a disclosure');
+
+  const fiveHints = controls.map((control, index) => ({ ...control, marker: `oc-hint-${index}`, origin: 'hint' as const }));
+  const hinted = await runRenderedClickLoop({
+    targets: fiveHints,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    click: async () => true,
+    enumerate: async () => renderedEnumeration(fiveHints),
+    pageUrl: () => 'https://creator.example/',
+  });
+  assert.equal(hinted.evidenceControlsSkipped, 1);
+  assert.equal(hinted.interactionGap, true, 'an unclicked evidence control remains a retryable gap');
+});
+
+test('an over-budget icon-recovery control also makes the page retryable', async () => {
+  const controls = Array.from({ length: 5 }, (_, index) => ({
+    ...renderedButton(index, `oc-icon-${index}`),
+    origin: 'icon' as const,
+  }));
+  let clicks = 0;
+  const result = await runRenderedClickLoop({
+    targets: controls,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    click: async () => { clicks++; return true; },
+    enumerate: async () => renderedEnumeration(controls),
+    pageUrl: () => 'https://creator.example/',
+  });
+  assert.equal(clicks, 4, 'icon recoveries consume the click budget');
+  assert.equal(result.evidenceControlsSkipped, 1);
+  assert.equal(result.interactionGap, true, 'an unclicked icon recovery is evidence-bearing, not opportunistic');
+});
+
+test('a replaced document only gaps on unexamined hint/icon leftovers', async () => {
+  const disclosures = Array.from({ length: 3 }, (_, index) => ({
+    ...renderedButton(index, `oc-left-${index}`),
+    origin: 'disclosure' as const,
+  }));
+  const url = { value: 'https://creator.example/start' };
+  const disclosureOnly = await runRenderedClickLoop({
+    targets: disclosures,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    click: async () => { url.value = 'https://creator.example/next'; return true; },
+    enumerate: async () => renderedEnumeration(disclosures),
+    pageUrl: () => url.value,
+  });
+  assert.equal(disclosureOnly.evidenceControlsSkipped, 2);
+  assert.equal(disclosureOnly.interactionGap, false, 'disclosure-only leftovers stay opportunistic');
+
+  url.value = 'https://creator.example/start';
+  const withHint = await runRenderedClickLoop({
+    targets: [disclosures[0], { ...renderedButton(1, 'oc-hint'), origin: 'hint' as const }, disclosures[2]],
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    click: async () => { url.value = 'https://creator.example/next'; return true; },
+    enumerate: async () => renderedEnumeration(disclosures),
+    pageUrl: () => url.value,
+  });
+  assert.equal(withHint.evidenceControlsSkipped, 2);
+  assert.equal(withHint.interactionGap, true, 'a stranded hint control is a retryable gap');
 });
 
 test('executing click loop fails closed when post-click re-enumeration throws', async () => {
@@ -191,6 +627,561 @@ test('executing click loop fails closed when post-click re-enumeration throws', 
   assert.equal(result.evidenceControlsFailed, 0);
   assert.equal(result.evidenceControlsSkipped, 0);
   assert.equal(result.interactionGap, true, 'unknown disclosures must make coverage incomplete');
+});
+
+test('a click that replaces the document stops the loop and counts remaining controls as skipped', async () => {
+  const targets = [0, 1, 2].map(index => renderedButton(index, `oc-nav-${index}`));
+  let url = 'https://creator.example/start';
+  let enumerations = 0;
+  const result = await runRenderedClickLoop({
+    targets,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    click: async () => { url = 'https://creator.example/replaced'; return true; },
+    enumerate: async () => { enumerations++; return renderedEnumeration(targets); },
+    pageUrl: () => url,
+  });
+  assert.equal(result.evidenceControlsClicked, 1);
+  assert.equal(result.evidenceControlsSkipped, 2, 'old-document controls are unexamined after navigation');
+  assert.equal(result.interactionGap, true, 'navigation away leaves the interaction plan incomplete');
+  assert.equal(enumerations, 0, 'the replaced document is not re-enumerated as the original page');
+});
+
+test('a hash-only change is an in-place disclosure, not document navigation', async () => {
+  const targets = [renderedButton(0, 'oc-hash')];
+  let url = 'https://creator.example/start';
+  let enumerations = 0;
+  const result = await runRenderedClickLoop({
+    targets,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    click: async () => { url = 'https://creator.example/start#menu'; return true; },
+    enumerate: async () => { enumerations++; return renderedEnumeration(targets); },
+    pageUrl: () => url,
+  });
+  assert.equal(result.evidenceControlsSkipped, 0);
+  assert.equal(result.interactionGap, false);
+  assert.equal(enumerations, 1, 'hash-only changes still re-enumerate the same document');
+});
+
+test('a final click that navigates does not invent a gap', async () => {
+  const targets = [renderedButton(0, 'oc-final-nav')];
+  let url = 'https://creator.example/start';
+  const result = await runRenderedClickLoop({
+    targets,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    click: async () => { url = 'https://discord.gg/example'; return true; },
+    enumerate: async () => renderedEnumeration(targets),
+    pageUrl: () => url,
+  });
+  assert.equal(result.evidenceControlsClicked, 1);
+  assert.equal(result.evidenceControlsSkipped, 0);
+  assert.equal(result.interactionGap, false, 'no original-page control was left unexamined');
+});
+
+test('only terminal success satisfies required coverage', () => {
+  const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
+  assert.doesNotMatch(source, /inspectedPageKeys/, 'there is no write-only inspected-page set');
+  assert.doesNotMatch(source, /alreadyVisitedSet\.add\(/, 'a merely inspected page never becomes shared successful evidence');
+  assert.match(source, /const inspectedIdentities = visitIdentityKeys\(request\.url, page\.url\(\)\)/, 'both the request URL and the final URL identify the inspected document');
+  assert.match(source, /for \(const identity of inspectedIdentities\) \{\s*structuralVisitedKeys\.add\(identity\)/, 'both redirect identities count for structural-navigation deduplication');
+  assert.match(source, /for \(const identity of terminalSuccessUrls\)[\s\S]{0,160}?sharedCoveredKeys\.add\(key\)/, 'required coverage borrows only terminal-success identities');
+  assert.match(source, /renderedTerminalSuccessIdentities\(\{[\s\S]{0,300}?initialDocumentUrl: clickLoop\.initialDocumentUrl,[\s\S]{0,300}?inspectedDocumentUrl: clickLoop\.processedDocumentUrl,[\s\S]{0,300}?documentReplacedByClick: clickLoop\.documentReplaced,/, 'the start document and the last processed URL are evidence, while a click-committed replacement is not');
+  assert.match(source, /classifyRequiredCoverage\(\{[\s\S]{0,200}?sharedCoveredKeys,/, 'classification receives only terminal-success shared evidence');
+});
+
+test('a seed retry refreshes its own document identity and required links', () => {
+  const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
+  assert.match(source, /const seedRequestKey = normalizeVisitUrl\(seedUrl\)/, 'the seed request is identified once for the crawl');
+  assert.match(source, /if \(seedRequestKey && normalizeVisitUrl\(request\.url\) === seedRequestKey\)/, 'the snapshot is refreshed for each seed attempt, not only the first');
+  assert.match(source, /for \(const link of discoverRequiredSeedLinks\(await page\.content\(\), page\.url\(\)\)\) known\.add\(link\)/, 'retry-discovered links merge with earlier seed links');
+});
+
+test('cross-origin planner carries visible anchor text for generic paths', () => {
+  const currentUrl = 'https://creator.example/';
+  const admitted = planRenderedCrossOriginEnqueues({
+    candidates: [{ url: 'https://community.example/go', text: 'Join the private members community' }],
+    currentUrl,
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(admitted.admitted, ['https://community.example/go']);
+  assert.equal(admitted.disallowed, 0);
+
+  const noLabel = planRenderedCrossOriginEnqueues({
+    candidates: [{ url: 'https://community.example/go', text: '' }],
+    currentUrl,
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(noLabel.admitted, [], 'a generic path with no visible label is not admitted');
+  assert.equal(noLabel.disallowed, 1);
+});
+
+test('cross-origin planner deduplicates, skips visited, and enforces the cap', () => {
+  const currentUrl = 'https://creator.example/';
+  const plan = planRenderedCrossOriginEnqueues({
+    candidates: [
+      { url: 'https://linktr.ee/creator', text: 'Links' },
+      { url: 'https://linktr.ee/creator', text: 'Links again' },
+      { url: 'https://seen.example/join', text: 'Join the community' },
+      { url: 'https://linktr.ee/other', text: 'Links' },
+      { url: 'https://linktr.ee/third', text: 'Links' },
+      { url: 'https://linktr.ee/fourth', text: 'Links' },
+    ],
+    currentUrl,
+    alreadyVisited: new Set(['https://seen.example/join']),
+    queued: new Set(),
+    maxEnqueues: 2,
+  });
+  assert.deepEqual(plan.admitted, ['https://linktr.ee/creator', 'https://linktr.ee/other']);
+  assert.equal(plan.alreadyVisited, 1);
+  assert.equal(plan.duplicate, 0, 'a URL repeated inside one merged snapshot is deduped, not counted as a queue duplicate');
+  assert.equal(plan.budget, 2);
+});
+
+test('cross-origin planner keeps each snapshot origin for its candidates', () => {
+  // The seed page listed hub.example/community; a click then navigated to
+  // hub.example/home. The saved pre-click link must stay eligible against the
+  // origin that produced it.
+  const candidates = [
+    { url: 'https://hub.example/community', text: 'Join the community', sourceUrl: 'https://seed.example/' },
+  ];
+  const plan = planRenderedCrossOriginEnqueues({
+    candidates,
+    currentUrl: 'https://hub.example/home',
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(plan.admitted, ['https://hub.example/community']);
+  assert.equal(plan.disallowed, 0);
+
+  // Without the snapshot origin, the post-click URL classifies the same link
+  // as same-origin and silently drops it.
+  const withoutOrigin = planRenderedCrossOriginEnqueues({
+    candidates: [{ url: 'https://hub.example/community', text: 'Join the community' }],
+    currentUrl: 'https://hub.example/home',
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(withoutOrigin.admitted, []);
+  assert.equal(withoutOrigin.disallowed, 1);
+});
+
+test('a later strong label admits a URL whose first anchor is weak', () => {
+  const plan = planRenderedCrossOriginEnqueues({
+    candidates: [
+      { url: 'https://outside.example/go', text: 'About', sourceUrl: 'https://creator.example/' },
+      { url: 'https://outside.example/go', text: 'Club', sourceUrl: 'https://creator.example/home' },
+    ],
+    currentUrl: 'https://creator.example/home',
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(plan.admitted, ['https://outside.example/go'], 'the later community label must not be masked');
+  assert.equal(plan.disallowed, 0, 'the destination is decided once, using all labels');
+});
+
+test('merged pre/post-click snapshots count each URL once', () => {
+  const plan = planRenderedCrossOriginEnqueues({
+    candidates: [
+      { url: 'https://outside.example/prices', text: 'Prices', sourceUrl: 'https://creator.example/' },
+      { url: 'https://outside.example/prices', text: 'Prices', sourceUrl: 'https://creator.example/home' },
+      { url: 'https://seen.example/join', text: 'Join the community', sourceUrl: 'https://creator.example/' },
+      { url: 'https://seen.example/join', text: 'Join the community', sourceUrl: 'https://creator.example/home' },
+    ],
+    currentUrl: 'https://creator.example/home',
+    alreadyVisited: new Set(['https://seen.example/join']),
+    queued: new Set(),
+  });
+  assert.equal(plan.disallowed, 1, 'a disallowed URL present in both snapshots is counted once');
+  assert.equal(plan.alreadyVisited, 1, 'an already-visited URL present in both snapshots is counted once');
+});
+
+test('redirect and directory Discord pages still pass the destination policy', () => {
+  const plan = planRenderedCrossOriginEnqueues({
+    candidates: [
+      { url: 'https://discord.gg/Abc123', text: 'Discord' },
+      { url: 'https://discord.com/invite/Abc123', text: 'Discord' },
+      { url: 'https://dsc.gg/creator', text: 'Visit the Discord server' },
+      { url: 'https://discord.me/creator', text: 'Visit the Discord server' },
+      { url: 'https://discord.io/creator', text: 'Visit the Discord server' },
+      { url: 'https://disboard.org/server/123', text: 'Visit the Discord server' },
+    ],
+    currentUrl: 'https://creator.example/',
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(plan.admitted, [
+    'https://dsc.gg/creator',
+    'https://discord.me/creator',
+    'https://discord.io/creator',
+  ]);
+  assert.equal(plan.disallowed, 0);
+  assert.equal(plan.budget, 1, 'the cap is still crawl-wide; the directory page is only budget-limited');
+
+  const directory = planRenderedCrossOriginEnqueues({
+    candidates: [{ url: 'https://disboard.org/server/123', text: 'Visit the Discord server' }],
+    currentUrl: 'https://creator.example/',
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(directory.admitted, ['https://disboard.org/server/123']);
+  assert.equal(directory.disallowed, 0);
+});
+
+test('cross-origin enqueue pass enforces the crawl-wide cap and carries visible text', async () => {
+  const queued = new Set<string>();
+  const batches: string[][] = [];
+  const drops = new Map<string, number>();
+  const run = (candidates: { url: string; text: string }[], currentUrl: string) =>
+    enqueueRenderedCrossOriginPass({
+      collect: async () => candidates,
+      currentUrl,
+      alreadyVisited: new Set(),
+      queued,
+      maxEnqueues: MAX_RENDERED_CROSS_ORIGIN_ENQUEUES - queued.size,
+      enqueue: async urls => { batches.push(urls); },
+      countDrop: (reason, count) => drops.set(reason, (drops.get(reason) || 0) + count),
+    });
+  // An unknown host at `/` is admitted only by its visible community text, so
+  // this also proves the collected label reaches the destination policy.
+  await run([
+    { url: 'https://linktr.ee/creator', text: 'Links' },
+    { url: 'https://community.example/', text: 'Join the private members community' },
+  ], 'https://creator.example/');
+  // The second page repeats one destination, adds a third, then a fourth.
+  // The cap is crawl-wide, so the fourth is never passed to enqueue.
+  await run([
+    { url: 'https://linktr.ee/creator', text: 'Links again' },
+    { url: 'https://linktr.ee/third', text: 'Links' },
+    { url: 'https://linktr.ee/fourth', text: 'Links' },
+    { url: 'https://discord.gg/Abc123', text: 'Discord' },
+  ], 'https://creator.example/page-2');
+  assert.deepEqual(batches, [
+    ['https://linktr.ee/creator', 'https://community.example/'],
+    ['https://linktr.ee/third'],
+  ]);
+  assert.equal(queued.size, 3, 'the crawl-wide queued set stops at three destinations');
+  assert.equal(drops.get('destination-budget'), 1, 'the fourth cross-origin destination is not queued');
+  assert.equal(drops.get('cross-origin-disallowed') ?? 0, 0, 'the Discord invite is silently excluded');
+});
+
+test('Discord destinations do not consume cross-origin budget or policy drops', () => {
+  const plan = planRenderedCrossOriginEnqueues({
+    candidates: [
+      { url: 'https://discord.gg/Abc123', text: 'Discord' },
+      { url: 'https://linktr.ee/creator', text: 'Links' },
+    ],
+    currentUrl: 'https://creator.example/',
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(plan.admitted, ['https://linktr.ee/creator']);
+  assert.equal(plan.disallowed, 0);
+  assert.equal(plan.budget, 0);
+});
+
+test('cross-origin rendered enqueue stays policy- and budget-bounded', () => {
+  const currentUrl = 'https://creator.example/';
+  assert.equal(MAX_RENDERED_CROSS_ORIGIN_ENQUEUES, 3, 'the crawl-wide cap stays small');
+  assert.equal(DEFAULT_BROWSER_FALLBACK_BUDGET.crossOriginEnqueue, undefined, 'P1.6 is opt-in and default OFF');
+  assert.equal(
+    shouldEnqueueRenderedCrossOriginLink({
+      url: 'https://creator.example/community',
+      currentUrl,
+      anchorText: 'Join the community',
+    }),
+    false,
+    'same-origin links stay on the existing same-host hint pass',
+  );
+  assert.equal(
+    shouldEnqueueRenderedCrossOriginLink({
+      url: 'https://linktr.ee/creator',
+      currentUrl,
+      anchorText: 'Links',
+    }),
+    true,
+    'known link-hub hosts are admitted by the shared destination policy',
+  );
+  assert.equal(
+    shouldEnqueueRenderedCrossOriginLink({
+      url: 'https://community.example/join',
+      currentUrl,
+      anchorText: 'Join the private members community',
+    }),
+    true,
+    'strong community evidence can open an unknown host',
+  );
+  assert.equal(
+    shouldEnqueueRenderedCrossOriginLink({
+      url: 'https://random.example/about',
+      currentUrl,
+      anchorText: 'About',
+    }),
+    false,
+    'weak generic labels never open an unknown host',
+  );
+  assert.equal(
+    shouldEnqueueRenderedCrossOriginLink({
+      url: 'https://discord.gg/Abc123',
+      currentUrl,
+      anchorText: 'Discord',
+    }),
+    false,
+    'Discord destinations are invite candidates, not page-budget targets',
+  );
+  assert.equal(
+    shouldEnqueueRenderedCrossOriginLink({
+      url: 'https://169.254.169.254/latest/meta-data/',
+      currentUrl,
+      anchorText: 'Join the community',
+    }),
+    false,
+    'admission-rejected destinations are never enqueued',
+  );
+  assert.equal(
+    shouldEnqueueRenderedCrossOriginLink({ url: 'not a url', currentUrl, anchorText: 'join' }),
+    false,
+  );
+});
+
+test('required-link snapshot follows the seed document across a same-document query change', () => {
+  assert.equal(
+    isSameSeedDocument(
+      'document-1',
+      'document-1',
+      'https://creator.example/start',
+      'https://creator.example/start?menu=open',
+    ),
+    true,
+    'a history-only query change keeps the seed document and its newly revealed required links',
+  );
+  assert.equal(
+    isSameSeedDocument(
+      'document-1',
+      'document-2',
+      'https://creator.example/start',
+      'https://creator.example/start',
+    ),
+    false,
+    'a replaced document never contributes required obligations to the seed',
+  );
+  assert.equal(
+    isSameSeedDocument(
+      null,
+      null,
+      'https://creator.example/start',
+      'https://creator.example/start?menu=open',
+    ),
+    false,
+    'identity read failure falls back to the fail-closed URL comparison',
+  );
+  assert.equal(
+    isSameSeedDocument(
+      null,
+      null,
+      'https://creator.example/start',
+      'https://creator.example/start',
+    ),
+    true,
+  );
+});
+
+test('structural navigation is a coverage gap only when enqueue will not follow it', () => {
+  const pageUrl = 'https://creator.example/';
+  const visited = new Set<string>();
+  assert.equal(
+    isUnrecoveredStructuralNavigation('https://creator.example/resources', pageUrl, visited),
+    true,
+    'same-origin, admissible, hint-rejected: neither clicked nor enqueued',
+  );
+  assert.equal(
+    isUnrecoveredStructuralNavigation('https://creator.example/contact', pageUrl, visited),
+    false,
+    'the enqueue path owns and follows community-hint destinations',
+  );
+  assert.equal(
+    isUnrecoveredStructuralNavigation('https://other.example/resources', pageUrl, visited),
+    false,
+    'cross-origin destinations are represented by the cross-origin policy counter',
+  );
+  assert.equal(
+    isUnrecoveredStructuralNavigation('mailto:creator@example.com', pageUrl, visited),
+    false,
+    'format rejections are not unexamined navigation',
+  );
+  assert.equal(
+    isUnrecoveredStructuralNavigation('https://creator.example/logo.png', pageUrl, visited),
+    false,
+    'asset rejections are not unexamined navigation',
+  );
+  assert.equal(
+    isUnrecoveredStructuralNavigation(
+      'https://creator.example/resources',
+      pageUrl,
+      new Set(['https://creator.example/resources']),
+    ),
+    false,
+    'an already-visited destination was examined',
+  );
+});
+
+test('cross-hostname structural anchors are classified for the rendered policy ledger', () => {
+  assert.equal(
+    isCrossHostnameStructuralNavigation('https://other.example/resources', 'https://creator.example/'),
+    true,
+  );
+  assert.equal(
+    isCrossHostnameStructuralNavigation('https://creator.example/resources', 'https://creator.example/start'),
+    false,
+  );
+  assert.equal(
+    isCrossHostnameStructuralNavigation('http://creator.example/resources', 'https://creator.example/'),
+    false,
+    'the same-hostname enqueue strategy follows a scheme switch',
+  );
+  assert.equal(
+    isCrossHostnameStructuralNavigation('https://creator.example:8443/resources', 'https://creator.example/'),
+    false,
+    'the same-hostname enqueue strategy ignores the port',
+  );
+  assert.equal(
+    isCrossHostnameStructuralNavigation('mailto:creator@example.com', 'https://creator.example/'),
+    false,
+    'format rejections are not cross-hostname navigation',
+  );
+  assert.equal(isCrossHostnameStructuralNavigation('', 'https://creator.example/'), false);
+});
+
+test('overflow targets follow the durable rotation and expose only unexamined controls', () => {
+  const pageUrl = 'https://creator.example/';
+  const controls = Array.from({ length: 6 }, (_, index) => renderedButton(index, `oc-${index}`));
+  assert.deepEqual(renderedControlOverflowTargets(controls, pageUrl, 0, 4).map(c => c.marker), ['oc-4', 'oc-5']);
+  assert.deepEqual(
+    renderedControlOverflowTargets(controls, pageUrl, 4, 4).map(c => c.marker),
+    ['oc-2', 'oc-3'],
+    'the unexamined set rotates with the durable offset',
+  );
+  assert.deepEqual(renderedControlOverflowTargets(controls.slice(0, 4), pageUrl, 0, 4), [], 'a page inside the window has no overflow');
+  const withNavigable = [
+    ...Array.from({ length: 4 }, (_, index) => renderedButton(index, `oc-${index}`)),
+    { index: 4, marker: 'oc-community', text: 'Community', href: 'https://creator.example/community', tag: 'anchor' as const },
+    renderedButton(5, 'oc-menu'),
+  ];
+  assert.deepEqual(
+    renderedControlOverflowTargets(withNavigable, pageUrl, 0, 4).map(c => c.marker),
+    ['oc-menu'],
+    'a navigable anchor owned by the enqueue path is not an unexamined overflow control',
+  );
+});
+
+test('a same-document query change continues the click loop and reaches revealed controls', async () => {
+  const targets = [renderedButton(0, 'oc-push')];
+  const revealed = renderedButton(1, 'oc-revealed');
+  let url = 'https://creator.example/start';
+  let clicks = 0;
+  let enumerations = 0;
+  const result = await runRenderedClickLoop({
+    targets,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    click: async () => {
+      clicks++;
+      if (clicks === 1) url = 'https://creator.example/start?menu=open';
+      return true;
+    },
+    enumerate: async () => {
+      enumerations++;
+      return renderedEnumeration([...targets, revealed]);
+    },
+    pageUrl: () => url,
+    documentIdentity: async () => 'same-document',
+  });
+  assert.equal(result.evidenceControlsClicked, 2, 'the revealed control is still clicked');
+  assert.equal(result.evidenceControlsSkipped, 0);
+  assert.equal(result.interactionGap, false);
+  assert.equal(enumerations, 2, 'the same document is re-enumerated after the query change');
+});
+
+test('a later replacement keeps the last processed URL as inspected evidence', async () => {
+  const targets = [renderedButton(0, 'oc-push'), renderedButton(1, 'oc-nav')];
+  let url = 'https://creator.example/start';
+  let clicks = 0;
+  const result = await runRenderedClickLoop({
+    targets,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    click: async () => {
+      clicks++;
+      url = clicks === 1
+        ? 'https://creator.example/start?menu=open'
+        : 'https://creator.example/community';
+      return true;
+    },
+    enumerate: async () => renderedEnumeration(targets),
+    pageUrl: () => url,
+    documentIdentity: async () => (url.includes('community') ? 'document-2' : 'document-1'),
+  });
+  assert.equal(result.documentReplaced, true);
+  assert.equal(
+    result.initialDocumentUrl,
+    'https://creator.example/start',
+    'the document URL at loop start is retained across a history update',
+  );
+  assert.equal(
+    result.processedDocumentUrl,
+    'https://creator.example/start?menu=open',
+    'the same-document update before the replacement remains inspected evidence',
+  );
+});
+
+test('a changed document identity stops the loop even when the URL is unchanged', async () => {
+  const targets = [renderedButton(0, 'oc-identity-1'), renderedButton(1, 'oc-identity-2')];
+  let identity = 'document-1';
+  let enumerations = 0;
+  const result = await runRenderedClickLoop({
+    targets,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    click: async () => { identity = 'document-2'; return true; },
+    enumerate: async () => { enumerations++; return renderedEnumeration(targets); },
+    pageUrl: () => 'https://creator.example/start',
+    documentIdentity: async () => identity,
+  });
+  assert.equal(result.evidenceControlsClicked, 1);
+  assert.equal(result.evidenceControlsSkipped, 1, 'the replaced document leaves the queued control unexamined');
+  assert.equal(result.interactionGap, true);
+  assert.equal(enumerations, 0, 'a replaced document is never re-enumerated as the original page');
+});
+
+test('an unreadable document identity stops the loop instead of trusting an unchanged URL', async () => {
+  const targets = [renderedButton(0, 'oc-identity-1'), renderedButton(1, 'oc-identity-2')];
+  let reads = 0;
+  let enumerations = 0;
+  const result = await runRenderedClickLoop({
+    targets,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    click: async () => true,
+    enumerate: async () => { enumerations++; return renderedEnumeration(targets); },
+    pageUrl: () => 'https://creator.example/start',
+    // The before-read succeeds, the after-read rejects. The URL is unchanged,
+    // so URL comparison cannot distinguish a same-document update from a
+    // same-URL reload; the loop must fail closed.
+    documentIdentity: async () => {
+      reads++;
+      if (reads === 1) return 'document-1';
+      throw new Error('execution context destroyed');
+    },
+  });
+  assert.equal(result.documentReplaced, true, 'unreadable identity cannot prove document continuity');
+  assert.equal(result.evidenceControlsClicked, 1);
+  assert.equal(result.evidenceControlsSkipped, 1, 'the queued control on the unverified document is unexamined');
+  assert.equal(result.interactionGap, true);
+  assert.equal(result.processedDocumentUrl, 'https://creator.example/start');
+  assert.equal(enumerations, 0, 'a possibly replaced document is not re-enumerated as the original page');
 });
 
 test('revealed-control planning rotates with the durable retry offset', () => {
@@ -224,9 +1215,12 @@ test('outcome classifier source contracts: gap outranks clean resolution and nev
     source,
     /if \(interactionGap\) return \{outcome:'FOUND',failureClass:rendered\.timedOut\?'RENDERED_TIMEOUT':'RENDERED_INTERACTION_GAP',gapRetryable:true\};/,
   );
-  // Required-link coverage never absorbs the gap into a clean absence.
-  assert.match(source, /if \(requiredCovered && !interactionGap\) return \{outcome:'INSPECTED_NO_MATCH'\};/);
-  assert.match(source, /if\(rendered\.complete&&renderedProcessed&&!interactionGap\)return\{outcome:'INSPECTED_NO_MATCH'\};/);
+  // Required-link coverage never absorbs the gap into a clean absence, and the
+  // explicit false is scoped to runs that actually admitted optional
+  // cross-origin work, so flag-off retry/cache behavior is unchanged.
+  assert.match(source, /if \(requiredCovered && !interactionGap && !coverageGap\) return \{outcome:'INSPECTED_NO_MATCH',\.\.\.cleanRetryableOverride\};/);
+  assert.match(source, /if\(rendered\.complete&&renderedProcessed&&!interactionGap&&!coverageGap\)return\{outcome:'INSPECTED_NO_MATCH',\.\.\.cleanRetryableOverride\};/);
+  assert.match(source, /const optionalCrossOriginWork = \(rendered\.crossOriginEnqueued \|\| 0\) > 0;/);
   // Partial/acquisition-failed runs keep the gap class visible for retry.
   assert.match(source, /failureClass:timeoutClass\|\|interactionClass\|\|'RENDERED_PARTIAL_COVERAGE'/);
 });
@@ -242,21 +1236,253 @@ test('zero-candidate interaction gaps stay retryable even with permanent-only li
 
 test('rendered control coverage counts overflow and uses stable markers across DOM mutations', () => {
   const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
-  assert.match(source, /return \{ controls, total: matched\.length \}/, 'total matches are returned before the 64-item slice');
-  assert.match(source, /recordControlEnumeration\(firstEnumeration\.total\)/);
+  assert.match(source, /return \{\s*controls,\s*total: nodes\.length,/, 'the complete matched set is returned with its pre-filter total');
+  assert.match(source, /hintRejected: Math\.max\(0, nodes\.length - baseMatchedCount\)/, 'hint-rejected stays measured against the original filter');
+  assert.match(source, /structuralNavigation,/, 'structural navigation controls are counted for P1.1');
+  assert.match(source, /structuralDisclosure,/, 'in-place structural disclosures are counted for P1.1');
+  assert.match(source, /structuralUnrecovered,/, 'structural controls left to the enqueue path are counted');
+  assert.match(source, /iconLabelRecovered,/, 'icon/label recovery is counted for P1.2');
+  assert.match(source, /popupTargets,/, 'popup targets are counted for P1.3');
+  assert.doesNotMatch(source, /matched\.slice\(0, 64\)/, 'enumeration must not truncate before the retry rotation');
+  assert.match(source, /RENDERED_CONTROL_EVALUATION_WINDOW = 64/);
+  assert.match(source, /const evaluationWindow = ordered\.slice\(0, windowSize\)/, 'the evaluation window is applied after rotating the full matched pool');
+  assert.match(source, /recordControlEnumeration\(firstEnumeration\)/);
   assert.match(source, /data-oc-control/);
   assert.match(source, /partitionRenderedClickTargets\(controls, page\.url\(\), limits\.maxClicksPerPage, limits\.clickOffset\)/, 'the retry offset rotates the full pool before the cap');
   assert.match(source, /const pendingQueuedTargets = Math\.max\(0, clickTargets\.length - clickIndex - 1\)/, 'queued-but-unclicked controls consume the remaining budget');
   assert.match(source, /const freshPlan = planRevealedRenderedClickTargets\(\s*unqueued,\s*input\.pageUrl\(\),\s*input\.maxClicksPerPage,\s*clickedThisPage,\s*pendingQueuedTargets,\s*input\.clickOffset,?\s*\)/, 'revealed controls are planned against the truly remaining slots and retry offset');
-  assert.match(source, /const clickLoop = await runRenderedClickLoop\(\{[\s\S]*?enumerate: enumerateControls,[\s\S]*?onEnumerated: recordControlEnumeration,?\s*\}\);/, 'the handler executes the extracted loop after every click');
+  assert.match(source, /(?:const\s+)?clickLoop = await runRenderedClickLoop\(\{[\s\S]*?enumerate: enumerateControls,[\s\S]*?onEnumerated: recordControlEnumeration,?\s*\}\);/, 'the handler executes the extracted loop after every click');
   assert.doesNotMatch(source, /clickedThisPage < limits\.maxClicksPerPage && Date\.now\(\) - startedAt < limits\.totalTimeoutMs\) \{/, 'the old final-click guard must not return');
   assert.match(source, /freshDropped\+\+/, 're-enumerated controls beyond the remaining budget are counted as skipped');
+  assert.match(source, /const sliceSkippedTargets = clickPlan\.evaluationWindow\.filter/, 'slice accounting identifies the skipped targets');
+  assert.match(source, /renderedControlSkipsNeedInteractionGap\(sliceSkippedTargets\)/, 'only hint/icon skips make the initial plan retryable');
+  assert.match(source, /origin: baseMatched \? 'hint' : extendedMatched \? 'icon' : 'disclosure'/, 'enumeration records why a control entered the click set');
   assert.match(source, /drops\.count\('control-slice', clickLoop\.evidenceControlsSkipped\)/, 'revealed-control slices are recorded');
   assert.match(source, /interactionGap:interactionGap\|\|undefined/, 'throw paths retain the interaction gap');
   assert.match(source, /if \(clickedThisPage >= input\.maxClicksPerPage\) \{[\s\S]*?clickTargets\.slice\(clickIndex\)/,
     'queued controls beyond the click cap are counted as skipped');
   assert.match(source, /if \(!input\.deadlineExceeded\(\)\) \{[\s\S]*?const refreshed = await input\.enumerate\(\)/,
     'the loop re-enumerates after every click, including the final permitted click');
+  assert.match(source, /telemetry\.evidenceControlsTotal = evidenceControlsSeen \|\| undefined/);
+  assert.match(source, /telemetry\.evidenceControlsSkipped = evidenceControlsSkipped \|\| undefined/);
+  assert.match(source, /combineRenderedControlOffsetAdvances\(\s*evidenceControlsOffsetAdvance,\s*offsetAdvance,?\s*\)/, 'the crawl aggregates per-page progress conservatively');
+  assert.match(source, /evidenceControlsUncertified = true/, 'an unexamined clickable page blocks shared offset advancement');
+  assert.match(source, /telemetry\.evidenceControlsUncertified = \(evidenceControlsUncertified \|\| uncertifiedRequestKeys\.size > 0\) \|\| undefined/);
+  assert.match(source, /clickLoop\.firstFailedTargetIndex/, 'the crawl stops rotation at the first failed control');
+  assert.match(source, /if \(pageClickWindowPending\) evidenceControlsUncertified = true/, 'a throw during a clickable page leaves the seed uncertified');
+  assert.match(source, /if \(i === limits\.maxScrollsPerPage - 1\) pageScrollCapThisAttempt = true/, 'the scroll cap records when the page was still growing');
+  assert.match(source, /pageScrollCapByRequest\.set\(requestKey, pageScrollCapThisAttempt\)/, 'scroll-cap growth is stored per request attempt');
+  assert.match(source, /scrollCapReachedStillGrowing = \[\.\.\.pageScrollCapByRequest\.values\(\)\]\.some\(Boolean\)/, 'a successful retry replaces the stale scroll-cap flag');
+  assert.match(source, /baseHrefPresent = \[\.\.\.pageControlTotalsByRequest\.values\(\)\]\.some\(entry => entry\.baseHrefPresent === true\)/, 'base-href presence reflects the latest attempt per request');
+  assert.match(source, /recordClickDestinationContext\(page\.url\(\), \{/, 'a clicked destination is observed by identity instead of mutating the request counters');
+  assert.doesNotMatch(source, /admittedEnqueueKeys/, 'admission is not evidence of inspection: it cannot suppress a click-only sample');
+  assert.match(source, /reconcileClickDestinationContext\(\{[\s\S]{0,160}?observations: clickDestinationContextByKey,[\s\S]{0,120}?inspectedKeys: inspectedDocumentKeys,/, 'click-only context is reconciled against inspected documents at publish time');
+  assert.match(source, /if \(input\.inspectedKeys\.has\(key\)\) continue;/, 'a destination its own request inspected is not counted twice');
+  assert.match(source, /frameCount: frameCount \+ clickDestinationContext\.frameCount,[\s\S]{0,200}?shadowRootCount: shadowRootCount \+ clickDestinationContext\.shadowRootCount,/, 'the coverage reason sees the same click-only context that telemetry publishes');
+  assert.match(source, /const inspectedIdentities = visitIdentityKeys\(request\.url, page\.url\(\)\);\s*for \(const identity of inspectedIdentities\) \{\s*inspectedDocumentKeys\.add\(identity\);/, 'every request records the document it actually inspected');
+  assert.match(source, /page\.evaluate\(collectRenderedPageContext\)/, 'frame/shadow/base-href context is collected per page');
+  assert.match(source, /telemetry\.coverageReason = resolveRenderedCoverageReason\(/, 'the crawl publishes a diagnostic coverage reason');
+  assert.match(source, /telemetry\.controlsEnumeratedTotal = controlsEnumeratedTotal \|\| undefined/, 'pre-filter control totals are persisted');
+  assert.match(source, /telemetry\.navigationPolicyExcluded = /, 'navigation policy exclusions are persisted');
+  assert.equal(
+    (source.match(/publishEvidenceControlCertificate\(/g) || []).length,
+    2,
+    'both the success and catch paths publish the control certificate to telemetry',
+  );
+});
+
+test('P0.2 coverage counters stay coherent, bounded, and preserved on error paths', () => {
+  const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
+  assert.match(source, /if \(!pageSnapshotRecorded \|\| enumeration\.total > pageControlsEnumeratedTotal\) \{[\s\S]*?pageHintRejected = enumeration\.hintRejected/, 'the denominator and hint-rejected counts come from one enumeration snapshot');
+  assert.match(source, /if \(previous && !pageSnapshotRecorded\) \{[\s\S]{0,1400}?frameCount: Math\.max\(previous\.frameCount \|\| 0, pageFrameCount\),[\s\S]{0,200}?shadowRootCount: Math\.max\(previous\.shadowRootCount \|\| 0, pageShadowRootCount\),[\s\S]{0,200}?baseHrefPresent: previous\.baseHrefPresent \|\| pageBaseHrefPresent,[\s\S]{0,900}?return;/, 'a retry that never enumerated keeps the earlier control snapshot and merges every context count');
+  assert.match(source, /aggregatePageCountersOnError\?\.\(\)/, 'the handler catch preserves counters from an already-enumerated page');
+  assert.match(source, /if \(pageCountersAggregated\) return;/, 'the error and success aggregations cannot double-count a page');
+  assert.match(source, /await recordPageContext\(\);\s*\/\/ Page-end aggregation/, 'context counters refresh after the click loop');
+  assert.match(source, /const clickOutcome = await attemptRenderedControlClick[\s\S]{0,1200}?\n\s+queuePageContextProbe\(\);\n\s+if \(clickOutcome\.ok/, 'a context sample is queued after each click before the next can replace the DOM');
+  assert.match(source, /const pendingContextProbes: Array<Promise<void>> = \[\];/, 'per-click probes are not awaited on the click path');
+  assert.match(source, /await flushPageContextProbes\(\);\s*\n\s*await recordPageContext\(\);/, 'pending samples are flushed before page-end aggregation');
+  assert.match(source, /await flushPageContextProbesOnError\?\.\(\);/, 'pending samples are flushed before error aggregation');
+  assert.match(source, /const initialPageContext = await page\.evaluate\(collectRenderedPageContext\)\.catch\(\(\) => null\);/, 'the baseline identity and context counts are captured together before any counter sample');
+  assert.match(source, /pageDocumentIdentity = initialPageContext\.documentTimeOrigin \?\? null;/, 'the baseline identity comes from that first evaluation');
+  assert.doesNotMatch(source, /pageDocumentIdentity = currentIdentity;/, 'a later probe never redefines the inspected document');
+  assert.match(source, /const capMs = Math\.max\(0, Math\.min\(250, remainingMs\)\);/, 'probe flushing has a short cap bounded by the remaining crawl budget');
+  assert.match(source, /contextMeasurementAbandoned = true;/, 'abandoned context sampling is recorded at crawl level');
+  assert.match(source, /contextUnknown: contextMeasurementAbandoned/, 'abandoned context sampling prevents a COMPLETE coverage reason');
+  assert.match(source, /const sameDocument = pageDocumentIdentity !== null && currentIdentity !== null[\s\S]{0,260}?currentIdentity === pageDocumentIdentity/, 'the identity comparison gates the guard that permits counter updates');
+  assert.match(source, /if \(!sameDocument && !sameUrl\) \{[\s\S]{0,900}?recordClickDestinationContext\(page\.url\(\), \{[\s\S]{0,400}?return;/, 'a click-reached destination contributes context but never leaks another document into the request counters');
+  assert.match(source, /pagePopupMarkers = trackRenderedPopupCoverage\(pagePopupMarkers, enumeration\)/, 'popup identities are tracked across every enumeration');
+  assert.match(source, /popupCount: resolveUnexaminedPopupTargets\(pagePopupMarkers, examinedPopupMarkers\)/, 'only popups actually examined are excluded; a replacement cannot be cancelled by an earlier click');
+  assert.match(source, /popupTargets \+= delta\.popupCount/, 'the same-request retry delta adjusts the popup contribution');
+  assert.match(source, /pageControlTotalsByRequest\.set\(requestKey, current\)/, 'a retried request replaces its last-attempt counters');
+  assert.match(source, /if \(pageClickWindowPending\) evidenceControlsUncertified = true;/, 'a thrown handler certifies a pending click window before Crawlee retries');
+  assert.match(source, /document\.getElementsByTagName\(frameTags\[tagIndex\]\)/, 'frame counting uses live collections instead of materializing every match');
+  assert.doesNotMatch(source, /querySelectorAll\('iframe,frame,object,embed'\)/, 'the unbounded materializing frame query is gone');
+  assert.match(source, /const extendedText = `\$\{baseText\} \$\{title\} \$\{labelledByText\} \$\{childAlt\} \$\{dataLabel\} \$\{dataTooltip\} \$\{svgTitle\} \$\{hiddenText\}`/, 'structural classification reads the control own text plus bounded label attributes');
+  assert.doesNotMatch(source, /svgTitleNode\.textContent/, 'SVG title text is never materialized in full');
+  assert.match(source, /const svgTitleWalker = document\.createTreeWalker\(svgTitleNode, NodeFilter\.SHOW_TEXT\)/, 'the SVG title read is bounded like the other label sources');
+  assert.match(source, /const ariaHaspopup = \(element\.getAttribute\('aria-haspopup'\) \|\| ''\)\.trim\(\)\.toLowerCase\(\);/, 'padded aria-haspopup values are normalized before structural and popup checks');
+  assert.match(source, /drops\.countUnique\('cross-origin-disallowed', key\)/, 'each cross-origin structural destination is counted once per crawl, not once per page or retry');
+  assert.match(source, /const unrecoveredStructuralNavigation = excludedStructuralNavigation\s*&& \(explicitStructural \|\| extendedMatched\)/, 'only explicit menu semantics or a hint-recovered label turn a navigable anchor into a coverage gap');
+  assert.doesNotMatch(source, /const labelText = `\$\{element\.innerText \|\| ''\} \$\{ariaLabel\} \$\{title\}/, 'title text alone cannot be the only classification input');
+  const aggregateRegistration = source.indexOf('aggregatePageCountersOnError = aggregatePageControlCounters;');
+  const scrollLoop = source.indexOf('for (let i = 0; i < limits.maxScrollsPerPage; i++)');
+  assert.ok(aggregateRegistration !== -1 && scrollLoop !== -1, 'the error aggregator and scroll loop both exist');
+  assert.ok(aggregateRegistration < scrollLoop, 'the error aggregator is registered before scrolling so a scroll throw keeps measured context counts');
+  assert.match(source, /mergeRenderedCoverageGapCounters\(/, 'later enumerations merge their coverage-gap observations');
+  assert.match(source, /pageStructuralHintRejected = gapCounters\.structuralHintRejected/, 'a later smaller enumeration cannot discard a structural coverage gap');
+  assert.match(source, /popupWindowsThisClick\.size === 0/, 'a click that opened a new window is not treated as an examined popup');
+  assert.match(source, /clickPageContext\?\.off\?\.\('page', onPopupWindow\)/, 'the popup listener does not outlive the click loop');
+});
+
+test('hidden controls wait for the disclosure that reveals them', () => {
+  const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
+  assert.match(source, /for \(let ancestor = element\.parentElement; ancestor; ancestor = ancestor\.parentElement\) \{/, 'every closed <details> ancestor is considered, not only the nearest one');
+  assert.match(source, /ancestor\.tagName\.toLowerCase\(\) !== 'details' \|\| ancestor\.hasAttribute\('open'\)/, 'only closed details ancestors hide their content');
+  assert.match(source, /if \(summary && summary\.contains\(element\)\) continue;/, 'a summary and everything inside it stay visible while its details is closed');
+  assert.match(
+    source,
+    /const hidden = hiddenByClosedDetails\s*\|\| element\.getClientRects\(\)\.length === 0\s*\|\| getComputedStyle\(element\)\.visibility === 'hidden';/,
+    'a control with no layout box, no computed visibility, or a closed details ancestor is marked hidden',
+  );
+  assert.match(source, /if \(hidden && revealer\) \{/, 'a hidden control records the disclosure that reveals it');
+  assert.match(source, /revealerIndexByIndex\.set\(index, revealerIndex\);/, 'the revealer is tracked by control index');
+  assert.match(source, /const pending = hiddenAfter\.get\(revealerIndex\);/, 'hidden controls are grouped under their revealing control');
+  assert.match(source, /const afterMarker = revealerIndex === undefined \? undefined : markerByIndex\.get\(revealerIndex\);/, 'each hidden control carries the marker of its revealer into retry planning');
+  assert.match(source, /planRenderedClickRotation\(controls, offset\);/, 'retry rotation replays only the revealer chain for a boundary that lands on a hidden control');
+  assert.match(source, /const stack = \(hiddenAfter\.get\(root\.index\) \|\| \[\]\)\.slice\(\)\.reverse\(\);/, 'hidden controls follow their revealer, depth-first for nested disclosures');
+  assert.match(source, /roots\.push\(\.\.\.trailingHidden\);/, 'a hidden control with no known revealer is still queued last');
+  assert.doesNotMatch(source, /isVisible/, 'the click loop keeps its bounded actionability wait instead of a one-shot visibility probe');
+  assert.match(source, /\.\.\.\(hidden \? \{ hidden: true \} : \{\}\),/, 'the hidden mark travels with the enumerated control');
+});
+
+test('coverage-gap counters accumulate across later, smaller enumerations', () => {
+  const first = mergeRenderedCoverageGapCounters(
+    { structuralNavigation: 0, structuralHintRejected: 0, iconLabelRecovered: 0 },
+    { structuralNavigation: 0, structuralHintRejected: 0, iconLabelRecovered: 1 },
+  );
+  assert.deepEqual(first, { structuralNavigation: 0, structuralHintRejected: 0, iconLabelRecovered: 1 });
+  const second = mergeRenderedCoverageGapCounters(first, {
+    structuralNavigation: 1, structuralHintRejected: 1, iconLabelRecovered: 0,
+  });
+  assert.deepEqual(
+    second,
+    { structuralNavigation: 1, structuralHintRejected: 1, iconLabelRecovered: 1 },
+    'a menu trigger revealed by a click is counted even though the refreshed set is smaller',
+  );
+});
+
+test('popup coverage tracks identities so a replacement cannot be cancelled by a prior click', () => {
+  const tracked = trackRenderedPopupCoverage(new Set<string>(), { popupMarkers: ['popup-a'] });
+  assert.equal(
+    resolveUnexaminedPopupTargets(tracked, new Set(['popup-a'])),
+    0,
+    'an inline-examined popup is not a coverage gap',
+  );
+  // Clicking popup A replaces it with a hint-rejected popup B. B has its own
+  // marker, so A's click cannot cancel B out even in a same-sized snapshot.
+  const replacement = trackRenderedPopupCoverage(tracked, { popupMarkers: ['popup-b'] });
+  assert.equal(
+    resolveUnexaminedPopupTargets(replacement, new Set(['popup-a'])),
+    1,
+    'a hint-rejected replacement popup remains unexamined even though the old popup was clicked',
+  );
+});
+
+test('a retried request replaces its previous-attempt counters instead of double counting', () => {
+  const attempt = (enumerated: number, popupCount: number): RenderedRequestControlTotals => ({
+    enumerated,
+    hintRejected: 1,
+    structuralNavigation: 2,
+    structuralHintRejected: 1,
+    structuralDisclosure: 1,
+    structuralUnrecovered: 1,
+    iconLabelRecovered: 1,
+    popupCount,
+    frameCount: 1,
+    shadowRootCount: 1,
+    baseHrefPresent: false,
+  });
+  const first = renderedRequestControlTotalsDelta(undefined, attempt(5, 2));
+  assert.equal(first.enumerated, 5, 'the first attempt contributes its full observation');
+  assert.equal(first.popupCount, 2);
+
+  const retry = renderedRequestControlTotalsDelta(attempt(5, 2), attempt(5, 2));
+  assert.deepEqual(retry, {
+    enumerated: 0,
+    hintRejected: 0,
+    structuralNavigation: 0,
+    structuralHintRejected: 0,
+    structuralDisclosure: 0,
+    structuralUnrecovered: 0,
+    iconLabelRecovered: 0,
+    popupCount: 0,
+    frameCount: 0,
+    shadowRootCount: 0,
+  }, 'an identical retry adds nothing to crawl totals');
+
+  const changed = renderedRequestControlTotalsDelta(attempt(5, 2), attempt(7, 1));
+  assert.equal(changed.enumerated, 2, 'only the latest attempt delta is added');
+  assert.equal(changed.popupCount, -1, 'an examined popup adjusts the previous contribution downward');
+});
+
+test('label recovery stays bounded before allocating id lists or subtree text', () => {
+  const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
+  assert.doesNotMatch(source, /labelledBy\.split\(/, 'the whole aria-labelledby attribute is never split into an id array');
+  assert.match(source, /idCount < 16/, 'at most 16 id tokens are extracted');
+  assert.doesNotMatch(source, /labelNode\?\.textContent/, 'a referenced subtree is never materialized as full text');
+  assert.match(source, /document\.createTreeWalker\(labelNode, NodeFilter\.SHOW_TEXT\)/, 'referenced labels are walked as bounded text nodes');
+  assert.match(source, /visitedLabelNodes < 512/, 'the text walk has a fixed node ceiling');
+  assert.match(source, /labelledByText\.length < 200/, 'collection stops at 200 characters');
+  assert.match(source, /labelledByText \+= pendingSeparator \+ \(text\.length > remaining \? text\.slice\(0, remaining\) : text\)/, 'adjacent text nodes concatenate without splitting a word');
+  assert.match(source, /let pendingSeparator = labelledByText\.length > 0 \? ' ' : '';/, 'a separator is added once per referenced label');
+  assert.match(source, /hiddenText \+= value\.length > remaining \? value\.slice\(0, remaining\) : value;/, 'descendant text nodes concatenate without splitting a word');
+});
+
+test('a clicked destination that its own request inspects is not counted twice', () => {
+  const observations = new Map([
+    ['https://creator.example/community', { frameCount: 2, shadowRootCount: 1, baseHrefPresent: false }],
+    ['https://creator.example/landing', { frameCount: 1, shadowRootCount: 0, baseHrefPresent: true }],
+  ]);
+  const inspected = new Set(['https://creator.example/community']);
+  const reconciled = reconcileClickDestinationContext({ observations, inspectedKeys: inspected });
+  assert.equal(reconciled.frameCount, 1, 'the admitted destination is counted by its own request, not by the click');
+  assert.equal(reconciled.shadowRootCount, 0, 'the admitted destination cannot inflate shadow-root totals');
+  assert.equal(reconciled.baseHrefPresent, true, 'the click-only destination still contributes its base href');
+  assert.deepEqual(
+    reconcileClickDestinationContext({ observations, inspectedKeys: new Set() }),
+    { frameCount: 3, shadowRootCount: 1, baseHrefPresent: true },
+    'every observation counts when no request inspected the destination',
+  );
+  assert.deepEqual(
+    reconcileClickDestinationContext({ observations, inspectedKeys: new Set(observations.keys()) }),
+    { frameCount: 0, shadowRootCount: 0, baseHrefPresent: false },
+    'a fully inspected destination set leaves nothing to add',
+  );
+});
+
+test('a retried request clears its own uncertified click window', () => {
+  const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
+  assert.match(source, /uncertifiedRequestKeys\.delete\(request\.url\)/, 'a fresh attempt clears the request mark before re-examining');
+  assert.match(source, /if \(pageClickWindowPending\) uncertifiedRequestKeys\.add\(request\.url\)/, 'a pending window is certified per request, not crawl-wide');
+  assert.match(source, /telemetry\.evidenceControlsUncertified = \(evidenceControlsUncertified \|\| uncertifiedRequestKeys\.size > 0\)/, 'the published certificate reflects the remaining per-request marks');
+});
+
+test('popup coverage counts each popup once and keeps window-opening popups unexamined', () => {
+  let tracked = new Set<string>();
+  // The same static popup is observed on every scroll/enumeration pass.
+  tracked = trackRenderedPopupCoverage(tracked, { popupMarkers: ['popup-a'] });
+  tracked = trackRenderedPopupCoverage(tracked, { popupMarkers: ['popup-a'] });
+  assert.equal(tracked.size, 1, 're-observation does not duplicate the popup identity');
+  assert.equal(
+    resolveUnexaminedPopupTargets(tracked, new Set()),
+    1,
+    'a click that opened a new window did not examine the popup',
+  );
+  assert.equal(
+    resolveUnexaminedPopupTargets(tracked, new Set(['popup-a'])),
+    0,
+    'an inline click examines the matched popup',
+  );
 });
 
 test('shared rendered evidence stays fail-closed: gapped/timed-out lenders never enter inventory', () => {
@@ -267,4 +1493,63 @@ test('shared rendered evidence stays fail-closed: gapped/timed-out lenders never
     'only complete, non-timed-out, gapless rendered runs are reusable',
   );
   assert.match(source, /const rec=recs&&recs\[0\];if\(!rec\|\|rec\.complete!==true\)return null;/);
+});
+
+test('a failed cross-origin enqueue releases its cap identities for the retry', async () => {
+  const queued = new Set<string>();
+  const batches: string[][] = [];
+  let fail = true;
+  const run = () => enqueueRenderedCrossOriginPass({
+    collect: async () => [
+      { url: 'https://linktr.ee/creator', text: 'Links' },
+      { url: 'https://community.example/', text: 'Join the private members community' },
+    ],
+    currentUrl: 'https://creator.example/',
+    alreadyVisited: new Set(),
+    queued,
+    maxEnqueues: MAX_RENDERED_CROSS_ORIGIN_ENQUEUES - queued.size,
+    enqueue: async urls => {
+      if (fail) throw new Error('enqueue unavailable');
+      batches.push(urls);
+    },
+    countDrop: () => undefined,
+  });
+  await assert.rejects(run, /enqueue unavailable/);
+  assert.equal(queued.size, 0, 'a failed submission must not consume crawl-wide cap identities');
+  fail = false;
+  await run();
+  assert.deepEqual(batches, [
+    ['https://linktr.ee/creator', 'https://community.example/'],
+  ], 'the Crawlee page retry resubmits the same planned destinations');
+  assert.equal(queued.size, 2);
+});
+
+test('cross-origin admission dedupes terminally inspected request and final identities', () => {
+  const base = new Set(['https://seen.example/join']);
+  assert.equal(
+    renderedCrossOriginVisitedIdentities(base, []),
+    base,
+    'with no inspected identities the caller set is reused unchanged',
+  );
+  const combined = renderedCrossOriginVisitedIdentities(base, [
+    'https://hub.example/shortcut',
+    'https://hub.example/community',
+  ]);
+  assert.deepEqual([...combined], [
+    'https://seen.example/join',
+    'https://hub.example/shortcut',
+    'https://hub.example/community',
+  ]);
+  const plan = planRenderedCrossOriginEnqueues({
+    candidates: [
+      { url: 'https://hub.example/community', text: 'Join the community' },
+      { url: 'https://hub.example/other', text: 'Join the community' },
+    ],
+    currentUrl: 'https://creator.example/',
+    alreadyVisited: combined,
+    queued: new Set(),
+  });
+  assert.deepEqual(plan.admitted, ['https://hub.example/other'],
+    'a destination already inspected through its redirect target is not refetched');
+  assert.equal(plan.alreadyVisited, 1);
 });

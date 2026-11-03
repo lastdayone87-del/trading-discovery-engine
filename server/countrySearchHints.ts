@@ -27,7 +27,7 @@ const COUNTRY_SEARCH_HINTS: Record<string, CountrySearchHintConfig> = {
   luxembourg: { regionCode: 'LU', relevanceLanguage: 'lb', relevanceLanguages: ['lb', 'fr', 'de'] },
   japan: { regionCode: 'JP', relevanceLanguage: 'ja' },
   'south korea': { regionCode: 'KR', relevanceLanguage: 'ko' },
-  singapore: { regionCode: 'SG', relevanceLanguage: 'en' },
+  singapore: { regionCode: 'SG', relevanceLanguage: 'en', relevanceLanguages: ['en', 'ms', 'zh', 'ta'] },
   'united arab emirates': { regionCode: 'AE', relevanceLanguage: 'ar', relevanceLanguages: ['ar', 'en'] },
   denmark: { regionCode: 'DK', relevanceLanguage: 'da' },
   sweden: { regionCode: 'SE', relevanceLanguage: 'sv' },

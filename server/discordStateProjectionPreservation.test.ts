@@ -6,12 +6,16 @@ import { makeDiscordCandidate } from './discordCandidates';
 import {
   canProjectDiscordValidation,
   hasEstablishedValidatedDiscordSelection,
+  hasRetainedLastKnownGoodDiscordInvite,
+  hasServingLastKnownGoodDiscordInvite,
+  isAmbiguousSuccessfulDiscordValidation,
+  isSameSelectedDiscordCandidate,
   projectDiscordValidation,
   projectTradingReclassificationDiscordState,
   reconcileDiscordDiscoveryFromInspection,
 } from './discordProjection';
 import type { DiscordValidationResult } from './discordValidator';
-import { buildChannelListingWhere, CONFIRMED_DISCORD_INVITE_SQL, overlayLockedDiscordProjection } from './db';
+import { buildChannelListingWhere, CONFIRMED_DISCORD_INVITE_SQL, overlayLockedDiscordProjection, shouldRetainLockedDiscordProjection } from './db';
 import { projectNotFoundAfterInspection } from './queueManager';
 import { isConfirmedDiscordInvite } from '../src/discordInviteView';
 
@@ -211,6 +215,183 @@ test('cbrackn: a genuinely dead selected invite can still transition to DEAD', (
   assert.equal((channel as any).discord_validation_status, 'COMPLETED');
 });
 
+test('A1 ambiguous successful revalidation retains the last-known-good projection', () => {
+  const channel = cbrackn() as any;
+  const ambiguousCandidate = candidateFor('ambigCode');
+  const ambiguous = validation({
+    status: 'UNCERTAIN',
+    inviteUrl: null,
+    candidateInviteUrl: 'https://discord.gg/ambigCode',
+    operationalOutcome: 'SUCCEEDED',
+    livenessStatus: 'ACTIVE',
+    relevanceStatus: 'UNCERTAIN',
+    validationStatus: 'SUCCEEDED',
+  });
+
+  assert.equal(isAmbiguousSuccessfulDiscordValidation(ambiguous), true);
+  assert.equal(hasServingLastKnownGoodDiscordInvite(channel), true);
+  Object.assign(channel, projectDiscordValidation(channel, ambiguous, ambiguousCandidate));
+
+  assert.equal(channel.discord_invite, VALID_URL, 'the serving invite is not cleared');
+  assert.equal(channel.discord_status, 'ACTIVE', 'the serving status is retained');
+  assert.equal(channel.discord_candidate_id, validCandidate.candidateId, 'candidate identity stays aligned with the retained invite');
+  assert.equal(channel.discord_candidate_locator, VALID_URL);
+  assert.equal(channel.discord_liveness_status, 'ACTIVE');
+  assert.equal(channel.discord_validation_status, 'COMPLETED');
+  assert.equal(channel.discord_discovery_status, 'VALIDATED');
+  assert.equal(channel.discord_relevance_status, 'UNCERTAIN', 'current uncertainty is explicit');
+  assert.equal(hasRetainedLastKnownGoodDiscordInvite(channel), true);
+});
+
+test('A1 ambiguous success does not invent an invite when no last-known-good invite exists', () => {
+  const channel = cbrackn({
+    discord_status: 'UNCERTAIN',
+    discord_invite: null,
+    discord_candidate_id: null,
+    discord_candidate_locator: null,
+    discord_liveness_status: 'UNCERTAIN',
+    discord_relevance_status: 'NOT_CHECKED',
+    discord_validation_status: 'FAILED_OPERATIONAL',
+    discord_discovery_status: 'DISCOVERED_VALIDATION_FAILED',
+  }) as any;
+  const ambiguousCandidate = candidateFor('ambigCode');
+  const ambiguous = validation({
+    status: 'UNCERTAIN',
+    inviteUrl: null,
+    candidateInviteUrl: 'https://discord.gg/ambigCode',
+    operationalOutcome: 'SUCCEEDED',
+    livenessStatus: 'ACTIVE',
+    relevanceStatus: 'UNCERTAIN',
+    validationStatus: 'SUCCEEDED',
+  });
+
+  assert.equal(hasServingLastKnownGoodDiscordInvite(channel), false);
+  Object.assign(channel, projectDiscordValidation(channel, ambiguous, ambiguousCandidate));
+  assert.equal(channel.discord_invite, null);
+  assert.equal(channel.discord_status, 'UNCERTAIN');
+  assert.equal(channel.discord_candidate_id, ambiguousCandidate.candidateId);
+});
+
+test('A1 ambiguous success retains a previously retained invite after a status reset', () => {
+  const channel = cbrackn({
+    discord_status: 'UNCERTAIN',
+    discord_relevance_status: 'UNCERTAIN',
+  }) as any;
+  const ambiguousCandidate = candidateFor('ambigReset');
+  const ambiguous = validation({
+    status: 'UNCERTAIN',
+    inviteUrl: null,
+    candidateInviteUrl: 'https://discord.gg/ambigReset',
+    operationalOutcome: 'SUCCEEDED',
+    livenessStatus: 'ACTIVE',
+    relevanceStatus: 'UNCERTAIN',
+    validationStatus: 'SUCCEEDED',
+  });
+
+  assert.equal(hasServingLastKnownGoodDiscordInvite(channel), false);
+  assert.equal(hasRetainedLastKnownGoodDiscordInvite(channel), true);
+  Object.assign(channel, projectDiscordValidation(channel, ambiguous, ambiguousCandidate));
+
+  assert.equal(channel.discord_invite, VALID_URL, 'the retained invite is not cleared');
+  assert.equal(channel.discord_status, 'UNCERTAIN', 'the existing mutable status is preserved');
+  assert.equal(channel.discord_candidate_id, validCandidate.candidateId, 'identity stays aligned with the retained invite');
+  assert.equal(channel.discord_relevance_status, 'UNCERTAIN');
+  assert.equal(hasRetainedLastKnownGoodDiscordInvite(channel), true);
+});
+
+test('A1 ambiguous success cannot retain a candidate confirmed invalid in the same scan', () => {
+  const channel = cbrackn() as any;
+  const ambiguousCandidate = candidateFor('ambigOther');
+  const ambiguous = validation({
+    status: 'UNCERTAIN',
+    inviteUrl: null,
+    candidateInviteUrl: 'https://discord.gg/ambigOther',
+    operationalOutcome: 'SUCCEEDED',
+    livenessStatus: 'ACTIVE',
+    relevanceStatus: 'UNCERTAIN',
+    validationStatus: 'SUCCEEDED',
+  });
+
+  assert.equal(hasServingLastKnownGoodDiscordInvite(channel), true);
+  // Production derives the flag from the scan's terminal-invalid entries via
+  // the shared candidate identity, rather than passing `true` unconditionally.
+  const terminalInvalid = [{
+    validation: validation({
+      status: 'DEAD',
+      inviteUrl: null,
+      candidateInviteUrl: VALID_URL,
+      operationalOutcome: 'CONFIRMED_INVALID',
+      livenessStatus: 'DEAD',
+      relevanceStatus: 'NOT_CHECKED',
+      validationStatus: 'COMPLETED',
+    }),
+    candidate: validCandidate,
+  }];
+  const currentCandidateRejected = terminalInvalid.some(entry => isSameSelectedDiscordCandidate(channel, entry.candidate));
+  assert.equal(currentCandidateRejected, true, 'the retained candidate is detected as terminal-invalid');
+  Object.assign(channel, projectDiscordValidation(channel, ambiguous, ambiguousCandidate, { currentCandidateRejected }));
+
+  assert.equal(channel.discord_invite, null, 'the confirmed-invalid invite must not keep serving');
+  assert.equal(channel.discord_status, 'UNCERTAIN');
+  assert.equal(channel.discord_candidate_id, ambiguousCandidate.candidateId);
+  assert.equal(channel.discord_relevance_status, 'UNCERTAIN');
+});
+
+test('A1 ambiguous success cannot retain a candidate confirmed non-trading in the same scan', () => {
+  const channel = cbrackn() as any;
+  const ambiguousCandidate = candidateFor('ambigOther');
+  const ambiguous = validation({
+    status: 'UNCERTAIN',
+    inviteUrl: null,
+    candidateInviteUrl: 'https://discord.gg/ambigOther',
+    operationalOutcome: 'SUCCEEDED',
+    livenessStatus: 'ACTIVE',
+    relevanceStatus: 'UNCERTAIN',
+    validationStatus: 'SUCCEEDED',
+  });
+
+  assert.equal(hasServingLastKnownGoodDiscordInvite(channel), true);
+  // Non-trading is detected from the same-scan semantic result for the
+  // retained candidate (queueManager's `currentCandidateNonTrading`).
+  const sameScanNonTrading = validation({
+    status: 'NON_TRADING',
+    inviteUrl: null,
+    candidateInviteUrl: VALID_URL,
+    operationalOutcome: 'SUCCEEDED',
+    livenessStatus: 'ACTIVE',
+    relevanceStatus: 'NON_TRADING',
+    validationStatus: 'SUCCEEDED',
+  });
+  const currentCandidateNonTrading = sameScanNonTrading.status === 'NON_TRADING'
+    && isSameSelectedDiscordCandidate(channel, validCandidate);
+  assert.equal(currentCandidateNonTrading, true, 'the retained candidate is detected as non-trading');
+  Object.assign(channel, projectDiscordValidation(channel, ambiguous, ambiguousCandidate, { currentCandidateRejected: currentCandidateNonTrading }));
+
+  assert.equal(channel.discord_invite, null, 'a non-trading current invite must not keep serving');
+  assert.equal(channel.discord_status, 'UNCERTAIN');
+  assert.equal(channel.discord_candidate_id, ambiguousCandidate.candidateId);
+  assert.equal(channel.discord_relevance_status, 'UNCERTAIN');
+});
+
+test('A1 definitive non-trading cleanup still clears a serving invite', () => {
+  const channel = cbrackn() as any;
+  const nonTradingCandidate = candidateFor('nonTrading');
+  const nonTrading = validation({
+    status: 'NON_TRADING',
+    inviteUrl: null,
+    candidateInviteUrl: 'https://discord.gg/nonTrading',
+    operationalOutcome: 'SUCCEEDED',
+    livenessStatus: 'ACTIVE',
+    relevanceStatus: 'NON_TRADING',
+    validationStatus: 'COMPLETED',
+  });
+
+  assert.equal(isAmbiguousSuccessfulDiscordValidation(nonTrading), false);
+  Object.assign(channel, projectDiscordValidation(channel, nonTrading, nonTradingCandidate));
+  assert.equal(channel.discord_status, 'NON_TRADING');
+  assert.equal(channel.discord_invite, null);
+});
+
 test('a new valid candidate can still be selected normally after the reclassification', () => {
   const channel = cbrackn({ trading_status: 'UNCERTAIN', discord_status: 'UNCERTAIN' }) as any;
   const newValid = validation({
@@ -238,7 +419,7 @@ test('dashboard count, active filter, recent-confirmed filter, and selected cand
     { includeRejected: false, diagnosticsOnly: false, discordStatus: 'ACTIVE', recentInvites: true },
   );
   assert.match(where.where, /discord_status=\$1/);
-  assert.match(where.where, /discord_duplicate_owner_channel_id IS NULL/);
+  assert.match(where.where, /NOT \(EXISTS \(\s*SELECT 1 FROM discord_invite_registry owner[\s\S]*owner\.first_channel_id <> channel_id\s*\)\)/, 'recent-confirmed view excludes selected invites owned elsewhere');
   assert.deepEqual(where.values, ['ACTIVE']);
   assert.match(CONFIRMED_DISCORD_INVITE_SQL, /discord_validation_status IN \('SUCCEEDED','COMPLETED'\)/);
   assert.match(CONFIRMED_DISCORD_INVITE_SQL, /discord_liveness_status='ACTIVE'/);
@@ -303,10 +484,135 @@ test('pipeline and queue delegate Discord preservation to the shared guards', ()
   assert.doesNotMatch(pipeline, /uncertainChannel\.discord_status = 'UNCERTAIN';/);
   assert.match(pipeline, /Object\.assign\(withheldChannel,projectTradingReclassificationDiscordState\(withheldChannel\)\)/);
   assert.doesNotMatch(pipeline, /withheldChannel\.discord_invite=preservedDiscordState\?\.discord_invite\?\?null/);
+  // Gate 2 is a fresh terminal classification, not a stale snapshot: it must
+  // explicitly bypass the locked-row retention guard or a rejected channel
+  // would keep serving its old invite.
+  assert.match(pipeline, /await upsertChannel\(nonTradingChannel, \{ allowDiscordClear: true \}\);/);
 
   assert.match(queue, /const shouldProjectValidation=canProjectDiscordValidation\(channel,selected,selectedCandidate\);/);
-  assert.match(queue, /if\(shouldProjectValidation\)\{Object\.assign\(channel,projectDiscordValidation\(channel,selected,selectedCandidate\)\);await selectDiscordCandidate\(channel\.channel_id,selectedCandidate\.candidateId\);\}/);
+  assert.match(queue, /const currentCandidateRejected=currentCandidateNonTrading\s*\|\|terminalInvalid\.some\(entry=>isSameSelectedDiscordCandidate\(channel,entry\.candidate\)\);/);
+  assert.match(queue, /const projectedDiscord=projectDiscordValidation\(channel,selected,selectedCandidate,\{currentCandidateRejected\}\);/);
+  assert.match(queue, /if\(projectedDiscord\.discord_candidate_id\)await selectDiscordCandidate\(channel\.channel_id,projectedDiscord\.discord_candidate_id\);/);
+  assert.match(queue, /discordValidationProjected=true;/);
+  assert.match(queue, /await upsertChannel\(channel,\{freshDiscordValidation:discordValidationProjected\}\);/);
+  assert.doesNotMatch(queue, /await selectDiscordCandidate\(channel\.channel_id,selectedCandidate\.candidateId\)/);
   assert.doesNotMatch(queue, /channel\.discord_discovery_status==='VALIDATED'&&\(channel\.discord_status==='ACTIVE'\|\|channel\.discord_status==='DEAD'\)/);
+});
+
+test('A1 ordinary upsert retains a locked serving invite over a stale clear', () => {
+  const locked = cbrackn() as any;
+  const stale = cbrackn({
+    discord_status: 'UNCERTAIN',
+    discord_invite: null,
+    discord_candidate_id: null,
+    discord_candidate_locator: null,
+    discord_candidate_raw_locator: null,
+    discord_candidate_type: null,
+    discord_liveness_status: 'UNCERTAIN',
+    discord_relevance_status: 'NOT_CHECKED',
+    discord_validation_status: 'FAILED_OPERATIONAL',
+    discord_discovery_status: 'DISCOVERED_VALIDATION_FAILED',
+  }) as any;
+
+  assert.equal(shouldRetainLockedDiscordProjection(stale, locked), true);
+  const merged = overlayLockedDiscordProjection(stale, locked);
+  assert.equal(merged.discord_status, 'ACTIVE');
+  assert.equal(merged.discord_invite, VALID_URL);
+  assert.equal(merged.discord_candidate_id, validCandidate.candidateId);
+  assert.equal(merged.discord_validation_status, 'COMPLETED');
+});
+
+test('A1 ordinary upsert retains a locked UNCERTAIN last-known-good invite over a stale clear', () => {
+  const locked = cbrackn({
+    discord_status: 'UNCERTAIN',
+    discord_relevance_status: 'UNCERTAIN',
+  }) as any;
+  assert.equal(hasServingLastKnownGoodDiscordInvite(locked), false, 'the mutable status is no longer serving');
+  assert.equal(hasRetainedLastKnownGoodDiscordInvite(locked), true, 'the retained marker is still present');
+  const stale = cbrackn({
+    discord_status: 'UNCERTAIN',
+    discord_invite: null,
+    discord_candidate_id: null,
+    discord_candidate_locator: null,
+    discord_candidate_raw_locator: null,
+    discord_candidate_type: null,
+    discord_liveness_status: 'UNCERTAIN',
+    discord_relevance_status: 'NOT_CHECKED',
+    discord_validation_status: 'FAILED_OPERATIONAL',
+    discord_discovery_status: 'DISCOVERED_VALIDATION_FAILED',
+  }) as any;
+
+  assert.equal(shouldRetainLockedDiscordProjection(stale, locked), true);
+  const merged = overlayLockedDiscordProjection(stale, locked);
+  assert.equal(merged.discord_status, 'UNCERTAIN');
+  assert.equal(merged.discord_invite, VALID_URL);
+  assert.equal(merged.discord_candidate_id, validCandidate.candidateId);
+  assert.equal(merged.discord_relevance_status, 'UNCERTAIN');
+  assert.equal(merged.discord_validation_status, 'COMPLETED');
+});
+
+test('A1 ordinary terminal snapshots cannot clear a locked invite; fresh validation or cleanup can', () => {
+  const locked = cbrackn() as any;
+  const dead = cbrackn({ discord_status: 'DEAD', discord_invite: null, discord_liveness_status: 'DEAD' }) as any;
+  const nonTrading = cbrackn({ discord_status: 'NON_TRADING', discord_invite: null }) as any;
+  const sameInviteDead = cbrackn({ discord_status: 'DEAD', discord_invite: VALID_URL, discord_liveness_status: 'DEAD' }) as any;
+  const staleClear = cbrackn({ discord_status: 'UNCERTAIN', discord_invite: null }) as any;
+
+  // A snapshot loaded before a validation committed may itself carry a
+  // terminal status. It is not proof about the invite that now serves.
+  assert.equal(shouldRetainLockedDiscordProjection(dead, locked), true);
+  assert.equal(shouldRetainLockedDiscordProjection(nonTrading, locked), true);
+  assert.equal(shouldRetainLockedDiscordProjection(sameInviteDead, locked), true);
+  // The authoritative validation write and intentional cleanup still apply.
+  assert.equal(shouldRetainLockedDiscordProjection(dead, locked, { freshDiscordValidation: true }), false);
+  assert.equal(shouldRetainLockedDiscordProjection(nonTrading, locked, { allowDiscordClear: true }), false);
+  assert.equal(shouldRetainLockedDiscordProjection(staleClear, locked, { allowDiscordClear: true }), false);
+});
+
+test('A1 a fresh usable invite replaces the locked projection normally', () => {
+  const locked = cbrackn() as any;
+  const fresh = cbrackn({
+    discord_status: 'ACTIVE',
+    discord_invite: NEW_VALID_URL,
+    discord_candidate_id: newValidCandidate.candidateId,
+    discord_candidate_locator: NEW_VALID_URL,
+  }) as any;
+  assert.equal(shouldRetainLockedDiscordProjection(fresh, locked, { freshDiscordValidation: true }), false);
+  assert.equal(shouldRetainLockedDiscordProjection(fresh, locked), true, 'an ordinary snapshot cannot replace a serving invite');
+});
+
+test('A1 a fresh validation failure persists its retry-pending evidence', () => {
+  const locked = cbrackn() as any;
+  const failure = cbrackn({
+    discord_status: 'UNCERTAIN',
+    discord_invite: VALID_URL,
+    discord_liveness_status: 'INVALID_OBSERVED',
+    discord_relevance_status: 'NOT_CHECKED',
+    discord_validation_status: 'RETRY_PENDING',
+    discord_discovery_status: 'DISCOVERED_VALIDATION_FAILED',
+  }) as any;
+  assert.equal(
+    shouldRetainLockedDiscordProjection(failure, locked, { freshDiscordValidation: true }),
+    false,
+    'the authoritative validation upsert must write the fresh failure state',
+  );
+});
+
+test('A1 a stale ACTIVE snapshot cannot erase the retained uncertainty marker', () => {
+  const locked = cbrackn({ discord_relevance_status: 'UNCERTAIN' }) as any;
+  const stale = cbrackn({
+    discord_status: 'ACTIVE',
+    discord_invite: VALID_URL,
+    discord_candidate_id: 'stale-candidate',
+    discord_relevance_status: 'TRADING_RELEVANT',
+    discord_liveness_status: 'ACTIVE',
+    discord_validation_status: 'COMPLETED',
+  }) as any;
+  assert.equal(hasRetainedLastKnownGoodDiscordInvite(locked), true);
+  assert.equal(shouldRetainLockedDiscordProjection(stale, locked), true);
+  const merged = overlayLockedDiscordProjection(stale, locked);
+  assert.equal(merged.discord_relevance_status, 'UNCERTAIN');
+  assert.equal(merged.discord_candidate_id, validCandidate.candidateId);
 });
 
 test('classification-only upserts take the locked row Discord projection instead of a stale snapshot', () => {
@@ -338,6 +644,7 @@ test('classification-only upserts take the locked row Discord projection instead
   assert.match(pipeline, /discordStatus:authoritativeWithheld\.discord_status,discordInvite:authoritativeWithheld\.discord_invite\?\?null,channelRecord:authoritativeWithheld/);
 
   const dbCoreSource = readFileSync(fileURLToPath(new URL('./dbCore.ts', import.meta.url)), 'utf8');
-  assert.match(dbCoreSource, /options\?\.preserveDiscordOnUpdate && prior\.rowCount/);
+  assert.match(dbCoreSource, /const locked = prior\.rowCount \? prior\.rows\[0\] : null;/);
+  assert.match(dbCoreSource, /shouldRetainLockedDiscordProjection\(channel, locked, options\)/);
   assert.match(dbCoreSource, /DISCORD_PROJECTION_WRITE_COLUMNS/);
 });

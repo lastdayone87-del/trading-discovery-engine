@@ -615,7 +615,10 @@ test('A5b: a full portfolio cannot push creator-derived candidates out with free
       provider: 'WIKIPEDIA' as const,
       sourceIds: [`wikipedia:${index}`],
     }));
-  const creatorTerms = ['Charttechnik', 'Handelsstrategie', 'Risikomanagement'].map((term, index) => ({
+  // All three surfaces must pass the Q0 trading-semantics gate; generic
+  // administrative terms such as Handelsstrategie/Risikomanagement are
+  // evidence-only under the merged admission policy.
+  const creatorTerms = ['Charttechnik', 'Chartanalyse', 'Liquiditätszone'].map((term, index) => ({
     id: index + 1, term, score: 0.9, lifecycle: 'SEARCH_TRIAL' as const,
   }));
   const planned = planDiverseQueries({

@@ -33,6 +33,28 @@ test('promotion requires creator and community diversity, not occurrence volume'
   assert.equal(trial.searchEligible, true);
 });
 
+test('governed provenance bypasses only the semantic lexicon, not shape/script gates', () => {
+  const base = { current: 'MULTI_CREATOR_VALIDATED' as const, decayedEvidence: 6, distinctCreators: 3, distinctCommunities: 2, executions: 0, decayedYield: 0, termType: 'TERMINOLOGY' as const, term: 'frobnicate', country: 'Germany', language: 'de' };
+  // A producer-authorized surface skips only the learned-term lexicon.
+  const governed = decideLifecycle({ ...base, requireTradingSemantics: false });
+  assert.equal(governed.status, 'SEARCH_TRIAL');
+  assert.equal(governed.searchEligible, true);
+  // Without the bypass the same surface stays shape-ineligible.
+  const learned = decideLifecycle(base);
+  assert.equal(learned.searchEligible, false);
+  assert.match(learned.reason, /no-trading-semantics/);
+  assert.equal(learned.status, 'MULTI_CREATOR_VALIDATED');
+  // The bypass is not a shape waiver: a CTA-only surface still fails.
+  const cta = decideLifecycle({ ...base, term: 'subscribe', requireTradingSemantics: false });
+  assert.equal(cta.searchEligible, false);
+  assert.match(cta.reason, /cta-only/);
+  // Nor does it waive script compatibility: a Japanese surface under a Latin
+  // country profile is still rejected by the script gate.
+  const incompatible = decideLifecycle({ ...base, term: 'トレード', language: 'ja', requireTradingSemantics: false });
+  assert.equal(incompatible.searchEligible, false);
+  assert.match(incompatible.reason, /script-incompatible/);
+});
+
 test('branding never automatically becomes search eligible', () => {
   const result = decideLifecycle({ current: 'OBSERVED', decayedEvidence: 50, distinctCreators: 20, distinctCommunities: 10, executions: 10, decayedYield: 0.8, termType: 'BRAND' });
   assert.equal(result.searchEligible, false);

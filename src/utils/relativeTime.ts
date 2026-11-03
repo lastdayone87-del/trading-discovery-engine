@@ -17,3 +17,10 @@ export function formatFoundAgo(timestamp: string | null | undefined, now = Date.
   if (months < 12) return `Found ${months}mo ago`;
   return `Found ${Math.floor(months / 12)}y ago`;
 }
+
+/** Same bounded relative-time contract as `formatFoundAgo`, but for the
+ * latest serving verification rather than the first confirmation. */
+export function formatLastVerifiedAgo(timestamp: string | null | undefined, now = Date.now()): string | null {
+  const found = formatFoundAgo(timestamp, now);
+  return found ? found.replace(/^Found /, 'Verified ') : null;
+}

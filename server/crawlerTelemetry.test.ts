@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { isCeilingKind, renderedCrawlerTelemetry, safeCrawlerTelemetry, staticCrawlerTelemetry, workerInstanceId } from './crawlerTelemetry';
+import { isCeilingKind, isRenderedCoverageReason, renderedCrawlerTelemetry, resolveRenderedCoverageReason, safeCrawlerTelemetry, sanitizeNavigationPolicyExcluded, staticCrawlerTelemetry, workerInstanceId } from './crawlerTelemetry';
 
 test('static telemetry records redirect/page/budget measurements without changing outcome semantics', () => {
   const telemetry = staticCrawlerTelemetry({ redirectsFollowed: 2, pagesInspected: 3, ceiling: 'queue-cap' });
@@ -83,6 +83,43 @@ test('safe telemetry rejects malformed mode and clamps malformed counters', () =
   assert.equal(telemetry?.redirectsFollowed, 2);
   assert.equal(telemetry?.clicksFailed, 0);
   assert.equal(telemetry?.budgetExhausted, true);
+  const capped = safeCrawlerTelemetry({
+    mode: 'RENDERED',
+    pagesInspected: 1,
+    controlsEnumeratedTotal: 5_000_000,
+    popupTargets: Number.MAX_SAFE_INTEGER,
+    frameCount: 1_000_001,
+    coverageReason: 'BOUNDED',
+  });
+  assert.equal(capped?.controlsEnumeratedTotal, 999999, 'P0.2 counters use the same hard cap as other taxonomy counters');
+  assert.equal(capped?.popupTargets, 999999);
+  assert.equal(capped?.frameCount, 999999);
+});
+
+test('rendered telemetry strips invalid spread-carried coverage values', () => {
+  const dirty = renderedCrawlerTelemetry({
+    inspectedPages: 1,
+    clicks: 0,
+    complete: true,
+    telemetry: {
+      navigationPolicyExcluded: { 'not-a-reason': 3 } as never,
+      coverageReason: 'PARTIAL' as never,
+    },
+  });
+  assert.equal(dirty.navigationPolicyExcluded, undefined, 'an invalid exclusion map must not survive the spread');
+  assert.equal(dirty.coverageReason, undefined, 'an invalid coverage reason must not survive the spread');
+
+  const clean = renderedCrawlerTelemetry({
+    inspectedPages: 1,
+    clicks: 0,
+    complete: true,
+    telemetry: {
+      navigationPolicyExcluded: { 'admission-rejected': 2, 'not-a-reason': 9 } as never,
+      coverageReason: 'BOUNDED',
+    },
+  });
+  assert.deepEqual(clean.navigationPolicyExcluded, { 'admission-rejected': 2 });
+  assert.equal(clean.coverageReason, 'BOUNDED');
 });
 
 test('worker instance id is stable per process and identifies host and pid', () => {
@@ -127,6 +164,212 @@ test('safe telemetry round-trips new diagnostic fields to the ledger', () => {
   assert.equal(telemetry?.zeroPageReason, 'HANDLER_ENTERED_NO_PAGES');
   assert.equal(telemetry?.launchCauseSnippet, 'spaced cause');
   assert.equal(telemetry?.workerInstanceId, 'replica-a:123');
+});
+
+test('safe telemetry round-trips bounded control-offset advances', () => {
+  const rendered = safeCrawlerTelemetry({
+    mode: 'RENDERED',
+    pagesInspected: 1,
+    evidenceControlsTotal: 70,
+    evidenceControlsClicked: 4,
+    evidenceControlsFailed: 1,
+    evidenceControlsSkipped: 60,
+    evidenceControlsNavigableOnly: true,
+    evidenceControlsUncertified: true,
+    evidenceControlsOffsetAdvance: 8,
+  });
+  assert.equal(rendered?.evidenceControlsTotal, 70);
+  assert.equal(rendered?.evidenceControlsOffsetAdvance, 8);
+  assert.equal(rendered?.evidenceControlsNavigableOnly, true);
+  assert.equal(rendered?.evidenceControlsUncertified, true);
+
+  const zero = safeCrawlerTelemetry({ mode: 'RENDERED', pagesInspected: 1, evidenceControlsOffsetAdvance: 0 });
+  assert.equal(zero?.evidenceControlsOffsetAdvance, undefined, 'a zero advance is sparse, not a stored zero');
+  const negative = safeCrawlerTelemetry({ mode: 'RENDERED', pagesInspected: 1, evidenceControlsOffsetAdvance: -4 });
+  assert.equal(negative?.evidenceControlsOffsetAdvance, undefined, 'negative advances are dropped');
+  const oversized = safeCrawlerTelemetry({
+    mode: 'RENDERED',
+    pagesInspected: 1,
+    evidenceControlsTotal: Number.MAX_SAFE_INTEGER,
+    evidenceControlsClicked: 1e12,
+    evidenceControlsFailed: 1e12,
+    evidenceControlsSkipped: 1e12,
+    evidenceControlsOffsetAdvance: 10_000,
+  });
+  assert.equal(oversized?.evidenceControlsTotal, 999999, 'aggregate control counts use the persisted counter bound');
+  assert.equal(oversized?.evidenceControlsClicked, 999999);
+  assert.equal(oversized?.evidenceControlsFailed, 999999);
+  assert.equal(oversized?.evidenceControlsSkipped, 999999);
+  assert.equal(oversized?.evidenceControlsOffsetAdvance, 64, 'the offset cannot index past the 64-control evaluation window');
+  const staticRow = safeCrawlerTelemetry({ mode: 'STATIC', pagesInspected: 1, evidenceControlsOffsetAdvance: 8, evidenceControlsUncertified: true });
+  assert.equal(staticRow?.evidenceControlsOffsetAdvance, undefined, 'control offsets are rendered-only');
+  assert.equal(staticRow?.evidenceControlsUncertified, undefined, 'uncertified control windows are rendered-only');
+});
+
+test('coverage reason distinguishes complete, bounded, policy, context, and unknown runs', () => {
+  assert.equal(isRenderedCoverageReason('COMPLETE'), true);
+  assert.equal(isRenderedCoverageReason('PARTIAL'), false);
+  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 0 }), 'UNKNOWN');
+  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1 }), 'COMPLETE');
+  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, budgetExhausted: true }), 'BOUNDED');
+  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, interactionGap: true }), 'BOUNDED');
+  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, scrollCapReachedStillGrowing: true }), 'BOUNDED');
+  assert.equal(
+    resolveRenderedCoverageReason({ pagesInspected: 1, contextUnknown: true }),
+    'BOUNDED',
+    'abandoned context sampling prevents a COMPLETE claim',
+  );
+  assert.equal(
+    resolveRenderedCoverageReason({ pagesInspected: 1, structuralHintRejected: 2 }),
+    'COMPLETE',
+    'hint-rejected structural disclosures are recovered into the click set by P1.1',
+  );
+  assert.equal(
+    resolveRenderedCoverageReason({ pagesInspected: 1, iconLabelRecovered: 1 }),
+    'COMPLETE',
+    'icon-label recoveries are clicked by P1.2, so they no longer imply an unexamined destination',
+  );  assert.equal(
+    resolveRenderedCoverageReason({ pagesInspected: 1, unresolvedFailedRequests: 1 }),
+    'BOUNDED',
+    'a terminally failed child request can hide a destination, so it is not COMPLETE',
+  );
+  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, unresolvedFailedRequests: 0 }), 'COMPLETE');
+  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, frameCount: 1 }), 'CONTEXT_UNREACHABLE');
+  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, shadowRootCount: 1 }), 'CONTEXT_UNREACHABLE');
+  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, popupTargets: 1 }), 'CONTEXT_UNREACHABLE');
+  assert.equal(
+    resolveRenderedCoverageReason({ pagesInspected: 1, navigationPolicyExcluded: { 'admission-rejected': 3 } }),
+    'COMPLETE',
+    'format/security rejections are not unexamined navigation',
+  );
+  assert.equal(
+    resolveRenderedCoverageReason({ pagesInspected: 1, navigationPolicyExcluded: { 'cross-origin-disallowed': 3 } }),
+    'POLICY_EXCLUDED',
+  );
+  assert.equal(
+    resolveRenderedCoverageReason({ pagesInspected: 1, navigationPolicyExcluded: { 'hint-rejected': 3 } }),
+    'COMPLETE',
+    'hint-rejected is measured separately and is not a policy exclusion by itself',
+  );
+  assert.equal(
+    resolveRenderedCoverageReason({ pagesInspected: 1, unrecoveredNavigation: true }),
+    'POLICY_EXCLUDED',
+    'an observed but unfollowed structural navigation is not complete coverage',
+  );
+  // Stronger evidence wins: a named ceiling is BOUNDED even when context and
+  // policy exclusions are also present.
+  assert.equal(
+    resolveRenderedCoverageReason({
+      pagesInspected: 1,
+      budgetExhausted: true,
+      frameCount: 2,
+      navigationPolicyExcluded: { 'cross-origin-disallowed': 1 },
+    }),
+    'BOUNDED',
+  );
+});
+
+test('navigation exclusion sanitizer keeps only the closed taxonomy and bounded counts', () => {
+  assert.deepEqual(
+    sanitizeNavigationPolicyExcluded({
+      'admission-rejected': 3,
+      'cross-origin-disallowed': 2.9,
+      'hint-rejected': 0,
+      'control-slice': -1,
+      'not-a-reason': 9,
+      'invalid-protocol': '5',
+      'destination-budget': Number.POSITIVE_INFINITY,
+    }),
+    { 'admission-rejected': 3, 'cross-origin-disallowed': 2 },
+  );
+  assert.deepEqual(sanitizeNavigationPolicyExcluded(null), {});
+});
+
+test('safe telemetry round-trips P0.2 navigation-coverage fields on rendered rows only', () => {
+  const rendered = safeCrawlerTelemetry({
+    mode: 'RENDERED',
+    pagesInspected: 2,
+    controlsEnumeratedTotal: 120,
+    controlsHintRejected: 30,
+    controlsStructuralNavigation: 12,
+    controlsStructuralHintRejected: 9,
+    controlsStructuralDisclosure: 5,
+    controlsStructuralUnrecovered: 2,
+    controlsIconLabelRecovered: 4,
+    popupTargets: 3,
+    frameCount: 2,
+    shadowRootCount: 1,
+    baseHrefPresent: true,
+    scrollCapReachedStillGrowing: true,
+    navigationPolicyExcluded: { 'admission-rejected': 5, 'hint-rejected': 30 },
+    coverageReason: 'BOUNDED',
+  });
+  assert.equal(rendered?.controlsEnumeratedTotal, 120);
+  assert.equal(rendered?.controlsHintRejected, 30);
+  assert.equal(rendered?.controlsStructuralNavigation, 12);
+  assert.equal(rendered?.controlsStructuralHintRejected, 9);
+  assert.equal(rendered?.controlsStructuralDisclosure, 5);
+  assert.equal(rendered?.controlsStructuralUnrecovered, 2);
+  assert.equal(rendered?.controlsIconLabelRecovered, 4);
+  assert.equal(rendered?.popupTargets, 3);
+  assert.equal(rendered?.frameCount, 2);
+  assert.equal(rendered?.shadowRootCount, 1);
+  assert.equal(rendered?.baseHrefPresent, true);
+  assert.equal(rendered?.scrollCapReachedStillGrowing, true);
+  assert.deepEqual(rendered?.navigationPolicyExcluded, { 'admission-rejected': 5, 'hint-rejected': 30 });
+  assert.equal(rendered?.coverageReason, 'BOUNDED');
+
+  const malformed = safeCrawlerTelemetry({
+    mode: 'RENDERED',
+    pagesInspected: 1,
+    controlsEnumeratedTotal: -1,
+    frameCount: '2',
+    baseHrefPresent: 'yes',
+    coverageReason: 'PARTIAL',
+    navigationPolicyExcluded: { 'not-a-reason': 2 },
+  });
+  assert.equal(malformed?.controlsEnumeratedTotal, undefined);
+  assert.equal(malformed?.frameCount, undefined);
+  assert.equal(malformed?.baseHrefPresent, undefined);
+  assert.equal(malformed?.coverageReason, undefined);
+  assert.equal(malformed?.navigationPolicyExcluded, undefined);
+
+  const staticRow = safeCrawlerTelemetry({
+    mode: 'STATIC',
+    pagesInspected: 1,
+    controlsEnumeratedTotal: 5,
+    frameCount: 1,
+    baseHrefPresent: true,
+    scrollCapReachedStillGrowing: true,
+    navigationPolicyExcluded: { 'admission-rejected': 1 },
+    coverageReason: 'COMPLETE',
+  });
+  assert.equal(staticRow?.controlsEnumeratedTotal, undefined);
+  assert.equal(staticRow?.frameCount, undefined);
+  assert.equal(staticRow?.baseHrefPresent, undefined);
+  assert.equal(staticRow?.scrollCapReachedStillGrowing, undefined);
+  assert.equal(staticRow?.navigationPolicyExcluded, undefined);
+  assert.equal(staticRow?.coverageReason, undefined);
+});
+
+test('safe telemetry clamps oversized structural counters to the persisted bound', () => {
+  const oversized = safeCrawlerTelemetry({
+    mode: 'RENDERED',
+    pagesInspected: 1,
+    controlsStructuralDisclosure: 5_000_000,
+    controlsStructuralUnrecovered: 2_500_000.9,
+  });
+  assert.equal(oversized?.controlsStructuralDisclosure, 999999);
+  assert.equal(oversized?.controlsStructuralUnrecovered, 999999);
+
+  const malformed = safeCrawlerTelemetry({
+    mode: 'RENDERED',
+    pagesInspected: 1,
+    controlsStructuralDisclosure: Number.POSITIVE_INFINITY,
+    controlsStructuralUnrecovered: '4',
+  });
+  assert.equal(malformed?.controlsStructuralDisclosure, undefined);
+  assert.equal(malformed?.controlsStructuralUnrecovered, undefined);
 });
 
 test('safe telemetry drops unknown stage/reason and truncates cause text', () => {

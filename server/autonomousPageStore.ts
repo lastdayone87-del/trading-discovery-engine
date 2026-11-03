@@ -194,6 +194,49 @@ export async function getAutonomousPageObservation(runId: string, pageNumber: nu
     providerPageCostUsd: Math.max(0, Number(row.provider_page_cost_usd || 0)),
   };
 }
+export async function getAutonomousRunMetrics(runId: string): Promise<QueryFunnelMetrics> {
+  const db = await getDb();
+  // Page metrics count distinct creators per page. Summing them overcounts a
+  // channel that appears on several pages, while the reward numerator is
+  // run-wide distinct. Read the run-wide denominator from the same durable
+  // sighting set so the ratio cannot be diluted by cross-page repeats.
+  const [r, sightings] = await Promise.all([
+    db.query(
+      'SELECT page_metrics, cumulative_unique_creators FROM autonomous_query_page_observations WHERE query_run_id=$1 ORDER BY page_number',
+      [runId],
+    ),
+    db.query(`SELECT COUNT(DISTINCT channel_id)::int AS distinct_creators,
+      COUNT(DISTINCT channel_id) FILTER (WHERE country_outcome='REJECTED')::int AS country_rejected
+      FROM channel_sightings WHERE query_run_id=$1`, [runId]),
+  ]);
+  const metrics = aggregatePageMetrics(r.rows.map(row => {
+    const pageMetrics = typeof row.page_metrics === 'string' ? JSON.parse(row.page_metrics) : row.page_metrics;
+    // CDL pages persist the run-cumulative unique count in its own column.
+    // Attach it so aggregation can prefer run-wide reach over overlapping
+    // per-page populations; the sighting query below remains authoritative.
+    const cumulative = row.cumulative_unique_creators === null || row.cumulative_unique_creators === undefined
+      ? undefined
+      : Math.max(0, Number(row.cumulative_unique_creators) || 0);
+    return cumulative === undefined ? pageMetrics : { ...pageMetrics, cumulativeUniqueCreators: cumulative };
+  }));
+  const distinct = Number(sightings.rows[0]?.distinct_creators || 0);
+  if (!distinct || distinct === metrics.distinctResults) return metrics;
+  const rejected = Math.min(distinct, Number(sightings.rows[0]?.country_rejected || 0));
+  const evaluatedRawResults = Number(metrics.evaluatedRawResults ?? Math.max(0, metrics.rawResults - metrics.deferredResults));
+  return {
+    ...metrics,
+    distinctResults: distinct,
+    // The page sum only counts duplicates inside each page. Recompute from the
+    // run-wide evaluated total so creators repeated across pages are counted.
+    duplicateResults: Math.max(0, evaluatedRawResults - distinct),
+    // Keep the rejected count on the same run-wide distinct set as the
+    // denominator: the page sum double-counts cross-page repeats, and
+    // completeQueryRun recomputes precision from these two fields.
+    countryRejected: rejected,
+    noveltyRatio: metrics.newChannels / distinct,
+    countryPrecision: (distinct - rejected) / distinct,
+  };
+}
 
 export interface AutonomousPageMarginalMetrics {
   pageDistinctCreators: number;
@@ -357,23 +400,6 @@ export async function getAutonomousContinuationState(runId: string, pageNumber?:
     v2Streaks,
     lastDecisionV2: rows.length ? parseContinuationDecisionV2(rows[0].continuationDecisionV2) : null,
   };
-}
-
-export async function getAutonomousRunMetrics(runId: string): Promise<QueryFunnelMetrics> {
-  const db = await getDb();
-  const r = await db.query(
-    'SELECT page_metrics, cumulative_unique_creators FROM autonomous_query_page_observations WHERE query_run_id=$1 ORDER BY page_number',
-    [runId],
-  );
-  return aggregatePageMetrics(r.rows.map(row => {
-    const metrics = typeof row.page_metrics === 'string' ? JSON.parse(row.page_metrics) : row.page_metrics;
-    // Attach the persisted cumulative count so aggregation reports the run's
-    // true unique reach instead of the sum of overlapping page populations.
-    const cumulative = row.cumulative_unique_creators === null || row.cumulative_unique_creators === undefined
-      ? undefined
-      : Math.max(0, Number(row.cumulative_unique_creators) || 0);
-    return cumulative === undefined ? metrics : { ...metrics, cumulativeUniqueCreators: cumulative };
-  }));
 }
 
 export interface PendingAutonomousRun {

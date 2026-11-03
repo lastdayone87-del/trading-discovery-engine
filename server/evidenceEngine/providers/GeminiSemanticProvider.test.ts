@@ -379,3 +379,42 @@ test('404 fallback to the adjudicator model still skips a redundant second pass'
     delete process.env.MULTILINGUAL_ADJUDICATION_ENABLED;
   }
 });
+
+test('caller cancellation stops Gemini route failover before another route', async () => {
+  const { runGeminiRouteFailover } = await import('./GeminiSemanticProvider');
+  const controller = new AbortController();
+  const calls: string[] = [];
+  await assert.rejects(runGeminiRouteFailover(
+    [{ id: 'gemini-1', key: 'hidden-a' }, { id: 'gemini-2', key: 'hidden-b' }],
+    async route => {
+      calls.push(route.id);
+      controller.abort();
+      throw new ProviderCallError('cancelled', 'CANCELLED', true);
+    },
+    { signal: controller.signal },
+  ), (error: any) => error instanceof ProviderCallError && error.errorClass === 'CANCELLED');
+  assert.deepEqual(calls, ['gemini-1']);
+});
+
+test('an already-aborted Gemini caller starts no route', async () => {
+  const { runGeminiRouteFailover } = await import('./GeminiSemanticProvider');
+  let calls = 0;
+  await assert.rejects(runGeminiRouteFailover(
+    [{ id: 'gemini-1', key: 'hidden-a' }, { id: 'gemini-2', key: 'hidden-b' }],
+    async () => { calls++; return {}; },
+    { signal: AbortSignal.abort() },
+  ), (error: any) => error instanceof ProviderCallError && error.errorClass === 'CANCELLED');
+  assert.equal(calls, 0);
+});
+
+test('an already-expired Gemini caller is a TIMEOUT, not a cancellation', async () => {
+  const { runGeminiRouteFailover } = await import('./GeminiSemanticProvider');
+  let calls = 0;
+  const deadline = Object.assign(new Error('deadline'), { errorClass: 'TIMEOUT', retryable: true });
+  await assert.rejects(runGeminiRouteFailover(
+    [{ id: 'gemini-1', key: 'hidden-a' }, { id: 'gemini-2', key: 'hidden-b' }],
+    async () => { calls++; return {}; },
+    { signal: AbortSignal.abort(deadline) },
+  ), (error: any) => error instanceof ProviderCallError && error.errorClass === 'TIMEOUT');
+  assert.equal(calls, 0);
+});

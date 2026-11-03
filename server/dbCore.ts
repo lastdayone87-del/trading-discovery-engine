@@ -20,6 +20,7 @@ import { isYouTubePermanentInputError } from './youtubeKeyHealth';
 import { canonicalCountry } from './countryInference';
 import { classifyDiscoveryVisibility } from './discoveryStateVisibility';
 import { safeCrawlerTelemetry, type CrawlerTelemetry } from './crawlerTelemetry';
+import { hasRetainedLastKnownGoodDiscordInvite, hasServingLastKnownGoodDiscordInvite } from './discordProjection';
 import { validateLedgerInput, type ValidationKind, type ValidationStatus } from './phase3Validation';
 import { browserCapabilityIsUnavailable } from './browserCapability';
 import { STALE_CHANNEL_LOCK_AFTER_MINUTES, STALE_CHANNEL_LOCK_RECOVERY_BATCH_SIZE } from './staleChannelLockRecovery';
@@ -35,8 +36,14 @@ import { calculateSegmentHealthFromHistory, classifyCreatorSizeBand, type Segmen
 import { updateNeighborhoodFrontierStatePostRun } from './discoveryFrontierState';
 import { calculateQueryFunnel, isQualityCreator, QUALITY_CREATOR_SCORE_THRESHOLD, type QueryFunnelMetrics } from './queryPerformance';
 import { attributeTerminologyPerformance } from './terminologyIntelligence';
+import { admitQueryRecord, parseGenerationMetadata, withQueryAdmission } from './queryQuality/admission';
+import { deriveQueryFailureState, type QueryFailureStateRow } from './queryQuality/lifecycle';
+import { buildAttribution, buildQueryQualityVector } from './queryQuality/accounting';
+import { boundedPortfolioRatio, DECAY_HALF_LIFE_DAYS, portfolioContinuationAllowed } from './queryQuality/posterior';
+import type { QueryQualityDashboardRunInput } from './queryQuality/dashboard';
+import type { QueryAdmission } from './queryQuality/types';
 import type { NativeEvidenceStatus, SourceProvenanceFamily } from './countryNativeIntelligence';
-import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, providerSnapshotFromRegistryRow, isShadowBraveCanaryAllowed, rotateActiveProviderRow, applyDateOrderingProviderGuard, ledgerProviderToRegistryKey, providerCooldownObservationWindowSecs, type ProviderAllocation } from './providerAwareRetrieval';
+import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, providerSnapshotFromRegistryRow, isShadowBraveCanaryAllowed, isQuotaFreeSearchProviderRow, quotaFreeSearchProviderRows, rotateActiveProviderRow, applyDateOrderingProviderGuard, ledgerProviderToRegistryKey, providerCooldownObservationWindowSecs, type ProviderAllocation } from './providerAwareRetrieval';
 import { fingerprintYouTubeKey, projectYouTubeQuotaUsage } from './youtubeQuotaAttribution';
 import { sanitizeSchedulingError, type DiscoveryCandidateDiagnosticPatch } from './discoveryTelemetry';
 import { classifyProviderCapacityFailure, classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
@@ -449,6 +456,8 @@ export function rowToChannel(row: any): ChannelRecord {
     discord_status: row.discord_status,
     discord_invite: row.discord_invite || null,
     discord_invite_first_validated_at: iso(row.discord_invite_first_validated_at),
+    discord_invite_last_verified_at: iso(row.discord_invite_last_verified_at),
+    discord_invite_revalidation_uncertain: hasRetainedLastKnownGoodDiscordInvite(row),
     scan_status: row.scan_status,
     scan_attempts: row.scan_attempts || 0,
     discovery_source: row.discovery_source,
@@ -635,6 +644,40 @@ export const DISCORD_INVITE_FIRST_VALIDATED_SQL = `(SELECT dc.first_validated_at
    ORDER BY CASE WHEN dc.candidate_id=channels.discord_candidate_id THEN 0 ELSE 1 END,
             dc.selected DESC,dc.first_validated_at DESC NULLS LAST
    LIMIT 1)`;
+/** Latest successful serving validation of the selected invite. Unlike
+ * `discord_invite_first_validated_at` (earliest confirmation), this answers
+ * "when was the currently served invite last verified?" from the append-only
+ * attempt ledger. A1-retained invites keep their serving attempt timestamp
+ * even after an ambiguous revalidation, so the UI can label them as previously
+ * verified rather than freshly validated.
+ *
+ * Correlated against the invite the row actually serves, never candidate
+ * identity: a retained older invite can coexist with candidate fields that
+ * moved on, and a locator/id match on the current candidate could donate a
+ * different candidate's successful timestamp. A creator-association promotion
+ * turns an `UNCERTAIN` attempt into a serving `ACTIVE` invite after the attempt
+ * row is written; the channel's `TRADING_RELEVANT` marker identifies that
+ * effective serving state, so the promoted attempt still supplies the
+ * timestamp. `NON_TRADING` successes count too: the confirmed-invite view
+ * explicitly permits a `NON_TRADING` row with a serving invite, and the label
+ * answers "verified live", not "verified as trading". When the served invite
+ * has no successful ledger row the column is NULL (explicitly unavailable),
+ * never another candidate's date.
+ *
+ * Parameterized by table alias so `/api/channels/:id` (alias `c`) can project
+ * the same expression as the listing query (alias `channels`). */
+export const discordInviteLastVerifiedSql = (alias = 'channels'): string => `(SELECT MAX(a.checked_at)
+    FROM discord_check_attempts a
+   WHERE a.channel_id=${alias}.channel_id
+     AND a.operational_outcome='SUCCEEDED'
+     AND (
+       a.semantic_status IN ('ACTIVE','ACTIVE_LOW_VOLUME','NON_TRADING')
+       OR (a.semantic_status='UNCERTAIN' AND ${alias}.discord_relevance_status='TRADING_RELEVANT')
+     )
+     AND ${alias}.discord_invite IS NOT NULL
+     AND lower(COALESCE(a.resolved_locator,a.invite_locator))=lower(${alias}.discord_invite)
+   )`;
+export const DISCORD_INVITE_LAST_VERIFIED_SQL = discordInviteLastVerifiedSql();
 export const RECENT_INVITE_ORDER_SQL = 'discord_invite_first_validated_at DESC NULLS LAST,channel_id DESC';
 // This is the single definition of the operator-visible discovery corpus. Keep
 // both the paginated listing and dashboard aggregates anchored to this policy.
@@ -724,6 +767,7 @@ export async function listChannelsPage(args:ChannelListingFilter&{limit:number;o
     ${DISCORD_SELECTED_INVITE_CONFLICT_SQL} AS discord_selected_invite_conflict,
     (SELECT owner.channel_name FROM channels owner WHERE owner.channel_id=channels.discord_duplicate_owner_channel_id) discord_duplicate_owner_channel_name,
     ${DISCORD_INVITE_FIRST_VALIDATED_SQL} AS discord_invite_first_validated_at,
+    ${DISCORD_INVITE_LAST_VERIFIED_SQL} AS discord_invite_last_verified_at,
     (SELECT COUNT(*)::int FROM discord_candidates dc WHERE dc.channel_id=channels.channel_id) candidate_count,
     COALESCE((SELECT jsonb_agg((to_jsonb(dc) || jsonb_build_object('display_locator', (SELECT COALESCE(a.resolved_locator, a.invite_locator) FROM discord_check_attempts a WHERE a.channel_id=dc.channel_id AND lower(COALESCE(a.resolved_locator, a.invite_locator))=dc.normalized_locator ORDER BY a.checked_at DESC LIMIT 1))) ORDER BY dc.selected DESC,dc.last_checked DESC NULLS LAST,dc.discovered_at) FROM discord_candidates dc WHERE dc.channel_id=channels.channel_id AND dc.candidate_status='VALIDATED' AND dc.validation_status='COMPLETED' AND dc.liveness_status='ACTIVE'),'[]'::jsonb) discord_candidates,
     (SELECT status FROM jobs WHERE type='POST_APPROVAL_ENRICH' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) post_approval_job_status,
@@ -802,7 +846,7 @@ export async function getLegacyCommunityRetryDiagnostics(legacyBefore='2026-08-2
              EXISTS(
                SELECT 1 FROM (
                  SELECT DISTINCT ON (o.provenance->>'surface',lower(rtrim(COALESCE(o.requested_url,''),'/')))
-                        o.provenance->>'surface' AS surface,o.outcome,o.retryable,COALESCE(o.provenance->>'required','false') AS required
+                        o.provenance->>'surface' AS surface,o.outcome,o.retryable,o.failure_class,COALESCE(o.provenance->>'required','false') AS required
                    FROM external_acquisition_observations o
                   WHERE o.channel_id=j.payload->>'channelId'
                     AND o.observed_at >= COALESCE(c.last_checked,now()) - interval '5 minutes'
@@ -812,12 +856,13 @@ export async function getLegacyCommunityRetryDiagnostics(legacyBefore='2026-08-2
                            o.observed_at DESC
                ) effective
               WHERE effective.required='true' AND effective.outcome='ACQUISITION_FAILED' AND effective.retryable=true
+                AND COALESCE(effective.failure_class,'') <> 'REDIRECT_LIMIT'
                 AND effective.surface IN('CHANNEL_LINKS','EXTERNAL_LINKS','LINKED_WEBSITES','CUSTOM_DOMAINS','SOCIAL_PROFILES','SOCIAL_BIO')
              ) AS has_community_failure,
              EXISTS(
                SELECT 1 FROM (
                  SELECT DISTINCT ON (o.provenance->>'surface',lower(rtrim(COALESCE(o.requested_url,''),'/')))
-                        o.provenance->>'surface' AS surface,o.outcome,o.retryable,COALESCE(o.provenance->>'required','false') AS required
+                        o.provenance->>'surface' AS surface,o.outcome,o.retryable,o.failure_class,COALESCE(o.provenance->>'required','false') AS required
                    FROM external_acquisition_observations o
                   WHERE o.channel_id=j.payload->>'channelId'
                     AND o.observed_at >= COALESCE(c.last_checked,now()) - interval '5 minutes'
@@ -827,6 +872,7 @@ export async function getLegacyCommunityRetryDiagnostics(legacyBefore='2026-08-2
                            o.observed_at DESC
                ) effective
               WHERE effective.required='true' AND effective.outcome='ACQUISITION_FAILED' AND effective.retryable=true
+                AND COALESCE(effective.failure_class,'') <> 'REDIRECT_LIMIT'
                 AND effective.surface IN('YOUTUBE_ABOUT','RECENT_VIDEO_DESCRIPTIONS')
              ) AS has_upstream_failure
         FROM jobs j JOIN channels c ON c.channel_id=j.payload->>'channelId'
@@ -866,6 +912,7 @@ export async function getChannelById(channelId: string): Promise<ChannelRecord |
   const db = await getDb();
   const res = await db.query(`SELECT c.*,
     ${DISCORD_SELECTED_INVITE_CONFLICT_SQL} AS discord_selected_invite_conflict,
+    ${discordInviteLastVerifiedSql('c')} AS discord_invite_last_verified_at,
     (SELECT owner.channel_name FROM channels owner WHERE owner.channel_id=c.discord_duplicate_owner_channel_id) discord_duplicate_owner_channel_name,
     (SELECT COUNT(*)::int FROM discord_candidates dc WHERE dc.channel_id=c.channel_id) candidate_count
     FROM channels c WHERE c.channel_id=$1`, [channelId]);
@@ -900,6 +947,49 @@ export function overlayLockedDiscordProjection<T extends Partial<ChannelRecord>>
   const merged:{[key:string]:unknown}={...proposed};
   for(const column of DISCORD_PROJECTION_WRITE_COLUMNS)merged[column]=locked[column];
   return merged as T;
+}
+
+/**
+ * A1 targeted last-known-good guard for ordinary (non-classification) writes.
+ * A caller may load a channel before a validation commits, then persist its
+ * stale snapshot after it. When the locked row still serves a completed, live,
+ * validated invite — including a retained last-known-good row whose mutable
+ * status has become UNCERTAIN — an ordinary write must not clear it, replace
+ * it with a different invite, or erase the uncertainty marker with a stale
+ * ACTIVE snapshot. A stale snapshot cannot prove a terminal verdict either: its
+ * `DEAD`/`NON_TRADING` status may predate the validation that just committed.
+ * Only a fresh validation write (including a genuine `CONFIRMED_INVALID`
+ * projection) or explicit intentional cleanup may bypass the guard. This is
+ * deliberately narrower than making `preserveDiscordOnUpdate` the default: the
+ * authoritative inspection upsert opts into `freshDiscordValidation` so its
+ * latest status/evidence always reaches the row.
+ */
+export function shouldRetainLockedDiscordProjection(
+  proposed:Partial<ChannelRecord>,
+  locked:Partial<ChannelRecord>|null|undefined,
+  options?:{allowDiscordClear?:boolean;freshDiscordValidation?:boolean},
+):boolean{
+  if(!locked||options?.allowDiscordClear||options?.freshDiscordValidation)return false;
+  // A retained last-known-good invite can carry the mutable top-level status
+  // UNCERTAIN after a later status reset (the relevance field keeps the
+  // retention marker). The serving check alone would leave that row exposed to
+  // a stale ordinary snapshot that clears the invite and its evidence.
+  if(!hasServingLastKnownGoodDiscordInvite(locked)&&!hasRetainedLastKnownGoodDiscordInvite(locked))return false;
+  // A stale ordinary snapshot cannot prove a terminal verdict either: its
+  // DEAD/NON_TRADING status may predate the validation that just committed.
+  // Genuine terminal transitions arrive through the fresh-validation or
+  // explicit-cleanup options handled above.
+  if(proposed.discord_status==='DEAD'||proposed.discord_status==='NON_TRADING')return true;
+  const proposedInvite=proposed.discord_invite||null;
+  const lockedInvite=locked.discord_invite||null;
+  // No ordinary write may clear or replace a serving invite; only a fresh
+  // validation, a terminal verdict, or explicit cleanup owns that transition.
+  if(!proposedInvite||proposedInvite!==lockedInvite)return true;
+  // Same invite: a stale ACTIVE snapshot would silently overwrite the
+  // retained uncertainty marker and candidate identity. Recovery/reactivation
+  // writes move the row to UNCERTAIN and must still apply.
+  return hasRetainedLastKnownGoodDiscordInvite(locked)
+    &&(proposed.discord_status==='ACTIVE'||proposed.discord_status==='ACTIVE_LOW_VOLUME');
 }
 
 type ChannelUpsertClient = { query: (text: string, params?: unknown[]) => Promise<unknown> };
@@ -953,7 +1043,7 @@ ON CONFLICT(channel_id) DO UPDATE SET
   ]);
 }
 
-export async function upsertChannel(channel: ChannelRecord, options?: { preserveDiscordOnUpdate?: boolean }): Promise<void> {
+export async function upsertChannel(channel: ChannelRecord, options?: { preserveDiscordOnUpdate?: boolean; allowDiscordClear?: boolean; freshDiscordValidation?: boolean }): Promise<void> {
   const db = await getDb();
   const client = await db.connect();
   try {
@@ -962,13 +1052,20 @@ export async function upsertChannel(channel: ChannelRecord, options?: { preserve
       `SELECT quality_score,trading_status,${DISCORD_PROJECTION_WRITE_COLUMNS.join(',')} FROM channels WHERE channel_id=$1 FOR UPDATE`,
       [channel.channel_id]
     );
-    // The row is locked above for this transaction: a classification-only write
+    // The row is locked above for this transaction. A classification-only write
     // must not push its stale Discord snapshot over a validation result that
-    // committed while classification was running.
-    if (options?.preserveDiscordOnUpdate && prior.rowCount) {
-      channel = overlayLockedDiscordProjection(channel, prior.rows[0]);
+    // committed while classification was running. Ordinary writes get the
+    // narrower A1 guard: a stale snapshot cannot clear/replace a serving invite
+    // or erase a retained uncertainty marker. The authoritative inspection
+    // upsert passes `freshDiscordValidation` so fresh validation outcomes
+    // (including operational failures and retry-pending evidence) apply.
+    const locked = prior.rowCount ? prior.rows[0] : null;
+    const preserveDiscord = options?.preserveDiscordOnUpdate === true
+      || shouldRetainLockedDiscordProjection(channel, locked, options);
+    if (preserveDiscord && locked) {
+      channel = overlayLockedDiscordProjection(channel, locked);
     }
-    await writeChannelUpsert(client, channel, options);
+    await writeChannelUpsert(client, channel, { preserveDiscordOnUpdate: preserveDiscord });
     if (prior.rowCount) {
       const before = isQualityCreator(prior.rows[0].trading_status, Number(prior.rows[0].quality_score || 0));
       const after = isQualityCreator(channel.trading_status || 'UNCERTAIN', Number(channel.quality_score || 0));
@@ -1313,8 +1410,228 @@ export async function getSchemaInfo(): Promise<{currentVersion:number;migrations
 export function rowToQuery(r:any):QueryRecord{return {id:r.id,query:r.query,country:r.country,collection:r.collection,intent:r.intent,times_executed:r.times_executed||0,last_executed:iso(r.last_executed),total_channels_found:r.total_channels_found||0,unique_channels_found:r.unique_channels_found||0,quality_channels_found:r.quality_channels_found||0,community_channels_found:r.community_channels_found||0,avg_quality_score:r.avg_quality_score||0,performance_score:r.performance_score||0,created_at:iso(r.created_at)||new Date().toISOString(),status:r.status||'ACTIVE',knowledge_tiers:r.knowledge_tiers||[1],generation_mode:r.generation_mode||'LEGACY',generation_reason:r.generation_reason||'Legacy query',discovery_objective:r.discovery_objective||'Discover relevant trading creators.',primary_term:r.primary_term||undefined,generation_metadata:parseJson(r.generation_metadata,{}),reserved_until:iso(r.reserved_until),next_eligible_at:iso(r.next_eligible_at)} as QueryRecord;}
 export async function getAllQueries():Promise<QueryRecord[]>{const db=await getDb(); const res=await db.query('SELECT * FROM query_library ORDER BY performance_score DESC,times_executed DESC'); return res.rows.map(rowToQuery);}
 export async function getQueriesByCountry(country:string):Promise<QueryRecord[]>{const db=await getDb(); const res=await db.query(`SELECT * FROM query_library WHERE LOWER(country)=LOWER($1) AND status='ACTIVE' ORDER BY performance_score DESC,times_executed ASC`,[country]); return res.rows.map(rowToQuery);}
+
+/** Q5 per-run reward rows. Global newness and quality are read from
+ * sighting-level truth, never from query_library cumulative counters. */
+export interface QueryQualityRunRow{queryId:number;confirmed:number;quality:number;quotaUnits:number;ageDays:number;}
+export async function getQueryQualityRunRows(country?:string):Promise<QueryQualityRunRow[]>{const db=await getDb();const res=await db.query(`SELECT qr.query_id,EXTRACT(EPOCH FROM (now()-qr.completed_at))/86400.0 AS age_days,COALESCE(s.confirmed,0)::int AS confirmed,COALESCE(s.quality,0)::int AS quality,GREATEST(0,qr.quota_used)::float/100.0 AS quota_units FROM query_runs qr LEFT JOIN LATERAL (SELECT COUNT(DISTINCT cs.channel_id) FILTER (WHERE cs.persisted AND NOT cs.was_known AND cs.country_outcome IN ('CONFIRMED','LIKELY') AND cs.funnel_outcome='TRADING_CONFIRMED')::int AS confirmed,COUNT(DISTINCT cs.channel_id) FILTER (WHERE cs.persisted AND NOT cs.was_known AND cs.country_outcome IN ('CONFIRMED','LIKELY') AND cs.funnel_outcome='TRADING_CONFIRMED' AND c.quality_score>=${QUALITY_CREATOR_SCORE_THRESHOLD})::int AS quality FROM channel_sightings cs LEFT JOIN channels c ON c.channel_id=cs.channel_id WHERE cs.query_run_id=qr.id) s ON true WHERE qr.status='COMPLETED' AND qr.query_id IS NOT NULL AND qr.completed_at IS NOT NULL AND qr.completed_at>now()-interval '180 days' AND COALESCE((qr.performance_details->>'providerRequestsFailed')::int,0)=0 AND COALESCE((qr.performance_details->>'providerRateLimited')::int,0)=0 AND (COALESCE(qr.performance_details->>'providerRunOutcome','') = '' OR qr.performance_details->>'providerRunOutcome' LIKE 'SUCCESS%') AND ($1::text IS NULL OR LOWER(qr.country)=LOWER($1)) ORDER BY qr.completed_at DESC`,[country||null]);return res.rows.map((r:any)=>({queryId:Number(r.query_id),confirmed:Number(r.confirmed||0),quality:Number(r.quality||0),quotaUnits:Number(r.quota_units||0),ageDays:Number(r.age_days||0)}));}
+/**
+ * Decayed reward counts aggregated in SQL. Selection runs on the scheduler hot
+ * path, so reading one row per completed run over 180 days (each with a
+ * per-row sighting LATERAL) does not scale with history. This returns at most
+ * one row per query id and applies the same half-life weight as
+ * decayArmCounts, provider-failure exclusion and zero-quota exclusion.
+ * `queryId` narrows the aggregate when only one arm's history is needed.
+ */
+export interface QueryQualityDecayedCounts{queryId:number;counts:{confirmed:number;quality:number;quotaUnits:number;runs:number};}
+export async function getQueryQualityDecayedCounts(country?:string,queryId?:number,halfLifeDays=30):Promise<QueryQualityDecayedCounts[]>{
+  const db=await getDb();
+  const halfLife=Number.isFinite(halfLifeDays)&&halfLifeDays>0?halfLifeDays:30;
+  const res=await db.query(`SELECT qr.query_id,SUM(COALESCE(s.confirmed,0)*power(0.5::float8,GREATEST(0,EXTRACT(EPOCH FROM (now()-qr.completed_at))/86400.0)/$2::float8))::float8 AS confirmed,SUM(COALESCE(s.quality,0)*power(0.5::float8,GREATEST(0,EXTRACT(EPOCH FROM (now()-qr.completed_at))/86400.0)/$2::float8))::float8 AS quality,SUM((GREATEST(0,qr.quota_used)::float8/100.0)*power(0.5::float8,GREATEST(0,EXTRACT(EPOCH FROM (now()-qr.completed_at))/86400.0)/$2::float8))::float8 AS quota_units,COUNT(*)::int AS runs FROM query_runs qr LEFT JOIN LATERAL (SELECT COUNT(DISTINCT cs.channel_id) FILTER (WHERE cs.persisted AND NOT cs.was_known AND cs.country_outcome IN ('CONFIRMED','LIKELY') AND cs.funnel_outcome='TRADING_CONFIRMED')::int AS confirmed,COUNT(DISTINCT cs.channel_id) FILTER (WHERE cs.persisted AND NOT cs.was_known AND cs.country_outcome IN ('CONFIRMED','LIKELY') AND cs.funnel_outcome='TRADING_CONFIRMED' AND c.quality_score>=${QUALITY_CREATOR_SCORE_THRESHOLD})::int AS quality FROM channel_sightings cs LEFT JOIN channels c ON c.channel_id=cs.channel_id WHERE cs.query_run_id=qr.id) s ON true WHERE qr.status='COMPLETED' AND qr.query_id IS NOT NULL AND qr.completed_at IS NOT NULL AND qr.completed_at>now()-interval '180 days' AND COALESCE((qr.performance_details->>'providerRequestsFailed')::int,0)=0 AND COALESCE((qr.performance_details->>'providerRateLimited')::int,0)=0 AND (COALESCE(qr.performance_details->>'providerRunOutcome','') = '' OR qr.performance_details->>'providerRunOutcome' LIKE 'SUCCESS%') AND GREATEST(0,qr.quota_used)>0 AND ($1::text IS NULL OR LOWER(qr.country)=LOWER($1)) AND ($3::int IS NULL OR qr.query_id=$3) GROUP BY qr.query_id`,[country||null,halfLife,queryId??null]);
+  return res.rows.map((r:any)=>({queryId:Number(r.query_id),counts:{confirmed:Number(r.confirmed||0),quality:Number(r.quality||0),quotaUnits:Number(r.quota_units||0),runs:Number(r.runs||0)}}));
+}
+/**
+ * All attributable quota spend in the accounting window, including runs that
+ * are still scheduled/running and runs excluded from reward by a provider
+ * failure. Share caps must see every family/source spend, including queries
+ * that are currently cooling down or otherwise unselectable.
+ */
+export interface QueryQuotaSpendRow{queryId:number;quotaUnits:number;ageDays:number;}
+export async function getQueryQuotaSpendRows(country?:string):Promise<QueryQuotaSpendRow[]>{
+  const db=await getDb();
+  const res=await db.query(`SELECT query_id,GREATEST(0,GREATEST(quota_reserved,quota_used))::float/100.0 AS quota_units,EXTRACT(EPOCH FROM (now()-COALESCE(completed_at,scheduled_at)))/86400.0 AS age_days FROM query_runs WHERE query_id IS NOT NULL AND status IN ('SCHEDULED','RUNNING','RETRYING','COMPLETED','FAILED') AND COALESCE(completed_at,scheduled_at)>now()-interval '180 days' AND ($1::text IS NULL OR LOWER(country)=LOWER($1))`,[country||null]);
+  return res.rows.map((r:any)=>({queryId:Number(r.query_id),quotaUnits:Number(r.quota_units||0),ageDays:Math.max(0,Number(r.age_days||0))}));
+}
+/** In-flight (scheduled/running/retrying) uses per primary term. */
+export interface QueryPrimaryTermUsageRow{primaryTerm:string;uses:number;}
+export async function getInFlightPrimaryTermUsage(country:string|undefined,sinceIso:string):Promise<QueryPrimaryTermUsageRow[]>{
+  const db=await getDb();
+  const res=await db.query(`SELECT ql.primary_term,COUNT(*)::int AS uses FROM query_runs qr JOIN query_library ql ON ql.id=qr.query_id WHERE qr.query_id IS NOT NULL AND qr.status IN ('SCHEDULED','RUNNING','RETRYING') AND COALESCE(qr.scheduled_at,now()) >= $2 AND ql.primary_term IS NOT NULL AND btrim(ql.primary_term)<>'' AND ($1::text IS NULL OR LOWER(qr.country)=LOWER($1)) GROUP BY ql.primary_term`,[country||null,sinceIso]);
+  return res.rows.map((r:any)=>({primaryTerm:String(r.primary_term),uses:Number(r.uses||0)}));
+}
+/** Consecutive terminal query failures, newest first, with provider failures exempt. */
+export interface QueryFailureState{queryId:number;consecutiveFailures:number;backoffUntil:string|null;}
+export async function getQueryFailureStates(country?:string):Promise<QueryFailureState[]>{
+  const db=await getDb();
+  const res=await db.query(`SELECT query_id,status,completed_at,COALESCE(performance_details->>'failureKind','') AS failure_kind FROM (SELECT query_id,status,completed_at,performance_details,ROW_NUMBER() OVER (PARTITION BY query_id ORDER BY completed_at DESC) AS rn FROM query_runs WHERE query_id IS NOT NULL AND status IN ('COMPLETED','FAILED') AND completed_at IS NOT NULL AND ($1::text IS NULL OR LOWER(country)=LOWER($1))) ordered WHERE rn<=10 ORDER BY query_id,completed_at DESC`,[country||null]);
+  const grouped=new Map<number,QueryFailureStateRow[]>();
+  for(const row of res.rows){
+    const queryId=Number(row.query_id);
+    const list=grouped.get(queryId)||[];
+    list.push({status:String(row.status||''),completedAt:iso(row.completed_at),failureKind:row.failure_kind?String(row.failure_kind):null});
+    grouped.set(queryId,list);
+  }
+  return [...grouped.entries()].map(([queryId,rows])=>({queryId,...deriveQueryFailureState(rows)}));
+}
+/** Current-run reward truth, matching getQueryQualityRunRows' sighting definition. */
+export async function getQueryRunReward(runId:string):Promise<{confirmed:number;quality:number}>{
+  const db=await getDb();
+  const res=await db.query(`SELECT COUNT(DISTINCT cs.channel_id) FILTER (WHERE cs.persisted AND NOT cs.was_known AND cs.country_outcome IN ('CONFIRMED','LIKELY') AND cs.funnel_outcome='TRADING_CONFIRMED')::int AS confirmed,COUNT(DISTINCT cs.channel_id) FILTER (WHERE cs.persisted AND NOT cs.was_known AND cs.country_outcome IN ('CONFIRMED','LIKELY') AND cs.funnel_outcome='TRADING_CONFIRMED' AND c.quality_score>=${QUALITY_CREATOR_SCORE_THRESHOLD})::int AS quality FROM channel_sightings cs LEFT JOIN channels c ON c.channel_id=cs.channel_id WHERE cs.query_run_id=$1`,[runId]);
+  return {confirmed:Number(res.rows[0]?.confirmed||0),quality:Number(res.rows[0]?.quality||0)};
+}
+// Continuation pages increment quota_reserved on a run that may have been
+// scheduled before UTC midnight, so the day filter cannot rely on
+// scheduled_at alone: active runs always count against today's bound, and
+// terminal runs count when either their schedule or their completion was
+// today. Each run is counted once with its current reservation.
+const PORTFOLIO_UNITS_SQL=`SELECT COALESCE(SUM(GREATEST(quota_reserved,quota_used)),0)::float/100.0 AS units FROM query_runs WHERE (scheduled_at>=(date_trunc('day',now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') OR status IN ('SCHEDULED','RUNNING','RETRYING') OR completed_at>=(date_trunc('day',now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')) AND status IN ('SCHEDULED','RUNNING','RETRYING','COMPLETED','FAILED') AND (selection_strategy IN ('UCB_PORTFOLIO','UCB1_EXPLORATION','COLD_START_GENERATION') OR selection_reason LIKE 'Bounded portfolio%')`;
+/**
+ * Shared portfolio budget plus an optional country breakdown. The budget the
+ * selector enforces is global; a country-filtered total must never be
+ * compared against the global reservation (that would report budget available
+ * after other countries exhausted it). Callers that pass a country receive
+ * `countryUnitsUsed` alongside the authoritative global `portfolioUnitsUsed`.
+ */
+export async function getQueryPortfolioBudgetState(country?:string):Promise<{portfolioUnitsUsed:number;dailyQuotaUnits:number;portfolioUnitsReserved:number;countryUnitsUsed?:number}>{
+  const db=await getDb();
+  const [quota,used,countryUsed,configuredRatio]=await Promise.all([
+    db.query(`SELECT daily_limit FROM quota_tracker WHERE id='youtube'`),
+    db.query(PORTFOLIO_UNITS_SQL),
+    country
+      ? db.query(`${PORTFOLIO_UNITS_SQL} AND LOWER(country)=LOWER($1)`,[country])
+      : Promise.resolve({rows:[{units:null}]}),
+    // The dashboard must report the same bounded allocation the selector uses;
+    // a hard-coded 15% would disagree at either configured band edge.
+    getAppSetting('query_intelligence_portfolio_ratio',process.env.QUERY_INTELLIGENCE_PORTFOLIO_RATIO||'0.15'),
+  ]);
+  const dailyQuotaUnits=Math.max(1,Number(quota.rows[0]?.daily_limit||10000)/100);
+  const portfolioUnitsUsed=Math.max(0,Number(used.rows[0]?.units||0));
+  return {
+    portfolioUnitsUsed,
+    dailyQuotaUnits,
+    portfolioUnitsReserved:dailyQuotaUnits*boundedPortfolioRatio(configuredRatio),
+    ...(country?{countryUnitsUsed:Math.max(0,Number(countryUsed.rows[0]?.units||0))}:{}),
+  };
+}
+
+/**
+ * Whether the provider registry can serve exploration without official quota.
+ *
+ * Selection must not infer this from environment flags or from prior run
+ * outcomes: the authoritative capability is the same `discovery_provider_registry`
+ * row that ordinary allocation rotates over. Only an ACTIVE SEARCH_YOUTUBE row
+ * in the free quota domain grants this. Any lookup failure fails closed, so an
+ * unreadable registry can never open official exploration after budget
+ * exhaustion.
+ */
+export async function isQuotaFreeProviderAvailable():Promise<boolean>{
+  try {
+    const db=await getDb();
+    const res=await db.query(
+      `SELECT provider_key,provider_family,capabilities,quota_domain,mode FROM discovery_provider_registry WHERE mode='ACTIVE' AND capabilities ? 'SEARCH_YOUTUBE'`
+    );
+    return res.rows.some((row:any)=>isQuotaFreeSearchProviderRow({
+      mode:row.mode,
+      quota_domain:row.quota_domain,
+      capabilities:row.capabilities,
+    }));
+  } catch(error) {
+    console.warn('[QuerySelection] Quota-free provider capability lookup failed; failing closed.', error);
+    return false;
+  }
+}
+
+/**
+ * Authorize one more official page for a portfolio-selected run.
+ *
+ * Selection reserves the first page; every continuation page must clear the
+ * same shared portfolio floor before it is enqueued. The check and the
+ * reservation increment run under one advisory lock so two workers cannot
+ * both spend the last unit. The reservation is addressed by target page
+ * number, which makes a retried continuation idempotent instead of
+ * over-reserving the run.
+ *
+ * Quota-free providers spend no official units and are always allowed.
+ */
+export async function reservePortfolioContinuationPage(input: {
+  queryRunId: string;
+  pageNumber: number;
+  providerQuotaUnits: number;
+  /**
+   * When supplied, the caller owns the transaction: this function neither
+   * begins, commits, rolls back, nor releases. The queue uses this to commit
+   * the page reservation atomically with the child-job enqueue.
+   */
+  clientOverride?: any;
+}): Promise<{authorized:boolean;reason:string}> {
+  const pageUnits = Number(input.providerQuotaUnits);
+  if (!Number.isFinite(pageUnits) || pageUnits <= 0) return {authorized:true,reason:'NO_OFFICIAL_QUOTA'};
+  if (!Number.isFinite(input.pageNumber) || input.pageNumber < 1) return {authorized:false,reason:'INVALID_PAGE_NUMBER'};
+  const db=await getDb();
+  const client=input.clientOverride||await db.connect();
+  const ownsTransaction=!input.clientOverride;
+  try {
+    if (ownsTransaction) await client.query('BEGIN');
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`,['query-portfolio-budget']);
+    const run=await client.query(`SELECT selection_strategy,selection_reason,quota_reserved,quota_used FROM query_runs WHERE id=$1 FOR UPDATE`,[input.queryRunId]);
+    if(!run.rowCount){if(ownsTransaction)await client.query('ROLLBACK');return {authorized:false,reason:'QUERY_RUN_NOT_FOUND'};}
+    const row=run.rows[0];
+    const strategy=String(row.selection_strategy||'');
+    const selectionReason=String(row.selection_reason||'');
+    const portfolioRun=['UCB_PORTFOLIO','UCB1_EXPLORATION','COLD_START_GENERATION'].includes(strategy)
+      || selectionReason.startsWith('Bounded portfolio');
+    if(!portfolioRun){if(ownsTransaction)await client.query('COMMIT');return {authorized:true,reason:'NOT_PORTFOLIO_RUN'};}
+
+    const targetReserved=Math.max(0,input.pageNumber*pageUnits);
+    const currentReserved=Math.max(0,Number(row.quota_reserved||0),Number(row.quota_used||0));
+    if(currentReserved>=targetReserved){
+      // This page was already authorized (job retry or duplicate delivery).
+      if(ownsTransaction)await client.query('COMMIT');
+      return {authorized:true,reason:'ALREADY_RESERVED'};
+    }
+
+    const [quota,used,configuredRatio]=await Promise.all([
+      client.query(`SELECT daily_limit FROM quota_tracker WHERE id='youtube'`),
+      client.query(PORTFOLIO_UNITS_SQL),
+      client.query(`SELECT setting_value FROM app_settings WHERE setting_key='query_intelligence_portfolio_ratio'`),
+    ]);
+    const dailyQuotaUnits=Math.max(1,Number(quota.rows[0]?.daily_limit||10000)/100);
+    const portfolioUnitsReserved=dailyQuotaUnits*boundedPortfolioRatio(
+      configuredRatio.rows[0]?.setting_value ?? process.env.QUERY_INTELLIGENCE_PORTFOLIO_RATIO ?? '0.15',
+    );
+    const portfolioUnitsUsed=Math.max(0,Number(used.rows[0]?.units||0));
+    const additionalUnits=(targetReserved-currentReserved)/100;
+    if(!portfolioContinuationAllowed({portfolioUnitsUsed,portfolioUnitsReserved,nextPageUnits:additionalUnits})){
+      if(ownsTransaction)await client.query('ROLLBACK');
+      return {authorized:false,reason:'PORTFOLIO_BUDGET_EXHAUSTED'};
+    }
+    await client.query(`UPDATE query_runs SET quota_reserved=GREATEST(COALESCE(quota_reserved,0),COALESCE(quota_used,0),$2) WHERE id=$1`,[input.queryRunId,targetReserved]);
+    if(ownsTransaction)await client.query('COMMIT');
+    return {authorized:true,reason:'RESERVED'};
+  } catch(error) {
+    if(ownsTransaction)await client.query('ROLLBACK').catch(()=>undefined);
+    console.warn('[QueryPortfolio] Failed to reserve continuation page:',error);
+    return {authorized:false,reason:'RESERVATION_FAILED'};
+  } finally {
+    if(ownsTransaction) client.release();
+  }
+}
+/** Q6 read-only projection over query runs + stored attribution JSONB. */
+export async function getQueryQualityDashboardRows(country?:string,limit=200):Promise<QueryQualityDashboardRunInput[]>{const db=await getDb();const res=await db.query(`SELECT qr.id::text AS run_id,qr.query_id,COALESCE(ql.query,'') AS query,qr.country,qr.status,qr.selection_strategy,qr.selection_reason,qr.quota_used,qr.completed_at,qr.performance_details,COALESCE(a.metrics,'{}'::jsonb) AS metrics,COALESCE(qr.metadata,'{}'::jsonb) AS run_metadata,(SELECT apo.stopping_reason FROM autonomous_query_page_observations apo WHERE apo.query_run_id=qr.id ORDER BY apo.page_number DESC LIMIT 1) AS stop_reason FROM query_runs qr LEFT JOIN query_library ql ON ql.id=qr.query_id LEFT JOIN query_run_accounting_attributions a ON a.query_run_id=qr.id WHERE ($1::text IS NULL OR LOWER(qr.country)=LOWER($1)) ORDER BY qr.scheduled_at DESC LIMIT $2`,[country||null,Math.max(1,Math.min(500,Math.floor(limit)))]);return res.rows.map((r:any)=>{const metrics=parseJson<Record<string,any>>(r.metrics,{});const metadata=parseGenerationMetadata(r.run_metadata);const admission=metadata.queryAdmission||null;return {runId:String(r.run_id||''),queryId:Number(r.query_id||0),query:String(r.query||''),country:String(r.country||''),status:String(r.status||''),selectionStrategy:String(r.selection_strategy||'UNKNOWN'),selectionReason:String(r.selection_reason||''),stopReason:r.stop_reason?String(r.stop_reason):null,quotaUsed:Number(r.quota_used||0),completedAt:iso(r.completed_at),performanceScore:Number(r.performance_details?.performanceScore||metrics.performanceScore||0),qualityVector:metrics.qualityVector||null,admission:admission?{tier:admission.tier,compositionFamily:admission.compositionFamily,reasonCodes:Array.isArray(admission.reasonCodes)?admission.reasonCodes:[],source:admission.source,eligible:admission.eligible}:null};});}
 export async function getQueryByText(queryText:string):Promise<QueryRecord|null>{const db=await getDb(); const res=await db.query('SELECT * FROM query_library WHERE LOWER(query)=LOWER($1)',[queryText.trim()]); return res.rows[0]?rowToQuery(res.rows[0]):null;}
-export async function upsertQueryRecord(record:{query:string;country:string;collection:'PROVEN'|'EXPERIMENTAL'|'REJECTED';intent:string;knowledgeTiers?:number[];generationMode?:string;generationReason?:string;discoveryObjective?:string;primaryTerm?:string;generationMetadata?:Record<string,unknown>;}):Promise<QueryRecord>{const db=await getDb(); const query=record.query.normalize('NFKC').trim().replace(/\s+/g,' '); const res=await db.query(`INSERT INTO query_library(query,normalized_query,country,collection,intent,knowledge_tiers,generation_mode,generation_reason,discovery_objective,primary_term,generation_metadata,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now()) ON CONFLICT(country,normalized_query) DO UPDATE SET query=excluded.query,collection=excluded.collection,intent=excluded.intent,knowledge_tiers=excluded.knowledge_tiers,generation_mode=excluded.generation_mode,generation_reason=excluded.generation_reason,discovery_objective=excluded.discovery_objective,primary_term=excluded.primary_term,generation_metadata=excluded.generation_metadata RETURNING *`,[query,normalizeQueryText(query),record.country,record.collection,record.intent,record.knowledgeTiers||[1],record.generationMode||'LEGACY',record.generationReason||'Legacy query',record.discoveryObjective||'Discover relevant trading creators.',record.primaryTerm||null,JSON.stringify(record.generationMetadata||{})]); return rowToQuery(res.rows[0]);}
+export interface QueryDuplicateHistoryItem {query:string;country:string;aliasOf?:string;}
+export async function upsertQueryRecord(record:{query:string;country:string;collection:'PROVEN'|'EXPERIMENTAL'|'REJECTED';intent:string;knowledgeTiers?:number[];generationMode?:string;generationReason?:string;discoveryObjective?:string;primaryTerm?:string;generationMetadata?:Record<string,unknown>;},options:{/** Still-current same-country rows, preloaded by a batch producer. */history?:QueryDuplicateHistoryItem[]}={}):Promise<QueryRecord>{
+  const db=await getDb();
+  const query=record.query.normalize('NFKC').trim().replace(/\s+/g,' ');
+  const normalized=normalizeQueryText(query);
+  const admissionMetadata=parseGenerationMetadata(record.generationMetadata as Record<string,unknown>||{});
+  // Country-scoped duplicate suppression compares against every other row,
+  // including cooling/rejected rows. The current row is excluded so an
+  // in-place update never rejects itself. Batch producers pass the history
+  // once instead of rescanning the whole country per candidate.
+  const history=(options.history
+    ? options.history
+    : (await db.query(`SELECT query,country,generation_metadata FROM query_library WHERE LOWER(country)=LOWER($1) AND normalized_query<>$2`,[record.country,normalized])).rows.map((row:any)=>{
+        const metadata=parseGenerationMetadata(row.generation_metadata);
+        const aliasOf=typeof metadata.aliasOf==='string'?metadata.aliasOf:undefined;
+        return {query:String(row.query||''),country:String(row.country||''),...(aliasOf?{aliasOf}:{})};
+      })
+  ).filter((item:QueryDuplicateHistoryItem)=>item.query&&normalizeQueryText(item.query)!==normalized);
+  const admission=admitQueryRecord({query,country:record.country,primary_term:record.primaryTerm,generation_metadata:admissionMetadata},{history,now:new Date().toISOString()});
+  const generationMetadata=withQueryAdmission(admissionMetadata,admission.admission);
+  const res=await db.query(`INSERT INTO query_library(query,normalized_query,country,collection,intent,knowledge_tiers,generation_mode,generation_reason,discovery_objective,primary_term,generation_metadata,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now()) ON CONFLICT(country,normalized_query) DO UPDATE SET query=excluded.query,collection=excluded.collection,intent=excluded.intent,knowledge_tiers=excluded.knowledge_tiers,generation_mode=excluded.generation_mode,generation_reason=excluded.generation_reason,discovery_objective=excluded.discovery_objective,primary_term=excluded.primary_term,generation_metadata=excluded.generation_metadata RETURNING *`,[query,normalized,record.country,record.collection,record.intent,record.knowledgeTiers||[1],record.generationMode||'LEGACY',record.generationReason||'Legacy query',record.discoveryObjective||'Discover relevant trading creators.',record.primaryTerm||null,JSON.stringify(generationMetadata)]);
+  return rowToQuery(res.rows[0]);
+}
 export async function updateQueryExecutionStats(queryId:number,stats:{totalChannelsFound:number;uniqueChannelsFound:number;qualityChannelsFound:number;communityChannelsFound:number;avgQualityScore:number;performanceScore:number;newCollection?:'PROVEN'|'EXPERIMENTAL'|'REJECTED';}):Promise<void>{const db=await getDb(); await db.query(`UPDATE query_library SET times_executed=times_executed+1,last_executed=now(),total_channels_found=total_channels_found+$1,unique_channels_found=unique_channels_found+$2,quality_channels_found=quality_channels_found+$3,community_channels_found=community_channels_found+$4,avg_quality_score=ROUND(((avg_quality_score*times_executed)+$5)/(times_executed+1)),performance_score=$6,collection=COALESCE($7,collection) WHERE id=$8`,[stats.totalChannelsFound,stats.uniqueChannelsFound,stats.qualityChannelsFound,stats.communityChannelsFound,stats.avgQualityScore,stats.performanceScore,stats.newCollection||null,queryId]);}
 export async function setQueryCollection(queryId:number,collection:'PROVEN'|'EXPERIMENTAL'|'REJECTED'):Promise<void>{const db=await getDb(); await db.query('UPDATE query_library SET collection=$1 WHERE id=$2',[collection,queryId]);}
 export async function addQueryExecutionLog(log:{query_id?:number;query_run_id?:string;query:string;country:string;executed_at:string;channels_discovered:number;unique_new_channels:number;quality_creators_discovered:number;communities_discovered:number;cycle_quality_score:number;logs?:string[];}):Promise<void>{const db=await getDb(); await db.query(`INSERT INTO query_execution_logs(query_run_id,query_id,query,country,executed_at,channels_discovered,unique_new_channels,quality_creators_discovered,communities_discovered,cycle_quality_score,logs) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(query_run_id) WHERE query_run_id IS NOT NULL DO NOTHING`,[log.query_run_id||null,log.query_id||null,log.query,log.country,log.executed_at,log.channels_discovered,log.unique_new_channels,log.quality_creators_discovered,log.communities_discovered,log.cycle_quality_score,JSON.stringify(log.logs||[])]);}
@@ -2449,6 +2766,13 @@ export interface AutonomousQueryCandidate {
   frontierDecisionId?: string;
   targetNeighborhoodDimensions?: DiscoveryNeighborhoodDimensions;
   provider?: ProviderAllocation;
+  /**
+   * Selection proved the official portfolio floor is exhausted and chose this
+   * arm for quota-free capacity. Scheduling must allocate an ACTIVE
+   * SEARCH_YOUTUBE provider in the free quota domain or fail closed; it may
+   * never fall back to the official provider.
+   */
+  quotaFreeRequired?: boolean;
   allowShadowProvider?: boolean;
   /**
    * Opt-in selection-experiment observation (Thompson/Contextual/CONTROL).
@@ -2667,14 +2991,30 @@ export async function scheduleAutonomousQueryRuns(
           ).catch(() => ({ rows: [] as any[] }));
           const coolingKeys = (coolingRes.rows || []).map((row: any) => ledgerProviderToRegistryKey(String(row.provider)));
           if (Array.isArray(rotationRes.rows) && rotationRes.rows.length > 0) {
-            const picked = rotateActiveProviderRow(rotationRes.rows, `scheduled:${candidate.query.id}:${candidate.query.country}`, coolingKeys);
+            // A quota-free exploration decision must be served by quota-free
+            // capacity. Filtering here prevents the stable rotation key from
+            // selecting the official provider and failing later against the
+            // exhausted portfolio floor.
+            const allocationRows = candidate.quotaFreeRequired
+              ? quotaFreeSearchProviderRows(rotationRes.rows)
+              : rotationRes.rows;
+            if (allocationRows.length === 0) {
+              throw new Error('QUOTA_FREE_PROVIDER_UNAVAILABLE');
+            }
+            const picked = rotateActiveProviderRow(allocationRows, `scheduled:${candidate.query.id}:${candidate.query.country}`, coolingKeys);
             // Registry rows carry quota_domain (there is no cost_domain
             // column); providerSnapshotFromRegistryRow derives the allocation
             // costDomain from it and validates the snapshot, so a bad column
             // fails loudly here instead of silently pinning traffic to official.
             allocatedProvider = providerSnapshotFromRegistryRow(picked, 'SEARCH_YOUTUBE');
+          } else if (candidate.quotaFreeRequired) {
+            throw new Error('QUOTA_FREE_PROVIDER_UNAVAILABLE');
           }
-        } catch {
+        } catch (error) {
+          // Normal allocation keeps its historical fail-open default to the
+          // official provider. A quota-free requirement cannot: falling back
+          // would spend official budget the selector already found exhausted.
+          if (candidate.quotaFreeRequired) await failStep('quota_free_provider_allocation', error);
           allocatedProvider = providerSnapshot(YOUTUBE_SEARCH_PROVIDER);
         }
       }
@@ -2747,9 +3087,15 @@ export async function scheduleAutonomousQueryRuns(
         `SELECT COUNT(*) FILTER (WHERE search_ordering='DATE')::int AS date, COUNT(*)::int AS total
          FROM query_runs WHERE retrieval_lane='VIDEO' AND scheduled_at >= date_trunc('day', now() AT TIME ZONE 'UTC')`
       );
-      const controlSearchOrdering = allocatedDimensions
-        ? allocatedDimensions.searchOrdering as SearchOrdering
-        : allocateSearchOrdering(controlRetrievalLane, orderingCounts.rows[0]?.date || 0, orderingCounts.rows[0]?.total || 0, datePercent);
+      // InnerTube has no date ordering, and quota-free exploration cannot be
+      // retargeted to the official provider after the portfolio floor is
+      // exhausted. Pin these candidates to RELEVANCE before the ordering draw
+      // rather than drawing DATE and failing closed.
+      const controlSearchOrdering: SearchOrdering = candidate.quotaFreeRequired
+        ? 'RELEVANCE'
+        : allocatedDimensions
+          ? allocatedDimensions.searchOrdering as SearchOrdering
+          : allocateSearchOrdering(controlRetrievalLane, orderingCounts.rows[0]?.date || 0, orderingCounts.rows[0]?.total || 0, datePercent);
 
       const controlConfig = buildRetrievalConfiguration({
         searchOrdering: controlSearchOrdering,
@@ -2802,16 +3148,21 @@ export async function scheduleAutonomousQueryRuns(
 
       // Phase 9 Canary Treatment Reservation under transaction advisory lock
       activeOperation = 'phase9_treatment_reservation';
-      const canaryTreatment = await reserveRetrievalCanaryTreatment({
-        opportunityKey: oppKey,
-        neighborhoodKey: neighborhood.neighborhoodKey,
-        retrievalLane: controlRetrievalLane,
-        defaultOrdering: controlSearchOrdering,
-        frontierState,
-        isSaturating,
-        providerQuotaUnits: allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE' ? 0 : 100,
-        clientOverride: client
-      });
+      // A quota-free run cannot accept a DATE treatment config: the free
+      // provider has no date ordering and there is no official budget left to
+      // retarget. Keep these exceptional runs on RELEVANCE.
+      const canaryTreatment = candidate.quotaFreeRequired
+        ? { authorized: false, reason: 'QUOTA_FREE_EXPLORATION_RELEVANCE_ONLY' }
+        : await reserveRetrievalCanaryTreatment({
+          opportunityKey: oppKey,
+          neighborhoodKey: neighborhood.neighborhoodKey,
+          retrievalLane: controlRetrievalLane,
+          defaultOrdering: controlSearchOrdering,
+          frontierState,
+          isSaturating,
+          providerQuotaUnits: allocatedProvider.costDomain==='YOUTUBE_DATA_API' ? 100 : 0,
+          clientOverride: client
+        });
 
       setDiagnostic({ phase9TreatmentOutcome: canaryTreatment.authorized ? 'AUTHORIZED' : 'NOT_AUTHORIZED', phase9TreatmentReasonCode: canaryTreatment.reason });
       if (canaryTreatment.authorized && canaryTreatment.config && canaryTreatment.reservation) {
@@ -2826,6 +3177,36 @@ export async function scheduleAutonomousQueryRuns(
       if (allocatedDimensions && (retrievalLane !== allocatedDimensions.retrievalLane ||
           searchOrdering !== allocatedDimensions.searchOrdering)) {
         throw new Error('PHASE9_TREATMENT_CHANGED_PHASE8_NEIGHBORHOOD');
+      }
+
+      // Quota-free candidates are pinned to RELEVANCE before the ordering
+      // draw, so this guard is unreachable on the normal path. It remains
+      // fail-closed for a frontier lineage or any future caller that
+      // reintroduces DATE.
+      if (candidate.quotaFreeRequired && searchOrdering === 'DATE') {
+        await failStep('quota_free_provider_capability', new Error('QUOTA_FREE_PROVIDER_CANNOT_SERVE_DATE_ORDERING'));
+      }
+      // The selector's free-capacity proof is an ACTIVE SEARCH_YOUTUBE row in
+      // the free quota domain. Re-check the full row shape here: frontier
+      // lineage or an explicit provider can override the rotation pick, and a
+      // canary/global or non-search row must not satisfy the requirement.
+      if (candidate.quotaFreeRequired && (
+        allocatedProvider.costDomain !== 'YOUTUBE_INNERTUBE_FREE' ||
+        allocatedProvider.capability !== 'SEARCH_YOUTUBE' ||
+        eligibleProvider.rows[0]?.mode !== 'ACTIVE'
+      )) {
+        await failStep('quota_free_provider_capability', new Error('QUOTA_FREE_PROVIDER_REQUIRED'));
+      }
+      // InnerTube has no publishedAfter/Before support. A quota-free run
+      // assigned a windowed ordering treatment would be persisted as a
+      // treatment observation while executing unwindowed, contaminating the
+      // benchmark comparison. There is no official budget left to serve the
+      // window, so fail closed instead of recording a treatment that did not
+      // run.
+      if (candidate.quotaFreeRequired &&
+          candidate.experiment?.ordering?.arm === 'TREATMENT' &&
+          candidate.experiment.ordering.windowApplied) {
+        await failStep('quota_free_provider_capability', new Error('QUOTA_FREE_PROVIDER_CANNOT_SERVE_ORDERING_WINDOW'));
       }
 
       // DATE-ordering capability guard: InnerTube exposes no sort-by-date, so
@@ -2898,7 +3279,47 @@ export async function scheduleAutonomousQueryRuns(
       const origin = candidate.allocationOrigin || 'LEGACY';
       // Quota-free providers (YouTube.js/InnerTube) reserve 0 official units;
       // the official YouTube path keeps its 100-unit page reservation.
-      const scheduledProviderUnits = allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE' ? 0 : 100;
+      const scheduledProviderUnits = allocatedProvider.costDomain==='YOUTUBE_DATA_API' ? 100 : 0;
+
+      // Selection is an advisory snapshot, so the first page's portfolio
+      // reservation is enforced again here, atomically with the run insert.
+      // Without this, two concurrent selectors could both observe one
+      // remaining unit and reserve 100 units each. The advisory lock is the
+      // same one continuation pages use, so first and later pages share one
+      // budget. Quota-free runs spend no official units and skip the check.
+      const portfolioRunStrategy = ['UCB_PORTFOLIO','UCB1_EXPLORATION','COLD_START_GENERATION'].includes(String(candidate.strategy))
+        || String(candidate.reason || '').startsWith('Bounded portfolio');
+      if (portfolioRunStrategy && scheduledProviderUnits > 0) {
+        await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, ['query-portfolio-budget']);
+        const [portfolioQuota, portfolioUsed, portfolioRatioSetting] = await Promise.all([
+          client.query(`SELECT daily_limit FROM quota_tracker WHERE id='youtube'`),
+          client.query(PORTFOLIO_UNITS_SQL),
+          client.query(`SELECT setting_value FROM app_settings WHERE setting_key='query_intelligence_portfolio_ratio'`),
+        ]);
+        const dailyQuotaUnits = Math.max(1, Number(portfolioQuota.rows[0]?.daily_limit || 10000) / 100);
+        const portfolioUnitsReserved = dailyQuotaUnits * boundedPortfolioRatio(
+          portfolioRatioSetting.rows[0]?.setting_value ?? process.env.QUERY_INTELLIGENCE_PORTFOLIO_RATIO ?? '0.15',
+        );
+        const portfolioUnitsUsed = Math.max(0, Number(portfolioUsed.rows[0]?.units || 0));
+        if (!portfolioContinuationAllowed({ portfolioUnitsUsed, portfolioUnitsReserved, nextPageUnits: scheduledProviderUnits / 100 })) {
+          if (canaryReservationId) {
+            await releaseRetrievalCanaryReservation(canaryReservationId, 'PORTFOLIO_BUDGET_EXHAUSTED', client);
+          }
+          // Release the frontier allocation in this transaction, not after it
+          // commits. The caller also retries the release, but a crash between
+          // commit and that call must not strand a reserved decision.
+          if (candidate.frontierDecisionId) {
+            const { releaseAllocationDecision } = await import('./discoveryFrontierAllocator');
+            if (!await releaseAllocationDecision(candidate.frontierDecisionId, 'PORTFOLIO_BUDGET_EXHAUSTED', client)) {
+              throw new Error('FRONTIER_ALLOCATION_RELEASE_FAILED');
+            }
+          }
+          await client.query(`UPDATE query_library SET reserved_at=NULL,reserved_until=NULL,reserved_by=NULL WHERE id=$1`, [candidate.query.id]);
+          flushDiagnostic({ selectedQueryId: candidate.query.id, provider: { providerKey: allocatedProvider.providerKey, capability: allocatedProvider.capability, quotaDomain: allocatedProvider.costDomain }, reservationOutcome: 'SKIPPED', reservationReasonCode: 'PORTFOLIO_BUDGET_EXHAUSTED', disposition: 'SKIPPED', reasonCode: 'PORTFOLIO_BUDGET_EXHAUSTED' });
+          continue;
+        }
+      }
+
       // Opt-in canary-trial initiation. The existing gate (kill switch, caps,
       // protections) stays fail-closed inside initiateCanaryTrial; a rejection
       // or error here is recorded on the run but never fails scheduling.
@@ -3790,7 +4211,60 @@ export async function completeQueryRun(runId: string, metrics: {
       await appendOutcomeWith(client,{eventKey:`query-run:${runId}:funnel:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_FUNNEL_RECORDED',verificationStatus:'PROVISIONAL',sourceEventKey:`query-run:${runId}:selected:v1`,queryId:run.rows[0].query_id,queryRunId:runId,jobId:row.job_id,country:row.country,retrievalLane:row.retrieval_lane,eventTime:iso(row.completed_at)!,payload:{...metrics}});
       await attributeCompletedCountryNativeRun(client,runId,metrics);
       await attributeCompletedExternalOsintRun(client,runId,metrics);
-      const attributionMetrics: QueryFunnelMetrics = {
+      // Q5 reward truth is result-level, not a page-local or cumulative
+      // counter: globally new (never seen before), persisted, confirmed
+      // creators attributed to this run, plus the quality subset.
+      const sightingTruth = await client.query(
+        `SELECT COUNT(DISTINCT s.channel_id) FILTER (
+           WHERE s.persisted AND NOT s.was_known AND s.country_outcome IN ('CONFIRMED','LIKELY') AND s.funnel_outcome='TRADING_CONFIRMED')::int AS confirmed_new,
+         COUNT(DISTINCT s.channel_id) FILTER (
+           WHERE s.persisted AND NOT s.was_known AND s.country_outcome IN ('CONFIRMED','LIKELY') AND s.funnel_outcome='TRADING_CONFIRMED'
+             AND c.quality_score>=${QUALITY_CREATOR_SCORE_THRESHOLD})::int AS quality_new,
+         COUNT(DISTINCT s.channel_id) FILTER (
+           WHERE s.persisted AND s.country_outcome IN ('CONFIRMED','LIKELY'))::int AS target_market_confirmed
+         FROM channel_sightings s LEFT JOIN channels c ON c.channel_id=s.channel_id
+         WHERE s.query_run_id=$1`, [runId]
+      );
+      const newConfirmedCreators = Number(sightingTruth.rows[0]?.confirmed_new || 0);
+      const newQualityCreators = Number(sightingTruth.rows[0]?.quality_new || 0);
+      const qualityVector = buildQueryQualityVector({
+        rawResults: metrics.rawResults,
+        distinctResults: metrics.distinctResults,
+        duplicateResults: metrics.duplicateResults,
+        knownChannels: metrics.knownChannels,
+        newChannels: metrics.newChannels,
+        newConfirmedCreators,
+        newQualityCreators,
+        countryRejected: metrics.countryRejected,
+        tradingConfirmed: metrics.tradingConfirmed,
+        qualityChannels: metrics.qualityChannels,
+        quotaUsed: metrics.quotaUsed,
+        // A rate-limited-only recovered run is degraded too: it paid for a
+        // provider failure and must not become an eligible reward sample.
+        providerDegraded: (metrics.providerRequestsFailed || 0) > 0
+          || (metrics.providerRateLimited || 0) > 0
+          || (!!metrics.providerRunOutcome && !/^SUCCESS(?:_|$)/.test(String(metrics.providerRunOutcome))),
+        failed: false,
+        // Target-market precision uses the explicit membership allow-list
+        // (CONFIRMED/LIKELY), matching the reward contract. UNKNOWN/UNCERTAIN
+        // results are not silently promoted to confirmed, so a run whose
+        // creators all have unknown countries reports 0% rather than 100%.
+        targetMarketConfirmed: Number(sightingTruth.rows[0]?.target_market_confirmed || 0),
+        languageMatchedConfirmed: null,
+      });
+      const generationMetadata = parseGenerationMetadata(row.generation_metadata);
+      const admission = generationMetadata.queryAdmission as QueryAdmission | undefined;
+      const attribution = buildAttribution({
+        termSense: String(row.primary_term || row.query || row.query_id || ''),
+        relation: String(generationMetadata.queryTemplate || 'SURFACE'),
+        compositionFamily: admission?.compositionFamily || 'family:UNKNOWN',
+        surface: String(row.query || ''),
+        country: String(row.country || ''),
+        market: admission?.market || 'UNKNOWN',
+        language: admission?.language || 'und',
+        vector: qualityVector,
+      });
+      const attributionMetrics: QueryFunnelMetrics & { qualityVector: typeof qualityVector; attribution: typeof attribution } = {
         rawResults: metrics.rawResults, distinctResults: metrics.distinctResults, duplicateResults: metrics.duplicateResults,
         knownChannels: metrics.knownChannels, newChannels: metrics.newChannels, inScopeNewChannels: metrics.inScopeNewChannels, countryRejected: metrics.countryRejected,
         nonTrading: metrics.nonTrading, uncertain: metrics.uncertain, needsReview: metrics.needsReview,
@@ -3801,7 +4275,9 @@ export async function completeQueryRun(runId: string, metrics: {
         noveltyRatio: metrics.distinctResults ? metrics.newChannels / metrics.distinctResults : 0,
         countryPrecision: metrics.distinctResults ? (metrics.distinctResults - metrics.countryRejected) / metrics.distinctResults : 0,
         tradingPrecision: (metrics.nonTrading + metrics.uncertain + metrics.needsReview + metrics.tradingConfirmed) ? metrics.tradingConfirmed / (metrics.nonTrading + metrics.uncertain + metrics.needsReview + metrics.tradingConfirmed) : 0,
-        performanceScore: metrics.performanceScore || 0
+        performanceScore: metrics.performanceScore || 0,
+        qualityVector,
+        attribution,
       };
       const marker = await client.query(`INSERT INTO query_run_accounting_attributions(query_run_id,query_id,attribution_version,performance_score,metrics) VALUES($1,$2,'query-run-accounting-v1',$3,$4) ON CONFLICT(query_run_id) DO NOTHING RETURNING query_run_id`, [runId, run.rows[0].query_id, metrics.performanceScore || 0, JSON.stringify(attributionMetrics)]);
       if (marker.rowCount) {
@@ -4559,7 +5035,7 @@ export async function updateQueryRunProgress(runId: string, patch: Partial<{
   effectiveBindingBound: QueryRunProgress['effectiveBindingBound'];
   resumeCount: number;
   resumeRewalkCount: number;
-}>): Promise<void> {
+}>, clientOverride?: { query: (sql: string, params?: unknown[]) => Promise<unknown> }): Promise<void> {
   const columns: string[] = [];
   const values: unknown[] = [];
   const add = (column: string, value: unknown) => {
@@ -4580,8 +5056,8 @@ export async function updateQueryRunProgress(runId: string, patch: Partial<{
   if (patch.resumeCount !== undefined) add('resume_count', patch.resumeCount);
   if (patch.resumeRewalkCount !== undefined) add('resume_rewalk_count', patch.resumeRewalkCount);
   if (!columns.length) return;
-  const db = await getDb();
-  await db.query(`UPDATE query_runs SET ${columns.join(',')} WHERE id=$1`, [runId, ...values]);
+  const runner = clientOverride || await getDb();
+  await runner.query(`UPDATE query_runs SET ${columns.join(',')} WHERE id=$1`, [runId, ...values]);
 }
 
 export async function markQueryRunDeferred(runId: string, status: 'DEFERRED_QUOTA' | 'DEFERRED_TIME', deferredUntil: string): Promise<void> {

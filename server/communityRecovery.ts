@@ -175,12 +175,16 @@ export async function reconcileLegacyCommunityRetryOwnership(
   now = new Date().toISOString()
 ): Promise<{ examined: number; completedNegative: number; closedNonCommunity: number; activeCommunity: number }> {
   const db = await getDb();
+  // Legacy rows persisted with retryable=true before REDIRECT_LIMIT became
+  // non-retryable must not own recovery: the sweep applies the same class
+  // exclusion as the current TS predicate, so such a job is closed instead of
+  // being reactivated for one more identical run.
   const result = await db.query(
     `SELECT j.id,j.status,j.payload,c.channel_id,c.scan_status,c.discord_status,c.discord_validation_status,c.inspection_trail,
             EXISTS(
               SELECT 1 FROM (
                 SELECT DISTINCT ON (o.provenance->>'surface',lower(rtrim(COALESCE(o.requested_url,''),'/')))
-                       o.provenance->>'surface' AS surface,o.outcome,o.retryable,COALESCE(o.provenance->>'required','false') AS required
+                       o.provenance->>'surface' AS surface,o.outcome,o.retryable,o.failure_class,COALESCE(o.provenance->>'required','false') AS required
                   FROM external_acquisition_observations o
                  WHERE o.channel_id=c.channel_id
                    AND o.observed_at >= COALESCE(c.last_checked,now()) - interval '5 minutes'
@@ -192,12 +196,13 @@ export async function reconcileLegacyCommunityRetryOwnership(
              WHERE effective.required='true'
                AND effective.outcome='ACQUISITION_FAILED'
                AND effective.retryable=true
+               AND COALESCE(effective.failure_class,'') <> 'REDIRECT_LIMIT'
                AND effective.surface IN('CHANNEL_EXTERNAL_LINKS','CREATOR_WEBSITES','SOCIAL_PROFILES','CHANNEL_LINKS','EXTERNAL_LINKS','LINKED_WEBSITES','CUSTOM_DOMAINS','SOCIAL_BIO')
             ) AS has_current_community_retryable_failure,
             EXISTS(
               SELECT 1 FROM (
                 SELECT DISTINCT ON (o.provenance->>'surface',lower(rtrim(COALESCE(o.requested_url,''),'/')))
-                       o.provenance->>'surface' AS surface,o.outcome,o.retryable,COALESCE(o.provenance->>'required','false') AS required
+                       o.provenance->>'surface' AS surface,o.outcome,o.retryable,o.failure_class,COALESCE(o.provenance->>'required','false') AS required
                   FROM external_acquisition_observations o
                  WHERE o.channel_id=c.channel_id
                    AND o.observed_at >= COALESCE(c.last_checked,now()) - interval '5 minutes'
@@ -209,6 +214,7 @@ export async function reconcileLegacyCommunityRetryOwnership(
              WHERE effective.required='true'
                AND effective.outcome='ACQUISITION_FAILED'
                AND effective.retryable=true
+               AND COALESCE(effective.failure_class,'') <> 'REDIRECT_LIMIT'
                AND effective.surface IN('YOUTUBE_ABOUT','RECENT_VIDEO_DESCRIPTIONS')
             ) AS has_current_upstream_retryable_failure
        FROM jobs j

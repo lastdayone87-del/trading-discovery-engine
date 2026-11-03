@@ -84,6 +84,23 @@ test('entity and dot obfuscation decode to real invites; obfuscation never inven
   assert.deepEqual(codeOf('Join discord\uFF0Egg/dotroom'), [], 'full-width dot is not decoded into a host');
 });
 
+test('percent-encoded hyphens inside invite codes decode without truncation', () => {
+  assert.deepEqual(codeOf('https://discord.gg/abc%2D123'), ['abc-123']);
+  assert.deepEqual(codeOf('https://discord.gg/abc%2d123'), ['abc-123'], 'decoding is case-insensitive');
+  assert.equal(discordInviteCodeOf('https://discord.gg/abc%2D123'), 'abc-123');
+  // Decoding a hyphen cannot create a Discord host inside another path or word:
+  // the host boundary still rejects embedded/lookalike references.
+  for (const input of [
+    'https://notdiscord%2Dgg/abc%2D123',
+    'https://example.com/discord%2Dgg/abc%2D123',
+  ]) {
+    assert.deepEqual(codeOf(input), [], input);
+  }
+  // Malformed percent sequences are plain-text replacements, never a decode
+  // call that can throw and abort extraction.
+  assert.doesNotThrow(() => codeOf('https://discord.gg/abc%ZZ123'));
+});
+
 test('alternative invite hosts remain eligible references (resolved by following the redirect)', () => {
   for (const host of ['dsc.gg', 'discord.me', 'discord.io']) {
     const candidates = extractDiscordCandidates(`Join https://${host}/altroom`, 'CREATOR_WEBSITES');

@@ -277,7 +277,9 @@ test('crawler keeps the prior 20-hop redirect budget with a distinct limit class
   );
   assert.equal(fetched.length, 20, 'crawler redirect chain is bounded at the previous 20-hop budget');
   assert.equal(result.observations[0]?.failureClass, 'REDIRECT_LIMIT');
-  assert.equal(result.observations[0]?.retryable, true);
+  // The same URL exhausts the fixed 20-hop budget deterministically, so an
+  // identical retry cannot complete and must not own community retry work.
+  assert.equal(result.observations[0]?.retryable, false);
 });
 
 test('crawler rejects stalled or unsupported final bodies without draining them', async () => {
