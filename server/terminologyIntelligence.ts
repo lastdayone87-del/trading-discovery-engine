@@ -50,7 +50,7 @@ export function decayWeight(observedAt: Date, now: Date, halfLifeDays: number): 
   return Math.pow(0.5, ageDays / Math.max(1, halfLifeDays));
 }
 
-export function decideLifecycle(input: { current: TerminologyLifecycle; decayedEvidence: number; distinctCreators: number; distinctCommunities: number; executions: number; decayedYield: number; termType: TerminologyTermType; term?: string; country?: string; language?: string }, policy = DEFAULT_TERMINOLOGY_POLICY): { status: TerminologyLifecycle; searchEligible: boolean; reason: string } {
+export function decideLifecycle(input: { current: TerminologyLifecycle; decayedEvidence: number; distinctCreators: number; distinctCommunities: number; executions: number; decayedYield: number; termType: TerminologyTermType; term?: string; country?: string; language?: string; requireTradingSemantics?: boolean }, policy = DEFAULT_TERMINOLOGY_POLICY): { status: TerminologyLifecycle; searchEligible: boolean; reason: string } {
   if (input.executions >= policy.demotionExecutions && input.decayedYield < policy.demotionYield)
     return { status: 'DEMOTED', searchEligible: false, reason: 'Sustained production yield fell below the configured demotion threshold.' };
   if (input.termType === 'BRAND') return { status: input.decayedEvidence >= policy.observedEvidence ? 'OBSERVED' : 'CANDIDATE', searchEligible: false, reason: 'Branding evidence is retained but cannot automatically become a search term.' };
@@ -58,7 +58,7 @@ export function decideLifecycle(input: { current: TerminologyLifecycle; decayedE
   // Evidence still accrues and the term may reach MULTI_CREATOR_VALIDATED,
   // but it can never become SEARCH_TRIAL/PROVEN_SEARCH_TERM while ineligible.
   if (input.term) {
-    const gate = isSearchableTradingTerm({ term: input.term, termType: input.termType, country: input.country, language: input.language });
+    const gate = isSearchableTradingTerm({ term: input.term, termType: input.termType, country: input.country, language: input.language, requireTradingSemantics: input.requireTradingSemantics });
     if (!gate.eligible) {
       const status: TerminologyLifecycle = input.distinctCreators >= policy.validationCreators && input.distinctCommunities >= policy.validationCommunities
         ? 'MULTI_CREATOR_VALIDATED'
@@ -1047,20 +1047,26 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
   // neither hazard. Namespace follows the codebase hashtext($1) convention.
   await runner.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`terminology-lifecycle:${termId}`]);
   const result = await runner.query(`SELECT t.*, COALESCE(o.distinct_creators,0)::int distinct_creators, COALESCE(o.distinct_communities,0)::int distinct_communities,
-    COALESCE(o.human_approved,0)::int human_approved, COALESCE(o.decayed_evidence,0)::float decayed_evidence,
+    COALESCE(o.human_approved,0)::int human_approved, COALESCE(o.decayed_evidence,0)::float decayed_evidence, COALESCE(o.governed_provenance,false) governed_provenance,
     COALESCE(p.executions,0)::int executions, COALESCE(p.decayed_yield,0)::float decayed_yield
     FROM canonical_trading_terms t LEFT JOIN LATERAL (SELECT COUNT(DISTINCT source_channel_id) FILTER (WHERE source_channel_id IS NOT NULL) distinct_creators,
       COUNT(DISTINCT community_fingerprint) FILTER (WHERE community_fingerprint IS NOT NULL) distinct_communities, COUNT(DISTINCT source_channel_id) FILTER (WHERE human_approved) human_approved,
+      BOOL_OR(source_provenance_family IN ('COUNTRY_VOCABULARY','STATIC_BOOTSTRAP','TRANSLATED_QUERY')) governed_provenance,
       SUM(evidence_weight * power(0.5, EXTRACT(EPOCH FROM (now()-observed_at))/86400/$2)) decayed_evidence FROM terminology_observations WHERE canonical_term_id=t.id) o ON true
     LEFT JOIN LATERAL (SELECT COALESCE(SUM(executions),0) executions, COALESCE(SUM(decayed_yield_score*executions)/NULLIF(SUM(executions),0),0) decayed_yield FROM terminology_performance WHERE canonical_term_id=t.id) p ON true WHERE t.id=$1`, [termId, policy.halfLifeDays]);
   if (!result.rows[0]) return;
   const row = result.rows[0];
+  // Country-vocabulary, static-bootstrap and translated surfaces are
+  // producer-authorized, exactly like the composition admission path: they
+  // still pass shape/script/CTA checks but are not required to repeat the
+  // learned-term semantic lexicon.
+  const requireTradingSemantics = !row.governed_provenance;
   // The gate needs the canonical surface. Test doubles and legacy fixtures
   // may omit it; in that case the existing legacy/native path is unchanged.
   const gate = String(row.canonical_term || '').trim()
-    ? isSearchableTradingTerm({ term: row.canonical_term, termType: row.term_type, country: row.country, language: row.language })
+    ? isSearchableTradingTerm({ term: row.canonical_term, termType: row.term_type, country: row.country, language: row.language, requireTradingSemantics })
     : null;
-  const decision = decideLifecycle({ current: row.lifecycle_status, decayedEvidence: row.decayed_evidence, distinctCreators: row.distinct_creators, distinctCommunities: row.distinct_communities, executions: row.executions, decayedYield: row.decayed_yield, termType: row.term_type, term: row.canonical_term, country: row.country, language: row.language }, policy);
+  const decision = decideLifecycle({ current: row.lifecycle_status, decayedEvidence: row.decayed_evidence, distinctCreators: row.distinct_creators, distinctCommunities: row.distinct_communities, executions: row.executions, decayedYield: row.decayed_yield, termType: row.term_type, term: row.canonical_term, country: row.country, language: row.language, requireTradingSemantics }, policy);
   // Native quality gate: applies whenever the term carries new-pipeline
   // (qualityVersion) evidence, whether entering eligibility or already
   // eligible. Legacy-only terms take the legacy path below byte-identically.
@@ -1101,11 +1107,16 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
   // judgment); earlier lifecycle states keep their status and only lose the
   // search flag. Observation evidence and counts are untouched.
   const gateRevokesExistingEligibility = Boolean(gate && !gate.eligible && (row.search_eligible || ['SEARCH_TRIAL', 'PROVEN_SEARCH_TERM'].includes(row.lifecycle_status)));
+  // A yield demotion can coincide with a term-shape revocation. Keep the
+  // DEMOTED status and its yield reason, and append the shape reason; the
+  // lifecycle event must remain a DEMOTION so the yield history is not lost.
+  const yieldDemoted = decision.status === 'DEMOTED';
   if (gateRevokesExistingEligibility && gate) {
+    const shapeReason = `term-shape-ineligible: ${gate.reasons.join(', ')}`;
     effectiveDecision = {
-      status: ['SEARCH_TRIAL', 'PROVEN_SEARCH_TERM'].includes(row.lifecycle_status) ? 'DEMOTED' : row.lifecycle_status,
+      status: yieldDemoted ? 'DEMOTED' : ['SEARCH_TRIAL', 'PROVEN_SEARCH_TERM'].includes(row.lifecycle_status) ? 'DEMOTED' : row.lifecycle_status,
       searchEligible: false,
-      reason: `term-shape-ineligible: ${gate.reasons.join(', ')}`,
+      reason: yieldDemoted ? `${decision.reason} ${shapeReason}` : shapeReason,
     };
   }
   // New promotions only: an already-PROVEN row keeps its status (and trust
@@ -1162,8 +1173,10 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
           ? `quality-gate revoked eligibility: ${entry.reasons.join('; ')}`
           : `quality-gate blocked trial entry: ${entry.reasons.join('; ')}`)
           + (gateRevokesExistingEligibility && gate ? `; term-shape-ineligible: ${gate.reasons.join(', ')}` : '');
-        // A Q0 gate revocation is an eligibility change, not a yield demotion.
-        const eventType = gateRevokesExistingEligibility ? 'ELIGIBILITY_CHANGE' : demoteFollows ? 'DEMOTION' : 'ELIGIBILITY_CHANGE';
+        // A Q0 gate revocation is an eligibility change, not a yield demotion;
+        // a legacy yield demotion that coincides with the gate stays a DEMOTION
+        // so the yield history is retained.
+        const eventType = yieldDemoted ? 'DEMOTION' : gateRevokesExistingEligibility ? 'ELIGIBILITY_CHANGE' : demoteFollows ? 'DEMOTION' : 'ELIGIBILITY_CHANGE';
         // Persist the effective status (which may include a Q0 gate demotion),
         // never the superseded legacy decision, so the row and event agree.
         const eventTo = demoteFollows ? effectiveDecision.status : row.lifecycle_status;
@@ -1197,7 +1210,7 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
   }
   if (!qualityBlocked && (effectiveDecision.status !== row.lifecycle_status || effectiveDecision.searchEligible !== row.search_eligible)) {
     const gateEvidenced = gateRevokesExistingEligibility && gate;
-    const eventType = gateEvidenced ? 'ELIGIBILITY_CHANGE' : effectiveDecision.status === 'DEMOTED' ? 'DEMOTION' : 'PROMOTION';
+    const eventType = yieldDemoted ? 'DEMOTION' : gateEvidenced ? 'ELIGIBILITY_CHANGE' : effectiveDecision.status === 'DEMOTED' ? 'DEMOTION' : 'PROMOTION';
     await runner.query('UPDATE canonical_trading_terms SET lifecycle_status=$2,search_eligible=$3,trust_tier=$4 WHERE id=$1', [termId, effectiveDecision.status, effectiveDecision.searchEligible, effectiveDecision.status === 'PROVEN_SEARCH_TERM' ? 1 : effectiveDecision.searchEligible ? 2 : 3]);
     await runner.query(`INSERT INTO terminology_lifecycle_events(canonical_term_id,from_status,to_status,event_type,reason,evidence_snapshot) VALUES($1,$2,$3,$4,$5,$6)`, [termId, row.lifecycle_status, effectiveDecision.status, eventType, effectiveDecision.reason, JSON.stringify({ distinctCreators: row.distinct_creators, distinctCommunities: row.distinct_communities, executions: row.executions, decayedEvidence: row.decayed_evidence, decayedYield: row.decayed_yield, ...(gateEvidenced && gate ? { searchabilityVersion: gate.version, searchabilityReasons: gate.reasons, searchabilityShape: gate.shape } : {}) })]);
   }

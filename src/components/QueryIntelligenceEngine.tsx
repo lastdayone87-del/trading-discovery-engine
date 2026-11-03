@@ -61,6 +61,10 @@ interface QualityDashboardRun {
 interface QualityDashboard {
   version: string;
   generatedAt: string;
+  /** Maximum number of run rows the projection returns. */
+  rowLimit: number;
+  /** True when older runs were omitted; every total covers the visible rows. */
+  truncated: boolean;
   portfolio: { dailyQuotaUnits: number; portfolioRatio: number; portfolioUnitsReserved: number; portfolioUnitsUsed: number; countryUnitsUsed: number | null; portfolioShareUsed: number; withinBudget: boolean };
   totals: { runs: number; completedRuns: number; pendingRuns: number; failedRuns: number; accountedRuns: number; unaccountedCompletedRuns: number; newConfirmedCreators: number; newQualityCreators: number; quotaUnits: number; confirmedNewCreatorsPer100Quota: number; zeroConfirmRuns: number; zeroConfirmShare: number; targetMarketPrecision: number | null; duplicateRatio: number; providerDegradedRuns: number };
   selection: { strategies: Record<string, number>; stopReasons: Array<{ reason: string; count: number }>; stopReasonCoverage: number; admissionRejections: Array<{ reason: string; count: number }>; admissionTiers: Record<string, number>; compositionFamilies: Record<string, number> };
@@ -118,12 +122,17 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
   const qualitySequence = useRef(0);
   const selectedCountryRef = useRef(selectedCountry);
   selectedCountryRef.current = selectedCountry;
+  // The quality projection is an expensive read. Poll it only while its tab is
+  // visible; the ref keeps the interval callback on the current tab.
+  const activeSubTabRef = useRef(activeSubTab);
+  activeSubTabRef.current = activeSubTab;
 
   // Fetch data
   const fetchData = async () => {
     const requestId = ++fetchSequence.current;
     const qualityRequestId = ++qualitySequence.current;
     const requestCountry = selectedCountry;
+    const includeQuality = activeSubTabRef.current === 'quality';
     try {
       const qualityUrl = requestCountry === 'All'
         ? '/api/query-intelligence/quality-dashboard'
@@ -137,42 +146,44 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
         apiFetch('/api/query-intelligence/logs').catch(() => null),
         apiFetch('/api/query-intelligence/status').catch(() => null),
         apiFetch('/api/query-intelligence/scope').catch(() => null),
-        apiFetch(qualityUrl).catch(() => null)
+        includeQuality ? apiFetch(qualityUrl).catch(() => null) : Promise.resolve(null)
       ]);
 
       // The quality projection carries its own error state: apiFetch resolves
       // on HTTP 4xx/5xx, so checking `ok` alone would silently drop the error.
-      let quality: QualityDashboard | null = null;
-      let qualityError: string | null = null;
-      if (!qualityRes) {
-        qualityError = 'Unable to reach the query-quality projection.';
-      } else if (qualityRes.ok) {
-        try {
-          quality = await qualityRes.json();
-        } catch {
-          qualityError = 'The query-quality projection returned an unreadable response.';
-        }
-      } else {
-        let detail: string | null = null;
-        try {
-          const body = await qualityRes.json();
-          if (body && typeof body.error === 'string') detail = body.error;
-        } catch {
-          // Non-JSON error bodies fall back to the HTTP status below.
-        }
-        qualityError = detail
-          || `The query-quality projection failed (${qualityRes.status}${qualityRes.statusText ? ` ${qualityRes.statusText}` : ''}).`;
-      }
-      // Quality commits independently of the full-fetch sequence. A stale
-      // country response still loses: both its request sequence and the live
-      // selected country must match.
-      if (qualityRequestId === qualitySequence.current && requestCountry === selectedCountryRef.current) {
-        if (quality) {
-          setQualityDashboard(quality);
-          setQualityDashboardCountry(requestCountry);
-          setQualityDashboardError(null);
+      if (includeQuality) {
+        let quality: QualityDashboard | null = null;
+        let qualityError: string | null = null;
+        if (!qualityRes) {
+          qualityError = 'Unable to reach the query-quality projection.';
+        } else if (qualityRes.ok) {
+          try {
+            quality = await qualityRes.json();
+          } catch {
+            qualityError = 'The query-quality projection returned an unreadable response.';
+          }
         } else {
-          setQualityDashboardError(qualityError);
+          let detail: string | null = null;
+          try {
+            const body = await qualityRes.json();
+            if (body && typeof body.error === 'string') detail = body.error;
+          } catch {
+            // Non-JSON error bodies fall back to the HTTP status below.
+          }
+          qualityError = detail
+            || `The query-quality projection failed (${qualityRes.status}${qualityRes.statusText ? ` ${qualityRes.statusText}` : ''}).`;
+        }
+        // Quality commits independently of the full-fetch sequence. A stale
+        // country response still loses: both its request sequence and the live
+        // selected country must match.
+        if (qualityRequestId === qualitySequence.current && requestCountry === selectedCountryRef.current) {
+          if (quality) {
+            setQualityDashboard(quality);
+            setQualityDashboardCountry(requestCountry);
+            setQualityDashboardError(null);
+          } else {
+            setQualityDashboardError(qualityError);
+          }
         }
       }
 
@@ -217,7 +228,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
     fetchData();
     const interval = setInterval(fetchData, 10000); // refresh every 10s
     return () => clearInterval(interval);
-  }, [selectedCountry]);
+  }, [selectedCountry, activeSubTab]);
 
   // Handle Pause / Resume toggle
   const handleTogglePause = async () => {
@@ -836,6 +847,11 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
                 {qualityDashboardError && (
                   <div className="p-3 text-xs bg-rose-50 dark:bg-rose-900/20 border border-rose-200 dark:border-rose-800 rounded-xl text-rose-700 dark:text-rose-300">
                     Showing the last successful projection. Refresh failed: {qualityDashboardError}
+                  </div>
+                )}
+                {qualityDashboard.truncated && (
+                  <div className="p-3 text-xs bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-xl text-amber-700 dark:text-amber-300">
+                    Showing the most recent {qualityDashboard.rowLimit} runs. Older runs are omitted, and every figure above covers only these rows.
                   </div>
                 )}
                 <p className="text-xs text-slate-500 dark:text-slate-400">

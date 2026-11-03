@@ -18,16 +18,16 @@ export class MultilingualContextProvider implements EvidenceProvider {
     const hasCreatorTradingPractice = execution.length > 0 || education.length > 0;
     const items: EvidenceItem[] = [];
     const now = new Date().toISOString();
-    // C1a: retrieval provenance is never attributable evidence. A phrase can
-    // span two documents in the joined channel text; attribute it to the
-    // documents that contain its parts rather than emitting evidence with an
-    // empty field list.
+    // C1a: retrieval provenance is never attributable evidence. Attribute a
+    // phrase only to documents that individually contain it (or a significant
+    // part of it); a phrase that exists only in the joined channel text spans
+    // documents and must not satisfy the independence gate.
     const attributableDocuments=(input.evidence_corpus||[]).filter(document=>document.field!=='search_match_context');
     const fieldsFor=(terms:string[])=>{
       const exact=attributableDocuments.filter(document=>terms.some(term=>matchedTerms(document.text,[term]).length>0));
       if(exact.length)return exact.map(documentRef);
       const partial=attributableDocuments.filter(document=>terms.some(term=>String(term).split(/\s+/u).some(part=>part.length>2&&matchedTerms(document.text,[part]).length>0)));
-      return (partial.length?partial:attributableDocuments).map(documentRef);
+      return partial.map(documentRef);
     };
 
     if (hasCreatorTradingPractice) {

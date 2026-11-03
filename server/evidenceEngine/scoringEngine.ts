@@ -113,7 +113,7 @@ export class ConfigurableWeightedStrategy {
 
     const providerCoverage = evidenceCollection.providers.filter(provider => provider.availability === 'AVAILABLE').length;
     const evidenceCount = evidenceItems.filter(item => item.rawMatches.length > 0 && item.category !== 'SEMANTIC_ABSTENTION').length;
-    const classificationMethod: VerificationDecision['classificationMethod'] = semanticItem
+    const classificationMethod: VerificationDecision['classificationMethod'] = semanticItem && semanticItem.category !== 'SEMANTIC_ABSTENTION'
       ? semanticItem.source === 'groq_semantic' ? 'SEMANTIC_GROQ'
         : semanticItem.source === 'gemini_free_semantic' ? 'SEMANTIC_GEMINI_FREE' : 'SEMANTIC_GEMINI'
       : recognition

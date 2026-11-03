@@ -28,6 +28,16 @@ export type SimulationScenario =
 
 export type SimulatedSelector = 'current_ucb1' | 'hierarchical_ucb_c1' | 'hierarchical_ucb_c2' | 'independent_ts' | 'hierarchical_ts';
 
+/**
+ * The serving selector. The frozen UCB1 baseline and the TS comparators are
+ * offline counterfactuals, so serving-only behaviour such as the portfolio
+ * exploration floor must not override their choices.
+ */
+export const SERVING_SELECTOR: SimulatedSelector = 'hierarchical_ucb_c2';
+
+/** Maximum reachable confirmations per quota unit in the synthetic world. */
+const SIM_MAX_ARM_RATE = 5;
+
 export interface SimulationConfig {
   scenario: SimulationScenario;
   seeds: number;
@@ -134,7 +144,7 @@ function buildWorld(config: SimulationConfig, seed: number): CountrySimState[] {
         const armEffect = normal(rng) * params.armSd;
         const lambda = rng() < params.zeroFraction
           ? 0
-          : Math.min(5, Math.max(0.01, params.baseRate * Math.exp(familyEffects[family] + countryEffects[country] + armEffect)));
+          : Math.min(SIM_MAX_ARM_RATE, Math.max(0.01, params.baseRate * Math.exp(familyEffects[family] + countryEffects[country] + armEffect)));
         const shiftRoll = rng();
         const shiftRate = params.stationary || lambda <= 0
           ? null
@@ -434,7 +444,11 @@ export function runSelectorSimulation(config: SimulationConfig, selector: Simula
       portfolioRatio,
       baselineQuotaUnits,
     });
-    if (portfolio) portfolioQuotaUnits += quotaUnits;
+    // Only the serving selector applies the portfolio floor. Applying it to
+    // the UCB1/TS comparators would replace their own choice on admitted
+    // pulls with the same sd-priority pick, confounding the comparison.
+    const portfolioApplies = portfolio && selector === SERVING_SELECTOR;
+    if (portfolioApplies) portfolioQuotaUnits += quotaUnits;
     // Cold-start coverage: each country's first arm is forced before index
     // play. The cursor is read here, not merely advanced, so the comment and
     // behavior agree.
@@ -450,7 +464,7 @@ export function runSelectorSimulation(config: SimulationConfig, selector: Simula
     const uncapped = country.arms.filter(arm =>
       ((familyPulls.get(arm.family) || 0) + 1) / Math.max(1, step + 1) <= SIM_FAMILY_SHARE_CAP);
     const arm = coldStartArm
-      || chooseArm(selector, uncapped.length ? uncapped : country.arms, aggregates, priorFor(aggregates), rng, portfolio, c);
+      || chooseArm(selector, uncapped.length ? uncapped : country.arms, aggregates, priorFor(aggregates), rng, portfolioApplies, c);
     const effectiveLambda = !scenarioParameters(config.scenario).stationary && step > pulls * 0.6 && arm.shiftRate != null
       ? arm.shiftRate
       : arm.lambda;
@@ -461,7 +475,12 @@ export function runSelectorSimulation(config: SimulationConfig, selector: Simula
     arm.confirmed += confirmed;
     arm.quotaUnits += quotaUnits;
     arm.pulls += 1;
-    arm.lastRate = quotaUnits > 0 ? confirmed / quotaUnits : 0;
+    // `lastRate` stands in for production's normalized performance score
+    // (`performance_score / 100`), so it is expressed on the same [0,1] axis:
+    // raw confirmed-per-quota yield divided by the synthetic maximum rate.
+    arm.lastRate = quotaUnits > 0
+      ? Math.min(1, confirmed / quotaUnits / SIM_MAX_ARM_RATE)
+      : 0;
     recordAggregateDelta(aggregates, arm, {
       confirmed,
       quality: confirmed * 0.8,

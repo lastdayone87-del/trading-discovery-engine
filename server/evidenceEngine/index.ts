@@ -178,7 +178,9 @@ export async function executeSemanticChain(
       reports.push({ provider: provider.name, availability: 'FAILED', evidenceCount: 0,
         outcome: timeout ? 'FAILED_TIMEOUT' : 'FAILED_PROVIDER',
         reasonCodes: safeProviderFailureReasonCodes(err, timeout),
-        reason: `Provider failure (${String(err?.errorClass || 'UNKNOWN')})${err?.errorClass ? '' : `: ${String(err?.message || err).slice(0, 240)}`}.`,
+        // Keep the report to the error class; raw provider SDK messages can
+        // carry request details and remain on the existing log line only.
+        reason: `Provider failure (${String(err?.errorClass || 'UNKNOWN')}).`,
         durationMs: Date.now() - started,
         ...(failedOrg ? { orgId: failedOrg } : {}) });
       priorFailed = true;

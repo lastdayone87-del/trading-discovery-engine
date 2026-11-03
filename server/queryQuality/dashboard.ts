@@ -158,7 +158,11 @@ export function buildQueryQualityDashboard(input: {
   };
   rows: QueryQualityDashboardRunInput[];
 }): QueryQualityDashboard {
-  const rows: QueryQualityDashboardRun[] = input.rows.map(row => {
+  // The route fetches one extra row to distinguish "exactly at the limit"
+  // from "more rows were omitted". Slice before computing totals so every
+  // reported aggregate is over the same visible window.
+  const truncated = input.rows.length > QUERY_QUALITY_DASHBOARD_MAX_ROWS;
+  const rows: QueryQualityDashboardRun[] = input.rows.slice(0, QUERY_QUALITY_DASHBOARD_MAX_ROWS).map(row => {
     const qualityVector = normalizeVector(row.qualityVector);
     return { ...row, qualityVector, accounted: row.status === 'COMPLETED' && qualityVector !== null };
   });
@@ -253,7 +257,7 @@ export function buildQueryQualityDashboard(input: {
     version: QUERY_QUALITY_DASHBOARD_VERSION,
     generatedAt: input.generatedAt,
     rowLimit: QUERY_QUALITY_DASHBOARD_MAX_ROWS,
-    truncated: rows.length >= QUERY_QUALITY_DASHBOARD_MAX_ROWS,
+    truncated,
     portfolio: {
       dailyQuotaUnits,
       portfolioRatio: dailyQuotaUnits > 0 ? portfolioUnitsReserved / dailyQuotaUnits : 0,

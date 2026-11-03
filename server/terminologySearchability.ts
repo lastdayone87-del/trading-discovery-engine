@@ -293,7 +293,9 @@ function scriptCompatible(country: string | null | undefined, scripts: Set<strin
   // GLOBAL atoms are deliberately not country-scoped; their language is
   // checked by the caller against the candidate country profile.
   if (!country || country === 'GLOBAL' || scripts.size === 0) return true;
-  const configured = COUNTRY_SCRIPTS[country];
+  // Own-key check: a plain-object lookup would resolve inherited keys such as
+  // "constructor" to a truthy non-Set value and make `.has` throw.
+  const configured = Object.hasOwn(COUNTRY_SCRIPTS, country) ? COUNTRY_SCRIPTS[country] : undefined;
   if (configured) return [...scripts].every(script => script === 'Zyyy' || configured.has(script));
   if (LATIN_COUNTRIES.has(country)) return [...scripts].every(script => script === 'Zyyy' || script === 'Latn');
   // Unsupported/unknown country: script compatibility alone must not reject

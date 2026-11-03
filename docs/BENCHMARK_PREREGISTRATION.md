@@ -71,18 +71,24 @@ path the frozen CONTROL arm of the selection experiment. CONTROL therefore
 runs the same hierarchical selector as production and is never served by the
 treatment arms.
 
-The UCB1 parameters below are retained as the retired formula and as the
-offline simulator comparator (`server/queryQuality/simulator.ts`,
+The UCB1 parameters listed under “retired formula” below are retained only as
+the offline simulator comparator (`server/queryQuality/simulator.ts`,
 `currentUcb1Index`). They are not the experiment control.
 
 Implementation: `server/queryIntelligence.ts:selectNextQueryForCountry`; hierarchical selector `server/queryQuality/selector.ts`.
 
 Frozen control parameters (literals):
 
-- Exploration constant: `explorationConst = 0.8`, hardcoded (`queryIntelligence.ts:368`); term `0.8 * sqrt(log(totalExecutions+1) / (times_executed+1))` (`:369`); score `max(0, normPerformance + ucbTerm)`, `normPerformance = performance_score/100` (`:365-370`); stored `ucb_score = round(ucbScore*100)/100` (`:374`); descending sort (`:379`).
-- Stochastic exploration gate: `explorationRatio` default `'0.4'`, clamp `[0.1,0.9]` (`:330`); `isExploration = Math.random() < explorationRatio` (`:452`); exploration branch filters `collection==='EXPERIMENTAL'`, sorts `times_executed ASC, ucb_score DESC` (`:456-463`).
-- Cold start: empty query set → `generateCandidateQueriesForCountry(country,4,'COLD_START')`, strategy `COLD_START_GENERATION` (`:333-342`); empty eligible set → 4 `EXPLORATION` candidates, strategy `UCB1_EXPLORATION` (`:348-357`); generator default `count=3`, upserts `collection:'EXPERIMENTAL'` (`:482-525`).
-- Eligibility gates (pre-UCB): `collection!=='REJECTED'`, `reserved_until`/`next_eligible_at` null or past (`:321-327`); cooldown `query_intelligence_query_cooldown_minutes`, default `'360'`, `max(1,…)` (`:328`); primary-term cap `query_intelligence_primary_term_max_uses`, default `'2'` (`:329`); `queriesOutsideCooldown` + `limitRepeatedPrimaryTerms` + `rotateAwayFromMostRecentIntent` (`queryPlanner.ts:117-138`); authority reject → `REJECTED` + skip (`autonomousDiscovery.ts:601-620`, rules `autonomousQueryAuthority.ts:107-151`); batch diversity guard (`autonomousDiscovery.ts:622-632`); reservation `reserved_until=now()+20min`, zero-rows skip (`dbCore.ts:1852-1866`); provider must be `ACTIVE/ACTIVE_GLOBAL/CANARY` (+`SHADOW` only explicit Brave canary) (`dbCore.ts:1829-1834`).
+- Selector versions: `SELECTOR_POLICY_VERSION='hierarchical-ucb-v1'` (`posterior.ts:4`) and `QUERY_PORTFOLIO_VERSION='query-portfolio-v1'` (`selector.ts:22`); `verifyFrozenBenchmarkVersions()` fails closed if either changes.
+- Exploration constant: `SELECTOR_C=2.0` (`posterior.ts:5`); index `mean + c*sd`, capped at `MAX_SELECTION_INDEX=4.0`; `hierarchical_ucb_c1` (c=1.0) is a calibration comparator, not the control.
+- Prior/hierarchy: `QUERY_POSTERIOR_VERSION='gamma-poisson-hierarchy-v1'`; partial-pooling weights `global 0.20 / family 0.35 / country 0.20 / market 0.15 / language 0.10`; smoothing `2.0`; decay half-life `30` days; `MIN_SELECTION_SAMPLE=2`.
+- Portfolio floor: `PORTFOLIO_RATIO=0.15`, clamped to `[0.10,0.20]`; `PORTFOLIO_PAGE_UNITS=1` (100 quota units = 1 normalized unit).
+- Admission: Q0–Q8 `revalidateQueryRecordAdmission` gates (shape, script, CTA, country, tier) before index play.
+- Retired UCB1 formula (offline simulator comparator only; not the control):
+  - Exploration constant: `explorationConst = 0.8`, hardcoded (`queryIntelligence.ts:368`); term `0.8 * sqrt(log(totalExecutions+1) / (times_executed+1))` (`:369`); score `max(0, normPerformance + ucbTerm)`, `normPerformance = performance_score/100` (`:365-370`); stored `ucb_score = round(ucbScore*100)/100` (`:374`); descending sort (`:379`).
+  - Stochastic exploration gate: `explorationRatio` default `'0.4'`, clamp `[0.1,0.9]` (`:330`); `isExploration = Math.random() < explorationRatio` (`:452`); exploration branch filters `collection==='EXPERIMENTAL'`, sorts `times_executed ASC, ucb_score DESC` (`:456-463`).
+  - Cold start: empty query set → `generateCandidateQueriesForCountry(country,4,'COLD_START')`, strategy `COLD_START_GENERATION` (`:333-342`); empty eligible set → 4 `EXPLORATION` candidates, strategy `UCB1_EXPLORATION` (`:348-357`); generator default `count=3`, upserts `collection:'EXPERIMENTAL'` (`:482-525`).
+- Eligibility gates (pre-selector): `collection!=='REJECTED'`, `reserved_until`/`next_eligible_at` null or past (`:321-327`); cooldown `query_intelligence_query_cooldown_minutes`, default `'360'`, `max(1,…)` (`:328`); primary-term cap `query_intelligence_primary_term_max_uses`, default `'2'` (`:329`); `queriesOutsideCooldown` + `limitRepeatedPrimaryTerms` + `rotateAwayFromMostRecentIntent` (`queryPlanner.ts:117-138`); authority reject → `REJECTED` + skip (`autonomousDiscovery.ts:601-620`, rules `autonomousQueryAuthority.ts:107-151`); batch diversity guard (`autonomousDiscovery.ts:622-632`); reservation `reserved_until=now()+20min`, zero-rows skip (`dbCore.ts:1852-1866`); provider must be `ACTIVE/ACTIVE_GLOBAL/CANARY` (+`SHADOW` only explicit Brave canary) (`dbCore.ts:1829-1834`).
 - Quota/cost: per-key `YOUTUBE_DAILY_QUOTA_PER_KEY||'10000'` (`dbCore.ts:651`); autonomous share default `70`, range `[1,100]` (`autonomousDiscovery.ts:100-108`); capacity `min(batchSize, max(0,target-current))` (`discoverySchedulerPolicy.ts:29-37`); execution reserves 100 units `AUTONOMOUS_QUERY_PAGE` (`queueManager.ts:615-618`); `YOUTUBE_INNERTUBE_FREE` reserves nothing; Brave uses provider-request ledger (`:602-634`); `quotaConsumed = providerCostUsd>0 || INNERTUBE_FREE ? 0 : pageNumber*100` (`:824`); pagination caps `autonomous_pagination_max_pages='3'`, `autonomous_pagination_max_low_yield_pages='2'` (`:691-702`).
 - Allocation semantics: control `allocationOrigin='LEGACY'`, no frontier decision id/dimensions (`autonomousDiscovery.ts:633-658`); provider rotation stable per `scheduled:${query.id}:${country}` (`dbCore.ts:1787-1822`); lane/ordering deficit allocator, video-lane target 70 (`retrievalLanes.ts:4-6`, default `discovery_video_lane_percent`), ordering `CHANNEL=>RELEVANCE`, video date target `max(configured '10', recency floor '60')` (`searchOrdering.ts:15-27`).
 - Attribution semantics: `completeQueryRun` sets `COMPLETED/quota_used/provider_*/performance_details`, idempotent `query_run_accounting_attributions` (`attribution_version='query-run-accounting-v1'`), updates `query_library` + `query_execution_logs` + terminology attribution (`dbCore.ts:2841-2903`); funnel→score `100*(0.30 tradingPrecision + 0.25 noveltyRatio + 0.20 qualityYield + 0.15 countryPrecision + 0.10 communityYield)` (`queryPerformance.ts:90-96`); quality = `TRADING_CONFIRMED && score>=55` (`:6-10`); promotion `>=60=>PROVEN`, `<25 && runs>=2=>REJECTED` (`:135-141`).
@@ -168,6 +174,10 @@ No frozen corpus/snapshot exists at preregistration time. Pool construction is f
 
 | Parameter | Frozen value | Source |
 |---|---|---|
+| Hierarchical selector policy | `hierarchical-ucb-v1` (frozen) | `server/queryQuality/posterior.ts:4` |
+| Query portfolio policy | `query-portfolio-v1` (frozen) | `server/queryQuality/selector.ts:22` |
+| Selector exploration constant | `c=2.0`; index cap `4.0` | `server/queryQuality/posterior.ts:5` |
+| Portfolio share | `0.15`, clamp `[0.10,0.20]`; 1 page = 1 unit | `server/queryQuality/posterior.ts:7-9,22` |
 | UCB1 exploration constant (retired; offline comparator only) | `0.8` hardcoded | `server/queryQuality/simulator.ts:currentUcb1Index` |
 | Exploration ratio | default `'0.4'`, clamp `[0.1,0.9]` | `queryIntelligence.ts:330` |
 | Query cooldown minutes | default `'360'`, `max(1,…)` | `queryIntelligence.ts:328` |

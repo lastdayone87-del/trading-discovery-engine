@@ -32,6 +32,12 @@ export interface CompositionContext {
   history?: Array<{ query: string; country: string; aliasOf?: string }>;
   policyVersions?: Record<string, string>;
   now?: string;
+  /**
+   * The row carries a live operator scope-promotion marker. A registered but
+   * dormant country may then sweep while it remains selected; removing the
+   * selection restores dormant behaviour (execution authority rechecks it).
+   */
+  scopeAuthorized?: boolean;
 }
 
 export function normalizeCompositionTerm(term: string): string {
@@ -222,7 +228,7 @@ export function compositionFamilyFor(atoms: QueryAtom[]): string {
   return `family:${types.join('+') || 'EMPTY'}`;
 }
 
-export function candidateHash(candidate: QueryCandidate): string {
+export function candidateHash(candidate: QueryCandidate, tier: QueryCompositionTier = candidate.tier): string {
   return createHash('sha256').update(JSON.stringify({
     query: normalizeCompositionTerm(candidate.query),
     country: candidate.country,
@@ -242,7 +248,7 @@ export function candidateHash(candidate: QueryCandidate): string {
       instrumentClass: atom.sense.instrumentClass,
       attestationIds: [...atom.sense.attestationIds].sort(),
     })),
-    tier: candidate.tier,
+    tier,
     family: candidate.compositionFamily,
   })).digest('hex').slice(0, 24);
 }
@@ -272,7 +278,7 @@ export function evaluateQueryComposition(candidate: QueryCandidate, context: Com
   // Registration only proves the country is known to the fixture. Dormant
   // markets (for example Italy, Japan, Spain and the UAE) must not reach
   // selection and spend quota unless production explicitly configures them.
-  if (isRegisteredCountry(candidate.country) && !isProductionConfiguredCountry(candidate.country)) {
+  if (isRegisteredCountry(candidate.country) && !isProductionConfiguredCountry(candidate.country) && !context.scopeAuthorized) {
     reasons.push('COUNTRY_NOT_PRODUCTION_CONFIGURED');
   }
   if (!normalized || tokens.length === 0) reasons.push('EMPTY_QUERY');
@@ -311,7 +317,8 @@ export function evaluateQueryComposition(candidate: QueryCandidate, context: Com
   const resolvedTier = resolveCompositionTier(candidate, { ...context, profile });
   if (resolvedTier === 'SPECULATIVE') reasons.push('SPECULATIVE_EVIDENCE_ONLY');
   // Tier fields are derived, never trusted from a producer-supplied label.
-  if (candidate.tier !== resolvedTier) candidate.tier = resolvedTier;
+  // The gate is pure, so the derived tier is returned to the caller rather
+  // than written back onto the caller's candidate.
 
   return {
     eligible: reasons.length === 0,
@@ -325,7 +332,7 @@ export function admitQueryCandidate(candidate: QueryCandidate, context: Composit
   const decision = evaluateQueryComposition(candidate, context);
   return {
     version: QUERY_ADMISSION_VERSION,
-    candidateHash: candidateHash(candidate),
+    candidateHash: candidateHash(candidate, decision.tier),
     eligible: decision.eligible,
     tier: decision.tier,
     reasonCodes: decision.reasonCodes,

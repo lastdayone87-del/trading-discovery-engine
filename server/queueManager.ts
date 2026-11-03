@@ -1359,7 +1359,7 @@ export async function processNextSearchJob(
 
         // Incremental Treatment Page Quota Reservation Boundary
         if (retrievalTreatmentOrigin === 'CANARY_TREATMENT' && pageNumber >= 1) {
-          const incRes = await reserveIncrementalTreatmentPageQuota({ queryRunId, pageNumber: pageNumber + 1, providerQuotaUnits: allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE' ? 0 : 100 });
+          const incRes = await reserveIncrementalTreatmentPageQuota({ queryRunId, pageNumber: pageNumber + 1, providerQuotaUnits: allocatedProvider.costDomain==='YOUTUBE_DATA_API' ? 100 : 0 });
           if (!incRes.authorized) {
             console.log(`[Phase 9 Continuation] Incremental page continuation denied by treatment quota caps for run ${queryRunId}: ${incRes.reason}`);
             await completeJob(job.id);
@@ -1377,12 +1377,13 @@ export async function processNextSearchJob(
         const continuationDb = await getDb();
         const continuationClient = await continuationDb.connect();
         let portfolioPage: { authorized: boolean; reason: string };
+        let continuationCommitted = false;
         try {
           await continuationClient.query('BEGIN');
           portfolioPage = await reservePortfolioContinuationPage({
             queryRunId,
             pageNumber: pageNumber + 1,
-            providerQuotaUnits: allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE' ? 0 : 100,
+            providerQuotaUnits: allocatedProvider.costDomain==='YOUTUBE_DATA_API' ? 100 : 0,
             clientOverride: continuationClient,
           });
           if (portfolioPage.authorized) {
@@ -1401,11 +1402,20 @@ export async function processNextSearchJob(
               clientOverride: continuationClient,
             });
             await continuationClient.query('COMMIT');
+            continuationCommitted = true;
           } else {
             await continuationClient.query('ROLLBACK');
           }
         } catch (error) {
           await continuationClient.query('ROLLBACK').catch(() => undefined);
+          // `enqueueChildAndCommitPageReservation` releases the page
+          // reservation through this transaction's client; that release is
+          // undone by the ROLLBACK. Release it again in its own transaction so
+          // a failed continuation cannot keep the canary slot reserved.
+          if (incPageReservationId && !continuationCommitted) {
+            await releaseIncrementalTreatmentPageReservation(incPageReservationId, queryRunId)
+              .catch(releaseError => console.warn('[Phase 9 Continuation] Failed to release treatment page reservation after rollback:', releaseError));
+          }
           throw error;
         } finally {
           continuationClient.release();

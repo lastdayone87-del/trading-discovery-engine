@@ -87,7 +87,10 @@ const NON_LATIN_SCRIPT_PATTERNS: RegExp[] = [
 ];
 
 export function hasCoveredNonLatinScript(value: string): boolean {
-  const normalized = String(value || '').normalize('NFKC').replace(/[\u{1D400}-\u{1D7FF}]/gu, ' ');
+  // Strip Mathematical Alphanumeric Symbols before NFKC: normalization would
+  // otherwise fold them into ordinary Greek/Latin letters and defeat the
+  // decorative-symbol exclusion.
+  const normalized = String(value || '').replace(/[\u{1D400}-\u{1D7FF}]/gu, ' ').normalize('NFKC');
   return NON_LATIN_SCRIPT_PATTERNS.some(pattern => {
     const matches = normalized.match(new RegExp(pattern.source, 'gu')) || [];
     return matches.length >= 2;

@@ -44,7 +44,9 @@ export function isExplicitCreatorTradingText(text: string, context: LayeredKnowl
     .filter(term => !GENERIC_TRADING_TERM.test(term.trim()));
   const hasLanguageTradingSignal = languagePositiveTerms.some(term => textMatchesTerm(normalized, term));
   const hasCountryTradingSignal = (context.countryKnowledge?.nativeTradingTerminology || []).some(term => textMatchesTerm(normalized, term));
-  const hasTierASignal = matchedTierATradingSignals(normalized, context).some(signal => signal !== 'KNOWN_METHOD');
+  // Generic method/education phrases (including native ones) are not Tier A
+  // evidence by themselves; the independent-context checks below handle them.
+  const hasTierASignal = matchedTierATradingSignals(normalized, context).some(signal => !['KNOWN_METHOD', 'NATIVE_METHOD', 'NATIVE_EDUCATION'].includes(signal));
   const hasFinancialQualifier = FINANCIAL_QUALIFIER_PATTERN.test(normalized) || TRADER_DOMAIN_PHRASE.test(normalized);
   // "Trader Joe's" is a grocery brand, not a trading creator. Excluding the
   // brand before any other signal avoids both the generic-literal path and
@@ -172,16 +174,19 @@ export class VideoMetadataProvider implements EvidenceProvider {
       ...matchedPlatformsInVideos,
       ...matchedConceptsInVideos,
     ].map(normalizedSignalKey)).size;
-    // Tier A corroboration must come from more than one video. One title that
-    // matches two categories (e.g. "Trading strategy") cannot establish
-    // multi-video consistency by itself.
-    const tierASignalsAcrossVideos = [...tierASignalVideos.values()].filter(videos => videos.size >= 2).length;
+    // Tier A corroboration must come from more than one video, and repeated
+    // generic method/education phrases collapse to one non-specific signal.
+    // One high-specificity signal (for example DAY_TRADING) repeated across
+    // independent videos is sufficient; generic repeats are not.
+    const genericTierASignals = new Set(['KNOWN_METHOD', 'NATIVE_METHOD', 'NATIVE_EDUCATION']);
+    const tierASignalsAcrossVideos = [...tierASignalVideos.entries()]
+      .filter(([signal, videos]) => !genericTierASignals.has(signal) && videos.size >= 2).length;
     // C2 aggregation: a repeated generic phrase is one signal, and a single
     // video cannot establish consistency. Require at least three videos and
-    // either two Tier A signals corroborated across videos or a high
+    // either one corroborated high-specificity Tier A signal or a high
     // consistency ratio with distinct contextual signals.
     const consistencyEligible = titles.length >= 3
-      && (tierASignalsAcrossVideos >= 2 || (consistencyRatio >= 0.6 && distinctContextualSignals >= 2));
+      && (tierASignalsAcrossVideos >= 1 || (consistencyRatio >= 0.6 && distinctContextualSignals >= 2));
 
     // 1. Multi-Video Consistency Evidence
     if (consistencyEligible) {

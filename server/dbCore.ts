@@ -1439,7 +1439,12 @@ export async function getQueryRunReward(runId:string):Promise<{confirmed:number;
   const res=await db.query(`SELECT COUNT(DISTINCT cs.channel_id) FILTER (WHERE cs.persisted AND NOT cs.was_known AND cs.country_outcome IN ('CONFIRMED','LIKELY') AND cs.funnel_outcome='TRADING_CONFIRMED')::int AS confirmed,COUNT(DISTINCT cs.channel_id) FILTER (WHERE cs.persisted AND NOT cs.was_known AND cs.country_outcome IN ('CONFIRMED','LIKELY') AND cs.funnel_outcome='TRADING_CONFIRMED' AND c.quality_score>=${QUALITY_CREATOR_SCORE_THRESHOLD})::int AS quality FROM channel_sightings cs LEFT JOIN channels c ON c.channel_id=cs.channel_id WHERE cs.query_run_id=$1`,[runId]);
   return {confirmed:Number(res.rows[0]?.confirmed||0),quality:Number(res.rows[0]?.quality||0)};
 }
-const PORTFOLIO_UNITS_SQL=`SELECT COALESCE(SUM(GREATEST(quota_reserved,quota_used)),0)::float/100.0 AS units FROM query_runs WHERE scheduled_at>=date_trunc('day',now() AT TIME ZONE 'UTC') AND status IN ('SCHEDULED','RUNNING','RETRYING','COMPLETED','FAILED') AND (selection_strategy IN ('UCB_PORTFOLIO','UCB1_EXPLORATION','COLD_START_GENERATION') OR selection_reason LIKE 'Bounded portfolio%')`;
+// Continuation pages increment quota_reserved on a run that may have been
+// scheduled before UTC midnight, so the day filter cannot rely on
+// scheduled_at alone: active runs always count against today's bound, and
+// terminal runs count when either their schedule or their completion was
+// today. Each run is counted once with its current reservation.
+const PORTFOLIO_UNITS_SQL=`SELECT COALESCE(SUM(GREATEST(quota_reserved,quota_used)),0)::float/100.0 AS units FROM query_runs WHERE (scheduled_at>=(date_trunc('day',now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') OR status IN ('SCHEDULED','RUNNING','RETRYING') OR completed_at>=(date_trunc('day',now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')) AND status IN ('SCHEDULED','RUNNING','RETRYING','COMPLETED','FAILED') AND (selection_strategy IN ('UCB_PORTFOLIO','UCB1_EXPLORATION','COLD_START_GENERATION') OR selection_reason LIKE 'Bounded portfolio%')`;
 /**
  * Shared portfolio budget plus an optional country breakdown. The budget the
  * selector enforces is global; a country-filtered total must never be
@@ -3064,7 +3069,7 @@ export async function scheduleAutonomousQueryRuns(
         defaultOrdering: controlSearchOrdering,
         frontierState,
         isSaturating,
-        providerQuotaUnits: allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE' ? 0 : 100,
+        providerQuotaUnits: allocatedProvider.costDomain==='YOUTUBE_DATA_API' ? 100 : 0,
         clientOverride: client
       });
 
@@ -3153,7 +3158,7 @@ export async function scheduleAutonomousQueryRuns(
       const origin = candidate.allocationOrigin || 'LEGACY';
       // Quota-free providers (YouTube.js/InnerTube) reserve 0 official units;
       // the official YouTube path keeps its 100-unit page reservation.
-      const scheduledProviderUnits = allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE' ? 0 : 100;
+      const scheduledProviderUnits = allocatedProvider.costDomain==='YOUTUBE_DATA_API' ? 100 : 0;
 
       // Selection is an advisory snapshot, so the first page's portfolio
       // reservation is enforced again here, atomically with the run insert.
@@ -4082,7 +4087,9 @@ export async function completeQueryRun(runId: string, metrics: {
            WHERE s.persisted AND NOT s.was_known AND s.country_outcome IN ('CONFIRMED','LIKELY') AND s.funnel_outcome='TRADING_CONFIRMED')::int AS confirmed_new,
          COUNT(DISTINCT s.channel_id) FILTER (
            WHERE s.persisted AND NOT s.was_known AND s.country_outcome IN ('CONFIRMED','LIKELY') AND s.funnel_outcome='TRADING_CONFIRMED'
-             AND c.quality_score>=${QUALITY_CREATOR_SCORE_THRESHOLD})::int AS quality_new
+             AND c.quality_score>=${QUALITY_CREATOR_SCORE_THRESHOLD})::int AS quality_new,
+         COUNT(DISTINCT s.channel_id) FILTER (
+           WHERE s.persisted AND s.country_outcome IN ('CONFIRMED','LIKELY'))::int AS target_market_confirmed
          FROM channel_sightings s LEFT JOIN channels c ON c.channel_id=s.channel_id
          WHERE s.query_run_id=$1`, [runId]
       );
@@ -4106,9 +4113,11 @@ export async function completeQueryRun(runId: string, metrics: {
           || (metrics.providerRateLimited || 0) > 0
           || (!!metrics.providerRunOutcome && !/^SUCCESS(?:_|$)/.test(String(metrics.providerRunOutcome))),
         failed: false,
-        // Target-market precision treats only an explicit country rejection as
-        // a miss; UNCERTAIN and unresolved results stay neutral.
-        targetMarketConfirmed: Math.max(0, metrics.distinctResults - metrics.countryRejected),
+        // Target-market precision uses the explicit membership allow-list
+        // (CONFIRMED/LIKELY), matching the reward contract. UNKNOWN/UNCERTAIN
+        // results are not silently promoted to confirmed, so a run whose
+        // creators all have unknown countries reports 0% rather than 100%.
+        targetMarketConfirmed: Number(sightingTruth.rows[0]?.target_market_confirmed || 0),
         languageMatchedConfirmed: null,
       });
       const generationMetadata = parseGenerationMetadata(row.generation_metadata);

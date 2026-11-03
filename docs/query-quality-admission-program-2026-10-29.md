@@ -2,9 +2,10 @@
 
 **Date:** 2026-10-29
 **Branch:** `feat/query-quality-admission-q0-q8`
-**Worktree:** `/root/.local/share/opencode/worktree/0cb9bd/query-quality-admission-q0-q8`
-**Plan:** `/tmp/opencode/QUERY_QUALITY_FINAL_PLAN_20261029.md`
-**Specification:** `/tmp/opencode/TRADING_DISCOVERY_RECOGNITION_REVISION_20261028.md`
+**Implementation:** this document plus the Q0–Q8 source modules it names
+(`server/queryQuality/`, `server/queryIntelligence.ts`, `server/dbCore.ts`).
+The original local worktree, plan and specification files were operator-only
+scratch material and are not part of the repository.
 
 **Status:** implemented and tested locally. Merged into
 `e2e/invite-discovery-remediation` by PR #568; promoted to `main` by PR #569
@@ -98,8 +99,9 @@ remains unmodified; PR #567 was not touched.
   the deterministic intent rotation as a filter, applies family/source caps
   against `max(candidate spend, daily quota)` with an achievable `1/n` floor and
   a bounded family-then-source relaxation when the caps would block every
-  candidate, and returns `NO_ELIGIBLE_QUERY` only when no admitted candidate
-  remains. The 16-country scheduler owns global country rotation, so the
+  candidate, and returns `NO_ELIGIBLE_QUERY` when no admitted candidate remains
+  or when the bounded portfolio is exhausted before any candidate reaches the
+  minimum sample. The 16-country scheduler owns global country rotation, so the
   per-country cap is 1 per call.
 - New truthful strategies are `UCB_EXPLOITATION`, `UCB_PORTFOLIO`,
   `COLD_START_GENERATION` and `NEIGHBORHOOD_TARGETED`; `selectionStrategy`
@@ -112,8 +114,10 @@ remains unmodified; PR #567 was not touched.
 ### Q5 — reward accounting and attribution
 
 - `completeQueryRun` derives `newConfirmedCreators`/`newQualityCreators` from
-  distinct, persisted, globally-new, non-country-rejected
-  `channel_sightings` rows with `funnel_outcome='TRADING_CONFIRMED'`.
+  distinct, persisted, globally-new `channel_sightings` rows with
+  `funnel_outcome='TRADING_CONFIRMED'` **and**
+  `country_outcome IN ('CONFIRMED','LIKELY')` (the explicit sighting
+  allow-list; `UNCERTAIN` and unresolved outcomes never count).
   `query_library.unique_channels_found` is never a reward source.
 - `buildQueryQualityVector` emits quota-normalized reward, duplicate ratio,
   semantic overlap, invalid/zero-result rates, target-market precision,

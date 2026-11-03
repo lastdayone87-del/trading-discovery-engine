@@ -14,6 +14,7 @@ import {
   withQueryAdmission,
 } from './admission';
 import {
+  admitQueryCandidate,
   buildQueryCandidate,
   candidateHash,
   compositionFamilyFor,
@@ -34,8 +35,8 @@ import { deriveQueryFailureState, isQuerySelectable } from './lifecycle';
 import { buildQueryQualityVector, buildAttribution, canPromoteToProven, isRewardEligibleQuota } from './accounting';
 import { selectQueryCollection } from '../queryPerformance';
 import { decideLifecycle } from '../terminologyIntelligence';
-import { buildQueryQualityDashboard } from './dashboard';
-import { compareSelectors, currentUcb1Index, portfolioPullAdmitted, runSelectorSimulation } from './simulator';
+import { buildQueryQualityDashboard, QUERY_QUALITY_DASHBOARD_MAX_ROWS } from './dashboard';
+import { compareSelectors, currentUcb1Index, portfolioPullAdmitted, runSelectorSimulation, SERVING_SELECTOR } from './simulator';
 import { verifyFrozenBenchmarkVersions } from '../benchmarkPreregV1';
 import { AUTONOMOUS_QUERY_AUTHORITY_POLICY_VERSION } from '../autonomousQueryAuthority';
 import { CANDIDATE_TRIAGE_POLICY_VERSION } from '../candidateTriage';
@@ -853,6 +854,17 @@ test('Q5/Q6: production wiring uses accounting-window spend, derived failure sta
   // before the target-market check instead of pinning the exact clause order.
   assert.match(dbCore, /COUNT\(DISTINCT s\.channel_id\) FILTER \(\s*WHERE s\.persisted AND NOT s\.was_known AND s\.country_outcome IN \('CONFIRMED','LIKELY'\)/);
   assert.match(dbCore, /languageMatchedConfirmed: null/);
+  // Target-market precision is the explicit CONFIRMED/LIKELY sighting count;
+  // unresolved creators must report 0%, not 100% by subtraction.
+  assert.match(dbCore, /COUNT\(DISTINCT s\.channel_id\) FILTER \(\s*WHERE s\.persisted AND s\.country_outcome IN \('CONFIRMED','LIKELY'\)\)::int AS target_market_confirmed/);
+  assert.match(dbCore, /targetMarketConfirmed: Number\(sightingTruth\.rows\[0\]\?\.target_market_confirmed \|\| 0\)/);
+  // Portfolio spend is UTC-day scoped and includes active runs scheduled
+  // before midnight; a completion qualifies even when the schedule did not.
+  assert.match(dbCore, /scheduled_at>=\(date_trunc\('day',now\(\) AT TIME ZONE 'UTC'\) AT TIME ZONE 'UTC'\)/);
+  assert.match(dbCore, /OR status IN \('SCHEDULED','RUNNING','RETRYING'\)/);
+  assert.match(dbCore, /OR completed_at>=\(date_trunc\('day',now\(\) AT TIME ZONE 'UTC'\) AT TIME ZONE 'UTC'\)/);
+  // Only the official Data API consumes quota units; InnerTube/YouTube.js are free.
+  assert.match(dbCore, /costDomain==='YOUTUBE_DATA_API' \? 100 : 0/);
   // Reward is in-scope only: UNCERTAIN/no-country sightings may not earn
   // credit even when they pass the general funnel as TRADING_CONFIRMED.
   assert.ok(!dbCore.includes("country_outcome<>'REJECTED'"));
@@ -893,6 +905,11 @@ test('Q5/Q6: production wiring uses accounting-window spend, derived failure sta
 
   const queueManager = readFileSync(join(__dirname, '..', 'queueManager.ts'), 'utf8');
   assert.match(queueManager, /queryRunId, persist: false/);
+  // Continuation reservations use the same quota-domain test as scheduling.
+  assert.match(queueManager, /reservePortfolioContinuationPage\(\{[\s\S]*?providerQuotaUnits: allocatedProvider\.costDomain==='YOUTUBE_DATA_API' \? 100 : 0/);
+  // A failed continuation transaction rolls back the release issued through
+  // that client, so the reservation must be released again independently.
+  assert.match(queueManager, /if \(incPageReservationId && !continuationCommitted\) \{[\s\S]*?releaseIncrementalTreatmentPageReservation/);
 });
 
 test('Q6: portfolio over-budget is conspicuous, not hidden', () => {
@@ -905,6 +922,45 @@ test('Q6: portfolio over-budget is conspicuous, not hidden', () => {
   assert.equal(dashboard.portfolio.portfolioShareUsed, 0.2);
 });
 
+test('Q6: dashboard slices to the row limit and reports truncation honestly', () => {
+  const rows = Array.from({ length: QUERY_QUALITY_DASHBOARD_MAX_ROWS + 1 }, (_, index) => ({
+    runId: `run-${index}`,
+    queryId: index,
+    query: `query ${index}`,
+    country: 'Germany',
+    status: 'COMPLETED',
+    selectionStrategy: 'UCB_EXPLOITATION',
+    selectionReason: 'selected',
+    stopReason: 'MAX_PAGES_REACHED',
+    quotaUsed: 100,
+    completedAt: '2026-01-01T00:00:00.000Z',
+    performanceScore: 50,
+    qualityVector: buildQueryQualityVector({
+      rawResults: 1, distinctResults: 1, newChannels: 0, newConfirmedCreators: 0,
+      newQualityCreators: 0, quotaUsed: 100,
+    }),
+  }));
+  const input = {
+    generatedAt: '2026-01-01T00:00:00.000Z',
+    portfolio: { dailyQuotaUnits: 1000, portfolioUnitsReserved: 150, portfolioUnitsUsed: 0 },
+  };
+
+  const truncated = buildQueryQualityDashboard({ ...input, rows });
+  assert.equal(truncated.rowLimit, QUERY_QUALITY_DASHBOARD_MAX_ROWS);
+  assert.equal(truncated.rows.length, QUERY_QUALITY_DASHBOARD_MAX_ROWS);
+  assert.equal(truncated.truncated, true);
+  // Totals describe the visible window, not the discarded extra row.
+  assert.equal(truncated.totals.runs, QUERY_QUALITY_DASHBOARD_MAX_ROWS);
+
+  // The route fetches limit + 1, so an exactly-full window is not truncated.
+  const exact = buildQueryQualityDashboard({
+    ...input,
+    rows: rows.slice(0, QUERY_QUALITY_DASHBOARD_MAX_ROWS),
+  });
+  assert.equal(exact.rows.length, QUERY_QUALITY_DASHBOARD_MAX_ROWS);
+  assert.equal(exact.truncated, false);
+});
+
 test('Q8: registry contracts stay 20 supported / 5 dormant / 15 default / 16 production', () => {
   assert.equal(SUPPORTED_PRODUCTION_COUNTRIES.length, 20);
   assert.equal(SUPPORTED_DORMANT_COUNTRIES.length, 5);
@@ -914,6 +970,98 @@ test('Q8: registry contracts stay 20 supported / 5 dormant / 15 default / 16 pro
   for (const absent of ['Italy', 'Japan', 'Spain', 'United Arab Emirates']) {
     assert.ok(!(PRODUCTION_CONFIGURED_ACTIVE_COUNTRIES as readonly string[]).includes(absent));
   }
+});
+
+test('Q8: a live scope promotion may admit a registered dormant country', () => {
+  const record = (metadata: Record<string, unknown>) => ({
+    query: 'Nikkei day trading',
+    country: 'Japan',
+    primary_term: 'Nikkei',
+    generation_metadata: {
+      queryTemplate: 'COMPACT_PAIR',
+      atoms: [
+        { term: 'Nikkei', type: 'INSTRUMENT', origin: 'CURATED' },
+        { term: 'day trading', type: 'METHOD', origin: 'CURATED' },
+      ],
+      ...metadata,
+    },
+  });
+  const dormant = admitQueryRecord(record({}));
+  assert.equal(dormant.eligible, false);
+  assert.ok(dormant.reasonCodes.includes('COUNTRY_NOT_PRODUCTION_CONFIGURED'));
+
+  const promoted = admitQueryRecord(record({ scopePromoted: true }));
+  assert.equal(promoted.eligible, true);
+  assert.equal(promoted.admission.source, 'COUNTRY_VOCABULARY');
+
+  // Execution-time revalidation honours the live marker without re-hardcoding
+  // the country into the production fixture.
+  const stored = withQueryAdmission(record({ scopePromoted: true }).generation_metadata, promoted.admission);
+  const revalidated = revalidateQueryRecordAdmission({
+    ...record({ scopePromoted: true }),
+    generation_metadata: stored,
+  });
+  assert.equal(revalidated.eligible, true);
+  assert.equal(revalidated.admission.candidateHash, promoted.admission.candidateHash);
+});
+
+test('Q2: governed sources cannot be spoofed by inherited template keys', () => {
+  const record = (metadata: Record<string, unknown>) => ({
+    query: 'DAX day trading',
+    country: 'Germany',
+    primary_term: 'DAX',
+    generation_metadata: {
+      atoms: [
+        { term: 'DAX', type: 'INSTRUMENT', origin: 'CURATED' },
+        { term: 'day trading', type: 'METHOD', origin: 'CURATED' },
+      ],
+      ...metadata,
+    },
+  });
+  for (const template of ['constructor', 'toString', '__proto__']) {
+    const decision = admitQueryRecord(record({ queryTemplate: template }));
+    assert.equal(typeof decision.admission.source, 'string');
+    assert.ok(Object.hasOwn(QUERY_SOURCE_REGISTRY, decision.admission.source));
+    assert.equal(decision.admission.source, 'LEARNED_TERMINOLOGY');
+  }
+  // A persisted research allocation keeps its own source instead of being
+  // charged to the standalone organic template.
+  const research = admitQueryRecord(record({
+    queryTemplate: 'ORGANIC_STANDALONE',
+    persistentResearchActionId: 'action-1',
+  }));
+  assert.equal(research.admission.source, 'PERSISTENT_RESEARCH');
+});
+
+test('Q2: a country-native override covers only the approved local surface', () => {
+  const record = (anchorEligibility: string) => ({
+    query: 'ドル円 デイトレード',
+    country: 'Japan',
+    primary_term: 'デイトレード',
+    generation_metadata: {
+      queryTemplate: 'ANCHOR_LEARNED',
+      scopePromoted: true,
+      countryNativeAllocation: { decisionId: 'decision-1' },
+      learnedTerm: 'デイトレード',
+      atoms: [
+        {
+          term: 'デイトレード', type: 'TERMINOLOGY', role: 'ANCHOR', origin: 'LEARNED',
+          retrievalPolicy: { eligibility: anchorEligibility },
+        },
+        { term: 'ドル円', type: 'INSTRUMENT', origin: 'LEARNED' },
+      ],
+    },
+  });
+
+  const approved = admitQueryRecord(record('STANDALONE'));
+  const approvedProvenance = Object.fromEntries(approved.candidate.atoms.map(atom => [atom.term, atom.provenance]));
+  assert.equal(approvedProvenance['デイトレード'], 'COUNTRY_VOCABULARY');
+  assert.equal(approvedProvenance['ドル円'], 'LEARNED');
+
+  // Without an independently authorized anchor the allocation must not
+  // whitelist every atom in the row.
+  const unapproved = admitQueryRecord(record('CONTEXT_REQUIRED'));
+  for (const atom of unapproved.candidate.atoms) assert.equal(atom.provenance, 'LEARNED');
 });
 
 test('Q8: corrected hierarchical TS is an offline comparator and UCB c=2 is non-inferior in the seeded sample', () => {
@@ -1241,6 +1389,28 @@ test('Q2: a source- or provenance-only change invalidates the admission hash', (
   assert.notEqual(candidateHash(baseline), candidateHash(provenanceChanged));
 });
 
+test('Q2: composition evaluation is pure and hashes the derived tier', () => {
+  const candidate = buildQueryCandidate({
+    query: 'DAX day trading',
+    country: 'Germany',
+    source: 'CURATED',
+    atoms: [
+      { term: 'DAX', type: 'INSTRUMENT', provenance: 'CURATED' },
+      { term: 'day trading', type: 'TERMINOLOGY', provenance: 'CURATED' },
+    ],
+    relation: 'ANCHOR_MODIFIER',
+  });
+  // A stale producer-supplied tier must not survive the gate.
+  candidate.tier = 'SPECULATIVE';
+  const decision = evaluateQueryComposition(candidate, {});
+  assert.equal(decision.tier, 'LICENSED_UNSEEN');
+  assert.equal(candidate.tier, 'SPECULATIVE');
+
+  const admission = admitQueryCandidate(candidate, {});
+  assert.equal(admission.candidateHash, candidateHash(candidate, decision.tier));
+  assert.notEqual(admission.candidateHash, candidateHash(candidate));
+});
+
 test('Q2: exact, reordered, alias and near-duplicate compositions are suppressed; cross-country is not deduped', () => {
   const record = heldOutRecord('Germany', 'DAX day trading', [
     { term: 'DAX', type: 'INSTRUMENT' }, { term: 'day trading', type: 'METHOD' },
@@ -1532,6 +1702,18 @@ test('Q4: simulator UCB1 baseline clamps the normalized score and uses portfolio
   assert.equal(currentUcb1Index(100, 0, 1), 1 + 0.8 * Math.sqrt(Math.log(2)));
   assert.equal(currentUcb1Index(0.5, 3, 9), 0.5 + 0.8 * Math.sqrt(Math.log(10) / 4));
   assert.ok(currentUcb1Index(0.5, 3, 9) < currentUcb1Index(0.5, 3, 90));
+});
+
+test('Q4: only the serving selector applies the simulator portfolio floor', () => {
+  assert.equal(SERVING_SELECTOR, 'hierarchical_ucb_c2');
+  const source = readFileSync(join(__dirname, 'simulator.ts'), 'utf8');
+  // Applying the serving floor to the UCB1/TS counterfactuals would replace
+  // their own pick on admitted pulls and confound the comparison.
+  assert.match(source, /const portfolioApplies = portfolio && selector === SERVING_SELECTOR;/);
+  assert.match(source, /chooseArm\(selector, uncapped\.length \? uncapped : country\.arms, aggregates, priorFor\(aggregates\), rng, portfolioApplies, c\)/);
+  // Raw confirmed-per-quota yield is normalized to production's [0,1]
+  // performance-score axis before clamping, keeping the exploitation signal.
+  assert.match(source, /arm\.lastRate = quotaUnits > 0\s*\?\s*Math\.min\(1, confirmed \/ quotaUnits \/ SIM_MAX_ARM_RATE\)/);
 });
 
 test('Q8: simulator cold-start cursor forces each country before index play', () => {

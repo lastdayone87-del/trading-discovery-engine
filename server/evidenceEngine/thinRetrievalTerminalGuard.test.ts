@@ -88,7 +88,8 @@ function decide(input: any, evidence: EvidenceItem[], collection = sufficientCol
       collection,
       lifecycleAction: stages.lifecycleAction,
       minimumPositiveWeight: 25,
-      minimumTradingScore: 68
+      minimumTradingScore: 68,
+      composition
     })
   };
 }
@@ -269,6 +270,22 @@ test('query-only composition preserves affirmative REVIEW and never confirms', (
   assert.equal(abstained.stages.stages.find(stage => stage.stage === 'CONTRADICTION')?.disposition, 'ABSTAIN');
   assert.equal(abstained.stages.lifecycleAction, 'REVIEW');
   assert.equal(abstained.decision.status, 'UNCERTAIN');
+});
+
+test('policy-level confirmation gate rejects a query-only composition', () => {
+  const input = retrievalOnlyInput();
+  const composition = buildContextualComposition(input);
+  assert.equal(composition.focus, 'QUERY_ONLY');
+  const decision = evaluateUnifiedDecisionPolicy({
+    evidence: affirmativeEvidence(),
+    collection: sufficientCollection(),
+    lifecycleAction: 'CONFIRM',
+    minimumPositiveWeight: 25,
+    minimumTradingScore: 68,
+    composition
+  });
+  assert.equal(decision.status, 'UNCERTAIN');
+  assert.ok(decision.reasonCodes.includes('CONTEXTUAL_COMPOSITION_CONFIRMATION_REQUIRED'));
 });
 
 test('insufficient coverage preserves affirmative REVIEW and a supported terminal REJECT', () => {

@@ -86,7 +86,7 @@ const GENERIC_TIER_A_SIGNALS: ReadonlySet<string> = new Set(['KNOWN_METHOD', 'NA
  * financial market, instrument, or trading activity.
  */
 const FINANCIAL_CONTEXT_PATTERN = /\b(trad(?:e|ing|er|en)|stocks?|equit(?:y|ies)|crypto(?:currenc(?:y|ies))?|bitcoin|ethereum|forex|commodit(?:y|ies)|brokers?|bourse|börse|boerse|bolsa|borsa|beurs|aktien|aandelen|aksjer|osakkeet|azioni|acciones|titres|handelsplan|tradingdagboek|orderboek|finan(?:ce|cial)|invest(?:ing|ment)?|(?:stock|equity|financial|capital|forex|crypto|futures?|options?|bond|commodit(?:y|ies))\s+markets?)\b/iu;
-const FINANCIAL_CONTEXT_CJK_PATTERN = /(株式|株|仮想通貨|為替|先物|トレード|取引|投資|板読み|注文|日経|بورصة|الأسهم|股票|交易)/u;
+const FINANCIAL_CONTEXT_CJK_PATTERN = /(株(?!式会社)|仮想通貨|為替|先物|トレード|取引|投資|板読み|注文|日経|بورصة|الأسهم|股票|交易)/u;
 
 export function isTierATradingText(text: string, context?: LayeredKnowledgeContext): boolean {
   const normalized = String(text || '').normalize('NFKC');
@@ -97,7 +97,7 @@ export function isTierATradingText(text: string, context?: LayeredKnowledgeConte
 }
 
 /** Format/generic words that never establish trading by themselves. */
-const TIER_C_PATTERN = /\b(trading|trader|market|invest|crypto|live|stream|session|finance)\b/iu;
+const TIER_C_PATTERN = /\b(trading|trader|crypto)\b/iu;
 
 /** Explicit governed alternative-focus signals (not a single ambiguous word). */
 const ALTERNATIVE_PATTERNS: Array<[string, RegExp]> = [
@@ -250,7 +250,8 @@ export function buildContextualComposition(
       if (focus === 'TRADING') explicitCreatorTrading = true;
       if (focus === 'ALTERNATIVE') explicitCreatorAlternative = true;
     }
-    familyClassifications.push({ sourceFamilyId, field: familyDocuments[0].field, focus, recent, tierA });
+    const matchedDocument = familyDocuments.find(document => classifyCompositionDocument(document.text, context) === focus) || familyDocuments[0];
+    familyClassifications.push({ sourceFamilyId, field: matchedDocument.field, focus, recent, tierA });
   }
 
   const observedFamilies = byFamily.size;

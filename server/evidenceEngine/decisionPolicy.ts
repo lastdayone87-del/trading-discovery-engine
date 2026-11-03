@@ -2,6 +2,7 @@ import type { EvidenceCollectionReport, EvidenceItem, LifecycleAction } from './
 import { isSemanticClassificationSource } from './types';
 import { SEMANTIC_TOP_CALIBRATED_CONFIDENCE } from './semanticCalibration';
 import type { ContextualCompositionReport } from './contextualComposition';
+import { CREATOR_OWNED_EVIDENCE_FIELDS } from './canonicalEvidencePlane';
 import type { RecognitionAssessment } from './recognitionState';
 
 export const UNIFIED_DECISION_POLICY_VERSION='unified-selective-policy-v2-conflict-aware';
@@ -12,7 +13,10 @@ export interface UnifiedDecisionPolicyResult {status:'TRADING_CONFIRMED'|'NON_TR
 
 /** C2: a channel title is a name prior, never independent confirmation. */
 export function hasIndependentCreatorOwnedPositiveField(items:EvidenceItem[]):boolean{
-  return items.some(item=>item.polarity==='POSITIVE'&&(item.provenance?.fields||[]).some(field=>field.field!=='channel_title'&&field.field!=='search_match_context'&&Boolean(field.field)));
+  // Registry/context fields (country, language, activity_metadata) are not
+  // creator output either: require the canonical creator-owned allowlist and
+  // keep the title/retrieval-context exclusions.
+  return items.some(item=>item.polarity==='POSITIVE'&&(item.provenance?.fields||[]).some(field=>field.field!=='channel_title'&&field.field!=='search_match_context'&&CREATOR_OWNED_EVIDENCE_FIELDS.has(field.field)));
 }
 
 /**
@@ -153,7 +157,14 @@ export function evaluateUnifiedDecisionPolicy(input:UnifiedDecisionPolicyInput):
     if(input.lifecycleAction==='CONFIRM'&&!independentCreatorField)reasons.push('INDEPENDENT_CREATOR_OWNED_FIELD_REQUIRED');
     if(input.lifecycleAction==='CONFIRM'&&!compositionOk)reasons.push('CONTEXTUAL_COMPOSITION_CONFIRMATION_REQUIRED');
     if(input.lifecycleAction==='CONFIRM'&&!recognitionAllowsConfirmation)reasons.push('RECOGNITION_STATE_NOT_DECISIVE_TRADING');
-    reasons.push(input.lifecycleAction==='ENRICH'?'EVIDENCE_COVERAGE_INCOMPLETE':input.lifecycleAction==='REVIEW'?'SELECTIVE_POLICY_ABSTAINED':positive.length>0&&substantivePositiveWeight<input.minimumPositiveWeight?'SUBSTANTIVE_POSITIVE_EVIDENCE_REQUIRED':'SCORE_BOUNDARY_NOT_SATISFIED');
+    const fallbackReason=input.lifecycleAction==='ENRICH'?'EVIDENCE_COVERAGE_INCOMPLETE'
+      :input.lifecycleAction==='REVIEW'?'SELECTIVE_POLICY_ABSTAINED'
+        :positive.length>0&&substantivePositiveWeight<input.minimumPositiveWeight?'SUBSTANTIVE_POSITIVE_EVIDENCE_REQUIRED'
+          :!positiveBoundary?'SCORE_BOUNDARY_NOT_SATISFIED'
+            :null;
+    // A CONFIRM that already passed the score boundary is blocked by a
+    // specific gate above; do not also claim the boundary failed.
+    if(fallbackReason)reasons.push(fallbackReason);
   }
   // `confidenceScore` is persisted as the channel's trading confidence, not as
   // "probability of the reported status". Keep it on the trading scale so a

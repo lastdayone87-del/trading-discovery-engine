@@ -295,7 +295,9 @@ export function defaultClient(
             ? error
             : aborted
               ? (deadlineExpired || callerTimedOut)
-                ? new ProviderCallError(`Free Gemini call exceeded ${timeoutMs}ms deadline.`, 'TIMEOUT', true, { cause: error })
+                ? new ProviderCallError(deadlineExpired
+                  ? `Free Gemini call exceeded ${timeoutMs}ms deadline.`
+                  : 'Free Gemini call exceeded the caller deadline.', 'TIMEOUT', true, { cause: error })
                 : geminiFreeFailoverCancelled(signal)
               : classifyProviderError(error);
           if (!aborted && typed.errorClass === 'RATE_LIMIT' && (error as { geminiFreeCooldownDeferred?: unknown })?.geminiFreeCooldownDeferred !== true) {

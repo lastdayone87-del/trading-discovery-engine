@@ -21,6 +21,7 @@ import {
   isRetryableInfrastructureFailure
 } from './db';
 import { assertCountryAllowed } from './countryExclusion';
+import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
 import { isTerminologyKillSwitchActive, TERMINOLOGY_KILL_SWITCH_KEY } from './terminologyKillSwitch';
 import { planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, rotateAwayFromMostRecentIntent, reformulatePollutedQuery } from './queryPlanner';
 import { revalidateQueryRecordAdmission, withQueryAdmission, type QueryRecordAdmission } from './queryQuality/admission';
@@ -1042,7 +1043,7 @@ export async function selectNextQueryForCountry(
 
   const loadQueries = async (): Promise<QueryRecord[]> => getQueriesByCountry(country);
   const loadPool = async (queries: QueryRecord[]): Promise<SelectorPool> =>
-    buildSelectorPool(country, queries, { now, cooldownMinutes, maxPrimaryUses, nowIso, portfolioRatio, familyCap, sourceCap });
+    buildSelectorPool(country, queries, { now, cooldownMinutes, maxPrimaryUses, nowIso, portfolioRatio, familyCap, sourceCap, scopePromotionBasis: options.scopePromotionBasis });
 
   let allQueries = await loadQueries();
   if (allQueries.length === 0) {
@@ -1202,6 +1203,7 @@ async function buildSelectorPool(
     portfolioRatio: number;
     familyCap: number;
     sourceCap: number;
+    scopePromotionBasis?: 'PERSISTENT_SCOPE_SELECTION' | 'DIRECT_TARGET';
   },
 ): Promise<SelectorPool> {
   const recentCutoff = options.now.getTime() - options.cooldownMinutes * 60_000;
@@ -1275,6 +1277,15 @@ async function buildSelectorPool(
     admissions.set(query.id, admissionInfo);
     if (!admissionInfo.eligible) continue;
     if (admissionInfo.admission.tier === 'SPECULATIVE') continue;
+    // The execution authority is the last gate before quota spend. Applying it
+    // here as well keeps the selector from repeatedly choosing a stale/legacy
+    // row that the scheduler would immediately quarantine, which would starve
+    // otherwise eligible queries. Scope-promoted rows are checked against the
+    // same promotion basis the scheduler will use.
+    const authority = evaluateAutonomousQueryAuthority(query, {
+      scopePromotionActive: options.scopePromotionBasis != null,
+    });
+    if (!authority.eligible) continue;
     const failure = failureByQuery.get(query.id);
     const selectable = isQuerySelectable({
       record: query,

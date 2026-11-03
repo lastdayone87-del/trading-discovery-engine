@@ -8,7 +8,8 @@ import { CountryKnowledgeProvider } from './providers/CountryKnowledgeProvider';
 import { ExternalLinkProvider } from './providers/ExternalLinkProvider';
 import { MultilingualContextProvider } from './providers/MultilingualContextProvider';
 import { getLayeredKnowledgeContext } from './knowledgePacks';
-import { SUPPORTED_CLASSIFICATION_COUNTRIES } from './multilingualTerminology';
+import { SUPPORTED_CLASSIFICATION_COUNTRIES, isTradingFocusedText } from './multilingualTerminology';
+import { isTierATradingText } from './contextualComposition';
 import { SUPPORTED_PRODUCTION_COUNTRIES } from '../../src/data/initial_countries';
 
 const engine = new EvidenceBasedTradingEngine([
@@ -80,4 +81,28 @@ test('classification knowledge covers every production country', () => {
   assert.deepEqual([...SUPPORTED_CLASSIFICATION_COUNTRIES], ['United States', 'United Kingdom', 'Germany', 'France', 'Spain', 'Netherlands', 'Italy', 'Australia', 'Canada', 'Japan', 'Switzerland', 'Denmark', 'Sweden', 'United Arab Emirates', 'Singapore', 'New Zealand', 'Belgium', 'Luxembourg', 'Ireland', 'Norway']);
   assert.equal(getLayeredKnowledgeContext('Brazil').countryKnowledge, undefined);
   assert.equal(getLayeredKnowledgeContext('India').countryKnowledge, undefined);
+});
+
+test('the corporate suffix 株式会社 is never financial-market context', () => {
+  const context = getLayeredKnowledgeContext('Japan');
+  assert.equal(isTradingFocusedText('株式会社の採用情報', context), false);
+  assert.equal(isTradingFocusedText('株のデイトレード', context), true);
+  // Keep the composition classifier consistent: a company post carrying a
+  // generic method phrase must not become TRADING through the 株式 match.
+  assert.equal(isTierATradingText('株式会社のテクニカル分析', context), false);
+  assert.equal(isTierATradingText('日経225のトレード', context), true);
+});
+
+test('one high-specificity Tier A signal across independent videos establishes consistency', async () => {
+  const context = getLayeredKnowledgeContext('United States');
+  const provider = new VideoMetadataProvider();
+  const input: RawChannelInput = {
+    channel_name: 'Day Trading Desk',
+    description: '',
+    country: 'United States',
+    video_titles: ['Day trading live session', 'Day trading recap', 'Day trading journal'],
+    video_descriptions: ['', '', ''],
+  };
+  const items = await provider.collectEvidence(input, context);
+  assert.ok(items.some(item => item.category === 'MULTI_VIDEO_CONSISTENCY'));
 });

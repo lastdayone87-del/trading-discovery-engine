@@ -99,8 +99,14 @@ function asSource(metadata: Record<string, any>): QuerySource {
   // reuse the ANCHOR_LEARNED shape but their spend belongs to the native
   // vocabulary source, not learned terminology.
   if (metadata.countryNativeAllocation) return 'COUNTRY_VOCABULARY';
+  // A persisted research allocation is its own governed source. Without this
+  // check the ORGANIC_STANDALONE template would classify it as ORGANIC and
+  // charge its spend to the organic source-share cap.
+  if (metadata.persistentResearchActionId) return 'PERSISTENT_RESEARCH';
   const template = String(metadata.queryTemplate || '');
-  if (TEMPLATE_SOURCE[template]) return TEMPLATE_SOURCE[template];
+  // Own-key check: "constructor"/"toString" must not resolve to an inherited
+  // Object.prototype member and masquerade as a QuerySource.
+  if (Object.hasOwn(TEMPLATE_SOURCE, template)) return TEMPLATE_SOURCE[template];
   if (metadata.organicProvenance) return 'ORGANIC';
   if (metadata.learnedTerm) return 'LEARNED_TERMINOLOGY';
   if (metadata.scopePromoted === true) return 'COUNTRY_VOCABULARY';
@@ -135,24 +141,34 @@ function typedAtoms(metadata: Record<string, any>, record: QueryRecordAdmissionI
   const market = String(metadata.market || metadata.targetMarket || '') || undefined;
   const raw = Array.isArray(metadata.atoms) ? metadata.atoms as Array<Record<string, any>> : [];
   // A governed country-native allocation is an explicit, lineage-bearing
-  // override. Its local term is still shape/script/CTA checked, but it does
-  // not need to repeat the governed semantic lexicon: the allocation and its
-  // concrete trading anchor supply that context. Arbitrary learned rows do
-  // not get this path.
-  const countryNativeOverride = Boolean(metadata.countryNativeAllocation?.decisionId || metadata.countryNativeAllocation?.proposalId);
+  // override. Require validated lineage AND an independently authorized
+  // anchor atom, then bypass the semantic lexicon only for the approved local
+  // surface (metadata.learnedTerm), never for every atom in the row.
+  const allocation = metadata.countryNativeAllocation && typeof metadata.countryNativeAllocation === 'object'
+    ? metadata.countryNativeAllocation as Record<string, any>
+    : null;
+  const hasAllocationLineage = Boolean(allocation
+    && (String(allocation.decisionId || '').trim() || String(allocation.proposalId || '').trim()));
+  const declaredAnchor = raw.find(atom => String(atom.role || '').toUpperCase() === 'ANCHOR') || raw[0];
+  const anchorAuthorized = ['STANDALONE', 'ANCHOR_ONLY'].includes(String(declaredAnchor?.retrievalPolicy?.eligibility || '').toUpperCase());
+  const allocatedNativeSurface = String(metadata.learnedTerm || '').normalize('NFKC').trim().toLocaleLowerCase('en');
+  const countryNativeOverride = hasAllocationLineage && anchorAuthorized && allocatedNativeSurface.length > 0;
   const atoms = raw
     .map((atom, index) => {
       const declaredOrigin = String(atom.origin || '');
       // The compatibility bridge is assigned only by the zero-atom fallback
       // below. Provenance is a free-form producer string, so a normal atom
       // must never be able to opt itself into the legacy token allowance.
-      const atomProvenance = countryNativeOverride
+      const normalizedTerm = String(atom.term || '').normalize('NFKC').trim();
+      const isApprovedNativeSurface = countryNativeOverride
+        && normalizedTerm.toLocaleLowerCase('en') === allocatedNativeSurface;
+      const atomProvenance = isApprovedNativeSurface
         ? 'COUNTRY_VOCABULARY'
         : declaredOrigin && declaredOrigin.toUpperCase() !== 'LEGACY_COMPATIBILITY'
           ? declaredOrigin
           : source;
       return {
-        term: String(atom.term || '').normalize('NFKC').trim(),
+        term: normalizedTerm,
         role: String(atom.role || (index === 0 ? 'ANCHOR' : 'MODIFIER')).toUpperCase() === 'ANCHOR' ? 'ANCHOR' as const : 'MODIFIER' as const,
         type: ATOM_TYPE[String(atom.type || '').toUpperCase()] || 'TERMINOLOGY',
         provenance: atomProvenance,
@@ -234,6 +250,11 @@ export function admitQueryRecord(
   const candidate = candidateFromQueryRecord(record, context);
   const contextWithPolicies: CompositionContext = {
     ...context,
+    // A scope-promoted row is explicitly authorized by the live operator
+    // selection, so a registered-but-dormant country may reactivate without
+    // hard-coding it into the production fixture. Execution authority still
+    // verifies that the promotion is currently active.
+    scopeAuthorized: context.scopeAuthorized ?? metadata.scopePromoted === true,
     policyVersions: { ...policyVersions(metadata), ...(context.policyVersions || {}) },
   };
   const admission = admitQueryCandidate(candidate, contextWithPolicies);
@@ -272,6 +293,11 @@ export function revalidateQueryRecordAdmission(
   }
   const contextWithPolicies: CompositionContext = {
     ...context,
+    // A scope-promoted row is explicitly authorized by the live operator
+    // selection, so a registered-but-dormant country may reactivate without
+    // hard-coding it into the production fixture. Execution authority still
+    // verifies that the promotion is currently active.
+    scopeAuthorized: context.scopeAuthorized ?? metadata.scopePromoted === true,
     policyVersions: { ...policyVersions(metadata), ...(context.policyVersions || {}) },
   };
   const revalidated = revalidateAdmission(stored, fresh.candidate, contextWithPolicies);

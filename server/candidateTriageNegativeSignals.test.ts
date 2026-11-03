@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { triageAutonomousSearchCandidate } from './candidateTriage';
+import { hasCoveredNonLatinScript, triageAutonomousSearchCandidate } from './candidateTriage';
 import type { DiscoveredChannelRaw } from './youtube';
 
 const candidate = (title: string, description = ''): DiscoveredChannelRaw => ({
@@ -33,6 +33,14 @@ test('candidate triage withholds obvious entertainment vlogs early', () => {
   const result = triageAutonomousSearchCandidate(candidate('Celebrity Gossip Vlog & Pranks'), 'automated_query', false);
   assert.equal(result.disposition, 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS');
   assert.ok(result.reasonCodes.includes('EXPLICIT_NON_TRADING_SIGNAL_DETECTED'));
+});
+
+test('mathematical alphanumeric symbols never count as a covered script', () => {
+  // These fold to Greek under NFKC, so they must be stripped before
+  // normalization or decorative math symbols would establish script coverage.
+  assert.equal(hasCoveredNonLatinScript('\u{1D6A8}\u{1D6A9}'), false);
+  assert.equal(hasCoveredNonLatinScript('\u{1D400}\u{1D401}'), false);
+  assert.equal(hasCoveredNonLatinScript('ΑΒ'), true);
 });
 
 test('candidate triage admits explicit trading candidates', () => {
