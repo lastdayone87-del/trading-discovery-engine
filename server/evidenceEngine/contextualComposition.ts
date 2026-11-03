@@ -86,7 +86,14 @@ const GENERIC_TIER_A_SIGNALS: ReadonlySet<string> = new Set(['KNOWN_METHOD', 'NA
  * financial market, instrument, or trading activity.
  */
 const FINANCIAL_CONTEXT_PATTERN = /\b(trad(?:e|ing|er|en)|stocks?|equit(?:y|ies)|crypto(?:currenc(?:y|ies))?|bitcoin|ethereum|forex|commodit(?:y|ies)|brokers?|bourse|börse|boerse|bolsa|borsa|beurs|aktien|aandelen|aksjer|osakkeet|azioni|acciones|titres|handelsplan|tradingdagboek|orderboek|finan(?:ce|cial)|invest(?:ing|ment)?|(?:stock|equity|financial|capital|forex|crypto|futures?|options?|bond|commodit(?:y|ies))\s+markets?)\b/iu;
-export const FINANCIAL_CONTEXT_CJK_PATTERN = /(株(?!式会社)|仮想通貨|為替|先物|トレード|取引|投資|板読み|注文|日経|بورصة|الأسهم|股票|交易)/u;
+/**
+ * Explicit CJK/Arabic financial-market context. Bare `交易` (transaction),
+ * `取引` (transaction/deal) and `注文` (order) are ordinary commercial words
+ * too (for example 电商交易教学, 取引先, 商品注文), so they are not market
+ * context on their own. Instrument and venue names remain valid context,
+ * which keeps 股票交易, 期货交易, 東京証券取引所 and 日経225 analysis as trading.
+ */
+export const FINANCIAL_CONTEXT_CJK_PATTERN = /(株(?!式会社)|仮想通貨|暗号資産|為替|先物|トレード|投資|板読み|日経|注文フロー|取引所|بورصة|الأسهم|股票|期货|外汇|证券|债券|基金|加密货币|数字货币|股市|港股|美股|A股|K线|大盘)/u;
 
 export function isTierATradingText(text: string, context?: LayeredKnowledgeContext): boolean {
   const normalized = String(text || '').normalize('NFKC');

@@ -93,6 +93,36 @@ test('the corporate suffix 株式会社 is never financial-market context', () =
   assert.equal(isTierATradingText('日経225のトレード', context), true);
 });
 
+test('generic Chinese transaction education is not financial-market context', () => {
+  const context = getLayeredKnowledgeContext('Singapore');
+  // `交易教学`/`交易策略` are education phrases, but `交易` alone is an
+  // everyday commercial transaction word. Without an instrument or venue the
+  // document must stay non-trading rather than becoming e-commerce evidence.
+  assert.equal(isTierATradingText('电商交易教学', context), false);
+  assert.equal(isTierATradingText('电商交易策略', context), false);
+  assert.equal(isTradingFocusedText('电商交易教学', context), false);
+
+  // Market-specific Chinese terms still supply the second dimension.
+  assert.equal(isTierATradingText('股票交易教学', context), true);
+  assert.equal(isTierATradingText('期货交易策略', context), true);
+  assert.equal(isTradingFocusedText('股票交易教学', context), true);
+});
+
+test('generic Japanese transaction words are not financial-market context', () => {
+  const context = getLayeredKnowledgeContext('Japan');
+  assert.equal(isTierATradingText('取引先のテクニカル分析', context), false);
+  assert.equal(isTierATradingText('商品注文のテクニカル分析', context), false);
+  // Venue and index names still preserve legitimate Japanese market cases.
+  assert.equal(isTierATradingText('東京証券取引所のテクニカル分析', context), true);
+  assert.equal(isTradingFocusedText('日経225のテクニカル分析', context), true);
+});
+
+test('Arabic market terms still qualify method education as trading', () => {
+  const context = getLayeredKnowledgeContext('United Arab Emirates');
+  assert.equal(isTierATradingText('تحليل فني لبورصة نيويورك', context), true);
+  assert.equal(isTradingFocusedText('تحليل فني لبورصة نيويورك', context), true);
+});
+
 test('one high-specificity Tier A signal across independent videos establishes consistency', async () => {
   const context = getLayeredKnowledgeContext('United States');
   const provider = new VideoMetadataProvider();
