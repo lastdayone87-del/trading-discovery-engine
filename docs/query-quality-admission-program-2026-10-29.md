@@ -112,10 +112,12 @@ remains unmodified; PR #567 was not touched.
   is restricted to free rows for that decision, and scheduling fails closed
   with `QUOTA_FREE_PROVIDER_UNAVAILABLE`, `QUOTA_FREE_PROVIDER_REQUIRED` or
   `QUOTA_FREE_PROVIDER_CANNOT_SERVE_DATE_ORDERING` instead of falling back to
-  the official provider. Official exploration stays blocked: the scheduler
-  re-checks the portfolio floor for every allocated provider that consumes
-  official units, and only zero-unit InnerTube runs skip the check. The 16-country scheduler owns global country
-  rotation, so the per-country cap is 1 per call.
+  the official provider. Official exploration stays blocked: for
+  portfolio-labelled strategies the scheduler re-checks the portfolio floor
+  whenever the allocated provider consumes official units (the official
+  YouTube page reserves 100 units). Runs with zero official units — InnerTube
+  and any other zero-unit provider — skip that check. The 16-country scheduler
+  owns global country rotation, so the per-country cap is 1 per call.
 - New truthful strategies are `UCB_EXPLOITATION`, `UCB_PORTFOLIO`,
   `COLD_START_GENERATION` and `NEIGHBORHOOD_TARGETED`; quota-free exploration
   keeps the `UCB_PORTFOLIO` strategy label (so it remains portfolio-accounted)

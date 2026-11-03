@@ -275,10 +275,13 @@ export function selectHierarchicalUcb(candidates: SelectorCandidate[], context: 
   } else if (context.quotaFreeProviderAvailable === true && immature.length > 0) {
     // The official portfolio floor is gone, but the provider registry still
     // proves quota-free SEARCH_YOUTUBE capacity (for example InnerTube). That
-    // capacity can mature an unproven arm without spending official units.
-    // Official/paid exploration stays blocked: the scheduler re-checks the
-    // portfolio floor for every allocated provider that consumes official
-    // quota, while zero-quota runs skip that check.
+    // capacity can explore an unproven arm without spending official units.
+    // Zero-quota runs stay out of maturity counts, so the arm remains immature
+    // until an accounted run exists; repeated free exploration is therefore
+    // expected while the official floor is exhausted. Official/paid
+    // exploration stays blocked: the scheduler re-checks the portfolio floor
+    // for portfolio-labelled strategies that consume official units, while
+    // zero-quota runs skip that check.
     chosen = [...immature].sort((a, b) => compareExploration(a, b, context))[0];
     strategy = 'UCB_PORTFOLIO';
     reasonCodes = ['QUOTA_FREE_EXPLORATION', 'MINIMUM_SAMPLE_NOT_MET'];
