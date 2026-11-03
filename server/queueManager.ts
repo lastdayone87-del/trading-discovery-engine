@@ -2434,7 +2434,7 @@ export async function resumeOrphanedAutonomousPages(options: {
         const incRes = await reserveIncrementalTreatmentPageQuota({
           queryRunId: run.runId,
           pageNumber: nextPage,
-          providerQuotaUnits: provider?.costDomain === 'YOUTUBE_INNERTUBE_FREE' ? 0 : 100,
+          providerQuotaUnits: provider?.costDomain === 'YOUTUBE_DATA_API' ? 100 : 0,
         });
         if (!incRes.authorized) {
           // Do not fail the run or bypass caps. Daily-cap denials cannot clear
@@ -2469,7 +2469,7 @@ export async function resumeOrphanedAutonomousPages(options: {
       // Recovery must pass the same shared-portfolio boundary as the worker's
       // continuation path: only the first page was covered by the scheduling
       // reservation, so every recovered later page needs its own reservation.
-      const providerQuotaUnits = provider?.costDomain === 'YOUTUBE_INNERTUBE_FREE' ? 0 : 100;
+      const providerQuotaUnits = provider?.costDomain === 'YOUTUBE_DATA_API' ? 100 : 0;
       let portfolioPage: { authorized: boolean; reason: string } = { authorized: true, reason: 'FIRST_PAGE' };
       let pageCommitted = false;
       try {

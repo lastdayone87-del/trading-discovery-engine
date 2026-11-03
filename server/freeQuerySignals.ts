@@ -530,9 +530,9 @@ export async function refreshFreeQuerySignalsForCountry(country: string, options
   const result = await fetchFreeQuerySignals({ country, ...options });
   if (result.signals.length) {
     await persistFreeQuerySignals(result.signals).catch(error => {
-      // A persistence failure leaves the stored signal set empty for this
-      // country. Surface it in logs instead of silently pretending the
-      // provider returned nothing.
+      // A persistence failure may leave this country's signal set only
+      // partially persisted, and previously stored signals remain. Surface it
+      // in logs instead of silently masking the storage failure.
       console.warn(`[FreeQuerySignals] Failed to persist ${result.signals.length} signal(s) for ${country}:`, error);
       return 0;
     });

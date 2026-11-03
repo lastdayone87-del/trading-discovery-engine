@@ -10,7 +10,6 @@ import { isSearchableTradingTerm } from '../terminologySearchability';
 import {
   QUERY_SOURCE_REGISTRY,
   admitQueryRecord,
-  candidateFromQueryRecord,
   revalidateQueryRecordAdmission,
   withQueryAdmission,
 } from './admission';
@@ -2089,12 +2088,13 @@ test('Q2: CDL anchored bootstrap templates admit without granting PR557 provenan
   });
 
   for (const [template, origin, modifier] of [
-    ['ANCHOR_FREE_SIGNAL', 'FREE_SIGNAL', 'Börse Frankfurt'],
-    ['ANCHOR_DEMAND_SIGNAL', 'DEMAND_SIGNAL', 'Frankfurt trading desk'],
+    ['ANCHOR_FREE_SIGNAL', 'FREE_SIGNAL', 'futures'],
+    ['ANCHOR_DEMAND_SIGNAL', 'DEMAND_SIGNAL', 'futures'],
   ] as const) {
-    const candidate = candidateFromQueryRecord(record(template, origin, modifier));
-    assert.equal(candidate.relation, 'ANCHOR_MODIFIER', `${template} needs a licensed anchor relation`);
-    assert.equal(candidate.atoms[1]?.provenance, origin, 'bootstrap atoms keep their own provenance');
-    assert.notEqual(candidate.atoms[1]?.provenance, 'PR557', 'candidate vocabulary must still pass the semantic lexicon');
+    const decision = admitQueryRecord(record(template, origin, modifier));
+    assert.equal(decision.eligible, true, `${template} must pass the admission gates: ${decision.reasonCodes.join(', ')}`);
+    assert.equal(decision.candidate.relation, 'ANCHOR_MODIFIER', `${template} needs a licensed anchor relation`);
+    assert.equal(decision.candidate.atoms[1]?.provenance, origin, 'bootstrap atoms keep their own provenance');
+    assert.notEqual(decision.candidate.atoms[1]?.provenance, 'PR557', 'candidate vocabulary must still pass the semantic lexicon');
   }
 });

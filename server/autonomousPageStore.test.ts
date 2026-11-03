@@ -91,3 +91,15 @@ test('run-wide sightings recompute duplicate metrics even when the distinct tota
   assert.ok(!source.includes('distinct === metrics.distinctResults'));
   assert.match(source,/duplicateResults:\s*Math\.max\(0, evaluatedRawResults - distinct\)/);
 });
+test('legacy page metrics keep evaluatedRawResults absent through aggregation',()=>{
+  const legacy=(overrides: Record<string, unknown> = {})=>({rawResults:10,distinctResults:8,duplicateResults:2,knownChannels:1,newChannels:7,countryRejected:1,nonTrading:1,uncertain:1,needsReview:1,tradingConfirmed:4,qualityChannels:2,communitiesDiscovered:1,averageQualityScore:60,noveltyRatio:.875,countryPrecision:.875,tradingPrecision:.57,performanceScore:60,...overrides});
+  // The field is optional specifically so consumers can fall back to
+  // rawResults - deferredResults. Materializing 0 would make run-wide
+  // duplicates collapse to zero on legacy runs.
+  assert.equal(aggregatePageMetrics([legacy()]).evaluatedRawResults, undefined);
+  assert.equal(
+    aggregatePageMetrics([legacy(), legacy({ rawResults: 6, deferredResults: 2, evaluatedRawResults: 4 })]).evaluatedRawResults,
+    14,
+    'mixed-version runs contribute the raw-minus-deferred fallback for legacy pages',
+  );
+});

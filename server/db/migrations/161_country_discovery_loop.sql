@@ -226,17 +226,57 @@ WHERE continuation_status IS NULL
 
 -- Legacy non-terminal runs predate continuation tracking and therefore only
 -- carry the new column default ('RUNNING'). A run with no PENDING/PROCESSING
--- job has no execution owner; leaving it RUNNING makes the resume scanner
--- treat stale rows as live continuations. RESUME_UNAVAILABLE is the truthful
--- terminal state and keeps them out of the pending-continuation indexes.
-UPDATE query_runs qr
-SET continuation_status = 'RESUME_UNAVAILABLE'
+-- job has no execution owner. Hiding it from the resume scanner alone leaves
+-- it counted as active portfolio budget forever, so finish it and release its
+-- reservations exactly like the orphaned-job reconciler (migration 122).
+CREATE TEMP TABLE _cdl_stale_query_runs ON COMMIT DROP AS
+SELECT qr.id AS query_run_id, qr.query_id
+FROM query_runs qr
 WHERE qr.status IN ('SCHEDULED', 'RUNNING', 'RETRYING')
   AND qr.continuation_status = 'RUNNING'
   AND NOT EXISTS (
     SELECT 1 FROM jobs j
     WHERE j.id = qr.job_id
       AND j.status IN ('PENDING', 'PROCESSING')
+  );
+
+UPDATE query_runs qr
+SET status = 'FAILED',
+    continuation_status = 'RESUME_UNAVAILABLE',
+    completed_at = COALESCE(qr.completed_at, now()),
+    error = COALESCE(qr.error, 'RESUME_UNAVAILABLE'),
+    -- Only consumed units remain chargeable; the unused reservation is
+    -- released with the run instead of inflating the shared portfolio.
+    quota_reserved = COALESCE(qr.quota_used, 0),
+    performance_details = COALESCE(qr.performance_details, '{}'::jsonb)
+      || jsonb_build_object(
+        'failureKind', 'RESUME_UNAVAILABLE',
+        'retryOwnership', 'RELEASED',
+        'reconciliationMigration', '161_country_discovery_loop'
+      )
+WHERE qr.id IN (SELECT query_run_id FROM _cdl_stale_query_runs);
+
+UPDATE quota_reservations r
+SET status = 'RELEASED'
+WHERE r.status = 'RESERVED'
+  AND EXISTS (
+    SELECT 1
+    FROM _cdl_stale_query_runs s
+    WHERE (r.operation_type = 'AUTONOMOUS_QUERY_PAGE'
+           AND r.operation_id LIKE s.query_run_id::text || ':%')
+       OR (r.operation_type = 'SEARCH_YOUTUBE'
+           AND r.operation_id = s.query_run_id::text)
+  );
+
+UPDATE query_library q
+SET reserved_at = NULL,
+    reserved_until = NULL,
+    reserved_by = NULL
+WHERE q.id IN (SELECT query_id FROM _cdl_stale_query_runs WHERE query_id IS NOT NULL)
+  AND NOT EXISTS (
+    SELECT 1 FROM query_runs active
+    WHERE active.query_id = q.id
+      AND active.status IN ('SCHEDULED', 'RUNNING', 'RETRYING')
   );
 
 CREATE INDEX IF NOT EXISTS idx_query_runs_resume_pending

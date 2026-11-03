@@ -575,6 +575,16 @@ export function aggregatePageMetrics(pages: QueryFunnelMetrics[]): QueryFunnelMe
   // are clamped so precision cannot go negative.
   const countryRejected = Math.min(distinct, cumulativeCountryRejected ?? sum('countryRejected'));
   const evaluated = sum('nonTrading') + sum('uncertain') + sum('needsReview') + sum('tradingConfirmed');
+  // Preserve the field's absence for all-legacy page sets. Materializing a
+  // missing optional field as 0 makes run-wide duplicate accounting treat a
+  // page with raw results as having none evaluated. Mixed-version runs still
+  // contribute each page's raw-minus-deferred fallback.
+  const hasEvaluatedRawResults = pages.some(page => page.evaluatedRawResults !== undefined);
+  const evaluatedRawResults = hasEvaluatedRawResults
+    ? pages.reduce((n, page) => n + Number(
+      page.evaluatedRawResults ?? Math.max(0, Number(page.rawResults || 0) - Number(page.deferredResults || 0)),
+    ), 0)
+    : undefined;
   const weighted = (key: keyof QueryFunnelMetrics) => weightedDistinct ? pages.reduce((n, p) => n + p.distinctResults * Number(p[key] || 0), 0) / weightedDistinct : 0;
   // Scope weighting survives aggregation: pages carrying scope data sum
   // their in-scope counts while legacy pages without the field contribute
@@ -586,7 +596,7 @@ export function aggregatePageMetrics(pages: QueryFunnelMetrics[]): QueryFunnelMe
     : undefined;
   return {
     rawResults: sum('rawResults'), deferredResults: sum('deferredResults'),
-    evaluatedRawResults: sum('evaluatedRawResults'), distinctResults: distinct,
+    evaluatedRawResults, distinctResults: distinct,
     duplicateResults: sum('duplicateResults'), knownChannels: sum('knownChannels'),
     newChannels: sum('newChannels'), inScopeNewChannels: inScopeAggregate,
     countryRejected, nonTrading: sum('nonTrading'),

@@ -2872,9 +2872,15 @@ test('R6: orphan sweep respects the pause, finalizes terminal pages before token
     /releaseIncrementalTreatmentPageReservation/,
     'a rolled-back/denied recovered page must release its treatment reservation',
   );
+  // Brave and InnerTube pages spend no official YouTube quota. Both recovery
+  // reservations must use the worker's cost-domain rule rather than treating
+  // every non-InnerTube provider as official YouTube.
+  assert.match(sweep, /providerQuotaUnits: provider\?\.costDomain === 'YOUTUBE_DATA_API' \? 100 : 0/);
+  assert.match(sweep, /const providerQuotaUnits = provider\?\.costDomain === 'YOUTUBE_DATA_API' \? 100 : 0/);
+  assert.doesNotMatch(sweep, /costDomain === 'YOUTUBE_INNERTUBE_FREE'/);
 });
 
-test('R7: migration backfills require matching creator country and normalize ownerless runs', () => {
+test('R7: migration backfills require matching creator country and finish ownerless runs', () => {
   const migration = migration161();
   assert.match(
     migration,
@@ -2883,9 +2889,17 @@ test('R7: migration backfills require matching creator country and normalize own
   );
   assert.match(
     migration,
-    /SET continuation_status = 'RESUME_UNAVAILABLE'[\s\S]*?status IN \('SCHEDULED', 'RUNNING', 'RETRYING'\)[\s\S]*?j\.status IN \('PENDING', 'PROCESSING'\)/,
-    'legacy non-terminal runs without a live job must stop looking resumable',
+    /CREATE TEMP TABLE _cdl_stale_query_runs[\s\S]*?status IN \('SCHEDULED', 'RUNNING', 'RETRYING'\)[\s\S]*?j\.status IN \('PENDING', 'PROCESSING'\)/,
+    'legacy non-terminal runs without a live job must be identified',
   );
+  assert.match(migration, /SET status = 'FAILED',\s+continuation_status = 'RESUME_UNAVAILABLE'/);
+  assert.match(
+    migration,
+    /quota_reserved = COALESCE\(qr\.quota_used, 0\)/,
+    'unused reservation must not keep consuming shared portfolio budget',
+  );
+  assert.match(migration, /UPDATE quota_reservations r\s+SET status = 'RELEASED'/);
+  assert.match(migration, /UPDATE query_library q\s+SET reserved_at = NULL/);
 });
 
 test('R8: the three extraction flags are read in one settings query', () => {
