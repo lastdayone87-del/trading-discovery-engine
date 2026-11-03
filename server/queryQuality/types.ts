@@ -195,6 +195,12 @@ export interface SelectorContext {
   portfolioRatio: number;
   totalDailyQuotaUnits: number;
   portfolioUnitsUsed: number;
+  /**
+   * Provider-registry capability: an ACTIVE SEARCH_YOUTUBE provider in the
+   * quota-free domain can serve exploration without official portfolio units.
+   * Absent/false keeps the fail-closed exhausted-budget branch.
+   */
+  quotaFreeProviderAvailable?: boolean;
   familyShare: Record<string, number>;
   familyCap: number;
   queryCap: number;

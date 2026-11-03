@@ -101,11 +101,22 @@ remains unmodified; PR #567 was not touched.
   a bounded family-then-source relaxation when the caps would block every
   candidate, and returns `NO_ELIGIBLE_QUERY` when no admitted candidate remains
   or when the bounded portfolio is exhausted before any candidate reaches the
-  minimum sample. The 16-country scheduler owns global country rotation, so the
-  per-country cap is 1 per call.
+  minimum sample **and** the provider registry cannot serve exploration for
+  free. When the official floor is exhausted but an `ACTIVE`
+  `SEARCH_YOUTUBE` registry row in `YOUTUBE_INNERTUBE_FREE` exists, the
+  selector instead returns the deterministic highest-uncertainty/lowest-yield
+  immature arm with reason code `QUOTA_FREE_EXPLORATION`. That capability is
+  read from the same `discovery_provider_registry` rows ordinary allocation
+  rotates over, not from an environment flag or prior run outcome. Official
+  exploration stays blocked: the scheduler re-checks the portfolio floor for
+  every allocated provider that consumes official units, and only zero-unit
+  InnerTube runs skip the check. The 16-country scheduler owns global country
+  rotation, so the per-country cap is 1 per call.
 - New truthful strategies are `UCB_EXPLOITATION`, `UCB_PORTFOLIO`,
-  `COLD_START_GENERATION` and `NEIGHBORHOOD_TARGETED`; `selectionStrategy`
-  remains string-compatible downstream.
+  `COLD_START_GENERATION` and `NEIGHBORHOOD_TARGETED`; quota-free exploration
+  keeps the `UCB_PORTFOLIO` strategy label (so it remains portfolio-accounted)
+  and is distinguished by the `QUOTA_FREE_EXPLORATION` reason code.
+  `selectionStrategy` remains string-compatible downstream.
 - Promotion reads result-level sighting truth, adds the in-flight run, computes
   a posterior LCB and requires `PROVEN_MIN_COMPLETED_RUNS = 2` with
   `PROVEN_LCB_THRESHOLD = 0.5`. Zero-confirm can never become `PROVEN`.
@@ -214,6 +225,7 @@ remains unmodified; PR #567 was not touched.
 | Hierarchy | new surface inherits family prior; no cross-country leakage | posterior hierarchy tests + isolation tests | PASS |
 | Cold start | all 16 countries get valid candidates; cold-start recorded | 123/123 planner matrix; `COLD_START_GENERATION` | PASS |
 | Exploration | 10–20% (default 15%); per-country floor; family/query/source caps | `Q4: portfolio budget…`; selector cap fixtures | PASS |
+| Quota-free exploration | exhausted official floor + ACTIVE `YOUTUBE_INNERTUBE_FREE` registry row may select the deterministic best immature arm (`QUOTA_FREE_EXPLORATION`); paid-only stays blocked; zero-quota runs never mature or supply reward | `Q4: exhausted official budget permits quota-free exploration…`; `Q4: exhausted official budget blocks…`; `Q4: zero-quota free-provider runs…`; `Q4: quota-free capability is derived…` | PASS |
 | Non-domination | no family/query/source over the active cap; caps relax only when they would block every candidate | selector cap filter + cap fixtures | PASS |
 | Non-stationarity | decayed counts; halved yield demoted | 30-day decay + non-stationary simulator | PASS |
 | Duplicate | semantic duplicates suppressed before quota; one stable winner per persisted duplicate group; duplicate-heavy demoted | duplicate tests + `DUPLICATE_SATURATED` promotion guard | PASS |

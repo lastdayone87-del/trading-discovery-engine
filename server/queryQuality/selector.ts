@@ -129,6 +129,18 @@ function deterministicTieBreak(a: CandidateScore, b: CandidateScore, context: Se
   return key(a.candidate).localeCompare(key(b.candidate));
 }
 
+/** Exploration priority: high uncertainty and low observed yield first. */
+function explorationPriority(item: CandidateScore): number {
+  return item.posterior.sd * (1 + 1 / (1 + item.posterior.mean));
+}
+
+/** Deterministic ordering shared by paid and quota-free exploration. */
+function compareExploration(a: CandidateScore, b: CandidateScore, context: SelectorContext): number {
+  const priorityDifference = explorationPriority(b) - explorationPriority(a);
+  if (priorityDifference !== 0) return priorityDifference;
+  return deterministicTieBreak(a, b, context);
+}
+
 /**
  * Deterministic hierarchical, cost-aware UCB selection.
  *
@@ -230,6 +242,7 @@ export function selectHierarchicalUcb(candidates: SelectorCandidate[], context: 
   });
 
   const mature = scored.filter(item => item.candidate.counts.runs >= (context.minSample ?? MIN_SELECTION_SAMPLE));
+  const immature = scored.filter(item => item.candidate.counts.runs < (context.minSample ?? MIN_SELECTION_SAMPLE));
   // The portfolio is the exploration floor for immature arms and explicit
   // coverage debt. Testing `tier !== ATTESTED_EXACT` made every query
   // portfolio-eligible because production never supplies attestations, so a
@@ -248,12 +261,7 @@ export function selectHierarchicalUcb(candidates: SelectorCandidate[], context: 
   if (portfolioNeeded(context) && portfolioPool.length > 0) {
     // Prioritise high posterior uncertainty and low observed confirmed yield,
     // then deterministic index/tie-break. This is not a random exploration arm.
-    chosen = [...portfolioPool].sort((a, b) => {
-      const aPriority = a.posterior.sd * (1 + 1 / (1 + a.posterior.mean));
-      const bPriority = b.posterior.sd * (1 + 1 / (1 + b.posterior.mean));
-      if (bPriority !== aPriority) return bPriority - aPriority;
-      return deterministicTieBreak(a, b, context);
-    })[0];
+    chosen = [...portfolioPool].sort((a, b) => compareExploration(a, b, context))[0];
     strategy = 'UCB_PORTFOLIO';
     reasonCodes = ['PORTFOLIO_BUDGET_RESERVED', 'COVERAGE_OR_UNSEEN_COMPOSITION'];
   } else if (mature.length > 0) {
@@ -264,21 +272,32 @@ export function selectHierarchicalUcb(candidates: SelectorCandidate[], context: 
     chosen = [...scored].sort((a, b) => deterministicTieBreak(a, b, context))[0];
     strategy = 'UCB_PORTFOLIO';
     reasonCodes = ['COLD_START_PRIOR', 'MINIMUM_SAMPLE_NOT_MET'];
+  } else if (context.quotaFreeProviderAvailable === true && immature.length > 0) {
+    // The official portfolio floor is gone, but the provider registry still
+    // proves quota-free SEARCH_YOUTUBE capacity (for example InnerTube). That
+    // capacity can mature an unproven arm without spending official units.
+    // Official/paid exploration stays blocked: the scheduler re-checks the
+    // portfolio floor for every allocated provider that consumes official
+    // quota, while zero-quota runs skip that check.
+    chosen = [...immature].sort((a, b) => compareExploration(a, b, context))[0];
+    strategy = 'UCB_PORTFOLIO';
+    reasonCodes = ['QUOTA_FREE_EXPLORATION', 'MINIMUM_SAMPLE_NOT_MET'];
   } else {
-    // No mature candidate and no reserved exploration budget left. Refuse to
-    // spend quota on an unproven arm rather than inventing an unbounded
-    // exploration branch; the caller may generate a new governed candidate.
+    // No mature candidate, no reserved official exploration budget, and no
+    // registry-backed quota-free capacity. Refuse to spend quota on an
+    // unproven arm rather than inventing an unbounded exploration branch; the
+    // caller may generate a new governed candidate.
     return {
       ...base,
       strategy: 'NO_ELIGIBLE_QUERY',
-      reason: 'The bounded portfolio budget is exhausted and no candidate has reached the minimum sample.',
+      reason: 'The bounded portfolio budget is exhausted, no quota-free provider is available, and no candidate has reached the minimum sample.',
       queryId: null,
       query: null,
       index: null,
       posterior: null,
       tier: null,
       compositionFamily: null,
-      reasonCodes: ['PORTFOLIO_BUDGET_EXHAUSTED', 'FAIL_CLOSED'],
+      reasonCodes: ['PORTFOLIO_BUDGET_EXHAUSTED', 'NO_QUOTA_FREE_PROVIDER', 'FAIL_CLOSED'],
     };
   }
 
@@ -299,10 +318,14 @@ export function selectHierarchicalUcb(candidates: SelectorCandidate[], context: 
     };
   }
 
+  const detail = `${chosen.candidate.query} (mean ${chosen.posterior.mean.toFixed(4)}, SD ${chosen.posterior.sd.toFixed(4)}, c ${c.toFixed(1)}, index ${chosen.index.toFixed(4)}).`;
+  const reason = reasonCodes.includes('QUOTA_FREE_EXPLORATION')
+    ? `Quota-free provider capacity selected the most uncertain immature candidate: ${detail}`
+    : `${strategy === 'UCB_PORTFOLIO' ? 'Bounded portfolio selected an uncertain/coverage candidate' : 'Exploitation selected the highest deterministic optimistic index'}: ${detail}`;
   return {
     ...base,
     strategy,
-    reason: `${strategy === 'UCB_PORTFOLIO' ? 'Bounded portfolio selected an uncertain/coverage candidate' : 'Exploitation selected the highest deterministic optimistic index'}: ${chosen.candidate.query} (mean ${chosen.posterior.mean.toFixed(4)}, SD ${chosen.posterior.sd.toFixed(4)}, c ${c.toFixed(1)}, index ${chosen.index.toFixed(4)}).`,
+    reason,
     queryId: chosen.candidate.queryId,
     query: chosen.candidate.query,
     index: chosen.index,

@@ -14,6 +14,7 @@ import {
   getAppSetting,
   getQueryQualityDecayedCounts,
   getQueryPortfolioBudgetState,
+  isQuotaFreeProviderAvailable,
   getQueryQuotaSpendRows,
   getQueryFailureStates,
   getInFlightPrimaryTermUsage,
@@ -1336,7 +1337,14 @@ async function buildSelectorPool(
   // quota. Comparing only against query history would make a homogeneous pool
   // 100% of its own family/source and cap every candidate forever, even when
   // the family has spent a tiny fraction of the day.
-  const budget = await getQueryPortfolioBudgetState();
+  const [budget, quotaFreeProviderAvailable] = await Promise.all([
+    getQueryPortfolioBudgetState(),
+    // Provider-registry capability, read from the same ACTIVE rows the
+    // scheduler allocates from. It only opens the selector's quota-free
+    // exploration branch; the scheduler still enforces the official portfolio
+    // floor per run.
+    isQuotaFreeProviderAvailable(),
+  ]);
   const shareBase = Math.max(1, totalQuota, budget.dailyQuotaUnits);
   const share = (rows: Map<string, number>, key: string): number => (rows.get(key) || 0) / shareBase;
   const familyShare = Object.fromEntries([...familyQuota.keys()].map(key => [key, share(familyQuota, key)]));
@@ -1353,6 +1361,7 @@ async function buildSelectorPool(
     portfolioRatio: options.portfolioRatio,
     totalDailyQuotaUnits: budget.dailyQuotaUnits,
     portfolioUnitsUsed: budget.portfolioUnitsUsed,
+    quotaFreeProviderAvailable,
     familyShare,
     familyCap: options.familyCap,
     queryCap: 1,

@@ -42,7 +42,7 @@ import { boundedPortfolioRatio, DECAY_HALF_LIFE_DAYS, portfolioContinuationAllow
 import type { QueryQualityDashboardRunInput } from './queryQuality/dashboard';
 import type { QueryAdmission } from './queryQuality/types';
 import type { NativeEvidenceStatus, SourceProvenanceFamily } from './countryNativeIntelligence';
-import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, providerSnapshotFromRegistryRow, isShadowBraveCanaryAllowed, rotateActiveProviderRow, applyDateOrderingProviderGuard, ledgerProviderToRegistryKey, providerCooldownObservationWindowSecs, type ProviderAllocation } from './providerAwareRetrieval';
+import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, providerSnapshotFromRegistryRow, isShadowBraveCanaryAllowed, isQuotaFreeSearchProviderRow, rotateActiveProviderRow, applyDateOrderingProviderGuard, ledgerProviderToRegistryKey, providerCooldownObservationWindowSecs, type ProviderAllocation } from './providerAwareRetrieval';
 import { fingerprintYouTubeKey, projectYouTubeQuotaUsage } from './youtubeQuotaAttribution';
 import { sanitizeSchedulingError, type DiscoveryCandidateDiagnosticPatch } from './discoveryTelemetry';
 import { classifyProviderCapacityFailure, classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
@@ -1472,6 +1472,33 @@ export async function getQueryPortfolioBudgetState(country?:string):Promise<{por
     portfolioUnitsReserved:dailyQuotaUnits*boundedPortfolioRatio(configuredRatio),
     ...(country?{countryUnitsUsed:Math.max(0,Number(countryUsed.rows[0]?.units||0))}:{}),
   };
+}
+
+/**
+ * Whether the provider registry can serve exploration without official quota.
+ *
+ * Selection must not infer this from environment flags or from prior run
+ * outcomes: the authoritative capability is the same `discovery_provider_registry`
+ * row that ordinary allocation rotates over. Only an ACTIVE SEARCH_YOUTUBE row
+ * in the free quota domain grants this. Any lookup failure fails closed, so an
+ * unreadable registry can never open official exploration after budget
+ * exhaustion.
+ */
+export async function isQuotaFreeProviderAvailable():Promise<boolean>{
+  try {
+    const db=await getDb();
+    const res=await db.query(
+      `SELECT provider_key,provider_family,capabilities,quota_domain,mode FROM discovery_provider_registry WHERE mode='ACTIVE' AND capabilities ? 'SEARCH_YOUTUBE'`
+    );
+    return res.rows.some((row:any)=>isQuotaFreeSearchProviderRow({
+      mode:row.mode,
+      quota_domain:row.quota_domain,
+      capabilities:row.capabilities,
+    }));
+  } catch(error) {
+    console.warn('[QuerySelection] Quota-free provider capability lookup failed; failing closed.', error);
+    return false;
+  }
 }
 
 /**

@@ -32,8 +32,9 @@ import {
 import { computePosterior, empiricalPrior, PORTFOLIO_RATIO, SELECTOR_C, portfolioContinuationAllowed } from './posterior';
 import { selectHierarchicalUcb, portfolioBudget, buildHierarchy } from './selector';
 import { deriveQueryFailureState, isQuerySelectable } from './lifecycle';
-import { buildQueryQualityVector, buildAttribution, canPromoteToProven, isRewardEligibleQuota } from './accounting';
+import { buildQueryQualityVector, buildAttribution, canPromoteToProven, isRewardEligibleQuota, rewardRate } from './accounting';
 import { selectQueryCollection } from '../queryPerformance';
+import { isQuotaFreeSearchProviderRow } from '../providerAwareRetrieval';
 import { decideLifecycle } from '../terminologyIntelligence';
 import { buildQueryQualityDashboard, QUERY_QUALITY_DASHBOARD_MAX_ROWS } from './dashboard';
 import { compareSelectors, currentUcb1Index, portfolioPullAdmitted, runSelectorSimulation, SERVING_SELECTOR } from './simulator';
@@ -415,6 +416,133 @@ test('Q4: exhausted portfolio budget cannot be exceeded by coverage or cold-star
   const remaining = selectHierarchicalUcb([cold], selectorContext({ portfolioUnitsUsed: 14, ...coverageDebt }));
   assert.equal(remaining.strategy, 'UCB_PORTFOLIO');
   assert.ok(remaining.queryId);
+});
+
+test('Q4: exhausted official budget permits quota-free exploration when the registry offers InnerTube', () => {
+  const cold = [candidate(1, 'family:A', 0, 0), candidate(2, 'family:B', 0, 0)];
+  const first = selectHierarchicalUcb(cold, selectorContext({
+    portfolioUnitsUsed: 15,
+    quotaFreeProviderAvailable: true,
+  }));
+  assert.equal(first.strategy, 'UCB_PORTFOLIO');
+  assert.ok(first.queryId);
+  assert.ok(first.reasonCodes.includes('QUOTA_FREE_EXPLORATION'));
+  assert.ok(first.reasonCodes.includes('MINIMUM_SAMPLE_NOT_MET'));
+  assert.ok(!first.reasonCodes.includes('PORTFOLIO_BUDGET_EXHAUSTED'));
+  assert.match(first.reason, /Quota-free provider capacity/);
+
+  // Deterministic: the same exhausted-budget pool and capability always yield
+  // the same immature arm, never a random or least-executed pick.
+  const second = selectHierarchicalUcb(cold, selectorContext({
+    portfolioUnitsUsed: 15,
+    quotaFreeProviderAvailable: true,
+  }));
+  assert.deepEqual(first, second);
+
+  // A mature arm still exploits even though the official floor is exhausted;
+  // the free path only replaces the fail-closed immature branch.
+  const mature = selectHierarchicalUcb([candidate(3, 'family:A', 4, 4)], selectorContext({
+    portfolioUnitsUsed: 15,
+    quotaFreeProviderAvailable: true,
+  }));
+  assert.equal(mature.strategy, 'UCB_EXPLOITATION');
+  assert.ok(mature.reasonCodes.includes('MATURE_SAMPLE'));
+});
+
+test('Q4: exhausted official budget blocks exploration when only paid/official providers exist', () => {
+  const cold = candidate(1, 'family:A', 0, 0);
+  const paidOnly = selectHierarchicalUcb([cold], selectorContext({
+    portfolioUnitsUsed: 15,
+    quotaFreeProviderAvailable: false,
+  }));
+  assert.equal(paidOnly.strategy, 'NO_ELIGIBLE_QUERY');
+  assert.equal(paidOnly.queryId, null);
+  assert.ok(paidOnly.reasonCodes.includes('PORTFOLIO_BUDGET_EXHAUSTED'));
+  assert.ok(paidOnly.reasonCodes.includes('NO_QUOTA_FREE_PROVIDER'));
+  assert.ok(paidOnly.reasonCodes.includes('FAIL_CLOSED'));
+  assert.ok(!paidOnly.reasonCodes.includes('QUOTA_FREE_EXPLORATION'));
+
+  // The optional capability defaults to false for callers that cannot prove a
+  // registry-backed free provider, preserving the old fail-closed contract.
+  const unknown = selectHierarchicalUcb([cold], selectorContext({ portfolioUnitsUsed: 15 }));
+  assert.equal(unknown.strategy, 'NO_ELIGIBLE_QUERY');
+  assert.ok(unknown.reasonCodes.includes('PORTFOLIO_BUDGET_EXHAUSTED'));
+});
+
+test('Q4: zero-quota free-provider runs cannot mature an arm or supply reward', () => {
+  // The decayed-count SQL excludes zero-quota runs entirely, so a free-only
+  // arm has no maturity sample. Selection must still treat it as immature even
+  // when quota-free exploration is available.
+  const freeOnlyHistory = {
+    ...candidate(1, 'family:A'),
+    counts: { confirmed: 5, quality: 4, quotaUnits: 0, runs: 0 },
+  };
+  const decision = selectHierarchicalUcb([freeOnlyHistory], selectorContext({
+    portfolioUnitsUsed: 15,
+    quotaFreeProviderAvailable: true,
+  }));
+  assert.ok(decision.reasonCodes.includes('QUOTA_FREE_EXPLORATION'));
+  assert.ok(decision.reasonCodes.includes('MINIMUM_SAMPLE_NOT_MET'));
+  assert.ok(!decision.reasonCodes.includes('MATURE_SAMPLE'));
+
+  // A zero-quota run cannot contribute creators to a per-100-quota reward it
+  // never paid for.
+  const reward = rewardRate(buildQueryQualityVector({
+    rawResults: 8, distinctResults: 8, newConfirmedCreators: 8, quotaUsed: 0,
+  }));
+  assert.equal(reward.eligible, false);
+  assert.ok(reward.reasonCodes.includes('ZERO_QUOTA_EXCLUDED'));
+  assert.equal(reward.rate, 0);
+
+  const dbCore = readFileSync(join(__dirname, '..', 'dbCore.ts'), 'utf8');
+  assert.match(dbCore, /AND GREATEST\(0,qr\.quota_used\)>0/);
+});
+
+test('Q4: quota-free capability is derived from the allocation provider registry, not a stale flag', () => {
+  // Only the exact row shape ordinary allocation can select grants capacity.
+  assert.equal(isQuotaFreeSearchProviderRow({
+    mode: 'ACTIVE',
+    quota_domain: 'YOUTUBE_INNERTUBE_FREE',
+    capabilities: ['SEARCH_YOUTUBE'],
+  }), true);
+  assert.equal(isQuotaFreeSearchProviderRow({
+    mode: 'ACTIVE',
+    quota_domain: 'YOUTUBE_INNERTUBE_FREE',
+    capabilities: '["SEARCH_YOUTUBE"]',
+  }), true);
+  assert.equal(isQuotaFreeSearchProviderRow({
+    mode: 'ACTIVE',
+    quota_domain: 'YOUTUBE_DATA_API',
+    capabilities: ['SEARCH_YOUTUBE'],
+  }), false);
+  assert.equal(isQuotaFreeSearchProviderRow({
+    mode: 'PAUSED',
+    quota_domain: 'YOUTUBE_INNERTUBE_FREE',
+    capabilities: ['SEARCH_YOUTUBE'],
+  }), false);
+  assert.equal(isQuotaFreeSearchProviderRow({
+    mode: 'ACTIVE',
+    quota_domain: 'YOUTUBE_INNERTUBE_FREE',
+    capabilities: ['SEARCH_BRAVE_DIRECT'],
+  }), false);
+
+  const dbCore = readFileSync(join(__dirname, '..', 'dbCore.ts'), 'utf8');
+  const helperStart = dbCore.indexOf('export async function isQuotaFreeProviderAvailable');
+  const helperEnd = dbCore.indexOf('export async function reservePortfolioContinuationPage', helperStart);
+  assert.ok(helperStart > 0 && helperEnd > helperStart);
+  const helper = dbCore.slice(helperStart, helperEnd);
+  assert.match(helper, /FROM discovery_provider_registry/);
+  assert.match(helper, /mode='ACTIVE'/);
+  assert.match(helper, /capabilities \? 'SEARCH_YOUTUBE'/);
+  assert.match(helper, /isQuotaFreeSearchProviderRow/);
+  // Neither configuration env nor the execution-time free-run flag may stand
+  // in for an actual ACTIVE registry row.
+  assert.doesNotMatch(helper, /process\.env/);
+  assert.doesNotMatch(helper, /quotaFreeInnertubeProvider/);
+
+  const intelligence = readFileSync(join(__dirname, '..', 'queryIntelligence.ts'), 'utf8');
+  assert.match(intelligence, /isQuotaFreeProviderAvailable\(\)/);
+  assert.match(intelligence, /quotaFreeProviderAvailable,/);
 });
 
 test('Q4: a mature proven pool exploits even while portfolio budget remains', () => {

@@ -115,6 +115,35 @@ export interface RegistryProviderRow {
   mode: string;
 }
 
+/** Quota domain whose providers spend no official YouTube units. */
+export const QUOTA_FREE_SEARCH_PROVIDER_QUOTA_DOMAIN = 'YOUTUBE_INNERTUBE_FREE';
+
+function registryCapabilities(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map(String);
+  if (typeof value !== 'string') return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * True when a registry row proves quota-free SEARCH_YOUTUBE capacity.
+ *
+ * This is deliberately derived from the same ACTIVE registry row the scheduler
+ * may allocate ordinary traffic to. A paused/retired row, a different quota
+ * domain, or a row without SEARCH_YOUTUBE never grants free exploration.
+ */
+export function isQuotaFreeSearchProviderRow(
+  row: Pick<RegistryProviderRow, 'mode' | 'quota_domain' | 'capabilities'>,
+): boolean {
+  return String(row.mode) === 'ACTIVE'
+    && String(row.quota_domain) === QUOTA_FREE_SEARCH_PROVIDER_QUOTA_DOMAIN
+    && registryCapabilities(row.capabilities).includes('SEARCH_YOUTUBE');
+}
+
 /**
  * Maps a registry row to a validated ProviderAllocation snapshot. Surface
  * derivation mirrors the frontier allocator exactly: family 'youtube' serves
