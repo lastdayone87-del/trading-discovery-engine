@@ -64,7 +64,7 @@ const TIER_A_PATTERNS: Array<[string, RegExp]> = [
   // C5 multilingual education/execution vocabulary. These are the same
   // governed language-pack phrases used by the deterministic providers; they
   // classify a document as trading, not an entire creator as confirmed.
-  ['NATIVE_EDUCATION', /(trading\s*lernen|trading\s*strateg(?:y|ies|ien|ie)|strategie\s*erkl[aä]rt|chartanalyse|trade\s*analyse|fehleranalyse|trading\s*ausbildung|trade\s*einstieg|stop\s*loss|positionsgr[oö][sß]e|risiko\s*pro\s*trade|markttechnik|orderflow|trading\s*journal|strategie\s*backtest|gestion\s*du\s*risque|journal\s*de\s*trading|carnet\s*d.ordres|point\s*d.entr[eé]e|backtest\s*strat[eé]gie|formation\s*trading|strat[eé]gie\s*expliqu[eé]e|analyse\s*de\s*trade|cours\s*de\s*trading|gesti[oó]n\s*de\s*riesgo|diario\s*de\s*trading|punto\s*de\s*entrada|flujo\s*de\s*[oó]rdenes|backtest\s*de\s*estrategia|curso\s*de\s*trading|estrategia\s*explicada|an[aá]lisis\s*de\s*operaciones|clase\s*de\s*trading|gestione\s*del\s*rischio|diario\s*di\s*trading|punto\s*di\s*ingresso|book\s*ordini|backtest\s*strategia|corso\s*di\s*trading|strategia\s*spiegata|analisi\s*delle\s*operazioni|lezione\s*di\s*trading|risicomanagement|tradingdagboek|instappunt|orderboek|leren\s*traden|strategie\s*uitgelegd|technische\s*analyse|trading\s*cursus|risikostyring|inngangspunkt|ing[aå]ngspunkt|aksjehandel|handelsstrategi|riskhantering|handelsplan|l[aæ]r\s*(?:dig\s*)?trading|teknisk\s*analys|エントリーポイント|損切り|資金管理|トレード日誌|ストラテジー検証|トレード講座|手法解説|トレード振り返り|初心者向けfx|خطة\s*التداول|إدارة\s*المخاطر|نقطة\s*الدخول|وقف\s*الخسارة|تعليم\s*التداول|تحليل\s*فني|交易计划|风险管理|入场点|止损|股票交易|策略回测|交易教学|技术分析|交易策略|pelan\s*dagangan|pengurusan\s*risiko|titik\s*masuk|henti\s*rugi|dagangan\s*saham|belajar\s*berdagang|analisis\s*teknikal|strategi\s*dagangan)/iu],
+  ['NATIVE_EDUCATION', /(trading\s*lernen|trading\s*strateg(?:y|ies|ien|ie)|strategie\s*erkl[aä]rt|chartanalyse|trade\s*analyse|fehleranalyse|trading\s*ausbildung|trade\s*einstieg|stop\s*loss|positionsgr[oö][sß]e|risiko\s*pro\s*trade|markttechnik|orderflow|trading\s*journal|strategie\s*backtest|gestion\s*du\s*risque|journal\s*de\s*trading|carnet\s*d.ordres|point\s*d.entr[eé]e|backtest\s*strat[eé]gie|formation\s*trading|strat[eé]gie\s*expliqu[eé]e|analyse\s*de\s*trade|cours\s*de\s*trading|gesti[oó]n\s*de\s*riesgo|diario\s*de\s*trading|punto\s*de\s*entrada|flujo\s*de\s*[oó]rdenes|backtest\s*de\s*estrategia|curso\s*de\s*trading|estrategia\s*explicada|an[aá]lisis\s*de\s*operaciones|clase\s*de\s*trading|gestione\s*del\s*rischio|diario\s*di\s*trading|punto\s*di\s*ingresso|book\s*ordini|backtest\s*strategia|corso\s*di\s*trading|strategia\s*spiegata|analisi\s*delle\s*operazioni|lezione\s*di\s*trading|risicomanagement|tradingdagboek|instappunt|orderboek|leren\s*traden|strategie\s*uitgelegd|technische\s*analyse|trading\s*cursus|risikostyring|inngangspunkt|ing[aå]ngspunkt|aksjehandel|handelsstrategi|riskhantering|handelsplan|l[aæ]r\s*(?:dig\s*)?trading|teknisk\s*analys|エントリーポイント|損切り|資金管理|トレード日誌|ストラテジー検証|トレード講座|手法解説|トレード振り返り|初心者向けfx|خطة\s*التداول|إدارة\s*المخاطر|نقطة\s*الدخول|وقف\s*الخسارة|تعليم\s*التداول|تحليل\s*فني|交易计划|风险管理|入场点|止损|股票交易|策略回测|交易教学|技术分析|交易策略|交易計劃|風險管理|入場點|止損|策略回測|交易教學|技術分析|期貨交易|外匯交易|pelan\s*dagangan|pengurusan\s*risiko|titik\s*masuk|henti\s*rugi|dagangan\s*saham|belajar\s*berdagang|analisis\s*teknikal|strategi\s*dagangan)/iu],
 ];
 
 export function tierATradingSignals(text: string, context?: LayeredKnowledgeContext): string[] {
@@ -91,9 +91,11 @@ const FINANCIAL_CONTEXT_PATTERN = /\b(trad(?:e|ing|er|en)|stocks?|equit(?:y|ies)
  * `取引` (transaction/deal) and `注文` (order) are ordinary commercial words
  * too (for example 电商交易教学, 取引先, 商品注文), so they are not market
  * context on their own. Instrument and venue names remain valid context,
- * which keeps 股票交易, 期货交易, 東京証券取引所 and 日経225 analysis as trading.
+ * which keeps 股票交易, 期货交易, 期貨交易, 東京証券取引所 and 日経225 analysis
+ * as trading. Both Simplified and Traditional Chinese forms are listed so
+ * script choice does not decide whether a creator is recognised.
  */
-export const FINANCIAL_CONTEXT_CJK_PATTERN = /(株(?!式会社)|仮想通貨|暗号資産|為替|先物|トレード|投資|板読み|日経|注文フロー|取引所|بورصة|الأسهم|股票|期货|外汇|证券|债券|基金|加密货币|数字货币|股市|港股|美股|A股|K线|大盘)/u;
+export const FINANCIAL_CONTEXT_CJK_PATTERN = /(株(?!式会社)|仮想通貨|暗号資産|為替|先物|トレード|投資|板読み|日経|注文フロー|取引所|بورصة|الأسهم|股票|期货|期貨|外汇|外匯|证券|證券|债券|債券|基金|加密货币|加密貨幣|数字货币|數位貨幣|股市|港股|美股|A股|K线|K線|大盘|大盤)/u;
 
 export function isTierATradingText(text: string, context?: LayeredKnowledgeContext): boolean {
   const normalized = String(text || '').normalize('NFKC');

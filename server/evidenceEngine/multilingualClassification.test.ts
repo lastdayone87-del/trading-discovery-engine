@@ -108,6 +108,18 @@ test('generic Chinese transaction education is not financial-market context', ()
   assert.equal(isTradingFocusedText('股票交易教学', context), true);
 });
 
+test('Traditional Chinese market terms remain financial-market context', () => {
+  const context = getLayeredKnowledgeContext('Singapore');
+  // Regression: removing bare `交易` must not drop Traditional Chinese
+  // creators whose text uses 期貨/外匯 with an education phrase.
+  assert.equal(isTierATradingText('期貨交易策略', context), true);
+  assert.equal(isTierATradingText('外匯交易策略', context), true);
+  assert.equal(isTierATradingText('股票交易教學', context), true);
+  assert.equal(isTierATradingText('股票技術分析', context), true);
+  // The bare transaction word still cannot qualify e-commerce content.
+  assert.equal(isTierATradingText('電商交易教學', context), false);
+});
+
 test('generic Japanese transaction words are not financial-market context', () => {
   const context = getLayeredKnowledgeContext('Japan');
   assert.equal(isTierATradingText('取引先のテクニカル分析', context), false);
