@@ -113,7 +113,9 @@ remains unmodified; PR #567 was not touched.
   is restricted to free rows for that decision, and scheduling fails closed
   with `QUOTA_FREE_PROVIDER_UNAVAILABLE`, `QUOTA_FREE_PROVIDER_REQUIRED` or
   `QUOTA_FREE_PROVIDER_CANNOT_SERVE_DATE_ORDERING` instead of falling back to
-  the official provider. Official exploration stays blocked: for
+  the official provider. Quota-free candidates are pinned to RELEVANCE before
+  the ordering draw because InnerTube cannot serve DATE. Official exploration
+  stays blocked: for
   portfolio-labelled strategies the scheduler re-checks the portfolio floor
   whenever the allocated provider consumes official units (the official
   YouTube page reserves 100 units). Runs with zero official units — InnerTube
@@ -232,7 +234,7 @@ remains unmodified; PR #567 was not touched.
 | Hierarchy | new surface inherits family prior; no cross-country leakage | posterior hierarchy tests + isolation tests | PASS |
 | Cold start | all 16 countries get valid candidates; cold-start recorded | 123/123 planner matrix; `COLD_START_GENERATION` | PASS |
 | Exploration | 10–20% (default 15%); per-country floor; family/query/source caps | `Q4: portfolio budget…`; selector cap fixtures | PASS |
-| Quota-free exploration | exhausted official floor + ACTIVE `YOUTUBE_INNERTUBE_FREE` registry row may select the deterministic least-attempted immature arm (`QUOTA_FREE_EXPLORATION`); scheduling is restricted to free rows and fails closed rather than falling back to official; zero-quota runs never mature or supply reward and only rotate free attempts | `Q4: exhausted official budget permits quota-free exploration…`; `Q4: quota-free exploration rotates…`; `Q4: exhausted official budget blocks…`; `Q4: zero-quota free-provider runs…`; `Q4: quota-free capability is derived…`; `Q4: quota-free selection carries a scheduling requirement…` | PASS |
+| Quota-free exploration | exhausted official floor + ACTIVE `YOUTUBE_INNERTUBE_FREE` registry row may select the deterministic least-attempted immature arm (`QUOTA_FREE_EXPLORATION`); scheduling is restricted to free rows on RELEVANCE ordering and fails closed rather than falling back to official; zero-quota runs never mature or supply reward and only rotate free attempts | `Q4: exhausted official budget permits quota-free exploration…`; `Q4: quota-free exploration rotates…`; `Q4: exhausted official budget blocks…`; `Q4: zero-quota free-provider runs…`; `Q4: quota-free capability is derived…`; `Q4: quota-free selection carries a scheduling requirement…` | PASS |
 | Non-domination | no family/query/source over the active cap; caps relax only when they would block every candidate | selector cap filter + cap fixtures | PASS |
 | Non-stationarity | decayed counts; halved yield demoted | 30-day decay + non-stationary simulator | PASS |
 | Duplicate | semantic duplicates suppressed before quota; one stable winner per persisted duplicate group; duplicate-heavy demoted | duplicate tests + `DUPLICATE_SATURATED` promotion guard | PASS |

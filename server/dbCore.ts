@@ -3057,9 +3057,15 @@ export async function scheduleAutonomousQueryRuns(
         `SELECT COUNT(*) FILTER (WHERE search_ordering='DATE')::int AS date, COUNT(*)::int AS total
          FROM query_runs WHERE retrieval_lane='VIDEO' AND scheduled_at >= date_trunc('day', now() AT TIME ZONE 'UTC')`
       );
-      const controlSearchOrdering = allocatedDimensions
-        ? allocatedDimensions.searchOrdering as SearchOrdering
-        : allocateSearchOrdering(controlRetrievalLane, orderingCounts.rows[0]?.date || 0, orderingCounts.rows[0]?.total || 0, datePercent);
+      // InnerTube has no date ordering, and quota-free exploration cannot be
+      // retargeted to the official provider after the portfolio floor is
+      // exhausted. Pin these candidates to RELEVANCE before the ordering draw
+      // rather than drawing DATE and failing closed.
+      const controlSearchOrdering: SearchOrdering = candidate.quotaFreeRequired
+        ? 'RELEVANCE'
+        : allocatedDimensions
+          ? allocatedDimensions.searchOrdering as SearchOrdering
+          : allocateSearchOrdering(controlRetrievalLane, orderingCounts.rows[0]?.date || 0, orderingCounts.rows[0]?.total || 0, datePercent);
 
       const controlConfig = buildRetrievalConfiguration({
         searchOrdering: controlSearchOrdering,
@@ -3112,16 +3118,21 @@ export async function scheduleAutonomousQueryRuns(
 
       // Phase 9 Canary Treatment Reservation under transaction advisory lock
       activeOperation = 'phase9_treatment_reservation';
-      const canaryTreatment = await reserveRetrievalCanaryTreatment({
-        opportunityKey: oppKey,
-        neighborhoodKey: neighborhood.neighborhoodKey,
-        retrievalLane: controlRetrievalLane,
-        defaultOrdering: controlSearchOrdering,
-        frontierState,
-        isSaturating,
-        providerQuotaUnits: allocatedProvider.costDomain==='YOUTUBE_DATA_API' ? 100 : 0,
-        clientOverride: client
-      });
+      // A quota-free run cannot accept a DATE treatment config: the free
+      // provider has no date ordering and there is no official budget left to
+      // retarget. Keep these exceptional runs on RELEVANCE.
+      const canaryTreatment = candidate.quotaFreeRequired
+        ? { authorized: false, reason: 'QUOTA_FREE_EXPLORATION_RELEVANCE_ONLY' }
+        : await reserveRetrievalCanaryTreatment({
+          opportunityKey: oppKey,
+          neighborhoodKey: neighborhood.neighborhoodKey,
+          retrievalLane: controlRetrievalLane,
+          defaultOrdering: controlSearchOrdering,
+          frontierState,
+          isSaturating,
+          providerQuotaUnits: allocatedProvider.costDomain==='YOUTUBE_DATA_API' ? 100 : 0,
+          clientOverride: client
+        });
 
       setDiagnostic({ phase9TreatmentOutcome: canaryTreatment.authorized ? 'AUTHORIZED' : 'NOT_AUTHORIZED', phase9TreatmentReasonCode: canaryTreatment.reason });
       if (canaryTreatment.authorized && canaryTreatment.config && canaryTreatment.reservation) {
@@ -3138,15 +3149,22 @@ export async function scheduleAutonomousQueryRuns(
         throw new Error('PHASE9_TREATMENT_CHANGED_PHASE8_NEIGHBORHOOD');
       }
 
-      // Quota-free exploration may only execute on zero-cost capacity. This
-      // check runs after canary treatment/ordering resolution and before the
-      // DATE-ordering official retarget, so neither an explicit provider, a
-      // frontier lineage nor an ordering guard can silently turn the decision
-      // into an official run against the exhausted portfolio floor.
+      // Quota-free candidates are pinned to RELEVANCE before the ordering
+      // draw, so this guard is unreachable on the normal path. It remains
+      // fail-closed for a frontier lineage or any future caller that
+      // reintroduces DATE.
       if (candidate.quotaFreeRequired && searchOrdering === 'DATE') {
         await failStep('quota_free_provider_capability', new Error('QUOTA_FREE_PROVIDER_CANNOT_SERVE_DATE_ORDERING'));
       }
-      if (candidate.quotaFreeRequired && allocatedProvider.costDomain !== 'YOUTUBE_INNERTUBE_FREE') {
+      // The selector's free-capacity proof is an ACTIVE SEARCH_YOUTUBE row in
+      // the free quota domain. Re-check the full row shape here: frontier
+      // lineage or an explicit provider can override the rotation pick, and a
+      // canary/global or non-search row must not satisfy the requirement.
+      if (candidate.quotaFreeRequired && (
+        allocatedProvider.costDomain !== 'YOUTUBE_INNERTUBE_FREE' ||
+        allocatedProvider.capability !== 'SEARCH_YOUTUBE' ||
+        eligibleProvider.rows[0]?.mode !== 'ACTIVE'
+      )) {
         await failStep('quota_free_provider_capability', new Error('QUOTA_FREE_PROVIDER_REQUIRED'));
       }
 

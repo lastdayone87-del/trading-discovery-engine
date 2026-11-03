@@ -604,6 +604,13 @@ test('Q4: quota-free selection carries a scheduling requirement that cannot fall
   assert.match(dbCore, /QUOTA_FREE_PROVIDER_UNAVAILABLE/);
   assert.match(dbCore, /QUOTA_FREE_PROVIDER_REQUIRED/);
   assert.match(dbCore, /QUOTA_FREE_PROVIDER_CANNOT_SERVE_DATE_ORDERING/);
+  // Quota-free draws are pinned to RELEVANCE before ordering allocation and
+  // skip the canary treatment that could switch them to DATE; the DATE guard
+  // remains only as fail-closed defence. The registry row must be the full
+  // ACTIVE SEARCH_YOUTUBE free shape, not just any zero-cost domain.
+  assert.match(dbCore, /const controlSearchOrdering: SearchOrdering = candidate\.quotaFreeRequired\s*\n\s*\? 'RELEVANCE'/);
+  assert.match(dbCore, /candidate\.quotaFreeRequired\s*\n\s*\? \{ authorized: false, reason: 'QUOTA_FREE_EXPLORATION_RELEVANCE_ONLY' \}/);
+  assert.match(dbCore, /eligibleProvider\.rows\[0\]\?\.mode !== 'ACTIVE'/);
   // A normal (non-required) allocation keeps its historical fail-open default
   // only; a required free allocation never falls back to official.
   assert.match(dbCore, /if \(candidate\.quotaFreeRequired\) await failStep\('quota_free_provider_allocation', error\);/);
