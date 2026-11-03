@@ -565,6 +565,14 @@ test('Q4: quota-free selection carries a scheduling requirement that cannot fall
   const discovery = readFileSync(join(__dirname, '..', 'autonomousDiscovery.ts'), 'utf8');
   assert.match(discovery, /quotaFreeRequired: selected\.quotaFreeRequired === true/);
 
+  // The experiment wrapper reconstructs serving-selector results for its
+  // control arm and both fallbacks. Every reconstruction must carry the
+  // scheduling requirement, otherwise an exhausted-portfolio control run
+  // would rotate back to the official provider.
+  const experiments = readFileSync(join(__dirname, '..', 'querySelectionExperiments.ts'), 'utf8');
+  assert.match(experiments, /quotaFreeRequired\?: boolean;/);
+  assert.equal((experiments.match(/quotaFreeRequired: base\.quotaFreeRequired/g) || []).length, 3);
+
   const dbCore = readFileSync(join(__dirname, '..', 'dbCore.ts'), 'utf8');
   assert.match(dbCore, /const allocationRows = candidate\.quotaFreeRequired/);
   assert.match(dbCore, /quotaFreeSearchProviderRows\(rotationRes\.rows\)/);

@@ -808,6 +808,8 @@ export async function selectExperimentalQueryForCountry(
   queryRecord: QueryRecord;
   selectionStrategy: string;
   reason: string;
+  /** Scheduling must allocate a registry-backed quota-free provider. */
+  quotaFreeRequired?: boolean;
   experiment: SelectionExperimentObservation | null;
 } | null> {
   const now = new Date();
@@ -843,7 +845,12 @@ export async function selectExperimentalQueryForCountry(
     // eligible query yields no candidate — never a cycle-failing exception
     // merely because the experimental wrapper is active.
     if (!base) return null;
-    return { queryRecord: base.queryRecord, selectionStrategy: base.selectionStrategy, reason: base.reason };
+    return {
+      queryRecord: base.queryRecord,
+      selectionStrategy: base.selectionStrategy,
+      reason: base.reason,
+      quotaFreeRequired: base.quotaFreeRequired,
+    };
   };
   if (!selection || !eligibility.eligible) {
     const base = await delegateLegacy();
@@ -895,6 +902,7 @@ export async function selectExperimentalQueryForCountry(
       queryRecord: base.queryRecord,
       selectionStrategy: base.selectionStrategy,
       reason: base.reason,
+      quotaFreeRequired: base.quotaFreeRequired,
       experiment: buildSelectionExperimentObservation({
         ...envelopeBase,
         reason: 'Control arm: serving selector unchanged.',
@@ -930,6 +938,7 @@ export async function selectExperimentalQueryForCountry(
       queryRecord: base.queryRecord,
       selectionStrategy: base.selectionStrategy,
       reason: base.reason,
+      quotaFreeRequired: base.quotaFreeRequired,
       experiment: buildSelectionExperimentObservation({
         ...envelopeBase,
         reason: 'Requested treatment arm but the eligible pool was empty; served control fallback.',

@@ -626,7 +626,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
           // Opt-in experimental selection substitutes the UCB1 call at this
           // legacy site only. A null experimental result propagates as-is to
           // the existing skip path below (never re-runs legacy selection).
-          let fallbackSelection: { queryRecord: any; selectionStrategy: any; reason: string } | null;
+          let fallbackSelection: { queryRecord: any; selectionStrategy: any; reason: string; quotaFreeRequired?: boolean } | null;
           let fallbackExperiment: SelectionExperimentObservation | null = null;
           if (normalizedExperiment) {
             const experimental = await selectExperimentalQueryForCountry(legacyCountry, normalizedExperiment, { opportunityKey: `${opportunityKey}:fallback`, scopePromotionBasis });
@@ -656,7 +656,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         }
       } else {
         // Same opt-in substitution as the fallback site above.
-        let legacySelection: { queryRecord: any; selectionStrategy: any; reason: string } | null;
+        let legacySelection: { queryRecord: any; selectionStrategy: any; reason: string; quotaFreeRequired?: boolean } | null;
         let legacyExperiment: SelectionExperimentObservation | null = null;
         if (normalizedExperiment) {
           const experimental = await selectExperimentalQueryForCountry(country, normalizedExperiment, { opportunityKey: `${opportunityKey}:legacy`, scopePromotionBasis });
