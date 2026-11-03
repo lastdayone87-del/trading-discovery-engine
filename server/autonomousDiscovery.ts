@@ -506,7 +506,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         research = await getAllocatedResearchQuery(country);
       }
 
-      let selected: { queryRecord: any; selectionStrategy: any; reason: string };
+      let selected: { queryRecord: any; selectionStrategy: any; reason: string; quotaFreeRequired?: boolean };
       // Experiment envelope for the scheduled run, if an opt-in selection
       // experiment served this attempt. Null on every legacy path (targeted,
       // research, native, or no experiment requested).
@@ -744,6 +744,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         query: selected.queryRecord,
         strategy: selected.selectionStrategy,
         reason: `${selected.reason} Execution authority: ${queryAuthority.reasonCodes.join(', ')}.`,
+        quotaFreeRequired: selected.quotaFreeRequired === true,
         allocationOrigin: frontierAllocationInfo?.authorized ? 'FRONTIER_CANARY' : 'LEGACY',
         frontierDecisionId: frontierAllocationInfo?.authorized ? frontierAllocationInfo.decision?.decisionId : undefined,
         targetNeighborhoodDimensions: frontierAllocationInfo?.authorized ? frontierAllocationInfo.targetNeighborhoodDimensions : undefined,

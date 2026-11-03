@@ -42,7 +42,7 @@ import { boundedPortfolioRatio, DECAY_HALF_LIFE_DAYS, portfolioContinuationAllow
 import type { QueryQualityDashboardRunInput } from './queryQuality/dashboard';
 import type { QueryAdmission } from './queryQuality/types';
 import type { NativeEvidenceStatus, SourceProvenanceFamily } from './countryNativeIntelligence';
-import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, providerSnapshotFromRegistryRow, isShadowBraveCanaryAllowed, isQuotaFreeSearchProviderRow, rotateActiveProviderRow, applyDateOrderingProviderGuard, ledgerProviderToRegistryKey, providerCooldownObservationWindowSecs, type ProviderAllocation } from './providerAwareRetrieval';
+import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, providerSnapshotFromRegistryRow, isShadowBraveCanaryAllowed, isQuotaFreeSearchProviderRow, quotaFreeSearchProviderRows, rotateActiveProviderRow, applyDateOrderingProviderGuard, ledgerProviderToRegistryKey, providerCooldownObservationWindowSecs, type ProviderAllocation } from './providerAwareRetrieval';
 import { fingerprintYouTubeKey, projectYouTubeQuotaUsage } from './youtubeQuotaAttribution';
 import { sanitizeSchedulingError, type DiscoveryCandidateDiagnosticPatch } from './discoveryTelemetry';
 import { classifyProviderCapacityFailure, classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
@@ -2736,6 +2736,13 @@ export interface AutonomousQueryCandidate {
   frontierDecisionId?: string;
   targetNeighborhoodDimensions?: DiscoveryNeighborhoodDimensions;
   provider?: ProviderAllocation;
+  /**
+   * Selection proved the official portfolio floor is exhausted and chose this
+   * arm for quota-free capacity. Scheduling must allocate an ACTIVE
+   * SEARCH_YOUTUBE provider in the free quota domain or fail closed; it may
+   * never fall back to the official provider.
+   */
+  quotaFreeRequired?: boolean;
   allowShadowProvider?: boolean;
   /**
    * Opt-in selection-experiment observation (Thompson/Contextual/CONTROL).
@@ -2954,14 +2961,30 @@ export async function scheduleAutonomousQueryRuns(
           ).catch(() => ({ rows: [] as any[] }));
           const coolingKeys = (coolingRes.rows || []).map((row: any) => ledgerProviderToRegistryKey(String(row.provider)));
           if (Array.isArray(rotationRes.rows) && rotationRes.rows.length > 0) {
-            const picked = rotateActiveProviderRow(rotationRes.rows, `scheduled:${candidate.query.id}:${candidate.query.country}`, coolingKeys);
+            // A quota-free exploration decision must be served by quota-free
+            // capacity. Filtering here prevents the stable rotation key from
+            // selecting the official provider and failing later against the
+            // exhausted portfolio floor.
+            const allocationRows = candidate.quotaFreeRequired
+              ? quotaFreeSearchProviderRows(rotationRes.rows)
+              : rotationRes.rows;
+            if (allocationRows.length === 0) {
+              throw new Error('QUOTA_FREE_PROVIDER_UNAVAILABLE');
+            }
+            const picked = rotateActiveProviderRow(allocationRows, `scheduled:${candidate.query.id}:${candidate.query.country}`, coolingKeys);
             // Registry rows carry quota_domain (there is no cost_domain
             // column); providerSnapshotFromRegistryRow derives the allocation
             // costDomain from it and validates the snapshot, so a bad column
             // fails loudly here instead of silently pinning traffic to official.
             allocatedProvider = providerSnapshotFromRegistryRow(picked, 'SEARCH_YOUTUBE');
+          } else if (candidate.quotaFreeRequired) {
+            throw new Error('QUOTA_FREE_PROVIDER_UNAVAILABLE');
           }
-        } catch {
+        } catch (error) {
+          // Normal allocation keeps its historical fail-open default to the
+          // official provider. A quota-free requirement cannot: falling back
+          // would spend official budget the selector already found exhausted.
+          if (candidate.quotaFreeRequired) await failStep('quota_free_provider_allocation', error);
           allocatedProvider = providerSnapshot(YOUTUBE_SEARCH_PROVIDER);
         }
       }
@@ -3113,6 +3136,18 @@ export async function scheduleAutonomousQueryRuns(
       if (allocatedDimensions && (retrievalLane !== allocatedDimensions.retrievalLane ||
           searchOrdering !== allocatedDimensions.searchOrdering)) {
         throw new Error('PHASE9_TREATMENT_CHANGED_PHASE8_NEIGHBORHOOD');
+      }
+
+      // Quota-free exploration may only execute on zero-cost capacity. This
+      // check runs after canary treatment/ordering resolution and before the
+      // DATE-ordering official retarget, so neither an explicit provider, a
+      // frontier lineage nor an ordering guard can silently turn the decision
+      // into an official run against the exhausted portfolio floor.
+      if (candidate.quotaFreeRequired && searchOrdering === 'DATE') {
+        await failStep('quota_free_provider_capability', new Error('QUOTA_FREE_PROVIDER_CANNOT_SERVE_DATE_ORDERING'));
+      }
+      if (candidate.quotaFreeRequired && allocatedProvider.costDomain !== 'YOUTUBE_INNERTUBE_FREE') {
+        await failStep('quota_free_provider_capability', new Error('QUOTA_FREE_PROVIDER_REQUIRED'));
       }
 
       // DATE-ordering capability guard: InnerTube exposes no sort-by-date, so

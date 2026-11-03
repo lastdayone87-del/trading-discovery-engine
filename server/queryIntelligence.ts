@@ -987,6 +987,8 @@ export interface QuerySelectionResult {
     | 'COLD_START_GENERATION'
     | 'NEIGHBORHOOD_TARGETED';
   reason: string;
+  /** Scheduling must allocate a registry-backed quota-free provider. */
+  quotaFreeRequired?: boolean;
   selector?: SelectorDecision;
   admission?: {
     hash: string;
@@ -1029,6 +1031,7 @@ export async function selectNextQueryForCountry(
   selector?: SelectorDecision;
   admission?: QuerySelectionResult['admission'];
   reason: string;
+  quotaFreeRequired?: boolean;
 } | null> {
   const now = new Date();
   const nowIso = now.toISOString();
@@ -1413,6 +1416,7 @@ function buildSelectionResult(
   return { queryRecord: selected,
     selectionStrategy: strategy,
     reason: `${portfolioMarker}${reason}`,
+    quotaFreeRequired: selector.reasonCodes.includes('QUOTA_FREE_EXPLORATION'),
     selector,
     admission: admissionInfo ? {
       hash: admissionInfo.admission.candidateHash,

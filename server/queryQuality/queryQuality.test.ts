@@ -34,7 +34,7 @@ import { selectHierarchicalUcb, portfolioBudget, buildHierarchy } from './select
 import { deriveQueryFailureState, isQuerySelectable } from './lifecycle';
 import { buildQueryQualityVector, buildAttribution, canPromoteToProven, isRewardEligibleQuota, rewardRate } from './accounting';
 import { selectQueryCollection } from '../queryPerformance';
-import { isQuotaFreeSearchProviderRow } from '../providerAwareRetrieval';
+import { isQuotaFreeSearchProviderRow, quotaFreeSearchProviderRows } from '../providerAwareRetrieval';
 import { decideLifecycle } from '../terminologyIntelligence';
 import { buildQueryQualityDashboard, QUERY_QUALITY_DASHBOARD_MAX_ROWS } from './dashboard';
 import { compareSelectors, currentUcb1Index, portfolioPullAdmitted, runSelectorSimulation, SERVING_SELECTOR } from './simulator';
@@ -543,6 +543,37 @@ test('Q4: quota-free capability is derived from the allocation provider registry
   const intelligence = readFileSync(join(__dirname, '..', 'queryIntelligence.ts'), 'utf8');
   assert.match(intelligence, /isQuotaFreeProviderAvailable\(\)/);
   assert.match(intelligence, /quotaFreeProviderAvailable,/);
+});
+
+test('Q4: quota-free selection carries a scheduling requirement that cannot fall back to official', () => {
+  const official = {
+    provider_key: 'youtube-search', mode: 'ACTIVE',
+    quota_domain: 'YOUTUBE_DATA_API', capabilities: ['SEARCH_YOUTUBE'],
+  };
+  const free = {
+    provider_key: 'youtube-innertube', mode: 'ACTIVE',
+    quota_domain: 'YOUTUBE_INNERTUBE_FREE', capabilities: ['SEARCH_YOUTUBE'],
+  };
+  // The scheduler's rotation pool must contain only free capacity when the
+  // decision required it; a paid-only pool yields nothing and must fail closed.
+  assert.deepEqual(quotaFreeSearchProviderRows([official, free]).map(row => row.provider_key), ['youtube-innertube']);
+  assert.deepEqual(quotaFreeSearchProviderRows([official]), []);
+
+  const intelligence = readFileSync(join(__dirname, '..', 'queryIntelligence.ts'), 'utf8');
+  assert.match(intelligence, /quotaFreeRequired: selector\.reasonCodes\.includes\('QUOTA_FREE_EXPLORATION'\)/);
+
+  const discovery = readFileSync(join(__dirname, '..', 'autonomousDiscovery.ts'), 'utf8');
+  assert.match(discovery, /quotaFreeRequired: selected\.quotaFreeRequired === true/);
+
+  const dbCore = readFileSync(join(__dirname, '..', 'dbCore.ts'), 'utf8');
+  assert.match(dbCore, /const allocationRows = candidate\.quotaFreeRequired/);
+  assert.match(dbCore, /quotaFreeSearchProviderRows\(rotationRes\.rows\)/);
+  assert.match(dbCore, /QUOTA_FREE_PROVIDER_UNAVAILABLE/);
+  assert.match(dbCore, /QUOTA_FREE_PROVIDER_REQUIRED/);
+  assert.match(dbCore, /QUOTA_FREE_PROVIDER_CANNOT_SERVE_DATE_ORDERING/);
+  // A normal (non-required) allocation keeps its historical fail-open default
+  // only; a required free allocation never falls back to official.
+  assert.match(dbCore, /if \(candidate\.quotaFreeRequired\) await failStep\('quota_free_provider_allocation', error\);/);
 });
 
 test('Q4: a mature proven pool exploits even while portfolio budget remains', () => {

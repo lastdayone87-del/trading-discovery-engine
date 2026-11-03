@@ -145,6 +145,17 @@ export function isQuotaFreeSearchProviderRow(
 }
 
 /**
+ * Restrict allocation rows to proven quota-free SEARCH_YOUTUBE capacity.
+ * Selection can require this when the official portfolio floor is exhausted;
+ * an empty result must fail closed rather than fall back to the official API.
+ */
+export function quotaFreeSearchProviderRows<
+  T extends Pick<RegistryProviderRow, 'mode' | 'quota_domain' | 'capabilities'>,
+>(rows: T[]): T[] {
+  return rows.filter(row => isQuotaFreeSearchProviderRow(row));
+}
+
+/**
  * Maps a registry row to a validated ProviderAllocation snapshot. Surface
  * derivation mirrors the frontier allocator exactly: family 'youtube' serves
  * YOUTUBE_NATIVE, every other family serves <FAMILY>_NATIVE.
