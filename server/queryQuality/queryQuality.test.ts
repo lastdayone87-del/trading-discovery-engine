@@ -819,6 +819,10 @@ test('Q5/Q6: production wiring uses accounting-window spend, derived failure sta
   );
   assert.match(spendQuery, /status IN \('SCHEDULED','RUNNING','RETRYING','COMPLETED','FAILED'\)/);
   assert.match(dbCore, /const PORTFOLIO_UNITS_SQL=.*status IN \('SCHEDULED','RUNNING','RETRYING','COMPLETED','FAILED'\)/);
+  // The shared fragment must not contain a statement terminator: the
+  // country-scoped caller appends " AND ..." to it, so an embedded ";" would
+  // produce invalid SQL (the ";" after the template literal is TS syntax).
+  assert.doesNotMatch(dbCore, /PORTFOLIO_UNITS_SQL=`[^`]*;/);
   assert.match(intelligence, /getQueryRunReward\(attribution\.queryRunId\)/);
   assert.match(intelligence, /consecutiveFailures: failure\?\.consecutiveFailures/);
   // Promotion and hierarchy learning use the same eligibility as serving and

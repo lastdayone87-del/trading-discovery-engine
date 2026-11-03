@@ -38,6 +38,11 @@ test('governed provenance bypasses only the semantic lexicon, not shape/script g
   const cta = decideLifecycle({ ...base, term: 'subscribe', requireTradingSemantics: false });
   assert.equal(cta.searchEligible, false);
   assert.match(cta.reason, /cta-only/);
+  // Nor does it waive script compatibility: a Japanese surface under a Latin
+  // country profile is still rejected by the script gate.
+  const incompatible = decideLifecycle({ ...base, term: 'トレード', language: 'ja', requireTradingSemantics: false });
+  assert.equal(incompatible.searchEligible, false);
+  assert.match(incompatible.reason, /script-incompatible/);
 });
 
 test('branding never automatically becomes search eligible', () => {

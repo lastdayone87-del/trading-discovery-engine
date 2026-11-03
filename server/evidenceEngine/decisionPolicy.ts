@@ -161,7 +161,10 @@ export function evaluateUnifiedDecisionPolicy(input:UnifiedDecisionPolicyInput):
       :input.lifecycleAction==='REVIEW'?'SELECTIVE_POLICY_ABSTAINED'
         :positive.length>0&&substantivePositiveWeight<input.minimumPositiveWeight?'SUBSTANTIVE_POSITIVE_EVIDENCE_REQUIRED'
           :!positiveBoundary?'SCORE_BOUNDARY_NOT_SATISFIED'
-            :null;
+            // A REJECT that cleared the score boundary still needs an
+            // explainable reason when terminal rejection was not met.
+            :input.lifecycleAction==='REJECT'?'TERMINAL_REJECTION_THRESHOLD_NOT_SATISFIED'
+              :null;
     // A CONFIRM that already passed the score boundary is blocked by a
     // specific gate above; do not also claim the boundary failed.
     if(fallbackReason)reasons.push(fallbackReason);

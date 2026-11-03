@@ -284,7 +284,9 @@ export class EvidenceBasedTradingEngine {
         return { items: [] as EvidenceItem[], report: { provider: provider.name, availability: 'FAILED' as const, evidenceCount: 0,
           outcome:timeout?'FAILED_TIMEOUT' as const:'FAILED_PROVIDER' as const,
           reasonCodes:safeProviderFailureReasonCodes(err,timeout),
-          reason:`Provider failure (${errorClass})${err?.errorClass ? '' : `: ${String(err?.message || err).slice(0,240)}`}.`,durationMs:Date.now()-started } };
+          // Keep the report to the error class; the raw provider/SDK message
+          // stays on the log line above and can carry request details.
+          reason:`Provider failure (${errorClass}).`,durationMs:Date.now()-started } };
       }
     };
 

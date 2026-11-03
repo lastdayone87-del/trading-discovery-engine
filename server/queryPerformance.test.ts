@@ -226,8 +226,10 @@ test('promotion guard uses evaluated raw results for duplicate saturation', () =
     channelId: 'a', wasKnown: false, persisted: true,
     funnelOutcome: 'TRADING_CONFIRMED', qualityScore: 80, hasCommunity: false,
   };
-  const metrics = calculateQueryFunnel(5, Array.from({ length: 5 }, () => ({ ...observation })));
+  const metrics = calculateQueryFunnel(10, Array.from({ length: 5 }, () => ({ ...observation })), 5);
   assert.equal(metrics.evaluatedRawResults, 5);
+  // Five deferred results must not dilute the duplicate denominator; using
+  // rawResults (10) here would halve the duplicate share and hide the bug.
   assert.equal(metrics.distinctResults, 1);
   assert.equal(metrics.duplicateResults, 4);
   assert.ok(metrics.performanceScore >= 60);

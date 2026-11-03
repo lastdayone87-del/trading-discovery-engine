@@ -1,6 +1,6 @@
 import type { LayeredKnowledgeContext, RawChannelInput } from './types';
 import { textMatchesTerm } from './utils/textMatching';
-import { tierATradingSignals } from './contextualComposition';
+import { FINANCIAL_CONTEXT_CJK_PATTERN, tierATradingSignals } from './contextualComposition';
 import { SUPPORTED_PRODUCTION_COUNTRIES } from '../../src/data/initial_countries';
 
 /** Backward-compatible export backed by the single production-country registry. */
@@ -144,9 +144,10 @@ export function isTradingFocusedText(text: string, context: LayeredKnowledgeCont
   // A bare "market" is not financial context ("technical analysis of the
   // housing market"). Require an explicit financial-market phrase.
   const hasFinancialMarketContext = /\b(trad(?:e|ing|er|en)|stocks?|equities|crypto(?:currencies)?|bitcoin|ethereum|forex|commodit(?:y|ies)|(?:stock|equity|financial|capital|forex|crypto|futures?|options?|bond|commodit(?:y|ies))\s+markets?|brokers?|bourse|börse|boerse|bolsa|borsa|beurs|aktien|aandelen|aksjer|osakkeet|azioni|acciones|actions|titres|handelsplan|tradingdagboek|orderboek)\b/iu.test(normalized)
-    // `株` alone matches the everyday corporate suffix 株式会社. Exclude that
-    // suffix so workplace posts are not treated as a financial-market dimension.
-    || /(株(?!式会社)|仮想通貨|為替|先物|トレード|取引|投資|板読み|注文|日経|بورصة|الأسهم|股票|交易)/u.test(normalized);
+    // `株` alone matches the everyday corporate suffix 株式会社. The shared
+    // constant excludes that suffix so workplace posts are not treated as a
+    // financial-market dimension.
+    || FINANCIAL_CONTEXT_CJK_PATTERN.test(normalized);
   const signals = tierATradingSignals(normalized, context);
   // Generic method/education vocabulary only qualifies alongside a second,
   // independent dimension. Treating every Tier A match as decisive made
