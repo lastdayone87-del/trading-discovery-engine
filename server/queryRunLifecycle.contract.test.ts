@@ -39,3 +39,16 @@ test('continuation retries use a stable child-job idempotency key', () => {
   assert.match(queue, /idempotencyKey: `search-run:\$\{queryRunId\}:page:\$\{pageNumber \+ 1\}`/);
   assert.match(queue, /enqueueChildAndCommitPageReservation/);
 });
+
+test('continuation reservation and child enqueue commit or roll back together', () => {
+  const start = queue.indexOf('const continuationDb = await getDb()');
+  const end = queue.indexOf('if (!portfolioPage.authorized)', start);
+  assert.ok(start >= 0 && end > start);
+  const block = queue.slice(start, end);
+  assert.match(block, /await continuationClient\.query\('BEGIN'\)/);
+  assert.match(block, /reservePortfolioContinuationPage\(\{[\s\S]*?clientOverride: continuationClient/);
+  assert.match(block, /enqueueChildAndCommitPageReservation\(\{[\s\S]*?clientOverride: continuationClient/);
+  assert.match(block, /if \(portfolioPage\.authorized\) \{[\s\S]*?COMMIT/);
+  assert.match(block, /else \{[\s\S]*?ROLLBACK/);
+  assert.match(block, /catch \(error\) \{[\s\S]*?ROLLBACK[\s\S]*?throw error/);
+});

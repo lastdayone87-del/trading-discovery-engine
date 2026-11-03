@@ -8,7 +8,8 @@ import { CountryKnowledgeProvider } from './providers/CountryKnowledgeProvider';
 import { ExternalLinkProvider } from './providers/ExternalLinkProvider';
 import { MultilingualContextProvider } from './providers/MultilingualContextProvider';
 import { getLayeredKnowledgeContext } from './knowledgePacks';
-import { SUPPORTED_CLASSIFICATION_COUNTRIES } from './multilingualTerminology';
+import { SUPPORTED_CLASSIFICATION_COUNTRIES, isTradingFocusedText } from './multilingualTerminology';
+import { isTierATradingText } from './contextualComposition';
 import { SUPPORTED_PRODUCTION_COUNTRIES } from '../../src/data/initial_countries';
 
 const engine = new EvidenceBasedTradingEngine([
@@ -80,4 +81,70 @@ test('classification knowledge covers every production country', () => {
   assert.deepEqual([...SUPPORTED_CLASSIFICATION_COUNTRIES], ['United States', 'United Kingdom', 'Germany', 'France', 'Spain', 'Netherlands', 'Italy', 'Australia', 'Canada', 'Japan', 'Switzerland', 'Denmark', 'Sweden', 'United Arab Emirates', 'Singapore', 'New Zealand', 'Belgium', 'Luxembourg', 'Ireland', 'Norway']);
   assert.equal(getLayeredKnowledgeContext('Brazil').countryKnowledge, undefined);
   assert.equal(getLayeredKnowledgeContext('India').countryKnowledge, undefined);
+});
+
+test('the corporate suffix 株式会社 is never financial-market context', () => {
+  const context = getLayeredKnowledgeContext('Japan');
+  assert.equal(isTradingFocusedText('株式会社の採用情報', context), false);
+  assert.equal(isTradingFocusedText('株のデイトレード', context), true);
+  // Keep the composition classifier consistent: a company post carrying a
+  // generic method phrase must not become TRADING through the 株式 match.
+  assert.equal(isTierATradingText('株式会社のテクニカル分析', context), false);
+  assert.equal(isTierATradingText('日経225のトレード', context), true);
+});
+
+test('generic Chinese transaction education is not financial-market context', () => {
+  const context = getLayeredKnowledgeContext('Singapore');
+  // `交易教学`/`交易策略` are education phrases, but `交易` alone is an
+  // everyday commercial transaction word. Without an instrument or venue the
+  // document must stay non-trading rather than becoming e-commerce evidence.
+  assert.equal(isTierATradingText('电商交易教学', context), false);
+  assert.equal(isTierATradingText('电商交易策略', context), false);
+  assert.equal(isTradingFocusedText('电商交易教学', context), false);
+
+  // Market-specific Chinese terms still supply the second dimension.
+  assert.equal(isTierATradingText('股票交易教学', context), true);
+  assert.equal(isTierATradingText('期货交易策略', context), true);
+  assert.equal(isTradingFocusedText('股票交易教学', context), true);
+});
+
+test('Traditional Chinese market terms remain financial-market context', () => {
+  const context = getLayeredKnowledgeContext('Singapore');
+  // Regression: removing bare `交易` must not drop Traditional Chinese
+  // creators whose text uses 期貨/外匯 with an education phrase.
+  assert.equal(isTierATradingText('期貨交易策略', context), true);
+  assert.equal(isTierATradingText('外匯交易策略', context), true);
+  assert.equal(isTierATradingText('股票交易教學', context), true);
+  assert.equal(isTierATradingText('股票技術分析', context), true);
+  // The bare transaction word still cannot qualify e-commerce content.
+  assert.equal(isTierATradingText('電商交易教學', context), false);
+});
+
+test('generic Japanese transaction words are not financial-market context', () => {
+  const context = getLayeredKnowledgeContext('Japan');
+  assert.equal(isTierATradingText('取引先のテクニカル分析', context), false);
+  assert.equal(isTierATradingText('商品注文のテクニカル分析', context), false);
+  // Venue and index names still preserve legitimate Japanese market cases.
+  assert.equal(isTierATradingText('東京証券取引所のテクニカル分析', context), true);
+  assert.equal(isTradingFocusedText('日経225のテクニカル分析', context), true);
+});
+
+test('Arabic market terms still qualify method education as trading', () => {
+  const context = getLayeredKnowledgeContext('United Arab Emirates');
+  assert.equal(isTierATradingText('تحليل فني لبورصة نيويورك', context), true);
+  assert.equal(isTradingFocusedText('تحليل فني لبورصة نيويورك', context), true);
+});
+
+test('one high-specificity Tier A signal across independent videos establishes consistency', async () => {
+  const context = getLayeredKnowledgeContext('United States');
+  const provider = new VideoMetadataProvider();
+  const input: RawChannelInput = {
+    channel_name: 'Day Trading Desk',
+    description: '',
+    country: 'United States',
+    video_titles: ['Day trading live session', 'Day trading recap', 'Day trading journal'],
+    video_descriptions: ['', '', ''],
+  };
+  const items = await provider.collectEvidence(input, context);
+  assert.ok(items.some(item => item.category === 'MULTI_VIDEO_CONSISTENCY'));
 });

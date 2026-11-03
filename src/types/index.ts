@@ -101,7 +101,9 @@ export interface TradingRelevanceBreakdown {
   consistency_ratio: number;
   ai_reviewed: boolean;
   fast_heuristic_status?: 'FAST_ACCEPT' | 'FAST_REJECT' | 'UNCERTAIN';
-  classification_method?: 'FAST_HEURISTIC_ACCEPT' | 'FAST_HEURISTIC_REJECT' | 'AI_SEMANTIC_CLASSIFIER';
+  classification_method?: 'FAST_HEURISTIC_ACCEPT' | 'FAST_HEURISTIC_REJECT' | 'AI_SEMANTIC_CLASSIFIER' | 'DETERMINISTIC_EVIDENCE' | 'HEURISTIC_ONLY' | 'DEGRADED_HEURISTIC';
+  /** C3 display basis: never present a neutral prior as a measured score. */
+  confidence_basis?: 'CALIBRATED' | 'NEUTRAL_PRIOR' | 'HEURISTIC' | 'NONE';
   ai_prompt_payload?: string;
   ai_raw_response?: string;
   ai_model?: string;

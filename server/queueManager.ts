@@ -15,6 +15,7 @@ import {
   getQueryById,
   startQueryRun,
   completeQueryRun,
+  reservePortfolioContinuationPage,
   failQueryRun,
   addQueryExecutionLog,
   tryReserveQuota,
@@ -49,7 +50,7 @@ import {
   type OrphanDiscordCandidateRow,
 } from './db';
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
-import { reserveIncrementalTreatmentPageQuota, enqueueChildAndCommitPageReservation } from './retrievalPolicyCanary';
+import { reserveIncrementalTreatmentPageQuota, releaseIncrementalTreatmentPageReservation, enqueueChildAndCommitPageReservation } from './retrievalPolicyCanary';
 import { resolveExecutionSearchWindow } from './retrievalExperiment';
 import { trialContinuationCap } from './discoveryFrontierTrials';
 import { aggregatedLanguageCandidateSet, mergeCountryValidationResults, validateChannelCountry } from './countryValidator';
@@ -1296,7 +1297,14 @@ export async function processNextSearchJob(
       if (!queryRecord) throw new Error(`Query ${queryId} no longer exists for run ${queryRunId}.`);
       const metrics = calculateQueryFunnel(searchPage?.rawResultCount ?? extracted.length, observations, deferredResults);
       await recordQueryRunSightings(queryRunId, queryId, sightings.map(s=>({...s,pageNumber})));
-      const globalMaxPages = Math.max(1, Number(await getAppSetting('autonomous_pagination_max_pages', '3')));
+      const configuredMaxPages = Number(await getAppSetting('autonomous_pagination_max_pages', '3'));
+      // A malformed setting must not become an unbounded (or NaN) page
+      // ceiling. Fall back to the documented three-page default; finite
+      // values below one clamp to a single page rather than silently
+      // becoming the default.
+      const globalMaxPages = Number.isFinite(configuredMaxPages)
+        ? Math.max(1, Math.floor(configuredMaxPages))
+        : 3;
       const maxPages = retrievalTreatmentOrigin === 'CANARY_TREATMENT'
         ? Math.min(requestedPageDepth ?? 1, globalMaxPages)
         : globalMaxPages;
@@ -1351,7 +1359,7 @@ export async function processNextSearchJob(
 
         // Incremental Treatment Page Quota Reservation Boundary
         if (retrievalTreatmentOrigin === 'CANARY_TREATMENT' && pageNumber >= 1) {
-          const incRes = await reserveIncrementalTreatmentPageQuota({ queryRunId, pageNumber: pageNumber + 1, providerQuotaUnits: allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE' ? 0 : 100 });
+          const incRes = await reserveIncrementalTreatmentPageQuota({ queryRunId, pageNumber: pageNumber + 1, providerQuotaUnits: allocatedProvider.costDomain==='YOUTUBE_DATA_API' ? 100 : 0 });
           if (!incRes.authorized) {
             console.log(`[Phase 9 Continuation] Incremental page continuation denied by treatment quota caps for run ${queryRunId}: ${incRes.reason}`);
             await completeJob(job.id);
@@ -1360,23 +1368,79 @@ export async function processNextSearchJob(
           incPageReservationId = incRes.pageReservationId;
         }
 
-        // Atomic child job enqueue + page reservation commit
-        await enqueueChildAndCommitPageReservation({
-          pageReservationId: incPageReservationId,
-          queryRunId,
-          jobType: 'SEARCH_YOUTUBE',
-          jobPayload: {
-            ...job.payload,
+        // Continuation is bounded page by page against the shared portfolio
+        // floor. Selection only reserved the first page, so the budget check
+        // must happen here rather than forcing the pagination ceiling into
+        // the pre-run reservation. The reservation update and child enqueue
+        // share one transaction: a failed enqueue must not leave committed
+        // quota that consumes portfolio budget during retries.
+        const continuationDb = await getDb();
+        const continuationClient = await continuationDb.connect();
+        let portfolioPage: { authorized: boolean; reason: string };
+        let continuationCommitted = false;
+        try {
+          await continuationClient.query('BEGIN');
+          portfolioPage = await reservePortfolioContinuationPage({
+            queryRunId,
             pageNumber: pageNumber + 1,
-            pageToken: searchPage.nextPageToken
-          },
-          priority: 20,
-          maxAttempts: 3,
-          idempotencyKey: `search-run:${queryRunId}:page:${pageNumber + 1}`
-        });
-
-        await completeJob(job.id);
-        return true;
+            providerQuotaUnits: allocatedProvider.costDomain==='YOUTUBE_DATA_API' ? 100 : 0,
+            clientOverride: continuationClient,
+          });
+          if (portfolioPage.authorized) {
+            await enqueueChildAndCommitPageReservation({
+              pageReservationId: incPageReservationId,
+              queryRunId,
+              jobType: 'SEARCH_YOUTUBE',
+              jobPayload: {
+                ...job.payload,
+                pageNumber: pageNumber + 1,
+                pageToken: searchPage.nextPageToken
+              },
+              priority: 20,
+              maxAttempts: 3,
+              idempotencyKey: `search-run:${queryRunId}:page:${pageNumber + 1}`,
+              clientOverride: continuationClient,
+            });
+            await continuationClient.query('COMMIT');
+            continuationCommitted = true;
+          } else {
+            await continuationClient.query('ROLLBACK');
+          }
+        } catch (error) {
+          await continuationClient.query('ROLLBACK').catch(() => undefined);
+          // `enqueueChildAndCommitPageReservation` releases the page
+          // reservation through this transaction's client; that release is
+          // undone by the ROLLBACK. Release it again in its own transaction so
+          // a failed continuation cannot keep the canary slot reserved.
+          if (incPageReservationId && !continuationCommitted) {
+            await releaseIncrementalTreatmentPageReservation(incPageReservationId, queryRunId)
+              .catch(releaseError => console.warn('[Phase 9 Continuation] Failed to release treatment page reservation after rollback:', releaseError));
+          }
+          throw error;
+        } finally {
+          continuationClient.release();
+        }
+        if (!portfolioPage.authorized) {
+          if (incPageReservationId) {
+            await releaseIncrementalTreatmentPageReservation(incPageReservationId, queryRunId)
+              .catch(error => console.warn('[Phase 9 Continuation] Failed to release treatment page reservation after portfolio denial:', error));
+          }
+          console.log(`[Phase 9 Continuation] Portfolio continuation denied for run ${queryRunId}: ${portfolioPage.reason}`);
+          if (portfolioPage.reason !== 'PORTFOLIO_BUDGET_EXHAUSTED') {
+            // A reservation error is retryable. Completing the run here would
+            // mislabel a transient database failure as budget exhaustion.
+            throw new Error(`Continuation reservation failed: ${portfolioPage.reason}`);
+          }
+          await (await getDb()).query(
+            `UPDATE autonomous_query_page_observations SET stopping_reason=$3 WHERE query_run_id=$1 AND page_number=$2`,
+            [queryRunId, pageNumber, 'PORTFOLIO_BUDGET_EXHAUSTED'],
+          ).catch(error => console.warn('[Phase 9 Continuation] Failed to record portfolio stop reason:', error));
+          // Fall through to finalization: the run stops cleanly with the
+          // pages it was authorized to execute.
+        } else {
+          await completeJob(job.id);
+          return true;
+        }
       }
       const finalMetrics=await getAutonomousRunMetrics(queryRunId);
       if (job.payload.provider?.costDomain === 'BRAVE_SEARCH_API') {
@@ -1435,7 +1499,7 @@ export async function processNextSearchJob(
         });
       }
       const quotaConsumed=providerCostUsd>0||allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE'?0:pageNumber*100;
-      const performance = await evaluateQueryPerformance(queryRecord, finalMetrics, { retrievalLane, searchOrdering, quotaConsumed, persist: false });
+      const performance = await evaluateQueryPerformance(queryRecord, finalMetrics, { retrievalLane, searchOrdering, quotaConsumed, queryRunId, persist: false, providerRequestsFailed, providerRunOutcome });
       // Worker wall-time split (observability only, persisted in
       // performance_details): quota-wait vs retrieval vs per-channel
       // processing vs total worker time. Never affects scoring or behavior.

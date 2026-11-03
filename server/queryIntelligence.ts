@@ -12,12 +12,38 @@ import {
   getChannelById,
   upsertChannel,
   getAppSetting,
+  getQueryQualityDecayedCounts,
+  getQueryPortfolioBudgetState,
+  isQuotaFreeProviderAvailable,
+  getQueryQuotaSpendRows,
+  getQueryFailureStates,
+  getInFlightPrimaryTermUsage,
+  getQueryRunReward,
   isRetryableInfrastructureFailure
 } from './db';
 import { assertCountryAllowed } from './countryExclusion';
+import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
 import { isTerminologyKillSwitchActive, TERMINOLOGY_KILL_SWITCH_KEY } from './terminologyKillSwitch';
-import { limitRepeatedPrimaryTerms, planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, queriesOutsideCooldown, rotateAwayFromMostRecentIntent, reformulatePollutedQuery } from './queryPlanner';
-import { selectQueryCollection, isSeverelyContaminatedQuery, type QueryFunnelMetrics } from './queryPerformance';
+import { planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, rotateAwayFromMostRecentIntent, reformulatePollutedQuery } from './queryPlanner';
+import { revalidateQueryRecordAdmission, withQueryAdmission, type QueryRecordAdmission } from './queryQuality/admission';
+import { isRewardEligibleQuota } from './queryQuality/accounting';
+import { selectionHistoryFor } from './queryQuality/composition';
+import {
+  DECAY_HALF_LIFE_DAYS,
+  MAX_SELECTION_INDEX,
+  MIN_SELECTION_SAMPLE,
+  SELECTOR_C,
+  boundedPortfolioRatio,
+  computePosterior,
+  decayWeight,
+  empiricalPrior,
+  promotionQualityScore,
+} from './queryQuality/posterior';
+import { coverageCellFor, portfolioBudget, buildHierarchy, selectHierarchicalUcb } from './queryQuality/selector';
+import { isQuerySelectable } from './queryQuality/lifecycle';
+import { getCountryMarketProfile } from './queryQuality/profiles';
+import type { DecayedArmCounts, SelectorCandidate, SelectorContext, SelectorDecision } from './queryQuality/types';
+import { selectQueryCollection, isSeverelyContaminatedQuery, PROVEN_LCB_THRESHOLD, PROVEN_MIN_COMPLETED_RUNS, type QueryFunnelMetrics, type QueryPromotionGuard } from './queryPerformance';
 import { attributeTerminologyPerformance, buildNoveltyBaseline, classifyNativeCandidate, detectSpamSignals, findLiteralSpan, getPlannerTerminology, normalizeTerm, observeTerminology, observeTerminologyDetailed, KNOWN_INSTRUMENT_TERMS, type LiteralSourceText, type LiteralSpanMatch, type NativeAdmissionRejectReason, type NoveltyBaseline, type TerminologyObservationResult } from './terminologyIntelligence';
 import type { ExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { canonicalCountry } from './countryInference';
@@ -828,7 +854,13 @@ Description: "${effDesc}"
 Recent Titles:
 ${effTitles.map(t => `- ${t}`).join('\n')}
 
-Identify any localized, native trading terminology, popular financial instruments, market phrases, or content formats specific to traders in ${channel.country}. Quote every term EXACTLY as it appears in the texts above: do not paraphrase, translate, or invent terms.
+Identify localized trading vocabulary used by traders in ${channel.country}. Each bucket has a strict trading meaning:
+- "terminology": native market, method, execution or platform language used by traders (for example "analyse technique", "order flow", "scalping").
+- "instruments": tradeable instruments, exchanges or contracts (for example "NQ Futures", "XAUUSD", "DAX").
+- "phrases": multiword phrases with a genuine market/trading meaning (for example "live trading", "trade review", "risk management").
+- "formats": trading-specific content formats only (for example "live trading", "trade review"), never generic packaging.
+Quote every term EXACTLY as it appears in the texts above: do not paraphrase, translate, or invent terms.
+Exclude calls to action (subscribe, like, comment, notification), channel boilerplate, episode/part/volume labels, emoji-only or symbol-only surfaces, hashtags, URLs, handles, and generic words such as "free", "video", "channel", "interview", "live" or "session" without a trading qualifier. Do not return "Subscribe and Like button", "Free Interviews", "Épisode 6", "🔴" or "#trading".
 Return ONLY a valid JSON object with format:
 {
   "terminology": ["term1", "term2"],
@@ -944,12 +976,43 @@ Return ONLY a valid JSON object with format:
 }
 
 // ==========================================
-// 3. MULTI-ARMED BANDIT (UCB1) QUERY SELECTOR
+// 3. HIERARCHICAL, COST-AWARE UCB QUERY SELECTOR
 // ==========================================
 
+export interface QuerySelectionResult {
+  queryRecord: QueryRecord;
+  selectionStrategy:
+    | 'UCB_EXPLOITATION'
+    | 'UCB_PORTFOLIO'
+    | 'COLD_START_GENERATION'
+    | 'NEIGHBORHOOD_TARGETED';
+  reason: string;
+  /** Scheduling must allocate a registry-backed quota-free provider. */
+  quotaFreeRequired?: boolean;
+  selector?: SelectorDecision;
+  admission?: {
+    hash: string;
+    tier: string;
+    compositionFamily: string;
+    reasonCodes: string[];
+  };
+}
+
+function primaryKey(value: string | undefined | null): string {
+  return String(value || '').normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en');
+}
+
+const emptyArmCounts = (): DecayedArmCounts => ({ confirmed: 0, quality: 0, quotaUnits: 0, runs: 0 });
+
 /**
- * Selects the next search query for a country using Multi-Armed Bandit (UCB1)
- * balancing exploitation (PROVEN) vs exploration (EXPERIMENTAL) with intent rotation.
+ * Selects the next query with the Q4 hierarchical, cost-aware UCB policy.
+ *
+ * Hard gates (lifecycle, cooldown, same-tick, admission) run before scoring.
+ * The old UCB1 formula, the `Math.random()` exploration branch, the
+ * least-executed-first ordering and the unscored generated fallback are
+ * retired. A generated candidate is re-admitted and scored before execution;
+ * if the pool is still empty the selector returns null with an explicit
+ * NO_ELIGIBLE_QUERY decision.
  */
 export async function selectNextQueryForCountry(
   country: string,
@@ -964,164 +1027,405 @@ export async function selectNextQueryForCountry(
   } = {}
 ): Promise<{
   queryRecord: QueryRecord;
-  selectionStrategy: 'UCB1_EXPLOITATION' | 'UCB1_EXPLORATION' | 'COLD_START_GENERATION' | 'NEIGHBORHOOD_TARGETED';
+  selectionStrategy: QuerySelectionResult['selectionStrategy'];
+  selector?: SelectorDecision;
+  admission?: QuerySelectionResult['admission'];
   reason: string;
+  quotaFreeRequired?: boolean;
 } | null> {
   const now = new Date();
-  const queries = (await getQueriesByCountry(country)).filter(query => {
-    const reservedUntil = (query as QueryRecord & { reserved_until?: string | null }).reserved_until;
-    const nextEligibleAt = (query as QueryRecord & { next_eligible_at?: string | null }).next_eligible_at;
-    return query.collection !== 'REJECTED'
-      && (!reservedUntil || new Date(reservedUntil) <= now)
-      && (!nextEligibleAt || new Date(nextEligibleAt) <= now);
-  });
+  const nowIso = now.toISOString();
   const cooldownMinutes = Math.max(1, Number(await getAppSetting('query_intelligence_query_cooldown_minutes', process.env.QUERY_INTELLIGENCE_COOLDOWN_MINUTES || '360')) || 360);
   const maxPrimaryUses = Math.max(1, Number(await getAppSetting('query_intelligence_primary_term_max_uses', process.env.QUERY_INTELLIGENCE_PRIMARY_TERM_MAX_USES || '2')) || 2);
-  const explorationRatio = Math.min(0.9, Math.max(0.1, Number(await getAppSetting('query_intelligence_exploration_ratio', process.env.QUERY_INTELLIGENCE_EXPLORATION_RATIO || '0.4')) || 0.4));
+  // The retired UCB1 formula's explorationRatio is replaced by the bounded
+  // portfolio ratio. Keeping the name visible documents the policy migration
+  // for audit consumers while no random exploration remains in serving.
+  const configuredPortfolioRatio = boundedPortfolioRatio(await getAppSetting('query_intelligence_portfolio_ratio', process.env.QUERY_INTELLIGENCE_PORTFOLIO_RATIO || '0.15'));
+  const portfolioRatio = portfolioBudget(1, configuredPortfolioRatio).ratio;
+  const familyCap = Math.min(1, Math.max(0.1, Number(await getAppSetting('query_intelligence_family_share_cap', process.env.QUERY_INTELLIGENCE_FAMILY_SHARE_CAP || '0.45')) || 0.45));
+  const sourceCap = Math.min(1, Math.max(0.1, Number(await getAppSetting('query_intelligence_source_share_cap', process.env.QUERY_INTELLIGENCE_SOURCE_SHARE_CAP || '0.60')) || 0.60));
 
-  // If no queries exist for country, generate cold-start initial queries
-  if (queries.length === 0) {
+  const loadQueries = async (): Promise<QueryRecord[]> => getQueriesByCountry(country);
+  const loadPool = async (queries: QueryRecord[]): Promise<SelectorPool> =>
+    buildSelectorPool(country, queries, { now, cooldownMinutes, maxPrimaryUses, nowIso, portfolioRatio, familyCap, sourceCap, scopePromotionBasis: options.scopePromotionBasis });
+
+  let allQueries = await loadQueries();
+  if (allQueries.length === 0) {
     const generated = await generateCandidateQueriesForCountry(country, 4, 'COLD_START', { scopePromotionBasis: options.scopePromotionBasis });
     const selected = generated[0];
     if (!selected) return null;
-    return {
-      queryRecord: selected,
-      selectionStrategy: 'COLD_START_GENERATION',
-      reason: selected.generation_reason || `Cold start query initialization for ${country}`
-    };
+    // Generated rows are reloaded and re-admitted through the same pool; the
+    // first generated candidate only proves that generation produced output.
+    const pool = await loadPool(await loadQueries());
+    if (!pool.decision.queryId) return null;
+    const admitted = pool.queriesById.get(pool.decision.queryId);
+    if (!admitted) return null;
+    return buildSelectionResult(admitted, pool, 'COLD_START_GENERATION', `Cold start query initialization for ${country}: ${pool.decision.reason}`, pool.decision);
   }
 
-  // Cooldown is a hard eligibility gate, never merely a score penalty.
-  const outsideCooldown = queriesOutsideCooldown(queries, now, cooldownMinutes);
-  let eligible = limitRepeatedPrimaryTerms(outsideCooldown, queries, now, cooldownMinutes, maxPrimaryUses);
-  eligible = rotateAwayFromMostRecentIntent(eligible, queries);
-  if (eligible.length === 0) {
+  let pool = await loadPool(allQueries);
+  // An empty pool means every row is cooling down, saturated by a share cap,
+  // or stale after admission revalidation. Never execute an unscored legacy
+  // fallback: generate through the governed planner, then re-admit and score.
+  if (pool.candidates.length === 0 || pool.decision.strategy === 'NO_ELIGIBLE_QUERY') {
     const generated = await generateCandidateQueriesForCountry(country, 4, 'EXPLORATION', { scopePromotionBasis: options.scopePromotionBasis });
-    const selected = generated[0];
-    if (!selected) return null;
-    return {
-      queryRecord: selected,
-      selectionStrategy: 'UCB1_EXPLORATION',
-      reason: `${selected.generation_reason || selected.query} Existing queries were unavailable due to the ${cooldownMinutes}-minute cooldown or primary-term diversity limit.`
-    };
+    if (generated.length > 0) {
+      allQueries = await loadQueries();
+      pool = await loadPool(allQueries);
+    }
   }
 
-  // Calculate UCB1 score for each query
-  const totalExecutionsSum = eligible.reduce((acc, q) => acc + q.times_executed, 0);
-  const totalExecutions = Math.max(1, totalExecutionsSum);
-
-  const scoredQueries = eligible.map(q => {
-    // Normalized performance score (0 to 1)
-    const normPerformance = (q.performance_score || 0) / 100;
-
-    // UCB1 formula: Score + c * sqrt(ln(N) / (n_i + 1))
-    const explorationConst = 0.8;
-    const ucbTerm = explorationConst * Math.sqrt(Math.log(totalExecutions + 1) / ((q.times_executed || 0) + 1));
-    const ucbScore = Math.max(0, normPerformance + ucbTerm);
-
-    return {
-      ...q,
-      ucb_score: Math.round(ucbScore * 100) / 100
-    };
-  });
-
-  // Sort by UCB score descending
-  scoredQueries.sort((a, b) => (b.ucb_score || 0) - (a.ucb_score || 0));
-
-  let selected: QueryRecord | null = null;
-  let strategy: 'UCB1_EXPLOITATION' | 'UCB1_EXPLORATION' | 'COLD_START_GENERATION' | 'NEIGHBORHOOD_TARGETED' = 'UCB1_EXPLOITATION';
-  let reason = '';
-
-  // Targeted Frontier Neighborhood Selection (if provided)
   if (options.targetNeighborhoodDimensions) {
     const target = options.targetNeighborhoodDimensions;
     const targetKey = createNeighborhoodKey(target);
-
-    // Filter scoredQueries for candidates whose mapped canonical neighborhood key matches targetKey
-    const matches = scoredQueries.filter(q => {
-      const qDims: DiscoveryNeighborhoodDimensions = {
+    const matches = pool.candidates.filter(candidate => {
+      const query = pool.queriesById.get(candidate.queryId);
+      if (!query) return false;
+      const dimensions: DiscoveryNeighborhoodDimensions = {
         country: target.country || country,
         language: target.language,
-        queryIntent: q.intent || target.queryIntent,
-        primaryTermFamily: q.primary_term || q.query,
+        queryIntent: query.intent || target.queryIntent,
+        primaryTermFamily: query.primary_term || query.query,
         retrievalLane: target.retrievalLane,
         searchOrdering: target.searchOrdering,
         instrumentOrTheme: target.instrumentOrTheme,
-        sourceFamily: target.sourceFamily
+        sourceFamily: target.sourceFamily,
       };
-      return createNeighborhoodKey(qDims) === targetKey;
+      return createNeighborhoodKey(dimensions) === targetKey;
     });
-
     if (matches.length > 0) {
-      selected = matches[0];
-      strategy = 'NEIGHBORHOOD_TARGETED';
-      reason = `Frontier neighborhood canonical selection for target key "${targetKey}": ${selected.query} (UCB ${selected.ucb_score}).`;
+      const targeted = selectHierarchicalUcb(matches, pool.context);
+      const selected = targeted.queryId ? pool.queriesById.get(targeted.queryId) : null;
+      if (selected) {
+        return buildSelectionResult(selected, pool, 'NEIGHBORHOOD_TARGETED', `Frontier neighborhood canonical selection for target key "${targetKey}": ${targeted.reason}`, targeted);
+      }
     } else {
       const generated = await generateCandidateQueriesForCountry(country, 1, 'EXPLORATION', { scopePromotionBasis: options.scopePromotionBasis });
-      const matchingGenerated = generated.find(gen => {
-        const genDims: DiscoveryNeighborhoodDimensions = {
+      const matchingGenerated = generated.find(query => {
+        const dimensions: DiscoveryNeighborhoodDimensions = {
           country: target.country || country,
           language: target.language,
-          queryIntent: gen.intent || target.queryIntent,
-          primaryTermFamily: gen.primary_term || gen.query,
+          queryIntent: query.intent || target.queryIntent,
+          primaryTermFamily: query.primary_term || query.query,
           retrievalLane: target.retrievalLane,
           searchOrdering: target.searchOrdering,
           instrumentOrTheme: target.instrumentOrTheme,
-          sourceFamily: target.sourceFamily
+          sourceFamily: target.sourceFamily,
         };
-        return createNeighborhoodKey(genDims) === targetKey;
+        return createNeighborhoodKey(dimensions) === targetKey;
       });
-
       if (matchingGenerated) {
-        selected = matchingGenerated;
-        strategy = 'NEIGHBORHOOD_TARGETED';
-        reason = `Generated candidate matching targeted frontier neighborhood key "${targetKey}": ${selected.query}.`;
-      } else {
-        const plannedTarget = planFrontierTargetedQuery({ country, target });
-        if (plannedTarget) {
-          selected = await upsertQueryRecord({
-            query: plannedTarget.query,
-            country,
-            collection: 'EXPERIMENTAL',
-            intent: plannedTarget.intent,
-            knowledgeTiers: plannedTarget.knowledgeTiers,
-            generationMode: plannedTarget.generationMode,
-            generationReason: plannedTarget.generationReason,
-            discoveryObjective: plannedTarget.discoveryObjective,
-            primaryTerm: plannedTarget.primaryTerm,
-            generationMetadata: plannedTarget.metadata
-          });
-          strategy = 'NEIGHBORHOOD_TARGETED';
-          reason = `Constructed governed fallback for targeted frontier neighborhood key "${targetKey}".`;
+        const refreshed = await loadPool(await loadQueries());
+        const candidate = refreshed.candidates.find(item => item.queryId === matchingGenerated.id);
+        if (candidate) {
+          const decision = selectHierarchicalUcb([candidate], refreshed.context);
+          if (decision.queryId) {
+            return buildSelectionResult(matchingGenerated, refreshed, 'NEIGHBORHOOD_TARGETED', `Generated candidate matching targeted frontier neighborhood key "${targetKey}": ${matchingGenerated.query}.`, decision);
+          }
+        }
+      }
+      const plannedTarget = planFrontierTargetedQuery({ country, target });
+      if (plannedTarget) {
+        const selected = await upsertQueryRecord({
+          query: plannedTarget.query,
+          country,
+          collection: 'EXPERIMENTAL',
+          intent: plannedTarget.intent,
+          knowledgeTiers: plannedTarget.knowledgeTiers,
+          generationMode: plannedTarget.generationMode,
+          generationReason: plannedTarget.generationReason,
+          discoveryObjective: plannedTarget.discoveryObjective,
+          primaryTerm: plannedTarget.primaryTerm,
+          generationMetadata: plannedTarget.metadata,
+        });
+        const refreshed = await loadPool(await loadQueries());
+        const candidate = refreshed.candidates.find(item => item.queryId === selected.id);
+        if (candidate) {
+          const decision = selectHierarchicalUcb([candidate], refreshed.context);
+          if (decision.queryId) {
+            return buildSelectionResult(selected, refreshed, 'NEIGHBORHOOD_TARGETED', `Constructed governed fallback for targeted frontier neighborhood key "${targetKey}".`, decision);
+          }
         }
       }
     }
   }
 
-  // Explicitly configured exploration prevents permanent overfitting to winners.
-  const isExploration = Math.random() < explorationRatio;
-
-  if (!selected && isExploration) {
-    // Pick an EXPERIMENTAL query with highest UCB or generate a new candidate
-    const experimental = scoredQueries
-      .filter(q => q.collection === 'EXPERIMENTAL')
-      .sort((a, b) => a.times_executed - b.times_executed || (b.ucb_score || 0) - (a.ucb_score || 0));
-    if (experimental.length > 0) {
-      selected = experimental[0];
-      strategy = 'UCB1_EXPLORATION';
-      reason = `Exploration selected an eligible experimental query outside the ${cooldownMinutes}-minute cooldown: ${selected.generation_reason || selected.query} (UCB ${selected.ucb_score}).`;
-    }
-  }
-
-  if (!selected) {
-    // Default to top overall UCB query (usually PROVEN)
-    selected = scoredQueries.find(query => query.collection === 'PROVEN') || scoredQueries[0];
-    strategy = selected.collection === 'PROVEN' ? 'UCB1_EXPLOITATION' : 'UCB1_EXPLORATION';
-    reason = `${strategy === 'UCB1_EXPLOITATION' ? 'Exploitation retained a historically successful query' : 'Exploration selected the best eligible candidate'} outside the ${cooldownMinutes}-minute cooldown (UCB ${selected.ucb_score}). ${selected.generation_reason || ''}`.trim();
-  }
-
+  if (pool.candidates.length === 0) return null;
+  const decision = selectHierarchicalUcb(pool.candidates, pool.context);
+  if (!decision.queryId) return null;
+  const selected = pool.queriesById.get(decision.queryId);
   if (!selected) return null;
-  return { queryRecord: selected, selectionStrategy: strategy, reason };
+  return buildSelectionResult(
+    selected,
+    pool,
+    decision.strategy === 'UCB_PORTFOLIO' ? 'UCB_PORTFOLIO' : 'UCB_EXPLOITATION',
+    decision.reason,
+    decision,
+  );
+}
+
+interface SelectorPool {
+  candidates: SelectorCandidate[];
+  queriesById: Map<number, QueryRecord>;
+  admissions: Map<number, QueryRecordAdmission>;
+  context: SelectorContext;
+  decision: SelectorDecision;
+}
+
+function buildSelectorCandidate(
+  record: QueryRecord,
+  admissionInfo: QueryRecordAdmission | undefined,
+  admission: QueryRecordAdmission['admission'] | undefined,
+  counts: DecayedArmCounts,
+): SelectorCandidate {
+  const profile = getCountryMarketProfile(record.country);
+  return {
+    queryId: record.id,
+    query: record.query,
+    collection: record.collection,
+    country: admission?.country || record.country,
+    language: admission?.language || profile.languages[0] || 'en',
+    market: admission?.market || profile.primaryMarket,
+    compositionFamily: admission?.compositionFamily || 'family:UNKNOWN',
+    tier: admission?.tier || 'SPECULATIVE',
+    primaryTerm: record.primary_term || record.query,
+    counts,
+    timesExecuted: Number(record.times_executed || 0),
+    admission,
+    nextEligibleAt: (record as QueryRecord & { next_eligible_at?: string | null }).next_eligible_at,
+    reservedUntil: (record as QueryRecord & { reserved_until?: string | null }).reserved_until,
+  };
+}
+
+async function buildSelectorPool(
+  country: string,
+  queries: QueryRecord[],
+  options: {
+    now: Date;
+    cooldownMinutes: number;
+    maxPrimaryUses: number;
+    nowIso: string;
+    portfolioRatio: number;
+    familyCap: number;
+    sourceCap: number;
+    scopePromotionBasis?: 'PERSISTENT_SCOPE_SELECTION' | 'DIRECT_TARGET';
+  },
+): Promise<SelectorPool> {
+  const recentCutoff = options.now.getTime() - options.cooldownMinutes * 60_000;
+  const primaryUsage = new Map<string, number>();
+  for (const query of queries) {
+    if (!query.primary_term || !query.last_executed) continue;
+    if (Date.parse(query.last_executed) <= recentCutoff) continue;
+    const key = primaryKey(query.primary_term);
+    primaryUsage.set(key, (primaryUsage.get(key) || 0) + 1);
+  }
+
+  // The decayed sums are aggregated in SQL (one row per query, not per run):
+  // selection is on the scheduler hot path and must not scale with 180 days of
+  // run history. Zero-quota and provider-failed runs are excluded in the same
+  // aggregate, matching the serving/dashboard reward definition.
+  const [qualityCounts, spendRows, failureStates, inFlightPrimary] = await Promise.all([
+    getQueryQualityDecayedCounts(country, undefined, DECAY_HALF_LIFE_DAYS),
+    getQueryQuotaSpendRows(country),
+    getQueryFailureStates(country),
+    getInFlightPrimaryTermUsage(country, new Date(recentCutoff).toISOString()),
+  ]);
+  // A selection that has been scheduled but has not executed yet does not have
+  // a `last_executed` timestamp. Count those in-flight uses too, otherwise a
+  // primary term can be selected repeatedly before any run completes.
+  for (const row of inFlightPrimary) {
+    const key = primaryKey(row.primaryTerm);
+    primaryUsage.set(key, (primaryUsage.get(key) || 0) + row.uses);
+  }
+  const countsById = new Map<number, DecayedArmCounts>(
+    qualityCounts.map(row => [row.queryId, row.counts]),
+  );
+  for (const query of queries) {
+    if (!countsById.has(query.id)) countsById.set(query.id, emptyArmCounts());
+  }
+  const prior = empiricalPrior([...countsById.values()], 0.05, 2);
+
+  // Share accounting covers every query in the country's accounting window,
+  // not only the survivors of cooldown/intent rotation. Otherwise a cooling
+  // query's spend disappears and a sibling from the same family/source can
+  // exceed the cap. Pending/reserved runs are included at their reserved
+  // weight so committed quota cannot be bypassed before completion.
+  const spendById = new Map<number, number>();
+  for (const row of spendRows) {
+    spendById.set(row.queryId, (spendById.get(row.queryId) || 0) + row.quotaUnits * decayWeight(row.ageDays, DECAY_HALF_LIFE_DAYS));
+  }
+  const failureByQuery = new Map(failureStates.map(state => [state.queryId, state]));
+  // A persisted row can be a losing duplicate of an older row. Keep the
+  // deterministic oldest row as the group's winner and omit higher-id
+  // duplicates from its history; otherwise mutually duplicate rows suppress
+  // each other and neither can ever be selected. Losing rows still see the
+  // winner and remain rejected.
+  const historyEntries = queries.map(query => {
+    const aliasOf = query.generation_metadata?.aliasOf;
+    return {
+      id: query.id,
+      query: query.query,
+      country: query.country,
+      ...(typeof aliasOf === 'string' ? { aliasOf } : {}),
+    };
+  });
+  const historyEntryById = new Map(historyEntries.map(entry => [entry.id, entry]));
+  const historyFor = (query: QueryRecord) => {
+    const entry = historyEntryById.get(query.id) || { id: query.id, query: query.query, country: query.country };
+    return selectionHistoryFor(entry, historyEntries);
+  };
+
+  const admissions = new Map<number, QueryRecordAdmission>();
+  let eligible: QueryRecord[] = [];
+  for (const query of queries) {
+    const admissionInfo = revalidateQueryRecordAdmission(query, { now: options.nowIso, history: historyFor(query) });
+    admissions.set(query.id, admissionInfo);
+    if (!admissionInfo.eligible) continue;
+    if (admissionInfo.admission.tier === 'SPECULATIVE') continue;
+    // The execution authority is the last gate before quota spend. Applying it
+    // here as well keeps the selector from repeatedly choosing a stale/legacy
+    // row that the scheduler would immediately quarantine, which would starve
+    // otherwise eligible queries. Scope-promoted rows are checked against the
+    // same promotion basis the scheduler will use.
+    const authority = evaluateAutonomousQueryAuthority(query, {
+      scopePromotionActive: options.scopePromotionBasis != null,
+    });
+    if (!authority.eligible) continue;
+    const failure = failureByQuery.get(query.id);
+    const selectable = isQuerySelectable({
+      record: query,
+      now: options.nowIso,
+      cooldownMinutes: options.cooldownMinutes,
+      admission: admissionInfo.admission,
+      primaryTermUses: primaryUsage.get(primaryKey(query.primary_term)) || 0,
+      maxPrimaryUses: options.maxPrimaryUses,
+      consecutiveFailures: failure?.consecutiveFailures,
+      backoffUntil: failure?.backoffUntil,
+    });
+    if (!selectable.selectable) continue;
+    eligible.push(query);
+  }
+
+  // Preserve the deterministic intent rotation as a diversity filter, never
+  // as a score bonus.
+  eligible = rotateAwayFromMostRecentIntent(eligible, queries);
+
+  const familyQuota = new Map<string, number>();
+  const sourceQuota = new Map<string, number>();
+  const hierarchyCandidates: SelectorCandidate[] = [];
+  const candidates: SelectorCandidate[] = [];
+  let totalQuota = 0;
+  for (const query of queries) {
+    const admissionInfo = admissions.get(query.id);
+    const counts = countsById.get(query.id) || emptyArmCounts();
+    const spend = spendById.get(query.id) ?? counts.quotaUnits;
+    totalQuota += spend;
+    const admission = admissionInfo?.admission;
+    const family = admission?.compositionFamily
+      || (typeof query.generation_metadata?.compositionFamily === 'string' ? query.generation_metadata.compositionFamily : 'family:UNKNOWN');
+    familyQuota.set(family, (familyQuota.get(family) || 0) + spend);
+    const source = admission?.source || 'UNKNOWN';
+    sourceQuota.set(source, (sourceQuota.get(source) || 0) + spend);
+    // Hierarchy history covers every query in the accounting window, not only
+    // the executable survivors. A cooling-down or share-capped sibling still
+    // informs its family/country/market/language prior for the next surface.
+    hierarchyCandidates.push(buildSelectorCandidate(query, admissionInfo, admission, counts));
+  }
+  for (const query of eligible) {
+    const admissionInfo = admissions.get(query.id);
+    const counts = countsById.get(query.id) || emptyArmCounts();
+    const candidate = buildSelectorCandidate(query, admissionInfo, admissionInfo?.admission, counts);
+    candidates.push(candidate);
+  }
+  // Shares are measured against the larger of observed spend and one day of
+  // quota. Comparing only against query history would make a homogeneous pool
+  // 100% of its own family/source and cap every candidate forever, even when
+  // the family has spent a tiny fraction of the day.
+  const [budget, quotaFreeProviderAvailable] = await Promise.all([
+    getQueryPortfolioBudgetState(),
+    // Provider-registry capability, read from the same ACTIVE rows the
+    // scheduler allocates from. It only opens the selector's quota-free
+    // exploration branch; the scheduler still enforces the official portfolio
+    // floor per run.
+    isQuotaFreeProviderAvailable(),
+  ]);
+  const shareBase = Math.max(1, totalQuota, budget.dailyQuotaUnits);
+  const share = (rows: Map<string, number>, key: string): number => (rows.get(key) || 0) / shareBase;
+  const familyShare = Object.fromEntries([...familyQuota.keys()].map(key => [key, share(familyQuota, key)]));
+  const sourceShare = Object.fromEntries([...sourceQuota.keys()].map(key => [key, share(sourceQuota, key)]));
+  const hierarchy = buildHierarchy(hierarchyCandidates);
+  const coverageCells = [...new Set(candidates.map(coverageCellFor))];
+  const coveredCells = [...new Set(candidates.filter(candidate => candidate.counts.runs > 0).map(coverageCellFor))];
+  const context: SelectorContext = {
+    country,
+    now: options.nowIso,
+    c: SELECTOR_C,
+    maxIndex: MAX_SELECTION_INDEX,
+    minSample: MIN_SELECTION_SAMPLE,
+    portfolioRatio: options.portfolioRatio,
+    totalDailyQuotaUnits: budget.dailyQuotaUnits,
+    portfolioUnitsUsed: budget.portfolioUnitsUsed,
+    quotaFreeProviderAvailable,
+    familyShare,
+    familyCap: options.familyCap,
+    queryCap: 1,
+    // Selection is invoked per country. The 16-country scheduler owns global
+    // country rotation, so a per-call country share would always be 1.0 and
+    // would block every candidate.
+    countryShare: {},
+    countryCap: 1,
+    sourceShare,
+    sourceCap: options.sourceCap,
+    prior,
+    halfLifeDays: DECAY_HALF_LIFE_DAYS,
+    hierarchy,
+    coverageCells,
+    coveredCells,
+  };
+  const queriesById = new Map(queries.map(query => [query.id, query]));
+  return { candidates, queriesById, admissions, context, decision: selectHierarchicalUcb(candidates, context) };
+}
+
+function buildSelectionResult(
+  selected: QueryRecord,
+  pool: SelectorPool,
+  strategy: QuerySelectionResult['selectionStrategy'],
+  reason: string,
+  decision?: SelectorDecision,
+): QuerySelectionResult | null {
+  const admissionInfo = pool.admissions.get(selected.id);
+  const ucb = decision?.index ?? pool.decision.index;
+  if (ucb != null) selected = { ...selected, ucb_score: Number(ucb.toFixed(4)) };
+  if (!selected) return null;
+  // Execution revalidates the persisted admission without this selector's
+  // country history. Return the history-adjusted admission so the scheduled
+  // run does not quarantine a winner the selector just proved eligible.
+  if (admissionInfo) {
+    selected = {
+      ...selected,
+      generation_metadata: withQueryAdmission(selected.generation_metadata, admissionInfo.admission),
+    };
+  }
+  const selector = decision ?? pool.decision;
+  // The portfolio budget read matches persisted selection_reason by this
+  // marker. Targeted/fallback shapes keep their own strategy label but still
+  // spend reserved portfolio units when the selector chose a portfolio arm;
+  // preserve the marker so the daily cap accounts for that spend.
+  const portfolioMarker = selector.strategy === 'UCB_PORTFOLIO' && strategy !== 'UCB_PORTFOLIO'
+    ? 'Bounded portfolio: '
+    : '';
+  return { queryRecord: selected,
+    selectionStrategy: strategy,
+    reason: `${portfolioMarker}${reason}`,
+    quotaFreeRequired: selector.reasonCodes.includes('QUOTA_FREE_EXPLORATION'),
+    selector,
+    admission: admissionInfo ? {
+      hash: admissionInfo.admission.candidateHash,
+      tier: admissionInfo.admission.tier,
+      compositionFamily: admissionInfo.admission.compositionFamily,
+      reasonCodes: admissionInfo.reasonCodes,
+    } : undefined,
+  };
 }
 
 // ==========================================
@@ -1156,6 +1460,16 @@ export async function generateCandidateQueriesForCountry(
     scopePromotionBasis: options.scopePromotionBasis
   });
   const newQueries: QueryRecord[] = [];
+  // One country history read for the batch. Without this every planned
+  // candidate rescans every same-country row to rebuild duplicate history.
+  const history = existingQueries.map(query => {
+    const aliasOf = query.generation_metadata?.aliasOf;
+    return {
+      query: query.query,
+      country: query.country,
+      ...(typeof aliasOf === 'string' ? { aliasOf } : {}),
+    };
+  });
   for (const candidate of planned) {
     const record = await upsertQueryRecord({
       query: candidate.query,
@@ -1168,6 +1482,12 @@ export async function generateCandidateQueriesForCountry(
       discoveryObjective: candidate.discoveryObjective,
       primaryTerm: candidate.primaryTerm,
       generationMetadata: candidate.metadata
+    }, { history });
+    const aliasOf = candidate.metadata?.aliasOf;
+    history.push({
+      query: record.query,
+      country: record.country,
+      ...(typeof aliasOf === 'string' ? { aliasOf } : {}),
     });
     newQueries.push(record);
   }
@@ -1312,10 +1632,100 @@ export async function constructCountryNativeAllocationQuery(args: {
 export async function evaluateQueryPerformance(
   queryRecord: QueryRecord,
   metrics: QueryFunnelMetrics,
-  attribution: { retrievalLane?: string; searchOrdering?: string; quotaConsumed?: number; persist?: boolean } = {}
+  attribution: {
+    retrievalLane?: string;
+    searchOrdering?: string;
+    quotaConsumed?: number;
+    queryRunId?: string;
+    persist?: boolean;
+    /** Provider degradation for this run; excluded from promotion evidence. */
+    providerRequestsFailed?: number;
+    providerRunOutcome?: string | null;
+  } = {}
 ): Promise<{ performanceScore: number; newCollection: QueryCollection; summary: string }> {
   const performanceScore = metrics.performanceScore;
-  const newCollection = selectQueryCollection(queryRecord.collection, queryRecord.times_executed, metrics);
+  // Q4c promotion guard: PROVEN is a lower-confidence-bound decision over
+  // result-level, globally-new confirmed creators per quota, not a high
+  // blended performance score. The current run is not yet committed when the
+  // queue evaluates it, so completed prior runs are read from sighting truth
+  // and the in-flight metrics are added as the newest observation.
+  let promotionGuard: QueryPromotionGuard | undefined;
+  if (performanceScore >= 60) {
+    // One aggregated read per country (a row per query id, not per run). The
+    // query's own prior is kept separate from every other arm so the promotion
+    // confidence bound is shrunk toward a genuinely peer-derived rate instead
+    // of counting the query's own yield twice.
+    const decayedByQuery = await getQueryQualityDecayedCounts(queryRecord.country, undefined, DECAY_HALF_LIFE_DAYS);
+    const ownPrior = decayedByQuery.find(row => row.queryId === queryRecord.id)?.counts || emptyArmCounts();
+    const peerArms = decayedByQuery
+      .filter(row => row.queryId !== queryRecord.id)
+      .map(row => row.counts);
+    const peerTotal = peerArms.reduce((total, arm) => ({
+      confirmed: total.confirmed + arm.confirmed,
+      quality: total.quality + arm.quality,
+      quotaUnits: total.quotaUnits + arm.quotaUnits,
+      runs: total.runs + arm.runs,
+    }), emptyArmCounts());
+    // Use the run's own sighting truth: confirmed/quality are intersections
+    // of persisted, globally-new, non-rejected, confirmed channels. The
+    // aggregate counters can independently contain known confirmed traders
+    // and new uncertain channels; min() would invent overlap that never
+    // existed and could promote a zero-new-confirmation run.
+    const currentReward = attribution.queryRunId
+      ? await getQueryRunReward(attribution.queryRunId)
+      : { confirmed: 0, quality: 0 };
+    const currentRun = {
+      ...currentReward,
+      quotaUnits: Math.max(0, attribution.quotaConsumed || 0) / 100,
+      ageDays: 0,
+    };
+    // Zero-quota runs are excluded from serving history, hierarchy learning
+    // and the dashboard reward rate. They must not supply a promotion sample:
+    // otherwise a free run could raise the per-100-quota LCB to PROVEN.
+    // A partially provider-degraded run is excluded for the same reason:
+    // completed-run reward reads and accounting already drop it, so letting it
+    // prove the query would promote from evidence the dashboard cannot see.
+    // Exclude every non-success outcome, not only hard failures: a
+    // rate-limit-only recovered run is still a partially retrieved sample and
+    // is dropped from completed-run reward history. An absent outcome keeps
+    // legacy rows eligible; an explicit SUCCESS outcome stays eligible.
+    const providerOutcome = String(attribution.providerRunOutcome || '');
+    const providerFailed = Number(attribution.providerRequestsFailed || 0) > 0
+      || (providerOutcome !== '' && !/^SUCCESS(?:_|$)/.test(providerOutcome));
+    // Sighting-level truth requires the run id. Without it the funnel counters
+    // are not country-qualified, so the run cannot prove a promotion.
+    const includeCurrentRun = Boolean(attribution.queryRunId) && isRewardEligibleQuota(currentRun.quotaUnits) && !providerFailed;
+    const counts = includeCurrentRun
+      ? {
+          confirmed: ownPrior.confirmed + currentRun.confirmed,
+          quality: ownPrior.quality + currentRun.quality,
+          quotaUnits: ownPrior.quotaUnits + currentRun.quotaUnits,
+          runs: ownPrior.runs + 1,
+        }
+      : ownPrior;
+    const prior = empiricalPrior(peerArms, 0.05, 2);
+    // computePosterior subtracts the arm's own counts from the supplied total
+    // stratum, so include this arm to leave only peers in the hierarchy.
+    const totalStratum = {
+      confirmed: peerTotal.confirmed + counts.confirmed,
+      quality: peerTotal.quality + counts.quality,
+      quotaUnits: peerTotal.quotaUnits + counts.quotaUnits,
+      runs: peerTotal.runs + counts.runs,
+    };
+    const posterior = computePosterior(counts, prior, { total: totalStratum }, SELECTOR_C, MAX_SELECTION_INDEX);
+    promotionGuard = {
+      completedRuns: counts.runs,
+      lcb: promotionQualityScore(posterior),
+      newConfirmedCreators: counts.confirmed,
+      duplicateRatio: (metrics.evaluatedRawResults ?? metrics.rawResults) > 0
+        ? metrics.duplicateResults / (metrics.evaluatedRawResults ?? metrics.rawResults)
+        : 0,
+      invalidQueryRate: 0,
+      threshold: PROVEN_LCB_THRESHOLD,
+      minRuns: PROVEN_MIN_COMPLETED_RUNS,
+    };
+  }
+  const newCollection = selectQueryCollection(queryRecord.collection, queryRecord.times_executed, metrics, promotionGuard);
 
   if (isSeverelyContaminatedQuery(metrics)) {
     const vocabs = await getCountryVocabularies();

@@ -44,6 +44,8 @@ import { GRAPH_EXPANSION_POLICY_VERSION } from './graphExpansionPolicy';
 import { RELATIONSHIP_CANARY_VERSION } from './relationshipCanary';
 import { AUTONOMOUS_QUERY_AUTHORITY_POLICY_VERSION, evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
 import { CANDIDATE_TRIAGE_POLICY_VERSION } from './candidateTriage';
+import { SELECTOR_POLICY_VERSION } from './queryQuality/posterior';
+import { QUERY_PORTFOLIO_VERSION } from './queryQuality/selector';
 import {
   queriesOutsideCooldown,
   limitRepeatedPrimaryTerms,
@@ -220,6 +222,8 @@ export function verifyFrozenBenchmarkVersions(
     relationshipCanary: RELATIONSHIP_CANARY_VERSION,
     autonomousQueryAuthority: AUTONOMOUS_QUERY_AUTHORITY_POLICY_VERSION,
     candidateTriage: CANDIDATE_TRIAGE_POLICY_VERSION,
+    selectorPolicy: SELECTOR_POLICY_VERSION,
+    queryPortfolio: QUERY_PORTFOLIO_VERSION,
   },
 ): void {
   const frozen: Record<string, string> = {
@@ -237,8 +241,10 @@ export function verifyFrozenBenchmarkVersions(
     llmAssist: 'llm-assist-v1',
     graphExpansion: 'graph-expansion-v1',
     relationshipCanary: 'relationship-canary-v1',
-    autonomousQueryAuthority: 'autonomous-query-authority-v2',
-    candidateTriage: 'candidate-triage-v4-contextual-admission',
+    autonomousQueryAuthority: 'autonomous-query-authority-v3',
+    candidateTriage: 'candidate-triage-v5-latin-market-finance',
+    selectorPolicy: 'hierarchical-ucb-v1',
+    queryPortfolio: 'query-portfolio-v1',
   };
   const mismatches = Object.keys(frozen).filter(key => live[key] !== frozen[key]);
   if (BENCHMARK_PREREG_ORDERING_WINDOW_DAYS !== 90) {

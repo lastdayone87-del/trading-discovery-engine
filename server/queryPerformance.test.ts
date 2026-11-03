@@ -44,13 +44,27 @@ test('severely contaminated retrieval is quarantined after its first run', () =>
     channelId: `junk-${index}`,
     wasKnown: false,
     persisted: true,
-    funnelOutcome: index === 0 ? 'TRADING_CONFIRMED' as const : index < 6 ? 'UNCERTAIN' as const : 'NEEDS_REVIEW' as const,
+    funnelOutcome: index === 0 ? 'TRADING_CONFIRMED' as const : 'NON_TRADING' as const,
     qualityScore: index === 0 ? 20 : 0,
     hasCommunity: false
   }));
   const metrics = calculateQueryFunnel(10, observations);
   assert.equal(isSeverelyContaminatedQuery(metrics), true);
   assert.equal(selectQueryCollection('EXPERIMENTAL', 0, metrics), 'REJECTED');
+});
+
+test('UNCERTAIN and NEEDS_REVIEW are not contamination', () => {
+  const observations: QueryObservation[] = Array.from({ length: 10 }, (_, index) => ({
+    channelId: `unresolved-${index}`,
+    wasKnown: false,
+    persisted: true,
+    funnelOutcome: index === 0 ? 'TRADING_CONFIRMED' as const : index < 6 ? 'UNCERTAIN' as const : 'NEEDS_REVIEW' as const,
+    qualityScore: index === 0 ? 20 : 0,
+    hasCommunity: false
+  }));
+  const metrics = calculateQueryFunnel(10, observations);
+  assert.equal(isSeverelyContaminatedQuery(metrics), false);
+  assert.notEqual(selectQueryCollection('EXPERIMENTAL', 0, metrics), 'REJECTED');
 });
 
 test('mixed but useful exploratory retrieval is not prematurely quarantined', () => {
@@ -202,4 +216,29 @@ test('scope weighting stays neutral when no observation carries scope', () => {
   ]);
   assert.equal(metrics.newChannels, 2);
   assert.equal(metrics.inScopeNewChannels, 2);
+});
+
+test('promotion guard uses evaluated raw results for duplicate saturation', () => {
+  // Five evaluated raw results all resolve to the same channel: the funnel
+  // derives four duplicates, and deferred accounting must not dilute that
+  // denominator.
+  const observation: QueryObservation = {
+    channelId: 'a', wasKnown: false, persisted: true,
+    funnelOutcome: 'TRADING_CONFIRMED', qualityScore: 80, hasCommunity: false,
+  };
+  const metrics = calculateQueryFunnel(10, Array.from({ length: 5 }, () => ({ ...observation })), 5);
+  assert.equal(metrics.evaluatedRawResults, 5);
+  // Five deferred results must not dilute the duplicate denominator; using
+  // rawResults (10) here would halve the duplicate share and hide the bug.
+  assert.equal(metrics.distinctResults, 1);
+  assert.equal(metrics.duplicateResults, 4);
+  assert.ok(metrics.performanceScore >= 60);
+  assert.equal(selectQueryCollection('EXPERIMENTAL', 3, metrics, {
+    completedRuns: 3,
+    minRuns: 2,
+    lcb: 0.9,
+    threshold: 0.5,
+    newConfirmedCreators: 2,
+    invalidQueryRate: 0,
+  }), 'EXPERIMENTAL');
 });

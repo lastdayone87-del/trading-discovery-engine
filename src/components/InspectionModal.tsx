@@ -99,18 +99,35 @@ export const InspectionModal: React.FC<Props> = ({ channel, onClose }) => {
                   🤖 AI & Heuristic Trading Classifier Audit
                 </span>
                 <span className="px-2 py-0.5 rounded bg-indigo-100 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 font-mono text-[10px] font-bold">
-                  {channel.trading_relevance_breakdown.classification_method || 'HEURISTIC_PREFILTER'}
+                  {channel.trading_relevance_breakdown.classification_method === 'AI_SEMANTIC_CLASSIFIER'
+                    ? 'Calibrated (semantic)'
+                    : channel.trading_relevance_breakdown.classification_method === 'DETERMINISTIC_EVIDENCE'
+                      ? 'Deterministic evidence'
+                      : channel.trading_relevance_breakdown.classification_method === 'DEGRADED_HEURISTIC'
+                        ? 'Degraded heuristic'
+                        : 'Heuristic'}
                 </span>
               </div>
 
               <div className="grid grid-cols-2 gap-2 text-[11px]">
                 <div>
                   <span className="text-slate-500 block">Trading Status:</span>
-                  <span className="font-semibold text-slate-800 dark:text-slate-200">{channel.trading_status} ({channel.trading_confidence_score}% score)</span>
+                  <span className="font-semibold text-slate-800 dark:text-slate-200">
+                    {channel.trading_status} ({channel.trading_confidence_score == null ? '—' : `${channel.trading_confidence_score}%`}
+                    {channel.trading_relevance_breakdown.confidence_basis === 'NEUTRAL_PRIOR'
+                      ? ' · Neutral prior'
+                      : channel.trading_relevance_breakdown.confidence_basis === 'CALIBRATED'
+                        ? ' · Calibrated'
+                        : channel.trading_relevance_breakdown.confidence_basis === 'HEURISTIC'
+                          ? ' · Heuristic'
+                          : ''})
+                  </span>
                 </div>
                 <div>
                   <span className="text-slate-500 block">Detected Category:</span>
-                  <span className="font-semibold text-slate-800 dark:text-slate-200">{channel.trading_category}</span>
+                  <span className="font-semibold text-slate-800 dark:text-slate-200">
+                    {channel.trading_category && channel.trading_category !== 'General Trading' ? channel.trading_category : 'Unclassified'}
+                  </span>
                 </div>
               </div>
 

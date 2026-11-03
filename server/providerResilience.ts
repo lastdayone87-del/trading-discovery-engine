@@ -377,6 +377,10 @@ function safeProviderReasons(values?:string[]):string[]{
 }
 
 export async function executeProviderCall<T>(args:{context:ProviderCallContext; timeoutMs:number; enabled?:boolean; signal?:AbortSignal; call:(signal:AbortSignal)=>Promise<T>; emit:ProviderEventSink; trace?:(stage:string)=>void}):Promise<T>{
+  // An already-aborted caller must never start a billable request. Without
+  // this check the abort listener is installed after the fact, so downstream
+  // route failover can issue further calls for an abandoned evaluation.
+  if(args.signal?.aborted)throw new ProviderCallError('Provider call was cancelled before execution.','CANCELLED',true,{cause:args.signal.reason});
   const started=Date.now(), id=randomUUID(), controller=new AbortController();
   const base={id,provider:args.context.provider,operation:args.context.operation,requestId:args.context.requestId,runId:args.context.runId,jobId:args.context.jobId,requestMetadata:args.context.requestMetadata,attempt:args.context.attempt||1,reservedCost:args.context.reservedCost||0,policyVersion:args.context.policyVersion||'provider-resilience-v1'};
   let capacityLease:GeminiCapacityLease|undefined;
@@ -398,7 +402,12 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
     await args.emit(event).catch(()=>undefined);
     return value;
   }catch(error){
-    const typed=timedOut?new ProviderCallError(`Provider call exceeded ${args.timeoutMs}ms deadline.`,'TIMEOUT',true,{cause:error}):classifyProviderError(error);
+    // A caller-supplied deadline aborts through the same controller. Preserve
+    // its TIMEOUT class instead of collapsing it to a generic CANCELLED.
+    const callerAbortClass=args.signal?.aborted?(args.signal.reason as {errorClass?:string}|undefined)?.errorClass:undefined;
+    const typed=timedOut?new ProviderCallError(`Provider call exceeded ${args.timeoutMs}ms deadline.`,'TIMEOUT',true,{cause:error})
+      :callerAbortClass==='TIMEOUT'?new ProviderCallError('Provider call exceeded the caller deadline.','TIMEOUT',true,{cause:error})
+        :classifyProviderError(error);
     args.trace?.(`provider-call-caught (${typed.errorClass})`);
     if(args.context.provider==='gemini')console.warn('[Gemini Provider Diagnostic]',JSON.stringify({operation:args.context.operation,errorClass:typed.errorClass,status:typed.status??null,retryable:typed.retryable,providerReasons:safeProviderReasons(typed.providerReasons)}));
     const event:ProviderCallEvent={...base,status:statusFor(typed),latencyMs:Date.now()-started,actualCost:0,errorClass:typed.errorClass,occurredAt:new Date().toISOString()};
