@@ -3167,6 +3167,17 @@ export async function scheduleAutonomousQueryRuns(
       )) {
         await failStep('quota_free_provider_capability', new Error('QUOTA_FREE_PROVIDER_REQUIRED'));
       }
+      // InnerTube has no publishedAfter/Before support. A quota-free run
+      // assigned a windowed ordering treatment would be persisted as a
+      // treatment observation while executing unwindowed, contaminating the
+      // benchmark comparison. There is no official budget left to serve the
+      // window, so fail closed instead of recording a treatment that did not
+      // run.
+      if (candidate.quotaFreeRequired &&
+          candidate.experiment?.ordering?.arm === 'TREATMENT' &&
+          candidate.experiment.ordering.windowApplied) {
+        await failStep('quota_free_provider_capability', new Error('QUOTA_FREE_PROVIDER_CANNOT_SERVE_ORDERING_WINDOW'));
+      }
 
       // DATE-ordering capability guard: InnerTube exposes no sort-by-date, so
       // a DATE allocation served by YouTube.js would execute relevance order

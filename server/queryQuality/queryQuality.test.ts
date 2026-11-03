@@ -604,6 +604,11 @@ test('Q4: quota-free selection carries a scheduling requirement that cannot fall
   assert.match(dbCore, /QUOTA_FREE_PROVIDER_UNAVAILABLE/);
   assert.match(dbCore, /QUOTA_FREE_PROVIDER_REQUIRED/);
   assert.match(dbCore, /QUOTA_FREE_PROVIDER_CANNOT_SERVE_DATE_ORDERING/);
+  // A quota-free ordering-window treatment cannot be served by InnerTube,
+  // which ignores the job-payload window. Fail closed rather than persist a
+  // treatment observation that executed unwindowed.
+  assert.match(dbCore, /QUOTA_FREE_PROVIDER_CANNOT_SERVE_ORDERING_WINDOW/);
+  assert.match(dbCore, /candidate\.experiment\?\.ordering\?\.arm === 'TREATMENT'[\s\S]{0,80}windowApplied/);
   // Quota-free draws are pinned to RELEVANCE before ordering allocation and
   // skip the canary treatment that could switch them to DATE; the DATE guard
   // remains only as fail-closed defence. The registry row must be the full
