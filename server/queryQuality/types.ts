@@ -44,7 +44,12 @@ export interface QueryAtom {
   term: string;
   role: QueryAtomRole;
   sense: TermSense;
-  /** Human-readable provenance; never a classification authority. */
+  /**
+   * Producer declaration, not classifier output. Recognized governed values
+   * (see GOVERNED_LICENSED_PROVENANCE) skip only the learned-term
+   * trading-semantics lexicon; an unlabeled or unknown value still fails
+   * closed to that requirement.
+   */
   provenance: string;
 }
 

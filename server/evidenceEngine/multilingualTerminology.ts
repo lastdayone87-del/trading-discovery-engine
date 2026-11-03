@@ -127,8 +127,8 @@ export function matchedTerms(text: string, terms: string[]): string[] {
  * engineering and generic commentary confirm as trading. A text is now
  * trading-focused only when it contains a high-specificity Tier A signal, or
  * a method/education/execution term together with a second independent
- * dimension (instrument, execution, platform/prop firm, or an explicit
- * financial-market context).
+ * dimension (instrument, platform/prop firm, or an explicit financial-market
+ * context).
  */
 export function isTradingFocusedText(text: string, context: LayeredKnowledgeContext): boolean {
   const normalized = String(text || '').normalize('NFKC');
