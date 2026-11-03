@@ -229,6 +229,12 @@ WHERE continuation_status IS NULL
 -- job has no execution owner. Hiding it from the resume scanner alone leaves
 -- it counted as active portfolio budget forever, so finish it and release its
 -- reservations exactly like the orphaned-job reconciler (migration 122).
+--
+-- Ownership is not only query_runs.job_id: that pointer names the first-page
+-- job, while continuation pages are separate jobs keyed
+-- 'search-run:<runId>:page:<n>'. Any live page job keeps the run owned and
+-- must be excluded here; otherwise the migration would fail a run whose next
+-- page is already queued and release that page's reservation.
 CREATE TEMP TABLE _cdl_stale_query_runs ON COMMIT DROP AS
 SELECT qr.id AS query_run_id, qr.query_id
 FROM query_runs qr
@@ -236,8 +242,12 @@ WHERE qr.status IN ('SCHEDULED', 'RUNNING', 'RETRYING')
   AND qr.continuation_status = 'RUNNING'
   AND NOT EXISTS (
     SELECT 1 FROM jobs j
-    WHERE j.id = qr.job_id
-      AND j.status IN ('PENDING', 'PROCESSING')
+    WHERE j.status IN ('PENDING', 'PROCESSING')
+      AND (
+        j.id = qr.job_id
+        OR j.idempotency_key = 'search-run:' || qr.id::text
+        OR j.idempotency_key LIKE 'search-run:' || qr.id::text || ':page:%'
+      )
   );
 
 UPDATE query_runs qr
@@ -247,7 +257,25 @@ SET status = 'FAILED',
     error = COALESCE(qr.error, 'RESUME_UNAVAILABLE'),
     -- Only consumed units remain chargeable; the unused reservation is
     -- released with the run instead of inflating the shared portfolio.
-    quota_reserved = COALESCE(qr.quota_used, 0),
+    -- query_runs.quota_used is written only by the terminal finalizer, so an
+    -- incremental run can have earlier CONSUMED page reservations while
+    -- quota_used is still 0. Preserve the greater of the recorded total and
+    -- the durable consumed reservations; otherwise finalization would erase
+    -- quota the run already spent and under-count the portfolio.
+    quota_reserved = GREATEST(
+      COALESCE(qr.quota_used, 0),
+      COALESCE((
+        SELECT SUM(r.units)
+        FROM quota_reservations r
+        WHERE r.status = 'CONSUMED'
+          AND (
+            (r.operation_type = 'AUTONOMOUS_QUERY_PAGE'
+             AND r.operation_id LIKE qr.id::text || ':%')
+            OR (r.operation_type = 'SEARCH_YOUTUBE'
+                AND r.operation_id = qr.id::text)
+          )
+      ), 0)
+    ),
     performance_details = COALESCE(qr.performance_details, '{}'::jsonb)
       || jsonb_build_object(
         'failureKind', 'RESUME_UNAVAILABLE',

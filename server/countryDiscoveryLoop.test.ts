@@ -2887,19 +2887,47 @@ test('R7: migration backfills require matching creator country and finish ownerl
     /o\.source_creator_country IS NOT NULL\s+AND lower\(o\.source_creator_country\) = lower\(t\.country\)/,
     'an unknown creator country cannot prove native eligibility',
   );
+  // query_runs.job_id names the first-page job only. A queued continuation
+  // page ('search-run:<runId>:page:<n>') is equally a live owner and must
+  // keep the run out of the stale snapshot.
   assert.match(
     migration,
-    /CREATE TEMP TABLE _cdl_stale_query_runs[\s\S]*?status IN \('SCHEDULED', 'RUNNING', 'RETRYING'\)[\s\S]*?j\.status IN \('PENDING', 'PROCESSING'\)/,
-    'legacy non-terminal runs without a live job must be identified',
+    /CREATE TEMP TABLE _cdl_stale_query_runs[\s\S]*?status IN \('SCHEDULED', 'RUNNING', 'RETRYING'\)[\s\S]*?j\.status IN \('PENDING', 'PROCESSING'\)[\s\S]*?j\.id = qr\.job_id[\s\S]*?j\.idempotency_key = 'search-run:' \|\| qr\.id::text[\s\S]*?j\.idempotency_key LIKE 'search-run:' \|\| qr\.id::text \|\| ':page:%'/,
+    'legacy non-terminal runs with any live first- or later-page job must be excluded',
   );
-  assert.match(migration, /SET status = 'FAILED',\s+continuation_status = 'RESUME_UNAVAILABLE'/);
   assert.match(
+    migration,
+    /UPDATE query_runs qr\s+SET status = 'FAILED',\s+continuation_status = 'RESUME_UNAVAILABLE'[\s\S]*?WHERE qr\.id IN \(SELECT query_run_id FROM _cdl_stale_query_runs\)/,
+    'the run finalization must be scoped to the stale-run snapshot',
+  );
+  // quota_used is written only by the terminal finalizer, so incremental
+  // CONSUMED page reservations are the durable spend record for an unfinished
+  // run; finalization must not erase them.
+  assert.match(
+    migration,
+    /quota_reserved = GREATEST\(\s+COALESCE\(qr\.quota_used, 0\),\s+COALESCE\(\(\s+SELECT SUM\(r\.units\)\s+FROM quota_reservations r\s+WHERE r\.status = 'CONSUMED'/,
+    'consumed incremental page quota must survive finalization',
+  );
+  assert.doesNotMatch(
     migration,
     /quota_reserved = COALESCE\(qr\.quota_used, 0\)/,
-    'unused reservation must not keep consuming shared portfolio budget',
+    'finalization must not overwrite consumption recorded only in reservations',
   );
-  assert.match(migration, /UPDATE quota_reservations r\s+SET status = 'RELEASED'/);
-  assert.match(migration, /UPDATE query_library q\s+SET reserved_at = NULL/);
+  assert.match(
+    migration,
+    /r\.operation_id LIKE qr\.id::text \|\| ':%'/,
+    'consumed page reservations are keyed by run id and page number',
+  );
+  assert.match(
+    migration,
+    /UPDATE quota_reservations r\s+SET status = 'RELEASED'[\s\S]*?FROM _cdl_stale_query_runs s/,
+    'reservation release must be scoped to the stale-run snapshot',
+  );
+  assert.match(
+    migration,
+    /UPDATE query_library q\s+SET reserved_at = NULL,[\s\S]*?WHERE q\.id IN \(SELECT query_id FROM _cdl_stale_query_runs WHERE query_id IS NOT NULL\)/,
+    'query-library release must be scoped to the stale-run snapshot',
+  );
 });
 
 test('R8: the three extraction flags are read in one settings query', () => {
