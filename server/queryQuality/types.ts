@@ -181,6 +181,12 @@ export interface SelectorCandidate {
   tier: QueryCompositionTier;
   primaryTerm: string;
   counts: DecayedArmCounts;
+  /**
+   * Lifetime executions from `query_library`. Used only to rotate quota-free
+   * exploration away from an arm that has already been attempted; it is not
+   * reward or maturity accounting.
+   */
+  timesExecuted?: number;
   admission?: QueryAdmission;
   nextEligibleAt?: string | null;
   reservedUntil?: string | null;

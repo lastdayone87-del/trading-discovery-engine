@@ -104,10 +104,11 @@ remains unmodified; PR #567 was not touched.
   minimum sample **and** the provider registry cannot serve exploration for
   free. When the official floor is exhausted but an `ACTIVE`
   `SEARCH_YOUTUBE` registry row in `YOUTUBE_INNERTUBE_FREE` exists, the
-  selector instead returns the deterministic highest-uncertainty/lowest-yield
-  immature arm with reason code `QUOTA_FREE_EXPLORATION`. That capability is
-  read from the same `discovery_provider_registry` rows ordinary allocation
-  rotates over, not from an environment flag or prior run outcome. Selection
+  selector instead returns the deterministic least-attempted immature arm
+  (lifetime `query_library.times_executed`, then normal high-uncertainty/
+  low-yield ordering) with reason code `QUOTA_FREE_EXPLORATION`. That
+  capability is read from the same `discovery_provider_registry` rows ordinary
+  allocation rotates over, not from an environment flag or prior run outcome. Selection
   carries a `quotaFreeRequired` requirement into scheduling: provider rotation
   is restricted to free rows for that decision, and scheduling fails closed
   with `QUOTA_FREE_PROVIDER_UNAVAILABLE`, `QUOTA_FREE_PROVIDER_REQUIRED` or
@@ -231,7 +232,7 @@ remains unmodified; PR #567 was not touched.
 | Hierarchy | new surface inherits family prior; no cross-country leakage | posterior hierarchy tests + isolation tests | PASS |
 | Cold start | all 16 countries get valid candidates; cold-start recorded | 123/123 planner matrix; `COLD_START_GENERATION` | PASS |
 | Exploration | 10–20% (default 15%); per-country floor; family/query/source caps | `Q4: portfolio budget…`; selector cap fixtures | PASS |
-| Quota-free exploration | exhausted official floor + ACTIVE `YOUTUBE_INNERTUBE_FREE` registry row may select the deterministic best immature arm (`QUOTA_FREE_EXPLORATION`); scheduling is restricted to free rows and fails closed rather than falling back to official; zero-quota runs never mature or supply reward | `Q4: exhausted official budget permits quota-free exploration…`; `Q4: exhausted official budget blocks…`; `Q4: zero-quota free-provider runs…`; `Q4: quota-free capability is derived…`; `Q4: quota-free selection carries a scheduling requirement…` | PASS |
+| Quota-free exploration | exhausted official floor + ACTIVE `YOUTUBE_INNERTUBE_FREE` registry row may select the deterministic least-attempted immature arm (`QUOTA_FREE_EXPLORATION`); scheduling is restricted to free rows and fails closed rather than falling back to official; zero-quota runs never mature or supply reward and only rotate free attempts | `Q4: exhausted official budget permits quota-free exploration…`; `Q4: quota-free exploration rotates…`; `Q4: exhausted official budget blocks…`; `Q4: zero-quota free-provider runs…`; `Q4: quota-free capability is derived…`; `Q4: quota-free selection carries a scheduling requirement…` | PASS |
 | Non-domination | no family/query/source over the active cap; caps relax only when they would block every candidate | selector cap filter + cap fixtures | PASS |
 | Non-stationarity | decayed counts; halved yield demoted | 30-day decay + non-stationary simulator | PASS |
 | Duplicate | semantic duplicates suppressed before quota; one stable winner per persisted duplicate group; duplicate-heavy demoted | duplicate tests + `DUPLICATE_SATURATED` promotion guard | PASS |

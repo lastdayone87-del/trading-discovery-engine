@@ -317,7 +317,7 @@ test('Q4: posterior index is mean + c*SD, capped; c is fixed at 2.0', () => {
   assert.ok(capped.ucb <= 4);
 });
 
-const candidate = (id: number, family: string, runs = 3, confirmed = 1): SelectorCandidate => ({
+const candidate = (id: number, family: string, runs = 3, confirmed = 1, timesExecuted = 0): SelectorCandidate => ({
   queryId: id,
   query: `query ${id}`,
   collection: 'EXPERIMENTAL',
@@ -328,6 +328,7 @@ const candidate = (id: number, family: string, runs = 3, confirmed = 1): Selecto
   tier: 'LICENSED_UNSEEN',
   primaryTerm: `query ${id}`,
   counts: { confirmed, quality: 0, quotaUnits: 4, runs },
+  timesExecuted,
   admission: {
     version: 'query-admission-v1',
     candidateHash: `hash-${id}`,
@@ -432,7 +433,8 @@ test('Q4: exhausted official budget permits quota-free exploration when the regi
   assert.match(first.reason, /Quota-free provider capacity/);
 
   // Deterministic: the same exhausted-budget pool and capability always yield
-  // the same immature arm, never a random or least-executed pick.
+  // the same immature arm. The lifetime execution count is only a diversity
+  // counter here, never a random or recency fallback.
   const second = selectHierarchicalUcb(cold, selectorContext({
     portfolioUnitsUsed: 15,
     quotaFreeProviderAvailable: true,
@@ -447,6 +449,29 @@ test('Q4: exhausted official budget permits quota-free exploration when the regi
   }));
   assert.equal(mature.strategy, 'UCB_EXPLOITATION');
   assert.ok(mature.reasonCodes.includes('MATURE_SAMPLE'));
+});
+
+test('Q4: quota-free exploration rotates to the least-attempted immature arm', () => {
+  const context = selectorContext({
+    portfolioUnitsUsed: 15,
+    quotaFreeProviderAvailable: true,
+  });
+  const first = selectHierarchicalUcb([
+    candidate(1, 'family:A', 0, 0, 0),
+    candidate(2, 'family:B', 0, 0, 0),
+  ], context);
+  assert.equal(first.queryId, 1);
+
+  // Completing the free run leaves counts.runs unchanged (zero-quota runs are
+  // excluded from maturity), but advances the lifetime execution counter. The
+  // next free decision must move to the other immature arm instead of
+  // repeating the same dud after cooldown.
+  const second = selectHierarchicalUcb([
+    candidate(1, 'family:A', 0, 0, 1),
+    candidate(2, 'family:B', 0, 0, 0),
+  ], context);
+  assert.equal(second.queryId, 2);
+  assert.ok(second.reasonCodes.includes('QUOTA_FREE_EXPLORATION'));
 });
 
 test('Q4: exhausted official budget blocks exploration when only paid/official providers exist', () => {

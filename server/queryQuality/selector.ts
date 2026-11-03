@@ -142,6 +142,19 @@ function compareExploration(a: CandidateScore, b: CandidateScore, context: Selec
 }
 
 /**
+ * Quota-free exploration adds a bounded diversity signal on top of the normal
+ * uncertainty ordering. Zero-quota runs deliberately never advance reward or
+ * maturity counts, so without this the same immature arm could win again after
+ * every cooldown window. Prefer the least-attempted arm; lifetime executions
+ * are an attempt counter only, not reward or maturity accounting.
+ */
+function compareQuotaFreeExploration(a: CandidateScore, b: CandidateScore, context: SelectorContext): number {
+  const attemptDifference = (a.candidate.timesExecuted ?? 0) - (b.candidate.timesExecuted ?? 0);
+  if (attemptDifference !== 0) return attemptDifference;
+  return compareExploration(a, b, context);
+}
+
+/**
  * Deterministic hierarchical, cost-aware UCB selection.
  *
  * - `selectionIndex = posterior mean + c * posterior SD`, capped.
@@ -277,12 +290,12 @@ export function selectHierarchicalUcb(candidates: SelectorCandidate[], context: 
     // proves quota-free SEARCH_YOUTUBE capacity (for example InnerTube). That
     // capacity can explore an unproven arm without spending official units.
     // Zero-quota runs stay out of maturity counts, so the arm remains immature
-    // until an accounted run exists; repeated free exploration is therefore
-    // expected while the official floor is exhausted. Official/paid
-    // exploration stays blocked: the scheduler re-checks the portfolio floor
-    // for portfolio-labelled strategies that consume official units, while
-    // zero-quota runs skip that check.
-    chosen = [...immature].sort((a, b) => compareExploration(a, b, context))[0];
+    // until an accounted run exists; the lifetime execution count rotates free
+    // exploration to the least-attempted arm instead of repeating one dud
+    // indefinitely. Official/paid exploration stays blocked: the scheduler
+    // re-checks the portfolio floor for portfolio-labelled strategies that
+    // consume official units, while zero-quota runs skip that check.
+    chosen = [...immature].sort((a, b) => compareQuotaFreeExploration(a, b, context))[0];
     strategy = 'UCB_PORTFOLIO';
     reasonCodes = ['QUOTA_FREE_EXPLORATION', 'MINIMUM_SAMPLE_NOT_MET'];
   } else {

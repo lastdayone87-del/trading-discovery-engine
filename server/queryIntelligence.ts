@@ -1190,6 +1190,7 @@ function buildSelectorCandidate(
     tier: admission?.tier || 'SPECULATIVE',
     primaryTerm: record.primary_term || record.query,
     counts,
+    timesExecuted: Number(record.times_executed || 0),
     admission,
     nextEligibleAt: (record as QueryRecord & { next_eligible_at?: string | null }).next_eligible_at,
     reservedUntil: (record as QueryRecord & { reserved_until?: string | null }).reserved_until,
