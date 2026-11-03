@@ -983,9 +983,13 @@ async function processChannelThroughPipelineInContext(
   // also admit country-valid CONFIRMED + TRADING_CONFIRMED creators below the
   // quality bar. Those lower-quality observations are promotion-ineligible
   // and never write legacy extracted_vocabulary rows.
-  const cdlEnabled = await getAppSetting('country_discovery_loop_enabled', 'true') === 'true';
-  const nativeExtractionFlagEnabled = await getAppSetting('native_vocabulary_extraction_enabled', 'true') === 'true';
-  const promotionV2Enabled = await getAppSetting('native_evidence_promotion_v2_enabled', 'true') === 'true';
+  // Independent settings: one concurrent read avoids three serial round trips
+  // on the successful-ingestion path.
+  const [cdlEnabled, nativeExtractionFlagEnabled, promotionV2Enabled] = await Promise.all([
+    getAppSetting('country_discovery_loop_enabled', 'true').then(value => value === 'true'),
+    getAppSetting('native_vocabulary_extraction_enabled', 'true').then(value => value === 'true'),
+    getAppSetting('native_evidence_promotion_v2_enabled', 'true').then(value => value === 'true'),
+  ]);
   const extraction = resolveNativeExtractionEligibility({
     cdlEnabled,
     nativeExtractionFlagEnabled,

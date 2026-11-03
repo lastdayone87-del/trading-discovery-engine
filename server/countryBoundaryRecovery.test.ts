@@ -28,6 +28,15 @@ test('dry-run eligibility requires non-excluded pinned-boundary rejection', asyn
   assert.equal(isNonExcludedBoundaryCandidate(candidate({ country_status: 'CONFIRMED', inspection_trail: [] }), INITIAL_EXCLUDED_COUNTRIES), false);
 });
 
+test('alias-form exclusions retain rejected creators by canonical identity', async () => {
+  const { classifyReconciliationState } = await import('./countryBoundaryRecovery');
+  const channel = candidate({ country: 'Germany', country_status: 'REJECTED', inspection_trail: [] });
+  const retained = classifyReconciliationState(channel, [{ country_name: 'DE', reason: 'test exclusion' }], []);
+  assert.equal(retained.state, 'LEGITIMATE_REJECTION');
+  assert.equal(retained.detectedCountry, 'Germany');
+  assert.match(retained.reasoning, /explicit country match/);
+});
+
 test('Discord inspection-step detection is independent from current Discord projection', () => {
   assert.equal(hasDiscordInspectionStep(candidate()), false);
   assert.equal(hasDiscordInspectionStep(candidate({ inspection_trail: [{ step: 'Step 4 — Linked Websites', details: 'Inspected successfully.' }] })), true);
@@ -263,6 +272,11 @@ test('TEST G: Dashboard projection SQL filters out excluded countries and non-re
   const { OPERATOR_VISIBLE_CHANNEL_SQL } = await import('./dbCore');
   assert.match(OPERATOR_VISIBLE_CHANNEL_SQL, /country_status <> 'REJECTED'/);
   assert.match(OPERATOR_VISIBLE_CHANNEL_SQL, /NOT EXISTS[\s\S]+FROM excluded_countries/);
+  // The listing predicate must use the same alias identity as
+  // findCountryExclusion, so an operator exclusion stored as `DE` hides a
+  // channel stored as `Germany` (and vice versa).
+  assert.match(OPERATOR_VISIBLE_CHANNEL_SQL, /CASE[\s\S]+WHEN 'de' THEN 'germany'/);
+  assert.match(OPERATOR_VISIBLE_CHANNEL_SQL, /CASE[\s\S]+WHEN 'de' THEN 'germany'[\s\S]+channels\.country/);
 });
 
 const postgresUrl = process.env.COUNTRY_BOUNDARY_TEST_DATABASE_URL;

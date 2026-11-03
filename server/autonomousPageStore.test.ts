@@ -75,6 +75,8 @@ test('run-wide metrics keep the rejected count on the same distinct set as the d
   // exceed the denominator (two rejects repeated on two pages). Both sides
   // must come from channel_sightings for the run.
   assert.match(source,/COUNT\(DISTINCT channel_id\) FILTER \(WHERE country_outcome='REJECTED'\)/);
-  assert.match(source,/countryRejected:rejected,/);
-  assert.match(source,/countryPrecision:\(distinct-rejected\)\/distinct/);
+  // Whitespace-tolerant: this branch pretty-prints the returned object, while
+  // the contract is the value identity, not the exact formatting.
+  assert.match(source,/countryRejected:\s*rejected,/);
+  assert.match(source,/countryPrecision:\s*\(distinct\s*-\s*rejected\)\s*\/\s*distinct/);
 });

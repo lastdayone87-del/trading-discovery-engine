@@ -96,7 +96,8 @@ function isFreeSignalStandaloneAuthorized(
   if (!atom || String(atom.origin || '') !== 'FREE_SIGNAL') return false;
   if (Number(atom.tier) !== 3) return false;
   if (!['INSTRUMENT', 'METHOD'].includes(String(atom.type || '').toUpperCase())) return false;
-  if (String(atom.type || '').toUpperCase() === 'METHOD' && !EXPLICIT_STANDALONE_METHOD_CONTEXT.test(query.query)) return false;
+  // Generic METHOD surfaces are rejected by the shared standalone-method
+  // guard below, so they receive the same reason as SINGLE_ATOM methods.
   if (atom.retrievalPolicy?.policyVersion !== RETRIEVAL_SPECIFICITY_POLICY_VERSION) return false;
   if (isBareShortTicker(query.query)) return false;
   return true;

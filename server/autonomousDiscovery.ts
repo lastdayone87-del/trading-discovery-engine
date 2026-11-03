@@ -38,7 +38,7 @@ import {
   quarantineUnexecutableAllocation,
   markAllocationDecisionDeferred
 } from './discoveryFrontierAllocator';
-import { reconcileYouTubeQuotaRolloverAndGetAutonomousSnapshot } from './quotaRolloverReconciliation';
+import { getAutonomousQueueDepth, reconcileYouTubeQuotaRolloverAndGetAutonomousSnapshot } from './quotaRolloverReconciliation';
 import { materializeAdaptiveDiscoveryPilotProposals } from './adaptiveDiscoveryPilot';
 import { materializeStoredExternalOsintProposals } from './externalOsint';
 import { randomUUID } from 'node:crypto';
@@ -397,29 +397,47 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
     // keep their on-demand country scope and do not resume other countries.
     const config = await getDiscoveryConfig();
     let resumedPages = 0;
+    // Queue occupancy used by capacity and reporting. The reconciled snapshot
+    // is the starting point; successful resumptions are added, and a failed
+    // sweep refreshes it because enqueues commit incrementally before a throw.
+    let queueDepth = snapshot.queueDepth;
+    let continuationSweepFailed = false;
     if (!targetCountry) {
       try {
         const { resumeOrphanedAutonomousPages } = await import('./queueManager');
         // Forced recovery must respect the same target queue depth as new
         // queries; otherwise a single sweep can enqueue up to 50 pages into a
         // queue that is already full.
-        const headroom = Math.max(0, config.targetQueueDepth - snapshot.queueDepth);
+        const headroom = Math.max(0, config.targetQueueDepth - queueDepth);
         const resumed = await resumeOrphanedAutonomousPages({ force: true, maxEnqueued: headroom });
         resumedPages = resumed.enqueued;
+        queueDepth += resumedPages;
         if (resumedPages > 0) {
           log(`Continuation-first: resumed ${resumedPages} pending page(s) before new-query scheduling.`);
         }
       } catch (error) {
-        // Continuation recovery is best-effort; the maintenance scheduler
-        // retries it and new-query scheduling must not be blocked by it.
-        console.warn('[Autonomous Producer] Continuation resume sweep failed; new-query scheduling continues:', error);
+        continuationSweepFailed = true;
+        console.warn('[Autonomous Producer] Continuation resume sweep failed; refreshing queue depth before fresh-query admission:', error);
+        try {
+          // The sweep enqueues page by page, so a mid-sweep error may leave
+          // committed pages behind even though the aggregate result was lost.
+          const refreshed = await getAutonomousQueueDepth();
+          queueDepth = refreshed;
+          resumedPages = Math.max(0, refreshed - snapshot.queueDepth);
+        } catch (refreshError) {
+          // If occupancy cannot be re-read, conservatively treat the cycle as
+          // full instead of scheduling fresh queries past the watermark.
+          console.warn('[Autonomous Producer] Queue depth refresh failed; skipping fresh-query scheduling this cycle:', refreshError);
+          queueDepth = Math.max(snapshot.queueDepth, config.targetQueueDepth);
+          resumedPages = 0;
+        }
       }
     }
 
     const calculatedCapacity = calculateDiscoveryCapacity({
       batchSize: config.batchSize,
       targetQueueDepth: config.targetQueueDepth,
-      currentQueueDepth: snapshot.queueDepth + resumedPages,
+      currentQueueDepth: queueDepth,
       dailyBudget: config.dailyQuotaBudget,
       allocationPercent: config.autonomousQuotaPercent,
       unitsUsed: snapshot.autonomousUnitsUsed,
@@ -440,9 +458,13 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       lastReport = {
         country: 'MULTI', query: 'NONE', strategy: 'QUOTA_OR_QUEUE_GUARD', discoveredCount: 0,
         uniqueCount: 0, qualityCreatorsCount: 0, performanceScore: 0, newCollection: 'NONE',
-        queuedCount: 0, queueDepth: snapshot.queueDepth,
+        queuedCount: resumedPages, queueDepth,
         remainingAutonomousQuota: Math.max(0, Math.floor(config.dailyQuotaBudget * config.autonomousQuotaPercent / 100) - snapshot.autonomousUnitsUsed - snapshot.autonomousUnitsReserved),
-        summary: 'No work scheduled: queue target or paced autonomous quota capacity is exhausted.', diagnostics
+        summary: continuationSweepFailed
+          ? 'No fresh work scheduled: the continuation sweep failed and queue occupancy was conservatively treated as full.'
+          : resumedPages > 0
+            ? `No fresh work scheduled: resumed ${resumedPages} continuation page(s) and queue/quota capacity is exhausted.`
+            : 'No work scheduled: queue target or paced autonomous quota capacity is exhausted.', diagnostics
       };
       return { ...lastReport, logs };
     }
@@ -842,7 +864,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       queries: scheduled.map(item => item.query.query),
       strategy: 'DURABLE_BATCH_PRODUCER', discoveredCount: 0, uniqueCount: 0,
       qualityCreatorsCount: 0, performanceScore: 0, newCollection: 'PENDING',
-      queuedCount: scheduled.length, queueDepth: snapshot.queueDepth + scheduled.length,
+      queuedCount: scheduled.length, queueDepth: queueDepth + scheduled.length,
       remainingAutonomousQuota: Math.max(0, Math.floor(config.dailyQuotaBudget * config.autonomousQuotaPercent / 100) - snapshot.autonomousUnitsUsed - snapshot.autonomousUnitsReserved - scheduled.length * 100),
       summary: `Scheduled ${scheduled.length} diverse durable search job(s); workers own all YouTube execution.`,
       diagnostics

@@ -2,7 +2,7 @@ import { getAllChannels, getExcludedCountries, getCountryVocabularies, getDb, en
 import { canonicalCountry, inferChannelCountry } from './countryInference';
 import { resolveScopeEligibility } from './scopeEligibility';
 import { stringifyWellFormedJson } from './unicodeSafety';
-import { normalizeCountryName } from './countryExclusionRules';
+import { countryIdentityKey } from './countryExclusionRules';
 import { creatorLevelCountryEvidence } from './countryValidator';
 import type { ChannelRecord, CountryVocabulary } from '../src/types';
 
@@ -176,8 +176,13 @@ export function classifyReconciliationState(
 } {
   const hasBoundaryRejection = hasPinnedBoundaryRejection(channel);
   if (!hasBoundaryRejection && channel.country_status === 'REJECTED') {
-    const isLiveExcluded = (country: string): boolean =>
-      excludedCountries.some(item => normalizeCountryName(item.country_name) === normalizeCountryName(country));
+    const isLiveExcluded = (country: string): boolean => {
+      // Match exclusions by canonical identity, not literal spelling: a live
+      // `DE` exclusion must retain a channel stored as `Germany`.
+      const identity = countryIdentityKey(country);
+      return Boolean(identity)
+        && excludedCountries.some(item => countryIdentityKey(item.country_name) === identity);
+    };
     // Aggregated-language rejections carry their candidate-country set in the
     // trail: restore the row unless every set member is still excluded.
     // Set membership (not the mechanical representative) decides, so removing

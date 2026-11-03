@@ -19,7 +19,10 @@ Migration `161_country_discovery_loop.sql` seeds those settings to `true` with
 `ON CONFLICT(setting_key) DO NOTHING`. A pre-existing explicit operator value is therefore preserved. If an
 operator intentionally set a core kill switch to `false` before deploy, the migration does not silently
 override it; the `core_kill_switches` health check reports a `WARN` naming the disabled path. Resolve that
-conflict explicitly (either accept the intentional kill switch or re-enable it) as part of deployment.
+conflict explicitly (either accept the intentional kill switch or re-enable it) as part of deployment. The
+same rule applies to `autonomous_pagination_max_pages`: migration 161 seeds `50` only when the setting is
+absent, because a persisted value has no provenance that could distinguish the old seeded default from an
+operator's deliberate ceiling. Raise an existing value explicitly if the higher bound is wanted.
 
 Only the paid demand adapter remains off:
 
@@ -31,8 +34,11 @@ Only the paid demand adapter remains off:
 1. Migration 161 is part of the normal migration step. It is additive and idempotent; it does not drop
    tables/columns, delete data, rewrite unrelated settings, or change country scope.
 2. `WIKIMEDIA_USER_AGENT` must be set to a descriptive agent with a real contact URL or email before free
-   signals are enabled. The built-in fallback names this prerequisite instead of using a fake address; the
-   `wikimedia_user_agent` health check warns when it is unset.
+   signals are enabled. The built-in fallback names this prerequisite instead of using a fake address.
+   While free signals are enabled and no contact-bearing agent is configured, the `wikimedia_user_agent`
+   health check returns `FAIL` and the health route returns `503`; set a real contact or disable free
+   signals. Reserved example domains (including `example.org`) are placeholders and do not satisfy the
+   prerequisite.
 3. `youtube_key_daily_cap_enforced` must remain `true`. The CDL migration does not change it.
 4. No paid-provider credential is required. The core path and its tests run with the paid adapter absent.
 
@@ -61,8 +67,8 @@ Both routes are operator routes requiring the `country-discovery.read` action:
 | `ai_daily_cost` | AI extraction cost against the $5/day cap. | `WARN` near the cap, `FAIL` above it. |
 | `ai_budget_skips` | AI budget skips versus logical calls. | `WARN` on a spike. |
 | `active_country_coverage` | Configured active countries with no page in 24 hours. | `WARN`; check the sweep and fairness cursor. |
-| `wikimedia_user_agent` | `WIKIMEDIA_USER_AGENT` is configured while free signals are on. | `WARN`; set a real contact before enabling. |
-| `paid_demand_off` | `query_demand_signals_enabled` is not enabled. | `FAIL` if paid demand is on without separate approval. |
+| `wikimedia_user_agent` | `WIKIMEDIA_USER_AGENT` is configured while free signals are on. | `FAIL` (health route `503`) when free signals are enabled and no contact-bearing agent is set; configure a real contact URL/email or disable free signals. |
+| `paid_demand_off` | `query_demand_signals_enabled` is not enabled. | `FAIL` whenever paid demand is enabled. The check has no approval state, so separate approval does not change the health result. |
 | `core_kill_switches` | Approved core paths are enabled. | `WARN` names any operator-disabled path. |
 | `wikimedia_pageviews_off` | Optional pageviews prior stays off. | `WARN` only if enabled. |
 
@@ -76,7 +82,7 @@ failures.
 |---|---|---|
 | `country_discovery_loop_enabled` | `true` | `false` stops new CDL portfolio/continuation/extraction paths. |
 | `autonomous_pagination_enabled` | `true` | `false` stops child-page enqueue; runs finish after the current page. |
-| `autonomous_pagination_v2_enabled` | `true` | `false` falls back to the legacy continuation policy; page metrics still record. |
+| `autonomous_pagination_v2_enabled` | `true` | `false` selects legacy continuation decisions; page metrics still record and the orphan reconciler remains active while `autonomous_pagination_enabled` and the CDL master switch are on. |
 | `native_evidence_promotion_v2_enabled` | `true` | `false` returns lifecycle selection to v1; v1 SQL is unchanged. |
 | `native_vocabulary_extraction_enabled` | `true` | `false` stops expanded extraction; the quality-gated legacy path remains. |
 | `free_query_signals_enabled` | `true` | `false` stops Wikipedia/Wikidata enrichment; terminology/seed/YouTube paths continue. |
@@ -92,7 +98,10 @@ state; resuming continues from the stored token/progress.
 The maintenance scheduler reconciles pending autonomous pages every tick (internally throttled to five
 minutes). The producer cycle also calls the reconciler with `force: true` before the queue snapshot on
 non-direct-target cycles, so a deferred continuation is scheduled before new-query work. Continuation jobs
-use priority 25 versus priority 20 for new queries.
+use priority 25 versus priority 20 for new queries. Both sweep paths are bounded by the configured queue
+headroom, and the reconciler stays active when `autonomous_pagination_v2_enabled=false`; that setting only
+switches the decision policy, it does not strand legacy pages. Disabling `autonomous_pagination_enabled` or
+the CDL master switch is what stops continuation enqueue.
 
 If `orphan_pending_pages` reports `FAIL` (the route returns 503):
 

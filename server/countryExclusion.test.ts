@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { findCountryExclusion, normalizeCountryName } from './countryExclusionRules';
+import { countryIdentitySql, findCountryExclusion, normalizeCountryName } from './countryExclusionRules';
 import { countryAliasTarget } from './countryAliases';
 import { assertCountryAllowed, getCountryExclusion, shouldBlockEnrichClaimForCountry } from './countryExclusion';
 import { buildOperationalEnrichmentRecoveryPayload } from './queueManager';
@@ -56,6 +56,13 @@ test('resolves non-ISO alias spellings through the shared identity map', () => {
     reason: 'x'
   });
   assert.equal(findCountryExclusion('Atlantis', [{ country_name: 'Germany', reason: 'x' }]), null);
+});
+
+test('operator-visible SQL uses the same alias identity as the application matcher', () => {
+  const expression = countryIdentitySql('excluded.country_name');
+  assert.match(expression, /WHEN 'de' THEN 'germany'/);
+  assert.match(expression, /WHEN 'usa' THEN 'united states'/);
+  assert.match(expression, /ELSE lower\(regexp_replace\(btrim\(excluded\.country_name\), '\\s\+', ' ', 'g'\)\)/);
 });
 
 test('alias lookup fails closed for inherited object properties', () => {

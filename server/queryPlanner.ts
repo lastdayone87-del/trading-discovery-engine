@@ -568,7 +568,13 @@ export function planDiverseQueries(args: {
       sourceTypes = [...new Set([
         ...sourceTypes,
         'FREE_SIGNAL' as const,
-        ...(freeSignalTerminology ? ['TERMINOLOGY' as const] : []),
+        // A matching proven term corroborates a standalone free surface but
+        // does not turn it into an anchored/mixed query. Adding TERMINOLOGY
+        // here would reclassify the source as MIXED and make the exact-shape
+        // execution authority withhold the planner's own standalone output.
+        ...(freeSignalTerminology && candidate.template !== 'FREE_SIGNAL_STANDALONE'
+          ? ['TERMINOLOGY' as const]
+          : []),
       ])];
     }
     if (candidate.demand) {

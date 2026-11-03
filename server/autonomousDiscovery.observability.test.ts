@@ -30,7 +30,9 @@ test('automated route reports the durable scheduled-query list and count without
 });
 
 test('scheduler exposes distinct operation labels and never passes query text to diagnostics', () => {
-  const db = here('./db.ts');
+  // The durable scheduler implementation lives in dbCore; db.ts is only the
+  // public facade. Scan the implementation, not its re-export.
+  const db = here('./dbCore.ts');
   for (const operation of ['provider_registry_eligibility', 'query_run_insert', 'child_job_insert', 'query_run_job_linkage', 'decision_event_persistence']) {
     assert.match(db, new RegExp(operation));
   }

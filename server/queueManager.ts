@@ -92,7 +92,8 @@ import { randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
 import { computeEffectivePageBudget, evaluateContinuation, evaluateContinuationV2, planPersistedPageRecovery, resumeModeForProvider, shouldCreateContinuationSegment, type ContinuationDecisionV2, type ContinuationResumeMode } from './continuationPolicy';
 import { evaluateAutonomousQueryAuthority, isScopePromotedRecord } from './autonomousQueryAuthority';
-import { getDiscoveryScope, resolveAutonomousCountries, resolveScopePromotionForScope } from './autonomousDiscovery';
+import { getDiscoveryScope, resolveAutonomousCountries, resolveDiscoveryTargetQueueDepth, resolveScopePromotionForScope } from './autonomousDiscovery';
+import { getAutonomousQueueDepth } from './quotaRolloverReconciliation';
 import { YOUTUBE_INNERTUBE_MAX_PAGES, INNERTUBE_TIMEOUT_CODE } from './youtubeInnertubeProvider';
 import { getNextYouTubeQuotaResetAt } from './youtubeQuotaDay';
 import { shouldReactivateCommunityRecovery, reactivateCommunityRecovery, projectTerminalCommunityRetryFailure } from './communityRecovery';
@@ -2246,7 +2247,11 @@ export function planContinuationResume<T extends { country: string; runId: strin
 export async function resumeOrphanedAutonomousPages(options: {
   force?: boolean;
   limit?: number;
-  /** Maximum new page jobs this sweep may enqueue (queue headroom). */
+  /**
+   * Maximum new page jobs this sweep may enqueue. Omitted means the current
+   * configured queue headroom, so maintenance and producer sweeps share the
+   * same watermark instead of letting a forced sweep enqueue up to 50 pages.
+   */
   maxEnqueued?: number;
   now?: Date;
 } = {}): Promise<{ swept: boolean; enqueued: number; skipped: number; unavailable: number }> {
@@ -2256,11 +2261,10 @@ export async function resumeOrphanedAutonomousPages(options: {
   }
   lastAutonomousResumeSweepAt = nowMs;
   const enabled = await getAppSetting('autonomous_pagination_enabled', 'true') === 'true';
-  const v2Enabled = await getAppSetting('autonomous_pagination_v2_enabled', 'true') === 'true';
   // The CDL master switch stops new continuation work as well as the worker
   // paths; operators must not need to flip several independent settings.
   const cdlEnabled = await getAppSetting('country_discovery_loop_enabled', 'true') === 'true';
-  if (!enabled || !v2Enabled || !cdlEnabled) {
+  if (!enabled || !cdlEnabled) {
     return { swept: true, enqueued: 0, skipped: 0, unavailable: 0 };
   }
   // The store returns a ranked fallback list per pending country, without a
@@ -2278,9 +2282,13 @@ export async function resumeOrphanedAutonomousPages(options: {
   const sweepCountryLimit = Math.max(1, Math.min(500, Math.trunc(options.limit || 50) || 50));
   // The forced producer sweep runs before queue-depth admission. Bound it by
   // the available headroom so recovery itself cannot overshoot the target
-  // queue depth. At most one page is enqueued per selected country.
+  // queue depth. At most one page is enqueued per selected country. Callers
+  // that omit the limit (the maintenance sweep) get the same headroom bound.
   const maxEnqueued = options.maxEnqueued === undefined
-    ? Number.POSITIVE_INFINITY
+    ? Math.max(0, resolveDiscoveryTargetQueueDepth(
+        await getAppSetting('discovery_target_queue_depth', ''),
+        process.env.DISCOVERY_TARGET_QUEUE_DEPTH,
+      ) - await getAutonomousQueueDepth())
     : Math.max(0, Math.trunc(options.maxEnqueued) || 0);
   const boundedCountryLimit = Number.isFinite(maxEnqueued)
     ? Math.min(sweepCountryLimit, maxEnqueued)

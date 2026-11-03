@@ -175,6 +175,9 @@ export function createOperationalMaintenanceScheduler(
     await isolate('provider_deferred_projection', () => dependencies.projectProviderDeferredEnrichment());
     await isolate('operational_enrichment_recovery', () => dependencies.reconcileOperationalEnrichmentRecovery());
     await isolate('phase_b_observation_reconciliation', () => dependencies.triggerPhaseBObservationReconciliation());
+    // The reconciler defaults its enqueue limit to the configured queue
+    // headroom, so this maintenance sweep cannot exceed the producer
+    // watermark even when no explicit limit is supplied.
     await isolate('autonomous_orphan_resume', () => dependencies.resumeOrphanedAutonomousPages());
   };
 

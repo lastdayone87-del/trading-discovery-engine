@@ -448,12 +448,17 @@ export function computeEffectivePageBudget(input: EffectivePageBudgetInput): Eff
   }
   let effective = bounds[0];
   for (const candidate of bounds.slice(1)) {
-    // Treatment/trial caps win ties. Otherwise an equal safety/provider/quota
-    // bound would leave bindingBound as SAFETY, and the segmenter would renew
-    // the same allocation cap with a fresh run quota instead of ending.
+    // Treatment/trial caps win ties. A quota budget tying the safety ceiling
+    // must also win: leaving bindingBound as SAFETY would let page 50 create a
+    // linked segment with a fresh run quota instead of exhausting the current
+    // fair-share allocation.
     if (
       candidate.pages < effective.pages
-      || (candidate.pages === effective.pages && (candidate.bound === 'TREATMENT' || candidate.bound === 'TRIAL'))
+      || (candidate.pages === effective.pages && (
+        candidate.bound === 'TREATMENT'
+        || candidate.bound === 'TRIAL'
+        || (candidate.bound === 'RUN_BUDGET' && effective.bound === 'SAFETY')
+      ))
     ) {
       effective = candidate;
     }

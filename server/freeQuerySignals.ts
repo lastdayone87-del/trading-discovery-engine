@@ -288,12 +288,17 @@ export const WIKIMEDIA_USER_AGENT_FALLBACK =
 export function isContactBearingWikimediaUserAgent(value: string | null | undefined): boolean {
   const configured = String(value || '').trim();
   if (!configured) return false;
-  const email = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i;
-  const url = /\bhttps?:\/\/[^\s()<>]+/i;
-  if (!email.test(configured) && !url.test(configured)) return false;
+  const email = /\b[A-Z0-9._%+-]+@([A-Z0-9.-]+\.[A-Z]{2,})\b/i;
+  const url = /\bhttps?:\/\/([^\s/():<>]+)/i;
+  const emailMatch = configured.match(email);
+  const urlMatch = configured.match(url);
+  if (!emailMatch && !urlMatch) return false;
   // Reserved/example hosts are documentation placeholders, not a reachable
-  // operator contact.
-  if (/https?:\/\/(?:example\.(?:invalid|test)|localhost|127\.0\.0\.1)\b/i.test(configured)) return false;
+  // operator contact. Apply the same rule to email contacts as URL contacts:
+  // `ops@example.org` must not authorize a real Wikimedia request.
+  const reservedHost = /^(?:localhost|127\.0\.0\.1|(?:[A-Z0-9-]+\.)*example\.(?:com|net|org|invalid|test|example)|(?:[A-Z0-9-]+\.)*(?:invalid|test|example|localhost))$/i;
+  if (emailMatch && reservedHost.test(emailMatch[1].replace(/\.$/, ''))) return false;
+  if (urlMatch && reservedHost.test(urlMatch[1].replace(/\.$/, ''))) return false;
   return true;
 }
 

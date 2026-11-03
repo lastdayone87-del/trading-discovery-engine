@@ -18,6 +18,7 @@ import { toWellFormedDeep, stringifyWellFormedJson } from './unicodeSafety';
 import { ProbeQuotaUnavailableError, resolveShadowConfig, settleKeyCapReservation, settleProbeQuotaReservation, settleShadowLeaseWithSavepoint, YouTubeKeyCapUnavailableError, type KeyCapReservationContext, type QuotaSettlementContext } from './quotaKeyCapShadow';
 import { isYouTubePermanentInputError } from './youtubeKeyHealth';
 import { canonicalCountry } from './countryInference';
+import { countryIdentitySql } from './countryExclusionRules';
 import { classifyDiscoveryVisibility } from './discoveryStateVisibility';
 import { safeCrawlerTelemetry, type CrawlerTelemetry } from './crawlerTelemetry';
 import { hasRetainedLastKnownGoodDiscordInvite, hasServingLastKnownGoodDiscordInvite } from './discordProjection';
@@ -688,8 +689,8 @@ export const OPERATOR_VISIBLE_CHANNEL_SQL = `country_status <> 'REJECTED'
   AND trading_status <> 'NON_TRADING'
   AND NOT EXISTS (
     SELECT 1 FROM excluded_countries excluded
-    WHERE lower(regexp_replace(trim(excluded.country_name), '\\s+', ' ', 'g')) =
-      lower(regexp_replace(trim(channels.country), '\\s+', ' ', 'g'))
+    WHERE ${countryIdentitySql('excluded.country_name')} =
+      ${countryIdentitySql('channels.country')}
   )`;
 // Defense in depth for legacy/preserved rows whose scan status was not
 // refreshed after a known low audience count arrived. Unknown or unparseable
@@ -4950,7 +4951,10 @@ export async function completeNativeVocabularyAiRun(args: {
  * A reopened reservation may already carry actual spend from its expired
  * owner. That spend and its call-cap slot must survive this release: zeroing
  * either would let later calls reuse budget that was already spent. Such a
- * row stays FAILED; only a row with no retained spend becomes BUDGET_SKIPPED.
+ * row stays FAILED. A reservation with no retained spend is deleted rather
+ * than left as a terminal BUDGET_SKIPPED row, so a later retry for the same
+ * metadata/day can admit a fresh reservation after a temporary route
+ * deferral instead of being rejected as idempotent for the rest of the day.
  * The lease token fences a stale worker from releasing a replacement owner.
  */
 export async function releaseNativeVocabularyAiRun(args: {
@@ -4959,16 +4963,26 @@ export async function releaseNativeVocabularyAiRun(args: {
 }): Promise<boolean> {
   const db = await getDb();
   const result = await db.query(
-    `UPDATE native_vocabulary_ai_runs
-     SET status=CASE WHEN actual_cost_microunits > 0 THEN 'FAILED' ELSE 'BUDGET_SKIPPED' END,
-         provider=NULL,attempts=0,
-         reserved_cost_microunits=0,
-         response_payload=NULL,completed_at=now(),lease_expires_at=NULL,lease_token=NULL
-     WHERE request_id=$1 AND status='RESERVED' AND lease_token=$2
-     RETURNING request_id`,
+    `WITH released AS (
+       DELETE FROM native_vocabulary_ai_runs
+       WHERE request_id=$1 AND status='RESERVED' AND lease_token=$2
+         AND actual_cost_microunits <= 0
+       RETURNING request_id
+     ), retained AS (
+       UPDATE native_vocabulary_ai_runs
+       SET status='FAILED',provider=NULL,attempts=0,
+           reserved_cost_microunits=0,
+           response_payload=NULL,completed_at=now(),lease_expires_at=NULL,lease_token=NULL
+       WHERE request_id=$1 AND status='RESERVED' AND lease_token=$2
+         AND actual_cost_microunits > 0
+       RETURNING request_id
+     )
+     SELECT request_id FROM released
+     UNION ALL
+     SELECT request_id FROM retained`,
     [args.requestId, args.leaseToken],
   );
-  return Boolean(result.rowCount);
+  return result.rowCount > 0;
 }
 
 export interface QueryRunProgress {

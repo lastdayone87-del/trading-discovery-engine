@@ -61,7 +61,7 @@ import { resolveNativeExtractionEligibility } from './ingestionPipeline';
 import { isTerminologyKillSwitchActive } from './terminologyKillSwitch';
 
 /** Explicit operator identity; Wikimedia policy forbids placeholder agents. */
-const TEST_WIKIMEDIA_USER_AGENT = 'CountryDiscoveryLoop/1.0 (https://ops.example.org; ops@example.org)';
+const TEST_WIKIMEDIA_USER_AGENT = 'CountryDiscoveryLoop/1.0 (https://ops.cdl-monitoring.dev; ops@cdl-monitoring.dev)';
 
 // ---------------------------------------------------------------------------
 // Deterministic fixtures and source readers. The gate is intentionally
@@ -726,7 +726,11 @@ test('A6: provider rate-limit failure degrades to seeds without failing the cycl
       TEST_WIKIMEDIA_USER_AGENT,
     );
     assert.equal(isContactBearingWikimediaUserAgent(TEST_WIKIMEDIA_USER_AGENT), true);
-    assert.equal(isContactBearingWikimediaUserAgent('ops@example.org'), true);
+    assert.equal(isContactBearingWikimediaUserAgent('ops@cdl-monitoring.dev'), true);
+    // RFC 2606 example domains are placeholders, not operator contacts, even
+    // when the configured value is an email rather than a URL.
+    assert.equal(isContactBearingWikimediaUserAgent('ops@example.org'), false);
+    assert.equal(isContactBearingWikimediaUserAgent('https://ops.example.org'), false);
     assert.equal(isContactBearingWikimediaUserAgent('WIKIMEDIA_USER_AGENT'), false);
     assert.equal(isContactBearingWikimediaUserAgent('CountryDiscoveryLoop/1.0'), false);
     assert.equal(isContactBearingWikimediaUserAgent('https://example.invalid/contact'), false);
@@ -1018,6 +1022,16 @@ test('P8: a 300-unit run budget allows at most three 100-unit pages', () => {
 });
 
 test('P8b: equal treatment/trial caps win ties so segmentation cannot renew them', () => {
+  // A quota-derived budget tying the safety ceiling must not masquerade as a
+  // safety boundary: that would let the segmenter restart the same allocation
+  // with a fresh run quota.
+  const quotaSafetyTie = computeEffectivePageBudget({
+    safetyMaxPages: 2, providerMaxPages: 10, pageCostUnits: 100,
+    remainingAutonomousQuota: 200, pendingCountries: 1,
+  });
+  assert.equal(quotaSafetyTie.effectiveMaxPages, 2);
+  assert.equal(quotaSafetyTie.bindingBound, 'RUN_BUDGET');
+
   const safetyTie = computeEffectivePageBudget({
     safetyMaxPages: 2, providerMaxPages: 10, pageCostUnits: 100,
     remainingAutonomousQuota: 1000, pendingCountries: 1, treatmentCapPages: 2,
@@ -1329,6 +1343,17 @@ test('P16: a creator seen on pages 1 and 2 is counted once with a cross-page rep
     serverSource('terminologyIntelligence.ts'),
     /query_run_id=COALESCE\(terminology_observations\.query_run_id, EXCLUDED\.query_run_id\)/,
   );
+  // The COALESCE assignments are gated by the ON CONFLICT WHERE predicate:
+  // without these null-to-non-null checks an identical replay skips the update
+  // and never fills provenance left missing by a legacy writer.
+  assert.match(
+    serverSource('terminologyIntelligence.ts'),
+    /terminology_observations\.query_run_id IS NULL AND EXCLUDED\.query_run_id IS NOT NULL/,
+  );
+  assert.match(
+    serverSource('terminologyIntelligence.ts'),
+    /terminology_observations\.query_page_number IS NULL AND EXCLUDED\.query_page_number IS NOT NULL/,
+  );
   assert.match(migration161(), /ADD COLUMN IF NOT EXISTS query_run_id TEXT/);
 });
 
@@ -1559,6 +1584,24 @@ test('T7: two independent external sources/families validate; a single source or
   assert.match(migration161(), /idx_external_osint_surface_country[\s\S]*?\(country, canonical_concept, observed_at DESC\)/);
 });
 
+test('T7a: a second family confined to syndicated copies cannot satisfy family diversity', () => {
+  const now = new Date('2026-10-26T00:00:00Z');
+  const result = evaluateExternalTermEvidence({
+    term: 'Charttechnik', aliases: [], language: 'de', script: 'LATIN', now,
+    rows: [
+      // One syndicated source carries both labels under the same correlation
+      // key; the second independent bucket is only the first family.
+      { sourceId: 's1', sourceFamily: 'NEWS', correlationKey: 'same', observedAt: '2026-10-25T00:00:00Z', confidence: 0.9, reliability: 0.9, relevance: 0.9, surface: 'charttechnik', language: 'de', script: 'LATIN' },
+      { sourceId: 's2', sourceFamily: 'PUBLICATION', correlationKey: 'same', observedAt: '2026-10-25T00:00:00Z', confidence: 0.9, reliability: 0.9, relevance: 0.9, surface: 'charttechnik', language: 'de', script: 'LATIN' },
+      { sourceId: 's3', sourceFamily: 'NEWS', correlationKey: 'other', observedAt: '2026-10-25T00:00:00Z', confidence: 0.9, reliability: 0.9, relevance: 0.9, surface: 'charttechnik', language: 'de', script: 'LATIN' },
+    ],
+  });
+  assert.equal(result.independentSources, 2);
+  assert.equal(result.eligible, false);
+  assert.deepEqual(result.families, ['NEWS']);
+  assert.ok(result.reasons.includes('INSUFFICIENT_SOURCE_FAMILIES'));
+});
+
 test('T7b: an undetermined target language fails closed for external corroboration', () => {
   const now = new Date('2026-10-26T00:00:00Z');
   const rows = [
@@ -1588,6 +1631,30 @@ test('T8: two native plus one external validates; one native plus one external d
     externalSources: 1, externalSourceCount: 1, externalEligible: false,
   });
   assert.equal(insufficient.status, 'OBSERVED');
+
+  // Two native buckets cannot reach the three-bucket native validation bar,
+  // but qualified external corroboration contributes trial units to the same
+  // threshold. Without it a mixed term can never become search-eligible.
+  const mixedTrial = decideLifecycleV2({
+    ...baseLifecycle,
+    nativeCreators: 2, nativeEvidenceBuckets: 2,
+    decayedEvidence: 2,
+    externalSources: 3, externalSourceCount: 3, externalEligible: true,
+    externalTrialEvidenceScore: 3,
+    confirmedTradingCreators: 1, freshConfirmedTradingCreators: 1,
+  });
+  assert.equal(mixedTrial.status, 'SEARCH_TRIAL');
+  assert.equal(mixedTrial.searchEligible, true);
+
+  const unqualifiedExternal = decideLifecycleV2({
+    ...baseLifecycle,
+    nativeCreators: 2, nativeEvidenceBuckets: 2,
+    decayedEvidence: 2,
+    externalSources: 3, externalSourceCount: 3, externalEligible: false,
+    externalTrialEvidenceScore: 3,
+    confirmedTradingCreators: 1, freshConfirmedTradingCreators: 1,
+  });
+  assert.equal(unqualifiedExternal.searchEligible, false);
 });
 
 test('T9: a 0.30 wrong-country share demotes an existing trial', () => {
@@ -2042,10 +2109,14 @@ test('Q2: a deferred continuation is scheduled before a new query', () => {
   const capacityAt = producer.indexOf('const calculatedCapacity = calculateDiscoveryCapacity({');
   assert.ok(snapshotAt > 0 && resumeAt > snapshotAt && capacityAt > resumeAt,
     'the reconciled snapshot precedes the resume sweep, which precedes capacity');
-  assert.match(producer, /const headroom = Math\.max\(0, config\.targetQueueDepth - snapshot\.queueDepth\)/);
+  assert.match(producer, /const headroom = Math\.max\(0, config\.targetQueueDepth - queueDepth\)/);
   // Resumed pages must count toward the queue watermark used by capacity, or
   // a full continuation sweep could still be crowded out by fresh queries.
-  assert.match(producer, /currentQueueDepth: snapshot\.queueDepth \+ resumedPages/);
+  assert.match(producer, /currentQueueDepth: queueDepth/);
+  // A mid-sweep failure can leave committed pages behind; refresh occupancy
+  // before fresh-query admission instead of reusing the stale snapshot.
+  assert.match(producer, /getAutonomousQueueDepth\(\)/);
+  assert.match(producer, /queueDepth: queueDepth \+ scheduled\.length/);
   assert.doesNotMatch(producer, /getAutonomousSchedulingSnapshot/);
   assert.ok(AUTONOMOUS_CONTINUATION_JOB_PRIORITY > AUTONOMOUS_NEW_QUERY_JOB_PRIORITY);
   const plan = planContinuationResume([{ country: 'Germany', runId: 'g1' }], 0, 15);
@@ -2059,6 +2130,11 @@ test('Q2: a deferred continuation is scheduled before a new query', () => {
   assert.match(queue, /Math\.min\(sweepCountryLimit, maxEnqueued\)/);
   assert.match(queue, /priority: AUTONOMOUS_CONTINUATION_JOB_PRIORITY/);
   assert.match(queue, /priority: source === 'manual_search' \? 100 : AUTONOMOUS_NEW_QUERY_JOB_PRIORITY/);
+  // Disabling V2 selects legacy decisions; it must not stop legacy pages from
+  // resuming. The reconciler also derives a headroom bound for callers that
+  // omit an explicit limit (the maintenance sweep).
+  assert.doesNotMatch(queue, /if \(!enabled \|\| !v2Enabled \|\| !cdlEnabled\)/);
+  assert.match(queue, /const maxEnqueued = options\.maxEnqueued === undefined[\s\S]{0,300}getAutonomousQueueDepth\(\)/);
 });
 
 test('Q3: a country with many pending pages is capped, and excess work is deferred rather than dropped', () => {
@@ -2148,7 +2224,12 @@ test('O1: migration 161 activates core paths, keeps paid demand off, and preserv
     assert.match(migration, new RegExp(`\\('${setting}', 'true'\\)`));
   }
   assert.match(migration, /\('query_demand_signals_enabled', 'false'\)/);
-  assert.match(migration, /WHERE setting_key = 'autonomous_pagination_max_pages'\s+AND setting_value = '10'/);
+  // Existing page ceilings are operator state: only an absent setting gets
+  // the new default, because a persisted 10 has no provenance to distinguish
+  // a seed from an explicit operator choice.
+  assert.match(migration, /VALUES \('autonomous_pagination_max_pages', '50'\)\s+ON CONFLICT\(setting_key\) DO NOTHING/);
+  assert.ok(!/UPDATE\s+app_settings[\s\S]{0,200}autonomous_pagination_max_pages/i.test(migration),
+    'migration 161 must not rewrite an existing autonomous_pagination_max_pages value');
   assert.match(migration, /ON CONFLICT\(setting_key\) DO NOTHING/);
   assert.ok(!/^\s*\('youtube_key_daily_cap_enforced'/m.test(migration));
   assert.ok(!/setting_key\s*=\s*'youtube_key_daily_cap_enforced'/m.test(migration));
@@ -2503,15 +2584,18 @@ test('R1: transient AI failure retries up to three attempts while rule evidence 
   assert.match(snapshotSource, /COALESCE\(SUM\(actual_cost_microunits\),0\)::bigint AS actual_cost/);
   assert.ok(!/SUM\(actual_cost_microunits\) FILTER/.test(snapshotSource), 'snapshot actual cost must not filter by status');
   // A reservation with zero provider attempts is released instead of charged
-  // or counted against the daily call cap. A reopened reservation that already
-  // carries actual spend from its expired owner must keep that spend and its
-  // call-cap slot, or later calls can reuse budget that was already spent.
+  // or counted against the daily call cap. Its row is deleted, not left as a
+  // terminal BUDGET_SKIPPED identity that blocks a later retry for the same
+  // metadata/day. A reopened reservation that already carries actual spend
+  // from its expired owner must keep that spend and its call-cap slot, or
+  // later calls can reuse budget that was already spent.
   assert.match(db, /export async function releaseNativeVocabularyAiRun/);
   const releaseStart = db.indexOf('export async function releaseNativeVocabularyAiRun');
   const releaseEnd = db.indexOf('export interface QueryRunProgress', releaseStart);
   assert.ok(releaseStart > 0 && releaseEnd > releaseStart);
   const releaseSource = db.slice(releaseStart, releaseEnd);
-  assert.match(releaseSource, /status=CASE WHEN actual_cost_microunits > 0 THEN 'FAILED' ELSE 'BUDGET_SKIPPED' END/);
+  assert.match(releaseSource, /DELETE FROM native_vocabulary_ai_runs[\s\S]*?actual_cost_microunits <= 0/);
+  assert.match(releaseSource, /SET status='FAILED'[\s\S]*?actual_cost_microunits > 0/);
   assert.match(releaseSource, /reserved_cost_microunits=0/);
   assert.ok(!/actual_cost_microunits\s*=\s*0/.test(releaseSource), 'release must preserve retained actual spend');
   assert.match(source, /aiRun\.attempts === 0/);

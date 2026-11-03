@@ -637,13 +637,20 @@ export function decideLifecycleV2(
   const validationBasis = nativeBasis || mixedBasis || externalOnlyBasis;
   const tradingValidNativeBasis =
     nativeBasis && freshConfirmedTradingCreators >= 1 && confirmedShare >= NATIVE_V2_MIN_CONFIRMED_SHARE;
+  // Mixed native/external terms can be validated by two native buckets plus
+  // qualified external corroboration, so their trial score must include the
+  // external units as well. Requiring the native-only three-bucket basis here
+  // would leave every mixed term permanently non-search-eligible.
+  const mixedTrialEvidence = mixedBasis && externalEligible &&
+    input.decayedEvidence + Math.max(0, input.externalTrialEvidenceScore ?? 0) >= policy.trialEvidence &&
+    freshConfirmedTradingCreators >= 1 && confirmedShare >= NATIVE_V2_MIN_CONFIRMED_SHARE;
   const externalTrialEvidence = externalOnlyBasis &&
     input.decayedEvidence + Math.max(0, input.externalTrialEvidenceScore ?? 0) >= policy.trialEvidence;
   const nativeTrialEvidence =
-    (nativeBasis || mixedBasis) &&
+    nativeBasis &&
     input.decayedEvidence >= policy.trialEvidence &&
     tradingValidNativeBasis;
-  const trialEvidence = externalTrialEvidence || nativeTrialEvidence;
+  const trialEvidence = externalTrialEvidence || mixedTrialEvidence || nativeTrialEvidence;
 
   if (input.executions >= policy.demotionExecutions && input.decayedYield < policy.demotionYield) {
     return { status: 'DEMOTED', searchEligible: false, reason: 'Sustained production yield fell below the configured demotion threshold.' };
@@ -718,7 +725,9 @@ export function decideLifecycleV2(
       searchEligible: true,
       reason: externalOnlyBasis
         ? 'Independently corroborated external evidence qualifies the term for controlled exploration.'
-        : 'Independent native creators and trading-valid evidence qualify the term for controlled exploration.',
+        : mixedTrialEvidence
+          ? 'Independent native creators plus qualified external corroboration qualify the term for controlled exploration.'
+          : 'Independent native creators and trading-valid evidence qualify the term for controlled exploration.',
     };
   }
   // Existing search eligibility is not revoked merely because a fresh
@@ -889,17 +898,28 @@ export function evaluateExternalTermEvidence(args: {
   const scripts = new Set(scriptMatched.map(row => String(row.script || '').toUpperCase()));
   if (scripts.size !== 1) reasons.push('SCRIPT_CONFLICT');
   const buckets = new Map<string, Set<string>>();
-  const families = new Set<string>();
+  const bucketFamilies = new Map<string, Set<string>>();
   let weightedSum = 0;
   for (const row of scriptMatched) {
     const key = row.correlationKey?.trim().toLowerCase() || `source:${row.sourceId.trim().toLowerCase()}`;
     const bucket = buckets.get(key) || new Set<string>();
     bucket.add(row.sourceId.trim().toLowerCase());
     buckets.set(key, bucket);
-    families.add(String(row.sourceFamily).toUpperCase());
+    const familiesInBucket = bucketFamilies.get(key) || new Set<string>();
+    familiesInBucket.add(String(row.sourceFamily).toUpperCase());
+    bucketFamilies.set(key, familiesInBucket);
     weightedSum += Math.min(1, Math.max(0, row.confidence))
       * Math.min(1, Math.max(0, row.reliability))
       * Math.min(1, Math.max(0, row.relevance));
+  }
+  // Family diversity must be independent, not just a row count. A bucket is
+  // one source (syndicated copies share a correlation key); if that bucket
+  // carries conflicting family labels, those labels are correlated copies of
+  // each other and cannot certify a second family. Only unambiguous buckets
+  // contribute to the two-family gate.
+  const families = new Set<string>();
+  for (const familiesInBucket of bucketFamilies.values()) {
+    if (familiesInBucket.size === 1) families.add([...familiesInBucket][0]);
   }
   const weighted = weightedSum / scriptMatched.length;
   if (buckets.size < 2) reasons.push('INSUFFICIENT_INDEPENDENT_SOURCES');
@@ -1368,6 +1388,11 @@ export async function observeTerminologyDetailed(args: {
         OR terminology_observations.locale IS DISTINCT FROM EXCLUDED.locale
         OR terminology_observations.source_creator_country IS DISTINCT FROM EXCLUDED.source_creator_country
         OR terminology_observations.target_market_country IS DISTINCT FROM EXCLUDED.target_market_country
+        -- Provenance is fill-only above; without these null-to-non-null checks
+        -- an otherwise identical replay would skip the UPDATE and never fill
+        -- a legacy writer's missing run/page attribution.
+        OR (terminology_observations.query_run_id IS NULL AND EXCLUDED.query_run_id IS NOT NULL)
+        OR (terminology_observations.query_page_number IS NULL AND EXCLUDED.query_page_number IS NOT NULL)
         OR (terminology_observations.evidence->>'spamConfirmed') IS DISTINCT FROM (EXCLUDED.evidence->>'spamConfirmed')
         -- Any other evidence-substance change (novelty flips, generic flags,
         -- spam-signal or translation-risk updates, extractor-label aside):
