@@ -63,7 +63,10 @@ Admitted third-party pages are tagged (`userData.crossOrigin = true`) and skip
 their own same-host hint passes when their handler runs. Their bounded
 cross-origin pass still runs, so the crawl-wide cap bounds the whole optional
 branch rather than only the first hop; an admitted link hub cannot enqueue an
-uncapped set of its own hint links and consume `maxPages`. Interaction-revealed
+uncapped set of its own hint links and consume `maxPages`. Because the hint
+pass is skipped, hint-bearing links revealed by interaction on a tagged page
+are admitted by the same capped reveal planner instead of being discarded as
+hint-owned, and they consume the same optional budget. Interaction-revealed
 same-origin destinations and popups opened by a tagged third-party page inherit
 the same tag and consume the same cap; when it is exhausted they are recorded
 as `destination-budget` instead of being enqueued.

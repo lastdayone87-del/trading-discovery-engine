@@ -717,6 +717,23 @@ test('revealed same-origin planner admits only post-interaction generic links', 
     'only a newly revealed, admissible, non-hint same-origin link is admitted');
   assert.equal(plan.hintHandled, 1, 'hint-bearing links stay owned by the existing same-host pass');
 
+  const hintPassSkipped = planRevealedSameOriginEnqueues({
+    candidates: [
+      { url: 'https://creator.example/community', text: 'Community' },
+      { url: 'https://creator.example/resources', text: 'Resources' },
+    ],
+    currentUrl,
+    initialLinks: new Set(),
+    alreadyVisited: new Set(),
+    queued: new Set(),
+    maxEnqueues: 1,
+    hintPassSkipped: true,
+  });
+  assert.deepEqual(hintPassSkipped.admitted, ['https://creator.example/community'],
+    'an optional third-party page has no hint pass, so a revealed hint link is admitted through the capped pass');
+  assert.equal(hintPassSkipped.hintHandled, 0, 'nothing else owns hint links when the hint pass is skipped');
+  assert.equal(hintPassSkipped.budget, 1, 'hint links beyond the optional cap stay a counted budget exclusion');
+
   const capped = planRevealedSameOriginEnqueues({
     candidates: [
       { url: 'https://creator.example/resources', text: 'Resources' },

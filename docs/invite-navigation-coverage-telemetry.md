@@ -294,7 +294,10 @@ A non-`COMPLETE` coverage reason is never a clean absence:
   baseline is saturated; an interaction on that document instead records one
   `revealedSameOriginDropped` gap. When the overflow sample itself is filled
   and anchors remain unclassified, coverage stays partial even if the sample
-  contains only irrelevant links. No navigation limit value changed.
+  contains only irrelevant links. A destination promoted into a later
+  snapshot's visible candidate window, or already queued/inspected, is removed
+  from the overflow set before publishing, so recovered work cannot leave the
+  crawl permanently `BOUNDED`. No navigation limit value changed.
 - The interaction-revealed same-origin baseline is captured after the scroll
   loop, not before it, so infinite-scroll links are static relative to the
   inspected page rather than "revealed by interaction". A saturated baseline

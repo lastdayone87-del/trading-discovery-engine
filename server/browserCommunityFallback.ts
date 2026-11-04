@@ -2739,6 +2739,13 @@ export function planRevealedSameOriginEnqueues(input: {
    * pass still owns hint-bearing destinations. Return no admissions.
    */
   baselineSaturated?: boolean;
+  /**
+   * The caller skipped the same-host hint pass (an optional third-party page
+   * bounded by the cross-origin cap), so hint-bearing links are not owned
+   * elsewhere. Admit them through this same capped pass instead of dropping
+   * them as `hintHandled`.
+   */
+  hintPassSkipped?: boolean;
 }): RenderedRevealedSameOriginPlan {
   const plan: RenderedRevealedSameOriginPlan = {
     admitted: [],
@@ -2783,8 +2790,10 @@ export function planRevealedSameOriginEnqueues(input: {
       plan.admissionRejected++;
       continue;
     }
-    // The same-host hint pass already owns these URLs.
-    if (shouldEnqueueRenderedCommunityLink(url)) {
+    // The same-host hint pass already owns these URLs unless the caller
+    // skipped it (optional third-party page); then this bounded pass is the
+    // only path that can admit them.
+    if (!input.hintPassSkipped && shouldEnqueueRenderedCommunityLink(url)) {
       plan.hintHandled++;
       continue;
     }
@@ -4968,6 +4977,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 queued: revealedQueued,
                 maxEnqueues: Math.min(remainingPageBudget, remainingOptionalCap),
                 baselineSaturated: baseline.saturated,
+                hintPassSkipped: crossOriginRequest,
               });
               // Mark every candidate as considered even when it was rejected:
               // a later pass must not re-count the same budget loss.
@@ -5308,6 +5318,14 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 for (const url of pursuableRenderedOverflowUrls(collection.overflowCandidates, currentUrl)) {
                   crossOriginOverflowEligible.add(url);
                 }
+                // A later snapshot can promote an earlier overflow destination
+                // into its visible candidate window (an interaction removed
+                // anchors ahead of it). It is then classified and potentially
+                // admitted by this pass, so it is no longer truncation.
+                for (const candidate of collection.candidates) {
+                  const key = normalizeVisitUrl(candidate.url) || String(candidate.url || '').trim();
+                  if (key) crossOriginOverflowEligible.delete(key);
+                }
                 if (collection.overflowSampleFilled === true) crossOriginOverflowSampleFilled = true;
                 return collection.candidates;
               } catch {
@@ -5328,6 +5346,15 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
              * modes because later anchors were never classified.
              */
             const publishCrossOriginOverflow = (): void => {
+              // Queued or already-inspected destinations are covered work, not
+              // truncation. This removes an overflow URL that a later snapshot
+              // admitted, as well as destinations another page already
+              // inspected, before the remaining gap is published.
+              for (const key of crossOriginQueued) crossOriginOverflowEligible.delete(key);
+              for (const url of [...alreadyVisitedSet, ...terminalSuccessUrls]) {
+                const key = normalizeVisitUrl(url);
+                if (key) crossOriginOverflowEligible.delete(key);
+              }
               const overflowEligible = crossOriginOverflowEligible.size;
               if (!limits.crossOriginEnqueue) {
                 if (overflowEligible > 0) {

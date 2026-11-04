@@ -1010,6 +1010,11 @@ test('cross-origin requests are tagged and skip uncapped same-host fan-out', () 
     /crossOriginRequest && crossOriginQueued\.size >= MAX_RENDERED_CROSS_ORIGIN_ENQUEUES/,
     'popups opened by a third-party page cannot exceed the crawl-wide optional cap',
   );
+  assert.match(
+    source,
+    /hintPassSkipped: crossOriginRequest/,
+    'hint-bearing links revealed on an optional page are admitted through the capped pass instead of being dropped',
+  );
 });
 
 test('cross-origin submission is deferred until after the post-click same-host pass', () => {
@@ -1062,6 +1067,21 @@ test('cross-origin submission is deferred until after the post-click same-host p
     source,
     /if \(!limits\.crossOriginEnqueue\) \{[\s\S]{0,800}?else if \(crossOriginOverflowSampleFilled\)/,
     'the default-OFF path treats a filled overflow sample as unclassified, not a clean absence',
+  );
+  assert.match(
+    source,
+    /for \(const candidate of collection\.candidates\)[\s\S]{0,180}?crossOriginOverflowEligible\.delete\(key\)/,
+    'a URL recovered into a later visible candidate window stops counting as truncation',
+  );
+  assert.match(
+    source,
+    /for \(const key of crossOriginQueued\) crossOriginOverflowEligible\.delete\(key\)/,
+    'queued overflow destinations are covered work, not truncation',
+  );
+  assert.match(
+    source,
+    /\[\.\.\.alreadyVisitedSet, \.\.\.terminalSuccessUrls\]/,
+    'already-inspected overflow destinations stop counting as truncation',
   );
 });
 
