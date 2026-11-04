@@ -1002,6 +1002,16 @@ test('cross-origin requests are tagged and skip uncapped same-host fan-out', () 
   );
   assert.match(
     source,
+    /urls: revealedPlan\.admitted,[\s\S]{0,220}?\.\.\.\(crossOriginRequest \? \{ userData: \{ crossOrigin: true \} \} : \{\}\)/,
+    'the revealed-destination enqueue propagates the optional tag',
+  );
+  assert.match(
+    source,
+    /urls: \[popupUrl\],[\s\S]{0,220}?\.\.\.\(crossOriginRequest \? \{ userData: \{ crossOrigin: true \} \} : \{\}\)/,
+    'the popup enqueue propagates the optional tag',
+  );
+  assert.match(
+    source,
     /crossOriginRequest\s*\?\s*Math\.max\(0, MAX_RENDERED_CROSS_ORIGIN_ENQUEUES - crossOriginQueued\.size\)/,
     'revealed destinations from a third-party page share the crawl-wide optional cap',
   );

@@ -67,9 +67,11 @@ uncapped set of its own hint links and consume `maxPages`. Because the hint
 pass is skipped, hint-bearing links revealed by interaction on a tagged page
 are admitted by the same capped reveal planner instead of being discarded as
 hint-owned, and they consume the same optional budget. Interaction-revealed
-same-origin destinations and popups opened by a tagged third-party page inherit
-the same tag and consume the same cap; when it is exhausted they are recorded
-as `destination-budget` instead of being enqueued.
+same-origin destinations and same-origin popups opened by a tagged third-party
+page inherit the same tag and consume the same cap; when it is exhausted they
+are recorded as `destination-budget` instead of being enqueued. Cross-origin
+popups are policy exclusions: they are recorded as `cross-origin-disallowed`
+before the optional cap is consulted and are never navigated to.
 
 ## Policy and safety boundary
 
