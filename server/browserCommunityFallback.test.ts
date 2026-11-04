@@ -1080,8 +1080,13 @@ test('cross-origin submission is deferred until after the post-click same-host p
   );
   assert.match(
     source,
-    /for \(const candidate of collection\.candidates\)[\s\S]{0,180}?crossOriginOverflowEligible\.delete\(key\)/,
+    /for \(const candidate of collection\.candidates\)[\s\S]{0,220}?recoverRenderedOverflowCandidate\(\s*candidate,\s*crossOriginOverflowLabels,\s*crossOriginOverflowEligible,?\s*\)/,
     'a URL recovered into a later visible candidate window stops counting as truncation',
+  );
+  assert.match(
+    source,
+    /crossOriginOverflowLabels\.set\(key, labels\)/,
+    'overflow labels are accumulated per destination before recovery',
   );
   assert.match(
     source,

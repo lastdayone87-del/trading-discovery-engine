@@ -2341,6 +2341,29 @@ export interface RenderedCrossOriginCandidate {
 }
 
 /**
+ * A destination can appear in a bounded overflow sample with a strong community
+ * label and later in a snapshot's visible candidate window with a weaker label
+ * (or none). Recovering it as visible must not discard the evidence that made
+ * it pursuable: fold the earlier labels into the visible candidate, then remove
+ * the URL from the overflow gap. Otherwise a weak first anchor can hide the
+ * community destination and let an unexamined page resolve clean.
+ */
+export function recoverRenderedOverflowCandidate(
+  candidate: RenderedCrossOriginCandidate,
+  labelsByKey: ReadonlyMap<string, readonly string[]>,
+  overflowEligible: Set<string>,
+): void {
+  const key = normalizeVisitUrl(candidate.url) || String(candidate.url || '').trim();
+  if (!key) return;
+  const labels = labelsByKey.get(key);
+  if (labels?.length) {
+    const texts = [String(candidate.text || '').trim(), ...labels].filter(Boolean);
+    candidate.text = [...new Set(texts)].join(' ');
+  }
+  overflowEligible.delete(key);
+}
+
+/**
  * Bounded collector result. `truncated` counts eligible destinations beyond
  * the collector limit (up to a bounded 500-candidate overflow sample, so a
  * pathological page cannot make the diagnostic itself expensive). Callers
@@ -5320,11 +5343,24 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 }
                 // A later snapshot can promote an earlier overflow destination
                 // into its visible candidate window (an interaction removed
-                // anchors ahead of it). It is then classified and potentially
-                // admitted by this pass, so it is no longer truncation.
-                for (const candidate of collection.candidates) {
+                // anchors ahead of it). Carry every label sampled for that URL
+                // forward before classifying it: the visible anchor may be
+                // weak ("About") while the overflow sample carries the
+                // community label that made the destination pursuable.
+                for (const candidate of collection.overflowCandidates) {
                   const key = normalizeVisitUrl(candidate.url) || String(candidate.url || '').trim();
-                  if (key) crossOriginOverflowEligible.delete(key);
+                  if (!key) continue;
+                  const labels = crossOriginOverflowLabels.get(key) || [];
+                  const text = String(candidate.text || '').trim();
+                  if (text && !labels.includes(text)) labels.push(text);
+                  crossOriginOverflowLabels.set(key, labels);
+                }
+                for (const candidate of collection.candidates) {
+                  recoverRenderedOverflowCandidate(
+                    candidate,
+                    crossOriginOverflowLabels,
+                    crossOriginOverflowEligible,
+                  );
                 }
                 if (collection.overflowSampleFilled === true) crossOriginOverflowSampleFilled = true;
                 return collection.candidates;
@@ -5337,6 +5373,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             };
             let preClickCrossOriginCandidates: RenderedCrossOriginCandidate[] = [];
             const crossOriginOverflowEligible = new Set<string>();
+            const crossOriginOverflowLabels = new Map<string, string[]>();
             let crossOriginOverflowSampleFilled = false;
             /**
              * Publish collector overflow once per page, after every snapshot

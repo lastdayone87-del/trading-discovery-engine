@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { DEFAULT_BROWSER_FALLBACK_BUDGET, MAX_RENDERED_CROSS_ORIGIN_ENQUEUES, combineRenderedControlOffsetAdvances, countPursuableRenderedOverflow, enqueueRenderedCrossOriginPass, isCrossHostnameStructuralNavigation, isNavigableOnlyControlWindow, isSameSeedDocument, isSkippableNavigableAnchorClick, isUnrecoveredStructuralNavigation, mergeRenderedCoverageGapCounters, planRevealedRenderedClickTargets, planRevealedSameOriginEnqueues, planRenderedCrossOriginEnqueues, partitionRenderedClickTargets, reconcileClickDestinationContext, remainingRenderedClickBudget, renderedClickOffsetAdvance, renderedControlOverflowTargets, renderedCrossOriginVisitedIdentities, renderedRequestControlTotalsDelta, resolveRenderedCompletionState, resolveUnexaminedPopupTargets, runRenderedClickLoop, shouldEnqueueRenderedCrossOriginLink, trackRenderedPopupCoverage, type RenderedControlEnumeration, type RenderedRequestControlTotals } from './browserCommunityFallback';
+import { DEFAULT_BROWSER_FALLBACK_BUDGET, MAX_RENDERED_CROSS_ORIGIN_ENQUEUES, combineRenderedControlOffsetAdvances, countPursuableRenderedOverflow, enqueueRenderedCrossOriginPass, isCrossHostnameStructuralNavigation, isNavigableOnlyControlWindow, isSameSeedDocument, isSkippableNavigableAnchorClick, isUnrecoveredStructuralNavigation, mergeRenderedCoverageGapCounters, planRevealedRenderedClickTargets, planRevealedSameOriginEnqueues, planRenderedCrossOriginEnqueues, partitionRenderedClickTargets, reconcileClickDestinationContext, recoverRenderedOverflowCandidate, remainingRenderedClickBudget, renderedClickOffsetAdvance, renderedControlOverflowTargets, renderedCrossOriginVisitedIdentities, renderedRequestControlTotalsDelta, resolveRenderedCompletionState, resolveUnexaminedPopupTargets, runRenderedClickLoop, shouldEnqueueRenderedCrossOriginLink, trackRenderedPopupCoverage, type RenderedControlEnumeration, type RenderedRequestControlTotals } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -816,6 +816,25 @@ test('cross-origin planner deduplicates, skips visited, and enforces the cap', (
   assert.equal(rejected.admissionRejected, 1, 'format/security rejections are not eligible destinations');
   assert.equal(rejected.irrelevant, 1, 'an unrelated vendor link is not an eligible destination');
   assert.equal(rejected.budget, 0);
+});
+
+test('a recovered overflow destination keeps the label that made it pursuable', () => {
+  const url = 'https://community.example/go';
+  const overflowEligible = new Set([url]);
+  const labelsByKey = new Map([[url, ['Join the private members community']]]);
+  const recovered = { url, text: 'About' };
+  recoverRenderedOverflowCandidate(recovered, labelsByKey, overflowEligible);
+  assert.equal(recovered.text, 'About Join the private members community',
+    'the strong overflow label is folded into the weak visible anchor');
+  assert.equal(overflowEligible.size, 0, 'a recovered destination is no longer counted as truncation');
+  const plan = planRenderedCrossOriginEnqueues({
+    candidates: [recovered],
+    currentUrl: 'https://creator.example/',
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(plan.admitted, [url],
+    'preserved evidence lets the planner pursue a destination the weak visible label alone would reject');
 });
 
 test('collector overflow counts only policy-pursuable destinations', () => {
