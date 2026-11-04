@@ -1085,8 +1085,8 @@ test('cross-origin submission is deferred until after the post-click same-host p
   );
   assert.match(
     source,
-    /crossOriginOverflowLabels\.set\(key, labels\)/,
-    'overflow labels are accumulated per destination before recovery',
+    /for \(const candidate of collection\.overflowCandidates\)[\s\S]{0,500}?crossOriginOverflowLabels\.set\(key, labels\);[\s\S]{0,500}?for \(const candidate of collection\.candidates\)[\s\S]{0,300}?recoverRenderedOverflowCandidate\(/,
+    'overflow labels are accumulated before the visible candidates are recovered',
   );
   assert.match(
     source,
