@@ -869,19 +869,19 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
       ? { popupTargets: boundedCount(candidate.popupTargets) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.popupCaptured) > 0
-      ? { popupCaptured: number(candidate.popupCaptured) }
+      ? { popupCaptured: boundedCount(candidate.popupCaptured) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.popupDestinationsDropped) > 0
-      ? { popupDestinationsDropped: number(candidate.popupDestinationsDropped) }
+      ? { popupDestinationsDropped: boundedCount(candidate.popupDestinationsDropped) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.revealedSameOriginAdmitted) > 0
-      ? { revealedSameOriginAdmitted: number(candidate.revealedSameOriginAdmitted) }
+      ? { revealedSameOriginAdmitted: boundedCount(candidate.revealedSameOriginAdmitted) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.revealedSameOriginDropped) > 0
-      ? { revealedSameOriginDropped: number(candidate.revealedSameOriginDropped) }
+      ? { revealedSameOriginDropped: boundedCount(candidate.revealedSameOriginDropped) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.opaqueInteractiveControls) > 0
-      ? { opaqueInteractiveControls: number(candidate.opaqueInteractiveControls) }
+      ? { opaqueInteractiveControls: boundedCount(candidate.opaqueInteractiveControls) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.frameCount) > 0
       ? { frameCount: boundedCount(candidate.frameCount) }
@@ -890,16 +890,16 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
       ? { shadowRootCount: boundedCount(candidate.shadowRootCount) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.closedShadowRootCount) > 0
-      ? { closedShadowRootCount: number(candidate.closedShadowRootCount) }
+      ? { closedShadowRootCount: boundedCount(candidate.closedShadowRootCount) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.declarativeClosedShadowRootCount) > 0
-      ? { declarativeClosedShadowRootCount: number(candidate.declarativeClosedShadowRootCount) }
+      ? { declarativeClosedShadowRootCount: boundedCount(candidate.declarativeClosedShadowRootCount) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.declarativeShadowScanGap) > 0
-      ? { declarativeShadowScanGap: number(candidate.declarativeShadowScanGap) }
+      ? { declarativeShadowScanGap: boundedCount(candidate.declarativeShadowScanGap) }
       : {}),
     ...(candidate.mode === 'RENDERED' && number(candidate.candidateCapTruncated) > 0
-      ? { candidateCapTruncated: number(candidate.candidateCapTruncated) }
+      ? { candidateCapTruncated: boundedCount(candidate.candidateCapTruncated) }
       : {}),
     ...(candidate.mode === 'RENDERED' && candidate.baseHrefPresent === true
       ? { baseHrefPresent: true }

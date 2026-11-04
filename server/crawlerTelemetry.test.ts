@@ -444,6 +444,31 @@ test('safe telemetry clamps oversized structural counters to the persisted bound
   assert.equal(malformed?.controlsStructuralUnrecovered, undefined);
 });
 
+test('safe telemetry clamps oversized popup, reveal, and context counters to the persisted bound', () => {
+  const oversized = safeCrawlerTelemetry({
+    mode: 'RENDERED',
+    pagesInspected: 1,
+    popupCaptured: 5_000_000,
+    popupDestinationsDropped: 2_500_000.9,
+    revealedSameOriginAdmitted: Number.MAX_SAFE_INTEGER,
+    revealedSameOriginDropped: 1_000_001,
+    opaqueInteractiveControls: 3_000_000,
+    closedShadowRootCount: 4_000_000,
+    declarativeClosedShadowRootCount: 5_000_001,
+    declarativeShadowScanGap: 6_000_000,
+    candidateCapTruncated: 7_000_000,
+  });
+  assert.equal(oversized?.popupCaptured, 999999);
+  assert.equal(oversized?.popupDestinationsDropped, 999999);
+  assert.equal(oversized?.revealedSameOriginAdmitted, 999999);
+  assert.equal(oversized?.revealedSameOriginDropped, 999999);
+  assert.equal(oversized?.opaqueInteractiveControls, 999999);
+  assert.equal(oversized?.closedShadowRootCount, 999999);
+  assert.equal(oversized?.declarativeClosedShadowRootCount, 999999);
+  assert.equal(oversized?.declarativeShadowScanGap, 999999);
+  assert.equal(oversized?.candidateCapTruncated, 999999);
+});
+
 test('safe telemetry drops unknown stage/reason and truncates cause text', () => {
   const telemetry = safeCrawlerTelemetry({
     mode: 'RENDERED',

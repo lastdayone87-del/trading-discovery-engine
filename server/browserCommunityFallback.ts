@@ -579,6 +579,7 @@ export function visitIdentityKeys(requestUrl: string, finalUrl: string): string[
 export interface ClickDestinationContext {
   frameCount: number;
   shadowRootCount: number;
+  closedShadowRootCount: number;
   baseHrefPresent: boolean;
 }
 
@@ -597,11 +598,17 @@ export function reconcileClickDestinationContext(input: {
   observations: ReadonlyMap<string, ClickDestinationContext>;
   inspectedKeys: ReadonlySet<string>;
 }): ClickDestinationContext {
-  const reconciled: ClickDestinationContext = { frameCount: 0, shadowRootCount: 0, baseHrefPresent: false };
+  const reconciled: ClickDestinationContext = {
+    frameCount: 0,
+    shadowRootCount: 0,
+    closedShadowRootCount: 0,
+    baseHrefPresent: false,
+  };
   for (const [key, observed] of input.observations) {
     if (input.inspectedKeys.has(key)) continue;
     reconciled.frameCount += observed.frameCount;
     reconciled.shadowRootCount += observed.shadowRootCount;
+    reconciled.closedShadowRootCount += observed.closedShadowRootCount;
     reconciled.baseHrefPresent = reconciled.baseHrefPresent || observed.baseHrefPresent;
   }
   return reconciled;
@@ -2284,24 +2291,41 @@ export function countPursuableRenderedOverflow(
   candidates: readonly RenderedCrossOriginCandidate[],
   currentUrl: string,
 ): number {
-  let count = 0;
+  return pursuableRenderedOverflowUrls(candidates, currentUrl).size;
+}
+
+/**
+ * URL-deduplicated subset of an overflow sample that policy would pursue.
+ * Callers merge pre-click and post-click samples before publishing, so a
+ * destination present in both snapshots is counted once even when a click did
+ * not replace the document. Each candidate is classified against the document
+ * that actually contained it (`sourceUrl`), preserving the pre-click origin
+ * after a click navigates elsewhere.
+ */
+export function pursuableRenderedOverflowUrls(
+  candidates: readonly RenderedCrossOriginCandidate[],
+  currentUrl: string,
+): Set<string> {
+  const urls = new Set<string>();
   for (const candidate of candidates) {
     const url = String(candidate.url || '').trim();
     if (!url) continue;
+    const key = normalizeVisitUrl(url) || url;
+    if (urls.has(key)) continue;
     if (isDiscordDestinationUrl(url)
       && extractDiscordCandidates(url).some(entry => entry.nativeInviteCode)) {
-      count++;
+      urls.add(key);
       continue;
     }
     if (shouldEnqueueRenderedCrossOriginLink({
       url,
-      currentUrl,
+      currentUrl: candidate.sourceUrl || currentUrl,
       anchorText: candidate.text || '',
     })) {
-      count++;
+      urls.add(key);
     }
   }
-  return count;
+  return urls;
 }
 
 export interface RenderedCrossOriginCandidate {
@@ -2457,6 +2481,7 @@ export function collectRenderedCrossOriginCandidates(
         overflowCandidates.push({
           url: target.toString(),
           text: (anchor.textContent || '').trim().slice(0, 200),
+          sourceUrl: currentUrl,
         });
         if (truncated >= overflowSampleMax) {
           // The sample is full. Only a page ending here is fully classified;
@@ -4229,7 +4254,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
     telemetry.opaqueInteractiveControls = opaqueInteractiveControls || undefined;
     telemetry.frameCount = (frameCount + clickDestinationContext.frameCount) || undefined;
     telemetry.shadowRootCount = (shadowRootCount + clickDestinationContext.shadowRootCount) || undefined;
-    telemetry.closedShadowRootCount = closedShadowRootCount || undefined;
+    telemetry.closedShadowRootCount = (closedShadowRootCount + clickDestinationContext.closedShadowRootCount) || undefined;
     telemetry.declarativeClosedShadowRootCount = declarativeClosedShadowRootCount || undefined;
     telemetry.declarativeShadowScanGap = declarativeShadowScanGap || undefined;
     telemetry.candidateCapTruncated = candidateCapTruncated || undefined;
@@ -4261,7 +4286,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
       // shadow roots, so it cannot be reported as fully covered.
       frameCount: frameCount + clickDestinationContext.frameCount,
       shadowRootCount: shadowRootCount + clickDestinationContext.shadowRootCount,
-      closedShadowRootCount,
+      closedShadowRootCount: closedShadowRootCount + clickDestinationContext.closedShadowRootCount,
       declarativeClosedShadowRootCount,
       declarativeShadowScanGap,
       candidateCapTruncated,
@@ -4702,6 +4727,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               clickDestinationContextByKey.set(key, {
                 frameCount: Math.max(previous?.frameCount ?? 0, Math.max(0, Math.floor(observation.frameCount) || 0)),
                 shadowRootCount: Math.max(previous?.shadowRootCount ?? 0, Math.max(0, Math.floor(observation.shadowRootCount) || 0)),
+                closedShadowRootCount: Math.max(
+                  previous?.closedShadowRootCount ?? 0,
+                  Math.max(0, Math.floor(observation.closedShadowRootCount) || 0),
+                ),
                 baseHrefPresent: previous?.baseHrefPresent === true || observation.baseHrefPresent === true,
               });
             };
@@ -4728,6 +4757,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                   recordClickDestinationContext(page.url(), {
                     frameCount: pageContext.frameCount,
                     shadowRootCount: pageContext.shadowRootCount,
+                    closedShadowRootCount: pageContext.closedShadowRootCount,
                     baseHrefPresent: pageContext.baseHrefPresent === true,
                   });
                   return;
@@ -4913,21 +4943,30 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               // Hint-bearing links revealed by this interaction must get the
               // request slots before generic revealed links; otherwise the
               // budget can be consumed by generic destinations that will not
-              // be retried.
-              await enqueueSameHostHints();
+              // be retried. Optional third-party pages skip this pass: their
+              // same-host fan-out is not required coverage and must not take
+              // page budget beyond the crawl-wide optional-branch cap.
+              if (!crossOriginRequest) await enqueueSameHostHints();
               // Reuse the existing page budget and subtract requests already
               // queued but not yet inspected: Crawlee refuses requests past
               // maxRequestsPerCrawl, so counting the whole nominal budget
               // would over-admit generic links and then mark the overflow as
-              // a coverage gap.
+              // a coverage gap. On an optional third-party page the same
+              // crawl-wide cap that bounds the cross-origin pass also bounds
+              // revealed destinations, so a hub cannot extend the optional
+              // branch past its reserved page budget.
               const pendingQueued = await renderedPendingRequestCount();
+              const remainingPageBudget = Math.max(0, limits.maxPages - inspectedPages - pendingQueued);
+              const remainingOptionalCap = crossOriginRequest
+                ? Math.max(0, MAX_RENDERED_CROSS_ORIGIN_ENQUEUES - crossOriginQueued.size)
+                : remainingPageBudget;
               const revealedPlan = planRevealedSameOriginEnqueues({
                 candidates: revealedCollection.candidates,
                 currentUrl,
                 initialLinks: baseline.links,
                 alreadyVisited: alreadyVisitedSet,
                 queued: revealedQueued,
-                maxEnqueues: Math.max(0, limits.maxPages - inspectedPages - pendingQueued),
+                maxEnqueues: Math.min(remainingPageBudget, remainingOptionalCap),
                 baselineSaturated: baseline.saturated,
               });
               // Mark every candidate as considered even when it was rejected:
@@ -4938,7 +4977,15 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               }
               if (revealedPlan.alreadyVisited) drops.count('already-visited', revealedPlan.alreadyVisited);
               if (revealedPlan.admissionRejected) drops.count('admission-rejected', revealedPlan.admissionRejected);
-              if (revealedPlan.budget > 0) revealedSameOriginDropped += revealedPlan.budget;
+              if (crossOriginRequest) {
+                // The hint pass was skipped above, and any reveal beyond the
+                // optional cap is deterministic optional work, not retryable
+                // page-budget loss. Both are destination-budget exclusions.
+                const optionalDropped = revealedPlan.hintHandled + revealedPlan.budget;
+                if (optionalDropped > 0) drops.count('destination-budget', optionalDropped);
+              } else if (revealedPlan.budget > 0) {
+                revealedSameOriginDropped += revealedPlan.budget;
+              }
               if (!revealedPlan.admitted.length) return;
               for (const url of revealedPlan.admitted) {
                 const key = normalizeVisitUrl(url) || url;
@@ -4946,7 +4993,17 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               }
               revealedSameOriginAdmitted += revealedPlan.admitted.length;
               try {
-                await enqueueLinks({ urls: revealedPlan.admitted, strategy: 'all' });
+                await enqueueLinks({
+                  urls: revealedPlan.admitted,
+                  strategy: 'all',
+                  ...(crossOriginRequest ? { userData: { crossOrigin: true } } : {}),
+                });
+                if (crossOriginRequest) {
+                  for (const url of revealedPlan.admitted) {
+                    crossOriginQueued.add(normalizeVisitUrl(url) || url);
+                  }
+                  crossOriginEnqueued += revealedPlan.admitted.length;
+                }
               } catch {
                 // Keys are already recorded; post-run resolution accounts for
                 // every destination that was never inspected.
@@ -5230,11 +5287,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // Collection runs even when pursuit is OFF: a discovered eligible
             // destination that policy did not pursue is a coverage gap, never
             // a silent discard.
-            const collectCrossOriginCandidates = async (
-              countOverflow = true,
-            ): Promise<RenderedCrossOriginCandidate[]> => {
+            const collectCrossOriginCandidates = async (): Promise<RenderedCrossOriginCandidate[]> => {
               if (Date.now() - startedAt >= limits.totalTimeoutMs) return [];
               try {
+                const currentUrl = page.url();
                 // Crawlee's enqueueLinks exposes only hrefs to its transform
                 // hook. Collect bounded href+visible-text pairs, filtering
                 // same-origin/non-HTTP(S) anchors before the bound so internal
@@ -5242,34 +5298,17 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 const collection = await page.$$eval(
                   'a[href]',
                   collectRenderedCrossOriginCandidates,
-                  page.url(),
+                  currentUrl,
                 );
-                // Collector overflow is only a coverage gap when the omitted
-                // links are community-relevant. A page with hundreds of
-                // affiliate/social/vendor links must not become permanently
-                // BOUNDED; a Discord invite or a destination the evidence
-                // policy would pursue is genuine unexamined navigation.
-                if (countOverflow) {
-                  const overflowEligible = countPursuableRenderedOverflow(
-                    collection.overflowCandidates,
-                    page.url(),
-                  );
-                  if (!limits.crossOriginEnqueue) {
-                    // Pursuit is OFF, so any eligible destination is a
-                    // deliberate policy exclusion rather than a collector gap.
-                    if (overflowEligible > 0) {
-                      drops.count('cross-origin-disallowed', overflowEligible);
-                    }
-                  } else if (overflowEligible > 0) {
-                    candidateCapTruncated = Math.max(candidateCapTruncated, overflowEligible);
-                  } else if (collection.overflowSampleFilled === true) {
-                    // The sample itself was exhausted: later anchors were never
-                    // classified, so an all-irrelevant sample cannot prove that
-                    // no eligible community destination remains. Keep coverage
-                    // partial instead of certifying a clean absence.
-                    candidateCapTruncated = Math.max(candidateCapTruncated, 1);
-                  }
+                // Merge overflow evidence from every snapshot (pre-click,
+                // reservation, post-click) into one URL-deduplicated set. A
+                // click that replaces the document must not erase the original
+                // page's unclassified destinations, and a destination seen in
+                // both snapshots must not be counted twice.
+                for (const url of pursuableRenderedOverflowUrls(collection.overflowCandidates, currentUrl)) {
+                  crossOriginOverflowEligible.add(url);
                 }
+                if (collection.overflowSampleFilled === true) crossOriginOverflowSampleFilled = true;
                 return collection.candidates;
               } catch {
                 // A control may have replaced or detached the document
@@ -5279,6 +5318,31 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               }
             };
             let preClickCrossOriginCandidates: RenderedCrossOriginCandidate[] = [];
+            const crossOriginOverflowEligible = new Set<string>();
+            let crossOriginOverflowSampleFilled = false;
+            /**
+             * Publish collector overflow once per page, after every snapshot
+             * has been merged. Pursuit OFF treats eligible overflow as a
+             * deliberate policy exclusion; pursuit ON treats it as a bounded
+             * collector gap. An exhausted overflow sample is a gap in both
+             * modes because later anchors were never classified.
+             */
+            const publishCrossOriginOverflow = (): void => {
+              const overflowEligible = crossOriginOverflowEligible.size;
+              if (!limits.crossOriginEnqueue) {
+                if (overflowEligible > 0) {
+                  drops.count('cross-origin-disallowed', overflowEligible);
+                } else if (crossOriginOverflowSampleFilled) {
+                  candidateCapTruncated = Math.max(candidateCapTruncated, 1);
+                }
+                return;
+              }
+              if (overflowEligible > 0) {
+                candidateCapTruncated = Math.max(candidateCapTruncated, overflowEligible);
+              } else if (crossOriginOverflowSampleFilled) {
+                candidateCapTruncated = Math.max(candidateCapTruncated, 1);
+              }
+            };
             /**
              * `submit=false` reserves the cap-owned destinations for the click
              * plan without enqueueing them. `submit=true` performs the single
@@ -5292,14 +5356,18 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               if (!limits.crossOriginEnqueue && !submit) return;
               // Post-click candidates are collected against the current document
               // and merged with the pre-click snapshot, so a click that replaced
-              // the document loses neither set. Overflow is classified only on
-              // the submitting pass, where it is published as coverage.
-              const latestCandidates = await collectCrossOriginCandidates(submit);
+              // the document loses neither set. Overflow from both snapshots was
+              // merged by the collector and is published once, here.
+              const latestCandidates = await collectCrossOriginCandidates();
               const candidates = [...preClickCrossOriginCandidates, ...latestCandidates];
               if (!limits.crossOriginEnqueue) {
                 // Opt-in pursuit is OFF: every eligible destination (including
                 // those beyond the cap) is a deliberate policy exclusion. This
                 // keeps the run partial instead of certifying a clean absence.
+                // This is the only pass that runs with pursuit OFF (the
+                // pre-click reservation returns above), so it publishes
+                // overflow exactly once.
+                publishCrossOriginOverflow();
                 const plan = planRenderedCrossOriginEnqueues({
                   candidates,
                   currentUrl: page.url(),
@@ -5332,6 +5400,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 }
                 return;
               }
+              // Every snapshot has now been collected and merged, so this is
+              // the single publish point for overflow evidence.
+              publishCrossOriginOverflow();
               await enqueueRenderedCrossOriginPass({
                 collect: async () => candidates,
                 currentUrl: page.url(),
@@ -5385,11 +5456,15 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 // invite. A generic Discord-host page is not terminal evidence
                 // either: its URL has no invite, so inspect its document for
                 // invite markup before treating the destination as unexamined.
-                // In both cases the popup remains an unexamined navigation
-                // surface, but its contents are no longer silently lost.
+                // An allowed same-origin popup may likewise contain markup the
+                // opener wrote after load that a fresh request cannot
+                // reproduce, so snapshot it before closing instead of relying
+                // on the queued re-open alone. In every case the popup remains
+                // an unexamined navigation surface, but its contents are no
+                // longer silently lost.
                 const genericDiscordPopup = kind !== 'discord' && isDiscordDestinationUrl(popupUrl);
                 let popupContent = '';
-                if ((kind === 'uninspectable' || genericDiscordPopup) && popup.content) {
+                if ((kind === 'uninspectable' || kind === 'same-origin' || genericDiscordPopup) && popup.content) {
                   try { popupContent = await popup.content(); } catch { /* best effort */ }
                 }
                 await popup.close().catch(() => undefined);
@@ -5430,10 +5505,25 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                   popupDestinationsDropped++;
                   continue;
                 }
+                if (crossOriginRequest && crossOriginQueued.size >= MAX_RENDERED_CROSS_ORIGIN_ENQUEUES) {
+                  // A popup opened by an optional third-party page is part of
+                  // the same capped branch. It is deterministic optional work,
+                  // not retryable page-budget loss.
+                  drops.count('destination-budget');
+                  continue;
+                }
                 popupQueued.set(key, popupUrl);
                 popupCaptured++;
                 try {
-                  await enqueueLinks({ urls: [popupUrl], strategy: 'all' });
+                  await enqueueLinks({
+                    urls: [popupUrl],
+                    strategy: 'all',
+                    ...(crossOriginRequest ? { userData: { crossOrigin: true } } : {}),
+                  });
+                  if (crossOriginRequest) {
+                    crossOriginQueued.add(key);
+                    crossOriginEnqueued++;
+                  }
                 } catch {
                   popupQueued.delete(key);
                   popupCaptured = Math.max(0, popupCaptured - 1);
@@ -5444,7 +5534,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // Capture the original document's anchors before a click can
             // replace it. The post-click pass merges this snapshot, so a click
             // to another document loses neither set.
-            preClickCrossOriginCandidates = await collectCrossOriginCandidates(false);
+            preClickCrossOriginCandidates = await collectCrossOriginCandidates();
             if (!crossOriginRequest && Date.now() - startedAt < limits.totalTimeoutMs) {
               await enqueueSameHostHints();
             }

@@ -293,7 +293,7 @@ function coverageOf(result: InspectionResult): {
     failureClass: outcome?.failureClass,
     coverageReason: outcome?.telemetry?.coverageReason,
     inspectedPages: outcome?.telemetry?.pagesInspected,
-    complete: outcome?.telemetry ? outcome.telemetry.pagesInspected > 0 && !outcome.retryable : undefined,
+    complete: outcome?.telemetry ? outcome.telemetry.coverageReason === 'COMPLETE' : undefined,
     timedOut: outcome?.telemetry?.ceiling?.kind === 'total-timeout',
   };
 }

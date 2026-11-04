@@ -276,7 +276,10 @@ A non-`COMPLETE` coverage reason is never a clean absence:
 - Popups opened by a click are drained per click. A blank sibling is probed for
   an opener or `document.write` content before being skipped as browser-pool
   idle state; a direct Discord popup URL is retained as terminal evidence and
-  excluded from the cross-origin policy counter. Uninspectable popups remain a
+  excluded from the cross-origin policy counter. An allowed same-origin
+  popup's current markup is retained before it is closed, because opener-
+  written or one-use content may not be reproduced by the queued request; the
+  request still runs for the live document. Uninspectable popups remain a
   coverage gap.
 - Interaction-revealed same-origin links are captured after each click, keyed
   by document identity, so a later click cannot erase an earlier panel's

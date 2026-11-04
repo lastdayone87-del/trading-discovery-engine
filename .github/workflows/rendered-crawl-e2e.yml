@@ -9,11 +9,18 @@ on:
       - 'e2e/**'
   pull_request:
     paths:
-      - 'server/renderedCrawlE2E.browser.test.ts'
-      - 'server/browserCommunityFallback.ts'
-      - 'server/testCrawlHelpers.ts'
+      # The E2E drives the production rendered-crawl implementation and its
+      # transitive server dependencies (extraction, policy, telemetry, proxy,
+      # and the inspection entry point). Any server change can alter its
+      # outcome, so do not maintain a fragile hand-written dependency list.
+      - 'server/**'
+      - 'package.json'
+      - 'package-lock.json'
       - '.github/workflows/rendered-crawl-e2e.yml'
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   baseline:

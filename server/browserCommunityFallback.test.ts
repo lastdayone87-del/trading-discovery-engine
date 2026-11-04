@@ -985,7 +985,30 @@ test('cross-origin requests are tagged and skip uncapped same-host fan-out', () 
   assert.equal(
     guardedPasses.length,
     2,
-    'both same-host hint passes must be skipped for optional third-party pages',
+    'both static same-host hint passes must be skipped for optional third-party pages',
+  );
+  assert.match(
+    source,
+    /if \(!crossOriginRequest\) await enqueueSameHostHints\(\);/,
+    'the reveal-time same-host hint pass must be skipped for optional third-party pages',
+  );
+  const taggedOptionalEnqueues = [
+    ...source.matchAll(/\.\.\.\(crossOriginRequest \? \{ userData: \{ crossOrigin: true \} \} : \{\}\)/g),
+  ];
+  assert.equal(
+    taggedOptionalEnqueues.length,
+    2,
+    'revealed destinations and popups opened by a third-party page inherit the optional tag',
+  );
+  assert.match(
+    source,
+    /crossOriginRequest\s*\?\s*Math\.max\(0, MAX_RENDERED_CROSS_ORIGIN_ENQUEUES - crossOriginQueued\.size\)/,
+    'revealed destinations from a third-party page share the crawl-wide optional cap',
+  );
+  assert.match(
+    source,
+    /crossOriginRequest && crossOriginQueued\.size >= MAX_RENDERED_CROSS_ORIGIN_ENQUEUES/,
+    'popups opened by a third-party page cannot exceed the crawl-wide optional cap',
   );
 });
 
@@ -1005,6 +1028,41 @@ test('cross-origin submission is deferred until after the post-click same-host p
   const postClickSameHost = source.lastIndexOf('await enqueueSameHostHints();');
   assert.ok(postClickSameHost > clickLoop && postClickSameHost < submissions[0],
     'JS-revealed required same-host links are queued before optional cross-origin pages');
+  assert.match(
+    source,
+    /preClickCrossOriginCandidates = await collectCrossOriginCandidates\(\);/,
+    'the pre-click snapshot collects its own overflow evidence instead of discarding it',
+  );
+  assert.match(
+    source,
+    /pursuableRenderedOverflowUrls\(collection\.overflowCandidates, currentUrl\)[\s\S]{0,120}?crossOriginOverflowEligible\.add\(url\)/,
+    'overflow from every snapshot is merged into one URL-deduplicated set',
+  );
+  assert.match(
+    source,
+    /const latestCandidates = await collectCrossOriginCandidates\(\);\s*const candidates = \[\.\.\.preClickCrossOriginCandidates, \.\.\.latestCandidates\];/,
+    'the post-click snapshot is merged with the pre-click snapshot before accounting',
+  );
+  assert.equal(
+    [...source.matchAll(/publishCrossOriginOverflow\(\);/g)].length,
+    2,
+    'overflow is published from exactly two terminal paths, never from the pre-click reservation',
+  );
+  assert.match(
+    source,
+    /if \(!limits\.crossOriginEnqueue\) \{[\s\S]{0,800}?publishCrossOriginOverflow\(\);/,
+    'the default-OFF path publishes overflow on its only accounting pass',
+  );
+  assert.match(
+    source,
+    /if \(!submit\) \{[\s\S]{0,1400}?return;\s*\}[\s\S]{0,300}?publishCrossOriginOverflow\(\);/,
+    'the reserve-only call never publishes overflow; the post-click submission does',
+  );
+  assert.match(
+    source,
+    /if \(!limits\.crossOriginEnqueue\) \{[\s\S]{0,800}?else if \(crossOriginOverflowSampleFilled\)/,
+    'the default-OFF path treats a filled overflow sample as unclassified, not a clean absence',
+  );
 });
 
 test('pre-click cross-origin reservation owns cap slots without submitting', () => {

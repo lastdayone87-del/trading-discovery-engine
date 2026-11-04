@@ -821,6 +821,14 @@ test('collector overflow counts only policy-pursuable destinations', () => {
     0,
     'a page of unrelated vendor links must not become BOUNDED through collector overflow',
   );
+  assert.equal(
+    countPursuableRenderedOverflow([
+      { url: 'https://linktr.ee/creator', text: 'All my links', sourceUrl: currentUrl },
+      { url: 'https://linktr.ee/creator', text: 'All my links', sourceUrl: 'https://other.example/' },
+    ], currentUrl),
+    1,
+    'the same overflow destination seen in two snapshots is counted once',
+  );
 });
 
 test('cross-origin clicks are skipped only while the destination pass pursues them', () => {
@@ -1656,22 +1664,23 @@ test('label recovery stays bounded before allocating id lists or subtree text', 
 
 test('a clicked destination that its own request inspects is not counted twice', () => {
   const observations = new Map([
-    ['https://creator.example/community', { frameCount: 2, shadowRootCount: 1, baseHrefPresent: false }],
-    ['https://creator.example/landing', { frameCount: 1, shadowRootCount: 0, baseHrefPresent: true }],
+    ['https://creator.example/community', { frameCount: 2, shadowRootCount: 1, closedShadowRootCount: 3, baseHrefPresent: false }],
+    ['https://creator.example/landing', { frameCount: 1, shadowRootCount: 0, closedShadowRootCount: 2, baseHrefPresent: true }],
   ]);
   const inspected = new Set(['https://creator.example/community']);
   const reconciled = reconcileClickDestinationContext({ observations, inspectedKeys: inspected });
   assert.equal(reconciled.frameCount, 1, 'the admitted destination is counted by its own request, not by the click');
   assert.equal(reconciled.shadowRootCount, 0, 'the admitted destination cannot inflate shadow-root totals');
+  assert.equal(reconciled.closedShadowRootCount, 2, 'the admitted destination cannot inflate closed-root totals');
   assert.equal(reconciled.baseHrefPresent, true, 'the click-only destination still contributes its base href');
   assert.deepEqual(
     reconcileClickDestinationContext({ observations, inspectedKeys: new Set() }),
-    { frameCount: 3, shadowRootCount: 1, baseHrefPresent: true },
+    { frameCount: 3, shadowRootCount: 1, closedShadowRootCount: 5, baseHrefPresent: true },
     'every observation counts when no request inspected the destination',
   );
   assert.deepEqual(
     reconcileClickDestinationContext({ observations, inspectedKeys: new Set(observations.keys()) }),
-    { frameCount: 0, shadowRootCount: 0, baseHrefPresent: false },
+    { frameCount: 0, shadowRootCount: 0, closedShadowRootCount: 0, baseHrefPresent: false },
     'a fully inspected destination set leaves nothing to add',
   );
 });
@@ -1726,6 +1735,16 @@ test('interaction-revealed links are captured per click and context counters ref
   );
   assert.match(source, /pageClosedShadowRootCount = Math\.max\(/, 'live context counters are maxed per document');
   assert.match(source, /recordClickDestinationContext\(page\.url\(\), \{/, 'a click-navigated document keeps its context by destination');
+  assert.match(
+    source,
+    /recordClickDestinationContext\(page\.url\(\), \{[\s\S]{0,200}?closedShadowRootCount: pageContext\.closedShadowRootCount/,
+    'a click-navigated document keeps its closed-shadow-root count, not just frames and open roots',
+  );
+  assert.match(
+    source,
+    /closedShadowRootCount: closedShadowRootCount \+ clickDestinationContext\.closedShadowRootCount/,
+    'click-only closed roots are added to the crawl totals at publish time',
+  );
   assert.doesNotMatch(
     source,
     /isSameSeedDocument\(pageDocumentIdentity, currentIdentity, pageDocumentUrl, currentUrl\)/,
@@ -1754,6 +1773,11 @@ test('interaction-revealed links are captured per click and context counters ref
   );
   assert.match(source, /shouldSkipPreexistingSiblingPage\(existingUrl, probe\)/, 'blank siblings are classified before being skipped');
   assert.match(source, /popupContent = await popup\.content\(\)/, 'document.write content in a blank popup is inspected before closing');
+  assert.match(
+    source,
+    /kind === 'uninspectable' \|\| kind === 'same-origin' \|\| genericDiscordPopup/,
+    'an allowed same-origin popup snapshot is retained before close so opener-written content is not lost',
+  );
 });
 
 test('shared rendered evidence stays fail-closed: gapped/timed-out lenders never enter inventory', () => {
