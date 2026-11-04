@@ -36,8 +36,10 @@ test('acquisition: same-host navigable anchors skip clicks, buttons do not', () 
   // drops them and the required set excludes them, so no click is needed
   // and no obligation is created (all three layers agree).
   assert.equal(isSkippableNavigableAnchorClick({ href: '/community-help.js' }, PAGE), true);
-  // Cross-host navigation keeps current behavior (never silently dropped).
-  assert.equal(isSkippableNavigableAnchorClick({ href: 'https://other.example.net/join' }, PAGE), false);
+  // Cross-host navigation is owned by the bounded destination-policy pass:
+  // clicking only learns the destination by navigating away (or opening an
+  // unmanaged popup), so the anchor text+href is retained but not clicked.
+  assert.equal(isSkippableNavigableAnchorClick({ href: 'https://other.example.net/join' }, PAGE), true);
   // Unparseable hrefs fail open toward recall.
   assert.equal(isSkippableNavigableAnchorClick({ href: 'http://exa mple.com/' }, PAGE), false);
 });

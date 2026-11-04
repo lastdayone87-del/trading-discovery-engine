@@ -236,7 +236,27 @@ test('coverage reason distinguishes complete, bounded, policy, context, and unkn
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, unresolvedFailedRequests: 0 }), 'COMPLETE');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, frameCount: 1 }), 'CONTEXT_UNREACHABLE');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, shadowRootCount: 1 }), 'CONTEXT_UNREACHABLE');
+  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, closedShadowRootCount: 1 }), 'CONTEXT_UNREACHABLE');
+  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, declarativeClosedShadowRootCount: 1 }), 'CONTEXT_UNREACHABLE');
+  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, declarativeShadowScanGap: 1 }), 'BOUNDED');
+  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, candidateCapTruncated: 1 }), 'BOUNDED');
   assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, popupTargets: 1 }), 'CONTEXT_UNREACHABLE');
+  assert.equal(resolveRenderedCoverageReason({ pagesInspected: 1, opaqueInteractiveControls: 1 }), 'CONTEXT_UNREACHABLE');
+  assert.equal(
+    resolveRenderedCoverageReason({ pagesInspected: 1, requiredUnvisited: 2 }),
+    'BOUNDED',
+    'required-but-unvisited work is a bounded traversal gap even when no queue stat proves it',
+  );
+  assert.equal(
+    resolveRenderedCoverageReason({ pagesInspected: 1, popupDestinationsDropped: 1 }),
+    'BOUNDED',
+    'a captured but unvisited same-origin popup is a bounded gap',
+  );
+  assert.equal(
+    resolveRenderedCoverageReason({ pagesInspected: 1, revealedSameOriginDropped: 1 }),
+    'BOUNDED',
+    'an admitted but unvisited revealed link is a bounded gap',
+  );
   assert.equal(
     resolveRenderedCoverageReason({ pagesInspected: 1, navigationPolicyExcluded: { 'admission-rejected': 3 } }),
     'COMPLETE',
@@ -297,8 +317,17 @@ test('safe telemetry round-trips P0.2 navigation-coverage fields on rendered row
     controlsStructuralUnrecovered: 2,
     controlsIconLabelRecovered: 4,
     popupTargets: 3,
+    popupCaptured: 2,
+    popupDestinationsDropped: 1,
+    revealedSameOriginAdmitted: 2,
+    revealedSameOriginDropped: 1,
+    opaqueInteractiveControls: 2,
     frameCount: 2,
     shadowRootCount: 1,
+    closedShadowRootCount: 1,
+    declarativeClosedShadowRootCount: 2,
+    declarativeShadowScanGap: 1,
+    candidateCapTruncated: 3,
     baseHrefPresent: true,
     scrollCapReachedStillGrowing: true,
     navigationPolicyExcluded: { 'admission-rejected': 5, 'hint-rejected': 30 },
@@ -312,8 +341,17 @@ test('safe telemetry round-trips P0.2 navigation-coverage fields on rendered row
   assert.equal(rendered?.controlsStructuralUnrecovered, 2);
   assert.equal(rendered?.controlsIconLabelRecovered, 4);
   assert.equal(rendered?.popupTargets, 3);
+  assert.equal(rendered?.popupCaptured, 2);
+  assert.equal(rendered?.popupDestinationsDropped, 1);
+  assert.equal(rendered?.revealedSameOriginAdmitted, 2);
+  assert.equal(rendered?.revealedSameOriginDropped, 1);
+  assert.equal(rendered?.opaqueInteractiveControls, 2);
   assert.equal(rendered?.frameCount, 2);
   assert.equal(rendered?.shadowRootCount, 1);
+  assert.equal(rendered?.closedShadowRootCount, 1);
+  assert.equal(rendered?.declarativeClosedShadowRootCount, 2);
+  assert.equal(rendered?.declarativeShadowScanGap, 1);
+  assert.equal(rendered?.candidateCapTruncated, 3);
   assert.equal(rendered?.baseHrefPresent, true);
   assert.equal(rendered?.scrollCapReachedStillGrowing, true);
   assert.deepEqual(rendered?.navigationPolicyExcluded, { 'admission-rejected': 5, 'hint-rejected': 30 });
@@ -338,14 +376,48 @@ test('safe telemetry round-trips P0.2 navigation-coverage fields on rendered row
     mode: 'STATIC',
     pagesInspected: 1,
     controlsEnumeratedTotal: 5,
+    controlsHintRejected: 2,
+    controlsStructuralNavigation: 1,
+    controlsStructuralHintRejected: 1,
+    controlsStructuralDisclosure: 1,
+    controlsStructuralUnrecovered: 1,
+    controlsIconLabelRecovered: 1,
+    popupTargets: 1,
+    popupCaptured: 1,
+    popupDestinationsDropped: 1,
+    revealedSameOriginAdmitted: 1,
+    revealedSameOriginDropped: 1,
+    opaqueInteractiveControls: 1,
     frameCount: 1,
+    shadowRootCount: 1,
+    closedShadowRootCount: 1,
+    declarativeClosedShadowRootCount: 1,
+    declarativeShadowScanGap: 1,
+    candidateCapTruncated: 1,
     baseHrefPresent: true,
     scrollCapReachedStillGrowing: true,
     navigationPolicyExcluded: { 'admission-rejected': 1 },
     coverageReason: 'COMPLETE',
   });
   assert.equal(staticRow?.controlsEnumeratedTotal, undefined);
+  assert.equal(staticRow?.controlsHintRejected, undefined);
+  assert.equal(staticRow?.controlsStructuralNavigation, undefined);
+  assert.equal(staticRow?.controlsStructuralHintRejected, undefined);
+  assert.equal(staticRow?.controlsStructuralDisclosure, undefined);
+  assert.equal(staticRow?.controlsStructuralUnrecovered, undefined);
+  assert.equal(staticRow?.controlsIconLabelRecovered, undefined);
+  assert.equal(staticRow?.popupTargets, undefined);
+  assert.equal(staticRow?.popupCaptured, undefined);
+  assert.equal(staticRow?.popupDestinationsDropped, undefined);
+  assert.equal(staticRow?.revealedSameOriginAdmitted, undefined);
+  assert.equal(staticRow?.revealedSameOriginDropped, undefined);
+  assert.equal(staticRow?.opaqueInteractiveControls, undefined);
   assert.equal(staticRow?.frameCount, undefined);
+  assert.equal(staticRow?.shadowRootCount, undefined);
+  assert.equal(staticRow?.closedShadowRootCount, undefined);
+  assert.equal(staticRow?.declarativeClosedShadowRootCount, undefined);
+  assert.equal(staticRow?.declarativeShadowScanGap, undefined);
+  assert.equal(staticRow?.candidateCapTruncated, undefined);
   assert.equal(staticRow?.baseHrefPresent, undefined);
   assert.equal(staticRow?.scrollCapReachedStillGrowing, undefined);
   assert.equal(staticRow?.navigationPolicyExcluded, undefined);
@@ -370,6 +442,31 @@ test('safe telemetry clamps oversized structural counters to the persisted bound
   });
   assert.equal(malformed?.controlsStructuralDisclosure, undefined);
   assert.equal(malformed?.controlsStructuralUnrecovered, undefined);
+});
+
+test('safe telemetry clamps oversized popup, reveal, and context counters to the persisted bound', () => {
+  const oversized = safeCrawlerTelemetry({
+    mode: 'RENDERED',
+    pagesInspected: 1,
+    popupCaptured: 5_000_000,
+    popupDestinationsDropped: 2_500_000.9,
+    revealedSameOriginAdmitted: Number.MAX_SAFE_INTEGER,
+    revealedSameOriginDropped: 1_000_001,
+    opaqueInteractiveControls: 3_000_000,
+    closedShadowRootCount: 4_000_000,
+    declarativeClosedShadowRootCount: 5_000_001,
+    declarativeShadowScanGap: 6_000_000,
+    candidateCapTruncated: 7_000_000,
+  });
+  assert.equal(oversized?.popupCaptured, 999999);
+  assert.equal(oversized?.popupDestinationsDropped, 999999);
+  assert.equal(oversized?.revealedSameOriginAdmitted, 999999);
+  assert.equal(oversized?.revealedSameOriginDropped, 999999);
+  assert.equal(oversized?.opaqueInteractiveControls, 999999);
+  assert.equal(oversized?.closedShadowRootCount, 999999);
+  assert.equal(oversized?.declarativeClosedShadowRootCount, 999999);
+  assert.equal(oversized?.declarativeShadowScanGap, 999999);
+  assert.equal(oversized?.candidateCapTruncated, 999999);
 });
 
 test('safe telemetry drops unknown stage/reason and truncates cause text', () => {

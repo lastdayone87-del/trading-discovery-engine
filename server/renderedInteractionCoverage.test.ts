@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { DEFAULT_BROWSER_FALLBACK_BUDGET, MAX_RENDERED_CROSS_ORIGIN_ENQUEUES, combineRenderedControlOffsetAdvances, enqueueRenderedCrossOriginPass, isCrossHostnameStructuralNavigation, isNavigableOnlyControlWindow, isSameSeedDocument, isUnrecoveredStructuralNavigation, mergeRenderedCoverageGapCounters, planRevealedRenderedClickTargets, planRenderedCrossOriginEnqueues, partitionRenderedClickTargets, reconcileClickDestinationContext, remainingRenderedClickBudget, renderedClickOffsetAdvance, renderedControlOverflowTargets, renderedCrossOriginVisitedIdentities, renderedRequestControlTotalsDelta, resolveRenderedCompletionState, resolveUnexaminedPopupTargets, runRenderedClickLoop, shouldEnqueueRenderedCrossOriginLink, trackRenderedPopupCoverage, type RenderedControlEnumeration, type RenderedRequestControlTotals } from './browserCommunityFallback';
+import { DEFAULT_BROWSER_FALLBACK_BUDGET, MAX_RENDERED_CROSS_ORIGIN_ENQUEUES, combineRenderedControlOffsetAdvances, countPursuableRenderedOverflow, enqueueRenderedCrossOriginPass, isCrossHostnameStructuralNavigation, isNavigableOnlyControlWindow, isSameSeedDocument, isSkippableNavigableAnchorClick, isUnrecoveredStructuralNavigation, mergeRenderedCoverageGapCounters, planRevealedRenderedClickTargets, planRevealedSameOriginEnqueues, planRenderedCrossOriginEnqueues, partitionRenderedClickTargets, reconcileClickDestinationContext, recoverRenderedOverflowCandidate, remainingRenderedClickBudget, renderedClickOffsetAdvance, renderedControlOverflowTargets, renderedCrossOriginVisitedIdentities, renderedRequestControlTotalsDelta, resolveRenderedCompletionState, resolveUnexaminedPopupTargets, runRenderedClickLoop, shouldEnqueueRenderedCrossOriginLink, trackRenderedPopupCoverage, type RenderedControlEnumeration, type RenderedRequestControlTotals } from './browserCommunityFallback';
 import { isSufficientRenderedCoverage } from './siteInspectionCache';
 import { FOUND_GAP_RETRYABLE_FAILURE_CLASSES } from './communityRetryPolicy';
 import { readFileSync } from 'node:fs';
@@ -66,6 +66,7 @@ const renderedEnumeration = (
   iconLabelRecovered: 0,
   popupTargets: 0,
   popupMarkers: controls.filter(control => control.popup && control.marker).map(control => control.marker as string),
+  opaqueInteractiveControls: 0,
 });
 
 test('an evidence-bearing interaction gap keeps a processed run incomplete and retryable', () => {
@@ -698,6 +699,57 @@ test('a seed retry refreshes its own document identity and required links', () =
   assert.match(source, /for \(const link of discoverRequiredSeedLinks\(await page\.content\(\), page\.url\(\)\)\) known\.add\(link\)/, 'retry-discovered links merge with earlier seed links');
 });
 
+test('revealed same-origin planner admits only post-interaction generic links', () => {
+  const currentUrl = 'https://creator.example/';
+  const plan = planRevealedSameOriginEnqueues({
+    candidates: [
+      { url: 'https://creator.example/resources', text: 'Resources' },
+      { url: 'https://creator.example/community', text: 'Community' },
+      { url: 'https://creator.example/about', text: 'About' },
+      { url: 'https://other.example/room', text: 'Room' },
+    ],
+    currentUrl,
+    initialLinks: new Set(['https://creator.example/about']),
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(plan.admitted, ['https://creator.example/resources'],
+    'only a newly revealed, admissible, non-hint same-origin link is admitted');
+  assert.equal(plan.hintHandled, 1, 'hint-bearing links stay owned by the existing same-host pass');
+
+  const hintPassSkipped = planRevealedSameOriginEnqueues({
+    candidates: [
+      { url: 'https://creator.example/community', text: 'Community' },
+      { url: 'https://creator.example/resources', text: 'Resources' },
+    ],
+    currentUrl,
+    initialLinks: new Set(),
+    alreadyVisited: new Set(),
+    queued: new Set(),
+    maxEnqueues: 1,
+    hintPassSkipped: true,
+  });
+  assert.deepEqual(hintPassSkipped.admitted, ['https://creator.example/community'],
+    'an optional third-party page has no hint pass, so a revealed hint link is admitted through the capped pass');
+  assert.equal(hintPassSkipped.hintHandled, 0, 'nothing else owns hint links when the hint pass is skipped');
+  assert.equal(hintPassSkipped.budget, 1, 'hint links beyond the optional cap stay a counted budget exclusion');
+
+  const capped = planRevealedSameOriginEnqueues({
+    candidates: [
+      { url: 'https://creator.example/resources', text: 'Resources' },
+      { url: 'https://creator.example/support', text: 'Support' },
+      { url: 'https://creator.example/explore', text: 'Explore' },
+    ],
+    currentUrl,
+    initialLinks: new Set(),
+    alreadyVisited: new Set(),
+    queued: new Set(),
+    maxEnqueues: 2,
+  });
+  assert.equal(capped.admitted.length, 2);
+  assert.equal(capped.budget, 1, 'revealed-link overflow is counted, never silently discarded');
+});
+
 test('cross-origin planner carries visible anchor text for generic paths', () => {
   const currentUrl = 'https://creator.example/';
   const admitted = planRenderedCrossOriginEnqueues({
@@ -707,7 +759,7 @@ test('cross-origin planner carries visible anchor text for generic paths', () =>
     queued: new Set(),
   });
   assert.deepEqual(admitted.admitted, ['https://community.example/go']);
-  assert.equal(admitted.disallowed, 0);
+  assert.equal(admitted.irrelevant, 0);
 
   const noLabel = planRenderedCrossOriginEnqueues({
     candidates: [{ url: 'https://community.example/go', text: '' }],
@@ -716,7 +768,9 @@ test('cross-origin planner carries visible anchor text for generic paths', () =>
     queued: new Set(),
   });
   assert.deepEqual(noLabel.admitted, [], 'a generic path with no visible label is not admitted');
-  assert.equal(noLabel.disallowed, 1);
+  assert.equal(noLabel.irrelevant, 1, 'an unrelated outbound link is diagnostic, never a coverage exclusion');
+  assert.equal(noLabel.admissionRejected, 0);
+  assert.equal(noLabel.budget, 0);
 });
 
 test('cross-origin planner deduplicates, skips visited, and enforces the cap', () => {
@@ -739,6 +793,197 @@ test('cross-origin planner deduplicates, skips visited, and enforces the cap', (
   assert.equal(plan.alreadyVisited, 1);
   assert.equal(plan.duplicate, 0, 'a URL repeated inside one merged snapshot is deduped, not counted as a queue duplicate');
   assert.equal(plan.budget, 2);
+
+  const terminal = planRenderedCrossOriginEnqueues({
+    candidates: [{ url: 'https://discord.gg/Abc123', text: 'Discord' }],
+    currentUrl: 'https://creator.example/',
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.equal(terminal.discordDestinations, 1);
+  assert.equal(terminal.irrelevant, 0, 'Discord is a terminal invite candidate, not a policy exclusion');
+  assert.equal(terminal.admissionRejected, 0);
+
+  const rejected = planRenderedCrossOriginEnqueues({
+    candidates: [
+      { url: 'http://127.0.0.1/private', text: 'Join the private community' },
+      { url: 'https://outside.test/privacy', text: 'Privacy policy' },
+    ],
+    currentUrl: 'https://creator.example/',
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.equal(rejected.admissionRejected, 1, 'format/security rejections are not eligible destinations');
+  assert.equal(rejected.irrelevant, 1, 'an unrelated vendor link is not an eligible destination');
+  assert.equal(rejected.budget, 0);
+});
+
+test('a recovered overflow destination keeps the label that made it pursuable', () => {
+  const url = 'https://community.example/go';
+  const overflowEligible = new Set([url]);
+  const labelsByKey = new Map([[url, ['Join the private members community']]]);
+  const recovered = { url, text: 'About' };
+  recoverRenderedOverflowCandidate(recovered, labelsByKey, overflowEligible);
+  assert.equal(recovered.text, 'About Join the private members community',
+    'the strong overflow label is folded into the weak visible anchor');
+  assert.equal(overflowEligible.size, 0, 'a recovered destination is no longer counted as truncation');
+  const plan = planRenderedCrossOriginEnqueues({
+    candidates: [recovered],
+    currentUrl: 'https://creator.example/',
+    alreadyVisited: new Set(),
+    queued: new Set(),
+  });
+  assert.deepEqual(plan.admitted, [url],
+    'preserved evidence lets the planner pursue a destination the weak visible label alone would reject');
+});
+
+test('collector overflow counts only policy-pursuable destinations', () => {
+  const currentUrl = 'https://creator.example/';
+  const overflow = [
+    { url: 'https://outside.test/privacy', text: 'Privacy policy' },
+    { url: 'https://outside.test/sponsor', text: 'Sponsored partner' },
+    { url: 'https://linktr.ee/creator', text: 'All my links' },
+    { url: 'https://discord.gg/Abc123', text: 'Join Discord' },
+    { url: 'https://discord.com/users/123456789', text: 'Discord profile' },
+    { url: 'https://creator.example/community', text: 'Join the community' },
+  ];
+  assert.equal(
+    countPursuableRenderedOverflow(overflow, currentUrl),
+    3,
+    'the aggregator hub, the direct Discord invite, and the community-labeled generic Discord page stay unexamined navigation',
+  );
+  assert.equal(
+    countPursuableRenderedOverflow([{ url: 'https://outside.test/privacy', text: 'Privacy policy' }], currentUrl),
+    0,
+    'a page of unrelated vendor links must not become BOUNDED through collector overflow',
+  );
+  assert.equal(
+    countPursuableRenderedOverflow([
+      { url: 'https://linktr.ee/creator', text: 'All my links', sourceUrl: currentUrl },
+      { url: 'https://linktr.ee/creator', text: 'All my links', sourceUrl: 'https://other.example/' },
+    ], currentUrl),
+    1,
+    'the same overflow destination seen in two snapshots is counted once',
+  );
+});
+
+test('cross-origin clicks are skipped only while the destination pass pursues them', () => {
+  const pageUrl = 'https://creator.example/';
+  const aggregator = { href: 'https://linktr.ee/creator', text: 'All my links' };
+  const vendor = { href: 'https://outside.test/privacy', text: 'Privacy policy' };
+  const discord = { href: 'https://discord.gg/Abc123', text: 'Join Discord' };
+  assert.equal(
+    isSkippableNavigableAnchorClick(aggregator, pageUrl, { crossOriginPursued: true }),
+    true,
+    'the bounded cross-origin pass owns eligible anchors while it has budget',
+  );
+  assert.equal(
+    isSkippableNavigableAnchorClick(aggregator, pageUrl, { crossOriginPursued: false }),
+    false,
+    'with pursuit OFF or its cap exhausted, clicking the aggregator is the only remaining discovery path',
+  );
+  assert.equal(
+    isSkippableNavigableAnchorClick(vendor, pageUrl, { crossOriginPursued: false }),
+    true,
+    'policy-irrelevant vendor links stay skipped even without pursuit',
+  );
+  assert.equal(
+    isSkippableNavigableAnchorClick(discord, pageUrl, { crossOriginPursued: false }),
+    true,
+    'a direct Discord invite is terminal evidence and is never clicked',
+  );
+  assert.equal(
+    isSkippableNavigableAnchorClick(aggregator, pageUrl),
+    true,
+    'omitting the option preserves the legacy cross-host skip for unaffected callers',
+  );
+  assert.equal(
+    isSkippableNavigableAnchorClick({ ...aggregator, newContext: true }, pageUrl, { crossOriginPursued: false }),
+    true,
+    'a cross-origin hub that opens a popup cannot be inspected by a click: cross-origin popups are policy-dropped, so the enqueue budget owns it',
+  );
+});
+
+test('an already-queued cross-origin hub is never clicked after re-enumeration', async () => {
+  // The cross-origin pass reserves its cap before the click loop. The initial
+  // plan skipped the hub because it was enqueue-owned; after a same-document
+  // click the re-enumeration sees the same anchor with no click record. It must
+  // stay skipped by URL, not become clickable because cap space is gone.
+  const pageUrl = 'https://creator.example/';
+  const queued = new Set(['https://linktr.ee/creator']);
+  const hub = {
+    index: 1,
+    marker: 'oc-hub',
+    text: 'All my links',
+    href: 'https://linktr.ee/creator',
+    tag: 'anchor' as const,
+  };
+  const first = renderedButton(0, 'oc-first');
+  const revealed = renderedButton(2, 'oc-revealed');
+  const initialPlan = partitionRenderedClickTargets([first, hub], pageUrl, 4, 0, undefined, {
+    crossOriginPursued: false,
+    queuedDestinations: queued,
+  });
+  assert.deepEqual(initialPlan.toClick.map(target => target.marker), ['oc-first']);
+  assert.equal(initialPlan.skippedNavigableAnchors, 1, 'the queued hub is enqueue-owned, not clickable');
+
+  let clicks = 0;
+  const result = await runRenderedClickLoop({
+    targets: initialPlan.toClick,
+    maxClicksPerPage: 4,
+    deadlineExceeded: () => false,
+    click: async () => { clicks++; return true; },
+    enumerate: async () => renderedEnumeration([first, hub, revealed]),
+    pageUrl: () => pageUrl,
+    crossOriginPursued: false,
+    queuedDestinations: queued,
+  });
+  assert.equal(clicks, 2, 'only the original button and the newly revealed button are clicked');
+  assert.equal(result.evidenceControlsClicked, 2);
+  assert.equal(result.evidenceControlsSkipped, 0, 'the queued hub is covered by the enqueue pass, not an unexamined click gap');
+});
+
+test('over-cap cross-origin hubs stay clickable after the enqueue pass reserves the cap', () => {
+  // The page has five eligible hubs but only three enqueue slots. The pass
+  // reserves three; the remaining two must stay in the click plan. Building
+  // the click plan before the reservation would mark all five as enqueue-owned
+  // and leave the over-cap hubs neither queued nor clicked.
+  const currentUrl = 'https://creator.example/';
+  const hubs = Array.from({ length: 5 }, (_, index) => ({
+    url: `https://linktr.ee/creator-${index}`,
+    text: 'All my links',
+  }));
+  const queued = new Set<string>();
+  const enqueuePlan = planRenderedCrossOriginEnqueues({
+    candidates: hubs,
+    currentUrl,
+    alreadyVisited: new Set(),
+    queued,
+    maxEnqueues: MAX_RENDERED_CROSS_ORIGIN_ENQUEUES,
+  });
+  assert.deepEqual(enqueuePlan.admitted, hubs.slice(0, 3).map(hub => hub.url));
+  for (const url of enqueuePlan.admitted) queued.add(url);
+  assert.equal(queued.size, MAX_RENDERED_CROSS_ORIGIN_ENQUEUES);
+  const pursuitActive = queued.size < MAX_RENDERED_CROSS_ORIGIN_ENQUEUES;
+  assert.equal(pursuitActive, false, 'the cap is exhausted after admission');
+
+  const controls = hubs.map((hub, index) => ({
+    index,
+    marker: `oc-hub-${index}`,
+    text: hub.text,
+    href: hub.url,
+    tag: 'anchor' as const,
+  }));
+  const clickPlan = partitionRenderedClickTargets(controls, currentUrl, 5, 0, undefined, {
+    crossOriginPursued: pursuitActive,
+    queuedDestinations: queued,
+  });
+  assert.deepEqual(
+    clickPlan.toClick.map(target => target.href),
+    hubs.slice(3).map(hub => hub.url),
+    'hubs beyond the enqueue cap remain clickable while queued hubs stay enqueue-owned',
+  );
+  assert.equal(clickPlan.skippedNavigableAnchors, 3);
 });
 
 test('cross-origin planner keeps each snapshot origin for its candidates', () => {
@@ -786,8 +1031,8 @@ test('a later strong label admits a URL whose first anchor is weak', () => {
 test('merged pre/post-click snapshots count each URL once', () => {
   const plan = planRenderedCrossOriginEnqueues({
     candidates: [
-      { url: 'https://outside.example/prices', text: 'Prices', sourceUrl: 'https://creator.example/' },
-      { url: 'https://outside.example/prices', text: 'Prices', sourceUrl: 'https://creator.example/home' },
+      { url: 'https://creator.example/prices', text: 'Prices', sourceUrl: 'https://creator.example/' },
+      { url: 'https://creator.example/prices', text: 'Prices', sourceUrl: 'https://creator.example/home' },
       { url: 'https://seen.example/join', text: 'Join the community', sourceUrl: 'https://creator.example/' },
       { url: 'https://seen.example/join', text: 'Join the community', sourceUrl: 'https://creator.example/home' },
     ],
@@ -1219,7 +1464,7 @@ test('outcome classifier source contracts: gap outranks clean resolution and nev
   // explicit false is scoped to runs that actually admitted optional
   // cross-origin work, so flag-off retry/cache behavior is unchanged.
   assert.match(source, /if \(requiredCovered && !interactionGap && !coverageGap\) return \{outcome:'INSPECTED_NO_MATCH',\.\.\.cleanRetryableOverride\};/);
-  assert.match(source, /if\(rendered\.complete&&renderedProcessed&&!interactionGap&&!coverageGap\)return\{outcome:'INSPECTED_NO_MATCH',\.\.\.cleanRetryableOverride\};/);
+  assert.match(source, /if\(rendered\.complete&&renderedProcessed&&!interactionGap&&!coverageGap&&!gap\)return\{outcome:'INSPECTED_NO_MATCH',\.\.\.cleanRetryableOverride\};/);
   assert.match(source, /const optionalCrossOriginWork = \(rendered\.crossOriginEnqueued \|\| 0\) > 0;/);
   // Partial/acquisition-failed runs keep the gap class visible for retry.
   assert.match(source, /failureClass:timeoutClass\|\|interactionClass\|\|'RENDERED_PARTIAL_COVERAGE'/);
@@ -1248,10 +1493,21 @@ test('rendered control coverage counts overflow and uses stable markers across D
   assert.match(source, /const evaluationWindow = ordered\.slice\(0, windowSize\)/, 'the evaluation window is applied after rotating the full matched pool');
   assert.match(source, /recordControlEnumeration\(firstEnumeration\)/);
   assert.match(source, /data-oc-control/);
-  assert.match(source, /partitionRenderedClickTargets\(controls, page\.url\(\), limits\.maxClicksPerPage, limits\.clickOffset\)/, 'the retry offset rotates the full pool before the cap');
+  assert.match(source, /partitionRenderedClickTargets\(\s*controls,\s*page\.url\(\),\s*limits\.maxClicksPerPage,\s*limits\.clickOffset,\s*undefined,\s*\{\s*crossOriginPursued: crossOriginPursuitActive\(\),\s*queuedDestinations: isQueuedDestination,\s*\},\s*\)/, 'the retry offset rotates the full pool before the cap and excludes queued destinations');
+  const reserveCrossOriginPos = source.indexOf('await enqueueCrossOrigin(false);');
+  const submitCrossOriginPos = source.indexOf('await enqueueCrossOrigin();');
+  const clickPlanPos = source.indexOf('const clickPlan = partitionRenderedClickTargets(');
+  assert.ok(
+    reserveCrossOriginPos !== -1 && clickPlanPos !== -1 && reserveCrossOriginPos < clickPlanPos,
+    'the pre-click pass reserves cap-owned hubs before the click plan decides which are enqueue-owned',
+  );
+  assert.ok(
+    submitCrossOriginPos > clickPlanPos,
+    'the actual cross-origin submission is deferred until after interactions',
+  );
   assert.match(source, /const pendingQueuedTargets = Math\.max\(0, clickTargets\.length - clickIndex - 1\)/, 'queued-but-unclicked controls consume the remaining budget');
-  assert.match(source, /const freshPlan = planRevealedRenderedClickTargets\(\s*unqueued,\s*input\.pageUrl\(\),\s*input\.maxClicksPerPage,\s*clickedThisPage,\s*pendingQueuedTargets,\s*input\.clickOffset,?\s*\)/, 'revealed controls are planned against the truly remaining slots and retry offset');
-  assert.match(source, /(?:const\s+)?clickLoop = await runRenderedClickLoop\(\{[\s\S]*?enumerate: enumerateControls,[\s\S]*?onEnumerated: recordControlEnumeration,?\s*\}\);/, 'the handler executes the extracted loop after every click');
+  assert.match(source, /const freshPlan = planRevealedRenderedClickTargets\(\s*unqueued,\s*input\.pageUrl\(\),\s*input\.maxClicksPerPage,\s*clickedThisPage,\s*pendingQueuedTargets,\s*input\.clickOffset,\s*\{\s*crossOriginPursued: input\.crossOriginPursued,\s*queuedDestinations: input\.queuedDestinations,?\s*\},?\s*\)/, 'revealed controls are planned against the truly remaining slots and retry offset');
+  assert.match(source, /clickLoop = await runRenderedClickLoop\(\{[\s\S]*?enumerate: enumerateControls,[\s\S]*?onEnumerated: recordControlEnumeration,?\s*\}\);/, 'the handler executes the extracted loop after every click');
   assert.doesNotMatch(source, /clickedThisPage < limits\.maxClicksPerPage && Date\.now\(\) - startedAt < limits\.totalTimeoutMs\) \{/, 'the old final-click guard must not return');
   assert.match(source, /freshDropped\+\+/, 're-enumerated controls beyond the remaining budget are counted as skipped');
   assert.match(source, /const sliceSkippedTargets = clickPlan\.evaluationWindow\.filter/, 'slice accounting identifies the skipped targets');
@@ -1398,8 +1654,10 @@ test('a retried request replaces its previous-attempt counters instead of double
     structuralUnrecovered: 1,
     iconLabelRecovered: 1,
     popupCount,
+    opaqueInteractiveControls: 1,
     frameCount: 1,
     shadowRootCount: 1,
+    closedShadowRootCount: 1,
     baseHrefPresent: false,
   });
   const first = renderedRequestControlTotalsDelta(undefined, attempt(5, 2));
@@ -1416,8 +1674,10 @@ test('a retried request replaces its previous-attempt counters instead of double
     structuralUnrecovered: 0,
     iconLabelRecovered: 0,
     popupCount: 0,
+    opaqueInteractiveControls: 0,
     frameCount: 0,
     shadowRootCount: 0,
+    closedShadowRootCount: 0,
   }, 'an identical retry adds nothing to crawl totals');
 
   const changed = renderedRequestControlTotalsDelta(attempt(5, 2), attempt(7, 1));
@@ -1440,22 +1700,23 @@ test('label recovery stays bounded before allocating id lists or subtree text', 
 
 test('a clicked destination that its own request inspects is not counted twice', () => {
   const observations = new Map([
-    ['https://creator.example/community', { frameCount: 2, shadowRootCount: 1, baseHrefPresent: false }],
-    ['https://creator.example/landing', { frameCount: 1, shadowRootCount: 0, baseHrefPresent: true }],
+    ['https://creator.example/community', { frameCount: 2, shadowRootCount: 1, closedShadowRootCount: 3, baseHrefPresent: false }],
+    ['https://creator.example/landing', { frameCount: 1, shadowRootCount: 0, closedShadowRootCount: 2, baseHrefPresent: true }],
   ]);
   const inspected = new Set(['https://creator.example/community']);
   const reconciled = reconcileClickDestinationContext({ observations, inspectedKeys: inspected });
   assert.equal(reconciled.frameCount, 1, 'the admitted destination is counted by its own request, not by the click');
   assert.equal(reconciled.shadowRootCount, 0, 'the admitted destination cannot inflate shadow-root totals');
+  assert.equal(reconciled.closedShadowRootCount, 2, 'the admitted destination cannot inflate closed-root totals');
   assert.equal(reconciled.baseHrefPresent, true, 'the click-only destination still contributes its base href');
   assert.deepEqual(
     reconcileClickDestinationContext({ observations, inspectedKeys: new Set() }),
-    { frameCount: 3, shadowRootCount: 1, baseHrefPresent: true },
+    { frameCount: 3, shadowRootCount: 1, closedShadowRootCount: 5, baseHrefPresent: true },
     'every observation counts when no request inspected the destination',
   );
   assert.deepEqual(
     reconcileClickDestinationContext({ observations, inspectedKeys: new Set(observations.keys()) }),
-    { frameCount: 0, shadowRootCount: 0, baseHrefPresent: false },
+    { frameCount: 0, shadowRootCount: 0, closedShadowRootCount: 0, baseHrefPresent: false },
     'a fully inspected destination set leaves nothing to add',
   );
 });
@@ -1482,6 +1743,76 @@ test('popup coverage counts each popup once and keeps window-opening popups unex
     resolveUnexaminedPopupTargets(tracked, new Set(['popup-a'])),
     0,
     'an inline click examines the matched popup',
+  );
+});
+
+test('interaction-revealed links are captured per click and context counters refresh after interactions', () => {
+  const source = readFileSync(fileURLToPath(new URL('./browserCommunityFallback.ts', import.meta.url)), 'utf8');
+  assert.match(
+    source,
+    /click: async control => \{[\s\S]*?const clickOutcome = await attemptRenderedControlClick[\s\S]*?await captureRevealedSameOrigin\(true\);[\s\S]*?return clickOutcome\.ok;/,
+    'new same-origin destinations are captured after every click, before the next click can replace them',
+  );
+  assert.match(
+    source,
+    /await captureRevealedSameOrigin\(false\);\s*if \(revealedScanFailed\)/,
+    'the post-loop pass captures scroll-revealed links and reports a failed scan as a gap',
+  );
+  assert.match(source, /const linkBaselines = new Map<string, RenderedLinkBaseline>\(\)/);
+  assert.match(source, /baselineKey = documentBaselineKey\(identity, currentUrl\)/, 'link comparisons are scoped to the current document identity');
+  assert.match(source, /if \(!baseline\) \{[\s\S]*?linkBaselines\.set\(baselineKey, buildRenderedLinkBaseline\(revealedCollection\)\);[\s\S]*?return;/, 'a clicked-to document establishes its own static baseline');
+  assert.match(source, /for \(let i = 0; i < limits\.maxScrollsPerPage[\s\S]*?await captureBaseline\(\);/, 'the baseline is captured after the scroll loop');
+  assert.match(source, /await recordPageContext\(\);\s*await recordDeclarativeShadowScan\(\);/, 'context counters refresh after the click loop');
+  assert.match(source, /await recordPageContext\(\);/, 'context counters also refresh after scrolling');
+  assert.match(
+    source,
+    /declarativeScan\.closedRoots\) \|\| 0\) - lastDeclarativeClosedRoots/,
+    'declarative-root re-reads add only the delta, never double count',
+  );
+  assert.match(source, /pageClosedShadowRootCount = Math\.max\(/, 'live context counters are maxed per document');
+  assert.match(source, /recordClickDestinationContext\(page\.url\(\), \{/, 'a click-navigated document keeps its context by destination');
+  assert.match(
+    source,
+    /recordClickDestinationContext\(page\.url\(\), \{[\s\S]{0,200}?closedShadowRootCount: pageContext\.closedShadowRootCount/,
+    'a click-navigated document keeps its closed-shadow-root count, not just frames and open roots',
+  );
+  assert.match(
+    source,
+    /closedShadowRootCount: closedShadowRootCount \+ clickDestinationContext\.closedShadowRootCount/,
+    'click-only closed roots are added to the crawl totals at publish time',
+  );
+  assert.doesNotMatch(
+    source,
+    /isSameSeedDocument\(pageDocumentIdentity, currentIdentity, pageDocumentUrl, currentUrl\)/,
+    'a click-navigated document is recorded instead of being dropped by the original-document guard',
+  );
+  assert.match(
+    source,
+    /const clickOutcome = await attemptRenderedControlClick[\s\S]{0,1200}?\n\s+queuePageContextProbe\(\);/,
+    'each click queues a context sample before the next click can replace the document',
+  );
+  assert.match(source, /retain\(popupUrl, openerUrl\)/, 'a direct Discord popup URL is retained as terminal evidence');
+  assert.match(
+    source,
+    /classifyRenderedPopupDestination\(popupUrl, openerUrl\)/,
+    'popup origin is resolved against the opener URL captured when the popup was observed',
+  );
+  assert.match(
+    source,
+    /isDiscordDestinationUrl\(popupUrl\) && extractDiscordCandidates\(popupUrl\)\.length > 0/,
+    'only URLs with an extractable Discord invite are terminal evidence',
+  );
+  assert.match(
+    source,
+    /genericDiscordPopup = kind !== 'discord' && isDiscordDestinationUrl\(popupUrl\)/,
+    'a generic Discord-host popup is inspected before being counted as unexamined',
+  );
+  assert.match(source, /shouldSkipPreexistingSiblingPage\(existingUrl, probe\)/, 'blank siblings are classified before being skipped');
+  assert.match(source, /popupContent = await popup\.content\(\)/, 'document.write content in a blank popup is inspected before closing');
+  assert.match(
+    source,
+    /kind === 'uninspectable' \|\| kind === 'same-origin' \|\| genericDiscordPopup/,
+    'an allowed same-origin popup snapshot is retained before close so opener-written content is not lost',
   );
 });
 
