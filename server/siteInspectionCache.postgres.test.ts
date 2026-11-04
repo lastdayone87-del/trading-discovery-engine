@@ -52,6 +52,38 @@ maybe('site inspections upsert, read back, and converge across writers', async t
   assert.equal(await getSiteInspections([]).then(rows => rows.length), 0, 'empty input reads nothing');
 });
 
+maybe('concurrent writers converge without losing observations or pending claims', async t => {
+  const { getDb } = await import('./dbCore');
+  const db = await getDb();
+  const CONCURRENT_SITE = 'apex-concurrent-writers.example';
+  const channels = Array.from({ length: 5 }, (_, index) => `UCconcurrentwriter${String(index).padStart(6, '0')}`);
+  const cleanup = async () => {
+    await db.query(`DELETE FROM site_inspections WHERE site_identity=$1`, [CONCURRENT_SITE]);
+  };
+  await cleanup();
+  t.after(cleanup);
+  // Five independent crawler workers upsert the same site concurrently. Each
+  // statement is a single ON CONFLICT ... observed_count+1 update, so no
+  // observation or channel claim may be lost to a read-modify-write race.
+  await Promise.all(channels.map((channelId, index) => upsertSiteInspection({
+    siteIdentity: CONCURRENT_SITE, identityTier: 'A', identityBasis: 'test',
+    canonicalUrl: `https://${CONCURRENT_SITE}/`, outcome: 'FOUND', retryable: false,
+    candidates: [{ candidateId: `worker-${index}`, nativeInviteCode: `room${index}`, sourceSurface: 'CREATOR_WEBSITES' }],
+    observations: [{ outcome: 'FOUND', worker: index }],
+    renderedCovered: false, sourceChannelId: channelId, claimStatus: 'PENDING', provenance: {},
+  })));
+  const [row] = await getSiteInspections([CONCURRENT_SITE]);
+  assert.equal(row.observedCount, channels.length, 'every concurrent observation is counted');
+  assert.deepEqual(Object.keys(row.pendingClaims || {}).sort(), [...channels].sort(), 'every writer claim survives');
+  for (let index = 0; index < channels.length; index++) {
+    assert.deepEqual(
+      (row.pendingClaims?.[channels[index]] || []).map(candidate => candidate.candidateId),
+      [`worker-${index}`],
+      `worker ${index} retains exactly its own unclaimed candidate`,
+    );
+  }
+});
+
 maybe('cross-writer pending claims keep each channel unclaimed invite recoverable', async t => {
   const { getDb } = await import('./dbCore');
   const db = await getDb();

@@ -14,8 +14,11 @@ be inspected because it points at another host. Static navigation already uses
 ## Behavior
 
 `BrowserFallbackBudget.crossOriginEnqueue` is an opt-in boolean. When absent or
-false, the rendered crawl is byte-for-byte the previous behavior: one
-`same-hostname` enqueue pass before interactions and one after.
+false, no cross-origin page is enqueued: the rendered crawl keeps its two
+`same-hostname` passes. The collector still classifies discovered cross-origin
+anchors so an eligible community destination that pursuit did not follow is a
+visible policy exclusion (`cross-origin-disallowed`), not a silent absence;
+unrelated and admission-rejected links only update diagnostic counters.
 
 When enabled, a second `enqueueLinks` pass admits a candidate only if all of
 the following hold:
@@ -27,9 +30,11 @@ the following hold:
 3. The crawl-wide cross-origin cap
    (`MAX_RENDERED_CROSS_ORIGIN_ENQUEUES = 3`) has room. A skip is counted as
    `destination-budget`.
-4. `shouldEnqueueRenderedCrossOriginLink` returns true: the shared
-   `shouldFollowDestination` policy must admit the target. Admission-rejected
-   and weak/generic destinations are counted as `cross-origin-disallowed`.
+4. The shared `shouldFollowDestination` policy admits the target
+   (`shouldEnqueueRenderedCrossOriginLink`). Unrelated and weak/generic
+   destinations are counted as `hint-rejected`, admission/security rejections
+   as `admission-rejected`, and only an eligible community destination left
+   unvisited by the cap counts as `cross-origin-disallowed`.
 5. It is not a native Discord invite URL (`discord.gg/code`,
    `discord.com|discordapp.com|discord.app/invite/code`). Those are terminal
    candidates already extracted from the page, so enqueueing them would spend
@@ -40,14 +45,19 @@ the following hold:
 
 The pass captures cross-origin anchors before interactions, so a click that
 replaces the document cannot hide them, but submits only after the post-click
-same-host pass. Each candidate keeps the page URL where it was observed, so a
-click that navigates elsewhere cannot retroactively make the pre-click
-snapshot's cross-origin links look same-origin. The merged pre/post-click
-snapshots are deduplicated by normalized visit URL before accounting (all
-labels sharing a normalized URL are evaluated together, so a weak first anchor
-cannot hide a later community label), so an anchor present in both states is
-never counted twice in drop telemetry. Optional destinations therefore never take queue positions ahead of
-JS-revealed required same-host links.
+same-host pass. Before the click loop, the same cap plan reserves the
+destinations that would be admitted; the click plan treats reserved URLs as
+enqueue-owned while leaving inspectable eligible hubs beyond the cap clickable.
+Because no queue slot is committed until after interactions, optional
+destinations never take queue positions ahead of JS-revealed required same-host
+links. Each
+candidate keeps the page URL where it was observed, so a click that navigates
+elsewhere cannot retroactively make the pre-click snapshot's cross-origin links
+look same-origin. The merged pre/post-click snapshots are deduplicated by
+normalized visit URL before accounting (all labels sharing a normalized URL are
+evaluated together, so a weak first anchor cannot hide a later community
+label), so an anchor present in both states is never counted twice in drop
+telemetry.
 
 Admitted third-party pages are tagged (`userData.crossOrigin = true`) and skip
 their own same-host hint passes when their handler runs. Their bounded
@@ -66,8 +76,11 @@ uncapped set of its own hint links and consume `maxPages`.
   the cap either.
 - A clean required-covered negative is explicitly non-retryable only when the
   run actually admitted cross-origin work (`crossOriginEnqueued > 0`). With
-  P1.6 off, the previous `rendered.retryable || !renderedProcessed` fallback
-  and the 30-day cache behavior are unchanged.
+  P1.6 off, an eligible cross-origin destination is still recorded as
+  `cross-origin-disallowed` so the run is a visible policy-excluded partial
+  rather than a clean absence; no cross-origin request or retry is created.
+  Unrelated and admission-rejected links do not change the outcome. Partial
+  rows keep the existing site-evidence TTL.
 - Cross-origin destinations are optional evidence. They never become seed
   `required` obligations, which remain same-host community-hint links only.
 - The browser route guard and loopback egress proxy still enforce public
@@ -85,26 +98,13 @@ requires:
 2. a canary with measured cross-origin yield, page-budget consumption, and
    failure/retry attribution;
 3. a product decision that link-hub/community destinations are in scope for
-   rendered acquisition;
-4. click-plan ownership: an admitted destination must not also be clicked
-   (see “Known pre-enablement blocker” below).
+   rendered acquisition.
 
-Until those approvals exist, only tests may enable the option.
-
-## Known pre-enablement blocker: click-plan ownership
-
-`partitionRenderedClickTargets` still treats a cross-origin anchor as
-click-only unless its href is same-origin. When the option is enabled, an
-admitted cross-origin destination is enqueued and should be enqueue-owned, but
-the click plan can also click it. A click that navigates the seed away marks
-the remaining seed controls skipped and can make coverage incomplete.
-
-This must be fixed before enablement: thread the crawl-wide
-`crossOriginQueued` set, including destinations revealed after a click, into
-initial and post-click click planning so an admitted destination is never both
-enqueued and clicked. It is not changed here because the option is default OFF
-and the fix changes interaction ordering; it is part of the enablement gate and
-requires the canary/browser validation below.
+Until those approvals exist, only tests may enable the option. Click-plan
+ownership is already enforced: the pre-click reservation and the live
+`crossOriginQueued` set are threaded into initial and post-click click planning,
+so an admitted destination is never both enqueued and clicked, while inspectable
+over-cap hubs remain clickable.
 
 ## Validation
 
@@ -112,9 +112,10 @@ requires the canary/browser validation below.
   community evidence, weak-label rejection, native-invite-only Discord
   exclusion, redirect/directory Discord admission, per-snapshot origin
   retention, merged-snapshot deduplication, admission-rejected targets,
-  malformed URLs, the cap constant, and the default-OFF budget.
+  malformed URLs, the cap constant, pre-click reservation, deferred
+  submission, and the default-OFF budget.
 - `npx tsc --noEmit`: pass.
-- Targeted rendered/fallback suite: 67/67 pass.
+- Targeted rendered/fallback suites: pass.
 
 ## Rollout
 

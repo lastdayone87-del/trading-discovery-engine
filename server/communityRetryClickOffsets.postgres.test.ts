@@ -14,6 +14,51 @@ import type { CommunityRetryDirective } from './communityRetryPolicy';
 const enabled = Boolean(process.env.DATABASE_URL);
 const maybe = enabled ? test : test.skip;
 
+maybe('concurrent retry writers merge disjoint and overlapping click offsets monotonically', async t => {
+  const db = await getDb();
+  const channelId = 'UCclickoffsetsconcurrent0001';
+  const key = communityAcquisitionRetryKey(channelId);
+  const cleanup = async () => {
+    await db.query(`DELETE FROM jobs WHERE idempotency_key=$1`, [key]);
+  };
+  await cleanup();
+  t.after(cleanup);
+
+  await enqueueJob(
+    'RETRY_COMMUNITY_ACQUISITION',
+    { channelId, clickOffsets: { 'https://seed-a.test/': 2 } },
+    { idempotencyKey: key, maxAttempts: 5 },
+  );
+
+  const directive = (offsets: Record<string, number>, reason: string): CommunityRetryDirective => ({
+    attemptFree: false,
+    code: 'COMMUNITY_ACQUISITION_REQUIRED',
+    reason,
+    retryReason: 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE',
+    clickOffsets: offsets,
+  });
+  // Two workers write the same durable row without an application-level
+  // lock. The SQL merge must keep the greater offset for every seed even when
+  // the updates interleave, and must not lose either writer's new seeds.
+  await Promise.all([
+    enqueueCommunityAcquisitionRetry(channelId, directive({
+      'https://seed-a.test/': 5,
+      'https://seed-b.test/': 1,
+    }, 'worker one'), 'INSPECTION'),
+    enqueueCommunityAcquisitionRetry(channelId, directive({
+      'https://seed-a.test/': 3,
+      'https://seed-c.test/': 4,
+    }, 'worker two'), 'RECOVERY'),
+  ]);
+
+  const row = await db.query(`SELECT payload FROM jobs WHERE idempotency_key=$1`, [key]);
+  assert.deepEqual(row.rows[0].payload.clickOffsets, {
+    'https://seed-a.test/': 5,
+    'https://seed-b.test/': 1,
+    'https://seed-c.test/': 4,
+  });
+});
+
 maybe('partial retries and fresh scans merge per-seed click progress monotonically', async t => {
   const db = await getDb();
   const channelId = 'UCclickoffsetsmerge00000000001';

@@ -1069,7 +1069,7 @@ export function renderedAcquisitionOutcome(rendered:BrowserFallbackResult,render
   const optionalCrossOriginWork = (rendered.crossOriginEnqueued || 0) > 0;
   const cleanRetryableOverride = optionalCrossOriginWork ? { gapRetryable: false } : {};
   if (requiredCovered && !interactionGap && !coverageGap) return {outcome:'INSPECTED_NO_MATCH',...cleanRetryableOverride};
-  if(rendered.complete&&renderedProcessed&&!interactionGap&&!coverageGap)return{outcome:'INSPECTED_NO_MATCH',...cleanRetryableOverride};
+  if(rendered.complete&&renderedProcessed&&!interactionGap&&!coverageGap&&!gap)return{outcome:'INSPECTED_NO_MATCH',...cleanRetryableOverride};
   if (hasUnvisited) return{outcome:'PARTIALLY_INSPECTED',failureClass:'REQUIRED_UNVISITED_BUDGET_GAP',gapRetryable:true};
   // An unexamined control outranks a permanent-only required failure: the
   // blocked link cannot own retry work, but content hidden behind a failed or

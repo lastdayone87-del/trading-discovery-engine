@@ -72,9 +72,18 @@ none contains a URL, selector, element text, or payload.
 | `controlsStructuralDisclosure` | Structural controls included in the click set because they can reveal content in place (a collapsed disclosure or a menu trigger that does not navigate). An already-open `<details>` summary is excluded: its content is already in the DOM and clicking would close it. |
 | `controlsStructuralUnrecovered` | Structural navigable anchors that are outside the click set and that the enqueue path will not follow: explicit menu-semantic or hint-recovered anchors, same-origin, admissible, not already visited, rejected by the community-hint filter. Ordinary “Learn more”/“Resources”/“Support” page links are not counted. If the enqueue path does not follow one, its destination was not examined; this forces `POLICY_EXCLUDED` (unless a stronger reason applies). The href sample is bounded at 64: when candidates remain beyond it, the count records at least one unrecovered destination fail-closed without proving each candidate's classification, so treat it as a lower bound in that case. |
 | `controlsIconLabelRecovered` | Controls recovered by a label the original filter ignored: `title`, `aria-labelledby`, child `alt`, `data-label`, `data-tooltip`, SVG `<title>`, or capped hidden text. These are included in the click set. |
-| `popupTargets` | Popup/dialog controls that remain unexamined by the click loop and require capture rather than navigation: any non-false `aria-haspopup` value and `target="_blank"` controls without an HTTP(S) href. A `_blank` anchor with a followable HTTP(S) href is reachable by navigation and is not counted; a popup the click loop successfully examined is subtracted. Presence only; no popup capture. |
+| `popupTargets` | Popup/dialog controls that remain unexamined by the click loop and require capture rather than navigation: any non-false `aria-haspopup` value and `target="_blank"` controls without an HTTP(S) href. A `_blank` anchor with a followable HTTP(S) href is reachable by navigation and is not counted; a popup the click loop successfully examined is subtracted. Popup pages are captured through the browser context (including COOP-severed popups) and drained within the existing page budget. |
+| `popupCaptured` | Popup destinations retained as terminal evidence or admitted for bounded inspection. |
+| `popupDestinationsDropped` | Popup destinations that could not be inspected (blank, non-HTTP, over the per-page popup bound, or budget-stopped). |
+| `revealedSameOriginAdmitted` | Interaction-revealed same-origin destinations admitted for bounded inspection. |
+| `revealedSameOriginDropped` | Interaction-revealed same-origin destinations left unvisited by the page budget, a failed scan, or a saturated baseline. |
+| `opaqueInteractiveControls` | Button/role controls with no text, accessible label, href, or structural semantics, and with a rendered box. Their click handler could reveal an invite, so they are reported as unexamined context instead of a clean absence. |
 | `frameCount` | `iframe`/`frame`/`object`/`embed` elements observed on processed pages (bounded live-collection scan). |
-| `shadowRootCount` | Open shadow roots observed on processed pages. Presence only; no traversal. |
+| `shadowRootCount` | Open shadow roots observed on processed pages. Their text and anchor hrefs are traversed by a bounded walker for invite discovery and Playwright selectors already click through them. |
+| `closedShadowRootCount` | Closed roots detected by the bounded `attachShadow` probe. Never traversed. |
+| `declarativeClosedShadowRootCount` | Parser-attached closed roots found by scanning the raw main-document response. The parser removes the `<template shadowrootmode="closed">` node, so the live DOM cannot report these roots. |
+| `declarativeShadowScanGap` | Main-document responses whose raw body was unavailable, above the bounded scan size, or not scanned in time. A non-zero value keeps coverage partial. |
+| `candidateCapTruncated` | Largest single-collection overflow beyond the 500-item per-collector bound (sampled up to 500). Cross-origin overflow is counted only for destinations the community/destination policy would pursue (plus direct Discord invites). Same-origin overflow is raw collector overflow: it is counted before admission and before visited/duplicate filtering, and only when the baseline is not saturated. A full overflow sample with anchors remaining that could not be classified also counts here, so coverage cannot resolve as a clean absence. The collector still stops at the existing bound; overflow is counted so it cannot be a silent loss. |
 | `baseHrefPresent` | A document `<base href>` was observed. |
 | `scrollCapReachedStillGrowing` | The last permitted scroll iteration still found a growing document. |
 | `navigationPolicyExcluded` | Counts by `invalid-protocol`, `admission-rejected`, `cross-origin-disallowed`, `destination-budget`, `control-slice`, `hint-rejected`. |
@@ -98,12 +107,15 @@ Existing fields keep their meanings:
 
 1. `UNKNOWN` when no page was processed.
 2. `BOUNDED` when a named ceiling, interaction gap, scroll-cap-still-growing,
-   or unresolved terminal request failure was observed. A failed child request
-   can hide a destination, so it is never reported as `COMPLETE`. Icon-label
-   recoveries and structural disclosures are clicked, so they no longer imply
-   an unexamined destination on their own.
-3. `CONTEXT_UNREACHABLE` when frames, open shadow roots, or unexamined popup
-   targets were observed. Popups the click loop successfully examined are not
+   unresolved terminal request failure, declarative-shadow scan gap, required
+   outstanding work, dropped popup/revealed-link destinations, or
+   candidate-collector overflow was observed. A failed child request can hide a
+   destination, so it is never reported as `COMPLETE`. Icon-label recoveries
+   and structural disclosures are clicked, so they no longer imply an
+   unexamined destination on their own.
+3. `CONTEXT_UNREACHABLE` when frames, open or closed shadow roots (including
+   declarative closed roots), unexamined popup targets, or opaque interactive
+   controls were observed. Popups the click loop successfully examined are not
    context gaps.
 4. `POLICY_EXCLUDED` when `cross-origin-disallowed` or `destination-budget`
    exclusions occurred, or when `structuralUnrecovered` recorded an unfollowed
@@ -226,25 +238,81 @@ A non-`COMPLETE` coverage reason is never a clean absence:
   an obligation instead of disappearing with that attempt's document.
 - `collectRenderedPageContext` uses a bounded `TreeWalker` (2,000 elements,
   100 shadow roots) and a bounded frame scan over live `getElementsByTagName`
-  collections (1,000). It never traverses frames or shadow roots. Context
-  counters are refreshed after scrolling and after each click so transient
-  interaction-revealed frames/shadows are counted. The baseline identity and
-  counts are captured together in one evaluation before any counter sample, so
-  a URL update during a probe is not mistaken for a replacement; a sample
-  counts when either the document identity or the URL still matches this page.
-  A same-document path/query update and a same-URL reload are both recorded,
-  while a real navigation to another URL is left to its own request. A
-  per-click probe is queued without awaiting it, so telemetry never delays the
-  next click; pending probes are flushed at page end under a 250 ms cap that
-  never exceeds the remaining crawl budget, and unfinished samples are
-  dropped. A retry that throws before its first enumeration keeps the earlier
-  control observation and merges context counts per field rather than
-  replacing them with zeros. If a page cannot be measured because no
-  trustworthy document identity was available, the internal resolver input
-  `contextUnknown` forces `coverageReason: BOUNDED`, never `COMPLETE`. It is
-  not persisted as a separate field, so consumers see the reason rather than
-  the cause. Counters are aggregated on the page
-  error path so an enumerated page is never published as zero.
+  collections (1,000). It never traverses frames or shadow roots; a closed
+  root is counted by a bounded `attachShadow` probe instead. Context counters
+  are refreshed after scrolling and after each click so transient
+  interaction-revealed frames/shadows/closed roots are counted. The baseline
+  identity and counts are captured together in one evaluation before any
+  counter sample, so a URL update during a probe is not mistaken for a
+  replacement; a sample counts when either the document identity or the URL
+  still matches this page. A same-document path/query update and a same-URL
+  reload are both recorded, while a real navigation to another URL is left to
+  its own request. A per-click probe is queued without awaiting it, so
+  telemetry never delays the next click; pending probes are flushed at page
+  end under a 250 ms cap that never exceeds the remaining crawl budget, and
+  unfinished samples are dropped. A retry that throws before its first
+  enumeration keeps the earlier control observation and merges context counts
+  per field rather than replacing them with zeros. If a page cannot be
+  measured because no trustworthy document identity was available, the
+  internal resolver input `contextUnknown` forces `coverageReason: BOUNDED`,
+  never `COMPLETE`. It is not persisted as a separate field, so consumers see
+  the reason rather than the cause. Counters are aggregated on the page error
+  path so an enumerated page is never published as zero.
+- Counts are maxed per request/field while a retry is pending and summed
+  across processed pages. A click-reached destination that is never inspected
+  as its own request contributes its frames/shadows/closed roots at publish
+  time; a destination its own request did inspect is reconciled against that
+  request so it cannot be counted twice.
+- Open shadow traversal is a separate bounded walker (`64` roots, `4,000`
+  nodes, `200,000` characters, `256` hrefs, depth `4`). It reads only same-
+  document text and anchor attributes; it never fetches, clicks, or crosses
+  into a frame. Closed roots remain inaccessible and are counted instead.
+- Declarative closed roots are detected by a raw main-document response scan
+  capped at `8 MiB` per body and `1,000` roots. Bodies with a declared length
+  above the cap are skipped; chunked or compressed bodies are read and checked
+  against the decoded-size cap. An unreadable or over-cap body is a
+  `declarativeShadowScanGap` (`BOUNDED`), never an assumed clean document. The
+  scan is re-read after interactions and only deltas are added.
+- Popups opened by a click are drained per click. A blank sibling is probed for
+  an opener or `document.write` content before being skipped as browser-pool
+  idle state; a direct Discord popup URL is retained as terminal evidence and
+  excluded from the cross-origin policy counter. Uninspectable popups remain a
+  coverage gap.
+- Interaction-revealed same-origin links are captured after each click, keyed
+  by document identity, so a later click cannot erase an earlier panel's
+  destination. A clicked-to document establishes its own static baseline;
+  original-document links are never compared against it.
+- Both navigation collectors retain their existing `500`-candidate bound.
+  Overflow is sampled up to `500` additional candidates and published as
+  `candidateCapTruncated` instead of disappearing; cross-origin overflow is
+  counted only after destination-policy filtering, so unrelated vendor links
+  cannot force `BOUNDED`, while same-origin overflow is raw collector overflow
+  counted before admission. Same-origin overflow is not counted when the
+  baseline is saturated; an interaction on that document instead records one
+  `revealedSameOriginDropped` gap. When the overflow sample itself is filled
+  and anchors remain unclassified, coverage stays partial even if the sample
+  contains only irrelevant links. No navigation limit value changed.
+- The interaction-revealed same-origin baseline is captured after the scroll
+  loop, not before it, so infinite-scroll links are static relative to the
+  inspected page rather than "revealed by interaction". A saturated baseline
+  (collector overflow) admits nothing: static overflow cannot be distinguished
+  from revealed links, and the same-host hint pass still owns hint-bearing
+  destinations. However, when an interaction actually occurred on that
+  document, the ambiguity is recorded once as a `revealedSameOriginDropped`
+  gap, so a menu-revealed generic destination cannot be certified absent; a
+  document with no interaction stays clean. The revealed pass also subtracts
+  already-queued requests from the remaining page budget, and a destination
+  already enqueued by another pass is never clicked again on re-enumeration.
+  The initial cross-origin reservation runs before the click plan is built
+  (while actual submission waits until after interactions), so when a page has
+  more eligible hubs than remaining enqueue slots, the over-cap hubs stay in
+  the click set instead of being treated as enqueue-owned. That
+  click path only applies when the click can inspect in place: a cross-origin
+  `target=_blank` destination opens a popup whose content is policy-dropped, so
+  it stays enqueue-owned and is reported as a `destination-budget` (or
+  `cross-origin-disallowed`) gap instead of being clicked for a discarded
+  request. `aria-haspopup` is not treated as a new context because it can
+  describe an in-page menu/dialog that reveals content without navigating.
 - The published denominator and hint-rejected count come from one coherent
   enumeration snapshot (largest total; first wins ties). Structural and
   icon-label counters are merged observations: a later, smaller snapshot can
@@ -327,9 +395,11 @@ are excluded by the `mode = RENDERED` filter, so they cannot appear as
 - `frameCount` includes advertising/analytics iframes. It is a presence
   counter, not proof that a frame contains navigation or invite evidence.
 - `popupTargets` counts popup/dialog controls that need capture (ARIA
-  haspopup, or a `_blank` control with no href). It does not capture or inspect
-  the popup (P1.3). A normal external link that opens a new tab is still
-  reachable through its href and is not counted.
+  haspopup, or a `_blank` control with no href). Popups are drained per click
+  and bounded per page (see above); successfully resolved controls are
+  subtracted, so only unresolved targets feed `CONTEXT_UNREACHABLE`. A normal
+  external link that opens a new tab is still reachable through its href and is
+  not counted.
 - `shadowRootCount` counts open roots only. Closed roots remain unreachable and
   are a documented limit.
 - `scrollCapReachedStillGrowing` is a post-hoc observation; content that grew
