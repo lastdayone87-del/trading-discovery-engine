@@ -179,6 +179,28 @@ test('demand-signal standalone bootstrap carries a narrow execution-time authori
   assert.equal(evaluateAutonomousQueryAuthority(foreignAtom).eligible, false);
 });
 
+test('the paid-demand kill switch also rejects anchored demand rows', () => {
+  const planned = planDiverseQueries({
+    country: 'Germany',
+    count: 4,
+    learnedVocabulary: [],
+    existingQueries: [],
+    demandSignalCandidates: [{
+      surface: 'Chartanalyse', language: 'de', demandScore: 55, sourceIds: ['trends:1'],
+    }],
+  });
+  const anchored = planned.find(query => query.metadata.queryTemplate === 'ANCHOR_DEMAND_SIGNAL');
+  assert.ok(anchored, 'Germany has anchors, so the demand surface must be anchored');
+  // Anchored demand is a MIXED source by design; the template/atom origin is
+  // the demand marker, not metadata.source.
+  assert.equal(anchored.metadata.source, 'MIXED');
+  const record = alignedStandaloneRecord(3, anchored, 'Germany', 'de');
+  assert.equal(evaluateAutonomousQueryAuthority(record, { demandSignalsEnabled: true }).eligible, true);
+  const disabled = evaluateAutonomousQueryAuthority(record, { demandSignalsEnabled: false });
+  assert.equal(disabled.eligible, false);
+  assert.ok(disabled.reasonCodes.includes('DEMAND_SIGNALS_DISABLED'));
+});
+
 test('free-signal standalone planning excludes ambiguous market/entity surfaces', () => {
   // Nigeria has no curated anchors, so this is the exact anchorless path that
   // could emit a standalone candidate. An exchange surface is modifier-only

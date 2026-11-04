@@ -986,14 +986,23 @@ async function processChannelThroughPipelineInContext(
   // and never write legacy extracted_vocabulary rows.
   // Independent settings: one query and one round trip avoids three serial
   // setting reads on the successful-ingestion path.
-  const extractionSettings = await (await getDb()).query(
-    `SELECT setting_key,setting_value FROM app_settings WHERE setting_key = ANY($1)`,
-    [['country_discovery_loop_enabled', 'native_vocabulary_extraction_enabled', 'native_evidence_promotion_v2_enabled']],
-  );
-  const extractionValues = new Map<string, string>((extractionSettings.rows || []).map(
-    (row: Record<string, unknown>) => [String(row.setting_key), String(row.setting_value)],
-  ));
-  const extractionFlag = (key: string): boolean => (extractionValues.get(key) ?? 'true') === 'true';
+  // A settings-read failure must not fail the channel ingestion after the
+  // channel row was already upserted. Missing or unreadable gates fail closed
+  // to the legacy quality path; migration 161 seeds all three to 'true' for
+  // the normal CDL path.
+  let extractionValues = new Map<string, string>();
+  try {
+    const extractionSettings = await (await getDb()).query(
+      `SELECT setting_key,setting_value FROM app_settings WHERE setting_key = ANY($1)`,
+      [['country_discovery_loop_enabled', 'native_vocabulary_extraction_enabled', 'native_evidence_promotion_v2_enabled']],
+    );
+    extractionValues = new Map<string, string>((extractionSettings.rows || []).map(
+      (row: Record<string, unknown>) => [String(row.setting_key), String(row.setting_value)],
+    ));
+  } catch (error) {
+    console.warn('[Ingestion] CDL extraction settings read failed; falling back to the legacy extraction path:', error);
+  }
+  const extractionFlag = (key: string): boolean => (extractionValues.get(key) ?? 'false') === 'true';
   const cdlEnabled = extractionFlag('country_discovery_loop_enabled');
   const nativeExtractionFlagEnabled = extractionFlag('native_vocabulary_extraction_enabled');
   const promotionV2Enabled = extractionFlag('native_evidence_promotion_v2_enabled');

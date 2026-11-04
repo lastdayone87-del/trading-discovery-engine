@@ -606,6 +606,39 @@ test('A5: the free-signal cap preserves creator-observed terminology', () => {
   assert.ok(!/promotion_eligible\s*=/.test(freeSource), 'free signals never assign promotion eligibility');
 });
 
+test('A5a: blocked free signals do not consume the 30% cap', () => {
+  // Chile has no authorized creator-observed anchor, so these free signals
+  // stand alone and the cap applies to their exact query text. The first two
+  // are already in the library (cooldown); without filtering before the cap,
+  // they would consume both free-signal slots and the later two would never
+  // be planned.
+  const surfaces = ['Análisis Chartista', 'Estrategia Bursátil', 'Análisis Técnico', 'Gestión de Riesgo'];
+  const freeSignals = surfaces.map((surface, index) => ({
+    surface,
+    signalType: 'METHOD' as const,
+    country: 'Chile',
+    language: 'es',
+    provider: 'WIKIPEDIA' as const,
+    sourceIds: [`wikipedia:${index}`],
+  }));
+  const planned = planDiverseQueries({
+    country: 'Chile',
+    count: 6,
+    learnedVocabulary: [],
+    existingQueries: [
+      { query: surfaces[0], intent: 'strategy' },
+      { query: surfaces[1], intent: 'strategy' },
+    ] as any,
+    freeSignalCandidates: freeSignals,
+  });
+  const freeQueries = planned.filter(query => (query.metadata.sourceTypes as string[]).includes('FREE_SIGNAL'));
+  assert.deepEqual(
+    freeQueries.map(query => query.query),
+    [surfaces[2], surfaces[3]],
+    'the cap must be applied after blocked candidates are removed',
+  );
+});
+
 test('A5b: a full portfolio cannot push creator-derived candidates out with free signals', () => {
   const freeSignals = ['Charttechnik', 'Börse Frankfurt', 'DAX Futures', 'Technische Analyse', 'Handelsstrategie', 'Risikomanagement']
     .map((surface, index) => ({
@@ -1334,8 +1367,11 @@ test('P16: a creator seen on pages 1 and 2 is counted once with a cross-page rep
   assert.match(sql, /fs\.first_page <= \$2/);
   assert.match(sql, /fs\.first_page < \$2 AND ps\.channel_id IS NOT NULL/);
   // A fresh but unpersisted (for example country-rejected) candidate is not
-  // productive: only a persisted first sighting can extend the run.
-  assert.match(sql, /BOOL_OR\(s\.persisted AND NOT s\.was_known\) AS was_new/);
+  // productive: only a persisted first sighting can extend the run, and the
+  // first sighting is authoritative (a later was_known=false row cannot
+  // retroactively credit an earlier page).
+  assert.match(sql, /\(array_agg\(s\.persisted AND NOT s\.was_known ORDER BY s\.page_number, s\.id\)\)\[1\] AS first_was_new/);
+  assert.match(sql, /AND fs\.first_was_new\)::int AS marginal_new/);
   const { getAutonomousContinuationState } = await import('./autonomousPageStore');
   await getAutonomousContinuationState('run-1', 3, runner as never);
   const streakCall = runner.calls.find(call => call.text.includes('page_number < $2'));
@@ -1454,6 +1490,24 @@ test('P18: migration 161 allows only continuation metadata to change on a comple
   );
   assert.match(migration, /IF TG_OP = 'DELETE' THEN[\s\S]*?RAISE EXCEPTION 'completed query_runs are immutable'/,
     'deleting a completed run stays forbidden');
+});
+
+test('P18b: indexes on populated tables are built concurrently outside the migration transaction', () => {
+  const migration = migration161();
+  const db = serverSource('dbCore.ts');
+  for (const name of [
+    'idx_term_obs_promotion', 'idx_term_obs_run_page',
+    'idx_external_osint_surface_country', 'idx_autonomous_pages_economics',
+    'idx_query_runs_resume_pending', 'idx_query_runs_country_source',
+    'idx_query_runs_continuation_segment',
+  ]) {
+    assert.ok(!new RegExp(`CREATE INDEX IF NOT EXISTS\\s+${name}\\b`).test(migration),
+      `${name} must not be built inside the transactional migration`);
+    assert.match(db, new RegExp(`CREATE INDEX CONCURRENTLY IF NOT EXISTS\\s+${name}\\b`),
+      `${name} must be built concurrently by ensureCdlHotTableIndexes`);
+  }
+  assert.match(db, /if \(cdlMigration\.rowCount\) await ensureCdlHotTableIndexes\(client\)/,
+    'concurrent builds run after migration 161 commits');
 });
 
 // ---------------------------------------------------------------------------
@@ -1592,7 +1646,7 @@ test('T7: two independent external sources/families validate; a single source or
   const terminology = serverSource('terminologyIntelligence.ts');
   assert.match(terminology, /AND canonical_concept = ANY\(\$2::text\[\]\)/);
   assert.ok(!/lower\(btrim\(regexp_replace\(normalize\(original_surface, NFKC\)/.test(terminology), 'SQL surface matching must not depend on database lower() collation');
-  assert.match(migration161(), /idx_external_osint_surface_country[\s\S]*?\(country, canonical_concept, observed_at DESC\)/);
+  assert.match(serverSource('dbCore.ts'), /idx_external_osint_surface_country ON public\.external_osint_observations\(country, canonical_concept, observed_at DESC\)/);
 });
 
 test('T7a: a second family confined to syndicated copies cannot satisfy family diversity', () => {
@@ -2038,6 +2092,21 @@ test('E2: an active country-valid low-quality trader runs extraction without pro
   assert.equal(eligibility.termHarvestEnabled, false);
 });
 
+test('E2b: an explicit undefined policy field cannot disable the AI budget caps', () => {
+  const decision = evaluateNativeVocabularyAiBudget({
+    requestId: 'req-undefined-policy',
+    snapshot: { globalCalls: 200, countryCalls: 0, actualCostMicrounits: 0, outstandingReservationMicrounits: 0 },
+    policy: {
+      dailyCalls: undefined as unknown as number,
+      countryDailyCalls: undefined as unknown as number,
+      dailyCostMicrounits: undefined as unknown as number,
+      reservationMicrounits: undefined as unknown as number,
+    },
+  });
+  assert.equal(decision.admit, false);
+  assert.match(decision.reason, /GLOBAL_CALL_CAP:200>=200/);
+});
+
 test('E3: the 201st AI call is budget-skipped while rule evidence persists', () => {
   const decision = evaluateNativeVocabularyAiBudget({
     requestId: 'req-201',
@@ -2206,9 +2275,25 @@ test('Q5: InnerTube pages cost 0 YouTube units, official pages 100, and Brave us
     safetyMaxPages: 50, providerMaxPages: 10, pageCostUnits: 0,
     remainingAutonomousQuota: 0, pendingCountries: 16,
   });
-  assert.equal(innerTube.quotaPages, 50);
+  // Zero page cost makes the quota bound unbounded: it must never tie (and
+  // therefore mislabel) the safety ceiling or suppress a linked segment.
+  assert.equal(innerTube.quotaPages, Number.MAX_SAFE_INTEGER);
   assert.equal(innerTube.effectiveMaxPages, 10);
   assert.equal(innerTube.bindingBound, 'PROVIDER');
+
+  const providerTie = computeEffectivePageBudget({
+    safetyMaxPages: 10, providerMaxPages: 10, pageCostUnits: 100,
+    remainingAutonomousQuota: 10_000, pendingCountries: 1,
+  });
+  assert.equal(providerTie.effectiveMaxPages, 10);
+  assert.equal(providerTie.bindingBound, 'PROVIDER', 'a provider tie must not be labelled SAFETY');
+
+  const zeroCostSafety = computeEffectivePageBudget({
+    safetyMaxPages: 10, providerMaxPages: 50, pageCostUnits: 0,
+    remainingAutonomousQuota: 0, pendingCountries: 1,
+  });
+  assert.equal(zeroCostSafety.effectiveMaxPages, 10);
+  assert.equal(zeroCostSafety.bindingBound, 'SAFETY', 'the zero-cost quota bound never binds');
 
   const official = computeEffectivePageBudget({
     safetyMaxPages: 50, providerMaxPages: 10, pageCostUnits: 100,
@@ -2264,6 +2349,8 @@ test('O1: migration 161 activates core paths, keeps paid demand off, and preserv
   assert.ok(!/UPDATE\s+app_settings[\s\S]{0,200}autonomous_pagination_max_pages/i.test(migration),
     'migration 161 must not rewrite an existing autonomous_pagination_max_pages value');
   assert.match(migration, /ON CONFLICT\(setting_key\) DO NOTHING/);
+  assert.ok(!/autonomous_pagination_min_run_pages/.test(migration),
+    'the removed min-run-pages knob must not be seeded as a dead operator setting');
   assert.ok(!/^\s*\('youtube_key_daily_cap_enforced'/m.test(migration));
   assert.ok(!/setting_key\s*=\s*'youtube_key_daily_cap_enforced'/m.test(migration));
   assert.ok(!/^\s*\('discovery_extraction_enabled'/m.test(migration));
@@ -2938,6 +3025,10 @@ test('R8: the three extraction flags are read in one settings query', () => {
     /'country_discovery_loop_enabled', 'native_vocabulary_extraction_enabled', 'native_evidence_promotion_v2_enabled'/,
   );
   assert.ok(!/getAppSetting\('country_discovery_loop_enabled', 'true'\)\.then/.test(ingestion));
+  // A settings-read failure degrades to the legacy path, and a missing gate
+  // fails closed rather than enabling native extraction implicitly.
+  assert.match(ingestion, /catch \(error\)[\s\S]*legacy extraction path/);
+  assert.match(ingestion, /get\(key\) \?\? 'false'/);
 });
 
 test('R9: Arabic exchange surfaces classify as EXCHANGE', () => {
@@ -2947,6 +3038,18 @@ test('R9: Arabic exchange surfaces classify as EXCHANGE', () => {
   );
   assert.equal(signals[0]?.surface, 'بورصة');
   assert.equal(signals[0]?.signalType, 'EXCHANGE');
+
+  // Keyword classification is anchored at a word start, not a substring:
+  // inflection/plural suffixes still match, but unrelated words do not.
+  const classify = (title: string) => parseWikipediaSearchSignals(
+    { query: { search: [{ title, pageid: 1 }] } },
+    { country: 'Germany', language: 'en' },
+  )[0]?.signalType;
+  assert.equal(classify('Delivery Hero'), 'ENTITY');
+  assert.equal(classify('Reaction'), 'ENTITY');
+  assert.equal(classify('Information'), 'ENTITY');
+  assert.equal(classify('Live Trading'), 'FORMAT');
+  assert.equal(classify('Frankfurt Stock Exchanges'), 'EXCHANGE');
 });
 
 test('R10: external eligibility defaults closed and PROVEN cannot skip trial evidence', () => {

@@ -429,9 +429,13 @@ export function computeEffectivePageBudget(input: EffectivePageBudgetInput): Eff
   const runQuotaBudgetUnits = pageCost > 0
     ? Math.min(remaining, Math.max(pageCost, Math.floor(remaining / pendingCountries)))
     : remaining;
+  // A zero-cost provider consumes no fair-share quota, so its quota bound is
+  // unbounded. Using the safety ceiling here made RUN_BUDGET tie SAFETY and
+  // win the tie-break, labelling a safety stop as budget exhaustion and
+  // suppressing the linked continuation segment.
   const quotaPages = pageCost > 0
     ? Math.floor(runQuotaBudgetUnits / pageCost)
-    : safety;
+    : Number.MAX_SAFE_INTEGER;
 
   const bounds: Array<{ bound: EffectivePageBudget['bindingBound']; pages: number }> = [
     { bound: 'SAFETY', pages: safety },
@@ -446,15 +450,19 @@ export function computeEffectivePageBudget(input: EffectivePageBudgetInput): Eff
   }
   let effective = bounds[0];
   for (const candidate of bounds.slice(1)) {
-    // Treatment/trial caps win ties. A quota budget tying the safety ceiling
-    // must also win: leaving bindingBound as SAFETY would let page 50 create a
-    // linked segment with a fresh run quota instead of exhausting the current
-    // fair-share allocation.
+    // Treatment/trial caps win ties. A provider cap tying the safety ceiling
+    // must also win: labelling that stop as SAFETY would enqueue a linked
+    // continuation segment that immediately hits the same provider cap. A
+    // quota budget tying the safety ceiling must win too: leaving
+    // bindingBound as SAFETY would let the final page create a linked segment
+    // with a fresh run quota instead of exhausting the current fair-share
+    // allocation.
     if (
       candidate.pages < effective.pages
       || (candidate.pages === effective.pages && (
         candidate.bound === 'TREATMENT'
         || candidate.bound === 'TRIAL'
+        || (candidate.bound === 'PROVIDER' && effective.bound === 'SAFETY')
         || (candidate.bound === 'RUN_BUDGET' && effective.bound === 'SAFETY')
       ))
     ) {

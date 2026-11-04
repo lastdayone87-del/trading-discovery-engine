@@ -465,7 +465,11 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       lastReport = {
         country: 'MULTI', query: 'NONE', strategy: 'QUOTA_OR_QUEUE_GUARD', discoveredCount: 0,
         uniqueCount: 0, qualityCreatorsCount: 0, performanceScore: 0, newCollection: 'NONE',
-        queuedCount: resumedPages, queueDepth,
+        // queuedCount is always the number of fresh governed queries scheduled
+        // this cycle (0 here); resumed pages are reflected in queueDepth and
+        // the summary, never mixed into a count whose queries[] lists fresh
+        // query text only.
+        queuedCount: 0, queueDepth,
         remainingAutonomousQuota: Math.max(0, Math.floor(config.dailyQuotaBudget * config.autonomousQuotaPercent / 100) - snapshot.autonomousUnitsUsed - snapshot.autonomousUnitsReserved),
         summary: continuationSweepFailed
           ? queueDepthRefreshFailed

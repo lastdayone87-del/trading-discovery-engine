@@ -1,4 +1,4 @@
-import test from 'node:test'; import assert from 'node:assert/strict'; import { readFileSync } from 'node:fs'; import { dirname, join } from 'node:path'; import { fileURLToPath } from 'node:url'; import { aggregatePageMetrics } from './autonomousPageStore';
+import test from 'node:test'; import assert from 'node:assert/strict'; import { readFileSync } from 'node:fs'; import { dirname, join } from 'node:path'; import { fileURLToPath } from 'node:url'; import { aggregatePageMetrics, getAutonomousRunMetrics } from './autonomousPageStore';
 test('aggregates pages into one final learning measurement without counting review states as quality',()=>{const page=(overrides:any)=>({rawResults:10,distinctResults:8,duplicateResults:2,knownChannels:1,newChannels:7,countryRejected:1,nonTrading:1,uncertain:1,needsReview:1,tradingConfirmed:4,qualityChannels:2,communitiesDiscovered:1,averageQualityScore:60,noveltyRatio:.875,countryPrecision:.875,tradingPrecision:.57,performanceScore:60,...overrides});const total=aggregatePageMetrics([page({}),page({qualityChannels:1,tradingConfirmed:2,needsReview:3})]);assert.equal(total.rawResults,20);assert.equal(total.qualityChannels,3);assert.equal(total.tradingConfirmed,6);assert.equal(total.needsReview,4);});
 test('scope weighting survives page aggregation; legacy pages stay neutral',()=>{
   const scoped=(inScopeNewChannels:number)=>({rawResults:10,distinctResults:8,duplicateResults:2,knownChannels:1,newChannels:7,inScopeNewChannels,countryRejected:1,nonTrading:1,uncertain:1,needsReview:1,tradingConfirmed:4,qualityChannels:2,communitiesDiscovered:1,averageQualityScore:60,noveltyRatio:.875,countryPrecision:.875,tradingPrecision:.57,performanceScore:60});
@@ -80,16 +80,37 @@ test('run-wide metrics keep the rejected count on the same distinct set as the d
   assert.match(source,/countryRejected:\s*rejected,/);
   assert.match(source,/countryPrecision:\s*distinct\s*\?\s*\(distinct\s*-\s*rejected\)\s*\/\s*distinct/);
 });
-test('run-wide sightings recompute duplicate metrics even when the distinct total matches',()=>{
-  const source=readFileSync(join(dirname(fileURLToPath(import.meta.url)),'autonomousPageStore.ts'),'utf8');
-  // Cross-page repeats change duplicateResults even when the run-wide distinct
-  // total happens to equal the per-page sum, so the recompute cannot be
-  // gated on the distinct count changing.
-  assert.match(source,/COUNT\(\*\)::int AS sightings/);
-  assert.match(source,/const sightingCount = Number\(sightings\.rows\[0\]\?\.sightings \|\| 0\)/);
-  assert.match(source,/if \(!sightingCount\) return metrics;/);
-  assert.ok(!source.includes('distinct === metrics.distinctResults'));
-  assert.match(source,/duplicateResults:\s*Math\.max\(0, evaluatedRawResults - distinct\)/);
+test('run-wide sightings recompute duplicate metrics even when the distinct total matches', async () => {
+  const page = (overrides: Record<string, unknown>) => ({
+    rawResults: 10, deferredResults: 0, evaluatedRawResults: 10,
+    distinctResults: 6, duplicateResults: 4, knownChannels: 1, newChannels: 5,
+    countryRejected: 2, nonTrading: 1, uncertain: 1, needsReview: 1,
+    tradingConfirmed: 4, qualityChannels: 2, communitiesDiscovered: 1,
+    averageQualityScore: 60, noveltyRatio: .5, countryPrecision: .5,
+    tradingPrecision: .57, performanceScore: 60, ...overrides,
+  });
+  // Both pages report the same run-cumulative distinct total (6), so the old
+  // distinct-count-changed guard would skip the recompute. Cross-page repeats
+  // still change duplicateResults: evaluated raw = 20, unique = 6.
+  const runner = {
+    query: async (sql: string) => {
+      if (sql.includes('FROM autonomous_query_page_observations')) {
+        return { rows: [
+          { page_metrics: page({}), cumulative_unique_creators: 6 },
+          { page_metrics: page({}), cumulative_unique_creators: 6 },
+        ] };
+      }
+      if (sql.includes('COUNT(*)::int AS sightings')) {
+        return { rows: [{ sightings: 8, distinct_creators: 6, country_rejected: 2 }] };
+      }
+      throw new Error(`unexpected query: ${sql.slice(0, 60)}`);
+    },
+  };
+  const metrics = await getAutonomousRunMetrics('run-1', runner);
+  assert.equal(metrics.distinctResults, 6);
+  assert.equal(metrics.duplicateResults, 14);
+  assert.equal(metrics.countryRejected, 2);
+  assert.equal(metrics.countryPrecision, (6 - 2) / 6);
 });
 test('legacy page metrics keep evaluatedRawResults absent through aggregation',()=>{
   const legacy=(overrides: Record<string, unknown> = {})=>({rawResults:10,distinctResults:8,duplicateResults:2,knownChannels:1,newChannels:7,countryRejected:1,nonTrading:1,uncertain:1,needsReview:1,tradingConfirmed:4,qualityChannels:2,communitiesDiscovered:1,averageQualityScore:60,noveltyRatio:.875,countryPrecision:.875,tradingPrecision:.57,performanceScore:60,...overrides});
@@ -101,5 +122,14 @@ test('legacy page metrics keep evaluatedRawResults absent through aggregation',(
     aggregatePageMetrics([legacy(), legacy({ rawResults: 6, deferredResults: 2, evaluatedRawResults: 4 })]).evaluatedRawResults,
     14,
     'mixed-version runs contribute the raw-minus-deferred fallback for legacy pages',
+  );
+});
+test('legacy page metrics leave freshTradingConfirmed unknown instead of inventing zero',()=>{
+  const legacy=(overrides: Record<string, unknown> = {})=>({rawResults:10,distinctResults:8,duplicateResults:2,knownChannels:1,newChannels:7,countryRejected:1,nonTrading:1,uncertain:1,needsReview:1,tradingConfirmed:4,qualityChannels:2,communitiesDiscovered:1,averageQualityScore:60,noveltyRatio:.875,countryPrecision:.875,tradingPrecision:.57,performanceScore:60,...overrides});
+  assert.equal(aggregatePageMetrics([legacy()]).freshTradingConfirmed, undefined);
+  assert.equal(
+    aggregatePageMetrics([legacy(), legacy({ freshTradingConfirmed: 2 })]).freshTradingConfirmed,
+    2,
+    'a measured page still contributes; legacy pages add no invented zero',
   );
 });

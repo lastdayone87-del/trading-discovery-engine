@@ -137,11 +137,20 @@ function isDemandSignalStandaloneAuthorized(
   return true;
 }
 
+/** True when a stored row carries any paid-demand provenance. Anchored
+ * demand is a MIXED query (local anchor + demand atom), so its source is not
+ * DEMAND_SIGNAL; the template and atom origins are the authoritative markers. */
+function hasDemandSignalMetadata(metadata: Record<string, any>): boolean {
+  const template = String(metadata.queryTemplate || '').toUpperCase();
+  if (template === 'DEMAND_SIGNAL_STANDALONE' || template === 'ANCHOR_DEMAND_SIGNAL') return true;
+  if (String(metadata.source || '').toUpperCase() === 'DEMAND_SIGNAL') return true;
+  const atoms = Array.isArray(metadata.atoms) ? metadata.atoms as Array<Record<string, any>> : [];
+  return atoms.some(atom => String(atom?.origin || '').toUpperCase() === 'DEMAND_SIGNAL');
+}
+
 /** True when a stored row needs the paid-demand execution exception. */
 export function isDemandSignalRecord(query: QueryRecord): boolean {
-  const metadata = metadataOf(query);
-  return String(metadata.queryTemplate || '').toUpperCase() === 'DEMAND_SIGNAL_STANDALONE'
-    || String(metadata.source || '').toUpperCase() === 'DEMAND_SIGNAL';
+  return hasDemandSignalMetadata(metadataOf(query));
 }
 
 function metadataOf(query: QueryRecord): Record<string, any> {
@@ -194,6 +203,15 @@ export function evaluateAutonomousQueryAuthority(
   const specificity = metadata.retrievalSpecificity as Record<string, any> | undefined;
   const atoms = Array.isArray(metadata.atoms) ? metadata.atoms as Array<Record<string, any>> : [];
   const template = String(metadata.queryTemplate || '');
+
+  // The paid-demand setting is a live execution kill switch. Record-level
+  // demand provenance (standalone OR anchored) must be rejected here, not
+  // only in the standalone exception: an authorized primary anchor would
+  // otherwise execute an ANCHOR_DEMAND_SIGNAL row after the operator disabled
+  // paid demand.
+  if (options.demandSignalsEnabled === false && hasDemandSignalMetadata(metadata)) {
+    return { eligible: false, reasonCodes: ['DEMAND_SIGNALS_DISABLED'], retrievalPolicyVersion: String(specificity?.policyVersion || '') };
+  }
 
   if (!specificity) return { eligible: false, reasonCodes: ['CURRENT_RETRIEVAL_PROVENANCE_MISSING'] };
   if (specificity.policyVersion !== RETRIEVAL_SPECIFICITY_POLICY_VERSION) {

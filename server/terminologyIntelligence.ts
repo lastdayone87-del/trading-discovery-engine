@@ -1006,9 +1006,6 @@ export const NATIVE_QUALITY_ROLLUP_SQL =
     ), false) AS novel
    FROM terminology_observations WHERE canonical_term_id=$1 AND evidence->>'qualityVersion'='native-v1'`;
 
-/** V2 quality rollup counts only promotion-eligible observations. */
-export const NATIVE_QUALITY_ROLLUP_V2_SQL = `${NATIVE_QUALITY_ROLLUP_SQL} AND promotion_eligible=true`;
-
 export async function readNativeQualityEvidence(
   termId: number,
   runner: Queryable,
@@ -1698,7 +1695,12 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
     );
     const perfRow = ((perf.rows || [])[0] || {}) as Record<string, unknown>;
     const freshConfirmed = Number(perfRow.fresh_confirmed || 0);
-    const v2Quality = await readNativeQualityEvidence(termId, runner, NATIVE_QUALITY_ROLLUP_V2_SQL);
+    // Quality and novelty gates span every native-v1 observation, not just the
+    // currently promotion-eligible subset: a spam or non-novel row that has
+    // since been demoted must still block promotion and trial entry. The
+    // promotion counts themselves come from the eligibility-filtered
+    // aggregate above.
+    const v2Quality = await readNativeQualityEvidence(termId, runner);
     cachedQuality = v2Quality;
     const nativeCreators = Number(v2Row.native_creators || 0);
     const nativeEvidenceBuckets = Number(v2Row.native_evidence_buckets || nativeCreators);
@@ -1766,7 +1768,7 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
   // PROVEN legacy decision always sets searchEligible, so the PROVEN cap
   // below never faces a skipped read.
   const quality: NativeQualityRollup = cachedQuality ?? ((enteringEligibility || row.search_eligible)
-    ? await readNativeQualityEvidence(termId, runner, v2Enabled ? NATIVE_QUALITY_ROLLUP_V2_SQL : NATIVE_QUALITY_ROLLUP_SQL)
+    ? await readNativeQualityEvidence(termId, runner)
     : { v1Observations: 0, spamConfirmed: false, novel: false });
   // Native PROVEN gate: the legacy lifecycle must not automatically mark a
   // native-v1 term PROVEN on executions/yield alone (scopeWeightedYield counts

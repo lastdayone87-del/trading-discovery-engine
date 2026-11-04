@@ -105,6 +105,10 @@ const CDL_SETTING_KEYS = [
 ] as const;
 
 const ORPHAN_AGE_MINUTES = 15;
+// Rate-based provider checks are advisory below this sample size: a single
+// failed call during an off-peak hour must not turn the whole deployment
+// unhealthy (the canary would otherwise return 503 on 0/1).
+const PROVIDER_MIN_SAMPLE_CALLS = 10;
 
 export function evaluateCountryDiscoveryHealth(
   input: CountryDiscoveryHealthInput,
@@ -196,7 +200,7 @@ export function evaluateCountryDiscoveryHealth(
     // advisory only: a low-volume spike degrades the report instead of
     // declaring the deployment unhealthy.
     const calls = input.providerCalls == null ? null : Math.max(0, Number(input.providerCalls) || 0);
-    const lowSample = calls != null && calls < 10;
+    const lowSample = calls != null && calls < PROVIDER_MIN_SAMPLE_CALLS;
     add(
       'provider_spike',
       worst >= 0.25 && !lowSample ? 'FAIL' : worst >= 0.1 ? 'WARN' : 'PASS',
@@ -462,7 +466,12 @@ export async function gatherCountryDiscoveryHealth(clientOverride?: HealthRunner
   const providerRow = (provider.rows || [])[0] || {};
   const providerCalls = Number(providerRow.calls || 0);
   const providerSuccessRate = providerCalls > 0 ? Number(providerRow.successes || 0) / providerCalls : null;
-  const providerCanaryOk = providerSuccessRate === null ? null : providerSuccessRate >= 0.5;
+  // Below the same minimum sample used by provider_spike the canary is
+  // advisory (WARN), not a hard failure. A 0/1 off-peak window is not enough
+  // evidence to declare the deployment unhealthy and return 503.
+  const providerCanaryOk = providerSuccessRate === null || providerCalls < PROVIDER_MIN_SAMPLE_CALLS
+    ? null
+    : providerSuccessRate >= 0.5;
   const providerErrorRate = providerCalls > 0 ? Number(providerRow.errors || 0) / providerCalls : null;
   const providerTimeoutRate = providerCalls > 0 ? Number(providerRow.timeouts || 0) / providerCalls : null;
   const providerRateLimitRate = providerCalls > 0 ? Number(providerRow.rate_limited || 0) / providerCalls : null;

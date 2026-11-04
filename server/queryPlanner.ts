@@ -474,8 +474,12 @@ export function planDiverseQueries(args: {
   // with no creator evidence, but they can never crowd out creator-observed
   // terminology (capFreeSignalCandidates reserves the portfolio majority for
   // existing candidates). They never write an observation or lifecycle row.
-  const provenBySurface = new Map<string, ProvenTerminologyAtom>();
-  for (const term of args.provenTerminology || []) provenBySurface.set(normalizeQuery(term.term), term);
+  // Build corroboration from the already-gated `proven` set, never from the
+  // raw input: a term rejected by the searchability gate must not attach a
+  // terminology id to a free-signal query.
+  const provenBySurface = new Map<string, ProvenTerminologyAtom>(
+    proven.map(item => [normalizeQuery(item.atom.term), item.terminology]),
+  );
   const freeSignalPlanCandidates = (args.freeSignalCandidates || []).flatMap<FreePlanCandidate>(candidate => {
     const surface = candidate.surface.normalize('NFKC').trim().replace(/\s+/g, ' ');
     if (!surface) return [];
@@ -493,8 +497,18 @@ export function planDiverseQueries(args: {
     }
     return [];
   });
+  // Apply the cooldown/duplicate filters BEFORE the 30% cap: otherwise the
+  // first cap candidates can all be blocked and later fresh free signals are
+  // never considered. Deduplicate within this batch for the same reason.
+  const seenFreeSignalQueries = new Set<string>();
+  const availableFreeSignalCandidates = freeSignalPlanCandidates.filter(candidate => {
+    const queryText = normalizeQuery(candidate.atoms.map(item => item.term).join(' '));
+    if (blocked.has(queryText) || seenFreeSignalQueries.has(queryText)) return false;
+    seenFreeSignalQueries.add(queryText);
+    return true;
+  });
   const cappedFreeSignalCandidates = capFreeSignalCandidates(
-    freeSignalPlanCandidates,
+    availableFreeSignalCandidates,
     count,
     Math.min(count, candidates.length),
   );

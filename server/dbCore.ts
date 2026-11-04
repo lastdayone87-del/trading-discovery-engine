@@ -59,6 +59,7 @@ import {
 import {
   DEFAULT_NATIVE_VOCABULARY_AI_BUDGET,
   evaluateNativeVocabularyAiBudget,
+  resolveNativeVocabularyAiBudgetPolicy,
   type NativeVocabularyAiBudgetPolicy,
   type NativeVocabularyAiBudgetSnapshot,
   type NativeVocabularyAiRunStatus,
@@ -376,6 +377,73 @@ async function ensureJobAttemptsFinishedErrorIndex(client: { query: (text: strin
   await client.query(`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_job_attempts_finished_error ON public.job_attempts (finished_at) WHERE error IS NOT NULL`);
 }
 
+/**
+ * Migration 161 adds columns to existing hot tables (`query_runs`,
+ * `terminology_observations`, `external_osint_observations`,
+ * `autonomous_query_page_observations`). Building those indexes inside the
+ * transactional migration loop would hold a SHARE lock and block writes for
+ * the full build. The migration creates only indexes on new (empty) tables;
+ * the hot-table indexes are adopted or built concurrently here, after the
+ * migration transaction commits.
+ */
+async function ensureCdlHotTableIndexes(client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> }): Promise<void> {
+  const indexes = [
+    {
+      name: 'idx_term_obs_promotion',
+      table: 'terminology_observations',
+      create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_term_obs_promotion ON public.terminology_observations(canonical_term_id, promotion_eligible)`,
+    },
+    {
+      name: 'idx_term_obs_run_page',
+      table: 'terminology_observations',
+      create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_term_obs_run_page ON public.terminology_observations(query_run_id, query_page_number) WHERE query_run_id IS NOT NULL`,
+    },
+    {
+      name: 'idx_external_osint_surface_country',
+      table: 'external_osint_observations',
+      create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_external_osint_surface_country ON public.external_osint_observations(country, canonical_concept, observed_at DESC)`,
+    },
+    {
+      name: 'idx_autonomous_pages_economics',
+      table: 'autonomous_query_page_observations',
+      create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_autonomous_pages_economics ON public.autonomous_query_page_observations(query_run_id, page_number, marginal_quality_creators)`,
+    },
+    {
+      name: 'idx_query_runs_resume_pending',
+      table: 'query_runs',
+      create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_query_runs_resume_pending ON public.query_runs(continuation_status, deferred_until, last_page_at) WHERE continuation_status IN ('RUNNING', 'DEFERRED_QUOTA', 'DEFERRED_TIME')`,
+    },
+    {
+      name: 'idx_query_runs_country_source',
+      table: 'query_runs',
+      create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_query_runs_country_source ON public.query_runs(country, source, completed_at DESC)`,
+    },
+    {
+      name: 'idx_query_runs_continuation_segment',
+      table: 'query_runs',
+      create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_query_runs_continuation_segment ON public.query_runs(continued_from_run_id) WHERE continued_from_run_id IS NOT NULL`,
+    },
+  ];
+  for (const index of indexes) {
+    // A failed concurrent build can leave an invalid/not-ready catalog entry
+    // that cannot serve queries; treat name existence as insufficient.
+    const existing = await client.query(`
+      SELECT c.oid, i.indisvalid, i.indisready
+        FROM pg_class c
+        JOIN pg_index i ON i.indexrelid = c.oid
+       WHERE c.oid = to_regclass('public.${index.name}')
+    `);
+    const row = existing.rows[0];
+    if (row?.indisvalid && row?.indisready) continue;
+    if (row?.oid) {
+      await client.query(`DROP INDEX CONCURRENTLY IF EXISTS public.${index.name}`);
+    }
+    const table = await client.query(`SELECT to_regclass('public.${index.table}') AS oid`);
+    if (!table.rows[0]?.oid) continue;
+    await client.query(index.create);
+  }
+}
+
 export async function runMigrations(): Promise<Array<{ version: number; name: string; applied_at: string }>> {
   const db = pool || new Pool({ connectionString: requireDatabaseUrl(), ssl: process.env.PGSSL === 'disable' ? false : process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined });
   const client = await db.connect();
@@ -416,6 +484,10 @@ export async function runMigrations(): Promise<Array<{ version: number; name: st
         throw err;
       }
     }
+    // The migration has committed by now, so CONCURRENTLY is legal. This is
+    // idempotent and also repairs a build that failed on a previous boot.
+    const cdlMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=161');
+    if (cdlMigration.rowCount) await ensureCdlHotTableIndexes(client);
     const res = await client.query('SELECT version,name,applied_at FROM schema_migrations ORDER BY version');
     return res.rows.map(r => ({ version: r.version, name: r.name, applied_at: iso(r.applied_at)! }));
   } finally {
@@ -4849,7 +4921,10 @@ export async function reserveNativeVocabularyAiRun(args: {
        FROM native_vocabulary_ai_runs WHERE budget_day=$1`,
       [args.budgetDay, args.country],
     );
-    const policy = { ...(await readNativeVocabularyAiBudgetPolicy(client)), ...(args.policy || {}) };
+    const policy = resolveNativeVocabularyAiBudgetPolicy({
+      ...(await readNativeVocabularyAiBudgetPolicy(client)),
+      ...(args.policy || {}),
+    });
     const row = counts.rows[0] || {};
     const decision = evaluateNativeVocabularyAiBudget({
       requestId: args.requestId,

@@ -68,14 +68,26 @@ function isUsableSurface(value: string): boolean {
   return true;
 }
 
+// Keyword matching is anchored at a word START (not the end) so suffixes such
+// as "exchanges", "Börsen", or "journaling" still classify while substrings
+// inside unrelated words ("delivery" -> live, "transaction" -> action,
+// "information" -> format) do not. A Unicode letter/digit lookbehind is used
+// instead of \b because \b treats accented letters as non-word characters.
+const wordStart = (pattern: string) => new RegExp(`(?<![\\p{L}\\p{N}])(?:${pattern})`, 'iu');
+const EXCHANGE_SURFACE = wordStart('exchange|börse|bourse|bolsa|beurs|بورصة');
+const REGULATOR_SURFACE = wordStart('regulator|commission|authority|regulier|regulador|aufsicht');
+const INSTRUMENT_SURFACE = wordStart('futures|options|forex|index|indices|aktie|acao|ação|action|titre|anleihe|obligation|etf');
+const MARKET_SURFACE = wordStart('market|marché|markt|mercado|mercat|session');
+const METHOD_SURFACE = wordStart('strategy|analyse|analysis|methode|méthode|método|scalping|swing');
+const FORMAT_SURFACE = wordStart('format|journal|podcast|live|webinar|newsletter');
+
 function classifySurface(surface: string): FreeSignalType {
-  const normalized = normalizeFreeSignalSurface(surface);
-  if (/(exchange|börse|bourse|bolsa|beurs|بورصة)/iu.test(surface)) return 'EXCHANGE';
-  if (/(regulator|commission|authority|regulier|regulador|aufsicht)/iu.test(surface)) return 'REGULATOR';
-  if (/(futures|options|forex|index|indices|aktie|acao|ação|action|titre|anleihe|obligation|etf)/iu.test(surface)) return 'INSTRUMENT';
-  if (/(market|marché|markt|mercado|mercat|session)/iu.test(surface)) return 'MARKET';
-  if (/(strategy|analyse|analysis|analysis|methode|méthode|método|scalping|swing)/iu.test(surface)) return 'METHOD';
-  if (/(format|journal|podcast|live|webinar|newsletter)/iu.test(surface)) return 'FORMAT';
+  if (EXCHANGE_SURFACE.test(surface)) return 'EXCHANGE';
+  if (REGULATOR_SURFACE.test(surface)) return 'REGULATOR';
+  if (INSTRUMENT_SURFACE.test(surface)) return 'INSTRUMENT';
+  if (MARKET_SURFACE.test(surface)) return 'MARKET';
+  if (METHOD_SURFACE.test(surface)) return 'METHOD';
+  if (FORMAT_SURFACE.test(surface)) return 'FORMAT';
   if (/\b(alias|aka|also known as)\b/iu.test(surface)) return 'ALIAS';
   return 'ENTITY';
 }
@@ -91,6 +103,17 @@ function providerSignalId(provider: FreeSignalProvider, value: unknown): string 
 /**
  * Parse a Wikipedia Action API `list=search` response. Only real page titles
  * and snippets supplied by the provider are considered; no alias is invented.
+ */
+/**
+ * Parse a Wikipedia full-text search response.
+ *
+ * Unlike Wikidata's generic label/alias prefix search, the Wikipedia query
+ * text always carries the requesting country (`wikipediaSearchTerm`), so the
+ * results are already country-scoped by the provider's relevance ranking. The
+ * titles are candidate vocabulary only: they never create observations or
+ * promotion eligibility, and the planner still applies its own searchability
+ * gates. A second title-level identity check would therefore reject valid
+ * local vocabulary (names without the country word) without adding safety.
  */
 export function parseWikipediaSearchSignals(
   payload: unknown,

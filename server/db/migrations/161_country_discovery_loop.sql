@@ -43,8 +43,10 @@ WHERE o.canonical_term_id = t.id
   AND COALESCE(o.is_code_switched, false) = false
   AND (o.term_language IS NULL OR o.native_language IS NULL OR lower(o.term_language) = lower(o.native_language));
 
-CREATE INDEX IF NOT EXISTS idx_term_obs_promotion
-  ON terminology_observations(canonical_term_id, promotion_eligible);
+-- Hot-table indexes (terminology_observations, external_osint_observations,
+-- query_runs) are built CONCURRENTLY after this migration transaction commits;
+-- see ensureCdlHotTableIndexes in server/dbCore.ts. An ordinary CREATE INDEX
+-- here would hold a SHARE lock and block writes for the full build.
 
 -- Page provenance for novelty attribution: a term observed while processing a
 -- specific autonomous page belongs to that run/page, never to another run that
@@ -53,9 +55,6 @@ ALTER TABLE terminology_observations
   ADD COLUMN IF NOT EXISTS query_run_id TEXT;
 ALTER TABLE terminology_observations
   ADD COLUMN IF NOT EXISTS query_page_number INTEGER;
-CREATE INDEX IF NOT EXISTS idx_term_obs_run_page
-  ON terminology_observations(query_run_id, query_page_number)
-  WHERE query_run_id IS NOT NULL;
 
 -- External terminology corroboration is looked up by the local surface, not
 -- only by country: filtering a country-wide LIMIT in JavaScript can drop a
@@ -64,9 +63,8 @@ CREATE INDEX IF NOT EXISTS idx_term_obs_run_page
 -- collapse, trim, and English lowercase mapping as normalizeTerm. Matching it
 -- avoids PostgreSQL lower(), whose case mapping follows the database collation
 -- (for example Turkish I) and can discard valid observations before the
--- JavaScript evaluator sees them.
-CREATE INDEX IF NOT EXISTS idx_external_osint_surface_country
-  ON external_osint_observations(country, canonical_concept, observed_at DESC);
+-- JavaScript evaluator sees them. The supporting index is built concurrently
+-- out-of-band (ensureCdlHotTableIndexes).
 
 -- Promotion yield must count creators that are BOTH newly discovered and
 -- trading-confirmed. The aggregate new/confirmed totals can describe different
@@ -115,8 +113,9 @@ ALTER TABLE autonomous_query_page_observations
 ALTER TABLE autonomous_query_page_observations
   VALIDATE CONSTRAINT chk_page_obs_deferred_reason;
 
-CREATE INDEX IF NOT EXISTS idx_autonomous_pages_economics
-  ON autonomous_query_page_observations(query_run_id, page_number, marginal_quality_creators);
+-- The economics index is built concurrently out-of-band
+-- (ensureCdlHotTableIndexes): this table already carries production page
+-- history from the adaptive-pagination feature.
 
 -- ---------------------------------------------------------------------------
 -- 3. Run-level resumable progress
@@ -307,14 +306,10 @@ WHERE q.id IN (SELECT query_id FROM _cdl_stale_query_runs WHERE query_id IS NOT 
       AND active.status IN ('SCHEDULED', 'RUNNING', 'RETRYING')
   );
 
-CREATE INDEX IF NOT EXISTS idx_query_runs_resume_pending
-  ON query_runs(continuation_status, deferred_until, last_page_at)
-  WHERE continuation_status IN ('RUNNING', 'DEFERRED_QUOTA', 'DEFERRED_TIME');
-CREATE INDEX IF NOT EXISTS idx_query_runs_country_source
-  ON query_runs(country, source, completed_at DESC);
-CREATE INDEX IF NOT EXISTS idx_query_runs_continuation_segment
-  ON query_runs(continued_from_run_id)
-  WHERE continued_from_run_id IS NOT NULL;
+-- query_runs is a hot, long-lived table: the pending-page, country/source,
+-- and continuation-segment indexes are built CONCURRENTLY after this
+-- migration commits (ensureCdlHotTableIndexes), so the deploy never blocks
+-- scheduler writes during the build.
 
 -- ---------------------------------------------------------------------------
 -- 4. Native vocabulary AI budget ledger
@@ -414,7 +409,6 @@ INSERT INTO app_settings(setting_key, setting_value) VALUES
   ('autonomous_pagination_exploration_pages', '1'),
   ('autonomous_pagination_max_duplicate_pages', '2'),
   ('autonomous_pagination_max_wrong_country_pages', '2'),
-  ('autonomous_pagination_min_run_pages', '1'),
   ('native_evidence_promotion_v2_enabled', 'true'),
   ('native_vocabulary_extraction_enabled', 'true'),
   ('native_vocabulary_ai_daily_calls', '200'),

@@ -194,8 +194,8 @@ export async function getAutonomousPageObservation(runId: string, pageNumber: nu
     providerPageCostUsd: Math.max(0, Number(row.provider_page_cost_usd || 0)),
   };
 }
-export async function getAutonomousRunMetrics(runId: string): Promise<QueryFunnelMetrics> {
-  const db = await getDb();
+export async function getAutonomousRunMetrics(runId: string, clientOverride?: PageStoreRunner): Promise<QueryFunnelMetrics> {
+  const db = clientOverride || await getDb();
   // Page metrics count distinct creators per page. Summing them overcounts a
   // channel that appears on several pages, while the reward numerator is
   // run-wide distinct. Read the run-wide denominator from the same durable
@@ -272,10 +272,13 @@ export async function getAutonomousPageMarginalMetrics(runId: string, pageNumber
               -- Productivity requires a persisted fresh creator. An unseen
               -- country-rejected candidate was never catalogued and must not
               -- excuse a low-value or wrong-country page from stopping.
-              BOOL_OR(s.persisted AND NOT s.was_known) AS was_new,
+              -- Read freshness from the FIRST sighting only: a later row can
+              -- report was_known=false after a concurrent catalog insert and
+              -- must not retroactively credit an earlier page.
+              (array_agg(s.persisted AND NOT s.was_known ORDER BY s.page_number, s.id))[1] AS first_was_new,
               -- Outcome at the creator's first sighting: a creator rejected on
               -- page 1 and seen again on page 3 is still one rejection.
-              (array_agg(s.funnel_outcome ORDER BY s.page_number))[1] AS first_outcome
+              (array_agg(s.funnel_outcome ORDER BY s.page_number, s.id))[1] AS first_outcome
        FROM channel_sightings s
        WHERE s.query_run_id=$1
        GROUP BY s.channel_id
@@ -287,7 +290,7 @@ export async function getAutonomousPageMarginalMetrics(runId: string, pageNumber
      )
      SELECT
        COUNT(*) FILTER (WHERE fs.first_page=$2)::int AS page_distinct,
-       COUNT(*) FILTER (WHERE fs.first_page=$2 AND fs.was_new)::int AS marginal_new,
+       COUNT(*) FILTER (WHERE fs.first_page=$2 AND fs.first_was_new)::int AS marginal_new,
        COUNT(*) FILTER (WHERE fs.first_page=$2 AND c.trading_status='TRADING_CONFIRMED')::int AS marginal_confirmed,
        COUNT(*) FILTER (WHERE fs.first_page=$2 AND c.trading_status='TRADING_CONFIRMED' AND COALESCE(c.quality_score,0)>=55)::int AS marginal_quality,
        COUNT(*) FILTER (WHERE fs.first_page=$2 AND c.trading_status IN ('NON_TRADING','HUMAN_REJECTED'))::int AS marginal_non_trading,
@@ -486,6 +489,10 @@ export async function listPendingAutonomousRuns(
               ),0) AS marginal_utility
        FROM query_runs qr
        JOIN query_library ql ON ql.id=qr.query_id
+       -- Parents with continued_to_run_id are intentionally included: the
+       -- reconciler never resumes their cursor, but it uses this shortlist to
+       -- repair the child handoff and finalize the parent when the link
+       -- committed before parent completion did.
        WHERE qr.continuation_status IN ('RUNNING','DEFERRED_QUOTA','DEFERRED_TIME')
          AND qr.status NOT IN ('COMPLETED','FAILED')
          AND (qr.deferred_until IS NULL OR qr.deferred_until <= now())
@@ -585,6 +592,10 @@ export function aggregatePageMetrics(pages: QueryFunnelMetrics[]): QueryFunnelMe
       page.evaluatedRawResults ?? Math.max(0, Number(page.rawResults || 0) - Number(page.deferredResults || 0)),
     ), 0)
     : undefined;
+  // Same unknown-vs-zero distinction for the fresh∩confirmed intersection:
+  // legacy pages never measured it, and consumers already fall back with
+  // `?? 0` at the persistence boundary.
+  const hasFreshTradingConfirmed = pages.some(page => page.freshTradingConfirmed !== undefined);
   const weighted = (key: keyof QueryFunnelMetrics) => weightedDistinct ? pages.reduce((n, p) => n + p.distinctResults * Number(p[key] || 0), 0) / weightedDistinct : 0;
   // Scope weighting survives aggregation: pages carrying scope data sum
   // their in-scope counts while legacy pages without the field contribute
@@ -602,7 +613,7 @@ export function aggregatePageMetrics(pages: QueryFunnelMetrics[]): QueryFunnelMe
     countryRejected, nonTrading: sum('nonTrading'),
     uncertain: sum('uncertain'), needsReview: sum('needsReview'),
     tradingConfirmed: sum('tradingConfirmed'),
-    freshTradingConfirmed: sum('freshTradingConfirmed'),
+    freshTradingConfirmed: hasFreshTradingConfirmed ? sum('freshTradingConfirmed') : undefined,
     qualityChannels: sum('qualityChannels'),
     communitiesDiscovered: sum('communitiesDiscovered'),
     averageQualityScore: weighted('averageQualityScore'),

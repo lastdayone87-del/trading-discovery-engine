@@ -25,6 +25,22 @@ export const DEFAULT_NATIVE_VOCABULARY_AI_BUDGET: NativeVocabularyAiBudgetPolicy
   reservationMicrounits: 25_000,
 });
 
+/**
+ * Resolve a partial policy without letting an explicit `undefined` property
+ * erase a safe default. A spread merge would turn { dailyCalls: undefined }
+ * into NaN comparisons below and silently disable both call and cost caps.
+ */
+export function resolveNativeVocabularyAiBudgetPolicy(
+  policy?: Partial<NativeVocabularyAiBudgetPolicy> | null,
+): NativeVocabularyAiBudgetPolicy {
+  return {
+    dailyCalls: policy?.dailyCalls ?? DEFAULT_NATIVE_VOCABULARY_AI_BUDGET.dailyCalls,
+    countryDailyCalls: policy?.countryDailyCalls ?? DEFAULT_NATIVE_VOCABULARY_AI_BUDGET.countryDailyCalls,
+    dailyCostMicrounits: policy?.dailyCostMicrounits ?? DEFAULT_NATIVE_VOCABULARY_AI_BUDGET.dailyCostMicrounits,
+    reservationMicrounits: policy?.reservationMicrounits ?? DEFAULT_NATIVE_VOCABULARY_AI_BUDGET.reservationMicrounits,
+  };
+}
+
 export type NativeVocabularyAiRunStatus = 'RESERVED' | 'SUCCEEDED' | 'FAILED' | 'BUDGET_SKIPPED';
 
 export interface NativeVocabularyAiBudgetSnapshot {
@@ -76,7 +92,7 @@ export function evaluateNativeVocabularyAiBudget(args: {
   snapshot: NativeVocabularyAiBudgetSnapshot;
   policy?: Partial<NativeVocabularyAiBudgetPolicy>;
 }): NativeVocabularyAiBudgetDecision {
-  const policy = { ...DEFAULT_NATIVE_VOCABULARY_AI_BUDGET, ...(args.policy || {}) };
+  const policy = resolveNativeVocabularyAiBudgetPolicy(args.policy);
   const existing = args.existingStatus || null;
   if (existing && existing !== 'RESERVED') {
     return {
