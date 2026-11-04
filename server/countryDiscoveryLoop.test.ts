@@ -14,6 +14,7 @@ import {
   AUTONOMOUS_CONTINUATION_JOB_PRIORITY,
   AUTONOMOUS_NEW_QUERY_JOB_PRIORITY,
   planContinuationResume,
+  providerPageCap,
 } from './queueManager';
 import { resolveAutonomousCountries } from './autonomousDiscovery';
 import { countryIdentityTerms } from './countryInference';
@@ -606,7 +607,7 @@ test('A5: the free-signal cap preserves creator-observed terminology', () => {
   assert.ok(!/promotion_eligible\s*=/.test(freeSource), 'free signals never assign promotion eligibility');
 });
 
-test('A5a: blocked free signals do not consume the 30% cap', () => {
+test('A5a: blocked free signals do not consume the one-third cap', () => {
   // Chile has no authorized creator-observed anchor, so these free signals
   // stand alone and the cap applies to their exact query text. The first two
   // are already in the library (cooldown); without filtering before the cap,
@@ -2280,6 +2281,7 @@ test('Q5: InnerTube pages cost 0 YouTube units, official pages 100, and Brave us
   assert.equal(innerTube.quotaPages, Number.MAX_SAFE_INTEGER);
   assert.equal(innerTube.effectiveMaxPages, 10);
   assert.equal(innerTube.bindingBound, 'PROVIDER');
+  assert.equal(providerPageCap('youtube-innertube', 50), 10, 'InnerTube keeps its real provider cap');
 
   const providerTie = computeEffectivePageBudget({
     safetyMaxPages: 10, providerMaxPages: 10, pageCostUnits: 100,
@@ -2287,6 +2289,21 @@ test('Q5: InnerTube pages cost 0 YouTube units, official pages 100, and Brave us
   });
   assert.equal(providerTie.effectiveMaxPages, 10);
   assert.equal(providerTie.bindingBound, 'PROVIDER', 'a provider tie must not be labelled SAFETY');
+
+  // Official YouTube token pagination has no provider page cap: the provider
+  // bound must stay unbounded so the safety ceiling remains the binding bound
+  // and a productive page can hand its cursor to a linked continuation run.
+  assert.equal(providerPageCap('youtube-search', 10), Number.MAX_SAFE_INTEGER);
+  const officialCeiling = computeEffectivePageBudget({
+    safetyMaxPages: 10, providerMaxPages: providerPageCap('youtube-search', 10), pageCostUnits: 100,
+    remainingAutonomousQuota: 10_000, pendingCountries: 1,
+  });
+  assert.equal(officialCeiling.effectiveMaxPages, 10);
+  assert.equal(officialCeiling.bindingBound, 'SAFETY');
+  assert.equal(shouldCreateContinuationSegment({
+    paginationEnabled: true, usingV2: true, primaryReason: 'PAGE_CEILING',
+    bindingBound: officialCeiling.bindingBound, hasNextPage: true,
+  }), true, 'the safety ceiling must still create a linked YouTube segment');
 
   const zeroCostSafety = computeEffectivePageBudget({
     safetyMaxPages: 10, providerMaxPages: 50, pageCostUnits: 0,

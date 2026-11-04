@@ -103,17 +103,14 @@ function providerSignalId(provider: FreeSignalProvider, value: unknown): string 
 /**
  * Parse a Wikipedia Action API `list=search` response. Only real page titles
  * and snippets supplied by the provider are considered; no alias is invented.
- */
-/**
- * Parse a Wikipedia full-text search response.
  *
- * Unlike Wikidata's generic label/alias prefix search, the Wikipedia query
- * text always carries the requesting country (`wikipediaSearchTerm`), so the
- * results are already country-scoped by the provider's relevance ranking. The
- * titles are candidate vocabulary only: they never create observations or
- * promotion eligibility, and the planner still applies its own searchability
- * gates. A second title-level identity check would therefore reject valid
- * local vocabulary (names without the country word) without adding safety.
+ * The search text includes the requesting country (`wikipediaSearchTerm`), but
+ * Wikipedia's full-text ranking is relevance-based, not an identity filter: a
+ * response can still contain generic or foreign-market pages. These titles are
+ * candidate vocabulary only: they never create observations or promotion
+ * eligibility, and the planner re-applies its searchability gates. This path
+ * therefore does not apply the stricter Wikidata identity filter, which exists
+ * because `wbsearchentities` is an unqualified label/alias prefix search.
  */
 export function parseWikipediaSearchSignals(
   payload: unknown,

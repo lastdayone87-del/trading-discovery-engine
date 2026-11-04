@@ -936,10 +936,18 @@ async function countActiveAutonomousCountries(): Promise<number> {
   return Math.max(1, (await resolveActiveAutonomousCountryKeys()).size);
 }
 
-function providerPageCap(providerKey: string, safetyMaxPages: number): number {
+/** Page cap imposed by the provider itself, independent of the safety ceiling. */
+export function providerPageCap(providerKey: string, _safetyMaxPages: number): number {
   if (providerKey === 'youtube-innertube') return YOUTUBE_INNERTUBE_MAX_PAGES;
   if (providerKey === 'brave-search') return Math.max(1, Number(process.env.BRAVE_MAX_OFFSET || 9) + 1);
-  return safetyMaxPages;
+  // Official YouTube token pagination (and any provider without a real
+  // cursor/offset ceiling) has no separate provider page cap. Returning the
+  // safety ceiling here would tie PROVIDER with SAFETY in
+  // computeEffectivePageBudget; the provider tie-break would then label the
+  // safety stop PROVIDER and suppress the linked continuation segment that
+  // preserves the cursor. Keep the provider bound unbounded so SAFETY remains
+  // the binding bound at the configured ceiling.
+  return Number.MAX_SAFE_INTEGER;
 }
 
 

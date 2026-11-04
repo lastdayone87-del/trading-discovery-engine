@@ -497,9 +497,10 @@ export function planDiverseQueries(args: {
     }
     return [];
   });
-  // Apply the cooldown/duplicate filters BEFORE the 30% cap: otherwise the
-  // first cap candidates can all be blocked and later fresh free signals are
-  // never considered. Deduplicate within this batch for the same reason.
+  // Apply the cooldown/duplicate filters BEFORE the one-third free-signal cap:
+  // otherwise the first cap candidates can all be blocked and later fresh free
+  // signals are never considered. Deduplicate within this batch for the same
+  // reason.
   const seenFreeSignalQueries = new Set<string>();
   const availableFreeSignalCandidates = freeSignalPlanCandidates.filter(candidate => {
     const queryText = normalizeQuery(candidate.atoms.map(item => item.term).join(' '));

@@ -60,7 +60,7 @@ Both routes are operator routes requiring the `country-discovery.read` action:
 | `youtube_hard_cap` | `youtube_key_daily_cap_enforced=true`. | `FAIL` means the hard cap is not enforced. |
 | `discovery_scope` | `query_intelligence_discovery_scope` and `query_intelligence_selected_countries` parse under the strict runtime parsers. | `FAIL` for an invalid mode or unparseable selected-country list. |
 | `orphan_pending_pages` | Pending pages older than 15 minutes. | `FAIL` when any are due; inspect the reconciler. |
-| `provider_canary` | Recent provider telemetry success rate (no active probe). | `FAIL` below 50% success. |
+| `provider_canary` | Recent provider telemetry success rate (no active probe). | `FAIL` below 50% success once the window has at least 10 calls; smaller samples are advisory `WARN` only. |
 | `provider_spike` | Recent error/timeout/rate-limit rates. | `WARN` at 10%, `FAIL` at 25% once the window has at least 10 calls; smaller samples are advisory `WARN` only. |
 | `quota_reservation_failures` | Quota deferrals above the prior-hour baseline (the observable outcome of reservation denials). | `WARN` on a spike. |
 | `duplicate_ratio_two_windows` | Duplicate ratio for two consecutive 24-hour windows. | `WARN` in one window, `FAIL` in both at >=90%. |
