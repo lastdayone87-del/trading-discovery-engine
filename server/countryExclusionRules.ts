@@ -1,4 +1,5 @@
 import type { ExcludedCountry } from '../src/types';
+import { COUNTRY_ALIASES, countryAliasTarget } from './countryAliases';
 
 export interface CountryExclusionMatch {
   country: string;
@@ -13,12 +14,43 @@ export function normalizeCountryName(country: string | null | undefined): string
   return country.normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('en');
 }
 
+/**
+ * Identity key for exclusion comparison. Alias spellings (ISO codes and
+ * common exonyms) resolve to the same canonical country as their full name,
+ * so a `DE` exclusion applies to a `Germany` run and vice versa. Values
+ * outside the alias vocabulary fall back to their normalized spelling and
+ * therefore keep exact-match semantics.
+ */
+export function countryIdentityKey(country: string | null | undefined): string {
+  const normalized = normalizeCountryName(country);
+  if (!normalized) return '';
+  const canonical = countryAliasTarget(normalized);
+  return canonical ? normalizeCountryName(canonical) : normalized;
+}
+
 export function findCountryExclusion(
   country: string | null | undefined,
   exclusions: ExcludedCountry[]
 ): CountryExclusionMatch | null {
-  const normalized = normalizeCountryName(country);
-  if (!normalized) return null;
-  const match = exclusions.find(item => normalizeCountryName(item.country_name) === normalized);
+  const identity = countryIdentityKey(country);
+  if (!identity) return null;
+  const match = exclusions.find(item => countryIdentityKey(item.country_name) === identity);
   return match ? { country: match.country_name, reason: match.reason } : null;
+}
+
+/**
+ * SQL expression that normalizes a country column to the same identity key as
+ * `countryIdentityKey`. Operator-visible predicates run in SQL, so they must
+ * apply the alias vocabulary too; otherwise a `DE` exclusion still leaves a
+ * `Germany` channel visible even though the application matcher excludes it.
+ * The column expression is supplied by trusted internal callers, and alias
+ * literals come from the frozen alias map.
+ */
+export function countryIdentitySql(column: string): string {
+  const normalized = `lower(regexp_replace(btrim(${column}), '\\s+', ' ', 'g'))`;
+  const quote = (value: string) => `'${value.replace(/'/g, "''")}'`;
+  const branches = Object.entries(COUNTRY_ALIASES)
+    .map(([alias, canonical]) => `WHEN ${quote(alias)} THEN ${quote(normalizeCountryName(canonical))}`)
+    .join(' ');
+  return `(CASE ${normalized} ${branches} ELSE ${normalized} END)`;
 }

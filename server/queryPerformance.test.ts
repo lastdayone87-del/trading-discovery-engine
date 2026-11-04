@@ -23,11 +23,37 @@ test('query funnel keeps duplicates, known channels, exclusions, and classificat
     nonTrading: metrics.nonTrading,
     uncertain: metrics.uncertain,
     review: metrics.needsReview,
-    confirmed: metrics.tradingConfirmed
-  }, { distinct: 5, duplicates: 1, known: 1, fresh: 3, rejected: 1, nonTrading: 1, uncertain: 1, review: 1, confirmed: 1 });
+    confirmed: metrics.tradingConfirmed,
+    freshConfirmed: metrics.freshTradingConfirmed
+  }, { distinct: 5, duplicates: 1, known: 1, fresh: 3, rejected: 1, nonTrading: 1, uncertain: 1, review: 1, confirmed: 1, freshConfirmed: 1 });
   assert.equal(metrics.noveltyRatio, 3 / 5);
   assert.equal(metrics.countryPrecision, 4 / 5);
   assert.equal(metrics.tradingPrecision, 1 / 4);
+});
+
+test('fresh confirmed is the exact creator intersection, not min(confirmed,new)', () => {
+  const observations: QueryObservation[] = [
+    ...Array.from({ length: 5 }, (_, index) => ({
+      channelId: `known-confirmed-${index}`,
+      wasKnown: true,
+      persisted: true,
+      funnelOutcome: 'TRADING_CONFIRMED' as const,
+      qualityScore: 80,
+      hasCommunity: false,
+    })),
+    ...Array.from({ length: 5 }, (_, index) => ({
+      channelId: `new-non-trading-${index}`,
+      wasKnown: false,
+      persisted: true,
+      funnelOutcome: 'NON_TRADING' as const,
+      qualityScore: 40,
+      hasCommunity: false,
+    })),
+  ];
+  const metrics = calculateQueryFunnel(observations.length, observations);
+  assert.equal(metrics.tradingConfirmed, 5);
+  assert.equal(metrics.newChannels, 5);
+  assert.equal(metrics.freshTradingConfirmed, 0, 'repeat confirmed traders cannot borrow credit from new non-traders');
 });
 
 test('excluded candidates never count as new database channels', () => {

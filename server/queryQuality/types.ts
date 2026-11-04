@@ -74,7 +74,9 @@ export type QuerySource =
   | 'MANUAL'
   | 'PERSISTENT_RESEARCH'
   | 'PR557'
-  | 'COLD_START';
+  | 'COLD_START'
+  | 'FREE_SIGNAL'
+  | 'DEMAND_SIGNAL';
 
 export interface QueryAdmission {
   version: string;

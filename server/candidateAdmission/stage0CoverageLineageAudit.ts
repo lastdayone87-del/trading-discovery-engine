@@ -1,4 +1,5 @@
 import { Pool } from 'pg';
+import { countryIdentitySql } from '../countryExclusionRules';
 
 export type Stage0CoverageLineageStatus =
   | 'DIRECT_LINK'
@@ -39,8 +40,8 @@ const OPERATOR_VISIBLE_CHANNEL_SQL = `country_status <> 'REJECTED'
   AND trading_status <> 'NON_TRADING'
   AND NOT EXISTS (
     SELECT 1 FROM excluded_countries excluded
-    WHERE lower(regexp_replace(trim(excluded.country_name), '\\s+', ' ', 'g')) =
-      lower(regexp_replace(trim(channels.country), '\\s+', ' ', 'g'))
+    WHERE ${countryIdentitySql('excluded.country_name')} =
+      ${countryIdentitySql('channels.country')}
   )`;
 
 export async function auditStage0CoverageLineage(): Promise<Record<string, unknown>> {

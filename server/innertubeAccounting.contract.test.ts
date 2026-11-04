@@ -14,8 +14,8 @@ const monitor = readFileSync(new URL('../src/components/QueueMonitor.tsx', impor
  * innertube branch and zeroed real InnerTube counts.
  */
 test('run-outcome aggregation checks innertube before the official predicate', () => {
-  const innertubeFirst = queueManager.indexOf("allocatedProvider.providerKey === 'youtube-innertube' && queryRunId");
-  const officialPredicate = queueManager.indexOf("allocatedProvider.providerKey !== 'brave-search' && queryRunId");
+  const innertubeFirst = queueManager.indexOf("args.allocatedProvider.providerKey === 'youtube-innertube'");
+  const officialPredicate = queueManager.indexOf("args.allocatedProvider.providerKey !== 'brave-search'");
   assert.ok(innertubeFirst !== -1, 'innertube outcome branch exists');
   assert.ok(officialPredicate !== -1, 'official outcome branch exists');
   assert.ok(innertubeFirst < officialPredicate, 'innertube branch must precede the official predicate or it is dead code');

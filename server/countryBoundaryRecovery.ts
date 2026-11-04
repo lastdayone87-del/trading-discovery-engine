@@ -2,9 +2,9 @@ import { getAllChannels, getExcludedCountries, getCountryVocabularies, getDb, en
 import { canonicalCountry, inferChannelCountry } from './countryInference';
 import { resolveScopeEligibility } from './scopeEligibility';
 import { stringifyWellFormedJson } from './unicodeSafety';
-import { normalizeCountryName } from './countryExclusionRules';
+import { findCountryExclusion } from './countryExclusionRules';
 import { creatorLevelCountryEvidence } from './countryValidator';
-import type { ChannelRecord, CountryVocabulary } from '../src/types';
+import type { ChannelRecord, CountryVocabulary, ExcludedCountry } from '../src/types';
 
 export const COUNTRY_BOUNDARY_RECOVERY_VERSION = 'country-boundary-nonexcluded-v4';
 export const COUNTRY_BOUNDARY_RECOVERY_JOB = 'COUNTRY_BOUNDARY_REPROCESS';
@@ -175,9 +175,15 @@ export function classifyReconciliationState(
   confidence: number;
 } {
   const hasBoundaryRejection = hasPinnedBoundaryRejection(channel);
+  const liveExclusions: ExcludedCountry[] = excludedCountries.map(item => ({
+    country_name: item.country_name,
+    reason: item.reason || 'Excluded by policy',
+  }));
   if (!hasBoundaryRejection && channel.country_status === 'REJECTED') {
+    // Delegate to the shared matcher so the recovery path and every other
+    // exclusion consumer use one canonical-identity implementation.
     const isLiveExcluded = (country: string): boolean =>
-      excludedCountries.some(item => normalizeCountryName(item.country_name) === normalizeCountryName(country));
+      findCountryExclusion(country, liveExclusions) != null;
     // Aggregated-language rejections carry their candidate-country set in the
     // trail: restore the row unless every set member is still excluded.
     // Set membership (not the mechanical representative) decides, so removing
@@ -237,8 +243,7 @@ export function classifyReconciliationState(
     metadataStatus: channel.country_metadata_status
   });
 
-  const formattedExclusions = excludedCountries.map(e => ({ country_name: e.country_name, reason: e.reason || 'Excluded by policy' }));
-  const inference = inferChannelCountry(creatorEvidence, formattedExclusions, vocabularies);
+  const inference = inferChannelCountry(creatorEvidence, liveExclusions, vocabularies);
 
   if (inference.status === 'REJECTED') {
     return {

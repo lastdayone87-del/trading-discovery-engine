@@ -1,11 +1,21 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { decayWeight, decideLifecycle, getTerminologyDashboard, inferScript, normalizeTerm } from './terminologyIntelligence';
+import { normalizeNativeTerm } from './countryNativeIntelligence';
 
 test('normalization is Unicode-safe and stable across whitespace variants', () => {
   assert.equal(normalizeTerm('  ＮＱ   Futures '), 'nq futures');
   assert.equal(inferScript('テクニカル分析'), 'Hani');
   assert.equal(inferScript('Börsenanalyse'), 'Latn');
+});
+
+test('external observation concepts use the same English normalization as terminology surfaces', () => {
+  // readExternalTermEvidence matches the stored canonical_concept against
+  // normalizeTerm targets. These must stay byte-identical, including under
+  // locales whose database lower() differs (for example Turkish I).
+  for (const value of ['I', 'İ', '  Börse   Handel ', 'ＮＱ Futures', 'PETR4']) {
+    assert.equal(normalizeNativeTerm(value), normalizeTerm(value));
+  }
 });
 
 test('recency decay halves evidence at the configured half life', () => {

@@ -12,6 +12,24 @@ export interface AutonomousQuotaSchedulingSnapshot {
 
 const QUOTA_DEFERRED_JOB_TYPES = ['SEARCH_YOUTUBE', 'MANUAL_SEARCH_PAGE', 'ENRICH_CHANNEL'];
 
+/** Queue depth denominator shared by the scheduler snapshot and maintenance
+ * recovery. Kept in one place so a resume sweep cannot use a different
+ * admission definition than the producer. */
+const AUTONOMOUS_QUEUE_DEPTH_SQL = `SELECT COUNT(*)::int AS count
+  FROM jobs
+  WHERE type='SEARCH_YOUTUBE'
+    AND status IN ('PENDING','PROCESSING')
+    AND payload->>'source'='automated_query'`;
+
+/** Current autonomous search-queue occupancy, without the rollover side
+ * effects of the full scheduler snapshot. Recovery uses this after a partial
+ * sweep failure so fresh-query admission cannot overshoot the watermark. */
+export async function getAutonomousQueueDepth(): Promise<number> {
+  const db = await getDb();
+  const result = await db.query(AUTONOMOUS_QUEUE_DEPTH_SQL);
+  return Number(result.rows[0]?.count || 0);
+}
+
 /**
  * Reconcile the durable queue with the authoritative YouTube Pacific quota day.
  *
@@ -65,13 +83,7 @@ export async function reconcileYouTubeQuotaRolloverAndGetAutonomousSnapshot(
     awakenedQuotaDeferredJobs = awakened.rowCount || 0;
 
     const [depth, used, reserved] = await Promise.all([
-      client.query(
-        `SELECT COUNT(*)::int AS count
-         FROM jobs
-         WHERE type='SEARCH_YOUTUBE'
-           AND status IN ('PENDING','PROCESSING')
-           AND payload->>'source'='automated_query'`
-      ),
+      client.query(AUTONOMOUS_QUEUE_DEPTH_SQL),
       client.query(
         `SELECT COALESCE(SUM(quota_used),0)::int AS units
          FROM query_runs

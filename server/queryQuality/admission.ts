@@ -37,6 +37,8 @@ export const QUERY_SOURCE_REGISTRY: Record<QuerySource, { producer: string; dire
   PERSISTENT_RESEARCH: { producer: 'persistent research allocation', directWriteAllowed: false },
   PR557: { producer: 'PR #557 continuation surface', directWriteAllowed: false },
   COLD_START: { producer: 'queryPlanner cold-start generation', directWriteAllowed: false },
+  FREE_SIGNAL: { producer: 'PR #557 free Wikipedia/Wikidata bootstrap surface', directWriteAllowed: false },
+  DEMAND_SIGNAL: { producer: 'PR #557 optional paid demand bootstrap surface', directWriteAllowed: false },
 };
 
 const TEMPLATE_RELATION: Record<string, string> = {
@@ -46,12 +48,21 @@ const TEMPLATE_RELATION: Record<string, string> = {
   METHOD_INSTRUMENT: 'METHOD_INSTRUMENT',
   ANCHOR_LEARNED: 'ANCHOR_LEARNED',
   ANCHOR_ORGANIC: 'ANCHOR_ORGANIC',
+  // Anchored CDL bootstrap surfaces are an authorized anchor plus one
+  // candidate modifier. Without a licensed relation the two-atom shape is
+  // rejected before the rest of the admission gates can evaluate it.
+  ANCHOR_FREE_SIGNAL: 'ANCHOR_MODIFIER',
+  ANCHOR_DEMAND_SIGNAL: 'ANCHOR_MODIFIER',
 };
 
 const TEMPLATE_SOURCE: Record<string, QuerySource> = {
   ANCHOR_LEARNED: 'LEARNED_TERMINOLOGY',
   ANCHOR_ORGANIC: 'ORGANIC',
   ORGANIC_STANDALONE: 'ORGANIC',
+  ANCHOR_FREE_SIGNAL: 'FREE_SIGNAL',
+  FREE_SIGNAL_STANDALONE: 'FREE_SIGNAL',
+  ANCHOR_DEMAND_SIGNAL: 'DEMAND_SIGNAL',
+  DEMAND_SIGNAL_STANDALONE: 'DEMAND_SIGNAL',
 };
 
 const ATOM_TYPE: Record<string, TermSense['type']> = {
@@ -162,6 +173,10 @@ function typedAtoms(metadata: Record<string, any>, record: QueryRecordAdmissionI
       const normalizedTerm = String(atom.term || '').normalize('NFKC').trim();
       const isApprovedNativeSurface = countryNativeOverride
         && normalizedTerm.toLocaleLowerCase('en') === allocatedNativeSurface;
+      // Free/demand bootstrap atoms keep their own provenance. Mapping them to
+      // PR557 would grant the Q0 trading-semantics exemption to candidate
+      // Wikipedia/Wikidata vocabulary, which the admission program explicitly
+      // forbids: those surfaces still have to pass the semantic lexicon.
       const atomProvenance = isApprovedNativeSurface
         ? 'COUNTRY_VOCABULARY'
         : declaredOrigin && declaredOrigin.toUpperCase() !== 'LEGACY_COMPATIBILITY'

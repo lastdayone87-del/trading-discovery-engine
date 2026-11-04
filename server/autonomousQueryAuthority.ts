@@ -1,5 +1,5 @@
 import type { QueryRecord } from '../src/types';
-import { isRetrievalOrientedQuery } from './queryPlanner';
+import { isBareShortTicker, isRetrievalOrientedQuery } from './queryPlanner';
 import { RETRIEVAL_SPECIFICITY_POLICY_VERSION } from './retrievalSpecificity';
 import { revalidateQueryRecordAdmission } from './queryQuality/admission';
 
@@ -15,7 +15,7 @@ export interface AutonomousQueryAuthorityDecision {
   admissionReasonCodes?: string[];
 }
 
-const EXPLICIT_STANDALONE_METHOD_CONTEXT = /\b(trading|trader|day\s*trading|swing\s*trading|forex|futures?|options?|spread\s*betting|prop\s*firm|funded\s*trader|analyse\s*technique|analisi\s*tecnica|an[aá]lisis\s*t[eé]cnico|technische\s*analyse|teknisk\s*analys|teknisk\s*analyse|b[oö]rsen?analyse\s+schweiz|futures\s*handel|trading\s*psychology)\b/iu;
+const EXPLICIT_STANDALONE_METHOD_CONTEXT = /\b(trading|trader|day\s*trading|swing\s*trading|forex|futures?|options?|spread\s*betting|prop\s*firm|funded\s*trader|analyse\s*technique|analisi\s*tecnica|an[aá]lisis\s*t[eé]cnico|technische\s*analyse|teknisk\s*analys|teknisk\s*analyse|chartanalyse|charttechnik|chart\s*analysis|technical\s*analysis|b[oö]rsen?analyse\s+schweiz|futures\s*handel|trading\s*psychology)\b/iu;
 
 /** Pair templates in which a scope-promoted vocabulary anchor may lead.
  * This is exactly the set the planner can emit for anchor-less promoted
@@ -71,6 +71,88 @@ function isScopePromotedAnchor(
   return true;
 }
 
+/**
+ * Narrow execution-time authority for free-signal bootstrap queries.
+ *
+ * Free Wikipedia/Wikidata surfaces are candidate vocabulary, never governed
+ * evidence, so their own specificity is MODIFIER_ONLY. The planner emits a
+ * standalone free surface only for a country with no authorized anchor and
+ * only when the assembled query passes the same retrieval-shape gate as every
+ * other candidate. This check re-verifies that exact shape at execution time:
+ * one free-signal atom, concrete instrument or method class, current policy
+ * provenance, and no bare short ticker. It cannot authorize anchored templates,
+ * mixed/learned queries, or any surface the planner would reject.
+ */
+function isFreeSignalStandaloneAuthorized(
+  query: QueryRecord,
+  metadata: Record<string, any>,
+  atoms: Array<Record<string, any>>,
+): boolean {
+  if (String(metadata.queryTemplate || '') !== 'FREE_SIGNAL_STANDALONE') return false;
+  if (metadata.source !== 'FREE_SIGNAL') return false;
+  if (!Array.isArray(metadata.sourceTypes) || metadata.sourceTypes.length !== 1 || metadata.sourceTypes[0] !== 'FREE_SIGNAL') return false;
+  if (atoms.length !== 1) return false;
+  const atom = atoms[0];
+  if (!atom || String(atom.origin || '') !== 'FREE_SIGNAL') return false;
+  if (Number(atom.tier) !== 3) return false;
+  if (!['INSTRUMENT', 'METHOD'].includes(String(atom.type || '').toUpperCase())) return false;
+  // Generic METHOD surfaces are rejected by the shared standalone-method
+  // guard below, so they receive the same reason as SINGLE_ATOM methods.
+  if (atom.retrievalPolicy?.policyVersion !== RETRIEVAL_SPECIFICITY_POLICY_VERSION) return false;
+  if (isBareShortTicker(query.query)) return false;
+  return true;
+}
+
+/**
+ * Narrow execution-time authority for paid demand-only bootstrap queries.
+ *
+ * The planner may emit a standalone demand surface only for a country with no
+ * authorized anchor. Demand surfaces are `ENTITY` modifier-only vocabulary, so
+ * without this exact-shape exception the execution-time gate would withhold
+ * every planned standalone demand query. It authorizes only the one-atom
+ * template the planner writes; anchored, mixed, or copied markers stay
+ * rejected.
+ */
+function isDemandSignalStandaloneAuthorized(
+  query: QueryRecord,
+  metadata: Record<string, any>,
+  atoms: Array<Record<string, any>>,
+  demandSignalsEnabled?: boolean,
+): boolean {
+  // The paid-demand switch is authoritative even for rows already stored and
+  // queued: disabling demand must stop the next execution, not just new
+  // planning. Callers with access to settings pass the live value; undefined
+  // keeps the pure authority helper usable in benchmark/replay contexts.
+  if (demandSignalsEnabled === false) return false;
+  if (String(metadata.queryTemplate || '') !== 'DEMAND_SIGNAL_STANDALONE') return false;
+  if (metadata.source !== 'DEMAND_SIGNAL') return false;
+  if (!Array.isArray(metadata.sourceTypes) || metadata.sourceTypes.length !== 1 || metadata.sourceTypes[0] !== 'DEMAND_SIGNAL') return false;
+  if (atoms.length !== 1) return false;
+  const atom = atoms[0];
+  if (!atom || String(atom.origin || '') !== 'DEMAND_SIGNAL') return false;
+  if (Number(atom.tier) !== 3) return false;
+  if (String(atom.type || '').toUpperCase() !== 'ENTITY') return false;
+  if (atom.retrievalPolicy?.policyVersion !== RETRIEVAL_SPECIFICITY_POLICY_VERSION) return false;
+  if (isBareShortTicker(query.query)) return false;
+  return true;
+}
+
+/** True when a stored row carries any paid-demand provenance. Anchored
+ * demand is a MIXED query (local anchor + demand atom), so its source is not
+ * DEMAND_SIGNAL; the template and atom origins are the authoritative markers. */
+function hasDemandSignalMetadata(metadata: Record<string, any>): boolean {
+  const template = String(metadata.queryTemplate || '').toUpperCase();
+  if (template === 'DEMAND_SIGNAL_STANDALONE' || template === 'ANCHOR_DEMAND_SIGNAL') return true;
+  if (String(metadata.source || '').toUpperCase() === 'DEMAND_SIGNAL') return true;
+  const atoms = Array.isArray(metadata.atoms) ? metadata.atoms as Array<Record<string, any>> : [];
+  return atoms.some(atom => String(atom?.origin || '').toUpperCase() === 'DEMAND_SIGNAL');
+}
+
+/** True when a stored row needs the paid-demand execution exception. */
+export function isDemandSignalRecord(query: QueryRecord): boolean {
+  return hasDemandSignalMetadata(metadataOf(query));
+}
+
 function metadataOf(query: QueryRecord): Record<string, any> {
   const raw = (query as QueryRecord & { generation_metadata?: unknown }).generation_metadata;
   if (!raw) return {};
@@ -111,7 +193,7 @@ export function isScopePromotedRecord(metadata: unknown): boolean {
  */
 export function evaluateAutonomousQueryAuthority(
   query: QueryRecord,
-  options: { scopePromotionActive?: boolean } = {},
+  options: { scopePromotionActive?: boolean; demandSignalsEnabled?: boolean } = {},
 ): AutonomousQueryAuthorityDecision {
   const reasons: string[] = [];
   if (query.collection === 'REJECTED') return { eligible: false, reasonCodes: ['QUERY_ALREADY_REJECTED'] };
@@ -122,11 +204,25 @@ export function evaluateAutonomousQueryAuthority(
   const atoms = Array.isArray(metadata.atoms) ? metadata.atoms as Array<Record<string, any>> : [];
   const template = String(metadata.queryTemplate || '');
 
+  // The paid-demand setting is a live execution kill switch. Record-level
+  // demand provenance (standalone OR anchored) must be rejected here, not
+  // only in the standalone exception: an authorized primary anchor would
+  // otherwise execute an ANCHOR_DEMAND_SIGNAL row after the operator disabled
+  // paid demand.
+  if (options.demandSignalsEnabled === false && hasDemandSignalMetadata(metadata)) {
+    return { eligible: false, reasonCodes: ['DEMAND_SIGNALS_DISABLED'], retrievalPolicyVersion: String(specificity?.policyVersion || '') };
+  }
+
   if (!specificity) return { eligible: false, reasonCodes: ['CURRENT_RETRIEVAL_PROVENANCE_MISSING'] };
   if (specificity.policyVersion !== RETRIEVAL_SPECIFICITY_POLICY_VERSION) {
     return { eligible: false, reasonCodes: ['STALE_RETRIEVAL_POLICY_VERSION'], retrievalPolicyVersion: String(specificity.policyVersion || '') };
   }
-  if (!['STANDALONE', 'ANCHOR_ONLY'].includes(String(specificity.eligibility)) && !isScopePromotedAnchor(metadata, atoms, options.scopePromotionActive)) {
+  if (
+    !['STANDALONE', 'ANCHOR_ONLY'].includes(String(specificity.eligibility))
+    && !isScopePromotedAnchor(metadata, atoms, options.scopePromotionActive)
+    && !isFreeSignalStandaloneAuthorized(query, metadata, atoms)
+    && !isDemandSignalStandaloneAuthorized(query, metadata, atoms, options.demandSignalsEnabled)
+  ) {
     return { eligible: false, reasonCodes: ['PRIMARY_ATOM_NOT_AUTHORIZED_FOR_RETRIEVAL'], retrievalPolicyVersion: specificity.policyVersion };
   }
 
@@ -134,17 +230,27 @@ export function evaluateAutonomousQueryAuthority(
     const staleAtom = atoms.find(atom => atom.retrievalPolicy?.policyVersion !== RETRIEVAL_SPECIFICITY_POLICY_VERSION);
     if (staleAtom) return { eligible: false, reasonCodes: ['ATOM_POLICY_PROVENANCE_STALE'], retrievalPolicyVersion: specificity.policyVersion };
     const anchor = atoms[0]?.retrievalPolicy?.eligibility;
-    if (!['STANDALONE', 'ANCHOR_ONLY'].includes(String(anchor)) && !isScopePromotedAnchor(metadata, atoms, options.scopePromotionActive)) {
+    if (
+      !['STANDALONE', 'ANCHOR_ONLY'].includes(String(anchor))
+      && !isScopePromotedAnchor(metadata, atoms, options.scopePromotionActive)
+      && !isFreeSignalStandaloneAuthorized(query, metadata, atoms)
+      && !isDemandSignalStandaloneAuthorized(query, metadata, atoms, options.demandSignalsEnabled)
+    ) {
       return { eligible: false, reasonCodes: ['QUERY_ANCHOR_NOT_CURRENTLY_AUTHORIZED'], retrievalPolicyVersion: specificity.policyVersion };
     }
 
     // A generic method can be semantically trading-related while still being a
     // poor global retrieval surface (for example "Order Flow" or "Price Action").
     // Country-targeted autonomous retrieval therefore requires a concrete market/
-    // instrument companion unless the standalone method carries explicit trading
-    // context in the surface itself.
+    // instrument companion unless the standalone surface carries explicit trading
+    // context. Free-signal bootstrap methods obey the same rule as curated
+    // SINGLE_ATOM methods; localized method surfaces that meet the standard pass.
     const primaryType = String(atoms[0]?.type || '').toUpperCase();
-    if (template === 'SINGLE_ATOM' && primaryType === 'METHOD' && !EXPLICIT_STANDALONE_METHOD_CONTEXT.test(query.query)) {
+    if (
+      (template === 'SINGLE_ATOM' || template === 'FREE_SIGNAL_STANDALONE')
+      && primaryType === 'METHOD'
+      && !EXPLICIT_STANDALONE_METHOD_CONTEXT.test(query.query)
+    ) {
       return { eligible: false, reasonCodes: ['STANDALONE_METHOD_REQUIRES_CONCRETE_TRADING_ANCHOR'], retrievalPolicyVersion: specificity.policyVersion };
     }
   } else if (!['SINGLE_ATOM', 'ORGANIC_STANDALONE'].includes(template)) {

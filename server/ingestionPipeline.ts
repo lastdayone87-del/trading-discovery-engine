@@ -13,7 +13,8 @@ import {
   upsertChannel,
   enqueueJob,
   getQuota,
-  getAppSetting
+  getAppSetting,
+  getDb
 } from './db';
 import { calculateCreatorQualityScore, extractVocabularyFromCreator, invokeChannelVocabularyExtraction, replayVocabularyForRetry, resolveExtractionVideoIds } from './queryIntelligence';
 import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
@@ -52,6 +53,63 @@ import { resolvePipelineQuotaOrigin } from './quotaOrigin';
 let discoveryExtractionTail: Promise<unknown> = Promise.resolve();
 let discoveryExtractionBacklog = 0;
 const MAX_DISCOVERY_EXTRACTION_BACKLOG = 8;
+
+export interface NativeExtractionEligibilityInput {
+  cdlEnabled: boolean;
+  nativeExtractionFlagEnabled: boolean;
+  promotionV2Enabled: boolean;
+  qualityScore: number;
+  source: string;
+  countryStatus: string | null | undefined;
+  countryInScope: boolean;
+  tradingStatus: string | null | undefined;
+}
+
+export interface NativeExtractionEligibility {
+  /** All three CDL gates on. `discovery_extraction_enabled` is deliberately absent. */
+  nativeExtractionEnabled: boolean;
+  qualityEligible: boolean;
+  countryValid: boolean;
+  nativeEligible: boolean;
+  /** undefined preserves legacy observation behavior when the new path is off. */
+  promotionEligible: boolean | undefined;
+  persistLegacyTerm: boolean;
+  termHarvestEnabled: boolean;
+}
+
+/**
+ * Pure expanded-extraction split (CDL §7.8). The candidate-corpus path stays
+ * quality-gated exactly as before. The native terminology path also admits
+ * country-valid CONFIRMED + TRADING_CONFIRMED creators below the quality bar,
+ * but those observations are promotion-ineligible and never write legacy
+ * extracted_vocabulary rows. The legacy `discovery_extraction_enabled` flag
+ * is not an input: it governs only the separate staging pipeline.
+ */
+export function resolveNativeExtractionEligibility(input: NativeExtractionEligibilityInput): NativeExtractionEligibility {
+  const nativeExtractionEnabled =
+    input.cdlEnabled === true &&
+    input.nativeExtractionFlagEnabled === true &&
+    input.promotionV2Enabled === true;
+  const qualityEligible = input.qualityScore >= 55 && input.source !== 'manual_search';
+  const countryValid = input.countryStatus === 'CONFIRMED' && input.countryInScope === true;
+  const nativeEligible =
+    nativeExtractionEnabled &&
+    countryValid &&
+    input.tradingStatus === 'TRADING_CONFIRMED' &&
+    input.source !== 'manual_search';
+  const promotionEligible = nativeExtractionEnabled
+    ? qualityEligible && countryValid && input.tradingStatus === 'TRADING_CONFIRMED'
+    : undefined;
+  return {
+    nativeExtractionEnabled,
+    qualityEligible,
+    countryValid,
+    nativeEligible: qualityEligible || nativeEligible,
+    promotionEligible,
+    persistLegacyTerm: promotionEligible !== false,
+    termHarvestEnabled: qualityEligible,
+  };
+}
 
 export interface IngestionCandidate extends DiscoveredChannelRaw {
   // Option for additional candidate details if provided
@@ -921,14 +979,61 @@ async function processChannelThroughPipelineInContext(
   finalChannel.quality_breakdown = qualityResult.breakdown;
   await upsertChannel(finalChannel);
 
-  // Professional manual search is an operator-directed measurement lane. Its
-  // discoveries are persisted, but must not train autonomous terminology until
-  // an explicit human approval supplies independent provenance.
-  if (qualityResult.score >= 55 && source !== 'manual_search') {
-    // Provenance: align YouTube video IDs to titles (null where unknown)
-    // so title-backed terminology observations trace to their source video.
-    await invokeChannelVocabularyExtraction(finalChannel, candidate, selectExplicitTerminologyLanguageContext(candidate));
+  // Expanded extraction split (CDL §7.8): the candidate-corpus path stays
+  // quality-gated exactly as before, while the native terminology path may
+  // also admit country-valid CONFIRMED + TRADING_CONFIRMED creators below the
+  // quality bar. Those lower-quality observations are promotion-ineligible
+  // and never write legacy extracted_vocabulary rows.
+  // Independent settings: one query and one round trip avoids three serial
+  // setting reads on the successful-ingestion path.
+  // A settings-read failure must not fail the channel ingestion after the
+  // channel row was already upserted. Missing or unreadable gates fail closed
+  // to the legacy quality path; migration 161 seeds all three to 'true' for
+  // the normal CDL path.
+  let extractionValues = new Map<string, string>();
+  try {
+    const extractionSettings = await (await getDb()).query(
+      `SELECT setting_key,setting_value FROM app_settings WHERE setting_key = ANY($1)`,
+      [['country_discovery_loop_enabled', 'native_vocabulary_extraction_enabled', 'native_evidence_promotion_v2_enabled']],
+    );
+    extractionValues = new Map<string, string>((extractionSettings.rows || []).map(
+      (row: Record<string, unknown>) => [String(row.setting_key), String(row.setting_value)],
+    ));
+  } catch (error) {
+    console.warn('[Ingestion] CDL extraction settings read failed; falling back to the legacy extraction path:', error);
+  }
+  const extractionFlag = (key: string): boolean => (extractionValues.get(key) ?? 'false') === 'true';
+  const cdlEnabled = extractionFlag('country_discovery_loop_enabled');
+  const nativeExtractionFlagEnabled = extractionFlag('native_vocabulary_extraction_enabled');
+  const promotionV2Enabled = extractionFlag('native_evidence_promotion_v2_enabled');
+  const extraction = resolveNativeExtractionEligibility({
+    cdlEnabled,
+    nativeExtractionFlagEnabled,
+    promotionV2Enabled,
+    qualityScore: qualityResult.score,
+    source,
+    countryStatus: finalChannel.country_status,
+    countryInScope: resolveScopeEligibility(finalChannel.country) === 'IN_SCOPE',
+    tradingStatus: finalChannel.trading_status,
+  });
+
+  // Candidate-corpus shadow path: unchanged, quality-gated only. Operator
+  // rechecks are not autonomous corpus evidence: their observations stay in
+  // the channel/terminology audit trail and must not feed AUTONOMOUS lineage.
+  if (extraction.termHarvestEnabled && !isManualScan) {
     await enqueueTermHarvest({channelId:finalChannel.channel_id,text:[candidate.description,...candidate.videoTitles].filter(Boolean).join('\n'),lineage:'AUTONOMOUS'});
+  }
+
+  // Native terminology path: existing quality path or expanded confirmed-
+  // trader path. Provenance: aligned YouTube video IDs trace title-backed
+  // terminology observations to their source video.
+  if (extraction.nativeEligible) {
+    await invokeChannelVocabularyExtraction(finalChannel, candidate, selectExplicitTerminologyLanguageContext(candidate), undefined, {
+      promotionEligible: extraction.promotionEligible,
+      persistLegacyTerm: extraction.persistLegacyTerm,
+      queryRunId: options?.runId || candidate.queryRunId,
+      queryPageNumber: candidate.queryPageNumber,
+    });
   }
 
   return {

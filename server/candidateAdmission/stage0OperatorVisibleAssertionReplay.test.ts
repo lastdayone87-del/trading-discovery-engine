@@ -45,3 +45,9 @@ test('direct coverage lineage remains preferred and lineage source is auditable'
   assert.match(source, /coverageLineageSource/);
   assert.match(source, /coverageLineageCounts/);
 });
+
+test('operator-visible replay SQL compares canonical country identity on both operands', () => {
+  assert.match(source, /countryIdentitySql\('excluded\.country_name'\)/);
+  assert.match(source, /countryIdentitySql\('channels\.country'\)/);
+  assert.doesNotMatch(source, /regexp_replace\(trim\(excluded\.country_name\)/);
+});

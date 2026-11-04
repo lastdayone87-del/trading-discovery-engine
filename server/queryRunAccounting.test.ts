@@ -27,7 +27,7 @@ test('successful accounting keeps query-run, execution-log, and learned-term lin
 });
 
 test('queue evaluation delegates persistence to completed-run accounting', () => {
-  assert.match(queueSource, /evaluateQueryPerformance\(queryRecord, finalMetrics, \{ retrievalLane, searchOrdering, quotaConsumed, queryRunId, persist: false, providerRequestsFailed, providerRunOutcome \}\)/);
+  assert.match(queueSource, /evaluateQueryPerformance\(queryRecord, finalMetrics, \{\s*retrievalLane: args\.retrievalLane,\s*searchOrdering: args\.searchOrdering,\s*quotaConsumed,\s*queryRunId: args\.queryRunId,\s*persist: false,\s*providerRequestsFailed,\s*providerRunOutcome,?\s*\}\)/);
   assert.match(queueSource, /performanceScore: performance\.performanceScore/);
   assert.match(queueSource, /newCollection: performance\.newCollection/);
 });

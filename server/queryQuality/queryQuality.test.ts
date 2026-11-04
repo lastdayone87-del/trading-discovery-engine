@@ -1112,7 +1112,7 @@ test('Q5/Q6: production wiring uses accounting-window spend, derived failure sta
   assert.match(engine, /apiFetch\(qualityUrl\)\.catch\(\(\) => null\)/);
 
   const queueManager = readFileSync(join(__dirname, '..', 'queueManager.ts'), 'utf8');
-  assert.match(queueManager, /queryRunId, persist: false/);
+  assert.match(queueManager, /queryRunId: args\.queryRunId,\s*persist: false/);
   // Continuation reservations use the same quota-domain test as scheduling.
   assert.match(queueManager, /reservePortfolioContinuationPage\(\{[\s\S]*?providerQuotaUnits: allocatedProvider\.costDomain==='YOUTUBE_DATA_API' \? 100 : 0/);
   // A failed continuation transaction rolls back the release issued through
@@ -2071,4 +2071,30 @@ test('C5: recency-specific mixed composition keeps its distinct reason', () => {
   assert.equal(composition.focus, 'MIXED');
   assert.ok(composition.reasonCodes.includes('RECENT_ALTERNATIVE_OUTPUT_CONFLICTS_WITH_TRADING_HISTORY'));
   assert.ok(!composition.reasonCodes.includes('TRADING_AND_ALTERNATIVE_CONFLICT'));
+});
+
+test('Q2: CDL anchored bootstrap templates admit without granting PR557 provenance', () => {
+  const record = (template: string, origin: 'FREE_SIGNAL' | 'DEMAND_SIGNAL', modifier: string) => ({
+    query: `order flow ${modifier}`,
+    country: 'Germany',
+    primary_term: 'order flow',
+    generation_metadata: {
+      queryTemplate: template,
+      atoms: [
+        { term: 'order flow', type: 'METHOD', origin: 'CURATED', role: 'ANCHOR' },
+        { term: modifier, type: 'CONCEPT', origin, role: 'MODIFIER' },
+      ],
+    },
+  });
+
+  for (const [template, origin, modifier] of [
+    ['ANCHOR_FREE_SIGNAL', 'FREE_SIGNAL', 'futures'],
+    ['ANCHOR_DEMAND_SIGNAL', 'DEMAND_SIGNAL', 'futures'],
+  ] as const) {
+    const decision = admitQueryRecord(record(template, origin, modifier));
+    assert.equal(decision.eligible, true, `${template} must pass the admission gates: ${decision.reasonCodes.join(', ')}`);
+    assert.equal(decision.candidate.relation, 'ANCHOR_MODIFIER', `${template} needs a licensed anchor relation`);
+    assert.equal(decision.candidate.atoms[1]?.provenance, origin, 'bootstrap atoms keep their own provenance');
+    assert.notEqual(decision.candidate.atoms[1]?.provenance, 'PR557', 'candidate vocabulary must still pass the semantic lexicon');
+  }
 });

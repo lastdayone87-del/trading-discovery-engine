@@ -49,6 +49,25 @@ test('explicit "based in Vietnam" remains hard exclusion evidence', () => {
   assert.equal(res.gateDisposition, 'REJECT_EXCLUDED');
 });
 
+test('alias-form exclusion rows apply to the decisive domicile path', () => {
+  const res = assessChannelCountry(
+    {
+      channelName: 'Edge Trading Journal',
+      aboutBio: 'Trader based in Vietnam covering Asian equity futures.',
+      videoTitles: [],
+      videoDescriptions: [],
+      videoDescriptionsAuthoritative: false,
+      playlists: [],
+    } as never,
+    [{ country_name: 'VN', reason: 'alias-form exclusion' }] as never,
+    [],
+  );
+  assert.equal(res.countryStatus, 'REJECTED');
+  assert.equal(res.detectedCreatorCountry, 'Vietnam');
+  assert.equal(res.gateDisposition, 'REJECT_EXCLUDED');
+  assert.match(res.rejectionReason || '', /alias-form exclusion/);
+});
+
 test('explicit "located in Vietnam" remains hard exclusion evidence', () => {
   const res = assess('Research team located in Vietnam trading global macro themes.');
   assert.equal(res.countryStatus, 'REJECTED');

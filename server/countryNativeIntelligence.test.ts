@@ -155,6 +155,25 @@ function createMockRunner() {
         return { rows: ch ? [{ country: ch.country }] : [] };
       }
 
+      if (sqlNorm.startsWith('SELECT country, country_status, trading_status, quality_score FROM channels WHERE channel_id = $1')) {
+        const ch = channels.get(params[0]);
+        return { rows: ch ? [{
+          country: ch.country,
+          country_status: ch.country_status ?? null,
+          trading_status: ch.trading_status ?? null,
+          quality_score: ch.quality_score ?? 0,
+        }] : [] };
+      }
+
+      if (sqlNorm.startsWith('SELECT country_status, trading_status, quality_score FROM channels WHERE channel_id = $1')) {
+        const ch = channels.get(params[0]);
+        return { rows: ch ? [{
+          country_status: ch.country_status ?? null,
+          trading_status: ch.trading_status ?? null,
+          quality_score: ch.quality_score ?? 0,
+        }] : [] };
+      }
+
       if (sqlNorm.startsWith('UPDATE canonical_trading_terms SET last_observed_at = $2 WHERE id = $1')) {
         const id = Number(params[0]);
         const term = canonicalTerms.get(id);
