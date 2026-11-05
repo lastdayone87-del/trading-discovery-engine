@@ -5,6 +5,12 @@
 **Report status:** Incomplete: historical evaluation data was not reachable  
 **Production authority exercised:** None
 
+> **Infrastructure correction (2026-10-27):** Production is hosted on
+> **Coolify**, not Railway. The Railway proxy described below was a separate
+> configured database that was mistakenly treated as production; it is not the
+> production access path. The observed DNS failure is retained. See
+> [Production infrastructure](./production-infrastructure.md).
+
 ## Executive finding
 
 Admission V2 cannot yet be judged semantically from the evidence available in
@@ -50,10 +56,11 @@ creator-focus and coverage snapshots. It performs no write or provider operation
 
 ### Configured historical store
 
-`DATABASE_URL` was configured, but the Railway proxy hostname
-`trolley.proxy.rlwy.net` failed DNS resolution on every connection attempt with
-`getaddrinfo EAI_AGAIN`. A direct DNS check returned the same result. No SQL query
-reached PostgreSQL.
+`DATABASE_URL` was configured with a Railway proxy hostname
+`trolley.proxy.rlwy.net`, which failed DNS resolution on every connection attempt
+with `getaddrinfo EAI_AGAIN`. That target was not the production database
+(production is Coolify). A direct DNS check returned the same result. No SQL
+query reached PostgreSQL.
 
 ### Local repository data
 
