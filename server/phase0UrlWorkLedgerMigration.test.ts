@@ -89,6 +89,10 @@ test('the Phase 0 report is read-only and reconciles the two bounds', () => {
   assert.match(reportBuilder, /never_browser_executed_rows/);
   assert.match(reportBuilder, /ledger_empty_phase0_expected/);
   assert.match(reportBuilder, /retryableWithinFivePercent/);
+  assert.ok(
+    reportBuilder.includes('THEN (${jsonExpression})::int ELSE 0 END'),
+    'JSONB text casts must be parenthesized so ::int does not bind to the key literal',
+  );
   assert.match(reportScript, /buildPhase0UrlWorkLedgerReport/);
   assert.doesNotMatch(reportScript, /INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM/i);
 });

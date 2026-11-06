@@ -47,7 +47,9 @@ const SURFACES = [...COMMUNITY_ACQUISITION_WORK_SURFACES];
 // removed) rather than the projection's full canonicalization, so a
 // normalization bug appears as a delta instead of being hidden.
 function safeIntSql(jsonExpression: string): string {
-  return `(CASE WHEN ${jsonExpression} ~ '^[0-9]+$' THEN ${jsonExpression}::int ELSE 0 END)`;
+  // Parentheses are required: `::` binds tighter than `->>`, so an unparenthesized
+  // cast would apply to the trailing key literal instead of the extracted value.
+  return `(CASE WHEN ${jsonExpression} ~ '^[0-9]+$' THEN (${jsonExpression})::int ELSE 0 END)`;
 }
 
 export async function buildPhase0UrlWorkLedgerReport(
