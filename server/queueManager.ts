@@ -1188,7 +1188,7 @@ export async function processNextSearchJob(
       // unresolved acquisition for the same channel: its inspection must
       // re-acquire rather than borrow its own incomplete coverage in a loop.
       // First-time inspections leave the flag unset and borrow normally.
-      const inspectionResult=await inspectAndValidateChannel(channel,undefined,false,false,false,{jobId:job.id,attemptNumber:job.attempts,isRetryOwnedReacquire:true,clickOffsets:resolveInspectionClickOffsets(job.payload.clickOffsets)});
+      const inspectionResult=await inspectAndValidateChannel(channel,undefined,false,false,false,{jobId:job.id,attemptNumber:job.attempts,generation:job.reopen_generation,isRetryOwnedReacquire:true,clickOffsets:resolveInspectionClickOffsets(job.payload.clickOffsets)});
       // The retry worker replaces this inspection result with a bare error
       // below. Lift the execution counters now so the shadow classifier can
       // distinguish a post-work browser/runtime failure from an unstarted
@@ -2856,7 +2856,7 @@ export async function inspectAndValidateChannel(
   isManualScan: boolean = false,
   enableDebug: boolean = false,
   scheduleRetry: boolean = true,
-  executionMarker?: { jobId: string; attemptNumber: number; isRetryOwnedReacquire?: boolean; clickOffsets?: Record<string, number> }
+  executionMarker?: { jobId: string; attemptNumber: number; generation?: number; isRetryOwnedReacquire?: boolean; clickOffsets?: Record<string, number> }
 ): Promise<{ debugLog?: any; inspection?: Awaited<ReturnType<typeof runChannelInspection>>; retryDirective?: CommunityRetryDirective } | void> {
   if (isTerminalState(channel) && !isManualScan) {
     console.log(`[Queue Manager] Channel '${channel.channel_name}' (${channel.channel_id}) is in terminal state '${channel.country_status}' / '${channel.trading_status}'. Aborting inspection.`);
@@ -2906,7 +2906,7 @@ export async function inspectAndValidateChannel(
   // marking, so they can never count as executed. The marker is bound to the
   // exact claimed attempt: a zero-row update means the claim was already
   // recovered or completed, and inspection must not start on a stale claim.
-  if (executionMarker) await markCommunityInspectionStarted(executionMarker.jobId, executionMarker.attemptNumber);
+  if (executionMarker) await markCommunityInspectionStarted(executionMarker.jobId, executionMarker.attemptNumber, executionMarker.generation);
 
   const now = new Date().toISOString();
 

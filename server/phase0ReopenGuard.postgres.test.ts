@@ -1,12 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { claimNextJob, enqueueJob, getDb } from './dbCore';
+import { claimNextJob, enqueueJob, getDb, markCommunityInspectionStarted } from './dbCore';
 import { ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV } from './acquisitionJobClockPolicy';
 
 // These tests toggle the database-wide job_reopen_guard_config row. They only
 // run in the dedicated Phase 0 reopen-guard workflow so a shared test database
 // used by unrelated PostgreSQL suites never observes the guard enabled.
-const enabled = Boolean(process.env.PHASE0_REOPEN_GUARD_TEST_DATABASE_URL);
+//
+// The opt-in variable also selects the connection: enabling the suite must
+// never mutate whatever DATABASE_URL happened to be inherited from the shell.
+const dedicatedDatabaseUrl = process.env.PHASE0_REOPEN_GUARD_TEST_DATABASE_URL;
+if (dedicatedDatabaseUrl) process.env.DATABASE_URL = dedicatedDatabaseUrl;
+const enabled = Boolean(dedicatedDatabaseUrl);
 const maybe = enabled ? test : test.skip;
 
 const RETRY_TYPE = 'RETRY_COMMUNITY_ACQUISITION';
@@ -52,6 +57,20 @@ async function cleanup(db: any, fixture: Fixture): Promise<void> {
   await db.query(`DELETE FROM job_reopen_events WHERE job_id=$1`, [fixture.id]);
   await db.query(`DELETE FROM job_attempts WHERE job_id=$1`, [fixture.id]);
   await db.query(`DELETE FROM jobs WHERE id=$1`, [fixture.id]);
+}
+
+async function waitForWaitingAdvisoryLock(db: any, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const waiting = await db.query(
+      `SELECT count(*)::int AS waiting
+         FROM pg_locks
+        WHERE locktype='advisory' AND NOT granted`,
+    );
+    if (Number(waiting.rows[0]?.waiting || 0) > 0) return;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  throw new Error('second reopen never blocked on the channel advisory lock');
 }
 
 async function reopen(db: any, fixture: Fixture, type = RETRY_TYPE): Promise<{ status: string; generation: number }> {
@@ -118,6 +137,11 @@ maybe('a reopen records prior status and keeps generation-scoped attempt history
 
   const claimed = await claimNextJob(`phase0-reopen-guard-${Date.now()}`, [ENRICH_TYPE]);
   assert.equal(claimed?.id, fixture.id, 'the highest-priority queued retry must be claimed');
+  assert.equal(
+    claimed?.reopen_generation,
+    1,
+    'the claimed job must expose its generation to the worker attempt marker',
+  );
 
   const attempts = (await db.query(
     `SELECT generation,attempt_number,status
@@ -150,6 +174,23 @@ maybe('a reopen records prior status and keeps generation-scoped attempt history
     Number(olderWorkerAttempt.generation),
     1,
     'the database must assign the claimed job generation when an older worker omits it',
+  );
+
+  // A late marker from an older generation must not attach to the current
+  // attempt even when attempt_number matches; it only matches its own row.
+  await assert.rejects(
+    markCommunityInspectionStarted(fixture.id, 2, 0),
+    /Community inspection marker found no open attempt/,
+  );
+  await markCommunityInspectionStarted(fixture.id, 2, 1);
+  const markedAttempt = (await db.query(
+    `SELECT logs FROM job_attempts WHERE job_id=$1 AND attempt_number=2`,
+    [fixture.id],
+  )).rows[0];
+  assert.ok(
+    Array.isArray(markedAttempt.logs)
+      && markedAttempt.logs.includes('communityInspectionStarted'),
+    'the matching generation must receive the execution marker',
   );
 
   await db.query(`UPDATE jobs SET status='COMPLETED',completed_at=now() WHERE id=$1`, [fixture.id]);
@@ -267,7 +308,19 @@ maybe('an operator override can reopen a capped job', async t => {
   try {
     await client.query('BEGIN');
     await client.query(`SET LOCAL acquisition.reopen_guard_override='on'`);
-    await client.query(`UPDATE jobs SET status='PENDING' WHERE id=$1`, [fixture.id]);
+    // Exercise the real reopen path, not a raw status update: enqueueJob must
+    // carry the operator override through the trigger.
+    const reopened = await enqueueJob(
+      RETRY_TYPE,
+      { channelId: fixture.channelId },
+      {
+        idempotencyKey: fixture.key,
+        priority: 1_000_000_000,
+        maxAttempts: 3,
+        clientOverride: client,
+      },
+    );
+    assert.equal(reopened.status, 'PENDING');
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');
@@ -382,8 +435,9 @@ maybe('concurrent reopens at the cap boundary cannot both pass', async t => {
 
     await secondClient.query('BEGIN');
     secondUpdate = secondClient.query(`UPDATE jobs SET status='PENDING' WHERE id=$1`, [second.id]);
-    // Let the second trigger reach the channel advisory lock, then release it.
-    await new Promise(resolve => setTimeout(resolve, 150));
+    // Wait until the second transaction is actually queued on the channel
+    // advisory lock, then release it. A fixed sleep can miss this on slow CI.
+    await waitForWaitingAdvisoryLock(db);
     await firstClient.query('COMMIT');
 
     const result = await secondUpdate;

@@ -74,7 +74,11 @@ test('migration 165 is additive and rewrites no existing job or observation', ()
   assert.doesNotMatch(withoutSqlComments, /DROP\s+(TABLE|COLUMN)/i);
   assert.doesNotMatch(withoutSqlComments, /DELETE\s+FROM/i);
   assert.doesNotMatch(withoutSqlComments, /TRUNCATE\s+/i);
-  assert.doesNotMatch(withoutSqlComments, /UPDATE\s+public\.jobs/i);
+  assert.doesNotMatch(withoutSqlComments, /\bUPDATE\s+(?:public\.)?jobs\b/i);
+  assert.doesNotMatch(
+    withoutSqlComments,
+    /\b(?:UPDATE|DELETE)\s+(?:public\.)?[\w.]*observations\b/i,
+  );
 });
 
 test('recovery paths do not project a runnable state for a blocked reopen', () => {
@@ -91,23 +95,32 @@ test('recovery paths do not project a runnable state for a blocked reopen', () =
   assert.match(enrichmentRecovery, /if \(outcome === 'BLOCKED'\) \{/);
 });
 
-test('recovery sweeps skip a job whose current generation is capped', () => {
+test('recovery sweeps re-evaluate blocked reopens against current guard state', () => {
   const communityRecovery = readFileSync(new URL('./communityRecovery.ts', import.meta.url), 'utf8');
   const enrichmentRecovery = readFileSync(new URL('./operationalEnrichmentRecovery.ts', import.meta.url), 'utf8');
-  const blockedPredicate = /blocked_reopen\.prior_generation=(?:j|retry_job|failed_job)\.reopen_generation/;
 
-  assert.match(communityRecovery, blockedPredicate);
-  assert.match(enrichmentRecovery, blockedPredicate);
-  assert.match(communityRecovery, /AND NOT EXISTS \(\s*SELECT 1 FROM job_reopen_events blocked_reopen/);
-  assert.match(enrichmentRecovery, /AND NOT EXISTS \(\s*SELECT 1 FROM job_reopen_events blocked_reopen/);
+  // A BLOCKED event is evidence, not a 30-day tombstone: recovery must retry
+  // through enqueueJob so the trigger sees the current config and rolling
+  // reopen window (including an operator disabling the guard).
+  assert.doesNotMatch(communityRecovery, /blocked_reopen/);
+  assert.doesNotMatch(enrichmentRecovery, /blocked_reopen/);
+  assert.doesNotMatch(communityRecovery, /job_reopen_events/);
+  assert.doesNotMatch(enrichmentRecovery, /job_reopen_events/);
 });
 
 test('claims and reopen bookkeeping carry the generation through the writer', () => {
+  const queueManager = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
   assert.match(
     dbCore,
     /INSERT INTO job_attempts\(job_id,attempt_number,generation,status\) VALUES\(\$1,\$2,\$3,'PROCESSING'\)/,
   );
   assert.match(dbCore, /Number\(upd\.rows\[0\]\.reopen_generation\|\|0\)/);
+  assert.match(dbCore, /\(\$4::int IS NULL OR generation=\$4\)/);
+  assert.match(queueManager, /generation:job\.reopen_generation/);
+  assert.match(
+    queueManager,
+    /markCommunityInspectionStarted\(executionMarker\.jobId, executionMarker\.attemptNumber, executionMarker\.generation\)/,
+  );
   assert.match(dbCore, /event:'job_reopen_guard_blocked'/);
   assert.match(dbCore, /throw new Error\('JOB_ENQUEUE_LOST_ROW'\)/);
   assert.ok(

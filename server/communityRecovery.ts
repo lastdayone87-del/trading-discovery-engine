@@ -393,13 +393,6 @@ export async function reconcileCommunityAcquisitionRecovery(
         WHERE j.type='ENRICH_CHANNEL'
           AND j.status='FAILED'
           AND j.last_error LIKE $1
-          AND NOT EXISTS (
-            SELECT 1 FROM job_reopen_events blocked_reopen
-             WHERE blocked_reopen.job_id=j.id
-               AND blocked_reopen.outcome='BLOCKED'
-               AND blocked_reopen.prior_generation=j.reopen_generation
-               AND blocked_reopen.reopened_at > now() - interval '30 days'
-          )
         RETURNING j.payload->>'channelId' AS channel_id
      )
      UPDATE channels c
@@ -453,13 +446,6 @@ export async function reconcileCommunityAcquisitionRecovery(
              AND j.payload->>'channelId'=c.channel_id
              AND j.status IN('PENDING','PROCESSING')
         )
-        AND NOT EXISTS (
-          SELECT 1 FROM job_reopen_events blocked_reopen
-           WHERE blocked_reopen.job_id=retry_job.id
-             AND blocked_reopen.outcome='BLOCKED'
-             AND blocked_reopen.prior_generation=retry_job.reopen_generation
-             AND blocked_reopen.reopened_at > now() - interval '30 days'
-        )
       ORDER BY (retry_job.status='FAILED' AND retry_job.last_error LIKE $2) DESC,
                c.last_checked ASC NULLS FIRST
       LIMIT $1`,
@@ -501,7 +487,9 @@ export async function reconcileCommunityAcquisitionRecovery(
         if (enqueued === false) {
           // The reopen guard kept the retry job terminal. Restore the channel
           // projection so it does not claim an active retry that was never
-          // created.
+          // created. The guard is re-evaluated from current config and the
+          // rolling reopen window on the next sweep; a BLOCKED ledger row is
+          // evidence, never a stale 30-day ban.
           await upsertChannel(channelRecord);
           continue;
         }

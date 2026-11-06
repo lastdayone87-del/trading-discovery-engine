@@ -2614,7 +2614,7 @@ export async function getApprovedWeights(siteIdentity: string): Promise<{
 export async function performManualDatabaseBackup():Promise<{success:boolean;timestamp:string;backupPath:string}>{throw new Error('Manual SQL.js file backup is disabled after PostgreSQL migration. Use PostgreSQL/Railway backups or pg_dump.');}
 
 export type JobStatus='PENDING'|'PROCESSING'|'COMPLETED'|'FAILED';
-export interface DurableJob{ id:string; type:string; status:JobStatus; payload:any; attempts:number; max_attempts:number; run_after:string; locked_by?:string|null; locked_at?:string|null; last_error?:string|null; created_at:string; reopen_blocked?:boolean; }
+export interface DurableJob{ id:string; type:string; status:JobStatus; payload:any; attempts:number; max_attempts:number; run_after:string; locked_by?:string|null; locked_at?:string|null; last_error?:string|null; created_at:string; reopen_generation?:number; reopen_blocked?:boolean; }
 /** Minimal client surface for budget guards evaluated inside the claim transaction. */
 export interface ClaimBudgetClient { query: (text: string, params?: any[]) => Promise<{ rows: any[] }>; }
 /**
@@ -2674,7 +2674,7 @@ export async function enqueueJob(type:string,payload:any,opts:{priority?:number;
   }
   throw new Error('JOB_ENQUEUE_LOST_ROW');
 }
-function rowToJob(r:any):DurableJob{return {id:r.id,type:r.type,status:r.status,payload:parseJson(r.payload,{}),attempts:r.attempts,max_attempts:r.max_attempts,run_after:iso(r.run_after)||'',locked_by:r.locked_by,locked_at:iso(r.locked_at),last_error:r.last_error,created_at:iso(r.created_at)||''};}
+function rowToJob(r:any):DurableJob{return {id:r.id,type:r.type,status:r.status,payload:parseJson(r.payload,{}),attempts:r.attempts,max_attempts:r.max_attempts,run_after:iso(r.run_after)||'',locked_by:r.locked_by,locked_at:iso(r.locked_at),last_error:r.last_error,created_at:iso(r.created_at)||'',reopen_generation:r.reopen_generation==null?0:Number(r.reopen_generation)};}
 export async function claimNextJob(workerId:string,types?:string[],excludedErrorPatterns?:string[],excludedReconciliationStatuses?:string[],budgetGuards:ClaimBudgetGuard[]=[]):Promise<DurableJob|null>{const db=await getDb(); const client=await db.connect(); let claimed:DurableJob|null=null;try{await client.query('BEGIN');
     // Single priority-preserving claim loop: always consider the globally
     // highest-priority pending candidate first. Unguarded candidates claim
@@ -2731,9 +2731,11 @@ export async function completeJob(jobId:string):Promise<void>{const db=await get
  * execution, while failing fast retries the job with the marker intact.
  */
 export const COMMUNITY_INSPECTION_STARTED_MARKER = 'communityInspectionStarted';
-export async function markCommunityInspectionStarted(jobId:string,attemptNumber:number):Promise<void>{
+export async function markCommunityInspectionStarted(jobId:string,attemptNumber:number,generation?:number):Promise<void>{
   const db=await getDb();
-  const res=await db.query(`UPDATE job_attempts SET logs = logs || $3::jsonb WHERE job_id=$1 AND attempt_number=$2 AND status='PROCESSING' AND finished_at IS NULL`,[jobId,attemptNumber,JSON.stringify(COMMUNITY_INSPECTION_STARTED_MARKER)]);
+  // attempt_number restarts at 1 after a reopen, so a late marker from an older
+  // generation must also match the claimed generation when the caller knows it.
+  const res=await db.query(`UPDATE job_attempts SET logs = logs || $3::jsonb WHERE job_id=$1 AND attempt_number=$2 AND ($4::int IS NULL OR generation=$4) AND status='PROCESSING' AND finished_at IS NULL`,[jobId,attemptNumber,JSON.stringify(COMMUNITY_INSPECTION_STARTED_MARKER),generation??null]);
   if(!res.rowCount) throw new Error(`Community inspection marker found no open attempt (job ${jobId} attempt ${attemptNumber}); claim was recovered or completed before inspection.`);
 }
 export type JobFailureDisposition='RETRYING_WITHOUT_ATTEMPT'|'RETRYING'|'FAILED';

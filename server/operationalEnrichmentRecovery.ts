@@ -301,13 +301,6 @@ async function runOperationalEnrichmentReconciliation(
            WHERE terminal_event.channel_id=c.channel_id
              AND terminal_event.event_key LIKE 'operational-enrichment-terminal:%'
         )
-        AND NOT EXISTS (
-          SELECT 1 FROM job_reopen_events blocked_reopen
-           WHERE blocked_reopen.job_id=failed_job.id
-             AND blocked_reopen.outcome='BLOCKED'
-             AND blocked_reopen.prior_generation=failed_job.reopen_generation
-             AND blocked_reopen.reopened_at > now() - interval '30 days'
-        )
       ORDER BY c.last_checked ASC NULLS FIRST
       LIMIT $1`,
     [Math.min(100, Math.max(1, limit))]
@@ -372,7 +365,9 @@ async function runOperationalEnrichmentReconciliation(
     }
     if (outcome === 'BLOCKED') {
       // The reopen guard kept the enrichment job terminal. Restore the
-      // channel projection and do not consume a recovery cycle.
+      // channel projection and do not consume a recovery cycle. The next sweep
+      // re-evaluates the current guard config and rolling window instead of
+      // treating the BLOCKED ledger row as a separate 30-day ban.
       await upsertChannel(channel);
       continue;
     }
