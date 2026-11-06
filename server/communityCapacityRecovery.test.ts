@@ -4,6 +4,7 @@ import {
   COMMUNITY_CAPACITY_RETRY_LEASE_MS,
   reconcileCommunityAcquisitionRecovery
 } from './communityRecovery';
+import { ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV } from './acquisitionJobClockPolicy';
 
 test('capacity-only terminal community retry is reopened immediately and its retry epoch is renewed', async () => {
   const queries: Array<{ sql: string; values?: unknown[] }> = [];
@@ -77,4 +78,86 @@ test('capacity-only terminal community retry is reopened immediately and its ret
   const terminalEpochRefresh = queries.find(q => q.sql.includes("WHERE id=$1 AND status='FAILED'"));
   assert.ok(terminalEpochRefresh, 'terminal capacity-only retry should receive a fresh retry epoch before enqueue');
   assert.deepEqual(terminalEpochRefresh?.values, ['job-capacity-only']);
+});
+
+test('clock-v2 capacity recovery renews leases without rewriting queue or failure clocks', async () => {
+  process.env[ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV] = 'true';
+  try {
+    const queries: Array<{ sql: string; values?: unknown[] }> = [];
+    const db = {
+      async query(sql: string, values?: unknown[]) {
+        queries.push({ sql, values });
+        if (sql.includes('SELECT c.channel_id')) {
+          return {
+            rows: [{
+              channel_id: 'UC_CAPACITY_ONLY',
+              capacity_retry_job_id: 'job-capacity-only',
+              capacity_terminal: true,
+              retry_reason: 'BROWSER_RUNTIME_UNAVAILABLE'
+            }]
+          };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    };
+
+    const channel: any = {
+      channel_id: 'UC_CAPACITY_ONLY',
+      channel_name: 'Capacity Only',
+      youtube_url: 'https://youtube.com/channel/UC_CAPACITY_ONLY',
+      country: 'Germany',
+      country_status: 'CONFIRMED',
+      confidence_score: 100,
+      discord_status: 'UNCERTAIN',
+      discord_invite: null,
+      discord_validation_status: 'RETRY_PENDING',
+      scan_status: 'FAILED',
+      scan_attempts: 1,
+      discovery_source: 'autonomous',
+      first_seen: new Date(0).toISOString(),
+      last_checked: new Date().toISOString(),
+      inspection_trail: [],
+      trading_status: 'TRADING_CONFIRMED',
+      trading_confidence_score: 100,
+      trading_category: 'General Trading',
+      activity_band: 'UNKNOWN',
+      activity_score: 50
+    };
+
+    await reconcileCommunityAcquisitionRecovery(
+      async () => db,
+      async id => id === channel.channel_id ? channel : null,
+      async () => undefined,
+      20,
+      Date.now() + 240_000,
+      async () => undefined
+    );
+
+    assert.equal(
+      queries.filter(query => /created_at\s*=\s*now\(\)/.test(query.sql)).length,
+      0,
+      'clock-v2 reconciliation must never rewrite the queue clock'
+    );
+
+    const communityRefresh = queries.find(query =>
+      query.sql.includes("type='RETRY_COMMUNITY_ACQUISITION'")
+      && query.sql.includes("status IN('PENDING','PROCESSING')")
+    );
+    assert.ok(communityRefresh, 'active capacity deferrals should renew their lease');
+    assert.match(communityRefresh!.sql, /capacity_lease_expires_at=/);
+    assert.match(communityRefresh!.sql, /capacity_lease_renewals=/);
+    assert.doesNotMatch(communityRefresh!.sql, /first_transient_failure_at/);
+    assert.equal(communityRefresh!.values?.[1], String(COMMUNITY_CAPACITY_RETRY_LEASE_MS));
+
+    const terminalEpochRefresh = queries.find(query => query.sql.includes("WHERE id=$1 AND status='FAILED'"));
+    assert.ok(terminalEpochRefresh, 'terminal capacity-only retry should renew its lease before reopen');
+    assert.match(terminalEpochRefresh!.sql, /capacity_lease_started_at=/);
+    assert.doesNotMatch(terminalEpochRefresh!.sql, /created_at/);
+    assert.deepEqual(terminalEpochRefresh!.values, ['job-capacity-only', String(COMMUNITY_CAPACITY_RETRY_LEASE_MS)]);
+
+    const selection = queries.find(query => query.sql.includes('SELECT c.channel_id'))?.sql || '';
+    assert.match(selection, /ORDER BY COALESCE\(j\.last_reopened_at, j\.created_at\) DESC/);
+  } finally {
+    delete process.env[ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV];
+  }
 });

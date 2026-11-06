@@ -1,5 +1,6 @@
 import type { ChannelRecord } from '../src/types';
 import type { DiscoveredChannelRaw } from './youtube';
+import { acquisitionJobClockV2Enabled, CAPACITY_LEASE_DURATION_MS, capacityLeaseRefreshSetSql } from './acquisitionJobClockPolicy';
 
 export interface CommunityRecoveryReactivationReason {
   reactivate: boolean;
@@ -74,9 +75,10 @@ export const COMMUNITY_ACTIVE_RECOVERY_COOLDOWN_MS = 24 * 60 * 60_000;
 // The generic job failure policy has a six-hour transient-age ceiling based on
 // jobs.created_at. Capacity deferrals are intentionally attempt-free, so they
 // must not age into a terminal result merely because provider capacity stayed
-// unavailable. Renew the retry epoch before that generic ceiling while
-// preserving normal run_after backoff and durable execution history.
-export const COMMUNITY_CAPACITY_RETRY_LEASE_MS = 5 * 60 * 60_000;
+// unavailable. Legacy mode renews the retry epoch by rewriting created_at;
+// clock-v2 mode renews only the capacity-lease fields, leaving queue age and
+// the genuine failure anchor untouched.
+export const COMMUNITY_CAPACITY_RETRY_LEASE_MS = CAPACITY_LEASE_DURATION_MS;
 const COMMUNITY_CAPACITY_DEFERRED_PREFIX = 'Community acquisition deferred:';
 const COMMUNITY_CAPACITY_TERMINAL_PREFIX = 'OPERATIONALLY_BLOCKED_RETRY_REQUIRED: Community acquisition deferred:';
 const ENRICHMENT_CAPACITY_ERROR_FRAGMENT = 'ENRICHMENT YouTube quota allocation is exhausted';
@@ -316,47 +318,78 @@ export async function reconcileCommunityAcquisitionRecovery(
   lastCommunityRecoveryReconciliationAt = now;
 
   const db = await getDb();
+  const clockV2 = acquisitionJobClockV2Enabled();
+  const retryJobRecencyOrder = clockV2
+    ? 'COALESCE(j.last_reopened_at, j.created_at) DESC'
+    : 'j.created_at DESC';
 
-  // Keep active community capacity deferrals younger than the generic transient
-  // age ceiling. This does not change run_after, attempts, or attempt history.
-  await db.query(
-    `UPDATE jobs
-        SET created_at=now(), updated_at=now()
-      WHERE type='RETRY_COMMUNITY_ACQUISITION'
-        AND status IN('PENDING','PROCESSING')
-        AND last_error LIKE $1
-        AND created_at < now() - ($2 || ' milliseconds')::interval`,
-    [`${COMMUNITY_CAPACITY_DEFERRED_PREFIX}%`, String(COMMUNITY_CAPACITY_RETRY_LEASE_MS)]
-  );
+  if (clockV2) {
+    // Clock-v2: renew capacity bookkeeping only. created_at remains the
+    // immutable queue clock and first_transient_failure_at remains the
+    // genuine failure anchor.
+    await db.query(
+      `UPDATE jobs
+          SET ${capacityLeaseRefreshSetSql('$2')}
+        WHERE type='RETRY_COMMUNITY_ACQUISITION'
+          AND status IN('PENDING','PROCESSING')
+          AND last_error LIKE $1
+          AND COALESCE(capacity_lease_expires_at, created_at + ($2 || ' milliseconds')::interval)
+              < now() + interval '1 hour'`,
+      [`${COMMUNITY_CAPACITY_DEFERRED_PREFIX}%`, String(COMMUNITY_CAPACITY_RETRY_LEASE_MS)]
+    );
 
-  // ENRICH_CHANNEL uses the same attempt-free quota signal. Prevent an old
-  // pending enrichment job from becoming terminal merely because it waited for
-  // the next quota window longer than the generic six-hour age ceiling.
-  await db.query(
-    `UPDATE jobs
-        SET created_at=now(), updated_at=now()
-      WHERE type='ENRICH_CHANNEL'
-        AND status IN('PENDING','PROCESSING')
-        AND last_error LIKE $1
-        AND created_at < now() - ($2 || ' milliseconds')::interval`,
-    [`%${ENRICHMENT_CAPACITY_ERROR_FRAGMENT}%`, String(COMMUNITY_CAPACITY_RETRY_LEASE_MS)]
-  );
+    await db.query(
+      `UPDATE jobs
+          SET ${capacityLeaseRefreshSetSql('$2')}
+        WHERE type='ENRICH_CHANNEL'
+          AND status IN('PENDING','PROCESSING')
+          AND last_error LIKE $1
+          AND COALESCE(capacity_lease_expires_at, created_at + ($2 || ' milliseconds')::interval)
+              < now() + interval '1 hour'`,
+      [`%${ENRICHMENT_CAPACITY_ERROR_FRAGMENT}%`, String(COMMUNITY_CAPACITY_RETRY_LEASE_MS)]
+    );
+  } else {
+    // Keep active community capacity deferrals younger than the generic transient
+    // age ceiling. This does not change run_after, attempts, or attempt history.
+    await db.query(
+      `UPDATE jobs
+          SET created_at=now(), updated_at=now()
+        WHERE type='RETRY_COMMUNITY_ACQUISITION'
+          AND status IN('PENDING','PROCESSING')
+          AND last_error LIKE $1
+          AND created_at < now() - ($2 || ' milliseconds')::interval`,
+      [`${COMMUNITY_CAPACITY_DEFERRED_PREFIX}%`, String(COMMUNITY_CAPACITY_RETRY_LEASE_MS)]
+    );
+
+    // ENRICH_CHANNEL uses the same attempt-free quota signal. Prevent an old
+    // pending enrichment job from becoming terminal merely because it waited for
+    // the next quota window longer than the generic six-hour age ceiling.
+    await db.query(
+      `UPDATE jobs
+          SET created_at=now(), updated_at=now()
+        WHERE type='ENRICH_CHANNEL'
+          AND status IN('PENDING','PROCESSING')
+          AND last_error LIKE $1
+          AND created_at < now() - ($2 || ' milliseconds')::interval`,
+      [`%${ENRICHMENT_CAPACITY_ERROR_FRAGMENT}%`, String(COMMUNITY_CAPACITY_RETRY_LEASE_MS)]
+    );
+  }
 
   // Repair historical/current enrichment rows already terminalized solely by
   // quota capacity. The job remains the same durable owner; its retry epoch is
   // renewed, the claim increment is undone because the failure was attempt-free,
   // and the channel projection returns to ENRICHMENT_PENDING. Semantic terminal
   // channels are deliberately excluded.
+  const enrichmentRecoverySet = clockV2
+    ? `status='PENDING',attempts=GREATEST(0,j.attempts-1),last_enqueued_at=now(),reopen_generation=j.reopen_generation+1,last_reopened_at=now(),${capacityLeaseRefreshSetSql('$2')},locked_by=NULL,locked_at=NULL,completed_at=NULL`
+    : `status='PENDING',attempts=GREATEST(0,j.attempts-1),created_at=now(),updated_at=now(),locked_by=NULL,locked_at=NULL,completed_at=NULL`;
+  const enrichmentRecoveryValues = clockV2
+    ? [`OPERATIONALLY_BLOCKED_RETRY_REQUIRED:%${ENRICHMENT_CAPACITY_ERROR_FRAGMENT}%`, String(COMMUNITY_CAPACITY_RETRY_LEASE_MS)]
+    : [`OPERATIONALLY_BLOCKED_RETRY_REQUIRED:%${ENRICHMENT_CAPACITY_ERROR_FRAGMENT}%`];
   await db.query(
     `WITH recovered AS (
        UPDATE jobs j
-          SET status='PENDING',
-              attempts=GREATEST(0,j.attempts-1),
-              created_at=now(),
-              updated_at=now(),
-              locked_by=NULL,
-              locked_at=NULL,
-              completed_at=NULL
+          SET ${enrichmentRecoverySet}
         WHERE j.type='ENRICH_CHANNEL'
           AND j.status='FAILED'
           AND j.last_error LIKE $1
@@ -369,7 +402,7 @@ export async function reconcileCommunityAcquisitionRecovery(
         AND c.scan_status='FAILED'
         AND c.country_status <> 'REJECTED'
         AND c.trading_status NOT IN('NON_TRADING','HUMAN_REJECTED')`,
-    [`OPERATIONALLY_BLOCKED_RETRY_REQUIRED:%${ENRICHMENT_CAPACITY_ERROR_FRAGMENT}%`]
+    enrichmentRecoveryValues
   );
 
   const rows = await db.query(
@@ -387,7 +420,7 @@ export async function reconcileCommunityAcquisitionRecovery(
            FROM jobs j
           WHERE j.type='RETRY_COMMUNITY_ACQUISITION'
             AND j.payload->>'channelId'=c.channel_id
-          ORDER BY j.created_at DESC
+          ORDER BY ${retryJobRecencyOrder}
           LIMIT 1
        ) retry_job ON true
       WHERE c.scan_status IN('FAILED','FAILED_PERMANENT')
@@ -432,10 +465,17 @@ export async function reconcileCommunityAcquisitionRecovery(
     await upsertChannel(updated);
     try {
       if (capacityTerminal && row.capacity_retry_job_id) {
-        await db.query(
-          `UPDATE jobs SET created_at=now(),updated_at=now() WHERE id=$1 AND status='FAILED'`,
-          [row.capacity_retry_job_id]
-        );
+        if (clockV2) {
+          await db.query(
+            `UPDATE jobs SET ${capacityLeaseRefreshSetSql('$2')} WHERE id=$1 AND status='FAILED'`,
+            [row.capacity_retry_job_id, String(COMMUNITY_CAPACITY_RETRY_LEASE_MS)]
+          );
+        } else {
+          await db.query(
+            `UPDATE jobs SET created_at=now(),updated_at=now() WHERE id=$1 AND status='FAILED'`,
+            [row.capacity_retry_job_id]
+          );
+        }
       }
       if (enqueueRecoveryJob) {
         await enqueueRecoveryJob(

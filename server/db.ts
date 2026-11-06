@@ -4,6 +4,7 @@
 export * from './dbCore';
 
 import { getDb, isRetryableInfrastructureFailure, resolveGeminiSemanticCooldownExpiryMs, resolveGeminiOrgSemanticCooldownExpiryMs, resolveGroqSemanticCooldownExpiryMs, resolveGroqOrgCooldownExpiryMs, resolveGeminiFreeSemanticCooldownExpiryMs, failedProviderOrg } from './dbCore';
+import { acquisitionJobClockV2Enabled, CAPACITY_LEASE_DURATION_MS, capacityLeaseRefreshSetSql, capacityLeaseRunAfter, isCapacityLeaseFailure, normalizeCapacityLeaseRunAfter } from './acquisitionJobClockPolicy';
 import { bumpJobFailureDisposition, jobDispositionExecutionKey, markJobDispositionCounted } from './operationsTelemetry';
 
 export type JobFailureDisposition='RETRYING_WITHOUT_ATTEMPT'|'RETRYING'|'FAILED';
@@ -80,14 +81,23 @@ export function resolveTransientFailureAnchor(error:any,persistedFirstTransientF
   return Number.isFinite(persisted)?persisted:now;
 }
 
-export async function failJob(jobId:string,error:any):Promise<JobFailureDisposition|null>{
-  const db=await getDb();
+export interface JobFailureDb {
+  query(text:string,values?:unknown[]):Promise<{rowCount?:number|null;rows:any[]}>;
+}
+
+export async function failJob(jobId:string,error:any,deps?:{db?:JobFailureDb;now?:number}):Promise<JobFailureDisposition|null>{
+  const db=(deps?.db??await getDb()) as unknown as JobFailureDb;
   const res=await db.query('SELECT attempts,max_attempts,first_transient_failure_at FROM jobs WHERE id=$1',[jobId]);
   if(!res.rowCount)return null;
   const {attempts,max_attempts,first_transient_failure_at}=res.rows[0];
-  const now=Date.now();
+  const now=deps?.now??Date.now();
+  const clockV2=acquisitionJobClockV2Enabled();
+  // Capacity/runtime waits are not genuine acquisition failures. They must not
+  // receive a failure-budget anchor, and passing `now` to the decision keeps an
+  // old genuine anchor from terminalizing a wait that never ran acquisition.
+  const capacityLease=clockV2&&isCapacityLeaseFailure(error);
   const retryableInfrastructure=isRetryableInfrastructureFailure(error);
-  const firstFailureAt=resolveTransientFailureAnchor(error,first_transient_failure_at,now);
+  const firstFailureAt=capacityLease?now:resolveTransientFailureAnchor(error,first_transient_failure_at,now);
   const msg=persistedJobFailureMessage(error);
 
   // Query the authoritative Gemini semantic cooldown from provider_call_events.
@@ -119,6 +129,13 @@ export async function failJob(jobId:string,error:any):Promise<JobFailureDisposit
   }
 
   const decision=(await import('./dbCore')).decideJobFailure(error,attempts,max_attempts,now,firstFailureAt,geminiSemanticCooldownExpiryMs,groqSemanticCooldownExpiryMs,geminiFreeSemanticCooldownExpiryMs);
+  // A capacity wait is attempt-free regardless of the generic classification:
+  // no acquisition work ran, so it cannot spend a durable attempt or age into
+  // a false terminal. The run_after schedule still honors provider hints.
+  const disposition:JobFailureDisposition=capacityLease?'RETRYING_WITHOUT_ATTEMPT':decision.disposition;
+  const runAfter=capacityLease
+    ? normalizeCapacityLeaseRunAfter(error,decision.runAfter??capacityLeaseRunAfter(error,attempts,now),attempts,now)
+    : decision.runAfter;
   // Operations telemetry lives on the serving facade (this failJob shadows
   // dbCore.failJob for all worker imports). Capture this execution's open
   // attempt row BEFORE the transition below publishes PENDING: a new claim
@@ -134,16 +151,22 @@ export async function failJob(jobId:string,error:any):Promise<JobFailureDisposit
     attemptRowId = open.rows[0]?.id ?? null;
   } catch { attemptRowId = null; }
   const countDisposition=()=>{
-    if (markJobDispositionCounted(jobDispositionExecutionKey(attemptRowId, jobId, attempts), decision.disposition)) {
-      bumpJobFailureDisposition(decision.disposition);
+    if (markJobDispositionCounted(jobDispositionExecutionKey(attemptRowId, jobId, attempts), disposition)) {
+      bumpJobFailureDisposition(disposition);
     }
   };
-  const persistedMessage=decision.operationallyBlocked?`OPERATIONALLY_BLOCKED_RETRY_REQUIRED: ${msg}`:msg;
+  const persistedMessage=decision.operationallyBlocked&&!capacityLease?`OPERATIONALLY_BLOCKED_RETRY_REQUIRED: ${msg}`:msg;
   const transientAnchor=retryableInfrastructure?new Date(firstFailureAt).toISOString():null;
 
-  if(decision.disposition==='RETRYING_WITHOUT_ATTEMPT'){
-    await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,first_transient_failure_at=COALESCE(first_transient_failure_at,$4::timestamptz),updated_at=now() WHERE id=$1`,[jobId,persistedMessage,new Date(decision.runAfter!).toISOString(),transientAnchor]);
-  }else if(decision.disposition==='FAILED'){
+  if(disposition==='RETRYING_WITHOUT_ATTEMPT'){
+    if(capacityLease){
+      // Renew only capacity bookkeeping. first_transient_failure_at and
+      // created_at are deliberately absent from this statement.
+      await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,${capacityLeaseRefreshSetSql('$4')} WHERE id=$1`,[jobId,persistedMessage,new Date(runAfter!).toISOString(),String(CAPACITY_LEASE_DURATION_MS)]);
+    }else{
+      await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,first_transient_failure_at=COALESCE(first_transient_failure_at,$4::timestamptz),updated_at=now() WHERE id=$1`,[jobId,persistedMessage,new Date(runAfter!).toISOString(),transientAnchor]);
+    }
+  }else if(disposition==='FAILED'){
     await db.query(`UPDATE jobs SET status='FAILED',last_error=$2,locked_by=NULL,locked_at=NULL,first_transient_failure_at=CASE WHEN $3::boolean THEN COALESCE(first_transient_failure_at,$4::timestamptz) ELSE first_transient_failure_at END,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,retryableInfrastructure,transientAnchor]);
   }else{
     const seconds=Math.min(900,30*Math.pow(2,Math.max(0,attempts-1)));
@@ -157,5 +180,5 @@ export async function failJob(jobId:string,error:any):Promise<JobFailureDisposit
   // open row happens to exist now — a post-transition claim opens a new row).
   const finalize = failedAttemptFinalizeQuery(jobId, attemptRowId, persistedMessage);
   await db.query(finalize.text, finalize.values as any[]);
-  return decision.disposition;
+  return disposition;
 }
