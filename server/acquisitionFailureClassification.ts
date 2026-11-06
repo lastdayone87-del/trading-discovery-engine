@@ -234,6 +234,12 @@ export function acquisitionEvidenceFromError(error: unknown): AcquisitionFailure
 
 /** The evidence-bearing shape shared by acquisition observations. */
 export interface AcquisitionEvidenceObservation {
+  /**
+   * Borrowed cache-hit observations replay telemetry from an earlier crawl;
+   * their counters describe that crawl, not this attempt, so they must not
+   * contribute to the current execution evidence.
+   */
+  siteCacheHit?: unknown;
   telemetry?: {
     pagesInspected?: unknown;
     requestsStarted?: unknown;
@@ -246,10 +252,11 @@ export interface AcquisitionEvidenceObservation {
  *
  * The community retry worker replaces its inspection observation with a new,
  * unannotated error, so the counters must be lifted from the observation rows
- * before failJob classifies it. A counter is reported only when every
- * observation carried a valid value (so a zero total cannot hide an unknown
- * row); a positive value from any observation is always retained because it
- * proves work started on its own.
+ * before failJob classifies it. Cache-hit observations are skipped because
+ * their telemetry belongs to an earlier execution. A counter is reported only
+ * when every remaining observation carried a valid value (so a zero total
+ * cannot hide an unknown row); a positive value from any observation is always
+ * retained because it proves work started on its own.
  */
 export function acquisitionEvidenceFromObservations(
   observations: readonly AcquisitionEvidenceObservation[] | null | undefined,
@@ -265,7 +272,10 @@ export function acquisitionEvidenceFromObservations(
     requestsStarted: true,
     redirectsFollowed: true,
   };
+  let included = 0;
   for (const observation of observations) {
+    if (observation?.siteCacheHit === true) continue;
+    included += 1;
     const telemetry = observation?.telemetry;
     for (const key of WORK_EVIDENCE_COUNTERS) {
       const value = telemetry && typeof telemetry === 'object' ? telemetry[key] : undefined;
@@ -280,6 +290,9 @@ export function acquisitionEvidenceFromObservations(
   for (const key of WORK_EVIDENCE_COUNTERS) {
     if (complete[key] || totals[key] > 0) evidence[key] = totals[key];
   }
+  // Only cache-hit observations were available: nothing here describes this
+  // execution, so report UNKNOWN rather than a synthetic zero-work attempt.
+  if (included === 0) return undefined;
   return Object.keys(evidence).length > 0 ? evidence : undefined;
 }
 

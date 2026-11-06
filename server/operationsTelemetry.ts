@@ -149,33 +149,35 @@ export function bumpCommunitySaturationDeferral(): void {
 }
 
 /**
- * Bounded idempotency guard shared by the disposition and classification
- * counters. failJob performs its writes outside a transaction: if a secondary
- * bookkeeping write fails after the job row committed, a worker retry re-runs
- * the same transition and must not count it twice. Keys are prefixed by
- * counter kind so a classification count can never suppress a disposition
- * count for the same execution.
+ * Bounded idempotency guards for the disposition and classification counters.
+ * failJob performs its writes outside a transaction: if a secondary bookkeeping
+ * write fails after the job row committed, a worker retry re-runs the same
+ * transition and must not count it twice.
+ *
+ * The guards are separate per kind so classification traffic can never evict a
+ * disposition key (or vice versa) and cause a repeated failure to double-count.
  */
-const countedExecutions = new Map<string, number>();
-const MAX_COUNTED_EXECUTIONS = 5000;
+const countedDispositions = new Map<string, number>();
+const countedClassifications = new Map<string, number>();
+const MAX_COUNTED_EXECUTIONS_PER_KIND = 5000;
 
-function markExecutionCounted(key: string): boolean {
-  if (countedExecutions.has(key)) return false;
-  if (countedExecutions.size >= MAX_COUNTED_EXECUTIONS) {
-    const oldest = countedExecutions.keys().next();
-    if (!oldest.done) countedExecutions.delete(oldest.value);
+function markExecutionCounted(guard: Map<string, number>, key: string): boolean {
+  if (guard.has(key)) return false;
+  if (guard.size >= MAX_COUNTED_EXECUTIONS_PER_KIND) {
+    const oldest = guard.keys().next();
+    if (!oldest.done) guard.delete(oldest.value);
   }
-  countedExecutions.set(key, Date.now());
+  guard.set(key, Date.now());
   return true;
 }
 
 export function markJobDispositionCounted(executionKey: unknown, disposition: unknown): boolean {
-  return markExecutionCounted(`disposition:${String(executionKey)}:${normalizeJobFailure(disposition)}`);
+  return markExecutionCounted(countedDispositions, `${String(executionKey)}:${normalizeJobFailure(disposition)}`);
 }
 
 /** Count a persisted classification at most once per execution. */
 export function markJobFailureClassificationCounted(executionKey: unknown): boolean {
-  return markExecutionCounted(`classification:${String(executionKey)}`);
+  return markExecutionCounted(countedClassifications, String(executionKey));
 }
 
 export function jobDispositionExecutionKey(
@@ -219,4 +221,8 @@ export function resetOperationsTelemetry(): void {
   counters.operationalEnrichmentRecoveryDuplicateEventsTotal = fresh.operationalEnrichmentRecoveryDuplicateEventsTotal;
   counters.operationalEnrichmentRecoveryExhaustedTotal = fresh.operationalEnrichmentRecoveryExhaustedTotal;
   counters.communitySaturationDeferralsTotal = fresh.communitySaturationDeferralsTotal;
+  // Dedupe state is test-observable too: a reset must start from a clean slate
+  // or a later test can be silently suppressed by an earlier execution key.
+  countedDispositions.clear();
+  countedClassifications.clear();
 }

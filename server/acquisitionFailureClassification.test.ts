@@ -262,3 +262,21 @@ test('inspection observations aggregate counters without hiding unknown rows', (
     'UNKNOWN',
   );
 });
+
+test('cache-hit observations never contribute execution counters', () => {
+  assert.equal(
+    acquisitionEvidenceFromObservations([
+      { siteCacheHit: true, telemetry: { pagesInspected: 9, requestsStarted: 9, redirectsFollowed: 9 } },
+    ]),
+    undefined,
+    'a cache hit alone is borrowed evidence, not this execution',
+  );
+  assert.deepEqual(
+    acquisitionEvidenceFromObservations([
+      { siteCacheHit: true, telemetry: { pagesInspected: 9, requestsStarted: 9, redirectsFollowed: 9 } },
+      { telemetry: { pagesInspected: 1, requestsStarted: 0, redirectsFollowed: 0 } },
+    ]),
+    { pagesInspected: 1, requestsStarted: 0, redirectsFollowed: 0 },
+    'stale cache-hit counters must not make the current attempt look like work started',
+  );
+});

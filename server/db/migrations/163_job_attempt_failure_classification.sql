@@ -22,6 +22,10 @@
 --     window and a later slice can add a partial index if measured volume
 --     requires one.
 --
+-- Closed value sets get NOT VALID CHECK constraints: they apply to every new
+-- write without scanning existing rows, so historical NULLs and a rolling
+-- deploy with an older worker remain valid.
+--
 -- The columns are written only while the job-clock v2 canary is enabled, so
 -- flag-off behavior stays byte-for-byte legacy.
 
@@ -32,3 +36,13 @@ ALTER TABLE public.job_attempts
   ADD COLUMN IF NOT EXISTS failure_reason TEXT,
   ADD COLUMN IF NOT EXISTS failure_existing_capacity_lease BOOLEAN,
   ADD COLUMN IF NOT EXISTS failure_work_started_evidence TEXT;
+
+ALTER TABLE public.job_attempts
+  ADD CONSTRAINT job_attempts_failure_class_check
+    CHECK (failure_class IN ('CAPACITY', 'BROWSER_RUNTIME', 'GENUINE_FAILURE'))
+    NOT VALID;
+
+ALTER TABLE public.job_attempts
+  ADD CONSTRAINT job_attempts_failure_work_started_evidence_check
+    CHECK (failure_work_started_evidence IN ('UNKNOWN', 'PROVEN_UNSTARTED', 'PROVEN_STARTED'))
+    NOT VALID;

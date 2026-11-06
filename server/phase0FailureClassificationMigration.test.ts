@@ -20,7 +20,7 @@ test('migration 163 is present and sorts after migration 162', () => {
   assert.ok(files.indexOf(migrationName) > files.indexOf('162_job_clock_and_capacity_lease.sql'));
 });
 
-test('migration 163 alters only public.job_attempts with the four nullable shadow columns', () => {
+test('migration 163 adds four nullable shadow columns and NOT VALID value checks', () => {
   const statements = withoutSqlComments
     .split(';')
     .map(statement => statement.replace(/\s+/g, ' ').trim())
@@ -31,6 +31,10 @@ test('migration 163 alters only public.job_attempts with the four nullable shado
       + 'ADD COLUMN IF NOT EXISTS failure_reason TEXT, '
       + 'ADD COLUMN IF NOT EXISTS failure_existing_capacity_lease BOOLEAN, '
       + 'ADD COLUMN IF NOT EXISTS failure_work_started_evidence TEXT',
+    "ALTER TABLE public.job_attempts ADD CONSTRAINT job_attempts_failure_class_check "
+      + "CHECK (failure_class IN ('CAPACITY', 'BROWSER_RUNTIME', 'GENUINE_FAILURE')) NOT VALID",
+    'ALTER TABLE public.job_attempts ADD CONSTRAINT job_attempts_failure_work_started_evidence_check '
+      + "CHECK (failure_work_started_evidence IN ('UNKNOWN', 'PROVEN_UNSTARTED', 'PROVEN_STARTED')) NOT VALID",
   ]);
   assert.doesNotMatch(withoutSqlComments, /\b(?:DROP|DELETE|TRUNCATE|UPDATE|INSERT)\b/i);
   assert.doesNotMatch(withoutSqlComments, /NOT\s+NULL/i);
@@ -38,6 +42,17 @@ test('migration 163 alters only public.job_attempts with the four nullable shado
   assert.doesNotMatch(withoutSqlComments, /DO\s+\$\$/);
   assert.doesNotMatch(withoutSqlComments, /first_transient_failure_at\s*=/i);
   assert.doesNotMatch(withoutSqlComments, /created_at\s*=/i);
+  // Closed sets are enforced on new writes without scanning history.
+  assert.equal(
+    (withoutSqlComments.match(/NOT VALID/g) || []).length,
+    2,
+    'both checks must be NOT VALID so the migration stays metadata-only',
+  );
+  assert.match(withoutSqlComments, /CHECK \(failure_class IN \('CAPACITY', 'BROWSER_RUNTIME', 'GENUINE_FAILURE'\)\)/);
+  assert.match(
+    withoutSqlComments,
+    /CHECK \(failure_work_started_evidence IN \('UNKNOWN', 'PROVEN_UNSTARTED', 'PROVEN_STARTED'\)\)/,
+  );
 });
 
 test('the serving failJob persists comparison evidence only inside the flag-on clock path', () => {
@@ -107,6 +122,35 @@ test('classification telemetry is counted only after a durable shadow row exists
   );
   assert.match(
     telemetrySource,
-    /markExecutionCounted\(`classification:\$\{String\(executionKey\)\}`\)/,
+    /const countedDispositions = new Map<string, number>\(\);\s*const countedClassifications = new Map<string, number>\(\);/,
+    'the two counters must not share one bounded FIFO',
+  );
+  assert.match(
+    telemetrySource,
+    /export function markJobFailureClassificationCounted\(executionKey: unknown\): boolean \{\s*return markExecutionCounted\(countedClassifications, String\(executionKey\)\);/,
+  );
+  assert.match(
+    telemetrySource,
+    /countedDispositions\.clear\(\);\s*countedClassifications\.clear\(\);/,
+    'a test reset must clear both dedupe guards',
+  );
+
+  // Prove the serving path counts only after the classified row is durable:
+  // the persistence assignment must appear before the counted guard in db.ts.
+  const persistedIndex = dbSource.indexOf(
+    'classificationPersisted = failureClassification !== undefined && (finalized.rowCount ?? 0) > 0;',
+  );
+  const countedIndex = dbSource.indexOf(
+    'if (classificationPersisted && failureClassification\n    && markJobFailureClassificationCounted(executionKey)) {',
+  );
+  assert.ok(persistedIndex > -1, 'classification persistence must be captured');
+  assert.ok(
+    countedIndex > persistedIndex,
+    'the classification counter must be gated on the durable row write',
+  );
+  assert.doesNotMatch(
+    dbSource,
+    /const countDisposition=[\s\S]{0,200}bumpJobFailureClassification/,
+    'a disposition count must not bump the classification counter',
   );
 });

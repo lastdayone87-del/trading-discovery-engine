@@ -8,6 +8,7 @@ import {
   bumpRepeatFailureSkip,
   jobDispositionExecutionKey,
   markJobDispositionCounted,
+  markJobFailureClassificationCounted,
   operationsTelemetrySnapshot,
   resetOperationsTelemetry,
 } from './operationsTelemetry';
@@ -76,4 +77,28 @@ test('missing attempt rows fall back to a job+attempt key', () => {
   assert.equal(markJobDispositionCounted(fallback, 'FAILED'), true);
   assert.equal(markJobDispositionCounted(fallback, 'FAILED'), false);
   assert.equal(markJobDispositionCounted(jobDispositionExecutionKey(undefined, 'job-9', 5), 'FAILED'), true);
+});
+
+test('classification traffic cannot evict disposition idempotency keys', () => {
+  resetOperationsTelemetry();
+  const dispositionKey = jobDispositionExecutionKey('evict-row', 'job-1', 1);
+  assert.equal(markJobDispositionCounted(dispositionKey, 'FAILED'), true);
+  for (let i = 0; i < 5000; i += 1) {
+    assert.equal(markJobFailureClassificationCounted(`attempt-${i}`), true);
+  }
+  assert.equal(
+    markJobDispositionCounted(dispositionKey, 'FAILED'),
+    false,
+    'a full classification guard must not displace a disposition entry',
+  );
+});
+
+test('resetOperationsTelemetry clears both dedupe guards', () => {
+  resetOperationsTelemetry();
+  const key = jobDispositionExecutionKey('reset-row', 'job-2', 1);
+  assert.equal(markJobDispositionCounted(key, 'FAILED'), true);
+  assert.equal(markJobFailureClassificationCounted(key), true);
+  resetOperationsTelemetry();
+  assert.equal(markJobDispositionCounted(key, 'FAILED'), true);
+  assert.equal(markJobFailureClassificationCounted(key), true);
 });
