@@ -33,6 +33,31 @@ ALTER TABLE public.jobs
 ALTER TABLE public.job_attempts
   ADD COLUMN IF NOT EXISTS generation INTEGER NOT NULL DEFAULT 0;
 
+-- Older workers do not know about job_attempts.generation yet. Fill the column
+-- from the durable job row on insert so a rolling deploy cannot record a
+-- reopened attempt as generation zero.
+CREATE OR REPLACE FUNCTION public.assign_job_attempt_generation()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NEW.generation IS NULL OR NEW.generation = 0 THEN
+    SELECT COALESCE(j.reopen_generation, 0)
+      INTO NEW.generation
+      FROM public.jobs j
+     WHERE j.id = NEW.job_id;
+    NEW.generation := COALESCE(NEW.generation, 0);
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS job_attempts_generation_guard ON public.job_attempts;
+CREATE TRIGGER job_attempts_generation_guard
+  BEFORE INSERT ON public.job_attempts
+  FOR EACH ROW
+  EXECUTE FUNCTION public.assign_job_attempt_generation();
+
 CREATE TABLE IF NOT EXISTS public.job_reopen_guard_config (
   singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK (singleton),
   enabled BOOLEAN NOT NULL DEFAULT false,

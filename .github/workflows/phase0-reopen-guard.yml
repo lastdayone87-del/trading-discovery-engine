@@ -3,11 +3,7 @@ name: Phase 0 reopen guard
 on:
   pull_request:
     paths:
-      - 'server/db/migrations/002_jobs_scheduler.sql'
-      - 'server/db/migrations/162_job_clock_and_capacity_lease.sql'
-      - 'server/db/migrations/163_job_attempt_failure_classification.sql'
-      - 'server/db/migrations/164_job_clock_immutability_guard.sql'
-      - 'server/db/migrations/165_job_reopen_generation_guard.sql'
+      - 'server/db/migrations/**'
       - 'server/phase0ReopenGuardMigration.test.ts'
       - 'server/phase0ReopenGuard.postgres.test.ts'
       - 'server/acquisitionJobClockPolicy.ts'
@@ -45,6 +41,9 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/phase0_reopen_guard
+      # The reopen-guard suite toggles the database-wide guard config, so it is
+      # opt-in and only runs against this dedicated scratch database.
+      PHASE0_REOPEN_GUARD_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/phase0_reopen_guard
       PGSSL: disable
       NODE_ENV: test
     steps:

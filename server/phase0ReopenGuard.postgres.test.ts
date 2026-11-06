@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import { claimNextJob, enqueueJob, getDb } from './dbCore';
 import { ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV } from './acquisitionJobClockPolicy';
 
-const enabled = Boolean(process.env.DATABASE_URL);
+// These tests toggle the database-wide job_reopen_guard_config row. They only
+// run in the dedicated Phase 0 reopen-guard workflow so a shared test database
+// used by unrelated PostgreSQL suites never observes the guard enabled.
+const enabled = Boolean(process.env.PHASE0_REOPEN_GUARD_TEST_DATABASE_URL);
 const maybe = enabled ? test : test.skip;
 
 const RETRY_TYPE = 'RETRY_COMMUNITY_ACQUISITION';
@@ -132,6 +135,21 @@ maybe('a reopen records prior status and keeps generation-scoped attempt history
       { generation: 0, attemptNumber: 1, status: 'COMPLETED' },
       { generation: 1, attemptNumber: 1, status: 'PROCESSING' },
     ],
+  );
+
+  // Simulate a worker deployed before this change: it omits the column.
+  await db.query(
+    `INSERT INTO job_attempts(job_id,attempt_number,status) VALUES($1,2,'PROCESSING')`,
+    [fixture.id],
+  );
+  const olderWorkerAttempt = (await db.query(
+    `SELECT generation FROM job_attempts WHERE job_id=$1 AND attempt_number=2`,
+    [fixture.id],
+  )).rows[0];
+  assert.equal(
+    Number(olderWorkerAttempt.generation),
+    1,
+    'the database must assign the claimed job generation when an older worker omits it',
   );
 
   await db.query(`UPDATE jobs SET status='COMPLETED',completed_at=now() WHERE id=$1`, [fixture.id]);

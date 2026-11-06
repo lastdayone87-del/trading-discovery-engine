@@ -29,6 +29,14 @@ test('migration 165 adds reopen identity and generation-scoped attempt history a
   assert.match(migration, /next_generation INTEGER/);
 });
 
+test('attempt inserts fill the generation from the durable job for older workers', () => {
+  assert.match(migration, /CREATE OR REPLACE FUNCTION public\.assign_job_attempt_generation\(\)/);
+  assert.match(migration, /IF NEW\.generation IS NULL OR NEW\.generation = 0 THEN/);
+  assert.match(migration, /SELECT COALESCE\(j\.reopen_generation, 0\)/);
+  assert.match(migration, /BEFORE INSERT ON public\.job_attempts/);
+  assert.match(migration, /EXECUTE FUNCTION public\.assign_job_attempt_generation\(\)/);
+});
+
 test('the reopen guard is default-off and shadow-first', () => {
   assert.match(migration, /enabled BOOLEAN NOT NULL DEFAULT false/);
   assert.match(migration, /max_reopens_per_30d INTEGER NOT NULL DEFAULT 6/);
