@@ -1,0 +1,55 @@
+name: Phase 0 job clock immutability
+
+on:
+  pull_request:
+    paths:
+      - 'server/db/migrations/164_job_clock_immutability_guard.sql'
+      - 'server/phase0JobClockImmutabilityMigration.test.ts'
+      - 'server/phase0JobClockImmutability.postgres.test.ts'
+      - 'server/acquisitionJobClockPolicy.ts'
+      - 'server/dbCore.ts'
+      - 'scripts/runMigrations.ts'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
+      - '.github/workflows/phase0-job-clock-immutability.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pg-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: phase0_clock_guard
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d phase0_clock_guard"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/phase0_clock_guard
+      PGSSL: disable
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Apply migrations to isolated test database
+        run: npx tsx scripts/runMigrations.ts
+      - name: Phase 0 clock guard migration assertions
+        run: node --import tsx --test server/phase0JobClockImmutabilityMigration.test.ts
+      - name: Phase 0 clock guard PostgreSQL regression
+        run: node --import tsx --test server/phase0JobClockImmutability.postgres.test.ts
