@@ -6,6 +6,8 @@
  * exists so roadmap phases can measure before/after instead of asserting.
  */
 
+import type { AcquisitionFailureClass } from './acquisitionFailureClassification';
+
 export type Gate1DispositionKey =
   | 'REJECT_EXCLUDED'
   | 'REJECT_UNSUPPORTED'
@@ -25,6 +27,8 @@ interface OperationsCounters {
   repeatFailureSkipsTotal: number;
   repeatFailureHistoryOutagesTotal: number;
   jobFailureDispositionsTotal: Record<JobFailureDispositionKey, number>;
+  /** Phase 0 shadow split; every counted failure is also a disposition. */
+  jobFailureClassificationsTotal: Record<AcquisitionFailureClass, number>;
   invalidApiKeyQuarantinesTotal: number;
 }
 
@@ -57,6 +61,11 @@ function freshCounters(): OperationsCounters & CommunityRecoveryCounters {
       RETRYING_WITHOUT_ATTEMPT: 0,
       UNKNOWN: 0,
     },
+    jobFailureClassificationsTotal: {
+      CAPACITY: 0,
+      BROWSER_RUNTIME: 0,
+      GENUINE_FAILURE: 0,
+    },
     invalidApiKeyQuarantinesTotal: 0,
     operationalEnrichmentRecoveryEnqueuedTotal: 0,
     operationalEnrichmentRecoveryDuplicateEventsTotal: 0,
@@ -83,6 +92,12 @@ function normalizeJobFailure(value: unknown): JobFailureDispositionKey {
     : 'UNKNOWN';
 }
 
+function normalizeAcquisitionFailureClass(value: unknown): AcquisitionFailureClass | null {
+  return value === 'CAPACITY' || value === 'BROWSER_RUNTIME' || value === 'GENUINE_FAILURE'
+    ? value
+    : null;
+}
+
 export function bumpGate1Evaluation(disposition: unknown): void {
   counters.gate1EvaluationsTotal[normalizeGate1(disposition)] += 1;
 }
@@ -99,6 +114,11 @@ export function bumpRepeatFailureHistoryOutage(): void {
 
 export function bumpJobFailureDisposition(disposition: unknown): void {
   counters.jobFailureDispositionsTotal[normalizeJobFailure(disposition)] += 1;
+}
+
+export function bumpJobFailureClassification(classification: unknown): void {
+  const key = normalizeAcquisitionFailureClass(classification);
+  if (key) counters.jobFailureClassificationsTotal[key] += 1;
 }
 
 export function bumpInvalidApiKeyQuarantine(): void {
@@ -162,6 +182,7 @@ export function operationsTelemetrySnapshot(): OperationsCounters & CommunityRec
     repeatFailureSkipsTotal: counters.repeatFailureSkipsTotal,
     repeatFailureHistoryOutagesTotal: counters.repeatFailureHistoryOutagesTotal,
     jobFailureDispositionsTotal: { ...counters.jobFailureDispositionsTotal },
+    jobFailureClassificationsTotal: { ...counters.jobFailureClassificationsTotal },
     invalidApiKeyQuarantinesTotal: counters.invalidApiKeyQuarantinesTotal,
     operationalEnrichmentRecoveryEnqueuedTotal: counters.operationalEnrichmentRecoveryEnqueuedTotal,
     operationalEnrichmentRecoveryDuplicateEventsTotal: counters.operationalEnrichmentRecoveryDuplicateEventsTotal,
@@ -177,6 +198,7 @@ export function resetOperationsTelemetry(): void {
   counters.repeatFailureSkipsTotal = fresh.repeatFailureSkipsTotal;
   counters.repeatFailureHistoryOutagesTotal = fresh.repeatFailureHistoryOutagesTotal;
   counters.jobFailureDispositionsTotal = fresh.jobFailureDispositionsTotal;
+  counters.jobFailureClassificationsTotal = fresh.jobFailureClassificationsTotal;
   counters.invalidApiKeyQuarantinesTotal = fresh.invalidApiKeyQuarantinesTotal;
   counters.operationalEnrichmentRecoveryEnqueuedTotal = fresh.operationalEnrichmentRecoveryEnqueuedTotal;
   counters.operationalEnrichmentRecoveryDuplicateEventsTotal = fresh.operationalEnrichmentRecoveryDuplicateEventsTotal;
