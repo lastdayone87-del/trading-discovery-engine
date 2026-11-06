@@ -44,6 +44,9 @@ test('the guard only caps terminal-to-pending acquisition reopens', () => {
   assert.match(migration, /interval '30 days'/);
   assert.match(migration, /current_setting\('acquisition\.reopen_guard_override', true\)/);
   assert.match(migration, /RETURN NULL/);
+  assert.match(migration, /idx_job_reopen_events_blocked_once/);
+  assert.match(migration, /WHERE outcome = 'BLOCKED'/);
+  assert.match(migration, /ON CONFLICT DO NOTHING/);
 });
 
 test('the guard preserves the old generation when it blocks a reopen', () => {

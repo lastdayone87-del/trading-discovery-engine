@@ -67,6 +67,12 @@ CREATE INDEX IF NOT EXISTS idx_job_reopen_events_channel_window
 CREATE INDEX IF NOT EXISTS idx_job_reopen_events_job_time
   ON public.job_reopen_events (job_id, reopened_at DESC);
 
+-- A capped job can be offered for reopen repeatedly. Record each blocked
+-- generation once instead of appending an unbounded audit stream.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_job_reopen_events_blocked_once
+  ON public.job_reopen_events (job_id, prior_generation)
+  WHERE outcome = 'BLOCKED';
+
 CREATE OR REPLACE FUNCTION public.guard_job_reopen_generation()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -117,7 +123,8 @@ BEGIN
         OLD.id, channel_key, OLD.type, 'BLOCKED', OLD.status,
         OLD.reopen_generation, OLD.reopen_generation + 1,
         'REOPEN_GENERATION_CAP'
-      );
+      )
+      ON CONFLICT DO NOTHING;
       RETURN NULL;
     END IF;
   END IF;

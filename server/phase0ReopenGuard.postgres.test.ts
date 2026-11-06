@@ -162,6 +162,8 @@ maybe('the enabled guard blocks the reopen after the per-channel cap', async t =
   const blocked = await reopen(db, fixture);
   assert.equal(blocked.status, 'COMPLETED', 'the blocked enqueue must return the terminal owner');
   assert.equal(blocked.generation, 2, 'a blocked reopen must not advance the generation');
+  const blockedAgain = await reopen(db, fixture);
+  assert.equal(blockedAgain.status, 'COMPLETED');
 
   const row = (await db.query(
     `SELECT status,reopen_generation FROM jobs WHERE id=$1`,
@@ -176,8 +178,9 @@ maybe('the enabled guard blocks the reopen after the per-channel cap', async t =
     [fixture.id],
   )).rows;
   assert.equal(events.filter(event => event.outcome === 'REOPENED').length, 2);
-  const blockedEvent = events.find(event => event.outcome === 'BLOCKED');
-  assert.ok(blockedEvent);
+  const blockedEvents = events.filter(event => event.outcome === 'BLOCKED');
+  assert.equal(blockedEvents.length, 1, 'the same blocked generation is recorded only once');
+  const blockedEvent = blockedEvents[0];
   assert.equal(blockedEvent.reason, 'REOPEN_GENERATION_CAP');
   assert.equal(blockedEvent.prior_generation, 2);
   assert.equal(blockedEvent.next_generation, 3);
