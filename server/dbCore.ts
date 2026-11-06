@@ -378,6 +378,41 @@ async function ensureJobAttemptsFinishedErrorIndex(client: { query: (text: strin
 }
 
 /**
+ * Migration 162 adds the immutable queue clocks and capacity-lease columns to
+ * the populated jobs table. Its supporting indexes are built concurrently
+ * after the transactional migration commits; building them inside the
+ * migration would hold a write-blocking lock on every queue write.
+ */
+async function ensurePhase0JobClockIndexes(client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> }): Promise<void> {
+  const jobs = await client.query(`SELECT to_regclass('public.jobs') AS oid`);
+  if (!jobs.rows[0]?.oid) return;
+  const indexes = [
+    {
+      name: 'idx_jobs_pending_queue_age',
+      create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_pending_queue_age ON public.jobs (priority DESC, first_enqueued_at ASC) WHERE status='PENDING'`,
+    },
+    {
+      name: 'idx_jobs_capacity_lease_pending',
+      create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_capacity_lease_pending ON public.jobs (capacity_lease_expires_at) WHERE status='PENDING' AND capacity_lease_expires_at IS NOT NULL`,
+    },
+  ];
+  for (const index of indexes) {
+    const existing = await client.query(`
+      SELECT c.oid, i.indisvalid, i.indisready
+        FROM pg_class c
+        JOIN pg_index i ON i.indexrelid = c.oid
+       WHERE c.oid = to_regclass('public.${index.name}')
+    `);
+    const row = existing.rows[0];
+    if (row?.indisvalid && row?.indisready) continue;
+    if (row?.oid) {
+      await client.query(`DROP INDEX CONCURRENTLY IF EXISTS public.${index.name}`);
+    }
+    await client.query(index.create);
+  }
+}
+
+/**
  * Migration 161 adds columns to existing hot tables (`query_runs`,
  * `terminology_observations`, `external_osint_observations`,
  * `autonomous_query_page_observations`). Building those indexes inside the
@@ -488,6 +523,10 @@ export async function runMigrations(): Promise<Array<{ version: number; name: st
     // idempotent and also repairs a build that failed on a previous boot.
     const cdlMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=161');
     if (cdlMigration.rowCount) await ensureCdlHotTableIndexes(client);
+    // Phase 0 queue/capacity indexes require migration 162's columns. They are
+    // built after its transaction commits so queue writes stay available.
+    const phase0ClockMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=162');
+    if (phase0ClockMigration.rowCount) await ensurePhase0JobClockIndexes(client);
     const res = await client.query('SELECT version,name,applied_at FROM schema_migrations ORDER BY version');
     return res.rows.map(r => ({ version: r.version, name: r.name, applied_at: iso(r.applied_at)! }));
   } finally {
