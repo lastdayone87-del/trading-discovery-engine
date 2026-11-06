@@ -6,7 +6,7 @@ import { CAPACITY_LEASE_DURATION_MS, capacityLeaseRefreshSetSql } from './acquis
 const maybe = process.env.DATABASE_URL ? test : test.skip;
 
 function time(value: unknown): number {
-  return new Date(String(value)).getTime();
+  return value instanceof Date ? value.getTime() : new Date(String(value)).getTime();
 }
 
 maybe('job clocks survive capacity-lease renewal and reject re-aging', async t => {
