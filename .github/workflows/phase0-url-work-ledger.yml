@@ -1,0 +1,59 @@
+name: Phase 0 URL work ledger
+
+on:
+  pull_request:
+    paths:
+      - 'server/db/migrations/**'
+      - 'server/communityAcquisitionWorkLedger.ts'
+      - 'server/communityAcquisitionWorkLedger.test.ts'
+      - 'server/phase0UrlWorkLedgerReport.ts'
+      - 'server/phase0UrlWorkLedgerMigration.test.ts'
+      - 'server/phase0UrlWorkLedger.postgres.test.ts'
+      - 'scripts/phase0UrlWorkLedgerReport.ts'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
+      - '.github/workflows/phase0-url-work-ledger.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pg-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: phase0_url_ledger
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d phase0_url_ledger"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/phase0_url_ledger
+      # The integration test inserts ledger/observation fixtures, so it is
+      # opt-in and only runs against this dedicated scratch database.
+      PHASE0_URL_LEDGER_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/phase0_url_ledger
+      PGSSL: disable
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Apply migrations to isolated test database
+        run: npx tsx scripts/runMigrations.ts
+      - name: Phase 0 URL work ledger static assertions
+        run: node --import tsx --test server/phase0UrlWorkLedgerMigration.test.ts server/communityAcquisitionWorkLedger.test.ts
+      - name: Phase 0 URL work ledger PostgreSQL regression
+        run: node --import tsx --test server/phase0UrlWorkLedger.postgres.test.ts
