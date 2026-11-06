@@ -6,6 +6,8 @@
  * exists so roadmap phases can measure before/after instead of asserting.
  */
 
+import type { AcquisitionFailureClass } from './acquisitionFailureClassification';
+
 export type Gate1DispositionKey =
   | 'REJECT_EXCLUDED'
   | 'REJECT_UNSUPPORTED'
@@ -25,6 +27,10 @@ interface OperationsCounters {
   repeatFailureSkipsTotal: number;
   repeatFailureHistoryOutagesTotal: number;
   jobFailureDispositionsTotal: Record<JobFailureDispositionKey, number>;
+  /** Phase 0 shadow split; every counted failure is also a disposition. */
+  jobFailureClassificationsTotal: Record<AcquisitionFailureClass, number>;
+  /** Shadow writes that failed and fell back to the legacy finalize statement. */
+  jobFailureClassificationFallbacksTotal: number;
   invalidApiKeyQuarantinesTotal: number;
 }
 
@@ -57,6 +63,12 @@ function freshCounters(): OperationsCounters & CommunityRecoveryCounters {
       RETRYING_WITHOUT_ATTEMPT: 0,
       UNKNOWN: 0,
     },
+    jobFailureClassificationsTotal: {
+      CAPACITY: 0,
+      BROWSER_RUNTIME: 0,
+      GENUINE_FAILURE: 0,
+    },
+    jobFailureClassificationFallbacksTotal: 0,
     invalidApiKeyQuarantinesTotal: 0,
     operationalEnrichmentRecoveryEnqueuedTotal: 0,
     operationalEnrichmentRecoveryDuplicateEventsTotal: 0,
@@ -83,6 +95,12 @@ function normalizeJobFailure(value: unknown): JobFailureDispositionKey {
     : 'UNKNOWN';
 }
 
+function normalizeAcquisitionFailureClass(value: unknown): AcquisitionFailureClass | null {
+  return value === 'CAPACITY' || value === 'BROWSER_RUNTIME' || value === 'GENUINE_FAILURE'
+    ? value
+    : null;
+}
+
 export function bumpGate1Evaluation(disposition: unknown): void {
   counters.gate1EvaluationsTotal[normalizeGate1(disposition)] += 1;
 }
@@ -99,6 +117,15 @@ export function bumpRepeatFailureHistoryOutage(): void {
 
 export function bumpJobFailureDisposition(disposition: unknown): void {
   counters.jobFailureDispositionsTotal[normalizeJobFailure(disposition)] += 1;
+}
+
+export function bumpJobFailureClassification(classification: unknown): void {
+  const key = normalizeAcquisitionFailureClass(classification);
+  if (key) counters.jobFailureClassificationsTotal[key] += 1;
+}
+
+export function bumpJobFailureClassificationFallback(): void {
+  counters.jobFailureClassificationFallbacksTotal += 1;
 }
 
 export function bumpInvalidApiKeyQuarantine(): void {
@@ -122,27 +149,35 @@ export function bumpCommunitySaturationDeferral(): void {
 }
 
 /**
- * Idempotency guard for job-disposition telemetry. failJob performs its writes
- * outside a transaction: if a secondary bookkeeping write fails after the job
- * row committed, a worker retry re-runs the same transition and must not count
- * it twice. Keyed by the open job_attempts row id (one row per claim), so
- * attempt-free deferrals — which reuse the same attempt number on the next
- * claim — still count every distinct persisted transition. Callers without an
- * open attempt row fall back to a job+attempt key. Bounded FIFO so the set
- * cannot grow without limit. Returns true on first count, false on repeats.
+ * Bounded idempotency guards for the disposition and classification counters.
+ * failJob performs its writes outside a transaction: if a secondary bookkeeping
+ * write fails after the job row committed, a worker retry re-runs the same
+ * transition and must not count it twice.
+ *
+ * The guards are separate per kind so classification traffic can never evict a
+ * disposition key (or vice versa) and cause a repeated failure to double-count.
  */
 const countedDispositions = new Map<string, number>();
-const MAX_COUNTED_DISPOSITIONS = 5000;
+const countedClassifications = new Map<string, number>();
+const MAX_COUNTED_EXECUTIONS_PER_KIND = 5000;
+
+function markExecutionCounted(guard: Map<string, number>, key: string): boolean {
+  if (guard.has(key)) return false;
+  if (guard.size >= MAX_COUNTED_EXECUTIONS_PER_KIND) {
+    const oldest = guard.keys().next();
+    if (!oldest.done) guard.delete(oldest.value);
+  }
+  guard.set(key, Date.now());
+  return true;
+}
 
 export function markJobDispositionCounted(executionKey: unknown, disposition: unknown): boolean {
-  const key = `${String(executionKey)}:${normalizeJobFailure(disposition)}`;
-  if (countedDispositions.has(key)) return false;
-  if (countedDispositions.size >= MAX_COUNTED_DISPOSITIONS) {
-    const oldest = countedDispositions.keys().next();
-    if (!oldest.done) countedDispositions.delete(oldest.value);
-  }
-  countedDispositions.set(key, Date.now());
-  return true;
+  return markExecutionCounted(countedDispositions, `${String(executionKey)}:${normalizeJobFailure(disposition)}`);
+}
+
+/** Count a persisted classification at most once per execution. */
+export function markJobFailureClassificationCounted(executionKey: unknown): boolean {
+  return markExecutionCounted(countedClassifications, String(executionKey));
 }
 
 export function jobDispositionExecutionKey(
@@ -162,6 +197,8 @@ export function operationsTelemetrySnapshot(): OperationsCounters & CommunityRec
     repeatFailureSkipsTotal: counters.repeatFailureSkipsTotal,
     repeatFailureHistoryOutagesTotal: counters.repeatFailureHistoryOutagesTotal,
     jobFailureDispositionsTotal: { ...counters.jobFailureDispositionsTotal },
+    jobFailureClassificationsTotal: { ...counters.jobFailureClassificationsTotal },
+    jobFailureClassificationFallbacksTotal: counters.jobFailureClassificationFallbacksTotal,
     invalidApiKeyQuarantinesTotal: counters.invalidApiKeyQuarantinesTotal,
     operationalEnrichmentRecoveryEnqueuedTotal: counters.operationalEnrichmentRecoveryEnqueuedTotal,
     operationalEnrichmentRecoveryDuplicateEventsTotal: counters.operationalEnrichmentRecoveryDuplicateEventsTotal,
@@ -177,9 +214,15 @@ export function resetOperationsTelemetry(): void {
   counters.repeatFailureSkipsTotal = fresh.repeatFailureSkipsTotal;
   counters.repeatFailureHistoryOutagesTotal = fresh.repeatFailureHistoryOutagesTotal;
   counters.jobFailureDispositionsTotal = fresh.jobFailureDispositionsTotal;
+  counters.jobFailureClassificationsTotal = fresh.jobFailureClassificationsTotal;
+  counters.jobFailureClassificationFallbacksTotal = fresh.jobFailureClassificationFallbacksTotal;
   counters.invalidApiKeyQuarantinesTotal = fresh.invalidApiKeyQuarantinesTotal;
   counters.operationalEnrichmentRecoveryEnqueuedTotal = fresh.operationalEnrichmentRecoveryEnqueuedTotal;
   counters.operationalEnrichmentRecoveryDuplicateEventsTotal = fresh.operationalEnrichmentRecoveryDuplicateEventsTotal;
   counters.operationalEnrichmentRecoveryExhaustedTotal = fresh.operationalEnrichmentRecoveryExhaustedTotal;
   counters.communitySaturationDeferralsTotal = fresh.communitySaturationDeferralsTotal;
+  // Dedupe state is test-observable too: a reset must start from a clean slate
+  // or a later test can be silently suppressed by an earlier execution key.
+  countedDispositions.clear();
+  countedClassifications.clear();
 }

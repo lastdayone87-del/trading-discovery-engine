@@ -5,7 +5,8 @@ export * from './dbCore';
 
 import { getDb, isRetryableInfrastructureFailure, resolveGeminiSemanticCooldownExpiryMs, resolveGeminiOrgSemanticCooldownExpiryMs, resolveGroqSemanticCooldownExpiryMs, resolveGroqOrgCooldownExpiryMs, resolveGeminiFreeSemanticCooldownExpiryMs, failedProviderOrg } from './dbCore';
 import { acquisitionJobClockV2Enabled, CAPACITY_LEASE_DURATION_MS, capacityLeaseRefreshSetSql, capacityLeaseRunAfter, isCapacityLeaseFailure, normalizeCapacityLeaseRunAfter } from './acquisitionJobClockPolicy';
-import { bumpJobFailureDisposition, jobDispositionExecutionKey, markJobDispositionCounted } from './operationsTelemetry';
+import { acquisitionEvidenceFromError, classifyAcquisitionFailure, type AcquisitionFailureClassification } from './acquisitionFailureClassification';
+import { bumpJobFailureClassification, bumpJobFailureClassificationFallback, bumpJobFailureDisposition, jobDispositionExecutionKey, markJobDispositionCounted, markJobFailureClassificationCounted } from './operationsTelemetry';
 
 export type JobFailureDisposition='RETRYING_WITHOUT_ATTEMPT'|'RETRYING'|'FAILED';
 
@@ -22,8 +23,36 @@ export function failedAttemptFinalizeQuery(
   jobId: string,
   attemptRowId: unknown,
   error: string,
+  classification?: Pick<
+    AcquisitionFailureClassification,
+    'failureClass' | 'reason' | 'existingCapacityLease' | 'workStartedEvidence'
+  >,
 ): { text: string; values: unknown[] } {
-  if (attemptRowId !== null && attemptRowId !== undefined && String(attemptRowId) !== '') {
+  const captured = attemptRowId !== null && attemptRowId !== undefined && String(attemptRowId) !== '';
+  if (classification) {
+    // Shadow columns are appended only when the caller has a classification.
+    // Flag-off calls with no classification keep the exact legacy statement.
+    // existingCapacityLease and workStartedEvidence make disagreements with
+    // the legacy predicate and missing evidence measurable after the fact.
+    const shadowColumns = 'failure_class=$2,failure_reason=$3,failure_existing_capacity_lease=$4,failure_work_started_evidence=$5';
+    const shadowValues = [
+      classification.failureClass,
+      classification.reason,
+      classification.existingCapacityLease,
+      classification.workStartedEvidence,
+    ];
+    if (captured) {
+      return {
+        text: `UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$1,${shadowColumns} WHERE id=$6 AND finished_at IS NULL`,
+        values: [error, ...shadowValues, String(attemptRowId)],
+      };
+    }
+    return {
+      text: `UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$1,${shadowColumns} WHERE job_id=$6 AND finished_at IS NULL`,
+      values: [error, ...shadowValues, jobId],
+    };
+  }
+  if (captured) {
     return {
       text: `UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$1 WHERE id=$2 AND finished_at IS NULL`,
       values: [error, String(attemptRowId)],
@@ -92,6 +121,19 @@ export async function failJob(jobId:string,error:any,deps?:{db?:JobFailureDb;now
   const {attempts,max_attempts,first_transient_failure_at}=res.rows[0];
   const now=deps?.now??Date.now();
   const clockV2=acquisitionJobClockV2Enabled();
+  // Shadow classification only: it is persisted with the attempt for later
+  // comparison and never participates in the transition below. Flag-off keeps
+  // the legacy finalize statement and writes no shadow columns. A malformed
+  // carrier must not be able to change failure handling, so the shadow is
+  // intentionally best-effort here.
+  let failureClassification: AcquisitionFailureClassification | undefined;
+  if (clockV2) {
+    try {
+      failureClassification = classifyAcquisitionFailure(error, acquisitionEvidenceFromError(error));
+    } catch {
+      failureClassification = undefined;
+    }
+  }
   // Capacity/runtime waits are not genuine acquisition failures. They must not
   // receive a failure-budget anchor, and passing `now` to the decision keeps an
   // old genuine anchor from terminalizing a wait that never ran acquisition.
@@ -150,8 +192,9 @@ export async function failJob(jobId:string,error:any,deps?:{db?:JobFailureDb;now
     );
     attemptRowId = open.rows[0]?.id ?? null;
   } catch { attemptRowId = null; }
+  const executionKey=jobDispositionExecutionKey(attemptRowId, jobId, attempts);
   const countDisposition=()=>{
-    if (markJobDispositionCounted(jobDispositionExecutionKey(attemptRowId, jobId, attempts), disposition)) {
+    if (markJobDispositionCounted(executionKey, disposition)) {
       bumpJobFailureDisposition(disposition);
     }
   };
@@ -178,7 +221,31 @@ export async function failJob(jobId:string,error:any,deps?:{db?:JobFailureDb;now
   countDisposition();
   // Finalize THIS execution's captured attempt row by id (never whichever
   // open row happens to exist now — a post-transition claim opens a new row).
-  const finalize = failedAttemptFinalizeQuery(jobId, attemptRowId, persistedMessage);
-  await db.query(finalize.text, finalize.values as any[]);
+  const finalize = failedAttemptFinalizeQuery(jobId, attemptRowId, persistedMessage, failureClassification);
+  let classificationPersisted = false;
+  try {
+    const finalized = await db.query(finalize.text, finalize.values as any[]);
+    // Count the shadow only after the durable row exists. A missing attempt
+    // row or a concurrent finalizer means no classification is stored, so
+    // /api/version must not report one.
+    classificationPersisted = failureClassification !== undefined && (finalized.rowCount ?? 0) > 0;
+  } catch (finalizeError) {
+    if (!failureClassification) throw finalizeError;
+    // Shadow evidence must never block the legacy finalize path. This covers
+    // a database that has not applied migration 163 yet: the classification
+    // write fails atomically, then the unchanged legacy statement finalizes
+    // the attempt without the shadow columns.
+    console.warn(
+      '[JobFailure] Shadow classification write failed; using legacy finalize.',
+      finalizeError instanceof Error ? finalizeError.message : finalizeError,
+    );
+    bumpJobFailureClassificationFallback();
+    const legacyFinalize = failedAttemptFinalizeQuery(jobId, attemptRowId, persistedMessage);
+    await db.query(legacyFinalize.text, legacyFinalize.values as any[]);
+  }
+  if (classificationPersisted && failureClassification
+    && markJobFailureClassificationCounted(executionKey)) {
+    bumpJobFailureClassification(failureClassification.failureClass);
+  }
   return disposition;
 }
