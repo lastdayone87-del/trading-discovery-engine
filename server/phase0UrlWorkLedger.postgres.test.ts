@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getDb } from './dbCore';
+import { reconcileCommunityWorkProjection } from './communityAcquisitionWorkLedger';
 import { buildPhase0UrlWorkLedgerReport } from './phase0UrlWorkLedgerReport';
 
 // These tests insert ledger and observation fixtures, so they are opt-in and
@@ -77,11 +78,15 @@ maybe('the read-only report projects and reconciles a fixture backlog', async t 
   const suffix = uniqueSuffix();
   const channelId = `UCphase0ledger-report-${suffix}`;
   const jobKey = `phase0-ledger-report-job-${suffix}`;
+  // external_acquisition_observations is append-only by design, so fixtures are
+  // never deleted. Assertions compare against a pre-insert baseline, which also
+  // makes the test safe to rerun against a non-empty scratch database.
   t.after(async () => {
     await db.query(`DELETE FROM community_acquisition_url_state WHERE channel_id=$1`, [channelId]);
-    await db.query(`DELETE FROM external_acquisition_observations WHERE channel_id=$1`, [channelId]);
     await db.query(`DELETE FROM jobs WHERE payload->>'channelId'=$1`, [channelId]);
   });
+
+  const baseline = await buildPhase0UrlWorkLedgerReport(db, { windowDays: 1, maxDeltaPct: 5 });
 
   await db.query(
     `INSERT INTO jobs(type,payload,status,priority,max_attempts,run_after,idempotency_key)
@@ -167,10 +172,28 @@ maybe('the read-only report projects and reconciles a fixture backlog', async t 
 
   // The SQL telemetry bound and the TypeScript projection must agree on the
   // fixture rows: two retryable URLs, both never browser-executed.
-  assert.equal(report.projection.retryableRows, 2);
-  assert.equal(report.projection.retryableNeverBrowserExecutedRows, 2);
-  assert.equal(report.telemetry.retryableRows, 2);
-  assert.equal(report.telemetry.neverBrowserExecutedRows, 2);
-  assert.equal(report.reconciliation.retryableWithinFivePercent, true);
-  assert.equal(report.reconciliation.neverExecutedWithinFivePercent, true);
+  const retryableDelta = report.projection.retryableRows - baseline.projection.retryableRows;
+  const retryableNeverBrowserDelta = report.projection.retryableNeverBrowserExecutedRows
+    - baseline.projection.retryableNeverBrowserExecutedRows;
+  const telemetryRetryableDelta = report.telemetry.retryableRows - baseline.telemetry.retryableRows;
+  const telemetryNeverBrowserDelta = report.telemetry.neverBrowserExecutedRows
+    - baseline.telemetry.neverBrowserExecutedRows;
+  assert.equal(retryableDelta, 2);
+  assert.equal(retryableNeverBrowserDelta, 2);
+  assert.equal(telemetryRetryableDelta, 2);
+  assert.equal(telemetryNeverBrowserDelta, 2);
+
+  const reconciled = reconcileCommunityWorkProjection(
+    {
+      retryableRows: retryableDelta,
+      neverBrowserExecutedRows: retryableNeverBrowserDelta,
+      retryableNeverBrowserExecutedRows: retryableNeverBrowserDelta,
+    },
+    {
+      retryableRows: telemetryRetryableDelta,
+      neverBrowserExecutedRows: telemetryNeverBrowserDelta,
+    },
+  );
+  assert.equal(reconciled.retryableWithinFivePercent, true);
+  assert.equal(reconciled.neverExecutedWithinFivePercent, true);
 });
