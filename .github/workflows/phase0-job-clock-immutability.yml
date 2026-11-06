@@ -3,6 +3,8 @@ name: Phase 0 job clock immutability
 on:
   pull_request:
     paths:
+      - 'server/db/migrations/120_transient_retry_age_anchor.sql'
+      - 'server/db/migrations/162_job_clock_and_capacity_lease.sql'
       - 'server/db/migrations/164_job_clock_immutability_guard.sql'
       - 'server/phase0JobClockImmutabilityMigration.test.ts'
       - 'server/phase0JobClockImmutability.postgres.test.ts'

@@ -145,7 +145,7 @@ maybe('the bounded backfill may fill a null queue clock exactly once', async t =
   });
 
   await db.query(
-    `UPDATE jobs SET first_enqueued_at=now()-interval '10 hours',last_enqueued_at=now()-interval '10 hours' WHERE id=$1`,
+    `UPDATE jobs SET first_enqueued_at=created_at,last_enqueued_at=created_at WHERE id=$1`,
     [original.id]
   );
   const filled = (await db.query(
