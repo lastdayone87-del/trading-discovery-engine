@@ -409,6 +409,12 @@ export async function reconcileCommunityAcquisitionRecovery(
     `SELECT c.channel_id,
             retry_job.id AS capacity_retry_job_id,
             retry_job.retry_reason,
+            EXISTS (
+              SELECT 1 FROM job_reopen_events blocked
+               WHERE blocked.job_id = retry_job.id
+                 AND blocked.outcome = 'BLOCKED'
+                 AND blocked.prior_generation = COALESCE(retry_job.reopen_generation, 0)
+            ) AS reopen_blocked,
             COALESCE(
               retry_job.status='FAILED'
               AND retry_job.last_error LIKE $2,
@@ -446,7 +452,8 @@ export async function reconcileCommunityAcquisitionRecovery(
              AND j.payload->>'channelId'=c.channel_id
              AND j.status IN('PENDING','PROCESSING')
         )
-      ORDER BY (retry_job.status='FAILED' AND retry_job.last_error LIKE $2) DESC,
+      ORDER BY reopen_blocked ASC,
+               (retry_job.status='FAILED' AND retry_job.last_error LIKE $2) DESC,
                c.last_checked ASC NULLS FIRST
       LIMIT $1`,
     [Math.min(100, Math.max(1, limit)), `${COMMUNITY_CAPACITY_TERMINAL_PREFIX}%`]

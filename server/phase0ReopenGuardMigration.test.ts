@@ -101,11 +101,20 @@ test('recovery sweeps re-evaluate blocked reopens against current guard state', 
 
   // A BLOCKED event is evidence, not a 30-day tombstone: recovery must retry
   // through enqueueJob so the trigger sees the current config and rolling
-  // reopen window (including an operator disabling the guard).
+  // reopen window (including an operator disabling the guard). The ledger is
+  // read only to deprioritize the current blocked generation, never to
+  // suppress the retry permanently.
   assert.doesNotMatch(communityRecovery, /blocked_reopen/);
   assert.doesNotMatch(enrichmentRecovery, /blocked_reopen/);
-  assert.doesNotMatch(communityRecovery, /job_reopen_events/);
-  assert.doesNotMatch(enrichmentRecovery, /job_reopen_events/);
+  assert.match(communityRecovery, /AS reopen_blocked/);
+  assert.match(enrichmentRecovery, /AS reopen_blocked/);
+  assert.match(communityRecovery, /ORDER BY reopen_blocked ASC,/);
+  assert.match(enrichmentRecovery, /ORDER BY reopen_blocked ASC,/);
+  assert.match(communityRecovery, /const enqueued = await enqueueRecoveryJob\(/);
+  assert.match(
+    enrichmentRecovery,
+    /const enqueued = await enqueueRecoveryJob\(updated, decision\.reasonCodes, queryable\)/,
+  );
 });
 
 test('claims and reopen bookkeeping carry the generation through the writer', () => {

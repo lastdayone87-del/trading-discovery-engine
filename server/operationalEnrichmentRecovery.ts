@@ -266,6 +266,12 @@ async function runOperationalEnrichmentReconciliation(
     `SELECT c.channel_id,
             failed_job.id AS failed_job_id,
             failed_job.attempts AS failed_job_attempts,
+            EXISTS (
+              SELECT 1 FROM job_reopen_events blocked
+               WHERE blocked.job_id = failed_job.id
+                 AND blocked.outcome = 'BLOCKED'
+                 AND blocked.prior_generation = COALESCE(failed_job.reopen_generation, 0)
+            ) AS reopen_blocked,
             (SELECT count(*)::int
                FROM operational_enrichment_recovery_events cycle_event
               WHERE cycle_event.channel_id=c.channel_id
@@ -301,7 +307,7 @@ async function runOperationalEnrichmentReconciliation(
            WHERE terminal_event.channel_id=c.channel_id
              AND terminal_event.event_key LIKE 'operational-enrichment-terminal:%'
         )
-      ORDER BY c.last_checked ASC NULLS FIRST
+      ORDER BY reopen_blocked ASC, c.last_checked ASC NULLS FIRST
       LIMIT $1`,
     [Math.min(100, Math.max(1, limit))]
   );
