@@ -71,7 +71,10 @@ ON CONFLICT (singleton) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS public.job_reopen_events (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  job_id UUID NOT NULL REFERENCES public.jobs(id) ON DELETE CASCADE,
+  -- Deliberately no foreign key: the reopen ledger is append-only cap
+  -- evidence and must survive job-row cleanup. The cap is keyed by channel and
+  -- job type, so a deleted job cannot reset a channel's reopen budget.
+  job_id UUID NOT NULL,
   channel_id TEXT,
   job_type TEXT NOT NULL,
   outcome TEXT NOT NULL CHECK (outcome IN ('REOPENED', 'BLOCKED')),

@@ -65,6 +65,11 @@ test('the guard preserves the old generation when it blocks a reopen', () => {
   assert.match(migration, /NEW\.last_reopened_at := now\(\)/);
 });
 
+test('the append-only reopen ledger survives job-row cleanup', () => {
+  assert.match(migration, /job_id UUID NOT NULL,\n  channel_id TEXT,/);
+  assert.doesNotMatch(migration, /job_id UUID NOT NULL REFERENCES public\.jobs\(id\) ON DELETE CASCADE/);
+});
+
 test('migration 165 is additive and rewrites no existing job or observation', () => {
   assert.doesNotMatch(withoutSqlComments, /DROP\s+(TABLE|COLUMN)/i);
   assert.doesNotMatch(withoutSqlComments, /DELETE\s+FROM/i);
