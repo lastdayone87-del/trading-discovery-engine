@@ -6,10 +6,12 @@ on:
       - 'server/db/migrations/**'
       - 'server/phase0ReopenGuardMigration.test.ts'
       - 'server/phase0ReopenGuard.postgres.test.ts'
+      - 'server/communityRetryExecutedEvidence.test.ts'
       - 'server/acquisitionJobClockPolicy.ts'
       - 'server/db.ts'
       - 'server/dbCore.ts'
       - 'server/communityRecovery.ts'
+      - 'server/operationalEnrichmentRecovery.ts'
       - 'server/queueManager.ts'
       - 'scripts/runMigrations.ts'
       - 'package.json'
@@ -56,6 +58,6 @@ jobs:
       - name: Apply migrations to isolated test database
         run: npx tsx scripts/runMigrations.ts
       - name: Phase 0 reopen guard migration assertions
-        run: node --import tsx --test server/phase0ReopenGuardMigration.test.ts
+        run: node --import tsx --test server/phase0ReopenGuardMigration.test.ts server/communityRetryExecutedEvidence.test.ts
       - name: Phase 0 reopen guard PostgreSQL regression
         run: node --import tsx --test server/phase0ReopenGuard.postgres.test.ts
