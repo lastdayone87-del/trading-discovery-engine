@@ -148,6 +148,23 @@ export async function getDb(): Promise<InstanceType<typeof Pool>> {
   return initPromise;
 }
 
+/**
+ * Dedicated operator-reporting pool. Unlike getDb(), this never runs
+ * migrations or seeds defaults, so an advertised read-only report cannot
+ * mutate the database during connection initialization. The server-side
+ * default makes every transaction read-only as defense in depth; callers
+ * should still open an explicit REPEATABLE READ READ ONLY snapshot.
+ */
+export function createReadOnlyDbPool(): InstanceType<typeof Pool> {
+  return new Pool({
+    connectionString: requireDatabaseUrl(),
+    ssl: process.env.PGSSL === 'disable' ? false : process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined,
+    max: 1,
+    application_name: 'phase0-url-work-ledger-report',
+    options: '-c default_transaction_read_only=on',
+  });
+}
+
 export function saveDb(): void {
   // PostgreSQL commits writes transactionally; retained as no-op compatibility shim.
 }

@@ -38,6 +38,12 @@ CREATE TABLE IF NOT EXISTS public.community_acquisition_url_state (
   never_executed BOOLEAN NOT NULL DEFAULT TRUE,
   attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
   max_attempts INTEGER NOT NULL DEFAULT 5 CHECK (max_attempts > 0),
+  -- Persisted copies of the two exit-gate facts. Without them the ledger can
+  -- express neither retry ownership nor never-browser-executed work; attempts
+  -- alone cannot distinguish a direct browser run from a static or borrowed
+  -- outcome.
+  retryable BOOLEAN NOT NULL DEFAULT FALSE,
+  browser_executed BOOLEAN NOT NULL DEFAULT FALSE,
   first_observed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   last_attempt_at TIMESTAMPTZ,
   next_eligible_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -48,13 +54,22 @@ CREATE TABLE IF NOT EXISTS public.community_acquisition_url_state (
     CHECK (jsonb_typeof(terminal_evidence) = 'object'),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (channel_id, normalized_url, surface)
+  UNIQUE (channel_id, normalized_url, surface),
+  -- Processed evidence is exactly what makes an attempt real. A genuine
+  -- transport failure is an attempt without processed evidence, so the
+  -- converse alone is asserted (attempts > 0 must not accompany a false
+  -- never_executed flag).
+  CONSTRAINT community_url_state_never_executed_attempts_check
+    CHECK (never_executed OR attempts > 0),
+  CONSTRAINT community_url_state_browser_executed_check
+    CHECK (NOT browser_executed OR NOT never_executed)
 );
 
 -- Worker claim path: find due work for one channel or across channels.
+-- RUNNING is included so stale-lease recovery can find crashed claims.
 CREATE INDEX IF NOT EXISTS idx_community_url_state_due
   ON public.community_acquisition_url_state (state, next_eligible_at)
-  WHERE state = 'PENDING';
+  WHERE state IN ('PENDING', 'RUNNING');
 
 CREATE INDEX IF NOT EXISTS idx_community_url_state_channel
   ON public.community_acquisition_url_state (channel_id, state, next_eligible_at);
@@ -87,6 +102,12 @@ CREATE TRIGGER community_url_state_touch_updated_at
 COMMENT ON TABLE public.community_acquisition_url_state IS
   'Phase 0 URL work ledger: per-channel/surface/URL state, never executed vs attempted vs resolved.';
 COMMENT ON COLUMN public.community_acquisition_url_state.never_executed IS
-  'TRUE until processed evidence exists; a started request alone never clears it.';
+  'TRUE until direct processed evidence exists; a started request alone never clears it.';
+COMMENT ON COLUMN public.community_acquisition_url_state.attempts IS
+  'Billable retry attempts: genuine transport/site failures and direct processed work; capacity/browser-runtime parks and borrowed evidence do not consume the budget.';
+COMMENT ON COLUMN public.community_acquisition_url_state.retryable IS
+  'TRUE when the effective observation for this work row owns a retry (required ACQUISITION_FAILED, retryable, not REDIRECT_LIMIT).';
+COMMENT ON COLUMN public.community_acquisition_url_state.browser_executed IS
+  'TRUE only when a direct rendered observation processed pages/requests/clicks; borrowed or static evidence never sets it.';
 COMMENT ON COLUMN public.community_acquisition_url_state.state IS
   'PENDING/RUNNING are runnable; RESOLVED is terminal; PARKED_INFRA/PARKED_EXTERNAL are bounded parks; EXHAUSTED is attempt-capped.';

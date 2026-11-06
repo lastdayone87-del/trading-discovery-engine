@@ -7,14 +7,24 @@
  * reconciliation report, so the derivation can be reviewed before any worker
  * writes the ledger.
  *
- * Two distinctions matter for truthfulness:
+ * Truthfulness rules:
  *
- *   * `neverExecuted` clears only when processed evidence exists. A request
- *     that started, or a fetch that returned transport metadata, is not
- *     inspection evidence.
+ *   * Only required, community-surface work belongs in this ledger. Optional
+ *     or borrowed observations never inflate the backlog.
+ *   * `neverExecuted` clears only when direct processed evidence exists. A
+ *     request that started, or a fetch that returned transport metadata, is
+ *     not inspection evidence. Borrowed (`sharedEvidenceFrom`) rows are not
+ *     direct execution of this URL.
+ *   * `attempts` is the billable retry budget. Genuine transport/site failures
+ *     consume it even without telemetry; capacity/browser-runtime parks and
+ *     borrowed evidence do not.
  *   * `INSPECTED_NO_MATCH` resolves a URL only when the crawl actually
  *     processed pages. An unevidenced static result stays PENDING so an
  *     incomplete inspection can never become a false NOT_FOUND.
+ *   * The effective observation is chosen rank-first (FOUND >
+ *     INSPECTED_NO_MATCH > PARTIALLY_INSPECTED > ACQUISITION_FAILED), then by
+ *     time. This mirrors the production retry predicate and tolerates
+ *     inspection-start timestamp skew between static and rendered rows.
  */
 
 import { createHash } from 'node:crypto';
@@ -52,13 +62,27 @@ export const COMMUNITY_ACQUISITION_WORK_SURFACES: ReadonlySet<string> = new Set(
   'CREATOR_WEBSITES',
 ]);
 
-/** Capacity/runtime failures park the URL without spending its attempt budget. */
+/**
+ * Capacity/runtime failures park the URL without spending its attempt budget.
+ * These are the observation-level classes actually persisted by the static and
+ * rendered crawlers (browserCapability/browserCommunityFallback) plus the
+ * coarse capacity names used by retry directives and shadow classification.
+ */
 const INFRA_FAILURE_CLASSES: ReadonlySet<string> = new Set([
+  'BROWSER_RUNTIME',
   'BROWSER_RUNTIME_UNAVAILABLE',
+  'BROWSER_BINARY_MISSING',
+  'BROWSER_LINUX_DEPENDENCY_MISSING',
+  'BROWSER_PERMISSION_DENIED',
+  'BROWSER_LAUNCH_FAILED',
+  'CAPACITY',
+  'CAPACITY_ADMISSION_UNAVAILABLE',
   'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE',
-  'RENDERED_FALLBACK_SATURATED',
-  'RATE_LIMITED',
   'QUOTA_ALLOCATION_EXHAUSTED',
+  'BROWSER_GATE_SATURATION',
+  'RENDERED_FALLBACK_SATURATED',
+  'RATE_LIMIT',
+  'RATE_LIMITED',
 ]);
 
 export interface CommunityWorkObservation {
@@ -88,7 +112,7 @@ export interface CommunityWorkProjectionRow {
   lastOutcome: string;
   terminalReason: string | null;
   terminalEvidence: Record<string, unknown>;
-  anyRetryable: boolean;
+  retryOwned: boolean;
   observations: number;
 }
 
@@ -110,7 +134,7 @@ export interface CommunityWorkReconciliation {
   retryableDeltaPct: number;
   retryableWithinFivePercent: boolean;
   telemetryNeverBrowserExecutedRows: number;
-  projectionNeverBrowserExecutedRows: number;
+  projectionRetryableNeverBrowserExecutedRows: number;
   neverExecutedDelta: number;
   neverExecutedDeltaPct: number;
   neverExecutedWithinFivePercent: boolean;
@@ -131,10 +155,10 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value as Record<string, unknown>;
 }
 
+/** Accept only JSON numbers. Booleans, arrays, and strings are malformed input. */
 function nonNegativeInt(value: unknown): number {
-  const parsed = typeof value === 'number' ? value : Number(value);
-  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
-  return Math.floor(parsed);
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return 0;
+  return Math.floor(value);
 }
 
 export function telemetryFactsFromProvenance(provenance: unknown): TelemetryFacts {
@@ -156,12 +180,28 @@ export function surfaceFromObservation(observation: CommunityWorkObservation): s
   return typeof provenance?.surface === 'string' ? provenance.surface.trim().toUpperCase() : '';
 }
 
+/** The production retry predicate only owns required community observations. */
+export function isRequiredCommunityWorkObservation(observation: CommunityWorkObservation): boolean {
+  return asRecord(observation.provenance)?.required === true;
+}
+
 /**
- * A completed page/request/click is processed evidence. `requestsStarted`
- * alone is deliberately excluded: a request that starts and then hangs or is
- * killed has not executed the work.
+ * Lender seed URL when this row only references another same-inspection fetch.
+ * Such a row carries no page counters of its own, so it must never be charged
+ * as this URL's attempt or browser execution.
  */
-export function hasProcessedAcquisitionEvidence(observation: CommunityWorkObservation): boolean {
+export function sharedEvidenceSource(observation: CommunityWorkObservation): string {
+  const value = asRecord(observation.provenance)?.sharedEvidenceFrom;
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+/**
+ * A completed page/request/click is direct processed evidence. `requestsStarted`
+ * alone is deliberately excluded: a request that starts and then hangs or is
+ * killed has not executed the work. Borrowed evidence is never direct.
+ */
+export function hasDirectProcessedAcquisitionEvidence(observation: CommunityWorkObservation): boolean {
+  if (sharedEvidenceSource(observation)) return false;
   const telemetry = telemetryFactsFromProvenance(observation.provenance);
   if (telemetry.pagesInspected > 0) return true;
   if (telemetry.requestsFinished > 0) return true;
@@ -171,8 +211,14 @@ export function hasProcessedAcquisitionEvidence(observation: CommunityWorkObserv
   return observation.outcome === 'FOUND';
 }
 
-/** Browser execution requires rendered mode plus processed browser activity. */
+/** Backwards-compatible alias: processed means direct processed. */
+export function hasProcessedAcquisitionEvidence(observation: CommunityWorkObservation): boolean {
+  return hasDirectProcessedAcquisitionEvidence(observation);
+}
+
+/** Browser execution requires rendered mode plus direct processed activity. */
 export function hasBrowserExecution(observation: CommunityWorkObservation): boolean {
+  if (sharedEvidenceSource(observation)) return false;
   const telemetry = telemetryFactsFromProvenance(observation.provenance);
   if (telemetry.mode !== 'RENDERED') return false;
   return telemetry.requestsFinished > 0
@@ -180,10 +226,45 @@ export function hasBrowserExecution(observation: CommunityWorkObservation): bool
     || telemetry.clicksSucceeded > 0;
 }
 
+export function failureClassOf(observation: CommunityWorkObservation): string {
+  return String(observation.failureClass || '').trim().toUpperCase();
+}
+
+export function isInfrastructureFailure(observation: CommunityWorkObservation): boolean {
+  return observation.outcome === 'ACQUISITION_FAILED'
+    && INFRA_FAILURE_CLASSES.has(failureClassOf(observation));
+}
+
+/**
+ * Billable attempt accounting:
+ *   * direct processed work always counts (the URL executed, even if an infra
+ *     failure interrupted it afterwards);
+ *   * genuine transport/site failures count even with no telemetry;
+ *   * infrastructure/capacity waits and borrowed evidence do not count.
+ */
+export function countsTowardAttemptBudget(observation: CommunityWorkObservation): boolean {
+  if (sharedEvidenceSource(observation)) return false;
+  if (hasDirectProcessedAcquisitionEvidence(observation)) return true;
+  if (isInfrastructureFailure(observation)) return false;
+  return observation.outcome === 'ACQUISITION_FAILED';
+}
+
+/**
+ * Effective retry ownership, matching the production predicate: the chosen
+ * observation is a required ACQUISITION_FAILED row that is retryable and is
+ * not the deterministic REDIRECT_LIMIT case.
+ */
+export function observationOwnsRetry(observation: CommunityWorkObservation): boolean {
+  if (!isRequiredCommunityWorkObservation(observation)) return false;
+  if (sharedEvidenceSource(observation)) return false;
+  if (failureClassOf(observation) === 'REDIRECT_LIMIT') return false;
+  return observation.outcome === 'ACQUISITION_FAILED' && observation.retryable === true;
+}
+
 /**
  * Canonical work identity. Host/scheme are case-insensitive; path case is
  * preserved because many sites route by case. Fragments never reach a server
- * and are dropped. Trailing slashes are equivalent for this ledger.
+ * and are dropped. Trailing path slashes are equivalent for this ledger.
  */
 export function normalizeCommunityWorkUrl(raw: string): string | null {
   const value = String(raw || '').trim();
@@ -231,16 +312,25 @@ function observationRank(observation: CommunityWorkObservation): number {
   }
 }
 
-function isLaterObservation(
+/**
+ * Rank-first effective selection. Timestamps are only a tie-breaker: the
+ * inspector stamps rendered observations at inspection start while static
+ * observations get a later timestamp, so pure time ordering can prefer an
+ * older failure over a newer successful rendered run.
+ */
+function isPreferredObservation(
   candidate: CommunityWorkObservation,
   current: CommunityWorkObservation,
 ): boolean {
+  const candidateRank = observationRank(candidate);
+  const currentRank = observationRank(current);
+  if (candidateRank !== currentRank) return candidateRank > currentRank;
   const candidateAt = Date.parse(candidate.observedAt);
   const currentAt = Date.parse(current.observedAt);
   if (Number.isFinite(candidateAt) && Number.isFinite(currentAt) && candidateAt !== currentAt) {
     return candidateAt > currentAt;
   }
-  return observationRank(candidate) > observationRank(current);
+  return false;
 }
 
 export function resolveCommunityWorkState(
@@ -248,15 +338,19 @@ export function resolveCommunityWorkState(
   attempts: number,
   maxAttempts: number,
 ): { state: CommunityWorkState; terminalReason: string | null } {
-  const failureClass = String(latest.failureClass || '').trim().toUpperCase();
+  const failureClass = failureClassOf(latest);
   if (latest.outcome === 'FOUND') {
     return { state: 'RESOLVED', terminalReason: 'FOUND' };
   }
   if (latest.outcome === 'INSPECTED_NO_MATCH') {
-    if (hasProcessedAcquisitionEvidence(latest)) {
+    if (hasDirectProcessedAcquisitionEvidence(latest)) {
       return { state: 'RESOLVED', terminalReason: 'INSPECTED_NO_MATCH' };
     }
-    // Unevidenced absence is inconclusive, never a terminal NOT_FOUND.
+    // Unevidenced absence is inconclusive, never a terminal NOT_FOUND. It
+    // still obeys the attempt cap so an exhausted URL cannot loop forever.
+    if (attempts >= maxAttempts) {
+      return { state: 'EXHAUSTED', terminalReason: 'MAX_ATTEMPTS' };
+    }
     return { state: 'PENDING', terminalReason: null };
   }
   if (attempts >= maxAttempts) {
@@ -291,6 +385,12 @@ export function projectCommunityAcquisitionWork(
   for (const observation of observations) {
     const surface = surfaceFromObservation(observation);
     if (!surfaces.has(surface)) {
+      skippedRows++;
+      continue;
+    }
+    // Optional/auxiliary observations are not backlog work, and borrowed
+    // evidence must never create a work row for the borrower URL.
+    if (!isRequiredCommunityWorkObservation(observation) || sharedEvidenceSource(observation)) {
       skippedRows++;
       continue;
     }
@@ -332,37 +432,34 @@ export function projectCommunityAcquisitionWork(
     let latest = group.observations[0];
     let earliestAt = latest.observedAt;
     let attempts = 0;
-    let anyRetryable = false;
-    let anyBrowserExecution = false;
+    let directProcessedExecutions = 0;
+    let browserExecutions = 0;
     let lastAttemptAt: string | null = null;
 
     for (const observation of group.observations) {
-      if (isLaterObservation(observation, latest)) latest = observation;
+      if (isPreferredObservation(observation, latest)) latest = observation;
       if (Date.parse(observation.observedAt) < Date.parse(earliestAt)) {
         earliestAt = observation.observedAt;
       }
-      if (observation.retryable) anyRetryable = true;
-      if (hasProcessedAcquisitionEvidence(observation)) {
+      if (hasDirectProcessedAcquisitionEvidence(observation)) directProcessedExecutions++;
+      if (hasBrowserExecution(observation)) browserExecutions++;
+      if (countsTowardAttemptBudget(observation)) {
         attempts++;
         if (!lastAttemptAt || Date.parse(observation.observedAt) > Date.parse(lastAttemptAt)) {
           lastAttemptAt = observation.observedAt;
         }
       }
-      if (hasBrowserExecution(observation)) anyBrowserExecution = true;
     }
 
     const { state, terminalReason } = resolveCommunityWorkState(latest, attempts, maxAttempts);
-    const neverExecuted = attempts === 0;
-    const neverBrowserExecuted = !anyBrowserExecution;
-    if (state !== 'RESOLVED') {
-      byState[state]++;
-    } else {
-      byState.RESOLVED++;
-    }
-    if (anyRetryable) retryableRows++;
+    const neverExecuted = directProcessedExecutions === 0;
+    const neverBrowserExecuted = browserExecutions === 0;
+    const retryOwned = observationOwnsRetry(latest);
+    byState[state]++;
+    if (retryOwned) retryableRows++;
     if (neverExecuted) neverExecutedRows++;
     if (neverBrowserExecuted) neverBrowserExecutedRows++;
-    if (anyRetryable && neverBrowserExecuted) retryableNeverBrowserExecutedRows++;
+    if (retryOwned && neverBrowserExecuted) retryableNeverBrowserExecutedRows++;
 
     rows.push({
       workKey,
@@ -382,13 +479,15 @@ export function projectCommunityAcquisitionWork(
       terminalReason,
       terminalEvidence: {
         observationCount: group.observations.length,
-        processedExecutions: attempts,
-        browserExecutions: anyBrowserExecution ? 1 : 0,
+        processedExecutions: directProcessedExecutions,
+        billableAttempts: attempts,
+        browserExecutions,
         latestOutcome: latest.outcome,
         latestObservedAt: latest.observedAt,
         latestFailureClass: latest.failureClass || null,
+        retryOwned,
       },
-      anyRetryable,
+      retryOwned,
       observations: group.observations.length,
     });
   }
@@ -437,7 +536,7 @@ export function reconcileCommunityWorkProjection(
     retryableDeltaPct,
     retryableWithinFivePercent: retryableDeltaPct <= tolerancePct,
     telemetryNeverBrowserExecutedRows: telemetry.neverBrowserExecutedRows,
-    projectionNeverBrowserExecutedRows: projection.retryableNeverBrowserExecutedRows,
+    projectionRetryableNeverBrowserExecutedRows: projection.retryableNeverBrowserExecutedRows,
     neverExecutedDelta,
     neverExecutedDeltaPct,
     neverExecutedWithinFivePercent: neverExecutedDeltaPct <= tolerancePct,

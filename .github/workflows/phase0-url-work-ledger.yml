@@ -7,9 +7,13 @@ on:
       - 'server/communityAcquisitionWorkLedger.ts'
       - 'server/communityAcquisitionWorkLedger.test.ts'
       - 'server/phase0UrlWorkLedgerReport.ts'
+      - 'server/phase0UrlWorkLedgerReport.test.ts'
       - 'server/phase0UrlWorkLedgerMigration.test.ts'
       - 'server/phase0UrlWorkLedger.postgres.test.ts'
       - 'scripts/phase0UrlWorkLedgerReport.ts'
+      - 'scripts/runMigrations.ts'
+      - 'server/db.ts'
+      - 'server/dbCore.ts'
       - 'package.json'
       - 'package-lock.json'
       - 'tsconfig.json'
@@ -53,7 +57,9 @@ jobs:
       - run: npm ci
       - name: Apply migrations to isolated test database
         run: npx tsx scripts/runMigrations.ts
+      - name: TypeScript check
+        run: npx tsc --noEmit
       - name: Phase 0 URL work ledger static assertions
-        run: node --import tsx --test server/phase0UrlWorkLedgerMigration.test.ts server/communityAcquisitionWorkLedger.test.ts
+        run: node --import tsx --test server/phase0UrlWorkLedgerMigration.test.ts server/communityAcquisitionWorkLedger.test.ts server/phase0UrlWorkLedgerReport.test.ts
       - name: Phase 0 URL work ledger PostgreSQL regression
         run: node --import tsx --test server/phase0UrlWorkLedger.postgres.test.ts

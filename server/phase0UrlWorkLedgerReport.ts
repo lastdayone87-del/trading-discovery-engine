@@ -4,6 +4,11 @@
  * The CLI wrapper lives in scripts/phase0UrlWorkLedgerReport.ts. Keeping the
  * builder here lets the PostgreSQL regression exercise the same SQL the
  * operator runs, without duplicating query text in tests.
+ *
+ * The builder issues several queries. Callers must run it on one connection in
+ * a REPEATABLE READ transaction (the CLI and the PostgreSQL regression do), so
+ * the pending-channel population cannot change between the projection and the
+ * independent SQL bound.
  */
 
 import {
@@ -41,23 +46,132 @@ export interface Phase0UrlWorkLedgerReportDb {
   query: (sql: string, values?: unknown[]) => Promise<{ rows: any[] }>;
 }
 
+export interface Phase0UrlWorkLedgerReportArgs {
+  windowDays: number;
+  maxDeltaPct: number;
+  check: boolean;
+  includeRows: boolean;
+  out: string | null;
+  help: boolean;
+}
+
+export const PHASE0_URL_WORK_LEDGER_USAGE =
+  'Usage: npx tsx scripts/phase0UrlWorkLedgerReport.ts '
+  + '[--window-days=14] [--max-delta-pct=5] [--check] [--include-rows] [--out=path]';
+
+function parseBoundedInteger(rawValue: string, flag: string, min: number, max: number): number {
+  if (!/^\d+$/.test(rawValue)) {
+    throw new Error(`${flag} must be an integer between ${min} and ${max}: "${rawValue}"`);
+  }
+  const value = Number(rawValue);
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new Error(`${flag} must be an integer between ${min} and ${max}: "${rawValue}"`);
+  }
+  return value;
+}
+
+function parseBoundedPercent(rawValue: string, flag: string, max: number): number {
+  if (!/^\d+(?:\.\d+)?$/.test(rawValue)) {
+    throw new Error(`${flag} must be a number between 0 and ${max}: "${rawValue}"`);
+  }
+  const value = Number(rawValue);
+  if (!Number.isFinite(value) || value < 0 || value > max) {
+    throw new Error(`${flag} must be a number between 0 and ${max}: "${rawValue}"`);
+  }
+  return value;
+}
+
+/**
+ * Strict argument parsing: unknown or malformed tokens fail instead of being
+ * silently ignored. In particular `--max-delta-pct=0` must remain zero, and
+ * `--check=true` / bare `--window-days` must not be treated as defaults.
+ */
+export function parsePhase0UrlWorkLedgerReportArgs(
+  argv: readonly string[],
+): Phase0UrlWorkLedgerReportArgs {
+  const args: Phase0UrlWorkLedgerReportArgs = {
+    windowDays: 14,
+    maxDeltaPct: 5,
+    check: false,
+    includeRows: false,
+    out: null,
+    help: false,
+  };
+  for (const raw of argv) {
+    if (raw === '--check') args.check = true;
+    else if (raw === '--include-rows') args.includeRows = true;
+    else if (raw === '--help' || raw === '-h') args.help = true;
+    else if (raw.startsWith('--window-days=')) {
+      args.windowDays = parseBoundedInteger(raw.slice('--window-days='.length), '--window-days', 1, 90);
+    } else if (raw.startsWith('--max-delta-pct=')) {
+      args.maxDeltaPct = parseBoundedPercent(raw.slice('--max-delta-pct='.length), '--max-delta-pct', 100);
+    } else if (raw.startsWith('--out=')) {
+      const out = raw.slice('--out='.length);
+      if (!out.trim()) throw new Error('--out must name a non-empty file path');
+      args.out = out;
+    } else {
+      throw new Error(`unknown argument: "${raw}". ${PHASE0_URL_WORK_LEDGER_USAGE}`);
+    }
+  }
+  return args;
+}
+
 const SURFACES = [...COMMUNITY_ACQUISITION_WORK_SURFACES];
 
-// The SQL bound deliberately uses raw URL spelling (lowercased, trailing slash
-// removed) rather than the projection's full canonicalization, so a
-// normalization bug appears as a delta instead of being hidden.
-function safeIntSql(jsonExpression: string): string {
-  // Parentheses are required: `::` binds tighter than `->>`, so an unparenthesized
-  // cast would apply to the trailing key literal instead of the extracted value.
-  return `(CASE WHEN ${jsonExpression} ~ '^[0-9]+$' THEN (${jsonExpression})::int ELSE 0 END)`;
+/**
+ * SQL spelling of the work URL. This is deliberately independent of the
+ * TypeScript URL serializer so normalization drift shows up as a delta, but it
+ * must still be structurally correct:
+ *
+ *   * drop the fragment, preserve the query;
+ *   * trim trailing slashes only from the path, never from query values;
+ *   * keep a root path slash so `https://example.com` and
+ *     `https://example.com/` agree with `URL.toString()`.
+ */
+function sqlNormalizedUrl(expression: string): string {
+  const withoutFragment = `split_part(trim(COALESCE(${expression}, '')), '#', 1)`;
+  const pathPart = `(CASE WHEN strpos(${withoutFragment}, '?') > 0`
+    + ` THEN substr(${withoutFragment}, 1, strpos(${withoutFragment}, '?') - 1)`
+    + ` ELSE ${withoutFragment} END)`;
+  const queryPart = `(CASE WHEN strpos(${withoutFragment}, '?') > 0`
+    + ` THEN substr(${withoutFragment}, strpos(${withoutFragment}, '?'))`
+    + ` ELSE '' END)`;
+  const trimmedPath = `(CASE WHEN rtrim(${pathPart}, '/') ~ '^[A-Za-z][A-Za-z0-9+.-]*://[^/]+$'`
+    + ` THEN rtrim(${pathPart}, '/') || '/'`
+    + ` ELSE rtrim(${pathPart}, '/') END)`;
+  return `lower(${trimmedPath} || ${queryPart})`;
 }
+
+function safeIntSql(jsonExpression: string): string {
+  // Parentheses are required: `::` binds tighter than `->>`, so an
+  // unparenthesized cast would apply to the trailing key literal instead of
+  // the extracted value. The digit-length bound keeps the numeric cast safe for
+  // arbitrarily long JSON strings; out-of-range counters contribute no evidence.
+  return `(CASE WHEN ${jsonExpression} ~ '^[0-9]{1,18}$'`
+    + ` AND (${jsonExpression})::numeric <= 2147483647`
+    + ` THEN (${jsonExpression})::int ELSE 0 END)`;
+}
+
+const REQUIRED_COMMUNITY_OBSERVATION_WHERE = `
+  COALESCE(o.requested_url,'') <> ''
+  AND COALESCE(o.requested_url,'') ~* '^https?://'
+  AND COALESCE(o.provenance->>'surface','') = ANY($2::text[])
+  AND COALESCE(o.provenance->>'required','false') = 'true'
+  AND COALESCE(o.provenance->>'sharedEvidenceFrom','') = ''
+`;
 
 export async function buildPhase0UrlWorkLedgerReport(
   db: Phase0UrlWorkLedgerReportDb,
   options: Phase0UrlWorkLedgerReportOptions = {},
 ): Promise<Phase0UrlWorkLedgerReport> {
-  const windowDays = Math.max(1, Math.min(90, Math.round(options.windowDays ?? 14)));
-  const maxDeltaPct = Math.max(0, Math.min(100, options.maxDeltaPct ?? 5));
+  const requestedWindowDays = options.windowDays ?? 14;
+  const requestedMaxDeltaPct = options.maxDeltaPct ?? 5;
+  const windowDays = Number.isFinite(requestedWindowDays)
+    ? Math.max(1, Math.min(90, Math.round(requestedWindowDays)))
+    : 14;
+  const maxDeltaPct = Number.isFinite(requestedMaxDeltaPct)
+    ? Math.max(0, Math.min(100, requestedMaxDeltaPct))
+    : 5;
 
   const schema = await db.query(
     `SELECT to_regclass('public.community_acquisition_url_state') AS oid`,
@@ -88,8 +202,7 @@ export async function buildPhase0UrlWorkLedgerReport(
             AND status IN ('PENDING','PROCESSING')
        ) pending ON pending.channel_id = o.channel_id
       WHERE o.observed_at > now() - ($1::text || ' days')::interval
-        AND COALESCE(o.requested_url,'') <> ''
-        AND COALESCE(o.provenance->>'surface','') = ANY($2::text[])
+        AND ${REQUIRED_COMMUNITY_OBSERVATION_WHERE}
       ORDER BY o.channel_id, o.observed_at`,
     [windowDays, SURFACES],
   );
@@ -113,11 +226,15 @@ export async function buildPhase0UrlWorkLedgerReport(
         WHERE type='RETRY_COMMUNITY_ACQUISITION'
           AND status IN ('PENDING','PROCESSING')
      ),
-     deferred AS (
+     raw AS (
        SELECT o.channel_id,
               COALESCE(o.provenance->>'surface','') AS surface,
-              lower(rtrim(COALESCE(o.requested_url,''),'/')) AS normalized_url,
-              bool_or(
+              ${sqlNormalizedUrl('o.requested_url')} AS normalized_url,
+              o.outcome,
+              o.retryable,
+              COALESCE(o.failure_class,'') AS failure_class,
+              o.observed_at,
+              (
                 COALESCE(o.provenance->'crawlerTelemetry'->>'mode','') = 'RENDERED'
                 AND (
                   ${safeIntSql(`o.provenance->'crawlerTelemetry'->>'requestsFinished'`)} > 0
@@ -127,15 +244,49 @@ export async function buildPhase0UrlWorkLedgerReport(
               ) AS browser_executed
          FROM external_acquisition_observations o
          JOIN pending ON pending.channel_id = o.channel_id
-        WHERE o.retryable
-          AND o.observed_at > now() - ($1::text || ' days')::interval
-          AND COALESCE(o.requested_url,'') <> ''
-          AND COALESCE(o.provenance->>'surface','') = ANY($2::text[])
-        GROUP BY 1,2,3
+        WHERE o.observed_at > now() - ($1::text || ' days')::interval
+          AND ${REQUIRED_COMMUNITY_OBSERVATION_WHERE}
+     ),
+     grouped AS (
+       SELECT channel_id,
+              surface,
+              normalized_url,
+              bool_or(browser_executed) AS browser_executed
+         FROM raw
+        GROUP BY channel_id, surface, normalized_url
+     ),
+     ranked AS (
+       SELECT raw.*,
+              row_number() OVER (
+                PARTITION BY channel_id, surface, normalized_url
+                ORDER BY CASE outcome
+                           WHEN 'FOUND' THEN 4
+                           WHEN 'INSPECTED_NO_MATCH' THEN 3
+                           WHEN 'PARTIALLY_INSPECTED' THEN 2
+                           WHEN 'ACQUISITION_FAILED' THEN 1
+                           ELSE 0
+                         END DESC,
+                         observed_at DESC
+              ) AS effective_rank
+         FROM raw
      )
-     SELECT count(*)::int AS retryable_rows,
-            count(*) FILTER (WHERE NOT browser_executed)::int AS never_browser_executed_rows
-       FROM deferred`,
+     SELECT count(*) FILTER (
+              WHERE e.outcome = 'ACQUISITION_FAILED'
+                AND e.retryable
+                AND e.failure_class <> 'REDIRECT_LIMIT'
+            )::int AS retryable_rows,
+            count(*) FILTER (
+              WHERE e.outcome = 'ACQUISITION_FAILED'
+                AND e.retryable
+                AND e.failure_class <> 'REDIRECT_LIMIT'
+                AND NOT g.browser_executed
+            )::int AS never_browser_executed_rows
+       FROM ranked e
+       JOIN grouped g
+         ON g.channel_id = e.channel_id
+        AND g.surface = e.surface
+        AND g.normalized_url = e.normalized_url
+      WHERE e.effective_rank = 1`,
     [windowDays, SURFACES],
   );
 
@@ -156,17 +307,18 @@ export async function buildPhase0UrlWorkLedgerReport(
         WHERE type='RETRY_COMMUNITY_ACQUISITION'
           AND status IN ('PENDING','PROCESSING')
      )
-     SELECT count(*)::int AS rows
+     SELECT count(DISTINCT (l.channel_id, ${sqlNormalizedUrl('l.source_url')}))::int AS rows
        FROM creator_site_links l
        JOIN pending ON pending.channel_id = l.channel_id
-       LEFT JOIN site_inspections s ON s.site_identity = l.site_identity
-      WHERE COALESCE(s.canonical_url,l.source_url,'') <> ''
+      WHERE COALESCE(l.source_url,'') ~* '^https?://'
         AND NOT EXISTS (
           SELECT 1
             FROM external_acquisition_observations o
            WHERE o.channel_id = l.channel_id
-             AND lower(rtrim(COALESCE(o.requested_url,''),'/'))
-                 = lower(rtrim(COALESCE(s.canonical_url,l.source_url),'/'))
+             AND (
+               ${sqlNormalizedUrl('o.requested_url')} = ${sqlNormalizedUrl('l.source_url')}
+               OR ${sqlNormalizedUrl('o.final_url')} = ${sqlNormalizedUrl('l.source_url')}
+             )
         )`,
   );
 
@@ -190,11 +342,14 @@ export async function buildPhase0UrlWorkLedgerReport(
   } else if (ledger.rows === 0) {
     warnings.push('ledger_empty_phase0_expected: the ledger is not populated until Phase 1 dual-write');
   }
+  if (telemetryBound.retryableRows === 0) {
+    warnings.push('no_retryable_work_measured: the window contains no retry-owned work to reconcile');
+  }
   if (!reconciliation.retryableWithinFivePercent) {
     warnings.push('retryable_projection_delta_exceeds_tolerance');
   }
   if (!reconciliation.neverExecutedWithinFivePercent) {
-    warnings.push('never_executed_projection_delta_exceeds_tolerance');
+    warnings.push('retryable_never_browser_executed_delta_exceeds_tolerance');
   }
 
   return {

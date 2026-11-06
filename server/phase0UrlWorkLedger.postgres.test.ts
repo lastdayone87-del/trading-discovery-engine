@@ -1,13 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getDb } from './dbCore';
-import { reconcileCommunityWorkProjection } from './communityAcquisitionWorkLedger';
 import { buildPhase0UrlWorkLedgerReport } from './phase0UrlWorkLedgerReport';
 
-// These tests insert ledger and observation fixtures, so they are opt-in and
-// only run in the dedicated Phase 0 URL-ledger workflow against its scratch
-// database.
-const enabled = Boolean(process.env.PHASE0_URL_LEDGER_TEST_DATABASE_URL);
+// These tests insert ledger and observation fixtures. The opt-in variable also
+// selects the connection: enabling the suite must never insert into whatever
+// DATABASE_URL happened to be inherited from the shell.
+const dedicatedDatabaseUrl = process.env.PHASE0_URL_LEDGER_TEST_DATABASE_URL;
+if (dedicatedDatabaseUrl) process.env.DATABASE_URL = dedicatedDatabaseUrl;
+const enabled = Boolean(dedicatedDatabaseUrl);
 const maybe = enabled ? test : test.skip;
 
 function uniqueSuffix(): string {
@@ -29,13 +30,15 @@ maybe('migration 166 enforces lifecycle constraints and freshness', async t => {
     `INSERT INTO community_acquisition_url_state(
        work_key,channel_id,url,normalized_url,surface
      ) VALUES($1,$2,'https://example.com/links','https://example.com/links','CREATOR_WEBSITES')
-     RETURNING state,never_executed,attempts,max_attempts,terminal_evidence,updated_at`,
+     RETURNING state,never_executed,attempts,max_attempts,retryable,browser_executed,terminal_evidence,updated_at`,
     [workKey, channelId],
   );
   assert.equal(inserted.rows[0].state, 'PENDING');
   assert.equal(inserted.rows[0].never_executed, true);
   assert.equal(inserted.rows[0].attempts, 0);
   assert.equal(inserted.rows[0].max_attempts, 5);
+  assert.equal(inserted.rows[0].retryable, false);
+  assert.equal(inserted.rows[0].browser_executed, false);
   assert.deepEqual(inserted.rows[0].terminal_evidence, {});
 
   await assert.rejects(
@@ -58,6 +61,16 @@ maybe('migration 166 enforces lifecycle constraints and freshness', async t => {
     /duplicate key value violates unique constraint/,
   );
 
+  await assert.rejects(
+    db.query(
+      `INSERT INTO community_acquisition_url_state(
+         work_key,channel_id,url,normalized_url,surface,never_executed,browser_executed
+       ) VALUES($1,$2,'https://example.com/impossible','https://example.com/impossible','CREATOR_WEBSITES',TRUE,TRUE)`,
+      [`phase0-ledger-impossible-${uniqueSuffix()}`, channelId],
+    ),
+    /community_url_state_browser_executed_check/,
+  );
+
   const before = inserted.rows[0].updated_at;
   await db.query(`SELECT pg_sleep(0.02)`);
   const updated = await db.query(
@@ -75,6 +88,7 @@ maybe('migration 166 enforces lifecycle constraints and freshness', async t => {
 
 maybe('the read-only report projects and reconciles a fixture backlog', async t => {
   const db = await getDb();
+  const client = await db.connect();
   const suffix = uniqueSuffix();
   const channelId = `UCphase0ledger-report-${suffix}`;
   const jobKey = `phase0-ledger-report-job-${suffix}`;
@@ -86,114 +100,198 @@ maybe('the read-only report projects and reconciles a fixture backlog', async t 
     await db.query(`DELETE FROM jobs WHERE payload->>'channelId'=$1`, [channelId]);
   });
 
-  const baseline = await buildPhase0UrlWorkLedgerReport(db, { windowDays: 1, maxDeltaPct: 5 });
+  let baseline!: Awaited<ReturnType<typeof buildPhase0UrlWorkLedgerReport>>;
+  let report!: Awaited<ReturnType<typeof buildPhase0UrlWorkLedgerReport>>;
+  try {
+    // One snapshot freezes the external pending-channel population. Fixtures
+    // inserted below are visible through our own writes but unrelated retry
+    // completions cannot change the baseline or the reconciliation report.
+    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+    baseline = await buildPhase0UrlWorkLedgerReport(client, { windowDays: 1, maxDeltaPct: 5 });
 
-  await db.query(
-    `INSERT INTO jobs(type,payload,status,priority,max_attempts,run_after,idempotency_key)
-     VALUES('RETRY_COMMUNITY_ACQUISITION',$1::jsonb,'PENDING',1000000000,5,now()-interval '1 minute',$2)`,
-    [JSON.stringify({ channelId, retryReason: 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE' }), jobKey],
-  );
-
-  const observations = [
-    {
-      key: `phase0-ledger-found-${suffix}`,
-      url: 'https://found.example/links',
-      outcome: 'FOUND',
-      retryable: false,
-      failureClass: null,
-      surface: 'CREATOR_WEBSITES',
-      telemetry: { mode: 'STATIC', pagesInspected: 3, requestsStarted: 0, requestsFinished: 0 },
-    },
-    {
-      key: `phase0-ledger-never-${suffix}`,
-      url: 'https://never.example/bio',
-      outcome: 'ACQUISITION_FAILED',
-      retryable: true,
-      failureClass: 'NETWORK_FAILURE',
-      surface: 'SOCIAL_PROFILES',
-      telemetry: { mode: 'STATIC', pagesInspected: 0, requestsStarted: 5, requestsFinished: 0 },
-    },
-    {
-      key: `phase0-ledger-static-${suffix}`,
-      url: 'https://static.example/',
-      outcome: 'ACQUISITION_FAILED',
-      retryable: true,
-      failureClass: 'NETWORK_FAILURE',
-      surface: 'CREATOR_WEBSITES',
-      telemetry: { mode: 'STATIC', pagesInspected: 2, requestsStarted: 0, requestsFinished: 0 },
-    },
-  ];
-
-  for (const observation of observations) {
-    await db.query(
-      `INSERT INTO external_acquisition_observations(
-         observation_key,channel_id,requested_url,outcome,retryable,failure_class,
-         detail,provenance,policy_version,observed_at
-       ) VALUES($1,$2,$3,$4,$5,$6,'fixture',$7::jsonb,'phase0-ledger-test-v1',now())`,
-      [
-        observation.key,
-        channelId,
-        observation.url,
-        observation.outcome,
-        observation.retryable,
-        observation.failureClass,
-        JSON.stringify({
-          provider: 'external-link',
-          surface: observation.surface,
-          required: true,
-          crawlerTelemetry: observation.telemetry,
-        }),
-      ],
+    await client.query(
+      `INSERT INTO jobs(type,payload,status,priority,max_attempts,run_after,idempotency_key)
+       VALUES('RETRY_COMMUNITY_ACQUISITION',$1::jsonb,'PENDING',1000000000,5,now()-interval '1 minute',$2)`,
+      [JSON.stringify({ channelId, retryReason: 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE' }), jobKey],
     );
-  }
 
-  const report = await buildPhase0UrlWorkLedgerReport(db, {
-    windowDays: 1,
-    maxDeltaPct: 5,
-    includeRows: true,
-  });
+    const observations: Array<{
+      key: string;
+      url: string;
+      outcome: string;
+      retryable: boolean;
+      failureClass: string | null;
+      required: boolean;
+      observedAt?: string;
+      telemetry: Record<string, unknown>;
+    }> = [
+      {
+        key: `phase0-ledger-found-${suffix}`,
+        url: 'https://found.example/links',
+        outcome: 'FOUND',
+        retryable: false,
+        failureClass: null,
+        required: true,
+        telemetry: { mode: 'STATIC', pagesInspected: 3, requestsStarted: 0, requestsFinished: 0 },
+      },
+      {
+        key: `phase0-ledger-never-${suffix}`,
+        url: 'https://never.example/bio',
+        outcome: 'ACQUISITION_FAILED',
+        retryable: true,
+        failureClass: 'NETWORK_FAILURE',
+        required: true,
+        telemetry: { mode: 'STATIC', pagesInspected: 0, requestsStarted: 5, requestsFinished: 0 },
+      },
+      {
+        key: `phase0-ledger-static-${suffix}`,
+        url: 'https://static.example/',
+        outcome: 'ACQUISITION_FAILED',
+        retryable: true,
+        failureClass: 'NETWORK_FAILURE',
+        required: true,
+        telemetry: { mode: 'STATIC', pagesInspected: 2, requestsStarted: 0, requestsFinished: 0 },
+      },
+      {
+        key: `phase0-ledger-recovered-static-${suffix}`,
+        url: 'https://recovered.example/',
+        outcome: 'ACQUISITION_FAILED',
+        retryable: true,
+        failureClass: 'NETWORK_FAILURE',
+        required: true,
+        observedAt: `now() - interval '2 minutes'`,
+        telemetry: { mode: 'STATIC', pagesInspected: 1, requestsStarted: 0, requestsFinished: 0 },
+      },
+      {
+        key: `phase0-ledger-recovered-found-${suffix}`,
+        url: 'https://recovered.example/',
+        outcome: 'FOUND',
+        retryable: false,
+        failureClass: null,
+        required: true,
+        observedAt: `now() - interval '1 minute'`,
+        telemetry: { mode: 'RENDERED', pagesInspected: 2, requestsStarted: 2, requestsFinished: 2 },
+      },
+      {
+        key: `phase0-ledger-oversized-${suffix}`,
+        url: 'https://oversized.example/',
+        outcome: 'ACQUISITION_FAILED',
+        retryable: true,
+        failureClass: 'NETWORK_FAILURE',
+        required: true,
+        telemetry: {
+          mode: 'RENDERED',
+          pagesInspected: 0,
+          requestsStarted: 0,
+          requestsFinished: '999999999999999999999999999',
+        },
+      },
+      {
+        key: `phase0-ledger-optional-${suffix}`,
+        url: 'https://optional.example/',
+        outcome: 'ACQUISITION_FAILED',
+        retryable: true,
+        failureClass: 'NETWORK_FAILURE',
+        required: false,
+        telemetry: { mode: 'STATIC', pagesInspected: 1, requestsStarted: 0, requestsFinished: 0 },
+      },
+    ];
+
+    for (const observation of observations) {
+      await client.query(
+        `INSERT INTO external_acquisition_observations(
+           observation_key,channel_id,requested_url,outcome,retryable,failure_class,
+           detail,provenance,policy_version,observed_at
+         ) VALUES($1,$2,$3,$4,$5,$6,'fixture',$7::jsonb,'phase0-ledger-test-v1',
+                  ${observation.observedAt || 'now()'})`,
+        [
+          observation.key,
+          channelId,
+          observation.url,
+          observation.outcome,
+          observation.retryable,
+          observation.failureClass,
+          JSON.stringify({
+            provider: 'external-link',
+            surface: observation.url.includes('/bio') ? 'SOCIAL_PROFILES' : 'CREATOR_WEBSITES',
+            required: observation.required,
+            crawlerTelemetry: observation.telemetry,
+          }),
+        ],
+      );
+    }
+
+    report = await buildPhase0UrlWorkLedgerReport(client, {
+      windowDays: 1,
+      maxDeltaPct: 5,
+      includeRows: true,
+    });
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
 
   assert.equal(report.schema.ledgerTablePresent, true);
   assert.ok(report.batches.pendingChannels >= 1);
   assert.ok(report.rows, 'includeRows must return the projection rows');
 
   const rows = report.rows.filter(row => row.channelId === channelId);
-  assert.equal(rows.length, 3);
+  assert.equal(rows.length, 5, 'optional observations never become ledger work');
   const byUrl = new Map(rows.map(row => [row.normalizedUrl, row]));
   assert.equal(byUrl.get('https://found.example/links')?.state, 'RESOLVED');
   assert.equal(byUrl.get('https://found.example/links')?.neverExecuted, false);
   assert.equal(byUrl.get('https://found.example/links')?.neverBrowserExecuted, true);
   assert.equal(byUrl.get('https://never.example/bio')?.state, 'PENDING');
   assert.equal(byUrl.get('https://never.example/bio')?.neverExecuted, true);
-  assert.equal(byUrl.get('https://never.example/bio')?.attempts, 0);
+  assert.equal(byUrl.get('https://never.example/bio')?.attempts, 1);
+  assert.equal(byUrl.get('https://never.example/bio')?.retryOwned, true);
   assert.equal(byUrl.get('https://static.example/')?.state, 'PENDING');
   assert.equal(byUrl.get('https://static.example/')?.neverExecuted, false);
   assert.equal(byUrl.get('https://static.example/')?.neverBrowserExecuted, true);
+  assert.equal(byUrl.get('https://recovered.example/')?.state, 'RESOLVED');
+  assert.equal(byUrl.get('https://recovered.example/')?.retryOwned, false);
+  assert.equal(byUrl.get('https://recovered.example/')?.neverBrowserExecuted, false);
+  assert.equal(byUrl.get('https://recovered.example/')?.attempts, 2);
+  assert.equal(byUrl.get('https://oversized.example/')?.state, 'PENDING');
+  assert.equal(byUrl.get('https://oversized.example/')?.neverExecuted, true);
+  assert.equal(byUrl.get('https://oversized.example/')?.neverBrowserExecuted, true);
+  assert.equal(byUrl.get('https://optional.example/'), undefined);
 
   // The SQL telemetry bound and the TypeScript projection must agree on the
-  // fixture rows: two retryable URLs, both never browser-executed.
+  // fixture rows: three effective retry owners, all never browser-executed.
+  // `recovered.example` has a retryable static failure plus a rendered success,
+  // so it is not retry-owned but must count as browser-executed.
   const retryableDelta = report.projection.retryableRows - baseline.projection.retryableRows;
   const retryableNeverBrowserDelta = report.projection.retryableNeverBrowserExecutedRows
     - baseline.projection.retryableNeverBrowserExecutedRows;
   const telemetryRetryableDelta = report.telemetry.retryableRows - baseline.telemetry.retryableRows;
   const telemetryNeverBrowserDelta = report.telemetry.neverBrowserExecutedRows
     - baseline.telemetry.neverBrowserExecutedRows;
-  assert.equal(retryableDelta, 2);
-  assert.equal(retryableNeverBrowserDelta, 2);
-  assert.equal(telemetryRetryableDelta, 2);
-  assert.equal(telemetryNeverBrowserDelta, 2);
+  assert.equal(retryableDelta, 3);
+  assert.equal(retryableNeverBrowserDelta, 3);
+  assert.equal(telemetryRetryableDelta, 3);
+  assert.equal(telemetryNeverBrowserDelta, 3);
 
-  const reconciled = reconcileCommunityWorkProjection(
-    {
-      retryableRows: retryableDelta,
-      neverBrowserExecutedRows: retryableNeverBrowserDelta,
-      retryableNeverBrowserExecutedRows: retryableNeverBrowserDelta,
-    },
-    {
-      retryableRows: telemetryRetryableDelta,
-      neverBrowserExecutedRows: telemetryNeverBrowserDelta,
-    },
+  // The report must expose its own reconciliation, not just a recomputed copy.
+  assert.equal(report.reconciliation.projectionRetryableRows, report.projection.retryableRows);
+  assert.equal(report.reconciliation.telemetryRetryableRows, report.telemetry.retryableRows);
+  assert.equal(
+    report.reconciliation.projectionRetryableNeverBrowserExecutedRows,
+    report.projection.retryableNeverBrowserExecutedRows,
   );
-  assert.equal(reconciled.retryableWithinFivePercent, true);
-  assert.equal(reconciled.neverExecutedWithinFivePercent, true);
+  assert.equal(
+    report.reconciliation.retryableDelta,
+    report.projection.retryableRows - report.telemetry.retryableRows,
+  );
+  assert.equal(
+    report.reconciliation.neverExecutedDelta,
+    report.projection.retryableNeverBrowserExecutedRows - report.telemetry.neverBrowserExecutedRows,
+  );
+  if (baseline.telemetry.retryableRows === 0 && baseline.projection.retryableRows === 0) {
+    assert.equal(report.reconciliation.retryableDelta, 3);
+    assert.equal(report.reconciliation.neverExecutedDelta, 3);
+  }
 });
