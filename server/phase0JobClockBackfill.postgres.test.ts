@@ -12,6 +12,14 @@ maybe('phase 0 clock backfill preserves earliest evidence and historical clocks'
   const iso = (ms: number) => new Date(ms).toISOString();
   const anchor = iso(now - 10 * 60_000);
 
+  const ids: string[] = [];
+
+  t.after(async () => {
+    if (!ids.length) return;
+    await db.query(`DELETE FROM job_attempts WHERE job_id=ANY($1::uuid[])`, [ids]);
+    await db.query(`DELETE FROM jobs WHERE id=ANY($1::uuid[])`, [ids]);
+  });
+
   const insert = async (suffix: string, createdAt: string, payload: unknown): Promise<string> => {
     const res = await db.query(
       `INSERT INTO jobs(
@@ -23,7 +31,9 @@ maybe('phase 0 clock backfill preserves earliest evidence and historical clocks'
        ) RETURNING id`,
       ['PHASE0_CLOCK_BACKFILL_TEST', JSON.stringify(payload), createdAt, anchor, `${prefix}-${suffix}`],
     );
-    return res.rows[0].id as string;
+    const id = res.rows[0].id as string;
+    ids.push(id);
+    return id;
   };
 
   const createdEarlier = iso(now - 60 * 60_000);
@@ -41,12 +51,6 @@ maybe('phase 0 clock backfill preserves earliest evidence and historical clocks'
   const missingId = await insert('missing', createdMissing, {});
   const malformedId = await insert('malformed', createdMalformed, { retryObservedAt: 'not-a-date' });
   const attemptId = await insert('attempt', createdAttempt, { retryObservedAt: observedAttempt });
-  const ids = [earlierId, laterId, missingId, malformedId, attemptId];
-
-  t.after(async () => {
-    await db.query(`DELETE FROM job_attempts WHERE job_id=ANY($1::uuid[])`, [ids]);
-    await db.query(`DELETE FROM jobs WHERE id=ANY($1::uuid[])`, [ids]);
-  });
 
   await db.query(
     `INSERT INTO job_attempts(job_id,attempt_number,started_at,status)

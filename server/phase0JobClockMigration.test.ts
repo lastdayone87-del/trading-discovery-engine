@@ -54,7 +54,7 @@ test('migration 162 performs only metadata-only DDL and defers the backfill', ()
 test('the runner backfills queue clocks in bounded idempotent batches', () => {
   assert.match(dbCore, /export async function backfillPhase0JobClocks/);
   assert.match(dbCore, /WHERE \(first_enqueued_at IS NULL OR last_enqueued_at IS NULL\)/);
-  assert.match(dbCore, /AND id > \$1::uuid/);
+  assert.match(dbCore, /AND id >= \$1::uuid/);
   assert.match(dbCore, /LIMIT \$2/);
   assert.match(dbCore, /SELECT job_id, MIN\(started_at\) AS started_at/);
   assert.match(dbCore, /phase0PayloadEpochMs\(row\.payload\)/);
@@ -67,8 +67,8 @@ test('the runner backfills queue clocks in bounded idempotent batches', () => {
     'the backfill must run outside the transactional migration loop',
   );
   assert.ok(
-    dbCore.indexOf('await backfillPhase0JobClocks(client)') < dbCore.indexOf('await ensurePhase0JobClockIndexes(client)'),
-    'queue clocks must be backfilled before the queue-age index is built',
+    dbCore.indexOf('await ensurePhase0JobClockIndexes(client)') < dbCore.indexOf('await backfillPhase0JobClocks(client)'),
+    'the partial backfill index must exist before the historical scan runs',
   );
 });
 
@@ -80,6 +80,10 @@ test('migration 162 never rewrites the genuine transient-failure anchor', () => 
 test('migration 162 defers populated-table indexes to the concurrent runner', () => {
   assert.doesNotMatch(withoutSqlComments, /CREATE\s+INDEX/i);
   assert.match(dbCore, /async function ensurePhase0JobClockIndexes/);
+  assert.match(
+    dbCore,
+    /CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_phase0_backfill_pending ON public\.jobs \(id\) WHERE first_enqueued_at IS NULL OR last_enqueued_at IS NULL/,
+  );
   assert.match(
     dbCore,
     /CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_pending_queue_age ON public\.jobs \(priority DESC, first_enqueued_at ASC\) WHERE status='PENDING'/,

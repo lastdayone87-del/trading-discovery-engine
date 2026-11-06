@@ -422,7 +422,7 @@ export async function backfillPhase0JobClocks(
       `SELECT id, created_at, payload
          FROM public.jobs
         WHERE (first_enqueued_at IS NULL OR last_enqueued_at IS NULL)
-          AND id > $1::uuid
+          AND id >= $1::uuid
         ORDER BY id
         LIMIT $2`,
       [cursor, bounded],
@@ -467,6 +467,9 @@ export async function backfillPhase0JobClocks(
     cursor = String(batch.rows[batch.rows.length - 1].id);
     if (batch.rows.length < bounded) break;
   }
+  if (total > 0) {
+    console.log(JSON.stringify({ event: 'phase0_job_clock_backfill', processed: total, timestamp: new Date().toISOString() }));
+  }
   return total;
 }
 
@@ -480,6 +483,10 @@ async function ensurePhase0JobClockIndexes(client: { query: (text: string, value
   const jobs = await client.query(`SELECT to_regclass('public.jobs') AS oid`);
   if (!jobs.rows[0]?.oid) return;
   const indexes = [
+    {
+      name: 'idx_jobs_phase0_backfill_pending',
+      create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_phase0_backfill_pending ON public.jobs (id) WHERE first_enqueued_at IS NULL OR last_enqueued_at IS NULL`,
+    },
     {
       name: 'idx_jobs_pending_queue_age',
       create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_pending_queue_age ON public.jobs (priority DESC, first_enqueued_at ASC) WHERE status='PENDING'`,
@@ -616,13 +623,14 @@ export async function runMigrations(): Promise<Array<{ version: number; name: st
     // idempotent and also repairs a build that failed on a previous boot.
     const cdlMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=161');
     if (cdlMigration.rowCount) await ensureCdlHotTableIndexes(client);
-    // Phase 0 queue/capacity indexes require migration 162's columns. The
-    // historical clock backfill also runs here, in bounded batches, so the
-    // migration transaction only ever holds a brief metadata-only lock.
+    // Phase 0 queue/capacity indexes and the partial backfill index require
+    // migration 162's columns. Build them concurrently first, then run the
+    // idempotent historical clock backfill in bounded batches. The partial
+    // index keeps later boots O(1) once every clock is populated.
     const phase0ClockMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=162');
     if (phase0ClockMigration.rowCount) {
-      await backfillPhase0JobClocks(client);
       await ensurePhase0JobClockIndexes(client);
+      await backfillPhase0JobClocks(client);
     }
     const res = await client.query('SELECT version,name,applied_at FROM schema_migrations ORDER BY version');
     return res.rows.map(r => ({ version: r.version, name: r.name, applied_at: iso(r.applied_at)! }));
