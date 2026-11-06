@@ -131,6 +131,8 @@ function readFailureFields(error: unknown): FailureFields {
         retryable?: unknown;
         status?: unknown;
         statusCode?: unknown;
+        quotaExceeded?: unknown;
+        providerReasons?: unknown;
         errorClass?: unknown;
       };
     }
@@ -145,15 +147,19 @@ function readFailureFields(error: unknown): FailureFields {
     ?? cause?.status
     ?? cause?.statusCode,
   );
-  const providerReasons = Array.isArray(candidate?.providerReasons)
-    ? candidate.providerReasons.map(value => String(value).toLowerCase())
-    : [];
+  // A wrapper may keep the provider quota metadata only on `cause`, so read
+  // both levels; otherwise a wrapped quota exhaustion is misread as genuine.
+  const providerReasons = [
+    ...(Array.isArray(candidate?.providerReasons) ? candidate.providerReasons : []),
+    ...(Array.isArray(cause?.providerReasons) ? cause.providerReasons : []),
+  ].map(value => String(value).toLowerCase());
   return {
     code,
     message,
     retryable: candidate?.retryable === true || cause?.retryable === true,
     status: Number.isFinite(statusValue) ? statusValue : undefined,
     quotaSignal: candidate?.quotaExceeded === true
+      || cause?.quotaExceeded === true
       || providerReasons.some(reason => QUOTA_PROVIDER_REASONS.has(reason)),
     name: String(candidate?.name ?? ''),
     errorClass: String(candidate?.errorClass ?? cause?.errorClass ?? '').toUpperCase(),

@@ -47,6 +47,16 @@ test('wrapped provider quota is capacity even when the legacy predicate misses i
   assert.equal(wrapped.reason, 'QUOTA_ALLOCATION');
   assert.equal(wrapped.evidence.quotaSignal, true);
   assert.equal(wrapped.existingCapacityLease, false);
+
+  // A wrapper can carry the quota metadata only on its cause.
+  const nestedWrapped = classifyAcquisitionFailure(
+    Object.assign(new Error('Provider rate limit reached.'), {
+      cause: { code: 'RATE_LIMIT', quotaExceeded: true, providerReasons: ['dailyLimitExceeded'] },
+    }),
+  );
+  assert.equal(nestedWrapped.failureClass, 'CAPACITY');
+  assert.equal(nestedWrapped.reason, 'QUOTA_ALLOCATION');
+  assert.equal(nestedWrapped.evidence.quotaSignal, true);
 });
 
 test('community admission deferrals are capacity and keep their saturation reason', () => {
