@@ -290,8 +290,16 @@ maybe('the read-only report projects and reconciles a fixture backlog', async t 
     report.reconciliation.neverExecutedDelta,
     report.projection.retryableNeverBrowserExecutedRows - report.telemetry.neverBrowserExecutedRows,
   );
-  if (baseline.telemetry.retryableRows === 0 && baseline.projection.retryableRows === 0) {
-    assert.equal(report.reconciliation.retryableDelta, 3);
-    assert.equal(report.reconciliation.neverExecutedDelta, 3);
-  }
+  // Adding balanced fixture rows must not move the projection-vs-telemetry
+  // delta, regardless of the surrounding backlog in the scratch database.
+  assert.equal(
+    report.reconciliation.retryableDelta,
+    baseline.reconciliation.retryableDelta,
+    'fixture additions preserve the retryable projection-vs-telemetry delta',
+  );
+  assert.equal(
+    report.reconciliation.neverExecutedDelta,
+    baseline.reconciliation.neverExecutedDelta,
+    'fixture additions preserve the never-browser-executed delta',
+  );
 });

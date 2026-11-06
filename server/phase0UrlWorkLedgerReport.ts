@@ -130,16 +130,21 @@ const SURFACES = [...COMMUNITY_ACQUISITION_WORK_SURFACES];
  */
 function sqlNormalizedUrl(expression: string): string {
   const withoutFragment = `split_part(trim(COALESCE(${expression}, '')), '#', 1)`;
-  const pathPart = `(CASE WHEN strpos(${withoutFragment}, '?') > 0`
-    + ` THEN substr(${withoutFragment}, 1, strpos(${withoutFragment}, '?') - 1)`
-    + ` ELSE ${withoutFragment} END)`;
-  const queryPart = `(CASE WHEN strpos(${withoutFragment}, '?') > 0`
-    + ` THEN substr(${withoutFragment}, strpos(${withoutFragment}, '?'))`
+  // Lowercase only scheme + authority: hosts are case-insensitive, but paths
+  // and query values are not. Lowercasing the whole URL would merge distinct
+  // work keys and diverge from URL.toString().
+  const origin = `substring(${withoutFragment} from '^[A-Za-z][A-Za-z0-9+.-]*://[^/?#]+')`;
+  const rest = `substr(${withoutFragment}, length(${origin}) + 1)`;
+  const pathPart = `(CASE WHEN strpos(${rest}, '?') > 0`
+    + ` THEN substr(${rest}, 1, strpos(${rest}, '?') - 1)`
+    + ` ELSE ${rest} END)`;
+  const queryPart = `(CASE WHEN strpos(${rest}, '?') > 0`
+    + ` THEN substr(${rest}, strpos(${rest}, '?'))`
     + ` ELSE '' END)`;
-  const trimmedPath = `(CASE WHEN rtrim(${pathPart}, '/') ~ '^[A-Za-z][A-Za-z0-9+.-]*://[^/]+$'`
+  const trimmedPath = `(CASE WHEN rtrim(${pathPart}, '/') ~ '^[^/]*$'`
     + ` THEN rtrim(${pathPart}, '/') || '/'`
     + ` ELSE rtrim(${pathPart}, '/') END)`;
-  return `lower(${trimmedPath} || ${queryPart})`;
+  return `lower(${origin}) || ${trimmedPath} || ${queryPart}`;
 }
 
 function safeIntSql(jsonExpression: string): string {
@@ -157,7 +162,6 @@ const REQUIRED_COMMUNITY_OBSERVATION_WHERE = `
   AND COALESCE(o.requested_url,'') ~* '^https?://'
   AND COALESCE(o.provenance->>'surface','') = ANY($2::text[])
   AND COALESCE(o.provenance->>'required','false') = 'true'
-  AND COALESCE(o.provenance->>'sharedEvidenceFrom','') = ''
 `;
 
 export async function buildPhase0UrlWorkLedgerReport(
@@ -234,8 +238,10 @@ export async function buildPhase0UrlWorkLedgerReport(
               o.retryable,
               COALESCE(o.failure_class,'') AS failure_class,
               o.observed_at,
+              COALESCE(o.provenance->>'sharedEvidenceFrom','') = '' AS direct_evidence,
               (
-                COALESCE(o.provenance->'crawlerTelemetry'->>'mode','') = 'RENDERED'
+                COALESCE(o.provenance->>'sharedEvidenceFrom','') = ''
+                AND COALESCE(o.provenance->'crawlerTelemetry'->>'mode','') = 'RENDERED'
                 AND (
                   ${safeIntSql(`o.provenance->'crawlerTelemetry'->>'requestsFinished'`)} > 0
                   OR ${safeIntSql(`o.provenance->'crawlerTelemetry'->>'pagesInspected'`)} > 0
@@ -273,11 +279,13 @@ export async function buildPhase0UrlWorkLedgerReport(
      SELECT count(*) FILTER (
               WHERE e.outcome = 'ACQUISITION_FAILED'
                 AND e.retryable
+                AND e.direct_evidence
                 AND e.failure_class <> 'REDIRECT_LIMIT'
             )::int AS retryable_rows,
             count(*) FILTER (
               WHERE e.outcome = 'ACQUISITION_FAILED'
                 AND e.retryable
+                AND e.direct_evidence
                 AND e.failure_class <> 'REDIRECT_LIMIT'
                 AND NOT g.browser_executed
             )::int AS never_browser_executed_rows

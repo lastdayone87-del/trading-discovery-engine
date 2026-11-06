@@ -141,7 +141,7 @@ test('rendered processed evidence counts as browser execution', () => {
   assert.equal(rows[0].state, 'RESOLVED');
 });
 
-test('borrowed shared evidence never creates work or execution evidence', () => {
+test('borrowed shared evidence never counts as execution or an attempt', () => {
   const { rows, stats } = projectCommunityAcquisitionWork([
     observation({
       outcome: 'INSPECTED_NO_MATCH',
@@ -153,8 +153,13 @@ test('borrowed shared evidence never creates work or execution evidence', () => 
       },
     }),
   ]);
-  assert.equal(rows.length, 0);
-  assert.equal(stats.skippedRows, 1);
+  assert.equal(stats.skippedRows, 0);
+  assert.equal(rows.length, 1, 'shared evidence still identifies real URL work');
+  assert.equal(rows[0].neverExecuted, true);
+  assert.equal(rows[0].neverBrowserExecuted, true);
+  assert.equal(rows[0].attempts, 0);
+  assert.equal(rows[0].state, 'RESOLVED', 'same-inspection lender evidence can resolve the URL');
+  assert.equal(rows[0].retryOwned, false);
 });
 
 test('only required community observations become backlog work', () => {

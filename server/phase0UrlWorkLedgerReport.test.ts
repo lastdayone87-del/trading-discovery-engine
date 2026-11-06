@@ -83,6 +83,9 @@ test('the SQL bound keeps path-only URL normalization and all-observation browse
   );
   assert.match(telemetrySql, /COALESCE\(o\.provenance->>'required','false'\) = 'true'/);
   assert.match(telemetrySql, /sharedEvidenceFrom/);
+  assert.match(telemetrySql, /AS direct_evidence/);
+  assert.match(telemetrySql, /AND e\.direct_evidence/);
+  assert.match(telemetrySql, /lower\(substring\(/, 'only scheme + authority are lowercased');
   assert.match(telemetrySql, /CASE WHEN strpos\(.*\?.*\) > 0/);
   assert.match(telemetrySql, /\^\[0-9\]\{1,18\}\$/);
   assert.match(telemetrySql, /::numeric <= 2147483647/);

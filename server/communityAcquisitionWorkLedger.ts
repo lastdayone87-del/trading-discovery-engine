@@ -211,8 +211,13 @@ export function hasDirectProcessedAcquisitionEvidence(observation: CommunityWork
   return observation.outcome === 'FOUND';
 }
 
-/** Backwards-compatible alias: processed means direct processed. */
+/**
+ * Production-compatible processed check: borrowed same-inspection evidence is
+ * genuine inspection evidence for resolution, but it is not direct execution
+ * of this URL (see `hasDirectProcessedAcquisitionEvidence`).
+ */
 export function hasProcessedAcquisitionEvidence(observation: CommunityWorkObservation): boolean {
+  if (sharedEvidenceSource(observation)) return true;
   return hasDirectProcessedAcquisitionEvidence(observation);
 }
 
@@ -343,7 +348,7 @@ export function resolveCommunityWorkState(
     return { state: 'RESOLVED', terminalReason: 'FOUND' };
   }
   if (latest.outcome === 'INSPECTED_NO_MATCH') {
-    if (hasDirectProcessedAcquisitionEvidence(latest)) {
+    if (hasProcessedAcquisitionEvidence(latest)) {
       return { state: 'RESOLVED', terminalReason: 'INSPECTED_NO_MATCH' };
     }
     // Unevidenced absence is inconclusive, never a terminal NOT_FOUND. It
@@ -388,9 +393,10 @@ export function projectCommunityAcquisitionWork(
       skippedRows++;
       continue;
     }
-    // Optional/auxiliary observations are not backlog work, and borrowed
-    // evidence must never create a work row for the borrower URL.
-    if (!isRequiredCommunityWorkObservation(observation) || sharedEvidenceSource(observation)) {
+    // Optional/auxiliary observations are not backlog work. Shared-evidence
+    // rows still describe real work (and may carry a FOUND outcome), but their
+    // borrowed counters never count as this URL's execution or attempt.
+    if (!isRequiredCommunityWorkObservation(observation)) {
       skippedRows++;
       continue;
     }
