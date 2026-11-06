@@ -168,20 +168,32 @@ function isRetryableFailure(fields: FailureFields): boolean {
     || RETRYABLE_CLASSES.has(fields.errorClass);
 }
 
+const WORK_EVIDENCE_COUNTERS = ['pagesInspected', 'requestsStarted', 'redirectsFollowed'] as const;
+
+function isCounter(value: unknown): value is number {
+  // Only real non-negative numbers count. Number('') / Number(false) / Number([])
+  // all coerce to 0 and would otherwise manufacture PROVEN_UNSTARTED from a
+  // malformed carrier.
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
 /**
- * Classify the evidence available for one failed execution. Missing or
- * malformed evidence is UNKNOWN; a row only proves no work started when all
- * three execution counters are present and zero.
+ * Classify the evidence available for one failed execution.
+ *
+ * A single present, valid positive counter proves work started even when the
+ * other counters are missing (a browser crash after inspecting one page is
+ * executable work, not an attempt-free wait). Proving that no work started is
+ * stricter: all three counters must be present, numeric, and zero. Anything
+ * else is UNKNOWN — absence of a signal is never proof of absence.
  */
 export function classifyWorkStartedEvidence(
   evidence?: AcquisitionFailureEvidence | null,
 ): WorkStartedEvidence {
   if (!evidence || typeof evidence !== 'object') return 'UNKNOWN';
-  const raw = [evidence.pagesInspected, evidence.requestsStarted, evidence.redirectsFollowed];
-  if (raw.some(value => value === undefined || value === null)) return 'UNKNOWN';
-  const values = raw.map(value => Number(value));
-  if (values.some(value => !Number.isFinite(value) || value < 0)) return 'UNKNOWN';
-  return values.some(value => value > 0) ? 'PROVEN_STARTED' : 'PROVEN_UNSTARTED';
+  const raw = WORK_EVIDENCE_COUNTERS.map(key => evidence[key]);
+  if (raw.some(value => isCounter(value) && value > 0)) return 'PROVEN_STARTED';
+  if (!raw.every(isCounter)) return 'UNKNOWN';
+  return 'PROVEN_UNSTARTED';
 }
 
 /**
@@ -212,6 +224,57 @@ export function acquisitionEvidenceFromError(error: unknown): AcquisitionFailure
     requestsStarted: counters.requestsStarted,
     redirectsFollowed: counters.redirectsFollowed,
   };
+}
+
+/** The evidence-bearing shape shared by acquisition observations. */
+export interface AcquisitionEvidenceObservation {
+  telemetry?: {
+    pagesInspected?: unknown;
+    requestsStarted?: unknown;
+    redirectsFollowed?: unknown;
+  } | null;
+}
+
+/**
+ * Aggregate execution counters across one inspection's observations.
+ *
+ * The community retry worker replaces its inspection observation with a new,
+ * unannotated error, so the counters must be lifted from the observation rows
+ * before failJob classifies it. A counter is reported only when every
+ * observation carried a valid value (so a zero total cannot hide an unknown
+ * row); a positive value from any observation is always retained because it
+ * proves work started on its own.
+ */
+export function acquisitionEvidenceFromObservations(
+  observations: readonly AcquisitionEvidenceObservation[] | null | undefined,
+): AcquisitionFailureEvidence | undefined {
+  if (!Array.isArray(observations) || observations.length === 0) return undefined;
+  const totals: Record<(typeof WORK_EVIDENCE_COUNTERS)[number], number> = {
+    pagesInspected: 0,
+    requestsStarted: 0,
+    redirectsFollowed: 0,
+  };
+  const complete: Record<(typeof WORK_EVIDENCE_COUNTERS)[number], boolean> = {
+    pagesInspected: true,
+    requestsStarted: true,
+    redirectsFollowed: true,
+  };
+  for (const observation of observations) {
+    const telemetry = observation?.telemetry;
+    for (const key of WORK_EVIDENCE_COUNTERS) {
+      const value = telemetry && typeof telemetry === 'object' ? telemetry[key] : undefined;
+      if (!isCounter(value)) {
+        complete[key] = false;
+        continue;
+      }
+      totals[key] += value;
+    }
+  }
+  const evidence: AcquisitionFailureEvidence = {};
+  for (const key of WORK_EVIDENCE_COUNTERS) {
+    if (complete[key] || totals[key] > 0) evidence[key] = totals[key];
+  }
+  return Object.keys(evidence).length > 0 ? evidence : undefined;
 }
 
 function classification(

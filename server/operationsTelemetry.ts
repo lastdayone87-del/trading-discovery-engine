@@ -29,6 +29,8 @@ interface OperationsCounters {
   jobFailureDispositionsTotal: Record<JobFailureDispositionKey, number>;
   /** Phase 0 shadow split; every counted failure is also a disposition. */
   jobFailureClassificationsTotal: Record<AcquisitionFailureClass, number>;
+  /** Shadow writes that failed and fell back to the legacy finalize statement. */
+  jobFailureClassificationFallbacksTotal: number;
   invalidApiKeyQuarantinesTotal: number;
 }
 
@@ -66,6 +68,7 @@ function freshCounters(): OperationsCounters & CommunityRecoveryCounters {
       BROWSER_RUNTIME: 0,
       GENUINE_FAILURE: 0,
     },
+    jobFailureClassificationFallbacksTotal: 0,
     invalidApiKeyQuarantinesTotal: 0,
     operationalEnrichmentRecoveryEnqueuedTotal: 0,
     operationalEnrichmentRecoveryDuplicateEventsTotal: 0,
@@ -121,6 +124,10 @@ export function bumpJobFailureClassification(classification: unknown): void {
   if (key) counters.jobFailureClassificationsTotal[key] += 1;
 }
 
+export function bumpJobFailureClassificationFallback(): void {
+  counters.jobFailureClassificationFallbacksTotal += 1;
+}
+
 export function bumpInvalidApiKeyQuarantine(): void {
   counters.invalidApiKeyQuarantinesTotal += 1;
 }
@@ -142,27 +149,33 @@ export function bumpCommunitySaturationDeferral(): void {
 }
 
 /**
- * Idempotency guard for job-disposition telemetry. failJob performs its writes
- * outside a transaction: if a secondary bookkeeping write fails after the job
- * row committed, a worker retry re-runs the same transition and must not count
- * it twice. Keyed by the open job_attempts row id (one row per claim), so
- * attempt-free deferrals — which reuse the same attempt number on the next
- * claim — still count every distinct persisted transition. Callers without an
- * open attempt row fall back to a job+attempt key. Bounded FIFO so the set
- * cannot grow without limit. Returns true on first count, false on repeats.
+ * Bounded idempotency guard shared by the disposition and classification
+ * counters. failJob performs its writes outside a transaction: if a secondary
+ * bookkeeping write fails after the job row committed, a worker retry re-runs
+ * the same transition and must not count it twice. Keys are prefixed by
+ * counter kind so a classification count can never suppress a disposition
+ * count for the same execution.
  */
-const countedDispositions = new Map<string, number>();
-const MAX_COUNTED_DISPOSITIONS = 5000;
+const countedExecutions = new Map<string, number>();
+const MAX_COUNTED_EXECUTIONS = 5000;
+
+function markExecutionCounted(key: string): boolean {
+  if (countedExecutions.has(key)) return false;
+  if (countedExecutions.size >= MAX_COUNTED_EXECUTIONS) {
+    const oldest = countedExecutions.keys().next();
+    if (!oldest.done) countedExecutions.delete(oldest.value);
+  }
+  countedExecutions.set(key, Date.now());
+  return true;
+}
 
 export function markJobDispositionCounted(executionKey: unknown, disposition: unknown): boolean {
-  const key = `${String(executionKey)}:${normalizeJobFailure(disposition)}`;
-  if (countedDispositions.has(key)) return false;
-  if (countedDispositions.size >= MAX_COUNTED_DISPOSITIONS) {
-    const oldest = countedDispositions.keys().next();
-    if (!oldest.done) countedDispositions.delete(oldest.value);
-  }
-  countedDispositions.set(key, Date.now());
-  return true;
+  return markExecutionCounted(`disposition:${String(executionKey)}:${normalizeJobFailure(disposition)}`);
+}
+
+/** Count a persisted classification at most once per execution. */
+export function markJobFailureClassificationCounted(executionKey: unknown): boolean {
+  return markExecutionCounted(`classification:${String(executionKey)}`);
 }
 
 export function jobDispositionExecutionKey(
@@ -183,6 +196,7 @@ export function operationsTelemetrySnapshot(): OperationsCounters & CommunityRec
     repeatFailureHistoryOutagesTotal: counters.repeatFailureHistoryOutagesTotal,
     jobFailureDispositionsTotal: { ...counters.jobFailureDispositionsTotal },
     jobFailureClassificationsTotal: { ...counters.jobFailureClassificationsTotal },
+    jobFailureClassificationFallbacksTotal: counters.jobFailureClassificationFallbacksTotal,
     invalidApiKeyQuarantinesTotal: counters.invalidApiKeyQuarantinesTotal,
     operationalEnrichmentRecoveryEnqueuedTotal: counters.operationalEnrichmentRecoveryEnqueuedTotal,
     operationalEnrichmentRecoveryDuplicateEventsTotal: counters.operationalEnrichmentRecoveryDuplicateEventsTotal,
@@ -199,6 +213,7 @@ export function resetOperationsTelemetry(): void {
   counters.repeatFailureHistoryOutagesTotal = fresh.repeatFailureHistoryOutagesTotal;
   counters.jobFailureDispositionsTotal = fresh.jobFailureDispositionsTotal;
   counters.jobFailureClassificationsTotal = fresh.jobFailureClassificationsTotal;
+  counters.jobFailureClassificationFallbacksTotal = fresh.jobFailureClassificationFallbacksTotal;
   counters.invalidApiKeyQuarantinesTotal = fresh.invalidApiKeyQuarantinesTotal;
   counters.operationalEnrichmentRecoveryEnqueuedTotal = fresh.operationalEnrichmentRecoveryEnqueuedTotal;
   counters.operationalEnrichmentRecoveryDuplicateEventsTotal = fresh.operationalEnrichmentRecoveryDuplicateEventsTotal;

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   acquisitionEvidenceFromError,
+  acquisitionEvidenceFromObservations,
   classifyAcquisitionFailure,
   classifyWorkStartedEvidence,
 } from './acquisitionFailureClassification';
@@ -157,22 +158,44 @@ test('nested causes are read without throwing', () => {
   assert.doesNotThrow(() => classifyAcquisitionFailure({ code: 42, message: {} }));
 });
 
-test('work-started evidence is conservative and requires all three counters', () => {
+test('work-started evidence proves a start from any positive counter but needs all three for zero', () => {
   assert.equal(classifyWorkStartedEvidence(undefined), 'UNKNOWN');
   assert.equal(classifyWorkStartedEvidence({}), 'UNKNOWN');
   assert.equal(classifyWorkStartedEvidence({ pagesInspected: 0 }), 'UNKNOWN');
+  // A present positive counter proves execution began even when the other
+  // counters are missing; discarding it would hide a post-work crash.
+  assert.equal(classifyWorkStartedEvidence({ pagesInspected: 1 }), 'PROVEN_STARTED');
+  assert.equal(classifyWorkStartedEvidence({ requestsStarted: 2 }), 'PROVEN_STARTED');
+  assert.equal(classifyWorkStartedEvidence({ redirectsFollowed: 1 }), 'PROVEN_STARTED');
+  assert.equal(
+    classifyWorkStartedEvidence({ pagesInspected: 1, requestsStarted: undefined, redirectsFollowed: 0 }),
+    'PROVEN_STARTED',
+  );
   assert.equal(
     classifyWorkStartedEvidence({ pagesInspected: 0, requestsStarted: 0, redirectsFollowed: 0 }),
     'PROVEN_UNSTARTED',
   );
   assert.equal(
-    classifyWorkStartedEvidence({ pagesInspected: 0, requestsStarted: 1, redirectsFollowed: 0 }),
-    'PROVEN_STARTED',
+    classifyWorkStartedEvidence({ pagesInspected: 0, requestsStarted: 0, redirectsFollowed: undefined }),
+    'UNKNOWN',
   );
   assert.equal(
     classifyWorkStartedEvidence({ pagesInspected: -1, requestsStarted: 0, redirectsFollowed: 0 }),
     'UNKNOWN',
   );
+  // Malformed counters must never coerce to a zero and manufacture
+  // PROVEN_UNSTARTED.
+  for (const malformed of ['', '0', false, true, [], {}, Number.NaN, Infinity]) {
+    assert.equal(
+      classifyWorkStartedEvidence({
+        pagesInspected: malformed as never,
+        requestsStarted: 0,
+        redirectsFollowed: 0,
+      }),
+      'UNKNOWN',
+      `malformed counter ${String(malformed)} must stay UNKNOWN`,
+    );
+  }
 });
 
 test('evidence can be read from an error, its telemetry envelope, or its direct counters', () => {
@@ -191,4 +214,41 @@ test('evidence can be read from an error, its telemetry envelope, or its direct 
   );
   assert.equal(acquisitionEvidenceFromError(new Error('no evidence')), undefined);
   assert.equal(acquisitionEvidenceFromError(null), undefined);
+});
+
+test('inspection observations aggregate counters without hiding unknown rows', () => {
+  assert.equal(acquisitionEvidenceFromObservations(undefined), undefined);
+  assert.equal(acquisitionEvidenceFromObservations([]), undefined);
+
+  assert.deepEqual(
+    acquisitionEvidenceFromObservations([
+      { telemetry: { pagesInspected: 2, requestsStarted: 5, redirectsFollowed: 1 } },
+      { telemetry: { pagesInspected: 1, requestsStarted: 3, redirectsFollowed: 0 } },
+    ]),
+    { pagesInspected: 3, requestsStarted: 8, redirectsFollowed: 1 },
+  );
+  assert.equal(
+    classifyWorkStartedEvidence(acquisitionEvidenceFromObservations([
+      { telemetry: { pagesInspected: 0, requestsStarted: 0, redirectsFollowed: 0 } },
+      { telemetry: { pagesInspected: 0, requestsStarted: 0, redirectsFollowed: 0 } },
+    ])),
+    'PROVEN_UNSTARTED',
+  );
+
+  // A missing row makes the zero total untrustworthy, but an observed positive
+  // counter still proves work started.
+  assert.deepEqual(
+    acquisitionEvidenceFromObservations([
+      { telemetry: { pagesInspected: 1, requestsStarted: undefined, redirectsFollowed: 0 } },
+      { telemetry: undefined },
+    ]),
+    { pagesInspected: 1 },
+  );
+  assert.equal(
+    classifyWorkStartedEvidence(acquisitionEvidenceFromObservations([
+      { telemetry: { pagesInspected: 0, requestsStarted: undefined, redirectsFollowed: 0 } },
+      { telemetry: undefined },
+    ])),
+    'UNKNOWN',
+  );
 });

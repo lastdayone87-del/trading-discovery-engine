@@ -6,6 +6,13 @@
 -- classification survives process restarts and can be reconciled with the
 -- existing coarse capacity predicate in SQL.
 --
+-- The comparison columns are the point of the shadow:
+--   * failure_class / failure_reason  — the new evidence-based split;
+--   * failure_existing_capacity_lease — what the legacy predicate decided;
+--   * failure_work_started_evidence   — UNKNOWN / PROVEN_UNSTARTED /
+--     PROVEN_STARTED, so a BROWSER_RUNTIME row with missing evidence is
+--     distinguishable from one proved to have done no work.
+--
 -- This is additive, metadata-only DDL:
 --   * no backfill; historical attempts remain NULL because their execution
 --     evidence is not available and must not be guessed from current policy;
@@ -22,4 +29,6 @@ SET LOCAL lock_timeout = '10s';
 
 ALTER TABLE public.job_attempts
   ADD COLUMN IF NOT EXISTS failure_class TEXT,
-  ADD COLUMN IF NOT EXISTS failure_reason TEXT;
+  ADD COLUMN IF NOT EXISTS failure_reason TEXT,
+  ADD COLUMN IF NOT EXISTS failure_existing_capacity_lease BOOLEAN,
+  ADD COLUMN IF NOT EXISTS failure_work_started_evidence TEXT;

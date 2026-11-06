@@ -130,6 +130,7 @@ import { recordExecutionStage, withExecutionTrace } from './executionTrace';
 import { recordNomination } from './candidateAdmission/store';
 import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
 import { bumpCommunitySaturationDeferral } from './operationsTelemetry';
+import { acquisitionEvidenceFromObservations } from './acquisitionFailureClassification';
 import { canContinueCommunityInspectionAfterDegradedManualClassification } from './manualRecheckPolicy';
 import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_ACQUISITION_REQUIRED, COMMUNITY_RETRY_REASON, FOUND_GAP_RETRYABLE_FAILURE_CLASSES, buildCommunityRetryJobMetadata, isAttemptFreeCommunityFailure, attemptFreeDiscordValidation, retryAtFromUnknown, retryReasonFromError, type CommunityRetryDirective} from './communityRetryPolicy';
 import { classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
@@ -1188,6 +1189,14 @@ export async function processNextSearchJob(
       // re-acquire rather than borrow its own incomplete coverage in a loop.
       // First-time inspections leave the flag unset and borrow normally.
       const inspectionResult=await inspectAndValidateChannel(channel,undefined,false,false,false,{jobId:job.id,attemptNumber:job.attempts,isRetryOwnedReacquire:true,clickOffsets:resolveInspectionClickOffsets(job.payload.clickOffsets)});
+      // The retry worker replaces this inspection result with a bare error
+      // below. Lift the execution counters now so the shadow classifier can
+      // distinguish a post-work browser/runtime failure from an unstarted
+      // capacity wait after the observation rows are out of scope. Attaching
+      // only this evidence property leaves the retry decision untouched.
+      const inspectionAcquisitionEvidence=inspectionResult&&typeof inspectionResult==='object'
+        ?acquisitionEvidenceFromObservations(inspectionResult.inspection?.acquisitionOutcomes)
+        :undefined;
       // Attempt-free deferral is reserved for capacity/browser signals where no
       // real acquisition was attempted (browser runtime unavailable). Genuine
       // acquisition failures (COMMUNITY_REQUIRED) consumed a real inspection
@@ -1196,7 +1205,7 @@ export async function processNextSearchJob(
       // forever at attempts=0 with ever-growing execution counts.
       const directive=inspectionResult?inspectionResult.retryDirective:undefined;
       if(directive?.attemptFree&&directive.retryReason===COMMUNITY_RETRY_REASON.BROWSER_RUNTIME_UNAVAILABLE){
-        const deferred=Object.assign(new Error(`Community acquisition deferred: ${directive.reason}`),{code:directive.code,retryable:true,retryAt:directive.retryAt});
+        const deferred=Object.assign(new Error(`Community acquisition deferred: ${directive.reason}`),{code:directive.code,retryable:true,retryAt:directive.retryAt,...(inspectionAcquisitionEvidence?{acquisitionEvidence:inspectionAcquisitionEvidence}:{})});
         // Observability for the dominant saturation-deferral path: the
         // RENDERED_FALLBACK_SATURATED class rejects before admission, so this
         // deferral proves no acquisition work started and stays attempt-free.
@@ -1210,7 +1219,12 @@ export async function processNextSearchJob(
       // work through the generic unresolved-failure path below.
       // Browser-capacity attempt-free deferral throws above and is untouched.
       if(shouldCompleteSuppressedRetryJob(inspectionResult,refreshed?.scan_status)){await completeJob(job.id);return true;}
-      if(refreshed?.scan_status==='FAILED'||refreshed?.scan_status==='FAILED_PERMANENT')throw new Error('Retryable community acquisition remains unresolved');
+      if(refreshed?.scan_status==='FAILED'||refreshed?.scan_status==='FAILED_PERMANENT'){
+        throw Object.assign(
+          new Error('Retryable community acquisition remains unresolved'),
+          inspectionAcquisitionEvidence?{acquisitionEvidence:inspectionAcquisitionEvidence}:{},
+        );
+      }
       await completeJob(job.id);return true;
     }
     if(job.type==='TERM_HARVEST'){await processTermHarvestJob(job);return true;}
