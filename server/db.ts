@@ -4,7 +4,7 @@
 export * from './dbCore';
 
 import { getDb, isRetryableInfrastructureFailure, resolveGeminiSemanticCooldownExpiryMs, resolveGeminiOrgSemanticCooldownExpiryMs, resolveGroqSemanticCooldownExpiryMs, resolveGroqOrgCooldownExpiryMs, resolveGeminiFreeSemanticCooldownExpiryMs, failedProviderOrg } from './dbCore';
-import { acquisitionJobClockV2Enabled, CAPACITY_LEASE_DURATION_MS, capacityLeaseRefreshSetSql, capacityLeaseRunAfter, isCapacityLeaseFailure } from './acquisitionJobClockPolicy';
+import { acquisitionJobClockV2Enabled, CAPACITY_LEASE_DURATION_MS, capacityLeaseRefreshSetSql, capacityLeaseRunAfter, isCapacityLeaseFailure, normalizeCapacityLeaseRunAfter } from './acquisitionJobClockPolicy';
 import { bumpJobFailureDisposition, jobDispositionExecutionKey, markJobDispositionCounted } from './operationsTelemetry';
 
 export type JobFailureDisposition='RETRYING_WITHOUT_ATTEMPT'|'RETRYING'|'FAILED';
@@ -134,7 +134,7 @@ export async function failJob(jobId:string,error:any,deps?:{db?:JobFailureDb;now
   // a false terminal. The run_after schedule still honors provider hints.
   const disposition:JobFailureDisposition=capacityLease?'RETRYING_WITHOUT_ATTEMPT':decision.disposition;
   const runAfter=capacityLease
-    ? decision.runAfter??capacityLeaseRunAfter(error,attempts,now)
+    ? normalizeCapacityLeaseRunAfter(error,decision.runAfter??capacityLeaseRunAfter(error,attempts,now),attempts,now)
     : decision.runAfter;
   // Operations telemetry lives on the serving facade (this failJob shadows
   // dbCore.failJob for all worker imports). Capture this execution's open

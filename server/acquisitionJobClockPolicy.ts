@@ -21,6 +21,7 @@ export const CAPACITY_LEASE_DURATION_MS = 5 * 60 * 60_000;
 const ALWAYS_CAPACITY_CODES = new Set([
   'YOUTUBE_KEY_CAP_EXCEEDED',
   'YOUTUBE_KEY_CAP_UNAVAILABLE',
+  'QUOTA_ALLOCATION_EXHAUSTED',
 ]);
 
 const RETRYABLE_CAPACITY_CODES = new Set([
@@ -112,12 +113,47 @@ export function reopenClockUpdateSql(enabled: boolean): string {
  * Retry schedule for a capacity/runtime wait that did not run acquisition
  * work. Mirrors the legacy deferred schedule but never depends on the
  * genuine-failure anchor.
+ *
+ * Provider hints are bounded: ordinary capacity waits cap at the queue's
+ * fifteen-minute backoff ceiling, while quota-allocation/key-cap waits may
+ * honor the next Pacific reset (at most 24 hours). Non-finite or past hints
+ * fall back to exponential backoff so they can never throw while persisting
+ * run_after or park work indefinitely.
  */
+export const MAX_CAPACITY_LEASE_RETRY_DELAY_MS = 15 * 60_000;
+export const MAX_QUOTA_WAIT_DELAY_MS = 24 * 60 * 60_000;
+
+export function isQuotaCapacityFailure(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const candidate = error as { code?: unknown; message?: unknown; cause?: { code?: unknown; message?: unknown } };
+  const code = String(candidate.code ?? candidate.cause?.code ?? '').toUpperCase();
+  if (code === 'QUOTA_ALLOCATION_EXHAUSTED'
+    || code === 'YOUTUBE_KEY_CAP_EXCEEDED'
+    || code === 'YOUTUBE_KEY_CAP_UNAVAILABLE') return true;
+  const message = String(candidate.message ?? candidate.cause?.message ?? '').toLowerCase();
+  return message.includes(ENRICHMENT_CAPACITY_MESSAGE_FRAGMENT);
+}
+
+export function normalizeCapacityLeaseRunAfter(
+  error: unknown,
+  candidate: number | undefined,
+  attempts: number,
+  now = Date.now(),
+): number {
+  const fallback = now + Math.min(15 * 60_000, 30_000 * Math.pow(2, Math.max(0, attempts - 1)));
+  if (typeof candidate !== 'number' || !Number.isFinite(candidate) || candidate <= now) return fallback;
+  const maxDelay = isQuotaCapacityFailure(error) ? MAX_QUOTA_WAIT_DELAY_MS : MAX_CAPACITY_LEASE_RETRY_DELAY_MS;
+  return Math.min(candidate, now + maxDelay);
+}
+
 export function capacityLeaseRunAfter(error: unknown, attempts: number, now = Date.now()): number {
   const candidate = error as { retryAt?: unknown; retryAfterMs?: unknown } | null | undefined;
   const retryAt = Number(candidate?.retryAt);
-  if (Number.isFinite(retryAt) && retryAt > now) return retryAt;
   const retryAfterMs = Number(candidate?.retryAfterMs);
-  if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) return now + retryAfterMs;
-  return now + Math.min(15 * 60_000, 30_000 * Math.pow(2, Math.max(0, attempts - 1)));
+  const hint = Number.isFinite(retryAt) && retryAt > now
+    ? retryAt
+    : Number.isFinite(retryAfterMs) && retryAfterMs > 0
+      ? now + retryAfterMs
+      : undefined;
+  return normalizeCapacityLeaseRunAfter(error, hint, attempts, now);
 }

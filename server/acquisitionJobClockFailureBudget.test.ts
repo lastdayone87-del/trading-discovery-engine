@@ -122,3 +122,83 @@ test('flag on still terminalizes a genuine retryable failure after six hours', a
     delete process.env[ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV];
   }
 });
+
+test('flag on bounds a rendered capacity retry hint before persisting run_after', async () => {
+  process.env[ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV] = 'true';
+  try {
+    const now = Date.UTC(2026, 10, 6, 12, 0, 0);
+    const db = makeDb({ attempts: 1, max_attempts: 5, first_transient_failure_at: null });
+    const error = Object.assign(new Error('rendered capacity saturated'), {
+      code: 'RENDERED_FALLBACK_SATURATED',
+      retryable: true,
+      retryAt: now + 48 * 60 * 60_000,
+    });
+    const disposition = await failJob('job-rendered-hint', error, { db, now });
+
+    assert.equal(disposition, 'RETRYING_WITHOUT_ATTEMPT');
+    const transition = db.queries.find(query => query.sql.startsWith('UPDATE jobs SET status='));
+    assert.ok(transition, 'failJob must transition the job row');
+    assert.equal(transition!.values?.[2], new Date(now + 15 * 60_000).toISOString());
+    assert.match(transition!.sql, /capacity_lease_expires_at=/);
+    assert.doesNotMatch(transition!.sql, /first_transient_failure_at/);
+  } finally {
+    delete process.env[ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV];
+  }
+});
+
+test('flag on honors a quota reset hint but never beyond twenty-four hours', async () => {
+  process.env[ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV] = 'true';
+  try {
+    const now = Date.UTC(2026, 10, 6, 12, 0, 0);
+    const nearReset = Object.assign(new Error('ENRICHMENT YouTube quota allocation is exhausted'), {
+      code: 'QUOTA_ALLOCATION_EXHAUSTED',
+      retryAt: now + 20 * 60 * 60_000,
+    });
+    const acceptedDb = makeDb({ attempts: 1, max_attempts: 5, first_transient_failure_at: null });
+    assert.equal(
+      await failJob('job-quota-near-reset', nearReset, { db: acceptedDb, now }),
+      'RETRYING_WITHOUT_ATTEMPT'
+    );
+    const accepted = acceptedDb.queries.find(query => query.sql.startsWith('UPDATE jobs SET status='));
+    assert.ok(accepted);
+    assert.equal(accepted!.values?.[2], new Date(now + 20 * 60 * 60_000).toISOString());
+    assert.match(accepted!.sql, /capacity_lease_expires_at=/);
+    assert.doesNotMatch(accepted!.sql, /first_transient_failure_at/);
+
+    const farReset = Object.assign(new Error('ENRICHMENT YouTube quota allocation is exhausted'), {
+      code: 'QUOTA_ALLOCATION_EXHAUSTED',
+      retryAt: now + 30 * 60 * 60_000,
+    });
+    const cappedDb = makeDb({ attempts: 1, max_attempts: 5, first_transient_failure_at: null });
+    assert.equal(
+      await failJob('job-quota-far-reset', farReset, { db: cappedDb, now }),
+      'RETRYING_WITHOUT_ATTEMPT'
+    );
+    const capped = cappedDb.queries.find(query => query.sql.startsWith('UPDATE jobs SET status='));
+    assert.ok(capped);
+    assert.equal(capped!.values?.[2], new Date(now + 24 * 60 * 60_000).toISOString());
+  } finally {
+    delete process.env[ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV];
+  }
+});
+
+test('flag on does not let an expired provider hint retry a capacity wait immediately', async () => {
+  process.env[ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV] = 'true';
+  try {
+    const now = Date.UTC(2026, 10, 6, 12, 0, 0);
+    const db = makeDb({ attempts: 1, max_attempts: 5, first_transient_failure_at: null });
+    const error = Object.assign(new Error('Community acquisition deferred: browser gate saturated'), {
+      code: 'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE',
+      retryable: true,
+      retryAt: now - 60_000,
+    });
+    const disposition = await failJob('job-expired-hint', error, { db, now });
+
+    assert.equal(disposition, 'RETRYING_WITHOUT_ATTEMPT');
+    const transition = db.queries.find(query => query.sql.startsWith('UPDATE jobs SET status='));
+    assert.ok(transition, 'failJob must transition the job row');
+    assert.equal(transition!.values?.[2], new Date(now + 30_000).toISOString());
+  } finally {
+    delete process.env[ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV];
+  }
+});

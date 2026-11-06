@@ -381,7 +381,7 @@ export async function reconcileCommunityAcquisitionRecovery(
   // and the channel projection returns to ENRICHMENT_PENDING. Semantic terminal
   // channels are deliberately excluded.
   const enrichmentRecoverySet = clockV2
-    ? `status='PENDING',attempts=GREATEST(0,j.attempts-1),${capacityLeaseRefreshSetSql('$2')},locked_by=NULL,locked_at=NULL,completed_at=NULL`
+    ? `status='PENDING',attempts=GREATEST(0,j.attempts-1),last_enqueued_at=now(),reopen_generation=j.reopen_generation+1,last_reopened_at=now(),${capacityLeaseRefreshSetSql('$2')},locked_by=NULL,locked_at=NULL,completed_at=NULL`
     : `status='PENDING',attempts=GREATEST(0,j.attempts-1),created_at=now(),updated_at=now(),locked_by=NULL,locked_at=NULL,completed_at=NULL`;
   const enrichmentRecoveryValues = clockV2
     ? [`OPERATIONALLY_BLOCKED_RETRY_REQUIRED:%${ENRICHMENT_CAPACITY_ERROR_FRAGMENT}%`, String(COMMUNITY_CAPACITY_RETRY_LEASE_MS)]

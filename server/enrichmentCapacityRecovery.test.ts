@@ -74,6 +74,9 @@ test('clock-v2 enrichment capacity recovery renews leases without rewriting queu
     );
     assert.ok(terminalRecovery, 'quota-terminalized enrichment jobs should be restored to pending');
     assert.match(terminalRecovery!.sql, /attempts=GREATEST\(0,j\.attempts-1\)/);
+    assert.match(terminalRecovery!.sql, /last_enqueued_at=now\(\)/);
+    assert.match(terminalRecovery!.sql, /reopen_generation=j\.reopen_generation\+1/);
+    assert.match(terminalRecovery!.sql, /last_reopened_at=now\(\)/);
     assert.match(terminalRecovery!.sql, /capacity_lease_started_at=/);
     assert.match(terminalRecovery!.sql, /capacity_lease_renewals=/);
     assert.doesNotMatch(terminalRecovery!.sql, /created_at/);
