@@ -2614,7 +2614,7 @@ export async function getApprovedWeights(siteIdentity: string): Promise<{
 export async function performManualDatabaseBackup():Promise<{success:boolean;timestamp:string;backupPath:string}>{throw new Error('Manual SQL.js file backup is disabled after PostgreSQL migration. Use PostgreSQL/Railway backups or pg_dump.');}
 
 export type JobStatus='PENDING'|'PROCESSING'|'COMPLETED'|'FAILED';
-export interface DurableJob{ id:string; type:string; status:JobStatus; payload:any; attempts:number; max_attempts:number; run_after:string; locked_by?:string|null; locked_at?:string|null; last_error?:string|null; created_at:string; }
+export interface DurableJob{ id:string; type:string; status:JobStatus; payload:any; attempts:number; max_attempts:number; run_after:string; locked_by?:string|null; locked_at?:string|null; last_error?:string|null; created_at:string; reopen_blocked?:boolean; }
 /** Minimal client surface for budget guards evaluated inside the claim transaction. */
 export interface ClaimBudgetClient { query: (text: string, params?: any[]) => Promise<{ rows: any[] }>; }
 /**
@@ -2669,7 +2669,7 @@ export async function enqueueJob(type:string,payload:any,opts:{priority?:number;
     if(row&&(row.status==='COMPLETED'||row.status==='FAILED')){
       const existingPayload=typeof row.payload==='string'?parseJson(row.payload,{}):(row.payload||{});
       console.warn(JSON.stringify({event:'job_reopen_guard_blocked',jobId:row.id,type:row.type,channelId:existingPayload.channelId||null,reopenGeneration:row.reopen_generation??null,status:row.status,timestamp:new Date().toISOString()}));
-      return rowToJob(row);
+      return {...rowToJob(row),reopen_blocked:true};
     }
   }
   throw new Error('JOB_ENQUEUE_LOST_ROW');

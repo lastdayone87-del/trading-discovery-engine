@@ -27,10 +27,11 @@ async function insertTerminalJob(
   db: any,
   type: string,
   status = 'COMPLETED',
+  channelIdOverride?: string,
 ): Promise<Fixture> {
   const suffix = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const key = `phase0-reopen-guard-${suffix}`;
-  const channelId = `UCphase0${suffix}`;
+  const channelId = channelIdOverride || `UCphase0${suffix}`;
   const inserted = await db.query(
     `INSERT INTO jobs(
        type,payload,priority,max_attempts,status,attempts,run_after,
@@ -333,4 +334,66 @@ maybe('non-acquisition job types are recorded but never capped', async t => {
   )).rows;
   assert.equal(events.length, 2);
   assert.ok(events.every(event => event.outcome === 'REOPENED'));
+});
+
+maybe('concurrent reopens at the cap boundary cannot both pass', async t => {
+  process.env[ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV] = 'true';
+  const db = await getDb();
+  const channelId = `UCphase0concurrent-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const first = await insertTerminalJob(db, RETRY_TYPE, 'COMPLETED', channelId);
+  const second = await insertTerminalJob(db, RETRY_TYPE, 'COMPLETED', channelId);
+  t.after(async () => {
+    await cleanup(db, first);
+    await cleanup(db, second);
+    await resetGuard(db);
+    delete process.env[ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV];
+  });
+
+  await db.query(
+    `UPDATE job_reopen_guard_config
+        SET enabled=true,max_reopens_per_30d=1,updated_at=now()
+      WHERE singleton`,
+  );
+
+  const firstClient = await db.connect();
+  const secondClient = await db.connect();
+  let secondUpdate: any;
+  try {
+    await firstClient.query('BEGIN');
+    await firstClient.query(`UPDATE jobs SET status='PENDING' WHERE id=$1`, [first.id]);
+
+    await secondClient.query('BEGIN');
+    secondUpdate = secondClient.query(`UPDATE jobs SET status='PENDING' WHERE id=$1`, [second.id]);
+    // Let the second trigger reach the channel advisory lock, then release it.
+    await new Promise(resolve => setTimeout(resolve, 150));
+    await firstClient.query('COMMIT');
+
+    const result = await secondUpdate;
+    assert.equal(result.rowCount, 0, 'the second transaction must wait and then be capped');
+    await secondClient.query('COMMIT');
+  } catch (error) {
+    await firstClient.query('ROLLBACK').catch(() => undefined);
+    await secondClient.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    firstClient.release();
+    secondClient.release();
+  }
+
+  const statuses = (await db.query(
+    `SELECT id,status FROM jobs WHERE id=ANY($1::uuid[])`,
+    [[first.id, second.id]],
+  )).rows;
+  assert.equal(
+    statuses.filter(row => row.status === 'PENDING').length,
+    1,
+    'exactly one concurrent reopen may consume the last slot',
+  );
+
+  const events = (await db.query(
+    `SELECT outcome FROM job_reopen_events WHERE job_id=ANY($1::uuid[])`,
+    [[first.id, second.id]],
+  )).rows;
+  assert.equal(events.filter(event => event.outcome === 'REOPENED').length, 1);
+  assert.equal(events.filter(event => event.outcome === 'BLOCKED').length, 1);
 });

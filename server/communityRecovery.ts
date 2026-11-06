@@ -11,7 +11,7 @@ export type EnqueueCommunityRecoveryJob = (
   channelId: string,
   reactivationReasonCodes?: string,
   priorRetryReason?: string
-) => Promise<void>;
+) => Promise<boolean | void>;
 
 const COMMUNITY_RETRY_SURFACES = new Set([
   'CHANNEL_LINKS', 'CHANNEL_EXTERNAL_LINKS', 'EXTERNAL_LINKS', 'LINKED_WEBSITES', 'CUSTOM_DOMAINS',
@@ -393,6 +393,13 @@ export async function reconcileCommunityAcquisitionRecovery(
         WHERE j.type='ENRICH_CHANNEL'
           AND j.status='FAILED'
           AND j.last_error LIKE $1
+          AND NOT EXISTS (
+            SELECT 1 FROM job_reopen_events blocked_reopen
+             WHERE blocked_reopen.job_id=j.id
+               AND blocked_reopen.outcome='BLOCKED'
+               AND blocked_reopen.prior_generation=j.reopen_generation
+               AND blocked_reopen.reopened_at > now() - interval '30 days'
+          )
         RETURNING j.payload->>'channelId' AS channel_id
      )
      UPDATE channels c
@@ -416,7 +423,8 @@ export async function reconcileCommunityAcquisitionRecovery(
             ) AS capacity_terminal
        FROM channels c
        LEFT JOIN LATERAL (
-         SELECT j.id,j.status,j.last_error,j.payload->>'retryReason' AS retry_reason
+         SELECT j.id,j.status,j.last_error,j.payload->>'retryReason' AS retry_reason,
+                j.reopen_generation
            FROM jobs j
           WHERE j.type='RETRY_COMMUNITY_ACQUISITION'
             AND j.payload->>'channelId'=c.channel_id
@@ -444,6 +452,13 @@ export async function reconcileCommunityAcquisitionRecovery(
            WHERE j.type='RETRY_COMMUNITY_ACQUISITION'
              AND j.payload->>'channelId'=c.channel_id
              AND j.status IN('PENDING','PROCESSING')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM job_reopen_events blocked_reopen
+           WHERE blocked_reopen.job_id=retry_job.id
+             AND blocked_reopen.outcome='BLOCKED'
+             AND blocked_reopen.prior_generation=retry_job.reopen_generation
+             AND blocked_reopen.reopened_at > now() - interval '30 days'
         )
       ORDER BY (retry_job.status='FAILED' AND retry_job.last_error LIKE $2) DESC,
                c.last_checked ASC NULLS FIRST
@@ -478,11 +493,18 @@ export async function reconcileCommunityAcquisitionRecovery(
         }
       }
       if (enqueueRecoveryJob) {
-        await enqueueRecoveryJob(
+        const enqueued = await enqueueRecoveryJob(
           channelRecord.channel_id,
           triggerCheck.reasonCodes.join(','),
           capacityTerminal ? String(row.retry_reason || '') : undefined
         );
+        if (enqueued === false) {
+          // The reopen guard kept the retry job terminal. Restore the channel
+          // projection so it does not claim an active retry that was never
+          // created.
+          await upsertChannel(channelRecord);
+          continue;
+        }
       }
     } catch (error) {
       await upsertChannel(channelRecord);

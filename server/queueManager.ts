@@ -3494,7 +3494,7 @@ export async function projectNotFoundAfterInspection(
   } | null | undefined,
   admittedInspection: Parameters<typeof reconcileDiscordDiscoveryFromInspection>[1],
   scheduleRetry: boolean,
-  enqueue: (channelId: string, directive?: CommunityRetryDirective) => Promise<void> = enqueueCommunityAcquisitionRetry,
+  enqueue: (channelId: string, directive?: CommunityRetryDirective) => Promise<boolean | void> = enqueueCommunityAcquisitionRetry,
 ): Promise<void> {
       // Pending-work guard (E7): never project COMPLETED/attempts=0 onto a
       // channel that still owns discovery work — a stored unvalidated locator,
@@ -3611,7 +3611,7 @@ export function shouldCompleteSuppressedRetryJob(inspection:{
   return scanStatus==='FAILED'||scanStatus==='FAILED_PERMANENT';
 }
 
-export async function enqueueCommunityAcquisitionRetry(channelId:string,directive?:CommunityRetryDirective,source:'INSPECTION'|'RECOVERY'|'LEGACY'='INSPECTION',clientOverride?:{query:(sql:string,params?:unknown[])=>Promise<{rows:unknown[];rowCount:number}>}):Promise<void>{
+export async function enqueueCommunityAcquisitionRetry(channelId:string,directive?:CommunityRetryDirective,source:'INSPECTION'|'RECOVERY'|'LEGACY'='INSPECTION',clientOverride?:{query:(sql:string,params?:unknown[])=>Promise<{rows:unknown[];rowCount:number}>}):Promise<boolean>{
   const metadata=buildCommunityRetryJobMetadata({
     code:directive?.code||COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,
     retryReason:directive?.retryReason||'COMMUNITY_REQUIRED_ACQUISITION_FAILURE',
@@ -3622,6 +3622,9 @@ export async function enqueueCommunityAcquisitionRetry(channelId:string,directiv
   // the retry-worker deferral branch; count them at the durable enqueue point.
   if(String(directive?.reason||'').includes('RENDERED_FALLBACK_SATURATED'))bumpCommunitySaturationDeferral();
   const job=await enqueueJob('RETRY_COMMUNITY_ACQUISITION',{channelId,...metadata},{idempotencyKey:communityAcquisitionRetryKey(channelId),priority:15,maxAttempts:5,runAfter:directive?.retryAt?new Date(directive.retryAt).toISOString():undefined,clientOverride});
+  // A capped reopen leaves the durable owner terminal. Callers that project a
+  // channel state (recovery sweeps) must not treat this as a runnable enqueue.
+  if(job.reopen_blocked)return false;
   // Preserve a pending job's original ownership and retry window while merging
   // the latest attributable reason into its durable payload. Per-seed click
   // progress is monotonic, and the merge must read the CURRENT row inside this
@@ -3665,6 +3668,7 @@ export async function enqueueCommunityAcquisitionRetry(channelId:string,directiv
      WHERE id=$1 AND status IN('PENDING','PROCESSING')`,
     [job.id,JSON.stringify(metadata)]
   );
+  return true;
 }
 
 export function operationalEnrichmentRecoveryKey(channelId:string):string{return `operational-enrichment-recovery:${channelId}`;}
@@ -3678,9 +3682,11 @@ export function operationalEnrichmentRecoveryKey(channelId:string):string{return
 export function buildOperationalEnrichmentRecoveryPayload(channel:Pick<ChannelRecord,'channel_id'|'channel_name'|'youtube_url'|'country'|'discovery_source'|'subscriber_count'|'channel_thumbnail_url'>,reasonCodes:string[]){
   return {channelId:channel.channel_id,targetCountry:channel.country,source:(channel.discovery_source||'recovery') as DiscoverySource,enrichmentStage:1,evidenceAction:'CHANNEL_RECENT_METADATA',candidate:{channelId:channel.channel_id,channelName:channel.channel_name,youtubeUrl:channel.youtube_url,locationTag:channel.country,description:'',videoTitles:[],channelLinks:[],subscriberCount:channel.subscriber_count,channelThumbnailUrl:channel.channel_thumbnail_url,enrichmentStage:1},recoveryReasonCodes:reasonCodes};
 }
-export async function enqueueOperationalEnrichmentRecoveryJob(channel:ChannelRecord,reasonCodes:string[],clientOverride?:any):Promise<void>{
+export async function enqueueOperationalEnrichmentRecoveryJob(channel:ChannelRecord,reasonCodes:string[],clientOverride?:any):Promise<boolean>{
   const job=await enqueueJob('ENRICH_CHANNEL',buildOperationalEnrichmentRecoveryPayload(channel,reasonCodes),{idempotencyKey:operationalEnrichmentRecoveryKey(channel.channel_id),priority:10,maxAttempts:4,clientOverride});
+  if(job.reopen_blocked)return false;
   await (clientOverride||await getDb()).query(`UPDATE jobs SET first_transient_failure_at=NULL WHERE id=$1 AND status='PENDING'`,[job.id]);
+  return true;
 }
 
 /**

@@ -107,6 +107,11 @@ BEGIN
     IN ('on', 'true', '1', 'yes');
 
   IF guard_enabled AND guarded_type AND channel_key IS NOT NULL AND NOT override_enabled THEN
+    -- Different terminal jobs for one channel can reach this trigger
+    -- concurrently. Serialize the count-and-insert decision for the channel
+    -- and job type; a transaction-scoped advisory lock releases on commit.
+    PERFORM pg_advisory_xact_lock(hashtextextended(channel_key || ':' || OLD.type, 0));
+
     SELECT count(*)::int
       INTO recent_reopens
       FROM public.job_reopen_events e

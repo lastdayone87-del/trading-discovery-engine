@@ -147,7 +147,7 @@ export type EnqueueOperationalEnrichmentRecovery = (
   channel: ChannelRecord,
   reasonCodes: string[],
   client?: any
-) => Promise<void>;
+) => Promise<boolean | void>;
 
 export const OPERATIONAL_ENRICHMENT_RECOVERY_POLICY_VERSION = 'operational-enrichment-recovery-v2';
 
@@ -272,7 +272,8 @@ async function runOperationalEnrichmentReconciliation(
                 AND cycle_event.event_key LIKE 'operational-enrichment:%') AS recovery_cycles
        FROM channels c
        JOIN LATERAL (
-         SELECT latest_job.id, latest_job.attempts, latest_job.status, latest_job.last_error
+         SELECT latest_job.id, latest_job.attempts, latest_job.status, latest_job.last_error,
+                latest_job.reopen_generation
            FROM jobs latest_job
           WHERE latest_job.type IN('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN')
             AND latest_job.payload->>'channelId'=c.channel_id
@@ -299,6 +300,13 @@ async function runOperationalEnrichmentReconciliation(
           SELECT 1 FROM operational_enrichment_recovery_events terminal_event
            WHERE terminal_event.channel_id=c.channel_id
              AND terminal_event.event_key LIKE 'operational-enrichment-terminal:%'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM job_reopen_events blocked_reopen
+           WHERE blocked_reopen.job_id=failed_job.id
+             AND blocked_reopen.outcome='BLOCKED'
+             AND blocked_reopen.prior_generation=failed_job.reopen_generation
+             AND blocked_reopen.reopened_at > now() - interval '30 days'
         )
       ORDER BY c.last_checked ASC NULLS FIRST
       LIMIT $1`,
@@ -340,14 +348,15 @@ async function runOperationalEnrichmentReconciliation(
     if (!decision.reactivate) continue;
     const updated = reactivateOperationalEnrichment(channel, decision.reasonCodes, new Date(now).toISOString());
     await upsertChannel(updated);
-    let recorded = false;
+    let outcome: 'RECORDED' | 'DUPLICATE' | 'BLOCKED' = 'BLOCKED';
     try {
       // Enqueue and ledger write share one transaction on the real pool: a
       // failed ledger insert must not leave a reopened job that consumes a
       // recovery cycle without a durable record (or vice versa).
-      recorded = await withRecoveryTransaction(db, async queryable => {
-        await enqueueRecoveryJob(updated, decision.reasonCodes, queryable);
-        return insertOperationalEnrichmentRecoveryEvent(
+      outcome = await withRecoveryTransaction(db, async queryable => {
+        const enqueued = await enqueueRecoveryJob(updated, decision.reasonCodes, queryable);
+        if (enqueued === false) return 'BLOCKED';
+        const recorded = await insertOperationalEnrichmentRecoveryEvent(
           queryable,
           operationalEnrichmentCycleEventKey(channel.channel_id, failedJobId, row.failed_job_attempts, recoveryCycles + 1),
           channel.channel_id,
@@ -355,12 +364,19 @@ async function runOperationalEnrichmentReconciliation(
           channel.scan_status,
           decision.reasonCodes
         );
+        return recorded ? 'RECORDED' : 'DUPLICATE';
       });
     } catch (error) {
       await upsertChannel(channel);
       throw error;
     }
-    if (recorded) {
+    if (outcome === 'BLOCKED') {
+      // The reopen guard kept the enrichment job terminal. Restore the
+      // channel projection and do not consume a recovery cycle.
+      await upsertChannel(channel);
+      continue;
+    }
+    if (outcome === 'RECORDED') {
       bumpOperationalEnrichmentRecoveryEnqueued();
       console.info(JSON.stringify({event:'operational_enrichment_recovery_enqueued',channelId:channel.channel_id,failedJobId,cycle:recoveryCycles+1,maxRecoveryCycles:OPERATIONAL_ENRICHMENT_MAX_RECOVERY_CYCLES,reasonCodes:decision.reasonCodes,timestamp:new Date(now).toISOString()}));
     } else {
