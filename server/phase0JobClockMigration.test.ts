@@ -13,6 +13,7 @@ const dbCore = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
 
 test('migration 162 is present and sorts after migration 161', () => {
   const files = readdirSync(migrationsDir).filter(name => name.endsWith('.sql')).sort();
+  assert.ok(files.includes('161_country_discovery_loop.sql'));
   assert.ok(files.includes(migrationName));
   assert.ok(files.indexOf(migrationName) > files.indexOf('161_country_discovery_loop.sql'));
 });
@@ -38,15 +39,36 @@ test('migration 162 adds separate queue, capacity-lease, and reopen clocks addit
   );
 });
 
-test('migration 162 backfills first_enqueued_at from retryObservedAt before created_at', () => {
-  assert.match(migration, /job\.payload \? 'retryObservedAt'/);
-  assert.match(migration, /\(job\.payload ->> 'retryObservedAt'\)::timestamptz/);
-  assert.match(migration, /EXCEPTION WHEN others THEN[\s\S]*observed_at := NULL;/);
-  assert.match(migration, /first_enqueued_at = COALESCE\(\s*first_enqueued_at,\s*LEAST\(job\.created_at, COALESCE\(observed_at, job\.created_at\)\)/s);
-  assert.match(migration, /last_enqueued_at = COALESCE\(last_enqueued_at, job\.created_at\)/);
+test('migration 162 performs only metadata-only DDL and defers the backfill', () => {
+  assert.doesNotMatch(withoutSqlComments, /DO\s+\$\$/);
+  assert.doesNotMatch(withoutSqlComments, /UPDATE\s+public\.jobs/i);
+  assert.doesNotMatch(withoutSqlComments, /SET\s+NOT\s+NULL/i);
+  assert.match(migration, /ALTER COLUMN first_enqueued_at SET DEFAULT now\(\)/);
+  assert.match(migration, /ALTER COLUMN last_enqueued_at SET DEFAULT now\(\)/);
   assert.ok(
-    migration.indexOf('first_enqueued_at SET DEFAULT now()') > migration.indexOf('DO $$'),
-    'defaults and NOT NULL constraints must be applied after the historical backfill',
+    migration.indexOf('SET DEFAULT now()') > migration.indexOf('ADD COLUMN IF NOT EXISTS'),
+    'defaults are applied after the columns exist and never rewrite existing rows',
+  );
+});
+
+test('the runner backfills queue clocks in bounded idempotent batches', () => {
+  assert.match(dbCore, /export async function backfillPhase0JobClocks/);
+  assert.match(dbCore, /WHERE \(first_enqueued_at IS NULL OR last_enqueued_at IS NULL\)/);
+  assert.match(dbCore, /AND id > \$1::uuid/);
+  assert.match(dbCore, /LIMIT \$2/);
+  assert.match(dbCore, /SELECT job_id, MIN\(started_at\) AS started_at/);
+  assert.match(dbCore, /phase0PayloadEpochMs\(row\.payload\)/);
+  assert.match(dbCore, /function phase0PayloadEpochMs\(payload: unknown\)/);
+  assert.match(dbCore, /retryObservedAt/);
+  assert.match(dbCore, /COALESCE\(j\.first_enqueued_at,v\.first_enqueued_at\)/);
+  assert.match(dbCore, /COALESCE\(j\.last_enqueued_at,v\.last_enqueued_at\)/);
+  assert.ok(
+    dbCore.indexOf('await backfillPhase0JobClocks(client)') > dbCore.indexOf('for (const file of files)'),
+    'the backfill must run outside the transactional migration loop',
+  );
+  assert.ok(
+    dbCore.indexOf('await backfillPhase0JobClocks(client)') < dbCore.indexOf('await ensurePhase0JobClockIndexes(client)'),
+    'queue clocks must be backfilled before the queue-age index is built',
   );
 });
 
@@ -67,7 +89,7 @@ test('migration 162 defers populated-table indexes to the concurrent runner', ()
     /CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_capacity_lease_pending ON public\.jobs \(capacity_lease_expires_at\) WHERE status='PENDING' AND capacity_lease_expires_at IS NOT NULL/,
   );
   assert.match(dbCore, /const phase0ClockMigration = await client\.query\('SELECT 1 FROM schema_migrations WHERE version=162'\);/);
-  assert.match(dbCore, /if \(phase0ClockMigration\.rowCount\) await ensurePhase0JobClockIndexes\(client\);/);
+  assert.match(dbCore, /if \(phase0ClockMigration\.rowCount\) \{/);
   assert.ok(
     dbCore.indexOf('await ensurePhase0JobClockIndexes(client)') > dbCore.indexOf('for (const file of files)'),
     'the index helper must run after migration 162 commits its columns',

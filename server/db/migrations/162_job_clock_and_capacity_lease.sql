@@ -10,6 +10,15 @@
 -- genuine retryable-failure budget. A capacity lease renewal must never write
 -- that anchor. This migration is additive only: existing runtime behavior and
 -- every historical observation remain unchanged.
+--
+-- Only fast, metadata-only DDL runs here. The historical backfill is a
+-- bounded, batched runner step that executes after this transaction commits
+-- (see backfillPhase0JobClocks in dbCore.ts), so the ACCESS EXCLUSIVE lock
+-- taken by ALTER TABLE is never held across a table scan or row updates.
+-- Defaults apply to new inserts immediately; existing rows stay NULL until
+-- the idempotent backfill fills them. NOT NULL is intentionally deferred
+-- until after the backfill has soaked, so a rolling deploy with old workers
+-- cannot fail updates on rows that are still being backfilled.
 
 SET LOCAL lock_timeout = '10s';
 
@@ -23,48 +32,12 @@ ALTER TABLE public.jobs
   ADD COLUMN IF NOT EXISTS reopen_generation INTEGER NOT NULL DEFAULT 0,
   ADD COLUMN IF NOT EXISTS last_reopened_at TIMESTAMPTZ;
 
--- Backfill the immutable first queue clock from the best durable evidence.
--- Retry jobs carry the original observation time in payload.retryObservedAt;
--- created_at may already have been rewritten by the legacy five-hour capacity
--- lease. For those rows the earlier of the two timestamps is the truthful
--- queue age. A malformed historical payload must not abort deployment, so each
--- candidate is parsed with a local exception guard and falls back to created_at.
-DO $$
-DECLARE
-  job record;
-  observed_at TIMESTAMPTZ;
-BEGIN
-  FOR job IN
-    SELECT id, created_at, payload
-      FROM public.jobs
-     WHERE first_enqueued_at IS NULL OR last_enqueued_at IS NULL
-  LOOP
-    observed_at := NULL;
-    BEGIN
-      IF job.payload IS NOT NULL AND job.payload ? 'retryObservedAt' THEN
-        observed_at := (job.payload ->> 'retryObservedAt')::timestamptz;
-      END IF;
-    EXCEPTION WHEN others THEN
-      observed_at := NULL;
-    END;
-
-    UPDATE public.jobs
-       SET first_enqueued_at = COALESCE(
-             first_enqueued_at,
-             LEAST(job.created_at, COALESCE(observed_at, job.created_at))
-           ),
-           last_enqueued_at = COALESCE(last_enqueued_at, job.created_at)
-     WHERE id = job.id;
-  END LOOP;
-END $$;
-
--- New inserts inherit the same clocks without a runtime write. NOT NULL is
--- applied only after the historical backfill above has completed.
+-- Adding a DEFAULT here is metadata-only. Existing rows are deliberately left
+-- NULL: a DEFAULT on ADD COLUMN would have made every historical job look
+-- freshly enqueued and destroy the backfill.
 ALTER TABLE public.jobs
   ALTER COLUMN first_enqueued_at SET DEFAULT now(),
-  ALTER COLUMN last_enqueued_at SET DEFAULT now(),
-  ALTER COLUMN first_enqueued_at SET NOT NULL,
-  ALTER COLUMN last_enqueued_at SET NOT NULL;
+  ALTER COLUMN last_enqueued_at SET DEFAULT now();
 
 -- The queue-age and capacity-lease indexes are built concurrently by the
 -- migration runner after this transaction commits. They are intentionally not
