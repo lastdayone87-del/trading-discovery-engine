@@ -378,6 +378,141 @@ async function ensureJobAttemptsFinishedErrorIndex(client: { query: (text: strin
 }
 
 /**
+ * Migration 162 adds the queue clocks as nullable columns with defaults. This
+ * helper fills historical rows in bounded batches after the migration
+ * transaction commits, so the ACCESS EXCLUSIVE lock from ALTER TABLE is never
+ * held across a table scan.
+ *
+ * first_enqueued_at uses the earliest durable evidence available:
+ *   * created_at, which the legacy five-hour capacity lease may already have
+ *     re-aged;
+ *   * payload.retryObservedAt, which is not immutable and may describe a later
+ *     retry, so it is only accepted when it precedes the other candidates;
+ *   * the first job_attempts.started_at, a durable execution floor that
+ *     survives queue re-aging.
+ *
+ * last_enqueued_at falls back to created_at because legacy rows carry no
+ * separate enqueue/reopen event. Clock-v2 writes the real value on reopen;
+ * until then, the most recent legacy queue activity is the best available
+ * reconstruction. The helper is idempotent and safe to rerun on every boot.
+ */
+function phase0PayloadEpochMs(payload: unknown): number | null {
+  let value: unknown = payload;
+  if (typeof value === 'string') {
+    try { value = JSON.parse(value); } catch { return null; }
+  }
+  if (!value || typeof value !== 'object') return null;
+  const raw = (value as Record<string, unknown>).retryObservedAt;
+  if (typeof raw !== 'string' || !raw.trim()) return null;
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+export async function backfillPhase0JobClocks(
+  client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> },
+  batchSize = 1_000,
+): Promise<number> {
+  const jobs = await client.query(`SELECT to_regclass('public.jobs') AS oid`);
+  if (!jobs.rows[0]?.oid) return 0;
+  const bounded = Math.max(1, Math.min(Math.floor(batchSize) || 1_000, 5_000));
+  let cursor = '00000000-0000-0000-0000-000000000000';
+  let total = 0;
+  for (;;) {
+    const batch = await client.query(
+      `SELECT id, created_at, payload
+         FROM public.jobs
+        WHERE (first_enqueued_at IS NULL OR last_enqueued_at IS NULL)
+          AND id >= $1::uuid
+        ORDER BY id
+        LIMIT $2`,
+      [cursor, bounded],
+    );
+    if (!batch.rowCount) break;
+    const ids = batch.rows.map(row => row.id);
+    const attempts = await client.query(
+      `SELECT job_id, MIN(started_at) AS started_at
+         FROM public.job_attempts
+        WHERE job_id = ANY($1::uuid[])
+        GROUP BY job_id`,
+      [ids],
+    );
+    const firstAttemptStart = new Map<string, number>();
+    for (const row of attempts.rows) {
+      const started = new Date(row.started_at).getTime();
+      if (Number.isFinite(started)) firstAttemptStart.set(String(row.job_id), started);
+    }
+    const values: unknown[] = [];
+    const tuples: string[] = [];
+    for (const row of batch.rows) {
+      const created = new Date(row.created_at).getTime();
+      const fallback = Number.isFinite(created) ? created : Date.now();
+      let first = fallback;
+      const observed = phase0PayloadEpochMs(row.payload);
+      if (observed !== null) first = Math.min(first, observed);
+      const attempt = firstAttemptStart.get(String(row.id));
+      if (attempt !== undefined) first = Math.min(first, attempt);
+      const offset = values.length;
+      values.push(row.id, new Date(first).toISOString(), new Date(fallback).toISOString());
+      tuples.push(`($${offset + 1}::uuid,$${offset + 2}::timestamptz,$${offset + 3}::timestamptz)`);
+    }
+    await client.query(
+      `UPDATE public.jobs j
+          SET first_enqueued_at=COALESCE(j.first_enqueued_at,v.first_enqueued_at),
+              last_enqueued_at=COALESCE(j.last_enqueued_at,v.last_enqueued_at)
+         FROM (VALUES ${tuples.join(',')}) AS v(id,first_enqueued_at,last_enqueued_at)
+        WHERE j.id=v.id`,
+      values,
+    );
+    total += ids.length;
+    cursor = String(batch.rows[batch.rows.length - 1].id);
+    if (batch.rows.length < bounded) break;
+  }
+  if (total > 0) {
+    console.log(JSON.stringify({ event: 'phase0_job_clock_backfill', processed: total, timestamp: new Date().toISOString() }));
+  }
+  return total;
+}
+
+/**
+ * Migration 162 adds the immutable queue clocks and capacity-lease columns to
+ * the populated jobs table. Its supporting indexes are built concurrently
+ * after the transactional migration commits; building them inside the
+ * migration would hold a write-blocking lock on every queue write.
+ */
+async function ensurePhase0JobClockIndexes(client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> }): Promise<void> {
+  const jobs = await client.query(`SELECT to_regclass('public.jobs') AS oid`);
+  if (!jobs.rows[0]?.oid) return;
+  const indexes = [
+    {
+      name: 'idx_jobs_phase0_backfill_pending',
+      create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_phase0_backfill_pending ON public.jobs (id) WHERE first_enqueued_at IS NULL OR last_enqueued_at IS NULL`,
+    },
+    {
+      name: 'idx_jobs_pending_queue_age',
+      create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_pending_queue_age ON public.jobs (priority DESC, first_enqueued_at ASC) WHERE status='PENDING'`,
+    },
+    {
+      name: 'idx_jobs_capacity_lease_pending',
+      create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_capacity_lease_pending ON public.jobs (capacity_lease_expires_at) WHERE status='PENDING' AND capacity_lease_expires_at IS NOT NULL`,
+    },
+  ];
+  for (const index of indexes) {
+    const existing = await client.query(`
+      SELECT c.oid, i.indisvalid, i.indisready
+        FROM pg_class c
+        JOIN pg_index i ON i.indexrelid = c.oid
+       WHERE c.oid = to_regclass('public.${index.name}')
+    `);
+    const row = existing.rows[0];
+    if (row?.indisvalid && row?.indisready) continue;
+    if (row?.oid) {
+      await client.query(`DROP INDEX CONCURRENTLY IF EXISTS public.${index.name}`);
+    }
+    await client.query(index.create);
+  }
+}
+
+/**
  * Migration 161 adds columns to existing hot tables (`query_runs`,
  * `terminology_observations`, `external_osint_observations`,
  * `autonomous_query_page_observations`). Building those indexes inside the
@@ -488,6 +623,15 @@ export async function runMigrations(): Promise<Array<{ version: number; name: st
     // idempotent and also repairs a build that failed on a previous boot.
     const cdlMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=161');
     if (cdlMigration.rowCount) await ensureCdlHotTableIndexes(client);
+    // Phase 0 queue/capacity indexes and the partial backfill index require
+    // migration 162's columns. Build them concurrently first, then run the
+    // idempotent historical clock backfill in bounded batches. The partial
+    // index keeps later boots O(1) once every clock is populated.
+    const phase0ClockMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=162');
+    if (phase0ClockMigration.rowCount) {
+      await ensurePhase0JobClockIndexes(client);
+      await backfillPhase0JobClocks(client);
+    }
     const res = await client.query('SELECT version,name,applied_at FROM schema_migrations ORDER BY version');
     return res.rows.map(r => ({ version: r.version, name: r.name, applied_at: iso(r.applied_at)! }));
   } finally {
