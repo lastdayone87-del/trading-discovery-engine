@@ -61,14 +61,14 @@ test('migration 166 constrains the lifecycle and idempotent work identity', () =
 });
 
 test('migration 166 indexes the due, channel, and never-executed claims', () => {
-  assert.match(migration, /idx_community_url_state_due/);
+  assert.match(withoutSqlComments, /idx_community_url_state_due/);
   assert.match(
-    migration,
+    withoutSqlComments,
     /ON public\.community_acquisition_url_state \(state, next_eligible_at\)\s+WHERE state IN \('PENDING', 'RUNNING'\)/,
   );
-  assert.match(migration, /idx_community_url_state_channel/);
-  assert.match(migration, /idx_community_url_state_never_executed/);
-  assert.match(migration, /WHERE never_executed/);
+  assert.match(withoutSqlComments, /idx_community_url_state_channel/);
+  assert.match(withoutSqlComments, /idx_community_url_state_never_executed/);
+  assert.match(withoutSqlComments, /WHERE never_executed/);
 });
 
 test('migration 166 touches updated_at without rewriting history', () => {
