@@ -82,7 +82,9 @@ test('the SQL bound keeps path-only URL normalization and all-observation browse
     /WHERE\s+o\.retryable\b/i,
     'retryability must be aggregated after browser execution, not used to filter observations',
   );
-  assert.match(telemetrySql, /COALESCE\(o\.provenance->>'required','false'\) = 'true'/);
+  assert.match(telemetrySql, /o\.provenance->'required' = 'true'::jsonb/);
+  assert.match(telemetrySql, /jsonb_typeof\(o\.provenance->'sharedEvidenceFrom'\) = 'string'/);
+  assert.match(telemetrySql, /btrim\(o\.provenance->>'sharedEvidenceFrom'\)/);
   assert.match(telemetrySql, /sharedEvidenceFrom/);
   assert.match(telemetrySql, /e\.requested_url/);
   assert.match(telemetrySql, /g\.browser_executed/);
@@ -133,7 +135,7 @@ test('the telemetry bound applies shared URL admission and auxiliary ownership',
     retryable: true,
     failure_class: 'NETWORK_FAILURE',
     observed_at: observedAt,
-    required_value: true,
+    required: true,
     relevance_tier_value: null,
     shared_evidence_from_value: null,
     browser_executed: false,
@@ -167,7 +169,15 @@ test('the telemetry bound applies shared URL admission and auxiliary ownership',
       id: '55555555-5555-4555-8555-555555555555',
       normalized_url: 'https://creator.example/string-required',
       requested_url: 'https://creator.example/string-required',
-      required_value: 'true',
+      required: 'true',
+    }),
+    // A non-string sharedEvidenceFrom is not shared evidence, exactly like the
+    // projection's string-only check.
+    effectiveRow({
+      id: '66666666-6666-4666-8666-666666666666',
+      normalized_url: 'https://creator.example/numeric-shared',
+      requested_url: 'https://creator.example/numeric-shared',
+      shared_evidence_from_value: 5,
     }),
   ];
   const db = {
@@ -179,6 +189,6 @@ test('the telemetry bound applies shared URL admission and auxiliary ownership',
   };
 
   const report = await buildPhase0UrlWorkLedgerReport(db, { windowDays: 7 });
-  assert.equal(report.telemetry.retryableRows, 2);
-  assert.equal(report.telemetry.neverBrowserExecutedRows, 2);
+  assert.equal(report.telemetry.retryableRows, 3);
+  assert.equal(report.telemetry.neverBrowserExecutedRows, 3);
 });

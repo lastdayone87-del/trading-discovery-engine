@@ -193,6 +193,23 @@ const LEDGER_ADMITTED_WORK_CONDITION = `
     AND retryable)
 `;
 
+/**
+ * Exact SQL spellings of the shared provenance checks. The projection requires
+ * the JSON boolean `true` for required work and a string (after trimming) for
+ * shared evidence; text coercion (`->>`) would treat a malformed string
+ * `"true"` or numeric shared value differently on the SQL side.
+ */
+function sqlRequiredTrue(alias: string): string {
+  return `${alias}.provenance->'required' = 'true'::jsonb`;
+}
+
+function sqlSharedEvidence(alias: string): string {
+  return `(
+    jsonb_typeof(${alias}.provenance->'sharedEvidenceFrom') = 'string'
+    AND btrim(${alias}.provenance->>'sharedEvidenceFrom') <> ''
+  )`;
+}
+
 /*
  * The SQL side owns work identity and effective-row selection: URL
  * normalization, the latest-inspection window, and production precedence.
@@ -281,15 +298,14 @@ export async function buildPhase0UrlWorkLedgerReport(
               COALESCE(o.failure_class,'') AS failure_class,
               o.observed_at,
               o.requested_url,
-              COALESCE(o.provenance->>'required','false') = 'true' AS required,
-              o.provenance->'required' AS required_value,
+              ${sqlRequiredTrue('o')} AS required,
               o.provenance->'relevanceTier' AS relevance_tier_value,
               o.provenance->'sharedEvidenceFrom' AS shared_evidence_from_value,
               (
-                COALESCE(o.provenance->>'sharedEvidenceFrom','') <> ''
+                ${sqlSharedEvidence('o')}
                 OR o.outcome = 'FOUND'
                 OR (
-                  COALESCE(o.provenance->>'sharedEvidenceFrom','') = ''
+                  NOT ${sqlSharedEvidence('o')}
                   AND (
                     ${safeCounterSql(`o.provenance->'crawlerTelemetry'->'pagesInspected'`)} > 0
                     OR ${safeCounterSql(`o.provenance->'crawlerTelemetry'->'requestsFinished'`)} > 0
@@ -298,7 +314,7 @@ export async function buildPhase0UrlWorkLedgerReport(
                 )
               ) AS processed_evidence,
               (
-                COALESCE(o.provenance->>'sharedEvidenceFrom','') = ''
+                NOT ${sqlSharedEvidence('o')}
                 AND COALESCE(o.provenance->'crawlerTelemetry'->>'mode','') = 'RENDERED'
                 AND (
                   ${safeCounterSql(`o.provenance->'crawlerTelemetry'->'requestsFinished'`)} > 0
@@ -390,7 +406,7 @@ export async function buildPhase0UrlWorkLedgerReport(
             e.retryable,
             e.failure_class,
             e.observed_at,
-            e.required_value,
+            e.required,
             e.relevance_tier_value,
             e.shared_evidence_from_value,
             g.browser_executed
@@ -424,7 +440,7 @@ export async function buildPhase0UrlWorkLedgerReport(
       id: row.id ? String(row.id) : undefined,
       provenance: {
         surface: String(row.surface || ''),
-        required: row.required_value === true,
+        required: row.required === true,
         ...(typeof row.relevance_tier_value === 'string'
           ? { relevanceTier: row.relevance_tier_value }
           : {}),
