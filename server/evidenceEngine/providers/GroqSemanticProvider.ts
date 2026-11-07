@@ -9,6 +9,9 @@ import {
 } from '../../providerResilience';
 import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../semanticCalibration';
 import { abortedByDeadline } from './abortReason';
+import { readSemanticResultCache, SEMANTIC_RESULT_CACHE_HIT_REASON, writeSemanticResultCache } from '../semanticResultCache';
+import { applySemanticPrefilter, recordSemanticPrefilterOutcome } from '../../semanticPrefilter';
+import { classifySemanticPrompt } from '../semanticBatch';
 import type { EvidenceCategory, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import {
   buildSemanticPrompt,
@@ -962,7 +965,7 @@ export function defaultClient(
   const timeoutMs = groqTimeoutMs();
   const deadlinesEnabled = groqDeadlinesEnabled();
   const persistedCooldownExpiryMs = deps?.persistedCooldownExpiryMs ?? defaultPersistedCooldownExpiryMs;
-  return { classify: async (prompt, model, observability, signal) => {
+  return { batchGroup: 'groq-semantic', classify: async (prompt, model, observability, signal) => {
     // Routes are re-discovered per call so key rotation is config-only. The
     // restricted-route quarantine is applied before the failover so a known
     // dead organization is never retried (or paced) again in this process.
@@ -994,7 +997,7 @@ export function defaultClient(
       const base = {
         id: randomUUID(), provider: 'groq', operation: 'multilingual-semantic-classification',
         ...semanticObservabilityFields(observability),
-        requestMetadata: { groqRoute: route.id, groqOrg: orgId, ...(promptCapped ? { groqPromptCapped: 'true' } : {}) }, attempt: 1,
+        requestMetadata: { ...(observability?.requestMetadata || {}), groqRoute: route.id, groqOrg: orgId, ...(promptCapped ? { groqPromptCapped: 'true' } : {}) }, attempt: 1,
         reservedCost: 0, policyVersion: 'provider-resilience-v1',
       };
       try {
@@ -1146,12 +1149,12 @@ export function defaultClient(
 
 async function classifyCandidateWith404Fallback(client: SemanticModelClient, candidatePrompt: string, candidateModel: string, fallbackModel: string, observability?: SemanticObservabilityContext, signal?: AbortSignal) {
   try {
-    return { value: await client.classify(candidatePrompt, candidateModel, observability, signal), model: candidateModel, fallbackUsed: false };
+    return { value: await classifySemanticPrompt({ client, prompt: candidatePrompt, model: candidateModel, observability, signal }), model: candidateModel, fallbackUsed: false };
   } catch (error) {
     const isModel404 = error instanceof ProviderCallError && error.errorClass === 'PERMANENT_INPUT' && error.status === 404;
     if (!isModel404 || candidateModel === fallbackModel) throw error;
     console.warn('[Groq Semantic] Candidate model returned 404; retrying once with configured adjudicator model.', { candidateModel, fallbackModel });
-    return { value: await client.classify(candidatePrompt, fallbackModel, observability, signal), model: fallbackModel, fallbackUsed: true };
+    return { value: await classifySemanticPrompt({ client, prompt: candidatePrompt, model: fallbackModel, observability, signal }), model: fallbackModel, fallbackUsed: true };
   }
 }
 
@@ -1236,6 +1239,10 @@ export class GroqSemanticProvider implements EvidenceProvider {
     if (!hasCreatorLevelSemanticContext(input)) {
       return { availability: 'NOT_APPLICABLE' as const, reason: 'Retrieval-only candidate has no independent creator-level semantic context yet.' };
     }
+    const prefilter = applySemanticPrefilter(input, this.name);
+    if (prefilter.skip) {
+      return { availability: 'NOT_APPLICABLE' as const, reason: `Semantic prefilter withheld semantic quota: ${prefilter.decision?.reasonCodes.join(',') || 'WITHHELD'}.` };
+    }
     return { availability: 'AVAILABLE' as const };
   }
 
@@ -1245,49 +1252,87 @@ export class GroqSemanticProvider implements EvidenceProvider {
     const candidateModel = process.env.GROQ_CANDIDATE_MODEL || DEFAULT_GROQ_CANDIDATE_MODEL;
     const adjudicatorModel = process.env.GROQ_ADJUDICATOR_MODEL || DEFAULT_GROQ_ADJUDICATOR_MODEL;
     const observability = { jobId: input.job_id, runId: input.run_id };
-    const candidatePrompt = buildSemanticPrompt(input, 'CANDIDATE');
-    const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel, observability, signal);
-    let result = parseSemanticResult(candidate.value);
-    let model = candidate.model;
-    const fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
-    // Citation repair (Groq-only): a decisive-but-uncited result would abstain
-    // for missing attribution, not for lack of a decision. Offer exactly one
-    // targeted retry demanding citations. The original decision fields are
-    // preserved in code (prompt text is unenforceable on model output) and
-    // only citations referencing supplied documents are retained; a
-    // still-uncited result abstains as before, so unsupported classifications
-    // can never pass this gate.
-    let repairUsed = false;
-    let repairedCitations: SemanticModelResult['citations'] | null = null;
-    if (isDecisiveButUncited(result)) {
-      try {
-        const repaired = parseSemanticResult(await client.classify(buildCitationRepairPrompt(candidatePrompt, result, candidateDocumentRefs(input)), model, observability, signal));
-        const retained = retainSuppliedCitations(repaired.citations, candidateDocumentRefs(input));
-        if (retained.length > 0) {
-          result = { ...result, citations: retained };
-          repairedCitations = retained;
-          repairUsed = true;
+    const adjudicationEnabled = process.env.MULTILINGUAL_ADJUDICATION_ENABLED === 'true';
+    const cacheIdentity = {
+      input,
+      provider: this.name,
+      promptVersion: SEMANTIC_PROMPT_VERSION,
+      featureVersion: SEMANTIC_FEATURE_VERSION,
+      modelVersion: candidateModel,
+      adjudicatorModelVersion: adjudicatorModel,
+      adjudicationEnabled,
+    };
+    const cached = this.injectedClient ? undefined : await readSemanticResultCache(cacheIdentity);
+    let result: SemanticModelResult;
+    let model: string;
+    let fallbackReasonCodes: string[];
+    let repairSurvived: () => boolean;
+    if (cached) {
+      result = cached.result;
+      model = cached.modelVersion;
+      fallbackReasonCodes = [
+        ...(cached.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : []),
+        SEMANTIC_RESULT_CACHE_HIT_REASON,
+      ];
+      repairSurvived = () => Boolean(cached.repairPromptVersion);
+    } else {
+      const candidatePrompt = buildSemanticPrompt(input, 'CANDIDATE');
+      const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel, observability, signal);
+      result = parseSemanticResult(candidate.value);
+      model = candidate.model;
+      fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
+      // Citation repair (Groq-only): a decisive-but-uncited result would abstain
+      // for missing attribution, not for lack of a decision. Offer exactly one
+      // targeted retry demanding citations. The original decision fields are
+      // preserved in code (prompt text is unenforceable on model output) and
+      // only citations referencing supplied documents are retained; a
+      // still-uncited result abstains as before, so unsupported classifications
+      // can never pass this gate.
+      let repairUsed = false;
+      let repairedCitations: SemanticModelResult['citations'] | null = null;
+      if (isDecisiveButUncited(result)) {
+        try {
+          const repaired = parseSemanticResult(await client.classify(buildCitationRepairPrompt(candidatePrompt, result, candidateDocumentRefs(input)), model, observability, signal));
+          const retained = retainSuppliedCitations(repaired.citations, candidateDocumentRefs(input));
+          if (retained.length > 0) {
+            result = { ...result, citations: retained };
+            repairedCitations = retained;
+            repairUsed = true;
+          }
+        } catch (error) {
+          // Repair is best-effort, but cancellation is not a repair failure:
+          // propagate it so canceled work is not reported as a completed
+          // abstention.
+          if (signal?.aborted) throw error;
+          // Keep the original result, which abstains.
         }
-      } catch (error) {
-        // Repair is best-effort, but cancellation is not a repair failure:
-        // propagate it so canceled work is not reported as a completed
-        // abstention.
-        if (signal?.aborted) throw error;
-        // Keep the original result, which abstains.
       }
+      // The repair code marks only results that survive to evidence
+      // construction with their repaired citations: a later adjudication that
+      // replaces the result drops the code with it. Evaluated below, after
+      // adjudication has had its chance to replace the result.
+      repairSurvived = () => repairUsed && repairedCitations !== null && result.citations === repairedCitations;
+      // Second pass runs unless adjudication already occurred (candidate served
+      // from the adjudicator model via 404 fallback). Gated on occurrence, not
+      // on model-name inequality, so identical candidate/adjudicator defaults
+      // still adjudicate low-confidence results.
+      if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && adjudicationEnabled && !candidate.fallbackUsed) {
+        result = parseSemanticResult(await classifySemanticPrompt({ client, prompt: buildSemanticPrompt(input, 'ADJUDICATION'), model: adjudicatorModel, observability, signal })); model = adjudicatorModel;
+      }
+      // Cache the final verdict after repair/adjudication. Repair provenance
+      // is stored explicitly so a cache hit reports the same reason codes.
+      // Injected clients are a test/shadow seam and never touch the cache.
+      if (!this.injectedClient) await writeSemanticResultCache(cacheIdentity, {
+        result,
+        modelVersion: model,
+        fallbackUsed: candidate.fallbackUsed,
+        repairPromptVersion: repairSurvived() ? SEMANTIC_CITATION_REPAIR_PROMPT_VERSION : undefined,
+      });
     }
-    // The repair code marks only results that survive to evidence
-    // construction with their repaired citations: a later adjudication that
-    // replaces the result drops the code with it. Evaluated below, after
-    // adjudication has had its chance to replace the result.
-    const repairSurvived = () => repairUsed && repairedCitations !== null && result.citations === repairedCitations;
-    // Second pass runs unless adjudication already occurred (candidate served
-    // from the adjudicator model via 404 fallback). Gated on occurrence, not
-    // on model-name inequality, so identical candidate/adjudicator defaults
-    // still adjudicate low-confidence results.
-    if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && process.env.MULTILINGUAL_ADJUDICATION_ENABLED === 'true' && !candidate.fallbackUsed) {
-      result = parseSemanticResult(await client.classify(buildSemanticPrompt(input, 'ADJUDICATION'), adjudicatorModel, observability, signal)); model = adjudicatorModel;
-    }
+    // Shadow validation for the Phase 4 prefilter gate. Observability only:
+    // it never changes the verdict, and enforce mode records nothing because
+    // withheld channels never reach this provider.
+    recordSemanticPrefilterOutcome(input, this.name, result.label);
     const calibrated = calibrateSemanticConfidence(result.confidence);
     const abstained = !result.supportedLanguage || result.label === 'AMBIGUOUS' || calibrated < 50 || result.citations.length === 0;
     const positive = result.label === 'ACTIVE_TRADING' || result.label === 'INVESTING_EDUCATION';

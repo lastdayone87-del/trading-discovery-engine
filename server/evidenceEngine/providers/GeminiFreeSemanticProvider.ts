@@ -10,6 +10,9 @@ import {
 } from '../../providerResilience';
 import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../semanticCalibration';
 import { abortedByDeadline } from './abortReason';
+import { readSemanticResultCache, SEMANTIC_RESULT_CACHE_HIT_REASON, writeSemanticResultCache } from '../semanticResultCache';
+import { applySemanticPrefilter, recordSemanticPrefilterOutcome } from '../../semanticPrefilter';
+import { classifySemanticPrompt } from '../semanticBatch';
 import type { EvidenceCategory, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import {
   buildSemanticPrompt,
@@ -275,6 +278,7 @@ export function defaultClient(
   const deadlinesEnabled = geminiFreeDeadlinesEnabled();
   const persistedCooldownExpiryMs = deps?.persistedCooldownExpiryMs ?? defaultPersistedCooldownExpiryMs;
   return {
+    batchGroup: 'gemini-free-semantic',
     classify: async (prompt, model, observability, signal) => {
       const response = await runGeminiFreeRouteFailover(routes, async route => {
         const started = Date.now();
@@ -290,7 +294,7 @@ export function defaultClient(
         const base = {
           id: randomUUID(), provider: 'gemini-free', operation: 'multilingual-semantic-classification',
           ...semanticObservabilityFields(observability),
-          requestMetadata: { geminiFreeRoute: route.id }, attempt: 1,
+          requestMetadata: { ...(observability?.requestMetadata || {}), geminiFreeRoute: route.id }, attempt: 1,
           reservedCost: 0, policyVersion: 'provider-resilience-v1',
         };
         try {
@@ -365,12 +369,12 @@ export function defaultClient(
 
 async function classifyCandidateWith404Fallback(client: SemanticModelClient, candidatePrompt: string, candidateModel: string, fallbackModel: string, observability?: SemanticObservabilityContext, signal?: AbortSignal) {
   try {
-    return { value: await client.classify(candidatePrompt, candidateModel, observability, signal), model: candidateModel, fallbackUsed: false };
+    return { value: await classifySemanticPrompt({ client, prompt: candidatePrompt, model: candidateModel, observability, signal }), model: candidateModel, fallbackUsed: false };
   } catch (error) {
     const isModel404 = error instanceof ProviderCallError && error.errorClass === 'PERMANENT_INPUT' && error.status === 404;
     if (!isModel404 || candidateModel === fallbackModel) throw error;
     console.warn('[GeminiFree Semantic] Candidate model returned 404; retrying once with configured adjudicator model.', { candidateModel, fallbackModel });
-    return { value: await client.classify(candidatePrompt, fallbackModel, observability, signal), model: fallbackModel, fallbackUsed: true };
+    return { value: await classifySemanticPrompt({ client, prompt: candidatePrompt, model: fallbackModel, observability, signal }), model: fallbackModel, fallbackUsed: true };
   }
 }
 
@@ -383,6 +387,10 @@ export class GeminiFreeSemanticProvider implements EvidenceProvider {
     if (!hasCreatorLevelSemanticContext(input)) {
       return { availability: 'NOT_APPLICABLE' as const, reason: 'Retrieval-only candidate has no independent creator-level semantic context yet.' };
     }
+    const prefilter = applySemanticPrefilter(input, this.name);
+    if (prefilter.skip) {
+      return { availability: 'NOT_APPLICABLE' as const, reason: `Semantic prefilter withheld semantic quota: ${prefilter.decision?.reasonCodes.join(',') || 'WITHHELD'}.` };
+    }
     return { availability: 'AVAILABLE' as const };
   }
 
@@ -392,20 +400,48 @@ export class GeminiFreeSemanticProvider implements EvidenceProvider {
     const candidateModel = process.env.GEMINI_FREE_CANDIDATE_MODEL || DEFAULT_GEMINI_FREE_CANDIDATE_MODEL;
     const adjudicatorModel = process.env.GEMINI_FREE_ADJUDICATOR_MODEL || DEFAULT_GEMINI_FREE_ADJUDICATOR_MODEL;
     const observability = { jobId: input.job_id, runId: input.run_id };
-    const candidatePrompt = buildSemanticPrompt(input, 'CANDIDATE');
-    const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel, observability, signal);
-    let result = parseSemanticResult(candidate.value);
-    let model = candidate.model;
-    const fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
-    // Adjudication is a second pass with the ADJUDICATION prompt for
-    // AMBIGUOUS/low-confidence candidates. Unlike an earlier same-model
-    // guard, the pass runs whenever it is enabled and the result qualifies —
-    // with default models candidate and adjudicator intentionally share
-    // gemini-2.5-flash-lite, and skipping then would silently disable the
-    // flag. Decisive results still cost exactly one call (first conditions).
-    if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && process.env.GEMINI_FREE_ADJUDICATION_ENABLED === 'true') {
-      result = parseSemanticResult(await client.classify(buildSemanticPrompt(input, 'ADJUDICATION'), adjudicatorModel, observability, signal)); model = adjudicatorModel;
+    const adjudicationEnabled = process.env.GEMINI_FREE_ADJUDICATION_ENABLED === 'true';
+    const cacheIdentity = {
+      input,
+      provider: this.name,
+      promptVersion: SEMANTIC_PROMPT_VERSION,
+      featureVersion: SEMANTIC_FEATURE_VERSION,
+      modelVersion: candidateModel,
+      adjudicatorModelVersion: adjudicatorModel,
+      adjudicationEnabled,
+    };
+    const cached = this.injectedClient ? undefined : await readSemanticResultCache(cacheIdentity);
+    let result: ReturnType<typeof parseSemanticResult>;
+    let model: string;
+    let fallbackReasonCodes: string[];
+    if (cached) {
+      result = cached.result;
+      model = cached.modelVersion;
+      fallbackReasonCodes = [
+        ...(cached.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : []),
+        SEMANTIC_RESULT_CACHE_HIT_REASON,
+      ];
+    } else {
+      const candidatePrompt = buildSemanticPrompt(input, 'CANDIDATE');
+      const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel, observability, signal);
+      result = parseSemanticResult(candidate.value);
+      model = candidate.model;
+      fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
+      // Adjudication is a second pass with the ADJUDICATION prompt for
+      // AMBIGUOUS/low-confidence candidates. Unlike an earlier same-model
+      // guard, the pass runs whenever it is enabled and the result qualifies —
+      // with default models candidate and adjudicator intentionally share
+      // gemini-2.5-flash-lite, and skipping then would silently disable the
+      // flag. Decisive results still cost exactly one call (first conditions).
+      if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && adjudicationEnabled) {
+        result = parseSemanticResult(await classifySemanticPrompt({ client, prompt: buildSemanticPrompt(input, 'ADJUDICATION'), model: adjudicatorModel, observability, signal })); model = adjudicatorModel;
+      }
+      if (!this.injectedClient) await writeSemanticResultCache(cacheIdentity, { result, modelVersion: model, fallbackUsed: candidate.fallbackUsed });
     }
+    // Shadow validation for the Phase 4 prefilter gate. Observability only:
+    // it never changes the verdict, and enforce mode records nothing because
+    // withheld channels never reach this provider.
+    recordSemanticPrefilterOutcome(input, this.name, result.label);
     const calibrated = calibrateSemanticConfidence(result.confidence);
     const abstained = !result.supportedLanguage || result.label === 'AMBIGUOUS' || calibrated < 50 || result.citations.length === 0;
     const positive = result.label === 'ACTIVE_TRADING' || result.label === 'INVESTING_EDUCATION';

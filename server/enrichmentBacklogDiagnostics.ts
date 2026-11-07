@@ -1,6 +1,8 @@
 import { getDb } from './db';
 import { CLASSIFICATION_JOB_TYPE } from './classificationDecoupling';
 import { diagnoseEnrichmentBacklog } from './enrichmentBacklogDiagnosis';
+import { semanticPrefilterSnapshot } from './semanticPrefilter';
+import { ENRICHMENT_WORKER_BASELINE, evaluateEnrichmentScaleGate, loadEnrichmentScaleMetrics } from './enrichmentScaleGate';
 
 /**
  * Build the read-only diagnostic SQL for one queue job type. The job type is a
@@ -171,6 +173,35 @@ export async function getEnrichmentBacklogDiagnostics(requestedLimit=10):Promise
       aggregate:classificationAggregate.rows[0]||{},
       throughput:classificationThroughput.rows,
       oldest:classificationJobs
-    }
+    },
+    phase4:await phase4Diagnostics()
+  };
+}
+
+/**
+ * Phase 4 scale observability. Best-effort: a missing migration or transient
+ * database error must never break the existing backlog diagnostic.
+ */
+async function phase4Diagnostics():Promise<any>{
+  const requestedWorkers=Math.max(1,Number(process.env.ENRICHMENT_WORKER_CONCURRENCY||ENRICHMENT_WORKER_BASELINE));
+  let semanticCache:any=null;
+  let enrichmentScale:any=null;
+  try{
+    const db=await getDb();
+    const cache=await db.query(`SELECT COUNT(*)::int AS entries,COALESCE(SUM(hits),0)::int AS hits,MAX(last_hit_at) AS last_hit_at,MAX(created_at) AS newest_entry_at FROM semantic_classification_cache`);
+    semanticCache=cache.rows[0]||null;
+  }catch(error){
+    semanticCache={unavailable:error instanceof Error?error.message:'unavailable'};
+  }
+  try{
+    const metrics=await loadEnrichmentScaleMetrics();
+    enrichmentScale={metrics,decision:evaluateEnrichmentScaleGate(metrics,undefined,requestedWorkers)};
+  }catch(error){
+    enrichmentScale={unavailable:error instanceof Error?error.message:'unavailable',decision:evaluateEnrichmentScaleGate(undefined,undefined,requestedWorkers)};
+  }
+  return {
+    semanticPrefilter:semanticPrefilterSnapshot(),
+    semanticCache,
+    enrichmentScale
   };
 }

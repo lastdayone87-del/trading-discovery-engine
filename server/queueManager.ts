@@ -1,4 +1,5 @@
 import { browserCapabilityIsUnavailable } from './browserCapability';
+import { ENRICHMENT_WORKER_BASELINE, enrichmentScaleGateEnabled, enrichmentScaleThresholds, evaluateEnrichmentScaleGate, loadEnrichmentScaleMetrics } from './enrichmentScaleGate';
 import {
   getDb,
   enqueueJob,
@@ -4723,6 +4724,44 @@ function startWorkerPool(type: 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEA
 let workersStarted = false;
 
 /**
+ * Enrichment startup consults the Phase 4 measured scale gate, then applies
+ * the Phase 3 classification split to the gate's effective total. A request
+ * for more than the measured-safe baseline stays clamped at 3 unless semantic
+ * success, p95 latency, and backlog stability all pass. `getDb()` is already
+ * the first thing every worker tick needs, so waiting here cannot delay work
+ * that could actually run.
+ *
+ * The split itself keeps the total unchanged:
+ *   2 shared workers claim CLASSIFY_DISCOVERED_CHANNEL first (priority 15),
+ *   then ENRICH_CHANNEL; the remainder claim ENRICH_CHANNEL only.
+ * With decoupling off, one shared worker still drains old classification jobs
+ * while the other workers keep the pre-existing ENRICH backlog moving.
+ */
+async function startGatedEnrichmentWorkers(): Promise<void> {
+  const requested = resolveEnrichmentWorkerCount();
+  const decoupling = resolveClassificationDecouplingConfig();
+  let effectiveWorkers = requested;
+  if (requested > ENRICHMENT_WORKER_BASELINE && enrichmentScaleGateEnabled()) {
+    let metrics;
+    try {
+      metrics = await loadEnrichmentScaleMetrics();
+    } catch (error) {
+      console.warn('[Queue] Enrichment scale metrics unavailable; staying at baseline.', error);
+    }
+    const decision = evaluateEnrichmentScaleGate(metrics, enrichmentScaleThresholds(), requested);
+    effectiveWorkers = decision.effectiveWorkers;
+    if (decision.effectiveWorkers < requested) {
+      console.warn(`[Queue] Enrichment scale gate clamped workers ${requested}->${decision.effectiveWorkers}: ${decision.reasons.join(',')}`);
+    }
+  }
+  const enrichmentSplit = resolveEnrichmentWorkerSplit(effectiveWorkers, decoupling.enabled);
+  startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.classificationWorkers, [CLASSIFICATION_JOB_TYPE], 'enrich_channel_shared');
+  if (enrichmentSplit.enrichmentOnlyWorkers > 0) {
+    startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.enrichmentOnlyWorkers, [], 'enrich_channel_backlog');
+  }
+}
+
+/**
  * Start the durable queue consumers explicitly, after HTTP readiness. Keeping
  * this idempotent prevents duplicate consumers if startup orchestration is
  * retried; individual ticks already preserve the existing claim/retry rules.
@@ -4738,21 +4777,8 @@ export function startSearchWorkers(): void {
   // Enrichment defaults to 3 workers: measured service demand is ~334s mean
   // per completion (~10.8/hr per worker), so 3 workers burst ~30/hr against
   // ample provider headroom while staying within daily YouTube (~107k/day at
-  // full tilt vs 300k pool) and browser-gate bounds. Env override still wins.
-  //
-  // Phase 3 keeps the total unchanged and splits claim preference:
-  //   2 shared workers claim CLASSIFY_DISCOVERED_CHANNEL first (priority 15),
-  //   then ENRICH_CHANNEL; 1 backlog worker claims ENRICH_CHANNEL only.
-  // With the flag off, one shared worker still drains old classification jobs
-  // while two workers keep the pre-existing ENRICH backlog moving.
-  const decoupling = resolveClassificationDecouplingConfig();
-  // Keep the configured pool's historical 20-worker maximum before starting
-  // two pools. resolveEnrichmentWorkerCount owns the cap; the explicit clamp
-  // here keeps that startup invariant local to the split as well.
-  const enrichmentWorkers = Math.min(20, resolveEnrichmentWorkerCount());
-  const enrichmentSplit = resolveEnrichmentWorkerSplit(enrichmentWorkers, decoupling.enabled);
-  startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.classificationWorkers, [CLASSIFICATION_JOB_TYPE], 'enrich_channel_shared');
-  if (enrichmentSplit.enrichmentOnlyWorkers > 0) {
-    startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.enrichmentOnlyWorkers, [], 'enrich_channel_backlog');
-  }
+  // full tilt vs 300k pool) and browser-gate bounds. Explicit requests above
+  // baseline must pass the Phase 4 measured scale gate; env override wins
+  // only when the gate is explicitly disabled.
+  void startGatedEnrichmentWorkers();
 }

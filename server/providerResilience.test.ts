@@ -31,10 +31,14 @@ test('Gemini route identifiers are normalized to machine-owned slots',()=>{
   assert.equal(resolveGeminiRouteId('gemini-4;DROP'),'gemini-1');
 });
 
-test('Gemini capacity queries are route-scoped while legacy events remain on route 1',()=>{
+test('Gemini capacity queries are account-scoped and never use one global lock',()=>{
   const source=readFileSync('server/providerResilience.ts','utf8');
-  assert.match(source,/COALESCE\(request_metadata->>'geminiRoute',\$1\)=\$1/);
-  assert.match(source,/COALESCE\(request_metadata->>'geminiRoute',\$2\)=\$2/);
+  // Phase 4: independent Google projects must not pace each other. Pacing,
+  // cooldown, and the token bucket all read strict geminiOrg tags.
+  assert.match(source,/request_metadata->>'geminiOrg'=\$1/);
+  assert.match(source,/request_metadata->>'geminiOrg'=\$2/);
+  assert.match(source,/pg_try_advisory_lock\(\$1,hashtext\(\$2\)\)/);
+  assert.doesNotMatch(source,/pg_try_advisory_lock\(\$1\) AS acquired/);
 });
 
 test('an already-aborted caller never starts a provider call',async()=>{
