@@ -5,7 +5,7 @@ import {
   GeminiSemanticProvider,
   type SemanticModelClient
 } from './GeminiSemanticProvider';
-import { ProviderCallError } from '../../providerResilience';
+import { classifyProviderError, ProviderCallError } from '../../providerResilience';
 
 const input = {
   channel_id: 'channel-1',
@@ -417,4 +417,25 @@ test('an already-expired Gemini caller is a TIMEOUT, not a cancellation', async 
     { signal: AbortSignal.abort(deadline) },
   ), (error: any) => error instanceof ProviderCallError && error.errorClass === 'TIMEOUT');
   assert.equal(calls, 0);
+});
+
+test('route-scoped credential failure advances to an independent Gemini account', async () => {
+  const { runGeminiRouteFailover } = await import('./GeminiSemanticProvider');
+  const calls: string[] = [];
+  const result = await runGeminiRouteFailover(
+    [
+      { id: 'gemini-1', key: 'hidden-a', orgId: 'proj-a' },
+      { id: 'gemini-2', key: 'hidden-b', orgId: 'proj-a' },
+      { id: 'gemini-3', key: 'hidden-c', orgId: 'proj-b' },
+    ],
+    async route => {
+      calls.push(route.id);
+      if (route.id === 'gemini-1') throw classifyProviderError(Object.assign(new Error('unauthorized'), { status: 401 }));
+      return { route: route.id };
+    },
+  );
+  // The rejected credential belongs to proj-a: its sibling route is not
+  // retried, while the independent proj-b account still serves.
+  assert.deepEqual(calls, ['gemini-1', 'gemini-3']);
+  assert.deepEqual(result, { route: 'gemini-3' });
 });

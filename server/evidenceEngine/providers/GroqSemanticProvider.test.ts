@@ -5,15 +5,21 @@ import {
   DEFAULT_GROQ_CANDIDATE_MODEL,
   GroqSemanticProvider,
   buildCitationRepairPrompt,
+  capGroqSemanticPrompt,
+  classifyGroqHttpError,
   configuredGroqRoutes,
   defaultClient,
+  estimateGroqTokens,
+  getGroqRouteHealth,
   groqCooldownRemainingMs,
   groqOrgCooldownRemainingMs,
+  groqOrgDisabledRemainingMs,
   groqOrgIdForSlot,
   groqRouteOrg,
   groqTimeoutMs,
   isDecisiveButUncited,
   resetGroqCooldownForTests,
+  resetGroqRouteHealthForTests,
   runGroqRouteFailover,
   shouldUseGroqSemantic,
 } from './GroqSemanticProvider';
@@ -1031,4 +1037,170 @@ test('an already-expired Groq caller is a TIMEOUT, not a cancellation', async ()
     { signal: AbortSignal.abort(deadline) },
   ), (error: any) => error instanceof ProviderCallError && error.errorClass === 'TIMEOUT');
   assert.equal(calls, 0);
+});
+
+test('organization-restricted 400 is route-scoped and fails over to another org', async () => {
+  const restricted = classifyGroqHttpError(400, '{"error":{"message":"organization_restricted","type":"invalid_request_error"}}');
+  assert.equal(restricted.errorClass, 'CREDENTIALS_EXHAUSTED');
+  assert.equal(restricted.retryable, false);
+  assert.equal(restricted.routeScoped, true);
+  assert.ok(restricted.providerReasons?.includes('GROQ_ORGANIZATION_RESTRICTED'));
+
+  const order: string[] = [];
+  const result = await runGroqRouteFailover(
+    [
+      { id: 'groq-1', key: 'k1', orgId: 'org-a' },
+      { id: 'groq-2', key: 'k2', orgId: 'org-b' },
+    ],
+    async route => {
+      order.push(route.id);
+      if (route.id === 'groq-1') throw restricted;
+      return { route: route.id };
+    },
+  );
+  assert.deepEqual(order, ['groq-1', 'groq-2']);
+  assert.deepEqual(result, { route: 'groq-2' });
+});
+
+test('same-org groq routes are not retried after a route-scoped credential failure', async () => {
+  const order: string[] = [];
+  const result = await runGroqRouteFailover(
+    [
+      { id: 'groq-1', key: 'k1', orgId: 'acme' },
+      { id: 'groq-2', key: 'k2', orgId: 'acme' },
+      { id: 'groq-3', key: 'k3', orgId: 'other' },
+    ],
+    async route => {
+      order.push(route.id);
+      if (route.id === 'groq-1') throw classifyGroqHttpError(401, '{"error":{"message":"invalid api key"}}');
+      return { route: route.id };
+    },
+  );
+  assert.deepEqual(order, ['groq-1', 'groq-3']);
+  assert.deepEqual(result, { route: 'groq-3' });
+});
+
+test('JSON-validation content failures cap route attempts instead of burning the pool', async () => {
+  let calls = 0;
+  await assert.rejects(runGroqRouteFailover(
+    [
+      { id: 'groq-1', key: 'k1', orgId: 'org-a' },
+      { id: 'groq-2', key: 'k2', orgId: 'org-b' },
+      { id: 'groq-3', key: 'k3', orgId: 'org-c' },
+      { id: 'groq-4', key: 'k4', orgId: 'org-d' },
+    ],
+    async () => {
+      calls++;
+      throw classifyGroqHttpError(400, '{"error":{"message":"json_validate_failed","failed_generation":"{"}}');
+    },
+    { maxContentFailures: 2 },
+  ), (error: any) => error instanceof ProviderCallError && error.errorClass === 'TRANSIENT');
+  assert.equal(calls, 2);
+});
+
+test('restricted groq org is quarantined and skipped on later calls', async () => {
+  resetGroqCooldownForTests();
+  resetGroqRouteHealthForTests();
+  const savedFetch = globalThis.fetch;
+  const saved: Record<string, string | undefined> = {};
+  for (const name of ['GROQ_API_KEY', 'GROQ_API_KEY_2', 'GROQ_ORG_ID', 'GROQ_ORG_ID_2']) {
+    saved[name] = process.env[name];
+    delete process.env[name];
+  }
+  const fetchedKeys: string[] = [];
+  globalThis.fetch = (async (_url: unknown, init: any) => {
+    const key = String(init?.headers?.Authorization || '');
+    fetchedKeys.push(key);
+    if (key.includes('restricted-key')) {
+      return new Response('{"error":{"message":"organization_restricted"}}', { status: 400, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ choices: [{ message: { content: '{"ok":true}' } }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as unknown as typeof fetch;
+  process.env.GROQ_API_KEY = 'restricted-key';
+  process.env.GROQ_API_KEY_2 = 'healthy-key';
+  process.env.GROQ_ORG_ID = 'org-restricted';
+  process.env.GROQ_ORG_ID_2 = 'org-healthy';
+  try {
+    const client = defaultClient(async () => undefined, { persistedCooldownExpiryMs: async () => undefined });
+    assert.deepEqual(await client!.classify('prompt', 'model'), { ok: true });
+    assert.equal(fetchedKeys.length, 2, 'first call discovers the restriction and fails over');
+    assert.ok(groqOrgDisabledRemainingMs('org-restricted') > 0, 'restricted org must be quarantined');
+    const health = getGroqRouteHealth();
+    assert.equal(health.find(route => route.route === 'groq-1')?.status, 'disabled');
+    assert.equal(health.find(route => route.route === 'groq-2')?.status, 'healthy');
+
+    assert.deepEqual(await client!.classify('prompt', 'model'), { ok: true });
+    assert.equal(fetchedKeys.length, 3, 'quarantined org must not be fetched again');
+    assert.ok(fetchedKeys[2].includes('healthy-key'));
+  } finally {
+    globalThis.fetch = savedFetch;
+    for (const name of Object.keys(saved)) {
+      if (saved[name] === undefined) delete process.env[name];
+      else process.env[name] = saved[name] as string;
+    }
+    resetGroqCooldownForTests();
+    resetGroqRouteHealthForTests();
+  }
+});
+
+test('all restricted groq routes surface a bounded pool-disabled failure', async () => {
+  resetGroqRouteHealthForTests();
+  const savedFetch = globalThis.fetch;
+  const saved: Record<string, string | undefined> = {};
+  for (const name of ['GROQ_API_KEY', 'GROQ_ORG_ID']) {
+    saved[name] = process.env[name];
+    delete process.env[name];
+  }
+  globalThis.fetch = (async () => new Response('{"error":{"message":"organization_restricted"}}', { status: 400 })) as unknown as typeof fetch;
+  process.env.GROQ_API_KEY = 'only-restricted-key';
+  process.env.GROQ_ORG_ID = 'only-restricted-org';
+  try {
+    const client = defaultClient(async () => undefined, { persistedCooldownExpiryMs: async () => undefined });
+    await assert.rejects(client!.classify('prompt', 'model'), (error: any) => error instanceof ProviderCallError
+      && error.errorClass === 'CREDENTIALS_EXHAUSTED'
+      && error.providerReasons?.includes('GROQ_ORGANIZATION_RESTRICTED'));
+    await assert.rejects(client!.classify('prompt', 'model'), (error: any) => error instanceof ProviderCallError
+      && error.providerReasons?.includes('GROQ_ROUTE_POOL_DISABLED')
+      && (error.retryAfterMs || 0) > 0);
+  } finally {
+    globalThis.fetch = savedFetch;
+    for (const name of Object.keys(saved)) {
+      if (saved[name] === undefined) delete process.env[name];
+      else process.env[name] = saved[name] as string;
+    }
+    resetGroqRouteHealthForTests();
+  }
+});
+
+test('groq prompt cap preserves every field reference and marks truncation', () => {
+  const prompt = JSON.stringify({
+    task: 'CANDIDATE',
+    promptVersion: 'v1',
+    documents: [
+      { ref: { field: 'channel_title' }, text: 'a'.repeat(5_000) },
+      { ref: { field: 'video_description', index: 2, sourceId: 'video-2' }, text: 'b'.repeat(5_000) },
+    ],
+  });
+  const capped = capGroqSemanticPrompt(prompt, 4_000);
+  assert.ok(capped.length <= 4_000, `expected <= 4000 chars, got ${capped.length}`);
+  const parsed = JSON.parse(capped);
+  assert.equal(parsed.contextTruncated, true);
+  assert.deepEqual(parsed.documents.map((document: any) => document.ref), [
+    { field: 'channel_title' },
+    { field: 'video_description', index: 2, sourceId: 'video-2' },
+  ]);
+  assert.equal(capGroqSemanticPrompt('{"documents":[]}', 4_000), '{"documents":[]}');
+});
+
+test('groq prompt cap enforces a script-aware token budget for CJK evidence', () => {
+  const documents = Array.from({ length: 8 }, (_, index) => ({
+    ref: { field: 'video_title', index },
+    text: '交易策略'.repeat(800),
+  }));
+  const prompt = JSON.stringify({ task: 'CANDIDATE', documents });
+  const capped = capGroqSemanticPrompt(prompt, 200_000, 6_000);
+  assert.ok(estimateGroqTokens(capped) <= 6_000, `expected <= 6000 tokens, got ${estimateGroqTokens(capped)}`);
+  const parsed = JSON.parse(capped);
+  assert.equal(parsed.contextTruncated, true);
+  assert.deepEqual(parsed.documents.map((document: any) => document.ref.index), [0, 1, 2, 3, 4, 5, 6, 7]);
 });
