@@ -15,6 +15,7 @@
     "queue:smoke": "tsx scripts/queueSmokeTest.ts",
     "youtube-key-cap:monitor": "tsx scripts/youtubeKeyCapStopMonitor.ts",
     "phase0:url-ledger-report": "tsx scripts/phase0UrlWorkLedgerReport.ts",
+    "phase0:zombie-dry-run": "tsx scripts/phase0ZombieReconciliationDryRun.ts",
     "phase3:baseline": "tsx scripts/phase3Baseline.ts",
     "admission:v2-poc": "tsx scripts/evaluateAdmissionV2Offline.ts",
     "phaseb:admission-v2-poc": "tsx scripts/phaseBAdmissionV2Poc.ts",
