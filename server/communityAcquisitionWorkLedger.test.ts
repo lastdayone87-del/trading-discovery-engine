@@ -496,7 +496,14 @@ test('retry ownership follows the effective production predicate', () => {
     outcome: 'FOUND',
     failureClass: 'REQUIRED_UNVISITED_BUDGET_GAP',
   });
-  assert.equal(projectCommunityAcquisitionWork([foundGap]).rows[0].retryOwned, true);
+  const foundGapProjection = projectCommunityAcquisitionWork([foundGap]);
+  assert.equal(foundGapProjection.rows[0].retryOwned, true);
+  assert.equal(
+    foundGapProjection.rows[0].state,
+    'PENDING',
+    'a FOUND gap that owns retry must stay claimable for bounded recovery',
+  );
+  assert.equal(foundGapProjection.rows[0].terminalReason, null);
 
   const staticGap = observation({
     outcome: 'PARTIALLY_INSPECTED',

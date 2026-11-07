@@ -466,7 +466,11 @@ export function resolveCommunityWorkState(
   maxAttempts: number,
 ): { state: CommunityWorkState; terminalReason: string | null } {
   const failureClass = failureClassOf(latest);
-  if (latest.outcome === 'FOUND') {
+  // A FOUND row is terminal only when nothing bounded remains to recover. A
+  // required FOUND carrying an outstanding gap class (multi-invite recall) is
+  // still retry work, so it must stay claimable instead of resolving and
+  // leaving the gap unscheduled behind PENDING/RUNNING-only claim indexes.
+  if (latest.outcome === 'FOUND' && !observationOwnsRetry(latest)) {
     return { state: 'RESOLVED', terminalReason: 'FOUND' };
   }
   if (latest.outcome === 'INSPECTED_NO_MATCH') {

@@ -221,6 +221,15 @@ maybe('the read-only report projects and reconciles a fixture backlog', async t 
         telemetry: { mode: 'RENDERED', pagesInspected: 2, requestsStarted: 2, requestsFinished: 2 },
       },
       {
+        key: `phase0-ledger-found-gap-${suffix}`,
+        url: 'https://found-gap.example/',
+        outcome: 'FOUND',
+        retryable: true,
+        failureClass: 'REQUIRED_UNVISITED_BUDGET_GAP',
+        required: true,
+        telemetry: { mode: 'STATIC', pagesInspected: 2, requestsStarted: 0, requestsFinished: 0 },
+      },
+      {
         key: `phase0-ledger-mixed-clean-${suffix}`,
         url: 'https://mixed-signal.example/',
         outcome: 'INSPECTED_NO_MATCH',
@@ -306,7 +315,7 @@ maybe('the read-only report projects and reconciles a fixture backlog', async t 
   assert.ok(report.rows, 'includeRows must return the projection rows');
 
   const rows = report.rows.filter(row => row.channelId === channelId);
-  assert.equal(rows.length, 9, 'optional observations never create a work row by themselves');
+  assert.equal(rows.length, 10, 'optional observations never create a work row by themselves');
   const byUrl = new Map(rows.map(row => [row.normalizedUrl, row]));
   assert.equal(byUrl.get('https://found.example/links')?.state, 'RESOLVED');
   assert.equal(byUrl.get('https://found.example/links')?.neverExecuted, false);
@@ -349,13 +358,21 @@ maybe('the read-only report projects and reconciles a fixture backlog', async t 
   assert.equal(byUrl.get('https://mixed-signal.example/')?.attempts, 2);
   assert.equal(byUrl.get('https://mixed-signal.example/')?.neverExecuted, false);
   assert.equal(byUrl.get('https://mixed-signal.example/')?.neverBrowserExecuted, false);
+  // A FOUND row with an outstanding bounded gap is still retry work, so it
+  // must stay PENDING and claimable instead of resolving the row.
+  assert.equal(byUrl.get('https://found-gap.example/')?.state, 'PENDING');
+  assert.equal(byUrl.get('https://found-gap.example/')?.lastOutcome, 'FOUND');
+  assert.equal(byUrl.get('https://found-gap.example/')?.retryOwned, true);
+  assert.equal(byUrl.get('https://found-gap.example/')?.attempts, 1);
+  assert.equal(byUrl.get('https://found-gap.example/')?.neverExecuted, false);
+  assert.equal(byUrl.get('https://found-gap.example/')?.neverBrowserExecuted, true);
   assert.equal(byUrl.get('https://oversized.example/')?.state, 'PENDING');
   assert.equal(byUrl.get('https://oversized.example/')?.neverExecuted, true);
   assert.equal(byUrl.get('https://oversized.example/')?.neverBrowserExecuted, true);
   assert.equal(byUrl.get('https://optional.example/'), undefined);
 
   // The SQL telemetry bound and the TypeScript projection must agree on the
-  // fixture rows: six effective retry owners, five never browser-executed.
+  // fixture rows: seven effective retry owners, six never browser-executed.
   // `recovered.example` has a retryable static failure plus a rendered success
   // in the same inspection, so it is not retry-owned but must count as
   // browser-executed. `mixed-signal.example` keeps its required browser
@@ -366,10 +383,10 @@ maybe('the read-only report projects and reconciles a fixture backlog', async t 
   const telemetryRetryableDelta = report.telemetry.retryableRows - baseline.telemetry.retryableRows;
   const telemetryNeverBrowserDelta = report.telemetry.neverBrowserExecutedRows
     - baseline.telemetry.neverBrowserExecutedRows;
-  assert.equal(retryableDelta, 6);
-  assert.equal(retryableNeverBrowserDelta, 5);
-  assert.equal(telemetryRetryableDelta, 6);
-  assert.equal(telemetryNeverBrowserDelta, 5);
+  assert.equal(retryableDelta, 7);
+  assert.equal(retryableNeverBrowserDelta, 6);
+  assert.equal(telemetryRetryableDelta, 7);
+  assert.equal(telemetryNeverBrowserDelta, 6);
 
   // The report must expose its own reconciliation, not just a recomputed copy.
   assert.equal(report.reconciliation.projectionRetryableRows, report.projection.retryableRows);
