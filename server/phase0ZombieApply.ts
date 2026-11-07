@@ -16,12 +16,14 @@
  *     reopened generation is not re-closed by Phase 0;
  *   * every closure writes append-only `closed_reason`, `closed_evidence`,
  *     `closed_by`, and `closed_at` in the same transaction;
- *   * the batch is bounded by both `maxScan` and `maxClosures`, and `offset`
- *     lets an operator advance past a window dominated by permanent skips;
+ *   * the batch is bounded by both `maxScan` and `maxClosures`; keyset cursors
+ *     advance past a window dominated by permanent skips without skipping
+ *     survivors when closures leave the window;
  *   * report-only mode (no `--apply`) issues no writes;
  *   * the closure UPDATE re-checks the ownership prefilter and active ledger
- *     state at statement time, so evidence committed after the evidence query
- *     still blocks the write;
+ *     state at statement time, excluding observations the batch classifier
+ *     already examined, so only evidence that appeared after the batch
+ *     snapshot can block the write;
  *   * the CLI runs the batch in one `READ COMMITTED` transaction. Full
  *     synchronization with evidence writers lands with Phase 1's atomic
  *     claim/lease/recovery; Phase 0 relies on the reviewed dry-run, the actor
@@ -47,10 +49,20 @@ export const PHASE0_ZOMBIE_APPLY_DEFAULT_MAX_SCAN = 500;
 export const PHASE0_ZOMBIE_APPLY_DEFAULT_MAX_CLOSURES = 100;
 export const PHASE0_ZOMBIE_APPLY_MAX_SCAN = 5_000;
 export const PHASE0_ZOMBIE_APPLY_MAX_CLOSURES = 500;
-export const PHASE0_ZOMBIE_APPLY_MAX_OFFSET = 1_000_000;
+export const PHASE0_ZOMBIE_APPLY_MAX_CURSOR_LENGTH = 256;
 export const PHASE0_ZOMBIE_APPLY_MAX_ACTOR_LENGTH = 200;
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
+const TIMESTAMP_KEY_PATTERN =
+  /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?Z$/;
+
+function isValidTimestampKey(value: string): boolean {
+  const match = TIMESTAMP_KEY_PATTERN.exec(value);
+  if (!match) return false;
+  const millis = (match[2] || '').padEnd(3, '0').slice(0, 3);
+  return Number.isFinite(Date.parse(`${match[1]}.${millis}Z`));
+}
 
 export interface Phase0ZombieApplyOptions {
   /** When false (the default), classify and report without writing. */
@@ -61,8 +73,8 @@ export interface Phase0ZombieApplyOptions {
   maxScan?: number;
   /** Bound on applied closures from one scan. */
   maxClosures?: number;
-  /** Advance the bounded candidate window past permanent skips. */
-  offset?: number;
+  /** Opaque keyset cursor from a previous report: resume after that row. */
+  cursor?: string | null;
   /** Optional explicit job ids (operator audit batch or test isolation). */
   jobIds?: readonly string[];
   includeRows?: boolean;
@@ -90,7 +102,19 @@ export interface Phase0ZombieApplyReport {
   schema: { ledgerTablePresent: boolean; closureColumnsPresent: boolean };
   population: { pendingRetries: number; processingRetries: number; scannable: number };
   ledger: { rows: number };
-  scan: { locked: number; offset: number; nextOffset: number | null };
+  scan: {
+    /** Rows returned by the keyset window before locking. */
+    window: number;
+    locked: number;
+    /** Input cursor, if this run resumed a prior page. */
+    cursor: string | null;
+    /**
+     * Cursor for the next batch. It never advances past a row this run did not
+     * classify, and it repeats the current page when `maxClosures` left
+     * proposals unapplied.
+     */
+    nextCursor: string | null;
+  };
   summary: {
     examined: number;
     proposedClosures: number;
@@ -105,12 +129,14 @@ export interface Phase0ZombieApplyReport {
   warnings: string[];
 }
 
+export type Phase0ZombieApplyTransaction = 'COMMITTED' | 'ROLLED_BACK';
+
 export interface Phase0ZombieApplyArgs {
   apply: boolean;
   actor: string | null;
   maxScan: number;
   maxClosures: number;
-  offset: number;
+  cursor: string | null;
   includeRows: boolean;
   check: boolean;
   out: string | null;
@@ -119,7 +145,74 @@ export interface Phase0ZombieApplyArgs {
 
 export const PHASE0_ZOMBIE_APPLY_USAGE =
   'Usage: npx tsx scripts/phase0ZombieApply.ts --apply --actor=<operator> '
-  + '[--max-scan=500] [--max-closures=100] [--offset=0] [--include-rows] [--check] [--out=path]';
+  + '[--max-scan=500] [--max-closures=100] [--cursor=<token>] [--include-rows] [--check] [--out=path]';
+
+/** Immutable ordering key for the apply's keyset paging. */
+export interface Phase0ZombieApplyCursor {
+  at: string | null;
+  id: string;
+}
+
+/**
+ * Encode the last classified row as an opaque cursor. The queue clock is
+ * nullable for historical rows, so `at: null` is a valid key inside the
+ * NULLS FIRST band.
+ *
+ * The key preserves PostgreSQL's microsecond precision: `Date.toISOString()`
+ * truncates to milliseconds, which can make a cursor re-include its own row
+ * forever when `maxScan` is 1. The SQL returns `first_enqueued_at_key` in an
+ * explicit UTC ISO form for that reason. The key is immutable, which is what
+ * makes resuming safe even when closures remove earlier rows from the window.
+ */
+export function encodePhase0ZombieApplyCursor(row: {
+  job_id?: unknown;
+  first_enqueued_at?: unknown;
+  first_enqueued_at_key?: unknown;
+}): string | null {
+  const id = String(row.job_id || '').trim();
+  if (!UUID_PATTERN.test(id)) return null;
+  let at: string | null = null;
+  const rawKey = row.first_enqueued_at_key;
+  if (typeof rawKey === 'string' && isValidTimestampKey(rawKey.trim())) {
+    at = rawKey.trim();
+  } else {
+    const rawAt = row.first_enqueued_at;
+    if (rawAt instanceof Date) {
+      if (Number.isFinite(rawAt.getTime())) at = rawAt.toISOString();
+    } else if (typeof rawAt === 'string' && isValidTimestampKey(rawAt.trim())) {
+      at = rawAt.trim();
+    }
+  }
+  return Buffer.from(JSON.stringify({ v: 1, at, id }), 'utf8').toString('base64url');
+}
+
+/** Strict cursor parsing: malformed input must fail before any query runs. */
+export function parsePhase0ZombieApplyCursor(raw: unknown): Phase0ZombieApplyCursor {
+  const token = String(raw ?? '').trim();
+  if (!token
+      || token.length > PHASE0_ZOMBIE_APPLY_MAX_CURSOR_LENGTH
+      || !BASE64URL_PATTERN.test(token)) {
+    throw new Error('--cursor is invalid');
+  }
+  let decoded: any;
+  try {
+    decoded = JSON.parse(Buffer.from(token, 'base64url').toString('utf8'));
+  } catch {
+    throw new Error('--cursor is invalid');
+  }
+  if (!decoded || typeof decoded !== 'object' || decoded.v !== 1) {
+    throw new Error('--cursor is invalid');
+  }
+  const id = typeof decoded.id === 'string' ? decoded.id : '';
+  if (!UUID_PATTERN.test(id)) throw new Error('--cursor is invalid');
+  const at = decoded.at === null
+    ? null
+    : (typeof decoded.at === 'string' ? decoded.at : undefined);
+  if (at === undefined || (at !== null && !isValidTimestampKey(at))) {
+    throw new Error('--cursor is invalid');
+  }
+  return { at, id };
+}
 
 /** Shared actor validation: trimmed, bounded, and free of control characters. */
 export function normalizeZombieApplyActor(raw: unknown): string {
@@ -174,7 +267,7 @@ export function parsePhase0ZombieApplyArgs(
     actor: null,
     maxScan: PHASE0_ZOMBIE_APPLY_DEFAULT_MAX_SCAN,
     maxClosures: PHASE0_ZOMBIE_APPLY_DEFAULT_MAX_CLOSURES,
-    offset: 0,
+    cursor: null,
     includeRows: false,
     check: false,
     out: null,
@@ -201,13 +294,10 @@ export function parsePhase0ZombieApplyArgs(
         1,
         PHASE0_ZOMBIE_APPLY_MAX_CLOSURES,
       );
-    } else if (raw.startsWith('--offset=')) {
-      args.offset = parseBoundedInteger(
-        raw.slice('--offset='.length),
-        '--offset',
-        0,
-        PHASE0_ZOMBIE_APPLY_MAX_OFFSET,
-      );
+    } else if (raw.startsWith('--cursor=')) {
+      const token = raw.slice('--cursor='.length);
+      parsePhase0ZombieApplyCursor(token);
+      args.cursor = token;
     } else if (raw.startsWith('--out=')) {
       const out = raw.slice('--out='.length);
       if (!out.trim()) throw new Error('--out must name a non-empty file path');
@@ -281,6 +371,29 @@ export function phase0ZombieApplyCheckFailures(report: Phase0ZombieApplyReport):
   return failures;
 }
 
+/**
+ * Finalize the report against the transaction outcome. A rolled-back batch
+ * wrote nothing, so its audit artifact must not claim that closures, actors,
+ * or closure timestamps persisted. `proposedClosures` keeps the plan size.
+ */
+export function finalizePhase0ZombieApplyReport(
+  report: Phase0ZombieApplyReport,
+  transaction: Phase0ZombieApplyTransaction,
+): Phase0ZombieApplyReport & { transaction: Phase0ZombieApplyTransaction } {
+  if (transaction === 'COMMITTED') return { ...report, transaction };
+  return {
+    ...report,
+    summary: { ...report.summary, appliedClosures: 0 },
+    closures: report.closures.map(closure => ({
+      ...closure,
+      applied: false,
+      closedAt: null,
+      actor: null,
+    })),
+    transaction,
+  };
+}
+
 function zombieApplyPopulationSql(restricted: boolean): string {
   return `
     SELECT count(*) FILTER (WHERE status='PENDING')::int AS pending_retries,
@@ -317,9 +430,15 @@ export async function runPhase0ZombieApply(
     1,
     PHASE0_ZOMBIE_APPLY_MAX_CLOSURES,
   );
-  const offset = boundedInteger(options.offset, 0, 0, PHASE0_ZOMBIE_APPLY_MAX_OFFSET);
   const jobIds = normalizeJobIds(options.jobIds);
   const restricted = jobIds !== null;
+  const cursorToken = options.cursor === null || options.cursor === undefined
+    ? null
+    : String(options.cursor).trim();
+  if (restricted && cursorToken) {
+    throw new Error('--cursor cannot be combined with an explicit jobIds batch');
+  }
+  const cursor = cursorToken ? parsePhase0ZombieApplyCursor(cursorToken) : null;
   const includeRows = options.includeRows === true;
   const now = options.now ?? (() => new Date());
   const generatedAt = now().toISOString();
@@ -353,21 +472,51 @@ export async function runPhase0ZombieApply(
   );
   const ledgerRows = Number(ledgerResult.rows[0]?.rows || 0);
 
-  const candidates = await db.query(
+  // Page first, then lock exactly that page. `OFFSET` is deliberately absent:
+  // closures leave the candidate window, so a row-count offset would skip
+  // survivors on the next batch. Fetching one extra row tells us whether a
+  // later page exists without a second population query.
+  const candidateWindow = await db.query(
     zombieCandidateJobIdsSql({
       statuses: ['PENDING'],
       excludeClosed: true,
-      lock: true,
       restricted,
-      paged: true,
+      after: cursor !== null,
+      includeKey: true,
     }),
-    restricted ? [maxScan, jobIds, offset] : [maxScan, offset],
+    restricted
+      ? [maxScan + 1, jobIds]
+      : cursor
+        ? [maxScan + 1, cursor.at, cursor.id]
+        : [maxScan + 1],
   );
-  const lockedIds = candidates.rows
-    .map(row => String(row.job_id || ''))
-    .filter(Boolean);
+  const candidateRows = candidateWindow.rows.filter(row => String(row.job_id || ''));
+  const hasMore = candidateRows.length > maxScan;
+  const window = candidateRows.slice(0, maxScan);
+  const windowIds = window.map(row => String(row.job_id));
+
+  let lockedIds: string[] = [];
+  if (windowIds.length > 0) {
+    const locked = await db.query(
+      zombieCandidateJobIdsSql({
+        statuses: ['PENDING'],
+        excludeClosed: true,
+        restricted: true,
+        lock: true,
+      }),
+      [windowIds.length, windowIds],
+    );
+    const lockedSet = new Set(
+      locked.rows.map(row => String(row.job_id || '')).filter(Boolean),
+    );
+    // Preserve the immutable queue order for cursor bookkeeping.
+    lockedIds = windowIds.filter(id => lockedSet.has(id));
+  }
+  const lockedSet = new Set(lockedIds);
+  const unexaminedIds = windowIds.filter(id => !lockedSet.has(id));
 
   let rows: Phase0ZombieReconciliationRow[] = [];
+  const knownObservationIdsByJob = new Map<string, string[]>();
   if (lockedIds.length > 0) {
     const evidence = await db.query(
       zombieEvidenceSqlForJobIds(true),
@@ -377,6 +526,14 @@ export async function runPhase0ZombieApply(
       zombieNewerObservationSqlByJobIds(),
       [lockedIds, ZOMBIE_COMMUNITY_SURFACES],
     );
+    for (const observation of newerObservations.rows) {
+      const jobId = String(observation.job_id || '');
+      const observationId = String(observation.id || '');
+      if (!jobId || !observationId) continue;
+      const ids = knownObservationIdsByJob.get(jobId) || [];
+      ids.push(observationId);
+      knownObservationIdsByJob.set(jobId, ids);
+    }
     rows = buildZombieReconciliationRows(evidence.rows, newerObservations.rows);
   }
 
@@ -385,6 +542,7 @@ export async function runPhase0ZombieApply(
   const selected = proposals.slice(0, maxClosures);
   const warnings: string[] = [];
   const closures: Phase0ZombieApplyClosure[] = [];
+  const updateSkippedIds: string[] = [];
 
   if (!apply) {
     for (const row of selected) {
@@ -416,7 +574,7 @@ export async function runPhase0ZombieApply(
           WHERE id=$1
             AND status='PENDING'
             AND closed_at IS NULL
-            AND ${zombieClosureEvidenceGuardSql('$6')}
+            AND ${zombieClosureEvidenceGuardSql('$6', '$7')}
           RETURNING id`,
         [
           row.jobId,
@@ -425,10 +583,12 @@ export async function runPhase0ZombieApply(
           actor,
           closedAt,
           ZOMBIE_COMMUNITY_SURFACES,
+          knownObservationIdsByJob.get(row.jobId) || [],
         ],
       );
       if (!updated.rows || updated.rows.length === 0) {
         warnings.push(`closure_update_skipped:${row.jobId}`);
+        updateSkippedIds.push(row.jobId);
         continue;
       }
       closures.push({
@@ -458,15 +618,36 @@ export async function runPhase0ZombieApply(
   if (ledgerRows === 0) {
     warnings.push('phase0_ledger_empty_channel_evidence_only');
   }
-  if (proposals.length > selected.length) {
+  const closureLimitReached = proposals.length > selected.length;
+  if (closureLimitReached) {
     warnings.push('closure_limit_reached');
   }
-  const remainingAfterScan = Math.max(0, scannable - offset - lockedIds.length);
-  const scanLimitReached = !restricted
-    && lockedIds.length === maxScan
-    && remainingAfterScan > 0;
+  const scanLimitReached = !restricted && hasMore;
   if (scanLimitReached) {
     warnings.push('scan_limit_reached');
+  }
+  if (unexaminedIds.length > 0) {
+    warnings.push('candidate_rows_locked_by_workers');
+  }
+
+  // A cursor may only advance past rows this run actually classified. If a
+  // worker locked a window row or the statement-time guard skipped an update,
+  // resume at the row before the earliest such problem. If `maxClosures`
+  // truncated the proposals, repeat the current page (or start over when
+  // there was no cursor), because those proposals remain pending.
+  const problemIds = new Set([...unexaminedIds, ...updateSkippedIds]);
+  const firstProblemIndex = windowIds.findIndex(id => problemIds.has(id));
+  let nextCursor: string | null;
+  if (firstProblemIndex === 0) {
+    nextCursor = cursorToken;
+  } else if (firstProblemIndex > 0) {
+    nextCursor = encodePhase0ZombieApplyCursor(window[firstProblemIndex - 1]);
+  } else if (closureLimitReached) {
+    nextCursor = cursorToken;
+  } else if (scanLimitReached) {
+    nextCursor = encodePhase0ZombieApplyCursor(window[window.length - 1]);
+  } else {
+    nextCursor = null;
   }
 
   const byReason: Record<string, number> = {};
@@ -487,16 +668,17 @@ export async function runPhase0ZombieApply(
     },
     ledger: { rows: ledgerRows },
     scan: {
+      window: windowIds.length,
       locked: lockedIds.length,
-      offset,
-      nextOffset: scanLimitReached ? offset + lockedIds.length : null,
+      cursor: cursorToken,
+      nextCursor,
     },
     summary: {
       examined: rows.length,
       proposedClosures: proposals.length,
       appliedClosures: closures.filter(closure => closure.applied).length,
       skipped: skippedRows.length,
-      closureLimitReached: proposals.length > selected.length,
+      closureLimitReached,
       scanLimitReached,
       byReason,
     },

@@ -24,6 +24,7 @@
 import { writeFileSync } from 'node:fs';
 import { createOperatorWriteDbPool } from '../server/db';
 import {
+  finalizePhase0ZombieApplyReport,
   parsePhase0ZombieApplyArgs,
   phase0ZombieApplyCheckFailures,
   PHASE0_ZOMBIE_APPLY_USAGE,
@@ -55,23 +56,26 @@ async function main(): Promise<void> {
         actor: args.actor,
         maxScan: args.maxScan,
         maxClosures: args.maxClosures,
-        offset: args.offset,
+        cursor: args.cursor,
         includeRows: args.includeRows,
       });
 
       // Evaluate the gate before committing: a failed check must not leave a
       // partial batch persisted while the process exits non-zero.
       const failures = args.check ? phase0ZombieApplyCheckFailures(report) : [];
-      if (args.apply && failures.length === 0) {
+      const committed = args.apply && failures.length === 0;
+      if (committed) {
         await client.query('COMMIT');
       } else {
         await client.query('ROLLBACK');
       }
 
-      const output = {
-        ...report,
-        transaction: args.apply && failures.length === 0 ? 'COMMITTED' : 'ROLLED_BACK',
-      };
+      // A rolled-back batch wrote nothing: do not let the audit artifact claim
+      // persisted closures, actors, or closure timestamps.
+      const output = finalizePhase0ZombieApplyReport(
+        report,
+        committed ? 'COMMITTED' : 'ROLLED_BACK',
+      );
       const json = JSON.stringify(output, null, 2);
       // Print the committed closure list before touching the optional output
       // file: a disk error must not hide what the database already accepted.

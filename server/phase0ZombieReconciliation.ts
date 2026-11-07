@@ -269,8 +269,10 @@ export interface ZombieCandidateSqlOptions {
   lock?: boolean;
   /** Restrict to explicit job ids in `$2`. */
   restricted?: boolean;
-  /** Page the candidate window with `OFFSET` (`$2`, or `$3` when restricted). */
-  paged?: boolean;
+  /** Resume strictly after the immutable `(first_enqueued_at, id)` cursor. */
+  after?: boolean;
+  /** Include the queue clock and a microsecond-precision cursor key. */
+  includeKey?: boolean;
 }
 
 /**
@@ -280,24 +282,53 @@ export interface ZombieCandidateSqlOptions {
  * dry-run, so the two paths cannot drift. Ordering is the immutable queue
  * clock, never age-of-lease.
  *
+ * Paging is a keyset cursor on that ordering key, never a row-count `OFFSET`:
+ * closures leave the candidate window, so an offset computed before a batch
+ * would skip surviving candidates on the next page. `NULL` queue clocks sort
+ * first, and the cursor comparison preserves that ordering.
+ *
  * A closed epoch is excluded when closure columns exist: the closure record is
  * append-only and a later reopen is a new generation, so Phase 0 never rewrites
- * earlier evidence. `paged` lets an operator advance past a window that is
- * dominated by permanent skips.
+ * earlier evidence.
  */
 export function zombieCandidateJobIdsSql(options: ZombieCandidateSqlOptions = {}): string {
   const statuses = options.statuses ?? ['PENDING', 'PROCESSING'];
-  const offsetParam = options.restricted ? '$3' : '$2';
+  const predicates = [
+    `j.type='${ZOMBIE_RETRY_JOB_TYPE}'`,
+    `j.status IN (${statuses.map(status => `'${status}'`).join(',')})`,
+  ];
+  let nextParam = 2;
+  if (options.excludeClosed) predicates.push('j.closed_at IS NULL');
+  if (options.restricted) {
+    predicates.push(`j.id = ANY($${nextParam++}::uuid[])`);
+  }
+  if (options.after) {
+    const atParam = `$${nextParam++}`;
+    const idParam = `$${nextParam++}`;
+    predicates.push(`(
+      CASE
+        WHEN ${atParam}::timestamptz IS NULL THEN
+          j.first_enqueued_at IS NOT NULL
+          OR (j.first_enqueued_at IS NULL AND j.id > ${idParam}::uuid)
+        ELSE
+          j.first_enqueued_at > ${atParam}::timestamptz
+          OR (j.first_enqueued_at = ${atParam}::timestamptz AND j.id > ${idParam}::uuid)
+      END
+    )`);
+  }
   return `
-    SELECT j.id AS job_id
+    SELECT j.id AS job_id${options.includeKey
+      ? `,
+           j.first_enqueued_at AS first_enqueued_at,
+           to_char(
+             j.first_enqueued_at AT TIME ZONE 'UTC',
+             'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+           ) AS first_enqueued_at_key`
+      : ''}
       FROM jobs j
-     WHERE j.type='${ZOMBIE_RETRY_JOB_TYPE}'
-       AND j.status IN (${statuses.map(status => `'${status}'`).join(',')})
-       ${options.excludeClosed ? 'AND j.closed_at IS NULL' : ''}
-       ${options.restricted ? 'AND j.id = ANY($2::uuid[])' : ''}
+     WHERE ${predicates.join('\n       AND ')}
      ORDER BY j.first_enqueued_at ASC NULLS FIRST, j.id ASC
      LIMIT $1
-     ${options.paged ? `OFFSET ${offsetParam}` : ''}
      ${options.lock ? 'FOR UPDATE SKIP LOCKED' : ''}
   `;
 }
@@ -364,10 +395,24 @@ function zombieObservationOwnershipPrefilterSql(args: {
  * Statement-time closure guard for the apply UPDATE. It re-checks the same
  * coarse ownership prefilter under the UPDATE's own snapshot, so evidence
  * committed after the evidence query but before the write still blocks the
- * closure. Full synchronization with evidence writers is a Phase 1 concern
- * (atomic claim/lease/recovery); this guard removes the avoidable window.
+ * closure.
+ *
+ * Observations already returned by the batch evidence query are excluded by
+ * id: `observationOwnsRetry` has already decided whether they own a retry, and
+ * encoding that rule a second time in SQL would drift (for example, a
+ * `DEMOTE` or auxiliary row must not block a valid closure). The guard
+ * therefore blocks only coarse-owning evidence that appeared after the batch
+ * snapshot. A brand-new non-owning row can conservatively block one attempt;
+ * the next reviewed run classifies it and proceeds.
+ *
+ * Full synchronization with evidence writers is a Phase 1 concern (atomic
+ * claim/lease/recovery); this guard removes the avoidable window without
+ * duplicating the ownership policy.
  */
-export function zombieClosureEvidenceGuardSql(surfacesParam: string): string {
+export function zombieClosureEvidenceGuardSql(
+  surfacesParam: string,
+  knownObservationIdsParam: string,
+): string {
   return `
     NOT EXISTS (
       SELECT 1
@@ -378,6 +423,7 @@ export function zombieClosureEvidenceGuardSql(surfacesParam: string): string {
          retryObservedAtExpression: "jobs.payload->>'retryObservedAt'",
          surfacesParam,
        })}
+         AND o.id <> ALL(${knownObservationIdsParam}::uuid[])
     )
     AND NOT EXISTS (
       SELECT 1
@@ -596,14 +642,26 @@ export async function buildPhase0ZombieReconciliationReport(
             count(*) FILTER (
               WHERE status='PENDING'
               ${closureColumnsPresent ? 'AND closed_at IS NULL' : ''}
-            )::int AS scannable
+            )::int AS scannable_pending,
+            count(*) FILTER (
+              WHERE status='PROCESSING'
+              ${closureColumnsPresent ? 'AND closed_at IS NULL' : ''}
+            )::int AS scannable_processing
        FROM jobs
       WHERE type='${ZOMBIE_RETRY_JOB_TYPE}'
         AND status IN ('PENDING','PROCESSING')`,
   );
   const pendingRetries = Number(populationResult.rows[0]?.pending_retries || 0);
   const processingRetries = Number(populationResult.rows[0]?.processing_retries || 0);
-  const scannable = Number(populationResult.rows[0]?.scannable ?? pendingRetries);
+  // Candidate eligibility, not raw status counts: a previously closed epoch
+  // can reopen into PENDING or PROCESSING but is deliberately excluded from
+  // this Phase 0 window, so counting it again would make a complete report
+  // look truncated forever.
+  const scannable = Number(
+    populationResult.rows[0]?.scannable_pending ?? pendingRetries,
+  ) + Number(
+    populationResult.rows[0]?.scannable_processing ?? processingRetries,
+  );
 
   const ledgerResult = ledgerTablePresent
     ? await db.query(`SELECT count(*)::int AS rows FROM community_acquisition_url_state`)
@@ -645,7 +703,7 @@ export async function buildPhase0ZombieReconciliationReport(
   if (!closureColumnsPresent) {
     warnings.push('closure_columns_missing_historical_epochs_not_filtered');
   }
-  if (rows.length < scannable + processingRetries) {
+  if (rows.length < scannable) {
     warnings.push('candidate_limit_reached');
   }
 

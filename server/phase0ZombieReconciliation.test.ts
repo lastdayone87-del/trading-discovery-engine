@@ -6,6 +6,8 @@ import {
   classifyZombieRetryClosure,
   parsePhase0ZombieReconciliationArgs,
   phase0ZombieReconciliationCheckFailures,
+  zombieCandidateJobIdsSql,
+  zombieClosureEvidenceGuardSql,
   type ZombieRetryEvidence,
 } from './phase0ZombieReconciliation';
 
@@ -203,15 +205,16 @@ function fakeDb(candidateRows: any[], options: {
         };
       }
       if (text.includes('pending_retries')) {
+        const pending = options.pendingRetries ?? candidateRows
+          .filter(row => row.job_status === 'PENDING').length;
+        const processing = options.processingRetries ?? candidateRows
+          .filter(row => row.job_status === 'PROCESSING').length;
         return {
           rows: [{
-            pending_retries: options.pendingRetries ?? candidateRows
-              .filter(row => row.job_status === 'PENDING').length,
-            processing_retries: options.processingRetries ?? candidateRows
-              .filter(row => row.job_status === 'PROCESSING').length,
-            scannable: options.scannable
-              ?? options.pendingRetries
-              ?? candidateRows.filter(row => row.job_status === 'PENDING').length,
+            pending_retries: pending,
+            processing_retries: processing,
+            scannable_pending: options.scannable ?? pending,
+            scannable_processing: options.scannable !== undefined ? 0 : processing,
           }],
         };
       }
@@ -301,7 +304,7 @@ test('the dry-run report partitions every examined job into proposals or skips',
   assert.match(candidateSql, /LIMIT \$1/);
   assert.match(candidateSql, /closed_at IS NULL/);
   assert.equal(report.schema.closureColumnsPresent, true);
-  assert.equal(report.population.scannable, 8);
+  assert.equal(report.population.scannable, 9);
   assert.doesNotMatch(candidateSql, /\b(?:INSERT|UPDATE|DELETE|TRUNCATE)\b/i);
 
   const evidenceSql = sql.find(text => text.includes('WITH candidate_channels AS'));
@@ -346,6 +349,55 @@ test('the dry-run filters closed epochs only when closure columns exist', async 
     && !text.includes('external_acquisition_observations'));
   assert.ok(absentCandidate);
   assert.doesNotMatch(absentCandidate, /closed_at IS NULL/);
+});
+
+test('a closed reopened processing row does not make a complete report look truncated', async () => {
+  const { db } = fakeDb([fixtureRow()], {
+    pendingRetries: 1,
+    processingRetries: 1,
+    // The processing retry reopened from a closed epoch, so the candidate
+    // window cannot see it. It must not count toward the completeness bound.
+    scannable: 1,
+  });
+  const report = await buildPhase0ZombieReconciliationReport(db);
+  assert.equal(report.population.examined, 1);
+  assert.equal(report.population.scannable, 1);
+  assert.equal(report.warnings.includes('candidate_limit_reached'), false);
+  assert.deepEqual(phase0ZombieReconciliationCheckFailures(report), []);
+});
+
+test('candidate paging is a keyset and the write guard excludes known evidence', () => {
+  const base = zombieCandidateJobIdsSql({ excludeClosed: true });
+  assert.match(base, /ORDER BY j\.first_enqueued_at ASC NULLS FIRST, j\.id ASC/);
+  assert.doesNotMatch(base, /OFFSET/);
+  assert.doesNotMatch(base, /CASE/);
+
+  const page = zombieCandidateJobIdsSql({
+    excludeClosed: true,
+    after: true,
+    includeKey: true,
+  });
+  assert.match(page, /j\.first_enqueued_at AS first_enqueued_at/);
+  assert.match(page, /to_char\(\s*j\.first_enqueued_at AT TIME ZONE 'UTC',\s*'YYYY-MM-DD"T"HH24:MI:SS\.US"Z"'\s*\) AS first_enqueued_at_key/);
+  assert.match(page, /WHEN \$2::timestamptz IS NULL THEN/);
+  assert.match(page, /j\.id > \$3::uuid/);
+  assert.match(page, /j\.first_enqueued_at = \$2::timestamptz AND j\.id > \$3::uuid/);
+  assert.doesNotMatch(page, /OFFSET/);
+
+  const lockedPage = zombieCandidateJobIdsSql({
+    excludeClosed: true,
+    restricted: true,
+    lock: true,
+  });
+  assert.match(lockedPage, /j\.id = ANY\(\$2::uuid\[\]\)/);
+  assert.match(lockedPage, /FOR UPDATE SKIP LOCKED/);
+  assert.doesNotMatch(lockedPage, /OFFSET/);
+
+  const guard = zombieClosureEvidenceGuardSql('$6', '$7');
+  assert.match(guard, /o\.id <> ALL\(\$7::uuid\[\]\)/);
+  assert.match(guard, /NOT EXISTS \(\s*SELECT 1\s+FROM external_acquisition_observations/);
+  assert.match(guard, /NOT EXISTS \(\s*SELECT 1\s+FROM community_acquisition_url_state/);
+  assert.match(guard, /pg_input_is_valid/);
 });
 
 test('newer observations are classified by shared retry ownership, not raw flags', async () => {

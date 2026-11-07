@@ -6,7 +6,10 @@ import {
   PHASE0_ZOMBIE_APPLY_DEFAULT_MAX_CLOSURES,
   PHASE0_ZOMBIE_APPLY_DEFAULT_MAX_SCAN,
   buildZombieClosureEvidence,
+  encodePhase0ZombieApplyCursor,
+  finalizePhase0ZombieApplyReport,
   parsePhase0ZombieApplyArgs,
+  parsePhase0ZombieApplyCursor,
   phase0ZombieApplyCheckFailures,
   runPhase0ZombieApply,
   type Phase0ZombieApplyReport,
@@ -19,7 +22,7 @@ test('apply arguments default to report-only with the documented bounds', () => 
     actor: null,
     maxScan: PHASE0_ZOMBIE_APPLY_DEFAULT_MAX_SCAN,
     maxClosures: PHASE0_ZOMBIE_APPLY_DEFAULT_MAX_CLOSURES,
-    offset: 0,
+    cursor: null,
     includeRows: false,
     check: false,
     out: null,
@@ -48,19 +51,67 @@ test('apply bounds and actor inputs are validated', () => {
     ['--max-closures=0'],
     ['--max-closures=501'],
     ['--max-closures=1.5'],
-    ['--offset=-1'],
-    ['--offset=1000001'],
-    ['--offset=abc'],
+    ['--cursor='],
+    ['--cursor=not-a-cursor'],
     ['--out='],
   ]) {
-    assert.throws(() => parsePhase0ZombieApplyArgs(argv), /max-scan|max-closures|offset|out/);
+    assert.throws(() => parsePhase0ZombieApplyArgs(argv), /max-scan|max-closures|cursor|out/);
   }
   for (const actor of ['x'.repeat(201), 'operator\nname', 'operator\u0000']) {
     assert.throws(() => parsePhase0ZombieApplyArgs([`--actor=${actor}`]), /--actor/);
   }
   assert.equal(parsePhase0ZombieApplyArgs(['--max-scan=42', '--max-closures=7']).maxScan, 42);
   assert.equal(parsePhase0ZombieApplyArgs(['--max-closures=7']).maxClosures, 7);
-  assert.equal(parsePhase0ZombieApplyArgs(['--offset=42']).offset, 42);
+});
+
+test('the keyset cursor round-trips both nullable and populated queue clocks', () => {
+  const populated = {
+    job_id: randomUUID(),
+    first_enqueued_at: '2026-10-01T00:00:00.000Z',
+  };
+  const populatedToken = encodePhase0ZombieApplyCursor(populated);
+  assert.ok(populatedToken);
+  assert.deepEqual(parsePhase0ZombieApplyCursor(populatedToken), {
+    at: '2026-10-01T00:00:00.000Z',
+    id: populated.job_id,
+  });
+  assert.equal(parsePhase0ZombieApplyArgs([`--cursor=${populatedToken}`]).cursor, populatedToken);
+
+  const legacy = { job_id: randomUUID(), first_enqueued_at: null };
+  const legacyToken = encodePhase0ZombieApplyCursor(legacy);
+  assert.ok(legacyToken);
+  assert.deepEqual(parsePhase0ZombieApplyCursor(legacyToken), {
+    at: null,
+    id: legacy.job_id,
+  });
+
+  const dateRow = { job_id: randomUUID(), first_enqueued_at: new Date('2026-10-02T00:00:00Z') };
+  assert.deepEqual(
+    parsePhase0ZombieApplyCursor(encodePhase0ZombieApplyCursor(dateRow)),
+    { at: '2026-10-02T00:00:00.000Z', id: dateRow.job_id },
+  );
+
+  // PostgreSQL stores microseconds; the SQL-provided key must survive intact.
+  const precise = {
+    job_id: randomUUID(),
+    first_enqueued_at: new Date('2026-10-01T00:00:00.123Z'),
+    first_enqueued_at_key: '2026-10-01T00:00:00.123456Z',
+  };
+  const preciseToken = encodePhase0ZombieApplyCursor(precise);
+  assert.deepEqual(parsePhase0ZombieApplyCursor(preciseToken), {
+    at: '2026-10-01T00:00:00.123456Z',
+    id: precise.job_id,
+  });
+
+  for (const token of [
+    'not-a-cursor',
+    Buffer.from(JSON.stringify({ v: 2, at: null, id: randomUUID() })).toString('base64url'),
+    Buffer.from(JSON.stringify({ v: 1, at: null, id: 'bad' })).toString('base64url'),
+    Buffer.from(JSON.stringify({ v: 1, at: 'not-a-date', id: randomUUID() })).toString('base64url'),
+    'x'.repeat(300),
+  ]) {
+    assert.throws(() => parsePhase0ZombieApplyCursor(token), /--cursor is invalid/);
+  }
 });
 
 function evidenceRow(overrides: Record<string, unknown> = {}) {
@@ -104,6 +155,7 @@ function fakeApplyDb(config: {
   scannable?: number;
   ledgerRows?: number;
   candidateIds: string[];
+  windowRows?: Array<{ job_id: string; first_enqueued_at?: string | null }>;
   evidenceRows: any[];
   newerObservations?: any[];
   updateSucceeds?: (jobId: string) => boolean;
@@ -112,6 +164,11 @@ function fakeApplyDb(config: {
   const params: unknown[][] = [];
   const jobUpdates: Array<{ jobId: string; values: unknown[] }> = [];
   const attemptUpdates: unknown[][] = [];
+  const windowRows = config.windowRows
+    ?? config.candidateIds.map(jobId => ({
+      job_id: jobId,
+      first_enqueued_at: '2026-10-01T00:00:00.000Z',
+    }));
   const db = {
     async query(text: string, values: unknown[] = []) {
       sql.push(text);
@@ -135,6 +192,9 @@ function fakeApplyDb(config: {
       }
       if (text.includes('count(*)::int AS rows')) {
         return { rows: [{ rows: config.ledgerRows ?? 0 }] };
+      }
+      if (text.includes('first_enqueued_at AS first_enqueued_at')) {
+        return { rows: windowRows };
       }
       if (text.includes('FOR UPDATE SKIP LOCKED')) {
         return { rows: config.candidateIds.map(jobId => ({ job_id: jobId })) };
@@ -177,8 +237,9 @@ test('report-only mode classifies the bounded batch and issues no writes', async
   assert.equal(report.dryRun, true);
   assert.equal(report.actor, null);
   assert.equal(report.scan.locked, 2);
-  assert.equal(report.scan.offset, 0);
-  assert.equal(report.scan.nextOffset, null);
+  assert.equal(report.scan.window, 2);
+  assert.equal(report.scan.cursor, null);
+  assert.equal(report.scan.nextCursor, null);
   assert.equal(report.summary.examined, 2);
   assert.equal(report.summary.proposedClosures, 1);
   assert.equal(report.summary.appliedClosures, 0);
@@ -289,49 +350,96 @@ test('maxClosures bounds the applied batch even when more proposals exist', asyn
   assert.equal(report.summary.closureLimitReached, true);
   assert.ok(report.warnings.includes('closure_limit_reached'));
   assert.equal(jobUpdates.length, 2);
+  // Unapplied proposals stay pending, so a fresh run must revisit this page.
+  assert.equal(report.scan.nextCursor, null);
 });
 
-test('maxScan is reported when the candidate window truncates the backlog', async () => {
-  const rows = [evidenceRow(), evidenceRow()];
+test('a truncated scan reports a keyset cursor instead of an offset', async () => {
+  const rows = [evidenceRow(), evidenceRow(), evidenceRow()];
+  const windowRows = rows.map((row, index) => ({
+    job_id: String(row.job_id),
+    first_enqueued_at: '2026-10-01T00:00:00.000Z',
+    first_enqueued_at_key: `2026-10-01T00:00:0${index}.123456Z`,
+  }));
   const { db, sql, params } = fakeApplyDb({
-    candidateIds: rows.map(row => String(row.job_id)),
-    evidenceRows: rows,
+    candidateIds: rows.slice(0, 2).map(row => String(row.job_id)),
+    windowRows,
+    evidenceRows: rows.slice(0, 2),
     scannable: 9,
   });
   const report = await runPhase0ZombieApply(db, { maxScan: 2 });
 
   assert.equal(report.summary.scanLimitReached, true);
-  assert.equal(report.scan.nextOffset, 2);
+  assert.equal(report.scan.window, 2);
+  assert.equal(report.scan.locked, 2);
+  assert.equal(
+    report.scan.nextCursor,
+    encodePhase0ZombieApplyCursor(windowRows[1]),
+  );
   assert.ok(report.warnings.includes('scan_limit_reached'));
-  const candidateIndex = sql.findIndex(text => text.includes('FOR UPDATE SKIP LOCKED'));
-  assert.ok(candidateIndex >= 0);
-  assert.match(sql[candidateIndex], /OFFSET \$2/);
-  assert.deepEqual(params[candidateIndex], [2, 0]);
+  const windowIndex = sql.findIndex(text =>
+    text.includes('first_enqueued_at AS first_enqueued_at'));
+  assert.ok(windowIndex >= 0);
+  assert.match(sql[windowIndex], /LIMIT \$1/);
+  assert.doesNotMatch(sql[windowIndex], /OFFSET/);
+  assert.deepEqual(params[windowIndex], [3]);
 });
 
-test('offset advances the bounded candidate window past permanent skips', async () => {
-  const rows = [evidenceRow(), evidenceRow()];
-  const { db, sql, params } = fakeApplyDb({
-    candidateIds: rows.map(row => String(row.job_id)),
-    evidenceRows: rows,
-    scannable: 9,
+test('a keyset cursor resumes past permanent skips and survives closures', async () => {
+  const rows = [evidenceRow(), evidenceRow(), evidenceRow()];
+  const windowRows = rows.map(row => ({
+    job_id: String(row.job_id),
+    first_enqueued_at: '2026-10-02T00:00:00.000Z',
+  }));
+  const cursorToken = encodePhase0ZombieApplyCursor({
+    job_id: randomUUID(),
+    first_enqueued_at: '2026-10-01T00:00:00.000Z',
   });
-  const report = await runPhase0ZombieApply(db, { maxScan: 2, offset: 4 });
+  const cursor = parsePhase0ZombieApplyCursor(cursorToken);
+  const { db, sql, params } = fakeApplyDb({
+    candidateIds: rows.slice(0, 2).map(row => String(row.job_id)),
+    windowRows,
+    evidenceRows: rows.slice(0, 2),
+  });
+  const report = await runPhase0ZombieApply(db, { maxScan: 2, cursor: cursorToken });
 
-  assert.equal(report.scan.offset, 4);
+  assert.equal(report.scan.cursor, cursorToken);
   assert.equal(report.summary.scanLimitReached, true);
-  assert.equal(report.scan.nextOffset, 6);
-  const candidateIndex = sql.findIndex(text => text.includes('FOR UPDATE SKIP LOCKED'));
-  assert.ok(candidateIndex >= 0);
-  assert.match(sql[candidateIndex], /OFFSET \$2/);
-  assert.deepEqual(params[candidateIndex], [2, 4]);
+  assert.equal(report.scan.nextCursor, encodePhase0ZombieApplyCursor(windowRows[1]));
+  const windowIndex = sql.findIndex(text =>
+    text.includes('first_enqueued_at AS first_enqueued_at'));
+  assert.ok(windowIndex >= 0);
+  assert.match(sql[windowIndex], /j\.id > \$3::uuid/);
+  assert.doesNotMatch(sql[windowIndex], /OFFSET/);
+  assert.deepEqual(params[windowIndex], [3, cursor.at, cursor.id]);
 
   const exhausted = await runPhase0ZombieApply(
-    fakeApplyDb({ candidateIds: [], evidenceRows: [], scannable: 4 }).db,
-    { maxScan: 2, offset: 4 },
+    fakeApplyDb({ candidateIds: [], windowRows: [], evidenceRows: [] }).db,
+    { maxScan: 2, cursor: cursorToken },
   );
   assert.equal(exhausted.summary.scanLimitReached, false);
-  assert.equal(exhausted.scan.nextOffset, null);
+  assert.equal(exhausted.scan.nextCursor, null);
+});
+
+test('closure truncation repeats the same cursor page', async () => {
+  const rows = [evidenceRow(), evidenceRow(), evidenceRow()];
+  const cursorToken = encodePhase0ZombieApplyCursor({
+    job_id: randomUUID(),
+    first_enqueued_at: '2026-10-01T00:00:00.000Z',
+  });
+  const { db } = fakeApplyDb({
+    candidateIds: rows.map(row => String(row.job_id)),
+    evidenceRows: rows,
+  });
+  const report = await runPhase0ZombieApply(db, {
+    apply: true,
+    actor: 'operator',
+    maxClosures: 2,
+    cursor: cursorToken,
+  });
+
+  assert.equal(report.summary.closureLimitReached, true);
+  assert.equal(report.scan.nextCursor, cursorToken);
 });
 
 test('an explicit job-id batch is bounded and does not report scan truncation', async () => {
@@ -347,10 +455,15 @@ test('an explicit job-id batch is bounded and does not report scan truncation', 
   assert.equal(report.restricted, true);
   assert.equal(report.summary.scanLimitReached, false);
   assert.equal(report.warnings.includes('scan_limit_reached'), false);
-  const candidateIndex = sql.findIndex(text => text.includes('FOR UPDATE SKIP LOCKED'));
-  assert.ok(candidateIndex >= 0);
-  assert.match(sql[candidateIndex], /OFFSET \$3/);
-  assert.deepEqual(params[candidateIndex], [2, jobIds, 0]);
+  const windowIndex = sql.findIndex(text =>
+    text.includes('first_enqueued_at AS first_enqueued_at'));
+  assert.ok(windowIndex >= 0);
+  assert.match(sql[windowIndex], /j\.id = ANY\(\$2::uuid\[\]\)/);
+  assert.doesNotMatch(sql[windowIndex], /OFFSET/);
+  assert.deepEqual(params[windowIndex], [3, jobIds]);
+  const lockIndex = sql.findIndex(text => text.includes('FOR UPDATE SKIP LOCKED'));
+  assert.ok(lockIndex >= 0);
+  assert.deepEqual(params[lockIndex], [2, jobIds]);
 });
 
 test('a skipped update is surfaced instead of being counted as a closure', async () => {
@@ -439,7 +552,7 @@ test('closure evidence is self-contained and carries the shared criterion', () =
     schema: { ledgerTablePresent: true, closureColumnsPresent: true },
     population: { pendingRetries: 1, processingRetries: 0, scannable: 1 },
     ledger: { rows: 0 },
-    scan: { locked: 1, offset: 0, nextOffset: null },
+    scan: { window: 1, locked: 1, cursor: null, nextCursor: null },
     summary: {
       examined: 1,
       proposedClosures: 1,
@@ -455,6 +568,90 @@ test('closure evidence is self-contained and carries the shared criterion', () =
   assert.deepEqual(phase0ZombieApplyCheckFailures(syntheticReport), []);
   syntheticReport.schema.closureColumnsPresent = false;
   assert.deepEqual(phase0ZombieApplyCheckFailures(syntheticReport), ['closure_columns_missing']);
+});
+
+test('a rollback rewrites every applied marker in the audit report', () => {
+  const jobId = randomUUID();
+  const report: Phase0ZombieApplyReport = {
+    generatedAt: '2026-11-07T00:00:00.000Z',
+    dryRun: false,
+    actor: 'operator',
+    maxScan: 1,
+    maxClosures: 1,
+    restricted: false,
+    schema: { ledgerTablePresent: true, closureColumnsPresent: true },
+    population: { pendingRetries: 1, processingRetries: 0, scannable: 1 },
+    ledger: { rows: 1 },
+    scan: { window: 1, locked: 1, cursor: null, nextCursor: null },
+    summary: {
+      examined: 1,
+      proposedClosures: 1,
+      appliedClosures: 1,
+      skipped: 0,
+      closureLimitReached: false,
+      scanLimitReached: false,
+      byReason: { CHANNEL_TERMINAL: 1 },
+    },
+    closures: [{
+      jobId,
+      channelId: 'UCrollback',
+      reason: 'CHANNEL_TERMINAL',
+      applied: true,
+      closedAt: '2026-11-07T00:00:00.000Z',
+      actor: 'operator',
+      evidence: { reason: 'CHANNEL_TERMINAL' },
+    }],
+    warnings: [],
+  };
+
+  const committed = finalizePhase0ZombieApplyReport(report, 'COMMITTED');
+  assert.equal(committed.transaction, 'COMMITTED');
+  assert.equal(committed.summary.appliedClosures, 1);
+  assert.equal(committed.closures[0].applied, true);
+  assert.equal(committed.closures[0].closedAt, '2026-11-07T00:00:00.000Z');
+
+  const rolledBack = finalizePhase0ZombieApplyReport(report, 'ROLLED_BACK');
+  assert.equal(rolledBack.transaction, 'ROLLED_BACK');
+  assert.equal(rolledBack.summary.appliedClosures, 0);
+  assert.equal(rolledBack.summary.proposedClosures, 1);
+  assert.deepEqual(rolledBack.closures[0], {
+    ...report.closures[0],
+    applied: false,
+    closedAt: null,
+    actor: null,
+  });
+});
+
+test('the write guard excludes evidence the batch already classified', async () => {
+  const closable = evidenceRow();
+  // A newer required, retryable row that `observationOwnsRetry` rejects as
+  // low-value. It must not block the closure, and its id must be excluded from
+  // the statement-time guard because the batch snapshot already judged it.
+  const demoted = observationRow({
+    job_id: closable.job_id,
+    provenance: { surface: 'CREATOR_WEBSITES', required: true, relevanceTier: 'DEMOTE' },
+  });
+  const { db, sql, jobUpdates } = fakeApplyDb({
+    candidateIds: [String(closable.job_id)],
+    evidenceRows: [closable],
+    newerObservations: [demoted],
+  });
+
+  const report = await runPhase0ZombieApply(db, {
+    apply: true,
+    actor: 'operator',
+    maxScan: 10,
+    maxClosures: 5,
+  });
+
+  assert.equal(report.summary.proposedClosures, 1);
+  assert.equal(report.summary.appliedClosures, 1);
+  assert.equal(report.summary.skipped, 0);
+  assert.equal(jobUpdates.length, 1);
+  assert.deepEqual(jobUpdates[0].values[6], [demoted.id]);
+  const updateSql = sql.find(text => text.includes('UPDATE jobs'));
+  assert.ok(updateSql);
+  assert.match(updateSql, /o\.id <> ALL\(\$7::uuid\[\]\)/);
 });
 
 test('the apply module and CLI keep the write path explicit and bounded', () => {
@@ -478,14 +675,20 @@ test('the apply module and CLI keep the write path explicit and bounded', () => 
   assert.match(moduleSource, /statuses: \['PENDING'\]/);
   assert.match(moduleSource, /excludeClosed: true/);
   assert.match(moduleSource, /lock: true/);
+  assert.match(moduleSource, /after: cursor !== null/);
   assert.match(moduleSource, /zombieClosureEvidenceGuardSql/);
   assert.match(reconciliationSource, /FOR UPDATE SKIP LOCKED/);
   assert.match(reconciliationSource, /j\.closed_at IS NULL/);
+  assert.match(reconciliationSource, /o\.id <> ALL\(\$\{knownObservationIdsParam\}::uuid\[\]\)/);
+  assert.match(reconciliationSource, /j\.first_enqueued_at > \$\{atParam\}::timestamptz/);
+  assert.match(moduleSource, /nextCursor/);
+  assert.match(moduleSource, /problemIds/);
   assert.match(moduleSource, /migration 167/);
   assert.match(scriptSource, /createOperatorWriteDbPool/);
   assert.match(scriptSource, /BEGIN ISOLATION LEVEL READ COMMITTED/);
   assert.match(scriptSource, /phase0ZombieApplyCheckFailures/);
-  assert.match(scriptSource, /args\.apply && failures\.length === 0/);
+  assert.match(scriptSource, /finalizePhase0ZombieApplyReport/);
+  assert.match(scriptSource, /const committed = args\.apply && failures\.length === 0/);
   const checkIndex = scriptSource.indexOf('args.check ? phase0ZombieApplyCheckFailures(report) : []');
   const commitIndex = scriptSource.indexOf("await client.query('COMMIT')");
   assert.ok(checkIndex >= 0);
