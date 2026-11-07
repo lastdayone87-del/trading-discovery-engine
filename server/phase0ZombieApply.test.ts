@@ -19,6 +19,7 @@ test('apply arguments default to report-only with the documented bounds', () => 
     actor: null,
     maxScan: PHASE0_ZOMBIE_APPLY_DEFAULT_MAX_SCAN,
     maxClosures: PHASE0_ZOMBIE_APPLY_DEFAULT_MAX_CLOSURES,
+    offset: 0,
     includeRows: false,
     check: false,
     out: null,
@@ -47,15 +48,19 @@ test('apply bounds and actor inputs are validated', () => {
     ['--max-closures=0'],
     ['--max-closures=501'],
     ['--max-closures=1.5'],
+    ['--offset=-1'],
+    ['--offset=1000001'],
+    ['--offset=abc'],
     ['--out='],
   ]) {
-    assert.throws(() => parsePhase0ZombieApplyArgs(argv), /max-scan|max-closures|out/);
+    assert.throws(() => parsePhase0ZombieApplyArgs(argv), /max-scan|max-closures|offset|out/);
   }
   for (const actor of ['x'.repeat(201), 'operator\nname', 'operator\u0000']) {
     assert.throws(() => parsePhase0ZombieApplyArgs([`--actor=${actor}`]), /--actor/);
   }
   assert.equal(parsePhase0ZombieApplyArgs(['--max-scan=42', '--max-closures=7']).maxScan, 42);
   assert.equal(parsePhase0ZombieApplyArgs(['--max-closures=7']).maxClosures, 7);
+  assert.equal(parsePhase0ZombieApplyArgs(['--offset=42']).offset, 42);
 });
 
 function evidenceRow(overrides: Record<string, unknown> = {}) {
@@ -134,12 +139,6 @@ function fakeApplyDb(config: {
       if (text.includes('FOR UPDATE SKIP LOCKED')) {
         return { rows: config.candidateIds.map(jobId => ({ job_id: jobId })) };
       }
-      if (text.includes('external_acquisition_observations')) {
-        return { rows: config.newerObservations ?? [] };
-      }
-      if (text.includes('WITH candidate_channels AS')) {
-        return { rows: config.evidenceRows };
-      }
       if (text.includes('UPDATE job_attempts')) {
         attemptUpdates.push(values);
         return { rows: [] };
@@ -149,6 +148,12 @@ function fakeApplyDb(config: {
         jobUpdates.push({ jobId, values });
         const succeeds = config.updateSucceeds ? config.updateSucceeds(jobId) : true;
         return { rows: succeeds ? [{ id: jobId }] : [] };
+      }
+      if (text.includes('external_acquisition_observations')) {
+        return { rows: config.newerObservations ?? [] };
+      }
+      if (text.includes('WITH candidate_channels AS')) {
+        return { rows: config.evidenceRows };
       }
       return { rows: [] };
     },
@@ -172,6 +177,8 @@ test('report-only mode classifies the bounded batch and issues no writes', async
   assert.equal(report.dryRun, true);
   assert.equal(report.actor, null);
   assert.equal(report.scan.locked, 2);
+  assert.equal(report.scan.offset, 0);
+  assert.equal(report.scan.nextOffset, null);
   assert.equal(report.summary.examined, 2);
   assert.equal(report.summary.proposedClosures, 1);
   assert.equal(report.summary.appliedClosures, 0);
@@ -180,8 +187,32 @@ test('report-only mode classifies the bounded batch and issues no writes', async
   assert.equal(report.closures[0].applied, false);
   assert.equal(report.closures[0].closedAt, null);
   assert.equal(jobUpdates.length, 0);
-  assert.equal(sql.some(text => /^\s*UPDATE\s/i.test(text)), false);
+  const mutatingSql = sql.filter(text =>
+    /\b(?:INSERT|UPDATE|DELETE|TRUNCATE|MERGE)\b/i.test(text.replace(/FOR\s+UPDATE/gi, '')));
+  assert.deepEqual(mutatingSql, []);
   assert.ok(sql.some(text => /FOR UPDATE SKIP LOCKED/.test(text)));
+});
+
+test('closure evidence that appears before classification blocks the closure', async () => {
+  const closable = evidenceRow();
+  const { db, jobUpdates } = fakeApplyDb({
+    candidateIds: [String(closable.job_id)],
+    evidenceRows: [closable],
+    newerObservations: [observationRow({ job_id: closable.job_id })],
+  });
+
+  const report = await runPhase0ZombieApply(db, {
+    apply: true,
+    actor: 'operator',
+    maxScan: 10,
+    maxClosures: 5,
+  });
+
+  assert.equal(report.summary.proposedClosures, 0);
+  assert.equal(report.summary.appliedClosures, 0);
+  assert.equal(report.summary.skipped, 1);
+  assert.equal(report.summary.byReason.NEWER_RETRY_OWNING_OBSERVATION, 1);
+  assert.equal(jobUpdates.length, 0);
 });
 
 test('apply mode closes only proposals and records append-only evidence', async () => {
@@ -190,7 +221,7 @@ test('apply mode closes only proposals and records append-only evidence', async 
     discord_validation_status: null,
     discord_status: 'UNCERTAIN',
   });
-  const { db, jobUpdates, attemptUpdates } = fakeApplyDb({
+  const { db, sql, jobUpdates, attemptUpdates } = fakeApplyDb({
     candidateIds: [String(closable.job_id), String(skipped.job_id)],
     evidenceRows: [closable, skipped],
   });
@@ -215,6 +246,11 @@ test('apply mode closes only proposals and records append-only evidence', async 
   assert.equal(values[0], closable.job_id);
   assert.equal(values[1], 'CHANNEL_TERMINAL');
   assert.equal(values[3], 'operator@example');
+  assert.equal(typeof values[4], 'string');
+  assert.deepEqual(values[5], [
+    'CHANNEL_LINKS', 'CHANNEL_EXTERNAL_LINKS', 'EXTERNAL_LINKS', 'LINKED_WEBSITES',
+    'CUSTOM_DOMAINS', 'SOCIAL_PROFILES', 'SOCIAL_BIO', 'CREATOR_WEBSITES',
+  ]);
   const evidence = JSON.parse(String(values[2]));
   assert.equal(evidence.classifier, 'phase0-zombie-retry-closure');
   assert.equal(evidence.reason, 'CHANNEL_TERMINAL');
@@ -222,6 +258,13 @@ test('apply mode closes only proposals and records append-only evidence', async 
   assert.equal(evidence.job.id, closable.job_id);
   assert.equal(evidence.channel.id, closable.channel_id);
   assert.equal(typeof evidence.closedAt, 'string');
+  const updateSql = sql.find(text => text.includes('UPDATE jobs'));
+  assert.ok(updateSql);
+  assert.match(updateSql, /completed_at=COALESCE\(completed_at,\$5::timestamptz\)/);
+  assert.match(updateSql, /NOT EXISTS \(\s*SELECT 1\s+FROM external_acquisition_observations/);
+  assert.match(updateSql, /NOT EXISTS \(\s*SELECT 1\s+FROM community_acquisition_url_state/);
+  assert.match(updateSql, /AND status='PENDING'/);
+  assert.match(updateSql, /AND closed_at IS NULL/);
   assert.deepEqual(attemptUpdates, [[[closable.job_id]]]);
   assert.equal(
     report.warnings.some(warning => warning.startsWith('closure_update_skipped')),
@@ -258,10 +301,37 @@ test('maxScan is reported when the candidate window truncates the backlog', asyn
   const report = await runPhase0ZombieApply(db, { maxScan: 2 });
 
   assert.equal(report.summary.scanLimitReached, true);
+  assert.equal(report.scan.nextOffset, 2);
   assert.ok(report.warnings.includes('scan_limit_reached'));
   const candidateIndex = sql.findIndex(text => text.includes('FOR UPDATE SKIP LOCKED'));
   assert.ok(candidateIndex >= 0);
-  assert.deepEqual(params[candidateIndex], [2]);
+  assert.match(sql[candidateIndex], /OFFSET \$2/);
+  assert.deepEqual(params[candidateIndex], [2, 0]);
+});
+
+test('offset advances the bounded candidate window past permanent skips', async () => {
+  const rows = [evidenceRow(), evidenceRow()];
+  const { db, sql, params } = fakeApplyDb({
+    candidateIds: rows.map(row => String(row.job_id)),
+    evidenceRows: rows,
+    scannable: 9,
+  });
+  const report = await runPhase0ZombieApply(db, { maxScan: 2, offset: 4 });
+
+  assert.equal(report.scan.offset, 4);
+  assert.equal(report.summary.scanLimitReached, true);
+  assert.equal(report.scan.nextOffset, 6);
+  const candidateIndex = sql.findIndex(text => text.includes('FOR UPDATE SKIP LOCKED'));
+  assert.ok(candidateIndex >= 0);
+  assert.match(sql[candidateIndex], /OFFSET \$2/);
+  assert.deepEqual(params[candidateIndex], [2, 4]);
+
+  const exhausted = await runPhase0ZombieApply(
+    fakeApplyDb({ candidateIds: [], evidenceRows: [], scannable: 4 }).db,
+    { maxScan: 2, offset: 4 },
+  );
+  assert.equal(exhausted.summary.scanLimitReached, false);
+  assert.equal(exhausted.scan.nextOffset, null);
 });
 
 test('an explicit job-id batch is bounded and does not report scan truncation', async () => {
@@ -279,7 +349,8 @@ test('an explicit job-id batch is bounded and does not report scan truncation', 
   assert.equal(report.warnings.includes('scan_limit_reached'), false);
   const candidateIndex = sql.findIndex(text => text.includes('FOR UPDATE SKIP LOCKED'));
   assert.ok(candidateIndex >= 0);
-  assert.deepEqual(params[candidateIndex], [2, jobIds]);
+  assert.match(sql[candidateIndex], /OFFSET \$3/);
+  assert.deepEqual(params[candidateIndex], [2, jobIds, 0]);
 });
 
 test('a skipped update is surfaced instead of being counted as a closure', async () => {
@@ -368,7 +439,7 @@ test('closure evidence is self-contained and carries the shared criterion', () =
     schema: { ledgerTablePresent: true, closureColumnsPresent: true },
     population: { pendingRetries: 1, processingRetries: 0, scannable: 1 },
     ledger: { rows: 0 },
-    scan: { locked: 1 },
+    scan: { locked: 1, offset: 0, nextOffset: null },
     summary: {
       examined: 1,
       proposedClosures: 1,
@@ -391,6 +462,10 @@ test('the apply module and CLI keep the write path explicit and bounded', () => 
     new URL('./phase0ZombieApply.ts', import.meta.url),
     'utf8',
   );
+  const reconciliationSource = readFileSync(
+    new URL('./phase0ZombieReconciliation.ts', import.meta.url),
+    'utf8',
+  );
   const scriptSource = readFileSync(
     new URL('../scripts/phase0ZombieApply.ts', import.meta.url),
     'utf8',
@@ -399,10 +474,21 @@ test('the apply module and CLI keep the write path explicit and bounded', () => 
     assert.doesNotMatch(source, /\bDELETE\s+FROM\b/i);
     assert.doesNotMatch(source, /\bTRUNCATE\b/i);
   }
-  assert.match(moduleSource, /FOR UPDATE SKIP LOCKED/);
-  assert.match(moduleSource, /closed_at IS NULL/);
+  assert.match(moduleSource, /zombieCandidateJobIdsSql/);
+  assert.match(moduleSource, /statuses: \['PENDING'\]/);
+  assert.match(moduleSource, /excludeClosed: true/);
+  assert.match(moduleSource, /lock: true/);
+  assert.match(moduleSource, /zombieClosureEvidenceGuardSql/);
+  assert.match(reconciliationSource, /FOR UPDATE SKIP LOCKED/);
+  assert.match(reconciliationSource, /j\.closed_at IS NULL/);
   assert.match(moduleSource, /migration 167/);
   assert.match(scriptSource, /createOperatorWriteDbPool/);
-  assert.match(scriptSource, /BEGIN ISOLATION LEVEL REPEATABLE READ/);
-  assert.match(scriptSource, /args\.apply/);
+  assert.match(scriptSource, /BEGIN ISOLATION LEVEL READ COMMITTED/);
+  assert.match(scriptSource, /phase0ZombieApplyCheckFailures/);
+  assert.match(scriptSource, /args\.apply && failures\.length === 0/);
+  const checkIndex = scriptSource.indexOf('args.check ? phase0ZombieApplyCheckFailures(report) : []');
+  const commitIndex = scriptSource.indexOf("await client.query('COMMIT')");
+  assert.ok(checkIndex >= 0);
+  assert.ok(commitIndex >= 0);
+  assert.ok(checkIndex < commitIndex, 'the check gate must run before COMMIT');
 });

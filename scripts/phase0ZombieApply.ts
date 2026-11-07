@@ -6,9 +6,14 @@
  * `--actor` it closes at most `--max-closures` evidence-backed PENDING jobs and
  * records append-only closure evidence.
  *
- * The whole run is one transaction. Candidate jobs are locked with
- * `FOR UPDATE SKIP LOCKED`, so workers skip them while the batch is audited.
- * The apply path never deletes rows and never scans beyond `--max-scan`.
+ * The whole run is one READ COMMITTED transaction. Candidate jobs are locked
+ * with `FOR UPDATE SKIP LOCKED`, so workers skip them while the batch is
+ * audited, and the closure UPDATE re-checks ownership evidence at statement
+ * time. `--check` failures roll the batch back before commit.
+ *
+ * The operator must review a fresh dry-run first. The CLI cannot prove that
+ * review happened; it can only require the explicit `--apply` + `--actor`
+ * gate and keep the batch small enough for a full audit.
  *
  * Usage:
  *   npx tsx scripts/phase0ZombieApply.ts --max-closures=100
@@ -42,7 +47,7 @@ async function main(): Promise<void> {
   let client: Awaited<ReturnType<typeof pool.connect>> | undefined;
   try {
     client = await pool.connect();
-    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+    await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
     let report;
     try {
       report = await runPhase0ZombieApply(client, {
@@ -50,31 +55,41 @@ async function main(): Promise<void> {
         actor: args.actor,
         maxScan: args.maxScan,
         maxClosures: args.maxClosures,
+        offset: args.offset,
         includeRows: args.includeRows,
       });
-      // A preview acquired row locks only to prove the same bounded candidate
-      // set; roll back so a report-only run cannot leave locks behind.
-      if (args.apply) await client.query('COMMIT');
-      else await client.query('ROLLBACK');
-    } catch (error) {
-      await client.query('ROLLBACK').catch(() => undefined);
-      throw error;
-    }
 
-    const json = JSON.stringify(report, null, 2);
-    if (args.out) writeFileSync(args.out, `${json}\n`, 'utf8');
-    await writeStdout(`${json}\n`);
+      // Evaluate the gate before committing: a failed check must not leave a
+      // partial batch persisted while the process exits non-zero.
+      const failures = args.check ? phase0ZombieApplyCheckFailures(report) : [];
+      if (args.apply && failures.length === 0) {
+        await client.query('COMMIT');
+      } else {
+        await client.query('ROLLBACK');
+      }
 
-    if (args.check) {
-      const failures = phase0ZombieApplyCheckFailures(report);
+      const output = {
+        ...report,
+        transaction: args.apply && failures.length === 0 ? 'COMMITTED' : 'ROLLED_BACK',
+      };
+      const json = JSON.stringify(output, null, 2);
+      // Print the committed closure list before touching the optional output
+      // file: a disk error must not hide what the database already accepted.
+      await writeStdout(`${json}\n`);
+      if (args.out) writeFileSync(args.out, `${json}\n`, 'utf8');
+
       if (failures.length > 0) {
         process.exitCode = 1;
         console.error(JSON.stringify({
           event: 'phase0_zombie_apply_check_failed',
           failures,
           generatedAt: report.generatedAt,
+          transaction: 'ROLLED_BACK',
         }));
       }
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
     }
   } finally {
     client?.release();

@@ -12,8 +12,9 @@
 --
 -- Append-only means exactly that: `closed_reason`, `closed_evidence`,
 -- `closed_by`, and `closed_at` may be set once (all together) and can never
--- change afterwards. Status transitions, payload updates, queue clocks, and
--- capacity leases are untouched by this guard.
+-- change or disappear afterwards. Status transitions, payload updates, queue
+-- clocks, and capacity leases are untouched by this guard; a DELETE of a
+-- closed job is rejected so the closure record cannot be erased either.
 
 SET LOCAL lock_timeout = '10s';
 
@@ -54,11 +55,37 @@ BEGIN
 END
 $$;
 
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+      FROM pg_constraint
+     WHERE conname = 'jobs_closure_reason_allowed_check'
+       AND conrelid = 'public.jobs'::regclass
+  ) THEN
+    ALTER TABLE public.jobs
+      ADD CONSTRAINT jobs_closure_reason_allowed_check
+      CHECK (
+        closed_reason IS NULL
+        OR closed_reason IN ('CHANNEL_TERMINAL','LEDGER_ALL_TERMINAL')
+      ) NOT VALID;
+  END IF;
+END
+$$;
+
 CREATE OR REPLACE FUNCTION public.guard_job_closure_evidence()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
+  IF TG_OP = 'DELETE' THEN
+    IF OLD.closed_at IS NOT NULL THEN
+      RAISE EXCEPTION
+        'JOB_CLOSURE_IMMUTABLE: closure evidence cannot be deleted (job %)', OLD.id;
+    END IF;
+    RETURN OLD;
+  END IF;
+
   IF OLD.closed_at IS NOT NULL
      AND (
        NEW.closed_at IS DISTINCT FROM OLD.closed_at
@@ -75,11 +102,11 @@ END;
 $$;
 
 COMMENT ON FUNCTION public.guard_job_closure_evidence() IS
-  'Phase 0: closure reason, evidence, actor, and time are append-only.';
+  'Phase 0: closure reason, evidence, actor, and time are append-only, including DELETE.';
 
 DROP TRIGGER IF EXISTS jobs_closure_evidence_guard ON public.jobs;
 CREATE TRIGGER jobs_closure_evidence_guard
-  BEFORE UPDATE ON public.jobs
+  BEFORE UPDATE OR DELETE ON public.jobs
   FOR EACH ROW
   EXECUTE FUNCTION public.guard_job_closure_evidence();
 

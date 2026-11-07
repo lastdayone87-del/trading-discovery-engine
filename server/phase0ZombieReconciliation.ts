@@ -148,8 +148,13 @@ export interface Phase0ZombieReconciliationReport {
   generatedAt: string;
   dryRun: true;
   maxJobs: number;
-  schema: { ledgerTablePresent: boolean };
-  population: { pendingRetries: number; processingRetries: number; examined: number };
+  schema: { ledgerTablePresent: boolean; closureColumnsPresent: boolean };
+  population: {
+    pendingRetries: number;
+    processingRetries: number;
+    scannable: number;
+    examined: number;
+  };
   ledger: { rows: number };
   summary: {
     proposedClosures: number;
@@ -255,20 +260,131 @@ function evidenceLines(evidence: ZombieRetryEvidence, reason: ZombieRetryDecisio
   return lines;
 }
 
+export interface ZombieCandidateSqlOptions {
+  /** Statuses eligible for the candidate window. Defaults to pending+processing. */
+  statuses?: readonly ('PENDING' | 'PROCESSING')[];
+  /** Exclude an epoch that already carries append-only closure evidence. */
+  excludeClosed?: boolean;
+  /** Lock candidates for the operator apply. */
+  lock?: boolean;
+  /** Restrict to explicit job ids in `$2`. */
+  restricted?: boolean;
+  /** Page the candidate window with `OFFSET` (`$2`, or `$3` when restricted). */
+  paged?: boolean;
+}
+
 /**
- * Bounded candidate identity query. Keeping identity separate from evidence
- * lets the apply path lock exactly these rows with `FOR UPDATE SKIP LOCKED`
- * and then reuse the same evidence assembly as the dry-run, so the two paths
- * cannot drift. Ordering is the immutable queue clock, never age-of-lease.
+ * Shared bounded candidate identity query. Keeping identity separate from
+ * evidence lets the apply path lock exactly these rows with
+ * `FOR UPDATE SKIP LOCKED` and then reuse the same evidence assembly as the
+ * dry-run, so the two paths cannot drift. Ordering is the immutable queue
+ * clock, never age-of-lease.
+ *
+ * A closed epoch is excluded when closure columns exist: the closure record is
+ * append-only and a later reopen is a new generation, so Phase 0 never rewrites
+ * earlier evidence. `paged` lets an operator advance past a window that is
+ * dominated by permanent skips.
  */
-export function zombieCandidateJobIdsSql(): string {
+export function zombieCandidateJobIdsSql(options: ZombieCandidateSqlOptions = {}): string {
+  const statuses = options.statuses ?? ['PENDING', 'PROCESSING'];
+  const offsetParam = options.restricted ? '$3' : '$2';
   return `
     SELECT j.id AS job_id
       FROM jobs j
      WHERE j.type='${ZOMBIE_RETRY_JOB_TYPE}'
-       AND j.status IN ('PENDING','PROCESSING')
+       AND j.status IN (${statuses.map(status => `'${status}'`).join(',')})
+       ${options.excludeClosed ? 'AND j.closed_at IS NULL' : ''}
+       ${options.restricted ? 'AND j.id = ANY($2::uuid[])' : ''}
      ORDER BY j.first_enqueued_at ASC NULLS FIRST, j.id ASC
      LIMIT $1
+     ${options.paged ? `OFFSET ${offsetParam}` : ''}
+     ${options.lock ? 'FOR UPDATE SKIP LOCKED' : ''}
+  `;
+}
+
+/**
+ * Schema probe shared by the dry-run and apply. The closure columns arrive in
+ * migration 167, after the dry-run shipped, so the report must tolerate their
+ * absence and say so rather than crash or silently assume they exist.
+ */
+export function zombieReconciliationSchemaSql(): string {
+  return `
+    SELECT to_regclass('public.community_acquisition_url_state') IS NOT NULL
+             AS ledger_table_present,
+           (
+             SELECT count(*) = 4
+               FROM information_schema.columns
+              WHERE table_schema='public'
+                AND table_name='jobs'
+                AND column_name IN (
+                  'closed_reason','closed_evidence','closed_by','closed_at'
+                )
+           ) AS closure_columns_present
+  `;
+}
+
+/**
+ * Shared SQL prefilter for observations that may own retry: ledger work that
+ * is stored retryable. It is a deliberate superset of `observationOwnsRetry`
+ * (which also rejects auxiliary/shared evidence), so SQL can narrow the scan
+ * without deciding ownership. The final decision always stays in TypeScript.
+ *
+ * `CASE` protects the `timestamptz` cast: `pg_input_is_valid` and the cast in
+ * the same `AND` chain have no guaranteed evaluation order, and a malformed
+ * `retryObservedAt` must skip the job, never abort the whole report.
+ */
+function zombieObservationOwnershipPrefilterSql(args: {
+  observationAlias: string;
+  channelExpression: string;
+  retryObservedAtExpression: string;
+  surfacesParam: string;
+}): string {
+  const o = args.observationAlias;
+  return `${o}.channel_id = ${args.channelExpression}
+       AND CASE
+             WHEN pg_input_is_valid(
+               btrim(COALESCE(${args.retryObservedAtExpression},'')),
+               'timestamptz'
+             )
+             THEN ${o}.observed_at > btrim(${args.retryObservedAtExpression})::timestamptz
+             ELSE false
+           END
+       AND ${o}.provenance->>'surface' = ANY(${args.surfacesParam}::text[])
+       AND ${o}.retryable = true
+       AND (
+         ${o}.provenance->'required' = 'true'::jsonb
+         OR (
+           ${o}.outcome = 'PARTIALLY_INSPECTED'
+           AND ${o}.failure_class = 'STATIC_BUDGET_GAP'
+         )
+       )`;
+}
+
+/**
+ * Statement-time closure guard for the apply UPDATE. It re-checks the same
+ * coarse ownership prefilter under the UPDATE's own snapshot, so evidence
+ * committed after the evidence query but before the write still blocks the
+ * closure. Full synchronization with evidence writers is a Phase 1 concern
+ * (atomic claim/lease/recovery); this guard removes the avoidable window.
+ */
+export function zombieClosureEvidenceGuardSql(surfacesParam: string): string {
+  return `
+    NOT EXISTS (
+      SELECT 1
+        FROM external_acquisition_observations o
+       WHERE ${zombieObservationOwnershipPrefilterSql({
+         observationAlias: 'o',
+         channelExpression: "COALESCE(jobs.payload->>'channelId','')",
+         retryObservedAtExpression: "jobs.payload->>'retryObservedAt'",
+         surfacesParam,
+       })}
+    )
+    AND NOT EXISTS (
+      SELECT 1
+        FROM community_acquisition_url_state l
+       WHERE l.channel_id = COALESCE(jobs.payload->>'channelId','')
+         AND l.state IN (${sqlStateList(ZOMBIE_ACTIVE_LEDGER_STATES)})
+    )
   `;
 }
 
@@ -363,21 +479,12 @@ export function zombieNewerObservationSqlByJobIds(): string {
            o.provenance
       FROM jobs j
       JOIN external_acquisition_observations o
-        ON o.channel_id = COALESCE(j.payload->>'channelId','')
-       AND pg_input_is_valid(
-             btrim(COALESCE(j.payload->>'retryObservedAt','')),
-             'timestamptz'
-           )
-       AND o.observed_at > btrim(j.payload->>'retryObservedAt')::timestamptz
-       AND o.provenance->>'surface' = ANY($2::text[])
-       AND o.retryable = true
-       AND (
-         o.provenance->'required' = 'true'::jsonb
-         OR (
-           o.outcome = 'PARTIALLY_INSPECTED'
-           AND o.failure_class = 'STATIC_BUDGET_GAP'
-         )
-       )
+        ON ${zombieObservationOwnershipPrefilterSql({
+          observationAlias: 'o',
+          channelExpression: "COALESCE(j.payload->>'channelId','')",
+          retryObservedAtExpression: "j.payload->>'retryObservedAt'",
+          surfacesParam: '$2',
+        })}
      WHERE j.id = ANY($1::uuid[])
        AND j.type='${ZOMBIE_RETRY_JOB_TYPE}'
      ORDER BY j.id, o.observed_at, o.id
@@ -479,28 +586,34 @@ export async function buildPhase0ZombieReconciliationReport(
   const includeRows = options.includeRows === true;
   const generatedAt = new Date().toISOString();
 
-  const schema = await db.query(
-    `SELECT to_regclass('public.community_acquisition_url_state') IS NOT NULL
-            AS ledger_table_present`,
-  );
+  const schema = await db.query(zombieReconciliationSchemaSql());
   const ledgerTablePresent = schema.rows[0]?.ledger_table_present === true;
+  const closureColumnsPresent = schema.rows[0]?.closure_columns_present === true;
 
   const populationResult = await db.query(
     `SELECT count(*) FILTER (WHERE status='PENDING')::int AS pending_retries,
-            count(*) FILTER (WHERE status='PROCESSING')::int AS processing_retries
+            count(*) FILTER (WHERE status='PROCESSING')::int AS processing_retries,
+            count(*) FILTER (
+              WHERE status='PENDING'
+              ${closureColumnsPresent ? 'AND closed_at IS NULL' : ''}
+            )::int AS scannable
        FROM jobs
       WHERE type='${ZOMBIE_RETRY_JOB_TYPE}'
         AND status IN ('PENDING','PROCESSING')`,
   );
   const pendingRetries = Number(populationResult.rows[0]?.pending_retries || 0);
   const processingRetries = Number(populationResult.rows[0]?.processing_retries || 0);
+  const scannable = Number(populationResult.rows[0]?.scannable ?? pendingRetries);
 
   const ledgerResult = ledgerTablePresent
     ? await db.query(`SELECT count(*)::int AS rows FROM community_acquisition_url_state`)
     : { rows: [{ rows: 0 }] };
   const ledgerRows = Number(ledgerResult.rows[0]?.rows || 0);
 
-  const candidateIds = await db.query(zombieCandidateJobIdsSql(), [maxJobs]);
+  const candidateIds = await db.query(
+    zombieCandidateJobIdsSql({ excludeClosed: closureColumnsPresent }),
+    [maxJobs],
+  );
   const jobIds = candidateIds.rows
     .map(row => String(row.job_id || ''))
     .filter(Boolean);
@@ -529,7 +642,10 @@ export async function buildPhase0ZombieReconciliationReport(
   } else if (ledgerRows === 0) {
     warnings.push('phase0_ledger_empty_channel_evidence_only');
   }
-  if (rows.length < pendingRetries + processingRetries) {
+  if (!closureColumnsPresent) {
+    warnings.push('closure_columns_missing_historical_epochs_not_filtered');
+  }
+  if (rows.length < scannable + processingRetries) {
     warnings.push('candidate_limit_reached');
   }
 
@@ -537,10 +653,11 @@ export async function buildPhase0ZombieReconciliationReport(
     generatedAt,
     dryRun: true,
     maxJobs,
-    schema: { ledgerTablePresent },
+    schema: { ledgerTablePresent, closureColumnsPresent },
     population: {
       pendingRetries,
       processingRetries,
+      scannable,
       examined: rows.length,
     },
     ledger: { rows: ledgerRows },

@@ -46,6 +46,7 @@ test('migration 167 requires all-or-none closure evidence without validating his
   assert.match(withoutSqlComments, /closed_reason IS NULL/);
   assert.match(withoutSqlComments, /closed_evidence IS NULL/);
   assert.match(withoutSqlComments, /closed_by IS NULL/);
+  assert.match(withoutSqlComments, /\)\s*OR\s*\(/);
   assert.match(withoutSqlComments, /closed_at IS NOT NULL/);
   assert.match(withoutSqlComments, /closed_reason IS NOT NULL/);
   assert.match(withoutSqlComments, /btrim\(closed_reason\) <> ''/);
@@ -59,10 +60,21 @@ test('migration 167 requires all-or-none closure evidence without validating his
   assert.match(migration, /FROM pg_constraint/);
 });
 
-test('migration 167 installs a single append-only BEFORE UPDATE guard on jobs', () => {
+test('migration 167 constrains closure reasons to the classifier values', () => {
+  assert.match(migration, /ADD CONSTRAINT jobs_closure_reason_allowed_check/);
+  assert.match(
+    withoutSqlComments,
+    /closed_reason IS NULL\s+OR closed_reason IN \('CHANNEL_TERMINAL','LEDGER_ALL_TERMINAL'\)/,
+  );
+});
+
+test('migration 167 installs a single append-only UPDATE/DELETE guard on jobs', () => {
   assert.match(migration, /CREATE OR REPLACE FUNCTION public\.guard_job_closure_evidence\(\)/);
   assert.match(migration, /RETURNS trigger/);
   assert.match(migration, /LANGUAGE plpgsql/);
+  assert.match(migration, /TG_OP = 'DELETE'/);
+  assert.match(migration, /JOB_CLOSURE_IMMUTABLE: closure evidence cannot be deleted/);
+  assert.match(migration, /RETURN OLD;/);
   assert.match(migration, /OLD\.closed_at IS NOT NULL/);
   for (const field of ['closed_at', 'closed_reason', 'closed_evidence', 'closed_by']) {
     assert.match(
@@ -75,14 +87,15 @@ test('migration 167 installs a single append-only BEFORE UPDATE guard on jobs', 
   assert.match(migration, /DROP TRIGGER IF EXISTS jobs_closure_evidence_guard ON public\.jobs/);
   assert.match(
     migration,
-    /CREATE TRIGGER jobs_closure_evidence_guard\s+BEFORE UPDATE ON public\.jobs\s+FOR EACH ROW\s+EXECUTE FUNCTION public\.guard_job_closure_evidence\(\)/s,
+    /CREATE TRIGGER jobs_closure_evidence_guard\s+BEFORE UPDATE OR DELETE ON public\.jobs\s+FOR EACH ROW\s+EXECUTE FUNCTION public\.guard_job_closure_evidence\(\)/s,
   );
   assert.equal((migration.match(/CREATE TRIGGER jobs_closure_evidence_guard/g) || []).length, 1);
 });
 
 test('migration 167 is additive and rewrites no historical rows', () => {
   assert.match(migration, /SET LOCAL lock_timeout = '10s'/);
-  assert.doesNotMatch(withoutSqlComments, /\b(?:DROP\s+TABLE|DELETE|TRUNCATE)\b/i);
+  assert.doesNotMatch(withoutSqlComments, /\b(?:DROP\s+TABLE|TRUNCATE)\b/i);
+  assert.doesNotMatch(withoutSqlComments, /\bDELETE\s+FROM\b/i);
   assert.doesNotMatch(withoutSqlComments, /\bUPDATE\s+(?:public\.)?jobs\b/i);
   assert.doesNotMatch(withoutSqlComments, /\bINSERT\s+INTO\b/i);
   assert.doesNotMatch(withoutSqlComments, /\bSET\s+closed_(?:reason|evidence|by|at)\s*=/i);
@@ -93,6 +106,10 @@ test('migration 167 is additive and rewrites no historical rows', () => {
 
 test('the closure write is confined to the operator-gated apply path', () => {
   const applyModule = readFileSync(new URL('./phase0ZombieApply.ts', import.meta.url), 'utf8');
+  const reconciliationModule = readFileSync(
+    new URL('./phase0ZombieReconciliation.ts', import.meta.url),
+    'utf8',
+  );
   const applyScript = readFileSync(new URL('../scripts/phase0ZombieApply.ts', import.meta.url), 'utf8');
 
   // The apply writes all four closure fields in one statement, so a crash
@@ -102,8 +119,9 @@ test('the closure write is confined to the operator-gated apply path', () => {
   assert.match(applyModule, /closed_by=\$4/);
   assert.match(applyModule, /closed_at=\$5::timestamptz/);
   assert.match(applyModule, /AND status='PENDING'/);
-  assert.match(applyModule, /AND closed_at IS NULL/);
-  assert.match(applyModule, /FOR UPDATE SKIP LOCKED/);
+  assert.match(applyModule, /zombieClosureEvidenceGuardSql/);
+  assert.match(reconciliationModule, /j\.closed_at IS NULL/);
+  assert.match(reconciliationModule, /FOR UPDATE SKIP LOCKED/);
 
   // A report-only run (no --apply) must never reach the closure UPDATE.
   assert.match(applyModule, /if \(!apply\) \{/);

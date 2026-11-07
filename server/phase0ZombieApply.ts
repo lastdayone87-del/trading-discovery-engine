@@ -12,21 +12,31 @@
  *   * only `PENDING` jobs are candidates, and candidate rows are locked with
  *     `FOR UPDATE SKIP LOCKED` so a worker can never claim one mid-audit;
  *   * `closed_at IS NULL` excludes jobs that already carry closure evidence
- *     from an earlier batch or retry epoch;
+ *     from an earlier batch or retry epoch; the record is append-only, so a
+ *     reopened generation is not re-closed by Phase 0;
  *   * every closure writes append-only `closed_reason`, `closed_evidence`,
  *     `closed_by`, and `closed_at` in the same transaction;
- *   * the batch is bounded by both `maxScan` and `maxClosures`;
+ *   * the batch is bounded by both `maxScan` and `maxClosures`, and `offset`
+ *     lets an operator advance past a window dominated by permanent skips;
  *   * report-only mode (no `--apply`) issues no writes;
- *   * the CLI runs the batch in one transaction and requires a reviewed
- *     dry-run before the operator enables `--apply`.
+ *   * the closure UPDATE re-checks the ownership prefilter and active ledger
+ *     state at statement time, so evidence committed after the evidence query
+ *     still blocks the write;
+ *   * the CLI runs the batch in one `READ COMMITTED` transaction. Full
+ *     synchronization with evidence writers lands with Phase 1's atomic
+ *     claim/lease/recovery; Phase 0 relies on the reviewed dry-run, the actor
+ *     gate, the bounded batch, and 100% audit of the first 100 closures.
  */
 
 import {
   ZOMBIE_COMMUNITY_SURFACES,
   ZOMBIE_RETRY_JOB_TYPE,
   buildZombieReconciliationRows,
+  zombieCandidateJobIdsSql,
+  zombieClosureEvidenceGuardSql,
   zombieEvidenceSqlForJobIds,
   zombieNewerObservationSqlByJobIds,
+  zombieReconciliationSchemaSql,
   type Phase0ZombieReconciliationDb,
   type Phase0ZombieReconciliationRow,
   type ZombieClosureReason,
@@ -37,6 +47,7 @@ export const PHASE0_ZOMBIE_APPLY_DEFAULT_MAX_SCAN = 500;
 export const PHASE0_ZOMBIE_APPLY_DEFAULT_MAX_CLOSURES = 100;
 export const PHASE0_ZOMBIE_APPLY_MAX_SCAN = 5_000;
 export const PHASE0_ZOMBIE_APPLY_MAX_CLOSURES = 500;
+export const PHASE0_ZOMBIE_APPLY_MAX_OFFSET = 1_000_000;
 export const PHASE0_ZOMBIE_APPLY_MAX_ACTOR_LENGTH = 200;
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -50,6 +61,8 @@ export interface Phase0ZombieApplyOptions {
   maxScan?: number;
   /** Bound on applied closures from one scan. */
   maxClosures?: number;
+  /** Advance the bounded candidate window past permanent skips. */
+  offset?: number;
   /** Optional explicit job ids (operator audit batch or test isolation). */
   jobIds?: readonly string[];
   includeRows?: boolean;
@@ -77,7 +90,7 @@ export interface Phase0ZombieApplyReport {
   schema: { ledgerTablePresent: boolean; closureColumnsPresent: boolean };
   population: { pendingRetries: number; processingRetries: number; scannable: number };
   ledger: { rows: number };
-  scan: { locked: number };
+  scan: { locked: number; offset: number; nextOffset: number | null };
   summary: {
     examined: number;
     proposedClosures: number;
@@ -97,6 +110,7 @@ export interface Phase0ZombieApplyArgs {
   actor: string | null;
   maxScan: number;
   maxClosures: number;
+  offset: number;
   includeRows: boolean;
   check: boolean;
   out: string | null;
@@ -105,7 +119,7 @@ export interface Phase0ZombieApplyArgs {
 
 export const PHASE0_ZOMBIE_APPLY_USAGE =
   'Usage: npx tsx scripts/phase0ZombieApply.ts --apply --actor=<operator> '
-  + '[--max-scan=500] [--max-closures=100] [--include-rows] [--check] [--out=path]';
+  + '[--max-scan=500] [--max-closures=100] [--offset=0] [--include-rows] [--check] [--out=path]';
 
 /** Shared actor validation: trimmed, bounded, and free of control characters. */
 export function normalizeZombieApplyActor(raw: unknown): string {
@@ -160,6 +174,7 @@ export function parsePhase0ZombieApplyArgs(
     actor: null,
     maxScan: PHASE0_ZOMBIE_APPLY_DEFAULT_MAX_SCAN,
     maxClosures: PHASE0_ZOMBIE_APPLY_DEFAULT_MAX_CLOSURES,
+    offset: 0,
     includeRows: false,
     check: false,
     out: null,
@@ -185,6 +200,13 @@ export function parsePhase0ZombieApplyArgs(
         '--max-closures',
         1,
         PHASE0_ZOMBIE_APPLY_MAX_CLOSURES,
+      );
+    } else if (raw.startsWith('--offset=')) {
+      args.offset = parseBoundedInteger(
+        raw.slice('--offset='.length),
+        '--offset',
+        0,
+        PHASE0_ZOMBIE_APPLY_MAX_OFFSET,
       );
     } else if (raw.startsWith('--out=')) {
       const out = raw.slice('--out='.length);
@@ -259,36 +281,6 @@ export function phase0ZombieApplyCheckFailures(report: Phase0ZombieApplyReport):
   return failures;
 }
 
-function zombieApplySchemaSql(): string {
-  return `
-    SELECT to_regclass('public.community_acquisition_url_state') IS NOT NULL
-             AS ledger_table_present,
-           (
-             SELECT count(*) = 4
-               FROM information_schema.columns
-              WHERE table_schema='public'
-                AND table_name='jobs'
-                AND column_name IN (
-                  'closed_reason','closed_evidence','closed_by','closed_at'
-                )
-           ) AS closure_columns_present
-  `;
-}
-
-function zombieApplyCandidateSql(restricted: boolean): string {
-  return `
-    SELECT j.id AS job_id
-      FROM jobs j
-     WHERE j.type='${ZOMBIE_RETRY_JOB_TYPE}'
-       AND j.status='PENDING'
-       AND j.closed_at IS NULL
-       ${restricted ? 'AND j.id = ANY($2::uuid[])' : ''}
-     ORDER BY j.first_enqueued_at ASC NULLS FIRST, j.id ASC
-     LIMIT $1
-     FOR UPDATE SKIP LOCKED
-  `;
-}
-
 function zombieApplyPopulationSql(restricted: boolean): string {
   return `
     SELECT count(*) FILTER (WHERE status='PENDING')::int AS pending_retries,
@@ -325,13 +317,14 @@ export async function runPhase0ZombieApply(
     1,
     PHASE0_ZOMBIE_APPLY_MAX_CLOSURES,
   );
+  const offset = boundedInteger(options.offset, 0, 0, PHASE0_ZOMBIE_APPLY_MAX_OFFSET);
   const jobIds = normalizeJobIds(options.jobIds);
   const restricted = jobIds !== null;
   const includeRows = options.includeRows === true;
   const now = options.now ?? (() => new Date());
   const generatedAt = now().toISOString();
 
-  const schemaResult = await db.query(zombieApplySchemaSql());
+  const schemaResult = await db.query(zombieReconciliationSchemaSql());
   const schema = {
     ledgerTablePresent: schemaResult.rows[0]?.ledger_table_present === true,
     closureColumnsPresent: schemaResult.rows[0]?.closure_columns_present === true,
@@ -361,8 +354,14 @@ export async function runPhase0ZombieApply(
   const ledgerRows = Number(ledgerResult.rows[0]?.rows || 0);
 
   const candidates = await db.query(
-    zombieApplyCandidateSql(restricted),
-    restricted ? [maxScan, jobIds] : [maxScan],
+    zombieCandidateJobIdsSql({
+      statuses: ['PENDING'],
+      excludeClosed: true,
+      lock: true,
+      restricted,
+      paged: true,
+    }),
+    restricted ? [maxScan, jobIds, offset] : [maxScan, offset],
   );
   const lockedIds = candidates.rows
     .map(row => String(row.job_id || ''))
@@ -406,7 +405,7 @@ export async function runPhase0ZombieApply(
       const updated = await db.query(
         `UPDATE jobs
             SET status='COMPLETED',
-                completed_at=COALESCE(completed_at,now()),
+                completed_at=COALESCE(completed_at,$5::timestamptz),
                 locked_by=NULL,
                 locked_at=NULL,
                 closed_reason=$2,
@@ -417,8 +416,16 @@ export async function runPhase0ZombieApply(
           WHERE id=$1
             AND status='PENDING'
             AND closed_at IS NULL
+            AND ${zombieClosureEvidenceGuardSql('$6')}
           RETURNING id`,
-        [row.jobId, row.reason, JSON.stringify(evidence), actor, closedAt],
+        [
+          row.jobId,
+          row.reason,
+          JSON.stringify(evidence),
+          actor,
+          closedAt,
+          ZOMBIE_COMMUNITY_SURFACES,
+        ],
       );
       if (!updated.rows || updated.rows.length === 0) {
         warnings.push(`closure_update_skipped:${row.jobId}`);
@@ -454,7 +461,11 @@ export async function runPhase0ZombieApply(
   if (proposals.length > selected.length) {
     warnings.push('closure_limit_reached');
   }
-  if (!restricted && lockedIds.length === maxScan && scannable > lockedIds.length) {
+  const remainingAfterScan = Math.max(0, scannable - offset - lockedIds.length);
+  const scanLimitReached = !restricted
+    && lockedIds.length === maxScan
+    && remainingAfterScan > 0;
+  if (scanLimitReached) {
     warnings.push('scan_limit_reached');
   }
 
@@ -475,16 +486,18 @@ export async function runPhase0ZombieApply(
       scannable,
     },
     ledger: { rows: ledgerRows },
-    scan: { locked: lockedIds.length },
+    scan: {
+      locked: lockedIds.length,
+      offset,
+      nextOffset: scanLimitReached ? offset + lockedIds.length : null,
+    },
     summary: {
       examined: rows.length,
       proposedClosures: proposals.length,
       appliedClosures: closures.filter(closure => closure.applied).length,
       skipped: skippedRows.length,
       closureLimitReached: proposals.length > selected.length,
-      scanLimitReached: !restricted
-        && lockedIds.length === maxScan
-        && scannable > lockedIds.length,
+      scanLimitReached,
       byReason,
     },
     closures,

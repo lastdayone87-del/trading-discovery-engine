@@ -181,8 +181,10 @@ function observationRow(overrides: Record<string, unknown> = {}) {
 
 function fakeDb(candidateRows: any[], options: {
   ledgerTablePresent?: boolean;
+  closureColumnsPresent?: boolean;
   pendingRetries?: number;
   processingRetries?: number;
+  scannable?: number;
   ledgerRows?: number;
   newerObservations?: any[];
 } = {}) {
@@ -193,7 +195,12 @@ function fakeDb(candidateRows: any[], options: {
       sql.push(text);
       params.push(values);
       if (text.includes('to_regclass')) {
-        return { rows: [{ ledger_table_present: options.ledgerTablePresent !== false }] };
+        return {
+          rows: [{
+            ledger_table_present: options.ledgerTablePresent !== false,
+            closure_columns_present: options.closureColumnsPresent !== false,
+          }],
+        };
       }
       if (text.includes('pending_retries')) {
         return {
@@ -202,6 +209,9 @@ function fakeDb(candidateRows: any[], options: {
               .filter(row => row.job_status === 'PENDING').length,
             processing_retries: options.processingRetries ?? candidateRows
               .filter(row => row.job_status === 'PROCESSING').length,
+            scannable: options.scannable
+              ?? options.pendingRetries
+              ?? candidateRows.filter(row => row.job_status === 'PENDING').length,
           }],
         };
       }
@@ -289,6 +299,9 @@ test('the dry-run report partitions every examined job into proposals or skips',
   const candidateSql = sql[candidateIndex];
   assert.doesNotMatch(candidateSql, /external_acquisition_observations/);
   assert.match(candidateSql, /LIMIT \$1/);
+  assert.match(candidateSql, /closed_at IS NULL/);
+  assert.equal(report.schema.closureColumnsPresent, true);
+  assert.equal(report.population.scannable, 8);
   assert.doesNotMatch(candidateSql, /\b(?:INSERT|UPDATE|DELETE|TRUNCATE)\b/i);
 
   const evidenceSql = sql.find(text => text.includes('WITH candidate_channels AS'));
@@ -302,7 +315,9 @@ test('the dry-run report partitions every examined job into proposals or skips',
   const newerSql = sql.find(text => text.includes('external_acquisition_observations'));
   assert.ok(newerSql);
   assert.match(newerSql, /o\.provenance->>'surface' = ANY\(\$2::text\[\]\)/);
-  assert.match(newerSql, /o\.observed_at > btrim\(j\.payload->>'retryObservedAt'\)::timestamptz/);
+  assert.match(newerSql, /CASE\s+WHEN pg_input_is_valid/);
+  assert.match(newerSql, /THEN o\.observed_at > btrim\(j\.payload->>'retryObservedAt'\)::timestamptz/);
+  assert.doesNotMatch(newerSql, /AND o\.observed_at >/);
   assert.match(newerSql, /ANY\(\$1::uuid\[\]\)/);
   assert.match(newerSql, /o\.retryable = true/);
   assert.match(newerSql, /o\.provenance->'required' = 'true'::jsonb/);
@@ -310,6 +325,27 @@ test('the dry-run report partitions every examined job into proposals or skips',
   assert.match(newerSql, /o\.failure_class = 'STATIC_BUDGET_GAP'/);
   assert.doesNotMatch(newerSql, /\bLIMIT\s+\$1\b/);
   assert.doesNotMatch(newerSql, /\b(?:INSERT|UPDATE|DELETE|TRUNCATE)\b/i);
+});
+
+test('the dry-run filters closed epochs only when closure columns exist', async () => {
+  const present = fakeDb([fixtureRow()]);
+  const presentReport = await buildPhase0ZombieReconciliationReport(present.db);
+  assert.equal(presentReport.schema.closureColumnsPresent, true);
+  const presentCandidate = present.sql.find(text =>
+    text.includes('SELECT j.id AS job_id')
+    && !text.includes('external_acquisition_observations'));
+  assert.ok(presentCandidate);
+  assert.match(presentCandidate, /closed_at IS NULL/);
+
+  const absent = fakeDb([fixtureRow()], { closureColumnsPresent: false });
+  const absentReport = await buildPhase0ZombieReconciliationReport(absent.db);
+  assert.equal(absentReport.schema.closureColumnsPresent, false);
+  assert.ok(absentReport.warnings.includes('closure_columns_missing_historical_epochs_not_filtered'));
+  const absentCandidate = absent.sql.find(text =>
+    text.includes('SELECT j.id AS job_id')
+    && !text.includes('external_acquisition_observations'));
+  assert.ok(absentCandidate);
+  assert.doesNotMatch(absentCandidate, /closed_at IS NULL/);
 });
 
 test('newer observations are classified by shared retry ownership, not raw flags', async () => {

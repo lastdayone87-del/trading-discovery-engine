@@ -150,6 +150,11 @@ maybe('the bounded apply closes only evidence-backed zombies and records immutab
       assert.equal(row.closed_reason, 'CHANNEL_TERMINAL');
       assert.equal(row.closed_by, 'phase0-zombie-apply-test');
       assert.ok(row.closed_at);
+      assert.equal(row.completed_at.getTime(), row.closed_at.getTime());
+      assert.equal(
+        new Date(row.closed_evidence.closedAt).getTime(),
+        row.closed_at.getTime(),
+      );
       assert.equal(row.closed_evidence.classifier, 'phase0-zombie-retry-closure');
       assert.equal(row.closed_evidence.reason, 'CHANNEL_TERMINAL');
       assert.equal(row.closed_evidence.criterion, 'channel_terminal');
@@ -208,6 +213,30 @@ maybe('the bounded apply closes only evidence-backed zombies and records immutab
       /jobs_closure_evidence_complete_check/,
     );
     await client.query('ROLLBACK TO SAVEPOINT completeness_guard');
+
+    // A complete closure shape still has to use a classifier reason.
+    await client.query('SAVEPOINT reason_guard');
+    await assert.rejects(
+      client.query(
+        `UPDATE jobs
+            SET closed_reason='OTHER',
+                closed_evidence='{}'::jsonb,
+                closed_by='phase0-zombie-apply-test',
+                closed_at=now()
+          WHERE id=$1`,
+        [skipOpen],
+      ),
+      /jobs_closure_reason_allowed_check/,
+    );
+    await client.query('ROLLBACK TO SAVEPOINT reason_guard');
+
+    // A closed job cannot be deleted, so its evidence cannot disappear.
+    await client.query('SAVEPOINT delete_guard');
+    await assert.rejects(
+      client.query('DELETE FROM jobs WHERE id=$1', [closeTerminal]),
+      /JOB_CLOSURE_IMMUTABLE: closure evidence cannot be deleted/,
+    );
+    await client.query('ROLLBACK TO SAVEPOINT delete_guard');
   } finally {
     // Everything in this suite is transactional; rolling back removes the
     // fixtures without deleting append-only historical observations.
