@@ -1,5 +1,5 @@
 import { getDb } from './dbCore';
-import { providerCooldownExpiryMs } from './providerResilience';
+import { geminiSemanticCooldownMs, providerCooldownExpiryMs } from './providerResilience';
 
 /**
  * Credential-free semantic provider route health. Exposed through the
@@ -133,14 +133,14 @@ export async function getSemanticRouteHealth(nowMs: number = Date.now(), deps?: 
     };
   });
 
-  const geminiCooldownMs = Number(process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS || 90_000);
+  const geminiCooldownMs = geminiSemanticCooldownMs();
   const geminiRoutes = geminiModule.configuredGeminiRoutes().map(route => {
     const org = geminiModule.geminiRouteOrg(route);
     const persisted = ledger.get(`gemini\u0000${org}`);
     const cooldownUntilMs = providerCooldownExpiryMs(
       persisted?.lastAt,
       persisted?.declaredUntil,
-      Number.isFinite(geminiCooldownMs) && geminiCooldownMs >= 0 ? geminiCooldownMs : 90_000,
+      geminiCooldownMs,
       nowMs,
     );
     return {

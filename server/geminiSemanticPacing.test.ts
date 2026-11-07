@@ -438,12 +438,17 @@ describe('Gemini semantic pacing regression', () => {
       if (saved !== undefined) process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS = saved;
     });
 
-    it('empty env var uses 90,000 default (deployment UIs send empty for unset)', () => {
+    it('empty/whitespace env vars use 90,000 default (deployment UIs send empty for unset)', () => {
       const saved = process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS;
-      try { process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS = ''; } catch {}
-      assert.equal(geminiSemanticCooldownMs(), 90_000, 'empty var must behave as unset, not zero');
-      if (saved !== undefined) process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS = saved;
-      else delete process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS;
+      try {
+        for (const value of ['', '   ']) {
+          process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS = value;
+          assert.equal(geminiSemanticCooldownMs(), 90_000, `${JSON.stringify(value)} must behave as unset, not zero`);
+        }
+      } finally {
+        if (saved !== undefined) process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS = saved;
+        else delete process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS;
+      }
     });
 
     it('valid positive value is respected', () => {

@@ -32,17 +32,26 @@ test('a failed ledger read is not cached as an authoritative empty ledger', asyn
   }
 });
 
-test('a complete ledger read is cached across polls inside the TTL', async () => {
+test('a complete ledger read is cached inside the TTL and refreshed after it', async (t) => {
   resetSemanticRouteHealthCacheForTests();
+  let clockMs = 1_000_000;
+  t.mock.method(Date, 'now', () => clockMs);
   try {
     let queries = 0;
     const ok = async () => {
       queries++;
       return [];
     };
-    await getSemanticRouteHealth(Date.now(), { query: ok });
-    await getSemanticRouteHealth(Date.now() + 5_000, { query: ok });
-    assert.equal(queries, 2, 'the second poll inside the TTL must reuse the cache');
+    await getSemanticRouteHealth(clockMs, { query: ok });
+    assert.equal(queries, 2, 'the first poll reads both aggregates');
+
+    clockMs += 5_000;
+    await getSemanticRouteHealth(clockMs, { query: ok });
+    assert.equal(queries, 2, 'a poll inside the TTL must reuse the cache');
+
+    clockMs += 20_000;
+    await getSemanticRouteHealth(clockMs, { query: ok });
+    assert.equal(queries, 4, 'a poll after the TTL must re-read both aggregates');
   } finally {
     resetSemanticRouteHealthCacheForTests();
   }
