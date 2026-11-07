@@ -204,10 +204,13 @@ function sqlRequiredTrue(alias: string): string {
 }
 
 function sqlSharedEvidence(alias: string): string {
-  return `(
+  // COALESCE keeps absent/non-string keys FALSE instead of NULL: `NOT NULL`
+  // would otherwise poison both processed and browser evidence for ordinary
+  // observations that carry no sharedEvidenceFrom.
+  return `COALESCE((
     jsonb_typeof(${alias}.provenance->'sharedEvidenceFrom') = 'string'
     AND btrim(${alias}.provenance->>'sharedEvidenceFrom') <> ''
-  )`;
+  ), false)`;
 }
 
 /*
