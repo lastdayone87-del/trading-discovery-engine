@@ -123,8 +123,9 @@ function requireDatabaseUrl(): string {
 }
 
 /**
- * One TLS policy for every PostgreSQL pool. Keeping this in one place means a
- * future hardening change reaches both the runtime and operator-report pools.
+ * TLS policy shared by the runtime and operator-report pools in this module.
+ * Scripts under scripts/ create their own pools and do not use this helper, so
+ * a hardening change here must be mirrored there.
  */
 function postgresSslOptions(): false | { rejectUnauthorized: false } | undefined {
   if (process.env.PGSSL === 'disable') return false;

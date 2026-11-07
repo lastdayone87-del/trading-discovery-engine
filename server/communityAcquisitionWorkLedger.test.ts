@@ -271,6 +271,11 @@ test('equal-timestamp observations are ordered deterministically by id', () => {
   const reverse = projectCommunityAcquisitionWork([second, first]).rows[0];
   assert.equal(forward.lastOutcome, reverse.lastOutcome);
   assert.equal(forward.lastFailureClass, 'PERMANENT_ACCESS_BLOCK');
+  assert.equal(
+    reverse.lastFailureClass,
+    'PERMANENT_ACCESS_BLOCK',
+    'reversing input order must not change the id tie-break winner',
+  );
 });
 
 test('the latest observation wins within the same rank regardless of input order', () => {
