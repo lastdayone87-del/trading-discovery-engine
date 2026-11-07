@@ -6,6 +6,8 @@ import {
   classifyZombieRetryClosure,
   parsePhase0ZombieReconciliationArgs,
   phase0ZombieReconciliationCheckFailures,
+  zombieCandidateJobIdsSql,
+  zombieClosureEvidenceGuardSql,
   type ZombieRetryEvidence,
 } from './phase0ZombieReconciliation';
 
@@ -154,6 +156,7 @@ function fixtureRow(overrides: Record<string, unknown> = {}) {
     created_at: '2026-10-01T00:00:00.000Z',
     first_enqueued_at: '2026-10-01T00:00:00.000Z',
     reopen_generation: 0,
+    closed_at: null,
     retry_observed_at: '2026-10-02T00:00:00.000Z',
     channel_present: true,
     discord_validation_status: 'SUCCEEDED',
@@ -181,6 +184,7 @@ function observationRow(overrides: Record<string, unknown> = {}) {
 
 function fakeDb(candidateRows: any[], options: {
   ledgerTablePresent?: boolean;
+  closureColumnsPresent?: boolean;
   pendingRetries?: number;
   processingRetries?: number;
   ledgerRows?: number;
@@ -188,27 +192,55 @@ function fakeDb(candidateRows: any[], options: {
 } = {}) {
   const sql: string[] = [];
   const params: unknown[][] = [];
+  const closureColumnsPresent = options.closureColumnsPresent !== false;
+  const isScannable = (row: any) => !closureColumnsPresent || row.closed_at === null;
+  let candidateIds: string[] | null = null;
   const db = {
     async query(text: string, values: unknown[] = []) {
       sql.push(text);
       params.push(values);
       if (text.includes('to_regclass')) {
-        return { rows: [{ ledger_table_present: options.ledgerTablePresent !== false }] };
-      }
-      if (text.includes('pending_retries')) {
         return {
           rows: [{
-            pending_retries: options.pendingRetries ?? candidateRows
-              .filter(row => row.job_status === 'PENDING').length,
-            processing_retries: options.processingRetries ?? candidateRows
-              .filter(row => row.job_status === 'PROCESSING').length,
+            ledger_table_present: options.ledgerTablePresent !== false,
+            closure_columns_present: closureColumnsPresent,
+          }],
+        };
+      }
+      if (text.includes('pending_retries')) {
+        const pending = candidateRows.filter(row => row.job_status === 'PENDING');
+        const processing = candidateRows.filter(row => row.job_status === 'PROCESSING');
+        return {
+          rows: [{
+            pending_retries: options.pendingRetries ?? pending.length,
+            processing_retries: options.processingRetries ?? processing.length,
+            // `pendingRetries` also simulates a backlog larger than the rows
+            // returned by the bounded candidate window.
+            scannable_pending: options.pendingRetries
+              ?? pending.filter(isScannable).length,
+            scannable_processing: processing.filter(isScannable).length,
           }],
         };
       }
       if (text.includes('external_acquisition_observations')) {
         return { rows: options.newerObservations ?? [] };
       }
-      if (text.includes('WITH candidates AS')) return { rows: candidateRows };
+      if (text.includes('WITH candidate_channels AS')) {
+        return {
+          rows: candidateIds === null
+            ? candidateRows
+            : candidateRows.filter(row => candidateIds!.includes(row.job_id)),
+        };
+      }
+      if (text.includes('SELECT j.id AS job_id')) {
+        const limit = Number(values[0] ?? candidateRows.length);
+        const scannable = candidateRows.filter(row =>
+          (row.job_status === 'PENDING' || row.job_status === 'PROCESSING')
+          && isScannable(row));
+        const ids = scannable.slice(0, limit).map(row => row.job_id);
+        candidateIds = ids;
+        return { rows: ids.map(jobId => ({ job_id: jobId })) };
+      }
       if (text.includes('FROM community_acquisition_url_state')) {
         return { rows: [{ rows: options.ledgerRows ?? 0 }] };
       }
@@ -280,26 +312,116 @@ test('the dry-run report partitions every examined job into proposals or skips',
   assert.equal(proposals.split(',').length, 2);
   assert.equal(report.summary.proposedClosures + skipped, report.population.examined);
 
-  assert.deepEqual(params[params.length - 1]?.[0], 100);
-  const candidateSql = sql.find(text => text.includes('WITH candidates AS'));
-  assert.ok(candidateSql);
-  assert.match(candidateSql, /pg_input_is_valid/);
+  const candidateIndex = sql.findIndex(text => text.includes('SELECT j.id AS job_id'));
+  assert.ok(candidateIndex >= 0);
+  assert.deepEqual(params[candidateIndex], [100]);
+  const candidateSql = sql[candidateIndex];
   assert.doesNotMatch(candidateSql, /external_acquisition_observations/);
-  assert.match(candidateSql, /RESOLVED','PARKED_EXTERNAL','EXHAUSTED/);
-  assert.match(candidateSql, /PENDING','RUNNING','PARKED_INFRA/);
   assert.match(candidateSql, /LIMIT \$1/);
+  assert.match(candidateSql, /closed_at IS NULL/);
+  assert.equal(report.schema.closureColumnsPresent, true);
+  assert.equal(report.population.scannable, 9);
   assert.doesNotMatch(candidateSql, /\b(?:INSERT|UPDATE|DELETE|TRUNCATE)\b/i);
+
+  const evidenceSql = sql.find(text => text.includes('WITH candidate_channels AS'));
+  assert.ok(evidenceSql);
+  assert.match(evidenceSql, /pg_input_is_valid/);
+  assert.match(evidenceSql, /ANY\(\$1::uuid\[\]\)/);
+  assert.match(evidenceSql, /RESOLVED','PARKED_EXTERNAL','EXHAUSTED/);
+  assert.match(evidenceSql, /PENDING','RUNNING','PARKED_INFRA/);
+  assert.doesNotMatch(evidenceSql, /\b(?:INSERT|UPDATE|DELETE|TRUNCATE)\b/i);
 
   const newerSql = sql.find(text => text.includes('external_acquisition_observations'));
   assert.ok(newerSql);
   assert.match(newerSql, /o\.provenance->>'surface' = ANY\(\$2::text\[\]\)/);
-  assert.match(newerSql, /o\.observed_at > c\.retry_observed_at/);
+  assert.match(newerSql, /CASE\s+WHEN pg_input_is_valid/);
+  assert.match(newerSql, /THEN o\.observed_at > btrim\(j\.payload->>'retryObservedAt'\)::timestamptz/);
+  assert.doesNotMatch(newerSql, /AND o\.observed_at >/);
+  assert.match(newerSql, /ANY\(\$1::uuid\[\]\)/);
   assert.match(newerSql, /o\.retryable = true/);
   assert.match(newerSql, /o\.provenance->'required' = 'true'::jsonb/);
   assert.match(newerSql, /o\.outcome = 'PARTIALLY_INSPECTED'/);
   assert.match(newerSql, /o\.failure_class = 'STATIC_BUDGET_GAP'/);
-  assert.match(newerSql, /LIMIT \$1/);
+  assert.doesNotMatch(newerSql, /\bLIMIT\s+\$1\b/);
   assert.doesNotMatch(newerSql, /\b(?:INSERT|UPDATE|DELETE|TRUNCATE)\b/i);
+});
+
+test('the dry-run filters closed epochs only when closure columns exist', async () => {
+  const present = fakeDb([fixtureRow()]);
+  const presentReport = await buildPhase0ZombieReconciliationReport(present.db);
+  assert.equal(presentReport.schema.closureColumnsPresent, true);
+  const presentCandidate = present.sql.find(text =>
+    text.includes('SELECT j.id AS job_id')
+    && !text.includes('external_acquisition_observations'));
+  assert.ok(presentCandidate);
+  assert.match(presentCandidate, /closed_at IS NULL/);
+
+  const absent = fakeDb([fixtureRow()], { closureColumnsPresent: false });
+  const absentReport = await buildPhase0ZombieReconciliationReport(absent.db);
+  assert.equal(absentReport.schema.closureColumnsPresent, false);
+  assert.ok(absentReport.warnings.includes('closure_columns_missing_historical_epochs_not_filtered'));
+  const absentCandidate = absent.sql.find(text =>
+    text.includes('SELECT j.id AS job_id')
+    && !text.includes('external_acquisition_observations'));
+  assert.ok(absentCandidate);
+  assert.doesNotMatch(absentCandidate, /closed_at IS NULL/);
+});
+
+test('a closed reopened processing row does not make a complete report look truncated', async () => {
+  const openPending = fixtureRow({ job_id: 'reopened-pending' });
+  const closedProcessing = fixtureRow({
+    job_id: 'closed-processing-epoch',
+    job_status: 'PROCESSING',
+    closed_at: '2026-10-05T00:00:00.000Z',
+  });
+  const { db, sql } = fakeDb([openPending, closedProcessing]);
+  const report = await buildPhase0ZombieReconciliationReport(db);
+  assert.equal(report.population.pendingRetries, 1);
+  assert.equal(report.population.processingRetries, 1);
+  // The closed processing epoch is excluded from both the candidate window
+  // and the scannable bound, so it cannot make a complete report look
+  // truncated forever.
+  assert.equal(report.population.examined, 1);
+  assert.equal(report.population.scannable, 1);
+  assert.equal(report.warnings.includes('candidate_limit_reached'), false);
+  assert.deepEqual(phase0ZombieReconciliationCheckFailures(report), []);
+  const candidateSql = sql.find(text => text.includes('SELECT j.id AS job_id'));
+  assert.ok(candidateSql);
+  assert.match(candidateSql, /closed_at IS NULL/);
+});
+
+test('candidate paging is a keyset and the write guard excludes known evidence', () => {
+  const base = zombieCandidateJobIdsSql({ excludeClosed: true });
+  assert.match(base, /ORDER BY j\.first_enqueued_at ASC NULLS FIRST, j\.id ASC/);
+  assert.doesNotMatch(base, /OFFSET/);
+  assert.doesNotMatch(base, /CASE/);
+
+  const page = zombieCandidateJobIdsSql({
+    excludeClosed: true,
+    after: true,
+    includeKey: true,
+  });
+  assert.match(page, /j\.first_enqueued_at AS first_enqueued_at/);
+  assert.match(page, /to_char\(\s*j\.first_enqueued_at AT TIME ZONE 'UTC',\s*'YYYY-MM-DD"T"HH24:MI:SS\.US"Z"'\s*\) AS first_enqueued_at_key/);
+  assert.match(page, /WHEN \$2::timestamptz IS NULL THEN/);
+  assert.match(page, /j\.id > \$3::uuid/);
+  assert.match(page, /j\.first_enqueued_at = \$2::timestamptz AND j\.id > \$3::uuid/);
+  assert.doesNotMatch(page, /OFFSET/);
+
+  const lockedPage = zombieCandidateJobIdsSql({
+    excludeClosed: true,
+    restricted: true,
+    lock: true,
+  });
+  assert.match(lockedPage, /j\.id = ANY\(\$2::uuid\[\]\)/);
+  assert.match(lockedPage, /FOR UPDATE SKIP LOCKED/);
+  assert.doesNotMatch(lockedPage, /OFFSET/);
+
+  const guard = zombieClosureEvidenceGuardSql('$6', '$7');
+  assert.match(guard, /o\.id <> ALL\(\$7::uuid\[\]\)/);
+  assert.match(guard, /NOT EXISTS \(\s*SELECT 1\s+FROM external_acquisition_observations/);
+  assert.match(guard, /NOT EXISTS \(\s*SELECT 1\s+FROM community_acquisition_url_state/);
+  assert.match(guard, /pg_input_is_valid/);
 });
 
 test('newer observations are classified by shared retry ownership, not raw flags', async () => {
@@ -389,7 +511,7 @@ test('a non-finite maxJobs falls back to the documented bound', async () => {
     const report = await buildPhase0ZombieReconciliationReport(db, { maxJobs });
     assert.equal(report.maxJobs, 5_000);
     const candidateIndex = sql.findIndex(text =>
-      text.includes('WITH candidates AS')
+      text.includes('SELECT j.id AS job_id')
       && !text.includes('external_acquisition_observations'));
     assert.ok(candidateIndex >= 0);
     assert.equal(params[candidateIndex]?.[0], 5_000);
