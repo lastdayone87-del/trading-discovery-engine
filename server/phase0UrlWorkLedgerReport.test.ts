@@ -133,9 +133,9 @@ test('the telemetry bound applies shared URL admission and auxiliary ownership',
     retryable: true,
     failure_class: 'NETWORK_FAILURE',
     observed_at: observedAt,
-    required: true,
-    relevance_tier: '',
-    shared_evidence_from: '',
+    required_value: true,
+    relevance_tier_value: null,
+    shared_evidence_from_value: null,
     browser_executed: false,
     ...overrides,
   });
@@ -161,6 +161,13 @@ test('the telemetry bound applies shared URL admission and auxiliary ownership',
       id: '44444444-4444-4444-8444-444444444444',
       normalized_url: 'https://creator.example/topics/vue.js',
       requested_url: 'https://creator.example/topics/vue.js/',
+    }),
+    // Only the JSON boolean true is required, exactly like the projection.
+    effectiveRow({
+      id: '55555555-5555-4555-8555-555555555555',
+      normalized_url: 'https://creator.example/string-required',
+      requested_url: 'https://creator.example/string-required',
+      required_value: 'true',
     }),
   ];
   const db = {

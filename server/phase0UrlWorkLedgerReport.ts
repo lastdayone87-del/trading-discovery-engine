@@ -282,8 +282,9 @@ export async function buildPhase0UrlWorkLedgerReport(
               o.observed_at,
               o.requested_url,
               COALESCE(o.provenance->>'required','false') = 'true' AS required,
-              COALESCE(o.provenance->>'relevanceTier','') AS relevance_tier,
-              COALESCE(o.provenance->>'sharedEvidenceFrom','') AS shared_evidence_from,
+              o.provenance->'required' AS required_value,
+              o.provenance->'relevanceTier' AS relevance_tier_value,
+              o.provenance->'sharedEvidenceFrom' AS shared_evidence_from_value,
               (
                 COALESCE(o.provenance->>'sharedEvidenceFrom','') <> ''
                 OR o.outcome = 'FOUND'
@@ -389,9 +390,9 @@ export async function buildPhase0UrlWorkLedgerReport(
             e.retryable,
             e.failure_class,
             e.observed_at,
-            e.required,
-            e.relevance_tier,
-            e.shared_evidence_from,
+            e.required_value,
+            e.relevance_tier_value,
+            e.shared_evidence_from_value,
             g.browser_executed
        FROM ranked e
        JOIN grouped g
@@ -402,13 +403,19 @@ export async function buildPhase0UrlWorkLedgerReport(
     [windowDays, SURFACES],
   );
 
-  const effectiveRows = telemetry.rows.map(row => ({
-    observation: {
+  let retryableRows = 0;
+  let neverBrowserExecutedRows = 0;
+  for (const row of telemetry.rows) {
+    // Ownership must see the observed URL, not the canonical work key:
+    // stripping a trailing slash can change crawl admission (for example
+    // `/topics/vue.js/` is eligible while `/topics/vue.js` looks like a
+    // resource extension). Keep normalized_url for grouping only.
+    //
+    // The raw JSON values (not text-coerced SQL booleans/strings) preserve the
+    // projection's strict `required === true` and string-only relevance/shared
+    // checks, so malformed provenance cannot change only one side.
+    const observation: CommunityWorkObservation = {
       channelId: String(row.channel_id || ''),
-      // Ownership must see the observed URL, not the canonical work key:
-      // stripping a trailing slash can change crawl admission (for example
-      // `/topics/vue.js/` is eligible while `/topics/vue.js` looks like a
-      // resource extension). Keep normalized_url for grouping only.
       requestedUrl: String(row.requested_url || row.normalized_url || ''),
       outcome: String(row.outcome || ''),
       retryable: row.retryable === true,
@@ -417,21 +424,18 @@ export async function buildPhase0UrlWorkLedgerReport(
       id: row.id ? String(row.id) : undefined,
       provenance: {
         surface: String(row.surface || ''),
-        required: row.required === true,
-        relevanceTier: String(row.relevance_tier || ''),
-        ...(row.shared_evidence_from
-          ? { sharedEvidenceFrom: String(row.shared_evidence_from) }
+        required: row.required_value === true,
+        ...(typeof row.relevance_tier_value === 'string'
+          ? { relevanceTier: row.relevance_tier_value }
+          : {}),
+        ...(typeof row.shared_evidence_from_value === 'string'
+          ? { sharedEvidenceFrom: row.shared_evidence_from_value }
           : {}),
       },
-    } satisfies CommunityWorkObservation,
-    browserExecuted: row.browser_executed === true,
-  }));
-  let retryableRows = 0;
-  let neverBrowserExecutedRows = 0;
-  for (const row of effectiveRows) {
-    if (!observationOwnsRetry(row.observation)) continue;
+    };
+    if (!observationOwnsRetry(observation)) continue;
     retryableRows++;
-    if (!row.browserExecuted) neverBrowserExecutedRows++;
+    if (row.browser_executed !== true) neverBrowserExecutedRows++;
   }
   const telemetryBound = { retryableRows, neverBrowserExecutedRows };
   const reconciliation = reconcileCommunityWorkProjection(
