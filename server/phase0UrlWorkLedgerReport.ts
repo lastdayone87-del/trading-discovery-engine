@@ -13,6 +13,7 @@
 
 import {
   COMMUNITY_ACQUISITION_WORK_SURFACES,
+  observationOwnsRetry,
   projectCommunityAcquisitionWork,
   reconcileCommunityWorkProjection,
   type CommunityWorkObservation,
@@ -192,45 +193,15 @@ const LEDGER_ADMITTED_WORK_CONDITION = `
     AND retryable)
 `;
 
-/**
- * SQL spelling of the production retry-ownership outcome rules. URL admission
- * and auxiliary-link ownership are applied by the shared policy code in the
- * TypeScript projection; reimplementing URL classification in SQL would be a
- * second source of truth, so this bound leaves that residual to the tolerated
- * reconciliation delta.
+/*
+ * The SQL side owns work identity and effective-row selection: URL
+ * normalization, the latest-inspection window, and production precedence.
+ * Retention ownership is then classified with the shared
+ * `observationOwnsRetry` predicate in TypeScript, so URL admission and
+ * auxiliary-link rejection cannot drift from the worker or the projection.
+ * Reimplementing those policy rules in SQL would create a second source of
+ * truth and let the bound over-count auxiliary links.
  */
-const PERMANENT_FAILURE_CLASSES_SQL = `ARRAY[
-  'UNSUPPORTED_CONTENT_TYPE',
-  'LOGIN_WALL',
-  'PAYWALL_WALL',
-  'PERMANENT_ACCESS_BLOCK',
-  'REDIRECT_LIMIT'
-]`;
-
-const FOUND_GAP_FAILURE_CLASSES_SQL = `ARRAY[
-  'REQUIRED_UNVISITED_BUDGET_GAP',
-  'RENDERED_TIMEOUT',
-  'RENDERED_BUDGET_EXPIRED',
-  'RENDERED_PARTIAL_COVERAGE',
-  'RENDERED_INTERACTION_GAP'
-]`;
-
-function retryOwnedSql(alias: string): string {
-  const failureClass = `upper(COALESCE(${alias}.failure_class,''))`;
-  return `(
-    ${alias}.direct_evidence
-    AND ${alias}.retryable
-    AND NOT (${failureClass} = ANY (${PERMANENT_FAILURE_CLASSES_SQL}))
-    AND COALESCE(${alias}.relevance_tier,'') NOT IN ('BLOCK','DEMOTE')
-    AND (
-      (${alias}.required AND ${alias}.outcome = 'FOUND'
-        AND ${failureClass} = ANY (${FOUND_GAP_FAILURE_CLASSES_SQL}))
-      OR (${alias}.outcome = 'PARTIALLY_INSPECTED'
-        AND ${failureClass} = 'STATIC_BUDGET_GAP')
-      OR (${alias}.required AND ${alias}.outcome IN ('ACQUISITION_FAILED','PARTIALLY_INSPECTED'))
-    )
-  )`;
-}
 
 export async function buildPhase0UrlWorkLedgerReport(
   db: Phase0UrlWorkLedgerReportDb,
@@ -309,9 +280,8 @@ export async function buildPhase0UrlWorkLedgerReport(
               o.retryable,
               COALESCE(o.failure_class,'') AS failure_class,
               o.observed_at,
+              o.provenance,
               COALESCE(o.provenance->>'required','false') = 'true' AS required,
-              COALESCE(o.provenance->>'relevanceTier','') AS relevance_tier,
-              COALESCE(o.provenance->>'sharedEvidenceFrom','') = '' AS direct_evidence,
               (
                 COALESCE(o.provenance->>'sharedEvidenceFrom','') <> ''
                 OR o.outcome = 'FOUND'
@@ -375,11 +345,12 @@ export async function buildPhase0UrlWorkLedgerReport(
      ),
      -- Mirror the projection helper selectEffectiveInspectionObservation:
      -- any FOUND wins; else required observations dominate optional notes; an
-     -- unevidenced clean only wins when it is all that remains. This bound
-     -- deliberately omits production effectiveAcquisitionOutcomes' fallback
-     -- collapse to PARTIALLY_INSPECTED, shared-clean shortcut, and later-gap
-     -- carry-over; those residuals stay inside the tolerated reconciliation
-     -- delta rather than being reimplemented in SQL.
+     -- unevidenced clean only wins when it is all that remains. The SQL bound
+     -- and the projection share this simplified selection; production's
+     -- effectiveAcquisitionOutcomes fallback collapse, shared-clean shortcut,
+     -- and later-gap carry-over remain a Phase 1 wiring concern. Retention
+     -- ownership is applied by the shared TypeScript predicate after this
+     -- query returns, so auxiliary URLs cannot inflate the bound.
      pooled AS (
        SELECT current_inspection.*,
               max((outcome = 'FOUND')::int) OVER w AS has_found,
@@ -407,13 +378,16 @@ export async function buildPhase0UrlWorkLedgerReport(
               ) AS effective_rank
          FROM pooled
      )
-     SELECT count(*) FILTER (
-              WHERE ${retryOwnedSql('e')}
-            )::int AS retryable_rows,
-            count(*) FILTER (
-              WHERE ${retryOwnedSql('e')}
-                AND NOT g.browser_executed
-            )::int AS never_browser_executed_rows
+     SELECT e.id,
+            e.channel_id,
+            e.surface,
+            e.normalized_url,
+            e.outcome,
+            e.retryable,
+            e.failure_class,
+            e.observed_at,
+            e.provenance,
+            g.browser_executed
        FROM ranked e
        JOIN grouped g
          ON g.channel_id = e.channel_id
@@ -423,9 +397,26 @@ export async function buildPhase0UrlWorkLedgerReport(
     [windowDays, SURFACES],
   );
 
+  const effectiveRows = telemetry.rows.map(row => ({
+    observation: {
+      channelId: String(row.channel_id || ''),
+      requestedUrl: String(row.normalized_url || ''),
+      outcome: String(row.outcome || ''),
+      retryable: row.retryable === true,
+      failureClass: row.failure_class ? String(row.failure_class) : null,
+      observedAt: new Date(row.observed_at).toISOString(),
+      id: row.id ? String(row.id) : undefined,
+      provenance: row.provenance,
+    } satisfies CommunityWorkObservation,
+    browserExecuted: row.browser_executed === true,
+  }));
+  const retryableEffectiveRows = effectiveRows.filter(
+    row => observationOwnsRetry(row.observation),
+  );
   const telemetryBound = {
-    retryableRows: Number(telemetry.rows[0]?.retryable_rows || 0),
-    neverBrowserExecutedRows: Number(telemetry.rows[0]?.never_browser_executed_rows || 0),
+    retryableRows: retryableEffectiveRows.length,
+    neverBrowserExecutedRows: retryableEffectiveRows
+      .filter(row => !row.browserExecuted).length,
   };
   const reconciliation = reconcileCommunityWorkProjection(
     projection.stats,

@@ -272,6 +272,24 @@ maybe('the read-only report projects and reconciles a fixture backlog', async t 
         required: false,
         telemetry: { mode: 'STATIC', pagesInspected: 1, requestsStarted: 0, requestsFinished: 0 },
       },
+      {
+        key: `phase0-ledger-auxiliary-${suffix}`,
+        url: 'https://calendly.com/phase0-fixture/30min',
+        outcome: 'ACQUISITION_FAILED',
+        retryable: true,
+        failureClass: 'NETWORK_FAILURE',
+        required: true,
+        telemetry: { mode: 'STATIC', pagesInspected: 1, requestsStarted: 0, requestsFinished: 0 },
+      },
+      {
+        key: `phase0-ledger-inadmissible-${suffix}`,
+        url: 'https://fixture.example/assets/logo.png',
+        outcome: 'ACQUISITION_FAILED',
+        retryable: true,
+        failureClass: 'NETWORK_FAILURE',
+        required: true,
+        telemetry: { mode: 'STATIC', pagesInspected: 1, requestsStarted: 0, requestsFinished: 0 },
+      },
     ];
 
     for (const observation of observations) {
@@ -316,7 +334,7 @@ maybe('the read-only report projects and reconciles a fixture backlog', async t 
   assert.ok(report.rows, 'includeRows must return the projection rows');
 
   const rows = report.rows.filter(row => row.channelId === channelId);
-  assert.equal(rows.length, 10, 'optional observations never create a work row by themselves');
+  assert.equal(rows.length, 12, 'optional observations never create a work row by themselves');
   const byUrl = new Map(rows.map(row => [row.normalizedUrl, row]));
   assert.equal(byUrl.get('https://found.example/links')?.state, 'RESOLVED');
   assert.equal(byUrl.get('https://found.example/links')?.neverExecuted, false);
@@ -371,6 +389,11 @@ maybe('the read-only report projects and reconciles a fixture backlog', async t 
   assert.equal(byUrl.get('https://oversized.example/')?.neverExecuted, true);
   assert.equal(byUrl.get('https://oversized.example/')?.neverBrowserExecuted, true);
   assert.equal(byUrl.get('https://optional.example/'), undefined);
+  // Auxiliary commerce/booking URLs and URLs rejected by the crawl admission
+  // gate create admitted work rows but never own retry. The telemetry bound
+  // must reach the same conclusion via the shared predicate.
+  assert.equal(byUrl.get('https://calendly.com/phase0-fixture/30min')?.retryOwned, false);
+  assert.equal(byUrl.get('https://fixture.example/assets/logo.png')?.retryOwned, false);
 
   // The SQL telemetry bound and the TypeScript projection must agree on the
   // fixture rows: seven effective retry owners, six never browser-executed.
