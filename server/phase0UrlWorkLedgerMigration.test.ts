@@ -50,14 +50,14 @@ test('migration 166 adds the mutable URL work ledger additively', () => {
 
 test('migration 166 constrains the lifecycle and idempotent work identity', () => {
   for (const state of ['PENDING', 'RUNNING', 'RESOLVED', 'PARKED_INFRA', 'PARKED_EXTERNAL', 'EXHAUSTED']) {
-    assert.ok(migration.includes(`'${state}'`), `missing state: ${state}`);
+    assert.ok(withoutSqlComments.includes(`'${state}'`), `missing state: ${state}`);
   }
-  assert.match(migration, /UNIQUE \(channel_id, normalized_url, surface\)/);
-  assert.match(migration, /attempts INTEGER NOT NULL DEFAULT 0 CHECK \(attempts >= 0\)/);
-  assert.match(migration, /max_attempts INTEGER NOT NULL DEFAULT 5 CHECK \(max_attempts > 0\)/);
-  assert.match(migration, /CHECK \(jsonb_typeof\(terminal_evidence\) = 'object'\)/);
-  assert.match(migration, /CHECK \(never_executed OR attempts > 0\)/);
-  assert.match(migration, /CHECK \(NOT browser_executed OR NOT never_executed\)/);
+  assert.match(withoutSqlComments, /UNIQUE \(channel_id, normalized_url, surface\)/);
+  assert.match(withoutSqlComments, /attempts INTEGER NOT NULL DEFAULT 0 CHECK \(attempts >= 0\)/);
+  assert.match(withoutSqlComments, /max_attempts INTEGER NOT NULL DEFAULT 5 CHECK \(max_attempts > 0\)/);
+  assert.match(withoutSqlComments, /CHECK \(jsonb_typeof\(terminal_evidence\) = 'object'\)/);
+  assert.match(withoutSqlComments, /CHECK \(never_executed OR attempts > 0\)/);
+  assert.match(withoutSqlComments, /CHECK \(NOT browser_executed OR NOT never_executed\)/);
 });
 
 test('migration 166 indexes the due, channel, and never-executed claims', () => {
@@ -104,11 +104,12 @@ test('the Phase 0 report is read-only and reconciles the two bounds', () => {
   assert.match(reportBuilder, /o\.final_url/);
   assert.match(reportBuilder, /l\.source_url/);
   assert.doesNotMatch(reportBuilder, /canonical_url|site_inspections/);
-  assert.match(reportBuilder, /\^\[0-9\]\{1,18\}\$/);
-  assert.match(reportBuilder, /::numeric <= 2147483647/);
-  assert.ok(
-    reportBuilder.includes('THEN (${jsonExpression})::int ELSE 0 END'),
-    'JSONB text casts must be parenthesized so ::int does not bind to the key literal',
+  assert.match(reportBuilder, /jsonb_typeof\(\$\{jsonbExpression\}\) = 'number'/);
+  assert.match(reportBuilder, /::numeric/);
+  assert.doesNotMatch(
+    reportBuilder,
+    /::int ELSE 0 END/,
+    'counter evidence must not depend on a text-to-int cast that malformed rows can abort',
   );
   assert.match(reportScript, /buildPhase0UrlWorkLedgerReport/);
   assert.match(reportScript, /createReadOnlyDbPool/);

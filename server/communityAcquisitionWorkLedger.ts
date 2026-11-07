@@ -9,8 +9,10 @@
  *
  * Truthfulness rules:
  *
- *   * Only required, community-surface work belongs in this ledger. Optional
- *     or borrowed observations never inflate the backlog.
+ *   * Required, community-surface work belongs in this ledger. Production's
+ *     narrow `STATIC_BUDGET_GAP` exception is included even when
+ *     `required=false` because that gap owns a bounded retry in production.
+ *     Other optional or borrowed observations never inflate the backlog.
  *   * `neverExecuted` clears only when direct processed evidence exists. A
  *     request that started, or a fetch that returned transport metadata, is
  *     not inspection evidence. Borrowed (`sharedEvidenceFrom`) rows are not
@@ -21,13 +23,17 @@
  *   * `INSPECTED_NO_MATCH` resolves a URL only when the crawl actually
  *     processed pages. An unevidenced static result stays PENDING so an
  *     incomplete inspection can never become a false NOT_FOUND.
- *   * The effective observation is chosen rank-first (FOUND >
+ *   * The effective observation is chosen from the latest inspection window
+ *     first, then rank-first within that inspection (FOUND >
  *     INSPECTED_NO_MATCH > PARTIALLY_INSPECTED > ACQUISITION_FAILED), then by
- *     time. This mirrors the production retry predicate and tolerates
- *     inspection-start timestamp skew between static and rendered rows.
+ *     time and observation id. Selecting the latest inspection first prevents
+ *     an old success from hiding a current failure; rank-first within the
+ *     window tolerates inspection-start timestamp skew between static and
+ *     rendered rows.
  */
 
 import { createHash } from 'node:crypto';
+import { isCommunityRetryableObservation } from './communityRetryPolicy';
 
 export type CommunityWorkState =
   | 'PENDING'
@@ -92,8 +98,17 @@ export interface CommunityWorkObservation {
   retryable: boolean;
   failureClass?: string | null;
   observedAt: string;
+  /** Durable observation id. Used only for deterministic same-timestamp ties. */
+  id?: string;
   provenance?: unknown;
 }
+
+/**
+ * Production's current-inspection boundary. Observations from one inspector
+ * run can be stamped minutes apart (static vs rendered), but older runs must
+ * never outrank the latest one.
+ */
+export const COMMUNITY_INSPECTION_WINDOW_MS = 5 * 60 * 1000;
 
 export interface CommunityWorkProjectionRow {
   workKey: string;
@@ -180,9 +195,32 @@ export function surfaceFromObservation(observation: CommunityWorkObservation): s
   return typeof provenance?.surface === 'string' ? provenance.surface.trim().toUpperCase() : '';
 }
 
-/** The production retry predicate only owns required community observations. */
+/** The production retry predicate owns required community observations. */
 export function isRequiredCommunityWorkObservation(observation: CommunityWorkObservation): boolean {
   return asRecord(observation.provenance)?.required === true;
+}
+
+/**
+ * Production's narrow static-budget-gap exception: a retryable
+ * `PARTIALLY_INSPECTED` static seed owns bounded retry even though static
+ * seeds run with `required=false`. It is genuine URL work, not optional
+ * filler, so it belongs in the ledger.
+ */
+export function isStaticBudgetGapWorkObservation(observation: CommunityWorkObservation): boolean {
+  return observation.outcome === 'PARTIALLY_INSPECTED'
+    && failureClassOf(observation) === 'STATIC_BUDGET_GAP'
+    && observation.retryable === true;
+}
+
+/** Work rows the ledger materializes: required work plus the static-gap exception. */
+export function isCommunityLedgerWorkObservation(observation: CommunityWorkObservation): boolean {
+  return isRequiredCommunityWorkObservation(observation)
+    || isStaticBudgetGapWorkObservation(observation);
+}
+
+function relevanceTierOf(observation: CommunityWorkObservation): string | undefined {
+  const value = asRecord(observation.provenance)?.relevanceTier;
+  return typeof value === 'string' ? value : undefined;
 }
 
 /**
@@ -212,9 +250,15 @@ export function hasDirectProcessedAcquisitionEvidence(observation: CommunityWork
 }
 
 /**
- * Production-compatible processed check: borrowed same-inspection evidence is
- * genuine inspection evidence for resolution, but it is not direct execution
- * of this URL (see `hasDirectProcessedAcquisitionEvidence`).
+ * Ledger processed check: borrowed same-inspection evidence is genuine
+ * inspection evidence for resolution, but it is not direct execution of this
+ * URL (see `hasDirectProcessedAcquisitionEvidence`).
+ *
+ * This is deliberately stricter than the inspector's defense-in-depth check,
+ * which also accepts `requestsStarted` and `redirectsFollowed`. A started
+ * request or followed redirect alone never proves a page was inspected, so it
+ * cannot turn absent evidence into a terminal NOT_FOUND. The divergence is
+ * intentional and prevents false negatives.
  */
 export function hasProcessedAcquisitionEvidence(observation: CommunityWorkObservation): boolean {
   if (sharedEvidenceSource(observation)) return true;
@@ -255,15 +299,28 @@ export function countsTowardAttemptBudget(observation: CommunityWorkObservation)
 }
 
 /**
- * Effective retry ownership, matching the production predicate: the chosen
- * observation is a required ACQUISITION_FAILED row that is retryable and is
- * not the deterministic REDIRECT_LIMIT case.
+ * Effective retry ownership. Delegate to the production predicate so the
+ * ledger cannot drift from the worker:
+ *
+ *   * required retryable `ACQUISITION_FAILED` / `PARTIALLY_INSPECTED`;
+ *   * required `FOUND` rows with an outstanding bounded gap class;
+ *   * eligible `PARTIALLY_INSPECTED` `STATIC_BUDGET_GAP` rows even when
+ *     `required=false`;
+ *   * no deterministic permanent failure, BLOCK/DEMOTE tier, auxiliary URL,
+ *     or borrowed shared evidence.
  */
 export function observationOwnsRetry(observation: CommunityWorkObservation): boolean {
-  if (!isRequiredCommunityWorkObservation(observation)) return false;
   if (sharedEvidenceSource(observation)) return false;
-  if (failureClassOf(observation) === 'REDIRECT_LIMIT') return false;
-  return observation.outcome === 'ACQUISITION_FAILED' && observation.retryable === true;
+  if (!isCommunityLedgerWorkObservation(observation)) return false;
+  return isCommunityRetryableObservation({
+    required: isRequiredCommunityWorkObservation(observation),
+    surface: surfaceFromObservation(observation),
+    outcome: observation.outcome,
+    retryable: observation.retryable,
+    failureClass: observation.failureClass ?? undefined,
+    requestedUrl: observation.requestedUrl,
+    relevanceTier: relevanceTierOf(observation),
+  });
 }
 
 /**
@@ -317,11 +374,36 @@ function observationRank(observation: CommunityWorkObservation): number {
   }
 }
 
+function observedAtMs(observation: CommunityWorkObservation): number {
+  const value = Date.parse(observation.observedAt);
+  return Number.isFinite(value) ? value : Number.NEGATIVE_INFINITY;
+}
+
 /**
- * Rank-first effective selection. Timestamps are only a tie-breaker: the
- * inspector stamps rendered observations at inspection start while static
- * observations get a later timestamp, so pure time ordering can prefer an
- * older failure over a newer successful rendered run.
+ * Latest-inspection candidates. Production evaluates retry ownership against
+ * the current inspection (observations around `last_checked`), not against the
+ * whole reporting window. Using the group's newest observation as the anchor
+ * is equivalent for append-only URL history and keeps the pure projection
+ * independent of `channels.last_checked`.
+ */
+export function latestInspectionObservations(
+  observations: readonly CommunityWorkObservation[],
+): CommunityWorkObservation[] {
+  let latest = Number.NEGATIVE_INFINITY;
+  for (const observation of observations) {
+    latest = Math.max(latest, observedAtMs(observation));
+  }
+  if (latest === Number.NEGATIVE_INFINITY) return [...observations];
+  const cutoff = latest - COMMUNITY_INSPECTION_WINDOW_MS;
+  return observations.filter(observation => observedAtMs(observation) >= cutoff);
+}
+
+/**
+ * Rank-first effective selection within the latest inspection. Timestamps are
+ * a tie-breaker because the inspector stamps rendered observations at
+ * inspection start while static observations get a later timestamp. The
+ * observation id makes equal timestamps deterministic and matches the SQL
+ * bound's `id DESC` ordering.
  */
 function isPreferredObservation(
   candidate: CommunityWorkObservation,
@@ -330,12 +412,12 @@ function isPreferredObservation(
   const candidateRank = observationRank(candidate);
   const currentRank = observationRank(current);
   if (candidateRank !== currentRank) return candidateRank > currentRank;
-  const candidateAt = Date.parse(candidate.observedAt);
-  const currentAt = Date.parse(current.observedAt);
-  if (Number.isFinite(candidateAt) && Number.isFinite(currentAt) && candidateAt !== currentAt) {
-    return candidateAt > currentAt;
-  }
-  return false;
+  const candidateAt = observedAtMs(candidate);
+  const currentAt = observedAtMs(current);
+  if (candidateAt !== currentAt) return candidateAt > currentAt;
+  const candidateId = String(candidate.id || '');
+  const currentId = String(current.id || '');
+  return candidateId > currentId;
 }
 
 export function resolveCommunityWorkState(
@@ -395,8 +477,10 @@ export function projectCommunityAcquisitionWork(
     }
     // Optional/auxiliary observations are not backlog work. Shared-evidence
     // rows still describe real work (and may carry a FOUND outcome), but their
-    // borrowed counters never count as this URL's execution or attempt.
-    if (!isRequiredCommunityWorkObservation(observation)) {
+    // borrowed counters never count as this URL's execution or attempt. The
+    // static-budget-gap exception is production retry work even when the seed
+    // is not required.
+    if (!isCommunityLedgerWorkObservation(observation)) {
       skippedRows++;
       continue;
     }
@@ -435,15 +519,18 @@ export function projectCommunityAcquisitionWork(
   let retryableNeverBrowserExecutedRows = 0;
 
   for (const [workKey, group] of grouped) {
-    let latest = group.observations[0];
-    let earliestAt = latest.observedAt;
+    const inspectionCandidates = latestInspectionObservations(group.observations);
+    let latest = inspectionCandidates[0];
+    for (const observation of inspectionCandidates) {
+      if (isPreferredObservation(observation, latest)) latest = observation;
+    }
+    let earliestAt = group.observations[0].observedAt;
     let attempts = 0;
     let directProcessedExecutions = 0;
     let browserExecutions = 0;
     let lastAttemptAt: string | null = null;
 
     for (const observation of group.observations) {
-      if (isPreferredObservation(observation, latest)) latest = observation;
       if (Date.parse(observation.observedAt) < Date.parse(earliestAt)) {
         earliestAt = observation.observedAt;
       }

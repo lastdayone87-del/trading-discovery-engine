@@ -122,6 +122,15 @@ function requireDatabaseUrl(): string {
   return url;
 }
 
+/**
+ * One TLS policy for every PostgreSQL pool. Keeping this in one place means a
+ * future hardening change reaches both the runtime and operator-report pools.
+ */
+function postgresSslOptions(): false | { rejectUnauthorized: false } | undefined {
+  if (process.env.PGSSL === 'disable') return false;
+  return process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined;
+}
+
 export async function getDb(): Promise<InstanceType<typeof Pool>> {
   // `pool` is assigned before connectivity checks, migrations, and default-data
   // seeding finish. Always join an in-flight initialization before exposing it;
@@ -131,7 +140,7 @@ export async function getDb(): Promise<InstanceType<typeof Pool>> {
   if (pool) return pool;
   initPromise = (async () => {
     const connectionString = requireDatabaseUrl();
-    pool = new Pool({ connectionString, ssl: process.env.PGSSL === 'disable' ? false : process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined });
+    pool = new Pool({ connectionString, ssl: postgresSslOptions() });
     try {
       await waitForPostgresReady(pool);
       await runMigrations();
@@ -158,7 +167,7 @@ export async function getDb(): Promise<InstanceType<typeof Pool>> {
 export function createReadOnlyDbPool(): InstanceType<typeof Pool> {
   return new Pool({
     connectionString: requireDatabaseUrl(),
-    ssl: process.env.PGSSL === 'disable' ? false : process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined,
+    ssl: postgresSslOptions(),
     max: 1,
     application_name: 'phase0-url-work-ledger-report',
     options: '-c default_transaction_read_only=on',

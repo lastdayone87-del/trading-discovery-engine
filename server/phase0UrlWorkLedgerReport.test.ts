@@ -84,11 +84,18 @@ test('the SQL bound keeps path-only URL normalization and all-observation browse
   assert.match(telemetrySql, /COALESCE\(o\.provenance->>'required','false'\) = 'true'/);
   assert.match(telemetrySql, /sharedEvidenceFrom/);
   assert.match(telemetrySql, /AS direct_evidence/);
-  assert.match(telemetrySql, /AND e\.direct_evidence/);
+  assert.match(telemetrySql, /e\.direct_evidence/);
   assert.match(telemetrySql, /lower\(substring\(/, 'only scheme + authority are lowercased');
   assert.match(telemetrySql, /CASE WHEN strpos\(.*\?.*\) > 0/);
-  assert.match(telemetrySql, /\^\[0-9\]\{1,18\}\$/);
-  assert.match(telemetrySql, /::numeric <= 2147483647/);
+  assert.match(telemetrySql, /regexp_replace\(.*':80\$'/);
+  assert.match(telemetrySql, /regexp_replace\(.*':443\$'/);
+  assert.match(telemetrySql, /jsonb_typeof\(.*\) = 'number'/);
+  assert.match(telemetrySql, /::numeric > 0/);
+  assert.doesNotMatch(telemetrySql, /::int ELSE 0 END/);
+  assert.match(telemetrySql, /latest_inspection_at/);
+  assert.match(telemetrySql, /interval '5 minutes'/);
+  assert.match(telemetrySql, /id DESC/);
+  assert.match(telemetrySql, /STATIC_BUDGET_GAP/);
 
   const rawSql = queries.find(sql => sql.includes('o.requested_url,') && sql.includes('o.provenance'));
   assert.ok(rawSql);

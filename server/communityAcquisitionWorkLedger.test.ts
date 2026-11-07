@@ -180,7 +180,7 @@ test('only required community observations become backlog work', () => {
   assert.equal(rows[0].normalizedUrl, 'https://required.example/');
 });
 
-test('the effective observation is chosen rank-first, then by time', () => {
+test('an old success never hides a newer inspection failure', () => {
   const olderFound = observation({
     observedAt: '2026-11-01T00:00:00.000Z',
     outcome: 'FOUND',
@@ -191,21 +191,53 @@ test('the effective observation is chosen rank-first, then by time', () => {
       crawlerTelemetry: { mode: 'STATIC', pagesInspected: 1, requestsStarted: 0, requestsFinished: 0 },
     },
   });
-  const newerNoMatch = observation({
+  const newerFailure = observation({
     observedAt: '2026-11-02T00:00:00.000Z',
-    outcome: 'INSPECTED_NO_MATCH',
-    failureClass: null,
+    outcome: 'ACQUISITION_FAILED',
+    failureClass: 'NETWORK_FAILURE',
     provenance: {
       surface: 'CREATOR_WEBSITES',
       required: true,
       crawlerTelemetry: { mode: 'RENDERED', pagesInspected: 2, requestsFinished: 2 },
     },
   });
-  const { rows } = projectCommunityAcquisitionWork([newerNoMatch, olderFound]);
+  const { rows } = projectCommunityAcquisitionWork([newerFailure, olderFound]);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].state, 'PENDING');
+  assert.equal(rows[0].lastOutcome, 'ACQUISITION_FAILED');
+  assert.equal(rows[0].retryOwned, true, 'the newer failure owns retry despite the old success');
+  assert.equal(rows[0].neverBrowserExecuted, false, 'browser evidence is aggregated across every observation');
+});
+
+test('rank-first applies within the latest inspection, not across inspections', () => {
+  const newerFailure = observation({
+    observedAt: '2026-11-02T00:00:00.000Z',
+    outcome: 'ACQUISITION_FAILED',
+    failureClass: 'NETWORK_FAILURE',
+  });
+  const sameInspectionSuccess = observation({
+    observedAt: '2026-11-02T00:02:00.000Z',
+    outcome: 'FOUND',
+    failureClass: null,
+  });
+  const { rows } = projectCommunityAcquisitionWork([newerFailure, sameInspectionSuccess]);
   assert.equal(rows.length, 1);
   assert.equal(rows[0].state, 'RESOLVED');
-  assert.equal(rows[0].lastOutcome, 'FOUND');
-  assert.equal(rows[0].neverBrowserExecuted, false, 'browser evidence is aggregated across every observation');
+  assert.equal(rows[0].lastOutcome, 'FOUND', 'rank-first tolerates inspector timestamp skew');
+  assert.equal(rows[0].retryOwned, false);
+});
+
+test('equal-timestamp observations are ordered deterministically by id', () => {
+  const first = observation({ id: '00000000-0000-0000-0000-000000000001' });
+  const second = observation({
+    id: '00000000-0000-0000-0000-000000000002',
+    retryable: false,
+    failureClass: 'PERMANENT_ACCESS_BLOCK',
+  });
+  const forward = projectCommunityAcquisitionWork([first, second]).rows[0];
+  const reverse = projectCommunityAcquisitionWork([second, first]).rows[0];
+  assert.equal(forward.lastOutcome, reverse.lastOutcome);
+  assert.equal(forward.lastFailureClass, 'PERMANENT_ACCESS_BLOCK');
 });
 
 test('the latest observation wins within the same rank regardless of input order', () => {
@@ -325,6 +357,48 @@ test('retry ownership follows the effective production predicate', () => {
     provenance: { surface: 'CREATOR_WEBSITES', required: false, crawlerTelemetry: { pagesInspected: 1 } },
   });
   assert.equal(projectCommunityAcquisitionWork([optionalFailure]).rows.length, 0);
+
+  // Production owns retry for retryable partial inspections, FOUND rows with
+  // an outstanding bounded gap, and static-budget-gap seeds even when the seed
+  // is not required. Permanent classes never own retry.
+  const partial = observation({
+    outcome: 'PARTIALLY_INSPECTED',
+    failureClass: 'RESPONSE_TRUNCATED',
+  });
+  assert.equal(projectCommunityAcquisitionWork([partial]).rows[0].retryOwned, true);
+
+  const foundGap = observation({
+    outcome: 'FOUND',
+    failureClass: 'REQUIRED_UNVISITED_BUDGET_GAP',
+  });
+  assert.equal(projectCommunityAcquisitionWork([foundGap]).rows[0].retryOwned, true);
+
+  const staticGap = observation({
+    outcome: 'PARTIALLY_INSPECTED',
+    failureClass: 'STATIC_BUDGET_GAP',
+    provenance: {
+      surface: 'CREATOR_WEBSITES',
+      required: false,
+      crawlerTelemetry: { mode: 'STATIC', pagesInspected: 1 },
+    },
+  });
+  const staticGapProjection = projectCommunityAcquisitionWork([staticGap]);
+  assert.equal(staticGapProjection.rows.length, 1, 'the static-gap exception is real retry work');
+  assert.equal(staticGapProjection.rows[0].retryOwned, true);
+
+  for (const failureClass of [
+    'UNSUPPORTED_CONTENT_TYPE',
+    'LOGIN_WALL',
+    'PAYWALL_WALL',
+    'PERMANENT_ACCESS_BLOCK',
+  ]) {
+    const permanent = observation({ failureClass });
+    assert.equal(
+      projectCommunityAcquisitionWork([permanent]).rows[0].retryOwned,
+      false,
+      `${failureClass} must never own retry`,
+    );
+  }
 });
 
 test('work is exhausted only after the attempt cap and never once resolved', () => {

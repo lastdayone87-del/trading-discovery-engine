@@ -134,6 +134,13 @@ function sqlNormalizedUrl(expression: string): string {
   // and query values are not. Lowercasing the whole URL would merge distinct
   // work keys and diverge from URL.toString().
   const origin = `substring(${withoutFragment} from '^[A-Za-z][A-Za-z0-9+.-]*://[^/?#]+')`;
+  const loweredOrigin = `lower(${origin})`;
+  // URL.toString() drops default ports; do the same so explicit `:80`/`:443`
+  // cannot split one work key into two.
+  const normalizedOrigin = `(CASE`
+    + ` WHEN ${loweredOrigin} ~ '^http://[^/]+:80$' THEN regexp_replace(${loweredOrigin}, ':80$', '')`
+    + ` WHEN ${loweredOrigin} ~ '^https://[^/]+:443$' THEN regexp_replace(${loweredOrigin}, ':443$', '')`
+    + ` ELSE ${loweredOrigin} END)`;
   const rest = `substr(${withoutFragment}, length(${origin}) + 1)`;
   const pathPart = `(CASE WHEN strpos(${rest}, '?') > 0`
     + ` THEN substr(${rest}, 1, strpos(${rest}, '?') - 1)`
@@ -144,25 +151,83 @@ function sqlNormalizedUrl(expression: string): string {
   const trimmedPath = `(CASE WHEN rtrim(${pathPart}, '/') ~ '^[^/]*$'`
     + ` THEN rtrim(${pathPart}, '/') || '/'`
     + ` ELSE rtrim(${pathPart}, '/') END)`;
-  return `lower(${origin}) || ${trimmedPath} || ${queryPart}`;
+  return `${normalizedOrigin} || ${trimmedPath} || ${queryPart}`;
 }
 
-function safeIntSql(jsonExpression: string): string {
-  // Parentheses are required: `::` binds tighter than `->>`, so an
-  // unparenthesized cast would apply to the trailing key literal instead of
-  // the extracted value. The digit-length bound keeps the numeric cast safe for
-  // arbitrarily long JSON strings; out-of-range counters contribute no evidence.
-  return `(CASE WHEN ${jsonExpression} ~ '^[0-9]{1,18}$'`
-    + ` AND (${jsonExpression})::numeric <= 2147483647`
-    + ` THEN (${jsonExpression})::int ELSE 0 END)`;
+/**
+ * Counter evidence matching `nonNegativeInt`: only JSON numbers count, and a
+ * number is positive only when its numeric value is greater than zero. A JSON
+ * string such as `"4"` is malformed input and contributes zero, while `2.5`
+ * counts exactly like TypeScript. No text-to-int cast is performed, so a
+ * malformed counter can never abort the read-only report.
+ */
+function safeCounterSql(jsonbExpression: string): string {
+  const numeric = `((${jsonbExpression})::text)::numeric`;
+  return `(CASE WHEN jsonb_typeof(${jsonbExpression}) = 'number'`
+    + ` AND ${numeric} > 0`
+    + ` THEN ${numeric} ELSE 0 END)`;
 }
 
-const REQUIRED_COMMUNITY_OBSERVATION_WHERE = `
+/**
+ * Required community observations plus production's narrow static-gap
+ * exception. A no-authority URL (`https://`, `https:///x`) is excluded here
+ * because `normalizeCommunityWorkUrl` rejects it; silently dropping it from
+ * only one side of the reconciliation would create a phantom delta.
+ */
+const LEDGER_COMMUNITY_OBSERVATION_WHERE = `
   COALESCE(o.requested_url,'') <> ''
   AND COALESCE(o.requested_url,'') ~* '^https?://'
+  AND substring(trim(COALESCE(o.requested_url,'')) from '^[A-Za-z][A-Za-z0-9+.-]*://[^/?#]+') IS NOT NULL
   AND COALESCE(o.provenance->>'surface','') = ANY($2::text[])
-  AND COALESCE(o.provenance->>'required','false') = 'true'
+  AND (
+    COALESCE(o.provenance->>'required','false') = 'true'
+    OR (
+      o.outcome = 'PARTIALLY_INSPECTED'
+      AND COALESCE(o.failure_class,'') = 'STATIC_BUDGET_GAP'
+      AND o.retryable
+    )
+  )
 `;
+
+/**
+ * SQL spelling of the production retry-ownership outcome rules. URL admission
+ * and auxiliary-link ownership are applied by the shared policy code in the
+ * TypeScript projection; reimplementing URL classification in SQL would be a
+ * second source of truth, so this bound leaves that residual to the tolerated
+ * reconciliation delta.
+ */
+const PERMANENT_FAILURE_CLASSES_SQL = `ARRAY[
+  'UNSUPPORTED_CONTENT_TYPE',
+  'LOGIN_WALL',
+  'PAYWALL_WALL',
+  'PERMANENT_ACCESS_BLOCK',
+  'REDIRECT_LIMIT'
+]`;
+
+const FOUND_GAP_FAILURE_CLASSES_SQL = `ARRAY[
+  'REQUIRED_UNVISITED_BUDGET_GAP',
+  'RENDERED_TIMEOUT',
+  'RENDERED_BUDGET_EXPIRED',
+  'RENDERED_PARTIAL_COVERAGE',
+  'RENDERED_INTERACTION_GAP'
+]`;
+
+function retryOwnedSql(alias: string): string {
+  const failureClass = `upper(COALESCE(${alias}.failure_class,''))`;
+  return `(
+    ${alias}.direct_evidence
+    AND ${alias}.retryable
+    AND NOT (${failureClass} = ANY (${PERMANENT_FAILURE_CLASSES_SQL}))
+    AND COALESCE(${alias}.relevance_tier,'') NOT IN ('BLOCK','DEMOTE')
+    AND (
+      (${alias}.required AND ${alias}.outcome = 'FOUND'
+        AND ${failureClass} = ANY (${FOUND_GAP_FAILURE_CLASSES_SQL}))
+      OR (${alias}.outcome = 'PARTIALLY_INSPECTED'
+        AND ${failureClass} = 'STATIC_BUDGET_GAP')
+      OR (${alias}.required AND ${alias}.outcome IN ('ACQUISITION_FAILED','PARTIALLY_INSPECTED'))
+    )
+  )`;
+}
 
 export async function buildPhase0UrlWorkLedgerReport(
   db: Phase0UrlWorkLedgerReportDb,
@@ -191,7 +256,8 @@ export async function buildPhase0UrlWorkLedgerReport(
   );
 
   const rawObservations = await db.query(
-    `SELECT o.channel_id,
+    `SELECT o.id,
+            o.channel_id,
             o.requested_url,
             o.outcome,
             o.retryable,
@@ -206,8 +272,8 @@ export async function buildPhase0UrlWorkLedgerReport(
             AND status IN ('PENDING','PROCESSING')
        ) pending ON pending.channel_id = o.channel_id
       WHERE o.observed_at > now() - ($1::text || ' days')::interval
-        AND ${REQUIRED_COMMUNITY_OBSERVATION_WHERE}
-      ORDER BY o.channel_id, o.observed_at`,
+        AND ${LEDGER_COMMUNITY_OBSERVATION_WHERE}
+      ORDER BY o.channel_id, o.observed_at, o.id`,
     [windowDays, SURFACES],
   );
 
@@ -218,6 +284,7 @@ export async function buildPhase0UrlWorkLedgerReport(
     retryable: row.retryable === true,
     failureClass: row.failure_class ? String(row.failure_class) : null,
     observedAt: new Date(row.observed_at).toISOString(),
+    id: row.id ? String(row.id) : undefined,
     provenance: row.provenance,
   }));
 
@@ -231,27 +298,30 @@ export async function buildPhase0UrlWorkLedgerReport(
           AND status IN ('PENDING','PROCESSING')
      ),
      raw AS (
-       SELECT o.channel_id,
+       SELECT o.id,
+              o.channel_id,
               COALESCE(o.provenance->>'surface','') AS surface,
               ${sqlNormalizedUrl('o.requested_url')} AS normalized_url,
               o.outcome,
               o.retryable,
               COALESCE(o.failure_class,'') AS failure_class,
               o.observed_at,
+              COALESCE(o.provenance->>'required','false') = 'true' AS required,
+              COALESCE(o.provenance->>'relevanceTier','') AS relevance_tier,
               COALESCE(o.provenance->>'sharedEvidenceFrom','') = '' AS direct_evidence,
               (
                 COALESCE(o.provenance->>'sharedEvidenceFrom','') = ''
                 AND COALESCE(o.provenance->'crawlerTelemetry'->>'mode','') = 'RENDERED'
                 AND (
-                  ${safeIntSql(`o.provenance->'crawlerTelemetry'->>'requestsFinished'`)} > 0
-                  OR ${safeIntSql(`o.provenance->'crawlerTelemetry'->>'pagesInspected'`)} > 0
-                  OR ${safeIntSql(`o.provenance->'crawlerTelemetry'->>'clicksSucceeded'`)} > 0
+                  ${safeCounterSql(`o.provenance->'crawlerTelemetry'->'requestsFinished'`)} > 0
+                  OR ${safeCounterSql(`o.provenance->'crawlerTelemetry'->'pagesInspected'`)} > 0
+                  OR ${safeCounterSql(`o.provenance->'crawlerTelemetry'->'clicksSucceeded'`)} > 0
                 )
               ) AS browser_executed
          FROM external_acquisition_observations o
          JOIN pending ON pending.channel_id = o.channel_id
         WHERE o.observed_at > now() - ($1::text || ' days')::interval
-          AND ${REQUIRED_COMMUNITY_OBSERVATION_WHERE}
+          AND ${LEDGER_COMMUNITY_OBSERVATION_WHERE}
      ),
      grouped AS (
        SELECT channel_id,
@@ -261,8 +331,22 @@ export async function buildPhase0UrlWorkLedgerReport(
          FROM raw
         GROUP BY channel_id, surface, normalized_url
      ),
-     ranked AS (
+     -- Match the projection's latest-inspection boundary. An old FOUND must
+     -- not outrank a current failure within the same reporting window.
+     windowed AS (
        SELECT raw.*,
+              max(observed_at) OVER (
+                PARTITION BY channel_id, surface, normalized_url
+              ) AS latest_inspection_at
+         FROM raw
+     ),
+     current_inspection AS (
+       SELECT *
+         FROM windowed
+        WHERE observed_at >= latest_inspection_at - interval '5 minutes'
+     ),
+     ranked AS (
+       SELECT current_inspection.*,
               row_number() OVER (
                 PARTITION BY channel_id, surface, normalized_url
                 ORDER BY CASE outcome
@@ -272,21 +356,16 @@ export async function buildPhase0UrlWorkLedgerReport(
                            WHEN 'ACQUISITION_FAILED' THEN 1
                            ELSE 0
                          END DESC,
-                         observed_at DESC
+                         observed_at DESC,
+                         id DESC
               ) AS effective_rank
-         FROM raw
+         FROM current_inspection
      )
      SELECT count(*) FILTER (
-              WHERE e.outcome = 'ACQUISITION_FAILED'
-                AND e.retryable
-                AND e.direct_evidence
-                AND e.failure_class <> 'REDIRECT_LIMIT'
+              WHERE ${retryOwnedSql('e')}
             )::int AS retryable_rows,
             count(*) FILTER (
-              WHERE e.outcome = 'ACQUISITION_FAILED'
-                AND e.retryable
-                AND e.direct_evidence
-                AND e.failure_class <> 'REDIRECT_LIMIT'
+              WHERE ${retryOwnedSql('e')}
                 AND NOT g.browser_executed
             )::int AS never_browser_executed_rows
        FROM ranked e
@@ -319,6 +398,7 @@ export async function buildPhase0UrlWorkLedgerReport(
        FROM creator_site_links l
        JOIN pending ON pending.channel_id = l.channel_id
       WHERE COALESCE(l.source_url,'') ~* '^https?://'
+        AND ${sqlNormalizedUrl('l.source_url')} IS NOT NULL
         AND NOT EXISTS (
           SELECT 1
             FROM external_acquisition_observations o
