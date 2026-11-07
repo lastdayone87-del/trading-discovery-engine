@@ -37,11 +37,12 @@ export const ZOMBIE_RETRY_JOB_TYPE = 'RETRY_COMMUNITY_ACQUISITION';
 export const ZOMBIE_TERMINAL_LEDGER_STATES = ['RESOLVED', 'PARKED_EXTERNAL', 'EXHAUSTED'] as const;
 export const ZOMBIE_ACTIVE_LEDGER_STATES = ['PENDING', 'RUNNING', 'PARKED_INFRA'] as const;
 
-const ZOMBIE_SURFACES = [...COMMUNITY_ACQUISITION_WORK_SURFACES];
-
 function sqlStateList(states: readonly string[]): string {
   return states.map(state => `'${state}'`).join(',');
 }
+
+/** Community surfaces whose observation can own a channel retry. */
+export const ZOMBIE_COMMUNITY_SURFACES: readonly string[] = [...COMMUNITY_ACQUISITION_WORK_SURFACES];
 
 export type ZombieClosureReason = 'CHANNEL_TERMINAL' | 'LEDGER_ALL_TERMINAL';
 
@@ -255,11 +256,29 @@ function evidenceLines(evidence: ZombieRetryEvidence, reason: ZombieRetryDecisio
 }
 
 /**
- * The ledger CTE is conditional because Phase 0 can run against a database
- * where migration 166 has not been applied yet. A missing table is reported as
- * an explicit warning, never as "zero active rows, therefore resolved".
+ * Bounded candidate identity query. Keeping identity separate from evidence
+ * lets the apply path lock exactly these rows with `FOR UPDATE SKIP LOCKED`
+ * and then reuse the same evidence assembly as the dry-run, so the two paths
+ * cannot drift. Ordering is the immutable queue clock, never age-of-lease.
  */
-function zombieCandidateSql(ledgerTablePresent: boolean): string {
+export function zombieCandidateJobIdsSql(): string {
+  return `
+    SELECT j.id AS job_id
+      FROM jobs j
+     WHERE j.type='${ZOMBIE_RETRY_JOB_TYPE}'
+       AND j.status IN ('PENDING','PROCESSING')
+     ORDER BY j.first_enqueued_at ASC NULLS FIRST, j.id ASC
+     LIMIT $1
+  `;
+}
+
+/**
+ * Evidence for a bounded set of retry job ids. The ledger CTE is conditional
+ * because Phase 0 can run against a database where migration 166 has not been
+ * applied yet. A missing table is reported as an explicit warning, never as
+ * "zero active rows, therefore resolved".
+ */
+export function zombieEvidenceSqlForJobIds(ledgerTablePresent: boolean): string {
   const ledgerCte = ledgerTablePresent
     ? `ledger AS (
          SELECT l.channel_id,
@@ -283,83 +302,58 @@ function zombieCandidateSql(ledgerTablePresent: boolean): string {
        )`;
 
   return `
-    WITH candidates AS (
-      SELECT j.id AS job_id,
-             COALESCE(j.payload->>'channelId','') AS channel_id,
-             j.status AS job_status,
-             j.created_at,
-             j.first_enqueued_at,
-             COALESCE(j.reopen_generation,0) AS reopen_generation,
-             CASE
-               WHEN pg_input_is_valid(
-                 btrim(COALESCE(j.payload->>'retryObservedAt','')),
-                 'timestamptz'
-               )
-               THEN btrim(j.payload->>'retryObservedAt')::timestamptz
-             END AS retry_observed_at
+    WITH candidate_channels AS (
+      SELECT DISTINCT COALESCE(j.payload->>'channelId','') AS channel_id
         FROM jobs j
-       WHERE j.type='${ZOMBIE_RETRY_JOB_TYPE}'
-         AND j.status IN ('PENDING','PROCESSING')
-       ORDER BY j.first_enqueued_at ASC NULLS FIRST, j.id ASC
-       LIMIT $1
-    ),
-    candidate_channels AS (
-      SELECT DISTINCT channel_id FROM candidates WHERE channel_id <> ''
+       WHERE j.id = ANY($1::uuid[])
+         AND COALESCE(j.payload->>'channelId','') <> ''
     ),
     ${ledgerCte}
-    SELECT c.job_id,
-           c.channel_id,
-           c.job_status,
-           c.created_at,
-           c.first_enqueued_at,
-           c.reopen_generation,
-           c.retry_observed_at,
+    SELECT j.id AS job_id,
+           COALESCE(j.payload->>'channelId','') AS channel_id,
+           j.status AS job_status,
+           j.created_at,
+           j.first_enqueued_at,
+           COALESCE(j.reopen_generation,0) AS reopen_generation,
+           CASE
+             WHEN pg_input_is_valid(
+               btrim(COALESCE(j.payload->>'retryObservedAt','')),
+               'timestamptz'
+             )
+             THEN btrim(j.payload->>'retryObservedAt')::timestamptz
+           END AS retry_observed_at,
            ch.channel_id IS NOT NULL AS channel_present,
            ch.discord_validation_status,
            ch.discord_status,
            COALESCE(l.ledger_rows,0) AS ledger_rows,
            COALESCE(l.ledger_active_rows,0) AS ledger_active_rows,
            COALESCE(l.ledger_terminal_rows,0) AS ledger_terminal_rows
-      FROM candidates c
-      LEFT JOIN channels ch ON ch.channel_id = c.channel_id
-      LEFT JOIN ledger l ON l.channel_id = c.channel_id
-     ORDER BY c.first_enqueued_at ASC NULLS FIRST, c.job_id ASC
+      FROM jobs j
+      LEFT JOIN channels ch ON ch.channel_id = COALESCE(j.payload->>'channelId','')
+      LEFT JOIN ledger l ON l.channel_id = COALESCE(j.payload->>'channelId','')
+     WHERE j.id = ANY($1::uuid[])
+       AND j.type='${ZOMBIE_RETRY_JOB_TYPE}'
+     ORDER BY j.first_enqueued_at ASC NULLS FIRST, j.id ASC
   `;
 }
 
 /**
- * Observations newer than each candidate job's retry epoch. Retry ownership is
+ * Observations newer than each selected job's retry epoch. Retry ownership is
  * decided in the builder by the shared `observationOwnsRetry` predicate, never
- * by a SQL approximation of `required && retryable`. The candidate ordering and
- * limit must match `zombieCandidateSql` so both queries describe the same jobs.
- * The raw `provenance` object is returned unprojected so optional
- * `STATIC_BUDGET_GAP` owners and demoted/auxiliary observations are classified
- * exactly as the production worker classifies them.
+ * by a SQL approximation of `required && retryable`. The raw `provenance`
+ * object is returned unprojected so optional `STATIC_BUDGET_GAP` owners and
+ * demoted/auxiliary observations are classified exactly as the production
+ * worker classifies them.
  *
  * The SQL prefilter is a deliberately coarse superset of retry owners: ledger
  * work (required rows or the static-gap exception) that is stored retryable.
  * Every row it removes would be rejected by `observationOwnsRetry` anyway, so
- * final ownership still lives in one shared predicate.
+ * final ownership still lives in one shared predicate. The query is bounded by
+ * the selected job ids, never by the whole observation history.
  */
-function zombieNewerObservationSql(): string {
+export function zombieNewerObservationSqlByJobIds(): string {
   return `
-    WITH candidates AS (
-      SELECT j.id AS job_id,
-             COALESCE(j.payload->>'channelId','') AS channel_id,
-             CASE
-               WHEN pg_input_is_valid(
-                 btrim(COALESCE(j.payload->>'retryObservedAt','')),
-                 'timestamptz'
-               )
-               THEN btrim(j.payload->>'retryObservedAt')::timestamptz
-             END AS retry_observed_at
-        FROM jobs j
-       WHERE j.type='${ZOMBIE_RETRY_JOB_TYPE}'
-         AND j.status IN ('PENDING','PROCESSING')
-       ORDER BY j.first_enqueued_at ASC NULLS FIRST, j.id ASC
-       LIMIT $1
-    )
-    SELECT c.job_id,
+    SELECT j.id AS job_id,
            o.requested_url,
            o.outcome,
            o.retryable,
@@ -367,11 +361,14 @@ function zombieNewerObservationSql(): string {
            o.observed_at,
            o.id,
            o.provenance
-      FROM candidates c
+      FROM jobs j
       JOIN external_acquisition_observations o
-        ON o.channel_id = c.channel_id
-       AND c.retry_observed_at IS NOT NULL
-       AND o.observed_at > c.retry_observed_at
+        ON o.channel_id = COALESCE(j.payload->>'channelId','')
+       AND pg_input_is_valid(
+             btrim(COALESCE(j.payload->>'retryObservedAt','')),
+             'timestamptz'
+           )
+       AND o.observed_at > btrim(j.payload->>'retryObservedAt')::timestamptz
        AND o.provenance->>'surface' = ANY($2::text[])
        AND o.retryable = true
        AND (
@@ -381,8 +378,92 @@ function zombieNewerObservationSql(): string {
            AND o.failure_class = 'STATIC_BUDGET_GAP'
          )
        )
-     ORDER BY c.job_id, o.observed_at, o.id
+     WHERE j.id = ANY($1::uuid[])
+       AND j.type='${ZOMBIE_RETRY_JOB_TYPE}'
+     ORDER BY j.id, o.observed_at, o.id
   `;
+}
+
+export interface ZombieMappedObservation {
+  jobId: string;
+  observation: CommunityWorkObservation;
+}
+
+/** Map a raw observation row; shared by the dry-run report and the apply path. */
+export function mapZombieNewerObservation(raw: any): ZombieMappedObservation {
+  return {
+    jobId: String(raw.job_id || ''),
+    observation: {
+      channelId: '',
+      requestedUrl: String(raw.requested_url || ''),
+      outcome: String(raw.outcome || ''),
+      retryable: raw.retryable === true,
+      failureClass: raw.failure_class ? String(raw.failure_class) : null,
+      observedAt: nullableIso(raw.observed_at) || '',
+      id: raw.id ? String(raw.id) : undefined,
+      provenance: raw.provenance,
+    },
+  };
+}
+
+/**
+ * Build classified rows from evidence rows and the bounded newer-observation
+ * rows. Both the dry-run and the operator apply call this function, so a
+ * closure decision is produced by exactly one code path.
+ */
+export function buildZombieReconciliationRows(
+  candidateRows: any[],
+  newerObservationRows: any[],
+  nowMs = Date.now(),
+): Phase0ZombieReconciliationRow[] {
+  const newerRetryOwningByJob = new Map<string, number>();
+  for (const raw of newerObservationRows) {
+    const { jobId, observation } = mapZombieNewerObservation(raw);
+    if (!observationOwnsRetry(observation)) continue;
+    newerRetryOwningByJob.set(jobId, (newerRetryOwningByJob.get(jobId) || 0) + 1);
+  }
+
+  const rows: Phase0ZombieReconciliationRow[] = [];
+  for (const raw of candidateRows) {
+    const retryObservedAt = nullableIso(raw.retry_observed_at);
+    const firstEnqueuedAt = nullableIso(raw.first_enqueued_at);
+    const evidence: ZombieRetryEvidence = {
+      jobStatus: String(raw.job_status || ''),
+      channelPresent: raw.channel_present === true,
+      discordValidationStatus: raw.discord_validation_status
+        ? String(raw.discord_validation_status)
+        : null,
+      discordStatus: raw.discord_status ? String(raw.discord_status) : null,
+      retryObservedAt,
+      ledgerRows: Number(raw.ledger_rows || 0),
+      ledgerActiveRows: Number(raw.ledger_active_rows || 0),
+      ledgerTerminalRows: Number(raw.ledger_terminal_rows || 0),
+      newerRetryOwningObservations: newerRetryOwningByJob.get(String(raw.job_id || '')) || 0,
+    };
+    const outcome = classifyZombieRetryClosure(evidence);
+    rows.push({
+      jobId: String(raw.job_id || ''),
+      channelId: String(raw.channel_id || ''),
+      jobStatus: evidence.jobStatus,
+      channelPresent: evidence.channelPresent,
+      discordValidationStatus: evidence.discordValidationStatus,
+      discordStatus: evidence.discordStatus,
+      retryObservedAt,
+      firstEnqueuedAt,
+      jobAgeHours: firstEnqueuedAt
+        ? Math.round(((nowMs - Date.parse(firstEnqueuedAt)) / 3_600_000) * 10) / 10
+        : null,
+      reopenGeneration: Number(raw.reopen_generation || 0),
+      ledgerRows: evidence.ledgerRows,
+      ledgerActiveRows: evidence.ledgerActiveRows,
+      ledgerTerminalRows: evidence.ledgerTerminalRows,
+      newerRetryOwningObservations: evidence.newerRetryOwningObservations,
+      decision: outcome.decision,
+      reason: outcome.reason,
+      evidence: evidenceLines(evidence, outcome.reason),
+    });
+  }
+  return rows;
 }
 
 export async function buildPhase0ZombieReconciliationReport(
@@ -419,83 +500,28 @@ export async function buildPhase0ZombieReconciliationReport(
     : { rows: [{ rows: 0 }] };
   const ledgerRows = Number(ledgerResult.rows[0]?.rows || 0);
 
-  const candidates = await db.query(
-    zombieCandidateSql(ledgerTablePresent),
-    [maxJobs],
-  );
+  const candidateIds = await db.query(zombieCandidateJobIdsSql(), [maxJobs]);
+  const jobIds = candidateIds.rows
+    .map(row => String(row.job_id || ''))
+    .filter(Boolean);
 
-  const newerRetryOwningByJob = new Map<string, number>();
-  if (candidates.rows.length > 0) {
-    const newerObservations = await db.query(
-      zombieNewerObservationSql(),
-      [maxJobs, ZOMBIE_SURFACES],
+  let rows: Phase0ZombieReconciliationRow[] = [];
+  if (jobIds.length > 0) {
+    const evidence = await db.query(
+      zombieEvidenceSqlForJobIds(ledgerTablePresent),
+      [jobIds],
     );
-    for (const raw of newerObservations.rows) {
-      const observation: CommunityWorkObservation = {
-        channelId: '',
-        requestedUrl: String(raw.requested_url || ''),
-        outcome: String(raw.outcome || ''),
-        retryable: raw.retryable === true,
-        failureClass: raw.failure_class ? String(raw.failure_class) : null,
-        observedAt: nullableIso(raw.observed_at) || '',
-        id: raw.id ? String(raw.id) : undefined,
-        provenance: raw.provenance,
-      };
-      if (!observationOwnsRetry(observation)) continue;
-      const jobId = String(raw.job_id || '');
-      newerRetryOwningByJob.set(jobId, (newerRetryOwningByJob.get(jobId) || 0) + 1);
-    }
+    const newerObservations = await db.query(
+      zombieNewerObservationSqlByJobIds(),
+      [jobIds, ZOMBIE_COMMUNITY_SURFACES],
+    );
+    rows = buildZombieReconciliationRows(evidence.rows, newerObservations.rows);
   }
 
-  const rows: Phase0ZombieReconciliationRow[] = [];
-  const proposals: Phase0ZombieReconciliationRow[] = [];
-  const skippedRows: Phase0ZombieReconciliationRow[] = [];
+  const proposals = rows.filter(row => row.decision === 'PROPOSE_CLOSE');
+  const skippedRows = rows.filter(row => row.decision === 'SKIP');
   const byReason: Record<string, number> = {};
-  const nowMs = Date.now();
-
-  for (const raw of candidates.rows) {
-    const retryObservedAt = nullableIso(raw.retry_observed_at);
-    const firstEnqueuedAt = nullableIso(raw.first_enqueued_at);
-    const evidence: ZombieRetryEvidence = {
-      jobStatus: String(raw.job_status || ''),
-      channelPresent: raw.channel_present === true,
-      discordValidationStatus: raw.discord_validation_status
-        ? String(raw.discord_validation_status)
-        : null,
-      discordStatus: raw.discord_status ? String(raw.discord_status) : null,
-      retryObservedAt,
-      ledgerRows: Number(raw.ledger_rows || 0),
-      ledgerActiveRows: Number(raw.ledger_active_rows || 0),
-      ledgerTerminalRows: Number(raw.ledger_terminal_rows || 0),
-      newerRetryOwningObservations: newerRetryOwningByJob.get(String(raw.job_id || '')) || 0,
-    };
-    const outcome = classifyZombieRetryClosure(evidence);
-    const row: Phase0ZombieReconciliationRow = {
-      jobId: String(raw.job_id || ''),
-      channelId: String(raw.channel_id || ''),
-      jobStatus: evidence.jobStatus,
-      channelPresent: evidence.channelPresent,
-      discordValidationStatus: evidence.discordValidationStatus,
-      discordStatus: evidence.discordStatus,
-      retryObservedAt,
-      firstEnqueuedAt,
-      jobAgeHours: firstEnqueuedAt
-        ? Math.round(((nowMs - Date.parse(firstEnqueuedAt)) / 3_600_000) * 10) / 10
-        : null,
-      reopenGeneration: Number(raw.reopen_generation || 0),
-      ledgerRows: evidence.ledgerRows,
-      ledgerActiveRows: evidence.ledgerActiveRows,
-      ledgerTerminalRows: evidence.ledgerTerminalRows,
-      newerRetryOwningObservations: evidence.newerRetryOwningObservations,
-      decision: outcome.decision,
-      reason: outcome.reason,
-      evidence: evidenceLines(evidence, outcome.reason),
-    };
-    rows.push(row);
-    byReason[row.reason] = (byReason[row.reason] || 0) + 1;
-    if (outcome.decision === 'PROPOSE_CLOSE') proposals.push(row);
-    else skippedRows.push(row);
-  }
+  for (const row of rows) byReason[row.reason] = (byReason[row.reason] || 0) + 1;
 
   const warnings: string[] = [];
   if (!ledgerTablePresent) {

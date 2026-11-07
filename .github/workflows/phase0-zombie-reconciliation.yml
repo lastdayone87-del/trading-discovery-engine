@@ -6,9 +6,14 @@ on:
       - 'server/phase0ZombieReconciliation.ts'
       - 'server/phase0ZombieReconciliation.test.ts'
       - 'server/phase0ZombieReconciliation.postgres.test.ts'
+      - 'server/phase0ZombieApply.ts'
+      - 'server/phase0ZombieApply.test.ts'
+      - 'server/phase0ZombieApply.postgres.test.ts'
+      - 'server/phase0JobClosureEvidenceMigration.test.ts'
       - 'server/communityAcquisitionWorkLedger.ts'
       - 'server/db/migrations/**'
       - 'scripts/phase0ZombieReconciliationDryRun.ts'
+      - 'scripts/phase0ZombieApply.ts'
       - 'scripts/runMigrations.ts'
       - 'server/db.ts'
       - 'server/dbCore.ts'
@@ -61,3 +66,9 @@ jobs:
         run: node --import tsx --test server/phase0ZombieReconciliation.test.ts
       - name: Phase 0 zombie dry-run PostgreSQL regression
         run: node --import tsx --test server/phase0ZombieReconciliation.postgres.test.ts
+      - name: Phase 0 closure evidence migration tests
+        run: node --import tsx --test server/phase0JobClosureEvidenceMigration.test.ts
+      - name: Phase 0 zombie apply unit tests
+        run: node --import tsx --test server/phase0ZombieApply.test.ts
+      - name: Phase 0 zombie apply PostgreSQL regression
+        run: node --import tsx --test server/phase0ZombieApply.postgres.test.ts

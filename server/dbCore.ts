@@ -175,6 +175,23 @@ export function createReadOnlyDbPool(): InstanceType<typeof Pool> {
   });
 }
 
+/**
+ * Dedicated operator write pool. Like the read-only report pool it never runs
+ * migrations or seeds defaults, so a bounded operator command cannot trigger
+ * schema initialization as a side effect. Writes are allowed only for
+ * explicitly operator-gated maintenance; the caller owns transaction scope.
+ */
+export function createOperatorWriteDbPool(
+  applicationName = 'phase0-operator-write',
+): InstanceType<typeof Pool> {
+  return new Pool({
+    connectionString: requireDatabaseUrl(),
+    ssl: postgresSslOptions(),
+    max: 1,
+    application_name: applicationName,
+  });
+}
+
 export function saveDb(): void {
   // PostgreSQL commits writes transactionally; retained as no-op compatibility shim.
 }

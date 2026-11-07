@@ -208,7 +208,10 @@ function fakeDb(candidateRows: any[], options: {
       if (text.includes('external_acquisition_observations')) {
         return { rows: options.newerObservations ?? [] };
       }
-      if (text.includes('WITH candidates AS')) return { rows: candidateRows };
+      if (text.includes('WITH candidate_channels AS')) return { rows: candidateRows };
+      if (text.includes('SELECT j.id AS job_id')) {
+        return { rows: candidateRows.map(row => ({ job_id: row.job_id })) };
+      }
       if (text.includes('FROM community_acquisition_url_state')) {
         return { rows: [{ rows: options.ledgerRows ?? 0 }] };
       }
@@ -280,25 +283,32 @@ test('the dry-run report partitions every examined job into proposals or skips',
   assert.equal(proposals.split(',').length, 2);
   assert.equal(report.summary.proposedClosures + skipped, report.population.examined);
 
-  assert.deepEqual(params[params.length - 1]?.[0], 100);
-  const candidateSql = sql.find(text => text.includes('WITH candidates AS'));
-  assert.ok(candidateSql);
-  assert.match(candidateSql, /pg_input_is_valid/);
+  const candidateIndex = sql.findIndex(text => text.includes('SELECT j.id AS job_id'));
+  assert.ok(candidateIndex >= 0);
+  assert.deepEqual(params[candidateIndex], [100]);
+  const candidateSql = sql[candidateIndex];
   assert.doesNotMatch(candidateSql, /external_acquisition_observations/);
-  assert.match(candidateSql, /RESOLVED','PARKED_EXTERNAL','EXHAUSTED/);
-  assert.match(candidateSql, /PENDING','RUNNING','PARKED_INFRA/);
   assert.match(candidateSql, /LIMIT \$1/);
   assert.doesNotMatch(candidateSql, /\b(?:INSERT|UPDATE|DELETE|TRUNCATE)\b/i);
+
+  const evidenceSql = sql.find(text => text.includes('WITH candidate_channels AS'));
+  assert.ok(evidenceSql);
+  assert.match(evidenceSql, /pg_input_is_valid/);
+  assert.match(evidenceSql, /ANY\(\$1::uuid\[\]\)/);
+  assert.match(evidenceSql, /RESOLVED','PARKED_EXTERNAL','EXHAUSTED/);
+  assert.match(evidenceSql, /PENDING','RUNNING','PARKED_INFRA/);
+  assert.doesNotMatch(evidenceSql, /\b(?:INSERT|UPDATE|DELETE|TRUNCATE)\b/i);
 
   const newerSql = sql.find(text => text.includes('external_acquisition_observations'));
   assert.ok(newerSql);
   assert.match(newerSql, /o\.provenance->>'surface' = ANY\(\$2::text\[\]\)/);
-  assert.match(newerSql, /o\.observed_at > c\.retry_observed_at/);
+  assert.match(newerSql, /o\.observed_at > btrim\(j\.payload->>'retryObservedAt'\)::timestamptz/);
+  assert.match(newerSql, /ANY\(\$1::uuid\[\]\)/);
   assert.match(newerSql, /o\.retryable = true/);
   assert.match(newerSql, /o\.provenance->'required' = 'true'::jsonb/);
   assert.match(newerSql, /o\.outcome = 'PARTIALLY_INSPECTED'/);
   assert.match(newerSql, /o\.failure_class = 'STATIC_BUDGET_GAP'/);
-  assert.match(newerSql, /LIMIT \$1/);
+  assert.doesNotMatch(newerSql, /\bLIMIT\s+\$1\b/);
   assert.doesNotMatch(newerSql, /\b(?:INSERT|UPDATE|DELETE|TRUNCATE)\b/i);
 });
 
@@ -389,7 +399,7 @@ test('a non-finite maxJobs falls back to the documented bound', async () => {
     const report = await buildPhase0ZombieReconciliationReport(db, { maxJobs });
     assert.equal(report.maxJobs, 5_000);
     const candidateIndex = sql.findIndex(text =>
-      text.includes('WITH candidates AS')
+      text.includes('SELECT j.id AS job_id')
       && !text.includes('external_acquisition_observations'));
     assert.ok(candidateIndex >= 0);
     assert.equal(params[candidateIndex]?.[0], 5_000);
