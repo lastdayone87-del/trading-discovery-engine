@@ -280,8 +280,10 @@ export async function buildPhase0UrlWorkLedgerReport(
               o.retryable,
               COALESCE(o.failure_class,'') AS failure_class,
               o.observed_at,
-              o.provenance,
+              o.requested_url,
               COALESCE(o.provenance->>'required','false') = 'true' AS required,
+              COALESCE(o.provenance->>'relevanceTier','') AS relevance_tier,
+              COALESCE(o.provenance->>'sharedEvidenceFrom','') AS shared_evidence_from,
               (
                 COALESCE(o.provenance->>'sharedEvidenceFrom','') <> ''
                 OR o.outcome = 'FOUND'
@@ -382,11 +384,14 @@ export async function buildPhase0UrlWorkLedgerReport(
             e.channel_id,
             e.surface,
             e.normalized_url,
+            e.requested_url,
             e.outcome,
             e.retryable,
             e.failure_class,
             e.observed_at,
-            e.provenance,
+            e.required,
+            e.relevance_tier,
+            e.shared_evidence_from,
             g.browser_executed
        FROM ranked e
        JOIN grouped g
@@ -400,24 +405,35 @@ export async function buildPhase0UrlWorkLedgerReport(
   const effectiveRows = telemetry.rows.map(row => ({
     observation: {
       channelId: String(row.channel_id || ''),
-      requestedUrl: String(row.normalized_url || ''),
+      // Ownership must see the observed URL, not the canonical work key:
+      // stripping a trailing slash can change crawl admission (for example
+      // `/topics/vue.js/` is eligible while `/topics/vue.js` looks like a
+      // resource extension). Keep normalized_url for grouping only.
+      requestedUrl: String(row.requested_url || row.normalized_url || ''),
       outcome: String(row.outcome || ''),
       retryable: row.retryable === true,
       failureClass: row.failure_class ? String(row.failure_class) : null,
       observedAt: new Date(row.observed_at).toISOString(),
       id: row.id ? String(row.id) : undefined,
-      provenance: row.provenance,
+      provenance: {
+        surface: String(row.surface || ''),
+        required: row.required === true,
+        relevanceTier: String(row.relevance_tier || ''),
+        ...(row.shared_evidence_from
+          ? { sharedEvidenceFrom: String(row.shared_evidence_from) }
+          : {}),
+      },
     } satisfies CommunityWorkObservation,
     browserExecuted: row.browser_executed === true,
   }));
-  const retryableEffectiveRows = effectiveRows.filter(
-    row => observationOwnsRetry(row.observation),
-  );
-  const telemetryBound = {
-    retryableRows: retryableEffectiveRows.length,
-    neverBrowserExecutedRows: retryableEffectiveRows
-      .filter(row => !row.browserExecuted).length,
-  };
+  let retryableRows = 0;
+  let neverBrowserExecutedRows = 0;
+  for (const row of effectiveRows) {
+    if (!observationOwnsRetry(row.observation)) continue;
+    retryableRows++;
+    if (!row.browserExecuted) neverBrowserExecutedRows++;
+  }
+  const telemetryBound = { retryableRows, neverBrowserExecutedRows };
   const reconciliation = reconcileCommunityWorkProjection(
     projection.stats,
     telemetryBound,

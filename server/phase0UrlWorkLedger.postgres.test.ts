@@ -290,6 +290,18 @@ maybe('the read-only report projects and reconciles a fixture backlog', async t 
         required: true,
         telemetry: { mode: 'STATIC', pagesInspected: 1, requestsStarted: 0, requestsFinished: 0 },
       },
+      {
+        // Normalization strips the trailing slash, which would make the shared
+        // admission gate reject the `.js` suffix as a resource. Ownership must
+        // classify the observed URL, not the canonical work key.
+        key: `phase0-ledger-directory-retry-${suffix}`,
+        url: 'https://creator.example/topics/vue.js/',
+        outcome: 'ACQUISITION_FAILED',
+        retryable: true,
+        failureClass: 'NETWORK_FAILURE',
+        required: true,
+        telemetry: { mode: 'STATIC', pagesInspected: 1, requestsStarted: 0, requestsFinished: 0 },
+      },
     ];
 
     for (const observation of observations) {
@@ -334,7 +346,7 @@ maybe('the read-only report projects and reconciles a fixture backlog', async t 
   assert.ok(report.rows, 'includeRows must return the projection rows');
 
   const rows = report.rows.filter(row => row.channelId === channelId);
-  assert.equal(rows.length, 12, 'optional observations never create a work row by themselves');
+  assert.equal(rows.length, 13, 'optional observations never create a work row by themselves');
   const byUrl = new Map(rows.map(row => [row.normalizedUrl, row]));
   assert.equal(byUrl.get('https://found.example/links')?.state, 'RESOLVED');
   assert.equal(byUrl.get('https://found.example/links')?.neverExecuted, false);
@@ -394,23 +406,27 @@ maybe('the read-only report projects and reconciles a fixture backlog', async t 
   // must reach the same conclusion via the shared predicate.
   assert.equal(byUrl.get('https://calendly.com/phase0-fixture/30min')?.retryOwned, false);
   assert.equal(byUrl.get('https://fixture.example/assets/logo.png')?.retryOwned, false);
+  // The canonical work key drops the trailing slash, but the observed URL is
+  // what the production admission gate judged, so this stays retry-owned.
+  assert.equal(byUrl.get('https://creator.example/topics/vue.js')?.retryOwned, true);
 
   // The SQL telemetry bound and the TypeScript projection must agree on the
-  // fixture rows: seven effective retry owners, six never browser-executed.
+  // fixture rows: eight effective retry owners, seven never browser-executed.
   // `recovered.example` has a retryable static failure plus a rendered success
   // in the same inspection, so it is not retry-owned but must count as
   // browser-executed. `mixed-signal.example` keeps its required browser
-  // failure, so it is retry-owned but not never-executed.
+  // failure, so it is retry-owned but not never-executed. Auxiliary and
+  // admission-ineligible rows create work rows but never own retry.
   const retryableDelta = report.projection.retryableRows - baseline.projection.retryableRows;
   const retryableNeverBrowserDelta = report.projection.retryableNeverBrowserExecutedRows
     - baseline.projection.retryableNeverBrowserExecutedRows;
   const telemetryRetryableDelta = report.telemetry.retryableRows - baseline.telemetry.retryableRows;
   const telemetryNeverBrowserDelta = report.telemetry.neverBrowserExecutedRows
     - baseline.telemetry.neverBrowserExecutedRows;
-  assert.equal(retryableDelta, 7);
-  assert.equal(retryableNeverBrowserDelta, 6);
-  assert.equal(telemetryRetryableDelta, 7);
-  assert.equal(telemetryNeverBrowserDelta, 6);
+  assert.equal(retryableDelta, 8);
+  assert.equal(retryableNeverBrowserDelta, 7);
+  assert.equal(telemetryRetryableDelta, 8);
+  assert.equal(telemetryNeverBrowserDelta, 7);
 
   // The report must expose its own reconciliation, not just a recomputed copy.
   assert.equal(report.reconciliation.projectionRetryableRows, report.projection.retryableRows);

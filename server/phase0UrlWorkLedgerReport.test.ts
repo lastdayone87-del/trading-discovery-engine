@@ -84,7 +84,7 @@ test('the SQL bound keeps path-only URL normalization and all-observation browse
   );
   assert.match(telemetrySql, /COALESCE\(o\.provenance->>'required','false'\) = 'true'/);
   assert.match(telemetrySql, /sharedEvidenceFrom/);
-  assert.match(telemetrySql, /e\.provenance/);
+  assert.match(telemetrySql, /e\.requested_url/);
   assert.match(telemetrySql, /g\.browser_executed/);
   assert.match(telemetrySql, /lower\(substring\(/, 'only scheme + authority are lowercased');
   assert.match(telemetrySql, /CASE WHEN strpos\(.*\?.*\) > 0/);
@@ -126,49 +126,42 @@ test('the SQL bound keeps path-only URL normalization and all-observation browse
 
 test('the telemetry bound applies shared URL admission and auxiliary ownership', async () => {
   const observedAt = new Date().toISOString();
-  const provenance = (required: boolean) => ({
-    provider: 'external-link',
+  const effectiveRow = (overrides: Record<string, unknown>) => ({
+    channel_id: 'UCphase0-classify',
     surface: 'CREATOR_WEBSITES',
-    required,
-    crawlerTelemetry: { mode: 'STATIC', pagesInspected: 1 },
+    outcome: 'ACQUISITION_FAILED',
+    retryable: true,
+    failure_class: 'NETWORK_FAILURE',
+    observed_at: observedAt,
+    required: true,
+    relevance_tier: '',
+    shared_evidence_from: '',
+    browser_executed: false,
+    ...overrides,
   });
   const effectiveRows = [
-    {
+    effectiveRow({
       id: '11111111-1111-4111-8111-111111111111',
-      channel_id: 'UCphase0-classify',
-      surface: 'CREATOR_WEBSITES',
       normalized_url: 'https://creator.example/links',
-      outcome: 'ACQUISITION_FAILED',
-      retryable: true,
-      failure_class: 'NETWORK_FAILURE',
-      observed_at: observedAt,
-      provenance: provenance(true),
-      browser_executed: false,
-    },
-    {
+      requested_url: 'https://creator.example/links',
+    }),
+    effectiveRow({
       id: '22222222-2222-4222-8222-222222222222',
-      channel_id: 'UCphase0-classify',
-      surface: 'CREATOR_WEBSITES',
       normalized_url: 'https://calendly.com/phase0-fixture/30min',
-      outcome: 'ACQUISITION_FAILED',
-      retryable: true,
-      failure_class: 'NETWORK_FAILURE',
-      observed_at: observedAt,
-      provenance: provenance(true),
-      browser_executed: false,
-    },
-    {
+      requested_url: 'https://calendly.com/phase0-fixture/30min',
+    }),
+    effectiveRow({
       id: '33333333-3333-4333-8333-333333333333',
-      channel_id: 'UCphase0-classify',
-      surface: 'CREATOR_WEBSITES',
       normalized_url: 'https://fixture.example/assets/logo.png',
-      outcome: 'ACQUISITION_FAILED',
-      retryable: true,
-      failure_class: 'NETWORK_FAILURE',
-      observed_at: observedAt,
-      provenance: provenance(true),
-      browser_executed: false,
-    },
+      requested_url: 'https://fixture.example/assets/logo.png',
+    }),
+    // Normalization strips the trailing slash, which would make the shared
+    // admission gate reject `.js`; ownership must use the observed URL.
+    effectiveRow({
+      id: '44444444-4444-4444-8444-444444444444',
+      normalized_url: 'https://creator.example/topics/vue.js',
+      requested_url: 'https://creator.example/topics/vue.js/',
+    }),
   ];
   const db = {
     async query(sql: string) {
@@ -179,6 +172,6 @@ test('the telemetry bound applies shared URL admission and auxiliary ownership',
   };
 
   const report = await buildPhase0UrlWorkLedgerReport(db, { windowDays: 7 });
-  assert.equal(report.telemetry.retryableRows, 1);
-  assert.equal(report.telemetry.neverBrowserExecutedRows, 1);
+  assert.equal(report.telemetry.retryableRows, 2);
+  assert.equal(report.telemetry.neverBrowserExecutedRows, 2);
 });
