@@ -13,7 +13,7 @@ import { ADAPTIVE_PILOT_POLICY_VERSION } from './adaptiveDiscoveryPilotPolicy';
 import { getConfiguredYouTubeKeys, getConfiguredYouTubeProviders } from './youtubeKeyPool';
 import { youtubeProviderCooldown, type YouTubeProviderOperationalStatus } from './youtubeProviderCooldown';
 import type { AuditEvent } from './operatorAuth';
-import { providerCooldownExpiryMs, type ProviderCallEvent } from './providerResilience';
+import { providerCooldownExpiryMs, getGeminiOrgSemanticCooldownExpiry, getGeminiSemanticCooldownExpiry, type ProviderCallEvent } from './providerResilience';
 import { toWellFormedDeep, stringifyWellFormedJson } from './unicodeSafety';
 import { ProbeQuotaUnavailableError, resolveShadowConfig, settleKeyCapReservation, settleProbeQuotaReservation, settleShadowLeaseWithSavepoint, YouTubeKeyCapUnavailableError, type KeyCapReservationContext, type QuotaSettlementContext } from './quotaKeyCapShadow';
 import { isYouTubePermanentInputError } from './youtubeKeyHealth';
@@ -2821,31 +2821,21 @@ export async function resolveGeminiFreeSemanticCooldownExpiryMs(nowMs:number=Dat
     return providerCooldownExpiryMs(row.occurred_at,row.cooldown_until_ms,cooldownMs,nowMs);
   }catch{return undefined;}
 }
+/**
+ * Pool-wide Gemini semantic cooldown. Delegates to the provider-boundary
+ * resolver so failover and the queue gate can never drift apart.
+ */
 export async function resolveGeminiSemanticCooldownExpiryMs(nowMs:number=Date.now()):Promise<number|undefined>{
-  const cooldownMs=geminiSemanticCooldownMs();
-  try{
-    const db=await getDb();
-    const res=await db.query(`SELECT occurred_at, MAX((request_metadata->>'cooldownUntilMs')::bigint) FILTER (WHERE request_metadata->>'cooldownUntilMs' ~ '^[0-9]+$') OVER () AS cooldown_until_ms FROM provider_call_events WHERE provider='gemini' AND status='RATE_LIMITED' AND occurred_at >= now() - interval '2 days' ORDER BY occurred_at DESC LIMIT 1`);
-    const row=res.rows[0];
-    if(!row?.occurred_at)return undefined;
-    return providerCooldownExpiryMs(row.occurred_at,row.cooldown_until_ms,cooldownMs,nowMs);
-  }catch{return undefined;}
+  return getGeminiSemanticCooldownExpiry(nowMs);
 }
 /**
  * Per-account Gemini cooldown expiry. Each account's window derives only from
  * RATE_LIMITED rows tagged with its own org label; untagged rows cool no
- * account. A 429 on one account never affects another's window. The
- * pool-wide resolver below is retained for legacy callers.
+ * account. A 429 on one account never affects another's window. Delegates to
+ * the provider-boundary resolver (single cooldown rule).
  */
 export async function resolveGeminiOrgSemanticCooldownExpiryMs(orgId:string,nowMs:number=Date.now()):Promise<number|undefined>{
-  const cooldownMs=geminiSemanticCooldownMs();
-  try{
-    const db=await getDb();
-    const res=await db.query(`SELECT occurred_at, MAX((request_metadata->>'cooldownUntilMs')::bigint) FILTER (WHERE request_metadata->>'cooldownUntilMs' ~ '^[0-9]+$') OVER () AS cooldown_until_ms FROM provider_call_events WHERE provider='gemini' AND status='RATE_LIMITED' AND request_metadata->>'geminiOrg'=$1 AND occurred_at >= now() - interval '2 days' ORDER BY occurred_at DESC LIMIT 1`,[orgId]);
-    const row=res.rows[0];
-    if(!row?.occurred_at)return undefined;
-    return providerCooldownExpiryMs(row.occurred_at,row.cooldown_until_ms,cooldownMs,nowMs);
-  }catch{return undefined;}
+  return getGeminiOrgSemanticCooldownExpiry(orgId,nowMs);
 }
 /**
  * Pool-wide Groq semantic cooldown expiry from persisted provider_call_events:

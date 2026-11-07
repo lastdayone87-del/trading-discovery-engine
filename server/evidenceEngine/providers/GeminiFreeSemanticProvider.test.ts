@@ -8,6 +8,9 @@ import {
   clearGeminiFreeSdkCacheForTests,
   defaultClient,
   geminiFreeCooldownRemainingMs,
+  geminiFreeFailureCooldownUntilMs,
+  geminiFreeFailureMetadata,
+  geminiFreeRateLimitCooldownMs,
   geminiFreeSdkForRouteForTests,
   geminiFreeTimeoutMs,
   resetGeminiFreeCooldownForTests,
@@ -192,6 +195,51 @@ test('free cooldown resolver is provider-scoped and excludes deferral echoes', a
   assert.ok(fnStr.includes('GEMINI_FREE_COOLDOWN_DEFERRAL_METADATA_KEY'), 'resolver must reference the shared deferral tag key');
   assert.ok(fnStr.includes("provider='gemini-free'"), 'resolver stays gemini-free-scoped');
   assert.doesNotMatch(fnStr, /provider='gemini'[^_-]/);
+});
+
+test('local free cooldown honors a declared daily reset instead of the 90s default', () => {
+  const now = 1_000_000;
+  const declaredDailyReset = now + 4 * 60 * 60_000;
+  const daily = new ProviderCallError('daily quota exhausted', 'RATE_LIMIT', true, {
+    status: 429,
+    cooldownUntilMs: declaredDailyReset,
+    quotaScope: 'DAILY',
+    quotaId: 'generate-content-per-day',
+  });
+  // A daily reset must outlive the short default: otherwise calls resume every
+  // 90 seconds against an exhausted daily quota.
+  assert.equal(geminiFreeFailureCooldownUntilMs(daily, now), declaredDailyReset);
+
+  // A provider-declared minute delay shorter than the configured window never
+  // shortens the fast local gate below the persisted resolver's window.
+  const minute = new ProviderCallError('per-minute quota exhausted', 'RATE_LIMIT', true, {
+    status: 429,
+    cooldownUntilMs: now + 5_000,
+    quotaScope: 'MINUTE',
+  });
+  assert.equal(geminiFreeFailureCooldownUntilMs(minute, now), now + geminiFreeRateLimitCooldownMs());
+});
+
+test('genuine free failures persist typed cooldown metadata; deferral echoes stay tagged', () => {
+  const typed = new ProviderCallError('daily quota exhausted', 'RATE_LIMIT', true, {
+    status: 429,
+    cooldownUntilMs: 1_234,
+    quotaScope: 'DAILY',
+    quotaId: 'generate-content-per-day',
+    providerReasons: ['GEMINI_FREE_RATE_LIMITED'],
+  });
+  const metadata = geminiFreeFailureMetadata(typed, false);
+  assert.equal(metadata.cooldownUntilMs, '1234');
+  assert.equal(metadata.quotaScope, 'DAILY');
+  assert.equal(metadata.quotaId, 'generate-content-per-day');
+  assert.equal(metadata.providerReasons, 'GEMINI_FREE_RATE_LIMITED');
+  assert.equal(metadata.geminiFreeCooldownDeferral, undefined);
+  // A local deferral made no upstream request: it carries only the exclusion
+  // tag and must never re-arm the persisted window or count as an attempt.
+  assert.deepEqual(
+    geminiFreeFailureMetadata(typed, true),
+    { geminiFreeCooldownDeferral: 'true' },
+  );
 });
 
 test('free rate-limit failures schedule retries past the shared cooldown expiry', async () => {

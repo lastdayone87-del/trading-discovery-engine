@@ -187,12 +187,9 @@ export async function runGeminiRouteFailover<T>(
         continue;
       }
       if (error instanceof ProviderCallError && error.routeScoped) {
-        // A rejected credential belongs to one account/project. Independent
-        // accounts may still serve, so advance instead of aborting the pool.
-        const failedOrg = failedGeminiOrg(error, route);
-        for (const candidate of ordered) {
-          if (geminiRouteOrg(candidate) === failedOrg) tried.add(candidate);
-        }
+        // A rejected credential belongs to one key/project, not to every key
+        // that shares its quota label: sibling keys may still serve. Only the
+        // failing route is marked tried.
         if (!ordered.some(candidate => !tried.has(candidate))) throw error;
         continue;
       }

@@ -245,7 +245,12 @@ test('per-org cooldown resolvers scope by org label, not route', async () => {
   const groqFn = dbCore.resolveGroqOrgCooldownExpiryMs.toString();
   assert.ok(groqFn.includes("request_metadata->>'groqOrg'"), 'groq resolver must scope by org tag');
   const geminiFn = dbCore.resolveGeminiOrgSemanticCooldownExpiryMs.toString();
-  assert.ok(geminiFn.includes("request_metadata->>'geminiOrg'"), 'gemini resolver must scope by org tag');
+  assert.ok(geminiFn.includes('getGeminiOrgSemanticCooldownExpiry'), 'gemini resolver must delegate to the provider boundary');
+  const { getGeminiOrgSemanticCooldownExpiry } = await import('./providerResilience');
+  assert.ok(
+    getGeminiOrgSemanticCooldownExpiry.toString().includes("request_metadata->>'geminiOrg'"),
+    'gemini resolver must scope by org tag',
+  );
 });
 
 test('exhausted groq org survives wrapping with its rate-limit reason for org-scoped retry', async () => {
@@ -265,13 +270,14 @@ test('exhausted groq org survives wrapping with its rate-limit reason for org-sc
 
 test('org resolvers scope strictly by org tag: untagged rows cool no account', async () => {
   const dbCore = await import('./dbCore');
-  for (const fn of [dbCore.resolveGeminiOrgSemanticCooldownExpiryMs, dbCore.resolveGroqOrgCooldownExpiryMs]) {
-    const source = fn.toString();
-    assert.ok(source.includes('request_metadata->>'), 'resolver must scope by metadata tag');
-  }
-  const gemini = dbCore.resolveGeminiOrgSemanticCooldownExpiryMs.toString();
+  const { getGeminiOrgSemanticCooldownExpiry } = await import('./providerResilience');
+  const gemini = getGeminiOrgSemanticCooldownExpiry.toString();
   assert.ok(gemini.includes("request_metadata->>'geminiOrg'=$1"), 'gemini resolver must match the queried org only');
   assert.ok(!gemini.includes('IS NULL'), 'untagged gemini rows must not poison explicitly labelled accounts');
+  assert.ok(
+    dbCore.resolveGeminiOrgSemanticCooldownExpiryMs.toString().includes('getGeminiOrgSemanticCooldownExpiry'),
+    'dbCore must delegate to the provider-boundary resolver',
+  );
   const groq = dbCore.resolveGroqOrgCooldownExpiryMs.toString();
   assert.ok(groq.includes("request_metadata->>'groqOrg'=$1"), 'groq resolver must match the queried org only');
   assert.ok(!groq.includes("groqOrg' IS NULL"), 'untagged groq rows must not poison explicitly labelled orgs');

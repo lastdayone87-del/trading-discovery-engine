@@ -21,6 +21,7 @@ import {
   resetGroqCooldownForTests,
   resetGroqRouteHealthForTests,
   runGroqRouteFailover,
+  runGroqTextCompletion,
   shouldUseGroqSemantic,
 } from './GroqSemanticProvider';
 import type { SemanticModelClient } from './GeminiSemanticProvider';
@@ -1039,7 +1040,7 @@ test('an already-expired Groq caller is a TIMEOUT, not a cancellation', async ()
   assert.equal(calls, 0);
 });
 
-test('organization-restricted 400 is route-scoped and fails over to another org', async () => {
+test('organization-restricted 400 skips same-org siblings and fails over to another org', async () => {
   const restricted = classifyGroqHttpError(400, '{"error":{"message":"organization_restricted","type":"invalid_request_error"}}');
   assert.equal(restricted.errorClass, 'CREDENTIALS_EXHAUSTED');
   assert.equal(restricted.retryable, false);
@@ -1050,7 +1051,8 @@ test('organization-restricted 400 is route-scoped and fails over to another org'
   const result = await runGroqRouteFailover(
     [
       { id: 'groq-1', key: 'k1', orgId: 'org-a' },
-      { id: 'groq-2', key: 'k2', orgId: 'org-b' },
+      { id: 'groq-2', key: 'k2', orgId: 'org-a' },
+      { id: 'groq-3', key: 'k3', orgId: 'org-b' },
     ],
     async route => {
       order.push(route.id);
@@ -1058,11 +1060,11 @@ test('organization-restricted 400 is route-scoped and fails over to another org'
       return { route: route.id };
     },
   );
-  assert.deepEqual(order, ['groq-1', 'groq-2']);
-  assert.deepEqual(result, { route: 'groq-2' });
+  assert.deepEqual(order, ['groq-1', 'groq-3']);
+  assert.deepEqual(result, { route: 'groq-3' });
 });
 
-test('same-org groq routes are not retried after a route-scoped credential failure', async () => {
+test('a 401 for one groq key does not suppress a healthy sibling key', async () => {
   const order: string[] = [];
   const result = await runGroqRouteFailover(
     [
@@ -1076,8 +1078,9 @@ test('same-org groq routes are not retried after a route-scoped credential failu
       return { route: route.id };
     },
   );
-  assert.deepEqual(order, ['groq-1', 'groq-3']);
-  assert.deepEqual(result, { route: 'groq-3' });
+  // Credential rejection is key-scoped: the sibling key is still valid.
+  assert.deepEqual(order, ['groq-1', 'groq-2']);
+  assert.deepEqual(result, { route: 'groq-2' });
 });
 
 test('JSON-validation content failures cap route attempts instead of burning the pool', async () => {
@@ -1172,6 +1175,60 @@ test('all restricted groq routes surface a bounded pool-disabled failure', async
   }
 });
 
+test('a mixed cooling/quarantined pool defers for the earliest availability instead of claiming disabled', async () => {
+  resetGroqCooldownForTests();
+  resetGroqRouteHealthForTests();
+  const savedFetch = globalThis.fetch;
+  const saved: Record<string, string | undefined> = {};
+  for (const name of ['GROQ_API_KEY', 'GROQ_API_KEY_2', 'GROQ_ORG_ID', 'GROQ_ORG_ID_2']) {
+    saved[name] = process.env[name];
+    delete process.env[name];
+  }
+  globalThis.fetch = (async (_url: unknown, init: any) => {
+    const auth = String(init?.headers?.Authorization || '');
+    if (auth.includes('cooling-key')) {
+      return new Response('{"error":{"message":"Rate limit reached"}}', { status: 429, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response('{"error":{"message":"organization_restricted"}}', { status: 400, headers: { 'content-type': 'application/json' } });
+  }) as unknown as typeof fetch;
+  process.env.GROQ_API_KEY = 'cooling-key';
+  process.env.GROQ_API_KEY_2 = 'restricted-key';
+  process.env.GROQ_ORG_ID = 'org-cooling';
+  process.env.GROQ_ORG_ID_2 = 'org-quarantined';
+  try {
+    const client = defaultClient(async () => undefined, { persistedCooldownExpiryMs: async () => undefined });
+    // One call leaves org-cooling in a 429 window and org-quarantined disabled.
+    await assert.rejects(client!.classify('prompt', 'model'));
+    assert.ok(groqOrgCooldownRemainingMs('org-cooling') > 0, 'first org must be cooling');
+    assert.ok(groqOrgDisabledRemainingMs('org-quarantined') > 0, 'second org must be disabled');
+
+    let fetched = false;
+    const error = await runGroqTextCompletion(
+      { prompt: 'extract vocabulary' },
+      {
+        persistedCooldownExpiryMs: async () => undefined,
+        fetchImpl: (async () => { fetched = true; throw new Error('cooling pool must not fetch'); }) as unknown as typeof fetch,
+      },
+    ).then(() => null, (caught: unknown) => caught);
+    assert.equal(fetched, false, 'no request may be spent while every route is unavailable');
+    assert.ok(error instanceof ProviderCallError);
+    // Not every route is quarantined: the cooling route recovers first, so the
+    // caller must receive a bounded deferral, not GROQ_ROUTE_POOL_DISABLED.
+    assert.equal((error as { groqCooldownDeferred?: unknown }).groqCooldownDeferred, true);
+    assert.ok(!(error as { providerReasons?: string[] }).providerReasons?.includes('GROQ_ROUTE_POOL_DISABLED'));
+    const retryAfterMs = Number((error as { retryAfterMs?: unknown }).retryAfterMs);
+    assert.ok(retryAfterMs > 0 && retryAfterMs <= 90_000, `expected the cooling window, got ${retryAfterMs}`);
+  } finally {
+    globalThis.fetch = savedFetch;
+    for (const name of Object.keys(saved)) {
+      if (saved[name] === undefined) delete process.env[name];
+      else process.env[name] = saved[name] as string;
+    }
+    resetGroqCooldownForTests();
+    resetGroqRouteHealthForTests();
+  }
+});
+
 test('groq prompt cap preserves every field reference and marks truncation', () => {
   const prompt = JSON.stringify({
     task: 'CANDIDATE',
@@ -1203,4 +1260,53 @@ test('groq prompt cap enforces a script-aware token budget for CJK evidence', ()
   const parsed = JSON.parse(capped);
   assert.equal(parsed.contextTruncated, true);
   assert.deepEqual(parsed.documents.map((document: any) => document.ref.index), [0, 1, 2, 3, 4, 5, 6, 7]);
+});
+
+test('groq prompt cap shrinks below the old 40-character floor to meet a 1,000-token budget', () => {
+  const documents = Array.from({ length: 40 }, (_, index) => ({
+    ref: { field: 'video_title', index },
+    text: '交易策略'.repeat(100),
+  }));
+  const prompt = JSON.stringify({ task: 'CANDIDATE', documents });
+  const capped = capGroqSemanticPrompt(prompt, 200_000, 1_000);
+  assert.ok(estimateGroqTokens(capped) <= 1_000, `expected <= 1000 tokens, got ${estimateGroqTokens(capped)}`);
+  const parsed = JSON.parse(capped);
+  assert.deepEqual(parsed.documents.map((document: any) => document.ref.index), documents.map(document => document.ref.index));
+  assert.ok(parsed.documents.every((document: any) => document.text.length < 40), 'text must shrink below the old floor');
+});
+
+test('groq prompt cap fails closed when fixed references alone exceed the budget', () => {
+  const documents = Array.from({ length: 40 }, (_, index) => ({
+    ref: { field: 'video_title', index, sourceId: 's'.repeat(1_000) },
+    text: 'small',
+  }));
+  const prompt = JSON.stringify({ task: 'CANDIDATE', documents });
+  assert.throws(
+    () => capGroqSemanticPrompt(prompt, 200_000, 6_000),
+    (error: any) => error instanceof ProviderCallError
+      && error.errorClass === 'PERMANENT_INPUT'
+      && error.providerReasons?.includes('GROQ_PROMPT_BUDGET_EXCEEDED'),
+  );
+});
+
+test('citation-repair prompt caps the embedded request without dropping document refs', () => {
+  const documents = Array.from({ length: 20 }, (_, index) => ({
+    ref: { field: 'video_title', index },
+    text: '交易策略'.repeat(500),
+  }));
+  const candidatePrompt = JSON.stringify({ task: 'CANDIDATE', documents });
+  const refs = documents.map(document => document.ref);
+  const prompt = buildCitationRepairPrompt(
+    candidatePrompt,
+    { label: 'UNRELATED', confidence: 96, supportedLanguage: true } as any,
+    refs,
+    { maxChars: 4_000, maxTokens: 4_000 },
+  );
+  assert.ok(prompt.length <= 4_000, `expected <= 4000 chars, got ${prompt.length}`);
+  assert.ok(estimateGroqTokens(prompt) <= 4_000, `expected <= 4000 tokens, got ${estimateGroqTokens(prompt)}`);
+  const marker = 'Original request: ';
+  const embedded = prompt.slice(prompt.indexOf(marker) + marker.length);
+  const parsed = JSON.parse(embedded);
+  assert.equal(parsed.contextTruncated, true);
+  assert.deepEqual(parsed.documents.map((document: any) => document.ref), refs);
 });

@@ -419,7 +419,7 @@ test('an already-expired Gemini caller is a TIMEOUT, not a cancellation', async 
   assert.equal(calls, 0);
 });
 
-test('route-scoped credential failure advances to an independent Gemini account', async () => {
+test('route-scoped credential failure retries sibling keys and independent accounts', async () => {
   const { runGeminiRouteFailover } = await import('./GeminiSemanticProvider');
   const calls: string[] = [];
   const result = await runGeminiRouteFailover(
@@ -434,8 +434,8 @@ test('route-scoped credential failure advances to an independent Gemini account'
       return { route: route.id };
     },
   );
-  // The rejected credential belongs to proj-a: its sibling route is not
-  // retried, while the independent proj-b account still serves.
-  assert.deepEqual(calls, ['gemini-1', 'gemini-3']);
-  assert.deepEqual(result, { route: 'gemini-3' });
+  // A rejected credential invalidates only that key; its sibling is still
+  // valid and must serve instead of being suppressed by the shared label.
+  assert.deepEqual(calls, ['gemini-1', 'gemini-2']);
+  assert.deepEqual(result, { route: 'gemini-2' });
 });

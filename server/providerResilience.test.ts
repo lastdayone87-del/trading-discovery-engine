@@ -150,3 +150,59 @@ test('non-quota YouTube 403 stays transient while semantic credential 403 is rou
   assert.equal(gemini.routeScoped, true);
   assert.ok(gemini.providerReasons?.includes('PROVIDER_ROUTE_UNAUTHORIZED'));
 });
+
+test('transient-looking 400/404/422 messages stay retryable', () => {
+  for (const status of [400, 404, 422]) {
+    const error = classifyProviderError(Object.assign(new Error('upstream is temporarily unavailable'), { status }));
+    assert.equal(error.errorClass, 'TRANSIENT', `status ${status} must stay transient`);
+    assert.equal(error.retryable, true);
+  }
+  const permanent = classifyProviderError(Object.assign(new Error('bad argument'), { status: 400 }));
+  assert.equal(permanent.errorClass, 'PERMANENT_INPUT');
+  assert.equal(permanent.retryable, false);
+});
+
+test('a short declared retry delay never shortens the fixed semantic cooldown', () => {
+  const now = 1_000_000;
+  const config = { globalMinIntervalMs: 6_000, semanticRateLimitCooldownMs: 90_000, vocabularyRateLimitSuppressionMs: 900_000, vocabularySemanticQuietMs: 120_000, vocabularyMinIntervalMs: 30_000, maxInlineWaitMs: 8_000, semanticMaxInlineWaitMs: 8_000 };
+  const decision = decideGeminiCapacity('multilingual-semantic-classification', {
+    nowMs: now,
+    lastRateLimitAtMs: now,
+    rateLimitCooldownUntilMs: now + 5_000,
+  }, config);
+  // The 5s declared delay is shorter than the fixed 90s window. Before the
+  // fix this returned WAIT(5s); it must stay deferred for the full window.
+  assert.equal(decision.action, 'DEFER');
+  assert.equal(decision.reasonCode, 'SEMANTIC_DEFERRED_RATE_PRESSURE');
+});
+
+test('an expired daily quota is not extended by the generic cooldown clocks', () => {
+  const now = 1_000_000;
+  const config = { globalMinIntervalMs: 6_000, semanticRateLimitCooldownMs: 90_000, vocabularyRateLimitSuppressionMs: 900_000, vocabularySemanticQuietMs: 120_000, vocabularyMinIntervalMs: 30_000, maxInlineWaitMs: 8_000, semanticMaxInlineWaitMs: 8_000 };
+  const semantic = decideGeminiCapacity('multilingual-semantic-classification', {
+    nowMs: now,
+    lastRateLimitAtMs: now - 20_000,
+    rateLimitCooldownUntilMs: now - 1_000,
+    rateLimitQuotaScope: 'DAILY',
+  }, config);
+  assert.equal(semantic.action, 'RUN');
+  const vocabulary = decideGeminiCapacity('vocabulary-extraction', {
+    nowMs: now,
+    lastRateLimitAtMs: now - 20_000,
+    rateLimitCooldownUntilMs: now - 1_000,
+    rateLimitQuotaScope: 'DAILY',
+  }, config);
+  assert.equal(vocabulary.action, 'RUN');
+});
+
+test('a per-minute declared reset still applies when it extends past the fixed cooldown', () => {
+  const now = 1_000_000;
+  const config = { globalMinIntervalMs: 6_000, semanticRateLimitCooldownMs: 90_000, vocabularyRateLimitSuppressionMs: 900_000, vocabularySemanticQuietMs: 120_000, vocabularyMinIntervalMs: 30_000, maxInlineWaitMs: 8_000, semanticMaxInlineWaitMs: 8_000 };
+  const decision = decideGeminiCapacity('multilingual-semantic-classification', {
+    nowMs: now,
+    lastRateLimitAtMs: now - 10_000,
+    rateLimitCooldownUntilMs: now + 120_000,
+    rateLimitQuotaScope: 'MINUTE',
+  }, config);
+  assert.equal(decision.action, 'DEFER');
+});

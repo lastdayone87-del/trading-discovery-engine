@@ -510,11 +510,16 @@ describe('Gemini semantic pacing regression', () => {
       assert.ok(fnStr.includes('getGeminiSemanticCooldownExpiry'), 'must delegate to getGeminiSemanticCooldownExpiry');
     });
 
-    it('resolveGeminiSemanticCooldownExpiryMs uses global scope (no route parameter)', async () => {
+    it('resolveGeminiSemanticCooldownExpiryMs delegates to the provider-boundary resolver', async () => {
       const { resolveGeminiSemanticCooldownExpiryMs } = await import('./dbCore');
       const fnStr = resolveGeminiSemanticCooldownExpiryMs.toString();
       assert.ok(!fnStr.includes('configuredRouteIds'), 'resolveGeminiSemanticCooldownExpiryMs must not accept configuredRouteIds');
-      assert.ok(fnStr.includes('RATE_LIMITED'), 'must query RATE_LIMITED events');
+      // The SQL lives in providerResilience.getGeminiSemanticCooldownExpiry;
+      // dbCore must delegate so the queue gate and provider failover cannot
+      // drift onto independent clocks.
+      assert.ok(fnStr.includes('getGeminiSemanticCooldownExpiry'), 'must delegate to getGeminiSemanticCooldownExpiry');
+      const { getGeminiSemanticCooldownExpiry } = await import('./providerResilience');
+      assert.ok(getGeminiSemanticCooldownExpiry.toString().includes("status='RATE_LIMITED'"), 'resolver must query RATE_LIMITED events');
     });
 
     it('db.ts failJob does not import configuredGeminiRouteIds', async () => {

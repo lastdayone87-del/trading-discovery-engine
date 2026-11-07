@@ -223,7 +223,6 @@ export function classifyProviderError(error: unknown, nowMs: number = Date.now()
       cause:error,status,providerReasons:[...reasons,'GROQ_JSON_VALIDATION_FAILED'],routeScoped:true,
     });
   }
-  if (status===400 || status===404 || status===422) return new ProviderCallError('Permanent provider input failure.','PERMANENT_INPUT',false,{cause:error,status,providerReasons:value?.providerReasons});
   if (status===401 || status===403) {
     if (!routeCredentialFailure) return new ProviderCallError('Transient provider failure.','TRANSIENT',true,{cause:error,status});
     // Credential rejection is route-scoped: advance to another independent
@@ -233,7 +232,11 @@ export function classifyProviderError(error: unknown, nowMs: number = Date.now()
       cause:error,status,providerReasons:[...reasons,'PROVIDER_ROUTE_UNAUTHORIZED'],routeScoped:true,
     });
   }
-  if ([408,500,502,503,504].includes(Number(value?.status||value?.code)) || /ECONNRESET|ETIMEDOUT|high demand|temporar/i.test(message)) return new ProviderCallError('Transient provider failure.','TRANSIENT',true,{cause:error});
+  // Transient-looking messages keep their historical classification even when
+  // carried on a 400/404/422 status: the specific 400 branches above already
+  // claimed the two conditions that must not be treated as transport noise.
+  if ([408,500,502,503,504].includes(status) || /ECONNRESET|ETIMEDOUT|high demand|temporar/i.test(message)) return new ProviderCallError('Transient provider failure.','TRANSIENT',true,{cause:error,status});
+  if (status===400 || status===404 || status===422) return new ProviderCallError('Permanent provider input failure.','PERMANENT_INPUT',false,{cause:error,status,providerReasons:value?.providerReasons});
   return new ProviderCallError('Provider call failed.','TRANSIENT',true,{cause:error});
 }
 
@@ -277,6 +280,8 @@ type GeminiCapacitySnapshot = {
   lastRateLimitAtMs?: number;
   /** Absolute expiry carried by the latest rate-limit event (daily quota reset). */
   rateLimitCooldownUntilMs?: number;
+  /** Quota scope of the latest rate-limit event, when the provider declared it. */
+  rateLimitQuotaScope?: ProviderQuotaScope;
   lastSemanticAtMs?: number;
   lastVocabularyAtMs?: number;
 };
@@ -316,21 +321,28 @@ export function decideGeminiCapacity(operation:string, snapshot:GeminiCapacitySn
   const semanticMaxInlineWaitMs=config.semanticMaxInlineWaitMs??maxInlineWaitMs;
   const globalWait=Math.max(0,config.globalMinIntervalMs-age(snapshot.lastGeminiAtMs));
   // A provider-declared absolute reset (daily quota) is authoritative and
-  // must not be retried on the short per-minute cooldown clock.
+  // must not be retried on the short per-minute cooldown clock. For per-minute
+  // limits the provider may declare a shorter retry delay than our fixed
+  // cooldown; take the larger of the two so this gate never reopens before the
+  // persisted resolver (providerCooldownExpiryMs) does.
   const declaredRateLimitWait=snapshot.rateLimitCooldownUntilMs!=null
     ? Math.max(0,snapshot.rateLimitCooldownUntilMs-snapshot.nowMs)
     : 0;
+  const dailyDeclaredExpired=snapshot.rateLimitQuotaScope==='DAILY'&&declaredRateLimitWait<=0;
+  const minuteRateLimitWait=dailyDeclaredExpired
+    ? 0
+    : age(snapshot.lastRateLimitAtMs)<config.semanticRateLimitCooldownMs
+      ? config.semanticRateLimitCooldownMs-age(snapshot.lastRateLimitAtMs)
+      : 0;
   if(operation===GEMINI_VOCABULARY_OPERATION){
-    if(declaredRateLimitWait>0||age(snapshot.lastRateLimitAtMs)<config.vocabularyRateLimitSuppressionMs) return {action:'DEFER',waitMs:0,reasonCode:'VOCABULARY_DEFERRED_RATE_PRESSURE'};
+    if(declaredRateLimitWait>0||(!dailyDeclaredExpired&&age(snapshot.lastRateLimitAtMs)<config.vocabularyRateLimitSuppressionMs)) return {action:'DEFER',waitMs:0,reasonCode:'VOCABULARY_DEFERRED_RATE_PRESSURE'};
     if(age(snapshot.lastSemanticAtMs)<config.vocabularySemanticQuietMs) return {action:'DEFER',waitMs:0,reasonCode:'VOCABULARY_DEFERRED_SEMANTIC_PRIORITY'};
     const vocabularyWait=Math.max(0,config.vocabularyMinIntervalMs-age(snapshot.lastVocabularyAtMs));
     const waitMs=Math.max(globalWait,vocabularyWait);
     if(waitMs>maxInlineWaitMs) return {action:'DEFER',waitMs:0,reasonCode:'VOCABULARY_DEFERRED_CAPACITY_WAIT'};
     return {action:waitMs>0?'WAIT':'RUN',waitMs};
   }
-  const rateLimitWait=declaredRateLimitWait>0
-    ? declaredRateLimitWait
-    : age(snapshot.lastRateLimitAtMs)<config.semanticRateLimitCooldownMs?config.semanticRateLimitCooldownMs-age(snapshot.lastRateLimitAtMs):0;
+  const rateLimitWait=Math.max(declaredRateLimitWait,minuteRateLimitWait);
   const waitMs=Math.max(globalWait,rateLimitWait);
   const isSemantic=operation===GEMINI_SEMANTIC_OPERATION;
   const waitCeiling=isSemantic?semanticMaxInlineWaitMs:maxInlineWaitMs;
@@ -556,13 +568,14 @@ async function acquireGeminiCapacity(context:ProviderCallContext,signal?:AbortSi
       // rows feed its cooldown window (strict org tag match — untagged rows
       // cool no account), so one exhausted account never paces the healthy
       // ones.
-      queryWithDeadline(client,`SELECT occurred_at, MAX((request_metadata->>'cooldownUntilMs')::bigint) FILTER (WHERE request_metadata->>'cooldownUntilMs' ~ '^[0-9]+$') OVER () AS cooldown_until_ms FROM provider_call_events WHERE provider='gemini' AND status='RATE_LIMITED' AND request_metadata->>'geminiOrg'=$1 AND occurred_at >= now() - interval '2 days' ORDER BY occurred_at DESC LIMIT 1`,[orgId],signal,deadlineAtMs),
+      queryWithDeadline(client,`SELECT occurred_at, request_metadata->>'quotaScope' AS quota_scope, MAX((request_metadata->>'cooldownUntilMs')::bigint) FILTER (WHERE request_metadata->>'cooldownUntilMs' ~ '^[0-9]+$') OVER () AS cooldown_until_ms FROM provider_call_events WHERE provider='gemini' AND status='RATE_LIMITED' AND request_metadata->>'geminiOrg'=$1 AND occurred_at >= now() - interval '2 days' ORDER BY occurred_at DESC LIMIT 1`,[orgId],signal,deadlineAtMs),
       queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND operation=$1 AND COALESCE(request_metadata->>'geminiRoute',$2)=$2 ORDER BY occurred_at DESC LIMIT 1`,[GEMINI_SEMANTIC_OPERATION,routeId],signal,deadlineAtMs),
       queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND operation=$1 AND COALESCE(request_metadata->>'geminiRoute',$2)=$2 ORDER BY occurred_at DESC LIMIT 1`,[GEMINI_VOCABULARY_OPERATION,routeId],signal,deadlineAtMs)
     ]);
     const at=(row:any)=>row?.occurred_at?new Date(row.occurred_at).getTime():undefined;
     const declaredCooldownUntil=Number(lastRate.rows[0]?.cooldown_until_ms);
-    const decision=decideGeminiCapacity(context.operation,{nowMs:Date.now(),lastGeminiAtMs:at(lastAny.rows[0]),lastRateLimitAtMs:at(lastRate.rows[0]),rateLimitCooldownUntilMs:Number.isFinite(declaredCooldownUntil)?declaredCooldownUntil:undefined,lastSemanticAtMs:at(lastSemantic.rows[0]),lastVocabularyAtMs:at(lastVocabulary.rows[0])});
+    const quotaScope=lastRate.rows[0]?.quota_scope;
+    const decision=decideGeminiCapacity(context.operation,{nowMs:Date.now(),lastGeminiAtMs:at(lastAny.rows[0]),lastRateLimitAtMs:at(lastRate.rows[0]),rateLimitCooldownUntilMs:Number.isFinite(declaredCooldownUntil)?declaredCooldownUntil:undefined,rateLimitQuotaScope:quotaScope==='DAILY'||quotaScope==='MINUTE'?quotaScope:undefined,lastSemanticAtMs:at(lastSemantic.rows[0]),lastVocabularyAtMs:at(lastVocabulary.rows[0])});
     if(decision.action==='DEFER'){
       await client.query({text:'SELECT pg_advisory_unlock($1)',values:[GEMINI_CAPACITY_LOCK],query_timeout:1000}).catch(()=>undefined);
       client.release(); client=undefined;
@@ -594,7 +607,7 @@ function safeProviderReasons(values?:string[]):string[]{
 }
 
 /** Bounded, credential-free failure metadata persisted for cooldown/health readers. */
-function providerFailureMetadata(typed:ProviderCallError):Record<string,string>{
+export function providerFailureMetadata(typed:ProviderCallError):Record<string,string>{
   const extra:Record<string,string>={};
   if(typed.cooldownUntilMs!=null&&Number.isFinite(typed.cooldownUntilMs))extra.cooldownUntilMs=String(Math.floor(typed.cooldownUntilMs));
   if(typed.retryAfterMs!=null&&Number.isFinite(typed.retryAfterMs))extra.retryAfterMs=String(Math.floor(typed.retryAfterMs));

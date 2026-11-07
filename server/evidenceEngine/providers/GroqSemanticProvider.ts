@@ -363,12 +363,16 @@ export async function runGroqRouteFailover<T>(
         continue;
       }
       if (error instanceof ProviderCallError && error.routeScoped) {
-        // A rejected credential or organization restriction belongs to one
-        // route/account. Independent accounts may still serve, so advance
-        // instead of aborting the pool.
-        const failedOrg = failedGroqOrg(error, route);
-        for (const candidate of ordered) {
-          if (groqRouteOrg(candidate) === failedOrg) tried.add(candidate);
+        // An organization restriction belongs to every route in that account,
+        // so skip its siblings. A rejected credential (401/403) belongs to the
+        // single key only: sibling keys may still be valid, so advance to them
+        // instead of suppressing the whole org.
+        const reasons = Array.isArray(error.providerReasons) ? error.providerReasons : [];
+        if (reasons.includes('GROQ_ORGANIZATION_RESTRICTED')) {
+          const failedOrg = failedGroqOrg(error, route);
+          for (const candidate of ordered) {
+            if (groqRouteOrg(candidate) === failedOrg) tried.add(candidate);
+          }
         }
         if (!ordered.some(candidate => !tried.has(candidate))) throw error;
         continue;
@@ -537,14 +541,22 @@ export async function runGroqTextCompletion(
     groqOrgDisabledRemainingMs(groqRouteOrg(route)) <= 0
   );
   if (!usable.length) {
-    const disabledRemainingMs = Math.max(0, ...routes.map(route => groqOrgDisabledRemainingMs(groqRouteOrg(route))));
-    if (disabledRemainingMs > 0) throw groqPoolDisabledError(disabledRemainingMs);
-    const remainingMs = Math.max(0, ...routes.map(route => groqOrgCooldownRemainingMs(groqRouteOrg(route))));
+    // Report the earliest route that can become usable, not the longest ban:
+    // a mixed cooling/quarantined pool is not "all disabled", and a route
+    // whose 90s cooldown ends first makes the pool usable before a one-hour
+    // quarantine elsewhere expires.
+    const remainingByRoute = routes.map(route => {
+      const org = groqRouteOrg(route);
+      return Math.max(groqOrgDisabledRemainingMs(org), groqOrgCooldownRemainingMs(org));
+    });
+    const earliestRemainingMs = Math.max(0, Math.min(...remainingByRoute));
+    const everyRouteDisabled = routes.every(route => groqOrgDisabledRemainingMs(groqRouteOrg(route)) > 0);
+    if (everyRouteDisabled) throw groqPoolDisabledError(earliestRemainingMs);
     throw Object.assign(
       new ProviderCallError('Groq routes cooling; deferring.', 'RATE_LIMIT', true, {
         providerReasons: [GROQ_RATE_LIMITED_REASON],
       }),
-      { groqCooldownDeferred: true, retryAfterMs: remainingMs }
+      { groqCooldownDeferred: true, retryAfterMs: earliestRemainingMs }
     );
   }
   const operation = input.operation || GROQ_VOCABULARY_OPERATION;
@@ -853,6 +865,16 @@ function truncateToTokenBudget(text: string, maxTokens: number): string {
   return text.slice(0, Math.max(0, Math.floor(text.length * (maxTokens / estimate))));
 }
 
+/** Fail closed when even the fixed prompt structure exceeds the budget. */
+function groqPromptBudgetError(): ProviderCallError {
+  return new ProviderCallError(
+    'Groq semantic prompt exceeds the configured budget even after removing document text.',
+    'PERMANENT_INPUT',
+    false,
+    { providerReasons: ['GROQ_PROMPT_BUDGET_EXCEEDED'] },
+  );
+}
+
 /**
  * Bound a semantic prompt to Groq's free-tier token budget without dropping
  * any field references. All documents stay present (so every citation remains
@@ -879,7 +901,7 @@ export function capGroqSemanticPrompt(
     contextTruncated: true,
     documents: documents.map((document: any) => ({
       ...document,
-      text: document.text.slice(0, Math.max(40, perDocumentChars)),
+      text: document.text.slice(0, Math.max(0, Math.floor(perDocumentChars))),
     })),
   });
   const overhead = JSON.stringify({
@@ -892,12 +914,17 @@ export function capGroqSemanticPrompt(
   let perDocumentChars = documents.length
     ? Math.min(totalTextChars, Math.floor(available / documents.length))
     : available;
-  let bounded = build(perDocumentChars);
   const exceeds = (value: string) => value.length > maxChars || estimateGroqTokens(value) > maxTokens;
-  while (exceeds(bounded) && perDocumentChars > 40) {
-    perDocumentChars = Math.max(40, Math.floor(perDocumentChars * 0.8));
+  // The fixed references and structure alone can exceed the budget (very large
+  // corpus at a small configured limit). Never send an over-budget request:
+  // fail closed so the caller can use its fallback instead of provoking 429s.
+  if (exceeds(build(0))) throw groqPromptBudgetError();
+  let bounded = build(perDocumentChars);
+  while (exceeds(bounded) && perDocumentChars > 0) {
+    perDocumentChars = Math.max(0, Math.floor(perDocumentChars * 0.8));
     bounded = build(perDocumentChars);
   }
+  if (exceeds(bounded)) throw groqPromptBudgetError();
   return bounded;
 }
 
@@ -941,7 +968,7 @@ export function defaultClient(
     // dead organization is never retried (or paced) again in this process.
     const routes = configuredGroqRoutes().filter(route => groqOrgDisabledRemainingMs(groqRouteOrg(route)) <= 0);
     if (!routes.length) {
-      const remainingMs = Math.max(0, ...configuredGroqRoutes().map(route => groqOrgDisabledRemainingMs(groqRouteOrg(route))));
+      const remainingMs = Math.max(0, Math.min(...configuredGroqRoutes().map(route => groqOrgDisabledRemainingMs(groqRouteOrg(route)))));
       throw groqPoolDisabledError(remainingMs);
     }
     const response = await runGroqRouteFailover(routes, async route => {
@@ -1155,15 +1182,30 @@ export function buildCitationRepairPrompt(
   candidatePrompt: string,
   result: SemanticModelResult,
   refs: Array<{ field: string; index?: number; sourceId?: string }>,
+  limits?: { maxChars?: number; maxTokens?: number },
 ): string {
   const refList = refs.map(ref => JSON.stringify(ref)).join(', ');
-  return [
+  const header = [
     'Your previous classification is missing required field citations.',
     `Keep label=${result.label}, confidence=${result.confidence}, supportedLanguage=${result.supportedLanguage}.`,
     `You may only cite from this exact list: [${refList}]. Cite only list entries, with matching field, index, and sourceId. If no listed reference supports the decision, return "citations":[] — never invent a reference.`,
     'Return the complete classification JSON with citations populated from the supplied field references; an uncited classification cannot be used.',
-    `Original request: ${candidatePrompt}`,
   ].join(' ');
+  const separator = ' Original request: ';
+  const maxChars = limits?.maxChars ?? groqMaxPromptChars();
+  const maxTokens = limits?.maxTokens ?? groqMaxPromptTokens();
+  const fixedChars = header.length + separator.length;
+  const fixedTokens = estimateGroqTokens(header + separator);
+  if (fixedChars > maxChars || fixedTokens > maxTokens) throw groqPromptBudgetError();
+  // Cap the embedded structured request first: raw truncation would cut the
+  // tail documents and their references, leaving the repair unable to cite
+  // evidence the model was originally given.
+  const boundedCandidate = capGroqSemanticPrompt(
+    candidatePrompt,
+    maxChars - fixedChars,
+    maxTokens - fixedTokens,
+  );
+  return `${header}${separator}${boundedCandidate}`;
 }
 
 /**

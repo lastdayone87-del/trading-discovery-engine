@@ -1,6 +1,6 @@
 # Semantic provider capacity — Phase 1 + 2
 
-Status: implemented on `main` in the provider-boundary PR. This document covers
+Status: implemented in this PR (Phase 1 + 2). This document covers
 the production configuration corrections (Phase 1) and the provider-resilience
 code that makes them durable (Phase 2). It supersedes any earlier assumption
 that all Gemini keys belonged to one Google Cloud project.
@@ -25,7 +25,9 @@ Three independent faults combined into a capacity outage:
 
 Applied in Coolify and verified in the running container:
 
-- `SEMANTIC_PROVIDER=groq` (Groq primary; Gemini remains the pairwise fallback).
+- `SEMANTIC_PROVIDER=groq` (Groq primary; the only keyed fallback is free-tier
+  Gemini, which requires `GEMINI_FREE_API_KEY`. Paid Gemini keys are not part
+  of this chain; `SEMANTIC_PROVIDER_FORCE_GEMINI=true` is the rollback path).
 - Restricted Groq keys removed; healthy slots renumbered so route discovery
   sees only usable keys. Route IDs are assigned by sorted configured slot;
   after removal `groq-6`/`groq-7` map to the surviving `_14`/`_17` keys.
@@ -64,30 +66,38 @@ window from `provider_call_events`.
   filtered before pacing/fetching, so later calls do not spend time or quota on
   a known-dead credential. Quarantine is in-process; telemetry records the
   event so operators and other replicas can see it.
-- **Route-scoped failover.** 400 restricted, 401/403 credential rejection, and
-  JSON-validation failures advance to another independent org. Sibling routes
-  in the same org are skipped because they share one quota pool. An error
-  carrying an explicit org still advances even when the failing route differs.
+- **Route-scoped failover.** HTTP 400 `organization_restricted` quarantines the
+  organization, so its sibling routes are skipped. A 401/403 credential
+  rejection skips only the rejected key: sibling keys and independent orgs may
+  still serve. JSON-validation failures are capped by attempted route count
+  (below) and may retry a same-org sibling. An error carrying an explicit org
+  still advances even when the failing route differs.
 - **Content-failure cap.** Invalid or missing model JSON repeats across accounts
   at temperature 0, so failover stops after
   `GROQ_JSON_VALIDATION_MAX_ROUTES` (default 2) and lets the caller use its
   deterministic fallback.
 - **Prompt budget.** `GROQ_MAX_PROMPT_CHARS` (default 24,000) and the
   script-aware `GROQ_MAX_PROMPT_TOKENS` (default 6,000) shorten document text
-  while keeping every field reference. `contextTruncated` tells the model the
-  evidence set is partial, and all citations stay attributable. The token
-  bound matters for CJK/Thai evidence, where one character can cost one token.
+  while keeping every field reference. Text shrinks to zero before the request
+  is allowed to exceed either budget; if the fixed references alone cannot fit,
+  the call fails closed with `GROQ_PROMPT_BUDGET_EXCEEDED` instead of sending an
+  oversized request. `contextTruncated` tells the model the evidence set is
+  partial, and all citations stay attributable. The token bound matters for
+  CJK/Thai evidence, where one character can cost one token.
 - **Pool exhaustion.** When every route is quarantined, the caller receives a
-  bounded `GROQ_ROUTE_POOL_DISABLED` error with the remaining TTL instead of a
-  misleading permanent-input failure.
+  bounded `GROQ_ROUTE_POOL_DISABLED` error with the earliest route's remaining
+  TTL. A mixed cooling/quarantined pool reports the earliest route availability
+  as a deferral instead of claiming the pool is disabled.
 
 ### Gemini
 
-- A rejected credential (401/403) is route-scoped: independent projects still
-  serve; same-project siblings are not retried.
-- Daily-quota cooldowns are authoritative. Capacity decisions and the persisted
-  cooldown resolvers use `cooldownUntilMs` when present, so a daily 429 is not
-  retried every 90 seconds.
+- A rejected credential (401/403) is route-scoped: only the rejected key is
+  skipped; sibling keys and independent projects still serve.
+- Daily-quota cooldowns are authoritative. Capacity decisions, the in-process
+  free-tier gate, and the persisted cooldown resolvers use `cooldownUntilMs`
+  when present, so a daily 429 is not retried every 90 seconds. A daily window
+  that has already passed is not extended by the generic per-minute or
+  vocabulary-suppression clocks.
 - Per-org cooldown lookups continue to match only rows tagged with that org.
   Untagged rows cool no account.
 
@@ -118,14 +128,17 @@ window from `provider_call_events`.
   "recentFailures": [
     { "provider": "groq", "route": "groq-1", "org": "slot-1",
       "status": "CREDENTIALS_EXHAUSTED", "error_class": "CREDENTIALS_EXHAUSTED",
-      "events": 2, "route_disabled_events": 2 }
+      "cooldown_deferral": false, "events": 2, "route_disabled_events": 2 }
   ]
 }
 ```
 
 Status values are `healthy`, `cooling` (provider 429 window), and `disabled`
-(restricted-route quarantine). The endpoint is read-only, credential-free, and
-authorized by the existing `providers.metrics.read` policy.
+(restricted-route quarantine). Local cooldown-deferral echoes are excluded from
+cooldowns and reported as `cooldown_deferral: true` rows instead of fresh
+failures. Ledger aggregates are cached for 15 seconds (the dashboard polling
+interval); in-process route state stays live. The endpoint is read-only,
+credential-free, and authorized by the existing `providers.metrics.read` policy.
 
 Key events to watch:
 
