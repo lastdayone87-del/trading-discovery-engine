@@ -1289,6 +1289,52 @@ test('groq prompt cap fails closed when fixed references alone exceed the budget
   );
 });
 
+test('an over-budget prompt fails closed before arming the deadline timer or fetching', async () => {
+  resetGroqCooldownForTests();
+  resetGroqRouteHealthForTests();
+  const names = ['GROQ_API_KEY', 'GROQ_API_KEY_2', 'GROQ_ORG_ID', 'GROQ_ORG_ID_2', 'GROQ_MAX_PROMPT_CHARS', 'GROQ_MAX_PROMPT_TOKENS'];
+  const saved: Record<string, string | undefined> = {};
+  for (const name of names) saved[name] = process.env[name];
+  const savedFetch = globalThis.fetch;
+  const savedSetTimeout = globalThis.setTimeout;
+  let fetchCalls = 0;
+  let timers = 0;
+  process.env.GROQ_API_KEY = 'budget-key';
+  delete process.env.GROQ_API_KEY_2;
+  delete process.env.GROQ_ORG_ID;
+  delete process.env.GROQ_ORG_ID_2;
+  process.env.GROQ_MAX_PROMPT_CHARS = '4000';
+  process.env.GROQ_MAX_PROMPT_TOKENS = '1000';
+  globalThis.fetch = (async () => { fetchCalls++; throw new Error('over-budget prompt must not fetch'); }) as unknown as typeof fetch;
+  globalThis.setTimeout = ((fn: (...args: any[]) => void, ms?: number, ...args: any[]) => {
+    timers++;
+    return savedSetTimeout(fn, ms, ...args);
+  }) as unknown as typeof setTimeout;
+  try {
+    const client = defaultClient(async () => undefined, { persistedCooldownExpiryMs: async () => undefined });
+    const documents = Array.from({ length: 40 }, (_, index) => ({
+      ref: { field: 'video_title', index, sourceId: 's'.repeat(1_000) },
+      text: 'small',
+    }));
+    const error = await client!.classify(JSON.stringify({ task: 'CANDIDATE', documents }), 'model')
+      .then(() => null, (caught: unknown) => caught);
+    assert.ok(error instanceof ProviderCallError);
+    assert.equal((error as ProviderCallError).errorClass, 'PERMANENT_INPUT');
+    assert.ok((error as ProviderCallError).providerReasons?.includes('GROQ_PROMPT_BUDGET_EXCEEDED'));
+    assert.equal(fetchCalls, 0, 'no request may be spent on an over-budget prompt');
+    assert.equal(timers, 0, 'the cap must fail before the deadline timer is armed');
+  } finally {
+    globalThis.fetch = savedFetch;
+    globalThis.setTimeout = savedSetTimeout;
+    for (const name of names) {
+      if (saved[name] === undefined) delete process.env[name];
+      else process.env[name] = saved[name] as string;
+    }
+    resetGroqCooldownForTests();
+    resetGroqRouteHealthForTests();
+  }
+});
+
 test('citation-repair prompt caps the embedded request without dropping document refs', () => {
   const documents = Array.from({ length: 20 }, (_, index) => ({
     ref: { field: 'video_title', index },

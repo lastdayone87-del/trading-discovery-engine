@@ -973,6 +973,15 @@ export function defaultClient(
     }
     const response = await runGroqRouteFailover(routes, async route => {
       const started = Date.now();
+      const orgId = groqRouteOrg(route);
+      // Groq's free tier meters tokens per minute. Keep every supplied field
+      // reference (citations stay attributable) while shortening document
+      // text so one oversized evidence set cannot 429 the whole pool. Cap
+      // before allocating the abort listener/deadline timer: this call can
+      // fail closed with GROQ_PROMPT_BUDGET_EXCEEDED, and a rejected prompt
+      // must not leave those resources attached.
+      const boundedPrompt = capGroqSemanticPrompt(prompt, groqMaxPromptChars());
+      const promptCapped = boundedPrompt.length !== prompt.length;
       const controller = new AbortController();
       const abortFromCaller = () => controller.abort(signal?.reason);
       if (signal?.aborted) controller.abort(signal.reason);
@@ -982,12 +991,6 @@ export function defaultClient(
       // provider reports instead of masquerading as a slow provider.
       let deadlineExpired = false;
       const timer = deadlinesEnabled ? setTimeout(() => { deadlineExpired = true; controller.abort(); }, timeoutMs) : undefined;
-      const orgId = groqRouteOrg(route);
-      // Groq's free tier meters tokens per minute. Keep every supplied field
-      // reference (citations stay attributable) while shortening document
-      // text so one oversized evidence set cannot 429 the whole pool.
-      const boundedPrompt = capGroqSemanticPrompt(prompt, groqMaxPromptChars());
-      const promptCapped = boundedPrompt.length !== prompt.length;
       const base = {
         id: randomUUID(), provider: 'groq', operation: 'multilingual-semantic-classification',
         ...semanticObservabilityFields(observability),
