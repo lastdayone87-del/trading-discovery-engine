@@ -155,17 +155,17 @@ function sqlNormalizedUrl(expression: string): string {
 }
 
 /**
- * Counter evidence matching `nonNegativeInt`: only JSON numbers count, and a
- * number is positive only when its numeric value is greater than zero. A JSON
- * string such as `"4"` is malformed input and contributes zero, while `2.5`
- * counts exactly like TypeScript. No text-to-int cast is performed, so a
- * malformed counter can never abort the read-only report.
+ * Counter evidence matching `nonNegativeInt`: only JSON numbers count, and
+ * `floor(value)` must be positive. A JSON string such as `"4"` is malformed
+ * input and contributes zero, while `2.5` floors to 2 exactly like TypeScript.
+ * No text-to-int cast is performed, so a malformed counter can never abort the
+ * read-only report.
  */
 function safeCounterSql(jsonbExpression: string): string {
   const numeric = `((${jsonbExpression})::text)::numeric`;
   return `(CASE WHEN jsonb_typeof(${jsonbExpression}) = 'number'`
-    + ` AND ${numeric} > 0`
-    + ` THEN ${numeric} ELSE 0 END)`;
+    + ` AND floor(${numeric}) > 0`
+    + ` THEN floor(${numeric}) ELSE 0 END)`;
 }
 
 /**

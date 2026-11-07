@@ -90,7 +90,7 @@ test('the SQL bound keeps path-only URL normalization and all-observation browse
   assert.match(telemetrySql, /regexp_replace\(.*':80\$'/);
   assert.match(telemetrySql, /regexp_replace\(.*':443\$'/);
   assert.match(telemetrySql, /jsonb_typeof\(.*\) = 'number'/);
-  assert.match(telemetrySql, /::numeric > 0/);
+  assert.match(telemetrySql, /floor\(.*::numeric\) > 0/);
   assert.doesNotMatch(telemetrySql, /::int ELSE 0 END/);
   assert.match(telemetrySql, /latest_inspection_at/);
   assert.match(telemetrySql, /interval '5 minutes'/);
