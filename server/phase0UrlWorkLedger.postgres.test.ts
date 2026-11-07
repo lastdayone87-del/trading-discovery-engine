@@ -221,6 +221,25 @@ maybe('the read-only report projects and reconciles a fixture backlog', async t 
         telemetry: { mode: 'RENDERED', pagesInspected: 2, requestsStarted: 2, requestsFinished: 2 },
       },
       {
+        key: `phase0-ledger-mixed-clean-${suffix}`,
+        url: 'https://mixed-signal.example/',
+        outcome: 'INSPECTED_NO_MATCH',
+        retryable: false,
+        failureClass: null,
+        required: false,
+        observedAt: `now() - interval '1 minute'`,
+        telemetry: { mode: 'STATIC', pagesInspected: 2, requestsStarted: 0, requestsFinished: 0 },
+      },
+      {
+        key: `phase0-ledger-mixed-failure-${suffix}`,
+        url: 'https://mixed-signal.example/',
+        outcome: 'ACQUISITION_FAILED',
+        retryable: true,
+        failureClass: 'NETWORK_FAILURE',
+        required: true,
+        telemetry: { mode: 'RENDERED', pagesInspected: 0, requestsStarted: 1, requestsFinished: 1 },
+      },
+      {
         key: `phase0-ledger-oversized-${suffix}`,
         url: 'https://oversized.example/',
         outcome: 'ACQUISITION_FAILED',
@@ -287,7 +306,7 @@ maybe('the read-only report projects and reconciles a fixture backlog', async t 
   assert.ok(report.rows, 'includeRows must return the projection rows');
 
   const rows = report.rows.filter(row => row.channelId === channelId);
-  assert.equal(rows.length, 8, 'optional observations never create a work row by themselves');
+  assert.equal(rows.length, 9, 'optional observations never create a work row by themselves');
   const byUrl = new Map(rows.map(row => [row.normalizedUrl, row]));
   assert.equal(byUrl.get('https://found.example/links')?.state, 'RESOLVED');
   assert.equal(byUrl.get('https://found.example/links')?.neverExecuted, false);
@@ -321,25 +340,35 @@ maybe('the read-only report projects and reconciles a fixture backlog', async t 
   assert.equal(byUrl.get('https://recovered-gap.example/')?.attempts, 2);
   assert.equal(byUrl.get('https://recovered-gap.example/')?.neverExecuted, false);
   assert.equal(byUrl.get('https://recovered-gap.example/')?.neverBrowserExecuted, false);
+  // The latest inspection keeps the required browser failure even though an
+  // optional static clean is more recent: required results dominate optional
+  // notes, exactly as production's effectiveAcquisitionOutcomes does.
+  assert.equal(byUrl.get('https://mixed-signal.example/')?.state, 'PENDING');
+  assert.equal(byUrl.get('https://mixed-signal.example/')?.lastOutcome, 'ACQUISITION_FAILED');
+  assert.equal(byUrl.get('https://mixed-signal.example/')?.retryOwned, true);
+  assert.equal(byUrl.get('https://mixed-signal.example/')?.attempts, 2);
+  assert.equal(byUrl.get('https://mixed-signal.example/')?.neverExecuted, false);
+  assert.equal(byUrl.get('https://mixed-signal.example/')?.neverBrowserExecuted, false);
   assert.equal(byUrl.get('https://oversized.example/')?.state, 'PENDING');
   assert.equal(byUrl.get('https://oversized.example/')?.neverExecuted, true);
   assert.equal(byUrl.get('https://oversized.example/')?.neverBrowserExecuted, true);
   assert.equal(byUrl.get('https://optional.example/'), undefined);
 
   // The SQL telemetry bound and the TypeScript projection must agree on the
-  // fixture rows: five effective retry owners, all never browser-executed.
+  // fixture rows: six effective retry owners, five never browser-executed.
   // `recovered.example` has a retryable static failure plus a rendered success
   // in the same inspection, so it is not retry-owned but must count as
-  // browser-executed.
+  // browser-executed. `mixed-signal.example` keeps its required browser
+  // failure, so it is retry-owned but not never-executed.
   const retryableDelta = report.projection.retryableRows - baseline.projection.retryableRows;
   const retryableNeverBrowserDelta = report.projection.retryableNeverBrowserExecutedRows
     - baseline.projection.retryableNeverBrowserExecutedRows;
   const telemetryRetryableDelta = report.telemetry.retryableRows - baseline.telemetry.retryableRows;
   const telemetryNeverBrowserDelta = report.telemetry.neverBrowserExecutedRows
     - baseline.telemetry.neverBrowserExecutedRows;
-  assert.equal(retryableDelta, 5);
+  assert.equal(retryableDelta, 6);
   assert.equal(retryableNeverBrowserDelta, 5);
-  assert.equal(telemetryRetryableDelta, 5);
+  assert.equal(telemetryRetryableDelta, 6);
   assert.equal(telemetryNeverBrowserDelta, 5);
 
   // The report must expose its own reconciliation, not just a recomputed copy.

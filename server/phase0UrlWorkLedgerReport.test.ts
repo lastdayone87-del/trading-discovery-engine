@@ -99,6 +99,12 @@ test('the SQL bound keeps path-only URL normalization and all-observation browse
   assert.match(telemetrySql, /interval '5 minutes'/);
   assert.match(telemetrySql, /id DESC/);
   assert.match(telemetrySql, /STATIC_BUDGET_GAP/);
+  assert.match(telemetrySql, /AS processed_evidence/);
+  assert.match(telemetrySql, /AS has_found/);
+  assert.match(telemetrySql, /AS has_required/);
+  assert.match(telemetrySql, /WHEN has_found > 0 THEN outcome = 'FOUND'/);
+  assert.match(telemetrySql, /WHEN has_required > 0 THEN required/);
+  assert.match(telemetrySql, /outcome <> 'INSPECTED_NO_MATCH' OR processed_evidence/);
 
   const rawSql = queries.find(sql => sql.includes('o.requested_url,') && sql.includes('o.provenance'));
   assert.ok(rawSql);

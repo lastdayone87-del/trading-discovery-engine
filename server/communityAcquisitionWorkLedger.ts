@@ -25,12 +25,13 @@
  *     processed pages. An unevidenced static result stays PENDING so an
  *     incomplete inspection can never become a false NOT_FOUND.
  *   * The effective observation is chosen from the latest inspection window
- *     first, then rank-first within that inspection (FOUND >
- *     INSPECTED_NO_MATCH > PARTIALLY_INSPECTED > ACQUISITION_FAILED), then by
- *     time and observation id. Selecting the latest inspection first prevents
- *     an old success from hiding a current failure; rank-first within the
- *     window tolerates inspection-start timestamp skew between static and
- *     rendered rows.
+ *     using the production precedence: any `FOUND`, then required observations
+ *     over optional notes, then an unevidenced clean only when nothing else
+ *     remains, then rank (FOUND > INSPECTED_NO_MATCH > PARTIALLY_INSPECTED >
+ *     ACQUISITION_FAILED), time, and observation id. Selecting the latest
+ *     inspection first prevents an old success from hiding a current failure;
+ *     required dominance prevents a later optional static clean from hiding a
+ *     required browser failure for the same URL.
  */
 
 import { createHash } from 'node:crypto';
@@ -400,11 +401,10 @@ export function latestInspectionObservations(
 }
 
 /**
- * Rank-first effective selection within the latest inspection. Timestamps are
- * a tie-breaker because the inspector stamps rendered observations at
- * inspection start while static observations get a later timestamp. The
- * observation id makes equal timestamps deterministic and matches the SQL
- * bound's `id DESC` ordering.
+ * Rank-first effective selection. Timestamps are a tie-breaker because the
+ * inspector stamps rendered observations at inspection start while static
+ * observations get a later timestamp. The observation id makes equal
+ * timestamps deterministic and matches the SQL bound's `id DESC` ordering.
  */
 function isPreferredObservation(
   candidate: CommunityWorkObservation,
@@ -419,6 +419,45 @@ function isPreferredObservation(
   const candidateId = String(candidate.id || '');
   const currentId = String(current.id || '');
   return candidateId > currentId;
+}
+
+/**
+ * Effective observation selection within one inspection, mirroring the
+ * production `effectiveAcquisitionOutcomes` precedence:
+ *
+ *   1. Any `FOUND` wins outright: a discovered candidate must never be lost
+ *      to an optional static note, so optional recovery can still resolve an
+ *      admitted key.
+ *   2. Otherwise required observations dominate optional notes: a required
+ *      rendered failure outranks a later non-required static clean for the
+ *      same URL. Falling back to optional rows only when no required result
+ *      remains is what lets the completed static-gap case resolve.
+ *   3. Within that pool an unevidenced `INSPECTED_NO_MATCH` never beats a
+ *      real signal; it only wins when it is the sole pool.
+ *   4. Rank, then latest time, then observation id.
+ */
+export function selectEffectiveInspectionObservation(
+  observations: readonly CommunityWorkObservation[],
+): CommunityWorkObservation | null {
+  if (observations.length === 0) return null;
+  const found = observations.filter(observation => observation.outcome === 'FOUND');
+  let pool: readonly CommunityWorkObservation[];
+  if (found.length > 0) {
+    pool = found;
+  } else {
+    const required = observations.filter(isRequiredCommunityWorkObservation);
+    pool = required.length > 0 ? required : observations;
+  }
+  const evidenced = pool.filter(
+    observation => observation.outcome !== 'INSPECTED_NO_MATCH'
+      || hasProcessedAcquisitionEvidence(observation),
+  );
+  const finalists = evidenced.length > 0 ? evidenced : pool;
+  let best = finalists[0];
+  for (const observation of finalists) {
+    if (isPreferredObservation(observation, best)) best = observation;
+  }
+  return best;
 }
 
 export function resolveCommunityWorkState(
@@ -544,10 +583,8 @@ export function projectCommunityAcquisitionWork(
 
   for (const [workKey, group] of grouped) {
     const inspectionCandidates = latestInspectionObservations(group.observations);
-    let latest = inspectionCandidates[0];
-    for (const observation of inspectionCandidates) {
-      if (isPreferredObservation(observation, latest)) latest = observation;
-    }
+    const latest = selectEffectiveInspectionObservation(inspectionCandidates);
+    if (!latest) continue;
     let earliestAt = group.observations[0].observedAt;
     let attempts = 0;
     let directProcessedExecutions = 0;

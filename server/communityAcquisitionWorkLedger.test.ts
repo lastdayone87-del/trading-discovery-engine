@@ -260,6 +260,93 @@ test('rank-first applies within the latest inspection, not across inspections', 
   assert.equal(rows[0].retryOwned, false);
 });
 
+test('a required failure outranks a later optional static clean in the same inspection', () => {
+  const requiredFailure = observation({
+    observedAt: '2026-11-02T00:00:00.000Z',
+    outcome: 'ACQUISITION_FAILED',
+    failureClass: 'NETWORK_FAILURE',
+    provenance: {
+      surface: 'CREATOR_WEBSITES',
+      required: true,
+      crawlerTelemetry: { mode: 'RENDERED', pagesInspected: 0, requestsStarted: 1, requestsFinished: 1 },
+    },
+  });
+  const optionalClean = observation({
+    observedAt: '2026-11-02T00:01:00.000Z',
+    outcome: 'INSPECTED_NO_MATCH',
+    failureClass: null,
+    retryable: false,
+    provenance: {
+      surface: 'CREATOR_WEBSITES',
+      required: false,
+      crawlerTelemetry: { mode: 'STATIC', pagesInspected: 2, requestsStarted: 0, requestsFinished: 0 },
+    },
+  });
+  const { rows } = projectCommunityAcquisitionWork([optionalClean, requiredFailure]);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].lastOutcome, 'ACQUISITION_FAILED');
+  assert.equal(rows[0].state, 'PENDING');
+  assert.equal(rows[0].retryOwned, true, 'a later optional clean must not hide required retry work');
+});
+
+test('an optional clean resolves an admitted key when no required result remains', () => {
+  const optionalGap = observation({
+    observedAt: '2026-11-02T00:00:00.000Z',
+    outcome: 'PARTIALLY_INSPECTED',
+    failureClass: 'STATIC_BUDGET_GAP',
+    provenance: {
+      surface: 'CREATOR_WEBSITES',
+      required: false,
+      crawlerTelemetry: { mode: 'STATIC', pagesInspected: 1, requestsStarted: 0, requestsFinished: 0 },
+    },
+  });
+  const optionalClean = observation({
+    observedAt: '2026-11-02T00:01:00.000Z',
+    outcome: 'INSPECTED_NO_MATCH',
+    failureClass: null,
+    retryable: false,
+    provenance: {
+      surface: 'CREATOR_WEBSITES',
+      required: false,
+      crawlerTelemetry: { mode: 'STATIC', pagesInspected: 2, requestsStarted: 0, requestsFinished: 0 },
+    },
+  });
+  const { rows } = projectCommunityAcquisitionWork([optionalGap, optionalClean]);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].state, 'RESOLVED');
+  assert.equal(rows[0].lastOutcome, 'INSPECTED_NO_MATCH');
+  assert.equal(rows[0].retryOwned, false, 'optional recovery still resolves a completed static-gap key');
+});
+
+test('an unevidenced clean never outranks a real failure in the same pool', () => {
+  const unevidencedClean = observation({
+    observedAt: '2026-11-02T00:01:00.000Z',
+    outcome: 'INSPECTED_NO_MATCH',
+    failureClass: null,
+    retryable: false,
+    provenance: {
+      surface: 'CREATOR_WEBSITES',
+      required: false,
+      crawlerTelemetry: { mode: 'STATIC', pagesInspected: 0, requestsStarted: 0, requestsFinished: 0 },
+    },
+  });
+  const optionalPartial = observation({
+    observedAt: '2026-11-02T00:00:00.000Z',
+    outcome: 'PARTIALLY_INSPECTED',
+    failureClass: 'STATIC_BUDGET_GAP',
+    provenance: {
+      surface: 'CREATOR_WEBSITES',
+      required: false,
+      crawlerTelemetry: { mode: 'STATIC', pagesInspected: 0, requestsStarted: 3, requestsFinished: 0 },
+    },
+  });
+  const { rows } = projectCommunityAcquisitionWork([unevidencedClean, optionalPartial]);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].state, 'PENDING');
+  assert.equal(rows[0].lastOutcome, 'PARTIALLY_INSPECTED');
+  assert.equal(rows[0].retryOwned, true);
+});
+
 test('equal-timestamp observations are ordered deterministically by id', () => {
   const first = observation({ id: '00000000-0000-0000-0000-000000000001' });
   const second = observation({

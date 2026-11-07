@@ -313,6 +313,18 @@ export async function buildPhase0UrlWorkLedgerReport(
               COALESCE(o.provenance->>'relevanceTier','') AS relevance_tier,
               COALESCE(o.provenance->>'sharedEvidenceFrom','') = '' AS direct_evidence,
               (
+                COALESCE(o.provenance->>'sharedEvidenceFrom','') <> ''
+                OR o.outcome = 'FOUND'
+                OR (
+                  COALESCE(o.provenance->>'sharedEvidenceFrom','') = ''
+                  AND (
+                    ${safeCounterSql(`o.provenance->'crawlerTelemetry'->'pagesInspected'`)} > 0
+                    OR ${safeCounterSql(`o.provenance->'crawlerTelemetry'->'requestsFinished'`)} > 0
+                    OR ${safeCounterSql(`o.provenance->'crawlerTelemetry'->'clicksSucceeded'`)} > 0
+                  )
+                )
+              ) AS processed_evidence,
+              (
                 COALESCE(o.provenance->>'sharedEvidenceFrom','') = ''
                 AND COALESCE(o.provenance->'crawlerTelemetry'->>'mode','') = 'RENDERED'
                 AND (
@@ -361,11 +373,25 @@ export async function buildPhase0UrlWorkLedgerReport(
          FROM windowed
         WHERE observed_at >= latest_inspection_at - interval '5 minutes'
      ),
-     ranked AS (
+     -- Mirror production effectiveAcquisitionOutcomes: any FOUND wins; else
+     -- required observations dominate optional notes; an unevidenced clean
+     -- only wins when it is all that remains.
+     pooled AS (
        SELECT current_inspection.*,
+              max((outcome = 'FOUND')::int) OVER w AS has_found,
+              max(required::int) OVER w AS has_required
+         FROM current_inspection
+       WINDOW w AS (PARTITION BY channel_id, surface, normalized_url)
+     ),
+     ranked AS (
+       SELECT pooled.*,
               row_number() OVER (
                 PARTITION BY channel_id, surface, normalized_url
-                ORDER BY CASE outcome
+                ORDER BY (CASE WHEN has_found > 0 THEN outcome = 'FOUND'
+                               WHEN has_required > 0 THEN required
+                               ELSE TRUE END) DESC,
+                         (outcome <> 'INSPECTED_NO_MATCH' OR processed_evidence) DESC,
+                         CASE outcome
                            WHEN 'FOUND' THEN 4
                            WHEN 'INSPECTED_NO_MATCH' THEN 3
                            WHEN 'PARTIALLY_INSPECTED' THEN 2
@@ -375,7 +401,7 @@ export async function buildPhase0UrlWorkLedgerReport(
                          observed_at DESC,
                          id DESC
               ) AS effective_rank
-         FROM current_inspection
+         FROM pooled
      )
      SELECT count(*) FILTER (
               WHERE ${retryOwnedSql('e')}
