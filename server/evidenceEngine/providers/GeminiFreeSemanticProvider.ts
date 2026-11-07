@@ -115,6 +115,16 @@ export function geminiFreeFailureCooldownUntilMs(typed: ProviderCallError, nowMs
 }
 
 /**
+ * Merge a fresh failure into the in-process gate without ever shrinking an
+ * already-armed window. A daily reset can be hours away, so a later per-minute
+ * 429 (or a concurrent call's short RetryInfo) must not reopen the account
+ * before that reset.
+ */
+export function nextGeminiFreeCooldownUntilMs(currentUntilMs: number, typed: ProviderCallError, nowMs: number = Date.now()): number {
+  return Math.max(currentUntilMs, geminiFreeFailureCooldownUntilMs(typed, nowMs));
+}
+
+/**
  * Failure metadata persisted on the event row. Local deferral echoes stay
  * tagged so the resolver/metrics exclude them; genuine upstream failures carry
  * the typed cooldown/quota fields the resolver reads on every replica.
@@ -326,7 +336,7 @@ export function defaultClient(
                 : geminiFreeFailoverCancelled(signal)
               : classifyProviderError(error);
           if (!aborted && typed.errorClass === 'RATE_LIMIT' && (error as { geminiFreeCooldownDeferred?: unknown })?.geminiFreeCooldownDeferred !== true) {
-            geminiFreeCooldownUntilMs = geminiFreeFailureCooldownUntilMs(typed);
+            geminiFreeCooldownUntilMs = nextGeminiFreeCooldownUntilMs(geminiFreeCooldownUntilMs, typed);
           }
           if (typed.errorClass === 'RATE_LIMIT') {
             const reasons = Array.isArray((typed as { providerReasons?: unknown }).providerReasons)

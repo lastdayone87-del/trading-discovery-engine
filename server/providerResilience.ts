@@ -299,7 +299,12 @@ type GeminiCapacityConfig = {
 export type GeminiCapacityDecision = { action:'RUN'|'WAIT'|'DEFER'; waitMs:number; reasonCode?:string };
 
 function envMs(name:string, fallback:number):number {
-  const parsed=Number(process.env[name]);
+  const raw=process.env[name];
+  // Empty values are how deployment UIs represent "unset"; treating them as
+  // numeric zero would silently disable the fallback window (e.g. the 90s
+  // Gemini semantic cooldown).
+  if(raw===undefined||raw===null||raw.trim()==='')return fallback;
+  const parsed=Number(raw);
   return Number.isFinite(parsed)&&parsed>=0?parsed:fallback;
 }
 
@@ -366,12 +371,17 @@ export function decideGeminiCapacity(operation:string, snapshot:GeminiCapacitySn
  * It queries the same provider_call_events table used by acquireGeminiCapacity,
  * so there are no independent clocks or parallel rate limiters.
  */
-export async function getGeminiSemanticCooldownExpiry(nowMs: number = Date.now()): Promise<number | undefined> {
-  const config = geminiCapacityConfig();
-  try {
+export async function getGeminiSemanticCooldownExpiry(
+  nowMs: number = Date.now(),
+  query: (sql: string, values?: unknown[]) => Promise<{ rows: any[] }> = async (sql, values) => {
     const { getDb } = await import('./db');
     const db = await getDb();
-    const res = await db.query(
+    return db.query(sql, values);
+  },
+): Promise<number | undefined> {
+  const config = geminiCapacityConfig();
+  try {
+    const res = await query(
       `SELECT occurred_at,
               MAX((request_metadata->>'cooldownUntilMs')::bigint)
                 FILTER (WHERE request_metadata->>'cooldownUntilMs' ~ '^[0-9]+$') OVER () AS cooldown_until_ms

@@ -86,8 +86,10 @@ window from `provider_call_events`.
   CJK/Thai evidence, where one character can cost one token.
 - **Pool exhaustion.** When every route is quarantined, the caller receives a
   bounded `GROQ_ROUTE_POOL_DISABLED` error with the earliest route's remaining
-  TTL. A mixed cooling/quarantined pool reports the earliest route availability
-  as a deferral instead of claiming the pool is disabled.
+  TTL. In the vocabulary text-completion path, a mixed cooling/quarantined pool
+  reports the earliest route availability as a deferral instead of claiming the
+  pool is disabled; the semantic failover loop surfaces the last attempted
+  route's own retry hint.
 
 ### Gemini
 
@@ -136,8 +138,9 @@ window from `provider_call_events`.
 Status values are `healthy`, `cooling` (provider 429 window), and `disabled`
 (restricted-route quarantine). Local cooldown-deferral echoes are excluded from
 cooldowns and reported as `cooldown_deferral: true` rows instead of fresh
-failures. Ledger aggregates are cached for 15 seconds (the dashboard polling
-interval); in-process route state stays live. The endpoint is read-only,
+failures. Ledger aggregates are cached for 20 seconds (slightly longer than the
+15-second dashboard polling interval) and a failed ledger read is never cached
+as an empty result; in-process route state stays live. The endpoint is read-only,
 credential-free, and authorized by the existing `providers.metrics.read` policy.
 
 Key events to watch:

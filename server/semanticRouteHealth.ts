@@ -20,8 +20,13 @@ const RECENT_FAILURE_WINDOW_HOURS = 6;
  * failure scan), so cache the raw rows for one polling interval. In-process
  * route state and expiry arithmetic stay live on every call.
  */
-const LEDGER_CACHE_MS = 15_000;
+const LEDGER_CACHE_MS = 20_000;
 let ledgerCache: { cachedAtMs: number; cooldowns: any[]; recentFailures: any[] } | undefined;
+
+/** Test seam: inject the ledger reader so cache behavior is testable without a DB. */
+export interface SemanticRouteHealthDeps {
+  query?: (sql: string, values?: unknown[]) => Promise<any[]>;
+}
 
 /** Test-only reset for the ledger aggregate cache. */
 export function resetSemanticRouteHealthCacheForTests(): void {
@@ -37,19 +42,21 @@ function cooldownRows(rows: any[]): Map<string, { lastAt?: unknown; declaredUnti
   return map;
 }
 
-async function safeQuery(sql: string, values?: unknown[]): Promise<any[]> {
+async function safeQuery(sql: string, values?: unknown[], deps?: SemanticRouteHealthDeps): Promise<any[] | undefined> {
   try {
+    if (deps?.query) return await deps.query(sql, values);
     const db = await getDb();
     const result = await db.query(sql, values);
     return result.rows;
   } catch {
     // Diagnostics must never fail a metrics request: an unavailable ledger
-    // degrades to in-process state.
-    return [];
+    // degrades to in-process state. The undefined result also tells the
+    // caller not to cache the degraded read as an authoritative empty ledger.
+    return undefined;
   }
 }
 
-export async function getSemanticRouteHealth(nowMs: number = Date.now()): Promise<any> {
+export async function getSemanticRouteHealth(nowMs: number = Date.now(), deps?: SemanticRouteHealthDeps): Promise<any> {
   const [groqModule, geminiModule] = await Promise.all([
     import('./evidenceEngine/providers/GroqSemanticProvider'),
     import('./evidenceEngine/providers/GeminiSemanticProvider'),
@@ -75,6 +82,7 @@ export async function getSemanticRouteHealth(nowMs: number = Date.now()): Promis
             AND COALESCE(request_metadata->>'geminiFreeCooldownDeferral','') <> 'true'
           GROUP BY provider, org`,
         [String(COOLDOWN_LOOKBACK_DAYS)],
+        deps,
       ),
       safeQuery(
         `SELECT provider,
@@ -93,10 +101,15 @@ export async function getSemanticRouteHealth(nowMs: number = Date.now()): Promis
           ORDER BY MAX(occurred_at) DESC
           LIMIT 100`,
         [String(RECENT_FAILURE_WINDOW_HOURS)],
+        deps,
       ),
     ]);
-    ledgerCache = { cachedAtMs: now, cooldowns: nextCooldowns, recentFailures: nextRecentFailures };
-    return [nextCooldowns, nextRecentFailures] as const;
+    // Only a complete read is cacheable. A transient ledger failure must not
+    // masquerade as an authoritative empty ledger for the next poll window.
+    if (nextCooldowns !== undefined && nextRecentFailures !== undefined) {
+      ledgerCache = { cachedAtMs: now, cooldowns: nextCooldowns, recentFailures: nextRecentFailures };
+    }
+    return [nextCooldowns ?? [], nextRecentFailures ?? []] as const;
   })();
   const ledger = cooldownRows(cooldowns);
 

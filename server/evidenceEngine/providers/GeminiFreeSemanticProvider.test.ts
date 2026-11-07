@@ -13,6 +13,7 @@ import {
   geminiFreeRateLimitCooldownMs,
   geminiFreeSdkForRouteForTests,
   geminiFreeTimeoutMs,
+  nextGeminiFreeCooldownUntilMs,
   resetGeminiFreeCooldownForTests,
   runGeminiFreeRouteFailover,
   shouldUseGeminiFreeSemantic,
@@ -218,6 +219,27 @@ test('local free cooldown honors a declared daily reset instead of the 90s defau
     quotaScope: 'MINUTE',
   });
   assert.equal(geminiFreeFailureCooldownUntilMs(minute, now), now + geminiFreeRateLimitCooldownMs());
+});
+
+test('a later short 429 never shortens an armed daily-quota cooldown', () => {
+  const now = 1_000_000;
+  const dailyReset = now + 4 * 60 * 60_000;
+  const daily = new ProviderCallError('daily quota exhausted', 'RATE_LIMIT', true, {
+    status: 429,
+    cooldownUntilMs: dailyReset,
+    quotaScope: 'DAILY',
+  });
+  const armed = geminiFreeFailureCooldownUntilMs(daily, now);
+  assert.equal(armed, dailyReset);
+
+  // A concurrent or later per-minute 429 declares a much shorter reset. The
+  // in-process gate must keep the daily reset instead of reopening early.
+  const minute = new ProviderCallError('per-minute quota exhausted', 'RATE_LIMIT', true, {
+    status: 429,
+    cooldownUntilMs: now + 5_000,
+    quotaScope: 'MINUTE',
+  });
+  assert.equal(nextGeminiFreeCooldownUntilMs(armed, minute, now + 1_000), dailyReset);
 });
 
 test('genuine free failures persist typed cooldown metadata; deferral echoes stay tagged', () => {

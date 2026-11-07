@@ -438,6 +438,14 @@ describe('Gemini semantic pacing regression', () => {
       if (saved !== undefined) process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS = saved;
     });
 
+    it('empty env var uses 90,000 default (deployment UIs send empty for unset)', () => {
+      const saved = process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS;
+      try { process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS = ''; } catch {}
+      assert.equal(geminiSemanticCooldownMs(), 90_000, 'empty var must behave as unset, not zero');
+      if (saved !== undefined) process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS = saved;
+      else delete process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS;
+    });
+
     it('valid positive value is respected', () => {
       const saved = process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS;
       try { process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS = '120000'; } catch {}
@@ -519,7 +527,22 @@ describe('Gemini semantic pacing regression', () => {
       // drift onto independent clocks.
       assert.ok(fnStr.includes('getGeminiSemanticCooldownExpiry'), 'must delegate to getGeminiSemanticCooldownExpiry');
       const { getGeminiSemanticCooldownExpiry } = await import('./providerResilience');
-      assert.ok(getGeminiSemanticCooldownExpiry.toString().includes("status='RATE_LIMITED'"), 'resolver must query RATE_LIMITED events');
+      // Behavioral check: seed a RATE_LIMITED row through the query seam so a
+      // reformatted SQL string or a stray comment cannot satisfy the test.
+      const now = Date.now();
+      const declaredResetMs = now + 45_000;
+      let sqlSeen = '';
+      const expiry = await getGeminiSemanticCooldownExpiry(now, async (sql) => {
+        sqlSeen = sql;
+        return { rows: [{ occurred_at: new Date(now - 120_000).toISOString(), cooldown_until_ms: String(declaredResetMs) }] };
+      });
+      assert.equal(expiry, declaredResetMs, 'resolver must return the declared reset');
+      assert.match(sqlSeen, /status='RATE_LIMITED'/, 'resolver must read RATE_LIMITED events');
+      assert.equal(
+        await getGeminiSemanticCooldownExpiry(now, async () => ({ rows: [] })),
+        undefined,
+        'no rate-limit row means no cooldown',
+      );
     });
 
     it('db.ts failJob does not import configuredGeminiRouteIds', async () => {
