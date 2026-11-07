@@ -335,6 +335,11 @@ function zombieCandidateSql(ledgerTablePresent: boolean): string {
  * The raw `provenance` object is returned unprojected so optional
  * `STATIC_BUDGET_GAP` owners and demoted/auxiliary observations are classified
  * exactly as the production worker classifies them.
+ *
+ * The SQL prefilter is a deliberately coarse superset of retry owners: ledger
+ * work (required rows or the static-gap exception) that is stored retryable.
+ * Every row it removes would be rejected by `observationOwnsRetry` anyway, so
+ * final ownership still lives in one shared predicate.
  */
 function zombieNewerObservationSql(): string {
   return `
@@ -368,6 +373,14 @@ function zombieNewerObservationSql(): string {
        AND c.retry_observed_at IS NOT NULL
        AND o.observed_at > c.retry_observed_at
        AND o.provenance->>'surface' = ANY($2::text[])
+       AND o.retryable = true
+       AND (
+         o.provenance->'required' = 'true'::jsonb
+         OR (
+           o.outcome = 'PARTIALLY_INSPECTED'
+           AND o.failure_class = 'STATIC_BUDGET_GAP'
+         )
+       )
      ORDER BY c.job_id, o.observed_at, o.id
   `;
 }

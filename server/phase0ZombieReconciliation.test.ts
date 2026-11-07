@@ -294,8 +294,10 @@ test('the dry-run report partitions every examined job into proposals or skips',
   assert.ok(newerSql);
   assert.match(newerSql, /o\.provenance->>'surface' = ANY\(\$2::text\[\]\)/);
   assert.match(newerSql, /o\.observed_at > c\.retry_observed_at/);
-  assert.doesNotMatch(newerSql, /o\.retryable\s*=\s*true/);
-  assert.doesNotMatch(newerSql, /provenance->'required'/);
+  assert.match(newerSql, /o\.retryable = true/);
+  assert.match(newerSql, /o\.provenance->'required' = 'true'::jsonb/);
+  assert.match(newerSql, /o\.outcome = 'PARTIALLY_INSPECTED'/);
+  assert.match(newerSql, /o\.failure_class = 'STATIC_BUDGET_GAP'/);
   assert.match(newerSql, /LIMIT \$1/);
   assert.doesNotMatch(newerSql, /\b(?:INSERT|UPDATE|DELETE|TRUNCATE)\b/i);
 });
