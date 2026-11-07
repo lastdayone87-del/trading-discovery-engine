@@ -372,9 +372,12 @@ export function phase0ZombieApplyCheckFailures(report: Phase0ZombieApplyReport):
 }
 
 /**
- * Finalize the report against the transaction outcome. A rolled-back batch
+ * Finalize the report against the transaction outcome. A rolled-back apply
  * wrote nothing, so its audit artifact must not claim that closures, actors,
- * or closure timestamps persisted. `proposedClosures` keeps the plan size.
+ * or closure timestamps persisted, and its cursor must not skip the rows it
+ * tried to close: those rows are still `PENDING`, so resume at the input page.
+ * A report-only scan never attempted writes and keeps its computed
+ * `nextCursor` for read-only paging. `proposedClosures` keeps the plan size.
  */
 export function finalizePhase0ZombieApplyReport(
   report: Phase0ZombieApplyReport,
@@ -384,6 +387,12 @@ export function finalizePhase0ZombieApplyReport(
   return {
     ...report,
     summary: { ...report.summary, appliedClosures: 0 },
+    scan: {
+      ...report.scan,
+      nextCursor: report.summary.appliedClosures > 0
+        ? report.scan.cursor
+        : report.scan.nextCursor,
+    },
     closures: report.closures.map(closure => ({
       ...closure,
       applied: false,

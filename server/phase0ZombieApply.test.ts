@@ -570,8 +570,17 @@ test('closure evidence is self-contained and carries the shared criterion', () =
   assert.deepEqual(phase0ZombieApplyCheckFailures(syntheticReport), ['closure_columns_missing']);
 });
 
-test('a rollback rewrites every applied marker in the audit report', () => {
+test('a rollback rewrites applied markers and re-examines the rows it tried to close', () => {
   const jobId = randomUUID();
+  const cursor = encodePhase0ZombieApplyCursor({
+    job_id: randomUUID(),
+    first_enqueued_at: '2026-10-01T00:00:00.000Z',
+  });
+  const nextCursor = encodePhase0ZombieApplyCursor({
+    job_id: jobId,
+    first_enqueued_at: '2026-11-01T00:00:00.000Z',
+  });
+  assert.ok(cursor && nextCursor);
   const report: Phase0ZombieApplyReport = {
     generatedAt: '2026-11-07T00:00:00.000Z',
     dryRun: false,
@@ -582,14 +591,14 @@ test('a rollback rewrites every applied marker in the audit report', () => {
     schema: { ledgerTablePresent: true, closureColumnsPresent: true },
     population: { pendingRetries: 1, processingRetries: 0, scannable: 1 },
     ledger: { rows: 1 },
-    scan: { window: 1, locked: 1, cursor: null, nextCursor: null },
+    scan: { window: 1, locked: 1, cursor, nextCursor },
     summary: {
       examined: 1,
       proposedClosures: 1,
       appliedClosures: 1,
       skipped: 0,
       closureLimitReached: false,
-      scanLimitReached: false,
+      scanLimitReached: true,
       byReason: { CHANNEL_TERMINAL: 1 },
     },
     closures: [{
@@ -609,6 +618,7 @@ test('a rollback rewrites every applied marker in the audit report', () => {
   assert.equal(committed.summary.appliedClosures, 1);
   assert.equal(committed.closures[0].applied, true);
   assert.equal(committed.closures[0].closedAt, '2026-11-07T00:00:00.000Z');
+  assert.equal(committed.scan.nextCursor, nextCursor);
 
   const rolledBack = finalizePhase0ZombieApplyReport(report, 'ROLLED_BACK');
   assert.equal(rolledBack.transaction, 'ROLLED_BACK');
@@ -620,6 +630,19 @@ test('a rollback rewrites every applied marker in the audit report', () => {
     closedAt: null,
     actor: null,
   });
+  // The closures did not persist, so the rows are still PENDING. Resuming
+  // from the advanced cursor would skip them.
+  assert.equal(rolledBack.scan.nextCursor, cursor);
+
+  // A report-only scan never attempted writes and keeps its paging cursor.
+  const dryRun = finalizePhase0ZombieApplyReport({
+    ...report,
+    dryRun: true,
+    actor: null,
+    summary: { ...report.summary, appliedClosures: 0 },
+    closures: [{ ...report.closures[0], applied: false, closedAt: null, actor: null }],
+  }, 'ROLLED_BACK');
+  assert.equal(dryRun.scan.nextCursor, nextCursor);
 });
 
 test('the write guard excludes evidence the batch already classified', async () => {

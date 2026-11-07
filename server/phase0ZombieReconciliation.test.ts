@@ -156,6 +156,7 @@ function fixtureRow(overrides: Record<string, unknown> = {}) {
     created_at: '2026-10-01T00:00:00.000Z',
     first_enqueued_at: '2026-10-01T00:00:00.000Z',
     reopen_generation: 0,
+    closed_at: null,
     retry_observed_at: '2026-10-02T00:00:00.000Z',
     channel_present: true,
     discord_validation_status: 'SUCCEEDED',
@@ -186,12 +187,14 @@ function fakeDb(candidateRows: any[], options: {
   closureColumnsPresent?: boolean;
   pendingRetries?: number;
   processingRetries?: number;
-  scannable?: number;
   ledgerRows?: number;
   newerObservations?: any[];
 } = {}) {
   const sql: string[] = [];
   const params: unknown[][] = [];
+  const closureColumnsPresent = options.closureColumnsPresent !== false;
+  const isScannable = (row: any) => !closureColumnsPresent || row.closed_at === null;
+  let candidateIds: string[] | null = null;
   const db = {
     async query(text: string, values: unknown[] = []) {
       sql.push(text);
@@ -200,30 +203,43 @@ function fakeDb(candidateRows: any[], options: {
         return {
           rows: [{
             ledger_table_present: options.ledgerTablePresent !== false,
-            closure_columns_present: options.closureColumnsPresent !== false,
+            closure_columns_present: closureColumnsPresent,
           }],
         };
       }
       if (text.includes('pending_retries')) {
-        const pending = options.pendingRetries ?? candidateRows
-          .filter(row => row.job_status === 'PENDING').length;
-        const processing = options.processingRetries ?? candidateRows
-          .filter(row => row.job_status === 'PROCESSING').length;
+        const pending = candidateRows.filter(row => row.job_status === 'PENDING');
+        const processing = candidateRows.filter(row => row.job_status === 'PROCESSING');
         return {
           rows: [{
-            pending_retries: pending,
-            processing_retries: processing,
-            scannable_pending: options.scannable ?? pending,
-            scannable_processing: options.scannable !== undefined ? 0 : processing,
+            pending_retries: options.pendingRetries ?? pending.length,
+            processing_retries: options.processingRetries ?? processing.length,
+            // `pendingRetries` also simulates a backlog larger than the rows
+            // returned by the bounded candidate window.
+            scannable_pending: options.pendingRetries
+              ?? pending.filter(isScannable).length,
+            scannable_processing: processing.filter(isScannable).length,
           }],
         };
       }
       if (text.includes('external_acquisition_observations')) {
         return { rows: options.newerObservations ?? [] };
       }
-      if (text.includes('WITH candidate_channels AS')) return { rows: candidateRows };
+      if (text.includes('WITH candidate_channels AS')) {
+        return {
+          rows: candidateIds === null
+            ? candidateRows
+            : candidateRows.filter(row => candidateIds!.includes(row.job_id)),
+        };
+      }
       if (text.includes('SELECT j.id AS job_id')) {
-        return { rows: candidateRows.map(row => ({ job_id: row.job_id })) };
+        const limit = Number(values[0] ?? candidateRows.length);
+        const scannable = candidateRows.filter(row =>
+          (row.job_status === 'PENDING' || row.job_status === 'PROCESSING')
+          && isScannable(row));
+        const ids = scannable.slice(0, limit).map(row => row.job_id);
+        candidateIds = ids;
+        return { rows: ids.map(jobId => ({ job_id: jobId })) };
       }
       if (text.includes('FROM community_acquisition_url_state')) {
         return { rows: [{ rows: options.ledgerRows ?? 0 }] };
@@ -352,18 +368,26 @@ test('the dry-run filters closed epochs only when closure columns exist', async 
 });
 
 test('a closed reopened processing row does not make a complete report look truncated', async () => {
-  const { db } = fakeDb([fixtureRow()], {
-    pendingRetries: 1,
-    processingRetries: 1,
-    // The processing retry reopened from a closed epoch, so the candidate
-    // window cannot see it. It must not count toward the completeness bound.
-    scannable: 1,
+  const openPending = fixtureRow({ job_id: 'reopened-pending' });
+  const closedProcessing = fixtureRow({
+    job_id: 'closed-processing-epoch',
+    job_status: 'PROCESSING',
+    closed_at: '2026-10-05T00:00:00.000Z',
   });
+  const { db, sql } = fakeDb([openPending, closedProcessing]);
   const report = await buildPhase0ZombieReconciliationReport(db);
+  assert.equal(report.population.pendingRetries, 1);
+  assert.equal(report.population.processingRetries, 1);
+  // The closed processing epoch is excluded from both the candidate window
+  // and the scannable bound, so it cannot make a complete report look
+  // truncated forever.
   assert.equal(report.population.examined, 1);
   assert.equal(report.population.scannable, 1);
   assert.equal(report.warnings.includes('candidate_limit_reached'), false);
   assert.deepEqual(phase0ZombieReconciliationCheckFailures(report), []);
+  const candidateSql = sql.find(text => text.includes('SELECT j.id AS job_id'));
+  assert.ok(candidateSql);
+  assert.match(candidateSql, /closed_at IS NULL/);
 });
 
 test('candidate paging is a keyset and the write guard excludes known evidence', () => {
