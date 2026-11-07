@@ -60,6 +60,7 @@ test('the SQL bound keeps path-only URL normalization and all-observation browse
     async query(sql: string) {
       queries.push(sql);
       if (sql.includes('ORDER BY o.channel_id, o.observed_at')) return { rows: [] };
+      if (sql.includes('FROM ranked e')) return { rows: [] };
       return { rows: [{}] };
     },
   };
@@ -72,7 +73,7 @@ test('the SQL bound keeps path-only URL normalization and all-observation browse
   assert.equal(report.maxDeltaPct, 0);
   assert.ok(report.warnings.some(warning => warning.startsWith('no_retryable_work_measured')));
 
-  const telemetrySql = queries.find(sql => sql.includes('AS retryable_rows'));
+  const telemetrySql = queries.find(sql => sql.includes('FROM ranked e'));
   assert.ok(telemetrySql, 'the telemetry bound query must run');
   assert.match(telemetrySql, /bool_or\(browser_executed\)/);
   assert.match(telemetrySql, /PARTITION BY channel_id, surface, normalized_url/);
@@ -81,10 +82,12 @@ test('the SQL bound keeps path-only URL normalization and all-observation browse
     /WHERE\s+o\.retryable\b/i,
     'retryability must be aggregated after browser execution, not used to filter observations',
   );
-  assert.match(telemetrySql, /COALESCE\(o\.provenance->>'required','false'\) = 'true'/);
+  assert.match(telemetrySql, /o\.provenance->'required' = 'true'::jsonb/);
+  assert.match(telemetrySql, /jsonb_typeof\(o\.provenance->'sharedEvidenceFrom'\) = 'string'/);
+  assert.match(telemetrySql, /btrim\(o\.provenance->>'sharedEvidenceFrom'\)/);
   assert.match(telemetrySql, /sharedEvidenceFrom/);
-  assert.match(telemetrySql, /AS direct_evidence/);
-  assert.match(telemetrySql, /e\.direct_evidence/);
+  assert.match(telemetrySql, /e\.requested_url/);
+  assert.match(telemetrySql, /g\.browser_executed/);
   assert.match(telemetrySql, /lower\(substring\(/, 'only scheme + authority are lowercased');
   assert.match(telemetrySql, /CASE WHEN strpos\(.*\?.*\) > 0/);
   assert.match(telemetrySql, /regexp_replace\(.*':80\$'/);
@@ -121,4 +124,71 @@ test('the SQL bound keeps path-only URL normalization and all-observation browse
   assert.match(discoveredSql, /l\.source_url/);
   assert.match(discoveredSql, /o\.final_url/);
   assert.doesNotMatch(discoveredSql, /site_inspections|canonical_url/);
+});
+
+test('the telemetry bound applies shared URL admission and auxiliary ownership', async () => {
+  const observedAt = new Date().toISOString();
+  const effectiveRow = (overrides: Record<string, unknown>) => ({
+    channel_id: 'UCphase0-classify',
+    surface: 'CREATOR_WEBSITES',
+    outcome: 'ACQUISITION_FAILED',
+    retryable: true,
+    failure_class: 'NETWORK_FAILURE',
+    observed_at: observedAt,
+    required: true,
+    relevance_tier_value: null,
+    shared_evidence_from_value: null,
+    browser_executed: false,
+    ...overrides,
+  });
+  const effectiveRows = [
+    effectiveRow({
+      id: '11111111-1111-4111-8111-111111111111',
+      normalized_url: 'https://creator.example/links',
+      requested_url: 'https://creator.example/links',
+    }),
+    effectiveRow({
+      id: '22222222-2222-4222-8222-222222222222',
+      normalized_url: 'https://calendly.com/phase0-fixture/30min',
+      requested_url: 'https://calendly.com/phase0-fixture/30min',
+    }),
+    effectiveRow({
+      id: '33333333-3333-4333-8333-333333333333',
+      normalized_url: 'https://fixture.example/assets/logo.png',
+      requested_url: 'https://fixture.example/assets/logo.png',
+    }),
+    // Normalization strips the trailing slash, which would make the shared
+    // admission gate reject `.js`; ownership must use the observed URL.
+    effectiveRow({
+      id: '44444444-4444-4444-8444-444444444444',
+      normalized_url: 'https://creator.example/topics/vue.js',
+      requested_url: 'https://creator.example/topics/vue.js/',
+    }),
+    // Only the JSON boolean true is required, exactly like the projection.
+    effectiveRow({
+      id: '55555555-5555-4555-8555-555555555555',
+      normalized_url: 'https://creator.example/string-required',
+      requested_url: 'https://creator.example/string-required',
+      required: 'true',
+    }),
+    // A non-string sharedEvidenceFrom is not shared evidence, exactly like the
+    // projection's string-only check.
+    effectiveRow({
+      id: '66666666-6666-4666-8666-666666666666',
+      normalized_url: 'https://creator.example/numeric-shared',
+      requested_url: 'https://creator.example/numeric-shared',
+      shared_evidence_from_value: 5,
+    }),
+  ];
+  const db = {
+    async query(sql: string) {
+      if (sql.includes('ORDER BY o.channel_id, o.observed_at')) return { rows: [] };
+      if (sql.includes('FROM ranked e')) return { rows: effectiveRows };
+      return { rows: [{}] };
+    },
+  };
+
+  const report = await buildPhase0UrlWorkLedgerReport(db, { windowDays: 7 });
+  assert.equal(report.telemetry.retryableRows, 3);
+  assert.equal(report.telemetry.neverBrowserExecutedRows, 3);
 });

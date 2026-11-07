@@ -13,6 +13,7 @@
 
 import {
   COMMUNITY_ACQUISITION_WORK_SURFACES,
+  observationOwnsRetry,
   projectCommunityAcquisitionWork,
   reconcileCommunityWorkProjection,
   type CommunityWorkObservation,
@@ -193,44 +194,34 @@ const LEDGER_ADMITTED_WORK_CONDITION = `
 `;
 
 /**
- * SQL spelling of the production retry-ownership outcome rules. URL admission
- * and auxiliary-link ownership are applied by the shared policy code in the
- * TypeScript projection; reimplementing URL classification in SQL would be a
- * second source of truth, so this bound leaves that residual to the tolerated
- * reconciliation delta.
+ * Exact SQL spellings of the shared provenance checks. The projection requires
+ * the JSON boolean `true` for required work and a string (after trimming) for
+ * shared evidence; text coercion (`->>`) would treat a malformed string
+ * `"true"` or numeric shared value differently on the SQL side.
  */
-const PERMANENT_FAILURE_CLASSES_SQL = `ARRAY[
-  'UNSUPPORTED_CONTENT_TYPE',
-  'LOGIN_WALL',
-  'PAYWALL_WALL',
-  'PERMANENT_ACCESS_BLOCK',
-  'REDIRECT_LIMIT'
-]`;
-
-const FOUND_GAP_FAILURE_CLASSES_SQL = `ARRAY[
-  'REQUIRED_UNVISITED_BUDGET_GAP',
-  'RENDERED_TIMEOUT',
-  'RENDERED_BUDGET_EXPIRED',
-  'RENDERED_PARTIAL_COVERAGE',
-  'RENDERED_INTERACTION_GAP'
-]`;
-
-function retryOwnedSql(alias: string): string {
-  const failureClass = `upper(COALESCE(${alias}.failure_class,''))`;
-  return `(
-    ${alias}.direct_evidence
-    AND ${alias}.retryable
-    AND NOT (${failureClass} = ANY (${PERMANENT_FAILURE_CLASSES_SQL}))
-    AND COALESCE(${alias}.relevance_tier,'') NOT IN ('BLOCK','DEMOTE')
-    AND (
-      (${alias}.required AND ${alias}.outcome = 'FOUND'
-        AND ${failureClass} = ANY (${FOUND_GAP_FAILURE_CLASSES_SQL}))
-      OR (${alias}.outcome = 'PARTIALLY_INSPECTED'
-        AND ${failureClass} = 'STATIC_BUDGET_GAP')
-      OR (${alias}.required AND ${alias}.outcome IN ('ACQUISITION_FAILED','PARTIALLY_INSPECTED'))
-    )
-  )`;
+function sqlRequiredTrue(alias: string): string {
+  return `${alias}.provenance->'required' = 'true'::jsonb`;
 }
+
+function sqlSharedEvidence(alias: string): string {
+  // COALESCE keeps absent/non-string keys FALSE instead of NULL: `NOT NULL`
+  // would otherwise poison both processed and browser evidence for ordinary
+  // observations that carry no sharedEvidenceFrom.
+  return `COALESCE((
+    jsonb_typeof(${alias}.provenance->'sharedEvidenceFrom') = 'string'
+    AND btrim(${alias}.provenance->>'sharedEvidenceFrom') <> ''
+  ), false)`;
+}
+
+/*
+ * The SQL side owns work identity and effective-row selection: URL
+ * normalization, the latest-inspection window, and production precedence.
+ * Retention ownership is then classified with the shared
+ * `observationOwnsRetry` predicate in TypeScript, so URL admission and
+ * auxiliary-link rejection cannot drift from the worker or the projection.
+ * Reimplementing those policy rules in SQL would create a second source of
+ * truth and let the bound over-count auxiliary links.
+ */
 
 export async function buildPhase0UrlWorkLedgerReport(
   db: Phase0UrlWorkLedgerReportDb,
@@ -309,14 +300,15 @@ export async function buildPhase0UrlWorkLedgerReport(
               o.retryable,
               COALESCE(o.failure_class,'') AS failure_class,
               o.observed_at,
-              COALESCE(o.provenance->>'required','false') = 'true' AS required,
-              COALESCE(o.provenance->>'relevanceTier','') AS relevance_tier,
-              COALESCE(o.provenance->>'sharedEvidenceFrom','') = '' AS direct_evidence,
+              o.requested_url,
+              ${sqlRequiredTrue('o')} AS required,
+              o.provenance->'relevanceTier' AS relevance_tier_value,
+              o.provenance->'sharedEvidenceFrom' AS shared_evidence_from_value,
               (
-                COALESCE(o.provenance->>'sharedEvidenceFrom','') <> ''
+                ${sqlSharedEvidence('o')}
                 OR o.outcome = 'FOUND'
                 OR (
-                  COALESCE(o.provenance->>'sharedEvidenceFrom','') = ''
+                  NOT ${sqlSharedEvidence('o')}
                   AND (
                     ${safeCounterSql(`o.provenance->'crawlerTelemetry'->'pagesInspected'`)} > 0
                     OR ${safeCounterSql(`o.provenance->'crawlerTelemetry'->'requestsFinished'`)} > 0
@@ -325,7 +317,7 @@ export async function buildPhase0UrlWorkLedgerReport(
                 )
               ) AS processed_evidence,
               (
-                COALESCE(o.provenance->>'sharedEvidenceFrom','') = ''
+                NOT ${sqlSharedEvidence('o')}
                 AND COALESCE(o.provenance->'crawlerTelemetry'->>'mode','') = 'RENDERED'
                 AND (
                   ${safeCounterSql(`o.provenance->'crawlerTelemetry'->'requestsFinished'`)} > 0
@@ -375,11 +367,12 @@ export async function buildPhase0UrlWorkLedgerReport(
      ),
      -- Mirror the projection helper selectEffectiveInspectionObservation:
      -- any FOUND wins; else required observations dominate optional notes; an
-     -- unevidenced clean only wins when it is all that remains. This bound
-     -- deliberately omits production effectiveAcquisitionOutcomes' fallback
-     -- collapse to PARTIALLY_INSPECTED, shared-clean shortcut, and later-gap
-     -- carry-over; those residuals stay inside the tolerated reconciliation
-     -- delta rather than being reimplemented in SQL.
+     -- unevidenced clean only wins when it is all that remains. The SQL bound
+     -- and the projection share this simplified selection; production's
+     -- effectiveAcquisitionOutcomes fallback collapse, shared-clean shortcut,
+     -- and later-gap carry-over remain a Phase 1 wiring concern. Retention
+     -- ownership is applied by the shared TypeScript predicate after this
+     -- query returns, so auxiliary URLs cannot inflate the bound.
      pooled AS (
        SELECT current_inspection.*,
               max((outcome = 'FOUND')::int) OVER w AS has_found,
@@ -407,13 +400,19 @@ export async function buildPhase0UrlWorkLedgerReport(
               ) AS effective_rank
          FROM pooled
      )
-     SELECT count(*) FILTER (
-              WHERE ${retryOwnedSql('e')}
-            )::int AS retryable_rows,
-            count(*) FILTER (
-              WHERE ${retryOwnedSql('e')}
-                AND NOT g.browser_executed
-            )::int AS never_browser_executed_rows
+     SELECT e.id,
+            e.channel_id,
+            e.surface,
+            e.normalized_url,
+            e.requested_url,
+            e.outcome,
+            e.retryable,
+            e.failure_class,
+            e.observed_at,
+            e.required,
+            e.relevance_tier_value,
+            e.shared_evidence_from_value,
+            g.browser_executed
        FROM ranked e
        JOIN grouped g
          ON g.channel_id = e.channel_id
@@ -423,10 +422,41 @@ export async function buildPhase0UrlWorkLedgerReport(
     [windowDays, SURFACES],
   );
 
-  const telemetryBound = {
-    retryableRows: Number(telemetry.rows[0]?.retryable_rows || 0),
-    neverBrowserExecutedRows: Number(telemetry.rows[0]?.never_browser_executed_rows || 0),
-  };
+  let retryableRows = 0;
+  let neverBrowserExecutedRows = 0;
+  for (const row of telemetry.rows) {
+    // Ownership must see the observed URL, not the canonical work key:
+    // stripping a trailing slash can change crawl admission (for example
+    // `/topics/vue.js/` is eligible while `/topics/vue.js` looks like a
+    // resource extension). Keep normalized_url for grouping only.
+    //
+    // The raw JSON values (not text-coerced SQL booleans/strings) preserve the
+    // projection's strict `required === true` and string-only relevance/shared
+    // checks, so malformed provenance cannot change only one side.
+    const observation: CommunityWorkObservation = {
+      channelId: String(row.channel_id || ''),
+      requestedUrl: String(row.requested_url || row.normalized_url || ''),
+      outcome: String(row.outcome || ''),
+      retryable: row.retryable === true,
+      failureClass: row.failure_class ? String(row.failure_class) : null,
+      observedAt: new Date(row.observed_at).toISOString(),
+      id: row.id ? String(row.id) : undefined,
+      provenance: {
+        surface: String(row.surface || ''),
+        required: row.required === true,
+        ...(typeof row.relevance_tier_value === 'string'
+          ? { relevanceTier: row.relevance_tier_value }
+          : {}),
+        ...(typeof row.shared_evidence_from_value === 'string'
+          ? { sharedEvidenceFrom: row.shared_evidence_from_value }
+          : {}),
+      },
+    };
+    if (!observationOwnsRetry(observation)) continue;
+    retryableRows++;
+    if (row.browser_executed !== true) neverBrowserExecutedRows++;
+  }
+  const telemetryBound = { retryableRows, neverBrowserExecutedRows };
   const reconciliation = reconcileCommunityWorkProjection(
     projection.stats,
     telemetryBound,

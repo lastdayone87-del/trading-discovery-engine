@@ -95,7 +95,8 @@ test('the Phase 0 report is read-only and reconciles the two bounds', () => {
   assert.doesNotMatch(reportBuilder, /UPDATE\s+(?:public\.)?community_acquisition_url_state/i);
   assert.doesNotMatch(reportBuilder, /DELETE\s+FROM\s+(?:public\.)?community_acquisition_url_state/i);
   assert.match(reportBuilder, /reconcileCommunityWorkProjection/);
-  assert.match(reportBuilder, /never_browser_executed_rows/);
+  assert.match(reportBuilder, /observationOwnsRetry/);
+  assert.match(reportBuilder, /g\.browser_executed/);
   assert.match(reportBuilder, /ledger_empty_phase0_expected/);
   assert.match(reportBuilder, /retryableWithinFivePercent/);
   assert.match(reportBuilder, /no_retryable_work_measured/);
