@@ -147,7 +147,7 @@ export type EnqueueOperationalEnrichmentRecovery = (
   channel: ChannelRecord,
   reasonCodes: string[],
   client?: any
-) => Promise<void>;
+) => Promise<boolean | void>;
 
 export const OPERATIONAL_ENRICHMENT_RECOVERY_POLICY_VERSION = 'operational-enrichment-recovery-v2';
 
@@ -266,13 +266,20 @@ async function runOperationalEnrichmentReconciliation(
     `SELECT c.channel_id,
             failed_job.id AS failed_job_id,
             failed_job.attempts AS failed_job_attempts,
+            EXISTS (
+              SELECT 1 FROM job_reopen_events blocked
+               WHERE blocked.job_id = failed_job.id
+                 AND blocked.outcome = 'BLOCKED'
+                 AND blocked.prior_generation = COALESCE(failed_job.reopen_generation, 0)
+            ) AS reopen_blocked,
             (SELECT count(*)::int
                FROM operational_enrichment_recovery_events cycle_event
               WHERE cycle_event.channel_id=c.channel_id
                 AND cycle_event.event_key LIKE 'operational-enrichment:%') AS recovery_cycles
        FROM channels c
        JOIN LATERAL (
-         SELECT latest_job.id, latest_job.attempts, latest_job.status, latest_job.last_error
+         SELECT latest_job.id, latest_job.attempts, latest_job.status, latest_job.last_error,
+                latest_job.reopen_generation
            FROM jobs latest_job
           WHERE latest_job.type IN('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN')
             AND latest_job.payload->>'channelId'=c.channel_id
@@ -300,7 +307,7 @@ async function runOperationalEnrichmentReconciliation(
            WHERE terminal_event.channel_id=c.channel_id
              AND terminal_event.event_key LIKE 'operational-enrichment-terminal:%'
         )
-      ORDER BY c.last_checked ASC NULLS FIRST
+      ORDER BY reopen_blocked ASC, c.last_checked ASC NULLS FIRST
       LIMIT $1`,
     [Math.min(100, Math.max(1, limit))]
   );
@@ -340,14 +347,15 @@ async function runOperationalEnrichmentReconciliation(
     if (!decision.reactivate) continue;
     const updated = reactivateOperationalEnrichment(channel, decision.reasonCodes, new Date(now).toISOString());
     await upsertChannel(updated);
-    let recorded = false;
+    let outcome: 'RECORDED' | 'DUPLICATE' | 'BLOCKED' = 'BLOCKED';
     try {
       // Enqueue and ledger write share one transaction on the real pool: a
       // failed ledger insert must not leave a reopened job that consumes a
       // recovery cycle without a durable record (or vice versa).
-      recorded = await withRecoveryTransaction(db, async queryable => {
-        await enqueueRecoveryJob(updated, decision.reasonCodes, queryable);
-        return insertOperationalEnrichmentRecoveryEvent(
+      outcome = await withRecoveryTransaction(db, async queryable => {
+        const enqueued = await enqueueRecoveryJob(updated, decision.reasonCodes, queryable);
+        if (enqueued === false) return 'BLOCKED';
+        const recorded = await insertOperationalEnrichmentRecoveryEvent(
           queryable,
           operationalEnrichmentCycleEventKey(channel.channel_id, failedJobId, row.failed_job_attempts, recoveryCycles + 1),
           channel.channel_id,
@@ -355,12 +363,21 @@ async function runOperationalEnrichmentReconciliation(
           channel.scan_status,
           decision.reasonCodes
         );
+        return recorded ? 'RECORDED' : 'DUPLICATE';
       });
     } catch (error) {
       await upsertChannel(channel);
       throw error;
     }
-    if (recorded) {
+    if (outcome === 'BLOCKED') {
+      // The reopen guard kept the enrichment job terminal. Restore the
+      // channel projection and do not consume a recovery cycle. The next sweep
+      // re-evaluates the current guard config and rolling window instead of
+      // treating the BLOCKED ledger row as a separate 30-day ban.
+      await upsertChannel(channel);
+      continue;
+    }
+    if (outcome === 'RECORDED') {
       bumpOperationalEnrichmentRecoveryEnqueued();
       console.info(JSON.stringify({event:'operational_enrichment_recovery_enqueued',channelId:channel.channel_id,failedJobId,cycle:recoveryCycles+1,maxRecoveryCycles:OPERATIONAL_ENRICHMENT_MAX_RECOVERY_CYCLES,reasonCodes:decision.reasonCodes,timestamp:new Date(now).toISOString()}));
     } else {

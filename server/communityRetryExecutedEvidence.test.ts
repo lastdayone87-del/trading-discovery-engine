@@ -20,11 +20,11 @@ test('inspection-start marker lands after channel load and immediately before in
   // therefore leave unmarked rows that can never count as executed.
   assert.match(
     queueManager,
-    /recordExecutionStage\('DISPATCHER','REACHED'[\s\S]*?if\(job\.type==='RETRY_COMMUNITY_ACQUISITION'\)[\s\S]*?getChannelById[\s\S]*?if\(!channel\)[\s\S]*?inspectAndValidateChannel\(channel,undefined,false,false,false,\{jobId:job\.id,attemptNumber:job\.attempts,isRetryOwnedReacquire:true,clickOffsets:resolveInspectionClickOffsets\(job\.payload\.clickOffsets\)\}\)/,
+    /recordExecutionStage\('DISPATCHER','REACHED'[\s\S]*?if\(job\.type==='RETRY_COMMUNITY_ACQUISITION'\)[\s\S]*?getChannelById[\s\S]*?if\(!channel\)[\s\S]*?inspectAndValidateChannel\(channel,undefined,false,false,false,\{jobId:job\.id,attemptNumber:job\.attempts,generation:job\.reopen_generation,isRetryOwnedReacquire:true,clickOffsets:resolveInspectionClickOffsets\(job\.payload\.clickOffsets\)\}\)/,
   );
   assert.match(
     queueManager,
-    /isTerminalState\(channel\)[\s\S]*?channelProcessing\.isPaused[\s\S]*?markCommunityInspectionStarted\(executionMarker\.jobId, executionMarker\.attemptNumber\)[\s\S]*?validateChannelCountry/,
+    /isTerminalState\(channel\)[\s\S]*?channelProcessing\.isPaused[\s\S]*?markCommunityInspectionStarted\(executionMarker\.jobId, executionMarker\.attemptNumber, executionMarker\.generation\)[\s\S]*?validateChannelCountry/,
   );
 });
 
@@ -36,7 +36,7 @@ test('marker binds to the exact claimed attempt and aborts on stale claims', () 
   assert.match(dbCore, /export const COMMUNITY_INSPECTION_STARTED_MARKER = 'communityInspectionStarted'/);
   assert.match(
     dbCore,
-    /UPDATE job_attempts SET logs = logs \|\| \$3::jsonb WHERE job_id=\$1 AND attempt_number=\$2 AND status='PROCESSING' AND finished_at IS NULL/,
+    /UPDATE job_attempts SET logs = logs \|\| \$3::jsonb WHERE job_id=\$1 AND attempt_number=\$2 AND \(\$4::int IS NULL OR generation=\$4\) AND status='PROCESSING' AND finished_at IS NULL/,
   );
   assert.match(dbCore, /if\(!res\.rowCount\) throw new Error\(`Community inspection marker found no open attempt/);
 });

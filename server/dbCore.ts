@@ -2614,7 +2614,7 @@ export async function getApprovedWeights(siteIdentity: string): Promise<{
 export async function performManualDatabaseBackup():Promise<{success:boolean;timestamp:string;backupPath:string}>{throw new Error('Manual SQL.js file backup is disabled after PostgreSQL migration. Use PostgreSQL/Railway backups or pg_dump.');}
 
 export type JobStatus='PENDING'|'PROCESSING'|'COMPLETED'|'FAILED';
-export interface DurableJob{ id:string; type:string; status:JobStatus; payload:any; attempts:number; max_attempts:number; run_after:string; locked_by?:string|null; locked_at?:string|null; last_error?:string|null; created_at:string; }
+export interface DurableJob{ id:string; type:string; status:JobStatus; payload:any; attempts:number; max_attempts:number; run_after:string; locked_by?:string|null; locked_at?:string|null; last_error?:string|null; created_at:string; reopen_generation?:number; reopen_blocked?:boolean; }
 /** Minimal client surface for budget guards evaluated inside the claim transaction. */
 export interface ClaimBudgetClient { query: (text: string, params?: any[]) => Promise<{ rows: any[] }>; }
 /**
@@ -2652,8 +2652,29 @@ export async function evaluateClaimGuard(client: ClaimBudgetClient, guard: Claim
     return { admitted: false, exhausted: true };
   }
 }
-export async function enqueueJob(type:string,payload:any,opts:{priority?:number;maxAttempts?:number;runAfter?:string;idempotencyKey?:string;clientOverride?:any;preventReopen?:boolean}={}):Promise<DurableJob>{const db=opts.clientOverride||await getDb(); const reopenClockSql=reopenClockUpdateSql(acquisitionJobClockV2Enabled()); const sql=opts.preventReopen?`INSERT INTO jobs(type,payload,priority,max_attempts,run_after,idempotency_key,catalog_version_id,catalog_policy_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(idempotency_key) DO UPDATE SET updated_at=jobs.updated_at RETURNING *`:`INSERT INTO jobs(type,payload,priority,max_attempts,run_after,idempotency_key,catalog_version_id,catalog_policy_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(idempotency_key) DO UPDATE SET payload=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.payload ELSE jobs.payload END,status=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 'PENDING' ELSE jobs.status END,priority=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.priority ELSE jobs.priority END,max_attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.max_attempts ELSE jobs.max_attempts END,attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 0 ELSE jobs.attempts END,run_after=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.run_after ELSE jobs.run_after END,locked_by=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_by END,locked_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_at END,last_error=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.last_error END,completed_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.completed_at END,updated_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN now() ELSE jobs.updated_at END${reopenClockSql} RETURNING *`; const res=await db.query(sql,[type,JSON.stringify(payload),opts.priority||0,opts.maxAttempts||3,opts.runAfter||new Date().toISOString(),opts.idempotencyKey||null,payload?.catalogPin?.catalogVersionId||null,payload?.catalogPin?.policyVersion||null]); return rowToJob(res.rows[0]);}
-function rowToJob(r:any):DurableJob{return {id:r.id,type:r.type,status:r.status,payload:parseJson(r.payload,{}),attempts:r.attempts,max_attempts:r.max_attempts,run_after:iso(r.run_after)||'',locked_by:r.locked_by,locked_at:iso(r.locked_at),last_error:r.last_error,created_at:iso(r.created_at)||''};}
+export async function enqueueJob(type:string,payload:any,opts:{priority?:number;maxAttempts?:number;runAfter?:string;idempotencyKey?:string;clientOverride?:any;preventReopen?:boolean}={}):Promise<DurableJob>{
+  const db=opts.clientOverride||await getDb();
+  const reopenClockSql=reopenClockUpdateSql(acquisitionJobClockV2Enabled());
+  const sql=opts.preventReopen
+    ?`INSERT INTO jobs(type,payload,priority,max_attempts,run_after,idempotency_key,catalog_version_id,catalog_policy_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(idempotency_key) DO UPDATE SET updated_at=jobs.updated_at RETURNING *`
+    :`INSERT INTO jobs(type,payload,priority,max_attempts,run_after,idempotency_key,catalog_version_id,catalog_policy_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(idempotency_key) DO UPDATE SET payload=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.payload ELSE jobs.payload END,status=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 'PENDING' ELSE jobs.status END,priority=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.priority ELSE jobs.priority END,max_attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.max_attempts ELSE jobs.max_attempts END,attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 0 ELSE jobs.attempts END,run_after=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.run_after ELSE jobs.run_after END,locked_by=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_by END,locked_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_at END,last_error=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.last_error END,completed_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.completed_at END,updated_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN now() ELSE jobs.updated_at END${reopenClockSql} RETURNING *`;
+  const res=await db.query(sql,[type,JSON.stringify(payload),opts.priority||0,opts.maxAttempts||3,opts.runAfter||new Date().toISOString(),opts.idempotencyKey||null,payload?.catalogPin?.catalogVersionId||null,payload?.catalogPin?.policyVersion||null]);
+  if(res.rows[0])return rowToJob(res.rows[0]);
+  // Migration 165's reopen trigger can suppress a terminal-to-pending update
+  // when the per-channel cap is reached. Return the still-terminal durable
+  // owner and leave an audit log instead of pretending a new job exists.
+  if(opts.idempotencyKey){
+    const existing=await db.query(`SELECT * FROM jobs WHERE idempotency_key=$1`,[opts.idempotencyKey]);
+    const row=existing.rows[0];
+    if(row&&(row.status==='COMPLETED'||row.status==='FAILED')){
+      const existingPayload=typeof row.payload==='string'?parseJson(row.payload,{}):(row.payload||{});
+      console.warn(JSON.stringify({event:'job_reopen_guard_blocked',jobId:row.id,type:row.type,channelId:existingPayload.channelId||null,reopenGeneration:row.reopen_generation??null,status:row.status,timestamp:new Date().toISOString()}));
+      return {...rowToJob(row),reopen_blocked:true};
+    }
+  }
+  throw new Error('JOB_ENQUEUE_LOST_ROW');
+}
+function rowToJob(r:any):DurableJob{return {id:r.id,type:r.type,status:r.status,payload:parseJson(r.payload,{}),attempts:r.attempts,max_attempts:r.max_attempts,run_after:iso(r.run_after)||'',locked_by:r.locked_by,locked_at:iso(r.locked_at),last_error:r.last_error,created_at:iso(r.created_at)||'',reopen_generation:r.reopen_generation==null?0:Number(r.reopen_generation)};}
 export async function claimNextJob(workerId:string,types?:string[],excludedErrorPatterns?:string[],excludedReconciliationStatuses?:string[],budgetGuards:ClaimBudgetGuard[]=[]):Promise<DurableJob|null>{const db=await getDb(); const client=await db.connect(); let claimed:DurableJob|null=null;try{await client.query('BEGIN');
     // Single priority-preserving claim loop: always consider the globally
     // highest-priority pending candidate first. Unguarded candidates claim
@@ -2681,7 +2702,7 @@ export async function claimNextJob(workerId:string,types?:string[],excludedError
       if (verdict.exhausted && effectiveTypes) effectiveTypes = effectiveTypes.filter(t => !guard.types.includes(t));
     }
     if (deniedIds.length && effectiveTypes !== null && !effectiveTypes.length) { await client.query('COMMIT'); return null; }
-    const res=await client.query(`SELECT * FROM jobs WHERE status='PENDING' AND run_after<=now() AND ($1::text[] IS NULL OR type=ANY($1)) AND ($2::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND EXISTS (SELECT 1 FROM unnest($2::text[]) pattern WHERE COALESCE(last_error,'') LIKE pattern))) AND ($3::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND COALESCE(payload->>'reconciliationStatus','NONE')=ANY($3::text[]))) AND NOT (type='RETRY_COMMUNITY_ACQUISITION' AND CASE WHEN btrim(COALESCE(payload->>'retryLifecycleVersion','')) ~ '^[0-9]+$' THEN btrim(payload->>'retryLifecycleVersion')::numeric ELSE 0 END < 2 AND COALESCE(payload->>'retryReason','') <> 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE') AND NOT (id = ANY($4::uuid[])) ORDER BY ${claimOrderByClause()} FOR UPDATE SKIP LOCKED LIMIT 1`,[effectiveTypes||null,excludedErrorPatterns||null,excludedReconciliationStatuses||null,deniedIds]); if(!res.rowCount){await client.query('COMMIT'); return null;} const job=res.rows[0];const upd=await client.query(`UPDATE jobs SET status='PROCESSING',locked_by=$1,locked_at=now(),attempts=attempts+1,updated_at=now() WHERE id=$2 RETURNING *`,[workerId,job.id]);await client.query(`INSERT INTO job_attempts(job_id,attempt_number,status) VALUES($1,$2,'PROCESSING')`,[job.id,upd.rows[0].attempts]); await client.query('COMMIT');claimed=rowToJob(upd.rows[0]);
+    const res=await client.query(`SELECT * FROM jobs WHERE status='PENDING' AND run_after<=now() AND ($1::text[] IS NULL OR type=ANY($1)) AND ($2::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND EXISTS (SELECT 1 FROM unnest($2::text[]) pattern WHERE COALESCE(last_error,'') LIKE pattern))) AND ($3::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND COALESCE(payload->>'reconciliationStatus','NONE')=ANY($3::text[]))) AND NOT (type='RETRY_COMMUNITY_ACQUISITION' AND CASE WHEN btrim(COALESCE(payload->>'retryLifecycleVersion','')) ~ '^[0-9]+$' THEN btrim(payload->>'retryLifecycleVersion')::numeric ELSE 0 END < 2 AND COALESCE(payload->>'retryReason','') <> 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE') AND NOT (id = ANY($4::uuid[])) ORDER BY ${claimOrderByClause()} FOR UPDATE SKIP LOCKED LIMIT 1`,[effectiveTypes||null,excludedErrorPatterns||null,excludedReconciliationStatuses||null,deniedIds]); if(!res.rowCount){await client.query('COMMIT'); return null;} const job=res.rows[0];const upd=await client.query(`UPDATE jobs SET status='PROCESSING',locked_by=$1,locked_at=now(),attempts=attempts+1,updated_at=now() WHERE id=$2 RETURNING *`,[workerId,job.id]);await client.query(`INSERT INTO job_attempts(job_id,attempt_number,generation,status) VALUES($1,$2,$3,'PROCESSING')`,[job.id,upd.rows[0].attempts,Number(upd.rows[0].reopen_generation||0)]); await client.query('COMMIT');claimed=rowToJob(upd.rows[0]);
     }catch(e){await client.query('ROLLBACK'); throw e;}finally{client.release();}
   // Trace persistence is deliberately outside the claim transaction. The old
   // implementation inserted diagnostic rows before COMMIT, so any trace-only
@@ -2710,9 +2731,11 @@ export async function completeJob(jobId:string):Promise<void>{const db=await get
  * execution, while failing fast retries the job with the marker intact.
  */
 export const COMMUNITY_INSPECTION_STARTED_MARKER = 'communityInspectionStarted';
-export async function markCommunityInspectionStarted(jobId:string,attemptNumber:number):Promise<void>{
+export async function markCommunityInspectionStarted(jobId:string,attemptNumber:number,generation?:number):Promise<void>{
   const db=await getDb();
-  const res=await db.query(`UPDATE job_attempts SET logs = logs || $3::jsonb WHERE job_id=$1 AND attempt_number=$2 AND status='PROCESSING' AND finished_at IS NULL`,[jobId,attemptNumber,JSON.stringify(COMMUNITY_INSPECTION_STARTED_MARKER)]);
+  // attempt_number restarts at 1 after a reopen, so a late marker from an older
+  // generation must also match the claimed generation when the caller knows it.
+  const res=await db.query(`UPDATE job_attempts SET logs = logs || $3::jsonb WHERE job_id=$1 AND attempt_number=$2 AND ($4::int IS NULL OR generation=$4) AND status='PROCESSING' AND finished_at IS NULL`,[jobId,attemptNumber,JSON.stringify(COMMUNITY_INSPECTION_STARTED_MARKER),generation??null]);
   if(!res.rowCount) throw new Error(`Community inspection marker found no open attempt (job ${jobId} attempt ${attemptNumber}); claim was recovered or completed before inspection.`);
 }
 export type JobFailureDisposition='RETRYING_WITHOUT_ATTEMPT'|'RETRYING'|'FAILED';
