@@ -76,23 +76,32 @@ async function insertObservation(
     required: boolean;
     retryable: boolean;
     observedAt: string;
+    requestedUrl?: string;
+    outcome?: string;
+    failureClass?: string;
+    relevanceTier?: string;
+    sharedEvidenceFrom?: string;
   },
 ): Promise<void> {
   await db.query(
     `INSERT INTO external_acquisition_observations(
        observation_key,channel_id,requested_url,outcome,retryable,failure_class,
        detail,provenance,policy_version,observed_at
-     ) VALUES($1,$2,'https://fixture.example/links','ACQUISITION_FAILED',$3,
-              'NETWORK_FAILURE','zombie fixture',$4::jsonb,'phase0-zombie-test-v1',$5::timestamptz)`,
+     ) VALUES($1,$2,$3,$4,$5,$6,'zombie fixture',$7::jsonb,'phase0-zombie-test-v1',$8::timestamptz)`,
     [
       args.key,
       args.channelId,
+      args.requestedUrl || 'https://fixture.example/links',
+      args.outcome || 'ACQUISITION_FAILED',
       args.retryable,
+      args.failureClass || 'NETWORK_FAILURE',
       JSON.stringify({
         provider: 'external-link',
         surface: args.surface,
         required: args.required,
         crawlerTelemetry: { mode: 'STATIC', pagesInspected: 1 },
+        ...(args.relevanceTier ? { relevanceTier: args.relevanceTier } : {}),
+        ...(args.sharedEvidenceFrom ? { sharedEvidenceFrom: args.sharedEvidenceFrom } : {}),
       }),
       args.observedAt,
     ],
@@ -127,6 +136,11 @@ maybe('the zombie dry-run classifies evidence-backed closures and every skip rea
         required: boolean;
         retryable: boolean;
         observedAt: string;
+        requestedUrl?: string;
+        outcome?: string;
+        failureClass?: string;
+        relevanceTier?: string;
+        sharedEvidenceFrom?: string;
       }>;
       ledgerStates?: string[];
     }> = [
@@ -151,6 +165,77 @@ maybe('the zombie dry-run classifies evidence-backed closures and every skip rea
         discordStatus: 'FOUND',
         observations: [
           { surface: 'CREATOR_WEBSITES', required: true, retryable: true, observedAt: '2026-10-03T00:00:00.000Z' },
+        ],
+      },
+      {
+        // Optional static budget gaps are genuine URL work and own retry even
+        // though static seeds run with required=false.
+        name: 'skip-static-gap',
+        discordStatus: 'FOUND',
+        observations: [
+          {
+            surface: 'CREATOR_WEBSITES',
+            required: false,
+            retryable: true,
+            observedAt: '2026-10-03T00:00:00.000Z',
+            outcome: 'PARTIALLY_INSPECTED',
+            failureClass: 'STATIC_BUDGET_GAP',
+          },
+        ],
+      },
+      {
+        // Required/retryable flags are not ownership: deterministic permanent
+        // failure classes, demoted tiers, auxiliary URLs, and borrowed shared
+        // evidence cannot keep a terminal-channel retry alive.
+        name: 'close-redirect-limit',
+        discordStatus: 'FOUND',
+        observations: [
+          {
+            surface: 'CREATOR_WEBSITES',
+            required: true,
+            retryable: true,
+            observedAt: '2026-10-03T00:00:00.000Z',
+            failureClass: 'REDIRECT_LIMIT',
+          },
+        ],
+      },
+      {
+        name: 'close-demoted',
+        discordStatus: 'FOUND',
+        observations: [
+          {
+            surface: 'CREATOR_WEBSITES',
+            required: true,
+            retryable: true,
+            observedAt: '2026-10-03T00:00:00.000Z',
+            relevanceTier: 'DEMOTE',
+          },
+        ],
+      },
+      {
+        name: 'close-auxiliary',
+        discordStatus: 'FOUND',
+        observations: [
+          {
+            surface: 'CREATOR_WEBSITES',
+            required: true,
+            retryable: true,
+            observedAt: '2026-10-03T00:00:00.000Z',
+            requestedUrl: 'https://fixture.example/guide?ref=BRANDON',
+          },
+        ],
+      },
+      {
+        name: 'close-shared-evidence',
+        discordStatus: 'FOUND',
+        observations: [
+          {
+            surface: 'CREATOR_WEBSITES',
+            required: true,
+            retryable: true,
+            observedAt: '2026-10-03T00:00:00.000Z',
+            sharedEvidenceFrom: 'https://fixture.example/lender',
+          },
         ],
       },
       {
@@ -225,7 +310,12 @@ maybe('the zombie dry-run classifies evidence-backed closures and every skip rea
 
     assert.deepEqual(decision('close-terminal'), ['PROPOSE_CLOSE', 'CHANNEL_TERMINAL']);
     assert.deepEqual(decision('close-ledger'), ['PROPOSE_CLOSE', 'LEDGER_ALL_TERMINAL']);
-    assert.deepEqual(decision('skip-fresh'), ['SKIP', 'NEWER_RETRYABLE_OBSERVATION']);
+    assert.deepEqual(decision('skip-fresh'), ['SKIP', 'NEWER_RETRY_OWNING_OBSERVATION']);
+    assert.deepEqual(decision('skip-static-gap'), ['SKIP', 'NEWER_RETRY_OWNING_OBSERVATION']);
+    assert.deepEqual(decision('close-redirect-limit'), ['PROPOSE_CLOSE', 'CHANNEL_TERMINAL']);
+    assert.deepEqual(decision('close-demoted'), ['PROPOSE_CLOSE', 'CHANNEL_TERMINAL']);
+    assert.deepEqual(decision('close-auxiliary'), ['PROPOSE_CLOSE', 'CHANNEL_TERMINAL']);
+    assert.deepEqual(decision('close-shared-evidence'), ['PROPOSE_CLOSE', 'CHANNEL_TERMINAL']);
     assert.deepEqual(decision('skip-processing'), ['SKIP', 'PROCESSING_ACTIVE']);
     assert.deepEqual(decision('skip-open'), ['SKIP', 'CHANNEL_NOT_TERMINAL']);
     assert.deepEqual(decision('skip-active-ledger'), ['SKIP', 'LEDGER_ACTIVE_WORK']);

@@ -19,6 +19,7 @@ import { createReadOnlyDbPool } from '../server/db';
 import {
   buildPhase0ZombieReconciliationReport,
   parsePhase0ZombieReconciliationArgs,
+  phase0ZombieReconciliationCheckFailures,
   PHASE0_ZOMBIE_RECONCILIATION_USAGE,
 } from '../server/phase0ZombieReconciliation';
 
@@ -57,15 +58,7 @@ async function main(): Promise<void> {
     await writeStdout(`${json}\n`);
 
     if (args.check) {
-      const failures: string[] = [];
-      if (!report.schema.ledgerTablePresent) failures.push('ledger_table_missing');
-      // An empty ledger is expected in Phase 0 and is already reported as a
-      // warning: channel-terminal evidence is then the only closure basis.
-      if (report.population.examined > 0
-          && report.summary.proposedClosures + report.summary.skipped
-             !== report.population.examined) {
-        failures.push('decision_partition_mismatch');
-      }
+      const failures = phase0ZombieReconciliationCheckFailures(report);
       if (failures.length > 0) {
         process.exitCode = 1;
         console.error(JSON.stringify({

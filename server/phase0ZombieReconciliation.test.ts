@@ -5,6 +5,7 @@ import {
   buildPhase0ZombieReconciliationReport,
   classifyZombieRetryClosure,
   parsePhase0ZombieReconciliationArgs,
+  phase0ZombieReconciliationCheckFailures,
   type ZombieRetryEvidence,
 } from './phase0ZombieReconciliation';
 
@@ -17,7 +18,7 @@ const baseEvidence: ZombieRetryEvidence = {
   ledgerRows: 0,
   ledgerActiveRows: 0,
   ledgerTerminalRows: 0,
-  newerRetryableRequiredObservations: 0,
+  newerRetryOwningObservations: 0,
 };
 
 test('zombie dry-run arguments default to the documented bound', () => {
@@ -134,14 +135,14 @@ test('active ledger work blocks closure even for a terminal channel', () => {
   );
 });
 
-test('fresh required retryable evidence blocks closure', () => {
+test('fresh retry-owning evidence blocks closure', () => {
   assert.deepEqual(
     classifyZombieRetryClosure({
       ...baseEvidence,
       discordValidationStatus: 'SUCCEEDED',
-      newerRetryableRequiredObservations: 1,
+      newerRetryOwningObservations: 1,
     }),
-    { decision: 'SKIP', reason: 'NEWER_RETRYABLE_OBSERVATION' },
+    { decision: 'SKIP', reason: 'NEWER_RETRY_OWNING_OBSERVATION' },
   );
 });
 
@@ -160,7 +161,20 @@ function fixtureRow(overrides: Record<string, unknown> = {}) {
     ledger_rows: 0,
     ledger_active_rows: 0,
     ledger_terminal_rows: 0,
-    newer_retryable_required: 0,
+    ...overrides,
+  };
+}
+
+function observationRow(overrides: Record<string, unknown> = {}) {
+  return {
+    job_id: 'fresh-evidence',
+    requested_url: 'https://creator.example.com/community',
+    outcome: 'ACQUISITION_FAILED',
+    retryable: true,
+    failure_class: 'TIMEOUT',
+    observed_at: '2026-10-03T00:00:00.000Z',
+    id: `observation-${Math.random().toString(16).slice(2)}`,
+    provenance: { surface: 'CREATOR_WEBSITES', required: true },
     ...overrides,
   };
 }
@@ -170,11 +184,14 @@ function fakeDb(candidateRows: any[], options: {
   pendingRetries?: number;
   processingRetries?: number;
   ledgerRows?: number;
+  newerObservations?: any[];
 } = {}) {
   const sql: string[] = [];
+  const params: unknown[][] = [];
   const db = {
-    async query(text: string) {
+    async query(text: string, values: unknown[] = []) {
       sql.push(text);
+      params.push(values);
       if (text.includes('to_regclass')) {
         return { rows: [{ ledger_table_present: options.ledgerTablePresent !== false }] };
       }
@@ -188,6 +205,9 @@ function fakeDb(candidateRows: any[], options: {
           }],
         };
       }
+      if (text.includes('external_acquisition_observations')) {
+        return { rows: options.newerObservations ?? [] };
+      }
       if (text.includes('WITH candidates AS')) return { rows: candidateRows };
       if (text.includes('FROM community_acquisition_url_state')) {
         return { rows: [{ rows: options.ledgerRows ?? 0 }] };
@@ -195,7 +215,7 @@ function fakeDb(candidateRows: any[], options: {
       return { rows: [] };
     },
   };
-  return { db, sql };
+  return { db, sql, params };
 }
 
 test('the dry-run report partitions every examined job into proposals or skips', async () => {
@@ -231,9 +251,11 @@ test('the dry-run report partitions every examined job into proposals or skips',
       ledger_terminal_rows: 1,
     }),
     fixtureRow({ job_id: 'ledger-active', channel_id: 'UCledgeractive', ledger_active_rows: 1 }),
-    fixtureRow({ job_id: 'fresh-evidence', channel_id: 'UCfresh', newer_retryable_required: 1 }),
+    fixtureRow({ job_id: 'fresh-evidence', channel_id: 'UCfresh' }),
   ];
-  const { db, sql } = fakeDb(candidateRows);
+  const { db, sql, params } = fakeDb(candidateRows, {
+    newerObservations: [observationRow({ job_id: 'fresh-evidence' })],
+  });
   const report = await buildPhase0ZombieReconciliationReport(db, { maxJobs: 100 });
 
   assert.equal(report.dryRun, true);
@@ -250,7 +272,7 @@ test('the dry-run report partitions every examined job into proposals or skips',
   assert.equal(report.summary.byReason.CHANNEL_NOT_TERMINAL, 1);
   assert.equal(report.summary.byReason.LEDGER_NOT_TERMINAL, 1);
   assert.equal(report.summary.byReason.LEDGER_ACTIVE_WORK, 1);
-  assert.equal(report.summary.byReason.NEWER_RETRYABLE_OBSERVATION, 1);
+  assert.equal(report.summary.byReason.NEWER_RETRY_OWNING_OBSERVATION, 1);
   assert.equal(report.skippedRows, undefined, 'skipped rows are opt-in');
 
   const proposals = report.proposals.map(row => row.jobId).join(',');
@@ -258,16 +280,133 @@ test('the dry-run report partitions every examined job into proposals or skips',
   assert.equal(proposals.split(',').length, 2);
   assert.equal(report.summary.proposedClosures + skipped, report.population.examined);
 
+  assert.deepEqual(params[params.length - 1]?.[0], 100);
   const candidateSql = sql.find(text => text.includes('WITH candidates AS'));
   assert.ok(candidateSql);
   assert.match(candidateSql, /pg_input_is_valid/);
-  assert.match(candidateSql, /o\.provenance->'required' = 'true'::jsonb/);
-  assert.match(candidateSql, /o\.retryable = true/);
-  assert.match(candidateSql, /o\.observed_at > c\.retry_observed_at/);
+  assert.doesNotMatch(candidateSql, /external_acquisition_observations/);
   assert.match(candidateSql, /RESOLVED','PARKED_EXTERNAL','EXHAUSTED/);
   assert.match(candidateSql, /PENDING','RUNNING','PARKED_INFRA/);
   assert.match(candidateSql, /LIMIT \$1/);
   assert.doesNotMatch(candidateSql, /\b(?:INSERT|UPDATE|DELETE|TRUNCATE)\b/i);
+
+  const newerSql = sql.find(text => text.includes('external_acquisition_observations'));
+  assert.ok(newerSql);
+  assert.match(newerSql, /o\.provenance->>'surface' = ANY\(\$2::text\[\]\)/);
+  assert.match(newerSql, /o\.observed_at > c\.retry_observed_at/);
+  assert.doesNotMatch(newerSql, /o\.retryable\s*=\s*true/);
+  assert.doesNotMatch(newerSql, /provenance->'required'/);
+  assert.match(newerSql, /LIMIT \$1/);
+  assert.doesNotMatch(newerSql, /\b(?:INSERT|UPDATE|DELETE|TRUNCATE)\b/i);
+});
+
+test('newer observations are classified by shared retry ownership, not raw flags', async () => {
+  const candidateRows = [
+    fixtureRow({ job_id: 'owning-required', channel_id: 'UCowning-required' }),
+    fixtureRow({ job_id: 'owning-static-gap', channel_id: 'UCowning-static-gap' }),
+    fixtureRow({ job_id: 'owning-found-gap', channel_id: 'UCowning-found-gap' }),
+    fixtureRow({ job_id: 'close-redirect-limit', channel_id: 'UCclose-redirect-limit' }),
+    fixtureRow({ job_id: 'close-demoted', channel_id: 'UCclose-demoted' }),
+    fixtureRow({ job_id: 'close-auxiliary', channel_id: 'UCclose-auxiliary' }),
+    fixtureRow({ job_id: 'close-upstream', channel_id: 'UCclose-upstream' }),
+    fixtureRow({ job_id: 'close-shared', channel_id: 'UCclose-shared' }),
+    fixtureRow({ job_id: 'close-none', channel_id: 'UCclose-none' }),
+  ];
+  const newerObservations = [
+    observationRow({ job_id: 'owning-required' }),
+    observationRow({
+      job_id: 'owning-static-gap',
+      outcome: 'PARTIALLY_INSPECTED',
+      failure_class: 'STATIC_BUDGET_GAP',
+      provenance: { surface: 'CREATOR_WEBSITES', required: false },
+    }),
+    observationRow({
+      job_id: 'owning-found-gap',
+      outcome: 'FOUND',
+      failure_class: 'RENDERED_BUDGET_EXPIRED',
+    }),
+    observationRow({
+      job_id: 'close-redirect-limit',
+      failure_class: 'REDIRECT_LIMIT',
+    }),
+    observationRow({
+      job_id: 'close-demoted',
+      provenance: { surface: 'CREATOR_WEBSITES', required: true, relevanceTier: 'DEMOTE' },
+    }),
+    observationRow({
+      job_id: 'close-auxiliary',
+      requested_url: 'https://creator.example.com/?ref=BRANDON',
+    }),
+    observationRow({
+      job_id: 'close-upstream',
+      provenance: { surface: 'YOUTUBE_ABOUT', required: true },
+    }),
+    observationRow({
+      job_id: 'close-shared',
+      provenance: {
+        surface: 'CREATOR_WEBSITES',
+        required: true,
+        sharedEvidenceFrom: 'https://creator.example.com/lender',
+      },
+    }),
+  ];
+  const { db } = fakeDb(candidateRows, { newerObservations });
+  const report = await buildPhase0ZombieReconciliationReport(db, { includeRows: true });
+
+  const allRows = [...report.proposals, ...(report.skippedRows || [])];
+  const byJob = new Map(allRows.map(row => [row.jobId, row]));
+  const decision = (jobId: string) => {
+    const row = byJob.get(jobId);
+    assert.ok(row, `missing decision for ${jobId}`);
+    return [row.decision, row.reason];
+  };
+
+  assert.deepEqual(decision('owning-required'), ['SKIP', 'NEWER_RETRY_OWNING_OBSERVATION']);
+  assert.deepEqual(decision('owning-static-gap'), ['SKIP', 'NEWER_RETRY_OWNING_OBSERVATION']);
+  assert.deepEqual(decision('owning-found-gap'), ['SKIP', 'NEWER_RETRY_OWNING_OBSERVATION']);
+  for (const jobId of [
+    'close-redirect-limit',
+    'close-demoted',
+    'close-auxiliary',
+    'close-upstream',
+    'close-shared',
+    'close-none',
+  ]) {
+    assert.deepEqual(decision(jobId), ['PROPOSE_CLOSE', 'CHANNEL_TERMINAL']);
+  }
+  assert.equal(byJob.get('owning-required')?.newerRetryOwningObservations, 1);
+  assert.equal(byJob.get('close-demoted')?.newerRetryOwningObservations, 0);
+  assert.ok(
+    byJob.get('owning-required')?.evidence.includes('newer_retry_owning_observations=1'),
+  );
+});
+
+test('a non-finite maxJobs falls back to the documented bound', async () => {
+  for (const maxJobs of [Number.NaN, Number.POSITIVE_INFINITY, 0, -1]) {
+    const { db, sql, params } = fakeDb([fixtureRow()]);
+    const report = await buildPhase0ZombieReconciliationReport(db, { maxJobs });
+    assert.equal(report.maxJobs, 5_000);
+    const candidateIndex = sql.findIndex(text =>
+      text.includes('WITH candidates AS')
+      && !text.includes('external_acquisition_observations'));
+    assert.ok(candidateIndex >= 0);
+    assert.equal(params[candidateIndex]?.[0], 5_000);
+  }
+});
+
+test('--check fails when the candidate window truncates the report', async () => {
+  const healthy = await buildPhase0ZombieReconciliationReport(
+    fakeDb([fixtureRow()], { ledgerRows: 1 }).db,
+  );
+  assert.deepEqual(phase0ZombieReconciliationCheckFailures(healthy), []);
+
+  const truncated = await buildPhase0ZombieReconciliationReport(
+    fakeDb([fixtureRow()], { pendingRetries: 10 }).db,
+    { maxJobs: 1 },
+  );
+  assert.deepEqual(phase0ZombieReconciliationCheckFailures(truncated), [
+    'candidate_limit_reached',
+  ]);
 });
 
 test('the report warns when the ledger is absent or empty and when the bound truncates', async () => {
