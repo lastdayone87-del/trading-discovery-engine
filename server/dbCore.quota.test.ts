@@ -339,7 +339,7 @@ test('normal-origin batches contain probe channel refusals; probe jobs still def
   const source = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
   assert.match(source, /processPlaylistInspectionJob\(job,processDiscoveredChannelContained\)/);
   assert.match(source, /processFeaturedChannelInspectionJob\(job,processDiscoveredChannelContained\)/);
-  assert.match(source, /const outcome = await processDiscoveredChannelContained\(raw, country, source/);
+  assert.match(source, /outcome = await processDiscoveredChannelContained\(raw, country, source/);
   assert.match(source, /const outcome = await processDiscoveredChannelContained\(raw, session\.country, 'manual_search', \{ jobId \}\)/);
   assert.match(source, /calculateQueryFunnel\(searchPage\?\.rawResultCount \?\? extracted\.length, observations, deferredResults\)/);
   assert.match(source, /deferredOnly: observations\.length === 0 && deferredResults > 0/);

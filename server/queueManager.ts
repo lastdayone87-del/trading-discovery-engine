@@ -56,6 +56,12 @@ import {
   type DiscordAttemptCandidate,
   type DiscordInviteClaim,
   type OrphanDiscordCandidateRow,
+  type DurableJob,
+  insertChannelIfAbsent,
+  deleteClassificationPlaceholder,
+  getClassificationBackpressureState,
+  hasActiveClassificationJob,
+  reconcileClassificationSighting,
 } from './db';
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
 import { reserveIncrementalTreatmentPageQuota, releaseIncrementalTreatmentPageReservation, enqueueChildAndCommitPageReservation } from './retrievalPolicyCanary';
@@ -75,7 +81,8 @@ import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabula
 import { calculateQueryFunnel, countDeferredRawResults, manualSearchContinuationMetrics, type FunnelOutcome, type QueryFunnelMetrics, type QueryObservation } from './queryPerformance';
 import { resolveScopeEligibility } from './scopeEligibility';
 import { processChannelThroughPipeline, isTerminalState, applyGate1CountryRejectionToExisting, type PipelineExecutionOptions } from './ingestionPipeline';
-import { evaluateLowAudienceGate } from './lowAudienceGate';
+import { evaluateLowAudienceGate, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
+import { shouldPreserveExistingChannel } from './terminalPreservationPolicy';
 import { resolveTerminalEnrichmentFailure } from './enrichmentLifecycle';
 import { recordEvidenceActionOutcome } from './voiEvidenceController';
 import { completeInvestigationStep, failInvestigationStep, heartbeatInvestigationStep, startInvestigationStep } from './investigationWorkflow';
@@ -112,6 +119,21 @@ import {
 import { recordPassivePage, recordShadowFailure } from './passiveExploration';
 import { enqueueTermHarvest, processTermHarvestJob, readCorpusBudgetForUpdate } from './candidateCorpus';
 import { selectExplicitTerminologyLanguageContext, type ExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
+import {
+  CLASSIFICATION_JOB_TYPE,
+  buildClassificationJobPayload,
+  buildProvisionalClassificationChannel,
+  classificationAdmission,
+  classificationJobIdempotencyKey,
+  classificationQueryScopeKey,
+  mapClassificationOutcomeToFunnelOutcome,
+  resolveClassificationDecouplingConfig,
+  resolveEnrichmentWorkerCount,
+  resolveEnrichmentWorkerSplit,
+  resolveSearchWorkerCount,
+  type ClassificationBackpressureState,
+  type ClassificationJobPayload,
+} from './classificationDecoupling';
 import { processAiAdjudicationJob, processCandidateScoringJob } from './candidateScoring';
 import { processConceptResolutionJob } from './conceptGraph';
 import { processOfflineEvaluationJob } from './offlineEvaluation';
@@ -876,7 +898,7 @@ async function recoverPersistedAutonomousPage(args: PersistedPageRecoveryArgs): 
  * provider profile, same tick lifecycle) behind its own settings gate, so no
  * new worker architecture is required for continuous canary consumption.
  */
-export type ClaimableSearchJobType = 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'RESOLVE_STAGED_CANDIDATE' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'RETRY_COMMUNITY_ACQUISITION' | 'TERM_HARVEST' | 'SCORE_CANDIDATES' | 'AI_ADJUDICATE_CANDIDATE' | 'PROPOSE_CONCEPT_RESOLUTION' | 'OFFLINE_CANDIDATE_EVALUATION' | 'INSPECT_PLAYLIST' | 'INSPECT_FEATURED_CHANNELS' | 'PERSISTENT_RESEARCH_EXTERNAL_PROVIDER' | 'COUNTRY_BOUNDARY_REPROCESS' | 'RELATIONSHIP_CANARY_EXPANSION';
+export type ClaimableSearchJobType = 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'CLASSIFY_DISCOVERED_CHANNEL' | 'RESOLVE_STAGED_CANDIDATE' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'RETRY_COMMUNITY_ACQUISITION' | 'TERM_HARVEST' | 'SCORE_CANDIDATES' | 'AI_ADJUDICATE_CANDIDATE' | 'PROPOSE_CONCEPT_RESOLUTION' | 'OFFLINE_CANDIDATE_EVALUATION' | 'INSPECT_PLAYLIST' | 'INSPECT_FEATURED_CHANNELS' | 'PERSISTENT_RESEARCH_EXTERNAL_PROVIDER' | 'COUNTRY_BOUNDARY_REPROCESS' | 'RELATIONSHIP_CANARY_EXPANSION';
 
 const AUTONOMOUS_TIME_DEFER_MS = 5 * 60_000;
 let lastAutonomousResumeSweepAt = 0;
@@ -1068,6 +1090,160 @@ export const RESOLUTION_BUDGET_GUARD: ClaimBudgetGuard = {
 export const RESOLUTION_CLAIM_BUDGET_GUARDS: ClaimBudgetGuard[] = [RESOLUTION_BUDGET_GUARD];
 
 /**
+ * Outcome synthesised for a preserved row exactly as the legacy inline loop
+ * would report it. Preserved rows are known-complete: their terminal outcome
+ * is already durable and must not spend semantic capacity again.
+ */
+export function preservedChannelOutcome(existing: ChannelRecord): ProcessDiscoveredChannelOutcome {
+  return {
+    channelId: existing.channel_id,
+    channelName: existing.channel_name,
+    isNew: false,
+    wasKnown: true,
+    persisted: true,
+    countryStatus: existing.country_status,
+    detectedCountry: existing.country_status === 'UNCERTAIN' ? null : existing.country,
+    tradingStatus: existing.trading_status || 'UNCERTAIN',
+    discordStatus: existing.discord_status,
+    discordInvite: existing.discord_invite || null,
+    channelRecord: existing,
+  };
+}
+
+/**
+ * Provisional outcome for a discovery whose durable classification has not
+ * finished yet. Page accounting counts it as a persisted new creator but not
+ * as an evaluated semantic verdict; reconciliation fills in the truth later.
+ */
+export function classificationPendingOutcome(
+  raw: DiscoveredChannelRaw,
+  existing?: ChannelRecord | null,
+): ProcessDiscoveredChannelOutcome {
+  return {
+    channelId: raw.channelId,
+    channelName: raw.channelName,
+    isNew: !existing,
+    wasKnown: Boolean(existing),
+    persisted: true,
+    countryStatus: existing?.country_status || 'UNCERTAIN',
+    detectedCountry: existing && existing.country_status !== 'UNCERTAIN' ? existing.country : null,
+    tradingStatus: existing?.trading_status || 'UNCERTAIN',
+    discordStatus: existing?.discord_status || 'UNCERTAIN',
+    discordInvite: existing?.discord_invite || null,
+    channelRecord: existing || undefined,
+  };
+}
+
+/**
+ * Phase 3 admission for one discovered channel.
+ *
+ * - Preserved terminal/known-complete rows are reported without any work.
+ * - Under backpressure the legacy inline pipeline runs (never drop).
+ * - Otherwise a provisional insert-only row plus a durable
+ *   CLASSIFY_DISCOVERED_CHANNEL job carry the observation.
+ *
+ * A terminal job from the same UTC day cannot be reopened by the day-bucketed
+ * idempotency key, so that rediscovery is classified inline instead of waiting
+ * until tomorrow. Enqueue failure also falls back inline: the discovery is
+ * never lost to a queue write error.
+ */
+export async function admitDiscoveredChannel(input: {
+  raw: DiscoveredChannelRaw;
+  targetCountry: string;
+  source: DiscoverySource;
+  query: string;
+  queryRunId?: string;
+  queryId?: number;
+  discoveryJobId: string;
+  catalogPin?: unknown;
+  forceExtraction: boolean;
+  backpressure: ClassificationBackpressureState;
+  existing?: ChannelRecord | null;
+}): Promise<{ outcome: ProcessDiscoveredChannelOutcome | null; pending: boolean }> {
+  const { raw, targetCountry, source, backpressure } = input;
+  const existing = input.existing === undefined ? await getChannelById(raw.channelId) : input.existing;
+  if (
+    existing
+    && shouldPreserveExistingChannel(existing, source, false)
+    && !shouldReclassifyPreservedCompletedChannel(existing.scan_status, evaluateLowAudienceGate(raw.subscriberCount))
+  ) {
+    return { outcome: preservedChannelOutcome(existing), pending: false };
+  }
+  const inline = () => processDiscoveredChannelContained(raw, targetCountry, source, {
+    forceExtraction: input.forceExtraction,
+    jobId: input.discoveryJobId,
+    runId: input.queryRunId,
+  });
+  if (classificationAdmission(backpressure) === 'INLINE') {
+    return { outcome: await inline(), pending: false };
+  }
+  const config = resolveClassificationDecouplingConfig();
+  const ambientOrigin = currentOfficialYouTubeQuotaOrigin();
+  const quotaOrigin = ambientOrigin === 'PROBE' ? 'PROBE' : 'NORMAL';
+  let insertedPlaceholder = false;
+  try {
+    // A durable job already owns this channel. Count the observation as
+    // pending instead of enqueueing a duplicate; its completion reconciles
+    // every pending sighting for the channel.
+    if (await hasActiveClassificationJob(raw.channelId)) {
+      const channel = existing || await getChannelById(raw.channelId);
+      return { outcome: classificationPendingOutcome(raw, channel), pending: true };
+    }
+    if (!existing) {
+      insertedPlaceholder = await insertChannelIfAbsent(
+        buildProvisionalClassificationChannel(raw, source),
+      );
+    }
+    const queued = await enqueueJob(CLASSIFICATION_JOB_TYPE, buildClassificationJobPayload({
+      candidate: raw,
+      targetCountry,
+      source,
+      queryRunId: input.queryRunId,
+      queryId: input.queryId,
+      queryScopeKey: classificationQueryScopeKey({
+        queryRunId: input.queryRunId,
+        queryId: input.queryId,
+        query: input.query,
+        country: targetCountry,
+      }),
+      discoveryJobId: input.discoveryJobId,
+      nominationId: raw.nominationId,
+      catalogPin: input.catalogPin,
+      quotaOrigin,
+      forceExtraction: input.forceExtraction,
+    }), {
+      priority: config.priority,
+      maxAttempts: config.maxAttempts,
+      idempotencyKey: classificationJobIdempotencyKey(raw.channelId),
+      preventReopen: true,
+    });
+    if (queued.status === 'PENDING' || queued.status === 'PROCESSING') {
+      backpressure.globalPending += 1;
+      backpressure.scopedPending += 1;
+      return { outcome: classificationPendingOutcome(raw, existing), pending: true };
+    }
+    // Terminal same-day job: the key deliberately refuses to reopen it, so
+    // fall through to inline classification for this new rediscovery. The
+    // provisional row must go first or the inline pipeline would see this
+    // discovery as an already-known channel.
+    if (insertedPlaceholder) await deleteClassificationPlaceholder(raw.channelId).catch(() => undefined);
+  } catch (error) {
+    // A queue read/write failure must not fail a page whose retrieval already
+    // succeeded. Remove the untouched placeholder and classify inline.
+    if (insertedPlaceholder) await deleteClassificationPlaceholder(raw.channelId).catch(() => undefined);
+    console.warn(JSON.stringify({
+      event: 'classification_enqueue_failed_inline_fallback',
+      channelId: raw.channelId,
+      source,
+      targetCountry,
+      reason: String(error instanceof Error ? error.message : error).slice(0, 300),
+      timestamp: new Date().toISOString(),
+    }));
+  }
+  return { outcome: await inline(), pending: false };
+}
+
+/**
  * Worker loop that processes one durable search or enrichment job.
  */
 export async function processNextSearchJob(
@@ -1117,7 +1293,14 @@ export async function processNextSearchJob(
       groqFallbackConfigured = fallbackRoutes.length > 0 && process.env.SEMANTIC_PROVIDER_FORCE_GEMINI !== 'true';
       if (groqFallbackConfigured) groqFallbackCooldownActive = allRoutesCoolingDown(await Promise.all(fallbackRoutes.map(async route => groqFallbackCoolingDown(await isGroqOrgCooldownActive(groqRouteOrg(route)), groqOrgCooldownRemainingMs(groqRouteOrg(route))))));
     }
-    if (enrichChannelClaimableDuringCooldown({ groqSelected, geminiFreeSelected, geminiCooldownActive, groqCooldownActive, geminiFreeCooldownActive, groqFallbackConfigured, groqFallbackCooldownActive })) claimableTypes.push('ENRICH_CHANNEL');
+    if (enrichChannelClaimableDuringCooldown({ groqSelected, geminiFreeSelected, geminiCooldownActive, groqCooldownActive, geminiFreeCooldownActive, groqFallbackConfigured, groqFallbackCooldownActive })) {
+      claimableTypes.push('ENRICH_CHANNEL');
+      // Classification jobs perform the same semantic work and consult the
+      // same route health. The flag only stops NEW enqueues; every durable
+      // classification already queued must stay claimable so a rollback drains
+      // instead of stranding PENDING jobs behind the legacy inline path.
+      if (!claimableOverride || claimableOverride.includes(CLASSIFICATION_JOB_TYPE)) claimableTypes.push(CLASSIFICATION_JOB_TYPE);
+    }
   }
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('RESOLVE_STAGED_CANDIDATE'))) claimableTypes.push('RESOLVE_STAGED_CANDIDATE');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('POST_APPROVAL_ENRICH')) claimableTypes.push('POST_APPROVAL_ENRICH');
@@ -1296,6 +1479,11 @@ export async function processNextSearchJob(
         }
       }
       await completeJob(job.id); return true;
+    }
+    if (job.type === CLASSIFICATION_JOB_TYPE) {
+      await processClassificationJob(job);
+      await completeJob(job.id);
+      return true;
     }
     if (job.type === 'MANUAL_SEARCH_PAGE') {
       const sessionId = String(job.payload.sessionId || '');
@@ -1763,6 +1951,12 @@ export async function processNextSearchJob(
     const sightings = [];
     const deferredChannelIds = new Set<string>();
     const channelLoopStartMs = Date.now();
+    // Phase 3 is inert by default: disabled means the exact legacy inline loop.
+    // When enabled, backpressure state is read once per page and adjusted
+    // locally per enqueue; WORKING-style slight overrun is bounded by one page
+    // per search worker.
+    const classificationDecoupling = resolveClassificationDecouplingConfig();
+    let classificationBackpressure: ClassificationBackpressureState | null = null;
     for (const [index, raw] of distinctExtracted.entries()) {
       // A durable nomination is written before channel processing. When the
       // ledger is OFF, legacy channel_sightings remain the compatibility path.
@@ -1772,15 +1966,41 @@ export async function processNextSearchJob(
         country,declaredLanguage:raw.detectedLanguages?.[0]?.language,retrievalLane,searchOrdering,pageNumber,resultRank:index+1,
         matchedDocument:raw.matchedDocument||{type:'UNKNOWN'},rawObservation:{channelName:raw.channelName,youtubeUrl:raw.youtubeUrl,locationTag:raw.locationTag||null}},'INVESTIGATION_QUEUED');
       raw.nominationId=nomination.id||undefined;raw.queryRunId=queryRunId;raw.queryPageNumber=pageNumber;raw.discoveryJobId=job.id;
-      const outcome = await processDiscoveredChannelContained(raw, country, source, { forceExtraction: isRepairEligibleRetry(job) });
+      let outcome: ProcessDiscoveredChannelOutcome | null;
+      let classificationPending = false;
+      if (classificationDecoupling.enabled) {
+        if (!classificationBackpressure) {
+          classificationBackpressure = await getClassificationBackpressureState(
+            classificationQueryScopeKey({ queryRunId, queryId, query, country }),
+          );
+        }
+        const admitted = await admitDiscoveredChannel({
+          raw,
+          targetCountry: country,
+          source,
+          query,
+          queryRunId,
+          queryId,
+          discoveryJobId: job.id,
+          catalogPin: job.payload.catalogPin,
+          forceExtraction: isRepairEligibleRetry(job),
+          backpressure: classificationBackpressure,
+        });
+        outcome = admitted.outcome;
+        classificationPending = admitted.pending;
+      } else {
+        outcome = await processDiscoveredChannelContained(raw, country, source, { forceExtraction: isRepairEligibleRetry(job) });
+      }
       // A sticky-PROBE channel refused by its own allocation is deferred for
       // this run; the rest of the NORMAL page must still be processed. Keep it
       // out of yield/duplicate math: it was not evaluated, and counting it as
       // a duplicate can stop pagination before later normal results.
       if (!outcome) { deferredChannelIds.add(raw.channelId); continue; }
-      const funnelOutcome: FunnelOutcome = outcome.countryStatus === 'REJECTED'
-        ? 'COUNTRY_REJECTED'
-        : outcome.tradingStatus === 'HUMAN_REJECTED' ? 'NON_TRADING' : outcome.tradingStatus;
+      const funnelOutcome: FunnelOutcome = classificationPending
+        ? 'CLASSIFICATION_PENDING'
+        : outcome.countryStatus === 'REJECTED'
+          ? 'COUNTRY_REJECTED'
+          : outcome.tradingStatus === 'HUMAN_REJECTED' ? 'NON_TRADING' : outcome.tradingStatus;
       const qualityScore = outcome.channelRecord?.quality_score || 0;
       const hasCommunity = outcome.discordStatus === 'ACTIVE' || outcome.discordStatus === 'ACTIVE_LOW_VOLUME';
       observations.push({ channelId: outcome.channelId, wasKnown: outcome.wasKnown, persisted: outcome.persisted, funnelOutcome, qualityScore, hasCommunity, scopeEligibility: resolveScopeEligibility(outcome.channelRecord?.country ?? outcome.detectedCountry ?? null) });
@@ -1792,7 +2012,11 @@ export async function processNextSearchJob(
           source,
           country,
           targetCountry: country,
-          detectedCountry: outcome.detectedCountry || outcome.channelRecord?.country || raw.locationTag || null,
+          // Pending truth must not claim the retrieval target as creator
+          // country; only reconciled classification may fill that in.
+          detectedCountry: classificationPending
+            ? (outcome.detectedCountry || null)
+            : (outcome.detectedCountry || outcome.channelRecord?.country || raw.locationTag || null),
           rejectionReason: outcome.countryStatus === 'REJECTED' ? (outcome.rejectionReason || outcome.channelRecord?.inspection_trail?.find(t => t.step === 'COUNTRY_VALIDATION')?.details || undefined) : undefined,
           retrievalLane,
           searchOrdering
@@ -2118,8 +2342,17 @@ export async function processNextSearchJob(
     if (err instanceof ExcludedCountryError) {
       // A policy change can make an already-persisted job ineligible. Consume it
       // without retrying so it can never spend external API quota.
-      const runId = String(job.payload?.queryRunId || '');
+      // Classification jobs never own the search run: the run already completed
+      // before classification started, so a later policy change must not fail it.
+      const runId = job.type === CLASSIFICATION_JOB_TYPE ? '' : String(job.payload?.queryRunId || '');
       if (runId) await failQueryRun(runId, err, true);
+      if (job.type === CLASSIFICATION_JOB_TYPE) {
+        const channelId = String(job.payload?.channelId || '');
+        if (channelId) {
+          await deleteClassificationPlaceholder(channelId).catch(() => undefined);
+          await reconcileClassificationSighting({channelId,funnelOutcome:'COUNTRY_REJECTED',countryOutcome:'REJECTED',tradingOutcome:'UNCERTAIN',persisted:false,jobId:job.id}).catch(() => undefined);
+        }
+      }
       if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:'POLICY_REJECTED',output:{reason:'COUNTRY_POLICY_CHANGED'}});else await completeJob(job.id);
       return true;
     }
@@ -2156,12 +2389,28 @@ export async function processNextSearchJob(
           .catch(error=>console.warn(`[CandidateAdmission] operational-failure shadow write failed for ${channelId}:`,error instanceof Error?error.message:error));
       }
     }
+    if (job.type === CLASSIFICATION_JOB_TYPE && terminal) {
+      const channelId = String(job.payload?.channelId || '');
+      const channel = channelId ? await getChannelById(channelId) : null;
+      if (channel && channel.trading_status === 'UNCERTAIN' && channel.scan_status === 'CLASSIFICATION_PENDING') {
+        channel.scan_status = isProviderDeferredEnrichmentError(err) ? 'PROVIDER_DEFERRED' : 'FAILED';
+        channel.trading_status = 'UNCERTAIN';
+        channel.scan_attempts = job.attempts;
+        channel.last_checked = new Date().toISOString();
+        await upsertChannel(channel);
+        void recordAdmissionShadow({channelId,priorState:'NOT_EVALUATED',classificationStatus:'UNCERTAIN',investigationState:'OPERATIONALLY_BLOCKED',operationalFailure:true,candidateHypothesis:{},evidenceCoverage:{failureClass:String(err?.code||err?.name||'WORKER_FAILURE'),stage:'CLASSIFY_DISCOVERED_CHANNEL'}})
+          .catch(error=>console.warn(`[CandidateAdmission] classification-failure shadow write failed for ${channelId}:`,error instanceof Error?error.message:error));
+      }
+      if (channelId) {
+        await reconcileClassificationResult({channelId,jobId:job.id,channel,persisted:Boolean(channel)});
+      }
+    }
     if (job.type === 'RETRY_COMMUNITY_ACQUISITION' && terminal) {
       const channelId=String(job.payload?.channelId||'');
       const channel=channelId?await getChannelById(channelId):null;
       if(channel)await upsertChannel(projectTerminalCommunityRetryFailure(channel,job.attempts,new Date().toISOString()));
     }
-    const runId = String(job.payload?.queryRunId || '');
+    const runId = job.type === CLASSIFICATION_JOB_TYPE ? '' : String(job.payload?.queryRunId || '');
     if (runId) await failQueryRun(runId, err, terminal);
     return false;
   } finally {
@@ -2736,6 +2985,77 @@ export async function processDiscoveredChannel(
   options?: PipelineExecutionOptions
 ): Promise<ProcessDiscoveredChannelOutcome> {
   return processChannelThroughPipeline(raw, targetCountry, source, false, false, options);
+}
+
+/**
+ * Reconciles every provisional sighting for a channel to its durable terminal
+ * outcome after classification completes or fails. Deliberately best-effort:
+ * the channel row is authoritative, and a sighting update failure must not
+ * rerun semantic classification.
+ */
+async function reconcileClassificationResult(input: {
+  channelId: string;
+  jobId: string;
+  channel?: ChannelRecord | null;
+  outcome?: ProcessDiscoveredChannelOutcome | null;
+  persisted: boolean;
+}): Promise<void> {
+  const countryStatus = input.channel?.country_status || input.outcome?.countryStatus || 'UNCERTAIN';
+  const tradingStatus = input.channel?.trading_status || input.outcome?.tradingStatus || 'UNCERTAIN';
+  try {
+    await reconcileClassificationSighting({
+      channelId: input.channelId,
+      funnelOutcome: mapClassificationOutcomeToFunnelOutcome({ countryStatus, tradingStatus }),
+      countryOutcome: countryStatus,
+      tradingOutcome: tradingStatus,
+      persisted: input.persisted,
+      jobId: input.jobId,
+    });
+  } catch (error) {
+    console.warn(JSON.stringify({
+      event: 'classification_sighting_reconcile_failed',
+      channelId: input.channelId,
+      jobId: input.jobId,
+      reason: String(error instanceof Error ? error.message : error).slice(0, 300),
+      timestamp: new Date().toISOString(),
+    }));
+  }
+}
+
+/**
+ * Durable classification worker: runs the same unified pipeline as the legacy
+ * inline path, then reconciles the exemplary search sighting. The insert-only
+ * provisional row written by the search worker guarantees quota provenance;
+ * the pipeline remains the only writer of semantic outcomes.
+ */
+export async function processClassificationJob(job: DurableJob): Promise<void> {
+  const payload = job.payload as ClassificationJobPayload;
+  const channelId = String(payload?.channelId || '');
+  if (!channelId || !payload?.candidate) return;
+  await assertCountryAllowed(String(payload.targetCountry || ''), `classification_worker:${job.id}`);
+  const outcome = await processChannelThroughPipeline(
+    payload.candidate,
+    payload.targetCountry,
+    payload.source,
+    false,
+    false,
+    {
+      forceExtraction: payload.forceExtraction === true || isRepairEligibleRetry(job),
+      jobId: job.id,
+      runId: payload.queryRunId,
+      quotaOrigin: payload.quotaOrigin,
+    },
+  );
+  const channel = outcome.channelRecord || await getChannelById(channelId);
+  if (!outcome.persisted || !channel) {
+    // Retrieval triage or a non-persisted policy rejection leaves no semantic
+    // verdict. Remove the untouched placeholder so a later independent
+    // rediscovery can classify it with fresh evidence.
+    await deleteClassificationPlaceholder(channelId).catch(() => undefined);
+    await reconcileClassificationResult({ channelId, jobId: job.id, channel: null, outcome, persisted: false });
+    return;
+  }
+  await reconcileClassificationResult({ channelId, jobId: job.id, channel, outcome, persisted: true });
 }
 
 /**
@@ -4345,22 +4665,12 @@ export async function executeFullManualSearch(userQuery: string, countryName: st
   return { session, traceId, message: 'Manual discovery is queued; page 1 and all continuation pages will run in the high-priority durable queue.' };
 }
 
-/** Default search workers when SEARCH_WORKER_CONCURRENCY is unset. */
-export const SEARCH_WORKER_CONCURRENCY_DEFAULT = 4;
-/** Resolve the search worker count from env (pure; explicit env wins, unset resolves to the default). */
-export function resolveSearchWorkerCount(env: NodeJS.ProcessEnv = process.env): number {
-  return Math.max(1, Number(env.SEARCH_WORKER_CONCURRENCY || SEARCH_WORKER_CONCURRENCY_DEFAULT));
-}
-/** Default enrichment workers when ENRICHMENT_WORKER_CONCURRENCY is unset. */
-export const ENRICHMENT_WORKER_CONCURRENCY_DEFAULT = 3;
-/** Resolve the enrichment worker count from env (pure; env override wins). */
-export function resolveEnrichmentWorkerCount(env: NodeJS.ProcessEnv = process.env): number {
-  return Math.max(1, Number(env.ENRICHMENT_WORKER_CONCURRENCY || ENRICHMENT_WORKER_CONCURRENCY_DEFAULT));
-}
-function startWorkerPool(type: 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE', concurrency: number, extraClaimableTypes: ClaimableSearchJobType[] = []): void {
+export { SEARCH_WORKER_CONCURRENCY_DEFAULT, ENRICHMENT_WORKER_CONCURRENCY_DEFAULT, resolveSearchWorkerCount, resolveEnrichmentWorkerCount } from './classificationDecoupling';
+
+function startWorkerPool(type: 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE', concurrency: number, extraClaimableTypes: ClaimableSearchJobType[] = [], workerPrefix?: string): void {
   const safeConcurrency = Math.min(20, Math.max(1, Math.floor(concurrency) || 1));
   for (let index = 0; index < safeConcurrency; index++) {
-    const workerId = `${type.toLowerCase()}_${process.pid}_${index}`;
+    const workerId = `${(workerPrefix || type).toLowerCase()}_${process.pid}_${index}`;
     const tick = async () => {
       try {
         await processNextSearchJob([type, ...extraClaimableTypes], workerId);
@@ -4394,5 +4704,15 @@ export function startSearchWorkers(): void {
   // per completion (~10.8/hr per worker), so 3 workers burst ~30/hr against
   // ample provider headroom while staying within daily YouTube (~107k/day at
   // full tilt vs 300k pool) and browser-gate bounds. Env override still wins.
-  startWorkerPool('ENRICH_CHANNEL', resolveEnrichmentWorkerCount());
+  //
+  // Phase 3 keeps the total unchanged and splits claim preference:
+  //   2 shared workers claim CLASSIFY_DISCOVERED_CHANNEL first (priority 15),
+  //   then ENRICH_CHANNEL; 1 backlog worker claims ENRICH_CHANNEL only.
+  // With the flag off, one shared worker still drains old classification jobs
+  // while two workers keep the pre-existing ENRICH backlog moving.
+  const decoupling = resolveClassificationDecouplingConfig();
+  const enrichmentWorkers = resolveEnrichmentWorkerCount();
+  const enrichmentSplit = resolveEnrichmentWorkerSplit(enrichmentWorkers, decoupling.enabled);
+  startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.classificationWorkers, [CLASSIFICATION_JOB_TYPE], 'enrich_channel_shared');
+  startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.enrichmentOnlyWorkers, [], 'enrich_channel_backlog');
 }

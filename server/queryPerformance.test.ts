@@ -31,6 +31,19 @@ test('query funnel keeps duplicates, known channels, exclusions, and classificat
   assert.equal(metrics.tradingPrecision, 1 / 4);
 });
 
+test('pending classifications count as persisted new creators but not as evaluated verdicts', () => {
+  const metrics = calculateQueryFunnel(2, [
+    { channelId: 'pending', wasKnown: false, persisted: true, funnelOutcome: 'CLASSIFICATION_PENDING', qualityScore: 0, hasCommunity: false },
+    { channelId: 'known-confirmed', wasKnown: true, persisted: true, funnelOutcome: 'TRADING_CONFIRMED', qualityScore: 80, hasCommunity: true },
+  ]);
+  assert.equal(metrics.classificationPending, 1);
+  assert.equal(metrics.newChannels, 1, 'a durable pending row is a real new creator');
+  assert.equal(metrics.distinctResults, 2);
+  assert.equal(metrics.uncertain, 0, 'pending is not a semantic uncertainty verdict');
+  assert.equal(metrics.tradingPrecision, 1, 'pending must not dilute precision');
+  assert.equal(metrics.qualityChannels, 1);
+});
+
 test('fresh confirmed is the exact creator intersection, not min(confirmed,new)', () => {
   const observations: QueryObservation[] = [
     ...Array.from({ length: 5 }, (_, index) => ({

@@ -1,7 +1,7 @@
 import type { QueryCollection } from '../src/types';
 import { canPromoteToProven, isContaminatedRun } from './queryQuality/accounting';
 
-export type FunnelOutcome = 'COUNTRY_REJECTED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW' | 'TRADING_CONFIRMED';
+export type FunnelOutcome = 'COUNTRY_REJECTED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW' | 'TRADING_CONFIRMED' | 'CLASSIFICATION_PENDING';
 
 /** Authoritative production threshold for a trading-confirmed creator to count as quality. */
 export const QUALITY_CREATOR_SCORE_THRESHOLD = 55;
@@ -84,6 +84,14 @@ export interface QueryFunnelMetrics {
   needsReview: number;
   tradingConfirmed: number;
   /**
+   * Discoveries whose classification is durably queued. They count as new
+   * creators (persisted, not previously known) so a productive page is not
+   * mistaken for a low-yield page, but they are excluded from `evaluated`
+   * because no semantic verdict exists yet. Later classification reconciles
+   * the persisted sighting to its terminal outcome.
+   */
+  classificationPending?: number;
+  /**
    * Exact intersection of persisted NEW creators and TRADING_CONFIRMED
    * creators for this funnel. Optional for legacy/manual metrics that predate
    * the field; absent means the intersection is unknown and must not be
@@ -132,6 +140,10 @@ export function calculateQueryFunnel(
   const uncertain = count('UNCERTAIN');
   const needsReview = count('NEEDS_REVIEW');
   const tradingConfirmed = count('TRADING_CONFIRMED');
+  const classificationPending = count('CLASSIFICATION_PENDING');
+  // Pending classifications are observations with no semantic verdict yet.
+  // They stay in distinct/new/duplicate accounting (a real provider result)
+  // but must not dilute precision or suggest a trading outcome.
   const evaluated = nonTrading + uncertain + needsReview + tradingConfirmed;
   const persisted = values.filter(value => value.persisted);
   const fresh = values.filter(value => value.persisted && !value.wasKnown);
@@ -182,6 +194,7 @@ export function calculateQueryFunnel(
     uncertain,
     needsReview,
     tradingConfirmed,
+    classificationPending,
     freshTradingConfirmed,
     qualityChannels,
     communitiesDiscovered,

@@ -1,6 +1,7 @@
 import {
   getChannelById,
   getDb,
+  reconcileStaleClassificationSightings,
   recoverStaleChannelLocks,
   upsertChannel
 } from './db';
@@ -29,6 +30,8 @@ export interface OperationalMaintenanceDependencies {
   reconcileOperationalEnrichmentRecovery(): Promise<unknown>;
   triggerPhaseBObservationReconciliation(): unknown;
   resumeOrphanedAutonomousPages(): Promise<unknown>;
+  /** Optional so existing scheduler fixtures remain valid. */
+  reconcileStaleClassificationSightings?(): Promise<unknown>;
 }
 
 export interface OperationalMaintenanceSnapshot {
@@ -179,6 +182,7 @@ export function createOperationalMaintenanceScheduler(
     // headroom, so this maintenance sweep cannot exceed the producer
     // watermark even when no explicit limit is supplied.
     await isolate('autonomous_orphan_resume', () => dependencies.resumeOrphanedAutonomousPages());
+    await isolate('classification_sighting_reconciliation', () => dependencies.reconcileStaleClassificationSightings?.());
   };
 
   const run = (): Promise<void> => {
@@ -238,6 +242,10 @@ export function createOperationalMaintenanceScheduler(
   return { run, start, stop, snapshot };
 }
 
+/** Delayed reconciliation is minute-scale; avoid a full-scan every 10s tick. */
+let lastClassificationSightingSweepAt = 0;
+const CLASSIFICATION_SIGHTING_SWEEP_INTERVAL_MS = 60_000;
+
 function createDefaultDependencies(): OperationalMaintenanceDependencies {
   return {
     recoverStaleChannelLocks: () => recoverStaleChannelLocks(),
@@ -278,7 +286,13 @@ function createDefaultDependencies(): OperationalMaintenanceDependencies {
       Date.now()
     ),
     triggerPhaseBObservationReconciliation: () => triggerPhaseBObservationReconciliation(),
-    resumeOrphanedAutonomousPages: () => resumeOrphanedAutonomousPages()
+    resumeOrphanedAutonomousPages: () => resumeOrphanedAutonomousPages(),
+    reconcileStaleClassificationSightings: () => {
+      const now = Date.now();
+      if (now - lastClassificationSightingSweepAt < CLASSIFICATION_SIGHTING_SWEEP_INTERVAL_MS) return Promise.resolve({ reconciled: 0, orphaned: 0 });
+      lastClassificationSightingSweepAt = now;
+      return reconcileStaleClassificationSightings(200);
+    }
   };
 }
 
