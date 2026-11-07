@@ -122,6 +122,16 @@ function requireDatabaseUrl(): string {
   return url;
 }
 
+/**
+ * TLS policy shared by the runtime and operator-report pools in this module.
+ * Scripts under scripts/ create their own pools and do not use this helper, so
+ * a hardening change here must be mirrored there.
+ */
+function postgresSslOptions(): false | { rejectUnauthorized: false } | undefined {
+  if (process.env.PGSSL === 'disable') return false;
+  return process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined;
+}
+
 export async function getDb(): Promise<InstanceType<typeof Pool>> {
   // `pool` is assigned before connectivity checks, migrations, and default-data
   // seeding finish. Always join an in-flight initialization before exposing it;
@@ -131,7 +141,7 @@ export async function getDb(): Promise<InstanceType<typeof Pool>> {
   if (pool) return pool;
   initPromise = (async () => {
     const connectionString = requireDatabaseUrl();
-    pool = new Pool({ connectionString, ssl: process.env.PGSSL === 'disable' ? false : process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined });
+    pool = new Pool({ connectionString, ssl: postgresSslOptions() });
     try {
       await waitForPostgresReady(pool);
       await runMigrations();
@@ -146,6 +156,23 @@ export async function getDb(): Promise<InstanceType<typeof Pool>> {
     }
   })();
   return initPromise;
+}
+
+/**
+ * Dedicated operator-reporting pool. Unlike getDb(), this never runs
+ * migrations or seeds defaults, so an advertised read-only report cannot
+ * mutate the database during connection initialization. The server-side
+ * default makes every transaction read-only as defense in depth; callers
+ * should still open an explicit REPEATABLE READ READ ONLY snapshot.
+ */
+export function createReadOnlyDbPool(): InstanceType<typeof Pool> {
+  return new Pool({
+    connectionString: requireDatabaseUrl(),
+    ssl: postgresSslOptions(),
+    max: 1,
+    application_name: 'phase0-url-work-ledger-report',
+    options: '-c default_transaction_read_only=on',
+  });
 }
 
 export function saveDb(): void {
