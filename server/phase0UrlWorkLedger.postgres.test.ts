@@ -246,6 +246,7 @@ maybe('the read-only report projects and reconciles a fixture backlog', async t 
         retryable: true,
         failureClass: 'NETWORK_FAILURE',
         required: true,
+        observedAt: `now() - interval '2 minutes'`,
         telemetry: { mode: 'RENDERED', pagesInspected: 0, requestsStarted: 1, requestsFinished: 1 },
       },
       {

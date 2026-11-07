@@ -373,9 +373,13 @@ export async function buildPhase0UrlWorkLedgerReport(
          FROM windowed
         WHERE observed_at >= latest_inspection_at - interval '5 minutes'
      ),
-     -- Mirror production effectiveAcquisitionOutcomes: any FOUND wins; else
-     -- required observations dominate optional notes; an unevidenced clean
-     -- only wins when it is all that remains.
+     -- Mirror the projection helper selectEffectiveInspectionObservation:
+     -- any FOUND wins; else required observations dominate optional notes; an
+     -- unevidenced clean only wins when it is all that remains. This bound
+     -- deliberately omits production effectiveAcquisitionOutcomes' fallback
+     -- collapse to PARTIALLY_INSPECTED, shared-clean shortcut, and later-gap
+     -- carry-over; those residuals stay inside the tolerated reconciliation
+     -- delta rather than being reimplemented in SQL.
      pooled AS (
        SELECT current_inspection.*,
               max((outcome = 'FOUND')::int) OVER w AS has_found,
