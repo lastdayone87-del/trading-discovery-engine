@@ -92,6 +92,9 @@ test('the SQL bound keeps path-only URL normalization and all-observation browse
   assert.match(telemetrySql, /jsonb_typeof\(.*\) = 'number'/);
   assert.match(telemetrySql, /floor\(.*::numeric\) > 0/);
   assert.doesNotMatch(telemetrySql, /::int ELSE 0 END/);
+  assert.match(telemetrySql, /raw_all AS/);
+  assert.match(telemetrySql, /admitted AS/);
+  assert.match(telemetrySql, /JOIN admitted/);
   assert.match(telemetrySql, /latest_inspection_at/);
   assert.match(telemetrySql, /interval '5 minutes'/);
   assert.match(telemetrySql, /id DESC/);
@@ -99,8 +102,13 @@ test('the SQL bound keeps path-only URL normalization and all-observation browse
 
   const rawSql = queries.find(sql => sql.includes('o.requested_url,') && sql.includes('o.provenance'));
   assert.ok(rawSql);
-  assert.match(rawSql, /COALESCE\(o\.provenance->>'required','false'\) = 'true'/);
+  assert.match(rawSql, /COALESCE\(o\.provenance->>'surface',''\) = ANY/);
   assert.match(rawSql, /\^https\?:\/\//);
+  assert.doesNotMatch(
+    rawSql,
+    /COALESCE\(o\.provenance->>'required','false'\) = 'true'/,
+    'admission is decided per work key, not per observation',
+  );
 
   const discoveredSql = queries.find(sql => sql.includes('creator_site_links') && sql.includes('count(DISTINCT'));
   assert.ok(discoveredSql);

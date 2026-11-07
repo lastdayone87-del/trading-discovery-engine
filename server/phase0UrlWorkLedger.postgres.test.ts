@@ -201,6 +201,26 @@ maybe('the read-only report projects and reconciles a fixture backlog', async t 
         telemetry: { mode: 'STATIC', pagesInspected: 1, requestsStarted: 0, requestsFinished: 0 },
       },
       {
+        key: `phase0-ledger-recovered-gap-partial-${suffix}`,
+        url: 'https://recovered-gap.example/',
+        outcome: 'PARTIALLY_INSPECTED',
+        retryable: true,
+        failureClass: 'STATIC_BUDGET_GAP',
+        required: false,
+        observedAt: `now() - interval '2 minutes'`,
+        telemetry: { mode: 'STATIC', pagesInspected: 1, requestsStarted: 0, requestsFinished: 0 },
+      },
+      {
+        key: `phase0-ledger-recovered-gap-found-${suffix}`,
+        url: 'https://recovered-gap.example/',
+        outcome: 'FOUND',
+        retryable: false,
+        failureClass: null,
+        required: false,
+        observedAt: `now() - interval '1 minute'`,
+        telemetry: { mode: 'RENDERED', pagesInspected: 2, requestsStarted: 2, requestsFinished: 2 },
+      },
+      {
         key: `phase0-ledger-oversized-${suffix}`,
         url: 'https://oversized.example/',
         outcome: 'ACQUISITION_FAILED',
@@ -267,7 +287,7 @@ maybe('the read-only report projects and reconciles a fixture backlog', async t 
   assert.ok(report.rows, 'includeRows must return the projection rows');
 
   const rows = report.rows.filter(row => row.channelId === channelId);
-  assert.equal(rows.length, 7, 'optional observations never become ledger work');
+  assert.equal(rows.length, 8, 'optional observations never create a work row by themselves');
   const byUrl = new Map(rows.map(row => [row.normalizedUrl, row]));
   assert.equal(byUrl.get('https://found.example/links')?.state, 'RESOLVED');
   assert.equal(byUrl.get('https://found.example/links')?.neverExecuted, false);
@@ -294,6 +314,13 @@ maybe('the read-only report projects and reconciles a fixture backlog', async t 
   assert.equal(byUrl.get('https://static-gap.example/')?.state, 'PENDING');
   assert.equal(byUrl.get('https://static-gap.example/')?.retryOwned, true);
   assert.equal(byUrl.get('https://static-gap.example/')?.attempts, 1);
+  // Optional recovery evidence for an admitted static-gap URL must resolve it.
+  assert.equal(byUrl.get('https://recovered-gap.example/')?.state, 'RESOLVED');
+  assert.equal(byUrl.get('https://recovered-gap.example/')?.lastOutcome, 'FOUND');
+  assert.equal(byUrl.get('https://recovered-gap.example/')?.retryOwned, false);
+  assert.equal(byUrl.get('https://recovered-gap.example/')?.attempts, 2);
+  assert.equal(byUrl.get('https://recovered-gap.example/')?.neverExecuted, false);
+  assert.equal(byUrl.get('https://recovered-gap.example/')?.neverBrowserExecuted, false);
   assert.equal(byUrl.get('https://oversized.example/')?.state, 'PENDING');
   assert.equal(byUrl.get('https://oversized.example/')?.neverExecuted, true);
   assert.equal(byUrl.get('https://oversized.example/')?.neverBrowserExecuted, true);

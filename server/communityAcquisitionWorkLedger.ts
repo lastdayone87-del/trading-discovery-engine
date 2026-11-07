@@ -12,7 +12,8 @@
  *   * Required, community-surface work belongs in this ledger. Production's
  *     narrow `STATIC_BUDGET_GAP` exception is included even when
  *     `required=false` because that gap owns a bounded retry in production.
- *     Other optional or borrowed observations never inflate the backlog.
+ *     Other optional or borrowed observations never create a work row, but
+ *     later optional evidence for an already-admitted URL can still resolve it.
  *   * `neverExecuted` clears only when direct processed evidence exists. A
  *     request that started, or a fetch that returned transport metadata, is
  *     not inspection evidence. Borrowed (`sharedEvidenceFrom`) rows are not
@@ -468,19 +469,22 @@ export function projectCommunityAcquisitionWork(
     observations: CommunityWorkObservation[];
   }>();
   let skippedRows = 0;
+  const admittedKeys = new Set<string>();
+  const candidates: Array<{
+    workKey: string;
+    channelId: string;
+    normalizedUrl: string;
+    url: string;
+    surface: string;
+    observation: CommunityWorkObservation;
+  }> = [];
 
+  // First pass: validate identity and decide which work keys exist. A key is
+  // admitted by required work or the static-gap exception. Optional evidence
+  // for a different URL never creates a row.
   for (const observation of observations) {
     const surface = surfaceFromObservation(observation);
     if (!surfaces.has(surface)) {
-      skippedRows++;
-      continue;
-    }
-    // Optional/auxiliary observations are not backlog work. Shared-evidence
-    // rows still describe real work (and may carry a FOUND outcome), but their
-    // borrowed counters never count as this URL's execution or attempt. The
-    // static-budget-gap exception is production retry work even when the seed
-    // is not required.
-    if (!isCommunityLedgerWorkObservation(observation)) {
       skippedRows++;
       continue;
     }
@@ -495,16 +499,36 @@ export function projectCommunityAcquisitionWork(
       continue;
     }
     const workKey = communityAcquisitionWorkKey(channelId, normalizedUrl, surface);
-    const existing = grouped.get(workKey);
+    if (isCommunityLedgerWorkObservation(observation)) admittedKeys.add(workKey);
+    candidates.push({
+      workKey,
+      channelId,
+      normalizedUrl,
+      url: String(observation.requestedUrl),
+      surface,
+      observation,
+    });
+  }
+
+  // Second pass: keep every observation for an admitted key, even optional
+  // ones. Static seeds recover with required=false FOUND/INSPECTED_NO_MATCH
+  // rows; dropping them would leave an old static gap looking retry-owned
+  // forever. Shared-evidence counters remain non-billable inside the group.
+  for (const candidate of candidates) {
+    if (!admittedKeys.has(candidate.workKey)) {
+      skippedRows++;
+      continue;
+    }
+    const existing = grouped.get(candidate.workKey);
     if (existing) {
-      existing.observations.push(observation);
+      existing.observations.push(candidate.observation);
     } else {
-      grouped.set(workKey, {
-        channelId,
-        normalizedUrl,
-        url: String(observation.requestedUrl),
-        surface,
-        observations: [observation],
+      grouped.set(candidate.workKey, {
+        channelId: candidate.channelId,
+        normalizedUrl: candidate.normalizedUrl,
+        url: candidate.url,
+        surface: candidate.surface,
+        observations: [candidate.observation],
       });
     }
   }

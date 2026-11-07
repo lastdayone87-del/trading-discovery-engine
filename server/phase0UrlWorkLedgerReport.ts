@@ -169,24 +169,27 @@ function safeCounterSql(jsonbExpression: string): string {
 }
 
 /**
- * Required community observations plus production's narrow static-gap
- * exception. A no-authority URL (`https://`, `https:///x`) is excluded here
- * because `normalizeCommunityWorkUrl` rejects it; silently dropping it from
- * only one side of the reconciliation would create a phantom delta.
+ * Community-surface observations with a valid work URL. A no-authority URL
+ * (`https://`, `https:///x`) is excluded here because
+ * `normalizeCommunityWorkUrl` rejects it; silently dropping it from only one
+ * side of the reconciliation would create a phantom delta.
+ *
+ * Admission to the ledger is decided per work key: required work or the
+ * static-gap exception admits the key, then every observation for that key is
+ * kept so later optional recovery evidence can resolve it.
  */
 const LEDGER_COMMUNITY_OBSERVATION_WHERE = `
   COALESCE(o.requested_url,'') <> ''
   AND COALESCE(o.requested_url,'') ~* '^https?://'
   AND substring(trim(COALESCE(o.requested_url,'')) from '^[A-Za-z][A-Za-z0-9+.-]*://[^/?#]+') IS NOT NULL
   AND COALESCE(o.provenance->>'surface','') = ANY($2::text[])
-  AND (
-    COALESCE(o.provenance->>'required','false') = 'true'
-    OR (
-      o.outcome = 'PARTIALLY_INSPECTED'
-      AND COALESCE(o.failure_class,'') = 'STATIC_BUDGET_GAP'
-      AND o.retryable
-    )
-  )
+`;
+
+const LEDGER_ADMITTED_WORK_CONDITION = `
+  required
+  OR (outcome = 'PARTIALLY_INSPECTED'
+    AND failure_class = 'STATIC_BUDGET_GAP'
+    AND retryable)
 `;
 
 /**
@@ -297,7 +300,7 @@ export async function buildPhase0UrlWorkLedgerReport(
         WHERE type='RETRY_COMMUNITY_ACQUISITION'
           AND status IN ('PENDING','PROCESSING')
      ),
-     raw AS (
+     raw_all AS (
        SELECT o.id,
               o.channel_id,
               COALESCE(o.provenance->>'surface','') AS surface,
@@ -322,6 +325,19 @@ export async function buildPhase0UrlWorkLedgerReport(
          JOIN pending ON pending.channel_id = o.channel_id
         WHERE o.observed_at > now() - ($1::text || ' days')::interval
           AND ${LEDGER_COMMUNITY_OBSERVATION_WHERE}
+     ),
+     admitted AS (
+       SELECT DISTINCT channel_id, surface, normalized_url
+         FROM raw_all
+        WHERE ${LEDGER_ADMITTED_WORK_CONDITION}
+     ),
+     raw AS (
+       SELECT raw_all.*
+         FROM raw_all
+         JOIN admitted
+           ON admitted.channel_id = raw_all.channel_id
+          AND admitted.surface = raw_all.surface
+          AND admitted.normalized_url = raw_all.normalized_url
      ),
      grouped AS (
        SELECT channel_id,

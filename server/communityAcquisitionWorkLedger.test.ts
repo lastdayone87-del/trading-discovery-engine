@@ -162,6 +162,39 @@ test('borrowed shared evidence never counts as execution or an attempt', () => {
   assert.equal(rows[0].retryOwned, false);
 });
 
+test('later optional recovery evidence resolves an admitted static-gap key', () => {
+  const gap = observation({
+    observedAt: '2026-11-01T00:00:00.000Z',
+    outcome: 'PARTIALLY_INSPECTED',
+    failureClass: 'STATIC_BUDGET_GAP',
+    provenance: {
+      surface: 'CREATOR_WEBSITES',
+      required: false,
+      crawlerTelemetry: { mode: 'STATIC', pagesInspected: 1, requestsStarted: 0, requestsFinished: 0 },
+    },
+  });
+  const laterFound = observation({
+    observedAt: '2026-11-01T00:01:00.000Z',
+    outcome: 'FOUND',
+    failureClass: null,
+    retryable: false,
+    provenance: {
+      surface: 'CREATOR_WEBSITES',
+      required: false,
+      crawlerTelemetry: { mode: 'RENDERED', pagesInspected: 2, requestsStarted: 2, requestsFinished: 2 },
+    },
+  });
+  const { rows, stats } = projectCommunityAcquisitionWork([gap, laterFound]);
+  assert.equal(stats.skippedRows, 0, 'optional evidence for an admitted key is not discarded');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].state, 'RESOLVED');
+  assert.equal(rows[0].lastOutcome, 'FOUND');
+  assert.equal(rows[0].retryOwned, false, 'the completed URL is no longer retry work');
+  assert.equal(rows[0].observations, 2);
+  assert.equal(rows[0].neverExecuted, false);
+  assert.equal(rows[0].neverBrowserExecuted, false);
+});
+
 test('only required community observations become backlog work', () => {
   const { rows, stats } = projectCommunityAcquisitionWork([
     observation({
