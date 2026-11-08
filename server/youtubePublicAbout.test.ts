@@ -5,8 +5,10 @@ import {
   isChannelDescriptionInsufficient,
   parseYouTubeChannelAboutFromHtml,
   shouldAttemptPublicAboutCountryFallback,
-  fetchLiveYouTubeChannelData
+  fetchLiveYouTubeChannelData,
+  youtubeChannelAboutUrl
 } from './youtubePublicAbout';
+import { MAX_CRAWL_RESPONSE_CHARS } from './crawlResponseBounds';
 import { inferChannelCountry } from './countryInference';
 
 /** Mirrors creatorLevelCountryEvidence About wiring without importing db-backed validator. */
@@ -166,6 +168,135 @@ test('D: network error soft-fails to null', async () => {
     }
   );
   assert.equal(live, null);
+});
+
+test('D: About acquisition requests the /about tab and preserves scheme-less links', async () => {
+  const requested: string[] = [];
+  const aboutHtml = `<script>var ytInitialData = ${JSON.stringify({
+    metadata: { channelMetadataRenderer: { description: 'BigShort bio' } },
+    links: [{ channelExternalLinkViewModel: { link: { content: 'bigshort.com' } } }]
+  })};</script>`;
+  const live = await fetchLiveYouTubeChannelData(
+    'https://www.youtube.com/channel/UC_test',
+    false,
+    (async (input: RequestInfo | URL) => {
+      requested.push(String(input));
+      return new Response(aboutHtml, { status: 200, headers: { 'content-type': 'text/html' } });
+    }) as typeof fetch
+  );
+  assert.deepEqual(requested, [
+    'https://www.youtube.com/channel/UC_test/about',
+    'https://www.youtube.com/channel/UC_test'
+  ]);
+  assert.equal(live?.bio, 'BigShort bio');
+  assert.ok(live?.channelLinks?.includes('bigshort.com'));
+});
+
+test('D: About tab without a bio merges both link sets and keeps the root bio', async () => {
+  const requested: string[] = [];
+  const aboutHtml = `<script>var ytInitialData = ${JSON.stringify({
+    links: [{ channelExternalLinkViewModel: { link: { content: 'about-only.example' } } }]
+  })};</script>`;
+  const rootHtml = `<script>var ytInitialData = ${JSON.stringify({
+    metadata: { channelMetadataRenderer: { description: 'Root bio' } },
+    links: [{ channelExternalLinkViewModel: { link: { content: 'root.example' } } }]
+  })};</script>`;
+  const live = await fetchLiveYouTubeChannelData(
+    'https://www.youtube.com/channel/UC_test',
+    false,
+    (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      requested.push(url);
+      return new Response(url.endsWith('/about') ? aboutHtml : rootHtml, {
+        status: 200,
+        headers: { 'content-type': 'text/html' }
+      });
+    }) as typeof fetch
+  );
+  assert.deepEqual(requested, [
+    'https://www.youtube.com/channel/UC_test/about',
+    'https://www.youtube.com/channel/UC_test'
+  ]);
+  assert.equal(live?.bio, 'Root bio');
+  assert.ok(live?.channelLinks?.includes('about-only.example'));
+  assert.ok(live?.channelLinks?.includes('root.example'));
+});
+
+test('D: an About bio never suppresses root-only header links', async () => {
+  const aboutHtml = `<script>var ytInitialData = ${JSON.stringify({
+    metadata: { channelMetadataRenderer: { description: 'About bio' } },
+    links: [{ channelExternalLinkViewModel: { link: { content: 'about.example' } } }]
+  })};</script>`;
+  const rootHtml = `<script>var ytInitialData = ${JSON.stringify({
+    metadata: { channelMetadataRenderer: { description: 'Root bio' } },
+    links: [{ channelExternalLinkViewModel: { link: { content: 'root-only.example' } } }]
+  })};</script>`;
+  const live = await fetchLiveYouTubeChannelData(
+    'https://www.youtube.com/channel/UC_test',
+    false,
+    (async (input: RequestInfo | URL) =>
+      new Response(String(input).endsWith('/about') ? aboutHtml : rootHtml, {
+        status: 200,
+        headers: { 'content-type': 'text/html' }
+      })) as typeof fetch
+  );
+  assert.equal(live?.bio, 'About bio');
+  assert.ok(live?.channelLinks?.includes('about.example'));
+  assert.ok(live?.channelLinks?.includes('root-only.example'));
+});
+
+test('D: debug HTML and fetch log follow the surface that supplied the bio', async () => {
+  const aboutHtml = `<script>var ytInitialData = ${JSON.stringify({
+    links: [{ channelExternalLinkViewModel: { link: { content: 'about.example' } } }]
+  })};</script>`;
+  const rootHtml = `<script>var ytInitialData = ${JSON.stringify({
+    metadata: { channelMetadataRenderer: { description: 'Root bio' } }
+  })};</script>`;
+  const live = await fetchLiveYouTubeChannelData(
+    'https://www.youtube.com/channel/UC_test',
+    true,
+    (async (input: RequestInfo | URL) =>
+      new Response(String(input).endsWith('/about') ? aboutHtml : rootHtml, {
+        status: 200,
+        headers: { 'content-type': 'text/html' }
+      })) as typeof fetch
+  );
+  assert.equal(live?.bio, 'Root bio');
+  assert.doesNotMatch(live?.fetchLog || '', /\/about/, 'fetch log must not describe the About page when the root supplied the bio');
+  assert.match(live?.rawHtml || '', /Root bio/);
+});
+
+test('D: a truncated About response keeps coverage incomplete after the root merge', async () => {
+  const aboutHtml = `<html><body>${'x'.repeat(MAX_CRAWL_RESPONSE_CHARS + 5_000)}</body></html>`;
+  const rootHtml = `<script>var ytInitialData = ${JSON.stringify({
+    metadata: { channelMetadataRenderer: { description: 'Root bio' } }
+  })};</script>`;
+  const live = await fetchLiveYouTubeChannelData(
+    'https://www.youtube.com/channel/UC_test',
+    false,
+    (async (input: RequestInfo | URL) =>
+      new Response(String(input).endsWith('/about') ? aboutHtml : rootHtml, {
+        status: 200,
+        headers: { 'content-type': 'text/html' }
+      })) as typeof fetch
+  );
+  assert.equal(live?.bio, 'Root bio');
+  assert.equal(live?.truncated, true);
+});
+
+test('D: About URL helper appends to the pathname without swallowing query or fragment', () => {
+  assert.equal(
+    youtubeChannelAboutUrl('https://www.youtube.com/@creator?si=abc'),
+    'https://www.youtube.com/@creator/about?si=abc'
+  );
+  assert.equal(
+    youtubeChannelAboutUrl('https://www.youtube.com/channel/UC_test/about?si=abc'),
+    'https://www.youtube.com/channel/UC_test/about?si=abc'
+  );
+  assert.equal(
+    youtubeChannelAboutUrl('https://www.youtube.com/channel/UC_test#bio'),
+    'https://www.youtube.com/channel/UC_test/about#bio'
+  );
 });
 
 test('applyPublicAboutToCandidate sets description from bio for Gate 1 re-validation', () => {

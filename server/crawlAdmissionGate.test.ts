@@ -53,6 +53,31 @@ test('R6: https://g/ is rejected before scoring or crawling', async () => {
   assert.ok(!trail.includes('Dotless single-label host note'), 'dead post-gate branch must not appear in the trail');
 });
 
+// 1b. BigShort regression: YouTube's channel header link is a redirect whose
+// `q` destination is scheme-less (`q=BigShort.com`). It must become a crawl
+// seed instead of being silently dropped by normalization.
+test('R6: scheme-less YouTube redirect destinations become crawl seeds', async () => {
+  const wrapper = 'https://www.youtube.com/redirect?event=channel_header&redir_token=x&q=BigShort.com';
+  assert.equal(normalizeExternalUrl(wrapper)?.url, 'https://bigshort.com/');
+  const fetched: string[] = [];
+  const result = await runChannelInspection({
+    channelId: 'r6-scheme-less-redirect',
+    channelName: 'BigShort ',
+    channelBio: 'bigshort.com is a predictive order flow analytics platform.',
+    channelLinks: [wrapper],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: false,
+    externalFetchImpl: (async (input) => {
+      fetched.push(String(input));
+      return noInviteHtml();
+    }) as typeof fetch,
+    renderedFallback: emptyRendered,
+  });
+  assert.ok(fetched.some((url) => url.startsWith('https://bigshort.com/')), 'scheme-less destination must be crawled');
+  const trail = JSON.stringify(result.steps || []);
+  assert.ok(!trail.includes('No website or messaging URLs to crawl'), 'the redirect must not leave Step 4 empty');
+});
+
 // 2. Generic dotless hosts are rejected, not just "g".
 test('R6: generic dotless single-label hosts are rejected', () => {
   for (const raw of [
