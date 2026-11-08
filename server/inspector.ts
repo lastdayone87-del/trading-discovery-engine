@@ -252,7 +252,12 @@ export function youtubeRedirectDestination(raw:string):string|null {
     if((parsed.hostname!=='youtube.com'&&!parsed.hostname.endsWith('.youtube.com'))||parsed.pathname!=='/redirect')return null;
     let destination=parsed.searchParams.get('q');
     if(!destination)return null;
-    for(let i=0;i<2;i++)try{const decoded=decodeURIComponent(destination);if(decoded===destination)break;destination=decoded;}catch{break;}
+    // URLSearchParams.get already decodes once. Decode a second time only when
+    // the value is still fully encoded (no scheme yet); otherwise path escapes
+    // such as %2F inside an already-decoded URL would be rewritten.
+    if(!/^(?:[a-zA-Z][a-zA-Z0-9+-]*:|\/\/)/.test(destination)){
+      try{const decoded=decodeURIComponent(destination);if(decoded!==destination)destination=decoded;}catch{/* keep the first decode */}
+    }
     return destination;
   }catch{return null;}
 }
@@ -267,15 +272,21 @@ export function normalizeExternalUrl(raw:string):NormalizedExternalUrl|null {
       if(/^[^/\s@]+@[^/\s@]+\.[^/\s@]+$/.test(redirectDestination))return null;
       wrapperUrl=parsed.toString();
       // Scheme-less redirect destinations are the normal YouTube shape
-      // (`q=BigShort.com`). Apply the same https fallback used for ordinary
-      // scheme-less links; protocol-relative and explicit non-HTTP schemes
+      // (`q=BigShort.com`). Dots are excluded from scheme detection so
+      // `example.com:8080/path` keeps its host-and-port meaning, matching
+      // assessCrawlAdmission. Protocol-relative and explicit non-HTTP schemes
       // keep their semantics (the latter fail closed below).
-      const destination=/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(redirectDestination)
+      const hasExplicitScheme=/^[a-zA-Z][a-zA-Z0-9+-]*:/.test(redirectDestination);
+      const destination=hasExplicitScheme
         ?redirectDestination
         :redirectDestination.startsWith('//')?`https:${redirectDestination}`:`https://${redirectDestination}`;
       parsed=new URL(destination);
     }
     if(!['http:','https:'].includes(parsed.protocol))return null;
+    // Credentials are never creator links. This also closes the email-plus-
+    // path bypass (`trader@gmail.com/contact`), which would otherwise parse
+    // as userinfo `trader` on host `gmail.com`.
+    if(parsed.username||parsed.password)return null;
     const host=parsed.hostname.toLowerCase();
     if(host==='youtube.com'||host.endsWith('.youtube.com')||host==='youtu.be')return null;
     if(directDiscordHosts.has(host))return null;
@@ -987,25 +998,21 @@ async function fetchLiveYouTubeChannelData(youtubeUrl:string,enableDebug?:boolea
     const extractedUrls=Array.from(new Set([...explicitLinks,...extractExternalUrlsFromText(cleanHtml)])).filter(url=>!isPageAssetInfrastructureUrl(url));
     return {page,cleanHtml,bio,thumbnailUrl,extractedUrls};
   };
-  // The external-link panel lives on /about; the channel root only exposes the
-  // header CTA. Request the tab first and fall back to the root when the tab
-  // is unavailable or omits the canonical description.
-  let about=await parsePage(youtubeChannelAboutUrl(youtubeUrl));
-  if(!about?.bio){
-    const root=await parsePage(youtubeUrl);
-    if(root){
-      about={
-        page:root.page,
-        cleanHtml:root.cleanHtml,
-        bio:root.bio||about?.bio,
-        thumbnailUrl:about?.thumbnailUrl||root.thumbnailUrl,
-        extractedUrls:Array.from(new Set([...(about?.extractedUrls||[]),...root.extractedUrls])),
-      };
-    }
-  }
-  if(!about)return null;
-  if(about.page.truncated&&!about.bio&&about.extractedUrls.length===0)return null;
-  return {bio:about.bio,channelLinks:about.extractedUrls,thumbnailUrl:about.thumbnailUrl,truncated:about.page.truncated,rawHtml:enableDebug?about.cleanHtml:undefined,fetchLog:enableDebug?`Fetched ${about.page.finalUrl} (${about.page.html.length} bytes)`:undefined};
+  // The external-link panel lives on /about, while the channel root can carry
+  // a header-only CTA. Fetch both and merge their links so neither surface is
+  // silently lost; prefer the About bio when both pages expose one.
+  const aboutUrl=youtubeChannelAboutUrl(youtubeUrl);
+  const [aboutPage,rootPage]=await Promise.all([
+    parsePage(aboutUrl),
+    aboutUrl===youtubeUrl?Promise.resolve(null):parsePage(youtubeUrl),
+  ]);
+  const page=aboutPage?.page||rootPage?.page;
+  if(!page)return null;
+  const bio=aboutPage?.bio?.trim()?aboutPage.bio:rootPage?.bio;
+  const extractedUrls=Array.from(new Set([...(aboutPage?.extractedUrls||[]),...(rootPage?.extractedUrls||[])]));
+  const truncated=Boolean(aboutPage?.page.truncated||rootPage?.page.truncated);
+  if(truncated&&!bio&&extractedUrls.length===0)return null;
+  return {bio,channelLinks:extractedUrls,thumbnailUrl:aboutPage?.thumbnailUrl||rootPage?.thumbnailUrl,truncated,rawHtml:enableDebug?(aboutPage?.cleanHtml||rootPage?.cleanHtml):undefined,fetchLog:enableDebug?`Fetched ${page.finalUrl} (${page.html.length} bytes)`:undefined};
 }
 
 function normalizedRenderedCandidates(rendered:BrowserFallbackResult,surface:AcquisitionSurface,seedUrl:string):DiscordCandidate[]{

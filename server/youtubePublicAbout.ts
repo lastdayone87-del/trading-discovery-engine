@@ -241,16 +241,28 @@ export function parseYouTubeChannelAboutFromHtml(
 /**
  * Canonical public About-tab URL. YouTube's channelExternalLinkViewModel links
  * are rendered on /about, not on the channel root, so "About" acquisition must
- * request the tab. Already-tabbed URLs are left untouched.
+ * request the tab. Append to the pathname (never after a query/fragment) and
+ * leave already-tabbed URLs untouched.
  */
 export function youtubeChannelAboutUrl(youtubeUrl: string): string {
-  const trimmed = youtubeUrl.replace(/\/+$/, '');
-  return /\/about$/i.test(trimmed) ? trimmed : `${trimmed}/about`;
+  try {
+    const parsed = new URL(youtubeUrl);
+    const pathname = parsed.pathname.replace(/\/+$/, '');
+    if (!/\/about$/i.test(pathname)) parsed.pathname = `${pathname}/about`;
+    return parsed.toString();
+  } catch {
+    const trimmed = youtubeUrl.replace(/\/+$/, '');
+    return /\/about$/i.test(trimmed) ? trimmed : `${trimmed}/about`;
+  }
 }
 
 /**
  * Fetch public channel About without YouTube Data API keys.
  * Soft-fails to null on any network/parse/consent failure.
+ *
+ * Both surfaces are fetched and merged: /about carries
+ * channelExternalLinkViewModel links, while the channel root can carry a
+ * header-only CTA. The About bio is preferred when both are present.
  */
 export async function fetchLiveYouTubeChannelData(
   youtubeUrl: string,
@@ -260,37 +272,39 @@ export async function fetchLiveYouTubeChannelData(
   if (!youtubeUrl || !youtubeUrl.startsWith('http')) return null;
   try {
     const aboutUrl = youtubeChannelAboutUrl(youtubeUrl);
-    let page = await fetchPublicYouTubePage(aboutUrl, 0, fetchImpl);
-    let parsed: PublicYouTubeChannelAbout | null = page
-      ? parseYouTubeChannelAboutFromHtml(page.html, { enableDebug, finalUrl: page.finalUrl })
+    const [aboutPage, rootPage] = await Promise.all([
+      fetchPublicYouTubePage(aboutUrl, 0, fetchImpl),
+      aboutUrl === youtubeUrl ? Promise.resolve(null) : fetchPublicYouTubePage(youtubeUrl, 0, fetchImpl)
+    ]);
+    const aboutParsed = aboutPage
+      ? parseYouTubeChannelAboutFromHtml(aboutPage.html, { enableDebug, finalUrl: aboutPage.finalUrl })
       : null;
-
-    // The About tab carries links the channel root omits. If the tab is
-    // unavailable or lacks the canonical description, fall back to the root
-    // and merge the links each surface exposed so neither is silently lost.
-    if (!parsed?.bio?.trim()) {
-      const rootPage = await fetchPublicYouTubePage(youtubeUrl, 0, fetchImpl);
-      if (rootPage) {
-        const rootParsed = parseYouTubeChannelAboutFromHtml(rootPage.html, {
-          enableDebug,
-          finalUrl: rootPage.finalUrl
-        });
-        parsed = {
-          ...rootParsed,
-          channelLinks: Array.from(
-            new Set([...(parsed?.channelLinks || []), ...(rootParsed.channelLinks || [])])
-          ),
-          thumbnailUrl: parsed?.thumbnailUrl || rootParsed.thumbnailUrl
-        };
-        page = rootPage;
-      }
-    }
-    if (!page || !parsed) return null;
+    const rootParsed = rootPage
+      ? parseYouTubeChannelAboutFromHtml(rootPage.html, { enableDebug, finalUrl: rootPage.finalUrl })
+      : null;
+    if (!aboutPage && !rootPage) return null;
+    const bio = aboutParsed?.bio?.trim() ? aboutParsed.bio : rootParsed?.bio;
+    const channelLinks = Array.from(
+      new Set([...(aboutParsed?.channelLinks || []), ...(rootParsed?.channelLinks || [])])
+    );
+    // A truncated page may hide links even when the other page produced a bio.
+    const truncated = Boolean(aboutPage?.truncated || rootPage?.truncated);
     // A truncated prefix with no usable evidence is an incomplete fetch, not
     // a definitive empty About page: return null so callers record
     // ATTEMPTED_FAILED (retryable) instead of ATTEMPTED_EMPTY (terminal).
-    if (page.truncated && !parsed.bio?.trim() && !(parsed.channelLinks?.length)) return null;
-    return page.truncated ? { ...parsed, truncated: true } : parsed;
+    if (truncated && !bio?.trim() && channelLinks.length === 0) return null;
+    return {
+      ...(bio?.trim() ? { bio } : {}),
+      ...(channelLinks.length ? { channelLinks } : {}),
+      thumbnailUrl: aboutParsed?.thumbnailUrl || rootParsed?.thumbnailUrl,
+      ...(aboutParsed?.rawHtml || rootParsed?.rawHtml
+        ? { rawHtml: aboutParsed?.rawHtml || rootParsed?.rawHtml }
+        : {}),
+      ...(aboutParsed?.fetchLog || rootParsed?.fetchLog
+        ? { fetchLog: aboutParsed?.fetchLog || rootParsed?.fetchLog }
+        : {}),
+      ...(truncated ? { truncated: true } : {})
+    };
   } catch {
     return null;
   }
