@@ -117,6 +117,35 @@ test('thresholds ignore blank and non-numeric env values', () => {
   assert.deepEqual(enrichmentScaleThresholds({ ENRICHMENT_SCALE_MIN_SUCCESS_RATE: 'not-a-number' } as any), DEFAULT_ENRICHMENT_SCALE_THRESHOLDS);
 });
 
+test('percent-style rate thresholds fall back instead of silently blocking scale', () => {
+  assert.deepEqual(enrichmentScaleThresholds({
+    ENRICHMENT_SCALE_MIN_SUCCESS_RATE: '90',
+    ENRICHMENT_SCALE_MIN_COMPLETION_RATIO: '80',
+  } as any), DEFAULT_ENRICHMENT_SCALE_THRESHOLDS);
+  // Explicit endpoints are valid fractions.
+  assert.equal(enrichmentScaleThresholds({ ENRICHMENT_SCALE_MIN_SUCCESS_RATE: '1' } as any).minSuccessRate, 1);
+  assert.equal(enrichmentScaleThresholds({ ENRICHMENT_SCALE_MIN_COMPLETION_RATIO: '0' } as any).minCompletionToCreationRatio, 0);
+});
+
+test('metrics queries inherit the live deadline and abort signal', async () => {
+  const controller = new AbortController();
+  const deadlineAtMs = Date.now() + 1_000;
+  const seen: Array<{ query_timeout: number; signal?: AbortSignal }> = [];
+  await loadEnrichmentScaleMetrics(0, { ENRICHMENT_SCALE_METRICS_TIMEOUT_MS: '5000' } as any, {
+    signal: controller.signal,
+    deadlineAtMs,
+    query: async config => {
+      seen.push({ query_timeout: config.query_timeout, signal: config.signal });
+      return { rows: [{}] };
+    },
+  });
+  assert.equal(seen.length, 3);
+  for (const query of seen) {
+    assert.equal(query.signal, controller.signal);
+    assert.ok(query.query_timeout > 0 && query.query_timeout <= 1_000, `expected a live-deadline budget, got ${query.query_timeout}`);
+  }
+});
+
 test('the gate resolves configured thresholds when callers omit them', () => {
   const decision = evaluateEnrichmentScaleGate(
     { ...healthy, semanticSuccessRate: 0.95 },
@@ -190,7 +219,8 @@ test('every scale-metrics query carries the configured query timeout', async () 
     },
   });
   assert.deepEqual(seen, [1500, 1500, 1500]);
-  assert.match(statements[0], /geminiCapacityDeferral/, 'local capacity deferrals must not count as semantic failures');
+  assert.match(statements[0], /geminiScaleGateDeferral/, 'reason-coded capacity deferrals must not count as semantic failures');
+  assert.doesNotMatch(statements[0], /geminiCapacityDeferral/, 'lock-wait contention must stay in the scale-gate denominator');
   assert.match(statements[0], /groqCooldownDeferral/, 'local Groq cooldown deferrals must not count as semantic failures');
   assert.match(statements[0], /geminiFreeCooldownDeferral/, 'local free-Gemini deferrals must not count as semantic failures');
   assert.equal(metrics.semanticCalls, 100);
@@ -200,13 +230,22 @@ test('every scale-metrics query carries the configured query timeout', async () 
 
 test('a stalled metrics load resolves at the deadline so startup can use baseline', async () => {
   const started = Date.now();
+  let signal: AbortSignal | undefined;
   const metrics = await loadEnrichmentScaleMetricsWithinDeadline(
     0,
     { ENRICHMENT_SCALE_METRICS_TIMEOUT_MS: '50' } as any,
-    () => new Promise<EnrichmentScaleMetrics>(() => {}),
+    (loadSignal?: AbortSignal) => {
+      signal = loadSignal;
+      return new Promise<EnrichmentScaleMetrics>(() => {});
+    },
   );
+  const elapsed = Date.now() - started;
   assert.equal(metrics, undefined);
-  assert.ok(Date.now() - started < 3_000);
+  // The 50 ms input clamps to the 250 ms floor. Keep the assertion close
+  // enough to that deadline that a multi-second regression cannot pass.
+  assert.ok(elapsed >= 240, `expected at least the 250 ms deadline, got ${elapsed} ms`);
+  assert.ok(elapsed < 1_500, `expected the wrapper to settle near 250 ms, got ${elapsed} ms`);
+  assert.equal(signal?.aborted, true, 'the deadline must cancel in-flight metrics work');
 });
 
 test('a completed metrics load is returned by the deadline wrapper', async () => {

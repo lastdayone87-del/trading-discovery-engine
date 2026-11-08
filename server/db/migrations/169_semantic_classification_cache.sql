@@ -33,14 +33,13 @@ CREATE TABLE IF NOT EXISTS semantic_classification_cache (
 ALTER TABLE semantic_classification_cache
   ADD COLUMN IF NOT EXISTS batch_prompt_version TEXT;
 
-CREATE INDEX IF NOT EXISTS idx_semantic_cache_created_at
-  ON semantic_classification_cache(created_at);
-
+-- The retention expression index lives in migration 170 so databases that
+-- already applied this migration still converge on the documented purge query.
 COMMENT ON TABLE semantic_classification_cache IS
   'Phase 4: final semantic-model result keyed by evidence checksum + prompt/feature/model versions. Fail-open; never authoritative evidence.';
 COMMENT ON COLUMN semantic_classification_cache.input_checksum IS
-  'Attribution-free classification input fingerprint (job_id/run_id excluded).';
+  'Attribution-free classification input fingerprint (job_id/run_id and audience counters excluded).';
 COMMENT ON COLUMN semantic_classification_cache.batch_prompt_version IS
-  'Batch prompt version that produced the result, or NULL for a single-call result; operators can purge superseded batches by version.';
+  'Batch prompt version in effect when the result was cached (set for every call while batching is enabled, NULL otherwise); purging by version also removes single-call rows written under batching.';
 COMMENT ON COLUMN semantic_classification_cache.hits IS
   'Number of cache reads that returned this row; used to measure quota savings.';

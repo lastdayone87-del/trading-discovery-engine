@@ -21,12 +21,16 @@ test('Phase 3 exposes V2 contracts and compatibility adapters without replacing 
 });
 
 test('Phase 3 separates search context and does not begin Release 3', async () => {
-  const [canonical, semantic, ingestion] = await Promise.all([
-    read('./canonicalEvidencePlane.ts'), read('./providers/GeminiSemanticProvider.ts'), read('../ingestionPipeline.ts')
+  const [canonical, semantic, documentRefs, ingestion] = await Promise.all([
+    read('./canonicalEvidencePlane.ts'), read('./providers/GeminiSemanticProvider.ts'), read('./semanticDocumentRefs.ts'), read('../ingestionPipeline.ts')
   ]);
   assert.match(canonical, /search_match_context/);
   assert.match(semantic, /search_match_context/);
-  assert.match(semantic, /\.filter\(document=>!/);
+  // Prompt construction and citation validation share one document projection;
+  // the retrieval-only filter lives there so a citation can never validate
+  // against a document the model was not shown.
+  assert.match(semantic, /semanticFieldDocuments\(input\)/);
+  assert.match(documentRefs, /\.filter\(document\s*=>\s*!\[/);
   assert.match(ingestion, /search_match_context:candidate.matchedDocument/);
   const migrations = await readdir(new URL('../db/migrations/', import.meta.url));
   assert.ok(migrations.includes('055_evidence_documents_and_assertions.sql'));

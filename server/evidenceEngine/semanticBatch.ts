@@ -2,6 +2,29 @@ import type { SemanticModelClient, SemanticObservabilityContext } from './provid
 import { isSemanticResultShape } from './semanticResultShape';
 
 /**
+ * Marks a result that was returned as one element of a multi-channel batch.
+ * The marker is non-enumerable so it never reaches JSON, structural
+ * validation, or persisted evidence, and provider caches can exclude results
+ * whose realized request included sibling channels.
+ */
+const SEMANTIC_BATCH_RESULT_MARKER = Symbol.for('trading-discovery-engine.semantic-batch-result');
+
+export function markSemanticBatchResult(value: unknown, batchSize: number): void {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+  Object.defineProperty(value, SEMANTIC_BATCH_RESULT_MARKER, {
+    value: { batchSize: Math.max(1, Math.floor(Number(batchSize) || 1)) },
+    enumerable: false,
+    configurable: true,
+  });
+}
+
+export function semanticResultWasBatched(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const marker = (value as Record<symbol, { batchSize?: number } | undefined>)[SEMANTIC_BATCH_RESULT_MARKER];
+  return Number(marker?.batchSize) > 1;
+}
+
+/**
  * Phase 4 semantic batching.
  *
  * Several enrichment workers run inside one process. A short, bounded
@@ -402,6 +425,7 @@ export class SemanticBatchScheduler {
         if (!active.has(request)) return;
         const item = parsed[index];
         if (isSemanticResultShape(item)) {
+          markSemanticBatchResult(item, pending.length);
           request.resolve(item);
           return;
         }

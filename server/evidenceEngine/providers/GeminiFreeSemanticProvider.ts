@@ -12,7 +12,7 @@ import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../se
 import { abortedByDeadline } from './abortReason';
 import { readSemanticResultCache, SEMANTIC_RESULT_CACHE_HIT_REASON, writeSemanticResultCache } from '../semanticResultCache';
 import { applySemanticPrefilter, recordSemanticPrefilterOutcome } from '../../semanticPrefilter';
-import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, semanticBatchConfig } from '../semanticBatch';
+import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, semanticBatchConfig, semanticResultWasBatched } from '../semanticBatch';
 import { isSemanticResultShape } from '../semanticResultShape';
 import type { EvidenceCategory, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import {
@@ -431,6 +431,9 @@ export class GeminiFreeSemanticProvider implements EvidenceProvider {
       // a missing/partial reply into an AMBIGUOUS abstention; persisting that
       // placeholder would replay it for the same evidence indefinitely.
       let cacheable = isSemanticResultShape(candidate.value);
+      // A verdict produced inside a multi-channel batch saw sibling evidence
+      // and a different completion allowance; keep it out of the cache.
+      let batchedOutput = semanticResultWasBatched(candidate.value);
       result = parseSemanticResult(candidate.value);
       model = candidate.model;
       fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
@@ -443,8 +446,10 @@ export class GeminiFreeSemanticProvider implements EvidenceProvider {
       if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && adjudicationEnabled) {
         const adjudicatedValue = await classifySemanticPrompt({ client, prompt: buildSemanticPrompt(input, 'ADJUDICATION'), model: adjudicatorModel, observability, signal });
         cacheable = isSemanticResultShape(adjudicatedValue);
+        batchedOutput = batchedOutput || semanticResultWasBatched(adjudicatedValue);
         result = parseSemanticResult(adjudicatedValue); model = adjudicatorModel;
       }
+      cacheable = cacheable && !batchedOutput;
       if (!this.injectedClient && cacheable) await writeSemanticResultCache(cacheIdentity, { result, modelVersion: model, fallbackUsed: candidate.fallbackUsed }, process.env, { signal });
     }
     // Shadow validation for the Phase 4 prefilter gate. Observability only:

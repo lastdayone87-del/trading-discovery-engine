@@ -38,8 +38,20 @@ export const CLASSIFICATION_INPUT_CHECKSUM_VERSION = 'canonical-json-v1';
 
 export function normalizeClassificationInput(input: RawChannelInput): RawChannelInput & { input_checksum: string; input_checksum_version: string } {
   const classificationInput: RawChannelInput = { ...input };
+  // Attribution and audience metadata are not classification evidence.
+  // `subscriber_count`/`video_count` change on every channel refresh, and a
+  // checksum that moves with them would miss the semantic cache and rewrite
+  // the diagnostic ledger for an unchanged evidence set.
   delete classificationInput.job_id;
   delete classificationInput.run_id;
+  delete classificationInput.subscriber_count;
+  delete classificationInput.video_count;
+  // The checksum fields are derived output. A stored diagnostic row carries
+  // them inside `normalized_input`, so they must be stripped before hashing or
+  // re-normalizing a replay would hash a different payload.
+  const derived = classificationInput as RawChannelInput & { input_checksum?: string; input_checksum_version?: string };
+  delete derived.input_checksum;
+  delete derived.input_checksum_version;
   const stable: RawChannelInput = {
     ...classificationInput,
     channel_name: String(classificationInput.channel_name || '').normalize('NFKC').trim(),

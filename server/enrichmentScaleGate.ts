@@ -75,12 +75,18 @@ export function enrichmentScaleThresholds(env: NodeJS.ProcessEnv = process.env):
     const value = Number(raw);
     return Number.isFinite(value) && value >= 0 ? value : fallback;
   };
+  // Rates are fractions, not percentages. A percent-style value such as `90`
+  // would otherwise pass validation and silently block every scale-up.
+  const rate = (name: string, fallback: number) => {
+    const value = number(name, fallback);
+    return value >= 0 && value <= 1 ? value : fallback;
+  };
   return {
-    minSuccessRate: number('ENRICHMENT_SCALE_MIN_SUCCESS_RATE', DEFAULT_ENRICHMENT_SCALE_THRESHOLDS.minSuccessRate),
+    minSuccessRate: rate('ENRICHMENT_SCALE_MIN_SUCCESS_RATE', DEFAULT_ENRICHMENT_SCALE_THRESHOLDS.minSuccessRate),
     maxP95LatencyMs: number('ENRICHMENT_SCALE_MAX_P95_MS', DEFAULT_ENRICHMENT_SCALE_THRESHOLDS.maxP95LatencyMs),
     minSemanticSample: number('ENRICHMENT_SCALE_MIN_SAMPLE', DEFAULT_ENRICHMENT_SCALE_THRESHOLDS.minSemanticSample),
     maxPendingEnrichmentJobs: number('ENRICHMENT_SCALE_MAX_PENDING', DEFAULT_ENRICHMENT_SCALE_THRESHOLDS.maxPendingEnrichmentJobs),
-    minCompletionToCreationRatio: number('ENRICHMENT_SCALE_MIN_COMPLETION_RATIO', DEFAULT_ENRICHMENT_SCALE_THRESHOLDS.minCompletionToCreationRatio),
+    minCompletionToCreationRatio: rate('ENRICHMENT_SCALE_MIN_COMPLETION_RATIO', DEFAULT_ENRICHMENT_SCALE_THRESHOLDS.minCompletionToCreationRatio),
   };
 }
 
@@ -176,7 +182,16 @@ export function evaluateEnrichmentScaleGate(
  * clock so a stalled connection acquisition cannot hold startup open.
  */
 export interface EnrichmentScaleMetricsDeps {
-  query?: (config: { text: string; query_timeout: number }) => Promise<{ rows: any[] }>;
+  /**
+   * Query seam. `query_timeout` is recomputed from the live deadline so the
+   * database cancels a statement at the same moment the caller stops waiting.
+   * `signal` lets an injected query honor the same deadline explicitly.
+   */
+  query?: (config: { text: string; query_timeout: number; signal?: AbortSignal }) => Promise<{ rows: any[] }>;
+  /** Aborted when the startup wrapper reaches its deadline. */
+  signal?: AbortSignal;
+  /** Absolute epoch milliseconds at which the metrics load is abandoned. */
+  deadlineAtMs?: number;
 }
 
 export async function loadEnrichmentScaleMetrics(
@@ -190,13 +205,22 @@ export async function loadEnrichmentScaleMetrics(
     const { getDb } = await import('./db');
     const db = await getDb();
     // The pool wrapper is typed for text-only queries; node-postgres accepts
-    // the config object and honors query_timeout.
-    query = config => db.query(config as unknown as string);
+    // the config object and honors query_timeout. `signal` is not a pg option,
+    // so it is stripped here; query_timeout performs the actual cancellation.
+    query = config => db.query({ text: config.text, query_timeout: config.query_timeout } as unknown as string);
   }
+  const queryBudget = () => {
+    if (deps.deadlineAtMs == null) return timeoutMs;
+    return Math.max(1, Math.min(timeoutMs, deps.deadlineAtMs - Date.now()));
+  };
+  const runQuery = (text: string) => query({
+    text,
+    query_timeout: queryBudget(),
+    ...(deps.signal ? { signal: deps.signal } : {}),
+  });
   const thresholds = enrichmentScaleThresholds(env);
   const [provider, backlog, throughput] = await Promise.all([
-    query({
-      text: `SELECT
+    runQuery(`SELECT
          COUNT(*)::int AS calls,
          COUNT(*) FILTER (WHERE status='SUCCESS')::int AS successes,
          COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)
@@ -207,26 +231,20 @@ export async function loadEnrichmentScaleMetrics(
          AND status <> 'CANCELLED'
          -- Local deferral echoes never reached the provider. Counting them
          -- would drag the success rate down and block legitimate scale.
-         AND COALESCE(request_metadata->>'geminiCapacityDeferral','') <> 'true'
+         -- Lock-wait/deadline contention is NOT excluded: the scale gate must
+         -- see calls that failed before reaching Google under load.
+         AND COALESCE(request_metadata->>'geminiScaleGateDeferral','') <> 'true'
          AND COALESCE(request_metadata->>'groqCooldownDeferral','') <> 'true'
-         AND COALESCE(request_metadata->>'geminiFreeCooldownDeferral','') <> 'true'`,
-      query_timeout: timeoutMs,
-    }),
-    query({
-      text: `SELECT COUNT(*)::int AS pending
+         AND COALESCE(request_metadata->>'geminiFreeCooldownDeferral','') <> 'true'`),
+    runQuery(`SELECT COUNT(*)::int AS pending
        FROM jobs
-       WHERE type='ENRICH_CHANNEL' AND status IN ('PENDING','PROCESSING')`,
-      query_timeout: timeoutMs,
-    }),
-    query({
-      text: `SELECT
+       WHERE type='ENRICH_CHANNEL' AND status IN ('PENDING','PROCESSING')`),
+    runQuery(`SELECT
          COUNT(*) FILTER (WHERE created_at > now() - interval '1 hour')::int AS created_last_hour,
          COUNT(*) FILTER (WHERE completed_at > now() - interval '1 hour' AND status='COMPLETED')::int AS completed_last_hour
        FROM jobs
        WHERE type='ENRICH_CHANNEL'
-         AND (created_at > now() - interval '1 hour' OR completed_at > now() - interval '1 hour')`,
-      query_timeout: timeoutMs,
-    }),
+         AND (created_at > now() - interval '1 hour' OR completed_at > now() - interval '1 hour')`),
   ]);
   const calls = Number(provider.rows[0]?.calls || 0);
   const successes = Number(provider.rows[0]?.successes || 0);
@@ -255,15 +273,25 @@ export async function loadEnrichmentScaleMetrics(
 export async function loadEnrichmentScaleMetricsWithinDeadline(
   nowMs: number = Date.now(),
   env: NodeJS.ProcessEnv = process.env,
-  load: () => Promise<EnrichmentScaleMetrics> = () => loadEnrichmentScaleMetrics(nowMs, env),
+  load: (signal?: AbortSignal) => Promise<EnrichmentScaleMetrics> = signal => loadEnrichmentScaleMetrics(nowMs, env, {
+    signal,
+    deadlineAtMs: Date.now() + enrichmentScaleMetricsTimeoutMs(env),
+  }),
 ): Promise<EnrichmentScaleMetrics | undefined> {
   const timeoutMs = enrichmentScaleMetricsTimeoutMs(env);
+  const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
-      load().catch(() => undefined),
+      load(controller.signal).catch(() => undefined),
       new Promise<undefined>(resolve => {
-        timer = setTimeout(() => resolve(undefined), timeoutMs);
+        timer = setTimeout(() => {
+          // Cancel in-flight statements instead of merely abandoning them.
+          // node-postgres also enforces the same deadline through
+          // query_timeout, so a stalled metrics load cannot outlive startup.
+          controller.abort(new Error('Enrichment scale metrics deadline expired.'));
+          resolve(undefined);
+        }, timeoutMs);
         timer.unref?.();
       }),
     ]);

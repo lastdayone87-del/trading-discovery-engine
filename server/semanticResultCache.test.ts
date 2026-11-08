@@ -91,7 +91,7 @@ test('canonical JSON sorts object keys recursively but preserves array order', (
 });
 
 test('semantic cache version is part of the key contract', () => {
-  assert.equal(SEMANTIC_RESULT_CACHE_VERSION, 'semantic-result-cache-v1');
+  assert.equal(SEMANTIC_RESULT_CACHE_VERSION, 'semantic-result-cache-v2');
   assert.equal(semanticResultCacheKey(identity).cacheKey.length, 64);
 });
 
@@ -105,6 +105,7 @@ test('semantic cache defaults on and has an explicit rollback switch', () => {
 test('structurally corrupt cached rows are treated as misses', () => {
   assert.equal(isUsableCachedResult(complete), true);
   assert.equal(isUsableCachedResult({ label: 'ACTIVE_TRADING', citations: [] }), false);
+  assert.equal(isUsableCachedResult({ ...complete, citations: [] }), false, 'uncited abstentions are not replayable verdicts');
   assert.equal(isUsableCachedResult({ ...complete, confidence: Number.NaN }), false);
   assert.equal(isUsableCachedResult({ ...complete, confidence: 101 }), false);
   assert.equal(isUsableCachedResult({ ...complete, supportedLanguage: 'yes' }), false);
@@ -112,6 +113,14 @@ test('structurally corrupt cached rows are treated as misses', () => {
   assert.equal(isUsableCachedResult({ ...complete, languages: [{ language: 'en', script: 'Latin', confidence: 90, field: 'not_a_field' }] }), false);
   assert.equal(isUsableCachedResult({ ...complete, citations: [{ field: 'video_title', index: -1 }] }), false);
   assert.equal(isUsableCachedResult(null), false);
+});
+
+test('cached and persisted citations must resolve to supplied documents', () => {
+  assert.equal(isUsableCachedResult(complete, baseInput), true);
+  assert.equal(isUsableCachedResult({ ...complete, citations: [{ field: 'video_title', index: 999 }] }, baseInput), false);
+  assert.equal(isUsableCachedResult({ ...complete, citations: [{ field: 'channel_title', index: 0 }] }, baseInput), false);
+  assert.equal(isCacheableSemanticResult(complete, baseInput), true);
+  assert.equal(isCacheableSemanticResult({ ...complete, citations: [{ field: 'video_title', index: 999 }] }, baseInput), false);
 });
 
 test('degenerate and uncited results are never persisted', () => {
@@ -153,8 +162,18 @@ test('cache operations are fail-open and deadline-bounded', () => {
   const readFn = source.match(/export async function readSemanticResultCache[\s\S]*?\n}/)?.[0] || '';
   assert.match(readFn, /boundedCacheOperation\(\(async \(\) => \{[\s\S]*?await import\('\.\.\/db'\)[\s\S]*?await getDb\(\)/, 'getDb must resolve inside the cache deadline race');
   assert.match(source, /DELETE FROM semantic_classification_cache WHERE cache_key=\$1/, 'invalid rows must be deleted rather than replayed');
-  assert.match(source, /isCacheableSemanticResult\(value\.result\)/, 'writes must reject degenerate results');
-  assert.match(source, /value\.citations\.length > 0/, 'only cited results may be cached');
+  assert.match(source, /isCacheableSemanticResult\(value\.result, identity\.input\)/, 'writes must reject degenerate results and out-of-corpus citations');
+  assert.match(source, /isUsableCachedResult\(row\.result, identity\.input\)/, 'reads must validate citations against the supplied evidence');
+  assert.match(source, /void boundedCacheOperation\(/, 'hit counting must not add a blocking round trip');
+  assert.match(source, /citationsReferenceSuppliedDocuments/, 'citations must resolve to supplied documents');
   assert.match(source, /batch_prompt_version/, 'the batch prompt version must be persisted for operator purges');
   assert.match(source, /identity\.batchPromptVersion \|\| null/, 'the persisted batch version must come from the cache identity');
+  for (const file of [
+    'server/evidenceEngine/providers/GeminiSemanticProvider.ts',
+    'server/evidenceEngine/providers/GroqSemanticProvider.ts',
+    'server/evidenceEngine/providers/GeminiFreeSemanticProvider.ts',
+  ]) {
+    const provider = readFileSync(file, 'utf8');
+    assert.match(provider, /semanticResultWasBatched\(/, `${file} must keep multi-channel batch results out of the cache`);
+  }
 });

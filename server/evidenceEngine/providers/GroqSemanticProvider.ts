@@ -11,12 +11,12 @@ import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../se
 import { abortedByDeadline } from './abortReason';
 import { readSemanticResultCache, SEMANTIC_RESULT_CACHE_HIT_REASON, writeSemanticResultCache } from '../semanticResultCache';
 import { applySemanticPrefilter, recordSemanticPrefilterOutcome } from '../../semanticPrefilter';
-import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, SEMANTIC_REPAIR_REQUEST_MARKER, semanticBatchConfig } from '../semanticBatch';
+import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, SEMANTIC_REPAIR_REQUEST_MARKER, semanticBatchConfig, semanticResultWasBatched } from '../semanticBatch';
 import { isSemanticResultShape } from '../semanticResultShape';
+import { candidateDocumentRefs } from '../semanticDocumentRefs';
 import type { EvidenceCategory, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import {
   buildSemanticPrompt,
-  candidateDocumentRefs,
   hasCreatorLevelSemanticContext,
   parseSemanticResult,
   semanticObservabilityFields,
@@ -833,7 +833,12 @@ function groqRequestExtras(env: NodeJS.ProcessEnv = process.env, batchSize = 1):
   const extras: Record<string, unknown> = {
     temperature: 0,
     response_format: { type: 'json_object' },
-    max_completion_tokens: Math.min(configured * size, Math.max(configured, GROQ_MAX_BATCH_COMPLETION_TOKENS)),
+    // A single call honors the operator's configured allowance exactly. A
+    // batch envelope is hard-capped: sibling results multiply the response,
+    // and an operator value above the cap must not grow it without bound.
+    max_completion_tokens: size <= 1
+      ? configured
+      : Math.min(configured * size, GROQ_MAX_BATCH_COMPLETION_TOKENS),
   };
   // Reasoning effort is opt-in per model family: unsupported values 400 on
   // models without reasoning controls, so the default request carries none
@@ -1446,6 +1451,10 @@ export class GroqSemanticProvider implements EvidenceProvider {
       // a missing/partial reply into an AMBIGUOUS abstention; persisting that
       // placeholder would replay it for the same evidence indefinitely.
       let cacheable = isSemanticResultShape(candidate.value);
+      // A verdict produced inside a multi-channel batch saw sibling evidence
+      // and a different completion allowance. Keep it out of the cache: the
+      // realized batch request is not part of this per-channel identity.
+      let batchedOutput = semanticResultWasBatched(candidate.value);
       result = parseSemanticResult(candidate.value);
       model = candidate.model;
       fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
@@ -1462,6 +1471,7 @@ export class GroqSemanticProvider implements EvidenceProvider {
       if (isDecisiveButUncited(result)) {
         try {
           const repairedValue = await classifySemanticPrompt({ client, prompt: buildCitationRepairPrompt(candidatePrompt, result, candidateDocumentRefs(input)), model, observability, signal });
+          batchedOutput = batchedOutput || semanticResultWasBatched(repairedValue);
           if (isSemanticResultShape(repairedValue)) {
             const repaired = parseSemanticResult(repairedValue);
             const retained = retainSuppliedCitations(repaired.citations, candidateDocumentRefs(input));
@@ -1495,8 +1505,10 @@ export class GroqSemanticProvider implements EvidenceProvider {
       if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && adjudicationEnabled && !candidate.fallbackUsed) {
         const adjudicatedValue = await classifySemanticPrompt({ client, prompt: buildSemanticPrompt(input, 'ADJUDICATION'), model: adjudicatorModel, observability, signal });
         cacheable = cacheable && isSemanticResultShape(adjudicatedValue);
+        batchedOutput = batchedOutput || semanticResultWasBatched(adjudicatedValue);
         result = parseSemanticResult(adjudicatedValue); model = adjudicatorModel;
       }
+      cacheable = cacheable && !batchedOutput;
       // Cache the final verdict after repair/adjudication. Repair provenance
       // is stored explicitly so a cache hit reports the same reason codes.
       // Injected clients are a test/shadow seam and never touch the cache.

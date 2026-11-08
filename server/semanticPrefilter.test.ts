@@ -133,6 +133,33 @@ test('accented finance terms match with Unicode-aware boundaries', () => {
   assert.ok(decision.matchedSignals.includes('FRENCH_FINANCE'));
 });
 
+test('retrieval-only corpus text cannot veto withholding for an unrelated creator', () => {
+  const raw: RawChannelInput = {
+    channel_name: 'Block World',
+    description: 'Minecraft gameplay walkthrough and speedrun.',
+    evidence_corpus: [
+      { id: 'retrieval-hit', field: 'search_match_context', text: 'Futures trading order flow and market analysis.', sourceFamilyId: 'search-match' },
+      { id: 'creator-bio', field: 'channel_bio', text: 'Minecraft gameplay walkthrough and speedrun.', sourceFamilyId: 'channel' },
+    ],
+  };
+  const projected = semanticPrefilterInputFromRaw(raw);
+  assert.deepEqual(projected.evidenceCorpus, ['Minecraft gameplay walkthrough and speedrun.']);
+  assert.equal(evaluateSemanticPrefilter(projected, NOW).disposition, 'WITHHOLD_SEMANTIC');
+});
+
+test('creator-owned corpus finance evidence still vetoes withholding', () => {
+  const raw: RawChannelInput = {
+    channel_name: 'Block World',
+    description: 'Minecraft gameplay walkthrough and speedrun.',
+    evidence_corpus: [
+      { id: 'retrieval-hit', field: 'search_match_context', text: 'Minecraft gameplay walkthrough', sourceFamilyId: 'search-match' },
+      { id: 'creator-bio', field: 'channel_bio', text: 'I also teach futures trading risk management.', sourceFamilyId: 'channel' },
+    ],
+  };
+  const projected = semanticPrefilterInputFromRaw(raw);
+  assert.equal(evaluateSemanticPrefilter(projected, NOW).disposition, 'CLASSIFY');
+});
+
 test('raw audience counts are projected into the prefilter and can withhold a thin surface', () => {
   const raw: RawChannelInput = {
     channel_name: 'Tiny Channel',

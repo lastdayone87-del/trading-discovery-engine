@@ -1,5 +1,5 @@
 import { TradingClassificationResult, TradingRelevanceBreakdown } from '../src/types';
-import { verifyChannelTradingRelevance, VerificationDecision, type RawChannelInput } from './evidenceEngine';
+import { buildCanonicalEvidenceCorpus, verifyChannelTradingRelevance, VerificationDecision, type RawChannelInput } from './evidenceEngine';
 
 /**
  * Main Entry Point: Classifies a YouTube Channel's Trading Relevance
@@ -40,6 +40,11 @@ export async function classifyTradingRelevanceDetailed(
     discord_invite: discordInvite
   };
 
+  // The engine builds the canonical corpus on a local copy. Attach the same
+  // deterministic corpus to the caller-visible input so the diagnostic ledger
+  // and the semantic result cache fingerprint identical evidence; otherwise
+  // the cache key covers documents the ledger's checksum omits.
+  input.evidence_corpus = buildCanonicalEvidenceCorpus(input);
   const decision: VerificationDecision = await verifyChannelTradingRelevance(input);
 
   // Map to legacy breakdown format while adding rich evidence audit details

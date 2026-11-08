@@ -718,10 +718,28 @@ export function providerFailureMetadata(typed:ProviderCallError):Record<string,s
  * A Gemini failure that never started the provider call did not consume
  * Google quota. The marker must cover lock waits, deadline aborts, and
  * deferral paths that throw before `args.call`, not only known reason codes.
- * Post-call failures stay counted because the quota was already spent.
+ * Pacing and bucket reads exclude these rows so local echoes never consume
+ * quota against their own account.
  */
 export function isGeminiCapacityDeferral(provider: string, providerCallStarted: boolean): boolean {
   return provider === 'gemini' && !providerCallStarted;
+}
+
+/**
+ * The scale gate has a different question: it must exclude only failures that
+ * are reason-coded provider-capacity deferrals (which never attempted work),
+ * while still counting lock-wait and deadline contention that higher
+ * concurrency causes. Marking every pre-call failure would make the gate pass
+ * by removing its own overload failures from the denominator.
+ */
+export function isGeminiScaleGateDeferral(
+  provider: string,
+  providerCallStarted: boolean,
+  error?: Pick<ProviderCallError, 'providerReasons'>,
+): boolean {
+  if (!isGeminiCapacityDeferral(provider, providerCallStarted)) return false;
+  return (error?.providerReasons || []).some(reason =>
+    reason === 'GEMINI_ORG_TOKEN_BUCKET_EMPTY' || reason.includes('DEFERRED'));
 }
 
 export async function executeProviderCall<T>(args:{context:ProviderCallContext; timeoutMs:number; enabled?:boolean; signal?:AbortSignal; call:(signal:AbortSignal)=>Promise<T>; emit:ProviderEventSink; trace?:(stage:string)=>void}):Promise<T>{
@@ -765,9 +783,11 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
     // quota consumption (which would keep a full account full forever). The
     // marker tracks the provider call itself: lock waits, deadline aborts,
     // and deferral paths that throw before `args.call` are all pre-lease
-    // failures, including errors without a deferral reason code.
+    // failures, including errors without a deferral reason code. The scale
+    // gate gets a narrower marker so lock contention stays in its denominator.
     const capacityDeferral=isGeminiCapacityDeferral(args.context.provider,providerCallStarted);
-    const event:ProviderCallEvent={...base,requestMetadata:{...base.requestMetadata,...providerFailureMetadata(typed),...(capacityDeferral?{geminiCapacityDeferral:'true'}:{})},status:statusFor(typed),latencyMs:Date.now()-started,actualCost:0,errorClass:typed.errorClass,occurredAt:new Date().toISOString()};
+    const scaleGateDeferral=isGeminiScaleGateDeferral(args.context.provider,providerCallStarted,typed);
+    const event:ProviderCallEvent={...base,requestMetadata:{...base.requestMetadata,...providerFailureMetadata(typed),...(capacityDeferral?{geminiCapacityDeferral:'true'}:{}),...(scaleGateDeferral?{geminiScaleGateDeferral:'true'}:{})},status:statusFor(typed),latencyMs:Date.now()-started,actualCost:0,errorClass:typed.errorClass,occurredAt:new Date().toISOString()};
     if(capacityLease&&(typed.errorClass==='TIMEOUT'||typed.errorClass==='CANCELLED')){
       const cleanupController=new AbortController();
       const cleanupDeadlineAtMs=Date.now()+GEMINI_OUTCOME_CLEANUP_TIMEOUT_MS;

@@ -9,9 +9,11 @@ import {
   buildSemanticBatchPrompt,
   classifySemanticPrompt,
   isSemanticBatchContainerUsable,
+  markSemanticBatchResult,
   parseSemanticBatchResponse,
   resetSemanticBatchSchedulerForTests,
   semanticBatchConfig,
+  semanticResultWasBatched,
 } from './evidenceEngine/semanticBatch';
 import type { SemanticModelClient } from './evidenceEngine/providers/GeminiSemanticProvider';
 
@@ -132,6 +134,19 @@ test('independent submissions are coalesced into one provider call', async () =>
   assert.match(calls[0].prompt, /BATCH_CLASSIFICATION/);
   assert.equal((results[0] as any).label, 'ACTIVE_TRADING');
   assert.equal((results[1] as any).label, 'UNRELATED');
+  assert.equal(semanticResultWasBatched(results[0]), true);
+  assert.equal(semanticResultWasBatched(results[1]), true);
+  assert.equal(JSON.stringify(results[0]).includes('semantic-batch-result'), false, 'the marker must never serialize into evidence');
+});
+
+test('the batch marker reports size without changing the result shape', () => {
+  const value = semanticResult('UNRELATED');
+  assert.equal(semanticResultWasBatched(value), false);
+  markSemanticBatchResult(value, 1);
+  assert.equal(semanticResultWasBatched(value), false, 'a solo request is not a batch sibling');
+  markSemanticBatchResult(value, 3);
+  assert.equal(semanticResultWasBatched(value), true);
+  assert.deepEqual(Object.keys(value).sort(), ['citations', 'concepts', 'confidence', 'explanation', 'label', 'languages', 'reasonCodes', 'supportedLanguage']);
 });
 
 test('a malformed individual item falls back to a single call for that channel only', async () => {
@@ -152,6 +167,8 @@ test('a malformed individual item falls back to a single call for that channel o
   assert.equal(calls.length, 2);
   assert.equal((a as any).label, 'ACTIVE_TRADING');
   assert.equal((b as any).label, 'UNRELATED');
+  assert.equal(semanticResultWasBatched(a), true, 'the batched sibling keeps the batch marker');
+  assert.equal(semanticResultWasBatched(b), false, 'a per-channel retry is a normal single call');
 });
 
 test('a malformed whole-batch container fails the batch instead of issuing N+1 calls', async () => {

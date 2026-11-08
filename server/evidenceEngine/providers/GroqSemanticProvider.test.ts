@@ -300,6 +300,14 @@ test('batch calls scale the Groq completion allowance but never beyond the cap',
     assert.equal(bodies[0].max_completion_tokens, 800, 'single-call default must stay unchanged');
     assert.equal(bodies[1].max_completion_tokens, 4000, 'batch allowance must scale with batch size');
     assert.equal(bodies[2].max_completion_tokens, 8192, 'batch allowance must stay bounded');
+    // An operator-configured value above the cap still bounds a batch. The
+    // single call keeps the explicit allowance, but a batch envelope may not
+    // grow without bound with it.
+    process.env.GROQ_MAX_COMPLETION_TOKENS = '12000';
+    await client!.classify('configured single', 'model');
+    await client!.classify('configured oversized batch', 'model', undefined, undefined, { batchSize: 5 });
+    assert.equal(bodies[3].max_completion_tokens, 12000, 'single-call operator allowance must be honored');
+    assert.equal(bodies[4].max_completion_tokens, 8192, 'oversized operator values must still cap a batch at 8192');
   } finally {
     globalThis.fetch = savedFetch;
     if (savedKey === undefined) delete process.env.GROQ_API_KEY;
@@ -1388,6 +1396,29 @@ test('groq batch prompt capping bounds a structured repair request without dropp
   assert.deepEqual(embedded.documents.map((document: any) => document.ref), repairDocuments.map(document => document.ref));
   assert.ok(embedded.documents[0].text.length > 0, 'evidence must not be deleted outright');
   assert.ok(embedded.documents[0].text.length < repairDocuments[0].text.length);
+});
+
+test('groq batch prompt capping bounds an oversized raw repair member without dropping it', () => {
+  const header = 'Your previous classification is missing required field citations. Keep label=UNRELATED, confidence=96, supportedLanguage=true.';
+  const rawRepair = `${header}${SEMANTIC_REPAIR_REQUEST_MARKER}${'unstructured repair tail '.repeat(500)}`;
+  const candidatePrompt = JSON.stringify({
+    task: 'CANDIDATE',
+    documents: [{ ref: { field: 'channel_title' }, text: 'Channel 1' }],
+  });
+  const batch = buildSemanticBatchPrompt([rawRepair, candidatePrompt]);
+  const capped = capGroqSemanticPrompt(batch, 4_000, 1_600);
+  assert.ok(capped.length <= 4_000);
+  assert.ok(estimateGroqTokens(capped) <= 1_600);
+  const parsed = JSON.parse(capped);
+  assert.equal(parsed.inputs.length, 2);
+  const member = parsed.inputs[0].request;
+  assert.equal(typeof member.raw, 'string', 'a raw repair member must survive as bounded text');
+  assert.equal(member.repairRequest, undefined);
+  assert.equal(member.contextTruncated, true);
+  assert.ok(member.raw.startsWith(header), 'repair instructions must stay in front of the raw text');
+  assert.ok(member.raw.length > 0, 'the raw member must not be dropped outright');
+  assert.ok(member.raw.length < rawRepair.length, 'the raw member must be shortened to fit the batch budget');
+  assert.equal(parsed.inputs[1].request.documents[0].text, 'Channel 1');
 });
 
 test('an over-budget prompt fails closed before arming the deadline timer or fetching', async () => {

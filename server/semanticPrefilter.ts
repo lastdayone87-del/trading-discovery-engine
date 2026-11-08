@@ -1,4 +1,5 @@
 import type { RawChannelInput } from './evidenceEngine/types';
+import { creatorOwnedEvidenceCorpus } from './evidenceEngine/canonicalEvidencePlane';
 
 /**
  * Phase 4 deterministic semantic prefilter.
@@ -142,7 +143,11 @@ export function semanticPrefilterInputFromRaw(input: RawChannelInput): SemanticP
     externalLinkLabels: (input.external_link_details || []).map(link => link.label || ''),
     transcriptExcerpts: (input.transcript_excerpts || []).map(excerpt => excerpt.text),
     visualEvidence: (input.visual_evidence || []).map(visual => visual.description),
-    evidenceCorpus: (input.evidence_corpus || []).map(document => document.text),
+    // Only creator-owned documents are model-facing evidence. Retrieval
+    // provenance (`search_match_context`) can contain the trading query that
+    // found the channel; scanning it would let an unrelated creator dodge the
+    // prefilter that the semantic prompt applies.
+    evidenceCorpus: creatorOwnedEvidenceCorpus(input).map(document => document.text),
     pinnedComment: input.pinned_comment,
     subscriberCount: numeric(input.subscriber_count),
     videoCount: numeric(input.video_count),

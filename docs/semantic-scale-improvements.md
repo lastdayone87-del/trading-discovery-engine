@@ -210,7 +210,8 @@ currently running pool.
 | `SEMANTIC_PREFILTER_MIN_SUBSCRIBERS` | `50` | Low-audience thin-surface threshold. |
 | `SEMANTIC_BATCH_CLASSIFICATION_ENABLED` | `false` | `true` enables coalescing. |
 | `SEMANTIC_BATCH_MAX_SIZE` | `8` | Clamped 2–10. |
-| `SEMANTIC_BATCH_WINDOW_MS` | `400` | Clamped 0–10 000; must fit the 2 s attempt budget. |
+| `SEMANTIC_BATCH_WINDOW_MS` | `400` | Clamped 0–2000; must fit the 2 s attempt budget. |
+| `SEMANTIC_BATCH_MAX_PROMPT_CHARS` | `120000` | Serialized batch budget, clamped 20000–400000; oversized batches split before dispatch. |
 | `GEMINI_ORG_MIN_INTERVAL_MS` | `6000` | Per-account pacing. |
 | `GEMINI_ORG_MAX_CALLS_PER_MINUTE` | `10` | Per-account rolling bucket; `0` disables. |
 | `GEMINI_ORG_RATE_WINDOW_MS` | `60000` | Rolling window length. |

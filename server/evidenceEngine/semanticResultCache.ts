@@ -3,6 +3,7 @@ import { classificationInputChecksum } from '../classificationInputChecksum';
 import type { RawChannelInput } from './types';
 import type { SemanticModelResult } from './providers/GeminiSemanticProvider';
 import { isSemanticResultShape } from './semanticResultShape';
+import { citationsReferenceSuppliedDocuments } from './semanticDocumentRefs';
 
 /**
  * Phase 4 semantic result cache.
@@ -16,7 +17,7 @@ import { isSemanticResultShape } from './semanticResultShape';
  * degrades to a normal provider call. It must never change classification
  * semantics, only avoid paying for an identical question twice.
  */
-export const SEMANTIC_RESULT_CACHE_VERSION = 'semantic-result-cache-v1';
+export const SEMANTIC_RESULT_CACHE_VERSION = 'semantic-result-cache-v2';
 export const SEMANTIC_RESULT_CACHE_HIT_REASON = 'SEMANTIC_RESULT_CACHE_HIT';
 export const DEFAULT_SEMANTIC_RESULT_CACHE_TIMEOUT_MS = 500;
 
@@ -131,20 +132,22 @@ function boundedCacheOperation<T>(operation: Promise<T>, options: SemanticResult
  * Structural guard for cached rows. The cache is fail-open, so an incomplete
  * or corrupt row must be treated as a miss. Validate every field the provider
  * consumes downstream, not just the label: a partial object must never reach
- * evidence construction.
+ * evidence construction. A cached value must also cite at least one supplied
+ * document; uncited rows are transient abstentions, not replayable verdicts.
  */
-export function isUsableCachedResult(value: unknown): value is SemanticModelResult {
-  return isSemanticResultShape(value);
+export function isUsableCachedResult(value: unknown, input?: RawChannelInput): value is SemanticModelResult {
+  if (!isSemanticResultShape(value) || value.citations.length === 0) return false;
+  return input ? citationsReferenceSuppliedDocuments(value.citations, input) : true;
 }
 
 /**
  * A cache write is only useful when the result survived the provider boundary
- * with citations. Degenerate/uncited replies (empty model output, failed
- * citation repair) are transient and must stay retryable instead of being
- * replayed for the same evidence forever.
+ * with citations that resolve to the supplied evidence. Degenerate/uncited
+ * replies (empty model output, failed citation repair) are transient and must
+ * stay retryable instead of being replayed for the same evidence forever.
  */
-export function isCacheableSemanticResult(value: unknown): value is SemanticModelResult {
-  return isUsableCachedResult(value) && value.citations.length > 0;
+export function isCacheableSemanticResult(value: unknown, input?: RawChannelInput): value is SemanticModelResult {
+  return isUsableCachedResult(value, input);
 }
 
 // Fail-open circuit breaker: a missing/unreachable database must not make
@@ -199,15 +202,18 @@ export async function readSemanticResultCache(
     noteCacheSuccess();
     const row = res.rows[0];
     if (!row) return undefined;
-    if (!isUsableCachedResult(row.result)) {
+    if (!isUsableCachedResult(row.result, identity.input)) {
       await boundedCacheOperation((async () => {
         const { getDb } = await import('../db');
         const db = await getDb();
         return db.query('DELETE FROM semantic_classification_cache WHERE cache_key=$1', [cacheKey]);
-      })(), {}, env).catch(() => undefined);
+      })(), options, env).catch(() => undefined);
       return undefined;
     }
-    await boundedCacheOperation((async () => {
+    // Hit counting is observability-only and must not add a second round trip
+    // to the classification deadline. The row was already validated; a lost
+    // increment degrades quota-savings evidence, never a verdict.
+    void boundedCacheOperation((async () => {
       const { getDb } = await import('../db');
       const db = await getDb();
       return db.query('UPDATE semantic_classification_cache SET hits=hits+1,last_hit_at=now() WHERE cache_key=$1', [cacheKey]);
@@ -234,9 +240,10 @@ export async function writeSemanticResultCache(
   options: SemanticResultCacheOptions = {},
 ): Promise<void> {
   if (!semanticResultCacheEnabled(env) || !cacheCircuitClosed()) return;
-  // Never persist a partial/degenerate result: the reader would reject it
+  // Never persist a partial/degenerate/uncited result, or a citation that does
+  // not resolve to this input's supplied documents: the reader would reject it
   // anyway, and an uncited abstention must remain eligible for a later retry.
-  if (!isCacheableSemanticResult(value.result)) return;
+  if (!isCacheableSemanticResult(value.result, identity.input)) return;
   const { cacheKey, inputChecksum } = semanticResultCacheKey(identity);
   try {
     await boundedCacheOperation((async () => {

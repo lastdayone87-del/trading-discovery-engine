@@ -2,7 +2,7 @@ import { getDb } from './db';
 import { CLASSIFICATION_JOB_TYPE, resolveEnrichmentWorkerCount } from './classificationDecoupling';
 import { diagnoseEnrichmentBacklog } from './enrichmentBacklogDiagnosis';
 import { semanticPrefilterSnapshot } from './semanticPrefilter';
-import { enrichmentScaleThresholds, evaluateEnrichmentScaleGate, getRunningEnrichmentWorkerCount, loadEnrichmentScaleMetricsWithinDeadline } from './enrichmentScaleGate';
+import { enrichmentScaleMetricsTimeoutMs, enrichmentScaleThresholds, evaluateEnrichmentScaleGate, getRunningEnrichmentWorkerCount, loadEnrichmentScaleMetricsWithinDeadline } from './enrichmentScaleGate';
 
 /**
  * Build the read-only diagnostic SQL for one queue job type. The job type is a
@@ -189,7 +189,13 @@ async function phase4Diagnostics():Promise<any>{
   let enrichmentScale:any=null;
   try{
     const db=await getDb();
-    const cache=await db.query(`SELECT COUNT(*)::int AS entries,COALESCE(SUM(hits),0)::int AS hits,MAX(last_hit_at) AS last_hit_at,MAX(created_at) AS newest_entry_at FROM semantic_classification_cache`);
+    // The pool wrapper is typed for text-only queries; node-postgres accepts
+    // the config object and honors query_timeout, so an unbounded scan here
+    // cannot outlive the diagnostics request.
+    const cache=await db.query({
+      text:`SELECT COUNT(*)::int AS entries,COALESCE(SUM(hits),0)::int AS hits,MAX(last_hit_at) AS last_hit_at,MAX(created_at) AS newest_entry_at FROM semantic_classification_cache`,
+      query_timeout:enrichmentScaleMetricsTimeoutMs(),
+    } as unknown as string);
     semanticCache=cache.rows[0]||null;
   }catch(error){
     semanticCache={unavailable:error instanceof Error?error.message:'unavailable'};

@@ -3,11 +3,11 @@ import { appendProviderCallEvent } from '../../db';
 import { executeProviderCall, getGeminiOrgSemanticCooldownExpiry, ProviderCallError, resolveGeminiRouteId } from '../../providerResilience';
 import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../semanticCalibration';
 import type { EvidenceCategory, EvidenceFieldRef, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
-import { documentRef } from '../canonicalEvidencePlane';
 import { abortedByDeadline } from './abortReason';
 import { readSemanticResultCache, SEMANTIC_RESULT_CACHE_HIT_REASON, writeSemanticResultCache } from '../semanticResultCache';
 import { applySemanticPrefilter, recordSemanticPrefilterOutcome } from '../../semanticPrefilter';
-import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, semanticBatchConfig } from '../semanticBatch';
+import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, semanticBatchConfig, semanticResultWasBatched } from '../semanticBatch';
+import { semanticFieldDocuments } from '../semanticDocumentRefs';
 import { SEMANTIC_RESULT_FIELD_NAMES, SEMANTIC_RESULT_LABELS, isSemanticResultShape, type SemanticResultLabel } from '../semanticResultShape';
 
 export const SEMANTIC_PROMPT_VERSION = 'priority2-multilingual-structured-1';
@@ -312,33 +312,6 @@ function defaultClient(): SemanticModelClient | undefined {
   }};
 }
 
-function fieldDocuments(input: RawChannelInput) {
-  if(input.evidence_corpus?.length)return input.evidence_corpus.filter(document=>!['activity_metadata','search_match_context','country','language'].includes(document.field)).slice(0,40).map(document=>({ref:documentRef(document),text:document.text}));
-  return [
-    { ref: { field: 'channel_title' as const }, text: input.channel_name },
-    { ref: { field: 'channel_bio' as const }, text: input.description },
-    ...(input.videos || (input.video_titles || []).map((title, index) => ({ title, description: input.video_descriptions?.[index] }))).slice(0, 12).flatMap((video, index) => [
-      { ref: { field: 'video_title' as const, index, sourceId: 'id' in video ? video.id : undefined, publishedAt: 'published_at' in video ? video.published_at : undefined }, text: video.title },
-      { ref: { field: 'video_description' as const, index, sourceId: 'id' in video ? video.id : undefined }, text: video.description || '' }
-    ]),
-    ...(input.playlists || []).slice(0, 6).flatMap((playlist, index) => [
-      { ref: { field: 'playlist_name' as const, index, sourceId: playlist.id }, text: playlist.name },
-      { ref: { field: 'playlist_description' as const, index, sourceId: playlist.id }, text: playlist.description || '' }
-    ]),
-    ...(input.transcript_excerpts || []).slice(0, 4).map((excerpt, index) => ({ ref: { field: 'transcript_excerpt' as const, index, sourceId: excerpt.video_id }, text: excerpt.text }))
-  ].filter(document => document.text?.trim()).map(document => ({ ...document, text: document.text.slice(0, 1200) }));
-}
-
-/**
- * Exact field references emitted for one input (see buildSemanticPrompt).
- * Shared source of truth for validating repaired citations: prompt
- * construction and citation validation read the same document set, so a
- * repaired citation can only ever attribute a supplied document.
- */
-export function candidateDocumentRefs(input: RawChannelInput): EvidenceFieldRef[] {
-  return fieldDocuments(input).map(document => document.ref);
-}
-
 /** Shared creator-context gate (see buildSemanticPrompt). */
 export function hasCreatorLevelSemanticContext(input: RawChannelInput): boolean {
   const retrievalOnly = !!input.search_match_context && (input.enrichment_stage || 0) === 0;
@@ -368,7 +341,7 @@ export function buildSemanticPrompt(input: RawChannelInput, tier: 'CANDIDATE' | 
       'Distinguish active trading, investing education, financial news, personal finance, hype, and unrelated content.',
       'Return JSON with label, confidence 0..100, supportedLanguage, reasonCodes, explanation, concepts, languages, citations.'
     ],
-    declaredCountry: input.country || null, declaredLanguageHints: input.detected_languages || [], documents: fieldDocuments(input)
+    declaredCountry: input.country || null, declaredLanguageHints: input.detected_languages || [], documents: semanticFieldDocuments(input)
   });
 }
 
@@ -451,6 +424,11 @@ export class GeminiSemanticProvider implements EvidenceProvider {
       // a missing/partial reply into an AMBIGUOUS abstention; persisting that
       // placeholder would replay it for the same evidence indefinitely.
       let cacheable = isSemanticResultShape(candidate.value);
+      // A verdict produced inside a multi-channel batch saw sibling evidence
+      // and a different completion allowance. It is not interchangeable with a
+      // solo call for the same channel, so keeping it out of the cache avoids
+      // replaying a result whose realized request cannot be keyed cheaply.
+      let batchedOutput = semanticResultWasBatched(candidate.value);
       result = parse(candidate.value);
       model = candidate.model;
       fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
@@ -461,8 +439,10 @@ export class GeminiSemanticProvider implements EvidenceProvider {
       if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && adjudicationEnabled && !candidate.fallbackUsed) {
         const adjudicatedValue = await classifySemanticPrompt({ client, prompt: prompt(input, 'ADJUDICATION'), model: adjudicatorModel, observability, signal });
         cacheable = isSemanticResultShape(adjudicatedValue);
+        batchedOutput = batchedOutput || semanticResultWasBatched(adjudicatedValue);
         result = parse(adjudicatedValue); model = adjudicatorModel;
       }
+      cacheable = cacheable && !batchedOutput;
       // Cache the final (possibly adjudicated) verdict. A later recheck of the
       // same evidence under the same prompt/model versions replays this result
       // without spending provider quota. Injected clients are a test/shadow
