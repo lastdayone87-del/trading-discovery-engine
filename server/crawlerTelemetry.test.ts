@@ -519,7 +519,10 @@ test('ledger persists sanitized telemetry wholesale into observation provenance'
   // crawler → result → observation → ledger without further mapping.
   const dbCore = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
   assert.match(dbCore, /const telemetry=safeCrawlerTelemetry\(observation\.telemetry\)/);
-  assert.match(dbCore, /\.\.\.\(telemetry\?\{crawlerTelemetry:telemetry\}:\{\}\)/);
+  // Lane attribution is merged into the sanitized telemetry (never replacing
+  // it), then the whole object is serialized at the provenance boundary.
+  assert.match(dbCore, /const telemetryWithAttribution=telemetry&&laneAttribution\?\{\.\.\.telemetry,acquisitionLane:laneAttribution\.lane/);
+  assert.match(dbCore, /\.\.\.\(telemetryWithAttribution\?\{crawlerTelemetry:telemetryWithAttribution\}:\{\}\)/);
 });
 
 test('sanitizer redacts sensitive cause text independently of callers', () => {

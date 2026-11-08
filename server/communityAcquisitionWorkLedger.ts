@@ -281,9 +281,14 @@ export function failureClassOf(observation: CommunityWorkObservation): string {
   return String(observation.failureClass || '').trim().toUpperCase();
 }
 
+/** Shared class predicate so lane telemetry cannot drift from work accounting. */
+export function isInfrastructureFailureClass(value: unknown): boolean {
+  return INFRA_FAILURE_CLASSES.has(String(value || '').trim().toUpperCase());
+}
+
 export function isInfrastructureFailure(observation: CommunityWorkObservation): boolean {
   return observation.outcome === 'ACQUISITION_FAILED'
-    && INFRA_FAILURE_CLASSES.has(failureClassOf(observation));
+    && isInfrastructureFailureClass(observation.failureClass);
 }
 
 /**
@@ -487,7 +492,7 @@ export function resolveCommunityWorkState(
   if (attempts >= maxAttempts) {
     return { state: 'EXHAUSTED', terminalReason: 'MAX_ATTEMPTS' };
   }
-  if (latest.outcome === 'ACQUISITION_FAILED' && INFRA_FAILURE_CLASSES.has(failureClass)) {
+  if (latest.outcome === 'ACQUISITION_FAILED' && isInfrastructureFailureClass(failureClass)) {
     return { state: 'PARKED_INFRA', terminalReason: failureClass };
   }
   return { state: 'PENDING', terminalReason: null };

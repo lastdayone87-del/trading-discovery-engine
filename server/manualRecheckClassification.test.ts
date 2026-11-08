@@ -24,7 +24,7 @@ test('manual recheck may continue community inspection only through the explicit
   assert.match(recheck, /canContinueCommunityInspectionAfterDegradedManualClassification\(/);
   assert.match(recheck, /existingTradingStatus:\s*preserved\.trading_status/);
   assert.match(recheck, /errorCode:\s*code/);
-  assert.match(recheck, /inspectAndValidateChannel\(preserved, freshCandidate, true, enableDebug, false\)/);
+  assert.match(recheck, /inspectAndValidateChannel\(preserved, freshCandidate, true, enableDebug, false, undefined, \{ lane: 'MANUAL', jobType: 'MANUAL_RECHECK', slicePass: 1 \}\)/);
   assert.match(recheck, /MANUAL_RESCAN_COMMUNITY_INCOMPLETE/);
 });
 

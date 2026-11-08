@@ -2,6 +2,7 @@ import { ChannelRecord, DiscoverySource, DiscordStatus } from '../src/types';
 import { DiscoveredChannelRaw, classifierLanguageInputs, fetchYouTubeChannelCountryMetadata } from './youtube';
 import { aggregatedLanguageCandidateSet, validateChannelCountry } from './countryValidator';
 import { bumpGate1Evaluation } from './operationsTelemetry';
+import type { AcquisitionLane } from './acquisitionLaneKeys';
 import { resolveScopeEligibility } from './scopeEligibility';
 import { classifyTradingRelevanceDetailed } from './tradingRelevanceClassifier';
 import { runAndRecordAdaptiveShadow } from './adaptiveTradingClassifier';
@@ -191,6 +192,9 @@ export interface PipelineExecutionOptions {
   /** Observability attribution for semantic provider ledger rows. */
   jobId?: string;
   runId?: string;
+  /** Phase 0 acquisition lane for durable lane telemetry (optional). */
+  lane?: AcquisitionLane;
+  jobType?: string;
 }
 
 export async function processChannelThroughPipeline(
@@ -1006,8 +1010,14 @@ async function processChannelThroughPipelineInContext(
 
   await upsertChannel(activeChannel);
 
-  // Run Discord Inspection Engine
-  await inspectAndValidateChannel(activeChannel, candidate, isManualScan);
+  // Run Discord Inspection Engine. Lane attribution is observational only and
+  // defaults to the pipeline shape when the caller does not supply one.
+  await inspectAndValidateChannel(activeChannel, candidate, isManualScan, false, true, undefined, {
+    lane: options?.lane || (isManualScan ? 'MANUAL' : isEnrichmentPass ? 'ENRICHMENT' : 'DISCOVERY'),
+    ...(options?.jobType ? { jobType: options.jobType } : {}),
+    ...(options?.jobId ? { jobId: options.jobId } : {}),
+    slicePass: 1,
+  });
 
   const finalChannel = (await getChannelById(candidate.channelId)) || activeChannel;
 

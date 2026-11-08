@@ -162,7 +162,7 @@ async function defaultIngestChannel(
     'automated_query',
     false,
     false,
-    { quotaOrigin: 'PROBE' },
+    { quotaOrigin: 'PROBE', lane: 'DISCOVERY', jobType: 'DISCOVERY_PROBE' },
   );
   return { wasKnown: outcome.wasKnown, isNew: outcome.isNew, persisted: outcome.persisted };
 }
