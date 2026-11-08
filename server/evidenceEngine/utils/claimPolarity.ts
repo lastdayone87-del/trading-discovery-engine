@@ -57,7 +57,7 @@ const HYPOTHETICAL_CUES: Record<LanguageCode, string[]> = {
   // Bare conditionals ("if", "when", "si", "se", "wenn") are ordinary creator
   // framing ("If you want to learn day trading"). Only explicit hypothetical
   // frames qualify.
-  en: ['imagine', 'suppose', 'supposing', 'what if', 'hypothetically', 'pretend', 'would', 'could', 'might'],
+  en: ['imagine', 'suppose', 'supposing', 'what if', 'hypothetically', 'pretend', 'would', 'could', 'might', 'may', 'in theory'],
   de: ['stell dir vor', 'angenommen', 'würde', 'könnte'],
   fr: ['imaginez', 'imagine', 'supposons', 'pourrait', 'serait', 'peut-être'],
   es: ['imagina', 'supongamos', 'podría', 'sería', 'quizás', 'tal vez'],
@@ -73,7 +73,7 @@ const HYPOTHETICAL_CUES: Record<LanguageCode, string[]> = {
 };
 
 const CRITICISM_CUE = /\b(?:scam(?:mers?|med)?|fake|fraud(?:ulent)?|beware|avoid|myth|debunk(?:ed|ing)?|so-called|snake\s*oil|too\s*good\s*to\s*be\s*true|misleading|lies?|red\s*flags?)\b/iu;
-const ATTRIBUTION_CUE = /\b(?:they|these|those|gurus?|scammers?|sellers?|promoters?|influencers?)\b[^.!?;\n]{0,48}\b(?:say|says|promise|promises|promised|claim|claims|claimed|sell|sells|teach|teaches)\b/iu;
+const ATTRIBUTION_CUE = /\b(?:they|these|those|gurus?|scammers?|courses?|sellers?|promoters?|influencers?)\b[^.!?;\n]{0,48}\b(?:say|says|promise|promises|promised|claim|claims|claimed|sell|sells|teach|teaches)\b/iu;
 // Criticism/quotation framing only neutralizes claim-like language. "Avoid
 // fake breakouts with order flow" is asserted education, not a quoted hype
 // claim about order flow.
@@ -288,12 +288,15 @@ export function classifyClaimPolarity(
   const quotationFrame = CRITICISM_CUE.test(nearbyWindow) || ATTRIBUTION_CUE.test(nearbyWindow);
   const attributionBefore = ATTRIBUTION_CUE.test(before);
   const criticismBefore = CRITICISM_CUE.test(before);
-  if (quotationFrame && (attributionBefore || (termLooksLikeClaim && criticismBefore))) {
+  // "My courses teach day trading" is the creator's own course, not a claim
+  // attributed to someone else; "Scam courses teach day trading" is criticism.
+  const ownCourse = /\b(?:my|our)\s+courses?\b/iu.test(before);
+  if (quotationFrame && ((attributionBefore && !ownCourse) || (termLooksLikeClaim && criticismBefore))) {
     const cue = (ATTRIBUTION_CUE.exec(before) || CRITICISM_CUE.exec(before) || [undefined])[0];
     return { polarity: 'QUOTED', cue, confidence: 0.88 };
   }
   if (isInsideQuotes(normalized, start, end)
-    && (ATTRIBUTION_CUE.test(nearbyWindow) || (termLooksLikeClaim && CRITICISM_CUE.test(nearbyWindow)))) {
+    && ((ATTRIBUTION_CUE.test(nearbyWindow) && !ownCourse) || (termLooksLikeClaim && CRITICISM_CUE.test(nearbyWindow)))) {
     const cue = (ATTRIBUTION_CUE.exec(nearbyWindow) || CRITICISM_CUE.exec(nearbyWindow) || [undefined])[0];
     return { polarity: 'QUOTED', cue, confidence: 0.85 };
   }

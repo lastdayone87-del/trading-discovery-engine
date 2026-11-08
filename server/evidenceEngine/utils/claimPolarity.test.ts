@@ -25,6 +25,7 @@ test('claim polarity distinguishes assertions, disclaimers and negations', () =>
 test('claim polarity neutralizes quoted criticism and hypotheticals', () => {
   assert.equal(polarity('Scam gurus promise guaranteed profits', 'guaranteed profit'), 'QUOTED');
   assert.equal(polarity('Scam gurus teach forex', 'forex'), 'QUOTED');
+  assert.equal(polarity('Scam courses teach day trading', 'day trading'), 'QUOTED');
   assert.equal(polarity('They say guaranteed profits, then lose money', 'guaranteed profit'), 'QUOTED');
   assert.equal(polarity('Imagine guaranteed profits, then lose money', 'guaranteed profit'), 'HYPOTHETICAL');
   assert.equal(polarity('"Guaranteed profits" is a red flag', 'guaranteed profit'), 'QUOTED');
@@ -34,6 +35,8 @@ test('claim polarity neutralizes quoted criticism and hypotheticals', () => {
   assert.equal(polarity('Crypto trader teaching beginners to avoid scams', 'crypto trader'), 'ASSERTED');
   assert.equal(polarity('My courses teach day trading and order flow', 'day trading'), 'ASSERTED');
   assert.equal(polarity('Le day trading pourrait devenir mon activité', 'day trading'), 'HYPOTHETICAL');
+  assert.equal(polarity('Day trading may become my activity', 'day trading'), 'HYPOTHETICAL');
+  assert.equal(polarity('Day trading in theory', 'day trading'), 'HYPOTHETICAL');
   assert.equal(polarity('Guaranteed profits? Not financial advice.', 'guaranteed profit'), 'ASSERTED');
   assert.equal(polarity('Forex trading? No, this is a cooking channel.', 'forex trading'), 'NEGATED');
   assert.equal(polarity("Ce n'est pas du trading", 'trading'), 'NEGATED');
