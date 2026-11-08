@@ -44,7 +44,27 @@ export function matchedTerms(text: string, terms: string[]): string[] {
  * requires an independent market/instrument/venue dimension.
  */
 export function isTradingFocusedText(text: string, context: LayeredKnowledgeContext): boolean {
-  return isAffirmativeTradingText(String(text || '').normalize('NFKC'), context);
+  const normalized = String(text || '').normalize('NFKC');
+  // The predicate must see language packs matched from the text itself, not
+  // only the country's configured language. A US channel can post German or
+  // Japanese trading titles.
+  const contentPacks = contentLanguagePacks({ channel_name: '', description: normalized }, context);
+  const byCode = new Map((context.languageKnowledgePacks || []).map(pack => [pack.languageCode, pack]));
+  for (const pack of contentPacks) {
+    if (!byCode.has(pack.languageCode)) {
+      byCode.set(pack.languageCode, {
+        languageCode: pack.languageCode,
+        languageName: pack.languageCode,
+        positiveTerms: [],
+        negativeTerms: [],
+        commonPhrases: [],
+      });
+    }
+  }
+  return isAffirmativeTradingText(normalized, {
+    ...context,
+    languageKnowledgePacks: [...byCode.values()],
+  });
 }
 
 /** Known Tier A signals, used for C2 aggregation (distinct signals, not repeats). */

@@ -160,6 +160,11 @@ test('shared taxonomy classifies multilingual trading, commentary and non-tradin
     ['Nasdaq : la claque ! Panique ou opportunité ?', 'TRADING_ADJACENT'],
     ['Or sous 4 000 $ : pourquoi j’ai coupé ma position', 'TRADING_ADJACENT'],
     ['Trading au sens large', 'TRADING_ADJACENT'],
+    ['Minecraft es mi vida', 'UNRELATED'],
+    ['El sol', 'UNINFORMATIVE'],
+    ['Menu options', 'UNINFORMATIVE'],
+    ['ES futures trading', 'TRADING_CORE'],
+    ['Options trading', 'TRADING_CORE'],
     ['Les bases de Trading', 'TRADING_ADJACENT'],
     ['Nq trading videos', 'TRADING_CORE'],
     ['Trades for 1st day of July 2022', 'TRADING_CORE'],
@@ -225,6 +230,30 @@ test('negative evidence roles keep only creator-level unrelated-domain evidence 
   assert.equal(classifyNegativeEvidenceRole(negative({})), 'CONFIDENCE_PENALTY');
   assert.equal(classifyNegativeEvidenceRole(negative({ category: 'NON_TRADING_ADJACENT' })), 'CONFIDENCE_PENALTY');
   assert.equal(classifyNegativeEvidenceRole(negative({ category: 'IRRELEVANT_DOMAIN' })), 'TERMINAL');
+  assert.equal(classifyNegativeEvidenceRole(negative({
+    category: 'IRRELEVANT_DOMAIN',
+    provenance: {
+      provider: 'channel_metadata', type: 'IRRELEVANT_DOMAIN', matchedTerm: 'gaming', sourceRef: 'video',
+      fields: [{ field: 'video_title', sourceId: 'v1', sourceFamilyId: 'video:v1' }],
+    },
+  })), 'CONFIDENCE_PENALTY');
+  assert.equal(classifyNegativeEvidenceRole(negative({
+    category: 'IRRELEVANT_DOMAIN',
+    provenance: {
+      provider: 'channel_metadata', type: 'IRRELEVANT_DOMAIN', matchedTerm: 'gaming', sourceRef: 'videos',
+      fields: [
+        { field: 'video_title', sourceId: 'v1', sourceFamilyId: 'video:v1' },
+        { field: 'video_title', sourceId: 'v2', sourceFamilyId: 'video:v2' },
+      ],
+    },
+  })), 'TERMINAL');
+  assert.equal(classifyNegativeEvidenceRole(negative({
+    category: 'IRRELEVANT_DOMAIN',
+    provenance: {
+      provider: 'channel_metadata', type: 'IRRELEVANT_DOMAIN', matchedTerm: 'gaming', sourceRef: 'bio',
+      fields: [{ field: 'channel_bio', sourceId: 'about' }],
+    },
+  })), 'TERMINAL');
   assert.equal(classifyNegativeEvidenceRole(negative({ claimPolarity: 'DISCLAIMER' })), 'DISCLAIMER');
   assert.equal(classifyNegativeEvidenceRole(negative({ claimPolarity: 'QUOTED' })), 'QUOTED');
   assert.equal(negativeEvidencePolicyWeight(negative({ claimPolarity: 'DISCLAIMER' })), 0);

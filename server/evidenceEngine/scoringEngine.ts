@@ -11,6 +11,7 @@ import { evaluateClassificationStages } from './stagedClassification';
 import { ENGINE_VERSIONS, getScoringConfig } from './config';
 import { TradingCategory } from '../../src/types';
 import { evaluateUnifiedDecisionPolicy, UNIFIED_DECISION_POLICY_VERSION } from './decisionPolicy';
+import { negativeEvidencePolicyWeight } from './negativeEvidenceRole';
 import type { ContextualCompositionReport } from './contextualComposition';
 import type { RecognitionAssessment } from './recognitionState';
 
@@ -45,7 +46,7 @@ export class ConfigurableWeightedStrategy {
     const negativeItems = evidenceItems.filter(i => i.polarity === 'NEGATIVE');
 
     const totalPositiveWeight = positiveItems.reduce((acc, curr) => acc + Math.abs(curr.finalWeight), 0);
-    const totalNegativeWeight = negativeItems.reduce((acc, curr) => acc + Math.abs(curr.finalWeight), 0);
+    const totalNegativeWeight = negativeItems.reduce((acc, curr) => acc + negativeEvidencePolicyWeight(curr), 0);
     // Multi-video consistency ratio check
     const consistencyItem = evidenceItems.find(i => i.category === 'MULTI_VIDEO_CONSISTENCY');
     let consistencyRatio = 0.5; // default if no video titles present

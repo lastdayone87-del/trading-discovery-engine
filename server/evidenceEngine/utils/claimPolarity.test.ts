@@ -25,7 +25,7 @@ test('claim polarity distinguishes assertions, disclaimers and negations', () =>
 test('claim polarity neutralizes quoted criticism and hypotheticals', () => {
   assert.equal(polarity('Scam gurus promise guaranteed profits', 'guaranteed profit'), 'QUOTED');
   assert.equal(polarity('They say guaranteed profits, then lose money', 'guaranteed profit'), 'QUOTED');
-  assert.equal(polarity('If you want guaranteed profits, this is not for you', 'guaranteed profit'), 'HYPOTHETICAL');
+  assert.equal(polarity('Imagine guaranteed profits, then lose money', 'guaranteed profit'), 'HYPOTHETICAL');
   assert.equal(polarity('"Guaranteed profits" is a red flag', 'guaranteed profit'), 'QUOTED');
 });
 
@@ -42,6 +42,21 @@ test('multilingual disclaimer frames are recognized', () => {
   assert.equal(polarity('Pas de conseil en investissement', 'conseil'), 'DISCLAIMER');
   assert.equal(polarity('Sin garantía de ganancias', 'garantía'), 'DISCLAIMER');
   assert.equal(polarity('过去的表现不代表未来收益', '表现'), 'DISCLAIMER');
+});
+
+test('claim polarity keeps ordinary creator framing asserted', () => {
+  assert.equal(polarity("I don't need a broker, I trade stocks daily", 'stocks'), 'ASSERTED');
+  assert.equal(polarity('I do not trade stocks and teach trading strategy', 'stocks'), 'NEGATED');
+  assert.equal(polarity('I do not trade stocks and teach trading strategy', 'trading strategy'), 'ASSERTED');
+  assert.equal(polarity('I teach day trading, no hype', 'day trading'), 'ASSERTED');
+  assert.equal(polarity('No experience needed: learn forex trading', 'forex'), 'ASSERTED');
+  assert.equal(polarity('No BS Forex Trading', 'forex'), 'ASSERTED');
+  assert.equal(polarity('Zero to Hero Forex', 'forex'), 'ASSERTED');
+  assert.equal(polarity('If you want to learn day trading, subscribe', 'day trading'), 'ASSERTED');
+  // Criticism only neutralizes claim-like language, not a trading method it
+  // merely appears near.
+  assert.equal(polarity('Avoid fake breakouts with order flow', 'order flow'), 'ASSERTED');
+  assert.equal(polarity('Trading could happen', 'trading'), 'HYPOTHETICAL');
 });
 
 test('affirmedTerms keeps only asserted occurrences', () => {

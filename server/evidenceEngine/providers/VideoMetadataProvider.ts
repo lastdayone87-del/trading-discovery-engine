@@ -1,7 +1,7 @@
 import { EvidenceItem, EvidenceProvider, RawChannelInput, LayeredKnowledgeContext } from '../types';
 import { pushUniqueMatch } from '../utils/textMatching';
 import { findScopedTermMatches } from '../utils/claimPolarity';
-import { affirmedTierATradingSignals, assessTradingText } from '../tradingSignalTaxonomy';
+import { affirmedTierATradingSignals, assessTradingText, hasIndependentMarketFrame, requiresMarketFrameForProvider } from '../tradingSignalTaxonomy';
 import { isTradingFocusedText } from '../multilingualTerminology';
 
 /**
@@ -31,13 +31,6 @@ function hasAssertedTerm(text: string, term: string): boolean {
 
 export function isExplicitCreatorTradingText(text: string, context: LayeredKnowledgeContext): boolean {
   const normalized = text.normalize('NFKC');
-  // A negated or disclaimed occurrence is not an explicit creator claim. The
-  // taxonomy assessment is polarity-aware; an ambiguous legacy match (for
-  // example "Strategia di Trading") still falls through to the historical
-  // qualifier rules below.
-  const assessment = assessTradingText(normalized, context);
-  if (assessment.focus === 'TRADING_CORE' || assessment.focus === 'TRADING_ADJACENT') return true;
-  if (assessment.signals.length > 0 && assessment.assertedSignals.length === 0) return false;
   const unrelatedTradingUsage = /\b(trading\s*cards?|card\s*trading|pok[eé]mon|yugioh|steam\s*trading|skin\s*trading|sports?\s*card)\b/iu;
   // "Trader Joe's" is a grocery brand, not a trading creator. Excluding the
   // brand avoids both the generic-literal path and the "of Trader" domain
@@ -81,6 +74,14 @@ export function isExplicitCreatorTradingText(text: string, context: LayeredKnowl
   if (unrelatedTradingUsage.test(normalized)) {
     return hasExplicitFinancialLiteral || hasKnownPlatform || hasCountryTradingSignal;
   }
+
+  // A negated or disclaimed occurrence is not an explicit creator claim. Run
+  // this only after the brand/card guards so an instrument mention cannot
+  // bypass those exclusions.
+  const assessment = assessTradingText(normalized, context);
+  if (assessment.focus === 'TRADING_CORE' || assessment.focus === 'TRADING_ADJACENT') return true;
+  const assertedTradingSignals = assessment.assertedSignals.filter(match => match.category !== 'NON_TRADING');
+  if (assessment.signals.length > 0 && assertedTradingSignals.length === 0) return false;
 
   return hasTierASignal
     || hasExplicitFinancialLiteral
@@ -137,12 +138,23 @@ export class VideoMetadataProvider implements EvidenceProvider {
       const title = titles[i] || '';
       const desc = descriptions[i] || '';
       const combo = `${title} ${desc}`;
+      const hasAssertedInFields = (term: string) =>
+        hasAssertedTerm(title, term) || (Boolean(desc) && hasAssertedTerm(desc, term));
 
-      const isTrading = isTradingFocusedText(combo, knowledgeContext) || isExplicitCreatorTradingText(combo, knowledgeContext);
+      // Assess title and description separately so a title negation cannot
+      // suppress an asserted description claim.
+      const isTrading = isTradingFocusedText(title, knowledgeContext)
+        || isExplicitCreatorTradingText(title, knowledgeContext)
+        || (Boolean(desc) && (isTradingFocusedText(desc, knowledgeContext)
+          || isExplicitCreatorTradingText(desc, knowledgeContext)));
       if (!isTrading) continue;
       tradingFocusedCount++;
       tradingVideoIndexes.add(i);
-      for (const signal of affirmedTierATradingSignals(combo, knowledgeContext)) {
+      const assertedSignals = [
+        ...affirmedTierATradingSignals(title, knowledgeContext),
+        ...(desc ? affirmedTierATradingSignals(desc, knowledgeContext) : []),
+      ];
+      for (const signal of [...new Set(assertedSignals)]) {
         const videos = tierASignalVideos.get(signal) || new Set<number>();
         videos.add(i);
         tierASignalVideos.set(signal, videos);
@@ -151,28 +163,29 @@ export class VideoMetadataProvider implements EvidenceProvider {
       // C2: a video is trading-focused at most once, and specific evidence is
       // only attributed to videos whose text met the corrected predicate.
       for (const inst of knowledgeContext.globalInstruments) {
-        if (hasAssertedTerm(combo, inst)) {
+        if (requiresMarketFrameForProvider(inst) && !hasIndependentMarketFrame(combo)) continue;
+        if (hasAssertedInFields(inst)) {
           pushUniqueMatch(matchedInstrumentsInVideos, inst);
         }
       }
       for (const plat of knowledgeContext.globalPlatformsPropFirms) {
-        if (hasAssertedTerm(combo, plat)) {
+        if (hasAssertedInFields(plat)) {
           pushUniqueMatch(matchedPlatformsInVideos, plat);
         }
       }
       for (const concept of knowledgeContext.globalAdvancedConcepts) {
-        if (hasAssertedTerm(combo, concept)) {
+        if (hasAssertedInFields(concept)) {
           pushUniqueMatch(matchedConceptsInVideos, concept);
         }
       }
       for (const langTerm of (knowledgeContext.languageKnowledgePacks||[knowledgeContext.languageKnowledge]).flatMap(pack=>pack?.positiveTerms||[])) {
         if (GENERIC_TRADING_TERM.test(langTerm.trim())) continue;
-        if (hasAssertedTerm(combo, langTerm)) {
+        if (hasAssertedInFields(langTerm)) {
           pushUniqueMatch(matchedConceptsInVideos, langTerm);
         }
       }
       for (const countryTerm of knowledgeContext.countryKnowledge?.nativeTradingTerminology || []) {
-        if (hasAssertedTerm(combo, countryTerm)) {
+        if (hasAssertedInFields(countryTerm)) {
           pushUniqueMatch(matchedConceptsInVideos, countryTerm);
         }
       }
@@ -187,19 +200,26 @@ export class VideoMetadataProvider implements EvidenceProvider {
       ...matchedPlatformsInVideos,
       ...matchedConceptsInVideos,
     ].map(normalizedSignalKey)).size;
-    // Tier A corroboration must come from more than one video, and repeated
-    // generic method/education phrases collapse to one non-specific signal.
-    // One high-specificity signal (for example DAY_TRADING) repeated across
-    // independent videos is sufficient; generic repeats are not.
-    const genericTierASignals = new Set(['KNOWN_METHOD', 'NATIVE_METHOD', 'NATIVE_EDUCATION']);
+    // Tier A corroboration must come from more than one video. Generic
+    // method/education phrases, bare platform literals and context-gated
+    // risk/ICT terms are not high-specificity consistency signals.
+    const nonSpecificTierASignals = new Set([
+      'KNOWN_METHOD', 'NATIVE_METHOD', 'NATIVE_EDUCATION',
+      'PLATFORM', 'EXECUTION_TERM', 'RISK_MANAGEMENT', 'ICT_METHOD',
+    ]);
     const tierASignalsAcrossVideos = [...tierASignalVideos.entries()]
-      .filter(([signal, videos]) => !genericTierASignals.has(signal) && videos.size >= 2).length;
+      .filter(([signal, videos]) => !nonSpecificTierASignals.has(signal) && videos.size >= 2).length;
+    const coreSignalVideos = [...tierASignalVideos.entries()]
+      .filter(([signal]) => !nonSpecificTierASignals.has(signal))
+      .reduce((total, [, videos]) => total + videos.size, 0);
     // C2 aggregation: a repeated generic phrase is one signal, and a single
     // video cannot establish consistency. Require at least three videos and
     // either one corroborated high-specificity Tier A signal or a high
-    // consistency ratio with distinct contextual signals.
+    // consistency ratio with distinct contextual signals plus at least one
+    // core/identity signal. Adjacent-only market commentary cannot qualify.
     const consistencyEligible = titles.length >= 3
-      && (tierASignalsAcrossVideos >= 1 || (consistencyRatio >= 0.6 && distinctContextualSignals >= 2));
+      && (tierASignalsAcrossVideos >= 1
+        || (coreSignalVideos >= 1 && consistencyRatio >= 0.6 && distinctContextualSignals >= 2));
 
     // 1. Multi-Video Consistency Evidence
     if (consistencyEligible) {

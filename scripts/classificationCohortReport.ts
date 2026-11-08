@@ -7,6 +7,7 @@ import { ExternalLinkProvider } from '../server/evidenceEngine/providers/Externa
 import { MultilingualContextProvider } from '../server/evidenceEngine/providers/MultilingualContextProvider';
 import { VideoMetadataProvider } from '../server/evidenceEngine/providers/VideoMetadataProvider';
 import type { RawChannelInput } from '../server/evidenceEngine/types';
+import { classificationInputChecksum } from '../server/classificationInputChecksum';
 
 /**
  * Read-only classification cohort report.
@@ -79,6 +80,15 @@ function increment(counts: Record<string, number>, key: string | undefined | nul
 }
 
 function deterministicEngine(): EvidenceBasedTradingEngine {
+  // Replay is deliberately deterministic and offline. Clear semantic selector
+  // and cache env so a loaded production environment cannot make a paid model
+  // call or write the semantic cache.
+  for (const key of [
+    'SEMANTIC_PROVIDER', 'SEMANTIC_PROVIDER_FORCE_GEMINI', 'SEMANTIC_RESULT_CACHE_ENABLED',
+    'GEMINI_API_KEY', 'GOOGLE_AI_STUDIO.GEMINI_API_KEY', 'GEMINI_FREE_API_KEY', 'GROQ_API_KEY',
+  ]) {
+    delete process.env[key];
+  }
   return new EvidenceBasedTradingEngine([
     new ChannelMetadataProvider(),
     new VideoMetadataProvider(),
@@ -88,6 +98,8 @@ function deterministicEngine(): EvidenceBasedTradingEngine {
     new DiscordProvider(),
   ]);
 }
+
+const SEMANTIC_PROVIDERS = new Set(['gemini_semantic', 'groq_semantic', 'gemini_free_semantic']);
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
@@ -162,18 +174,61 @@ async function main(): Promise<void> {
     let matched = 0;
     const replayedStatuses: Record<string, number> = {};
     const mismatches: Array<{ channelId: string; stored?: string; replayed?: string }> = [];
+    const semanticRowsExcluded: string[] = [];
+    const semanticRowReplays: Array<{ channelId: string; stored?: string; replayed?: string }> = [];
+    const semanticReplayStatuses: Record<string, number> = {};
+    const checksumMismatches: Array<{ channelId: string; stored?: string; recomputed: string }> = [];
+    const errors: Array<{ channelId: string; error: string }> = [];
     for (const row of rows) {
       if (!row.normalizedInput) continue;
-      const replayed = await engine.evaluateChannel(row.normalizedInput);
-      increment(replayedStatuses, replayed.status);
-      if (replayed.status === row.decision.status) matched++;
-      else mismatches.push({ channelId: row.channelId, stored: row.decision.status, replayed: replayed.status });
+      const storedChecksum = row.decision.replay?.inputChecksum;
+      const recomputed = classificationInputChecksum(row.normalizedInput);
+      if (storedChecksum && storedChecksum !== recomputed) {
+        checksumMismatches.push({ channelId: row.channelId, stored: storedChecksum, recomputed });
+        continue;
+      }
+      const providers = row.decision.evidenceCollection?.providers || [];
+      const usedSemantic = Boolean(row.decision.geminiSemanticSummary)
+        || providers.some((provider: any) =>
+          SEMANTIC_PROVIDERS.has(provider?.provider)
+          && provider?.outcome === 'EXECUTED_WITH_EVIDENCE');
+      if (usedSemantic) {
+        // The deterministic replay intentionally omits semantic evidence.
+        // Report these rows separately instead of counting them as true
+        // classification mismatches.
+        semanticRowsExcluded.push(row.channelId);
+        try {
+          const replayed = await engine.evaluateChannel(row.normalizedInput);
+          increment(semanticReplayStatuses, replayed.status);
+          semanticRowReplays.push({ channelId: row.channelId, stored: row.decision.status, replayed: replayed.status });
+        } catch (error) {
+          errors.push({ channelId: row.channelId, error: error instanceof Error ? error.message : String(error) });
+        }
+        continue;
+      }
+      try {
+        const replayed = await engine.evaluateChannel(row.normalizedInput);
+        increment(replayedStatuses, replayed.status);
+        if (replayed.status === row.decision.status) matched++;
+        else mismatches.push({ channelId: row.channelId, stored: row.decision.status, replayed: replayed.status });
+      } catch (error) {
+        errors.push({ channelId: row.channelId, error: error instanceof Error ? error.message : String(error) });
+      }
     }
     report.replay = {
+      deterministicOnly: true,
       evaluated: matched + mismatches.length,
       matched,
       mismatched: mismatches.length,
       statuses: replayedStatuses,
+      semanticRowsExcluded: semanticRowsExcluded.length,
+      semanticExcludedChannelIds: semanticRowsExcluded.slice(0, 50),
+      semanticReplayStatuses,
+      semanticRowReplays: semanticRowReplays.slice(0, 50),
+      checksumMismatches: checksumMismatches.length,
+      checksumMismatchDetails: checksumMismatches.slice(0, 50),
+      errors: errors.length,
+      errorDetails: errors.slice(0, 50),
       mismatches: mismatches.slice(0, 50),
     };
   }

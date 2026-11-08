@@ -2,7 +2,7 @@ import { getDb } from './db';
 import type { RawChannelInput, VerificationDecision } from './evidenceEngine';
 import { persistClassificationEvidenceBundle } from './evidenceEngine/dualWrite';
 import { classificationInputChecksum, normalizeClassificationInput } from './classificationInputChecksum';
-import { assessNegativeEvidence, NEGATIVE_EVIDENCE_ROLE_VERSION } from './evidenceEngine/negativeEvidenceRole';
+import { assessNegativeEvidence, negativeEvidencePolicyWeight, NEGATIVE_EVIDENCE_ROLE_VERSION } from './evidenceEngine/negativeEvidenceRole';
 import { CONTEXTUAL_COMPOSITION_VERSION } from './evidenceEngine/contextualComposition';
 import { CLAIM_POLARITY_VERSION } from './evidenceEngine/utils/claimPolarity';
 import { TRADING_SIGNAL_TAXONOMY_VERSION } from './evidenceEngine/tradingSignalTaxonomy';
@@ -38,15 +38,29 @@ export async function recordProductionClassification(
   diagnostic: ProductionClassificationDiagnosticInput
 ): Promise<string | undefined> {
   const db = await getDb();
-  const compositionForDiagnostics = diagnostic.decision.compositionReport;
-  const signalMatches = (compositionForDiagnostics?.familyClassifications || []).flatMap(family =>
+  const fullComposition = diagnostic.decision.compositionReport;
+  const compositionForDiagnostics = fullComposition
+    ? {
+      ...fullComposition,
+      familyClassifications: fullComposition.familyClassifications.map(({ signals, suppressedSignals, ...family }) => ({
+        ...family,
+        signalCount: signals?.length || 0,
+        suppressedSignalCount: suppressedSignals?.length || 0,
+      })),
+    }
+    : undefined;
+  const terminalNegativeStatus = diagnostic.decision.evidenceCollection?.terminalNegativeSufficiency?.status;
+  const negativeRoleOptions = terminalNegativeStatus
+    ? { terminalEligible: terminalNegativeStatus === 'SUFFICIENT' }
+    : {};
+  const signalMatches = (fullComposition?.familyClassifications || []).flatMap(family =>
     (family.signals || []).map(signal => ({
       ...signal,
       field: family.field,
       sourceFamilyId: family.sourceFamilyId,
     }))
   ).slice(0, 200);
-  const suppressedSignalMatches = (compositionForDiagnostics?.familyClassifications || []).flatMap(family =>
+  const suppressedSignalMatches = (fullComposition?.familyClassifications || []).flatMap(family =>
     (family.suppressedSignals || []).map(signal => ({
       ...signal,
       field: family.field,
@@ -100,8 +114,8 @@ export async function recordProductionClassification(
           ...diagnostic.decision.negativeEvidence,
         ].map(item => ({
           id: item.id,
-          ...assessNegativeEvidence(item),
-          weight: item.finalWeight,
+          ...assessNegativeEvidence(item, negativeRoleOptions),
+          weight: -negativeEvidencePolicyWeight(item),
         })),
         policyVersions: {
           composition: CONTEXTUAL_COMPOSITION_VERSION,

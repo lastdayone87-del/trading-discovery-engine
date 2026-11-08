@@ -4,7 +4,7 @@ import { SEMANTIC_TOP_CALIBRATED_CONFIDENCE } from './semanticCalibration';
 import type { ContextualCompositionReport } from './contextualComposition';
 import { CREATOR_OWNED_EVIDENCE_FIELDS } from './canonicalEvidencePlane';
 import type { RecognitionAssessment } from './recognitionState';
-import { isTerminalNegativeEvidence, negativeEvidencePolicyWeight } from './negativeEvidenceRole';
+import { negativeEvidencePolicyWeight, terminalNegativeItems } from './negativeEvidenceRole';
 
 export const UNIFIED_DECISION_POLICY_VERSION='unified-selective-policy-v3-affirmative-evidence';
 export const SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDENCE=SEMANTIC_TOP_CALIBRATED_CONFIDENCE;
@@ -76,7 +76,7 @@ export function qualifiesSemanticUnrelatedTerminalReject(evidence:EvidenceItem[]
   if(collection.terminalNegativeSufficiency?.status!=='SUFFICIENT'||!collection.terminalNegativeSufficiency.creatorLevelCoverage) return false;
   const substantivePositiveWeight=evidence.filter(item=>item.polarity==='POSITIVE'&&item.rawMatches.length&&!isWeakVideoTerminologyEvidence(item)).reduce((sum,item)=>sum+Math.abs(item.finalWeight),0);
   if(substantivePositiveWeight>0) return false;
-  const semanticUnrelated=evidence.filter(item=>isSemanticClassificationSource(item.source)&&item.polarity==='NEGATIVE'&&item.category==='IRRELEVANT_DOMAIN'&&item.provenance?.semantic?.taxonomyLabel==='UNRELATED'&&Number(item.provenance.semantic.calibratedConfidence)>=SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDENCE&&isTerminalNegativeEvidence(item));
+  const semanticUnrelated=terminalNegativeItems(evidence, { terminalEligible: true }).filter(item=>isSemanticClassificationSource(item.source)&&item.category==='IRRELEVANT_DOMAIN'&&item.provenance?.semantic?.taxonomyLabel==='UNRELATED'&&Number(item.provenance.semantic.calibratedConfidence)>=SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDENCE);
   return semanticUnrelated.length>0&&hasCreatorLevelUnrelatedAttribution(semanticUnrelated);
 }
 
@@ -135,7 +135,7 @@ export function dedupeWeightByFieldGroup<T extends { provenance?: { fields?: Arr
 function qualifiesDominantAttributedContradiction(evidence:EvidenceItem[],collection:EvidenceCollectionReport):boolean{
   if(collection.terminalNegativeSufficiency?.status!=='SUFFICIENT')return false;
   const positiveWeight=dedupeWeightByFieldGroup(evidence.filter(item=>item.polarity==='POSITIVE'&&item.rawMatches.length));
-  const terminalNegativeWeight=dedupeWeightByFieldGroup(evidence.filter(item=>item.polarity==='NEGATIVE'&&isTerminalNegativeEvidence(item)));
+  const terminalNegativeWeight=dedupeWeightByFieldGroup(terminalNegativeItems(evidence, { terminalEligible: true }));
   return terminalNegativeWeight>=25&&(positiveWeight===0||terminalNegativeWeight>positiveWeight*1.5);
 }
 
@@ -154,7 +154,10 @@ export function evaluateUnifiedDecisionPolicy(input:UnifiedDecisionPolicyInput):
   const positiveBoundary=boundary.satisfied;
   const semanticUnrelatedTerminal=qualifiesSemanticUnrelatedTerminalReject(input.evidence,input.collection);
   const dominantAttributedContradiction=qualifiesDominantAttributedContradiction(input.evidence,input.collection);
-  if(input.lifecycleAction==='CONFIRM'&&positiveBoundary&&independentCreatorField&&compositionOk&&recognitionAllowsConfirmation){status='TRADING_CONFIRMED';reasons.push('CALIBRATED_SUPPORT_AND_INDEPENDENCE_SATISFIED','AFFIRMATIVE_EVIDENCE_SUFFICIENCY');if(negative.some(item=>negativeEvidencePolicyWeight(item)>0&&!isTerminalNegativeEvidence(item)))reasons.push('NON_TERMINAL_NEGATIVE_PENALTY_ONLY');}
+  const terminalNegative=terminalNegativeItems(negative, input.collection.terminalNegativeSufficiency
+    ? { terminalEligible: input.collection.terminalNegativeSufficiency.status === 'SUFFICIENT' }
+    : {});
+  if(input.lifecycleAction==='CONFIRM'&&positiveBoundary&&independentCreatorField&&compositionOk&&recognitionAllowsConfirmation){status='TRADING_CONFIRMED';reasons.push('CALIBRATED_SUPPORT_AND_INDEPENDENCE_SATISFIED','AFFIRMATIVE_EVIDENCE_SUFFICIENCY');if(negative.some(item=>negativeEvidencePolicyWeight(item)>0&&!terminalNegative.includes(item)))reasons.push('NON_TERMINAL_NEGATIVE_PENALTY_ONLY');}
   else if(input.lifecycleAction==='REJECT'&&(semanticUnrelatedTerminal||dominantAttributedContradiction)){
     status='NON_TRADING';reasons.push(semanticUnrelatedTerminal?'HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED':'DOMINANT_CREATOR_LEVEL_IRRELEVANT_CONTRADICTION');
   } else {

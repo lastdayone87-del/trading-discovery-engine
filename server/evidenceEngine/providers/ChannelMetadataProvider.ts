@@ -1,6 +1,7 @@
 import { EvidenceItem, EvidenceProvider, RawChannelInput, LayeredKnowledgeContext } from '../types';
 import { pushUniqueMatch } from '../utils/textMatching';
 import { findScopedTermMatches } from '../utils/claimPolarity';
+import { hasIndependentMarketFrame, requiresMarketFrameForProvider } from '../tradingSignalTaxonomy';
 
 export class ChannelMetadataProvider implements EvidenceProvider {
   name = 'channel_metadata' as const;
@@ -24,7 +25,10 @@ export class ChannelMetadataProvider implements EvidenceProvider {
       ...(knowledgeContext.countryKnowledge?.popularInstruments || [])
     ];
 
+    const textBlob = `${input.channel_name} ${input.description || ''}`;
+    const hasMarketFrame = hasIndependentMarketFrame(textBlob);
     for (const inst of allInstruments) {
+      if (requiresMarketFrameForProvider(inst) && !hasMarketFrame) continue;
       if (hasAssertedTerm(inst)) {
         pushUniqueMatch(matchedInstruments, inst);
       }

@@ -6,7 +6,7 @@ import { isSemanticClassificationSource } from './types';
 import { collapseSourceIndependentObservations } from '../entityResolution';
 import { dedupeWeightByFieldGroup, hasCreatorLevelUnrelatedAttribution } from './decisionPolicy';
 import type { ContextualCompositionReport } from './contextualComposition';
-import { isTerminalNegativeEvidence, negativeEvidencePolicyWeight } from './negativeEvidenceRole';
+import { negativeEvidencePolicyWeight, terminalNegativeItems } from './negativeEvidenceRole';
 
 export const STAGED_CLASSIFICATION_VERSION = '3.3.0';
 
@@ -75,11 +75,18 @@ function isWeakVideoTerminologyEvidence(item: EvidenceItem): boolean {
   return fields.length > 0 && fields.every(field => field.field === 'video_title');
 }
 
-function terminalContradictionWeights(negative: EvidenceItem[], positive: EvidenceItem[]) {
+function terminalContradictionWeights(
+  negative: EvidenceItem[],
+  positive: EvidenceItem[],
+  terminalEligible?: boolean,
+) {
   // Only IRRELEVANT_DOMAIN evidence whose claim is asserted and creator-level
   // may reject. Hype and adjacent finance are confidence penalties, and a
   // disclaimer/quotation is absence, never terminal opposition.
-  const terminalNegative = negative.filter(isTerminalNegativeEvidence);
+  const terminalNegative = terminalNegativeItems(
+    negative,
+    terminalEligible === undefined ? {} : { terminalEligible },
+  );
   // Same observation-aware weights as the final policy (see
   // dedupeWeightByFieldGroup): stage dispositions and the terminal decision
   // must agree, so a withheld case routes to ENRICH/REVIEW in both layers
@@ -95,7 +102,7 @@ function terminalContradictionWeights(negative: EvidenceItem[], positive: Eviden
  * positive blockers remain the responsibility of decisionPolicy.ts. */
 function hasCreatorLevelSemanticUnrelatedCandidate(negative: EvidenceItem[], collection: EvidenceCollectionReport): boolean {
   if (collection.terminalNegativeSufficiency?.status !== 'SUFFICIENT' || !collection.terminalNegativeSufficiency.creatorLevelCoverage) return false;
-  const semanticUnrelated=negative.filter(item => isSemanticClassificationSource(item.source) && item.category === 'IRRELEVANT_DOMAIN' && item.provenance?.semantic?.taxonomyLabel === 'UNRELATED');
+  const semanticUnrelated=terminalNegativeItems(negative, { terminalEligible: true }).filter(item => isSemanticClassificationSource(item.source) && item.category === 'IRRELEVANT_DOMAIN' && item.provenance?.semantic?.taxonomyLabel === 'UNRELATED');
   return semanticUnrelated.length>0&&hasCreatorLevelUnrelatedAttribution(semanticUnrelated);
 }
 
@@ -119,8 +126,11 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   const independentDimensions = new Set(corroborating.map(item => item.category));
   const negativeWeight = negative.reduce((sum, item) => sum + negativeEvidencePolicyWeight(item), 0);
   const positiveWeight = positive.reduce((sum, item) => sum + Math.abs(item.finalWeight), 0);
-  const nonTerminalNegativeWeight = dedupeWeightByFieldGroup(negative.filter(item => !isTerminalNegativeEvidence(item) && negativeEvidencePolicyWeight(item) > 0));
-  const {terminalNegative,terminalNegativeWeight,materiallyDominant}=terminalContradictionWeights(negative,positive);
+  const terminalEligible = collection.terminalNegativeSufficiency
+    ? collection.terminalNegativeSufficiency.status === 'SUFFICIENT'
+    : undefined;
+  const {terminalNegative,terminalNegativeWeight,materiallyDominant}=terminalContradictionWeights(negative,positive,terminalEligible);
+  const nonTerminalNegativeWeight = dedupeWeightByFieldGroup(negative.filter(item => !terminalNegative.includes(item) && negativeEvidencePolicyWeight(item) > 0));
   const terminalNegativeSufficient=collection.terminalNegativeSufficiency?.status==='SUFFICIENT';
   const semanticUnrelatedCandidate=hasCreatorLevelSemanticUnrelatedCandidate(negative,collection);
   const dominantContradiction = materiallyDominant && terminalNegativeSufficient;

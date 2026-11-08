@@ -54,26 +54,34 @@ const NEGATION_CUES: Record<LanguageCode, string[]> = {
 };
 
 const HYPOTHETICAL_CUES: Record<LanguageCode, string[]> = {
-  en: ['if', 'imagine', 'suppose', 'supposing', 'what if', 'would', 'could', 'might', 'hypothetically', 'pretend'],
-  de: ['wenn', 'falls', 'stell dir vor', 'angenommen', 'würde', 'könnte', 'vielleicht'],
-  fr: ['si', 'imaginez', 'imagine', 'supposons', 'pourrait', 'serait', 'peut-être'],
-  es: ['si', 'imagina', 'supongamos', 'podría', 'sería', 'quizás', 'tal vez'],
-  it: ['se', 'immagina', 'supponiamo', 'potrebbe', 'sarebbe', 'forse'],
-  nl: ['als', 'stel je voor', 'veronderstel', 'zou', 'zou kunnen', 'misschien'],
-  da: ['hvis', 'forestil dig', 'antag', 'ville', 'kunne', 'måske'],
-  sv: ['om', 'föreställ dig', 'anta', 'skulle', 'kunde', 'kanske'],
-  no: ['hvis', 'forestill deg', 'anta', 'ville', 'kunne', 'kanskje'],
+  // Bare conditionals ("if", "when", "si", "se", "wenn") are ordinary creator
+  // framing ("If you want to learn day trading"). Only explicit hypothetical
+  // frames qualify.
+  en: ['imagine', 'suppose', 'supposing', 'what if', 'hypothetically', 'pretend', 'would', 'could', 'might'],
+  de: ['stell dir vor', 'angenommen', 'würde', 'könnte'],
+  fr: ['imaginez', 'imagine', 'supposons', 'pourrait', 'serait', 'peut-être'],
+  es: ['imagina', 'supongamos', 'podría', 'sería', 'quizás', 'tal vez'],
+  it: ['immagina', 'supponiamo', 'potrebbe', 'sarebbe', 'forse'],
+  nl: ['stel je voor', 'veronderstel', 'zou', 'zou kunnen', 'misschien'],
+  da: ['forestil dig', 'antag', 'ville', 'kunne', 'måske'],
+  sv: ['föreställ dig', 'anta', 'skulle', 'kunde', 'kanske'],
+  no: ['forestill deg', 'anta', 'ville', 'kunne', 'kanskje'],
   ar: ['إذا', 'لو', 'تخيل', 'قد', 'ربما'],
   zh: ['如果', '假如', '想象', '可能', '也许', '也許'],
-  ms: ['jika', 'kalau', 'bayangkan', 'mungkin', 'andaikan'],
-  ja: ['もし', 'なら', '想像', 'かもしれない', 'だろう'],
+  ms: ['bayangkan', 'mungkin', 'andaikan'],
+  ja: ['想像', 'かもしれない', 'だろう'],
 };
 
 const CRITICISM_CUE = /\b(?:scam(?:mers?|med)?|fake|fraud(?:ulent)?|beware|avoid|myth|debunk(?:ed|ing)?|so-called|snake\s*oil|too\s*good\s*to\s*be\s*true|misleading|lies?|red\s*flags?)\b/iu;
 const ATTRIBUTION_CUE = /\b(?:they|these|those|gurus?|scammers?|courses?|sellers?|promoters?|influencers?)\b[^.!?;\n]{0,48}\b(?:say|says|promise|promises|promised|claim|claims|claimed|sell|sells|teach|teaches)\b/iu;
+// Criticism/quotation framing only neutralizes claim-like language. "Avoid
+// fake breakouts with order flow" is asserted education, not a quoted hype
+// claim about order flow.
+const CLAIM_LIKE_TERM = /\b(?:guaranteed?|profits?|returns?|gains?|rich|wealth|money|gems?|moonshots?|100x|bitcoin|crypto|signals?|courses?|mentors?|hype|wins?)\b/iu;
 const POST_NEGATION = /^\s*(?:[?!.,:;\-–—]+\s*)?(?:no|nope|not|never|false|myth|wrong|incorrect|pas|non|nein|kein|inte|ikke|aldrig|nunca|mai)\b/iu;
 const POST_DENIAL = /\b(?:is|are|was|were)\s+(?:a\s+)?(?:myth|lie|false|not\s+true|incorrect|wrong)\b/iu;
-const CONTRAST_CUE = /\b(?:but|however|yet|although|though|whereas|nevertheless|nonetheless|mais|aber|pero|però|ma|doch|men|maar|mas|но|但|但是|しかし)\b/iu;
+const ASSERTIVE_NEGATION_FRAME = /\b(?:no\s+(?:bs|b\.s\.|nonsense|fluff|hype|shortcuts?)|zero\s+to\s+(?:hero|pro|funded|profit))\b/iu;
+const CONTRAST_CUE = /(?:\b(?:but|however|yet|although|though|whereas|nevertheless|nonetheless|and|mais|aber|pero|però|ma|doch|men|maar|mas)\b|(?:но|但|但是|しかし))/iu;
 
 const DISCLAIMER_PATTERNS: RegExp[] = [
   /\b(?:no|not|never|without)\s+(?:financial|investment|trading|tax)\s+advice\b/iu,
@@ -174,7 +182,7 @@ interface ClauseBounds { start: number; end: number }
  */
 function clauseBounds(text: string, start: number, end: number): ClauseBounds {
   let left = start;
-  while (left > 0 && !/[.!?;\n]/.test(text[left - 1])) left--;
+  while (left > 0 && !/[.!?;,\n:]/.test(text[left - 1])) left--;
   const before = text.slice(left, start);
   const contrasts = [...before.matchAll(new RegExp(CONTRAST_CUE.source, 'giu'))];
   const lastContrast = contrasts[contrasts.length - 1];
@@ -182,7 +190,7 @@ function clauseBounds(text: string, start: number, end: number): ClauseBounds {
     left += lastContrast.index + lastContrast[0].length;
   }
   let right = end;
-  while (right < text.length && !/[.!?;\n]/.test(text[right])) right++;
+  while (right < text.length && !/[.!?;,\n:]/.test(text[right])) right++;
   return { start: left, end: right };
 }
 
@@ -264,13 +272,16 @@ export function classifyClaimPolarity(
   }
 
   // Quoted criticism: "Scam gurus promise guaranteed profits". Quotation marks
-  // alone are not enough; a criticism/attribution frame must be present.
+  // alone are not enough; a criticism/attribution frame must be present and the
+  // matched term must be claim-like ("order flow" after "avoid fake breakouts"
+  // is asserted education, not quoted hype).
+  const termLooksLikeClaim = CLAIM_LIKE_TERM.test(normalized.slice(start, end));
   const quotationFrame = CRITICISM_CUE.test(nearbyWindow) || ATTRIBUTION_CUE.test(nearbyWindow);
-  if (quotationFrame && (CRITICISM_CUE.test(before) || ATTRIBUTION_CUE.test(before))) {
+  if (termLooksLikeClaim && quotationFrame && (CRITICISM_CUE.test(before) || ATTRIBUTION_CUE.test(before))) {
     const cue = (CRITICISM_CUE.exec(before) || ATTRIBUTION_CUE.exec(before) || [undefined])[0];
     return { polarity: 'QUOTED', cue, confidence: 0.88 };
   }
-  if (isInsideQuotes(normalized, start, end) && (CRITICISM_CUE.test(nearbyWindow) || ATTRIBUTION_CUE.test(nearbyWindow))) {
+  if (termLooksLikeClaim && isInsideQuotes(normalized, start, end) && (CRITICISM_CUE.test(nearbyWindow) || ATTRIBUTION_CUE.test(nearbyWindow))) {
     const cue = (CRITICISM_CUE.exec(nearbyWindow) || ATTRIBUTION_CUE.exec(nearbyWindow) || [undefined])[0];
     return { polarity: 'QUOTED', cue, confidence: 0.85 };
   }
@@ -282,13 +293,24 @@ export function classifyClaimPolarity(
     if (cue && /\bnot\s+only\s*$/iu.test(before)) {
       return { polarity: 'ASSERTED', confidence: 0.6 };
     }
-    if (cue) return { polarity: 'NEGATED', cue, confidence: 0.9 };
+    // "No BS Forex", "Zero to Hero Forex" are assertive creator framing, not
+    // denials of the trading claim that follows.
+    if (cue && ASSERTIVE_NEGATION_FRAME.test(before)) {
+      // fall through to hypothetical/assertion
+    } else if (cue) {
+      return { polarity: 'NEGATED', cue, confidence: 0.9 };
+    }
   }
 
   const hypothetical = combinedCueRegex(before, language, HYPOTHETICAL_CUES);
   if (hypothetical) {
     const cue = closestCue(hypothetical, before);
     if (cue) return { polarity: 'HYPOTHETICAL', cue, confidence: 0.8 };
+  }
+  const hypotheticalAfter = combinedCueRegex(afterClause, language, HYPOTHETICAL_CUES);
+  if (hypotheticalAfter) {
+    const cue = closestCue(hypotheticalAfter, afterClause);
+    if (cue) return { polarity: 'HYPOTHETICAL', cue, confidence: 0.75 };
   }
 
   // A negation cue after a contrastive conjunction applies to the other clause,
@@ -330,7 +352,7 @@ export function findScopedTermMatches(
 ): ScopedTermMatch[] {
   const source = normalizeWithApostrophes(String(text || ''));
   if (!source) return [];
-  const haystack = source.toLocaleLowerCase('en');
+  const haystack = source;
   const matches: ScopedTermMatch[] = [];
   const seen = new Set<string>();
   for (const rawTerm of terms) {

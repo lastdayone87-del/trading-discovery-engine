@@ -73,3 +73,29 @@ test('trading-card usage does not become financial trading evidence', async () =
   const evidence = await new VideoMetadataProvider().collectEvidence(creatorInput(titles), context);
   assert.equal(evidence.some(item => item.category === 'MULTI_VIDEO_CONSISTENCY'), false);
 });
+
+test('a negated video title does not suppress an asserted description', async () => {
+  const context = getLayeredKnowledgeContext('United States');
+  const titles = ['I do not trade forex', 'I do not trade forex', 'I do not trade forex'];
+  const input = {
+    ...creatorInput(titles),
+    video_descriptions: [
+      'Day trading order flow and risk management.',
+      'Backtesting market structure and position sizing.',
+      'Live trading execution and trade journal review.',
+    ],
+  };
+  const evidence = await new VideoMetadataProvider().collectEvidence(input, context);
+  assert.ok(evidence.some(item => item.category === 'MULTI_VIDEO_CONSISTENCY'));
+});
+
+test('a repeated platform literal alone cannot establish multi-video consistency', async () => {
+  const context = getLayeredKnowledgeContext('United States');
+  const input = creatorInput([
+    'TradingView tutorial one',
+    'TradingView tutorial two',
+    'TradingView tutorial three',
+  ]);
+  const evidence = await new VideoMetadataProvider().collectEvidence(input, context);
+  assert.equal(evidence.some(item => item.category === 'MULTI_VIDEO_CONSISTENCY'), false);
+});

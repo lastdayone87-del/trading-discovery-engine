@@ -4,7 +4,7 @@ import {
   findScopedTermMatches,
   type ClaimPolarity,
 } from './utils/claimPolarity';
-import { normalizeMatchToken, textMatchesTerm } from './utils/textMatching';
+import { normalizeMatchToken } from './utils/textMatching';
 import {
   MULTILINGUAL_CLASSIFICATION_PACKS,
   type MultilingualClassificationPack,
@@ -103,6 +103,35 @@ export const FINANCIAL_CONTEXT_PATTERN = /\b(trad(?:e|ing|er|en)|stocks?|equit(?
  * script choice does not decide whether a creator is recognised.
  */
 export const FINANCIAL_CONTEXT_CJK_PATTERN = /(株(?!式会社)|仮想通貨|暗号資産|為替|先物|トレード|投資|板読み|日経|注文フロー|取引所|بورصة|الأسهم|股票|期货|期貨|外汇|外匯|证券|證券|债券|債券|基金|加密货币|加密貨幣|数字货币|數位貨幣|股市|港股|美股|A股|K线|K線|大盘|大盤)/u;
+
+/**
+ * Short/common-word instrument names that occur in ordinary language:
+ * Spanish "es" (is), French/Spanish "sol" (sun), "cl"/"ng" abbreviations and
+ * English "options"/"leverage". They supply trading context only when the
+ * document also has an independent market frame.
+ */
+const AMBIGUOUS_INSTRUMENT_TERMS: ReadonlySet<string> = new Set([
+  'es', 'sol', 'cl', 'ng', 'option', 'options', 'leverage',
+  'bond', 'bonds', 'equity', 'equities', 'stock', 'stocks',
+  'crypto', 'defi', 'forex', 'future', 'futures',
+]);
+
+export function isAmbiguousInstrumentTerm(term: string): boolean {
+  return AMBIGUOUS_INSTRUMENT_TERMS.has(normalizeMatchToken(term));
+}
+
+/** Short/ordinary-word instruments that providers should not emit alone. */
+const PROVIDER_AMBIGUOUS_INSTRUMENT_TERMS: ReadonlySet<string> = new Set([
+  'es', 'sol', 'cl', 'ng', 'option', 'options', 'leverage',
+]);
+
+export function requiresMarketFrameForProvider(term: string): boolean {
+  return PROVIDER_AMBIGUOUS_INSTRUMENT_TERMS.has(normalizeMatchToken(term));
+}
+
+export function hasIndependentMarketFrame(text: string): boolean {
+  return /\b(?:trading|trader|trade|market|chart|price|setup|analysis|contract|expiry|long|short|position|spread|ticker|instrument|exchange|broker|prop\s*firm|funded|backtest|strategy|portfolio|entry|exit)\b/iu.test(text);
+}
 
 /**
  * Core market-specific signals. Existing IDs (DAY_TRADING,
@@ -230,7 +259,7 @@ const GENERIC_BOILERPLATE = [
   /^welcome to (?:my|our) channel$/u,
   /^subscribe(?: to (?:my|our) channel)?$/u,
   /^business inquiries?$/u,
-  /^contact (?:me|us)(?: at .*)?$/u,
+  /^contact (?:me|us)(?: at \S+)?$/u,
   /^(?:official|main) channel$/u,
   /^no videos? yet$/u,
 ];
@@ -407,7 +436,8 @@ function hasTradingContext(
   asserted: TradingSignalMatch[],
   context?: LayeredKnowledgeContext,
 ): boolean {
-  if (asserted.some(match => match.id === 'INSTRUMENT')) return true;
+  if (asserted.some(match => match.id === 'INSTRUMENT'
+    && (!isAmbiguousInstrumentTerm(match.term) || hasIndependentMarketFrame(text)))) return true;
   if (asserted.some(match => match.id === 'CREATOR_IDENTITY')) return true;
   const ambiguousTradingUsage = AMBIGUOUS_TRADING_USAGE.test(text);
   // Bare "trading" is card/skin/game vocabulary too. It supplies financial
@@ -518,7 +548,7 @@ export function assessTradingText(
     focus = tradingContext || unrelatedMatches.length === 0 ? 'TRADING_CORE' : 'UNRELATED';
   } else if (coreMatches.some(match => match.generic) && tradingContext) {
     focus = 'TRADING_ADJACENT';
-  } else if (adjacentMatches.length > 0 && (tradingContext || adjacentMatches.some(match => match.id === 'MARKET_VENUE' || match.id === 'COMMODITY' || match.id === 'INSTRUMENT' || match.id === 'COUNTRY_NATIVE'))) {
+  } else if (adjacentMatches.length > 0 && (tradingContext || adjacentMatches.some(match => match.id === 'MARKET_VENUE' || match.id === 'COMMODITY' || match.id === 'COUNTRY_NATIVE'))) {
     focus = 'TRADING_ADJACENT';
   } else if (financeMatches.length > 0) {
     focus = 'FINANCE_ADJACENT';
@@ -567,40 +597,29 @@ export function isCompositionTradingText(text: string, context?: LayeredKnowledg
 }
 
 /**
- * Compatibility wrapper for C2 aggregation. Returns the distinct Tier A signal
- * IDs, including the three generic IDs that callers explicitly filter.
+ * Compatibility wrapper for C2 aggregation. Returns distinct asserted Tier A
+ * IDs; negated/disclaimed phrases are not included.
  */
 export function tierATradingSignals(text: string, context?: LayeredKnowledgeContext): string[] {
-  const normalized = normalizeText(text);
-  const signals: string[] = [];
-  // Context-gated phrases (bare risk-management vocabulary and the ambiguous
-  // acronym `ICT`) require an independent market/trading word in this
-  // compatibility predicate too.
-  const hasExplicitContext = TIER_C_PATTERN.test(normalized)
-    || FINANCIAL_CONTEXT_PATTERN.test(normalized)
-    || FINANCIAL_CONTEXT_CJK_PATTERN.test(normalized);
-  for (const definition of CORE_PATTERN_DEFINITIONS.filter(item => item.strength === 'TIER_A')) {
-    if (CONTEXT_GATED_CORE_IDS.has(definition.id) && !hasExplicitContext) continue;
-    const pattern = new RegExp(definition.pattern.source, definition.pattern.flags);
-    if (pattern.test(normalized)) signals.push(definition.id);
-  }
-  if ((context?.globalAdvancedConcepts || []).some(term => !/technical\s*analysis|market\s*analysis/i.test(term) && textMatchesTerm(normalized, term))) {
-    signals.push('KNOWN_METHOD');
-  }
-  return [...new Set(signals)];
+  return affirmedTierATradingSignals(normalizeText(text), context);
 }
 
 /** Polarity-aware Tier A IDs; used where a negated claim must not count. */
 export function affirmedTierATradingSignals(text: string, context?: LayeredKnowledgeContext): string[] {
-  return [...new Set(matchTradingSignals(text, context || {} as LayeredKnowledgeContext)
+  const normalized = normalizeText(text);
+  const hasExplicitContext = TIER_C_PATTERN.test(normalized)
+    || FINANCIAL_CONTEXT_PATTERN.test(normalized)
+    || FINANCIAL_CONTEXT_CJK_PATTERN.test(normalized);
+  return [...new Set(matchTradingSignals(normalized, context || {} as LayeredKnowledgeContext)
     .filter(match => match.polarity === 'ASSERTED' && match.strength === 'TIER_A')
+    .filter(match => !CONTEXT_GATED_CORE_IDS.has(match.id) || hasExplicitContext)
     .map(match => match.id))];
 }
 
 /** Compatibility wrapper: Tier A text with generic signals requiring context. */
 export function isTierATradingText(text: string, context?: LayeredKnowledgeContext): boolean {
   const normalized = normalizeText(text);
-  const signals = tierATradingSignals(normalized, context);
+  const signals = affirmedTierATradingSignals(normalized, context);
   if (signals.length === 0) return false;
   if (signals.some(signal => !GENERIC_CORE_IDS.has(signal))) return true;
   return FINANCIAL_CONTEXT_PATTERN.test(normalized) || FINANCIAL_CONTEXT_CJK_PATTERN.test(normalized);

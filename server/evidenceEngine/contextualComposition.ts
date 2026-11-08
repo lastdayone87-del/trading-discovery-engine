@@ -2,7 +2,6 @@ import type { EvidenceFieldRef, EvidenceFieldType, LayeredKnowledgeContext, RawC
 import { creatorOwnedEvidenceCorpus } from './canonicalEvidencePlane';
 import {
   assessTradingText,
-  hasExplicitAlternativeIdentity,
   type CompositionTextFocus,
   type TradingSignalMatch,
 } from './tradingSignalTaxonomy';
@@ -208,7 +207,7 @@ function normalizedForComparison(text: string): string {
     .normalize('NFKC')
     .toLocaleLowerCase('en')
     .replace(/https?:\/\/\S+/gu, ' ')
-    .replace(/\b(?:www\.)?[\w-]+(?:\.[\w-]+)+(?:\/\S*)?/gu, ' ')
+    .replace(/\b(?:www\.)?[\p{L}][\p{L}\p{N}-]*(?:\.[\p{L}][\p{L}\p{N}-]*)+(?:\/\S*)?/gu, ' ')
     .replace(/[\p{Extended_Pictographic}\p{Emoji_Presentation}]/gu, ' ')
     .replace(/[^\p{L}\p{N}]+/gu, ' ')
     .replace(/\s+/gu, ' ')
@@ -352,7 +351,7 @@ export function buildContextualComposition(
     );
     const creatorAlternative = assessments.some(item =>
       CREATOR_LEVEL_FIELDS.has(item.document.field)
-      && (item.assessment.focus === 'UNRELATED' || hasExplicitAlternativeIdentity(item.document.text))
+      && item.assessment.focus === 'UNRELATED'
     );
     // Duplicate checks compare the whole upload (title + description + other
     // fields), not one representative field. Two videos with the same generic
@@ -380,7 +379,8 @@ export function buildContextualComposition(
   const groups: DuplicateGroup[] = [];
   const byExactContent = new Map<string, DuplicateGroup>();
   for (const record of records) {
-    let group = record.normalized ? byExactContent.get(record.normalized) : undefined;
+    const exactKey = record.normalized ? `${record.field}:${record.normalized}` : '';
+    let group = exactKey ? byExactContent.get(exactKey) : undefined;
     if (!group && record.normalized && record.tokens.size >= 3) {
       for (const candidate of groups) {
         if (candidate.field !== record.field || !candidate.normalized) continue;
@@ -393,7 +393,7 @@ export function buildContextualComposition(
     }
     if (group) {
       mergeIntoGroup(group, record);
-      if (record.normalized) byExactContent.set(record.normalized, group);
+      if (exactKey) byExactContent.set(exactKey, group);
       continue;
     }
     const duplicateGroupId = `composition-family:${groups.length}`;
@@ -414,7 +414,7 @@ export function buildContextualComposition(
       duplicateGroupId,
     };
     groups.push(created);
-    if (record.normalized) byExactContent.set(record.normalized, created);
+    if (exactKey) byExactContent.set(exactKey, created);
   }
 
   let tradingCoreFamilies = 0;

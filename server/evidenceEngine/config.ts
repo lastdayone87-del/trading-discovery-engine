@@ -5,9 +5,9 @@ import {
 } from './providers/GeminiSemanticProvider';
 
 export const ENGINE_VERSIONS: VerificationEngineVersions = {
-  evidenceEngineVersion: '3.0.0',
-  decisionEngineVersion: '3.0.0',
-  scoringEngineVersion: '3.0.0',
+  evidenceEngineVersion: '3.1.0',
+  decisionEngineVersion: '3.1.0',
+  scoringEngineVersion: '3.1.0',
   knowledgePackVersion: '1.2.0',
   // Derived from the paid semantic provider defaults so version/audit
   // metadata always describes the model configuration that actually ran.

@@ -1,6 +1,6 @@
 import type { EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import { contentLanguagePacks } from '../multilingualTerminology';
-import { buildCanonicalEvidenceCorpus, documentRef } from '../canonicalEvidencePlane';
+import { buildCanonicalEvidenceCorpus, creatorOwnedEvidenceCorpus, documentRef } from '../canonicalEvidencePlane';
 import { findScopedTermMatches, type ClaimPolarity } from '../utils/claimPolarity';
 import { pushUniqueMatch } from '../utils/textMatching';
 import { isAmbiguousExecutionTerm } from '../tradingSignalTaxonomy';
@@ -14,10 +14,9 @@ export class MultilingualContextProvider implements EvidenceProvider {
     // phrase only to documents that individually assert it; a phrase that
     // exists only in the joined channel text spans documents and must not
     // satisfy the independence gate.
-    const attributableDocuments=(input.evidence_corpus?.length
-      ? input.evidence_corpus
-      : buildCanonicalEvidenceCorpus(input)
-    ).filter(document=>document.field!=='search_match_context');
+    const attributableDocuments=(creatorOwnedEvidenceCorpus(
+      input.evidence_corpus?.length ? input : { ...input, evidence_corpus: buildCanonicalEvidenceCorpus(input) }
+    )).filter(document=>document.field!=='search_match_context');
 
     type LanguageKey = 'executionTerms' | 'educationalTerms' | 'businessNewsTerms' | 'genericFinanceTerms' | 'hypeTerms' | 'motivationTerms';
     const termMatchCache = new Map<string, Array<{ term: string; polarity: ClaimPolarity; cue?: string; document: typeof attributableDocuments[number] }>>();
