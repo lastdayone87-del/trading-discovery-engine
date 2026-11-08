@@ -227,7 +227,9 @@ test('claim polarity suppresses disclaimers and quoted criticism but keeps asser
   const framedItems = await provider.collectEvidence(framed, context);
   const practice = framedItems.find(item => item.category === 'METHODOLOGY_CONCEPT');
   assert.ok(practice);
-  assert.ok((practice!.provenance?.fields || []).every(field => field.field !== 'video_title'));
+  const practiceFields = practice!.provenance?.fields || [];
+  assert.ok(practiceFields.length > 0);
+  assert.ok(practiceFields.every(field => field.field !== 'video_title'));
   const assertedHype = await collect('Guaranteed profits');
   assert.equal(assertedHype.some(item => item.category === 'HYPE_SPECULATION'), true);
 

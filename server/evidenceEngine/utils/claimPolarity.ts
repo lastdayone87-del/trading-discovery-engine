@@ -81,7 +81,7 @@ const CLAIM_LIKE_TERM = /\b(?:guaranteed?|profits?|returns?|gains?|rich|wealth|m
 const POST_NEGATION = /^\s*(?:[?!.,:;\-–—]+\s*)?(?:no|nope|not|never|false|myth|wrong|incorrect|pas|non|nein|kein|inte|ikke|aldrig|nunca|mai)\b/iu;
 const POST_DENIAL = /\b(?:is|are|was|were)\s+(?:a\s+)?(?:myth|lie|false|not\s+true|incorrect|wrong)\b/iu;
 const ASSERTIVE_NEGATION_FRAME = /\b(?:no\s+(?:bs|b\.s\.|nonsense|fluff|hype|shortcuts?)|zero\s+to\s+(?:hero|pro|funded|profit))\b/iu;
-const POST_CRITICISM = /(?:\b(?:is|are|was|were|sounds?|seems?)\s+(?:a\s+|an\s+)?(?:scam|fraud|myth|lie|red\s*flag|fake|misleading)\b|\b(?:red\s*flags?|too\s*good\s*to\s*be\s*true)\b)/iu;
+const POST_CRITICISM = /(?:\b(?:is|are|was|were|sounds?|seems?)\s+(?:a\s+|an\s+)?(?:scam|fraud(?:ulent)?|myth|lies?|red\s*flag|fake|misleading)\b|\b(?:red\s*flags?|too\s*good\s*to\s*be\s*true)\b)/iu;
 const CONTRAST_CUE = /(?:\b(?:but|however|yet|although|though|whereas|nevertheless|nonetheless|mais|aber|pero|però|ma|doch|men|maar|mas)\b|(?:но|但|但是|しかし))/iu;
 // `and` only starts a new clause when it introduces a new predicate/subject;
 // noun coordination ("stocks and crypto") stays inside the negation scope.
