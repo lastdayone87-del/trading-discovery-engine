@@ -151,6 +151,18 @@ test('externally blocked community surfaces escalate to rendered instead of a cl
   assert.equal(result.steps.find(step=>step.step==='CUSTOM_DOMAINS')?.status,'FOUND');
 });
 
+test('external-block escalation covers platform subdomains and partial crawls',async()=>{
+  const {isExternalBlockEscalation}=await import('./inspector');
+  const blocked=(requestedUrl:string,httpStatus=406,failureClass='HTTP_ERROR')=>({
+    requestedUrl,outcome:'ACQUISITION_FAILED',retryable:false,httpStatus,failureClass,detail:'',observedAt:'',
+    surface:'CREATOR_WEBSITES',required:false,
+  } as any);
+  assert.equal(isExternalBlockEscalation({outcome:'ACQUISITION_FAILED',observations:[blocked('https://community.circle.so/x')]},'https://community.circle.so/x'),true,'platform subdomain must escalate');
+  assert.equal(isExternalBlockEscalation({outcome:'PARTIALLY_INSPECTED',observations:[blocked('https://linktr.ee/x')]},'https://linktr.ee/x'),true,'blocked child in a partial crawl must escalate');
+  assert.equal(isExternalBlockEscalation({outcome:'ACQUISITION_FAILED',observations:[blocked('https://example.com/x')]},'https://example.com/x'),false,'generic website keeps the existing status contract');
+  assert.equal(isExternalBlockEscalation({outcome:'PARTIALLY_INSPECTED',observations:[blocked('https://linktr.ee/x',404)]},'https://linktr.ee/x'),false,'permanent 404 does not render');
+});
+
 test('recent-video Discord is preserved before optional acquisition',async()=>{
   const result=await runChannelInspection({channelId:'recent',channelBio:'No invite',channelLinks:[],videoDescriptions:['one','two https://discord.gg/recent-room','three','four','five']});
   assert.equal(result.foundInvite,'recent-room');assert.equal(result.foundLocation,'VIDEO_2_DESCRIPTION');assert.equal(result.acquisitionStatus,'FOUND');

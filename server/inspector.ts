@@ -996,14 +996,17 @@ export { parseAboutPageMetadataFromHtml };
  * TRADING_CONFIRMED; permanent/security outcomes never do.
  */
 export function isExternalBlockEscalation(crawlRes: Pick<ExternalDiscordCrawlResult,'outcome'|'observations'>,seedUrl?:string): boolean {
-  if(crawlRes.outcome!=='ACQUISITION_FAILED')return false;
+  if(crawlRes.outcome!=='ACQUISITION_FAILED'&&crawlRes.outcome!=='PARTIALLY_INSPECTED')return false;
   // Scope the extra rendered spend to community-bearing hosts. A generic
   // optional website failure keeps its existing status contract; a link-in-bio
-  // or social surface is exactly where a Discord invite can live.
+  // or social surface is exactly where a Discord invite can live. Match the
+  // platform subdomain boundary too (community.circle.so, app.circle.so) and
+  // normalize trailing dots, mirroring creatorWebsiteHostsFromLinks.
   if(seedUrl){
     try{
-      const host=new URL(seedUrl).hostname.toLowerCase();
-      if(!CROSS_DOMAIN_COMMUNITY_HOSTS.has(host)&&!socialHosts.has(host))return false;
+      const host=new URL(seedUrl).hostname.toLowerCase().replace(/\.$/,'');
+      const knownHosts=[...CROSS_DOMAIN_COMMUNITY_HOSTS,...socialHosts].map(value=>value.replace(/^www\./,'').replace(/\.$/,''));
+      if(!knownHosts.some(known=>host===known||host.endsWith(`.${known}`)))return false;
     }catch{return false;}
   }
   return crawlRes.observations.some(observation=>{
