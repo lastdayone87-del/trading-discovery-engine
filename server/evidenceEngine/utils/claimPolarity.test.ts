@@ -34,6 +34,11 @@ test('claim polarity neutralizes quoted criticism and hypotheticals', () => {
   assert.equal(polarity('Guaranteed profits are lies', 'guaranteed profit'), 'QUOTED');
   assert.equal(polarity('Crypto trader teaching beginners to avoid scams', 'crypto trader'), 'ASSERTED');
   assert.equal(polarity('My courses teach day trading and order flow', 'day trading'), 'ASSERTED');
+  assert.equal(polarity('My online courses teach day trading', 'day trading'), 'ASSERTED');
+  assert.equal(polarity('My courses I teach day trading', 'day trading'), 'ASSERTED');
+  assert.equal(polarity('My courses explain why gurus promise guaranteed profits', 'guaranteed profit'), 'QUOTED');
+  assert.equal(polarity('May day trading recap', 'day trading'), 'ASSERTED');
+  assert.equal(polarity('Order flow May 2026', 'order flow'), 'ASSERTED');
   assert.equal(polarity('Le day trading pourrait devenir mon activité', 'day trading'), 'HYPOTHETICAL');
   assert.equal(polarity('Day trading may become my activity', 'day trading'), 'HYPOTHETICAL');
   assert.equal(polarity('Day trading in theory', 'day trading'), 'HYPOTHETICAL');

@@ -57,7 +57,7 @@ const HYPOTHETICAL_CUES: Record<LanguageCode, string[]> = {
   // Bare conditionals ("if", "when", "si", "se", "wenn") are ordinary creator
   // framing ("If you want to learn day trading"). Only explicit hypothetical
   // frames qualify.
-  en: ['imagine', 'suppose', 'supposing', 'what if', 'hypothetically', 'pretend', 'would', 'could', 'might', 'may', 'in theory'],
+  en: ['imagine', 'suppose', 'supposing', 'what if', 'hypothetically', 'pretend', 'would', 'could', 'might', 'in theory'],
   de: ['stell dir vor', 'angenommen', 'würde', 'könnte'],
   fr: ['imaginez', 'imagine', 'supposons', 'pourrait', 'serait', 'peut-être'],
   es: ['imagina', 'supongamos', 'podría', 'sería', 'quizás', 'tal vez'],
@@ -86,6 +86,12 @@ const CONTRAST_CUE = /(?:\b(?:but|however|yet|although|though|whereas|neverthele
 // `and` only starts a new clause when it introduces a new predicate/subject;
 // noun coordination ("stocks and crypto") stays inside the negation scope.
 const COORDINATION_CUE = /\b(?:and|&)\s+(?=(?:i|we|you|they|he|she|it)\b|(?:teach|learn|trade|show|share|explain|post|upload|run|make|offer|provide|help|cover|analy[sz]e|review|discuss|focus|talk|stream|prefer)\b)/iu;
+const POST_MAY = /^\s*may(?![ \t]+\d{4}|[ \t]+\d{1,2}\b)/iu;
+
+function lastAttributionMatch(text: string): RegExpExecArray | undefined {
+  const matches = [...text.matchAll(new RegExp(ATTRIBUTION_CUE.source, 'giu'))];
+  return matches[matches.length - 1];
+}
 
 const DISCLAIMER_PATTERNS: RegExp[] = [
   /\b(?:no|not|never|without)\s+(?:financial|investment|trading|tax)\s+advice\b/iu,
@@ -286,13 +292,18 @@ export function classifyClaimPolarity(
   // is asserted education, not quoted hype).
   const termLooksLikeClaim = CLAIM_LIKE_TERM.test(normalized.slice(start, end));
   const quotationFrame = CRITICISM_CUE.test(nearbyWindow) || ATTRIBUTION_CUE.test(nearbyWindow);
-  const attributionBefore = ATTRIBUTION_CUE.test(before);
+  const attributionMatch = lastAttributionMatch(before);
+  const attributionBefore = Boolean(attributionMatch);
   const criticismBefore = CRITICISM_CUE.test(before);
   // "My courses teach day trading" is the creator's own course, not a claim
-  // attributed to someone else; "Scam courses teach day trading" is criticism.
-  const ownCourse = /\b(?:my|our)\s+courses?\b/iu.test(before);
+  // attributed to someone else. Scope the exception to the matched course
+  // phrase so a later gurus/courses claim is still quoted.
+  const ownCourse = Boolean(attributionMatch
+    && /^courses?\b/iu.test(attributionMatch[0])
+    && !/\b(?:gurus?|scammers?|sellers?|promoters?|influencers?|they|these|those)\b/iu.test(attributionMatch[0])
+    && /\b(?:my|our)\b/iu.test(before.slice(0, (attributionMatch.index || 0) + attributionMatch[0].length)));
   if (quotationFrame && ((attributionBefore && !ownCourse) || (termLooksLikeClaim && criticismBefore))) {
-    const cue = (ATTRIBUTION_CUE.exec(before) || CRITICISM_CUE.exec(before) || [undefined])[0];
+    const cue = (attributionMatch?.[0] || CRITICISM_CUE.exec(before)?.[0]);
     return { polarity: 'QUOTED', cue, confidence: 0.88 };
   }
   if (isInsideQuotes(normalized, start, end)
@@ -339,6 +350,9 @@ export function classifyClaimPolarity(
   if (hypotheticalAfter) {
     const anchored = new RegExp(`^\\s*(?:${hypotheticalAfter.source})`, 'iu').exec(afterClause);
     if (anchored) return { polarity: 'HYPOTHETICAL', cue: anchored[0].trim().slice(0, 24), confidence: 0.75 };
+  }
+  if (POST_MAY.test(afterClause)) {
+    return { polarity: 'HYPOTHETICAL', cue: afterClause.trim().slice(0, 24), confidence: 0.75 };
   }
 
   // A negation cue after a contrastive conjunction applies to the other clause,
