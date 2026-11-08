@@ -77,6 +77,40 @@ test('completed query runs are never reopened by lifecycle reconciliation', () =
   });
 });
 
+test('a completed job inside the finalization grace window leaves the run active', () => {
+  assert.deepEqual(decideQueryRunJobLifecycle({
+    queryRunStatus: 'RUNNING',
+    jobStatus: 'COMPLETED',
+    jobLastError: null,
+    jobRunAfter: null,
+    jobCompletedAt: '2026-08-23T08:00:00.000Z',
+    now: '2026-08-23T08:05:00.000Z',
+    completedJobGraceMinutes: 15
+  }), {
+    action: 'NOOP',
+    queryRunStatus: 'RUNNING',
+    releaseReservation: false,
+    reasonCode: 'COMPLETED_JOB_FINALIZATION_GRACE'
+  });
+});
+
+test('a completed job past the grace window closes its orphaned active run', () => {
+  assert.deepEqual(decideQueryRunJobLifecycle({
+    queryRunStatus: 'RUNNING',
+    jobStatus: 'COMPLETED',
+    jobLastError: null,
+    jobRunAfter: null,
+    jobCompletedAt: '2026-08-23T08:00:00.000Z',
+    now: '2026-08-23T08:16:00.000Z',
+    completedJobGraceMinutes: 15
+  }), {
+    action: 'TERMINALIZE_QUERY_RUN',
+    queryRunStatus: 'FAILED',
+    releaseReservation: true,
+    reasonCode: 'ORPHANED_COMPLETED_JOB_STATE'
+  });
+});
+
 test('a pending retry without a persisted retry marker is not promoted to retry ownership', () => {
   assert.deepEqual(decideQueryRunJobLifecycle({
     queryRunStatus: 'RUNNING',

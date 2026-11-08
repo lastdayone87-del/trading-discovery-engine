@@ -2056,6 +2056,16 @@ export async function getInFlightPrimaryTermUsage(country:string|undefined,since
   const res=await db.query(`SELECT ql.primary_term,COUNT(*)::int AS uses FROM query_runs qr JOIN query_library ql ON ql.id=qr.query_id WHERE qr.query_id IS NOT NULL AND qr.status IN ('SCHEDULED','RUNNING','RETRYING') AND COALESCE(qr.scheduled_at,now()) >= $2 AND ql.primary_term IS NOT NULL AND btrim(ql.primary_term)<>'' AND ($1::text IS NULL OR LOWER(qr.country)=LOWER($1)) GROUP BY ql.primary_term`,[country||null,sinceIso]);
   return res.rows.map((r:any)=>({primaryTerm:String(r.primary_term),uses:Number(r.uses||0)}));
 }
+/**
+ * Query IDs that already have a non-terminal query run. The scheduler selector
+ * and the query_library reservation both need this same exclusion; without it
+ * the selector repeatedly picks a query that the reservation SQL must reject.
+ */
+export async function getActiveQueryRunQueryIds(country?:string):Promise<number[]>{
+  const db=await getDb();
+  const res=await db.query(`SELECT DISTINCT query_id FROM query_runs WHERE query_id IS NOT NULL AND status IN ('SCHEDULED','RUNNING','RETRYING') AND ($1::text IS NULL OR LOWER(country)=LOWER($1))`,[country||null]);
+  return res.rows.map((r:any)=>Number(r.query_id)).filter((id:number)=>Number.isFinite(id));
+}
 /** Consecutive terminal query failures, newest first, with provider failures exempt. */
 export interface QueryFailureState{queryId:number;consecutiveFailures:number;backoffUntil:string|null;}
 export async function getQueryFailureStates(country?:string):Promise<QueryFailureState[]>{
@@ -3529,7 +3539,8 @@ export async function reconcileQueryRunJobLifecycleForQuery(client: any, queryId
       jobStatus: row.job_status as QueryJobLifecycleStatus,
       jobLastError: row.last_error,
       jobRunAfter: row.run_after,
-      jobCompletedAt: row.job_completed_at
+      jobCompletedAt: row.job_completed_at,
+      now: new Date().toISOString(),
     });
 
     if (decision.action === 'ALIGN_RETRY_WAIT') {
@@ -3543,13 +3554,18 @@ export async function reconcileQueryRunJobLifecycleForQuery(client: any, queryId
     }
 
     if (decision.action !== 'TERMINALIZE_QUERY_RUN') continue;
+    // Preserve the established failed-job marker byte-for-byte; a completed
+    // job that lost its finalizer is a distinct operational failure.
+    const failureKind = decision.reasonCode === 'ORPHANED_COMPLETED_JOB_STATE'
+      ? 'ORPHANED_COMPLETED_JOB_STATE'
+      : 'ORPHANED_FAILED_JOB_STATE';
     const closed = await client.query(`
       UPDATE query_runs
       SET status='FAILED', completed_at=COALESCE(completed_at,now()),
           error=COALESCE(error,$2),
           performance_details=COALESCE(performance_details,'{}'::jsonb)||$3::jsonb
       WHERE id=$1 AND status IN ('SCHEDULED','RUNNING','RETRYING')
-      RETURNING query_id`, [row.query_run_id, row.query_run_error || row.last_error || 'ORPHANED_FAILED_JOB_STATE', JSON.stringify({ failureKind: 'ORPHANED_FAILED_JOB_STATE', retryOwnership: 'RELEASED' })]);
+      RETURNING query_id`, [row.query_run_id, row.query_run_error || row.last_error || failureKind, JSON.stringify({ failureKind, retryOwnership: 'RELEASED' })]);
     if (!closed.rowCount) continue;
     summary.terminalRunsClosed++;
     terminalQueryIds.add(Number(closed.rows[0].query_id));
@@ -5808,11 +5824,12 @@ export async function createContinuationRunSegment(args: {
        SELECT query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,
          quota_reserved,metadata,allocation_origin,retrieval_config_key,retrieval_treatment_origin,
          provider_key,retrieval_surface,provider_capability,cost_domain,provider_allocation_snapshot,
-         'SCHEDULED',now(),0,$2,$3,0,0,'RUNNING',$4,$1,$5,requested_page_depth
-       FROM query_runs WHERE id=$1 RETURNING id`,
+         'SCHEDULED',now(),0,$2,$3,0,0,'RUNNING',$4,$1::text,$5,requested_page_depth
+       FROM query_runs WHERE id=$6::uuid RETURNING id`,
       [
         args.parentRunId, args.nextPageToken, args.resumeMode,
         Math.max(0, Math.trunc(args.explorationPagesRemaining || 0)), segment,
+        args.parentRunId,
       ],
     );
     const childRunId = String(child.rows[0].id);

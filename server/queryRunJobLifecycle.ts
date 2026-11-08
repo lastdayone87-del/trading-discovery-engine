@@ -7,6 +7,10 @@ export interface QueryRunJobLifecycleInput {
   jobLastError?: string | null;
   jobRunAfter?: string | null;
   jobCompletedAt?: string | null;
+  /** Clock for the completed-job finalization grace window. */
+  now?: string | null;
+  /** A completed job may still be finalizing its run for this long. */
+  completedJobGraceMinutes?: number;
 }
 
 export type QueryRunJobLifecycleAction = 'NOOP' | 'ALIGN_RETRY_WAIT' | 'TERMINALIZE_QUERY_RUN';
@@ -48,6 +52,21 @@ export function decideQueryRunJobLifecycle(input: QueryRunJobLifecycleInput): Qu
 
   if (input.jobStatus === 'FAILED') {
     return { action: 'TERMINALIZE_QUERY_RUN', queryRunStatus: 'FAILED', releaseReservation: true, reasonCode: 'FAILED_JOB_STATUS_IS_TERMINAL' };
+  }
+
+  // A COMPLETED job must have finalized its query run. If the run is still
+  // active after a bounded grace window, the finalizer was lost (for example
+  // the worker crashed between job completion and run completion). Close the
+  // orphaned run so its query can be reserved again; the small grace window
+  // prevents racing a finalizer that is still committing.
+  if (input.jobStatus === 'COMPLETED' && input.jobCompletedAt) {
+    const completedAt = Date.parse(input.jobCompletedAt);
+    const now = input.now ? Date.parse(input.now) : Date.now();
+    const graceMs = Math.max(1, input.completedJobGraceMinutes ?? 15) * 60_000;
+    if (Number.isFinite(completedAt) && Number.isFinite(now) && now - completedAt >= graceMs) {
+      return { action: 'TERMINALIZE_QUERY_RUN', queryRunStatus: 'FAILED', releaseReservation: true, reasonCode: 'ORPHANED_COMPLETED_JOB_STATE' };
+    }
+    return { action: 'NOOP', queryRunStatus: input.queryRunStatus, releaseReservation: false, reasonCode: 'COMPLETED_JOB_FINALIZATION_GRACE' };
   }
 
   return { action: 'NOOP', queryRunStatus: input.queryRunStatus, releaseReservation: false, reasonCode: 'ACTIVE_JOB_OWNS_QUERY_RUN' };

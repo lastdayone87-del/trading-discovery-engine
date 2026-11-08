@@ -24,6 +24,13 @@ export interface SelectabilityInput {
    */
   consecutiveFailures?: number;
   backoffUntil?: string | null;
+  /**
+   * Number of non-terminal query runs already owned by this query. The
+   * scheduler reservation SQL refuses a query with an active run, so the
+   * selector must apply the same hard gate; otherwise it repeatedly selects
+   * a query that can never be reserved and starves the cycle.
+   */
+  activeRunCount?: number;
 }
 
 export interface SelectabilityDecision {
@@ -54,6 +61,7 @@ export function isQuerySelectable(input: SelectabilityInput): SelectabilityDecis
   if (record.collection === 'REJECTED') reasons.push('REJECTED_COLLECTION');
   if (INACTIVE_STATUSES.has(String(record.status || '').toUpperCase())) reasons.push('INACTIVE_STATUS');
   if (input.admission && (!input.admission.eligible || input.admission.tier === 'SPECULATIVE')) reasons.push('NO_CURRENT_ADMISSION');
+  if ((input.activeRunCount || 0) > 0) reasons.push('ACTIVE_RUN_EXISTS');
 
   if (hasValidNow) {
     const last = record.last_executed ? Date.parse(record.last_executed) : NaN;
