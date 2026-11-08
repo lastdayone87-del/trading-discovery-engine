@@ -65,6 +65,43 @@ test('GEMINI_ORG_MAX_CALLS_PER_MINUTE tunes the default per-account bucket', () 
   }
 });
 
+test('blank per-account bucket settings keep the safe default instead of disabling the cap', () => {
+  const previousCalls = process.env.GEMINI_ORG_MAX_CALLS_PER_MINUTE;
+  const previousWindow = process.env.GEMINI_ORG_RATE_WINDOW_MS;
+  process.env.GEMINI_ORG_MAX_CALLS_PER_MINUTE = '   ';
+  process.env.GEMINI_ORG_RATE_WINDOW_MS = '';
+  try {
+    const decision = decideGeminiCapacity('multilingual-semantic-classification', {
+      nowMs: 1_000_000,
+      lastGeminiAtMs: 990_000,
+      orgCallsInWindow: 10,
+    });
+    assert.equal(decision.action, 'DEFER', 'blank must not silently disable the bucket');
+    assert.equal(decision.reasonCode, 'GEMINI_ORG_TOKEN_BUCKET_EMPTY');
+  } finally {
+    if (previousCalls === undefined) delete process.env.GEMINI_ORG_MAX_CALLS_PER_MINUTE;
+    else process.env.GEMINI_ORG_MAX_CALLS_PER_MINUTE = previousCalls;
+    if (previousWindow === undefined) delete process.env.GEMINI_ORG_RATE_WINDOW_MS;
+    else process.env.GEMINI_ORG_RATE_WINDOW_MS = previousWindow;
+  }
+});
+
+test('an explicit per-account bucket of 0 still disables the cap', () => {
+  const previousCalls = process.env.GEMINI_ORG_MAX_CALLS_PER_MINUTE;
+  process.env.GEMINI_ORG_MAX_CALLS_PER_MINUTE = '0';
+  try {
+    const decision = decideGeminiCapacity('multilingual-semantic-classification', {
+      nowMs: 1_000_000,
+      lastGeminiAtMs: 990_000,
+      orgCallsInWindow: 10_000,
+    });
+    assert.equal(decision.action, 'RUN');
+  } finally {
+    if (previousCalls === undefined) delete process.env.GEMINI_ORG_MAX_CALLS_PER_MINUTE;
+    else process.env.GEMINI_ORG_MAX_CALLS_PER_MINUTE = previousCalls;
+  }
+});
+
 test('per-account capacity uses a two-key advisory lock and strict org-scoped ledgers', () => {
   const source = readFileSync('server/providerResilience.ts', 'utf8');
   assert.match(source, /pg_try_advisory_lock\(\$1,hashtext\(\$2\)\)/);

@@ -196,7 +196,7 @@ async function phase4Diagnostics():Promise<any>{
   }
   try{
     const metrics=await loadEnrichmentScaleMetricsWithinDeadline();
-    if(!metrics)throw new Error('Enrichment scale metrics did not settle before the deadline.');
+    if(!metrics)throw new Error('Enrichment scale metrics unavailable: the query failed or did not settle before the deadline.');
     enrichmentScale={runningWorkers:getRunningEnrichmentWorkerCount(),liveDecision:true,metrics,decision:evaluateEnrichmentScaleGate(metrics,thresholds,requestedWorkers)};
   }catch(error){
     enrichmentScale={runningWorkers:getRunningEnrichmentWorkerCount(),liveDecision:true,unavailable:error instanceof Error?error.message:'unavailable',decision:evaluateEnrichmentScaleGate(undefined,thresholds,requestedWorkers)};

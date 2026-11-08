@@ -18,6 +18,7 @@ test('diagnostic checksum excludes job/run attribution but keeps classification 
     run_id: 'query-run-2',
   });
   assert.equal(first.input_checksum, replay.input_checksum);
+  assert.equal(first.input_checksum_version, 'canonical-json-v1');
   assert.equal(first.job_id, undefined);
   assert.equal(first.run_id, undefined);
 

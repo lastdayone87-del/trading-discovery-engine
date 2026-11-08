@@ -81,6 +81,20 @@ export interface SemanticModelClient {
   batchGroup?: string;
 }
 
+/**
+ * A batch asks for one full classification object per submitted channel, so
+ * the output allowance must grow with batch size. Single-call requests keep
+ * the client default (no explicit cap) to avoid changing existing behavior.
+ */
+export const GEMINI_BATCH_OUTPUT_TOKENS_PER_ITEM = 1024;
+export const GEMINI_BATCH_OUTPUT_TOKENS_MAX = 8192;
+
+export function geminiBatchOutputConfig(batchSize = 1): { maxOutputTokens?: number } {
+  const size = Math.max(1, Math.floor(Number(batchSize) || 1));
+  if (size <= 1) return {};
+  return { maxOutputTokens: Math.min(GEMINI_BATCH_OUTPUT_TOKENS_PER_ITEM * (size + 1), GEMINI_BATCH_OUTPUT_TOKENS_MAX) };
+}
+
 export interface GeminiRoute { id: string; key: string; orgId?: string; }
 
 /**
@@ -255,7 +269,7 @@ function defaultClient(): SemanticModelClient | undefined {
     sdkByRoute.set(route.id, created);
     return created;
   };
-  return { batchGroup: 'gemini-semantic', classify: async (prompt, model, observability, signal) => {
+  return { batchGroup: 'gemini-semantic', classify: async (prompt, model, observability, signal, options) => {
     // Caller already aborted: do not read the per-org cooldown ledger (one
     // provider_call_events query per org) only to throw afterwards.
     if (signal?.aborted) {
@@ -281,7 +295,7 @@ function defaultClient(): SemanticModelClient | undefined {
           context: geminiSemanticProviderContext(observability, { geminiRoute: route.id, geminiOrg: geminiRouteOrg(route) }),
           timeoutMs: Number(process.env.GEMINI_PROVIDER_TIMEOUT_MS || '135000'),
           enabled: process.env.PROVIDER_DEADLINES_ENABLED !== 'false', emit: appendProviderCallEvent, signal,
-          call: (signal) => sdkFor(route).models.generateContent({ model, contents: prompt, config: { responseMimeType: 'application/json', temperature: 0, abortSignal: signal } })
+          call: (signal) => sdkFor(route).models.generateContent({ model, contents: prompt, config: { responseMimeType: 'application/json', temperature: 0, abortSignal: signal, ...geminiBatchOutputConfig(options?.batchSize) } })
         });
       } catch (error) {
         // Carry the failing route AND its account for per-account failover

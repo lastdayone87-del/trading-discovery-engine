@@ -6,6 +6,7 @@ import {
   evaluateSemanticPrefilter,
   recordSemanticPrefilterOutcome,
   resetSemanticPrefilterMetricsForTests,
+  resetSemanticPrefilterWarningsForTests,
   SEMANTIC_PREFILTER_POLICY_VERSION,
   semanticPrefilterInputFromRaw,
   semanticPrefilterMode,
@@ -108,6 +109,21 @@ test('unmodeled detected languages veto withholding before stale and audience ru
   assert.ok(decision.reasonCodes.includes('UNMODELED_LANGUAGE_NEEDS_SEMANTICS'));
 });
 
+test('a mixed-language hint list keeps semantics when any language is unmodeled', () => {
+  const decision = evaluateSemanticPrefilter({
+    channelName: 'Mkulima Channel',
+    description: 'Kilimo na mazao.',
+    detectedLanguages: ['en', 'sw'],
+    subscriberCount: 5,
+    videoCount: 1,
+    latestUploadAt: '2018-01-01T00:00:00Z',
+    uploadsLast365Days: 0,
+    videoTitles: ['Minecraft gameplay walkthrough'],
+  }, NOW);
+  assert.equal(decision.disposition, 'CLASSIFY');
+  assert.ok(decision.reasonCodes.includes('UNMODELED_LANGUAGE_NEEDS_SEMANTICS'));
+});
+
 test('accented finance terms match with Unicode-aware boundaries', () => {
   const decision = evaluateSemanticPrefilter({
     channelName: 'Analyse du marché',
@@ -128,6 +144,12 @@ test('raw audience counts are projected into the prefilter and can withhold a th
   assert.equal(projected.subscriberCount, 5);
   assert.equal(projected.videoCount, 1);
   assert.equal(evaluateSemanticPrefilter(projected, NOW).disposition, 'WITHHOLD_SEMANTIC');
+});
+
+test('ingestion threads observed video volume alongside subscribers', () => {
+  const source = readFileSync('server/ingestionPipeline.ts', 'utf8');
+  assert.match(source, /subscriber_count:parseSubscriberCountNumber\(candidate\.subscriberCount\),video_count:structuredVideos\.length/,
+    'the low-audience rule must not treat an observed video sample as an empty surface');
 });
 
 test('custom env is threaded through the stale and audience thresholds', () => {
@@ -251,6 +273,25 @@ test('mode defaults to shadow and rejects unknown values safely', () => {
   assert.equal(semanticPrefilterMode({ SEMANTIC_PREFILTER_MODE: 'enforce' } as any), 'enforce');
   assert.equal(semanticPrefilterMode({ SEMANTIC_PREFILTER_MODE: 'off' } as any), 'off');
   assert.equal(semanticPrefilterMode({ SEMANTIC_PREFILTER_MODE: 'unexpected' } as any), 'shadow');
+});
+
+test('an unrecognized mode warns once per distinct token and names supported values', () => {
+  resetSemanticPrefilterWarningsForTests();
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+  try {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      assert.equal(semanticPrefilterMode({ SEMANTIC_PREFILTER_MODE: 'enfroce' } as any), 'shadow');
+    }
+    assert.equal(semanticPrefilterMode({ SEMANTIC_PREFILTER_MODE: 'shadwo' } as any), 'shadow');
+  } finally {
+    console.warn = originalWarn;
+    resetSemanticPrefilterWarningsForTests();
+  }
+  assert.equal(warnings.length, 2, 'each distinct token warns once');
+  assert.match(warnings[0], /enfroce/);
+  assert.match(warnings[0], /"off", "shadow", "enforce"/);
 });
 
 test('shadow validation records real-traffic false negatives without changing behavior', () => {

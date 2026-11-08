@@ -19,7 +19,7 @@ The approved Phase 4 policy allows scale work only after measurement:
   maximum 8, operator clamp 2–10). Batching is opt-in.
 - The semantic cache key is `input_checksum + promptVersion + featureVersion +
   modelVersion + adjudicator model/flag + batch prompt version + repair prompt
-  version` (plus provider and cache version).
+  version + provider request settings` (plus provider and cache version).
 - The deterministic prefilter is shadow-first and must be validated for false
   negatives before enforcement.
 
@@ -38,10 +38,16 @@ Files: `server/evidenceEngine/semanticResultCache.ts`,
 - Key: SHA-256 over the cache version, attribution-free evidence checksum,
   provider name, prompt version, feature version, candidate model version,
   adjudicator model version, adjudication-enabled flag, batch prompt version
-  (when batching is enabled), and the Groq citation-repair prompt version.
+  (when batching is enabled), the Groq citation-repair prompt version, and the
+  Groq request settings that change the model-facing call (prompt caps,
+  completion allowance, reasoning effort).
   `job_id`/`run_id` are observability attribution and are excluded from the
   checksum, so a recheck under a new job can hit; any evidence, prompt, model,
-  or repair change is a miss.
+  repair, or request-settings change is a miss. The producing
+  `batch_prompt_version` is also stored as a column so a superseded batch can
+  be purged by version. The diagnostic envelope records
+  `input_checksum_version: canonical-json-v1` beside every new fingerprint so
+  rows written with the earlier insertion-order hash remain distinguishable.
 - Fail-open: a missing migration, database outage, or structurally invalid row
   is a miss. A corrupt row is validated before it is counted, deleted rather
   than replayed, and can never reach evidence construction. Three consecutive
@@ -109,18 +115,24 @@ Files: `server/evidenceEngine/semanticBatch.ts`, provider candidate calls.
 
 - Opt-in: `SEMANTIC_BATCH_CLASSIFICATION_ENABLED=false` by default.
 - Coalesces independent requests by provider client group and model over a
-  bounded window (`SEMANTIC_BATCH_WINDOW_MS`, default 400 ms), up to
-  `SEMANTIC_BATCH_MAX_SIZE` (default 8, clamp 2–10). The window is paid out of
-  the stage-0 semantic attempt budget (2 s aggregate), so the default leaves
-  most of the attempt for inference; raise it only when quota, not latency, is
-  the bottleneck.
+  bounded window (`SEMANTIC_BATCH_WINDOW_MS`, default 400 ms, clamped to
+  0–2000 ms), up to `SEMANTIC_BATCH_MAX_SIZE` (default 8, clamp 2–10) and a
+  serialized prompt budget (`SEMANTIC_BATCH_MAX_PROMPT_CHARS`, default
+  120,000 characters, clamp 20,000–400,000). The window is paid out of the
+  stage-0 semantic attempt budget (2 s aggregate), so the default leaves most
+  of the attempt for inference and the clamp prevents a configured window from
+  outlasting the attempt; raise it only when quota, not latency, is the
+  bottleneck. Oversized batches are split before dispatch, and a single
+  oversized prompt travels alone so it can only fail itself.
 - The batch prompt declares an explicit array schema, one result per input, in
   input order, with per-channel citations and an instruction never to merge
   evidence across inputs. Groq's completion allowance scales with batch size.
-- If a batch exceeds Groq's prompt budget, nested document text (and any raw
-  repair request) is shortened in place: every batch member and every field
-  reference survives, so no channel is silently dropped or classified from a
-  truncated tail. `contextTruncated` marks the partial evidence.
+- If a batch exceeds Groq's prompt budget, nested document text (including the
+  structured evidence inside a citation-repair request) is shortened in place:
+  every batch member and every field reference survives, and the repair
+  instructions plus the embedded request stay separated by the shared marker
+  and re-serialized as parseable JSON. A raw prompt without that structure is
+  shortened at its tail; `contextTruncated` marks the partial evidence.
 - Each array element is parsed independently and structurally validated. A
   missing/invalid element falls back to a single call for **that channel
   only**. A malformed whole-batch container (not an array or `{results:[...]}`)
@@ -283,6 +295,7 @@ SELECT request_metadata->>'geminiOrg' AS org,
 FROM provider_call_events
 WHERE provider='gemini'
   AND occurred_at > now() - interval '1 minute'
+  AND COALESCE(request_metadata->>'geminiCapacityDeferral','') <> 'true'
 GROUP BY 1
 ORDER BY calls_last_minute DESC;
 ```
@@ -373,21 +386,21 @@ is optional and destroys only non-authoritative cache rows.
 
 Fresh runs in the Phase 4 worktree:
 
-- New Phase 4 suites: **70 passed, 0 failed**
+- New Phase 4 suites: **82 passed, 0 failed**
   (`semanticResultCache`, `semanticPrefilter`, `semanticBatch`,
-  `geminiOrgCapacity`, `enrichmentScaleGate`).
-- Provider, capacity, queue, and diagnostics regression suites: **133 passed,
+  `semanticResultShape`, `geminiOrgCapacity`, `enrichmentScaleGate`).
+- Provider, capacity, queue, and diagnostics regression suites: **136 passed,
   0 failed** (`providerResilience`, `geminiSemanticPacing`,
   `enrichConcurrencyDefaults`, `searchCapacityDefaults`,
   `classificationDiagnostics`, `productionIntegration`,
   `manualRecheckClassification`, `enrichmentBacklogDiagnostics`,
   `enrichmentBacklogEvidence`, `enrichmentBacklogDrain.contract`,
   `providerFailureDiagnostics`).
-- Provider implementation suites: **124 passed, 0 failed**
+- Provider implementation suites: **125 passed, 0 failed**
   (`GeminiSemanticProvider`, `GroqSemanticProvider`,
   `GeminiFreeSemanticProvider`).
 - Migration runner, including a unique-version guard: **2 passed, 0 failed**.
-- Combined Phase 4 plus regression run: **329 passed, 0 failed**.
+- Combined Phase 4 plus regression run: **345 passed, 0 failed**.
 - `npx tsc --noEmit`: clean.
 - `multilingualSemanticProvider.test.ts` retains one pre-existing
   environment-dependent assertion (`gemini-3.6-flash` vs expected

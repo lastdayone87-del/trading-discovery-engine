@@ -21,11 +21,17 @@ CREATE TABLE IF NOT EXISTS semantic_classification_cache (
   result JSONB NOT NULL,
   fallback_used BOOLEAN NOT NULL DEFAULT false,
   repair_prompt_version TEXT,
+  batch_prompt_version TEXT,
   hits INTEGER NOT NULL DEFAULT 0 CHECK(hits >= 0),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   last_hit_at TIMESTAMPTZ,
   CHECK(jsonb_typeof(result)='object')
 );
+
+-- A database that applied this migration before the batch column existed must
+-- still converge: CREATE TABLE IF NOT EXISTS does not add columns.
+ALTER TABLE semantic_classification_cache
+  ADD COLUMN IF NOT EXISTS batch_prompt_version TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_semantic_cache_created_at
   ON semantic_classification_cache(created_at);
@@ -34,5 +40,7 @@ COMMENT ON TABLE semantic_classification_cache IS
   'Phase 4: final semantic-model result keyed by evidence checksum + prompt/feature/model versions. Fail-open; never authoritative evidence.';
 COMMENT ON COLUMN semantic_classification_cache.input_checksum IS
   'Attribution-free classification input fingerprint (job_id/run_id excluded).';
+COMMENT ON COLUMN semantic_classification_cache.batch_prompt_version IS
+  'Batch prompt version that produced the result, or NULL for a single-call result; operators can purge superseded batches by version.';
 COMMENT ON COLUMN semantic_classification_cache.hits IS
   'Number of cache reads that returned this row; used to measure quota savings.';

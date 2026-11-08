@@ -178,9 +178,11 @@ test('the metrics deadline defaults safely and clamps explicit values', () => {
 
 test('every scale-metrics query carries the configured query timeout', async () => {
   const seen: number[] = [];
+  const statements: string[] = [];
   const metrics = await loadEnrichmentScaleMetrics(0, { ENRICHMENT_SCALE_METRICS_TIMEOUT_MS: '1500' } as any, {
     query: async config => {
       seen.push(config.query_timeout);
+      statements.push(config.text);
       const call = seen.length;
       if (call === 1) return { rows: [{ calls: 100, successes: 95, p95: 9000 }] };
       if (call === 2) return { rows: [{ pending: 20 }] };
@@ -188,6 +190,9 @@ test('every scale-metrics query carries the configured query timeout', async () 
     },
   });
   assert.deepEqual(seen, [1500, 1500, 1500]);
+  assert.match(statements[0], /geminiCapacityDeferral/, 'local capacity deferrals must not count as semantic failures');
+  assert.match(statements[0], /groqCooldownDeferral/, 'local Groq cooldown deferrals must not count as semantic failures');
+  assert.match(statements[0], /geminiFreeCooldownDeferral/, 'local free-Gemini deferrals must not count as semantic failures');
   assert.equal(metrics.semanticCalls, 100);
   assert.equal(metrics.semanticSuccesses, 95);
   assert.equal(metrics.backlogStable, true);

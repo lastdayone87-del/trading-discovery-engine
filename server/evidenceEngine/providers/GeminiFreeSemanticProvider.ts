@@ -17,6 +17,7 @@ import { isSemanticResultShape } from '../semanticResultShape';
 import type { EvidenceCategory, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import {
   buildSemanticPrompt,
+  geminiBatchOutputConfig,
   hasCreatorLevelSemanticContext,
   parseSemanticResult,
   semanticObservabilityFields,
@@ -280,7 +281,7 @@ export function defaultClient(
   const persistedCooldownExpiryMs = deps?.persistedCooldownExpiryMs ?? defaultPersistedCooldownExpiryMs;
   return {
     batchGroup: 'gemini-free-semantic',
-    classify: async (prompt, model, observability, signal) => {
+    classify: async (prompt, model, observability, signal, options) => {
       const response = await runGeminiFreeRouteFailover(routes, async route => {
         const started = Date.now();
         const controller = new AbortController();
@@ -320,7 +321,7 @@ export function defaultClient(
           const raw = await sdkFor(route).models.generateContent({
             model,
             contents: prompt,
-            config: { responseMimeType: 'application/json', temperature: 0, abortSignal: controller.signal },
+            config: { responseMimeType: 'application/json', temperature: 0, abortSignal: controller.signal, ...geminiBatchOutputConfig(options?.batchSize) },
           });
           const parsed = JSON.parse(raw.text || '{}');
           await emit({

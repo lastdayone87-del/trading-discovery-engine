@@ -11,7 +11,7 @@ import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../se
 import { abortedByDeadline } from './abortReason';
 import { readSemanticResultCache, SEMANTIC_RESULT_CACHE_HIT_REASON, writeSemanticResultCache } from '../semanticResultCache';
 import { applySemanticPrefilter, recordSemanticPrefilterOutcome } from '../../semanticPrefilter';
-import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, semanticBatchConfig } from '../semanticBatch';
+import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, SEMANTIC_REPAIR_REQUEST_MARKER, semanticBatchConfig } from '../semanticBatch';
 import { isSemanticResultShape } from '../semanticResultShape';
 import type { EvidenceCategory, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import {
@@ -806,6 +806,22 @@ function failedGroqOrg(error: unknown, route: GroqRoute): string {
 export const GROQ_MAX_BATCH_COMPLETION_TOKENS = 8192;
 
 /**
+ * Stable fingerprint of the settings that change the Groq model-facing call.
+ * Part of the semantic cache identity: changing a prompt cap, completion
+ * allowance, or reasoning effort must not replay results generated under the
+ * previous configuration.
+ */
+export function groqRequestSettingsKey(env: NodeJS.ProcessEnv = process.env): string {
+  const completion = Math.max(1, Math.floor(Number(env.GROQ_MAX_COMPLETION_TOKENS || '800')) || 800);
+  return [
+    `chars=${groqMaxPromptChars(env)}`,
+    `tokens=${groqMaxPromptTokens(env)}`,
+    `completion=${completion}`,
+    `reasoning=${env.GROQ_REASONING_EFFORT || ''}`,
+  ].join('|');
+}
+
+/**
  * Request extras for one Groq completion. A batch call asks the model for one
  * result object per submitted channel, so the completion allowance scales
  * with the batch size; the single-call default stays byte-identical. The cap
@@ -976,25 +992,41 @@ function capSinglePrompt(parsed: any, maxChars: number, maxTokens: number): stri
  * Batch prompt: one channel request per input, with documents nested under
  * `inputs[].request`. The single-channel cap cannot see those documents, and
  * raw-slicing the batch JSON would delete later channels entirely. Bound the
- * nested document text (and any raw repair request) uniformly instead, so
+ * nested document text (and nested repair evidence) uniformly instead, so
  * every batch member and every field reference survives.
  */
 function capBatchPrompt(parsed: any, maxChars: number, maxTokens: number): string {
   const prepared = parsed.inputs.map((input: any) => {
     const request = input && typeof input === 'object' ? input.request : undefined;
     if (!request || typeof request !== 'object') {
-      return { input, request: undefined, documents: undefined, raw: undefined };
+      return { input, request: undefined, documents: undefined, raw: undefined, repair: undefined, repairDocuments: undefined };
     }
     const documents = Array.isArray(request.documents)
       ? request.documents.map((document: any) => ({ ...document, text: String(document?.text || '') }))
       : undefined;
     const raw = typeof request.raw === 'string' ? request.raw : undefined;
-    return { input, request, documents, raw };
+    // A structured repair request keeps its instruction prefix in `raw` and
+    // the original request in `repairRequest` (see parsePrompt). Its evidence
+    // lives inside that nested request, not at the top level.
+    const repair = request.repairRequest && typeof request.repairRequest === 'object' && !Array.isArray(request.repairRequest)
+      ? request.repairRequest
+      : undefined;
+    const repairDocuments = repair && Array.isArray(repair.documents)
+      ? repair.documents.map((document: any) => ({ ...document, text: String(document?.text || '') }))
+      : undefined;
+    return { input, request, documents, raw, repair, repairDocuments };
   });
   const texts: string[] = [];
   for (const entry of prepared) {
     if (entry.documents) for (const document of entry.documents) texts.push(document.text);
-    if (entry.raw !== undefined) texts.push(entry.raw);
+    // `make` consumes one allowance per renderable slot. A structured repair
+    // prefix is fixed overhead, not a slot: it is kept intact in every render
+    // and already covered by the zero-allowance baseline.
+    if (entry.repair) {
+      if (entry.repairDocuments) for (const document of entry.repairDocuments) texts.push(document.text);
+    } else if (entry.raw !== undefined) {
+      texts.push(entry.raw);
+    }
   }
   const make = (allowances: number[]) => {
     let cursor = 0;
@@ -1011,10 +1043,22 @@ function capBatchPrompt(parsed: any, maxChars: number, maxTokens: number): strin
           }));
           request.contextTruncated = true;
         }
-        if (entry.raw !== undefined) {
-          // Repair prompts are plain text, not JSON. Keep their instructions
-          // and allowlisted references (the head) and shorten the embedded
-          // evidence.
+        if (entry.repair) {
+          const repair: any = { ...entry.repair };
+          if (entry.repairDocuments) {
+            repair.documents = entry.repairDocuments.map((document: any) => ({
+              ...document,
+              text: document.text.slice(0, allowances[cursor++] ?? 0),
+            }));
+            repair.contextTruncated = true;
+          }
+          // Rebuild a single raw string so the marker still separates the
+          // repair instructions from a parseable embedded request. Slicing
+          // the raw prompt would cut the tail documents and their refs.
+          request.raw = String(entry.raw || '') + JSON.stringify(repair);
+          delete request.repairRequest;
+          request.contextTruncated = true;
+        } else if (entry.raw !== undefined) {
           request.raw = entry.raw.slice(0, allowances[cursor++] ?? 0);
           request.contextTruncated = true;
         }
@@ -1310,7 +1354,7 @@ export function buildCitationRepairPrompt(
     `You may only cite from this exact list: [${refList}]. Cite only list entries, with matching field, index, and sourceId. If no listed reference supports the decision, return "citations":[] — never invent a reference.`,
     'Return the complete classification JSON with citations populated from the supplied field references; an uncited classification cannot be used.',
   ].join(' ');
-  const separator = ' Original request: ';
+  const separator = SEMANTIC_REPAIR_REQUEST_MARKER;
   const maxChars = limits?.maxChars ?? groqMaxPromptChars();
   const maxTokens = limits?.maxTokens ?? groqMaxPromptTokens();
   const fixedChars = header.length + separator.length;
@@ -1378,6 +1422,9 @@ export class GroqSemanticProvider implements EvidenceProvider {
       // Repaired citations are part of the cached result, so a change to the
       // repair prompt must invalidate entries produced by the old prompt.
       repairPromptVersion: SEMANTIC_CITATION_REPAIR_PROMPT_VERSION,
+      // Prompt caps, completion allowance, and reasoning effort change the
+      // model-facing request; a cached result must not outlive them.
+      requestSettings: groqRequestSettingsKey(),
     };
     const cached = this.injectedClient ? undefined : await readSemanticResultCache(cacheIdentity, process.env, { signal });
     let result: SemanticModelResult;

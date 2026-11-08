@@ -204,7 +204,12 @@ export async function loadEnrichmentScaleMetrics(
        FROM provider_call_events
        WHERE operation='multilingual-semantic-classification'
          AND occurred_at > now() - interval '24 hours'
-         AND status <> 'CANCELLED'`,
+         AND status <> 'CANCELLED'
+         -- Local deferral echoes never reached the provider. Counting them
+         -- would drag the success rate down and block legitimate scale.
+         AND COALESCE(request_metadata->>'geminiCapacityDeferral','') <> 'true'
+         AND COALESCE(request_metadata->>'groqCooldownDeferral','') <> 'true'
+         AND COALESCE(request_metadata->>'geminiFreeCooldownDeferral','') <> 'true'`,
       query_timeout: timeoutMs,
     }),
     query({

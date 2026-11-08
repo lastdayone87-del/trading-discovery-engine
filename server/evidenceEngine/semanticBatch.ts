@@ -16,11 +16,27 @@ import { isSemanticResultShape } from './semanticResultShape';
  */
 export const SEMANTIC_BATCH_PROMPT_VERSION = 'semantic-batch-array-1';
 export const DEFAULT_SEMANTIC_BATCH_WINDOW_MS = 400;
+/**
+ * Serialized-size budget for one provider batch. Item count alone is not a
+ * bound: ten evidence-heavy prompts can exceed a provider request limit, and
+ * an oversized batch fails as one call (rejecting every channel in it). The
+ * scheduler splits on this budget before dispatch; a single oversized prompt
+ * still travels alone so it can only fail itself.
+ */
+export const DEFAULT_SEMANTIC_BATCH_MAX_PROMPT_CHARS = 120_000;
+/**
+ * Citation-repair prompts are a plain-text header followed by the original
+ * structured request. The marker is shared with the repair-prompt builder so
+ * batch capping can split the instructions from the embedded request and
+ * shorten nested documents while keeping the embedded JSON parseable.
+ */
+export const SEMANTIC_REPAIR_REQUEST_MARKER = ' Original request: ';
 
 export interface SemanticBatchConfig {
   enabled: boolean;
   maxSize: number;
   windowMs: number;
+  maxPromptChars: number;
 }
 
 function clamp(value: number, min: number, max: number, fallback: number): number {
@@ -33,10 +49,13 @@ export function semanticBatchConfig(env: NodeJS.ProcessEnv = process.env): Seman
     enabled: env.SEMANTIC_BATCH_CLASSIFICATION_ENABLED === 'true',
     maxSize: clamp(Number(env.SEMANTIC_BATCH_MAX_SIZE || '8'), 2, 10, 8),
     // The scheduler window is paid out of the 2s stage-0 semantic attempt
-    // budget. Keep the default small enough that inference still has most of
-    // the attempt window; operators can raise it when quota, not latency, is
-    // the bottleneck.
-    windowMs: clamp(Number(env.SEMANTIC_BATCH_WINDOW_MS || String(DEFAULT_SEMANTIC_BATCH_WINDOW_MS)), 0, 10_000, DEFAULT_SEMANTIC_BATCH_WINDOW_MS),
+    // budget and may never exceed it: a longer window would let the caller
+    // abort before the provider call even starts. Keep the default small
+    // enough that inference still has most of the attempt window; operators
+    // can raise it up to the attempt budget when quota, not latency, is the
+    // bottleneck.
+    windowMs: clamp(Number(env.SEMANTIC_BATCH_WINDOW_MS || String(DEFAULT_SEMANTIC_BATCH_WINDOW_MS)), 0, 2_000, DEFAULT_SEMANTIC_BATCH_WINDOW_MS),
+    maxPromptChars: clamp(Number(env.SEMANTIC_BATCH_MAX_PROMPT_CHARS || String(DEFAULT_SEMANTIC_BATCH_MAX_PROMPT_CHARS)), 20_000, 400_000, DEFAULT_SEMANTIC_BATCH_MAX_PROMPT_CHARS),
   };
 }
 
@@ -44,6 +63,21 @@ function parsePrompt(prompt: string): unknown {
   try {
     return JSON.parse(prompt);
   } catch {
+    const markerIndex = prompt.indexOf(SEMANTIC_REPAIR_REQUEST_MARKER);
+    if (markerIndex >= 0) {
+      const raw = prompt.slice(0, markerIndex + SEMANTIC_REPAIR_REQUEST_MARKER.length);
+      try {
+        const repairRequest = JSON.parse(prompt.slice(raw.length));
+        if (repairRequest && typeof repairRequest === 'object' && !Array.isArray(repairRequest)) {
+          // Keep the instructions and the embedded request separable so the
+          // batch cap can shorten nested document text instead of truncating
+          // the tail (which would remove citations the repair must reuse).
+          return { raw, repairRequest };
+        }
+      } catch {
+        // The tail is not a standalone request; keep the prompt as raw text.
+      }
+    }
     return { raw: String(prompt || '') };
   }
 }
@@ -70,7 +104,9 @@ export function buildSemanticBatchPrompt(prompts: string[]): string {
 
 /**
  * A malformed whole-batch response must fail the batch, not be interpreted as
- * N missing entries (which would turn one provider call into N+1).
+ * N missing entries (which would turn one provider call into N+1). Require at
+ * least one object entry: an array of primitives is just as unusable as an
+ * empty one, and per-item retry would spend quota on every member.
  */
 export function isSemanticBatchContainerUsable(value: unknown): boolean {
   const container = Array.isArray(value)
@@ -78,7 +114,8 @@ export function isSemanticBatchContainerUsable(value: unknown): boolean {
     : value && typeof value === 'object' && Array.isArray((value as { results?: unknown }).results)
       ? (value as { results: unknown[] }).results
       : undefined;
-  return Array.isArray(container) && container.length > 0;
+  return Array.isArray(container)
+    && container.some(item => item !== null && typeof item === 'object' && !Array.isArray(item));
 }
 
 /**
@@ -254,8 +291,33 @@ export class SemanticBatchScheduler {
     this.timer.unref?.();
   }
 
+  /**
+   * Split one provider group into chunks bounded by both item count and the
+   * serialized batch-prompt size. A single oversized prompt is still sent
+   * alone because it cannot be split without dropping evidence, so an
+   * over-budget request can only reject its own channel.
+   */
+  private chunkGroup(group: PendingRequest[]): PendingRequest[][] {
+    const chunks: PendingRequest[][] = [];
+    let current: PendingRequest[] = [];
+    for (const request of group) {
+      const next = [...current, request];
+      const overCount = next.length > this.config.maxSize;
+      const overChars = next.length > 1
+        && buildSemanticBatchPrompt(next.map(item => item.prompt)).length > this.config.maxPromptChars;
+      if (current.length > 0 && (overCount || overChars)) {
+        chunks.push(current);
+        current = [request];
+      } else {
+        current = next;
+      }
+    }
+    if (current.length > 0) chunks.push(current);
+    return chunks;
+  }
+
   private flush(): void {
-    const batch = this.queue.splice(0, Math.max(this.config.maxSize, this.queue.length));
+    const batch = this.queue.splice(0);
     if (batch.length === 0) return;
     const groups = new Map<string, PendingRequest[]>();
     for (const request of batch) {
@@ -265,10 +327,7 @@ export class SemanticBatchScheduler {
       else groups.set(key, [request]);
     }
     for (const group of groups.values()) {
-      for (let offset = 0; offset < group.length; offset += this.config.maxSize) {
-        const chunk = group.slice(offset, offset + this.config.maxSize);
-        void this.executeChunk(chunk);
-      }
+      for (const chunk of this.chunkGroup(group)) void this.executeChunk(chunk);
     }
     this.scheduleIfNeeded();
   }
@@ -370,7 +429,7 @@ let defaultSchedulerConfigKey = '';
 
 function schedulerForCurrentConfig(): SemanticBatchScheduler {
   const config = semanticBatchConfig();
-  const key = `${config.enabled}|${config.maxSize}|${config.windowMs}`;
+  const key = `${config.enabled}|${config.maxSize}|${config.windowMs}|${config.maxPromptChars}`;
   if (!defaultScheduler || defaultSchedulerConfigKey !== key) {
     // Replacing the scheduler must settle work queued under the old window;
     // otherwise an orphaned timer flushes into a scheduler nobody awaits.

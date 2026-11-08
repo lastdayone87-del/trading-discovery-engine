@@ -3,7 +3,7 @@
 // and independently testable without changing the rest of the database surface.
 export * from './dbCore';
 
-import { getDb, isRetryableInfrastructureFailure, resolveGeminiSemanticCooldownExpiryMs, resolveGeminiOrgSemanticCooldownExpiryMs, resolveGroqSemanticCooldownExpiryMs, resolveGroqOrgCooldownExpiryMs, resolveGeminiFreeSemanticCooldownExpiryMs, failedProviderOrg } from './dbCore';
+import { getDb, isRetryableInfrastructureFailure, resolveGeminiSemanticCooldownExpiryMs, resolveGeminiOrgSemanticCooldownExpiryMs, resolveGeminiOrgBucketExpiryMs, resolveGroqSemanticCooldownExpiryMs, resolveGroqOrgCooldownExpiryMs, resolveGeminiFreeSemanticCooldownExpiryMs, failedProviderOrg } from './dbCore';
 import { acquisitionJobClockV2Enabled, CAPACITY_LEASE_DURATION_MS, capacityLeaseRefreshSetSql, capacityLeaseRunAfter, isCapacityLeaseFailure, normalizeCapacityLeaseRunAfter } from './acquisitionJobClockPolicy';
 import { acquisitionEvidenceFromError, classifyAcquisitionFailure, type AcquisitionFailureClassification } from './acquisitionFailureClassification';
 import { bumpJobFailureClassification, bumpJobFailureClassificationFallback, bumpJobFailureDisposition, jobDispositionExecutionKey, markJobDispositionCounted, markJobFailureClassificationCounted } from './operationsTelemetry';
@@ -153,6 +153,14 @@ export async function failJob(jobId:string,error:any,deps?:{db?:JobFailureDb;now
   if(providerReasons.includes('SEMANTIC_DEFERRED_RATE_PRESSURE')||providerReasons.includes('GEMINI_CAPACITY_DEFERRED')||(providerReasons.includes('PROVIDER_RATE_LIMIT')&&failedProviderOrg(error,['PROVIDER_RATE_LIMIT'],['gemini_semantic'])!==undefined)){
     const failedGeminiOrg=failedProviderOrg(error,['SEMANTIC_DEFERRED_RATE_PRESSURE','GEMINI_CAPACITY_DEFERRED','PROVIDER_RATE_LIMIT'],['gemini_semantic']);
     geminiSemanticCooldownExpiryMs=failedGeminiOrg?await resolveGeminiOrgSemanticCooldownExpiryMs(failedGeminiOrg,now):await resolveGeminiSemanticCooldownExpiryMs(now);
+  }
+  // A full per-account token bucket wakes on the moment the oldest counted
+  // attempt leaves its rolling window, not a generic backoff. The org survives
+  // the enrichment wrapping in `providerFailures[].orgId`.
+  if(providerReasons.includes('GEMINI_ORG_TOKEN_BUCKET_EMPTY')){
+    const failedGeminiOrg=failedProviderOrg(error,['GEMINI_ORG_TOKEN_BUCKET_EMPTY'],['gemini_semantic']);
+    const bucketExpiry=failedGeminiOrg?await resolveGeminiOrgBucketExpiryMs(failedGeminiOrg,now):undefined;
+    if(bucketExpiry!==undefined)geminiSemanticCooldownExpiryMs=Math.max(geminiSemanticCooldownExpiryMs??0,bucketExpiry);
   }
   // Groq cooldown from the same persisted ledger (provider='groq'), scoped to
   // the failed organization when the error carries one: a Groq 429 defers the

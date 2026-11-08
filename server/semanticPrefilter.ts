@@ -97,9 +97,24 @@ const FINANCE_LANGUAGE_CODES = new Set([
   'ja', 'ko', 'zh', 'cmn', 'ar', 'ru', 'hi', 'tr', 'id', 'ms', 'th', 'vi',
 ]);
 
+const warnedUnknownPrefilterModes = new Set<string>();
+
+/** Test seam: allows a warning assertion to run more than once per process. */
+export function resetSemanticPrefilterWarningsForTests(): void {
+  warnedUnknownPrefilterModes.clear();
+}
+
 export function semanticPrefilterMode(env: NodeJS.ProcessEnv = process.env): SemanticPrefilterMode {
   const value = String(env.SEMANTIC_PREFILTER_MODE || 'shadow').trim().toLowerCase();
-  return value === 'off' || value === 'enforce' ? value : 'shadow';
+  if (value === 'off' || value === 'enforce' || value === 'shadow') return value;
+  // A mistyped rollback value must be visible instead of silently running
+  // shadow. Warn once per distinct token so a repeated availability() probe
+  // does not flood the log.
+  if (!warnedUnknownPrefilterModes.has(value)) {
+    warnedUnknownPrefilterModes.add(value);
+    console.warn(`[Semantic Prefilter] Unrecognized SEMANTIC_PREFILTER_MODE="${value}"; falling back to "shadow". Supported values are "off", "shadow", "enforce".`);
+  }
+  return 'shadow';
 }
 
 function numeric(value: unknown): number | undefined {
@@ -219,10 +234,12 @@ export function evaluateSemanticPrefilter(
   }
 
   // A language the cheap lexicon does not model needs semantics regardless of
-  // an English unrelated cue in the title. Check this before every withhold
-  // rule so a non-lexicon finance creator is never filtered out.
+  // an English unrelated cue in the title. Any unmodeled language in a mixed
+  // hint list vetoes withholding: the finance content may live in that
+  // language. Check this before every withhold rule so a non-lexicon finance
+  // creator is never filtered out.
   const unmodeledLanguage = (input.detectedLanguages || []).length > 0 &&
-    (input.detectedLanguages || []).every(code => !FINANCE_LANGUAGE_CODES.has(String(code || '').toLowerCase().split(/[-_]/)[0]));
+    (input.detectedLanguages || []).some(code => !FINANCE_LANGUAGE_CODES.has(String(code || '').toLowerCase().split(/[-_]/)[0]));
   if (unmodeledLanguage) {
     return {
       disposition: 'CLASSIFY',

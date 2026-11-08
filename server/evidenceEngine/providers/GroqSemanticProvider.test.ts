@@ -25,6 +25,7 @@ import {
   shouldUseGroqSemantic,
 } from './GroqSemanticProvider';
 import type { SemanticModelClient } from './GeminiSemanticProvider';
+import { buildSemanticBatchPrompt, SEMANTIC_REPAIR_REQUEST_MARKER } from '../semanticBatch';
 import {
   buildSemanticPrompt,
   parseSemanticResult,
@@ -1356,23 +1357,37 @@ test('groq batch prompt capping preserves every member and nested field referenc
   ]);
 });
 
-test('groq batch prompt capping bounds a raw repair request without dropping other members', () => {
-  const batch = JSON.stringify({
-    task: 'BATCH_CLASSIFICATION',
-    promptVersion: 'semantic-batch-array-1',
-    inputs: [
-      { index: 0, request: { raw: 'repair instructions '.repeat(500) } },
-      { index: 1, request: { task: 'CANDIDATE', documents: [{ ref: { field: 'channel_title' }, text: 'Channel 1' }] } },
-    ],
+test('groq batch prompt capping bounds a structured repair request without dropping refs or other members', () => {
+  const repairDocuments = Array.from({ length: 6 }, (_, index) => ({
+    ref: { field: 'video_title', index },
+    text: 'repair evidence '.repeat(120),
+  }));
+  const header = 'Your previous classification is missing required field citations. Keep label=UNRELATED, confidence=96, supportedLanguage=true.';
+  const repairPrompt = `${header}${SEMANTIC_REPAIR_REQUEST_MARKER}${JSON.stringify({ task: 'CANDIDATE', documents: repairDocuments })}`;
+  const candidatePrompt = JSON.stringify({
+    task: 'CANDIDATE',
+    documents: [{ ref: { field: 'channel_title' }, text: 'Channel 1' }],
   });
-  const capped = capGroqSemanticPrompt(batch, 2_000, 800);
-  assert.ok(capped.length <= 2_000);
-  assert.ok(estimateGroqTokens(capped) <= 800);
+  const batch = buildSemanticBatchPrompt([repairPrompt, candidatePrompt]);
+  const capped = capGroqSemanticPrompt(batch, 4_000, 1_600);
+  assert.ok(capped.length <= 4_000);
+  assert.ok(estimateGroqTokens(capped) <= 1_600);
   const parsed = JSON.parse(capped);
   assert.equal(parsed.inputs.length, 2);
   assert.deepEqual(parsed.inputs.map((entry: any) => entry.index), [0, 1]);
+  // The second, ordinary member survives untouched.
   assert.equal(parsed.inputs[1].request.documents[0].text, 'Channel 1');
-  assert.ok(parsed.inputs[0].request.raw.length > 0, 'repair instructions must not be deleted outright');
+
+  const repaired = parsed.inputs[0].request;
+  assert.equal(repaired.repairRequest, undefined, 'capping must rebuild a single model-facing request');
+  assert.ok(repaired.raw.startsWith(header), 'repair instructions must stay in front of the request');
+  const markerIndex = repaired.raw.indexOf(SEMANTIC_REPAIR_REQUEST_MARKER);
+  assert.ok(markerIndex >= 0, 'the shared marker must separate instructions from the embedded request');
+  const embedded = JSON.parse(repaired.raw.slice(markerIndex + SEMANTIC_REPAIR_REQUEST_MARKER.length));
+  assert.equal(embedded.contextTruncated, true);
+  assert.deepEqual(embedded.documents.map((document: any) => document.ref), repairDocuments.map(document => document.ref));
+  assert.ok(embedded.documents[0].text.length > 0, 'evidence must not be deleted outright');
+  assert.ok(embedded.documents[0].text.length < repairDocuments[0].text.length);
 });
 
 test('an over-budget prompt fails closed before arming the deadline timer or fetching', async () => {

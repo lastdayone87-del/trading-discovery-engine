@@ -1,11 +1,35 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { decideJobFailure, failJob } from './db';
 import { decideGeminiCapacity, geminiSemanticCooldownMs, configuredGeminiRouteIds, resolveGeminiRouteId, isGeminiSemanticCooldownActive, geminiCapacityDeferralError } from './providerResilience';
 import { parseTransientRetryAgeMs } from './db';
 import { configuredGeminiRoutes, GeminiSemanticProvider } from './evidenceEngine/providers/GeminiSemanticProvider';
 import { enrichmentOperationalFailure, OperationalEnrichmentProviderError } from './enrichmentOperationalFailure';
 import type { RawChannelInput } from './evidenceEngine/types';
+
+/**
+ * Isolate a test from whatever Gemini account labels the surrounding
+ * process happens to have. Label-based lookups scan every configured slot,
+ * so a leftover `GEMINI_API_KEY_7` would change the expected org list.
+ */
+async function withCleanGeminiEnv<T>(fn: () => T | Promise<T>): Promise<T> {
+  const saved: Record<string, string | undefined> = {};
+  for (const key of Object.keys(process.env)) {
+    if (/^GEMINI_(API_KEY|ORG_ID)(_[0-9]+)?$/.test(key)) {
+      saved[key] = process.env[key];
+      delete (process.env as any)[key];
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value !== undefined) (process.env as any)[key] = value;
+      else delete (process.env as any)[key];
+    }
+  }
+}
 
 describe('Gemini semantic pacing regression', () => {
   const now = 1_000_000_000;
@@ -536,11 +560,9 @@ describe('Gemini semantic pacing regression', () => {
       // reformatted SQL string or a stray comment cannot satisfy the test.
       const now = Date.now();
       const declaredResetMs = now + 45_000;
-      const previousKey = process.env.GEMINI_API_KEY;
-      const previousOrg = process.env.GEMINI_ORG_ID;
-      process.env.GEMINI_API_KEY = 'test-key';
-      process.env.GEMINI_ORG_ID = 'project-a';
-      try {
+      await withCleanGeminiEnv(async () => {
+        process.env.GEMINI_API_KEY = 'test-key';
+        process.env.GEMINI_ORG_ID = 'project-a';
         let sqlSeen = '';
         let valuesSeen: unknown[] | undefined;
         const expiry = await getGeminiSemanticCooldownExpiry(now, async (sql, values) => {
@@ -557,25 +579,12 @@ describe('Gemini semantic pacing regression', () => {
           undefined,
           'no rate-limit row means no cooldown',
         );
-      } finally {
-        if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
-        else process.env.GEMINI_API_KEY = previousKey;
-        if (previousOrg === undefined) delete process.env.GEMINI_ORG_ID;
-        else process.env.GEMINI_ORG_ID = previousOrg;
-      }
+      });
     });
 
     it('a legacy pool-wide cooldown read is scoped to configured Gemini projects', async () => {
       const { getGeminiSemanticCooldownExpiry } = await import('./providerResilience');
-      const previousKey = process.env.GEMINI_API_KEY;
-      const previousKey2 = process.env.GEMINI_API_KEY_2;
-      const previousOrg = process.env.GEMINI_ORG_ID;
-      const previousOrg2 = process.env.GEMINI_ORG_ID_2;
-      delete process.env.GEMINI_API_KEY;
-      delete process.env.GEMINI_API_KEY_2;
-      delete process.env.GEMINI_ORG_ID;
-      delete process.env.GEMINI_ORG_ID_2;
-      try {
+      await withCleanGeminiEnv(async () => {
         let queried = false;
         const expiry = await getGeminiSemanticCooldownExpiry(Date.now(), async () => {
           queried = true;
@@ -583,12 +592,7 @@ describe('Gemini semantic pacing regression', () => {
         });
         assert.equal(expiry, undefined);
         assert.equal(queried, false, 'no configured Gemini project means no unscoped ledger read');
-      } finally {
-        if (previousKey !== undefined) process.env.GEMINI_API_KEY = previousKey;
-        if (previousKey2 !== undefined) process.env.GEMINI_API_KEY_2 = previousKey2;
-        if (previousOrg !== undefined) process.env.GEMINI_ORG_ID = previousOrg;
-        if (previousOrg2 !== undefined) process.env.GEMINI_ORG_ID_2 = previousOrg2;
-      }
+      });
     });
 
     it('db.ts failJob does not import configuredGeminiRouteIds', async () => {
@@ -673,7 +677,7 @@ describe('Gemini semantic pacing regression', () => {
       assert.ok(result.runAfter! >= cooldownExpiry);
     });
 
-    it('GEMINI_ORG_TOKEN_BUCKET_EMPTY survives wrapping, carries its retry timing, and schedules past the bucket window', () => {
+    it('GEMINI_ORG_TOKEN_BUCKET_EMPTY survives wrapping, carries its retry timing, and schedules past the bucket window', async () => {
       const geminiError = geminiCapacityDeferralError('multilingual-semantic-classification', 'GEMINI_ORG_TOKEN_BUCKET_EMPTY', 12_000);
       assert.deepEqual(geminiError.providerReasons, ['GEMINI_ORG_TOKEN_BUCKET_EMPTY']);
       assert.equal(geminiError.retryAfterMs, 12_000);
@@ -684,12 +688,25 @@ describe('Gemini semantic pacing regression', () => {
         providers: [{
           provider: 'gemini_semantic',
           availability: 'FAILED',
-          reasonCodes: wrappedReasonCodes
+          reasonCodes: wrappedReasonCodes,
+          orgId: 'project-a',
         }]
       } as any, true);
 
       assert.ok(operationalError);
       assert.ok(operationalError!.providerReasons.includes('GEMINI_ORG_TOKEN_BUCKET_EMPTY'));
+
+      // The active failJob path recovers the account from the wrapped
+      // providerFailures, then recomputes the window from the persisted
+      // bucket ledger; timing must not need to survive as a raw field.
+      const { failedProviderOrg } = await import('./dbCore');
+      assert.equal(failedProviderOrg(operationalError, ['GEMINI_ORG_TOKEN_BUCKET_EMPTY'], ['gemini_semantic']), 'project-a');
+      const dbCoreSource = readFileSync('server/dbCore.ts', 'utf8');
+      const bucketResolver = dbCoreSource.match(/export async function resolveGeminiOrgBucketExpiryMs[\s\S]*?\n}/)?.[0] || '';
+      assert.match(bucketResolver, /request_metadata->>'geminiOrg'=\$1/, 'bucket expiry must be account-scoped');
+      assert.match(bucketResolver, /geminiCapacityDeferral/, 'bucket expiry must ignore local deferral echoes');
+      const dbSource = readFileSync('server/db.ts', 'utf8');
+      assert.match(dbSource, /resolveGeminiOrgBucketExpiryMs\(failedGeminiOrg,now\)/, 'failJob must schedule past the failed bucket window');
 
       const bucketExpiry = now + 12_000;
       const result = decideJobFailure(operationalError!, 1, 4, now, now, bucketExpiry);
@@ -724,7 +741,7 @@ describe('Gemini semantic pacing regression', () => {
     it('returns empty array when no GEMINI_API_KEY set', () => {
       const saved: Record<string, string|undefined> = {};
       for (const key of Object.keys(process.env)) {
-        if (key === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_[2-9][0-9]*$/.test(key)) {
+        if (key === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_[0-9]+$/.test(key)) {
           saved[key] = process.env[key];
           delete (process.env as any)[key];
         }
@@ -739,7 +756,7 @@ describe('Gemini semantic pacing regression', () => {
     it('returns route IDs for configured keys', () => {
       const saved: Record<string, string|undefined> = {};
       for (const key of Object.keys(process.env)) {
-        if (key === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_[2-9][0-9]*$/.test(key)) {
+        if (key === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_[0-9]+$/.test(key)) {
           saved[key] = process.env[key];
           delete (process.env as any)[key];
         }
@@ -761,7 +778,7 @@ describe('Gemini semantic pacing regression', () => {
     function withCleanGeminiEnv(fn: () => void) {
       const saved: Record<string, string|undefined> = {};
       for (const key of Object.keys(process.env)) {
-        if (key === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_[2-9][0-9]*$/.test(key)) {
+        if (key === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_[0-9]+$/.test(key)) {
           saved[key] = process.env[key];
           delete (process.env as any)[key];
         }

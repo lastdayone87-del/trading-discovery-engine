@@ -33,6 +33,9 @@ export const SEMANTIC_RESULT_FIELD_NAMES: ReadonlySet<string> = new Set([
   'transcript_excerpt',
   'visual_evidence',
   'discord_invite',
+  // Advertised by the canonical evidence corpus and therefore citable.
+  'pinned_comment',
+  'location',
 ]);
 
 const LABELS: ReadonlySet<string> = new Set(SEMANTIC_RESULT_LABELS);
@@ -67,7 +70,9 @@ export function isSemanticResultShape(value: unknown): value is {
   for (const language of result.languages) {
     if (!language || typeof language !== 'object' || Array.isArray(language)) return false;
     const entry = language as Record<string, unknown>;
-    if (!SEMANTIC_RESULT_FIELD_NAMES.has(String(entry.field || ''))) return false;
+    // Check the declared type directly: String(['channel_title']) would pass
+    // the set membership test even though it is not a valid field reference.
+    if (typeof entry.field !== 'string' || !SEMANTIC_RESULT_FIELD_NAMES.has(entry.field)) return false;
     if (typeof entry.language !== 'string' || typeof entry.script !== 'string') return false;
     if (!isBoundedConfidence(entry.confidence)) return false;
   }
@@ -75,7 +80,7 @@ export function isSemanticResultShape(value: unknown): value is {
   for (const citation of result.citations) {
     if (!citation || typeof citation !== 'object' || Array.isArray(citation)) return false;
     const entry = citation as Record<string, unknown>;
-    if (!SEMANTIC_RESULT_FIELD_NAMES.has(String(entry.field || ''))) return false;
+    if (typeof entry.field !== 'string' || !SEMANTIC_RESULT_FIELD_NAMES.has(entry.field)) return false;
     if (entry.index !== undefined && (!Number.isInteger(entry.index) || (entry.index as number) < 0)) return false;
     if (entry.sourceId !== undefined && typeof entry.sourceId !== 'string') return false;
   }

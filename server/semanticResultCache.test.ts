@@ -73,6 +73,15 @@ test('batch and citation-repair prompt versions invalidate cached results', () =
   );
 });
 
+test('provider request settings invalidate cached results', () => {
+  const original = semanticResultCacheKey(identity).cacheKey;
+  assert.notEqual(original, semanticResultCacheKey({ ...identity, requestSettings: 'chars=24000|tokens=6000|completion=800|reasoning=' }).cacheKey);
+  assert.notEqual(
+    semanticResultCacheKey({ ...identity, requestSettings: 'chars=24000|tokens=6000|completion=800|reasoning=' }).cacheKey,
+    semanticResultCacheKey({ ...identity, requestSettings: 'chars=24000|tokens=6000|completion=1600|reasoning=' }).cacheKey,
+  );
+});
+
 test('canonical JSON sorts object keys recursively but preserves array order', () => {
   assert.equal(
     canonicalJsonStringify({ b: 1, a: { d: [3, 2], c: 2 } }),
@@ -131,6 +140,7 @@ test('all production semantic providers wire the cache and keep injected clients
   }
   const groq = readFileSync('server/evidenceEngine/providers/GroqSemanticProvider.ts', 'utf8');
   assert.match(groq, /repairPromptVersion: SEMANTIC_CITATION_REPAIR_PROMPT_VERSION/, 'Groq cache identity must include the repair prompt version');
+  assert.match(groq, /requestSettings: groqRequestSettingsKey\(\)/, 'Groq cache identity must include prompt/completion settings');
   assert.match(groq, /batchPromptVersion: semanticBatchConfig\(\)\.enabled \? SEMANTIC_BATCH_PROMPT_VERSION : undefined/, 'Groq cache identity must include the batch prompt version');
 });
 
@@ -139,7 +149,12 @@ test('cache operations are fail-open and deadline-bounded', () => {
   assert.match(source, /function boundedCacheOperation/, 'cache reads and writes must share a deadline-bound helper');
   assert.match(source, /DEFAULT_SEMANTIC_RESULT_CACHE_TIMEOUT_MS = 500/);
   assert.match(source, /signal\?\.addEventListener\('abort', onAbort/, 'cache operations must honor caller cancellation');
+  assert.match(source, /operation\.catch\(\(\) => undefined\)/, 'an already-aborted cache operation must consume its rejection');
+  const readFn = source.match(/export async function readSemanticResultCache[\s\S]*?\n}/)?.[0] || '';
+  assert.match(readFn, /boundedCacheOperation\(\(async \(\) => \{[\s\S]*?await import\('\.\.\/db'\)[\s\S]*?await getDb\(\)/, 'getDb must resolve inside the cache deadline race');
   assert.match(source, /DELETE FROM semantic_classification_cache WHERE cache_key=\$1/, 'invalid rows must be deleted rather than replayed');
   assert.match(source, /isCacheableSemanticResult\(value\.result\)/, 'writes must reject degenerate results');
   assert.match(source, /value\.citations\.length > 0/, 'only cited results may be cached');
+  assert.match(source, /batch_prompt_version/, 'the batch prompt version must be persisted for operator purges');
+  assert.match(source, /identity\.batchPromptVersion \|\| null/, 'the persisted batch version must come from the cache identity');
 });

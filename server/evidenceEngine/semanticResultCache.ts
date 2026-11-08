@@ -32,6 +32,12 @@ export interface SemanticResultCacheIdentity {
   batchPromptVersion?: string;
   /** Provider-specific repair prompt whose output can be part of the result. */
   repairPromptVersion?: string;
+  /**
+   * Provider request settings that change the model-facing call (prompt caps,
+   * completion allowance, reasoning effort). Changing one must not serve
+   * results generated under the old configuration.
+   */
+  requestSettings?: string;
 }
 
 export interface SemanticResultCacheOptions {
@@ -65,6 +71,7 @@ export function semanticResultCacheKey(identity: SemanticResultCacheIdentity): {
     identity.adjudicationEnabled === true,
     identity.batchPromptVersion || '',
     identity.repairPromptVersion || '',
+    identity.requestSettings || '',
   ])).digest('hex');
   return { cacheKey, inputChecksum };
 }
@@ -88,7 +95,12 @@ function semanticResultCacheTimeoutMs(env: NodeJS.ProcessEnv = process.env): num
  */
 function boundedCacheOperation<T>(operation: Promise<T>, options: SemanticResultCacheOptions, env: NodeJS.ProcessEnv): Promise<T> {
   const signal = options.signal;
-  if (signal?.aborted) return Promise.reject(signal.reason instanceof Error ? signal.reason : new Error('Cache operation aborted.'));
+  if (signal?.aborted) {
+    // The query may already be in flight; consume its rejection so an
+    // abandoned cache operation cannot surface as an unhandled rejection.
+    operation.catch(() => undefined);
+    return Promise.reject(signal.reason instanceof Error ? signal.reason : new Error('Cache operation aborted.'));
+  }
   const timeoutMs = options.timeoutMs && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
     ? Math.floor(options.timeoutMs)
     : semanticResultCacheTimeoutMs(env);
@@ -172,32 +184,34 @@ export async function readSemanticResultCache(
   if (!semanticResultCacheEnabled(env) || !cacheCircuitClosed()) return undefined;
   const { cacheKey, inputChecksum } = semanticResultCacheKey(identity);
   try {
-    const { getDb } = await import('../db');
-    const db = await getDb();
-    // Validate before counting a hit. A corrupt row must be removed, not
-    // replayed (or silently kept alive by an incrementing counter).
-    const res = await boundedCacheOperation(
-      db.query(
+    // Resolve the connection inside the same deadline race: getDb() retries
+    // startup connections and can block for minutes during an outage.
+    const res = await boundedCacheOperation((async () => {
+      const { getDb } = await import('../db');
+      const db = await getDb();
+      return db.query(
         `SELECT result,model_version,fallback_used,repair_prompt_version
            FROM semantic_classification_cache
           WHERE cache_key=$1`,
         [cacheKey]
-      ),
-      options,
-      env,
-    );
+      );
+    })(), options, env);
     noteCacheSuccess();
     const row = res.rows[0];
     if (!row) return undefined;
     if (!isUsableCachedResult(row.result)) {
-      await boundedCacheOperation(db.query('DELETE FROM semantic_classification_cache WHERE cache_key=$1', [cacheKey]), {}, env).catch(() => undefined);
+      await boundedCacheOperation((async () => {
+        const { getDb } = await import('../db');
+        const db = await getDb();
+        return db.query('DELETE FROM semantic_classification_cache WHERE cache_key=$1', [cacheKey]);
+      })(), {}, env).catch(() => undefined);
       return undefined;
     }
-    await boundedCacheOperation(
-      db.query('UPDATE semantic_classification_cache SET hits=hits+1,last_hit_at=now() WHERE cache_key=$1', [cacheKey]),
-      options,
-      env,
-    ).catch(() => undefined);
+    await boundedCacheOperation((async () => {
+      const { getDb } = await import('../db');
+      const db = await getDb();
+      return db.query('UPDATE semantic_classification_cache SET hits=hits+1,last_hit_at=now() WHERE cache_key=$1', [cacheKey]);
+    })(), options, env).catch(() => undefined);
     return {
       cacheKey,
       inputChecksum,
@@ -225,15 +239,15 @@ export async function writeSemanticResultCache(
   if (!isCacheableSemanticResult(value.result)) return;
   const { cacheKey, inputChecksum } = semanticResultCacheKey(identity);
   try {
-    const { getDb } = await import('../db');
-    const db = await getDb();
-    await boundedCacheOperation(
-      db.query(
+    await boundedCacheOperation((async () => {
+      const { getDb } = await import('../db');
+      const db = await getDb();
+      return db.query(
         `INSERT INTO semantic_classification_cache(
           cache_key,input_checksum,prompt_version,feature_version,model_version,
           adjudicator_model_version,adjudication_enabled,provider,result,
-          fallback_used,repair_prompt_version
-        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+          fallback_used,repair_prompt_version,batch_prompt_version
+        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
         ON CONFLICT(cache_key) DO NOTHING`,
         [
           cacheKey,
@@ -247,11 +261,10 @@ export async function writeSemanticResultCache(
           JSON.stringify(value.result),
           value.fallbackUsed === true,
           value.repairPromptVersion || null,
+          identity.batchPromptVersion || null,
         ]
-      ),
-      options,
-      env,
-    );
+      );
+    })(), options, env);
     noteCacheSuccess();
   } catch (error) {
     if (!options.signal?.aborted) noteCacheFailure();

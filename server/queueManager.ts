@@ -4727,9 +4727,9 @@ let workersStarted = false;
  * Enrichment startup consults the Phase 4 measured scale gate, then applies
  * the Phase 3 classification split to the gate's effective total. A request
  * for more than the measured-safe baseline stays clamped at 3 unless semantic
- * success, p95 latency, and backlog stability all pass. `getDb()` is already
- * the first thing every worker tick needs, so waiting here cannot delay work
- * that could actually run.
+ * success, p95 latency, and backlog stability all pass. The metrics read is
+ * deadline-bounded, so a stalled query delays startup by at most that bound
+ * before the baseline of 3 starts; it never leaves the pool stopped.
  *
  * The split itself keeps the total unchanged:
  *   2 shared workers claim CLASSIFY_DISCOVERED_CHANNEL first (priority 15),

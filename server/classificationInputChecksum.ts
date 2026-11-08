@@ -28,7 +28,15 @@ export function canonicalJsonStringify(value: unknown): string {
   return JSON.stringify(value);
 }
 
-export function normalizeClassificationInput(input: RawChannelInput): RawChannelInput & { input_checksum: string } {
+/**
+ * Algorithm marker stored beside every new `input_checksum`. Rows written
+ * before this version used insertion-order `JSON.stringify`; the marker lets
+ * an auditor tell which normalization produced a stored fingerprint instead
+ * of assuming the current canonical algorithm.
+ */
+export const CLASSIFICATION_INPUT_CHECKSUM_VERSION = 'canonical-json-v1';
+
+export function normalizeClassificationInput(input: RawChannelInput): RawChannelInput & { input_checksum: string; input_checksum_version: string } {
   const classificationInput: RawChannelInput = { ...input };
   delete classificationInput.job_id;
   delete classificationInput.run_id;
@@ -40,6 +48,7 @@ export function normalizeClassificationInput(input: RawChannelInput): RawChannel
   };
   return {
     ...stable,
+    input_checksum_version: CLASSIFICATION_INPUT_CHECKSUM_VERSION,
     input_checksum: createHash('sha256').update(canonicalJsonStringify(stable)).digest('hex')
   };
 }

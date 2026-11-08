@@ -340,8 +340,13 @@ function envMs(name:string, fallback:number):number {
 }
 
 function geminiCapacityConfig():GeminiCapacityConfig {
-  const orgMaxCalls = Number(process.env.GEMINI_ORG_MAX_CALLS_PER_MINUTE ?? '10');
-  const orgWindowMs = Number(process.env.GEMINI_ORG_RATE_WINDOW_MS ?? '60000');
+  // Blank is how deployment UIs express "unset": treating it as 0 would
+  // silently disable the per-account token bucket. 0 stays an explicit
+  // opt-out; negative/garbage falls back to the default.
+  const orgMaxCallsRaw = String(process.env.GEMINI_ORG_MAX_CALLS_PER_MINUTE ?? '').trim();
+  const orgMaxCalls = orgMaxCallsRaw === '' ? 10 : Number(orgMaxCallsRaw);
+  const orgWindowMsRaw = String(process.env.GEMINI_ORG_RATE_WINDOW_MS ?? '').trim();
+  const orgWindowMs = orgWindowMsRaw === '' ? 60000 : Number(orgWindowMsRaw);
   return {
     // Pacing is per configured account. The legacy name stays honored so an
     // existing deployment keeps its interval, but one account's call no
@@ -709,6 +714,16 @@ export function providerFailureMetadata(typed:ProviderCallError):Record<string,s
   return extra;
 }
 
+/**
+ * A Gemini failure that never started the provider call did not consume
+ * Google quota. The marker must cover lock waits, deadline aborts, and
+ * deferral paths that throw before `args.call`, not only known reason codes.
+ * Post-call failures stay counted because the quota was already spent.
+ */
+export function isGeminiCapacityDeferral(provider: string, providerCallStarted: boolean): boolean {
+  return provider === 'gemini' && !providerCallStarted;
+}
+
 export async function executeProviderCall<T>(args:{context:ProviderCallContext; timeoutMs:number; enabled?:boolean; signal?:AbortSignal; call:(signal:AbortSignal)=>Promise<T>; emit:ProviderEventSink; trace?:(stage:string)=>void}):Promise<T>{
   // An already-aborted caller must never start a billable request. Without
   // this check the abort listener is installed after the fact, so downstream
@@ -717,6 +732,7 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
   const started=Date.now(), id=randomUUID(), controller=new AbortController();
   const base={id,provider:args.context.provider,operation:args.context.operation,requestId:args.context.requestId,runId:args.context.runId,jobId:args.context.jobId,requestMetadata:args.context.requestMetadata,attempt:args.context.attempt||1,reservedCost:args.context.reservedCost||0,policyVersion:args.context.policyVersion||'provider-resilience-v1'};
   let capacityLease:GeminiCapacityLease|undefined;
+  let providerCallStarted=false;
   let timer:ReturnType<typeof setTimeout>|undefined; let timedOut=false;
   const abort=()=>controller.abort(args.signal?.reason); args.signal?.addEventListener('abort',abort,{once:true});
   const deadlineAtMs=args.enabled!==false&&args.timeoutMs>0?started+args.timeoutMs:undefined;
@@ -727,6 +743,7 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
     capacityLease=await acquireGeminiCapacity(args.context,controller.signal,deadlineAtMs);
     if(controller.signal.aborted)throw abortError();
     args.trace?.('before provider-call at server/providerResilience.ts');
+    providerCallStarted=true;
     const value=await args.call(controller.signal);
     args.trace?.('after provider-call at server/providerResilience.ts');
     const event:ProviderCallEvent={...base,status:'SUCCESS',latencyMs:Date.now()-started,actualCost:args.context.actualCost||0,occurredAt:new Date().toISOString()};
@@ -743,10 +760,13 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
         :classifyProviderError(error,Date.now(),args.context.provider);
     args.trace?.(`provider-call-caught (${typed.errorClass})`);
     if(args.context.provider==='gemini')console.warn('[Gemini Provider Diagnostic]',JSON.stringify({operation:args.context.operation,errorClass:typed.errorClass,status:typed.status??null,retryable:typed.retryable,providerReasons:safeProviderReasons(typed.providerReasons)}));
-    // A capacity deferral never reached Google. Tag the observability row so
+    // A capacity failure never reached Google. Tag the observability row so
     // pacing and the rolling token bucket never count their own echoes as new
-    // quota consumption (which would keep a full account full forever).
-    const capacityDeferral=args.context.provider==='gemini'&&!capacityLease&&safeProviderReasons(typed.providerReasons).some(reason=>reason==='GEMINI_ORG_TOKEN_BUCKET_EMPTY'||reason==='GEMINI_CAPACITY_DEFERRED'||reason.includes('_DEFERRED_'));
+    // quota consumption (which would keep a full account full forever). The
+    // marker tracks the provider call itself: lock waits, deadline aborts,
+    // and deferral paths that throw before `args.call` are all pre-lease
+    // failures, including errors without a deferral reason code.
+    const capacityDeferral=isGeminiCapacityDeferral(args.context.provider,providerCallStarted);
     const event:ProviderCallEvent={...base,requestMetadata:{...base.requestMetadata,...providerFailureMetadata(typed),...(capacityDeferral?{geminiCapacityDeferral:'true'}:{})},status:statusFor(typed),latencyMs:Date.now()-started,actualCost:0,errorClass:typed.errorClass,occurredAt:new Date().toISOString()};
     if(capacityLease&&(typed.errorClass==='TIMEOUT'||typed.errorClass==='CANCELLED')){
       const cleanupController=new AbortController();

@@ -4,8 +4,10 @@ import { readFileSync } from 'node:fs';
 import {
   DEFAULT_SEMANTIC_BATCH_WINDOW_MS,
   SEMANTIC_BATCH_PROMPT_VERSION,
+  SEMANTIC_REPAIR_REQUEST_MARKER,
   SemanticBatchScheduler,
   buildSemanticBatchPrompt,
+  classifySemanticPrompt,
   isSemanticBatchContainerUsable,
   parseSemanticBatchResponse,
   resetSemanticBatchSchedulerForTests,
@@ -14,16 +16,20 @@ import {
 import type { SemanticModelClient } from './evidenceEngine/providers/GeminiSemanticProvider';
 
 function fakeClock() {
-  const callbacks: Array<() => void> = [];
+  const callbacks: Array<{ handle: ReturnType<typeof setTimeout>; callback: () => void }> = [];
   return {
     callbacks,
     setTimeoutFn: (callback: () => void) => {
-      callbacks.push(callback);
-      return { unref() {} } as unknown as ReturnType<typeof setTimeout>;
+      const handle = { unref() {} } as unknown as ReturnType<typeof setTimeout>;
+      callbacks.push({ handle, callback });
+      return handle;
     },
-    clearTimeoutFn: () => undefined,
+    clearTimeoutFn: (handle: ReturnType<typeof setTimeout>) => {
+      const index = callbacks.findIndex(entry => entry.handle === handle);
+      if (index >= 0) callbacks.splice(index, 1);
+    },
     runAll() {
-      while (callbacks.length) callbacks.shift()!();
+      while (callbacks.length) callbacks.shift()!.callback();
     },
   };
 }
@@ -46,18 +52,18 @@ function semanticResult(label: string, citationField = 'channel_title') {
 
 function scheduler(clock: ReturnType<typeof fakeClock>) {
   return new SemanticBatchScheduler({
-    config: { enabled: true, maxSize: 8, windowMs: 10 },
+    config: { enabled: true, maxSize: 8, windowMs: 10, maxPromptChars: 120_000 },
     setTimeoutFn: clock.setTimeoutFn,
     clearTimeoutFn: clock.clearTimeoutFn,
   });
 }
 
 test('batch config is opt-in, clamps the size safely, and keeps a stage-0-bounded window', () => {
-  assert.deepEqual(semanticBatchConfig({} as any), { enabled: false, maxSize: 8, windowMs: 400 });
+  assert.deepEqual(semanticBatchConfig({} as any), { enabled: false, maxSize: 8, windowMs: 400, maxPromptChars: 120_000 });
   assert.equal(DEFAULT_SEMANTIC_BATCH_WINDOW_MS, 400);
-  assert.deepEqual(semanticBatchConfig({ SEMANTIC_BATCH_CLASSIFICATION_ENABLED: 'true', SEMANTIC_BATCH_MAX_SIZE: '99', SEMANTIC_BATCH_WINDOW_MS: '99999' } as any), { enabled: true, maxSize: 10, windowMs: 10_000 });
-  assert.deepEqual(semanticBatchConfig({ SEMANTIC_BATCH_CLASSIFICATION_ENABLED: 'true', SEMANTIC_BATCH_MAX_SIZE: '1' } as any), { enabled: true, maxSize: 2, windowMs: 400 });
-  assert.deepEqual(semanticBatchConfig({ SEMANTIC_BATCH_WINDOW_MS: 'not-a-number' } as any), { enabled: false, maxSize: 8, windowMs: 400 });
+  assert.deepEqual(semanticBatchConfig({ SEMANTIC_BATCH_CLASSIFICATION_ENABLED: 'true', SEMANTIC_BATCH_MAX_SIZE: '99', SEMANTIC_BATCH_WINDOW_MS: '99999' } as any), { enabled: true, maxSize: 10, windowMs: 2_000, maxPromptChars: 120_000 });
+  assert.deepEqual(semanticBatchConfig({ SEMANTIC_BATCH_CLASSIFICATION_ENABLED: 'true', SEMANTIC_BATCH_MAX_SIZE: '1' } as any), { enabled: true, maxSize: 2, windowMs: 400, maxPromptChars: 120_000 });
+  assert.deepEqual(semanticBatchConfig({ SEMANTIC_BATCH_WINDOW_MS: 'not-a-number' } as any), { enabled: false, maxSize: 8, windowMs: 400, maxPromptChars: 120_000 });
 });
 
 test('batch prompt declares an array schema with one independent request per channel', () => {
@@ -72,6 +78,23 @@ test('batch prompt declares an array schema with one independent request per cha
   assert.equal(prompt.inputs[1].request.channel_name, 'B');
   assert.ok(prompt.instructions.some((instruction: string) => /exactly one result object per input/.test(instruction)));
   assert.ok(prompt.instructions.some((instruction: string) => /Never merge evidence/.test(instruction)));
+});
+
+test('repair prompts split into instructions and a parseable embedded request', () => {
+  const header = 'Your previous classification is missing required field citations. Keep label=UNRELATED.';
+  const embedded = JSON.stringify({
+    task: 'CANDIDATE',
+    documents: [{ ref: { field: 'channel_bio' }, text: 'Trading education' }],
+  });
+  const request = JSON.parse(buildSemanticBatchPrompt([`${header}${SEMANTIC_REPAIR_REQUEST_MARKER}${embedded}`])).inputs[0].request;
+  assert.equal(request.raw, `${header}${SEMANTIC_REPAIR_REQUEST_MARKER}`);
+  assert.deepEqual(request.repairRequest, JSON.parse(embedded));
+
+  // A non-JSON tail cannot be structurally capped; it must stay raw text
+  // rather than being dropped or misparsed.
+  const malformed = JSON.parse(buildSemanticBatchPrompt([`${header}${SEMANTIC_REPAIR_REQUEST_MARKER}not json`])).inputs[0].request;
+  assert.equal(malformed.raw, `${header}${SEMANTIC_REPAIR_REQUEST_MARKER}not json`);
+  assert.equal(malformed.repairRequest, undefined);
 });
 
 test('batch response aligns by explicit index and leaves missing entries undefined', () => {
@@ -163,6 +186,27 @@ test('a whole-batch provider failure rejects every request without per-channel r
   assert.equal(calls, 1);
 });
 
+test('serialized prompt size splits a group before dispatch', async () => {
+  const clock = fakeClock();
+  const calls: string[] = [];
+  const client = clientWith(async prompt => {
+    calls.push(prompt);
+    return semanticResult('UNRELATED');
+  });
+  const instance = new SemanticBatchScheduler({
+    config: { enabled: true, maxSize: 8, windowMs: 10, maxPromptChars: 20_000 },
+    setTimeoutFn: clock.setTimeoutFn,
+    clearTimeoutFn: clock.clearTimeoutFn,
+  });
+  const prompt = (name: string) => JSON.stringify({ task: 'CANDIDATE', channel_name: name, description: 'x'.repeat(11_000) });
+  const first = instance.submit({ client, prompt: prompt('A'), model: 'm1' });
+  const second = instance.submit({ client, prompt: prompt('B'), model: 'm1' });
+  clock.runAll();
+  await Promise.all([first, second]);
+  assert.equal(calls.length, 2, 'an oversized pair must split into two provider calls');
+  assert.ok(calls.every(call => !call.includes('BATCH_CLASSIFICATION')), 'each oversized request travels alone');
+});
+
 test('an aborted queued request never reaches the provider', async () => {
   const clock = fakeClock();
   let calls = 0;
@@ -214,15 +258,45 @@ test('disabled batching is a byte-for-byte direct provider call', async () => {
     seen.push(prompt);
     return semanticResult('UNRELATED');
   });
-  const instance = new SemanticBatchScheduler({ config: { enabled: false, maxSize: 8, windowMs: 10 } });
+  const instance = new SemanticBatchScheduler({ config: { enabled: false, maxSize: 8, windowMs: 10, maxPromptChars: 120_000 } });
   const result = await instance.submit({ client, prompt: '{"channel_name":"A"}', model: 'm1' });
   assert.equal((result as any).label, 'UNRELATED');
   assert.deepEqual(seen, ['{"channel_name":"A"}']);
 });
 
-test('resetting the process-wide scheduler leaves no orphaned flush', async () => {
+test('resetting the process-wide scheduler rejects queued work and clears the flush timer', async () => {
   resetSemanticBatchSchedulerForTests();
-  assert.doesNotThrow(() => resetSemanticBatchSchedulerForTests());
+  const savedEnabled = process.env.SEMANTIC_BATCH_CLASSIFICATION_ENABLED;
+  const savedWindow = process.env.SEMANTIC_BATCH_WINDOW_MS;
+  const savedSetTimeout = globalThis.setTimeout;
+  const savedClearTimeout = globalThis.clearTimeout;
+  const clock = fakeClock();
+  let calls = 0;
+  const client = clientWith(async () => {
+    calls += 1;
+    return semanticResult('UNRELATED');
+  });
+  try {
+    process.env.SEMANTIC_BATCH_CLASSIFICATION_ENABLED = 'true';
+    process.env.SEMANTIC_BATCH_WINDOW_MS = '400';
+    globalThis.setTimeout = clock.setTimeoutFn as unknown as typeof setTimeout;
+    globalThis.clearTimeout = clock.clearTimeoutFn as unknown as typeof clearTimeout;
+    const pending = classifySemanticPrompt({ client, prompt: '{"channel_name":"A"}', model: 'm1' });
+    assert.equal(clock.callbacks.length, 1, 'the queued request must arm a flush timer');
+    resetSemanticBatchSchedulerForTests();
+    assert.equal(clock.callbacks.length, 0, 'reset must remove the orphaned flush timer');
+    await assert.rejects(pending, /reset/);
+    clock.runAll();
+    assert.equal(calls, 0, 'no provider call may run after the scheduler is reset');
+  } finally {
+    globalThis.setTimeout = savedSetTimeout;
+    globalThis.clearTimeout = savedClearTimeout;
+    if (savedEnabled === undefined) delete process.env.SEMANTIC_BATCH_CLASSIFICATION_ENABLED;
+    else process.env.SEMANTIC_BATCH_CLASSIFICATION_ENABLED = savedEnabled;
+    if (savedWindow === undefined) delete process.env.SEMANTIC_BATCH_WINDOW_MS;
+    else process.env.SEMANTIC_BATCH_WINDOW_MS = savedWindow;
+    resetSemanticBatchSchedulerForTests();
+  }
 });
 
 test('all production semantic providers route candidate and repair calls through the batch entry point', () => {
