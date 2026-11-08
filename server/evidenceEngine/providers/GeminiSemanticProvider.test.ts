@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   DEFAULT_MULTILINGUAL_CANDIDATE_MODEL,
+  GEMINI_BATCH_OUTPUT_TOKENS_MAX,
   GeminiSemanticProvider,
+  geminiBatchOutputConfig,
   type SemanticModelClient
 } from './GeminiSemanticProvider';
 import { classifyProviderError, ProviderCallError } from '../../providerResilience';
@@ -89,6 +91,15 @@ test('configured Gemini routes are ordered, non-empty, and deduplicated without 
   const routes=configuredGeminiRoutes({GEMINI_API_KEY:'a',GEMINI_API_KEY_2:'b',GEMINI_API_KEY_3:'a',GEMINI_API_KEY_4:'',GEMINI_API_KEY_5:'e',GEMINI_API_KEY_20:'z'});
   assert.deepEqual(routes.map(route=>route.id),['gemini-1','gemini-2','gemini-5','gemini-20']);
   assert.deepEqual(routes.map(route=>route.key),['a','b','e','z']);
+});
+
+test('Gemini batch output allowance scales with batch size and stays bounded',()=>{
+  assert.deepEqual(geminiBatchOutputConfig(),{},'single-call config must stay unchanged');
+  assert.deepEqual(geminiBatchOutputConfig(1),{},'single-call config must stay unchanged');
+  assert.deepEqual(geminiBatchOutputConfig(2),{maxOutputTokens:3072});
+  assert.deepEqual(geminiBatchOutputConfig(10),{maxOutputTokens:GEMINI_BATCH_OUTPUT_TOKENS_MAX});
+  assert.deepEqual(geminiBatchOutputConfig(0),{},'invalid sizes fall back to single-call defaults');
+  assert.deepEqual(geminiBatchOutputConfig(Number.NaN),{},'invalid sizes fall back to single-call defaults');
 });
 
 test('rate-limited Gemini route failure surfaces without cross-route burst',async()=>{

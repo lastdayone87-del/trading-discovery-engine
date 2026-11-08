@@ -243,7 +243,7 @@ export function classifyProviderError(error: unknown, nowMs: number = Date.now()
 export const statusFor=(e:ProviderCallError):ProviderStatus => e.errorClass==='TIMEOUT'?'TIMEOUT':e.errorClass==='CANCELLED'?'CANCELLED':e.errorClass==='RATE_LIMIT'?'RATE_LIMITED':e.retryable?'TRANSIENT_ERROR':'PERMANENT_ERROR';
 export type ProviderEventSink=(event:ProviderCallEvent)=>Promise<void>;
 
-const GEMINI_CAPACITY_LOCK = 741963285;
+const GEMINI_CAPACITY_LOCK_NAMESPACE = 741963285;
 const GEMINI_SEMANTIC_OPERATION = 'multilingual-semantic-classification';
 const GEMINI_VOCABULARY_OPERATION = 'vocabulary-extraction';
 const GEMINI_LOCK_POLL_MS = 100;
@@ -268,6 +268,31 @@ export function configuredGeminiRouteIds(env: NodeJS.ProcessEnv = process.env): 
   });
 }
 
+/**
+ * Configured Gemini account labels, matching the provider's
+ * `geminiOrgIdForSlot`: an explicit GEMINI_ORG_ID(_N) label, else the slot's
+ * own independent account. Used only to scope ledger reads; never a secret.
+ */
+function configuredGeminiOrgIds(env: NodeJS.ProcessEnv = process.env): string[] {
+  const names = Object.keys(env).filter(name => name === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_[2-9][0-9]*$/.test(name));
+  names.sort((a, b) => {
+    const slot = (name: string) => name === 'GEMINI_API_KEY' ? 1 : Number(name.slice('GEMINI_API_KEY_'.length));
+    return slot(a) - slot(b);
+  });
+  const seenKeys = new Set<string>();
+  const orgs: string[] = [];
+  for (const name of names) {
+    const key = String(env[name] || '').trim();
+    if (!key || seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    const slot = name === 'GEMINI_API_KEY' ? 1 : Number(name.slice('GEMINI_API_KEY_'.length));
+    const orgName = slot === 1 ? 'GEMINI_ORG_ID' : `GEMINI_ORG_ID_${slot}`;
+    const label = String(env[orgName] || '').trim();
+    orgs.push(label || `slot-${slot}`);
+  }
+  return orgs;
+}
+
 /** Resolve only machine-owned route identifiers; never expose or persist credentials. */
 export function resolveGeminiRouteId(value: unknown): string {
   const candidate = String(value || '').trim();
@@ -284,6 +309,8 @@ type GeminiCapacitySnapshot = {
   rateLimitQuotaScope?: ProviderQuotaScope;
   lastSemanticAtMs?: number;
   lastVocabularyAtMs?: number;
+  /** All Gemini calls for this account inside the rolling quota window. */
+  orgCallsInWindow?: number;
 };
 
 type GeminiCapacityConfig = {
@@ -294,6 +321,10 @@ type GeminiCapacityConfig = {
   vocabularyMinIntervalMs: number;
   maxInlineWaitMs?: number;
   semanticMaxInlineWaitMs?: number;
+  /** Rolling-window length for the per-account token bucket. */
+  orgRateLimitWindowMs?: number;
+  /** 0 disables the bucket; otherwise DEFER once the window is full. */
+  orgMaxCallsPerWindow?: number;
 };
 
 export type GeminiCapacityDecision = { action:'RUN'|'WAIT'|'DEFER'; waitMs:number; reasonCode?:string };
@@ -309,14 +340,27 @@ function envMs(name:string, fallback:number):number {
 }
 
 function geminiCapacityConfig():GeminiCapacityConfig {
+  // Blank is how deployment UIs express "unset": treating it as 0 would
+  // silently disable the per-account token bucket. 0 stays an explicit
+  // opt-out; negative/garbage falls back to the default.
+  const orgMaxCallsRaw = String(process.env.GEMINI_ORG_MAX_CALLS_PER_MINUTE ?? '').trim();
+  const orgMaxCalls = orgMaxCallsRaw === '' ? 10 : Number(orgMaxCallsRaw);
+  const orgWindowMsRaw = String(process.env.GEMINI_ORG_RATE_WINDOW_MS ?? '').trim();
+  const orgWindowMs = orgWindowMsRaw === '' ? 60000 : Number(orgWindowMsRaw);
   return {
-    globalMinIntervalMs: envMs('GEMINI_GLOBAL_MIN_INTERVAL_MS', 6000),
+    // Pacing is per configured account. The legacy name stays honored so an
+    // existing deployment keeps its interval, but one account's call no
+    // longer delays every other independent project.
+    globalMinIntervalMs: envMs('GEMINI_ORG_MIN_INTERVAL_MS', envMs('GEMINI_GLOBAL_MIN_INTERVAL_MS', 6000)),
     semanticRateLimitCooldownMs: envMs('GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS', 90000),
     vocabularyRateLimitSuppressionMs: envMs('GEMINI_VOCABULARY_RATE_LIMIT_SUPPRESSION_MS', 15*60*1000),
     vocabularySemanticQuietMs: envMs('GEMINI_VOCABULARY_SEMANTIC_QUIET_MS', 2*60*1000),
     vocabularyMinIntervalMs: envMs('GEMINI_VOCABULARY_MIN_INTERVAL_MS', 30000),
     maxInlineWaitMs: envMs('GEMINI_CAPACITY_MAX_INLINE_WAIT_MS', 8000),
-    semanticMaxInlineWaitMs: envMs('GEMINI_SEMANTIC_MAX_INLINE_WAIT_MS', 8000)
+    semanticMaxInlineWaitMs: envMs('GEMINI_SEMANTIC_MAX_INLINE_WAIT_MS', 8000),
+    orgRateLimitWindowMs: Number.isFinite(orgWindowMs) && orgWindowMs > 0 ? orgWindowMs : 60000,
+    // 0 is an explicit opt-out; negative/garbage falls back to the default.
+    orgMaxCallsPerWindow: Number.isFinite(orgMaxCalls) && orgMaxCalls >= 0 ? orgMaxCalls : 10,
   };
 }
 
@@ -324,6 +368,13 @@ export function decideGeminiCapacity(operation:string, snapshot:GeminiCapacitySn
   const age=(value?:number)=>value==null?Number.POSITIVE_INFINITY:Math.max(0,snapshot.nowMs-value);
   const maxInlineWaitMs=config.maxInlineWaitMs??8000;
   const semanticMaxInlineWaitMs=config.semanticMaxInlineWaitMs??maxInlineWaitMs;
+  // Per-account token bucket. The advisory lock serializes only calls that
+  // share this account, so independent Google projects are no longer paced by
+  // one another. A full window defers; it never silently drops the call.
+  const bucketCapacity = config.orgMaxCallsPerWindow ?? 10;
+  if (bucketCapacity > 0 && (snapshot.orgCallsInWindow ?? 0) >= bucketCapacity) {
+    return {action:'DEFER',waitMs:0,reasonCode:'GEMINI_ORG_TOKEN_BUCKET_EMPTY'};
+  }
   const globalWait=Math.max(0,config.globalMinIntervalMs-age(snapshot.lastGeminiAtMs));
   // A provider-declared absolute reset (daily quota) is authoritative and
   // must not be retried on the short per-minute cooldown clock. For per-minute
@@ -358,14 +409,14 @@ export function decideGeminiCapacity(operation:string, snapshot:GeminiCapacitySn
 /**
  * Returns the timestamp (ms since epoch) at which the Gemini semantic provider
  * cooldown will expire, based on the last RATE_LIMITED event persisted in
- * provider_call_events. Returns undefined if no rate limit has been recorded
- * or if the cooldown has already elapsed.
+ * provider_call_events for an account this process can actually serve.
+ * Returns undefined if no configured Gemini account has a recorded rate limit
+ * or the cooldown has already elapsed.
  *
- * Gemini rate limits are project-level, not per-key. A single RATE_LIMITED
- * event on ANY route applies the shared cooldown to ALL routes. This is the
- * same scope used by acquireGeminiCapacity (which queries any route's
- * RATE_LIMITED event) and decideGeminiCapacity (which defers semantic
- * operations during the cooldown window).
+ * Gemini rate limits are project-level, so each independent account's window
+ * derives only from rows tagged with that account. This legacy pool-wide
+ * resolver keeps its no-argument call shape for the queue retry fallback, but
+ * never lets an untagged or unrelated account's 429 cool configured projects.
  *
  * This is the single authoritative source of Gemini semantic cooldown state.
  * It queries the same provider_call_events table used by acquireGeminiCapacity,
@@ -379,6 +430,10 @@ export async function getGeminiSemanticCooldownExpiry(
     return db.query(sql, values);
   },
 ): Promise<number | undefined> {
+  const orgIds = [...new Set(configuredGeminiOrgIds())];
+  // No configured paid-Gemini account means this pool gate has no account to
+  // describe; a global unscoped read would only group independent projects.
+  if (!orgIds.length) return undefined;
   const config = geminiCapacityConfig();
   try {
     const res = await query(
@@ -387,8 +442,10 @@ export async function getGeminiSemanticCooldownExpiry(
                 FILTER (WHERE request_metadata->>'cooldownUntilMs' ~ '^[0-9]+$') OVER () AS cooldown_until_ms
          FROM provider_call_events
         WHERE provider='gemini' AND status='RATE_LIMITED'
+          AND request_metadata->>'geminiOrg' = ANY($1::text[])
           AND occurred_at >= now() - interval '2 days'
-        ORDER BY occurred_at DESC LIMIT 1`
+        ORDER BY occurred_at DESC LIMIT 1`,
+      [orgIds],
     );
     const row = res.rows[0];
     if (!row?.occurred_at) return undefined;
@@ -524,7 +581,7 @@ type GeminiCapacityLease={
   release:()=>Promise<void>;
 };
 
-export function geminiCapacityDeferralError(operation:string, reasonCode?:string):ProviderCallError {
+export function geminiCapacityDeferralError(operation:string, reasonCode?:string, retryAfterMs?:number):ProviderCallError {
   const isVocabulary=operation===GEMINI_VOCABULARY_OPERATION;
   const isSemantic=operation===GEMINI_SEMANTIC_OPERATION;
   const message=isVocabulary
@@ -532,7 +589,10 @@ export function geminiCapacityDeferralError(operation:string, reasonCode?:string
     : isSemantic
       ? 'Gemini semantic classification deferred during provider rate pressure.'
       : 'Gemini operation deferred during provider rate pressure.';
-  return new ProviderCallError(message,'TRANSIENT',true,{providerReasons:[reasonCode||'GEMINI_CAPACITY_DEFERRED']});
+  return new ProviderCallError(message,'TRANSIENT',true,{
+    providerReasons:[reasonCode||'GEMINI_CAPACITY_DEFERRED'],
+    ...(retryAfterMs!=null&&Number.isFinite(retryAfterMs)&&retryAfterMs>0?{retryAfterMs:Math.floor(retryAfterMs)}:{}),
+  });
 }
 
 async function connectWithAbort(db:any,signal?:AbortSignal):Promise<any>{
@@ -566,33 +626,58 @@ async function acquireGeminiCapacity(context:ProviderCallContext,signal?:AbortSi
     while(true){
       if(signal?.aborted)throw abortError();
       client=await connectWithAbort(db,signal);
-      const lock=await queryWithDeadline(client,'SELECT pg_try_advisory_lock($1) AS acquired',[GEMINI_CAPACITY_LOCK],signal,deadlineAtMs);
+      // Per-account advisory lock: same account calls serialize; independent
+      // Google projects proceed in parallel. hashtext gives a stable int4
+      // object key without storing or exposing credentials.
+      const lock=await queryWithDeadline(client,'SELECT pg_try_advisory_lock($1,hashtext($2)) AS acquired',[GEMINI_CAPACITY_LOCK_NAMESPACE,orgId],signal,deadlineAtMs);
       if(lock.rows[0]?.acquired)break;
       client.release();client=undefined;
       await waitForCapacity(GEMINI_LOCK_POLL_MS,signal);
     }
     if(signal?.aborted)throw abortError();
-    const [lastAny,lastRate,lastSemantic,lastVocabulary]=await Promise.all([
-      queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND COALESCE(request_metadata->>'geminiRoute',$1)=$1 ORDER BY occurred_at DESC LIMIT 1`,[routeId],signal,deadlineAtMs),
+    const capacityConfig = geminiCapacityConfig();
+    const [lastAny,lastRate,lastSemantic,lastVocabulary,orgWindowCalls]=await Promise.all([
+      // Pacing is per account. Strict org match: an untagged legacy row is
+      // not evidence about any specific project (fail-open for one window).
+      // Capacity deferrals never reached Google and must not reset pacing.
+      queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND request_metadata->>'geminiOrg'=$1 AND COALESCE(request_metadata->>'geminiCapacityDeferral','') <> 'true' ORDER BY occurred_at DESC LIMIT 1`,[orgId],signal,deadlineAtMs),
       // Rate limits are per-account: only this account's own RATE_LIMITED
       // rows feed its cooldown window (strict org tag match — untagged rows
       // cool no account), so one exhausted account never paces the healthy
       // ones.
       queryWithDeadline(client,`SELECT occurred_at, request_metadata->>'quotaScope' AS quota_scope, MAX((request_metadata->>'cooldownUntilMs')::bigint) FILTER (WHERE request_metadata->>'cooldownUntilMs' ~ '^[0-9]+$') OVER () AS cooldown_until_ms FROM provider_call_events WHERE provider='gemini' AND status='RATE_LIMITED' AND request_metadata->>'geminiOrg'=$1 AND occurred_at >= now() - interval '2 days' ORDER BY occurred_at DESC LIMIT 1`,[orgId],signal,deadlineAtMs),
-      queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND operation=$1 AND COALESCE(request_metadata->>'geminiRoute',$2)=$2 ORDER BY occurred_at DESC LIMIT 1`,[GEMINI_SEMANTIC_OPERATION,routeId],signal,deadlineAtMs),
-      queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND operation=$1 AND COALESCE(request_metadata->>'geminiRoute',$2)=$2 ORDER BY occurred_at DESC LIMIT 1`,[GEMINI_VOCABULARY_OPERATION,routeId],signal,deadlineAtMs)
+      queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND operation=$1 AND request_metadata->>'geminiOrg'=$2 AND COALESCE(request_metadata->>'geminiCapacityDeferral','') <> 'true' ORDER BY occurred_at DESC LIMIT 1`,[GEMINI_SEMANTIC_OPERATION,orgId],signal,deadlineAtMs),
+      queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND operation=$1 AND request_metadata->>'geminiOrg'=$2 AND COALESCE(request_metadata->>'geminiCapacityDeferral','') <> 'true' ORDER BY occurred_at DESC LIMIT 1`,[GEMINI_VOCABULARY_OPERATION,orgId],signal,deadlineAtMs),
+      // Rolling per-account token bucket. Counts every attempt that reached
+      // the provider (including failures) because quota is consumed by
+      // attempts, not successes. Deferral echoes are excluded so a full
+      // bucket cannot refill itself with retries.
+      queryWithDeadline(client,`SELECT COUNT(*)::int AS calls, MIN(occurred_at) AS oldest FROM provider_call_events WHERE provider='gemini' AND occurred_at > now() - ($1::int * interval '1 millisecond') AND request_metadata->>'geminiOrg'=$2 AND COALESCE(request_metadata->>'geminiCapacityDeferral','') <> 'true'`,[capacityConfig.orgRateLimitWindowMs ?? 60000,orgId],signal,deadlineAtMs)
     ]);
     const at=(row:any)=>row?.occurred_at?new Date(row.occurred_at).getTime():undefined;
     const declaredCooldownUntil=Number(lastRate.rows[0]?.cooldown_until_ms);
     const quotaScope=lastRate.rows[0]?.quota_scope;
-    const decision=decideGeminiCapacity(context.operation,{nowMs:Date.now(),lastGeminiAtMs:at(lastAny.rows[0]),lastRateLimitAtMs:at(lastRate.rows[0]),rateLimitCooldownUntilMs:Number.isFinite(declaredCooldownUntil)?declaredCooldownUntil:undefined,rateLimitQuotaScope:quotaScope==='DAILY'||quotaScope==='MINUTE'?quotaScope:undefined,lastSemanticAtMs:at(lastSemantic.rows[0]),lastVocabularyAtMs:at(lastVocabulary.rows[0])});
+    const decision=decideGeminiCapacity(context.operation,{nowMs:Date.now(),lastGeminiAtMs:at(lastAny.rows[0]),lastRateLimitAtMs:at(lastRate.rows[0]),rateLimitCooldownUntilMs:Number.isFinite(declaredCooldownUntil)?declaredCooldownUntil:undefined,rateLimitQuotaScope:quotaScope==='DAILY'||quotaScope==='MINUTE'?quotaScope:undefined,lastSemanticAtMs:at(lastSemantic.rows[0]),lastVocabularyAtMs:at(lastVocabulary.rows[0]),orgCallsInWindow:Number(orgWindowCalls.rows[0]?.calls||0)},capacityConfig);
     if(decision.action==='DEFER'){
-      await client.query({text:'SELECT pg_advisory_unlock($1)',values:[GEMINI_CAPACITY_LOCK],query_timeout:1000}).catch(()=>undefined);
-      client.release(); client=undefined;
+      // Align a bucket wait with the oldest counted attempt leaving the
+      // rolling window, instead of a generic exponential retry.
+      const oldestMs=orgWindowCalls.rows[0]?.oldest?new Date(orgWindowCalls.rows[0].oldest).getTime():undefined;
+      const bucketRetryAfterMs=decision.reasonCode==='GEMINI_ORG_TOKEN_BUCKET_EMPTY'&&oldestMs!=null&&Number.isFinite(oldestMs)
+        ? Math.max(1,oldestMs+(capacityConfig.orgRateLimitWindowMs??60000)-Date.now())
+        : undefined;
+      try{
+        await client.query({text:'SELECT pg_advisory_unlock($1,hashtext($2))',values:[GEMINI_CAPACITY_LOCK_NAMESPACE,orgId],query_timeout:1000});
+        client.release();
+      }catch{
+        // If the unlock cannot be confirmed, destroy the session so its
+        // advisory lock cannot outlive the deferral.
+        client.release(true);
+      }
+      client=undefined;
       // Carry the deferring account so retry scheduling can align run_after
       // with this account's cooldown instead of a global window. The route
       // id is kept alongside for ledger correlation.
-      throw Object.assign(geminiCapacityDeferralError(context.operation,decision.reasonCode),{geminiRoute:routeId,geminiOrg:orgId});
+      throw Object.assign(geminiCapacityDeferralError(context.operation,decision.reasonCode,bucketRetryAfterMs),{geminiRoute:routeId,geminiOrg:orgId});
     }
     if(decision.waitMs>0) await waitForCapacity(decision.waitMs,signal);
     if(signal?.aborted)throw abortError();
@@ -601,10 +686,10 @@ async function acquireGeminiCapacity(context:ProviderCallContext,signal?:AbortSi
         if(!client)return;
         await queryWithDeadline(client,`INSERT INTO provider_call_events(id,provider,operation,request_id,run_id,job_id,request_metadata,attempt,status,latency_ms,reserved_cost,actual_cost,error_class,policy_version,occurred_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT(id) DO NOTHING`,[event.id,event.provider,event.operation,event.requestId||null,event.runId||null,event.jobId||null,JSON.stringify(event.requestMetadata||{}),event.attempt,event.status,event.latencyMs,event.reservedCost,event.actualCost,event.errorClass||null,event.policyVersion,event.occurredAt],persistenceContext?.signal??signal,persistenceContext?.deadlineAtMs??deadlineAtMs);
       },
-      release:async()=>{if(!client)return;const leasedClient=client;client=undefined;try{await leasedClient.query({text:'SELECT pg_advisory_unlock($1)',values:[GEMINI_CAPACITY_LOCK],query_timeout:1000});leasedClient.release();}catch{leasedClient.release(true);}}
+      release:async()=>{if(!client)return;const leasedClient=client;client=undefined;try{await leasedClient.query({text:'SELECT pg_advisory_unlock($1,hashtext($2))',values:[GEMINI_CAPACITY_LOCK_NAMESPACE,orgId],query_timeout:1000});leasedClient.release();}catch{leasedClient.release(true);}}
     };
   }catch(error){
-    if(client){const leasedClient=client;client=undefined;try{await leasedClient.query({text:'SELECT pg_advisory_unlock($1)',values:[GEMINI_CAPACITY_LOCK],query_timeout:1000});leasedClient.release();}catch{leasedClient.release(true);}}
+    if(client){const leasedClient=client;client=undefined;try{await leasedClient.query({text:'SELECT pg_advisory_unlock($1,hashtext($2))',values:[GEMINI_CAPACITY_LOCK_NAMESPACE,orgId],query_timeout:1000});leasedClient.release();}catch{leasedClient.release(true);}}
     if(error instanceof ProviderCallError) throw error;
     if((error as any)?.name==='AbortError')throw error;
     if(context.operation===GEMINI_VOCABULARY_OPERATION) throw new ProviderCallError('Gemini vocabulary extraction deferred because capacity state is unavailable.','TRANSIENT',true,{cause:error,providerReasons:['VOCABULARY_CAPACITY_STATE_UNAVAILABLE']});
@@ -629,6 +714,34 @@ export function providerFailureMetadata(typed:ProviderCallError):Record<string,s
   return extra;
 }
 
+/**
+ * A Gemini failure that never started the provider call did not consume
+ * Google quota. The marker must cover lock waits, deadline aborts, and
+ * deferral paths that throw before `args.call`, not only known reason codes.
+ * Pacing and bucket reads exclude these rows so local echoes never consume
+ * quota against their own account.
+ */
+export function isGeminiCapacityDeferral(provider: string, providerCallStarted: boolean): boolean {
+  return provider === 'gemini' && !providerCallStarted;
+}
+
+/**
+ * The scale gate has a different question: it must exclude only failures that
+ * are reason-coded provider-capacity deferrals (which never attempted work),
+ * while still counting lock-wait and deadline contention that higher
+ * concurrency causes. Marking every pre-call failure would make the gate pass
+ * by removing its own overload failures from the denominator.
+ */
+export function isGeminiScaleGateDeferral(
+  provider: string,
+  providerCallStarted: boolean,
+  error?: Pick<ProviderCallError, 'providerReasons'>,
+): boolean {
+  if (!isGeminiCapacityDeferral(provider, providerCallStarted)) return false;
+  return (error?.providerReasons || []).some(reason =>
+    reason === 'GEMINI_ORG_TOKEN_BUCKET_EMPTY' || reason.includes('DEFERRED'));
+}
+
 export async function executeProviderCall<T>(args:{context:ProviderCallContext; timeoutMs:number; enabled?:boolean; signal?:AbortSignal; call:(signal:AbortSignal)=>Promise<T>; emit:ProviderEventSink; trace?:(stage:string)=>void}):Promise<T>{
   // An already-aborted caller must never start a billable request. Without
   // this check the abort listener is installed after the fact, so downstream
@@ -637,6 +750,7 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
   const started=Date.now(), id=randomUUID(), controller=new AbortController();
   const base={id,provider:args.context.provider,operation:args.context.operation,requestId:args.context.requestId,runId:args.context.runId,jobId:args.context.jobId,requestMetadata:args.context.requestMetadata,attempt:args.context.attempt||1,reservedCost:args.context.reservedCost||0,policyVersion:args.context.policyVersion||'provider-resilience-v1'};
   let capacityLease:GeminiCapacityLease|undefined;
+  let providerCallStarted=false;
   let timer:ReturnType<typeof setTimeout>|undefined; let timedOut=false;
   const abort=()=>controller.abort(args.signal?.reason); args.signal?.addEventListener('abort',abort,{once:true});
   const deadlineAtMs=args.enabled!==false&&args.timeoutMs>0?started+args.timeoutMs:undefined;
@@ -647,6 +761,7 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
     capacityLease=await acquireGeminiCapacity(args.context,controller.signal,deadlineAtMs);
     if(controller.signal.aborted)throw abortError();
     args.trace?.('before provider-call at server/providerResilience.ts');
+    providerCallStarted=true;
     const value=await args.call(controller.signal);
     args.trace?.('after provider-call at server/providerResilience.ts');
     const event:ProviderCallEvent={...base,status:'SUCCESS',latencyMs:Date.now()-started,actualCost:args.context.actualCost||0,occurredAt:new Date().toISOString()};
@@ -663,7 +778,16 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
         :classifyProviderError(error,Date.now(),args.context.provider);
     args.trace?.(`provider-call-caught (${typed.errorClass})`);
     if(args.context.provider==='gemini')console.warn('[Gemini Provider Diagnostic]',JSON.stringify({operation:args.context.operation,errorClass:typed.errorClass,status:typed.status??null,retryable:typed.retryable,providerReasons:safeProviderReasons(typed.providerReasons)}));
-    const event:ProviderCallEvent={...base,requestMetadata:{...base.requestMetadata,...providerFailureMetadata(typed)},status:statusFor(typed),latencyMs:Date.now()-started,actualCost:0,errorClass:typed.errorClass,occurredAt:new Date().toISOString()};
+    // A capacity failure never reached Google. Tag the observability row so
+    // pacing and the rolling token bucket never count their own echoes as new
+    // quota consumption (which would keep a full account full forever). The
+    // marker tracks the provider call itself: lock waits, deadline aborts,
+    // and deferral paths that throw before `args.call` are all pre-lease
+    // failures, including errors without a deferral reason code. The scale
+    // gate gets a narrower marker so lock contention stays in its denominator.
+    const capacityDeferral=isGeminiCapacityDeferral(args.context.provider,providerCallStarted);
+    const scaleGateDeferral=isGeminiScaleGateDeferral(args.context.provider,providerCallStarted,typed);
+    const event:ProviderCallEvent={...base,requestMetadata:{...base.requestMetadata,...providerFailureMetadata(typed),...(capacityDeferral?{geminiCapacityDeferral:'true'}:{}),...(scaleGateDeferral?{geminiScaleGateDeferral:'true'}:{})},status:statusFor(typed),latencyMs:Date.now()-started,actualCost:0,errorClass:typed.errorClass,occurredAt:new Date().toISOString()};
     if(capacityLease&&(typed.errorClass==='TIMEOUT'||typed.errorClass==='CANCELLED')){
       const cleanupController=new AbortController();
       const cleanupDeadlineAtMs=Date.now()+GEMINI_OUTCOME_CLEANUP_TIMEOUT_MS;

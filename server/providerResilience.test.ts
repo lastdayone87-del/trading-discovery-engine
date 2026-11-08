@@ -1,5 +1,5 @@
 import test from 'node:test'; import assert from 'node:assert/strict'; import { readFileSync } from 'node:fs';
-import { executeProviderCall, classifyProviderError, ProviderCallError, decideGeminiCapacity, resolveGeminiRouteId, extractGoogleQuotaFailure, parseProviderRetryDelayMs, nextPacificMidnightMs, providerCooldownExpiryMs, type ProviderCallEvent } from './providerResilience';
+import { executeProviderCall, classifyProviderError, ProviderCallError, decideGeminiCapacity, isGeminiCapacityDeferral, isGeminiScaleGateDeferral, resolveGeminiRouteId, extractGoogleQuotaFailure, parseProviderRetryDelayMs, nextPacificMidnightMs, providerCooldownExpiryMs, type ProviderCallEvent } from './providerResilience';
 
 test('successful calls emit bounded, payload-free cost telemetry',async()=>{const events:ProviderCallEvent[]=[];const result=await executeProviderCall({context:{provider:'fake',operation:'read',actualCost:3,requestId:'r',runId:'run-1',jobId:'job-1',requestMetadata:{regionCode:'FR',relevanceLanguage:'fr'},attempt:2},timeoutMs:50,call:async()=>({secret:'not logged'}),emit:async e=>{events.push(e)}});assert.equal(result.secret,'not logged');assert.equal(events[0].status,'SUCCESS');assert.equal(events[0].actualCost,3);assert.equal(events[0].requestId,'r');assert.equal(events[0].runId,'run-1');assert.equal(events[0].jobId,'job-1');assert.deepEqual(events[0].requestMetadata,{regionCode:'FR',relevanceLanguage:'fr'});assert.equal(events[0].attempt,2);assert.equal(JSON.stringify(events).includes('not logged'),false)});
 test('deadline aborts a fake provider and produces a retryable typed timeout',async()=>{const events:ProviderCallEvent[]=[];await assert.rejects(executeProviderCall({context:{provider:'fake',operation:'hang'},timeoutMs:10,call:signal=>new Promise((_r,reject)=>signal.addEventListener('abort',()=>reject(new Error('aborted')))),emit:async e=>{events.push(e)}}),(e:any)=>e instanceof ProviderCallError&&e.errorClass==='TIMEOUT'&&e.retryable);assert.equal(events[0].status,'TIMEOUT')});
@@ -31,10 +31,45 @@ test('Gemini route identifiers are normalized to machine-owned slots',()=>{
   assert.equal(resolveGeminiRouteId('gemini-4;DROP'),'gemini-1');
 });
 
-test('Gemini capacity queries are route-scoped while legacy events remain on route 1',()=>{
+test('Gemini capacity queries are account-scoped and never use one global lock',()=>{
   const source=readFileSync('server/providerResilience.ts','utf8');
-  assert.match(source,/COALESCE\(request_metadata->>'geminiRoute',\$1\)=\$1/);
-  assert.match(source,/COALESCE\(request_metadata->>'geminiRoute',\$2\)=\$2/);
+  // Phase 4: independent Google projects must not pace each other. Pacing,
+  // cooldown, and the token bucket all read strict geminiOrg tags.
+  assert.match(source,/request_metadata->>'geminiOrg'=\$1/);
+  assert.match(source,/request_metadata->>'geminiOrg'=\$2/);
+  assert.match(source,/pg_try_advisory_lock\(\$1,hashtext\(\$2\)\)/);
+  assert.doesNotMatch(source,/pg_try_advisory_lock\(\$1\) AS acquired/);
+  // Every SELECT path must be scoped, not just one representative query.
+  const templates=source.match(/`[^`]*provider_call_events[^`]*`/g)||[];
+  const reads=templates.filter(sql=>/SELECT/i.test(sql));
+  assert.ok(reads.length>=5,'expected the account-scoped ledger reads');
+  for(const sql of reads)assert.match(sql,/request_metadata->>'geminiOrg'/,'unscoped Gemini ledger read');
+  for(const sql of reads.filter(sql=>/COUNT\(\*\)::int AS calls|operation=\$1/.test(sql))){
+    assert.match(sql,/geminiCapacityDeferral/,'pacing/bucket reads must exclude deferral echoes');
+  }
+  assert.doesNotMatch(source,/provider='gemini' AND status='RATE_LIMITED'\s+AND occurred_at/,'cooldown read must not span every project');
+});
+
+test('Gemini capacity tagging covers every pre-call failure, not just deferral codes',()=>{
+  // Lock waits, deadline aborts, and unknown pre-lease failures never reached
+  // Google and must be excluded from pacing/bucket reads.
+  assert.equal(isGeminiCapacityDeferral('gemini',false),true);
+  // Once the provider call starts, quota is spent even if it then fails.
+  assert.equal(isGeminiCapacityDeferral('gemini',true),false);
+  assert.equal(isGeminiCapacityDeferral('groq',false),false);
+});
+
+test('the scale gate excludes only reason-coded capacity deferrals',()=>{
+  // A lock-wait/deadline timeout has no deferral reason. It must stay in the
+  // gate denominator so higher concurrency cannot hide its own contention.
+  assert.equal(isGeminiScaleGateDeferral('gemini',false,new ProviderCallError('lock wait timed out','TIMEOUT',true)),false);
+  const rateDeferred=new ProviderCallError('deferred','TRANSIENT',true,{providerReasons:['SEMANTIC_DEFERRED_RATE_PRESSURE']});
+  const bucketDeferred=new ProviderCallError('bucket empty','TRANSIENT',true,{providerReasons:['GEMINI_ORG_TOKEN_BUCKET_EMPTY']});
+  assert.equal(isGeminiScaleGateDeferral('gemini',false,rateDeferred),true);
+  assert.equal(isGeminiScaleGateDeferral('gemini',false,bucketDeferred),true);
+  // A post-call failure already spent quota and is always counted.
+  assert.equal(isGeminiScaleGateDeferral('gemini',true,rateDeferred),false);
+  assert.equal(isGeminiScaleGateDeferral('groq',false,rateDeferred),false);
 });
 
 test('an already-aborted caller never starts a provider call',async()=>{

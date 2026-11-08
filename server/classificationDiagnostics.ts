@@ -1,7 +1,14 @@
-import { createHash } from 'node:crypto';
 import { getDb } from './db';
 import type { RawChannelInput, VerificationDecision } from './evidenceEngine';
 import { persistClassificationEvidenceBundle } from './evidenceEngine/dualWrite';
+import { normalizeClassificationInput } from './classificationInputChecksum';
+
+/**
+ * Retained public name: the immutable diagnostic ledger and the Phase 4
+ * semantic result cache must fingerprint evidence identically, so the
+ * normalization lives in one shared module.
+ */
+export const normalizeProductionDiagnosticInput = normalizeClassificationInput;
 
 export interface ProductionClassificationDiagnosticInput {
   channelId: string;
@@ -12,26 +19,6 @@ export interface ProductionClassificationDiagnosticInput {
   nominationId?: string;
   catalogVersions?: string[];
   observationKey?: string;
-}
-
-export function normalizeProductionDiagnosticInput(input: RawChannelInput) {
-  // job_id/run_id are provider-observability attribution, not classification
-  // evidence. They already have dedicated diagnostic columns. Excluding them
-  // here keeps input_checksum stable when the same channel evidence is
-  // replayed under a different job or query run.
-  const classificationInput = { ...input };
-  delete classificationInput.job_id;
-  delete classificationInput.run_id;
-  const stable = {
-    ...classificationInput,
-    channel_name: classificationInput.channel_name.normalize('NFKC').trim(),
-    description: classificationInput.description || '',
-    external_links: [...(classificationInput.external_links || [])].sort()
-  };
-  return {
-    ...stable,
-    input_checksum: createHash('sha256').update(JSON.stringify(stable)).digest('hex')
-  };
 }
 
 /**

@@ -9,10 +9,14 @@ import {
 } from '../../providerResilience';
 import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../semanticCalibration';
 import { abortedByDeadline } from './abortReason';
+import { readSemanticResultCache, SEMANTIC_RESULT_CACHE_HIT_REASON, writeSemanticResultCache } from '../semanticResultCache';
+import { applySemanticPrefilter, recordSemanticPrefilterOutcome } from '../../semanticPrefilter';
+import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, SEMANTIC_REPAIR_REQUEST_MARKER, semanticBatchConfig, semanticResultWasBatched } from '../semanticBatch';
+import { isSemanticResultShape } from '../semanticResultShape';
+import { candidateDocumentRefs } from '../semanticDocumentRefs';
 import type { EvidenceCategory, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import {
   buildSemanticPrompt,
-  candidateDocumentRefs,
   hasCreatorLevelSemanticContext,
   parseSemanticResult,
   semanticObservabilityFields,
@@ -799,11 +803,42 @@ function failedGroqOrg(error: unknown, route: GroqRoute): string {
   return label || groqRouteOrg(route);
 }
 
-function groqRequestExtras(env: NodeJS.ProcessEnv = process.env): Record<string, unknown> {
+export const GROQ_MAX_BATCH_COMPLETION_TOKENS = 8192;
+
+/**
+ * Stable fingerprint of the settings that change the Groq model-facing call.
+ * Part of the semantic cache identity: changing a prompt cap, completion
+ * allowance, or reasoning effort must not replay results generated under the
+ * previous configuration.
+ */
+export function groqRequestSettingsKey(env: NodeJS.ProcessEnv = process.env): string {
+  const completion = Math.max(1, Math.floor(Number(env.GROQ_MAX_COMPLETION_TOKENS || '800')) || 800);
+  return [
+    `chars=${groqMaxPromptChars(env)}`,
+    `tokens=${groqMaxPromptTokens(env)}`,
+    `completion=${completion}`,
+    `reasoning=${env.GROQ_REASONING_EFFORT || ''}`,
+  ].join('|');
+}
+
+/**
+ * Request extras for one Groq completion. A batch call asks the model for one
+ * result object per submitted channel, so the completion allowance scales
+ * with the batch size; the single-call default stays byte-identical. The cap
+ * prevents an operator-configured value from growing an unbounded envelope.
+ */
+function groqRequestExtras(env: NodeJS.ProcessEnv = process.env, batchSize = 1): Record<string, unknown> {
+  const configured = Math.max(1, Math.floor(Number(env.GROQ_MAX_COMPLETION_TOKENS || '800')) || 800);
+  const size = Math.max(1, Math.floor(Number(batchSize) || 1));
   const extras: Record<string, unknown> = {
     temperature: 0,
     response_format: { type: 'json_object' },
-    max_completion_tokens: Math.max(1, Math.floor(Number(env.GROQ_MAX_COMPLETION_TOKENS || '800')) || 800),
+    // A single call honors the operator's configured allowance exactly. A
+    // batch envelope is hard-capped: sibling results multiply the response,
+    // and an operator value above the cap must not grow it without bound.
+    max_completion_tokens: size <= 1
+      ? configured
+      : Math.min(configured * size, GROQ_MAX_BATCH_COMPLETION_TOKENS),
   };
   // Reasoning effort is opt-in per model family: unsupported values 400 on
   // models without reasoning controls, so the default request carries none
@@ -876,12 +911,174 @@ function groqPromptBudgetError(): ProviderCallError {
 }
 
 /**
+ * Water-fill a character budget across variable text slots. Short slots keep
+ * their full text and the remainder is split evenly among the longer ones, so
+ * a batch's small headings are not shortened just because one document is
+ * huge. Every slot stays present.
+ */
+function textAllowances(texts: string[], availableChars: number): number[] {
+  const allowances = texts.map(() => 0);
+  let remaining = Math.max(0, availableChars);
+  let open = texts.map((_, index) => index);
+  while (open.length > 0 && remaining > 0) {
+    const share = Math.floor(remaining / open.length);
+    if (share <= 0) break;
+    const stillOpen: number[] = [];
+    for (const index of open) {
+      if (texts[index].length <= share) {
+        allowances[index] = texts[index].length;
+        remaining -= texts[index].length;
+      } else {
+        stillOpen.push(index);
+      }
+    }
+    if (stillOpen.length === open.length) {
+      for (const index of stillOpen) allowances[index] = share;
+      break;
+    }
+    open = stillOpen;
+  }
+  return allowances;
+}
+
+/**
+ * Bound a prompt by shortening its variable text while preserving every
+ * structural member. `make` receives one allowance per text slot and must
+ * render the same structure with each slot sliced to its allowance. Both a
+ * character ceiling and a script-aware token estimate are enforced because
+ * Groq meters tokens, and a 24k-character CJK prompt can cost far more tokens
+ * than its Latin equivalent.
+ */
+function boundPromptText(
+  make: (allowances: number[]) => string,
+  texts: string[],
+  maxChars: number,
+  maxTokens: number,
+): string {
+  const exceeds = (value: string) => value.length > maxChars || estimateGroqTokens(value) > maxTokens;
+  // The fixed references and structure alone can exceed the budget (very large
+  // corpus at a small configured limit). Never send an over-budget request:
+  // fail closed so the caller can use its fallback instead of provoking 429s.
+  const overhead = make(texts.map(() => 0));
+  if (exceeds(overhead)) throw groqPromptBudgetError();
+  const available = Math.max(0, maxChars - overhead.length);
+  let allowances = textAllowances(texts, available);
+  let bounded = make(allowances);
+  while (exceeds(bounded)) {
+    if (allowances.every(allowance => allowance === 0)) throw groqPromptBudgetError();
+    allowances = allowances.map(allowance => Math.max(0, Math.floor(allowance * 0.8)));
+    bounded = make(allowances);
+  }
+  return bounded;
+}
+
+/** Single-channel prompt: keep every document reference, shorten its text. */
+function capSinglePrompt(parsed: any, maxChars: number, maxTokens: number): string {
+  const documents = parsed.documents.map((document: any) => ({
+    ...document,
+    text: String(document?.text || ''),
+  }));
+  return boundPromptText(
+    allowances => JSON.stringify({
+      ...parsed,
+      contextTruncated: true,
+      documents: documents.map((document: any, index: number) => ({
+        ...document,
+        text: document.text.slice(0, allowances[index]),
+      })),
+    }),
+    documents.map((document: any) => document.text),
+    maxChars,
+    maxTokens,
+  );
+}
+
+/**
+ * Batch prompt: one channel request per input, with documents nested under
+ * `inputs[].request`. The single-channel cap cannot see those documents, and
+ * raw-slicing the batch JSON would delete later channels entirely. Bound the
+ * nested document text (and nested repair evidence) uniformly instead, so
+ * every batch member and every field reference survives.
+ */
+function capBatchPrompt(parsed: any, maxChars: number, maxTokens: number): string {
+  const prepared = parsed.inputs.map((input: any) => {
+    const request = input && typeof input === 'object' ? input.request : undefined;
+    if (!request || typeof request !== 'object') {
+      return { input, request: undefined, documents: undefined, raw: undefined, repair: undefined, repairDocuments: undefined };
+    }
+    const documents = Array.isArray(request.documents)
+      ? request.documents.map((document: any) => ({ ...document, text: String(document?.text || '') }))
+      : undefined;
+    const raw = typeof request.raw === 'string' ? request.raw : undefined;
+    // A structured repair request keeps its instruction prefix in `raw` and
+    // the original request in `repairRequest` (see parsePrompt). Its evidence
+    // lives inside that nested request, not at the top level.
+    const repair = request.repairRequest && typeof request.repairRequest === 'object' && !Array.isArray(request.repairRequest)
+      ? request.repairRequest
+      : undefined;
+    const repairDocuments = repair && Array.isArray(repair.documents)
+      ? repair.documents.map((document: any) => ({ ...document, text: String(document?.text || '') }))
+      : undefined;
+    return { input, request, documents, raw, repair, repairDocuments };
+  });
+  const texts: string[] = [];
+  for (const entry of prepared) {
+    if (entry.documents) for (const document of entry.documents) texts.push(document.text);
+    // `make` consumes one allowance per renderable slot. A structured repair
+    // prefix is fixed overhead, not a slot: it is kept intact in every render
+    // and already covered by the zero-allowance baseline.
+    if (entry.repair) {
+      if (entry.repairDocuments) for (const document of entry.repairDocuments) texts.push(document.text);
+    } else if (entry.raw !== undefined) {
+      texts.push(entry.raw);
+    }
+  }
+  const make = (allowances: number[]) => {
+    let cursor = 0;
+    return JSON.stringify({
+      ...parsed,
+      contextTruncated: true,
+      inputs: prepared.map(entry => {
+        if (!entry.request) return entry.input;
+        const request: any = { ...entry.request };
+        if (entry.documents) {
+          request.documents = entry.documents.map((document: any) => ({
+            ...document,
+            text: document.text.slice(0, allowances[cursor++] ?? 0),
+          }));
+          request.contextTruncated = true;
+        }
+        if (entry.repair) {
+          const repair: any = { ...entry.repair };
+          if (entry.repairDocuments) {
+            repair.documents = entry.repairDocuments.map((document: any) => ({
+              ...document,
+              text: document.text.slice(0, allowances[cursor++] ?? 0),
+            }));
+            repair.contextTruncated = true;
+          }
+          // Rebuild a single raw string so the marker still separates the
+          // repair instructions from a parseable embedded request. Slicing
+          // the raw prompt would cut the tail documents and their refs.
+          request.raw = String(entry.raw || '') + JSON.stringify(repair);
+          delete request.repairRequest;
+          request.contextTruncated = true;
+        } else if (entry.raw !== undefined) {
+          request.raw = entry.raw.slice(0, allowances[cursor++] ?? 0);
+          request.contextTruncated = true;
+        }
+        return { ...entry.input, request };
+      }),
+    });
+  };
+  return boundPromptText(make, texts, maxChars, maxTokens);
+}
+
+/**
  * Bound a semantic prompt to Groq's free-tier token budget without dropping
- * any field references. All documents stay present (so every citation remains
- * attributable); only their text is shortened. `contextTruncated` tells the
- * model the evidence set is partial. Both a character ceiling and a
- * script-aware token estimate are enforced because Groq meters tokens, and a
- * 24k-character CJK prompt can cost far more tokens than its Latin equivalent.
+ * any field references. Single prompts shorten document text; batch prompts
+ * shorten each nested member's text so no channel is silently removed.
+ * `contextTruncated` tells the model the evidence set is partial.
  */
 export function capGroqSemanticPrompt(
   prompt: string,
@@ -891,41 +1088,9 @@ export function capGroqSemanticPrompt(
   if (prompt.length <= maxChars && estimateGroqTokens(prompt) <= maxTokens) return prompt;
   let parsed: any;
   try { parsed = JSON.parse(prompt); } catch { return truncateToTokenBudget(prompt.slice(0, maxChars), maxTokens); }
+  if (Array.isArray(parsed?.inputs)) return capBatchPrompt(parsed, maxChars, maxTokens);
   if (!Array.isArray(parsed?.documents)) return truncateToTokenBudget(prompt.slice(0, maxChars), maxTokens);
-  const documents = parsed.documents.map((document: any) => ({
-    ...document,
-    text: String(document?.text || ''),
-  }));
-  const build = (perDocumentChars: number) => JSON.stringify({
-    ...parsed,
-    contextTruncated: true,
-    documents: documents.map((document: any) => ({
-      ...document,
-      text: document.text.slice(0, Math.max(0, Math.floor(perDocumentChars))),
-    })),
-  });
-  const overhead = JSON.stringify({
-    ...parsed,
-    contextTruncated: true,
-    documents: documents.map((document: any) => ({ ...document, text: '' })),
-  }).length;
-  const totalTextChars = documents.reduce((sum: number, document: any) => sum + document.text.length, 0);
-  const available = Math.max(0, maxChars - overhead);
-  let perDocumentChars = documents.length
-    ? Math.min(totalTextChars, Math.floor(available / documents.length))
-    : available;
-  const exceeds = (value: string) => value.length > maxChars || estimateGroqTokens(value) > maxTokens;
-  // The fixed references and structure alone can exceed the budget (very large
-  // corpus at a small configured limit). Never send an over-budget request:
-  // fail closed so the caller can use its fallback instead of provoking 429s.
-  if (exceeds(build(0))) throw groqPromptBudgetError();
-  let bounded = build(perDocumentChars);
-  while (exceeds(bounded) && perDocumentChars > 0) {
-    perDocumentChars = Math.max(0, Math.floor(perDocumentChars * 0.8));
-    bounded = build(perDocumentChars);
-  }
-  if (exceeds(bounded)) throw groqPromptBudgetError();
-  return bounded;
+  return capSinglePrompt(parsed, maxChars, maxTokens);
 }
 
 function emitGroqEvent(event: ProviderCallEvent): Promise<void> {
@@ -962,7 +1127,7 @@ export function defaultClient(
   const timeoutMs = groqTimeoutMs();
   const deadlinesEnabled = groqDeadlinesEnabled();
   const persistedCooldownExpiryMs = deps?.persistedCooldownExpiryMs ?? defaultPersistedCooldownExpiryMs;
-  return { classify: async (prompt, model, observability, signal) => {
+  return { batchGroup: 'groq-semantic', classify: async (prompt, model, observability, signal, options) => {
     // Routes are re-discovered per call so key rotation is config-only. The
     // restricted-route quarantine is applied before the failover so a known
     // dead organization is never retried (or paced) again in this process.
@@ -994,7 +1159,7 @@ export function defaultClient(
       const base = {
         id: randomUUID(), provider: 'groq', operation: 'multilingual-semantic-classification',
         ...semanticObservabilityFields(observability),
-        requestMetadata: { groqRoute: route.id, groqOrg: orgId, ...(promptCapped ? { groqPromptCapped: 'true' } : {}) }, attempt: 1,
+        requestMetadata: { ...(observability?.requestMetadata || {}), groqRoute: route.id, groqOrg: orgId, ...(promptCapped ? { groqPromptCapped: 'true' } : {}) }, attempt: 1,
         reservedCost: 0, policyVersion: 'provider-resilience-v1',
       };
       try {
@@ -1033,7 +1198,7 @@ export function defaultClient(
               { role: 'system', content: 'Return only valid JSON matching the requested schema.' },
               { role: 'user', content: boundedPrompt },
             ],
-            ...groqRequestExtras(),
+            ...groqRequestExtras(process.env, options?.batchSize),
           }),
           signal: controller.signal,
         });
@@ -1146,12 +1311,12 @@ export function defaultClient(
 
 async function classifyCandidateWith404Fallback(client: SemanticModelClient, candidatePrompt: string, candidateModel: string, fallbackModel: string, observability?: SemanticObservabilityContext, signal?: AbortSignal) {
   try {
-    return { value: await client.classify(candidatePrompt, candidateModel, observability, signal), model: candidateModel, fallbackUsed: false };
+    return { value: await classifySemanticPrompt({ client, prompt: candidatePrompt, model: candidateModel, observability, signal }), model: candidateModel, fallbackUsed: false };
   } catch (error) {
     const isModel404 = error instanceof ProviderCallError && error.errorClass === 'PERMANENT_INPUT' && error.status === 404;
     if (!isModel404 || candidateModel === fallbackModel) throw error;
     console.warn('[Groq Semantic] Candidate model returned 404; retrying once with configured adjudicator model.', { candidateModel, fallbackModel });
-    return { value: await client.classify(candidatePrompt, fallbackModel, observability, signal), model: fallbackModel, fallbackUsed: true };
+    return { value: await classifySemanticPrompt({ client, prompt: candidatePrompt, model: fallbackModel, observability, signal }), model: fallbackModel, fallbackUsed: true };
   }
 }
 
@@ -1194,7 +1359,7 @@ export function buildCitationRepairPrompt(
     `You may only cite from this exact list: [${refList}]. Cite only list entries, with matching field, index, and sourceId. If no listed reference supports the decision, return "citations":[] — never invent a reference.`,
     'Return the complete classification JSON with citations populated from the supplied field references; an uncited classification cannot be used.',
   ].join(' ');
-  const separator = ' Original request: ';
+  const separator = SEMANTIC_REPAIR_REQUEST_MARKER;
   const maxChars = limits?.maxChars ?? groqMaxPromptChars();
   const maxTokens = limits?.maxTokens ?? groqMaxPromptTokens();
   const fixedChars = header.length + separator.length;
@@ -1236,6 +1401,10 @@ export class GroqSemanticProvider implements EvidenceProvider {
     if (!hasCreatorLevelSemanticContext(input)) {
       return { availability: 'NOT_APPLICABLE' as const, reason: 'Retrieval-only candidate has no independent creator-level semantic context yet.' };
     }
+    const prefilter = applySemanticPrefilter(input, this.name);
+    if (prefilter.skip) {
+      return { availability: 'NOT_APPLICABLE' as const, reason: `Semantic prefilter withheld semantic quota: ${prefilter.decision?.reasonCodes.join(',') || 'WITHHELD'}.` };
+    }
     return { availability: 'AVAILABLE' as const };
   }
 
@@ -1245,49 +1414,115 @@ export class GroqSemanticProvider implements EvidenceProvider {
     const candidateModel = process.env.GROQ_CANDIDATE_MODEL || DEFAULT_GROQ_CANDIDATE_MODEL;
     const adjudicatorModel = process.env.GROQ_ADJUDICATOR_MODEL || DEFAULT_GROQ_ADJUDICATOR_MODEL;
     const observability = { jobId: input.job_id, runId: input.run_id };
-    const candidatePrompt = buildSemanticPrompt(input, 'CANDIDATE');
-    const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel, observability, signal);
-    let result = parseSemanticResult(candidate.value);
-    let model = candidate.model;
-    const fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
-    // Citation repair (Groq-only): a decisive-but-uncited result would abstain
-    // for missing attribution, not for lack of a decision. Offer exactly one
-    // targeted retry demanding citations. The original decision fields are
-    // preserved in code (prompt text is unenforceable on model output) and
-    // only citations referencing supplied documents are retained; a
-    // still-uncited result abstains as before, so unsupported classifications
-    // can never pass this gate.
-    let repairUsed = false;
-    let repairedCitations: SemanticModelResult['citations'] | null = null;
-    if (isDecisiveButUncited(result)) {
-      try {
-        const repaired = parseSemanticResult(await client.classify(buildCitationRepairPrompt(candidatePrompt, result, candidateDocumentRefs(input)), model, observability, signal));
-        const retained = retainSuppliedCitations(repaired.citations, candidateDocumentRefs(input));
-        if (retained.length > 0) {
-          result = { ...result, citations: retained };
-          repairedCitations = retained;
-          repairUsed = true;
+    const adjudicationEnabled = process.env.MULTILINGUAL_ADJUDICATION_ENABLED === 'true';
+    const cacheIdentity = {
+      input,
+      provider: this.name,
+      promptVersion: SEMANTIC_PROMPT_VERSION,
+      featureVersion: SEMANTIC_FEATURE_VERSION,
+      modelVersion: candidateModel,
+      adjudicatorModelVersion: adjudicatorModel,
+      adjudicationEnabled,
+      batchPromptVersion: semanticBatchConfig().enabled ? SEMANTIC_BATCH_PROMPT_VERSION : undefined,
+      // Repaired citations are part of the cached result, so a change to the
+      // repair prompt must invalidate entries produced by the old prompt.
+      repairPromptVersion: SEMANTIC_CITATION_REPAIR_PROMPT_VERSION,
+      // Prompt caps, completion allowance, and reasoning effort change the
+      // model-facing request; a cached result must not outlive them.
+      requestSettings: groqRequestSettingsKey(),
+    };
+    const cached = this.injectedClient ? undefined : await readSemanticResultCache(cacheIdentity, process.env, { signal });
+    let result: SemanticModelResult;
+    let model: string;
+    let fallbackReasonCodes: string[];
+    let repairSurvived: () => boolean;
+    if (cached) {
+      result = cached.result;
+      model = cached.modelVersion;
+      fallbackReasonCodes = [
+        ...(cached.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : []),
+        SEMANTIC_RESULT_CACHE_HIT_REASON,
+      ];
+      repairSurvived = () => Boolean(cached.repairPromptVersion);
+    } else {
+      const candidatePrompt = buildSemanticPrompt(input, 'CANDIDATE');
+      const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel, observability, signal);
+      // Only a complete model reply may be cached. parseSemanticResult turns
+      // a missing/partial reply into an AMBIGUOUS abstention; persisting that
+      // placeholder would replay it for the same evidence indefinitely.
+      let cacheable = isSemanticResultShape(candidate.value);
+      // A verdict produced inside a multi-channel batch saw sibling evidence
+      // and a different completion allowance. Keep it out of the cache: the
+      // realized batch request is not part of this per-channel identity.
+      let batchedOutput = semanticResultWasBatched(candidate.value);
+      result = parseSemanticResult(candidate.value);
+      model = candidate.model;
+      fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
+      // Citation repair (Groq-only): a decisive-but-uncited result would abstain
+      // for missing attribution, not for lack of a decision. Offer exactly one
+      // targeted retry demanding citations. The original decision fields are
+      // preserved in code (prompt text is unenforceable on model output) and
+      // only citations referencing supplied documents are retained; a
+      // still-uncited result abstains as before, so unsupported classifications
+      // can never pass this gate. Routed through the batch scheduler so
+      // independent repairs can share one provider call.
+      let repairUsed = false;
+      let repairedCitations: SemanticModelResult['citations'] | null = null;
+      if (isDecisiveButUncited(result)) {
+        try {
+          const repairedValue = await classifySemanticPrompt({ client, prompt: buildCitationRepairPrompt(candidatePrompt, result, candidateDocumentRefs(input)), model, observability, signal });
+          batchedOutput = batchedOutput || semanticResultWasBatched(repairedValue);
+          if (isSemanticResultShape(repairedValue)) {
+            const repaired = parseSemanticResult(repairedValue);
+            const retained = retainSuppliedCitations(repaired.citations, candidateDocumentRefs(input));
+            if (retained.length > 0) {
+              result = { ...result, citations: retained };
+              repairedCitations = retained;
+              repairUsed = true;
+            }
+          } else {
+            // A malformed repair is not a usable attribution source; keep the
+            // original abstention and let a later attempt retry.
+            cacheable = false;
+          }
+        } catch (error) {
+          // Repair is best-effort, but cancellation is not a repair failure:
+          // propagate it so canceled work is not reported as a completed
+          // abstention.
+          if (signal?.aborted) throw error;
+          // Keep the original result, which abstains.
         }
-      } catch (error) {
-        // Repair is best-effort, but cancellation is not a repair failure:
-        // propagate it so canceled work is not reported as a completed
-        // abstention.
-        if (signal?.aborted) throw error;
-        // Keep the original result, which abstains.
       }
+      // The repair code marks only results that survive to evidence
+      // construction with their repaired citations: a later adjudication that
+      // replaces the result drops the code with it. Evaluated below, after
+      // adjudication has had its chance to replace the result.
+      repairSurvived = () => repairUsed && repairedCitations !== null && result.citations === repairedCitations;
+      // Second pass runs unless adjudication already occurred (candidate served
+      // from the adjudicator model via 404 fallback). Gated on occurrence, not
+      // on model-name inequality, so identical candidate/adjudicator defaults
+      // still adjudicate low-confidence results.
+      if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && adjudicationEnabled && !candidate.fallbackUsed) {
+        const adjudicatedValue = await classifySemanticPrompt({ client, prompt: buildSemanticPrompt(input, 'ADJUDICATION'), model: adjudicatorModel, observability, signal });
+        cacheable = cacheable && isSemanticResultShape(adjudicatedValue);
+        batchedOutput = batchedOutput || semanticResultWasBatched(adjudicatedValue);
+        result = parseSemanticResult(adjudicatedValue); model = adjudicatorModel;
+      }
+      cacheable = cacheable && !batchedOutput;
+      // Cache the final verdict after repair/adjudication. Repair provenance
+      // is stored explicitly so a cache hit reports the same reason codes.
+      // Injected clients are a test/shadow seam and never touch the cache.
+      if (!this.injectedClient && cacheable) await writeSemanticResultCache(cacheIdentity, {
+        result,
+        modelVersion: model,
+        fallbackUsed: candidate.fallbackUsed,
+        repairPromptVersion: repairSurvived() ? SEMANTIC_CITATION_REPAIR_PROMPT_VERSION : undefined,
+      }, process.env, { signal });
     }
-    // The repair code marks only results that survive to evidence
-    // construction with their repaired citations: a later adjudication that
-    // replaces the result drops the code with it. Evaluated below, after
-    // adjudication has had its chance to replace the result.
-    const repairSurvived = () => repairUsed && repairedCitations !== null && result.citations === repairedCitations;
-    // Second pass runs unless adjudication already occurred (candidate served
-    // from the adjudicator model via 404 fallback). Gated on occurrence, not
-    // on model-name inequality, so identical candidate/adjudicator defaults
-    // still adjudicate low-confidence results.
-    if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && process.env.MULTILINGUAL_ADJUDICATION_ENABLED === 'true' && !candidate.fallbackUsed) {
-      result = parseSemanticResult(await client.classify(buildSemanticPrompt(input, 'ADJUDICATION'), adjudicatorModel, observability, signal)); model = adjudicatorModel;
-    }
+    // Shadow validation for the Phase 4 prefilter gate. Observability only:
+    // it never changes the verdict, and enforce mode records nothing because
+    // withheld channels never reach this provider.
+    recordSemanticPrefilterOutcome(input, this.name, result.label);
     const calibrated = calibrateSemanticConfidence(result.confidence);
     const abstained = !result.supportedLanguage || result.label === 'AMBIGUOUS' || calibrated < 50 || result.citations.length === 0;
     const positive = result.label === 'ACTIVE_TRADING' || result.label === 'INVESTING_EDUCATION';

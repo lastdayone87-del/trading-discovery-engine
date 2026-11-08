@@ -4,6 +4,8 @@ import {classifyTradingRelevanceDetailed} from './tradingRelevanceClassifier';
 import {evaluateRetrievalSpecificity} from './retrievalSpecificity';
 import {evaluateClassificationStages} from './evidenceEngine/stagedClassification';
 import type {EvidenceCollectionReport,EvidenceItem} from './evidenceEngine';
+import {buildCanonicalEvidenceCorpus} from './evidenceEngine';
+import {classificationInputChecksum} from './classificationInputChecksum';
 
 test('field-aware production boundary preserves structured and aligned evidence',async()=>{
   const result=await classifyTradingRelevanceDetailed({channel_id:'c1',channel_name:' Order Flow Lab ',description:'About',country:'United States',
@@ -14,6 +16,15 @@ test('field-aware production boundary preserves structured and aligned evidence'
   assert.equal(result.input.channel_name,'Order Flow Lab');
   assert.deepEqual(result.input.video_descriptions,['first description','second description']);
   assert.equal(result.input.videos?.[1].id,'v2');assert.equal(result.input.playlists?.[0].id,'p1');assert.equal(result.input.transcript_excerpts?.[0].video_id,'v1');
+  // The returned input must carry the corpus the engine actually evaluated.
+  // Diagnostics and the semantic cache hash the same fields, so a corpus that
+  // exists only on the engine's local copy would make their checksums diverge.
+  assert.ok(result.input.evidence_corpus?.length,'returned input must include the canonical evidence corpus');
+  assert.equal(
+    classificationInputChecksum(result.input),
+    classificationInputChecksum({...result.input,evidence_corpus:buildCanonicalEvidenceCorpus(result.input)}),
+    'corpus enrichment must be idempotent for the shared checksum',
+  );
 });
 
 test('retrieval specificity is semantic and language independent',()=>{

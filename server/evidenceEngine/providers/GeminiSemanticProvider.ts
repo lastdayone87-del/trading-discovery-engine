@@ -3,15 +3,19 @@ import { appendProviderCallEvent } from '../../db';
 import { executeProviderCall, getGeminiOrgSemanticCooldownExpiry, ProviderCallError, resolveGeminiRouteId } from '../../providerResilience';
 import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../semanticCalibration';
 import type { EvidenceCategory, EvidenceFieldRef, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
-import { documentRef } from '../canonicalEvidencePlane';
 import { abortedByDeadline } from './abortReason';
+import { readSemanticResultCache, SEMANTIC_RESULT_CACHE_HIT_REASON, writeSemanticResultCache } from '../semanticResultCache';
+import { applySemanticPrefilter, recordSemanticPrefilterOutcome } from '../../semanticPrefilter';
+import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, semanticBatchConfig, semanticResultWasBatched } from '../semanticBatch';
+import { semanticFieldDocuments } from '../semanticDocumentRefs';
+import { SEMANTIC_RESULT_FIELD_NAMES, SEMANTIC_RESULT_LABELS, isSemanticResultShape, type SemanticResultLabel } from '../semanticResultShape';
 
 export const SEMANTIC_PROMPT_VERSION = 'priority2-multilingual-structured-1';
 export const SEMANTIC_FEATURE_VERSION = 'field-aware-evidence-1';
-export const SEMANTIC_TAXONOMY = ['ACTIVE_TRADING', 'INVESTING_EDUCATION', 'FINANCIAL_NEWS', 'PERSONAL_FINANCE', 'HYPE', 'UNRELATED', 'AMBIGUOUS'] as const;
+export const SEMANTIC_TAXONOMY = SEMANTIC_RESULT_LABELS;
 export const DEFAULT_MULTILINGUAL_CANDIDATE_MODEL = 'gemini-3.6-flash';
 export const DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL = 'gemini-3.6-flash';
-type SemanticLabel = typeof SEMANTIC_TAXONOMY[number];
+type SemanticLabel = SemanticResultLabel;
 
 export interface SemanticModelResult {
   label: SemanticLabel;
@@ -28,16 +32,19 @@ export interface SemanticObservabilityContext {
   /** Provider-ledger attribution; never part of the prompt. */
   jobId?: string;
   runId?: string;
+  /** Extra bounded, non-secret ledger labels (for example semanticBatchSize). */
+  requestMetadata?: Record<string, string>;
 }
 
 /** Shared attribution fields for every semantic provider ledger event. Keeping
  * this in one place means a writer cannot silently drop jobId/runId. */
 export function semanticObservabilityFields(
   observability?: SemanticObservabilityContext,
-): { jobId?: string; runId?: string } {
-  const fields: { jobId?: string; runId?: string } = {};
+): { jobId?: string; runId?: string; requestMetadata?: Record<string, string> } {
+  const fields: { jobId?: string; runId?: string; requestMetadata?: Record<string, string> } = {};
   if (observability?.jobId) fields.jobId = observability.jobId;
   if (observability?.runId) fields.runId = observability.runId;
+  if (observability?.requestMetadata) fields.requestMetadata = { ...observability.requestMetadata };
   return fields;
 }
 
@@ -51,12 +58,41 @@ export function geminiSemanticProviderContext(
     provider: 'gemini' as const,
     operation: 'multilingual-semantic-classification',
     ...semanticObservabilityFields(observability),
-    requestMetadata,
+    requestMetadata: { ...(observability?.requestMetadata || {}), ...requestMetadata },
   };
 }
 
+export interface SemanticClassificationOptions {
+  /**
+   * Number of independent channel requests in this provider call. Batch
+   * callers use it to scale provider output allowances; a single call leaves
+   * the configured default untouched.
+   */
+  batchSize?: number;
+}
+
 export interface SemanticModelClient {
-  classify(prompt: string, model: string, observability?: SemanticObservabilityContext, signal?: AbortSignal): Promise<unknown>;
+  classify(prompt: string, model: string, observability?: SemanticObservabilityContext, signal?: AbortSignal, options?: SemanticClassificationOptions): Promise<unknown>;
+  /**
+   * Stable provider identity used by the Phase 4 batch scheduler. Injected
+   * clients leave it undefined and are grouped by object identity instead.
+   * It never contains credentials.
+   */
+  batchGroup?: string;
+}
+
+/**
+ * A batch asks for one full classification object per submitted channel, so
+ * the output allowance must grow with batch size. Single-call requests keep
+ * the client default (no explicit cap) to avoid changing existing behavior.
+ */
+export const GEMINI_BATCH_OUTPUT_TOKENS_PER_ITEM = 1024;
+export const GEMINI_BATCH_OUTPUT_TOKENS_MAX = 8192;
+
+export function geminiBatchOutputConfig(batchSize = 1): { maxOutputTokens?: number } {
+  const size = Math.max(1, Math.floor(Number(batchSize) || 1));
+  if (size <= 1) return {};
+  return { maxOutputTokens: Math.min(GEMINI_BATCH_OUTPUT_TOKENS_PER_ITEM * (size + 1), GEMINI_BATCH_OUTPUT_TOKENS_MAX) };
 }
 
 export interface GeminiRoute { id: string; key: string; orgId?: string; }
@@ -233,7 +269,7 @@ function defaultClient(): SemanticModelClient | undefined {
     sdkByRoute.set(route.id, created);
     return created;
   };
-  return { classify: async (prompt, model, observability, signal) => {
+  return { batchGroup: 'gemini-semantic', classify: async (prompt, model, observability, signal, options) => {
     // Caller already aborted: do not read the per-org cooldown ledger (one
     // provider_call_events query per org) only to throw afterwards.
     if (signal?.aborted) {
@@ -259,7 +295,7 @@ function defaultClient(): SemanticModelClient | undefined {
           context: geminiSemanticProviderContext(observability, { geminiRoute: route.id, geminiOrg: geminiRouteOrg(route) }),
           timeoutMs: Number(process.env.GEMINI_PROVIDER_TIMEOUT_MS || '135000'),
           enabled: process.env.PROVIDER_DEADLINES_ENABLED !== 'false', emit: appendProviderCallEvent, signal,
-          call: (signal) => sdkFor(route).models.generateContent({ model, contents: prompt, config: { responseMimeType: 'application/json', temperature: 0, abortSignal: signal } })
+          call: (signal) => sdkFor(route).models.generateContent({ model, contents: prompt, config: { responseMimeType: 'application/json', temperature: 0, abortSignal: signal, ...geminiBatchOutputConfig(options?.batchSize) } })
         });
       } catch (error) {
         // Carry the failing route AND its account for per-account failover
@@ -274,33 +310,6 @@ function defaultClient(): SemanticModelClient | undefined {
     }, { isOrgCooling: orgId => coolingOrgs.has(orgId), signal });
     return JSON.parse(response.text || '{}');
   }};
-}
-
-function fieldDocuments(input: RawChannelInput) {
-  if(input.evidence_corpus?.length)return input.evidence_corpus.filter(document=>!['activity_metadata','search_match_context','country','language'].includes(document.field)).slice(0,40).map(document=>({ref:documentRef(document),text:document.text}));
-  return [
-    { ref: { field: 'channel_title' as const }, text: input.channel_name },
-    { ref: { field: 'channel_bio' as const }, text: input.description },
-    ...(input.videos || (input.video_titles || []).map((title, index) => ({ title, description: input.video_descriptions?.[index] }))).slice(0, 12).flatMap((video, index) => [
-      { ref: { field: 'video_title' as const, index, sourceId: 'id' in video ? video.id : undefined, publishedAt: 'published_at' in video ? video.published_at : undefined }, text: video.title },
-      { ref: { field: 'video_description' as const, index, sourceId: 'id' in video ? video.id : undefined }, text: video.description || '' }
-    ]),
-    ...(input.playlists || []).slice(0, 6).flatMap((playlist, index) => [
-      { ref: { field: 'playlist_name' as const, index, sourceId: playlist.id }, text: playlist.name },
-      { ref: { field: 'playlist_description' as const, index, sourceId: playlist.id }, text: playlist.description || '' }
-    ]),
-    ...(input.transcript_excerpts || []).slice(0, 4).map((excerpt, index) => ({ ref: { field: 'transcript_excerpt' as const, index, sourceId: excerpt.video_id }, text: excerpt.text }))
-  ].filter(document => document.text?.trim()).map(document => ({ ...document, text: document.text.slice(0, 1200) }));
-}
-
-/**
- * Exact field references emitted for one input (see buildSemanticPrompt).
- * Shared source of truth for validating repaired citations: prompt
- * construction and citation validation read the same document set, so a
- * repaired citation can only ever attribute a supplied document.
- */
-export function candidateDocumentRefs(input: RawChannelInput): EvidenceFieldRef[] {
-  return fieldDocuments(input).map(document => document.ref);
 }
 
 /** Shared creator-context gate (see buildSemanticPrompt). */
@@ -332,7 +341,7 @@ export function buildSemanticPrompt(input: RawChannelInput, tier: 'CANDIDATE' | 
       'Distinguish active trading, investing education, financial news, personal finance, hype, and unrelated content.',
       'Return JSON with label, confidence 0..100, supportedLanguage, reasonCodes, explanation, concepts, languages, citations.'
     ],
-    declaredCountry: input.country || null, declaredLanguageHints: input.detected_languages || [], documents: fieldDocuments(input)
+    declaredCountry: input.country || null, declaredLanguageHints: input.detected_languages || [], documents: semanticFieldDocuments(input)
   });
 }
 
@@ -343,7 +352,7 @@ function parse(value: any): SemanticModelResult {
 /** Shared production semantic-result parser (see buildSemanticPrompt). */
 export function parseSemanticResult(value: any): SemanticModelResult {
   const label = SEMANTIC_TAXONOMY.includes(value?.label) ? value.label : 'AMBIGUOUS';
-  const fields = new Set(['channel_title','channel_bio','video_title','video_description','playlist_name','playlist_description','external_link_label','external_link_domain','country','language','transcript_excerpt','visual_evidence','discord_invite']);
+  const fields = SEMANTIC_RESULT_FIELD_NAMES;
   return {
     label, confidence: Math.max(0, Math.min(100, Number(value?.confidence) || 0)), supportedLanguage: value?.supportedLanguage === true,
     reasonCodes: Array.isArray(value?.reasonCodes) ? value.reasonCodes.map(String).slice(0, 8) : [],
@@ -355,12 +364,12 @@ export function parseSemanticResult(value: any): SemanticModelResult {
 
 async function classifyCandidateWith404Fallback(client: SemanticModelClient, candidatePrompt: string, candidateModel: string, fallbackModel: string, observability?: SemanticObservabilityContext, signal?: AbortSignal) {
   try {
-    return { value: await client.classify(candidatePrompt, candidateModel, observability, signal), model: candidateModel, fallbackUsed: false };
+    return { value: await classifySemanticPrompt({ client, prompt: candidatePrompt, model: candidateModel, observability, signal }), model: candidateModel, fallbackUsed: false };
   } catch (error) {
     const isModel404 = error instanceof ProviderCallError && error.errorClass === 'PERMANENT_INPUT' && error.status === 404;
     if (!isModel404 || candidateModel === fallbackModel) throw error;
     console.warn('[Gemini Semantic] Candidate model returned 404; retrying once with configured adjudicator model.', { candidateModel, fallbackModel });
-    return { value: await client.classify(candidatePrompt, fallbackModel, observability, signal), model: fallbackModel, fallbackUsed: true };
+    return { value: await classifySemanticPrompt({ client, prompt: candidatePrompt, model: fallbackModel, observability, signal }), model: fallbackModel, fallbackUsed: true };
   }
 }
 
@@ -373,6 +382,10 @@ export class GeminiSemanticProvider implements EvidenceProvider {
     if (!hasCreatorLevelSemanticContext(input)) {
       return { availability: 'NOT_APPLICABLE' as const, reason: 'Retrieval-only candidate has no independent creator-level semantic context yet.' };
     }
+    const prefilter = applySemanticPrefilter(input, this.name);
+    if (prefilter.skip) {
+      return { availability: 'NOT_APPLICABLE' as const, reason: `Semantic prefilter withheld semantic quota: ${prefilter.decision?.reasonCodes.join(',') || 'WITHHELD'}.` };
+    }
     return { availability: 'AVAILABLE' as const };
   }
 
@@ -382,18 +395,65 @@ export class GeminiSemanticProvider implements EvidenceProvider {
     const candidateModel = process.env.MULTILINGUAL_CANDIDATE_MODEL || DEFAULT_MULTILINGUAL_CANDIDATE_MODEL;
     const adjudicatorModel = process.env.MULTILINGUAL_ADJUDICATOR_MODEL || DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL;
     const observability = { jobId: input.job_id, runId: input.run_id };
-    const candidatePrompt = prompt(input, 'CANDIDATE');
-    const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel, observability, signal);
-    let result = parse(candidate.value);
-    let model = candidate.model;
-    const fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
-    // Second pass runs unless adjudication already occurred (candidate served
-    // from the adjudicator model via 404 fallback). Gated on occurrence, not
-    // on model-name inequality, so identical candidate/adjudicator defaults
-    // still adjudicate low-confidence results.
-    if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && process.env.MULTILINGUAL_ADJUDICATION_ENABLED === 'true' && !candidate.fallbackUsed) {
-      result = parse(await client.classify(prompt(input, 'ADJUDICATION'), adjudicatorModel, observability, signal)); model = adjudicatorModel;
+    const adjudicationEnabled = process.env.MULTILINGUAL_ADJUDICATION_ENABLED === 'true';
+    const cacheIdentity = {
+      input,
+      provider: this.name,
+      promptVersion: SEMANTIC_PROMPT_VERSION,
+      featureVersion: SEMANTIC_FEATURE_VERSION,
+      modelVersion: candidateModel,
+      adjudicatorModelVersion: adjudicatorModel,
+      adjudicationEnabled,
+      batchPromptVersion: semanticBatchConfig().enabled ? SEMANTIC_BATCH_PROMPT_VERSION : undefined,
+    };
+    const cached = this.injectedClient ? undefined : await readSemanticResultCache(cacheIdentity, process.env, { signal });
+    let result: SemanticModelResult;
+    let model: string;
+    let fallbackReasonCodes: string[];
+    if (cached) {
+      result = cached.result;
+      model = cached.modelVersion;
+      fallbackReasonCodes = [
+        ...(cached.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : []),
+        SEMANTIC_RESULT_CACHE_HIT_REASON,
+      ];
+    } else {
+      const candidatePrompt = prompt(input, 'CANDIDATE');
+      const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel, observability, signal);
+      // Only a complete model reply may be cached. parseSemanticResult turns
+      // a missing/partial reply into an AMBIGUOUS abstention; persisting that
+      // placeholder would replay it for the same evidence indefinitely.
+      let cacheable = isSemanticResultShape(candidate.value);
+      // A verdict produced inside a multi-channel batch saw sibling evidence
+      // and a different completion allowance. It is not interchangeable with a
+      // solo call for the same channel, so keeping it out of the cache avoids
+      // replaying a result whose realized request cannot be keyed cheaply.
+      let batchedOutput = semanticResultWasBatched(candidate.value);
+      result = parse(candidate.value);
+      model = candidate.model;
+      fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
+      // Second pass runs unless adjudication already occurred (candidate served
+      // from the adjudicator model via 404 fallback). Gated on occurrence, not
+      // on model-name inequality, so identical candidate/adjudicator defaults
+      // still adjudicate low-confidence results.
+      if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && adjudicationEnabled && !candidate.fallbackUsed) {
+        const adjudicatedValue = await classifySemanticPrompt({ client, prompt: prompt(input, 'ADJUDICATION'), model: adjudicatorModel, observability, signal });
+        cacheable = isSemanticResultShape(adjudicatedValue);
+        batchedOutput = batchedOutput || semanticResultWasBatched(adjudicatedValue);
+        result = parse(adjudicatedValue); model = adjudicatorModel;
+      }
+      cacheable = cacheable && !batchedOutput;
+      // Cache the final (possibly adjudicated) verdict. A later recheck of the
+      // same evidence under the same prompt/model versions replays this result
+      // without spending provider quota. Injected clients are a test/shadow
+      // seam and must never read or write the production cache. Uncited
+      // abstentions stay out of the cache so a later attempt can recover.
+      if (!this.injectedClient && cacheable) await writeSemanticResultCache(cacheIdentity, { result, modelVersion: model, fallbackUsed: candidate.fallbackUsed }, process.env, { signal });
     }
+    // Shadow validation for the Phase 4 prefilter gate. Observability only:
+    // it never changes the verdict, and enforce mode records nothing because
+    // withheld channels never reach this provider.
+    recordSemanticPrefilterOutcome(input, this.name, result.label);
     const calibrated = calibrateSemanticConfidence(result.confidence);
     const abstained = !result.supportedLanguage || result.label === 'AMBIGUOUS' || calibrated < 50 || result.citations.length === 0;
     const positive = result.label === 'ACTIVE_TRADING' || result.label === 'INVESTING_EDUCATION';

@@ -649,6 +649,57 @@ async function ensureClassificationSightingIndex(client: { query: (text: string,
   await client.query(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${name} ON public.channel_sightings (observed_at) WHERE funnel_outcome='CLASSIFICATION_PENDING'`);
 }
 
+/**
+ * Migration 170 indexes the enrichment throughput window and the semantic
+ * cache retention sweep. `jobs` is a hot queue table: a transactional build
+ * would block inserts, claims, heartbeats, and completions for the duration.
+ * Build every index concurrently before the loop's BEGIN; migration 170 then
+ * only adopts a valid index or verifies an empty table.
+ */
+async function ensurePhase4ScaleIndexes(client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> }): Promise<void> {
+  const ensure = async (name: string, table: string, createSql: string): Promise<void> => {
+    // A failed concurrent build can leave an invalid/not-ready catalog entry.
+    // It cannot serve queries, so never treat mere name existence as success.
+    const index = await client.query(`
+      SELECT c.oid, i.indisvalid, i.indisready
+        FROM pg_class c
+        JOIN pg_index i ON i.indexrelid = c.oid
+       WHERE c.oid = to_regclass('public.${name}')
+    `);
+    const existing = index.rows[0];
+    if (existing?.indisvalid && existing?.indisready) return;
+    if (existing?.oid) {
+      // The invalid index is unusable; drop it concurrently (outside the
+      // migration transaction) and rebuild below when the table is populated.
+      await client.query(`DROP INDEX CONCURRENTLY IF EXISTS public.${name}`);
+    }
+    const target = await client.query(`SELECT to_regclass('public.${table}') AS oid`);
+    if (!target.rows[0]?.oid) return;
+    const populated = await client.query(`SELECT EXISTS(SELECT 1 FROM public.${table} LIMIT 1) AS populated`);
+    if (!populated.rows[0]?.populated) return;
+    await client.query(createSql);
+  };
+  await ensure(
+    'idx_jobs_enrich_created_at',
+    'jobs',
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_enrich_created_at ON public.jobs (created_at) WHERE type='ENRICH_CHANNEL'`,
+  );
+  await ensure(
+    'idx_jobs_enrich_completed_at',
+    'jobs',
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_enrich_completed_at ON public.jobs (completed_at) WHERE type='ENRICH_CHANNEL' AND completed_at IS NOT NULL`,
+  );
+  await ensure(
+    'idx_semantic_cache_retention',
+    'semantic_classification_cache',
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_semantic_cache_retention ON public.semantic_classification_cache ((COALESCE(last_hit_at, created_at)))`,
+  );
+  // Migration 169 pre-created this index before the retention query was
+  // finalized. Drop it concurrently so the migration transaction does not
+  // hold a table lock for cleanup.
+  await client.query(`DROP INDEX CONCURRENTLY IF EXISTS public.idx_semantic_cache_created_at`);
+}
+
 export async function runMigrations(): Promise<Array<{ version: number; name: string; applied_at: string }>> {
   const db = pool || new Pool({ connectionString: requireDatabaseUrl(), ssl: process.env.PGSSL === 'disable' ? false : process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined });
   const client = await db.connect();
@@ -673,6 +724,10 @@ export async function runMigrations(): Promise<Array<{ version: number; name: st
     if (!migration160.rowCount) await ensureJobAttemptsFinishedErrorIndex(client);
     const migration168 = await client.query('SELECT 1 FROM schema_migrations WHERE version=168');
     if (!migration168.rowCount) await ensureClassificationSightingIndex(client);
+    // Migration 170 indexes the hot jobs queue. Build concurrently before the
+    // transactional loop; the migration itself only adopts or verifies.
+    const migration170 = await client.query('SELECT 1 FROM schema_migrations WHERE version=170');
+    if (!migration170.rowCount) await ensurePhase4ScaleIndexes(client);
     const files = fs.readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith('.sql')).sort();
     const versions=new Map<number,string>();
     for(const file of files){const version=Number(file.split('_')[0]);const previous=versions.get(version);if(previous)throw new Error(`Duplicate migration version ${version}: ${previous} and ${file}`);versions.set(version,file);}
@@ -3128,6 +3183,27 @@ export async function resolveGeminiOrgSemanticCooldownExpiryMs(orgId:string,nowM
   return getGeminiOrgSemanticCooldownExpiry(orgId,nowMs);
 }
 /**
+ * Earliest moment the failed account's rolling token bucket frees a slot.
+ * Counts only rows that actually reached Google (deferral echoes excluded),
+ * matching acquireGeminiCapacity's bucket query. Used by retry scheduling so
+ * GEMINI_ORG_TOKEN_BUCKET_EMPTY wakes on its own window instead of a generic
+ * backoff that generates more deferrals.
+ */
+export async function resolveGeminiOrgBucketExpiryMs(orgId:string,nowMs:number=Date.now()):Promise<number|undefined>{
+  const windowRaw=process.env.GEMINI_ORG_RATE_WINDOW_MS;
+  const windowMs=windowRaw===undefined||String(windowRaw).trim()===''?60000:Number(windowRaw);
+  if(!Number.isFinite(windowMs)||windowMs<=0)return undefined;
+  try{
+    const db=await getDb();
+    const res=await db.query(`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND request_metadata->>'geminiOrg'=$1 AND COALESCE(request_metadata->>'geminiCapacityDeferral','') <> 'true' AND occurred_at > now() - ($2::int * interval '1 millisecond') ORDER BY occurred_at ASC LIMIT 1`,[orgId,Math.floor(windowMs)]);
+    if(!res.rows[0]?.occurred_at)return undefined;
+    const oldestMs=new Date(res.rows[0].occurred_at).getTime();
+    if(!Number.isFinite(oldestMs))return undefined;
+    const expiry=oldestMs+windowMs;
+    return expiry>nowMs?expiry:undefined;
+  }catch{return undefined;}
+}
+/**
  * Pool-wide Groq semantic cooldown expiry from persisted provider_call_events:
  * one RATE_LIMITED event on any route cools the whole pool. Retained for
  * legacy callers and failures without a known scoped org; per-org callers
@@ -3238,7 +3314,7 @@ export function decideJobFailure(error:any,attempts:number,maxAttempts:number,no
     // this marker the recovery SQL EXISTS predicate never fires for these rows.
     if(boundedCooldown&&attempts>=maxAttempts)return {disposition:'FAILED',operationallyBlocked:true};
     const providerReasons=Array.isArray(error?.providerReasons)?error.providerReasons.map(String):[];
-    const isGeminiSemanticDefer=providerReasons.includes('SEMANTIC_DEFERRED_RATE_PRESSURE')||providerReasons.includes('GEMINI_CAPACITY_DEFERRED');
+    const isGeminiSemanticDefer=providerReasons.includes('SEMANTIC_DEFERRED_RATE_PRESSURE')||providerReasons.includes('GEMINI_CAPACITY_DEFERRED')||providerReasons.includes('GEMINI_ORG_TOKEN_BUCKET_EMPTY');
     if(isGeminiSemanticDefer&&typeof geminiSemanticCooldownExpiryMs==='number'&&Number.isFinite(geminiSemanticCooldownExpiryMs)&&geminiSemanticCooldownExpiryMs>now){
       scheduled=Math.max(scheduled,geminiSemanticCooldownExpiryMs);
     }
@@ -3254,7 +3330,7 @@ export function decideJobFailure(error:any,attempts:number,maxAttempts:number,no
   }
   return {disposition:attempts>=maxAttempts?'FAILED':'RETRYING'};
 }
-export async function failJob(jobId:string,error:any):Promise<JobFailureDisposition|null>{const db=await getDb(); const res=await db.query('SELECT attempts,max_attempts,created_at FROM jobs WHERE id=$1',[jobId]); if(!res.rowCount)return null; const {attempts,max_attempts,created_at}=res.rows[0]; const msg=String(error?.message||error).slice(0,2000); let geminiSemanticCooldownExpiryMs: number|undefined=undefined; let groqSemanticCooldownExpiryMs: number|undefined=undefined; let geminiFreeSemanticCooldownExpiryMs: number|undefined=undefined; const providerReasons=Array.isArray(error?.providerReasons)?error.providerReasons.map(String):[]; if(providerReasons.includes('SEMANTIC_DEFERRED_RATE_PRESSURE')||providerReasons.includes('GEMINI_CAPACITY_DEFERRED')||(providerReasons.includes('PROVIDER_RATE_LIMIT')&&failedProviderOrg(error,['PROVIDER_RATE_LIMIT'],['gemini_semantic'])!==undefined)){const failedGeminiOrg=failedProviderOrg(error,['SEMANTIC_DEFERRED_RATE_PRESSURE','GEMINI_CAPACITY_DEFERRED','PROVIDER_RATE_LIMIT'],['gemini_semantic']);geminiSemanticCooldownExpiryMs=failedGeminiOrg?await resolveGeminiOrgSemanticCooldownExpiryMs(failedGeminiOrg,Date.now()):await resolveGeminiSemanticCooldownExpiryMs(Date.now());} if(providerReasons.includes('GROQ_RATE_LIMITED')){const failedGroqOrg=failedProviderOrg(error,['GROQ_RATE_LIMITED']);groqSemanticCooldownExpiryMs=failedGroqOrg?await resolveGroqOrgCooldownExpiryMs(failedGroqOrg,Date.now()):await resolveGroqSemanticCooldownExpiryMs(Date.now());} if(providerReasons.includes('GEMINI_FREE_RATE_LIMITED')){geminiFreeSemanticCooldownExpiryMs=await resolveGeminiFreeSemanticCooldownExpiryMs(Date.now());}const decision=decideJobFailure(error,attempts,max_attempts,Date.now(),new Date(created_at).getTime(),geminiSemanticCooldownExpiryMs,groqSemanticCooldownExpiryMs,geminiFreeSemanticCooldownExpiryMs);const persistedMessage=decision.operationallyBlocked?`OPERATIONALLY_BLOCKED_RETRY_REQUIRED: ${msg}`:msg;if(decision.disposition==='RETRYING_WITHOUT_ATTEMPT'){await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,new Date(decision.runAfter!).toISOString()]);}else if(decision.disposition==='FAILED'){await db.query(`UPDATE jobs SET status='FAILED',last_error=$2,locked_by=NULL,locked_at=NULL,updated_at=now() WHERE id=$1`,[jobId,persistedMessage]);}else{const seconds=Math.min(900,30*Math.pow(2,Math.max(0,attempts-1))); await db.query(`UPDATE jobs SET status='PENDING',last_error=$2,locked_by=NULL,locked_at=NULL,run_after=now()+($3||' seconds')::interval,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,String(seconds)]);} await db.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$2 WHERE job_id=$1 AND finished_at IS NULL`,[jobId,persistedMessage]);return decision.disposition;}
+export async function failJob(jobId:string,error:any):Promise<JobFailureDisposition|null>{const db=await getDb(); const res=await db.query('SELECT attempts,max_attempts,created_at FROM jobs WHERE id=$1',[jobId]); if(!res.rowCount)return null; const {attempts,max_attempts,created_at}=res.rows[0]; const msg=String(error?.message||error).slice(0,2000); let geminiSemanticCooldownExpiryMs: number|undefined=undefined; let groqSemanticCooldownExpiryMs: number|undefined=undefined; let geminiFreeSemanticCooldownExpiryMs: number|undefined=undefined; const providerReasons=Array.isArray(error?.providerReasons)?error.providerReasons.map(String):[]; if(providerReasons.includes('SEMANTIC_DEFERRED_RATE_PRESSURE')||providerReasons.includes('GEMINI_CAPACITY_DEFERRED')||(providerReasons.includes('PROVIDER_RATE_LIMIT')&&failedProviderOrg(error,['PROVIDER_RATE_LIMIT'],['gemini_semantic'])!==undefined)){const failedGeminiOrg=failedProviderOrg(error,['SEMANTIC_DEFERRED_RATE_PRESSURE','GEMINI_CAPACITY_DEFERRED','PROVIDER_RATE_LIMIT'],['gemini_semantic']);geminiSemanticCooldownExpiryMs=failedGeminiOrg?await resolveGeminiOrgSemanticCooldownExpiryMs(failedGeminiOrg,Date.now()):await resolveGeminiSemanticCooldownExpiryMs(Date.now());} if(providerReasons.includes('GEMINI_ORG_TOKEN_BUCKET_EMPTY')){const failedGeminiOrg=failedProviderOrg(error,['GEMINI_ORG_TOKEN_BUCKET_EMPTY'],['gemini_semantic']);const bucketExpiry=failedGeminiOrg?await resolveGeminiOrgBucketExpiryMs(failedGeminiOrg,Date.now()):undefined;if(bucketExpiry!==undefined)geminiSemanticCooldownExpiryMs=bucketExpiry;} if(providerReasons.includes('GROQ_RATE_LIMITED')){const failedGroqOrg=failedProviderOrg(error,['GROQ_RATE_LIMITED']);groqSemanticCooldownExpiryMs=failedGroqOrg?await resolveGroqOrgCooldownExpiryMs(failedGroqOrg,Date.now()):await resolveGroqSemanticCooldownExpiryMs(Date.now());} if(providerReasons.includes('GEMINI_FREE_RATE_LIMITED')){geminiFreeSemanticCooldownExpiryMs=await resolveGeminiFreeSemanticCooldownExpiryMs(Date.now());}const decision=decideJobFailure(error,attempts,max_attempts,Date.now(),new Date(created_at).getTime(),geminiSemanticCooldownExpiryMs,groqSemanticCooldownExpiryMs,geminiFreeSemanticCooldownExpiryMs);const persistedMessage=decision.operationallyBlocked?`OPERATIONALLY_BLOCKED_RETRY_REQUIRED: ${msg}`:msg;if(decision.disposition==='RETRYING_WITHOUT_ATTEMPT'){await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,new Date(decision.runAfter!).toISOString()]);}else if(decision.disposition==='FAILED'){await db.query(`UPDATE jobs SET status='FAILED',last_error=$2,locked_by=NULL,locked_at=NULL,updated_at=now() WHERE id=$1`,[jobId,persistedMessage]);}else{const seconds=Math.min(900,30*Math.pow(2,Math.max(0,attempts-1))); await db.query(`UPDATE jobs SET status='PENDING',last_error=$2,locked_by=NULL,locked_at=NULL,run_after=now()+($3||' seconds')::interval,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,String(seconds)]);} await db.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$2 WHERE job_id=$1 AND finished_at IS NULL`,[jobId,persistedMessage]);return decision.disposition;}
 export async function recoverStaleJobs(staleAfterMinutes=15):Promise<number>{const db=await getDb(); const client=await db.connect(); try{await client.query('BEGIN'); const stuck=await client.query(`SELECT id,type,locked_by,locked_at,attempts FROM jobs WHERE status='PROCESSING' AND locked_at < now()-($1||' minutes')::interval FOR UPDATE`,[String(staleAfterMinutes)]); const res=await client.query(`UPDATE jobs SET status='PENDING',locked_by=NULL,locked_at=NULL,updated_at=now(),last_error=COALESCE(last_error,'Recovered stale processing lock') WHERE id=ANY($1::uuid[])`,[stuck.rows.map(row=>row.id)]); if(res.rowCount) await client.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=COALESCE(error,'Worker heartbeat expired; job recovered for retry') WHERE finished_at IS NULL AND job_id=ANY($1::uuid[])`,[stuck.rows.map(row=>row.id)]); await client.query('COMMIT'); const summary=summarizeRecoveredStaleJobs(stuck.rows,Date.now()); if(summary.recovered>0)console.warn(JSON.stringify({event:'stale_jobs_recovered',...summary,staleAfterMinutes,timestamp:new Date().toISOString()})); return res.rowCount||0;}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}}
 
 /**

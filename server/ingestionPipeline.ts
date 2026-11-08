@@ -36,7 +36,7 @@ import { recordReviewEligibilityShadow } from './reviewEligibility/store';
 import { evaluateReviewEligibilityV2, resolveReviewProviderDegraded } from './reviewEligibility/policy';
 import { shouldPreserveExistingChannel } from './terminalPreservationPolicy';
 import { CANDIDATE_TRIAGE_POLICY_VERSION, hasIndependentTradingHypothesis, triageAutonomousSearchCandidate } from './candidateTriage';
-import { evaluateLowAudienceGate, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
+import { evaluateLowAudienceGate, parseSubscriberCountNumber, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
 import { shouldReactivateCommunityRecovery, reactivateCommunityRecovery } from './communityRecovery';
 import { maybeRunDiscoveryEvidenceExtraction } from './discovery/evidencePipeline';
 import {
@@ -714,6 +714,7 @@ async function processChannelThroughPipelineInContext(
     playlists:candidate.playlists,
     transcript_excerpts:candidate.transcriptExcerpts,detected_languages:languageInputs.detected_languages,visual_evidence:candidate.visualEvidence,
     pinned_comment:candidate.pinnedComment,enrichment_stage:candidate.enrichmentStage||0,
+    subscriber_count:parseSubscriberCountNumber(candidate.subscriberCount),video_count:structuredVideos.length,
     search_match_context:candidate.matchedDocument?{type:candidate.matchedDocument.type,provider_native_id:candidate.matchedDocument.providerNativeId,title:candidate.matchedDocument.title,description:candidate.matchedDocument.description,published_at:candidate.matchedDocument.publishedAt,locator:candidate.matchedDocument.locator}:undefined,
     activity_metadata:{latest_upload_at:candidate.latestUploadAt,uploads_last_30_days:candidate.uploadsLast30Days,uploads_last_90_days:candidate.uploadsLast90Days,uploads_last_365_days:candidate.uploadsLast365Days,activity_band:candidate.activityBand,activity_score:candidate.activityScore,observed_at:candidate.activityObservedAt}
   };
