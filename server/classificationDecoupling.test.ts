@@ -231,9 +231,9 @@ test('source wiring keeps the inline path as the explicit rollback fallback and 
   assert.match(queue, /push\(CLASSIFICATION_JOB_TYPE\)/);
   assert.match(queue, /job\.type === CLASSIFICATION_JOB_TYPE[\s\S]{0,120}processClassificationJob/);
   assert.match(queue, /startWorkerPool\('ENRICH_CHANNEL', enrichmentSplit\.classificationWorkers, \[CLASSIFICATION_JOB_TYPE\]/);
-  // The split starts two pools, so startup clamps the total to the historical
-  // 20-worker maximum before splitting.
-  assert.match(queue, /const enrichmentWorkers = Math\.min\(20, resolveEnrichmentWorkerCount\(\)\)/);
+  // Phase 4 startup clamps through the measured gate and the approved hard
+  // ceiling before splitting into the two pools.
+  assert.match(queue, /resolveEnrichmentWorkerSplit\(Math\.min\(ENRICHMENT_WORKER_SCALE_CEILING, effectiveWorkers\), decoupling\.enabled\)/);
   // The search run must not fail because a later classification failed.
   assert.match(queue, /job\.type === CLASSIFICATION_JOB_TYPE \? '' : String\(job\.payload\?\.queryRunId/);
   // Provisional rows are insert-only and classification reconciliation is durable.
