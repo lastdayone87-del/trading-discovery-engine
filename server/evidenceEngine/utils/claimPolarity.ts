@@ -81,6 +81,7 @@ const CLAIM_LIKE_TERM = /\b(?:guaranteed?|profits?|returns?|gains?|rich|wealth|m
 const POST_NEGATION = /^\s*(?:[?!.,:;\-–—]+\s*)?(?:no|nope|not|never|false|myth|wrong|incorrect|pas|non|nein|kein|inte|ikke|aldrig|nunca|mai)\b/iu;
 const POST_DENIAL = /\b(?:is|are|was|were)\s+(?:a\s+)?(?:myth|lie|false|not\s+true|incorrect|wrong)\b/iu;
 const ASSERTIVE_NEGATION_FRAME = /\b(?:no\s+(?:bs|b\.s\.|nonsense|fluff|hype|shortcuts?)|zero\s+to\s+(?:hero|pro|funded|profit))\b/iu;
+const POST_CRITICISM = /(?:\b(?:is|are|was|were|sounds?|seems?)\s+(?:a\s+|an\s+)?(?:scam|fraud|myth|lie|red\s*flag|fake|misleading)\b|\b(?:red\s*flags?|too\s*good\s*to\s*be\s*true)\b)/iu;
 const CONTRAST_CUE = /(?:\b(?:but|however|yet|although|though|whereas|nevertheless|nonetheless|mais|aber|pero|però|ma|doch|men|maar|mas)\b|(?:но|但|但是|しかし))/iu;
 // `and` only starts a new clause when it introduces a new predicate/subject;
 // noun coordination ("stocks and crypto") stays inside the negation scope.
@@ -114,7 +115,7 @@ const DISCLAIMER_PATTERNS: RegExp[] = [
   /(?<![\p{L}\p{N}])(?:担保|保証|保證)\s*(?:は|が)?\s*(?:ありません|ない|なし)/u,
   /(?:过去|過去)?的表现(?:并|並)?不代表(?:未来|未來)?(?:收益|表现|表現)?/u,
   /\bbukan\s+(?:nasihat|jaminan)\b/iu,
-  /(?<![\p{L}\p{N}])(?:投資助言ではありません|必ず儲かることはありません|保証はありません)/u,
+  /(?:投資助言ではありません|必ず儲かることはありません|保証はありません)/u,
 ];
 
 const DISCLAIMER_GLOBAL_PATTERNS = DISCLAIMER_PATTERNS.map(pattern =>
@@ -273,7 +274,7 @@ export function classifyClaimPolarity(
   if (POST_NEGATION.test(sameClauseAfter)) {
     return { polarity: 'NEGATED', cue: sameClauseAfter.trim().slice(0, 24), confidence: 0.9 };
   }
-  if (/^[\p{L}\p{N}]{0,4}\s*[?!]\s*(?:no|nope|not|never|false|myth|wrong|incorrect|pas|non|nein|kein|inte|ikke|aldrig|nunca|mai)(?:\s*[.!?]|$)/iu.test(afterImmediate)) {
+  if (/^[\p{L}\p{N}]{0,4}\s*[?!]\s*(?:no|nope|not|never|false|myth|wrong|incorrect|pas|non|nein|kein|inte|ikke|aldrig|nunca|mai)(?:\s*[.!?,]|$)/iu.test(afterImmediate)) {
     return { polarity: 'NEGATED', cue: afterImmediate.trim().slice(0, 24), confidence: 0.9 };
   }
   if (POST_DENIAL.test(afterClause)) {
@@ -298,9 +299,10 @@ export function classifyClaimPolarity(
     return { polarity: 'QUOTED', cue, confidence: 0.85 };
   }
   // Post-term criticism: "Guaranteed profits are a red flag" is criticism of
-  // the claim, not an asserted promise.
-  if (termLooksLikeClaim && CRITICISM_CUE.test(afterClause)) {
-    return { polarity: 'QUOTED', cue: closestCue(CRITICISM_CUE, afterClause), confidence: 0.84 };
+  // the claim, not an asserted promise. Require a predicate that describes the
+  // term, not any later criticism of another subject.
+  if (termLooksLikeClaim && POST_CRITICISM.test(afterClause)) {
+    return { polarity: 'QUOTED', cue: closestCue(POST_CRITICISM, afterClause), confidence: 0.84 };
   }
 
   const negation = combinedCueRegex(before, language, NEGATION_CUES);

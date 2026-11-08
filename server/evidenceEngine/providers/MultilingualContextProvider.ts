@@ -73,9 +73,16 @@ export class MultilingualContextProvider implements EvidenceProvider {
     const items: EvidenceItem[] = [];
     const now = new Date().toISOString();
     const fieldsFor=(terms:string[])=>{
-      const exact=attributableDocuments.filter(document=>terms.some(term=>findScopedTermMatches(document.text,[term],document.language).some(match=>match.polarity==='ASSERTED')));
+      const documentAsserts = (document: typeof attributableDocuments[number], term: string) => {
+        if (isAmbiguousExecutionTerm(term) && !hasIndependentMarketFrame(document.text)) return false;
+        return findScopedTermMatches(document.text,[term],document.language).some(match=>match.polarity==='ASSERTED');
+      };
+      const exact=attributableDocuments.filter(document=>terms.some(term=>documentAsserts(document,term)));
       if(exact.length)return exact.map(documentRef);
-      const partial=attributableDocuments.filter(document=>terms.some(term=>String(term).split(/\s+/u).some(part=>part.length>2&&findScopedTermMatches(document.text,[part],document.language).some(match=>match.polarity==='ASSERTED'))));
+      const partial=attributableDocuments.filter(document=>terms.some(term=>{
+        if (isAmbiguousExecutionTerm(term) && !hasIndependentMarketFrame(document.text)) return false;
+        return String(term).split(/\s+/u).some(part=>part.length>2&&findScopedTermMatches(document.text,[part],document.language).some(match=>match.polarity==='ASSERTED'));
+      }));
       return partial.map(documentRef);
     };
 

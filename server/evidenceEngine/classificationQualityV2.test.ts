@@ -220,6 +220,14 @@ test('claim polarity suppresses disclaimers and quoted criticism but keeps asser
   assert.equal((await collect("I don't trade forex")).some(item => item.polarity === 'POSITIVE'), false);
   assert.equal((await collect('Gestion du risque')).some(item => item.polarity === 'POSITIVE'), false);
   assert.equal((await collect('Gestion du risque Forex EURUSD.')).some(item => item.category === 'METHODOLOGY_CONCEPT'), true);
+  const framed = input({
+    description: 'Gestion du risque Forex EURUSD.',
+    videos: [{ id: 'v1', title: 'Gestion du risque' }],
+  });
+  const framedItems = await provider.collectEvidence(framed, context);
+  const practice = framedItems.find(item => item.category === 'METHODOLOGY_CONCEPT');
+  assert.ok(practice);
+  assert.ok((practice!.provenance?.fields || []).every(field => field.field !== 'video_title'));
   const assertedHype = await collect('Guaranteed profits');
   assert.equal(assertedHype.some(item => item.category === 'HYPE_SPECULATION'), true);
 
