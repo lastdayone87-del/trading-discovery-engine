@@ -36,7 +36,7 @@ import { getYouTubeQuotaDay } from './youtubeQuotaDay';
 import { assertCountryAllowed } from './countryExclusion';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
 import { isTerminologyKillSwitchActive, TERMINOLOGY_KILL_SWITCH_KEY } from './terminologyKillSwitch';
-import { planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, rotateAwayFromMostRecentIntent, reformulatePollutedQuery } from './queryPlanner';
+import { planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, rotateAwayFromMostRecentIntent, reformulatePollutedQuery, shouldGenerateNativeQueries } from './queryPlanner';
 import { revalidateQueryRecordAdmission, withQueryAdmission, type QueryRecordAdmission } from './queryQuality/admission';
 import { isRewardEligibleQuota } from './queryQuality/accounting';
 import { selectionHistoryFor } from './queryQuality/composition';
@@ -1279,6 +1279,13 @@ export async function selectNextQueryForCountry(
     buildSelectorPool(country, queries, { now, cooldownMinutes, maxPrimaryUses, nowIso, portfolioRatio, familyCap, sourceCap, scopePromotionBasis: options.scopePromotionBasis });
 
   let allQueries = await loadQueries();
+  if (allQueries.length > 0 && shouldGenerateNativeQueries({ queries: allQueries, now })) {
+    // Replenish a thinned or rejected library even when a few selectable rows
+    // remain. Without this a country whose whole library was rejected could
+    // never recover, and healthy libraries never gained new native phrases.
+    const generated = await generateCandidateQueriesForCountry(country, 4, 'EXPLORATION', { scopePromotionBasis: options.scopePromotionBasis });
+    if (generated.length > 0) allQueries = await loadQueries();
+  }
   if (allQueries.length === 0) {
     const generated = await generateCandidateQueriesForCountry(country, 4, 'COLD_START', { scopePromotionBasis: options.scopePromotionBasis });
     const selected = generated[0];

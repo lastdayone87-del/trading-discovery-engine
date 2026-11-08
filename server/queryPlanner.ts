@@ -67,8 +67,65 @@ const COUNTRY_SEARCH_ATOMS: Record<string, Array<[string, SearchAtomType, QueryI
   Norway: [['OBX', 'INSTRUMENT', 'stocks'], ['Aksjehandel', 'METHOD', 'strategy'], ['Teknisk Analyse', 'METHOD', 'education']]
 };
 
+/**
+ * Native query phrases and local platform/broker names. These are not
+ * translations of English atoms: they are the surfaces local traders actually
+ * use (live autocomplete and public YouTube results, 2026-11-08). They are
+ * merged into the country atom set and can be selected as compact standalone
+ * queries, so they do not need to be paired with a global instrument.
+ */
+const COUNTRY_NATIVE_QUERY_ATOMS: Record<string, Array<[string, SearchAtomType, QueryIntent]>> = {
+  'United States': [['premarket analysis', 'MARKET', 'premarket_prep'], ['opening bell', 'MARKET', 'session_analysis'], ['Topstep', 'MARKET', 'strategy'], ['Apex Trader', 'MARKET', 'strategy']],
+  'United Kingdom': [['London open', 'MARKET', 'session_analysis'], ['spread betting', 'METHOD', 'strategy'], ['IG Index', 'MARKET', 'stocks'], ['Trading 212', 'MARKET', 'stocks']],
+  Germany: [['DAX Analyse heute', 'MARKET', 'market_analysis'], ['DAX Analyse aktuell', 'MARKET', 'market_analysis'], ['Charttechnik DAX', 'MARKET', 'market_analysis'], ['Orderflow DAX', 'MARKET', 'strategy'], ['Trade Republic', 'MARKET', 'stocks'], ['XTB DAX', 'MARKET', 'stocks']],
+  France: [['analyse technique CAC', 'MARKET', 'market_analysis'], ["CAC 40 aujourd'hui", 'MARKET', 'market_analysis'], ['carnet ordres CAC', 'MARKET', 'strategy'], ['Boursorama CAC 40', 'MARKET', 'stocks'], ['Bourse Direct', 'MARKET', 'stocks'], ['PEA bourse', 'MARKET', 'stocks']],
+  Spain: [['análisis técnico IBEX', 'MARKET', 'market_analysis'], ['IBEX 35 hoy', 'MARKET', 'market_analysis'], ['bolsa española análisis', 'MARKET', 'market_analysis'], ['velas japonesas', 'METHOD', 'indicators'], ['operativa intradía', 'METHOD', 'live_trading'], ['Bolsamanía IBEX', 'MARKET', 'market_analysis']],
+  Netherlands: [['technische analyse AEX', 'MARKET', 'market_analysis'], ['AEX opening', 'MARKET', 'session_analysis'], ['opties AEX', 'MARKET', 'options'], ['Daghandel AEX', 'MARKET', 'live_trading'], ['Nico Bakker', 'MARKET', 'market_analysis'], ['Tostrams AEX', 'MARKET', 'market_analysis']],
+  Italy: [['analisi tecnica FTSE', 'MARKET', 'market_analysis'], ['FTSE MIB oggi', 'MARKET', 'market_analysis'], ['analisi ciclica', 'METHOD', 'market_analysis'], ['titoli FTSE MIB', 'MARKET', 'stocks'], ['Milano Finanza', 'MARKET', 'market_analysis'], ['Teleborsa FTSE', 'MARKET', 'market_analysis']],
+  Japan: [['日経225先物', 'MARKET', 'futures'], ['日経225 デイトレード', 'MARKET', 'live_trading'], ['日経225 チャート分析', 'MARKET', 'market_analysis'], ['ドル円 デイトレード', 'MARKET', 'forex'], ['板読み トレード', 'MARKET', 'strategy'], ['東京市場 オープン', 'MARKET', 'session_analysis']],
+  Denmark: [['OMXC25 analyse', 'MARKET', 'market_analysis'], ['teknisk analyse aktier', 'MARKET', 'market_analysis'], ['aktiehandel Danmark', 'MARKET', 'stocks'], ['Nordnet Danmark', 'MARKET', 'stocks']],
+  Sweden: [['OMXS30 analys', 'MARKET', 'market_analysis'], ['teknisk analys aktier', 'MARKET', 'market_analysis'], ['börsanalys Stockholm', 'MARKET', 'market_analysis'], ['Avanza aktier', 'MARKET', 'stocks']],
+  Norway: [['OBX analyse', 'MARKET', 'market_analysis'], ['teknisk analyse aksjer', 'MARKET', 'market_analysis'], ['Oslo Børs analyse', 'MARKET', 'market_analysis'], ['Nordnet aksjer', 'MARKET', 'stocks']],
+  Switzerland: [['Schweizer Börse Analyse', 'MARKET', 'market_analysis'], ['Charttechnik SMI', 'MARKET', 'market_analysis'], ['Swissquote SMI', 'MARKET', 'stocks']],
+  Belgium: [['BEL20 analyse', 'MARKET', 'market_analysis'], ['beursanalyse België', 'MARKET', 'market_analysis'], ['Euronext Brussels analyse', 'MARKET', 'market_analysis'], ['Bolero aandelen', 'MARKET', 'stocks']],
+  Luxembourg: [['LuxX Analyse', 'MARKET', 'market_analysis'], ['Bourse Luxembourg analyse', 'MARKET', 'market_analysis'], ['Swissquote Luxembourg', 'MARKET', 'stocks']],
+  Ireland: [['ISEQ 20 analyse', 'MARKET', 'market_analysis'], ['Euronext Dublin', 'MARKET', 'market_analysis'], ['Davy Select', 'MARKET', 'stocks']],
+  Singapore: [['STI analysis', 'MARKET', 'market_analysis'], ['SGX analysis', 'MARKET', 'market_analysis'], ['Singapore market outlook', 'MARKET', 'market_analysis'], ['DBS Vickers', 'MARKET', 'stocks']],
+  'New Zealand': [['NZX 50 analysis', 'MARKET', 'market_analysis'], ['NZX market wrap', 'MARKET', 'market_analysis'], ['Sharesies investing', 'MARKET', 'stocks']],
+  'United Arab Emirates': [['تداول الأسهم الإمارات', 'MARKET', 'stocks'], ['تحليل فني دبي', 'MARKET', 'market_analysis'], ['DFM trading', 'MARKET', 'stocks'], ['ADX trading', 'MARKET', 'stocks'], ['Sarwa investing', 'MARKET', 'stocks']],
+};
+
 export function getCuratedQueryCountries(): string[] {
   return Object.keys(COUNTRY_SEARCH_ATOMS);
+}
+
+/** Keep a replenishment floor per country so a rejected library can recover. */
+export const NATIVE_QUERY_REFRESH_MIN_ACTIVE = 10;
+export const NATIVE_QUERY_REFRESH_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * The original selector only generated when the country had zero queries or
+ * the eligible pool was empty. A country whose whole library had been rejected
+ * therefore starved forever, and a healthy country never gained new native
+ * phrases. Generate when the non-rejected inventory is below the floor, with a
+ * cooldown so the scheduler does not write duplicates every cycle.
+ */
+export function shouldGenerateNativeQueries(input: {
+  queries: Array<Pick<QueryRecord, 'collection' | 'created_at'>>;
+  now: Date;
+  minActive?: number;
+  cooldownMs?: number;
+}): boolean {
+  const minActive = Math.max(1, input.minActive ?? NATIVE_QUERY_REFRESH_MIN_ACTIVE);
+  const cooldownMs = Math.max(0, input.cooldownMs ?? NATIVE_QUERY_REFRESH_COOLDOWN_MS);
+  const active = input.queries.filter(query => query.collection !== 'REJECTED').length;
+  if (active >= minActive) return false;
+  const cutoff = input.now.getTime() - cooldownMs;
+  const recentlyGenerated = input.queries.some(query => {
+    const createdAt = Date.parse(String(query.created_at || ''));
+    return Number.isFinite(createdAt) && createdAt > cutoff;
+  });
+  return !recentlyGenerated;
 }
 
 const OBJECTIVES: Partial<Record<QueryIntent, string>> = {
@@ -359,6 +416,18 @@ export function capDemandSignalCandidates<T>(candidates: T[], count: number): T[
 
 function countryAtoms(country: string, vocabulary?: CountryVocabulary): SearchAtom[] {
   const curated = (COUNTRY_SEARCH_ATOMS[country] || []).map(([term, type, intent]) => atom(term, type, intent, 1, 'CURATED'));
+  const nativeQueries = (COUNTRY_NATIVE_QUERY_ATOMS[country] || []).map(([term, type, intent]) => {
+    const nativeAtom = atom(term, type, intent, 1, 'COUNTRY_VOCABULARY');
+    // These are reviewed local surfaces, not ambiguous generic markets. They
+    // are allowed to stand alone; the generic MARKET specificity policy would
+    // otherwise force a companion and lose the actual local search phrase.
+    nativeAtom.retrievalPolicy = {
+      ...nativeAtom.retrievalPolicy,
+      eligibility: 'STANDALONE',
+      reasonCodes: [...nativeAtom.retrievalPolicy.reasonCodes, 'REVIEWED_NATIVE_PHRASE'],
+    };
+    return nativeAtom;
+  });
   const vocabularyAtoms = [
     ...(vocabulary?.popular_instruments || []).map(term => atom(term, 'INSTRUMENT', 'market_analysis', 1, 'COUNTRY_VOCABULARY')),
     ...(vocabulary?.native_trading_terminology || []).map(term => atom(term, 'METHOD', 'strategy', 1, 'COUNTRY_VOCABULARY')),
@@ -366,7 +435,7 @@ function countryAtoms(country: string, vocabulary?: CountryVocabulary): SearchAt
     ...(vocabulary?.common_content_format_names || []).map(term => atom(term, 'FORMAT', 'education', 1, 'COUNTRY_VOCABULARY'))
   ];
   const unique = new Map<string, SearchAtom>();
-  for (const candidate of [...curated, ...vocabularyAtoms]) {
+  for (const candidate of [...curated, ...nativeQueries, ...vocabularyAtoms]) {
     // Bare short tickers stay pairable here: the ticker barrier applies to
     // final assembled queries (single-token gate above), so atoms like OBX
     // or ICT can still form qualified pairs such as "OBX Aksjehandel".
