@@ -132,6 +132,25 @@ test('C5 v2: duplicate collapse preserves distinct numbered videos', () => {
   assert.equal(composition.tradingCoreFamilies, 2);
 });
 
+test('C5 v2: long numbered titles with nearly identical text stay distinct', () => {
+  const shared = 'advanced day trading order flow strategy review setup execution journal risk position stop loss market structure liquidity fair value gap break of structure volume profile footprint chart';
+  const composition = compose([
+    { title: `${shared} episode 1` },
+    { title: `${shared} episode 2` },
+  ]);
+  assert.equal(composition.duplicateFamiliesCollapsed, 0);
+  assert.equal(composition.tradingCoreFamilies, 2);
+});
+
+test('C5 v2: the same generic title with different descriptions is not a duplicate', () => {
+  const composition = compose([
+    { title: 'Day trading setup', description: 'London session execution with order flow and stop loss placement.' },
+    { title: 'Day trading setup', description: 'Backtesting the FTSE strategy with position sizing and trade journal review.' },
+  ]);
+  assert.equal(composition.duplicateFamiliesCollapsed, 0);
+  assert.equal(composition.tradingCoreFamilies, 2);
+});
+
 test('shared taxonomy classifies multilingual trading, commentary and non-trading controls', () => {
   const context = getLayeredKnowledgeContext('United States');
   const expected: Array<[string, string]> = [
@@ -146,6 +165,11 @@ test('shared taxonomy classifies multilingual trading, commentary and non-tradin
     ['Trades for 1st day of July 2022', 'TRADING_CORE'],
     ['STUDY THE CHART. MASTER THE SETUP. #SMC', 'TRADING_CORE'],
     ['Another Day 🤑', 'UNINFORMATIVE'],
+    ['Day trading. Not financial advice.', 'TRADING_CORE'],
+    ['Workplace risk management', 'UNINFORMATIVE'],
+    ['Gestion du risque', 'UNINFORMATIVE'],
+    ['ICT', 'UNINFORMATIVE'],
+    ['ICT trading', 'TRADING_CORE'],
     ['Pokemon trading cards opening and grading', 'UNRELATED'],
     ['Official music video', 'UNRELATED'],
     ['Minecraft gameplay', 'UNRELATED'],
@@ -169,6 +193,7 @@ test('claim polarity suppresses disclaimers and quoted criticism but keeps asser
   assert.equal((await collect('No guaranteed profits')).some(item => item.category === 'HYPE_SPECULATION'), false);
   assert.equal((await collect('Scam gurus promise guaranteed profits')).some(item => item.category === 'HYPE_SPECULATION'), false);
   assert.equal((await collect("I don't trade forex")).some(item => item.polarity === 'POSITIVE'), false);
+  assert.equal((await collect('Gestion du risque')).some(item => item.polarity === 'POSITIVE'), false);
   const assertedHype = await collect('Guaranteed profits');
   assert.equal(assertedHype.some(item => item.category === 'HYPE_SPECULATION'), true);
 

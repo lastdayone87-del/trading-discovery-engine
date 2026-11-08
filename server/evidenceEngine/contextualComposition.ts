@@ -228,6 +228,14 @@ function jaccard(left: Set<string>, right: Set<string>): number {
   return intersection / (left.size + right.size - intersection);
 }
 
+/**
+ * Episode/part numbers distinguish uploads even when long titles share almost
+ * every token. Near-duplicate collapse must not overwrite that distinction.
+ */
+function numericSignature(tokens: Set<string>): string {
+  return [...tokens].filter(token => /^\d+$/u.test(token)).sort().join(',');
+}
+
 function strongestFocus(focuses: CompositionDocumentFocus[]): CompositionDocumentFocus {
   return focuses.reduce((strongest, focus) => FOCUS_RANK[focus] > FOCUS_RANK[strongest] ? focus : strongest, 'UNINFORMATIVE');
 }
@@ -346,7 +354,10 @@ export function buildContextualComposition(
       CREATOR_LEVEL_FIELDS.has(item.document.field)
       && (item.assessment.focus === 'UNRELATED' || hasExplicitAlternativeIdentity(item.document.text))
     );
-    const normalized = representative ? normalizedForComparison(representative.document.text) : '';
+    // Duplicate checks compare the whole upload (title + description + other
+    // fields), not one representative field. Two videos with the same generic
+    // title but materially different descriptions are distinct families.
+    const normalized = normalizedForComparison(familyDocuments.map(document => document.text).join('\n'));
     records.push({
       sourceFamilyId,
       field: representative?.document.field || familyDocuments[0].field,
@@ -373,7 +384,8 @@ export function buildContextualComposition(
     if (!group && record.normalized && record.tokens.size >= 3) {
       for (const candidate of groups) {
         if (candidate.field !== record.field || !candidate.normalized) continue;
-        if (jaccard(record.tokens, candidate.tokens) >= 0.9) {
+        if (jaccard(record.tokens, candidate.tokens) >= 0.9
+          && numericSignature(record.tokens) === numericSignature(candidate.tokens)) {
           group = candidate;
           break;
         }

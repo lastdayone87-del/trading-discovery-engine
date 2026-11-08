@@ -38,11 +38,16 @@ function loadRows(path: string): DiagnosticRow[] {
   if (!raw) return [];
   if (raw.startsWith('[')) return JSON.parse(raw) as DiagnosticRow[];
   if (raw.startsWith('{')) {
-    const parsed = JSON.parse(raw) as DiagnosticRow | { rows?: DiagnosticRow[] };
-    if (Array.isArray((parsed as { rows?: DiagnosticRow[] }).rows)) {
-      return (parsed as { rows: DiagnosticRow[] }).rows;
+    try {
+      const parsed = JSON.parse(raw) as DiagnosticRow | { rows?: DiagnosticRow[] };
+      if (Array.isArray((parsed as { rows?: DiagnosticRow[] }).rows)) {
+        return (parsed as { rows: DiagnosticRow[] }).rows;
+      }
+      return [parsed as DiagnosticRow];
+    } catch {
+      // Multiple JSON objects (JSONL) also start with `{`; fall through to
+      // line-by-line parsing instead of rejecting the whole export.
     }
-    return [parsed as DiagnosticRow];
   }
   return raw.split(/\r?\n/u).filter(Boolean).map(line => JSON.parse(line) as DiagnosticRow);
 }

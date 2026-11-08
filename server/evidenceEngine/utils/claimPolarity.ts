@@ -240,6 +240,7 @@ export function classifyClaimPolarity(
   const before = normalized.slice(Math.max(bounds.start, start - 80), start);
   const afterClause = normalized.slice(end, Math.min(bounds.end, end + 80));
   const afterImmediate = normalized.slice(end, Math.min(normalized.length, end + 32));
+  const sameClauseAfter = normalized.slice(end, Math.min(bounds.end, end + 40));
   const nearbyWindow = normalized.slice(Math.max(0, start - 180), Math.min(normalized.length, end + 180));
 
   // An explicit disclaimer frame outranks a bare negation cue: "No guaranteed
@@ -248,8 +249,14 @@ export function classifyClaimPolarity(
   const disclaimer = findOverlappingDisclaimer(normalized, start, end);
   if (disclaimer) return { polarity: 'DISCLAIMER', cue: disclaimer, confidence: 0.95 };
 
-  // Post-negation: "Guaranteed profits? No."
-  if (POST_NEGATION.test(afterImmediate)) {
+  // Post-negation: "Guaranteed profits? No." The answer must be in the same
+  // clause, or immediately after a question/exclamation; a period starts a
+  // new sentence and must not let "Day trading. Not financial advice." negate
+  // the earlier claim.
+  if (POST_NEGATION.test(sameClauseAfter)) {
+    return { polarity: 'NEGATED', cue: sameClauseAfter.trim().slice(0, 24), confidence: 0.9 };
+  }
+  if (/^[\p{L}\p{N}]{0,4}\s*[?!]\s*(?:no|nope|not|never|false|myth|wrong|incorrect|pas|non|nein|kein|inte|ikke|aldrig|nunca|mai)\b/iu.test(afterImmediate)) {
     return { polarity: 'NEGATED', cue: afterImmediate.trim().slice(0, 24), confidence: 0.9 };
   }
   if (POST_DENIAL.test(afterClause)) {

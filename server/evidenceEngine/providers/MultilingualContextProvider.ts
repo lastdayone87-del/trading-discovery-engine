@@ -3,6 +3,7 @@ import { contentLanguagePacks } from '../multilingualTerminology';
 import { buildCanonicalEvidenceCorpus, documentRef } from '../canonicalEvidencePlane';
 import { findScopedTermMatches, type ClaimPolarity } from '../utils/claimPolarity';
 import { pushUniqueMatch } from '../utils/textMatching';
+import { isAmbiguousExecutionTerm } from '../tradingSignalTaxonomy';
 
 export class MultilingualContextProvider implements EvidenceProvider {
   name = 'multilingual_context' as const;
@@ -55,7 +56,7 @@ export class MultilingualContextProvider implements EvidenceProvider {
       return suppressed;
     };
 
-    const execution = assertedMatches('executionTerms');
+    const execution = assertedMatches('executionTerms').filter(term => !isAmbiguousExecutionTerm(term));
     const education = assertedMatches('educationalTerms');
     const news = assertedMatches('businessNewsTerms');
     const genericFinance = assertedMatches('genericFinanceTerms');

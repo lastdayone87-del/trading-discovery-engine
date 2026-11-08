@@ -124,7 +124,10 @@ const CORE_PATTERN_DEFINITIONS: PatternSignalDefinition[] = [
   // classify a document as trading-adjacent, not an entire creator as
   // confirmed. Generic rules below require an independent market dimension.
   { id: 'NATIVE_EDUCATION', category: 'EDUCATION', strength: 'TIER_A', generic: true, pattern: /(trading\s*lernen|trading\s*strateg(?:y|ies|ien|ie)|strategie\s*erkl[aä]rt|chartanalyse|trade\s*analyse|fehleranalyse|trading\s*ausbildung|trade\s*einstieg|stop\s*loss|positionsgr[oö][sß]e|risiko\s*pro\s*trade|markttechnik|orderflow|trading\s*journal|strategie\s*backtest|gestion\s*du\s*risque|journal\s*de\s*trading|carnet\s*d.ordres|point\s*d.entr[eé]e|backtest\s*strat[eé]gie|formation\s*trading|strat[eé]gie\s*expliqu[eé]e|analyse\s*de\s*trade|cours\s*de\s*trading|gesti[oó]n\s*de\s*riesgo|diario\s*de\s*trading|punto\s*de\s*entrada|flujo\s*de\s*[oó]rdenes|backtest\s*de\s*estrategia|curso\s*de\s*trading|estrategia\s*explicada|an[aá]lisis\s*de\s*operaciones|clase\s*de\s*trading|gestione\s*del\s*rischio|diario\s*di\s*trading|punto\s*di\s*ingresso|book\s*ordini|backtest\s*strategia|corso\s*di\s*trading|strategia\s*spiegata|analisi\s*delle\s*operazioni|lezione\s*di\s*trading|risicomanagement|tradingdagboek|instappunt|orderboek|leren\s*traden|strategie\s*uitgelegd|technische\s*analyse|trading\s*cursus|risikostyring|inngangspunkt|ing[aå]ngspunkt|aksjehandel|handelsstrategi|riskhantering|handelsplan|l[aæ]r\s*(?:dig\s*)?trading|teknisk\s*analys|エントリーポイント|損切り|資金管理|トレード日誌|ストラテジー検証|トレード講座|手法解説|トレード振り返り|初心者向けfx|خطة\s*التداول|إدارة\s*المخاطر|نقطة\s*الدخول|وقف\s*الخسارة|تعليم\s*التداول|تحليل\s*فني|交易计划|风险管理|入场点|止损|股票交易|策略回测|交易教学|技术分析|交易策略|交易計劃|風險管理|入場點|止損|策略回測|交易教學|技術分析|期貨交易|外匯交易|pelan\s*dagangan|pengurusan\s*risiko|titik\s*masuk|henti\s*rugi|dagangan\s*saham|belajar\s*berdagang|analisis\s*teknikal|strategi\s*dagangan|ma\s+semaine\s+de\s+trading|trading\s+au\s+quotidien|trading\s+au\s+sens\s+large|les\s+bases\s+(?:de|du)\s+trading|trader\s+le\s+fondamental)/giu },
-  { id: 'MARKET_METHOD_SHORTHAND', category: 'MARKET_METHOD', strength: 'TIER_A', pattern: /\b(?:smc|ict|smart\s*money(?:\s*concepts?)?|price\s*action|fair\s*value\s*gap|fvg|order\s*block|liquidity\s*sweep|market\s*structure|break\s*of\s*structure)\b/giu },
+  { id: 'MARKET_METHOD_SHORTHAND', category: 'MARKET_METHOD', strength: 'TIER_A', pattern: /\b(?:smc|smart\s*money(?:\s*concepts?)?|price\s*action|fair\s*value\s*gap|fvg|order\s*block|liquidity\s*sweep|market\s*structure|break\s*of\s*structure)\b/giu },
+  // `ICT` is also information-and-communications-technology. It only becomes
+  // core trading evidence when the same document supplies market context.
+  { id: 'ICT_METHOD', category: 'MARKET_METHOD', strength: 'TIER_A', pattern: /\bict\b/giu },
   // Risk/position vocabulary is execution practice, not generic education.
   // The multilingual forms are the same governed phrases the language packs
   // already contain, promoted to core because they describe trade management.
@@ -179,9 +182,15 @@ const GENERIC_CORE_IDS: ReadonlySet<string> = new Set([
   'NATIVE_EDUCATION',
 ]);
 
+/** Tier A phrases that need independent market context before they are core. */
+const CONTEXT_GATED_CORE_IDS: ReadonlySet<string> = new Set([
+  'RISK_MANAGEMENT',
+  'ICT_METHOD',
+]);
+
 const CORE_IDS: ReadonlySet<string> = new Set([
   'DAY_TRADING', 'FUTURES_FOREX_TRADING', 'ORDER_FLOW', 'EXECUTION',
-  'MARKET_METHOD_SHORTHAND', 'RISK_MANAGEMENT', 'TRADE_JOURNAL', 'CREATOR_IDENTITY',
+  'MARKET_METHOD_SHORTHAND', 'RISK_MANAGEMENT', 'ICT_METHOD', 'TRADE_JOURNAL', 'CREATOR_IDENTITY',
   'CREATOR_TRADING_INVESTING', 'TRADING_PSYCHOLOGY', 'INSTRUMENT_TRADING', 'PLATFORM', 'EXECUTION_TERM',
   'KNOWN_METHOD', 'NATIVE_METHOD', 'NATIVE_EDUCATION',
 ]);
@@ -312,6 +321,13 @@ function matchTerms(
   }
 }
 
+const AMBIGUOUS_EXECUTION_TERM = /^(?:gestion\s+du\s+risque|gesti[oó]n\s+de\s+riesgo|gestione\s+del\s+rischio|risicomanagement|risikomanagement|risikostyring|riskhantering)$/iu;
+
+/** Risk-management phrases used outside trading; context must come elsewhere. */
+export function isAmbiguousExecutionTerm(term: string): boolean {
+  return AMBIGUOUS_EXECUTION_TERM.test(term);
+}
+
 function languagePacks(context?: LayeredKnowledgeContext): MultilingualClassificationPack[] {
   const codes = new Set<string>();
   for (const pack of [
@@ -371,7 +387,7 @@ export function matchTradingSignals(
 
   for (const pack of languagePacks(context)) {
     const language = pack.languageCode;
-    matchTerms(normalized, pack.executionTerms, 'EXECUTION_TERM', 'MARKET_METHOD', 'TIER_A', matches, seen, { language });
+    matchTerms(normalized, pack.executionTerms.filter(term => !AMBIGUOUS_EXECUTION_TERM.test(term)), 'EXECUTION_TERM', 'MARKET_METHOD', 'TIER_A', matches, seen, { language });
     matchTerms(normalized, pack.educationalTerms, 'EDUCATION_TERM', 'EDUCATION', 'TIER_B', matches, seen, { language, generic: true });
     matchTerms(normalized, pack.businessNewsTerms, 'BUSINESS_NEWS', 'MARKET_COMMENTARY', 'TIER_B', matches, seen, { language });
     matchTerms(normalized, pack.genericFinanceTerms, 'GENERIC_FINANCE', 'MARKET_COMMENTARY', 'TIER_B', matches, seen, { language });
@@ -448,13 +464,15 @@ export function assessTradingText(
 
   const tradingContext = hasTradingContext(normalized, asserted, context);
   const coreMatches = asserted.filter(match => CORE_IDS.has(match.id));
-  const specificCore = strongestCore(coreMatches);
+  const contextGatedCore = coreMatches.filter(match => !CONTEXT_GATED_CORE_IDS.has(match.id) || tradingContext);
+  const specificCore = strongestCore(contextGatedCore);
   const adjacentMatches = asserted.filter(match => ADJACENT_IDS.has(match.id));
   const financeMatches = asserted.filter(match => FINANCE_IDS.has(match.id));
   const unrelatedMatches = asserted.filter(match => UNRELATED_IDS.has(match.id) || match.category === 'NON_TRADING');
   const tierASignals = [...new Set(asserted
     .filter(match => match.strength === 'TIER_A')
     .filter(match => !GENERIC_CORE_IDS.has(match.id) || tradingContext)
+    .filter(match => !CONTEXT_GATED_CORE_IDS.has(match.id) || tradingContext)
     .map(match => match.id))];
 
   // A document that is explicitly about a non-trading domain must stay
@@ -555,7 +573,14 @@ export function isCompositionTradingText(text: string, context?: LayeredKnowledg
 export function tierATradingSignals(text: string, context?: LayeredKnowledgeContext): string[] {
   const normalized = normalizeText(text);
   const signals: string[] = [];
+  // Context-gated phrases (bare risk-management vocabulary and the ambiguous
+  // acronym `ICT`) require an independent market/trading word in this
+  // compatibility predicate too.
+  const hasExplicitContext = TIER_C_PATTERN.test(normalized)
+    || FINANCIAL_CONTEXT_PATTERN.test(normalized)
+    || FINANCIAL_CONTEXT_CJK_PATTERN.test(normalized);
   for (const definition of CORE_PATTERN_DEFINITIONS.filter(item => item.strength === 'TIER_A')) {
+    if (CONTEXT_GATED_CORE_IDS.has(definition.id) && !hasExplicitContext) continue;
     const pattern = new RegExp(definition.pattern.source, definition.pattern.flags);
     if (pattern.test(normalized)) signals.push(definition.id);
   }

@@ -33,6 +33,8 @@ test('claim polarity is clause-scoped: a disclaimer cannot suppress a later clai
   assert.equal(polarity('No guaranteed profits. I teach order flow.', 'order flow'), 'ASSERTED');
   assert.equal(polarity('No shortcuts, but guaranteed profits', 'guaranteed profit'), 'ASSERTED');
   assert.equal(polarity('No guaranteed profits; order flow is my method', 'order flow'), 'ASSERTED');
+  assert.equal(polarity('Day trading. Not financial advice.', 'day trading'), 'ASSERTED');
+  assert.equal(polarity('Guaranteed profits? No.', 'guaranteed profit'), 'NEGATED');
 });
 
 test('multilingual disclaimer frames are recognized', () => {
