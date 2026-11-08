@@ -16,10 +16,11 @@ import type { RawChannelInput } from './evidenceEngine/types';
  *
  * The policy is deliberately precision-first. Any finance/trading signal
  * suppresses withholding, so a dormant or low-audience trading educator is
- * still classified. The labeled-sample test pins the false-negative rate at
- * zero for the supported market languages.
+ * still classified. The finance veto scans every model-facing evidence field
+ * at full length; the 4,000-character projection limit only applies to the
+ * unrelated-domain heuristic, never to the veto.
  */
-export const SEMANTIC_PREFILTER_POLICY_VERSION = 'semantic-prefilter-v1';
+export const SEMANTIC_PREFILTER_POLICY_VERSION = 'semantic-prefilter-v2';
 
 export type SemanticPrefilterDisposition = 'CLASSIFY' | 'WITHHOLD_SEMANTIC';
 export type SemanticPrefilterMode = 'off' | 'shadow' | 'enforce';
@@ -34,6 +35,10 @@ export interface SemanticPrefilterInput {
   playlistNames?: string[];
   playlistDescriptions?: string[];
   externalLinks?: string[];
+  externalLinkLabels?: string[];
+  transcriptExcerpts?: string[];
+  visualEvidence?: string[];
+  evidenceCorpus?: string[];
   pinnedComment?: string;
   subscriberCount?: number;
   videoCount?: number;
@@ -52,31 +57,39 @@ export interface SemanticPrefilterDecision {
  * Finance/trading vocabulary across the production market languages. A single
  * match vetoes withholding. This list intentionally errs broad: one extra
  * semantic call is cheaper than losing a real trading creator.
+ *
+ * Boundaries are Unicode-aware lookarounds rather than `\b`, because `\b`
+ * treats accented letters (for example `marché`) as non-word characters and
+ * would silently miss them.
  */
 const FINANCE_SIGNALS: Array<[string, RegExp]> = [
-  ['TRADING_LITERAL', /\b(trading|trader|day\s*trading|swing\s*trading|scalping|forex|fx|futures?|options?|cfd|stocks?|equities|shares?|investing|investor|portfolio|market\s*analysis|technical\s*analysis|price\s*action|order\s*flow|crypto|bitcoin|ethereum|blockchain|prop\s*firm|broker)\b/iu],
-  ['SPANISH_PORTUGUESE_FINANCE', /\b(bolsa|acciones|mercado|inversi[oó]n|inversiones|inversor|divisas|trading|criptomonedas|a[cç][oõ]es|investimento|mercado\s*financeiro)\b/iu],
-  ['FRENCH_FINANCE', /\b(bourse|march[eé]|investissement|investisseur|actions?|devises|trading|analyse\s*technique|crypto)\b/iu],
-  ['GERMAN_DUTCH_FINANCE', /\b(b[oö]rse|aktien?|finanzen|investment|anleger|handel|trading|beleggen|aandelen|beurs|analyse\s*technique)\b/iu],
-  ['ITALIAN_FINANCE', /\b(borsa|azioni|mercato|investimento|investitore|valute|trading|criptovalute)\b/iu],
-  ['NORDIC_POLISH_FINANCE', /\b(b[oø]rs|aktier|investering|marknad|inwestycje|giełda|akcje|rynek|trading)\b/iu],
+  ['TRADING_LITERAL', /(?<![\p{L}\p{N}])(trading|trader|day\s*trading|swing\s*trading|scalping|forex|fx|futures?|options?|cfd|stocks?|equities|shares?|investing|investor|portfolio|market\s*analysis|technical\s*analysis|price\s*action|order\s*flow|crypto|bitcoin|ethereum|blockchain|prop\s*firm|broker)(?![\p{L}\p{N}])/iu],
+  ['SPANISH_PORTUGUESE_FINANCE', /(?<![\p{L}\p{N}])(bolsa|acciones|mercado|inversi[oó]n|inversiones|inversor|divisas|trading|criptomonedas|a[cç][oõ]es|investimento|mercado\s*financeiro)(?![\p{L}\p{N}])/iu],
+  ['FRENCH_FINANCE', /(?<![\p{L}\p{N}])(bourse|march[eé]|investissement|investisseur|actions?|devises|trading|analyse\s*technique|crypto)(?![\p{L}\p{N}])/iu],
+  ['GERMAN_DUTCH_FINANCE', /(?<![\p{L}\p{N}])(b[oö]rse|aktien?|finanzen|investment|anleger|handel|trading|beleggen|aandelen|beurs|analyse\s*technique)(?![\p{L}\p{N}])/iu],
+  ['ITALIAN_FINANCE', /(?<![\p{L}\p{N}])(borsa|azioni|mercato|investimento|investitore|valute|trading|criptovalute)(?![\p{L}\p{N}])/iu],
+  ['NORDIC_POLISH_FINANCE', /(?<![\p{L}\p{N}])(b[oø]rs|aktier|investering|marknad|inwestycje|giełda|akcje|rynek|trading)(?![\p{L}\p{N}])/iu],
+  ['TURKISH_FINANCE', /(?<![\p{L}\p{N}])(borsa|hisse|hisseler|yatırım|yatirim|döviz|doviz|piyasa|kripto|forex|trading|teknik\s*analiz)(?![\p{L}\p{N}])/iu],
+  ['INDONESIAN_MALAY_FINANCE', /(?<![\p{L}\p{N}])(saham|investasi|investor|pasar|kripto|forex|trading|analisis)(?![\p{L}\p{N}])/iu],
+  ['THAI_FINANCE', /(หุ้น|การลงทุน|เทรด|ตลาด|คริปโต|ฟอเร็กซ์)/u],
+  ['VIETNAMESE_FINANCE', /(?<![\p{L}\p{N}])(chứng\s*khoán|chung\s*khoan|đầu\s*tư|dau\s*tu|giao\s*dịch|giao\s*dich|cổ\s*phiếu|co\s*phieu|tiền\s*điện\s*tử|tien\s*dien\s*tu|forex|trading)(?![\p{L}\p{N}])/iu],
   ['JAPANESE_FINANCE', /(トレード|投資|株式|相場|為替|先物|仮想通貨|テクニカル)/u],
   ['KOREAN_FINANCE', /(주식|투자|트레이딩|선물|외환|코인|차트)/u],
   ['CHINESE_FINANCE', /(股票|投资|交易|期货|外汇|加密货币|技术分析)/u],
   ['ARABIC_FINANCE', /(تداول|أسهم|استثمار|عملات|فوركس|تحليل\s*فني)/u],
   ['CYRILLIC_FINANCE', /(трейдинг|акции|инвестиции|форекс|биржа|криптовалюта)/u],
   ['HINDI_FINANCE', /(ट्रेडिंग|शेयर|निवेश|बाज़ार|क्रिप्टो)/u],
-  ['FINANCE_LINK', /\b(tradingview\.com|forexfactory\.com|myfxbook\.com|broker|propfirm|investing\.com)\b/iu],
+  ['FINANCE_LINK', /(?<![\p{L}\p{N}])(tradingview\.com|forexfactory\.com|myfxbook\.com|broker|propfirm|investing\.com)(?![\p{L}\p{N}])/iu],
 ];
 
 /** Strong unrelated-domain cues. Only a match with no finance signal can withhold. */
 const UNRELATED_DOMAIN_SIGNALS: Array<[string, RegExp]> = [
-  ['GAMING', /\b(gameplay|walkthrough|playthrough|minecraft|roblox|fortnite|valorant|league\s*of\s*legends|gta\s*v|gta\s*5|call\s*of\s*duty|pokemon|pokémon|genshin|esports?|speedrun)\b/iu],
-  ['COOKING', /\b(recipe|recipes|cooking|kitchen|bake|baking|chef|cuisine|mukbang|street\s*food)\b/iu],
-  ['MUSIC', /\b(official\s*music\s*video|music\s*video|official\s*audio|lyrics?|lyric\s*video|album|singer|songwriter|record\s*label|clip\s*officiel|chanson)\b/iu],
-  ['BEAUTY_ENTERTAINMENT', /\b(celebrity\s*gossip|makeup\s*tutorial|beauty\s*vlog|toy\s*review|prank|unboxing)\b/iu],
-  ['SPORTS', /\b(highlights|match\s*replay|full\s*game|nba|nfl|premier\s*league|world\s*cup|football\s*skills)\b/iu],
-  ['LIFESTYLE_TRAVEL', /\b(travel\s*vlog|daily\s*vlog|food\s*vlog|fitness\s*routine|workout\s*plan)\b/iu],
+  ['GAMING', /(?<![\p{L}\p{N}])(gameplay|walkthrough|playthrough|minecraft|roblox|fortnite|valorant|league\s*of\s*legends|gta\s*v|gta\s*5|call\s*of\s*duty|pokemon|pokémon|genshin|esports?|speedrun)(?![\p{L}\p{N}])/iu],
+  ['COOKING', /(?<![\p{L}\p{N}])(recipe|recipes|cooking|kitchen|bake|baking|chef|cuisine|mukbang|street\s*food)(?![\p{L}\p{N}])/iu],
+  ['MUSIC', /(?<![\p{L}\p{N}])(official\s*music\s*video|music\s*video|official\s*audio|lyrics?|lyric\s*video|album|singer|songwriter|record\s*label|clip\s*officiel|chanson)(?![\p{L}\p{N}])/iu],
+  ['BEAUTY_ENTERTAINMENT', /(?<![\p{L}\p{N}])(celebrity\s*gossip|makeup\s*tutorial|beauty\s*vlog|toy\s*review|prank|unboxing)(?![\p{L}\p{N}])/iu],
+  ['SPORTS', /(?<![\p{L}\p{N}])(highlights|match\s*replay|full\s*game|nba|nfl|premier\s*league|world\s*cup|football\s*skills)(?![\p{L}\p{N}])/iu],
+  ['LIFESTYLE_TRAVEL', /(?<![\p{L}\p{N}])(travel\s*vlog|daily\s*vlog|food\s*vlog|fitness\s*routine|workout\s*plan)(?![\p{L}\p{N}])/iu],
 ];
 
 const FINANCE_LANGUAGE_CODES = new Set([
@@ -89,21 +102,35 @@ export function semanticPrefilterMode(env: NodeJS.ProcessEnv = process.env): Sem
   return value === 'off' || value === 'enforce' ? value : 'shadow';
 }
 
+function numeric(value: unknown): number | undefined {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
 export function semanticPrefilterInputFromRaw(input: RawChannelInput): SemanticPrefilterInput {
+  const videos = input.videos?.length
+    ? input.videos
+    : (input.video_titles || []).map((title, index) => ({ title, description: input.video_descriptions?.[index] }));
   return {
     channelName: input.channel_name,
     description: input.description,
     country: input.country,
     detectedLanguages: (input.detected_languages || []).map(language => language.language),
-    videoTitles: input.videos?.map(video => video.title) || input.video_titles || [],
-    videoDescriptions: input.videos?.map(video => video.description || '') || input.video_descriptions || [],
+    videoTitles: videos.map(video => video.title),
+    videoDescriptions: videos.map(video => video.description || ''),
     playlistNames: input.playlists?.map(playlist => playlist.name) || [],
     playlistDescriptions: input.playlists?.map(playlist => playlist.description || '') || [],
     externalLinks: [
       ...(input.external_links || []),
       ...(input.external_link_details || []).flatMap(link => [link.url, link.domain || '']),
     ],
+    externalLinkLabels: (input.external_link_details || []).map(link => link.label || ''),
+    transcriptExcerpts: (input.transcript_excerpts || []).map(excerpt => excerpt.text),
+    visualEvidence: (input.visual_evidence || []).map(visual => visual.description),
+    evidenceCorpus: (input.evidence_corpus || []).map(document => document.text),
     pinnedComment: input.pinned_comment,
+    subscriberCount: numeric(input.subscriber_count),
+    videoCount: numeric(input.video_count),
     latestUploadAt: input.activity_metadata?.latest_upload_at,
     uploadsLast365Days: input.activity_metadata?.uploads_last_365_days,
   };
@@ -120,10 +147,44 @@ function staleDays(latestUploadAt: string | undefined, nowMs: number): number | 
   return Math.max(0, (nowMs - parsed) / 86_400_000);
 }
 
+function envNumber(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const raw = env[name];
+  if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+/**
+ * One evaluation per channel object/provider pair. The evidence engine probes
+ * `availability()` before execution and may probe again inside the semantic
+ * chain; both calls describe the same evaluation and must not inflate the
+ * shadow/false-negative counters.
+ */
+let evaluationCache = new WeakMap<RawChannelInput, Map<string, { mode: SemanticPrefilterMode; decision: SemanticPrefilterDecision; skip: boolean }>>();
+
 export function evaluateSemanticPrefilter(
   input: SemanticPrefilterInput,
-  nowMs: number = Date.now()
+  nowMs: number = Date.now(),
+  env: NodeJS.ProcessEnv = process.env
 ): SemanticPrefilterDecision {
+  // Finance evidence is collected from every model-facing field before any
+  // length cap. A shared 4,000-character projection must never discard the
+  // veto that protects a trading channel from enforcement.
+  const financeTexts = [
+    input.channelName,
+    input.description,
+    input.pinnedComment,
+    ...(input.videoTitles || []),
+    ...(input.videoDescriptions || []),
+    ...(input.playlistNames || []),
+    ...(input.playlistDescriptions || []),
+    ...(input.externalLinks || []),
+    ...(input.externalLinkLabels || []),
+    ...(input.transcriptExcerpts || []),
+    ...(input.visualEvidence || []),
+    ...(input.evidenceCorpus || []),
+  ].map(value => String(value || '').normalize('NFKC')).filter(Boolean);
+
   const creatorText = clean([
     input.channelName,
     input.description,
@@ -135,8 +196,12 @@ export function evaluateSemanticPrefilter(
     ...(input.externalLinks || []),
   ].filter(Boolean).join(' | '));
 
-  const financeSignals = FINANCE_SIGNALS.filter(([, pattern]) => pattern.test(creatorText)).map(([name]) => name);
-  const unrelatedSignals = UNRELATED_DOMAIN_SIGNALS.filter(([, pattern]) => pattern.test(creatorText)).map(([name]) => name);
+  const financeSignals = FINANCE_SIGNALS
+    .filter(([, pattern]) => financeTexts.some(text => pattern.test(text)))
+    .map(([name]) => name);
+  const unrelatedSignals = UNRELATED_DOMAIN_SIGNALS
+    .filter(([, pattern]) => pattern.test(creatorText))
+    .map(([name]) => name);
 
   // A finance signal always wins. The only exception is when the channel text
   // is entirely empty, which the provider-level creator-context gate already
@@ -149,6 +214,20 @@ export function evaluateSemanticPrefilter(
         'SEMANTIC_CLASSIFICATION_RETAINED',
       ],
       matchedSignals: financeSignals,
+      policyVersion: SEMANTIC_PREFILTER_POLICY_VERSION,
+    };
+  }
+
+  // A language the cheap lexicon does not model needs semantics regardless of
+  // an English unrelated cue in the title. Check this before every withhold
+  // rule so a non-lexicon finance creator is never filtered out.
+  const unmodeledLanguage = (input.detectedLanguages || []).length > 0 &&
+    (input.detectedLanguages || []).every(code => !FINANCE_LANGUAGE_CODES.has(String(code || '').toLowerCase().split(/[-_]/)[0]));
+  if (unmodeledLanguage) {
+    return {
+      disposition: 'CLASSIFY',
+      reasonCodes: ['UNMODELED_LANGUAGE_NEEDS_SEMANTICS', 'SEMANTIC_CLASSIFICATION_RETAINED'],
+      matchedSignals: ['LANGUAGE_OUTSIDE_CHEAP_LEXICON'],
       policyVersion: SEMANTIC_PREFILTER_POLICY_VERSION,
     };
   }
@@ -168,12 +247,10 @@ export function evaluateSemanticPrefilter(
 
   const daysSinceUpload = staleDays(input.latestUploadAt, nowMs);
   const noRecentUploads = input.uploadsLast365Days !== undefined && input.uploadsLast365Days <= 0;
-  const configuredStaleDays = Number(process.env.SEMANTIC_PREFILTER_STALE_DAYS || '730');
+  const configuredStaleDays = envNumber(env, 'SEMANTIC_PREFILTER_STALE_DAYS', 730);
   // 0 disables the staleness rule, matching sibling triage age knobs.
-  const staleThresholdDays = Number.isFinite(configuredStaleDays) && configuredStaleDays > 0
-    ? configuredStaleDays
-    : Number.POSITIVE_INFINITY;
-  const lowAudienceThreshold = Number(process.env.SEMANTIC_PREFILTER_MIN_SUBSCRIBERS || '50');
+  const staleThresholdDays = configuredStaleDays > 0 ? configuredStaleDays : Number.POSITIVE_INFINITY;
+  const lowAudienceThreshold = envNumber(env, 'SEMANTIC_PREFILTER_MIN_SUBSCRIBERS', 50);
   const lowAudience = input.subscriberCount !== undefined &&
     Number.isFinite(input.subscriberCount) &&
     input.subscriberCount < lowAudienceThreshold &&
@@ -207,16 +284,10 @@ export function evaluateSemanticPrefilter(
     };
   }
 
-  const unmodeledLanguage = (input.detectedLanguages || []).length > 0 &&
-    (input.detectedLanguages || []).every(code => !FINANCE_LANGUAGE_CODES.has(String(code || '').toLowerCase().split(/[-_]/)[0]));
-
   return {
     disposition: 'CLASSIFY',
-    reasonCodes: [
-      unmodeledLanguage ? 'UNMODELED_LANGUAGE_NEEDS_SEMANTICS' : 'NO_CONFIDENT_PREFILTER_SKIP',
-      'SEMANTIC_CLASSIFICATION_RETAINED',
-    ],
-    matchedSignals: unmodeledLanguage ? ['LANGUAGE_OUTSIDE_CHEAP_LEXICON'] : [],
+    reasonCodes: ['NO_CONFIDENT_PREFILTER_SKIP', 'SEMANTIC_CLASSIFICATION_RETAINED'],
+    matchedSignals: [],
     policyVersion: SEMANTIC_PREFILTER_POLICY_VERSION,
   };
 }
@@ -279,6 +350,29 @@ function recordPrefilter(decision: SemanticPrefilterDecision, provider: string, 
   }
 }
 
+function decisionForPrefilter(
+  input: RawChannelInput,
+  provider: string,
+  env: NodeJS.ProcessEnv,
+  record = true,
+): { skip: boolean; decision?: SemanticPrefilterDecision } {
+  const mode = semanticPrefilterMode(env);
+  if (mode === 'off') return { skip: false };
+  const key = `${provider}|${mode}`;
+  let byProvider = evaluationCache.get(input);
+  const cached = byProvider?.get(key);
+  if (cached) return { skip: cached.skip, decision: cached.decision };
+  const decision = evaluateSemanticPrefilter(semanticPrefilterInputFromRaw(input), Date.now(), env);
+  const result = { skip: mode === 'enforce' && decision.disposition === 'WITHHOLD_SEMANTIC', decision };
+  if (!byProvider) {
+    byProvider = new Map();
+    evaluationCache.set(input, byProvider);
+  }
+  byProvider.set(key, { mode, ...result });
+  if (record) recordPrefilter(decision, provider, mode);
+  return result;
+}
+
 /**
  * Evaluate and, in enforce mode, tell the provider to become NOT_APPLICABLE.
  * Shadow mode is observability-only: it always returns skip=false.
@@ -288,11 +382,7 @@ export function applySemanticPrefilter(
   provider: string,
   env: NodeJS.ProcessEnv = process.env
 ): { skip: boolean; decision?: SemanticPrefilterDecision } {
-  const mode = semanticPrefilterMode(env);
-  if (mode === 'off') return { skip: false };
-  const decision = evaluateSemanticPrefilter(semanticPrefilterInputFromRaw(input));
-  recordPrefilter(decision, provider, mode);
-  return { skip: mode === 'enforce' && decision.disposition === 'WITHHOLD_SEMANTIC', decision };
+  return decisionForPrefilter(input, provider, env);
 }
 
 /**
@@ -310,7 +400,8 @@ export function recordSemanticPrefilterOutcome(
   env: NodeJS.ProcessEnv = process.env
 ): void {
   if (semanticPrefilterMode(env) !== 'shadow') return;
-  const decision = evaluateSemanticPrefilter(semanticPrefilterInputFromRaw(input));
+  const decision = decisionForPrefilter(input, provider, env, false).decision
+    || evaluateSemanticPrefilter(semanticPrefilterInputFromRaw(input), Date.now(), env);
   if (decision.disposition !== 'WITHHOLD_SEMANTIC') return;
   metrics.shadowComparisons += 1;
   if (!SEMANTIC_POSITIVE_LABELS.has(semanticLabel)) return;
@@ -340,6 +431,7 @@ export function semanticPrefilterSnapshot(): SemanticPrefilterMetrics {
 
 /** Test seam. */
 export function resetSemanticPrefilterMetricsForTests(env: NodeJS.ProcessEnv = process.env): void {
+  evaluationCache = new WeakMap();
   metrics = {
     mode: semanticPrefilterMode(env),
     evaluations: 0,

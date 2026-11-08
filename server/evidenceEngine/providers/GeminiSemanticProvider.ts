@@ -7,14 +7,15 @@ import { documentRef } from '../canonicalEvidencePlane';
 import { abortedByDeadline } from './abortReason';
 import { readSemanticResultCache, SEMANTIC_RESULT_CACHE_HIT_REASON, writeSemanticResultCache } from '../semanticResultCache';
 import { applySemanticPrefilter, recordSemanticPrefilterOutcome } from '../../semanticPrefilter';
-import { classifySemanticPrompt } from '../semanticBatch';
+import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, semanticBatchConfig } from '../semanticBatch';
+import { SEMANTIC_RESULT_FIELD_NAMES, SEMANTIC_RESULT_LABELS, isSemanticResultShape, type SemanticResultLabel } from '../semanticResultShape';
 
 export const SEMANTIC_PROMPT_VERSION = 'priority2-multilingual-structured-1';
 export const SEMANTIC_FEATURE_VERSION = 'field-aware-evidence-1';
-export const SEMANTIC_TAXONOMY = ['ACTIVE_TRADING', 'INVESTING_EDUCATION', 'FINANCIAL_NEWS', 'PERSONAL_FINANCE', 'HYPE', 'UNRELATED', 'AMBIGUOUS'] as const;
+export const SEMANTIC_TAXONOMY = SEMANTIC_RESULT_LABELS;
 export const DEFAULT_MULTILINGUAL_CANDIDATE_MODEL = 'gemini-3.6-flash';
 export const DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL = 'gemini-3.6-flash';
-type SemanticLabel = typeof SEMANTIC_TAXONOMY[number];
+type SemanticLabel = SemanticResultLabel;
 
 export interface SemanticModelResult {
   label: SemanticLabel;
@@ -61,8 +62,17 @@ export function geminiSemanticProviderContext(
   };
 }
 
+export interface SemanticClassificationOptions {
+  /**
+   * Number of independent channel requests in this provider call. Batch
+   * callers use it to scale provider output allowances; a single call leaves
+   * the configured default untouched.
+   */
+  batchSize?: number;
+}
+
 export interface SemanticModelClient {
-  classify(prompt: string, model: string, observability?: SemanticObservabilityContext, signal?: AbortSignal): Promise<unknown>;
+  classify(prompt: string, model: string, observability?: SemanticObservabilityContext, signal?: AbortSignal, options?: SemanticClassificationOptions): Promise<unknown>;
   /**
    * Stable provider identity used by the Phase 4 batch scheduler. Injected
    * clients leave it undefined and are grouped by object identity instead.
@@ -355,7 +365,7 @@ function parse(value: any): SemanticModelResult {
 /** Shared production semantic-result parser (see buildSemanticPrompt). */
 export function parseSemanticResult(value: any): SemanticModelResult {
   const label = SEMANTIC_TAXONOMY.includes(value?.label) ? value.label : 'AMBIGUOUS';
-  const fields = new Set(['channel_title','channel_bio','video_title','video_description','playlist_name','playlist_description','external_link_label','external_link_domain','country','language','transcript_excerpt','visual_evidence','discord_invite']);
+  const fields = SEMANTIC_RESULT_FIELD_NAMES;
   return {
     label, confidence: Math.max(0, Math.min(100, Number(value?.confidence) || 0)), supportedLanguage: value?.supportedLanguage === true,
     reasonCodes: Array.isArray(value?.reasonCodes) ? value.reasonCodes.map(String).slice(0, 8) : [],
@@ -407,8 +417,9 @@ export class GeminiSemanticProvider implements EvidenceProvider {
       modelVersion: candidateModel,
       adjudicatorModelVersion: adjudicatorModel,
       adjudicationEnabled,
+      batchPromptVersion: semanticBatchConfig().enabled ? SEMANTIC_BATCH_PROMPT_VERSION : undefined,
     };
-    const cached = this.injectedClient ? undefined : await readSemanticResultCache(cacheIdentity);
+    const cached = this.injectedClient ? undefined : await readSemanticResultCache(cacheIdentity, process.env, { signal });
     let result: SemanticModelResult;
     let model: string;
     let fallbackReasonCodes: string[];
@@ -422,6 +433,10 @@ export class GeminiSemanticProvider implements EvidenceProvider {
     } else {
       const candidatePrompt = prompt(input, 'CANDIDATE');
       const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel, observability, signal);
+      // Only a complete model reply may be cached. parseSemanticResult turns
+      // a missing/partial reply into an AMBIGUOUS abstention; persisting that
+      // placeholder would replay it for the same evidence indefinitely.
+      let cacheable = isSemanticResultShape(candidate.value);
       result = parse(candidate.value);
       model = candidate.model;
       fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
@@ -430,13 +445,16 @@ export class GeminiSemanticProvider implements EvidenceProvider {
       // on model-name inequality, so identical candidate/adjudicator defaults
       // still adjudicate low-confidence results.
       if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && adjudicationEnabled && !candidate.fallbackUsed) {
-        result = parse(await classifySemanticPrompt({ client, prompt: prompt(input, 'ADJUDICATION'), model: adjudicatorModel, observability, signal })); model = adjudicatorModel;
+        const adjudicatedValue = await classifySemanticPrompt({ client, prompt: prompt(input, 'ADJUDICATION'), model: adjudicatorModel, observability, signal });
+        cacheable = isSemanticResultShape(adjudicatedValue);
+        result = parse(adjudicatedValue); model = adjudicatorModel;
       }
       // Cache the final (possibly adjudicated) verdict. A later recheck of the
       // same evidence under the same prompt/model versions replays this result
       // without spending provider quota. Injected clients are a test/shadow
-      // seam and must never read or write the production cache.
-      if (!this.injectedClient) await writeSemanticResultCache(cacheIdentity, { result, modelVersion: model, fallbackUsed: candidate.fallbackUsed });
+      // seam and must never read or write the production cache. Uncited
+      // abstentions stay out of the cache so a later attempt can recover.
+      if (!this.injectedClient && cacheable) await writeSemanticResultCache(cacheIdentity, { result, modelVersion: model, fallbackUsed: candidate.fallbackUsed }, process.env, { signal });
     }
     // Shadow validation for the Phase 4 prefilter gate. Observability only:
     // it never changes the verdict, and enforce mode records nothing because

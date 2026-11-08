@@ -6,6 +6,7 @@ import {
   ENRICHMENT_WORKER_BASELINE,
   ENRICHMENT_WORKER_SCALE_CEILING,
   enrichmentScaleThresholds,
+  evaluateBacklogStability,
   evaluateEnrichmentScaleGate,
   type EnrichmentScaleMetrics,
 } from './enrichmentScaleGate';
@@ -65,6 +66,23 @@ test('missing measurements fail closed at baseline', () => {
   assert.deepEqual(decision.reasons, ['SCALE_METRICS_UNAVAILABLE']);
 });
 
+test('backlog stability is behaviorally below-threshold on the creation/completion ratio', () => {
+  // Fewer completions than 90% of creations is unstable.
+  assert.equal(evaluateBacklogStability(10, 8, 20), false);
+  assert.equal(evaluateBacklogStability(10, 9, 20), true);
+  // No creations: stability is the pending cap.
+  assert.equal(evaluateBacklogStability(0, 0, 500), true);
+  assert.equal(evaluateBacklogStability(0, 0, 501), false);
+  const decision = evaluateEnrichmentScaleGate({ ...healthy, enrichmentCreatedLastHour: 10, enrichmentCompletedLastHour: 8, backlogStable: false }, DEFAULT_ENRICHMENT_SCALE_THRESHOLDS, 6);
+  assert.equal(decision.allowed, false);
+  assert.ok(decision.reasons.includes('ENRICHMENT_BACKLOG_NOT_STABLE'));
+});
+
+test('the metrics loader derives stability from the shared ratio helper', () => {
+  const source = readFileSync('server/enrichmentScaleGate.ts', 'utf8');
+  assert.match(source, /const backlogStable = evaluateBacklogStability\(createdLastHour, completedLastHour, pending, thresholds\)/);
+});
+
 test('an allowed request is capped at the approved ceiling of 6', () => {
   const decision = evaluateEnrichmentScaleGate(healthy, DEFAULT_ENRICHMENT_SCALE_THRESHOLDS, 12);
   assert.equal(decision.allowed, true);
@@ -90,10 +108,50 @@ test('thresholds are environment-tunable and reject invalid values', () => {
   assert.deepEqual(enrichmentScaleThresholds({ ENRICHMENT_SCALE_MIN_SUCCESS_RATE: 'garbage' } as any), DEFAULT_ENRICHMENT_SCALE_THRESHOLDS);
 });
 
-test('worker startup routes every above-baseline request through the measured gate', () => {
+test('thresholds ignore blank and non-numeric env values', () => {
+  assert.deepEqual(enrichmentScaleThresholds({ ENRICHMENT_SCALE_MIN_SUCCESS_RATE: '' } as any), DEFAULT_ENRICHMENT_SCALE_THRESHOLDS);
+  assert.deepEqual(enrichmentScaleThresholds({ ENRICHMENT_SCALE_MIN_SUCCESS_RATE: 'not-a-number' } as any), DEFAULT_ENRICHMENT_SCALE_THRESHOLDS);
+});
+
+test('the gate resolves configured thresholds when callers omit them', () => {
+  const decision = evaluateEnrichmentScaleGate(
+    { ...healthy, semanticSuccessRate: 0.95 },
+    undefined,
+    6,
+    { ENRICHMENT_SCALE_MIN_SUCCESS_RATE: '0.99' } as any,
+  );
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.thresholds.minSuccessRate, 0.99);
+  assert.ok(decision.reasons.includes('SEMANTIC_SUCCESS_RATE_NOT_ABOVE_THRESHOLD'));
+});
+
+test('the disabled rollback still never exceeds the approved ceiling of 6', () => {
+  const decision = evaluateEnrichmentScaleGate(undefined, undefined, 12, { ENRICHMENT_SCALE_GATE_ENABLED: 'false' } as any);
+  assert.equal(decision.allowed, true);
+  assert.equal(decision.effectiveWorkers, ENRICHMENT_WORKER_SCALE_CEILING);
+});
+
+test('worker startup routes every above-baseline request through the measured gate and split', () => {
   const source = readFileSync('server/queueManager.ts', 'utf8');
   assert.match(source, /void startGatedEnrichmentWorkers\(\)/);
-  assert.match(source, /loadEnrichmentScaleMetrics\(\)/);
-  assert.match(source, /evaluateEnrichmentScaleGate\(metrics, undefined, requested\)/);
-  assert.match(source, /startWorkerPool\('ENRICH_CHANNEL', decision\.effectiveWorkers\)/);
+  assert.match(source, /requested > ENRICHMENT_WORKER_BASELINE && enrichmentScaleGateEnabled\(\)/);
+  assert.match(source, /evaluateEnrichmentScaleGate\(metrics, enrichmentScaleThresholds\(\), requested\)/);
+  assert.match(source, /resolveEnrichmentWorkerSplit\(Math\.min\(ENRICHMENT_WORKER_SCALE_CEILING, effectiveWorkers\), decoupling\.enabled\)/);
+  assert.match(source, /setRunningEnrichmentWorkerCount\(/);
+  assert.match(source, /startWorkerPool\('ENRICH_CHANNEL', enrichmentSplit\.classificationWorkers/);
+});
+
+test('diagnostics separate the live decision from the running worker count', () => {
+  const source = readFileSync('server/enrichmentBacklogDiagnostics.ts', 'utf8');
+  assert.match(source, /runningWorkers:getRunningEnrichmentWorkerCount\(\)/);
+  assert.match(source, /liveDecision:true/);
+  assert.match(source, /evaluateEnrichmentScaleGate\(metrics,thresholds,requestedWorkers\)/);
+  assert.match(source, /evaluateEnrichmentScaleGate\(undefined,thresholds,requestedWorkers\)/);
+});
+
+test('the disabled gate skips the metrics load entirely', () => {
+  const source = readFileSync('server/queueManager.ts', 'utf8');
+  assert.match(source, /requested > ENRICHMENT_WORKER_BASELINE && enrichmentScaleGateEnabled\(\)/);
+  const disabledBranch = source.slice(source.indexOf('async function startGatedEnrichmentWorkers'));
+  assert.ok(disabledBranch.indexOf('enrichmentScaleGateEnabled()') < disabledBranch.indexOf('loadEnrichmentScaleMetrics()'));
 });

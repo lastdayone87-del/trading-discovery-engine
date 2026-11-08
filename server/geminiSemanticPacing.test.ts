@@ -536,18 +536,59 @@ describe('Gemini semantic pacing regression', () => {
       // reformatted SQL string or a stray comment cannot satisfy the test.
       const now = Date.now();
       const declaredResetMs = now + 45_000;
-      let sqlSeen = '';
-      const expiry = await getGeminiSemanticCooldownExpiry(now, async (sql) => {
-        sqlSeen = sql;
-        return { rows: [{ occurred_at: new Date(now - 120_000).toISOString(), cooldown_until_ms: String(declaredResetMs) }] };
-      });
-      assert.equal(expiry, declaredResetMs, 'resolver must return the declared reset');
-      assert.match(sqlSeen, /status='RATE_LIMITED'/, 'resolver must read RATE_LIMITED events');
-      assert.equal(
-        await getGeminiSemanticCooldownExpiry(now, async () => ({ rows: [] })),
-        undefined,
-        'no rate-limit row means no cooldown',
-      );
+      const previousKey = process.env.GEMINI_API_KEY;
+      const previousOrg = process.env.GEMINI_ORG_ID;
+      process.env.GEMINI_API_KEY = 'test-key';
+      process.env.GEMINI_ORG_ID = 'project-a';
+      try {
+        let sqlSeen = '';
+        let valuesSeen: unknown[] | undefined;
+        const expiry = await getGeminiSemanticCooldownExpiry(now, async (sql, values) => {
+          sqlSeen = sql;
+          valuesSeen = values;
+          return { rows: [{ occurred_at: new Date(now - 120_000).toISOString(), cooldown_until_ms: String(declaredResetMs) }] };
+        });
+        assert.equal(expiry, declaredResetMs, 'resolver must return the declared reset');
+        assert.match(sqlSeen, /status='RATE_LIMITED'/, 'resolver must read RATE_LIMITED events');
+        assert.match(sqlSeen, /request_metadata->>'geminiOrg' = ANY\(\$1::text\[\]\)/, 'resolver must scope to configured accounts');
+        assert.deepEqual(valuesSeen, [['project-a']], 'resolver must pass configured org labels');
+        assert.equal(
+          await getGeminiSemanticCooldownExpiry(now, async () => ({ rows: [] })),
+          undefined,
+          'no rate-limit row means no cooldown',
+        );
+      } finally {
+        if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+        else process.env.GEMINI_API_KEY = previousKey;
+        if (previousOrg === undefined) delete process.env.GEMINI_ORG_ID;
+        else process.env.GEMINI_ORG_ID = previousOrg;
+      }
+    });
+
+    it('a legacy pool-wide cooldown read is scoped to configured Gemini projects', async () => {
+      const { getGeminiSemanticCooldownExpiry } = await import('./providerResilience');
+      const previousKey = process.env.GEMINI_API_KEY;
+      const previousKey2 = process.env.GEMINI_API_KEY_2;
+      const previousOrg = process.env.GEMINI_ORG_ID;
+      const previousOrg2 = process.env.GEMINI_ORG_ID_2;
+      delete process.env.GEMINI_API_KEY;
+      delete process.env.GEMINI_API_KEY_2;
+      delete process.env.GEMINI_ORG_ID;
+      delete process.env.GEMINI_ORG_ID_2;
+      try {
+        let queried = false;
+        const expiry = await getGeminiSemanticCooldownExpiry(Date.now(), async () => {
+          queried = true;
+          return { rows: [] };
+        });
+        assert.equal(expiry, undefined);
+        assert.equal(queried, false, 'no configured Gemini project means no unscoped ledger read');
+      } finally {
+        if (previousKey !== undefined) process.env.GEMINI_API_KEY = previousKey;
+        if (previousKey2 !== undefined) process.env.GEMINI_API_KEY_2 = previousKey2;
+        if (previousOrg !== undefined) process.env.GEMINI_ORG_ID = previousOrg;
+        if (previousOrg2 !== undefined) process.env.GEMINI_ORG_ID_2 = previousOrg2;
+      }
     });
 
     it('db.ts failJob does not import configuredGeminiRouteIds', async () => {
@@ -630,6 +671,30 @@ describe('Gemini semantic pacing regression', () => {
       const result = decideJobFailure(operationalError!, 1, 4, now, now, cooldownExpiry);
       assert.equal(result.disposition, 'RETRYING_WITHOUT_ATTEMPT');
       assert.ok(result.runAfter! >= cooldownExpiry);
+    });
+
+    it('GEMINI_ORG_TOKEN_BUCKET_EMPTY survives wrapping, carries its retry timing, and schedules past the bucket window', () => {
+      const geminiError = geminiCapacityDeferralError('multilingual-semantic-classification', 'GEMINI_ORG_TOKEN_BUCKET_EMPTY', 12_000);
+      assert.deepEqual(geminiError.providerReasons, ['GEMINI_ORG_TOKEN_BUCKET_EMPTY']);
+      assert.equal(geminiError.retryAfterMs, 12_000);
+
+      const wrappedReasonCodes = ['PROVIDER_TRANSIENT_FAILURE', ...geminiError.providerReasons!];
+      const operationalError = enrichmentOperationalFailure({
+        degraded: true,
+        providers: [{
+          provider: 'gemini_semantic',
+          availability: 'FAILED',
+          reasonCodes: wrappedReasonCodes
+        }]
+      } as any, true);
+
+      assert.ok(operationalError);
+      assert.ok(operationalError!.providerReasons.includes('GEMINI_ORG_TOKEN_BUCKET_EMPTY'));
+
+      const bucketExpiry = now + 12_000;
+      const result = decideJobFailure(operationalError!, 1, 4, now, now, bucketExpiry);
+      assert.equal(result.disposition, 'RETRYING_WITHOUT_ATTEMPT');
+      assert.ok(result.runAfter! >= bucketExpiry, `runAfter (${result.runAfter}) must wait for the bucket window (${bucketExpiry})`);
     });
 
     it('wrapping path without Gemini reason codes does not trigger cooldown', () => {

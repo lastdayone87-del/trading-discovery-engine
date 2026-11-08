@@ -55,7 +55,9 @@ export const DEFAULT_ENRICHMENT_SCALE_THRESHOLDS: EnrichmentScaleThresholds = {
 
 export function enrichmentScaleThresholds(env: NodeJS.ProcessEnv = process.env): EnrichmentScaleThresholds {
   const number = (name: string, fallback: number) => {
-    const value = Number(env[name]);
+    const raw = env[name];
+    if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
+    const value = Number(raw);
     return Number.isFinite(value) && value >= 0 ? value : fallback;
   };
   return {
@@ -71,21 +73,65 @@ export function enrichmentScaleGateEnabled(env: NodeJS.ProcessEnv = process.env)
   return env.ENRICHMENT_SCALE_GATE_ENABLED !== 'false';
 }
 
+/**
+ * Backlog stability from the one-hour creation/completion counters. Extracted
+ * so the below-threshold case is behaviorally testable without a database.
+ */
+export function evaluateBacklogStability(
+  createdLastHour: number,
+  completedLastHour: number,
+  pending: number,
+  thresholds: EnrichmentScaleThresholds = DEFAULT_ENRICHMENT_SCALE_THRESHOLDS,
+): boolean {
+  return createdLastHour === 0
+    ? pending <= thresholds.maxPendingEnrichmentJobs
+    : completedLastHour >= createdLastHour * thresholds.minCompletionToCreationRatio;
+}
+
+/**
+ * The worker count actually started in this process. Startup records it after
+ * the gate and classification split, so diagnostics can distinguish the live
+ * what-if decision from the running pool.
+ */
+let runningEnrichmentWorkerCount = 0;
+
+export function setRunningEnrichmentWorkerCount(count: number): void {
+  runningEnrichmentWorkerCount = Math.max(0, Math.floor(Number(count) || 0));
+}
+
+export function getRunningEnrichmentWorkerCount(): number {
+  return runningEnrichmentWorkerCount;
+}
+
+export function resetRunningEnrichmentWorkerCountForTests(): void {
+  runningEnrichmentWorkerCount = 0;
+}
+
 export function evaluateEnrichmentScaleGate(
   metrics: EnrichmentScaleMetrics | undefined,
-  thresholds: EnrichmentScaleThresholds = DEFAULT_ENRICHMENT_SCALE_THRESHOLDS,
+  thresholds?: EnrichmentScaleThresholds,
   requestedWorkers: number = ENRICHMENT_WORKER_BASELINE,
   env: NodeJS.ProcessEnv = process.env,
 ): EnrichmentScaleDecision {
   const requested = Math.max(1, Math.floor(Number(requestedWorkers) || ENRICHMENT_WORKER_BASELINE));
+  // Resolve here, not only in callers: startup, diagnostics, and tests all
+  // must honor the operator's configured thresholds when they omit the arg.
+  const resolvedThresholds = thresholds ?? enrichmentScaleThresholds(env);
   const base = {
     requestedWorkers: requested,
     metrics,
-    thresholds,
+    thresholds: resolvedThresholds,
     gateVersion: ENRICHMENT_SCALE_GATE_VERSION,
   };
   if (!enrichmentScaleGateEnabled(env)) {
-    return { ...base, allowed: true, effectiveWorkers: requested, reasons: ['SCALE_GATE_DISABLED'] };
+    // The documented hard ceiling is not a gate decision: a rollback restores
+    // the explicit request, still bounded by the approved maximum.
+    return {
+      ...base,
+      allowed: true,
+      effectiveWorkers: Math.min(ENRICHMENT_WORKER_SCALE_CEILING, requested),
+      reasons: ['SCALE_GATE_DISABLED'],
+    };
   }
   if (requested <= ENRICHMENT_WORKER_BASELINE) {
     return { ...base, allowed: true, effectiveWorkers: requested, reasons: ['BASELINE_REQUEST'] };
@@ -94,10 +140,10 @@ export function evaluateEnrichmentScaleGate(
   if (!metrics) {
     reasons.push('SCALE_METRICS_UNAVAILABLE');
   } else {
-    if (metrics.semanticCalls < thresholds.minSemanticSample) reasons.push('INSUFFICIENT_SEMANTIC_SAMPLE');
-    if (!(metrics.semanticSuccessRate > thresholds.minSuccessRate)) reasons.push('SEMANTIC_SUCCESS_RATE_NOT_ABOVE_THRESHOLD');
-    if (!(metrics.semanticP95LatencyMs < thresholds.maxP95LatencyMs)) reasons.push('SEMANTIC_P95_NOT_BELOW_THRESHOLD');
-    if (!metrics.backlogStable || metrics.pendingEnrichmentJobs > thresholds.maxPendingEnrichmentJobs) reasons.push('ENRICHMENT_BACKLOG_NOT_STABLE');
+    if (metrics.semanticCalls < resolvedThresholds.minSemanticSample) reasons.push('INSUFFICIENT_SEMANTIC_SAMPLE');
+    if (!(metrics.semanticSuccessRate > resolvedThresholds.minSuccessRate)) reasons.push('SEMANTIC_SUCCESS_RATE_NOT_ABOVE_THRESHOLD');
+    if (!(metrics.semanticP95LatencyMs < resolvedThresholds.maxP95LatencyMs)) reasons.push('SEMANTIC_P95_NOT_BELOW_THRESHOLD');
+    if (!metrics.backlogStable || metrics.pendingEnrichmentJobs > resolvedThresholds.maxPendingEnrichmentJobs) reasons.push('ENRICHMENT_BACKLOG_NOT_STABLE');
   }
   const allowed = reasons.length === 0;
   return {
@@ -112,10 +158,10 @@ export function evaluateEnrichmentScaleGate(
  * Read the measured inputs from the durable ledgers. Any database failure is
  * the caller's signal to stay at baseline; it never authorizes scale.
  */
-export async function loadEnrichmentScaleMetrics(nowMs: number = Date.now()): Promise<EnrichmentScaleMetrics> {
+export async function loadEnrichmentScaleMetrics(nowMs: number = Date.now(), env: NodeJS.ProcessEnv = process.env): Promise<EnrichmentScaleMetrics> {
   const { getDb } = await import('./db');
   const db = await getDb();
-  const thresholds = enrichmentScaleThresholds();
+  const thresholds = enrichmentScaleThresholds(env);
   const [provider, backlog, throughput] = await Promise.all([
     db.query(
       `SELECT
@@ -147,9 +193,7 @@ export async function loadEnrichmentScaleMetrics(nowMs: number = Date.now()): Pr
   const createdLastHour = Number(throughput.rows[0]?.created_last_hour || 0);
   const completedLastHour = Number(throughput.rows[0]?.completed_last_hour || 0);
   const pending = Number(backlog.rows[0]?.pending || 0);
-  const backlogStable = createdLastHour === 0
-    ? pending <= thresholds.maxPendingEnrichmentJobs
-    : completedLastHour >= createdLastHour * thresholds.minCompletionToCreationRatio;
+  const backlogStable = evaluateBacklogStability(createdLastHour, completedLastHour, pending, thresholds);
   return {
     semanticCalls: calls,
     semanticSuccesses: successes,

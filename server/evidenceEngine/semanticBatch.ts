@@ -1,4 +1,5 @@
 import type { SemanticModelClient, SemanticObservabilityContext } from './providers/GeminiSemanticProvider';
+import { isSemanticResultShape } from './semanticResultShape';
 
 /**
  * Phase 4 semantic batching.
@@ -14,6 +15,7 @@ import type { SemanticModelClient, SemanticObservabilityContext } from './provid
  * enrichment scale gate show provider headroom.
  */
 export const SEMANTIC_BATCH_PROMPT_VERSION = 'semantic-batch-array-1';
+export const DEFAULT_SEMANTIC_BATCH_WINDOW_MS = 400;
 
 export interface SemanticBatchConfig {
   enabled: boolean;
@@ -30,7 +32,11 @@ export function semanticBatchConfig(env: NodeJS.ProcessEnv = process.env): Seman
   return {
     enabled: env.SEMANTIC_BATCH_CLASSIFICATION_ENABLED === 'true',
     maxSize: clamp(Number(env.SEMANTIC_BATCH_MAX_SIZE || '8'), 2, 10, 8),
-    windowMs: clamp(Number(env.SEMANTIC_BATCH_WINDOW_MS || '1200'), 0, 10_000, 1200),
+    // The scheduler window is paid out of the 2s stage-0 semantic attempt
+    // budget. Keep the default small enough that inference still has most of
+    // the attempt window; operators can raise it when quota, not latency, is
+    // the bottleneck.
+    windowMs: clamp(Number(env.SEMANTIC_BATCH_WINDOW_MS || String(DEFAULT_SEMANTIC_BATCH_WINDOW_MS)), 0, 10_000, DEFAULT_SEMANTIC_BATCH_WINDOW_MS),
   };
 }
 
@@ -60,6 +66,19 @@ export function buildSemanticBatchPrompt(prompts: string[]): string {
     ],
     inputs: prompts.map((prompt, index) => ({ index, request: parsePrompt(prompt) })),
   });
+}
+
+/**
+ * A malformed whole-batch response must fail the batch, not be interpreted as
+ * N missing entries (which would turn one provider call into N+1).
+ */
+export function isSemanticBatchContainerUsable(value: unknown): boolean {
+  const container = Array.isArray(value)
+    ? value
+    : value && typeof value === 'object' && Array.isArray((value as { results?: unknown }).results)
+      ? (value as { results: unknown[] }).results
+      : undefined;
+  return Array.isArray(container) && container.length > 0;
 }
 
 /**
@@ -126,7 +145,16 @@ function commonObservability(requests: PendingRequest[], batchSize: number): Sem
   const first = attribution[0];
   const shared = attribution.every(item => item.jobId === first.jobId && item.runId === first.runId);
   const requestMetadata: Record<string, string> = { semanticBatchSize: String(batchSize) };
-  if (!shared) return { requestMetadata };
+  if (!shared) {
+    // A mixed-attribution batch has one ledger row but served several jobs.
+    // Carry bounded member IDs so an incident can still be joined back to
+    // the affected work instead of dropping attribution entirely.
+    const jobIds = [...new Set(attribution.map(item => item.jobId).filter((value): value is string => Boolean(value)))];
+    const runIds = [...new Set(attribution.map(item => item.runId).filter((value): value is string => Boolean(value)))];
+    if (jobIds.length) requestMetadata.semanticBatchJobIds = jobIds.slice(0, 10).join(',');
+    if (runIds.length) requestMetadata.semanticBatchRunIds = runIds.slice(0, 10).join(',');
+    return { requestMetadata };
+  }
   return {
     ...(first.jobId ? { jobId: first.jobId } : {}),
     ...(first.runId ? { runId: first.runId } : {}),
@@ -153,6 +181,23 @@ export class SemanticBatchScheduler {
     this.config = deps.config;
     this.setTimeoutFn = deps.setTimeoutFn || ((callback, ms) => setTimeout(callback, ms));
     this.clearTimeoutFn = deps.clearTimeoutFn || (timer => clearTimeout(timer));
+  }
+
+  /**
+   * Cancel every queued request and the pending flush timer. Used when the
+   * process-wide scheduler is replaced (config change) or torn down for
+   * tests: orphaned timers must never flush work into a dead scheduler.
+   */
+  cancel(reason?: unknown): void {
+    if (this.timer) {
+      this.clearTimeoutFn(this.timer);
+      this.timer = undefined;
+    }
+    const queued = this.queue.splice(0);
+    for (const request of queued) {
+      request.removeAbortListener();
+      request.reject(abortError(reason));
+    }
   }
 
   submit(input: {
@@ -285,17 +330,25 @@ export class SemanticBatchScheduler {
         pending[0].model,
         commonObservability(pending, pending.length),
         controller.signal,
+        { batchSize: pending.length },
       );
+      if (!isSemanticBatchContainerUsable(response)) {
+        // A malformed container is a whole-batch failure. Per-item fallback
+        // here would turn one call into N+1 and consume quota precisely when
+        // the provider is already misbehaving.
+        throw new Error('Semantic batch response was not a usable result container.');
+      }
       const parsed = parseSemanticBatchResponse(response, pending.length);
       await Promise.all(pending.map(async (request, index) => {
         if (!active.has(request)) return;
         const item = parsed[index];
-        if (item && typeof item === 'object') {
+        if (isSemanticResultShape(item)) {
           request.resolve(item);
           return;
         }
-        // Per-channel isolation: a missing/invalid array element is retried
-        // alone. It cannot poison the sibling results that already succeeded.
+        // Per-channel isolation: a missing or malformed array element is
+        // retried alone. It cannot poison the sibling results that already
+        // succeeded, and a partial object never becomes a cached abstention.
         try {
           request.resolve(await request.client.classify(request.prompt, request.model, request.observability, request.signal));
         } catch (error) {
@@ -319,6 +372,9 @@ function schedulerForCurrentConfig(): SemanticBatchScheduler {
   const config = semanticBatchConfig();
   const key = `${config.enabled}|${config.maxSize}|${config.windowMs}`;
   if (!defaultScheduler || defaultSchedulerConfigKey !== key) {
+    // Replacing the scheduler must settle work queued under the old window;
+    // otherwise an orphaned timer flushes into a scheduler nobody awaits.
+    defaultScheduler?.cancel(new Error('Semantic batch scheduler configuration changed.'));
     defaultScheduler = new SemanticBatchScheduler({ config });
     defaultSchedulerConfigKey = key;
   }
@@ -338,8 +394,9 @@ export function classifySemanticPrompt(input: {
   return schedulerForCurrentConfig().submit(input);
 }
 
-/** Test seam: drops the process-wide scheduler and its queued work. */
+/** Test seam: cancels the process-wide scheduler and its queued work. */
 export function resetSemanticBatchSchedulerForTests(): void {
+  defaultScheduler?.cancel(new Error('Semantic batch scheduler reset.'));
   defaultScheduler = undefined;
   defaultSchedulerConfigKey = '';
 }

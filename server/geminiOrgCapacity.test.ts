@@ -74,3 +74,17 @@ test('per-account capacity uses a two-key advisory lock and strict org-scoped le
   assert.match(source, /orgCallsInWindow:Number\(orgWindowCalls\.rows\[0\]\?\.calls\|\|0\)/);
   assert.match(source, /GEMINI_ORG_MAX_CALLS_PER_MINUTE/);
 });
+
+test('every Gemini ledger read is scoped to an account, including cooldowns and deferrals', () => {
+  const source = readFileSync('server/providerResilience.ts', 'utf8');
+  const templates = source.match(/`[^`]*provider_call_events[^`]*`/g) || [];
+  const reads = templates.filter(sql => /SELECT/i.test(sql));
+  assert.ok(reads.length >= 5, 'expected the account-scoped ledger reads');
+  for (const sql of reads) {
+    assert.match(sql, /request_metadata->>'geminiOrg'/, `unscoped Gemini ledger read: ${sql}`);
+  }
+  for (const sql of reads.filter(sql => /COUNT\(\*\)::int AS calls|operation=\$1/.test(sql))) {
+    assert.match(sql, /geminiCapacityDeferral/, `pacing/bucket reads must exclude deferral echoes: ${sql}`);
+  }
+  assert.doesNotMatch(source, /provider='gemini' AND status='RATE_LIMITED'\s+AND occurred_at/, 'cooldown read must not span every project');
+});

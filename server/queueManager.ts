@@ -1,5 +1,5 @@
 import { browserCapabilityIsUnavailable } from './browserCapability';
-import { ENRICHMENT_WORKER_BASELINE, enrichmentScaleGateEnabled, enrichmentScaleThresholds, evaluateEnrichmentScaleGate, loadEnrichmentScaleMetrics } from './enrichmentScaleGate';
+import { ENRICHMENT_WORKER_BASELINE, ENRICHMENT_WORKER_SCALE_CEILING, enrichmentScaleGateEnabled, enrichmentScaleThresholds, evaluateEnrichmentScaleGate, loadEnrichmentScaleMetrics, setRunningEnrichmentWorkerCount } from './enrichmentScaleGate';
 import {
   getDb,
   enqueueJob,
@@ -4754,7 +4754,8 @@ async function startGatedEnrichmentWorkers(): Promise<void> {
       console.warn(`[Queue] Enrichment scale gate clamped workers ${requested}->${decision.effectiveWorkers}: ${decision.reasons.join(',')}`);
     }
   }
-  const enrichmentSplit = resolveEnrichmentWorkerSplit(effectiveWorkers, decoupling.enabled);
+  const enrichmentSplit = resolveEnrichmentWorkerSplit(Math.min(ENRICHMENT_WORKER_SCALE_CEILING, effectiveWorkers), decoupling.enabled);
+  setRunningEnrichmentWorkerCount(enrichmentSplit.classificationWorkers + enrichmentSplit.enrichmentOnlyWorkers);
   startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.classificationWorkers, [CLASSIFICATION_JOB_TYPE], 'enrich_channel_shared');
   if (enrichmentSplit.enrichmentOnlyWorkers > 0) {
     startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.enrichmentOnlyWorkers, [], 'enrich_channel_backlog');

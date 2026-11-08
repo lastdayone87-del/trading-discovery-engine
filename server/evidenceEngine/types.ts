@@ -124,6 +124,9 @@ export interface RawChannelInput {
   transcript_excerpts?: Array<{ video_id?: string; text: string; language?: string }>;
   visual_evidence?: Array<{ source_ref: string; description: string; model_provenance: string }>;
   pinned_comment?: string;
+  /** Audience metadata used only by the deterministic prefilter; not prompt evidence. */
+  subscriber_count?: number;
+  video_count?: number;
   /** Set only by enrichment hydration: the video sample is an authoritative
    * recent-channel sample, not retrieval-selected match content. */
   videoDescriptionsAuthoritative?: boolean;

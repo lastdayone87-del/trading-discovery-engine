@@ -17,8 +17,9 @@ The approved Phase 4 policy allows scale work only after measurement:
   ENRICH backlog. The hard ceiling is 6.
 - Batched semantics groups independent channels into one prompt (default
   maximum 8, operator clamp 2–10). Batching is opt-in.
-- The semantic cache key is `input_checksum + promptVersion + modelVersion`
-  (plus provider, feature version, adjudicator model/flag).
+- The semantic cache key is `input_checksum + promptVersion + featureVersion +
+  modelVersion + adjudicator model/flag + batch prompt version + repair prompt
+  version` (plus provider and cache version).
 - The deterministic prefilter is shadow-first and must be validated for false
   negatives before enforcement.
 
@@ -36,24 +37,33 @@ Files: `server/evidenceEngine/semanticResultCache.ts`,
   evidence decision.
 - Key: SHA-256 over the cache version, attribution-free evidence checksum,
   provider name, prompt version, feature version, candidate model version,
-  adjudicator model version, and adjudication-enabled flag. `job_id`/`run_id`
-  are observability attribution and are excluded from the checksum, so a
-  recheck under a new job can hit; any evidence or version change is a miss.
+  adjudicator model version, adjudication-enabled flag, batch prompt version
+  (when batching is enabled), and the Groq citation-repair prompt version.
+  `job_id`/`run_id` are observability attribution and are excluded from the
+  checksum, so a recheck under a new job can hit; any evidence, prompt, model,
+  or repair change is a miss.
 - Fail-open: a missing migration, database outage, or structurally invalid row
-  is a miss. Three consecutive cache failures open a 60-second process-local
-  circuit so a doomed connection cannot slow every classification. Injected
-  test/shadow clients never read or write the production cache.
+  is a miss. A corrupt row is validated before it is counted, deleted rather
+  than replayed, and can never reach evidence construction. Three consecutive
+  cache failures open a 60-second process-local circuit so a doomed connection
+  cannot slow every classification. Every read/write is also bounded by the
+  caller's abort signal and `SEMANTIC_RESULT_CACHE_TIMEOUT_MS` (default 500 ms).
+  Injected test/shadow clients never read or write the production cache.
+- Only a structurally complete result with at least one citation is written.
+  A missing/partial model reply and an uncited abstention stay out of the cache
+  so a later attempt can recover instead of replaying a degenerate result.
 - Writes are `ON CONFLICT (cache_key) DO NOTHING`: the first stored result wins,
   and a concurrent duplicate evaluation cannot rewrite it.
 - Hits increment `hits` and set `last_hit_at` for measurement.
 
 **Retention.** Migration 168 does not install an automatic purge. Rows are
 small and keyed by evidence; stale rows simply stop being read. Trim manually
-when needed (safe because the cache is never authoritative):
+when needed (safe because the cache is never authoritative). Retain by last
+use, not creation, so a frequently hit entry is not purged merely for age:
 
 ```sql
 DELETE FROM semantic_classification_cache
-WHERE created_at < now() - interval '90 days';
+WHERE COALESCE(last_hit_at, created_at) < now() - interval '90 days';
 ```
 
 ### 2.2 Deterministic semantic prefilter
@@ -99,18 +109,26 @@ Files: `server/evidenceEngine/semanticBatch.ts`, provider candidate calls.
 
 - Opt-in: `SEMANTIC_BATCH_CLASSIFICATION_ENABLED=false` by default.
 - Coalesces independent requests by provider client group and model over a
-  bounded window (`SEMANTIC_BATCH_WINDOW_MS`, default 1200 ms), up to
-  `SEMANTIC_BATCH_MAX_SIZE` (default 8, clamp 2–10).
+  bounded window (`SEMANTIC_BATCH_WINDOW_MS`, default 400 ms), up to
+  `SEMANTIC_BATCH_MAX_SIZE` (default 8, clamp 2–10). The window is paid out of
+  the stage-0 semantic attempt budget (2 s aggregate), so the default leaves
+  most of the attempt for inference; raise it only when quota, not latency, is
+  the bottleneck.
 - The batch prompt declares an explicit array schema, one result per input, in
   input order, with per-channel citations and an instruction never to merge
-  evidence across inputs.
-- Each array element is parsed independently. A missing/invalid element falls
-  back to a single call for **that channel only**. A whole-batch provider
-  failure rejects every member without a per-channel retry storm; normal job
-  retry policy owns recovery.
-- Caller aborts are honored while queued and in flight.
-- Citation repair stays unbatched: it is Groq-specific, low volume, and needs
-  the original single-channel prompt.
+  evidence across inputs. Groq's completion allowance scales with batch size.
+- Each array element is parsed independently and structurally validated. A
+  missing/invalid element falls back to a single call for **that channel
+  only**. A malformed whole-batch container (not an array or `{results:[...]}`)
+  fails the entire batch instead of turning one provider call into N+1.
+- A whole-batch provider failure rejects every member without a per-channel
+  retry storm; normal job retry policy owns recovery.
+- Caller aborts are honored while queued and in flight. Replacing the
+  scheduler configuration cancels queued work instead of leaving an orphaned
+  timer behind.
+- Citation repair routes through the same scheduler, so independent Groq
+  repairs can share one provider call. The repair prompt version is part of
+  the cache identity.
 - With batching disabled, the provider call path is unchanged.
 
 ### 2.4 Per-account Gemini capacity
@@ -156,19 +174,24 @@ clamped to 3 unless **all** pass:
 On success the effective count is capped at 6. Any metrics/query error fails
 closed to 3. The gate is re-evaluated on each process start; a running process
 never changes its worker count. `ENRICHMENT_SCALE_GATE_ENABLED=false` is the
-operator rollback that restores the raw explicit environment value.
+operator rollback that restores the raw explicit environment value (skipping
+the metrics load entirely), still capped at the approved hard ceiling of 6.
+The diagnostics block reports the live what-if decision separately from
+`runningWorkers`, so a passing live decision is never mistaken for the
+currently running pool.
 
 ## 3. Configuration
 
 | Variable | Default | Purpose / rollback |
 |----------|---------|--------------------|
 | `SEMANTIC_RESULT_CACHE_ENABLED` | `true` | `false` bypasses all cache reads and writes. |
+| `SEMANTIC_RESULT_CACHE_TIMEOUT_MS` | `500` | Per-read/write bound; non-positive or blank falls back to 500. |
 | `SEMANTIC_PREFILTER_MODE` | `shadow` | `off` disables; `enforce` skips semantic calls for confident unrelated domains. |
 | `SEMANTIC_PREFILTER_STALE_DAYS` | `730` | `0` disables the staleness rule. |
 | `SEMANTIC_PREFILTER_MIN_SUBSCRIBERS` | `50` | Low-audience thin-surface threshold. |
 | `SEMANTIC_BATCH_CLASSIFICATION_ENABLED` | `false` | `true` enables coalescing. |
 | `SEMANTIC_BATCH_MAX_SIZE` | `8` | Clamped 2–10. |
-| `SEMANTIC_BATCH_WINDOW_MS` | `1200` | Clamped 0–10 000. |
+| `SEMANTIC_BATCH_WINDOW_MS` | `400` | Clamped 0–10 000; must fit the 2 s attempt budget. |
 | `GEMINI_ORG_MIN_INTERVAL_MS` | `6000` | Per-account pacing. |
 | `GEMINI_ORG_MAX_CALLS_PER_MINUTE` | `10` | Per-account rolling bucket; `0` disables. |
 | `GEMINI_ORG_RATE_WINDOW_MS` | `60000` | Rolling window length. |
@@ -256,8 +279,10 @@ GROUP BY 1
 ORDER BY calls_last_minute DESC;
 ```
 
-Deferrals do not create provider rows (no attempt occurs). Inspect retry
-scheduling instead:
+Deferrals never reach Google, so they create no real quota consumption. They
+do emit a provider row tagged `geminiCapacityDeferral=true`, which the pacing
+and rolling-bucket reads exclude; otherwise queued retries could keep a full
+account full forever. Inspect retry scheduling instead:
 
 ```sql
 SELECT COUNT(*)::int AS jobs_waiting_on_org_capacity
@@ -303,7 +328,7 @@ All controls are feature-flag based and additive:
 | Cache serving stale/wrong verdicts | `SEMANTIC_RESULT_CACHE_ENABLED=false`; no restart required beyond env propagation. Cache rows remain inert. |
 | Prefilter withholds a real creator | `SEMANTIC_PREFILTER_MODE=off` (or back to `shadow`). Withheld channels immediately classify again. |
 | Batch quality or latency regression | `SEMANTIC_BATCH_CLASSIFICATION_ENABLED=false`. |
-| Enrichment scale causes pressure | Unset `ENRICHMENT_WORKER_CONCURRENCY` (returns to 3) or set `ENRICHMENT_SCALE_GATE_ENABLED=false` and set concurrency explicitly. |
+| Enrichment scale causes pressure | Unset `ENRICHMENT_WORKER_CONCURRENCY` (returns to 3) or set `ENRICHMENT_SCALE_GATE_ENABLED=false` and set concurrency explicitly (still capped at 6). |
 | Gemini account misbehaves | Per-account cooldown/bucket already defers automatically; the account's route can be removed without affecting other projects. |
 
 Phase 3 classification jobs are durable and remain drainable: Phase 4 adds no
@@ -320,11 +345,12 @@ is optional and destroys only non-authoritative cache rows.
 - **Cache staleness.** Key covers evidence and all model-facing versions.
   Prompt, feature, model, adjudicator, or adjudication-flag changes invalidate
   automatically. The cache stores only the model result, not the decision.
-- **Corrupt cache rows.** Structurally validated as a whole; anything
-  incomplete is a miss and never reaches evidence construction.
+- **Corrupt cache rows.** Structurally validated as a whole before counting a
+  hit; anything incomplete is deleted and treated as a miss, never sent to
+  evidence construction. Degenerate/uncited results are never persisted.
 - **Batch schema drift or partial output.** Per-item alignment by index,
-  explicit cardinality, per-item single-call fallback, and no retry storm on a
-  whole-batch failure.
+  structural item validation, explicit cardinality, per-item single-call
+  fallback, and no retry storm on a malformed container or whole-batch failure.
 - **Batch latency.** The coalescing window adds at most `SEMANTIC_BATCH_WINDOW_MS`
   to a request; usually the batch fills earlier. Enabled only after p95 review.
 - **Advisory-lock collision.** A `hashtext` collision serializes two accounts
@@ -339,19 +365,20 @@ is optional and destroys only non-authoritative cache rows.
 
 Fresh runs in the Phase 4 worktree:
 
-- New Phase 4 suites: **40 passed, 0 failed**
+- New Phase 4 suites: **65 passed, 0 failed**
   (`semanticResultCache`, `semanticPrefilter`, `semanticBatch`,
   `geminiOrgCapacity`, `enrichmentScaleGate`).
-- Provider, capacity, queue, and diagnostics regression suites: **117 passed,
+- Provider, capacity, queue, and diagnostics regression suites: **133 passed,
   0 failed** (`providerResilience`, `geminiSemanticPacing`,
   `enrichConcurrencyDefaults`, `searchCapacityDefaults`,
   `classificationDiagnostics`, `productionIntegration`,
   `manualRecheckClassification`, `enrichmentBacklogDiagnostics`,
   `enrichmentBacklogEvidence`, `enrichmentBacklogDrain.contract`,
   `providerFailureDiagnostics`).
-- Provider implementation suites: **105 passed, 0 failed**
+- Provider implementation suites: **122 passed, 0 failed**
   (`GeminiSemanticProvider`, `GroqSemanticProvider`,
   `GeminiFreeSemanticProvider`).
+- Combined Phase 4 plus regression run: **320 passed, 0 failed**.
 - `npx tsc --noEmit`: clean.
 - `multilingualSemanticProvider.test.ts` retains one pre-existing
   environment-dependent assertion (`gemini-3.6-flash` vs expected

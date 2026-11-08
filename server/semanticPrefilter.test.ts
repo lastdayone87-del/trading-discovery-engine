@@ -7,10 +7,14 @@ import {
   recordSemanticPrefilterOutcome,
   resetSemanticPrefilterMetricsForTests,
   SEMANTIC_PREFILTER_POLICY_VERSION,
+  semanticPrefilterInputFromRaw,
   semanticPrefilterMode,
   semanticPrefilterSnapshot,
   type SemanticPrefilterInput,
 } from './semanticPrefilter';
+import { GeminiSemanticProvider } from './evidenceEngine/providers/GeminiSemanticProvider';
+import { GroqSemanticProvider } from './evidenceEngine/providers/GroqSemanticProvider';
+import { GeminiFreeSemanticProvider } from './evidenceEngine/providers/GeminiFreeSemanticProvider';
 import type { RawChannelInput } from './evidenceEngine/types';
 
 const NOW = Date.parse('2026-11-07T00:00:00Z');
@@ -58,6 +62,84 @@ test('a finance signal vetoes an unrelated-domain cue', () => {
   }, NOW);
   assert.equal(decision.disposition, 'CLASSIFY');
   assert.ok(decision.reasonCodes.includes('FINANCE_SIGNAL_PRESENT'));
+});
+
+test('finance evidence in transcripts, visuals, corpus, and link labels vetoes withholding at full length', () => {
+  const padding = ` ${'unrelated lifestyle text '.repeat(300)}`;
+  const decision = evaluateSemanticPrefilter({
+    channelName: 'Minecraft gameplay walkthrough',
+    description: `${padding}Minecraft gameplay walkthrough.`,
+    transcriptExcerpts: [`${padding} We review futures order flow and risk.`],
+    visualEvidence: [`${padding} Chart shows a trading setup.`],
+    evidenceCorpus: [`${padding} Technical analysis of the market.`],
+    externalLinkLabels: [`${padding} My broker`],
+  }, NOW);
+  assert.equal(decision.disposition, 'CLASSIFY');
+  assert.ok(decision.reasonCodes.includes('FINANCE_SIGNAL_PRESENT'));
+});
+
+test('an empty videos array still uses populated legacy titles and descriptions', () => {
+  const raw: RawChannelInput = {
+    channel_name: 'Quiet Channel',
+    description: '',
+    videos: [],
+    video_titles: ['Futures trading for beginners'],
+    video_descriptions: ['Order flow and risk management.'],
+  };
+  const input = semanticPrefilterInputFromRaw(raw);
+  assert.deepEqual(input.videoTitles, ['Futures trading for beginners']);
+  assert.deepEqual(input.videoDescriptions, ['Order flow and risk management.']);
+  assert.equal(evaluateSemanticPrefilter(input, NOW).disposition, 'CLASSIFY');
+  assert.ok(evaluateSemanticPrefilter(input, NOW).matchedSignals.includes('TRADING_LITERAL'));
+});
+
+test('unmodeled detected languages veto withholding before stale and audience rules', () => {
+  const decision = evaluateSemanticPrefilter({
+    channelName: 'Mkulima Channel',
+    description: 'Kilimo na mazao.',
+    detectedLanguages: ['sw'],
+    subscriberCount: 5,
+    videoCount: 1,
+    latestUploadAt: '2018-01-01T00:00:00Z',
+    uploadsLast365Days: 0,
+    videoTitles: ['Minecraft gameplay walkthrough'],
+  }, NOW);
+  assert.equal(decision.disposition, 'CLASSIFY');
+  assert.ok(decision.reasonCodes.includes('UNMODELED_LANGUAGE_NEEDS_SEMANTICS'));
+});
+
+test('accented finance terms match with Unicode-aware boundaries', () => {
+  const decision = evaluateSemanticPrefilter({
+    channelName: 'Analyse du marché',
+    description: 'Bourse et investissement.',
+  }, NOW);
+  assert.equal(decision.disposition, 'CLASSIFY');
+  assert.ok(decision.matchedSignals.includes('FRENCH_FINANCE'));
+});
+
+test('raw audience counts are projected into the prefilter and can withhold a thin surface', () => {
+  const raw: RawChannelInput = {
+    channel_name: 'Tiny Channel',
+    description: 'Hi',
+    subscriber_count: 5,
+    video_count: 1,
+  };
+  const projected = semanticPrefilterInputFromRaw(raw);
+  assert.equal(projected.subscriberCount, 5);
+  assert.equal(projected.videoCount, 1);
+  assert.equal(evaluateSemanticPrefilter(projected, NOW).disposition, 'WITHHOLD_SEMANTIC');
+});
+
+test('custom env is threaded through the stale and audience thresholds', () => {
+  const input = {
+    channelName: 'Old Hobby',
+    description: 'My random life updates.',
+    latestUploadAt: '2018-01-01T00:00:00Z',
+    uploadsLast365Days: 0,
+  };
+  assert.equal(evaluateSemanticPrefilter(input, NOW, { SEMANTIC_PREFILTER_STALE_DAYS: '0' } as any).disposition, 'CLASSIFY');
+  assert.equal(evaluateSemanticPrefilter(input, NOW, { SEMANTIC_PREFILTER_STALE_DAYS: '1' } as any).disposition, 'WITHHOLD_SEMANTIC');
+  assert.equal(evaluateSemanticPrefilter(input, NOW, { SEMANTIC_PREFILTER_STALE_DAYS: '36500' } as any).disposition, 'CLASSIFY');
 });
 
 test('stale threshold 0 disables the staleness rule', () => {
@@ -117,6 +199,51 @@ test('off mode performs no evaluation and has no behavior change', () => {
   assert.equal(result.skip, false);
   assert.equal(result.decision, undefined);
   assert.equal(semanticPrefilterSnapshot().evaluations, 0);
+});
+
+test('repeated availability probes count one evaluation for the same channel and provider', () => {
+  const env = { SEMANTIC_PREFILTER_MODE: 'shadow' } as any;
+  resetSemanticPrefilterMetricsForTests(env);
+  const raw: RawChannelInput = { channel_name: 'Block World', description: 'Minecraft gameplay walkthrough.' };
+  applySemanticPrefilter(raw, 'gemini_semantic', env);
+  applySemanticPrefilter(raw, 'gemini_semantic', env);
+  applySemanticPrefilter(raw, 'gemini_semantic', env);
+  assert.equal(semanticPrefilterSnapshot().evaluations, 1);
+});
+
+test('each production provider actually withholds an unrelated channel at availability in enforce mode', async () => {
+  const previous = process.env.SEMANTIC_PREFILTER_MODE;
+  process.env.SEMANTIC_PREFILTER_MODE = 'enforce';
+  resetSemanticPrefilterMetricsForTests();
+  try {
+    const refusingClient = { classify: async () => { throw new Error('model must not be called by availability'); } };
+    const providers = [
+      new GeminiSemanticProvider(refusingClient as any),
+      new GroqSemanticProvider(refusingClient as any),
+      new GeminiFreeSemanticProvider(refusingClient as any),
+    ];
+    for (const provider of providers) {
+      const unrelated = provider.availability({
+        channel_name: 'Block World',
+        description: 'Minecraft gameplay walkthrough and speedrun.',
+        video_titles: ['Minecraft episode 1'],
+      });
+      assert.equal(unrelated.availability, 'NOT_APPLICABLE', `${provider.name} must honor enforce mode`);
+      assert.match(String(unrelated.reason), /Semantic prefilter withheld/);
+
+      const finance = provider.availability({
+        channel_name: 'Order Flow Lab',
+        description: 'Day trading futures with risk controls.',
+        video_titles: ['Liquidity sweeps'],
+      });
+      assert.equal(finance.availability, 'AVAILABLE', `${provider.name} must retain finance channels`);
+    }
+    assert.equal(semanticPrefilterSnapshot().enforcedWithholds, providers.length);
+  } finally {
+    if (previous === undefined) delete process.env.SEMANTIC_PREFILTER_MODE;
+    else process.env.SEMANTIC_PREFILTER_MODE = previous;
+    resetSemanticPrefilterMetricsForTests();
+  }
 });
 
 test('mode defaults to shadow and rejects unknown values safely', () => {

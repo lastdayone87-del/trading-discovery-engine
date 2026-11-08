@@ -10,6 +10,24 @@ import type { RawChannelInput } from './evidenceEngine/types';
  * required by both the immutable diagnostics ledger and the semantic result
  * cache (Phase 4).
  */
+
+/**
+ * Deterministic JSON for hashing. Object keys are sorted recursively because
+ * two callers can assemble the same evidence in different insertion order.
+ * Array order is preserved: it carries evidence index/order semantics.
+ */
+export function canonicalJsonStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(item => canonicalJsonStringify(item === undefined ? null : item)).join(',')}]`;
+  }
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record).filter(key => record[key] !== undefined).sort();
+    return `{${keys.map(key => `${JSON.stringify(key)}:${canonicalJsonStringify(record[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
 export function normalizeClassificationInput(input: RawChannelInput): RawChannelInput & { input_checksum: string } {
   const classificationInput: RawChannelInput = { ...input };
   delete classificationInput.job_id;
@@ -22,7 +40,7 @@ export function normalizeClassificationInput(input: RawChannelInput): RawChannel
   };
   return {
     ...stable,
-    input_checksum: createHash('sha256').update(JSON.stringify(stable)).digest('hex')
+    input_checksum: createHash('sha256').update(canonicalJsonStringify(stable)).digest('hex')
   };
 }
 

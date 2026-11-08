@@ -2,12 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
-  SEMANTIC_RESULT_CACHE_VERSION,
+  isCacheableSemanticResult,
   isUsableCachedResult,
+  SEMANTIC_RESULT_CACHE_VERSION,
   resetSemanticResultCacheCircuitForTests,
   semanticResultCacheEnabled,
   semanticResultCacheKey,
 } from './evidenceEngine/semanticResultCache';
+import { canonicalJsonStringify } from './classificationInputChecksum';
 import type { RawChannelInput } from './evidenceEngine/types';
 
 const baseInput: RawChannelInput = {
@@ -28,6 +30,12 @@ const identity = {
   modelVersion: 'model-v1',
   adjudicatorModelVersion: 'model-v2',
   adjudicationEnabled: true,
+};
+
+const complete = {
+  label: 'ACTIVE_TRADING', confidence: 88, supportedLanguage: true,
+  reasonCodes: ['REPEATED_EXECUTION_DISCUSSION'], explanation: 'Futures execution.',
+  concepts: ['risk'], languages: [], citations: [{ field: 'video_title', index: 0 }],
 };
 
 test('semantic cache identity is stable across job/run attribution and input ordering', () => {
@@ -55,6 +63,24 @@ test('semantic cache key changes with evidence, prompt, feature, model, and adju
   assert.notEqual(original, semanticResultCacheKey({ ...identity, adjudicationEnabled: false }).cacheKey);
 });
 
+test('batch and citation-repair prompt versions invalidate cached results', () => {
+  const original = semanticResultCacheKey(identity).cacheKey;
+  assert.notEqual(original, semanticResultCacheKey({ ...identity, batchPromptVersion: 'semantic-batch-array-2' }).cacheKey);
+  assert.notEqual(original, semanticResultCacheKey({ ...identity, repairPromptVersion: 'citation-repair-3' }).cacheKey);
+  assert.notEqual(
+    semanticResultCacheKey({ ...identity, batchPromptVersion: 'semantic-batch-array-1' }).cacheKey,
+    semanticResultCacheKey({ ...identity, batchPromptVersion: 'semantic-batch-array-1', repairPromptVersion: 'citation-repair-2' }).cacheKey,
+  );
+});
+
+test('canonical JSON sorts object keys recursively but preserves array order', () => {
+  assert.equal(
+    canonicalJsonStringify({ b: 1, a: { d: [3, 2], c: 2 } }),
+    canonicalJsonStringify({ a: { c: 2, d: [3, 2] }, b: 1 }),
+  );
+  assert.notEqual(canonicalJsonStringify({ a: [1, 2] }), canonicalJsonStringify({ a: [2, 1] }));
+});
+
 test('semantic cache version is part of the key contract', () => {
   assert.equal(SEMANTIC_RESULT_CACHE_VERSION, 'semantic-result-cache-v1');
   assert.equal(semanticResultCacheKey(identity).cacheKey.length, 64);
@@ -68,17 +94,22 @@ test('semantic cache defaults on and has an explicit rollback switch', () => {
 });
 
 test('structurally corrupt cached rows are treated as misses', () => {
-  const complete = {
-    label: 'ACTIVE_TRADING', confidence: 88, supportedLanguage: true,
-    reasonCodes: ['REPEATED_EXECUTION_DISCUSSION'], explanation: 'Futures execution.',
-    concepts: ['risk'], languages: [], citations: [{ field: 'video_title', index: 0 }],
-  };
   assert.equal(isUsableCachedResult(complete), true);
   assert.equal(isUsableCachedResult({ label: 'ACTIVE_TRADING', citations: [] }), false);
   assert.equal(isUsableCachedResult({ ...complete, confidence: Number.NaN }), false);
+  assert.equal(isUsableCachedResult({ ...complete, confidence: 101 }), false);
   assert.equal(isUsableCachedResult({ ...complete, supportedLanguage: 'yes' }), false);
   assert.equal(isUsableCachedResult({ ...complete, citations: 'none' }), false);
+  assert.equal(isUsableCachedResult({ ...complete, languages: [{ language: 'en', script: 'Latin', confidence: 90, field: 'not_a_field' }] }), false);
+  assert.equal(isUsableCachedResult({ ...complete, citations: [{ field: 'video_title', index: -1 }] }), false);
   assert.equal(isUsableCachedResult(null), false);
+});
+
+test('degenerate and uncited results are never persisted', () => {
+  assert.equal(isCacheableSemanticResult(complete), true);
+  assert.equal(isCacheableSemanticResult({ ...complete, citations: [] }), false);
+  assert.equal(isCacheableSemanticResult({ label: 'AMBIGUOUS' }), false);
+  assert.equal(isCacheableSemanticResult(null), false);
 });
 
 test('all production semantic providers wire the cache and keep injected clients isolated', () => {
@@ -91,7 +122,24 @@ test('all production semantic providers wire the cache and keep injected clients
     assert.match(source, /readSemanticResultCache/, `${file} must read the cache`);
     assert.match(source, /writeSemanticResultCache/, `${file} must write the cache`);
     assert.match(source, /this\.injectedClient \? undefined : await readSemanticResultCache/, `${file} must not let test clients read production cache`);
-    assert.match(source, /if \(!this\.injectedClient\) await writeSemanticResultCache/, `${file} must not let test clients write production cache`);
+    assert.match(source, /if \(!this\.injectedClient && cacheable\) await writeSemanticResultCache/, `${file} must gate cache writes on a structurally valid result`);
+    assert.match(source, /isSemanticResultShape\(/, `${file} must validate the model result before caching`);
     assert.match(source, /SEMANTIC_RESULT_CACHE_HIT_REASON/, `${file} must mark cache hits`);
+    assert.match(source, /fallbackReasonCodes = \[[\s\S]*SEMANTIC_RESULT_CACHE_HIT_REASON/, `${file} must append the cache-hit reason to the result`);
+    assert.match(source, /readSemanticResultCache\(cacheIdentity, process\.env, \{ signal \}\)/, `${file} must bound cache reads by the caller deadline`);
+    assert.match(source, /writeSemanticResultCache\(cacheIdentity,[\s\S]{0,400}process\.env, \{ signal \}\)/, `${file} must bound cache writes by the caller deadline`);
   }
+  const groq = readFileSync('server/evidenceEngine/providers/GroqSemanticProvider.ts', 'utf8');
+  assert.match(groq, /repairPromptVersion: SEMANTIC_CITATION_REPAIR_PROMPT_VERSION/, 'Groq cache identity must include the repair prompt version');
+  assert.match(groq, /batchPromptVersion: semanticBatchConfig\(\)\.enabled \? SEMANTIC_BATCH_PROMPT_VERSION : undefined/, 'Groq cache identity must include the batch prompt version');
+});
+
+test('cache operations are fail-open and deadline-bounded', () => {
+  const source = readFileSync('server/evidenceEngine/semanticResultCache.ts', 'utf8');
+  assert.match(source, /function boundedCacheOperation/, 'cache reads and writes must share a deadline-bound helper');
+  assert.match(source, /DEFAULT_SEMANTIC_RESULT_CACHE_TIMEOUT_MS = 500/);
+  assert.match(source, /signal\?\.addEventListener\('abort', onAbort/, 'cache operations must honor caller cancellation');
+  assert.match(source, /DELETE FROM semantic_classification_cache WHERE cache_key=\$1/, 'invalid rows must be deleted rather than replayed');
+  assert.match(source, /isCacheableSemanticResult\(value\.result\)/, 'writes must reject degenerate results');
+  assert.match(source, /value\.citations\.length > 0/, 'only cited results may be cached');
 });

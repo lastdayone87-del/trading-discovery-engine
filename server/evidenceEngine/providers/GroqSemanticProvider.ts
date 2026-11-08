@@ -11,7 +11,8 @@ import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../se
 import { abortedByDeadline } from './abortReason';
 import { readSemanticResultCache, SEMANTIC_RESULT_CACHE_HIT_REASON, writeSemanticResultCache } from '../semanticResultCache';
 import { applySemanticPrefilter, recordSemanticPrefilterOutcome } from '../../semanticPrefilter';
-import { classifySemanticPrompt } from '../semanticBatch';
+import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, semanticBatchConfig } from '../semanticBatch';
+import { isSemanticResultShape } from '../semanticResultShape';
 import type { EvidenceCategory, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import {
   buildSemanticPrompt,
@@ -802,11 +803,21 @@ function failedGroqOrg(error: unknown, route: GroqRoute): string {
   return label || groqRouteOrg(route);
 }
 
-function groqRequestExtras(env: NodeJS.ProcessEnv = process.env): Record<string, unknown> {
+export const GROQ_MAX_BATCH_COMPLETION_TOKENS = 8192;
+
+/**
+ * Request extras for one Groq completion. A batch call asks the model for one
+ * result object per submitted channel, so the completion allowance scales
+ * with the batch size; the single-call default stays byte-identical. The cap
+ * prevents an operator-configured value from growing an unbounded envelope.
+ */
+function groqRequestExtras(env: NodeJS.ProcessEnv = process.env, batchSize = 1): Record<string, unknown> {
+  const configured = Math.max(1, Math.floor(Number(env.GROQ_MAX_COMPLETION_TOKENS || '800')) || 800);
+  const size = Math.max(1, Math.floor(Number(batchSize) || 1));
   const extras: Record<string, unknown> = {
     temperature: 0,
     response_format: { type: 'json_object' },
-    max_completion_tokens: Math.max(1, Math.floor(Number(env.GROQ_MAX_COMPLETION_TOKENS || '800')) || 800),
+    max_completion_tokens: Math.min(configured * size, Math.max(configured, GROQ_MAX_BATCH_COMPLETION_TOKENS)),
   };
   // Reasoning effort is opt-in per model family: unsupported values 400 on
   // models without reasoning controls, so the default request carries none
@@ -965,7 +976,7 @@ export function defaultClient(
   const timeoutMs = groqTimeoutMs();
   const deadlinesEnabled = groqDeadlinesEnabled();
   const persistedCooldownExpiryMs = deps?.persistedCooldownExpiryMs ?? defaultPersistedCooldownExpiryMs;
-  return { batchGroup: 'groq-semantic', classify: async (prompt, model, observability, signal) => {
+  return { batchGroup: 'groq-semantic', classify: async (prompt, model, observability, signal, options) => {
     // Routes are re-discovered per call so key rotation is config-only. The
     // restricted-route quarantine is applied before the failover so a known
     // dead organization is never retried (or paced) again in this process.
@@ -1036,7 +1047,7 @@ export function defaultClient(
               { role: 'system', content: 'Return only valid JSON matching the requested schema.' },
               { role: 'user', content: boundedPrompt },
             ],
-            ...groqRequestExtras(),
+            ...groqRequestExtras(process.env, options?.batchSize),
           }),
           signal: controller.signal,
         });
@@ -1261,8 +1272,12 @@ export class GroqSemanticProvider implements EvidenceProvider {
       modelVersion: candidateModel,
       adjudicatorModelVersion: adjudicatorModel,
       adjudicationEnabled,
+      batchPromptVersion: semanticBatchConfig().enabled ? SEMANTIC_BATCH_PROMPT_VERSION : undefined,
+      // Repaired citations are part of the cached result, so a change to the
+      // repair prompt must invalidate entries produced by the old prompt.
+      repairPromptVersion: SEMANTIC_CITATION_REPAIR_PROMPT_VERSION,
     };
-    const cached = this.injectedClient ? undefined : await readSemanticResultCache(cacheIdentity);
+    const cached = this.injectedClient ? undefined : await readSemanticResultCache(cacheIdentity, process.env, { signal });
     let result: SemanticModelResult;
     let model: string;
     let fallbackReasonCodes: string[];
@@ -1278,6 +1293,10 @@ export class GroqSemanticProvider implements EvidenceProvider {
     } else {
       const candidatePrompt = buildSemanticPrompt(input, 'CANDIDATE');
       const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel, observability, signal);
+      // Only a complete model reply may be cached. parseSemanticResult turns
+      // a missing/partial reply into an AMBIGUOUS abstention; persisting that
+      // placeholder would replay it for the same evidence indefinitely.
+      let cacheable = isSemanticResultShape(candidate.value);
       result = parseSemanticResult(candidate.value);
       model = candidate.model;
       fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
@@ -1287,17 +1306,25 @@ export class GroqSemanticProvider implements EvidenceProvider {
       // preserved in code (prompt text is unenforceable on model output) and
       // only citations referencing supplied documents are retained; a
       // still-uncited result abstains as before, so unsupported classifications
-      // can never pass this gate.
+      // can never pass this gate. Routed through the batch scheduler so
+      // independent repairs can share one provider call.
       let repairUsed = false;
       let repairedCitations: SemanticModelResult['citations'] | null = null;
       if (isDecisiveButUncited(result)) {
         try {
-          const repaired = parseSemanticResult(await client.classify(buildCitationRepairPrompt(candidatePrompt, result, candidateDocumentRefs(input)), model, observability, signal));
-          const retained = retainSuppliedCitations(repaired.citations, candidateDocumentRefs(input));
-          if (retained.length > 0) {
-            result = { ...result, citations: retained };
-            repairedCitations = retained;
-            repairUsed = true;
+          const repairedValue = await classifySemanticPrompt({ client, prompt: buildCitationRepairPrompt(candidatePrompt, result, candidateDocumentRefs(input)), model, observability, signal });
+          if (isSemanticResultShape(repairedValue)) {
+            const repaired = parseSemanticResult(repairedValue);
+            const retained = retainSuppliedCitations(repaired.citations, candidateDocumentRefs(input));
+            if (retained.length > 0) {
+              result = { ...result, citations: retained };
+              repairedCitations = retained;
+              repairUsed = true;
+            }
+          } else {
+            // A malformed repair is not a usable attribution source; keep the
+            // original abstention and let a later attempt retry.
+            cacheable = false;
           }
         } catch (error) {
           // Repair is best-effort, but cancellation is not a repair failure:
@@ -1317,17 +1344,19 @@ export class GroqSemanticProvider implements EvidenceProvider {
       // on model-name inequality, so identical candidate/adjudicator defaults
       // still adjudicate low-confidence results.
       if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && adjudicationEnabled && !candidate.fallbackUsed) {
-        result = parseSemanticResult(await classifySemanticPrompt({ client, prompt: buildSemanticPrompt(input, 'ADJUDICATION'), model: adjudicatorModel, observability, signal })); model = adjudicatorModel;
+        const adjudicatedValue = await classifySemanticPrompt({ client, prompt: buildSemanticPrompt(input, 'ADJUDICATION'), model: adjudicatorModel, observability, signal });
+        cacheable = cacheable && isSemanticResultShape(adjudicatedValue);
+        result = parseSemanticResult(adjudicatedValue); model = adjudicatorModel;
       }
       // Cache the final verdict after repair/adjudication. Repair provenance
       // is stored explicitly so a cache hit reports the same reason codes.
       // Injected clients are a test/shadow seam and never touch the cache.
-      if (!this.injectedClient) await writeSemanticResultCache(cacheIdentity, {
+      if (!this.injectedClient && cacheable) await writeSemanticResultCache(cacheIdentity, {
         result,
         modelVersion: model,
         fallbackUsed: candidate.fallbackUsed,
         repairPromptVersion: repairSurvived() ? SEMANTIC_CITATION_REPAIR_PROMPT_VERSION : undefined,
-      });
+      }, process.env, { signal });
     }
     // Shadow validation for the Phase 4 prefilter gate. Observability only:
     // it never changes the verdict, and enforce mode records nothing because

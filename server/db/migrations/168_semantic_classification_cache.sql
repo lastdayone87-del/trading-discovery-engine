@@ -7,8 +7,8 @@
 --
 -- Rows are written append-only (ON CONFLICT DO NOTHING). Hits are counted for
 -- observability so operators can measure quota savings before enabling the
--- batch path. A corrupt row is ignored by the reader; it is never treated as
--- evidence.
+-- batch path. A corrupt row is ignored by the reader and deleted; it is never
+-- treated as evidence.
 CREATE TABLE IF NOT EXISTS semantic_classification_cache (
   cache_key TEXT PRIMARY KEY,
   input_checksum TEXT NOT NULL,
@@ -27,8 +27,6 @@ CREATE TABLE IF NOT EXISTS semantic_classification_cache (
   CHECK(jsonb_typeof(result)='object')
 );
 
-CREATE INDEX IF NOT EXISTS idx_semantic_cache_input_checksum
-  ON semantic_classification_cache(input_checksum);
 CREATE INDEX IF NOT EXISTS idx_semantic_cache_created_at
   ON semantic_classification_cache(created_at);
 

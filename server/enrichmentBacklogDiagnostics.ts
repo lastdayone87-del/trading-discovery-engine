@@ -1,8 +1,8 @@
 import { getDb } from './db';
-import { CLASSIFICATION_JOB_TYPE } from './classificationDecoupling';
+import { CLASSIFICATION_JOB_TYPE, resolveEnrichmentWorkerCount } from './classificationDecoupling';
 import { diagnoseEnrichmentBacklog } from './enrichmentBacklogDiagnosis';
 import { semanticPrefilterSnapshot } from './semanticPrefilter';
-import { ENRICHMENT_WORKER_BASELINE, evaluateEnrichmentScaleGate, loadEnrichmentScaleMetrics } from './enrichmentScaleGate';
+import { enrichmentScaleThresholds, evaluateEnrichmentScaleGate, getRunningEnrichmentWorkerCount, loadEnrichmentScaleMetrics } from './enrichmentScaleGate';
 
 /**
  * Build the read-only diagnostic SQL for one queue job type. The job type is a
@@ -183,7 +183,8 @@ export async function getEnrichmentBacklogDiagnostics(requestedLimit=10):Promise
  * database error must never break the existing backlog diagnostic.
  */
 async function phase4Diagnostics():Promise<any>{
-  const requestedWorkers=Math.max(1,Number(process.env.ENRICHMENT_WORKER_CONCURRENCY||ENRICHMENT_WORKER_BASELINE));
+  const requestedWorkers=resolveEnrichmentWorkerCount();
+  const thresholds=enrichmentScaleThresholds();
   let semanticCache:any=null;
   let enrichmentScale:any=null;
   try{
@@ -195,9 +196,9 @@ async function phase4Diagnostics():Promise<any>{
   }
   try{
     const metrics=await loadEnrichmentScaleMetrics();
-    enrichmentScale={metrics,decision:evaluateEnrichmentScaleGate(metrics,undefined,requestedWorkers)};
+    enrichmentScale={runningWorkers:getRunningEnrichmentWorkerCount(),liveDecision:true,metrics,decision:evaluateEnrichmentScaleGate(metrics,thresholds,requestedWorkers)};
   }catch(error){
-    enrichmentScale={unavailable:error instanceof Error?error.message:'unavailable',decision:evaluateEnrichmentScaleGate(undefined,undefined,requestedWorkers)};
+    enrichmentScale={runningWorkers:getRunningEnrichmentWorkerCount(),liveDecision:true,unavailable:error instanceof Error?error.message:'unavailable',decision:evaluateEnrichmentScaleGate(undefined,thresholds,requestedWorkers)};
   }
   return {
     semanticPrefilter:semanticPrefilterSnapshot(),

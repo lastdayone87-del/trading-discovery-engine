@@ -278,6 +278,36 @@ test('valid model content emits exactly one success event with the parsed value'
   }
 });
 
+test('batch calls scale the Groq completion allowance but never beyond the cap', async () => {
+  const bodies: Array<Record<string, unknown>> = [];
+  const savedFetch = globalThis.fetch;
+  const savedKey = process.env.GROQ_API_KEY;
+  const savedTokens = process.env.GROQ_MAX_COMPLETION_TOKENS;
+  delete process.env.GROQ_MAX_COMPLETION_TOKENS;
+  globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
+    bodies.push(JSON.parse(String(init?.body || '{}')));
+    return new Response(JSON.stringify({ choices: [{ message: { content: '{"ok":true}' } }] }), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    });
+  }) as unknown as typeof fetch;
+  process.env.GROQ_API_KEY = 'test-key';
+  try {
+    const client = defaultClient(async () => undefined, { persistedCooldownExpiryMs: async () => undefined });
+    await client!.classify('single', 'model');
+    await client!.classify('batch', 'model', undefined, undefined, { batchSize: 5 });
+    await client!.classify('oversized batch', 'model', undefined, undefined, { batchSize: 100 });
+    assert.equal(bodies[0].max_completion_tokens, 800, 'single-call default must stay unchanged');
+    assert.equal(bodies[1].max_completion_tokens, 4000, 'batch allowance must scale with batch size');
+    assert.equal(bodies[2].max_completion_tokens, 8192, 'batch allowance must stay bounded');
+  } finally {
+    globalThis.fetch = savedFetch;
+    if (savedKey === undefined) delete process.env.GROQ_API_KEY;
+    else process.env.GROQ_API_KEY = savedKey;
+    if (savedTokens === undefined) delete process.env.GROQ_MAX_COMPLETION_TOKENS;
+    else process.env.GROQ_MAX_COMPLETION_TOKENS = savedTokens;
+  }
+});
+
 test('groq-routed classifications populate the semantic audit trail with the serving model', async () => {
   const provider = new GroqSemanticProvider(of(unrelatedResult));
   const [item] = await provider.collectEvidence(input, {} as any);

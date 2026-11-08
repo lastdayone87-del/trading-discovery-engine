@@ -10,6 +10,7 @@ const OPERATIONAL_PROVIDER_REASONS = new Set([
   'PROVIDER_EXECUTION_FAILED',
   'SEMANTIC_DEFERRED_RATE_PRESSURE',
   'GEMINI_CAPACITY_DEFERRED',
+  'GEMINI_ORG_TOKEN_BUCKET_EMPTY',
   // Preserved (not filtered out) so retry scheduling can align with the
   // failed Groq org's cooldown via failedProviderOrg() instead of falling
   // back to a generic delay.
