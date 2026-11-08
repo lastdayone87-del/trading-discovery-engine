@@ -1,4 +1,5 @@
 import { getDb } from './db';
+import { CLASSIFICATION_JOB_TYPE } from './classificationDecoupling';
 import { getYouTubeQuotaDay, getYouTubeQuotaDayStartAt, minutesSinceYouTubeQuotaDayStart } from './youtubeQuotaDay';
 
 export interface AutonomousQuotaSchedulingSnapshot {
@@ -10,7 +11,7 @@ export interface AutonomousQuotaSchedulingSnapshot {
   quotaDay: string;
 }
 
-const QUOTA_DEFERRED_JOB_TYPES = ['SEARCH_YOUTUBE', 'MANUAL_SEARCH_PAGE', 'ENRICH_CHANNEL'];
+const QUOTA_DEFERRED_JOB_TYPES = ['SEARCH_YOUTUBE', 'MANUAL_SEARCH_PAGE', 'ENRICH_CHANNEL', CLASSIFICATION_JOB_TYPE];
 
 /** Queue depth denominator shared by the scheduler snapshot and maintenance
  * recovery. Kept in one place so a resume sweep cannot use a different

@@ -38,7 +38,7 @@ export interface CommunityIntentEvidence {
   extractionConfidence: 'EXPLICIT' | 'INFERRED';
 }
 
-export type ScanStatus = 'PENDING' | 'LOCKED' | 'ENRICHMENT_PENDING' | 'ENRICHING' | 'PROVIDER_DEFERRED' | 'NEEDS_REVIEW' | 'COMPLETED' | 'FAILED' | 'FAILED_PERMANENT' | 'SKIPPED_NON_TRADING' | 'SKIPPED_EXCLUDED' | 'SKIPPED_LOW_AUDIENCE';
+export type ScanStatus = 'PENDING' | 'LOCKED' | 'CLASSIFICATION_PENDING' | 'ENRICHMENT_PENDING' | 'ENRICHING' | 'PROVIDER_DEFERRED' | 'NEEDS_REVIEW' | 'COMPLETED' | 'FAILED' | 'FAILED_PERMANENT' | 'SKIPPED_NON_TRADING' | 'SKIPPED_EXCLUDED' | 'SKIPPED_LOW_AUDIENCE';
 
 export type DiscoverySource = 'manual_search' | 'automated_query' | 'recheck';
 
@@ -380,6 +380,30 @@ export interface QueueStatus {
   discordValidation: { depth: number; isPaused: boolean };
   communityRetry: CommunityRetryAdmissionDiagnostics;
   pendingWork: Array<{ id: string; type: string; waitingReason: string; retryAt: string | null; priority: number; ageMs: number; lastProviderError: string | null }>;
+  /**
+   * Phase 3 classification visibility. Optional for backward compatibility
+   * with older payloads/caches. It never exposes credentials or payload bodies.
+   */
+  classificationQueue?: {
+    pending: number;
+    processing: number;
+    oldestPendingAt: string | null;
+    /** Feature flag state; false still allows old queued jobs to drain. */
+    enabled: boolean;
+    /** Configured global cap on PENDING+PROCESSING classification jobs. */
+    maxPending: number;
+    bySource: Array<{ source: string; pending: number; processing: number; oldestPendingAt: string | null }>;
+  };
+  /**
+   * Search-worker occupancy derived from the PROCESSING claim owners. It never
+   * exposes credentials or payload bodies.
+   */
+  searchWorkers?: {
+    /** Configured search-worker concurrency. */
+    configured: number;
+    /** Search workers currently holding a search job. */
+    busy: number;
+  };
 }
 
 export interface KeyQuotaUsage {

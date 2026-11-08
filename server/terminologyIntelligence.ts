@@ -1923,6 +1923,18 @@ export async function attributeTerminologyPerformance(query: QueryRecord, metric
   const metadata = query.generation_metadata || {};
   const learned = typeof metadata.learnedTerm === 'string' ? normalizeTerm(metadata.learnedTerm) : null;
   if (!learned) return;
+  // A run with durably queued classifications has not resolved those creators
+  // yet. Attribute only the evaluated share now: excluding pending creators
+  // from both the numerator and the denominator prevents zero-yield credit
+  // from demoting a productive term. An all-pending run records an inert
+  // executions=0 row for audit; it cannot move the lifecycle.
+  const pending = Math.max(0, Math.min(metrics.distinctResults, Math.trunc(metrics.classificationPending || 0)));
+  const evaluatedDistinct = Math.max(0, metrics.distinctResults - pending);
+  const evaluatedNewChannels = Math.max(0, metrics.newChannels - Math.min(pending, metrics.newChannels));
+  const evaluatedInScopeNew = metrics.inScopeNewChannels === undefined
+    ? undefined
+    : Math.max(0, metrics.inScopeNewChannels - Math.min(pending, metrics.inScopeNewChannels));
+  const executions = evaluatedDistinct > 0 ? 1 : 0;
   const runner = clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
   if (!runner) return;
   // Same Pool discipline as observe/refresh: the advisory lock, the
@@ -1947,8 +1959,8 @@ export async function attributeTerminologyPerformance(query: QueryRecord, metric
     // Lock order: advisory BEFORE the performance insert below (its FK takes
     // KEY SHARE on the term row). Matches observe/refresh ordering.
     await acquireTerminologyLifecycleLock(Number(row.id), runner);
-    const yieldScore = scopeWeightedYield(metrics.distinctResults, metrics.newChannels, metrics.inScopeNewChannels);
-    await runner.query(`INSERT INTO terminology_performance(canonical_term_id,query_id,retrieval_lane,search_ordering,raw_results,unique_creators,new_creators,confirmed_trading_creators,fresh_confirmed_trading_creators,needs_review_creators,non_trading_creators,wrong_country_creators,communities_discovered,quota_consumed,decayed_yield_score) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`, [row.id, query.id, String(retrievalLane || metadata.retrievalLane || 'UNKNOWN'), String(searchOrdering || metadata.searchOrdering || 'RELEVANCE'), metrics.rawResults, metrics.distinctResults, metrics.newChannels, metrics.tradingConfirmed, Math.max(0, Math.trunc(metrics.freshTradingConfirmed || 0)), metrics.needsReview, metrics.nonTrading, metrics.countryRejected, metrics.communitiesDiscovered, quotaConsumed, yieldScore]);
+    const yieldScore = scopeWeightedYield(evaluatedDistinct, evaluatedNewChannels, evaluatedInScopeNew);
+    await runner.query(`INSERT INTO terminology_performance(canonical_term_id,query_id,retrieval_lane,search_ordering,raw_results,unique_creators,new_creators,confirmed_trading_creators,fresh_confirmed_trading_creators,needs_review_creators,non_trading_creators,wrong_country_creators,communities_discovered,quota_consumed,executions,decayed_yield_score) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`, [row.id, query.id, String(retrievalLane || metadata.retrievalLane || 'UNKNOWN'), String(searchOrdering || metadata.searchOrdering || 'RELEVANCE'), metrics.rawResults, evaluatedDistinct, evaluatedNewChannels, metrics.tradingConfirmed, Math.max(0, Math.trunc(metrics.freshTradingConfirmed || 0)), metrics.needsReview, metrics.nonTrading, metrics.countryRejected, metrics.communitiesDiscovered, quotaConsumed, executions, yieldScore]);
     await refreshTerminologyLifecycle(Number(row.id), DEFAULT_TERMINOLOGY_POLICY, runner);
   }
 }
@@ -1989,7 +2001,7 @@ export async function getPlannerTerminology(country: string, clientOverride?: Qu
   const PLANNER_MAX_SCAN = 1000;
   const terms: Array<{ id: number; term: string; score: number; lifecycle: 'SEARCH_TRIAL' | 'PROVEN_SEARCH_TERM' }> = [];
   const seenTermIds = new Set<number>();
-  const result = await runner.query(`SELECT t.id,t.canonical_term term,t.lifecycle_status,t.term_type,t.country,t.language,COALESCE(AVG(p.decayed_yield_score),0)::float score FROM canonical_trading_terms t LEFT JOIN terminology_performance p ON p.canonical_term_id=t.id WHERE t.country=$1 AND t.search_eligible=true AND t.lifecycle_status IN ('SEARCH_TRIAL','PROVEN_SEARCH_TERM') GROUP BY t.id ORDER BY score DESC,t.last_observed_at DESC NULLS LAST,t.id ASC LIMIT $2`, [canonicalCountry(country), PLANNER_MAX_SCAN]);
+  const result = await runner.query(`SELECT t.id,t.canonical_term term,t.lifecycle_status,t.term_type,t.country,t.language,COALESCE(SUM(p.decayed_yield_score*p.executions)/NULLIF(SUM(p.executions),0),0)::float score FROM canonical_trading_terms t LEFT JOIN terminology_performance p ON p.canonical_term_id=t.id WHERE t.country=$1 AND t.search_eligible=true AND t.lifecycle_status IN ('SEARCH_TRIAL','PROVEN_SEARCH_TERM') GROUP BY t.id ORDER BY score DESC,t.last_observed_at DESC NULLS LAST,t.id ASC LIMIT $2`, [canonicalCountry(country), PLANNER_MAX_SCAN]);
   for (const row of result.rows) {
     if (terms.length >= 50) break;
     const id = Number(row.id);

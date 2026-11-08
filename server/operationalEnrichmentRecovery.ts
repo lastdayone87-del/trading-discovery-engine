@@ -1,4 +1,5 @@
 import type { ChannelRecord } from '../src/types';
+import { CLASSIFICATION_JOB_TYPE } from './classificationDecoupling';
 import { evaluateLowAudienceGate } from './lowAudienceGate';
 import { bumpOperationalEnrichmentRecoveryDuplicateEvent, bumpOperationalEnrichmentRecoveryEnqueued, bumpOperationalEnrichmentRecoveryExhausted } from './operationsTelemetry';
 
@@ -125,13 +126,13 @@ async function runProviderDeferredProjection(
         )
         AND NOT EXISTS (
           SELECT 1 FROM jobs active_job
-           WHERE active_job.type IN('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION')
+           WHERE active_job.type IN('ENRICH_CHANNEL',$2,'POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION')
              AND active_job.status IN('PENDING','PROCESSING')
              AND active_job.payload->>'channelId'=c.channel_id
         )
       ORDER BY c.last_checked ASC NULLS FIRST
       LIMIT $1`,
-    [Math.min(100, Math.max(1, limit))]
+    [Math.min(100, Math.max(1, limit)), CLASSIFICATION_JOB_TYPE]
   );
   let projected = 0;
   for (const row of rows.rows) {
@@ -298,7 +299,7 @@ async function runOperationalEnrichmentReconciliation(
         AND (c.last_checked IS NULL OR c.last_checked < now() - interval '24 hours')
         AND NOT EXISTS (
           SELECT 1 FROM jobs active_job
-           WHERE active_job.type IN('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION')
+           WHERE active_job.type IN('ENRICH_CHANNEL',$2,'POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION')
              AND active_job.status IN('PENDING','PROCESSING')
              AND active_job.payload->>'channelId'=c.channel_id
         )
@@ -309,7 +310,7 @@ async function runOperationalEnrichmentReconciliation(
         )
       ORDER BY reopen_blocked ASC, c.last_checked ASC NULLS FIRST
       LIMIT $1`,
-    [Math.min(100, Math.max(1, limit))]
+    [Math.min(100, Math.max(1, limit)), CLASSIFICATION_JOB_TYPE]
   );
   let reconciled = 0;
   for (const row of rows.rows) {

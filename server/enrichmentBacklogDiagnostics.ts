@@ -1,8 +1,17 @@
 import { getDb } from './db';
+import { CLASSIFICATION_JOB_TYPE } from './classificationDecoupling';
 import { diagnoseEnrichmentBacklog } from './enrichmentBacklogDiagnosis';
 
-export const ENRICHMENT_DIAGNOSTIC_QUERIES = {
-  aggregate: `
+/**
+ * Build the read-only diagnostic SQL for one queue job type. The job type is a
+ * code constant, never user input, and the allow-list keeps the embedded
+ * literal safe. Both queue views share one definition so an aggregate,
+ * throughput, or oldest-query fix cannot drift between them.
+ */
+export function buildEnrichmentDiagnosticQueries(jobType: string) {
+  if (!/^[A-Z][A-Z0-9_]*$/.test(jobType)) throw new Error(`Invalid diagnostic job type: ${jobType}`);
+  return {
+    aggregate: `
     SELECT
       COUNT(*) FILTER (WHERE status='PENDING')::int AS pending,
       COUNT(*) FILTER (WHERE status='PENDING' AND run_after<=now())::int AS runnable,
@@ -13,9 +22,9 @@ export const ENRICHMENT_DIAGNOSTIC_QUERIES = {
       MIN(created_at) FILTER (WHERE status IN ('PENDING','PROCESSING')) AS oldest_noncompleted_created_at,
       MIN(run_after) FILTER (WHERE status='PENDING' AND run_after>now()) AS next_deferred_run_at
     FROM jobs
-    WHERE type='ENRICH_CHANNEL'
+    WHERE type='${jobType}'
   `,
-  throughput: `
+    throughput: `
     WITH windows(label, minutes) AS (VALUES ('15m',15),('1h',60),('6h',360))
     SELECT
       w.label,
@@ -27,14 +36,15 @@ export const ENRICHMENT_DIAGNOSTIC_QUERIES = {
     FROM windows w
     CROSS JOIN jobs j
     LEFT JOIN job_attempts ja ON ja.job_id=j.id
-    WHERE j.type='ENRICH_CHANNEL'
+    WHERE j.type='${jobType}'
     GROUP BY w.label,w.minutes
     ORDER BY w.minutes
   `,
-  oldest: `
+    oldest: `
     SELECT
       j.id::text AS job_id,
       j.payload->>'channelId' AS channel_id,
+      j.payload->>'source' AS source,
       j.status,
       j.created_at,
       j.updated_at,
@@ -73,24 +83,33 @@ export const ENRICHMENT_DIAGNOSTIC_QUERIES = {
       ORDER BY occurred_at DESC
       LIMIT 1
     ) p ON true
-    WHERE j.type='ENRICH_CHANNEL' AND j.status IN ('PENDING','PROCESSING')
+    WHERE j.type='${jobType}' AND j.status IN ('PENDING','PROCESSING')
     ORDER BY j.created_at ASC,j.id ASC
     LIMIT $1
   `
-} as const;
+  } as const;
+}
+
+export const ENRICHMENT_DIAGNOSTIC_QUERIES = buildEnrichmentDiagnosticQueries('ENRICH_CHANNEL');
+export const CLASSIFICATION_DIAGNOSTIC_QUERIES = buildEnrichmentDiagnosticQueries(CLASSIFICATION_JOB_TYPE);
+
 
 export async function getEnrichmentBacklogDiagnostics(requestedLimit=10):Promise<any>{
   const limit=Math.min(Math.max(Number.isFinite(requestedLimit)?Math.trunc(requestedLimit):10,1),50);
   const db=await getDb();
-  const [aggregate,throughput,oldest]=await Promise.all([
+  const [aggregate,throughput,oldest,classificationAggregate,classificationThroughput,classificationOldest]=await Promise.all([
     db.query(ENRICHMENT_DIAGNOSTIC_QUERIES.aggregate),
     db.query(ENRICHMENT_DIAGNOSTIC_QUERIES.throughput),
-    db.query(ENRICHMENT_DIAGNOSTIC_QUERIES.oldest,[limit])
+    db.query(ENRICHMENT_DIAGNOSTIC_QUERIES.oldest,[limit]),
+    db.query(CLASSIFICATION_DIAGNOSTIC_QUERIES.aggregate),
+    db.query(CLASSIFICATION_DIAGNOSTIC_QUERIES.throughput),
+    db.query(CLASSIFICATION_DIAGNOSTIC_QUERIES.oldest,[limit])
   ]);
   const now=Date.now();
-  const jobs=oldest.rows.map((row:any)=>({
+  const mapOldestRows=(rows:any[])=>rows.map((row:any)=>({
     jobId:row.job_id,
     channelId:row.channel_id||null,
+    source:row.source||null,
     status:row.status,
     createdAt:row.created_at,
     updatedAt:row.updated_at,
@@ -129,6 +148,7 @@ export async function getEnrichmentBacklogDiagnostics(requestedLimit=10):Promise
       status:row.status,
       runAfter:new Date(row.run_after).toISOString(),
       runnable:Boolean(row.runnable),
+      attempts:Number(row.attempts||0),
       lockedBy:row.locked_by,
       lockedAt:row.locked_at,
       investigationState:row.investigation_state,
@@ -138,12 +158,19 @@ export async function getEnrichmentBacklogDiagnostics(requestedLimit=10):Promise
       lastError:row.last_error
     },now)
   }));
+  const jobs=mapOldestRows(oldest.rows);
+  const classificationJobs=mapOldestRows(classificationOldest.rows);
   return {
     generatedAt:new Date(now).toISOString(),
     readOnly:true,
     limit,
     aggregate:aggregate.rows[0]||{},
     throughput:throughput.rows,
-    oldest:jobs
+    oldest:jobs,
+    classification:{
+      aggregate:classificationAggregate.rows[0]||{},
+      throughput:classificationThroughput.rows,
+      oldest:classificationJobs
+    }
   };
 }

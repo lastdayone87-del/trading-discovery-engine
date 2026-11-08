@@ -1,7 +1,7 @@
 import type { QueryCollection } from '../src/types';
 import { canPromoteToProven, isContaminatedRun } from './queryQuality/accounting';
 
-export type FunnelOutcome = 'COUNTRY_REJECTED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW' | 'TRADING_CONFIRMED';
+export type FunnelOutcome = 'COUNTRY_REJECTED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW' | 'TRADING_CONFIRMED' | 'CLASSIFICATION_PENDING';
 
 /** Authoritative production threshold for a trading-confirmed creator to count as quality. */
 export const QUALITY_CREATOR_SCORE_THRESHOLD = 55;
@@ -84,6 +84,14 @@ export interface QueryFunnelMetrics {
   needsReview: number;
   tradingConfirmed: number;
   /**
+   * Discoveries whose classification is durably queued. They count as new
+   * creators (persisted, not previously known) so a productive page is not
+   * mistaken for a low-yield page, but they are excluded from `evaluated`
+   * because no semantic verdict exists yet. Later classification reconciles
+   * the persisted sighting to its terminal outcome.
+   */
+  classificationPending?: number;
+  /**
    * Exact intersection of persisted NEW creators and TRADING_CONFIRMED
    * creators for this funnel. Optional for legacy/manual metrics that predate
    * the field; absent means the intersection is unknown and must not be
@@ -132,6 +140,10 @@ export function calculateQueryFunnel(
   const uncertain = count('UNCERTAIN');
   const needsReview = count('NEEDS_REVIEW');
   const tradingConfirmed = count('TRADING_CONFIRMED');
+  const classificationPending = count('CLASSIFICATION_PENDING');
+  // Pending classifications are observations with no semantic verdict yet.
+  // They stay in distinct/new/duplicate accounting (a real provider result)
+  // but must not dilute precision or suggest a trading outcome.
   const evaluated = nonTrading + uncertain + needsReview + tradingConfirmed;
   const persisted = values.filter(value => value.persisted);
   const fresh = values.filter(value => value.persisted && !value.wasKnown);
@@ -156,7 +168,14 @@ export function calculateQueryFunnel(
     ? Math.round(persisted.reduce((sum, value) => sum + value.qualityScore, 0) / persisted.length)
     : 0;
   const noveltyRatio = ratio(values.filter(value => value.persisted && !value.wasKnown).length, values.length);
-  const countryPrecision = ratio(values.length - countryRejected, values.length);
+  // A pending classification has no country verdict. Including it in the
+  // denominator makes a page look more country-accurate than it is, so
+  // precision is measured over evaluated country outcomes only. When nothing
+  // was evaluated, no result is a country miss: report the vacuous neutral
+  // value instead of zero so legacy pagination does not stop on an
+  // unresolved-only page.
+  const countryEvaluated = Math.max(0, values.length - classificationPending);
+  const countryPrecision = countryEvaluated > 0 ? ratio(countryEvaluated - countryRejected, countryEvaluated) : 1;
   const tradingPrecision = ratio(tradingConfirmed, evaluated);
   const qualityYield = ratio(qualityChannels, evaluated);
   const communityYield = ratio(communitiesDiscovered, evaluated);
@@ -182,6 +201,7 @@ export function calculateQueryFunnel(
     uncertain,
     needsReview,
     tradingConfirmed,
+    classificationPending,
     freshTradingConfirmed,
     qualityChannels,
     communitiesDiscovered,
@@ -246,7 +266,12 @@ export function manualSearchContinuationMetrics(input: {
  * based only on observed retrieval outcomes.
  */
 export function isSeverelyContaminatedQuery(metrics: QueryFunnelMetrics): boolean {
-  const evaluated = metrics.distinctResults;
+  // Pending classifications are real observations, but they have no semantic
+  // verdict. Counting them in the evaluated denominator dilutes the
+  // wrong-country and non-trading shares and can let a contaminated query
+  // escape quarantine while its discoveries are still unclassified.
+  const pending = Math.max(0, Math.min(metrics.distinctResults, metrics.classificationPending || 0));
+  const evaluated = metrics.distinctResults - pending;
   if (evaluated < 8) return false;
   // Reuse the recalibrated contamination guard: UNCERTAIN and NEEDS_REVIEW
   // are not evidence of a bad query; only explicit non-trading share,

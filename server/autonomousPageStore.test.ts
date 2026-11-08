@@ -78,7 +78,10 @@ test('run-wide metrics keep the rejected count on the same distinct set as the d
   // Whitespace-tolerant: this branch pretty-prints the returned object, while
   // the contract is the value identity, not the exact formatting.
   assert.match(source,/countryRejected:\s*rejected,/);
-  assert.match(source,/countryPrecision:\s*distinct\s*\?\s*\(distinct\s*-\s*rejected\)\s*\/\s*distinct/);
+  // Pending sightings have no country verdict and stay out of both sides:
+  // the denominator is the run-wide distinct set minus still-pending creators.
+  assert.match(source,/classification_pending/);
+  assert.match(source,/countryPrecision:\s*countryEvaluated\s*\?\s*\(countryEvaluated\s*-\s*rejected\)\s*\/\s*countryEvaluated\s*:\s*1/);
 });
 test('run-wide sightings recompute duplicate metrics even when the distinct total matches', async () => {
   const page = (overrides: Record<string, unknown>) => ({
@@ -111,6 +114,30 @@ test('run-wide sightings recompute duplicate metrics even when the distinct tota
   assert.equal(metrics.duplicateResults, 14);
   assert.equal(metrics.countryRejected, 2);
   assert.equal(metrics.countryPrecision, (6 - 2) / 6);
+});
+test('run-wide metrics exclude still-pending sightings from country precision', async () => {
+  const page = {
+    rawResults: 4, deferredResults: 0, evaluatedRawResults: 4,
+    distinctResults: 4, duplicateResults: 0, knownChannels: 0, newChannels: 4,
+    countryRejected: 0, nonTrading: 0, uncertain: 0, needsReview: 0,
+    tradingConfirmed: 0, qualityChannels: 0, communitiesDiscovered: 0,
+    averageQualityScore: 0, noveltyRatio: 1, countryPrecision: 1,
+    tradingPrecision: 0, performanceScore: 10, classificationPending: 4,
+  };
+  const runner = {
+    query: async (sql: string) => {
+      if (sql.includes('FROM autonomous_query_page_observations')) {
+        return { rows: [{ page_metrics: page, cumulative_unique_creators: 4 }] };
+      }
+      if (sql.includes('COUNT(*)::int AS sightings')) {
+        return { rows: [{ sightings: 4, distinct_creators: 4, country_rejected: 0, classification_pending: 4 }] };
+      }
+      throw new Error(`unexpected query: ${sql.slice(0, 60)}`);
+    },
+  };
+  const metrics = await getAutonomousRunMetrics('run-2', runner);
+  assert.equal(metrics.classificationPending, 4);
+  assert.equal(metrics.countryPrecision, 1, 'no evaluated country outcome means no country miss');
 });
 test('legacy page metrics keep evaluatedRawResults absent through aggregation',()=>{
   const legacy=(overrides: Record<string, unknown> = {})=>({rawResults:10,distinctResults:8,duplicateResults:2,knownChannels:1,newChannels:7,countryRejected:1,nonTrading:1,uncertain:1,needsReview:1,tradingConfirmed:4,qualityChannels:2,communitiesDiscovered:1,averageQualityScore:60,noveltyRatio:.875,countryPrecision:.875,tradingPrecision:.57,performanceScore:60,...overrides});

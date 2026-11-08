@@ -107,6 +107,13 @@ export function shouldReactivateCommunityRecovery(
     return { reactivate: false, reasonCodes: ['SEMANTIC_TERMINAL_EVIDENCE_PRESERVED'] };
   }
 
+  // A terminal classification failure keeps the provisional UNKNOWN country.
+  // Community acquisition on a creator whose country and trading status were
+  // never established would spend Discord/browser work on an unclassified row.
+  if (channel.country?.trim().toUpperCase() === 'UNKNOWN' && channel.country_status === 'UNCERTAIN') {
+    return { reactivate: false, reasonCodes: ['COUNTRY_NOT_ESTABLISHED'] };
+  }
+
   const reasons: string[] = [];
 
   if (isManualRecheck) reasons.push('OPERATOR_NOMINATED_RECHECK');
@@ -434,6 +441,7 @@ export async function reconcileCommunityAcquisitionRecovery(
         AND c.discord_validation_status <> 'COMPLETED'
         AND c.trading_status NOT IN('NON_TRADING','HUMAN_REJECTED')
         AND c.country_status <> 'REJECTED'
+        AND c.country <> 'UNKNOWN'
         AND (
           c.last_checked IS NULL
           OR c.last_checked < now() - interval '30 days'

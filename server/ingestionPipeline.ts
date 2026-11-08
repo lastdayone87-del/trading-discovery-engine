@@ -634,10 +634,40 @@ async function processChannelThroughPipelineInContext(
       trading_status: 'UNCERTAIN'
     };
 
+    // lowAudienceChannel aliases existing, so capture the prior lifecycle
+    // state before the SKIPPED_LOW_AUDIENCE mutation below. Checking
+    // existing.scan_status afterwards would always miss the provisional row.
+    const wasClassificationPending = existing?.scan_status === 'CLASSIFICATION_PENDING';
     lowAudienceChannel.subscriber_count = candidate.subscriberCount;
     lowAudienceChannel.scan_status = 'SKIPPED_LOW_AUDIENCE';
     lowAudienceChannel.trading_status = existing?.trading_status || 'UNCERTAIN';
     lowAudienceChannel.last_checked = now;
+    if (wasClassificationPending) {
+      // A provisional classification row starts as country='UNKNOWN'. The
+      // low-audience branch reuses that row, so the validated creator country
+      // must be projected here or the durable row keeps the placeholder.
+      // Restrict the projection to provisional rows: an uncertain rediscovery
+      // must not downgrade country evidence on a completed channel. Without a
+      // creator country, preserve the prior country/status pair because
+      // downgrading only the status would leave a stale country looking
+      // established to country-gated recovery paths.
+      if (creatorCountry) {
+        const verdictChanged = lowAudienceChannel.country !== creatorCountry
+          || lowAudienceChannel.country_status !== countryVal.status;
+        lowAudienceChannel.country = creatorCountry;
+        lowAudienceChannel.country_status = countryVal.status;
+        lowAudienceChannel.confidence_score = countryVal.score;
+        // A low-audience row can be rediscovered repeatedly while its
+        // classification is queued. Append the validation step only when the
+        // country verdict actually changes so the trail stays bounded.
+        if (verdictChanged) {
+          lowAudienceChannel.inspection_trail = [
+            ...(lowAudienceChannel.inspection_trail || []),
+            countryValidationStep,
+          ];
+        }
+      }
+    }
     applyCandidateObservability(lowAudienceChannel, candidate);
     await upsertChannel(lowAudienceChannel);
 
@@ -647,7 +677,14 @@ async function processChannelThroughPipelineInContext(
       isNew: !existing,
       wasKnown: !!existing,
       persisted: true,
-      countryStatus: countryVal.status,
+      // Report the country evidence that was actually persisted. When no new
+      // creator country is available, the existing country/status pair is
+      // retained, so returning the fresh countryVal.status would disagree
+      // with the durable row (for example CONFIRMED row reported UNCERTAIN).
+      countryStatus: lowAudienceChannel.country_status,
+      detectedCountry: lowAudienceChannel.country_status === 'UNCERTAIN'
+        ? null
+        : lowAudienceChannel.country,
       tradingStatus: lowAudienceChannel.trading_status || 'UNCERTAIN',
       discordStatus: 'NOT_FOUND',
       discordInvite: null,

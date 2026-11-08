@@ -207,7 +207,8 @@ export async function getAutonomousRunMetrics(runId: string, clientOverride?: Pa
     ),
     db.query(`SELECT COUNT(*)::int AS sightings,
       COUNT(DISTINCT channel_id)::int AS distinct_creators,
-      COUNT(DISTINCT channel_id) FILTER (WHERE country_outcome='REJECTED')::int AS country_rejected
+      COUNT(DISTINCT channel_id) FILTER (WHERE country_outcome='REJECTED')::int AS country_rejected,
+      COUNT(DISTINCT channel_id) FILTER (WHERE funnel_outcome='CLASSIFICATION_PENDING')::int AS classification_pending
       FROM channel_sightings WHERE query_run_id=$1`, [runId]),
   ]);
   const metrics = aggregatePageMetrics(r.rows.map(row => {
@@ -227,6 +228,12 @@ export async function getAutonomousRunMetrics(runId: string, clientOverride?: Pa
   if (!sightingCount) return metrics;
   const distinct = Number(sightings.rows[0]?.distinct_creators || 0);
   const rejected = Math.min(distinct, Number(sightings.rows[0]?.country_rejected || 0));
+  // Pending sightings have no country verdict yet. The sighting set is
+  // authoritative run-wide: creators reconciled since the pages were written
+  // are evaluated now, while still-queued creators must stay out of the
+  // country-precision denominator.
+  const classificationPending = Math.min(distinct, Number(sightings.rows[0]?.classification_pending || 0));
+  const countryEvaluated = Math.max(0, distinct - classificationPending);
   const evaluatedRawResults = Number(metrics.evaluatedRawResults ?? Math.max(0, metrics.rawResults - metrics.deferredResults));
   return {
     ...metrics,
@@ -238,8 +245,9 @@ export async function getAutonomousRunMetrics(runId: string, clientOverride?: Pa
     // denominator: the page sum double-counts cross-page repeats, and
     // completeQueryRun recomputes precision from these two fields.
     countryRejected: rejected,
+    classificationPending,
     noveltyRatio: distinct ? metrics.newChannels / distinct : metrics.noveltyRatio,
-    countryPrecision: distinct ? (distinct - rejected) / distinct : metrics.countryPrecision,
+    countryPrecision: countryEvaluated ? (countryEvaluated - rejected) / countryEvaluated : 1,
   };
 }
 
@@ -582,6 +590,16 @@ export function aggregatePageMetrics(pages: QueryFunnelMetrics[]): QueryFunnelMe
   // are clamped so precision cannot go negative.
   const countryRejected = Math.min(distinct, cumulativeCountryRejected ?? sum('countryRejected'));
   const evaluated = sum('nonTrading') + sum('uncertain') + sum('needsReview') + sum('tradingConfirmed');
+  // Carry the queued-classification count through multi-page aggregation. It
+  // must be recomputed run-wide (not merely summed) because a creator can be
+  // pending on more than one page; callers with sighting data override this
+  // with the authoritative distinct count. Absence is preserved for legacy
+  // page sets so downstream attribution can distinguish unknown from zero.
+  const hasClassificationPending = pages.some(page => page.classificationPending !== undefined);
+  const classificationPending = hasClassificationPending
+    ? Math.min(distinct, sum('classificationPending'))
+    : undefined;
+  const countryEvaluated = Math.max(0, distinct - Number(classificationPending || 0));
   // Preserve the field's absence for all-legacy page sets. Materializing a
   // missing optional field as 0 makes run-wide duplicate accounting treat a
   // page with raw results as having none evaluated. Mixed-version runs still
@@ -613,12 +631,13 @@ export function aggregatePageMetrics(pages: QueryFunnelMetrics[]): QueryFunnelMe
     countryRejected, nonTrading: sum('nonTrading'),
     uncertain: sum('uncertain'), needsReview: sum('needsReview'),
     tradingConfirmed: sum('tradingConfirmed'),
+    classificationPending,
     freshTradingConfirmed: hasFreshTradingConfirmed ? sum('freshTradingConfirmed') : undefined,
     qualityChannels: sum('qualityChannels'),
     communitiesDiscovered: sum('communitiesDiscovered'),
     averageQualityScore: weighted('averageQualityScore'),
     noveltyRatio: distinct ? sum('newChannels') / distinct : 0,
-    countryPrecision: distinct ? (distinct - countryRejected) / distinct : 0,
+    countryPrecision: countryEvaluated ? (countryEvaluated - countryRejected) / countryEvaluated : 1,
     tradingPrecision: evaluated ? sum('tradingConfirmed') / evaluated : 0,
     performanceScore: Math.round(weighted('performanceScore')),
   };

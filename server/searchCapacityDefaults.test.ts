@@ -26,10 +26,8 @@ test('explicit SEARCH_WORKER_CONCURRENCY values keep prior validation', () => {
   // fallback applies only when the variable is unset/empty, and
   // Math.max(1, …) still guards explicitly supplied values.
   assert.equal(resolveSearchWorkerCount({ SEARCH_WORKER_CONCURRENCY: '0' }), 1);
-  // Non-numeric input yields NaN out of Number(); startWorkerPool clamps it
-  // to one loop via `Math.floor(NaN) || 1`. Pinned here so the behavior is
-  // documented, not silently changed by the refactor.
-  assert.ok(Number.isNaN(resolveSearchWorkerCount({ SEARCH_WORKER_CONCURRENCY: 'abc' })));
+  // Non-numeric input falls back to the measured default instead of NaN.
+  assert.equal(resolveSearchWorkerCount({ SEARCH_WORKER_CONCURRENCY: 'abc' }), 4);
 });
 
 test('startSearchWorkers consumes the resolver (not a hardcoded 1)', () => {

@@ -51,6 +51,7 @@ import { sanitizeSchedulingError, type DiscoveryCandidateDiagnosticPatch } from 
 import { classifyProviderCapacityFailure, classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
 import { decideQueryRunJobLifecycle, type QueryJobLifecycleStatus, type QueryRunLifecycleStatus } from './queryRunJobLifecycle';
 import { createBriefCache } from './briefCache';
+import { CLASSIFICATION_JOB_TYPE, resolveClassificationDecouplingConfig, resolveSearchWorkerCount, type ClassificationBackpressureState } from './classificationDecoupling';
 import type { SelectionExperimentObservation } from './querySelectionExperiments';
 import {
   currentOfficialYouTubeQuotaOrigin,
@@ -624,6 +625,30 @@ async function ensureCdlHotTableIndexes(client: { query: (text: string, values?:
   }
 }
 
+/**
+ * Migration 168 indexes the maintenance sweep's pending-classification
+ * predicate. `channel_sightings` is a populated hot table, so the runner
+ * builds the index concurrently before the transactional migration, which
+ * only adopts a valid index or verifies an empty table.
+ */
+async function ensureClassificationSightingIndex(client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> }): Promise<void> {
+  const name = 'idx_channel_sightings_classification_pending';
+  const existing = await client.query(`
+    SELECT c.oid, i.indisvalid, i.indisready
+      FROM pg_class c
+      JOIN pg_index i ON i.indexrelid = c.oid
+     WHERE c.oid = to_regclass('public.${name}')
+  `);
+  const row = existing.rows[0];
+  if (row?.indisvalid && row?.indisready) return;
+  if (row?.oid) {
+    await client.query(`DROP INDEX CONCURRENTLY IF EXISTS public.${name}`);
+  }
+  const table = await client.query(`SELECT to_regclass('public.channel_sightings') AS oid`);
+  if (!table.rows[0]?.oid) return;
+  await client.query(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${name} ON public.channel_sightings (observed_at) WHERE funnel_outcome='CLASSIFICATION_PENDING'`);
+}
+
 export async function runMigrations(): Promise<Array<{ version: number; name: string; applied_at: string }>> {
   const db = pool || new Pool({ connectionString: requireDatabaseUrl(), ssl: process.env.PGSSL === 'disable' ? false : process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined });
   const client = await db.connect();
@@ -646,6 +671,8 @@ export async function runMigrations(): Promise<Array<{ version: number; name: st
     if (!migration157.rowCount) await ensureJobsChannelPayloadIndex(client);
     const migration160 = await client.query('SELECT 1 FROM schema_migrations WHERE version=160');
     if (!migration160.rowCount) await ensureJobAttemptsFinishedErrorIndex(client);
+    const migration168 = await client.query('SELECT 1 FROM schema_migrations WHERE version=168');
+    if (!migration168.rowCount) await ensureClassificationSightingIndex(client);
     const files = fs.readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith('.sql')).sort();
     const versions=new Map<number,string>();
     for(const file of files){const version=Number(file.split('_')[0]);const previous=versions.get(version);if(previous)throw new Error(`Duplicate migration version ${version}: ${previous} and ${file}`);versions.set(version,file);}
@@ -947,6 +974,7 @@ export const RECENT_INVITE_ORDER_SQL = 'discord_invite_first_validated_at DESC N
 // channel whose denormalized validation statuses have not yet been refreshed.
 export const OPERATOR_VISIBLE_CHANNEL_SQL = `country_status <> 'REJECTED'
   AND scan_status <> 'SKIPPED_EXCLUDED'
+  AND scan_status <> 'CLASSIFICATION_PENDING'
   AND trading_status <> 'NON_TRADING'
   AND NOT EXISTS (
     SELECT 1 FROM excluded_countries excluded
@@ -1000,7 +1028,8 @@ export function buildChannelListingWhere(defaultServing:{predicate:string;scope:
   const viewingRejectedSlice = !args.diagnosticsOnly && !args.includeRejected && args.countryStatus === 'REJECTED';
   const viewingNonTradingSlice = !args.diagnosticsOnly && !args.includeRejected && args.tradingStatus === 'NON_TRADING';
   const viewingSkippedExcludedSlice = !args.diagnosticsOnly && !args.includeRejected && args.scanStatus === 'SKIPPED_EXCLUDED';
-  const viewingDiagnosticSlice = viewingRejectedSlice || viewingNonTradingSlice || viewingSkippedExcludedSlice;
+  const viewingClassificationPendingSlice = !args.diagnosticsOnly && !args.includeRejected && args.scanStatus === 'CLASSIFICATION_PENDING';
+  const viewingDiagnosticSlice = viewingRejectedSlice || viewingNonTradingSlice || viewingSkippedExcludedSlice || viewingClassificationPendingSlice;
   const clauses=[(args.diagnosticsOnly || viewingDiagnosticSlice)?`NOT (${defaultServing.predicate})`:args.includeRejected?'TRUE':`(${defaultServing.predicate})`]; const values:string[]=[];
   const explicitlyViewingLowAudience=args.scanStatus==='SKIPPED_LOW_AUDIENCE';
   // Diagnostic slices read the rejected corpus deliberately, so the audience
@@ -1161,7 +1190,7 @@ export async function getDashboardOperationalSummary(env:NodeJS.ProcessEnv=proce
   // Stored means every durable channel row; serving eligibility is a separate policy.
   const result=await db.query(`SELECT COUNT(*)::int stored_channels,
     COUNT(*) FILTER(WHERE discord_status IN('ACTIVE','ACTIVE_LOW_VOLUME'))::int active_discords,
-    COUNT(*) FILTER(WHERE scan_status IN('PENDING','LOCKED','ENRICHMENT_PENDING','ENRICHING','NEEDS_REVIEW'))::int pending_scans,
+    COUNT(*) FILTER(WHERE scan_status IN('PENDING','LOCKED','ENRICHMENT_PENDING','ENRICHING','NEEDS_REVIEW','CLASSIFICATION_PENDING'))::int pending_scans,
     (SELECT COUNT(*)::int FROM channel_reviews WHERE state='PENDING') pending_reviews,
     (SELECT COUNT(*)::int FROM channels c WHERE c.discord_discovery_status='NOT_DISCOVERED' AND c.discord_validation_status='NOT_STARTED' AND (c.inspection_trail IS NULL OR c.inspection_trail::text IN ('[]','null')) AND NOT EXISTS(SELECT 1 FROM discord_candidates dc WHERE dc.channel_id=c.channel_id)) legacy_unclassified_channels
     FROM channels`);
@@ -1254,7 +1283,7 @@ export function shouldRetainLockedDiscordProjection(
     &&(proposed.discord_status==='ACTIVE'||proposed.discord_status==='ACTIVE_LOW_VOLUME');
 }
 
-type ChannelUpsertClient = { query: (text: string, params?: unknown[]) => Promise<unknown> };
+type ChannelUpsertClient = { query: (text: string, params?: unknown[]) => Promise<{ rowCount?: number | null }> };
 
 /**
  * Writes the channel row inside the caller's transaction. Kept separate from
@@ -1265,8 +1294,8 @@ type ChannelUpsertClient = { query: (text: string, params?: unknown[]) => Promis
 export async function writeChannelUpsert(
   client: ChannelUpsertClient,
   channel: ChannelRecord,
-  options?: { preserveDiscordOnUpdate?: boolean },
-): Promise<void> {
+  options?: { preserveDiscordOnUpdate?: boolean; insertOnly?: boolean },
+): Promise<number> {
   // Normalize at the persistence boundary: upstream payloads can carry
   // unpaired UTF-16 surrogates, which JSON.stringify preserves and PostgreSQL
   // rejects for json/jsonb columns (and which cannot be encoded as UTF-8 text).
@@ -1285,11 +1314,13 @@ export async function writeChannelUpsert(
     channel.quota_origin,
     currentOfficialYouTubeQuotaOrigin(),
   );
-  await client.query(`INSERT INTO channels (
-  channel_id,channel_name,youtube_url,country,country_status,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,next_check,inspection_trail,subscriber_count,channel_thumbnail_url,quality_score,quality_breakdown,trading_status,trading_confidence_score,trading_category,trading_relevance_breakdown,country_metadata_status,country_metadata_checked_at,public_about_status,public_about_checked_at,public_about_attempts,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,scope_eligibility,community_discovery_status,community_intents,discord_duplicate_owner_channel_id,quota_origin,updated_at
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$50,now())
-ON CONFLICT(channel_id) DO UPDATE SET
-  channel_name=excluded.channel_name,youtube_url=excluded.youtube_url,country=excluded.country,country_status=excluded.country_status,confidence_score=excluded.confidence_score,${preserveDiscordOnConflictSql('discord_status')},${preserveDiscordOnConflictSql('discord_invite')},scan_status=excluded.scan_status,scan_attempts=excluded.scan_attempts,discovery_source=excluded.discovery_source,last_checked=excluded.last_checked,next_check=excluded.next_check,inspection_trail=excluded.inspection_trail,subscriber_count=excluded.subscriber_count,channel_thumbnail_url=excluded.channel_thumbnail_url,quality_score=excluded.quality_score,quality_breakdown=excluded.quality_breakdown,trading_status=excluded.trading_status,trading_confidence_score=excluded.trading_confidence_score,trading_category=excluded.trading_category,trading_relevance_breakdown=excluded.trading_relevance_breakdown,country_metadata_status=excluded.country_metadata_status,country_metadata_checked_at=excluded.country_metadata_checked_at,public_about_status=excluded.public_about_status,public_about_checked_at=excluded.public_about_checked_at,public_about_attempts=excluded.public_about_attempts,latest_upload_at=excluded.latest_upload_at,uploads_last_30_days=excluded.uploads_last_30_days,uploads_last_90_days=excluded.uploads_last_90_days,uploads_last_365_days=excluded.uploads_last_365_days,activity_band=excluded.activity_band,activity_score=excluded.activity_score,activity_observed_at=excluded.activity_observed_at,${preserveDiscordOnConflictSql('discord_discovery_status')},${preserveDiscordOnConflictSql('discord_candidate_locator')},${preserveDiscordOnConflictSql('discord_candidate_id')},${preserveDiscordOnConflictSql('discord_candidate_raw_locator')},${preserveDiscordOnConflictSql('discord_candidate_type')},${preserveDiscordOnConflictSql('discord_resolution_status')},${preserveDiscordOnConflictSql('discord_liveness_status')},${preserveDiscordOnConflictSql('discord_relevance_status')},${preserveDiscordOnConflictSql('discord_validation_status')},scope_eligibility=excluded.scope_eligibility,community_discovery_status=excluded.community_discovery_status,community_intents=excluded.community_intents,${preserveDiscordOnConflictSql('discord_duplicate_owner_channel_id')},quota_origin=channels.quota_origin,updated_at=now()`, [
+  const insertOnly = options?.insertOnly === true;
+  // `$49` is the preserve-Discord flag; it only exists in the DO UPDATE
+  // branch. The insert-only statement must therefore use a contiguous
+  // parameter list, or PostgreSQL cannot infer the type of the unused slot
+  // and rejects every provisional insert.
+  const quotaOriginPlaceholder = insertOnly ? '$49' : '$50';
+  const queryParams: unknown[] = [
   channel.channel_id, channel.channel_name, channel.youtube_url, channel.country, channel.country_status, channel.confidence_score || 0,
   channel.discord_status, channel.discord_invite || null, channel.scan_status, channel.scan_attempts || 0, channel.discovery_source,
   channel.first_seen || new Date().toISOString(), channel.last_checked || null, null, stringifyWellFormedJson(channel.inspection_trail || []),
@@ -1302,7 +1333,162 @@ ON CONFLICT(channel_id) DO UPDATE SET
   channel.latest_upload_at || null, channel.uploads_last_30_days || 0, channel.uploads_last_90_days || 0,
   channel.uploads_last_365_days || 0, channel.activity_band || 'UNKNOWN', channel.activity_score ?? 50,
   channel.activity_observed_at || null,channel.discord_discovery_status||'NOT_DISCOVERED',channel.discord_candidate_locator||null,channel.discord_candidate_id||null,channel.discord_candidate_raw_locator||null,channel.discord_candidate_type||null,channel.discord_resolution_status||'NOT_ATTEMPTED',channel.discord_liveness_status||'NOT_CHECKED',channel.discord_relevance_status||'NOT_CHECKED',channel.discord_validation_status||'NOT_STARTED',scopeEligibility,channel.community_discovery_status||'NONE',stringifyWellFormedJson(channel.community_intents||[]),channel.discord_duplicate_owner_channel_id||null,options?.preserveDiscordOnUpdate===true,persistedOrigin
-  ]);
+  ];
+  if (insertOnly) queryParams.splice(48, 1);
+  const result = await client.query(`INSERT INTO channels (
+  channel_id,channel_name,youtube_url,country,country_status,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,next_check,inspection_trail,subscriber_count,channel_thumbnail_url,quality_score,quality_breakdown,trading_status,trading_confidence_score,trading_category,trading_relevance_breakdown,country_metadata_status,country_metadata_checked_at,public_about_status,public_about_checked_at,public_about_attempts,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,scope_eligibility,community_discovery_status,community_intents,discord_duplicate_owner_channel_id,quota_origin,updated_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,${quotaOriginPlaceholder},now())
+${options?.insertOnly === true ? 'ON CONFLICT(channel_id) DO NOTHING' : `ON CONFLICT(channel_id) DO UPDATE SET
+  channel_name=excluded.channel_name,youtube_url=excluded.youtube_url,country=excluded.country,country_status=excluded.country_status,confidence_score=excluded.confidence_score,${preserveDiscordOnConflictSql('discord_status')},${preserveDiscordOnConflictSql('discord_invite')},scan_status=excluded.scan_status,scan_attempts=excluded.scan_attempts,discovery_source=excluded.discovery_source,last_checked=excluded.last_checked,next_check=excluded.next_check,inspection_trail=excluded.inspection_trail,subscriber_count=excluded.subscriber_count,channel_thumbnail_url=excluded.channel_thumbnail_url,quality_score=excluded.quality_score,quality_breakdown=excluded.quality_breakdown,trading_status=excluded.trading_status,trading_confidence_score=excluded.trading_confidence_score,trading_category=excluded.trading_category,trading_relevance_breakdown=excluded.trading_relevance_breakdown,country_metadata_status=excluded.country_metadata_status,country_metadata_checked_at=excluded.country_metadata_checked_at,public_about_status=excluded.public_about_status,public_about_checked_at=excluded.public_about_checked_at,public_about_attempts=excluded.public_about_attempts,latest_upload_at=excluded.latest_upload_at,uploads_last_30_days=excluded.uploads_last_30_days,uploads_last_90_days=excluded.uploads_last_90_days,uploads_last_365_days=excluded.uploads_last_365_days,activity_band=excluded.activity_band,activity_score=excluded.activity_score,activity_observed_at=excluded.activity_observed_at,${preserveDiscordOnConflictSql('discord_discovery_status')},${preserveDiscordOnConflictSql('discord_candidate_locator')},${preserveDiscordOnConflictSql('discord_candidate_id')},${preserveDiscordOnConflictSql('discord_candidate_raw_locator')},${preserveDiscordOnConflictSql('discord_candidate_type')},${preserveDiscordOnConflictSql('discord_resolution_status')},${preserveDiscordOnConflictSql('discord_liveness_status')},${preserveDiscordOnConflictSql('discord_relevance_status')},${preserveDiscordOnConflictSql('discord_validation_status')},scope_eligibility=excluded.scope_eligibility,community_discovery_status=excluded.community_discovery_status,community_intents=excluded.community_intents,${preserveDiscordOnConflictSql('discord_duplicate_owner_channel_id')},quota_origin=channels.quota_origin,updated_at=now()`}`, queryParams);
+  return result.rowCount || 0;
+}
+
+/**
+ * Insert-only channel write for Phase 3 provisional classification rows.
+ *
+ * A search worker only needs a durable row so the classification job has an
+ * authoritative quota origin and page accounting can count the creator. It
+ * must never overwrite a classification that a concurrent worker already
+ * committed: `ON CONFLICT DO NOTHING` makes the insert a no-op in that case.
+ */
+export async function insertChannelIfAbsent(channel: ChannelRecord): Promise<boolean> {
+  const db = await getDb();
+  const client = await db.connect();
+  try {
+    const inserted = await writeChannelUpsert(client, channel, { insertOnly: true });
+    return inserted > 0;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Removes a provisional row only when classification produced no persisted
+ * verdict (for example the retrieval triage withheld the candidate). The
+ * guard proves the row is still the untouched placeholder created by the
+ * search worker; a row any other writer enriched is preserved.
+ */
+export async function deleteClassificationPlaceholder(channelId: string): Promise<boolean> {
+  const db = await getDb();
+  const result = await db.query(
+    `DELETE FROM channels
+      WHERE channel_id=$1
+        AND scan_status='CLASSIFICATION_PENDING'
+        AND trading_status='UNCERTAIN'
+        AND country_status='UNCERTAIN'`,
+    [channelId],
+  );
+  return (result.rowCount || 0) > 0;
+}
+
+/**
+ * Project a terminal classification failure without clobbering a verdict that
+ * another worker committed after this job read the row. The update is a single
+ * conditional statement against the untouched placeholder; the caller must
+ * re-read the authoritative row before reconciling sightings.
+ */
+export async function projectClassificationFailureIfPending(
+  channelId: string,
+  attempts: number,
+  scanStatus: 'FAILED' | 'PROVIDER_DEFERRED',
+): Promise<boolean> {
+  const db = await getDb();
+  const result = await db.query(
+    `UPDATE channels
+        SET scan_status=$2,trading_status='UNCERTAIN',scan_attempts=GREATEST(scan_attempts,$3),last_checked=now(),updated_at=now()
+      WHERE channel_id=$1
+        AND scan_status='CLASSIFICATION_PENDING'
+        AND trading_status='UNCERTAIN'
+        AND country_status='UNCERTAIN'
+      RETURNING channel_id`,
+    [channelId, scanStatus, Math.max(0, Math.trunc(attempts) || 0)],
+  );
+  return (result.rowCount || 0) > 0;
+}
+
+/**
+ * Durable classification backpressure for one query scope. Counts include
+ * PENDING and PROCESSING jobs so a burst cannot overrun the cap simply by
+ * having already been claimed.
+ */
+export async function getClassificationBackpressureState(queryScopeKey: string): Promise<ClassificationBackpressureState> {
+  const config = resolveClassificationDecouplingConfig();
+  const db = await getDb();
+  const result = await db.query(
+    `SELECT COUNT(*)::int AS global_pending,
+       COUNT(*) FILTER (WHERE payload->>'queryScopeKey'=$1)::int AS scoped_pending
+       FROM jobs
+      WHERE type=$2 AND status IN ('PENDING','PROCESSING')`,
+    [queryScopeKey, CLASSIFICATION_JOB_TYPE],
+  );
+  return {
+    globalPending: Number(result.rows[0]?.global_pending || 0),
+    scopedPending: Number(result.rows[0]?.scoped_pending || 0),
+    maxPending: config.maxPending,
+    maxPerQuery: config.maxPerQuery,
+  };
+}
+
+/** True while a durable classification for this channel is still claimable. */
+export async function hasActiveClassificationJob(channelId: string): Promise<boolean> {
+  const db = await getDb();
+  const result = await db.query(
+    `SELECT 1 FROM jobs WHERE type=$1 AND status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$2 LIMIT 1`,
+    [CLASSIFICATION_JOB_TYPE, channelId],
+  );
+  return (result.rowCount || 0) > 0;
+}
+
+/**
+ * Delayed query learning: classification completes after the search run has
+ * already been closed, so the page's provisional sighting is reconciled to the
+ * creator's real terminal outcome. Every pending sighting for this channel is
+ * updated (a shared durable job may serve sightings from several runs), and
+ * query-quality selection reads sightings rather than the historical page
+ * counters, so correctness improves without double-counting page aggregates.
+ */
+export async function reconcileClassificationSighting(input: {
+  channelId: string;
+  funnelOutcome: string;
+  countryOutcome: string;
+  tradingOutcome: string;
+  persisted: boolean;
+  jobId?: string;
+  metadata?: Record<string, unknown>;
+}): Promise<number> {
+  const db = await getDb();
+  const result = await db.query(
+    `UPDATE channel_sightings
+        SET funnel_outcome=$2,country_outcome=$3,trading_outcome=$4,persisted=$5,
+            metadata=(metadata - 'reconciledBy')||$6::jsonb
+      WHERE channel_id=$1
+        AND (
+          funnel_outcome='CLASSIFICATION_PENDING'
+          -- A maintenance sweep may finalize a sighting in the same instant a
+          -- new classification is admitted. Let the newer authoritative job
+          -- verdict revise that sweep-only projection once, inside a short
+          -- window, then clear the marker so later jobs never rewrite
+          -- historical sweep rows from unrelated runs.
+          OR (
+            metadata->>'reconciledBy'='MAINTENANCE_SWEEP'
+            AND COALESCE((metadata->>'classificationReconciledAt')::timestamptz, observed_at)
+              > now()-interval '1 hour'
+          )
+        )`,
+    [
+      input.channelId,
+      input.funnelOutcome,
+      input.countryOutcome,
+      input.tradingOutcome,
+      input.persisted,
+      JSON.stringify({
+        classificationReconciledAt: new Date().toISOString(),
+        ...(input.jobId ? { classificationJobId: input.jobId } : {}),
+        ...(input.metadata || {}),
+      }),
+    ],
+  );
+  return result.rowCount || 0;
 }
 
 export async function upsertChannel(channel: ChannelRecord, options?: { preserveDiscordOnUpdate?: boolean; allowDiscordClear?: boolean; freshDiscordValidation?: boolean }): Promise<void> {
@@ -1343,6 +1529,76 @@ export async function upsertChannel(channel: ChannelRecord, options?: { preserve
   } finally {
     client.release();
   }
+}
+
+/**
+ * Delayed reconciliation sweep for provisional sightings that a classification
+ * job could not update itself (for example a completion racing the search
+ * worker's page-end sighting insert, or a crashed reconciliation). Only
+ * definitive channel projections are applied; placeholders with no active job
+ * stay pending so a later-day classification can still fill in the truth.
+ */
+export async function reconcileStaleClassificationSightings(limit = 200): Promise<{reconciled:number;orphaned:number}> {
+  const db = await getDb();
+  const bounded = Math.min(Math.max(Math.trunc(Number(limit) || 200), 1), 1000);
+  const stale = await db.query(
+    `WITH stale AS (
+       SELECT s.id
+         FROM channel_sightings s
+         JOIN channels c ON c.channel_id=s.channel_id
+        WHERE s.funnel_outcome='CLASSIFICATION_PENDING'
+          AND s.observed_at > now()-interval '14 days'
+          AND c.scan_status <> 'CLASSIFICATION_PENDING'
+          AND NOT EXISTS (
+            SELECT 1 FROM jobs j
+             WHERE j.type=$2 AND j.status IN ('PENDING','PROCESSING')
+               AND j.payload->>'channelId'=s.channel_id
+          )
+        ORDER BY s.observed_at, s.id
+        LIMIT $1
+     )
+     UPDATE channel_sightings s
+        SET funnel_outcome=CASE
+              WHEN c.country_status='REJECTED' THEN 'COUNTRY_REJECTED'
+              WHEN c.trading_status IN ('HUMAN_REJECTED','NON_TRADING') THEN 'NON_TRADING'
+              WHEN c.trading_status IS NULL THEN 'UNCERTAIN'
+              ELSE c.trading_status
+            END,
+            country_outcome=c.country_status,
+            trading_outcome=COALESCE(c.trading_status,'UNCERTAIN'),
+            persisted=true,
+            metadata=s.metadata||jsonb_build_object('classificationReconciledAt',now()::text,'reconciledBy','MAINTENANCE_SWEEP')
+       FROM stale, channels c
+      WHERE s.id=stale.id AND c.channel_id=s.channel_id`,
+    [String(bounded), CLASSIFICATION_JOB_TYPE],
+  );
+  // A withheld candidate has no channel row by design (the search worker's
+  // placeholder is deleted). Reconcile those after a grace period once no
+  // classification is in flight, so they cannot stay pending forever.
+  const orphaned = await db.query(
+    `WITH orphans AS (
+       SELECT s.id
+         FROM channel_sightings s
+        WHERE s.funnel_outcome='CLASSIFICATION_PENDING'
+          AND s.observed_at < now()-interval '5 minutes'
+          AND s.observed_at > now()-interval '14 days'
+          AND NOT EXISTS (SELECT 1 FROM channels c WHERE c.channel_id=s.channel_id)
+          AND NOT EXISTS (
+            SELECT 1 FROM jobs j
+             WHERE j.type=$1 AND j.status IN ('PENDING','PROCESSING')
+               AND j.payload->>'channelId'=s.channel_id
+          )
+        ORDER BY s.observed_at, s.id
+        LIMIT $2
+     )
+     UPDATE channel_sightings s
+        SET funnel_outcome='UNCERTAIN',persisted=false,
+            metadata=s.metadata||jsonb_build_object('classificationReconciledAt',now()::text,'reconciledBy','MAINTENANCE_SWEEP')
+       FROM orphans
+      WHERE s.id=orphans.id`,
+    [CLASSIFICATION_JOB_TYPE, String(bounded)],
+  );
+  return { reconciled: stale.rowCount || 0, orphaned: orphaned.rowCount || 0 };
 }
 
 export async function getCountryVocabularies(): Promise<CountryVocabulary[]> {
@@ -1400,12 +1656,43 @@ async function loadQueueStatus(): Promise<QueueStatus> {
     MIN(locked_at) FILTER (WHERE status='PROCESSING') AS oldest_processing_at
     FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND status IN ('PENDING','PROCESSING')`);
   const retry=retryDiagnostics.rows[0]||{};
+  const [classificationRows, searchWorkerRows] = await Promise.all([
+    db.query(
+      `SELECT status, COALESCE(payload->>'source','UNKNOWN') AS source, COUNT(*)::int AS count, MIN(created_at) AS oldest_created_at
+         FROM jobs WHERE type=$1 AND status IN ('PENDING','PROCESSING')
+        GROUP BY status, COALESCE(payload->>'source','UNKNOWN')`,
+      [CLASSIFICATION_JOB_TYPE],
+    ),
+    db.query(`SELECT COUNT(DISTINCT locked_by)::int AS busy FROM jobs WHERE status='PROCESSING' AND type IN ('SEARCH_YOUTUBE','MANUAL_SEARCH_PAGE')`),
+  ]);
+  const classificationConfig = resolveClassificationDecouplingConfig();
+  const classificationBySource = new Map<string, { source: string; pending: number; processing: number; oldestPendingAt: string | null }>();
+  let classificationPending = 0;
+  let classificationProcessing = 0;
+  let classificationOldestPendingAt: string | null = null;
+  for (const row of classificationRows.rows) {
+    const count = Number(row.count || 0);
+    const sourceKey = String(row.source || 'UNKNOWN');
+    const bucket = classificationBySource.get(sourceKey) || { source: sourceKey, pending: 0, processing: 0, oldestPendingAt: null };
+    const createdAt = iso(row.oldest_created_at);
+    if (row.status === 'PENDING') {
+      classificationPending += count;
+      bucket.pending += count;
+      if (createdAt && (!bucket.oldestPendingAt || createdAt < bucket.oldestPendingAt)) bucket.oldestPendingAt = createdAt;
+      if (createdAt && (!classificationOldestPendingAt || createdAt < classificationOldestPendingAt)) classificationOldestPendingAt = createdAt;
+    } else if (row.status === 'PROCESSING') {
+      classificationProcessing += count;
+      bucket.processing += count;
+    }
+    classificationBySource.set(sourceKey, bucket);
+  }
+  const searchConfigured = resolveSearchWorkerCount() + Math.max(1, Number(process.env.MANUAL_SEARCH_WORKER_CONCURRENCY || 1));
   const duePending=Number(retry.due_pending||0);
   const dueBrowserBlocked=browserCapabilityIsUnavailable()?Number(retry.due_browser_blocked||0):0;
   const dueReconciliationBlocked=Number(retry.due_reconciliation_blocked||0);
   const now=Date.now();
   const pendingWork=pending.rows.map(r=>({id:r.id,type:r.type,status:r.status,priority:r.priority||0,ageMs:Math.max(0,now-new Date(r.created_at).getTime()),waitingReason:r.status==='PROCESSING'?'waiting_for_worker':String(r.last_error||'').match(/BROWSER_RUNTIME_UNAVAILABLE/i)?'waiting_for_browser_runtime':new Date(r.run_after).getTime()>now?(String(r.last_error||'').match(/rate.?limit|429/i)?'waiting_for_youtube_rate_limit':String(r.last_error||'').match(/quota|provider.*cool/i)?'waiting_for_quota':'retry_at'):'waiting_for_worker',retryAt:r.status==='PENDING'&&new Date(r.run_after).getTime()>now?iso(r.run_after):null,lastProviderError:r.last_error||null}));
-  return { searchJobs:{depth:typeCount(['SEARCH_YOUTUBE','MANUAL_SEARCH_PAGE','AUTONOMOUS_DISCOVERY_CYCLE']),isPaused:!!paused.search_jobs}, channelProcessing:{depth:typeCount(['PROCESS_CHANNEL','ENRICH_CHANNEL']),isPaused:!!paused.channel_processing}, discordValidation:{depth:typeCount(['INSPECT_DISCORD']),isPaused:!!paused.discord_validation}, communityRetry:{duePending,dueBrowserBlocked,dueReconciliationBlocked,dueClaimable:Math.max(0,duePending-dueBrowserBlocked-dueReconciliationBlocked),processing:Number(retry.processing||0),staleProcessing:Number(retry.stale_processing||0),oldestDueAt:iso(retry.oldest_due_at),oldestProcessingAt:iso(retry.oldest_processing_at)},pendingWork };
+  return { searchJobs:{depth:typeCount(['SEARCH_YOUTUBE','MANUAL_SEARCH_PAGE','AUTONOMOUS_DISCOVERY_CYCLE']),isPaused:!!paused.search_jobs}, channelProcessing:{depth:typeCount(['PROCESS_CHANNEL','ENRICH_CHANNEL']),isPaused:!!paused.channel_processing}, discordValidation:{depth:typeCount(['INSPECT_DISCORD']),isPaused:!!paused.discord_validation}, communityRetry:{duePending,dueBrowserBlocked,dueReconciliationBlocked,dueClaimable:Math.max(0,duePending-dueBrowserBlocked-dueReconciliationBlocked),processing:Number(retry.processing||0),staleProcessing:Number(retry.stale_processing||0),oldestDueAt:iso(retry.oldest_due_at),oldestProcessingAt:iso(retry.oldest_processing_at)},pendingWork,classificationQueue:{pending:classificationPending,processing:classificationProcessing,oldestPendingAt:classificationOldestPendingAt,enabled:classificationConfig.enabled,maxPending:classificationConfig.maxPending,bySource:[...classificationBySource.values()].sort((a,b)=>a.source.localeCompare(b.source))},searchWorkers:{configured:searchConfigured,busy:Number(searchWorkerRows.rows[0]?.busy||0)} };
 }
 
 /**
@@ -1439,11 +1726,14 @@ export async function getQueueStatusFresh(): Promise<QueueStatus> {
  * Fresh production-depth read for recovery admission. This deliberately
  * bypasses the brief status cache: recovery work must not be admitted from a
  * backlog snapshot taken before newly arrived production jobs. The type set
- * matches the searchJobs + channelProcessing depths reported by queue status.
+ * covers the searchJobs, channelProcessing, and classificationQueue depths
+ * reported by queue status. Classification is included intentionally: recovery
+ * must not compete with a live discovery backlog that is still being
+ * classified, even before those jobs reach ENRICH_CHANNEL.
  */
 export async function getProductionBacklogDepth(): Promise<number> {
   const db=await getDb();
-  const res=await db.query(`SELECT COUNT(*)::int AS count FROM jobs WHERE status IN ('PENDING','PROCESSING') AND type IN ('SEARCH_YOUTUBE','MANUAL_SEARCH_PAGE','AUTONOMOUS_DISCOVERY_CYCLE','PROCESS_CHANNEL','ENRICH_CHANNEL')`);
+  const res=await db.query(`SELECT COUNT(*)::int AS count FROM jobs WHERE status IN ('PENDING','PROCESSING') AND type IN ('SEARCH_YOUTUBE','MANUAL_SEARCH_PAGE','AUTONOMOUS_DISCOVERY_CYCLE','PROCESS_CHANNEL','ENRICH_CHANNEL',$1)`,[CLASSIFICATION_JOB_TYPE]);
   return Number(res.rows[0]?.count||0);
 }
 
@@ -4405,6 +4695,8 @@ export async function completeQueryRun(runId: string, metrics: {
   uncertain: number;
   needsReview: number;
   tradingConfirmed: number;
+  /** Observations whose classification job is still queued; never a verdict. */
+  classificationPending?: number;
   /** Exact fresh ∩ trading-confirmed count; absent on legacy callers. */
   freshTradingConfirmed?: number;
   uniqueChannels: number;
@@ -4541,11 +4833,15 @@ export async function completeQueryRun(runId: string, metrics: {
         knownChannels: metrics.knownChannels, newChannels: metrics.newChannels, inScopeNewChannels: metrics.inScopeNewChannels, countryRejected: metrics.countryRejected,
         nonTrading: metrics.nonTrading, uncertain: metrics.uncertain, needsReview: metrics.needsReview,
         tradingConfirmed: metrics.tradingConfirmed,
+        classificationPending: metrics.classificationPending,
         freshTradingConfirmed: metrics.freshTradingConfirmed ?? 0,
         qualityChannels: metrics.qualityChannels,
         communitiesDiscovered: metrics.communitiesDiscovered, averageQualityScore: metrics.averageQualityScore || 0,
         noveltyRatio: metrics.distinctResults ? metrics.newChannels / metrics.distinctResults : 0,
-        countryPrecision: metrics.distinctResults ? (metrics.distinctResults - metrics.countryRejected) / metrics.distinctResults : 0,
+        countryPrecision: (() => {
+          const evaluatedCountry = Math.max(0, metrics.distinctResults - (metrics.classificationPending || 0));
+          return evaluatedCountry ? (evaluatedCountry - metrics.countryRejected) / evaluatedCountry : 1;
+        })(),
         tradingPrecision: (metrics.nonTrading + metrics.uncertain + metrics.needsReview + metrics.tradingConfirmed) ? metrics.tradingConfirmed / (metrics.nonTrading + metrics.uncertain + metrics.needsReview + metrics.tradingConfirmed) : 0,
         performanceScore: metrics.performanceScore || 0,
         qualityVector,

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { decayWeight, decideLifecycle, getTerminologyDashboard, inferScript, normalizeTerm } from './terminologyIntelligence';
+import { decayWeight, decideLifecycle, getPlannerTerminology, getTerminologyDashboard, inferScript, normalizeTerm } from './terminologyIntelligence';
 import { normalizeNativeTerm } from './countryNativeIntelligence';
 
 test('normalization is Unicode-safe and stable across whitespace variants', () => {
@@ -81,4 +81,23 @@ test('terminology dashboard projects the weighted yield before aggregating the d
   assert.match(capturedSql, /SUM\(weighted_yield_total\)\/NULLIF\(SUM\(executions\),0\)/);
   const derivedRelation = capturedSql.match(/FROM \(SELECT ([\s\S]+?) FROM terminology_performance/)?.[1] || '';
   assert.match(derivedRelation, /weighted_yield_total/);
+});
+
+test('planner ranks by execution-weighted yield so inert audit rows cannot lower a term', async () => {
+  let capturedSql = '';
+  const runner = {
+    async query(sql: string) {
+      capturedSql = sql;
+      return { rows: [] };
+    }
+  } as any;
+
+  await getPlannerTerminology('Germany', runner, { isKillSwitchActive: async () => false });
+
+  // A run whose classifications are all queued writes an inert executions=0
+  // audit row. A bare AVG would count each zero and dilute (or invert) the
+  // term's rank, so the planner uses the same executions-weighted average as
+  // lifecycle refresh.
+  assert.match(capturedSql, /SUM\(p\.decayed_yield_score\*p\.executions\)\/NULLIF\(SUM\(p\.executions\),0\)/);
+  assert.doesNotMatch(capturedSql, /AVG\(p\.decayed_yield_score\)/);
 });

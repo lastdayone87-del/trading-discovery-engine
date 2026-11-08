@@ -140,6 +140,25 @@ test('writeChannelUpsert normalizes unpaired surrogates at the database boundary
   assertWellFormedJson(captured[46], 'community_intents');
 });
 
+test('insert-only writes use a contiguous parameter list', async () => {
+  let sql = '';
+  let params: unknown[] = [];
+  const client = {
+    query: async (text: string, values?: unknown[]) => {
+      sql = text;
+      params = values || [];
+      return { rowCount: 1 };
+    },
+  };
+  await writeChannelUpsert(client as never, channelWithSurrogates(), { insertOnly: true });
+  const placeholders = [...sql.matchAll(/\$(\d+)/g)].map(match => Number(match[1]));
+  const distinct = [...new Set(placeholders)].sort((a, b) => a - b);
+  assert.deepEqual(distinct, Array.from({ length: 49 }, (_, index) => index + 1), 'insert-only placeholders must be contiguous');
+  assert.equal(params.length, 49, 'insert-only mode omits the DO UPDATE-only preserve flag');
+  assert.doesNotMatch(sql, /\$50/, 'insert-only mode must not leave a placeholder gap');
+  assert.match(sql, /ON CONFLICT\(channel_id\) DO NOTHING/);
+});
+
 test('country boundary recovery serializes every trail write through the Unicode-safe helper', () => {
   const source = readFileSync(new URL('./countryBoundaryRecovery.ts', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /JSON\.stringify\(channel\.inspection_trail\)/);

@@ -1,6 +1,7 @@
 import {
   getChannelById,
   getDb,
+  reconcileStaleClassificationSightings,
   recoverStaleChannelLocks,
   upsertChannel
 } from './db';
@@ -29,6 +30,8 @@ export interface OperationalMaintenanceDependencies {
   reconcileOperationalEnrichmentRecovery(): Promise<unknown>;
   triggerPhaseBObservationReconciliation(): unknown;
   resumeOrphanedAutonomousPages(): Promise<unknown>;
+  /** Delayed repair of pending classification sightings; runs at minute scale. */
+  reconcileStaleClassificationSightings(): Promise<unknown>;
 }
 
 export interface OperationalMaintenanceSnapshot {
@@ -55,6 +58,8 @@ export interface OperationalMaintenanceSchedulerOptions {
   now?: () => number;
   setTimer?: (callback: () => void, delayMs: number) => unknown;
   clearTimer?: (timer: unknown) => void;
+  /** Interval for the delayed classification-sighting sweep. */
+  classificationSightingSweepIntervalMs?: number;
   /** Warn when a single sweep remains in flight longer than this. */
   watchdogMs?: number;
   setWatchdog?: (callback: () => void, delayMs: number) => unknown;
@@ -70,6 +75,7 @@ export function createOperationalMaintenanceScheduler(
   options: OperationalMaintenanceSchedulerOptions = {}
 ): OperationalMaintenanceScheduler {
   const intervalMs = options.intervalMs ?? OPERATIONAL_MAINTENANCE_INTERVAL_MS;
+  const classificationSightingSweepIntervalMs = options.classificationSightingSweepIntervalMs ?? 60_000;
   const now = options.now ?? Date.now;
   const setTimer = options.setTimer ?? ((callback: () => void, delayMs: number) => {
     const timer = setTimeout(callback, delayMs);
@@ -91,6 +97,7 @@ export function createOperationalMaintenanceScheduler(
   let watchdogTimer: unknown = null;
   let runStartedAtMs: number | null = null;
   let lastStaleChannelLockRecoveryMs: number | null = null;
+  let lastClassificationSightingSweepMs: number | null = null;
   let ticks = 0;
   let failures = 0;
   let lastTickAt: string | null = null;
@@ -179,6 +186,25 @@ export function createOperationalMaintenanceScheduler(
     // headroom, so this maintenance sweep cannot exceed the producer
     // watermark even when no explicit limit is supplied.
     await isolate('autonomous_orphan_resume', () => dependencies.resumeOrphanedAutonomousPages());
+    // The delayed-classification sweep is minute-scale, not tick-scale. Use
+    // the scheduler's clock so tests and runtime share one cadence source.
+    if (lastClassificationSightingSweepMs === null
+      || nowMs - lastClassificationSightingSweepMs >= classificationSightingSweepIntervalMs) {
+      // Stamp before running so a failing sweep backs off instead of retrying
+      // on every maintenance tick.
+      lastClassificationSightingSweepMs = nowMs;
+      await isolate('classification_sighting_reconciliation', async () => {
+        const result = await dependencies.reconcileStaleClassificationSightings() as
+          { reconciled?: number; orphaned?: number } | undefined;
+        const reconciled = Number(result?.reconciled || 0);
+        const orphaned = Number(result?.orphaned || 0);
+        // Throttled ticks return no result at all; only a sweep that changed
+        // rows is operator-visible evidence that repair is keeping up.
+        if (reconciled || orphaned) {
+          console.info(`[Operational Maintenance] classification sightings reconciled=${reconciled} orphaned=${orphaned}.`);
+        }
+      });
+    }
   };
 
   const run = (): Promise<void> => {
@@ -238,6 +264,7 @@ export function createOperationalMaintenanceScheduler(
   return { run, start, stop, snapshot };
 }
 
+/** Delayed reconciliation is minute-scale; avoid a full-scan every 10s tick. */
 function createDefaultDependencies(): OperationalMaintenanceDependencies {
   return {
     recoverStaleChannelLocks: () => recoverStaleChannelLocks(),
@@ -278,7 +305,8 @@ function createDefaultDependencies(): OperationalMaintenanceDependencies {
       Date.now()
     ),
     triggerPhaseBObservationReconciliation: () => triggerPhaseBObservationReconciliation(),
-    resumeOrphanedAutonomousPages: () => resumeOrphanedAutonomousPages()
+    resumeOrphanedAutonomousPages: () => resumeOrphanedAutonomousPages(),
+    reconcileStaleClassificationSightings: () => reconcileStaleClassificationSightings(200)
   };
 }
 

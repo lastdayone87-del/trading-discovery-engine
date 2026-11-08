@@ -11,6 +11,8 @@ export interface EnrichmentBacklogEvidence {
   stepState?:string|null;
   failureClass?:string|null;
   lastError?:string|null;
+  /** Durable job attempt count; classification jobs have no investigation step. */
+  attempts?:number|null;
 }
 
 const operationalPattern=/(provider|timeout|rate.?limit|quota|cooldown|transient|temporar|econn|eai_again|429|503|502|504|credentials|cancel)/i;
@@ -20,6 +22,12 @@ export function diagnoseEnrichmentBacklog(evidence:EnrichmentBacklogEvidence,now
   if(evidence.investigationState==='ACTIVE'&&evidence.investigationDeadlineAt&&new Date(evidence.investigationDeadlineAt).getTime()<=now)return 'INVESTIGATION_DEADLINE_RISK';
   if(evidence.stepState==='RETRYING'&&operationalPattern.test(evidence.failureClass||evidence.lastError||''))return 'OPERATIONAL_RETRY';
   if(evidence.status==='PENDING'&&new Date(evidence.runAfter).getTime()>now)return 'PROVIDER_BACKOFF';
+  // Classification jobs have no investigation step, so their retry state lives
+  // in the job attempt count plus the last provider error class. A runnable
+  // job that already failed a transient provider call is an operational retry,
+  // not a job that has never been claimed.
+  if(evidence.status==='PENDING'&&evidence.runnable&&Number(evidence.attempts||0)>0
+    &&operationalPattern.test(evidence.failureClass||evidence.lastError||''))return 'OPERATIONAL_RETRY';
   if(evidence.status==='PENDING'&&evidence.runnable)return 'RUNNABLE_WAITING';
   return 'UNKNOWN';
 }
