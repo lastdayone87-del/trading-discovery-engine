@@ -245,6 +245,27 @@ test('D: an About bio never suppresses root-only header links', async () => {
   assert.ok(live?.channelLinks?.includes('root-only.example'));
 });
 
+test('D: debug HTML and fetch log follow the surface that supplied the bio', async () => {
+  const aboutHtml = `<script>var ytInitialData = ${JSON.stringify({
+    links: [{ channelExternalLinkViewModel: { link: { content: 'about.example' } } }]
+  })};</script>`;
+  const rootHtml = `<script>var ytInitialData = ${JSON.stringify({
+    metadata: { channelMetadataRenderer: { description: 'Root bio' } }
+  })};</script>`;
+  const live = await fetchLiveYouTubeChannelData(
+    'https://www.youtube.com/channel/UC_test',
+    true,
+    (async (input: RequestInfo | URL) =>
+      new Response(String(input).endsWith('/about') ? aboutHtml : rootHtml, {
+        status: 200,
+        headers: { 'content-type': 'text/html' }
+      })) as typeof fetch
+  );
+  assert.equal(live?.bio, 'Root bio');
+  assert.doesNotMatch(live?.fetchLog || '', /\/about/, 'fetch log must not describe the About page when the root supplied the bio');
+  assert.match(live?.rawHtml || '', /Root bio/);
+});
+
 test('D: a truncated About response keeps coverage incomplete after the root merge', async () => {
   const aboutHtml = `<html><body>${'x'.repeat(MAX_CRAWL_RESPONSE_CHARS + 5_000)}</body></html>`;
   const rootHtml = `<script>var ytInitialData = ${JSON.stringify({

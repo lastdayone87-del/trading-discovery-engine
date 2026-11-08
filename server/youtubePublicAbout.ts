@@ -283,7 +283,8 @@ export async function fetchLiveYouTubeChannelData(
       ? parseYouTubeChannelAboutFromHtml(rootPage.html, { enableDebug, finalUrl: rootPage.finalUrl })
       : null;
     if (!aboutPage && !rootPage) return null;
-    const bio = aboutParsed?.bio?.trim() ? aboutParsed.bio : rootParsed?.bio;
+    const bioSource = aboutParsed?.bio?.trim() ? aboutParsed : rootParsed;
+    const bio = bioSource?.bio;
     const channelLinks = Array.from(
       new Set([...(aboutParsed?.channelLinks || []), ...(rootParsed?.channelLinks || [])])
     );
@@ -297,11 +298,13 @@ export async function fetchLiveYouTubeChannelData(
       ...(bio?.trim() ? { bio } : {}),
       ...(channelLinks.length ? { channelLinks } : {}),
       thumbnailUrl: aboutParsed?.thumbnailUrl || rootParsed?.thumbnailUrl,
-      ...(aboutParsed?.rawHtml || rootParsed?.rawHtml
-        ? { rawHtml: aboutParsed?.rawHtml || rootParsed?.rawHtml }
+      // Debug HTML/log must describe the surface that supplied the selected
+      // bio, otherwise a root bio would be paired with About-page debug text.
+      ...(bioSource?.rawHtml || aboutParsed?.rawHtml || rootParsed?.rawHtml
+        ? { rawHtml: bioSource?.rawHtml || aboutParsed?.rawHtml || rootParsed?.rawHtml }
         : {}),
-      ...(aboutParsed?.fetchLog || rootParsed?.fetchLog
-        ? { fetchLog: aboutParsed?.fetchLog || rootParsed?.fetchLog }
+      ...(bioSource?.fetchLog || aboutParsed?.fetchLog || rootParsed?.fetchLog
+        ? { fetchLog: bioSource?.fetchLog || aboutParsed?.fetchLog || rootParsed?.fetchLog }
         : {}),
       ...(truncated ? { truncated: true } : {})
     };
