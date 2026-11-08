@@ -29,6 +29,7 @@ const indexes = [
 test('migration 170 is present and sorts after migration 169', () => {
   const files = readdirSync(migrationsDir).filter(name => name.endsWith('.sql')).sort();
   assert.ok(files.includes(migrationName));
+  assert.ok(files.includes('169_semantic_classification_cache.sql'), 'the predecessor migration must exist for the ordering contract');
   assert.ok(files.indexOf(migrationName) > files.indexOf('169_semantic_classification_cache.sql'));
 });
 
