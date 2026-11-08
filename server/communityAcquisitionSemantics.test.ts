@@ -113,6 +113,8 @@ test('scheme-less YouTube redirect destinations are never silently dropped',asyn
   assert.equal(normalizeExternalUrl('https://www.youtube.com/redirect?q=trader%40gmail.com%2Fcontact'),null,'email-plus-path destinations must stay rejected');
   assert.equal(normalizeExternalUrl('https://www.youtube.com/redirect?q=example.com%3A8080%2Fcommunity')?.url,'https://example.com:8080/community','scheme-less host:port destinations must keep their HTTPS meaning');
   assert.equal(normalizeExternalUrl('https://www.youtube.com/redirect?q=https%3A%2F%2Fexample.com%2Fa%252Fb')?.url,'https://example.com/a%2Fb','escaped path data in an already-decoded destination must be preserved');
+  assert.equal(normalizeExternalUrl('https://www.youtube.com/redirect?q=example.com%2Fa%252Fb')?.url,'https://example.com/a%2Fb','scheme-less destinations must not double-decode path data');
+  assert.equal(normalizeExternalUrl('https://www.youtube.com/redirect?q=https%253A%252F%252Fexample.com%252Fa')?.url,'https://example.com/a','legacy double-encoded full URLs still decode once');
 });
 
 test('encoded YouTube redirect destinations preserve direct Discord invites',async()=>{

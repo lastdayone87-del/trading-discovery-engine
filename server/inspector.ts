@@ -12,7 +12,7 @@ import {candidateFromNativeInvite,extractDiscordCandidates,makeDiscordCandidate,
 import { bumpRepeatFailureHistoryOutage, bumpRepeatFailureSkip } from './operationsTelemetry';
 import type { BrowserFallbackResult } from './browserCommunityFallback';
 import { RENDERED_CONTROL_EVALUATION_WINDOW, normalizeVisitUrl, type BrowserFallbackBudget } from './browserCommunityFallback';
-import { parseAboutPageMetadataFromHtml, youtubeChannelAboutUrl } from './youtubePublicAbout';
+import { fetchLiveYouTubeChannelData, parseAboutPageMetadataFromHtml } from './youtubePublicAbout';
 import { resolveDocumentBaseUrlFromRoot, stripBaseElements } from './documentBase';
 import {effectiveAcquisitionOutcomes,hasMessagingBridgeEvidence,isDiscordCommunityAcquisitionSurface,isDotlessHostnameUrl,isMessagingPreviewUrl,isAuxiliaryTriageCandidate,isAuxiliaryForOutcome,acquisitionOwnershipUrl,isPageAssetInfrastructureUrl,rankCommunitySurfaces,scoreCommunitySurface,assessCrawlAdmission,recoverTruncatedQueryToRoot,isPossiblyTruncatedPath} from './communitySurfacePolicy';
 import { isAcquisitionLadderEnabled, resolveRenderEscalation, selectSameSiteSitemapSeedCandidates, selectStructuredNavigationCandidates, MAX_LADDER_SITEMAP_SEEDS, MAX_LADDER_PROFILE_RUNS_PER_INSPECTION, ACQUISITION_LADDER_POLICY_VERSION } from './acquisitionLadder';
@@ -252,11 +252,12 @@ export function youtubeRedirectDestination(raw:string):string|null {
     if((parsed.hostname!=='youtube.com'&&!parsed.hostname.endsWith('.youtube.com'))||parsed.pathname!=='/redirect')return null;
     let destination=parsed.searchParams.get('q');
     if(!destination)return null;
-    // URLSearchParams.get already decodes once. Decode a second time only when
-    // the value is still fully encoded (no scheme yet); otherwise path escapes
-    // such as %2F inside an already-decoded URL would be rewritten.
-    if(!/^(?:[a-zA-Z][a-zA-Z0-9+-]*:|\/\/)/.test(destination)){
-      try{const decoded=decodeURIComponent(destination);if(decoded!==destination)destination=decoded;}catch{/* keep the first decode */}
+    // URLSearchParams.get already decodes once. Decode a second time only for
+    // a still-encoded *full* URL (the legacy double-encoded YouTube shape);
+    // scheme-less hosts keep their encoded path data intact.
+    if(!/^https?:\/\//i.test(destination)&&!/^\/\//.test(destination)
+      &&(/^https?%3A%2F%2F/i.test(destination)||/^%2F%2F/i.test(destination))){
+      try{destination=decodeURIComponent(destination);}catch{/* keep the first decode */}
     }
     return destination;
   }catch{return null;}
@@ -987,33 +988,6 @@ export async function scrapeRecentVideoDescriptionsWithCoverage(youtubeUrl:strin
 // callers that import it from the inspector module (including the
 // snapshot-retention regression test).
 export { parseAboutPageMetadataFromHtml };
-
-async function fetchLiveYouTubeChannelData(youtubeUrl:string,enableDebug?:boolean):Promise<{rawHtml?:string;fetchLog?:string;bio?:string;channelLinks?:string[];videoDescriptions?:string[];thumbnailUrl?:string;truncated?:boolean;}|null>{
-  if(!youtubeUrl||!youtubeUrl.startsWith('http'))return null;
-  const parsePage=async(url:string)=>{
-    const page=await fetchWithTimeout(url,0);
-    if(!page)return null;
-    const cleanHtml=decodeEmbeddedMarkup(page.html);
-    const {bio,thumbnailUrl,explicitLinks}=parseAboutPageMetadataFromHtml(page.html);
-    const extractedUrls=Array.from(new Set([...explicitLinks,...extractExternalUrlsFromText(cleanHtml)])).filter(url=>!isPageAssetInfrastructureUrl(url));
-    return {page,cleanHtml,bio,thumbnailUrl,extractedUrls};
-  };
-  // The external-link panel lives on /about, while the channel root can carry
-  // a header-only CTA. Fetch both and merge their links so neither surface is
-  // silently lost; prefer the About bio when both pages expose one.
-  const aboutUrl=youtubeChannelAboutUrl(youtubeUrl);
-  const [aboutPage,rootPage]=await Promise.all([
-    parsePage(aboutUrl),
-    aboutUrl===youtubeUrl?Promise.resolve(null):parsePage(youtubeUrl),
-  ]);
-  const page=aboutPage?.page||rootPage?.page;
-  if(!page)return null;
-  const bio=aboutPage?.bio?.trim()?aboutPage.bio:rootPage?.bio;
-  const extractedUrls=Array.from(new Set([...(aboutPage?.extractedUrls||[]),...(rootPage?.extractedUrls||[])]));
-  const truncated=Boolean(aboutPage?.page.truncated||rootPage?.page.truncated);
-  if(truncated&&!bio&&extractedUrls.length===0)return null;
-  return {bio,channelLinks:extractedUrls,thumbnailUrl:aboutPage?.thumbnailUrl||rootPage?.thumbnailUrl,truncated,rawHtml:enableDebug?(aboutPage?.cleanHtml||rootPage?.cleanHtml):undefined,fetchLog:enableDebug?`Fetched ${page.finalUrl} (${page.html.length} bytes)`:undefined};
-}
 
 function normalizedRenderedCandidates(rendered:BrowserFallbackResult,surface:AcquisitionSurface,seedUrl:string):DiscordCandidate[]{
   const available=(rendered.candidates||[]).filter(candidate=>candidate.nativeInviteCode);
