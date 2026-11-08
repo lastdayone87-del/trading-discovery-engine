@@ -2,6 +2,7 @@ import type { EvidenceFieldRef, EvidenceFieldType, LayeredKnowledgeContext, RawC
 import { creatorOwnedEvidenceCorpus } from './canonicalEvidencePlane';
 import {
   assessTradingText,
+  hasAffirmedAlternativeIdentity,
   type CompositionTextFocus,
   type TradingSignalMatch,
 } from './tradingSignalTaxonomy';
@@ -354,7 +355,7 @@ export function buildContextualComposition(
     );
     const creatorAlternative = assessments.some(item =>
       CREATOR_LEVEL_FIELDS.has(item.document.field)
-      && item.assessment.focus === 'UNRELATED'
+      && (item.assessment.focus === 'UNRELATED' || hasAffirmedAlternativeIdentity(item.document.text))
     );
     // Duplicate checks compare the whole upload (title + description + other
     // fields), not one representative field. Two videos with the same generic

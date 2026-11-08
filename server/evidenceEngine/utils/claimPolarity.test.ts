@@ -24,6 +24,7 @@ test('claim polarity distinguishes assertions, disclaimers and negations', () =>
 
 test('claim polarity neutralizes quoted criticism and hypotheticals', () => {
   assert.equal(polarity('Scam gurus promise guaranteed profits', 'guaranteed profit'), 'QUOTED');
+  assert.equal(polarity('Scam gurus teach forex', 'forex'), 'QUOTED');
   assert.equal(polarity('They say guaranteed profits, then lose money', 'guaranteed profit'), 'QUOTED');
   assert.equal(polarity('Imagine guaranteed profits, then lose money', 'guaranteed profit'), 'HYPOTHETICAL');
   assert.equal(polarity('"Guaranteed profits" is a red flag', 'guaranteed profit'), 'QUOTED');
@@ -52,6 +53,11 @@ test('claim polarity keeps ordinary creator framing asserted', () => {
   assert.equal(polarity("I don't need a broker, I trade stocks daily", 'stocks'), 'ASSERTED');
   assert.equal(polarity('I do not trade stocks and teach trading strategy', 'stocks'), 'NEGATED');
   assert.equal(polarity('I do not trade stocks and teach trading strategy', 'trading strategy'), 'ASSERTED');
+  assert.equal(polarity('I do not teach day trading and order flow', 'day trading'), 'NEGATED');
+  assert.equal(polarity('I do not teach day trading and order flow', 'order flow'), 'NEGATED');
+  assert.equal(polarity('I do not trade stocks and crypto', 'crypto'), 'NEGATED');
+  assert.equal(polarity('I teach day trading so you could learn to do it yourself', 'day trading'), 'ASSERTED');
+  assert.notEqual(polarity('Zero to hero course not guaranteed profits', 'guaranteed profit'), 'ASSERTED');
   assert.equal(polarity('I teach day trading, no hype', 'day trading'), 'ASSERTED');
   assert.equal(polarity('No experience needed: learn forex trading', 'forex'), 'ASSERTED');
   assert.equal(polarity('No BS Forex Trading', 'forex'), 'ASSERTED');

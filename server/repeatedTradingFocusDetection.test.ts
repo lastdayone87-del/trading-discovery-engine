@@ -61,6 +61,7 @@ test('a generic method cannot supply its own financial qualifier', () => {
   // "market" and "analysis"; neither may qualify itself as trading.
   assert.equal(isExplicitCreatorTradingText('Workplace risk management', context), false);
   assert.equal(isExplicitCreatorTradingText('Housing market analysis', context), false);
+  assert.equal(isExplicitCreatorTradingText('I do not trade forex, but personal finance', context), false);
   // An independent financial dimension still qualifies the method.
   assert.equal(isExplicitCreatorTradingText('Trading risk management', context), true);
   assert.equal(isExplicitCreatorTradingText('Forex market analysis', context), true);

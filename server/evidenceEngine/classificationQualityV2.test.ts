@@ -161,6 +161,16 @@ test('C5 v2: a shared description does not merge distinct upload titles', () => 
   assert.equal(composition.tradingCoreFamilies, 2);
 });
 
+test('C5 v2: explicit alternative identity is polarity-aware', () => {
+  const mixed = compose([], 'Gaming channel. I also cover day trading and order flow.');
+  assert.equal(mixed.explicitCreatorAlternative, true);
+  assert.equal(mixed.focus, 'MIXED');
+
+  const negated = compose([], 'Not a gaming channel. Day trading and order flow.');
+  assert.equal(negated.explicitCreatorAlternative, false);
+  assert.equal(negated.focus, 'TRADING_DOMINANT');
+});
+
 test('shared taxonomy classifies multilingual trading, commentary and non-trading controls', () => {
   const context = getLayeredKnowledgeContext('United States');
   const expected: Array<[string, string]> = [

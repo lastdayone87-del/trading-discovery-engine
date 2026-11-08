@@ -613,3 +613,19 @@ export function isTierATradingText(text: string, context?: LayeredKnowledgeConte
 export function hasExplicitAlternativeIdentity(text: string): boolean {
   return EXPLICIT_ALTERNATIVE_IDENTITY.test(normalizeText(text));
 }
+
+/** Polarity-aware alternative identity; "not a gaming channel" does not count. */
+export function hasAffirmedAlternativeIdentity(text: string): boolean {
+  const normalized = normalizeText(text);
+  const pattern = new RegExp(EXPLICIT_ALTERNATIVE_IDENTITY.source, 'giu');
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(normalized)) !== null) {
+    if (match[0].length === 0) {
+      pattern.lastIndex += 1;
+      continue;
+    }
+    const polarity = classifyClaimPolarity(normalized, match.index, match.index + match[0].length);
+    if (polarity.polarity === 'ASSERTED') return true;
+  }
+  return false;
+}

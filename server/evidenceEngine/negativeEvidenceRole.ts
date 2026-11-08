@@ -18,16 +18,7 @@ const CREATOR_LEVEL_FIELDS: ReadonlySet<EvidenceFieldType> = new Set<EvidenceFie
  * field attribution keep the historical terminal behaviour.
  */
 function hasCreatorLevelAttribution(item: EvidenceItem): boolean {
-  const fields = item.provenance?.fields;
-  if (!fields?.length) return true;
-  if (fields.some(field => CREATOR_LEVEL_FIELDS.has(field.field))) return true;
-  const videoFamilies = new Set(
-    fields
-      .filter(field => field.field === 'video_title' || field.field === 'video_description')
-      .map(field => field.sourceFamilyId || field.sourceId)
-      .filter((value): value is string => Boolean(value)),
-  );
-  return videoFamilies.size >= 2;
+  return hasCreatorLevelAttributionSet([item]);
 }
 
 /**

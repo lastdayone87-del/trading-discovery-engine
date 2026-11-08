@@ -81,7 +81,11 @@ const CLAIM_LIKE_TERM = /\b(?:guaranteed?|profits?|returns?|gains?|rich|wealth|m
 const POST_NEGATION = /^\s*(?:[?!.,:;\-–—]+\s*)?(?:no|nope|not|never|false|myth|wrong|incorrect|pas|non|nein|kein|inte|ikke|aldrig|nunca|mai)\b/iu;
 const POST_DENIAL = /\b(?:is|are|was|were)\s+(?:a\s+)?(?:myth|lie|false|not\s+true|incorrect|wrong)\b/iu;
 const ASSERTIVE_NEGATION_FRAME = /\b(?:no\s+(?:bs|b\.s\.|nonsense|fluff|hype|shortcuts?)|zero\s+to\s+(?:hero|pro|funded|profit))\b/iu;
-const CONTRAST_CUE = /(?:\b(?:but|however|yet|although|though|whereas|nevertheless|nonetheless|and|mais|aber|pero|però|ma|doch|men|maar|mas)\b|(?:но|但|但是|しかし))/iu;
+const CONTRAST_CUE = /(?:\b(?:but|however|yet|although|though|whereas|nevertheless|nonetheless|mais|aber|pero|però|ma|doch|men|maar|mas)\b|(?:но|但|但是|しかし))/iu;
+// `and` only starts a new clause when it introduces a new predicate/subject;
+// noun coordination ("stocks and crypto") stays inside the negation scope.
+const COORDINATION_CUE = /\b(?:and|&)\s+(?=(?:i|we|you|they|he|she|it)\b|(?:teach|learn|trade|show|share|explain|post|upload|run|make|offer|provide|help|cover|analy[sz]e|review|discuss|focus|talk|stream|prefer)\b)/iu;
+const POST_HYPOTHETICAL = /^\s*(?:could|would|might|may|hypothetically|in\s+theory)\b/iu;
 
 const DISCLAIMER_PATTERNS: RegExp[] = [
   /\b(?:no|not|never|without)\s+(?:financial|investment|trading|tax)\s+advice\b/iu,
@@ -187,11 +191,12 @@ function clauseBounds(text: string, start: number, end: number): ClauseBounds {
   let left = start;
   while (left > 0 && !/[.!?;,\n:]/.test(text[left - 1])) left--;
   const before = text.slice(left, start);
-  const contrasts = [...before.matchAll(new RegExp(CONTRAST_CUE.source, 'giu'))];
-  const lastContrast = contrasts[contrasts.length - 1];
-  if (lastContrast && lastContrast.index !== undefined) {
-    left += lastContrast.index + lastContrast[0].length;
-  }
+  const splitAt = (regex: RegExp): number => {
+    const matches = [...before.matchAll(new RegExp(regex.source, 'giu'))];
+    const last = matches[matches.length - 1];
+    return last && last.index !== undefined ? left + last.index + last[0].length : left;
+  };
+  left = Math.max(splitAt(CONTRAST_CUE), splitAt(COORDINATION_CUE));
   let right = end;
   while (right < text.length && !/[.!?;,\n:]/.test(text[right])) right++;
   return { start: left, end: right };
@@ -281,12 +286,15 @@ export function classifyClaimPolarity(
   // is asserted education, not quoted hype).
   const termLooksLikeClaim = CLAIM_LIKE_TERM.test(normalized.slice(start, end));
   const quotationFrame = CRITICISM_CUE.test(nearbyWindow) || ATTRIBUTION_CUE.test(nearbyWindow);
-  if (termLooksLikeClaim && quotationFrame && (CRITICISM_CUE.test(before) || ATTRIBUTION_CUE.test(before))) {
-    const cue = (CRITICISM_CUE.exec(before) || ATTRIBUTION_CUE.exec(before) || [undefined])[0];
+  const attributionBefore = ATTRIBUTION_CUE.test(before);
+  const criticismBefore = CRITICISM_CUE.test(before);
+  if (quotationFrame && (attributionBefore || (termLooksLikeClaim && criticismBefore))) {
+    const cue = (ATTRIBUTION_CUE.exec(before) || CRITICISM_CUE.exec(before) || [undefined])[0];
     return { polarity: 'QUOTED', cue, confidence: 0.88 };
   }
-  if (termLooksLikeClaim && isInsideQuotes(normalized, start, end) && (CRITICISM_CUE.test(nearbyWindow) || ATTRIBUTION_CUE.test(nearbyWindow))) {
-    const cue = (CRITICISM_CUE.exec(nearbyWindow) || ATTRIBUTION_CUE.exec(nearbyWindow) || [undefined])[0];
+  if (isInsideQuotes(normalized, start, end)
+    && (ATTRIBUTION_CUE.test(nearbyWindow) || (termLooksLikeClaim && CRITICISM_CUE.test(nearbyWindow)))) {
+    const cue = (ATTRIBUTION_CUE.exec(nearbyWindow) || CRITICISM_CUE.exec(nearbyWindow) || [undefined])[0];
     return { polarity: 'QUOTED', cue, confidence: 0.85 };
   }
   // Post-term criticism: "Guaranteed profits are a red flag" is criticism of
@@ -303,8 +311,11 @@ export function classifyClaimPolarity(
       return { polarity: 'ASSERTED', confidence: 0.6 };
     }
     // "No BS Forex", "Zero to Hero Forex" are assertive creator framing, not
-    // denials of the trading claim that follows.
-    if (cue && ASSERTIVE_NEGATION_FRAME.test(before)) {
+    // denials of the trading claim that follows. Only skip the cue when the
+    // cue itself sits inside the assertive frame.
+    const assertiveFrame = ASSERTIVE_NEGATION_FRAME.exec(before);
+    const cueIndex = cue ? before.lastIndexOf(cue) : -1;
+    if (cue && assertiveFrame && cueIndex < assertiveFrame.index + assertiveFrame[0].length) {
       // fall through to hypothetical/assertion
     } else if (cue) {
       return { polarity: 'NEGATED', cue, confidence: 0.9 };
@@ -316,10 +327,11 @@ export function classifyClaimPolarity(
     const cue = closestCue(hypothetical, before);
     if (cue) return { polarity: 'HYPOTHETICAL', cue, confidence: 0.8 };
   }
-  const hypotheticalAfter = combinedCueRegex(afterClause, language, HYPOTHETICAL_CUES);
-  if (hypotheticalAfter) {
-    const cue = closestCue(hypotheticalAfter, afterClause);
-    if (cue) return { polarity: 'HYPOTHETICAL', cue, confidence: 0.75 };
+  // Post-term hypotheticals must describe the matched activity: "Trading
+  // could happen" is hypothetical, while "I teach day trading so you could
+  // learn" is an asserted teaching claim.
+  if (POST_HYPOTHETICAL.test(afterClause)) {
+    return { polarity: 'HYPOTHETICAL', cue: afterClause.trim().slice(0, 24), confidence: 0.75 };
   }
 
   // A negation cue after a contrastive conjunction applies to the other clause,

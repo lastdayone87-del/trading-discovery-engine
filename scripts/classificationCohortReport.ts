@@ -144,7 +144,9 @@ async function main(): Promise<void> {
     if (stageReasons.includes('MIXED_EVIDENCE_TERMINAL_REJECTION_WITHHELD')) mixedNegativeWithholdings++;
     duplicateCollapsed += Number(composition?.duplicateFamiliesCollapsed || 0);
     for (const family of composition?.familyClassifications || []) {
-      suppressedTerms += Array.isArray(family?.suppressedSignals) ? family.suppressedSignals.length : 0;
+      suppressedTerms += Array.isArray(family?.suppressedSignals)
+        ? family.suppressedSignals.length
+        : Number(family?.suppressedSignalCount || 0);
     }
     for (const reason of decision.decisionPolicy?.reasonCodes || []) increment(reasonCodes, reason);
     for (const item of decision.negativeEvidence || []) increment(negativeRoles, item?.role);

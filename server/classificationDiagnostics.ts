@@ -102,7 +102,7 @@ export async function recordProductionClassification(
         decisionPolicy: diagnostic.decision.decisionPolicy,
         // v3: retain the decisive C5/C6 state instead of forcing operators to
         // replay normalized_input to discover why a decision abstained.
-        composition: diagnostic.decision.compositionReport || diagnostic.decision.composition,
+        composition: compositionForDiagnostics || diagnostic.decision.composition,
         signalMatches,
         suppressedSignalMatches,
         recognition: diagnostic.decision.recognitionAssessment || {
