@@ -40,8 +40,12 @@ test('audience counters do not change the evidence checksum', () => {
   const first = normalizeProductionDiagnosticInput({ ...base, subscriber_count: 12, video_count: 3 });
   const replayed = normalizeProductionDiagnosticInput({ ...base, subscriber_count: 900_000, video_count: 4_000 });
   assert.equal(first.input_checksum, replayed.input_checksum);
-  assert.equal(first.subscriber_count, undefined);
-  assert.equal(replayed.video_count, undefined);
+  // Audience data stays on the returned input so a stored diagnostic row can
+  // still replay the low-audience prefilter rule.
+  assert.equal(first.subscriber_count, 12);
+  assert.equal(first.video_count, 3);
+  assert.equal(replayed.subscriber_count, 900_000);
+  assert.equal(replayed.video_count, 4_000);
 });
 
 test('normalization is idempotent when a stored row carries derived checksum keys', () => {

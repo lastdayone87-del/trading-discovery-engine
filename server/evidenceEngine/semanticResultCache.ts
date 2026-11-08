@@ -1,17 +1,18 @@
 import { createHash } from 'node:crypto';
-import { classificationInputChecksum } from '../classificationInputChecksum';
+import { canonicalJsonStringify } from '../classificationInputChecksum';
 import type { RawChannelInput } from './types';
 import type { SemanticModelResult } from './providers/GeminiSemanticProvider';
 import { isSemanticResultShape } from './semanticResultShape';
-import { citationsReferenceSuppliedDocuments } from './semanticDocumentRefs';
+import { citationsReferenceSuppliedDocuments, semanticPromptInputProjection } from './semanticDocumentRefs';
 
 /**
- * Phase 4 semantic result cache.
- *
- * The cache key is the evidence fingerprint (`input_checksum`) plus every
- * model-facing version input. Attribution (job/run) is deliberately excluded
- * by `classificationInputChecksum`, so the same channel recheck under a new
- * job is a hit, while any evidence or version change is a miss.
+ * The cache key is the model-facing evidence fingerprint plus every
+ * model-facing version input. The fingerprint covers exactly the declared
+ * context and bounded documents `buildSemanticPrompt` serializes.
+ * Attribution (job/run), audience counters, retrieval-only documents, and
+ * corpus entries past the prompt limit are deliberately excluded, so the same
+ * channel recheck under a new job is a hit, while any evidence or version
+ * change the model would see is a miss.
  *
  * The cache is fail-open: a database outage, corrupt row, or disabled flag
  * degrades to a normal provider call. It must never change classification
@@ -60,7 +61,9 @@ export interface SemanticCacheHit extends CachedSemanticValue {
 }
 
 export function semanticResultCacheKey(identity: SemanticResultCacheIdentity): { cacheKey: string; inputChecksum: string } {
-  const inputChecksum = classificationInputChecksum(identity.input);
+  const inputChecksum = createHash('sha256')
+    .update(canonicalJsonStringify(semanticPromptInputProjection(identity.input)))
+    .digest('hex');
   const cacheKey = createHash('sha256').update(JSON.stringify([
     SEMANTIC_RESULT_CACHE_VERSION,
     inputChecksum,
@@ -155,6 +158,11 @@ export function isCacheableSemanticResult(value: unknown, input?: RawChannelInpu
 const CACHE_CIRCUIT_BREAKER_MS = 60_000;
 let consecutiveFailures = 0;
 let circuitOpenUntilMs = 0;
+// Hit counting is observability-only. At most one UPDATE may be in flight:
+// under database slowness, queueing one write per hit would pile up work that
+// outlives its deadline and competes with the next cache SELECT. Dropped
+// increments undercount savings; they can never affect a verdict.
+let hitCountInFlight = false;
 
 function cacheCircuitClosed(nowMs = Date.now()): boolean {
   return nowMs >= circuitOpenUntilMs;
@@ -177,6 +185,7 @@ function noteCacheSuccess(): void {
 export function resetSemanticResultCacheCircuitForTests(): void {
   consecutiveFailures = 0;
   circuitOpenUntilMs = 0;
+  hitCountInFlight = false;
 }
 
 export async function readSemanticResultCache(
@@ -211,13 +220,19 @@ export async function readSemanticResultCache(
       return undefined;
     }
     // Hit counting is observability-only and must not add a second round trip
-    // to the classification deadline. The row was already validated; a lost
-    // increment degrades quota-savings evidence, never a verdict.
-    void boundedCacheOperation((async () => {
-      const { getDb } = await import('../db');
-      const db = await getDb();
-      return db.query('UPDATE semantic_classification_cache SET hits=hits+1,last_hit_at=now() WHERE cache_key=$1', [cacheKey]);
-    })(), options, env).catch(() => undefined);
+    // to the classification deadline. Single-flight prevents DB slowness from
+    // queueing one UPDATE per hit; a skipped increment degrades quota-savings
+    // evidence, never a verdict.
+    if (!hitCountInFlight) {
+      hitCountInFlight = true;
+      void boundedCacheOperation((async () => {
+        const { getDb } = await import('../db');
+        const db = await getDb();
+        return db.query('UPDATE semantic_classification_cache SET hits=hits+1,last_hit_at=now() WHERE cache_key=$1', [cacheKey]);
+      })(), options, env)
+        .catch(() => undefined)
+        .then(() => { hitCountInFlight = false; });
+    }
     return {
       cacheKey,
       inputChecksum,

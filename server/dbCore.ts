@@ -649,6 +649,57 @@ async function ensureClassificationSightingIndex(client: { query: (text: string,
   await client.query(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${name} ON public.channel_sightings (observed_at) WHERE funnel_outcome='CLASSIFICATION_PENDING'`);
 }
 
+/**
+ * Migration 170 indexes the enrichment throughput window and the semantic
+ * cache retention sweep. `jobs` is a hot queue table: a transactional build
+ * would block inserts, claims, heartbeats, and completions for the duration.
+ * Build every index concurrently before the loop's BEGIN; migration 170 then
+ * only adopts a valid index or verifies an empty table.
+ */
+async function ensurePhase4ScaleIndexes(client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> }): Promise<void> {
+  const ensure = async (name: string, table: string, createSql: string): Promise<void> => {
+    // A failed concurrent build can leave an invalid/not-ready catalog entry.
+    // It cannot serve queries, so never treat mere name existence as success.
+    const index = await client.query(`
+      SELECT c.oid, i.indisvalid, i.indisready
+        FROM pg_class c
+        JOIN pg_index i ON i.indexrelid = c.oid
+       WHERE c.oid = to_regclass('public.${name}')
+    `);
+    const existing = index.rows[0];
+    if (existing?.indisvalid && existing?.indisready) return;
+    if (existing?.oid) {
+      // The invalid index is unusable; drop it concurrently (outside the
+      // migration transaction) and rebuild below when the table is populated.
+      await client.query(`DROP INDEX CONCURRENTLY IF EXISTS public.${name}`);
+    }
+    const target = await client.query(`SELECT to_regclass('public.${table}') AS oid`);
+    if (!target.rows[0]?.oid) return;
+    const populated = await client.query(`SELECT EXISTS(SELECT 1 FROM public.${table} LIMIT 1) AS populated`);
+    if (!populated.rows[0]?.populated) return;
+    await client.query(createSql);
+  };
+  await ensure(
+    'idx_jobs_enrich_created_at',
+    'jobs',
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_enrich_created_at ON public.jobs (created_at) WHERE type='ENRICH_CHANNEL'`,
+  );
+  await ensure(
+    'idx_jobs_enrich_completed_at',
+    'jobs',
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_enrich_completed_at ON public.jobs (completed_at) WHERE type='ENRICH_CHANNEL' AND completed_at IS NOT NULL`,
+  );
+  await ensure(
+    'idx_semantic_cache_retention',
+    'semantic_classification_cache',
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_semantic_cache_retention ON public.semantic_classification_cache ((COALESCE(last_hit_at, created_at)))`,
+  );
+  // Migration 169 pre-created this index before the retention query was
+  // finalized. Drop it concurrently so the migration transaction does not
+  // hold a table lock for cleanup.
+  await client.query(`DROP INDEX CONCURRENTLY IF EXISTS public.idx_semantic_cache_created_at`);
+}
+
 export async function runMigrations(): Promise<Array<{ version: number; name: string; applied_at: string }>> {
   const db = pool || new Pool({ connectionString: requireDatabaseUrl(), ssl: process.env.PGSSL === 'disable' ? false : process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined });
   const client = await db.connect();
@@ -673,6 +724,10 @@ export async function runMigrations(): Promise<Array<{ version: number; name: st
     if (!migration160.rowCount) await ensureJobAttemptsFinishedErrorIndex(client);
     const migration168 = await client.query('SELECT 1 FROM schema_migrations WHERE version=168');
     if (!migration168.rowCount) await ensureClassificationSightingIndex(client);
+    // Migration 170 indexes the hot jobs queue. Build concurrently before the
+    // transactional loop; the migration itself only adopts or verifies.
+    const migration170 = await client.query('SELECT 1 FROM schema_migrations WHERE version=170');
+    if (!migration170.rowCount) await ensurePhase4ScaleIndexes(client);
     const files = fs.readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith('.sql')).sort();
     const versions=new Map<number,string>();
     for(const file of files){const version=Number(file.split('_')[0]);const previous=versions.get(version);if(previous)throw new Error(`Duplicate migration version ${version}: ${previous} and ${file}`);versions.set(version,file);}

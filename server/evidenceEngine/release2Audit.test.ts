@@ -30,7 +30,10 @@ test('Phase 3 separates search context and does not begin Release 3', async () =
   // the retrieval-only filter lives there so a citation can never validate
   // against a document the model was not shown.
   assert.match(semantic, /semanticFieldDocuments\(input\)/);
-  assert.match(documentRefs, /\.filter\(document\s*=>\s*!\[/);
+  const excludedFields = documentRefs.match(/\.filter\(document\s*=>\s*!\[([^\]]*)\]/)?.[1] || '';
+  for (const field of ['activity_metadata', 'search_match_context', 'country', 'language']) {
+    assert.match(excludedFields, new RegExp(`'${field}'`), `${field} must never be model-facing semantic evidence`);
+  }
   assert.match(ingestion, /search_match_context:candidate.matchedDocument/);
   const migrations = await readdir(new URL('../db/migrations/', import.meta.url));
   assert.ok(migrations.includes('055_evidence_documents_and_assertions.sql'));

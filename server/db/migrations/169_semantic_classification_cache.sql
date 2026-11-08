@@ -38,7 +38,7 @@ ALTER TABLE semantic_classification_cache
 COMMENT ON TABLE semantic_classification_cache IS
   'Phase 4: final semantic-model result keyed by evidence checksum + prompt/feature/model versions. Fail-open; never authoritative evidence.';
 COMMENT ON COLUMN semantic_classification_cache.input_checksum IS
-  'Attribution-free classification input fingerprint (job_id/run_id and audience counters excluded).';
+  'Model-facing semantic prompt fingerprint (declared context plus bounded documents; retrieval-only evidence, attribution, and audience counters excluded).';
 COMMENT ON COLUMN semantic_classification_cache.batch_prompt_version IS
   'Batch prompt version in effect when the result was cached (set for every call while batching is enabled, NULL otherwise); purging by version also removes single-call rows written under batching.';
 COMMENT ON COLUMN semantic_classification_cache.hits IS

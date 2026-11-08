@@ -38,14 +38,11 @@ export const CLASSIFICATION_INPUT_CHECKSUM_VERSION = 'canonical-json-v1';
 
 export function normalizeClassificationInput(input: RawChannelInput): RawChannelInput & { input_checksum: string; input_checksum_version: string } {
   const classificationInput: RawChannelInput = { ...input };
-  // Attribution and audience metadata are not classification evidence.
-  // `subscriber_count`/`video_count` change on every channel refresh, and a
-  // checksum that moves with them would miss the semantic cache and rewrite
-  // the diagnostic ledger for an unchanged evidence set.
+  // Attribution is not classification evidence. Excluding it keeps the
+  // checksum stable when the same channel evidence is replayed under a
+  // different job or query run.
   delete classificationInput.job_id;
   delete classificationInput.run_id;
-  delete classificationInput.subscriber_count;
-  delete classificationInput.video_count;
   // The checksum fields are derived output. A stored diagnostic row carries
   // them inside `normalized_input`, so they must be stripped before hashing or
   // re-normalizing a replay would hash a different payload.
@@ -58,8 +55,18 @@ export function normalizeClassificationInput(input: RawChannelInput): RawChannel
     description: classificationInput.description || '',
     external_links: [...(classificationInput.external_links || [])].sort()
   };
+  // Audience counters are prefilter metadata, not classification evidence.
+  // They change on every channel refresh, which would miss the semantic cache
+  // and rewrite the diagnostic ledger for an unchanged evidence set. Keep them
+  // on the returned input so a stored row can replay the low-audience rule;
+  // exclude them only from the hashed projection.
+  delete stable.subscriber_count;
+  delete stable.video_count;
   return {
-    ...stable,
+    ...classificationInput,
+    channel_name: stable.channel_name,
+    description: stable.description,
+    external_links: stable.external_links,
     input_checksum_version: CLASSIFICATION_INPUT_CHECKSUM_VERSION,
     input_checksum: createHash('sha256').update(canonicalJsonStringify(stable)).digest('hex')
   };

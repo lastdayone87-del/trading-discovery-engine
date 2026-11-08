@@ -53,6 +53,39 @@ test('semantic cache identity is stable across job/run attribution and input ord
   assert.equal(semanticResultCacheKey(identity).inputChecksum, semanticResultCacheKey({ ...identity, input: replayed }).inputChecksum);
 });
 
+test('only model-facing evidence and declared context affect the cache key', () => {
+  const corpus = (count: number) => Array.from({ length: count }, (_, index) => ({
+    id: `doc-${index}`,
+    field: index === 0 ? 'channel_bio' as const : 'video_title' as const,
+    index,
+    text: `document ${index}`,
+    sourceFamilyId: 'family-1',
+  }));
+  const base = semanticResultCacheKey({ ...identity, input: { ...baseInput, evidence_corpus: corpus(45) } });
+  const nonModelFacingChanges = semanticResultCacheKey({
+    ...identity,
+    input: {
+      ...baseInput,
+      subscriber_count: 999_999,
+      video_count: 12_345,
+      evidence_corpus: [
+        ...corpus(40),
+        { id: 'late', field: 'video_title' as const, index: 99, text: 'beyond prompt limit', sourceFamilyId: 'family-2' },
+        { id: 'retrieval', field: 'search_match_context' as const, text: 'trading query', sourceFamilyId: 'search' },
+        { id: 'activity', field: 'activity_metadata' as const, text: '2 uploads', sourceFamilyId: 'activity' },
+      ],
+    },
+  });
+  assert.equal(base.cacheKey, nonModelFacingChanges.cacheKey);
+  assert.equal(base.inputChecksum, nonModelFacingChanges.inputChecksum);
+  // Declared country and language hints are serialized into the prompt, so a
+  // change the model can see must be a miss.
+  assert.notEqual(
+    base.cacheKey,
+    semanticResultCacheKey({ ...identity, input: { ...baseInput, evidence_corpus: corpus(45), country: 'GB' } }).cacheKey,
+  );
+});
+
 test('semantic cache key changes with evidence, prompt, feature, model, and adjudication configuration', () => {
   const original = semanticResultCacheKey(identity).cacheKey;
   assert.notEqual(original, semanticResultCacheKey({ ...identity, input: { ...baseInput, description: 'Changed.' } }).cacheKey);
@@ -165,6 +198,8 @@ test('cache operations are fail-open and deadline-bounded', () => {
   assert.match(source, /isCacheableSemanticResult\(value\.result, identity\.input\)/, 'writes must reject degenerate results and out-of-corpus citations');
   assert.match(source, /isUsableCachedResult\(row\.result, identity\.input\)/, 'reads must validate citations against the supplied evidence');
   assert.match(source, /void boundedCacheOperation\(/, 'hit counting must not add a blocking round trip');
+  assert.match(source, /if \(!hitCountInFlight\)/, 'hit counting must be single-flight under database slowness');
+  assert.match(source, /hitCountInFlight = false/, 'the single-flight guard must clear when the write settles');
   assert.match(source, /citationsReferenceSuppliedDocuments/, 'citations must resolve to supplied documents');
   assert.match(source, /batch_prompt_version/, 'the batch prompt version must be persisted for operator purges');
   assert.match(source, /identity\.batchPromptVersion \|\| null/, 'the persisted batch version must come from the cache identity');

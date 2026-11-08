@@ -35,15 +35,18 @@ Files: `server/evidenceEngine/semanticResultCache.ts`,
   classification decision. Deterministic providers and the normal decision
   policy run on every evaluation, so a cache hit cannot freeze a stale
   evidence decision.
-- Key: SHA-256 over the cache version, attribution-free evidence checksum,
+- Key: SHA-256 over the cache version, model-facing prompt fingerprint,
   provider name, prompt version, feature version, candidate model version,
   adjudicator model version, adjudication-enabled flag, batch prompt version
   (when batching is enabled), the Groq citation-repair prompt version, and the
   Groq request settings that change the model-facing call (prompt caps,
   completion allowance, reasoning effort).
-  `job_id`/`run_id` are observability attribution and are excluded from the
-  checksum, so a recheck under a new job can hit; any evidence, prompt, model,
-  repair, or request-settings change is a miss. The producing
+  The fingerprint covers exactly the declared country/language hints and
+  bounded documents serialized into the prompt: `job_id`/`run_id`,
+  audience counters, retrieval-only documents, and corpus entries past the
+  prompt limit are excluded, so a recheck under a new job can hit; any
+  evidence the model can actually see, or any prompt/model/repair/request
+  settings change, is a miss. The producing
   `batch_prompt_version` is also stored as a column so a superseded batch can
   be purged by version. The diagnostic envelope records
   `input_checksum_version: canonical-json-v1` beside every new fingerprint so

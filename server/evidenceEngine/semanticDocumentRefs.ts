@@ -41,6 +41,35 @@ export function candidateDocumentRefs(input: RawChannelInput): EvidenceFieldRef[
 }
 
 /**
+ * Exact model-facing projection hashed into the semantic cache key.
+ *
+ * `buildSemanticPrompt` serializes the declared country, language hints, and
+ * the bounded document set above. Hashing that projection means retrieval-only
+ * fields, audience counters, and documents past the prompt limit cannot
+ * invalidate a reusable result, while any change to evidence the model
+ * actually saw still does.
+ */
+export function semanticPromptInputProjection(input: RawChannelInput): {
+  country: string | null;
+  detected_languages: NonNullable<RawChannelInput['detected_languages']>;
+  documents: Array<{ ref: EvidenceFieldRef; text: string }>;
+} {
+  // The production classifier trims the channel name before the engine sees
+  // it. Normalize here too so a whitespace-only replay cannot miss a result
+  // whose prompt text is identical after trimming.
+  const normalized: RawChannelInput = {
+    ...input,
+    channel_name: String(input.channel_name || '').normalize('NFKC').trim(),
+    description: input.description || '',
+  };
+  return {
+    country: normalized.country || null,
+    detected_languages: normalized.detected_languages || [],
+    documents: semanticFieldDocuments(normalized),
+  };
+}
+
+/**
  * True only when every citation resolves to a supplied document. A citation
  * with an index must match that index; an index-less citation is accepted only
  * when the field is unambiguous (or its sourceId is supplied).
