@@ -4,6 +4,7 @@ import { appendProviderCallEvent, resolveGeminiFreeSemanticCooldownExpiryMs, GEM
 import {
   ProviderCallError,
   classifyProviderError,
+  providerFailureMetadata,
   statusFor,
   type ProviderCallEvent,
 } from '../../providerResilience';
@@ -98,6 +99,40 @@ function geminiFreeCooldownDeferredError(remainingMs: number): ProviderCallError
     }),
     { geminiFreeCooldownDeferred: true, retryAfterMs: Math.max(0, remainingMs) },
   );
+}
+
+/**
+ * Local cooldown expiry for one classified rate-limit failure. The provider's
+ * declared reset (a daily quota's next reset, or a minute window) is
+ * authoritative when it extends beyond the configured short cooldown, so the
+ * fast in-process gate can never reopen before the persisted ledger resolver.
+ */
+export function geminiFreeFailureCooldownUntilMs(typed: ProviderCallError, nowMs: number = Date.now()): number {
+  const declared = typed.cooldownUntilMs != null && Number.isFinite(typed.cooldownUntilMs)
+    ? typed.cooldownUntilMs
+    : 0;
+  return Math.max(nowMs + geminiFreeRateLimitCooldownMs(), declared);
+}
+
+/**
+ * Merge a fresh failure into the in-process gate without ever shrinking an
+ * already-armed window. A daily reset can be hours away, so a later per-minute
+ * 429 (or a concurrent call's short RetryInfo) must not reopen the account
+ * before that reset.
+ */
+export function nextGeminiFreeCooldownUntilMs(currentUntilMs: number, typed: ProviderCallError, nowMs: number = Date.now()): number {
+  return Math.max(currentUntilMs, geminiFreeFailureCooldownUntilMs(typed, nowMs));
+}
+
+/**
+ * Failure metadata persisted on the event row. Local deferral echoes stay
+ * tagged so the resolver/metrics exclude them; genuine upstream failures carry
+ * the typed cooldown/quota fields the resolver reads on every replica.
+ */
+export function geminiFreeFailureMetadata(typed: ProviderCallError, deferred: boolean): Record<string, string> {
+  return deferred
+    ? { [GEMINI_FREE_COOLDOWN_DEFERRAL_METADATA_KEY]: 'true' }
+    : providerFailureMetadata(typed);
 }
 
 export interface GeminiFreeRouteFailoverOptions {
@@ -301,7 +336,7 @@ export function defaultClient(
                 : geminiFreeFailoverCancelled(signal)
               : classifyProviderError(error);
           if (!aborted && typed.errorClass === 'RATE_LIMIT' && (error as { geminiFreeCooldownDeferred?: unknown })?.geminiFreeCooldownDeferred !== true) {
-            geminiFreeCooldownUntilMs = Date.now() + geminiFreeRateLimitCooldownMs();
+            geminiFreeCooldownUntilMs = nextGeminiFreeCooldownUntilMs(geminiFreeCooldownUntilMs, typed);
           }
           if (typed.errorClass === 'RATE_LIMIT') {
             const reasons = Array.isArray((typed as { providerReasons?: unknown }).providerReasons)
@@ -315,7 +350,7 @@ export function defaultClient(
           await emit({
             ...base, status: statusFor(typed), latencyMs: Date.now() - started,
             actualCost: 0, errorClass: typed.errorClass, occurredAt: new Date().toISOString(),
-            ...(deferred ? { requestMetadata: { ...base.requestMetadata, [GEMINI_FREE_COOLDOWN_DEFERRAL_METADATA_KEY]: 'true' } } : {}),
+            requestMetadata: { ...base.requestMetadata, ...geminiFreeFailureMetadata(typed, deferred) },
           });
           throw typed;
         } finally {

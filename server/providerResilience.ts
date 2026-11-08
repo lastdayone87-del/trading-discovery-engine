@@ -14,23 +14,229 @@ export interface ProviderCallEvent extends Required<Pick<ProviderCallContext,'pr
   errorClass?: ProviderErrorClass; policyVersion: string; occurredAt: string;
 }
 
+export type ProviderQuotaScope = 'DAILY'|'MINUTE';
+
+export interface ProviderCallErrorOptions {
+  cause?: unknown;
+  status?: number;
+  quotaExceeded?: boolean;
+  providerReasons?: string[];
+  /**
+   * True when the failure belongs to one route/key/project and another route
+   * may still succeed. Failover loops must advance past route-scoped errors;
+   * job-scoped errors (bad prompt, unsupported model shape) still abort.
+   */
+  routeScoped?: boolean;
+  /** Provider-supplied retry delay in milliseconds. */
+  retryAfterMs?: number;
+  /** Absolute epoch-ms at which the provider says the exhausted window resets. */
+  cooldownUntilMs?: number;
+  /** Daily quotas must not be retried on the per-minute cooldown clock. */
+  quotaScope?: ProviderQuotaScope;
+  /** Bounded provider quota identifier for diagnostics (never a credential). */
+  quotaId?: string;
+}
+
 export class ProviderCallError extends Error {
   readonly status?: number;
   readonly quotaExceeded?: boolean;
   readonly providerReasons?: string[];
-  constructor(message: string, public readonly errorClass: ProviderErrorClass, public readonly retryable: boolean, options?: { cause?: unknown; status?: number; quotaExceeded?: boolean; providerReasons?: string[] }) {
+  readonly routeScoped: boolean;
+  readonly retryAfterMs?: number;
+  readonly cooldownUntilMs?: number;
+  readonly quotaScope?: ProviderQuotaScope;
+  readonly quotaId?: string;
+  constructor(message: string, public readonly errorClass: ProviderErrorClass, public readonly retryable: boolean, options?: ProviderCallErrorOptions) {
     super(message, options); this.name='ProviderCallError';
     this.status=options?.status; this.quotaExceeded=options?.quotaExceeded; this.providerReasons=options?.providerReasons;
+    this.routeScoped=options?.routeScoped===true;
+    this.retryAfterMs=options?.retryAfterMs; this.cooldownUntilMs=options?.cooldownUntilMs;
+    this.quotaScope=options?.quotaScope; this.quotaId=options?.quotaId;
   }
 }
 
-export function classifyProviderError(error: unknown): ProviderCallError {
+/** Parse Google `RetryInfo.retryDelay` values such as `"61986.75s"` or `"59s"`. */
+export function parseProviderRetryDelayMs(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return Math.floor(value * 1000);
+  const text = String(value ?? '').trim();
+  const match = /^([0-9]+(?:\.[0-9]+)?)s$/i.exec(text);
+  if (!match) return undefined;
+  const seconds = Number(match[1]);
+  return Number.isFinite(seconds) && seconds >= 0 ? Math.floor(seconds * 1000) : undefined;
+}
+
+type GoogleQuotaFailure = {
+  retryAfterMs?: number;
+  quotaScope?: ProviderQuotaScope;
+  quotaId?: string;
+};
+
+/**
+ * Extract Google quota-failure details from an SDK error. The GenAI SDK puts
+ * the complete JSON error envelope in `error.message`; direct HTTP callers may
+ * instead expose `error.response.data` or `error.details`. Never throws.
+ */
+export function extractGoogleQuotaFailure(error: unknown): GoogleQuotaFailure {
+  const value = error as any;
+  const candidates: string[] = [];
+  const push = (candidate: unknown) => {
+    if (typeof candidate === 'string' && candidate.trim()) candidates.push(candidate);
+    else if (candidate && typeof candidate === 'object') {
+      try { candidates.push(JSON.stringify(candidate)); } catch { /* ignore */ }
+    }
+  };
+  push(value?.message);
+  push(value?.response?.data);
+  push(value?.errorDetails);
+  push(value?.details);
+  push(value?.cause?.message);
+  const body = candidates.join('\n');
+  if (!body) return {};
+
+  let retryDelay: unknown;
+  let quotaId: string | undefined;
+  const visit = (node: any) => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) { node.forEach(visit); return; }
+    const type = String(node['@type'] || node.type || '');
+    if (/RetryInfo/i.test(type) && node.retryDelay != null) retryDelay ??= node.retryDelay;
+    if (/QuotaFailure/i.test(type) && Array.isArray(node.violations)) {
+      for (const violation of node.violations) {
+        const id = String(violation?.quotaId || violation?.quotaMetric || '');
+        if (!id) continue;
+        // Prefer a daily quota over a per-minute quota when both are present:
+        // the longer window is the one failover must respect.
+        if (!quotaId || (/PerDay/i.test(id) && !/PerDay/i.test(quotaId))) quotaId = id;
+      }
+    }
+    for (const child of Object.values(node)) visit(child);
+  };
+
+  for (const candidate of candidates) {
+    const start = candidate.indexOf('{');
+    if (start < 0) continue;
+    try {
+      const parsed = JSON.parse(candidate.slice(start));
+      visit(parsed);
+      if (retryDelay != null && quotaId) break;
+    } catch {
+      // Fall through to bounded regex extraction below.
+    }
+  }
+  if (retryDelay == null) {
+    const match = /"retryDelay"\s*:\s*"([^"]+)"/i.exec(body);
+    retryDelay = match?.[1];
+  }
+  if (!quotaId) {
+    const match = /"(?:quotaId|quotaMetric)"\s*:\s*"([^"]+)"/i.exec(body);
+    quotaId = match?.[1];
+  }
+  const quotaScope: ProviderQuotaScope | undefined = quotaId
+    ? (/PerDay/i.test(quotaId) ? 'DAILY' : /PerMinute/i.test(quotaId) ? 'MINUTE' : undefined)
+    : /PerDay/i.test(body) ? 'DAILY' : /PerMinute/i.test(body) ? 'MINUTE' : undefined;
+  const result: GoogleQuotaFailure = {};
+  const retryAfterMs = parseProviderRetryDelayMs(retryDelay);
+  if (retryAfterMs !== undefined) result.retryAfterMs = retryAfterMs;
+  if (quotaScope !== undefined) result.quotaScope = quotaScope;
+  if (quotaId) result.quotaId = quotaId.slice(0, 160);
+  return result;
+}
+
+/** Next midnight Pacific (Google's daily-quota reset boundary), as epoch ms. */
+export function nextPacificMidnightMs(nowMs: number = Date.now()): number {
+  const timeZone = 'America/Los_Angeles';
+  const offsetAt = (utcMs: number): number => {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    }).formatToParts(new Date(utcMs));
+    const get = (type: string) => Number(parts.find(part => part.type === type)?.value || 0);
+    const asUtc = Date.UTC(get('year'), get('month') - 1, get('day'), get('hour'), get('minute'), get('second'));
+    return asUtc - utcMs;
+  };
+  const offset = offsetAt(nowMs);
+  const local = new Date(nowMs + offset);
+  const nextLocalMidnightAsUtc = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate() + 1, 0, 0, 0);
+  // Re-evaluate the offset at the reset instant so DST transitions cannot
+  // shift the boundary by an hour.
+  return nextLocalMidnightAsUtc - offsetAt(nextLocalMidnightAsUtc - offset);
+}
+
+/**
+ * Resolve the effective cooldown expiry from a persisted rate-limit row.
+ * Provider-declared absolute cooldowns (daily quotas) win over the fixed
+ * per-minute cooldown when they extend further into the future.
+ */
+export function providerCooldownExpiryMs(
+  occurredAt: unknown,
+  cooldownUntilMs: unknown,
+  defaultCooldownMs: number,
+  nowMs: number = Date.now(),
+): number | undefined {
+  const occurredMs = occurredAt == null ? NaN : new Date(occurredAt as any).getTime();
+  const declaredMs = Number(cooldownUntilMs);
+  const hasDeclared = cooldownUntilMs != null && cooldownUntilMs !== '' && Number.isFinite(declaredMs);
+  const fixedExpiry = Number.isFinite(occurredMs) ? occurredMs + defaultCooldownMs : undefined;
+  const expiry = Math.max(fixedExpiry ?? 0, hasDeclared ? declaredMs : 0) || undefined;
+  if (expiry === undefined || expiry <= nowMs) return undefined;
+  return expiry;
+}
+
+function errorText(value: any): string {
+  const pieces = [value?.message];
+  if (value?.response?.data) {
+    try { pieces.push(typeof value.response.data === 'string' ? value.response.data : JSON.stringify(value.response.data)); } catch { /* ignore */ }
+  }
+  return pieces.map(piece => String(piece ?? '')).join('\n');
+}
+
+export function classifyProviderError(error: unknown, nowMs: number = Date.now(), provider?: string): ProviderCallError {
   if (error instanceof ProviderCallError) return error;
   const value=error as any; const message=String(value?.message||value||'Provider call failed');
+  const status=Number(value?.status||value?.code)||undefined;
+  const reasons=Array.isArray(value?.providerReasons)?value.providerReasons.map(String):[];
+  const body=errorText(value);
+  // Route-scoped credential handling is meaningful for the semantic provider
+  // boundaries, where another key/project can still serve. Other callers
+  // (for example YouTube) keep their previous transient classification for a
+  // non-quota 403 so key rotation remains free to try another key.
+  const routeCredentialFailure = provider === undefined || provider === 'gemini' || provider === 'gemini-free' || provider === 'groq';
   if (value?.name==='AbortError') return new ProviderCallError('Provider call was cancelled.','CANCELLED',true,{cause:error});
-  if (value?.status===429 || value?.code===429 || /429|RESOURCE_EXHAUSTED|rate.?limit|quota/i.test(message)) return new ProviderCallError('Provider rate limit reached.','RATE_LIMIT',true,{cause:error,status:Number(value?.status||value?.code)||undefined,quotaExceeded:value?.quotaExceeded,providerReasons:value?.providerReasons});
-  if ([408,500,502,503,504].includes(Number(value?.status||value?.code)) || /ECONNRESET|ETIMEDOUT|high demand|temporar/i.test(message)) return new ProviderCallError('Transient provider failure.','TRANSIENT',true,{cause:error});
-  if ([400,404,422].includes(Number(value?.status||value?.code))) return new ProviderCallError('Permanent provider input failure.','PERMANENT_INPUT',false,{cause:error,status:Number(value?.status||value?.code)||undefined,providerReasons:value?.providerReasons});
+  if (status===429 || /429|RESOURCE_EXHAUSTED|rate.?limit|quota/i.test(message)) {
+    const quota=extractGoogleQuotaFailure(error);
+    const quotaReasons=quota.quotaScope?[`PROVIDER_QUOTA_${quota.quotaScope}`]:[];
+    return new ProviderCallError('Provider rate limit reached.','RATE_LIMIT',true,{
+      cause:error,status,quotaExceeded:value?.quotaExceeded??!!quota.quotaId,
+      providerReasons:[...reasons,...quotaReasons],
+      retryAfterMs:quota.retryAfterMs,
+      cooldownUntilMs:quota.retryAfterMs!=null?nowMs+quota.retryAfterMs:quota.quotaScope==='DAILY'?nextPacificMidnightMs(nowMs):undefined,
+      quotaScope:quota.quotaScope,quotaId:quota.quotaId,
+    });
+  }
+  if (status===400 && /organization_restricted/i.test(body)) {
+    return new ProviderCallError('Provider route is restricted to a different organization.','CREDENTIALS_EXHAUSTED',false,{
+      cause:error,status,providerReasons:[...reasons,'GROQ_ORGANIZATION_RESTRICTED'],routeScoped:true,
+    });
+  }
+  if (status===400 && /json_validate_failed|json validation failed/i.test(body)) {
+    return new ProviderCallError('Provider rejected the model completion as invalid JSON.','TRANSIENT',true,{
+      cause:error,status,providerReasons:[...reasons,'GROQ_JSON_VALIDATION_FAILED'],routeScoped:true,
+    });
+  }
+  if (status===401 || status===403) {
+    if (!routeCredentialFailure) return new ProviderCallError('Transient provider failure.','TRANSIENT',true,{cause:error,status});
+    // Credential rejection is route-scoped: advance to another independent
+    // account. It stays retryable (TRANSIENT) because a different route may
+    // serve; it is never rate-limit pressure, so it must not arm a cooldown.
+    return new ProviderCallError('Provider rejected the route credential.','TRANSIENT',true,{
+      cause:error,status,providerReasons:[...reasons,'PROVIDER_ROUTE_UNAUTHORIZED'],routeScoped:true,
+    });
+  }
+  // Transient-looking messages keep their historical classification even when
+  // carried on a 400/404/422 status: the specific 400 branches above already
+  // claimed the two conditions that must not be treated as transport noise.
+  if ([408,500,502,503,504].includes(status) || /ECONNRESET|ETIMEDOUT|high demand|temporar/i.test(message)) return new ProviderCallError('Transient provider failure.','TRANSIENT',true,{cause:error,status});
+  if (status===400 || status===404 || status===422) return new ProviderCallError('Permanent provider input failure.','PERMANENT_INPUT',false,{cause:error,status,providerReasons:value?.providerReasons});
   return new ProviderCallError('Provider call failed.','TRANSIENT',true,{cause:error});
 }
 
@@ -72,6 +278,10 @@ type GeminiCapacitySnapshot = {
   nowMs: number;
   lastGeminiAtMs?: number;
   lastRateLimitAtMs?: number;
+  /** Absolute expiry carried by the latest rate-limit event (daily quota reset). */
+  rateLimitCooldownUntilMs?: number;
+  /** Quota scope of the latest rate-limit event, when the provider declared it. */
+  rateLimitQuotaScope?: ProviderQuotaScope;
   lastSemanticAtMs?: number;
   lastVocabularyAtMs?: number;
 };
@@ -89,7 +299,12 @@ type GeminiCapacityConfig = {
 export type GeminiCapacityDecision = { action:'RUN'|'WAIT'|'DEFER'; waitMs:number; reasonCode?:string };
 
 function envMs(name:string, fallback:number):number {
-  const parsed=Number(process.env[name]);
+  const raw=process.env[name];
+  // Empty values are how deployment UIs represent "unset"; treating them as
+  // numeric zero would silently disable the fallback window (e.g. the 90s
+  // Gemini semantic cooldown).
+  if(raw===undefined||raw===null||raw.trim()==='')return fallback;
+  const parsed=Number(raw);
   return Number.isFinite(parsed)&&parsed>=0?parsed:fallback;
 }
 
@@ -110,15 +325,29 @@ export function decideGeminiCapacity(operation:string, snapshot:GeminiCapacitySn
   const maxInlineWaitMs=config.maxInlineWaitMs??8000;
   const semanticMaxInlineWaitMs=config.semanticMaxInlineWaitMs??maxInlineWaitMs;
   const globalWait=Math.max(0,config.globalMinIntervalMs-age(snapshot.lastGeminiAtMs));
+  // A provider-declared absolute reset (daily quota) is authoritative and
+  // must not be retried on the short per-minute cooldown clock. For per-minute
+  // limits the provider may declare a shorter retry delay than our fixed
+  // cooldown; take the larger of the two so this gate never reopens before the
+  // persisted resolver (providerCooldownExpiryMs) does.
+  const declaredRateLimitWait=snapshot.rateLimitCooldownUntilMs!=null
+    ? Math.max(0,snapshot.rateLimitCooldownUntilMs-snapshot.nowMs)
+    : 0;
+  const dailyDeclaredExpired=snapshot.rateLimitQuotaScope==='DAILY'&&declaredRateLimitWait<=0;
+  const minuteRateLimitWait=dailyDeclaredExpired
+    ? 0
+    : age(snapshot.lastRateLimitAtMs)<config.semanticRateLimitCooldownMs
+      ? config.semanticRateLimitCooldownMs-age(snapshot.lastRateLimitAtMs)
+      : 0;
   if(operation===GEMINI_VOCABULARY_OPERATION){
-    if(age(snapshot.lastRateLimitAtMs)<config.vocabularyRateLimitSuppressionMs) return {action:'DEFER',waitMs:0,reasonCode:'VOCABULARY_DEFERRED_RATE_PRESSURE'};
+    if(declaredRateLimitWait>0||(!dailyDeclaredExpired&&age(snapshot.lastRateLimitAtMs)<config.vocabularyRateLimitSuppressionMs)) return {action:'DEFER',waitMs:0,reasonCode:'VOCABULARY_DEFERRED_RATE_PRESSURE'};
     if(age(snapshot.lastSemanticAtMs)<config.vocabularySemanticQuietMs) return {action:'DEFER',waitMs:0,reasonCode:'VOCABULARY_DEFERRED_SEMANTIC_PRIORITY'};
     const vocabularyWait=Math.max(0,config.vocabularyMinIntervalMs-age(snapshot.lastVocabularyAtMs));
     const waitMs=Math.max(globalWait,vocabularyWait);
     if(waitMs>maxInlineWaitMs) return {action:'DEFER',waitMs:0,reasonCode:'VOCABULARY_DEFERRED_CAPACITY_WAIT'};
     return {action:waitMs>0?'WAIT':'RUN',waitMs};
   }
-  const rateLimitWait=age(snapshot.lastRateLimitAtMs)<config.semanticRateLimitCooldownMs?config.semanticRateLimitCooldownMs-age(snapshot.lastRateLimitAtMs):0;
+  const rateLimitWait=Math.max(declaredRateLimitWait,minuteRateLimitWait);
   const waitMs=Math.max(globalWait,rateLimitWait);
   const isSemantic=operation===GEMINI_SEMANTIC_OPERATION;
   const waitCeiling=isSemantic?semanticMaxInlineWaitMs:maxInlineWaitMs;
@@ -142,21 +371,28 @@ export function decideGeminiCapacity(operation:string, snapshot:GeminiCapacitySn
  * It queries the same provider_call_events table used by acquireGeminiCapacity,
  * so there are no independent clocks or parallel rate limiters.
  */
-export async function getGeminiSemanticCooldownExpiry(nowMs: number = Date.now()): Promise<number | undefined> {
-  const config = geminiCapacityConfig();
-  try {
+export async function getGeminiSemanticCooldownExpiry(
+  nowMs: number = Date.now(),
+  query: (sql: string, values?: unknown[]) => Promise<{ rows: any[] }> = async (sql, values) => {
     const { getDb } = await import('./db');
     const db = await getDb();
-    const res = await db.query(
-      `SELECT occurred_at FROM provider_call_events
-       WHERE provider='gemini' AND status='RATE_LIMITED'
-       ORDER BY occurred_at DESC LIMIT 1`
+    return db.query(sql, values);
+  },
+): Promise<number | undefined> {
+  const config = geminiCapacityConfig();
+  try {
+    const res = await query(
+      `SELECT occurred_at,
+              MAX((request_metadata->>'cooldownUntilMs')::bigint)
+                FILTER (WHERE request_metadata->>'cooldownUntilMs' ~ '^[0-9]+$') OVER () AS cooldown_until_ms
+         FROM provider_call_events
+        WHERE provider='gemini' AND status='RATE_LIMITED'
+          AND occurred_at >= now() - interval '2 days'
+        ORDER BY occurred_at DESC LIMIT 1`
     );
-    if (!res.rows[0]?.occurred_at) return undefined;
-    const lastRateLimitMs = new Date(res.rows[0].occurred_at).getTime();
-    const elapsed = nowMs - lastRateLimitMs;
-    if (elapsed >= config.semanticRateLimitCooldownMs) return undefined;
-    return lastRateLimitMs + config.semanticRateLimitCooldownMs;
+    const row = res.rows[0];
+    if (!row?.occurred_at) return undefined;
+    return providerCooldownExpiryMs(row.occurred_at, row.cooldown_until_ms, config.semanticRateLimitCooldownMs, nowMs);
   } catch {
     return undefined;
   }
@@ -188,17 +424,19 @@ export async function getGeminiOrgSemanticCooldownExpiry(orgId: string, nowMs: n
     const { getDb } = await import('./db');
     const db = await getDb();
     const res = await db.query(
-      `SELECT occurred_at FROM provider_call_events
-       WHERE provider='gemini' AND status='RATE_LIMITED'
-       AND request_metadata->>'geminiOrg'=$1
-       ORDER BY occurred_at DESC LIMIT 1`,
+      `SELECT occurred_at,
+              MAX((request_metadata->>'cooldownUntilMs')::bigint)
+                FILTER (WHERE request_metadata->>'cooldownUntilMs' ~ '^[0-9]+$') OVER () AS cooldown_until_ms
+         FROM provider_call_events
+        WHERE provider='gemini' AND status='RATE_LIMITED'
+          AND request_metadata->>'geminiOrg'=$1
+          AND occurred_at >= now() - interval '2 days'
+        ORDER BY occurred_at DESC LIMIT 1`,
       [orgId]
     );
-    if (!res.rows[0]?.occurred_at) return undefined;
-    const lastRateLimitMs = new Date(res.rows[0].occurred_at).getTime();
-    const elapsed = nowMs - lastRateLimitMs;
-    if (elapsed >= config.semanticRateLimitCooldownMs) return undefined;
-    return lastRateLimitMs + config.semanticRateLimitCooldownMs;
+    const row = res.rows[0];
+    if (!row?.occurred_at) return undefined;
+    return providerCooldownExpiryMs(row.occurred_at, row.cooldown_until_ms, config.semanticRateLimitCooldownMs, nowMs);
   } catch {
     return undefined;
   }
@@ -340,12 +578,14 @@ async function acquireGeminiCapacity(context:ProviderCallContext,signal?:AbortSi
       // rows feed its cooldown window (strict org tag match — untagged rows
       // cool no account), so one exhausted account never paces the healthy
       // ones.
-      queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND status='RATE_LIMITED' AND request_metadata->>'geminiOrg'=$1 ORDER BY occurred_at DESC LIMIT 1`,[orgId],signal,deadlineAtMs),
+      queryWithDeadline(client,`SELECT occurred_at, request_metadata->>'quotaScope' AS quota_scope, MAX((request_metadata->>'cooldownUntilMs')::bigint) FILTER (WHERE request_metadata->>'cooldownUntilMs' ~ '^[0-9]+$') OVER () AS cooldown_until_ms FROM provider_call_events WHERE provider='gemini' AND status='RATE_LIMITED' AND request_metadata->>'geminiOrg'=$1 AND occurred_at >= now() - interval '2 days' ORDER BY occurred_at DESC LIMIT 1`,[orgId],signal,deadlineAtMs),
       queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND operation=$1 AND COALESCE(request_metadata->>'geminiRoute',$2)=$2 ORDER BY occurred_at DESC LIMIT 1`,[GEMINI_SEMANTIC_OPERATION,routeId],signal,deadlineAtMs),
       queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND operation=$1 AND COALESCE(request_metadata->>'geminiRoute',$2)=$2 ORDER BY occurred_at DESC LIMIT 1`,[GEMINI_VOCABULARY_OPERATION,routeId],signal,deadlineAtMs)
     ]);
     const at=(row:any)=>row?.occurred_at?new Date(row.occurred_at).getTime():undefined;
-    const decision=decideGeminiCapacity(context.operation,{nowMs:Date.now(),lastGeminiAtMs:at(lastAny.rows[0]),lastRateLimitAtMs:at(lastRate.rows[0]),lastSemanticAtMs:at(lastSemantic.rows[0]),lastVocabularyAtMs:at(lastVocabulary.rows[0])});
+    const declaredCooldownUntil=Number(lastRate.rows[0]?.cooldown_until_ms);
+    const quotaScope=lastRate.rows[0]?.quota_scope;
+    const decision=decideGeminiCapacity(context.operation,{nowMs:Date.now(),lastGeminiAtMs:at(lastAny.rows[0]),lastRateLimitAtMs:at(lastRate.rows[0]),rateLimitCooldownUntilMs:Number.isFinite(declaredCooldownUntil)?declaredCooldownUntil:undefined,rateLimitQuotaScope:quotaScope==='DAILY'||quotaScope==='MINUTE'?quotaScope:undefined,lastSemanticAtMs:at(lastSemantic.rows[0]),lastVocabularyAtMs:at(lastVocabulary.rows[0])});
     if(decision.action==='DEFER'){
       await client.query({text:'SELECT pg_advisory_unlock($1)',values:[GEMINI_CAPACITY_LOCK],query_timeout:1000}).catch(()=>undefined);
       client.release(); client=undefined;
@@ -374,6 +614,19 @@ async function acquireGeminiCapacity(context:ProviderCallContext,signal?:AbortSi
 
 function safeProviderReasons(values?:string[]):string[]{
   return Array.isArray(values)?values.map(String).filter(value=>/^[A-Z0-9_.:-]{1,80}$/.test(value)).slice(0,6):[];
+}
+
+/** Bounded, credential-free failure metadata persisted for cooldown/health readers. */
+export function providerFailureMetadata(typed:ProviderCallError):Record<string,string>{
+  const extra:Record<string,string>={};
+  if(typed.cooldownUntilMs!=null&&Number.isFinite(typed.cooldownUntilMs))extra.cooldownUntilMs=String(Math.floor(typed.cooldownUntilMs));
+  if(typed.retryAfterMs!=null&&Number.isFinite(typed.retryAfterMs))extra.retryAfterMs=String(Math.floor(typed.retryAfterMs));
+  if(typed.quotaScope)extra.quotaScope=typed.quotaScope;
+  if(typed.quotaId)extra.quotaId=typed.quotaId.slice(0,160);
+  if(typed.routeScoped)extra.routeScoped='true';
+  const reasons=safeProviderReasons(typed.providerReasons);
+  if(reasons.length)extra.providerReasons=reasons.join(',');
+  return extra;
 }
 
 export async function executeProviderCall<T>(args:{context:ProviderCallContext; timeoutMs:number; enabled?:boolean; signal?:AbortSignal; call:(signal:AbortSignal)=>Promise<T>; emit:ProviderEventSink; trace?:(stage:string)=>void}):Promise<T>{
@@ -407,10 +660,10 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
     const callerAbortClass=args.signal?.aborted?(args.signal.reason as {errorClass?:string}|undefined)?.errorClass:undefined;
     const typed=timedOut?new ProviderCallError(`Provider call exceeded ${args.timeoutMs}ms deadline.`,'TIMEOUT',true,{cause:error})
       :callerAbortClass==='TIMEOUT'?new ProviderCallError('Provider call exceeded the caller deadline.','TIMEOUT',true,{cause:error})
-        :classifyProviderError(error);
+        :classifyProviderError(error,Date.now(),args.context.provider);
     args.trace?.(`provider-call-caught (${typed.errorClass})`);
     if(args.context.provider==='gemini')console.warn('[Gemini Provider Diagnostic]',JSON.stringify({operation:args.context.operation,errorClass:typed.errorClass,status:typed.status??null,retryable:typed.retryable,providerReasons:safeProviderReasons(typed.providerReasons)}));
-    const event:ProviderCallEvent={...base,status:statusFor(typed),latencyMs:Date.now()-started,actualCost:0,errorClass:typed.errorClass,occurredAt:new Date().toISOString()};
+    const event:ProviderCallEvent={...base,requestMetadata:{...base.requestMetadata,...providerFailureMetadata(typed)},status:statusFor(typed),latencyMs:Date.now()-started,actualCost:0,errorClass:typed.errorClass,occurredAt:new Date().toISOString()};
     if(capacityLease&&(typed.errorClass==='TIMEOUT'||typed.errorClass==='CANCELLED')){
       const cleanupController=new AbortController();
       const cleanupDeadlineAtMs=Date.now()+GEMINI_OUTCOME_CLEANUP_TIMEOUT_MS;

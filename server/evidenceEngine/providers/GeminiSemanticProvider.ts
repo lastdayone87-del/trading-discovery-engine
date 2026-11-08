@@ -186,6 +186,13 @@ export async function runGeminiRouteFailover<T>(
         if (!ordered.some(candidate => !tried.has(candidate))) throw error;
         continue;
       }
+      if (error instanceof ProviderCallError && error.routeScoped) {
+        // A rejected credential belongs to one key/project, not to every key
+        // that shares its quota label: sibling keys may still serve. Only the
+        // failing route is marked tried.
+        if (!ordered.some(candidate => !tried.has(candidate))) throw error;
+        continue;
+      }
       if (!(error instanceof ProviderCallError) || !error.retryable) throw error;
     }
   }
@@ -258,7 +265,7 @@ function defaultClient(): SemanticModelClient | undefined {
         // Carry the failing route AND its account for per-account failover
         // and retry scheduling. The ledger tags rows with both; these
         // sidecars cover errors that never reach persistence.
-        if (error instanceof ProviderCallError && error.errorClass === 'RATE_LIMIT') {
+        if (error instanceof ProviderCallError && (error.errorClass === 'RATE_LIMIT' || error.routeScoped)) {
           (error as { geminiRoute?: string }).geminiRoute ??= route.id;
           (error as { geminiOrg?: string }).geminiOrg ??= geminiRouteOrg(route);
         }

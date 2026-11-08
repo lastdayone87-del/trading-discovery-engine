@@ -179,6 +179,74 @@ function armGroqOrgCooldown(orgId: string, nowMs: number = Date.now()): void {
   groqOrgCooldownUntilMs.set(orgId, nowMs + groqRateLimitCooldownMs());
 }
 
+/**
+ * Route-health quarantine for credentials rejected at the organization level
+ * (`organization_restricted`). The key is route-scoped, not prompt-scoped:
+ * advancing to another account can succeed, while retrying the same account
+ * only burns time. In-process TTL state makes the skip immediate for every
+ * worker in this replica; telemetry records the event for operators and other
+ * replicas learn on their next attempt. Key values never enter this map.
+ */
+export const DEFAULT_GROQ_RESTRICTED_ROUTE_TTL_MS = 60 * 60 * 1000;
+const groqOrgDisabledUntilMs = new Map<string, number>();
+
+export function groqRestrictedRouteTtlMs(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number(env.GROQ_RESTRICTED_ROUTE_TTL_MS || DEFAULT_GROQ_RESTRICTED_ROUTE_TTL_MS);
+  return parsed > 0 ? clampTimeoutMs(parsed, DEFAULT_GROQ_RESTRICTED_ROUTE_TTL_MS) : DEFAULT_GROQ_RESTRICTED_ROUTE_TTL_MS;
+}
+
+/** In-process disabled-route remaining time for one quota organization. */
+export function groqOrgDisabledRemainingMs(orgId: string, nowMs: number = Date.now()): number {
+  return Math.max(0, (groqOrgDisabledUntilMs.get(orgId) || 0) - nowMs);
+}
+
+function disableGroqOrg(orgId: string, nowMs: number = Date.now()): number {
+  const untilMs = nowMs + groqRestrictedRouteTtlMs();
+  groqOrgDisabledUntilMs.set(orgId, untilMs);
+  return untilMs;
+}
+
+export interface GroqRouteHealth {
+  route: string;
+  org: string;
+  status: 'healthy'|'cooling'|'disabled';
+  cooldownRemainingMs: number;
+  disabledRemainingMs: number;
+}
+
+/** Credential-free route health for queue diagnostics and operator triage. */
+export function getGroqRouteHealth(nowMs: number = Date.now()): GroqRouteHealth[] {
+  return configuredGroqRoutes().map(route => {
+    const org = groqRouteOrg(route);
+    const disabledRemainingMs = groqOrgDisabledRemainingMs(org, nowMs);
+    const cooldownRemainingMs = groqOrgCooldownRemainingMs(org, nowMs);
+    return {
+      route: route.id,
+      org,
+      status: disabledRemainingMs > 0 ? 'disabled' : cooldownRemainingMs > 0 ? 'cooling' : 'healthy',
+      cooldownRemainingMs,
+      disabledRemainingMs,
+    };
+  });
+}
+
+function groqPoolDisabledError(remainingMs: number): ProviderCallError {
+  return Object.assign(
+    new ProviderCallError('All configured Groq routes are temporarily disabled by provider restrictions.', 'CREDENTIALS_EXHAUSTED', true, {
+      providerReasons: ['GROQ_ROUTE_POOL_DISABLED'],
+      routeScoped: true,
+      retryAfterMs: Math.max(0, remainingMs),
+      cooldownUntilMs: Date.now() + Math.max(0, remainingMs),
+    }),
+    { groqRoutePoolDisabled: true },
+  );
+}
+
+/** Test-only reset for the in-process restricted-route quarantine. */
+export function resetGroqRouteHealthForTests(): void {
+  groqOrgDisabledUntilMs.clear();
+}
+
 /** Test-only reset for the in-process cooldown. */
 export function resetGroqCooldownForTests(orgId?: string): void {
   if (orgId === undefined) {
@@ -213,6 +281,19 @@ export interface GroqRouteFailoverOptions {
   nowMs?: () => number;
   /** Caller cancellation: no route may start after this signal aborts. */
   signal?: AbortSignal;
+  /**
+   * Content/model-output failures repeat across accounts at temperature 0.
+   * Try at most this many routes before surfacing the failure instead of
+   * spending one paced request per remaining account.
+   */
+  maxContentFailures?: number;
+}
+
+const DEFAULT_GROQ_MAX_CONTENT_FAILURES = 2;
+function isGroqContentFailure(error: unknown): boolean {
+  if (!(error instanceof ProviderCallError)) return false;
+  const reasons = Array.isArray(error.providerReasons) ? error.providerReasons : [];
+  return reasons.includes('GROQ_JSON_VALIDATION_FAILED') || reasons.includes('GROQ_SEMANTIC_CONTENT_INVALID');
 }
 
 function groqFailoverCancelled(signal?: AbortSignal): ProviderCallError {
@@ -226,6 +307,8 @@ export async function runGroqRouteFailover<T>(
 ): Promise<T> {
   const isCooling = opts?.isOrgCooling ?? (() => false);
   let lastError: unknown;
+  let contentFailures = 0;
+  const maxContentFailures = Math.max(1, Math.floor(opts?.maxContentFailures ?? DEFAULT_GROQ_MAX_CONTENT_FAILURES));
   const tried = new Set<GroqRoute>();
   // Stable order, healthy orgs first: configured order is preserved within
   // each group, so single-org deployments behave exactly as before.
@@ -267,6 +350,29 @@ export async function runGroqRouteFailover<T>(
         // protection). Different-org routes hold independent quotas.
         for (const candidate of ordered) {
           if (groqRouteOrg(candidate) === failedOrg) tried.add(candidate);
+        }
+        if (!ordered.some(candidate => !tried.has(candidate))) throw error;
+        continue;
+      }
+      if (isGroqContentFailure(error)) {
+        // Invalid/missing model output is independent of the account. Cap
+        // route attempts so a deterministic bad completion cannot burn the
+        // whole pool, then surface the failure to the caller/fallback.
+        contentFailures++;
+        if (contentFailures >= maxContentFailures) throw error;
+        continue;
+      }
+      if (error instanceof ProviderCallError && error.routeScoped) {
+        // An organization restriction belongs to every route in that account,
+        // so skip its siblings. A rejected credential (401/403) belongs to the
+        // single key only: sibling keys may still be valid, so advance to them
+        // instead of suppressing the whole org.
+        const reasons = Array.isArray(error.providerReasons) ? error.providerReasons : [];
+        if (reasons.includes('GROQ_ORGANIZATION_RESTRICTED')) {
+          const failedOrg = failedGroqOrg(error, route);
+          for (const candidate of ordered) {
+            if (groqRouteOrg(candidate) === failedOrg) tried.add(candidate);
+          }
         }
         if (!ordered.some(candidate => !tried.has(candidate))) throw error;
         continue;
@@ -430,14 +536,27 @@ export async function runGroqTextCompletion(
   // before pacing or fetching, so no wait is spent on a short-circuit and
   // fallback stays fast. The shared failover loop is untouched (semantic
   // behavior identical); expiry is time-based so orgs rejoin on their own.
-  const usable = routes.filter(route => groqOrgCooldownRemainingMs(groqRouteOrg(route)) <= 0);
+  const usable = routes.filter(route =>
+    groqOrgCooldownRemainingMs(groqRouteOrg(route)) <= 0 &&
+    groqOrgDisabledRemainingMs(groqRouteOrg(route)) <= 0
+  );
   if (!usable.length) {
-    const remainingMs = Math.max(0, ...routes.map(route => groqOrgCooldownRemainingMs(groqRouteOrg(route))));
+    // Report the earliest route that can become usable, not the longest ban:
+    // a mixed cooling/quarantined pool is not "all disabled", and a route
+    // whose 90s cooldown ends first makes the pool usable before a one-hour
+    // quarantine elsewhere expires.
+    const remainingByRoute = routes.map(route => {
+      const org = groqRouteOrg(route);
+      return Math.max(groqOrgDisabledRemainingMs(org), groqOrgCooldownRemainingMs(org));
+    });
+    const earliestRemainingMs = Math.max(0, Math.min(...remainingByRoute));
+    const everyRouteDisabled = routes.every(route => groqOrgDisabledRemainingMs(groqRouteOrg(route)) > 0);
+    if (everyRouteDisabled) throw groqPoolDisabledError(earliestRemainingMs);
     throw Object.assign(
       new ProviderCallError('Groq routes cooling; deferring.', 'RATE_LIMIT', true, {
         providerReasons: [GROQ_RATE_LIMITED_REASON],
       }),
-      { groqCooldownDeferred: true, retryAfterMs: remainingMs }
+      { groqCooldownDeferred: true, retryAfterMs: earliestRemainingMs }
     );
   }
   const operation = input.operation || GROQ_VOCABULARY_OPERATION;
@@ -555,8 +674,7 @@ export async function runGroqTextCompletion(
       }
       const text = bounded.text;
       if (!res.ok) {
-        throw Object.assign(new Error(`Groq HTTP ${res.status}: ${text.slice(0, 500)}`),
-          { status: res.status, code: res.status });
+        throw classifyGroqHttpError(res.status, text);
       }
       const content = (JSON.parse(text) as any)?.choices?.[0]?.message?.content;
       if (typeof content !== 'string' || !content) {
@@ -618,20 +736,35 @@ export async function runGroqTextCompletion(
       if (!aborted && typed.errorClass === 'RATE_LIMIT' && (error as { groqCooldownDeferred?: unknown })?.groqCooldownDeferred !== true) {
         armGroqOrgCooldown(orgId);
       }
+      const reasons = Array.isArray((typed as { providerReasons?: unknown }).providerReasons)
+        ? ((typed as { providerReasons?: unknown }).providerReasons as string[]).map(String)
+        : [];
       if (typed.errorClass === 'RATE_LIMIT') {
-        const reasons = Array.isArray((typed as { providerReasons?: unknown }).providerReasons)
-          ? ((typed as { providerReasons?: unknown }).providerReasons as string[]).map(String)
-          : [];
         if (!reasons.includes(GROQ_RATE_LIMITED_REASON)) {
           (typed as { providerReasons?: string[] }).providerReasons = [...reasons, GROQ_RATE_LIMITED_REASON];
         }
-        (typed as { groqOrg?: string }).groqOrg = orgId;
+      }
+      if (typed.routeScoped) (typed as { groqOrg?: string }).groqOrg = orgId;
+      const failureMetadata: Record<string, string> = {};
+      if (reasons.includes('GROQ_ORGANIZATION_RESTRICTED')) {
+        const disabledUntilMs = disableGroqOrg(orgId);
+        failureMetadata.groqRouteDisabled = 'true';
+        failureMetadata.groqDisabledUntilMs = String(disabledUntilMs);
+        console.warn(JSON.stringify({
+          event: 'groq_route_disabled', route: route.id, org: orgId,
+          reason: 'GROQ_ORGANIZATION_RESTRICTED', disabledUntilMs,
+          timestamp: new Date().toISOString(),
+        }));
       }
       const deferred = (error as { groqCooldownDeferred?: unknown })?.groqCooldownDeferred === true;
       await emitBounded(emit, {
         ...base, status: statusFor(typed), latencyMs: Date.now() - started,
         actualCost: 0, errorClass: typed.errorClass, occurredAt: new Date().toISOString(),
-        ...(deferred ? { requestMetadata: { ...base.requestMetadata, groqCooldownDeferral: 'true' } } : {}),
+        requestMetadata: {
+          ...base.requestMetadata,
+          ...(deferred ? { groqCooldownDeferral: 'true' } : {}),
+          ...failureMetadata,
+        },
       }, emitBudgetMs);
       throw typed;
     } finally {
@@ -679,6 +812,122 @@ function groqRequestExtras(env: NodeJS.ProcessEnv = process.env): Record<string,
   return extras;
 }
 
+/**
+ * Route-scoped HTTP failure classifier. Groq returns HTTP 400 for two very
+ * different conditions: an organization-restricted key (the key is dead for
+ * this org, another route may work) and a model completion that failed the
+ * provider's JSON validator (content-local, bounded retry). Conflating either
+ * with a job-scoped input error aborts failover or burns the whole pool.
+ */
+export function classifyGroqHttpError(status: number, bodyText: string): ProviderCallError {
+  const body = String(bodyText || '').slice(0, 2000);
+  if (status === 400 && /organization_restricted/i.test(body)) {
+    return new ProviderCallError('Groq route is restricted to a different organization.', 'CREDENTIALS_EXHAUSTED', false, {
+      status, providerReasons: ['GROQ_ORGANIZATION_RESTRICTED'], routeScoped: true,
+    });
+  }
+  if (status === 400 && /json_validate_failed|json validation failed/i.test(body)) {
+    return new ProviderCallError('Groq rejected the model completion as invalid JSON.', 'TRANSIENT', true, {
+      status, providerReasons: ['GROQ_JSON_VALIDATION_FAILED'], routeScoped: true,
+    });
+  }
+  return classifyProviderError(Object.assign(new Error(`Groq HTTP ${status}: ${body}`), { status, code: status }));
+}
+
+export const DEFAULT_GROQ_MAX_PROMPT_CHARS = 24_000;
+export const DEFAULT_GROQ_MAX_PROMPT_TOKENS = 6_000;
+export function groqMaxPromptChars(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number(env.GROQ_MAX_PROMPT_CHARS || DEFAULT_GROQ_MAX_PROMPT_CHARS);
+  return Number.isFinite(parsed) && parsed >= 4_000 ? Math.min(Math.floor(parsed), 200_000) : DEFAULT_GROQ_MAX_PROMPT_CHARS;
+}
+export function groqMaxPromptTokens(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number(env.GROQ_MAX_PROMPT_TOKENS || DEFAULT_GROQ_MAX_PROMPT_TOKENS);
+  return Number.isFinite(parsed) && parsed >= 1_000 ? Math.min(Math.floor(parsed), 64_000) : DEFAULT_GROQ_MAX_PROMPT_TOKENS;
+}
+
+/**
+ * Conservative token estimate for rate-limit budgeting. Groq's free tier is
+ * metered in tokens, not characters, and non-ASCII scripts (CJK, Thai, etc.)
+ * can approach one token per character. ASCII is estimated at four chars per
+ * token. The estimate intentionally errs high to avoid 429s.
+ */
+export function estimateGroqTokens(text: string): number {
+  let tokens = 0;
+  for (const character of text) {
+    tokens += (character.codePointAt(0) as number) < 128 ? 0.25 : 1;
+  }
+  return Math.ceil(tokens);
+}
+
+function truncateToTokenBudget(text: string, maxTokens: number): string {
+  const estimate = estimateGroqTokens(text);
+  if (estimate <= maxTokens) return text;
+  return text.slice(0, Math.max(0, Math.floor(text.length * (maxTokens / estimate))));
+}
+
+/** Fail closed when even the fixed prompt structure exceeds the budget. */
+function groqPromptBudgetError(): ProviderCallError {
+  return new ProviderCallError(
+    'Groq semantic prompt exceeds the configured budget even after removing document text.',
+    'PERMANENT_INPUT',
+    false,
+    { providerReasons: ['GROQ_PROMPT_BUDGET_EXCEEDED'] },
+  );
+}
+
+/**
+ * Bound a semantic prompt to Groq's free-tier token budget without dropping
+ * any field references. All documents stay present (so every citation remains
+ * attributable); only their text is shortened. `contextTruncated` tells the
+ * model the evidence set is partial. Both a character ceiling and a
+ * script-aware token estimate are enforced because Groq meters tokens, and a
+ * 24k-character CJK prompt can cost far more tokens than its Latin equivalent.
+ */
+export function capGroqSemanticPrompt(
+  prompt: string,
+  maxChars: number,
+  maxTokens: number = groqMaxPromptTokens(),
+): string {
+  if (prompt.length <= maxChars && estimateGroqTokens(prompt) <= maxTokens) return prompt;
+  let parsed: any;
+  try { parsed = JSON.parse(prompt); } catch { return truncateToTokenBudget(prompt.slice(0, maxChars), maxTokens); }
+  if (!Array.isArray(parsed?.documents)) return truncateToTokenBudget(prompt.slice(0, maxChars), maxTokens);
+  const documents = parsed.documents.map((document: any) => ({
+    ...document,
+    text: String(document?.text || ''),
+  }));
+  const build = (perDocumentChars: number) => JSON.stringify({
+    ...parsed,
+    contextTruncated: true,
+    documents: documents.map((document: any) => ({
+      ...document,
+      text: document.text.slice(0, Math.max(0, Math.floor(perDocumentChars))),
+    })),
+  });
+  const overhead = JSON.stringify({
+    ...parsed,
+    contextTruncated: true,
+    documents: documents.map((document: any) => ({ ...document, text: '' })),
+  }).length;
+  const totalTextChars = documents.reduce((sum: number, document: any) => sum + document.text.length, 0);
+  const available = Math.max(0, maxChars - overhead);
+  let perDocumentChars = documents.length
+    ? Math.min(totalTextChars, Math.floor(available / documents.length))
+    : available;
+  const exceeds = (value: string) => value.length > maxChars || estimateGroqTokens(value) > maxTokens;
+  // The fixed references and structure alone can exceed the budget (very large
+  // corpus at a small configured limit). Never send an over-budget request:
+  // fail closed so the caller can use its fallback instead of provoking 429s.
+  if (exceeds(build(0))) throw groqPromptBudgetError();
+  let bounded = build(perDocumentChars);
+  while (exceeds(bounded) && perDocumentChars > 0) {
+    perDocumentChars = Math.max(0, Math.floor(perDocumentChars * 0.8));
+    bounded = build(perDocumentChars);
+  }
+  if (exceeds(bounded)) throw groqPromptBudgetError();
+  return bounded;
+}
+
 function emitGroqEvent(event: ProviderCallEvent): Promise<void> {
   return appendProviderCallEvent(event).catch(() => undefined);
 }
@@ -709,14 +958,30 @@ export function defaultClient(
   emit: (event: ProviderCallEvent) => Promise<void> = emitGroqEvent,
   deps?: GroqDefaultClientDeps,
 ): SemanticModelClient | undefined {
-  const routes = configuredGroqRoutes();
-  if (!routes.length) return undefined;
+  if (!configuredGroqRoutes().length) return undefined;
   const timeoutMs = groqTimeoutMs();
   const deadlinesEnabled = groqDeadlinesEnabled();
   const persistedCooldownExpiryMs = deps?.persistedCooldownExpiryMs ?? defaultPersistedCooldownExpiryMs;
   return { classify: async (prompt, model, observability, signal) => {
+    // Routes are re-discovered per call so key rotation is config-only. The
+    // restricted-route quarantine is applied before the failover so a known
+    // dead organization is never retried (or paced) again in this process.
+    const routes = configuredGroqRoutes().filter(route => groqOrgDisabledRemainingMs(groqRouteOrg(route)) <= 0);
+    if (!routes.length) {
+      const remainingMs = Math.max(0, Math.min(...configuredGroqRoutes().map(route => groqOrgDisabledRemainingMs(groqRouteOrg(route)))));
+      throw groqPoolDisabledError(remainingMs);
+    }
     const response = await runGroqRouteFailover(routes, async route => {
       const started = Date.now();
+      const orgId = groqRouteOrg(route);
+      // Groq's free tier meters tokens per minute. Keep every supplied field
+      // reference (citations stay attributable) while shortening document
+      // text so one oversized evidence set cannot 429 the whole pool. Cap
+      // before allocating the abort listener/deadline timer: this call can
+      // fail closed with GROQ_PROMPT_BUDGET_EXCEEDED, and a rejected prompt
+      // must not leave those resources attached.
+      const boundedPrompt = capGroqSemanticPrompt(prompt, groqMaxPromptChars());
+      const promptCapped = boundedPrompt.length !== prompt.length;
       const controller = new AbortController();
       const abortFromCaller = () => controller.abort(signal?.reason);
       if (signal?.aborted) controller.abort(signal.reason);
@@ -726,11 +991,10 @@ export function defaultClient(
       // provider reports instead of masquerading as a slow provider.
       let deadlineExpired = false;
       const timer = deadlinesEnabled ? setTimeout(() => { deadlineExpired = true; controller.abort(); }, timeoutMs) : undefined;
-      const orgId = groqRouteOrg(route);
       const base = {
         id: randomUUID(), provider: 'groq', operation: 'multilingual-semantic-classification',
         ...semanticObservabilityFields(observability),
-        requestMetadata: { groqRoute: route.id, groqOrg: orgId }, attempt: 1,
+        requestMetadata: { groqRoute: route.id, groqOrg: orgId, ...(promptCapped ? { groqPromptCapped: 'true' } : {}) }, attempt: 1,
         reservedCost: 0, policyVersion: 'provider-resilience-v1',
       };
       try {
@@ -767,7 +1031,7 @@ export function defaultClient(
             model,
             messages: [
               { role: 'system', content: 'Return only valid JSON matching the requested schema.' },
-              { role: 'user', content: prompt },
+              { role: 'user', content: boundedPrompt },
             ],
             ...groqRequestExtras(),
           }),
@@ -786,17 +1050,25 @@ export function defaultClient(
         }
         const text = bounded.text;
         if (!res.ok) {
-          throw Object.assign(new Error(`Groq HTTP ${res.status}: ${text.slice(0, 500)}`),
-            { status: res.status, code: res.status });
+          throw classifyGroqHttpError(res.status, text);
         }
         const content = (JSON.parse(text) as any)?.choices?.[0]?.message?.content;
         if (typeof content !== 'string' || !content) {
-          throw Object.assign(new Error('Groq returned no message content.'), { status: res.status });
+          throw new ProviderCallError('Groq returned no message content.', 'TRANSIENT', true, {
+            status: res.status, routeScoped: true, providerReasons: ['GROQ_SEMANTIC_CONTENT_INVALID'],
+          });
         }
         // Parse before persisting SUCCESS: a malformed completion must emit
         // exactly one terminal event (the failure below), never a false
         // success that the conflicting failure insert cannot overwrite.
-        const parsedContent = JSON.parse(content);
+        let parsedContent: unknown;
+        try {
+          parsedContent = JSON.parse(content);
+        } catch {
+          throw new ProviderCallError('Groq returned malformed JSON content.', 'TRANSIENT', true, {
+            status: res.status, routeScoped: true, providerReasons: ['GROQ_SEMANTIC_CONTENT_INVALID'],
+          });
+        }
         await emit({
           ...base, status: 'SUCCESS', latencyMs: Date.now() - started,
           actualCost: 0, occurredAt: new Date().toISOString(),
@@ -829,6 +1101,21 @@ export function defaultClient(
           // per-org retry scheduling downstream.
           (typed as { groqOrg?: string }).groqOrg = orgId;
         }
+        if (typed.routeScoped) (typed as { groqOrg?: string }).groqOrg = orgId;
+        const reasons = Array.isArray((typed as { providerReasons?: unknown }).providerReasons)
+          ? ((typed as { providerReasons?: unknown }).providerReasons as string[]).map(String)
+          : [];
+        const failureMetadata: Record<string, string> = {};
+        if (reasons.includes('GROQ_ORGANIZATION_RESTRICTED')) {
+          const disabledUntilMs = disableGroqOrg(orgId);
+          failureMetadata.groqRouteDisabled = 'true';
+          failureMetadata.groqDisabledUntilMs = String(disabledUntilMs);
+          console.warn(JSON.stringify({
+            event: 'groq_route_disabled', route: route.id, org: orgId,
+            reason: 'GROQ_ORGANIZATION_RESTRICTED', disabledUntilMs,
+            timestamp: new Date().toISOString(),
+          }));
+        }
         // Deferred short-circuits stay observable but must never restart the
         // persisted window: the shared expiry derives from the latest
         // RATE_LIMITED row, so a deferral is tagged and the resolver below
@@ -837,14 +1124,22 @@ export function defaultClient(
         await emit({
           ...base, status: statusFor(typed), latencyMs: Date.now() - started,
           actualCost: 0, errorClass: typed.errorClass, occurredAt: new Date().toISOString(),
-          ...(deferred ? { requestMetadata: { ...base.requestMetadata, groqCooldownDeferral: 'true' } } : {}),
+          requestMetadata: {
+            ...base.requestMetadata,
+            ...(deferred ? { groqCooldownDeferral: 'true' } : {}),
+            ...failureMetadata,
+          },
         });
         throw typed;
       } finally {
         if (timer) clearTimeout(timer);
         signal?.removeEventListener('abort', abortFromCaller);
       }
-    }, { isOrgCooling: orgId => groqOrgCooldownRemainingMs(orgId) > 0, signal });
+    }, {
+      isOrgCooling: orgId => groqOrgCooldownRemainingMs(orgId) > 0,
+      signal,
+      maxContentFailures: Math.max(1, Math.floor(Number(process.env.GROQ_JSON_VALIDATION_MAX_ROUTES || '2')) || 2),
+    });
     return response;
   }};
 }
@@ -890,15 +1185,30 @@ export function buildCitationRepairPrompt(
   candidatePrompt: string,
   result: SemanticModelResult,
   refs: Array<{ field: string; index?: number; sourceId?: string }>,
+  limits?: { maxChars?: number; maxTokens?: number },
 ): string {
   const refList = refs.map(ref => JSON.stringify(ref)).join(', ');
-  return [
+  const header = [
     'Your previous classification is missing required field citations.',
     `Keep label=${result.label}, confidence=${result.confidence}, supportedLanguage=${result.supportedLanguage}.`,
     `You may only cite from this exact list: [${refList}]. Cite only list entries, with matching field, index, and sourceId. If no listed reference supports the decision, return "citations":[] — never invent a reference.`,
     'Return the complete classification JSON with citations populated from the supplied field references; an uncited classification cannot be used.',
-    `Original request: ${candidatePrompt}`,
   ].join(' ');
+  const separator = ' Original request: ';
+  const maxChars = limits?.maxChars ?? groqMaxPromptChars();
+  const maxTokens = limits?.maxTokens ?? groqMaxPromptTokens();
+  const fixedChars = header.length + separator.length;
+  const fixedTokens = estimateGroqTokens(header + separator);
+  if (fixedChars > maxChars || fixedTokens > maxTokens) throw groqPromptBudgetError();
+  // Cap the embedded structured request first: raw truncation would cut the
+  // tail documents and their references, leaving the repair unable to cite
+  // evidence the model was originally given.
+  const boundedCandidate = capGroqSemanticPrompt(
+    candidatePrompt,
+    maxChars - fixedChars,
+    maxTokens - fixedTokens,
+  );
+  return `${header}${separator}${boundedCandidate}`;
 }
 
 /**
