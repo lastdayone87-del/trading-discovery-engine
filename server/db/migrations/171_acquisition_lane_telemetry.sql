@@ -1,4 +1,4 @@
--- Migration 168: append-only acquisition lane telemetry baseline.
+-- Migration 171: append-only acquisition lane telemetry baseline.
 --
 -- Phase 0 needs a durable per-lane accounting baseline before Phase 1 changes
 -- scheduling. The process-local counters in operationsTelemetry reset on every

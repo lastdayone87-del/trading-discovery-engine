@@ -345,9 +345,9 @@ test('crawler telemetry persists bounded lane attribution and gate wait', () => 
   assert.equal(invalid.gateWaitMs, 86_400_000);
 });
 
-test('migration 168 is additive, closed-taxonomy, and append-only', async () => {
+test('migration 171 is additive, closed-taxonomy, and append-only', async () => {
   const { readFile } = await import('node:fs/promises');
-  const migration = await readFile(new URL('./db/migrations/168_acquisition_lane_telemetry.sql', import.meta.url), 'utf8');
+  const migration = await readFile(new URL('./db/migrations/171_acquisition_lane_telemetry.sql', import.meta.url), 'utf8');
   assert.match(migration, /CREATE TABLE IF NOT EXISTS public\.acquisition_lane_events/);
   assert.match(migration, /event_key TEXT NOT NULL UNIQUE/);
   for (const lane of ACQUISITION_LANES) assert.match(migration, new RegExp(`'${lane}'`));
