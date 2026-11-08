@@ -96,6 +96,29 @@ test('YouTube redirect destinations are decoded, normalized, classified by hostn
   assert.equal(normalizeExternalUrl('https://youtube.com/watch?v=abcdefghijk'),null);
 });
 
+test('scheme-less YouTube redirect destinations are never silently dropped',async()=>{
+  const {normalizeExternalUrl}=await import('./inspector');
+  // YouTube emits the visible channel link as a scheme-less q destination
+  // (`q=BigShort.com`). This is the exact shape that hid bigshort.com from
+  // Step 4: the wrapper was admitted, then normalization threw and returned
+  // null with no audit line.
+  const wrapper='https://www.youtube.com/redirect?event=channel_header&redir_token=x&q=BigShort.com';
+  const normalized=normalizeExternalUrl(wrapper);
+  assert.equal(normalized?.url,'https://bigshort.com/');
+  assert.equal(normalized?.kind,'WEBSITE');
+  assert.equal(normalized?.wrapperUrl,wrapper);
+  assert.equal(normalizeExternalUrl('https://www.youtube.com/redirect?q=g'),null,'dotless destinations stay rejected');
+  assert.equal(normalizeExternalUrl('https://www.youtube.com/redirect?q=javascript%3Aalert(1)'),null,'non-HTTP destination schemes stay rejected');
+  assert.equal(normalizeExternalUrl('https://www.youtube.com/redirect?q=trader%40gmail.com'),null,'email destinations must never become gmail.com seeds');
+});
+
+test('encoded YouTube redirect destinations preserve direct Discord invites',async()=>{
+  const wrapper='https://www.youtube.com/redirect?event=channel_header&redir_token=x&q=discord.gg%2FQ9KP9u6CBZ';
+  const result=await runChannelInspection({channelId:'redirect-discord',channelBio:'No invite',channelLinks:[wrapper],videoDescriptions:['one','two','three','four','five']});
+  assert.equal(result.foundInvite,'Q9KP9u6CBZ');
+  assert.equal(result.foundLocation,'CHANNEL_EXTERNAL_LINKS');
+});
+
 test('recent-video Discord is preserved before optional acquisition',async()=>{
   const result=await runChannelInspection({channelId:'recent',channelBio:'No invite',channelLinks:[],videoDescriptions:['one','two https://discord.gg/recent-room','three','four','five']});
   assert.equal(result.foundInvite,'recent-room');assert.equal(result.foundLocation,'VIDEO_2_DESCRIPTION');assert.equal(result.acquisitionStatus,'FOUND');

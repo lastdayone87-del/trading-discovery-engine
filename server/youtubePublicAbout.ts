@@ -239,6 +239,16 @@ export function parseYouTubeChannelAboutFromHtml(
 }
 
 /**
+ * Canonical public About-tab URL. YouTube's channelExternalLinkViewModel links
+ * are rendered on /about, not on the channel root, so "About" acquisition must
+ * request the tab. Already-tabbed URLs are left untouched.
+ */
+export function youtubeChannelAboutUrl(youtubeUrl: string): string {
+  const trimmed = youtubeUrl.replace(/\/+$/, '');
+  return /\/about$/i.test(trimmed) ? trimmed : `${trimmed}/about`;
+}
+
+/**
  * Fetch public channel About without YouTube Data API keys.
  * Soft-fails to null on any network/parse/consent failure.
  */
@@ -249,12 +259,33 @@ export async function fetchLiveYouTubeChannelData(
 ): Promise<PublicYouTubeChannelAbout | null> {
   if (!youtubeUrl || !youtubeUrl.startsWith('http')) return null;
   try {
-    const page = await fetchPublicYouTubePage(youtubeUrl, 0, fetchImpl);
-    if (!page) return null;
-    const parsed = parseYouTubeChannelAboutFromHtml(page.html, {
-      enableDebug,
-      finalUrl: page.finalUrl
-    });
+    const aboutUrl = youtubeChannelAboutUrl(youtubeUrl);
+    let page = await fetchPublicYouTubePage(aboutUrl, 0, fetchImpl);
+    let parsed: PublicYouTubeChannelAbout | null = page
+      ? parseYouTubeChannelAboutFromHtml(page.html, { enableDebug, finalUrl: page.finalUrl })
+      : null;
+
+    // The About tab carries links the channel root omits. If the tab is
+    // unavailable or lacks the canonical description, fall back to the root
+    // and merge the links each surface exposed so neither is silently lost.
+    if (!parsed?.bio?.trim()) {
+      const rootPage = await fetchPublicYouTubePage(youtubeUrl, 0, fetchImpl);
+      if (rootPage) {
+        const rootParsed = parseYouTubeChannelAboutFromHtml(rootPage.html, {
+          enableDebug,
+          finalUrl: rootPage.finalUrl
+        });
+        parsed = {
+          ...rootParsed,
+          channelLinks: Array.from(
+            new Set([...(parsed?.channelLinks || []), ...(rootParsed.channelLinks || [])])
+          ),
+          thumbnailUrl: parsed?.thumbnailUrl || rootParsed.thumbnailUrl
+        };
+        page = rootPage;
+      }
+    }
+    if (!page || !parsed) return null;
     // A truncated prefix with no usable evidence is an incomplete fetch, not
     // a definitive empty About page: return null so callers record
     // ATTEMPTED_FAILED (retryable) instead of ATTEMPTED_EMPTY (terminal).

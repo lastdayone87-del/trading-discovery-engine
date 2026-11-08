@@ -168,6 +168,55 @@ test('D: network error soft-fails to null', async () => {
   assert.equal(live, null);
 });
 
+test('D: About acquisition requests the /about tab and preserves scheme-less links', async () => {
+  const requested: string[] = [];
+  const aboutHtml = `<script>var ytInitialData = ${JSON.stringify({
+    metadata: { channelMetadataRenderer: { description: 'BigShort bio' } },
+    links: [{ channelExternalLinkViewModel: { link: { content: 'bigshort.com' } } }]
+  })};</script>`;
+  const live = await fetchLiveYouTubeChannelData(
+    'https://www.youtube.com/channel/UC_test',
+    false,
+    (async (input: RequestInfo | URL) => {
+      requested.push(String(input));
+      return new Response(aboutHtml, { status: 200, headers: { 'content-type': 'text/html' } });
+    }) as typeof fetch
+  );
+  assert.deepEqual(requested, ['https://www.youtube.com/channel/UC_test/about']);
+  assert.equal(live?.bio, 'BigShort bio');
+  assert.ok(live?.channelLinks?.includes('bigshort.com'));
+});
+
+test('D: About tab without a bio falls back to the root and merges both link sets', async () => {
+  const requested: string[] = [];
+  const aboutHtml = `<script>var ytInitialData = ${JSON.stringify({
+    links: [{ channelExternalLinkViewModel: { link: { content: 'about-only.example' } } }]
+  })};</script>`;
+  const rootHtml = `<script>var ytInitialData = ${JSON.stringify({
+    metadata: { channelMetadataRenderer: { description: 'Root bio' } },
+    links: [{ channelExternalLinkViewModel: { link: { content: 'root.example' } } }]
+  })};</script>`;
+  const live = await fetchLiveYouTubeChannelData(
+    'https://www.youtube.com/channel/UC_test',
+    false,
+    (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      requested.push(url);
+      return new Response(url.endsWith('/about') ? aboutHtml : rootHtml, {
+        status: 200,
+        headers: { 'content-type': 'text/html' }
+      });
+    }) as typeof fetch
+  );
+  assert.deepEqual(requested, [
+    'https://www.youtube.com/channel/UC_test/about',
+    'https://www.youtube.com/channel/UC_test'
+  ]);
+  assert.equal(live?.bio, 'Root bio');
+  assert.ok(live?.channelLinks?.includes('about-only.example'));
+  assert.ok(live?.channelLinks?.includes('root.example'));
+});
+
 test('applyPublicAboutToCandidate sets description from bio for Gate 1 re-validation', () => {
   const candidate = { description: '', channelLinks: [] as string[] };
   assert.equal(

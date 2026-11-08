@@ -12,7 +12,7 @@ import {candidateFromNativeInvite,extractDiscordCandidates,makeDiscordCandidate,
 import { bumpRepeatFailureHistoryOutage, bumpRepeatFailureSkip } from './operationsTelemetry';
 import type { BrowserFallbackResult } from './browserCommunityFallback';
 import { RENDERED_CONTROL_EVALUATION_WINDOW, normalizeVisitUrl, type BrowserFallbackBudget } from './browserCommunityFallback';
-import { parseAboutPageMetadataFromHtml } from './youtubePublicAbout';
+import { parseAboutPageMetadataFromHtml, youtubeChannelAboutUrl } from './youtubePublicAbout';
 import { resolveDocumentBaseUrlFromRoot, stripBaseElements } from './documentBase';
 import {effectiveAcquisitionOutcomes,hasMessagingBridgeEvidence,isDiscordCommunityAcquisitionSurface,isDotlessHostnameUrl,isMessagingPreviewUrl,isAuxiliaryTriageCandidate,isAuxiliaryForOutcome,acquisitionOwnershipUrl,isPageAssetInfrastructureUrl,rankCommunitySurfaces,scoreCommunitySurface,assessCrawlAdmission,recoverTruncatedQueryToRoot,isPossiblyTruncatedPath} from './communitySurfacePolicy';
 import { isAcquisitionLadderEnabled, resolveRenderEscalation, selectSameSiteSitemapSeedCandidates, selectStructuredNavigationCandidates, MAX_LADDER_SITEMAP_SEEDS, MAX_LADDER_PROFILE_RUNS_PER_INSPECTION, ACQUISITION_LADDER_POLICY_VERSION } from './acquisitionLadder';
@@ -240,13 +240,39 @@ export function nextRenderedClickOffsets(
 export interface NormalizedExternalUrl {url:string;wrapperUrl?:string;kind:'WEBSITE'|'SOCIAL'|'MESSAGING'}
 const socialHosts=new Set(['twitter.com','www.twitter.com','x.com','www.x.com','instagram.com','www.instagram.com','tiktok.com','www.tiktok.com','facebook.com','www.facebook.com']);
 const directDiscordHosts=new Set(['discord.gg','www.discord.gg','discord.com','www.discord.com','discordapp.com','www.discordapp.com','discord.app','www.discord.app']);
+/**
+ * Decode the destination carried by a YouTube redirect wrapper. The `q`
+ * parameter is frequently a scheme-less host (`BigShort.com`,
+ * `discord.gg%2F...`), so callers must not feed it straight to `new URL`.
+ * Returns the destination text, or null when `raw` is not a YouTube redirect.
+ */
+export function youtubeRedirectDestination(raw:string):string|null {
+  try {
+    const parsed=new URL(raw.match(/^https?:\/\//i)?raw:`https://${raw}`);
+    if((parsed.hostname!=='youtube.com'&&!parsed.hostname.endsWith('.youtube.com'))||parsed.pathname!=='/redirect')return null;
+    let destination=parsed.searchParams.get('q');
+    if(!destination)return null;
+    for(let i=0;i<2;i++)try{const decoded=decodeURIComponent(destination);if(decoded===destination)break;destination=decoded;}catch{break;}
+    return destination;
+  }catch{return null;}
+}
 export function normalizeExternalUrl(raw:string):NormalizedExternalUrl|null {
   try {
     let parsed=new URL(raw.match(/^https?:\/\//i)?raw:`https://${raw}`),wrapperUrl:string|undefined;
-    if((parsed.hostname==='youtube.com'||parsed.hostname.endsWith('.youtube.com'))&&parsed.pathname==='/redirect'){
-      wrapperUrl=parsed.toString();let destination=parsed.searchParams.get('q');
-      if(!destination)return null;
-      for(let i=0;i<2;i++)try{const decoded=decodeURIComponent(destination);if(decoded===destination)break;destination=decoded;}catch{break;}
+    const redirectDestination=youtubeRedirectDestination(raw);
+    if(redirectDestination!==null){
+      // YouTube also carries contact email addresses in the same link slot.
+      // `new URL('https://trader@gmail.com')` would read the local part as
+      // userinfo and crawl gmail.com, so email destinations fail closed.
+      if(/^[^/\s@]+@[^/\s@]+\.[^/\s@]+$/.test(redirectDestination))return null;
+      wrapperUrl=parsed.toString();
+      // Scheme-less redirect destinations are the normal YouTube shape
+      // (`q=BigShort.com`). Apply the same https fallback used for ordinary
+      // scheme-less links; protocol-relative and explicit non-HTTP schemes
+      // keep their semantics (the latter fail closed below).
+      const destination=/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(redirectDestination)
+        ?redirectDestination
+        :redirectDestination.startsWith('//')?`https:${redirectDestination}`:`https://${redirectDestination}`;
       parsed=new URL(destination);
     }
     if(!['http:','https:'].includes(parsed.protocol))return null;
@@ -952,7 +978,34 @@ export async function scrapeRecentVideoDescriptionsWithCoverage(youtubeUrl:strin
 export { parseAboutPageMetadataFromHtml };
 
 async function fetchLiveYouTubeChannelData(youtubeUrl:string,enableDebug?:boolean):Promise<{rawHtml?:string;fetchLog?:string;bio?:string;channelLinks?:string[];videoDescriptions?:string[];thumbnailUrl?:string;truncated?:boolean;}|null>{
-  if(!youtubeUrl||!youtubeUrl.startsWith('http'))return null;const page=await fetchWithTimeout(youtubeUrl,0);if(!page)return null;const html=page.html,cleanHtml=decodeEmbeddedMarkup(html);const {bio,thumbnailUrl,explicitLinks}=parseAboutPageMetadataFromHtml(html);const extractedUrls=Array.from(new Set([...explicitLinks,...extractExternalUrlsFromText(cleanHtml)])).filter(url=>!isPageAssetInfrastructureUrl(url));if(page.truncated&&!bio&&extractedUrls.length===0)return null;return {bio,channelLinks:extractedUrls,thumbnailUrl,truncated:page.truncated,rawHtml:enableDebug?cleanHtml:undefined,fetchLog:enableDebug?`Fetched ${page.finalUrl} (${page.html.length} bytes)`:undefined};
+  if(!youtubeUrl||!youtubeUrl.startsWith('http'))return null;
+  const parsePage=async(url:string)=>{
+    const page=await fetchWithTimeout(url,0);
+    if(!page)return null;
+    const cleanHtml=decodeEmbeddedMarkup(page.html);
+    const {bio,thumbnailUrl,explicitLinks}=parseAboutPageMetadataFromHtml(page.html);
+    const extractedUrls=Array.from(new Set([...explicitLinks,...extractExternalUrlsFromText(cleanHtml)])).filter(url=>!isPageAssetInfrastructureUrl(url));
+    return {page,cleanHtml,bio,thumbnailUrl,extractedUrls};
+  };
+  // The external-link panel lives on /about; the channel root only exposes the
+  // header CTA. Request the tab first and fall back to the root when the tab
+  // is unavailable or omits the canonical description.
+  let about=await parsePage(youtubeChannelAboutUrl(youtubeUrl));
+  if(!about?.bio){
+    const root=await parsePage(youtubeUrl);
+    if(root){
+      about={
+        page:root.page,
+        cleanHtml:root.cleanHtml,
+        bio:root.bio||about?.bio,
+        thumbnailUrl:about?.thumbnailUrl||root.thumbnailUrl,
+        extractedUrls:Array.from(new Set([...(about?.extractedUrls||[]),...root.extractedUrls])),
+      };
+    }
+  }
+  if(!about)return null;
+  if(about.page.truncated&&!about.bio&&about.extractedUrls.length===0)return null;
+  return {bio:about.bio,channelLinks:about.extractedUrls,thumbnailUrl:about.thumbnailUrl,truncated:about.page.truncated,rawHtml:enableDebug?about.cleanHtml:undefined,fetchLog:enableDebug?`Fetched ${about.page.finalUrl} (${about.page.html.length} bytes)`:undefined};
 }
 
 function normalizedRenderedCandidates(rendered:BrowserFallbackResult,surface:AcquisitionSurface,seedUrl:string):DiscordCandidate[]{
@@ -1418,7 +1471,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
 
   const step1Logs:string[]=[];step1Logs.push(`Inspecting channel bio text (${bio.length} characters) and embedded links.`);const bioCandidates=extractDiscordCandidates(bio,'YOUTUBE_ABOUT',channelData.youtubeUrl).filter(c=>c.nativeInviteCode),directBioInvite=bioCandidates[0]?.nativeInviteCode||null;if(debugLog)debugLog.discordRegexAttempts.push({source:'CHANNEL_ABOUT',textLength:bio.length,result:bioCandidates.map(c=>c.nativeInviteCode)});addExternalUrls(bio,'CHANNEL_ABOUT');retainCandidates(bioCandidates);if(directBioInvite){step1Logs.push(`${bioCandidates.length} direct Discord candidate(s) detected in Channel Bio.`);addStep('BIO','Step 1 — Channel Bio & About Panel','FOUND',step1Logs,directBioInvite,'CHANNEL_ABOUT');acquisitionOutcomes.push({requestedUrl:channelData.youtubeUrl||`youtube:channel:${channelData.channelId}`,surface:'YOUTUBE_ABOUT',required:true,outcome:'FOUND',retryable:false,detail:`${bioCandidates.length} Discord candidate(s) discovered in YouTube About content`,observedAt:now});}else{if(acquiredAboutUrl)acquisitionOutcomes.push({requestedUrl:acquiredAboutUrl,surface:'YOUTUBE_ABOUT',required:true,outcome:'INSPECTED_NO_MATCH',retryable:false,detail:'YouTube About page acquired and inspected without a Discord invite',observedAt:now});step1Logs.push('No direct Discord invite found in channel bio.');addStep('BIO','Step 1 — Channel Bio & About Panel','NOT_FOUND',step1Logs);}
 
-  const step2Logs:string[]=[];const rawLinkCandidates=links.flatMap(link=>extractDiscordCandidates(link,'CHANNEL_EXTERNAL_LINKS',link)).filter(c=>c.nativeInviteCode);const linkCandidates=mergeDiscordCandidates(rawLinkCandidates,ownershipInput);retainCandidates(linkCandidates);if(links.length){step2Logs.push(`Scanning ${links.length} channel links.`);if(linkCandidates.length){const inviteCodes=linkCandidates.map(candidate=>candidate.nativeInviteCode!).filter(Boolean);step2Logs.push(`${linkCandidates.length} distinct direct Discord candidate(s) retained from channel links.`);step2Logs.push(`Retained invite code${inviteCodes.length===1?'':'s'}: ${inviteCodes.join(', ')}`);for(const candidate of linkCandidates)acquisitionOutcomes.push({requestedUrl:candidate.sourceUrl||candidate.rawLocator,surface:'CHANNEL_EXTERNAL_LINKS',required:true,outcome:'FOUND',retryable:false,detail:'Discord invite discovered in channel links',observedAt:now});addStep('EXTERNAL_LINKS','Step 2 — Channel External Links','FOUND',step2Logs,linkCandidates[0].nativeInviteCode||null,'CHANNEL_LINKS',inviteCodes);}else{step2Logs.push('No direct Discord invite found in channel links.');addStep('EXTERNAL_LINKS','Step 2 — Channel External Links','NOT_FOUND',step2Logs);}}else addStep('EXTERNAL_LINKS','Step 2 — Channel External Links','SKIPPED',['No channel links found.']);
+  const step2Logs:string[]=[];const rawLinkCandidates=links.flatMap(link=>{const sources=[link];const destination=youtubeRedirectDestination(link);if(destination)sources.push(destination);return sources.flatMap(text=>extractDiscordCandidates(text,'CHANNEL_EXTERNAL_LINKS',link)).filter(c=>c.nativeInviteCode);});const linkCandidates=mergeDiscordCandidates(rawLinkCandidates,ownershipInput);retainCandidates(linkCandidates);if(links.length){step2Logs.push(`Scanning ${links.length} channel links.`);if(linkCandidates.length){const inviteCodes=linkCandidates.map(candidate=>candidate.nativeInviteCode!).filter(Boolean);step2Logs.push(`${linkCandidates.length} distinct direct Discord candidate(s) retained from channel links.`);step2Logs.push(`Retained invite code${inviteCodes.length===1?'':'s'}: ${inviteCodes.join(', ')}`);for(const candidate of linkCandidates)acquisitionOutcomes.push({requestedUrl:candidate.sourceUrl||candidate.rawLocator,surface:'CHANNEL_EXTERNAL_LINKS',required:true,outcome:'FOUND',retryable:false,detail:'Discord invite discovered in channel links',observedAt:now});addStep('EXTERNAL_LINKS','Step 2 — Channel External Links','FOUND',step2Logs,linkCandidates[0].nativeInviteCode||null,'CHANNEL_LINKS',inviteCodes);}else{step2Logs.push('No direct Discord invite found in channel links.');addStep('EXTERNAL_LINKS','Step 2 — Channel External Links','NOT_FOUND',step2Logs);}}else addStep('EXTERNAL_LINKS','Step 2 — Channel External Links','SKIPPED',['No channel links found.']);
 
   const orderedVideoDescs=authoritativeInspectionDescriptions.length?Array.from(new Set([...channelSampledDescs(),...videoDescs])):videoDescs;const descriptionsToInspect=orderedVideoDescs.slice(0,5),step3Logs:string[]=[];const videoCandidates:DiscordCandidate[]=[];if(descriptionsToInspect.length){step3Logs.push(`Scanning ${descriptionsToInspect.length} recent video descriptions${orderedVideoDescs.length>descriptionsToInspect.length?` (${orderedVideoDescs.length} available; newest authoritative descriptions are prioritized).`:'.'}`);for(let i=0;i<descriptionsToInspect.length;i++){const d=descriptionsToInspect[i],sourceName=`VIDEO_${i+1}_DESCRIPTION`;addExternalUrls(d,sourceName);const candidates=extractDiscordCandidates(d,'RECENT_VIDEO_DESCRIPTIONS',`youtube:channel:${channelData.channelId}:${sourceName}`).filter(c=>c.nativeInviteCode);videoCandidates.push(...candidates);if(debugLog)debugLog.discordRegexAttempts.push({source:sourceName,textLength:d.length,result:candidates.map(c=>c.nativeInviteCode)});if(candidates.length)acquisitionOutcomes.push({requestedUrl:`youtube:channel:${channelData.channelId}:${sourceName}`,surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'FOUND',retryable:false,detail:`${candidates.length} Discord candidate(s) discovered in recent video description`,observedAt:now});}retainCandidates(videoCandidates);if(videoCandidates.length){step3Logs.push(`${videoCandidates.length} Discord candidate observation(s) retained across the inspected descriptions.`);addStep('VIDEO_DESCRIPTIONS','Step 3 — Latest Video Descriptions','FOUND',step3Logs,videoCandidates[0].nativeInviteCode||null,'RECENT_VIDEO_DESCRIPTIONS');}else{step3Logs.push('No direct Discord invite found in the descriptions actually inspected.');addStep('VIDEO_DESCRIPTIONS','Step 3 — Latest Video Descriptions','NOT_FOUND',step3Logs);}}else addStep('VIDEO_DESCRIPTIONS','Step 3 — Latest Video Descriptions','SKIPPED',['No video descriptions available.']);for(const surface of acquiredRecentDescriptionSurfaces)if(!videoCandidates.length)acquisitionOutcomes.push({requestedUrl:surface,surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'INSPECTED_NO_MATCH',retryable:false,detail:`Recent video descriptions acquired; ${descriptionsToInspect.length} description(s) inspected without a Discord invite`,observedAt:now});
 
