@@ -27,6 +27,10 @@ test('claim polarity neutralizes quoted criticism and hypotheticals', () => {
   assert.equal(polarity('They say guaranteed profits, then lose money', 'guaranteed profit'), 'QUOTED');
   assert.equal(polarity('Imagine guaranteed profits, then lose money', 'guaranteed profit'), 'HYPOTHETICAL');
   assert.equal(polarity('"Guaranteed profits" is a red flag', 'guaranteed profit'), 'QUOTED');
+  assert.equal(polarity('Guaranteed profits are a red flag', 'guaranteed profit'), 'QUOTED');
+  assert.equal(polarity('Guaranteed profits? Not financial advice.', 'guaranteed profit'), 'ASSERTED');
+  assert.equal(polarity("Ce n'est pas du trading", 'trading'), 'NEGATED');
+  assert.equal(polarity('لا ضمان على الأرباح', 'ضمان'), 'DISCLAIMER');
 });
 
 test('claim polarity is clause-scoped: a disclaimer cannot suppress a later claim', () => {

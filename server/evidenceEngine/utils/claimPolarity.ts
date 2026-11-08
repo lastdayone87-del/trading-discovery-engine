@@ -40,7 +40,7 @@ type LanguageCode =
 const NEGATION_CUES: Record<LanguageCode, string[]> = {
   en: ['no', 'not', 'never', 'without', 'zero', 'none', 'nobody', 'nothing', "don't", 'doesn\'t', 'didn\'t', "isn't", "aren't", "won't", "can't", 'cannot', 'neither', 'nor'],
   de: ['kein', 'keine', 'keinen', 'keinem', 'keiner', 'nicht', 'nie', 'niemals', 'ohne', 'niemand', 'nichts'],
-  fr: ['pas', 'aucun', 'aucune', 'sans', 'ne', 'n’', "n'", 'jamais', 'non', 'personne', 'rien'],
+  fr: ['pas', 'aucun', 'aucune', 'sans', 'ne', "n'", 'jamais', 'non', 'personne', 'rien'],
   es: ['no', 'sin', 'nunca', 'jamás', 'nadie', 'ni', 'ningún', 'ninguna', 'nada'],
   it: ['non', 'senza', 'mai', 'nessun', 'nessuna', 'niente', 'nulla', 'neppure', 'nemmeno'],
   nl: ['geen', 'niet', 'nooit', 'zonder', 'niemand', 'niets'],
@@ -105,12 +105,12 @@ const DISCLAIMER_PATTERNS: RegExp[] = [
   /\bgeen\s+(?:financieel\s+advies|garantie|winst)\b/iu,
   /\bikke\s+(?:finansiel\s+rådgivning|garanti)\b/iu,
   /\bing(?:en)?\s+(?:garanti|finansiell\s+rådgivning)\b/iu,
-  /\b(?:لا|ليس)\s+(?:نصيحة|ضمان|ربح)\b/u,
+  /(?<![\p{L}\p{N}])(?:لا|ليس)\s+(?:نصيحة|ضمان|ربح)(?![\p{L}\p{N}])/u,
   /(?:不是|没有|無|无)\s*(?:投资建议|投資建議|保证|保證|盈利)/u,
-  /\b(?:担保|保証|保證)\s*(?:は|が)?\s*(?:ありません|ない|なし)/u,
+  /(?<![\p{L}\p{N}])(?:担保|保証|保證)\s*(?:は|が)?\s*(?:ありません|ない|なし)/u,
   /(?:过去|過去)?的表现(?:并|並)?不代表(?:未来|未來)?(?:收益|表现|表現)?/u,
   /\bbukan\s+(?:nasihat|jaminan)\b/iu,
-  /\b(?:投資助言ではありません|必ず儲かることはありません|保証はありません)/u,
+  /(?<![\p{L}\p{N}])(?:投資助言ではありません|必ず儲かることはありません|保証はありません)/u,
 ];
 
 const DISCLAIMER_GLOBAL_PATTERNS = DISCLAIMER_PATTERNS.map(pattern =>
@@ -138,9 +138,12 @@ function cueRegex(cues: string[]): RegExp | null {
   // boundaries so "no" cannot match inside "notable".
   const sources = cues.map(cue => {
     const escaped = escapeRegExp(cue);
-    return /^[\x00-\x7F\s'-]+$/.test(cue)
-      ? `(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`
-      : escaped;
+    if (/^[\x00-\x7F\s'-]+$/.test(cue)) {
+      // French elision ("n'est") attaches the cue directly to a letter.
+      if (/['’]$/.test(cue)) return `(?<![\\p{L}\\p{N}])${escaped}(?=\\p{L})`;
+      return `(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`;
+    }
+    return escaped;
   });
   return new RegExp(sources.join('|'), 'iu');
 }
@@ -210,6 +213,7 @@ function findOverlappingDisclaimer(
     while ((match = pattern.exec(text)) !== null) {
       const matchStart = match.index;
       const matchEnd = matchStart + match[0].length;
+      if (matchStart >= end) break;
       // Only the term that is part of the disclaimer frame is neutralized.
       // "No guaranteed profits. I teach order flow." must not suppress the
       // second sentence's trading evidence.
@@ -264,7 +268,7 @@ export function classifyClaimPolarity(
   if (POST_NEGATION.test(sameClauseAfter)) {
     return { polarity: 'NEGATED', cue: sameClauseAfter.trim().slice(0, 24), confidence: 0.9 };
   }
-  if (/^[\p{L}\p{N}]{0,4}\s*[?!]\s*(?:no|nope|not|never|false|myth|wrong|incorrect|pas|non|nein|kein|inte|ikke|aldrig|nunca|mai)\b/iu.test(afterImmediate)) {
+  if (/^[\p{L}\p{N}]{0,4}\s*[?!]\s*(?:no|nope|not|never|false|myth|wrong|incorrect|pas|non|nein|kein|inte|ikke|aldrig|nunca|mai)(?:\s*[.!?]|$)/iu.test(afterImmediate)) {
     return { polarity: 'NEGATED', cue: afterImmediate.trim().slice(0, 24), confidence: 0.9 };
   }
   if (POST_DENIAL.test(afterClause)) {
@@ -284,6 +288,11 @@ export function classifyClaimPolarity(
   if (termLooksLikeClaim && isInsideQuotes(normalized, start, end) && (CRITICISM_CUE.test(nearbyWindow) || ATTRIBUTION_CUE.test(nearbyWindow))) {
     const cue = (CRITICISM_CUE.exec(nearbyWindow) || ATTRIBUTION_CUE.exec(nearbyWindow) || [undefined])[0];
     return { polarity: 'QUOTED', cue, confidence: 0.85 };
+  }
+  // Post-term criticism: "Guaranteed profits are a red flag" is criticism of
+  // the claim, not an asserted promise.
+  if (termLooksLikeClaim && CRITICISM_CUE.test(afterClause)) {
+    return { polarity: 'QUOTED', cue: closestCue(CRITICISM_CUE, afterClause), confidence: 0.84 };
   }
 
   const negation = combinedCueRegex(before, language, NEGATION_CUES);

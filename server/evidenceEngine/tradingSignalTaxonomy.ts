@@ -130,7 +130,7 @@ export function requiresMarketFrameForProvider(term: string): boolean {
 }
 
 export function hasIndependentMarketFrame(text: string): boolean {
-  return /\b(?:trading|trader|trade|market|chart|price|setup|analysis|contract|expiry|long|short|position|spread|ticker|instrument|exchange|broker|prop\s*firm|funded|backtest|strategy|portfolio|entry|exit)\b/iu.test(text);
+  return /\b(?:trading|trader|trade|market|chart|price|setup|analysis|contract|expiry|long|short|position|spread|ticker|instrument|exchange|broker|prop\s*firm|funded|backtest|strategy|portfolio|entry|exit|forex|fx|eurusd|gbpusd|usdjpy|xauusd|btc|eth|nasdaq|dax|ftse|cac|stocks?|crypto|bitcoin|ethereum|equit(?:y|ies)|commodit(?:y|ies)|bourse|invest(?:ing|ment)?)\b/iu.test(text);
 }
 
 /**
@@ -509,23 +509,7 @@ export function assessTradingText(
   // non-trading unless it also carries specific market activity, not merely
   // the ambiguous literal "trading" (cards/skins) or an ambiguous platform.
   const strongSpecificCore = specificCore.filter(match => match.id !== 'PLATFORM');
-  const onlyAmbiguousCore = specificCore.length > 0 && strongSpecificCore.length === 0;
   if (unrelatedMatches.length > 0 && !tradingContext && strongSpecificCore.length === 0) {
-    return {
-      focus: 'UNRELATED',
-      signals,
-      assertedSignals: asserted,
-      suppressedSignals: suppressed,
-      tierASignals,
-      coreSignals: coreMatches.map(match => match.id),
-      adjacentSignals: adjacentMatches.map(match => match.id),
-      financeSignals: financeMatches.map(match => match.id),
-      unrelatedSignals: unrelatedMatches.map(match => match.id),
-      hasExplicitCreatorIdentity: asserted.some(match => match.id === 'CREATOR_IDENTITY'),
-      hasTradingContext: tradingContext,
-    };
-  }
-  if (unrelatedMatches.length > 0 && onlyAmbiguousCore && !tradingContext) {
     return {
       focus: 'UNRELATED',
       signals,
@@ -545,7 +529,7 @@ export function assessTradingText(
   if (strongSpecificCore.length > 0) {
     focus = 'TRADING_CORE';
   } else if (specificCore.length > 0) {
-    focus = tradingContext || unrelatedMatches.length === 0 ? 'TRADING_CORE' : 'UNRELATED';
+    focus = 'TRADING_CORE';
   } else if (coreMatches.some(match => match.generic) && tradingContext) {
     focus = 'TRADING_ADJACENT';
   } else if (adjacentMatches.length > 0 && (tradingContext || adjacentMatches.some(match => match.id === 'MARKET_VENUE' || match.id === 'COMMODITY' || match.id === 'COUNTRY_NATIVE'))) {

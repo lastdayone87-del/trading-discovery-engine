@@ -151,6 +151,16 @@ test('C5 v2: the same generic title with different descriptions is not a duplica
   assert.equal(composition.tradingCoreFamilies, 2);
 });
 
+test('C5 v2: a shared description does not merge distinct upload titles', () => {
+  const sharedDescription = 'London and New York session execution with order flow, liquidity, stop loss placement, position sizing, trade journal review, backtesting and risk management. '.repeat(4);
+  const composition = compose([
+    { title: 'Day trading London open', description: sharedDescription },
+    { title: 'Order flow New York session', description: sharedDescription },
+  ]);
+  assert.equal(composition.duplicateFamiliesCollapsed, 0);
+  assert.equal(composition.tradingCoreFamilies, 2);
+});
+
 test('shared taxonomy classifies multilingual trading, commentary and non-trading controls', () => {
   const context = getLayeredKnowledgeContext('United States');
   const expected: Array<[string, string]> = [
@@ -199,6 +209,7 @@ test('claim polarity suppresses disclaimers and quoted criticism but keeps asser
   assert.equal((await collect('Scam gurus promise guaranteed profits')).some(item => item.category === 'HYPE_SPECULATION'), false);
   assert.equal((await collect("I don't trade forex")).some(item => item.polarity === 'POSITIVE'), false);
   assert.equal((await collect('Gestion du risque')).some(item => item.polarity === 'POSITIVE'), false);
+  assert.equal((await collect('Gestion du risque Forex EURUSD.')).some(item => item.category === 'METHODOLOGY_CONCEPT'), true);
   const assertedHype = await collect('Guaranteed profits');
   assert.equal(assertedHype.some(item => item.category === 'HYPE_SPECULATION'), true);
 

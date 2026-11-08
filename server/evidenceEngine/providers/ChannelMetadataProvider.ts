@@ -1,6 +1,6 @@
 import { EvidenceItem, EvidenceProvider, RawChannelInput, LayeredKnowledgeContext } from '../types';
 import { pushUniqueMatch } from '../utils/textMatching';
-import { findScopedTermMatches } from '../utils/claimPolarity';
+import { hasAffirmedTerm } from '../utils/claimPolarity';
 import { hasIndependentMarketFrame, requiresMarketFrameForProvider } from '../tradingSignalTaxonomy';
 
 export class ChannelMetadataProvider implements EvidenceProvider {
@@ -9,8 +9,7 @@ export class ChannelMetadataProvider implements EvidenceProvider {
   async collectEvidence(input: RawChannelInput, knowledgeContext: LayeredKnowledgeContext): Promise<EvidenceItem[]> {
     const items: EvidenceItem[] = [];
     const now = new Date().toISOString();
-    const assertedIn = (text: string, term: string) =>
-      findScopedTermMatches(text, [term]).some(match => match.polarity === 'ASSERTED');
+    const assertedIn = (text: string, term: string) => hasAffirmedTerm(text, [term]);
     const hasAssertedTerm = (term: string) =>
       assertedIn(input.channel_name, term) || assertedIn(input.description || '', term);
     const fieldsFor=(terms:string[])=>[

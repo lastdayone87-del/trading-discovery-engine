@@ -1,7 +1,7 @@
 import { getDb } from './db';
 import type { RawChannelInput, VerificationDecision } from './evidenceEngine';
 import { persistClassificationEvidenceBundle } from './evidenceEngine/dualWrite';
-import { classificationInputChecksum, normalizeClassificationInput } from './classificationInputChecksum';
+import { normalizeClassificationInput } from './classificationInputChecksum';
 import { assessNegativeEvidence, negativeEvidencePolicyWeight, NEGATIVE_EVIDENCE_ROLE_VERSION } from './evidenceEngine/negativeEvidenceRole';
 import { CONTEXTUAL_COMPOSITION_VERSION } from './evidenceEngine/contextualComposition';
 import { CLAIM_POLARITY_VERSION } from './evidenceEngine/utils/claimPolarity';
@@ -53,6 +53,7 @@ export async function recordProductionClassification(
   const negativeRoleOptions = terminalNegativeStatus
     ? { terminalEligible: terminalNegativeStatus === 'SUFFICIENT' }
     : {};
+  const normalizedDiagnosticInput = normalizeProductionDiagnosticInput(diagnostic.input);
   const signalMatches = (fullComposition?.familyClassifications || []).flatMap(family =>
     (family.signals || []).map(signal => ({
       ...signal,
@@ -81,7 +82,7 @@ export async function recordProductionClassification(
       diagnostic.queryRunId || null,
       diagnostic.nominationId || null,
       diagnostic.input.enrichment_stage || 0,
-      JSON.stringify(normalizeProductionDiagnosticInput(diagnostic.input)),
+      JSON.stringify(normalizedDiagnosticInput),
       JSON.stringify(diagnostic.decision.evidenceCollection.providers),
       JSON.stringify([
         ...diagnostic.decision.positiveEvidence,
@@ -129,8 +130,8 @@ export async function recordProductionClassification(
           scoringEngine: diagnostic.decision.versions.scoringEngineVersion,
         },
         replay: {
-          inputChecksum: classificationInputChecksum(diagnostic.input),
-          inputChecksumVersion: normalizeClassificationInput(diagnostic.input).input_checksum_version,
+          inputChecksum: normalizedDiagnosticInput.input_checksum,
+          inputChecksumVersion: normalizedDiagnosticInput.input_checksum_version,
           codeVersion: diagnostic.decision.versions.evidenceEngineVersion,
         },
       }),

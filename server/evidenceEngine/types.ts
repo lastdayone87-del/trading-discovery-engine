@@ -115,9 +115,9 @@ export interface EvidenceItem {
   /** Role assigned by the negative-evidence policy. Diagnostic and decision input. */
   negativeRole?: NegativeEvidenceRole;
   /**
-   * Strongest claim polarity observed for this item's matches. Providers that
-   * suppress a disclaimer/quotation leave the item positive or omit it
-   * entirely; this annotation explains what was suppressed.
+   * Strongest claim polarity observed for this item's matches. Negative items
+   * usually carry ASSERTED; suppressed non-asserted occurrences are recorded in
+   * `provenance.suppressedMatches` instead.
    */
   claimPolarity?: ClaimPolarity;
   timestamp: string;

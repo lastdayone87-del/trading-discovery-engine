@@ -254,6 +254,7 @@ interface FamilyRecord {
   field: EvidenceFieldType;
   normalized: string;
   tokens: Set<string>;
+  titleTokens: Set<string>;
   recent: boolean;
   tierA: boolean;
   focus: CompositionDocumentFocus;
@@ -270,6 +271,7 @@ interface DuplicateGroup {
   field: EvidenceFieldType;
   normalized: string;
   tokens: Set<string>;
+  titleTokens: Set<string>;
   recent: boolean;
   tierA: boolean;
   focus: CompositionDocumentFocus;
@@ -294,6 +296,7 @@ function mergeIntoGroup(group: DuplicateGroup, record: FamilyRecord): void {
     group.field = record.field;
     group.normalized = record.normalized;
     group.tokens = record.tokens;
+    group.titleTokens = record.titleTokens;
     group.sourceFamilyId = record.sourceFamilyId;
   }
 }
@@ -357,11 +360,18 @@ export function buildContextualComposition(
     // fields), not one representative field. Two videos with the same generic
     // title but materially different descriptions are distinct families.
     const normalized = normalizedForComparison(familyDocuments.map(document => document.text).join('\n'));
+    const titleText = familyDocuments
+      .filter(document => document.field === 'channel_title' || document.field === 'video_title'
+        || document.field === 'playlist_name' || document.field === 'external_link_label')
+      .map(document => document.text)
+      .join(' ');
+    const titleTokens = tokenSet(normalizedForComparison(titleText));
     records.push({
       sourceFamilyId,
       field: representative?.document.field || familyDocuments[0].field,
       normalized,
       tokens: tokenSet(normalized),
+      titleTokens,
       recent: familyDocuments.some(document => isRecent(document.publishedAt, now)),
       tierA,
       focus,
@@ -384,7 +394,11 @@ export function buildContextualComposition(
     if (!group && record.normalized && record.tokens.size >= 3) {
       for (const candidate of groups) {
         if (candidate.field !== record.field || !candidate.normalized) continue;
-        if (jaccard(record.tokens, candidate.tokens) >= 0.9
+        const titleSimilarity = record.titleTokens.size && candidate.titleTokens.size
+          ? jaccard(record.titleTokens, candidate.titleTokens)
+          : 1;
+        if (titleSimilarity >= 0.8
+          && jaccard(record.tokens, candidate.tokens) >= 0.9
           && numericSignature(record.tokens) === numericSignature(candidate.tokens)) {
           group = candidate;
           break;
@@ -404,6 +418,7 @@ export function buildContextualComposition(
       field: record.field,
       normalized: record.normalized,
       tokens: record.tokens,
+      titleTokens: record.titleTokens,
       recent: record.recent,
       tierA: record.tierA,
       focus: record.focus,
