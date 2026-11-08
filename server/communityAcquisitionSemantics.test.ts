@@ -124,6 +124,79 @@ test('encoded YouTube redirect destinations preserve direct Discord invites',asy
   assert.equal(result.foundLocation,'CHANNEL_EXTERNAL_LINKS');
 });
 
+test('externally blocked community surfaces escalate to rendered instead of a clean NOT_FOUND',async()=>{
+  let renderedCalls=0;
+  const staticCalls:string[]=[];
+  const result=await runChannelInspection({
+    channelId:'external-block-render',
+    channelName:'External Block',
+    channelBio:'No invite',
+    channelLinks:['https://linktr.ee/khuncoin1'],
+    videoDescriptions:['one','two','three','four','five'],
+    creatorLikelyTrading:false,
+    externalFetchImpl:(async(input)=>{staticCalls.push(String(input));return new Response('blocked',{status:406,headers:{'content-type':'text/html'}});}) as typeof fetch,
+    renderedFallback:(async(seedUrl:string)=>{renderedCalls++;return {
+      foundInvite:'FD8qmtxQcK',
+      foundLocation:seedUrl,
+      inspectedPages:1,
+      scrolls:0,
+      clicks:0,
+      complete:true,
+      retryable:false,
+      detail:'rendered found invite',
+    } as any;}) as any,
+  });
+  assert.ok(staticCalls.includes('https://linktr.ee/khuncoin1'),'static 406 must be attempted first');
+  assert.ok(result.acquisitionOutcomes?.some(item=>item.surface==='CREATOR_WEBSITES'&&item.outcome==='ACQUISITION_FAILED'&&item.httpStatus===406),'static 406 observation must be recorded');
+  assert.equal(renderedCalls,1,'external block must trigger the bounded rendered rung');
+  assert.equal(result.foundInvite,'FD8qmtxQcK');
+  assert.equal(result.acquisitionStatus,'FOUND');
+  assert.equal(result.steps.find(step=>step.step==='CUSTOM_DOMAINS')?.status,'FOUND');
+});
+
+test('externally blocked community surfaces stay non-clean when rendered also fails',async()=>{
+  const result=await runChannelInspection({
+    channelId:'external-block-render-fail',
+    channelName:'External Block Fail',
+    channelBio:'No invite',
+    channelLinks:['https://linktr.ee/example'],
+    videoDescriptions:['one','two','three','four','five'],
+    creatorLikelyTrading:false,
+    externalFetchImpl:(async()=>new Response('blocked',{status:406,headers:{'content-type':'text/html'}})) as typeof fetch,
+    renderedFallback:(async(seedUrl:string)=>({
+      foundInvite:null,
+      foundLocation:seedUrl,
+      inspectedPages:1,
+      scrolls:0,
+      clicks:0,
+      complete:false,
+      retryable:true,
+      timedOut:true,
+      interactionGap:true,
+      detail:'rendered blocked',
+    } as any)) as any,
+  });
+  assert.notEqual(result.acquisitionStatus,'INSPECTED_NO_MATCH','a failed rendered community surface cannot become a clean negative');
+  assert.ok(result.retryDirective,'blocked required surface must own retry');
+  assert.ok(result.acquisitionOutcomes?.some(item=>item.surface==='CREATOR_WEBSITES'&&item.required===true&&(item.outcome==='ACQUISITION_FAILED'||item.outcome==='PARTIALLY_INSPECTED')),'rendered required observation must stay failed/partial');
+});
+
+test('external-block escalation covers platform subdomains and partial crawls',async()=>{
+  const {isExternalBlockEscalation}=await import('./inspector');
+  const blocked=(requestedUrl:string,httpStatus=406,failureClass='HTTP_ERROR')=>({
+    requestedUrl,outcome:'ACQUISITION_FAILED',retryable:false,httpStatus,failureClass,detail:'',observedAt:'',
+    surface:'CREATOR_WEBSITES',required:false,
+  } as any);
+  assert.equal(isExternalBlockEscalation({outcome:'ACQUISITION_FAILED',observations:[blocked('https://community.circle.so/x')]},'https://community.circle.so/x'),true,'platform subdomain must escalate');
+  assert.equal(isExternalBlockEscalation({outcome:'PARTIALLY_INSPECTED',observations:[
+    {...blocked('https://linktr.ee/x'),outcome:'INSPECTED_NO_MATCH',httpStatus:200,failureClass:''},
+    blocked('https://linktr.ee/x/community'),
+  ]},'https://linktr.ee/x'),true,'blocked child in a partial crawl must escalate');
+  assert.equal(isExternalBlockEscalation({outcome:'ACQUISITION_FAILED',observations:[blocked('https://example.com/x')]},'https://example.com/x'),false,'generic website keeps the existing status contract');
+  assert.equal(isExternalBlockEscalation({outcome:'ACQUISITION_FAILED',observations:[{...blocked('https://creator.example/links'),finalUrl:'https://linktr.ee/creator'}]},'https://creator.example/links'),true,'redirected community final host must escalate');
+  assert.equal(isExternalBlockEscalation({outcome:'PARTIALLY_INSPECTED',observations:[blocked('https://linktr.ee/x',404)]},'https://linktr.ee/x'),false,'permanent 404 does not render');
+});
+
 test('recent-video Discord is preserved before optional acquisition',async()=>{
   const result=await runChannelInspection({channelId:'recent',channelBio:'No invite',channelLinks:[],videoDescriptions:['one','two https://discord.gg/recent-room','three','four','five']});
   assert.equal(result.foundInvite,'recent-room');assert.equal(result.foundLocation,'VIDEO_2_DESCRIPTION');assert.equal(result.acquisitionStatus,'FOUND');
