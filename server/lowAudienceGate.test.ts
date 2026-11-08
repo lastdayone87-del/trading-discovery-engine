@@ -63,9 +63,15 @@ test('ingestionPipeline enforces country hard-rejection before low-audience budg
 
 test('low-audience reuse projects only provisional country evidence and records real changes', () => {
   const source = read('server/ingestionPipeline.ts');
-  // Only a provisional classification row may be rewritten by the reuse path;
-  // an uncertain rediscovery cannot downgrade a completed channel.
-  assert.match(source, /if \(existing\?\.scan_status === 'CLASSIFICATION_PENDING'\) \{/);
+  // lowAudienceChannel aliases existing, so the prior status must be captured
+  // before SKIPPED_LOW_AUDIENCE mutates the shared row. Only a provisional
+  // classification row may be rewritten by the reuse path; an uncertain
+  // rediscovery cannot downgrade a completed channel.
+  assert.match(source, /const wasClassificationPending = existing\?\.scan_status === 'CLASSIFICATION_PENDING';/);
+  const captureIndex = source.indexOf('const wasClassificationPending');
+  const mutationIndex = source.indexOf("lowAudienceChannel.scan_status = 'SKIPPED_LOW_AUDIENCE'");
+  assert.ok(captureIndex >= 0 && captureIndex < mutationIndex, 'prior status must be captured before the aliased row is mutated');
+  assert.match(source, /if \(wasClassificationPending\) \{/);
   assert.match(
     source,
     /const verdictChanged = lowAudienceChannel\.country !== creatorCountry\s*\|\| lowAudienceChannel\.country_status !== countryVal\.status;/,

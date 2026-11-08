@@ -1236,11 +1236,14 @@ export async function admitDiscoveredChannel(input: {
     if (queued.status === 'PENDING' || queued.status === 'PROCESSING') {
       backpressure.globalPending += 1;
       backpressure.scopedPending += 1;
-      // insertChannelIfAbsent is insert-only, so a concurrent search worker can
-      // win the placeholder insert after our initial read. Re-read on conflict
-      // before building the pending outcome; otherwise the losing worker would
-      // report a known channel as new.
-      const channel = existing || await getChannelById(raw.channelId);
+      // insertChannelIfAbsent is insert-only. When this worker won the insert,
+      // the placeholder is our own fresh discovery and must remain novel: a
+      // re-read would return that row and mark the discovery as known. Only an
+      // insert conflict means another writer owns the row, so re-read the
+      // winner before reporting the channel as known.
+      const channel = insertedPlaceholder
+        ? existing
+        : (existing || await getChannelById(raw.channelId));
       return { outcome: classificationPendingOutcome(raw, channel), pending: true };
     }
     // Terminal same-day job: the key deliberately refuses to reopen it, so

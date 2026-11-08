@@ -243,11 +243,17 @@ test('source wiring keeps the inline path as the explicit rollback fallback and 
   assert.match(example, /SEARCH_CLASSIFICATION_DECOUPLING_ENABLED="true"/);
 });
 
-test('a concurrent placeholder insert re-reads the winner before reporting the channel as new', () => {
+test('an owned placeholder insert stays novel while a conflict re-reads the winner', () => {
   const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
   assert.match(
     queue,
-    /if \(queued\.status === 'PENDING' \|\| queued\.status === 'PROCESSING'\) \{[\s\S]{0,700}const channel = existing \|\| await getChannelById\(raw\.channelId\);\s*return \{ outcome: classificationPendingOutcome\(raw, channel\), pending: true \};/,
+    /if \(queued\.status === 'PENDING' \|\| queued\.status === 'PROCESSING'\) \{[\s\S]{0,900}const channel = insertedPlaceholder\s*\? existing\s*: \(existing \|\| await getChannelById\(raw\.channelId\)\);\s*return \{ outcome: classificationPendingOutcome\(raw, channel\), pending: true \};/,
+  );
+  // A row this worker just inserted is a genuinely new discovery. Re-reading
+  // it unconditionally would set wasKnown=true and erase its novelty.
+  assert.doesNotMatch(
+    queue,
+    /if \(queued\.status === 'PENDING' \|\| queued\.status === 'PROCESSING'\) \{[\s\S]{0,400}const channel = existing \|\| await getChannelById\(raw\.channelId\);/,
   );
 });
 

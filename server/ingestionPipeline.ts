@@ -634,11 +634,15 @@ async function processChannelThroughPipelineInContext(
       trading_status: 'UNCERTAIN'
     };
 
+    // lowAudienceChannel aliases existing, so capture the prior lifecycle
+    // state before the SKIPPED_LOW_AUDIENCE mutation below. Checking
+    // existing.scan_status afterwards would always miss the provisional row.
+    const wasClassificationPending = existing?.scan_status === 'CLASSIFICATION_PENDING';
     lowAudienceChannel.subscriber_count = candidate.subscriberCount;
     lowAudienceChannel.scan_status = 'SKIPPED_LOW_AUDIENCE';
     lowAudienceChannel.trading_status = existing?.trading_status || 'UNCERTAIN';
     lowAudienceChannel.last_checked = now;
-    if (existing?.scan_status === 'CLASSIFICATION_PENDING') {
+    if (wasClassificationPending) {
       // A provisional classification row starts as country='UNKNOWN'. The
       // low-audience branch reuses that row, so the validated creator country
       // must be projected here or the durable row keeps the placeholder.
