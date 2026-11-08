@@ -188,7 +188,10 @@ test('external-block escalation covers platform subdomains and partial crawls',a
     surface:'CREATOR_WEBSITES',required:false,
   } as any);
   assert.equal(isExternalBlockEscalation({outcome:'ACQUISITION_FAILED',observations:[blocked('https://community.circle.so/x')]},'https://community.circle.so/x'),true,'platform subdomain must escalate');
-  assert.equal(isExternalBlockEscalation({outcome:'PARTIALLY_INSPECTED',observations:[blocked('https://linktr.ee/x')]},'https://linktr.ee/x'),true,'blocked child in a partial crawl must escalate');
+  assert.equal(isExternalBlockEscalation({outcome:'PARTIALLY_INSPECTED',observations:[
+    {...blocked('https://linktr.ee/x'),outcome:'INSPECTED_NO_MATCH',httpStatus:200,failureClass:''},
+    blocked('https://linktr.ee/x/community'),
+  ]},'https://linktr.ee/x'),true,'blocked child in a partial crawl must escalate');
   assert.equal(isExternalBlockEscalation({outcome:'ACQUISITION_FAILED',observations:[blocked('https://example.com/x')]},'https://example.com/x'),false,'generic website keeps the existing status contract');
   assert.equal(isExternalBlockEscalation({outcome:'ACQUISITION_FAILED',observations:[{...blocked('https://creator.example/links'),finalUrl:'https://linktr.ee/creator'}]},'https://creator.example/links'),true,'redirected community final host must escalate');
   assert.equal(isExternalBlockEscalation({outcome:'PARTIALLY_INSPECTED',observations:[blocked('https://linktr.ee/x',404)]},'https://linktr.ee/x'),false,'permanent 404 does not render');
