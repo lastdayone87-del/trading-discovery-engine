@@ -1319,6 +1319,62 @@ test('groq prompt cap fails closed when fixed references alone exceed the budget
   );
 });
 
+test('groq batch prompt capping preserves every member and nested field reference', () => {
+  const longText = 'liquidity sweep and order flow evidence '.repeat(400);
+  const member = (name: string) => JSON.stringify({
+    task: 'CANDIDATE',
+    promptVersion: 'v1',
+    documents: [
+      { ref: { field: 'channel_title' }, text: name },
+      { ref: { field: 'video_description', index: 0 }, text: longText },
+    ],
+  });
+  const batch = JSON.stringify({
+    task: 'BATCH_CLASSIFICATION',
+    promptVersion: 'semantic-batch-array-1',
+    instructions: ['one result per input'],
+    inputs: [0, 1, 2, 3].map(index => ({ index, request: JSON.parse(member(`Channel ${index}`)) })),
+  });
+  const capped = capGroqSemanticPrompt(batch, 6_000, 1_600);
+  assert.ok(capped.length <= 6_000, `expected <= 6000 chars, got ${capped.length}`);
+  assert.ok(estimateGroqTokens(capped) <= 1_600, `expected <= 1600 tokens, got ${estimateGroqTokens(capped)}`);
+  const parsed = JSON.parse(capped);
+  assert.equal(parsed.contextTruncated, true);
+  assert.deepEqual(parsed.inputs.map((entry: any) => entry.index), [0, 1, 2, 3]);
+  for (const entry of parsed.inputs) {
+    assert.equal(entry.request.contextTruncated, true);
+    assert.equal(entry.request.documents.length, 2);
+    assert.deepEqual(entry.request.documents.map((document: any) => document.ref), [
+      { field: 'channel_title' },
+      { field: 'video_description', index: 0 },
+    ]);
+    assert.ok(entry.request.documents[1].text.length < longText.length);
+  }
+  // The short channel-title document is not shortened by a long sibling.
+  assert.deepEqual(parsed.inputs.map((entry: any) => entry.request.documents[0].text), [
+    'Channel 0', 'Channel 1', 'Channel 2', 'Channel 3',
+  ]);
+});
+
+test('groq batch prompt capping bounds a raw repair request without dropping other members', () => {
+  const batch = JSON.stringify({
+    task: 'BATCH_CLASSIFICATION',
+    promptVersion: 'semantic-batch-array-1',
+    inputs: [
+      { index: 0, request: { raw: 'repair instructions '.repeat(500) } },
+      { index: 1, request: { task: 'CANDIDATE', documents: [{ ref: { field: 'channel_title' }, text: 'Channel 1' }] } },
+    ],
+  });
+  const capped = capGroqSemanticPrompt(batch, 2_000, 800);
+  assert.ok(capped.length <= 2_000);
+  assert.ok(estimateGroqTokens(capped) <= 800);
+  const parsed = JSON.parse(capped);
+  assert.equal(parsed.inputs.length, 2);
+  assert.deepEqual(parsed.inputs.map((entry: any) => entry.index), [0, 1]);
+  assert.equal(parsed.inputs[1].request.documents[0].text, 'Channel 1');
+  assert.ok(parsed.inputs[0].request.raw.length > 0, 'repair instructions must not be deleted outright');
+});
+
 test('an over-budget prompt fails closed before arming the deadline timer or fetching', async () => {
   resetGroqCooldownForTests();
   resetGroqRouteHealthForTests();

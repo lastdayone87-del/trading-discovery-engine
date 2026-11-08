@@ -890,12 +890,146 @@ function groqPromptBudgetError(): ProviderCallError {
 }
 
 /**
+ * Water-fill a character budget across variable text slots. Short slots keep
+ * their full text and the remainder is split evenly among the longer ones, so
+ * a batch's small headings are not shortened just because one document is
+ * huge. Every slot stays present.
+ */
+function textAllowances(texts: string[], availableChars: number): number[] {
+  const allowances = texts.map(() => 0);
+  let remaining = Math.max(0, availableChars);
+  let open = texts.map((_, index) => index);
+  while (open.length > 0 && remaining > 0) {
+    const share = Math.floor(remaining / open.length);
+    if (share <= 0) break;
+    const stillOpen: number[] = [];
+    for (const index of open) {
+      if (texts[index].length <= share) {
+        allowances[index] = texts[index].length;
+        remaining -= texts[index].length;
+      } else {
+        stillOpen.push(index);
+      }
+    }
+    if (stillOpen.length === open.length) {
+      for (const index of stillOpen) allowances[index] = share;
+      break;
+    }
+    open = stillOpen;
+  }
+  return allowances;
+}
+
+/**
+ * Bound a prompt by shortening its variable text while preserving every
+ * structural member. `make` receives one allowance per text slot and must
+ * render the same structure with each slot sliced to its allowance. Both a
+ * character ceiling and a script-aware token estimate are enforced because
+ * Groq meters tokens, and a 24k-character CJK prompt can cost far more tokens
+ * than its Latin equivalent.
+ */
+function boundPromptText(
+  make: (allowances: number[]) => string,
+  texts: string[],
+  maxChars: number,
+  maxTokens: number,
+): string {
+  const exceeds = (value: string) => value.length > maxChars || estimateGroqTokens(value) > maxTokens;
+  // The fixed references and structure alone can exceed the budget (very large
+  // corpus at a small configured limit). Never send an over-budget request:
+  // fail closed so the caller can use its fallback instead of provoking 429s.
+  const overhead = make(texts.map(() => 0));
+  if (exceeds(overhead)) throw groqPromptBudgetError();
+  const available = Math.max(0, maxChars - overhead.length);
+  let allowances = textAllowances(texts, available);
+  let bounded = make(allowances);
+  while (exceeds(bounded)) {
+    if (allowances.every(allowance => allowance === 0)) throw groqPromptBudgetError();
+    allowances = allowances.map(allowance => Math.max(0, Math.floor(allowance * 0.8)));
+    bounded = make(allowances);
+  }
+  return bounded;
+}
+
+/** Single-channel prompt: keep every document reference, shorten its text. */
+function capSinglePrompt(parsed: any, maxChars: number, maxTokens: number): string {
+  const documents = parsed.documents.map((document: any) => ({
+    ...document,
+    text: String(document?.text || ''),
+  }));
+  return boundPromptText(
+    allowances => JSON.stringify({
+      ...parsed,
+      contextTruncated: true,
+      documents: documents.map((document: any, index: number) => ({
+        ...document,
+        text: document.text.slice(0, allowances[index]),
+      })),
+    }),
+    documents.map((document: any) => document.text),
+    maxChars,
+    maxTokens,
+  );
+}
+
+/**
+ * Batch prompt: one channel request per input, with documents nested under
+ * `inputs[].request`. The single-channel cap cannot see those documents, and
+ * raw-slicing the batch JSON would delete later channels entirely. Bound the
+ * nested document text (and any raw repair request) uniformly instead, so
+ * every batch member and every field reference survives.
+ */
+function capBatchPrompt(parsed: any, maxChars: number, maxTokens: number): string {
+  const prepared = parsed.inputs.map((input: any) => {
+    const request = input && typeof input === 'object' ? input.request : undefined;
+    if (!request || typeof request !== 'object') {
+      return { input, request: undefined, documents: undefined, raw: undefined };
+    }
+    const documents = Array.isArray(request.documents)
+      ? request.documents.map((document: any) => ({ ...document, text: String(document?.text || '') }))
+      : undefined;
+    const raw = typeof request.raw === 'string' ? request.raw : undefined;
+    return { input, request, documents, raw };
+  });
+  const texts: string[] = [];
+  for (const entry of prepared) {
+    if (entry.documents) for (const document of entry.documents) texts.push(document.text);
+    if (entry.raw !== undefined) texts.push(entry.raw);
+  }
+  const make = (allowances: number[]) => {
+    let cursor = 0;
+    return JSON.stringify({
+      ...parsed,
+      contextTruncated: true,
+      inputs: prepared.map(entry => {
+        if (!entry.request) return entry.input;
+        const request: any = { ...entry.request };
+        if (entry.documents) {
+          request.documents = entry.documents.map((document: any) => ({
+            ...document,
+            text: document.text.slice(0, allowances[cursor++] ?? 0),
+          }));
+          request.contextTruncated = true;
+        }
+        if (entry.raw !== undefined) {
+          // Repair prompts are plain text, not JSON. Keep their instructions
+          // and allowlisted references (the head) and shorten the embedded
+          // evidence.
+          request.raw = entry.raw.slice(0, allowances[cursor++] ?? 0);
+          request.contextTruncated = true;
+        }
+        return { ...entry.input, request };
+      }),
+    });
+  };
+  return boundPromptText(make, texts, maxChars, maxTokens);
+}
+
+/**
  * Bound a semantic prompt to Groq's free-tier token budget without dropping
- * any field references. All documents stay present (so every citation remains
- * attributable); only their text is shortened. `contextTruncated` tells the
- * model the evidence set is partial. Both a character ceiling and a
- * script-aware token estimate are enforced because Groq meters tokens, and a
- * 24k-character CJK prompt can cost far more tokens than its Latin equivalent.
+ * any field references. Single prompts shorten document text; batch prompts
+ * shorten each nested member's text so no channel is silently removed.
+ * `contextTruncated` tells the model the evidence set is partial.
  */
 export function capGroqSemanticPrompt(
   prompt: string,
@@ -905,41 +1039,9 @@ export function capGroqSemanticPrompt(
   if (prompt.length <= maxChars && estimateGroqTokens(prompt) <= maxTokens) return prompt;
   let parsed: any;
   try { parsed = JSON.parse(prompt); } catch { return truncateToTokenBudget(prompt.slice(0, maxChars), maxTokens); }
+  if (Array.isArray(parsed?.inputs)) return capBatchPrompt(parsed, maxChars, maxTokens);
   if (!Array.isArray(parsed?.documents)) return truncateToTokenBudget(prompt.slice(0, maxChars), maxTokens);
-  const documents = parsed.documents.map((document: any) => ({
-    ...document,
-    text: String(document?.text || ''),
-  }));
-  const build = (perDocumentChars: number) => JSON.stringify({
-    ...parsed,
-    contextTruncated: true,
-    documents: documents.map((document: any) => ({
-      ...document,
-      text: document.text.slice(0, Math.max(0, Math.floor(perDocumentChars))),
-    })),
-  });
-  const overhead = JSON.stringify({
-    ...parsed,
-    contextTruncated: true,
-    documents: documents.map((document: any) => ({ ...document, text: '' })),
-  }).length;
-  const totalTextChars = documents.reduce((sum: number, document: any) => sum + document.text.length, 0);
-  const available = Math.max(0, maxChars - overhead);
-  let perDocumentChars = documents.length
-    ? Math.min(totalTextChars, Math.floor(available / documents.length))
-    : available;
-  const exceeds = (value: string) => value.length > maxChars || estimateGroqTokens(value) > maxTokens;
-  // The fixed references and structure alone can exceed the budget (very large
-  // corpus at a small configured limit). Never send an over-budget request:
-  // fail closed so the caller can use its fallback instead of provoking 429s.
-  if (exceeds(build(0))) throw groqPromptBudgetError();
-  let bounded = build(perDocumentChars);
-  while (exceeds(bounded) && perDocumentChars > 0) {
-    perDocumentChars = Math.max(0, Math.floor(perDocumentChars * 0.8));
-    bounded = build(perDocumentChars);
-  }
-  if (exceeds(bounded)) throw groqPromptBudgetError();
-  return bounded;
+  return capSinglePrompt(parsed, maxChars, maxTokens);
 }
 
 function emitGroqEvent(event: ProviderCallEvent): Promise<void> {

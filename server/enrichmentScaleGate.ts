@@ -53,6 +53,21 @@ export const DEFAULT_ENRICHMENT_SCALE_THRESHOLDS: EnrichmentScaleThresholds = {
   minCompletionToCreationRatio: 0.9,
 };
 
+/**
+ * Startup must never be blocked by a stalled metrics query. The bound is a
+ * deployment concern (table lock, saturated pool), not a scale threshold, and
+ * exceeding it always fails closed to the baseline worker count.
+ */
+export const DEFAULT_ENRICHMENT_SCALE_METRICS_TIMEOUT_MS = 5_000;
+
+export function enrichmentScaleMetricsTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.ENRICHMENT_SCALE_METRICS_TIMEOUT_MS;
+  if (raw === undefined || raw === null || String(raw).trim() === '') return DEFAULT_ENRICHMENT_SCALE_METRICS_TIMEOUT_MS;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return DEFAULT_ENRICHMENT_SCALE_METRICS_TIMEOUT_MS;
+  return Math.min(60_000, Math.max(250, Math.floor(value)));
+}
+
 export function enrichmentScaleThresholds(env: NodeJS.ProcessEnv = process.env): EnrichmentScaleThresholds {
   const number = (name: string, fallback: number) => {
     const raw = env[name];
@@ -156,15 +171,32 @@ export function evaluateEnrichmentScaleGate(
 
 /**
  * Read the measured inputs from the durable ledgers. Any database failure is
- * the caller's signal to stay at baseline; it never authorizes scale.
+ * the caller's signal to stay at baseline; it never authorizes scale. Every
+ * query carries `query_timeout`, and the caller also races this against a wall
+ * clock so a stalled connection acquisition cannot hold startup open.
  */
-export async function loadEnrichmentScaleMetrics(nowMs: number = Date.now(), env: NodeJS.ProcessEnv = process.env): Promise<EnrichmentScaleMetrics> {
-  const { getDb } = await import('./db');
-  const db = await getDb();
+export interface EnrichmentScaleMetricsDeps {
+  query?: (config: { text: string; query_timeout: number }) => Promise<{ rows: any[] }>;
+}
+
+export async function loadEnrichmentScaleMetrics(
+  nowMs: number = Date.now(),
+  env: NodeJS.ProcessEnv = process.env,
+  deps: EnrichmentScaleMetricsDeps = {},
+): Promise<EnrichmentScaleMetrics> {
+  const timeoutMs = enrichmentScaleMetricsTimeoutMs(env);
+  let query = deps.query;
+  if (!query) {
+    const { getDb } = await import('./db');
+    const db = await getDb();
+    // The pool wrapper is typed for text-only queries; node-postgres accepts
+    // the config object and honors query_timeout.
+    query = config => db.query(config as unknown as string);
+  }
   const thresholds = enrichmentScaleThresholds(env);
   const [provider, backlog, throughput] = await Promise.all([
-    db.query(
-      `SELECT
+    query({
+      text: `SELECT
          COUNT(*)::int AS calls,
          COUNT(*) FILTER (WHERE status='SUCCESS')::int AS successes,
          COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)
@@ -172,21 +204,24 @@ export async function loadEnrichmentScaleMetrics(nowMs: number = Date.now(), env
        FROM provider_call_events
        WHERE operation='multilingual-semantic-classification'
          AND occurred_at > now() - interval '24 hours'
-         AND status <> 'CANCELLED'`
-    ),
-    db.query(
-      `SELECT COUNT(*)::int AS pending
+         AND status <> 'CANCELLED'`,
+      query_timeout: timeoutMs,
+    }),
+    query({
+      text: `SELECT COUNT(*)::int AS pending
        FROM jobs
-       WHERE type='ENRICH_CHANNEL' AND status IN ('PENDING','PROCESSING')`
-    ),
-    db.query(
-      `SELECT
+       WHERE type='ENRICH_CHANNEL' AND status IN ('PENDING','PROCESSING')`,
+      query_timeout: timeoutMs,
+    }),
+    query({
+      text: `SELECT
          COUNT(*) FILTER (WHERE created_at > now() - interval '1 hour')::int AS created_last_hour,
          COUNT(*) FILTER (WHERE completed_at > now() - interval '1 hour' AND status='COMPLETED')::int AS completed_last_hour
        FROM jobs
        WHERE type='ENRICH_CHANNEL'
-         AND (created_at > now() - interval '1 hour' OR completed_at > now() - interval '1 hour')`
-    ),
+         AND (created_at > now() - interval '1 hour' OR completed_at > now() - interval '1 hour')`,
+      query_timeout: timeoutMs,
+    }),
   ]);
   const calls = Number(provider.rows[0]?.calls || 0);
   const successes = Number(provider.rows[0]?.successes || 0);
@@ -205,4 +240,29 @@ export async function loadEnrichmentScaleMetrics(nowMs: number = Date.now(), env
     backlogStable,
     measuredAt: new Date(nowMs).toISOString(),
   };
+}
+
+/**
+ * Startup-safe wrapper: resolve `undefined` at the wall-clock deadline so the
+ * caller immediately starts the baseline pool. A rejected load also resolves
+ * `undefined` (the gate fails closed to three).
+ */
+export async function loadEnrichmentScaleMetricsWithinDeadline(
+  nowMs: number = Date.now(),
+  env: NodeJS.ProcessEnv = process.env,
+  load: () => Promise<EnrichmentScaleMetrics> = () => loadEnrichmentScaleMetrics(nowMs, env),
+): Promise<EnrichmentScaleMetrics | undefined> {
+  const timeoutMs = enrichmentScaleMetricsTimeoutMs(env);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      load().catch(() => undefined),
+      new Promise<undefined>(resolve => {
+        timer = setTimeout(() => resolve(undefined), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }

@@ -2,7 +2,7 @@ import { getDb } from './db';
 import { CLASSIFICATION_JOB_TYPE, resolveEnrichmentWorkerCount } from './classificationDecoupling';
 import { diagnoseEnrichmentBacklog } from './enrichmentBacklogDiagnosis';
 import { semanticPrefilterSnapshot } from './semanticPrefilter';
-import { enrichmentScaleThresholds, evaluateEnrichmentScaleGate, getRunningEnrichmentWorkerCount, loadEnrichmentScaleMetrics } from './enrichmentScaleGate';
+import { enrichmentScaleThresholds, evaluateEnrichmentScaleGate, getRunningEnrichmentWorkerCount, loadEnrichmentScaleMetricsWithinDeadline } from './enrichmentScaleGate';
 
 /**
  * Build the read-only diagnostic SQL for one queue job type. The job type is a
@@ -195,7 +195,8 @@ async function phase4Diagnostics():Promise<any>{
     semanticCache={unavailable:error instanceof Error?error.message:'unavailable'};
   }
   try{
-    const metrics=await loadEnrichmentScaleMetrics();
+    const metrics=await loadEnrichmentScaleMetricsWithinDeadline();
+    if(!metrics)throw new Error('Enrichment scale metrics did not settle before the deadline.');
     enrichmentScale={runningWorkers:getRunningEnrichmentWorkerCount(),liveDecision:true,metrics,decision:evaluateEnrichmentScaleGate(metrics,thresholds,requestedWorkers)};
   }catch(error){
     enrichmentScale={runningWorkers:getRunningEnrichmentWorkerCount(),liveDecision:true,unavailable:error instanceof Error?error.message:'unavailable',decision:evaluateEnrichmentScaleGate(undefined,thresholds,requestedWorkers)};

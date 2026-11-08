@@ -29,7 +29,7 @@ The approved Phase 4 policy allows scale work only after measurement:
 
 Files: `server/evidenceEngine/semanticResultCache.ts`,
 `server/classificationInputChecksum.ts`, migration
-`168_semantic_classification_cache.sql`.
+`169_semantic_classification_cache.sql`.
 
 - Stores only the final parsed semantic model result, never a whole
   classification decision. Deterministic providers and the normal decision
@@ -56,7 +56,7 @@ Files: `server/evidenceEngine/semanticResultCache.ts`,
   and a concurrent duplicate evaluation cannot rewrite it.
 - Hits increment `hits` and set `last_hit_at` for measurement.
 
-**Retention.** Migration 168 does not install an automatic purge. Rows are
+**Retention.** Migration 169 does not install an automatic purge. Rows are
 small and keyed by evidence; stale rows simply stop being read. Trim manually
 when needed (safe because the cache is never authoritative). Retain by last
 use, not creation, so a frequently hit entry is not purged merely for age:
@@ -117,6 +117,10 @@ Files: `server/evidenceEngine/semanticBatch.ts`, provider candidate calls.
 - The batch prompt declares an explicit array schema, one result per input, in
   input order, with per-channel citations and an instruction never to merge
   evidence across inputs. Groq's completion allowance scales with batch size.
+- If a batch exceeds Groq's prompt budget, nested document text (and any raw
+  repair request) is shortened in place: every batch member and every field
+  reference survives, so no channel is silently dropped or classified from a
+  truncated tail. `contextTruncated` marks the partial evidence.
 - Each array element is parsed independently and structurally validated. A
   missing/invalid element falls back to a single call for **that channel
   only**. A malformed whole-batch container (not an array or `{results:[...]}`)
@@ -172,7 +176,10 @@ clamped to 3 unless **all** pass:
 | Backlog stability (1 h completed/created) | at least 0.9, or no creations and pending within cap |
 
 On success the effective count is capped at 6. Any metrics/query error fails
-closed to 3. The gate is re-evaluated on each process start; a running process
+closed to 3, and the metrics wait itself is bounded by
+`ENRICHMENT_SCALE_METRICS_TIMEOUT_MS` (default 5000 ms): a stalled query or
+connection resolves to baseline workers instead of leaving the pool stopped.
+The gate is re-evaluated on each process start; a running process
 never changes its worker count. `ENRICHMENT_SCALE_GATE_ENABLED=false` is the
 operator rollback that restores the raw explicit environment value (skipping
 the metrics load entirely), still capped at the approved hard ceiling of 6.
@@ -202,13 +209,14 @@ currently running pool.
 | `ENRICHMENT_SCALE_MIN_SAMPLE` | `50` | Gate sample floor. |
 | `ENRICHMENT_SCALE_MAX_PENDING` | `500` | Gate backlog cap. |
 | `ENRICHMENT_SCALE_MIN_COMPLETION_RATIO` | `0.9` | Gate stability ratio. |
+| `ENRICHMENT_SCALE_METRICS_TIMEOUT_MS` | `5000` | Startup bound on the gate's metrics read; timeout falls back to 3 workers. |
 
 Production defaults at merge time: Groq remains the primary semantic provider,
 cache on, prefilter shadow, batching off, scale gate on, and enrichment at 3.
 
 ## 4. Rollout sequence
 
-1. **Deploy.** Migration 168 applies automatically during database
+1. **Deploy.** Migration 169 applies automatically during database
    initialization (`server/dbCore.ts`). The cache fails open if the table is
    briefly unavailable.
 2. **Observe cache and shadow prefilter for 24–48 h.** Confirm cache hits are
@@ -333,7 +341,7 @@ All controls are feature-flag based and additive:
 
 Phase 3 classification jobs are durable and remain drainable: Phase 4 adds no
 new job type, and disabling cache/prefilter/batching only removes an
-optimization. Migration 168 can stay applied after rollback; dropping the table
+optimization. Migration 169 can stay applied after rollback; dropping the table
 is optional and destroys only non-authoritative cache rows.
 
 ## 7. Risks and mitigations
@@ -365,7 +373,7 @@ is optional and destroys only non-authoritative cache rows.
 
 Fresh runs in the Phase 4 worktree:
 
-- New Phase 4 suites: **65 passed, 0 failed**
+- New Phase 4 suites: **70 passed, 0 failed**
   (`semanticResultCache`, `semanticPrefilter`, `semanticBatch`,
   `geminiOrgCapacity`, `enrichmentScaleGate`).
 - Provider, capacity, queue, and diagnostics regression suites: **133 passed,
@@ -375,10 +383,11 @@ Fresh runs in the Phase 4 worktree:
   `manualRecheckClassification`, `enrichmentBacklogDiagnostics`,
   `enrichmentBacklogEvidence`, `enrichmentBacklogDrain.contract`,
   `providerFailureDiagnostics`).
-- Provider implementation suites: **122 passed, 0 failed**
+- Provider implementation suites: **124 passed, 0 failed**
   (`GeminiSemanticProvider`, `GroqSemanticProvider`,
   `GeminiFreeSemanticProvider`).
-- Combined Phase 4 plus regression run: **320 passed, 0 failed**.
+- Migration runner, including a unique-version guard: **2 passed, 0 failed**.
+- Combined Phase 4 plus regression run: **329 passed, 0 failed**.
 - `npx tsc --noEmit`: clean.
 - `multilingualSemanticProvider.test.ts` retains one pre-existing
   environment-dependent assertion (`gemini-3.6-flash` vs expected

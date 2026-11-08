@@ -2,12 +2,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
+  DEFAULT_ENRICHMENT_SCALE_METRICS_TIMEOUT_MS,
   DEFAULT_ENRICHMENT_SCALE_THRESHOLDS,
   ENRICHMENT_WORKER_BASELINE,
   ENRICHMENT_WORKER_SCALE_CEILING,
+  enrichmentScaleMetricsTimeoutMs,
   enrichmentScaleThresholds,
   evaluateBacklogStability,
   evaluateEnrichmentScaleGate,
+  loadEnrichmentScaleMetrics,
+  loadEnrichmentScaleMetricsWithinDeadline,
   type EnrichmentScaleMetrics,
 } from './enrichmentScaleGate';
 
@@ -153,5 +157,58 @@ test('the disabled gate skips the metrics load entirely', () => {
   const source = readFileSync('server/queueManager.ts', 'utf8');
   assert.match(source, /requested > ENRICHMENT_WORKER_BASELINE && enrichmentScaleGateEnabled\(\)/);
   const disabledBranch = source.slice(source.indexOf('async function startGatedEnrichmentWorkers'));
-  assert.ok(disabledBranch.indexOf('enrichmentScaleGateEnabled()') < disabledBranch.indexOf('loadEnrichmentScaleMetrics()'));
+  assert.ok(disabledBranch.indexOf('enrichmentScaleGateEnabled()') < disabledBranch.indexOf('loadEnrichmentScaleMetricsWithinDeadline()'));
+});
+
+test('startup uses the deadline-bounded metrics loader', () => {
+  const source = readFileSync('server/queueManager.ts', 'utf8');
+  assert.match(source, /metrics = await loadEnrichmentScaleMetricsWithinDeadline\(\)/);
+  assert.doesNotMatch(source, /metrics = await loadEnrichmentScaleMetrics\(\)/);
+});
+
+test('the metrics deadline defaults safely and clamps explicit values', () => {
+  assert.equal(DEFAULT_ENRICHMENT_SCALE_METRICS_TIMEOUT_MS, 5_000);
+  assert.equal(enrichmentScaleMetricsTimeoutMs({} as any), 5_000);
+  assert.equal(enrichmentScaleMetricsTimeoutMs({ ENRICHMENT_SCALE_METRICS_TIMEOUT_MS: '' } as any), 5_000);
+  assert.equal(enrichmentScaleMetricsTimeoutMs({ ENRICHMENT_SCALE_METRICS_TIMEOUT_MS: 'nonsense' } as any), 5_000);
+  assert.equal(enrichmentScaleMetricsTimeoutMs({ ENRICHMENT_SCALE_METRICS_TIMEOUT_MS: '-1' } as any), 5_000);
+  assert.equal(enrichmentScaleMetricsTimeoutMs({ ENRICHMENT_SCALE_METRICS_TIMEOUT_MS: '10' } as any), 250);
+  assert.equal(enrichmentScaleMetricsTimeoutMs({ ENRICHMENT_SCALE_METRICS_TIMEOUT_MS: '999999' } as any), 60_000);
+});
+
+test('every scale-metrics query carries the configured query timeout', async () => {
+  const seen: number[] = [];
+  const metrics = await loadEnrichmentScaleMetrics(0, { ENRICHMENT_SCALE_METRICS_TIMEOUT_MS: '1500' } as any, {
+    query: async config => {
+      seen.push(config.query_timeout);
+      const call = seen.length;
+      if (call === 1) return { rows: [{ calls: 100, successes: 95, p95: 9000 }] };
+      if (call === 2) return { rows: [{ pending: 20 }] };
+      return { rows: [{ created_last_hour: 10, completed_last_hour: 10 }] };
+    },
+  });
+  assert.deepEqual(seen, [1500, 1500, 1500]);
+  assert.equal(metrics.semanticCalls, 100);
+  assert.equal(metrics.semanticSuccesses, 95);
+  assert.equal(metrics.backlogStable, true);
+});
+
+test('a stalled metrics load resolves at the deadline so startup can use baseline', async () => {
+  const started = Date.now();
+  const metrics = await loadEnrichmentScaleMetricsWithinDeadline(
+    0,
+    { ENRICHMENT_SCALE_METRICS_TIMEOUT_MS: '50' } as any,
+    () => new Promise<EnrichmentScaleMetrics>(() => {}),
+  );
+  assert.equal(metrics, undefined);
+  assert.ok(Date.now() - started < 3_000);
+});
+
+test('a completed metrics load is returned by the deadline wrapper', async () => {
+  const metrics = await loadEnrichmentScaleMetricsWithinDeadline(
+    0,
+    { ENRICHMENT_SCALE_METRICS_TIMEOUT_MS: '5000' } as any,
+    async () => ({ ...healthy }),
+  );
+  assert.equal(metrics?.semanticCalls, healthy.semanticCalls);
 });
