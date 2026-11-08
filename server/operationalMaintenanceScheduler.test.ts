@@ -82,6 +82,31 @@ test('classification sighting sweep is throttled by the scheduler clock', async 
   assert.equal(classificationCalls(), 2, 'the sweep runs once the interval elapses');
 });
 
+test('classification sweep repair counts are logged only when rows changed', async () => {
+  const { dependencies } = createDeps();
+  let result: { reconciled: number; orphaned: number } = { reconciled: 0, orphaned: 0 };
+  dependencies.reconcileStaleClassificationSightings = async () => result;
+  let clock = 1_000_000;
+  const scheduler = createOperationalMaintenanceScheduler(dependencies, {
+    now: () => clock,
+    classificationSightingSweepIntervalMs: 60_000
+  });
+  const logs: string[] = [];
+  const originalInfo = console.info;
+  console.info = (...args: unknown[]) => { logs.push(args.map(String).join(' ')); };
+  try {
+    await scheduler.run();
+    assert.equal(logs.length, 0, 'a sweep that changed nothing is not an operator-visible event');
+    result = { reconciled: 2, orphaned: 1 };
+    clock += 60_000;
+    await scheduler.run();
+  } finally {
+    console.info = originalInfo;
+  }
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /classification sightings reconciled=2 orphaned=1/);
+});
+
 test('one failing task does not suppress the remaining recovery guarantees', async () => {
   const { calls, dependencies } = createDeps('community');
   const scheduler = createOperationalMaintenanceScheduler(dependencies, { now: () => 2_000_000 });

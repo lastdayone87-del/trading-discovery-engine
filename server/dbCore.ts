@@ -1726,7 +1726,10 @@ export async function getQueueStatusFresh(): Promise<QueueStatus> {
  * Fresh production-depth read for recovery admission. This deliberately
  * bypasses the brief status cache: recovery work must not be admitted from a
  * backlog snapshot taken before newly arrived production jobs. The type set
- * matches the searchJobs + channelProcessing depths reported by queue status.
+ * covers the searchJobs, channelProcessing, and classificationQueue depths
+ * reported by queue status. Classification is included intentionally: recovery
+ * must not compete with a live discovery backlog that is still being
+ * classified, even before those jobs reach ENRICH_CHANNEL.
  */
 export async function getProductionBacklogDepth(): Promise<number> {
   const db=await getDb();

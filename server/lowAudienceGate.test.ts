@@ -61,13 +61,30 @@ test('ingestionPipeline enforces country hard-rejection before low-audience budg
   assert.ok(countryRejectedIndex < lowAudienceGateIndex, 'Country hard-rejection must precede low-audience budget gate in ingestion pipeline');
 });
 
-test('low-audience reuse keeps country and status as one evidence pair', () => {
+test('low-audience reuse projects only provisional country evidence and records real changes', () => {
   const source = read('server/ingestionPipeline.ts');
+  // Only a provisional classification row may be rewritten by the reuse path;
+  // an uncertain rediscovery cannot downgrade a completed channel.
+  assert.match(source, /if \(existing\?\.scan_status === 'CLASSIFICATION_PENDING'\) \{/);
   assert.match(
     source,
-    /if \(creatorCountry\) \{\s*lowAudienceChannel\.country = creatorCountry;\s*lowAudienceChannel\.country_status = countryVal\.status;\s*lowAudienceChannel\.confidence_score = countryVal\.score;\s*\}/,
+    /const verdictChanged = lowAudienceChannel\.country !== creatorCountry\s*\|\| lowAudienceChannel\.country_status !== countryVal\.status;/,
   );
-  assert.doesNotMatch(source, /if \(creatorCountry\) lowAudienceChannel\.country = creatorCountry;\s*lowAudienceChannel\.country_status = countryVal\.status;/);
+  // Country/status/confidence stay one atomic evidence pair.
+  assert.match(
+    source,
+    /lowAudienceChannel\.country = creatorCountry;\s*lowAudienceChannel\.country_status = countryVal\.status;\s*lowAudienceChannel\.confidence_score = countryVal\.score;/,
+  );
+  // Repeated rediscoveries of the same provisional verdict do not grow the
+  // inspection trail indefinitely.
+  assert.match(source, /if \(verdictChanged\) \{\s*lowAudienceChannel\.inspection_trail = \[/);
+  // The reported outcome must describe the persisted row, not the fresh
+  // (possibly unresolved) validation when the prior pair was retained.
+  assert.match(source, /countryStatus: lowAudienceChannel\.country_status,/);
+  assert.match(
+    source,
+    /detectedCountry: lowAudienceChannel\.country_status === 'UNCERTAIN'\s*\?\s*null\s*:\s*lowAudienceChannel\.country,/,
+  );
 });
 
 test('handle-shaped and missing counts fail open as unavailable, never as low-audience', () => {

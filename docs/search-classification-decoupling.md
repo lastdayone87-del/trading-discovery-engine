@@ -15,7 +15,8 @@ YouTube quota were not saturated.
 `SEARCH_CLASSIFICATION_DECOUPLING_ENABLED` (default `true`) switches the
 autonomous search loop from inline classification to durable admission. The
 durable queue is the active production path; an explicit `false` is the
-rollback switch.
+rollback switch. An unrecognized value warns once and keeps the default so a
+rollback token written as `disabled` cannot silently leave the queue active.
 
 When enabled, for every newly retrieved channel the search worker:
 
@@ -59,6 +60,9 @@ the only writer of classification outcomes.
 ## Worker capacity
 
 Worker counts are unchanged: 4 search workers and 3 enrichment workers.
+`ENRICHMENT_WORKER_CONCURRENCY` still wins, but the startup total is capped at
+the historical 20-worker maximum before it is split so two pools cannot exceed
+the old single-pool ceiling.
 
 The 3 enrichment workers keep the total but split claim preference:
 
@@ -111,7 +115,7 @@ removed reconcile to `UNCERTAIN` after a five-minute grace period.
   - `searchWorkers`: configured main search width and busy claim owners.
 - `GET /api/diagnostics/enrichment-backlog` (operator) now includes a `classification`
   block with the same aggregate, throughput, and oldest-job diagnostics as
-  ENRICH_CHANNEL.
+  ENRICH_CHANNEL; the QueueMonitor dashboard renders that block directly.
 - `/api/provider-metrics` keeps semantic route health / daily quota signals from
   the provider-resilience work; classify jobs appear in its queue latency by
   type.

@@ -389,9 +389,9 @@ export interface QueueStatus {
     processing: number;
     oldestPendingAt: string | null;
     /** Feature flag state; false still allows old queued jobs to drain. */
-    enabled?: boolean;
+    enabled: boolean;
     /** Configured global cap on PENDING+PROCESSING classification jobs. */
-    maxPending?: number;
+    maxPending: number;
     bySource: Array<{ source: string; pending: number; processing: number; oldestPendingAt: string | null }>;
   };
   /**

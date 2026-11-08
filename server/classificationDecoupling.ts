@@ -58,16 +58,29 @@ function positiveInt(value: unknown, fallback: number, max = Number.MAX_SAFE_INT
   return Math.min(max, Math.max(1, Math.floor(parsed)));
 }
 
+const warnedFlagValues = new Set<string>();
+
 /**
  * Default-on feature switches still need an unambiguous rollback value.
  * Missing, empty, or unrecognized values keep the shipped default; only an
- * explicit falsey token disables the path.
+ * explicit falsey token disables the path. Unrecognized values are warned
+ * about once per distinct token so a rollback written as `disabled` or `nope`
+ * does not silently leave the queue active.
  */
 function flagEnabled(value: unknown, fallback: boolean): boolean {
   if (value === undefined || value === null || String(value).trim() === '') return fallback;
-  const normalized = String(value).trim().toLowerCase();
+  const raw = String(value).trim();
+  const normalized = raw.toLowerCase();
   if (['false', '0', 'off', 'no'].includes(normalized)) return false;
   if (['true', '1', 'on', 'yes'].includes(normalized)) return true;
+  if (!warnedFlagValues.has(normalized)) {
+    warnedFlagValues.add(normalized);
+    console.warn(
+      `[Classification] Unrecognized ${CLASSIFICATION_DECOUPLING_FLAG} value "${raw}"; `
+      + `keeping the default (${fallback ? 'enabled' : 'disabled'}). `
+      + 'Use false/0/off to roll back.',
+    );
+  }
   return fallback;
 }
 
@@ -101,7 +114,10 @@ export function resolveSearchWorkerCount(env: NodeJS.ProcessEnv = process.env): 
 }
 
 export function resolveEnrichmentWorkerCount(env: NodeJS.ProcessEnv = process.env): number {
-  return workerCount(env.ENRICHMENT_WORKER_CONCURRENCY, ENRICHMENT_WORKER_CONCURRENCY_DEFAULT);
+  // startWorkerPool historically capped one enrichment pool at 20 workers.
+  // Decoupling starts two pools, so enforce the same total here before the
+  // split; otherwise a large env value could launch up to 40 workers.
+  return Math.min(20, workerCount(env.ENRICHMENT_WORKER_CONCURRENCY, ENRICHMENT_WORKER_CONCURRENCY_DEFAULT));
 }
 
 /**
@@ -121,7 +137,10 @@ export function resolveEnrichmentWorkerSplit(totalWorkers: number, decouplingEna
   classificationWorkers: number;
   enrichmentOnlyWorkers: number;
 } {
-  const total = positiveInt(totalWorkers, ENRICHMENT_WORKER_CONCURRENCY_DEFAULT, 100);
+  // Do not impose a second, lower cap here: the resolver owns the historical
+  // 20-worker startup ceiling, and direct callers expect their total preserved
+  // through the split rather than silently dropped.
+  const total = positiveInt(totalWorkers, ENRICHMENT_WORKER_CONCURRENCY_DEFAULT);
   if (total === 1) return { classificationWorkers: 1, enrichmentOnlyWorkers: 0 };
   const classificationCap = decouplingEnabled ? 2 : 1;
   const classificationWorkers = Math.max(1, Math.min(classificationCap, total - 1));

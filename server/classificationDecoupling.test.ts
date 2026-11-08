@@ -29,7 +29,22 @@ test('decoupling is active by default and an explicit false is the rollback swit
   assert.equal(resolveClassificationDecouplingConfig(env({ [CLASSIFICATION_DECOUPLING_FLAG]: 'false' })).enabled, false);
   assert.equal(resolveClassificationDecouplingConfig(env({ [CLASSIFICATION_DECOUPLING_FLAG]: '0' })).enabled, false);
   assert.equal(resolveClassificationDecouplingConfig(env({ [CLASSIFICATION_DECOUPLING_FLAG]: 'off' })).enabled, false);
-  assert.equal(resolveClassificationDecouplingConfig(env({ [CLASSIFICATION_DECOUPLING_FLAG]: 'not-a-boolean' })).enabled, true);
+});
+
+test('an unrecognized rollback value warns once and keeps the default', () => {
+  const token = `disabled-${Date.now()}`;
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+  try {
+    assert.equal(resolveClassificationDecouplingConfig(env({ [CLASSIFICATION_DECOUPLING_FLAG]: token })).enabled, true);
+    assert.equal(resolveClassificationDecouplingConfig(env({ [CLASSIFICATION_DECOUPLING_FLAG]: token })).enabled, true);
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.equal(warnings.length, 1, 'the same unrecognized token warns once, not on every resolve');
+  assert.match(warnings[0], /Unrecognized SEARCH_CLASSIFICATION_DECOUPLING_ENABLED value/);
+  assert.match(warnings[0], /Use false\/0\/off to roll back/);
 });
 
 test('caps, priority, and attempts clamp to safe positives', () => {
@@ -67,6 +82,10 @@ test('worker counts stay at the measured 4/3 defaults and env overrides still wi
   assert.equal(resolveEnrichmentWorkerCount(env({ ENRICHMENT_WORKER_CONCURRENCY: 'NaN' })), 3);
   assert.equal(resolveSearchWorkerCount(env({ SEARCH_WORKER_CONCURRENCY: '0' })), 1);
   assert.equal(resolveEnrichmentWorkerCount(env({ ENRICHMENT_WORKER_CONCURRENCY: '0' })), 1);
+  // The pre-decoupling startup capped one enrichment pool at 20 workers. Two
+  // pools are started now, so the total is capped in the resolver first.
+  assert.equal(resolveEnrichmentWorkerCount(env({ ENRICHMENT_WORKER_CONCURRENCY: '50' })), 20);
+  assert.equal(resolveEnrichmentWorkerCount(env({ ENRICHMENT_WORKER_CONCURRENCY: '1e6' })), 20);
 });
 
 test('enrichment pool splits 2/1 when enabled and always leaves an ENRICH-only lane', () => {
@@ -77,8 +96,12 @@ test('enrichment pool splits 2/1 when enabled and always leaves an ENRICH-only l
   // A two-worker pool must keep one lane on the existing ENRICH backlog even
   // when the classification queue never empties.
   assert.deepEqual(resolveEnrichmentWorkerSplit(2, true), { classificationWorkers: 1, enrichmentOnlyWorkers: 1 });
+  // Direct callers keep their configured total: there is no second 100-worker
+  // clamp inside the split. Startup applies the historical 20-worker cap in
+  // resolveEnrichmentWorkerCount before calling this function.
+  assert.deepEqual(resolveEnrichmentWorkerSplit(250, true), { classificationWorkers: 2, enrichmentOnlyWorkers: 248 });
   // Total worker count is preserved for every split.
-  for (const total of [1, 2, 3, 6]) {
+  for (const total of [1, 2, 3, 6, 250]) {
     for (const enabled of [true, false]) {
       const split = resolveEnrichmentWorkerSplit(total, enabled);
       assert.equal(split.classificationWorkers + split.enrichmentOnlyWorkers, total);
@@ -208,6 +231,9 @@ test('source wiring keeps the inline path as the explicit rollback fallback and 
   assert.match(queue, /push\(CLASSIFICATION_JOB_TYPE\)/);
   assert.match(queue, /job\.type === CLASSIFICATION_JOB_TYPE[\s\S]{0,120}processClassificationJob/);
   assert.match(queue, /startWorkerPool\('ENRICH_CHANNEL', enrichmentSplit\.classificationWorkers, \[CLASSIFICATION_JOB_TYPE\]/);
+  // The split starts two pools, so startup clamps the total to the historical
+  // 20-worker maximum before splitting.
+  assert.match(queue, /const enrichmentWorkers = Math\.min\(20, resolveEnrichmentWorkerCount\(\)\)/);
   // The search run must not fail because a later classification failed.
   assert.match(queue, /job\.type === CLASSIFICATION_JOB_TYPE \? '' : String\(job\.payload\?\.queryRunId/);
   // Provisional rows are insert-only and classification reconciliation is durable.
@@ -215,6 +241,14 @@ test('source wiring keeps the inline path as the explicit rollback fallback and 
   assert.match(db, /ON CONFLICT\(channel_id\) DO NOTHING/);
   assert.match(db, /export async function reconcileClassificationSighting/);
   assert.match(example, /SEARCH_CLASSIFICATION_DECOUPLING_ENABLED="true"/);
+});
+
+test('a concurrent placeholder insert re-reads the winner before reporting the channel as new', () => {
+  const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  assert.match(
+    queue,
+    /if \(queued\.status === 'PENDING' \|\| queued\.status === 'PROCESSING'\) \{[\s\S]{0,700}const channel = existing \|\| await getChannelById\(raw\.channelId\);\s*return \{ outcome: classificationPendingOutcome\(raw, channel\), pending: true \};/,
+  );
 });
 
 test('sweep revisions are recency-bounded and one-shot', () => {

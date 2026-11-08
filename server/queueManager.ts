@@ -1236,7 +1236,12 @@ export async function admitDiscoveredChannel(input: {
     if (queued.status === 'PENDING' || queued.status === 'PROCESSING') {
       backpressure.globalPending += 1;
       backpressure.scopedPending += 1;
-      return { outcome: classificationPendingOutcome(raw, existing), pending: true };
+      // insertChannelIfAbsent is insert-only, so a concurrent search worker can
+      // win the placeholder insert after our initial read. Re-read on conflict
+      // before building the pending outcome; otherwise the losing worker would
+      // report a known channel as new.
+      const channel = existing || await getChannelById(raw.channelId);
+      return { outcome: classificationPendingOutcome(raw, channel), pending: true };
     }
     // Terminal same-day job: the key deliberately refuses to reopen it, so
     // fall through to inline classification for this new rediscovery. The
@@ -4738,7 +4743,10 @@ export function startSearchWorkers(): void {
   // With the flag off, one shared worker still drains old classification jobs
   // while two workers keep the pre-existing ENRICH backlog moving.
   const decoupling = resolveClassificationDecouplingConfig();
-  const enrichmentWorkers = resolveEnrichmentWorkerCount();
+  // Keep the configured pool's historical 20-worker maximum before starting
+  // two pools. resolveEnrichmentWorkerCount owns the cap; the explicit clamp
+  // here keeps that startup invariant local to the split as well.
+  const enrichmentWorkers = Math.min(20, resolveEnrichmentWorkerCount());
   const enrichmentSplit = resolveEnrichmentWorkerSplit(enrichmentWorkers, decoupling.enabled);
   startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.classificationWorkers, [CLASSIFICATION_JOB_TYPE], 'enrich_channel_shared');
   if (enrichmentSplit.enrichmentOnlyWorkers > 0) {

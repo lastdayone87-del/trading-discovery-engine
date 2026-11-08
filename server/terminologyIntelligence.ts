@@ -2001,7 +2001,7 @@ export async function getPlannerTerminology(country: string, clientOverride?: Qu
   const PLANNER_MAX_SCAN = 1000;
   const terms: Array<{ id: number; term: string; score: number; lifecycle: 'SEARCH_TRIAL' | 'PROVEN_SEARCH_TERM' }> = [];
   const seenTermIds = new Set<number>();
-  const result = await runner.query(`SELECT t.id,t.canonical_term term,t.lifecycle_status,t.term_type,t.country,t.language,COALESCE(AVG(p.decayed_yield_score),0)::float score FROM canonical_trading_terms t LEFT JOIN terminology_performance p ON p.canonical_term_id=t.id WHERE t.country=$1 AND t.search_eligible=true AND t.lifecycle_status IN ('SEARCH_TRIAL','PROVEN_SEARCH_TERM') GROUP BY t.id ORDER BY score DESC,t.last_observed_at DESC NULLS LAST,t.id ASC LIMIT $2`, [canonicalCountry(country), PLANNER_MAX_SCAN]);
+  const result = await runner.query(`SELECT t.id,t.canonical_term term,t.lifecycle_status,t.term_type,t.country,t.language,COALESCE(SUM(p.decayed_yield_score*p.executions)/NULLIF(SUM(p.executions),0),0)::float score FROM canonical_trading_terms t LEFT JOIN terminology_performance p ON p.canonical_term_id=t.id WHERE t.country=$1 AND t.search_eligible=true AND t.lifecycle_status IN ('SEARCH_TRIAL','PROVEN_SEARCH_TERM') GROUP BY t.id ORDER BY score DESC,t.last_observed_at DESC NULLS LAST,t.id ASC LIMIT $2`, [canonicalCountry(country), PLANNER_MAX_SCAN]);
   for (const row of result.rows) {
     if (terms.length >= 50) break;
     const id = Number(row.id);

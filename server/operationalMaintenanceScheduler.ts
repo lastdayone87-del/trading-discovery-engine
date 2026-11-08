@@ -30,8 +30,8 @@ export interface OperationalMaintenanceDependencies {
   reconcileOperationalEnrichmentRecovery(): Promise<unknown>;
   triggerPhaseBObservationReconciliation(): unknown;
   resumeOrphanedAutonomousPages(): Promise<unknown>;
-  /** Optional so existing scheduler fixtures remain valid. */
-  reconcileStaleClassificationSightings?(): Promise<unknown>;
+  /** Delayed repair of pending classification sightings; runs at minute scale. */
+  reconcileStaleClassificationSightings(): Promise<unknown>;
 }
 
 export interface OperationalMaintenanceSnapshot {
@@ -188,13 +188,22 @@ export function createOperationalMaintenanceScheduler(
     await isolate('autonomous_orphan_resume', () => dependencies.resumeOrphanedAutonomousPages());
     // The delayed-classification sweep is minute-scale, not tick-scale. Use
     // the scheduler's clock so tests and runtime share one cadence source.
-    if (dependencies.reconcileStaleClassificationSightings
-      && (lastClassificationSightingSweepMs === null
-        || nowMs - lastClassificationSightingSweepMs >= classificationSightingSweepIntervalMs)) {
+    if (lastClassificationSightingSweepMs === null
+      || nowMs - lastClassificationSightingSweepMs >= classificationSightingSweepIntervalMs) {
       // Stamp before running so a failing sweep backs off instead of retrying
       // on every maintenance tick.
       lastClassificationSightingSweepMs = nowMs;
-      await isolate('classification_sighting_reconciliation', () => dependencies.reconcileStaleClassificationSightings!());
+      await isolate('classification_sighting_reconciliation', async () => {
+        const result = await dependencies.reconcileStaleClassificationSightings() as
+          { reconciled?: number; orphaned?: number } | undefined;
+        const reconciled = Number(result?.reconciled || 0);
+        const orphaned = Number(result?.orphaned || 0);
+        // Throttled ticks return no result at all; only a sweep that changed
+        // rows is operator-visible evidence that repair is keeping up.
+        if (reconciled || orphaned) {
+          console.info(`[Operational Maintenance] classification sightings reconciled=${reconciled} orphaned=${orphaned}.`);
+        }
+      });
     }
   };
 
