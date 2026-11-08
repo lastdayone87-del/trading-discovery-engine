@@ -41,6 +41,7 @@ test('pending classifications count as persisted new creators but not as evaluat
   assert.equal(metrics.distinctResults, 2);
   assert.equal(metrics.uncertain, 0, 'pending is not a semantic uncertainty verdict');
   assert.equal(metrics.tradingPrecision, 1, 'pending must not dilute precision');
+  assert.equal(metrics.countryPrecision, 1, 'pending has no country verdict and must not be counted as a country success');
   assert.equal(metrics.qualityChannels, 1);
 });
 
@@ -88,6 +89,21 @@ test('severely contaminated retrieval is quarantined after its first run', () =>
     hasCommunity: false
   }));
   const metrics = calculateQueryFunnel(10, observations);
+  assert.equal(isSeverelyContaminatedQuery(metrics), true);
+  assert.equal(selectQueryCollection('EXPERIMENTAL', 0, metrics), 'REJECTED');
+});
+
+test('pending classifications do not dilute contamination', () => {
+  const observations: QueryObservation[] = Array.from({ length: 16 }, (_, index) => ({
+    channelId: `mixed-${index}`,
+    wasKnown: false,
+    persisted: true,
+    funnelOutcome: index < 8 ? 'NON_TRADING' as const : 'CLASSIFICATION_PENDING' as const,
+    qualityScore: 0,
+    hasCommunity: false
+  }));
+  const metrics = calculateQueryFunnel(16, observations);
+  assert.equal(metrics.classificationPending, 8);
   assert.equal(isSeverelyContaminatedQuery(metrics), true);
   assert.equal(selectQueryCollection('EXPERIMENTAL', 0, metrics), 'REJECTED');
 });

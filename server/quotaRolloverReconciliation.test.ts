@@ -24,6 +24,7 @@ test('rollover reconciler wakes only previous-day quota deferrals and preserves 
   assert.match(source, /YouTube quota allocation is exhausted/);
   assert.match(source, /daily quota/);
   assert.match(source, /last_error !~\* 'rate\.\?limit\|429'/);
+  assert.match(source, /QUOTA_DEFERRED_JOB_TYPES = \[[^\]]*CLASSIFICATION_JOB_TYPE/);
 });
 
 test('autonomous producer uses the reconciled Pacific-day snapshot', () => {

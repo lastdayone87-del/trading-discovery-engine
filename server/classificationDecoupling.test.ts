@@ -18,6 +18,7 @@ import {
   resolveEnrichmentWorkerCount,
   resolveEnrichmentWorkerSplit,
   resolveSearchWorkerCount,
+  routeSearchPageChannel,
 } from './classificationDecoupling';
 
 const env = (overrides: Record<string, string | undefined> = {}): NodeJS.ProcessEnv => ({ ...overrides } as NodeJS.ProcessEnv);
@@ -59,18 +60,26 @@ test('worker counts stay at the measured 4/3 defaults and env overrides still wi
   assert.equal(resolveEnrichmentWorkerCount(env()), 3);
   assert.equal(resolveSearchWorkerCount(env({ SEARCH_WORKER_CONCURRENCY: '2' })), 2);
   assert.equal(resolveEnrichmentWorkerCount(env({ ENRICHMENT_WORKER_CONCURRENCY: '5' })), 5);
+  assert.equal(resolveSearchWorkerCount(env({ SEARCH_WORKER_CONCURRENCY: 'not-a-number' })), 4);
+  assert.equal(resolveEnrichmentWorkerCount(env({ ENRICHMENT_WORKER_CONCURRENCY: 'NaN' })), 3);
+  assert.equal(resolveSearchWorkerCount(env({ SEARCH_WORKER_CONCURRENCY: '0' })), 1);
+  assert.equal(resolveEnrichmentWorkerCount(env({ ENRICHMENT_WORKER_CONCURRENCY: '0' })), 1);
 });
 
-test('enrichment pool splits 2/1 when enabled and keeps one drain lane when rolled back', () => {
+test('enrichment pool splits 2/1 when enabled and always leaves an ENRICH-only lane', () => {
   assert.deepEqual(resolveEnrichmentWorkerSplit(3, true), { classificationWorkers: 2, enrichmentOnlyWorkers: 1 });
   assert.deepEqual(resolveEnrichmentWorkerSplit(3, false), { classificationWorkers: 1, enrichmentOnlyWorkers: 2 });
   assert.deepEqual(resolveEnrichmentWorkerSplit(1, true), { classificationWorkers: 1, enrichmentOnlyWorkers: 0 });
   assert.deepEqual(resolveEnrichmentWorkerSplit(2, false), { classificationWorkers: 1, enrichmentOnlyWorkers: 1 });
+  // A two-worker pool must keep one lane on the existing ENRICH backlog even
+  // when the classification queue never empties.
+  assert.deepEqual(resolveEnrichmentWorkerSplit(2, true), { classificationWorkers: 1, enrichmentOnlyWorkers: 1 });
   // Total worker count is preserved for every split.
   for (const total of [1, 2, 3, 6]) {
     for (const enabled of [true, false]) {
       const split = resolveEnrichmentWorkerSplit(total, enabled);
       assert.equal(split.classificationWorkers + split.enrichmentOnlyWorkers, total);
+      if (total > 1) assert.ok(split.enrichmentOnlyWorkers > 0, 'the ENRICH backlog must retain a dedicated lane');
     }
   }
 });
@@ -99,6 +108,28 @@ test('admission enqueues below both caps and processes inline at either cap', ()
   assert.equal(classificationAdmission({ ...below, globalPending: 500 }), 'INLINE');
   assert.equal(classificationAdmission({ ...below, scopedPending: 50 }), 'INLINE');
   assert.equal(classificationAdmission({ ...below, globalPending: 499, scopedPending: 49 }), 'ENQUEUE');
+});
+
+test('flag-off routes only through the legacy inline path; flag-on uses durable admission', async () => {
+  const calls: string[] = [];
+  const inlineOutcome = { marker: 'inline' };
+  const admitted = { outcome: { marker: 'admitted' }, pending: true };
+  const off = await routeSearchPageChannel({
+    decouplingEnabled: false,
+    inline: async () => { calls.push('inline'); return inlineOutcome; },
+    admit: async () => { calls.push('admit'); return admitted; },
+  });
+  assert.deepEqual(off, { outcome: inlineOutcome, pending: false });
+  assert.deepEqual(calls, ['inline'], 'the flag-off path must never enqueue');
+
+  calls.length = 0;
+  const on = await routeSearchPageChannel({
+    decouplingEnabled: true,
+    inline: async () => { calls.push('inline'); return inlineOutcome; },
+    admit: async () => { calls.push('admit'); return admitted; },
+  });
+  assert.deepEqual(on, admitted);
+  assert.deepEqual(calls, ['admit'], 'the flag-on path delegates to durable admission');
 });
 
 test('job payload keeps the exact candidate and durable provenance', () => {
@@ -165,9 +196,11 @@ test('source wiring keeps the inline path as the flag-off fallback and drains on
   const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
   const db = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
   const example = readFileSync(new URL('../.env.example', import.meta.url), 'utf8');
-  // Default-off branch still calls the exact legacy containment helper.
-  assert.match(queue, /classificationDecoupling\.enabled[\s\S]{0,800}admitDiscoveredChannel/);
-  assert.match(queue, /else \{\s*outcome = await processDiscoveredChannelContained\(raw, country, source/);
+  // Default-off branch still calls the exact legacy containment helper through
+  // the executable routing unit.
+  assert.match(queue, /decouplingEnabled: classificationDecoupling\.enabled/);
+  assert.match(queue, /inline: \(\) => processDiscoveredChannelContained\(raw, country, source/);
+  assert.match(queue, /return admitDiscoveredChannel\(\{/);
   // Classification is claimed by shared enrichment workers and dispatched.
   assert.match(queue, /push\(CLASSIFICATION_JOB_TYPE\)/);
   assert.match(queue, /job\.type === CLASSIFICATION_JOB_TYPE[\s\S]{0,120}processClassificationJob/);
@@ -179,4 +212,19 @@ test('source wiring keeps the inline path as the flag-off fallback and drains on
   assert.match(db, /ON CONFLICT\(channel_id\) DO NOTHING/);
   assert.match(db, /export async function reconcileClassificationSighting/);
   assert.match(example, /SEARCH_CLASSIFICATION_DECOUPLING_ENABLED="false"/);
+});
+
+test('pending-sighting sweep is indexed and bounded for post-rollback repair', () => {
+  const migration = readFileSync(new URL('./db/migrations/168_classification_sighting_sweep_index.sql', import.meta.url), 'utf8');
+  assert.match(migration, /idx_channel_sightings_classification_pending/);
+  assert.match(migration, /ON public\.channel_sightings \(observed_at\)/);
+  assert.match(migration, /WHERE funnel_outcome='CLASSIFICATION_PENDING'/);
+  const db = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
+  // The populated-table index is built concurrently before the transactional
+  // migration loop, and the migration itself only adopts it.
+  assert.match(db, /await ensureClassificationSightingIndex\(client\)/);
+  assert.match(db, /CREATE INDEX CONCURRENTLY IF NOT EXISTS \$\{name\}/);
+  // The orphan sweep is bounded so maintenance cannot rewrite the whole history.
+  assert.match(db, /FROM orphans\s+WHERE s\.id=orphans\.id/);
+  assert.match(db, /LIMIT \$2/);
 });

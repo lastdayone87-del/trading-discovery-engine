@@ -57,6 +57,19 @@ function positiveInt(value: unknown, fallback: number, max = Number.MAX_SAFE_INT
   return Math.min(max, Math.max(1, Math.floor(parsed)));
 }
 
+/**
+ * Worker-lane counts preserve the operator's historical validation: an
+ * explicit zero or negative value still means "one worker", while a missing
+ * or non-numeric value falls back to the measured default instead of letting
+ * NaN collapse the pool to one worker by accident.
+ */
+function workerCount(value: unknown, fallback: number): number {
+  if (value === undefined || value === null || String(value).trim() === '') return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(1, Math.floor(parsed));
+}
+
 export function resolveClassificationDecouplingConfig(
   env: NodeJS.ProcessEnv = process.env,
 ): ClassificationDecouplingConfig {
@@ -70,19 +83,21 @@ export function resolveClassificationDecouplingConfig(
 }
 
 export function resolveSearchWorkerCount(env: NodeJS.ProcessEnv = process.env): number {
-  return Math.max(1, Number(env.SEARCH_WORKER_CONCURRENCY || SEARCH_WORKER_CONCURRENCY_DEFAULT));
+  return workerCount(env.SEARCH_WORKER_CONCURRENCY, SEARCH_WORKER_CONCURRENCY_DEFAULT);
 }
 
 export function resolveEnrichmentWorkerCount(env: NodeJS.ProcessEnv = process.env): number {
-  return Math.max(1, Number(env.ENRICHMENT_WORKER_CONCURRENCY || ENRICHMENT_WORKER_CONCURRENCY_DEFAULT));
+  return workerCount(env.ENRICHMENT_WORKER_CONCURRENCY, ENRICHMENT_WORKER_CONCURRENCY_DEFAULT);
 }
 
 /**
- * 2/1 split for the measured three-worker pool: two workers claim new
- * classifications and fall back to ENRICH when no classification is due; one
- * worker claims only ENRICH so the pre-existing backlog cannot starve behind
- * new discoveries. The split scales without changing total worker count:
- * min(2, total) shared workers and the remainder dedicated to ENRICH.
+ * Split the measured enrichment pool without changing its total size.
+ *
+ * New classifications must not starve the pre-existing ENRICH backlog, so at
+ * most `total - 1` workers are classification-capable once the pool has more
+ * than one worker. The shared workers claim classifications first and fall
+ * back to ENRICH; at least one worker always remains ENRICH-only. With a
+ * single worker there is no second lane, so that worker handles both.
  *
  * After a rollback the flag is off but old PENDING classification jobs must
  * still drain, so one shared worker remains; the other workers stay dedicated
@@ -93,10 +108,12 @@ export function resolveEnrichmentWorkerSplit(totalWorkers: number, decouplingEna
   enrichmentOnlyWorkers: number;
 } {
   const total = positiveInt(totalWorkers, ENRICHMENT_WORKER_CONCURRENCY_DEFAULT, 100);
-  const classificationWorkers = Math.min(decouplingEnabled ? 2 : 1, total);
+  if (total === 1) return { classificationWorkers: 1, enrichmentOnlyWorkers: 0 };
+  const classificationCap = decouplingEnabled ? 2 : 1;
+  const classificationWorkers = Math.max(1, Math.min(classificationCap, total - 1));
   return {
     classificationWorkers,
-    enrichmentOnlyWorkers: Math.max(0, total - classificationWorkers),
+    enrichmentOnlyWorkers: total - classificationWorkers,
   };
 }
 
@@ -153,6 +170,22 @@ export function classificationAdmission(
   if (state.globalPending >= state.maxPending) return 'INLINE';
   if (state.scopedPending >= state.maxPerQuery) return 'INLINE';
   return 'ENQUEUE';
+}
+
+/**
+ * Per-channel routing for one search-page result. Extracted so the flag-off
+ * and decoupled branches have an executable unit contract instead of relying
+ * only on source-text assertions: flag off calls only the legacy containment
+ * path; flag on delegates to durable admission (which may itself fall back
+ * inline at a cap).
+ */
+export async function routeSearchPageChannel<T>(input: {
+  decouplingEnabled: boolean;
+  inline: () => Promise<T>;
+  admit: () => Promise<{ outcome: T; pending: boolean }>;
+}): Promise<{ outcome: T; pending: boolean }> {
+  if (!input.decouplingEnabled) return { outcome: await input.inline(), pending: false };
+  return input.admit();
 }
 
 export interface ClassificationJobPayload {

@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { diagnoseEnrichmentBacklog } from './enrichmentBacklogDiagnosis';
-import { ENRICHMENT_DIAGNOSTIC_QUERIES } from './enrichmentBacklogDiagnostics';
+import { CLASSIFICATION_DIAGNOSTIC_QUERIES, ENRICHMENT_DIAGNOSTIC_QUERIES } from './enrichmentBacklogDiagnostics';
 import { routePolicyInventory } from './operatorAuth';
 
 test('diagnostic SQL is SELECT-only',()=>{
-  for(const sql of Object.values(ENRICHMENT_DIAGNOSTIC_QUERIES)){
+  for(const sql of [...Object.values(ENRICHMENT_DIAGNOSTIC_QUERIES), ...Object.values(CLASSIFICATION_DIAGNOSTIC_QUERIES)]){
     const normalized=sql.trim().toUpperCase();
     assert.ok(normalized.startsWith('SELECT')||normalized.startsWith('WITH'));
     assert.equal(/\b(UPDATE|INSERT|DELETE|ALTER|DROP|TRUNCATE|CREATE)\b/.test(normalized),false);

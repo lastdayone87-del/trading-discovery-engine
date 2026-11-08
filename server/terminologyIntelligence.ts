@@ -1923,6 +1923,11 @@ export async function attributeTerminologyPerformance(query: QueryRecord, metric
   const metadata = query.generation_metadata || {};
   const learned = typeof metadata.learnedTerm === 'string' ? normalizeTerm(metadata.learnedTerm) : null;
   if (!learned) return;
+  // A run with durably queued classifications has not resolved the yield of
+  // those creators yet. Recording a zero-yield execution here would demote a
+  // productive term, and nothing later repairs that row. Defer this run's
+  // learning; the page's sightings still reconcile once classification ends.
+  if ((metrics.classificationPending || 0) > 0) return;
   const runner = clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
   if (!runner) return;
   // Same Pool discipline as observe/refresh: the advisory lock, the

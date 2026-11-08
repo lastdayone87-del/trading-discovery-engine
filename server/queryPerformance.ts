@@ -168,7 +168,11 @@ export function calculateQueryFunnel(
     ? Math.round(persisted.reduce((sum, value) => sum + value.qualityScore, 0) / persisted.length)
     : 0;
   const noveltyRatio = ratio(values.filter(value => value.persisted && !value.wasKnown).length, values.length);
-  const countryPrecision = ratio(values.length - countryRejected, values.length);
+  // A pending classification has no country verdict. Including it in the
+  // denominator makes a page look more country-accurate than it is, so
+  // precision is measured over evaluated country outcomes only.
+  const countryEvaluated = values.length - classificationPending;
+  const countryPrecision = ratio(countryEvaluated - countryRejected, countryEvaluated);
   const tradingPrecision = ratio(tradingConfirmed, evaluated);
   const qualityYield = ratio(qualityChannels, evaluated);
   const communityYield = ratio(communitiesDiscovered, evaluated);
@@ -259,7 +263,12 @@ export function manualSearchContinuationMetrics(input: {
  * based only on observed retrieval outcomes.
  */
 export function isSeverelyContaminatedQuery(metrics: QueryFunnelMetrics): boolean {
-  const evaluated = metrics.distinctResults;
+  // Pending classifications are real observations, but they have no semantic
+  // verdict. Counting them in the evaluated denominator dilutes the
+  // wrong-country and non-trading shares and can let a contaminated query
+  // escape quarantine while its discoveries are still unclassified.
+  const pending = Math.max(0, Math.min(metrics.distinctResults, metrics.classificationPending || 0));
+  const evaluated = metrics.distinctResults - pending;
   if (evaluated < 8) return false;
   // Reuse the recalibrated contamination guard: UNCERTAIN and NEEDS_REVIEW
   // are not evidence of a bad query; only explicit non-trading share,

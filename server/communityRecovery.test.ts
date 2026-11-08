@@ -95,6 +95,17 @@ test('legacy semantic terminal evidence is not resurrected',()=>{
   assert.deepEqual(check.reasonCodes,['SEMANTIC_TERMINAL_EVIDENCE_PRESERVED']);
 });
 
+test('terminal classification failures without an established country stay out of community recovery', () => {
+  const channel = Object.assign(mockChannel('FAILED', '2026-01-01T00:00:00Z'), {
+    country: 'UNKNOWN',
+    country_status: 'UNCERTAIN',
+  });
+  const check = shouldReactivateCommunityRecovery(channel, undefined, false, Date.parse('2026-03-01T00:00:00Z'));
+  assert.equal(check.reactivate, false);
+  assert.deepEqual(check.reasonCodes, ['COUNTRY_NOT_ESTABLISHED']);
+  assert.match(read('server/communityRecovery.ts'), /AND c\.country <> 'UNKNOWN'/);
+});
+
 test('reactivateCommunityRecovery resets scan_status to ENRICHMENT_PENDING while preserving history', () => {
   const channel = mockChannel();
   channel.inspection_trail = [{ step: 'BIO', title: 'Prior Failed Attempt', status: 'NOT_FOUND', timestamp: '2026-01-01T00:00:00Z' }];

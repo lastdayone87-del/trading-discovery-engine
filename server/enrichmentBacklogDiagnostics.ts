@@ -35,6 +35,7 @@ export const ENRICHMENT_DIAGNOSTIC_QUERIES = {
     SELECT
       j.id::text AS job_id,
       j.payload->>'channelId' AS channel_id,
+      j.payload->>'source' AS source,
       j.status,
       j.created_at,
       j.updated_at,

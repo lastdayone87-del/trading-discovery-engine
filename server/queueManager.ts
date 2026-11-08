@@ -62,6 +62,7 @@ import {
   getClassificationBackpressureState,
   hasActiveClassificationJob,
   reconcileClassificationSighting,
+  projectClassificationFailureIfPending,
 } from './db';
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
 import { reserveIncrementalTreatmentPageQuota, releaseIncrementalTreatmentPageReservation, enqueueChildAndCommitPageReservation } from './retrievalPolicyCanary';
@@ -131,6 +132,7 @@ import {
   resolveEnrichmentWorkerCount,
   resolveEnrichmentWorkerSplit,
   resolveSearchWorkerCount,
+  routeSearchPageChannel,
   type ClassificationBackpressureState,
   type ClassificationJobPayload,
 } from './classificationDecoupling';
@@ -1167,6 +1169,20 @@ export async function admitDiscoveredChannel(input: {
     && shouldPreserveExistingChannel(existing, source, false)
     && !shouldReclassifyPreservedCompletedChannel(existing.scan_status, evaluateLowAudienceGate(raw.subscriberCount))
   ) {
+    // Preserved rows still need the legacy repair pass: a retried search job
+    // may be repairing vocabulary that failed after its observation committed,
+    // and fresh provider metadata must not be stranded behind the early return.
+    await replayVocabularyForRetry(existing, raw, source, input.forceExtraction);
+    let metadataUpdated = false;
+    if (raw.subscriberCount && raw.subscriberCount !== existing.subscriber_count) {
+      existing.subscriber_count = raw.subscriberCount;
+      metadataUpdated = true;
+    }
+    if (raw.channelThumbnailUrl && raw.channelThumbnailUrl !== existing.channel_thumbnail_url) {
+      existing.channel_thumbnail_url = raw.channelThumbnailUrl;
+      metadataUpdated = true;
+    }
+    if (metadataUpdated) await upsertChannel(existing);
     return { outcome: preservedChannelOutcome(existing), pending: false };
   }
   const inline = () => processDiscoveredChannelContained(raw, targetCountry, source, {
@@ -1174,6 +1190,13 @@ export async function admitDiscoveredChannel(input: {
     jobId: input.discoveryJobId,
     runId: input.queryRunId,
   });
+  // A durable job already owns this channel. Check it before the backpressure
+  // decision: at a cap, rediscovery must reuse the in-flight work instead of
+  // running a second inline pipeline that races the job's writes.
+  if (await hasActiveClassificationJob(raw.channelId)) {
+    const channel = existing || await getChannelById(raw.channelId);
+    return { outcome: classificationPendingOutcome(raw, channel), pending: true };
+  }
   if (classificationAdmission(backpressure) === 'INLINE') {
     return { outcome: await inline(), pending: false };
   }
@@ -1182,13 +1205,6 @@ export async function admitDiscoveredChannel(input: {
   const quotaOrigin = ambientOrigin === 'PROBE' ? 'PROBE' : 'NORMAL';
   let insertedPlaceholder = false;
   try {
-    // A durable job already owns this channel. Count the observation as
-    // pending instead of enqueueing a duplicate; its completion reconciles
-    // every pending sighting for the channel.
-    if (await hasActiveClassificationJob(raw.channelId)) {
-      const channel = existing || await getChannelById(raw.channelId);
-      return { outcome: classificationPendingOutcome(raw, channel), pending: true };
-    }
     if (!existing) {
       insertedPlaceholder = await insertChannelIfAbsent(
         buildProvisionalClassificationChannel(raw, source),
@@ -1968,29 +1984,31 @@ export async function processNextSearchJob(
       raw.nominationId=nomination.id||undefined;raw.queryRunId=queryRunId;raw.queryPageNumber=pageNumber;raw.discoveryJobId=job.id;
       let outcome: ProcessDiscoveredChannelOutcome | null;
       let classificationPending = false;
-      if (classificationDecoupling.enabled) {
-        if (!classificationBackpressure) {
-          classificationBackpressure = await getClassificationBackpressureState(
-            classificationQueryScopeKey({ queryRunId, queryId, query, country }),
-          );
-        }
-        const admitted = await admitDiscoveredChannel({
-          raw,
-          targetCountry: country,
-          source,
-          query,
-          queryRunId,
-          queryId,
-          discoveryJobId: job.id,
-          catalogPin: job.payload.catalogPin,
-          forceExtraction: isRepairEligibleRetry(job),
-          backpressure: classificationBackpressure,
-        });
-        outcome = admitted.outcome;
-        classificationPending = admitted.pending;
-      } else {
-        outcome = await processDiscoveredChannelContained(raw, country, source, { forceExtraction: isRepairEligibleRetry(job) });
-      }
+      const routed = await routeSearchPageChannel({
+        decouplingEnabled: classificationDecoupling.enabled,
+        inline: () => processDiscoveredChannelContained(raw, country, source, { forceExtraction: isRepairEligibleRetry(job) }),
+        admit: async () => {
+          if (!classificationBackpressure) {
+            classificationBackpressure = await getClassificationBackpressureState(
+              classificationQueryScopeKey({ queryRunId, queryId, query, country }),
+            );
+          }
+          return admitDiscoveredChannel({
+            raw,
+            targetCountry: country,
+            source,
+            query,
+            queryRunId,
+            queryId,
+            discoveryJobId: job.id,
+            catalogPin: job.payload.catalogPin,
+            forceExtraction: isRepairEligibleRetry(job),
+            backpressure: classificationBackpressure,
+          });
+        },
+      });
+      outcome = routed.outcome;
+      classificationPending = routed.pending;
       // A sticky-PROBE channel refused by its own allocation is deferred for
       // this run; the rest of the NORMAL page must still be processed. Keep it
       // out of yield/duplicate math: it was not evaluated, and counting it as
@@ -2391,16 +2409,18 @@ export async function processNextSearchJob(
     }
     if (job.type === CLASSIFICATION_JOB_TYPE && terminal) {
       const channelId = String(job.payload?.channelId || '');
-      const channel = channelId ? await getChannelById(channelId) : null;
-      if (channel && channel.trading_status === 'UNCERTAIN' && channel.scan_status === 'CLASSIFICATION_PENDING') {
-        channel.scan_status = isProviderDeferredEnrichmentError(err) ? 'PROVIDER_DEFERRED' : 'FAILED';
-        channel.trading_status = 'UNCERTAIN';
-        channel.scan_attempts = job.attempts;
-        channel.last_checked = new Date().toISOString();
-        await upsertChannel(channel);
+      const scanStatus = isProviderDeferredEnrichmentError(err) ? 'PROVIDER_DEFERRED' : 'FAILED';
+      // Conditional projection: only an untouched placeholder may become a
+      // failure. Re-read before reconciliation so a verdict committed by a
+      // concurrent inline run is never overwritten by this stale snapshot.
+      const projected = channelId
+        ? await projectClassificationFailureIfPending(channelId, job.attempts, scanStatus)
+        : false;
+      if (projected) {
         void recordAdmissionShadow({channelId,priorState:'NOT_EVALUATED',classificationStatus:'UNCERTAIN',investigationState:'OPERATIONALLY_BLOCKED',operationalFailure:true,candidateHypothesis:{},evidenceCoverage:{failureClass:String(err?.code||err?.name||'WORKER_FAILURE'),stage:'CLASSIFY_DISCOVERED_CHANNEL'}})
           .catch(error=>console.warn(`[CandidateAdmission] classification-failure shadow write failed for ${channelId}:`,error instanceof Error?error.message:error));
       }
+      const channel = channelId ? await getChannelById(channelId) : null;
       if (channelId) {
         await reconcileClassificationResult({channelId,jobId:job.id,channel,persisted:Boolean(channel)});
       }
@@ -4668,6 +4688,11 @@ export async function executeFullManualSearch(userQuery: string, countryName: st
 export { SEARCH_WORKER_CONCURRENCY_DEFAULT, ENRICHMENT_WORKER_CONCURRENCY_DEFAULT, resolveSearchWorkerCount, resolveEnrichmentWorkerCount } from './classificationDecoupling';
 
 function startWorkerPool(type: 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE', concurrency: number, extraClaimableTypes: ClaimableSearchJobType[] = [], workerPrefix?: string): void {
+  // A zero lane is an intentional "no workers" decision (for example the
+  // ENRICH-only lane of a one-worker pool). Do not let the legacy clamp turn
+  // it into an extra worker beyond the operator's configured total. A NaN
+  // count still reaches the legacy single-worker fallback below.
+  if (concurrency <= 0) return;
   const safeConcurrency = Math.min(20, Math.max(1, Math.floor(concurrency) || 1));
   for (let index = 0; index < safeConcurrency; index++) {
     const workerId = `${(workerPrefix || type).toLowerCase()}_${process.pid}_${index}`;
@@ -4714,5 +4739,7 @@ export function startSearchWorkers(): void {
   const enrichmentWorkers = resolveEnrichmentWorkerCount();
   const enrichmentSplit = resolveEnrichmentWorkerSplit(enrichmentWorkers, decoupling.enabled);
   startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.classificationWorkers, [CLASSIFICATION_JOB_TYPE], 'enrich_channel_shared');
-  startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.enrichmentOnlyWorkers, [], 'enrich_channel_backlog');
+  if (enrichmentSplit.enrichmentOnlyWorkers > 0) {
+    startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.enrichmentOnlyWorkers, [], 'enrich_channel_backlog');
+  }
 }

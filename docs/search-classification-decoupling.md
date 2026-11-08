@@ -101,7 +101,7 @@ period.
   - `classificationQueue`: pending, processing, oldest pending, enabled, global
     cap, and per-source breakdown;
   - `searchWorkers`: configured main search width and busy claim owners.
-- `GET /api/enrichment-backlog` (operator) now includes a `classification`
+- `GET /api/diagnostics/enrichment-backlog` (operator) now includes a `classification`
   block with the same aggregate, throughput, and oldest-job diagnostics as
   ENRICH_CHANNEL.
 - `/api/provider-metrics` keeps semantic route health / daily quota signals from
