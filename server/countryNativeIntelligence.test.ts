@@ -924,7 +924,7 @@ test('Phase 10: a novel native proposal is represented by the governed Query Int
     'an unconstructable native proposal fails closed without a generic query');
 });
 
-test('Final integration: missing language evidence remains und and neutral', async () => {
+test('Final integration: a missing language hint is filled from the surface without fabricating native evidence', async () => {
   const runner = createMockRunner();
   const termId = await observeTerminology({
     term: 'analyse marché local', country: 'FR', termType: 'TERMINOLOGY',
@@ -933,16 +933,18 @@ test('Final integration: missing language evidence remains und and neutral', asy
   }, runner);
   const observation = runner.observations.find(row => row.canonical_term_id === termId);
   assert.ok(observation);
-  assert.equal(observation.native_language, 'und');
-  assert.equal(observation.term_language, 'und');
+  // The surface itself is French; the detector supplies the language identity.
+  // It must not upgrade the observation to native evidence without provenance.
+  assert.equal(observation.native_language, 'fr');
+  assert.equal(observation.term_language, 'fr');
   assert.equal(observation.native_evidence_status, null);
   assert.equal(observation.source_provenance_family, null);
 });
 
-test('Final integration: human approval does not fabricate language evidence', async () => {
+test('Final integration: human approval does not invent a language for an unidentifiable surface', async () => {
   const runner = createMockRunner();
   const termId = await observeTerminology({
-    term: 'forex trading strategy approved', country: 'DE', termType: 'TERMINOLOGY',
+    term: 'xyzzy approval', country: 'DE', termType: 'TERMINOLOGY',
     observationType: 'HUMAN_APPROVED_CHANNEL', videoId: 'VID_DE_APPROVED_1',
     sourceCreatorCountry: 'DE', targetMarketCountry: 'DE', humanApproved: true
   }, runner);

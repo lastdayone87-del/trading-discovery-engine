@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { getDb } from './db';
 import { canonicalCountry } from './countryInference';
+import { detectLanguage } from './languageDetection';
 import { isQualityCreator } from './queryPerformance';
 
 type Queryable = Pool | PoolClient | { query: (sql: string, params?: any[]) => Promise<any> };
@@ -202,13 +203,19 @@ export function inferScript(value: string): string {
 /**
  * Identifies code-switching evidence across language and script.
  */
-export function detectCodeSwitching(text: string, defaultLanguage = 'und'): {
+export function detectCodeSwitching(text: string, defaultLanguage = 'und', countryHint?: string | null): {
   isCodeSwitched: boolean;
   codeSwitchType: CodeSwitchType;
   dominantLanguage: string;
   termLanguage: string;
 } {
   const norm = normalizeNativeTerm(text);
+  // A caller that cannot supply a language (the legacy observation path often
+  // passes `und`) still gets a concrete term language when the surface itself
+  // is identifiable. This is what stops native terms from being permanently
+  // recorded as `und`.
+  const detected = (!defaultLanguage || defaultLanguage === 'und') ? detectLanguage(text, { countryHint }) : null;
+  const contextLanguage = detected && detected.language !== 'und' ? detected.language : defaultLanguage;
 
   const hasLatin = /\p{Script=Latin}/u.test(text);
   const hasHanOrKanaOrHangul = /\p{Script=Han}|\p{Script=Katakana}|\p{Script=Hiragana}|\p{Script=Hangul}/u.test(text);
@@ -219,7 +226,7 @@ export function detectCodeSwitching(text: string, defaultLanguage = 'und'): {
     return {
       isCodeSwitched: true,
       codeSwitchType: 'MIXED_SCRIPT_TERMINOLOGY',
-      dominantLanguage: defaultLanguage,
+      dominantLanguage: contextLanguage,
       termLanguage: 'en'
     };
   }
@@ -239,19 +246,19 @@ export function detectCodeSwitching(text: string, defaultLanguage = 'und'): {
   const hasEnglishToken = words.some(w => englishFinanceTokens.has(w));
   const hasNativeTokens = words.some(w => !englishFinanceTokens.has(w));
 
-  if (hasEnglishToken && defaultLanguage !== 'en' && defaultLanguage !== 'und') {
+  if (hasEnglishToken && contextLanguage !== 'en' && contextLanguage !== 'und') {
     if (hasNativeTokens) {
       return {
         isCodeSwitched: true,
         codeSwitchType: 'NATIVE_DOMINANT_ENGLISH_FINANCE',
-        dominantLanguage: defaultLanguage,
+        dominantLanguage: contextLanguage,
         termLanguage: 'en'
       };
     }
     return {
       isCodeSwitched: false,
       codeSwitchType: 'NONE',
-      dominantLanguage: defaultLanguage,
+      dominantLanguage: contextLanguage,
       termLanguage: 'en'
     };
   }
@@ -259,8 +266,8 @@ export function detectCodeSwitching(text: string, defaultLanguage = 'und'): {
   return {
     isCodeSwitched: false,
     codeSwitchType: 'NONE',
-    dominantLanguage: defaultLanguage,
-    termLanguage: defaultLanguage
+    dominantLanguage: contextLanguage,
+    termLanguage: contextLanguage
   };
 }
 

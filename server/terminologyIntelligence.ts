@@ -1114,7 +1114,7 @@ export async function observeTerminologyDetailed(args: {
   }
 
   const contextLang = args.locale ? args.locale.split('-')[0] : args.language || 'und';
-  const codeSwitching = detectCodeSwitching(canonical, contextLang);
+  const codeSwitching = detectCodeSwitching(canonical, contextLang, country);
   const weight = args.humanApproved ? 2.5 : args.observationType === 'ENRICHMENT' ? 1.25 : 1;
 
   // 1. Insert or fetch canonical trading term WITHOUT advancing last_observed_at on conflict.
