@@ -165,6 +165,8 @@ export class ConfigurableWeightedStrategy {
       recognitionState: recognition?.state,
       semanticPolicy: recognition?.semanticPolicy,
       semanticSkippedReason: recognition?.semanticSkippedReason ?? null,
+      compositionReport: composition,
+      recognitionAssessment: recognition,
       composition: composition ? {
         focus: composition.focus,
         observedFamilies: composition.observedFamilies,
@@ -174,7 +176,15 @@ export class ConfigurableWeightedStrategy {
         alternativeCoverage: composition.alternativeCoverage,
         temporalCoverage: composition.temporalCoverage,
         nonTitleTierAFamilies: composition.nonTitleTierAFamilies,
-        reasons: composition.reasonCodes
+        reasons: composition.reasonCodes,
+        informativeFamilies: composition.informativeFamilies,
+        tradingCoreFamilies: composition.tradingCoreFamilies,
+        tradingAdjacentFamilies: composition.tradingAdjacentFamilies,
+        financeAdjacentFamilies: composition.financeAdjacentFamilies,
+        unrelatedFamilies: composition.unrelatedFamilies,
+        uninformativeFamilies: composition.uninformativeFamilies,
+        duplicateFamiliesCollapsed: composition.duplicateFamiliesCollapsed,
+        unrelatedCoverage: composition.unrelatedCoverage,
       } : undefined
     };
   }

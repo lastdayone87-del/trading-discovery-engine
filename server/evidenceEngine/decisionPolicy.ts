@@ -4,8 +4,9 @@ import { SEMANTIC_TOP_CALIBRATED_CONFIDENCE } from './semanticCalibration';
 import type { ContextualCompositionReport } from './contextualComposition';
 import { CREATOR_OWNED_EVIDENCE_FIELDS } from './canonicalEvidencePlane';
 import type { RecognitionAssessment } from './recognitionState';
+import { isTerminalNegativeEvidence, negativeEvidencePolicyWeight } from './negativeEvidenceRole';
 
-export const UNIFIED_DECISION_POLICY_VERSION='unified-selective-policy-v2-conflict-aware';
+export const UNIFIED_DECISION_POLICY_VERSION='unified-selective-policy-v3-affirmative-evidence';
 export const SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDENCE=SEMANTIC_TOP_CALIBRATED_CONFIDENCE;
 
 export interface UnifiedDecisionPolicyInput {evidence:EvidenceItem[];collection:EvidenceCollectionReport;lifecycleAction:LifecycleAction;minimumPositiveWeight:number;minimumTradingScore:number;composition?:ContextualCompositionReport;recognition?:RecognitionAssessment}
@@ -27,14 +28,17 @@ export function hasIndependentCreatorOwnedPositiveField(items:EvidenceItem[]):bo
  */
 export function compositionConfirmsTrading(composition:ContextualCompositionReport):boolean{
   if(composition.focus!=='TRADING_DOMINANT') return false;
-  if(composition.alternativeCoverage>=0.34||composition.explicitCreatorAlternative) return false;
+  const unrelatedCoverage=composition.unrelatedCoverage??0;
+  if(composition.alternativeCoverage>=0.34||unrelatedCoverage>=0.34) return false;
+  if(composition.explicitCreatorAlternative) return false;
   if(composition.nonTitleTierAFamilies<1) return false;
   // Explicit creator-level trading statement: Tier A plus financial context
   // with no dominant alternative. It does not need a second family.
   if(composition.explicitCreatorTrading) return true;
-  // Otherwise require at least two observed trading families and majority
-  // trading coverage.
-  return composition.tradingCoverage>=0.5&&composition.tradingFamilies>=2;
+  // Otherwise require at least two observed core trading families and majority
+  // trading coverage. `tradingFamilies` is the v1-compatible fallback.
+  const tradingCoreFamilies=composition.tradingCoreFamilies??composition.tradingFamilies;
+  return composition.tradingCoverage>=0.5&&tradingCoreFamilies>=2;
 }
 
 const clamp=(n:number)=>Math.max(0,Math.min(100,n));
@@ -55,7 +59,7 @@ export function evaluateDecisionScoreBoundary(evidence:EvidenceItem[],minimumPos
   const positive=evidence.filter(item=>item.polarity==='POSITIVE'&&item.rawMatches.length);
   const negative=evidence.filter(item=>item.polarity==='NEGATIVE');
   const positiveWeight=positive.reduce((sum,item)=>sum+Math.abs(item.finalWeight),0);
-  const negativeWeight=negative.reduce((sum,item)=>sum+Math.abs(item.finalWeight),0);
+  const negativeWeight=negative.reduce((sum,item)=>sum+negativeEvidencePolicyWeight(item),0);
   const substantivePositiveWeight=positive.filter(item=>!isWeakVideoTerminologyEvidence(item)).reduce((sum,item)=>sum+Math.abs(item.finalWeight),0);
   const raw=clamp(50+positiveWeight-negativeWeight);
   return {positiveWeight,negativeWeight,substantivePositiveWeight,raw,satisfied:substantivePositiveWeight>=minimumPositiveWeight&&raw>=minimumTradingScore};
@@ -72,7 +76,7 @@ export function qualifiesSemanticUnrelatedTerminalReject(evidence:EvidenceItem[]
   if(collection.terminalNegativeSufficiency?.status!=='SUFFICIENT'||!collection.terminalNegativeSufficiency.creatorLevelCoverage) return false;
   const substantivePositiveWeight=evidence.filter(item=>item.polarity==='POSITIVE'&&item.rawMatches.length&&!isWeakVideoTerminologyEvidence(item)).reduce((sum,item)=>sum+Math.abs(item.finalWeight),0);
   if(substantivePositiveWeight>0) return false;
-  const semanticUnrelated=evidence.filter(item=>isSemanticClassificationSource(item.source)&&item.polarity==='NEGATIVE'&&item.category==='IRRELEVANT_DOMAIN'&&item.provenance?.semantic?.taxonomyLabel==='UNRELATED'&&Number(item.provenance.semantic.calibratedConfidence)>=SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDENCE);
+  const semanticUnrelated=evidence.filter(item=>isSemanticClassificationSource(item.source)&&item.polarity==='NEGATIVE'&&item.category==='IRRELEVANT_DOMAIN'&&item.provenance?.semantic?.taxonomyLabel==='UNRELATED'&&Number(item.provenance.semantic.calibratedConfidence)>=SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDENCE&&isTerminalNegativeEvidence(item));
   return semanticUnrelated.length>0&&hasCreatorLevelUnrelatedAttribution(semanticUnrelated);
 }
 
@@ -131,7 +135,7 @@ export function dedupeWeightByFieldGroup<T extends { provenance?: { fields?: Arr
 function qualifiesDominantAttributedContradiction(evidence:EvidenceItem[],collection:EvidenceCollectionReport):boolean{
   if(collection.terminalNegativeSufficiency?.status!=='SUFFICIENT')return false;
   const positiveWeight=dedupeWeightByFieldGroup(evidence.filter(item=>item.polarity==='POSITIVE'&&item.rawMatches.length));
-  const terminalNegativeWeight=dedupeWeightByFieldGroup(evidence.filter(item=>item.polarity==='NEGATIVE'&&item.category==='IRRELEVANT_DOMAIN'));
+  const terminalNegativeWeight=dedupeWeightByFieldGroup(evidence.filter(item=>item.polarity==='NEGATIVE'&&isTerminalNegativeEvidence(item)));
   return terminalNegativeWeight>=25&&(positiveWeight===0||terminalNegativeWeight>positiveWeight*1.5);
 }
 
@@ -150,7 +154,7 @@ export function evaluateUnifiedDecisionPolicy(input:UnifiedDecisionPolicyInput):
   const positiveBoundary=boundary.satisfied;
   const semanticUnrelatedTerminal=qualifiesSemanticUnrelatedTerminalReject(input.evidence,input.collection);
   const dominantAttributedContradiction=qualifiesDominantAttributedContradiction(input.evidence,input.collection);
-  if(input.lifecycleAction==='CONFIRM'&&positiveBoundary&&independentCreatorField&&compositionOk&&recognitionAllowsConfirmation){status='TRADING_CONFIRMED';reasons.push('CALIBRATED_SUPPORT_AND_INDEPENDENCE_SATISFIED');}
+  if(input.lifecycleAction==='CONFIRM'&&positiveBoundary&&independentCreatorField&&compositionOk&&recognitionAllowsConfirmation){status='TRADING_CONFIRMED';reasons.push('CALIBRATED_SUPPORT_AND_INDEPENDENCE_SATISFIED','AFFIRMATIVE_EVIDENCE_SUFFICIENCY');if(negative.some(item=>negativeEvidencePolicyWeight(item)>0&&!isTerminalNegativeEvidence(item)))reasons.push('NON_TERMINAL_NEGATIVE_PENALTY_ONLY');}
   else if(input.lifecycleAction==='REJECT'&&(semanticUnrelatedTerminal||dominantAttributedContradiction)){
     status='NON_TRADING';reasons.push(semanticUnrelatedTerminal?'HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED':'DOMINANT_CREATOR_LEVEL_IRRELEVANT_CONTRADICTION');
   } else {

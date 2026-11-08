@@ -430,6 +430,8 @@ export * from './reportGenerator';
 export * from './stagedClassification';
 export * from './canonicalEvidencePlane';
 export * from './decisionPolicy';
+export * from './tradingSignalTaxonomy';
+export * from './negativeEvidenceRole';
 export * from './documentTypes';
 export * from './documentProjection';
 export * from './documentSampling';

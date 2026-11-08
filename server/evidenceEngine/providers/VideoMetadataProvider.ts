@@ -1,6 +1,8 @@
 import { EvidenceItem, EvidenceProvider, RawChannelInput, LayeredKnowledgeContext } from '../types';
-import { pushUniqueMatch, textMatchesTerm } from '../utils/textMatching';
-import { isTradingFocusedText, matchedTierATradingSignals } from '../multilingualTerminology';
+import { pushUniqueMatch } from '../utils/textMatching';
+import { findScopedTermMatches } from '../utils/claimPolarity';
+import { affirmedTierATradingSignals, assessTradingText } from '../tradingSignalTaxonomy';
+import { isTradingFocusedText } from '../multilingualTerminology';
 
 /**
  * Cheap creator-owned upload signal used only after enrichment. The broader
@@ -23,8 +25,19 @@ const TRADER_DOMAIN_PHRASE = /\b(?:del|della|da|di|per|come|of|for|as)\s+trad(?:
 // must not qualify a creator without trading context.
 const GENERIC_TRADING_TERM = /^(trading|trader|trade|market analysis|risk management|technical analysis)$/i;
 
+function hasAssertedTerm(text: string, term: string): boolean {
+  return findScopedTermMatches(text, [term]).some(match => match.polarity === 'ASSERTED');
+}
+
 export function isExplicitCreatorTradingText(text: string, context: LayeredKnowledgeContext): boolean {
   const normalized = text.normalize('NFKC');
+  // A negated or disclaimed occurrence is not an explicit creator claim. The
+  // taxonomy assessment is polarity-aware; an ambiguous legacy match (for
+  // example "Strategia di Trading") still falls through to the historical
+  // qualifier rules below.
+  const assessment = assessTradingText(normalized, context);
+  if (assessment.focus === 'TRADING_CORE' || assessment.focus === 'TRADING_ADJACENT') return true;
+  if (assessment.signals.length > 0 && assessment.assertedSignals.length === 0) return false;
   const unrelatedTradingUsage = /\b(trading\s*cards?|card\s*trading|pok[eé]mon|yugioh|steam\s*trading|skin\s*trading|sports?\s*card)\b/iu;
   // "Trader Joe's" is a grocery brand, not a trading creator. Excluding the
   // brand avoids both the generic-literal path and the "of Trader" domain
@@ -36,17 +49,17 @@ export function isExplicitCreatorTradingText(text: string, context: LayeredKnowl
 
   const hasGenericTradingLiteral = genericTradingLiteral.test(normalized);
   const hasExplicitFinancialLiteral = explicitFinancialTradingLiteral.test(normalized) || nativeTradingLiteral.test(normalized);
-  const hasKnownMethod = context.globalAdvancedConcepts.some(term => textMatchesTerm(normalized, term));
-  const hasKnownPlatform = context.globalPlatformsPropFirms.some(term => textMatchesTerm(normalized, term));
+  const hasKnownMethod = context.globalAdvancedConcepts.some(term => hasAssertedTerm(normalized, term));
+  const hasKnownPlatform = context.globalPlatformsPropFirms.some(term => hasAssertedTerm(normalized, term));
   const languagePositiveTerms = (context.languageKnowledgePacks || [context.languageKnowledge])
     .flatMap(pack => pack?.positiveTerms || [])
     // The bare English language-pack literal is not a signal by itself.
     .filter(term => !GENERIC_TRADING_TERM.test(term.trim()));
-  const hasLanguageTradingSignal = languagePositiveTerms.some(term => textMatchesTerm(normalized, term));
-  const hasCountryTradingSignal = (context.countryKnowledge?.nativeTradingTerminology || []).some(term => textMatchesTerm(normalized, term));
+  const hasLanguageTradingSignal = languagePositiveTerms.some(term => hasAssertedTerm(normalized, term));
+  const hasCountryTradingSignal = (context.countryKnowledge?.nativeTradingTerminology || []).some(term => hasAssertedTerm(normalized, term));
   // Generic method/education phrases (including native ones) are not Tier A
   // evidence by themselves; the independent-context checks below handle them.
-  const hasTierASignal = matchedTierATradingSignals(normalized, context).some(signal => !['KNOWN_METHOD', 'NATIVE_METHOD', 'NATIVE_EDUCATION'].includes(signal));
+  const hasTierASignal = affirmedTierATradingSignals(normalized, context).some(signal => !['KNOWN_METHOD', 'NATIVE_METHOD', 'NATIVE_EDUCATION'].includes(signal));
   const hasFinancialQualifier = FINANCIAL_QUALIFIER_PATTERN.test(normalized) || TRADER_DOMAIN_PHRASE.test(normalized);
   // "Trader Joe's" is a grocery brand, not a trading creator. Excluding the
   // brand before any other signal avoids both the generic-literal path and
@@ -103,10 +116,10 @@ export class VideoMetadataProvider implements EvidenceProvider {
       const title=titles[index]||'';
       const desc=descriptions[index]||'';
       const refs=[
-        ...(terms.some(term=>textMatchesTerm(title,term))?[videoRef(index,'video_title')]:[]),
-        ...(desc&&terms.some(term=>textMatchesTerm(desc,term))?[videoRef(index,'video_description')]:[]),
+        ...(terms.some(term=>hasAssertedTerm(title,term))?[videoRef(index,'video_title')]:[]),
+        ...(desc&&terms.some(term=>hasAssertedTerm(desc,term))?[videoRef(index,'video_description')]:[]),
       ];
-      return refs.length?refs:terms.some(term=>textMatchesTerm(`${title} ${desc}`,term))?[videoRef(index,'video_title')]:[];
+      return refs.length?refs:terms.some(term=>hasAssertedTerm(`${title} ${desc}`,term))?[videoRef(index,'video_title')]:[];
     };
 
     if (titles.length === 0) {
@@ -129,7 +142,7 @@ export class VideoMetadataProvider implements EvidenceProvider {
       if (!isTrading) continue;
       tradingFocusedCount++;
       tradingVideoIndexes.add(i);
-      for (const signal of matchedTierATradingSignals(combo, knowledgeContext)) {
+      for (const signal of affirmedTierATradingSignals(combo, knowledgeContext)) {
         const videos = tierASignalVideos.get(signal) || new Set<number>();
         videos.add(i);
         tierASignalVideos.set(signal, videos);
@@ -138,28 +151,28 @@ export class VideoMetadataProvider implements EvidenceProvider {
       // C2: a video is trading-focused at most once, and specific evidence is
       // only attributed to videos whose text met the corrected predicate.
       for (const inst of knowledgeContext.globalInstruments) {
-        if (textMatchesTerm(combo, inst)) {
+        if (hasAssertedTerm(combo, inst)) {
           pushUniqueMatch(matchedInstrumentsInVideos, inst);
         }
       }
       for (const plat of knowledgeContext.globalPlatformsPropFirms) {
-        if (textMatchesTerm(combo, plat)) {
+        if (hasAssertedTerm(combo, plat)) {
           pushUniqueMatch(matchedPlatformsInVideos, plat);
         }
       }
       for (const concept of knowledgeContext.globalAdvancedConcepts) {
-        if (textMatchesTerm(combo, concept)) {
+        if (hasAssertedTerm(combo, concept)) {
           pushUniqueMatch(matchedConceptsInVideos, concept);
         }
       }
       for (const langTerm of (knowledgeContext.languageKnowledgePacks||[knowledgeContext.languageKnowledge]).flatMap(pack=>pack?.positiveTerms||[])) {
         if (GENERIC_TRADING_TERM.test(langTerm.trim())) continue;
-        if (textMatchesTerm(combo, langTerm)) {
+        if (hasAssertedTerm(combo, langTerm)) {
           pushUniqueMatch(matchedConceptsInVideos, langTerm);
         }
       }
       for (const countryTerm of knowledgeContext.countryKnowledge?.nativeTradingTerminology || []) {
-        if (textMatchesTerm(combo, countryTerm)) {
+        if (hasAssertedTerm(combo, countryTerm)) {
           pushUniqueMatch(matchedConceptsInVideos, countryTerm);
         }
       }

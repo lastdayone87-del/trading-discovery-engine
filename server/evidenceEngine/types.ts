@@ -1,4 +1,16 @@
 import { TradingStatus, TradingCategory } from '../../src/types';
+import type { ClaimPolarity } from './utils/claimPolarity';
+import type { ContextualCompositionReport } from './contextualComposition';
+import type { RecognitionAssessment } from './recognitionState';
+
+export type NegativeEvidenceRole =
+  | 'TERMINAL'
+  | 'CONFIDENCE_PENALTY'
+  | 'DISCLAIMER'
+  | 'QUOTED'
+  | 'UNKNOWN';
+
+export type { ClaimPolarity };
 
 export type EvidenceSourceType =
   | 'channel_metadata'
@@ -53,6 +65,8 @@ export interface EvidenceProvenance {
   sourceRef: string;
   /** Machine-readable input fields that support this assertion. */
   fields?: EvidenceFieldRef[];
+  /** Non-asserted occurrences that were intentionally suppressed. */
+  suppressedMatches?: Array<{ term: string; polarity: ClaimPolarity; cue?: string }>;
   /** Versioned semantic-model details. Deterministic providers omit this. */
   semantic?: {
     modelVersion: string;
@@ -98,6 +112,14 @@ export interface EvidenceItem {
   rawWeight: number;
   finalWeight: number; // (polarity == 'POSITIVE' ? +1 : -1) * rawWeight * reliabilityMultiplier * (confidence / 100)
   provenance?: EvidenceProvenance;
+  /** Role assigned by the negative-evidence policy. Diagnostic and decision input. */
+  negativeRole?: NegativeEvidenceRole;
+  /**
+   * Strongest claim polarity observed for this item's matches. Providers that
+   * suppress a disclaimer/quotation leave the item positive or omit it
+   * entirely; this annotation explains what was suppressed.
+   */
+  claimPolarity?: ClaimPolarity;
   timestamp: string;
 }
 
@@ -229,6 +251,10 @@ export interface VerificationDecision {
   recognitionState?: 'DECISIVE_TRADING' | 'DECISIVE_NON_TRADING' | 'AMBIGUOUS_CONFLICT' | 'AMBIGUOUS_THIN' | 'QUERY_ONLY' | 'PROVIDER_DEGRADED' | 'INSUFFICIENT';
   semanticPolicy?: 'SKIP' | 'BOUNDED_WAIT' | 'ENRICH' | 'NONE';
   semanticSkippedReason?: string | null;
+  /** Full C5 report for diagnostics/replay. Optional for older fixtures. */
+  compositionReport?: ContextualCompositionReport;
+  /** Full C6 assessment for diagnostics/replay. Optional for older fixtures. */
+  recognitionAssessment?: RecognitionAssessment;
   composition?: {
     focus: 'TRADING_DOMINANT' | 'ALTERNATIVE_DOMINANT' | 'MIXED' | 'INSUFFICIENT_COVERAGE' | 'QUERY_ONLY';
     observedFamilies: number;
@@ -239,6 +265,14 @@ export interface VerificationDecision {
     temporalCoverage: 'KNOWN' | 'UNKNOWN';
     nonTitleTierAFamilies: number;
     reasons: string[];
+    informativeFamilies?: number;
+    tradingCoreFamilies?: number;
+    tradingAdjacentFamilies?: number;
+    financeAdjacentFamilies?: number;
+    unrelatedFamilies?: number;
+    uninformativeFamilies?: number;
+    duplicateFamiliesCollapsed?: number;
+    unrelatedCoverage?: number;
   };
 }
 

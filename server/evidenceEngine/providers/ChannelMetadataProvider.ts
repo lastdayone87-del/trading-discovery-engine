@@ -1,16 +1,20 @@
 import { EvidenceItem, EvidenceProvider, RawChannelInput, LayeredKnowledgeContext } from '../types';
-import { pushUniqueMatch, textMatchesTerm } from '../utils/textMatching';
+import { pushUniqueMatch } from '../utils/textMatching';
+import { findScopedTermMatches } from '../utils/claimPolarity';
 
 export class ChannelMetadataProvider implements EvidenceProvider {
   name = 'channel_metadata' as const;
 
   async collectEvidence(input: RawChannelInput, knowledgeContext: LayeredKnowledgeContext): Promise<EvidenceItem[]> {
     const items: EvidenceItem[] = [];
-    const textBlob = `${input.channel_name} ${input.description || ''}`;
     const now = new Date().toISOString();
+    const assertedIn = (text: string, term: string) =>
+      findScopedTermMatches(text, [term]).some(match => match.polarity === 'ASSERTED');
+    const hasAssertedTerm = (term: string) =>
+      assertedIn(input.channel_name, term) || assertedIn(input.description || '', term);
     const fieldsFor=(terms:string[])=>[
-      ...(terms.some(term=>textMatchesTerm(input.channel_name,term))?[{field:'channel_title' as const,sourceFamilyId:input.channel_source_family_id,sourceEntityId:input.channel_entity_id}]:[]),
-      ...(terms.some(term=>textMatchesTerm(input.description||'',term))?[{field:'channel_bio' as const,sourceFamilyId:input.channel_source_family_id,sourceEntityId:input.channel_entity_id}]:[])
+      ...(terms.some(term=>assertedIn(input.channel_name,term))?[{field:'channel_title' as const,sourceFamilyId:input.channel_source_family_id,sourceEntityId:input.channel_entity_id}]:[]),
+      ...(terms.some(term=>assertedIn(input.description||'',term))?[{field:'channel_bio' as const,sourceFamilyId:input.channel_source_family_id,sourceEntityId:input.channel_entity_id}]:[])
     ];
 
     // 1. Match Global & Country Instruments in Channel Name/Description
@@ -21,7 +25,7 @@ export class ChannelMetadataProvider implements EvidenceProvider {
     ];
 
     for (const inst of allInstruments) {
-      if (textMatchesTerm(textBlob, inst)) {
+      if (hasAssertedTerm(inst)) {
         pushUniqueMatch(matchedInstruments, inst);
       }
     }
@@ -58,7 +62,7 @@ export class ChannelMetadataProvider implements EvidenceProvider {
     ];
 
     for (const platform of allPlatforms) {
-      if (textMatchesTerm(textBlob, platform)) {
+      if (hasAssertedTerm(platform)) {
         pushUniqueMatch(matchedPlatforms, platform);
       }
     }
@@ -95,7 +99,7 @@ export class ChannelMetadataProvider implements EvidenceProvider {
     ];
 
     for (const concept of allConcepts) {
-      if (textMatchesTerm(textBlob, concept)) {
+      if (hasAssertedTerm(concept)) {
         pushUniqueMatch(matchedConcepts, concept);
       }
     }
@@ -133,7 +137,7 @@ export class ChannelMetadataProvider implements EvidenceProvider {
     ];
 
     for (const neg of allNegative) {
-      if (textMatchesTerm(textBlob, neg)) {
+      if (hasAssertedTerm(neg)) {
         pushUniqueMatch(matchedNegative, neg);
       }
     }

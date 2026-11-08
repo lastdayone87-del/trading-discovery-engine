@@ -42,7 +42,7 @@ test('completely missing metadata is distinguished from sparse but classifiable 
   assert.ok(decision.evidenceCollection.reasonCodes.includes('NO_CLASSIFIABLE_METADATA'));
 });
 
-test('rich unmatched metadata is sufficient to inspect but remains uncertain without explicit evidence', async () => {
+test('rich unmatched metadata is inspected without fabricating affirmative evidence', async () => {
   const decision = await deterministicEngine().evaluateChannel({
     channel_name: 'Créateur indépendant',
     description: 'Une chaîne spécialisée avec des explications détaillées publiées chaque semaine pour sa communauté.',
@@ -50,7 +50,11 @@ test('rich unmatched metadata is sufficient to inspect but remains uncertain wit
     country: 'France'
   });
   assert.equal(decision.status, 'UNCERTAIN');
-  assert.equal(decision.evidenceCollection.sufficiency, 'SUFFICIENT');
+  // The old SUFFICIENT verdict came from the short instrument code `es`
+  // matching inside the French word "détaillées". Polarity-aware, Unicode
+  // boundary matching removes that false positive: generic unmatched metadata
+  // is inspected, but it is not affirmative evidence.
+  assert.equal(decision.evidenceCollection.sufficiency, 'INSUFFICIENT');
   assert.equal(decision.totalNegativeWeight, 0);
 });
 

@@ -264,10 +264,11 @@ test('query-only composition preserves affirmative REVIEW and never confirms', (
   assert.equal(stages.lifecycleAction, 'REVIEW');
   assert.equal(decision.status, 'UNCERTAIN');
 
-  // The mixed-evidence ABSTAIN route already produces REVIEW; query-only
-  // routing must preserve it instead of overwriting it with ENRICH.
+  // The mixed-evidence route is now penalty-only: hype no longer withholds
+  // confirmation, so the contradiction stage passes. Query-only routing still
+  // preserves REVIEW instead of confirming.
   const abstained = decide(input, [...affirmativeEvidence(), mixedNegative()], sufficientCollection(), composition);
-  assert.equal(abstained.stages.stages.find(stage => stage.stage === 'CONTRADICTION')?.disposition, 'ABSTAIN');
+  assert.equal(abstained.stages.stages.find(stage => stage.stage === 'CONTRADICTION')?.disposition, 'PASS');
   assert.equal(abstained.stages.lifecycleAction, 'REVIEW');
   assert.equal(abstained.decision.status, 'UNCERTAIN');
 });

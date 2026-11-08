@@ -6,8 +6,9 @@ import { isSemanticClassificationSource } from './types';
 import { collapseSourceIndependentObservations } from '../entityResolution';
 import { dedupeWeightByFieldGroup, hasCreatorLevelUnrelatedAttribution } from './decisionPolicy';
 import type { ContextualCompositionReport } from './contextualComposition';
+import { isTerminalNegativeEvidence, negativeEvidencePolicyWeight } from './negativeEvidenceRole';
 
-export const STAGED_CLASSIFICATION_VERSION = '3.2.1';
+export const STAGED_CLASSIFICATION_VERSION = '3.3.0';
 
 /**
  * Retrieval-only thin input requiring hydration. At enrichment_stage 0 with
@@ -68,10 +69,6 @@ function result(stage: ClassificationStageResult['stage'], disposition: Classifi
   return { stage, disposition, reasonCodes, evidenceIds: items.map(item => item.id), fields: uniqueFields(items), metrics };
 }
 
-function isPromotionalOrAdjacentNegative(item: EvidenceItem): boolean {
-  return item.category === 'HYPE_SPECULATION' || item.category === 'NON_TRADING_ADJACENT';
-}
-
 function isWeakVideoTerminologyEvidence(item: EvidenceItem): boolean {
   if (item.polarity !== 'POSITIVE' || item.category !== 'TERMINOLOGY') return false;
   const fields = item.provenance?.fields || [];
@@ -79,7 +76,10 @@ function isWeakVideoTerminologyEvidence(item: EvidenceItem): boolean {
 }
 
 function terminalContradictionWeights(negative: EvidenceItem[], positive: EvidenceItem[]) {
-  const terminalNegative = negative.filter(item => item.category === 'IRRELEVANT_DOMAIN' && !isPromotionalOrAdjacentNegative(item));
+  // Only IRRELEVANT_DOMAIN evidence whose claim is asserted and creator-level
+  // may reject. Hype and adjacent finance are confidence penalties, and a
+  // disclaimer/quotation is absence, never terminal opposition.
+  const terminalNegative = negative.filter(isTerminalNegativeEvidence);
   // Same observation-aware weights as the final policy (see
   // dedupeWeightByFieldGroup): stage dispositions and the terminal decision
   // must agree, so a withheld case routes to ENRICH/REVIEW in both layers
@@ -117,13 +117,18 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   const repeatedCreatorHypothesis = repeatedItems.filter(item => item.confidence >= 70 && Math.abs(item.finalWeight) >= 18);
   const repeatedCreatorIndependent = repeatedCreatorHypothesis.length > 0 && repeatedIndependence.independentFamilyCount >= 3;
   const independentDimensions = new Set(corroborating.map(item => item.category));
-  const negativeWeight = negative.reduce((sum, item) => sum + Math.abs(item.finalWeight), 0);
+  const negativeWeight = negative.reduce((sum, item) => sum + negativeEvidencePolicyWeight(item), 0);
   const positiveWeight = positive.reduce((sum, item) => sum + Math.abs(item.finalWeight), 0);
+  const nonTerminalNegativeWeight = dedupeWeightByFieldGroup(negative.filter(item => !isTerminalNegativeEvidence(item) && negativeEvidencePolicyWeight(item) > 0));
   const {terminalNegative,terminalNegativeWeight,materiallyDominant}=terminalContradictionWeights(negative,positive);
   const terminalNegativeSufficient=collection.terminalNegativeSufficiency?.status==='SUFFICIENT';
   const semanticUnrelatedCandidate=hasCreatorLevelSemanticUnrelatedCandidate(negative,collection);
   const dominantContradiction = materiallyDominant && terminalNegativeSufficient;
-  const mixedNegativeConflict = negative.length > 0 && negativeWeight >= 25 && !dominantContradiction && !semanticUnrelatedCandidate;
+  // Align the mixed gate with terminalContradictionWeights: only terminal
+  // unrelated-domain evidence can withhold confirmation. Hype and
+  // finance-adjacent negatives are confidence penalties, not abstention
+  // triggers, and disclaimers/quotations carry no negative weight at all.
+  const mixedNegativeConflict = terminalNegative.length > 0 && terminalNegativeWeight >= 25 && !dominantContradiction && !semanticUnrelatedCandidate;
 
   const availability = collection.sufficiency === 'SUFFICIENT'
     ? result('AVAILABILITY', 'PASS', [collection.degraded ? 'STAGE_EVIDENCE_SUFFICIENT_WITH_PROVIDER_DEGRADATION' : 'STAGE_EVIDENCE_SUFFICIENT'], evidence, { sufficiency: collection.sufficiency, degraded: collection.degraded })
@@ -143,14 +148,16 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
     && composition.explicitCreatorTrading
     && !composition.explicitCreatorAlternative
     && composition.alternativeCoverage < 0.34
+    && (composition.unrelatedCoverage ?? 0) < 0.34
     && composition.nonTitleTierAFamilies >= 1);
   const compositionCorroborates = !composition || explicitCreatorStatementConfirms || (
     composition.focus === 'TRADING_DOMINANT'
     && composition.alternativeCoverage < 0.34
+    && (composition.unrelatedCoverage ?? 0) < 0.34
     && !composition.explicitCreatorAlternative
     && composition.tradingCoverage >= 0.5
     && composition.nonTitleTierAFamilies >= 1
-    && composition.tradingFamilies >= 2
+    && (composition.tradingCoreFamilies ?? composition.tradingFamilies) >= 2
   );
   // Thin compositions cannot confirm, but they must not erase independent
   // evidence-based corroboration: the lifecycle routing below preserves it at
@@ -182,8 +189,10 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
         ? result('CONTRADICTION','FAIL',['CREATOR_LEVEL_SEMANTIC_UNRELATED_CANDIDATE'],negative,{negativeWeight,positiveWeight,terminalNegativeWeight})
         : result('CONTRADICTION', 'FAIL', ['DOMINANT_CREATOR_LEVEL_IRRELEVANT_CONTRADICTION'], terminalNegative, { negativeWeight, positiveWeight, terminalNegativeWeight }))
     : mixedNegativeConflict
-        ? result('CONTRADICTION','ABSTAIN',['MIXED_EVIDENCE_TERMINAL_REJECTION_WITHHELD'],negative,{negativeWeight,positiveWeight,terminalNegativeWeight,independentNegativeObservations:collection.terminalNegativeSufficiency?.independentObservations||0,independentNegativeSourceFamilies:collection.terminalNegativeSufficiency?.independentSourceFamilies||0})
-        : result('CONTRADICTION', 'PASS', negative.length ? ['CONTRADICTION_NOT_TERMINAL_OR_DOMINANT'] : ['NO_AFFIRMATIVE_CONTRADICTION'], negative, { negativeWeight, positiveWeight, terminalNegativeWeight });
+        ? result('CONTRADICTION','ABSTAIN',['MIXED_EVIDENCE_TERMINAL_REJECTION_WITHHELD'],negative,{negativeWeight,positiveWeight,terminalNegativeWeight,nonTerminalNegativeWeight,independentNegativeObservations:collection.terminalNegativeSufficiency?.independentObservations||0,independentNegativeSourceFamilies:collection.terminalNegativeSufficiency?.independentSourceFamilies||0})
+        : result('CONTRADICTION', 'PASS', negative.length
+          ? [terminalNegative.length === 0 ? 'NON_TERMINAL_NEGATIVE_PENALTY_ONLY' : 'CONTRADICTION_NOT_TERMINAL_OR_DOMINANT']
+          : ['NO_AFFIRMATIVE_CONTRADICTION'], negative, { negativeWeight, positiveWeight, terminalNegativeWeight, nonTerminalNegativeWeight });
 
   let lifecycleAction: LifecycleAction = 'REVIEW';
   if (availability.disposition !== 'PASS') lifecycleAction = collection.sufficiency === 'MISSING' || collection.sufficiency === 'INSUFFICIENT' ? 'ENRICH' : 'REVIEW';
@@ -205,6 +214,10 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
     else if (composition.focus === 'MIXED' && lifecycleAction === 'CONFIRM') lifecycleAction = 'REVIEW';
     else if (composition.focus === 'TRADING_DOMINANT' && lifecycleAction === 'CONFIRM' && !compositionCorroborates) lifecycleAction = 'REVIEW';
   }
+  // Anti-contamination safeguard: a retrieval-only stage-0 input is known to
+  // rest on title/bio alone. Even without a composition object, it must not
+  // confirm; legacy callers route to review instead of bypassing hydration.
+  if (lifecycleAction === 'CONFIRM' && isThinRetrievalInputRequiringHydration(input)) lifecycleAction = 'REVIEW';
   const lifecycle = result('LIFECYCLE', 'PASS', [`ROUTE_${lifecycleAction}`], [], { action: lifecycleAction });
   return { pipelineVersion: STAGED_CLASSIFICATION_VERSION, stages: [availability, candidate, corroboration, contradiction, lifecycle], lifecycleAction };
 }
