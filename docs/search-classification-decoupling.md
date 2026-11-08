@@ -12,8 +12,10 @@ YouTube quota were not saturated.
 
 ## Design
 
-`SEARCH_CLASSIFICATION_DECOUPLING_ENABLED` (default `false`) switches the
-autonomous search loop from inline classification to durable admission.
+`SEARCH_CLASSIFICATION_DECOUPLING_ENABLED` (default `true`) switches the
+autonomous search loop from inline classification to durable admission. The
+durable queue is the active production path; an explicit `false` is the
+rollback switch.
 
 When enabled, for every newly retrieved channel the search worker:
 
@@ -81,7 +83,10 @@ A pending observation counts as:
   productive page is not misread as low-yield and pagination does not stop too
   early;
 - **not** `evaluated`, so it cannot dilute country/trading precision or claim a
-  trading outcome.
+  trading outcome. A page whose country outcomes are all still pending is
+  neutral for the legacy continuation precision term and cannot trigger a
+  wrong-country stop; partially evaluated pages still report the real
+  wrong-country share.
 
 When classification completes, `reconcileClassificationSighting` rewrites every
 `channel_sightings` row for that channel whose `funnel_outcome` is
@@ -124,6 +129,8 @@ Alerts worth adding operationally:
 - classification terminal-failure rate > 10% of attempts in 1 hour.
 
 ## Rollback
+
+The queue is active by default. Rollback is one explicit setting:
 
 1. Set `SEARCH_CLASSIFICATION_DECOUPLING_ENABLED=false` and redeploy/restart.
 2. The search loop immediately returns to the legacy inline path for every new

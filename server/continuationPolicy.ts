@@ -12,6 +12,12 @@ export interface ContinuationPolicyInput {
   countryPrecision: number; communityDiversity: number; duplicateRatio: number;
   consecutiveLowYieldPages: number; maxConsecutiveLowYieldPages: number;
   /**
+   * Observations on this page whose classification is still queued. They have
+   * no country verdict, so they must not be counted as wrong-country results
+   * or contribute a zero to country precision.
+   */
+  classificationPending?: number;
+  /**
    * The page contained only deferred (not evaluated) provider results. It
    * carries no yield signal, so zero-value/duplicate/precision penalties must
    * not be attributed to it; page and creator ceilings still apply.
@@ -47,6 +53,11 @@ export function evaluateContinuation(input: ContinuationPolicyInput): Continuati
   const effectiveQuality = Math.max(input.qualityConfirmedCreators, input.delayedQualityCreators || 0);
   const distinct = Math.max(0, input.distinctCreators);
   const novelty = distinct ? clamp(input.newCreators / distinct) : 0;
+  // A pending classification has no country verdict. Treat an all-pending page
+  // as neutral for the precision term and skip the wrong-country stop; only
+  // observed country outcomes may declare the page a country miss.
+  const pending = Math.max(0, Math.min(distinct, Math.trunc(input.classificationPending || 0)));
+  const hasCountryVerdicts = distinct - pending > 0;
 
   // Cohort-attributed yield: cumulative confirmed creators against cumulative distinct creator cohort
   const confirmedYield = clamp(effectiveConfirmed / cumulativeDistinct);
@@ -55,7 +66,8 @@ export function evaluateContinuation(input: ContinuationPolicyInput): Continuati
 
   const marginalUtility = Number(clamp(
     0.30 * qualityYield + 0.25 * confirmedYield + 0.20 * novelty +
-    0.15 * clamp(input.countryPrecision) + 0.10 * clamp(input.communityDiversity) -
+    0.15 * (hasCountryVerdicts ? clamp(input.countryPrecision) : 0.5) +
+    0.10 * clamp(input.communityDiversity) -
     0.20 * clamp(input.duplicateRatio) - 0.20 * nonTradingPenalty
   ).toFixed(5));
 
@@ -65,8 +77,8 @@ export function evaluateContinuation(input: ContinuationPolicyInput): Continuati
   if (input.maxDistinctCreators && input.cumulativeDistinctCreators >= input.maxDistinctCreators) reasons.push('CREATOR_CEILING');
   if (effectiveConfirmed === 0 && input.newCreators === 0) reasons.push('ZERO_CONFIRMED_VALUE');
   if (input.duplicateRatio >= 0.8) reasons.push('DUPLICATE_HEAVY');
-  if (input.countryPrecision < 0.5) reasons.push('WRONG_COUNTRY');
-  const lowYield = marginalUtility < 0.2 || (effectiveConfirmed === 0 && input.newCreators === 0) || input.duplicateRatio >= 0.8 || input.countryPrecision < 0.5;
+  if (hasCountryVerdicts && input.countryPrecision < 0.5) reasons.push('WRONG_COUNTRY');
+  const lowYield = marginalUtility < 0.2 || (effectiveConfirmed === 0 && input.newCreators === 0) || input.duplicateRatio >= 0.8 || (hasCountryVerdicts && input.countryPrecision < 0.5);
   const lowYieldCount = lowYield ? input.consecutiveLowYieldPages + 1 : 0;
   if (lowYieldCount >= input.maxConsecutiveLowYieldPages) reasons.push('CONSECUTIVE_LOW_YIELD');
   const terminal = reasons.find(r => ['NO_NEXT_PAGE','PAGE_CEILING','CREATOR_CEILING','CONSECUTIVE_LOW_YIELD'].includes(r));

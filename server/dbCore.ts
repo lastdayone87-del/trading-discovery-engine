@@ -1460,14 +1460,20 @@ export async function reconcileClassificationSighting(input: {
   const result = await db.query(
     `UPDATE channel_sightings
         SET funnel_outcome=$2,country_outcome=$3,trading_outcome=$4,persisted=$5,
-            metadata=metadata||$6::jsonb
+            metadata=(metadata - 'reconciledBy')||$6::jsonb
       WHERE channel_id=$1
         AND (
           funnel_outcome='CLASSIFICATION_PENDING'
           -- A maintenance sweep may finalize a sighting in the same instant a
           -- new classification is admitted. Let the newer authoritative job
-          -- verdict revise that sweep-only projection instead of freezing it.
-          OR metadata->>'reconciledBy'='MAINTENANCE_SWEEP'
+          -- verdict revise that sweep-only projection once, inside a short
+          -- window, then clear the marker so later jobs never rewrite
+          -- historical sweep rows from unrelated runs.
+          OR (
+            metadata->>'reconciledBy'='MAINTENANCE_SWEEP'
+            AND COALESCE((metadata->>'classificationReconciledAt')::timestamptz, observed_at)
+              > now()-interval '1 hour'
+          )
         )`,
     [
       input.channelId,

@@ -1967,10 +1967,11 @@ export async function processNextSearchJob(
     const sightings = [];
     const deferredChannelIds = new Set<string>();
     const channelLoopStartMs = Date.now();
-    // Phase 3 is inert by default: disabled means the exact legacy inline loop.
-    // When enabled, backpressure state is read once per page and adjusted
-    // locally per enqueue; WORKING-style slight overrun is bounded by one page
-    // per search worker.
+    // Phase 3 durable admission is the default production path. The explicit
+    // rollback flag restores the exact legacy inline loop. When enabled,
+    // backpressure state is read once per page and adjusted locally per
+    // enqueue; WORKING-style slight overrun is bounded by one page per search
+    // worker.
     const classificationDecoupling = resolveClassificationDecouplingConfig();
     let classificationBackpressure: ClassificationBackpressureState | null = null;
     for (const [index, raw] of distinctExtracted.entries()) {
@@ -2182,6 +2183,7 @@ export async function processNextSearchJob(
         consecutiveLowYieldPages: prior.consecutiveLowYieldPages,
         maxConsecutiveLowYieldPages: maxLow,
         deferredOnly: observations.length === 0 && deferredResults > 0,
+        classificationPending: metrics.classificationPending,
       });
       const decision = v2Enabled ? decisionV2 : legacyDecision!;
       const usingV2 = v2Enabled;

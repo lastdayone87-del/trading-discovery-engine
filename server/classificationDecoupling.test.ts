@@ -23,10 +23,13 @@ import {
 
 const env = (overrides: Record<string, string | undefined> = {}): NodeJS.ProcessEnv => ({ ...overrides } as NodeJS.ProcessEnv);
 
-test('decoupling is inert by default and only an explicit true enables it', () => {
-  assert.equal(resolveClassificationDecouplingConfig(env()).enabled, false);
-  assert.equal(resolveClassificationDecouplingConfig(env({ [CLASSIFICATION_DECOUPLING_FLAG]: 'false' })).enabled, false);
+test('decoupling is active by default and an explicit false is the rollback switch', () => {
+  assert.equal(resolveClassificationDecouplingConfig(env()).enabled, true);
   assert.equal(resolveClassificationDecouplingConfig(env({ [CLASSIFICATION_DECOUPLING_FLAG]: 'TRUE' })).enabled, true);
+  assert.equal(resolveClassificationDecouplingConfig(env({ [CLASSIFICATION_DECOUPLING_FLAG]: 'false' })).enabled, false);
+  assert.equal(resolveClassificationDecouplingConfig(env({ [CLASSIFICATION_DECOUPLING_FLAG]: '0' })).enabled, false);
+  assert.equal(resolveClassificationDecouplingConfig(env({ [CLASSIFICATION_DECOUPLING_FLAG]: 'off' })).enabled, false);
+  assert.equal(resolveClassificationDecouplingConfig(env({ [CLASSIFICATION_DECOUPLING_FLAG]: 'not-a-boolean' })).enabled, true);
 });
 
 test('caps, priority, and attempts clamp to safe positives', () => {
@@ -192,11 +195,11 @@ test('terminal outcome mapping preserves country and human rejection semantics',
   assert.equal(mapClassificationOutcomeToFunnelOutcome({ countryStatus: 'UNCERTAIN', tradingStatus: 'UNCERTAIN' }), 'UNCERTAIN');
 });
 
-test('source wiring keeps the inline path as the flag-off fallback and drains on rollback', () => {
+test('source wiring keeps the inline path as the explicit rollback fallback and drains it', () => {
   const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
   const db = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
   const example = readFileSync(new URL('../.env.example', import.meta.url), 'utf8');
-  // Default-off branch still calls the exact legacy containment helper through
+  // The rollback branch still calls the exact legacy containment helper through
   // the executable routing unit.
   assert.match(queue, /decouplingEnabled: classificationDecoupling\.enabled/);
   assert.match(queue, /inline: \(\) => processDiscoveredChannelContained\(raw, country, source/);
@@ -211,7 +214,16 @@ test('source wiring keeps the inline path as the flag-off fallback and drains on
   assert.match(db, /insertOnly\?: boolean/);
   assert.match(db, /ON CONFLICT\(channel_id\) DO NOTHING/);
   assert.match(db, /export async function reconcileClassificationSighting/);
-  assert.match(example, /SEARCH_CLASSIFICATION_DECOUPLING_ENABLED="false"/);
+  assert.match(example, /SEARCH_CLASSIFICATION_DECOUPLING_ENABLED="true"/);
+});
+
+test('sweep revisions are recency-bounded and one-shot', () => {
+  const db = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
+  // A job may revise a sweep projection only inside a short window...
+  assert.match(db, /metadata->>'reconciledBy'='MAINTENANCE_SWEEP'[\s\S]{0,250}> now\(\)-interval '1 hour'/);
+  // ...and applying the job verdict clears the marker so later jobs cannot
+  // rewrite the same historical row again.
+  assert.match(db, /metadata=\(metadata - 'reconciledBy'\)\|\|\$6::jsonb/);
 });
 
 test('pending-sighting sweep is indexed and bounded for post-rollback repair', () => {

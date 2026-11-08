@@ -12,14 +12,15 @@ import type { FunnelOutcome } from './queryPerformance';
  * the enrichment pool, so retrieval is no longer head-of-line blocked by
  * semantic provider waits.
  *
- * Defaults are deliberately inert. Enabling the flag never changes discovery
+ * The durable admission path is the default. It never changes discovery
  * semantics: the pipeline, terminal projections, preservation rules, and
- * idempotency guards are shared with the inline path.
+ * idempotency guards are shared with the inline path. Setting the flag to an
+ * explicit false is the rollback switch and restores the legacy inline loop.
  */
 
 export const CLASSIFICATION_JOB_TYPE = 'CLASSIFY_DISCOVERED_CHANNEL' as const;
 
-/** Feature flag. Disabled means the legacy inline channel loop is unchanged. */
+/** Rollback switch. Explicit false restores the legacy inline channel loop. */
 export const CLASSIFICATION_DECOUPLING_FLAG = 'SEARCH_CLASSIFICATION_DECOUPLING_ENABLED';
 
 /** Global cap on PENDING/PROCESSING classification jobs. */
@@ -58,6 +59,19 @@ function positiveInt(value: unknown, fallback: number, max = Number.MAX_SAFE_INT
 }
 
 /**
+ * Default-on feature switches still need an unambiguous rollback value.
+ * Missing, empty, or unrecognized values keep the shipped default; only an
+ * explicit falsey token disables the path.
+ */
+function flagEnabled(value: unknown, fallback: boolean): boolean {
+  if (value === undefined || value === null || String(value).trim() === '') return fallback;
+  const normalized = String(value).trim().toLowerCase();
+  if (['false', '0', 'off', 'no'].includes(normalized)) return false;
+  if (['true', '1', 'on', 'yes'].includes(normalized)) return true;
+  return fallback;
+}
+
+/**
  * Worker-lane counts preserve the operator's historical validation: an
  * explicit zero or negative value still means "one worker", while a missing
  * or non-numeric value falls back to the measured default instead of letting
@@ -74,7 +88,7 @@ export function resolveClassificationDecouplingConfig(
   env: NodeJS.ProcessEnv = process.env,
 ): ClassificationDecouplingConfig {
   return {
-    enabled: String(env[CLASSIFICATION_DECOUPLING_FLAG] || '').toLowerCase() === 'true',
+    enabled: flagEnabled(env[CLASSIFICATION_DECOUPLING_FLAG], true),
     maxPending: positiveInt(env.CLASSIFY_DISCOVERED_CHANNEL_MAX_PENDING, CLASSIFICATION_MAX_PENDING_DEFAULT, 100_000),
     maxPerQuery: positiveInt(env.CLASSIFY_DISCOVERED_CHANNEL_MAX_PER_QUERY, CLASSIFICATION_MAX_PER_QUERY_DEFAULT, 10_000),
     priority: positiveInt(env.CLASSIFY_DISCOVERED_CHANNEL_PRIORITY, CLASSIFICATION_JOB_PRIORITY_DEFAULT, 1_000),
