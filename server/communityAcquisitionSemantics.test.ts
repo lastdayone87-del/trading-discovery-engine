@@ -124,6 +124,33 @@ test('encoded YouTube redirect destinations preserve direct Discord invites',asy
   assert.equal(result.foundLocation,'CHANNEL_EXTERNAL_LINKS');
 });
 
+test('externally blocked community surfaces escalate to rendered instead of a clean NOT_FOUND',async()=>{
+  let renderedCalls=0;
+  const result=await runChannelInspection({
+    channelId:'external-block-render',
+    channelName:'External Block',
+    channelBio:'No invite',
+    channelLinks:['https://linktr.ee/khuncoin1'],
+    videoDescriptions:['one','two','three','four','five'],
+    creatorLikelyTrading:false,
+    externalFetchImpl:(async()=>new Response('blocked',{status:406,headers:{'content-type':'text/html'}})) as typeof fetch,
+    renderedFallback:(async(seedUrl:string)=>{renderedCalls++;return {
+      foundInvite:'FD8qmtxQcK',
+      foundLocation:seedUrl,
+      inspectedPages:1,
+      scrolls:0,
+      clicks:0,
+      complete:true,
+      retryable:false,
+      detail:'rendered found invite',
+    } as any;}) as any,
+  });
+  assert.equal(renderedCalls,1,'external block must trigger the bounded rendered rung');
+  assert.equal(result.foundInvite,'FD8qmtxQcK');
+  assert.equal(result.acquisitionStatus,'FOUND');
+  assert.equal(result.steps.find(step=>step.step==='CUSTOM_DOMAINS')?.status,'FOUND');
+});
+
 test('recent-video Discord is preserved before optional acquisition',async()=>{
   const result=await runChannelInspection({channelId:'recent',channelBio:'No invite',channelLinks:[],videoDescriptions:['one','two https://discord.gg/recent-room','three','four','five']});
   assert.equal(result.foundInvite,'recent-room');assert.equal(result.foundLocation,'VIDEO_2_DESCRIPTION');assert.equal(result.acquisitionStatus,'FOUND');
