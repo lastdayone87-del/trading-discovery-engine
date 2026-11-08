@@ -80,9 +80,8 @@ export function isExplicitCreatorTradingText(text: string, context: LayeredKnowl
   // bypass those exclusions.
   const assessment = assessTradingText(normalized, context);
   if (assessment.focus === 'TRADING_CORE' || assessment.focus === 'TRADING_ADJACENT') return true;
-  const FINANCE_ONLY_SIGNAL_IDS = new Set(['BUSINESS_NEWS', 'GENERIC_FINANCE', 'MOTIVATION', 'HYPE']);
   const assertedTradingSignals = assessment.assertedSignals.filter(match =>
-    match.category !== 'NON_TRADING' && !FINANCE_ONLY_SIGNAL_IDS.has(match.id));
+    match.category !== 'NON_TRADING' && !assessment.financeSignals.includes(match.id));
   if (assessment.signals.length > 0 && assertedTradingSignals.length === 0) return false;
 
   return hasTierASignal

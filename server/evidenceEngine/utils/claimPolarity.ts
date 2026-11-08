@@ -73,7 +73,7 @@ const HYPOTHETICAL_CUES: Record<LanguageCode, string[]> = {
 };
 
 const CRITICISM_CUE = /\b(?:scam(?:mers?|med)?|fake|fraud(?:ulent)?|beware|avoid|myth|debunk(?:ed|ing)?|so-called|snake\s*oil|too\s*good\s*to\s*be\s*true|misleading|lies?|red\s*flags?)\b/iu;
-const ATTRIBUTION_CUE = /\b(?:they|these|those|gurus?|scammers?|courses?|sellers?|promoters?|influencers?)\b[^.!?;\n]{0,48}\b(?:say|says|promise|promises|promised|claim|claims|claimed|sell|sells|teach|teaches)\b/iu;
+const ATTRIBUTION_CUE = /\b(?:they|these|those|gurus?|scammers?|sellers?|promoters?|influencers?)\b[^.!?;\n]{0,48}\b(?:say|says|promise|promises|promised|claim|claims|claimed|sell|sells|teach|teaches)\b/iu;
 // Criticism/quotation framing only neutralizes claim-like language. "Avoid
 // fake breakouts with order flow" is asserted education, not a quoted hype
 // claim about order flow.
@@ -86,7 +86,6 @@ const CONTRAST_CUE = /(?:\b(?:but|however|yet|although|though|whereas|neverthele
 // `and` only starts a new clause when it introduces a new predicate/subject;
 // noun coordination ("stocks and crypto") stays inside the negation scope.
 const COORDINATION_CUE = /\b(?:and|&)\s+(?=(?:i|we|you|they|he|she|it)\b|(?:teach|learn|trade|show|share|explain|post|upload|run|make|offer|provide|help|cover|analy[sz]e|review|discuss|focus|talk|stream|prefer)\b)/iu;
-const POST_HYPOTHETICAL = /^\s*(?:could|would|might|may|hypothetically|in\s+theory)\b/iu;
 
 const DISCLAIMER_PATTERNS: RegExp[] = [
   /\b(?:no|not|never|without)\s+(?:financial|investment|trading|tax)\s+advice\b/iu,
@@ -331,9 +330,12 @@ export function classifyClaimPolarity(
   }
   // Post-term hypotheticals must describe the matched activity: "Trading
   // could happen" is hypothetical, while "I teach day trading so you could
-  // learn" is an asserted teaching claim.
-  if (POST_HYPOTHETICAL.test(afterClause)) {
-    return { polarity: 'HYPOTHETICAL', cue: afterClause.trim().slice(0, 24), confidence: 0.75 };
+  // learn" is an asserted teaching claim. Use the detected language's cues,
+  // anchored at the start of the term's tail.
+  const hypotheticalAfter = combinedCueRegex(afterClause, language, HYPOTHETICAL_CUES);
+  if (hypotheticalAfter) {
+    const anchored = new RegExp(`^\\s*(?:${hypotheticalAfter.source})`, 'iu').exec(afterClause);
+    if (anchored) return { polarity: 'HYPOTHETICAL', cue: anchored[0].trim().slice(0, 24), confidence: 0.75 };
   }
 
   // A negation cue after a contrastive conjunction applies to the other clause,
