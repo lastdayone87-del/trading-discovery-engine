@@ -1003,11 +1003,17 @@ export function isExternalBlockEscalation(crawlRes: Pick<ExternalDiscordCrawlRes
   // platform subdomain boundary too (community.circle.so, app.circle.so) and
   // normalize trailing dots, mirroring creatorWebsiteHostsFromLinks.
   if(seedUrl){
-    try{
-      const host=new URL(seedUrl).hostname.toLowerCase().replace(/\.$/,'');
-      const knownHosts=[...CROSS_DOMAIN_COMMUNITY_HOSTS,...socialHosts].map(value=>value.replace(/^www\./,'').replace(/\.$/,''));
-      if(!knownHosts.some(known=>host===known||host.endsWith(`.${known}`)))return false;
-    }catch{return false;}
+    // The admitted seed and every validated final destination are candidates:
+    // a generic creator URL may redirect to Linktree/circle before the block.
+    const candidateUrls=[seedUrl,...crawlRes.observations.map(observation=>observation.finalUrl).filter((value):value is string=>typeof value==='string'&&value.length>0)];
+    const knownHosts=[...CROSS_DOMAIN_COMMUNITY_HOSTS,...socialHosts].map(value=>value.replace(/^www\./,'').replace(/\.$/,''));
+    const matchesCommunityHost=candidateUrls.some(candidateUrl=>{
+      try{
+        const host=new URL(candidateUrl).hostname.toLowerCase().replace(/\.$/,'');
+        return knownHosts.some(known=>host===known||host.endsWith(`.${known}`));
+      }catch{return false;}
+    });
+    if(!matchesCommunityHost)return false;
   }
   return crawlRes.observations.some(observation=>{
     const status=Number(observation.httpStatus||0);
