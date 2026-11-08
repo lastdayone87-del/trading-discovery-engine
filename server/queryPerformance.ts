@@ -170,9 +170,12 @@ export function calculateQueryFunnel(
   const noveltyRatio = ratio(values.filter(value => value.persisted && !value.wasKnown).length, values.length);
   // A pending classification has no country verdict. Including it in the
   // denominator makes a page look more country-accurate than it is, so
-  // precision is measured over evaluated country outcomes only.
-  const countryEvaluated = values.length - classificationPending;
-  const countryPrecision = ratio(countryEvaluated - countryRejected, countryEvaluated);
+  // precision is measured over evaluated country outcomes only. When nothing
+  // was evaluated, no result is a country miss: report the vacuous neutral
+  // value instead of zero so legacy pagination does not stop on an
+  // unresolved-only page.
+  const countryEvaluated = Math.max(0, values.length - classificationPending);
+  const countryPrecision = countryEvaluated > 0 ? ratio(countryEvaluated - countryRejected, countryEvaluated) : 1;
   const tradingPrecision = ratio(tradingConfirmed, evaluated);
   const qualityYield = ratio(qualityChannels, evaluated);
   const communityYield = ratio(communitiesDiscovered, evaluated);

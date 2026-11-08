@@ -96,9 +96,12 @@ without double-counting historical page aggregates.
 
 A maintenance sweep (`reconcileStaleClassificationSightings`) closes the race
 where a classification completes before the search worker writes its page-end
-sighting, and repairs incomplete reconciliations. Withheld candidates whose
-placeholder was removed reconcile to `UNCERTAIN` after a five-minute grace
-period.
+sighting, and repairs incomplete reconciliations. A later classification job
+verdict can also revise a row the sweep already finalized
+(`metadata.reconciledBy='MAINTENANCE_SWEEP'`) for one hour after that
+reconciliation; applying the verdict clears the marker so subsequent jobs
+cannot rewrite the historical row. Withheld candidates whose placeholder was
+removed reconcile to `UNCERTAIN` after a five-minute grace period.
 
 ## Monitoring
 
@@ -138,9 +141,10 @@ The queue is active by default. Rollback is one explicit setting:
 3. Existing PENDING/PROCESSING classification jobs remain claimable through the
    dedicated drain lane and complete idempotently. They can also be left
    pending; the queue is not lost.
-4. No schema migration is required and no data rewrite is needed. Provisional
-   rows are reclaimed by normal classification, terminal projection, or the
-   placeholder deletion path.
+4. Migration 168 adds only a partial index for the sweep; the rollback leaves it
+   in place (it stays harmless and keeps post-rollback repair cheap). No data
+   rewrite is needed. Provisional rows are reclaimed by normal classification,
+   terminal projection, or the placeholder deletion path.
 
 ## Failure recovery
 

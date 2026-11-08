@@ -382,8 +382,7 @@ export interface QueueStatus {
   pendingWork: Array<{ id: string; type: string; waitingReason: string; retryAt: string | null; priority: number; ageMs: number; lastProviderError: string | null }>;
   /**
    * Phase 3 classification visibility. Optional for backward compatibility
-   * with older payloads/caches. Search-worker occupancy is derived from the
-   * PROCESSING claim owners; it never exposes credentials or payload bodies.
+   * with older payloads/caches. It never exposes credentials or payload bodies.
    */
   classificationQueue?: {
     pending: number;
@@ -395,8 +394,14 @@ export interface QueueStatus {
     maxPending?: number;
     bySource: Array<{ source: string; pending: number; processing: number; oldestPendingAt: string | null }>;
   };
+  /**
+   * Search-worker occupancy derived from the PROCESSING claim owners. It never
+   * exposes credentials or payload bodies.
+   */
   searchWorkers?: {
+    /** Configured search-worker concurrency. */
     configured: number;
+    /** Search workers currently holding a search job. */
     busy: number;
   };
 }

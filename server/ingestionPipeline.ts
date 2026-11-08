@@ -642,9 +642,14 @@ async function processChannelThroughPipelineInContext(
       // A provisional classification row starts as country='UNKNOWN'. The
       // low-audience branch reuses that row, so the validated creator country
       // must be projected here or the durable row keeps the placeholder.
-      if (creatorCountry) lowAudienceChannel.country = creatorCountry;
-      lowAudienceChannel.country_status = countryVal.status;
-      lowAudienceChannel.confidence_score = countryVal.score;
+      // Without a creator country, preserve the prior country/status pair:
+      // downgrading only the status would leave a stale country looking
+      // established to country-gated recovery paths.
+      if (creatorCountry) {
+        lowAudienceChannel.country = creatorCountry;
+        lowAudienceChannel.country_status = countryVal.status;
+        lowAudienceChannel.confidence_score = countryVal.score;
+      }
       lowAudienceChannel.inspection_trail = [
         ...(lowAudienceChannel.inspection_trail || []),
         countryValidationStep,

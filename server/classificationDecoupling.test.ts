@@ -231,6 +231,10 @@ test('pending-sighting sweep is indexed and bounded for post-rollback repair', (
   assert.match(migration, /idx_channel_sightings_classification_pending/);
   assert.match(migration, /ON public\.channel_sightings \(observed_at\)/);
   assert.match(migration, /WHERE funnel_outcome='CLASSIFICATION_PENDING'/);
+  // A missing table must fail the migration instead of silently recording it
+  // as applied without the index.
+  assert.doesNotMatch(migration, /IF to_regclass\('public\.channel_sightings'\) IS NULL THEN\s+RETURN;/);
+  assert.match(migration, /IF EXISTS \(SELECT 1 FROM public\.channel_sightings LIMIT 1\) THEN/);
   const db = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
   // The populated-table index is built concurrently before the transactional
   // migration loop, and the migration itself only adopts it.

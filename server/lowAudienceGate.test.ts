@@ -61,6 +61,15 @@ test('ingestionPipeline enforces country hard-rejection before low-audience budg
   assert.ok(countryRejectedIndex < lowAudienceGateIndex, 'Country hard-rejection must precede low-audience budget gate in ingestion pipeline');
 });
 
+test('low-audience reuse keeps country and status as one evidence pair', () => {
+  const source = read('server/ingestionPipeline.ts');
+  assert.match(
+    source,
+    /if \(creatorCountry\) \{\s*lowAudienceChannel\.country = creatorCountry;\s*lowAudienceChannel\.country_status = countryVal\.status;\s*lowAudienceChannel\.confidence_score = countryVal\.score;\s*\}/,
+  );
+  assert.doesNotMatch(source, /if \(creatorCountry\) lowAudienceChannel\.country = creatorCountry;\s*lowAudienceChannel\.country_status = countryVal\.status;/);
+});
+
 test('handle-shaped and missing counts fail open as unavailable, never as low-audience', () => {
   for (const raw of ['@KelvinVinny', '@DerivativeTradingAcademy', '', undefined]) {
     const gate = evaluateLowAudienceGate(raw);

@@ -26,10 +26,6 @@ DECLARE
   index_valid boolean;
   index_ready boolean;
 BEGIN
-  IF to_regclass('public.channel_sightings') IS NULL THEN
-    RETURN;
-  END IF;
-
   SELECT c.oid, i.indisvalid, i.indisready
     INTO index_oid, index_valid, index_ready
     FROM pg_class c

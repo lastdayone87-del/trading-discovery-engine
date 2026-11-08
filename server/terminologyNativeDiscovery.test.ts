@@ -956,6 +956,43 @@ test('attribution path acquires the advisory lock before its performance insert'
   assert.ok(lockAt >= 0 && perfAt > lockAt, 'performance insert follows the lock');
 });
 
+test('attribution excludes pending classifications from yield and keeps all-pending runs inert', async () => {
+  const run = async (metrics: Record<string, unknown>) => {
+    const statements: Array<{ text: string; params: unknown[] }> = [];
+    const runner = {
+      query: async (text: string, params: unknown[] = []) => {
+        statements.push({ text, params });
+        if (text.includes('pg_advisory_xact_lock')) return { rows: [{ locked: true }] };
+        if (text.startsWith('SELECT id FROM canonical_trading_terms')) return { rows: [{ id: 9 }] };
+        if (text.startsWith('SELECT t.*')) return { rows: [{ lifecycle_status: 'CANDIDATE', search_eligible: false, term_type: 'TERMINOLOGY', distinct_creators: 1, distinct_communities: 1, human_approved: 0, decayed_evidence: 1, executions: 0, decayed_yield: 0, trust_tier: 3 }] };
+        if (text.includes('FROM terminology_observations WHERE canonical_term_id=$1')) return { rows: [{ v1: 0, spam: false, novel: false }] };
+        return { rows: [] };
+      },
+    };
+    await attributeTerminologyPerformance(
+      { generation_metadata: { learnedTerm: 'P2P-Algo' }, country: 'Germany' } as never,
+      metrics as never,
+      100,
+      undefined,
+      undefined,
+      runner as never
+    );
+    return statements.find(statement => statement.text.startsWith('INSERT INTO terminology_performance'))!;
+  };
+
+  const partial = await run({ distinctResults: 10, newChannels: 3, classificationPending: 4, inScopeNewChannels: 2 });
+  assert.equal(partial.params[5], 6, 'pending creators leave the unique-creator denominator');
+  assert.equal(partial.params[6], 0, 'pending creators are not credited as new');
+  assert.equal(partial.params[14], 1, 'evaluated evidence still counts as an execution');
+  assert.equal(partial.params[15], 0, 'new-creator yield only uses evaluated creators');
+
+  const allPending = await run({ distinctResults: 10, newChannels: 3, classificationPending: 10 });
+  assert.equal(allPending.params[5], 0);
+  assert.equal(allPending.params[6], 0);
+  assert.equal(allPending.params[14], 0, 'an all-pending run cannot move the lifecycle');
+  assert.equal(allPending.params[15], 0);
+});
+
 // --- Finding C: deterministic lock-order competition model ---
 //
 // No writable database is available in this environment (no PHASE10_POSTGRES_URL

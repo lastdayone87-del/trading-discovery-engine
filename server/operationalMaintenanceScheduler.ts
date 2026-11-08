@@ -58,6 +58,8 @@ export interface OperationalMaintenanceSchedulerOptions {
   now?: () => number;
   setTimer?: (callback: () => void, delayMs: number) => unknown;
   clearTimer?: (timer: unknown) => void;
+  /** Interval for the delayed classification-sighting sweep. */
+  classificationSightingSweepIntervalMs?: number;
   /** Warn when a single sweep remains in flight longer than this. */
   watchdogMs?: number;
   setWatchdog?: (callback: () => void, delayMs: number) => unknown;
@@ -73,6 +75,7 @@ export function createOperationalMaintenanceScheduler(
   options: OperationalMaintenanceSchedulerOptions = {}
 ): OperationalMaintenanceScheduler {
   const intervalMs = options.intervalMs ?? OPERATIONAL_MAINTENANCE_INTERVAL_MS;
+  const classificationSightingSweepIntervalMs = options.classificationSightingSweepIntervalMs ?? 60_000;
   const now = options.now ?? Date.now;
   const setTimer = options.setTimer ?? ((callback: () => void, delayMs: number) => {
     const timer = setTimeout(callback, delayMs);
@@ -94,6 +97,7 @@ export function createOperationalMaintenanceScheduler(
   let watchdogTimer: unknown = null;
   let runStartedAtMs: number | null = null;
   let lastStaleChannelLockRecoveryMs: number | null = null;
+  let lastClassificationSightingSweepMs: number | null = null;
   let ticks = 0;
   let failures = 0;
   let lastTickAt: string | null = null;
@@ -182,7 +186,16 @@ export function createOperationalMaintenanceScheduler(
     // headroom, so this maintenance sweep cannot exceed the producer
     // watermark even when no explicit limit is supplied.
     await isolate('autonomous_orphan_resume', () => dependencies.resumeOrphanedAutonomousPages());
-    await isolate('classification_sighting_reconciliation', () => dependencies.reconcileStaleClassificationSightings?.());
+    // The delayed-classification sweep is minute-scale, not tick-scale. Use
+    // the scheduler's clock so tests and runtime share one cadence source.
+    if (dependencies.reconcileStaleClassificationSightings
+      && (lastClassificationSightingSweepMs === null
+        || nowMs - lastClassificationSightingSweepMs >= classificationSightingSweepIntervalMs)) {
+      // Stamp before running so a failing sweep backs off instead of retrying
+      // on every maintenance tick.
+      lastClassificationSightingSweepMs = nowMs;
+      await isolate('classification_sighting_reconciliation', () => dependencies.reconcileStaleClassificationSightings!());
+    }
   };
 
   const run = (): Promise<void> => {
@@ -243,9 +256,6 @@ export function createOperationalMaintenanceScheduler(
 }
 
 /** Delayed reconciliation is minute-scale; avoid a full-scan every 10s tick. */
-let lastClassificationSightingSweepAt = 0;
-const CLASSIFICATION_SIGHTING_SWEEP_INTERVAL_MS = 60_000;
-
 function createDefaultDependencies(): OperationalMaintenanceDependencies {
   return {
     recoverStaleChannelLocks: () => recoverStaleChannelLocks(),
@@ -287,12 +297,7 @@ function createDefaultDependencies(): OperationalMaintenanceDependencies {
     ),
     triggerPhaseBObservationReconciliation: () => triggerPhaseBObservationReconciliation(),
     resumeOrphanedAutonomousPages: () => resumeOrphanedAutonomousPages(),
-    reconcileStaleClassificationSightings: () => {
-      const now = Date.now();
-      if (now - lastClassificationSightingSweepAt < CLASSIFICATION_SIGHTING_SWEEP_INTERVAL_MS) return Promise.resolve({ reconciled: 0, orphaned: 0 });
-      lastClassificationSightingSweepAt = now;
-      return reconcileStaleClassificationSightings(200);
-    }
+    reconcileStaleClassificationSightings: () => reconcileStaleClassificationSightings(200)
   };
 }
 

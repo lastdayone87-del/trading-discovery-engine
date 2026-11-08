@@ -45,6 +45,38 @@ test('pending classifications count as persisted new creators but not as evaluat
   assert.equal(metrics.qualityChannels, 1);
 });
 
+test('a page with only pending country outcomes reports neutral precision, not a country miss', () => {
+  const metrics = calculateQueryFunnel(3, [
+    { channelId: 'pending-a', wasKnown: false, persisted: true, funnelOutcome: 'CLASSIFICATION_PENDING', qualityScore: 0, hasCommunity: false },
+    { channelId: 'pending-b', wasKnown: false, persisted: true, funnelOutcome: 'CLASSIFICATION_PENDING', qualityScore: 0, hasCommunity: false },
+    { channelId: 'pending-c', wasKnown: false, persisted: true, funnelOutcome: 'CLASSIFICATION_PENDING', qualityScore: 0, hasCommunity: false },
+  ]);
+  assert.equal(metrics.classificationPending, 3);
+  assert.equal(metrics.countryPrecision, 1, 'nothing was evaluated, so no result is a country miss');
+  // The legacy continuation path also needs the pending count to neutralize
+  // its own precision term; the funnel must not hide it behind a zero.
+  const aggregate = aggregatePageMetrics([metrics]);
+  assert.equal(aggregate.classificationPending, 3);
+  assert.equal(aggregate.countryPrecision, 1);
+});
+
+test('multi-page aggregation carries pending classifications into run-wide precision', () => {
+  const first = calculateQueryFunnel(3, [
+    { channelId: 'pending', wasKnown: false, persisted: true, funnelOutcome: 'CLASSIFICATION_PENDING', qualityScore: 0, hasCommunity: false },
+    { channelId: 'confirmed', wasKnown: false, persisted: true, funnelOutcome: 'TRADING_CONFIRMED', qualityScore: 80, hasCommunity: false },
+    { channelId: 'wrong-country', wasKnown: false, persisted: false, funnelOutcome: 'COUNTRY_REJECTED', qualityScore: 0, hasCommunity: false },
+  ]);
+  const second = calculateQueryFunnel(1, [
+    { channelId: 'pending-2', wasKnown: false, persisted: true, funnelOutcome: 'CLASSIFICATION_PENDING', qualityScore: 0, hasCommunity: false },
+  ]);
+  const aggregate = aggregatePageMetrics([first, second]);
+  assert.equal(aggregate.distinctResults, 4);
+  assert.equal(aggregate.classificationPending, 2, 'pending counts survive aggregation');
+  // Two country verdicts were evaluated and one was rejected: 1/2. Counting
+  // the two pending creators in the denominator would report 3/4 instead.
+  assert.equal(aggregate.countryPrecision, 0.5);
+});
+
 test('fresh confirmed is the exact creator intersection, not min(confirmed,new)', () => {
   const observations: QueryObservation[] = [
     ...Array.from({ length: 5 }, (_, index) => ({

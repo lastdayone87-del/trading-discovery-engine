@@ -4849,8 +4849,8 @@ export async function completeQueryRun(runId: string, metrics: {
         communitiesDiscovered: metrics.communitiesDiscovered, averageQualityScore: metrics.averageQualityScore || 0,
         noveltyRatio: metrics.distinctResults ? metrics.newChannels / metrics.distinctResults : 0,
         countryPrecision: (() => {
-          const evaluatedCountry = metrics.distinctResults - (metrics.classificationPending || 0);
-          return evaluatedCountry ? (evaluatedCountry - metrics.countryRejected) / evaluatedCountry : 0;
+          const evaluatedCountry = Math.max(0, metrics.distinctResults - (metrics.classificationPending || 0));
+          return evaluatedCountry ? (evaluatedCountry - metrics.countryRejected) / evaluatedCountry : 1;
         })(),
         tradingPrecision: (metrics.nonTrading + metrics.uncertain + metrics.needsReview + metrics.tradingConfirmed) ? metrics.tradingConfirmed / (metrics.nonTrading + metrics.uncertain + metrics.needsReview + metrics.tradingConfirmed) : 0,
         performanceScore: metrics.performanceScore || 0,

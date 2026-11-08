@@ -16,7 +16,8 @@ const ALL_TASKS = [
   'projection',
   'enrichment',
   'phaseb',
-  'resume'
+  'resume',
+  'classification'
 ];
 
 function createDeps(failAt?: string) {
@@ -34,7 +35,8 @@ function createDeps(failAt?: string) {
     projectProviderDeferredEnrichment: make('projection'),
     reconcileOperationalEnrichmentRecovery: make('enrichment'),
     triggerPhaseBObservationReconciliation: make('phaseb'),
-    resumeOrphanedAutonomousPages: make('resume')
+    resumeOrphanedAutonomousPages: make('resume'),
+    reconcileStaleClassificationSightings: make('classification')
   };
   return { calls, dependencies };
 }
@@ -57,6 +59,27 @@ test('one maintenance run executes every recovery task in order', async () => {
   assert.equal(snapshot.stalled, false);
   assert.equal(snapshot.runStartedAt, null);
   assert.equal(snapshot.lastStallAt, null);
+});
+
+test('classification sighting sweep is throttled by the scheduler clock', async () => {
+  const { calls, dependencies } = createDeps();
+  let clock = 1_000_000;
+  const scheduler = createOperationalMaintenanceScheduler(dependencies, {
+    now: () => clock,
+    classificationSightingSweepIntervalMs: 60_000
+  });
+  const classificationCalls = () => calls.filter(call => call === 'classification').length;
+
+  await scheduler.run();
+  assert.equal(classificationCalls(), 1, 'the first tick runs the sweep');
+
+  clock += 30_000;
+  await scheduler.run();
+  assert.equal(classificationCalls(), 1, 'a tick inside the interval does not rescan');
+
+  clock += 30_000;
+  await scheduler.run();
+  assert.equal(classificationCalls(), 2, 'the sweep runs once the interval elapses');
 });
 
 test('one failing task does not suppress the remaining recovery guarantees', async () => {
