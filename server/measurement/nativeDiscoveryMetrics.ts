@@ -186,6 +186,29 @@ function validateLabelIdentity(labels: NativeDiscoveryLabel[]): void {
   }
 }
 
+/** Validate a provider-yield JSON export before it can influence a report. */
+export function parseProviderYieldInputs(raw: unknown): ProviderYieldInput[] {
+  if (!Array.isArray(raw)) throw new Error('NATIVE_DISCOVERY_PROVIDER_YIELD_NOT_ARRAY');
+  return raw.map((row, index) => {
+    const record = row && typeof row === 'object' ? row as Record<string, unknown> : null;
+    const provider = typeof record?.provider === 'string' ? record.provider.trim() : '';
+    const requests = record?.requests;
+    const newConfirmedCreators = record?.newConfirmedCreators;
+    if (
+      !provider
+      || typeof requests !== 'number'
+      || !Number.isSafeInteger(requests)
+      || requests < 0
+      || typeof newConfirmedCreators !== 'number'
+      || !Number.isSafeInteger(newConfirmedCreators)
+      || newConfirmedCreators < 0
+    ) {
+      throw new Error(`NATIVE_DISCOVERY_PROVIDER_YIELD_MALFORMED:${index + 1}`);
+    }
+    return { provider, requests, newConfirmedCreators };
+  });
+}
+
 export function evaluateNativeDiscovery(args: {
   labels: NativeDiscoveryLabel[];
   providerYield?: ProviderYieldInput[];
@@ -242,18 +265,21 @@ function parseBoolean(value: string | undefined): boolean | null {
  * malformed are skipped and counted instead of silently disappearing.
  */
 export function parseNativeDiscoveryCsv(csv: string): NativeDiscoveryCsvParseResult {
-  const lines = String(csv || '').split(/\r?\n/).map(line => line.trim()).filter(line => line && !line.startsWith('#'));
+  const lines = String(csv || '')
+    .split(/\r?\n/)
+    .map((line, index) => ({ line: line.trim(), lineNumber: index + 1 }))
+    .filter(entry => entry.line && !entry.line.startsWith('#'));
   if (!lines.length) return { labels: [], skippedRows: 0 };
-  if (lines[0].includes('"')) throw new Error('NATIVE_DISCOVERY_CSV_QUOTED_ROW:1');
-  const header = lines[0].split(',').map(value => value.trim().toLocaleLowerCase('en'));
+  if (lines[0].line.includes('"')) throw new Error(`NATIVE_DISCOVERY_CSV_QUOTED_ROW:${lines[0].lineNumber}`);
+  const header = lines[0].line.split(',').map(value => value.trim().toLocaleLowerCase('en'));
   const index = (name: string) => header.indexOf(name);
   const required = ['channel_id', 'country', 'language', 'trading_relevant', 'discovered'];
   for (const name of required) if (index(name) < 0) throw new Error(`NATIVE_DISCOVERY_CSV_MISSING_COLUMN:${name}`);
   const rows: NativeDiscoveryLabel[] = [];
   const channelIds = new Set<string>();
   let skippedRows = 0;
-  for (const [offset, line] of lines.slice(1).entries()) {
-    const rowNumber = offset + 2;
+  for (const { line, lineNumber } of lines.slice(1)) {
+    const rowNumber = lineNumber;
     if (line.includes('"')) throw new Error(`NATIVE_DISCOVERY_CSV_QUOTED_ROW:${rowNumber}`);
     const cells = line.split(',').map(value => value.trim());
     if (cells.length !== header.length) throw new Error(`NATIVE_DISCOVERY_CSV_COLUMN_COUNT:${rowNumber}`);

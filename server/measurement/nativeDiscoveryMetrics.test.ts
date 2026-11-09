@@ -4,6 +4,7 @@ import {
   evaluateNativeDiscovery,
   evaluateProviderYield,
   parseNativeDiscoveryCsv,
+  parseProviderYieldInputs,
   proportion,
   wilsonInterval,
   type NativeDiscoveryLabel,
@@ -127,6 +128,32 @@ test('the evaluator rejects duplicate or conflicting creator identities', () => 
   assert.throws(
     () => evaluateNativeDiscovery({ labels: [label({ channelId: '  ' })] }),
     /NATIVE_DISCOVERY_EMPTY_CHANNEL/,
+  );
+});
+
+test('provider-yield JSON input requires non-negative safe integers', () => {
+  assert.deepEqual(
+    parseProviderYieldInputs([{ provider: 'youtube', requests: 10, newConfirmedCreators: 2 }]),
+    [{ provider: 'youtube', requests: 10, newConfirmedCreators: 2 }],
+  );
+  for (const invalid of [
+    { provider: 'youtube', requests: null, newConfirmedCreators: 2 },
+    { provider: 'youtube', requests: true, newConfirmedCreators: 2 },
+    { provider: 'youtube', requests: '10', newConfirmedCreators: 2 },
+    { provider: 'youtube', requests: 1.5, newConfirmedCreators: 2 },
+    { provider: 'youtube', requests: 10, newConfirmedCreators: -1 },
+    { provider: '', requests: 10, newConfirmedCreators: 2 },
+  ]) {
+    assert.throws(() => parseProviderYieldInputs([invalid]), /NATIVE_DISCOVERY_PROVIDER_YIELD_MALFORMED:1/);
+  }
+  assert.throws(() => parseProviderYieldInputs({}), /NATIVE_DISCOVERY_PROVIDER_YIELD_NOT_ARRAY/);
+});
+
+test('CSV row numbers count physical lines, not filtered entries', () => {
+  const header = 'channel_id,country,language,trading_relevant,discovered';
+  assert.throws(
+    () => parseNativeDiscoveryCsv(`${header}\n\n# comment\nc1,France,fr,true`),
+    /NATIVE_DISCOVERY_CSV_COLUMN_COUNT:4/,
   );
 });
 

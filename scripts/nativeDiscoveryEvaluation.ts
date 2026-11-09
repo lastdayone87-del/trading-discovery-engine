@@ -18,6 +18,7 @@ import { readFileSync } from 'node:fs';
 import {
   evaluateNativeDiscovery,
   parseNativeDiscoveryCsv,
+  parseProviderYieldInputs,
   type ProviderYieldInput,
 } from '../server/measurement/nativeDiscoveryMetrics';
 
@@ -30,17 +31,7 @@ const parsed = parseNativeDiscoveryCsv(readFileSync(path, 'utf8'));
 const providerPath = process.argv[3];
 let providerYield: ProviderYieldInput[] | undefined;
 if (providerPath) {
-  const raw = JSON.parse(readFileSync(providerPath, 'utf8'));
-  if (!Array.isArray(raw)) throw new Error('NATIVE_DISCOVERY_PROVIDER_YIELD_NOT_ARRAY');
-  providerYield = raw.map((row: Record<string, unknown>, index: number) => {
-    const provider = typeof row?.provider === 'string' ? row.provider.trim() : '';
-    const requests = Number(row?.requests);
-    const newConfirmedCreators = Number(row?.newConfirmedCreators);
-    if (!provider || !Number.isFinite(requests) || requests < 0 || !Number.isFinite(newConfirmedCreators) || newConfirmedCreators < 0) {
-      throw new Error(`NATIVE_DISCOVERY_PROVIDER_YIELD_MALFORMED:${index + 1}`);
-    }
-    return { provider, requests, newConfirmedCreators };
-  });
+  providerYield = parseProviderYieldInputs(JSON.parse(readFileSync(providerPath, 'utf8')));
 }
 const report = evaluateNativeDiscovery({ labels: parsed.labels, providerYield });
 const pct = (value: number | null) => value === null ? 'n/a' : `${(value * 100).toFixed(1)}%`;
