@@ -30,7 +30,7 @@ import { LANGUAGE_KNOWLEDGE_PACKS } from './evidenceEngine/knowledgePacks';
 import { observeProductionDiagnosticReliably, observeRetrievalAssignmentReliably } from './phaseBObservationOutbox';
 import { buildDecisionEvaluationSamplingPolicy } from './decisionEvaluationSamplingPolicy';
 import { ACTIONS, deriveVitalityScheduling, planAndRecordEvidenceAction, type EvidenceActionType, type EvidenceActionPlan } from './voiEvidenceController';
-import { INVESTIGATION_POLICY_VERSION, scheduleInvestigationStep } from './investigationWorkflow';
+import { INVESTIGATION_POLICY_VERSION, retryInvestigationStep, scheduleInvestigationStep } from './investigationWorkflow';
 import {assignRelease5Serving} from './release5/rollout';
 import { deterministicUuid, entityChecksum, observeYouTubeChannelEntity, sourceFamilyIdentity } from './entityResolution';
 import { enrichmentOperationalFailure, hasDecisionGradeEvidenceWithoutFailedProviders, manualRecheckDegradedError } from './enrichmentOperationalFailure';
@@ -986,7 +986,7 @@ async function processChannelThroughPipelineInContext(
       // recheck key and are never blocked by an earlier completed pass.
       const explicitRecheck=isManualScan||source==='recheck';
       const enrichmentKey=enrichmentJobIdempotencyKey(candidate.channelId,nextStage,Date.now(),{explicitRecheck});
-      const enqueueEnrichment=()=>enqueueJob('ENRICH_CHANNEL',payload,{priority,maxAttempts:4,idempotencyKey:enrichmentKey,...(explicitRecheck?{}:{preventCompletedReopen:true})});
+      const enqueueEnrichment=(extra?:Record<string,unknown>)=>enqueueJob('ENRICH_CHANNEL',extra?{...payload,...extra}:payload,{priority,maxAttempts:4,idempotencyKey:enrichmentKey,...(explicitRecheck?{}:{preventCompletedReopen:true})});
       const workflowAssignment=await assignRelease5Serving('INVESTIGATION_WORKFLOW',candidate.channelId).catch(()=>({assigned:false,mode:'OFF'})),legacyWorkflowEnabled=await getAppSetting('investigation_workflow_enabled','false')==='true';
       let enqueued: Awaited<ReturnType<typeof enqueueJob>> | undefined;
       if(workflowAssignment.assigned||legacyWorkflowEnabled){
@@ -1002,7 +1002,20 @@ async function processChannelThroughPipelineInContext(
         const admission=resolveExistingEnrichmentAction(explicitRecheck?null:existing?.status,lookupFailed);
         if(admission==='REUSE_ACTIVE'&&existing)enqueued=existing;
         else if(admission==='PROJECT_TERMINAL'&&existing)enqueued={...existing,reopen_blocked:true};
-        else if(admission==='RETRY_FAILED')enqueued=await enqueueEnrichment();
+        else if(admission==='RETRY_FAILED'){
+          // Reopening a failed workflow job must restore its step first, or
+          // the worker would skip investigation tracking and leave stale
+          // failure history behind a successful retry. If the step cannot be
+          // restored, run the retry without workflow linkage rather than
+          // blocking recovery.
+          let retryLinkage:Record<string,unknown>|undefined;
+          const retryInvestigationId=String(existing?.payload?.investigationId||''),retryStepId=String(existing?.payload?.investigationStepId||'');
+          if(retryInvestigationId&&retryStepId){
+            try{if(await retryInvestigationStep({investigationId:retryInvestigationId,stepId:retryStepId}))retryLinkage={investigationId:retryInvestigationId,investigationStepId:retryStepId};}
+            catch(error){console.warn(`[Investigation] Failed to reopen step for ${candidate.channelId}; retrying without workflow linkage:`,error instanceof Error?error.message:error);}
+          }
+          enqueued=await enqueueEnrichment(retryLinkage);
+        }
         else{
           try{await scheduleInvestigationStep({investigationId:candidate.investigationId,channelId:candidate.channelId,diagnosticId:classificationDiagnosticId,actionType:appliedAction,jobType:'ENRICH_CHANNEL',jobPayload:payload,priority,maxAttempts:4,idempotencyKey:enrichmentKey,policyVersion:INVESTIGATION_POLICY_VERSION,utilityContractVersion:'utility-constraints-v1',deadlineMinutes:Number(await getAppSetting('investigation_deadline_minutes','30'))||30});}
           catch(error){if(candidate.investigationId)throw error;console.error(`[Investigation] Initial transactional scheduling failed for ${candidate.channelId}; using compatible queue fallback.`,error);enqueued=await enqueueEnrichment();}
@@ -1012,13 +1025,15 @@ async function processChannelThroughPipelineInContext(
         // The stable same-stage pass is already terminal. Project the honest
         // terminal state, but update only the committed row's scan status so
         // a concurrent recovery/recheck cannot be overwritten by this stale
-        // snapshot. A later-stage job still owns the channel; on lookup error
-        // preserve the pending marker rather than clobbering live work.
-        let hasOtherActiveEnrichmentJob=true;
+        // snapshot. A later-stage job still owns the channel. If the check
+        // itself fails, project the blocked owner's honest terminal state:
+        // leaving ENRICHMENT_PENDING with no runnable job is worse, and an
+        // active worker will reassert its own marker when it finishes.
+        let hasOtherActiveEnrichmentJob=false;
         try{
           const active=await (await getDb()).query(`SELECT 1 FROM jobs WHERE type='ENRICH_CHANNEL' AND status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$1 AND ($2::uuid IS NULL OR id<>$2::uuid) LIMIT 1`,[candidate.channelId,options?.jobId||null]);
           hasOtherActiveEnrichmentJob=Boolean(active.rowCount);
-        }catch(error){console.warn(`[Enrichment] active-job check failed for ${candidate.channelId}; preserving the pending marker:`,error instanceof Error?error.message:error);}
+        }catch(error){console.warn(`[Enrichment] active-job check failed for ${candidate.channelId}; projecting the blocked owner terminal:`,error instanceof Error?error.message:error);}
         // A blocked FAILED job is FAILED, never COMPLETED.
         const blocked=resolveEnrichmentReopenBlockedLifecycle(authoritativeChannel,{blockedJobStatus:enqueued.status,hasOtherActiveEnrichmentJob});
         if(blocked.scanStatus!==authoritativeChannel.scan_status){

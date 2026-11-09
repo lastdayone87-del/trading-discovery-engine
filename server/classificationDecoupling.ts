@@ -157,9 +157,9 @@ export function classificationDayBucket(now: number = Date.now()): string {
 
 /**
  * Ordinary enrichment identity is stable per channel and stage. Rediscovery
- * can never create a second active job or reopen a completed pass; a new
- * stage (or an explicit operator recheck) is the only way to request more
- * work. Ordinary discovery pairs this key with preventCompletedReopen.
+ * cannot create a second job for the same stage or reopen a completed pass;
+ * later stages and explicit operator rechecks use distinct keys. Ordinary
+ * discovery pairs this key with preventCompletedReopen.
  */
 export function enrichmentJobIdempotencyKey(
   channelId: string,
