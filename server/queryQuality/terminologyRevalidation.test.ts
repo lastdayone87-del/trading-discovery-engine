@@ -33,6 +33,7 @@ test('digesting stale terminology keeps the genuine query metadata auditable', (
   assert.equal('terminologyId' in digested, false);
   assert.equal('terminologyLifecycle' in digested, false);
   assert.equal('terminologyDecayedYield' in digested, false);
+  assert.equal('learnedTerm' in digested, false);
   assert.deepEqual(digested.terminologyRevalidation, {
     disposition: 'DIGESTED',
     previousTermId: 153,
