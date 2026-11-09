@@ -1,5 +1,6 @@
 import * as cheerio from 'cheerio';
 import { decodeEmbeddedMarkup, detachPageSlice, extractDynamicTargetValues, extractEmbeddedUrls, extractYouTubeVideoIds } from './crawlerExtraction';
+import { staticControlTargetsFromDocument } from './staticControlTargets';
 import { InspectionStep } from '../src/types';
 import type { CommunityIntentEvidence } from '../src/types';
 import { extractCommunityIntentEvidence } from './communityIntent';
@@ -643,7 +644,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     // or fetching on any path. No observation is recorded for them, so they
     // can never own retry work either.
     const admission=assessCrawlAdmission(url);if(!admission.eligible){logDetails.push(`Admission rejected (${admission.reasonCode}): ${url}; not crawled.`);continue;}
-    scannedCount++;logDetails.push(`[Link #${scannedCount}] Inspecting target: ${url}`);const beforeSeed=discovered.length;
+    scannedCount++;logDetails.push(`[Link #${scannedCount}] Inspecting target: ${url}`);const beforeSeed=discovered.length;let seedFound=false;
     // Per-URL failure isolation: any unexpected throw for one candidate must
     // never terminate acquisition for the remaining candidates (recall-safe
     // continuation; PR #434 items 1-2).
@@ -651,7 +652,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     const seedLocators=extractDiscordCandidates(url,surface,url);const direct=seedLocators.filter(candidate=>candidate.nativeInviteCode);const wrapperCandidate=seedLocators.find(candidate=>candidate.locatorType==='ALTERNATIVE_REDIRECT'||candidate.locatorType==='DIRECTORY_PAGE');
     discovered.push(...direct);
     if(debugLog)debugLog.discordRegexAttempts.push({source:'crawlExternalLinks_direct',url,result:direct.map(c=>c.nativeInviteCode)});
-    if(direct.length){observations.push({requestedUrl:url,finalUrl:url,wrapperUrl,surface,required,rootUrl:url,outcome:'FOUND',retryable:false,detail:`${direct.length} direct Discord candidate(s) in URL`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed:0,pagesInspected:0})});continue;}
+    if(direct.length){seedFound=true;observations.push({requestedUrl:url,finalUrl:url,wrapperUrl,surface,required,rootUrl:url,outcome:'FOUND',retryable:false,detail:`${direct.length} direct Discord candidate(s) in URL`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed:0,pagesInspected:0})});continue;}
 
     let pagesInspected=0,redirectsFollowed=0,seedCeiling:CeilingKind|undefined;
     // First ceiling wins: the first cap encountered is what first cut
@@ -754,7 +755,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     const inspectPage=(current:{html:string;finalUrl:string},depth:number,truncated=false):Array<{url:string;score:number}>=>{
       pagesInspected++;logDetails.push(`Successfully loaded ${current.finalUrl} (${current.html.length} bytes, depth ${depth})`);
       const pageCandidates=extractDiscordCandidates(`${current.finalUrl}\n${current.html}`,surface,current.finalUrl).filter(candidate=>candidate.nativeInviteCode);
-      discovered.push(...pageCandidates);
+      if(pageCandidates.length)seedFound=true;discovered.push(...pageCandidates);
       // P4: platform-community evidence on every inspected page (best-effort:
       // evidence extraction never breaks crawling or invite discovery). A
       // confirmed paywall on a child platform page is paid intent too; a
@@ -767,14 +768,29 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       // just the response URL, so a page served at /guide with
       // <base href="/community/"> and <a href="join"> visits /community/join.
       const documentBase=resolveDocumentBaseUrlFromRoot($,current.finalUrl);
-      $('a[href]').each((_,el)=>{const href=($(el).attr('href')||'').trim(),label=$(el).text().trim();if(!href)return;let absolute:URL|null=null;try{absolute=new URL(href,documentBase);}catch{/* keep the raw href for candidate extraction and reject below */}const anchorCandidates=extractDiscordCandidates(`${absolute?absolute.toString():href} ${label}`,surface,current.finalUrl).filter(candidate=>candidate.nativeInviteCode);if(anchorCandidates.length){for(const candidate of anchorCandidates){candidate.observations=(candidate.observations||[]).map(obs=>({...obs,sourceAnchorText:label,sourcePageDepth:depth}));discovered.push(candidate);}return;}if(!absolute){drops.countUnique('invalid-protocol',href);return;}absolute.hash='';if(!['http:','https:'].includes(absolute.protocol)){drops.countUnique('invalid-protocol',href);return;}const decision=shouldFollowDestination({url:absolute.toString(),currentUrl:current.finalUrl,anchorText:label,baseScore:communityNavigationScore(absolute.pathname+absolute.search,label)});if(!decision.eligible){drops.countUnique(decision.reason==='admission-rejected'?'admission-rejected':'cross-origin-disallowed',absolute.toString());return;}navigation.push({url:absolute.toString(),score:decision.score,from:current.finalUrl});});
+      $('a[href]').each((_,el)=>{const href=($(el).attr('href')||'').trim(),label=$(el).text().trim();if(!href)return;let absolute:URL|null=null;try{absolute=new URL(href,documentBase);}catch{/* keep the raw href for candidate extraction and reject below */}const anchorCandidates=extractDiscordCandidates(`${absolute?absolute.toString():href} ${label}`,surface,current.finalUrl).filter(candidate=>candidate.nativeInviteCode);if(anchorCandidates.length){seedFound=true;for(const candidate of anchorCandidates){candidate.observations=(candidate.observations||[]).map(obs=>({...obs,sourceAnchorText:label,sourcePageDepth:depth}));discovered.push(candidate);}return;}if(!absolute){drops.countUnique('invalid-protocol',href);return;}absolute.hash='';if(!['http:','https:'].includes(absolute.protocol)){drops.countUnique('invalid-protocol',href);return;}const decision=shouldFollowDestination({url:absolute.toString(),currentUrl:current.finalUrl,anchorText:label,baseScore:communityNavigationScore(absolute.pathname+absolute.search,label)});if(!decision.eligible){drops.countUnique(decision.reason==='admission-rejected'?'admission-rejected':'cross-origin-disallowed',absolute.toString());return;}navigation.push({url:absolute.toString(),score:decision.score,from:current.finalUrl});});
       // The dynamic-target scanner also matches href values inside <base>
       // elements. Those values are resolution rules, not navigation targets;
       // remove exact base start tags with a single linear pass. This cannot
       // over-match <base-button>, drop a real button that shares the base
       // value, or rescan malformed unclosed markup.
       const dynamicHtml=stripBaseElements(current.html);
-      for(const rawTarget of extractDynamicTargetValues(dynamicHtml)){const target=rawTarget.trim();if(!target)continue;let absolute:URL|null=null;try{absolute=new URL(target,documentBase);}catch{/* keep the raw target for candidate extraction and reject below */}const targetCandidates=extractDiscordCandidates(absolute?absolute.toString():target,surface,current.finalUrl).filter(candidate=>candidate.nativeInviteCode);if(targetCandidates.length){discovered.push(...targetCandidates);continue;}if(!absolute){drops.countUnique('invalid-protocol',target);continue;}absolute.hash='';if(!['http:','https:'].includes(absolute.protocol)){drops.countUnique('invalid-protocol',target);continue;}const decision=shouldFollowDestination({url:absolute.toString(),currentUrl:current.finalUrl,anchorText:target,baseScore:communityNavigationScore(absolute.pathname+absolute.search,target)});if(!decision.eligible){drops.countUnique(decision.reason==='admission-rejected'?'admission-rejected':'cross-origin-disallowed',absolute.toString());continue;}navigation.push({url:absolute.toString(),score:decision.score,from:current.finalUrl});}
+      const dynamicTargetValues=extractDynamicTargetValues(dynamicHtml);
+      for(const rawTarget of dynamicTargetValues){const target=rawTarget.trim();if(!target)continue;let absolute:URL|null=null;try{absolute=new URL(target,documentBase);}catch{/* keep the raw target for candidate extraction and reject below */}const targetCandidates=extractDiscordCandidates(absolute?absolute.toString():target,surface,current.finalUrl).filter(candidate=>candidate.nativeInviteCode);if(targetCandidates.length){seedFound=true;discovered.push(...targetCandidates);continue;}if(!absolute){drops.countUnique('invalid-protocol',target);continue;}absolute.hash='';if(!['http:','https:'].includes(absolute.protocol)){drops.countUnique('invalid-protocol',target);continue;}const decision=shouldFollowDestination({url:absolute.toString(),currentUrl:current.finalUrl,anchorText:target,baseScore:communityNavigationScore(absolute.pathname+absolute.search,target)});if(!decision.eligible){drops.countUnique(decision.reason==='admission-rejected'?'admission-rejected':'cross-origin-disallowed',absolute.toString());continue;}navigation.push({url:absolute.toString(),score:decision.score,from:current.finalUrl});}
+      // M2a: static non-semantic controls. Only the closed literal allowlist
+      // (meta refresh, formaction, strict location/open onclick) is eligible;
+      // the extracted URL still passes the same admission, destination,
+      // ranking, and queue budgets as an anchor. No JS is evaluated.
+      // The pre-existing dynamic-attribute scanner already yields some
+      // href/url spellings (notably location.href and meta url=). Exclude
+      // those from the new block so they cannot consume its cap or double-
+      // count duplicate/candidate accounting.
+      const dynamicTargets=new Set<string>();
+      for(const rawTarget of dynamicTargetValues){const target=rawTarget.trim();if(!target)continue;try{dynamicTargets.add(new URL(target,documentBase).toString());}catch{/* raw target was already rejected above */}}
+      const staticControls=staticControlTargetsFromDocument($,undefined,documentBase,dynamicTargets);
+      if(staticControls.truncated>0){seedCeiling??='control-slice';drops.count('control-slice',staticControls.truncated);}
+      if(staticControls.targets.length)logDetails.push(`[Static controls] ${staticControls.targets.length} approved literal control target(s) considered${staticControls.truncated?` (${staticControls.truncated} cut by the deterministic cap)`:''}.`);
+      for(const control of staticControls.targets){let absolute:URL|null=null;try{absolute=new URL(control.url,documentBase);}catch{/* keep the raw target for candidate extraction and reject below */}const targetCandidates=extractDiscordCandidates(`${absolute?absolute.toString():control.url} ${control.label}`,surface,current.finalUrl).filter(candidate=>candidate.nativeInviteCode);if(targetCandidates.length){seedFound=true;for(const candidate of targetCandidates){candidate.observations=(candidate.observations||[]).map(obs=>({...obs,sourceAnchorText:control.label,sourcePageDepth:depth}));const existing=discovered.find(item=>item.candidateId===candidate.candidateId);if(existing){const merged=new Map([...(existing.observations||[]),...(candidate.observations||[])].map(obs=>[JSON.stringify([obs.sourceSurface,obs.sourceUrl||'',obs.rawLocator,obs.sourcePageUrl||'',obs.sourceAnchorText||'']),obs]));existing.observations=Array.from(merged.values());}else discovered.push(candidate);}continue;}if(!absolute){drops.countUnique('invalid-protocol',control.url);continue;}absolute.hash='';if(!['http:','https:'].includes(absolute.protocol)){drops.countUnique('invalid-protocol',control.url);continue;}const decision=shouldFollowDestination({url:absolute.toString(),currentUrl:current.finalUrl,anchorText:control.label,baseScore:communityNavigationScore(absolute.pathname+absolute.search,control.label)});if(!decision.eligible){drops.countUnique(decision.reason==='admission-rejected'?'admission-rejected':'cross-origin-disallowed',absolute.toString());continue;}navigation.push({url:absolute.toString(),score:decision.score,from:current.finalUrl});}
       // P-B ladder structured step (flag-gated): sameAs/canonical inventory
       // joins navigation under identical scoring, cross-origin, and budget
       // rules. Flag off skips this block entirely (legacy navigation only).
@@ -854,7 +870,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     }if(next.depth>=2){const seenChildren=new Set<string>();const unvisitedChildren=children.filter(child=>{if(seenChildren.has(child.url))return false;seenChildren.add(child.url);return !visited.has(child.url)&&!sharedVisited.has(sharedKey(child.url)??'');});if(unvisitedChildren.length>0){seedCeiling??='depth-limit';drops.count('depth-limit',unvisitedChildren.length);}}else{const bestChild=new Map<string,{url:string;score:number;from?:string}>();for(const child of children){const prior=bestChild.get(child.url);if(!prior||child.score>prior.score)bestChild.set(child.url,child);}const duplicateChildren=Math.max(0,children.length-bestChild.size);if(duplicateChildren>0)drops.count('duplicate',duplicateChildren);for(const child of [...bestChild.values()])if((!visited.has(child.url)&&!sharedVisited.has(sharedKey(child.url)??'')))queue.push({...child,depth:next.depth+1});}}
     if(queue.some(item=>!visited.has(item.url)))seedCeiling??='exploration-limit';const leftoverUnvisited=queue.filter(item=>!visited.has(item.url)).length;if(leftoverUnvisited>0)drops.count('exploration-limit',leftoverUnvisited);
     if(wrapperCandidate){const nativeForSeed=discovered.slice(beforeSeed).filter(candidate=>candidate.nativeInviteCode);if(nativeForSeed.length){discovered.splice(beforeSeed,discovered.length-beforeSeed,...preserveResolvedWrapperProvenance(wrapperCandidate,nativeForSeed));}}
-    const foundForSeed=discovered.length>beforeSeed;
+    const foundForSeed=seedFound||discovered.length>beforeSeed;
     // Confirmed login-wall terminal (resolved-flag gated, fail-open):
     // redirect-to-login + content markers from already-fetched root html,
     // never on FOUND rows, never URL-only, never shared as final across URLs
@@ -895,7 +911,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     // browser escalation still only per existing policy (no silent expensive
     // acquisition).
     const partialFlag = r6Options?.partialStaticRetry ?? true;
-    const staticCeilingKinds = new Set(['queue-cap', 'depth-limit', 'exploration-limit', 'response-cap', 'frontier-yield']);
+    const staticCeilingKinds = new Set(['queue-cap', 'depth-limit', 'exploration-limit', 'response-cap', 'control-slice', 'frontier-yield']);
     const staticGapRetryable = partialFlag && !foundForSeed && !confirmedBarrier && !!seedCeiling && staticCeilingKinds.has(String(seedCeiling));
     const seedOutcome:ExternalAcquisitionStatus=foundForSeed?'FOUND':(seedCeiling||confirmedBarrier)?'PARTIALLY_INSPECTED':'INSPECTED_NO_MATCH';const sharedRootAttribution=sharedRoot?`Shared static root evidence from ${sharedRoot.bySeed}; `:'';observations.push({requestedUrl:url,finalUrl:page.finalUrl,wrapperUrl,surface,required,rootUrl:url,outcome:seedOutcome,retryable:confirmedBarrier?false:(staticGapRetryable?true:false),httpStatus:200,failureClass:confirmedBarrier?barrierClass:(staticGapRetryable?STATIC_BUDGET_GAP_FAILURE_CLASS:''),detail:`${sharedRootAttribution}${foundForSeed?`Discord candidate(s) retained while inspecting root plus ${explored} prioritized page(s)`:confirmedLogin?`Login wall confirmed at ${page.finalUrl}; absence is not confirmed, no further identical retry`:confirmedPaywall?`Paywall confirmed at ${page.finalUrl}; absence is not confirmed, no further identical retry`:seedCeiling?`Root plus ${explored} prioritized page(s) inspected without a Discord invite; crawl budget exhausted before full coverage${truncatedResponse?'; response truncated at the bounded-response cap before full coverage':''}`:`Root page plus ${explored} prioritized same-origin community/navigation page(s) inspected without a Discord invite`}`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,ceiling:seedCeiling,dropReasons:drops.snapshot(),...(seedExperimentAttribution?{experimentAttribution:{...seedExperimentAttribution,...(seedCeiling==='frontier-yield'?{stoppingReason:'frontier-yield-stop'}:{})}}:{})}),...(sharedRoot?{sharedEvidenceFrom:sharedRoot.bySeed}:{})});
     if(frontierOn){
