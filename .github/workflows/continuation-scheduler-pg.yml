@@ -4,9 +4,11 @@ on:
   pull_request:
     paths:
       - 'server/db/migrations/**'
+      - 'server/db.ts'
       - 'server/dbCore.ts'
       - 'server/queryIntelligence.ts'
       - 'server/queryRunJobLifecycle.ts'
+      - 'server/queryRunJobLifecycle.test.ts'
       - 'server/queryQuality/lifecycle.ts'
       - 'server/queryRunLifecycle.postgres.test.ts'
       - 'server/continuationSegment.postgres.test.ts'
@@ -56,6 +58,7 @@ jobs:
       - name: Continuation segment, selector and lifecycle PostgreSQL regressions
         run: >-
           node --import tsx --test
+          server/queryRunJobLifecycle.test.ts
           server/queryRunLifecycle.postgres.test.ts
           server/continuationSegment.postgres.test.ts
           server/activeQueryRunIds.postgres.test.ts
