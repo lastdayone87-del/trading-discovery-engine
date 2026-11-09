@@ -1,5 +1,6 @@
 import * as cheerio from 'cheerio';
 import { decodeEmbeddedMarkup, detachPageSlice, extractDynamicTargetValues, extractEmbeddedUrls, extractYouTubeVideoIds } from './crawlerExtraction';
+import { staticControlTargetsFromDocument } from './staticControlTargets';
 import { InspectionStep } from '../src/types';
 import type { CommunityIntentEvidence } from '../src/types';
 import { extractCommunityIntentEvidence } from './communityIntent';
@@ -775,6 +776,14 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       // value, or rescan malformed unclosed markup.
       const dynamicHtml=stripBaseElements(current.html);
       for(const rawTarget of extractDynamicTargetValues(dynamicHtml)){const target=rawTarget.trim();if(!target)continue;let absolute:URL|null=null;try{absolute=new URL(target,documentBase);}catch{/* keep the raw target for candidate extraction and reject below */}const targetCandidates=extractDiscordCandidates(absolute?absolute.toString():target,surface,current.finalUrl).filter(candidate=>candidate.nativeInviteCode);if(targetCandidates.length){discovered.push(...targetCandidates);continue;}if(!absolute){drops.countUnique('invalid-protocol',target);continue;}absolute.hash='';if(!['http:','https:'].includes(absolute.protocol)){drops.countUnique('invalid-protocol',target);continue;}const decision=shouldFollowDestination({url:absolute.toString(),currentUrl:current.finalUrl,anchorText:target,baseScore:communityNavigationScore(absolute.pathname+absolute.search,target)});if(!decision.eligible){drops.countUnique(decision.reason==='admission-rejected'?'admission-rejected':'cross-origin-disallowed',absolute.toString());continue;}navigation.push({url:absolute.toString(),score:decision.score,from:current.finalUrl});}
+      // M2a: static non-semantic controls. Only the closed literal allowlist
+      // (meta refresh, formaction, strict location/open onclick) is eligible;
+      // the extracted URL still passes the same admission, destination,
+      // ranking, and queue budgets as an anchor. No JS is evaluated.
+      const staticControls=staticControlTargetsFromDocument($);
+      if(staticControls.truncated>0)drops.count('control-slice',staticControls.truncated);
+      if(staticControls.targets.length)logDetails.push(`[Static controls] ${staticControls.targets.length} approved literal control target(s) considered${staticControls.truncated?` (${staticControls.truncated} cut by the deterministic cap)`:''}.`);
+      for(const control of staticControls.targets){let absolute:URL|null=null;try{absolute=new URL(control.url,documentBase);}catch{/* keep the raw target for candidate extraction and reject below */}const targetCandidates=extractDiscordCandidates(`${absolute?absolute.toString():control.url} ${control.label}`,surface,current.finalUrl).filter(candidate=>candidate.nativeInviteCode);if(targetCandidates.length){for(const candidate of targetCandidates){candidate.observations=(candidate.observations||[]).map(obs=>({...obs,sourceAnchorText:control.label,sourcePageDepth:depth}));discovered.push(candidate);}continue;}if(!absolute){drops.countUnique('invalid-protocol',control.url);continue;}absolute.hash='';if(!['http:','https:'].includes(absolute.protocol)){drops.countUnique('invalid-protocol',control.url);continue;}const decision=shouldFollowDestination({url:absolute.toString(),currentUrl:current.finalUrl,anchorText:control.label,baseScore:communityNavigationScore(absolute.pathname+absolute.search,control.label)});if(!decision.eligible){drops.countUnique(decision.reason==='admission-rejected'?'admission-rejected':'cross-origin-disallowed',absolute.toString());continue;}navigation.push({url:absolute.toString(),score:decision.score,from:current.finalUrl});}
       // P-B ladder structured step (flag-gated): sameAs/canonical inventory
       // joins navigation under identical scoring, cross-origin, and budget
       // rules. Flag off skips this block entirely (legacy navigation only).
