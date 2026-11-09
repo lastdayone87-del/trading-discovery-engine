@@ -135,3 +135,53 @@ test('M2a direct control invites keep the control label as anchor provenance', a
     observation.sourceSurface === 'CREATOR_WEBSITES'
     && observation.sourceAnchorText === 'Join our community'));
 });
+
+test('M2a control labels can admit a destination the dynamic scan rejected', async () => {
+  const calls: string[] = [];
+  const result = await runChannelInspection({
+    channelId: 'm2a-label-upgrade',
+    channelName: 'M2a Label Upgrade',
+    channelBio: 'No invite',
+    channelLinks: ['https://creator.example/'],
+    videoDescriptions: ['one', 'two', 'three', 'four', 'five'],
+    externalFetchImpl: (async (input: any) => {
+      const url = String(input);
+      calls.push(url);
+      if (url === 'https://creator.example/') {
+        return seedFor(`<button onclick="location.href='https://other.example/start'">Join our community</button>`);
+      }
+      if (url === 'https://other.example/start') return roomPage('label-upgraded-room');
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch,
+  });
+
+  assert.equal(result.foundInvite, 'label-upgraded-room');
+  assert.ok(calls.includes('https://other.example/start'),
+    'the control label must upgrade the URL-only dynamic decision');
+});
+
+test('M2a dynamic duplicates do not consume the fresh control cap', async () => {
+  const calls: string[] = [];
+  const dynamic = Array.from({ length: 20 }, (_, index) =>
+    `<div onclick="location.href='https://unrelated-${index}.example/start'">Start</div>`).join('');
+  const result = await runChannelInspection({
+    channelId: 'm2a-dynamic-cap',
+    channelName: 'M2a Dynamic Cap',
+    channelBio: 'No invite',
+    channelLinks: ['https://creator.example/'],
+    videoDescriptions: ['one', 'two', 'three', 'four', 'five'],
+    externalFetchImpl: (async (input: any) => {
+      const url = String(input);
+      calls.push(url);
+      if (url === 'https://creator.example/') {
+        return seedFor(`${dynamic}<div onclick="window.open('/community')">Join our community</div>`);
+      }
+      if (url === 'https://creator.example/community') return roomPage('dynamic-cap-room');
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch,
+  });
+
+  assert.equal(result.foundInvite, 'dynamic-cap-room');
+  assert.ok(calls.includes('https://creator.example/community'),
+    'dynamic duplicates must not displace an M2a-only target');
+});

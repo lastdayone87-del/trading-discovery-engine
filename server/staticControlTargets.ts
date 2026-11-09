@@ -134,7 +134,7 @@ export function staticControlTargetsFromDocument(
   $: CheerioAPI,
   maxTargets: number = MAX_STATIC_CONTROL_TARGETS,
   baseUrl?: string,
-  excludeUrls?: ReadonlySet<string>,
+  dynamicUrls?: ReadonlySet<string>,
 ): StaticControlExtraction {
   const cap = Math.max(0, Math.floor(maxTargets) || 0);
   const byUrl = new Map<string, { target: StaticControlTarget; labels: Set<string> }>();
@@ -167,7 +167,7 @@ export function staticControlTargetsFromDocument(
   const add = (url: string | null, kind: StaticControlKind, label: string): void => {
     if (!url) return;
     const resolved = resolve(url);
-    if (!resolved || excludeUrls?.has(resolved)) return;
+    if (!resolved) return;
     const existing = byUrl.get(resolved);
     if (existing) {
       // Keep distinct labels for destination scoring: an unlabeled first
@@ -203,7 +203,25 @@ export function staticControlTargetsFromDocument(
     }
   });
 
+  // Dynamic-scanner duplicates still carry valuable control labels (a later
+  // "Join our community" can admit a destination the URL-only scan rejected),
+  // so return them for re-evaluation. They do not consume the fresh-target
+  // cap; only new M2a-only targets are capped.
   const all = Array.from(byUrl.values(), entry => entry.target);
-  const targets = all.slice(0, cap);
-  return { targets, truncated: Math.max(0, all.length - targets.length) };
+  const dynamicSet = dynamicUrls ?? new Set<string>();
+  const targets: StaticControlTarget[] = [];
+  let freshKept = 0;
+  let freshTotal = 0;
+  for (const target of all) {
+    if (dynamicSet.has(target.url)) {
+      targets.push(target);
+      continue;
+    }
+    freshTotal += 1;
+    if (freshKept < cap) {
+      targets.push(target);
+      freshKept += 1;
+    }
+  }
+  return { targets, truncated: Math.max(0, freshTotal - freshKept) };
 }
