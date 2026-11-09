@@ -18,7 +18,7 @@ test('Stage 4 PostgreSQL: dashboard library/vocabulary filters and pagination ar
   const suffix = `dashboard-page-${Date.now()}-${process.pid}`;
   const queryIds: number[] = [];
   const termIds: number[] = [];
-  const canonicalIds: number[] = [];
+  const canonicalIds: string[] = [];
   try {
     const insertQuery = async (country: string, collection: string, score: number) => {
       const id = (await db.query(
@@ -61,16 +61,18 @@ test('Stage 4 PostgreSQL: dashboard library/vocabulary filters and pagination ar
          VALUES($1,$2,'France','fr','Latn','TERMINOLOGY',3,false,'OBSERVED',$3,$3) RETURNING id`,
         [term, term.toLocaleLowerCase('en'), observedAt]
       )).rows[0].id;
-      const numericId = Number(id);
-      canonicalIds.push(numericId);
-      return numericId;
+      // Keep the exact bigint text for cleanup; Number() can lose precision
+      // once the BIGSERIAL sequence exceeds 2^53.
+      const exactId = String(id);
+      canonicalIds.push(exactId);
+      return exactId;
     };
     const olderCanonical = await insertCanonical(`${suffix}-canonical-older`, new Date(Date.now() - 120_000).toISOString());
     const newerCanonical = await insertCanonical(`${suffix}-canonical-newer`, new Date(Date.now() - 60_000).toISOString());
     const firstCanonicalPage = await getTerminologyDashboardPage('France', 1, 0);
     const secondCanonicalPage = await getTerminologyDashboardPage('France', 1, 1);
-    assert.equal(Number((firstCanonicalPage[0] as { id: number }).id), newerCanonical);
-    assert.equal(Number((secondCanonicalPage[0] as { id: number }).id), olderCanonical);
+    assert.equal(String((firstCanonicalPage[0] as { id: unknown }).id), newerCanonical);
+    assert.equal(String((secondCanonicalPage[0] as { id: unknown }).id), olderCanonical);
 
     resetQueryIntelligenceSummaryCacheForTests();
     const first = await getQueryIntelligenceSummary({ now: 1_000, force: true });
