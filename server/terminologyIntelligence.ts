@@ -2004,6 +2004,34 @@ async function withDashboardSnapshot<T>(runner: any, fn: (client: any) => Promis
   return fn(runner);
 }
 
+const DASHBOARD_ORDER_TTL_MS = 15_000;
+const dashboardOrderCache = new Map<string, { at: number; rows: any[] }>();
+
+/** Test/ops hook: discard the computed dashboard ordering projection. */
+export function resetTerminologyDashboardCacheForTests(): void {
+  dashboardOrderCache.clear();
+}
+
+async function orderedDashboardBase(
+  client: any,
+  normalizedCountry: string | null,
+  cacheable: boolean,
+): Promise<any[]> {
+  const cacheKey = normalizedCountry || '*';
+  const now = Date.now();
+  if (cacheable) {
+    const cached = dashboardOrderCache.get(cacheKey);
+    if (cached && now - cached.at >= 0 && now - cached.at < DASHBOARD_ORDER_TTL_MS) return cached.rows;
+  }
+  const base = await client.query(`SELECT t.id,t.canonical_term,t.term_type,t.country,t.language,t.lifecycle_status,t.search_eligible,
+      COALESCE((SELECT SUM(p.decayed_yield_score*p.executions)/NULLIF(SUM(p.executions),0) FROM terminology_performance p WHERE p.canonical_term_id=t.id),0)::float AS decayed_yield_score
+    FROM canonical_trading_terms t WHERE ($1::text IS NULL OR t.country=$1)
+    ORDER BY decayed_yield_score DESC,t.last_observed_at DESC NULLS LAST,t.id DESC`,[normalizedCountry]);
+  const rows = orderDashboardTerminologyRows(base.rows.map((row: any) => ({ ...row, ...dashboardSearchEligibility(row) })));
+  if (cacheable) dashboardOrderCache.set(cacheKey, { at: now, rows });
+  return rows;
+}
+
 async function hydrateTerminologyDashboardRows(runner: any, ids: unknown[]): Promise<any[]> {
   if (!ids.length) return [];
   const result = await runner.query(`SELECT t.*, COALESCE(a.aliases,'[]'::json) aliases, COALESCE(o.distinct_creators,0)::int distinct_creator_count,
@@ -2037,11 +2065,7 @@ export async function getTerminologyDashboardPage(country?: string, limit = 200,
   // requested page. Both reads share one snapshot so a concurrent lifecycle
   // refresh cannot mix a current lifecycle with stale eligibility.
   return withDashboardSnapshot(runner, async client => {
-    const base = await client.query(`SELECT t.id,t.canonical_term,t.term_type,t.country,t.language,t.lifecycle_status,t.search_eligible,
-        COALESCE((SELECT SUM(p.decayed_yield_score*p.executions)/NULLIF(SUM(p.executions),0) FROM terminology_performance p WHERE p.canonical_term_id=t.id),0)::float AS decayed_yield_score
-      FROM canonical_trading_terms t WHERE ($1::text IS NULL OR t.country=$1)
-      ORDER BY decayed_yield_score DESC,t.last_observed_at DESC NULLS LAST,t.id DESC`,[normalizedCountry]);
-    const ordered = orderDashboardTerminologyRows(base.rows.map((row: any) => ({ ...row, ...dashboardSearchEligibility(row) })));
+    const ordered = await orderedDashboardBase(client, normalizedCountry, typeof client.release === 'function');
     const page = ordered.slice(skipped, skipped + bounded);
     const hydrated = await hydrateTerminologyDashboardRows(client, page.map((row: any) => row.id));
     return mergeDashboardEligibility(hydrated, page);
@@ -2052,15 +2076,18 @@ export async function getTerminologyDashboard(country?: string, clientOverride?:
   const runner = clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
   if (!runner) return [];
   const normalizedCountry = country ? canonicalCountry(country) : null;
-  return withDashboardSnapshot(runner, async client => {
-    const base = await client.query(`SELECT t.id,t.canonical_term,t.term_type,t.country,t.language,t.lifecycle_status,t.search_eligible,
-        COALESCE((SELECT SUM(p.decayed_yield_score*p.executions)/NULLIF(SUM(p.executions),0) FROM terminology_performance p WHERE p.canonical_term_id=t.id),0)::float AS decayed_yield_score
-      FROM canonical_trading_terms t WHERE ($1::text IS NULL OR t.country=$1)
-      ORDER BY decayed_yield_score DESC,t.last_observed_at DESC NULLS LAST,t.id DESC`,[normalizedCountry]);
-    const ordered = orderDashboardTerminologyRows(base.rows.map((row: any) => ({ ...row, ...dashboardSearchEligibility(row) })));
-    const hydrated = await hydrateTerminologyDashboardRows(client, ordered.map((row: any) => row.id));
-    return mergeDashboardEligibility(hydrated, ordered);
-  });
+  // Single snapshot: this endpoint is unpaged, so fetch the complete projection
+  // once instead of mixing a base read with a separate hydration read.
+  const result = await runner.query(`SELECT t.*, COALESCE(a.aliases,'[]'::json) aliases, COALESCE(o.distinct_creators,0)::int distinct_creator_count,
+    COALESCE(p.executions,0)::int executions, COALESCE(p.new_creators,0)::int new_creators, COALESCE(p.decayed_yield_score,0)::float decayed_yield_score,
+    COALESCE(p.lanes,'{}'::json) retrieval_lanes, COALESCE(e.history,'[]'::json) lifecycle_history
+    FROM canonical_trading_terms t
+    LEFT JOIN LATERAL (SELECT json_agg(json_build_object('alias',alias,'type',alias_type,'language',language,'script',script)) aliases FROM trading_term_aliases WHERE canonical_term_id=t.id) a ON true
+    LEFT JOIN LATERAL (SELECT COUNT(DISTINCT source_channel_id) distinct_creators FROM terminology_observations WHERE canonical_term_id=t.id) o ON true
+    LEFT JOIN LATERAL (SELECT SUM(executions) executions,SUM(new_creators) new_creators,COALESCE(SUM(weighted_yield_total)/NULLIF(SUM(executions),0),0) decayed_yield_score,json_object_agg(retrieval_lane,lane_yield) lanes FROM (SELECT retrieval_lane,SUM(executions) executions,SUM(new_creators) new_creators,SUM(decayed_yield_score*executions) weighted_yield_total,AVG(decayed_yield_score) lane_yield FROM terminology_performance WHERE canonical_term_id=t.id GROUP BY retrieval_lane) x) p ON true
+    LEFT JOIN LATERAL (SELECT json_agg(json_build_object('type',event_type,'from',from_status,'to',to_status,'reason',reason,'at',created_at) ORDER BY created_at DESC) history FROM terminology_lifecycle_events WHERE canonical_term_id=t.id) e ON true
+    WHERE ($1::text IS NULL OR t.country=$1) ORDER BY t.search_eligible DESC,p.decayed_yield_score DESC,t.last_observed_at DESC NULLS LAST,t.id DESC`, [normalizedCountry]);
+  return orderDashboardTerminologyRows(result.rows.map((row: any) => ({ ...row, ...dashboardSearchEligibility(row) })));
 }
 
 export async function getPlannerTerminology(country: string, clientOverride?: Queryable, deps?: { isKillSwitchActive?: () => Promise<boolean> }): Promise<Array<{ id: number; term: string; score: number; lifecycle: 'SEARCH_TRIAL' | 'PROVEN_SEARCH_TERM' }>> {

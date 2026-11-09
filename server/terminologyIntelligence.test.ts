@@ -66,27 +66,22 @@ test('poor repeated production yield demotes without deleting evidence', () => {
   assert.match(result.reason, /demotion threshold/);
 });
 
-test('terminology dashboard reads an ordered base projection and hydrates weighted yield separately', async () => {
+test('terminology dashboard hydrates weighted yield in one snapshot and computes ordering', async () => {
   const capturedSql: string[] = [];
   const runner = {
     async query(sql: string) {
       capturedSql.push(sql);
-      if (sql.includes('FROM canonical_trading_terms t')) {
-        return { rows: [{ id: '1', canonical_term: 'ICT', term_type: 'TERMINOLOGY', country: 'United States', language: 'en', lifecycle_status: 'SEARCH_TRIAL', search_eligible: true, decayed_yield_score: 0.2 }] };
-      }
-      return { rows: [] };
+      return { rows: [{ id: '1', canonical_term: 'ICT', term_type: 'TERMINOLOGY', country: 'United States', language: 'en', lifecycle_status: 'SEARCH_TRIAL', search_eligible: true, decayed_yield_score: 0.2 }] };
     }
   } as any;
 
   await getTerminologyDashboard(undefined, runner);
 
-  const base = capturedSql.find(sql => sql.includes('ORDER BY decayed_yield_score DESC')) || '';
-  assert.match(base, /SUM\(p\.decayed_yield_score\*p\.executions\)\/NULLIF\(SUM\(p\.executions\),0\)/);
-  assert.match(base, /last_observed_at DESC NULLS LAST/);
-  assert.match(base, /t\.id DESC/);
-  const hydration = capturedSql.find(sql => sql.includes('weighted_yield_total')) || '';
-  assert.match(hydration, /SUM\(decayed_yield_score\*executions\) weighted_yield_total/);
-  assert.match(hydration, /SUM\(weighted_yield_total\)\/NULLIF\(SUM\(executions\),0\)/);
+  assert.equal(capturedSql.length, 1);
+  const sql = capturedSql[0];
+  assert.match(sql, /SUM\(decayed_yield_score\*executions\) weighted_yield_total/);
+  assert.match(sql, /SUM\(weighted_yield_total\)\/NULLIF\(SUM\(executions\),0\)/);
+  assert.match(sql, /last_observed_at DESC NULLS LAST,t\.id DESC/);
 });
 
 test('planner ranks by execution-weighted yield so inert audit rows cannot lower a term', async () => {

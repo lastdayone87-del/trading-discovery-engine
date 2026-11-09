@@ -487,21 +487,11 @@ export function dashboardSearchEligibility(row: {
   });
   const lifecycleEligible = row.lifecycle_status === 'SEARCH_TRIAL' || row.lifecycle_status === 'PROVEN_SEARCH_TERM';
   return {
-    search_eligible: row.search_eligible === true && lifecycleEligible && gate.eligible,
+    // Lifecycle + Q0 are the planner's authority. The persisted flag is left
+    // for audit/summary; a stale false must not hide an otherwise active term.
+    search_eligible: lifecycleEligible && gate.eligible,
     search_eligibility_reasons: gate.eligible ? [] : gate.reasons,
   };
-}
-
-/** Count only terms that would actually survive `getPlannerTerminology`. */
-export function countPlannerEligibleTerminologyRows(rows: Array<{
-  canonical_term: string;
-  term_type?: string | null;
-  country?: string | null;
-  language?: string | null;
-  lifecycle_status?: string | null;
-  search_eligible?: boolean | null;
-}>): number {
-  return rows.filter(row => dashboardSearchEligibility(row).search_eligible).length;
 }
 
 /**
