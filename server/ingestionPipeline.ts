@@ -1155,20 +1155,30 @@ async function processChannelThroughPipelineInContext(
     existing.trading_confidence_score = tradingVal.confidenceScore;
     existing.trading_category = tradingVal.category;
     existing.trading_relevance_breakdown = tradingVal.breakdown;
-    // A live enrichment owner keeps its pending marker; only an idle row is
-    // projected terminal by this classification-only stop.
-    let lowAudienceActiveOwner = false;
-    try { lowAudienceActiveOwner = await hasActiveEnrichmentJob(existing.channel_id, options?.jobId); } catch { lowAudienceActiveOwner = true; }
-    existing.scan_status = lowAudienceActiveOwner
-      ? existing.scan_status
-      : tradingVal.status === 'NEEDS_REVIEW' ? 'NEEDS_REVIEW' : 'COMPLETED';
     existing.last_checked = now;
     applyCandidateObservability(existing, candidate);
     const lowAudienceWritten = await upsertChannelWithResult(existing, { preserveDiscordOnUpdate: true, requireCountrySnapshot: lowAudienceSnapshot });
-    if (!lowAudienceWritten) {
-      const refreshed = await getChannelById(candidate.channelId);
-      if (refreshed) Object.assign(existing, refreshed);
+    if (lowAudienceWritten) {
+      // Project the scan marker atomically with the active-job check. A job
+      // committed after this statement owns the channel and will reassert its
+      // own marker; a separate read would only widen the race.
+      const targetScanStatus = tradingVal.status === 'NEEDS_REVIEW' ? 'NEEDS_REVIEW' : 'COMPLETED';
+      const db = await getDb();
+      await db.query(
+        `UPDATE channels c SET scan_status=$2,updated_at=now()
+          WHERE c.channel_id=$1 AND c.scan_status=$3
+            AND NOT EXISTS (
+              SELECT 1 FROM jobs j
+               WHERE j.type IN ('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION')
+                 AND j.status IN ('PENDING','PROCESSING')
+                 AND j.payload->>'channelId'=c.channel_id
+                 AND ($4::uuid IS NULL OR j.id<>$4::uuid)
+            )`,
+        [candidate.channelId, targetScanStatus, existing.scan_status, options?.jobId || null],
+      );
     }
+    const refreshed = await getChannelById(candidate.channelId);
+    if (refreshed) Object.assign(existing, refreshed);
     return {
       channelId: candidate.channelId,
       channelName: candidate.channelName,
