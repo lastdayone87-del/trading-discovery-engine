@@ -1,0 +1,227 @@
+/**
+ * M2a — deterministic static non-semantic control targets.
+ *
+ * The static crawler already follows semantic `<a href>` links, embedded
+ * URLs, and generic `data-href`/`data-url`/`data-link` attributes. Some
+ * creator pages expose their community destination only through a
+ * non-semantic control:
+ *
+ *   - `<meta http-equiv="refresh" content="0; url=...">`
+ *   - `<button formaction="...">` / `<input formaction="...">`
+ *   - `onclick="location.href='...'"` / `location.assign(...)` /
+ *     `location.replace(...)` / `window.open(...)`
+ *
+ * This module extracts only a closed, literal allowlist. It never evaluates
+ * JavaScript. Handlers with variables, concatenation, multiple statements,
+ * function calls, template literals, or non-http(s) schemes are excluded.
+ * The inspected page's existing destination policy, admission boundary,
+ * ranking, and navigation budgets still decide whether an extracted target is
+ * pursued.
+ *
+ * This is not clicking and not a generic heuristic: a target must be a
+ * statically readable literal in one of the approved control shapes.
+ */
+import type { CheerioAPI } from 'cheerio';
+
+export type StaticControlKind = 'META_REFRESH' | 'FORMACTION' | 'ONCLICK_NAVIGATION';
+
+export interface StaticControlTarget {
+  /** Literal target as written; the caller resolves it against `<base href>`. */
+  url: string;
+  kind: StaticControlKind;
+  /** Human-readable control text/kind used only for navigation scoring. */
+  label: string;
+}
+
+export interface StaticControlExtraction {
+  targets: StaticControlTarget[];
+  /** Eligible unique targets dropped by the deterministic cap. */
+  truncated: number;
+}
+
+/** Bound per inspected page; normal pages carry only a handful. */
+export const MAX_STATIC_CONTROL_TARGETS = 20;
+/** Control text is scoring/provenance input, never a place to copy a page. */
+export const MAX_CONTROL_LABEL_CHARS = 200;
+/** Keep at most a few distinct labels when controls share one URL. */
+export const MAX_CONTROL_LABELS_PER_URL = 4;
+
+/** Long-delayed refreshes are session/expiry pages, not immediate controls. */
+export const MAX_META_REFRESH_DELAY_SECONDS = 5;
+
+const NON_HTTP_SCHEME = /^(?:javascript|data|mailto|tel|blob|file|about):/i;
+
+/** JS string literals are never interpreted: a backslash escape could point
+ * the browser at a different URL than the raw captured text. */
+function literalJsStringTarget(raw: string): string | null {
+  if (String(raw).includes('\\')) return null;
+  return literalNavigationTarget(raw);
+}
+
+/**
+ * Accept only a literal navigation target. The value may be relative or
+ * absolute http(s); fragments are same-page and never reveal new content.
+ */
+export function literalNavigationTarget(raw: string | null | undefined): string | null {
+  const value = String(raw ?? '').trim();
+  if (!value || value.startsWith('#')) return null;
+  if (NON_HTTP_SCHEME.test(value)) return null;
+  try {
+    const parsed = new URL(value, 'https://static-control.invalid/');
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+  } catch {
+    return null;
+  }
+  return value;
+}
+
+/**
+ * Strict literal `onclick` navigation parser.
+ *
+ * Accepted shapes (optional `javascript:`/`return`, one trailing semicolon):
+ *   location = '...'
+ *   location.href = '...'
+ *   window.location = '...'
+ *   document.location.href = '...'
+ *   location.assign('...')
+ *   location.replace('...')
+ *   window.open('...') / window.open('...', '_blank')
+ *
+ * Any expression, concatenation, template literal, second statement, or
+ * non-http(s) literal is rejected.
+ */
+export function parseOnclickNavigation(raw: string | null | undefined): string | null {
+  let value = String(raw ?? '').trim();
+  if (!value) return null;
+  value = value.replace(/^javascript\s*:/i, '').trim();
+  // ASI: `return\nlocation.href=...` returns before the assignment.
+  value = value.replace(/^return[ \t]+/i, '').trim();
+  if (!value || /[`{}]/.test(value)) return null;
+
+  const assignment = /^(?:(?:window|document)\.)?location(?:\.href)?\s*=\s*(['"])((?:(?!\1).)*)\1\s*;?$/s.exec(value);
+  if (assignment) return literalJsStringTarget(assignment[2]);
+
+  const call = /^(?:(?:window|document)\.)?location\.(?:assign|replace)\(\s*(['"])((?:(?!\1).)*)\1\s*\)\s*;?$/s.exec(value);
+  if (call) return literalJsStringTarget(call[2]);
+
+  // Only the approved `_blank` window target is accepted; a named frame would
+  // navigate a frame, not the top-level page this crawler can inspect.
+  const open = /^(?:window\.)?open\(\s*(['"])((?:(?!\1).)*)\1(?:\s*,\s*(['"])_blank\3)?\s*\)\s*;?$/s.exec(value);
+  if (open) return literalJsStringTarget(open[2]);
+
+  return null;
+}
+
+/**
+ * Parse a literal meta-refresh content value. Requires a `url=` target and a
+ * finite non-negative delay; malformed or script targets return null.
+ */
+export function parseMetaRefreshTarget(raw: string | null | undefined): string | null {
+  const value = String(raw ?? '').trim();
+  if (!value) return null;
+  const match = /^(\d+(?:\.\d+)?)\s*;\s*(?:url\s*=\s*)?(?:"([^"]*)"|'([^']*)'|(\S+))\s*;?\s*$/i.exec(value);
+  if (!match) return null;
+  if (Number(match[1]) > MAX_META_REFRESH_DELAY_SECONDS) return null;
+  return literalNavigationTarget(match[2] ?? match[3] ?? match[4]);
+}
+
+/**
+ * Extract approved static control targets in DOM order. The same URL is kept
+ * once (the first control kind wins); the cap bounds pathological pages and
+ * reports how many eligible unique targets were dropped.
+ */
+export function staticControlTargetsFromDocument(
+  $: CheerioAPI,
+  maxTargets: number = MAX_STATIC_CONTROL_TARGETS,
+  baseUrl?: string,
+  dynamicUrls?: ReadonlySet<string>,
+): StaticControlExtraction {
+  const cap = Math.max(0, Math.floor(maxTargets) || 0);
+  const byUrl = new Map<string, { target: StaticControlTarget; labels: Set<string> }>();
+
+  const resolve = (url: string): string | null => {
+    if (!baseUrl) return url;
+    try {
+      return new URL(url, baseUrl).toString();
+    } catch {
+      return null;
+    }
+  };
+
+  const cleanLabel = (value: string): string =>
+    String(value).replace(/\s+/g, ' ').trim().slice(0, MAX_CONTROL_LABEL_CHARS);
+
+  const labelFor = (node: any, tag: string, fallback: string): string => {
+    const aria = String(node.attr('aria-label') || '').trim();
+    if (aria) return cleanLabel(aria);
+    const text = node.text().trim();
+    if (text) return cleanLabel(text);
+    if (tag === 'input') {
+      const value = String(node.attr('value') || '').trim();
+      if (value) return cleanLabel(value);
+    }
+    const title = String(node.attr('title') || '').trim();
+    return cleanLabel(title || fallback);
+  };
+
+  const add = (url: string | null, kind: StaticControlKind, label: string): void => {
+    if (!url) return;
+    const resolved = resolve(url);
+    if (!resolved) return;
+    const existing = byUrl.get(resolved);
+    if (existing) {
+      // Keep distinct labels for destination scoring: an unlabeled first
+      // occurrence must not hide a later "Join our community" occurrence.
+      if (label && !existing.labels.has(label) && existing.labels.size < MAX_CONTROL_LABELS_PER_URL) {
+        existing.labels.add(label);
+        existing.target.label = cleanLabel(`${existing.target.label} ${label}`);
+      }
+      return;
+    }
+    byUrl.set(resolved, { target: { url: resolved, kind, label }, labels: new Set(label ? [label] : []) });
+  };
+
+  $('meta[http-equiv], button[formaction], input[formaction], [onclick]').each((_, element) => {
+    const node = $(element);
+    const tag = String((element as { tagName?: unknown }).tagName || '').toLowerCase();
+    if (tag === 'meta') {
+      if (String(node.attr('http-equiv') || '').trim().toLowerCase() === 'refresh') {
+        add(parseMetaRefreshTarget(node.attr('content')), 'META_REFRESH', 'meta refresh');
+      }
+    }
+    if (tag === 'button' || tag === 'input') {
+      const formAction = node.attr('formaction');
+      const type = String(node.attr('type') || (tag === 'button' ? 'submit' : 'text')).trim().toLowerCase();
+      const submitLike = tag === 'button' ? type === 'submit' : type === 'submit' || type === 'image';
+      if (formAction !== undefined && submitLike) {
+        add(literalNavigationTarget(formAction), 'FORMACTION', labelFor(node, tag, `${tag} form action`));
+      }
+    }
+    const onclick = node.attr('onclick');
+    if (onclick !== undefined) {
+      add(parseOnclickNavigation(onclick), 'ONCLICK_NAVIGATION', labelFor(node, tag, 'onclick control'));
+    }
+  });
+
+  // Dynamic-scanner duplicates still carry valuable control labels (a later
+  // "Join our community" can admit a destination the URL-only scan rejected),
+  // so return them for re-evaluation. They do not consume the fresh-target
+  // cap; only new M2a-only targets are capped.
+  const all = Array.from(byUrl.values(), entry => entry.target);
+  const dynamicSet = dynamicUrls ?? new Set<string>();
+  const targets: StaticControlTarget[] = [];
+  let freshKept = 0;
+  let freshTotal = 0;
+  for (const target of all) {
+    if (dynamicSet.has(target.url)) {
+      targets.push(target);
+      continue;
+    }
+    freshTotal += 1;
+    if (freshKept < cap) {
+      targets.push(target);
+      freshKept += 1;
+    }
+  }
+  return { targets, truncated: Math.max(0, freshTotal - freshKept) };
+}
