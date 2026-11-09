@@ -64,7 +64,7 @@ interface AcquisitionLaneCounters {
   acquisitionLaneRequestsStartedTotal: Record<AcquisitionLane, number>;
   acquisitionLaneGateWaitMsTotal: Record<AcquisitionLane, number>;
   acquisitionLaneGateWaitMaxMs: Record<AcquisitionLane, number>;
-  acquisitionLaneWorkRemainingTotal: Record<AcquisitionLane, number>;
+  acquisitionLaneWorkRemainingMax: Record<AcquisitionLane, number>;
   /** Default-off bulk-enqueue caps; the warning counter is always active. */
   bulkEnqueueGuardBlocksTotal: { transaction: number; hour: number };
   bulkEnqueueWarningsTotal: number;
@@ -119,7 +119,7 @@ function freshCounters(): AllCounters {
     acquisitionLaneRequestsStartedTotal: emptyLaneCounts(),
     acquisitionLaneGateWaitMsTotal: emptyLaneCounts(),
     acquisitionLaneGateWaitMaxMs: emptyLaneCounts(),
-    acquisitionLaneWorkRemainingTotal: emptyLaneCounts(),
+    acquisitionLaneWorkRemainingMax: emptyLaneCounts(),
     bulkEnqueueGuardBlocksTotal: { transaction: 0, hour: 0 },
     bulkEnqueueWarningsTotal: 0,
   };
@@ -220,7 +220,7 @@ export function bumpAcquisitionLaneEvent(
     counters.acquisitionLaneGateWaitMsTotal[lane] += gateWaitMs;
     counters.acquisitionLaneGateWaitMaxMs[lane] = Math.max(counters.acquisitionLaneGateWaitMaxMs[lane], gateWaitMs);
   }
-  counters.acquisitionLaneWorkRemainingTotal[lane] += nonNegative(input.workRemaining);
+  counters.acquisitionLaneWorkRemainingMax[lane] = Math.max(counters.acquisitionLaneWorkRemainingMax[lane], nonNegative(input.workRemaining));
 }
 
 export type BulkEnqueueGuardBlockKind = 'transaction' | 'hour';
@@ -296,7 +296,7 @@ export function operationsTelemetrySnapshot(): AllCounters {
     acquisitionLaneRequestsStartedTotal: { ...counters.acquisitionLaneRequestsStartedTotal },
     acquisitionLaneGateWaitMsTotal: { ...counters.acquisitionLaneGateWaitMsTotal },
     acquisitionLaneGateWaitMaxMs: { ...counters.acquisitionLaneGateWaitMaxMs },
-    acquisitionLaneWorkRemainingTotal: { ...counters.acquisitionLaneWorkRemainingTotal },
+    acquisitionLaneWorkRemainingMax: { ...counters.acquisitionLaneWorkRemainingMax },
     bulkEnqueueGuardBlocksTotal: { ...counters.bulkEnqueueGuardBlocksTotal },
     bulkEnqueueWarningsTotal: counters.bulkEnqueueWarningsTotal,
   };
@@ -321,7 +321,7 @@ export function resetOperationsTelemetry(): void {
   counters.acquisitionLaneRequestsStartedTotal = fresh.acquisitionLaneRequestsStartedTotal;
   counters.acquisitionLaneGateWaitMsTotal = fresh.acquisitionLaneGateWaitMsTotal;
   counters.acquisitionLaneGateWaitMaxMs = fresh.acquisitionLaneGateWaitMaxMs;
-  counters.acquisitionLaneWorkRemainingTotal = fresh.acquisitionLaneWorkRemainingTotal;
+  counters.acquisitionLaneWorkRemainingMax = fresh.acquisitionLaneWorkRemainingMax;
   counters.bulkEnqueueGuardBlocksTotal = fresh.bulkEnqueueGuardBlocksTotal;
   counters.bulkEnqueueWarningsTotal = fresh.bulkEnqueueWarningsTotal;
   // Dedupe state is test-observable too: a reset must start from a clean slate

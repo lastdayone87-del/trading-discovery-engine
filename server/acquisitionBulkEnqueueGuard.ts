@@ -7,11 +7,13 @@
  *
  * Semantics:
  *
- *   * A "transaction" is either an explicit `withBulkEnqueueTransaction`
- *     scope, or one caller-supplied database client (`clientOverride`), which
- *     is how existing recovery sweeps share one SQL transaction.
- *   * The >250-per-transaction warning is ALWAYS on. Enforcement is behind
- *     `ACQUISITION_BULK_ENQUEUE_GUARD_ENABLED` (default false).
+ *   * A "transaction" is an explicit `withBulkEnqueueTransaction` scope.
+ *     Caller-supplied database clients are deliberately not scopes: pools
+ *     reuse clients after release(), so per-client counters would grow forever
+ *     and eventually reject unrelated enqueues.
+ *   * The >250-per-transaction warning is ALWAYS on for explicit scopes, and a
+ *     rolling 60s / >250 warning catches scope-less bulk producers. Enforcement
+ *     is behind `ACQUISITION_BULK_ENQUEUE_GUARD_ENABLED` (default false).
  *   * A blocked enqueue throws a typed error. Silently dropping work would be
  *     worse than failing the producer, so callers can retry/split the batch.
  *   * The tracker is process-local. It is not a distributed rate limiter and
@@ -45,6 +47,7 @@ function envFlag(value: unknown): boolean {
 }
 
 function boundedCap(value: unknown, fallback: number): number {
+  if (value === undefined || value === null || String(value).trim() === '') return fallback;
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.min(MAX_CONFIGURED_CAP, Math.max(1, Math.floor(parsed)));
@@ -67,12 +70,22 @@ export interface BulkEnqueueGuardDecision {
   used?: number;
   limit?: number;
   warned?: boolean;
+  /** Opaque reservation released when the durable INSERT fails or is a no-op. */
+  reservation?: BulkEnqueueReservation;
 }
 
 interface TransactionState {
   label: string;
+  labelLocked?: boolean;
   count: number;
   warned: boolean;
+}
+
+interface BulkEnqueueReservation {
+  state?: TransactionState;
+  transactionId?: number;
+  hourId?: number;
+  released?: boolean;
 }
 
 export class BulkEnqueueGuardError extends Error {
@@ -92,33 +105,25 @@ export class BulkEnqueueGuardError extends Error {
   }
 }
 
-/** A logical batch context for callers that do not share a SQL client. */
+/**
+ * A logical batch context. Counters are intentionally NOT keyed to a database
+ * client: pools reuse clients after release(), so per-client state would grow
+ * forever and eventually reject unrelated enqueues. Callers that want the
+ * per-transaction cap declare the batch with withBulkEnqueueTransaction().
+ */
 const bulkEnqueueScope = new AsyncLocalStorage<TransactionState>();
-let clientScopes = new WeakMap<object, TransactionState>();
-let hourAdmissions: number[] = [];
+let hourAdmissions: Array<{ id: number; at: number }> = [];
+let rollingAdmissions: Array<{ id: number; at: number }> = [];
+let rollingWarnedAt = 0;
+let reservationSequence = 0;
+const ROLLING_WARNING_WINDOW_MS = 60_000;
 
 function boundedLabel(value: unknown): string {
   const flat = String(value || 'bulk-enqueue').replace(/\s+/g, ' ').trim();
   return flat.slice(0, MAX_LABEL_LENGTH) || 'bulk-enqueue';
 }
 
-function transactionStateFor(client: unknown): TransactionState | undefined {
-  if (typeof client === 'object' && client !== null) {
-    let state = clientScopes.get(client);
-    if (!state) {
-      state = { label: 'db-client-transaction', count: 0, warned: false };
-      clientScopes.set(client, state);
-    }
-    return state;
-  }
-  if (typeof client === 'function') {
-    let state = clientScopes.get(client as unknown as object);
-    if (!state) {
-      state = { label: 'db-client-transaction', count: 0, warned: false };
-      clientScopes.set(client as unknown as object, state);
-    }
-    return state;
-  }
+function transactionStateFor(): TransactionState | undefined {
   return bulkEnqueueScope.getStore();
 }
 
@@ -136,12 +141,32 @@ function warnBulkEnqueue(state: TransactionState, now: number): void {
   }));
 }
 
+/** Always-on backstop for scope-less producers: no client object can opt out. */
+function warnRollingBulkEnqueue(now: number): void {
+  const cutoff = now - ROLLING_WARNING_WINDOW_MS;
+  while (rollingAdmissions.length && rollingAdmissions[0].at <= cutoff) rollingAdmissions.shift();
+  if (rollingAdmissions.length <= BULK_ENQUEUE_TRANSACTION_WARNING_THRESHOLD) return;
+  if (rollingWarnedAt && now - rollingWarnedAt < ROLLING_WARNING_WINDOW_MS) return;
+  rollingWarnedAt = now;
+  bumpBulkEnqueueWarning();
+  console.warn(JSON.stringify({
+    event: 'bulk_enqueue_transaction_warning',
+    scope: 'process-rolling-60s',
+    admitted: rollingAdmissions.length,
+    threshold: BULK_ENQUEUE_TRANSACTION_WARNING_THRESHOLD,
+    enforcementEnabled: resolveBulkEnqueueGuardConfig().enabled,
+    timestamp: new Date(now).toISOString(),
+  }));
+}
+
 /**
  * Reserve one enqueue slot. Called by `enqueueJob` before the INSERT. When the
  * guard is disabled this only counts and warns, so production behavior is
- * unchanged apart from bounded observability.
+ * unchanged apart from bounded observability. The returned reservation must be
+ * released if the durable INSERT fails or is a no-op.
  */
 export function admitBulkEnqueue(input: {
+  /** @deprecated Clients are not transaction boundaries; use withBulkEnqueueTransaction. */
   client?: unknown;
   label?: string;
   now?: number;
@@ -149,8 +174,8 @@ export function admitBulkEnqueue(input: {
 } = {}): BulkEnqueueGuardDecision {
   const config = input.config || resolveBulkEnqueueGuardConfig();
   const now = Number.isFinite(input.now) ? Number(input.now) : Date.now();
-  const state = transactionStateFor(input.client);
-  if (state && input.label) state.label = boundedLabel(input.label);
+  const state = transactionStateFor();
+  if (state && input.label && !state.labelLocked) state.label = boundedLabel(input.label);
 
   if (config.enabled) {
     if (state && state.count >= config.maxPerTransaction) {
@@ -158,24 +183,49 @@ export function admitBulkEnqueue(input: {
       return { allowed: false, kind: 'transaction', used: state.count, limit: config.maxPerTransaction };
     }
     const cutoff = now - HOUR_MS;
-    while (hourAdmissions.length && hourAdmissions[0] <= cutoff) hourAdmissions.shift();
+    while (hourAdmissions.length && hourAdmissions[0].at <= cutoff) hourAdmissions.shift();
     if (hourAdmissions.length >= config.maxPerHour) {
       bumpBulkEnqueueGuardBlock('hour');
       return { allowed: false, kind: 'hour', used: hourAdmissions.length, limit: config.maxPerHour };
     }
   }
 
+  const transactionId = ++reservationSequence;
+  rollingAdmissions.push({ id: transactionId, at: now });
   if (state) {
     state.count += 1;
     warnBulkEnqueue(state, now);
+  } else {
+    warnRollingBulkEnqueue(now);
   }
-  if (config.enabled) hourAdmissions.push(now);
+  const hourId = config.enabled ? transactionId : undefined;
+  if (hourId !== undefined) hourAdmissions.push({ id: hourId, at: now });
   return {
     allowed: true,
     used: state?.count,
     limit: config.maxPerTransaction,
     warned: state?.warned,
+    reservation: { state, transactionId, hourId },
   };
+}
+
+/** Mark a reservation as committed; no counter changes. */
+export function commitBulkEnqueue(decision?: BulkEnqueueGuardDecision): void {
+  if (decision?.reservation) decision.reservation.released = true;
+}
+
+/** Release a reservation after a failed or no-op durable insert. */
+export function releaseBulkEnqueue(decision?: BulkEnqueueGuardDecision): void {
+  const reservation = decision?.reservation;
+  if (!reservation || reservation.released) return;
+  reservation.released = true;
+  if (reservation.state) reservation.state.count = Math.max(0, reservation.state.count - 1);
+  if (reservation.hourId !== undefined) {
+    hourAdmissions = hourAdmissions.filter(entry => entry.id !== reservation.hourId);
+  }
+  if (reservation.transactionId !== undefined) {
+    rollingAdmissions = rollingAdmissions.filter(entry => entry.id !== reservation.transactionId);
+  }
 }
 
 /**
@@ -188,7 +238,7 @@ export async function withBulkEnqueueTransaction<T>(
 ): Promise<T> {
   const existing = bulkEnqueueScope.getStore();
   if (existing) return operation();
-  return bulkEnqueueScope.run({ label: boundedLabel(label), count: 0, warned: false }, operation);
+  return bulkEnqueueScope.run({ label: boundedLabel(label), labelLocked: true, count: 0, warned: false }, operation);
 }
 
 /** Snapshot for tests/diagnostics; the durable record is lane/orchestration telemetry. */
@@ -198,8 +248,8 @@ export function bulkEnqueueGuardSnapshot(): {
   scopes: number;
 } {
   let scopes = 0;
-  // WeakMap is not enumerable; scopes requested by callers are counted via the
-  // async scope only. Exposed for test observability, not capacity accounting.
+  // Scopes requested by callers are counted via the async scope only. Exposed
+  // for test observability, not capacity accounting.
   if (bulkEnqueueScope.getStore()) scopes += 1;
   return {
     config: resolveBulkEnqueueGuardConfig(),
@@ -210,6 +260,8 @@ export function bulkEnqueueGuardSnapshot(): {
 
 /** Test-only reset; never called from serving paths. */
 export function resetBulkEnqueueGuardForTests(): void {
-  clientScopes = new WeakMap<object, TransactionState>();
   hourAdmissions = [];
+  rollingAdmissions = [];
+  rollingWarnedAt = 0;
+  reservationSequence = 0;
 }

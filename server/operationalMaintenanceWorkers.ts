@@ -209,7 +209,7 @@ function startFalseNegativeRecoveryWorker(workerId: string): void {
 
       const channelId = String(job.payload?.channelId || '');
       if (!channelId) throw new Error('False-negative recovery job is missing channelId.');
-      const result = await triggerManualRecheck(channelId, true, true);
+      const result = await triggerManualRecheck(channelId, true, true, { lane: 'MAINTENANCE', jobType: job.type, jobId: job.id });
       if (!result.success) {
         const probeControl = result.probeQuotaExceeded === true
           || result.probeQuotaDisabled === true
@@ -276,7 +276,7 @@ function startCountryBoundaryRecoveryWorker(workerId: string): void {
       heartbeat.unref?.();
       const channelId = String(job.payload?.channelId || '');
       if (!channelId) throw new Error('Country-boundary recovery job is missing channelId.');
-      const result = await triggerManualRecheck(channelId, true, true);
+      const result = await triggerManualRecheck(channelId, true, true, { lane: 'MAINTENANCE', jobType: job.type, jobId: job.id });
       if (!result.success) {
         const probeControl = result.probeQuotaExceeded === true
           || result.probeQuotaDisabled === true

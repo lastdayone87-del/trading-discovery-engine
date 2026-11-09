@@ -99,6 +99,14 @@ CREATE TRIGGER acquisition_lane_events_append_only
   FOR EACH ROW
   EXECUTE FUNCTION public.reject_acquisition_lane_event_mutation();
 
+-- Row triggers do not fire for TRUNCATE. A statement-level guard keeps the
+-- append-only contract intact even for a caller with truncate privileges.
+DROP TRIGGER IF EXISTS acquisition_lane_events_no_truncate ON public.acquisition_lane_events;
+CREATE TRIGGER acquisition_lane_events_no_truncate
+  BEFORE TRUNCATE ON public.acquisition_lane_events
+  FOR EACH STATEMENT
+  EXECUTE FUNCTION public.reject_acquisition_lane_event_mutation();
+
 COMMENT ON TABLE public.acquisition_lane_events IS
   'Append-only per-lane acquisition inspection/slice outcomes. Flag-gated writes; never a retry input in Phase 0.';
 COMMENT ON COLUMN public.acquisition_lane_events.outcome IS

@@ -18,6 +18,8 @@ import {
   BULK_ENQUEUE_TRANSACTION_WARNING_THRESHOLD,
   BulkEnqueueGuardError,
   admitBulkEnqueue,
+  commitBulkEnqueue,
+  releaseBulkEnqueue,
   resolveBulkEnqueueGuardConfig,
   resetBulkEnqueueGuardForTests,
   withBulkEnqueueTransaction,
@@ -36,6 +38,7 @@ test.beforeEach(() => {
 test('lane taxonomy is closed and maps durable job types without silent drift', () => {
   assert.deepEqual([...ACQUISITION_LANES], ['DISCOVERY', 'ENRICHMENT', 'RETRY', 'MANUAL', 'MAINTENANCE', 'UNKNOWN']);
   assert.equal(acquisitionLaneForJobType('SEARCH_YOUTUBE'), 'DISCOVERY');
+  assert.equal(acquisitionLaneForJobType('CLASSIFY_DISCOVERED_CHANNEL'), 'DISCOVERY');
   assert.equal(acquisitionLaneForJobType('ENRICH_CHANNEL'), 'ENRICHMENT');
   assert.equal(acquisitionLaneForJobType('RETRY_COMMUNITY_ACQUISITION'), 'RETRY');
   assert.equal(acquisitionLaneForJobType('MANUAL_SEARCH_PAGE'), 'MANUAL');
@@ -144,6 +147,74 @@ test('capacity and browser-runtime waits never masquerade as acquisition failure
   assert.equal(quotaCapacity.outcome, 'CAPACITY_DEFERRED');
 });
 
+test('taxonomy collapses recovered work and requires per-URL processed evidence', () => {
+  const recovered = summarizeAcquisitionInspection({
+    inspection: {
+      acquisitionOutcomes: [
+        { required: false, outcome: 'PARTIALLY_INSPECTED', surface: 'CREATOR_WEBSITES', requestedUrl: 'https://example.com', failureClass: 'STATIC_BUDGET_GAP' },
+        { required: true, outcome: 'INSPECTED_NO_MATCH', surface: 'CREATOR_WEBSITES', requestedUrl: 'https://example.com', telemetry: { pagesInspected: 3 } },
+      ],
+    },
+  });
+  assert.equal(recovered.outcome, 'INSPECTED_NO_MATCH');
+  assert.equal(recovered.signals.effectiveObservations, 1);
+
+  const mixedEvidence = summarizeAcquisitionInspection({
+    inspection: {
+      acquisitionOutcomes: [
+        { required: true, outcome: 'INSPECTED_NO_MATCH', surface: 'CREATOR_WEBSITES', requestedUrl: 'https://a.example', telemetry: { pagesInspected: 1 } },
+        { required: true, outcome: 'INSPECTED_NO_MATCH', surface: 'CREATOR_WEBSITES', requestedUrl: 'https://b.example', telemetry: { pagesInspected: 0 } },
+      ],
+    },
+  });
+  assert.equal(mixedEvidence.outcome, 'INCONCLUSIVE');
+});
+
+test('non-required failures and terminal classes are not clean or externally blocked', () => {
+  const failedNoTelemetry = summarizeAcquisitionInspection({
+    inspection: {
+      acquisitionOutcomes: [
+        { required: false, outcome: 'ACQUISITION_FAILED', surface: 'CREATOR_WEBSITES', requestedUrl: 'https://example.com' },
+      ],
+    },
+  });
+  assert.equal(failedNoTelemetry.outcome, 'INCONCLUSIVE');
+
+  for (const failureClass of ['UNSUPPORTED_CONTENT_TYPE', 'REDIRECT_LIMIT']) {
+    const failed = summarizeAcquisitionInspection({
+      inspection: {
+        acquisitionOutcomes: [
+          { required: true, outcome: 'ACQUISITION_FAILED', retryable: false, failureClass, surface: 'CREATOR_WEBSITES', requestedUrl: 'https://example.com' },
+        ],
+      },
+    });
+    assert.equal(failed.outcome, 'ACQUISITION_FAILED', failureClass);
+  }
+});
+
+test('mixed saturation reasons do not mask genuine acquisition failures', () => {
+  const mixed = summarizeAcquisitionInspection({
+    inspection: {
+      acquisitionOutcomes: [
+        { required: true, outcome: 'ACQUISITION_FAILED', retryable: true, failureClass: 'TIMEOUT', surface: 'CREATOR_WEBSITES', requestedUrl: 'https://example.com' },
+      ],
+    },
+    retryDirective: { code: 'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE', reason: 'RENDERED_FALLBACK_SATURATED, TIMEOUT' },
+  });
+  assert.equal(mixed.outcome, 'ACQUISITION_FAILED');
+
+  const capacityAfterWork = summarizeAcquisitionInspection({
+    inspection: {
+      acquisitionOutcomes: [
+        { required: true, outcome: 'INSPECTED_NO_MATCH', surface: 'CREATOR_WEBSITES', requestedUrl: 'https://example.com', telemetry: { pagesInspected: 1 } },
+      ],
+    },
+    retryDirective: { code: 'RENDERED_FALLBACK_SATURATED', reason: 'RENDERED_FALLBACK_SATURATED' },
+  });
+  assert.equal(capacityAfterWork.outcome, 'INCONCLUSIVE');
+  assert.equal(capacityAfterWork.capacityEvent, 'RENDERED_FALLBACK_SATURATED');
+});
+
 test('retryable work remaining is counted without inventing clean outcomes', () => {
   const partial = summarizeAcquisitionInspection({
     inspection: {
@@ -176,6 +247,7 @@ test('lane telemetry flag is default-off and the writer never touches the databa
       workRemaining: 0,
       signals: {
         observations: 1,
+        effectiveObservations: 1,
         requiredObservations: 1,
         foundObservations: 0,
         failedObservations: 0,
@@ -211,6 +283,7 @@ test('lane telemetry writer appends one bounded row when enabled', async () => {
       workRemaining: 0,
       signals: {
         observations: 1,
+        effectiveObservations: 1,
         requiredObservations: 1,
         foundObservations: 1,
         failedObservations: 0,
@@ -240,6 +313,53 @@ test('lane telemetry writer appends one bounded row when enabled', async () => {
   assert.equal(detail.ignored, undefined, 'nested detail values are dropped');
   assert.equal(detail.observations, 1);
   assert.equal(detail.processedObservations, 1);
+});
+
+test('lane telemetry writer reports duplicate no-ops, bounds capacityEvent, and never throws', async () => {
+  const summary = {
+    pagesInspected: 0,
+    requestsStarted: 0,
+    workRemaining: 0,
+    capacityEvent: 'x'.repeat(200),
+    signals: {
+      observations: 1,
+      effectiveObservations: 1,
+      requiredObservations: 1,
+      foundObservations: 0,
+      failedObservations: 0,
+      partialObservations: 0,
+      inspectedNoMatchObservations: 0,
+      retryOwningObservations: 0,
+      infrastructureFailureObservations: 0,
+      conclusiveBlockObservations: 0,
+      processedObservations: 0,
+    },
+  };
+  const calls: unknown[][] = [];
+  const duplicate = await recordAcquisitionLaneEvent({
+    attribution: { lane: 'RETRY', channelId: 'chan-duplicate' },
+    outcome: 'CAPACITY_DEFERRED',
+    summary,
+    capacityEvent: 'x'.repeat(200),
+  }, {
+    enabled: () => true,
+    query: async (_sql, values) => { calls.push(values); return { rowCount: 0 }; },
+  });
+  assert.equal(duplicate, false);
+  assert.equal(String(calls[0][11]).length, 96);
+
+  let warned = 0;
+  const failed = await recordAcquisitionLaneEvent({
+    attribution: { lane: 'RETRY', channelId: 'chan-failed' },
+    outcome: 'CAPACITY_DEFERRED',
+    summary,
+  }, {
+    enabled: () => true,
+    query: async () => { throw new Error('db down'); },
+    warn: () => { warned += 1; },
+  });
+  assert.equal(failed, false);
+  assert.equal(warned, 1);
 });
 
 test('inspection wrapper returns the summary even when persistence is off', async () => {
@@ -274,15 +394,43 @@ test('bulk enqueue guard caps one logical transaction only when enabled', async 
   assert.equal(operationsTelemetrySnapshot().bulkEnqueueGuardBlocksTotal.transaction, 1);
 });
 
-test('bulk enqueue guard treats a shared database client as one transaction', () => {
+test('bulk enqueue guard does not charge a reused database client across calls', async () => {
   const client = {};
   const config = { enabled: true, maxPerTransaction: 1, maxPerHour: 100 };
-  assert.equal(admitBulkEnqueue({ client, now: 1, config }).allowed, true);
-  const blocked = admitBulkEnqueue({ client, now: 2, config });
-  assert.equal(blocked.allowed, false);
-  assert.equal(blocked.kind, 'transaction');
-  // A different client is a different transaction.
-  assert.equal(admitBulkEnqueue({ client: {}, now: 3, config }).allowed, true);
+  // A pooled client is not a logical transaction: reusing it must not exhaust
+  // the per-transaction budget for later independent enqueues.
+  for (let index = 0; index < 5; index += 1) {
+    assert.equal(admitBulkEnqueue({ client, now: 1_000 + index, config }).allowed, true);
+  }
+  // Explicit batch scopes still enforce the cap.
+  const decisions: boolean[] = [];
+  await withBulkEnqueueTransaction('shared-client-scope', async () => {
+    for (let index = 0; index < 2; index += 1) {
+      decisions.push(admitBulkEnqueue({ now: 2_000 + index, config }).allowed);
+    }
+  });
+  assert.deepEqual(decisions, [true, false]);
+});
+
+test('bulk enqueue release returns a failed or no-op reservation', async () => {
+  const config = { enabled: true, maxPerTransaction: 1, maxPerHour: 100 };
+  await withBulkEnqueueTransaction('release-test', async () => {
+    const first = admitBulkEnqueue({ now: 1, config });
+    assert.equal(first.allowed, true);
+    releaseBulkEnqueue(first);
+    const retry = admitBulkEnqueue({ now: 2, config });
+    assert.equal(retry.allowed, true, 'released slot must be reusable');
+    commitBulkEnqueue(retry);
+    assert.equal(admitBulkEnqueue({ now: 3, config }).allowed, false, 'committed slot stays charged');
+  });
+});
+
+test('scope-less bulk cohorts still trigger the always-on rolling warning', () => {
+  const config = { enabled: false, maxPerTransaction: 1000, maxPerHour: 1000 };
+  for (let index = 0; index < BULK_ENQUEUE_TRANSACTION_WARNING_THRESHOLD + 1; index += 1) {
+    assert.equal(admitBulkEnqueue({ now: 1_000 + index, config }).allowed, true);
+  }
+  assert.equal(operationsTelemetrySnapshot().bulkEnqueueWarningsTotal, 1);
 });
 
 test('bulk enqueue hourly cap blocks a process-wide burst when enabled', () => {
@@ -309,6 +457,14 @@ test('bulk guard config parsing is bounded and default-off', () => {
     maxPerTransaction: 1,
     maxPerHour: 1_000_000,
   });
+  assert.deepEqual(resolveBulkEnqueueGuardConfig({
+    ACQUISITION_BULK_ENQUEUE_MAX_PER_TRANSACTION: '  ',
+    ACQUISITION_BULK_ENQUEUE_MAX_PER_HOUR: '',
+  }), {
+    enabled: false,
+    maxPerTransaction: 250,
+    maxPerHour: 500,
+  }, 'blank caps must fall back to defaults, never clamp to 1');
 });
 
 test('typed guard errors are explicit, never silent drops', () => {
@@ -335,6 +491,10 @@ test('crawler telemetry persists bounded lane attribution and gate wait', () => 
   assert.equal(telemetry.acquisitionWorkRemaining, 3);
   assert.equal(telemetry.gateWaitMs, 120_000);
 
+  const completed = safeCrawlerTelemetry({ mode: 'RENDERED', acquisitionWorkRemaining: 0 });
+  assert.ok(completed);
+  assert.equal(completed.acquisitionWorkRemaining, 0, 'zero remaining work is a real completed-pass value');
+
   const invalid = safeCrawlerTelemetry({
     mode: 'STATIC',
     acquisitionLane: 'NOT_REAL',
@@ -342,7 +502,7 @@ test('crawler telemetry persists bounded lane attribution and gate wait', () => 
   });
   assert.ok(invalid);
   assert.equal(invalid.acquisitionLane, undefined);
-  assert.equal(invalid.gateWaitMs, 86_400_000);
+  assert.equal(invalid.gateWaitMs, undefined, 'gate waits are rendered-only');
 });
 
 test('migration 171 is additive, closed-taxonomy, and append-only', async () => {
@@ -353,6 +513,7 @@ test('migration 171 is additive, closed-taxonomy, and append-only', async () => 
   for (const lane of ACQUISITION_LANES) assert.match(migration, new RegExp(`'${lane}'`));
   for (const outcome of ACQUISITION_OUTCOMES) assert.match(migration, new RegExp(`'${outcome}'`));
   assert.match(migration, /BEFORE UPDATE OR DELETE ON public\.acquisition_lane_events/);
+  assert.match(migration, /BEFORE TRUNCATE ON public\.acquisition_lane_events/);
   assert.match(migration, /ACQUISITION_LANE_EVENT_IMMUTABLE/);
   assert.match(migration, /jsonb_typeof\(detail\) = 'object'/);
   assert.doesNotMatch(migration, /ALTER TABLE public\.(jobs|external_acquisition_observations|channels)/);

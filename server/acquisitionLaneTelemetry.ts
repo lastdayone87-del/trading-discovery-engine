@@ -80,8 +80,9 @@ function boundedDetail(detail: Record<string, unknown> | undefined): Record<stri
 }
 
 /**
- * Record one inspection/slice outcome. Returns true when the database row was
- * written (flag on and insert succeeded). Never throws.
+ * Record one inspection/slice outcome. Returns true when the insert was
+ * attempted without error and the driver did not report a zero row count; a
+ * duplicate event_key conflict is a successful no-op. Never throws.
  */
 export async function recordAcquisitionLaneEvent(
   input: AcquisitionLaneEventInput,
@@ -122,14 +123,15 @@ export async function recordAcquisitionLaneEvent(
     input.summary.requestsStarted,
     input.summary.gateWaitMs ?? null,
     input.summary.workRemaining,
-    input.capacityEvent || null,
+    input.capacityEvent ? String(input.capacityEvent).replace(/\s+/g, ' ').trim().slice(0, 96) || null : null,
     JSON.stringify(detail),
     observedAt,
   ];
 
   try {
+    let result: unknown;
     if (deps.query) {
-      await deps.query(
+      result = await deps.query(
         `INSERT INTO acquisition_lane_events(
            event_key,lane,outcome,job_type,job_id,channel_id,slice_pass,
            pages_inspected,requests_started,gate_wait_ms,work_remaining,
@@ -141,7 +143,7 @@ export async function recordAcquisitionLaneEvent(
     } else {
       const { getDb } = await import('./dbCore');
       const db = await getDb();
-      await db.query(
+      result = await db.query(
         `INSERT INTO acquisition_lane_events(
            event_key,lane,outcome,job_type,job_id,channel_id,slice_pass,
            pages_inspected,requests_started,gate_wait_ms,work_remaining,
@@ -151,7 +153,8 @@ export async function recordAcquisitionLaneEvent(
         values,
       );
     }
-    return true;
+    const rowCount = (result as { rowCount?: number | null } | null)?.rowCount;
+    return typeof rowCount === 'number' ? rowCount > 0 : true;
   } catch (error) {
     const warn = deps.warn || ((message: string) => console.warn(message));
     warn(JSON.stringify({

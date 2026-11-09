@@ -829,10 +829,12 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
   const acquisitionSlicePass = number(candidate.acquisitionSlicePass) > 0
     ? Math.min(MAX_TELEMETRY_COUNTER, number(candidate.acquisitionSlicePass))
     : undefined;
-  const acquisitionWorkRemaining = number(candidate.acquisitionWorkRemaining) > 0
+  const acquisitionWorkRemaining = typeof candidate.acquisitionWorkRemaining === 'number' && Number.isFinite(candidate.acquisitionWorkRemaining)
     ? boundedCount(candidate.acquisitionWorkRemaining)
     : undefined;
-  const gateWaitMs = number(candidate.gateWaitMs) > 0
+  // Gate waits only exist for the rendered path; a static row carrying one is
+  // malformed input, not capacity evidence.
+  const gateWaitMs = candidate.mode === 'RENDERED' && number(candidate.gateWaitMs) > 0
     ? Math.min(86_400_000, number(candidate.gateWaitMs))
     : undefined;
   const ceiling = candidate.ceiling && typeof candidate.ceiling === 'object' && isCeilingKind((candidate.ceiling as { kind?: unknown }).kind)

@@ -23,6 +23,7 @@ import {
   type CommunityRetryObservation,
 } from './communityRetryPolicy';
 import { isInfrastructureFailureClass } from './communityAcquisitionWorkLedger';
+import { effectiveAcquisitionOutcomes, type AcquisitionObservationLike } from './communitySurfacePolicy';
 import {
   ACQUISITION_LANES,
   ACQUISITION_OUTCOMES,
@@ -48,6 +49,7 @@ export {
  */
 const JOB_TYPE_LANES: Readonly<Record<string, AcquisitionLane>> = {
   SEARCH_YOUTUBE: 'DISCOVERY',
+  CLASSIFY_DISCOVERED_CHANNEL: 'DISCOVERY',
   INSPECT_PLAYLIST: 'DISCOVERY',
   INSPECT_FEATURED_CHANNELS: 'DISCOVERY',
   RELATIONSHIP_CANARY_EXPANSION: 'DISCOVERY',
@@ -159,6 +161,7 @@ export interface AcquisitionLaneInspection {
 
 export interface AcquisitionLaneSignals {
   observations: number;
+  effectiveObservations: number;
   requiredObservations: number;
   foundObservations: number;
   failedObservations: number;
@@ -236,8 +239,6 @@ const CONCLUSIVE_EXTERNAL_BLOCK_CLASSES = new Set([
   'LOGIN_WALL',
   'PAYWALL_WALL',
   'PERMANENT_ACCESS_BLOCK',
-  'UNSUPPORTED_CONTENT_TYPE',
-  'REDIRECT_LIMIT',
 ]);
 
 export function isConclusiveExternalBlock(observation: AcquisitionLaneObservation): boolean {
@@ -285,7 +286,10 @@ function capacitySignalFor(directive: AcquisitionLaneRetryDirective | null | und
   const retryReason = upper(directive.retryReason);
   const reason = upper(directive.reason);
 
-  if (code === 'RENDERED_FALLBACK_SATURATED' || reason.includes('RENDERED_FALLBACK_SATURATED')) {
+  const reasonFragments = reason.split(/[,;|]/).map(fragment => fragment.trim()).filter(Boolean);
+  const everyReasonIsSaturation = reasonFragments.length > 0
+    && reasonFragments.every(fragment => fragment === 'RENDERED_FALLBACK_SATURATED' || fragment === 'BROWSER_GATE_SATURATION');
+  if (code === 'RENDERED_FALLBACK_SATURATED' || everyReasonIsSaturation) {
     return { kind: 'CAPACITY', code: 'RENDERED_FALLBACK_SATURATED' };
   }
   if (retryReason === 'BROWSER_RUNTIME_UNAVAILABLE' || isBrowserRuntimeFailureClass(code)) {
@@ -298,6 +302,30 @@ function capacitySignalFor(directive: AcquisitionLaneRetryDirective | null | und
     return { kind: 'CAPACITY', code: code || 'QUOTA_ALLOCATION_EXHAUSTED' };
   }
   return undefined;
+}
+
+/** Collapse repeated attempts for the same surface+URL to the effective
+ * outcome, so a recovered rendered pass supersedes an earlier static failure.
+ * Observations without a usable surface/URL stay as-is for audit. */
+function collapseLaneObservations(observations: AcquisitionLaneObservation[]): AcquisitionLaneObservation[] {
+  const usable = observations.filter(observation =>
+    typeof observation.requestedUrl === 'string' && observation.requestedUrl.trim()
+    && typeof observation.surface === 'string' && observation.surface.trim()
+    && ['FOUND', 'INSPECTED_NO_MATCH', 'PARTIALLY_INSPECTED', 'ACQUISITION_FAILED'].includes(String(observation.outcome || ''))
+  );
+  const unusable = observations.filter(observation => !usable.includes(observation));
+  if (!usable.length) return observations;
+  const mapped = usable.map(observation => ({
+    ...observation,
+    requestedUrl: observation.requestedUrl!,
+    surface: observation.surface!,
+    outcome: observation.outcome as AcquisitionObservationLike['outcome'],
+    required: observation.required === true,
+  })) as Array<AcquisitionObservationLike & AcquisitionLaneObservation>;
+  return [
+    ...effectiveAcquisitionOutcomes(mapped).map(item => item as AcquisitionLaneObservation),
+    ...unusable,
+  ];
 }
 
 export function summarizeAcquisitionInspection(input: {
@@ -324,12 +352,19 @@ export function summarizeAcquisitionInspection(input: {
   let conclusiveBlockObservations = 0;
   let processedObservations = 0;
 
+  // Telemetry is summed over raw attempts; outcome accounting uses the
+  // collapsed effective result per surface+URL so recovered work is not
+  // reported as still incomplete.
   for (const observation of observations) {
     const telemetry = observation.telemetry || {};
     pagesInspected += nonNegativeCount(telemetry.pagesInspected);
     requestsStarted += nonNegativeCount(telemetry.requestsStarted);
     const wait = nonNegativeCount(telemetry.gateWaitMs);
     if (wait > 0) gateWaitMs = Math.max(gateWaitMs || 0, wait);
+  }
+
+  const effectiveObservations = collapseLaneObservations(observations);
+  for (const observation of effectiveObservations) {
     if (observation.required === true) requiredObservations++;
     if (observation.outcome === 'FOUND') foundObservations++;
     if (observation.outcome === 'ACQUISITION_FAILED') failedObservations++;
@@ -346,6 +381,7 @@ export function summarizeAcquisitionInspection(input: {
 
   const signals: AcquisitionLaneSignals = {
     observations: observations.length,
+    effectiveObservations: effectiveObservations.length,
     requiredObservations,
     foundObservations,
     failedObservations,
@@ -367,21 +403,22 @@ export function summarizeAcquisitionInspection(input: {
   });
 
   const capacity = capacitySignalFor(directive);
-  const anyProcessed = processedObservations > 0;
-  const anyAttempted = requestsStarted > 0;
-  if (capacity && !anyProcessed) {
-    if (capacity.kind === 'RUNTIME' && anyAttempted) return summary('INCONCLUSIVE', capacity.code);
-    return summary(capacity.kind === 'RUNTIME' ? 'RUNTIME_UNAVAILABLE' : 'CAPACITY_DEFERRED', capacity.code);
-  }
-  if (capacity && capacity.kind === 'RUNTIME') {
-    // The runtime failed after pages/requests were observed. The crawl was cut
-    // short, so the result is inconclusive rather than a clean runtime wait.
-    return summary('INCONCLUSIVE', capacity.code);
+  const anyProcessed = observations.some(hasDirectProcessedAcquisitionEvidence);
+  const anyAttempted = observations.some(observation => nonNegativeCount(observation.telemetry?.requestsStarted) > 0);
+  if (capacity) {
+    if (capacity.kind === 'RUNTIME') {
+      // The runtime failed after pages/requests were observed. The crawl was
+      // cut short, so the result is inconclusive rather than a clean wait.
+      return summary(anyProcessed || anyAttempted ? 'INCONCLUSIVE' : 'RUNTIME_UNAVAILABLE', capacity.code);
+    }
+    // Gate/quota capacity remains a deferral. If work already executed, the
+    // pass is inconclusive rather than a clean capacity wait or a failure.
+    return summary(anyProcessed ? 'INCONCLUSIVE' : 'CAPACITY_DEFERRED', capacity.code);
   }
 
   if (foundObservations > 0) return summary('ACQUIRED');
 
-  const required = observations.filter(observation => observation.required === true);
+  const required = effectiveObservations.filter(observation => observation.required === true);
   const requiredFailures = required.filter(observation => observation.outcome === 'ACQUISITION_FAILED');
   if (requiredFailures.length > 0) {
     const everyFailureConclusive = requiredFailures.every(isConclusiveExternalBlock);
@@ -396,14 +433,19 @@ export function summarizeAcquisitionInspection(input: {
   if (retryOwningObservations > 0 || partialObservations > 0) return summary('PARTIALLY_INSPECTED');
 
   if (inspectedNoMatchObservations > 0) {
-    // A clean no-match is only permitted with direct processed evidence. A
-    // request that started, or an empty static row, stays inconclusive.
-    return summary(anyProcessed ? 'INSPECTED_NO_MATCH' : 'INCONCLUSIVE');
+    // Every clean no-match row needs its own direct processed evidence. One
+    // processed row must never certify a different URL's empty attempt.
+    const everyNoMatchProcessed = effectiveObservations
+      .filter(observation => observation.outcome === 'INSPECTED_NO_MATCH')
+      .every(hasDirectProcessedAcquisitionEvidence);
+    return summary(everyNoMatchProcessed ? 'INSPECTED_NO_MATCH' : 'INCONCLUSIVE');
   }
 
   if (observations.length === 0) {
     return summary(inspection?.acquisitionStatus ? 'INCONCLUSIVE' : 'NEVER_EXECUTED');
   }
 
-  return summary(anyProcessed || anyAttempted ? 'INCONCLUSIVE' : 'NEVER_EXECUTED');
+  // Any recorded observation — including a non-required failure with no
+  // telemetry — is a work signal. NEVER_EXECUTED is reserved for no signal.
+  return summary('INCONCLUSIVE');
 }
