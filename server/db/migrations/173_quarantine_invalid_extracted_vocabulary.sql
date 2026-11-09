@@ -26,5 +26,8 @@ WHERE v.id = c.id
       OR c.term_norm ~ '[豈-﫿]'
     )
     OR c.term_norm ~ '[#@]'
-    OR c.term_norm ~ '^[0-9]+$'
+    -- Decimal digits across the supported scripts. The letter ranges above
+    -- contain some digit blocks (for example Arabic-Indic ٠-٩), so this
+    -- explicit numeric-only check keeps SQL aligned with \p{L} in TS.
+    OR c.term_norm ~ '^[0-9٠-٩۰-۹०-९০-৯੦-੯૦-૯୦-୯௦-௯౦-౯೦-೯൦-൯๐-๙໐-໙༠-༩]+$'
   );

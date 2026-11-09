@@ -5,7 +5,7 @@ import { isNuisanceVocabularySurface } from './terminologySearchability';
 import { saveExtractedTerm } from './db';
 
 test('legacy vocabulary quarantine targets emoji, hashtag and numeric surfaces only', () => {
-  for (const term of ['🔴', '#trading', '#daytrading', '🚨', '011', '12345', '@trader', '＃trading', 'crypto#trading', '\u200B#forex']) {
+  for (const term of ['🔴', '#trading', '#daytrading', '🚨', '011', '12345', '@trader', '＃trading', 'crypto#trading', '\u200B#forex', '١٢٣']) {
     assert.equal(isNuisanceVocabularySurface(term), true, term);
   }
   for (const term of ['ES', 'LIVE', 'Gold', 'Ｇｏｌｄ', 'Footprint Trading DAX', 'analyse technique']) {
@@ -21,7 +21,7 @@ test('migration 173 downgrades nuisance trust-tier-2 vocabulary without deleting
   assert.match(sql, /validation_count = 0/);
   assert.match(sql, /normalize\(term, NFKC\)/);
   assert.match(sql, /term_norm ~ '\[#@\]'/);
-  assert.match(sql, /term_norm ~ '\^\[0-9\]\+\$'/);
+  assert.match(sql, /term_norm ~ '\^\[0-9٠-٩۰-۹०-९০-৯੦-੯૦-૯୦-୯௦-௯౦-౯೦-೯൦-൯๐-๙໐-໙༠-༩\]\+\$'/);
   assert.doesNotMatch(sql, /term LIKE/);
   
   assert.doesNotMatch(sql, /DELETE FROM extracted_trading_vocabulary/i);
