@@ -225,6 +225,7 @@ test('a server-page 404 still falls back to an enabled widget', async () => {
       const url = String(input);
       calls.push(url);
       if (url === serverSurface().canonicalUrl) return html('gone', 404);
+      assert.equal(url, widgetJsonUrl(serverSurface().guildId));
       return json({ instant_invite: 'https://discord.gg/widget-survives' });
     }) as typeof fetch,
   });
@@ -310,6 +311,7 @@ test('safe Discord redirects are followed after destination validation', async (
   assert.equal(result.candidates[0]?.nativeInviteCode, 'fortnite-redirect');
   assert.equal(calls.length, 2);
   assert.equal(calls[1], 'https://discord.com/servers/fortnite-322850917248663552');
+  assert.equal(result.requestsStarted, 2, 'redirect hops count as requests');
 });
 
 test('a non-public redirect is rejected before contact', async () => {
@@ -330,6 +332,28 @@ test('a non-public redirect is rejected before contact', async () => {
   assert.equal(result.retryable, false);
   assert.equal(result.failureClass, 'SSRF_BLOCKED');
   assert.ok(!calls.includes('http://127.0.0.1/private'));
+});
+
+test('a retryable widget failure overrides a permanent page class', async () => {
+  let pageCalls = 0;
+  const result = await acquireDiscordPublicSurface({
+    surface: serverSurface(),
+    sourceSurface: 'CHANNEL_EXTERNAL_LINKS',
+    resolveHost: async () => ['93.184.216.34'],
+    fetchImpl: (async (input: any) => {
+      const url = String(input);
+      if (url.includes('/widget.json')) return html('unavailable', 503);
+      pageCalls += 1;
+      return new Response(null, {
+        status: 302,
+        headers: { location: `https://discord.com/servers/redirect-${pageCalls}-322850917248663552` },
+      });
+    }) as typeof fetch,
+  });
+  assert.equal(result.outcome, 'ACQUISITION_FAILED');
+  assert.equal(result.retryable, true);
+  assert.equal(result.failureClass, 'TRANSIENT_HTTP', 'the retryable source must supply the failure class');
+  assert.equal(result.requestsStarted, 6, 'five page hops plus the widget request');
 });
 
 test('a stalled response body is classified as a retryable timeout', async () => {
@@ -363,6 +387,7 @@ test('a truncated body without an invite is incomplete, never a clean negative',
   assert.equal(truncated.outcome, 'ACQUISITION_FAILED');
   assert.equal(truncated.retryable, true);
   assert.equal(truncated.failureClass, 'RESPONSE_TRUNCATED');
+  assert.equal(truncated.pagesInspected, 0, 'a truncated prefix is not a fully inspected page');
 
   const widgetTruncated = await acquireDiscordPublicSurface({
     surface: widgetSurface(),

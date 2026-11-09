@@ -135,7 +135,8 @@ interface BoundedFetch {
   status: number;
   text: string;
   truncated: boolean;
-  redirectsFollowed: number;
+  /** Actual requests made, including every followed redirect hop. */
+  requestsStarted: number;
   failureClass?: string;
   detail?: string;
   retryable?: boolean;
@@ -191,7 +192,7 @@ async function fetchBounded(
       status: 0,
       text: '',
       truncated: false,
-      redirectsFollowed: 0,
+      requestsStarted: 1,
       failureClass: blocked ? 'SSRF_BLOCKED' : timedOut ? 'TIMEOUT' : 'NETWORK_FAILURE',
       retryable: !blocked,
       detail: blocked
@@ -207,7 +208,7 @@ async function fetchBounded(
       status: fetched.status,
       text: '',
       truncated: false,
-      redirectsFollowed: Math.max(0, fetched.redirectsFollowed.length - 1),
+      requestsStarted: Math.max(1, fetched.redirectsFollowed.length),
       ...failure,
       detail: `${failure.detail}${fetched.rejectedRedirect ? `: ${fetched.rejectedRedirect}` : ''}`,
     };
@@ -216,7 +217,7 @@ async function fetchBounded(
     status: fetched.status,
     text: fetched.text,
     truncated: fetched.truncated,
-    redirectsFollowed: Math.max(0, fetched.redirectsFollowed.length - 1),
+    requestsStarted: Math.max(1, fetched.redirectsFollowed.length),
   };
 }
 
@@ -261,6 +262,7 @@ interface WidgetResult {
   detail: string;
   failureClass?: string;
   retryable?: boolean;
+  requestsStarted: number;
 }
 
 async function readWidget(
@@ -287,11 +289,12 @@ async function readWidget(
       failureClass: fetched.failureClass,
       retryable: fetched.retryable !== false,
       detail: fetched.detail || 'widget fetch failed',
+      requestsStarted: fetched.requestsStarted,
     };
   }
   if (fetched.status < 200 || fetched.status >= 300) {
     if (confirmedWidgetUnavailable(fetched.status, fetched.text)) {
-      return { state: 'UNAVAILABLE', candidates: [], detail: `widget disabled/unavailable (HTTP ${fetched.status})` };
+      return { state: 'UNAVAILABLE', candidates: [], detail: `widget disabled/unavailable (HTTP ${fetched.status})`, requestsStarted: fetched.requestsStarted };
     }
     const failure = statusFailure(fetched.status);
     return {
@@ -300,6 +303,7 @@ async function readWidget(
       failureClass: failure.failureClass,
       retryable: failure.retryable,
       detail: failure.detail,
+      requestsStarted: fetched.requestsStarted,
     };
   }
   if (fetched.truncated) {
@@ -309,6 +313,7 @@ async function readWidget(
       failureClass: 'RESPONSE_TRUNCATED',
       retryable: true,
       detail: 'widget JSON exceeded the bounded response cap',
+      requestsStarted: fetched.requestsStarted,
     };
   }
   let body: any;
@@ -321,6 +326,7 @@ async function readWidget(
       failureClass: 'MALFORMED_RESPONSE',
       retryable: true,
       detail: 'widget JSON could not be parsed',
+      requestsStarted: fetched.requestsStarted,
     };
   }
   const invite = typeof body?.instant_invite === 'string' ? body.instant_invite : '';
@@ -334,6 +340,7 @@ async function readWidget(
     detail: candidates.length
       ? `widget exposed ${candidates.length} native invite candidate(s)${name}`
       : `widget inspected with no instant invite${name}`,
+    requestsStarted: fetched.requestsStarted,
   };
 }
 
@@ -363,7 +370,6 @@ export async function acquireDiscordPublicSurface(input: {
   let pagesInspected = 0;
 
   if (surface.kind === 'WIDGET') {
-    requestsStarted += 1;
     const widget = await readWidget(
       fetchImpl,
       surface.guildId,
@@ -373,6 +379,7 @@ export async function acquireDiscordPublicSurface(input: {
       maxBodyChars,
       input.resolveHost,
     );
+    requestsStarted += widget.requestsStarted;
     if (widget.candidates.length) {
       return {
         surface,
@@ -407,7 +414,6 @@ export async function acquireDiscordPublicSurface(input: {
     };
   }
 
-  requestsStarted += 1;
   const page = await fetchBounded(
     fetchImpl,
     surface.canonicalUrl,
@@ -416,6 +422,7 @@ export async function acquireDiscordPublicSurface(input: {
     maxBodyChars,
     input.resolveHost,
   );
+  requestsStarted += page.requestsStarted;
   let pageFailure: { failureClass: string; retryable: boolean; detail: string } | null = null;
   if (page.failureClass) {
     pageFailure = {
@@ -426,7 +433,9 @@ export async function acquireDiscordPublicSurface(input: {
   } else if (page.status < 200 || page.status >= 300) {
     pageFailure = statusFailure(page.status);
   } else {
-    pagesInspected = 1;
+    // A truncated prefix is parsed for candidate recall but is not a fully
+    // inspected page; do not overstate coverage telemetry.
+    if (!page.truncated) pagesInspected = 1;
     const candidates = extractDiscordCandidates(page.text, input.sourceSurface, surface.canonicalUrl)
       .filter(candidate => candidate.nativeInviteCode);
     if (candidates.length) {
@@ -453,7 +462,6 @@ export async function acquireDiscordPublicSurface(input: {
   // The widget is an independent public surface for the same guild id: try it
   // even when the server page failed, so a 404/blocked page cannot hide an
   // enabled widget invite.
-  requestsStarted += 1;
   const widget = await readWidget(
     fetchImpl,
     surface.guildId,
@@ -463,6 +471,7 @@ export async function acquireDiscordPublicSurface(input: {
     maxBodyChars,
     input.resolveHost,
   );
+  requestsStarted += widget.requestsStarted;
   if (widget.candidates.length) {
     return {
       surface,
@@ -476,11 +485,16 @@ export async function acquireDiscordPublicSurface(input: {
   }
   if (widget.state === 'FAILED') {
     const retryable = pageFailure?.retryable === true || widget.retryable !== false;
+    // A retryable widget failure must not inherit a permanent page class
+    // (e.g. REDIRECT_LIMIT), or the retry classifier would reject it.
+    const failureClass = retryable
+      ? (pageFailure?.retryable === true ? pageFailure.failureClass : widget.failureClass)
+      : (pageFailure?.failureClass || widget.failureClass);
     return {
       surface,
       outcome: 'ACQUISITION_FAILED',
       retryable,
-      failureClass: pageFailure?.failureClass || widget.failureClass,
+      failureClass,
       detail: pageFailure
         ? `${pageFailure.detail}; ${widget.detail}`
         : widget.detail,
