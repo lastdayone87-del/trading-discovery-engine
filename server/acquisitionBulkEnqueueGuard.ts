@@ -66,7 +66,7 @@ export function resolveBulkEnqueueGuardConfig(env: NodeJS.ProcessEnv = process.e
 
 export interface BulkEnqueueGuardDecision {
   allowed: boolean;
-  kind?: 'transaction' | 'hour';
+  kind?: 'transaction' | 'window' | 'hour';
   used?: number;
   limit?: number;
   warned?: boolean;
@@ -89,15 +89,18 @@ interface BulkEnqueueReservation {
 }
 
 export class BulkEnqueueGuardError extends Error {
-  readonly code: 'BULK_ENQUEUE_TRANSACTION_CAP_EXCEEDED' | 'BULK_ENQUEUE_HOURLY_CAP_EXCEEDED';
-  readonly kind: 'transaction' | 'hour';
+  readonly code: 'BULK_ENQUEUE_TRANSACTION_CAP_EXCEEDED' | 'BULK_ENQUEUE_WINDOW_CAP_EXCEEDED' | 'BULK_ENQUEUE_HOURLY_CAP_EXCEEDED';
+  readonly kind: 'transaction' | 'window' | 'hour';
   readonly limit: number;
 
-  constructor(kind: 'transaction' | 'hour', limit: number) {
+  constructor(kind: 'transaction' | 'window' | 'hour', limit: number) {
     const code = kind === 'transaction'
       ? 'BULK_ENQUEUE_TRANSACTION_CAP_EXCEEDED'
-      : 'BULK_ENQUEUE_HOURLY_CAP_EXCEEDED';
-    super(`${code}: ${limit} acquisition jobs already admitted in this ${kind === 'transaction' ? 'transaction' : 'hour'}`);
+      : kind === 'window'
+        ? 'BULK_ENQUEUE_WINDOW_CAP_EXCEEDED'
+        : 'BULK_ENQUEUE_HOURLY_CAP_EXCEEDED';
+    const scope = kind === 'transaction' ? 'transaction' : kind === 'window' ? '60s window' : 'hour';
+    super(`${code}: ${limit} acquisition jobs already admitted in this ${scope}`);
     this.name = 'BulkEnqueueGuardError';
     this.code = code;
     this.kind = kind;
@@ -141,10 +144,14 @@ function warnBulkEnqueue(state: TransactionState, now: number): void {
   }));
 }
 
-/** Always-on backstop for scope-less producers: no client object can opt out. */
-function warnRollingBulkEnqueue(now: number): void {
+function pruneRolling(now: number): void {
   const cutoff = now - ROLLING_WARNING_WINDOW_MS;
   while (rollingAdmissions.length && rollingAdmissions[0].at <= cutoff) rollingAdmissions.shift();
+}
+
+/** Always-on backstop for scope-less producers: no client object can opt out. */
+function warnRollingBulkEnqueue(now: number): void {
+  pruneRolling(now);
   if (rollingAdmissions.length <= BULK_ENQUEUE_TRANSACTION_WARNING_THRESHOLD) return;
   if (rollingWarnedAt && now - rollingWarnedAt < ROLLING_WARNING_WINDOW_MS) return;
   rollingWarnedAt = now;
@@ -176,11 +183,18 @@ export function admitBulkEnqueue(input: {
   const now = Number.isFinite(input.now) ? Number(input.now) : Date.now();
   const state = transactionStateFor();
   if (state && input.label && !state.labelLocked) state.label = boundedLabel(input.label);
+  pruneRolling(now);
 
   if (config.enabled) {
     if (state && state.count >= config.maxPerTransaction) {
       bumpBulkEnqueueGuardBlock('transaction');
       return { allowed: false, kind: 'transaction', used: state.count, limit: config.maxPerTransaction };
+    }
+    // Scope-less producers get the same default budget over a rolling 60s
+    // window, so the default-off cap is not merely a warning in production.
+    if (!state && rollingAdmissions.length >= config.maxPerTransaction) {
+      bumpBulkEnqueueGuardBlock('window');
+      return { allowed: false, kind: 'window', used: rollingAdmissions.length, limit: config.maxPerTransaction };
     }
     const cutoff = now - HOUR_MS;
     while (hourAdmissions.length && hourAdmissions[0].at <= cutoff) hourAdmissions.shift();

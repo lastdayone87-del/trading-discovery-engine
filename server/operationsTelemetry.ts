@@ -66,7 +66,7 @@ interface AcquisitionLaneCounters {
   acquisitionLaneGateWaitMaxMs: Record<AcquisitionLane, number>;
   acquisitionLaneWorkRemainingMax: Record<AcquisitionLane, number>;
   /** Default-off bulk-enqueue caps; the warning counter is always active. */
-  bulkEnqueueGuardBlocksTotal: { transaction: number; hour: number };
+  bulkEnqueueGuardBlocksTotal: { transaction: number; window: number; hour: number };
   bulkEnqueueWarningsTotal: number;
 }
 
@@ -120,7 +120,7 @@ function freshCounters(): AllCounters {
     acquisitionLaneGateWaitMsTotal: emptyLaneCounts(),
     acquisitionLaneGateWaitMaxMs: emptyLaneCounts(),
     acquisitionLaneWorkRemainingMax: emptyLaneCounts(),
-    bulkEnqueueGuardBlocksTotal: { transaction: 0, hour: 0 },
+    bulkEnqueueGuardBlocksTotal: { transaction: 0, window: 0, hour: 0 },
     bulkEnqueueWarningsTotal: 0,
   };
 }
@@ -223,7 +223,7 @@ export function bumpAcquisitionLaneEvent(
   counters.acquisitionLaneWorkRemainingMax[lane] = Math.max(counters.acquisitionLaneWorkRemainingMax[lane], nonNegative(input.workRemaining));
 }
 
-export type BulkEnqueueGuardBlockKind = 'transaction' | 'hour';
+export type BulkEnqueueGuardBlockKind = 'transaction' | 'window' | 'hour';
 
 export function bumpBulkEnqueueGuardBlock(kind: BulkEnqueueGuardBlockKind): void {
   counters.bulkEnqueueGuardBlocksTotal[kind] += 1;

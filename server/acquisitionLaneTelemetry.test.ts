@@ -396,20 +396,33 @@ test('bulk enqueue guard caps one logical transaction only when enabled', async 
 
 test('bulk enqueue guard does not charge a reused database client across calls', async () => {
   const client = {};
-  const config = { enabled: true, maxPerTransaction: 1, maxPerHour: 100 };
+  const config = { enabled: true, maxPerTransaction: 250, maxPerHour: 1000 };
   // A pooled client is not a logical transaction: reusing it must not exhaust
   // the per-transaction budget for later independent enqueues.
   for (let index = 0; index < 5; index += 1) {
     assert.equal(admitBulkEnqueue({ client, now: 1_000 + index, config }).allowed, true);
   }
   // Explicit batch scopes still enforce the cap.
+  const scopeConfig = { enabled: true, maxPerTransaction: 1, maxPerHour: 100 };
   const decisions: boolean[] = [];
   await withBulkEnqueueTransaction('shared-client-scope', async () => {
     for (let index = 0; index < 2; index += 1) {
-      decisions.push(admitBulkEnqueue({ now: 2_000 + index, config }).allowed);
+      decisions.push(admitBulkEnqueue({ now: 2_000 + index, config: scopeConfig }).allowed);
     }
   });
   assert.deepEqual(decisions, [true, false]);
+});
+
+test('scope-less bulk bursts hit the rolling window cap when enabled', () => {
+  const config = { enabled: true, maxPerTransaction: 2, maxPerHour: 100 };
+  assert.equal(admitBulkEnqueue({ now: 1_000, config }).allowed, true);
+  assert.equal(admitBulkEnqueue({ now: 2_000, config }).allowed, true);
+  const blocked = admitBulkEnqueue({ now: 3_000, config });
+  assert.equal(blocked.allowed, false);
+  assert.equal(blocked.kind, 'window');
+  assert.equal(operationsTelemetrySnapshot().bulkEnqueueGuardBlocksTotal.window, 1);
+  // The rolling budget returns after the 60s window.
+  assert.equal(admitBulkEnqueue({ now: 70_000, config }).allowed, true);
 });
 
 test('bulk enqueue release returns a failed or no-op reservation', async () => {
@@ -472,6 +485,10 @@ test('typed guard errors are explicit, never silent drops', () => {
   assert.equal(error.code, 'BULK_ENQUEUE_HOURLY_CAP_EXCEEDED');
   assert.equal(error.kind, 'hour');
   assert.match(error.message, /500 acquisition jobs/);
+  const windowError = new BulkEnqueueGuardError('window', 250);
+  assert.equal(windowError.code, 'BULK_ENQUEUE_WINDOW_CAP_EXCEEDED');
+  assert.equal(windowError.kind, 'window');
+  assert.match(windowError.message, /60s window/);
 });
 
 test('crawler telemetry persists bounded lane attribution and gate wait', () => {
