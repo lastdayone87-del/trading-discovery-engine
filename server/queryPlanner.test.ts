@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ExtractedTermRecord, QueryRecord } from '../src/types';
-import { isCountryScriptCompatible, isRetrievalOrientedQuery, limitRepeatedPrimaryTerms, normalizeQuery, planDiverseQueries, planFrontierTargetedQuery, queriesOutsideCooldown, queryTokenCount, rotateAwayFromMostRecentIntent } from './queryPlanner';
+import { isCountryScriptCompatible, isRetrievalOrientedQuery, limitRepeatedPrimaryTerms, normalizeQuery, planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, queriesOutsideCooldown, queryTokenCount, rotateAwayFromMostRecentIntent } from './queryPlanner';
 import { ORGANIC_QUERY_POLICY_VERSION } from './organicQueryExpansion';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
 
@@ -249,6 +249,57 @@ test('planner produces novel local instrument-market variants when every current
   assert.ok(instrumentMarket.length > 0, 'no novel instrument-market fallback was planned');
   assert.ok(instrumentMarket.every(item => /BEL|EURUSD/i.test(item.query)));
   assert.ok(planned.some(item => item.metadata.queryTemplate === 'SINGLE_ATOM'));
+});
+
+test('ambiguous short modifiers are not used by frontier target fallback', () => {
+  const base = {
+    country: 'United States',
+    language: 'en',
+    queryIntent: 'strategy' as const,
+    primaryTermFamily: 'ES',
+    retrievalLane: 'VIDEO' as const,
+    searchOrdering: 'RELEVANCE' as const,
+    instrumentOrTheme: null,
+    sourceFamily: 'automated_query',
+  };
+  assert.equal(planFrontierTargetedQuery({ country: 'United States', target: base }), null);
+  assert.equal(planFrontierTargetedQuery({ country: 'United States', target: { ...base, primaryTermFamily: 'SL' } }), null);
+  assert.equal(planFrontierTargetedQuery({ country: 'United States', target: { ...base, primaryTermFamily: 'LIVE' } }), null);
+});
+
+test('ambiguous short modifiers are not planned as learned query atoms', () => {
+  const learned = ['ES', 'SL', 'LIVE'].map((term, index) => ({
+    id: index + 1,
+    country: 'United States',
+    term,
+    category: 'instrument' as const,
+    occurrences: 10,
+    first_extracted: '2026-01-01T00:00:00.000Z',
+    last_extracted: '2026-01-02T00:00:00.000Z',
+    trust_tier: 2 as const,
+    validation_count: 5,
+  }));
+  const planned = planDiverseQueries({
+    country: 'United States',
+    count: 40,
+    learnedVocabulary: learned,
+    existingQueries: [],
+  });
+  for (const value of ['ES', 'SL', 'LIVE']) {
+    assert.equal(
+      planned.some(item => String((item.metadata as any).learnedTerm || '').toUpperCase() === value),
+      false,
+      `${value} must not be planned as a learned modifier`,
+    );
+  }
+  const suppressed = planned.flatMap(item => (item.metadata as any).terminologyGate?.suppressed || []);
+  for (const value of ['ES', 'SL', 'LIVE']) {
+    assert.ok(
+      suppressed.some((item: any) => String(item.term || '').toUpperCase() === value && item.reasons?.includes('ambiguous-short-modifier')),
+      `${value} must be recorded with the ambiguous-short-modifier reason`,
+    );
+  }
+  assert.equal(planCountryNativeProposalQuery({ country: 'United States', nativeTerm: 'SL', targetIntent: 'strategy', allocationLineage: {} }), null);
 });
 
 test('bare short tickers require qualifying market context', () => {

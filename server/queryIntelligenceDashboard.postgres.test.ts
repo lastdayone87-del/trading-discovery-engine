@@ -1,10 +1,12 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   getDb,
   getQueryIntelligenceSummary,
   getQueryLibraryPage,
   getVocabularyPage,
+  getQueryTerminologyCurrentStatuses,
+  persistQueryTerminologyDigest,
   resetQueryIntelligenceSummaryCacheForTests,
 } from './db';
 import { getTerminologyDashboardPage } from './terminologyIntelligence';
@@ -88,6 +90,46 @@ test('Stage 4 PostgreSQL: dashboard library/vocabulary filters and pagination ar
     if (queryIds.length) await db.query('DELETE FROM query_library WHERE id=ANY($1::int[])', [queryIds]).catch(() => undefined);
     if (termIds.length) await db.query('DELETE FROM extracted_trading_vocabulary WHERE id=ANY($1::int[])', [termIds]).catch(() => undefined);
     if (canonicalIds.length) await db.query('DELETE FROM canonical_trading_terms WHERE id=ANY($1::bigint[])', [canonicalIds]).catch(() => undefined);
-    await db.end();
   }
+});
+
+
+test('Stage 4 PostgreSQL: saved query terminology status and digest persistence', { skip: databaseUrl ? false : 'PHASE4_POSTGRES_URL is required' }, async () => {
+  process.env.DATABASE_URL = databaseUrl!;
+  process.env.PGSSL = 'disable';
+  const db = await getDb();
+  const suffix = `terminology-reval-${Date.now()}-${process.pid}`;
+  let termId: string | null = null;
+  let queryId: number | null = null;
+  try {
+    termId = String((await db.query(
+      `INSERT INTO canonical_trading_terms(canonical_term,normalized_term,country,language,script,term_type,trust_tier,search_eligible,lifecycle_status)
+       VALUES($1,$2,'Germany','de','Latn','TERMINOLOGY',2,true,'SEARCH_TRIAL') RETURNING id`,
+      [`${suffix}-term`, suffix]
+    )).rows[0].id);
+    queryId = Number((await db.query(
+      `INSERT INTO query_library(query,country,collection,intent,normalized_query,performance_score,times_executed,generation_metadata)
+       VALUES($1,'Germany','EXPERIMENTAL','GENERAL',$1,10,0,$2::jsonb) RETURNING id`,
+      [`${suffix}-query`, JSON.stringify({ terminologyId: termId, terminologyLifecycle: 'SEARCH_TRIAL', learnedTerm: 'DAX' })]
+    )).rows[0].id);
+    const statuses = await getQueryTerminologyCurrentStatuses([queryId]);
+    assert.equal(statuses.get(queryId)?.termId, Number(termId));
+    assert.equal(statuses.get(queryId)?.searchEligible, true);
+    assert.equal(await persistQueryTerminologyDigest(queryId, termId, {
+      queryTemplate: 'ANCHOR_LEARNED',
+      terminologyRevalidation: { disposition: 'DIGESTED', previousTermId: termId },
+    }), true);
+    const stored = (await db.query('SELECT generation_metadata FROM query_library WHERE id=$1', [queryId])).rows[0].generation_metadata;
+    assert.equal(stored.terminologyId, undefined);
+    assert.equal(stored.terminologyRevalidation.disposition, 'DIGESTED');
+  } finally {
+    if (queryId !== null) await db.query('DELETE FROM query_library WHERE id=$1', [queryId]).catch(() => undefined);
+    if (termId !== null) await db.query('DELETE FROM canonical_trading_terms WHERE id=$1', [termId]).catch(() => undefined);
+  }
+});
+
+after(async () => {
+  if (!databaseUrl) return;
+  const db = await getDb();
+  await db.end().catch(() => undefined);
 });

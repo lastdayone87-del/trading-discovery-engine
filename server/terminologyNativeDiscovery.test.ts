@@ -1512,6 +1512,36 @@ test('observation failure never persists the extracted term (retryable)', async 
   assert.deepEqual(saved, [{ country: 'Germany', term: 'P2P-Algo' }]);
 });
 
+test('nuisance legacy surfaces are observed but never written to extracted vocabulary', async () => {
+  const observed: Array<Record<string, unknown>> = [];
+  const saved: Array<{ country: string; term: string }> = [];
+  const reconciled: Array<{ country: string; term: string }> = [];
+  const sources: LiteralSourceText[] = [{ kind: 'VIDEO_TITLE', index: 0, text: '12345 signals', videoId: 'vid-nuisance' }];
+  const deps = fakeDeps({ observed, saved, reconciled });
+  const report = await admitNativeCandidates({
+    channel: testChannel(), sources,
+    parsed: { terminology: ['12345'] },
+    baseline: okBaseline(), humanApproved: false, humanObservation: 'ENRICHMENT', deps,
+  });
+  assert.equal(report.admitted, 1);
+  assert.equal(observed.length, 1, 'canonical observation evidence is retained');
+  assert.equal(saved.length, 0, 'nuisance shape never increments legacy vocabulary');
+  assert.equal(reconciled.length, 0, 'replay repair also skips the legacy write');
+
+  const replayDeps = fakeDeps({
+    observed: [], saved: [], reconciled,
+    observe: async () => ({ termId: 7, observationInserted: false }),
+  });
+  const replay = await admitNativeCandidates({
+    channel: testChannel(), sources,
+    parsed: { terminology: ['12345'] },
+    baseline: okBaseline(), humanApproved: false, humanObservation: 'ENRICHMENT', deps: replayDeps,
+  });
+  assert.equal(replay.admitted, 0);
+  assert.equal(replay.duplicates, 1);
+  assert.equal(reconciled.length, 0);
+});
+
 test('replayed observations reuse evidence without inflating vocabulary counts', async () => {
   const observed: Array<Record<string, unknown>> = [];
   const saved: Array<{ country: string; term: string }> = [];

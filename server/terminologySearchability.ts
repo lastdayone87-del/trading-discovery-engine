@@ -164,6 +164,19 @@ function phraseKey(value: string): string {
  */
 const AMBIGUOUS_STANDALONE_SEMANTICS = new Set(['es']);
 
+/**
+ * Short surfaces that are valid inside a longer explicit phrase but are too
+ * ambiguous to use as learned modifiers on their own. `ES` is both the E-mini
+ * S&P ticker and Spanish "is"; `SL` is stop-loss jargon and an abbreviation
+ * with many unrelated meanings; `LIVE` is a format word, not a topic.
+ */
+const AMBIGUOUS_SHORT_MODIFIERS = new Set(['es', 'sl', 'live']);
+
+export function isAmbiguousShortModifier(term: string): boolean {
+  const key = phraseKey(term);
+  return AMBIGUOUS_SHORT_MODIFIERS.has(key);
+}
+
 function addPhrase(out: Set<string>, value: string | undefined | null): void {
   const key = phraseKey(String(value || ''));
   if (key && !AMBIGUOUS_STANDALONE_SEMANTICS.has(key)) out.add(key);
@@ -430,4 +443,18 @@ export function auditSearchableTerms<T extends { term: string; term_type?: strin
   return rows
     .map(row => ({ ...row, ...isSearchableTradingTerm({ term: row.term, termType: row.term_type, country: row.country, language: row.language }) }))
     .filter(row => !row.eligible);
+}
+
+
+/**
+ * Legacy-vocabulary surfaces that can never be a useful search atom. They are
+ * still valid evidence/metadata, but must not enter the planner's learned
+ * vocabulary path. Keep this deterministic so extraction and cleanup agree.
+ */
+export function isNuisanceVocabularySurface(term: string): boolean {
+  // NFKC folds fullwidth markers; remove zero-width/format characters so a
+  // hidden prefix such as U+200B + "#forex" cannot slip through.
+  const value = normalize(term).replace(/[\u200B-\u200D\uFEFF]/gu, '');
+  const letters = value.match(/\p{L}/gu)?.length ?? 0;
+  return letters === 0 || /[#@]/u.test(value) || /^[0-9]+$/u.test(value);
 }
