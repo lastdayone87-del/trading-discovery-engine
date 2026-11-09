@@ -65,6 +65,7 @@ import {
   hasActiveEnrichmentJob,
   reconcileClassificationSighting,
   projectClassificationFailureIfPending,
+  isRetryableInfrastructureFailure,
 } from './db';
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
 import { reserveIncrementalTreatmentPageQuota, releaseIncrementalTreatmentPageReservation, enqueueChildAndCommitPageReservation } from './retrievalPolicyCanary';
@@ -1192,7 +1193,8 @@ export async function admitDiscoveredChannel(input: {
       if (error instanceof OfficialYouTubeQuotaFenceError
         || error instanceof YouTubeKeyCapUnavailableError
         || isProbeQuotaControlError(error)
-        || isYouTubeQuotaAccountingError(error)) {
+        || isYouTubeQuotaAccountingError(error)
+        || isRetryableInfrastructureFailure(error)) {
         throw error;
       }
       console.warn(`[TerminalPreservation] confirmed country revalidation failed for ${raw.channelId}; preserving confirmed row:`, error instanceof Error ? error.message : error);
