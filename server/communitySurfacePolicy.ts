@@ -297,7 +297,7 @@ export function effectiveAcquisitionOutcomes<T extends AcquisitionObservationLik
  * a completed Discord/community negative into an operational Discord failure.
  */
 export function isDiscordCommunityAcquisitionSurface(surface: string): boolean {
-  return new Set(['CHANNEL_EXTERNAL_LINKS', 'CREATOR_WEBSITES', 'SOCIAL_PROFILES']).has(surface);
+  return new Set(['CHANNEL_EXTERNAL_LINKS', 'PINNED_COMMENT', 'CREATOR_WEBSITES', 'SOCIAL_PROFILES']).has(surface);
 }
 
 /**
