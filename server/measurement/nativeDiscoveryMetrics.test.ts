@@ -114,6 +114,8 @@ test('provider yield is reported per 100 requests without a binomial interval', 
   // One request can confirm several creators; the rate is allowed to exceed 100.
   const [highYield] = evaluateProviderYield([{ provider: 'youtube-innertube', requests: 10, newConfirmedCreators: 50 }]);
   assert.equal(highYield.newConfirmedPer100Requests, 500);
+  const [noRequests] = evaluateProviderYield([{ provider: 'youtube-innertube', requests: 0, newConfirmedCreators: 0 }]);
+  assert.equal(noRequests.newConfirmedPer100Requests, null);
 });
 
 test('the evaluator rejects duplicate or conflicting creator identities', () => {
@@ -143,10 +145,19 @@ test('provider-yield JSON input requires non-negative safe integers', () => {
     { provider: 'youtube', requests: 1.5, newConfirmedCreators: 2 },
     { provider: 'youtube', requests: 10, newConfirmedCreators: -1 },
     { provider: '', requests: 10, newConfirmedCreators: 2 },
+    { provider: 'youtube', requests: 0, newConfirmedCreators: 1 },
   ]) {
     assert.throws(() => parseProviderYieldInputs([invalid]), /NATIVE_DISCOVERY_PROVIDER_YIELD_MALFORMED:1/);
   }
   assert.throws(() => parseProviderYieldInputs({}), /NATIVE_DISCOVERY_PROVIDER_YIELD_NOT_ARRAY/);
+});
+
+test('malformed optional CSV labels fail with row and column instead of inflating rates', () => {
+  const header = 'channel_id,country,language,trading_relevant,discovered,quality';
+  assert.throws(
+    () => parseNativeDiscoveryCsv(`${header}\nc1,France,fr,true,true,unclear`),
+    /NATIVE_DISCOVERY_CSV_INVALID_BOOLEAN:2:quality/,
+  );
 });
 
 test('CSV row numbers count physical lines, not filtered entries', () => {

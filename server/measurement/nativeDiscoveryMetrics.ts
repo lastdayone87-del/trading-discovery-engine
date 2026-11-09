@@ -59,7 +59,8 @@ export interface ProviderYieldInput {
 }
 
 export interface ProviderYield extends ProviderYieldInput {
-  newConfirmedPer100Requests: number;
+  /** Null when no requests were made; a zero denominator is not zero yield. */
+  newConfirmedPer100Requests: number | null;
 }
 
 export interface NativeDiscoveryReport {
@@ -164,7 +165,7 @@ export function evaluateProviderYield(inputs: ProviderYieldInput[]): ProviderYie
       ...input,
       requests,
       newConfirmedCreators: confirmed,
-      newConfirmedPer100Requests: requests > 0 ? (confirmed / requests) * 100 : 0,
+      newConfirmedPer100Requests: requests > 0 ? (confirmed / requests) * 100 : null,
     };
   });
 }
@@ -202,6 +203,7 @@ export function parseProviderYieldInputs(raw: unknown): ProviderYieldInput[] {
       || typeof newConfirmedCreators !== 'number'
       || !Number.isSafeInteger(newConfirmedCreators)
       || newConfirmedCreators < 0
+      || (requests === 0 && newConfirmedCreators > 0)
     ) {
       throw new Error(`NATIVE_DISCOVERY_PROVIDER_YIELD_MALFORMED:${index + 1}`);
     }
@@ -294,16 +296,24 @@ export function parseNativeDiscoveryCsv(csv: string): NativeDiscoveryCsvParseRes
     if (!channelId) throw new Error(`NATIVE_DISCOVERY_CSV_EMPTY_CHANNEL:${rowNumber}`);
     if (channelIds.has(channelId)) throw new Error(`NATIVE_DISCOVERY_CSV_DUPLICATE_CHANNEL:${rowNumber}:${channelId}`);
     channelIds.add(channelId);
+    const optionalBoolean = (name: string): boolean | null => {
+      const rawValue = get(name);
+      const parsed = parseBoolean(rawValue);
+      if (rawValue !== undefined && String(rawValue).trim() !== '' && parsed === null) {
+        throw new Error(`NATIVE_DISCOVERY_CSV_INVALID_BOOLEAN:${rowNumber}:${name}`);
+      }
+      return parsed;
+    };
     rows.push({
       channelId,
       country: get('country') || 'unknown',
       language: get('language') || 'und',
       tradingRelevant,
       discovered,
-      discoveredCountryMatch: parseBoolean(get('country_match')),
-      discoveredLanguageMatch: parseBoolean(get('language_match')),
-      quality: parseBoolean(get('quality')),
-      community: parseBoolean(get('community')),
+      discoveredCountryMatch: optionalBoolean('country_match'),
+      discoveredLanguageMatch: optionalBoolean('language_match'),
+      quality: optionalBoolean('quality'),
+      community: optionalBoolean('community'),
       provider: get('provider') || undefined,
     });
   }

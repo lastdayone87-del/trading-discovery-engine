@@ -65,7 +65,7 @@ if (providerYield) {
   console.log('Provider yield:');
   if (!report.providerYield.length) console.log('  (none)');
   for (const row of report.providerYield) {
-    console.log(`  ${row.provider}: ${row.newConfirmedCreators}/${row.requests} = ${row.newConfirmedPer100Requests.toFixed(1)} new confirmed creators per 100 requests`);
+    console.log(`  ${row.provider}: ${row.newConfirmedCreators}/${row.requests} = ${row.newConfirmedPer100Requests === null ? 'n/a' : row.newConfirmedPer100Requests.toFixed(1)} new confirmed creators per 100 requests`);
   }
 } else {
   console.log('Provider yield: not provided (pass a provider-requests JSON file to include it)');
