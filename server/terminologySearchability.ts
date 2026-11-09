@@ -476,6 +476,7 @@ export function dashboardSearchEligibility(row: {
   term_type?: string | null;
   country?: string | null;
   language?: string | null;
+  lifecycle_status?: string | null;
   search_eligible?: boolean | null;
 }): DashboardTerminologyEligibility {
   const gate = isSearchableTradingTerm({
@@ -484,8 +485,33 @@ export function dashboardSearchEligibility(row: {
     country: row.country,
     language: row.language,
   });
+  const lifecycleEligible = row.lifecycle_status === 'SEARCH_TRIAL' || row.lifecycle_status === 'PROVEN_SEARCH_TERM';
   return {
-    search_eligible: row.search_eligible === true && gate.eligible,
+    search_eligible: row.search_eligible === true && lifecycleEligible && gate.eligible,
     search_eligibility_reasons: gate.eligible ? [] : gate.reasons,
   };
+}
+
+/** Count only terms that would actually survive `getPlannerTerminology`. */
+export function countPlannerEligibleTerminologyRows(rows: Array<{
+  canonical_term: string;
+  term_type?: string | null;
+  country?: string | null;
+  language?: string | null;
+  lifecycle_status?: string | null;
+  search_eligible?: boolean | null;
+}>): number {
+  return rows.filter(row => dashboardSearchEligibility(row).search_eligible).length;
+}
+
+/**
+ * Stable dashboard ordering: computed planner eligibility first, then the
+ * original SQL order (yield/last-observed). This prevents a stale flagged row
+ * from occupying a page ahead of a genuinely eligible row.
+ */
+export function orderDashboardTerminologyRows<T extends { search_eligible: boolean }>(rows: T[]): T[] {
+  return rows
+    .map((row, index) => ({ row, index }))
+    .sort((a, b) => Number(b.row.search_eligible) - Number(a.row.search_eligible) || a.index - b.index)
+    .map(({ row }) => row);
 }

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { detectLanguage, languageScript } from './languageDetection';
 import { detectCodeSwitching } from './countryNativeIntelligence';
-import { dashboardSearchEligibility, isSearchableTradingTerm } from './terminologySearchability';
+import { countPlannerEligibleTerminologyRows, dashboardSearchEligibility, isSearchableTradingTerm, orderDashboardTerminologyRows } from './terminologySearchability';
 import { buildQueryCandidate, evaluateQueryComposition } from './queryQuality/composition';
 import { admitQueryRecord } from './queryQuality/admission';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
@@ -123,11 +123,23 @@ test('reviewed native terms pass the semantic and token gates', () => {
 });
 
 test('dashboard eligibility reflects the planner gate, not a stale flag', () => {
-  assert.equal(dashboardSearchEligibility({ canonical_term: '🔴', term_type: 'FORMAT', country: 'United States', language: 'en', search_eligible: true }).search_eligible, false);
-  assert.equal(dashboardSearchEligibility({ canonical_term: '#daytrading', term_type: 'FORMAT', country: 'United States', language: 'en', search_eligible: true }).search_eligible, false);
-  assert.equal(dashboardSearchEligibility({ canonical_term: 'ICT', term_type: 'TERMINOLOGY', country: 'United States', language: 'en', search_eligible: true }).search_eligible, true);
-  const demoted = dashboardSearchEligibility({ canonical_term: 'ICT', term_type: 'TERMINOLOGY', country: 'United States', language: 'en', search_eligible: false });
-  assert.equal(demoted.search_eligible, false);
+  assert.equal(dashboardSearchEligibility({ canonical_term: '🔴', term_type: 'FORMAT', country: 'United States', language: 'en', lifecycle_status: 'SEARCH_TRIAL', search_eligible: true }).search_eligible, false);
+  assert.equal(dashboardSearchEligibility({ canonical_term: '#daytrading', term_type: 'FORMAT', country: 'United States', language: 'en', lifecycle_status: 'SEARCH_TRIAL', search_eligible: true }).search_eligible, false);
+  assert.equal(dashboardSearchEligibility({ canonical_term: 'ICT', term_type: 'TERMINOLOGY', country: 'United States', language: 'en', lifecycle_status: 'SEARCH_TRIAL', search_eligible: true }).search_eligible, true);
+  assert.equal(dashboardSearchEligibility({ canonical_term: 'ICT', term_type: 'TERMINOLOGY', country: 'United States', language: 'en', lifecycle_status: 'DEMOTED', search_eligible: false }).search_eligible, false);
+  assert.equal(dashboardSearchEligibility({ canonical_term: 'ICT', term_type: 'TERMINOLOGY', country: 'United States', language: 'en', lifecycle_status: 'OBSERVED', search_eligible: true }).search_eligible, false);
+});
+
+test('summary count and dashboard ordering use computed eligibility', () => {
+  const rows = [
+    { canonical_term: '🔴', term_type: 'FORMAT', country: 'United States', language: 'en', lifecycle_status: 'SEARCH_TRIAL', search_eligible: true },
+    { canonical_term: 'ICT', term_type: 'TERMINOLOGY', country: 'United States', language: 'en', lifecycle_status: 'SEARCH_TRIAL', search_eligible: true },
+    { canonical_term: 'Gold', term_type: 'INSTRUMENT', country: 'United States', language: 'en', lifecycle_status: 'DEMOTED', search_eligible: false },
+  ];
+  assert.equal(countPlannerEligibleTerminologyRows(rows), 1);
+  const ordered = orderDashboardTerminologyRows(rows.map(row => ({ ...row, ...dashboardSearchEligibility(row) })));
+  assert.equal(ordered[0].canonical_term, 'ICT');
+  assert.equal(ordered[ordered.length - 1].canonical_term, 'Gold');
 });
 
 test('unrelated foreign terms remain ineligible after the CJK relaxation', () => {
