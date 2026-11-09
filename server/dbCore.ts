@@ -3067,14 +3067,15 @@ export async function enqueueJob(type:string,payload:any,opts:{priority?:number;
   // and is deferred while the guard remains default-off.
   const bulkAdmission=admitBulkEnqueue({label:`enqueueJob:${String(type||'UNKNOWN')}`});
   if(!bulkAdmission.allowed)throw new BulkEnqueueGuardError(bulkAdmission.kind||'transaction',bulkAdmission.limit||0);
-  const db=opts.clientOverride||await getDb();
+  let db:any;
+  let res:any;
+  try{
+  db=opts.clientOverride||await getDb();
   const reopenClockSql=reopenClockUpdateSql(acquisitionJobClockV2Enabled());
   const sql=opts.preventReopen
     ?`INSERT INTO jobs(type,payload,priority,max_attempts,run_after,idempotency_key,catalog_version_id,catalog_policy_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(idempotency_key) DO UPDATE SET updated_at=jobs.updated_at RETURNING *`
     :`INSERT INTO jobs(type,payload,priority,max_attempts,run_after,idempotency_key,catalog_version_id,catalog_policy_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(idempotency_key) DO UPDATE SET payload=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.payload ELSE jobs.payload END,status=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 'PENDING' ELSE jobs.status END,priority=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.priority ELSE jobs.priority END,max_attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.max_attempts ELSE jobs.max_attempts END,attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 0 ELSE jobs.attempts END,run_after=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.run_after ELSE jobs.run_after END,locked_by=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_by END,locked_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_at END,last_error=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.last_error END,completed_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.completed_at END,updated_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN now() ELSE jobs.updated_at END${reopenClockSql} RETURNING *`;
-  let res:any;
-  try{
-    res=await db.query(sql,[type,JSON.stringify(payload),opts.priority||0,opts.maxAttempts||3,opts.runAfter||new Date().toISOString(),opts.idempotencyKey||null,payload?.catalogPin?.catalogVersionId||null,payload?.catalogPin?.policyVersion||null]);
+  res=await db.query(sql,[type,JSON.stringify(payload),opts.priority||0,opts.maxAttempts||3,opts.runAfter||new Date().toISOString(),opts.idempotencyKey||null,payload?.catalogPin?.catalogVersionId||null,payload?.catalogPin?.policyVersion||null]);
   }catch(error){
     releaseBulkEnqueue(bulkAdmission);
     throw error;

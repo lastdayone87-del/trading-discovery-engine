@@ -84,6 +84,7 @@ interface TransactionState {
 interface BulkEnqueueReservation {
   state?: TransactionState;
   transactionId?: number;
+  windowId?: number;
   hourId?: number;
   released?: boolean;
 }
@@ -116,7 +117,7 @@ export class BulkEnqueueGuardError extends Error {
  */
 const bulkEnqueueScope = new AsyncLocalStorage<TransactionState>();
 let hourAdmissions: Array<{ id: number; at: number }> = [];
-let rollingAdmissions: Array<{ id: number; at: number }> = [];
+let scopeLessAdmissions: Array<{ id: number; at: number }> = [];
 let rollingWarnedAt = 0;
 let reservationSequence = 0;
 const ROLLING_WARNING_WINDOW_MS = 60_000;
@@ -146,20 +147,20 @@ function warnBulkEnqueue(state: TransactionState, now: number): void {
 
 function pruneRolling(now: number): void {
   const cutoff = now - ROLLING_WARNING_WINDOW_MS;
-  while (rollingAdmissions.length && rollingAdmissions[0].at <= cutoff) rollingAdmissions.shift();
+  while (scopeLessAdmissions.length && scopeLessAdmissions[0].at <= cutoff) scopeLessAdmissions.shift();
 }
 
 /** Always-on backstop for scope-less producers: no client object can opt out. */
 function warnRollingBulkEnqueue(now: number): void {
   pruneRolling(now);
-  if (rollingAdmissions.length <= BULK_ENQUEUE_TRANSACTION_WARNING_THRESHOLD) return;
+  if (scopeLessAdmissions.length <= BULK_ENQUEUE_TRANSACTION_WARNING_THRESHOLD) return;
   if (rollingWarnedAt && now - rollingWarnedAt < ROLLING_WARNING_WINDOW_MS) return;
   rollingWarnedAt = now;
   bumpBulkEnqueueWarning();
   console.warn(JSON.stringify({
     event: 'bulk_enqueue_transaction_warning',
     scope: 'process-rolling-60s',
-    admitted: rollingAdmissions.length,
+    admitted: scopeLessAdmissions.length,
     threshold: BULK_ENQUEUE_TRANSACTION_WARNING_THRESHOLD,
     enforcementEnabled: resolveBulkEnqueueGuardConfig().enabled,
     timestamp: new Date(now).toISOString(),
@@ -192,9 +193,9 @@ export function admitBulkEnqueue(input: {
     }
     // Scope-less producers get the same default budget over a rolling 60s
     // window, so the default-off cap is not merely a warning in production.
-    if (!state && rollingAdmissions.length >= config.maxPerTransaction) {
+    if (!state && scopeLessAdmissions.length >= config.maxPerTransaction) {
       bumpBulkEnqueueGuardBlock('window');
-      return { allowed: false, kind: 'window', used: rollingAdmissions.length, limit: config.maxPerTransaction };
+      return { allowed: false, kind: 'window', used: scopeLessAdmissions.length, limit: config.maxPerTransaction };
     }
     const cutoff = now - HOUR_MS;
     while (hourAdmissions.length && hourAdmissions[0].at <= cutoff) hourAdmissions.shift();
@@ -205,7 +206,10 @@ export function admitBulkEnqueue(input: {
   }
 
   const transactionId = ++reservationSequence;
-  rollingAdmissions.push({ id: transactionId, at: now });
+  // Only scope-less admissions count against the scope-less rolling window;
+  // a scoped batch must not exhaust unrelated unscoped producers.
+  const windowId = state ? undefined : transactionId;
+  if (windowId !== undefined) scopeLessAdmissions.push({ id: windowId, at: now });
   if (state) {
     state.count += 1;
     warnBulkEnqueue(state, now);
@@ -219,7 +223,7 @@ export function admitBulkEnqueue(input: {
     used: state?.count,
     limit: config.maxPerTransaction,
     warned: state?.warned,
-    reservation: { state, transactionId, hourId },
+    reservation: { state, transactionId, windowId, hourId },
   };
 }
 
@@ -237,8 +241,8 @@ export function releaseBulkEnqueue(decision?: BulkEnqueueGuardDecision): void {
   if (reservation.hourId !== undefined) {
     hourAdmissions = hourAdmissions.filter(entry => entry.id !== reservation.hourId);
   }
-  if (reservation.transactionId !== undefined) {
-    rollingAdmissions = rollingAdmissions.filter(entry => entry.id !== reservation.transactionId);
+  if (reservation.windowId !== undefined) {
+    scopeLessAdmissions = scopeLessAdmissions.filter(entry => entry.id !== reservation.windowId);
   }
 }
 
@@ -275,7 +279,7 @@ export function bulkEnqueueGuardSnapshot(): {
 /** Test-only reset; never called from serving paths. */
 export function resetBulkEnqueueGuardForTests(): void {
   hourAdmissions = [];
-  rollingAdmissions = [];
+  scopeLessAdmissions = [];
   rollingWarnedAt = 0;
   reservationSequence = 0;
 }

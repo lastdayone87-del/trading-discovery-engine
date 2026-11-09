@@ -425,6 +425,19 @@ test('scope-less bulk bursts hit the rolling window cap when enabled', () => {
   assert.equal(admitBulkEnqueue({ now: 70_000, config }).allowed, true);
 });
 
+test('scoped batches do not consume the scope-less rolling window', async () => {
+  const scopeConfig = { enabled: true, maxPerTransaction: 10, maxPerHour: 100 };
+  await withBulkEnqueueTransaction('scoped-window', async () => {
+    for (let index = 0; index < 5; index += 1) {
+      assert.equal(admitBulkEnqueue({ now: 1_000 + index, config: scopeConfig }).allowed, true);
+    }
+  });
+  const config = { enabled: true, maxPerTransaction: 2, maxPerHour: 100 };
+  assert.equal(admitBulkEnqueue({ now: 2_000, config }).allowed, true);
+  assert.equal(admitBulkEnqueue({ now: 3_000, config }).allowed, true);
+  assert.equal(admitBulkEnqueue({ now: 4_000, config }).allowed, false, 'only unscoped admissions count toward the window');
+});
+
 test('bulk enqueue release returns a failed or no-op reservation', async () => {
   const config = { enabled: true, maxPerTransaction: 1, maxPerHour: 100 };
   await withBulkEnqueueTransaction('release-test', async () => {
