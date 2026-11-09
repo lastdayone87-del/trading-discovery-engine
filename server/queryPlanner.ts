@@ -6,6 +6,7 @@ import {evaluateRetrievalSpecificity,type RetrievalSpecificityDecision} from './
 import { countrySearchLanguageCandidates, normalizeLanguageCode } from './countrySearchHints';
 import { capFreeSignalCandidates, type FreeSignalQueryCandidate, type FreeSignalType } from './freeQuerySignals';
 import { isReviewedNativePhrase, isSearchableTradingTerm, reviewedNativePhraseLanguages, TERMINOLOGY_SEARCHABILITY_VERSION } from './terminologySearchability';
+import { isProductionConfiguredCountry } from './queryQuality/profiles';
 
 export type QueryKnowledgeTier = 1 | 2 | 3;
 export type QueryGenerationMode = 'EXPLORATION' | 'EXPLOITATION' | 'COLD_START';
@@ -738,7 +739,11 @@ export function planDiverseQueries(args: {
       : sourceTypes[0];
     // Marker consumed by the execution-time authority gate: a promoted anchor
     // acts as anchor only inside this paired template, by operator selection.
+    // An explicitly selected dormant country also needs the marker on its
+    // reviewed native singles; otherwise admission rejects them even though
+    // the operator authorized the market.
     const scopePromotedAnchor = !hasAuthorizedAnchor && promotedAnchors.includes(primary);
+    const scopePromotedRegion = args.scopePromotionBasis != null && !isProductionConfiguredCountry(args.country);
     planned.push({
       query,
       intent: primary.intent,
@@ -788,7 +793,7 @@ export function planDiverseQueries(args: {
           demandSignalIds: candidate.demand.sourceIds,
           demandScore: candidate.demand.demandScore,
         } : {}),
-        ...(scopePromotedAnchor ? { scopePromoted: true, promotionBasis: args.scopePromotionBasis } : {}),
+        ...(scopePromotedAnchor || scopePromotedRegion ? { scopePromoted: true, promotionBasis: args.scopePromotionBasis } : {}),
         retrievalSpecificity:{policyVersion:primary.retrievalPolicy.policyVersion,eligibility:primary.retrievalPolicy.eligibility,specificity:primary.retrievalPolicy.specificity,ambiguity:primary.retrievalPolicy.ambiguity,reasonCodes:primary.retrievalPolicy.reasonCodes},
         atoms: candidate.atoms.map((item, position) => ({ ...item, role: position === 0 ? 'ANCHOR' : 'MODIFIER', position })),
         localTier1Term: primary.term,

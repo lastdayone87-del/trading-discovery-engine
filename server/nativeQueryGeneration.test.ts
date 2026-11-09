@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { INITIAL_COUNTRY_VOCABULARIES } from '../src/data/initial_countries';
 import { planDiverseQueries, shouldGenerateNativeQueries } from './queryPlanner';
+import { admitQueryRecord } from './queryQuality/admission';
 
 function vocabulary(country: string) {
   const found = INITIAL_COUNTRY_VOCABULARIES.find(item => item.country === country);
@@ -34,6 +35,28 @@ test('native query atoms reach the planner for representative non-English market
     const queries = planned(country);
     assert.ok(queries.some(query => pattern.test(query)), `${country} planner did not emit a native surface: ${queries.join(' | ')}`);
   }
+});
+
+test('selected dormant countries can admit their native standalone surfaces', () => {
+  const planned = planDiverseQueries({
+    country: 'Spain',
+    count: 8,
+    countryVocabulary: vocabulary('Spain'),
+    learnedVocabulary: [],
+    existingQueries: [],
+    mode: 'EXPLORATION',
+    scopePromotionBasis: 'PERSISTENT_SCOPE_SELECTION',
+  });
+  const native = planned.find(item => item.metadata.queryTemplate === 'SINGLE_ATOM');
+  assert.ok(native, 'no native standalone surface was planned');
+  assert.equal(native.metadata.scopePromoted, true);
+  const decision = admitQueryRecord({
+    query: native.query,
+    country: 'Spain',
+    primary_term: native.primaryTerm,
+    generation_metadata: native.metadata,
+  });
+  assert.equal(decision.eligible, true, decision.reasonCodes.join(','));
 });
 
 test('native replenishment runs below the eligible floor, not only when the pool is empty', () => {

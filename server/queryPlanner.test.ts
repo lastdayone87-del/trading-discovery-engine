@@ -241,7 +241,7 @@ test('planner produces novel local instrument-market variants when every current
     organicCandidates: [],
     mode: 'EXPLORATION'
   });
-  assert.ok(planned.length >= 2);
+  assert.equal(planned.length, 8);
   assert.ok(planned.every(item => !existing.some(saved => normalizeQuery(saved.query) === normalizeQuery(item.query))));
   // Native local singles are now part of the pool, but the instrument-market
   // fallback shape must still be available for a fully cooling-down library.
