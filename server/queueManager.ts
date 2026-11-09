@@ -160,7 +160,7 @@ import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
 import { bumpCommunitySaturationDeferral } from './operationsTelemetry';
 import { acquisitionEvidenceFromObservations } from './acquisitionFailureClassification';
 import { canContinueCommunityInspectionAfterDegradedManualClassification } from './manualRecheckPolicy';
-import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_ACQUISITION_REQUIRED, COMMUNITY_RETRY_REASON, FOUND_GAP_RETRYABLE_FAILURE_CLASSES, buildCommunityRetryJobMetadata, isAttemptFreeCommunityFailure, attemptFreeDiscordValidation, retryAtFromUnknown, retryReasonFromError, type CommunityRetryDirective} from './communityRetryPolicy';
+import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_ACQUISITION_REQUIRED, COMMUNITY_RETRY_REASON, FOUND_GAP_RETRYABLE_FAILURE_CLASSES, buildCommunityRetryJobMetadata, isAttemptFreeCommunityFailure, attemptFreeDiscordValidation, communityRetryDirectiveOwnsDurableWork, retryAtFromUnknown, retryReasonFromError, type CommunityRetryDirective} from './communityRetryPolicy';
 import { classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
 import { discordCandidateCompositeRank } from './discordOwnershipSelection';
 import { admitDiscordCandidates, buildLegacyDiscordCandidate, canonicalDiscordInviteId, discordInviteCodeOf, extractDiscordInviteCodeRaw, inferDiscordOwnership, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
@@ -3748,10 +3748,15 @@ export async function inspectAndValidateChannel(
       // and required retryable PARTIALLY_INSPECTED both own the RETRY_PENDING
       // path, so partial-only acquisitions never strand in FAILED_OPERATIONAL.
       const hasRetryableAcquisitionFailure=hasRetryableCommunityAcquisitionFailure(inspection.acquisitionOutcomes||[],inspection.retrySuppressedUrls);
+      // H2: a non-attempt-free directive (real optional-surface failure) owns
+      // durable retry just like a capacity deferral. The previous
+      // attempt-free-only gate silently dropped it, leaving the channel
+      // FAILED_OPERATIONAL with no worker to consume the uncertainty.
+      const directiveOwnsDurableWork=communityRetryDirectiveOwnsDurableWork(inspection.retryDirective);
       if(!alreadyValidatedSuccess){
         channel.discord_status='UNCERTAIN';
         channel.discord_liveness_status=channel.discord_candidate_locator?channel.discord_liveness_status||'UNCERTAIN':'NOT_CHECKED';
-        channel.discord_validation_status=hasRetryableAcquisitionFailure?'RETRY_PENDING':'FAILED_OPERATIONAL';
+        channel.discord_validation_status=hasRetryableAcquisitionFailure||directiveOwnsDurableWork?'RETRY_PENDING':'FAILED_OPERATIONAL';
         channel.discord_resolution_status=channel.discord_resolution_status||'RESOLVED';
         channel.discord_discovery_status=channel.discord_candidate_locator?'DISCOVERED_VALIDATION_FAILED':'NOT_DISCOVERED';
       }
@@ -3764,12 +3769,16 @@ export async function inspectAndValidateChannel(
       // append-only checks remain authoritative until a new validation replaces
       // this compatibility projection.
       channel.last_checked=now;
-      if(retryDirective?.attemptFree&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id,retryDirective);
+      // One durable owner per projection: a FOUND-gap directive can satisfy
+      // both gates below, and enqueueing it twice double-counts saturation
+      // deferral telemetry even though the idempotency key collapses the job.
+      const inspectionDirectiveEnqueued=Boolean(retryDirective&&(retryDirective.attemptFree||directiveOwnsDurableWork)&&scheduleRetry);
+      if(inspectionDirectiveEnqueued)await enqueueCommunityAcquisitionRetry(channel.channel_id,retryDirective);
       // Retained-invite FOUND gap (multi-invite recall): the validation branch
       // owns this for admitted invites; discarded/unadmitted FOUND aggregates
       // reach this branch instead (E8) and must not lose the outstanding
       // bounded recovery.
-      if(scheduleRetry&&shouldScheduleFoundGapAcquisitionRetry(inspection))await enqueueCommunityAcquisitionRetry(channel.channel_id,inspection.retryDirective);
+      if(scheduleRetry&&!inspectionDirectiveEnqueued&&shouldScheduleFoundGapAcquisitionRetry(inspection))await enqueueCommunityAcquisitionRetry(channel.channel_id,inspection.retryDirective);
     } else {
       // Final NOT_FOUND projection after all steps (no admitted/discovered
       // invite and no FAILED/PARTIAL acquisition status). Extracted for
@@ -3934,10 +3943,11 @@ export async function handleRelationshipCanaryExpansionJob(
  * The projection may only complete a channel when no discovery obligation
  * remains outstanding; otherwise it would strand the work. Pure over
  * channel + inspection state (no DB): the durable retry job is preserved by
- * never clearing scan attempts on a pending projection. Three keep-pending
+ * never clearing scan attempts on a pending projection. Four keep-pending
  * signals:
  *  - a stored locator whose validation never reached a terminal verdict;
  *  - a FOUND+required-gap directive (invites retained, gap unresolved);
+ *  - a community retry directive (required or optional surface failure);
  *  - a mandatory community-surface observation that is retryable.
  *
  * The retryable-observation check intentionally reuses the shared
@@ -3966,6 +3976,13 @@ export function detectPendingDiscoveryWork(
   );
   if (locatorUnvalidated) reasons.push('locator-unvalidated');
   if (shouldScheduleFoundGapAcquisitionRetry(inspection)) reasons.push('found-gap-retry');
+  const directive = inspection?.retryDirective;
+  if (directive && typeof directive === 'object') {
+    const retryReason = String((directive as { retryReason?: unknown }).retryReason || '');
+    if (retryReason === COMMUNITY_RETRY_REASON.COMMUNITY_REQUIRED_ACQUISITION_FAILURE) {
+      reasons.push('community-retry-directive');
+    }
+  }
   const outcomes = Array.isArray(inspection?.acquisitionOutcomes) ? inspection.acquisitionOutcomes : [];
   const suppressed = Array.isArray(inspection?.retrySuppressedUrls) ? inspection.retrySuppressedUrls.map(String) : undefined;
   if (hasRetryableCommunityAcquisitionFailure(outcomes as Parameters<typeof hasRetryableCommunityAcquisitionFailure>[0], suppressed)) {

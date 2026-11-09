@@ -30,7 +30,11 @@ test('structured provider capacity errors retain retry-at metadata for durable s
 test('queue gates channel attempt increments and retry scheduling on the directive',()=>{
   const queue=readFileSync(new URL('./queueManager.ts',import.meta.url),'utf8');
   assert.match(queue,/if\(!retryDirective\?\.attemptFree\)channel\.scan_attempts\+\+/);
-  assert.match(queue,/if\(retryDirective\?\.attemptFree&&scheduleRetry\)await enqueueCommunityAcquisitionRetry/);
+  assert.match(queue,/communityRetryDirectiveOwnsDurableWork\(inspection\.retryDirective\)/);
+  assert.match(queue,/hasRetryableAcquisitionFailure\|\|directiveOwnsDurableWork\?'RETRY_PENDING'/);
+  assert.match(queue,/const inspectionDirectiveEnqueued=Boolean\(retryDirective&&\(retryDirective\.attemptFree\|\|directiveOwnsDurableWork\)&&scheduleRetry\)/);
+  assert.match(queue,/if\(inspectionDirectiveEnqueued\)await enqueueCommunityAcquisitionRetry/);
+  assert.match(queue,/if\(scheduleRetry&&!inspectionDirectiveEnqueued&&shouldScheduleFoundGapAcquisitionRetry/);
   assert.match(queue,/code:directive\.code,retryable:true,retryAt:directive\.retryAt/);
   assert.doesNotMatch(queue,/inspection\.acquisitionOutcomes\?\.some\(item=>item\.retryable\)&&scheduleRetry/);
   assert.match(queue,/browserCapabilityIsUnavailable/);

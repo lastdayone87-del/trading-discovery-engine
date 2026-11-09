@@ -209,12 +209,69 @@ test('Discord extraction is preserved across supported acquired surfaces',async(
   assert.equal(about.foundInvite,'about-room');assert.equal(links.foundInvite,'link-room');
 });
 
-test('optional website failure does not contaminate social or required acquisition coverage',async()=>{
+test('optional website failure is not a clean no-match and owns retry',async()=>{
   const result=await runChannelInspection({channelId:'optional',channelBio:'https://unreachable.invalid',videoDescriptions:['1','2','3','4','5'],externalFetchImpl:async()=>response(503,'','text/html')});
-  assert.equal(result.acquisitionStatus,'INSPECTED_NO_MATCH');
+  assert.equal(result.acquisitionStatus,'PARTIALLY_INSPECTED');
   const website=result.steps.find(step=>step.step==='CUSTOM_DOMAINS'),social=result.steps.find(step=>step.step==='SOCIAL_BIO');
   assert.equal(website?.status,'ERROR');assert.equal(social?.status,'SKIPPED');
   assert.equal(result.acquisitionOutcomes?.find(item=>item.surface==='CREATOR_WEBSITES')?.required,false);
+  assert.equal(result.retryDirective?.code,'COMMUNITY_ACQUISITION_REQUIRED');
+  assert.equal(result.retryDirective?.attemptFree,false);
+});
+
+test('genuinely inspected optional website no-match remains clean',async()=>{
+  const result=await runChannelInspection({
+    channelId:'optional-clean',
+    channelBio:'https://creator.example/',
+    videoDescriptions:['1','2','3','4','5'],
+    destinationResolver:async()=>['93.184.216.34'],
+    externalFetchImpl:async()=>response(200,'<html><body>No community links here.</body></html>','text/html'),
+  });
+  assert.equal(result.acquisitionStatus,'INSPECTED_NO_MATCH');
+  assert.equal(result.retryDirective,undefined);
+  assert.equal(result.steps.find(step=>step.step==='CUSTOM_DOMAINS')?.status,'NOT_FOUND');
+});
+
+test('a confirmed optional 404 is proven absence, not retry work',async()=>{
+  const result=await runChannelInspection({
+    channelId:'optional-404',
+    channelBio:'https://creator.example/missing',
+    videoDescriptions:['1','2','3','4','5'],
+    destinationResolver:async()=>['93.184.216.34'],
+    externalFetchImpl:async()=>response(404,'<html><body><h1>Page not found</h1><p>This page does not exist.</p></body></html>','text/html'),
+  });
+  assert.equal(result.acquisitionStatus,'INSPECTED_NO_MATCH');
+  assert.equal(result.retryDirective,undefined);
+  assert.ok(result.acquisitionOutcomes?.some(item=>item.surface==='CREATOR_WEBSITES'&&item.outcome==='ACQUISITION_FAILED'&&item.retryable===false));
+});
+
+test('a clean required surface does not hide an optional community failure',async()=>{
+  const result=await runChannelInspection({
+    channelId:'optional-hidden-by-required',
+    channelName:'Optional Hidden',
+    channelBio:'https://creator.example/',
+    channelLinks:['https://linktr.ee/example'],
+    videoDescriptions:['one','two','three','four','five'],
+    creatorLikelyTrading:false,
+    externalFetchImpl:(async(input)=>{
+      const url=String(input);
+      if(url.includes('linktr.ee'))return new Response('blocked',{status:406,headers:{'content-type':'text/html'}});
+      return new Response('unavailable',{status:503,headers:{'content-type':'text/html'}});
+    }) as typeof fetch,
+    renderedFallback:(async(seedUrl:string)=>({
+      foundInvite:null,
+      foundLocation:seedUrl,
+      inspectedPages:1,
+      scrolls:0,
+      clicks:0,
+      complete:true,
+      retryable:false,
+      detail:'rendered clean',
+    } as any)) as any,
+  });
+  assert.equal(result.acquisitionStatus,'PARTIALLY_INSPECTED');
+  assert.equal(result.retryDirective?.code,'COMMUNITY_ACQUISITION_REQUIRED');
+  assert.ok(result.acquisitionOutcomes?.some(item=>item.required===true&&item.surface==='CREATOR_WEBSITES'&&item.outcome==='INSPECTED_NO_MATCH'));
 });
 
 
