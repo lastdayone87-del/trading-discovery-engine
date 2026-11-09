@@ -66,21 +66,27 @@ test('poor repeated production yield demotes without deleting evidence', () => {
   assert.match(result.reason, /demotion threshold/);
 });
 
-test('terminology dashboard projects the weighted yield before aggregating the derived relation', async () => {
-  let capturedSql = '';
+test('terminology dashboard reads an ordered base projection and hydrates weighted yield separately', async () => {
+  const capturedSql: string[] = [];
   const runner = {
     async query(sql: string) {
-      capturedSql = sql;
+      capturedSql.push(sql);
+      if (sql.includes('FROM canonical_trading_terms t')) {
+        return { rows: [{ id: '1', canonical_term: 'ICT', term_type: 'TERMINOLOGY', country: 'United States', language: 'en', lifecycle_status: 'SEARCH_TRIAL', search_eligible: true, decayed_yield_score: 0.2 }] };
+      }
       return { rows: [] };
     }
   } as any;
 
   await getTerminologyDashboard(undefined, runner);
 
-  assert.match(capturedSql, /SUM\(decayed_yield_score\*executions\) weighted_yield_total/);
-  assert.match(capturedSql, /SUM\(weighted_yield_total\)\/NULLIF\(SUM\(executions\),0\)/);
-  const derivedRelation = capturedSql.match(/FROM \(SELECT ([\s\S]+?) FROM terminology_performance/)?.[1] || '';
-  assert.match(derivedRelation, /weighted_yield_total/);
+  const base = capturedSql.find(sql => sql.includes('ORDER BY decayed_yield_score DESC')) || '';
+  assert.match(base, /SUM\(p\.decayed_yield_score\*p\.executions\)\/NULLIF\(SUM\(p\.executions\),0\)/);
+  assert.match(base, /last_observed_at DESC NULLS LAST/);
+  assert.match(base, /t\.id DESC/);
+  const hydration = capturedSql.find(sql => sql.includes('weighted_yield_total')) || '';
+  assert.match(hydration, /SUM\(decayed_yield_score\*executions\) weighted_yield_total/);
+  assert.match(hydration, /SUM\(weighted_yield_total\)\/NULLIF\(SUM\(executions\),0\)/);
 });
 
 test('planner ranks by execution-weighted yield so inert audit rows cannot lower a term', async () => {
