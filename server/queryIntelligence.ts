@@ -409,6 +409,9 @@ export interface ReconcileOutcome {
  * save can never inflate frequency — the saver always brings it to exactly 1.
  */
 export async function defaultReconcileExtractedTerm(country: string, term: string, category: 'terminology' | 'instrument' | 'phrase' | 'format', sourceChannelId?: string, clientOverride?: { query: (text: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }> }): Promise<ReconcileOutcome> {
+  // Keep the migration invariant durable: repairing an existing row must not
+  // recompute a nuisance surface back to trust tier 2 from retained sources.
+  if (isNuisanceVocabularySurface(term)) return { rowInserted: false, linkInserted: false };
   const { normalizeTerm: normalizeTermForReconcile } = await import('./terminologyIntelligence');
   const db = clientOverride ?? await getDb();
   const clean = term.trim();

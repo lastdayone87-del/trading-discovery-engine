@@ -452,7 +452,9 @@ export function auditSearchableTerms<T extends { term: string; term_type?: strin
  * vocabulary path. Keep this deterministic so extraction and cleanup agree.
  */
 export function isNuisanceVocabularySurface(term: string): boolean {
-  const value = normalize(term);
+  // NFKC folds fullwidth markers; remove zero-width/format characters so a
+  // hidden prefix such as U+200B + "#forex" cannot slip through.
+  const value = normalize(term).replace(/[\u200B-\u200D\uFEFF]/gu, '');
   const letters = value.match(/\p{L}/gu)?.length ?? 0;
-  return letters === 0 || /^[#@]/u.test(value) || /^[0-9]+$/u.test(value);
+  return letters === 0 || /[#@]/u.test(value) || /^[0-9]+$/u.test(value);
 }
