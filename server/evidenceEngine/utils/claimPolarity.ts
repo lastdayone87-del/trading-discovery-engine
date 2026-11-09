@@ -86,7 +86,7 @@ const CONTRAST_CUE = /(?:\b(?:but|however|yet|although|though|whereas|neverthele
 // `and` only starts a new clause when it introduces a new predicate/subject;
 // noun coordination ("stocks and crypto") stays inside the negation scope.
 const COORDINATION_CUE = /\b(?:and|&)\s+(?=(?:i|we|you|they|he|she|it)\b|(?:teach|learn|trade|show|share|explain|post|upload|run|make|offer|provide|help|cover|analy[sz]e|review|discuss|focus|talk|stream|prefer)\b)/iu;
-const POST_MAY = /^\s*may(?![ \t]+\d{4}|[ \t]+\d{1,2}\b)/iu;
+const POST_MAY = /^\s*may\b(?![ \t]+\d{4}\b|[ \t]+\d{1,2}(?:st|nd|rd|th)?\b)/iu;
 const PRE_MAY_MODAL = /\b(?:i|we|you|they|he|she|it|one)\s+may\s+(?!\d{4}\b)/iu;
 const OWN_COURSE_PHRASE = /(?:^|[\s,;:])(?:my|our)(?:\s+(?:online|video|paid|new|trading|flagship|premium|free|beginner|advanced|own|private|membership|course|program|mentorship)){0,3}\s+courses?\b/iu;
 const FIRST_PERSON_COURSE = /\bcourses?\s+(?:i|we)\s+teach\b/iu;
