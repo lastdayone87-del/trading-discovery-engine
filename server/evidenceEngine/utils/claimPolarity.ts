@@ -87,6 +87,9 @@ const CONTRAST_CUE = /(?:\b(?:but|however|yet|although|though|whereas|neverthele
 // noun coordination ("stocks and crypto") stays inside the negation scope.
 const COORDINATION_CUE = /\b(?:and|&)\s+(?=(?:i|we|you|they|he|she|it)\b|(?:teach|learn|trade|show|share|explain|post|upload|run|make|offer|provide|help|cover|analy[sz]e|review|discuss|focus|talk|stream|prefer)\b)/iu;
 const POST_MAY = /^\s*may(?![ \t]+\d{4}|[ \t]+\d{1,2}\b)/iu;
+const PRE_MAY_MODAL = /\b(?:i|we|you|they|he|she|it|one)\s+may\s+(?!\d{4}\b)/iu;
+const OWN_COURSE_PHRASE = /(?:^|[\s,;:])(?:my|our)(?:\s+(?:online|video|paid|new|trading|flagship|premium|free|beginner|advanced|own|private|membership|course|program|mentorship)){0,3}\s+courses?\b/iu;
+const FIRST_PERSON_COURSE = /\bcourses?\s+(?:i|we)\s+teach\b/iu;
 
 function lastAttributionMatch(text: string): RegExpExecArray | undefined {
   const matches = [...text.matchAll(new RegExp(ATTRIBUTION_CUE.source, 'giu'))];
@@ -299,9 +302,9 @@ export function classifyClaimPolarity(
   // attributed to someone else. Scope the exception to the matched course
   // phrase so a later gurus/courses claim is still quoted.
   const ownCourse = Boolean(attributionMatch
-    && /^courses?\b/iu.test(attributionMatch[0])
     && !/\b(?:gurus?|scammers?|sellers?|promoters?|influencers?|they|these|those)\b/iu.test(attributionMatch[0])
-    && /\b(?:my|our)\b/iu.test(before.slice(0, (attributionMatch.index || 0) + attributionMatch[0].length)));
+    && (OWN_COURSE_PHRASE.test(before.slice(0, (attributionMatch.index || 0) + attributionMatch[0].length))
+      || FIRST_PERSON_COURSE.test(attributionMatch[0])));
   if (quotationFrame && ((attributionBefore && !ownCourse) || (termLooksLikeClaim && criticismBefore))) {
     const cue = (attributionMatch?.[0] || CRITICISM_CUE.exec(before)?.[0]);
     return { polarity: 'QUOTED', cue, confidence: 0.88 };
@@ -337,6 +340,9 @@ export function classifyClaimPolarity(
     }
   }
 
+  if (PRE_MAY_MODAL.test(before)) {
+    return { polarity: 'HYPOTHETICAL', cue: 'may', confidence: 0.75 };
+  }
   const hypothetical = combinedCueRegex(before, language, HYPOTHETICAL_CUES);
   if (hypothetical) {
     const cue = closestCue(hypothetical, before);
