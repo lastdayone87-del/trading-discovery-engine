@@ -5,6 +5,7 @@
 import { decodeEmbeddedMarkup, detachPageSlice, extractEmbeddedUrls } from './crawlerExtraction';
 import { readBoundedResponseText } from './crawlResponseBounds';
 import { isPageAssetInfrastructureUrl } from './communitySurfacePolicy';
+import { sanitizeSubscriberCountText } from './lowAudienceGate';
 
 /** Local unions avoid coupling this helper to the full app types module. */
 export type PublicAboutCountryStatus = 'CONFIRMED' | 'LIKELY' | 'UNCERTAIN' | 'REJECTED';
@@ -18,6 +19,8 @@ export interface PublicYouTubeChannelAbout {
   bio?: string;
   channelLinks?: string[];
   thumbnailUrl?: string;
+  /** Public subscriber text (e.g. "5 subscribers"), validated as a count. */
+  subscriberCountText?: string;
   rawHtml?: string;
   fetchLog?: string;
   /** True when the source page exceeded the bounded-response cap. */
@@ -143,9 +146,11 @@ export function parseAboutPageMetadataFromHtml(html: string): {
   bio?: string;
   thumbnailUrl?: string;
   explicitLinks: string[];
+  subscriberCountText?: string;
 } {
   let thumbnailUrl: string | undefined;
   let bio: string | undefined;
+  let subscriberCountText: string | undefined;
   const explicitLinks: string[] = [];
 
   const match = html.match(/ytInitialData\s*=\s*({.*?});<\/script>/);
@@ -158,9 +163,30 @@ export function parseAboutPageMetadataFromHtml(html: string): {
       if (ytData.metadata?.channelMetadataRenderer?.avatar?.thumbnails?.[0]?.url) {
         thumbnailUrl = ytData.metadata.channelMetadataRenderer.avatar.thumbnails[0].url;
       }
+      const recordSubscriberText = (value: unknown): void => {
+        if (subscriberCountText !== undefined) return;
+        const text = typeof value === 'string'
+          ? value
+          : typeof value === 'object' && value !== null
+            ? (value as { content?: unknown }).content
+            : undefined;
+        if (typeof text !== 'string') return;
+        subscriberCountText = sanitizeSubscriberCountText(text);
+      };
       function extractLinks(obj: unknown): void {
         if (typeof obj !== 'object' || obj === null) return;
         const record = obj as Record<string, unknown>;
+        if (record.subscriberCountText !== undefined) recordSubscriberText(record.subscriberCountText);
+        // Channel-root headers have no subscriberCountText field; the count is
+        // one of the metadataParts ("5 subscribers", "11 videos").
+        const metadataParts = record.metadataParts;
+        if (Array.isArray(metadataParts)) {
+          for (const part of metadataParts) {
+            if (typeof part !== 'object' || part === null) continue;
+            const text = (part as { text?: { content?: unknown } }).text?.content;
+            if (typeof text === 'string' && /subscribers?$/i.test(text.trim())) recordSubscriberText(text);
+          }
+        }
         const viewModel = record.channelExternalLinkViewModel as
           | { link?: { content?: string } }
           | undefined;
@@ -185,6 +211,18 @@ export function parseAboutPageMetadataFromHtml(html: string): {
     }
   }
 
+  if (!subscriberCountText) {
+    // Some surfaces render ytInitialData in a shape the JSON walk cannot
+    // reach; the decoded page still carries the same field as a literal.
+    const subscriberMatch = decodeEmbeddedMarkup(html).match(
+      /"subscriberCountText"\s*:\s*"((?:[^"\\]|\\.)+)"/
+    );
+    if (subscriberMatch) {
+      const literal = subscriberMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+      subscriberCountText = sanitizeSubscriberCountText(literal);
+    }
+  }
+
   if (!thumbnailUrl) {
     const ogImg =
       html.match(/<meta\s+property="og:image"\s+content="([^"]+)"/i) ||
@@ -199,7 +237,12 @@ export function parseAboutPageMetadataFromHtml(html: string): {
     if (ogDesc?.[1]) bio = detachPageSlice(ogDesc[1]);
   }
 
-  return { bio, thumbnailUrl, explicitLinks };
+  return {
+    bio,
+    thumbnailUrl,
+    explicitLinks,
+    ...(subscriberCountText ? { subscriberCountText } : {}),
+  };
 }
 
 /**
@@ -213,7 +256,7 @@ export function parseYouTubeChannelAboutFromHtml(
   options?: { enableDebug?: boolean; finalUrl?: string }
 ): PublicYouTubeChannelAbout {
   const cleanHtml = decodeEmbeddedMarkup(html);
-  const { bio, thumbnailUrl, explicitLinks } = parseAboutPageMetadataFromHtml(html);
+  const { bio, thumbnailUrl, explicitLinks, subscriberCountText } = parseAboutPageMetadataFromHtml(html);
 
   // Page-asset infrastructure endpoints (thumbnails, playback, telemetry,
   // schema, fonts) captured by the indiscriminate scrape above can never be
@@ -230,6 +273,7 @@ export function parseYouTubeChannelAboutFromHtml(
     bio,
     channelLinks: extractedUrls,
     thumbnailUrl,
+    ...(subscriberCountText ? { subscriberCountText } : {}),
     rawHtml: options?.enableDebug ? cleanHtml : undefined,
     fetchLog:
       options?.enableDebug && options.finalUrl
@@ -285,6 +329,7 @@ export async function fetchLiveYouTubeChannelData(
     if (!aboutPage && !rootPage) return null;
     const bioSource = aboutParsed?.bio?.trim() ? aboutParsed : rootParsed;
     const bio = bioSource?.bio;
+    const subscriberCountText = aboutParsed?.subscriberCountText || rootParsed?.subscriberCountText;
     const channelLinks = Array.from(
       new Set([...(aboutParsed?.channelLinks || []), ...(rootParsed?.channelLinks || [])])
     );
@@ -293,11 +338,12 @@ export async function fetchLiveYouTubeChannelData(
     // A truncated prefix with no usable evidence is an incomplete fetch, not
     // a definitive empty About page: return null so callers record
     // ATTEMPTED_FAILED (retryable) instead of ATTEMPTED_EMPTY (terminal).
-    if (truncated && !bio?.trim() && channelLinks.length === 0) return null;
+    if (truncated && !bio?.trim() && channelLinks.length === 0 && !subscriberCountText) return null;
     return {
       ...(bio?.trim() ? { bio } : {}),
       ...(channelLinks.length ? { channelLinks } : {}),
       thumbnailUrl: aboutParsed?.thumbnailUrl || rootParsed?.thumbnailUrl,
+      ...(subscriberCountText ? { subscriberCountText } : {}),
       // Debug HTML/log must describe the surface that supplied the selected
       // bio, otherwise a root bio would be paired with About-page debug text.
       ...(bioSource?.rawHtml || aboutParsed?.rawHtml || rootParsed?.rawHtml
@@ -314,26 +360,37 @@ export async function fetchLiveYouTubeChannelData(
 }
 
 /**
- * Apply public About text onto a mutable candidate and return whether description changed.
- * Soft-failing: returns false when nothing usable was retrieved.
+ * Apply public About text onto a mutable candidate and return whether a
+ * description or subscriber count changed. Soft-failing: returns false when
+ * neither was retrieved.
  */
 export function applyPublicAboutToCandidate(
   candidate: {
     description?: string;
     channelLinks?: string[];
     channelThumbnailUrl?: string;
+    subscriberCount?: string;
   },
   live: PublicYouTubeChannelAbout | null | undefined
 ): boolean {
-  if (!live?.bio?.trim()) return false;
-  candidate.description = live.bio.trim();
-  if (live.channelLinks?.length) {
-    candidate.channelLinks = Array.from(
-      new Set([...(candidate.channelLinks || []), ...live.channelLinks])
-    );
+  if (!live) return false;
+  let changed = false;
+  if (live.bio?.trim()) {
+    candidate.description = live.bio.trim();
+    if (live.channelLinks?.length) {
+      candidate.channelLinks = Array.from(
+        new Set([...(candidate.channelLinks || []), ...live.channelLinks])
+      );
+    }
+    if (live.thumbnailUrl && !candidate.channelThumbnailUrl) {
+      candidate.channelThumbnailUrl = live.thumbnailUrl;
+    }
+    changed = true;
   }
-  if (live.thumbnailUrl && !candidate.channelThumbnailUrl) {
-    candidate.channelThumbnailUrl = live.thumbnailUrl;
+  const subscriberCount = sanitizeSubscriberCountText(live.subscriberCountText);
+  if (subscriberCount && subscriberCount !== candidate.subscriberCount) {
+    candidate.subscriberCount = subscriberCount;
+    changed = true;
   }
-  return true;
+  return changed;
 }

@@ -18,6 +18,7 @@ import { toWellFormedDeep, stringifyWellFormedJson } from './unicodeSafety';
 import { ProbeQuotaUnavailableError, resolveShadowConfig, settleKeyCapReservation, settleProbeQuotaReservation, settleShadowLeaseWithSavepoint, YouTubeKeyCapUnavailableError, type KeyCapReservationContext, type QuotaSettlementContext } from './quotaKeyCapShadow';
 import { isYouTubePermanentInputError } from './youtubeKeyHealth';
 import { canonicalCountry } from './countryInference';
+import { sanitizeSubscriberCountText } from './lowAudienceGate';
 import { countryIdentitySql } from './countryExclusionRules';
 import { classifyDiscoveryVisibility } from './discoveryStateVisibility';
 import { safeCrawlerTelemetry, type CrawlerTelemetry } from './crawlerTelemetry';
@@ -1395,7 +1396,7 @@ export async function writeChannelUpsert(
   channel.channel_id, channel.channel_name, channel.youtube_url, channel.country, channel.country_status, channel.confidence_score || 0,
   channel.discord_status, channel.discord_invite || null, channel.scan_status, channel.scan_attempts || 0, channel.discovery_source,
   channel.first_seen || new Date().toISOString(), channel.last_checked || null, null, stringifyWellFormedJson(channel.inspection_trail || []),
-  channel.subscriber_count || null, channel.channel_thumbnail_url || null, channel.quality_score || 0,
+  sanitizeSubscriberCountText(channel.subscriber_count) || null, channel.channel_thumbnail_url || null, channel.quality_score || 0,
   channel.quality_breakdown ? stringifyWellFormedJson(channel.quality_breakdown) : null, channel.trading_status || 'UNCERTAIN',
   channel.trading_confidence_score || 0, channel.trading_category || 'General Trading',
   channel.trading_relevance_breakdown ? stringifyWellFormedJson(channel.trading_relevance_breakdown) : null,

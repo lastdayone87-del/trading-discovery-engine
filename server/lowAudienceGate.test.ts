@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseSubscriberCountNumber, evaluateLowAudienceGate, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
+import { parseSubscriberCountNumber, evaluateLowAudienceGate, sanitizeSubscriberCountText, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
 
 const root = process.cwd();
 const read = (p: string) => fs.readFileSync(path.join(root, p), 'utf8');
@@ -99,6 +99,23 @@ test('handle-shaped and missing counts fail open as unavailable, never as low-au
     assert.equal(gate.shouldSkipDeepEnrichment, false);
     assert.equal(gate.reasonCode, 'SUBSCRIBER_COUNT_UNAVAILABLE');
   }
+});
+
+test('subscriber persistence accepts only parseable counts', () => {
+  assert.equal(sanitizeSubscriberCountText('5 subscribers'), '5 subscribers');
+  assert.equal(sanitizeSubscriberCountText('10'), '10');
+  assert.equal(sanitizeSubscriberCountText('1.2K subscribers'), '1.2K subscribers');
+  for (const raw of ['@JarvisTrading', 'subscribers', 'N/A', '', null, undefined]) {
+    assert.equal(sanitizeSubscriberCountText(raw), undefined, String(raw));
+  }
+});
+
+test('channel writes and existing rows cannot keep non-count subscriber values', () => {
+  const db = read('server/dbCore.ts');
+  assert.match(db, /sanitizeSubscriberCountText\(channel\.subscriber_count\)/);
+  const migration = read('server/db/migrations/172_sanitize_invalid_subscriber_counts.sql');
+  assert.match(migration, /UPDATE channels/);
+  assert.match(migration, /!~\*/);
 });
 
 test('ENRICH claim reserves quota before hydrating and releases it on audience skip', () => {

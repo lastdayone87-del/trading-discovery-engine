@@ -86,6 +86,7 @@ import { calculateQueryFunnel, countDeferredRawResults, manualSearchContinuation
 import { resolveScopeEligibility } from './scopeEligibility';
 import { processChannelThroughPipeline, isTerminalState, applyGate1CountryRejectionToExisting, type PipelineExecutionOptions } from './ingestionPipeline';
 import { evaluateLowAudienceGate, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
+import { applyPublicAboutToCandidate, fetchLiveYouTubeChannelData } from './youtubePublicAbout';
 import { shouldPreserveExistingChannel } from './terminalPreservationPolicy';
 import { resolveTerminalEnrichmentFailure } from './enrichmentLifecycle';
 import { recordEvidenceActionOutcome } from './voiEvidenceController';
@@ -1654,6 +1655,7 @@ export async function processNextSearchJob(
       let claimAudienceGate = claimCandidateGate.shouldSkipDeepEnrichment ? claimCandidateGate : claimStoredGate;
       let claimHydrationUnits = 0;
       let claimHydrationChanged = false;
+      const claimHydrationAt = new Date().toISOString();
       if (claimAudienceGate.reasonCode === 'SUBSCRIBER_COUNT_UNAVAILABLE' && claimCandidateGate.reasonCode === 'SUBSCRIBER_COUNT_UNAVAILABLE') {
         const beforeSub = candidate.subscriberCount;
         const beforeDesc = candidate.description;
@@ -1680,8 +1682,44 @@ export async function processNextSearchJob(
             candidate.description !== beforeDesc ||
             candidate.locationTag !== beforeLoc;
         } catch {
-          // Hydration unavailable (no keys, quota, network): proceed fail-open.
+          // Hydration unavailable (no keys, quota, network): fall through to
+          // the keyless public About source below.
         }
+        if (claimAudienceGate.reasonCode === 'SUBSCRIBER_COUNT_UNAVAILABLE'
+          && candidate.countryMetadataStatus === 'UNAVAILABLE') {
+          // The Data API is unavailable or has no count (e.g. a hidden
+          // statistic). The public About/header text carries the same count
+          // without spending quota, so a queued channel can still be gated
+          // instead of reaching deep enrichment on unknown audience.
+          try {
+            const liveAbout = await fetchLiveYouTubeChannelData(channel.youtube_url);
+            (candidate as any).publicAboutCheckedAt = claimHydrationAt;
+            (candidate as any).publicAboutAttempts = Number(channel.public_about_attempts || 0) + 1;
+            if (liveAbout && applyPublicAboutToCandidate(candidate, liveAbout)) {
+              (candidate as any).publicAboutStatus = 'ATTEMPTED_SUCCEEDED';
+              claimAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount);
+              claimHydrationChanged =
+                claimHydrationChanged ||
+                candidate.subscriberCount !== beforeSub ||
+                candidate.description !== beforeDesc;
+            } else {
+              (candidate as any).publicAboutStatus = liveAbout ? 'ATTEMPTED_EMPTY' : 'ATTEMPTED_FAILED';
+            }
+          } catch {
+            // Public About is an evidence fallback; provider hydration remains
+            // the authoritative path when it is available.
+          }
+        }
+      }
+      // A keyless hydration can populate the count even when enrichment later
+      // fails or defers. Persist it now so the dashboard's known-low filter no
+      // longer treats a genuinely small channel as unknown while the job waits.
+      if (candidate.subscriberCount && candidate.subscriberCount !== channel.subscriber_count) {
+        channel.subscriber_count = candidate.subscriberCount;
+        channel.public_about_status = (candidate as any).publicAboutStatus || channel.public_about_status;
+        channel.public_about_checked_at = (candidate as any).publicAboutCheckedAt || channel.public_about_checked_at;
+        channel.public_about_attempts = (candidate as any).publicAboutAttempts ?? channel.public_about_attempts;
+        await upsertChannel(channel);
       }
       // Hydration may have upgraded an UNCERTAIN creator into a CONFIRMED
       // excluded country. Re-run the existing Gate-1 validation on the

@@ -22,6 +22,21 @@ export function parseSubscriberCountNumber(raw?: string): number | undefined {
 }
 
 /**
+ * Accept a subscriber value only when it is a parseable count. Channel handles
+ * ('@name'), digit-free text, and other non-count values must never be stored
+ * in `subscriber_count`: the low-audience gate treats them as unknown and
+ * fail-opens, so a poisoned value hides a genuinely small channel.
+ */
+export function sanitizeSubscriberCountText(value: unknown): string | undefined {
+  if (value === null || value === undefined) return undefined;
+  const text = String(value).replace(/\u00a0/g, ' ').trim();
+  if (!text || text.startsWith('@')) return undefined;
+  if (!/\d/.test(text)) return undefined;
+  if (parseSubscriberCountNumber(text) === undefined) return undefined;
+  return text;
+}
+
+/**
  * Low-Audience Budget Gate (Phase 7):
  * Configurable subscriber threshold gate (default: 30 subscribers).
  * 0-29 known subscribers: stored and marked low-audience skip; deep crawl/enrichment is skipped.
