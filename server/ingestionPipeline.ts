@@ -982,9 +982,11 @@ async function processChannelThroughPipelineInContext(
       let activeEnrichmentJob=false;
       try{
         const db=await getDb();
-        const active=await db.query(`SELECT 1 FROM jobs WHERE type='ENRICH_CHANNEL' AND status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$1 LIMIT 1`,[candidate.channelId]);
+        // Exclude the job currently executing this pipeline: stage 1 must be
+        // able to schedule stage 2 while its own PROCESSING row is still open.
+        const active=await db.query(`SELECT 1 FROM jobs WHERE type='ENRICH_CHANNEL' AND status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$1 AND ($2::uuid IS NULL OR id <> $2::uuid) LIMIT 1`,[candidate.channelId,options?.jobId||null]);
         activeEnrichmentJob=Boolean(active.rowCount);
-      }catch{activeEnrichmentJob=false;}
+      }catch{activeEnrichmentJob=true;}
       if(!activeEnrichmentJob){
         // Ordinary rediscovery must not turn a completed enrichment job back
         // into PENDING. The day bucket bounds fresh evidence passes;
