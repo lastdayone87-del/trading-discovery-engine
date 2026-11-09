@@ -43,9 +43,30 @@ test('precision, recall, country, language and false-positive rates are computed
   assert.equal(report.overall.recall.rate, 3 / 6);
   assert.equal(report.overall.countryRelevance.rate, 2 / 3);
   assert.equal(report.overall.languageMatch.rate, 3 / 3);
-  assert.equal(report.overall.falsePositiveRate.rate, 1 / 4);
+  // One discovered negative out of two labelled negatives.
+  assert.equal(report.overall.falsePositiveRate.rate, 1 / 2);
   assert.equal(report.byCountry.France.sampleSize, 8);
   assert.equal(report.byLanguage.fr.precision.rate, 3 / 4);
+});
+
+test('optional quality and community labels are excluded when unmeasured', () => {
+  const report = evaluateNativeDiscovery({
+    labels: [
+      label({ channelId: 'a', quality: true, community: null }),
+      label({ channelId: 'b', quality: null, community: true }),
+      label({ channelId: 'c', quality: null, community: null }),
+    ],
+  });
+  assert.equal(report.overall.qualityYield.total, 1);
+  assert.equal(report.overall.qualityYield.rate, 1);
+  assert.equal(report.overall.communityYield.total, 1);
+  assert.equal(report.overall.communityYield.rate, 1);
+
+  const unmeasured = evaluateNativeDiscovery({
+    labels: [label({ channelId: 'd', quality: null, community: null })],
+  });
+  assert.equal(unmeasured.overall.qualityYield.rate, null);
+  assert.equal(unmeasured.overall.communityYield.rate, null);
 });
 
 test('Wilson intervals are used so a target is judged on the lower bound', () => {
@@ -62,6 +83,8 @@ test('90% evidence gate fails on a small sample and passes only with a strong lo
     labels: [label({ channelId: 'a' }), label({ channelId: 'b' }), label({ channelId: 'c' })],
   });
   assert.equal(small.evidence.meets90PercentLowerBound, false);
+  assert.ok(small.evidence.marketsBelowRecommendedSample.includes('France'));
+
   const strong = evaluateNativeDiscovery({
     labels: Array.from({ length: 300 }, (_, index) => label({ channelId: `c${index}` })),
   });
@@ -70,22 +93,74 @@ test('90% evidence gate fails on a small sample and passes only with a strong lo
   assert.ok(strong.overall.recall.lower95! >= 0.9);
 });
 
-test('provider yield is reported per 100 requests with an interval', () => {
-  const [yieldRow] = evaluateProviderYield([{ provider: 'youtube-innertube', requests: 100, newConfirmedCreators: 50 }]);
-  assert.equal(yieldRow.newConfirmedPer100Requests, 50);
-  assert.equal(yieldRow.interval.rate, 0.5);
-  assert.ok(yieldRow.interval.lower95! < 0.5 && yieldRow.interval.upper95! > 0.5);
+test('a strong pooled result cannot hide a failing market', () => {
+  const report = evaluateNativeDiscovery({
+    labels: [
+      ...Array.from({ length: 300 }, (_, index) => label({ channelId: `fr${index}` })),
+      ...Array.from({ length: 3 }, (_, index) => label({ channelId: `de${index}`, country: 'Germany', language: 'de' })),
+    ],
+  });
+  assert.ok(report.overall.precision.lower95! >= 0.9);
+  assert.ok(report.overall.recall.lower95! >= 0.9);
+  assert.ok(report.evidence.marketsBelowRecommendedSample.includes('Germany'));
+  assert.equal(report.evidence.meets90PercentLowerBound, false);
 });
 
-test('CSV import requires the identity and label columns and ignores malformed booleans', () => {
-  const rows = parseNativeDiscoveryCsv(`channel_id,country,language,trading_relevant,discovered,country_match,language_match,quality,community,provider
+test('provider yield is reported per 100 requests without a binomial interval', () => {
+  const [yieldRow] = evaluateProviderYield([{ provider: 'youtube-innertube', requests: 100, newConfirmedCreators: 50 }]);
+  assert.equal(yieldRow.newConfirmedPer100Requests, 50);
+  assert.equal('interval' in yieldRow, false);
+  // One request can confirm several creators; the rate is allowed to exceed 100.
+  const [highYield] = evaluateProviderYield([{ provider: 'youtube-innertube', requests: 10, newConfirmedCreators: 50 }]);
+  assert.equal(highYield.newConfirmedPer100Requests, 500);
+});
+
+test('the evaluator rejects duplicate or conflicting creator identities', () => {
+  assert.throws(
+    () => evaluateNativeDiscovery({ labels: [label({ channelId: 'same' }), label({ channelId: 'same' })] }),
+    /NATIVE_DISCOVERY_DUPLICATE_CHANNEL:same/,
+  );
+  assert.throws(
+    () => evaluateNativeDiscovery({ labels: [label({ channelId: 'same', country: 'France' }), label({ channelId: 'same', country: 'Germany' })] }),
+    /NATIVE_DISCOVERY_CONFLICTING_CHANNEL:same/,
+  );
+  assert.throws(
+    () => evaluateNativeDiscovery({ labels: [label({ channelId: '  ' })] }),
+    /NATIVE_DISCOVERY_EMPTY_CHANNEL/,
+  );
+});
+
+test('CSV import validates identity, quoting and required labels', () => {
+  const parsed = parseNativeDiscoveryCsv(`channel_id,country,language,trading_relevant,discovered,country_match,language_match,quality,community,provider
 c1,France,fr,true,true,true,true,true,false,youtube-search
 c2,France,fr,yes,no,,,,,youtube-innertube
 c3,Germany,de,maybe,true,,,,,
 `);
-  assert.equal(rows.length, 2);
-  assert.equal(rows[0].channelId, 'c1');
-  assert.equal(rows[0].quality, true);
-  assert.equal(rows[1].discovered, false);
+  assert.equal(parsed.labels.length, 2);
+  assert.equal(parsed.skippedRows, 1);
+  assert.equal(parsed.labels[0].channelId, 'c1');
+  assert.equal(parsed.labels[0].quality, true);
+  assert.equal(parsed.labels[1].discovered, false);
+  assert.equal(parsed.labels[1].quality, null, 'missing optional labels stay unmeasured');
   assert.throws(() => parseNativeDiscoveryCsv('country,language\nFrance,fr'), /NATIVE_DISCOVERY_CSV_MISSING_COLUMN/);
+});
+
+test('CSV import rejects quoted fields, shifted columns and invalid identities', () => {
+  const header = 'channel_id,country,language,trading_relevant,discovered';
+  assert.throws(
+    () => parseNativeDiscoveryCsv(`${header}\nc1,France,fr,"true",true`),
+    /NATIVE_DISCOVERY_CSV_QUOTED_ROW:2/,
+  );
+  assert.throws(
+    () => parseNativeDiscoveryCsv(`${header}\nc1,France,fr,true`),
+    /NATIVE_DISCOVERY_CSV_COLUMN_COUNT:2/,
+  );
+  assert.throws(
+    () => parseNativeDiscoveryCsv(`${header}\n,France,fr,true,true`),
+    /NATIVE_DISCOVERY_CSV_EMPTY_CHANNEL:2/,
+  );
+  assert.throws(
+    () => parseNativeDiscoveryCsv(`${header}\nc1,France,fr,true,true\nc1,France,fr,true,true`),
+    /NATIVE_DISCOVERY_CSV_DUPLICATE_CHANNEL:3:c1/,
+  );
 });
