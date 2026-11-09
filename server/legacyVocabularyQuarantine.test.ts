@@ -17,9 +17,9 @@ test('migration 173 downgrades nuisance trust-tier-2 vocabulary without deleting
   assert.match(sql, /UPDATE extracted_trading_vocabulary/);
   assert.match(sql, /SET trust_tier = 3/);
   assert.match(sql, /validation_count = 0/);
-  assert.match(sql, /term !~ '\[\[:alpha:\]\]'/);
-  assert.match(sql, /term LIKE '#%'/);
-  assert.match(sql, /term LIKE '@%'/);
-  assert.match(sql, /term ~ '\^\[0-9\]\+\$'/);
+  assert.match(sql, /term !~ '\[A-Za-zÀ-ÖØ-öø-ɏͰ-῿぀-㐀-鿿가-힣豈-﫿\]'/);
+  assert.match(sql, /term ~ '\^\[#＃@＠\]'/);
+  assert.doesNotMatch(sql, /term LIKE/);
+  assert.match(sql, /term ~ '\^\[0-9０-９\]\+\$'/);
   assert.doesNotMatch(sql, /DELETE FROM extracted_trading_vocabulary/i);
 });
