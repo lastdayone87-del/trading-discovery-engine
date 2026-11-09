@@ -646,11 +646,11 @@ export async function buildPhase0ZombieReconciliationReport(
             count(*) FILTER (WHERE status='PROCESSING')::int AS processing_retries,
             count(*) FILTER (
               WHERE status='PENDING'
-              ${closureColumnsPresent ? 'AND closed_at IS NULL' : ''}
+              ${closureColumnsPresent ? 'AND closed_at IS NULL AND COALESCE(reopen_generation,0) = 0' : ''}
             )::int AS scannable_pending,
             count(*) FILTER (
               WHERE status='PROCESSING'
-              ${closureColumnsPresent ? 'AND closed_at IS NULL' : ''}
+              ${closureColumnsPresent ? 'AND closed_at IS NULL AND COALESCE(reopen_generation,0) = 0' : ''}
             )::int AS scannable_processing
        FROM jobs
       WHERE type='${ZOMBIE_RETRY_JOB_TYPE}'
