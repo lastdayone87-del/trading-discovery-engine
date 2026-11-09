@@ -76,6 +76,9 @@ export interface QueryQualityDashboard {
      * quota yield.
      */
     zeroQuotaRuns: number;
+    /** Discoveries from the zero-quota InnerTube arm, shown separately. */
+    zeroQuotaNewConfirmedCreators: number;
+    zeroQuotaNewQualityCreators: number;
     unaccountedCompletedRuns: number;
     newConfirmedCreators: number;
     newQualityCreators: number;
@@ -190,6 +193,14 @@ export function buildQueryQualityDashboard(input: {
   let duplicateResults = 0;
   let evaluatedResults = 0;
   let zeroConfirmRuns = 0;
+  let zeroQuotaNewConfirmedCreators = 0;
+  let zeroQuotaNewQualityCreators = 0;
+  for (const row of accounted) {
+    const vector = row.qualityVector!;
+    if (vector.failedRun || vector.providerDegraded || vector.quotaUsed > 0) continue;
+    zeroQuotaNewConfirmedCreators += vector.newConfirmedCreators;
+    zeroQuotaNewQualityCreators += vector.newQualityCreators;
+  }
   for (const row of rewardEligible) {
     const vector = row.qualityVector!;
     newConfirmedCreators += vector.newConfirmedCreators;
@@ -275,6 +286,8 @@ export function buildQueryQualityDashboard(input: {
       accountedRuns: accounted.length,
       rewardEligibleRuns: rewardEligible.length,
       zeroQuotaRuns,
+      zeroQuotaNewConfirmedCreators,
+      zeroQuotaNewQualityCreators,
       unaccountedCompletedRuns: completed.length - accounted.length,
       newConfirmedCreators,
       newQualityCreators,

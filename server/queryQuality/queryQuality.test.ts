@@ -1005,6 +1005,8 @@ test('Q6: zero-quota runs are separate, stop coverage is completed-only, compati
   assert.equal(dashboard.totals.rewardEligibleRuns, 1);
   assert.equal(dashboard.totals.zeroQuotaRuns, 1);
   assert.equal(dashboard.totals.newConfirmedCreators, 1);
+  assert.equal(dashboard.totals.zeroQuotaNewConfirmedCreators, 2);
+  assert.equal(dashboard.totals.zeroQuotaNewQualityCreators, 1);
   assert.equal(dashboard.totals.quotaUnits, 1);
   assert.equal(dashboard.selection.stopReasons.find(item => item.reason === 'MAX_PAGES_REACHED')?.count, 2);
   assert.equal(dashboard.selection.stopReasons.find(item => item.reason === 'COUNTRY_REJECTED')?.count, 1);

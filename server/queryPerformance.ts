@@ -296,9 +296,17 @@ export function selectQueryCollection(
   priorRuns: number,
   metrics: QueryFunnelMetrics,
   guard?: QueryPromotionGuard,
+  options: { quotaEligible?: boolean } = {},
 ): QueryCollection {
   const totalRuns = priorRuns + 1;
   if (isSeverelyContaminatedQuery(metrics)) return 'REJECTED';
+  // Zero-quota runs are a separate discovery arm. They are already excluded
+  // from positive promotion/maturity evidence because they cannot contribute
+  // to a per-100-quota rate they never paid for. Letting the same run demote a
+  // query is asymmetric: the free InnerTube path produces most new creators
+  // but could only ever push a query down. Keep the collection stable for
+  // this arm; severe contamination above still quarantines on safety.
+  if (options.quotaEligible === false) return current === 'REJECTED' ? 'REJECTED' : current;
   if (metrics.performanceScore >= 60) {
     // A zero-confirm run can never establish PROVEN, even when the legacy
     // blended score is high (novelty/community alone are not yield).

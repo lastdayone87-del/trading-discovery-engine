@@ -2041,7 +2041,13 @@ export async function evaluateQueryPerformance(
       minRuns: PROVEN_MIN_COMPLETED_RUNS,
     };
   }
-  const newCollection = selectQueryCollection(queryRecord.collection, queryRecord.times_executed, metrics, promotionGuard);
+  const newCollection = selectQueryCollection(
+    queryRecord.collection,
+    queryRecord.times_executed,
+    metrics,
+    promotionGuard,
+    { quotaEligible: (attribution.quotaConsumed || 0) > 0 },
+  );
 
   if (isSeverelyContaminatedQuery(metrics)) {
     const vocabs = await getCountryVocabularies();

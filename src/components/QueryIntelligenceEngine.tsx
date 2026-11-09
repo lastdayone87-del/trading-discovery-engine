@@ -77,7 +77,7 @@ interface QualityDashboard {
   /** True when older runs were omitted; every total covers the visible rows. */
   truncated: boolean;
   portfolio: { dailyQuotaUnits: number; portfolioRatio: number; portfolioUnitsReserved: number; portfolioUnitsUsed: number; countryUnitsUsed: number | null; portfolioShareUsed: number; withinBudget: boolean };
-  totals: { runs: number; completedRuns: number; pendingRuns: number; failedRuns: number; accountedRuns: number; unaccountedCompletedRuns: number; newConfirmedCreators: number; newQualityCreators: number; quotaUnits: number; confirmedNewCreatorsPer100Quota: number; zeroConfirmRuns: number; zeroConfirmShare: number; targetMarketPrecision: number | null; duplicateRatio: number; providerDegradedRuns: number };
+  totals: { runs: number; completedRuns: number; pendingRuns: number; failedRuns: number; accountedRuns: number; unaccountedCompletedRuns: number; newConfirmedCreators: number; newQualityCreators: number; zeroQuotaRuns: number; zeroQuotaNewConfirmedCreators: number; zeroQuotaNewQualityCreators: number; quotaUnits: number; confirmedNewCreatorsPer100Quota: number; zeroConfirmRuns: number; zeroConfirmShare: number; targetMarketPrecision: number | null; duplicateRatio: number; providerDegradedRuns: number };
   selection: { strategies: Record<string, number>; stopReasons: Array<{ reason: string; count: number }>; stopReasonCoverage: number; admissionRejections: Array<{ reason: string; count: number }>; admissionTiers: Record<string, number>; compositionFamilies: Record<string, number> };
   rows: QualityDashboardRun[];
 }
@@ -908,6 +908,8 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
                     { label: 'Confirmed / 100 quota', value: qualityDashboard.totals.confirmedNewCreatorsPer100Quota.toFixed(2), tone: 'text-emerald-600 dark:text-emerald-400' },
                     { label: 'New confirmed creators', value: qualityDashboard.totals.newConfirmedCreators, tone: 'text-emerald-600 dark:text-emerald-400' },
                     { label: 'New quality creators', value: qualityDashboard.totals.newQualityCreators, tone: 'text-indigo-600 dark:text-indigo-400' },
+                    { label: 'Free-provider new confirmed', value: qualityDashboard.totals.zeroQuotaNewConfirmedCreators, tone: 'text-teal-600 dark:text-teal-400' },
+                    { label: 'Free-provider new quality', value: qualityDashboard.totals.zeroQuotaNewQualityCreators, tone: 'text-cyan-600 dark:text-cyan-400' },
                     { label: 'Zero-confirm share', value: `${Math.round(qualityDashboard.totals.zeroConfirmShare * 100)}%`, tone: 'text-amber-600 dark:text-amber-400' },
                     { label: 'Target-market precision', value: qualityDashboard.totals.targetMarketPrecision === null ? 'unknown' : `${Math.round(qualityDashboard.totals.targetMarketPrecision * 100)}%`, tone: 'text-slate-900 dark:text-white' },
                     { label: 'Duplicate ratio', value: `${Math.round(qualityDashboard.totals.duplicateRatio * 100)}%`, tone: 'text-slate-900 dark:text-white' },
