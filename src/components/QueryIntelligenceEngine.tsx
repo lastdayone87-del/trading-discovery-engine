@@ -1,6 +1,6 @@
 import { apiFetch } from '../apiClient';
 import React, { useState, useEffect, useRef } from 'react';
-import { QueryRecord, QueryExecutionLog, ExtractedTermRecord, CountryVocabulary, CanonicalTradingTerm } from '../types';
+import { QueryRecord, QueryExecutionLog, CountryVocabulary, CanonicalTradingTerm } from '../types';
 import { SUPPORTED_DORMANT_COUNTRIES } from '../data/initial_countries';
 import {
   Brain,
@@ -84,7 +84,6 @@ interface QualityDashboard {
 
 export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }) => {
   const [queries, setQueries] = useState<QueryRecord[]>([]);
-  const [extractedVocabulary, setExtractedVocabulary] = useState<ExtractedTermRecord[]>([]);
   const [terminology, setTerminology] = useState<CanonicalTradingTerm[]>([]);
   const [logs, setLogs] = useState<QueryExecutionLog[]>([]);
   const [summary, setSummary] = useState<QueryIntelligenceSummary | null>(null);
@@ -132,6 +131,9 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
   // it its own sequence so a slow full fetch cannot discard every quality
   // response, while still letting a newer quality request win.
   const qualitySequence = useRef(0);
+  // The summary is independent of list requests: a slow/hung list must never
+  // block authoritative tab/KPI counts or be invalidated by the next poll.
+  const summarySequence = useRef(0);
   const selectedCountryRef = useRef(selectedCountry);
   selectedCountryRef.current = selectedCountry;
   // The quality projection is an expensive read. Poll it only while its tab is
@@ -143,25 +145,37 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
   const fetchData = async () => {
     const requestId = ++fetchSequence.current;
     const qualityRequestId = ++qualitySequence.current;
+    const summaryRequestId = ++summarySequence.current;
     const requestCountry = selectedCountry;
+    const requestCollection = selectedCollection;
     const activeTab = activeSubTabRef.current;
     const includeQuality = activeTab === 'quality';
     const includeLibrary = activeTab === 'library';
-    const includeVocabulary = activeTab === 'vocabulary';
     const includeTerminology = activeTab === 'vocabulary';
     const includeLogs = activeTab === 'logs';
     try {
       const qualityUrl = requestCountry === 'All'
         ? '/api/query-intelligence/quality-dashboard'
         : `/api/query-intelligence/quality-dashboard?country=${encodeURIComponent(requestCountry)}`;
+      const libraryParams = new URLSearchParams({ limit: '1000' });
+      if (requestCountry !== 'All') libraryParams.set('country', requestCountry);
+      if (requestCollection !== 'ALL') libraryParams.set('collection', requestCollection);
+      // The summary has its own commit path. It must not wait for, or be
+      // invalidated by, a slow active-tab list request.
+      const summaryPromise = apiFetch('/api/query-intelligence/summary')
+        .then(async response => {
+          if (!response.ok) return null;
+          const data = await response.json().catch(() => null);
+          if (summaryRequestId === summarySequence.current && data) setSummary(data);
+          return data;
+        })
+        .catch(() => null);
       // Isolate every request: a network failure in an unrelated projection
       // must not discard a healthy quality response and show the wrong error.
       // Heavy lists are fetched only for the visible tab; the small summary
       // supplies the tab counts even if a list request fails.
-      const [summaryRes, libRes, vocabRes, terminologyRes, logRes, statusRes, scopeRes, qualityRes] = await Promise.all([
-        apiFetch('/api/query-intelligence/summary').catch(() => null),
-        includeLibrary ? apiFetch('/api/query-intelligence/library?limit=500').catch(() => null) : Promise.resolve(null),
-        includeVocabulary ? apiFetch('/api/query-intelligence/vocabulary?limit=300').catch(() => null) : Promise.resolve(null),
+      const [libRes, terminologyRes, logRes, statusRes, scopeRes, qualityRes] = await Promise.all([
+        includeLibrary ? apiFetch(`/api/query-intelligence/library?${libraryParams.toString()}`).catch(() => null) : Promise.resolve(null),
         includeTerminology ? apiFetch('/api/query-intelligence/terminology?limit=200').catch(() => null) : Promise.resolve(null),
         includeLogs ? apiFetch('/api/query-intelligence/logs?limit=50').catch(() => null) : Promise.resolve(null),
         apiFetch('/api/query-intelligence/status').catch(() => null),
@@ -211,10 +225,8 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
       const read = (response: Response | null) => response?.ok
         ? response.json().catch(() => null)
         : Promise.resolve(null);
-      const [summaryData, lib, vocab, terminologyData, logData, statusData, scopeData] = await Promise.all([
-        read(summaryRes),
+      const [lib, terminologyData, logData, statusData, scopeData] = await Promise.all([
         read(libRes),
-        read(vocabRes),
         read(terminologyRes),
         read(logRes),
         read(statusRes),
@@ -222,9 +234,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
       ]);
       // Parsing is asynchronous too; re-check before committing the batch.
       if (requestId !== fetchSequence.current) return;
-      if (summaryData) setSummary(summaryData);
       if (lib) setQueries(lib);
-      if (vocab) setExtractedVocabulary(vocab);
       if (terminologyData) setTerminology(terminologyData);
       if (logData) setLogs(logData);
       if (statusData) setStatus(statusData);
@@ -232,6 +242,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
         setScopeMode(scopeData.scope || 'GLOBAL');
         setScopeCountries(scopeData.selectedCountries || []);
       }
+      await summaryPromise;
     } catch (err) {
       if (requestId !== fetchSequence.current) return;
       console.error('Error fetching Query Intelligence data:', err);
@@ -250,7 +261,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
     fetchData();
     const interval = setInterval(fetchData, 10000); // refresh every 10s
     return () => clearInterval(interval);
-  }, [selectedCountry, activeSubTab]);
+  }, [selectedCountry, selectedCollection, activeSubTab]);
 
   // Handle Pause / Resume toggle
   const handleTogglePause = async () => {
@@ -372,13 +383,15 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
 
   // Calculate statistics. The small summary is authoritative for tab/KPI
   // counts so a failed heavy-list request cannot render a false zero.
-  const provenCount = summary?.provenCount ?? queries.filter(q => q.collection === 'PROVEN').length;
-  const experimentalCount = summary?.experimentalCount ?? queries.filter(q => q.collection === 'EXPERIMENTAL').length;
-  const rejectedCount = summary?.rejectedCount ?? queries.filter(q => q.collection === 'REJECTED').length;
-  const queryCount = summary?.queryCount ?? queries.length;
-  const vocabularyCount = summary?.vocabularyCount ?? extractedVocabulary.length;
-  const terminologyCount = summary?.terminologyCount ?? terminology.length;
-  const logCount = summary?.executionLogCount ?? logs.length;
+  // Bounded lists are never totals. If the summary has not loaded, show an
+  // unknown marker rather than undercounting from a page.
+  const provenCount = summary?.provenCount ?? '—';
+  const experimentalCount = summary?.experimentalCount ?? '—';
+  const rejectedCount = summary?.rejectedCount ?? '—';
+  const queryCount = summary?.queryCount ?? '—';
+  const vocabularyCount = summary?.vocabularyCount ?? '—';
+  const terminologyCount = summary?.terminologyCount ?? '—';
+  const logCount = summary?.executionLogCount ?? '—';
 
   return (
     <div className="space-y-6">

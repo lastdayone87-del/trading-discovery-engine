@@ -18,7 +18,6 @@ import {
   getQueryLibraryPage,
   getVocabularyPage,
   getQueryIntelligenceSummary,
-  getQueriesByCountry,
   getRecentQueryExecutionLogs,
   getExtractedVocabulary,
   setQueryCollection,
@@ -661,9 +660,14 @@ async function startServer() {
   // 15. Get Query Library
   app.get('/api/query-intelligence/library', async (req, res) => {
     try {
-      const country = req.query.country as string | undefined;
+      const country = typeof req.query.country === 'string' && req.query.country.trim() ? req.query.country.trim() : undefined;
+      const requestedCollection = typeof req.query.collection === 'string' ? req.query.collection.toUpperCase() : '';
+      const collection = ['PROVEN', 'EXPERIMENTAL', 'REJECTED'].includes(requestedCollection) ? requestedCollection : undefined;
       const limit = Math.max(1, Math.min(1000, parseInt(req.query.limit as string) || 500));
-      let queries = country ? (await getQueriesByCountry(country)).slice(0, limit) : await getQueryLibraryPage(limit);
+      const offset = Math.max(0, Math.min(100000, parseInt(req.query.offset as string) || 0));
+      // Apply the selected country/collection in SQL BEFORE the page limit so
+      // a country's lower-ranked rows cannot disappear behind a global cutoff.
+      const queries = await getQueryLibraryPage(country, collection, limit, offset);
       res.json(queries);
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -673,9 +677,10 @@ async function startServer() {
   // 16. Get Extracted Vocabulary
   app.get('/api/query-intelligence/vocabulary', async (req, res) => {
     try {
-      const country = req.query.country as string | undefined;
+      const country = typeof req.query.country === 'string' && req.query.country.trim() ? req.query.country.trim() : undefined;
       const limit = Math.max(1, Math.min(1000, parseInt(req.query.limit as string) || 300));
-      const terms = await getVocabularyPage(country, limit);
+      const offset = Math.max(0, Math.min(100000, parseInt(req.query.offset as string) || 0));
+      const terms = await getVocabularyPage(country, limit, offset);
       res.json(terms);
     } catch (err: any) {
       res.status(500).json({ error: err.message });
