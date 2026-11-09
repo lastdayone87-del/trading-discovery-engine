@@ -159,7 +159,7 @@ import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
 import { bumpCommunitySaturationDeferral } from './operationsTelemetry';
 import { acquisitionEvidenceFromObservations } from './acquisitionFailureClassification';
 import { canContinueCommunityInspectionAfterDegradedManualClassification } from './manualRecheckPolicy';
-import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_ACQUISITION_REQUIRED, COMMUNITY_RETRY_REASON, FOUND_GAP_RETRYABLE_FAILURE_CLASSES, buildCommunityRetryJobMetadata, isAttemptFreeCommunityFailure, attemptFreeDiscordValidation, retryAtFromUnknown, retryReasonFromError, type CommunityRetryDirective} from './communityRetryPolicy';
+import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_ACQUISITION_REQUIRED, COMMUNITY_RETRY_REASON, FOUND_GAP_RETRYABLE_FAILURE_CLASSES, buildCommunityRetryJobMetadata, isAttemptFreeCommunityFailure, attemptFreeDiscordValidation, communityRetryDirectiveOwnsDurableWork, retryAtFromUnknown, retryReasonFromError, type CommunityRetryDirective} from './communityRetryPolicy';
 import { classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
 import { discordCandidateCompositeRank } from './discordOwnershipSelection';
 import { admitDiscordCandidates, buildLegacyDiscordCandidate, canonicalDiscordInviteId, discordInviteCodeOf, extractDiscordInviteCodeRaw, inferDiscordOwnership, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
@@ -3677,10 +3677,15 @@ export async function inspectAndValidateChannel(
       // and required retryable PARTIALLY_INSPECTED both own the RETRY_PENDING
       // path, so partial-only acquisitions never strand in FAILED_OPERATIONAL.
       const hasRetryableAcquisitionFailure=hasRetryableCommunityAcquisitionFailure(inspection.acquisitionOutcomes||[],inspection.retrySuppressedUrls);
+      // H2: a non-attempt-free directive (real optional-surface failure) owns
+      // durable retry just like a capacity deferral. The previous
+      // attempt-free-only gate silently dropped it, leaving the channel
+      // FAILED_OPERATIONAL with no worker to consume the uncertainty.
+      const directiveOwnsDurableWork=communityRetryDirectiveOwnsDurableWork(inspection.retryDirective);
       if(!alreadyValidatedSuccess){
         channel.discord_status='UNCERTAIN';
         channel.discord_liveness_status=channel.discord_candidate_locator?channel.discord_liveness_status||'UNCERTAIN':'NOT_CHECKED';
-        channel.discord_validation_status=hasRetryableAcquisitionFailure?'RETRY_PENDING':'FAILED_OPERATIONAL';
+        channel.discord_validation_status=hasRetryableAcquisitionFailure||directiveOwnsDurableWork?'RETRY_PENDING':'FAILED_OPERATIONAL';
         channel.discord_resolution_status=channel.discord_resolution_status||'RESOLVED';
         channel.discord_discovery_status=channel.discord_candidate_locator?'DISCOVERED_VALIDATION_FAILED':'NOT_DISCOVERED';
       }
@@ -3693,7 +3698,7 @@ export async function inspectAndValidateChannel(
       // append-only checks remain authoritative until a new validation replaces
       // this compatibility projection.
       channel.last_checked=now;
-      if(retryDirective?.attemptFree&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id,retryDirective);
+      if(retryDirective&&(retryDirective.attemptFree||directiveOwnsDurableWork)&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id,retryDirective);
       // Retained-invite FOUND gap (multi-invite recall): the validation branch
       // owns this for admitted invites; discarded/unadmitted FOUND aggregates
       // reach this branch instead (E8) and must not lose the outstanding

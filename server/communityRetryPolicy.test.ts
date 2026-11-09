@@ -266,3 +266,12 @@ test('mixed browser-runtime + genuine failure MUST NOT classify as attempt-free 
   ]);
   assert.equal(reversed?.retryReason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
 });
+
+test('community retry directives that own durable work are identified', async () => {
+  const { communityRetryDirectiveOwnsDurableWork } = await import('./communityRetryPolicy');
+  assert.equal(communityRetryDirectiveOwnsDurableWork({ retryReason: 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE' }), true);
+  assert.equal(communityRetryDirectiveOwnsDurableWork({ retryReason: 'BROWSER_RUNTIME_UNAVAILABLE' }), true);
+  assert.equal(communityRetryDirectiveOwnsDurableWork({ retryReason: 'NO_SURFACE' }), false);
+  assert.equal(communityRetryDirectiveOwnsDurableWork({ retryReason: 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' }), false);
+  assert.equal(communityRetryDirectiveOwnsDurableWork(undefined), false);
+});

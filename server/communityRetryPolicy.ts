@@ -429,4 +429,19 @@ export function attemptFreeDiscordValidation(outcome: string, retryable: boolean
   return retryable && outcome !== 'INVALID_OBSERVED';
 }
 
+/**
+ * Whether a directive represents real community-retry ownership that must be
+ * persisted as a durable RETRY_COMMUNITY_ACQUISITION job. Capacity deferrals
+ * are attempt-free but still own a job; genuine acquisition failures are
+ * attempt-consuming. Only NO_SURFACE/UPSTREAM reasons deliberately do not
+ * schedule community retry work here.
+ */
+export function communityRetryDirectiveOwnsDurableWork(
+  directive: Pick<CommunityRetryDirective, 'retryReason'> | null | undefined,
+): boolean {
+  if (!directive) return false;
+  return directive.retryReason === COMMUNITY_RETRY_REASON.BROWSER_RUNTIME_UNAVAILABLE
+    || directive.retryReason === COMMUNITY_RETRY_REASON.COMMUNITY_REQUIRED_ACQUISITION_FAILURE;
+}
+
 assert.equal(COMMUNITY_RETRY_REASON.NO_SURFACE, 'NO_SURFACE');

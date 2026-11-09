@@ -232,6 +232,48 @@ test('genuinely inspected optional website no-match remains clean',async()=>{
   assert.equal(result.steps.find(step=>step.step==='CUSTOM_DOMAINS')?.status,'NOT_FOUND');
 });
 
+test('a confirmed optional 404 is proven absence, not retry work',async()=>{
+  const result=await runChannelInspection({
+    channelId:'optional-404',
+    channelBio:'https://creator.example/missing',
+    videoDescriptions:['1','2','3','4','5'],
+    destinationResolver:async()=>['93.184.216.34'],
+    externalFetchImpl:async()=>response(404,'<html><body><h1>Page not found</h1><p>This page does not exist.</p></body></html>','text/html'),
+  });
+  assert.equal(result.acquisitionStatus,'INSPECTED_NO_MATCH');
+  assert.equal(result.retryDirective,undefined);
+  assert.ok(result.acquisitionOutcomes?.some(item=>item.surface==='CREATOR_WEBSITES'&&item.outcome==='ACQUISITION_FAILED'&&item.retryable===false));
+});
+
+test('a clean required surface does not hide an optional community failure',async()=>{
+  const result=await runChannelInspection({
+    channelId:'optional-hidden-by-required',
+    channelName:'Optional Hidden',
+    channelBio:'https://creator.example/',
+    channelLinks:['https://linktr.ee/example'],
+    videoDescriptions:['one','two','three','four','five'],
+    creatorLikelyTrading:false,
+    externalFetchImpl:(async(input)=>{
+      const url=String(input);
+      if(url.includes('linktr.ee'))return new Response('blocked',{status:406,headers:{'content-type':'text/html'}});
+      return new Response('unavailable',{status:503,headers:{'content-type':'text/html'}});
+    }) as typeof fetch,
+    renderedFallback:(async(seedUrl:string)=>({
+      foundInvite:null,
+      foundLocation:seedUrl,
+      inspectedPages:1,
+      scrolls:0,
+      clicks:0,
+      complete:true,
+      retryable:false,
+      detail:'rendered clean',
+    } as any)) as any,
+  });
+  assert.equal(result.acquisitionStatus,'PARTIALLY_INSPECTED');
+  assert.equal(result.retryDirective?.code,'COMMUNITY_ACQUISITION_REQUIRED');
+  assert.ok(result.acquisitionOutcomes?.some(item=>item.required===true&&item.surface==='CREATOR_WEBSITES'&&item.outcome==='INSPECTED_NO_MATCH'));
+});
+
 
 test('alternative locators retain their type and are not reinterpreted as native invite codes',async()=>{const {extractDiscordCandidates}=await import('./discordCandidates');const [candidate]=extractDiscordCandidates('https://dsc.gg/trading-room','CHANNEL_EXTERNAL_LINKS');assert.equal(candidate.locatorType,'ALTERNATIVE_REDIRECT');assert.equal(candidate.nativeInviteCode,undefined);assert.equal(candidate.rawLocator,'https://dsc.gg/trading-room');});
 
