@@ -25,9 +25,13 @@ test('Stage 4 PostgreSQL: provider-linked completion is success-gated and termin
        VALUES($1,'BR','EXPERIMENTAL','GENERAL',$1) RETURNING id`, [suffix]
     )).rows[0].id;
 
+    const providerSnapshot = JSON.stringify({
+      providerKey: 'youtube-search', retrievalSurface: 'YOUTUBE_NATIVE',
+      capability: 'SEARCH_YOUTUBE', costDomain: 'YOUTUBE_DATA_API', continuationOwner: 'PHASE_9',
+    });
     const run = (await db.query(
-      `INSERT INTO query_runs(query_id,country,source,status,selection_strategy,selection_reason,retrieval_lane,search_ordering,provider_key)
-       VALUES($1,'BR','automated_query','RUNNING','BASELINE','stage4','VIDEO','RELEVANCE','youtube-search') RETURNING id`, [queryId]
+      `INSERT INTO query_runs(query_id,country,source,status,selection_strategy,selection_reason,retrieval_lane,search_ordering,provider_key,retrieval_surface,provider_capability,cost_domain,provider_allocation_snapshot)
+       VALUES($1,'BR','automated_query','RUNNING','BASELINE','stage4','VIDEO','RELEVANCE','youtube-search','YOUTUBE_NATIVE','SEARCH_YOUTUBE','YOUTUBE_DATA_API',$2::jsonb) RETURNING id`, [queryId, providerSnapshot]
     )).rows[0];
     runIds.push(run.id);
 
@@ -51,8 +55,8 @@ test('Stage 4 PostgreSQL: provider-linked completion is success-gated and termin
     assert.equal(afterLateFailure.status, 'COMPLETED', 'a late failure must not overwrite COMPLETED');
 
     const retryRun = (await db.query(
-      `INSERT INTO query_runs(query_id,country,source,status,selection_strategy,selection_reason,retrieval_lane,search_ordering)
-       VALUES($1,'BR','automated_query','RUNNING','BASELINE','stage4 retry','VIDEO','RELEVANCE') RETURNING id`, [queryId]
+      `INSERT INTO query_runs(query_id,country,source,status,selection_strategy,selection_reason,retrieval_lane,search_ordering,provider_key,retrieval_surface,provider_capability,cost_domain,provider_allocation_snapshot)
+       VALUES($1,'BR','automated_query','RUNNING','BASELINE','stage4 retry','VIDEO','RELEVANCE','youtube-search','YOUTUBE_NATIVE','SEARCH_YOUTUBE','YOUTUBE_DATA_API',$2::jsonb) RETURNING id`, [queryId, providerSnapshot]
     )).rows[0];
     runIds.push(retryRun.id);
     await failQueryRun(retryRun.id, Object.assign(new Error('temporary provider outage'), { code: 'ETIMEDOUT' }), false);
