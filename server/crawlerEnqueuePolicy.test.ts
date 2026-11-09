@@ -153,8 +153,9 @@ test('static exploration bound is 12 with destination-budget drop accounting', (
   ]) {
     assert.ok(source.includes(marker), `missing static wiring: ${marker}`);
   }
-  assert.equal(CRAWL_DROP_REASONS.length, 16, 'destination-budget extends the closed taxonomy additively');
+  assert.equal(CRAWL_DROP_REASONS.length, 17, 'frame-slice extends the closed taxonomy additively');
   assert.ok(CRAWL_DROP_REASONS.includes('destination-budget'));
+  assert.ok(CRAWL_DROP_REASONS.includes('frame-slice'));
 });
 
 test('rendered control-slice, hint-reject, scroll, and stop accounting are wired', () => {

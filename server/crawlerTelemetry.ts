@@ -30,6 +30,8 @@ export const CRAWL_DROP_REASONS = [
   'destination-budget',
   'already-visited',
   'control-slice',
+  /** Same-origin iframe depth/count/fetch coverage cap. */
+  'frame-slice',
   'page-budget',
   'queue-exhausted',
   /**
@@ -67,6 +69,8 @@ export const CEILING_KINDS = [
   'total-timeout',
   /** Per-page static-control cap dropped eligible unique targets. */
   'control-slice',
+  /** Same-origin iframe depth/count/fetch coverage cap. */
+  'frame-slice',
   /** Frontier stopping-arbiter halt (see frontier-yield-stop above). */
   'frontier-yield',
 ] as const;
