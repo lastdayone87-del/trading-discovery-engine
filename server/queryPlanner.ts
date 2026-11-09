@@ -261,6 +261,10 @@ export function planCountryNativeProposalQuery(args: {
   dominantLocale?: string | null;
 }): PlannedQuery | null {
   const nativeTerm = args.nativeTerm.normalize('NFKC').trim().replace(/\s+/g, ' ');
+  // The country-native proposal path is separate from planDiverseQueries and
+  // must enforce the same ambiguous-short-modifier rule before it creates a
+  // LEARNED atom or receives allocation lineage.
+  if (isAmbiguousShortModifier(nativeTerm)) return null;
   const reviewedPhrase = isReviewedNativePhrase(nativeTerm);
   // Unknown long surfaces stay rejected. A reviewed native phrase may exceed
   // the normal three-token atom cap because it is a bounded whole query.

@@ -43,9 +43,14 @@ export function digestQueryTerminologyMetadata(
   const previousTermId = next.terminologyId ?? null;
   const previousLifecycle = next.terminologyLifecycle ?? null;
   const previousDecayedYield = next.terminologyDecayedYield ?? null;
+  const previousLearnedTerm = next.learnedTerm ?? null;
   delete next.terminologyId;
   delete next.terminologyLifecycle;
   delete next.terminologyDecayedYield;
+  // Completion accounting reloads the durable query row and attributes via
+  // learnedTerm. Remove it on digest so a stale term cannot keep receiving
+  // performance/lifecycle credit after its eligibility is gone.
+  delete next.learnedTerm;
   next.terminologyRevalidation = {
     disposition: 'DIGESTED',
     previousTermId,
@@ -53,6 +58,7 @@ export function digestQueryTerminologyMetadata(
     previousLifecycle,
     previousSearchEligible: status?.searchEligible ?? null,
     previousDecayedYield,
+    previousLearnedTerm,
     reason: status ? 'TERMINOLOGY_NOT_CURRENTLY_ELIGIBLE' : 'TERMINOLOGY_ROW_MISSING',
     revalidatedAt,
   };

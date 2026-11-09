@@ -26,6 +26,7 @@ import {
   getInFlightPrimaryTermUsage,
   getActiveQueryRunQueryIds,
   getQueryTerminologyCurrentStatuses,
+  persistQueryTerminologyDigest,
   getQueryRunReward,
   isRetryableInfrastructureFailure
 } from './db';
@@ -1569,14 +1570,23 @@ async function buildSelectorPool(
       if (disposition === 'DIGEST') {
         // The query itself is currently valid; only its attribution is stale.
         // Preserve the discovery surface, strip the dead terminology linkage,
-        // and record the audit trail on the runtime record.
+        // and persist the decision so completion accounting reloads the same
+        // digested metadata instead of re-crediting the demoted term.
+        const digestedMetadata = digestQueryTerminologyMetadata(
+          query.generation_metadata,
+          status,
+          options.nowIso,
+        );
+        const expectedTermId = String(query.generation_metadata.terminologyId);
+        await persistQueryTerminologyDigest(query.id, expectedTermId, digestedMetadata).catch(error => {
+          console.warn('[query-intelligence] failed to persist terminology digest', {
+            queryId: query.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
         digestedById.set(query.id, {
           ...query,
-          generation_metadata: digestQueryTerminologyMetadata(
-            query.generation_metadata,
-            status,
-            options.nowIso,
-          ),
+          generation_metadata: digestedMetadata,
         });
       }
     }

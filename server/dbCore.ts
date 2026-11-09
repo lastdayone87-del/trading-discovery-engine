@@ -2071,8 +2071,23 @@ export async function getQueryTerminologyCurrentStatuses(queryIds:number[]):Prom
   const ids = [...new Set(queryIds.map(Number).filter(id=>Number.isSafeInteger(id)&&id>0))];
   if (!ids.length) return new Map();
   const db=await getDb();
-  const res=await db.query(`SELECT ql.id AS query_id,t.id AS term_id,t.canonical_term AS term,t.lifecycle_status AS lifecycle_status,t.search_eligible AS search_eligible FROM query_library ql JOIN canonical_trading_terms t ON t.id::text=ql.generation_metadata->>'terminologyId' WHERE ql.id=ANY($1::int[])`,[ids]);
+  const res=await db.query(`WITH linked AS (
+      SELECT ql.id AS query_id,
+             CASE WHEN ql.generation_metadata->>'terminologyId' ~ '^[0-9]+$'
+                  THEN (ql.generation_metadata->>'terminologyId')::bigint END AS term_id
+      FROM query_library ql WHERE ql.id=ANY($1::int[])
+    )
+    SELECT l.query_id,t.id AS term_id,t.canonical_term AS term,t.lifecycle_status AS lifecycle_status,t.search_eligible AS search_eligible
+    FROM linked l JOIN canonical_trading_terms t ON t.id=l.term_id`,[ids]);
   return new Map(res.rows.map((row:any)=>[Number(row.query_id),{queryId:Number(row.query_id),termId:Number(row.term_id),term:String(row.term||''),lifecycleStatus:String(row.lifecycle_status||''),searchEligible:row.search_eligible===true}]));
+}
+
+/** Persist a digested runtime record so completion accounting sees the same
+ * decision and cannot re-attribute results to a stale terminology id. */
+export async function persistQueryTerminologyDigest(queryId:number,expectedTermId:string|number,metadata:Record<string,unknown>):Promise<boolean>{
+  const db=await getDb();
+  const res=await db.query(`UPDATE query_library SET generation_metadata=$3::jsonb WHERE id=$1 AND generation_metadata->>'terminologyId'=$2::text RETURNING id`,[queryId,String(expectedTermId),JSON.stringify(metadata)]);
+  return Boolean(res.rowCount);
 }
 
 /** Q5 per-run reward rows. Global newness and quality are read from

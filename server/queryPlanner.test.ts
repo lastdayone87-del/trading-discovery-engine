@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ExtractedTermRecord, QueryRecord } from '../src/types';
-import { isCountryScriptCompatible, isRetrievalOrientedQuery, limitRepeatedPrimaryTerms, normalizeQuery, planDiverseQueries, planFrontierTargetedQuery, queriesOutsideCooldown, queryTokenCount, rotateAwayFromMostRecentIntent } from './queryPlanner';
+import { isCountryScriptCompatible, isRetrievalOrientedQuery, limitRepeatedPrimaryTerms, normalizeQuery, planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, queriesOutsideCooldown, queryTokenCount, rotateAwayFromMostRecentIntent } from './queryPlanner';
 import { ORGANIC_QUERY_POLICY_VERSION } from './organicQueryExpansion';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
 
@@ -276,6 +276,14 @@ test('ambiguous short modifiers are not planned as learned query atoms', () => {
       `${value} must not be planned as a learned modifier`,
     );
   }
+  const suppressed = planned.flatMap(item => (item.metadata as any).terminologyGate?.suppressed || []);
+  for (const value of ['ES', 'SL', 'LIVE']) {
+    assert.ok(
+      suppressed.some((item: any) => String(item.term || '').toUpperCase() === value && item.reasons?.includes('ambiguous-short-modifier')),
+      `${value} must be recorded with the ambiguous-short-modifier reason`,
+    );
+  }
+  assert.equal(planCountryNativeProposalQuery({ country: 'United States', nativeTerm: 'SL', targetIntent: 'strategy', allocationLineage: {} }), null);
 });
 
 test('bare short tickers require qualifying market context', () => {
