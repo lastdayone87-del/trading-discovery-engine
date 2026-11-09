@@ -57,7 +57,13 @@ test('excludes JS expressions, multiple statements, and non-http schemes', () =>
   assert.equal(parseOnclickNavigation('doSomething()'), null);
   assert.equal(parseOnclickNavigation("location.href='/x?'+id"), null);
   assert.equal(parseOnclickNavigation("location.href='/a'; alert(1)"), null);
+  assert.equal(parseOnclickNavigation("location.href='/a'+id+'b'"), null);
+  assert.equal(parseOnclickNavigation("location.assign('/rooms/' + 'vip')"), null);
+  assert.equal(parseOnclickNavigation("location.href='/a'+'/b'"), null);
+  assert.equal(parseOnclickNavigation("location.href='\\x2fcommunity'"), null, 'JS escapes are never guessed');
   assert.equal(parseOnclickNavigation('location.href=`/template`'), null);
+  assert.equal(parseOnclickNavigation("window.open('/x','someFrame')"), null, 'named frames are outside the class');
+  assert.equal(parseOnclickNavigation("window.open('/x','_blank')"), '/x');
   assert.equal(parseOnclickNavigation("location.href='javascript:alert(1)'"), null);
   assert.equal(parseOnclickNavigation("location.href='data:text/html,x'"), null);
   assert.equal(parseOnclickNavigation("window.open('mailto:test@example.com')"), null);
@@ -106,6 +112,41 @@ test('dedupes repeated targets and reports cap truncation deterministically', ()
   assert.equal(capped.targets.length, MAX_STATIC_CONTROL_TARGETS);
   assert.equal(capped.truncated, 5);
   assert.equal(capped.targets[MAX_STATIC_CONTROL_TARGETS - 1]?.url, `/room-${MAX_STATIC_CONTROL_TARGETS - 1}`);
+});
+
+test('input values and aria labels are preserved for destination scoring', () => {
+  const input = extract('<input type="submit" value="Join our community" formaction="https://other.example/start">');
+  assert.equal(input.targets[0]?.label, 'Join our community');
+
+  const aria = extract('<button formaction="https://other.example/start" aria-label="Join the trading floor">Open</button>');
+  assert.equal(aria.targets[0]?.label, 'Join the trading floor');
+});
+
+test('duplicate URLs merge labels instead of hiding a later community label', () => {
+  const result = extract(`
+    <div onclick="location.href='https://other.example/start'">Start</div>
+    <div onclick="location.href='https://other.example/start'">Join our community</div>
+  `);
+  assert.equal(result.targets.length, 1);
+  assert.match(result.targets[0]?.label || '', /Start/);
+  assert.match(result.targets[0]?.label || '', /Join our community/);
+});
+
+test('base resolution dedupes aliases before the cap counts destinations', () => {
+  const result = staticControlTargetsFromDocument(
+    cheerio.load(`
+      <button formaction="/room">Join</button>
+      <button formaction="https://creator.example/room">Join again</button>
+      <button formaction="/unique">Unique</button>
+    `),
+    undefined,
+    'https://creator.example/',
+  );
+  assert.deepEqual(result.targets.map(target => target.url), [
+    'https://creator.example/room',
+    'https://creator.example/unique',
+  ]);
+  assert.equal(result.truncated, 0);
 });
 
 test('meta refresh supports quoted, unquoted, and spaced URL forms', () => {

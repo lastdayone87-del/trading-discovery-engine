@@ -81,3 +81,34 @@ test('M2a does not evaluate excluded controls or navigate their URLs', async () 
   assert.equal(result.foundInvite, null);
   assert.deepEqual(calls, ['https://creator.example/']);
 });
+
+test('M2a marks the seed partial and retryable when the control cap drops a target', async () => {
+  const calls: string[] = [];
+  const unrelated = Array.from({ length: 20 }, (_, index) =>
+    `<div onclick="window.open('https://unrelated-${index}.example/start')">Start</div>`).join('');
+  const result = await runChannelInspection({
+    channelId: 'm2a-cap',
+    channelName: 'M2a Cap',
+    channelBio: 'No invite',
+    channelLinks: ['https://creator.example/'],
+    videoDescriptions: ['one', 'two', 'three', 'four', 'five'],
+    externalFetchImpl: (async (input: any) => {
+      const url = String(input);
+      calls.push(url);
+      if (url === 'https://creator.example/') {
+        return seedFor(`${unrelated}<div onclick="window.open('/community')">Join our community</div>`);
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch,
+  });
+
+  assert.equal(result.foundInvite, null);
+  assert.equal(result.acquisitionStatus, 'PARTIALLY_INSPECTED');
+  assert.ok(result.retryDirective, 'a control-slice cap must own retry work');
+  const observation = result.acquisitionOutcomes?.find(outcome =>
+    outcome.surface === 'CREATOR_WEBSITES' && outcome.outcome === 'PARTIALLY_INSPECTED');
+  assert.equal(observation?.outcome, 'PARTIALLY_INSPECTED');
+  assert.equal(observation?.retryable, true);
+  assert.equal(observation?.failureClass, 'STATIC_BUDGET_GAP');
+  assert.deepEqual(calls, ['https://creator.example/']);
+});

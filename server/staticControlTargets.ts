@@ -47,6 +47,13 @@ export const MAX_META_REFRESH_DELAY_SECONDS = 5;
 
 const NON_HTTP_SCHEME = /^(?:javascript|data|mailto|tel|blob|file|about):/i;
 
+/** JS string literals are never interpreted: a backslash escape could point
+ * the browser at a different URL than the raw captured text. */
+function literalJsStringTarget(raw: string): string | null {
+  if (String(raw).includes('\\')) return null;
+  return literalNavigationTarget(raw);
+}
+
 /**
  * Accept only a literal navigation target. The value may be relative or
  * absolute http(s); fragments are same-page and never reveal new content.
@@ -86,14 +93,16 @@ export function parseOnclickNavigation(raw: string | null | undefined): string |
   value = value.replace(/^return\s+/i, '').trim();
   if (!value || /[`{}]/.test(value)) return null;
 
-  const assignment = /^(?:(?:window|document)\.)?location(?:\.href)?\s*=\s*(['"])(.*?)\1\s*;?$/s.exec(value);
-  if (assignment) return literalNavigationTarget(assignment[2]);
+  const assignment = /^(?:(?:window|document)\.)?location(?:\.href)?\s*=\s*(['"])((?:(?!\1).)*)\1\s*;?$/s.exec(value);
+  if (assignment) return literalJsStringTarget(assignment[2]);
 
-  const call = /^(?:(?:window|document)\.)?location\.(?:assign|replace)\(\s*(['"])(.*?)\1\s*\)\s*;?$/s.exec(value);
-  if (call) return literalNavigationTarget(call[2]);
+  const call = /^(?:(?:window|document)\.)?location\.(?:assign|replace)\(\s*(['"])((?:(?!\1).)*)\1\s*\)\s*;?$/s.exec(value);
+  if (call) return literalJsStringTarget(call[2]);
 
-  const open = /^(?:window\.)?open\(\s*(['"])(.*?)\1(?:\s*,\s*(['"]).*?\3)?\s*\)\s*;?$/s.exec(value);
-  if (open) return literalNavigationTarget(open[2]);
+  // Only the approved `_blank` window target is accepted; a named frame would
+  // navigate a frame, not the top-level page this crawler can inspect.
+  const open = /^(?:window\.)?open\(\s*(['"])((?:(?!\1).)*)\1(?:\s*,\s*(['"])_blank\3)?\s*\)\s*;?$/s.exec(value);
+  if (open) return literalJsStringTarget(open[2]);
 
   return null;
 }
@@ -119,18 +128,47 @@ export function parseMetaRefreshTarget(raw: string | null | undefined): string |
 export function staticControlTargetsFromDocument(
   $: CheerioAPI,
   maxTargets: number = MAX_STATIC_CONTROL_TARGETS,
+  baseUrl?: string,
 ): StaticControlExtraction {
   const cap = Math.max(0, Math.floor(maxTargets) || 0);
-  const targets: StaticControlTarget[] = [];
-  const seen = new Set<string>();
-  let eligible = 0;
+  const byUrl = new Map<string, StaticControlTarget>();
+
+  const resolve = (url: string): string | null => {
+    if (!baseUrl) return url;
+    try {
+      return new URL(url, baseUrl).toString();
+    } catch {
+      return null;
+    }
+  };
+
+  const labelFor = (node: any, tag: string, fallback: string): string => {
+    const aria = String(node.attr('aria-label') || '').trim();
+    if (aria) return aria;
+    const text = node.text().trim();
+    if (text) return text;
+    if (tag === 'input') {
+      const value = String(node.attr('value') || '').trim();
+      if (value) return value;
+    }
+    const title = String(node.attr('title') || '').trim();
+    return title || fallback;
+  };
 
   const add = (url: string | null, kind: StaticControlKind, label: string): void => {
     if (!url) return;
-    if (seen.has(url)) return;
-    seen.add(url);
-    eligible += 1;
-    if (targets.length < cap) targets.push({ url, kind, label });
+    const resolved = resolve(url);
+    if (!resolved) return;
+    const existing = byUrl.get(resolved);
+    if (existing) {
+      // Keep every distinct label for destination scoring: an unlabeled first
+      // occurrence must not hide a later "Join our community" occurrence.
+      if (label && !existing.label.split(/\s+/).includes(label)) {
+        existing.label = `${existing.label} ${label}`.trim();
+      }
+      return;
+    }
+    byUrl.set(resolved, { url: resolved, kind, label });
   };
 
   $('meta[http-equiv], button[formaction], input[formaction], [onclick]').each((_, element) => {
@@ -146,14 +184,16 @@ export function staticControlTargetsFromDocument(
       const type = String(node.attr('type') || (tag === 'button' ? 'submit' : 'text')).trim().toLowerCase();
       const submitLike = tag === 'button' ? type === 'submit' : type === 'submit' || type === 'image';
       if (formAction !== undefined && submitLike) {
-        add(literalNavigationTarget(formAction), 'FORMACTION', node.text().trim() || `${tag} form action`);
+        add(literalNavigationTarget(formAction), 'FORMACTION', labelFor(node, tag, `${tag} form action`));
       }
     }
     const onclick = node.attr('onclick');
     if (onclick !== undefined) {
-      add(parseOnclickNavigation(onclick), 'ONCLICK_NAVIGATION', node.text().trim() || 'onclick control');
+      add(parseOnclickNavigation(onclick), 'ONCLICK_NAVIGATION', labelFor(node, tag, 'onclick control'));
     }
   });
 
-  return { targets, truncated: Math.max(0, eligible - targets.length) };
+  const all = Array.from(byUrl.values());
+  const targets = all.slice(0, cap);
+  return { targets, truncated: Math.max(0, all.length - targets.length) };
 }
