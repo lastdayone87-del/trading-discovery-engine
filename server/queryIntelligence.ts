@@ -65,7 +65,7 @@ import { attributeTerminologyPerformance, buildNoveltyBaseline, classifyNativeCa
 import type { ExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { canonicalCountry } from './countryInference';
 import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
-import { reviewedNativePhraseLanguages } from './terminologySearchability';
+import { isNuisanceVocabularySurface, reviewedNativePhraseLanguages } from './terminologySearchability';
 import { countrySearchLanguageCandidates, normalizeLanguageCode } from './countrySearchHints';
 import { executeProviderCall, resolveGeminiRouteId } from './providerResilience';
 import { geminiOrgIdForSlot } from './evidenceEngine/providers/GeminiSemanticProvider';
@@ -409,6 +409,9 @@ export interface ReconcileOutcome {
  * save can never inflate frequency — the saver always brings it to exactly 1.
  */
 export async function defaultReconcileExtractedTerm(country: string, term: string, category: 'terminology' | 'instrument' | 'phrase' | 'format', sourceChannelId?: string, clientOverride?: { query: (text: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }> }): Promise<ReconcileOutcome> {
+  // Keep the migration invariant durable: repairing an existing row must not
+  // recompute a nuisance surface back to trust tier 2 from retained sources.
+  if (isNuisanceVocabularySurface(term)) return { rowInserted: false, linkInserted: false };
   const { normalizeTerm: normalizeTermForReconcile } = await import('./terminologyIntelligence');
   const db = clientOverride ?? await getDb();
   const clean = term.trim();
@@ -798,10 +801,11 @@ export async function admitNativeCandidates(args: {
       rejected['observation-failed'] += 1;
       return;
     }
-    // Legacy-vocabulary bypass guard: lower-quality or otherwise ineligible
-    // observations never increment extracted_vocabulary, so the planner
-    // cannot serve them through learnedVocabulary without the v2 basis.
-    if (args.persistLegacyTerm === false) {
+    // Legacy-vocabulary bypass guard: lower-quality, nuisance-shaped or
+    // otherwise ineligible observations never increment extracted_vocabulary,
+    // so the planner cannot serve them through learnedVocabulary without the
+    // v2 basis. Canonical observation evidence is still retained above.
+    if (args.persistLegacyTerm === false || isNuisanceVocabularySurface(String(raw))) {
       if (observation.observationInserted) admitted += 1;
       else duplicates += 1;
       return;
