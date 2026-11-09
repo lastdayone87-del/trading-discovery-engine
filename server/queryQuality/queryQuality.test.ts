@@ -1054,7 +1054,9 @@ test('Q5/Q6: production wiring uses accounting-window spend, derived failure sta
   assert.match(intelligence, /getQueryQualityDecayedCounts\(country, undefined, DECAY_HALF_LIFE_DAYS\)/);
   assert.match(intelligence, /getQueryQualityDecayedCounts\(queryRecord\.country, undefined, DECAY_HALF_LIFE_DAYS\)/);
   assert.match(intelligence, /const prior = empiricalPrior\(peerArms/);
-  assert.match(intelligence, /providerRequestsFailed \|\| 0\) > 0/);
+  const performanceSource = readFileSync(join(__dirname, '..', 'queryPerformance.ts'), 'utf8');
+  assert.match(performanceSource, /providerRequestsFailed \|\| 0\) > 0/);
+  assert.match(intelligence, /isCollectionChangeEligible\(attribution\)/);
   assert.match(intelligence, /buildHierarchy\(hierarchyCandidates\)/);
   assert.match(intelligence, /hierarchy,\n\s+coverageCells,/);
   // Share totals must be seeded from every query in the accounting window,

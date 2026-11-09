@@ -56,7 +56,7 @@ import { coverageCellFor, portfolioBudget, buildHierarchy, selectHierarchicalUcb
 import { isQuerySelectable } from './queryQuality/lifecycle';
 import { getCountryMarketProfile } from './queryQuality/profiles';
 import type { DecayedArmCounts, SelectorCandidate, SelectorContext, SelectorDecision } from './queryQuality/types';
-import { selectQueryCollection, isSeverelyContaminatedQuery, type QueryFunnelMetrics, type QueryPromotionGuard } from './queryPerformance';
+import { selectQueryCollection, isCollectionChangeEligible, isSeverelyContaminatedQuery, type QueryFunnelMetrics, type QueryPromotionGuard } from './queryPerformance';
 import { resolveProvenPolicy } from './queryQuality/provenPolicy';
 import { attributeTerminologyPerformance, buildNoveltyBaseline, classifyNativeCandidate, detectSpamSignals, findLiteralSpan, getPlannerTerminology, normalizeTerm, observeTerminology, observeTerminologyDetailed, KNOWN_INSTRUMENT_TERMS, type LiteralSourceText, type LiteralSpanMatch, type NativeAdmissionRejectReason, type NoveltyBaseline, type TerminologyObservationResult } from './terminologyIntelligence';
 import type { ExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
@@ -1974,7 +1974,8 @@ export async function evaluateQueryPerformance(
     await getAppSetting('query_proven_lcb_threshold', ''),
     await getAppSetting('query_proven_min_completed_runs', ''),
   );
-  if (performanceScore >= 60) {
+  const collectionChangeEligible = isCollectionChangeEligible(attribution);
+  if (performanceScore >= 60 && collectionChangeEligible) {
     // One aggregated read per country (a row per query id, not per run). The
     // query's own prior is kept separate from every other arm so the promotion
     // confidence bound is shrunk toward a genuinely peer-derived rate instead
@@ -2003,22 +2004,12 @@ export async function evaluateQueryPerformance(
       quotaUnits: Math.max(0, attribution.quotaConsumed || 0) / 100,
       ageDays: 0,
     };
-    // Zero-quota runs are excluded from serving history, hierarchy learning
-    // and the dashboard reward rate. They must not supply a promotion sample:
-    // otherwise a free run could raise the per-100-quota LCB to PROVEN.
-    // A partially provider-degraded run is excluded for the same reason:
-    // completed-run reward reads and accounting already drop it, so letting it
-    // prove the query would promote from evidence the dashboard cannot see.
-    // Exclude every non-success outcome, not only hard failures: a
-    // rate-limit-only recovered run is still a partially retrieved sample and
-    // is dropped from completed-run reward history. An absent outcome keeps
-    // legacy rows eligible; an explicit SUCCESS outcome stays eligible.
-    const providerOutcome = String(attribution.providerRunOutcome || '');
-    const providerFailed = Number(attribution.providerRequestsFailed || 0) > 0
-      || (providerOutcome !== '' && !/^SUCCESS(?:_|$)/.test(providerOutcome));
-    // Sighting-level truth requires the run id. Without it the funnel counters
-    // are not country-qualified, so the run cannot prove a promotion.
-    const includeCurrentRun = Boolean(attribution.queryRunId) && isRewardEligibleQuota(currentRun.quotaUnits) && !providerFailed;
+    // Zero-quota and provider-degraded runs never reach this block
+    // (collectionChangeEligible is false), so every sample here paid quota and
+    // completed without a degraded outcome. Sighting-level truth still
+    // requires the run id: without it the funnel counters are not
+    // country-qualified, so the run cannot prove a promotion.
+    const includeCurrentRun = Boolean(attribution.queryRunId) && isRewardEligibleQuota(currentRun.quotaUnits);
     const counts = includeCurrentRun
       ? {
           confirmed: ownPrior.confirmed + currentRun.confirmed,
@@ -2054,7 +2045,7 @@ export async function evaluateQueryPerformance(
     queryRecord.times_executed,
     metrics,
     promotionGuard,
-    { quotaEligible: (attribution.quotaConsumed || 0) > 0 },
+    { collectionChangeEligible },
   );
 
   if (isSeverelyContaminatedQuery(metrics)) {

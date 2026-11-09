@@ -72,11 +72,11 @@ export interface QueryQualityDashboard {
     rewardEligibleRuns: number;
     /**
      * Accounted, non-degraded/non-failed runs that spent no quota. They are
-     * reported separately so free-provider confirmations cannot be read as
-     * quota yield.
+     * reported separately so zero-quota confirmations cannot be read as
+     * quota yield. This population is quota-based and may include any provider.
      */
     zeroQuotaRuns: number;
-    /** Discoveries from the zero-quota InnerTube arm, shown separately. */
+    /** Discoveries from zero-quota runs (any provider), shown separately. */
     zeroQuotaNewConfirmedCreators: number;
     zeroQuotaNewQualityCreators: number;
     unaccountedCompletedRuns: number;
