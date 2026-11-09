@@ -1132,9 +1132,17 @@ async function processChannelThroughPipelineInContext(
   // known low-audience channel must not pay for another deep inspection or
   // Discord crawl. Persist the classification result and stop here.
   if (existing && shouldStopDeepInspectionForForcedPass(options?.forceClassification === true, candidate.subscriberCount)) {
-    existing.country_status = countryVal.status;
-    existing.country = creatorCountry;
-    existing.confidence_score = countryVal.score;
+    // Preserve a previously validated country when this pass has no new
+    // country evidence; only replace it with a resolved result.
+    const countryResolved = countryVal.status === 'CONFIRMED' || countryVal.status === 'LIKELY';
+    if (countryResolved || existing.country_status === 'UNCERTAIN' || !existing.country_status) {
+      existing.country_status = countryVal.status;
+      existing.country = creatorCountry;
+      existing.confidence_score = countryVal.score;
+    }
+    if (candidate.subscriberCount !== undefined && candidate.subscriberCount !== null) {
+      existing.subscriber_count = candidate.subscriberCount;
+    }
     existing.trading_status = tradingVal.status;
     existing.trading_confidence_score = tradingVal.confidenceScore;
     existing.trading_category = tradingVal.category;
