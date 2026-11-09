@@ -211,6 +211,13 @@ export interface BrowserFallbackTelemetry {
    * only the generic classifier label.
    */
   launchCauseSnippet?: string;
+  /**
+   * Longest time this seed waited for rendered-gate admission (milliseconds).
+   * Capacity evidence only: a gate wait is not an acquisition failure. Sparse:
+   * absent when the run was rejected before admission or predates
+   * instrumentation.
+   */
+  gateWaitMs?: number;
 }
 
 export function browserFallbackTelemetrySummary(telemetry: BrowserFallbackTelemetry): string {
@@ -4381,7 +4388,12 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   retain(seedUrl,seedUrl);
 
   try {
+    const gateRequestedAtMs = Date.now();
     return await renderedFallbackGate.run((gateAdmittedAtMs) => withRenderedQueueLifecycleLock(async () => {
+      // Admission wait is capacity evidence, measured before the lifecycle
+      // lock so serialized crawls correctly show gate pressure. It is never
+      // an acquisition failure or a reason to consume retry ownership.
+      telemetry.gateWaitMs = Math.max(0, gateAdmittedAtMs - gateRequestedAtMs);
       telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'GATE_ACQUIRED');
       // Total-budget clock: starts at gate admission, before the lifecycle
       // lock below, so a crawl admitted by a wider gate (env concurrency 2)

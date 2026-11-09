@@ -7,6 +7,14 @@
  */
 
 import type { AcquisitionFailureClass } from './acquisitionFailureClassification';
+import {
+  ACQUISITION_LANES,
+  ACQUISITION_OUTCOMES,
+  isAcquisitionLane,
+  isAcquisitionOutcome,
+  type AcquisitionLane,
+  type AcquisitionOutcome,
+} from './acquisitionLaneKeys';
 
 export type Gate1DispositionKey =
   | 'REJECT_EXCLUDED'
@@ -45,7 +53,39 @@ interface CommunityRecoveryCounters {
   communitySaturationDeferralsTotal: number;
 }
 
-function freshCounters(): OperationsCounters & CommunityRecoveryCounters {
+/**
+ * Phase 0 acquisition-lane baseline. Process-local and reset on restart; the
+ * durable baseline is `acquisition_lane_events` (flag-gated). Counters never
+ * influence acquisition, retry, or capacity decisions.
+ */
+interface AcquisitionLaneCounters {
+  acquisitionLaneEventsTotal: Record<AcquisitionLane, Record<AcquisitionOutcome, number>>;
+  acquisitionLanePagesInspectedTotal: Record<AcquisitionLane, number>;
+  acquisitionLaneRequestsStartedTotal: Record<AcquisitionLane, number>;
+  acquisitionLaneGateWaitMsTotal: Record<AcquisitionLane, number>;
+  acquisitionLaneGateWaitMaxMs: Record<AcquisitionLane, number>;
+  acquisitionLaneWorkRemainingMax: Record<AcquisitionLane, number>;
+  /** Default-off bulk-enqueue caps; the warning counter is always active. */
+  bulkEnqueueGuardBlocksTotal: { transaction: number; window: number; hour: number };
+  bulkEnqueueWarningsTotal: number;
+}
+
+type AllCounters = OperationsCounters & CommunityRecoveryCounters & AcquisitionLaneCounters;
+
+function emptyLaneCounts(): Record<AcquisitionLane, number> {
+  return Object.fromEntries(ACQUISITION_LANES.map(lane => [lane, 0])) as Record<AcquisitionLane, number>;
+}
+
+function emptyLaneOutcomeCounts(): Record<AcquisitionLane, Record<AcquisitionOutcome, number>> {
+  return Object.fromEntries(
+    ACQUISITION_LANES.map(lane => [
+      lane,
+      Object.fromEntries(ACQUISITION_OUTCOMES.map(outcome => [outcome, 0])) as Record<AcquisitionOutcome, number>,
+    ]),
+  ) as Record<AcquisitionLane, Record<AcquisitionOutcome, number>>;
+}
+
+function freshCounters(): AllCounters {
   return {
     gate1EvaluationsTotal: {
       REJECT_EXCLUDED: 0,
@@ -74,6 +114,14 @@ function freshCounters(): OperationsCounters & CommunityRecoveryCounters {
     operationalEnrichmentRecoveryDuplicateEventsTotal: 0,
     operationalEnrichmentRecoveryExhaustedTotal: 0,
     communitySaturationDeferralsTotal: 0,
+    acquisitionLaneEventsTotal: emptyLaneOutcomeCounts(),
+    acquisitionLanePagesInspectedTotal: emptyLaneCounts(),
+    acquisitionLaneRequestsStartedTotal: emptyLaneCounts(),
+    acquisitionLaneGateWaitMsTotal: emptyLaneCounts(),
+    acquisitionLaneGateWaitMaxMs: emptyLaneCounts(),
+    acquisitionLaneWorkRemainingMax: emptyLaneCounts(),
+    bulkEnqueueGuardBlocksTotal: { transaction: 0, window: 0, hour: 0 },
+    bulkEnqueueWarningsTotal: 0,
   };
 }
 
@@ -148,6 +196,43 @@ export function bumpCommunitySaturationDeferral(): void {
   counters.communitySaturationDeferralsTotal += 1;
 }
 
+function nonNegative(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+/**
+ * Count one classified inspection/slice. Called for every inspection even when
+ * the durable lane-event flag is off, so a deploy can compare in-process
+ * counters with the persisted baseline. Unknown lane/outcome values are
+ * dropped rather than coerced into a bucket.
+ */
+export function bumpAcquisitionLaneEvent(
+  lane: unknown,
+  outcome: unknown,
+  input: { pagesInspected?: unknown; requestsStarted?: unknown; gateWaitMs?: unknown; workRemaining?: unknown } = {},
+): void {
+  if (!isAcquisitionLane(lane) || !isAcquisitionOutcome(outcome)) return;
+  counters.acquisitionLaneEventsTotal[lane][outcome] += 1;
+  counters.acquisitionLanePagesInspectedTotal[lane] += nonNegative(input.pagesInspected);
+  counters.acquisitionLaneRequestsStartedTotal[lane] += nonNegative(input.requestsStarted);
+  const gateWaitMs = nonNegative(input.gateWaitMs);
+  if (gateWaitMs > 0) {
+    counters.acquisitionLaneGateWaitMsTotal[lane] += gateWaitMs;
+    counters.acquisitionLaneGateWaitMaxMs[lane] = Math.max(counters.acquisitionLaneGateWaitMaxMs[lane], gateWaitMs);
+  }
+  counters.acquisitionLaneWorkRemainingMax[lane] = Math.max(counters.acquisitionLaneWorkRemainingMax[lane], nonNegative(input.workRemaining));
+}
+
+export type BulkEnqueueGuardBlockKind = 'transaction' | 'window' | 'hour';
+
+export function bumpBulkEnqueueGuardBlock(kind: BulkEnqueueGuardBlockKind): void {
+  counters.bulkEnqueueGuardBlocksTotal[kind] += 1;
+}
+
+export function bumpBulkEnqueueWarning(): void {
+  counters.bulkEnqueueWarningsTotal += 1;
+}
+
 /**
  * Bounded idempotency guards for the disposition and classification counters.
  * failJob performs its writes outside a transaction: if a secondary bookkeeping
@@ -191,7 +276,7 @@ export function jobDispositionExecutionKey(
   return `job:${String(jobId)}:attempt:${String(attempts)}`;
 }
 
-export function operationsTelemetrySnapshot(): OperationsCounters & CommunityRecoveryCounters {
+export function operationsTelemetrySnapshot(): AllCounters {
   return {
     gate1EvaluationsTotal: { ...counters.gate1EvaluationsTotal },
     repeatFailureSkipsTotal: counters.repeatFailureSkipsTotal,
@@ -204,6 +289,16 @@ export function operationsTelemetrySnapshot(): OperationsCounters & CommunityRec
     operationalEnrichmentRecoveryDuplicateEventsTotal: counters.operationalEnrichmentRecoveryDuplicateEventsTotal,
     operationalEnrichmentRecoveryExhaustedTotal: counters.operationalEnrichmentRecoveryExhaustedTotal,
     communitySaturationDeferralsTotal: counters.communitySaturationDeferralsTotal,
+    acquisitionLaneEventsTotal: Object.fromEntries(
+      ACQUISITION_LANES.map(lane => [lane, { ...counters.acquisitionLaneEventsTotal[lane] }]),
+    ) as Record<AcquisitionLane, Record<AcquisitionOutcome, number>>,
+    acquisitionLanePagesInspectedTotal: { ...counters.acquisitionLanePagesInspectedTotal },
+    acquisitionLaneRequestsStartedTotal: { ...counters.acquisitionLaneRequestsStartedTotal },
+    acquisitionLaneGateWaitMsTotal: { ...counters.acquisitionLaneGateWaitMsTotal },
+    acquisitionLaneGateWaitMaxMs: { ...counters.acquisitionLaneGateWaitMaxMs },
+    acquisitionLaneWorkRemainingMax: { ...counters.acquisitionLaneWorkRemainingMax },
+    bulkEnqueueGuardBlocksTotal: { ...counters.bulkEnqueueGuardBlocksTotal },
+    bulkEnqueueWarningsTotal: counters.bulkEnqueueWarningsTotal,
   };
 }
 
@@ -221,6 +316,14 @@ export function resetOperationsTelemetry(): void {
   counters.operationalEnrichmentRecoveryDuplicateEventsTotal = fresh.operationalEnrichmentRecoveryDuplicateEventsTotal;
   counters.operationalEnrichmentRecoveryExhaustedTotal = fresh.operationalEnrichmentRecoveryExhaustedTotal;
   counters.communitySaturationDeferralsTotal = fresh.communitySaturationDeferralsTotal;
+  counters.acquisitionLaneEventsTotal = fresh.acquisitionLaneEventsTotal;
+  counters.acquisitionLanePagesInspectedTotal = fresh.acquisitionLanePagesInspectedTotal;
+  counters.acquisitionLaneRequestsStartedTotal = fresh.acquisitionLaneRequestsStartedTotal;
+  counters.acquisitionLaneGateWaitMsTotal = fresh.acquisitionLaneGateWaitMsTotal;
+  counters.acquisitionLaneGateWaitMaxMs = fresh.acquisitionLaneGateWaitMaxMs;
+  counters.acquisitionLaneWorkRemainingMax = fresh.acquisitionLaneWorkRemainingMax;
+  counters.bulkEnqueueGuardBlocksTotal = fresh.bulkEnqueueGuardBlocksTotal;
+  counters.bulkEnqueueWarningsTotal = fresh.bulkEnqueueWarningsTotal;
   // Dedupe state is test-observable too: a reset must start from a clean slate
   // or a later test can be silently suppressed by an earlier execution key.
   countedDispositions.clear();

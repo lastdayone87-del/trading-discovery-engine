@@ -72,6 +72,8 @@ import { trialContinuationCap } from './discoveryFrontierTrials';
 import { aggregatedLanguageCandidateSet, mergeCountryValidationResults, validateChannelCountry } from './countryValidator';
 import { runChannelInspection, hasProcessedAcquisitionEvidence } from './inspector';
 import { hasRetryableCommunityAcquisitionFailure } from './communityRetryPolicy';
+import { recordAcquisitionInspectionEvent } from './acquisitionLaneTelemetry';
+import { acquisitionLaneForJobType, summarizeAcquisitionInspection, type AcquisitionAttribution, type AcquisitionLane, type AcquisitionLaneInspection } from './acquisitionLaneTaxonomy';
 import { applyCommunityIntentEvidence } from './communityIntent';
 import { validateDiscordInvite } from './discordValidator';
 import {canProjectDiscordValidation,hasEstablishedValidatedDiscordSelection,hasRetainedLastKnownGoodDiscordInvite,isSameSelectedDiscordCandidate,projectDiscordValidation,reconcileDiscordDiscoveryFromInspection} from './discordProjection';
@@ -1396,7 +1398,7 @@ export async function processNextSearchJob(
       // unresolved acquisition for the same channel: its inspection must
       // re-acquire rather than borrow its own incomplete coverage in a loop.
       // First-time inspections leave the flag unset and borrow normally.
-      const inspectionResult=await inspectAndValidateChannel(channel,undefined,false,false,false,{jobId:job.id,attemptNumber:job.attempts,generation:job.reopen_generation,isRetryOwnedReacquire:true,clickOffsets:resolveInspectionClickOffsets(job.payload.clickOffsets)});
+      const inspectionResult=await inspectAndValidateChannel(channel,undefined,false,false,false,{jobId:job.id,attemptNumber:job.attempts,generation:job.reopen_generation,isRetryOwnedReacquire:true,clickOffsets:resolveInspectionClickOffsets(job.payload.clickOffsets)},{lane:acquisitionLaneForJobType(job.type),jobType:job.type,jobId:job.id,slicePass:1});
       // The retry worker replaces this inspection result with a bare error
       // below. Lift the execution counters now so the shadow classifier can
       // distinguish a post-work browser/runtime failure from an unstarted
@@ -1451,8 +1453,8 @@ export async function processNextSearchJob(
       await completeJob(job.id);
       return true;
     }
-    if(job.type==='INSPECT_PLAYLIST'){await processPlaylistInspectionJob(job,processDiscoveredChannelContained);return true;}
-    if(job.type==='INSPECT_FEATURED_CHANNELS'){await processFeaturedChannelInspectionJob(job,processDiscoveredChannelContained);return true;}
+    if(job.type==='INSPECT_PLAYLIST'){await processPlaylistInspectionJob(job,(raw,country,source)=>processDiscoveredChannelContained(raw,country,source,{lane:'DISCOVERY',jobType:job.type,jobId:job.id}));return true;}
+    if(job.type==='INSPECT_FEATURED_CHANNELS'){await processFeaturedChannelInspectionJob(job,(raw,country,source)=>processDiscoveredChannelContained(raw,country,source,{lane:'DISCOVERY',jobType:job.type,jobId:job.id}));return true;}
     if(job.type==='RELATIONSHIP_CANARY_EXPANSION'){
       await handleRelationshipCanaryExpansionJob(job, undefined, { workerId, attemptNumber: job.attempts });return true;
     }
@@ -1460,7 +1462,11 @@ export async function processNextSearchJob(
       const channelId=String(job.payload.channelId||'');
       const before=await getChannelById(channelId);
       if(!before) { await completeJob(job.id); return true; }
-      const result=await triggerManualRecheck(channelId, true, true);
+      const result=await triggerManualRecheck(channelId, true, true, {
+        lane: job.type==='POST_APPROVAL_ENRICH'?'ENRICHMENT':'MANUAL',
+        jobType: job.type,
+        jobId: job.id,
+      });
       if(!result.success){
         // A policy skip is a handled outcome, not a failure: complete the job
         // instead of consuming bounded retry attempts. Other policy refusals
@@ -1548,6 +1554,8 @@ export async function processNextSearchJob(
           forceExtraction: job.payload.forceExtraction === true || isRepairEligibleRetry(job),
           jobId: job.id,
           runId: typeof job.payload.queryRunId === 'string' ? job.payload.queryRunId : undefined,
+          lane: 'ENRICHMENT',
+          jobType: job.type,
         });
         await completeJob(job.id);
         return true;
@@ -1759,7 +1767,7 @@ export async function processNextSearchJob(
           // crashed after persisting the paid enrichment payload.
           await finishQuotaReservation('ENRICH_CHANNEL',job.id,true);
         }
-        const pipelineOutcome=await processChannelThroughPipeline(enriched,targetCountry,source,false,true,{forceExtraction:isRepairEligibleRetry(job),jobId:job.id,runId:typeof job.payload.queryRunId==='string'?job.payload.queryRunId:undefined});
+        const pipelineOutcome=await processChannelThroughPipeline(enriched,targetCountry,source,false,true,{forceExtraction:isRepairEligibleRetry(job),jobId:job.id,runId:typeof job.payload.queryRunId==='string'?job.payload.queryRunId:undefined,lane:'ENRICHMENT',jobType:job.type});
         if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SUCCEEDED',resultingStatus:pipelineOutcome.tradingStatus,providerCost:enrichmentQuotaUnits,latencyMs:Date.now()-evidenceStartedAt,reasonCode:pipelineOutcome.tradingStatus==='UNCERTAIN'||pipelineOutcome.tradingStatus==='NEEDS_REVIEW'?'EVIDENCE_DID_NOT_RESOLVE':'DECISION_RESOLVED'}).catch(()=>undefined);
         if(quotaReserved)await finishQuotaReservation('ENRICH_CHANNEL',job.id,true);
         if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:pipelineOutcome.tradingStatus,output:{channelId:pipelineOutcome.channelId,tradingStatus:pipelineOutcome.tradingStatus,countryStatus:pipelineOutcome.countryStatus}});else await completeJob(job.id);
@@ -3075,6 +3083,8 @@ export async function processClassificationJob(job: DurableJob): Promise<void> {
       jobId: job.id,
       runId: payload.queryRunId,
       quotaOrigin: payload.quotaOrigin,
+      lane: 'DISCOVERY',
+      jobType: 'CLASSIFY_DISCOVERED_CHANNEL',
     },
   );
   const channel = outcome.channelRecord || await getChannelById(channelId);
@@ -3201,16 +3211,57 @@ export async function processDiscoveredChannelContained(
 /**
  * Executes the inspection and Discord quality validation for a locked channel.
  */
+export interface ChannelInspectionAttributionInput {
+  lane?: AcquisitionLane;
+  jobType?: string;
+  jobId?: string;
+  slicePass?: number;
+  workRemaining?: number;
+}
+
 export async function inspectAndValidateChannel(
   channel: ChannelRecord,
   rawDetails?: DiscoveredChannelRaw,
   isManualScan: boolean = false,
   enableDebug: boolean = false,
   scheduleRetry: boolean = true,
-  executionMarker?: { jobId: string; attemptNumber: number; generation?: number; isRetryOwnedReacquire?: boolean; clickOffsets?: Record<string, number> }
+  executionMarker?: { jobId: string; attemptNumber: number; generation?: number; isRetryOwnedReacquire?: boolean; clickOffsets?: Record<string, number> },
+  attribution?: ChannelInspectionAttributionInput,
 ): Promise<{ debugLog?: any; inspection?: Awaited<ReturnType<typeof runChannelInspection>>; retryDirective?: CommunityRetryDirective } | void> {
+  // Phase 0 lane attribution: explicit caller lane > execution marker > the
+  // inspection shape. The attribution is observational only and never changes
+  // retry, validation, or projection behavior.
+  const laneAttribution: AcquisitionAttribution = {
+    lane: attribution?.lane
+      || (executionMarker?.isRetryOwnedReacquire ? 'RETRY' : isManualScan ? 'MANUAL' : 'DISCOVERY'),
+    ...(attribution?.jobType ? { jobType: attribution.jobType } : {}),
+    ...(attribution?.jobId || executionMarker?.jobId ? { jobId: attribution?.jobId || executionMarker?.jobId } : {}),
+    channelId: channel.channel_id,
+    slicePass: Math.max(1, Math.floor(attribution?.slicePass || 1)),
+    ...(attribution?.workRemaining !== undefined ? { workRemaining: attribution.workRemaining } : {}),
+  };
+  const recordLaneEvent = async (
+    inspection: AcquisitionLaneInspection | null | undefined,
+    retryDirective?: CommunityRetryDirective,
+  ): Promise<void> => {
+    await recordAcquisitionInspectionEvent({
+      attribution: laneAttribution,
+      channelId: channel.channel_id,
+      inspection,
+      retryDirective,
+      observedAt: new Date().toISOString(),
+    }).catch(error => console.warn(JSON.stringify({
+      event: 'acquisition_lane_event_failed',
+      channelId: channel.channel_id,
+      lane: laneAttribution.lane,
+      error: error instanceof Error ? error.message : String(error),
+      timestamp: new Date().toISOString(),
+    })));
+  };
+
   if (isTerminalState(channel) && !isManualScan) {
     console.log(`[Queue Manager] Channel '${channel.channel_name}' (${channel.channel_id}) is in terminal state '${channel.country_status}' / '${channel.trading_status}'. Aborting inspection.`);
+    await recordLaneEvent(undefined);
     return;
   }
 
@@ -3218,6 +3269,7 @@ export async function inspectAndValidateChannel(
   if (qStatus.channelProcessing.isPaused) {
     channel.scan_status = 'PENDING';
     await upsertChannel(channel);
+    await recordLaneEvent(undefined);
     return;
   }
 
@@ -3248,6 +3300,7 @@ export async function inspectAndValidateChannel(
       }];
       await upsertChannel(channel);
       console.warn(JSON.stringify({event:'excluded_channel_blocked',channelId:channel.channel_id,detectedCountry:channel.country,reason:storedBlock.reason,context:'retry_owned_reacquire',timestamp:rejectionNow}));
+      await recordLaneEvent(undefined);
       return;
     }
   }
@@ -3263,6 +3316,12 @@ export async function inspectAndValidateChannel(
 
   let finalDebugLog: any = null;
   let inspection: Awaited<ReturnType<typeof runChannelInspection>> | null = null;
+  // A started run is a work signal even when it returns no inspection object.
+  // The durable marker (or an explicit manual pass) precedes country
+  // validation, so a throw after either must be INCONCLUSIVE, not
+  // NEVER_EXECUTED. The terminal-state/pause early returns above bypass this
+  // scope and still record NEVER_EXECUTED.
+  let inspectionStarted = Boolean(executionMarker) || isManualScan;
   let retryDirective: CommunityRetryDirective | undefined;
   let attemptFree = false;
   // Set only when this pass actually projected a fresh validation result onto
@@ -3339,6 +3398,7 @@ export async function inspectAndValidateChannel(
     }
 
     // 2. Step-by-step Channel Inspection Engine for Discord Invites (force live YouTube scrape on manual scan)
+    inspectionStarted = true;
     inspection = await runChannelInspection({
       enableDebug,
       channelId: channel.channel_id,
@@ -3373,8 +3433,14 @@ export async function inspectAndValidateChannel(
         console.warn(JSON.stringify({event:'community_retry_click_offsets_persist_failed',jobId:executionMarker.jobId,channelId:channel.channel_id,error:error instanceof Error?error.message:String(error),timestamp:new Date().toISOString()}));
       });
     }
-    if(inspection.acquisitionOutcomes?.length)await appendExternalAcquisitionObservations(channel.channel_id,inspection.acquisitionOutcomes)
-      .catch(error=>console.warn(`[ExternalAcquisition] observational write failed for ${channel.channel_id}:`,error instanceof Error?error.message:error));
+    if(inspection.acquisitionOutcomes?.length){
+      // WorkRemaining is a per-pass snapshot, not a caller-supplied guess.
+      // Compute it from the same classifier the lane event uses so persisted
+      // observation telemetry and the event baseline cannot disagree.
+      const observationLaneAttribution:AcquisitionAttribution={...laneAttribution,workRemaining:summarizeAcquisitionInspection({inspection,retryDirective:inspection.retryDirective}).workRemaining};
+      await appendExternalAcquisitionObservations(channel.channel_id,inspection.acquisitionOutcomes,observationLaneAttribution)
+        .catch(error=>console.warn(`[ExternalAcquisition] observational write failed for ${channel.channel_id}:`,error instanceof Error?error.message:error));
+    }
 
     // Live About-page hydration can reveal stronger country evidence than the
     // search snippet. Re-evaluate BEFORE the authoritative claim (P2/E5): a
@@ -3674,6 +3740,13 @@ export async function inspectAndValidateChannel(
     // paths did not project a validation result, so they keep the ordinary
     // stale-snapshot guard.
     await upsertChannel(channel,{freshDiscordValidation:discordValidationProjected});
+    // Phase 0 lane baseline: classify the pass after all projection writes. A
+    // post-start throw without an inspection object is INCONCLUSIVE, never
+    // NEVER_EXECUTED; a capacity directive is a deferral, never a failure.
+    await recordLaneEvent(
+      inspection || (inspectionStarted ? { acquisitionStatus: 'INCONCLUSIVE' } : undefined),
+      retryDirective || inspection?.retryDirective,
+    );
   }
   return { debugLog: enableDebug ? finalDebugLog : undefined, inspection, retryDirective };
 }
@@ -4405,7 +4478,8 @@ export function classifyManualRecheckAcquisitionFailure(error: any): {
 export async function triggerManualRecheck(
   channelId: string,
   enableDebug?: boolean,
-  quotaAlreadyReserved = false
+  quotaAlreadyReserved = false,
+  attribution?: { lane?: AcquisitionLane; jobType?: string; jobId?: string },
 ): Promise<ManualRecheckResult> {
   const channel = await getChannelById(channelId);
   if (!channel) {
@@ -4506,7 +4580,11 @@ export async function triggerManualRecheck(
     console.log(`[Manual Reclassification Started] Channel: ${channel.channel_name} (${channel.channel_id})`);
 
     try {
-      const outcome = await processChannelThroughPipeline(freshCandidate, channel.country, 'recheck', true, true);
+      const outcome = await processChannelThroughPipeline(freshCandidate, channel.country, 'recheck', true, true, {
+        lane: attribution?.lane || 'MANUAL',
+        jobType: attribution?.jobType || 'MANUAL_RECHECK',
+        ...(attribution?.jobId ? { jobId: attribution.jobId } : {}),
+      });
       const updatedChannel = outcome.channelRecord || await getChannelById(channelId) || undefined;
       console.log(`[Manual Reclassification Completed] Channel: ${channel.channel_name}, Trading Status: ${updatedChannel?.trading_status || outcome.tradingStatus}, Score: ${updatedChannel?.trading_confidence_score ?? 'unknown'}, Discord Status: ${updatedChannel?.discord_status || outcome.discordStatus}`);
       return {
@@ -4530,7 +4608,12 @@ export async function triggerManualRecheck(
         console.warn(`[Manual Recheck] Gemini classification coverage is degraded for already-confirmed trading creator ${channelId}; preserving TRADING_CONFIRMED and continuing fresh community inspection.`);
         try {
           preserved.trading_status = 'TRADING_CONFIRMED';
-          await inspectAndValidateChannel(preserved, freshCandidate, true, enableDebug, false);
+          await inspectAndValidateChannel(preserved, freshCandidate, true, enableDebug, false, undefined, {
+            lane: attribution?.lane || 'MANUAL',
+            jobType: attribution?.jobType || 'MANUAL_RECHECK',
+            ...(attribution?.jobId ? { jobId: attribution.jobId } : {}),
+            slicePass: 1,
+          });
           const communityRefreshed = await getChannelById(channelId) || preserved;
           const communityIncomplete = communityRefreshed.scan_status === 'FAILED' || communityRefreshed.scan_status === 'FAILED_PERMANENT';
           if (communityIncomplete) {
@@ -4650,7 +4733,11 @@ async function executeManualSearchPage(sessionId: string, pageNumber: number, pa
         queryGenerationMode:'OPERATOR_DIRECTED',country:session.country,retrievalLane:session.retrievalLane,pageNumber,resultRank:index+1,
         matchedDocument:raw.matchedDocument||{type:'MANUAL'},rawObservation:{channelName:raw.channelName,youtubeUrl:raw.youtubeUrl,sessionId,variantIndex}},'INVESTIGATION_QUEUED');
       raw.nominationId=nomination.id||undefined;
-      const outcome = await processDiscoveredChannelContained(raw, session.country, 'manual_search', { jobId });
+      const outcome = await processDiscoveredChannelContained(raw, session.country, 'manual_search', {
+        jobId,
+        lane: 'MANUAL',
+        jobType: 'MANUAL_SEARCH_PAGE',
+      });
       if (!outcome) { deferredIds.add(raw.channelId); continue; }
       if (outcome.wasKnown) knownIds.push(outcome.channelId);
       if (outcome.persisted && outcome.countryStatus !== 'REJECTED') acceptedIds.push(outcome.channelId);

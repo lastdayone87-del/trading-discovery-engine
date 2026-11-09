@@ -12,7 +12,7 @@ test('legacy machine false-negative recovery uses the governed dedicated worker'
   assert.match(maintenance,/Reserve before claiming/);
   assert.match(maintenance,/reserveOfficialRecheckQuota\('OPERATIONAL_RECHECK'/);
   assert.match(maintenance,/claimNextJob\(workerId, \[FALSE_NEGATIVE_RECOVERY_JOB\]\)/);
-  assert.match(maintenance,/triggerManualRecheck\(channelId, true, true\)/);
+  assert.match(maintenance,/triggerManualRecheck\(channelId, true, true, \{ lane: 'MAINTENANCE', jobType: job\.type, jobId: job\.id \}\)/);
 });
 
 test('conflict-policy recovery is bounded and never reopens human or country rejection',()=>{

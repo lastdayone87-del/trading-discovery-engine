@@ -1,3 +1,5 @@
+import { isAcquisitionLane, type AcquisitionLane } from './acquisitionLaneKeys';
+
 export type CrawlerAcquisitionMode = 'STATIC' | 'RENDERED';
 
 /**
@@ -527,6 +529,23 @@ export interface CrawlerTelemetry {
    * absent on legacy crawls and on rows predating instrumentation.
    */
   experimentAttribution?: ExperimentAttribution;
+  /**
+   * Phase 0 acquisition-lane attribution. Sparse and additive: absent on rows
+   * that predate instrumentation or whose caller has no lane. `acquisitionLane`
+   * is a closed taxonomy value; job/slice/work fields are bounded provenance.
+   */
+  acquisitionLane?: AcquisitionLane;
+  acquisitionJobType?: string;
+  /** 1-based inspection pass; Phase 1 URL slices advance this per slice. */
+  acquisitionSlicePass?: number;
+  /** Required retryable work left after this pass (bounded count). */
+  acquisitionWorkRemaining?: number;
+  /**
+   * Longest single rendered-gate admission wait for this crawl (milliseconds).
+   * Capacity evidence only: never an acquisition failure. Sparse; absent for
+   * static crawls and for rows predating instrumentation.
+   */
+  gateWaitMs?: number;
 }
 
 import os from 'node:os';
@@ -801,6 +820,23 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
   const scrolls = sanitizeScrollsUsed(candidate.scrollsUsed);
   const attribution = sanitizeExperimentAttribution(candidate.experimentAttribution);
   const instance = text(candidate.workerInstanceId, 120);
+  // Phase 0 acquisition-lane attribution is a closed lane value plus bounded
+  // provenance. Unknown lanes are dropped instead of persisted; the numeric
+  // fields are capped independently because a gate wait can legitimately
+  // exceed the ordinary telemetry-counter ceiling.
+  const acquisitionLane = isAcquisitionLane(candidate.acquisitionLane) ? candidate.acquisitionLane : undefined;
+  const acquisitionJobType = text(candidate.acquisitionJobType, 96);
+  const acquisitionSlicePass = number(candidate.acquisitionSlicePass) > 0
+    ? Math.min(MAX_TELEMETRY_COUNTER, number(candidate.acquisitionSlicePass))
+    : undefined;
+  const acquisitionWorkRemaining = typeof candidate.acquisitionWorkRemaining === 'number' && Number.isFinite(candidate.acquisitionWorkRemaining)
+    ? boundedCount(candidate.acquisitionWorkRemaining)
+    : undefined;
+  // Gate waits only exist for the rendered path; a static row carrying one is
+  // malformed input, not capacity evidence.
+  const gateWaitMs = candidate.mode === 'RENDERED' && number(candidate.gateWaitMs) > 0
+    ? Math.min(86_400_000, number(candidate.gateWaitMs))
+    : undefined;
   const ceiling = candidate.ceiling && typeof candidate.ceiling === 'object' && isCeilingKind((candidate.ceiling as { kind?: unknown }).kind)
     ? { kind: (candidate.ceiling as { kind: CeilingKind }).kind }
     : undefined;
@@ -920,6 +956,11 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
     ...(Object.keys(drops).length ? { dropReasons: drops } : {}),
     ...(scrolls > 0 ? { scrollsUsed: scrolls } : {}),
     ...(attribution ? { experimentAttribution: attribution } : {}),
+    ...(acquisitionLane ? { acquisitionLane } : {}),
+    ...(acquisitionJobType ? { acquisitionJobType } : {}),
+    ...(acquisitionSlicePass !== undefined ? { acquisitionSlicePass } : {}),
+    ...(acquisitionWorkRemaining !== undefined ? { acquisitionWorkRemaining } : {}),
+    ...(gateWaitMs !== undefined ? { gateWaitMs } : {}),
     ...(ceiling ? { ceiling } : {}),
     ...(sanitizeClickFailureDetail(
       (candidate as { clickFailureDetail?: unknown }).clickFailureDetail,

@@ -49,7 +49,7 @@ test('false-negative recovery reserves quota before claiming its custom job', ()
   const claim = workers.indexOf('claimNextJob(workerId, [FALSE_NEGATIVE_RECOVERY_JOB])');
   assert.ok(reserve >= 0 && claim > reserve);
   assert.match(workers, /FALSE_NEGATIVE_RECOVERY_JOB = 'CLASSIFICATION_FALSE_NEGATIVE_RESCAN'/);
-  assert.match(workers, /triggerManualRecheck\(channelId, true, true\)/);
+  assert.match(workers, /triggerManualRecheck\(channelId, true, true, \{ lane: 'MAINTENANCE', jobType: job\.type, jobId: job\.id \}\)/);
   assert.match(workers, /completeJob\(job\.id\)/);
   assert.match(workers, /failJob\(claimedJobId, error\)/);
   assert.match(workers, /heartbeatJob\(job\.id, workerId\)/);
