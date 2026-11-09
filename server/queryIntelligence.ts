@@ -25,6 +25,7 @@ import {
   getQueryFailureStates,
   getInFlightPrimaryTermUsage,
   getActiveQueryRunQueryIds,
+  getQueryTerminologyCurrentStatuses,
   getQueryRunReward,
   isRetryableInfrastructureFailure
 } from './db';
@@ -58,6 +59,7 @@ import { getCountryMarketProfile } from './queryQuality/profiles';
 import type { DecayedArmCounts, SelectorCandidate, SelectorContext, SelectorDecision } from './queryQuality/types';
 import { selectQueryCollection, isCollectionChangeEligible, isSeverelyContaminatedQuery, type QueryFunnelMetrics, type QueryPromotionGuard } from './queryPerformance';
 import { resolveProvenPolicy } from './queryQuality/provenPolicy';
+import { digestQueryTerminologyMetadata, resolveSavedTerminologyDisposition } from './queryQuality/terminologyRevalidation';
 import { attributeTerminologyPerformance, buildNoveltyBaseline, classifyNativeCandidate, detectSpamSignals, findLiteralSpan, getPlannerTerminology, normalizeTerm, observeTerminology, observeTerminologyDetailed, KNOWN_INSTRUMENT_TERMS, type LiteralSourceText, type LiteralSpanMatch, type NativeAdmissionRejectReason, type NoveltyBaseline, type TerminologyObservationResult } from './terminologyIntelligence';
 import type { ExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { canonicalCountry } from './countryInference';
@@ -1539,6 +1541,13 @@ async function buildSelectorPool(
   const admissions = new Map<number, QueryRecordAdmission>();
   let permanentlyEligibleCount = 0;
   let eligible: QueryRecord[] = [];
+  const terminologyQueryIds = queries
+    .filter(query => query.generation_metadata && query.generation_metadata.terminologyId != null)
+    .map(query => query.id);
+  const terminologyStatuses = terminologyQueryIds.length
+    ? await getQueryTerminologyCurrentStatuses(terminologyQueryIds)
+    : new Map();
+  const digestedById = new Map<number, QueryRecord>();
   for (const query of queries) {
     const admissionInfo = revalidateQueryRecordAdmission(query, { now: options.nowIso, history: historyFor(query) });
     admissions.set(query.id, admissionInfo);
@@ -1554,6 +1563,23 @@ async function buildSelectorPool(
     });
     if (!authority.eligible) continue;
     permanentlyEligibleCount += 1;
+    if (query.generation_metadata && query.generation_metadata.terminologyId != null) {
+      const status = terminologyStatuses.get(query.id);
+      const disposition = resolveSavedTerminologyDisposition(status, true);
+      if (disposition === 'DIGEST') {
+        // The query itself is currently valid; only its attribution is stale.
+        // Preserve the discovery surface, strip the dead terminology linkage,
+        // and record the audit trail on the runtime record.
+        digestedById.set(query.id, {
+          ...query,
+          generation_metadata: digestQueryTerminologyMetadata(
+            query.generation_metadata,
+            status,
+            options.nowIso,
+          ),
+        });
+      }
+    }
     const failure = failureByQuery.get(query.id);
     const selectable = isQuerySelectable({
       record: query,
@@ -1567,7 +1593,7 @@ async function buildSelectorPool(
       activeRunCount: activeRunQueryIdSet.has(query.id) ? 1 : 0,
     });
     if (!selectable.selectable) continue;
-    eligible.push(query);
+    eligible.push(digestedById.get(query.id) || query);
   }
 
   // Preserve the deterministic intent rotation as a diversity filter, never
@@ -1646,7 +1672,7 @@ async function buildSelectorPool(
     coverageCells,
     coveredCells,
   };
-  const queriesById = new Map(queries.map(query => [query.id, query]));
+  const queriesById = new Map(queries.map(query => [query.id, digestedById.get(query.id) || query]));
   return {
     candidates,
     queriesById,

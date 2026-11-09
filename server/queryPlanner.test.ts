@@ -251,6 +251,33 @@ test('planner produces novel local instrument-market variants when every current
   assert.ok(planned.some(item => item.metadata.queryTemplate === 'SINGLE_ATOM'));
 });
 
+test('ambiguous short modifiers are not planned as learned query atoms', () => {
+  const learned = ['ES', 'SL', 'LIVE'].map((term, index) => ({
+    id: index + 1,
+    country: 'United States',
+    term,
+    category: 'instrument' as const,
+    occurrences: 10,
+    first_extracted: '2026-01-01T00:00:00.000Z',
+    last_extracted: '2026-01-02T00:00:00.000Z',
+    trust_tier: 2 as const,
+    validation_count: 5,
+  }));
+  const planned = planDiverseQueries({
+    country: 'United States',
+    count: 40,
+    learnedVocabulary: learned,
+    existingQueries: [],
+  });
+  for (const value of ['ES', 'SL', 'LIVE']) {
+    assert.equal(
+      planned.some(item => String((item.metadata as any).learnedTerm || '').toUpperCase() === value),
+      false,
+      `${value} must not be planned as a learned modifier`,
+    );
+  }
+});
+
 test('bare short tickers require qualifying market context', () => {
   for (const ticker of ['NG', 'ES', 'NQ', 'AI', 'ICT', 'SMI', 'LuxX', 'SEK']) {
     assert.equal(isRetrievalOrientedQuery('United States', ticker), false, ticker);
