@@ -44,9 +44,10 @@ export class ProviderCooldownReadCache {
       return activeValue(cached.value, nowMs);
     }
     // If an invalidation lands while a read is in flight, the older result must
-    // not repopulate the cache. Retry once against the new generation; if the
-    // state keeps changing, fail open without caching anything.
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    // not repopulate the cache. Retry against the new version; a sustained 429
+    // burst can invalidate repeatedly, so take one final uncached read rather
+    // than interpreting the race as "no cooldown" (which would fail open).
+    for (let attempt = 0; attempt < 3; attempt += 1) {
       const version = this.keyVersion(key);
       const value = await this.loadShared(key, loader);
       if (this.keyVersion(key) !== version) continue;
@@ -54,7 +55,7 @@ export class ProviderCooldownReadCache {
       this.entries.set(key, { value: normalized, checkedAtMs: nowMs });
       return normalized;
     }
-    return undefined;
+    return activeValue(await loader(), nowMs);
   }
 
   private loadShared(key: string, loader: () => Promise<number | undefined>): Promise<number | undefined> {

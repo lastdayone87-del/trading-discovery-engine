@@ -130,3 +130,18 @@ test('an org-scoped rate-limit invalidates that org and the pool, not sibling or
   assert.equal(loads.get('b'), 1, 'a sibling account keeps its cached cooldown');
   assert.equal(loads.get('pool'), 2, 'the pool read includes the affected account');
 });
+
+test('a sustained invalidation burst makes a final uncached read instead of reporting no cooldown', async () => {
+  const cache = new ProviderCooldownReadCache(5_000);
+  let loads = 0;
+  const loader = async () => {
+    loads += 1;
+    // Invalidate during every cached attempt, but the final uncached read sees
+    // the real active cooldown.
+    if (loads <= 3) cache.invalidate('gemini:pool');
+    return loads <= 3 ? undefined : 25_000;
+  };
+  assert.equal(await cache.get('gemini:pool', 1_000, loader), 25_000);
+  assert.equal(loads, 4);
+  assert.equal(cache.size(), 0, 'the final uncached result is not stored');
+});
