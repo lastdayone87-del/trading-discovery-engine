@@ -939,6 +939,9 @@ test('Final integration: a missing language hint is filled from the surface with
   assert.equal(observation.term_language, 'fr');
   assert.equal(observation.native_evidence_status, null);
   assert.equal(observation.source_provenance_family, null);
+  // The canonical row carries the detected term language instead of staying
+  // permanently `und` when no provider language/locale was supplied.
+  assert.equal(runner.canonicalTerms.get(termId!)?.language, 'fr');
 });
 
 test('Final integration: human approval does not invent a language for an unidentifiable surface', async () => {
@@ -952,6 +955,21 @@ test('Final integration: human approval does not invent a language for an uniden
   assert.ok(observation);
   assert.equal(observation.native_language, 'und');
   assert.equal(observation.term_language, 'und');
+  assert.equal(observation.native_evidence_status, null);
+  assert.equal(observation.source_provenance_family, null);
+});
+
+test('Final integration: human approval keeps a detectable language but not native evidence', async () => {
+  const runner = createMockRunner();
+  const termId = await observeTerminology({
+    term: 'forex trading strategy approved', country: 'DE', termType: 'TERMINOLOGY',
+    observationType: 'HUMAN_APPROVED_CHANNEL', videoId: 'VID_DE_APPROVED_DETECTABLE_1',
+    sourceCreatorCountry: 'DE', targetMarketCountry: 'DE', humanApproved: true
+  }, runner);
+  const observation = runner.observations.find(row => row.canonical_term_id === termId);
+  assert.ok(observation);
+  assert.equal(observation.native_language, 'en');
+  assert.equal(observation.term_language, 'en');
   assert.equal(observation.native_evidence_status, null);
   assert.equal(observation.source_provenance_family, null);
 });

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { getAppSetting } from '../db';
+import { canonicalCountry } from '../countryInference';
 import type { RawChannelInput, VerificationDecision } from './types';
 import { buildCanonicalEvidenceCorpus } from './canonicalEvidencePlane';
 import { projectEvidenceDocuments } from './documentProjection';
@@ -61,7 +62,11 @@ export async function persistClassificationEvidenceBundle(
   }
 
   const assertions = assertionsEnabled ? comparison.assertions : [];
-  const documentResult = await persistEvidenceDocuments(documents);
+  const documentResult = await persistEvidenceDocuments(documents, {
+    // Kanji-only Japanese surfaces need the channel's market to distinguish
+    // them from Chinese; the hint is ignored whenever token evidence is clear.
+    countryHint: input.country ? canonicalCountry(input.country) : null,
+  });
   let assertionResult = { attempted: 0, inserted: 0 };
   if (assertionsEnabled) assertionResult = await persistEvidenceAssertions(assertions);
 

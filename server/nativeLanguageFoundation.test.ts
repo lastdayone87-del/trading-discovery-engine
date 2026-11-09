@@ -3,6 +3,10 @@ import test from 'node:test';
 import { detectLanguage, languageScript } from './languageDetection';
 import { detectCodeSwitching } from './countryNativeIntelligence';
 import { isSearchableTradingTerm } from './terminologySearchability';
+import { buildQueryCandidate, evaluateQueryComposition } from './queryQuality/composition';
+import { admitQueryRecord } from './queryQuality/admission';
+import { planCountryNativeProposalQuery } from './queryPlanner';
+import { resolveEvidenceDocumentLanguage } from './evidenceEngine/documentStore';
 
 test('language detection identifies supported market languages from real local surfaces', () => {
   const cases: Array<[string, string, string]> = [
@@ -28,6 +32,47 @@ test('language detection identifies supported market languages from real local s
   assert.equal(detectLanguage('股票交易').language, 'zh');
   assert.equal(languageScript('ja'), 'Jpan');
   assert.equal(languageScript('fr'), 'Latn');
+});
+
+test('script detection requires a dominant non-Latin share', () => {
+  const mixed = detectLanguage('technical analysis の chart');
+  assert.equal(mixed.language, 'en');
+  assert.equal(mixed.script, 'Latn');
+  // An unsupported script must not be persisted as Latin.
+  const thai = detectLanguage('ตลาดหุ้น');
+  assert.equal(thai.script, 'Zyyy');
+  assert.equal(thai.language, 'und');
+  // Genuinely non-Latin surfaces still win.
+  assert.equal(detectLanguage('日経225先物', { countryHint: 'Japan' }).language, 'ja');
+});
+
+test('country hints only resolve textual ties and never override clear evidence', () => {
+  assert.equal(detectLanguage('technical market chart', { countryHint: 'Germany' }).language, 'en');
+  assert.equal(detectLanguage('analyse', { countryHint: 'Japan' }).language, 'und');
+  assert.equal(detectLanguage('action', { countryHint: 'Japan' }).language, 'und');
+  // A shared English/Portuguese loanword stays und unless a tie-breaking
+  // hint names one of the tied languages.
+  assert.equal(detectLanguage('trade').language, 'und');
+  assert.equal(detectLanguage('trade', { countryHint: 'Brazil' }).language, 'pt');
+  // Luxembourg's authoritative primary language is French; hinting an
+  // unsupported `lb` lexicon could never resolve a tie.
+  assert.equal(detectLanguage('analyse', { countryHint: 'Luxembourg' }).language, 'fr');
+});
+
+test('evidence persistence carries the market hint into language detection', () => {
+  assert.deepEqual(
+    resolveEvidenceDocumentLanguage({ normalizedText: '日経225先物' }, 'Japan'),
+    { language: 'ja', script: 'Hani' },
+  );
+  assert.deepEqual(
+    resolveEvidenceDocumentLanguage({ normalizedText: '日経225先物' }),
+    { language: 'zh', script: 'Hani' },
+  );
+  assert.deepEqual(
+    resolveEvidenceDocumentLanguage({ normalizedText: '日経225先物', language: 'en', script: 'Latn' }, 'Japan'),
+    { language: 'en', script: 'Latn' },
+    'provider metadata always wins',
+  );
 });
 
 test('terminology observations no longer default an identifiable surface to und', () => {
@@ -68,4 +113,56 @@ test('unrelated foreign terms remain ineligible after the CJK relaxation', () =>
   const gate = isSearchableTradingTerm({ term: 'Börsenanalyse', termType: 'TERMINOLOGY', country: 'Japan', language: 'ja' });
   assert.equal(gate.eligible, false);
   assert.ok(gate.reasons.includes('no-trading-semantics'));
+});
+
+test('boundary-free matching admits only unspaced native semantics', () => {
+  // Latin/ticker fragments inside a CJK term keep word boundaries.
+  for (const term of ['cooking動画', '株tradingcard', 'DOM操作', '日本pocket', 'トレードオフ']) {
+    const gate = isSearchableTradingTerm({ term, termType: 'TERMINOLOGY', country: 'Japan', language: 'ja' });
+    assert.equal(gate.eligible, false, `${term} unexpectedly passed: ${gate.reasons.join(', ')}`);
+  }
+  // Intended Japanese compounds continue to pass.
+  for (const term of ['ドル円トレード', '板読みトレード', 'デイトレード手法', '東京セッション']) {
+    const gate = isSearchableTradingTerm({ term, termType: 'TERMINOLOGY', country: 'Japan', language: 'ja' });
+    assert.equal(gate.eligible, true, `${term}: ${gate.reasons.join(', ')}`);
+  }
+});
+
+test('a reviewed native phrase is admissible as one bounded whole query', () => {
+  const query = 'analisi tecnica borsa italiana';
+  const candidate = buildQueryCandidate({
+    query,
+    country: 'Italy',
+    language: 'it',
+    atoms: [{
+      term: query,
+      role: 'ANCHOR',
+      type: 'TERMINOLOGY',
+      country: 'Italy',
+      language: 'it',
+      provenance: 'COUNTRY_VOCABULARY',
+    }],
+    source: 'COUNTRY_VOCABULARY',
+  });
+  const decision = evaluateQueryComposition(candidate, { scopeAuthorized: true });
+  assert.equal(decision.eligible, true, decision.reasonCodes.join(', '));
+  assert.equal(decision.tier, 'LICENSED_UNSEEN');
+
+  // The COUNTRY_NATIVE planner path must produce the same runnable surface
+  // instead of rejecting it before admission.
+  const planned = planCountryNativeProposalQuery({
+    country: 'Italy',
+    nativeTerm: query,
+    targetIntent: 'education',
+    allocationLineage: { decisionId: 'native-phrase-decision', proposalId: 'native-phrase-proposal' },
+  });
+  assert.ok(planned);
+  assert.equal(planned.query, query);
+  const admitted = admitQueryRecord({
+    query: planned.query,
+    country: 'Italy',
+    primary_term: planned.primaryTerm,
+    generation_metadata: planned.metadata,
+  }, { scopeAuthorized: true });
+  assert.equal(admitted.eligible, true, admitted.reasonCodes.join(', '));
 });

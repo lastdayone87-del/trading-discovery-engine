@@ -2,24 +2,47 @@ import { getDb } from '../db';
 import { detectLanguage } from '../languageDetection';
 import type { EvidenceDocumentObservation } from './documentTypes';
 
+export interface EvidenceDocumentLanguage {
+  language: string | null;
+  script: string | null;
+}
+
+/**
+ * Resolve the language/script persisted for one evidence document. Provider
+ * metadata always wins; otherwise the deterministic detector fills the gap.
+ * The country hint is essential for Kanji-only Japanese surfaces, which are
+ * otherwise indistinguishable from Chinese.
+ */
+export function resolveEvidenceDocumentLanguage(
+  document: { language?: string | null; script?: string | null; normalizedText?: string | null },
+  countryHint?: string | null,
+): EvidenceDocumentLanguage {
+  const detected = (!document.language || document.language === 'und')
+    ? detectLanguage(document.normalizedText || '', { countryHint })
+    : { language: document.language, script: document.script || null };
+  return {
+    language: detected.language && detected.language !== 'und' ? detected.language : null,
+    script: document.script || detected.script || null,
+  };
+}
+
 /**
  * Persist evidence documents. Language/script are provider-supplied when
  * present; otherwise the shared deterministic detector fills them so the
  * evidence plane is not permanently `und`/NULL. Detection never changes the
  * document's identity or its classification.
  */
-export async function persistEvidenceDocuments(documents: EvidenceDocumentObservation[]) {
+export async function persistEvidenceDocuments(
+  documents: EvidenceDocumentObservation[],
+  options: { countryHint?: string | null } = {},
+) {
   if (!documents.length) return { attempted: 0, inserted: 0 };
   const db = await getDb(), client = await db.connect();
   let inserted = 0;
   try {
     await client.query('BEGIN');
     for (const d of documents) {
-      const detected = (!d.language || d.language === 'und')
-        ? detectLanguage(d.normalizedText || '')
-        : { language: d.language, script: d.script || null, confidence: 1 };
-      const language = detected.language && detected.language !== 'und' ? detected.language : null;
-      const script = d.script || (detected as { script?: string | null }).script || null;
+      const { language, script } = resolveEvidenceDocumentLanguage(d, options.countryHint);
       const result = await client.query(
         `INSERT INTO evidence_documents(document_key,subject_entity_id,channel_id,document_type,provider,provider_native_id,canonical_locator,source_family_id,source_entity_id,language,script,content_type,published_at,observed_at,normalized_text,text_checksum,raw_payload_checksum,provenance,schema_version)
          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)

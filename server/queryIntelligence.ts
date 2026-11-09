@@ -60,6 +60,7 @@ import { attributeTerminologyPerformance, buildNoveltyBaseline, classifyNativeCa
 import type { ExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { canonicalCountry } from './countryInference';
 import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
+import { isReviewedNativePhrase } from './terminologySearchability';
 import { executeProviderCall, resolveGeminiRouteId } from './providerResilience';
 import { geminiOrgIdForSlot } from './evidenceEngine/providers/GeminiSemanticProvider';
 import { appendProviderCallEvent } from './db';
@@ -1796,7 +1797,11 @@ export function classifyCountryNativeAuthorizationInput(args: CountryNativeAutho
     : typeof evidence.canonicalConcept === 'string' ? evidence.canonicalConcept.trim() : '';
   if (!nativeTerm) return { status: 'REJECTED', code: 'NATIVE_TERM_MISSING' };
   if (!evidence.evidenceChecksum) return { status: 'REJECTED', code: 'EVIDENCE_CHECKSUM_MISSING' };
-  if (nativeTerm.normalize('NFKC').trim().replace(/\s+/g, ' ').split(/\s+/).length > 3) {
+  const normalizedNativeTerm = nativeTerm.normalize('NFKC').trim().replace(/\s+/g, ' ');
+  const nativeTokenCount = normalizedNativeTerm.split(/\s+/).length;
+  // Reviewed native phrases are the only bounded exception to the three-token
+  // specificity cap; arbitrary long proposals still fail closed.
+  if (nativeTokenCount > 3 && !isReviewedNativePhrase(normalizedNativeTerm)) {
     return { status: 'REJECTED', code: 'QUERY_SPECIFICITY_REJECTED' };
   }
   return { status: 'VALID', nativeTerm, evidence, targetKey };

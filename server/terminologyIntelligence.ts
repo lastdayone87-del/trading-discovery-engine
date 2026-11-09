@@ -1115,6 +1115,11 @@ export async function observeTerminologyDetailed(args: {
 
   const contextLang = args.locale ? args.locale.split('-')[0] : args.language || 'und';
   const codeSwitching = detectCodeSwitching(canonical, contextLang, country);
+  // When the caller has no language/locale evidence, the detected term
+  // language is still a real identity for the canonical row. Persisting
+  // `und` there leaves lifecycle and proposal consumers without the language
+  // the observation itself already carries.
+  const canonicalLanguage = contextLang !== 'und' ? contextLang : codeSwitching.termLanguage;
   const weight = args.humanApproved ? 2.5 : args.observationType === 'ENRICHMENT' ? 1.25 : 1;
 
   // 1. Insert or fetch canonical trading term WITHOUT advancing last_observed_at on conflict.
@@ -1143,7 +1148,7 @@ export async function observeTerminologyDetailed(args: {
      VALUES($1, $2, $3, $4, $5, $6, now(), now())
      ON CONFLICT(country, normalized_term) DO UPDATE SET language=EXCLUDED.language, script=EXCLUDED.script WHERE canonical_trading_terms.language IN ('und','')
      RETURNING id`,
-    [canonical, normalized, country, contextLang, inferScript(canonical), args.termType]
+    [canonical, normalized, country, canonicalLanguage, inferScript(canonical), args.termType]
   );
 
   let termId: number;

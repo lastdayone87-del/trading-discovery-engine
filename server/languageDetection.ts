@@ -42,12 +42,14 @@ const COUNTRY_LANGUAGE: Record<string, SupportedLanguage> = {
   'New Zealand': 'en', Canada: 'en', Singapore: 'en',
   France: 'fr', Germany: 'de', Netherlands: 'nl', Denmark: 'da', Sweden: 'sv',
   Norway: 'no', Spain: 'es', Italy: 'it', Portugal: 'pt', Brazil: 'pt',
-  Switzerland: 'de', Belgium: 'nl', Luxembourg: 'lb',
+  // The authoritative Luxembourg pack's primary language is French, and no
+  // Luxembourgish lexicon exists; hinting `lb` could never break a tie.
+  Switzerland: 'de', Belgium: 'nl', Luxembourg: 'fr',
   Japan: 'ja', China: 'zh', 'United Arab Emirates': 'ar', 'Saudi Arabia': 'ar',
 };
 
 const TOKENS: Partial<Record<SupportedLanguage, Set<string>>> = {
-  en: new Set(['the', 'and', 'for', 'with', 'this', 'that', 'trading', 'trader', 'market', 'analysis', 'technical', 'price', 'action', 'breakout', 'futures', 'forex', 'stocks', 'options', 'crypto', 'strategy', 'volume', 'support', 'resistance', 'chart', 'indicator', 'risk', 'management', 'liquidity', 'structure', 'order', 'flow']),
+  en: new Set(['the', 'and', 'for', 'with', 'this', 'that', 'trading', 'trade', 'trader', 'market', 'analysis', 'technical', 'price', 'action', 'breakout', 'futures', 'forex', 'stocks', 'options', 'crypto', 'strategy', 'volume', 'support', 'resistance', 'chart', 'indicator', 'risk', 'management', 'liquidity', 'structure', 'order', 'flow']),
   fr: new Set(['le', 'la', 'les', 'des', 'du', 'une', 'et', 'pour', 'avec', 'sur', 'dans', 'analyse', 'technique', 'bourse', 'marche', 'marché', 'action', 'actions', 'ordre', 'ordres', 'carnet', 'seance', 'séance', 'haussier', 'baissier', 'trading', 'investir', 'portefeuille', 'graphique', 'unite', 'unité']),
   de: new Set(['der', 'die', 'das', 'und', 'mit', 'fur', 'für', 'auf', 'von', 'den', 'dem', 'ist', 'analyse', 'borse', 'börse', 'markt', 'technische', 'chart', 'charttechnik', 'chartanalyse', 'handel', 'aktie', 'aktien', 'strategie', 'unterstutzung', 'unterstützung', 'widerstand', 'eroffnung', 'eröffnung', 'schlusskurs', 'tagesrading', 'marktstruktur', 'handelsstrategie']),
   nl: new Set(['de', 'het', 'een', 'van', 'en', 'met', 'voor', 'op', 'is', 'beurs', 'analyse', 'technische', 'handel', 'aandeel', 'aandelen', 'opties', 'weerstand', 'steun', 'daghandel', 'marktanalyse', 'opening', 'koersdoel', 'beleggen']),
@@ -80,10 +82,21 @@ function tokens(text: string): string[] {
 }
 
 function detectScript(text: string): { script: LanguageScript; language: SupportedLanguage | null } {
-  for (const [script, pattern, language] of SCRIPT_PATTERNS) {
-    if (pattern.test(text)) return { script, language };
+  const letterCount = text.match(/\p{L}/gu)?.length ?? 0;
+  const latinLetterCount = text.match(/\p{Script=Latin}/gu)?.length ?? 0;
+  // A single quoted foreign character or channel-name fragment inside an
+  // otherwise Latin document must not decide the persisted language/script.
+  // Script detection is only decisive when non-Latin letters dominate.
+  const nonLatinShare = letterCount > 0 ? (letterCount - latinLetterCount) / letterCount : 0;
+  if (nonLatinShare > 0.5) {
+    for (const [script, pattern, language] of SCRIPT_PATTERNS) {
+      if (pattern.test(text)) return { script, language };
+    }
+    // A dominated non-Latin script we do not model (for example Thai) must
+    // not be persisted as Latin just because the fallback used to be Latin.
+    return { script: 'Zyyy', language: null };
   }
-  return { script: 'Latn', language: null };
+  return { script: latinLetterCount > 0 ? 'Latn' : 'Zyyy', language: null };
 }
 
 function countryHintLanguage(countryHint: string | null | undefined): SupportedLanguage | null {
@@ -122,22 +135,27 @@ export function detectLanguage(text: string, options: DetectLanguageOptions = {}
     if (DIACRITIC_HINTS[language]?.test(value)) score += 2;
     if (score > 0) scores.set(language, score);
   }
-  // A country hint breaks ties between languages that already have textual
-  // evidence. It must never assign a language on its own: country is not
-  // language, and doing so would fabricate identity for unrelated text.
-  if (hint && scores.has(hint)) scores.set(hint, (scores.get(hint) || 0) + 3);
-
   const ranked = [...scores.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
   if (!ranked.length) return { language: 'und', confidence: 0, script: script.script, method: 'UNDETERMINED' };
-  const [language, top] = ranked[0];
-  const second = ranked[1]?.[1] || 0;
-  // A one-token surface whose score is also achieved by another language is
-  // ambiguous. Country hints already break the common Scandinavian ties.
-  if (top <= 1 && second === top && !hint) {
+  const top = ranked[0][1];
+  const tied = ranked.filter(([, score]) => score === top).map(([language]) => language);
+  let language: SupportedLanguage;
+  if (tied.length === 1) {
+    // Textual evidence has a clear winner; a country hint never overrides it.
+    language = tied[0];
+  } else if (hint && tied.includes(hint)) {
+    // A country hint may only break a tie that the text itself produced.
+    language = hint;
+  } else {
+    // Equal leading evidence that the hint cannot resolve stays und: a
+    // country is not a language, and guessing would fabricate identity.
     return { language: 'und', confidence: 0.2, script: script.script, method: 'UNDETERMINED' };
   }
   const total = ranked.reduce((sum, [, score]) => sum + score, 0);
-  const confidence = Math.max(0.3, Math.min(0.99, total > 0 ? top / total : 0));
+  const rawConfidence = total > 0 ? top / total : 0;
+  // A hint-resolved tie is deliberate but still weaker than a unique textual
+  // winner, so keep it at a moderate floor instead of near-certainty.
+  const confidence = Math.min(0.99, Math.max(tied.length > 1 ? 0.5 : 0.3, rawConfidence));
   return { language, confidence: Number(confidence.toFixed(3)), script: script.script, method: 'LEXICON' };
 }
 

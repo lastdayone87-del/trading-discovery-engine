@@ -21,7 +21,7 @@ import { MULTILINGUAL_CLASSIFICATION_PACKS } from './evidenceEngine/multilingual
  * backed override supplies the missing context. It never changes a channel's
  * trading status.
  */
-export const TERMINOLOGY_SEARCHABILITY_VERSION = 'terminology-searchability-v1';
+export const TERMINOLOGY_SEARCHABILITY_VERSION = 'terminology-searchability-v2';
 
 /**
  * Pre-admission query rows predate atomized composition, so the whole stored
@@ -237,9 +237,22 @@ const REVIEWED_NATIVE_PHRASES: Record<string, string[]> = {
   fr: ['structure du marché', 'analyse boursière', 'carnet d ordres'],
 };
 
-function isReviewedNativePhrase(term: string): boolean {
+export function isReviewedNativePhrase(term: string): boolean {
   const key = phraseKey(term);
   return Object.values(REVIEWED_NATIVE_PHRASES).some(values => values.some(value => phraseKey(value) === key));
+}
+
+/**
+ * Compounds whose local reading is not trading intent. `トレード` is a
+ * reviewed Japanese semantic, but `トレードオフ` (trade-off) and
+ * `トレードマーク` (trademark) are ordinary words, so boundary-free matching
+ * must not admit them as search surfaces.
+ */
+const NON_TRADING_COMPOUNDS = new Set(['トレードオフ', 'トレードマーク']);
+
+/** True when any letter in the value belongs to an unspaced script. */
+function usesUnspacedScript(value: string): boolean {
+  return /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(value);
 }
 
 const COUNTRY_NATIVE_SEMANTICS = new Map<string, Set<string>>(
@@ -274,6 +287,7 @@ export function hasGovernedTradingSemantics(
 ): boolean {
   const key = phraseKey(term);
   if (!key) return false;
+  if (NON_TRADING_COMPOUNDS.has(key)) return false;
   const out = new Set(GLOBAL_TRADING_SEMANTICS);
   const language = context.language ? String(context.language).toLocaleLowerCase('und').split('-')[0] : '';
   const country = context.country && context.country !== 'GLOBAL' ? context.country : '';
@@ -309,11 +323,14 @@ export function hasGovernedTradingSemantics(
   // surface (日経225先物) can never match a space-padded semantic (日経225).
   // Match reviewed multi-character semantics as substrings for unspaced
   // scripts; single-character semantics are excluded to avoid over-matching.
-  const unspaced = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(key);
+  const unspaced = usesUnspacedScript(key);
   for (const semantic of out) {
     if (semantic === key) return true;
     if (padded.includes(` ${semantic} `)) return true;
-    if (unspaced && Array.from(semantic).length >= 2 && key.includes(semantic)) return true;
+    // Boundary-free matching applies only to semantics written in an
+    // unspaced script. Latin/ticker semantics keep word boundaries even when
+    // the enclosing term contains CJK: `cooking動画` must not match `ng`.
+    if (unspaced && usesUnspacedScript(semantic) && Array.from(semantic).length >= 2 && key.includes(semantic)) return true;
   }
   return false;
 }

@@ -5,7 +5,7 @@ import { assessLanguageCapability, type GlobalLanguageContext } from './globalLa
 import {evaluateRetrievalSpecificity,type RetrievalSpecificityDecision} from './retrievalSpecificity';
 import { countrySearchLanguageCandidates, normalizeLanguageCode } from './countrySearchHints';
 import { capFreeSignalCandidates, type FreeSignalQueryCandidate, type FreeSignalType } from './freeQuerySignals';
-import { isSearchableTradingTerm } from './terminologySearchability';
+import { isReviewedNativePhrase, isSearchableTradingTerm, TERMINOLOGY_SEARCHABILITY_VERSION } from './terminologySearchability';
 
 export type QueryKnowledgeTier = 1 | 2 | 3;
 export type QueryGenerationMode = 'EXPLORATION' | 'EXPLOITATION' | 'COLD_START';
@@ -198,19 +198,51 @@ export function planCountryNativeProposalQuery(args: {
   dominantLocale?: string | null;
 }): PlannedQuery | null {
   const nativeTerm = args.nativeTerm.normalize('NFKC').trim().replace(/\s+/g, ' ');
-  if (!nativeTerm || queryTokenCount(nativeTerm) > 3) return null;
+  const reviewedPhrase = isReviewedNativePhrase(nativeTerm);
+  // Unknown long surfaces stay rejected. A reviewed native phrase may exceed
+  // the normal three-token atom cap because it is a bounded whole query.
+  if (!nativeTerm || (!reviewedPhrase && queryTokenCount(nativeTerm) > 3)) return null;
   const learned = atom(nativeTerm, 'LEARNED', (args.targetIntent || 'strategy') as QueryIntent, 2, 'LEARNED');
-  const anchor = countryAtoms(args.country, args.countryVocabulary)
-    .filter(item => ['STANDALONE', 'ANCHOR_ONLY'].includes(item.retrievalPolicy.eligibility))
-    .find(item => isRetrievalOrientedQuery(args.country, `${item.term} ${nativeTerm}`));
-  if (!anchor) return null;
-  const query = `${anchor.term} ${nativeTerm}`;
   const languageEvidence = [args.language, args.locale, args.dominantLocale]
     .filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
   const supportedLanguages = countrySearchLanguageCandidates(args.country, args.countryVocabulary?.languages || []);
   const preferredLanguage = languageEvidence
     .map(normalizeLanguageCode)
     .find(language => language && supportedLanguages.includes(language));
+  if (reviewedPhrase && queryTokenCount(nativeTerm) > 3) {
+    // Appending an anchor would push the phrase past the length/token budget
+    // and duplicate its retrieval identity. A reviewed phrase is already a
+    // bounded, script- and semantics-checked surface, so it runs whole.
+    return {
+      query: nativeTerm,
+      intent: (args.targetIntent || 'strategy') as QueryIntent,
+      primaryTerm: nativeTerm,
+      knowledgeTiers: [2],
+      generationMode: 'EXPLORATION',
+      generationReason: 'Reviewed native phrase executed as its own bounded retrieval surface.',
+      discoveryObjective: 'Test the reviewed country-native phrase while discovering relevant trading creators.',
+      metadata: {
+        country: args.country,
+        queryTemplate: 'REVIEWED_NATIVE_PHRASE',
+        retrievalOptimized: true,
+        tokenCount: queryTokenCount(nativeTerm),
+        scriptValidated: true,
+        atoms: [{ ...learned, role: 'ANCHOR', position: 0 }],
+        localTier1Term: nativeTerm,
+        learnedTerm: nativeTerm,
+        countryNativeAllocation: args.allocationLineage,
+        language: args.language || undefined,
+        locale: args.locale || undefined,
+        dominantLocale: args.dominantLocale || undefined,
+        preferredLanguage
+      }
+    };
+  }
+  const anchor = countryAtoms(args.country, args.countryVocabulary)
+    .filter(item => ['STANDALONE', 'ANCHOR_ONLY'].includes(item.retrievalPolicy.eligibility))
+    .find(item => isRetrievalOrientedQuery(args.country, `${item.term} ${nativeTerm}`));
+  if (!anchor) return null;
+  const query = `${anchor.term} ${nativeTerm}`;
   return {
     query,
     intent: (args.targetIntent || anchor.intent) as QueryIntent,
@@ -674,7 +706,7 @@ export function planDiverseQueries(args: {
         terminologyDecayedYield: learnedTerminology?.score ?? freeSignalTerminology?.score,
         ...(terminatedByGate.length ? {
           terminologyGate: {
-            policy: 'terminology-searchability-v1',
+            policy: TERMINOLOGY_SEARCHABILITY_VERSION,
             suppressedCount: terminatedByGate.length,
             // Cap the per-query audit copy: the same planning-run list is
             // repeated in every planned query's metadata, so an unbounded
