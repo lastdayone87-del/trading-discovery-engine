@@ -1,3 +1,4 @@
+import { isNuisanceVocabularySurface } from './terminologySearchability';
 import fs from 'fs';
 import path from 'path';
 import { randomUUID } from 'node:crypto';
@@ -2071,6 +2072,42 @@ export async function getQueryIntelligenceSummary(options:{now?:number;force?:bo
   (SELECT COUNT(*)::int FROM query_execution_logs) AS execution_log_count`); const r=res.rows[0]||{}; const value={queryCount:Number(r.query_count||0),provenCount:Number(r.proven_count||0),experimentalCount:Number(r.experimental_count||0),rejectedCount:Number(r.rejected_count||0),vocabularyCount:Number(r.vocabulary_count||0),terminologyCount:Number(r.terminology_count||0),searchEligibleTerminologyCount:Number(r.search_eligible_count||0),executionLogCount:Number(r.execution_log_count||0)}; queryIntelligenceSummaryCache={at:now,value}; return value;}
 export async function getQueriesByCountry(country:string):Promise<QueryRecord[]>{const db=await getDb(); const res=await db.query(`SELECT * FROM query_library WHERE LOWER(country)=LOWER($1) AND status='ACTIVE' ORDER BY performance_score DESC,times_executed ASC`,[country]); return res.rows.map(rowToQuery);}
 
+export interface QueryTerminologyCurrentStatus {
+  queryId: number;
+  termId: number;
+  term: string;
+  lifecycleStatus: string;
+  searchEligible: boolean;
+}
+
+/**
+ * Current canonical-term status for saved queries that carry a terminologyId.
+ * Selection uses this to digest stale attribution without discarding a query
+ * whose full composition is still valid.
+ */
+export async function getQueryTerminologyCurrentStatuses(queryIds:number[]):Promise<Map<number,QueryTerminologyCurrentStatus>>{
+  const ids = [...new Set(queryIds.map(Number).filter(id=>Number.isSafeInteger(id)&&id>0))];
+  if (!ids.length) return new Map();
+  const db=await getDb();
+  const res=await db.query(`WITH linked AS (
+      SELECT ql.id AS query_id,
+             CASE WHEN ql.generation_metadata->>'terminologyId' ~ '^[0-9]{1,18}$'
+                  THEN (ql.generation_metadata->>'terminologyId')::bigint END AS term_id
+      FROM query_library ql WHERE ql.id=ANY($1::int[])
+    )
+    SELECT l.query_id,t.id AS term_id,t.canonical_term AS term,t.lifecycle_status AS lifecycle_status,t.search_eligible AS search_eligible
+    FROM linked l JOIN canonical_trading_terms t ON t.id=l.term_id`,[ids]);
+  return new Map(res.rows.map((row:any)=>[Number(row.query_id),{queryId:Number(row.query_id),termId:Number(row.term_id),term:String(row.term||''),lifecycleStatus:String(row.lifecycle_status||''),searchEligible:row.search_eligible===true}]));
+}
+
+/** Persist a digested runtime record so completion accounting sees the same
+ * decision and cannot re-attribute results to a stale terminology id. */
+export async function persistQueryTerminologyDigest(queryId:number,expectedTermId:string|number,metadata:Record<string,unknown>):Promise<boolean>{
+  const db=await getDb();
+  const res=await db.query(`UPDATE query_library SET generation_metadata=$3::jsonb WHERE id=$1 AND generation_metadata->>'terminologyId'=$2::text RETURNING id`,[queryId,String(expectedTermId),JSON.stringify(metadata)]);
+  return Boolean(res.rowCount);
+}
+
 /** Q5 per-run reward rows. Global newness and quality are read from
  * sighting-level truth, never from query_library cumulative counters. */
 export interface QueryQualityRunRow{queryId:number;confirmed:number;quality:number;quotaUnits:number;ageDays:number;}
@@ -2337,6 +2374,7 @@ export async function setQueryCollection(queryId:number,collection:'PROVEN'|'EXP
 export async function addQueryExecutionLog(log:{query_id?:number;query_run_id?:string;query:string;country:string;executed_at:string;channels_discovered:number;unique_new_channels:number;quality_creators_discovered:number;communities_discovered:number;cycle_quality_score:number;logs?:string[];}):Promise<void>{const db=await getDb(); await db.query(`INSERT INTO query_execution_logs(query_run_id,query_id,query,country,executed_at,channels_discovered,unique_new_channels,quality_creators_discovered,communities_discovered,cycle_quality_score,logs) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(query_run_id) WHERE query_run_id IS NOT NULL DO NOTHING`,[log.query_run_id||null,log.query_id||null,log.query,log.country,log.executed_at,log.channels_discovered,log.unique_new_channels,log.quality_creators_discovered,log.communities_discovered,log.cycle_quality_score,JSON.stringify(log.logs||[])]);}
 export async function getRecentQueryExecutionLogs(limit=20):Promise<QueryExecutionLog[]>{const db=await getDb(); const res=await db.query('SELECT * FROM query_execution_logs ORDER BY executed_at DESC LIMIT $1',[limit]); return res.rows.map(r=>({id:r.id,query_id:r.query_id||undefined,query:r.query,country:r.country,executed_at:iso(r.executed_at)||'',channels_discovered:r.channels_discovered||0,unique_new_channels:r.unique_new_channels||0,quality_creators_discovered:r.quality_creators_discovered||0,communities_discovered:r.communities_discovered||0,cycle_quality_score:r.cycle_quality_score||0,logs:parseJson(r.logs,[])}));}
 export async function saveExtractedTerm(country:string,term:string,category:'terminology'|'instrument'|'phrase'|'format',sourceChannelId?:string,clientOverride?:{query:(text:string,params?:unknown[])=>Promise<{rows:Array<Record<string,unknown>>}>}):Promise<void>{const outerRunner=clientOverride||await getDb();const poolLike='connect' in (outerRunner as object)&&typeof (outerRunner as {connect?:unknown}).connect==='function'&&!('release' in (outerRunner as object));const client=poolLike?await (outerRunner as unknown as import('pg').Pool).connect():null;const runner=((client??outerRunner)as unknown as {query:(text:string,params?:unknown[])=>Promise<{rows:Array<Record<string,unknown>>}>});try{if(client)await runner.query('BEGIN');const db={query:(text:string,params?:unknown[])=>runner.query(text,params)};const clean=term.trim(); if(!clean){if(client)await runner.query('COMMIT');return;}
+if(isNuisanceVocabularySurface(clean)){if(client)await runner.query('COMMIT');return;}
 const countryCanon=canonicalCountry(country);await runner.query(`SELECT pg_advisory_xact_lock(hashtext($1))`,[`extracted-vocab:${countryCanon}:${clean.normalize('NFKC').trim().replace(/\s+/gu,' ').toLocaleLowerCase('en')}`]);const fold=(value:string)=>value.normalize('NFKC').trim().replace(/\s+/gu,' ').toLocaleLowerCase('en');/* keep in sync with normalizeTerm() in terminologyIntelligence.ts (inlined here to avoid a dbCore import cycle) */const normalized=fold(clean);const candidates=await db.query(`SELECT id, term FROM extracted_trading_vocabulary WHERE country=$1 ORDER BY id ASC`,[countryCanon]);let reuseId:number|null=null; for(const row of candidates.rows||[]){if(fold(String((row as Record<string,unknown>).term))===normalized){reuseId=Number((row as Record<string,unknown>).id);break;}}let savedId:number;if(reuseId!==null){const updated=await db.query(`UPDATE extracted_trading_vocabulary SET occurrences=occurrences+1,last_extracted=now(),source_channel_id=COALESCE($2,source_channel_id) WHERE id=$1 RETURNING id`,[reuseId,sourceChannelId||null]); savedId=Number(updated.rows[0].id);}else{const saved=await db.query(`INSERT INTO extracted_trading_vocabulary(country,term,category,source_channel_id,occurrences,first_extracted,last_extracted,trust_tier,validation_count) VALUES($1,$2,$3,$4,1,now(),now(),3,0) ON CONFLICT(country,term) DO UPDATE SET occurrences=extracted_trading_vocabulary.occurrences+1,last_extracted=now(),source_channel_id=COALESCE($4,extracted_trading_vocabulary.source_channel_id) RETURNING id`,[countryCanon,clean,category,sourceChannelId||null]); savedId=Number(saved.rows[0].id);} if(sourceChannelId){await db.query(`INSERT INTO extracted_vocabulary_sources(term_id,channel_id) SELECT $1,$2 WHERE EXISTS(SELECT 1 FROM channels WHERE channel_id=$2 AND trading_status='TRADING_CONFIRMED') ON CONFLICT DO NOTHING`,[savedId,sourceChannelId]); await db.query(`UPDATE extracted_trading_vocabulary v SET validation_count=s.confirmed_sources,trust_tier=CASE WHEN s.confirmed_sources>=2 THEN 2 ELSE 3 END FROM (SELECT COUNT(DISTINCT evs.channel_id)::int confirmed_sources FROM extracted_vocabulary_sources evs JOIN channels c ON c.channel_id=evs.channel_id AND c.trading_status='TRADING_CONFIRMED' WHERE evs.term_id=$1) s WHERE v.id=$1`,[savedId]);}await db.query(`UPDATE extracted_trading_vocabulary v SET occurrences=s.n FROM (SELECT COUNT(*)::int n FROM terminology_observations o JOIN canonical_trading_terms t ON t.id=o.canonical_term_id WHERE t.country=$2 AND t.normalized_term=$3) s WHERE v.id=$1 AND EXISTS(SELECT 1 FROM canonical_trading_terms t WHERE t.country=$2 AND t.normalized_term=$3)`,[savedId,countryCanon,normalized]);if(client)await runner.query('COMMIT');}catch(error){if(client)await runner.query('ROLLBACK').catch(()=>undefined);throw error;}finally{if(client)client.release();}}
 export async function getExtractedVocabulary(country?:string,clientOverride?:{query:(text:string,params?:unknown[])=>Promise<{rows:Array<Record<string,unknown>>}>}):Promise<ExtractedTermRecord[]>{const db=clientOverride||await getDb(); const res=country?await db.query('SELECT * FROM extracted_trading_vocabulary WHERE country=$1 ORDER BY trust_tier ASC,occurrences DESC,last_extracted DESC',[canonicalCountry(country)]):await db.query('SELECT * FROM extracted_trading_vocabulary ORDER BY trust_tier ASC,occurrences DESC,last_extracted DESC'); return res.rows.map(r=>({id:r.id,country:r.country,term:r.term,category:r.category,source_channel_id:r.source_channel_id||undefined,occurrences:r.occurrences||1,first_extracted:iso(r.first_extracted)||'',last_extracted:iso(r.last_extracted)||'',trust_tier:r.trust_tier||3,validation_count:r.validation_count||0}));}
 export async function getAppSetting(key:string,defaultValue=''):Promise<string>{const db=await getDb(); const res=await db.query('SELECT setting_value FROM app_settings WHERE setting_key=$1',[key]); return res.rows[0]?.setting_value ?? defaultValue;}
