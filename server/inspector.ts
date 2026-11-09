@@ -1556,6 +1556,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
         surface,
         sourceSurface:candidateSourceSurface,
         fetchImpl:channelData.externalFetchImpl||fetch,
+        resolveHost:channelData.destinationResolver,
       });
       discordSurfaceCandidates.push(...acquired.candidates);
       if(acquired.outcome==='FOUND')foundSurfaces++;
@@ -1578,8 +1579,10 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
     const mergedSurfaceCandidates=mergeDiscordCandidates(discordSurfaceCandidates,ownershipInput);
     retainCandidates(mergedSurfaceCandidates);
     if(mergedSurfaceCandidates.length)stepDiscordLogs.push(`${mergedSurfaceCandidates.length} distinct candidate(s) retained from Discord public surfaces.`);
-    const stepStatus:InspectionStep['status']=foundSurfaces&&failedSurfaces?'PARTIAL':foundSurfaces?'FOUND':failedSurfaces?'ERROR':inspectedSurfaces?'NOT_FOUND':'SKIPPED';
-    addStep('DISCORD_SURFACES','Step 3b — Discord Server & Widget Surfaces',stepStatus,stepDiscordLogs,mergedSurfaceCandidates[0]?.nativeInviteCode||null,'CHANNEL_EXTERNAL_LINKS',mergedSurfaceCandidates.map(candidate=>candidate.nativeInviteCode!).filter(Boolean));
+    const stepStatus:InspectionStep['status']=(foundSurfaces||inspectedSurfaces)&&failedSurfaces?'PARTIAL':foundSurfaces?'FOUND':failedSurfaces?'ERROR':inspectedSurfaces?'NOT_FOUND':'SKIPPED';
+    const surfaceSources=new Set(mergedSurfaceCandidates.map(candidate=>candidate.sourceSurface));
+    const stepInviteLocation=surfaceSources.size===1?mergedSurfaceCandidates[0]?.sourceSurface:undefined;
+    addStep('DISCORD_SURFACES','Step 3b — Discord Server & Widget Surfaces',stepStatus,stepDiscordLogs,mergedSurfaceCandidates[0]?.nativeInviteCode||null,stepInviteLocation,mergedSurfaceCandidates.map(candidate=>candidate.nativeInviteCode!).filter(Boolean));
   }else addStep('DISCORD_SURFACES','Step 3b — Discord Server & Widget Surfaces','SKIPPED',['No Discord server-page or widget URLs were discovered.']);
   // P-B acquisition ladder (flag-gated, default off): sitemap-inventoried URLs
   // enter as scored seed nominations through the normal ranking and budgets.

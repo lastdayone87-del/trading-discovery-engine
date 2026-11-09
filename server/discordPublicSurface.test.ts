@@ -50,6 +50,12 @@ test('parses Discord server-directory URL variants and canonicalizes the host', 
       canonicalUrl: 'https://discord.com/servers/valorant-679875946597056683',
     },
   );
+  // The guild id is anchored to the final hyphenated suffix: an earlier
+  // numeric slug segment can never be selected as the guild.
+  assert.equal(
+    discordPublicSurfaceFor('https://discord.com/servers/2024-123456789012345678-999999999999999999')?.guildId,
+    '999999999999999999',
+  );
 });
 
 test('parses widget URL variants and drops presentation-only query keys', () => {
@@ -71,6 +77,9 @@ test('rejects non-surface Discord paths and malformed guild ids', () => {
     'https://discord.com/servers',
     'https://discord.com/servers/gaming',
     'https://discord.com/servers/2024',
+    'https://discord.com/servers/123456789012345678/extra',
+    'https://discord.com/servers/12345678901234567890123456',
+    'https://discord.com/servers/official-12345678901234567890x',
     'https://discord.com/widget',
     'https://discord.com/widget?id=abc',
     'https://discord.com/widget?id=123',
@@ -106,7 +115,7 @@ test('server page HTML exposes a native invite candidate', async () => {
     sourceSurface: 'CHANNEL_EXTERNAL_LINKS',
     fetchImpl: (async (input: any, init?: RequestInit) => {
       calls.push(String(input));
-      assert.equal(init?.redirect, 'follow');
+      assert.equal(init?.redirect, 'manual');
       return html('<html><body><a href="https://discord.gg/fortnite">Join</a></body></html>');
     }) as typeof fetch,
   });
@@ -157,7 +166,7 @@ test('an absent invite is a clean inspected negative, not a retry', async () => 
     surface: serverSurface(),
     sourceSurface: 'CHANNEL_EXTERNAL_LINKS',
     fetchImpl: (async (input: any) => {
-      if (String(input).includes('/widget.json')) return json({}, 403);
+      if (String(input).includes('/widget.json')) return json({ message: 'Widget Disabled', code: 50004 }, 403);
       return html('<html><body><div id="app"></div></body></html>');
     }) as typeof fetch,
   });
@@ -167,7 +176,7 @@ test('an absent invite is a clean inspected negative, not a retry', async () => 
   assert.equal(result.requestsStarted, 2);
 });
 
-test('a disabled widget is a clean negative', async () => {
+test('a confirmed disabled widget is a clean negative', async () => {
   const result = await acquireDiscordPublicSurface({
     surface: widgetSurface(),
     sourceSurface: 'CHANNEL_EXTERNAL_LINKS',
@@ -175,6 +184,25 @@ test('a disabled widget is a clean negative', async () => {
   });
   assert.equal(result.outcome, 'INSPECTED_NO_MATCH');
   assert.equal(result.retryable, false);
+});
+
+test('a blocked widget response stays retryable instead of becoming a clean negative', async () => {
+  const blocked = await acquireDiscordPublicSurface({
+    surface: widgetSurface(),
+    sourceSurface: 'CHANNEL_EXTERNAL_LINKS',
+    fetchImpl: (async () => html('<html><body>Access denied</body></html>', 403)) as typeof fetch,
+  });
+  assert.equal(blocked.outcome, 'ACQUISITION_FAILED');
+  assert.equal(blocked.retryable, true);
+  assert.equal(blocked.failureClass, 'HTTP_ERROR');
+
+  const forbiddenJson = await acquireDiscordPublicSurface({
+    surface: widgetSurface(),
+    sourceSurface: 'CHANNEL_EXTERNAL_LINKS',
+    fetchImpl: (async () => json({ message: 'Forbidden' }, 403)) as typeof fetch,
+  });
+  assert.equal(forbiddenJson.outcome, 'ACQUISITION_FAILED');
+  assert.equal(forbiddenJson.retryable, true);
 });
 
 test('transient widget failures remain retryable uncertainty', async () => {
@@ -186,6 +214,37 @@ test('transient widget failures remain retryable uncertainty', async () => {
   assert.equal(result.outcome, 'ACQUISITION_FAILED');
   assert.equal(result.retryable, true);
   assert.equal(result.failureClass, 'TRANSIENT_HTTP');
+});
+
+test('a server-page 404 still falls back to an enabled widget', async () => {
+  const calls: string[] = [];
+  const result = await acquireDiscordPublicSurface({
+    surface: serverSurface(),
+    sourceSurface: 'CHANNEL_EXTERNAL_LINKS',
+    fetchImpl: (async (input: any) => {
+      const url = String(input);
+      calls.push(url);
+      if (url === serverSurface().canonicalUrl) return html('gone', 404);
+      return json({ instant_invite: 'https://discord.gg/widget-survives' });
+    }) as typeof fetch,
+  });
+  assert.equal(result.outcome, 'FOUND');
+  assert.equal(result.candidates[0]?.nativeInviteCode, 'widget-survives');
+  assert.equal(calls.length, 2);
+});
+
+test('request-timeout and too-early statuses stay retryable', async () => {
+  for (const status of [408, 425]) {
+    const result = await acquireDiscordPublicSurface({
+      surface: widgetSurface(),
+      sourceSurface: 'CHANNEL_EXTERNAL_LINKS',
+      fetchImpl: (async () => html('transient', status)) as typeof fetch,
+    });
+    assert.equal(result.outcome, 'ACQUISITION_FAILED');
+    assert.equal(result.retryable, true);
+    assert.equal(result.failureClass, 'TRANSIENT_HTTP');
+    assert.equal(result.requestsStarted, 1);
+  }
 });
 
 test('a confirmed server-page 404 is non-retryable; other failures are retryable', async () => {
@@ -227,6 +286,93 @@ test('network and malformed-response failures are retryable uncertainty', async 
   assert.equal(malformed.outcome, 'ACQUISITION_FAILED');
   assert.equal(malformed.retryable, true);
   assert.equal(malformed.failureClass, 'MALFORMED_RESPONSE');
+});
+
+test('safe Discord redirects are followed after destination validation', async () => {
+  const calls: string[] = [];
+  const result = await acquireDiscordPublicSurface({
+    surface: serverSurface(),
+    sourceSurface: 'CHANNEL_EXTERNAL_LINKS',
+    resolveHost: async () => ['93.184.216.34'],
+    fetchImpl: (async (input: any) => {
+      const url = String(input);
+      calls.push(url);
+      if (url === serverSurface().canonicalUrl) {
+        return new Response(null, {
+          status: 301,
+          headers: { location: 'https://discord.com/servers/fortnite-322850917248663552' },
+        });
+      }
+      return html('<a href="https://discord.gg/fortnite-redirect">Join</a>');
+    }) as typeof fetch,
+  });
+  assert.equal(result.outcome, 'FOUND');
+  assert.equal(result.candidates[0]?.nativeInviteCode, 'fortnite-redirect');
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1], 'https://discord.com/servers/fortnite-322850917248663552');
+});
+
+test('a non-public redirect is rejected before contact', async () => {
+  const calls: string[] = [];
+  const result = await acquireDiscordPublicSurface({
+    surface: serverSurface(),
+    sourceSurface: 'CHANNEL_EXTERNAL_LINKS',
+    fetchImpl: (async (input: any) => {
+      const url = String(input);
+      calls.push(url);
+      if (url === serverSurface().canonicalUrl) {
+        return new Response(null, { status: 302, headers: { location: 'http://127.0.0.1/private' } });
+      }
+      return json({ message: 'Widget Disabled', code: 50004 }, 403);
+    }) as typeof fetch,
+  });
+  assert.equal(result.outcome, 'ACQUISITION_FAILED');
+  assert.equal(result.retryable, false);
+  assert.equal(result.failureClass, 'SSRF_BLOCKED');
+  assert.ok(!calls.includes('http://127.0.0.1/private'));
+});
+
+test('a stalled response body is classified as a retryable timeout', async () => {
+  const result = await acquireDiscordPublicSurface({
+    surface: widgetSurface(),
+    sourceSurface: 'CHANNEL_EXTERNAL_LINKS',
+    timeoutMs: 25,
+    fetchImpl: (async (_input: any, init?: RequestInit) => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          init?.signal?.addEventListener('abort', () => {
+            controller.error(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+          });
+        },
+      });
+      return new Response(body, { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch,
+  });
+  assert.equal(result.outcome, 'ACQUISITION_FAILED');
+  assert.equal(result.retryable, true);
+  assert.equal(result.failureClass, 'TIMEOUT');
+});
+
+test('a truncated body without an invite is incomplete, never a clean negative', async () => {
+  const truncated = await acquireDiscordPublicSurface({
+    surface: serverSurface(),
+    sourceSurface: 'CHANNEL_EXTERNAL_LINKS',
+    maxBodyChars: 64,
+    fetchImpl: (async () => html(`<html><body>${'x'.repeat(200)}</body></html>`)) as typeof fetch,
+  });
+  assert.equal(truncated.outcome, 'ACQUISITION_FAILED');
+  assert.equal(truncated.retryable, true);
+  assert.equal(truncated.failureClass, 'RESPONSE_TRUNCATED');
+
+  const widgetTruncated = await acquireDiscordPublicSurface({
+    surface: widgetSurface(),
+    sourceSurface: 'CHANNEL_EXTERNAL_LINKS',
+    maxBodyChars: 16,
+    fetchImpl: (async () => json({ instant_invite: 'https://discord.gg/room123', name: 'Trading Floor' })) as typeof fetch,
+  });
+  assert.equal(widgetTruncated.outcome, 'ACQUISITION_FAILED');
+  assert.equal(widgetTruncated.retryable, true);
+  assert.equal(widgetTruncated.failureClass, 'RESPONSE_TRUNCATED');
 });
 
 test('duplicate invite links inside one server page collapse to one candidate', async () => {

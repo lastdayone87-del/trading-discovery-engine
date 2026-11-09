@@ -59,11 +59,14 @@ test('a Discord widget URL in the bio uses instant_invite and keeps bio attribut
 
   assert.equal(result.foundInvite, 'widget-room');
   assert.equal(result.discordCandidates?.[0]?.sourceSurface, 'YOUTUBE_ABOUT');
-  assert.equal(result.steps.find(item => item.step === 'DISCORD_SURFACES')?.status, 'FOUND');
+  const step = result.steps.find(item => item.step === 'DISCORD_SURFACES');
+  assert.equal(step?.status, 'FOUND');
+  assert.equal(step?.inviteLocation, 'YOUTUBE_ABOUT', 'the displayed source must follow the retained candidate, not a fixed surface');
   assert.deepEqual(calls, ['https://discord.com/api/v10/guilds/322850917248663552/widget.json']);
 });
 
 test('the same invite from a server page and a widget collapses to one candidate', async () => {
+  const calls: string[] = [];
   const result = await runChannelInspection({
     channelId: 'h1-duplicate',
     channelName: 'H1 Duplicate',
@@ -72,6 +75,7 @@ test('the same invite from a server page and a widget collapses to one candidate
     videoDescriptions: ['1', '2', '3', '4', '5'],
     externalFetchImpl: (async (input: any) => {
       const url = String(input);
+      calls.push(url);
       if (url === SERVER_PAGE) return html('<a href="https://discord.gg/shared-room">Join</a>');
       if (url.includes('/widget.json')) return json({ instant_invite: 'https://discord.com/invite/shared-room' });
       throw new Error(`unexpected fetch: ${url}`);
@@ -80,6 +84,7 @@ test('the same invite from a server page and a widget collapses to one candidate
 
   assert.equal(result.foundInvite, 'shared-room');
   assert.equal(result.discordCandidates?.length, 1);
+  assert.deepEqual(calls, [SERVER_PAGE, 'https://discord.com/api/v10/guilds/322850917248663552/widget.json']);
   const step = result.steps.find(item => item.step === 'DISCORD_SURFACES');
   assert.equal(step?.status, 'FOUND');
   assert.match(step?.details || '', /2 Discord server\/widget surface URL/);

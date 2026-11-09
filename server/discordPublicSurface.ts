@@ -18,11 +18,23 @@
  * `discord.gg/<code>` link). Widget pages are a JavaScript shell; the public
  * widget JSON is the authoritative surface and may expose `instant_invite`.
  *
+ * Fetching reuses the crawler's guarded manual-redirect path
+ * (`fetchProfilerUrl`): every redirect destination is checked before contact,
+ * production DNS is pinned, and the body is read under the same deadline and
+ * response cap as ordinary crawler requests.
+ *
  * Everything here is public-only: no login, token, or guild membership. The
  * callers keep the existing candidate admission, ownership, and validation
  * pipeline; this module never validates an invite.
  */
 import { extractDiscordCandidates, type DiscordCandidate } from './discordCandidates';
+import { MAX_CRAWL_RESPONSE_CHARS } from './crawlResponseBounds';
+import type { DnsResolver } from './publicDestination';
+import {
+  fetchProfilerUrl,
+  type ProfilerRedirectFailure,
+  type ProfilerTransportFailure,
+} from './siteProfiler';
 import type { AcquisitionSurface } from './inspector';
 
 export type DiscordPublicSurfaceKind = 'SERVER_PAGE' | 'WIDGET';
@@ -57,8 +69,10 @@ const DISCORD_PUBLIC_HOSTS = new Set([
   'www.discordapp.com',
 ]);
 const GUILD_ID = /^\d{15,25}$/;
-const GUILD_ID_IN_PATH = /(\d{15,25})/;
+const SERVER_PATH = /^\/servers\/([^/]+)$/i;
+const SERVER_GUILD_ID = /(?:^|-)(\d{15,25})$/;
 const DEFAULT_TIMEOUT_MS = 8_000;
+const MAX_REDIRECT_HOPS = 5;
 const PUBLIC_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
 };
@@ -66,8 +80,12 @@ const PUBLIC_HEADERS = {
 /**
  * Parse a Discord server-directory or widget URL. Returns null for every
  * other Discord path (invites, channels, the directory root, category pages,
- * and malformed guild ids) so callers keep the existing terminal-invite
- * behavior for those shapes.
+ * extra path segments, and malformed guild ids) so callers keep the existing
+ * terminal-invite behavior for those shapes.
+ *
+ * The guild id is anchored to the end of one server-path segment. This
+ * prevents a numeric slug segment from being selected instead of the real
+ * trailing id, and rejects over-long numeric runs instead of truncating them.
  */
 export function discordPublicSurfaceFor(raw: string): DiscordPublicSurfaceRef | null {
   let parsed: URL;
@@ -81,10 +99,10 @@ export function discordPublicSurfaceFor(raw: string): DiscordPublicSurfaceRef | 
   if (!DISCORD_PUBLIC_HOSTS.has(host)) return null;
 
   const path = parsed.pathname.replace(/\/+$/, '');
-  const serverPath = /^\/servers\/(.+)$/i.exec(path);
+  const serverPath = SERVER_PATH.exec(path);
   if (serverPath) {
     const tail = serverPath[1];
-    const match = GUILD_ID_IN_PATH.exec(tail);
+    const match = SERVER_GUILD_ID.exec(tail);
     if (!match) return null;
     return {
       kind: 'SERVER_PAGE',
@@ -113,10 +131,36 @@ export function widgetJsonUrl(guildId: string): string {
   return `https://discord.com/api/v10/guilds/${encodeURIComponent(guildId)}/widget.json`;
 }
 
-interface FetchResult {
-  response?: Response;
+interface BoundedFetch {
+  status: number;
+  text: string;
+  truncated: boolean;
+  redirectsFollowed: number;
   failureClass?: string;
   detail?: string;
+  retryable?: boolean;
+}
+
+function redirectFailure(failure: ProfilerRedirectFailure | undefined): {
+  failureClass: string;
+  retryable: boolean;
+  detail: string;
+} {
+  switch (failure) {
+    case 'DNS_RESOLUTION_FAILED':
+      return { failureClass: 'NETWORK_FAILURE', retryable: true, detail: 'redirect destination DNS lookup failed' };
+    case 'DNS_TIMEOUT':
+      return { failureClass: 'TIMEOUT', retryable: true, detail: 'redirect destination DNS lookup timed out' };
+    case 'REDIRECT_LOOP':
+      return { failureClass: 'REDIRECT_LOOP', retryable: false, detail: 'redirect loop detected' };
+    case 'REDIRECT_LIMIT':
+      return { failureClass: 'REDIRECT_LIMIT', retryable: false, detail: `redirect hop limit reached (${MAX_REDIRECT_HOPS})` };
+    case 'NON_PUBLIC_DESTINATION':
+      return { failureClass: 'SSRF_BLOCKED', retryable: false, detail: 'redirect destination is not public' };
+    case 'MALFORMED_LOCATION':
+    default:
+      return { failureClass: 'INVALID_REDIRECT', retryable: false, detail: 'malformed redirect destination' };
+  }
 }
 
 async function fetchBounded(
@@ -124,28 +168,62 @@ async function fetchBounded(
   url: string,
   accept: string,
   timeoutMs: number,
-): Promise<FetchResult> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
-  try {
-    const response = await fetchImpl(url, {
-      signal: controller.signal,
-      redirect: 'follow',
-      headers: { ...PUBLIC_HEADERS, Accept: accept },
-    });
-    return { response };
-  } catch (error: any) {
-    const timedOut = error?.name === 'AbortError' || error?.code === 'ABORT_ERR';
+  maxBodyChars: number,
+  resolveHost: DnsResolver | undefined,
+): Promise<BoundedFetch> {
+  let transportFailure: ProfilerTransportFailure | undefined;
+  const fetched = await fetchProfilerUrl(
+    url,
+    fetchImpl,
+    maxBodyChars,
+    timeoutMs,
+    resolveHost,
+    { ...PUBLIC_HEADERS, Accept: accept },
+    {
+      maxHops: MAX_REDIRECT_HOPS,
+      onTransportError: failure => { transportFailure = failure; },
+    },
+  );
+  if (!fetched) {
+    const blocked = transportFailure?.code === 'ESSRFBLOCKED' || transportFailure?.causeCode === 'ESSRFBLOCKED';
+    const timedOut = transportFailure?.name === 'AbortError';
     return {
-      failureClass: timedOut ? 'TIMEOUT' : 'NETWORK_FAILURE',
-      detail: timedOut ? 'public fetch timed out' : `public fetch failed: ${String(error?.message || error)}`,
+      status: 0,
+      text: '',
+      truncated: false,
+      redirectsFollowed: 0,
+      failureClass: blocked ? 'SSRF_BLOCKED' : timedOut ? 'TIMEOUT' : 'NETWORK_FAILURE',
+      retryable: !blocked,
+      detail: blocked
+        ? 'public fetch blocked a non-public destination'
+        : timedOut
+          ? 'public fetch timed out'
+          : `public fetch failed: ${transportFailure?.message || 'transport failure'}`,
     };
-  } finally {
-    clearTimeout(timer);
   }
+  if (fetched.redirectRejected || fetched.redirectFailure) {
+    const failure = redirectFailure(fetched.redirectFailure);
+    return {
+      status: fetched.status,
+      text: '',
+      truncated: false,
+      redirectsFollowed: Math.max(0, fetched.redirectsFollowed.length - 1),
+      ...failure,
+      detail: `${failure.detail}${fetched.rejectedRedirect ? `: ${fetched.rejectedRedirect}` : ''}`,
+    };
+  }
+  return {
+    status: fetched.status,
+    text: fetched.text,
+    truncated: fetched.truncated,
+    redirectsFollowed: Math.max(0, fetched.redirectsFollowed.length - 1),
+  };
 }
 
 function statusFailure(status: number): { failureClass: string; retryable: boolean; detail: string } {
+  if (status === 408 || status === 425) {
+    return { failureClass: 'TRANSIENT_HTTP', retryable: true, detail: `HTTP ${status} transient request failure` };
+  }
   if (status === 429) return { failureClass: 'RATE_LIMIT', retryable: true, detail: `HTTP ${status} rate limited` };
   if (status >= 500) return { failureClass: 'TRANSIENT_HTTP', retryable: true, detail: `HTTP ${status} transient upstream failure` };
   if (status === 401 || status === 403) {
@@ -154,8 +232,27 @@ function statusFailure(status: number): { failureClass: string; retryable: boole
   return { failureClass: 'HTTP_ERROR', retryable: false, detail: `HTTP ${status}` };
 }
 
-function widgetUnavailable(status: number): boolean {
-  return status === 401 || status === 403 || status === 404;
+/**
+ * Only a confirmed disabled/unknown widget is a clean negative. A generic
+ * 401/403 (or an HTML block page) is an access failure and stays retryable;
+ * otherwise a temporary block can masquerade as an absent invite.
+ */
+function confirmedWidgetUnavailable(status: number, bodyText: string): boolean {
+  let body: any = null;
+  try {
+    body = JSON.parse(bodyText);
+  } catch {
+    return false;
+  }
+  const code = Number(body?.code);
+  const message = String(body?.message || '');
+  if (status === 403) {
+    return code === 50004 || /widget.*disabled|disabled.*widget|not enabled/i.test(message);
+  }
+  if (status === 404) {
+    return code === 10004 || /unknown (?:guild|server)/i.test(message);
+  }
+  return false;
 }
 
 interface WidgetResult {
@@ -172,23 +269,31 @@ async function readWidget(
   sourceSurface: AcquisitionSurface,
   surfaceUrl: string,
   timeoutMs: number,
+  maxBodyChars: number,
+  resolveHost: DnsResolver | undefined,
 ): Promise<WidgetResult> {
-  const fetched = await fetchBounded(fetchImpl, widgetJsonUrl(guildId), 'application/json', timeoutMs);
-  if (!fetched.response) {
+  const fetched = await fetchBounded(
+    fetchImpl,
+    widgetJsonUrl(guildId),
+    'application/json',
+    timeoutMs,
+    maxBodyChars,
+    resolveHost,
+  );
+  if (fetched.failureClass) {
     return {
       state: 'FAILED',
       candidates: [],
       failureClass: fetched.failureClass,
-      retryable: true,
+      retryable: fetched.retryable !== false,
       detail: fetched.detail || 'widget fetch failed',
     };
   }
-  const response = fetched.response;
-  if (!response.ok) {
-    if (widgetUnavailable(response.status)) {
-      return { state: 'UNAVAILABLE', candidates: [], detail: `widget unavailable (HTTP ${response.status})` };
+  if (fetched.status < 200 || fetched.status >= 300) {
+    if (confirmedWidgetUnavailable(fetched.status, fetched.text)) {
+      return { state: 'UNAVAILABLE', candidates: [], detail: `widget disabled/unavailable (HTTP ${fetched.status})` };
     }
-    const failure = statusFailure(response.status);
+    const failure = statusFailure(fetched.status);
     return {
       state: 'FAILED',
       candidates: [],
@@ -197,9 +302,18 @@ async function readWidget(
       detail: failure.detail,
     };
   }
+  if (fetched.truncated) {
+    return {
+      state: 'FAILED',
+      candidates: [],
+      failureClass: 'RESPONSE_TRUNCATED',
+      retryable: true,
+      detail: 'widget JSON exceeded the bounded response cap',
+    };
+  }
   let body: any;
   try {
-    body = await response.json();
+    body = JSON.parse(fetched.text);
   } catch {
     return {
       state: 'FAILED',
@@ -227,25 +341,38 @@ async function readWidget(
  * Bounded public acquisition for one parsed Discord surface.
  *
  * Server pages: fetch the page and scan the rendered HTML for native invite
- * links; if the page proves no invite, fall back to the public widget JSON
- * (the page may be a client shell or the server may expose only the widget).
- * Widget URLs: fetch the public widget JSON directly.
+ * links. A server page that fails or proves no invite still falls back to the
+ * independent public widget JSON (the page may be a client shell, temporarily
+ * unavailable, or the server may expose only the widget). Widget URLs: fetch
+ * the public widget JSON directly.
  */
 export async function acquireDiscordPublicSurface(input: {
   surface: DiscordPublicSurfaceRef;
   sourceSurface: AcquisitionSurface;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  /** Test/diagnostic body cap; production uses the shared crawler cap. */
+  maxBodyChars?: number;
+  resolveHost?: DnsResolver;
 }): Promise<DiscordPublicSurfaceAcquisition> {
   const fetchImpl = input.fetchImpl || fetch;
   const timeoutMs = Math.max(1, input.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const maxBodyChars = Math.max(1, input.maxBodyChars ?? MAX_CRAWL_RESPONSE_CHARS);
   const surface = input.surface;
   let requestsStarted = 0;
   let pagesInspected = 0;
 
   if (surface.kind === 'WIDGET') {
     requestsStarted += 1;
-    const widget = await readWidget(fetchImpl, surface.guildId, input.sourceSurface, surface.canonicalUrl, timeoutMs);
+    const widget = await readWidget(
+      fetchImpl,
+      surface.guildId,
+      input.sourceSurface,
+      surface.canonicalUrl,
+      timeoutMs,
+      maxBodyChars,
+      input.resolveHost,
+    );
     if (widget.candidates.length) {
       return {
         surface,
@@ -286,87 +413,89 @@ export async function acquireDiscordPublicSurface(input: {
     surface.canonicalUrl,
     'text/html,application/xhtml+xml',
     timeoutMs,
+    maxBodyChars,
+    input.resolveHost,
   );
-  if (!page.response) {
-    return {
-      surface,
-      outcome: 'ACQUISITION_FAILED',
-      retryable: true,
+  let pageFailure: { failureClass: string; retryable: boolean; detail: string } | null = null;
+  if (page.failureClass) {
+    pageFailure = {
       failureClass: page.failureClass,
+      retryable: page.retryable !== false,
       detail: page.detail || 'server page fetch failed',
-      candidates: [],
-      requestsStarted,
-      pagesInspected,
     };
-  }
-  if (!page.response.ok) {
-    const failure = statusFailure(page.response.status);
-    return {
-      surface,
-      outcome: 'ACQUISITION_FAILED',
-      retryable: failure.retryable,
-      failureClass: failure.failureClass,
-      detail: `server page ${failure.detail}`,
-      candidates: [],
-      requestsStarted,
-      pagesInspected,
-    };
-  }
-
-  let html = '';
-  try {
-    html = await page.response.text();
+  } else if (page.status < 200 || page.status >= 300) {
+    pageFailure = statusFailure(page.status);
+  } else {
     pagesInspected = 1;
-  } catch {
-    return {
-      surface,
-      outcome: 'ACQUISITION_FAILED',
-      retryable: true,
-      failureClass: 'MALFORMED_RESPONSE',
-      detail: 'server page body could not be read',
-      candidates: [],
-      requestsStarted,
-      pagesInspected,
-    };
+    const candidates = extractDiscordCandidates(page.text, input.sourceSurface, surface.canonicalUrl)
+      .filter(candidate => candidate.nativeInviteCode);
+    if (candidates.length) {
+      return {
+        surface,
+        outcome: 'FOUND',
+        retryable: false,
+        detail: `server page exposed ${candidates.length} native invite candidate(s)`,
+        candidates,
+        requestsStarted,
+        pagesInspected,
+      };
+    }
+    // A truncated prefix that contains no invite is not proof of absence.
+    if (page.truncated) {
+      pageFailure = {
+        failureClass: 'RESPONSE_TRUNCATED',
+        retryable: true,
+        detail: 'server page exceeded the bounded response cap without an invite in the prefix',
+      };
+    }
   }
 
-  const candidates = extractDiscordCandidates(html, input.sourceSurface, surface.canonicalUrl)
-    .filter(candidate => candidate.nativeInviteCode);
-  if (candidates.length) {
-    return {
-      surface,
-      outcome: 'FOUND',
-      retryable: false,
-      detail: `server page exposed ${candidates.length} native invite candidate(s)`,
-      candidates,
-      requestsStarted,
-      pagesInspected,
-    };
-  }
-
-  // A server page can be a client shell. The public widget is the fallback
-  // public surface for the same guild; a disabled widget is a confirmed
-  // negative, not a failure.
+  // The widget is an independent public surface for the same guild id: try it
+  // even when the server page failed, so a 404/blocked page cannot hide an
+  // enabled widget invite.
   requestsStarted += 1;
-  const widget = await readWidget(fetchImpl, surface.guildId, input.sourceSurface, surface.canonicalUrl, timeoutMs);
+  const widget = await readWidget(
+    fetchImpl,
+    surface.guildId,
+    input.sourceSurface,
+    surface.canonicalUrl,
+    timeoutMs,
+    maxBodyChars,
+    input.resolveHost,
+  );
   if (widget.candidates.length) {
     return {
       surface,
       outcome: 'FOUND',
       retryable: false,
-      detail: `server page had no static invite; ${widget.detail}`,
+      detail: `${pageFailure ? 'server page unavailable; ' : 'server page had no static invite; '}${widget.detail}`,
       candidates: widget.candidates,
       requestsStarted,
       pagesInspected,
     };
   }
   if (widget.state === 'FAILED') {
+    const retryable = pageFailure?.retryable === true || widget.retryable !== false;
     return {
       surface,
       outcome: 'ACQUISITION_FAILED',
-      retryable: widget.retryable !== false,
-      failureClass: widget.failureClass,
-      detail: `server page had no static invite; ${widget.detail}`,
+      retryable,
+      failureClass: pageFailure?.failureClass || widget.failureClass,
+      detail: pageFailure
+        ? `${pageFailure.detail}; ${widget.detail}`
+        : widget.detail,
+      candidates: [],
+      requestsStarted,
+      pagesInspected,
+    };
+  }
+  if (pageFailure) {
+    return {
+      surface,
+      outcome: 'ACQUISITION_FAILED',
+      retryable: pageFailure.retryable,
+      failureClass: pageFailure.failureClass,
+      detail: `${pageFailure.detail}; ${widget.detail}`,
       candidates: [],
       requestsStarted,
       pagesInspected,
