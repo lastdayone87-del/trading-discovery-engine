@@ -3698,12 +3698,16 @@ export async function inspectAndValidateChannel(
       // append-only checks remain authoritative until a new validation replaces
       // this compatibility projection.
       channel.last_checked=now;
-      if(retryDirective&&(retryDirective.attemptFree||directiveOwnsDurableWork)&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id,retryDirective);
+      // One durable owner per projection: a FOUND-gap directive can satisfy
+      // both gates below, and enqueueing it twice double-counts saturation
+      // deferral telemetry even though the idempotency key collapses the job.
+      const inspectionDirectiveEnqueued=Boolean(retryDirective&&(retryDirective.attemptFree||directiveOwnsDurableWork)&&scheduleRetry);
+      if(inspectionDirectiveEnqueued)await enqueueCommunityAcquisitionRetry(channel.channel_id,retryDirective);
       // Retained-invite FOUND gap (multi-invite recall): the validation branch
       // owns this for admitted invites; discarded/unadmitted FOUND aggregates
       // reach this branch instead (E8) and must not lose the outstanding
       // bounded recovery.
-      if(scheduleRetry&&shouldScheduleFoundGapAcquisitionRetry(inspection))await enqueueCommunityAcquisitionRetry(channel.channel_id,inspection.retryDirective);
+      if(scheduleRetry&&!inspectionDirectiveEnqueued&&shouldScheduleFoundGapAcquisitionRetry(inspection))await enqueueCommunityAcquisitionRetry(channel.channel_id,inspection.retryDirective);
     } else {
       // Final NOT_FOUND projection after all steps (no admitted/discovered
       // invite and no FAILED/PARTIAL acquisition status). Extracted for
