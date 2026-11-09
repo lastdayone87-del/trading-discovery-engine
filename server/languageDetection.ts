@@ -105,9 +105,9 @@ function detectScript(text: string): { script: LanguageScript; language: Support
   if (share('Cyrl') > 0.5) return { script: 'Cyrl', language: 'ru' };
   if (share('Deva') > 0.5) return { script: 'Deva', language: 'hi' };
   if (share('Hani') > 0.5) return { script: 'Hani', language: 'zh' };
-  // Unmodelled dominant scripts (for example Thai) and Latin-free common
-  // text stay undetermined rather than being persisted as Latin.
-  return { script: latinLetterCount > 0 ? 'Latn' : 'Zyyy', language: null };
+  // Unmodelled dominant scripts (for example Thai) stay undetermined rather
+  // than being persisted as Latin just because a ticker appears in the text.
+  return { script: latinLetterCount / letterCount > 0.5 ? 'Latn' : 'Zyyy', language: null };
 }
 
 function countryHintLanguage(countryHint: string | null | undefined): SupportedLanguage | null {

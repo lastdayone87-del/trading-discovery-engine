@@ -52,6 +52,9 @@ test('script detection requires a dominant non-Latin share', () => {
   const thaiJapanese = detectLanguage('ตลาดหุ้น の');
   assert.equal(thaiJapanese.language, 'und');
   assert.equal(thaiJapanese.script, 'Zyyy');
+  // A ticker inside a mostly unsupported-script surface must not make the
+  // whole document look Latin either.
+  assert.equal(detectLanguage('ตลาดหุ้น NQ').script, 'Zyyy');
 });
 
 test('country hints only resolve textual ties and never override clear evidence', () => {
