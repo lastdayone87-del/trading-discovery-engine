@@ -340,7 +340,7 @@ test('parses subscriber count from the About ytInitialData view model', () => {
   assert.equal(parsed.bio, 'Jarvis Trading bio');
 });
 
-test('parses subscriber count from channel-root metadata parts', () => {
+test('parses subscriber count from the channel-root metadata parts', () => {
   const html = `<script>var ytInitialData = ${JSON.stringify({
     header: {
       pageHeaderRenderer: {
@@ -353,6 +353,20 @@ test('parses subscriber count from channel-root metadata parts', () => {
   })};</script>`;
   const parsed = parseYouTubeChannelAboutFromHtml(html);
   assert.equal(parsed.subscriberCountText, '10 subscribers');
+});
+
+test('parses subscriber count from YouTube simpleText shapes', () => {
+  const aboutHtml = `<script>var ytInitialData = ${JSON.stringify({
+    aboutChannelRenderer: {
+      metadata: { aboutChannelViewModel: { subscriberCountText: { simpleText: '5 subscribers' } } },
+    },
+  })};</script>`;
+  assert.equal(parseYouTubeChannelAboutFromHtml(aboutHtml).subscriberCountText, '5 subscribers');
+
+  const rootHtml = `<script>var ytInitialData = ${JSON.stringify({
+    header: { pageHeaderRenderer: { metadataParts: [{ text: { simpleText: '10 subscribers' } }] } },
+  })};</script>`;
+  assert.equal(parseYouTubeChannelAboutFromHtml(rootHtml).subscriberCountText, '10 subscribers');
 });
 
 test('never stores a handle or digit-free text as a public subscriber count', () => {
@@ -398,4 +412,39 @@ test('applyPublicAboutToCandidate applies a subscriber count without a bio', () 
     false
   );
   assert.equal(candidate.subscriberCount, '5 subscribers');
+});
+
+test('public subscriber text never replaces an authoritative count', () => {
+  const candidate = { description: '', subscriberCount: '1200' };
+  assert.equal(
+    applyPublicAboutToCandidate(candidate, { subscriberCountText: '1.2K subscribers' }),
+    false
+  );
+  assert.equal(candidate.subscriberCount, '1200');
+
+  const invalidExisting = { description: '', subscriberCount: '@JarvisTrading' };
+  assert.equal(
+    applyPublicAboutToCandidate(invalidExisting, { subscriberCountText: '5 subscribers' }),
+    true
+  );
+  assert.equal(invalidExisting.subscriberCount, '5 subscribers');
+});
+
+test('a truncated count-only About page stays an incomplete acquisition', async () => {
+  const aboutHtml = `<script>var ytInitialData = ${JSON.stringify({
+    aboutChannelRenderer: {
+      metadata: { aboutChannelViewModel: { subscriberCountText: '5 subscribers' } },
+    },
+  })};</script>${'x'.repeat(MAX_CRAWL_RESPONSE_CHARS + 5_000)}`;
+  const rootHtml = '<html><body>no about data</body></html>';
+  const live = await fetchLiveYouTubeChannelData(
+    'https://www.youtube.com/channel/UC_test',
+    false,
+    (async (input: RequestInfo | URL) =>
+      new Response(String(input).endsWith('/about') ? aboutHtml : rootHtml, {
+        status: 200,
+        headers: { 'content-type': 'text/html' }
+      })) as typeof fetch
+  );
+  assert.equal(live, null);
 });

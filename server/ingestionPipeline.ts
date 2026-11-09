@@ -417,11 +417,16 @@ async function processChannelThroughPipelineInContext(
   // the public page when the official call actually failed: a successful
   // channels.list that omits the count means YouTube hides it, and scraping
   // cannot reveal it.
+  const countryAlreadyRejected = countryVal.status === 'REJECTED'
+    || countryVal.gateDisposition === 'REJECT_EXCLUDED'
+    || countryVal.gateDisposition === 'REJECT_UNSUPPORTED';
   const subscriberFallbackWanted = subscriberEvidenceMissingAfterOfficial
     && candidate.countryMetadataStatus === 'UNAVAILABLE'
+    && !countryAlreadyRejected
     && publicAboutAttempts < 2;
   if (countryFallbackWanted || subscriberFallbackWanted) {
     const beforeDescription = candidate.description;
+    const beforeLinks = [...(candidate.channelLinks || [])];
     (candidate as any).publicAboutAttempted = true;
     (candidate as any).publicAboutAttempts = publicAboutAttempts + 1;
     (candidate as any).publicAboutCheckedAt = now;
@@ -430,7 +435,10 @@ async function processChannelThroughPipelineInContext(
       const liveAbout = await fetchLiveYouTubeChannelData(candidate.youtubeUrl);
       if (applyPublicAboutToCandidate(candidate, liveAbout)) {
         (candidate as any).publicAboutStatus = 'ATTEMPTED_SUCCEEDED';
-        if (countryFallbackWanted || candidate.description !== beforeDescription) {
+        const afterLinks = candidate.channelLinks || [];
+        const linksChanged = afterLinks.length !== beforeLinks.length
+          || afterLinks.some((link, index) => link !== beforeLinks[index]);
+        if (countryFallbackWanted || candidate.description !== beforeDescription || linksChanged) {
           countryVal = await validateChannelCountry({
             channelName: candidate.channelName,
             description: candidate.description,

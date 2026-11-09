@@ -15,9 +15,14 @@ test('parseSubscriberCountNumber correctly parses numeric and compact formats', 
   assert.equal(parseSubscriberCountNumber('1.2K'), 1200);
   assert.equal(parseSubscriberCountNumber('1M'), 1000000);
   assert.equal(parseSubscriberCountNumber('1.2K subscribers'), 1200);
+  assert.equal(parseSubscriberCountNumber('1,234 subscribers'), 1234);
   assert.equal(parseSubscriberCountNumber('29 subscribers'), 29);
   assert.equal(parseSubscriberCountNumber('hidden'), undefined);
   assert.equal(parseSubscriberCountNumber(undefined), undefined);
+  // Malformed decimals must not be rounded into a plausible count.
+  for (const raw of ['1..K', '..1K', '.5K', '1.2', 'NaN', 'Infinity']) {
+    assert.equal(parseSubscriberCountNumber(raw), undefined, raw);
+  }
 });
 
 test('evaluateLowAudienceGate skips deep crawl for known 0-29 subscribers and proceeds for 30+ or hidden', () => {
@@ -104,8 +109,9 @@ test('handle-shaped and missing counts fail open as unavailable, never as low-au
 test('subscriber persistence accepts only parseable counts', () => {
   assert.equal(sanitizeSubscriberCountText('5 subscribers'), '5 subscribers');
   assert.equal(sanitizeSubscriberCountText('10'), '10');
+  assert.equal(sanitizeSubscriberCountText('1,234'), '1,234');
   assert.equal(sanitizeSubscriberCountText('1.2K subscribers'), '1.2K subscribers');
-  for (const raw of ['@JarvisTrading', 'subscribers', 'N/A', '', null, undefined]) {
+  for (const raw of ['@JarvisTrading', 'subscribers', 'N/A', '', null, undefined, '1..K', '.5K', '1.2']) {
     assert.equal(sanitizeSubscriberCountText(raw), undefined, String(raw));
   }
 });
@@ -113,9 +119,12 @@ test('subscriber persistence accepts only parseable counts', () => {
 test('channel writes and existing rows cannot keep non-count subscriber values', () => {
   const db = read('server/dbCore.ts');
   assert.match(db, /sanitizeSubscriberCountText\(channel\.subscriber_count\)/);
+  assert.match(db, /subscriber_count=COALESCE\(excluded\.subscriber_count,channels\.subscriber_count\)/);
   const migration = read('server/db/migrations/172_sanitize_invalid_subscriber_counts.sql');
   assert.match(migration, /UPDATE channels/);
-  assert.match(migration, /!~\*/);
+  assert.match(migration, /SET subscriber_count = NULL/);
+  assert.match(migration, /btrim\(subscriber_count\) !~\*/);
+  assert.match(migration, /\[0-9,\]/);
 });
 
 test('ENRICH claim reserves quota before hydrating and releases it on audience skip', () => {

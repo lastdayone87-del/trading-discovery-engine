@@ -5,7 +5,7 @@
 import { decodeEmbeddedMarkup, detachPageSlice, extractEmbeddedUrls } from './crawlerExtraction';
 import { readBoundedResponseText } from './crawlResponseBounds';
 import { isPageAssetInfrastructureUrl } from './communitySurfacePolicy';
-import { sanitizeSubscriberCountText } from './lowAudienceGate';
+import { parseSubscriberCountNumber, sanitizeSubscriberCountText } from './lowAudienceGate';
 
 /** Local unions avoid coupling this helper to the full app types module. */
 export type PublicAboutCountryStatus = 'CONFIRMED' | 'LIKELY' | 'UNCERTAIN' | 'REJECTED';
@@ -168,7 +168,7 @@ export function parseAboutPageMetadataFromHtml(html: string): {
         const text = typeof value === 'string'
           ? value
           : typeof value === 'object' && value !== null
-            ? (value as { content?: unknown }).content
+            ? ((value as { content?: unknown }).content ?? (value as { simpleText?: unknown }).simpleText)
             : undefined;
         if (typeof text !== 'string') return;
         subscriberCountText = sanitizeSubscriberCountText(text);
@@ -183,7 +183,8 @@ export function parseAboutPageMetadataFromHtml(html: string): {
         if (Array.isArray(metadataParts)) {
           for (const part of metadataParts) {
             if (typeof part !== 'object' || part === null) continue;
-            const text = (part as { text?: { content?: unknown } }).text?.content;
+            const textOfPart = (part as { text?: { content?: unknown; simpleText?: unknown } }).text;
+            const text = textOfPart?.content ?? textOfPart?.simpleText;
             if (typeof text === 'string' && /subscribers?$/i.test(text.trim())) recordSubscriberText(text);
           }
         }
@@ -218,7 +219,9 @@ export function parseAboutPageMetadataFromHtml(html: string): {
       /"subscriberCountText"\s*:\s*"((?:[^"\\]|\\.)+)"/
     );
     if (subscriberMatch) {
-      const literal = subscriberMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+      const literal = detachPageSlice(subscriberMatch[1])
+        .replace(/\\"/g, '"')
+        .replace(/\\\\/g, '\\');
       subscriberCountText = sanitizeSubscriberCountText(literal);
     }
   }
@@ -338,7 +341,7 @@ export async function fetchLiveYouTubeChannelData(
     // A truncated prefix with no usable evidence is an incomplete fetch, not
     // a definitive empty About page: return null so callers record
     // ATTEMPTED_FAILED (retryable) instead of ATTEMPTED_EMPTY (terminal).
-    if (truncated && !bio?.trim() && channelLinks.length === 0 && !subscriberCountText) return null;
+    if (truncated && !bio?.trim() && channelLinks.length === 0) return null;
     return {
       ...(bio?.trim() ? { bio } : {}),
       ...(channelLinks.length ? { channelLinks } : {}),
@@ -388,7 +391,9 @@ export function applyPublicAboutToCandidate(
     changed = true;
   }
   const subscriberCount = sanitizeSubscriberCountText(live.subscriberCountText);
-  if (subscriberCount && subscriberCount !== candidate.subscriberCount) {
+  // Official metadata is authoritative. Public text may be rounded or stale,
+  // so it only fills an unknown/unparseable count, never replaces a known one.
+  if (subscriberCount && parseSubscriberCountNumber(candidate.subscriberCount) === undefined) {
     candidate.subscriberCount = subscriberCount;
     changed = true;
   }
