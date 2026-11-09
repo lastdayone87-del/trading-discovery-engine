@@ -974,6 +974,23 @@ test('Final integration: human approval keeps a detectable language but not nati
   assert.equal(observation.source_provenance_family, null);
 });
 
+test('Final integration: a hint-resolved tie does not permanently label the canonical term', async () => {
+  const runner = createMockRunner();
+  const termId = await observeTerminology({
+    term: 'trade', country: 'Brazil', termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE', videoId: 'VID_BR_TIE_1',
+    sourceCreatorCountry: 'BR', targetMarketCountry: 'BR'
+  }, runner);
+  const observation = runner.observations.find(row => row.canonical_term_id === termId);
+  assert.ok(observation);
+  // The embedded term itself is classified as English finance vocabulary,
+  // but the canonical row stays und because `trade` is also Portuguese and
+  // the market hint only resolved a tie. A later explicit provider language
+  // can therefore still replace the weak guess.
+  assert.equal(observation.term_language, 'en');
+  assert.equal(runner.canonicalTerms.get(termId!)?.language, 'und');
+});
+
 test('Final integration: explicit German context promotes agreeing German terminology', async () => {
   const runner = createMockRunner();
   const termId = await observeTerminology({

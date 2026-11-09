@@ -5,6 +5,7 @@ import type { QueryFunnelMetrics } from './queryPerformance';
 import { getDb } from './db';
 import { isTerminologyKillSwitchActive, isTerminologyKillSwitchActiveOn } from './terminologyKillSwitch';
 import { canonicalCountry } from './countryInference';
+import { detectLanguage } from './languageDetection';
 import {
   computeEvidenceChecksum,
   computeObservationKey,
@@ -1115,11 +1116,19 @@ export async function observeTerminologyDetailed(args: {
 
   const contextLang = args.locale ? args.locale.split('-')[0] : args.language || 'und';
   const codeSwitching = detectCodeSwitching(canonical, contextLang, country);
-  // When the caller has no language/locale evidence, the detected term
-  // language is still a real identity for the canonical row. Persisting
-  // `und` there leaves lifecycle and proposal consumers without the language
-  // the observation itself already carries.
-  const canonicalLanguage = contextLang !== 'und' ? contextLang : codeSwitching.termLanguage;
+  // When the caller has no language/locale evidence, a text-based detection
+  // is still a real identity for the canonical row. A hint-resolved tie is
+  // only a weak guess, however, and the upsert cannot revise it later because
+  // concrete languages are first-writer-wins. Leave those rows `und` so an
+  // explicit provider language can still upgrade them.
+  const detectedCanonical = contextLang === 'und'
+    ? detectLanguage(canonical, { countryHint: country })
+    : null;
+  const canonicalLanguage = contextLang !== 'und'
+    ? contextLang
+    : detectedCanonical && detectedCanonical.language !== 'und' && !detectedCanonical.tieResolvedByHint
+      ? detectedCanonical.language
+      : 'und';
   const weight = args.humanApproved ? 2.5 : args.observationType === 'ENRICHMENT' ? 1.25 : 1;
 
   // 1. Insert or fetch canonical trading term WITHOUT advancing last_observed_at on conflict.

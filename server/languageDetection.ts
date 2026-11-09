@@ -21,6 +21,8 @@ export interface LanguageDetection {
   confidence: number;
   script: LanguageScript;
   method: 'SCRIPT' | 'LEXICON' | 'UNDETERMINED';
+  /** True when the country hint, rather than the text alone, chose the winner. */
+  tieResolvedByHint?: boolean;
 }
 
 export interface DetectLanguageOptions {
@@ -167,7 +169,13 @@ export function detectLanguage(text: string, options: DetectLanguageOptions = {}
   // A hint-resolved tie is deliberate but still weaker than a unique textual
   // winner, so keep it at a moderate floor instead of near-certainty.
   const confidence = Math.min(0.99, Math.max(tied.length > 1 ? 0.5 : 0.3, rawConfidence));
-  return { language, confidence: Number(confidence.toFixed(3)), script: script.script, method: 'LEXICON' };
+  return {
+    language,
+    confidence: Number(confidence.toFixed(3)),
+    script: script.script,
+    method: 'LEXICON',
+    ...(tied.length > 1 ? { tieResolvedByHint: true } : {}),
+  };
 }
 
 export function languageScript(language: string): LanguageScript {
