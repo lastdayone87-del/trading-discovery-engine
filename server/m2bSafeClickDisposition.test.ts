@@ -18,7 +18,10 @@ test('M2b adds no new rendered click class and excludes form/download controls',
   assert.doesNotMatch(source, /formaction/i);
   assert.doesNotMatch(source, /requestSubmit\(/i);
   assert.doesNotMatch(source, /\.submit\(\)/);
-  assert.doesNotMatch(RENDERED_CONTROL_SELECTOR, /(?:^|,)\s*(?:form|input|select|textarea|meta)(?:[\s,\[]|$)/i);
+  assert.match(RENDERED_CONTROL_SELECTOR, /input\[type="submit"\]/);
+  assert.match(RENDERED_CONTROL_SELECTOR, /input\[type="image"\]/);
+  assert.match(RENDERED_CONTROL_SELECTOR, /input\[type="reset"\]/);
+  assert.doesNotMatch(RENDERED_CONTROL_SELECTOR, /(?:^|,)\s*(?:form|select|textarea|meta)(?:[\s,\[]|$)/i);
 });
 
 test('M2b disposition is documented as deferred with a never-click boundary', () => {
@@ -28,8 +31,11 @@ test('M2b disposition is documented as deferred with a never-click boundary', ()
   assert.match(doc, /Never-click boundary/i);
   assert.match(doc, /Enforced by this change/i);
   assert.match(doc, /Policy boundary — not newly enforced/i);
+  assert.match(doc, /real residual risk/i);
   assert.match(doc, /type is\s+`submit` or `reset`/i);
-  assert.match(doc, /input type="submit\|image\|reset"/i);
+  assert.match(doc, /<input type="submit">/i);
+  assert.match(doc, /<input type="image">/i);
+  assert.match(doc, /<input type="reset">/i);
   assert.match(doc, /trigger a download/i);
   assert.match(doc, /Revisit conditions/i);
 });

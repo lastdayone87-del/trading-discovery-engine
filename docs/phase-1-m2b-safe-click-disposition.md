@@ -45,12 +45,17 @@ boundary.
 - Form-associated `<button>` controls whose browser-normalized type is
   `submit` or `reset`, including absent, invalid, or padded `type` values that
   the browser treats as submit.
-- Form-associated `<input type="submit|image|reset">` controls.
+- Form-associated `<input type="submit">`, `<input type="image">`, and
+  `<input type="reset">` controls.
 - `<a download>` links.
-- Existing exclusions: hidden, disabled, `aria-disabled`, zero-box and
-  closed-`<details>` controls; open `<summary>` controls; structural anchors
-  that replace the document; opaque icon-only controls with no accessible
-  evidence.
+- Existing exclusions: hidden or disabled controls (including
+  `aria-disabled`, fieldset-inherited disabled, and zero-box controls) are
+  not clicked until the disclosure that reveals them runs; closed-`<details>`
+  content is deferred until its summary is clicked. `open <summary>` controls
+  are not clicked closed. Non-base-matched structural anchors that replace the
+  document are not clicked; base-matched navigable anchors remain clickable by
+  design. Opaque icon-only controls with no accessible evidence are not
+  clicked.
 
 Excluded controls that would otherwise have entered the hint/structural click
 set, or that would previously have been counted as opaque, are recorded as
@@ -67,11 +72,16 @@ claimed as individually guarded by this PR:
   `javascript:` and other non-http schemes);
 - popup/named-frame targets that cannot be inspected in the current document.
 
-The existing hint/structural click path remains limited to controls that can
-reveal content in place. No new selector, form action, or arbitrary `onclick`
-handler is added to the rendered click set. Clarifying these as policy-only
-is part of the deferral: broadening enforcement needs the safety harness
-described below.
+This is a real residual risk, not a promise: for example, a hint-matching
+`<button type="button">Pay to join our community</button>` remains clickable
+under the existing policy, and a hint-matching non-document link can still
+reach the click path. Broader label-based payment/destructive exclusions are
+not approved because they would be heuristic and could hide legitimate
+community links. The existing hint/structural click path remains limited to
+controls that can reveal content in place. No new selector, form action, or
+arbitrary `onclick` handler is added to the rendered click set. Clarifying
+these as policy-only is part of the deferral: broadening enforcement needs
+the safety harness described below.
 
 ## Why M2b remains deferred
 

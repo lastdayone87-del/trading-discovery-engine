@@ -537,7 +537,7 @@ export const COMMUNITY_HINTS = /discord|community|join|chat|member|membership|vi
  * shared by enumeration and clicking so locator indexes always refer to the
  * same full query.
  */
-export const RENDERED_CONTROL_SELECTOR = 'a,button,[role="button"],[role="tab"],[role="menuitem"],summary,[aria-expanded="false"],[aria-haspopup]';
+export const RENDERED_CONTROL_SELECTOR = 'a,button,input[type="submit"],input[type="image"],input[type="reset"],[role="button"],[role="tab"],[role="menuitem"],summary,[aria-expanded="false"],[aria-haspopup]';
 
 /**
  * Telegram channel pages contain a link for virtually every message. Those
@@ -1207,7 +1207,10 @@ export function enumerateRenderedControlNodes(
       }
     }
     const ariaLabel = element.getAttribute('aria-label') || '';
-    const baseText = `${element.innerText || ''} ${href || ''} ${ariaLabel}`;
+    const inputLabel = tagName === 'input'
+      ? `${(element as HTMLInputElement).value || ''} ${(element as HTMLInputElement).alt || ''}`
+      : '';
+    const baseText = `${element.innerText || ''} ${href || ''} ${ariaLabel} ${inputLabel}`;
     // P1.2: resolve labels the original filter ignored. A bounded descendant
     // text walk adds visually hidden text (innerText omits it) without
     // materializing a pathological control's entire subtree.
@@ -1410,6 +1413,7 @@ export function enumerateRenderedControlNodes(
     // be revealed.
     const hasAnyHref = typeof href === 'string' && href.length > 0;
     const interactiveControl = tagName === 'button'
+      || tagName === 'input'
       || role === 'button'
       || role === 'tab'
       || role === 'menuitem'
@@ -1437,7 +1441,8 @@ export function enumerateRenderedControlNodes(
       || style.display === 'none'
       || style.visibility === 'hidden';
     const disabledControl = (element as HTMLButtonElement).disabled === true
-      || element.getAttribute('aria-disabled') === 'true';
+      || element.getAttribute('aria-disabled') === 'true'
+      || element.matches(':disabled');
     // M2b: a click must never submit/reset a form or trigger a download.
     // These controls can mutate server state or leave the document without
     // revealing inspectable content, so they are counted as unsafe
@@ -1482,6 +1487,9 @@ export function enumerateRenderedControlNodes(
       opaqueInteractiveControls++;
     }
     if (openSummary) continue;
+    // Disabled controls (including fieldset-inherited disabled and
+    // aria-disabled) are not interaction surfaces and are never clicked.
+    if (disabledControl) continue;
     if (!hintMatchedControl && !isDisclosure) continue;
     // A structural anchor that navigates away is enqueue-owned and never
     // clicked: replacing the document would strand the remaining menu
