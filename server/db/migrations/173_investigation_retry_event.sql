@@ -7,6 +7,8 @@ SET LOCAL lock_timeout = '10s';
 ALTER TABLE public.investigation_events
   DROP CONSTRAINT IF EXISTS investigation_events_event_type_check;
 
+-- NOT VALID avoids an ACCESS EXCLUSIVE rewrite of the existing ledger; the
+-- follow-up VALIDATE takes the weaker SHARE UPDATE EXCLUSIVE lock.
 ALTER TABLE public.investigation_events
   ADD CONSTRAINT investigation_events_event_type_check CHECK(event_type IN (
     'INVESTIGATION_STARTED',
@@ -21,5 +23,9 @@ ALTER TABLE public.investigation_events
     'INVESTIGATION_COMPLETED',
     'INVESTIGATION_REVIEW',
     'INVESTIGATION_RECOVERED',
-    'INVESTIGATION_SUPERSEDED'
-  ));
+    'INVESTIGATION_SUPERSEDED',
+    'INVESTIGATION_DEADLINE_REFRESHED'
+  )) NOT VALID;
+
+ALTER TABLE public.investigation_events
+  VALIDATE CONSTRAINT investigation_events_event_type_check;

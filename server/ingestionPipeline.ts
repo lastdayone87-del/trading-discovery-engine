@@ -30,7 +30,7 @@ import { LANGUAGE_KNOWLEDGE_PACKS } from './evidenceEngine/knowledgePacks';
 import { observeProductionDiagnosticReliably, observeRetrievalAssignmentReliably } from './phaseBObservationOutbox';
 import { buildDecisionEvaluationSamplingPolicy } from './decisionEvaluationSamplingPolicy';
 import { ACTIONS, deriveVitalityScheduling, planAndRecordEvidenceAction, type EvidenceActionType, type EvidenceActionPlan } from './voiEvidenceController';
-import { INVESTIGATION_POLICY_VERSION, failInvestigationStep, retryInvestigationStep, scheduleInvestigationStep } from './investigationWorkflow';
+import { INVESTIGATION_POLICY_VERSION, restoreBlockedInvestigationStep, retryInvestigationStep, scheduleInvestigationStep } from './investigationWorkflow';
 import {assignRelease5Serving} from './release5/rollout';
 import { deterministicUuid, entityChecksum, observeYouTubeChannelEntity, sourceFamilyIdentity } from './entityResolution';
 import { enrichmentOperationalFailure, hasDecisionGradeEvidenceWithoutFailedProviders, manualRecheckDegradedError } from './enrichmentOperationalFailure';
@@ -1020,12 +1020,12 @@ async function processChannelThroughPipelineInContext(
               // The reopen guard refused the terminal owner. Restore the
               // blocked projection so the investigation does not stay ACTIVE
               // with a RETRYING step and no runnable job.
-              await failInvestigationStep({investigationId:retryInvestigationId,stepId:retryStepId,jobId:existing.id,attempt:Number(existing.attempts||0),terminal:true,failureClass:'RETRY_NOT_ADMITTED'})
+              await restoreBlockedInvestigationStep({investigationId:retryInvestigationId,stepId:retryStepId,jobId:existing.id,attempt:Number(existing.attempts||0),reason:'RETRY_NOT_ADMITTED'})
                 .catch(error=>console.warn(`[Investigation] Failed to restore blocked step for ${candidate.channelId}:`,error instanceof Error?error.message:error));
             }
           }catch(error){
             if(retryLinkage&&existing){
-              await failInvestigationStep({investigationId:retryInvestigationId,stepId:retryStepId,jobId:existing.id,attempt:Number(existing.attempts||0),terminal:true,failureClass:'RETRY_ENQUEUE_FAILED'})
+              await restoreBlockedInvestigationStep({investigationId:retryInvestigationId,stepId:retryStepId,jobId:existing.id,attempt:Number(existing.attempts||0),reason:'RETRY_ENQUEUE_FAILED'})
                 .catch(restoreError=>console.warn(`[Investigation] Failed to restore blocked step for ${candidate.channelId}:`,restoreError instanceof Error?restoreError.message:restoreError));
             }
             throw error;
@@ -1040,9 +1040,10 @@ async function processChannelThroughPipelineInContext(
         // The stable same-stage pass is already terminal. Project the honest
         // terminal state, but update only the committed row's scan status so
         // a concurrent recovery/recheck cannot be overwritten by this stale
-        // snapshot. The same UPDATE excludes a later-stage active job under
-        // the row lock, which is atomic: no read failure can leave the
-        // channel ENRICHMENT_PENDING without a runnable job.
+        // snapshot. The same UPDATE excludes a later-stage active job in one
+        // statement, which narrows the race to a job committed after that
+        // statement's snapshot. A worker that still owns the channel will
+        // reassert its marker; no separate read can orphan the pending row.
         // A blocked FAILED job is FAILED, never COMPLETED.
         const blocked=resolveEnrichmentReopenBlockedLifecycle(authoritativeChannel,{blockedJobStatus:enqueued.status,hasOtherActiveEnrichmentJob:false});
         if(blocked.scanStatus!==authoritativeChannel.scan_status){
