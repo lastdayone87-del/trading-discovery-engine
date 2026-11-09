@@ -43,12 +43,15 @@ test('H3 inspects the tenth authoritative description', async () => {
     videoId: `video-${index + 1}`,
     description: index === 9 ? withInvite('authoritative-tenth') : noInvite(index),
   }));
+  // Keep the invite only in the authoritative sample: a regression that
+  // ignores recentVideoDescriptions and falls back to preloaded text must miss.
+  const preloaded = Array.from({ length: 10 }, (_, index) => noInvite(index + 100));
   const result = await runChannelInspection({
     channelId: 'h3-authoritative-tenth',
     channelName: 'H3 Authoritative Tenth',
     channelBio: 'No invite',
     channelLinks: [],
-    videoDescriptions: recentVideoDescriptions.map(item => item.description),
+    videoDescriptions: preloaded,
     videoDescriptionsAuthoritative: true,
     recentVideoDescriptions,
   });
