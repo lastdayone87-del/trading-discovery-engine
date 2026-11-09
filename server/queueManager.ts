@@ -86,6 +86,7 @@ import { calculateQueryFunnel, countDeferredRawResults, manualSearchContinuation
 import { resolveScopeEligibility } from './scopeEligibility';
 import { processChannelThroughPipeline, isTerminalState, applyGate1CountryRejectionToExisting, type PipelineExecutionOptions } from './ingestionPipeline';
 import { evaluateLowAudienceGate, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
+import { applyPublicAboutToCandidate, fetchLiveYouTubeChannelData } from './youtubePublicAbout';
 import { shouldPreserveExistingChannel } from './terminalPreservationPolicy';
 import { resolveTerminalEnrichmentFailure } from './enrichmentLifecycle';
 import { recordEvidenceActionOutcome } from './voiEvidenceController';
@@ -1654,14 +1655,20 @@ export async function processNextSearchJob(
       let claimAudienceGate = claimCandidateGate.shouldSkipDeepEnrichment ? claimCandidateGate : claimStoredGate;
       let claimHydrationUnits = 0;
       let claimHydrationChanged = false;
+      let claimMetadataFailed = false;
+      let claimPublicAboutAttempted = false;
+      let claimHydratedSubscriberCount: string | undefined;
+      const claimHydrationAt = new Date().toISOString();
       if (claimAudienceGate.reasonCode === 'SUBSCRIBER_COUNT_UNAVAILABLE' && claimCandidateGate.reasonCode === 'SUBSCRIBER_COUNT_UNAVAILABLE') {
         const beforeSub = candidate.subscriberCount;
         const beforeDesc = candidate.description;
         const beforeLoc = candidate.locationTag;
+        const beforeLinks = [...(candidate.channelLinks || [])];
         try {
           const hydrated = await fetchYouTubeChannelCountryMetadata(channelId, candidate);
           if (hydrated.subscriberCount && hydrated.subscriberCount !== candidate.subscriberCount) {
             candidate.subscriberCount = hydrated.subscriberCount;
+            claimHydratedSubscriberCount = hydrated.subscriberCount;
             claimAudienceGate = evaluateLowAudienceGate(hydrated.subscriberCount);
           }
           if (hydrated.description) candidate.description = hydrated.description;
@@ -1673,16 +1680,80 @@ export async function processNextSearchJob(
           if (hydrated.countryMetadataStatus === 'AVAILABLE_DECLARED' || hydrated.countryMetadataStatus === 'AVAILABLE_NOT_DECLARED') claimHydrationUnits = 1;
           // Country revalidation triggers only on creator-evidence changes
           // (hidden-subscriber hydration can still deliver new country
-          // evidence via description/location); a bare metadata-status flip
-          // carries no country evidence and must not trigger it.
+          // evidence via description/location/links); a bare metadata-status
+          // flip carries no country evidence and must not trigger it.
+          const afterLinks = candidate.channelLinks || [];
+          const linksChanged = afterLinks.length !== beforeLinks.length
+            || afterLinks.some((link, index) => link !== beforeLinks[index]);
           claimHydrationChanged =
             candidate.subscriberCount !== beforeSub ||
             candidate.description !== beforeDesc ||
-            candidate.locationTag !== beforeLoc;
+            candidate.locationTag !== beforeLoc ||
+            linksChanged;
         } catch {
-          // Hydration unavailable (no keys, quota, network): proceed fail-open.
+          claimMetadataFailed = true;
+          // Hydration unavailable (no keys, quota, network): fall through to
+          // the keyless public About source below.
+        }
+        const storedAttempts = Number(channel.public_about_attempts || 0);
+        if (claimAudienceGate.reasonCode === 'SUBSCRIBER_COUNT_UNAVAILABLE'
+          && (claimMetadataFailed || candidate.countryMetadataStatus === 'UNAVAILABLE')
+          && storedAttempts < 2) {
+          // The Data API is unavailable or has no count (e.g. a hidden
+          // statistic). The public About/header text carries the same count
+          // without spending quota, so a queued channel can still be gated
+          // instead of reaching deep enrichment on unknown audience.
+          claimPublicAboutAttempted = true;
+          const beforePublicSub = candidate.subscriberCount;
+          const beforePublicDesc = candidate.description;
+          const beforePublicLinks = [...(candidate.channelLinks || [])];
+          try {
+            const liveAbout = await fetchLiveYouTubeChannelData(channel.youtube_url);
+            (candidate as any).publicAboutCheckedAt = claimHydrationAt;
+            (candidate as any).publicAboutAttempts = storedAttempts + 1;
+            if (liveAbout && applyPublicAboutToCandidate(candidate, liveAbout)) {
+              (candidate as any).publicAboutStatus = 'ATTEMPTED_SUCCEEDED';
+              claimAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount);
+              if (candidate.subscriberCount !== beforePublicSub) {
+                claimHydratedSubscriberCount = candidate.subscriberCount;
+              }
+              const afterPublicLinks = candidate.channelLinks || [];
+              const linksChanged = afterPublicLinks.length !== beforePublicLinks.length
+                || afterPublicLinks.some((link, index) => link !== beforePublicLinks[index]);
+              claimHydrationChanged =
+                claimHydrationChanged ||
+                candidate.subscriberCount !== beforePublicSub ||
+                candidate.description !== beforePublicDesc ||
+                linksChanged;
+            } else {
+              (candidate as any).publicAboutStatus = liveAbout ? 'ATTEMPTED_EMPTY' : 'ATTEMPTED_FAILED';
+            }
+          } catch {
+            (candidate as any).publicAboutStatus = 'ATTEMPTED_FAILED';
+            // Public About is an evidence fallback; provider hydration remains
+            // the authoritative path when it is available.
+          }
         }
       }
+      // Persist the attempt state even when the page yielded no count so a
+      // retrying job cannot repeat the same public fetch forever. A keyless
+      // count is persisted for dashboard visibility, but never over a stored
+      // known-low value the claim gate is about to skip on.
+      let persistClaimHydration = false;
+      if (claimPublicAboutAttempted) {
+        channel.public_about_status = (candidate as any).publicAboutStatus || channel.public_about_status;
+        channel.public_about_checked_at = (candidate as any).publicAboutCheckedAt || channel.public_about_checked_at;
+        channel.public_about_attempts = (candidate as any).publicAboutAttempts ?? channel.public_about_attempts;
+        persistClaimHydration = true;
+      }
+      if (!claimStoredGate.shouldSkipDeepEnrichment) {
+        const subscriberCount = claimHydratedSubscriberCount ?? candidate.subscriberCount;
+        if (subscriberCount && subscriberCount !== channel.subscriber_count) {
+          channel.subscriber_count = subscriberCount;
+          persistClaimHydration = true;
+        }
+      }
+      if (persistClaimHydration) await upsertChannel(channel);
       // Hydration may have upgraded an UNCERTAIN creator into a CONFIRMED
       // excluded country. Re-run the existing Gate-1 validation on the
       // hydrated candidate: a REJECTED result projects onto the row, releases

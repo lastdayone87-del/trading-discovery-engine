@@ -28,6 +28,35 @@ test('ingestion hydrates missing subscriber evidence before applying the low-aud
   assert.ok(classifier > gate, 'low-audience gate must stop the channel before deep classification');
 });
 
+test('keyless public About hydrates a missing count before the low-audience gate', () => {
+  const source = read('server/ingestionPipeline.ts');
+  const subscriberFallback = source.indexOf('const subscriberFallbackWanted');
+  const apply = source.indexOf('applyPublicAboutToCandidate(candidate, liveAbout)', subscriberFallback);
+  const gate = source.indexOf('// Phase 7: Low-Audience Budget Gate');
+  assert.ok(subscriberFallback >= 0, 'audience fallback decision exists');
+  assert.match(
+    source.slice(subscriberFallback, apply),
+    /subscriberEvidenceMissingAfterOfficial[\s\S]*candidate\.countryMetadataStatus === 'UNAVAILABLE'[\s\S]*!countryAlreadyRejected[\s\S]*publicAboutAttempts < 2/,
+    'public fetch is guarded by missing count, official failure, country policy, and attempt cap',
+  );
+  assert.ok(apply > subscriberFallback, 'public About is applied when the count is missing');
+  assert.ok(gate > apply, 'hydrated count reaches the low-audience gate');
+});
+
+test('enrichment claim falls back to keyless public About when official statistics are unavailable', () => {
+  const source = read('server/queueManager.ts');
+  const hydrate = source.indexOf('fetchYouTubeChannelCountryMetadata(channelId, candidate)');
+  const publicAbout = source.indexOf('fetchLiveYouTubeChannelData(channel.youtube_url)', hydrate);
+  const skip = source.indexOf('if (claimAudienceGate.shouldSkipDeepEnrichment) {', hydrate);
+  assert.ok(hydrate >= 0 && publicAbout > hydrate, 'public About fallback follows official hydration');
+  assert.ok(skip > publicAbout, 'public About count is evaluated by the claim-time audience gate');
+  const claimBlock = source.slice(hydrate, skip);
+  assert.match(claimBlock, /claimMetadataFailed \|\| candidate\.countryMetadataStatus === 'UNAVAILABLE'/);
+  assert.match(claimBlock, /storedAttempts < 2/);
+  assert.match(claimBlock, /!claimStoredGate\.shouldSkipDeepEnrichment/);
+  assert.match(claimBlock, /if \(claimPublicAboutAttempted\) \{/);
+});
+
 test('subscriber preflight preserves agreed 1-29 / 30+ / hidden semantics', () => {
   assert.equal(evaluateLowAudienceGate('7').shouldSkipDeepEnrichment, true);
   assert.equal(evaluateLowAudienceGate('29').shouldSkipDeepEnrichment, true);

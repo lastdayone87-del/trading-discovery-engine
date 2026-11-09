@@ -390,6 +390,11 @@ async function processChannelThroughPipelineInContext(
 
   // Gate 1 evidence-only fallback: if country remains uncertain and candidate lacks usable About text,
   // retrieve the public channel page without an API key and re-run the country validator.
+  // The same page is also the keyless audience source: when official metadata
+  // left the subscriber count unknown, its About/header text carries the public
+  // count even while the Data API cap is exhausted.
+  const subscriberEvidenceMissingAfterOfficial =
+    evaluateLowAudienceGate(candidate.subscriberCount).reasonCode === 'SUBSCRIBER_COUNT_UNAVAILABLE';
   const publicAboutStatus = (candidate as any).publicAboutStatus || existing?.public_about_status || 'NOT_ATTEMPTED';
   const publicAboutAttempts = Number((candidate as any).publicAboutAttempts ?? existing?.public_about_attempts ?? 0);
   const publicAboutAttempted = Boolean(
@@ -398,14 +403,30 @@ async function processChannelThroughPipelineInContext(
     publicAboutStatus === 'ATTEMPTED_EMPTY' ||
     existing?.inspection_trail?.some(s => s.details?.includes('Public About') || s.title?.includes('Live About'))
   );
-  if (shouldAttemptPublicAboutCountryFallback({
+  const countryFallbackWanted = shouldAttemptPublicAboutCountryFallback({
     countryStatus: countryVal.status,
     countryMetadataStatus: candidate.countryMetadataStatus,
     description: candidate.description,
     publicAboutStatus,
     publicAboutAttempts,
     publicAboutAttempted
-  })) {
+  });
+  // The audience source is independent of the country gate. Allow one retry
+  // beyond the country fallback's single attempt so channels first parsed
+  // before subscriber extraction existed can still be hydrated. Only pay for
+  // the public page when the official call actually failed: a successful
+  // channels.list that omits the count means YouTube hides it, and scraping
+  // cannot reveal it.
+  const countryAlreadyRejected = countryVal.status === 'REJECTED'
+    || countryVal.gateDisposition === 'REJECT_EXCLUDED'
+    || countryVal.gateDisposition === 'REJECT_UNSUPPORTED';
+  const subscriberFallbackWanted = subscriberEvidenceMissingAfterOfficial
+    && candidate.countryMetadataStatus === 'UNAVAILABLE'
+    && !countryAlreadyRejected
+    && publicAboutAttempts < 2;
+  if (countryFallbackWanted || subscriberFallbackWanted) {
+    const beforeDescription = candidate.description;
+    const beforeLinks = [...(candidate.channelLinks || [])];
     (candidate as any).publicAboutAttempted = true;
     (candidate as any).publicAboutAttempts = publicAboutAttempts + 1;
     (candidate as any).publicAboutCheckedAt = now;
@@ -414,17 +435,22 @@ async function processChannelThroughPipelineInContext(
       const liveAbout = await fetchLiveYouTubeChannelData(candidate.youtubeUrl);
       if (applyPublicAboutToCandidate(candidate, liveAbout)) {
         (candidate as any).publicAboutStatus = 'ATTEMPTED_SUCCEEDED';
-        countryVal = await validateChannelCountry({
-          channelName: candidate.channelName,
-          description: candidate.description,
-          videoTitles: candidate.videoTitles,
-          locationTag: candidate.locationTag,
-          externalLinks: candidate.channelLinks,
-          metadataStatus: candidate.countryMetadataStatus,
-          videoDescriptions: candidate.videoDescriptions,
-          videoDescriptionsAuthoritative: candidate.videoDescriptionsAuthoritative,
-          playlists: candidate.playlists,
-        }, targetCountry);
+        const afterLinks = candidate.channelLinks || [];
+        const linksChanged = afterLinks.length !== beforeLinks.length
+          || afterLinks.some((link, index) => link !== beforeLinks[index]);
+        if (countryFallbackWanted || candidate.description !== beforeDescription || linksChanged) {
+          countryVal = await validateChannelCountry({
+            channelName: candidate.channelName,
+            description: candidate.description,
+            videoTitles: candidate.videoTitles,
+            locationTag: candidate.locationTag,
+            externalLinks: candidate.channelLinks,
+            metadataStatus: candidate.countryMetadataStatus,
+            videoDescriptions: candidate.videoDescriptions,
+            videoDescriptionsAuthoritative: candidate.videoDescriptionsAuthoritative,
+            playlists: candidate.playlists,
+          }, targetCountry);
+        }
       } else {
         (candidate as any).publicAboutStatus = liveAbout ? 'ATTEMPTED_EMPTY' : 'ATTEMPTED_FAILED';
       }

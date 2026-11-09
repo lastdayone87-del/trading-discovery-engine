@@ -12,13 +12,30 @@ export function parseSubscriberCountNumber(raw?: string): number | undefined {
   const compact = normalized.replace(/,/g, '');
   const numeric = compact.match(/^(\d+)$/);
   const subscribers = compact.match(/^(\d+)\s+SUBSCRIBERS?$/);
-  const thousands = compact.match(/^([\d.]+)\s*K(?:\s+SUBSCRIBERS?)?$/);
-  const millions = compact.match(/^([\d.]+)\s*M(?:\s+SUBSCRIBERS?)?$/);
-  if (numeric) return parseInt(numeric[1], 10);
-  if (subscribers) return parseInt(subscribers[1], 10);
-  if (thousands) return Math.round(parseFloat(thousands[1]) * 1000);
-  if (millions) return Math.round(parseFloat(millions[1]) * 1000000);
+  const thousands = compact.match(/^(\d+(?:\.\d+)?)\s*K(?:\s+SUBSCRIBERS?)?$/);
+  const millions = compact.match(/^(\d+(?:\.\d+)?)\s*M(?:\s+SUBSCRIBERS?)?$/);
+  const finite = (value: number): number | undefined => Number.isFinite(value) ? value : undefined;
+  if (numeric) return finite(parseInt(numeric[1], 10));
+  if (subscribers) return finite(parseInt(subscribers[1], 10));
+  if (thousands) return finite(Math.round(parseFloat(thousands[1]) * 1000));
+  if (millions) return finite(Math.round(parseFloat(millions[1]) * 1000000));
   return undefined;
+}
+
+/**
+ * Accept a subscriber value only when it is a parseable count. Channel handles
+ * ('@name'), digit-free text, and other non-count values must never be stored
+ * in `subscriber_count`: the low-audience gate treats them as unknown and
+ * fail-opens, so a poisoned value hides a genuinely small channel.
+ */
+export function sanitizeSubscriberCountText(value: unknown): string | undefined {
+  if (value === null || value === undefined) return undefined;
+  const text = String(value).replace(/\u00a0/g, ' ').trim();
+  if (!text || text.startsWith('@')) return undefined;
+  if (!/\d/.test(text)) return undefined;
+  const count = parseSubscriberCountNumber(text);
+  if (count === undefined || !Number.isFinite(count)) return undefined;
+  return text;
 }
 
 /**
