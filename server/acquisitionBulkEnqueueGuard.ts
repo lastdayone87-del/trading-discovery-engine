@@ -160,6 +160,20 @@ function pruneRolling(now: number): void {
   while (scopeLessAdmissions.length && scopeLessAdmissions[0].at <= cutoff) scopeLessAdmissions.shift();
 }
 
+/** Enforcement must not hide the flood: a blocked admission is still warned. */
+function warnBulkEnqueueBlock(kind: 'transaction' | 'window' | 'hour', scope: string, used: number, limit: number, now: number): void {
+  bumpBulkEnqueueWarning();
+  console.warn(JSON.stringify({
+    event: 'bulk_enqueue_transaction_blocked',
+    kind,
+    scope,
+    admitted: used,
+    limit,
+    enforcementEnabled: true,
+    timestamp: new Date(now).toISOString(),
+  }));
+}
+
 /** Always-on backstop for scope-less producers: no client object can opt out. */
 function warnRollingBulkEnqueue(now: number): void {
   pruneRolling(now);
@@ -192,11 +206,10 @@ export function admitBulkEnqueue(input: {
 } = {}): BulkEnqueueGuardDecision {
   const config: BulkEnqueueGuardConfig = input.config
     ? {
-        enabled: false,
-        maxPerTransaction: DEFAULT_BULK_ENQUEUE_MAX_PER_TRANSACTION,
-        maxPerWindow: DEFAULT_BULK_ENQUEUE_MAX_PER_WINDOW,
-        maxPerHour: DEFAULT_BULK_ENQUEUE_MAX_PER_HOUR,
-        ...input.config,
+        enabled: input.config.enabled ?? false,
+        maxPerTransaction: input.config.maxPerTransaction ?? DEFAULT_BULK_ENQUEUE_MAX_PER_TRANSACTION,
+        maxPerWindow: input.config.maxPerWindow ?? DEFAULT_BULK_ENQUEUE_MAX_PER_WINDOW,
+        maxPerHour: input.config.maxPerHour ?? DEFAULT_BULK_ENQUEUE_MAX_PER_HOUR,
       }
     : resolveBulkEnqueueGuardConfig();
   const now = Number.isFinite(input.now) ? Number(input.now) : Date.now();
@@ -207,18 +220,21 @@ export function admitBulkEnqueue(input: {
   if (config.enabled) {
     if (state && state.count >= config.maxPerTransaction) {
       bumpBulkEnqueueGuardBlock('transaction');
+      warnBulkEnqueueBlock('transaction', state.label, state.count, config.maxPerTransaction, now);
       return { allowed: false, kind: 'transaction', used: state.count, limit: config.maxPerTransaction };
     }
     // Scope-less producers get the same default budget over a rolling 60s
     // window, so the default-off cap is not merely a warning in production.
     if (!state && scopeLessAdmissions.length >= config.maxPerWindow) {
       bumpBulkEnqueueGuardBlock('window');
+      warnBulkEnqueueBlock('window', 'process-rolling-60s', scopeLessAdmissions.length, config.maxPerWindow, now);
       return { allowed: false, kind: 'window', used: scopeLessAdmissions.length, limit: config.maxPerWindow };
     }
     const cutoff = now - HOUR_MS;
     while (hourAdmissions.length && hourAdmissions[0].at <= cutoff) hourAdmissions.shift();
     if (hourAdmissions.length >= config.maxPerHour) {
       bumpBulkEnqueueGuardBlock('hour');
+      warnBulkEnqueueBlock('hour', 'process-hourly', hourAdmissions.length, config.maxPerHour, now);
       return { allowed: false, kind: 'hour', used: hourAdmissions.length, limit: config.maxPerHour };
     }
   }

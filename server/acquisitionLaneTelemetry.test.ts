@@ -16,6 +16,7 @@ import {
 } from './acquisitionLaneTelemetry';
 import {
   BULK_ENQUEUE_TRANSACTION_WARNING_THRESHOLD,
+  DEFAULT_BULK_ENQUEUE_MAX_PER_WINDOW,
   BulkEnqueueGuardError,
   admitBulkEnqueue,
   commitBulkEnqueue,
@@ -421,8 +422,20 @@ test('scope-less bulk bursts hit the rolling window cap when enabled', () => {
   assert.equal(blocked.allowed, false);
   assert.equal(blocked.kind, 'window');
   assert.equal(operationsTelemetrySnapshot().bulkEnqueueGuardBlocksTotal.window, 1);
+  assert.equal(operationsTelemetrySnapshot().bulkEnqueueWarningsTotal, 1, 'enforcement must still warn');
   // The rolling budget returns after the 60s window.
   assert.equal(admitBulkEnqueue({ now: 70_000, config }).allowed, true);
+});
+
+test('undefined cap fields fall back to their defaults', () => {
+  const config = { enabled: true, maxPerTransaction: 1000, maxPerWindow: undefined, maxPerHour: 1000 } as any;
+  for (let index = 0; index < DEFAULT_BULK_ENQUEUE_MAX_PER_WINDOW; index += 1) {
+    assert.equal(admitBulkEnqueue({ now: 1_000 + index, config }).allowed, true);
+  }
+  const blocked = admitBulkEnqueue({ now: 2_000, config });
+  assert.equal(blocked.allowed, false);
+  assert.equal(blocked.kind, 'window');
+  assert.equal(blocked.limit, DEFAULT_BULK_ENQUEUE_MAX_PER_WINDOW);
 });
 
 test('scoped batches do not consume the scope-less rolling window', async () => {
