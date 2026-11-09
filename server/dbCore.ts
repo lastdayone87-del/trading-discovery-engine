@@ -21,7 +21,7 @@ import { canonicalCountry } from './countryInference';
 import { sanitizeSubscriberCountText } from './lowAudienceGate';
 import { countryIdentitySql } from './countryExclusionRules';
 import { classifyDiscoveryVisibility } from './discoveryStateVisibility';
-import { countryPolicySnapshotMatches, type CountryPolicySnapshot } from './terminalPreservationPolicy';
+import { countryPolicySnapshotFromRow, countryPolicySnapshotMatches, type CountryPolicySnapshot } from './terminalPreservationPolicy';
 import { safeCrawlerTelemetry, type CrawlerTelemetry } from './crawlerTelemetry';
 import { admitBulkEnqueue, commitBulkEnqueue, releaseBulkEnqueue, BulkEnqueueGuardError } from './acquisitionBulkEnqueueGuard';
 import { sanitizeAcquisitionAttribution, type AcquisitionAttribution } from './acquisitionLaneTaxonomy';
@@ -1585,7 +1585,10 @@ export async function upsertChannel(channel: ChannelRecord, options?: { preserve
     // concurrent rejection or confirmation. The row lock makes this check and
     // the write one atomic decision.
     if (options?.requireCountrySnapshot && locked
-      && !countryPolicySnapshotMatches(locked, options.requireCountrySnapshot)) {
+      && !countryPolicySnapshotMatches(
+        countryPolicySnapshotFromRow(locked),
+        options.requireCountrySnapshot,
+      )) {
       await client.query('COMMIT');
       return;
     }

@@ -77,6 +77,14 @@ export interface CountryPolicySnapshot {
   country?: string | null;
 }
 
+/** Map a raw channels row (snake_case columns) to the policy snapshot shape. */
+export function countryPolicySnapshotFromRow(
+  row: { country_status?: string | null; country?: string | null } | null | undefined,
+): CountryPolicySnapshot | null {
+  if (!row) return null;
+  return { countryStatus: row.country_status ?? null, country: row.country ?? null };
+}
+
 /** Compare a channel's locked country policy with the snapshot a slower pass read. */
 export function countryPolicySnapshotMatches(
   locked: CountryPolicySnapshot | null | undefined,

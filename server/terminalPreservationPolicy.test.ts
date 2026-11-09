@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ChannelRecord, DiscoverySource } from '../src/types';
-import { countryPolicySnapshotMatches, machineNonTradingRediscoveryEligible, shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldRevalidateConfirmedCountry, shouldShortCircuitConfirmedRediscovery, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
+import { countryPolicySnapshotFromRow, countryPolicySnapshotMatches, machineNonTradingRediscoveryEligible, shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldRevalidateConfirmedCountry, shouldShortCircuitConfirmedRediscovery, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
 
 const NOW = Date.parse('2026-08-16T04:00:00.000Z');
 
@@ -109,4 +109,12 @@ test('a slow country pass cannot overwrite a concurrent rejection or confirmatio
   assert.equal(countryPolicySnapshotMatches({ countryStatus: 'CONFIRMED', country: 'Netherlands' }, unconfirmed), false);
   assert.equal(countryPolicySnapshotMatches({ countryStatus: 'UNCERTAIN', country: 'Belgium' }, unconfirmed), false);
   assert.equal(countryPolicySnapshotMatches(null, unconfirmed), false);
+});
+
+test('raw channel rows map snake_case country columns before comparison', () => {
+  const row = { country_status: 'UNCERTAIN', country: '' };
+  assert.deepEqual(countryPolicySnapshotFromRow(row), { countryStatus: 'UNCERTAIN', country: '' });
+  assert.equal(countryPolicySnapshotMatches(countryPolicySnapshotFromRow(row), { countryStatus: 'UNCERTAIN', country: '' }), true);
+  assert.equal(countryPolicySnapshotMatches(countryPolicySnapshotFromRow({ country_status: 'REJECTED', country: 'Germany' }), { countryStatus: 'UNCERTAIN', country: '' }), false);
+  assert.equal(countryPolicySnapshotFromRow(null), null);
 });
