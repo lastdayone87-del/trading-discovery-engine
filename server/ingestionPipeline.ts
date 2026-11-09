@@ -1037,7 +1037,9 @@ async function processChannelThroughPipelineInContext(
             // An already-claimed owner cannot accept a workflow step. Reuse it
             // through the idempotent queue path rather than reporting that the
             // investigation scheduled work it does not own.
-            if(!scheduled.stepId)enqueued=await enqueueEnrichment();
+            // A completed or failed owner must still drive the lifecycle
+            // projection; a processing owner is already live.
+            if(!scheduled.stepId||scheduled.job.status!=='PENDING')enqueued=await enqueueEnrichment();
           }
           catch(error){if(candidate.investigationId)throw error;console.error(`[Investigation] Initial transactional scheduling failed for ${candidate.channelId}; using compatible queue fallback.`,error);enqueued=await enqueueEnrichment();}
         }

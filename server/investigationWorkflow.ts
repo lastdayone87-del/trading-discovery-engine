@@ -139,12 +139,13 @@ export async function restoreBlockedInvestigationStep(input:{investigationId:str
   const db=await getDb(),client=await db.connect();
   try{
     await client.query('BEGIN');
-    const step=await client.query(`SELECT s.id,s.investigation_id,s.state,s.attempt_count,s.policy_version,i.state investigation_state FROM investigation_steps s JOIN investigations i ON i.id=s.investigation_id WHERE s.id=$1 AND s.investigation_id=$2 AND s.job_id=$3 FOR UPDATE OF s,i`,[input.stepId,input.investigationId,input.jobId]);
+    const step=await client.query(`SELECT s.id,s.investigation_id,s.state,s.attempt_count,s.policy_version,i.state investigation_state,j.status job_status FROM investigation_steps s JOIN investigations i ON i.id=s.investigation_id JOIN jobs j ON j.id=s.job_id WHERE s.id=$1 AND s.investigation_id=$2 AND s.job_id=$3 FOR UPDATE OF s,i,j`,[input.stepId,input.investigationId,input.jobId]);
     if(!step.rowCount){await client.query('COMMIT');return;}
     const row=step.rows[0];
     // Only the retry this call just restored may be rolled back. A worker that
-    // has started it (RUNNING) or another retry that completed it owns the step.
-    if(row.state!=='RETRYING'){await client.query('COMMIT');return;}
+    // has started it (RUNNING), another retry that completed it, or another
+    // caller that already reopened the job owns the work now.
+    if(row.state!=='RETRYING'||row.job_status!=='FAILED'){await client.query('COMMIT');return;}
     const attempt=Number(row.attempt_count||0)+1;
     if(['COMPLETED','NEEDS_REVIEW','POLICY_REJECTED','SUPERSEDED'].includes(row.investigation_state)){
       // The investigation became terminal while this retry was being admitted.
