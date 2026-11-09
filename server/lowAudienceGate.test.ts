@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseSubscriberCountNumber, evaluateLowAudienceGate, sanitizeSubscriberCountText, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
+import { parseSubscriberCountNumber, evaluateLowAudienceGate, sanitizeSubscriberCountText, shouldReclassifyPreservedCompletedChannel, shouldStopDeepInspectionForForcedPass } from './lowAudienceGate';
 
 const root = process.cwd();
 const read = (p: string) => fs.readFileSync(path.join(root, p), 'utf8');
@@ -174,4 +174,10 @@ test('confirmed excluded creators reach the claim gate instead of the audience s
   const source = read('server/investigationWorkflow.ts');
   assert.match(source, /countryPreemptsAudience/);
   assert.match(source, /findCountryExclusion\(row\.country/);
+});
+
+test('the bounded Discord pass evaluates evidence but never pays for another crawl on a low-audience channel', () => {
+  assert.equal(shouldStopDeepInspectionForForcedPass(true, '12'), true);
+  assert.equal(shouldStopDeepInspectionForForcedPass(true, '1200'), false);
+  assert.equal(shouldStopDeepInspectionForForcedPass(false, '12'), false);
 });

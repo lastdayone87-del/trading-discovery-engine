@@ -39,7 +39,7 @@ import { recordReviewEligibilityShadow } from './reviewEligibility/store';
 import { evaluateReviewEligibilityV2, resolveReviewProviderDegraded } from './reviewEligibility/policy';
 import { shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldRevalidateConfirmedCountry, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
 import { CANDIDATE_TRIAGE_POLICY_VERSION, hasIndependentTradingHypothesis, triageAutonomousSearchCandidate } from './candidateTriage';
-import { evaluateLowAudienceGate, parseSubscriberCountNumber, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
+import { evaluateLowAudienceGate, parseSubscriberCountNumber, shouldReclassifyPreservedCompletedChannel, shouldStopDeepInspectionForForcedPass } from './lowAudienceGate';
 import { validatedDiscordEvidenceInvite } from './discordEvidence';
 import { shouldReactivateCommunityRecovery, reactivateCommunityRecovery } from './communityRecovery';
 import { maybeRunDiscoveryEvidenceExtraction } from './discovery/evidencePipeline';
@@ -1125,6 +1125,35 @@ async function processChannelThroughPipelineInContext(
       discordStatus: authoritativeChannel.discord_status,
       discordInvite: authoritativeChannel.discord_invite ?? null,
       channelRecord: authoritativeChannel
+    };
+  }
+
+  // The bounded Discord pass evaluated complete available evidence, but a
+  // known low-audience channel must not pay for another deep inspection or
+  // Discord crawl. Persist the classification result and stop here.
+  if (existing && shouldStopDeepInspectionForForcedPass(options?.forceClassification === true, candidate.subscriberCount)) {
+    existing.country_status = countryVal.status;
+    existing.country = creatorCountry;
+    existing.confidence_score = countryVal.score;
+    existing.trading_status = tradingVal.status;
+    existing.trading_confidence_score = tradingVal.confidenceScore;
+    existing.trading_category = tradingVal.category;
+    existing.trading_relevance_breakdown = tradingVal.breakdown;
+    existing.scan_status = tradingVal.status === 'NEEDS_REVIEW' ? 'NEEDS_REVIEW' : 'COMPLETED';
+    existing.last_checked = now;
+    applyCandidateObservability(existing, candidate);
+    await upsertChannel(existing, { preserveDiscordOnUpdate: true });
+    return {
+      channelId: candidate.channelId,
+      channelName: candidate.channelName,
+      isNew: false,
+      wasKnown: true,
+      persisted: true,
+      countryStatus: existing.country_status,
+      tradingStatus: existing.trading_status,
+      discordStatus: existing.discord_status,
+      discordInvite: existing.discord_invite ?? null,
+      channelRecord: existing,
     };
   }
 
