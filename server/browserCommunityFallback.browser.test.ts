@@ -951,3 +951,22 @@ test('real DOM: the only shadow host after the element bound still reports a gap
       'the post-bound invite is not read; the truncation flag is what keeps coverage honest');
   });
 });
+
+test('real DOM: M2b never clicks form submission/reset or download controls', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  await withControlPage(`<!doctype html><html><body>
+    <form><button>Join our community</button></form>
+    <form><button type="submit">Join our community</button></form>
+    <form><button type="reset">Reset our community</button></form>
+    <form><button type="button">Join our community</button></form>
+    <a href="https://discord.gg/room" download>Join our community</a>
+    <a href="https://discord.gg/room">Join our community</a>
+  </body></html>`, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(enumeration.total, 6);
+    assert.equal(enumeration.controls.length, 2, 'only non-submitting button and ordinary anchor remain clickable');
+    assert.equal(enumeration.opaqueInteractiveControls, 4, 'three form submit/reset controls plus the download link are unsafe surfaces');
+    assert.deepEqual(enumeration.controls.map(control => control.tag).sort(), ['anchor', 'button']);
+    assert.ok(enumeration.controls.some(control => control.tag === 'button' && control.text.includes('Join our community')));
+    assert.ok(enumeration.controls.some(control => control.tag === 'anchor'));
+  });
+});

@@ -143,9 +143,10 @@ export interface BrowserFallbackTelemetry {
   /** Revealed same-origin navigation candidates left unqueued or unvisited by
    * the bounded page budget. Counted as a bounded gap, not a clean run. */
   revealedSameOriginDropped?: number;
-  /** Control elements with no text, accessible label, href, or structural
-   * disclosure. Their content cannot be inspected without visual recognition;
-   * recorded so an opaque control can never be certified as a clean absence. */
+  /** Control elements that cannot be safely clicked: opaque icon-only
+   * controls, form submission/reset controls, and download links. Their
+   * content cannot be inspected without an unsafe interaction; recorded so
+   * they can never be certified as a clean absence. */
   opaqueInteractiveControls?: number;
   frameCount?: number;
   /** Open shadow roots observed in the light DOM. */
@@ -1436,6 +1437,28 @@ export function enumerateRenderedControlNodes(
       || style.visibility === 'hidden';
     const disabledControl = (element as HTMLButtonElement).disabled === true
       || element.getAttribute('aria-disabled') === 'true';
+    // M2b: a click must never submit/reset a form or trigger a download.
+    // These controls can mutate server state or leave the document without
+    // revealing inspectable content, so they are counted as unsafe
+    // interaction surfaces (never a clean absence) and excluded from clicks.
+    const associatedForm = (element as HTMLButtonElement).form
+      || (element as HTMLInputElement).form
+      || element.closest('form');
+    const controlType = (element.getAttribute('type') || '').trim().toLowerCase();
+    const submitsOrResetsForm = !!associatedForm && (
+      (tagName === 'button' && (controlType === '' || controlType === 'submit' || controlType === 'reset'))
+      || (tagName === 'input' && (controlType === 'submit' || controlType === 'image' || controlType === 'reset'))
+    );
+    const downloadsFile = tagName === 'a' && element.hasAttribute('download');
+    if (submitsOrResetsForm || downloadsFile) {
+      // Count only unsafe controls that would otherwise have been clicked;
+      // a generic newsletter/reset control not matching the hint/structural
+      // policy is not a coverage gap.
+      if (!hiddenControl && !disabledControl && (hintMatchedControl || isDisclosure)) {
+        opaqueInteractiveControls++;
+      }
+      continue;
+    }
     if (interactiveControl && !hiddenControl && !disabledControl && !hintMatchedControl && !isDisclosure && !openSummary && !hasAccessibleEvidence) {
       opaqueInteractiveControls++;
     }
