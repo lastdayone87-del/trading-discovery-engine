@@ -77,6 +77,26 @@ test('completed query runs are never reopened by lifecycle reconciliation', () =
   });
 });
 
+test('a deferred run keeps ownership of its completed page job', () => {
+  for (const continuationStatus of ['DEFERRED_QUOTA', 'DEFERRED_TIME']) {
+    assert.deepEqual(decideQueryRunJobLifecycle({
+      queryRunStatus: 'RUNNING',
+      jobStatus: 'COMPLETED',
+      jobLastError: null,
+      jobRunAfter: null,
+      jobCompletedAt: '2026-08-23T08:00:00.000Z',
+      now: '2026-08-23T09:00:00.000Z',
+      continuationStatus,
+      deferredUntil: '2026-08-23T10:00:00.000Z',
+    }), {
+      action: 'NOOP',
+      queryRunStatus: 'RUNNING',
+      releaseReservation: false,
+      reasonCode: 'DEFERRED_RUN_WAITING_FOR_RESUME',
+    });
+  }
+});
+
 test('a completed job inside the finalization grace window leaves the run active', () => {
   assert.deepEqual(decideQueryRunJobLifecycle({
     queryRunStatus: 'RUNNING',

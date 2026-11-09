@@ -773,6 +773,11 @@ test('Q3: derived consecutive failures drive lifecycle backoff; provider failure
     failed('2026-01-01T00:10:00.000Z', 'ORPHANED_FAILED_JOB_STATE'),
     failed('2026-01-01T00:05:00.000Z', 'INVALID_QUERY'),
   ], now), { consecutiveFailures: 0, backoffUntil: null });
+  // A completed job that lost its finalizer is the same operational class.
+  assert.deepEqual(deriveQueryFailureState([
+    failed('2026-01-01T00:10:00.000Z', 'ORPHANED_COMPLETED_JOB_STATE'),
+    failed('2026-01-01T00:05:00.000Z', 'INVALID_QUERY'),
+  ], now), { consecutiveFailures: 0, backoffUntil: null });
   assert.deepEqual(deriveQueryFailureState([
     { status: 'COMPLETED', completedAt: '2026-01-01T00:10:00.000Z', failureKind: null },
     failed('2026-01-01T00:05:00.000Z', 'INVALID_QUERY'),

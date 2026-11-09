@@ -36,8 +36,15 @@ test('Stage 4 PostgreSQL: continuation segment links parent and child without a 
        VALUES($1,'FR','EXPERIMENTAL','GENERAL',$1) RETURNING id`, [suffix]
     )).rows[0].id;
     parentId = (await db.query(
-      `INSERT INTO query_runs(query_id,country,source,status,selection_strategy,selection_reason,retrieval_lane,search_ordering,provider_key,continuation_segment)
-       VALUES($1,'FR','automated_query','RUNNING','BASELINE','continuation test','VIDEO','RELEVANCE','youtube-search',0) RETURNING id`, [queryId]
+      `INSERT INTO query_runs(query_id,country,source,status,selection_strategy,selection_reason,retrieval_lane,search_ordering,provider_key,retrieval_surface,provider_capability,cost_domain,provider_allocation_snapshot,continuation_segment)
+       VALUES($1,'FR','automated_query','RUNNING','BASELINE','continuation test','VIDEO','RELEVANCE','youtube-search','YOUTUBE_NATIVE','SEARCH_YOUTUBE','YOUTUBE_DATA_API',$2::jsonb,0) RETURNING id`,
+      [queryId, JSON.stringify({
+        providerKey: 'youtube-search',
+        retrievalSurface: 'YOUTUBE_NATIVE',
+        capability: 'SEARCH_YOUTUBE',
+        costDomain: 'YOUTUBE_DATA_API',
+        continuationOwner: 'PHASE_9',
+      })]
     )).rows[0].id;
 
     const segment = await createContinuationRunSegment({

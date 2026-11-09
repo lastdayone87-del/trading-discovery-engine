@@ -111,7 +111,7 @@ export function deriveQueryFailureState(
 
 export function classifyQueryBackoff(failureKind: string | undefined, now = new Date()): { failures: 0 | 1 | 2 | 3; backoffUntil: string | null; reasonCodes: string[] } {
   if (!failureKind) return { failures: 0, backoffUntil: null, reasonCodes: [] };
-  if (failureKind === 'PROVIDER_FAILURE' || failureKind === 'PROVIDER_CAPACITY' || failureKind === 'ORPHANED_FAILED_JOB_STATE') {
+  if (failureKind === 'PROVIDER_FAILURE' || failureKind === 'PROVIDER_CAPACITY' || failureKind === 'ORPHANED_FAILED_JOB_STATE' || failureKind === 'ORPHANED_COMPLETED_JOB_STATE') {
     // Provider/orchestration failure is not query negative quality: no query
     // backoff. A job row that vanished is infrastructure state, not a signal
     // that the query text itself is bad.

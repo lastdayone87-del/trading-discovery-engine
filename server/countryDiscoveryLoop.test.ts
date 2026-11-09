@@ -1444,7 +1444,8 @@ test('P17: the 50-page safety ceiling preserves a resumable linked segment', () 
   assert.ok(segmentFnStart >= 0 && segmentFnEnd > segmentFnStart);
   const segmentFn = dbCore.slice(segmentFnStart, segmentFnEnd);
   assert.doesNotMatch(segmentFn, /runQuotaBudgetUnits/);
-  assert.match(segmentFn, /'SCHEDULED',now\(\),0,\$2,\$3,0,0,'RUNNING',\$4,\$1,\$5,requested_page_depth/);
+  assert.match(segmentFn, /'SCHEDULED',now\(\),0,\$2,\$3,0,0,'RUNNING',\$4,\$1::text,\$5,requested_page_depth/);
+  assert.match(segmentFn, /FROM query_runs WHERE id=\$6::uuid RETURNING id/);
   // The parent stays active until its real completion. Marking it COMPLETED
   // inside segment creation would make completeQueryRun a silent no-op and
   // permanently strand the child when enqueue later fails.

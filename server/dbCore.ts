@@ -49,7 +49,7 @@ import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, providerSnapshotFromRegistry
 import { fingerprintYouTubeKey, projectYouTubeQuotaUsage } from './youtubeQuotaAttribution';
 import { sanitizeSchedulingError, type DiscoveryCandidateDiagnosticPatch } from './discoveryTelemetry';
 import { classifyProviderCapacityFailure, classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
-import { decideQueryRunJobLifecycle, type QueryJobLifecycleStatus, type QueryRunLifecycleStatus } from './queryRunJobLifecycle';
+import { COMPLETED_JOB_FINALIZATION_GRACE_MINUTES, decideQueryRunJobLifecycle, type QueryJobLifecycleStatus, type QueryRunLifecycleStatus } from './queryRunJobLifecycle';
 import { createBriefCache } from './briefCache';
 import { CLASSIFICATION_JOB_TYPE, resolveClassificationDecouplingConfig, resolveSearchWorkerCount, type ClassificationBackpressureState } from './classificationDecoupling';
 import type { SelectionExperimentObservation } from './querySelectionExperiments';
@@ -2061,9 +2061,25 @@ export async function getInFlightPrimaryTermUsage(country:string|undefined,since
  * and the query_library reservation both need this same exclusion; without it
  * the selector repeatedly picks a query that the reservation SQL must reject.
  */
-export async function getActiveQueryRunQueryIds(country?:string):Promise<number[]>{
+export async function getActiveQueryRunQueryIds(country?:string,completedJobGraceMinutes=COMPLETED_JOB_FINALIZATION_GRACE_MINUTES):Promise<number[]>{
   const db=await getDb();
-  const res=await db.query(`SELECT DISTINCT query_id FROM query_runs WHERE query_id IS NOT NULL AND status IN ('SCHEDULED','RUNNING','RETRYING') AND ($1::text IS NULL OR LOWER(country)=LOWER($1))`,[country||null]);
+  // Exclude a completed-job orphan that is past its finalization grace window
+  // and is not a deliberate quota/time deferral. The selector must let that
+  // query reach lifecycle reconciliation; otherwise the active-run gate hides
+  // the only path that can close the orphan. A deferred run stays in this set:
+  // the resume sweep owns it and its saved cursor.
+  const res=await db.query(`SELECT DISTINCT qr.query_id
+    FROM query_runs qr
+    LEFT JOIN jobs j ON j.id=qr.job_id
+    WHERE qr.query_id IS NOT NULL
+      AND qr.status IN ('SCHEDULED','RUNNING','RETRYING')
+      AND ($1::text IS NULL OR LOWER(qr.country)=LOWER($1))
+      AND NOT (
+        COALESCE(j.status,'')='COMPLETED'
+        AND j.completed_at IS NOT NULL
+        AND j.completed_at < now() - ($2::text || ' minutes')::interval
+        AND COALESCE(qr.continuation_status,'') NOT LIKE 'DEFERRED_%'
+      )`,[country||null,String(Math.max(1,completedJobGraceMinutes))]);
   return res.rows.map((r:any)=>Number(r.query_id)).filter((id:number)=>Number.isFinite(id));
 }
 /** Consecutive terminal query failures, newest first, with provider failures exempt. */
@@ -3517,7 +3533,8 @@ export interface QueryRunJobLifecycleReconciliation {
 export async function reconcileQueryRunJobLifecycleForQuery(client: any, queryId: number): Promise<QueryRunJobLifecycleReconciliation> {
   const result = await client.query(`
     SELECT qr.id AS query_run_id, qr.query_id, qr.status AS query_run_status,
-           qr.error AS query_run_error, j.id AS job_id, j.status AS job_status,
+           qr.error AS query_run_error, qr.continuation_status, qr.deferred_until,
+           j.id AS job_id, j.status AS job_status,
            j.attempts, j.max_attempts, j.last_error, j.run_after,
            j.completed_at AS job_completed_at
     FROM query_runs qr
@@ -3541,6 +3558,8 @@ export async function reconcileQueryRunJobLifecycleForQuery(client: any, queryId
       jobRunAfter: row.run_after,
       jobCompletedAt: row.job_completed_at,
       now: new Date().toISOString(),
+      continuationStatus: row.continuation_status,
+      deferredUntil: row.deferred_until,
     });
 
     if (decision.action === 'ALIGN_RETRY_WAIT') {
