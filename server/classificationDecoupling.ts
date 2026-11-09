@@ -156,11 +156,10 @@ export function classificationDayBucket(now: number = Date.now()): string {
 }
 
 /**
- * Enrichment identity is stage- and day-scoped. A completed pass must not be
- * reopened by ordinary rediscovery later the same day, while a new day can
- * legitimately request fresh evidence. Failed work keeps its normal retry path.
- * Ordinary discovery pairs this key with preventCompletedReopen; an explicit
- * operator recheck uses a fresh recheck key instead.
+ * Ordinary enrichment identity is stable per channel and stage. Rediscovery
+ * can never create a second active job or reopen a completed pass; a new
+ * stage (or an explicit operator recheck) is the only way to request more
+ * work. Ordinary discovery pairs this key with preventCompletedReopen.
  */
 export function enrichmentJobIdempotencyKey(
   channelId: string,
@@ -171,7 +170,7 @@ export function enrichmentJobIdempotencyKey(
   const base = `enrich:${channelId}:stage:${Math.max(1, Math.floor(stage) || 1)}`;
   return options.explicitRecheck
     ? `${base}:recheck:${Math.floor(options.recheckNonce ?? now)}`
-    : `${base}:${classificationDayBucket(now)}`;
+    : base;
 }
 
 /**

@@ -120,13 +120,12 @@ test('day-bucketed idempotency key is stable within a UTC day and changes next d
   assert.notEqual(classificationJobIdempotencyKey('chan-1', Date.UTC(2026, 10, 8, 0, 0, 1)), classificationJobIdempotencyKey('chan-1', morning));
 });
 
-test('enrichment idempotency is stable within a day, stage-scoped, and changes next day', () => {
+test('ordinary enrichment identity is stable per stage across days; explicit rechecks get fresh keys', () => {
   const morning = Date.UTC(2026, 10, 7, 1, 0, 0);
-  const evening = Date.UTC(2026, 10, 7, 23, 59, 0);
-  assert.equal(enrichmentJobIdempotencyKey('chan-1', 1, morning), 'enrich:chan-1:stage:1:2026-11-07');
-  assert.equal(enrichmentJobIdempotencyKey('chan-1', 1, evening), enrichmentJobIdempotencyKey('chan-1', 1, morning));
+  const nextDay = Date.UTC(2026, 10, 8, 1, 0, 0);
+  assert.equal(enrichmentJobIdempotencyKey('chan-1', 1, morning), 'enrich:chan-1:stage:1');
+  assert.equal(enrichmentJobIdempotencyKey('chan-1', 1, nextDay), 'enrich:chan-1:stage:1');
   assert.notEqual(enrichmentJobIdempotencyKey('chan-1', 2, morning), enrichmentJobIdempotencyKey('chan-1', 1, morning));
-  assert.notEqual(enrichmentJobIdempotencyKey('chan-1', 1, Date.UTC(2026, 10, 8, 0, 0, 1)), enrichmentJobIdempotencyKey('chan-1', 1, morning));
   assert.equal(
     enrichmentJobIdempotencyKey('chan-1', 1, morning, { explicitRecheck: true, recheckNonce: 42 }),
     'enrich:chan-1:stage:1:recheck:42',
