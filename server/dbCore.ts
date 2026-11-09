@@ -3170,6 +3170,14 @@ export async function enqueueJob(type:string,payload:any,opts:{priority?:number;
   }
   throw new Error('JOB_ENQUEUE_LOST_ROW');
 }
+/** Exact durable owner of an idempotency key, including terminal rows. */
+export async function getJobByIdempotencyKey(idempotencyKey: string): Promise<DurableJob | null> {
+  if (!idempotencyKey) return null;
+  const db = await getDb();
+  const res = await db.query('SELECT * FROM jobs WHERE idempotency_key=$1 LIMIT 1', [idempotencyKey]);
+  return res.rows[0] ? rowToJob(res.rows[0]) : null;
+}
+
 function rowToJob(r:any):DurableJob{return {id:r.id,type:r.type,status:r.status,payload:parseJson(r.payload,{}),attempts:r.attempts,max_attempts:r.max_attempts,run_after:iso(r.run_after)||'',locked_by:r.locked_by,locked_at:iso(r.locked_at),last_error:r.last_error,created_at:iso(r.created_at)||'',reopen_generation:r.reopen_generation==null?0:Number(r.reopen_generation)};}
 export async function claimNextJob(workerId:string,types?:string[],excludedErrorPatterns?:string[],excludedReconciliationStatuses?:string[],budgetGuards:ClaimBudgetGuard[]=[]):Promise<DurableJob|null>{const db=await getDb(); const client=await db.connect(); let claimed:DurableJob|null=null;try{await client.query('BEGIN');
     // Single priority-preserving claim loop: always consider the globally

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { resolveEnrichmentReopenBlockedLifecycle, resolveTerminalEnrichmentFailure, resolveUncertainLifecycle } from './enrichmentLifecycle';
+import { resolveEnrichmentReopenBlockedLifecycle, resolveExistingEnrichmentAction, resolveTerminalEnrichmentFailure, resolveUncertainLifecycle } from './enrichmentLifecycle';
 import { evaluateReviewEligibilityV2 } from './reviewEligibility/policy';
 
 const base={classificationStatus:'UNCERTAIN',investigationState:'UNRESOLVED',plausibleTradingHypothesis:true,evidenceSufficient:true,independentEvidence:true,countryAllowed:true,operationalFailure:false,providerDegraded:false,unsupportedLanguage:false,terminalDecision:false};
@@ -102,4 +102,16 @@ test('a blocked completed enrichment re-open cannot leave an orphan ENRICHMENT_P
     resolveEnrichmentReopenBlockedLifecycle({ scan_status: 'COMPLETED', trading_status: 'TRADING_CONFIRMED' }, { blockedJobStatus: 'COMPLETED' }),
     { scanStatus: 'COMPLETED', tradingStatus: 'TRADING_CONFIRMED' },
   );
+});
+
+test('workflow scheduling reuses the stable channel/stage owner instead of creating a second job', () => {
+  assert.equal(resolveExistingEnrichmentAction('PENDING'), 'REUSE_ACTIVE');
+  assert.equal(resolveExistingEnrichmentAction('PROCESSING'), 'REUSE_ACTIVE');
+  assert.equal(resolveExistingEnrichmentAction('COMPLETED'), 'PROJECT_TERMINAL');
+  assert.equal(resolveExistingEnrichmentAction('FAILED'), 'RETRY_FAILED');
+  assert.equal(resolveExistingEnrichmentAction(null), 'SCHEDULE_WORKFLOW');
+  assert.equal(resolveExistingEnrichmentAction(undefined), 'SCHEDULE_WORKFLOW');
+  // A failed lookup must not schedule a second key; the ordinary enqueue is idempotent.
+  assert.equal(resolveExistingEnrichmentAction('PENDING', true), 'RETRY_FAILED');
+  assert.equal(resolveExistingEnrichmentAction(null, true), 'RETRY_FAILED');
 });
