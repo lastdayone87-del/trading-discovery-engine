@@ -290,6 +290,78 @@ async function validateCountryWithHydration(
   return countryVal;
 }
 
+export interface ConfirmedCountryRevalidationResult {
+  countryUpdated: boolean;
+  rejectionApplied: boolean;
+}
+
+export interface ConfirmedCountryRevalidationDeps {
+  hydrate?: (
+    candidate: IngestionCandidate,
+    existing: ChannelRecord,
+    targetCountry: string,
+    now: string,
+  ) => Promise<ValidationResult>;
+}
+
+/**
+ * Country-only revalidation for a preserved TRADING_CONFIRMED row. Trading
+ * classification is never re-run; the function gathers country evidence,
+ * applies the rejection projection, and reports whether the row changed.
+ * Quota policy/accounting failures propagate to the caller's retry lifecycle.
+ */
+export async function revalidateConfirmedCountryForPreservedRow(
+  candidate: IngestionCandidate,
+  existing: ChannelRecord,
+  targetCountry: string,
+  now: string,
+  deps: ConfirmedCountryRevalidationDeps = {},
+): Promise<ConfirmedCountryRevalidationResult> {
+  try {
+    // Search results can be sparse. Use the same official metadata and public
+    // About hydration as Gate 1 before preserving the confirmed trading
+    // decision; only trading classification is skipped.
+    const hydrate = deps.hydrate
+      || ((input: IngestionCandidate, row: ChannelRecord, country: string, at: string) =>
+        validateCountryWithHydration(input, row, country, at, { includeAudience: false }));
+    const countryCheck = await hydrate(candidate, existing, targetCountry, now);
+    applyCandidateObservability(existing, candidate);
+    if (countryCheck.status === 'REJECTED' && countryCheck.detectedCreatorCountry) {
+      applyGate1CountryRejectionToExisting(existing, {
+        creatorCountry: countryCheck.detectedCreatorCountry,
+        score: countryCheck.score,
+        validationStep: {
+          step: 'COUNTRY_VALIDATION',
+          title: `Country Validation (${countryCheck.detectedCreatorCountry})`,
+          status: 'REJECTED',
+          details: countryCheck.decisionLogs,
+          timestamp: now,
+        },
+        now,
+      }, candidate);
+      return { countryUpdated: true, rejectionApplied: true };
+    }
+    if ((countryCheck.status === 'CONFIRMED' || countryCheck.status === 'LIKELY') && countryCheck.detectedCreatorCountry) {
+      existing.country = countryCheck.detectedCreatorCountry;
+      existing.country_status = countryCheck.status;
+      existing.confidence_score = countryCheck.score;
+    }
+    return { countryUpdated: true, rejectionApplied: false };
+  } catch (error) {
+    // Probe/quota policy and accounting failures are not evidence failures:
+    // propagating them keeps the caller's retry lifecycle and prevents a paid
+    // request from being silently replayed elsewhere.
+    if (error instanceof OfficialYouTubeQuotaFenceError
+      || error instanceof YouTubeKeyCapUnavailableError
+      || isProbeQuotaControlError(error)
+      || isYouTubeQuotaAccountingError(error)) {
+      throw error;
+    }
+    console.warn(`[Unified Ingestion Pipeline] Confirmed-country revalidation failed for ${candidate.channelId}; preserving confirmed row:`, error instanceof Error ? error.message : error);
+    return { countryUpdated: false, rejectionApplied: false };
+  }
+}
+
 export async function processChannelThroughPipeline(
   candidate: IngestionCandidate,
   targetCountry: string,
@@ -374,58 +446,23 @@ async function processChannelThroughPipelineInContext(
         ? { countryStatus: existing.country_status, country: existing.country }
         : undefined;
       if (countryRevalidation) {
-        try {
-          // Search results can be sparse. Use the same official metadata and
-          // public About hydration as Gate 1 before preserving the confirmed
-          // trading decision; only trading classification is skipped.
-          const countryCheck = await validateCountryWithHydration(candidate, existing, targetCountry, now, { includeAudience: false });
-          applyCandidateObservability(existing, candidate);
-          confirmedCountryUpdated = true;
-          if (countryCheck.status === 'REJECTED' && countryCheck.detectedCreatorCountry) {
-            applyGate1CountryRejectionToExisting(existing, {
-              creatorCountry: countryCheck.detectedCreatorCountry,
-              score: countryCheck.score,
-              validationStep: {
-                step: 'COUNTRY_VALIDATION',
-                title: `Country Validation (${countryCheck.detectedCreatorCountry})`,
-                status: 'REJECTED',
-                details: countryCheck.decisionLogs,
-                timestamp: now,
-              },
-              now,
-            }, candidate);
-            await upsertChannel(existing, countryPolicySnapshot ? { requireCountrySnapshot: countryPolicySnapshot } : undefined);
-            return {
-              channelId: candidate.channelId,
-              channelName: candidate.channelName,
-              isNew: false,
-              wasKnown: true,
-              persisted: true,
-              countryStatus: existing.country_status,
-              tradingStatus: existing.trading_status,
-              discordStatus: existing.discord_status,
-              discordInvite: existing.discord_invite || null,
-              channelRecord: existing,
-              skippedTerminalState: true,
-            };
-          }
-          if ((countryCheck.status === 'CONFIRMED' || countryCheck.status === 'LIKELY') && countryCheck.detectedCreatorCountry) {
-            existing.country = countryCheck.detectedCreatorCountry;
-            existing.country_status = countryCheck.status;
-            existing.confidence_score = countryCheck.score;
-            confirmedCountryUpdated = true;
-          }
-        } catch (error) {
-          // Probe/quota policy and accounting failures are not evidence
-          // failures: propagating them keeps the caller's retry lifecycle and
-          // prevents a paid request from being silently replayed elsewhere.
-          if (error instanceof OfficialYouTubeQuotaFenceError
-            || error instanceof YouTubeKeyCapUnavailableError
-            || isProbeQuotaControlError(error)
-            || isYouTubeQuotaAccountingError(error)) {
-            throw error;
-          }
-          console.warn(`[Unified Ingestion Pipeline] Confirmed-country revalidation failed for ${candidate.channelId}; preserving confirmed row:`, error instanceof Error ? error.message : error);
+        const revalidation = await revalidateConfirmedCountryForPreservedRow(candidate, existing, targetCountry, now);
+        confirmedCountryUpdated = revalidation.countryUpdated;
+        if (revalidation.rejectionApplied) {
+          await upsertChannel(existing, countryPolicySnapshot ? { requireCountrySnapshot: countryPolicySnapshot } : undefined);
+          return {
+            channelId: candidate.channelId,
+            channelName: candidate.channelName,
+            isNew: false,
+            wasKnown: true,
+            persisted: true,
+            countryStatus: existing.country_status,
+            tradingStatus: existing.trading_status,
+            discordStatus: existing.discord_status,
+            discordInvite: existing.discord_invite || null,
+            channelRecord: existing,
+            skippedTerminalState: true,
+          };
         }
       }
       const refreshedAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount);
