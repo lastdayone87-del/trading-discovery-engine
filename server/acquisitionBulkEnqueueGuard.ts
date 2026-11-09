@@ -26,10 +26,12 @@ import { bumpBulkEnqueueGuardBlock, bumpBulkEnqueueWarning } from './operationsT
 export const BULK_ENQUEUE_GUARD_ENABLED_ENV = 'ACQUISITION_BULK_ENQUEUE_GUARD_ENABLED';
 export const BULK_ENQUEUE_MAX_PER_TRANSACTION_ENV = 'ACQUISITION_BULK_ENQUEUE_MAX_PER_TRANSACTION';
 export const BULK_ENQUEUE_MAX_PER_HOUR_ENV = 'ACQUISITION_BULK_ENQUEUE_MAX_PER_HOUR';
+export const BULK_ENQUEUE_MAX_PER_WINDOW_ENV = 'ACQUISITION_BULK_ENQUEUE_MAX_PER_WINDOW';
 
 /** Always-on warning threshold; not configurable, so a flood is never silent. */
 export const BULK_ENQUEUE_TRANSACTION_WARNING_THRESHOLD = 250;
 export const DEFAULT_BULK_ENQUEUE_MAX_PER_TRANSACTION = 250;
+export const DEFAULT_BULK_ENQUEUE_MAX_PER_WINDOW = 250;
 export const DEFAULT_BULK_ENQUEUE_MAX_PER_HOUR = 500;
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -39,6 +41,10 @@ const MAX_LABEL_LENGTH = 96;
 export interface BulkEnqueueGuardConfig {
   enabled: boolean;
   maxPerTransaction: number;
+  /** Scope-less rolling 60s budget; deliberately independent of the
+   * per-transaction knob so raising an explicit batch cap cannot relax the
+   * process-wide safety net. */
+  maxPerWindow: number;
   maxPerHour: number;
 }
 
@@ -59,6 +65,10 @@ export function resolveBulkEnqueueGuardConfig(env: NodeJS.ProcessEnv = process.e
     maxPerTransaction: boundedCap(
       env[BULK_ENQUEUE_MAX_PER_TRANSACTION_ENV],
       DEFAULT_BULK_ENQUEUE_MAX_PER_TRANSACTION,
+    ),
+    maxPerWindow: boundedCap(
+      env[BULK_ENQUEUE_MAX_PER_WINDOW_ENV],
+      DEFAULT_BULK_ENQUEUE_MAX_PER_WINDOW,
     ),
     maxPerHour: boundedCap(env[BULK_ENQUEUE_MAX_PER_HOUR_ENV], DEFAULT_BULK_ENQUEUE_MAX_PER_HOUR),
   };
@@ -178,9 +188,17 @@ export function admitBulkEnqueue(input: {
   client?: unknown;
   label?: string;
   now?: number;
-  config?: BulkEnqueueGuardConfig;
+  config?: Partial<BulkEnqueueGuardConfig>;
 } = {}): BulkEnqueueGuardDecision {
-  const config = input.config || resolveBulkEnqueueGuardConfig();
+  const config: BulkEnqueueGuardConfig = input.config
+    ? {
+        enabled: false,
+        maxPerTransaction: DEFAULT_BULK_ENQUEUE_MAX_PER_TRANSACTION,
+        maxPerWindow: DEFAULT_BULK_ENQUEUE_MAX_PER_WINDOW,
+        maxPerHour: DEFAULT_BULK_ENQUEUE_MAX_PER_HOUR,
+        ...input.config,
+      }
+    : resolveBulkEnqueueGuardConfig();
   const now = Number.isFinite(input.now) ? Number(input.now) : Date.now();
   const state = transactionStateFor();
   if (state && input.label && !state.labelLocked) state.label = boundedLabel(input.label);
@@ -193,9 +211,9 @@ export function admitBulkEnqueue(input: {
     }
     // Scope-less producers get the same default budget over a rolling 60s
     // window, so the default-off cap is not merely a warning in production.
-    if (!state && scopeLessAdmissions.length >= config.maxPerTransaction) {
+    if (!state && scopeLessAdmissions.length >= config.maxPerWindow) {
       bumpBulkEnqueueGuardBlock('window');
-      return { allowed: false, kind: 'window', used: scopeLessAdmissions.length, limit: config.maxPerTransaction };
+      return { allowed: false, kind: 'window', used: scopeLessAdmissions.length, limit: config.maxPerWindow };
     }
     const cutoff = now - HOUR_MS;
     while (hourAdmissions.length && hourAdmissions[0].at <= cutoff) hourAdmissions.shift();

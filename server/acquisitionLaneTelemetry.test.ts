@@ -414,7 +414,7 @@ test('bulk enqueue guard does not charge a reused database client across calls',
 });
 
 test('scope-less bulk bursts hit the rolling window cap when enabled', () => {
-  const config = { enabled: true, maxPerTransaction: 2, maxPerHour: 100 };
+  const config = { enabled: true, maxPerTransaction: 1000, maxPerWindow: 2, maxPerHour: 100 };
   assert.equal(admitBulkEnqueue({ now: 1_000, config }).allowed, true);
   assert.equal(admitBulkEnqueue({ now: 2_000, config }).allowed, true);
   const blocked = admitBulkEnqueue({ now: 3_000, config });
@@ -432,7 +432,7 @@ test('scoped batches do not consume the scope-less rolling window', async () => 
       assert.equal(admitBulkEnqueue({ now: 1_000 + index, config: scopeConfig }).allowed, true);
     }
   });
-  const config = { enabled: true, maxPerTransaction: 2, maxPerHour: 100 };
+  const config = { enabled: true, maxPerTransaction: 2, maxPerWindow: 2, maxPerHour: 100 };
   assert.equal(admitBulkEnqueue({ now: 2_000, config }).allowed, true);
   assert.equal(admitBulkEnqueue({ now: 3_000, config }).allowed, true);
   assert.equal(admitBulkEnqueue({ now: 4_000, config }).allowed, false, 'only unscoped admissions count toward the window');
@@ -472,15 +472,18 @@ test('bulk guard config parsing is bounded and default-off', () => {
   assert.deepEqual(resolveBulkEnqueueGuardConfig({}), {
     enabled: false,
     maxPerTransaction: 250,
+    maxPerWindow: 250,
     maxPerHour: 500,
   });
   assert.deepEqual(resolveBulkEnqueueGuardConfig({
     ACQUISITION_BULK_ENQUEUE_GUARD_ENABLED: 'true',
     ACQUISITION_BULK_ENQUEUE_MAX_PER_TRANSACTION: '0',
+    ACQUISITION_BULK_ENQUEUE_MAX_PER_WINDOW: '7',
     ACQUISITION_BULK_ENQUEUE_MAX_PER_HOUR: '9999999',
   }), {
     enabled: true,
     maxPerTransaction: 1,
+    maxPerWindow: 7,
     maxPerHour: 1_000_000,
   });
   assert.deepEqual(resolveBulkEnqueueGuardConfig({
@@ -489,6 +492,7 @@ test('bulk guard config parsing is bounded and default-off', () => {
   }), {
     enabled: false,
     maxPerTransaction: 250,
+    maxPerWindow: 250,
     maxPerHour: 500,
   }, 'blank caps must fall back to defaults, never clamp to 1');
 });
