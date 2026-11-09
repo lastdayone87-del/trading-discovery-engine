@@ -51,20 +51,21 @@ export type ExistingEnrichmentAction =
   | 'SCHEDULE_WORKFLOW'
   | 'REUSE_ACTIVE'
   | 'RETRY_FAILED'
-  | 'PROJECT_TERMINAL';
+  | 'PROJECT_TERMINAL'
+  | 'ENQUEUE_IDEMPOTENT';
 
 /**
  * The stable channel/stage key is the single owner of ordinary enrichment.
  * Before the workflow lane creates an investigation step, it must reuse an
  * active job, retry a failed one through the ordinary reopen path, and treat
  * a completed one as terminal. A lookup failure cannot distinguish these
- * states, so it uses the idempotent ordinary enqueue (never a second key).
+ * states, so it uses the idempotent ordinary enqueue without a workflow step.
  */
 export function resolveExistingEnrichmentAction(
   status: string | null | undefined,
   lookupFailed: boolean = false,
 ): ExistingEnrichmentAction {
-  if (lookupFailed) return 'RETRY_FAILED';
+  if (lookupFailed) return 'ENQUEUE_IDEMPOTENT';
   switch (String(status || '').toUpperCase()) {
     case 'PENDING':
     case 'PROCESSING':

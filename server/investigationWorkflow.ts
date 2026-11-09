@@ -123,7 +123,7 @@ export async function retryInvestigationStep(input:{investigationId:string;stepI
     const attempt=Number(row.attempt_count||0)+1;
     // Preserve failure_class: an operational retry needs it to refresh an
     // expired investigation deadline instead of failing the retry.
-    await client.query(`UPDATE investigation_steps SET state='RETRYING',completed_at=NULL,lease_expires_at=NULL,updated_at=now() WHERE id=$1 AND investigation_id=$2 AND state IN ('FAILED','RETRYING','PENDING')`,[input.stepId,input.investigationId]);
+    await client.query(`UPDATE investigation_steps SET state='RETRYING',attempt_count=$3,completed_at=NULL,lease_expires_at=NULL,updated_at=now() WHERE id=$1 AND investigation_id=$2 AND state IN ('FAILED','RETRYING','PENDING')`,[input.stepId,input.investigationId,attempt]);
     await client.query(`UPDATE investigations SET state='ACTIVE',completed_at=NULL,version=version+1,updated_at=now() WHERE id=$1 AND state IN ('ACTIVE','OPERATIONALLY_BLOCKED')`,[input.investigationId]);
     await client.query(`INSERT INTO investigation_events(event_key,investigation_id,step_id,event_type,payload,policy_version) VALUES($1,$2,$3,'STEP_RETRY_REQUESTED',$4,$5) ON CONFLICT(event_key) DO NOTHING`,[`investigation:${input.investigationId}:step:${input.stepId}:attempt:${attempt}:retry-requested`,input.investigationId,input.stepId,JSON.stringify({reason:'ORDINARY_REDISCOVERY_RETRY'}),row.policy_version]);
     await client.query('COMMIT');return true;

@@ -112,6 +112,6 @@ test('workflow scheduling reuses the stable channel/stage owner instead of creat
   assert.equal(resolveExistingEnrichmentAction(null), 'SCHEDULE_WORKFLOW');
   assert.equal(resolveExistingEnrichmentAction(undefined), 'SCHEDULE_WORKFLOW');
   // A failed lookup must not schedule a second key; the ordinary enqueue is idempotent.
-  assert.equal(resolveExistingEnrichmentAction('PENDING', true), 'RETRY_FAILED');
-  assert.equal(resolveExistingEnrichmentAction(null, true), 'RETRY_FAILED');
+  assert.equal(resolveExistingEnrichmentAction('PENDING', true), 'ENQUEUE_IDEMPOTENT');
+  assert.equal(resolveExistingEnrichmentAction(null, true), 'ENQUEUE_IDEMPOTENT');
 });

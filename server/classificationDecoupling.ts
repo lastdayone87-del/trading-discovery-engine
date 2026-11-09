@@ -165,11 +165,11 @@ export function enrichmentJobIdempotencyKey(
   channelId: string,
   stage: number,
   now: number = Date.now(),
-  options: { explicitRecheck?: boolean; recheckNonce?: number } = {},
+  options: { explicitRecheck?: boolean; recheckNonce?: string | number } = {},
 ): string {
   const base = `enrich:${channelId}:stage:${Math.max(1, Math.floor(stage) || 1)}`;
   return options.explicitRecheck
-    ? `${base}:recheck:${Math.floor(options.recheckNonce ?? now)}`
+    ? `${base}:recheck:${typeof options.recheckNonce === 'string' ? options.recheckNonce : Math.floor(options.recheckNonce ?? now)}`
     : base;
 }
 
