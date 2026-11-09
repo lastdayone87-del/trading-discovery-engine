@@ -1207,7 +1207,13 @@ export function enumerateRenderedControlNodes(
       }
     }
     const ariaLabel = element.getAttribute('aria-label') || '';
-    const inputLabel = tagName === 'input'
+    // Only the excluded submit/image/reset inputs need value/alt for coverage
+    // accounting. Adding those labels to every input would turn previously
+    // skipped input buttons (e.g. `<input type="button" value="Subscribe">`)
+    // into new hint-matched click targets.
+    const excludedInputType = tagName === 'input'
+      && ['submit', 'image', 'reset'].includes((element as HTMLInputElement).type);
+    const inputLabel = excludedInputType
       ? `${(element as HTMLInputElement).value || ''} ${(element as HTMLInputElement).alt || ''}`
       : '';
     const baseText = `${element.innerText || ''} ${href || ''} ${ariaLabel} ${inputLabel}`;

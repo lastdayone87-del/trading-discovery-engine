@@ -11,6 +11,7 @@ test('M2b adds no new rendered click class and excludes form/download controls',
   assert.match(source, /effectiveType === 'reset'/);
   assert.match(source, /effectiveType === 'image'/);
   assert.match(source, /inputSubmitLike/);
+  assert.match(source, /excludedInputType/);
   assert.match(source, /inputSubmitLike\n\s*\|\| \(!!associatedForm/);
   assert.match(source, /element\.hasAttribute\('download'\)/);
   assert.match(source, /if \(submitsOrResetsForm \|\| downloadsFile\)/);
