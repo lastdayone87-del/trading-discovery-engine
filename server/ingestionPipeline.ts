@@ -986,7 +986,7 @@ async function processChannelThroughPipelineInContext(
         // able to schedule stage 2 while its own PROCESSING row is still open.
         const active=await db.query(`SELECT 1 FROM jobs WHERE type='ENRICH_CHANNEL' AND status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$1 AND ($2::uuid IS NULL OR id <> $2::uuid) LIMIT 1`,[candidate.channelId,options?.jobId||null]);
         activeEnrichmentJob=Boolean(active.rowCount);
-      }catch{activeEnrichmentJob=true;}
+      }catch(error){activeEnrichmentJob=false;console.warn(`[Enrichment] active-job lookup failed for ${candidate.channelId}; enqueueing defensively:`,error instanceof Error?error.message:error);}
       if(!activeEnrichmentJob){
         // Ordinary rediscovery must not turn a completed enrichment job back
         // into PENDING. The day bucket bounds fresh evidence passes;
