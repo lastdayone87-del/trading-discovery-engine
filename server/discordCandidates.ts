@@ -190,6 +190,7 @@ export function inferDiscordOwnership(candidate:DiscordCandidate,input:{creatorN
 
   if(surfaces.has('YOUTUBE_ABOUT')){score+=90;reasons.push('DIRECT_YOUTUBE_ABOUT');}
   else if(surfaces.has('CHANNEL_EXTERNAL_LINKS')){score+=70;reasons.push('DIRECT_CHANNEL_LINK');}
+  else if(surfaces.has('PINNED_COMMENT')){score+=70;reasons.push('DIRECT_PINNED_COMMENT');}
   else if(surfaces.has('RECENT_VIDEO_DESCRIPTIONS')){score+=65;reasons.push('DIRECT_CREATOR_VIDEO');}
   else if(surfaces.has('SOCIAL_PROFILES')){score+=55;reasons.push('CREATOR_SOCIAL_SURFACE');}
   else if(surfaces.has('CREATOR_WEBSITES')){score+=40;reasons.push('LINKED_WEBSITE_SURFACE');}
@@ -210,7 +211,7 @@ export function inferDiscordOwnership(candidate:DiscordCandidate,input:{creatorN
     .filter(Boolean));
   if(creatorVideoPages.size>=2){score+=15;reasons.push('REPEATED_CREATOR_VIDEO_OBSERVATION');}
 
-  if(surfaces.size>=2&&[...surfaces].some(surface=>surface==='YOUTUBE_ABOUT'||surface==='CHANNEL_EXTERNAL_LINKS'||surface==='RECENT_VIDEO_DESCRIPTIONS')){
+  if(surfaces.size>=2&&[...surfaces].some(surface=>surface==='YOUTUBE_ABOUT'||surface==='CHANNEL_EXTERNAL_LINKS'||surface==='PINNED_COMMENT'||surface==='RECENT_VIDEO_DESCRIPTIONS')){
     score+=15;reasons.push('CROSS_CREATOR_SURFACE_CORROBORATION');
   }
 

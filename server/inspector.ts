@@ -142,7 +142,7 @@ export interface InspectionResult {
   communityIntent?: CommunityIntentEvidence[];
 }
 export type ExternalAcquisitionStatus='FOUND'|'INSPECTED_NO_MATCH'|'PARTIALLY_INSPECTED'|'ACQUISITION_FAILED';
-export type AcquisitionSurface='YOUTUBE_ABOUT'|'RECENT_VIDEO_DESCRIPTIONS'|'CHANNEL_EXTERNAL_LINKS'|'CREATOR_WEBSITES'|'SOCIAL_PROFILES'|'DISCORD_VALIDATION';
+export type AcquisitionSurface='YOUTUBE_ABOUT'|'RECENT_VIDEO_DESCRIPTIONS'|'PINNED_COMMENT'|'CHANNEL_EXTERNAL_LINKS'|'CREATOR_WEBSITES'|'SOCIAL_PROFILES'|'DISCORD_VALIDATION';
 export interface ExternalAcquisitionObservation {requestedUrl:string;finalUrl?:string;wrapperUrl?:string;surface:AcquisitionSurface;required:boolean;outcome:ExternalAcquisitionStatus;retryable:boolean;httpStatus?:number;failureClass?:string;retryAt?:number;detail:string;observedAt:string;telemetry?:CrawlerTelemetry;rootUrl?:string;/** Body-level confirmation from the bounded static 404/410 probe. This is not a skip: the whole seed predicate must also pass. */staticNotFoundBodyConfirmed?:boolean;staticNotFoundBodyReason?:string;/** True only when rendered escalation was actually skipped for this seed; persisted provenance for post-deploy measurement. The observation itself stays FAILED/non-retryable. */staticTerminalNotFound?:boolean;staticTerminalNotFoundReason?:string;/** Lender seed URL when this row references shared same-inspection evidence instead of a direct fetch. The lender inspected the bytes; this row carries no page counters of its own. */sharedEvidenceFrom?:string}
 
 /** Advance per-seed click-window progress by work this inspection actually
@@ -1518,6 +1518,31 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
 
   const step2Logs:string[]=[];const rawLinkCandidates=links.flatMap(link=>{const sources=[link];const destination=youtubeRedirectDestination(link);if(destination)sources.push(destination);return sources.flatMap(text=>extractDiscordCandidates(text,'CHANNEL_EXTERNAL_LINKS',link)).filter(c=>c.nativeInviteCode);});const linkCandidates=mergeDiscordCandidates(rawLinkCandidates,ownershipInput);retainCandidates(linkCandidates);if(links.length){step2Logs.push(`Scanning ${links.length} channel links.`);if(linkCandidates.length){const inviteCodes=linkCandidates.map(candidate=>candidate.nativeInviteCode!).filter(Boolean);step2Logs.push(`${linkCandidates.length} distinct direct Discord candidate(s) retained from channel links.`);step2Logs.push(`Retained invite code${inviteCodes.length===1?'':'s'}: ${inviteCodes.join(', ')}`);for(const candidate of linkCandidates)acquisitionOutcomes.push({requestedUrl:candidate.sourceUrl||candidate.rawLocator,surface:'CHANNEL_EXTERNAL_LINKS',required:true,outcome:'FOUND',retryable:false,detail:'Discord invite discovered in channel links',observedAt:now});addStep('EXTERNAL_LINKS','Step 2 — Channel External Links','FOUND',step2Logs,linkCandidates[0].nativeInviteCode||null,'CHANNEL_LINKS',inviteCodes);}else{step2Logs.push('No direct Discord invite found in channel links.');addStep('EXTERNAL_LINKS','Step 2 — Channel External Links','NOT_FOUND',step2Logs);}}else addStep('EXTERNAL_LINKS','Step 2 — Channel External Links','SKIPPED',['No channel links found.']);
 
+  // L1: the pinned comment is creator-curated channel text, distinct from
+  // channel links and video descriptions. Direct invites retain PINNED_COMMENT
+  // as their source surface, and URLs found in the comment enter the normal
+  // crawl/ranking pipeline with PINNED_COMMENT provenance.
+  const pinnedComment=String(channelData.pinnedComment||'').trim();
+  const stepPinnedLogs:string[]=[];
+  const pinnedCandidates:DiscordCandidate[]=[];
+  if(pinnedComment){
+    stepPinnedLogs.push(`Scanning pinned comment (${pinnedComment.length} characters).`);
+    const candidates=extractDiscordCandidates(pinnedComment,'PINNED_COMMENT',`youtube:channel:${channelData.channelId}:pinned-comment`).filter(c=>c.nativeInviteCode);
+    pinnedCandidates.push(...candidates);
+    addExternalUrls(pinnedComment,'PINNED_COMMENT');
+    retainCandidates(pinnedCandidates);
+    if(pinnedCandidates.length){
+      const inviteCodes=pinnedCandidates.map(candidate=>candidate.nativeInviteCode!).filter(Boolean);
+      stepPinnedLogs.push(`${pinnedCandidates.length} distinct direct Discord candidate(s) retained from the pinned comment.`);
+      stepPinnedLogs.push(`Retained invite code${inviteCodes.length===1?'':'s'}: ${inviteCodes.join(', ')}`);
+      for(const candidate of pinnedCandidates)acquisitionOutcomes.push({requestedUrl:candidate.sourceUrl||candidate.rawLocator,surface:'PINNED_COMMENT',required:true,outcome:'FOUND',retryable:false,detail:'Discord invite discovered in pinned YouTube comment',observedAt:now});
+      addStep('PINNED_COMMENT','Step 2b — Pinned YouTube Comment','FOUND',stepPinnedLogs,pinnedCandidates[0].nativeInviteCode||null,'PINNED_COMMENT',inviteCodes);
+    }else{
+      stepPinnedLogs.push('No direct Discord invite found in the pinned comment; any embedded links continue through normal crawl ranking.');
+      addStep('PINNED_COMMENT','Step 2b — Pinned YouTube Comment','NOT_FOUND',stepPinnedLogs);
+    }
+  }else addStep('PINNED_COMMENT','Step 2b — Pinned YouTube Comment','SKIPPED',['No pinned comment available.']);
+
   const orderedVideoDescs=orderVideoDescriptionsForInspection(channelSampledDescs(),videoDescs);const descriptionsToInspect=orderedVideoDescs.slice(0,MAX_INSPECTED_VIDEO_DESCRIPTIONS),step3Logs:string[]=[];const videoCandidates:DiscordCandidate[]=[];if(descriptionsToInspect.length){step3Logs.push(`Scanning ${descriptionsToInspect.length} recent video descriptions${orderedVideoDescs.length>descriptionsToInspect.length?` (${orderedVideoDescs.length} available; newest authoritative descriptions are prioritized).`:'.'}`);for(let i=0;i<descriptionsToInspect.length;i++){const d=descriptionsToInspect[i],sourceName=`VIDEO_${i+1}_DESCRIPTION`;addExternalUrls(d,sourceName);const candidates=extractDiscordCandidates(d,'RECENT_VIDEO_DESCRIPTIONS',`youtube:channel:${channelData.channelId}:${sourceName}`).filter(c=>c.nativeInviteCode);videoCandidates.push(...candidates);if(debugLog)debugLog.discordRegexAttempts.push({source:sourceName,textLength:d.length,result:candidates.map(c=>c.nativeInviteCode)});if(candidates.length)acquisitionOutcomes.push({requestedUrl:`youtube:channel:${channelData.channelId}:${sourceName}`,surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'FOUND',retryable:false,detail:`${candidates.length} Discord candidate(s) discovered in recent video description`,observedAt:now});}retainCandidates(videoCandidates);if(videoCandidates.length){step3Logs.push(`${videoCandidates.length} Discord candidate observation(s) retained across the inspected descriptions.`);addStep('VIDEO_DESCRIPTIONS','Step 3 — Latest Video Descriptions','FOUND',step3Logs,videoCandidates[0].nativeInviteCode||null,'RECENT_VIDEO_DESCRIPTIONS');}else{step3Logs.push('No direct Discord invite found in the descriptions actually inspected.');addStep('VIDEO_DESCRIPTIONS','Step 3 — Latest Video Descriptions','NOT_FOUND',step3Logs);}}else addStep('VIDEO_DESCRIPTIONS','Step 3 — Latest Video Descriptions','SKIPPED',['No video descriptions available.']);for(const surface of acquiredRecentDescriptionSurfaces)if(!videoCandidates.length)acquisitionOutcomes.push({requestedUrl:surface,surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'INSPECTED_NO_MATCH',retryable:false,detail:`Recent video descriptions acquired; ${descriptionsToInspect.length} description(s) inspected without a Discord invite`,observedAt:now});
 
   // Recall-safe acquisition (PR #434 items 1-3): ranking reorders but never
@@ -1565,8 +1590,9 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   const discordSurfaceForSource=(source:string):AcquisitionSurface=>
     source.startsWith('VIDEO_')?'RECENT_VIDEO_DESCRIPTIONS'
       :source==='CHANNEL_ABOUT'?'YOUTUBE_ABOUT'
-        :source==='SOCIAL_LINKS'?'SOCIAL_PROFILES'
-          :'CHANNEL_EXTERNAL_LINKS';
+        :source==='PINNED_COMMENT'?'PINNED_COMMENT'
+          :source==='SOCIAL_LINKS'?'SOCIAL_PROFILES'
+            :'CHANNEL_EXTERNAL_LINKS';
   if(discordSurfaceSeeds.length){
     stepDiscordLogs.push(`Inspecting ${discordSurfaceSeeds.length} Discord server/widget surface URL(s).`);
     let foundSurfaces=0,inspectedSurfaces=0,failedSurfaces=0;
