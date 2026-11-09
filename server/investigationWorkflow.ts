@@ -66,20 +66,29 @@ export async function retryInvestigationStep(input:{investigationId:string;stepI
  * admitted. Unlike failInvestigationStep, this preserves the operational
  * failure_class so a later retry can still refresh an expired deadline.
  */
-export async function restoreBlockedInvestigationStep(input:{investigationId:string;stepId:string;jobId:string;attempt:number;reason:string}):Promise<void>{
+export async function restoreBlockedInvestigationStep(input:{investigationId:string;stepId:string;jobId:string;reason:string}):Promise<void>{
   const db=await getDb(),client=await db.connect();
   try{
     await client.query('BEGIN');
-    const step=await client.query(`SELECT s.id,s.investigation_id,s.state,s.policy_version,i.state investigation_state FROM investigation_steps s JOIN investigations i ON i.id=s.investigation_id WHERE s.id=$1 AND s.investigation_id=$2 AND s.job_id=$3 FOR UPDATE OF s,i`,[input.stepId,input.investigationId,input.jobId]);
+    const step=await client.query(`SELECT s.id,s.investigation_id,s.state,s.attempt_count,s.policy_version,i.state investigation_state FROM investigation_steps s JOIN investigations i ON i.id=s.investigation_id WHERE s.id=$1 AND s.investigation_id=$2 AND s.job_id=$3 FOR UPDATE OF s,i`,[input.stepId,input.investigationId,input.jobId]);
     if(!step.rowCount){await client.query('COMMIT');return;}
-    // A slower rediscovery must not undo a step that another retry already
-    // completed while this enqueue was in flight.
-    if(['COMPLETED','SKIPPED'].includes(step.rows[0].state)
-      || ['COMPLETED','NEEDS_REVIEW','POLICY_REJECTED','SUPERSEDED'].includes(step.rows[0].investigation_state)){await client.query('COMMIT');return;}
-    const restored=await client.query(`UPDATE investigation_steps SET state='FAILED',lease_expires_at=NULL,completed_at=COALESCE(completed_at,now()),updated_at=now() WHERE id=$1 AND investigation_id=$2 AND job_id=$3 AND state NOT IN ('COMPLETED','SKIPPED')`,[input.stepId,input.investigationId,input.jobId]);
+    const row=step.rows[0];
+    // Only the retry this call just restored may be rolled back. A worker that
+    // has started it (RUNNING) or another retry that completed it owns the step.
+    if(row.state!=='RETRYING'){await client.query('COMMIT');return;}
+    const attempt=Number(row.attempt_count||0)+1;
+    if(['COMPLETED','NEEDS_REVIEW','POLICY_REJECTED','SUPERSEDED'].includes(row.investigation_state)){
+      // The investigation became terminal while this retry was being admitted.
+      // Retire the unadmitted step as SKIPPED so a later projection repair
+      // cannot reactivate it, without changing the terminal investigation.
+      const skipped=await client.query(`UPDATE investigation_steps SET state='SKIPPED',lease_expires_at=NULL,completed_at=COALESCE(completed_at,now()),updated_at=now() WHERE id=$1 AND investigation_id=$2 AND job_id=$3 AND state='RETRYING'`,[input.stepId,input.investigationId,input.jobId]);
+      if(skipped.rowCount)await client.query(`INSERT INTO investigation_events(event_key,investigation_id,step_id,event_type,payload,policy_version) VALUES($1,$2,$3,'STEP_SKIPPED',$4,$5) ON CONFLICT(event_key) DO NOTHING`,[`investigation:${input.investigationId}:step:${input.stepId}:attempt:${attempt}:blocked:${input.reason}:skipped`,input.investigationId,input.stepId,JSON.stringify({jobId:input.jobId,reason:input.reason}),row.policy_version]);
+      await client.query('COMMIT');return;
+    }
+    const restored=await client.query(`UPDATE investigation_steps SET state='FAILED',lease_expires_at=NULL,completed_at=COALESCE(completed_at,now()),updated_at=now() WHERE id=$1 AND investigation_id=$2 AND job_id=$3 AND state='RETRYING'`,[input.stepId,input.investigationId,input.jobId]);
     if(!restored.rowCount){await client.query('COMMIT');return;}
     await client.query(`UPDATE investigations SET state='OPERATIONALLY_BLOCKED',version=version+1,completed_at=COALESCE(completed_at,now()),updated_at=now() WHERE id=$1 AND state='ACTIVE'`,[input.investigationId]);
-    await client.query(`INSERT INTO investigation_events(event_key,investigation_id,step_id,event_type,payload,policy_version) VALUES($1,$2,$3,'STEP_FAILED',$4,$5) ON CONFLICT(event_key) DO NOTHING`,[`investigation:${input.investigationId}:step:${input.stepId}:attempt:${input.attempt}:blocked:${input.reason}`,input.investigationId,input.stepId,JSON.stringify({jobId:input.jobId,reason:input.reason}),step.rows[0].policy_version]);
+    await client.query(`INSERT INTO investigation_events(event_key,investigation_id,step_id,event_type,payload,policy_version) VALUES($1,$2,$3,'STEP_FAILED',$4,$5) ON CONFLICT(event_key) DO NOTHING`,[`investigation:${input.investigationId}:step:${input.stepId}:attempt:${attempt}:blocked:${input.reason}`,input.investigationId,input.stepId,JSON.stringify({jobId:input.jobId,reason:input.reason}),row.policy_version]);
     await client.query('COMMIT');
   }catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
 }

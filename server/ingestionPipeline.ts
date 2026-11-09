@@ -1020,12 +1020,12 @@ async function processChannelThroughPipelineInContext(
               // The reopen guard refused the terminal owner. Restore the
               // blocked projection so the investigation does not stay ACTIVE
               // with a RETRYING step and no runnable job.
-              await restoreBlockedInvestigationStep({investigationId:retryInvestigationId,stepId:retryStepId,jobId:existing.id,attempt:Number(existing.attempts||0),reason:'RETRY_NOT_ADMITTED'})
+              await restoreBlockedInvestigationStep({investigationId:retryInvestigationId,stepId:retryStepId,jobId:existing.id,reason:'RETRY_NOT_ADMITTED'})
                 .catch(error=>console.warn(`[Investigation] Failed to restore blocked step for ${candidate.channelId}:`,error instanceof Error?error.message:error));
             }
           }catch(error){
             if(retryLinkage&&existing){
-              await restoreBlockedInvestigationStep({investigationId:retryInvestigationId,stepId:retryStepId,jobId:existing.id,attempt:Number(existing.attempts||0),reason:'RETRY_ENQUEUE_FAILED'})
+              await restoreBlockedInvestigationStep({investigationId:retryInvestigationId,stepId:retryStepId,jobId:existing.id,reason:'RETRY_ENQUEUE_FAILED'})
                 .catch(restoreError=>console.warn(`[Investigation] Failed to restore blocked step for ${candidate.channelId}:`,restoreError instanceof Error?restoreError.message:restoreError));
             }
             throw error;
