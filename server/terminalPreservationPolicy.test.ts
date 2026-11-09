@@ -79,7 +79,7 @@ test('TRADING_CONFIRMED is preserved under ordinary rediscovery even with uncert
 test('an active enrichment marker on a confirmed row is projected COMPLETED on rediscovery', () => {
   assert.equal(terminalScanStatusForConfirmedRediscovery('ENRICHMENT_PENDING', false), 'COMPLETED');
   assert.equal(terminalScanStatusForConfirmedRediscovery('ENRICHING', false), 'COMPLETED');
-  assert.equal(terminalScanStatusForConfirmedRediscovery('LOCKED', false), 'COMPLETED');
+  assert.equal(terminalScanStatusForConfirmedRediscovery('LOCKED', false), 'LOCKED');
   assert.equal(terminalScanStatusForConfirmedRediscovery('ENRICHING', true), 'ENRICHING', 'a live job owns the marker');
   assert.equal(terminalScanStatusForConfirmedRediscovery('NEEDS_REVIEW', false), 'NEEDS_REVIEW');
   assert.equal(terminalScanStatusForConfirmedRediscovery('FAILED', false), 'FAILED');

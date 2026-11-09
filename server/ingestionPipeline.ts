@@ -292,7 +292,7 @@ async function validateCountryWithHydration(
 }
 
 export interface ConfirmedCountryRevalidationResult {
-  countryUpdated: boolean;
+  countryChecked: boolean;
   rejectionApplied: boolean;
 }
 
@@ -340,14 +340,14 @@ export async function revalidateConfirmedCountryForPreservedRow(
         },
         now,
       }, candidate);
-      return { countryUpdated: true, rejectionApplied: true };
+      return { countryChecked: true, rejectionApplied: true };
     }
     if ((countryCheck.status === 'CONFIRMED' || countryCheck.status === 'LIKELY') && countryCheck.detectedCreatorCountry) {
       existing.country = countryCheck.detectedCreatorCountry;
       existing.country_status = countryCheck.status;
       existing.confidence_score = countryCheck.score;
     }
-    return { countryUpdated: true, rejectionApplied: false };
+    return { countryChecked: true, rejectionApplied: false };
   } catch (error) {
     // Probe/quota policy and accounting failures are not evidence failures:
     // propagating them keeps the caller's retry lifecycle and prevents a paid
@@ -359,7 +359,7 @@ export async function revalidateConfirmedCountryForPreservedRow(
       throw error;
     }
     console.warn(`[Unified Ingestion Pipeline] Confirmed-country revalidation failed for ${candidate.channelId}; preserving confirmed row:`, error instanceof Error ? error.message : error);
-    return { countryUpdated: false, rejectionApplied: false };
+    return { countryChecked: false, rejectionApplied: false };
   }
 }
 
@@ -439,7 +439,7 @@ async function processChannelThroughPipelineInContext(
     // Preserve terminal rows for every ordinary discovery lane. Explicit
     // operator recheck is the only supported terminal override.
     if (shouldPreserveExistingChannel(existing, source, isManualScan) && !shouldBypassPreservationForDiscordEvidence(existing, options?.forceClassification === true)) {
-      let confirmedCountryUpdated = false;
+      let confirmedCountryChecked = false;
       const countryRevalidation = shouldRevalidateConfirmedCountry(existing, isManualScan);
       // Capture the policy this pass read; the write below must not overwrite
       // a concurrent rejection/confirmation committed while hydration ran.
@@ -463,7 +463,7 @@ async function processChannelThroughPipelineInContext(
       };
       if (countryRevalidation) {
         const revalidation = await revalidateConfirmedCountryForPreservedRow(candidate, existing, targetCountry, now);
-        confirmedCountryUpdated = revalidation.countryUpdated;
+        confirmedCountryChecked = revalidation.countryChecked;
         if (revalidation.rejectionApplied) {
           await persistPreservedRow();
           return {
@@ -520,7 +520,7 @@ async function processChannelThroughPipelineInContext(
       // committed cannot strand missing rows behind this early return.
       await replayVocabularyForRetry(existing, candidate, source, options?.forceExtraction ?? false);
       // Update basic existing metadata if changed
-      let updated = confirmedCountryUpdated;
+      let updated = confirmedCountryChecked;
       if (candidate.subscriberCount && candidate.subscriberCount !== existing.subscriber_count) {
         existing.subscriber_count = candidate.subscriberCount;
         updated = true;
@@ -531,7 +531,7 @@ async function processChannelThroughPipelineInContext(
       }
       let activeEnrichmentJob = false;
       if (existing.trading_status === 'TRADING_CONFIRMED') {
-        try { activeEnrichmentJob = await hasActiveEnrichmentJob(existing.channel_id); } catch { activeEnrichmentJob = true; }
+        try { activeEnrichmentJob = await hasActiveEnrichmentJob(existing.channel_id, options?.jobId); } catch { activeEnrichmentJob = true; }
       }
       const confirmedScanStatus = existing.trading_status === 'TRADING_CONFIRMED'
         ? terminalScanStatusForConfirmedRediscovery(existing.scan_status, activeEnrichmentJob)
@@ -764,7 +764,7 @@ async function processChannelThroughPipelineInContext(
   }
 
   const lowAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount);
-  if (lowAudienceGate.shouldSkipDeepEnrichment) {
+  if (lowAudienceGate.shouldSkipDeepEnrichment && options?.forceClassification !== true) {
     console.log(`[Unified Ingestion Pipeline - Phase 7] Channel '${candidate.channelName}' (${candidate.channelId}) has ${candidate.subscriberCount} subscribers (< 30 threshold). Storing and marking low-audience skip.`);
     const lowAudienceChannel: ChannelRecord = existing || {
       channel_id: candidate.channelId,

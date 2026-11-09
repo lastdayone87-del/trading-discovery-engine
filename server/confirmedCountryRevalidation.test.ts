@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFileSync } from 'node:fs';
 import type { ChannelRecord } from '../src/types';
 import type { ValidationResult } from './countryValidator';
 import { revalidateConfirmedCountryForPreservedRow } from './ingestionPipeline';
@@ -56,7 +57,7 @@ test('confirmed unresolved-country rediscovery hydrates country evidence without
   });
 
   assert.equal(hydrations, 1);
-  assert.deepEqual(result, { countryUpdated: true, rejectionApplied: false });
+  assert.deepEqual(result, { countryChecked: true, rejectionApplied: false });
   assert.equal(existing.trading_status, 'TRADING_CONFIRMED');
   assert.equal(existing.country_status, 'CONFIRMED');
   assert.equal(existing.country, 'Netherlands');
@@ -69,7 +70,7 @@ test('a country rejection is projected while the confirmed trading decision stay
     hydrate: async () => validation({ status: 'REJECTED', detectedCreatorCountry: 'Germany', score: 95, decisionLogs: 'excluded country' }),
   });
 
-  assert.deepEqual(result, { countryUpdated: true, rejectionApplied: true });
+  assert.deepEqual(result, { countryChecked: true, rejectionApplied: true });
   assert.equal(existing.country_status, 'REJECTED');
   assert.equal(existing.country, 'Germany');
   assert.equal(existing.trading_status, 'TRADING_CONFIRMED');
@@ -82,7 +83,7 @@ test('sparse evidence that stays uncertain still reports the country pass as com
     hydrate: async () => validation({ status: 'UNCERTAIN' }),
   });
 
-  assert.deepEqual(result, { countryUpdated: true, rejectionApplied: false });
+  assert.deepEqual(result, { countryChecked: true, rejectionApplied: false });
   assert.equal(existing.country_status, 'UNCERTAIN');
   assert.equal(existing.trading_status, 'TRADING_CONFIRMED');
 });
@@ -110,7 +111,17 @@ test('ordinary provider failures preserve the confirmed row and report no update
     hydrate: async () => { throw new Error('network down'); },
   });
 
-  assert.deepEqual(result, { countryUpdated: false, rejectionApplied: false });
+  assert.deepEqual(result, { countryChecked: false, rejectionApplied: false });
   assert.equal(existing.country_status, 'UNCERTAIN');
   assert.equal(existing.trading_status, 'TRADING_CONFIRMED');
+});
+
+test('active-work detection covers community retries and can exclude the terminalizing job',()=>{
+  const source=readFileSync(new URL('./dbCore.ts',import.meta.url),'utf8');
+  assert.match(source,/RETRY_COMMUNITY_ACQUISITION/);
+  assert.match(source,/hasActiveEnrichmentJob\(channelId: string, excludeJobId\?: string \| null\)/);
+  assert.match(source,/id <> \$3::uuid/);
+  const pipeline=readFileSync(new URL('./ingestionPipeline.ts',import.meta.url),'utf8');
+  assert.match(pipeline,/hasActiveEnrichmentJob\(existing\.channel_id, options\?\.jobId\)/);
+  assert.match(pipeline,/lowAudienceGate\.shouldSkipDeepEnrichment && options\?\.forceClassification !== true/);
 });

@@ -3335,12 +3335,6 @@ export interface ChannelInspectionAttributionInput {
 }
 
 
-/**
- * After a successful Discord validation, an unconfirmed channel earns one
- * bounded classification pass with the stored invite available as evidence.
- * The pass is day-scoped and preventReopen keeps it from looping; an active
- * classification already owns the work. This never confirms by itself.
- */
 export interface DiscordReclassificationDeps {
   hasActiveClassificationJob?: (channelId: string) => Promise<boolean>;
   db?: { query: (sql: string, values?: unknown[]) => Promise<{ rows: any[] }> };
@@ -3349,6 +3343,12 @@ export interface DiscordReclassificationDeps {
   checkCountryAllowed?: (country: string) => Promise<void>;
 }
 
+/**
+ * After a successful Discord validation, an unconfirmed channel earns one
+ * bounded classification pass with the stored invite available as evidence.
+ * The pass is day-scoped and preventReopen keeps it from looping; an active
+ * classification already owns the work. This never confirms by itself.
+ */
 export async function enqueueDiscordEvidenceReclassification(
   channel: ChannelRecord,
   rawDetails?: DiscoveredChannelRaw,

@@ -37,9 +37,11 @@ export function terminalScanStatusForConfirmedRediscovery(
   hasActiveEnrichmentJob: boolean,
 ): ChannelRecord['scan_status'] {
   // A live job owns the active marker; only an abandoned pending marker is
-  // projected completed. ENRICHING/LOCKED without a job are also abandoned.
+  // projected completed. LOCKED is owned by the stale-lock recovery sweep:
+  // the inline pipeline can set it without a job row, so it is never treated
+  // as abandoned here.
   if (hasActiveEnrichmentJob) return scanStatus;
-  return scanStatus === 'ENRICHMENT_PENDING' || scanStatus === 'ENRICHING' || scanStatus === 'LOCKED'
+  return scanStatus === 'ENRICHMENT_PENDING' || scanStatus === 'ENRICHING'
     ? 'COMPLETED'
     : scanStatus;
 }
@@ -164,9 +166,9 @@ export function shouldPreserveExistingChannel(
 
     // Country uncertainty is explicitly non-terminal. Re-run Gate 1 so the
     // current creator evidence can resolve the country and apply exclusions.
-    // This check intentionally comes before the trading-status preservation
-    // rules below: a TRADING_CONFIRMED row with UNCERTAIN country must not
-    // bypass country policy.
+    // A TRADING_CONFIRMED row with UNCERTAIN country is short-circuited above
+    // and handled by shouldRevalidateConfirmedCountry, which fetches country
+    // evidence without reclassifying trading.
     if (existing.country_status === 'UNCERTAIN') return false;
 
     const machineNonTrading = existing.trading_status === 'NON_TRADING' || existing.scan_status === 'SKIPPED_NON_TRADING';

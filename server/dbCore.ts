@@ -1836,15 +1836,16 @@ export async function getProductionBacklogDepth(): Promise<number> {
  * classification. Rediscovery must not project a live row COMPLETED while any
  * of these still owns the channel.
  */
-export async function hasActiveEnrichmentJob(channelId: string): Promise<boolean> {
+export async function hasActiveEnrichmentJob(channelId: string, excludeJobId?: string | null): Promise<boolean> {
   const db = await getDb();
   const res = await db.query(
     `SELECT 1 FROM jobs
-      WHERE type IN ('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN',$2)
+      WHERE type IN ('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION',$2)
         AND status IN ('PENDING','PROCESSING')
         AND payload->>'channelId'=$1
+        AND ($3::uuid IS NULL OR id <> $3::uuid)
       LIMIT 1`,
-    [channelId, CLASSIFICATION_JOB_TYPE],
+    [channelId, CLASSIFICATION_JOB_TYPE, excludeJobId || null],
   );
   return Boolean(res.rowCount);
 }
