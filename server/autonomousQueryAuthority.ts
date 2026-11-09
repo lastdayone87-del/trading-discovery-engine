@@ -246,9 +246,12 @@ export function evaluateAutonomousQueryAuthority(
     // context. Free-signal bootstrap methods obey the same rule as curated
     // SINGLE_ATOM methods; localized method surfaces that meet the standard pass.
     const primaryType = String(atoms[0]?.type || '').toUpperCase();
+    const reviewedNativeSurface = Array.isArray(atoms[0]?.retrievalPolicy?.reasonCodes)
+      && atoms[0].retrievalPolicy.reasonCodes.includes('REVIEWED_NATIVE_PHRASE');
     if (
       (template === 'SINGLE_ATOM' || template === 'FREE_SIGNAL_STANDALONE')
       && primaryType === 'METHOD'
+      && !reviewedNativeSurface
       && !EXPLICIT_STANDALONE_METHOD_CONTEXT.test(query.query)
     ) {
       return { eligible: false, reasonCodes: ['STANDALONE_METHOD_REQUIRES_CONCRETE_TRADING_ANCHOR'], retrievalPolicyVersion: specificity.policyVersion };

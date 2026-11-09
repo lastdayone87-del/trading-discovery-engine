@@ -36,19 +36,26 @@ test('native query atoms reach the planner for representative non-English market
   }
 });
 
-test('native replenishment runs below the active floor, not only when the pool is empty', () => {
+test('native replenishment runs below the eligible floor, not only when the pool is empty', () => {
   const now = new Date('2026-11-08T12:00:00.000Z');
-  const old = '2026-11-01T12:00:00.000Z';
   assert.equal(shouldGenerateNativeQueries({
-    queries: [{ collection: 'EXPERIMENTAL', created_at: old }, { collection: 'REJECTED', created_at: old }],
+    active: 2,
+    lastAttemptAt: '2026-11-01T12:00:00.000Z',
     now,
-  }), true, 'two active queries are below the floor and the library is stale');
+  }), true, 'two permanently eligible queries are below the floor');
   assert.equal(shouldGenerateNativeQueries({
-    queries: Array.from({ length: 10 }, () => ({ collection: 'EXPERIMENTAL' as const, created_at: old })),
+    active: 10,
+    lastAttemptAt: '2026-11-01T12:00:00.000Z',
     now,
-  }), false, 'a healthy inventory does not need replenishment');
+  }), false, 'a healthy eligible inventory does not need replenishment');
   assert.equal(shouldGenerateNativeQueries({
-    queries: [{ collection: 'EXPERIMENTAL', created_at: '2026-11-08T09:00:00.000Z' }],
+    active: 1,
+    lastAttemptAt: '2026-11-08T09:00:00.000Z',
     now,
-  }), false, 'the cooldown prevents duplicate generation every cycle');
+  }), false, 'the persisted attempt cooldown prevents duplicate generation every cycle');
+  assert.equal(shouldGenerateNativeQueries({
+    active: 1,
+    lastAttemptAt: null,
+    now,
+  }), true, 'a missing attempt record allows the first replenishment');
 });

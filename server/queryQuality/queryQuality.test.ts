@@ -226,6 +226,7 @@ test('Q2: every planned query for all production countries is admitted', () => {
       learnedVocabulary: [],
       existingQueries: [],
     });
+    assert.ok(planned.length > 0, `${country} produced no planned queries`);
     for (const item of planned) {
       total++;
       const result = admitQueryRecord({

@@ -56,6 +56,32 @@ test('concrete instrument plus method remains authorized', () => {
   assert.equal(decision.eligible, true);
 });
 
+test('reviewed native method phrases are authorized as standalone surfaces', () => {
+  const decision = evaluateAutonomousQueryAuthority(query({
+    query: 'velas japonesas',
+    country: 'Spain',
+    generation_metadata: {
+      queryTemplate: 'SINGLE_ATOM',
+      scopePromoted: true,
+      retrievalSpecificity: {
+        policyVersion: RETRIEVAL_SPECIFICITY_POLICY_VERSION,
+        eligibility: 'STANDALONE',
+      },
+      atoms: [{
+        type: 'METHOD',
+        origin: 'COUNTRY_VOCABULARY',
+        term: 'velas japonesas',
+        retrievalPolicy: {
+          policyVersion: RETRIEVAL_SPECIFICITY_POLICY_VERSION,
+          eligibility: 'STANDALONE',
+          reasonCodes: ['REVIEWED_NATIVE_PHRASE'],
+        },
+      }],
+    },
+  } as any), { scopePromotionActive: true });
+  assert.equal(decision.eligible, true, decision.reasonCodes.join(','));
+});
+
 test('autonomous candidate with no trading signal is withheld before expensive processing', () => {
   const decision = triageAutonomousSearchCandidate({
     channelId: 'UCexample0000000000000000', channelName: 'Madeleine Beelen', youtubeUrl: 'https://youtube.com/channel/x',

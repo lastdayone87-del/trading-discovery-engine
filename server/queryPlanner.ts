@@ -107,25 +107,27 @@ export const NATIVE_QUERY_REFRESH_COOLDOWN_MS = 6 * 60 * 60 * 1000;
  * The original selector only generated when the country had zero queries or
  * the eligible pool was empty. A country whose whole library had been rejected
  * therefore starved forever, and a healthy country never gained new native
- * phrases. Generate when the non-rejected inventory is below the floor, with a
- * cooldown so the scheduler does not write duplicates every cycle.
+ * phrases. Generate when the permanently eligible inventory is below the
+ * floor. The cooldown is keyed to a persisted replenishment attempt rather
+ * than an arbitrary row's created_at, so legacy/manual inserts cannot
+ * suppress native generation and empty attempts still enter the cooldown.
  */
 export function shouldGenerateNativeQueries(input: {
-  queries: Array<Pick<QueryRecord, 'collection' | 'created_at'>>;
+  active: number;
+  lastAttemptAt?: string | Date | null;
   now: Date;
   minActive?: number;
   cooldownMs?: number;
 }): boolean {
   const minActive = Math.max(1, input.minActive ?? NATIVE_QUERY_REFRESH_MIN_ACTIVE);
   const cooldownMs = Math.max(0, input.cooldownMs ?? NATIVE_QUERY_REFRESH_COOLDOWN_MS);
-  const active = input.queries.filter(query => query.collection !== 'REJECTED').length;
-  if (active >= minActive) return false;
-  const cutoff = input.now.getTime() - cooldownMs;
-  const recentlyGenerated = input.queries.some(query => {
-    const createdAt = Date.parse(String(query.created_at || ''));
-    return Number.isFinite(createdAt) && createdAt > cutoff;
-  });
-  return !recentlyGenerated;
+  if (Math.max(0, Math.trunc(input.active)) >= minActive) return false;
+  if (!input.lastAttemptAt) return true;
+  const attemptedAt = input.lastAttemptAt instanceof Date
+    ? input.lastAttemptAt.getTime()
+    : Date.parse(String(input.lastAttemptAt));
+  if (!Number.isFinite(attemptedAt)) return true;
+  return attemptedAt <= input.now.getTime() - cooldownMs;
 }
 
 const OBJECTIVES: Partial<Record<QueryIntent, string>> = {

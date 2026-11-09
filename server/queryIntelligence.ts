@@ -12,6 +12,7 @@ import {
   getChannelById,
   upsertChannel,
   getAppSetting,
+  setAppSetting,
   getQueryDemandSignals,
   reserveNativeVocabularyAiRun,
   completeNativeVocabularyAiRun,
@@ -1278,13 +1279,32 @@ export async function selectNextQueryForCountry(
   const loadPool = async (queries: QueryRecord[]): Promise<SelectorPool> =>
     buildSelectorPool(country, queries, { now, cooldownMinutes, maxPrimaryUses, nowIso, portfolioRatio, familyCap, sourceCap, scopePromotionBasis: options.scopePromotionBasis });
 
+  const replenishmentSettingKey = `query_intelligence_native_replenishment:${country}`;
+  const lastReplenishmentAttempt = await getAppSetting(replenishmentSettingKey, '');
   let allQueries = await loadQueries();
-  if (allQueries.length > 0 && shouldGenerateNativeQueries({ queries: allQueries, now })) {
-    // Replenish a thinned or rejected library even when a few selectable rows
-    // remain. Without this a country whose whole library was rejected could
-    // never recover, and healthy libraries never gained new native phrases.
-    const generated = await generateCandidateQueriesForCountry(country, 4, 'EXPLORATION', { scopePromotionBasis: options.scopePromotionBasis });
-    if (generated.length > 0) allQueries = await loadQueries();
+  let pool = allQueries.length > 0 ? await loadPool(allQueries) : null;
+  if (pool && shouldGenerateNativeQueries({
+    active: pool.permanentlyEligibleCount,
+    lastAttemptAt: lastReplenishmentAttempt,
+    now,
+  })) {
+    // Record the attempt before generation so a failure or an empty result
+    // also enters the cooldown instead of retrying on every selection.
+    await setAppSetting(replenishmentSettingKey, nowIso).catch(() => undefined);
+    try {
+      const generated = await generateCandidateQueriesForCountry(country, 4, 'EXPLORATION', { scopePromotionBasis: options.scopePromotionBasis });
+      if (generated.length > 0) {
+        allQueries = await loadQueries();
+        pool = await loadPool(allQueries);
+      }
+    } catch (error) {
+      // Replenishment is optional; the already loaded inventory remains
+      // usable and the persisted attempt suppresses an immediate retry.
+      console.warn('[query-intelligence] native replenishment failed', {
+        country,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
   if (allQueries.length === 0) {
     const generated = await generateCandidateQueriesForCountry(country, 4, 'COLD_START', { scopePromotionBasis: options.scopePromotionBasis });
@@ -1299,7 +1319,7 @@ export async function selectNextQueryForCountry(
     return buildSelectionResult(admitted, pool, 'COLD_START_GENERATION', `Cold start query initialization for ${country}: ${pool.decision.reason}`, pool.decision);
   }
 
-  let pool = await loadPool(allQueries);
+  if (!pool) pool = await loadPool(allQueries);
   // An empty pool means every row is cooling down, saturated by a share cap,
   // or stale after admission revalidation. Never execute an unscored legacy
   // fallback: generate through the governed planner, then re-admit and score.
@@ -1406,6 +1426,8 @@ interface SelectorPool {
   admissions: Map<number, QueryRecordAdmission>;
   context: SelectorContext;
   decision: SelectorDecision;
+  /** Rows that pass admission + execution authority, regardless of cooldown. */
+  permanentlyEligibleCount: number;
 }
 
 function buildSelectorCandidate(
@@ -1514,6 +1536,7 @@ async function buildSelectorPool(
   };
 
   const admissions = new Map<number, QueryRecordAdmission>();
+  let permanentlyEligibleCount = 0;
   let eligible: QueryRecord[] = [];
   for (const query of queries) {
     const admissionInfo = revalidateQueryRecordAdmission(query, { now: options.nowIso, history: historyFor(query) });
@@ -1529,6 +1552,7 @@ async function buildSelectorPool(
       scopePromotionActive: options.scopePromotionBasis != null,
     });
     if (!authority.eligible) continue;
+    permanentlyEligibleCount += 1;
     const failure = failureByQuery.get(query.id);
     const selectable = isQuerySelectable({
       record: query,
@@ -1622,7 +1646,14 @@ async function buildSelectorPool(
     coveredCells,
   };
   const queriesById = new Map(queries.map(query => [query.id, query]));
-  return { candidates, queriesById, admissions, context, decision: selectHierarchicalUcb(candidates, context) };
+  return {
+    candidates,
+    queriesById,
+    admissions,
+    context,
+    permanentlyEligibleCount,
+    decision: selectHierarchicalUcb(candidates, context),
+  };
 }
 
 function buildSelectionResult(
