@@ -15,7 +15,7 @@ import { compositionConfirmsTrading, evaluateDecisionScoreBoundary, hasIndepende
  * creator-owned evidence composition, deterministic evidence and provider
  * reports; it has no network, database or clock dependency.
  */
-export const RECOGNITION_STATE_VERSION = 'recognition-state-v1';
+export const RECOGNITION_STATE_VERSION = 'recognition-state-v2';
 
 export type RecognitionState =
   | 'DECISIVE_TRADING'
@@ -30,6 +30,7 @@ export type SemanticPolicy = 'SKIP' | 'BOUNDED_WAIT' | 'ENRICH' | 'NONE';
 
 export type RecognitionGap =
   | 'CONTEXT_COVERAGE_MISSING'
+  | 'TRADING_EVIDENCE_INSUFFICIENT'
   | 'ALTERNATIVE_FOCUS_CONFLICT'
   | 'TIER_A_CORROBORATION_MISSING'
   | 'QUERY_ONLY_EVIDENCE'
@@ -48,7 +49,10 @@ export interface RecognitionAssessment {
     'focus' | 'observedFamilies' | 'tradingFamilies' | 'alternativeFamilies' |
     'neutralFamilies' | 'tradingCoverage' | 'alternativeCoverage' |
     'temporalCoverage' | 'nonTitleTierAFamilies' | 'explicitCreatorTrading' |
-    'explicitCreatorAlternative'>;
+    'explicitCreatorAlternative'> & Partial<Pick<ContextualCompositionReport,
+    'informativeFamilies' | 'tradingCoreFamilies' | 'tradingAdjacentFamilies' |
+    'financeAdjacentFamilies' | 'unrelatedFamilies' | 'uninformativeFamilies' |
+    'duplicateFamiliesCollapsed' | 'unrelatedCoverage' | 'financeCoverage'>>;
 }
 
 export interface RecognitionAssessmentInput {
@@ -91,7 +95,12 @@ export function assessRecognitionState(input: RecognitionAssessmentInput): Recog
 
   if (composition.temporalCoverage === 'UNKNOWN' && composition.observedFamilies > 0) gaps.add('TEMPORAL_COVERAGE_MISSING');
   if (composition.focus === 'MIXED') gaps.add('ALTERNATIVE_FOCUS_CONFLICT');
-  if (composition.focus === 'INSUFFICIENT_COVERAGE') gaps.add('CONTEXT_COVERAGE_MISSING');
+  const informativeFamilies = composition.informativeFamilies ?? composition.observedFamilies;
+  const hasAffirmativeTrading = composition.tradingFamilies > 0;
+  if (composition.focus === 'INSUFFICIENT_COVERAGE') {
+    if (informativeFamilies === 0 || !hasAffirmativeTrading) gaps.add('CONTEXT_COVERAGE_MISSING');
+    else gaps.add('TRADING_EVIDENCE_INSUFFICIENT');
+  }
   if (composition.tradingFamilies > 0 && composition.nonTitleTierAFamilies === 0) gaps.add('TIER_A_CORROBORATION_MISSING');
 
   const candidate = stage(input.staged, 'CANDIDATE_DETECTION');
@@ -154,9 +163,16 @@ export function assessRecognitionState(input: RecognitionAssessmentInput): Recog
   } else if (composition.focus === 'INSUFFICIENT_COVERAGE') {
     state = 'AMBIGUOUS_THIN';
     semanticPolicy = input.semanticAvailable && input.hasCreatorContext ? 'BOUNDED_WAIT' : 'ENRICH';
-    gaps.add('CONTEXT_COVERAGE_MISSING');
+    if (informativeFamilies === 0 || !hasAffirmativeTrading) {
+      gaps.add('CONTEXT_COVERAGE_MISSING');
+      reasons.push('INSUFFICIENT_INDEPENDENT_TRADING_COVERAGE');
+    } else {
+      // Affirmative trading families exist but do not meet the coverage or
+      // core-family gate. This is thin evidence, not missing context.
+      gaps.add('TRADING_EVIDENCE_INSUFFICIENT');
+      reasons.push('TRADING_EVIDENCE_INSUFFICIENT');
+    }
     if (composition.nonTitleTierAFamilies === 0) gaps.add('TIER_A_CORROBORATION_MISSING');
-    reasons.push('INSUFFICIENT_INDEPENDENT_TRADING_COVERAGE');
   } else if (hasProviderFailure(collection) && !substantivePositive) {
     state = 'PROVIDER_DEGRADED';
     semanticPolicy = 'NONE';
@@ -203,6 +219,15 @@ export function assessRecognitionState(input: RecognitionAssessmentInput): Recog
       nonTitleTierAFamilies: composition.nonTitleTierAFamilies,
       explicitCreatorTrading: composition.explicitCreatorTrading,
       explicitCreatorAlternative: composition.explicitCreatorAlternative,
+      informativeFamilies: composition.informativeFamilies,
+      tradingCoreFamilies: composition.tradingCoreFamilies,
+      tradingAdjacentFamilies: composition.tradingAdjacentFamilies,
+      financeAdjacentFamilies: composition.financeAdjacentFamilies,
+      unrelatedFamilies: composition.unrelatedFamilies,
+      uninformativeFamilies: composition.uninformativeFamilies,
+      duplicateFamiliesCollapsed: composition.duplicateFamiliesCollapsed,
+      unrelatedCoverage: composition.unrelatedCoverage,
+      financeCoverage: composition.financeCoverage,
     },
   };
 }

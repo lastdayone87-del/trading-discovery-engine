@@ -1,5 +1,6 @@
 import { EvidenceItem, EvidenceProvider, RawChannelInput, LayeredKnowledgeContext } from '../types';
-import { pushUniqueMatch, textMatchesTerm } from '../utils/textMatching';
+import { pushUniqueMatch } from '../utils/textMatching';
+import { findScopedTermMatches } from '../utils/claimPolarity';
 import { documentRef } from '../canonicalEvidencePlane';
 
 export class CountryKnowledgeProvider implements EvidenceProvider {
@@ -7,13 +8,19 @@ export class CountryKnowledgeProvider implements EvidenceProvider {
 
   async collectEvidence(input: RawChannelInput, knowledgeContext: LayeredKnowledgeContext): Promise<EvidenceItem[]> {
     const items: EvidenceItem[] = [];
-    const textBlob = `${input.channel_name} ${input.description || ''} ${(input.video_titles || []).join(' ')}`;
+    const sourceTexts = [
+      input.channel_name,
+      input.description || '',
+      ...(input.video_titles || []),
+    ].filter(Boolean);
+    const hasAssertedTerm = (term: string) =>
+      sourceTexts.some(text => findScopedTermMatches(text, [term]).some(match => match.polarity === 'ASSERTED'));
     const now = new Date().toISOString();
     const countryPack = knowledgeContext.countryKnowledge;
     const langPack = knowledgeContext.languageKnowledge;
     const langPacks=knowledgeContext.languageKnowledgePacks||[langPack].filter((pack):pack is NonNullable<typeof pack>=>Boolean(pack));
     // C1a: retrieval provenance is never attributable evidence.
-    const fieldsFor=(terms:string[])=>(input.evidence_corpus||[]).filter(document=>document.field!=='search_match_context'&&terms.some(term=>textMatchesTerm(document.text,term))).map(documentRef);
+    const fieldsFor=(terms:string[])=>(input.evidence_corpus||[]).filter(document=>document.field!=='search_match_context'&&terms.some(term=>findScopedTermMatches(document.text,[term],document.language).some(match=>match.polarity==='ASSERTED'))).map(documentRef);
 
     if (!countryPack && !langPack) {
       return items;
@@ -23,7 +30,7 @@ export class CountryKnowledgeProvider implements EvidenceProvider {
     const matchedRegionalExchanges: string[] = [];
     if (countryPack) {
       for (const exch of countryPack.regionalExchanges) {
-        if (textMatchesTerm(textBlob, exch)) {
+        if (hasAssertedTerm(exch)) {
           pushUniqueMatch(matchedRegionalExchanges, exch);
         }
       }
@@ -61,7 +68,7 @@ export class CountryKnowledgeProvider implements EvidenceProvider {
     ];
 
     for (const term of nativeTermsList) {
-      if (textMatchesTerm(textBlob, term)) {
+      if (hasAssertedTerm(term)) {
         pushUniqueMatch(matchedNativeTerms, term);
       }
     }
@@ -97,7 +104,7 @@ export class CountryKnowledgeProvider implements EvidenceProvider {
     ];
 
     for (const neg of regionalNegativesList) {
-      if (textMatchesTerm(textBlob, neg)) {
+      if (hasAssertedTerm(neg)) {
         pushUniqueMatch(matchedRegionalNegative, neg);
       }
     }

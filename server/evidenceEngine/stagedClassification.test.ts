@@ -56,9 +56,11 @@ test('promotional hype cannot terminally reject overwhelming trading evidence', 
     evidence('hype',{polarity:'NEGATIVE',category:'HYPE_SPECULATION',rawMatches:['guaranteed profit'],finalWeight:-26.1,rawWeight:32})
   ];
   const report=evaluateClassificationStages({channel_name:'Real Futures Trader',description:'Futures order flow education'},items,collection());
-  assert.notEqual(report.lifecycleAction,'REJECT');
-  assert.equal(stage(report,'CONTRADICTION').disposition,'ABSTAIN');
-  assert.ok(stage(report,'CONTRADICTION').reasonCodes.includes('MIXED_EVIDENCE_TERMINAL_REJECTION_WITHHELD'));
+  // Hype is a confidence penalty: it reduces the score but cannot withhold
+  // confirmation when independent creator evidence is otherwise sufficient.
+  assert.equal(report.lifecycleAction,'CONFIRM');
+  assert.equal(stage(report,'CONTRADICTION').disposition,'PASS');
+  assert.ok(stage(report,'CONTRADICTION').reasonCodes.includes('NON_TERMINAL_NEGATIVE_PENALTY_ONLY'));
 });
 
 test('irrelevant-domain evidence must materially dominate positive trading evidence before terminal rejection',()=>{

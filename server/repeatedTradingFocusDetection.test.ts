@@ -61,6 +61,7 @@ test('a generic method cannot supply its own financial qualifier', () => {
   // "market" and "analysis"; neither may qualify itself as trading.
   assert.equal(isExplicitCreatorTradingText('Workplace risk management', context), false);
   assert.equal(isExplicitCreatorTradingText('Housing market analysis', context), false);
+  assert.equal(isExplicitCreatorTradingText('I do not trade forex, but personal finance', context), false);
   // An independent financial dimension still qualifies the method.
   assert.equal(isExplicitCreatorTradingText('Trading risk management', context), true);
   assert.equal(isExplicitCreatorTradingText('Forex market analysis', context), true);
@@ -71,5 +72,31 @@ test('trading-card usage does not become financial trading evidence', async () =
   assert.equal(isExplicitCreatorTradingText('Pokemon trading cards opening and grading', context), false);
   const titles = Array.from({ length: 10 }, (_, index) => `Pokemon Trading Cards opening episode ${index + 1}`);
   const evidence = await new VideoMetadataProvider().collectEvidence(creatorInput(titles), context);
+  assert.equal(evidence.some(item => item.category === 'MULTI_VIDEO_CONSISTENCY'), false);
+});
+
+test('a negated video title does not suppress an asserted description', async () => {
+  const context = getLayeredKnowledgeContext('United States');
+  const titles = ['I do not trade forex', 'I do not trade forex', 'I do not trade forex'];
+  const input = {
+    ...creatorInput(titles),
+    video_descriptions: [
+      'Day trading order flow and risk management.',
+      'Backtesting market structure and position sizing.',
+      'Live trading execution and trade journal review.',
+    ],
+  };
+  const evidence = await new VideoMetadataProvider().collectEvidence(input, context);
+  assert.ok(evidence.some(item => item.category === 'MULTI_VIDEO_CONSISTENCY'));
+});
+
+test('a repeated platform literal alone cannot establish multi-video consistency', async () => {
+  const context = getLayeredKnowledgeContext('United States');
+  const input = creatorInput([
+    'TradingView tutorial one',
+    'TradingView tutorial two',
+    'TradingView tutorial three',
+  ]);
+  const evidence = await new VideoMetadataProvider().collectEvidence(input, context);
   assert.equal(evidence.some(item => item.category === 'MULTI_VIDEO_CONSISTENCY'), false);
 });

@@ -11,6 +11,7 @@ import { evaluateClassificationStages } from './stagedClassification';
 import { ENGINE_VERSIONS, getScoringConfig } from './config';
 import { TradingCategory } from '../../src/types';
 import { evaluateUnifiedDecisionPolicy, UNIFIED_DECISION_POLICY_VERSION } from './decisionPolicy';
+import { negativeEvidencePolicyWeight } from './negativeEvidenceRole';
 import type { ContextualCompositionReport } from './contextualComposition';
 import type { RecognitionAssessment } from './recognitionState';
 
@@ -45,7 +46,7 @@ export class ConfigurableWeightedStrategy {
     const negativeItems = evidenceItems.filter(i => i.polarity === 'NEGATIVE');
 
     const totalPositiveWeight = positiveItems.reduce((acc, curr) => acc + Math.abs(curr.finalWeight), 0);
-    const totalNegativeWeight = negativeItems.reduce((acc, curr) => acc + Math.abs(curr.finalWeight), 0);
+    const totalNegativeWeight = negativeItems.reduce((acc, curr) => acc + negativeEvidencePolicyWeight(curr), 0);
     // Multi-video consistency ratio check
     const consistencyItem = evidenceItems.find(i => i.category === 'MULTI_VIDEO_CONSISTENCY');
     let consistencyRatio = 0.5; // default if no video titles present
@@ -165,6 +166,8 @@ export class ConfigurableWeightedStrategy {
       recognitionState: recognition?.state,
       semanticPolicy: recognition?.semanticPolicy,
       semanticSkippedReason: recognition?.semanticSkippedReason ?? null,
+      compositionReport: composition,
+      recognitionAssessment: recognition,
       composition: composition ? {
         focus: composition.focus,
         observedFamilies: composition.observedFamilies,
@@ -174,7 +177,15 @@ export class ConfigurableWeightedStrategy {
         alternativeCoverage: composition.alternativeCoverage,
         temporalCoverage: composition.temporalCoverage,
         nonTitleTierAFamilies: composition.nonTitleTierAFamilies,
-        reasons: composition.reasonCodes
+        reasons: composition.reasonCodes,
+        informativeFamilies: composition.informativeFamilies,
+        tradingCoreFamilies: composition.tradingCoreFamilies,
+        tradingAdjacentFamilies: composition.tradingAdjacentFamilies,
+        financeAdjacentFamilies: composition.financeAdjacentFamilies,
+        unrelatedFamilies: composition.unrelatedFamilies,
+        uninformativeFamilies: composition.uninformativeFamilies,
+        duplicateFamiliesCollapsed: composition.duplicateFamiliesCollapsed,
+        unrelatedCoverage: composition.unrelatedCoverage,
       } : undefined
     };
   }
