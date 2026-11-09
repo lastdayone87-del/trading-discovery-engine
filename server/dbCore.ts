@@ -1,4 +1,4 @@
-import { countPlannerEligibleTerminologyRows, isNuisanceVocabularySurface, isSearchableTradingTerm } from './terminologySearchability';
+import { isNuisanceVocabularySurface } from './terminologySearchability';
 import fs from 'fs';
 import path from 'path';
 import { randomUUID } from 'node:crypto';
@@ -2040,11 +2040,8 @@ export async function getQueryLibraryPage(country?:string,collection?:string,lim
 export async function getVocabularyPage(country:string|undefined,limit=300,offset=0):Promise<ExtractedTermRecord[]>{const db=await getDb(); const bounded=Math.max(1,Math.min(1000,Math.trunc(limit))); const skipped=Math.max(0,Math.min(100000,Math.trunc(offset))); const res=country?await db.query('SELECT * FROM extracted_trading_vocabulary WHERE country=$1 ORDER BY trust_tier ASC,occurrences DESC,last_extracted DESC,id DESC LIMIT $2 OFFSET $3',[canonicalCountry(country),bounded,skipped]):await db.query('SELECT * FROM extracted_trading_vocabulary ORDER BY trust_tier ASC,occurrences DESC,last_extracted DESC,id DESC LIMIT $1 OFFSET $2',[bounded,skipped]); return res.rows.map(r=>({id:r.id,country:r.country,term:r.term,category:r.category,source_channel_id:r.source_channel_id||undefined,occurrences:r.occurrences||1,first_extracted:iso(r.first_extracted)||'',last_extracted:iso(r.last_extracted)||'',trust_tier:r.trust_tier||3,validation_count:r.validation_count||0}));}
 export interface QueryIntelligenceSummary { queryCount:number; provenCount:number; experimentalCount:number; rejectedCount:number; vocabularyCount:number; terminologyCount:number; searchEligibleTerminologyCount:number; executionLogCount:number; }
 const QUERY_INTELLIGENCE_SUMMARY_TTL_MS=15_000;
-const SEARCH_ELIGIBLE_COUNT_TTL_MS=60_000;
-const SEARCH_ELIGIBLE_COUNT_MAX_ROWS=1000;
 let queryIntelligenceSummaryCache:{at:number;value:QueryIntelligenceSummary}|null=null;
-let searchEligibleCountCache:{at:number;value:number}|null=null;
-export function resetQueryIntelligenceSummaryCacheForTests():void{queryIntelligenceSummaryCache=null;searchEligibleCountCache=null;}
+export function resetQueryIntelligenceSummaryCacheForTests():void{queryIntelligenceSummaryCache=null;}
 export function isQueryIntelligenceSummaryCacheFresh(cachedAt:number|null,now:number,ttlMs=QUERY_INTELLIGENCE_SUMMARY_TTL_MS):boolean{return cachedAt!==null&&Number.isFinite(cachedAt)&&Number.isFinite(now)&&now-cachedAt>=0&&now-cachedAt<Math.max(1,ttlMs);}
 /** One small aggregate row so the dashboard does not need a 1.8 MB payload for its tab counts. */
 export async function getQueryIntelligenceSummary(options:{now?:number;force?:boolean}={}):Promise<QueryIntelligenceSummary>{const now=options.now??Date.now(); if(!options.force&&queryIntelligenceSummaryCache&&isQueryIntelligenceSummaryCacheFresh(queryIntelligenceSummaryCache.at,now))return queryIntelligenceSummaryCache.value; const db=await getDb(); const res=await db.query(`SELECT
@@ -2054,7 +2051,8 @@ export async function getQueryIntelligenceSummary(options:{now?:number;force?:bo
   (SELECT COUNT(*)::int FROM query_library WHERE collection='REJECTED') AS rejected_count,
   (SELECT COUNT(*)::int FROM extracted_trading_vocabulary) AS vocabulary_count,
   (SELECT COUNT(*)::int FROM canonical_trading_terms) AS terminology_count,
-  (SELECT COUNT(*)::int FROM query_execution_logs) AS execution_log_count`); let searchEligibleTerminologyCount:number; if(searchEligibleCountCache&&isQueryIntelligenceSummaryCacheFresh(searchEligibleCountCache.at,now,SEARCH_ELIGIBLE_COUNT_TTL_MS)){searchEligibleTerminologyCount=searchEligibleCountCache.value;}else{const eligibleRows=await db.query(`SELECT canonical_term,term_type,country,language,lifecycle_status,search_eligible FROM canonical_trading_terms WHERE search_eligible=true AND lifecycle_status IN ('SEARCH_TRIAL','PROVEN_SEARCH_TERM') LIMIT $1`,[SEARCH_ELIGIBLE_COUNT_MAX_ROWS]); searchEligibleTerminologyCount=countPlannerEligibleTerminologyRows(eligibleRows.rows as any); searchEligibleCountCache={at:now,value:searchEligibleTerminologyCount};} const r=res.rows[0]||{}; const value={queryCount:Number(r.query_count||0),provenCount:Number(r.proven_count||0),experimentalCount:Number(r.experimental_count||0),rejectedCount:Number(r.rejected_count||0),vocabularyCount:Number(r.vocabulary_count||0),terminologyCount:Number(r.terminology_count||0),searchEligibleTerminologyCount,executionLogCount:Number(r.execution_log_count||0)}; queryIntelligenceSummaryCache={at:now,value}; return value;}
+  (SELECT COUNT(*)::int FROM canonical_trading_terms WHERE search_eligible) AS search_eligible_count,
+  (SELECT COUNT(*)::int FROM query_execution_logs) AS execution_log_count`); const r=res.rows[0]||{}; const value={queryCount:Number(r.query_count||0),provenCount:Number(r.proven_count||0),experimentalCount:Number(r.experimental_count||0),rejectedCount:Number(r.rejected_count||0),vocabularyCount:Number(r.vocabulary_count||0),terminologyCount:Number(r.terminology_count||0),searchEligibleTerminologyCount:Number(r.search_eligible_count||0),executionLogCount:Number(r.execution_log_count||0)}; queryIntelligenceSummaryCache={at:now,value}; return value;}
 export async function getQueriesByCountry(country:string):Promise<QueryRecord[]>{const db=await getDb(); const res=await db.query(`SELECT * FROM query_library WHERE LOWER(country)=LOWER($1) AND status='ACTIVE' ORDER BY performance_score DESC,times_executed ASC`,[country]); return res.rows.map(rowToQuery);}
 
 export interface QueryTerminologyCurrentStatus {

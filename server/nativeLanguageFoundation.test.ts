@@ -128,15 +128,17 @@ test('dashboard eligibility reflects the planner gate, not a stale flag', () => 
   assert.equal(dashboardSearchEligibility({ canonical_term: 'ICT', term_type: 'TERMINOLOGY', country: 'United States', language: 'en', lifecycle_status: 'SEARCH_TRIAL', search_eligible: true }).search_eligible, true);
   assert.equal(dashboardSearchEligibility({ canonical_term: 'ICT', term_type: 'TERMINOLOGY', country: 'United States', language: 'en', lifecycle_status: 'DEMOTED', search_eligible: false }).search_eligible, false);
   assert.equal(dashboardSearchEligibility({ canonical_term: 'ICT', term_type: 'TERMINOLOGY', country: 'United States', language: 'en', lifecycle_status: 'OBSERVED', search_eligible: true }).search_eligible, false);
+  assert.equal(dashboardSearchEligibility({ canonical_term: 'Footprint Trading', term_type: 'TERMINOLOGY', country: 'United States', language: 'en', lifecycle_status: 'PROVEN_SEARCH_TERM', search_eligible: true }).search_eligible, true);
 });
 
 test('summary count and dashboard ordering use computed eligibility', () => {
   const rows = [
     { canonical_term: '🔴', term_type: 'FORMAT', country: 'United States', language: 'en', lifecycle_status: 'SEARCH_TRIAL', search_eligible: true },
     { canonical_term: 'ICT', term_type: 'TERMINOLOGY', country: 'United States', language: 'en', lifecycle_status: 'SEARCH_TRIAL', search_eligible: true },
+    { canonical_term: 'Footprint Trading', term_type: 'TERMINOLOGY', country: 'United States', language: 'en', lifecycle_status: 'PROVEN_SEARCH_TERM', search_eligible: true },
     { canonical_term: 'Gold', term_type: 'INSTRUMENT', country: 'United States', language: 'en', lifecycle_status: 'DEMOTED', search_eligible: false },
   ];
-  assert.equal(countPlannerEligibleTerminologyRows(rows), 1);
+  assert.equal(countPlannerEligibleTerminologyRows(rows), 2);
   const ordered = orderDashboardTerminologyRows(rows.map(row => ({ ...row, ...dashboardSearchEligibility(row) })));
   assert.equal(ordered[0].canonical_term, 'ICT');
   assert.equal(ordered[ordered.length - 1].canonical_term, 'Gold');
