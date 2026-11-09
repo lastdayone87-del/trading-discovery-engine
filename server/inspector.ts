@@ -9,6 +9,7 @@ import { decideFrontierStep, scoreFrontierCandidate, classifyBlockedAcquisition,
 import { canonicalSiteIdentity, isSiteInspectionReusable, buildBorrowedSiteInspection, hasSameOwnerPendingCandidates, siteInspectionCoversRequest, isSufficientRenderedCoverage, rootCoverageTerminal, mergeRedirectBinding, redirectBindingFor, redirectDestinations, REDIRECT_BINDING_KIND, checksumSiteFacts, SITE_INSPECTION_POLICY_VERSION, isExactBarrierPageCover, aggregateSeedOutcome, SITE_INSPECTION_CLAIM_STATUS, type SiteIdentity, type SiteInspectionStore } from './siteInspectionCache';
 import { fetchRecentVideoDescriptionsWithIds, type RecentVideoDescription } from './youtube';
 import {candidateFromNativeInvite,extractDiscordCandidates,makeDiscordCandidate,mergeDiscordCandidates,type DiscordCandidate} from './discordCandidates';
+import {acquireDiscordPublicSurface,discordPublicSurfaceFor} from './discordPublicSurface';
 import { bumpRepeatFailureHistoryOutage, bumpRepeatFailureSkip } from './operationsTelemetry';
 import type { BrowserFallbackResult } from './browserCommunityFallback';
 import { RENDERED_CONTROL_EVALUATION_WINDOW, normalizeVisitUrl, type BrowserFallbackBudget } from './browserCommunityFallback';
@@ -237,7 +238,7 @@ export function nextRenderedClickOffsets(
 }
 
 
-export interface NormalizedExternalUrl {url:string;wrapperUrl?:string;kind:'WEBSITE'|'SOCIAL'|'MESSAGING'}
+export interface NormalizedExternalUrl {url:string;wrapperUrl?:string;kind:'WEBSITE'|'SOCIAL'|'MESSAGING'|'DISCORD'}
 const socialHosts=new Set(['twitter.com','www.twitter.com','x.com','www.x.com','instagram.com','www.instagram.com','tiktok.com','www.tiktok.com','facebook.com','www.facebook.com']);
 const directDiscordHosts=new Set(['discord.gg','www.discord.gg','discord.com','www.discord.com','discordapp.com','www.discordapp.com','discord.app','www.discord.app']);
 /**
@@ -290,6 +291,11 @@ export function normalizeExternalUrl(raw:string):NormalizedExternalUrl|null {
     if(parsed.username||parsed.password)return null;
     const host=parsed.hostname.toLowerCase();
     if(host==='youtube.com'||host.endsWith('.youtube.com')||host==='youtu.be')return null;
+    // H1: Discord server-directory and widget URLs are public community
+    // surfaces, not terminal invites. Admit only those two shapes; every
+    // other Discord path keeps the existing terminal-invite behavior.
+    const discordSurface=discordPublicSurfaceFor(parsed.toString());
+    if(discordSurface)return {url:discordSurface.canonicalUrl,kind:'DISCORD',...(wrapperUrl?{wrapperUrl}:{})};
     if(directDiscordHosts.has(host))return null;
     // R6 admission boundary (shared, generic): malformed/non-public and
     // asset/resource URLs never become crawl candidates. This runs before
@@ -1465,7 +1471,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   }
 
   function addStep(stepName:InspectionStep['step'],title:string,status:InspectionStep['status'],detailsArr:string[],foundInvite:string|null=null,inviteLocation:string|undefined=undefined,foundInvites:string[]=[]){steps.push({step:stepName,title,status,details:detailsArr.join('\n'),detectedInvite:foundInvite||undefined,detectedInvites:foundInvites.length?foundInvites:foundInvite?[foundInvite]:undefined,inviteLocation,timestamp:now});if(debugLog&&status==='NOT_FOUND'&&!debugLog.failureStep)debugLog.failureStep=stepName;}
-  let collectedExternalUrls:{url:string;wrapperUrl?:string;kind:'WEBSITE'|'SOCIAL'|'MESSAGING';contextMatches:boolean;source:string}[]=[];const checkContext=(text:string,url:string):boolean=>{const contextKeywords=['discord','community','join','trading floor','members','server'],lowerText=text.toLowerCase(),urlIndex=lowerText.indexOf(url.toLowerCase());if(urlIndex===-1)return false;const window=lowerText.substring(Math.max(0,urlIndex-100),Math.min(lowerText.length,urlIndex+url.length+100));return contextKeywords.some(kw=>window.includes(kw));};
+  let collectedExternalUrls:{url:string;wrapperUrl?:string;kind:'WEBSITE'|'SOCIAL'|'MESSAGING'|'DISCORD';contextMatches:boolean;source:string}[]=[];const checkContext=(text:string,url:string):boolean=>{const contextKeywords=['discord','community','join','trading floor','members','server'],lowerText=text.toLowerCase(),urlIndex=lowerText.indexOf(url.toLowerCase());if(urlIndex===-1)return false;const window=lowerText.substring(Math.max(0,urlIndex-100),Math.min(lowerText.length,urlIndex+url.length+100));return contextKeywords.some(kw=>window.includes(kw));};
   // R6 admission audit trail: every candidate rejected by the shared admission
   // boundary is logged with its stable reason code (no silent drops).
   const admissionRejectionLogs:string[]=[];
@@ -1515,7 +1521,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   const admissionRecoveryLogs:string[]=[];const admissionTruncationSignals:string[]=[];const seedDedupeLogs:string[]=[];
   const siblingValuedKeysByHost=new Map<string,Set<string>>();const siblingPathsByHost=new Map<string,Set<string>>();
   for(const item of collectedExternalUrls){let parsed:URL|null=null;try{parsed=new URL(item.url);}catch{continue;}const host=parsed.hostname.toLowerCase();if(!siblingPathsByHost.has(host))siblingPathsByHost.set(host,new Set());siblingPathsByHost.get(host)!.add(parsed.pathname||'/');for(const [key,value] of parsed.searchParams){if(value){if(!siblingValuedKeysByHost.has(host))siblingValuedKeysByHost.set(host,new Set());siblingValuedKeysByHost.get(host)!.add(key);}}}
-  const uniqueUrls=new Map<string,{url:string;wrapperUrl?:string;kind:'WEBSITE'|'SOCIAL'|'MESSAGING';contextMatches:boolean;source:string;sitemapUrl?:string}>();const collapseIndex=new Map<string,string>();
+  const uniqueUrls=new Map<string,{url:string;wrapperUrl?:string;kind:'WEBSITE'|'SOCIAL'|'MESSAGING'|'DISCORD';contextMatches:boolean;source:string;sitemapUrl?:string}>();const collapseIndex=new Map<string,string>();
   // Collapse key for bare/www duplicates: same site identity, scheme, path,
   // and query with hosts equal modulo one leading www. Null when the rule
   // does not apply (unidentifiable, non-www hosts are keyed distinctly so
@@ -1523,6 +1529,61 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   const wwwSchemeCollapseKey=(rawUrl:string):string|null=>{let parsed:URL;try{parsed=new URL(rawUrl);}catch{return null;}const identity=canonicalSiteIdentity(rawUrl)?.siteIdentity;if(!identity)return null;const host=parsed.hostname.toLowerCase();const stripped=host.replace(/^www\./,'');return `${identity}\u0000${parsed.protocol}\u0000${stripped}\u0000${parsed.port}\u0000${parsed.pathname}\u0000${parsed.search}`;};
   const hostsDifferOnlyByWww=(a:string,b:string):boolean=>{let pa:URL,pb:URL;try{pa=new URL(a);pb=new URL(b);}catch{return false;}const ha=pa.hostname.toLowerCase(),hb=pb.hostname.toLowerCase();return ha!==hb&&(ha===`www.${hb}`||hb===`www.${ha}`)&&pa.port===pb.port;};
   for(const item of collectedExternalUrls){let seedUrl=item.url;if(item.kind==='WEBSITE'){try{const host=new URL(seedUrl).hostname.toLowerCase();const recovered=recoverTruncatedQueryToRoot(seedUrl,siblingValuedKeysByHost.get(host)??new Set());if(recovered&&recovered!==seedUrl){admissionRecoveryLogs.push(`Recovered truncated query to host root (TRUNCATED_QUERY_PREFIX): ${seedUrl} → ${recovered}`);seedUrl=recovered;}else if(isPossiblyTruncatedPath(seedUrl,siblingPathsByHost.get(host)??new Set())){admissionTruncationSignals.push(`Possibly truncated path (signal only, still eligible): ${seedUrl}`);}}catch{/* recovery never breaks collection */}}const key=seedUrl;const existing=uniqueUrls.get(key);if(existing){if(item.contextMatches)existing.contextMatches=true;continue;}if(item.kind==='WEBSITE'){const collapseKey=wwwSchemeCollapseKey(seedUrl);if(collapseKey){const primaryKey=collapseIndex.get(collapseKey);const primary=primaryKey?uniqueUrls.get(primaryKey):undefined;if(primary&&hostsDifferOnlyByWww(primary.url,seedUrl)){if(item.contextMatches)primary.contextMatches=true;seedDedupeLogs.push(`Seed deduplicated (BARE_WWW_DUPLICATE): ${seedUrl} → kept ${primary.url}`);continue;}if(!primaryKey)collapseIndex.set(collapseKey,key);}}uniqueUrls.set(key,{...item,url:seedUrl});}const allCollectedUrls=Array.from(uniqueUrls.values());let websiteUrls=rankCommunitySurfaces(allCollectedUrls.filter(u=>u.kind==='WEBSITE'));const socialBioUrls=rankCommunitySurfaces(allCollectedUrls.filter(u=>u.kind==='SOCIAL')),messagingUrls=rankCommunitySurfaces(allCollectedUrls.filter(u=>u.kind==='MESSAGING'));
+
+  // H1: Discord server-directory and widget URLs carry no terminal invite in
+  // the URL. They are admitted as a distinct kind and resolved after every
+  // text source has been collected (bio, links, descriptions), so the same
+  // surface is fetched once and candidate attribution keeps the first source
+  // that named it. Acquisition observations use CHANNEL_EXTERNAL_LINKS as the
+  // retry-owning surface because these are external community locators; the
+  // candidate itself keeps the original source surface for ownership scoring.
+  const discordSurfaceSeeds=allCollectedUrls.filter(item=>item.kind==='DISCORD');
+  const stepDiscordLogs:string[]=[];
+  const discordSurfaceCandidates:DiscordCandidate[]=[];
+  const discordSurfaceForSource=(source:string):AcquisitionSurface=>
+    source.startsWith('VIDEO_')?'RECENT_VIDEO_DESCRIPTIONS'
+      :source==='CHANNEL_ABOUT'?'YOUTUBE_ABOUT'
+        :source==='SOCIAL_LINKS'?'SOCIAL_PROFILES'
+          :'CHANNEL_EXTERNAL_LINKS';
+  if(discordSurfaceSeeds.length){
+    stepDiscordLogs.push(`Inspecting ${discordSurfaceSeeds.length} Discord server/widget surface URL(s).`);
+    let foundSurfaces=0,inspectedSurfaces=0,failedSurfaces=0;
+    for(const seed of discordSurfaceSeeds){
+      const surface=discordPublicSurfaceFor(seed.url);
+      if(!surface){stepDiscordLogs.push(`Malformed Discord surface skipped: ${seed.url}`);continue;}
+      const candidateSourceSurface=discordSurfaceForSource(seed.source);
+      const acquired=await acquireDiscordPublicSurface({
+        surface,
+        sourceSurface:candidateSourceSurface,
+        fetchImpl:channelData.externalFetchImpl||fetch,
+        resolveHost:channelData.destinationResolver,
+      });
+      discordSurfaceCandidates.push(...acquired.candidates);
+      if(acquired.outcome==='FOUND')foundSurfaces++;
+      else if(acquired.outcome==='INSPECTED_NO_MATCH')inspectedSurfaces++;
+      else failedSurfaces++;
+      const kindLabel=surface.kind==='WIDGET'?'widget':'server page';
+      stepDiscordLogs.push(`Discord ${kindLabel} ${surface.canonicalUrl} (source: ${seed.source}) → ${acquired.outcome}: ${acquired.detail}`);
+      acquisitionOutcomes.push({
+        requestedUrl:surface.canonicalUrl,
+        surface:'CHANNEL_EXTERNAL_LINKS',
+        required:true,
+        outcome:acquired.outcome,
+        retryable:acquired.retryable,
+        failureClass:acquired.failureClass,
+        detail:`Discord ${kindLabel} from ${seed.source}: ${acquired.detail}`,
+        observedAt:now,
+        telemetry:{...staticCrawlerTelemetry({pagesInspected:acquired.pagesInspected,redirectsFollowed:0}),requestsStarted:Math.max(0,acquired.requestsStarted)},
+      });
+    }
+    const mergedSurfaceCandidates=mergeDiscordCandidates(discordSurfaceCandidates,ownershipInput);
+    retainCandidates(mergedSurfaceCandidates);
+    if(mergedSurfaceCandidates.length)stepDiscordLogs.push(`${mergedSurfaceCandidates.length} distinct candidate(s) retained from Discord public surfaces.`);
+    const stepStatus:InspectionStep['status']=(foundSurfaces||inspectedSurfaces)&&failedSurfaces?'PARTIAL':foundSurfaces?'FOUND':failedSurfaces?'ERROR':inspectedSurfaces?'NOT_FOUND':'SKIPPED';
+    const surfaceSources=new Set(mergedSurfaceCandidates.map(candidate=>candidate.sourceSurface));
+    const stepInviteLocation=surfaceSources.size===1?mergedSurfaceCandidates[0]?.sourceSurface:undefined;
+    addStep('DISCORD_SURFACES','Step 3b — Discord Server & Widget Surfaces',stepStatus,stepDiscordLogs,mergedSurfaceCandidates[0]?.nativeInviteCode||null,stepInviteLocation,mergedSurfaceCandidates.map(candidate=>candidate.nativeInviteCode!).filter(Boolean));
+  }else addStep('DISCORD_SURFACES','Step 3b — Discord Server & Widget Surfaces','SKIPPED',['No Discord server-page or widget URLs were discovered.']);
   // P-B acquisition ladder (flag-gated, default off): sitemap-inventoried URLs
   // enter as scored seed nominations through the normal ranking and budgets.
   // Flag off (or missing/failed profiles) yields zero seeds, leaving the
