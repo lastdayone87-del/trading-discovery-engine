@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { MAX_INSPECTED_VIDEO_DESCRIPTIONS } from './inspector';
+import { MAX_INSPECTED_VIDEO_DESCRIPTIONS, orderVideoDescriptionsForInspection } from './inspector';
 import { runChannelInspectionForTest as runChannelInspection } from './testCrawlHelpers';
 
 const noInvite = (index: number) => `Recent upload ${index + 1}: market recap with no community link.`;
@@ -106,4 +106,25 @@ test('H3 skips cleanly when every supplied description is empty', async () => {
 
   assert.equal(result.foundInvite, null);
   assert.equal(result.steps.find(item => item.step === 'VIDEO_DESCRIPTIONS')?.status, 'SKIPPED');
+});
+
+test('H3 channel-sampled top-ups outrank preloaded snippets in the ten slots', () => {
+  const channelSampled = [
+    'api upload 1', 'api upload 2', 'api upload 3', 'api upload 4', 'api upload 5',
+    'keyless top-up 6', 'keyless top-up 7', 'keyless top-up 8', 'keyless top-up 9', 'keyless top-up 10',
+  ];
+  const preloaded = ['preloaded snippet 1', 'preloaded snippet 2', 'preloaded snippet 3', 'preloaded snippet 4', 'preloaded snippet 5'];
+  const ordered = orderVideoDescriptionsForInspection(channelSampled, preloaded);
+  assert.deepEqual(ordered.slice(0, MAX_INSPECTED_VIDEO_DESCRIPTIONS), channelSampled);
+  assert.deepEqual(ordered.slice(MAX_INSPECTED_VIDEO_DESCRIPTIONS), preloaded);
+});
+
+test('H3 ordering trims, drops empty values, and dedupes while preserving order', () => {
+  assert.deepEqual(
+    orderVideoDescriptionsForInspection(
+      ['  first  ', '', 'second'],
+      ['second', '   ', 'third'],
+    ),
+    ['first', 'second', 'third'],
+  );
 });
