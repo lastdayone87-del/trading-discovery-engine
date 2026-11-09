@@ -21,8 +21,8 @@ export interface LanguageDetection {
   confidence: number;
   script: LanguageScript;
   method: 'SCRIPT' | 'LEXICON' | 'UNDETERMINED';
-  /** True when the country hint, rather than the text alone, chose the winner. */
-  tieResolvedByHint?: boolean;
+  /** True when the country hint helped choose the language (tie or script reading). */
+  hintResolved?: boolean;
 }
 
 export interface DetectLanguageOptions {
@@ -133,7 +133,9 @@ export function detectLanguage(text: string, options: DetectLanguageOptions = {}
     // Kanji-only surface is Chinese unless the country hint says Japan, in
     // which case Japanese is the better market-scoped reading.
     if (script.language === 'zh' && hint === 'ja') {
-      return { language: 'ja', confidence: 0.7, script: 'Hani', method: 'SCRIPT' };
+      // Kanji-only text is genuinely ambiguous between Chinese and Japanese;
+      // this is a market-scoped hint reading, not a text-only determination.
+      return { language: 'ja', confidence: 0.7, script: 'Hani', method: 'SCRIPT', hintResolved: true };
     }
     return { language: script.language, confidence: 0.98, script: script.script, method: 'SCRIPT' };
   }
@@ -174,7 +176,7 @@ export function detectLanguage(text: string, options: DetectLanguageOptions = {}
     confidence: Number(confidence.toFixed(3)),
     script: script.script,
     method: 'LEXICON',
-    ...(tied.length > 1 ? { tieResolvedByHint: true } : {}),
+    ...(tied.length > 1 ? { hintResolved: true } : {}),
   };
 }
 

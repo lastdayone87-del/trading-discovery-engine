@@ -991,6 +991,19 @@ test('Final integration: a hint-resolved tie does not permanently label the cano
   assert.equal(runner.canonicalTerms.get(termId!)?.language, 'und');
 });
 
+test('Final integration: Kanji-only Japanese hint does not lock the canonical language', async () => {
+  const runner = createMockRunner();
+  const termId = await observeTerminology({
+    term: '日経225先物', country: 'Japan', termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE', videoId: 'VID_JP_KANJI_1',
+    sourceCreatorCountry: 'JP', targetMarketCountry: 'JP'
+  }, runner);
+  const observation = runner.observations.find(row => row.canonical_term_id === termId);
+  assert.ok(observation);
+  assert.equal(observation.term_language, 'ja');
+  assert.equal(runner.canonicalTerms.get(termId!)?.language, 'und');
+});
+
 test('Final integration: explicit German context promotes agreeing German terminology', async () => {
   const runner = createMockRunner();
   const termId = await observeTerminology({

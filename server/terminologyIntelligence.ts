@@ -1126,7 +1126,7 @@ export async function observeTerminologyDetailed(args: {
     : null;
   const canonicalLanguage = contextLang !== 'und'
     ? contextLang
-    : detectedCanonical && detectedCanonical.language !== 'und' && !detectedCanonical.tieResolvedByHint
+    : detectedCanonical && detectedCanonical.language !== 'und' && !detectedCanonical.hintResolved
       ? detectedCanonical.language
       : 'und';
   const weight = args.humanApproved ? 2.5 : args.observationType === 'ENRICHMENT' ? 1.25 : 1;
