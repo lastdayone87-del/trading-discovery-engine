@@ -184,3 +184,34 @@ test('multiple concrete market contexts can corroborate a retrieval hypothesis w
   assert.equal(decision.disposition, 'PLAUSIBLE_TRADING_HYPOTHESIS');
   assert.ok(decision.reasonCodes.includes('MULTIPLE_MARKET_CONTEXT_SIGNALS_CORROBORATE_RETRIEVAL'));
 });
+
+
+test('reviewed native market rows with retained companion requirements cannot execute alone', () => {
+  const decision = evaluateAutonomousQueryAuthority(query({
+    query: 'STI analysis',
+    country: 'Singapore',
+    generation_metadata: {
+      queryTemplate: 'SINGLE_ATOM',
+      retrievalSpecificity: {
+        policyVersion: RETRIEVAL_SPECIFICITY_POLICY_VERSION,
+        eligibility: 'STANDALONE',
+        ambiguity: 72,
+        requiredCompanionClasses: ['INSTRUMENT', 'METHOD', 'STRATEGY', 'PLATFORM'],
+      },
+      atoms: [{
+        type: 'MARKET',
+        origin: 'COUNTRY_VOCABULARY',
+        term: 'STI analysis',
+        retrievalPolicy: {
+          policyVersion: RETRIEVAL_SPECIFICITY_POLICY_VERSION,
+          eligibility: 'STANDALONE',
+          ambiguity: 72,
+          requiredCompanionClasses: ['INSTRUMENT', 'METHOD', 'STRATEGY', 'PLATFORM'],
+          reasonCodes: ['REVIEWED_NATIVE_PHRASE', 'AMBIGUOUS_MARKET_CONTEXT_REQUIRES_COMPANION'],
+        },
+      }],
+    },
+  } as any));
+  assert.equal(decision.eligible, false);
+  assert.ok(decision.reasonCodes.includes('REVIEWED_NATIVE_REQUIRES_COMPANION'));
+});

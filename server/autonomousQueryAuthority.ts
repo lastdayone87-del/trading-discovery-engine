@@ -258,6 +258,27 @@ export function evaluateAutonomousQueryAuthority(
   if (atoms.length) {
     const staleAtom = atoms.find(atom => atom.retrievalPolicy?.policyVersion !== RETRIEVAL_SPECIFICITY_POLICY_VERSION);
     if (staleAtom) return { eligible: false, reasonCodes: ['ATOM_POLICY_PROVENANCE_STALE'], retrievalPolicyVersion: specificity.policyVersion };
+    // Reviewed native surfaces are audit provenance, not an authorization to
+    // ignore companion requirements. Older rows were written with
+    // eligibility=STANDALONE while retaining the generic ambiguity and
+    // requiredCompanionClasses metadata; a bare high-ambiguity surface (STI,
+    // Bolero, a broker/platform name) must not execute alone.
+    const earlyReviewedNativeSurface = Array.isArray(atoms[0]?.retrievalPolicy?.reasonCodes)
+      && atoms[0].retrievalPolicy.reasonCodes.includes('REVIEWED_NATIVE_PHRASE');
+    const companionClasses = Array.isArray(specificity.requiredCompanionClasses)
+      ? specificity.requiredCompanionClasses
+      : [];
+    if (
+      template === 'SINGLE_ATOM'
+      && earlyReviewedNativeSurface
+      && (companionClasses.length > 0 || Number(specificity.ambiguity) >= 60)
+    ) {
+      return {
+        eligible: false,
+        reasonCodes: ['REVIEWED_NATIVE_REQUIRES_COMPANION'],
+        retrievalPolicyVersion: specificity.policyVersion,
+      };
+    }
     const anchor = atoms[0]?.retrievalPolicy?.eligibility;
     if (
       !['STANDALONE', 'ANCHOR_ONLY'].includes(String(anchor))

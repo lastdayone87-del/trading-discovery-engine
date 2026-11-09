@@ -10,7 +10,7 @@ import { isProductionConfiguredCountry } from './queryQuality/profiles';
 
 export type QueryKnowledgeTier = 1 | 2 | 3;
 export type QueryGenerationMode = 'EXPLORATION' | 'EXPLOITATION' | 'COLD_START';
-export type SearchAtomType = 'INSTRUMENT' | 'METHOD' | 'MARKET' | 'FORMAT' | 'LEARNED' | 'CONCEPT' | 'ENTITY' | 'TOPIC' | 'NEIGHBORHOOD' | 'COVERAGE';
+export type SearchAtomType = 'INSTRUMENT' | 'METHOD' | 'MARKET' | 'BROKER' | 'PLATFORM' | 'FORMAT' | 'LEARNED' | 'CONCEPT' | 'ENTITY' | 'TOPIC' | 'NEIGHBORHOOD' | 'COVERAGE';
 export type QueryCandidateSource = 'TERMINOLOGY' | 'FREE_SIGNAL' | 'SEED' | 'MIXED' | 'DEMAND_SIGNAL';
 
 /** Per-query cap for the repeated searchability-gate audit snapshot. */
@@ -48,7 +48,7 @@ export interface ProvenTerminologyAtom { id: number; term: string; score: number
 const COUNTRY_SEARCH_ATOMS: Record<string, Array<[string, SearchAtomType, QueryIntent]>> = {
   'United States': [['NQ Futures', 'INSTRUMENT', 'futures'], ['ES Futures', 'INSTRUMENT', 'futures'], ['Order Flow', 'METHOD', 'strategy'], ['Footprint Chart', 'METHOD', 'indicators'], ['ICT', 'METHOD', 'strategy'], ['Volume Profile', 'METHOD', 'indicators'], ['Premarket', 'FORMAT', 'premarket_prep']],
   'United Kingdom': [['FTSE Trading', 'INSTRUMENT', 'stocks'], ['GBPUSD', 'INSTRUMENT', 'forex'], ['Spread Betting', 'METHOD', 'strategy'], ['London Session', 'MARKET', 'session_analysis'], ['Price Action', 'METHOD', 'strategy'], ['Trading Psychology', 'METHOD', 'psychology']],
-  Germany: [['DAX Analyse', 'INSTRUMENT', 'market_analysis'], ['DAX Trading', 'INSTRUMENT', 'futures'], ['Order Flow', 'METHOD', 'strategy'], ['Footprint Trading', 'METHOD', 'indicators'], ['Börsenanalyse', 'MARKET', 'market_analysis'], ['Technische Analyse', 'METHOD', 'education'], ['Futures Handel', 'METHOD', 'futures']],
+  Germany: [['DAX', 'INSTRUMENT', 'stocks'], ['DAX Analyse', 'INSTRUMENT', 'market_analysis'], ['DAX Trading', 'INSTRUMENT', 'futures'], ['Bund', 'INSTRUMENT', 'futures'], ['Order Flow', 'METHOD', 'strategy'], ['Footprint Trading', 'METHOD', 'indicators'], ['Börsenanalyse', 'MARKET', 'market_analysis'], ['Technische Analyse', 'METHOD', 'education'], ['Futures Handel', 'METHOD', 'futures']],
   France: [['CAC40 Analyse', 'INSTRUMENT', 'market_analysis'], ['Analyse Technique', 'METHOD', 'education'], ['Trading Futures', 'METHOD', 'futures'], ['Smart Money', 'METHOD', 'strategy'], ['Euronext', 'MARKET', 'stocks'], ['Journal Trading', 'FORMAT', 'trading_journals'], ['Flux Ordres', 'METHOD', 'strategy']],
   Spain: [['IBEX35', 'INSTRUMENT', 'stocks'], ['Análisis Técnico', 'METHOD', 'education'], ['Trading Forex', 'METHOD', 'forex'], ['Order Flow', 'METHOD', 'strategy'], ['Trading Intradía', 'METHOD', 'live_trading'], ['Futuros Trading', 'METHOD', 'futures']],
   Netherlands: [['AEX Trading', 'INSTRUMENT', 'stocks'], ['Technische Analyse', 'METHOD', 'education'], ['Opties Handelen', 'METHOD', 'options'], ['Beurs Analyse', 'MARKET', 'market_analysis'], ['Daghandel', 'METHOD', 'live_trading'], ['Order Flow', 'METHOD', 'strategy']],
@@ -76,24 +76,24 @@ const COUNTRY_SEARCH_ATOMS: Record<string, Array<[string, SearchAtomType, QueryI
  * queries, so they do not need to be paired with a global instrument.
  */
 const COUNTRY_NATIVE_QUERY_ATOMS: Record<string, Array<[string, SearchAtomType, QueryIntent]>> = {
-  'United States': [['premarket analysis', 'MARKET', 'premarket_prep'], ['opening bell', 'MARKET', 'session_analysis'], ['Topstep', 'MARKET', 'strategy'], ['Apex Trader', 'MARKET', 'strategy']],
-  'United Kingdom': [['London open', 'MARKET', 'session_analysis'], ['spread betting', 'METHOD', 'strategy'], ['IG Index', 'MARKET', 'stocks'], ['Trading 212', 'MARKET', 'stocks']],
-  Germany: [['DAX Analyse heute', 'MARKET', 'market_analysis'], ['DAX Analyse aktuell', 'MARKET', 'market_analysis'], ['Charttechnik DAX', 'MARKET', 'market_analysis'], ['Orderflow DAX', 'MARKET', 'strategy'], ['Trade Republic', 'MARKET', 'stocks'], ['XTB DAX', 'MARKET', 'stocks']],
-  France: [['analyse technique CAC', 'MARKET', 'market_analysis'], ["CAC 40 aujourd'hui", 'MARKET', 'market_analysis'], ['carnet ordres CAC', 'MARKET', 'strategy'], ['Boursorama CAC 40', 'MARKET', 'stocks'], ['Bourse Direct', 'MARKET', 'stocks'], ['PEA bourse', 'MARKET', 'stocks']],
+  'United States': [['premarket analysis', 'MARKET', 'premarket_prep'], ['opening bell', 'MARKET', 'session_analysis'], ['Topstep', 'PLATFORM', 'strategy'], ['Apex Trader', 'PLATFORM', 'strategy']],
+  'United Kingdom': [['London open', 'MARKET', 'session_analysis'], ['spread betting', 'METHOD', 'strategy'], ['IG Index', 'BROKER', 'stocks'], ['Trading 212', 'BROKER', 'stocks']],
+  Germany: [['DAX Analyse heute', 'MARKET', 'market_analysis'], ['DAX Analyse aktuell', 'MARKET', 'market_analysis'], ['Charttechnik DAX', 'MARKET', 'market_analysis'], ['Orderflow DAX', 'MARKET', 'strategy'], ['Trade Republic', 'BROKER', 'stocks'], ['XTB DAX', 'BROKER', 'stocks']],
+  France: [['analyse technique CAC', 'MARKET', 'market_analysis'], ["CAC 40 aujourd'hui", 'MARKET', 'market_analysis'], ['carnet ordres CAC', 'MARKET', 'strategy'], ['Boursorama CAC 40', 'BROKER', 'stocks'], ['Bourse Direct', 'BROKER', 'stocks'], ['PEA bourse', 'MARKET', 'stocks']],
   Spain: [['análisis técnico IBEX', 'MARKET', 'market_analysis'], ['IBEX 35 hoy', 'MARKET', 'market_analysis'], ['bolsa española análisis', 'MARKET', 'market_analysis'], ['velas japonesas', 'METHOD', 'indicators'], ['operativa intradía', 'METHOD', 'live_trading'], ['Bolsamanía IBEX', 'MARKET', 'market_analysis']],
   Netherlands: [['technische analyse AEX', 'MARKET', 'market_analysis'], ['AEX opening', 'MARKET', 'session_analysis'], ['opties AEX', 'MARKET', 'options'], ['Daghandel AEX', 'MARKET', 'live_trading'], ['Nico Bakker', 'MARKET', 'market_analysis'], ['Tostrams AEX', 'MARKET', 'market_analysis']],
   Italy: [['analisi tecnica FTSE', 'MARKET', 'market_analysis'], ['FTSE MIB oggi', 'MARKET', 'market_analysis'], ['analisi ciclica', 'METHOD', 'market_analysis'], ['titoli FTSE MIB', 'MARKET', 'stocks'], ['Milano Finanza', 'MARKET', 'market_analysis'], ['Teleborsa FTSE', 'MARKET', 'market_analysis']],
   Japan: [['日経225先物', 'MARKET', 'futures'], ['日経225 デイトレード', 'MARKET', 'live_trading'], ['日経225 チャート分析', 'MARKET', 'market_analysis'], ['ドル円 デイトレード', 'MARKET', 'forex'], ['板読み トレード', 'MARKET', 'strategy'], ['東京市場 オープン', 'MARKET', 'session_analysis']],
-  Denmark: [['OMXC25 analyse', 'MARKET', 'market_analysis'], ['teknisk analyse aktier', 'MARKET', 'market_analysis'], ['aktiehandel Danmark', 'MARKET', 'stocks'], ['Nordnet Danmark', 'MARKET', 'stocks']],
-  Sweden: [['OMXS30 analys', 'MARKET', 'market_analysis'], ['teknisk analys aktier', 'MARKET', 'market_analysis'], ['börsanalys Stockholm', 'MARKET', 'market_analysis'], ['Avanza aktier', 'MARKET', 'stocks']],
-  Norway: [['OBX analyse', 'MARKET', 'market_analysis'], ['teknisk analyse aksjer', 'MARKET', 'market_analysis'], ['Oslo Børs analyse', 'MARKET', 'market_analysis'], ['Nordnet aksjer', 'MARKET', 'stocks']],
-  Switzerland: [['Schweizer Börse Analyse', 'MARKET', 'market_analysis'], ['Charttechnik SMI', 'MARKET', 'market_analysis'], ['Swissquote SMI', 'MARKET', 'stocks']],
-  Belgium: [['BEL20 analyse', 'MARKET', 'market_analysis'], ['beursanalyse België', 'MARKET', 'market_analysis'], ['Euronext Brussels analyse', 'MARKET', 'market_analysis'], ['Bolero aandelen', 'MARKET', 'stocks']],
-  Luxembourg: [['LuxX Analyse', 'MARKET', 'market_analysis'], ['Bourse Luxembourg analyse', 'MARKET', 'market_analysis'], ['Swissquote Luxembourg', 'MARKET', 'stocks']],
-  Ireland: [['ISEQ 20 analyse', 'MARKET', 'market_analysis'], ['Euronext Dublin', 'MARKET', 'market_analysis'], ['Davy Select', 'MARKET', 'stocks']],
-  Singapore: [['STI analysis', 'MARKET', 'market_analysis'], ['SGX analysis', 'MARKET', 'market_analysis'], ['Singapore market outlook', 'MARKET', 'market_analysis'], ['DBS Vickers', 'MARKET', 'stocks']],
-  'New Zealand': [['NZX 50 analysis', 'MARKET', 'market_analysis'], ['NZX market wrap', 'MARKET', 'market_analysis'], ['Sharesies investing', 'MARKET', 'stocks']],
-  'United Arab Emirates': [['تداول الأسهم الإمارات', 'MARKET', 'stocks'], ['تحليل فني دبي', 'MARKET', 'market_analysis'], ['DFM trading', 'MARKET', 'stocks'], ['ADX trading', 'MARKET', 'stocks'], ['Sarwa investing', 'MARKET', 'stocks']],
+  Denmark: [['OMXC25 analyse', 'MARKET', 'market_analysis'], ['teknisk analyse aktier', 'MARKET', 'market_analysis'], ['aktiehandel Danmark', 'MARKET', 'stocks'], ['Nordnet Danmark', 'BROKER', 'stocks']],
+  Sweden: [['OMXS30 analys', 'MARKET', 'market_analysis'], ['teknisk analys aktier', 'MARKET', 'market_analysis'], ['börsanalys Stockholm', 'MARKET', 'market_analysis'], ['Avanza aktier', 'BROKER', 'stocks']],
+  Norway: [['OBX analyse', 'MARKET', 'market_analysis'], ['teknisk analyse aksjer', 'MARKET', 'market_analysis'], ['Oslo Børs analyse', 'MARKET', 'market_analysis'], ['Nordnet aksjer', 'BROKER', 'stocks']],
+  Switzerland: [['Schweizer Börse Analyse', 'MARKET', 'market_analysis'], ['Charttechnik SMI', 'MARKET', 'market_analysis'], ['Swissquote SMI', 'BROKER', 'stocks']],
+  Belgium: [['BEL20 analyse', 'MARKET', 'market_analysis'], ['beursanalyse België', 'MARKET', 'market_analysis'], ['Euronext Brussels analyse', 'MARKET', 'market_analysis'], ['Bolero aandelen', 'BROKER', 'stocks']],
+  Luxembourg: [['LuxX Analyse', 'MARKET', 'market_analysis'], ['Bourse Luxembourg analyse', 'MARKET', 'market_analysis'], ['Swissquote Luxembourg', 'BROKER', 'stocks']],
+  Ireland: [['ISEQ 20 analyse', 'MARKET', 'market_analysis'], ['Euronext Dublin', 'MARKET', 'market_analysis'], ['Davy Select', 'BROKER', 'stocks']],
+  Singapore: [['STI analysis', 'MARKET', 'market_analysis'], ['SGX analysis', 'MARKET', 'market_analysis'], ['Singapore market outlook', 'MARKET', 'market_analysis'], ['DBS Vickers', 'BROKER', 'stocks']],
+  'New Zealand': [['NZX 50 analysis', 'MARKET', 'market_analysis'], ['NZX market wrap', 'MARKET', 'market_analysis'], ['Sharesies investing', 'PLATFORM', 'stocks']],
+  'United Arab Emirates': [['تداول الأسهم الإمارات', 'MARKET', 'stocks'], ['تحليل فني دبي', 'MARKET', 'market_analysis'], ['DFM trading', 'MARKET', 'stocks'], ['ADX trading', 'MARKET', 'stocks'], ['Sarwa investing', 'PLATFORM', 'stocks']],
 };
 
 export function getCuratedQueryCountries(): string[] {
@@ -430,13 +430,14 @@ function countryAtoms(country: string, vocabulary?: CountryVocabulary): SearchAt
   const curated = (COUNTRY_SEARCH_ATOMS[country] || []).map(([term, type, intent]) => atom(term, type, intent, 1, 'CURATED'));
   const nativeQueries = (COUNTRY_NATIVE_QUERY_ATOMS[country] || []).map(([term, type, intent]) => {
     const nativeAtom = atom(term, type, intent, 1, 'COUNTRY_VOCABULARY');
-    // These are reviewed local surfaces, not ambiguous generic markets. They
-    // are allowed to stand alone; the generic MARKET specificity policy would
-    // otherwise force a companion and lose the actual local search phrase.
+    // Reviewed local surfaces are audit provenance, not an authorization to
+    // ignore retrieval specificity. Keep the policy evaluated for the atom's
+    // actual semantic class. High-ambiguity MARKET/BROKER/PLATFORM surfaces
+    // remain MODIFIER_ONLY and are paired with an authorized anchor below;
+    // only atoms whose own policy is STANDALONE may be selected as singles.
     nativeAtom.retrievalPolicy = {
       ...nativeAtom.retrievalPolicy,
-      eligibility: 'STANDALONE',
-      reasonCodes: [...nativeAtom.retrievalPolicy.reasonCodes, 'REVIEWED_NATIVE_PHRASE'],
+      reasonCodes: [...new Set([...nativeAtom.retrievalPolicy.reasonCodes, 'REVIEWED_NATIVE_PHRASE'])],
     };
     return nativeAtom;
   });
@@ -573,6 +574,26 @@ export function planDiverseQueries(args: {
     .flatMap(anchor => methods.map(method => ({ atoms: [anchor, method], template: 'COMPACT_PAIR' as const })))
     .filter(candidate => isRetrievalOrientedQuery(args.country, candidate.atoms.map(item => item.term).join(' ')));
   candidates.push(...compatiblePairs);
+
+  // Reviewed native surfaces that are not authorized to stand alone are still
+  // useful retrieval modifiers. Pair each with an authorized anchor instead of
+  // dropping it or promoting it to an ambiguous single. This is the path that
+  // keeps `STI analysis` and `Bolero aandelen` in companion-shaped queries
+  // (for example `USDSGD STI analysis` / `BEL20 Bolero aandelen`) while
+  // preventing the bare acronym/broker surface from searching on its own.
+  const nativeCompanionModifiers = anchors.filter(item =>
+    item.origin === 'COUNTRY_VOCABULARY'
+    && item.retrievalPolicy.eligibility === 'MODIFIER_ONLY'
+    && item.retrievalPolicy.requiredCompanionClasses.length > 0
+    && item.retrievalPolicy.reasonCodes.includes('REVIEWED_NATIVE_PHRASE'),
+  );
+  const nativeCompanionPairs = pairingAnchors
+    .flatMap(anchor => nativeCompanionModifiers.map(modifier => ({
+      atoms: [anchor, modifier],
+      template: 'COMPACT_PAIR' as const,
+    })))
+    .filter(candidate => isRetrievalOrientedQuery(args.country, candidate.atoms.map(item => item.term).join(' ')));
+  candidates.push(...nativeCompanionPairs);
 
   // A concrete local instrument plus a local market/exchange is a safe,
   // country-specific retrieval shape when the finite method combinations have

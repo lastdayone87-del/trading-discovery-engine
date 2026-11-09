@@ -51,6 +51,7 @@ import {
   markQueryRunResumeUnavailable,
   createContinuationRunSegment,
   setQueryRunJobId,
+  holdQueryForResultConsistency,
   markCommunityInspectionStarted,
   markSiteInspectionsClaimed,
   markSiteInspectionsDiscarded,
@@ -71,6 +72,7 @@ import {
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
 import { reserveIncrementalTreatmentPageQuota, releaseIncrementalTreatmentPageReservation, enqueueChildAndCommitPageReservation } from './retrievalPolicyCanary';
 import { resolveExecutionSearchWindow } from './retrievalExperiment';
+import { assessQueryResultConsistency } from './queryResultConsistency';
 import { trialContinuationCap } from './discoveryFrontierTrials';
 import { aggregatedLanguageCandidateSet, mergeCountryValidationResults, validateChannelCountry } from './countryValidator';
 import { runChannelInspection, hasProcessedAcquisitionEvidence } from './inspector';
@@ -2106,6 +2108,38 @@ export async function processNextSearchJob(
       searchRetrievalGrossMs += Date.now() - fallbackStartMs;
     }
     const distinctExtracted = [...new Map(extracted.map(channel => [channel.channelId, channel])).values()];
+    // Post-retrieval intent consistency: a query that returns a high share of
+    // scripts outside the target country's profile is held before any channel
+    // is persisted or queued for enrichment. The search quota is already spent;
+    // this guard prevents the far larger downstream spend and preserves the
+    // result evidence on the query/run for operator review.
+    const queryResultConsistency = queryId && source === 'automated_query'
+      ? assessQueryResultConsistency(country, distinctExtracted)
+      : null;
+    const queryResultHold = queryResultConsistency?.hold === true;
+    if (queryResultHold) {
+      await holdQueryForResultConsistency(queryId!, queryRunId, {
+        policyVersion: queryResultConsistency!.policyVersion,
+        reasonCodes: queryResultConsistency!.reasonCodes,
+        incompatibleShare: queryResultConsistency!.incompatibleShare,
+        sampleSize: queryResultConsistency!.sampleSize,
+        incompatibleScripts: queryResultConsistency!.incompatibleScripts,
+        expectedScripts: queryResultConsistency!.expectedScripts,
+        country,
+        query,
+      });
+      console.warn(JSON.stringify({
+        event: 'query_result_consistency_hold',
+        queryId,
+        queryRunId,
+        country,
+        query,
+        incompatibleShare: queryResultConsistency!.incompatibleShare,
+        sampleSize: queryResultConsistency!.sampleSize,
+        incompatibleScripts: queryResultConsistency!.incompatibleScripts,
+        timestamp: new Date().toISOString(),
+      }));
+    }
     const queryRecord=queryId?await getQueryById(queryId):null;
     const observations: QueryObservation[] = [];
     const sightings = [];
@@ -2118,7 +2152,7 @@ export async function processNextSearchJob(
     // worker.
     const classificationDecoupling = resolveClassificationDecouplingConfig();
     let classificationBackpressure: ClassificationBackpressureState | null = null;
-    for (const [index, raw] of distinctExtracted.entries()) {
+    for (const [index, raw] of (queryResultHold ? [] : distinctExtracted).entries()) {
       // A durable nomination is written before channel processing. When the
       // ledger is OFF, legacy channel_sightings remain the compatibility path.
       const nomination=await recordNomination({channelId:raw.channelId,sourceType:source,queryId,queryRunId,jobId:job.id,
@@ -2195,7 +2229,7 @@ export async function processNextSearchJob(
       const queryRecord = await getQueryById(queryId);
       if (!queryRecord) throw new Error(`Query ${queryId} no longer exists for run ${queryRunId}.`);
       const metrics = calculateQueryFunnel(searchPage?.rawResultCount ?? extracted.length, observations, deferredResults);
-      await recordQueryRunSightings(queryRunId, queryId, sightings.map(s=>({...s,pageNumber})));
+      if (sightings.length) await recordQueryRunSightings(queryRunId, queryId, sightings.map(s=>({...s,pageNumber})));
       const configuredMaxPages = Number(await getAppSetting('autonomous_pagination_max_pages', '50'));
       // A malformed setting must not become an unbounded (or NaN) page
       // ceiling. Fall back to the same 50-page default the migration seeds;
@@ -2487,8 +2521,8 @@ export async function processNextSearchJob(
         channelLoopStartMs,
         channelLoopEndMs,
         trial,
-        nextPageToken: searchPage?.nextPageToken || null,
-        createContinuation: shouldCreateContinuationSegment({
+        nextPageToken: queryResultHold ? null : (searchPage?.nextPageToken || null),
+        createContinuation: queryResultHold ? false : shouldCreateContinuationSegment({
           paginationEnabled: continuationEnabled,
           usingV2,
           primaryReason: decision.primaryReason,
@@ -2498,6 +2532,21 @@ export async function processNextSearchJob(
         continuationExplorationPagesRemaining: usingV2 ? decisionV2.explorationPagesRemaining : explorationPagesRemaining,
         continuationResumeMode: resumeModeForProvider(providerKey),
       });
+      if (queryResultHold) {
+        // completeQueryRun recomputes collection from the empty/held page
+        // metrics. Re-assert the terminal hold after finalization so a later
+        // selector cannot promote or re-use the query.
+        await holdQueryForResultConsistency(queryId, queryRunId, {
+          policyVersion: queryResultConsistency!.policyVersion,
+          reasonCodes: queryResultConsistency!.reasonCodes,
+          incompatibleShare: queryResultConsistency!.incompatibleShare,
+          sampleSize: queryResultConsistency!.sampleSize,
+          incompatibleScripts: queryResultConsistency!.incompatibleScripts,
+          expectedScripts: queryResultConsistency!.expectedScripts,
+          country,
+          query,
+        });
+      }
     }
     await completeJob(job.id);
     return true;

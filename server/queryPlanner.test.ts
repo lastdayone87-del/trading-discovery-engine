@@ -244,12 +244,15 @@ test('planner produces novel local instrument-market variants when every current
   });
   assert.equal(planned.length, 8);
   assert.ok(planned.every(item => !existing.some(saved => normalizeQuery(saved.query) === normalizeQuery(item.query))));
-  // Native local singles are now part of the pool, but the instrument-market
-  // fallback shape must still be available for a fully cooling-down library.
+  // Ambiguous native market/broker surfaces must never become singles; they
+  // remain useful as companion-shaped queries. The instrument-market fallback
+  // must still be available for a fully cooling-down library.
   const instrumentMarket = planned.filter(item => item.metadata.queryTemplate === 'INSTRUMENT_MARKET');
   assert.ok(instrumentMarket.length > 0, 'no novel instrument-market fallback was planned');
   assert.ok(instrumentMarket.every(item => /BEL|EURUSD/i.test(item.query)));
-  assert.ok(planned.some(item => item.metadata.queryTemplate === 'SINGLE_ATOM'));
+  assert.equal(planned.some(item => item.metadata.queryTemplate === 'SINGLE_ATOM'), false);
+  assert.ok(planned.some(item => /Bolero aandelen/.test(item.query)
+    && ((item.metadata as any).atoms as unknown[]).length >= 2));
 });
 
 test('accepted extracted queries are planned as standalone surfaces and pass admission/authority', () => {
@@ -489,4 +492,20 @@ test('short-ticker atoms survive to form qualified pairs but never search alone'
     `expected a qualified OBX pair among: ${queries.join(' | ')}`,
   );
   assert.ok(queries.every(query => isRetrievalOrientedQuery('Norway', query)));
+});
+
+
+test('ambiguous reviewed-native market and broker surfaces are never planned as standalone queries', () => {
+  const singapore = planDiverseQueries({ country: 'Singapore', count: 12, learnedVocabulary: [], existingQueries: [] });
+  const belgium = planDiverseQueries({ country: 'Belgium', count: 12, learnedVocabulary: [], existingQueries: [] });
+  const all = [...singapore, ...belgium];
+
+  assert.equal(all.some(item => item.query === 'STI analysis'), false);
+  assert.equal(all.some(item => item.query === 'Bolero aandelen'), false);
+  assert.equal(all.some(item => item.query === 'DBS Vickers'), false);
+
+  for (const item of all.filter(entry => /STI analysis|Bolero aandelen|DBS Vickers/.test(entry.query))) {
+    const atoms = (item.metadata as any).atoms as Array<Record<string, unknown>>;
+    assert.ok(atoms.length >= 2, `${item.query} must retain an authorized companion`);
+  }
 });

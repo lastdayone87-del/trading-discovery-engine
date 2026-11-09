@@ -2660,6 +2660,35 @@ export async function upsertQueryRecord(record:{query:string;country:string;coll
 }
 export async function updateQueryExecutionStats(queryId:number,stats:{totalChannelsFound:number;uniqueChannelsFound:number;qualityChannelsFound:number;communityChannelsFound:number;avgQualityScore:number;performanceScore:number;newCollection?:'PROVEN'|'EXPERIMENTAL'|'REJECTED';}):Promise<void>{const db=await getDb(); await db.query(`UPDATE query_library SET times_executed=times_executed+1,last_executed=now(),total_channels_found=total_channels_found+$1,unique_channels_found=unique_channels_found+$2,quality_channels_found=quality_channels_found+$3,community_channels_found=community_channels_found+$4,avg_quality_score=ROUND(((avg_quality_score*times_executed)+$5)/(times_executed+1)),performance_score=$6,collection=COALESCE($7,collection) WHERE id=$8`,[stats.totalChannelsFound,stats.uniqueChannelsFound,stats.qualityChannelsFound,stats.communityChannelsFound,stats.avgQualityScore,stats.performanceScore,stats.newCollection||null,queryId]);}
 export async function setQueryCollection(queryId:number,collection:'PROVEN'|'EXPERIMENTAL'|'REJECTED'):Promise<void>{const db=await getDb(); await db.query('UPDATE query_library SET collection=$1 WHERE id=$2',[collection,queryId]);}
+/**
+ * Quarantine a query after a post-retrieval consistency failure. The collection
+ * is terminal for autonomous selection; the hold evidence is retained in
+ * generation_metadata and on the run for review. Idempotent and never deletes
+ * evidence.
+ */
+export async function holdQueryForResultConsistency(queryId:number,runId:string|null,details:{
+  policyVersion:string; reasonCodes:string[]; incompatibleShare:number; sampleSize:number;
+  incompatibleScripts?:string[]; expectedScripts?:string[]; country?:string; query?:string;
+}):Promise<void>{
+  const db=await getDb();
+  const payload={queryHold:{...details,at:new Date().toISOString()}};
+  await db.query(
+    `UPDATE query_library
+     SET collection='REJECTED',
+         generation_metadata=COALESCE(generation_metadata,'{}'::jsonb)||$2::jsonb
+     WHERE id=$1`,
+    [queryId,JSON.stringify(payload)],
+  );
+  if(runId){
+    await db.query(
+      `UPDATE query_runs
+       SET next_page_token=NULL,
+           performance_details=COALESCE(performance_details,'{}'::jsonb)||$2::jsonb
+       WHERE id=$1`,
+      [runId,JSON.stringify(payload)],
+    );
+  }
+}
 export async function addQueryExecutionLog(log:{query_id?:number;query_run_id?:string;query:string;country:string;executed_at:string;channels_discovered:number;unique_new_channels:number;quality_creators_discovered:number;communities_discovered:number;cycle_quality_score:number;logs?:string[];}):Promise<void>{const db=await getDb(); await db.query(`INSERT INTO query_execution_logs(query_run_id,query_id,query,country,executed_at,channels_discovered,unique_new_channels,quality_creators_discovered,communities_discovered,cycle_quality_score,logs) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(query_run_id) WHERE query_run_id IS NOT NULL DO NOTHING`,[log.query_run_id||null,log.query_id||null,log.query,log.country,log.executed_at,log.channels_discovered,log.unique_new_channels,log.quality_creators_discovered,log.communities_discovered,log.cycle_quality_score,JSON.stringify(log.logs||[])]);}
 export async function getRecentQueryExecutionLogs(limit=20):Promise<QueryExecutionLog[]>{const db=await getDb(); const res=await db.query('SELECT * FROM query_execution_logs ORDER BY executed_at DESC LIMIT $1',[limit]); return res.rows.map(r=>({id:r.id,query_id:r.query_id||undefined,query:r.query,country:r.country,executed_at:iso(r.executed_at)||'',channels_discovered:r.channels_discovered||0,unique_new_channels:r.unique_new_channels||0,quality_creators_discovered:r.quality_creators_discovered||0,communities_discovered:r.communities_discovered||0,cycle_quality_score:r.cycle_quality_score||0,logs:parseJson(r.logs,[])}));}
 export async function saveExtractedTerm(country:string,term:string,category:'terminology'|'instrument'|'phrase'|'format',sourceChannelId?:string,clientOverride?:{query:(text:string,params?:unknown[])=>Promise<{rows:Array<Record<string,unknown>>}>}):Promise<void>{const outerRunner=clientOverride||await getDb();const poolLike='connect' in (outerRunner as object)&&typeof (outerRunner as {connect?:unknown}).connect==='function'&&!('release' in (outerRunner as object));const client=poolLike?await (outerRunner as unknown as import('pg').Pool).connect():null;const runner=((client??outerRunner)as unknown as {query:(text:string,params?:unknown[])=>Promise<{rows:Array<Record<string,unknown>>}>});try{if(client)await runner.query('BEGIN');const db={query:(text:string,params?:unknown[])=>runner.query(text,params)};const clean=term.trim(); if(!clean){if(client)await runner.query('COMMIT');return;}
