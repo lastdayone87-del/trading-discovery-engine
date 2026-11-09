@@ -15,7 +15,9 @@ import {
   getSchemaInfo,
   performManualDatabaseBackup,
   getAllQueries,
-  getQueriesByCountry,
+  getQueryLibraryPage,
+  getVocabularyPage,
+  getQueryIntelligenceSummary,
   getRecentQueryExecutionLogs,
   getExtractedVocabulary,
   setQueryCollection,
@@ -74,7 +76,7 @@ import {
 } from './server/autonomousDiscovery';
 import { generateCandidateQueriesForCountry } from './server/queryIntelligence';
 import { validateSelectionExperimentRequest } from './server/querySelectionExperiments';
-import { getTerminologyDashboard } from './server/terminologyIntelligence';
+import { getTerminologyDashboard, getTerminologyDashboardPage } from './server/terminologyIntelligence';
 import {
   runRegressionTestSuite,
   getRegressionRuns,
@@ -645,11 +647,27 @@ async function startServer() {
 
   // --- QUERY INTELLIGENCE ENGINE ROUTES ---
 
+  // 14b. Small aggregate counts. The dashboard uses this for tab labels and
+  // KPI cards so a slow/failed list request can never render a false zero.
+  app.get('/api/query-intelligence/summary', async (_req, res) => {
+    try {
+      res.json(await getQueryIntelligenceSummary());
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // 15. Get Query Library
   app.get('/api/query-intelligence/library', async (req, res) => {
     try {
-      const country = req.query.country as string | undefined;
-      let queries = country ? await getQueriesByCountry(country) : await getAllQueries();
+      const country = typeof req.query.country === 'string' && req.query.country.trim() ? req.query.country.trim() : undefined;
+      const requestedCollection = typeof req.query.collection === 'string' ? req.query.collection.toUpperCase() : '';
+      const collection = ['PROVEN', 'EXPERIMENTAL', 'REJECTED'].includes(requestedCollection) ? requestedCollection : undefined;
+      const limit = Math.max(1, Math.min(1000, parseInt(req.query.limit as string) || 500));
+      const offset = Math.max(0, Math.min(100000, parseInt(req.query.offset as string) || 0));
+      // Apply the selected country/collection in SQL BEFORE the page limit so
+      // a country's lower-ranked rows cannot disappear behind a global cutoff.
+      const queries = await getQueryLibraryPage(country, collection, limit, offset);
       res.json(queries);
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -659,8 +677,10 @@ async function startServer() {
   // 16. Get Extracted Vocabulary
   app.get('/api/query-intelligence/vocabulary', async (req, res) => {
     try {
-      const country = req.query.country as string | undefined;
-      const terms = await getExtractedVocabulary(country);
+      const country = typeof req.query.country === 'string' && req.query.country.trim() ? req.query.country.trim() : undefined;
+      const limit = Math.max(1, Math.min(1000, parseInt(req.query.limit as string) || 300));
+      const offset = Math.max(0, Math.min(100000, parseInt(req.query.offset as string) || 0));
+      const terms = await getVocabularyPage(country, limit, offset);
       res.json(terms);
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -670,7 +690,9 @@ async function startServer() {
   // Canonical Phase F view. The legacy vocabulary endpoint remains compatible.
   app.get('/api/query-intelligence/terminology', async (req, res) => {
     try {
-      res.json(await getTerminologyDashboard(req.query.country as string | undefined));
+      const limit = Math.max(1, Math.min(1000, parseInt(req.query.limit as string) || 200));
+      const offset = Math.max(0, Math.min(100000, parseInt(req.query.offset as string) || 0));
+      res.json(await getTerminologyDashboardPage(req.query.country as string | undefined, limit, offset));
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }

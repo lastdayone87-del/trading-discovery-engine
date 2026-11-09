@@ -1965,6 +1965,23 @@ export async function attributeTerminologyPerformance(query: QueryRecord, metric
   }
 }
 
+/** Bounded dashboard page. The tab count comes from the summary endpoint. */
+export async function getTerminologyDashboardPage(country?: string, limit = 200, offset = 0): Promise<unknown[]> {
+  const runner = await getDb();
+  const bounded = Math.max(1, Math.min(1000, Math.trunc(limit)));
+  const skipped = Math.max(0, Math.min(100000, Math.trunc(offset)));
+  const result = await runner.query(`SELECT t.*, COALESCE(a.aliases,'[]'::json) aliases, COALESCE(o.distinct_creators,0)::int distinct_creator_count,
+    COALESCE(p.executions,0)::int executions, COALESCE(p.new_creators,0)::int new_creators, COALESCE(p.decayed_yield_score,0)::float decayed_yield_score,
+    COALESCE(p.lanes,'{}'::json) retrieval_lanes, COALESCE(e.history,'[]'::json) lifecycle_history
+    FROM canonical_trading_terms t
+    LEFT JOIN LATERAL (SELECT json_agg(json_build_object('alias',alias,'type',alias_type,'language',language,'script',script)) aliases FROM trading_term_aliases WHERE canonical_term_id=t.id) a ON true
+    LEFT JOIN LATERAL (SELECT COUNT(DISTINCT source_channel_id) distinct_creators FROM terminology_observations WHERE canonical_term_id=t.id) o ON true
+    LEFT JOIN LATERAL (SELECT SUM(executions) executions,SUM(new_creators) new_creators,COALESCE(SUM(weighted_yield_total)/NULLIF(SUM(executions),0),0) decayed_yield_score,json_object_agg(retrieval_lane,lane_yield) lanes FROM (SELECT retrieval_lane,SUM(executions) executions,SUM(new_creators) new_creators,SUM(decayed_yield_score*executions) weighted_yield_total,AVG(decayed_yield_score) lane_yield FROM terminology_performance WHERE canonical_term_id=t.id GROUP BY retrieval_lane) x) p ON true
+    LEFT JOIN LATERAL (SELECT json_agg(json_build_object('type',event_type,'from',from_status,'to',to_status,'reason',reason,'at',created_at) ORDER BY created_at DESC) history FROM terminology_lifecycle_events WHERE canonical_term_id=t.id) e ON true
+    WHERE ($1::text IS NULL OR t.country=$1) ORDER BY t.search_eligible DESC,p.decayed_yield_score DESC,t.last_observed_at DESC NULLS LAST,t.id DESC LIMIT $2 OFFSET $3`, [country ? canonicalCountry(country) : null, bounded, skipped]);
+  return result.rows;
+}
+
 export async function getTerminologyDashboard(country?: string, clientOverride?: Queryable): Promise<unknown[]> {
   const runner = clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
   if (!runner) return [];
