@@ -106,5 +106,27 @@ test('search worker applies the consistency guard before processing a page and q
   assert.ok(guard >= 0, 'consistency guard must be wired into the search worker');
   assert.ok(loop > guard, 'the guard must run before the channel processing loop');
   assert.ok(hold >= 0, 'the worker must quarantine the query on a hold');
+  assert.match(source, /continuationEnabled && !queryResultHold && decision\.shouldContinue/);
   assert.match(source, /createContinuation: queryResultHold \? false/);
+});
+
+
+test('unmodeled foreign scripts are treated as incompatible rather than fail-open', () => {
+  const decision = assessQueryResultConsistency('United States', channels(
+    Array.from({ length: 12 }, (_, index) => ({
+      name: `us-${index}`,
+      description: 'Ֆինանսական շուկայի վերլուծություն և ներդրումներ',
+    })),
+  ));
+  assert.equal(decision.hold, true);
+  assert.ok(decision.incompatibleScripts.includes('Zzzz'));
+});
+
+test('country names that are inherited object keys fail open instead of throwing', () => {
+  for (const country of ['constructor', '__proto__', 'toString']) {
+    const decision = assessQueryResultConsistency(country, channels(
+      Array.from({ length: 12 }, (_, index) => ({ name: `x-${index}`, description: 'تحليل السوق.' })),
+    ));
+    assert.equal(decision.hold, false);
+  }
 });

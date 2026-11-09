@@ -2412,7 +2412,7 @@ export async function processNextSearchJob(
         await completeJob(job.id);
         return true;
       }
-      if (continuationEnabled && decision.shouldContinue && searchPage?.nextPageToken) {
+      if (continuationEnabled && !queryResultHold && decision.shouldContinue && searchPage?.nextPageToken) {
         let incPageReservationId: string | undefined;
 
         // Incremental Treatment Page Quota Reservation Boundary

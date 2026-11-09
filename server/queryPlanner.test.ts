@@ -500,12 +500,24 @@ test('ambiguous reviewed-native market and broker surfaces are never planned as 
   const belgium = planDiverseQueries({ country: 'Belgium', count: 12, learnedVocabulary: [], existingQueries: [] });
   const all = [...singapore, ...belgium];
 
-  assert.equal(all.some(item => item.query === 'STI analysis'), false);
-  assert.equal(all.some(item => item.query === 'Bolero aandelen'), false);
-  assert.equal(all.some(item => item.query === 'DBS Vickers'), false);
+  const normalized = all.map(item => normalizeQuery(item.query));
+  assert.equal(normalized.includes(normalizeQuery('STI analysis')), false);
+  assert.equal(normalized.includes(normalizeQuery('Bolero aandelen')), false);
+  assert.equal(normalized.includes(normalizeQuery('DBS Vickers')), false);
 
-  for (const item of all.filter(entry => /STI analysis|Bolero aandelen|DBS Vickers/.test(entry.query))) {
+  for (const item of all.filter(entry => /sti analysis|bolero aandelen|dbs vickers/i.test(normalizeQuery(entry.query)))) {
     const atoms = (item.metadata as any).atoms as Array<Record<string, unknown>>;
     assert.ok(atoms.length >= 2, `${item.query} must retain an authorized companion`);
   }
+});
+
+test('reviewed native trading methods remain standalone while ambiguous markets do not', () => {
+  const spain = planDiverseQueries({ country: 'Spain', count: 10, learnedVocabulary: [], existingQueries: [] });
+  assert.ok(spain.some(item => normalizeQuery(item.query) === normalizeQuery('velas japonesas')
+    && item.metadata.queryTemplate === 'SINGLE_ATOM'));
+  assert.ok(spain.some(item => normalizeQuery(item.query) === normalizeQuery('operativa intradía')
+    && item.metadata.queryTemplate === 'SINGLE_ATOM'));
+
+  const singapore = planDiverseQueries({ country: 'Singapore', count: 12, learnedVocabulary: [], existingQueries: [] });
+  assert.equal(singapore.some(item => normalizeQuery(item.query) === normalizeQuery('STI analysis')), false);
 });

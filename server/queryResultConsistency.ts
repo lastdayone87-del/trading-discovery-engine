@@ -114,8 +114,9 @@ export function assessQueryResultConsistency(
   for (const item of sample) {
     // Evaluate creator-content fields separately: a Latin brand name must not
     // mask a Marathi/Gujarati/other bio or matched document. A field is
-    // compatible when it contains at least one expected script; a field with
-    // only unexpected scripts is the mismatch signal.
+    // compatible when its dominant script is expected; a field with a
+    // dominant unexpected script (including an unmodeled script) is the
+    // mismatch signal.
     const incompatibleText = item.texts.find(text => !textHasExpectedScript(text, expected));
     if (!incompatibleText) continue;
     incompatibleCount += 1;

@@ -435,8 +435,16 @@ function countryAtoms(country: string, vocabulary?: CountryVocabulary): SearchAt
     // actual semantic class. High-ambiguity MARKET/BROKER/PLATFORM surfaces
     // remain MODIFIER_ONLY and are paired with an authorized anchor below;
     // only atoms whose own policy is STANDALONE may be selected as singles.
+    const reviewedMethod = nativeAtom.type === 'METHOD'
+      && nativeAtom.retrievalPolicy.specificity >= 55
+      && nativeAtom.retrievalPolicy.ambiguity <= 60;
     nativeAtom.retrievalPolicy = {
       ...nativeAtom.retrievalPolicy,
+      // Reviewed native METHODS are whole trading-method surfaces and may
+      // stand alone. Reviewed MARKET/BROKER/PLATFORM surfaces stay
+      // modifier-only: they are exactly the ambiguous surfaces that must be
+      // paired with an authorized anchor.
+      eligibility: reviewedMethod ? 'STANDALONE' : nativeAtom.retrievalPolicy.eligibility,
       reasonCodes: [...new Set([...nativeAtom.retrievalPolicy.reasonCodes, 'REVIEWED_NATIVE_PHRASE'])],
     };
     return nativeAtom;
@@ -588,10 +596,19 @@ export function planDiverseQueries(args: {
     && item.retrievalPolicy.reasonCodes.includes('REVIEWED_NATIVE_PHRASE'),
   );
   const nativeCompanionPairs = pairingAnchors
-    .flatMap(anchor => nativeCompanionModifiers.map(modifier => ({
-      atoms: [anchor, modifier],
-      template: 'COMPACT_PAIR' as const,
-    })))
+    .flatMap(anchor => nativeCompanionModifiers
+      .filter(modifier => modifier.retrievalPolicy.requiredCompanionClasses.includes(anchor.type))
+      .filter(modifier => {
+        // Do not emit a pair that repeats a token already in the anchor
+        // ("DAX XTB DAX"). The pair must add a distinct surface, not restate
+        // the anchor.
+        const anchorTokens = new Set(normalizeQuery(anchor.term).split(' '));
+        return !normalizeQuery(modifier.term).split(' ').some(token => token.length >= 3 && anchorTokens.has(token));
+      })
+      .map(modifier => ({
+        atoms: [anchor, modifier],
+        template: 'COMPACT_PAIR' as const,
+      })))
     .filter(candidate => isRetrievalOrientedQuery(args.country, candidate.atoms.map(item => item.term).join(' ')));
   candidates.push(...nativeCompanionPairs);
 

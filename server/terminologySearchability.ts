@@ -113,6 +113,7 @@ const SCRIPT_PATTERNS: Array<[string, RegExp]> = [
   ['Hani', /\p{Script=Han}/u],
   ['Jpan', /[\p{Script=Katakana}\p{Script=Hiragana}]/u],
   ['Cyrl', /\p{Script=Cyrillic}/u],
+  ['Grek', /\p{Script=Greek}/u],
   ['Arab', /\p{Script=Arabic}/u],
   ['Hang', /\p{Script=Hangul}/u],
   ['Deva', /\p{Script=Devanagari}/u],
@@ -162,7 +163,7 @@ function scriptsOf(value: string): Set<string> {
 export function expectedScriptsForCountry(country: string): ReadonlySet<string> | null {
   const normalized = String(country || '').trim();
   if (!normalized) return null;
-  if (COUNTRY_SCRIPTS[normalized]) return COUNTRY_SCRIPTS[normalized];
+  if (Object.prototype.hasOwnProperty.call(COUNTRY_SCRIPTS, normalized)) return COUNTRY_SCRIPTS[normalized];
   if (LATIN_COUNTRIES.has(normalized)) return new Set(['Latn']);
   return null;
 }
@@ -183,8 +184,7 @@ export function dominantScript(value: string): string | null {
   for (const char of normalize(value)) {
     if (!/\p{L}/u.test(char)) continue;
     if (/[\p{Script=Common}\p{Script=Inherited}]/u.test(char)) continue;
-    const script = SCRIPT_PATTERNS.find(([, pattern]) => pattern.test(char))?.[0];
-    if (!script) continue;
+    const script = SCRIPT_PATTERNS.find(([, pattern]) => pattern.test(char))?.[0] || 'Zzzz';
     counts.set(script, (counts.get(script) || 0) + 1);
   }
   const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]);
