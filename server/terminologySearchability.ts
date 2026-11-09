@@ -164,6 +164,19 @@ function phraseKey(value: string): string {
  */
 const AMBIGUOUS_STANDALONE_SEMANTICS = new Set(['es']);
 
+/**
+ * Short surfaces that are valid inside a longer explicit phrase but are too
+ * ambiguous to use as learned modifiers on their own. `ES` is both the E-mini
+ * S&P ticker and Spanish "is"; `SL` is stop-loss jargon and an abbreviation
+ * with many unrelated meanings; `LIVE` is a format word, not a topic.
+ */
+const AMBIGUOUS_SHORT_MODIFIERS = new Set(['es', 'sl', 'live']);
+
+export function isAmbiguousShortModifier(term: string): boolean {
+  const key = phraseKey(term);
+  return AMBIGUOUS_SHORT_MODIFIERS.has(key);
+}
+
 function addPhrase(out: Set<string>, value: string | undefined | null): void {
   const key = phraseKey(String(value || ''));
   if (key && !AMBIGUOUS_STANDALONE_SEMANTICS.has(key)) out.add(key);

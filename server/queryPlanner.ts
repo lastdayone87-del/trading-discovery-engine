@@ -5,7 +5,7 @@ import { assessLanguageCapability, type GlobalLanguageContext } from './globalLa
 import {evaluateRetrievalSpecificity,type RetrievalSpecificityDecision} from './retrievalSpecificity';
 import { countrySearchLanguageCandidates, normalizeLanguageCode } from './countrySearchHints';
 import { capFreeSignalCandidates, type FreeSignalQueryCandidate, type FreeSignalType } from './freeQuerySignals';
-import { isReviewedNativePhrase, isSearchableTradingTerm, reviewedNativePhraseLanguages, TERMINOLOGY_SEARCHABILITY_VERSION } from './terminologySearchability';
+import { isAmbiguousShortModifier, isReviewedNativePhrase, isSearchableTradingTerm, reviewedNativePhraseLanguages, TERMINOLOGY_SEARCHABILITY_VERSION } from './terminologySearchability';
 import { isProductionConfiguredCountry } from './queryQuality/profiles';
 
 export type QueryKnowledgeTier = 1 | 2 | 3;
@@ -223,6 +223,7 @@ export function planFrontierTargetedQuery(args: {
   target: DiscoveryNeighborhoodDimensions;
 }): PlannedQuery | null {
   const targetTerm = args.target.primaryTermFamily.normalize('NFKC').trim().replace(/\s+/g, ' ');
+  if (isAmbiguousShortModifier(targetTerm)) return null;
   const anchor = atom('trading', 'METHOD', (args.target.queryIntent || 'strategy') as QueryIntent, 1, 'CURATED');
   const neighborhood = atom(targetTerm, 'NEIGHBORHOOD', (args.target.queryIntent || 'strategy') as QueryIntent, 1, 'COUNTRY_VOCABULARY');
   const query = `${anchor.term} ${neighborhood.term}`.trim();
@@ -261,6 +262,10 @@ export function planCountryNativeProposalQuery(args: {
   dominantLocale?: string | null;
 }): PlannedQuery | null {
   const nativeTerm = args.nativeTerm.normalize('NFKC').trim().replace(/\s+/g, ' ');
+  // The country-native proposal path is separate from planDiverseQueries and
+  // must enforce the same ambiguous-short-modifier rule before it creates a
+  // LEARNED atom or receives allocation lineage.
+  if (isAmbiguousShortModifier(nativeTerm)) return null;
   const reviewedPhrase = isReviewedNativePhrase(nativeTerm);
   // Unknown long surfaces stay rejected. A reviewed native phrase may exceed
   // the normal three-token atom cap because it is a bounded whole query.
@@ -565,6 +570,10 @@ export function planDiverseQueries(args: {
   // can never become a planner atom.
   const terminatedByGate: Array<{ term: string; path: 'CANONICAL' | 'LEGACY'; reasons: string[] }> = [];
   const gateLearnedTerm = (term: string, termType: string | undefined, path: 'CANONICAL' | 'LEGACY') => {
+    if (isAmbiguousShortModifier(term)) {
+      terminatedByGate.push({ term, path, reasons: ['ambiguous-short-modifier'] });
+      return false;
+    }
     const gate = isSearchableTradingTerm({ term, termType, country: args.country });
     if (!gate.eligible) terminatedByGate.push({ term, path, reasons: gate.reasons });
     return gate.eligible;

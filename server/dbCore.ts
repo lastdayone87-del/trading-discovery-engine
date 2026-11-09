@@ -2054,6 +2054,42 @@ export async function getQueryIntelligenceSummary(options:{now?:number;force?:bo
   (SELECT COUNT(*)::int FROM query_execution_logs) AS execution_log_count`); const r=res.rows[0]||{}; const value={queryCount:Number(r.query_count||0),provenCount:Number(r.proven_count||0),experimentalCount:Number(r.experimental_count||0),rejectedCount:Number(r.rejected_count||0),vocabularyCount:Number(r.vocabulary_count||0),terminologyCount:Number(r.terminology_count||0),searchEligibleTerminologyCount:Number(r.search_eligible_count||0),executionLogCount:Number(r.execution_log_count||0)}; queryIntelligenceSummaryCache={at:now,value}; return value;}
 export async function getQueriesByCountry(country:string):Promise<QueryRecord[]>{const db=await getDb(); const res=await db.query(`SELECT * FROM query_library WHERE LOWER(country)=LOWER($1) AND status='ACTIVE' ORDER BY performance_score DESC,times_executed ASC`,[country]); return res.rows.map(rowToQuery);}
 
+export interface QueryTerminologyCurrentStatus {
+  queryId: number;
+  termId: number;
+  term: string;
+  lifecycleStatus: string;
+  searchEligible: boolean;
+}
+
+/**
+ * Current canonical-term status for saved queries that carry a terminologyId.
+ * Selection uses this to digest stale attribution without discarding a query
+ * whose full composition is still valid.
+ */
+export async function getQueryTerminologyCurrentStatuses(queryIds:number[]):Promise<Map<number,QueryTerminologyCurrentStatus>>{
+  const ids = [...new Set(queryIds.map(Number).filter(id=>Number.isSafeInteger(id)&&id>0))];
+  if (!ids.length) return new Map();
+  const db=await getDb();
+  const res=await db.query(`WITH linked AS (
+      SELECT ql.id AS query_id,
+             CASE WHEN ql.generation_metadata->>'terminologyId' ~ '^[0-9]{1,18}$'
+                  THEN (ql.generation_metadata->>'terminologyId')::bigint END AS term_id
+      FROM query_library ql WHERE ql.id=ANY($1::int[])
+    )
+    SELECT l.query_id,t.id AS term_id,t.canonical_term AS term,t.lifecycle_status AS lifecycle_status,t.search_eligible AS search_eligible
+    FROM linked l JOIN canonical_trading_terms t ON t.id=l.term_id`,[ids]);
+  return new Map(res.rows.map((row:any)=>[Number(row.query_id),{queryId:Number(row.query_id),termId:Number(row.term_id),term:String(row.term||''),lifecycleStatus:String(row.lifecycle_status||''),searchEligible:row.search_eligible===true}]));
+}
+
+/** Persist a digested runtime record so completion accounting sees the same
+ * decision and cannot re-attribute results to a stale terminology id. */
+export async function persistQueryTerminologyDigest(queryId:number,expectedTermId:string|number,metadata:Record<string,unknown>):Promise<boolean>{
+  const db=await getDb();
+  const res=await db.query(`UPDATE query_library SET generation_metadata=$3::jsonb WHERE id=$1 AND generation_metadata->>'terminologyId'=$2::text RETURNING id`,[queryId,String(expectedTermId),JSON.stringify(metadata)]);
+  return Boolean(res.rowCount);
+}
+
 /** Q5 per-run reward rows. Global newness and quality are read from
  * sighting-level truth, never from query_library cumulative counters. */
 export interface QueryQualityRunRow{queryId:number;confirmed:number;quality:number;quotaUnits:number;ageDays:number;}
