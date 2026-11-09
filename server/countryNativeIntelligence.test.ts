@@ -924,7 +924,7 @@ test('Phase 10: a novel native proposal is represented by the governed Query Int
     'an unconstructable native proposal fails closed without a generic query');
 });
 
-test('Final integration: missing language evidence remains und and neutral', async () => {
+test('Final integration: a missing language hint is filled from the surface without fabricating native evidence', async () => {
   const runner = createMockRunner();
   const termId = await observeTerminology({
     term: 'analyse marché local', country: 'FR', termType: 'TERMINOLOGY',
@@ -933,16 +933,21 @@ test('Final integration: missing language evidence remains und and neutral', asy
   }, runner);
   const observation = runner.observations.find(row => row.canonical_term_id === termId);
   assert.ok(observation);
-  assert.equal(observation.native_language, 'und');
-  assert.equal(observation.term_language, 'und');
+  // The surface itself is French; the detector supplies the language identity.
+  // It must not upgrade the observation to native evidence without provenance.
+  assert.equal(observation.native_language, 'fr');
+  assert.equal(observation.term_language, 'fr');
   assert.equal(observation.native_evidence_status, null);
   assert.equal(observation.source_provenance_family, null);
+  // The canonical row carries the detected term language instead of staying
+  // permanently `und` when no provider language/locale was supplied.
+  assert.equal(runner.canonicalTerms.get(termId!)?.language, 'fr');
 });
 
-test('Final integration: human approval does not fabricate language evidence', async () => {
+test('Final integration: human approval does not invent a language for an unidentifiable surface', async () => {
   const runner = createMockRunner();
   const termId = await observeTerminology({
-    term: 'forex trading strategy approved', country: 'DE', termType: 'TERMINOLOGY',
+    term: 'xyzzy approval', country: 'DE', termType: 'TERMINOLOGY',
     observationType: 'HUMAN_APPROVED_CHANNEL', videoId: 'VID_DE_APPROVED_1',
     sourceCreatorCountry: 'DE', targetMarketCountry: 'DE', humanApproved: true
   }, runner);
@@ -952,6 +957,51 @@ test('Final integration: human approval does not fabricate language evidence', a
   assert.equal(observation.term_language, 'und');
   assert.equal(observation.native_evidence_status, null);
   assert.equal(observation.source_provenance_family, null);
+});
+
+test('Final integration: human approval keeps a detectable language but not native evidence', async () => {
+  const runner = createMockRunner();
+  const termId = await observeTerminology({
+    term: 'forex trading strategy approved', country: 'DE', termType: 'TERMINOLOGY',
+    observationType: 'HUMAN_APPROVED_CHANNEL', videoId: 'VID_DE_APPROVED_DETECTABLE_1',
+    sourceCreatorCountry: 'DE', targetMarketCountry: 'DE', humanApproved: true
+  }, runner);
+  const observation = runner.observations.find(row => row.canonical_term_id === termId);
+  assert.ok(observation);
+  assert.equal(observation.native_language, 'en');
+  assert.equal(observation.term_language, 'en');
+  assert.equal(observation.native_evidence_status, null);
+  assert.equal(observation.source_provenance_family, null);
+});
+
+test('Final integration: a hint-resolved tie does not permanently label the canonical term', async () => {
+  const runner = createMockRunner();
+  const termId = await observeTerminology({
+    term: 'trade', country: 'Brazil', termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE', videoId: 'VID_BR_TIE_1',
+    sourceCreatorCountry: 'BR', targetMarketCountry: 'BR'
+  }, runner);
+  const observation = runner.observations.find(row => row.canonical_term_id === termId);
+  assert.ok(observation);
+  // The embedded term itself is classified as English finance vocabulary,
+  // but the canonical row stays und because `trade` is also Portuguese and
+  // the market hint only resolved a tie. A later explicit provider language
+  // can therefore still replace the weak guess.
+  assert.equal(observation.term_language, 'en');
+  assert.equal(runner.canonicalTerms.get(termId!)?.language, 'und');
+});
+
+test('Final integration: Kanji-only Japanese hint does not lock the canonical language', async () => {
+  const runner = createMockRunner();
+  const termId = await observeTerminology({
+    term: '日経225先物', country: 'Japan', termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE', videoId: 'VID_JP_KANJI_1',
+    sourceCreatorCountry: 'JP', targetMarketCountry: 'JP'
+  }, runner);
+  const observation = runner.observations.find(row => row.canonical_term_id === termId);
+  assert.ok(observation);
+  assert.equal(observation.term_language, 'ja');
+  assert.equal(runner.canonicalTerms.get(termId!)?.language, 'und');
 });
 
 test('Final integration: explicit German context promotes agreeing German terminology', async () => {

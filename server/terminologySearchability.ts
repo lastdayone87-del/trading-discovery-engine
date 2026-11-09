@@ -21,7 +21,7 @@ import { MULTILINGUAL_CLASSIFICATION_PACKS } from './evidenceEngine/multilingual
  * backed override supplies the missing context. It never changes a channel's
  * trading status.
  */
-export const TERMINOLOGY_SEARCHABILITY_VERSION = 'terminology-searchability-v1';
+export const TERMINOLOGY_SEARCHABILITY_VERSION = 'terminology-searchability-v2';
 
 /**
  * Pre-admission query rows predate atomized composition, so the whole stored
@@ -215,9 +215,56 @@ const REVIEWED_LANGUAGE_SEMANTICS: Record<string, string[]> = {
   // English is the universal retrieval language, so these reviewed phrases
   // must stay eligible for every English query surface.
   en: ['liquidity zone', 'liquidity zones'],
-  de: ['liquiditätszone', 'liquiditätszonen', 'charttechnik', 'chartanalyse'],
-  ja: ['トレード', 'デイトレード', 'オーダーフロー'],
+  de: ['liquiditätszone', 'liquiditätszonen', 'charttechnik', 'chartanalyse', 'marktstruktur', 'handelsstrategie', 'dax eröffnung'],
+  fr: ['structure du marché', 'analyse boursière', 'carnet d ordres', 'carnet d\'ordres'],
+  es: ['análisis bursátil', 'estructura de mercado', 'flujo de órdenes'],
+  it: ['analisi ciclica', 'analisi tecnica borsa italiana'],
+  nl: ['opties handelen'],
+  ja: ['トレード', 'デイトレード', 'オーダーフロー', '板読み', '歩み値', '裁量トレード', 'システムトレード', 'スキャルピング', '東京セッション'],
 };
+
+/**
+ * Reviewed native multi-word surfaces that are genuine local search phrases
+ * but exceed the default 3-token precision cap. This is a bounded allowlist,
+ * not a general relaxation: the term still has to pass script and semantic
+ * gates.
+ */
+const REVIEWED_NATIVE_PHRASES: Record<string, string[]> = {
+  es: ['análisis bursátil', 'estructura de mercado'],
+  it: ['analisi tecnica borsa italiana', 'analisi ciclica'],
+  nl: ['opties handelen'],
+  de: ['marktstruktur', 'handelsstrategie', 'dax eröffnung'],
+  fr: ['structure du marché', 'analyse boursière', 'carnet d ordres'],
+};
+
+/** Language codes of the reviewed phrases matching this exact surface. */
+export function reviewedNativePhraseLanguages(term: string): string[] {
+  const key = phraseKey(term);
+  return Object.entries(REVIEWED_NATIVE_PHRASES)
+    .filter(([, values]) => values.some(value => phraseKey(value) === key))
+    .map(([language]) => language);
+}
+
+export function isReviewedNativePhrase(term: string): boolean {
+  return reviewedNativePhraseLanguages(term).length > 0;
+}
+
+/**
+ * Compounds whose local reading is not trading intent. `トレード` is a
+ * reviewed Japanese semantic, but `トレードオフ` (trade-off) and
+ * `トレードマーク` (trademark) are ordinary words, so boundary-free matching
+ * must not admit them as search surfaces. Separators are allowed between
+ * characters (`トレード・オフ`) and the compounds may be embedded in a longer
+ * phrase (`トレードオフ分析`).
+ */
+const NON_TRADING_COMPOUND_PATTERNS = ['トレードオフ', 'トレードマーク'].map(compound =>
+  new RegExp([...compound].map(char => char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s*'), 'gu'),
+);
+
+/** True when any letter in the value belongs to an unspaced script. */
+function usesUnspacedScript(value: string): boolean {
+  return /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(value);
+}
 
 const COUNTRY_NATIVE_SEMANTICS = new Map<string, Set<string>>(
   Object.entries(COUNTRY_KNOWLEDGE_PACKS).map(([country, pack]) => {
@@ -249,7 +296,14 @@ export function hasGovernedTradingSemantics(
   term: string,
   context: { country?: string | null; language?: string | null } = {},
 ): boolean {
-  const key = phraseKey(term);
+  const rawKey = phraseKey(term);
+  if (!rawKey) return false;
+  // Remove non-trading compound readings before matching. If a genuine
+  // trading semantic remains elsewhere in the surface, it still passes.
+  const key = NON_TRADING_COMPOUND_PATTERNS
+    .reduce((value, pattern) => value.replace(pattern, ' '), rawKey)
+    .replace(/\s+/gu, ' ')
+    .trim();
   if (!key) return false;
   const out = new Set(GLOBAL_TRADING_SEMANTICS);
   const language = context.language ? String(context.language).toLocaleLowerCase('und').split('-')[0] : '';
@@ -282,9 +336,18 @@ export function hasGovernedTradingSemantics(
     }
   }
   const padded = ` ${key} `;
+  // Japanese/Chinese/Korean do not delimit words with spaces, so a compound
+  // surface (日経225先物) can never match a space-padded semantic (日経225).
+  // Match reviewed multi-character semantics as substrings for unspaced
+  // scripts; single-character semantics are excluded to avoid over-matching.
+  const unspaced = usesUnspacedScript(key);
   for (const semantic of out) {
     if (semantic === key) return true;
     if (padded.includes(` ${semantic} `)) return true;
+    // Boundary-free matching applies only to semantics written in an
+    // unspaced script. Latin/ticker semantics keep word boundaries even when
+    // the enclosing term contains CJK: `cooking動画` must not match `ng`.
+    if (unspaced && usesUnspacedScript(semantic) && Array.from(semantic).length >= 2 && key.includes(semantic)) return true;
   }
   return false;
 }
@@ -331,7 +394,12 @@ export function isSearchableTradingTerm(input: SearchabilityInput): Searchabilit
   if (contentTokens.length > 0 && contentTokens.every(token => CTA_TOKENS.has(token))) add('cta-only');
   if (contentTokens.length > 0 && contentTokens.every(token => CTA_TOKENS.has(token) || FORMAT_TOKENS.has(token))) add('format-only');
   if (lowerTokens.length > 0 && lowerTokens.every(token => STOPWORDS.has(token))) add('stopword-only');
-  if (termTokens.length > (input.allowExtendedTokens ? LEGACY_COMPATIBILITY_TOKEN_LIMIT : 3)) add('too-many-tokens');
+  const tokenLimit = input.allowExtendedTokens
+    ? LEGACY_COMPATIBILITY_TOKEN_LIMIT
+    : isReviewedNativePhrase(normalizedTerm)
+      ? 6
+      : 3;
+  if (termTokens.length > tokenLimit) add('too-many-tokens');
   if (input.requireTradingSemantics !== false
     && !hasGovernedTradingSemantics(normalizedTerm, { country: input.country, language: input.language })) add('no-trading-semantics');
 

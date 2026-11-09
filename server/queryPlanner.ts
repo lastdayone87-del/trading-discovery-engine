@@ -5,7 +5,7 @@ import { assessLanguageCapability, type GlobalLanguageContext } from './globalLa
 import {evaluateRetrievalSpecificity,type RetrievalSpecificityDecision} from './retrievalSpecificity';
 import { countrySearchLanguageCandidates, normalizeLanguageCode } from './countrySearchHints';
 import { capFreeSignalCandidates, type FreeSignalQueryCandidate, type FreeSignalType } from './freeQuerySignals';
-import { isSearchableTradingTerm } from './terminologySearchability';
+import { isReviewedNativePhrase, isSearchableTradingTerm, reviewedNativePhraseLanguages, TERMINOLOGY_SEARCHABILITY_VERSION } from './terminologySearchability';
 
 export type QueryKnowledgeTier = 1 | 2 | 3;
 export type QueryGenerationMode = 'EXPLORATION' | 'EXPLOITATION' | 'COLD_START';
@@ -122,7 +122,10 @@ export function isRetrievalOrientedQuery(country: string, query: string, languag
   const scriptCompatible = languageContext?.governed
     ? assessLanguageCapability([{ field: 'query', text: normalized, language: languageContext.contentLanguage }], languageContext).disposition !== 'ABSTAIN'
     : isCountryScriptCompatible(country, normalized);
-  return normalized.length >= 2 && normalized.length <= 40 && queryTokenCount(normalized) <= (languageContext?.governed?4:3) &&
+  // A reviewed native phrase is a bounded whole-query exception to the token
+  // cap. It is still subject to the length, ticker, prose and script gates.
+  const tokenLimit = isReviewedNativePhrase(normalized) ? 6 : languageContext?.governed ? 4 : 3;
+  return normalized.length >= 2 && normalized.length <= 40 && queryTokenCount(normalized) <= tokenLimit &&
     !isBareShortTicker(normalized) &&
     !FORBIDDEN_PROSE.test(normalized) && scriptCompatible;
 }
@@ -198,19 +201,79 @@ export function planCountryNativeProposalQuery(args: {
   dominantLocale?: string | null;
 }): PlannedQuery | null {
   const nativeTerm = args.nativeTerm.normalize('NFKC').trim().replace(/\s+/g, ' ');
-  if (!nativeTerm || queryTokenCount(nativeTerm) > 3) return null;
+  const reviewedPhrase = isReviewedNativePhrase(nativeTerm);
+  // Unknown long surfaces stay rejected. A reviewed native phrase may exceed
+  // the normal three-token atom cap because it is a bounded whole query.
+  if (!nativeTerm || (!reviewedPhrase && queryTokenCount(nativeTerm) > 3)) return null;
   const learned = atom(nativeTerm, 'LEARNED', (args.targetIntent || 'strategy') as QueryIntent, 2, 'LEARNED');
-  const anchor = countryAtoms(args.country, args.countryVocabulary)
-    .filter(item => ['STANDALONE', 'ANCHOR_ONLY'].includes(item.retrievalPolicy.eligibility))
-    .find(item => isRetrievalOrientedQuery(args.country, `${item.term} ${nativeTerm}`));
-  if (!anchor) return null;
-  const query = `${anchor.term} ${nativeTerm}`;
   const languageEvidence = [args.language, args.locale, args.dominantLocale]
     .filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
   const supportedLanguages = countrySearchLanguageCandidates(args.country, args.countryVocabulary?.languages || []);
   const preferredLanguage = languageEvidence
     .map(normalizeLanguageCode)
     .find(language => language && supportedLanguages.includes(language));
+  // The reviewed allowlist is language-owned. An Italian phrase must not be
+  // authorized as a Japanese native surface merely because it is reviewed.
+  const phraseLanguages = reviewedPhrase ? reviewedNativePhraseLanguages(nativeTerm) : [];
+  const declaredLanguage = languageEvidence.map(normalizeLanguageCode).find(Boolean);
+  if (reviewedPhrase && (
+    !phraseLanguages.some(language => supportedLanguages.includes(language))
+    || (declaredLanguage && !phraseLanguages.includes(declaredLanguage))
+  )) {
+    return null;
+  }
+  // A reviewed phrase that cannot fit beside an authorized anchor runs whole.
+  // Mark it STANDALONE in both the top-level and atom policy so execution
+  // authority does not quarantine it as an unanchored expansion surface.
+  const reviewedPolicy = {
+    ...learned.retrievalPolicy,
+    eligibility: 'STANDALONE' as const,
+    specificity: Math.max(learned.retrievalPolicy.specificity, 70),
+    ambiguity: Math.min(learned.retrievalPolicy.ambiguity, 30),
+    // The reviewed exception replaces the generic expansion warning; keeping
+    // both would leave contradictory audit provenance.
+    reasonCodes: [
+      ...new Set([
+        ...learned.retrievalPolicy.reasonCodes.filter(code => code !== 'EXPANSION_SURFACE_REQUIRES_TRADING_ANCHOR'),
+        'REVIEWED_NATIVE_PHRASE',
+      ]),
+    ],
+    requiredCompanionClasses: [],
+  };
+  const wholePhrase = (): PlannedQuery => ({
+    query: nativeTerm,
+    intent: (args.targetIntent || 'strategy') as QueryIntent,
+    primaryTerm: nativeTerm,
+    knowledgeTiers: [2],
+    generationMode: 'EXPLORATION',
+    generationReason: 'Reviewed native phrase executed as its own bounded retrieval surface.',
+    discoveryObjective: 'Test the reviewed country-native phrase while discovering relevant trading creators.',
+    metadata: {
+      country: args.country,
+      queryTemplate: 'REVIEWED_NATIVE_PHRASE',
+      retrievalOptimized: true,
+      tokenCount: queryTokenCount(nativeTerm),
+      scriptValidated: true,
+      retrievalSpecificity: reviewedPolicy,
+      atoms: [{ ...learned, retrievalPolicy: reviewedPolicy, role: 'ANCHOR', position: 0 }],
+      localTier1Term: nativeTerm,
+      learnedTerm: nativeTerm,
+      countryNativeAllocation: args.allocationLineage,
+      language: args.language || undefined,
+      locale: args.locale || undefined,
+      dominantLocale: args.dominantLocale || undefined,
+      preferredLanguage
+    }
+  });
+  if (reviewedPhrase && queryTokenCount(nativeTerm) > 3) return wholePhrase();
+  const anchor = countryAtoms(args.country, args.countryVocabulary)
+    .filter(item => ['STANDALONE', 'ANCHOR_ONLY'].includes(item.retrievalPolicy.eligibility))
+    .find(item => isRetrievalOrientedQuery(args.country, `${item.term} ${nativeTerm}`));
+  if (!anchor) return reviewedPhrase ? wholePhrase() : null;
+  const query = `${anchor.term} ${nativeTerm}`;
+  // Even a short reviewed phrase can overflow once the anchor is added; in
+  // that case the bounded whole-query reading is the only admissible shape.
+  if (reviewedPhrase && !isRetrievalOrientedQuery(args.country, query)) return wholePhrase();
   return {
     query,
     intent: (args.targetIntent || anchor.intent) as QueryIntent,
@@ -674,7 +737,7 @@ export function planDiverseQueries(args: {
         terminologyDecayedYield: learnedTerminology?.score ?? freeSignalTerminology?.score,
         ...(terminatedByGate.length ? {
           terminologyGate: {
-            policy: 'terminology-searchability-v1',
+            policy: TERMINOLOGY_SEARCHABILITY_VERSION,
             suppressedCount: terminatedByGate.length,
             // Cap the per-query audit copy: the same planning-run list is
             // repeated in every planned query's metadata, so an unbounded

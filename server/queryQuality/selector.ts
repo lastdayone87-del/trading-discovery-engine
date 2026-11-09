@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { TERMINOLOGY_SEARCHABILITY_VERSION } from '../terminologySearchability';
 import {
   boundedPortfolioRatio,
   computePosterior,
@@ -230,7 +231,7 @@ export function selectHierarchicalUcb(candidates: SelectorCandidate[], context: 
       portfolio: QUERY_PORTFOLIO_VERSION,
       composition: 'query-composition-v1',
       admission: 'query-admission-v1',
-      terminology: 'terminology-searchability-v1',
+      terminology: TERMINOLOGY_SEARCHABILITY_VERSION,
     },
   };
   if (eligible.length === 0) {

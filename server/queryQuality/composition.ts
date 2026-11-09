@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { isSearchableTradingTerm, LEGACY_COMPATIBILITY_TOKEN_LIMIT, type SearchabilityTermType } from '../terminologySearchability';
+import { isReviewedNativePhrase, isSearchableTradingTerm, LEGACY_COMPATIBILITY_TOKEN_LIMIT, type SearchabilityTermType } from '../terminologySearchability';
 import { getCountryMarketProfile, isProductionConfiguredCountry, isRegisteredCountry } from './profiles';
 import type {
   CountryMarketProfile,
@@ -273,6 +273,12 @@ export function evaluateQueryComposition(candidate: QueryCandidate, context: Com
   const legacyCompatibility = candidate.atoms.length === 1
     && candidate.atoms[0].provenance === 'LEGACY_COMPATIBILITY'
     && normalizeCompositionTerm(candidate.atoms[0].term) === normalized;
+  // A reviewed native phrase is a bounded whole-surface exception to the
+  // three-token precision cap. It must be the entire query and a single atom;
+  // using it as a modifier would otherwise smuggle an unbounded length.
+  const reviewedNativePhrase = candidate.atoms.length === 1
+    && isReviewedNativePhrase(normalized)
+    && normalizeCompositionTerm(candidate.atoms[0].term) === normalized;
 
   if (!isRegisteredCountry(candidate.country)) reasons.push('UNSUPPORTED_COUNTRY');
   // Registration only proves the country is known to the fixture. Dormant
@@ -282,7 +288,12 @@ export function evaluateQueryComposition(candidate: QueryCandidate, context: Com
     reasons.push('COUNTRY_NOT_PRODUCTION_CONFIGURED');
   }
   if (!normalized || tokens.length === 0) reasons.push('EMPTY_QUERY');
-  if (tokens.length > (legacyCompatibility ? LEGACY_COMPATIBILITY_TOKEN_LIMIT : 3)) reasons.push('TOO_MANY_TOKENS');
+  const tokenLimit = legacyCompatibility
+    ? LEGACY_COMPATIBILITY_TOKEN_LIMIT
+    : reviewedNativePhrase
+      ? 6
+      : 3;
+  if (tokens.length > tokenLimit) reasons.push('TOO_MANY_TOKENS');
   if (normalized.length > 40) reasons.push('TOO_LONG');
   if (tokens.length === 1 && BARE_SHORT_TICKER.test(tokens[0])) reasons.push('BARE_SHORT_TICKER');
   if (candidate.atoms.length === 0) reasons.push('NO_TYPED_ATOMS');

@@ -81,6 +81,45 @@ test('Stage 3 classifies over-specific native terms before planner authorization
   }))), 'QUERY_SPECIFICITY_REJECTED');
 });
 
+test('Stage 3 keeps reviewed native phrases inside their own language market', () => {
+  const italyTarget = dimensions('Italy', 'it');
+  const italy = classifyCountryNativeAuthorizationInput({
+    country: 'Italy',
+    decisionId: 'decision-reviewed-phrase',
+    proposalId: 'proposal-reviewed-phrase',
+    targetNeighborhoodDimensions: italyTarget,
+    proposalEvidenceSnapshot: {
+      proposalFamily: 'COUNTRY_NATIVE',
+      targetNeighborhoodKey: createNeighborhoodKey(italyTarget),
+      targetDimensions: italyTarget,
+      supportingEvidence: {
+        nativeTerm: 'analisi tecnica borsa italiana',
+        language: 'it',
+        evidenceChecksum: 'checksum-reviewed-phrase'
+      }
+    }
+  });
+  assert.equal(italy.status, 'VALID');
+
+  const japanTarget = dimensions('Japan', 'ja');
+  const japan = classifyCountryNativeAuthorizationInput({
+    country: 'Japan',
+    decisionId: 'decision-reviewed-phrase',
+    proposalId: 'proposal-reviewed-phrase',
+    targetNeighborhoodDimensions: japanTarget,
+    proposalEvidenceSnapshot: {
+      proposalFamily: 'COUNTRY_NATIVE',
+      targetNeighborhoodKey: createNeighborhoodKey(japanTarget),
+      targetDimensions: japanTarget,
+      supportingEvidence: {
+        nativeTerm: 'analisi tecnica borsa italiana',
+        evidenceChecksum: 'checksum-reviewed-phrase'
+      }
+    }
+  });
+  assert.equal(codeOf(japan), 'QUERY_SPECIFICITY_REJECTED');
+});
+
 test('creator-derived follow-up proposals pass the same immutable lineage gate as native proposals', () => {
   const result = classifyCountryNativeAuthorizationInput(input({
     proposalFamily: 'CREATOR_DERIVED',
