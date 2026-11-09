@@ -193,7 +193,7 @@ function fakeDb(candidateRows: any[], options: {
   const sql: string[] = [];
   const params: unknown[][] = [];
   const closureColumnsPresent = options.closureColumnsPresent !== false;
-  const isScannable = (row: any) => !closureColumnsPresent || row.closed_at === null;
+  const isScannable = (row: any) => !closureColumnsPresent || (row.closed_at === null && (row.reopen_generation ?? 0) === 0);
   let candidateIds: string[] | null = null;
   const db = {
     async query(text: string, values: unknown[] = []) {
@@ -355,6 +355,7 @@ test('the dry-run filters closed epochs only when closure columns exist', async 
     && !text.includes('external_acquisition_observations'));
   assert.ok(presentCandidate);
   assert.match(presentCandidate, /closed_at IS NULL/);
+  assert.match(presentCandidate, /COALESCE\(j\.reopen_generation,0\) = 0/);
 
   const absent = fakeDb([fixtureRow()], { closureColumnsPresent: false });
   const absentReport = await buildPhase0ZombieReconciliationReport(absent.db);
@@ -365,6 +366,20 @@ test('the dry-run filters closed epochs only when closure columns exist', async 
     && !text.includes('external_acquisition_observations'));
   assert.ok(absentCandidate);
   assert.doesNotMatch(absentCandidate, /closed_at IS NULL/);
+});
+
+test('open reopened epochs do not inflate the scannable population or truncate the check', async () => {
+  const openNew = fixtureRow({ job_id: 'open-new', channel_id: 'UCnew', reopen_generation: 0 });
+  const openReopened = fixtureRow({
+    job_id: 'open-reopened',
+    channel_id: 'UCreopened',
+    reopen_generation: 1,
+    closed_at: null,
+  });
+  const report = await buildPhase0ZombieReconciliationReport(fakeDb([openNew, openReopened]).db);
+  assert.equal(report.population.scannable, 1);
+  assert.equal(report.population.examined, 1);
+  assert.ok(!report.warnings.includes('candidate_limit_reached'));
 });
 
 test('a closed reopened processing row does not make a complete report look truncated', async () => {

@@ -408,7 +408,7 @@ function zombieApplyPopulationSql(restricted: boolean): string {
     SELECT count(*) FILTER (WHERE status='PENDING')::int AS pending_retries,
            count(*) FILTER (WHERE status='PROCESSING')::int AS processing_retries,
            count(*) FILTER (
-             WHERE status='PENDING' AND closed_at IS NULL
+             WHERE status='PENDING' AND closed_at IS NULL AND COALESCE(reopen_generation,0) = 0
            )::int AS scannable
       FROM jobs
      WHERE type='${ZOMBIE_RETRY_JOB_TYPE}'
