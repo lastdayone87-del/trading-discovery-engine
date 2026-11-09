@@ -72,10 +72,13 @@ export interface QueryQualityDashboard {
     rewardEligibleRuns: number;
     /**
      * Accounted, non-degraded/non-failed runs that spent no quota. They are
-     * reported separately so free-provider confirmations cannot be read as
-     * quota yield.
+     * reported separately so zero-quota confirmations cannot be read as
+     * quota yield. This population is quota-based and may include any provider.
      */
     zeroQuotaRuns: number;
+    /** Discoveries from zero-quota runs (any provider), shown separately. */
+    zeroQuotaNewConfirmedCreators: number;
+    zeroQuotaNewQualityCreators: number;
     unaccountedCompletedRuns: number;
     newConfirmedCreators: number;
     newQualityCreators: number;
@@ -190,6 +193,14 @@ export function buildQueryQualityDashboard(input: {
   let duplicateResults = 0;
   let evaluatedResults = 0;
   let zeroConfirmRuns = 0;
+  let zeroQuotaNewConfirmedCreators = 0;
+  let zeroQuotaNewQualityCreators = 0;
+  for (const row of accounted) {
+    const vector = row.qualityVector!;
+    if (vector.failedRun || vector.providerDegraded || vector.quotaUsed > 0) continue;
+    zeroQuotaNewConfirmedCreators += vector.newConfirmedCreators;
+    zeroQuotaNewQualityCreators += vector.newQualityCreators;
+  }
   for (const row of rewardEligible) {
     const vector = row.qualityVector!;
     newConfirmedCreators += vector.newConfirmedCreators;
@@ -275,6 +286,8 @@ export function buildQueryQualityDashboard(input: {
       accountedRuns: accounted.length,
       rewardEligibleRuns: rewardEligible.length,
       zeroQuotaRuns,
+      zeroQuotaNewConfirmedCreators,
+      zeroQuotaNewQualityCreators,
       unaccountedCompletedRuns: completed.length - accounted.length,
       newConfirmedCreators,
       newQualityCreators,

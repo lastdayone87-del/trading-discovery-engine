@@ -1005,6 +1005,8 @@ test('Q6: zero-quota runs are separate, stop coverage is completed-only, compati
   assert.equal(dashboard.totals.rewardEligibleRuns, 1);
   assert.equal(dashboard.totals.zeroQuotaRuns, 1);
   assert.equal(dashboard.totals.newConfirmedCreators, 1);
+  assert.equal(dashboard.totals.zeroQuotaNewConfirmedCreators, 2);
+  assert.equal(dashboard.totals.zeroQuotaNewQualityCreators, 1);
   assert.equal(dashboard.totals.quotaUnits, 1);
   assert.equal(dashboard.selection.stopReasons.find(item => item.reason === 'MAX_PAGES_REACHED')?.count, 2);
   assert.equal(dashboard.selection.stopReasons.find(item => item.reason === 'COUNTRY_REJECTED')?.count, 1);
@@ -1052,7 +1054,9 @@ test('Q5/Q6: production wiring uses accounting-window spend, derived failure sta
   assert.match(intelligence, /getQueryQualityDecayedCounts\(country, undefined, DECAY_HALF_LIFE_DAYS\)/);
   assert.match(intelligence, /getQueryQualityDecayedCounts\(queryRecord\.country, undefined, DECAY_HALF_LIFE_DAYS\)/);
   assert.match(intelligence, /const prior = empiricalPrior\(peerArms/);
-  assert.match(intelligence, /providerRequestsFailed \|\| 0\) > 0/);
+  const performanceSource = readFileSync(join(__dirname, '..', 'queryPerformance.ts'), 'utf8');
+  assert.match(performanceSource, /providerRequestsFailed \|\| 0\) > 0/);
+  assert.match(intelligence, /isCollectionChangeEligible\(attribution\)/);
   assert.match(intelligence, /buildHierarchy\(hierarchyCandidates\)/);
   assert.match(intelligence, /hierarchy,\n\s+coverageCells,/);
   // Share totals must be seeded from every query in the accounting window,

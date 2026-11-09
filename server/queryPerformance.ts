@@ -291,14 +291,39 @@ export function isSeverelyContaminatedQuery(metrics: QueryFunnelMetrics): boolea
   return metrics.tradingPrecision <= 0.1 && metrics.qualityChannels === 0;
 }
 
+/**
+ * Only a run that actually paid quota and completed without a degraded/failed
+ * provider outcome may change a query's collection. Zero-quota and degraded
+ * runs remain observations, but they cannot promote or demote a query.
+ */
+export function isCollectionChangeEligible(attribution: {
+  quotaConsumed?: number;
+  providerRequestsFailed?: number;
+  providerRunOutcome?: string | null;
+}): boolean {
+  const providerOutcome = String(attribution.providerRunOutcome || '');
+  const providerFailed = Number(attribution.providerRequestsFailed || 0) > 0
+    || (providerOutcome !== '' && !/^SUCCESS(?:_|$)/.test(providerOutcome));
+  return Math.max(0, Number(attribution.quotaConsumed) || 0) > 0 && !providerFailed;
+}
+
 export function selectQueryCollection(
   current: QueryCollection,
   priorRuns: number,
   metrics: QueryFunnelMetrics,
   guard?: QueryPromotionGuard,
+  options: { collectionChangeEligible?: boolean } = {},
 ): QueryCollection {
   const totalRuns = priorRuns + 1;
   if (isSeverelyContaminatedQuery(metrics)) return 'REJECTED';
+  // Zero-quota and provider-degraded runs are separate observation arms. They
+  // are already excluded from positive promotion/maturity evidence because
+  // they cannot contribute a complete per-100-quota sample. Letting the same
+  // run demote a query is asymmetric: the free InnerTube path produces most
+  // new creators but could only ever push a query down. Keep the collection
+  // stable for these arms; severe contamination above still quarantines on
+  // safety.
+  if (options.collectionChangeEligible === false) return current === 'REJECTED' ? 'REJECTED' : current;
   if (metrics.performanceScore >= 60) {
     // A zero-confirm run can never establish PROVEN, even when the legacy
     // blended score is high (novelty/community alone are not yield).

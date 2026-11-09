@@ -1,8 +1,48 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { calculateQueryFunnel, countDeferredRawResults, isSeverelyContaminatedQuery, manualSearchContinuationMetrics, selectQueryCollection, type QueryObservation } from './queryPerformance';
+import { calculateQueryFunnel, countDeferredRawResults, isCollectionChangeEligible, isSeverelyContaminatedQuery, manualSearchContinuationMetrics, selectQueryCollection, type QueryObservation } from './queryPerformance';
 import { countTrailingLowYieldPages, evaluateContinuation } from './continuationPolicy';
 import { aggregatePageMetrics } from './autonomousPageStore';
+
+test('zero-quota runs cannot demote a query while quota runs keep the existing threshold', () => {
+  const metrics = {
+    rawResults: 40, distinctResults: 30, duplicateResults: 2, knownChannels: 20, newChannels: 10,
+    countryRejected: 1, nonTrading: 2, uncertain: 1, needsReview: 0, tradingConfirmed: 27,
+    classificationPending: 0, uniqueChannels: 30, qualityChannels: 12, communitiesDiscovered: 3,
+    quotaUsed: 0, noveltyRatio: 0.3, countryPrecision: 0.96, tradingPrecision: 0.9,
+    averageQualityScore: 40, performanceScore: 10,
+  };
+  // Free-provider evidence is excluded from positive promotion/maturity. It
+  // must not be the only evidence that pushes a query down either.
+  assert.equal(selectQueryCollection('EXPERIMENTAL', 3, metrics, undefined, { collectionChangeEligible: false }), 'EXPERIMENTAL');
+  assert.equal(selectQueryCollection('REJECTED', 3, metrics, undefined, { collectionChangeEligible: false }), 'REJECTED');
+  assert.equal(selectQueryCollection('PROVEN', 3, metrics, undefined, { collectionChangeEligible: false }), 'PROVEN');
+  // A high score cannot promote from a zero-quota arm even when every guard
+  // input would otherwise pass.
+  const highScore = { ...metrics, performanceScore: 90, tradingConfirmed: 10 };
+  const passingGuard = {
+    completedRuns: 5, lcb: 0.9, newConfirmedCreators: 3,
+    duplicateRatio: 0, invalidQueryRate: 0, threshold: 0.5, minRuns: 2,
+  };
+  assert.equal(selectQueryCollection('EXPERIMENTAL', 3, highScore, passingGuard, { collectionChangeEligible: false }), 'EXPERIMENTAL');
+  assert.equal(selectQueryCollection('EXPERIMENTAL', 3, highScore, passingGuard, { collectionChangeEligible: true }), 'PROVEN');
+  // Severe contamination still quarantines on safety.
+  const contaminated = {
+    ...metrics, performanceScore: 90, countryRejected: 28,
+    tradingPrecision: 0, qualityChannels: 0, tradingConfirmed: 0,
+  };
+  assert.equal(selectQueryCollection('EXPERIMENTAL', 3, contaminated, undefined, { collectionChangeEligible: false }), 'REJECTED');
+  // The same low score on a quota-spending run remains a demotion.
+  assert.equal(selectQueryCollection('EXPERIMENTAL', 3, metrics, undefined, { collectionChangeEligible: true }), 'REJECTED');
+});
+
+test('only paid, successful provider runs may change a collection', () => {
+  assert.equal(isCollectionChangeEligible({ quotaConsumed: 100, providerRunOutcome: 'SUCCESS' }), true);
+  assert.equal(isCollectionChangeEligible({ quotaConsumed: 100 }), true);
+  assert.equal(isCollectionChangeEligible({ quotaConsumed: 0, providerRunOutcome: 'SUCCESS' }), false);
+  assert.equal(isCollectionChangeEligible({ quotaConsumed: 100, providerRequestsFailed: 1 }), false);
+  assert.equal(isCollectionChangeEligible({ quotaConsumed: 100, providerRunOutcome: 'RATE_LIMITED' }), false);
+});
 
 test('query funnel keeps duplicates, known channels, exclusions, and classifications separate', () => {
   const observations: QueryObservation[] = [
