@@ -7,8 +7,9 @@ test('M2b adds no new rendered click class and excludes form/download controls',
   const source = readFileSync(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8');
   assert.match(source, /submitsOrResetsForm/);
   assert.match(source, /downloadsFile/);
-  assert.match(source, /controlType === 'submit'/);
-  assert.match(source, /controlType === 'reset'/);
+  assert.match(source, /effectiveType === 'submit'/);
+  assert.match(source, /effectiveType === 'reset'/);
+  assert.match(source, /effectiveType === 'image'/);
   assert.match(source, /element\.hasAttribute\('download'\)/);
   assert.match(source, /if \(submitsOrResetsForm \|\| downloadsFile\)/);
 
@@ -25,7 +26,10 @@ test('M2b disposition is documented as deferred with a never-click boundary', ()
   assert.match(doc, /Status:\*\* DEFERRED/);
   assert.match(doc, /does not add clicking behavior/i);
   assert.match(doc, /Never-click boundary/i);
-  assert.match(doc, /form submission\/reset\/image controls/i);
-  assert.match(doc, /download links/i);
+  assert.match(doc, /Enforced by this change/i);
+  assert.match(doc, /Policy boundary — not newly enforced/i);
+  assert.match(doc, /type is\s+`submit` or `reset`/i);
+  assert.match(doc, /input type="submit\|image\|reset"/i);
+  assert.match(doc, /trigger a download/i);
   assert.match(doc, /Revisit conditions/i);
 });

@@ -958,14 +958,18 @@ test('real DOM: M2b never clicks form submission/reset or download controls', { 
     <form><button type="submit">Join our community</button></form>
     <form><button type="reset">Reset our community</button></form>
     <form><button type="button">Join our community</button></form>
+    <form><button type="invalid">Join our community</button></form>
+    <form><button type="button ">Join our community</button></form>
+    <form><button><svg width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="8"></circle></svg></button></form>
+    <form><button form="missing-form" type="submit">Join our community</button></form>
     <a href="https://discord.gg/room" download>Join our community</a>
     <a href="https://discord.gg/room">Join our community</a>
   </body></html>`, async (page) => {
     const enumeration = await enumeratePageControls(page);
-    assert.equal(enumeration.total, 6);
-    assert.equal(enumeration.controls.length, 2, 'only non-submitting button and ordinary anchor remain clickable');
-    assert.equal(enumeration.opaqueInteractiveControls, 4, 'three form submit/reset controls plus the download link are unsafe surfaces');
-    assert.deepEqual(enumeration.controls.map(control => control.tag).sort(), ['anchor', 'button']);
+    assert.equal(enumeration.total, 10);
+    assert.equal(enumeration.controls.length, 3, 'non-submitting button, detached-form button, and ordinary anchor remain clickable');
+    assert.equal(enumeration.opaqueInteractiveControls, 7, 'six hint-matched unsafe controls plus one icon-only submit are unsafe surfaces');
+    assert.deepEqual(enumeration.controls.map(control => control.tag).sort(), ['anchor', 'button', 'button']);
     assert.ok(enumeration.controls.some(control => control.tag === 'button' && control.text.includes('Join our community')));
     assert.ok(enumeration.controls.some(control => control.tag === 'anchor'));
   });

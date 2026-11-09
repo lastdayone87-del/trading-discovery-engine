@@ -1430,7 +1430,8 @@ export function enumerateRenderedControlNodes(
       ? Array.from(element.getClientRects())
       : [];
     const renderedBox = clientRects.some(rect => rect.width > 0 && rect.height > 0);
-    const hiddenControl = !renderedBox
+    const hiddenControl = hidden
+      || !renderedBox
       || (element as HTMLElement).hidden
       || element.getAttribute('aria-hidden') === 'true'
       || style.display === 'none'
@@ -1441,20 +1442,38 @@ export function enumerateRenderedControlNodes(
     // These controls can mutate server state or leave the document without
     // revealing inspectable content, so they are counted as unsafe
     // interaction surfaces (never a clean absence) and excluded from clicks.
-    const associatedForm = (element as HTMLButtonElement).form
-      || (element as HTMLInputElement).form
-      || element.closest('form');
-    const controlType = (element.getAttribute('type') || '').trim().toLowerCase();
+    // Native form association is authoritative. An explicit `form` attribute
+    // that names a missing form detaches the control; do not fall back to an
+    // ancestor form in that case. Browser-normalized `.type` is authoritative:
+    // invalid/padded button types behave as submit.
+    const hasFormAttribute = element.hasAttribute('form');
+    const nativeForm = tagName === 'button'
+      ? (element as HTMLButtonElement).form
+      : tagName === 'input'
+        ? (element as HTMLInputElement).form
+        : null;
+    const associatedForm = nativeForm || (!hasFormAttribute ? element.closest('form') : null);
+    const effectiveType = tagName === 'button'
+      ? (element as HTMLButtonElement).type
+      : tagName === 'input'
+        ? (element as HTMLInputElement).type
+        : '';
     const submitsOrResetsForm = !!associatedForm && (
-      (tagName === 'button' && (controlType === '' || controlType === 'submit' || controlType === 'reset'))
-      || (tagName === 'input' && (controlType === 'submit' || controlType === 'image' || controlType === 'reset'))
+      (tagName === 'button' && (effectiveType === 'submit' || effectiveType === 'reset'))
+      || (tagName === 'input' && (effectiveType === 'submit' || effectiveType === 'image' || effectiveType === 'reset'))
     );
     const downloadsFile = tagName === 'a' && element.hasAttribute('download');
     if (submitsOrResetsForm || downloadsFile) {
-      // Count only unsafe controls that would otherwise have been clicked;
-      // a generic newsletter/reset control not matching the hint/structural
-      // policy is not a coverage gap.
-      if (!hiddenControl && !disabledControl && (hintMatchedControl || isDisclosure)) {
+      // Preserve both unsafe-action coverage (a control that would otherwise
+      // have been clicked) and the existing opaque-control gap (a visible,
+      // enabled, unlabeled interactive control that may reveal content).
+      const wouldHaveBeenClicked = hintMatchedControl || isDisclosure;
+      const wouldHaveBeenOpaque = interactiveControl
+        && !openSummary
+        && !hasAccessibleEvidence
+        && !hintMatchedControl
+        && !isDisclosure;
+      if (!hiddenControl && !disabledControl && (wouldHaveBeenClicked || wouldHaveBeenOpaque)) {
         opaqueInteractiveControls++;
       }
       continue;
