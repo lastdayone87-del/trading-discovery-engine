@@ -355,6 +355,7 @@ test('the dry-run filters closed epochs only when closure columns exist', async 
     && !text.includes('external_acquisition_observations'));
   assert.ok(presentCandidate);
   assert.match(presentCandidate, /closed_at IS NULL/);
+  assert.match(presentCandidate, /COALESCE\(j\.reopen_generation,0\) = 0/);
 
   const absent = fakeDb([fixtureRow()], { closureColumnsPresent: false });
   const absentReport = await buildPhase0ZombieReconciliationReport(absent.db);

@@ -702,6 +702,7 @@ test('the apply module and CLI keep the write path explicit and bounded', () => 
   assert.match(moduleSource, /zombieClosureEvidenceGuardSql/);
   assert.match(reconciliationSource, /FOR UPDATE SKIP LOCKED/);
   assert.match(reconciliationSource, /j\.closed_at IS NULL/);
+  assert.match(reconciliationSource, /COALESCE\(j\.reopen_generation,0\) = 0/);
   assert.match(reconciliationSource, /o\.id <> ALL\(\$\{knownObservationIdsParam\}::uuid\[\]\)/);
   assert.match(reconciliationSource, /j\.first_enqueued_at > \$\{atParam\}::timestamptz/);
   assert.match(moduleSource, /nextCursor/);

@@ -298,7 +298,12 @@ export function zombieCandidateJobIdsSql(options: ZombieCandidateSqlOptions = {}
     `j.status IN (${statuses.map(status => `'${status}'`).join(',')})`,
   ];
   let nextParam = 2;
-  if (options.excludeClosed) predicates.push('j.closed_at IS NULL');
+  if (options.excludeClosed) {
+    predicates.push('j.closed_at IS NULL');
+    // A reopened epoch (reopen_generation > 0) is the planned Phase 1
+    // re-close gap, not a new Phase 0 zombie. Phase 0 must not re-close it.
+    predicates.push('COALESCE(j.reopen_generation,0) = 0');
+  }
   if (options.restricted) {
     predicates.push(`j.id = ANY($${nextParam++}::uuid[])`);
   }
