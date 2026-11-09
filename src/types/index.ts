@@ -111,7 +111,7 @@ export interface TradingRelevanceBreakdown {
 }
 
 export interface InspectionStep {
-  step: 'COUNTRY_VALIDATION' | 'BIO' | 'EXTERNAL_LINKS' | 'PINNED_COMMENT' | 'VIDEO_DESCRIPTIONS' | 'SOCIAL_BIO' | 'CUSTOM_DOMAINS';
+  step: 'COUNTRY_VALIDATION' | 'BIO' | 'EXTERNAL_LINKS' | 'PINNED_COMMENT' | 'VIDEO_DESCRIPTIONS' | 'DISCORD_SURFACES' | 'SOCIAL_BIO' | 'CUSTOM_DOMAINS';
   title: string;
   status: 'FOUND' | 'NOT_FOUND' | 'SKIPPED' | 'PARTIAL' | 'ERROR' | 'REJECTED';
   details?: string;
