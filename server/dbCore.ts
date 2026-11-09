@@ -3117,7 +3117,7 @@ export async function evaluateClaimGuard(client: ClaimBudgetClient, guard: Claim
     return { admitted: false, exhausted: true };
   }
 }
-export async function enqueueJob(type:string,payload:any,opts:{priority?:number;maxAttempts?:number;runAfter?:string;idempotencyKey?:string;clientOverride?:any;preventReopen?:boolean}={}):Promise<DurableJob>{
+export async function enqueueJob(type:string,payload:any,opts:{priority?:number;maxAttempts?:number;runAfter?:string;idempotencyKey?:string;clientOverride?:any;preventReopen?:boolean;preventCompletedReopen?:boolean}={}):Promise<DurableJob>{
   // Default-off bulk admission. When disabled this only counts and warns.
   // When enabled it enforces the explicit withBulkEnqueueTransaction scope or
   // the rolling 60s window before an unbounded burst reaches the queue.
@@ -3132,9 +3132,18 @@ export async function enqueueJob(type:string,payload:any,opts:{priority?:number;
   try{
   db=opts.clientOverride||await getDb();
   const reopenClockSql=reopenClockUpdateSql(acquisitionJobClockV2Enabled());
+  const reopenSet=`payload=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.payload ELSE jobs.payload END,status=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 'PENDING' ELSE jobs.status END,priority=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.priority ELSE jobs.priority END,max_attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.max_attempts ELSE jobs.max_attempts END,attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 0 ELSE jobs.attempts END,run_after=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.run_after ELSE jobs.run_after END,locked_by=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_by END,locked_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_at END,last_error=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.last_error END,completed_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.completed_at END,updated_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN now() ELSE jobs.updated_at END${reopenClockSql}`;
+  // Three explicit conflict policies:
+  //  - preventReopen: never reopen any terminal row (explicit recovery only).
+  //  - preventCompletedReopen: keep a completed job terminal, but still let a
+  //    failed job retry. Ordinary rediscovery must not turn finished enrichment
+  //    work back into PENDING, while genuine retries must remain possible.
+  //  - default: legacy reopen of both COMPLETED and FAILED work.
   const sql=opts.preventReopen
     ?`INSERT INTO jobs(type,payload,priority,max_attempts,run_after,idempotency_key,catalog_version_id,catalog_policy_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(idempotency_key) DO UPDATE SET updated_at=jobs.updated_at RETURNING *`
-    :`INSERT INTO jobs(type,payload,priority,max_attempts,run_after,idempotency_key,catalog_version_id,catalog_policy_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(idempotency_key) DO UPDATE SET payload=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.payload ELSE jobs.payload END,status=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 'PENDING' ELSE jobs.status END,priority=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.priority ELSE jobs.priority END,max_attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.max_attempts ELSE jobs.max_attempts END,attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 0 ELSE jobs.attempts END,run_after=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.run_after ELSE jobs.run_after END,locked_by=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_by END,locked_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_at END,last_error=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.last_error END,completed_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.completed_at END,updated_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN now() ELSE jobs.updated_at END${reopenClockSql} RETURNING *`;
+    :opts.preventCompletedReopen
+      ?`INSERT INTO jobs(type,payload,priority,max_attempts,run_after,idempotency_key,catalog_version_id,catalog_policy_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(idempotency_key) DO UPDATE SET ${reopenSet} WHERE jobs.status <> 'COMPLETED' RETURNING *`
+      :`INSERT INTO jobs(type,payload,priority,max_attempts,run_after,idempotency_key,catalog_version_id,catalog_policy_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(idempotency_key) DO UPDATE SET ${reopenSet} RETURNING *`;
   res=await db.query(sql,[type,JSON.stringify(payload),opts.priority||0,opts.maxAttempts||3,opts.runAfter||new Date().toISOString(),opts.idempotencyKey||null,payload?.catalogPin?.catalogVersionId||null,payload?.catalogPin?.policyVersion||null]);
   }catch(error){
     releaseBulkEnqueue(bulkAdmission);

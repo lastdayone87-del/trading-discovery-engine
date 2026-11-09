@@ -21,6 +21,26 @@ export function resolveUncertainLifecycle(wantsHumanReview: boolean, eligibility
   return { scanStatus: 'ENRICHMENT_PENDING', tradingStatus: 'UNCERTAIN', shouldEnqueue: true };
 }
 
+
+
+/**
+ * A completed enrichment job is durable evidence that the work already ran.
+ * When a later rediscovery is blocked from reopening it, the channel must not
+ * remain ENRICHMENT_PENDING with no runnable job. Active scan states collapse
+ * to COMPLETED; terminal/review states are preserved verbatim.
+ */
+export function resolveEnrichmentReopenBlockedLifecycle(
+  channel: Pick<ChannelRecord, 'scan_status' | 'trading_status'>,
+): { scanStatus: ScanStatus; tradingStatus: TradingStatus } {
+  const active = channel.scan_status === 'ENRICHMENT_PENDING'
+    || channel.scan_status === 'ENRICHING'
+    || channel.scan_status === 'LOCKED';
+  return {
+    scanStatus: active ? 'COMPLETED' : channel.scan_status,
+    tradingStatus: channel.trading_status,
+  };
+}
+
 export interface TerminalEnrichmentFailureProjection {
   shouldProject: boolean;
   scanStatus: ScanStatus;

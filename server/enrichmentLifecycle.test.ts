@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { resolveTerminalEnrichmentFailure, resolveUncertainLifecycle } from './enrichmentLifecycle';
+import { resolveEnrichmentReopenBlockedLifecycle, resolveTerminalEnrichmentFailure, resolveUncertainLifecycle } from './enrichmentLifecycle';
 import { evaluateReviewEligibilityV2 } from './reviewEligibility/policy';
 
 const base={classificationStatus:'UNCERTAIN',investigationState:'UNRESOLVED',plausibleTradingHypothesis:true,evidenceSufficient:true,independentEvidence:true,countryAllowed:true,operationalFailure:false,providerDegraded:false,unsupportedLanguage:false,terminalDecision:false};
@@ -75,4 +75,23 @@ test('review, rejection, and completed operational paths are never overwritten b
     lifecycleChannel({trading_status:'NON_TRADING',scan_status:'SKIPPED_NON_TRADING',discord_status:'NON_TRADING',discord_validation_status:'COMPLETED'}),
     lifecycleChannel({scan_status:'COMPLETED',discord_status:'DEAD',discord_validation_status:'COMPLETED'})
   ]) assert.equal(resolveTerminalEnrichmentFailure(channel,true).shouldProject,false);
+});
+
+test('a blocked completed enrichment re-open cannot leave an orphan ENRICHMENT_PENDING row', () => {
+  assert.deepEqual(
+    resolveEnrichmentReopenBlockedLifecycle({ scan_status: 'ENRICHMENT_PENDING', trading_status: 'UNCERTAIN' }),
+    { scanStatus: 'COMPLETED', tradingStatus: 'UNCERTAIN' },
+  );
+  assert.deepEqual(
+    resolveEnrichmentReopenBlockedLifecycle({ scan_status: 'ENRICHING', trading_status: 'UNCERTAIN' }),
+    { scanStatus: 'COMPLETED', tradingStatus: 'UNCERTAIN' },
+  );
+  assert.deepEqual(
+    resolveEnrichmentReopenBlockedLifecycle({ scan_status: 'NEEDS_REVIEW', trading_status: 'NEEDS_REVIEW' }),
+    { scanStatus: 'NEEDS_REVIEW', tradingStatus: 'NEEDS_REVIEW' },
+  );
+  assert.deepEqual(
+    resolveEnrichmentReopenBlockedLifecycle({ scan_status: 'COMPLETED', trading_status: 'TRADING_CONFIRMED' }),
+    { scanStatus: 'COMPLETED', tradingStatus: 'TRADING_CONFIRMED' },
+  );
 });

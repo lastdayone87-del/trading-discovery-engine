@@ -20,7 +20,8 @@ import {
 import { calculateCreatorQualityScore, extractVocabularyFromCreator, invokeChannelVocabularyExtraction, replayVocabularyForRetry, resolveExtractionVideoIds } from './queryIntelligence';
 import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { enqueueTermHarvest } from './candidateCorpus';
-import { resolveUncertainLifecycle } from './enrichmentLifecycle';
+import { resolveEnrichmentReopenBlockedLifecycle, resolveUncertainLifecycle } from './enrichmentLifecycle';
+import { enrichmentJobIdempotencyKey } from './classificationDecoupling';
 import {ConfigurableWeightedStrategy,evaluateClassificationStages,buildCanonicalEvidenceCorpus,getLayeredKnowledgeContext,type EvidenceCollectionReport,type RawChannelInput} from './evidenceEngine';
 import { buildContextualComposition } from './evidenceEngine/contextualComposition';
 import { contentLanguagePacks } from './evidenceEngine/multilingualTerminology';
@@ -975,11 +976,31 @@ async function processChannelThroughPipelineInContext(
     if (lifecycle.shouldEnqueue) {
       const action=ACTIONS.find(item=>item.action===appliedAction),nextStage=action?.enrichmentStage||Math.min(2,currentStage+1);
       const vitality=deriveVitalityScheduling(productionClassification.input.activity_metadata,productionClassification.decision.timestamp),priority=10+vitality.jobPriorityDelta,payload={ channelId: candidate.channelId, targetCountry, source, candidate, enrichmentStage:nextStage, quotaOrigin: currentOfficialYouTubeQuotaOrigin() === 'PROBE' ? 'PROBE' : 'NORMAL', evidenceAcquisitionDecisionId:evidencePlan?.decisionId, evidenceAction:appliedAction, vitalityScheduling:vitality };
+      // Ordinary rediscovery must not turn a completed enrichment job back into
+      // PENDING. The page/day bucket bounds re-enrichment to one stage pass per
+      // day; preventCompletedReopen keeps today's completed work terminal while
+      // still allowing a FAILED job to retry. Explicit rechecks/recovery use
+      // their own keys and are unaffected.
+      const enrichmentKey=enrichmentJobIdempotencyKey(candidate.channelId,nextStage);
+      const enqueueEnrichment=()=>enqueueJob('ENRICH_CHANNEL',payload,{priority,maxAttempts:4,idempotencyKey:enrichmentKey,preventCompletedReopen:true});
       const workflowAssignment=await assignRelease5Serving('INVESTIGATION_WORKFLOW',candidate.channelId).catch(()=>({assigned:false,mode:'OFF'})),legacyWorkflowEnabled=await getAppSetting('investigation_workflow_enabled','false')==='true';
+      let enqueued: Awaited<ReturnType<typeof enqueueJob>> | undefined;
       if(workflowAssignment.assigned||legacyWorkflowEnabled){
         try{await scheduleInvestigationStep({investigationId:candidate.investigationId,channelId:candidate.channelId,diagnosticId:classificationDiagnosticId,actionType:appliedAction,jobType:'ENRICH_CHANNEL',jobPayload:payload,priority,maxAttempts:4,idempotencyKey:`investigation-step:${candidate.channelId}:${classificationDiagnosticId||now}:${appliedAction}`,policyVersion:INVESTIGATION_POLICY_VERSION,utilityContractVersion:'utility-constraints-v1',deadlineMinutes:Number(await getAppSetting('investigation_deadline_minutes','30'))||30});}
-        catch(error){if(candidate.investigationId)throw error;console.error(`[Investigation] Initial transactional scheduling failed for ${candidate.channelId}; using compatible queue fallback.`,error);await enqueueJob('ENRICH_CHANNEL',payload,{priority,maxAttempts:4,idempotencyKey:`enrich:${candidate.channelId}:stage:${nextStage}`});}
-      }else await enqueueJob('ENRICH_CHANNEL',payload,{priority,maxAttempts:4,idempotencyKey:`enrich:${candidate.channelId}:stage:${nextStage}`});
+        catch(error){if(candidate.investigationId)throw error;console.error(`[Investigation] Initial transactional scheduling failed for ${candidate.channelId}; using compatible queue fallback.`,error);enqueued=await enqueueEnrichment();}
+      }else enqueued=await enqueueEnrichment();
+      if(enqueued?.reopen_blocked===true){
+        // The completed pass already ran today. Do not leave the row waiting on
+        // a job that cannot run; project the honest completed state while
+        // preserving the channel's semantic status.
+        const blocked=resolveEnrichmentReopenBlockedLifecycle(authoritativeChannel);
+        if(blocked.scanStatus!==authoritativeChannel.scan_status||blocked.tradingStatus!==authoritativeChannel.trading_status){
+          authoritativeChannel.scan_status=blocked.scanStatus;
+          authoritativeChannel.trading_status=blocked.tradingStatus;
+          authoritativeChannel.last_checked=now;
+          await upsertChannel(authoritativeChannel,{preserveDiscordOnUpdate:true});
+        }
+      }
     }
 
     return {
