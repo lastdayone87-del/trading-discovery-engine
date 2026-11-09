@@ -109,6 +109,10 @@ test('a slow country pass cannot overwrite a concurrent rejection or confirmatio
   assert.equal(countryPolicySnapshotMatches({ countryStatus: 'CONFIRMED', country: 'Netherlands' }, unconfirmed), false);
   assert.equal(countryPolicySnapshotMatches({ countryStatus: 'UNCERTAIN', country: 'Belgium' }, unconfirmed), false);
   assert.equal(countryPolicySnapshotMatches(null, unconfirmed), false);
+  const policy = { countryStatus: 'UNCERTAIN', country: '', tradingStatus: 'TRADING_CONFIRMED', scanStatus: 'COMPLETED' };
+  assert.equal(countryPolicySnapshotMatches({ ...policy }, policy), true);
+  assert.equal(countryPolicySnapshotMatches({ ...policy, tradingStatus: 'NON_TRADING' }, policy), false);
+  assert.equal(countryPolicySnapshotMatches({ ...policy, scanStatus: 'ENRICHMENT_PENDING' }, policy), false);
 });
 
 test('raw channel rows map snake_case country columns before comparison', () => {
@@ -117,4 +121,8 @@ test('raw channel rows map snake_case country columns before comparison', () => 
   assert.equal(countryPolicySnapshotMatches(countryPolicySnapshotFromRow(row), { countryStatus: 'UNCERTAIN', country: '' }), true);
   assert.equal(countryPolicySnapshotMatches(countryPolicySnapshotFromRow({ country_status: 'REJECTED', country: 'Germany' }), { countryStatus: 'UNCERTAIN', country: '' }), false);
   assert.equal(countryPolicySnapshotFromRow(null), null);
+  assert.deepEqual(
+    countryPolicySnapshotFromRow({ country_status: 'UNCERTAIN', country: '', trading_status: 'TRADING_CONFIRMED', scan_status: 'COMPLETED' }),
+    { countryStatus: 'UNCERTAIN', country: '', tradingStatus: 'TRADING_CONFIRMED', scanStatus: 'COMPLETED' },
+  );
 });

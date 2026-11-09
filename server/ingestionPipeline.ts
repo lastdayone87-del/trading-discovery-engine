@@ -444,7 +444,12 @@ async function processChannelThroughPipelineInContext(
       // Capture the policy this pass read; the write below must not overwrite
       // a concurrent rejection/confirmation committed while hydration ran.
       const countryPolicySnapshot = countryRevalidation
-        ? { countryStatus: existing.country_status, country: existing.country }
+        ? {
+            countryStatus: existing.country_status,
+            country: existing.country,
+            tradingStatus: existing.trading_status,
+            scanStatus: existing.scan_status,
+          }
         : undefined;
       // A guarded write can be skipped when another pass changed the country
       // decision. Re-read the committed row so the returned outcome and

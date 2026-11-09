@@ -1573,7 +1573,7 @@ export async function upsertChannelWithResult(channel: ChannelRecord, options?: 
   try {
     await client.query('BEGIN');
     const prior = await client.query(
-      `SELECT quality_score,trading_status,country,country_status,${DISCORD_PROJECTION_WRITE_COLUMNS.join(',')} FROM channels WHERE channel_id=$1 FOR UPDATE`,
+      `SELECT quality_score,trading_status,country,country_status,scan_status,${DISCORD_PROJECTION_WRITE_COLUMNS.join(',')} FROM channels WHERE channel_id=$1 FOR UPDATE`,
       [channel.channel_id]
     );
     // The row is locked above for this transaction. A classification-only write

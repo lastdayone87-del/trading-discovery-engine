@@ -75,14 +75,21 @@ export function shouldBypassPreservationForDiscordEvidence(
 export interface CountryPolicySnapshot {
   countryStatus?: string | null;
   country?: string | null;
+  tradingStatus?: string | null;
+  scanStatus?: string | null;
 }
 
 /** Map a raw channels row (snake_case columns) to the policy snapshot shape. */
 export function countryPolicySnapshotFromRow(
-  row: { country_status?: string | null; country?: string | null } | null | undefined,
+  row: { country_status?: string | null; country?: string | null; trading_status?: string | null; scan_status?: string | null } | null | undefined,
 ): CountryPolicySnapshot | null {
   if (!row) return null;
-  return { countryStatus: row.country_status ?? null, country: row.country ?? null };
+  return {
+    countryStatus: row.country_status ?? null,
+    country: row.country ?? null,
+    ...(row.trading_status !== undefined ? { tradingStatus: row.trading_status ?? null } : {}),
+    ...(row.scan_status !== undefined ? { scanStatus: row.scan_status ?? null } : {}),
+  };
 }
 
 /** Compare a channel's locked country policy with the snapshot a slower pass read. */
@@ -91,8 +98,13 @@ export function countryPolicySnapshotMatches(
   expected: CountryPolicySnapshot,
 ): boolean {
   if (!locked) return false;
-  return String(locked.countryStatus || '') === String(expected.countryStatus || '')
-    && String(locked.country || '') === String(expected.country || '');
+  if (String(locked.countryStatus || '') !== String(expected.countryStatus || '')) return false;
+  if (String(locked.country || '') !== String(expected.country || '')) return false;
+  if (expected.tradingStatus !== undefined
+    && String(locked.tradingStatus || '') !== String(expected.tradingStatus || '')) return false;
+  if (expected.scanStatus !== undefined
+    && String(locked.scanStatus || '') !== String(expected.scanStatus || '')) return false;
+  return true;
 }
 
 export function machineNonTradingRediscoveryEligible(existing: ChannelRecord, now = Date.now()): boolean {
