@@ -586,6 +586,7 @@ interface AutonomousRunFinalizationArgs {
   createContinuation: boolean;
   continuationExplorationPagesRemaining: number;
   continuationResumeMode: ContinuationResumeMode;
+  queryHold?: import('./queryResultConsistency').QueryResultConsistencyDecision | null;
 }
 
 /**
@@ -703,6 +704,7 @@ async function finalizeAutonomousSearchRun(args: AutonomousRunFinalizationArgs):
   }
   await completeQueryRun(args.queryRunId, {
     ...finalMetrics,
+    ...(args.queryHold ? { queryHold: args.queryHold } : {}),
     uniqueChannels: finalMetrics.newChannels,
     qualityChannels: finalMetrics.qualityChannels,
     communitiesDiscovered: finalMetrics.communitiesDiscovered,
@@ -2406,7 +2408,7 @@ export async function processNextSearchJob(
       };
       await recordAutonomousPage(pageObservation);
       try{await recordPassivePage({query,jobId:job.id,observation:pageObservation});}catch(shadowError){console.error('[Phase 5 shadow] Passive page write failed.',shadowError);await recordShadowFailure({queryRunId,jobId:job.id,stage:'PAGE_OUTCOME',error:shadowError}).catch(()=>undefined);}
-      if (deferDecision) {
+      if (!queryResultHold && deferDecision) {
         if (decisionV2.deferReason === 'QUOTA') await deferAutonomousRunForQuota(queryRunId, decisionV2.primaryReason);
         else await deferAutonomousRunForTime(queryRunId, decisionV2.primaryReason);
         await completeJob(job.id);
@@ -2531,6 +2533,7 @@ export async function processNextSearchJob(
         }),
         continuationExplorationPagesRemaining: usingV2 ? decisionV2.explorationPagesRemaining : explorationPagesRemaining,
         continuationResumeMode: resumeModeForProvider(providerKey),
+        queryHold: queryResultConsistency,
       });
       if (queryResultHold) {
         // completeQueryRun recomputes collection from the empty/held page

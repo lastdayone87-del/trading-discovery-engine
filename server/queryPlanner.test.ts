@@ -250,7 +250,7 @@ test('planner produces novel local instrument-market variants when every current
   const instrumentMarket = planned.filter(item => item.metadata.queryTemplate === 'INSTRUMENT_MARKET');
   assert.ok(instrumentMarket.length > 0, 'no novel instrument-market fallback was planned');
   assert.ok(instrumentMarket.every(item => /BEL|EURUSD/i.test(item.query)));
-  assert.equal(planned.some(item => item.metadata.queryTemplate === 'SINGLE_ATOM'), false);
+  assert.equal(planned.some(item => normalizeQuery(item.query) === normalizeQuery('Bolero aandelen')), false);
   assert.ok(planned.some(item => /Bolero aandelen/.test(item.query)
     && ((item.metadata as any).atoms as unknown[]).length >= 2));
 });
@@ -512,7 +512,7 @@ test('ambiguous reviewed-native market and broker surfaces are never planned as 
 });
 
 test('reviewed native trading methods remain standalone while ambiguous markets do not', () => {
-  const spain = planDiverseQueries({ country: 'Spain', count: 10, learnedVocabulary: [], existingQueries: [] });
+  const spain = planDiverseQueries({ country: 'Spain', count: 20, learnedVocabulary: [], existingQueries: [] });
   assert.ok(spain.some(item => normalizeQuery(item.query) === normalizeQuery('velas japonesas')
     && item.metadata.queryTemplate === 'SINGLE_ATOM'));
   assert.ok(spain.some(item => normalizeQuery(item.query) === normalizeQuery('operativa intradía')
@@ -520,4 +520,19 @@ test('reviewed native trading methods remain standalone while ambiguous markets 
 
   const singapore = planDiverseQueries({ country: 'Singapore', count: 12, learnedVocabulary: [], existingQueries: [] });
   assert.equal(singapore.some(item => normalizeQuery(item.query) === normalizeQuery('STI analysis')), false);
+});
+
+
+test('specific multi-token native market phrases remain standalone without stuttering pairs', () => {
+  const germany = planDiverseQueries({ country: 'Germany', count: 20, learnedVocabulary: [], existingQueries: [] });
+  const singapore = planDiverseQueries({ country: 'Singapore', count: 12, learnedVocabulary: [], existingQueries: [] });
+  assert.ok(germany.some(item => normalizeQuery(item.query) === normalizeQuery('DAX Analyse heute')
+    && item.metadata.queryTemplate === 'SINGLE_ATOM'));
+  assert.ok(singapore.some(item => normalizeQuery(item.query) === normalizeQuery('Singapore market outlook')
+    && item.metadata.queryTemplate === 'SINGLE_ATOM'));
+  for (const item of [...germany, ...singapore]) {
+    const normalized = normalizeQuery(item.query);
+    assert.notEqual(normalized, normalizeQuery('DAX Orderflow DAX'));
+    assert.notEqual(normalized, normalizeQuery('DAX XTB DAX'));
+  }
 });

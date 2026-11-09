@@ -5332,6 +5332,8 @@ export async function completeQueryRun(runId: string, metrics: {
    * performance_details via the metrics JSON; never affects scoring.
    */
   latencyBreakdownMs?: { workerTotalMs: number; quotaWaitMs: number; retrievalMs: number; channelProcessingMs: number };
+  /** Post-retrieval consistency hold, persisted atomically with completion. */
+  queryHold?: unknown;
 }): Promise<void> {
   const db = await getDb();
   const client = await db.connect();

@@ -435,17 +435,34 @@ function countryAtoms(country: string, vocabulary?: CountryVocabulary): SearchAt
     // actual semantic class. High-ambiguity MARKET/BROKER/PLATFORM surfaces
     // remain MODIFIER_ONLY and are paired with an authorized anchor below;
     // only atoms whose own policy is STANDALONE may be selected as singles.
+    const nativeTokens = queryTokenCount(nativeAtom.term);
+    const safeMarketQualifier = /\b(dax|ibex|cac|bel ?20|euronext|nyse|nasdaq|s&p|ftse|aex|smi|omx|tsx|asx|nzx|sgx|nikkei|topix|kospi|bist|bovespa|moex|jse|hose|set|bursa|stock\s*exchange|bourse|börse|beurs|market\s*outlook|market\s*wrap|opening|session|تحليل|تداول)\b/iu;
     const reviewedMethod = nativeAtom.type === 'METHOD'
       && nativeAtom.retrievalPolicy.specificity >= 55
       && nativeAtom.retrievalPolicy.ambiguity <= 60;
+    // Specific multi-token market phrases (DAX Analyse heute, NZX 50
+    // analysis, Singapore market outlook) are safe reviewed surfaces. Short
+    // acronym/broker surfaces (STI analysis, Bolero aandelen, DBS Vickers)
+    // remain modifier-only. Broker/platform names are never standalone.
+    const reviewedMarket = nativeAtom.type === 'MARKET'
+      && (nativeTokens >= 3 || (safeMarketQualifier.test(nativeAtom.term) && !/\bsti\b/i.test(nativeAtom.term)));
+    const reviewedStandalone = reviewedMethod || reviewedMarket;
     nativeAtom.retrievalPolicy = {
       ...nativeAtom.retrievalPolicy,
-      // Reviewed native METHODS are whole trading-method surfaces and may
-      // stand alone. Reviewed MARKET/BROKER/PLATFORM surfaces stay
-      // modifier-only: they are exactly the ambiguous surfaces that must be
-      // paired with an authorized anchor.
-      eligibility: reviewedMethod ? 'STANDALONE' : nativeAtom.retrievalPolicy.eligibility,
-      reasonCodes: [...new Set([...nativeAtom.retrievalPolicy.reasonCodes, 'REVIEWED_NATIVE_PHRASE'])],
+      ...(reviewedStandalone ? {
+        eligibility: 'STANDALONE' as const,
+        specificity: Math.max(nativeAtom.retrievalPolicy.specificity, 60),
+        ambiguity: Math.min(nativeAtom.retrievalPolicy.ambiguity, 45),
+        requiredCompanionClasses: [],
+        reasonCodes: [...new Set([
+          ...nativeAtom.retrievalPolicy.reasonCodes.filter(code =>
+            code !== 'AMBIGUOUS_MARKET_CONTEXT_REQUIRES_COMPANION'
+            && code !== 'UNGOVERNED_METHOD_REQUIRES_TRADING_ANCHOR'),
+          'REVIEWED_NATIVE_PHRASE',
+        ])],
+      } : {
+        reasonCodes: [...new Set([...nativeAtom.retrievalPolicy.reasonCodes, 'REVIEWED_NATIVE_PHRASE'])],
+      }),
     };
     return nativeAtom;
   });
