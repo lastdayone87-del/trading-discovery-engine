@@ -98,10 +98,9 @@ export class ProviderCooldownReadCache {
         : provider === 'groq'
           ? 'groq:'
           : '';
-    if (!prefix) {
-      this.invalidate();
-      return;
-    }
+    // The cache only holds these three provider families. A rate-limit event
+    // from YouTube or another provider must not flush unrelated entries.
+    if (!prefix) return;
     for (const key of new Set([...this.entries.keys(), ...this.inFlight.keys()])) {
       if (key.startsWith(prefix)) this.bump(key);
     }

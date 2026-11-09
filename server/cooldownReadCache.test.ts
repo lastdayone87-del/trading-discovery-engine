@@ -145,3 +145,12 @@ test('a sustained invalidation burst makes a final uncached read instead of repo
   assert.equal(loads, 4);
   assert.equal(cache.size(), 0, 'the final uncached result is not stored');
 });
+
+test('a rate limit from an unrelated provider does not flush cached semantic cooldowns', async () => {
+  const cache = new ProviderCooldownReadCache(5_000);
+  let loads = 0;
+  await cache.get('gemini:org:a', 1_000, async () => { loads += 1; return 8_000; });
+  cache.invalidateProvider('youtube');
+  assert.equal(await cache.get('gemini:org:a', 1_100, async () => { loads += 1; return 8_000; }), 8_000);
+  assert.equal(loads, 1);
+});
