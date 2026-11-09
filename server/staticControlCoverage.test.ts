@@ -184,4 +184,28 @@ test('M2a dynamic duplicates do not consume the fresh control cap', async () => 
   assert.equal(result.foundInvite, 'dynamic-cap-room');
   assert.ok(calls.includes('https://creator.example/community'),
     'dynamic duplicates must not displace an M2a-only target');
+  assert.ok(!calls.some(url => url.includes('unrelated-')),
+    'rejected dynamic destinations must not be fetched');
+});
+
+test('M2a control invite marks its own seed FOUND after cross-seed dedupe', async () => {
+  const result = await runChannelInspection({
+    channelId: 'm2a-cross-seed',
+    channelName: 'M2a Cross Seed',
+    channelBio: 'No invite',
+    channelLinks: ['https://creator.example/a', 'https://creator.example/b'],
+    videoDescriptions: ['one', 'two', 'three', 'four', 'five'],
+    externalFetchImpl: (async (input: any) => {
+      const url = String(input);
+      if (url === 'https://creator.example/a') return html('<a href="https://discord.gg/shared-merge-room">Join</a>');
+      if (url === 'https://creator.example/b') return html('<button formaction="https://&#100;iscord.gg/shared-merge-room">Join</button>');
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch,
+  });
+
+  assert.equal(result.foundInvite, 'shared-merge-room');
+  const outcomes = result.acquisitionOutcomes?.filter(outcome => outcome.surface === 'CREATOR_WEBSITES') || [];
+  assert.equal(outcomes.find(outcome => outcome.requestedUrl === 'https://creator.example/a')?.outcome, 'FOUND');
+  assert.equal(outcomes.find(outcome => outcome.requestedUrl === 'https://creator.example/b')?.outcome, 'FOUND',
+    'a control-discovered invite merged into an earlier candidate must still mark its own seed FOUND');
 });
