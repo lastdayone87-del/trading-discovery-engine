@@ -3868,10 +3868,11 @@ export async function handleRelationshipCanaryExpansionJob(
  * The projection may only complete a channel when no discovery obligation
  * remains outstanding; otherwise it would strand the work. Pure over
  * channel + inspection state (no DB): the durable retry job is preserved by
- * never clearing scan attempts on a pending projection. Three keep-pending
+ * never clearing scan attempts on a pending projection. Four keep-pending
  * signals:
  *  - a stored locator whose validation never reached a terminal verdict;
  *  - a FOUND+required-gap directive (invites retained, gap unresolved);
+ *  - a community retry directive (required or optional surface failure);
  *  - a mandatory community-surface observation that is retryable.
  *
  * The retryable-observation check intentionally reuses the shared
