@@ -60,9 +60,10 @@ test('Stage 4 PostgreSQL: dashboard library/vocabulary filters and pagination ar
         `INSERT INTO canonical_trading_terms(canonical_term,normalized_term,country,language,script,term_type,trust_tier,search_eligible,lifecycle_status,first_observed_at,last_observed_at)
          VALUES($1,$2,'France','fr','Latn','TERMINOLOGY',3,false,'OBSERVED',$3,$3) RETURNING id`,
         [term, term.toLocaleLowerCase('en'), observedAt]
-      )).rows[0].id as number;
-      canonicalIds.push(id);
-      return id;
+      )).rows[0].id;
+      const numericId = Number(id);
+      canonicalIds.push(numericId);
+      return numericId;
     };
     const olderCanonical = await insertCanonical(`${suffix}-canonical-older`, new Date(Date.now() - 120_000).toISOString());
     const newerCanonical = await insertCanonical(`${suffix}-canonical-newer`, new Date(Date.now() - 60_000).toISOString());
