@@ -56,7 +56,8 @@ import { coverageCellFor, portfolioBudget, buildHierarchy, selectHierarchicalUcb
 import { isQuerySelectable } from './queryQuality/lifecycle';
 import { getCountryMarketProfile } from './queryQuality/profiles';
 import type { DecayedArmCounts, SelectorCandidate, SelectorContext, SelectorDecision } from './queryQuality/types';
-import { selectQueryCollection, isSeverelyContaminatedQuery, PROVEN_LCB_THRESHOLD, PROVEN_MIN_COMPLETED_RUNS, type QueryFunnelMetrics, type QueryPromotionGuard } from './queryPerformance';
+import { selectQueryCollection, isSeverelyContaminatedQuery, type QueryFunnelMetrics, type QueryPromotionGuard } from './queryPerformance';
+import { resolveProvenPolicy } from './queryQuality/provenPolicy';
 import { attributeTerminologyPerformance, buildNoveltyBaseline, classifyNativeCandidate, detectSpamSignals, findLiteralSpan, getPlannerTerminology, normalizeTerm, observeTerminology, observeTerminologyDetailed, KNOWN_INSTRUMENT_TERMS, type LiteralSourceText, type LiteralSpanMatch, type NativeAdmissionRejectReason, type NoveltyBaseline, type TerminologyObservationResult } from './terminologyIntelligence';
 import type { ExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { canonicalCountry } from './countryInference';
@@ -1966,6 +1967,13 @@ export async function evaluateQueryPerformance(
   // queue evaluates it, so completed prior runs are read from sighting truth
   // and the in-flight metrics are added as the newest observation.
   let promotionGuard: QueryPromotionGuard | undefined;
+  // The threshold is a production-calibrated control, not a code constant.
+  // Defaults preserve the existing policy until an operator reviews the
+  // accounted run distribution and sets an explicit value.
+  const provenPolicy = resolveProvenPolicy(
+    await getAppSetting('query_proven_lcb_threshold', ''),
+    await getAppSetting('query_proven_min_completed_runs', ''),
+  );
   if (performanceScore >= 60) {
     // One aggregated read per country (a row per query id, not per run). The
     // query's own prior is kept separate from every other arm so the promotion
@@ -2037,8 +2045,8 @@ export async function evaluateQueryPerformance(
         ? metrics.duplicateResults / (metrics.evaluatedRawResults ?? metrics.rawResults)
         : 0,
       invalidQueryRate: 0,
-      threshold: PROVEN_LCB_THRESHOLD,
-      minRuns: PROVEN_MIN_COMPLETED_RUNS,
+      threshold: provenPolicy.threshold,
+      minRuns: provenPolicy.minRuns,
     };
   }
   const newCollection = selectQueryCollection(
