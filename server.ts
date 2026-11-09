@@ -691,7 +691,8 @@ async function startServer() {
   app.get('/api/query-intelligence/terminology', async (req, res) => {
     try {
       const limit = Math.max(1, Math.min(1000, parseInt(req.query.limit as string) || 200));
-      res.json(await getTerminologyDashboardPage(req.query.country as string | undefined, limit));
+      const offset = Math.max(0, Math.min(100000, parseInt(req.query.offset as string) || 0));
+      res.json(await getTerminologyDashboardPage(req.query.country as string | undefined, limit, offset));
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }

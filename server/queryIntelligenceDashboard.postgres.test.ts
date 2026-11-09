@@ -7,6 +7,7 @@ import {
   getVocabularyPage,
   resetQueryIntelligenceSummaryCacheForTests,
 } from './db';
+import { getTerminologyDashboardPage } from './terminologyIntelligence';
 
 const databaseUrl = process.env.PHASE4_POSTGRES_URL;
 
@@ -17,6 +18,7 @@ test('Stage 4 PostgreSQL: dashboard library/vocabulary filters and pagination ar
   const suffix = `dashboard-page-${Date.now()}-${process.pid}`;
   const queryIds: number[] = [];
   const termIds: number[] = [];
+  const canonicalIds: number[] = [];
   try {
     const insertQuery = async (country: string, collection: string, score: number) => {
       const id = (await db.query(
@@ -53,6 +55,22 @@ test('Stage 4 PostgreSQL: dashboard library/vocabulary filters and pagination ar
     assert.equal(frPage.length, 1);
     assert.equal(frPage[0].term, `${suffix}-fr-b`, 'the second French term must be reachable through offset');
 
+    const insertCanonical = async (term: string, observedAt: string) => {
+      const id = (await db.query(
+        `INSERT INTO canonical_trading_terms(canonical_term,normalized_term,country,language,script,term_type,trust_tier,search_eligible,lifecycle_status,first_observed_at,last_observed_at)
+         VALUES($1,$2,'France','fr','Latn','TERMINOLOGY',3,false,'OBSERVED',$3,$3) RETURNING id`,
+        [term, term.toLocaleLowerCase('en'), observedAt]
+      )).rows[0].id as number;
+      canonicalIds.push(id);
+      return id;
+    };
+    const olderCanonical = await insertCanonical(`${suffix}-canonical-older`, new Date(Date.now() - 120_000).toISOString());
+    const newerCanonical = await insertCanonical(`${suffix}-canonical-newer`, new Date(Date.now() - 60_000).toISOString());
+    const firstCanonicalPage = await getTerminologyDashboardPage('France', 1, 0);
+    const secondCanonicalPage = await getTerminologyDashboardPage('France', 1, 1);
+    assert.equal(Number((firstCanonicalPage[0] as { id: number }).id), newerCanonical);
+    assert.equal(Number((secondCanonicalPage[0] as { id: number }).id), olderCanonical);
+
     resetQueryIntelligenceSummaryCacheForTests();
     const first = await getQueryIntelligenceSummary({ now: 1_000, force: true });
     const extraId = await insertQuery('France', 'EXPERIMENTAL', 1);
@@ -66,6 +84,7 @@ test('Stage 4 PostgreSQL: dashboard library/vocabulary filters and pagination ar
     resetQueryIntelligenceSummaryCacheForTests();
     if (queryIds.length) await db.query('DELETE FROM query_library WHERE id=ANY($1::int[])', [queryIds]).catch(() => undefined);
     if (termIds.length) await db.query('DELETE FROM extracted_trading_vocabulary WHERE id=ANY($1::int[])', [termIds]).catch(() => undefined);
+    if (canonicalIds.length) await db.query('DELETE FROM canonical_trading_terms WHERE id=ANY($1::bigint[])', [canonicalIds]).catch(() => undefined);
     await db.end();
   }
 });

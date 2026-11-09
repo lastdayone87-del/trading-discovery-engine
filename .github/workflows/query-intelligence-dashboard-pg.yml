@@ -5,6 +5,7 @@ on:
     paths:
       - 'server/db/migrations/**'
       - 'server/dbCore.ts'
+      - 'server/terminologyIntelligence.ts'
       - 'server.ts'
       - 'src/components/QueryIntelligenceEngine.tsx'
       - 'server/queryIntelligenceDashboard.postgres.test.ts'
