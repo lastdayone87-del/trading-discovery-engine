@@ -92,6 +92,8 @@ test('terminology observations no longer default an identifiable surface to und'
   assert.equal(detectCodeSwitching('order flow').termLanguage, 'en');
   // An unknown short string still fails closed rather than inventing a language.
   assert.equal(detectCodeSwitching('xyzzy').termLanguage, 'und');
+  // German day-trading spelling must be in the lexicon (not `tagesrading`).
+  assert.equal(detectLanguage('Tagestrading DAX', { countryHint: 'Germany' }).language, 'de');
 });
 
 test('CJK compounds match reviewed semantics without space boundaries', () => {
