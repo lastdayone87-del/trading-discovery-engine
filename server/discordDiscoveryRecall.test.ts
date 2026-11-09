@@ -67,7 +67,8 @@ test('authoritative newest video descriptions are refreshed and prioritized over
   assert.equal(result.foundInvite, 'recent-room');
   const videoStep = result.steps.find(step => step.step === 'VIDEO_DESCRIPTIONS');
   assert.equal(videoStep?.status, 'FOUND');
-  assert.match(videoStep?.details || '', /Scanning 5 recent video descriptions/);
+  assert.match(videoStep?.details || '', /Scanning 10 recent video descriptions/);
+  assert.match(videoStep?.details || '', /\(11 available; newest authoritative descriptions are prioritized\)/);
 });
 
 test('confirmed trading social profiles escalate from static inspection to rendered fallback', async () => {
