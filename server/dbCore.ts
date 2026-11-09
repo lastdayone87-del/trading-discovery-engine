@@ -21,6 +21,7 @@ import { canonicalCountry } from './countryInference';
 import { sanitizeSubscriberCountText } from './lowAudienceGate';
 import { countryIdentitySql } from './countryExclusionRules';
 import { classifyDiscoveryVisibility } from './discoveryStateVisibility';
+import { countryPolicySnapshotMatches, type CountryPolicySnapshot } from './terminalPreservationPolicy';
 import { safeCrawlerTelemetry, type CrawlerTelemetry } from './crawlerTelemetry';
 import { admitBulkEnqueue, commitBulkEnqueue, releaseBulkEnqueue, BulkEnqueueGuardError } from './acquisitionBulkEnqueueGuard';
 import { sanitizeAcquisitionAttribution, type AcquisitionAttribution } from './acquisitionLaneTaxonomy';
@@ -1563,13 +1564,13 @@ export async function reconcileClassificationSighting(input: {
   return result.rowCount || 0;
 }
 
-export async function upsertChannel(channel: ChannelRecord, options?: { preserveDiscordOnUpdate?: boolean; allowDiscordClear?: boolean; freshDiscordValidation?: boolean }): Promise<void> {
+export async function upsertChannel(channel: ChannelRecord, options?: { preserveDiscordOnUpdate?: boolean; allowDiscordClear?: boolean; freshDiscordValidation?: boolean; requireCountrySnapshot?: CountryPolicySnapshot }): Promise<void> {
   const db = await getDb();
   const client = await db.connect();
   try {
     await client.query('BEGIN');
     const prior = await client.query(
-      `SELECT quality_score,trading_status,${DISCORD_PROJECTION_WRITE_COLUMNS.join(',')} FROM channels WHERE channel_id=$1 FOR UPDATE`,
+      `SELECT quality_score,trading_status,country,country_status,${DISCORD_PROJECTION_WRITE_COLUMNS.join(',')} FROM channels WHERE channel_id=$1 FOR UPDATE`,
       [channel.channel_id]
     );
     // The row is locked above for this transaction. A classification-only write
@@ -1580,6 +1581,14 @@ export async function upsertChannel(channel: ChannelRecord, options?: { preserve
     // upsert passes `freshDiscordValidation` so fresh validation outcomes
     // (including operational failures and retry-pending evidence) apply.
     const locked = prior.rowCount ? prior.rows[0] : null;
+    // A slow country revalidation must not write its snapshot over a
+    // concurrent rejection or confirmation. The row lock makes this check and
+    // the write one atomic decision.
+    if (options?.requireCountrySnapshot && locked
+      && !countryPolicySnapshotMatches(locked, options.requireCountrySnapshot)) {
+      await client.query('COMMIT');
+      return;
+    }
     const preserveDiscord = options?.preserveDiscordOnUpdate === true
       || shouldRetainLockedDiscordProjection(channel, locked, options);
     if (preserveDiscord && locked) {

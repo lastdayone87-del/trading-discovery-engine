@@ -72,6 +72,21 @@ export function shouldBypassPreservationForDiscordEvidence(
     && channel?.scan_status !== 'SKIPPED_EXCLUDED';
 }
 
+export interface CountryPolicySnapshot {
+  countryStatus?: string | null;
+  country?: string | null;
+}
+
+/** Compare a channel's locked country policy with the snapshot a slower pass read. */
+export function countryPolicySnapshotMatches(
+  locked: CountryPolicySnapshot | null | undefined,
+  expected: CountryPolicySnapshot,
+): boolean {
+  if (!locked) return false;
+  return String(locked.countryStatus || '') === String(expected.countryStatus || '')
+    && String(locked.country || '') === String(expected.country || '');
+}
+
 export function machineNonTradingRediscoveryEligible(existing: ChannelRecord, now = Date.now()): boolean {
   const machineNonTrading = existing.trading_status === 'NON_TRADING' || existing.scan_status === 'SKIPPED_NON_TRADING';
   if (!machineNonTrading) return false;

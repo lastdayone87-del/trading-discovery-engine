@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ChannelRecord, DiscoverySource } from '../src/types';
-import { machineNonTradingRediscoveryEligible, shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldRevalidateConfirmedCountry, shouldShortCircuitConfirmedRediscovery, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
+import { countryPolicySnapshotMatches, machineNonTradingRediscoveryEligible, shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldRevalidateConfirmedCountry, shouldShortCircuitConfirmedRediscovery, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
 
 const NOW = Date.parse('2026-08-16T04:00:00.000Z');
 
@@ -100,4 +100,13 @@ test('Discord bypass never reopens country-terminal or confirmed rows', () => {
   assert.equal(shouldBypassPreservationForDiscordEvidence(base({ trading_status: 'UNCERTAIN', scan_status: 'COMPLETED', country_status: 'REJECTED' }), true), false);
   assert.equal(shouldBypassPreservationForDiscordEvidence(base({ trading_status: 'UNCERTAIN', scan_status: 'SKIPPED_EXCLUDED' }), true), false);
   assert.equal(shouldBypassPreservationForDiscordEvidence(completed, false), false);
+});
+
+test('a slow country pass cannot overwrite a concurrent rejection or confirmation', () => {
+  const unconfirmed = { countryStatus: 'UNCERTAIN', country: '' };
+  assert.equal(countryPolicySnapshotMatches(unconfirmed, unconfirmed), true);
+  assert.equal(countryPolicySnapshotMatches({ countryStatus: 'REJECTED', country: 'Netherlands' }, unconfirmed), false);
+  assert.equal(countryPolicySnapshotMatches({ countryStatus: 'CONFIRMED', country: 'Netherlands' }, unconfirmed), false);
+  assert.equal(countryPolicySnapshotMatches({ countryStatus: 'UNCERTAIN', country: 'Belgium' }, unconfirmed), false);
+  assert.equal(countryPolicySnapshotMatches(null, unconfirmed), false);
 });

@@ -49,6 +49,8 @@ import {
   runWithOfficialYouTubeQuotaOrigin,
 } from './officialYouTubeQuotaFence';
 import { resolvePipelineQuotaOrigin } from './quotaOrigin';
+import { isProbeQuotaControlError, YouTubeKeyCapUnavailableError } from './quotaKeyCapShadow';
+import { isYouTubeQuotaAccountingError } from './youtubeKeyHealth';
 
 // Extraction is best-effort and flag-gated, but a burst of ingestion jobs must
 // not open hundreds of concurrent staging transactions. Serialize the
@@ -365,7 +367,13 @@ async function processChannelThroughPipelineInContext(
     // operator recheck is the only supported terminal override.
     if (shouldPreserveExistingChannel(existing, source, isManualScan) && !shouldBypassPreservationForDiscordEvidence(existing, options?.forceClassification === true)) {
       let confirmedCountryUpdated = false;
-      if (shouldRevalidateConfirmedCountry(existing, isManualScan)) {
+      const countryRevalidation = shouldRevalidateConfirmedCountry(existing, isManualScan);
+      // Capture the policy this pass read; the write below must not overwrite
+      // a concurrent rejection/confirmation committed while hydration ran.
+      const countryPolicySnapshot = countryRevalidation
+        ? { countryStatus: existing.country_status, country: existing.country }
+        : undefined;
+      if (countryRevalidation) {
         try {
           // Search results can be sparse. Use the same official metadata and
           // public About hydration as Gate 1 before preserving the confirmed
@@ -386,7 +394,7 @@ async function processChannelThroughPipelineInContext(
               },
               now,
             }, candidate);
-            await upsertChannel(existing);
+            await upsertChannel(existing, countryPolicySnapshot ? { requireCountrySnapshot: countryPolicySnapshot } : undefined);
             return {
               channelId: candidate.channelId,
               channelName: candidate.channelName,
@@ -408,6 +416,15 @@ async function processChannelThroughPipelineInContext(
             confirmedCountryUpdated = true;
           }
         } catch (error) {
+          // Probe/quota policy and accounting failures are not evidence
+          // failures: propagating them keeps the caller's retry lifecycle and
+          // prevents a paid request from being silently replayed elsewhere.
+          if (error instanceof OfficialYouTubeQuotaFenceError
+            || error instanceof YouTubeKeyCapUnavailableError
+            || isProbeQuotaControlError(error)
+            || isYouTubeQuotaAccountingError(error)) {
+            throw error;
+          }
           console.warn(`[Unified Ingestion Pipeline] Confirmed-country revalidation failed for ${candidate.channelId}; preserving confirmed row:`, error instanceof Error ? error.message : error);
         }
       }
@@ -427,7 +444,7 @@ async function processChannelThroughPipelineInContext(
             timestamp: now,
           },
         ];
-        await upsertChannel(existing);
+        await upsertChannel(existing, countryPolicySnapshot ? { requireCountrySnapshot: countryPolicySnapshot } : undefined);
         return {
           channelId: candidate.channelId,
           channelName: candidate.channelName,
@@ -471,7 +488,7 @@ async function processChannelThroughPipelineInContext(
         updated = true;
       }
       if (updated) {
-        await upsertChannel(existing);
+        await upsertChannel(existing, countryPolicySnapshot ? { requireCountrySnapshot: countryPolicySnapshot } : undefined);
       }
 
       return {
