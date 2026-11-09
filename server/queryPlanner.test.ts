@@ -251,6 +251,22 @@ test('planner produces novel local instrument-market variants when every current
   assert.ok(planned.some(item => item.metadata.queryTemplate === 'SINGLE_ATOM'));
 });
 
+test('ambiguous short modifiers are not used by frontier target fallback', () => {
+  const base = {
+    country: 'United States',
+    language: 'en',
+    queryIntent: 'strategy' as const,
+    primaryTermFamily: 'ES',
+    retrievalLane: 'VIDEO' as const,
+    searchOrdering: 'RELEVANCE' as const,
+    instrumentOrTheme: null,
+    sourceFamily: 'automated_query',
+  };
+  assert.equal(planFrontierTargetedQuery({ country: 'United States', target: base }), null);
+  assert.equal(planFrontierTargetedQuery({ country: 'United States', target: { ...base, primaryTermFamily: 'SL' } }), null);
+  assert.equal(planFrontierTargetedQuery({ country: 'United States', target: { ...base, primaryTermFamily: 'LIVE' } }), null);
+});
+
 test('ambiguous short modifiers are not planned as learned query atoms', () => {
   const learned = ['ES', 'SL', 'LIVE'].map((term, index) => ({
     id: index + 1,

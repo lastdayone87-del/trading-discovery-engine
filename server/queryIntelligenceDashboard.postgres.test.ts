@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   getDb,
@@ -90,7 +90,6 @@ test('Stage 4 PostgreSQL: dashboard library/vocabulary filters and pagination ar
     if (queryIds.length) await db.query('DELETE FROM query_library WHERE id=ANY($1::int[])', [queryIds]).catch(() => undefined);
     if (termIds.length) await db.query('DELETE FROM extracted_trading_vocabulary WHERE id=ANY($1::int[])', [termIds]).catch(() => undefined);
     if (canonicalIds.length) await db.query('DELETE FROM canonical_trading_terms WHERE id=ANY($1::bigint[])', [canonicalIds]).catch(() => undefined);
-    await db.end();
   }
 });
 
@@ -126,6 +125,11 @@ test('Stage 4 PostgreSQL: saved query terminology status and digest persistence'
   } finally {
     if (queryId !== null) await db.query('DELETE FROM query_library WHERE id=$1', [queryId]).catch(() => undefined);
     if (termId !== null) await db.query('DELETE FROM canonical_trading_terms WHERE id=$1', [termId]).catch(() => undefined);
-    await db.end();
   }
+});
+
+after(async () => {
+  if (!databaseUrl) return;
+  const db = await getDb();
+  await db.end().catch(() => undefined);
 });

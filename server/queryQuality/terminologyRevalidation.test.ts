@@ -24,6 +24,7 @@ test('digesting stale terminology keeps the genuine query metadata auditable', (
     terminologyId: 153,
     terminologyLifecycle: 'SEARCH_TRIAL',
     terminologyDecayedYield: 0.12,
+    learnedTerm: 'DAX',
     atoms: [{ term: 'Footprint Trading' }, { term: 'DAX' }],
   };
   const digested = digestQueryTerminologyMetadata(metadata, demoted, '2026-11-09T16:00:00.000Z');
@@ -39,7 +40,7 @@ test('digesting stale terminology keeps the genuine query metadata auditable', (
     previousLifecycle: 'SEARCH_TRIAL',
     previousSearchEligible: false,
     previousDecayedYield: 0.12,
-    previousLearnedTerm: null,
+    previousLearnedTerm: 'DAX',
     reason: 'TERMINOLOGY_NOT_CURRENTLY_ELIGIBLE',
     revalidatedAt: '2026-11-09T16:00:00.000Z',
   });
@@ -54,4 +55,5 @@ test('a missing term row is digested without inventing a term identity', () => {
   const revalidation = digested.terminologyRevalidation as Record<string, unknown>;
   assert.equal(revalidation.reason, 'TERMINOLOGY_ROW_MISSING');
   assert.equal(revalidation.previousTerm, null);
+  assert.equal(revalidation.previousLearnedTerm, 'gone');
 });

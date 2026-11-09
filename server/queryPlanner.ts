@@ -223,6 +223,7 @@ export function planFrontierTargetedQuery(args: {
   target: DiscoveryNeighborhoodDimensions;
 }): PlannedQuery | null {
   const targetTerm = args.target.primaryTermFamily.normalize('NFKC').trim().replace(/\s+/g, ' ');
+  if (isAmbiguousShortModifier(targetTerm)) return null;
   const anchor = atom('trading', 'METHOD', (args.target.queryIntent || 'strategy') as QueryIntent, 1, 'CURATED');
   const neighborhood = atom(targetTerm, 'NEIGHBORHOOD', (args.target.queryIntent || 'strategy') as QueryIntent, 1, 'COUNTRY_VOCABULARY');
   const query = `${anchor.term} ${neighborhood.term}`.trim();

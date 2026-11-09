@@ -2073,7 +2073,7 @@ export async function getQueryTerminologyCurrentStatuses(queryIds:number[]):Prom
   const db=await getDb();
   const res=await db.query(`WITH linked AS (
       SELECT ql.id AS query_id,
-             CASE WHEN ql.generation_metadata->>'terminologyId' ~ '^[0-9]+$'
+             CASE WHEN ql.generation_metadata->>'terminologyId' ~ '^[0-9]{1,18}$'
                   THEN (ql.generation_metadata->>'terminologyId')::bigint END AS term_id
       FROM query_library ql WHERE ql.id=ANY($1::int[])
     )
