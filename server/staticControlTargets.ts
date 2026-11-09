@@ -41,6 +41,10 @@ export interface StaticControlExtraction {
 
 /** Bound per inspected page; normal pages carry only a handful. */
 export const MAX_STATIC_CONTROL_TARGETS = 20;
+/** Control text is scoring/provenance input, never a place to copy a page. */
+export const MAX_CONTROL_LABEL_CHARS = 200;
+/** Keep at most a few distinct labels when controls share one URL. */
+export const MAX_CONTROL_LABELS_PER_URL = 4;
 
 /** Long-delayed refreshes are session/expiry pages, not immediate controls. */
 export const MAX_META_REFRESH_DELAY_SECONDS = 5;
@@ -90,7 +94,8 @@ export function parseOnclickNavigation(raw: string | null | undefined): string |
   let value = String(raw ?? '').trim();
   if (!value) return null;
   value = value.replace(/^javascript\s*:/i, '').trim();
-  value = value.replace(/^return\s+/i, '').trim();
+  // ASI: `return\nlocation.href=...` returns before the assignment.
+  value = value.replace(/^return[ \t]+/i, '').trim();
   if (!value || /[`{}]/.test(value)) return null;
 
   const assignment = /^(?:(?:window|document)\.)?location(?:\.href)?\s*=\s*(['"])((?:(?!\1).)*)\1\s*;?$/s.exec(value);
@@ -129,9 +134,10 @@ export function staticControlTargetsFromDocument(
   $: CheerioAPI,
   maxTargets: number = MAX_STATIC_CONTROL_TARGETS,
   baseUrl?: string,
+  excludeUrls?: ReadonlySet<string>,
 ): StaticControlExtraction {
   const cap = Math.max(0, Math.floor(maxTargets) || 0);
-  const byUrl = new Map<string, StaticControlTarget>();
+  const byUrl = new Map<string, { target: StaticControlTarget; labels: Set<string> }>();
 
   const resolve = (url: string): string | null => {
     if (!baseUrl) return url;
@@ -142,33 +148,37 @@ export function staticControlTargetsFromDocument(
     }
   };
 
+  const cleanLabel = (value: string): string =>
+    String(value).replace(/\s+/g, ' ').trim().slice(0, MAX_CONTROL_LABEL_CHARS);
+
   const labelFor = (node: any, tag: string, fallback: string): string => {
     const aria = String(node.attr('aria-label') || '').trim();
-    if (aria) return aria;
+    if (aria) return cleanLabel(aria);
     const text = node.text().trim();
-    if (text) return text;
+    if (text) return cleanLabel(text);
     if (tag === 'input') {
       const value = String(node.attr('value') || '').trim();
-      if (value) return value;
+      if (value) return cleanLabel(value);
     }
     const title = String(node.attr('title') || '').trim();
-    return title || fallback;
+    return cleanLabel(title || fallback);
   };
 
   const add = (url: string | null, kind: StaticControlKind, label: string): void => {
     if (!url) return;
     const resolved = resolve(url);
-    if (!resolved) return;
+    if (!resolved || excludeUrls?.has(resolved)) return;
     const existing = byUrl.get(resolved);
     if (existing) {
-      // Keep every distinct label for destination scoring: an unlabeled first
+      // Keep distinct labels for destination scoring: an unlabeled first
       // occurrence must not hide a later "Join our community" occurrence.
-      if (label && !existing.label.split(/\s+/).includes(label)) {
-        existing.label = `${existing.label} ${label}`.trim();
+      if (label && !existing.labels.has(label) && existing.labels.size < MAX_CONTROL_LABELS_PER_URL) {
+        existing.labels.add(label);
+        existing.target.label = cleanLabel(`${existing.target.label} ${label}`);
       }
       return;
     }
-    byUrl.set(resolved, { url: resolved, kind, label });
+    byUrl.set(resolved, { target: { url: resolved, kind, label }, labels: new Set(label ? [label] : []) });
   };
 
   $('meta[http-equiv], button[formaction], input[formaction], [onclick]').each((_, element) => {
@@ -193,7 +203,7 @@ export function staticControlTargetsFromDocument(
     }
   });
 
-  const all = Array.from(byUrl.values());
+  const all = Array.from(byUrl.values(), entry => entry.target);
   const targets = all.slice(0, cap);
   return { targets, truncated: Math.max(0, all.length - targets.length) };
 }

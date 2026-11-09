@@ -29,7 +29,7 @@ async function inspectSeed(control: string, code: string) {
 
 test('M2a follows a literal onclick navigation target', async () => {
   const { result, calls } = await inspectSeed(
-    `<div onclick="location.href='/community'">Join the community</div>`,
+    `<div onclick="location.assign('/community')">Join the community</div>`,
     'onclick-room',
   );
   assert.equal(result.foundInvite, 'onclick-room');
@@ -48,7 +48,7 @@ test('M2a follows a literal formaction control target', async () => {
 
 test('M2a follows a literal meta-refresh target', async () => {
   const { result, calls } = await inspectSeed(
-    `<meta http-equiv="refresh" content="0; url='/community'">`,
+    `<meta http-equiv="refresh" content="0; '/community'">`,
     'meta-room',
   );
   assert.equal(result.foundInvite, 'meta-room');
@@ -111,4 +111,27 @@ test('M2a marks the seed partial and retryable when the control cap drops a targ
   assert.equal(observation?.retryable, true);
   assert.equal(observation?.failureClass, 'STATIC_BUDGET_GAP');
   assert.deepEqual(calls, ['https://creator.example/']);
+});
+
+test('M2a direct control invites keep the control label as anchor provenance', async () => {
+  const result = await runChannelInspection({
+    channelId: 'm2a-provenance',
+    channelName: 'M2a Provenance',
+    channelBio: 'No invite',
+    channelLinks: ['https://creator.example/'],
+    videoDescriptions: ['one', 'two', 'three', 'four', 'five'],
+    externalFetchImpl: (async (input: any) => {
+      const url = String(input);
+      if (url === 'https://creator.example/') {
+        return seedFor('<button formaction="https://discord.gg/control-room" aria-label="Join our community">Open</button>');
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch,
+  });
+
+  assert.equal(result.foundInvite, 'control-room');
+  const candidate = result.discordCandidates?.find(item => item.nativeInviteCode === 'control-room');
+  assert.ok(candidate?.observations?.some(observation =>
+    observation.sourceSurface === 'CREATOR_WEBSITES'
+    && observation.sourceAnchorText === 'Join our community'));
 });

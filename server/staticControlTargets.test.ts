@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as cheerio from 'cheerio';
 import {
+  MAX_CONTROL_LABEL_CHARS,
   MAX_STATIC_CONTROL_TARGETS,
   literalNavigationTarget,
   parseMetaRefreshTarget,
@@ -51,6 +52,8 @@ test('extracts the approved literal control shapes in DOM order', () => {
     '/replaced',
   ]);
   assert.equal(result.truncated, 0);
+  assert.equal(result.targets[1]?.label, 'Join the room');
+  assert.equal(result.targets[4]?.label, 'Click');
 });
 
 test('excludes JS expressions, multiple statements, and non-http schemes', () => {
@@ -64,6 +67,8 @@ test('excludes JS expressions, multiple statements, and non-http schemes', () =>
   assert.equal(parseOnclickNavigation('location.href=`/template`'), null);
   assert.equal(parseOnclickNavigation("window.open('/x','someFrame')"), null, 'named frames are outside the class');
   assert.equal(parseOnclickNavigation("window.open('/x','_blank')"), '/x');
+  assert.equal(parseOnclickNavigation("return\nlocation.href='/community'"), null, 'ASI makes the assignment unreachable');
+  assert.equal(parseOnclickNavigation("return location.assign('/community')"), '/community');
   assert.equal(parseOnclickNavigation("location.href='javascript:alert(1)'"), null);
   assert.equal(parseOnclickNavigation("location.href='data:text/html,x'"), null);
   assert.equal(parseOnclickNavigation("window.open('mailto:test@example.com')"), null);
@@ -120,6 +125,18 @@ test('input values and aria labels are preserved for destination scoring', () =>
 
   const aria = extract('<button formaction="https://other.example/start" aria-label="Join the trading floor">Open</button>');
   assert.equal(aria.targets[0]?.label, 'Join the trading floor');
+});
+
+test('control labels are bounded and repeated identical labels do not grow', () => {
+  const long = extract(`<div onclick="location.assign('/community')">Join our community ${'padding '.repeat(100)}</div>`);
+  assert.equal(long.targets.length, 1);
+  assert.ok(long.targets[0]!.label.startsWith('Join our community'));
+  assert.ok(long.targets[0]!.label.length <= MAX_CONTROL_LABEL_CHARS);
+
+  const repeated = extract(Array.from({ length: 10 }, () =>
+    `<div onclick="location.assign('/shared')">Join our community</div>`).join(''));
+  assert.equal(repeated.targets.length, 1);
+  assert.equal(repeated.targets[0]?.label, 'Join our community');
 });
 
 test('duplicate URLs merge labels instead of hiding a later community label', () => {
