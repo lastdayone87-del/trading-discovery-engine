@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ChannelRecord, DiscoverySource } from '../src/types';
-import { machineNonTradingRediscoveryEligible, shouldPreserveExistingChannel, shouldShortCircuitConfirmedRediscovery, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
+import { machineNonTradingRediscoveryEligible, shouldPreserveExistingChannel, shouldRevalidateConfirmedCountry, shouldShortCircuitConfirmedRediscovery, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
 
 const NOW = Date.parse('2026-08-16T04:00:00.000Z');
 
@@ -80,6 +80,15 @@ test('an active enrichment marker on a confirmed row is projected COMPLETED on r
   assert.equal(terminalScanStatusForConfirmedRediscovery('ENRICHMENT_PENDING'), 'COMPLETED');
   assert.equal(terminalScanStatusForConfirmedRediscovery('ENRICHING'), 'COMPLETED');
   assert.equal(terminalScanStatusForConfirmedRediscovery('LOCKED'), 'COMPLETED');
+  assert.equal(terminalScanStatusForConfirmedRediscovery('ENRICHING', true), 'ENRICHING', 'a live job owns the marker');
   assert.equal(terminalScanStatusForConfirmedRediscovery('NEEDS_REVIEW'), 'NEEDS_REVIEW');
   assert.equal(terminalScanStatusForConfirmedRediscovery('FAILED'), 'FAILED');
+});
+
+test('confirmed rows with unresolved country get only the deterministic country pass', () => {
+  const confirmedUnknown = base({ trading_status: 'TRADING_CONFIRMED', country_status: 'UNCERTAIN', country: '' });
+  assert.equal(shouldRevalidateConfirmedCountry(confirmedUnknown, false), true);
+  assert.equal(shouldRevalidateConfirmedCountry(confirmedUnknown, true), false);
+  assert.equal(shouldRevalidateConfirmedCountry(base(), false), false);
+  assert.equal(shouldRevalidateConfirmedCountry(base({ trading_status: 'UNCERTAIN', country_status: 'UNCERTAIN' }), false), false);
 });

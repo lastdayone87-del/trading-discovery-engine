@@ -1803,6 +1803,16 @@ export async function getQueueStatusFresh(): Promise<QueueStatus> {
  * must not compete with a live discovery backlog that is still being
  * classified, even before those jobs reach ENRICH_CHANNEL.
  */
+/** Active durable enrichment work for one channel, regardless of stage. */
+export async function hasActiveEnrichmentJob(channelId: string): Promise<boolean> {
+  const db = await getDb();
+  const res = await db.query(
+    `SELECT 1 FROM jobs WHERE type='ENRICH_CHANNEL' AND status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$1 LIMIT 1`,
+    [channelId],
+  );
+  return Boolean(res.rowCount);
+}
+
 export async function getProductionBacklogDepth(): Promise<number> {
   const db=await getDb();
   const res=await db.query(`SELECT COUNT(*)::int AS count FROM jobs WHERE status IN ('PENDING','PROCESSING') AND type IN ('SEARCH_YOUTUBE','MANUAL_SEARCH_PAGE','AUTONOMOUS_DISCOVERY_CYCLE','PROCESS_CHANNEL','ENRICH_CHANNEL',$1)`,[CLASSIFICATION_JOB_TYPE]);

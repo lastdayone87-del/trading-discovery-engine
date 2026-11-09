@@ -62,6 +62,7 @@ import {
   deleteClassificationPlaceholder,
   getClassificationBackpressureState,
   hasActiveClassificationJob,
+  hasActiveEnrichmentJob,
   reconcileClassificationSighting,
   projectClassificationFailureIfPending,
 } from './db';
@@ -87,7 +88,7 @@ import { resolveScopeEligibility } from './scopeEligibility';
 import { processChannelThroughPipeline, isTerminalState, applyGate1CountryRejectionToExisting, type PipelineExecutionOptions } from './ingestionPipeline';
 import { evaluateLowAudienceGate, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
 import { applyPublicAboutToCandidate, fetchLiveYouTubeChannelData } from './youtubePublicAbout';
-import { shouldPreserveExistingChannel, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
+import { shouldPreserveExistingChannel, shouldRevalidateConfirmedCountry, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
 import { shouldEnqueueDiscordEvidenceReclassification, validatedDiscordEvidenceInvite } from './discordEvidence';
 import { resolveTerminalEnrichmentFailure } from './enrichmentLifecycle';
 import { recordEvidenceActionOutcome } from './voiEvidenceController';
@@ -1170,10 +1171,27 @@ export async function admitDiscoveredChannel(input: {
 }): Promise<{ outcome: ProcessDiscoveredChannelOutcome | null; pending: boolean }> {
   const { raw, targetCountry, source, backpressure } = input;
   const existing = input.existing === undefined ? await getChannelById(raw.channelId) : input.existing;
+  // A confirmed trading row must not be classified again, but an unresolved
+  // creator country still gets the deterministic Gate-1 pass through the
+  // normal pipeline. This keeps country policy current without semantic spend.
+  if (existing && shouldRevalidateConfirmedCountry(existing, false)) {
+    try {
+      return {
+        outcome: await processDiscoveredChannelContained(raw, targetCountry, source, {
+          forceExtraction: input.forceExtraction,
+          jobId: input.discoveryJobId,
+          runId: input.queryRunId,
+        }),
+        pending: false,
+      };
+    } catch (error) {
+      console.warn(`[TerminalPreservation] confirmed country revalidation failed for ${raw.channelId}; preserving confirmed row:`, error instanceof Error ? error.message : error);
+    }
+  }
   if (
     existing
     && shouldPreserveExistingChannel(existing, source, false)
-    && !shouldReclassifyPreservedCompletedChannel(existing.scan_status, evaluateLowAudienceGate(raw.subscriberCount))
+    && !shouldReclassifyPreservedCompletedChannel(existing.scan_status, evaluateLowAudienceGate(raw.subscriberCount), existing.trading_status)
   ) {
     // Preserved rows still need the legacy repair pass: a retried search job
     // may be repairing vocabulary that failed after its observation committed,
@@ -1188,7 +1206,13 @@ export async function admitDiscoveredChannel(input: {
       existing.channel_thumbnail_url = raw.channelThumbnailUrl;
       metadataUpdated = true;
     }
-    const confirmedScanStatus = terminalScanStatusForConfirmedRediscovery(existing.scan_status);
+    let activeEnrichmentJob = false;
+    if (existing.trading_status === 'TRADING_CONFIRMED') {
+      try { activeEnrichmentJob = await hasActiveEnrichmentJob(existing.channel_id); } catch { activeEnrichmentJob = false; }
+    }
+    const confirmedScanStatus = existing.trading_status === 'TRADING_CONFIRMED'
+      ? terminalScanStatusForConfirmedRediscovery(existing.scan_status, activeEnrichmentJob)
+      : existing.scan_status;
     if (confirmedScanStatus !== existing.scan_status) {
       existing.scan_status = confirmedScanStatus;
       metadataUpdated = true;
@@ -3161,6 +3185,7 @@ export async function processClassificationJob(job: DurableJob): Promise<void> {
       jobId: job.id,
       runId: payload.queryRunId,
       quotaOrigin: payload.quotaOrigin,
+      forceClassification: payload.forceClassification === true,
       lane: 'DISCOVERY',
       jobType: 'CLASSIFY_DISCOVERED_CHANNEL',
     },
@@ -3309,6 +3334,7 @@ export interface DiscordReclassificationDeps {
   db?: { query: (sql: string, values?: unknown[]) => Promise<{ rows: any[] }> };
   enqueue?: (type: string, payload: unknown, opts: Record<string, unknown>) => Promise<{ status: string }>;
   config?: { priority: number; maxAttempts: number };
+  checkCountryAllowed?: (country: string) => Promise<void>;
 }
 
 export async function enqueueDiscordEvidenceReclassification(
@@ -3337,8 +3363,11 @@ export async function enqueueDiscordEvidenceReclassification(
         ORDER BY observed_at DESC LIMIT 1`,
       [channel.channel_id],
     );
-    const targetCountry = String(sighting.rows[0]?.target_country || channel.country || '').trim();
+    // channel.country is creator evidence, never retrieval context. Without a
+    // recorded target we cannot safely reconstruct the classification scope.
+    const targetCountry = String(sighting.rows[0]?.target_country || '').trim();
     if (!targetCountry) return false;
+    await (deps.checkCountryAllowed || assertCountryAllowed)(targetCountry, 'discord-evidence-reclassification');
     const source = (channel.discovery_source || 'recheck') as DiscoverySource;
     const candidate: DiscoveredChannelRaw = {
       ...(rawDetails || {}),
@@ -3362,6 +3391,7 @@ export async function enqueueDiscordEvidenceReclassification(
       discoveryJobId: `discord-reclassify:${channel.channel_id}`,
       quotaOrigin: channel.quota_origin === 'PROBE' ? 'PROBE' : 'NORMAL',
       forceExtraction: false,
+      forceClassification: true,
     }), {
       priority: config.priority,
       maxAttempts: config.maxAttempts,

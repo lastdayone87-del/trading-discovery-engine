@@ -15,7 +15,8 @@ import {
   enqueueJob,
   getQuota,
   getAppSetting,
-  getDb
+  getDb,
+  hasActiveEnrichmentJob
 } from './db';
 import { calculateCreatorQualityScore, extractVocabularyFromCreator, invokeChannelVocabularyExtraction, replayVocabularyForRetry, resolveExtractionVideoIds } from './queryIntelligence';
 import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
@@ -35,7 +36,7 @@ import { enrichmentOperationalFailure, hasDecisionGradeEvidenceWithoutFailedProv
 import { recordAdmissionShadow } from './candidateAdmission/shadowEvaluator';
 import { recordReviewEligibilityShadow } from './reviewEligibility/store';
 import { evaluateReviewEligibilityV2, resolveReviewProviderDegraded } from './reviewEligibility/policy';
-import { shouldPreserveExistingChannel, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
+import { shouldPreserveExistingChannel, shouldRevalidateConfirmedCountry, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
 import { CANDIDATE_TRIAGE_POLICY_VERSION, hasIndependentTradingHypothesis, triageAutonomousSearchCandidate } from './candidateTriage';
 import { evaluateLowAudienceGate, parseSubscriberCountNumber, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
 import { validatedDiscordEvidenceInvite } from './discordEvidence';
@@ -196,6 +197,9 @@ export interface PipelineExecutionOptions {
   /** Phase 0 acquisition lane for durable lane telemetry (optional). */
   lane?: AcquisitionLane;
   jobType?: string;
+  /** Discord-evidence reclassification must evaluate a previously COMPLETED
+   * row once; confirmed rows remain terminal. */
+  forceClassification?: boolean;
 }
 
 export async function processChannelThroughPipeline(
@@ -273,7 +277,59 @@ async function processChannelThroughPipelineInContext(
     }
     // Preserve terminal rows for every ordinary discovery lane. Explicit
     // operator recheck is the only supported terminal override.
-    if (shouldPreserveExistingChannel(existing, source, isManualScan)) {
+    if (shouldPreserveExistingChannel(existing, source, isManualScan) && (!options?.forceClassification || existing.trading_status === 'TRADING_CONFIRMED')) {
+      let confirmedCountryUpdated = false;
+      if (shouldRevalidateConfirmedCountry(existing, isManualScan)) {
+        try {
+          const countryCheck = await validateChannelCountry({
+            channelName: candidate.channelName,
+            description: candidate.description,
+            videoTitles: candidate.videoTitles,
+            locationTag: candidate.locationTag,
+            externalLinks: candidate.channelLinks,
+            metadataStatus: candidate.countryMetadataStatus,
+            videoDescriptions: candidate.videoDescriptions,
+            videoDescriptionsAuthoritative: candidate.videoDescriptionsAuthoritative,
+            playlists: candidate.playlists,
+          }, targetCountry);
+          if (countryCheck.status === 'REJECTED' && countryCheck.detectedCreatorCountry) {
+            applyGate1CountryRejectionToExisting(existing, {
+              creatorCountry: countryCheck.detectedCreatorCountry,
+              score: countryCheck.score,
+              validationStep: {
+                step: 'COUNTRY_VALIDATION',
+                title: `Country Validation (${countryCheck.detectedCreatorCountry})`,
+                status: 'REJECTED',
+                details: countryCheck.decisionLogs,
+                timestamp: now,
+              },
+              now,
+            }, candidate);
+            await upsertChannel(existing);
+            return {
+              channelId: candidate.channelId,
+              channelName: candidate.channelName,
+              isNew: false,
+              wasKnown: true,
+              persisted: true,
+              countryStatus: existing.country_status,
+              tradingStatus: existing.trading_status,
+              discordStatus: existing.discord_status,
+              discordInvite: existing.discord_invite || null,
+              channelRecord: existing,
+              skippedTerminalState: true,
+            };
+          }
+          if ((countryCheck.status === 'CONFIRMED' || countryCheck.status === 'LIKELY') && countryCheck.detectedCreatorCountry) {
+            existing.country = countryCheck.detectedCreatorCountry;
+            existing.country_status = countryCheck.status;
+            existing.confidence_score = countryCheck.score;
+            confirmedCountryUpdated = true;
+          }
+        } catch (error) {
+          console.warn(`[Unified Ingestion Pipeline] Confirmed-country revalidation failed for ${candidate.channelId}; preserving confirmed row:`, error instanceof Error ? error.message : error);
+        }
+      }
       const refreshedAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount);
       if (shouldReclassifyPreservedCompletedChannel(existing.scan_status, refreshedAudienceGate, existing.trading_status)) {
         console.log(`[Unified Ingestion Pipeline] Refreshing preserved completed channel '${candidate.channelName}' as low-audience after fresh official subscriber metadata.`);
@@ -313,7 +369,7 @@ async function processChannelThroughPipelineInContext(
       // committed cannot strand missing rows behind this early return.
       await replayVocabularyForRetry(existing, candidate, source, options?.forceExtraction ?? false);
       // Update basic existing metadata if changed
-      let updated = false;
+      let updated = confirmedCountryUpdated;
       if (candidate.subscriberCount && candidate.subscriberCount !== existing.subscriber_count) {
         existing.subscriber_count = candidate.subscriberCount;
         updated = true;
@@ -322,7 +378,13 @@ async function processChannelThroughPipelineInContext(
         existing.channel_thumbnail_url = candidate.channelThumbnailUrl;
         updated = true;
       }
-      const confirmedScanStatus = terminalScanStatusForConfirmedRediscovery(existing.scan_status);
+      let activeEnrichmentJob = false;
+      if (existing.trading_status === 'TRADING_CONFIRMED') {
+        try { activeEnrichmentJob = await hasActiveEnrichmentJob(existing.channel_id); } catch { activeEnrichmentJob = false; }
+      }
+      const confirmedScanStatus = existing.trading_status === 'TRADING_CONFIRMED'
+        ? terminalScanStatusForConfirmedRediscovery(existing.scan_status, activeEnrichmentJob)
+        : existing.scan_status;
       if (confirmedScanStatus !== existing.scan_status) {
         existing.scan_status = confirmedScanStatus;
         updated = true;

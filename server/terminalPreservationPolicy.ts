@@ -34,10 +34,29 @@ export function shouldShortCircuitConfirmedRediscovery(
  */
 export function terminalScanStatusForConfirmedRediscovery(
   scanStatus: ChannelRecord['scan_status'],
+  hasActiveEnrichmentJob: boolean = false,
 ): ChannelRecord['scan_status'] {
+  // A live job owns the active marker; only an abandoned pending marker is
+  // projected completed. ENRICHING/LOCKED without a job are also abandoned.
+  if (hasActiveEnrichmentJob) return scanStatus;
   return scanStatus === 'ENRICHMENT_PENDING' || scanStatus === 'ENRICHING' || scanStatus === 'LOCKED'
     ? 'COMPLETED'
     : scanStatus;
+}
+
+
+/**
+ * A confirmed trading row is not reclassified, but an unresolved creator
+ * country still needs the deterministic Gate-1 pass. This is country policy,
+ * not trading reclassification, and spends no semantic/YouTube quota.
+ */
+export function shouldRevalidateConfirmedCountry(
+  channel: Pick<ChannelRecord, 'trading_status' | 'country_status'> | null | undefined,
+  isManualScan: boolean,
+): boolean {
+  return !isManualScan
+    && channel?.trading_status === 'TRADING_CONFIRMED'
+    && channel?.country_status === 'UNCERTAIN';
 }
 
 export function machineNonTradingRediscoveryEligible(existing: ChannelRecord, now = Date.now()): boolean {

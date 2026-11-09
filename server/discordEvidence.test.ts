@@ -73,11 +73,13 @@ test('Discord evidence alone requests a bounded pass only while unconfirmed and 
   }), false);
 });
 
-test('Discord reclassification enqueues one day-scoped pass with the validated invite available', async () => {
+test('Discord reclassification enqueues one day-scoped pass when a validated invite is stored', async () => {
+  assert.equal(validatedDiscordEvidenceInvite(channel()), 'https://discord.gg/9GqfAbpXrv');
   let captured: { type: string; payload: any; opts: any } | undefined;
   const ok = await enqueueDiscordEvidenceReclassification(channel(), undefined, {
     hasActiveClassificationJob: async () => false,
     db: { query: async () => ({ rows: [{ target_country: 'Netherlands' }] }) },
+    checkCountryAllowed: async () => undefined,
     enqueue: async (type, payload, opts) => {
       captured = { type, payload, opts };
       return { status: 'PENDING' };
@@ -88,8 +90,29 @@ test('Discord reclassification enqueues one day-scoped pass with the validated i
   assert.equal(captured?.type, 'CLASSIFY_DISCOVERED_CHANNEL');
   assert.equal(captured?.payload.targetCountry, 'Netherlands');
   assert.equal(captured?.payload.candidate.channelId, 'UCbowie');
+  assert.equal(captured?.payload.forceClassification, true);
   assert.match(String(captured?.opts.idempotencyKey), /^discord-classify:UCbowie:\d{4}-\d{2}-\d{2}$/);
   assert.equal(captured?.opts.preventReopen, true);
+});
+
+test('Discord reclassification skips when no retrieval target or the target is excluded', async () => {
+  let enqueued = 0;
+  const baseDeps = {
+    hasActiveClassificationJob: async () => false,
+    enqueue: async () => { enqueued += 1; return { status: 'PENDING' }; },
+    config: { priority: 15, maxAttempts: 4 },
+  };
+  assert.equal(await enqueueDiscordEvidenceReclassification(channel(), undefined, {
+    ...baseDeps,
+    db: { query: async () => ({ rows: [] }) },
+    checkCountryAllowed: async () => undefined,
+  }), false, 'creator country must not substitute for retrieval context');
+  assert.equal(await enqueueDiscordEvidenceReclassification(channel(), undefined, {
+    ...baseDeps,
+    db: { query: async () => ({ rows: [{ target_country: 'Excluded' }] }) },
+    checkCountryAllowed: async () => { throw new Error('excluded country'); },
+  }), false);
+  assert.equal(enqueued, 0);
 });
 
 test('confirmed channels and active classifications never get a Discord reclassification job', async () => {
