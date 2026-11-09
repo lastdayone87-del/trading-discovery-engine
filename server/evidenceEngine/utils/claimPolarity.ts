@@ -87,9 +87,25 @@ const CONTRAST_CUE = /(?:\b(?:but|however|yet|although|though|whereas|neverthele
 // noun coordination ("stocks and crypto") stays inside the negation scope.
 const COORDINATION_CUE = /\b(?:and|&)\s+(?=(?:i|we|you|they|he|she|it)\b|(?:teach|learn|trade|show|share|explain|post|upload|run|make|offer|provide|help|cover|analy[sz]e|review|discuss|focus|talk|stream|prefer)\b)/iu;
 const POST_MAY = /^\s*may\b(?![ \t]+\d{4}\b|[ \t]+\d{1,2}(?:st|nd|rd|th)?\b)/iu;
-const PRE_MAY_MODAL = /\b(?:i|we|you|they|he|she|it|one)\s+may\s+(?!\d{4}\b)/iu;
-const OWN_COURSE_PHRASE = /(?:^|[\s,;:])(?:my|our)(?:\s+(?:online|video|paid|new|trading|flagship|premium|free|beginner|advanced|own|private|membership|course|program|mentorship)){0,3}\s+courses?\b/iu;
+const PRE_MAY_MODAL = /\bmay\s+(?:teach|learn|trade|become|start|do|be|work|focus|cover|provide|offer|help|make|turn|grow|build|deliver|share|explain)\b/iu;
 const FIRST_PERSON_COURSE = /\bcourses?\s+(?:i|we)\s+teach\b/iu;
+const COURSE_MODIFIER = /^(?:online|video|paid|new|trading|flagship|premium|free|beginner|advanced|own|private|membership|course|program|mentorship|comprehensive|complete|full|detailed|professional|practical|interactive|exclusive|monthly|weekly|live|recorded|digital|structured|the|best|top|\p{L}+(?:ive|ous|al|ic|ary|ful|less|ible|able|ed|ing))$/iu;
+
+function isOwnCourseAttribution(before: string, match: RegExpExecArray): boolean {
+  if (FIRST_PERSON_COURSE.test(match[0])) return true;
+  if (!/^courses?\b/iu.test(match[0])) return false;
+  const prefixWords = before.slice(0, match.index || 0).trimEnd().split(/\s+/u).filter(Boolean).slice(-5);
+  let possessiveIndex = -1;
+  for (let index = prefixWords.length - 1; index >= 0; index--) {
+    if (/^(?:my|our)$/iu.test(prefixWords[index])) {
+      possessiveIndex = index;
+      break;
+    }
+  }
+  if (possessiveIndex < 0) return false;
+  const modifiers = prefixWords.slice(possessiveIndex + 1);
+  return modifiers.every(word => COURSE_MODIFIER.test(word));
+}
 
 function lastAttributionMatch(text: string): RegExpExecArray | undefined {
   const matches = [...text.matchAll(new RegExp(ATTRIBUTION_CUE.source, 'giu'))];
@@ -303,8 +319,7 @@ export function classifyClaimPolarity(
   // phrase so a later gurus/courses claim is still quoted.
   const ownCourse = Boolean(attributionMatch
     && !/\b(?:gurus?|scammers?|sellers?|promoters?|influencers?|they|these|those)\b/iu.test(attributionMatch[0])
-    && (OWN_COURSE_PHRASE.test(before.slice(0, (attributionMatch.index || 0) + attributionMatch[0].length))
-      || FIRST_PERSON_COURSE.test(attributionMatch[0])));
+    && isOwnCourseAttribution(before, attributionMatch));
   if (quotationFrame && ((attributionBefore && !ownCourse) || (termLooksLikeClaim && criticismBefore))) {
     const cue = (attributionMatch?.[0] || CRITICISM_CUE.exec(before)?.[0]);
     return { polarity: 'QUOTED', cue, confidence: 0.88 };
