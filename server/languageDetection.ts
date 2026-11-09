@@ -82,20 +82,31 @@ function tokens(text: string): string[] {
 }
 
 function detectScript(text: string): { script: LanguageScript; language: SupportedLanguage | null } {
-  const letterCount = text.match(/\p{L}/gu)?.length ?? 0;
-  const latinLetterCount = text.match(/\p{Script=Latin}/gu)?.length ?? 0;
-  // A single quoted foreign character or channel-name fragment inside an
-  // otherwise Latin document must not decide the persisted language/script.
-  // Script detection is only decisive when non-Latin letters dominate.
-  const nonLatinShare = letterCount > 0 ? (letterCount - latinLetterCount) / letterCount : 0;
-  if (nonLatinShare > 0.5) {
-    for (const [script, pattern, language] of SCRIPT_PATTERNS) {
-      if (pattern.test(text)) return { script, language };
-    }
-    // A dominated non-Latin script we do not model (for example Thai) must
-    // not be persisted as Latin just because the fallback used to be Latin.
-    return { script: 'Zyyy', language: null };
+  const counts = new Map<LanguageScript, number>();
+  let letterCount = 0;
+  for (const char of text) {
+    if (!/\p{L}/u.test(char)) continue;
+    letterCount += 1;
+    const match = SCRIPT_PATTERNS.find(([, pattern]) => pattern.test(char));
+    if (match) counts.set(match[0], (counts.get(match[0]) || 0) + 1);
   }
+  if (!letterCount) return { script: 'Zyyy', language: null };
+  const latinLetterCount = text.match(/\p{Script=Latin}/gu)?.length ?? 0;
+  const share = (...scripts: LanguageScript[]) =>
+    scripts.reduce((sum, script) => sum + (counts.get(script) || 0), 0) / letterCount;
+  // Kana is decisive for Japanese, and Han shares its reading. A mostly
+  // Arabic/Thai surface with one stray kana must not become Japanese because
+  // the kana script happens to be checked first.
+  if ((counts.get('Jpan') || 0) > 0 && share('Jpan', 'Hani') > 0.5) {
+    return { script: 'Jpan', language: 'ja' };
+  }
+  if (share('Hang') > 0.5) return { script: 'Hang', language: 'ko' };
+  if (share('Arab') > 0.5) return { script: 'Arab', language: 'ar' };
+  if (share('Cyrl') > 0.5) return { script: 'Cyrl', language: 'ru' };
+  if (share('Deva') > 0.5) return { script: 'Deva', language: 'hi' };
+  if (share('Hani') > 0.5) return { script: 'Hani', language: 'zh' };
+  // Unmodelled dominant scripts (for example Thai) and Latin-free common
+  // text stay undetermined rather than being persisted as Latin.
   return { script: latinLetterCount > 0 ? 'Latn' : 'Zyyy', language: null };
 }
 

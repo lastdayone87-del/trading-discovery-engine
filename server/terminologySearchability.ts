@@ -237,18 +237,29 @@ const REVIEWED_NATIVE_PHRASES: Record<string, string[]> = {
   fr: ['structure du marché', 'analyse boursière', 'carnet d ordres'],
 };
 
-export function isReviewedNativePhrase(term: string): boolean {
+/** Language codes of the reviewed phrases matching this exact surface. */
+export function reviewedNativePhraseLanguages(term: string): string[] {
   const key = phraseKey(term);
-  return Object.values(REVIEWED_NATIVE_PHRASES).some(values => values.some(value => phraseKey(value) === key));
+  return Object.entries(REVIEWED_NATIVE_PHRASES)
+    .filter(([, values]) => values.some(value => phraseKey(value) === key))
+    .map(([language]) => language);
+}
+
+export function isReviewedNativePhrase(term: string): boolean {
+  return reviewedNativePhraseLanguages(term).length > 0;
 }
 
 /**
  * Compounds whose local reading is not trading intent. `トレード` is a
  * reviewed Japanese semantic, but `トレードオフ` (trade-off) and
  * `トレードマーク` (trademark) are ordinary words, so boundary-free matching
- * must not admit them as search surfaces.
+ * must not admit them as search surfaces. Separators are allowed between
+ * characters (`トレード・オフ`) and the compounds may be embedded in a longer
+ * phrase (`トレードオフ分析`).
  */
-const NON_TRADING_COMPOUNDS = new Set(['トレードオフ', 'トレードマーク']);
+const NON_TRADING_COMPOUND_PATTERNS = ['トレードオフ', 'トレードマーク'].map(compound =>
+  new RegExp([...compound].map(char => char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s*'), 'gu'),
+);
 
 /** True when any letter in the value belongs to an unspaced script. */
 function usesUnspacedScript(value: string): boolean {
@@ -285,9 +296,15 @@ export function hasGovernedTradingSemantics(
   term: string,
   context: { country?: string | null; language?: string | null } = {},
 ): boolean {
-  const key = phraseKey(term);
+  const rawKey = phraseKey(term);
+  if (!rawKey) return false;
+  // Remove non-trading compound readings before matching. If a genuine
+  // trading semantic remains elsewhere in the surface, it still passes.
+  const key = NON_TRADING_COMPOUND_PATTERNS
+    .reduce((value, pattern) => value.replace(pattern, ' '), rawKey)
+    .replace(/\s+/gu, ' ')
+    .trim();
   if (!key) return false;
-  if (NON_TRADING_COMPOUNDS.has(key)) return false;
   const out = new Set(GLOBAL_TRADING_SEMANTICS);
   const language = context.language ? String(context.language).toLocaleLowerCase('und').split('-')[0] : '';
   const country = context.country && context.country !== 'GLOBAL' ? context.country : '';

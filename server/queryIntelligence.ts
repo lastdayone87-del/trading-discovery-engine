@@ -60,7 +60,8 @@ import { attributeTerminologyPerformance, buildNoveltyBaseline, classifyNativeCa
 import type { ExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { canonicalCountry } from './countryInference';
 import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
-import { isReviewedNativePhrase } from './terminologySearchability';
+import { reviewedNativePhraseLanguages } from './terminologySearchability';
+import { countrySearchLanguageCandidates, normalizeLanguageCode } from './countrySearchHints';
 import { executeProviderCall, resolveGeminiRouteId } from './providerResilience';
 import { geminiOrgIdForSlot } from './evidenceEngine/providers/GeminiSemanticProvider';
 import { appendProviderCallEvent } from './db';
@@ -1801,8 +1802,22 @@ export function classifyCountryNativeAuthorizationInput(args: CountryNativeAutho
   const nativeTokenCount = normalizedNativeTerm.split(/\s+/).length;
   // Reviewed native phrases are the only bounded exception to the three-token
   // specificity cap; arbitrary long proposals still fail closed.
-  if (nativeTokenCount > 3 && !isReviewedNativePhrase(normalizedNativeTerm)) {
-    return { status: 'REJECTED', code: 'QUERY_SPECIFICITY_REJECTED' };
+  if (nativeTokenCount > 3) {
+    const phraseLanguages = reviewedNativePhraseLanguages(normalizedNativeTerm);
+    if (!phraseLanguages.length) {
+      return { status: 'REJECTED', code: 'QUERY_SPECIFICITY_REJECTED' };
+    }
+    // The phrase's language must be compatible with the target country, and
+    // with any explicit language evidence. This stops an Italian phrase from
+    // being authorized as a Japanese native query.
+    const declaredLanguage = normalizeLanguageCode(String(evidence.language || evidence.locale || ''));
+    const supportedLanguages = countrySearchLanguageCandidates(args.country);
+    const languageCompatible = declaredLanguage
+      ? supportedLanguages.includes(declaredLanguage) && phraseLanguages.includes(declaredLanguage)
+      : phraseLanguages.some(language => supportedLanguages.includes(language));
+    if (!languageCompatible) {
+      return { status: 'REJECTED', code: 'QUERY_SPECIFICITY_REJECTED' };
+    }
   }
   return { status: 'VALID', nativeTerm, evidence, targetKey };
 }

@@ -5,8 +5,10 @@ import { detectCodeSwitching } from './countryNativeIntelligence';
 import { isSearchableTradingTerm } from './terminologySearchability';
 import { buildQueryCandidate, evaluateQueryComposition } from './queryQuality/composition';
 import { admitQueryRecord } from './queryQuality/admission';
+import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
 import { planCountryNativeProposalQuery } from './queryPlanner';
 import { resolveEvidenceDocumentLanguage } from './evidenceEngine/documentStore';
+import type { QueryRecord } from '../src/types';
 
 test('language detection identifies supported market languages from real local surfaces', () => {
   const cases: Array<[string, string, string]> = [
@@ -44,6 +46,12 @@ test('script detection requires a dominant non-Latin share', () => {
   assert.equal(thai.language, 'und');
   // Genuinely non-Latin surfaces still win.
   assert.equal(detectLanguage('日経225先物', { countryHint: 'Japan' }).language, 'ja');
+  // Scripts are counted separately: one stray kana cannot override a
+  // dominant Arabic surface or turn a mostly-Thai surface into Japanese.
+  assert.equal(detectLanguage('مرحبا بالعالم の').language, 'ar');
+  const thaiJapanese = detectLanguage('ตลาดหุ้น の');
+  assert.equal(thaiJapanese.language, 'und');
+  assert.equal(thaiJapanese.script, 'Zyyy');
 });
 
 test('country hints only resolve textual ties and never override clear evidence', () => {
@@ -116,13 +124,18 @@ test('unrelated foreign terms remain ineligible after the CJK relaxation', () =>
 });
 
 test('boundary-free matching admits only unspaced native semantics', () => {
-  // Latin/ticker fragments inside a CJK term keep word boundaries.
-  for (const term of ['cooking動画', '株tradingcard', 'DOM操作', '日本pocket', 'トレードオフ']) {
+  // Latin/ticker fragments inside a CJK term keep word boundaries, and
+  // denied compounds are stripped even inside longer or punctuated phrases.
+  for (const term of [
+    'cooking動画', '株tradingcard', 'DOM操作', '日本pocket',
+    'トレードオフ', 'トレードオフ分析', 'トレード・オフ', 'トレードマーク分析',
+  ]) {
     const gate = isSearchableTradingTerm({ term, termType: 'TERMINOLOGY', country: 'Japan', language: 'ja' });
     assert.equal(gate.eligible, false, `${term} unexpectedly passed: ${gate.reasons.join(', ')}`);
   }
-  // Intended Japanese compounds continue to pass.
-  for (const term of ['ドル円トレード', '板読みトレード', 'デイトレード手法', '東京セッション']) {
+  // Intended Japanese compounds continue to pass, including a surface where
+  // a denied reading and a separate genuine trading semantic coexist.
+  for (const term of ['ドル円トレード', '板読みトレード', 'デイトレード手法', '東京セッション', 'トレードオフトレード']) {
     const gate = isSearchableTradingTerm({ term, termType: 'TERMINOLOGY', country: 'Japan', language: 'ja' });
     assert.equal(gate.eligible, true, `${term}: ${gate.reasons.join(', ')}`);
   }
@@ -165,4 +178,29 @@ test('a reviewed native phrase is admissible as one bounded whole query', () => 
     generation_metadata: planned.metadata,
   }, { scopeAuthorized: true });
   assert.equal(admitted.eligible, true, admitted.reasonCodes.join(', '));
+
+  // Execution authority must accept the same bounded surface; otherwise it
+  // would be quarantined before quota spend.
+  const record: QueryRecord = {
+    id: 1,
+    query: planned.query,
+    country: 'Italy',
+    collection: 'EXPERIMENTAL',
+    intent: planned.intent,
+    times_executed: 0,
+    total_channels_found: 0,
+    unique_channels_found: 0,
+    quality_channels_found: 0,
+    community_channels_found: 0,
+    avg_quality_score: 0,
+    performance_score: 0,
+    created_at: '2026-08-01T00:00:00.000Z',
+    status: 'ACTIVE',
+    primary_term: planned.primaryTerm,
+    // Italy is dormant; simulate the live scope selection that authorizes
+    // execution. The token/provenance gates are what this assertion covers.
+    generation_metadata: { ...planned.metadata, scopePromoted: true },
+  };
+  const authority = evaluateAutonomousQueryAuthority(record, { scopePromotionActive: true });
+  assert.equal(authority.eligible, true, authority.reasonCodes.join(', '));
 });
