@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ChannelRecord, DiscoverySource } from '../src/types';
-import { machineNonTradingRediscoveryEligible, shouldPreserveExistingChannel, shouldRevalidateConfirmedCountry, shouldShortCircuitConfirmedRediscovery, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
+import { machineNonTradingRediscoveryEligible, shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldRevalidateConfirmedCountry, shouldShortCircuitConfirmedRediscovery, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
 
 const NOW = Date.parse('2026-08-16T04:00:00.000Z');
 
@@ -77,12 +77,12 @@ test('TRADING_CONFIRMED is preserved under ordinary rediscovery even with uncert
 });
 
 test('an active enrichment marker on a confirmed row is projected COMPLETED on rediscovery', () => {
-  assert.equal(terminalScanStatusForConfirmedRediscovery('ENRICHMENT_PENDING'), 'COMPLETED');
-  assert.equal(terminalScanStatusForConfirmedRediscovery('ENRICHING'), 'COMPLETED');
-  assert.equal(terminalScanStatusForConfirmedRediscovery('LOCKED'), 'COMPLETED');
+  assert.equal(terminalScanStatusForConfirmedRediscovery('ENRICHMENT_PENDING', false), 'COMPLETED');
+  assert.equal(terminalScanStatusForConfirmedRediscovery('ENRICHING', false), 'COMPLETED');
+  assert.equal(terminalScanStatusForConfirmedRediscovery('LOCKED', false), 'COMPLETED');
   assert.equal(terminalScanStatusForConfirmedRediscovery('ENRICHING', true), 'ENRICHING', 'a live job owns the marker');
-  assert.equal(terminalScanStatusForConfirmedRediscovery('NEEDS_REVIEW'), 'NEEDS_REVIEW');
-  assert.equal(terminalScanStatusForConfirmedRediscovery('FAILED'), 'FAILED');
+  assert.equal(terminalScanStatusForConfirmedRediscovery('NEEDS_REVIEW', false), 'NEEDS_REVIEW');
+  assert.equal(terminalScanStatusForConfirmedRediscovery('FAILED', false), 'FAILED');
 });
 
 test('confirmed rows with unresolved country get only the deterministic country pass', () => {
@@ -91,4 +91,13 @@ test('confirmed rows with unresolved country get only the deterministic country 
   assert.equal(shouldRevalidateConfirmedCountry(confirmedUnknown, true), false);
   assert.equal(shouldRevalidateConfirmedCountry(base(), false), false);
   assert.equal(shouldRevalidateConfirmedCountry(base({ trading_status: 'UNCERTAIN', country_status: 'UNCERTAIN' }), false), false);
+});
+
+test('Discord bypass never reopens country-terminal or confirmed rows', () => {
+  const completed = base({ trading_status: 'UNCERTAIN', scan_status: 'COMPLETED', country_status: 'CONFIRMED' });
+  assert.equal(shouldBypassPreservationForDiscordEvidence(completed, true), true);
+  assert.equal(shouldBypassPreservationForDiscordEvidence(base({ trading_status: 'TRADING_CONFIRMED', scan_status: 'COMPLETED' }), true), false);
+  assert.equal(shouldBypassPreservationForDiscordEvidence(base({ trading_status: 'UNCERTAIN', scan_status: 'COMPLETED', country_status: 'REJECTED' }), true), false);
+  assert.equal(shouldBypassPreservationForDiscordEvidence(base({ trading_status: 'UNCERTAIN', scan_status: 'SKIPPED_EXCLUDED' }), true), false);
+  assert.equal(shouldBypassPreservationForDiscordEvidence(completed, false), false);
 });

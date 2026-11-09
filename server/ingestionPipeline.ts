@@ -36,7 +36,7 @@ import { enrichmentOperationalFailure, hasDecisionGradeEvidenceWithoutFailedProv
 import { recordAdmissionShadow } from './candidateAdmission/shadowEvaluator';
 import { recordReviewEligibilityShadow } from './reviewEligibility/store';
 import { evaluateReviewEligibilityV2, resolveReviewProviderDegraded } from './reviewEligibility/policy';
-import { shouldPreserveExistingChannel, shouldRevalidateConfirmedCountry, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
+import { shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldRevalidateConfirmedCountry, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
 import { CANDIDATE_TRIAGE_POLICY_VERSION, hasIndependentTradingHypothesis, triageAutonomousSearchCandidate } from './candidateTriage';
 import { evaluateLowAudienceGate, parseSubscriberCountNumber, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
 import { validatedDiscordEvidenceInvite } from './discordEvidence';
@@ -277,7 +277,7 @@ async function processChannelThroughPipelineInContext(
     }
     // Preserve terminal rows for every ordinary discovery lane. Explicit
     // operator recheck is the only supported terminal override.
-    if (shouldPreserveExistingChannel(existing, source, isManualScan) && (!options?.forceClassification || existing.trading_status === 'TRADING_CONFIRMED')) {
+    if (shouldPreserveExistingChannel(existing, source, isManualScan) && !shouldBypassPreservationForDiscordEvidence(existing, options?.forceClassification === true)) {
       let confirmedCountryUpdated = false;
       if (shouldRevalidateConfirmedCountry(existing, isManualScan)) {
         try {
@@ -380,7 +380,7 @@ async function processChannelThroughPipelineInContext(
       }
       let activeEnrichmentJob = false;
       if (existing.trading_status === 'TRADING_CONFIRMED') {
-        try { activeEnrichmentJob = await hasActiveEnrichmentJob(existing.channel_id); } catch { activeEnrichmentJob = false; }
+        try { activeEnrichmentJob = await hasActiveEnrichmentJob(existing.channel_id); } catch { activeEnrichmentJob = true; }
       }
       const confirmedScanStatus = existing.trading_status === 'TRADING_CONFIRMED'
         ? terminalScanStatusForConfirmedRediscovery(existing.scan_status, activeEnrichmentJob)
@@ -414,18 +414,20 @@ async function processChannelThroughPipelineInContext(
   // Discord work, require a cheap plausible trading hypothesis from the matched
   // retrieval document. Withheld candidates remain preserved in the nomination
   // ledger and can be rediscovered later by independent evidence.
-  const retrievalTriage = triageAutonomousSearchCandidate(candidate, source, isEnrichmentPass);
-  if (retrievalTriage.disposition === 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS') {
-    console.log(`[Unified Ingestion Pipeline - Triage] Withholding '${candidate.channelName}' before provider spend: ${retrievalTriage.reasonCodes.join(', ')}.`);
-    void recordAdmissionShadow({
-      channelId:candidate.channelId, priorState:'NOT_EVALUATED', classificationStatus:'UNCERTAIN', investigationState:'COMPLETED',
-      candidateHypothesis:{plausibleTradingHypothesis:false,triagePolicyVersion:CANDIDATE_TRIAGE_POLICY_VERSION,matchedSignals:retrievalTriage.matchedSignals},
-      evidenceCoverage:{stage:'RETRIEVAL_TRIAGE',reasonCodes:retrievalTriage.reasonCodes,enrichmentStage:candidate.enrichmentStage||0}
-    }).catch(error=>console.warn(`[CandidateAdmission] retrieval-triage shadow write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
-    return {
-      channelId:candidate.channelId, channelName:candidate.channelName, isNew:!existing, wasKnown:!!existing, persisted:false,
-      countryStatus:'UNCERTAIN', tradingStatus:'UNCERTAIN', discordStatus:'NOT_FOUND', discordInvite:null, channelRecord:undefined
-    };
+  if (options?.forceClassification !== true) {
+    const retrievalTriage = triageAutonomousSearchCandidate(candidate, source, isEnrichmentPass);
+    if (retrievalTriage.disposition === 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS') {
+      console.log(`[Unified Ingestion Pipeline - Triage] Withholding '${candidate.channelName}' before provider spend: ${retrievalTriage.reasonCodes.join(', ')}.`);
+      void recordAdmissionShadow({
+        channelId:candidate.channelId, priorState:'NOT_EVALUATED', classificationStatus:'UNCERTAIN', investigationState:'COMPLETED',
+        candidateHypothesis:{plausibleTradingHypothesis:false,triagePolicyVersion:CANDIDATE_TRIAGE_POLICY_VERSION,matchedSignals:retrievalTriage.matchedSignals},
+        evidenceCoverage:{stage:'RETRIEVAL_TRIAGE',reasonCodes:retrievalTriage.reasonCodes,enrichmentStage:candidate.enrichmentStage||0}
+      }).catch(error=>console.warn(`[CandidateAdmission] retrieval-triage shadow write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
+      return {
+        channelId:candidate.channelId, channelName:candidate.channelName, isNew:!existing, wasKnown:!!existing, persisted:false,
+        countryStatus:'UNCERTAIN', tradingStatus:'UNCERTAIN', discordStatus:'NOT_FOUND', discordInvite:null, channelRecord:undefined
+      };
+    }
   }
 
   // Step 1: GATE 1 - Country Validation Hard Gate

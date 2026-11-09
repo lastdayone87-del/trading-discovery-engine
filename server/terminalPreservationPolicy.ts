@@ -34,7 +34,7 @@ export function shouldShortCircuitConfirmedRediscovery(
  */
 export function terminalScanStatusForConfirmedRediscovery(
   scanStatus: ChannelRecord['scan_status'],
-  hasActiveEnrichmentJob: boolean = false,
+  hasActiveEnrichmentJob: boolean,
 ): ChannelRecord['scan_status'] {
   // A live job owns the active marker; only an abandoned pending marker is
   // projected completed. ENRICHING/LOCKED without a job are also abandoned.
@@ -57,6 +57,19 @@ export function shouldRevalidateConfirmedCountry(
   return !isManualScan
     && channel?.trading_status === 'TRADING_CONFIRMED'
     && channel?.country_status === 'UNCERTAIN';
+}
+
+
+/** The bounded Discord pass may bypass COMPLETED preservation, but never
+ * country-terminal or confirmed rows. */
+export function shouldBypassPreservationForDiscordEvidence(
+  channel: Pick<ChannelRecord, 'trading_status' | 'country_status' | 'scan_status'> | null | undefined,
+  forceClassification: boolean,
+): boolean {
+  return forceClassification === true
+    && channel?.trading_status === 'UNCERTAIN'
+    && channel?.country_status !== 'REJECTED'
+    && channel?.scan_status !== 'SKIPPED_EXCLUDED';
 }
 
 export function machineNonTradingRediscoveryEligible(existing: ChannelRecord, now = Date.now()): boolean {

@@ -88,7 +88,7 @@ import { resolveScopeEligibility } from './scopeEligibility';
 import { processChannelThroughPipeline, isTerminalState, applyGate1CountryRejectionToExisting, type PipelineExecutionOptions } from './ingestionPipeline';
 import { evaluateLowAudienceGate, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
 import { applyPublicAboutToCandidate, fetchLiveYouTubeChannelData } from './youtubePublicAbout';
-import { shouldPreserveExistingChannel, shouldRevalidateConfirmedCountry, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
+import { shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldRevalidateConfirmedCountry, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
 import { shouldEnqueueDiscordEvidenceReclassification, validatedDiscordEvidenceInvite } from './discordEvidence';
 import { resolveTerminalEnrichmentFailure } from './enrichmentLifecycle';
 import { recordEvidenceActionOutcome } from './voiEvidenceController';
@@ -1208,7 +1208,7 @@ export async function admitDiscoveredChannel(input: {
     }
     let activeEnrichmentJob = false;
     if (existing.trading_status === 'TRADING_CONFIRMED') {
-      try { activeEnrichmentJob = await hasActiveEnrichmentJob(existing.channel_id); } catch { activeEnrichmentJob = false; }
+      try { activeEnrichmentJob = await hasActiveEnrichmentJob(existing.channel_id); } catch { activeEnrichmentJob = true; }
     }
     const confirmedScanStatus = existing.trading_status === 'TRADING_CONFIRMED'
       ? terminalScanStatusForConfirmedRediscovery(existing.scan_status, activeEnrichmentJob)

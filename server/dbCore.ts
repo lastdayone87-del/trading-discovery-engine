@@ -1803,20 +1803,29 @@ export async function getQueueStatusFresh(): Promise<QueueStatus> {
  * must not compete with a live discovery backlog that is still being
  * classified, even before those jobs reach ENRICH_CHANNEL.
  */
-/** Active durable enrichment work for one channel, regardless of stage. */
-export async function hasActiveEnrichmentJob(channelId: string): Promise<boolean> {
-  const db = await getDb();
-  const res = await db.query(
-    `SELECT 1 FROM jobs WHERE type='ENRICH_CHANNEL' AND status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$1 LIMIT 1`,
-    [channelId],
-  );
-  return Boolean(res.rowCount);
-}
-
 export async function getProductionBacklogDepth(): Promise<number> {
   const db=await getDb();
   const res=await db.query(`SELECT COUNT(*)::int AS count FROM jobs WHERE status IN ('PENDING','PROCESSING') AND type IN ('SEARCH_YOUTUBE','MANUAL_SEARCH_PAGE','AUTONOMOUS_DISCOVERY_CYCLE','PROCESS_CHANNEL','ENRICH_CHANNEL',$1)`,[CLASSIFICATION_JOB_TYPE]);
   return Number(res.rows[0]?.count||0);
+}
+
+/**
+ * Active work that may still mutate a channel's scan/trading projection:
+ * ordinary enrichment, post-approval/force rechecks, and an already-queued
+ * classification. Rediscovery must not project a live row COMPLETED while any
+ * of these still owns the channel.
+ */
+export async function hasActiveEnrichmentJob(channelId: string): Promise<boolean> {
+  const db = await getDb();
+  const res = await db.query(
+    `SELECT 1 FROM jobs
+      WHERE type IN ('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN',$2)
+        AND status IN ('PENDING','PROCESSING')
+        AND payload->>'channelId'=$1
+      LIMIT 1`,
+    [channelId, CLASSIFICATION_JOB_TYPE],
+  );
+  return Boolean(res.rowCount);
 }
 
 export async function toggleQueuePause(queueName:string,isPaused:boolean):Promise<void>{
