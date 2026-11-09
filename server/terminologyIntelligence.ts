@@ -2019,7 +2019,7 @@ async function orderedDashboardBase(
 ): Promise<any[]> {
   const cacheKey = normalizedCountry || '*';
   const now = Date.now();
-  if (cacheable) {
+  if (cacheable && cacheKey.length <= 80) {
     const cached = dashboardOrderCache.get(cacheKey);
     if (cached && now - cached.at >= 0 && now - cached.at < DASHBOARD_ORDER_TTL_MS) return cached.rows;
   }
@@ -2028,7 +2028,20 @@ async function orderedDashboardBase(
     FROM canonical_trading_terms t WHERE ($1::text IS NULL OR t.country=$1)
     ORDER BY decayed_yield_score DESC,t.last_observed_at DESC NULLS LAST,t.id DESC`,[normalizedCountry]);
   const rows = orderDashboardTerminologyRows(base.rows.map((row: any) => ({ ...row, ...dashboardSearchEligibility(row) })));
-  if (cacheable) dashboardOrderCache.set(cacheKey, { at: now, rows });
+  if (cacheable && cacheKey.length <= 80) {
+    // Keep the projection cache bounded: prune expired entries and drop the
+    // oldest key if an operator sends many distinct country filters.
+    if (dashboardOrderCache.size >= 50) {
+      for (const [key, entry] of dashboardOrderCache) {
+        if (now - entry.at >= DASHBOARD_ORDER_TTL_MS) dashboardOrderCache.delete(key);
+      }
+      if (dashboardOrderCache.size >= 50) {
+        const oldest = [...dashboardOrderCache.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+        if (oldest) dashboardOrderCache.delete(oldest[0]);
+      }
+    }
+    dashboardOrderCache.set(cacheKey, { at: now, rows });
+  }
   return rows;
 }
 
@@ -2047,12 +2060,11 @@ async function hydrateTerminologyDashboardRows(runner: any, ids: unknown[]): Pro
   return ids.map(id => byId.get(String(id))).filter(Boolean);
 }
 
-function mergeDashboardEligibility(rows: any[], computed: any[]): any[] {
-  const byId = new Map(computed.map(row => [String(row.id), row]));
-  return rows.map(row => {
-    const eligibility = byId.get(String(row.id));
-    return eligibility ? { ...row, search_eligible: eligibility.search_eligible, search_eligibility_reasons: eligibility.search_eligibility_reasons } : row;
-  });
+function mergeDashboardEligibility(rows: any[], _computed: any[]): any[] {
+  // The projection cache determines order, but the displayed badge must be
+  // derived from the hydrated current lifecycle/flag snapshot. Recompute it so
+  // a cache hit cannot return DEMOTED + search_eligible=true.
+  return rows.map(row => ({ ...row, ...dashboardSearchEligibility(row) }));
 }
 
 /** Bounded dashboard page. Ordering and pagination use computed eligibility. */

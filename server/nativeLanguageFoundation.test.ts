@@ -141,8 +141,8 @@ test('dashboard ordering uses computed eligibility', () => {
   const ordered = orderDashboardTerminologyRows(rows.map(row => ({ ...row, ...dashboardSearchEligibility(row) })));
   assert.equal(ordered[0].canonical_term, 'ICT');
   assert.equal(ordered[ordered.length - 1].canonical_term, 'Gold');
-  // A stale false flag on an active, gate-passing term must not hide it.
-  assert.equal(dashboardSearchEligibility({ canonical_term: 'ICT', term_type: 'TERMINOLOGY', country: 'United States', language: 'en', lifecycle_status: 'SEARCH_TRIAL', search_eligible: false }).search_eligible, true);
+  // The persisted flag is the planner's authority; a revoked flag stays hidden.
+  assert.equal(dashboardSearchEligibility({ canonical_term: 'ICT', term_type: 'TERMINOLOGY', country: 'United States', language: 'en', lifecycle_status: 'SEARCH_TRIAL', search_eligible: false }).search_eligible, false);
 });
 
 test('unrelated foreign terms remain ineligible after the CJK relaxation', () => {

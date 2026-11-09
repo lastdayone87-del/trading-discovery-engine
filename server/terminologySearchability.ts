@@ -487,9 +487,9 @@ export function dashboardSearchEligibility(row: {
   });
   const lifecycleEligible = row.lifecycle_status === 'SEARCH_TRIAL' || row.lifecycle_status === 'PROVEN_SEARCH_TERM';
   return {
-    // Lifecycle + Q0 are the planner's authority. The persisted flag is left
-    // for audit/summary; a stale false must not hide an otherwise active term.
-    search_eligible: lifecycleEligible && gate.eligible,
+    // The planner requires the persisted flag too: a quality/lifecycle refresh
+    // can revoke it while the row still carries SEARCH_TRIAL/PROVEN status.
+    search_eligible: row.search_eligible === true && lifecycleEligible && gate.eligible,
     search_eligibility_reasons: gate.eligible ? [] : gate.reasons,
   };
 }
