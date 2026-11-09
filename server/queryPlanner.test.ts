@@ -124,8 +124,8 @@ test('planner creates short, unique, attributable retrieval queries', () => {
     existingQueries: [],
     mode: 'COLD_START'
   });
-  assert.equal(planned.length, 11);
-  assert.equal(new Set(planned.map(item => normalizeQuery(item.query))).size, 11);
+  assert.equal(planned.length, 15);
+  assert.equal(new Set(planned.map(item => normalizeQuery(item.query))).size, 15);
   assert.ok(new Set(planned.map(item => item.intent)).size >= 4);
   assert.ok(planned.every(item => queryTokenCount(item.query) <= 3));
   assert.ok(planned.every(item => isRetrievalOrientedQuery('Germany', item.query)));
@@ -233,7 +233,7 @@ test('planner produces novel local instrument-market variants when every current
   ].map((value, id) => query({ id: id + 1, country: 'Belgium', query: value, last_executed: '2026-08-23T10:29:30.000Z' }));
   const planned = planDiverseQueries({
     country: 'Belgium',
-    count: 2,
+    count: 8,
     countryVocabulary,
     learnedVocabulary: [],
     existingQueries: existing,
@@ -241,10 +241,14 @@ test('planner produces novel local instrument-market variants when every current
     organicCandidates: [],
     mode: 'EXPLORATION'
   });
-  assert.equal(planned.length, 2);
+  assert.equal(planned.length, 8);
   assert.ok(planned.every(item => !existing.some(saved => normalizeQuery(saved.query) === normalizeQuery(item.query))));
-  assert.ok(planned.every(item => item.metadata.queryTemplate === 'INSTRUMENT_MARKET'));
-  assert.ok(planned.every(item => /BEL|EURUSD/i.test(item.query)));
+  // Native local singles are now part of the pool, but the instrument-market
+  // fallback shape must still be available for a fully cooling-down library.
+  const instrumentMarket = planned.filter(item => item.metadata.queryTemplate === 'INSTRUMENT_MARKET');
+  assert.ok(instrumentMarket.length > 0, 'no novel instrument-market fallback was planned');
+  assert.ok(instrumentMarket.every(item => /BEL|EURUSD/i.test(item.query)));
+  assert.ok(planned.some(item => item.metadata.queryTemplate === 'SINGLE_ATOM'));
 });
 
 test('bare short tickers require qualifying market context', () => {

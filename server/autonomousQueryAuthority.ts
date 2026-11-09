@@ -203,6 +203,22 @@ export function evaluateAutonomousQueryAuthority(
   const specificity = metadata.retrievalSpecificity as Record<string, any> | undefined;
   const atoms = Array.isArray(metadata.atoms) ? metadata.atoms as Array<Record<string, any>> : [];
   const template = String(metadata.queryTemplate || '');
+  // A persistent scope promotion is valid only while the operator still has
+  // the country selected. Check this for every promoted shape, including
+  // STANDALONE native singles, because their eligibility otherwise bypasses
+  // the pair-only promotion check below. DIRECT_TARGET is a one-shot order
+  // and keeps its existing exception.
+  if (
+    metadata.scopePromoted === true
+    && String(metadata.promotionBasis || 'PERSISTENT_SCOPE_SELECTION') !== 'DIRECT_TARGET'
+    && options.scopePromotionActive === false
+  ) {
+    return {
+      eligible: false,
+      reasonCodes: ['SCOPE_PROMOTION_INACTIVE'],
+      retrievalPolicyVersion: String(specificity?.policyVersion || ''),
+    };
+  }
 
   // The paid-demand setting is a live execution kill switch. Record-level
   // demand provenance (standalone OR anchored) must be rejected here, not
@@ -246,9 +262,12 @@ export function evaluateAutonomousQueryAuthority(
     // context. Free-signal bootstrap methods obey the same rule as curated
     // SINGLE_ATOM methods; localized method surfaces that meet the standard pass.
     const primaryType = String(atoms[0]?.type || '').toUpperCase();
+    const reviewedNativeSurface = Array.isArray(atoms[0]?.retrievalPolicy?.reasonCodes)
+      && atoms[0].retrievalPolicy.reasonCodes.includes('REVIEWED_NATIVE_PHRASE');
     if (
       (template === 'SINGLE_ATOM' || template === 'FREE_SIGNAL_STANDALONE')
       && primaryType === 'METHOD'
+      && !reviewedNativeSurface
       && !EXPLICIT_STANDALONE_METHOD_CONTEXT.test(query.query)
     ) {
       return { eligible: false, reasonCodes: ['STANDALONE_METHOD_REQUIRES_CONCRETE_TRADING_ANCHOR'], retrievalPolicyVersion: specificity.policyVersion };

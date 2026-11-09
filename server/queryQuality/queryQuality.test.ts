@@ -214,7 +214,7 @@ test('Q2: a mixed candidate cannot borrow the legacy composition limit', () => {
   assert.ok(decision.reasonCodes.includes('TOO_MANY_TOKENS'));
 });
 
-test('Q2: every planned query for all 16 production countries is admitted (123/123)', () => {
+test('Q2: every planned query for all production countries is admitted', () => {
   let total = 0;
   let admitted = 0;
   for (const country of PRODUCTION_CONFIGURED_ACTIVE_COUNTRIES) {
@@ -226,6 +226,7 @@ test('Q2: every planned query for all 16 production countries is admitted (123/1
       learnedVocabulary: [],
       existingQueries: [],
     });
+    assert.ok(planned.length > 0, `${country} produced no planned queries`);
     for (const item of planned) {
       total++;
       const result = admitQueryRecord({
@@ -238,8 +239,8 @@ test('Q2: every planned query for all 16 production countries is admitted (123/1
       else assert.fail(`${country} rejected ${item.query}: ${result.reasonCodes.join(',')}`);
     }
   }
-  assert.equal(total, 123);
-  assert.equal(admitted, 123);
+  assert.ok(total >= 123, `expected at least the previous planner inventory, got ${total}`);
+  assert.equal(admitted, total);
 });
 
 test('Q2: source registry has no direct-write producer and admission is deterministic', () => {

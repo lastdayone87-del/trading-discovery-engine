@@ -56,6 +56,67 @@ test('concrete instrument plus method remains authorized', () => {
   assert.equal(decision.eligible, true);
 });
 
+test('reviewed native method phrases are authorized as standalone surfaces', () => {
+  const decision = evaluateAutonomousQueryAuthority(query({
+    query: 'velas japonesas',
+    country: 'Spain',
+    generation_metadata: {
+      queryTemplate: 'SINGLE_ATOM',
+      scopePromoted: true,
+      retrievalSpecificity: {
+        policyVersion: RETRIEVAL_SPECIFICITY_POLICY_VERSION,
+        eligibility: 'STANDALONE',
+      },
+      atoms: [{
+        type: 'METHOD',
+        origin: 'COUNTRY_VOCABULARY',
+        term: 'velas japonesas',
+        retrievalPolicy: {
+          policyVersion: RETRIEVAL_SPECIFICITY_POLICY_VERSION,
+          eligibility: 'STANDALONE',
+          reasonCodes: ['REVIEWED_NATIVE_PHRASE'],
+        },
+      }],
+    },
+  } as any), { scopePromotionActive: true });
+  assert.equal(decision.eligible, true, decision.reasonCodes.join(','));
+});
+
+test('a deselected persistent promotion stops standalone native rows', () => {
+  const metadata = {
+    queryTemplate: 'SINGLE_ATOM',
+    scopePromoted: true,
+    promotionBasis: 'PERSISTENT_SCOPE_SELECTION',
+    retrievalSpecificity: {
+      policyVersion: RETRIEVAL_SPECIFICITY_POLICY_VERSION,
+      eligibility: 'STANDALONE',
+    },
+    atoms: [{
+      type: 'METHOD',
+      origin: 'COUNTRY_VOCABULARY',
+      term: 'velas japonesas',
+      retrievalPolicy: {
+        policyVersion: RETRIEVAL_SPECIFICITY_POLICY_VERSION,
+        eligibility: 'STANDALONE',
+        reasonCodes: ['REVIEWED_NATIVE_PHRASE'],
+      },
+    }],
+  };
+  const base = query({ query: 'velas japonesas', country: 'Spain', generation_metadata: metadata } as any);
+  assert.equal(evaluateAutonomousQueryAuthority(base, { scopePromotionActive: true }).eligible, true);
+  const deselected = evaluateAutonomousQueryAuthority(base, { scopePromotionActive: false });
+  assert.equal(deselected.eligible, false);
+  assert.ok(deselected.reasonCodes.includes('SCOPE_PROMOTION_INACTIVE'));
+
+  // A one-shot direct target remains valid without a persistent selection.
+  const direct = query({
+    query: 'velas japonesas',
+    country: 'Spain',
+    generation_metadata: { ...metadata, promotionBasis: 'DIRECT_TARGET' },
+  } as any);
+  assert.equal(evaluateAutonomousQueryAuthority(direct, { scopePromotionActive: false }).eligible, true);
+});
+
 test('autonomous candidate with no trading signal is withheld before expensive processing', () => {
   const decision = triageAutonomousSearchCandidate({
     channelId: 'UCexample0000000000000000', channelName: 'Madeleine Beelen', youtubeUrl: 'https://youtube.com/channel/x',
