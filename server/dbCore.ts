@@ -203,7 +203,23 @@ export function saveDb(): void {
 
 export async function appendOperatorAuditEvent(event: AuditEvent): Promise<void> { const db=await getDb(); await db.query(`INSERT INTO operator_audit_events(actor_identifier,actor_hash,role,action,target,request_id,outcome,safe_metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(request_id,action,target,outcome) DO NOTHING`,[event.actorId||null,event.actorHash||null,event.role||null,event.action,event.target,event.requestId,event.outcome,JSON.stringify(event.metadata||{})]); }
 export async function getOperatorAuditEvents(limit=100):Promise<any[]>{const db=await getDb();const res=await db.query(`SELECT id,actor_identifier,actor_hash,role,action,target,request_id,outcome,safe_metadata,created_at FROM operator_audit_events ORDER BY created_at DESC LIMIT $1`,[Math.min(Math.max(limit,1),500)]);return res.rows;}
-export async function appendProviderCallEvent(event:ProviderCallEvent):Promise<void>{const db=await getDb();await db.query(`INSERT INTO provider_call_events(id,provider,operation,request_id,run_id,job_id,request_metadata,attempt,status,latency_ms,reserved_cost,actual_cost,error_class,policy_version,occurred_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT(id) DO NOTHING`,[event.id,event.provider,event.operation,event.requestId||null,event.runId||null,event.jobId||null,JSON.stringify(event.requestMetadata||{}),event.attempt,event.status,event.latencyMs,event.reservedCost,event.actualCost,event.errorClass||null,event.policyVersion,event.occurredAt]);const meta=event.requestMetadata||{};const localDeferral=meta.geminiFreeCooldownDeferral==='true'||meta.groqCooldownDeferral==='true'||meta.geminiCapacityDeferral==='true';if(event.status==='RATE_LIMITED'&&!localDeferral)invalidateProviderCooldownCache(event.provider,event.provider==='groq'?meta.groqOrg:meta.geminiOrg);}
+export async function appendProviderCallEvent(event:ProviderCallEvent):Promise<void>{
+  const meta=event.requestMetadata||{};
+  const localDeferral=meta.geminiFreeCooldownDeferral==='true'||meta.groqCooldownDeferral==='true'||meta.geminiCapacityDeferral==='true';
+  const invalidate=()=>{if(event.status==='RATE_LIMITED'&&!localDeferral)invalidateProviderCooldownCache(event.provider,event.provider==='groq'?meta.groqOrg:meta.geminiOrg);};
+  // The provider outcome may already be durable before this event insert.
+  // Clear the cache first so a failed insert cannot leave a cached healthy
+  // result hiding the saved cooldown.
+  invalidate();
+  const db=await getDb();
+  try{
+    await db.query(`INSERT INTO provider_call_events(id,provider,operation,request_id,run_id,job_id,request_metadata,attempt,status,latency_ms,reserved_cost,actual_cost,error_class,policy_version,occurred_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT(id) DO NOTHING`,[event.id,event.provider,event.operation,event.requestId||null,event.runId||null,event.jobId||null,JSON.stringify(event.requestMetadata||{}),event.attempt,event.status,event.latencyMs,event.reservedCost,event.actualCost,event.errorClass||null,event.policyVersion,event.occurredAt]);
+  }finally{
+    // Clear again after the write so a read that raced the insert cannot
+    // repopulate the pre-event value.
+    invalidate();
+  }
+}
 export interface DiscordAttemptCandidate {candidateId?:string;rawLocator?:string;locatorType?:string;resolvedLocator?:string;sourceSurface?:string;sourceUrl?:string;observations?:Array<unknown>}
 export interface DiscordInviteClaim {code:string;admitted:boolean;firstChannelId:string|null}
 /**
