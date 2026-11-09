@@ -81,10 +81,12 @@ under the existing policy, and a hint-matching non-document link can still
 reach the click path. Broader label-based payment/destructive exclusions are
 not approved because they would be heuristic and could hide legitimate
 community links. The existing hint/structural click path remains limited to
-controls that can reveal content in place. No new selector, form action, or
-arbitrary `onclick` handler is added to the rendered click set. Clarifying
-these as policy-only is part of the deferral: broadening enforcement needs
-the safety harness described below.
+controls that can reveal content in place. The selector now includes
+submit/image/reset inputs only for unsafe-surface accounting; they are
+excluded from the click set, so no new **clickable** control class, form
+action, or arbitrary `onclick` handler is added. Clarifying these as
+policy-only is part of the deferral: broadening enforcement needs the safety
+harness described below.
 
 ## Why M2b remains deferred
 
