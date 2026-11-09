@@ -48,24 +48,6 @@ export function shouldBlockEnrichClaimForCountry(
 }
 
 /**
- * ENRICH-claim review predicate for LIKELY excluded countries. LIKELY is not
- * CONFIRMED, so it must not be hard-rejected; it is also not safe to spend
- * enrichment quota on a creator whose country is probably excluded. Return the
- * match so the worker can persist NEEDS_REVIEW without rejecting the channel.
- */
-export function shouldReviewEnrichClaimForCountry(
-  countryStatus: string | null | undefined,
-  country: string | null | undefined,
-  exclusion: CountryExclusionMatch | null
-): CountryExclusionMatch | null {
-  if (countryStatus !== 'LIKELY') return null;
-  if (typeof country !== 'string' || !country.trim()) return null;
-  if (!exclusion) return null;
-  if (countryIdentityKey(exclusion.country) !== countryIdentityKey(country)) return null;
-  return exclusion;
-}
-
-/**
  * The resource-boundary gate for any country-targeted operation. Call this before
  * creating jobs, selecting/generating queries, or invoking an external provider.
  * A null/unknown country is legitimate (e.g. unresolved creator country) and

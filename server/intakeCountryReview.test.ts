@@ -2,7 +2,6 @@ import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import { assessChannelCountry, inferChannelCountry } from './countryInference';
-import { shouldReviewEnrichClaimForCountry } from './countryExclusion';
 import { INITIAL_EXCLUDED_COUNTRIES } from '../src/data/initial_countries';
 
 const INDIA = [{ country_name: 'India', reason: 'test exclusion' }];
@@ -108,22 +107,4 @@ test('all configured excluded countries reject strong domicile evidence', () => 
     }, [{ country_name: country, reason: 'test exclusion' }]);
     assert.equal(result.status, 'REJECTED', `${country}: ${result.status} ${result.reasoning}`);
   }
-});
-
-test('LIKELY excluded claims are held for review while CONFIRMED uses the hard block', () => {
-  const exclusion = { country: 'India', country_name: 'India', reason: 'test exclusion' } as never;
-  assert.ok(shouldReviewEnrichClaimForCountry('LIKELY', 'India', exclusion));
-  assert.equal(shouldReviewEnrichClaimForCountry('CONFIRMED', 'India', exclusion), null);
-  assert.equal(shouldReviewEnrichClaimForCountry('UNCERTAIN', 'India', exclusion), null);
-  assert.equal(shouldReviewEnrichClaimForCountry('LIKELY', 'Singapore', exclusion), null);
-});
-
-
-test('enrichment worker holds LIKELY excluded creators before ENRICHING', () => {
-  const source = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
-  const review = source.indexOf('shouldReviewEnrichClaimForCountry(channel.country_status');
-  const enrich = source.indexOf("channel.scan_status = 'ENRICHING'", review);
-  assert.ok(review >= 0, 'LIKELY claim review branch must exist');
-  assert.ok(enrich > review, 'claim review must run before the ENRICHING transition');
-  assert.match(source, /event:'excluded_channel_review_held'/);
 });
