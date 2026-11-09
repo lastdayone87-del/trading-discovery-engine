@@ -458,3 +458,34 @@ export function isNuisanceVocabularySurface(term: string): boolean {
   const letters = value.match(/\p{L}/gu)?.length ?? 0;
   return letters === 0 || /[#@]/u.test(value) || /^[0-9]+$/u.test(value);
 }
+
+export interface DashboardTerminologyEligibility {
+  search_eligible: boolean;
+  search_eligibility_reasons: string[];
+}
+
+/**
+ * Display projection for the terminology dashboard. The raw database flag can
+ * be stale after the gate tightens or a lifecycle refresh is missed; the
+ * planner filters through this same pure gate at read time. Showing the
+ * computed result prevents an emoji/hashtag/format-only row from appearing as
+ * "search eligible" when it can never become a planner atom.
+ */
+export function dashboardSearchEligibility(row: {
+  canonical_term: string;
+  term_type?: string | null;
+  country?: string | null;
+  language?: string | null;
+  search_eligible?: boolean | null;
+}): DashboardTerminologyEligibility {
+  const gate = isSearchableTradingTerm({
+    term: row.canonical_term,
+    termType: row.term_type,
+    country: row.country,
+    language: row.language,
+  });
+  return {
+    search_eligible: row.search_eligible === true && gate.eligible,
+    search_eligibility_reasons: gate.eligible ? [] : gate.reasons,
+  };
+}

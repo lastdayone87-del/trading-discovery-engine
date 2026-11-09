@@ -15,7 +15,7 @@ import {
   type NativeEvidenceStatus,
   type SourceProvenanceFamily
 } from './countryNativeIntelligence';
-import { isSearchableTradingTerm } from './terminologySearchability';
+import { dashboardSearchEligibility, isSearchableTradingTerm } from './terminologySearchability';
 
 export { inferScript } from './countryNativeIntelligence';
 
@@ -1993,7 +1993,7 @@ export async function getTerminologyDashboardPage(country?: string, limit = 200,
     LEFT JOIN LATERAL (SELECT SUM(executions) executions,SUM(new_creators) new_creators,COALESCE(SUM(weighted_yield_total)/NULLIF(SUM(executions),0),0) decayed_yield_score,json_object_agg(retrieval_lane,lane_yield) lanes FROM (SELECT retrieval_lane,SUM(executions) executions,SUM(new_creators) new_creators,SUM(decayed_yield_score*executions) weighted_yield_total,AVG(decayed_yield_score) lane_yield FROM terminology_performance WHERE canonical_term_id=t.id GROUP BY retrieval_lane) x) p ON true
     LEFT JOIN LATERAL (SELECT json_agg(json_build_object('type',event_type,'from',from_status,'to',to_status,'reason',reason,'at',created_at) ORDER BY created_at DESC) history FROM terminology_lifecycle_events WHERE canonical_term_id=t.id) e ON true
     WHERE ($1::text IS NULL OR t.country=$1) ORDER BY t.search_eligible DESC,p.decayed_yield_score DESC,t.last_observed_at DESC NULLS LAST,t.id DESC LIMIT $2 OFFSET $3`, [country ? canonicalCountry(country) : null, bounded, skipped]);
-  return result.rows;
+  return result.rows.map(row => ({ ...row, ...dashboardSearchEligibility(row as any) }));
 }
 
 export async function getTerminologyDashboard(country?: string, clientOverride?: Queryable): Promise<unknown[]> {
@@ -2008,7 +2008,7 @@ export async function getTerminologyDashboard(country?: string, clientOverride?:
     LEFT JOIN LATERAL (SELECT SUM(executions) executions,SUM(new_creators) new_creators,COALESCE(SUM(weighted_yield_total)/NULLIF(SUM(executions),0),0) decayed_yield_score,json_object_agg(retrieval_lane,lane_yield) lanes FROM (SELECT retrieval_lane,SUM(executions) executions,SUM(new_creators) new_creators,SUM(decayed_yield_score*executions) weighted_yield_total,AVG(decayed_yield_score) lane_yield FROM terminology_performance WHERE canonical_term_id=t.id GROUP BY retrieval_lane) x) p ON true
     LEFT JOIN LATERAL (SELECT json_agg(json_build_object('type',event_type,'from',from_status,'to',to_status,'reason',reason,'at',created_at) ORDER BY created_at DESC) history FROM terminology_lifecycle_events WHERE canonical_term_id=t.id) e ON true
     WHERE ($1::text IS NULL OR t.country=$1) ORDER BY t.search_eligible DESC,p.decayed_yield_score DESC,t.last_observed_at DESC NULLS LAST`, [country ? canonicalCountry(country) : null]);
-  return result.rows;
+  return result.rows.map(row => ({ ...row, ...dashboardSearchEligibility(row as any) }));
 }
 
 export async function getPlannerTerminology(country: string, clientOverride?: Queryable, deps?: { isKillSwitchActive?: () => Promise<boolean> }): Promise<Array<{ id: number; term: string; score: number; lifecycle: 'SEARCH_TRIAL' | 'PROVEN_SEARCH_TERM' }>> {

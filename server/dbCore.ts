@@ -1,4 +1,4 @@
-import { isNuisanceVocabularySurface } from './terminologySearchability';
+import { isNuisanceVocabularySurface, isSearchableTradingTerm } from './terminologySearchability';
 import fs from 'fs';
 import path from 'path';
 import { randomUUID } from 'node:crypto';
@@ -2051,8 +2051,7 @@ export async function getQueryIntelligenceSummary(options:{now?:number;force?:bo
   (SELECT COUNT(*)::int FROM query_library WHERE collection='REJECTED') AS rejected_count,
   (SELECT COUNT(*)::int FROM extracted_trading_vocabulary) AS vocabulary_count,
   (SELECT COUNT(*)::int FROM canonical_trading_terms) AS terminology_count,
-  (SELECT COUNT(*)::int FROM canonical_trading_terms WHERE search_eligible) AS search_eligible_count,
-  (SELECT COUNT(*)::int FROM query_execution_logs) AS execution_log_count`); const r=res.rows[0]||{}; const value={queryCount:Number(r.query_count||0),provenCount:Number(r.proven_count||0),experimentalCount:Number(r.experimental_count||0),rejectedCount:Number(r.rejected_count||0),vocabularyCount:Number(r.vocabulary_count||0),terminologyCount:Number(r.terminology_count||0),searchEligibleTerminologyCount:Number(r.search_eligible_count||0),executionLogCount:Number(r.execution_log_count||0)}; queryIntelligenceSummaryCache={at:now,value}; return value;}
+  (SELECT COUNT(*)::int FROM query_execution_logs) AS execution_log_count`); const eligibleRows=await db.query(`SELECT canonical_term,term_type,country,language FROM canonical_trading_terms WHERE search_eligible=true AND lifecycle_status IN ('SEARCH_TRIAL','PROVEN_SEARCH_TERM')`); const searchEligibleTerminologyCount=eligibleRows.rows.filter((row:any)=>isSearchableTradingTerm({term:row.canonical_term,termType:row.term_type,country:row.country,language:row.language}).eligible).length; const r=res.rows[0]||{}; const value={queryCount:Number(r.query_count||0),provenCount:Number(r.proven_count||0),experimentalCount:Number(r.experimental_count||0),rejectedCount:Number(r.rejected_count||0),vocabularyCount:Number(r.vocabulary_count||0),terminologyCount:Number(r.terminology_count||0),searchEligibleTerminologyCount,executionLogCount:Number(r.execution_log_count||0)}; queryIntelligenceSummaryCache={at:now,value}; return value;}
 export async function getQueriesByCountry(country:string):Promise<QueryRecord[]>{const db=await getDb(); const res=await db.query(`SELECT * FROM query_library WHERE LOWER(country)=LOWER($1) AND status='ACTIVE' ORDER BY performance_score DESC,times_executed ASC`,[country]); return res.rows.map(rowToQuery);}
 
 export interface QueryTerminologyCurrentStatus {

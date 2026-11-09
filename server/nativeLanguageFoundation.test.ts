@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { detectLanguage, languageScript } from './languageDetection';
 import { detectCodeSwitching } from './countryNativeIntelligence';
-import { isSearchableTradingTerm } from './terminologySearchability';
+import { dashboardSearchEligibility, isSearchableTradingTerm } from './terminologySearchability';
 import { buildQueryCandidate, evaluateQueryComposition } from './queryQuality/composition';
 import { admitQueryRecord } from './queryQuality/admission';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
@@ -120,6 +120,14 @@ test('reviewed native terms pass the semantic and token gates', () => {
     const gate = isSearchableTradingTerm({ term, termType: 'TERMINOLOGY', country, language });
     assert.equal(gate.eligible, true, `${term}: ${gate.reasons.join(', ')}`);
   }
+});
+
+test('dashboard eligibility reflects the planner gate, not a stale flag', () => {
+  assert.equal(dashboardSearchEligibility({ canonical_term: '🔴', term_type: 'FORMAT', country: 'United States', language: 'en', search_eligible: true }).search_eligible, false);
+  assert.equal(dashboardSearchEligibility({ canonical_term: '#daytrading', term_type: 'FORMAT', country: 'United States', language: 'en', search_eligible: true }).search_eligible, false);
+  assert.equal(dashboardSearchEligibility({ canonical_term: 'ICT', term_type: 'TERMINOLOGY', country: 'United States', language: 'en', search_eligible: true }).search_eligible, true);
+  const demoted = dashboardSearchEligibility({ canonical_term: 'ICT', term_type: 'TERMINOLOGY', country: 'United States', language: 'en', search_eligible: false });
+  assert.equal(demoted.search_eligible, false);
 });
 
 test('unrelated foreign terms remain ineligible after the CJK relaxation', () => {
