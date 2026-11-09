@@ -12,9 +12,12 @@ import {
   ProbeQuotaUnavailableError,
   SHADOW_CAP_UNITS,
   SHADOW_LEASE_TTL_MS,
+  TEMPORARY_CAPACITY_RECHECK_MS,
   YouTubeKeyCapExceededError,
+  YouTubeKeyPoolCapacityExhaustedError,
   YouTubeKeyCapUnavailableError,
   assertKeyCapReservationDayCurrent,
+  classifyKeyCapCapacity,
   classifyShadowWouldBlock,
   isProbeQuotaControlError,
   isYouTubeKeyCapError,
@@ -22,6 +25,7 @@ import {
   parseShadowCapUnits,
   parseShadowLeaseTtlMs,
   probeQuotaMaxCapUnits,
+  readKeyCapCapacity,
   recordShadowDispatchSafe,
   reserveEnforcedKeyCap,
   reserveProbeQuota,
@@ -34,10 +38,12 @@ import {
   resolveKeyCapEnforcement,
   resolveProbeQuotaConfig,
   resolveShadowConfig,
+  selectKeyCapEligibleIndexes,
   settleKeyCapReservation,
   settleProbeQuotaReservation,
   settleShadowLease,
   simulateShadowReplay,
+  summarizeKeyCapPoolCapacity,
   sweepShadowEvents,
   sweepShadowLeases,
   type KeyCapReservationContext,
@@ -162,6 +168,127 @@ test('classifyShadowWouldBlock: 9000 admitted, 9001 blocked, partial fit defers'
   assert.equal(classifyShadowWouldBlock(0, 1, 9000), null);
   assert.equal(classifyShadowWouldBlock(9000, 0, 9000), null);
   assert.equal(classifyShadowWouldBlock(Number.NaN, 1, 9000), null);
+});
+
+test('capacity snapshot reads settled usage plus only unexpired leases for the quota day', async () => {
+  const now = new Date('2026-10-20T19:00:00.000Z');
+  const expiry = new Date('2026-10-20T19:02:00.000Z');
+  let captured: { text: string; values?: unknown[] } | undefined;
+  const client: ShadowQueryClient = {
+    async query(text, values) {
+      captured = { text, values };
+      return {
+        rows: [
+          { key_fingerprint: 'fp-a', settled_units: 8_990, lease_units: 9, earliest_lease_expiry: expiry.toISOString() },
+          { key_fingerprint: 'fp-b', settled_units: 9_000, lease_units: 0, earliest_lease_expiry: null },
+        ],
+        rowCount: 2,
+      };
+    },
+  };
+  const snapshots = await readKeyCapCapacity(client, '2026-10-20', ['fp-a', 'fp-b'], now);
+  assert.ok(captured?.text.includes('expires_at > $3'));
+  assert.deepEqual(captured?.values, ['2026-10-20', ['fp-a', 'fp-b'], now]);
+  assert.deepEqual(snapshots, [
+    { keyFingerprint: 'fp-a', settledUnits: 8_990, leaseUnits: 9, remainingUnits: 1, earliestLeaseExpiryMs: expiry.getTime() },
+    { keyFingerprint: 'fp-b', settledUnits: 9_000, leaseUnits: 0, remainingUnits: 0 },
+  ]);
+});
+
+test('capacity classification: permanent exhaustion, temporary leases, and insufficient units', () => {
+  assert.equal(classifyKeyCapCapacity({ keyFingerprint: 'fp', settledUnits: 8_999, leaseUnits: 0, remainingUnits: 0 }, 1).state, 'AVAILABLE');
+  assert.equal(classifyKeyCapCapacity({ keyFingerprint: 'fp', settledUnits: 9_000, leaseUnits: 0, remainingUnits: 0 }, 1).state, 'PERMANENTLY_EXHAUSTED');
+  assert.equal(classifyKeyCapCapacity({ keyFingerprint: 'fp', settledUnits: 8_900, leaseUnits: 100, remainingUnits: 0 }, 50).state, 'TEMPORARILY_UNAVAILABLE');
+  assert.equal(classifyKeyCapCapacity({ keyFingerprint: 'fp', settledUnits: 8_500, leaseUnits: 0, remainingUnits: 0 }, 600).state, 'INSUFFICIENT_UNTIL_RESET');
+  // Settling the 1-unit lease cannot make a 100-unit request fit.
+  assert.equal(classifyKeyCapCapacity({ keyFingerprint: 'fp', settledUnits: 8_950, leaseUnits: 1, remainingUnits: 0 }, 100).state, 'INSUFFICIENT_UNTIL_RESET');
+});
+
+test('pool summary returns one verdict: mixed availability, permanent-only, and lease-blocked', () => {
+  const now = new Date('2026-10-20T19:00:00.000Z');
+  const resetAt = getNextYouTubeQuotaResetAt(now);
+  const mixed = summarizeKeyCapPoolCapacity([
+    { keyFingerprint: 'fp-a', settledUnits: 8_990, leaseUnits: 0, remainingUnits: 10 },
+    { keyFingerprint: 'fp-b', settledUnits: 9_000, leaseUnits: 0, remainingUnits: 0 },
+  ], 10, now);
+  assert.equal(mixed.poolExhausted, false);
+  assert.deepEqual(mixed.availableKeyFingerprints, ['fp-a']);
+  assert.equal(mixed.retryAt, now.getTime());
+
+  const permanent = summarizeKeyCapPoolCapacity([
+    { keyFingerprint: 'fp-a', settledUnits: 9_000, leaseUnits: 0, remainingUnits: 0 },
+    { keyFingerprint: 'fp-b', settledUnits: 9_001, leaseUnits: 0, remainingUnits: 0 },
+  ], 1, now);
+  assert.equal(permanent.poolExhausted, true);
+  assert.equal(permanent.permanentlyExhaustedOnly, true);
+  assert.equal(permanent.retryAt, resetAt);
+
+  const leaseExpiry = now.getTime() + 30_000;
+  const leased = summarizeKeyCapPoolCapacity([
+    { keyFingerprint: 'fp-a', settledUnits: 8_990, leaseUnits: 10, remainingUnits: 0, earliestLeaseExpiryMs: leaseExpiry },
+  ], 1, now);
+  assert.equal(leased.poolExhausted, true);
+  assert.equal(leased.permanentlyExhaustedOnly, false);
+  assert.equal(leased.retryAt, Math.min(leaseExpiry, now.getTime() + TEMPORARY_CAPACITY_RECHECK_MS));
+
+  // A request that can never fit on settled usage is not lease-recoverable;
+  // its lease must not drive a one-minute retry loop until the reset.
+  const insufficient = summarizeKeyCapPoolCapacity([
+    { keyFingerprint: 'fp-a', settledUnits: 8_950, leaseUnits: 1, remainingUnits: 0, earliestLeaseExpiryMs: leaseExpiry },
+  ], 100, now);
+  assert.equal(insufficient.poolExhausted, true);
+  assert.equal(insufficient.permanentlyExhaustedOnly, true);
+  assert.equal(insufficient.temporarilyUnavailable.length, 0);
+  assert.equal(insufficient.insufficientUntilReset.length, 1);
+  assert.equal(insufficient.retryAt, resetAt);
+
+  // An expired lease is excluded by the snapshot query, so it contributes no
+  // lease units and cannot hide capacity.
+  const expired = summarizeKeyCapPoolCapacity([
+    { keyFingerprint: 'fp-a', settledUnits: 8_990, leaseUnits: 0, remainingUnits: 10 },
+  ], 10, now);
+  assert.equal(expired.poolExhausted, false);
+  assert.deepEqual(expired.availableKeyFingerprints, ['fp-a']);
+});
+
+test('preflight selection skips only keys that cannot serve the request', () => {
+  const now = new Date('2026-10-20T19:00:00.000Z');
+  const snapshots = [
+    { keyFingerprint: 'fp-a', settledUnits: 8_900, leaseUnits: 0, remainingUnits: 100 },
+    { keyFingerprint: 'fp-b', settledUnits: 8_950, leaseUnits: 50, remainingUnits: 0, earliestLeaseExpiryMs: now.getTime() + 1_000 },
+    { keyFingerprint: 'fp-c', settledUnits: 9_000, leaseUnits: 0, remainingUnits: 0 },
+  ];
+  const mixed = selectKeyCapEligibleIndexes([0, 1, 2], ['fp-a', 'fp-b', 'fp-c'], snapshots, 100, now);
+  assert.deepEqual(mixed.eligibleIndexes, [0]);
+  assert.equal(mixed.summary.poolExhausted, false);
+
+  const insufficient = selectKeyCapEligibleIndexes([0], ['fp-a'], [
+    { keyFingerprint: 'fp-a', settledUnits: 8_950, leaseUnits: 0, remainingUnits: 50 },
+  ], 100, now);
+  assert.deepEqual(insufficient.eligibleIndexes, []);
+  assert.equal(insufficient.summary.temporarilyUnavailable.length, 0);
+  assert.equal(insufficient.summary.insufficientUntilReset.length, 1);
+
+  // All exhausted returns no eligible keys, so callers raise exactly one
+  // pool-level deferral instead of attempting every key and recording one
+  // refusal per key.
+  const none = selectKeyCapEligibleIndexes([1, 2], ['fp-b', 'fp-c'], snapshots.slice(1), 1, now);
+  assert.deepEqual(none.eligibleIndexes, []);
+  assert.equal(none.summary.poolExhausted, true);
+
+  const error = new YouTubeKeyPoolCapacityExhaustedError(
+    '2026-10-20',
+    100,
+    none.summary.permanentlyExhausted.length,
+    none.summary.temporarilyUnavailable.length,
+    none.summary.retryAt,
+    none.summary.insufficientUntilReset.length,
+  );
+  assert.equal(error.code, 'YOUTUBE_KEY_POOL_CAPACITY_EXHAUSTED');
+  assert.equal(error.keyCapExceeded, true);
+  assert.equal(error.providerFailureRecorded, true);
+  assert.equal(error.markSuspension, false);
+  assert.equal(error.permanentlyExhaustedOnly, false);
 });
 
 test('resolveShadowConfig is fail-closed, clamps settings and caches for 30s', async () => {

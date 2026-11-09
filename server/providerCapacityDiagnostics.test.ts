@@ -14,6 +14,19 @@ test('classifies all-project daily quota exhaustion', () => {
   });
 });
 
+test('classifies per-key cap preflight exhaustion as a day-scoped capacity wait', () => {
+  assert.deepEqual(classifyProviderCapacityFailure({ code: 'YOUTUBE_KEY_POOL_CAPACITY_EXHAUSTED', retryAt: 1_800_000_000_000 }), {
+    reason: 'ALL_KEYS_DAILY_QUOTA_EXHAUSTED', retryable: true, retryAt: '2027-01-15T08:00:00.000Z'
+  });
+  assert.deepEqual(classifyProviderCapacityFailure({
+    code: 'YOUTUBE_KEY_POOL_CAPACITY_EXHAUSTED',
+    temporarilyUnavailableKeys: 2,
+    retryAt: 1_800_000_000_000,
+  }), {
+    reason: 'ALL_KEYS_KEY_CAPACITY_EXHAUSTED', retryable: true, retryAt: '2027-01-15T08:00:00.000Z'
+  });
+});
+
 test('classifies runtime pressure, quota allocation, cooldown, and concurrency separately', () => {
   assert.equal(classifyProviderCapacityFailure({ code: 'YOUTUBE_RUNTIME_RATE_PRESSURE' })?.reason, 'PROVIDER_RUNTIME_RATE_PRESSURE');
   assert.equal(classifyProviderCapacityFailure({ code: 'QUOTA_ALLOCATION_EXHAUSTED' })?.reason, 'PROVIDER_QUOTA_ALLOCATION_EXHAUSTED');

@@ -3395,6 +3395,18 @@ export function decideJobFailure(error:any,attempts:number,maxAttempts:number,no
     // Pacific reset without consuming an attempt or creating review work.
     return {disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:getNextYouTubeQuotaResetAt(new Date(now))};
   }
+  if(failureCode==='YOUTUBE_KEY_POOL_CAPACITY_EXHAUSTED'){
+    // No key can serve this request now. Honor a live producer hint; a stale
+    // hint means capacity was expected earlier but not confirmed, so re-check
+    // after a bounded delay instead of parking until the Pacific reset.
+    const retryAt=Number((error as any)?.retryAt);
+    return {
+      disposition:'RETRYING_WITHOUT_ATTEMPT',
+      runAfter:Number.isFinite(retryAt)
+        ? (retryAt>now?retryAt:now+60_000)
+        : getNextYouTubeQuotaResetAt(new Date(now))
+    };
+  }
   if(failureCode==='INVESTIGATION_DEADLINE_EXCEEDED')return {disposition:'FAILED'};
   if(isRetryableInfrastructureFailure(error)){
     if(now-firstFailureAt>=MAX_TRANSIENT_RETRY_AGE_MS)return {disposition:'FAILED',operationallyBlocked:true};

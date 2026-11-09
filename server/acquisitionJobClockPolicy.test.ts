@@ -50,6 +50,14 @@ test('capacity waits are separated from genuine retryable failures', () => {
   assert.equal(shouldChargeFailureBudget(quotaAllocation), false);
   assert.equal(isQuotaCapacityFailure(quotaAllocation), true);
 
+  const keyPoolCapacity = Object.assign(new Error('key pool capacity wait'), {
+    code: 'YOUTUBE_KEY_POOL_CAPACITY_EXHAUSTED',
+    retryAt: Date.now() + 60_000,
+  });
+  assert.equal(isCapacityLeaseFailure(keyPoolCapacity), true);
+  assert.equal(shouldChargeFailureBudget(keyPoolCapacity), false);
+  assert.equal(isQuotaCapacityFailure(keyPoolCapacity), true);
+
   const network = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
   assert.equal(isCapacityLeaseFailure(network), false);
   assert.equal(shouldChargeFailureBudget(network), true);
