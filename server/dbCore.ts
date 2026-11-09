@@ -18,6 +18,7 @@ import { toWellFormedDeep, stringifyWellFormedJson } from './unicodeSafety';
 import { ProbeQuotaUnavailableError, resolveShadowConfig, settleKeyCapReservation, settleProbeQuotaReservation, settleShadowLeaseWithSavepoint, YouTubeKeyCapUnavailableError, type KeyCapReservationContext, type QuotaSettlementContext } from './quotaKeyCapShadow';
 import { isYouTubePermanentInputError } from './youtubeKeyHealth';
 import { canonicalCountry } from './countryInference';
+import { invalidateProviderCooldownCache, providerCooldownReadCache } from './cooldownReadCache';
 import { sanitizeSubscriberCountText } from './lowAudienceGate';
 import { countryIdentitySql } from './countryExclusionRules';
 import { classifyDiscoveryVisibility } from './discoveryStateVisibility';
@@ -202,7 +203,7 @@ export function saveDb(): void {
 
 export async function appendOperatorAuditEvent(event: AuditEvent): Promise<void> { const db=await getDb(); await db.query(`INSERT INTO operator_audit_events(actor_identifier,actor_hash,role,action,target,request_id,outcome,safe_metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(request_id,action,target,outcome) DO NOTHING`,[event.actorId||null,event.actorHash||null,event.role||null,event.action,event.target,event.requestId,event.outcome,JSON.stringify(event.metadata||{})]); }
 export async function getOperatorAuditEvents(limit=100):Promise<any[]>{const db=await getDb();const res=await db.query(`SELECT id,actor_identifier,actor_hash,role,action,target,request_id,outcome,safe_metadata,created_at FROM operator_audit_events ORDER BY created_at DESC LIMIT $1`,[Math.min(Math.max(limit,1),500)]);return res.rows;}
-export async function appendProviderCallEvent(event:ProviderCallEvent):Promise<void>{const db=await getDb();await db.query(`INSERT INTO provider_call_events(id,provider,operation,request_id,run_id,job_id,request_metadata,attempt,status,latency_ms,reserved_cost,actual_cost,error_class,policy_version,occurred_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT(id) DO NOTHING`,[event.id,event.provider,event.operation,event.requestId||null,event.runId||null,event.jobId||null,JSON.stringify(event.requestMetadata||{}),event.attempt,event.status,event.latencyMs,event.reservedCost,event.actualCost,event.errorClass||null,event.policyVersion,event.occurredAt]);}
+export async function appendProviderCallEvent(event:ProviderCallEvent):Promise<void>{const db=await getDb();await db.query(`INSERT INTO provider_call_events(id,provider,operation,request_id,run_id,job_id,request_metadata,attempt,status,latency_ms,reserved_cost,actual_cost,error_class,policy_version,occurred_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT(id) DO NOTHING`,[event.id,event.provider,event.operation,event.requestId||null,event.runId||null,event.jobId||null,JSON.stringify(event.requestMetadata||{}),event.attempt,event.status,event.latencyMs,event.reservedCost,event.actualCost,event.errorClass||null,event.policyVersion,event.occurredAt]);if(event.status==='RATE_LIMITED')invalidateProviderCooldownCache();}
 export interface DiscordAttemptCandidate {candidateId?:string;rawLocator?:string;locatorType?:string;resolvedLocator?:string;sourceSurface?:string;sourceUrl?:string;observations?:Array<unknown>}
 export interface DiscordInviteClaim {code:string;admitted:boolean;firstChannelId:string|null}
 /**
@@ -3255,14 +3256,15 @@ export function isUpstreamProviderCallEvent(event:{requestMetadata?:unknown;requ
   return meta[GEMINI_FREE_COOLDOWN_DEFERRAL_METADATA_KEY]!=='true';
 }
 export async function resolveGeminiFreeSemanticCooldownExpiryMs(nowMs:number=Date.now()):Promise<number|undefined>{
-  const cooldownMs=geminiFreeSemanticCooldownMs();
-  try{
+  const load=async():Promise<number|undefined>=>{
+    const cooldownMs=geminiFreeSemanticCooldownMs();
     const db=await getDb();
     const res=await db.query(`SELECT occurred_at, MAX((request_metadata->>'cooldownUntilMs')::bigint) FILTER (WHERE request_metadata->>'cooldownUntilMs' ~ '^[0-9]+$') OVER () AS cooldown_until_ms FROM provider_call_events WHERE provider='gemini-free' AND status='RATE_LIMITED' AND COALESCE(request_metadata->>'${GEMINI_FREE_COOLDOWN_DEFERRAL_METADATA_KEY}','') <> 'true' AND occurred_at >= now() - interval '2 days' ORDER BY occurred_at DESC LIMIT 1`);
     const row=res.rows[0];
     if(!row?.occurred_at)return undefined;
     return providerCooldownExpiryMs(row.occurred_at,row.cooldown_until_ms,cooldownMs,nowMs);
-  }catch{return undefined;}
+  };
+  try{return await providerCooldownReadCache.get('gemini-free:pool',nowMs,load);}catch{return undefined;}
 }
 /**
  * Pool-wide Gemini semantic cooldown. Delegates to the provider-boundary
@@ -3312,15 +3314,16 @@ export async function resolveGeminiOrgBucketExpiryMs(orgId:string,nowMs:number=D
  * restart the shared window.
  */
 export async function resolveGroqSemanticCooldownExpiryMs(nowMs:number=Date.now()):Promise<number|undefined>{
-  const cooldownMs=groqSemanticCooldownMs();
-  try{
+  const load=async():Promise<number|undefined>=>{
+    const cooldownMs=groqSemanticCooldownMs();
     const db=await getDb();
     const res=await db.query(`SELECT occurred_at FROM provider_call_events WHERE provider='groq' AND status='RATE_LIMITED' AND COALESCE(request_metadata->>'groqCooldownDeferral','') <> 'true' ORDER BY occurred_at DESC LIMIT 1`);
     if(!res.rows[0]?.occurred_at)return undefined;
     const lastRateLimitMs=new Date(res.rows[0].occurred_at).getTime();
     if(nowMs-lastRateLimitMs>=cooldownMs)return undefined;
     return lastRateLimitMs+cooldownMs;
-  }catch{return undefined;}
+  };
+  try{return await providerCooldownReadCache.get('groq:pool',nowMs,load);}catch{return undefined;}
 }
 /**
  * Quota-organization that produced a provider failure, for per-account retry
@@ -3351,15 +3354,16 @@ export function failedProviderOrg(error:any,reasonCodes:string[],providers?:stri
  * 429 in one organization never affects another's window.
  */
 export async function resolveGroqOrgCooldownExpiryMs(orgId:string,nowMs:number=Date.now()):Promise<number|undefined>{
-  const cooldownMs=groqSemanticCooldownMs();
-  try{
+  const load=async():Promise<number|undefined>=>{
+    const cooldownMs=groqSemanticCooldownMs();
     const db=await getDb();
     const res=await db.query(`SELECT occurred_at FROM provider_call_events WHERE provider='groq' AND status='RATE_LIMITED' AND COALESCE(request_metadata->>'groqCooldownDeferral','') <> 'true' AND request_metadata->>'groqOrg'=$1 ORDER BY occurred_at DESC LIMIT 1`,[orgId]);
     if(!res.rows[0]?.occurred_at)return undefined;
     const lastRateLimitMs=new Date(res.rows[0].occurred_at).getTime();
     if(nowMs-lastRateLimitMs>=cooldownMs)return undefined;
     return lastRateLimitMs+cooldownMs;
-  }catch{return undefined;}
+  };
+  try{return await providerCooldownReadCache.get(`groq:org:${orgId}`,nowMs,load);}catch{return undefined;}
 }
 export function isRetryableInfrastructureFailure(error:any):boolean{
   const code=String(error?.code||error?.cause?.code||'').toUpperCase();
