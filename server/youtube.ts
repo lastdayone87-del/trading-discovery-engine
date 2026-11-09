@@ -293,39 +293,45 @@ function failedDispatchProviders(acquisition?: YouTubePoolAcquisition): Set<stri
  */
 const KEY_CAP_PREFLIGHT_TIMEOUT_MS = 2_000;
 
+/** Test seam: production always uses the enforcement setting and shared DB. */
+export interface YouTubeKeyPoolPreflightDeps {
+  resolveEnforcement?: () => Promise<boolean>;
+  readCapacity?: (quotaDay: string, keyFingerprints: string[], now: Date) => Promise<KeyCapCapacitySnapshot[]>;
+  timeoutMs?: number;
+}
+
 async function readKeyCapCapacityWithinDeadline(
-  keys: string[],
-  indexes: number[],
+  keyFingerprints: string[],
   quotaDay: string,
   now: Date,
+  readCapacity: NonNullable<YouTubeKeyPoolPreflightDeps['readCapacity']>,
+  timeoutMs: number,
 ): Promise<KeyCapCapacitySnapshot[]> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(
       () => reject(new Error('YouTube key cap capacity preflight timed out.')),
-      KEY_CAP_PREFLIGHT_TIMEOUT_MS,
+      timeoutMs,
     );
   });
   try {
-    return await Promise.race([
-      (async () => {
-        const db = await getDb();
-        return readKeyCapCapacity(db, quotaDay, indexes.map(index => fingerprintYouTubeKey(keys[index])), now);
-      })(),
-      deadline,
-    ]);
+    return await Promise.race([readCapacity(quotaDay, keyFingerprints, now), deadline]);
   } finally {
     if (timer) clearTimeout(timer);
   }
 }
 
-async function availableKeyIndexes(keys: string[], requestUnits = 1): Promise<number[]> {
+export async function availableKeyIndexes(
+  keys: string[],
+  requestUnits = 1,
+  deps: YouTubeKeyPoolPreflightDeps = {},
+): Promise<number[]> {
   const rotation = keys.map((_key, index) => (activeKeyIndex + index) % keys.length);
   const indexes = rotation.filter(index => youtubeProviderCooldown.eligible(keys[index]));
   if (!indexes.length) { throwIfAllProvidersCoolingDown(keys); return []; }
   let enforcement = false;
   try {
-    enforcement = await resolveKeyCapEnforcement(getAppSetting);
+    enforcement = await (deps.resolveEnforcement ?? (() => resolveKeyCapEnforcement(getAppSetting)))();
   } catch {
     enforcement = false;
   }
@@ -337,10 +343,20 @@ async function availableKeyIndexes(keys: string[], requestUnits = 1): Promise<nu
     const now = new Date();
     const quotaDay = getYouTubeQuotaDay(now);
     const fingerprintByIndex = new Map(rotation.map(index => [index, fingerprintYouTubeKey(keys[index])]));
+    const readCapacity = deps.readCapacity ?? (async (day, fingerprints, at) => {
+      const db = await getDb();
+      return readKeyCapCapacity(db, day, fingerprints, at);
+    });
     // Read every key, not just the dispatchable ones: a cooling key with
     // remaining quota can make work runnable before the Pacific reset, and its
     // cooldown expiry must refine the deferred retry time.
-    const snapshots = await readKeyCapCapacityWithinDeadline(keys, rotation, quotaDay, now);
+    const snapshots = await readKeyCapCapacityWithinDeadline(
+      rotation.map(index => fingerprintByIndex.get(index)!),
+      quotaDay,
+      now,
+      readCapacity,
+      deps.timeoutMs ?? KEY_CAP_PREFLIGHT_TIMEOUT_MS,
+    );
     const snapshotByFingerprint = new Map(snapshots.map(snapshot => [snapshot.keyFingerprint, snapshot]));
     const eligibleFingerprints = indexes.map(index => fingerprintByIndex.get(index)!);
     const eligibleSnapshots = eligibleFingerprints
