@@ -2075,10 +2075,24 @@ export async function getActiveQueryRunQueryIds(country?:string,completedJobGrac
       AND qr.status IN ('SCHEDULED','RUNNING','RETRYING')
       AND ($1::text IS NULL OR LOWER(qr.country)=LOWER($1))
       AND NOT (
-        COALESCE(j.status,'')='COMPLETED'
-        AND j.completed_at IS NOT NULL
-        AND j.completed_at < now() - ($2::text || ' minutes')::interval
-        AND COALESCE(qr.continuation_status,'') NOT LIKE 'DEFERRED_%'
+        COALESCE(qr.continuation_status,'') NOT LIKE 'DEFERRED_%'
+        AND NOT EXISTS (
+          SELECT 1 FROM jobs live
+          WHERE live.status IN ('PENDING','PROCESSING')
+            AND live.id <> qr.job_id
+            AND (
+              live.idempotency_key = 'search-run:' || qr.id::text
+              OR live.idempotency_key LIKE 'search-run:' || qr.id::text || ':page:%'
+            )
+        )
+        AND (
+          COALESCE(j.status,'')='FAILED'
+          OR (
+            COALESCE(j.status,'')='COMPLETED'
+            AND j.completed_at IS NOT NULL
+            AND j.completed_at < now() - ($2::text || ' minutes')::interval
+          )
+        )
       )`,[country||null,String(Math.max(1,completedJobGraceMinutes))]);
   return res.rows.map((r:any)=>Number(r.query_id)).filter((id:number)=>Number.isFinite(id));
 }
@@ -3536,7 +3550,16 @@ export async function reconcileQueryRunJobLifecycleForQuery(client: any, queryId
            qr.error AS query_run_error, qr.continuation_status, qr.deferred_until,
            j.id AS job_id, j.status AS job_status,
            j.attempts, j.max_attempts, j.last_error, j.run_after,
-           j.completed_at AS job_completed_at
+           j.completed_at AS job_completed_at,
+           EXISTS (
+             SELECT 1 FROM jobs live
+             WHERE live.status IN ('PENDING','PROCESSING')
+               AND live.id <> j.id
+               AND (
+                 live.idempotency_key = 'search-run:' || qr.id::text
+                 OR live.idempotency_key LIKE 'search-run:' || qr.id::text || ':page:%'
+               )
+           ) AS has_live_page_job
     FROM query_runs qr
     JOIN jobs j ON j.id = qr.job_id
     WHERE qr.query_id = $1
@@ -3560,6 +3583,7 @@ export async function reconcileQueryRunJobLifecycleForQuery(client: any, queryId
       now: new Date().toISOString(),
       continuationStatus: row.continuation_status,
       deferredUntil: row.deferred_until,
+      hasLivePageJob: row.has_live_page_job === true,
     });
 
     if (decision.action === 'ALIGN_RETRY_WAIT') {
@@ -3580,7 +3604,7 @@ export async function reconcileQueryRunJobLifecycleForQuery(client: any, queryId
       : 'ORPHANED_FAILED_JOB_STATE';
     const closed = await client.query(`
       UPDATE query_runs
-      SET status='FAILED', completed_at=COALESCE(completed_at,now()),
+      SET status='FAILED', continuation_status='FAILED', completed_at=COALESCE(completed_at,now()),
           error=COALESCE(error,$2),
           performance_details=COALESCE(performance_details,'{}'::jsonb)||$3::jsonb
       WHERE id=$1 AND status IN ('SCHEDULED','RUNNING','RETRYING')

@@ -95,6 +95,40 @@ test('a deferred run keeps ownership of its completed page job', () => {
       reasonCode: 'DEFERRED_RUN_WAITING_FOR_RESUME',
     });
   }
+  assert.deepEqual(decideQueryRunJobLifecycle({
+    queryRunStatus: 'RUNNING',
+    jobStatus: 'COMPLETED',
+    jobLastError: null,
+    jobRunAfter: null,
+    jobCompletedAt: '2026-08-23T08:00:00.000Z',
+    now: '2026-08-23T11:00:00.000Z',
+    continuationStatus: 'DEFERRED_QUOTA',
+    deferredUntil: '2026-08-23T10:00:00.000Z',
+  }), {
+    action: 'NOOP',
+    queryRunStatus: 'RUNNING',
+    releaseReservation: false,
+    reasonCode: 'DEFERRED_RUN_READY_FOR_RESUME',
+  });
+});
+
+test('a live later-page job protects the run from terminal completed/failed links', () => {
+  for (const jobStatus of ['COMPLETED', 'FAILED'] as const) {
+    assert.deepEqual(decideQueryRunJobLifecycle({
+      queryRunStatus: 'RUNNING',
+      jobStatus,
+      jobLastError: null,
+      jobRunAfter: null,
+      jobCompletedAt: '2026-08-23T08:00:00.000Z',
+      now: '2026-08-23T09:00:00.000Z',
+      hasLivePageJob: true,
+    }), {
+      action: 'NOOP',
+      queryRunStatus: 'RUNNING',
+      releaseReservation: false,
+      reasonCode: 'LIVE_PAGE_JOB_OWNS_QUERY_RUN',
+    });
+  }
 });
 
 test('a completed job inside the finalization grace window leaves the run active', () => {

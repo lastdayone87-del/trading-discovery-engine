@@ -18,6 +18,11 @@ export interface QueryRunJobLifecycleInput {
    */
   continuationStatus?: string | null;
   deferredUntil?: string | null;
+  /**
+   * A later page job may be the live owner while query_runs.job_id still
+   * points at the completed first-page job. Never terminalize that run.
+   */
+  hasLivePageJob?: boolean;
 }
 
 /** Shared by the lifecycle decision and the selector's active-run lookup. */
@@ -56,6 +61,13 @@ export function decideQueryRunJobLifecycle(input: QueryRunJobLifecycleInput): Qu
     return { action: 'NOOP', queryRunStatus: input.queryRunStatus, releaseReservation: false, reasonCode: 'QUERY_RUN_NOT_ACTIVE' };
   }
 
+  // A later page job can be live while query_runs.job_id still names the
+  // completed first page. The live page owns the run; neither the FAILED nor
+  // COMPLETED link is an orphan in that state.
+  if (input.hasLivePageJob) {
+    return { action: 'NOOP', queryRunStatus: input.queryRunStatus, releaseReservation: false, reasonCode: 'LIVE_PAGE_JOB_OWNS_QUERY_RUN' };
+  }
+
   if (hasScheduledRetry(input)) {
     return { action: 'ALIGN_RETRY_WAIT', queryRunStatus: 'RETRYING', releaseReservation: false, reasonCode: 'RETRY_WAIT_OWNERSHIP_ALIGNED' };
   }
@@ -68,7 +80,15 @@ export function decideQueryRunJobLifecycle(input: QueryRunJobLifecycleInput): Qu
   // quota window or time retry. The resume sweep owns it; completed-job
   // orphan recovery must never fail it or abandon its saved continuation.
   if (String(input.continuationStatus || '').toUpperCase().startsWith('DEFERRED_')) {
-    return { action: 'NOOP', queryRunStatus: input.queryRunStatus, releaseReservation: false, reasonCode: 'DEFERRED_RUN_WAITING_FOR_RESUME' };
+    const deferredUntil = input.deferredUntil ? Date.parse(input.deferredUntil) : NaN;
+    const now = input.now ? Date.parse(input.now) : Date.now();
+    const ready = Number.isFinite(deferredUntil) && Number.isFinite(now) && deferredUntil <= now;
+    return {
+      action: 'NOOP',
+      queryRunStatus: input.queryRunStatus,
+      releaseReservation: false,
+      reasonCode: ready ? 'DEFERRED_RUN_READY_FOR_RESUME' : 'DEFERRED_RUN_WAITING_FOR_RESUME',
+    };
   }
 
   // A COMPLETED job must have finalized its query run. If the run is still
