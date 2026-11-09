@@ -214,7 +214,12 @@ export function planCountryNativeProposalQuery(args: {
     .find(language => language && supportedLanguages.includes(language));
   // The reviewed allowlist is language-owned. An Italian phrase must not be
   // authorized as a Japanese native surface merely because it is reviewed.
-  if (reviewedPhrase && !reviewedNativePhraseLanguages(nativeTerm).some(language => supportedLanguages.includes(language))) {
+  const phraseLanguages = reviewedPhrase ? reviewedNativePhraseLanguages(nativeTerm) : [];
+  const declaredLanguage = languageEvidence.map(normalizeLanguageCode).find(Boolean);
+  if (reviewedPhrase && (
+    !phraseLanguages.some(language => supportedLanguages.includes(language))
+    || (declaredLanguage && !phraseLanguages.includes(declaredLanguage))
+  )) {
     return null;
   }
   // A reviewed phrase that cannot fit beside an authorized anchor runs whole.
@@ -225,7 +230,14 @@ export function planCountryNativeProposalQuery(args: {
     eligibility: 'STANDALONE' as const,
     specificity: Math.max(learned.retrievalPolicy.specificity, 70),
     ambiguity: Math.min(learned.retrievalPolicy.ambiguity, 30),
-    reasonCodes: [...new Set([...learned.retrievalPolicy.reasonCodes, 'REVIEWED_NATIVE_PHRASE'])],
+    // The reviewed exception replaces the generic expansion warning; keeping
+    // both would leave contradictory audit provenance.
+    reasonCodes: [
+      ...new Set([
+        ...learned.retrievalPolicy.reasonCodes.filter(code => code !== 'EXPANSION_SURFACE_REQUIRES_TRADING_ANCHOR'),
+        'REVIEWED_NATIVE_PHRASE',
+      ]),
+    ],
     requiredCompanionClasses: [],
   };
   const wholePhrase = (): PlannedQuery => ({
