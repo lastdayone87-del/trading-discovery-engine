@@ -25,6 +25,8 @@ import {
   getQueryFailureStates,
   getInFlightPrimaryTermUsage,
   getActiveQueryRunQueryIds,
+  getQueryTerminologyCurrentStatuses,
+  persistQueryTerminologyDigest,
   getQueryRunReward,
   isRetryableInfrastructureFailure
 } from './db';
@@ -58,11 +60,12 @@ import { getCountryMarketProfile } from './queryQuality/profiles';
 import type { DecayedArmCounts, SelectorCandidate, SelectorContext, SelectorDecision } from './queryQuality/types';
 import { selectQueryCollection, isCollectionChangeEligible, isSeverelyContaminatedQuery, type QueryFunnelMetrics, type QueryPromotionGuard } from './queryPerformance';
 import { resolveProvenPolicy } from './queryQuality/provenPolicy';
+import { digestQueryTerminologyMetadata, resolveSavedTerminologyDisposition } from './queryQuality/terminologyRevalidation';
 import { attributeTerminologyPerformance, buildNoveltyBaseline, classifyNativeCandidate, detectSpamSignals, findLiteralSpan, getPlannerTerminology, normalizeTerm, observeTerminology, observeTerminologyDetailed, KNOWN_INSTRUMENT_TERMS, type LiteralSourceText, type LiteralSpanMatch, type NativeAdmissionRejectReason, type NoveltyBaseline, type TerminologyObservationResult } from './terminologyIntelligence';
 import type { ExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { canonicalCountry } from './countryInference';
 import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
-import { reviewedNativePhraseLanguages } from './terminologySearchability';
+import { isNuisanceVocabularySurface, reviewedNativePhraseLanguages } from './terminologySearchability';
 import { countrySearchLanguageCandidates, normalizeLanguageCode } from './countrySearchHints';
 import { executeProviderCall, resolveGeminiRouteId } from './providerResilience';
 import { geminiOrgIdForSlot } from './evidenceEngine/providers/GeminiSemanticProvider';
@@ -406,6 +409,9 @@ export interface ReconcileOutcome {
  * save can never inflate frequency — the saver always brings it to exactly 1.
  */
 export async function defaultReconcileExtractedTerm(country: string, term: string, category: 'terminology' | 'instrument' | 'phrase' | 'format', sourceChannelId?: string, clientOverride?: { query: (text: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }> }): Promise<ReconcileOutcome> {
+  // Keep the migration invariant durable: repairing an existing row must not
+  // recompute a nuisance surface back to trust tier 2 from retained sources.
+  if (isNuisanceVocabularySurface(term)) return { rowInserted: false, linkInserted: false };
   const { normalizeTerm: normalizeTermForReconcile } = await import('./terminologyIntelligence');
   const db = clientOverride ?? await getDb();
   const clean = term.trim();
@@ -795,10 +801,11 @@ export async function admitNativeCandidates(args: {
       rejected['observation-failed'] += 1;
       return;
     }
-    // Legacy-vocabulary bypass guard: lower-quality or otherwise ineligible
-    // observations never increment extracted_vocabulary, so the planner
-    // cannot serve them through learnedVocabulary without the v2 basis.
-    if (args.persistLegacyTerm === false) {
+    // Legacy-vocabulary bypass guard: lower-quality, nuisance-shaped or
+    // otherwise ineligible observations never increment extracted_vocabulary,
+    // so the planner cannot serve them through learnedVocabulary without the
+    // v2 basis. Canonical observation evidence is still retained above.
+    if (args.persistLegacyTerm === false || isNuisanceVocabularySurface(String(raw))) {
       if (observation.observationInserted) admitted += 1;
       else duplicates += 1;
       return;
@@ -1539,6 +1546,13 @@ async function buildSelectorPool(
   const admissions = new Map<number, QueryRecordAdmission>();
   let permanentlyEligibleCount = 0;
   let eligible: QueryRecord[] = [];
+  const terminologyQueryIds = queries
+    .filter(query => query.generation_metadata && query.generation_metadata.terminologyId != null)
+    .map(query => query.id);
+  const terminologyStatuses = terminologyQueryIds.length
+    ? await getQueryTerminologyCurrentStatuses(terminologyQueryIds)
+    : new Map();
+  const digestedById = new Map<number, QueryRecord>();
   for (const query of queries) {
     const admissionInfo = revalidateQueryRecordAdmission(query, { now: options.nowIso, history: historyFor(query) });
     admissions.set(query.id, admissionInfo);
@@ -1554,6 +1568,32 @@ async function buildSelectorPool(
     });
     if (!authority.eligible) continue;
     permanentlyEligibleCount += 1;
+    if (query.generation_metadata && query.generation_metadata.terminologyId != null) {
+      const status = terminologyStatuses.get(query.id);
+      const disposition = resolveSavedTerminologyDisposition(status, true);
+      if (disposition === 'DIGEST') {
+        // The query itself is currently valid; only its attribution is stale.
+        // Preserve the discovery surface, strip the dead terminology linkage,
+        // and persist the decision so completion accounting reloads the same
+        // digested metadata instead of re-crediting the demoted term.
+        const digestedMetadata = digestQueryTerminologyMetadata(
+          query.generation_metadata,
+          status,
+          options.nowIso,
+        );
+        const expectedTermId = String(query.generation_metadata.terminologyId);
+        await persistQueryTerminologyDigest(query.id, expectedTermId, digestedMetadata).catch(error => {
+          console.warn('[query-intelligence] failed to persist terminology digest', {
+            queryId: query.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+        digestedById.set(query.id, {
+          ...query,
+          generation_metadata: digestedMetadata,
+        });
+      }
+    }
     const failure = failureByQuery.get(query.id);
     const selectable = isQuerySelectable({
       record: query,
@@ -1567,7 +1607,7 @@ async function buildSelectorPool(
       activeRunCount: activeRunQueryIdSet.has(query.id) ? 1 : 0,
     });
     if (!selectable.selectable) continue;
-    eligible.push(query);
+    eligible.push(digestedById.get(query.id) || query);
   }
 
   // Preserve the deterministic intent rotation as a diversity filter, never
@@ -1646,7 +1686,7 @@ async function buildSelectorPool(
     coverageCells,
     coveredCells,
   };
-  const queriesById = new Map(queries.map(query => [query.id, query]));
+  const queriesById = new Map(queries.map(query => [query.id, digestedById.get(query.id) || query]));
   return {
     candidates,
     queriesById,
