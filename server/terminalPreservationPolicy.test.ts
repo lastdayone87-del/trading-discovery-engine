@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ChannelRecord, DiscoverySource } from '../src/types';
-import { machineNonTradingRediscoveryEligible, shouldPreserveExistingChannel } from './terminalPreservationPolicy';
+import { machineNonTradingRediscoveryEligible, shouldPreserveExistingChannel, shouldShortCircuitConfirmedRediscovery, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
 
 const NOW = Date.parse('2026-08-16T04:00:00.000Z');
 
@@ -67,4 +67,19 @@ test('explicit recheck remains immediate terminal override lane', () => {
 
 test('manual search can still refresh a non-terminal stable trading row', () => {
   assert.equal(shouldPreserveExistingChannel(base(), source('manual_search'), true, NOW), false);
+});
+
+test('TRADING_CONFIRMED is preserved under ordinary rediscovery even with uncertain country', () => {
+  const confirmed = base({ trading_status: 'TRADING_CONFIRMED', country_status: 'UNCERTAIN', country: '' });
+  assert.equal(shouldShortCircuitConfirmedRediscovery(confirmed, false), true);
+  assert.equal(shouldPreserveExistingChannel(confirmed, source('automated_query'), false, NOW), true);
+  assert.equal(shouldShortCircuitConfirmedRediscovery(confirmed, true), false);
+});
+
+test('an active enrichment marker on a confirmed row is projected COMPLETED on rediscovery', () => {
+  assert.equal(terminalScanStatusForConfirmedRediscovery('ENRICHMENT_PENDING'), 'COMPLETED');
+  assert.equal(terminalScanStatusForConfirmedRediscovery('ENRICHING'), 'COMPLETED');
+  assert.equal(terminalScanStatusForConfirmedRediscovery('LOCKED'), 'COMPLETED');
+  assert.equal(terminalScanStatusForConfirmedRediscovery('NEEDS_REVIEW'), 'NEEDS_REVIEW');
+  assert.equal(terminalScanStatusForConfirmedRediscovery('FAILED'), 'FAILED');
 });

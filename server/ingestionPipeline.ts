@@ -35,9 +35,10 @@ import { enrichmentOperationalFailure, hasDecisionGradeEvidenceWithoutFailedProv
 import { recordAdmissionShadow } from './candidateAdmission/shadowEvaluator';
 import { recordReviewEligibilityShadow } from './reviewEligibility/store';
 import { evaluateReviewEligibilityV2, resolveReviewProviderDegraded } from './reviewEligibility/policy';
-import { shouldPreserveExistingChannel } from './terminalPreservationPolicy';
+import { shouldPreserveExistingChannel, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
 import { CANDIDATE_TRIAGE_POLICY_VERSION, hasIndependentTradingHypothesis, triageAutonomousSearchCandidate } from './candidateTriage';
 import { evaluateLowAudienceGate, parseSubscriberCountNumber, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
+import { validatedDiscordEvidenceInvite } from './discordEvidence';
 import { shouldReactivateCommunityRecovery, reactivateCommunityRecovery } from './communityRecovery';
 import { maybeRunDiscoveryEvidenceExtraction } from './discovery/evidencePipeline';
 import {
@@ -274,7 +275,7 @@ async function processChannelThroughPipelineInContext(
     // operator recheck is the only supported terminal override.
     if (shouldPreserveExistingChannel(existing, source, isManualScan)) {
       const refreshedAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount);
-      if (shouldReclassifyPreservedCompletedChannel(existing.scan_status, refreshedAudienceGate)) {
+      if (shouldReclassifyPreservedCompletedChannel(existing.scan_status, refreshedAudienceGate, existing.trading_status)) {
         console.log(`[Unified Ingestion Pipeline] Refreshing preserved completed channel '${candidate.channelName}' as low-audience after fresh official subscriber metadata.`);
         existing.subscriber_count = candidate.subscriberCount;
         existing.scan_status = 'SKIPPED_LOW_AUDIENCE';
@@ -319,6 +320,11 @@ async function processChannelThroughPipelineInContext(
       }
       if (candidate.channelThumbnailUrl && candidate.channelThumbnailUrl !== existing.channel_thumbnail_url) {
         existing.channel_thumbnail_url = candidate.channelThumbnailUrl;
+        updated = true;
+      }
+      const confirmedScanStatus = terminalScanStatusForConfirmedRediscovery(existing.scan_status);
+      if (confirmedScanStatus !== existing.scan_status) {
+        existing.scan_status = confirmedScanStatus;
         updated = true;
       }
       if (updated) {
@@ -744,6 +750,10 @@ async function processChannelThroughPipelineInContext(
     playlists:candidate.playlists,
     transcript_excerpts:candidate.transcriptExcerpts,detected_languages:languageInputs.detected_languages,visual_evidence:candidate.visualEvidence,
     pinned_comment:candidate.pinnedComment,enrichment_stage:candidate.enrichmentStage||0,
+    // Completed Discord validation is stored evidence. Supply it to the
+    // existing DiscordProvider so classification evaluates the complete
+    // evidence set; the provider/policy still decides whether it is enough.
+    discord_invite:validatedDiscordEvidenceInvite(existing) || undefined,
     subscriber_count:parseSubscriberCountNumber(candidate.subscriberCount),video_count:structuredVideos.length,
     search_match_context:candidate.matchedDocument?{type:candidate.matchedDocument.type,provider_native_id:candidate.matchedDocument.providerNativeId,title:candidate.matchedDocument.title,description:candidate.matchedDocument.description,published_at:candidate.matchedDocument.publishedAt,locator:candidate.matchedDocument.locator}:undefined,
     activity_metadata:{latest_upload_at:candidate.latestUploadAt,uploads_last_30_days:candidate.uploadsLast30Days,uploads_last_90_days:candidate.uploadsLast90Days,uploads_last_365_days:candidate.uploadsLast365Days,activity_band:candidate.activityBand,activity_score:candidate.activityScore,observed_at:candidate.activityObservedAt}

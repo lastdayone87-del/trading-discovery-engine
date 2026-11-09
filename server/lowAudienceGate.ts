@@ -64,6 +64,11 @@ export function evaluateLowAudienceGate(rawSubscriberCount?: string, threshold =
 export function shouldReclassifyPreservedCompletedChannel(
   existingScanStatus: string | undefined,
   gate: LowAudienceGateResult,
+  tradingStatus?: string | null,
 ): boolean {
+  // A confirmed trading classification is permanent under ordinary
+  // rediscovery. A later low subscriber observation may be recorded, but it
+  // must not move a confirmed channel into the low-audience skip lane.
+  if (tradingStatus === 'TRADING_CONFIRMED') return false;
   return existingScanStatus === 'COMPLETED' && gate.shouldSkipDeepEnrichment;
 }

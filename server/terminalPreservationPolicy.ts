@@ -8,6 +8,38 @@ function machineNonTradingReconsiderAfterMs(): number {
   return hours * 60 * 60 * 1000;
 }
 
+
+/** Confirmed trading classification is a permanent terminal state. */
+export function isPermanentTradingConfirmation(status: string | null | undefined): boolean {
+  return status === 'TRADING_CONFIRMED';
+}
+
+/**
+ * Ordinary discovery must not classify, enrich, or downgrade a channel whose
+ * trading classification was already confirmed. Explicit operator rechecks /
+ * force-rescans (isManualScan=true) are the audited correction lane and are
+ * deliberately outside this guard.
+ */
+export function shouldShortCircuitConfirmedRediscovery(
+  channel: Pick<ChannelRecord, 'trading_status'> | null | undefined,
+  isManualScan: boolean,
+): boolean {
+  return !isManualScan && isPermanentTradingConfirmation(channel?.trading_status);
+}
+
+
+/**
+ * A confirmed channel must not keep an active enrichment marker once ordinary
+ * rediscovery is short-circuited. Terminal review/failure markers are kept.
+ */
+export function terminalScanStatusForConfirmedRediscovery(
+  scanStatus: ChannelRecord['scan_status'],
+): ChannelRecord['scan_status'] {
+  return scanStatus === 'ENRICHMENT_PENDING' || scanStatus === 'ENRICHING' || scanStatus === 'LOCKED'
+    ? 'COMPLETED'
+    : scanStatus;
+}
+
 export function machineNonTradingRediscoveryEligible(existing: ChannelRecord, now = Date.now()): boolean {
   const machineNonTrading = existing.trading_status === 'NON_TRADING' || existing.scan_status === 'SKIPPED_NON_TRADING';
   if (!machineNonTrading) return false;
@@ -52,6 +84,11 @@ export function shouldPreserveExistingChannel(
   // discovery follows preservation policy; the recheck lane is the deliberate
   // operator override.
   if (source !== 'recheck') {
+    // TRADING_CONFIRMED is permanent under ordinary rediscovery, including
+    // rows whose creator country is still UNCERTAIN. Country exclusion remains
+    // a separate serving-policy concern; it must not be resolved by
+    // reclassifying the creator's trading status or spending semantic quota.
+    if (shouldShortCircuitConfirmedRediscovery(existing, isManualScan)) return true;
     const hardTerminal =
       existing.country_status === 'REJECTED' ||
       existing.trading_status === 'HUMAN_REJECTED' ||

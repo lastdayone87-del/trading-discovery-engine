@@ -46,6 +46,7 @@ test('evaluateLowAudienceGate allows reactivation when subscriber count grows fr
 
 test('preserved completed rows are reclassified only when fresh audience evidence is known low', () => {
   assert.equal(shouldReclassifyPreservedCompletedChannel('COMPLETED', evaluateLowAudienceGate('1')), true);
+  assert.equal(shouldReclassifyPreservedCompletedChannel('COMPLETED', evaluateLowAudienceGate('1'), 'TRADING_CONFIRMED'), false);
   assert.equal(shouldReclassifyPreservedCompletedChannel('COMPLETED', evaluateLowAudienceGate('hidden')), false);
   assert.equal(shouldReclassifyPreservedCompletedChannel('ENRICHMENT_PENDING', evaluateLowAudienceGate('1')), false);
   assert.equal(shouldReclassifyPreservedCompletedChannel('COMPLETED', evaluateLowAudienceGate('30')), false);
@@ -53,7 +54,7 @@ test('preserved completed rows are reclassified only when fresh audience evidenc
 
 test('ingestionPipeline refreshes preserved completed rows without hiding unknown audience rows', () => {
   const source = read('server/ingestionPipeline.ts');
-  assert.match(source, /shouldReclassifyPreservedCompletedChannel\(existing\.scan_status, refreshedAudienceGate\)/);
+  assert.match(source, /shouldReclassifyPreservedCompletedChannel\(existing\.scan_status, refreshedAudienceGate, existing\.trading_status\)/);
   assert.match(source, /existing\.scan_status = 'SKIPPED_LOW_AUDIENCE'/);
   assert.match(source, /const refreshedAudienceGate = evaluateLowAudienceGate\(candidate\.subscriberCount\)/);
 });
