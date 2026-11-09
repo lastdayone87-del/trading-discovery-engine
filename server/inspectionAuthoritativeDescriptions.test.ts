@@ -139,7 +139,11 @@ test('Step 3 inspects the authoritative seed and top-up before preloaded snippet
   const source = readFileSync(new URL('./inspector.ts', import.meta.url), 'utf8');
   assert.match(
     source,
-    /const orderedVideoDescs=authoritativeInspectionDescriptions\.length\?Array\.from\(new Set\(\[\.\.\.channelSampledDescs\(\),\.\.\.videoDescs\]\)\):videoDescs;const descriptionsToInspect=orderedVideoDescs\.slice\(0,5\)/,
+    /const orderedVideoDescs=Array\.from\(new Set\(authoritativeInspectionDescriptions\.length\?\[\.\.\.channelSampledDescs\(\),\.\.\.videoDescs\]:videoDescs\)\)/,
+  );
+  assert.match(
+    source,
+    /const descriptionsToInspect=uniqueVideoDescs\.slice\(0,MAX_INSPECTED_VIDEO_DESCRIPTIONS\)/,
   );
 });
 
