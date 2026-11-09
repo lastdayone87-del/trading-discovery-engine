@@ -12,6 +12,7 @@ import { applyPublicAboutToCandidate, fetchLiveYouTubeChannelData, shouldAttempt
 import {
   getChannelById,
   upsertChannel,
+  upsertChannelWithResult,
   enqueueJob,
   getQuota,
   getAppSetting,
@@ -445,11 +446,21 @@ async function processChannelThroughPipelineInContext(
       const countryPolicySnapshot = countryRevalidation
         ? { countryStatus: existing.country_status, country: existing.country }
         : undefined;
+      // A guarded write can be skipped when another pass changed the country
+      // decision. Re-read the committed row so the returned outcome and
+      // sighting projection never report a value the database rejected.
+      const persistPreservedRow = async (): Promise<void> => {
+        const written = await upsertChannelWithResult(existing, countryPolicySnapshot ? { requireCountrySnapshot: countryPolicySnapshot } : undefined);
+        if (!written) {
+          const refreshed = await getChannelById(candidate.channelId);
+          if (refreshed) Object.assign(existing, refreshed);
+        }
+      };
       if (countryRevalidation) {
         const revalidation = await revalidateConfirmedCountryForPreservedRow(candidate, existing, targetCountry, now);
         confirmedCountryUpdated = revalidation.countryUpdated;
         if (revalidation.rejectionApplied) {
-          await upsertChannel(existing, countryPolicySnapshot ? { requireCountrySnapshot: countryPolicySnapshot } : undefined);
+          await persistPreservedRow();
           return {
             channelId: candidate.channelId,
             channelName: candidate.channelName,
@@ -481,7 +492,7 @@ async function processChannelThroughPipelineInContext(
             timestamp: now,
           },
         ];
-        await upsertChannel(existing, countryPolicySnapshot ? { requireCountrySnapshot: countryPolicySnapshot } : undefined);
+        await persistPreservedRow();
         return {
           channelId: candidate.channelId,
           channelName: candidate.channelName,
@@ -525,7 +536,7 @@ async function processChannelThroughPipelineInContext(
         updated = true;
       }
       if (updated) {
-        await upsertChannel(existing, countryPolicySnapshot ? { requireCountrySnapshot: countryPolicySnapshot } : undefined);
+        await persistPreservedRow();
       }
 
       return {

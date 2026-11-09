@@ -1564,7 +1564,9 @@ export async function reconcileClassificationSighting(input: {
   return result.rowCount || 0;
 }
 
-export async function upsertChannel(channel: ChannelRecord, options?: { preserveDiscordOnUpdate?: boolean; allowDiscordClear?: boolean; freshDiscordValidation?: boolean; requireCountrySnapshot?: CountryPolicySnapshot }): Promise<void> {
+export interface UpsertChannelOptions { preserveDiscordOnUpdate?: boolean; allowDiscordClear?: boolean; freshDiscordValidation?: boolean; requireCountrySnapshot?: CountryPolicySnapshot }
+
+export async function upsertChannelWithResult(channel: ChannelRecord, options?: UpsertChannelOptions): Promise<boolean> {
   const db = await getDb();
   const client = await db.connect();
   try {
@@ -1590,7 +1592,7 @@ export async function upsertChannel(channel: ChannelRecord, options?: { preserve
         options.requireCountrySnapshot,
       )) {
       await client.query('COMMIT');
-      return;
+      return false;
     }
     const preserveDiscord = options?.preserveDiscordOnUpdate === true
       || shouldRetainLockedDiscordProjection(channel, locked, options);
@@ -1607,12 +1609,18 @@ export async function upsertChannel(channel: ChannelRecord, options?: { preserve
       }
     }
     await client.query('COMMIT');
+    return true;
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;
   } finally {
     client.release();
   }
+}
+
+/** Compatibility wrapper for callers that only need the write side effect. */
+export async function upsertChannel(channel: ChannelRecord, options?: UpsertChannelOptions): Promise<void> {
+  await upsertChannelWithResult(channel, options);
 }
 
 /**

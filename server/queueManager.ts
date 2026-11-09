@@ -100,7 +100,8 @@ import {
   runWithOfficialYouTubeQuotaOrigin,
 } from './officialYouTubeQuotaFence';
 import { resolveJobQuotaOrigin } from './quotaOrigin';
-import { isProbeQuotaControlError } from './quotaKeyCapShadow';
+import { isProbeQuotaControlError, YouTubeKeyCapUnavailableError } from './quotaKeyCapShadow';
+import { isYouTubeQuotaAccountingError } from './youtubeKeyHealth';
 import { assertCountryAllowed, ExcludedCountryError, getCountryExclusion, shouldBlockEnrichClaimForCountry } from './countryExclusion';
 import { randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
@@ -1185,6 +1186,15 @@ export async function admitDiscoveredChannel(input: {
         pending: false,
       };
     } catch (error) {
+      // Quota policy and accounting failures are retryable infrastructure
+      // signals, not evidence. Do not convert them into a successful
+      // preserved outcome that skips the unfinished country check.
+      if (error instanceof OfficialYouTubeQuotaFenceError
+        || error instanceof YouTubeKeyCapUnavailableError
+        || isProbeQuotaControlError(error)
+        || isYouTubeQuotaAccountingError(error)) {
+        throw error;
+      }
       console.warn(`[TerminalPreservation] confirmed country revalidation failed for ${raw.channelId}; preserving confirmed row:`, error instanceof Error ? error.message : error);
     }
   }
