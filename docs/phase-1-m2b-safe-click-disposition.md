@@ -29,14 +29,15 @@ boundary.
 - New exclusions in `server/browserCommunityFallback.ts`:
   - `<button>` inside an associated form whose type is absent, `submit`, or
     `reset` (absent means submit);
-  - `<input type="submit|image|reset">` inside an associated form;
+  - submit/image/reset inputs, with or without an associated form;
   - `<a download>` links.
   These are counted as unsafe interaction surfaces
   (`opaqueInteractiveControls`), so an invite hidden behind one cannot be
   certified as a clean absence.
 - The browser regression in
   `server/browserCommunityFallback.browser.test.ts` asserts that only the
-  non-submitting button and the ordinary anchor remain clickable.
+  non-submitting button, detached-form button, and ordinary anchor remain
+  clickable.
 
 ## Never-click boundary
 
@@ -48,14 +49,16 @@ boundary.
 - Form-associated `<input type="submit">`, `<input type="image">`, and
   `<input type="reset">` controls.
 - `<a download>` links.
-- Existing exclusions: hidden or disabled controls (including
-  `aria-disabled`, fieldset-inherited disabled, and zero-box controls) are
-  not clicked until the disclosure that reveals them runs; closed-`<details>`
-  content is deferred until its summary is clicked. `open <summary>` controls
-  are not clicked closed. Non-base-matched structural anchors that replace the
-  document are not clicked; base-matched navigable anchors remain clickable by
-  design. Opaque icon-only controls with no accessible evidence are not
-  clicked.
+- Submit/image/reset inputs are excluded unconditionally, even when they have
+  no associated form.
+- Disabled controls (including `aria-disabled`, fieldset-inherited disabled,
+  and zero-box controls) are always skipped and never clicked.
+- Hidden controls, including closed-`<details>` content, are deferred until
+  the disclosure that reveals them runs; after reveal they follow the normal
+  hint/structural policy. `open <summary>` controls are not clicked closed.
+- Non-base-matched structural anchors that replace the document are not
+  clicked; base-matched navigable anchors remain clickable by design.
+- Opaque icon-only controls with no accessible evidence are not clicked.
 
 Excluded controls that would otherwise have entered the hint/structural click
 set, or that would previously have been counted as opaque, are recorded as

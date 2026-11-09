@@ -10,6 +10,8 @@ test('M2b adds no new rendered click class and excludes form/download controls',
   assert.match(source, /effectiveType === 'submit'/);
   assert.match(source, /effectiveType === 'reset'/);
   assert.match(source, /effectiveType === 'image'/);
+  assert.match(source, /inputSubmitLike/);
+  assert.match(source, /inputSubmitLike\n\s*\|\| \(!!associatedForm/);
   assert.match(source, /element\.hasAttribute\('download'\)/);
   assert.match(source, /if \(submitsOrResetsForm \|\| downloadsFile\)/);
 
@@ -32,6 +34,8 @@ test('M2b disposition is documented as deferred with a never-click boundary', ()
   assert.match(doc, /Enforced by this change/i);
   assert.match(doc, /Policy boundary — not newly enforced/i);
   assert.match(doc, /real residual risk/i);
+  assert.match(doc, /Submit\/image\/reset inputs are excluded unconditionally/i);
+  assert.match(doc, /always skipped and never clicked/i);
   assert.match(doc, /type is\s+`submit` or `reset`/i);
   assert.match(doc, /<input type="submit">/i);
   assert.match(doc, /<input type="image">/i);

@@ -1463,10 +1463,14 @@ export function enumerateRenderedControlNodes(
       : tagName === 'input'
         ? (element as HTMLInputElement).type
         : '';
-    const submitsOrResetsForm = !!associatedForm && (
-      (tagName === 'button' && (effectiveType === 'submit' || effectiveType === 'reset'))
-      || (tagName === 'input' && (effectiveType === 'submit' || effectiveType === 'image' || effectiveType === 'reset'))
-    );
+    // Submit/image/reset inputs are a new selector class for coverage; exclude
+    // them from clicks unconditionally, even without a form. A form-less input
+    // can still carry a state-changing handler. Buttons retain the existing
+    // behavior unless they are associated with a form that would submit/reset.
+    const inputSubmitLike = tagName === 'input'
+      && (effectiveType === 'submit' || effectiveType === 'image' || effectiveType === 'reset');
+    const submitsOrResetsForm = inputSubmitLike
+      || (!!associatedForm && tagName === 'button' && (effectiveType === 'submit' || effectiveType === 'reset'));
     const downloadsFile = tagName === 'a' && element.hasAttribute('download');
     if (submitsOrResetsForm || downloadsFile) {
       // Preserve both unsafe-action coverage (a control that would otherwise

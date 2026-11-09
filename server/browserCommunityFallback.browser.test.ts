@@ -965,18 +965,19 @@ test('real DOM: M2b never clicks form submission/reset or download controls', { 
     <form><input type="submit" value="Join our community input submit"></form>
     <form><input type="image" alt="Join our community input image"></form>
     <form><input type="reset" value="Join our community input reset"></form>
+    <input type="submit" value="Join our community formless input">
     <fieldset disabled><button type="button" aria-label="Join our community disabled"><svg width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="8"></circle></svg></button></fieldset>
     <a href="https://discord.gg/room" download>Join our community download</a>
     <a href="https://discord.gg/room">Join our community anchor</a>
   </body></html>`, async (page) => {
     const enumeration = await enumeratePageControls(page);
-    assert.equal(enumeration.total, 14);
+    assert.equal(enumeration.total, 15);
     assert.equal(enumeration.controls.length, 3, 'non-submitting button, detached-form button, and ordinary anchor remain clickable');
-    assert.equal(enumeration.opaqueInteractiveControls, 10, 'form submit/reset/download/input controls plus one icon-only submit are unsafe surfaces');
+    assert.equal(enumeration.opaqueInteractiveControls, 11, 'form and form-less submit/reset/download/input controls plus one icon-only submit are unsafe surfaces');
     const texts = enumeration.controls.map(control => control.text);
     assert.equal(texts.filter(text => text.includes('type button')).length, 1, 'the type=button survivor is retained');
     assert.equal(texts.filter(text => text.includes('detached')).length, 1, 'the detached-form survivor is retained');
     assert.equal(texts.filter(text => text.includes('anchor')).length, 1, 'the ordinary anchor survivor is retained');
-    assert.ok(!texts.some(text => /download|invalid|padded|input submit|input image|input reset|disabled/.test(text)));
+    assert.ok(!texts.some(text => /download|invalid|padded|input submit|input image|input reset|formless|disabled/.test(text)));
   });
 });
