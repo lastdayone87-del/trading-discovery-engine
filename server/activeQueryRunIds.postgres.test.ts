@@ -38,7 +38,7 @@ test('Stage 4 PostgreSQL: a completed-job orphan is selectable but deferred and 
       await db.query(
         `INSERT INTO query_runs(id,query_id,country,source,status,selection_strategy,selection_reason,retrieval_lane,search_ordering,provider_key,retrieval_surface,provider_capability,cost_domain,provider_allocation_snapshot,job_id,continuation_status,deferred_until,continuation_segment)
          VALUES($1,$2,'FR','automated_query','RUNNING','BASELINE','active-run test','VIDEO','RELEVANCE','youtube-search','YOUTUBE_NATIVE','SEARCH_YOUTUBE','YOUTUBE_DATA_API',$3::jsonb,$4,$5,$6,0)`,
-        [id, queryId, JSON.stringify({ providerKey: 'youtube-search', retrievalSurface: 'YOUTUBE_NATIVE', capability: 'SEARCH_YOUTUBE', costDomain: 'YOUTUBE_DATA_API', continuationOwner: 'PHASE_9' }), jobId, continuationStatus, deferredUntil]
+        [id, queryId, JSON.stringify({ providerKey: 'youtube-search', retrievalSurface: 'YOUTUBE_NATIVE', capability: 'SEARCH_YOUTUBE', costDomain: 'YOUTUBE_DATA_API', continuationOwner: 'PHASE_9' }), jobId, continuationStatus || 'RUNNING', deferredUntil]
       );
       return id;
     };
