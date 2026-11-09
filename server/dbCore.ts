@@ -3058,9 +3058,9 @@ export async function evaluateClaimGuard(client: ClaimBudgetClient, guard: Claim
   }
 }
 export async function enqueueJob(type:string,payload:any,opts:{priority?:number;maxAttempts?:number;runAfter?:string;idempotencyKey?:string;clientOverride?:any;preventReopen?:boolean}={}):Promise<DurableJob>{
-  // Default-off bulk admission. When disabled this only counts/warns (>250 in
-  // one transaction/client scope); when enabled it fails the producer before
-  // an unbounded burst reaches the durable queue.
+  // Default-off bulk admission. When disabled this only counts and warns.
+  // When enabled it enforces the explicit withBulkEnqueueTransaction scope or
+  // the rolling 60s window before an unbounded burst reaches the queue.
   // The reservation is released below when the durable insert fails or the
   // reopen guard returns a still-terminal owner. Idempotent upserts still
   // consume a slot; exact new-vs-reopen accounting needs a Postgres-only CTE

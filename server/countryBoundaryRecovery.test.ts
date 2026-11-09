@@ -70,7 +70,7 @@ test('cohort scheduler is operator-protected, confirmation-gated, and worker use
   assert.match(cohortSource, new RegExp(`COUNTRY_BOUNDARY_RECOVERY_JOB = '${COUNTRY_BOUNDARY_RECOVERY_JOB}'`));
   assert.match(workerSource, /reserveOfficialRecheckQuota\('OPERATIONAL_RECHECK', operationId\)/);
   assert.match(workerSource, /claimNextJob\(workerId, COUNTRY_BOUNDARY_RECOVERY_TYPES\)/);
-  assert.match(workerSource, /triggerManualRecheck\(channelId, true, true\)/);
+  assert.match(workerSource, /triggerManualRecheck\(channelId, true, true, \{ lane: 'MAINTENANCE', jobType: job\.type, jobId: job\.id \}\)/);
   assert.match(workerSource, /completeJob\(job\.id\)/);
   assert.match(workerSource, /failJob\(claimedJobId, error\)/);
 });
