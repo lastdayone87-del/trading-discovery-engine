@@ -156,19 +156,29 @@ export function classificationDayBucket(now: number = Date.now()): string {
 }
 
 /**
+ * Enrichment identity is stage- and day-scoped. A completed pass must not be
+ * reopened by ordinary rediscovery later the same day, while a new day can
+ * legitimately request fresh evidence. Failed work keeps its normal retry path.
+ * Ordinary discovery pairs this key with preventCompletedReopen; an explicit
+ * operator recheck uses a fresh recheck key instead.
+ */
+export function enrichmentJobIdempotencyKey(
+  channelId: string,
+  stage: number,
+  now: number = Date.now(),
+  options: { explicitRecheck?: boolean; recheckNonce?: number } = {},
+): string {
+  const base = `enrich:${channelId}:stage:${Math.max(1, Math.floor(stage) || 1)}`;
+  return options.explicitRecheck
+    ? `${base}:recheck:${Math.floor(options.recheckNonce ?? now)}`
+    : `${base}:${classificationDayBucket(now)}`;
+}
+
+/**
  * Durable idempotency key. `preventReopen: true` must accompany this key so a
  * COMPLETED/FAILED job from the same day is never silently reopened; a later
  * day or an explicit operator recheck earns a new classification attempt.
  */
-/**
- * Enrichment identity is stage- and day-scoped. A completed pass must not be
- * reopened by ordinary rediscovery later the same day, while a new day can
- * legitimately request fresh evidence. Failed work keeps its normal retry path.
- */
-export function enrichmentJobIdempotencyKey(channelId: string, stage: number, now: number = Date.now()): string {
-  return `enrich:${channelId}:stage:${Math.max(1, Math.floor(stage) || 1)}:${classificationDayBucket(now)}`;
-}
-
 export function classificationJobIdempotencyKey(channelId: string, now: number = Date.now()): string {
   return `classify:${channelId}:${classificationDayBucket(now)}`;
 }

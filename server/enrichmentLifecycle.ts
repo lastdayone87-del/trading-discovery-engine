@@ -31,12 +31,18 @@ export function resolveUncertainLifecycle(wantsHumanReview: boolean, eligibility
  */
 export function resolveEnrichmentReopenBlockedLifecycle(
   channel: Pick<ChannelRecord, 'scan_status' | 'trading_status'>,
+  options: { blockedJobStatus?: string | null; hasOtherActiveEnrichmentJob?: boolean } = {},
 ): { scanStatus: ScanStatus; tradingStatus: TradingStatus } {
   const active = channel.scan_status === 'ENRICHMENT_PENDING'
     || channel.scan_status === 'ENRICHING'
     || channel.scan_status === 'LOCKED';
+  if (!active || options.hasOtherActiveEnrichmentJob === true) {
+    return { scanStatus: channel.scan_status, tradingStatus: channel.trading_status };
+  }
+  // A blocked FAILED job is terminal for this pass; it is not completed work.
+  // An active job elsewhere owns the channel and must keep the pending state.
   return {
-    scanStatus: active ? 'COMPLETED' : channel.scan_status,
+    scanStatus: String(options.blockedJobStatus || '').toUpperCase() === 'FAILED' ? 'FAILED' : 'COMPLETED',
     tradingStatus: channel.trading_status,
   };
 }

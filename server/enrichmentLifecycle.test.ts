@@ -79,19 +79,27 @@ test('review, rejection, and completed operational paths are never overwritten b
 
 test('a blocked completed enrichment re-open cannot leave an orphan ENRICHMENT_PENDING row', () => {
   assert.deepEqual(
-    resolveEnrichmentReopenBlockedLifecycle({ scan_status: 'ENRICHMENT_PENDING', trading_status: 'UNCERTAIN' }),
+    resolveEnrichmentReopenBlockedLifecycle({ scan_status: 'ENRICHMENT_PENDING', trading_status: 'UNCERTAIN' }, { blockedJobStatus: 'COMPLETED' }),
     { scanStatus: 'COMPLETED', tradingStatus: 'UNCERTAIN' },
   );
   assert.deepEqual(
-    resolveEnrichmentReopenBlockedLifecycle({ scan_status: 'ENRICHING', trading_status: 'UNCERTAIN' }),
+    resolveEnrichmentReopenBlockedLifecycle({ scan_status: 'ENRICHING', trading_status: 'UNCERTAIN' }, { blockedJobStatus: 'COMPLETED' }),
     { scanStatus: 'COMPLETED', tradingStatus: 'UNCERTAIN' },
   );
   assert.deepEqual(
-    resolveEnrichmentReopenBlockedLifecycle({ scan_status: 'NEEDS_REVIEW', trading_status: 'NEEDS_REVIEW' }),
+    resolveEnrichmentReopenBlockedLifecycle({ scan_status: 'ENRICHMENT_PENDING', trading_status: 'UNCERTAIN' }, { blockedJobStatus: 'FAILED' }),
+    { scanStatus: 'FAILED', tradingStatus: 'UNCERTAIN' },
+  );
+  assert.deepEqual(
+    resolveEnrichmentReopenBlockedLifecycle({ scan_status: 'ENRICHMENT_PENDING', trading_status: 'UNCERTAIN' }, { blockedJobStatus: 'COMPLETED', hasOtherActiveEnrichmentJob: true }),
+    { scanStatus: 'ENRICHMENT_PENDING', tradingStatus: 'UNCERTAIN' },
+  );
+  assert.deepEqual(
+    resolveEnrichmentReopenBlockedLifecycle({ scan_status: 'NEEDS_REVIEW', trading_status: 'NEEDS_REVIEW' }, { blockedJobStatus: 'COMPLETED' }),
     { scanStatus: 'NEEDS_REVIEW', tradingStatus: 'NEEDS_REVIEW' },
   );
   assert.deepEqual(
-    resolveEnrichmentReopenBlockedLifecycle({ scan_status: 'COMPLETED', trading_status: 'TRADING_CONFIRMED' }),
+    resolveEnrichmentReopenBlockedLifecycle({ scan_status: 'COMPLETED', trading_status: 'TRADING_CONFIRMED' }, { blockedJobStatus: 'COMPLETED' }),
     { scanStatus: 'COMPLETED', tradingStatus: 'TRADING_CONFIRMED' },
   );
 });

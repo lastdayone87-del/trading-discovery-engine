@@ -127,6 +127,14 @@ test('enrichment idempotency is stable within a day, stage-scoped, and changes n
   assert.equal(enrichmentJobIdempotencyKey('chan-1', 1, evening), enrichmentJobIdempotencyKey('chan-1', 1, morning));
   assert.notEqual(enrichmentJobIdempotencyKey('chan-1', 2, morning), enrichmentJobIdempotencyKey('chan-1', 1, morning));
   assert.notEqual(enrichmentJobIdempotencyKey('chan-1', 1, Date.UTC(2026, 10, 8, 0, 0, 1)), enrichmentJobIdempotencyKey('chan-1', 1, morning));
+  assert.equal(
+    enrichmentJobIdempotencyKey('chan-1', 1, morning, { explicitRecheck: true, recheckNonce: 42 }),
+    'enrich:chan-1:stage:1:recheck:42',
+  );
+  assert.notEqual(
+    enrichmentJobIdempotencyKey('chan-1', 1, morning, { explicitRecheck: true, recheckNonce: 42 }),
+    enrichmentJobIdempotencyKey('chan-1', 1, morning),
+  );
 });
 
 test('per-query scope prefers the run, then query+country, then normalized text', () => {

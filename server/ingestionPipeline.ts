@@ -976,29 +976,46 @@ async function processChannelThroughPipelineInContext(
     if (lifecycle.shouldEnqueue) {
       const action=ACTIONS.find(item=>item.action===appliedAction),nextStage=action?.enrichmentStage||Math.min(2,currentStage+1);
       const vitality=deriveVitalityScheduling(productionClassification.input.activity_metadata,productionClassification.decision.timestamp),priority=10+vitality.jobPriorityDelta,payload={ channelId: candidate.channelId, targetCountry, source, candidate, enrichmentStage:nextStage, quotaOrigin: currentOfficialYouTubeQuotaOrigin() === 'PROBE' ? 'PROBE' : 'NORMAL', evidenceAcquisitionDecisionId:evidencePlan?.decisionId, evidenceAction:appliedAction, vitalityScheduling:vitality };
-      // Ordinary rediscovery must not turn a completed enrichment job back into
-      // PENDING. The page/day bucket bounds re-enrichment to one stage pass per
-      // day; preventCompletedReopen keeps today's completed work terminal while
-      // still allowing a FAILED job to retry. Explicit rechecks/recovery use
-      // their own keys and are unaffected.
-      const enrichmentKey=enrichmentJobIdempotencyKey(candidate.channelId,nextStage);
-      const enqueueEnrichment=()=>enqueueJob('ENRICH_CHANNEL',payload,{priority,maxAttempts:4,idempotencyKey:enrichmentKey,preventCompletedReopen:true});
-      const workflowAssignment=await assignRelease5Serving('INVESTIGATION_WORKFLOW',candidate.channelId).catch(()=>({assigned:false,mode:'OFF'})),legacyWorkflowEnabled=await getAppSetting('investigation_workflow_enabled','false')==='true';
-      let enqueued: Awaited<ReturnType<typeof enqueueJob>> | undefined;
-      if(workflowAssignment.assigned||legacyWorkflowEnabled){
-        try{await scheduleInvestigationStep({investigationId:candidate.investigationId,channelId:candidate.channelId,diagnosticId:classificationDiagnosticId,actionType:appliedAction,jobType:'ENRICH_CHANNEL',jobPayload:payload,priority,maxAttempts:4,idempotencyKey:`investigation-step:${candidate.channelId}:${classificationDiagnosticId||now}:${appliedAction}`,policyVersion:INVESTIGATION_POLICY_VERSION,utilityContractVersion:'utility-constraints-v1',deadlineMinutes:Number(await getAppSetting('investigation_deadline_minutes','30'))||30});}
-        catch(error){if(candidate.investigationId)throw error;console.error(`[Investigation] Initial transactional scheduling failed for ${candidate.channelId}; using compatible queue fallback.`,error);enqueued=await enqueueEnrichment();}
-      }else enqueued=await enqueueEnrichment();
-      if(enqueued?.reopen_blocked===true){
-        // The completed pass already ran today. Do not leave the row waiting on
-        // a job that cannot run; project the honest completed state while
-        // preserving the channel's semantic status.
-        const blocked=resolveEnrichmentReopenBlockedLifecycle(authoritativeChannel);
-        if(blocked.scanStatus!==authoritativeChannel.scan_status||blocked.tradingStatus!==authoritativeChannel.trading_status){
-          authoritativeChannel.scan_status=blocked.scanStatus;
-          authoritativeChannel.trading_status=blocked.tradingStatus;
-          authoritativeChannel.last_checked=now;
-          await upsertChannel(authoritativeChannel,{preserveDiscordOnUpdate:true});
+      // An active pass for this channel already owns the work. Reusing it
+      // prevents a day-key rollover from creating a second job while
+      // yesterday's job is still pending/processing.
+      let activeEnrichmentJob=false;
+      try{
+        const db=await getDb();
+        const active=await db.query(`SELECT 1 FROM jobs WHERE type='ENRICH_CHANNEL' AND status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$1 LIMIT 1`,[candidate.channelId]);
+        activeEnrichmentJob=Boolean(active.rowCount);
+      }catch{activeEnrichmentJob=false;}
+      if(!activeEnrichmentJob){
+        // Ordinary rediscovery must not turn a completed enrichment job back
+        // into PENDING. The day bucket bounds fresh evidence passes;
+        // preventCompletedReopen keeps today's completed work terminal while
+        // still allowing a FAILED job to retry. Explicit rechecks always get a
+        // fresh job and are never blocked by an earlier completed pass.
+        const explicitRecheck=isManualScan||source==='recheck';
+        const enrichmentKey=enrichmentJobIdempotencyKey(candidate.channelId,nextStage,Date.now(),{explicitRecheck});
+        const enqueueEnrichment=()=>enqueueJob('ENRICH_CHANNEL',payload,{priority,maxAttempts:4,idempotencyKey:enrichmentKey,...(explicitRecheck?{}:{preventCompletedReopen:true})});
+        const workflowAssignment=await assignRelease5Serving('INVESTIGATION_WORKFLOW',candidate.channelId).catch(()=>({assigned:false,mode:'OFF'})),legacyWorkflowEnabled=await getAppSetting('investigation_workflow_enabled','false')==='true';
+        let enqueued: Awaited<ReturnType<typeof enqueueJob>> | undefined;
+        if(workflowAssignment.assigned||legacyWorkflowEnabled){
+          try{await scheduleInvestigationStep({investigationId:candidate.investigationId,channelId:candidate.channelId,diagnosticId:classificationDiagnosticId,actionType:appliedAction,jobType:'ENRICH_CHANNEL',jobPayload:payload,priority,maxAttempts:4,idempotencyKey:`investigation-step:${candidate.channelId}:${classificationDiagnosticId||now}:${appliedAction}`,policyVersion:INVESTIGATION_POLICY_VERSION,utilityContractVersion:'utility-constraints-v1',deadlineMinutes:Number(await getAppSetting('investigation_deadline_minutes','30'))||30});}
+          catch(error){if(candidate.investigationId)throw error;console.error(`[Investigation] Initial transactional scheduling failed for ${candidate.channelId}; using compatible queue fallback.`,error);enqueued=await enqueueEnrichment();}
+        }else enqueued=await enqueueEnrichment();
+        if(enqueued?.reopen_blocked===true){
+          // No other active pass exists (checked above). Project the honest
+          // terminal state, but update only the committed row's scan status so
+          // a concurrent recovery/recheck cannot be overwritten by this stale
+          // snapshot. A blocked FAILED job is FAILED, never COMPLETED.
+          const blocked=resolveEnrichmentReopenBlockedLifecycle(authoritativeChannel,{blockedJobStatus:enqueued.status,hasOtherActiveEnrichmentJob:false});
+          if(blocked.scanStatus!==authoritativeChannel.scan_status){
+            const db=await getDb();
+            await db.query(
+              `UPDATE channels SET scan_status=$2,last_checked=$3,updated_at=now()
+                WHERE channel_id=$1 AND scan_status = ANY($4::text[])`,
+              [candidate.channelId,blocked.scanStatus,now,['ENRICHMENT_PENDING','ENRICHING','LOCKED']],
+            );
+            const refreshed=await getChannelById(candidate.channelId);
+            if(refreshed)Object.assign(authoritativeChannel,refreshed);
+          }
         }
       }
     }
