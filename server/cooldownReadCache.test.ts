@@ -67,3 +67,47 @@ test('shared production cache can be invalidated as a whole', () => {
   providerCooldownReadCache.invalidate();
   assert.equal(providerCooldownReadCache.size(), 0);
 });
+
+test('concurrent misses for the same key share one ledger read', async () => {
+  const cache = new ProviderCooldownReadCache(5_000);
+  let loads = 0;
+  const loader = async () => { loads += 1; return 9_000; };
+  const [a, b, c] = await Promise.all([
+    cache.get('gemini:org:a', 1_000, loader),
+    cache.get('gemini:org:a', 1_000, loader),
+    cache.get('gemini:org:a', 1_000, loader),
+  ]);
+  assert.deepEqual([a, b, c], [9_000, 9_000, 9_000]);
+  assert.equal(loads, 1);
+});
+
+test('an in-flight read cannot repopulate stale state after invalidation', async () => {
+  const cache = new ProviderCooldownReadCache(5_000);
+  let resolveOld!: (value: number | undefined) => void;
+  let loads = 0;
+  const values: Array<number | undefined> = [undefined, 20_000];
+  const loader = () => {
+    const value = values[loads];
+    loads += 1;
+    if (loads === 1) return new Promise<number | undefined>(resolve => { resolveOld = resolve; });
+    return Promise.resolve(value);
+  };
+  const pending = cache.get('groq:org:a', 1_000, loader);
+  cache.invalidateProvider('groq');
+  resolveOld(undefined); // stale read completes after the new rate-limit landed
+  assert.equal(await pending, 20_000, 'the retry must observe the post-invalidation state');
+  assert.equal(loads, 2);
+});
+
+test('provider-scoped invalidation does not discard unrelated provider reads', async () => {
+  const cache = new ProviderCooldownReadCache(5_000);
+  let geminiLoads = 0;
+  let groqLoads = 0;
+  await cache.get('gemini:org:a', 1_000, async () => { geminiLoads += 1; return 8_000; });
+  await cache.get('groq:org:a', 1_000, async () => { groqLoads += 1; return 9_000; });
+  cache.invalidateProvider('gemini');
+  assert.equal(await cache.get('groq:org:a', 1_100, async () => { groqLoads += 1; return 9_000; }), 9_000);
+  assert.equal(groqLoads, 1);
+  assert.equal(await cache.get('gemini:org:a', 1_100, async () => { geminiLoads += 1; return 8_000; }), 8_000);
+  assert.equal(geminiLoads, 2);
+});
