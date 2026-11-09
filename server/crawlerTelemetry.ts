@@ -65,6 +65,8 @@ export const CEILING_KINDS = [
   'exploration-limit',
   'response-cap',
   'total-timeout',
+  /** Per-page static-control cap dropped eligible unique targets. */
+  'control-slice',
   /** Frontier stopping-arbiter halt (see frontier-yield-stop above). */
   'frontier-yield',
 ] as const;
