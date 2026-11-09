@@ -3895,6 +3895,13 @@ export function detectPendingDiscoveryWork(
   );
   if (locatorUnvalidated) reasons.push('locator-unvalidated');
   if (shouldScheduleFoundGapAcquisitionRetry(inspection)) reasons.push('found-gap-retry');
+  const directive = inspection?.retryDirective;
+  if (directive && typeof directive === 'object') {
+    const retryReason = String((directive as { retryReason?: unknown }).retryReason || '');
+    if (retryReason === COMMUNITY_RETRY_REASON.COMMUNITY_REQUIRED_ACQUISITION_FAILURE) {
+      reasons.push('community-retry-directive');
+    }
+  }
   const outcomes = Array.isArray(inspection?.acquisitionOutcomes) ? inspection.acquisitionOutcomes : [];
   const suppressed = Array.isArray(inspection?.retrySuppressedUrls) ? inspection.retrySuppressedUrls.map(String) : undefined;
   if (hasRetryableCommunityAcquisitionFailure(outcomes as Parameters<typeof hasRetryableCommunityAcquisitionFailure>[0], suppressed)) {

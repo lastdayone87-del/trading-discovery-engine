@@ -209,12 +209,27 @@ test('Discord extraction is preserved across supported acquired surfaces',async(
   assert.equal(about.foundInvite,'about-room');assert.equal(links.foundInvite,'link-room');
 });
 
-test('optional website failure does not contaminate social or required acquisition coverage',async()=>{
+test('optional website failure is not a clean no-match and owns retry',async()=>{
   const result=await runChannelInspection({channelId:'optional',channelBio:'https://unreachable.invalid',videoDescriptions:['1','2','3','4','5'],externalFetchImpl:async()=>response(503,'','text/html')});
-  assert.equal(result.acquisitionStatus,'INSPECTED_NO_MATCH');
+  assert.equal(result.acquisitionStatus,'PARTIALLY_INSPECTED');
   const website=result.steps.find(step=>step.step==='CUSTOM_DOMAINS'),social=result.steps.find(step=>step.step==='SOCIAL_BIO');
   assert.equal(website?.status,'ERROR');assert.equal(social?.status,'SKIPPED');
   assert.equal(result.acquisitionOutcomes?.find(item=>item.surface==='CREATOR_WEBSITES')?.required,false);
+  assert.equal(result.retryDirective?.code,'COMMUNITY_ACQUISITION_REQUIRED');
+  assert.equal(result.retryDirective?.attemptFree,false);
+});
+
+test('genuinely inspected optional website no-match remains clean',async()=>{
+  const result=await runChannelInspection({
+    channelId:'optional-clean',
+    channelBio:'https://creator.example/',
+    videoDescriptions:['1','2','3','4','5'],
+    destinationResolver:async()=>['93.184.216.34'],
+    externalFetchImpl:async()=>response(200,'<html><body>No community links here.</body></html>','text/html'),
+  });
+  assert.equal(result.acquisitionStatus,'INSPECTED_NO_MATCH');
+  assert.equal(result.retryDirective,undefined);
+  assert.equal(result.steps.find(step=>step.step==='CUSTOM_DOMAINS')?.status,'NOT_FOUND');
 });
 
 

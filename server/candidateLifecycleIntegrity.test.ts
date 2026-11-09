@@ -682,6 +682,21 @@ test('E7: pending detection uses community-surface retry semantics, not raw requ
   assert.deepEqual(websiteFailure, { pending: true, reasons: ['required-retryable-observation'] }, 'a required community failure still preserves pending work');
 });
 
+test('H2: a community retry directive prevents a clean absence projection', () => {
+  const pending = detectPendingDiscoveryWork(
+    { discord_candidate_locator: null, discord_validation_status: 'NOT_STARTED', discord_discovery_status: 'NOT_DISCOVERED' },
+    {
+      retryDirective: {
+        attemptFree: false,
+        code: 'COMMUNITY_ACQUISITION_REQUIRED',
+        retryReason: 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE',
+        reason: 'Optional community surface was not inspected',
+      },
+    },
+  );
+  assert.deepEqual(pending, { pending: true, reasons: ['community-retry-directive'] });
+});
+
 test('E7: a channel without pending work still projects clean absence', async () => {
   const channel = {
     channel_id: 'chanB',
