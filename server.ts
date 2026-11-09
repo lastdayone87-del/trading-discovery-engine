@@ -15,6 +15,9 @@ import {
   getSchemaInfo,
   performManualDatabaseBackup,
   getAllQueries,
+  getQueryLibraryPage,
+  getVocabularyPage,
+  getQueryIntelligenceSummary,
   getQueriesByCountry,
   getRecentQueryExecutionLogs,
   getExtractedVocabulary,
@@ -74,7 +77,7 @@ import {
 } from './server/autonomousDiscovery';
 import { generateCandidateQueriesForCountry } from './server/queryIntelligence';
 import { validateSelectionExperimentRequest } from './server/querySelectionExperiments';
-import { getTerminologyDashboard } from './server/terminologyIntelligence';
+import { getTerminologyDashboard, getTerminologyDashboardPage } from './server/terminologyIntelligence';
 import {
   runRegressionTestSuite,
   getRegressionRuns,
@@ -645,11 +648,22 @@ async function startServer() {
 
   // --- QUERY INTELLIGENCE ENGINE ROUTES ---
 
+  // 14b. Small aggregate counts. The dashboard uses this for tab labels and
+  // KPI cards so a slow/failed list request can never render a false zero.
+  app.get('/api/query-intelligence/summary', async (_req, res) => {
+    try {
+      res.json(await getQueryIntelligenceSummary());
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // 15. Get Query Library
   app.get('/api/query-intelligence/library', async (req, res) => {
     try {
       const country = req.query.country as string | undefined;
-      let queries = country ? await getQueriesByCountry(country) : await getAllQueries();
+      const limit = Math.max(1, Math.min(1000, parseInt(req.query.limit as string) || 500));
+      let queries = country ? (await getQueriesByCountry(country)).slice(0, limit) : await getQueryLibraryPage(limit);
       res.json(queries);
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -660,7 +674,8 @@ async function startServer() {
   app.get('/api/query-intelligence/vocabulary', async (req, res) => {
     try {
       const country = req.query.country as string | undefined;
-      const terms = await getExtractedVocabulary(country);
+      const limit = Math.max(1, Math.min(1000, parseInt(req.query.limit as string) || 300));
+      const terms = await getVocabularyPage(country, limit);
       res.json(terms);
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -670,7 +685,8 @@ async function startServer() {
   // Canonical Phase F view. The legacy vocabulary endpoint remains compatible.
   app.get('/api/query-intelligence/terminology', async (req, res) => {
     try {
-      res.json(await getTerminologyDashboard(req.query.country as string | undefined));
+      const limit = Math.max(1, Math.min(1000, parseInt(req.query.limit as string) || 200));
+      res.json(await getTerminologyDashboardPage(req.query.country as string | undefined, limit));
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }

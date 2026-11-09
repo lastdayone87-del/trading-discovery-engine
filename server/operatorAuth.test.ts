@@ -4,6 +4,10 @@ import { authenticate, operatorAuthorization, routePolicyInventory, validateOper
 test('Phase 12 diagnostics and materialization routes are governed',()=>{
  assert.ok(routePolicyInventory.some(r=>r.method==='GET'&&r.pattern.includes('discovery\\/evaluation')));
  assert.ok(routePolicyInventory.some(r=>r.method==='POST'&&r.pattern.includes('evaluation\\/snapshots')));
+ // The dashboard summary is a small bounded projection; it must use the same
+ // authenticated read policy as the heavy list endpoints.
+ const summary = routePolicyInventory.find(r => r.method === 'GET' && new RegExp(r.pattern).test('/api/query-intelligence/summary'));
+ assert.equal(summary?.policy, 'operator');
 });
 
 test('maps admin, operator, and transitional reviewer credentials without exposing tokens',()=>{

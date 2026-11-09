@@ -32,6 +32,17 @@ interface Props {
   onManualCycleTriggered?: () => void;
 }
 
+interface QueryIntelligenceSummary {
+  queryCount: number;
+  provenCount: number;
+  experimentalCount: number;
+  rejectedCount: number;
+  vocabularyCount: number;
+  terminologyCount: number;
+  searchEligibleTerminologyCount: number;
+  executionLogCount: number;
+}
+
 interface QualityDashboardRun {
   runId: string;
   queryId: number;
@@ -76,6 +87,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
   const [extractedVocabulary, setExtractedVocabulary] = useState<ExtractedTermRecord[]>([]);
   const [terminology, setTerminology] = useState<CanonicalTradingTerm[]>([]);
   const [logs, setLogs] = useState<QueryExecutionLog[]>([]);
+  const [summary, setSummary] = useState<QueryIntelligenceSummary | null>(null);
   const [qualityDashboardState, setQualityDashboard] = useState<QualityDashboard | null>(null);
   const [qualityDashboardCountry, setQualityDashboardCountry] = useState<string | null>(null);
   // A failed dashboard request must surface as an error with retry, not leave
@@ -132,18 +144,26 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
     const requestId = ++fetchSequence.current;
     const qualityRequestId = ++qualitySequence.current;
     const requestCountry = selectedCountry;
-    const includeQuality = activeSubTabRef.current === 'quality';
+    const activeTab = activeSubTabRef.current;
+    const includeQuality = activeTab === 'quality';
+    const includeLibrary = activeTab === 'library';
+    const includeVocabulary = activeTab === 'vocabulary';
+    const includeTerminology = activeTab === 'vocabulary';
+    const includeLogs = activeTab === 'logs';
     try {
       const qualityUrl = requestCountry === 'All'
         ? '/api/query-intelligence/quality-dashboard'
         : `/api/query-intelligence/quality-dashboard?country=${encodeURIComponent(requestCountry)}`;
       // Isolate every request: a network failure in an unrelated projection
       // must not discard a healthy quality response and show the wrong error.
-      const [libRes, vocabRes, terminologyRes, logRes, statusRes, scopeRes, qualityRes] = await Promise.all([
-        apiFetch('/api/query-intelligence/library').catch(() => null),
-        apiFetch('/api/query-intelligence/vocabulary').catch(() => null),
-        apiFetch('/api/query-intelligence/terminology').catch(() => null),
-        apiFetch('/api/query-intelligence/logs').catch(() => null),
+      // Heavy lists are fetched only for the visible tab; the small summary
+      // supplies the tab counts even if a list request fails.
+      const [summaryRes, libRes, vocabRes, terminologyRes, logRes, statusRes, scopeRes, qualityRes] = await Promise.all([
+        apiFetch('/api/query-intelligence/summary').catch(() => null),
+        includeLibrary ? apiFetch('/api/query-intelligence/library?limit=500').catch(() => null) : Promise.resolve(null),
+        includeVocabulary ? apiFetch('/api/query-intelligence/vocabulary?limit=300').catch(() => null) : Promise.resolve(null),
+        includeTerminology ? apiFetch('/api/query-intelligence/terminology?limit=200').catch(() => null) : Promise.resolve(null),
+        includeLogs ? apiFetch('/api/query-intelligence/logs?limit=50').catch(() => null) : Promise.resolve(null),
         apiFetch('/api/query-intelligence/status').catch(() => null),
         apiFetch('/api/query-intelligence/scope').catch(() => null),
         includeQuality ? apiFetch(qualityUrl).catch(() => null) : Promise.resolve(null)
@@ -191,7 +211,8 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
       const read = (response: Response | null) => response?.ok
         ? response.json().catch(() => null)
         : Promise.resolve(null);
-      const [lib, vocab, terminologyData, logData, statusData, scopeData] = await Promise.all([
+      const [summaryData, lib, vocab, terminologyData, logData, statusData, scopeData] = await Promise.all([
+        read(summaryRes),
         read(libRes),
         read(vocabRes),
         read(terminologyRes),
@@ -201,6 +222,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
       ]);
       // Parsing is asynchronous too; re-check before committing the batch.
       if (requestId !== fetchSequence.current) return;
+      if (summaryData) setSummary(summaryData);
       if (lib) setQueries(lib);
       if (vocab) setExtractedVocabulary(vocab);
       if (terminologyData) setTerminology(terminologyData);
@@ -348,10 +370,15 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
     return matchCountry && matchCollection;
   });
 
-  // Calculate statistics
-  const provenCount = queries.filter(q => q.collection === 'PROVEN').length;
-  const experimentalCount = queries.filter(q => q.collection === 'EXPERIMENTAL').length;
-  const rejectedCount = queries.filter(q => q.collection === 'REJECTED').length;
+  // Calculate statistics. The small summary is authoritative for tab/KPI
+  // counts so a failed heavy-list request cannot render a false zero.
+  const provenCount = summary?.provenCount ?? queries.filter(q => q.collection === 'PROVEN').length;
+  const experimentalCount = summary?.experimentalCount ?? queries.filter(q => q.collection === 'EXPERIMENTAL').length;
+  const rejectedCount = summary?.rejectedCount ?? queries.filter(q => q.collection === 'REJECTED').length;
+  const queryCount = summary?.queryCount ?? queries.length;
+  const vocabularyCount = summary?.vocabularyCount ?? extractedVocabulary.length;
+  const terminologyCount = summary?.terminologyCount ?? terminology.length;
+  const logCount = summary?.executionLogCount ?? logs.length;
 
   return (
     <div className="space-y-6">
@@ -598,7 +625,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
               <BookOpen className="w-3.5 h-3.5 text-indigo-400" />
               <span>Extracted Local Terms</span>
             </div>
-            <div className="text-lg font-black font-mono text-indigo-300">{extractedVocabulary.length}</div>
+            <div className="text-lg font-black font-mono text-indigo-300">{vocabularyCount}</div>
           </div>
         </div>
       </div>
@@ -616,7 +643,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
               }`}
             >
               <Layers className="w-3.5 h-3.5" />
-              <span>Query Library ({queries.length})</span>
+              <span>Query Library ({queryCount})</span>
             </button>
 
             <button
@@ -628,7 +655,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
               }`}
             >
               <BookOpen className="w-3.5 h-3.5" />
-              <span>Terminology Intelligence ({terminology.length})</span>
+              <span>Terminology Intelligence ({terminologyCount})</span>
             </button>
 
             <button
@@ -652,7 +679,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
               }`}
             >
               <History className="w-3.5 h-3.5" />
-              <span>Discovery Cycle History ({logs.length})</span>
+              <span>Discovery Cycle History ({logCount})</span>
             </button>
           </div>
 
@@ -790,6 +817,9 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
           <div className="space-y-4">
             <p className="text-xs text-slate-500 dark:text-slate-400">
               Canonical terminology is learned from durable production evidence. Promotion requires creator and community diversity; search performance is time-decayed and all lifecycle changes remain auditable.
+            </p>
+            <p className="text-[11px] text-slate-400 dark:text-slate-500">
+              Showing the top {terminology.length} of {terminologyCount} canonical terms. The summary count is independent of this bounded list request.
             </p>
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
               {terminology.length === 0 ? (
