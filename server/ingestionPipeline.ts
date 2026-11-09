@@ -30,7 +30,7 @@ import { LANGUAGE_KNOWLEDGE_PACKS } from './evidenceEngine/knowledgePacks';
 import { observeProductionDiagnosticReliably, observeRetrievalAssignmentReliably } from './phaseBObservationOutbox';
 import { buildDecisionEvaluationSamplingPolicy } from './decisionEvaluationSamplingPolicy';
 import { ACTIONS, deriveVitalityScheduling, planAndRecordEvidenceAction, type EvidenceActionType, type EvidenceActionPlan } from './voiEvidenceController';
-import { INVESTIGATION_POLICY_VERSION, retryInvestigationStep, scheduleInvestigationStep } from './investigationWorkflow';
+import { INVESTIGATION_POLICY_VERSION, failInvestigationStep, retryInvestigationStep, scheduleInvestigationStep } from './investigationWorkflow';
 import {assignRelease5Serving} from './release5/rollout';
 import { deterministicUuid, entityChecksum, observeYouTubeChannelEntity, sourceFamilyIdentity } from './entityResolution';
 import { enrichmentOperationalFailure, hasDecisionGradeEvidenceWithoutFailedProviders, manualRecheckDegradedError } from './enrichmentOperationalFailure';
@@ -1014,7 +1014,22 @@ async function processChannelThroughPipelineInContext(
             try{if(await retryInvestigationStep({investigationId:retryInvestigationId,stepId:retryStepId}))retryLinkage={investigationId:retryInvestigationId,investigationStepId:retryStepId};}
             catch(error){console.warn(`[Investigation] Failed to reopen step for ${candidate.channelId}; retrying without workflow linkage:`,error instanceof Error?error.message:error);}
           }
-          enqueued=await enqueueEnrichment(retryLinkage);
+          try{
+            enqueued=await enqueueEnrichment(retryLinkage);
+            if(retryLinkage&&enqueued?.reopen_blocked===true&&existing){
+              // The reopen guard refused the terminal owner. Restore the
+              // blocked projection so the investigation does not stay ACTIVE
+              // with a RETRYING step and no runnable job.
+              await failInvestigationStep({investigationId:retryInvestigationId,stepId:retryStepId,jobId:existing.id,attempt:Number(existing.attempts||0),terminal:true,failureClass:'RETRY_NOT_ADMITTED'})
+                .catch(error=>console.warn(`[Investigation] Failed to restore blocked step for ${candidate.channelId}:`,error instanceof Error?error.message:error));
+            }
+          }catch(error){
+            if(retryLinkage&&existing){
+              await failInvestigationStep({investigationId:retryInvestigationId,stepId:retryStepId,jobId:existing.id,attempt:Number(existing.attempts||0),terminal:true,failureClass:'RETRY_ENQUEUE_FAILED'})
+                .catch(restoreError=>console.warn(`[Investigation] Failed to restore blocked step for ${candidate.channelId}:`,restoreError instanceof Error?restoreError.message:restoreError));
+            }
+            throw error;
+          }
         }
         else{
           try{await scheduleInvestigationStep({investigationId:candidate.investigationId,channelId:candidate.channelId,diagnosticId:classificationDiagnosticId,actionType:appliedAction,jobType:'ENRICH_CHANNEL',jobPayload:payload,priority,maxAttempts:4,idempotencyKey:enrichmentKey,policyVersion:INVESTIGATION_POLICY_VERSION,utilityContractVersion:'utility-constraints-v1',deadlineMinutes:Number(await getAppSetting('investigation_deadline_minutes','30'))||30});}
@@ -1025,23 +1040,24 @@ async function processChannelThroughPipelineInContext(
         // The stable same-stage pass is already terminal. Project the honest
         // terminal state, but update only the committed row's scan status so
         // a concurrent recovery/recheck cannot be overwritten by this stale
-        // snapshot. A later-stage job still owns the channel. If the check
-        // itself fails, project the blocked owner's honest terminal state:
-        // leaving ENRICHMENT_PENDING with no runnable job is worse, and an
-        // active worker will reassert its own marker when it finishes.
-        let hasOtherActiveEnrichmentJob=false;
-        try{
-          const active=await (await getDb()).query(`SELECT 1 FROM jobs WHERE type='ENRICH_CHANNEL' AND status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$1 AND ($2::uuid IS NULL OR id<>$2::uuid) LIMIT 1`,[candidate.channelId,options?.jobId||null]);
-          hasOtherActiveEnrichmentJob=Boolean(active.rowCount);
-        }catch(error){console.warn(`[Enrichment] active-job check failed for ${candidate.channelId}; projecting the blocked owner terminal:`,error instanceof Error?error.message:error);}
+        // snapshot. The same UPDATE excludes a later-stage active job under
+        // the row lock, which is atomic: no read failure can leave the
+        // channel ENRICHMENT_PENDING without a runnable job.
         // A blocked FAILED job is FAILED, never COMPLETED.
-        const blocked=resolveEnrichmentReopenBlockedLifecycle(authoritativeChannel,{blockedJobStatus:enqueued.status,hasOtherActiveEnrichmentJob});
+        const blocked=resolveEnrichmentReopenBlockedLifecycle(authoritativeChannel,{blockedJobStatus:enqueued.status,hasOtherActiveEnrichmentJob:false});
         if(blocked.scanStatus!==authoritativeChannel.scan_status){
           const db=await getDb();
           await db.query(
-            `UPDATE channels SET scan_status=$2,last_checked=$3,updated_at=now()
-              WHERE channel_id=$1 AND scan_status = ANY($4::text[])`,
-            [candidate.channelId,blocked.scanStatus,now,['ENRICHMENT_PENDING','ENRICHING','LOCKED']],
+            `UPDATE channels c SET scan_status=$2,last_checked=$3,updated_at=now()
+              WHERE c.channel_id=$1 AND c.scan_status = ANY($4::text[])
+                AND NOT EXISTS (
+                  SELECT 1 FROM jobs j
+                   WHERE j.type='ENRICH_CHANNEL'
+                     AND j.status IN ('PENDING','PROCESSING')
+                     AND j.payload->>'channelId'=c.channel_id
+                     AND ($5::uuid IS NULL OR j.id<>$5::uuid)
+                )`,
+            [candidate.channelId,blocked.scanStatus,now,['ENRICHMENT_PENDING','ENRICHING','LOCKED'],options?.jobId||null],
           );
           const refreshed=await getChannelById(candidate.channelId);
           if(refreshed)Object.assign(authoritativeChannel,refreshed);
