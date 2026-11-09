@@ -211,7 +211,7 @@ export function inferDiscordOwnership(candidate:DiscordCandidate,input:{creatorN
     .filter(Boolean));
   if(creatorVideoPages.size>=2){score+=15;reasons.push('REPEATED_CREATOR_VIDEO_OBSERVATION');}
 
-  if(surfaces.size>=2&&[...surfaces].some(surface=>surface==='YOUTUBE_ABOUT'||surface==='CHANNEL_EXTERNAL_LINKS'||surface==='PINNED_COMMENT'||surface==='RECENT_VIDEO_DESCRIPTIONS')){
+  if(surfaces.size>=2&&[...surfaces].some(surface=>surface==='YOUTUBE_ABOUT'||surface==='CHANNEL_EXTERNAL_LINKS'||surface==='RECENT_VIDEO_DESCRIPTIONS')){
     score+=15;reasons.push('CROSS_CREATOR_SURFACE_CORROBORATION');
   }
 

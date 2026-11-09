@@ -69,6 +69,13 @@ test('L1 a link found in the pinned comment still flows through the crawler', as
 
   assert.equal(result.foundInvite, 'link-room');
   assert.ok(fetched.some(url => url.includes('linktr.ee/l1creator')));
+  const candidate = result.discordCandidates?.find(item => item.nativeInviteCode === 'link-room');
+  assert.ok(
+    candidate?.observations?.some(observation =>
+      observation.sourceSurface === 'PINNED_COMMENT'
+      && observation.sourceUrl === 'https://linktr.ee/l1creator'),
+    'the crawled invite must retain the pinned-comment seed provenance',
+  );
   assert.equal(result.steps.find(item => item.step === 'PINNED_COMMENT')?.status, 'NOT_FOUND');
   assert.equal(result.steps.find(item => item.step === 'CUSTOM_DOMAINS')?.status, 'FOUND');
 });
@@ -89,6 +96,9 @@ test('L1 a pinned Discord server page keeps PINNED_COMMENT on the resolved candi
 
   assert.equal(result.foundInvite, 'pinned-surface');
   assert.equal(result.discordCandidates?.[0]?.sourceSurface, 'PINNED_COMMENT');
+  assert.ok(result.acquisitionOutcomes?.some(outcome =>
+    outcome.surface === 'PINNED_COMMENT' && outcome.outcome === 'FOUND'),
+  'the acquisition ledger must keep pinned-comment provenance');
   assert.equal(result.steps.find(item => item.step === 'PINNED_COMMENT')?.status, 'NOT_FOUND');
   assert.equal(result.steps.find(item => item.step === 'DISCORD_SURFACES')?.status, 'FOUND');
 });
@@ -126,6 +136,23 @@ test('L1 pinned-comment ownership is provenance-distinct and corroborates across
   assert.equal(merged.length, 1);
   assert.equal(merged[0]?.ownershipStatus, 'CREATOR_OWNED');
   assert.ok(merged[0]?.ownershipReasons?.includes('CROSS_CREATOR_SURFACE_CORROBORATION'));
+
+  // A generic social profile or linked website must not be treated as
+  // identity corroboration merely because it carries the same invite.
+  for (const sourceSurface of ['SOCIAL_PROFILES', 'CREATOR_WEBSITES'] as const) {
+    const generic = makeDiscordCandidate({
+      locatorType: 'NATIVE_INVITE',
+      sourceSurface,
+      rawLocator: 'https://discord.gg/provenance-room',
+      nativeInviteCode: 'provenance-room',
+      normalizedLocator: 'https://discord.gg/provenance-room',
+      sourceUrl: sourceSurface === 'SOCIAL_PROFILES' ? 'https://instagram.com/random' : 'https://example.test/links',
+      extractionConfidence: 'EXPLICIT',
+    });
+    const genericMerged = mergeDiscordCandidates([pinned, generic], {});
+    assert.equal(genericMerged[0]?.ownershipStatus, 'UNCERTAIN', sourceSurface);
+    assert.ok(!genericMerged[0]?.ownershipReasons?.includes('CROSS_CREATOR_SURFACE_CORROBORATION'), sourceSurface);
+  }
 });
 
 test('L1 empty and invite-free pinned comments stay explicit', async () => {
