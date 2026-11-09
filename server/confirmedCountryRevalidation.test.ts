@@ -122,6 +122,6 @@ test('active-work detection covers community retries and can exclude the termina
   assert.match(source,/hasActiveEnrichmentJob\(channelId: string, excludeJobId\?: string \| null\)/);
   assert.match(source,/id <> \$3::uuid/);
   const pipeline=readFileSync(new URL('./ingestionPipeline.ts',import.meta.url),'utf8');
-  assert.match(pipeline,/hasActiveEnrichmentJob\(existing\.channel_id, options\?\.jobId\)/);
+  assert.match(pipeline,/hasActiveEnrichmentJob\(existing\.channel_id, options\?\.jobId\)/);assert.match(pipeline,/CLASSIFY_DISCOVERED_CHANNEL/);
   assert.match(pipeline,/lowAudienceGate\.shouldSkipDeepEnrichment && options\?\.forceClassification !== true/);
 });

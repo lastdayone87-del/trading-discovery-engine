@@ -1169,7 +1169,7 @@ async function processChannelThroughPipelineInContext(
           WHERE c.channel_id=$1 AND c.scan_status=$3
             AND NOT EXISTS (
               SELECT 1 FROM jobs j
-               WHERE j.type IN ('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION')
+               WHERE j.type IN ('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION','CLASSIFY_DISCOVERED_CHANNEL')
                  AND j.status IN ('PENDING','PROCESSING')
                  AND j.payload->>'channelId'=c.channel_id
                  AND ($4::uuid IS NULL OR j.id<>$4::uuid)
