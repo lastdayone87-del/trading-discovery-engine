@@ -1031,9 +1031,9 @@ test('Q6: zero-quota runs are separate, stop coverage is completed-only, compati
   assert.deepEqual(dashboard.selection.admissionRejections, [{ reason: 'SPECULATIVE_EVIDENCE_ONLY', count: 1 }]);
 });
 
-test('Q8: frozen benchmark guard requires authority v3 and triage v5, rejects older drift', () => {
+test('Q8: frozen benchmark guard requires authority v3 and triage v6, rejects older drift', () => {
   assert.equal(AUTONOMOUS_QUERY_AUTHORITY_POLICY_VERSION, 'autonomous-query-authority-v3');
-  assert.equal(CANDIDATE_TRIAGE_POLICY_VERSION, 'candidate-triage-v5-latin-market-finance');
+  assert.equal(CANDIDATE_TRIAGE_POLICY_VERSION, 'candidate-triage-v6-intake-trading-focus');
   assert.doesNotThrow(() => verifyFrozenBenchmarkVersions());
   assert.throws(
     () => verifyFrozenBenchmarkVersions({ candidateTriage: 'candidate-triage-v4-contextual-admission' }),

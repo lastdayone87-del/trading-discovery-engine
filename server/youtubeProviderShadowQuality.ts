@@ -12,7 +12,7 @@ export type RetrievalFreshnessBucket = 'LE_30D' | 'LE_90D' | 'LE_365D' | 'LE_730
 
 export interface ProviderShadowCandidateQuality {
   channelId?: string;
-  tradingRoutingDisposition: 'PLAUSIBLE_TRADING_HYPOTHESIS' | 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS' | 'NOT_APPLICABLE';
+  tradingRoutingDisposition: 'PLAUSIBLE_TRADING_HYPOTHESIS' | 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS' | 'DEFER_NO_CONFIDENT_EVIDENCE' | 'NOT_APPLICABLE';
   matchedSignals: string[];
   freshnessBucket: RetrievalFreshnessBucket;
   matchedVideoAgeDays: number | null;
@@ -24,6 +24,7 @@ export interface ProviderShadowQualitySummary {
   candidatesEvaluated: number;
   plausibleTradingCandidates: number;
   withheldCandidates: number;
+  deferredCandidates: number;
   candidatesWithTradingSignals: number;
   knownFreshnessCandidates: number;
   recent30d: number;
@@ -91,6 +92,7 @@ export function summarizeProviderShadowQuality(items: ProviderShadowCandidateQua
     candidatesEvaluated: items.length,
     plausibleTradingCandidates: items.filter(item => item.tradingRoutingDisposition === 'PLAUSIBLE_TRADING_HYPOTHESIS').length,
     withheldCandidates: items.filter(item => item.tradingRoutingDisposition === 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS').length,
+    deferredCandidates: items.filter(item => item.tradingRoutingDisposition === 'DEFER_NO_CONFIDENT_EVIDENCE').length,
     candidatesWithTradingSignals: items.filter(item => item.matchedSignals.length > 0).length,
     knownFreshnessCandidates: items.filter(item => item.freshnessBucket !== 'UNKNOWN').length,
     recent30d,

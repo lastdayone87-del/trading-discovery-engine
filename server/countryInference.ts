@@ -464,7 +464,7 @@ export const AGGREGATED_CONTENT_LANGUAGES: Record<string, AggregatedLanguageDefi
     scripts: ['Devanagari'],
     scriptNeedsCorroboration: true,
     wordKeywords: { words: ['है', 'हैं', 'हूँ', 'था', 'थी', 'थे', 'यह', 'ये', 'वह', 'वे', 'क्या', 'मैं', 'हम', 'मुझे', 'नहीं', 'वाला', 'वाले', 'वाली', 'करना', 'करता', 'करते', 'होगा', 'होगी', 'चाहिए', 'सकते', 'सकता'], minHits: 2 },
-    vetoWords: ['छ', 'छन्', 'छैन', 'होइन', 'थियो', 'थिइन्', 'नेप्से', 'लागि', 'बाट', 'तपाईं', 'तपाई', 'हामी', 'गरेको', 'भएको', 'हुने']
+    vetoWords: ['छ', 'छन्', 'छैन', 'होइन', 'थियो', 'थिइन्', 'नेप्से', 'लागि', 'बाट', 'तपाईं', 'तपाई', 'हामी', 'गरेको', 'भएको', 'हुने', 'आहे', 'आणि', 'नाही', 'मध्ये', 'साठी', 'मला', 'तुम्ही', 'आम्ही', 'मराठी']
   },
   Bengali: {
     // Bengali script is unique to Bengali/Assamese (Bangladesh/India, excluded).
@@ -475,6 +475,48 @@ export const AGGREGATED_CONTENT_LANGUAGES: Record<string, AggregatedLanguageDefi
     countries: ['Pakistan', 'India'],
     scripts: ['Arabic'],
     arabicMarkers: '\u0688\u0679\u0691\u06be\u06c1\u06d2'
+  },
+  Marathi: {
+    // Devanagari is shared with Hindi and Nepali. Marathi-specific function
+    // words are required; Hindi and Nepali veto words keep the sibling
+    // languages from stealing the vote. A bare script match abstains.
+    countries: ['India'],
+    scripts: ['Devanagari'],
+    scriptNeedsCorroboration: true,
+    wordKeywords: { words: ['आहे', 'आणि', 'नाही', 'मध्ये', 'साठी', 'मला', 'तुम्ही', 'आम्ही', 'झाले', 'मराठी', 'करा', 'होते'], minHits: 2 },
+    vetoWords: ['है', 'हैं', 'हूँ', 'यह', 'ये', 'वह', 'वे', 'क्या', 'मैं', 'हम', 'मुझे', 'नहीं', 'चाहिए', 'सकते', 'सकता', 'छ', 'छन्', 'छैन', 'होइन', 'नेप्से', 'तपाईं']
+  },
+  Gujarati: {
+    // Gujarati script is unique to Gujarati; no shared-script corroboration
+    // is required beyond the script itself.
+    countries: ['India'],
+    scripts: ['Gujarati']
+  },
+  Telugu: {
+    countries: ['India'],
+    scripts: ['Telugu']
+  },
+  Kannada: {
+    countries: ['India'],
+    scripts: ['Kannada']
+  },
+  Malayalam: {
+    countries: ['India'],
+    scripts: ['Malayalam']
+  },
+  Punjabi: {
+    countries: ['India', 'Pakistan'],
+    scripts: ['Gurmukhi']
+  },
+  Nepali: {
+    countries: ['Nepal'],
+    scripts: ['Devanagari'],
+    scriptNeedsCorroboration: true,
+    wordKeywords: { words: ['छ', 'छन्', 'छैन', 'होइन', 'थियो', 'थिइन्', 'नेप्से', 'लागि', 'बाट', 'तपाईं', 'तपाई', 'हामी', 'गरेको', 'भएको', 'हुने'], minHits: 2 }
+  },
+  Sinhala: {
+    countries: ['Sri Lanka'],
+    scripts: ['Sinhala']
   }
 };
 
@@ -782,7 +824,16 @@ export function assessChannelCountry(
   // below but is excluded from this decision by construction.
   if (!evidence.some(item => item.source === 'OFFICIAL_YOUTUBE_METADATA' || item.source === 'CHANNEL_ABOUT_BIO')) {
     if (input.videoDescriptionsAuthoritative === true) {
-      const aggregated = aggregateContentLanguage(input.videoDescriptions || [], input.playlists || []);
+      // The channel About/bio is creator-written and independent of the
+      // retrieval-selected snippet. Count it as one additional language sample
+      // so a channel with seven authoritative video descriptions plus a bio
+      // can meet the evidence floor; a bio alone still cannot reject.
+      const nonEmptyBio = String(input.aboutBio || '').trim();
+      const languageSamples = [
+        ...(input.videoDescriptions || []),
+        ...(nonEmptyBio ? [nonEmptyBio] : []),
+      ];
+      const aggregated = aggregateContentLanguage(languageSamples, input.playlists || []);
       if (aggregated) {
         const isLiveExcluded = (country: string): boolean =>
           findCountryExclusion(country, exclusions) !== null;
@@ -865,6 +916,31 @@ export function assessChannelCountry(
   const exclusionAuthority = decisiveEvidence.every(item => item.detectedCountry === detectedCreatorCountry) &&
     decisivePriority <= 3 && topConfidence >= 85 && !conflict &&
     decisiveEvidence.some(item => !item.domicileMention);
+
+  // A detected excluded country whose evidence is only mention-grade or
+  // indirect must not be laundered into CONFIRMED + ALLOW_NORMAL. It also must
+  // not be hard-rejected: a bare country name or a market reference is not
+  // domicile. Route it to review. This is the guard that prevents the
+  // "CONFIRMED India / ALLOW_NORMAL" contradiction while preserving legitimate
+  // international channels that merely cover a market.
+  if (excluded && !exclusionAuthority) {
+    const weakStatus: CountryStatus = confidence >= 60 ? 'LIKELY' : 'UNCERTAIN';
+    return {
+      discoveryCountry,
+      detectedCreatorCountry,
+      // Do not append an EXCLUSION_POLICY evidence item here: exchange-only
+      // and mention-grade evidence must remain visibly non-terminal. The
+      // review disposition and reasoning carry the policy context without
+      // turning indirect evidence into an exclusion finding.
+      countryEvidence: evidence,
+      countryStatus: weakStatus,
+      evidenceAvailability,
+      gateDisposition: 'NEEDS_REVIEW',
+      confidence,
+      reasoning: `${detectedCreatorCountry} is excluded by policy (${excluded.reason}), but the available evidence is mention-grade or indirect. Review is required before enrichment.`,
+      decisiveEvidence
+    };
+  }
 
   if (excluded && exclusionAuthority) {
     const policy: CountryInferenceEvidence = {

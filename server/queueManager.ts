@@ -106,7 +106,7 @@ import {
 import { resolveJobQuotaOrigin } from './quotaOrigin';
 import { isProbeQuotaControlError, YouTubeKeyCapUnavailableError } from './quotaKeyCapShadow';
 import { isYouTubeQuotaAccountingError } from './youtubeKeyHealth';
-import { assertCountryAllowed, ExcludedCountryError, getCountryExclusion, shouldBlockEnrichClaimForCountry } from './countryExclusion';
+import { assertCountryAllowed, ExcludedCountryError, getCountryExclusion, shouldBlockEnrichClaimForCountry, shouldReviewEnrichClaimForCountry } from './countryExclusion';
 import { randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
 import { computeEffectivePageBudget, evaluateContinuation, evaluateContinuationV2, planPersistedPageRecovery, resumeModeForProvider, shouldCreateContinuationSegment, type ContinuationDecisionV2, type ContinuationResumeMode } from './continuationPolicy';
@@ -1671,6 +1671,34 @@ export async function processNextSearchJob(
           console.warn(JSON.stringify({event:'excluded_channel_blocked',channelId,targetCountry,detectedCountry:channel.country,reason:claimBlock.reason,context:`enrichment_claim:${job.id}`,timestamp:claimNow}));
           if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SKIPPED',resultingStatus:channel.trading_status,providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'COUNTRY_POLICY_CHANGED'}).catch(()=>undefined);
           if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:'POLICY_REJECTED',output:{reason:'COUNTRY_POLICY_CHANGED'}});else await completeJob(job.id);
+          return true;
+        }
+      }
+
+      // A LIKELY excluded creator country is not domicile-grade proof, so it
+      // must not be hard-rejected; it is also not safe to spend enrichment
+      // quota. Park the channel for review before the ENRICHING transition.
+      if (channel.country_status === 'LIKELY' && channel.country) {
+        const creatorExclusion = await getCountryExclusion(channel.country);
+        const reviewBlock = shouldReviewEnrichClaimForCountry(channel.country_status, channel.country, creatorExclusion);
+        if (reviewBlock) {
+          const reviewNow = new Date().toISOString();
+          channel.scan_status = 'NEEDS_REVIEW';
+          channel.trading_status = 'NEEDS_REVIEW';
+          channel.last_checked = reviewNow;
+          channel.inspection_trail = [
+            ...(channel.inspection_trail || []),
+            {
+              step: 'COUNTRY_VALIDATION',
+              title: `Country Exclusion Review (${channel.country})`,
+              status: 'PARTIAL',
+              details: `${channel.country} is likely excluded by policy (${reviewBlock.reason}); enrichment held for review instead of quota spend.`,
+              timestamp: reviewNow,
+            },
+          ];
+          await upsertChannel(channel);
+          console.warn(JSON.stringify({event:'excluded_channel_review_held',channelId,targetCountry,detectedCountry:channel.country,reason:reviewBlock.reason,context:`enrichment_claim:${job.id}`,timestamp:reviewNow}));
+          await completeJob(job.id);
           return true;
         }
       }

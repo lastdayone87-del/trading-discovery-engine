@@ -366,6 +366,53 @@ export async function revalidateConfirmedCountryForPreservedRow(
   }
 }
 
+function buildDeferredTradingReviewChannel(
+  candidate: IngestionCandidate,
+  existing: ChannelRecord | undefined,
+  source: DiscoverySource,
+  now: string,
+  reasonCodes: string[],
+): ChannelRecord {
+  const channel: ChannelRecord = existing ? { ...existing } : {
+    channel_id: candidate.channelId,
+    channel_name: candidate.channelName,
+    youtube_url: candidate.youtubeUrl,
+    country: '',
+    country_status: 'UNCERTAIN',
+    confidence_score: 0,
+    discord_status: 'UNCERTAIN',
+    discord_invite: null,
+    scan_status: 'NEEDS_REVIEW',
+    scan_attempts: 0,
+    discovery_source: source,
+    first_seen: now,
+    last_checked: now,
+    inspection_trail: [],
+    subscriber_count: candidate.subscriberCount,
+    channel_thumbnail_url: candidate.channelThumbnailUrl || `https://ui-avatars.com/api/?name=${encodeURIComponent(candidate.channelName)}&background=0f172a&color=38bdf8&bold=true`,
+    trading_status: 'NEEDS_REVIEW',
+  };
+  channel.trading_status = 'NEEDS_REVIEW';
+  channel.scan_status = 'NEEDS_REVIEW';
+  channel.last_checked = now;
+  channel.scan_attempts = existing?.scan_attempts || 0;
+  if (!channel.country_status) channel.country_status = 'UNCERTAIN';
+  if (!channel.country) channel.country = '';
+  if (!channel.confidence_score) channel.confidence_score = 0;
+  channel.inspection_trail = [
+    ...(existing?.inspection_trail || []),
+    {
+      step: 'BIO',
+      title: 'Trading focus deferred for review',
+      status: 'PARTIAL',
+      details: `Insufficient evidence to spend enrichment quota: ${reasonCodes.join(', ')}`,
+      timestamp: now,
+    },
+  ];
+  applyCandidateObservability(channel, candidate);
+  return channel;
+}
+
 export async function processChannelThroughPipeline(
   candidate: IngestionCandidate,
   targetCountry: string,
@@ -583,6 +630,35 @@ async function processChannelThroughPipelineInContext(
         countryStatus:'UNCERTAIN', tradingStatus:'UNCERTAIN', discordStatus:'NOT_FOUND', discordInvite:null, channelRecord:undefined
       };
     }
+  }
+
+  // A DEFER is not a rejection. The cheap evidence is insufficient to justify
+  // enrichment, but the channel may still be a genuine creator in an
+  // unfamiliar language or a sparse surface. Persist it as NEEDS_REVIEW and
+  // do not enqueue ENRICH_CHANNEL; a later rediscovery/review carries fresh
+  // evidence without spending provider quota on a guess.
+  if (retrievalTriage.disposition === 'DEFER_NO_CONFIDENT_EVIDENCE') {
+    console.log(`[Unified Ingestion Pipeline - Triage] Deferring '${candidate.channelName}' to review: ${retrievalTriage.reasonCodes.join(', ')}.`);
+    void recordAdmissionShadow({
+      channelId:candidate.channelId, priorState:'NOT_EVALUATED', classificationStatus:'UNCERTAIN', investigationState:'DEFERRED',
+      candidateHypothesis:{plausibleTradingHypothesis:false,triagePolicyVersion:CANDIDATE_TRIAGE_POLICY_VERSION,matchedSignals:retrievalTriage.matchedSignals},
+      evidenceCoverage:{stage:'RETRIEVAL_TRIAGE',reasonCodes:retrievalTriage.reasonCodes,enrichmentStage:candidate.enrichmentStage||0}
+    }).catch(error=>console.warn(`[CandidateAdmission] retrieval-triage shadow write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
+    const reviewChannel = buildDeferredTradingReviewChannel(candidate, existing, source, now, retrievalTriage.reasonCodes);
+    await upsertChannel(reviewChannel);
+    return {
+      channelId: candidate.channelId,
+      channelName: candidate.channelName,
+      isNew: !existing,
+      wasKnown: !!existing,
+      persisted: true,
+      countryStatus: reviewChannel.country_status as IngestionPipelineOutcome['countryStatus'],
+      detectedCountry: reviewChannel.country || null,
+      tradingStatus: 'NEEDS_REVIEW',
+      discordStatus: 'UNCERTAIN',
+      discordInvite: null,
+      channelRecord: reviewChannel,
+    };
   }
 
   // Step 1: GATE 1 - Country Validation Hard Gate
