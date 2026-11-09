@@ -28,7 +28,7 @@ interface CacheEntry {
 export class ProviderCooldownReadCache {
   private readonly entries = new Map<string, CacheEntry>();
   private readonly inFlight = new Map<string, Promise<number | undefined>>();
-  private generation = 0;
+  private readonly versions = new Map<string, number>();
 
   constructor(private readonly ttlMs: number = PROVIDER_COOLDOWN_CACHE_TTL_MS) {
     if (!Number.isFinite(ttlMs) || ttlMs < 0) throw new Error('cooldown cache TTL must be non-negative');
@@ -47,9 +47,9 @@ export class ProviderCooldownReadCache {
     // not repopulate the cache. Retry once against the new generation; if the
     // state keeps changing, fail open without caching anything.
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const generation = this.generation;
+      const version = this.keyVersion(key);
       const value = await this.loadShared(key, loader);
-      if (this.generation !== generation) continue;
+      if (this.keyVersion(key) !== version) continue;
       const normalized = activeValue(value, nowMs);
       this.entries.set(key, { value: normalized, checkedAtMs: nowMs });
       return normalized;
@@ -68,14 +68,23 @@ export class ProviderCooldownReadCache {
     return pending;
   }
 
+  private keyVersion(key: string): number {
+    return this.versions.get(key) ?? 0;
+  }
+
+  private bump(key: string): void {
+    this.versions.set(key, this.keyVersion(key) + 1);
+    this.entries.delete(key);
+    this.inFlight.delete(key);
+  }
+
   invalidate(key?: string): void {
-    this.generation += 1;
     if (key === undefined) {
+      for (const current of new Set([...this.entries.keys(), ...this.inFlight.keys()])) this.bump(current);
       this.entries.clear();
       this.inFlight.clear();
     } else {
-      this.entries.delete(key);
-      this.inFlight.delete(key);
+      this.bump(key);
     }
   }
 
@@ -92,9 +101,27 @@ export class ProviderCooldownReadCache {
       this.invalidate();
       return;
     }
-    this.generation += 1;
-    for (const key of this.entries.keys()) if (key.startsWith(prefix)) this.entries.delete(key);
-    for (const key of this.inFlight.keys()) if (key.startsWith(prefix)) this.inFlight.delete(key);
+    for (const key of new Set([...this.entries.keys(), ...this.inFlight.keys()])) {
+      if (key.startsWith(prefix)) this.bump(key);
+    }
+  }
+
+  /**
+   * Invalidate the exact cooldown key(s) affected by one upstream event. A
+   * per-org event also invalidates the pool-wide read because that read
+   * aggregates every org; unaffected org entries remain cached.
+   */
+  invalidateProviderEvent(provider: string, orgId?: string | null): void {
+    if ((provider === 'gemini' || provider === 'groq') && orgId) {
+      this.bump(`${provider}:org:${orgId}`);
+      this.bump(`${provider}:pool`);
+      return;
+    }
+    if (provider === 'gemini-free') {
+      this.bump('gemini-free:pool');
+      return;
+    }
+    this.invalidateProvider(provider);
   }
 
   /** Test seam: number of entries currently cached. */
@@ -114,7 +141,7 @@ export const providerCooldownReadCache = new ProviderCooldownReadCache();
  * immediate. Local cooldown-deferral echoes are excluded by the caller; they
  * are backpressure observations, not new provider state.
  */
-export function invalidateProviderCooldownCache(provider?: string): void {
-  if (provider) providerCooldownReadCache.invalidateProvider(provider);
+export function invalidateProviderCooldownCache(provider?: string, orgId?: string | null): void {
+  if (provider) providerCooldownReadCache.invalidateProviderEvent(provider, orgId);
   else providerCooldownReadCache.invalidate();
 }

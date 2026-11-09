@@ -111,3 +111,22 @@ test('provider-scoped invalidation does not discard unrelated provider reads', a
   assert.equal(await cache.get('gemini:org:a', 1_100, async () => { geminiLoads += 1; return 8_000; }), 8_000);
   assert.equal(geminiLoads, 2);
 });
+
+test('an org-scoped rate-limit invalidates that org and the pool, not sibling orgs', async () => {
+  const cache = new ProviderCooldownReadCache(5_000);
+  const loads = new Map<string, number>();
+  const loader = (key: string, value: number) => async () => {
+    loads.set(key, (loads.get(key) || 0) + 1);
+    return value;
+  };
+  await cache.get('gemini:org:a', 1_000, loader('a', 10_000));
+  await cache.get('gemini:org:b', 1_000, loader('b', 11_000));
+  await cache.get('gemini:pool', 1_000, loader('pool', 12_000));
+  cache.invalidateProviderEvent('gemini', 'a');
+  assert.equal(await cache.get('gemini:org:a', 1_100, loader('a', 10_000)), 10_000);
+  assert.equal(await cache.get('gemini:org:b', 1_100, loader('b', 11_000)), 11_000);
+  assert.equal(await cache.get('gemini:pool', 1_100, loader('pool', 12_000)), 12_000);
+  assert.equal(loads.get('a'), 2);
+  assert.equal(loads.get('b'), 1, 'a sibling account keeps its cached cooldown');
+  assert.equal(loads.get('pool'), 2, 'the pool read includes the affected account');
+});
