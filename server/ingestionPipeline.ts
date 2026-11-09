@@ -1011,6 +1011,16 @@ async function processChannelThroughPipelineInContext(
           throw error;
         }
       };
+      const scheduleWorkflowOwner=async()=>{
+        const scheduled=await scheduleInvestigationStep({investigationId:candidate.investigationId,channelId:candidate.channelId,diagnosticId:classificationDiagnosticId,actionType:appliedAction,jobType:'ENRICH_CHANNEL',jobPayload:payload,priority,maxAttempts:4,idempotencyKey:enrichmentKey,policyVersion:INVESTIGATION_POLICY_VERSION,utilityContractVersion:'utility-constraints-v1',deadlineMinutes:Number(await getAppSetting('investigation_deadline_minutes','30'))||30});
+        // A failed owner needs its step restored before the job reopen. An
+        // already-claimed owner cannot accept a step and is reused through the
+        // idempotent queue path; a completed owner drives the blocked lifecycle
+        // projection.
+        if(scheduled.job.status==='FAILED')return enqueueWorkflowRetry(scheduled.job,scheduled.investigationId,scheduled.stepId);
+        if(!scheduled.stepId||scheduled.job.status!=='PENDING')return enqueueEnrichment();
+        return undefined;
+      };
       const workflowAssignment=await assignRelease5Serving('INVESTIGATION_WORKFLOW',candidate.channelId).catch(()=>({assigned:false,mode:'OFF'})),legacyWorkflowEnabled=await getAppSetting('investigation_workflow_enabled','false')==='true';
       let enqueued: Awaited<ReturnType<typeof enqueueJob>> | undefined;
       if(workflowAssignment.assigned||legacyWorkflowEnabled){
@@ -1029,17 +1039,15 @@ async function processChannelThroughPipelineInContext(
         else if(admission==='RETRY_FAILED'&&existing){
           enqueued=await enqueueWorkflowRetry(existing,String(existing.payload?.investigationId||''),String(existing.payload?.investigationStepId||''));
         }
-        else if(admission==='ENQUEUE_IDEMPOTENT')enqueued=await enqueueEnrichment();
+        else if(admission==='ENQUEUE_IDEMPOTENT'){
+          // The stable-key read failed, but the scheduler can still find and
+          // restore a failed workflow owner. Fall back to the idempotent queue
+          // only when scheduling itself fails.
+          try{enqueued=await scheduleWorkflowOwner();}
+          catch(error){if(candidate.investigationId)throw error;console.error(`[Investigation] Lookup-recovery scheduling failed for ${candidate.channelId}; using compatible queue fallback.`,error);enqueued=await enqueueEnrichment();}
+        }
         else{
-          try{
-            const scheduled=await scheduleInvestigationStep({investigationId:candidate.investigationId,channelId:candidate.channelId,diagnosticId:classificationDiagnosticId,actionType:appliedAction,jobType:'ENRICH_CHANNEL',jobPayload:payload,priority,maxAttempts:4,idempotencyKey:enrichmentKey,policyVersion:INVESTIGATION_POLICY_VERSION,utilityContractVersion:'utility-constraints-v1',deadlineMinutes:Number(await getAppSetting('investigation_deadline_minutes','30'))||30});
-            // A failed owner needs its step restored before the job reopen. An
-            // already-claimed owner cannot accept a step and is reused through
-            // the idempotent queue path; a completed owner drives the blocked
-            // lifecycle projection.
-            if(scheduled.job.status==='FAILED')enqueued=await enqueueWorkflowRetry(scheduled.job,scheduled.investigationId,scheduled.stepId);
-            else if(!scheduled.stepId||scheduled.job.status!=='PENDING')enqueued=await enqueueEnrichment();
-          }
+          try{enqueued=await scheduleWorkflowOwner();}
           catch(error){if(candidate.investigationId)throw error;console.error(`[Investigation] Initial transactional scheduling failed for ${candidate.channelId}; using compatible queue fallback.`,error);enqueued=await enqueueEnrichment();}
         }
       }else enqueued=await enqueueEnrichment();
