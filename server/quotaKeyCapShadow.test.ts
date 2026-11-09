@@ -199,7 +199,9 @@ test('capacity classification: permanent exhaustion, temporary leases, and insuf
   assert.equal(classifyKeyCapCapacity({ keyFingerprint: 'fp', settledUnits: 8_999, leaseUnits: 0, remainingUnits: 0 }, 1).state, 'AVAILABLE');
   assert.equal(classifyKeyCapCapacity({ keyFingerprint: 'fp', settledUnits: 9_000, leaseUnits: 0, remainingUnits: 0 }, 1).state, 'PERMANENTLY_EXHAUSTED');
   assert.equal(classifyKeyCapCapacity({ keyFingerprint: 'fp', settledUnits: 8_900, leaseUnits: 100, remainingUnits: 0 }, 50).state, 'TEMPORARILY_UNAVAILABLE');
-  assert.equal(classifyKeyCapCapacity({ keyFingerprint: 'fp', settledUnits: 8_500, leaseUnits: 0, remainingUnits: 0 }, 600).state, 'TEMPORARILY_UNAVAILABLE');
+  assert.equal(classifyKeyCapCapacity({ keyFingerprint: 'fp', settledUnits: 8_500, leaseUnits: 0, remainingUnits: 0 }, 600).state, 'INSUFFICIENT_UNTIL_RESET');
+  // Settling the 1-unit lease cannot make a 100-unit request fit.
+  assert.equal(classifyKeyCapCapacity({ keyFingerprint: 'fp', settledUnits: 8_950, leaseUnits: 1, remainingUnits: 0 }, 100).state, 'INSUFFICIENT_UNTIL_RESET');
 });
 
 test('pool summary returns one verdict: mixed availability, permanent-only, and lease-blocked', () => {
@@ -229,6 +231,17 @@ test('pool summary returns one verdict: mixed availability, permanent-only, and 
   assert.equal(leased.permanentlyExhaustedOnly, false);
   assert.equal(leased.retryAt, Math.min(leaseExpiry, now.getTime() + TEMPORARY_CAPACITY_RECHECK_MS));
 
+  // A request that can never fit on settled usage is not lease-recoverable;
+  // its lease must not drive a one-minute retry loop until the reset.
+  const insufficient = summarizeKeyCapPoolCapacity([
+    { keyFingerprint: 'fp-a', settledUnits: 8_950, leaseUnits: 1, remainingUnits: 0, earliestLeaseExpiryMs: leaseExpiry },
+  ], 100, now);
+  assert.equal(insufficient.poolExhausted, true);
+  assert.equal(insufficient.permanentlyExhaustedOnly, true);
+  assert.equal(insufficient.temporarilyUnavailable.length, 0);
+  assert.equal(insufficient.insufficientUntilReset.length, 1);
+  assert.equal(insufficient.retryAt, resetAt);
+
   // An expired lease is excluded by the snapshot query, so it contributes no
   // lease units and cannot hide capacity.
   const expired = summarizeKeyCapPoolCapacity([
@@ -253,7 +266,8 @@ test('preflight selection skips only keys that cannot serve the request', () => 
     { keyFingerprint: 'fp-a', settledUnits: 8_950, leaseUnits: 0, remainingUnits: 50 },
   ], 100, now);
   assert.deepEqual(insufficient.eligibleIndexes, []);
-  assert.equal(insufficient.summary.temporarilyUnavailable.length, 1);
+  assert.equal(insufficient.summary.temporarilyUnavailable.length, 0);
+  assert.equal(insufficient.summary.insufficientUntilReset.length, 1);
 
   // All exhausted returns no eligible keys, so callers raise exactly one
   // pool-level deferral instead of attempting every key and recording one
@@ -262,7 +276,14 @@ test('preflight selection skips only keys that cannot serve the request', () => 
   assert.deepEqual(none.eligibleIndexes, []);
   assert.equal(none.summary.poolExhausted, true);
 
-  const error = new YouTubeKeyPoolCapacityExhaustedError('2026-10-20', 100, 2, 1, insufficient.summary.retryAt);
+  const error = new YouTubeKeyPoolCapacityExhaustedError(
+    '2026-10-20',
+    100,
+    none.summary.permanentlyExhausted.length,
+    none.summary.temporarilyUnavailable.length,
+    none.summary.retryAt,
+    none.summary.insufficientUntilReset.length,
+  );
   assert.equal(error.code, 'YOUTUBE_KEY_POOL_CAPACITY_EXHAUSTED');
   assert.equal(error.keyCapExceeded, true);
   assert.equal(error.providerFailureRecorded, true);

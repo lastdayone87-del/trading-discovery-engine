@@ -175,11 +175,18 @@ export function isYouTubeKeyCapError(error: unknown): boolean {
  *  - AVAILABLE: remaining >= requested units.
  *  - PERMANENTLY_EXHAUSTED: settled usage alone has reached the cap; only the
  *    Pacific reset can restore capacity.
- *  - TEMPORARILY_UNAVAILABLE: settled usage is below the cap, but unexpired
- *    in-flight leases (or an otherwise insufficient remainder) leave less than
- *    the requested units. Lease settlement may restore capacity.
+ *  - TEMPORARILY_UNAVAILABLE: settled usage is below the cap and settling all
+ *    in-flight leases would leave enough room, so a lease release may restore
+ *    capacity.
+ *  - INSUFFICIENT_UNTIL_RESET: settled usage plus the request exceeds the cap
+ *    even with every lease released; only the reset (or a smaller request) can
+ *    make it fit.
  */
-export type KeyCapCapacityState = 'AVAILABLE' | 'PERMANENTLY_EXHAUSTED' | 'TEMPORARILY_UNAVAILABLE';
+export type KeyCapCapacityState =
+  | 'AVAILABLE'
+  | 'PERMANENTLY_EXHAUSTED'
+  | 'TEMPORARILY_UNAVAILABLE'
+  | 'INSUFFICIENT_UNTIL_RESET';
 
 export interface KeyCapCapacitySnapshot {
   keyFingerprint: string;
@@ -198,8 +205,9 @@ export interface KeyCapPoolCapacitySummary {
   availableKeyFingerprints: string[];
   permanentlyExhausted: KeyCapCapacityDecision[];
   temporarilyUnavailable: KeyCapCapacityDecision[];
+  insufficientUntilReset: KeyCapCapacityDecision[];
   poolExhausted: boolean;
-  /** True only when every exhausted key has settled at the cap. */
+  /** True when no key can recover before the Pacific reset. */
   permanentlyExhaustedOnly: boolean;
   /** Earliest re-check: lease settlement for temporary occupancy, else reset. */
   retryAt: number;
@@ -227,10 +235,12 @@ export class YouTubeKeyPoolCapacityExhaustedError extends Error {
     readonly permanentlyExhaustedKeys: number,
     readonly temporarilyUnavailableKeys: number,
     readonly retryAt: number,
+    readonly insufficientUntilResetKeys: number = 0,
   ) {
     super(
       `YouTube key pool has no capacity for ${requestUnits} units on ${quotaDay}: `
-      + `${permanentlyExhaustedKeys} permanently exhausted, ${temporarilyUnavailableKeys} temporarily unavailable; `
+      + `${permanentlyExhaustedKeys} permanently exhausted, ${temporarilyUnavailableKeys} temporarily unavailable, `
+      + `${insufficientUntilResetKeys} insufficient until reset; `
       + `retry after ${new Date(retryAt).toISOString()}.`,
     );
     this.name = 'YouTubeKeyPoolCapacityExhaustedError';
@@ -272,7 +282,11 @@ export async function readKeyCapCapacity(
   return result.rows.map(row => {
     const settledUnits = Math.max(0, Number(row.settled_units ?? 0));
     const leaseUnits = Math.max(0, Number(row.lease_units ?? 0));
-    const expiry = row.earliest_lease_expiry ? Date.parse(String(row.earliest_lease_expiry)) : undefined;
+    const expiry = row.earliest_lease_expiry instanceof Date
+      ? row.earliest_lease_expiry.getTime()
+      : row.earliest_lease_expiry
+        ? Date.parse(String(row.earliest_lease_expiry))
+        : undefined;
     return {
       keyFingerprint: String(row.key_fingerprint),
       settledUnits,
@@ -295,7 +309,9 @@ export function classifyKeyCapCapacity(
     ? 'AVAILABLE'
     : settledUnits >= capUnits
       ? 'PERMANENTLY_EXHAUSTED'
-      : 'TEMPORARILY_UNAVAILABLE';
+      : settledUnits + requestUnits <= capUnits
+        ? 'TEMPORARILY_UNAVAILABLE'
+        : 'INSUFFICIENT_UNTIL_RESET';
   return { ...snapshot, settledUnits, leaseUnits, remainingUnits, state };
 }
 
@@ -337,6 +353,7 @@ export function summarizeKeyCapPoolCapacity(
   const available = decisions.filter(decision => decision.state === 'AVAILABLE');
   const permanent = decisions.filter(decision => decision.state === 'PERMANENTLY_EXHAUSTED');
   const temporary = decisions.filter(decision => decision.state === 'TEMPORARILY_UNAVAILABLE');
+  const insufficient = decisions.filter(decision => decision.state === 'INSUFFICIENT_UNTIL_RESET');
   const leaseExpiries = temporary
     .map(decision => decision.earliestLeaseExpiryMs)
     .filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value > now.getTime());
@@ -351,6 +368,7 @@ export function summarizeKeyCapPoolCapacity(
     availableKeyFingerprints: available.map(decision => decision.keyFingerprint),
     permanentlyExhausted: permanent,
     temporarilyUnavailable: temporary,
+    insufficientUntilReset: insufficient,
     poolExhausted: available.length === 0,
     permanentlyExhaustedOnly: available.length === 0 && temporary.length === 0,
     retryAt,

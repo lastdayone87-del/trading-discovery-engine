@@ -269,6 +269,11 @@ test('probe allocation and per-key cap exhaustion defer without consuming an att
   const noHint = decideJobFailure({ code: 'YOUTUBE_KEY_POOL_CAPACITY_EXHAUSTED' }, 3, 3, now);
   assert.equal(noHint.disposition, 'RETRYING_WITHOUT_ATTEMPT');
   assert.equal(noHint.runAfter, getNextYouTubeQuotaResetAt(new Date(now)));
+
+  // A stale finite hint is re-checked shortly instead of parking until reset.
+  const stale = decideJobFailure({ code: 'YOUTUBE_KEY_POOL_CAPACITY_EXHAUSTED', retryAt: now - 1 }, 3, 3, now);
+  assert.equal(stale.disposition, 'RETRYING_WITHOUT_ATTEMPT');
+  assert.equal(stale.runAfter, now + 60_000);
 });
 
 test('normal allocation exhaustion keeps its transient age limit; probe markers do not', async () => {

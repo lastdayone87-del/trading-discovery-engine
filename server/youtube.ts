@@ -22,7 +22,9 @@ import {
   selectKeyCapEligibleIndexes,
   settleKeyCapReservation,
   SHADOW_OBSERVATION_BUDGET_MS,
+  summarizeKeyCapPoolCapacity,
   YouTubeKeyPoolCapacityExhaustedError,
+  type KeyCapCapacitySnapshot,
   type KeyCapReservationContext,
   type ProbeQuotaReservation,
   type QuotaSettlementContext,
@@ -284,9 +286,42 @@ function failedDispatchProviders(acquisition?: YouTubePoolAcquisition): Set<stri
   return failed;
 }
 
+/**
+ * The preflight is advisory, so it must never outlive the bounded atomic
+ * reservation it precedes. A stalled pool acquisition or query falls back to
+ * the existing rotation path, where reservation admission still fails closed.
+ */
+const KEY_CAP_PREFLIGHT_TIMEOUT_MS = 2_000;
+
+async function readKeyCapCapacityWithinDeadline(
+  keys: string[],
+  indexes: number[],
+  quotaDay: string,
+  now: Date,
+): Promise<KeyCapCapacitySnapshot[]> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new Error('YouTube key cap capacity preflight timed out.')),
+      KEY_CAP_PREFLIGHT_TIMEOUT_MS,
+    );
+  });
+  try {
+    return await Promise.race([
+      (async () => {
+        const db = await getDb();
+        return readKeyCapCapacity(db, quotaDay, indexes.map(index => fingerprintYouTubeKey(keys[index])), now);
+      })(),
+      deadline,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function availableKeyIndexes(keys: string[], requestUnits = 1): Promise<number[]> {
-  const indexes = keys.map((_key, index) => (activeKeyIndex + index) % keys.length)
-    .filter(index => youtubeProviderCooldown.eligible(keys[index]));
+  const rotation = keys.map((_key, index) => (activeKeyIndex + index) % keys.length);
+  const indexes = rotation.filter(index => youtubeProviderCooldown.eligible(keys[index]));
   if (!indexes.length) { throwIfAllProvidersCoolingDown(keys); return []; }
   let enforcement = false;
   try {
@@ -299,25 +334,46 @@ async function availableKeyIndexes(keys: string[], requestUnits = 1): Promise<nu
   // inside youtubeFetch still owns admission and fail-closed behavior.
   if (!enforcement) return indexes;
   try {
-    const db = await getDb();
     const now = new Date();
     const quotaDay = getYouTubeQuotaDay(now);
-    const fingerprints = indexes.map(index => fingerprintYouTubeKey(keys[index]));
-    const snapshots = await readKeyCapCapacity(db, quotaDay, fingerprints, now);
+    const fingerprintByIndex = new Map(rotation.map(index => [index, fingerprintYouTubeKey(keys[index])]));
+    // Read every key, not just the dispatchable ones: a cooling key with
+    // remaining quota can make work runnable before the Pacific reset, and its
+    // cooldown expiry must refine the deferred retry time.
+    const snapshots = await readKeyCapCapacityWithinDeadline(keys, rotation, quotaDay, now);
+    const snapshotByFingerprint = new Map(snapshots.map(snapshot => [snapshot.keyFingerprint, snapshot]));
+    const eligibleFingerprints = indexes.map(index => fingerprintByIndex.get(index)!);
+    const eligibleSnapshots = eligibleFingerprints
+      .map(fingerprint => snapshotByFingerprint.get(fingerprint))
+      .filter((snapshot): snapshot is KeyCapCapacitySnapshot => snapshot !== undefined);
+    // An incomplete snapshot must not be mistaken for an empty pool.
+    if (eligibleSnapshots.length !== indexes.length) return indexes;
     const { eligibleIndexes, summary } = selectKeyCapEligibleIndexes(
       indexes,
-      fingerprints,
-      snapshots,
+      eligibleFingerprints,
+      eligibleSnapshots,
       requestUnits,
       now,
     );
     if (summary.poolExhausted) {
+      const allAvailable = new Set(
+        summarizeKeyCapPoolCapacity(snapshots, requestUnits, now).availableKeyFingerprints,
+      );
+      const coolingRetryTimes = rotation
+        .filter(index => !youtubeProviderCooldown.eligible(keys[index]))
+        .filter(index => allAvailable.has(fingerprintByIndex.get(index)!))
+        .map(index => youtubeProviderCooldown.retryAt(keys[index]))
+        .filter(retryAt => retryAt > now.getTime());
+      const retryAt = coolingRetryTimes.length > 0
+        ? Math.min(summary.retryAt, ...coolingRetryTimes)
+        : summary.retryAt;
       throw new YouTubeKeyPoolCapacityExhaustedError(
         quotaDay,
         requestUnits,
         summary.permanentlyExhausted.length,
         summary.temporarilyUnavailable.length,
-        summary.retryAt,
+        retryAt,
+        summary.insufficientUntilReset.length,
       );
     }
     return eligibleIndexes;
@@ -1021,7 +1077,10 @@ export async function resolveYouTubeLocatorAuthoritatively(identity: string, typ
         // A permanent invalid input (deleted handle/video) will fail on every
         // key; one attempt is the authoritative answer.
         if (isYouTubePermanentInputError(error)) throw error;
-        if (attempt === keys.length - 1) throw error;
+        // The loop may run on a preflight-filtered subset; compare against the
+        // subset actually attempted so the final provider failure propagates
+        // instead of being reported as an empty resolution.
+        if (attempt === providerIndexes.length - 1) throw error;
       }
     }
     return null;
@@ -1528,10 +1587,9 @@ export async function fetchYouTubeChannelEnrichment(
   };
   // What the first attempt on a fresh key must be able to spend: one
   // channels.list (1) + one playlistItems.list (1), plus the stage-2
-  // playlist search (100) and optional video-details (1). Skip keys that
-  // cannot cover the full stage up front instead of rotating into a
-  // guaranteed 100-unit refusal.
-  const enrichmentRequestUnits = stage >= 2 ? 103 : 2;
+  // playlist search (100). The 1-unit videos.list follow-up is optional and
+  // degrades when it cannot be admitted, so it is not part of the gate.
+  const enrichmentRequestUnits = stage >= 2 ? 102 : 2;
   try { const providerIndexes=await availableKeyIndexes(keyPool, enrichmentRequestUnits); for (let attempt = 0; attempt < providerIndexes.length; attempt++) {
     const currentIndex = providerIndexes[attempt];
     const apiKey = keyPool[currentIndex];
@@ -1602,7 +1660,25 @@ export async function fetchYouTubeChannelEnrichment(
         }
         const playlistPayload=playlistsCheckpoint;
         playlists=playlistPayload.items.map((item:any)=>({id:item.id?.playlistId,name:String(item.snippet?.title||''),description:String(item.snippet?.description||'')})).filter((item:any)=>item.name);
-        if(ids){if(!videoDetailsCheckpoint){if(attempt>0)await topUp(1);const videoResponse=await youtubeFetch(buildYouTubeApiUrl('videos',apiKey,{part:'snippet',id:ids}),'enrichment-video-details',1,attempt+1,acquisition,priority,apiKey);await accountYouTubeQuotaResponse(videoResponse, 1);const videoDetailsPayload=await readYouTubeJsonObject(videoResponse,'enrichment-video-details');videoDetailsCheckpoint=videoDetailsPayload;}const byId=new Map(videoDetailsCheckpoint.items?.map((item:any)=>[item.id,item.snippet])||[]);videos=videos.map(video=>({...video,description:String((byId.get(video.id) as any)?.description||video.description||''),language:snippetLanguage(byId.get(video.id))}));}
+        if(ids){
+          if(!videoDetailsCheckpoint){
+            try {
+              if(attempt>0)await topUp(1);
+              const videoResponse=await youtubeFetch(buildYouTubeApiUrl('videos',apiKey,{part:'snippet',id:ids}),'enrichment-video-details',1,attempt+1,acquisition,priority,apiKey);
+              await accountYouTubeQuotaResponse(videoResponse, 1);
+              videoDetailsCheckpoint=await readYouTubeJsonObject(videoResponse,'enrichment-video-details');
+            } catch (error) {
+              // The mandatory stage is already paid for. A local cap refusal
+              // of this optional 1-unit details call must keep the playlist
+              // snippets instead of rotating keys and refetching the stage.
+              if (!isYouTubeKeyCapError(error)) throw error;
+            }
+          }
+          if(videoDetailsCheckpoint){
+            const byId=new Map(videoDetailsCheckpoint.items?.map((item:any)=>[item.id,item.snippet])||[]);
+            videos=videos.map(video=>({...video,description:String((byId.get(video.id) as any)?.description||video.description||''),language:snippetLanguage(byId.get(video.id))}));
+          }
+        }
       }
 
       // Channel-level provider language as fallback only, resolved through
@@ -1695,7 +1771,20 @@ export async function fetchYouTubeChannelCountryMetadata(channelId: string, fall
     if (isYouTubeQuarantinedInput(error)) return { ...fallback, countryMetadataStatus: 'UNAVAILABLE', countryMetadataCheckedAt: checkedAt };
   }
   let quotaExceededCount = 0;
-  try { const providerIndexes=await availableKeyIndexes(keys, 1); for (let attempt = 0; attempt < providerIndexes.length; attempt++) {
+  try {
+    // The keyless public About source is a valid fallback for this optional
+    // hydration. A pool-wide cap wait must degrade to UNAVAILABLE instead of
+    // aborting a paid ingestion candidate loop.
+    let providerIndexes: number[];
+    try {
+      providerIndexes = await availableKeyIndexes(keys, 1);
+    } catch (error) {
+      if (error instanceof YouTubeKeyPoolCapacityExhaustedError) {
+        return { ...fallback, countryMetadataStatus: 'UNAVAILABLE', countryMetadataCheckedAt: checkedAt };
+      }
+      throw error;
+    }
+    for (let attempt = 0; attempt < providerIndexes.length; attempt++) {
     const index = providerIndexes[attempt];
     try {
       const url = buildYouTubeApiUrl('channels',keys[index],{part:'snippet,brandingSettings,statistics',id:channelId});
