@@ -1132,6 +1132,14 @@ async function processChannelThroughPipelineInContext(
   // known low-audience channel must not pay for another deep inspection or
   // Discord crawl. Persist the classification result and stop here.
   if (existing && shouldStopDeepInspectionForForcedPass(options?.forceClassification === true, candidate.subscriberCount)) {
+    // Guard the whole policy snapshot: a concurrent operator recheck must not
+    // be overwritten by this classification snapshot.
+    const lowAudienceSnapshot = {
+      countryStatus: existing.country_status,
+      country: existing.country,
+      tradingStatus: existing.trading_status,
+      scanStatus: existing.scan_status,
+    };
     // Preserve a previously validated country when this pass has no new
     // country evidence; only replace it with a resolved result.
     const countryResolved = countryVal.status === 'CONFIRMED' || countryVal.status === 'LIKELY';
@@ -1147,10 +1155,20 @@ async function processChannelThroughPipelineInContext(
     existing.trading_confidence_score = tradingVal.confidenceScore;
     existing.trading_category = tradingVal.category;
     existing.trading_relevance_breakdown = tradingVal.breakdown;
-    existing.scan_status = tradingVal.status === 'NEEDS_REVIEW' ? 'NEEDS_REVIEW' : 'COMPLETED';
+    // A live enrichment owner keeps its pending marker; only an idle row is
+    // projected terminal by this classification-only stop.
+    let lowAudienceActiveOwner = false;
+    try { lowAudienceActiveOwner = await hasActiveEnrichmentJob(existing.channel_id, options?.jobId); } catch { lowAudienceActiveOwner = true; }
+    existing.scan_status = lowAudienceActiveOwner
+      ? existing.scan_status
+      : tradingVal.status === 'NEEDS_REVIEW' ? 'NEEDS_REVIEW' : 'COMPLETED';
     existing.last_checked = now;
     applyCandidateObservability(existing, candidate);
-    await upsertChannel(existing, { preserveDiscordOnUpdate: true });
+    const lowAudienceWritten = await upsertChannelWithResult(existing, { preserveDiscordOnUpdate: true, requireCountrySnapshot: lowAudienceSnapshot });
+    if (!lowAudienceWritten) {
+      const refreshed = await getChannelById(candidate.channelId);
+      if (refreshed) Object.assign(existing, refreshed);
+    }
     return {
       channelId: candidate.channelId,
       channelName: candidate.channelName,
