@@ -23,6 +23,7 @@ import {
   getQueryQuotaSpendRows,
   getQueryFailureStates,
   getInFlightPrimaryTermUsage,
+  getActiveQueryRunQueryIds,
   getQueryRunReward,
   isRetryableInfrastructureFailure
 } from './db';
@@ -1450,12 +1451,14 @@ async function buildSelectorPool(
   // selection is on the scheduler hot path and must not scale with 180 days of
   // run history. Zero-quota and provider-failed runs are excluded in the same
   // aggregate, matching the serving/dashboard reward definition.
-  const [qualityCounts, spendRows, failureStates, inFlightPrimary] = await Promise.all([
+  const [qualityCounts, spendRows, failureStates, inFlightPrimary, activeRunQueryIds] = await Promise.all([
     getQueryQualityDecayedCounts(country, undefined, DECAY_HALF_LIFE_DAYS),
     getQueryQuotaSpendRows(country),
     getQueryFailureStates(country),
     getInFlightPrimaryTermUsage(country, new Date(recentCutoff).toISOString()),
+    getActiveQueryRunQueryIds(country),
   ]);
+  const activeRunQueryIdSet = new Set(activeRunQueryIds);
   // A selection that has been scheduled but has not executed yet does not have
   // a `last_executed` timestamp. Count those in-flight uses too, otherwise a
   // primary term can be selected repeatedly before any run completes.
@@ -1527,6 +1530,7 @@ async function buildSelectorPool(
       maxPrimaryUses: options.maxPrimaryUses,
       consecutiveFailures: failure?.consecutiveFailures,
       backoffUntil: failure?.backoffUntil,
+      activeRunCount: activeRunQueryIdSet.has(query.id) ? 1 : 0,
     });
     if (!selectable.selectable) continue;
     eligible.push(query);

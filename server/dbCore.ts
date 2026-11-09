@@ -49,7 +49,7 @@ import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, providerSnapshotFromRegistry
 import { fingerprintYouTubeKey, projectYouTubeQuotaUsage } from './youtubeQuotaAttribution';
 import { sanitizeSchedulingError, type DiscoveryCandidateDiagnosticPatch } from './discoveryTelemetry';
 import { classifyProviderCapacityFailure, classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
-import { decideQueryRunJobLifecycle, type QueryJobLifecycleStatus, type QueryRunLifecycleStatus } from './queryRunJobLifecycle';
+import { COMPLETED_JOB_FINALIZATION_GRACE_MINUTES, decideQueryRunJobLifecycle, type QueryJobLifecycleStatus, type QueryRunLifecycleStatus } from './queryRunJobLifecycle';
 import { createBriefCache } from './briefCache';
 import { CLASSIFICATION_JOB_TYPE, resolveClassificationDecouplingConfig, resolveSearchWorkerCount, type ClassificationBackpressureState } from './classificationDecoupling';
 import type { SelectionExperimentObservation } from './querySelectionExperiments';
@@ -2056,6 +2056,46 @@ export async function getInFlightPrimaryTermUsage(country:string|undefined,since
   const res=await db.query(`SELECT ql.primary_term,COUNT(*)::int AS uses FROM query_runs qr JOIN query_library ql ON ql.id=qr.query_id WHERE qr.query_id IS NOT NULL AND qr.status IN ('SCHEDULED','RUNNING','RETRYING') AND COALESCE(qr.scheduled_at,now()) >= $2 AND ql.primary_term IS NOT NULL AND btrim(ql.primary_term)<>'' AND ($1::text IS NULL OR LOWER(qr.country)=LOWER($1)) GROUP BY ql.primary_term`,[country||null,sinceIso]);
   return res.rows.map((r:any)=>({primaryTerm:String(r.primary_term),uses:Number(r.uses||0)}));
 }
+/**
+ * Query IDs that already have a non-terminal query run. The scheduler selector
+ * and the query_library reservation both need this same exclusion; without it
+ * the selector repeatedly picks a query that the reservation SQL must reject.
+ */
+export async function getActiveQueryRunQueryIds(country?:string,completedJobGraceMinutes=COMPLETED_JOB_FINALIZATION_GRACE_MINUTES):Promise<number[]>{
+  const db=await getDb();
+  // Exclude a completed-job orphan that is past its finalization grace window
+  // and is not a deliberate quota/time deferral. The selector must let that
+  // query reach lifecycle reconciliation; otherwise the active-run gate hides
+  // the only path that can close the orphan. A deferred run stays in this set:
+  // the resume sweep owns it and its saved cursor.
+  const res=await db.query(`SELECT DISTINCT qr.query_id
+    FROM query_runs qr
+    LEFT JOIN jobs j ON j.id=qr.job_id
+    WHERE qr.query_id IS NOT NULL
+      AND qr.status IN ('SCHEDULED','RUNNING','RETRYING')
+      AND ($1::text IS NULL OR LOWER(qr.country)=LOWER($1))
+      AND NOT (
+        COALESCE(qr.continuation_status,'') NOT LIKE 'DEFERRED_%'
+        AND NOT EXISTS (
+          SELECT 1 FROM jobs live
+          WHERE live.status IN ('PENDING','PROCESSING')
+            AND live.id <> qr.job_id
+            AND (
+              live.idempotency_key = 'search-run:' || qr.id::text
+              OR live.idempotency_key LIKE 'search-run:' || qr.id::text || ':page:%'
+            )
+        )
+        AND (
+          COALESCE(j.status,'')='FAILED'
+          OR (
+            COALESCE(j.status,'')='COMPLETED'
+            AND j.completed_at IS NOT NULL
+            AND j.completed_at < now() - ($2::text || ' minutes')::interval
+          )
+        )
+      )`,[country||null,String(Math.max(1,completedJobGraceMinutes))]);
+  return res.rows.map((r:any)=>Number(r.query_id)).filter((id:number)=>Number.isFinite(id));
+}
 /** Consecutive terminal query failures, newest first, with provider failures exempt. */
 export interface QueryFailureState{queryId:number;consecutiveFailures:number;backoffUntil:string|null;}
 export async function getQueryFailureStates(country?:string):Promise<QueryFailureState[]>{
@@ -3507,9 +3547,19 @@ export interface QueryRunJobLifecycleReconciliation {
 export async function reconcileQueryRunJobLifecycleForQuery(client: any, queryId: number): Promise<QueryRunJobLifecycleReconciliation> {
   const result = await client.query(`
     SELECT qr.id AS query_run_id, qr.query_id, qr.status AS query_run_status,
-           qr.error AS query_run_error, j.id AS job_id, j.status AS job_status,
+           qr.error AS query_run_error, qr.continuation_status, qr.deferred_until,
+           j.id AS job_id, j.status AS job_status,
            j.attempts, j.max_attempts, j.last_error, j.run_after,
-           j.completed_at AS job_completed_at
+           j.completed_at AS job_completed_at,
+           EXISTS (
+             SELECT 1 FROM jobs live
+             WHERE live.status IN ('PENDING','PROCESSING')
+               AND live.id <> j.id
+               AND (
+                 live.idempotency_key = 'search-run:' || qr.id::text
+                 OR live.idempotency_key LIKE 'search-run:' || qr.id::text || ':page:%'
+               )
+           ) AS has_live_page_job
     FROM query_runs qr
     JOIN jobs j ON j.id = qr.job_id
     WHERE qr.query_id = $1
@@ -3529,7 +3579,11 @@ export async function reconcileQueryRunJobLifecycleForQuery(client: any, queryId
       jobStatus: row.job_status as QueryJobLifecycleStatus,
       jobLastError: row.last_error,
       jobRunAfter: row.run_after,
-      jobCompletedAt: row.job_completed_at
+      jobCompletedAt: row.job_completed_at,
+      now: new Date().toISOString(),
+      continuationStatus: row.continuation_status,
+      deferredUntil: row.deferred_until,
+      hasLivePageJob: row.has_live_page_job === true,
     });
 
     if (decision.action === 'ALIGN_RETRY_WAIT') {
@@ -3543,13 +3597,18 @@ export async function reconcileQueryRunJobLifecycleForQuery(client: any, queryId
     }
 
     if (decision.action !== 'TERMINALIZE_QUERY_RUN') continue;
+    // Preserve the established failed-job marker byte-for-byte; a completed
+    // job that lost its finalizer is a distinct operational failure.
+    const failureKind = decision.reasonCode === 'ORPHANED_COMPLETED_JOB_STATE'
+      ? 'ORPHANED_COMPLETED_JOB_STATE'
+      : 'ORPHANED_FAILED_JOB_STATE';
     const closed = await client.query(`
       UPDATE query_runs
-      SET status='FAILED', completed_at=COALESCE(completed_at,now()),
+      SET status='FAILED', continuation_status='FAILED', completed_at=COALESCE(completed_at,now()),
           error=COALESCE(error,$2),
           performance_details=COALESCE(performance_details,'{}'::jsonb)||$3::jsonb
       WHERE id=$1 AND status IN ('SCHEDULED','RUNNING','RETRYING')
-      RETURNING query_id`, [row.query_run_id, row.query_run_error || row.last_error || 'ORPHANED_FAILED_JOB_STATE', JSON.stringify({ failureKind: 'ORPHANED_FAILED_JOB_STATE', retryOwnership: 'RELEASED' })]);
+      RETURNING query_id`, [row.query_run_id, row.query_run_error || row.last_error || failureKind, JSON.stringify({ failureKind, retryOwnership: 'RELEASED' })]);
     if (!closed.rowCount) continue;
     summary.terminalRunsClosed++;
     terminalQueryIds.add(Number(closed.rows[0].query_id));
@@ -5808,11 +5867,12 @@ export async function createContinuationRunSegment(args: {
        SELECT query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,
          quota_reserved,metadata,allocation_origin,retrieval_config_key,retrieval_treatment_origin,
          provider_key,retrieval_surface,provider_capability,cost_domain,provider_allocation_snapshot,
-         'SCHEDULED',now(),0,$2,$3,0,0,'RUNNING',$4,$1,$5,requested_page_depth
-       FROM query_runs WHERE id=$1 RETURNING id`,
+         'SCHEDULED',now(),0,$2,$3,0,0,'RUNNING',$4,$1::text,$5,requested_page_depth
+       FROM query_runs WHERE id=$6::uuid RETURNING id`,
       [
         args.parentRunId, args.nextPageToken, args.resumeMode,
         Math.max(0, Math.trunc(args.explorationPagesRemaining || 0)), segment,
+        args.parentRunId,
       ],
     );
     const childRunId = String(child.rows[0].id);

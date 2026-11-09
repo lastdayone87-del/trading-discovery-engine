@@ -24,6 +24,13 @@ export interface SelectabilityInput {
    */
   consecutiveFailures?: number;
   backoffUntil?: string | null;
+  /**
+   * Number of non-terminal query runs already owned by this query. The
+   * scheduler reservation SQL refuses a query with an active run, so the
+   * selector must apply the same hard gate; otherwise it repeatedly selects
+   * a query that can never be reserved and starves the cycle.
+   */
+  activeRunCount?: number;
 }
 
 export interface SelectabilityDecision {
@@ -54,6 +61,7 @@ export function isQuerySelectable(input: SelectabilityInput): SelectabilityDecis
   if (record.collection === 'REJECTED') reasons.push('REJECTED_COLLECTION');
   if (INACTIVE_STATUSES.has(String(record.status || '').toUpperCase())) reasons.push('INACTIVE_STATUS');
   if (input.admission && (!input.admission.eligible || input.admission.tier === 'SPECULATIVE')) reasons.push('NO_CURRENT_ADMISSION');
+  if ((input.activeRunCount || 0) > 0) reasons.push('ACTIVE_RUN_EXISTS');
 
   if (hasValidNow) {
     const last = record.last_executed ? Date.parse(record.last_executed) : NaN;
@@ -103,7 +111,7 @@ export function deriveQueryFailureState(
 
 export function classifyQueryBackoff(failureKind: string | undefined, now = new Date()): { failures: 0 | 1 | 2 | 3; backoffUntil: string | null; reasonCodes: string[] } {
   if (!failureKind) return { failures: 0, backoffUntil: null, reasonCodes: [] };
-  if (failureKind === 'PROVIDER_FAILURE' || failureKind === 'PROVIDER_CAPACITY' || failureKind === 'ORPHANED_FAILED_JOB_STATE') {
+  if (failureKind === 'PROVIDER_FAILURE' || failureKind === 'PROVIDER_CAPACITY' || failureKind === 'ORPHANED_FAILED_JOB_STATE' || failureKind === 'ORPHANED_COMPLETED_JOB_STATE') {
     // Provider/orchestration failure is not query negative quality: no query
     // backoff. A job row that vanished is infrastructure state, not a signal
     // that the query text itself is bad.
