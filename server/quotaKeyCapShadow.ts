@@ -160,8 +160,201 @@ export class YouTubeKeyCapUnavailableError extends Error {
 export function isYouTubeKeyCapError(error: unknown): boolean {
   return error instanceof YouTubeKeyCapExceededError
     || error instanceof YouTubeKeyCapUnavailableError
+    || error instanceof YouTubeKeyPoolCapacityExhaustedError
     || (error as { code?: unknown } | null)?.code === 'YOUTUBE_KEY_CAP_EXCEEDED'
-    || (error as { code?: unknown } | null)?.code === 'YOUTUBE_KEY_CAP_UNAVAILABLE';
+    || (error as { code?: unknown } | null)?.code === 'YOUTUBE_KEY_CAP_UNAVAILABLE'
+    || (error as { code?: unknown } | null)?.code === 'YOUTUBE_KEY_POOL_CAPACITY_EXHAUSTED';
+}
+
+/**
+ * Early pool-wide capacity verdict. This is a dispatch optimization, never a
+ * replacement for `reserveEnforcedKeyCap`: the final atomic reservation still
+ * owns admission and concurrent requests still cannot overrun the cap.
+ *
+ * State precedence:
+ *  - AVAILABLE: remaining >= requested units.
+ *  - PERMANENTLY_EXHAUSTED: settled usage alone has reached the cap; only the
+ *    Pacific reset can restore capacity.
+ *  - TEMPORARILY_UNAVAILABLE: settled usage is below the cap, but unexpired
+ *    in-flight leases (or an otherwise insufficient remainder) leave less than
+ *    the requested units. Lease settlement may restore capacity.
+ */
+export type KeyCapCapacityState = 'AVAILABLE' | 'PERMANENTLY_EXHAUSTED' | 'TEMPORARILY_UNAVAILABLE';
+
+export interface KeyCapCapacitySnapshot {
+  keyFingerprint: string;
+  settledUnits: number;
+  leaseUnits: number;
+  remainingUnits: number;
+  earliestLeaseExpiryMs?: number;
+}
+
+export interface KeyCapCapacityDecision extends KeyCapCapacitySnapshot {
+  state: KeyCapCapacityState;
+}
+
+export interface KeyCapPoolCapacitySummary {
+  requestUnits: number;
+  availableKeyFingerprints: string[];
+  permanentlyExhausted: KeyCapCapacityDecision[];
+  temporarilyUnavailable: KeyCapCapacityDecision[];
+  poolExhausted: boolean;
+  /** True only when every exhausted key has settled at the cap. */
+  permanentlyExhaustedOnly: boolean;
+  /** Earliest re-check: lease settlement for temporary occupancy, else reset. */
+  retryAt: number;
+}
+
+/**
+ * How soon a pool blocked only by in-flight leases should be re-checked.
+ * Enforced leases are held until the Pacific reset as a crash backstop, so
+ * their `expires_at` is not a useful wake instant. A normal provider call
+ * settles (or times out) within tens of seconds; re-checking after one minute
+ * lets settled capacity return without parking work until reset.
+ */
+export const TEMPORARY_CAPACITY_RECHECK_MS = 60_000;
+
+export class YouTubeKeyPoolCapacityExhaustedError extends Error {
+  readonly code = 'YOUTUBE_KEY_POOL_CAPACITY_EXHAUSTED';
+  readonly keyCapExceeded = true;
+  readonly capacityExhausted = true;
+  readonly providerFailureRecorded = true;
+  readonly markSuspension = false;
+  readonly rotateKey = false;
+  constructor(
+    readonly quotaDay: string,
+    readonly requestUnits: number,
+    readonly permanentlyExhaustedKeys: number,
+    readonly temporarilyUnavailableKeys: number,
+    readonly retryAt: number,
+  ) {
+    super(
+      `YouTube key pool has no capacity for ${requestUnits} units on ${quotaDay}: `
+      + `${permanentlyExhaustedKeys} permanently exhausted, ${temporarilyUnavailableKeys} temporarily unavailable; `
+      + `retry after ${new Date(retryAt).toISOString()}.`,
+    );
+    this.name = 'YouTubeKeyPoolCapacityExhaustedError';
+  }
+
+  /** True when no key can recover before the Pacific reset. */
+  get permanentlyExhaustedOnly(): boolean {
+    return this.temporarilyUnavailableKeys === 0;
+  }
+}
+
+const KEY_CAP_CAPACITY_SQL = `
+SELECT k.key_fingerprint,
+       COALESCE(u.units_used, 0)::int AS settled_units,
+       COALESCE(l.lease_units, 0)::int AS lease_units,
+       l.earliest_lease_expiry
+  FROM unnest($2::text[]) AS k(key_fingerprint)
+  LEFT JOIN youtube_key_quota_usage u
+    ON u.quota_day = $1 AND u.key_fingerprint = k.key_fingerprint
+  LEFT JOIN (
+    SELECT key_fingerprint,
+           SUM(reserved_units)::int AS lease_units,
+           MIN(expires_at) AS earliest_lease_expiry
+      FROM youtube_key_cap_shadow_leases
+     WHERE quota_day = $1 AND expires_at > $3
+     GROUP BY key_fingerprint
+  ) l ON l.key_fingerprint = k.key_fingerprint
+`;
+
+/** Read one quota-day snapshot for the supplied keys. Read-only. */
+export async function readKeyCapCapacity(
+  client: ShadowQueryClient,
+  quotaDay: string,
+  keyFingerprints: string[],
+  now: Date = new Date(),
+): Promise<KeyCapCapacitySnapshot[]> {
+  if (keyFingerprints.length === 0) return [];
+  const result = await client.query(KEY_CAP_CAPACITY_SQL, [quotaDay, keyFingerprints, now]);
+  return result.rows.map(row => {
+    const settledUnits = Math.max(0, Number(row.settled_units ?? 0));
+    const leaseUnits = Math.max(0, Number(row.lease_units ?? 0));
+    const expiry = row.earliest_lease_expiry ? Date.parse(String(row.earliest_lease_expiry)) : undefined;
+    return {
+      keyFingerprint: String(row.key_fingerprint),
+      settledUnits,
+      leaseUnits,
+      remainingUnits: Math.max(0, ENFORCED_CAP_UNITS - settledUnits - leaseUnits),
+      ...(Number.isFinite(expiry) && leaseUnits > 0 ? { earliestLeaseExpiryMs: expiry } : {}),
+    };
+  });
+}
+
+export function classifyKeyCapCapacity(
+  snapshot: KeyCapCapacitySnapshot,
+  requestUnits: number,
+  capUnits: number = ENFORCED_CAP_UNITS,
+): KeyCapCapacityDecision {
+  const settledUnits = Math.max(0, snapshot.settledUnits);
+  const leaseUnits = Math.max(0, snapshot.leaseUnits);
+  const remainingUnits = Math.max(0, capUnits - settledUnits - leaseUnits);
+  const state: KeyCapCapacityState = remainingUnits >= requestUnits
+    ? 'AVAILABLE'
+    : settledUnits >= capUnits
+      ? 'PERMANENTLY_EXHAUSTED'
+      : 'TEMPORARILY_UNAVAILABLE';
+  return { ...snapshot, settledUnits, leaseUnits, remainingUnits, state };
+}
+
+/**
+ * Pure selection step used by the dispatch preflight. Indexes and
+ * fingerprints are positionally aligned; the returned indexes preserve the
+ * caller's rotation order. Advisory only: the atomic reservation remains the
+ * authority, so a race between this snapshot and dispatch can never overrun.
+ */
+export function selectKeyCapEligibleIndexes(
+  orderedIndexes: number[],
+  keyFingerprints: string[],
+  snapshots: KeyCapCapacitySnapshot[],
+  requestUnits: number,
+  now: Date = new Date(),
+): { eligibleIndexes: number[]; summary: KeyCapPoolCapacitySummary } {
+  const summary = summarizeKeyCapPoolCapacity(snapshots, requestUnits, now);
+  if (summary.poolExhausted) return { eligibleIndexes: [], summary };
+  const available = new Set(summary.availableKeyFingerprints);
+  return {
+    eligibleIndexes: orderedIndexes.filter((_index, position) => available.has(keyFingerprints[position])),
+    summary,
+  };
+}
+
+/**
+ * Classify the whole pool and compute one retry instant. A pool is only
+ * exhausted when no key can serve the request. Temporary occupancy re-checks
+ * after a bounded settlement window (using an earlier lease expiry when one is
+ * sooner); with no leases at all, the Pacific reset is the only event that can
+ * restore settled capacity.
+ */
+export function summarizeKeyCapPoolCapacity(
+  snapshots: KeyCapCapacitySnapshot[],
+  requestUnits: number,
+  now: Date = new Date(),
+): KeyCapPoolCapacitySummary {
+  const decisions = snapshots.map(snapshot => classifyKeyCapCapacity(snapshot, requestUnits));
+  const available = decisions.filter(decision => decision.state === 'AVAILABLE');
+  const permanent = decisions.filter(decision => decision.state === 'PERMANENTLY_EXHAUSTED');
+  const temporary = decisions.filter(decision => decision.state === 'TEMPORARILY_UNAVAILABLE');
+  const leaseExpiries = temporary
+    .map(decision => decision.earliestLeaseExpiryMs)
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value > now.getTime());
+  const resetAt = getNextYouTubeQuotaResetAt(now);
+  const retryAt = available.length > 0
+    ? now.getTime()
+    : leaseExpiries.length > 0
+      ? Math.min(...leaseExpiries, now.getTime() + TEMPORARY_CAPACITY_RECHECK_MS)
+      : resetAt;
+  return {
+    requestUnits,
+    availableKeyFingerprints: available.map(decision => decision.keyFingerprint),
+    permanentlyExhausted: permanent,
+    temporarilyUnavailable: temporary,
+    poolExhausted: available.length === 0,
+    permanentlyExhaustedOnly: available.length === 0 && temporary.length === 0,
+    retryAt,
+  };
 }
 
 /**

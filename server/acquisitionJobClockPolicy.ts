@@ -21,6 +21,7 @@ export const CAPACITY_LEASE_DURATION_MS = 5 * 60 * 60_000;
 const ALWAYS_CAPACITY_CODES = new Set([
   'YOUTUBE_KEY_CAP_EXCEEDED',
   'YOUTUBE_KEY_CAP_UNAVAILABLE',
+  'YOUTUBE_KEY_POOL_CAPACITY_EXHAUSTED',
   'QUOTA_ALLOCATION_EXHAUSTED',
 ]);
 
@@ -129,7 +130,8 @@ export function isQuotaCapacityFailure(error: unknown): boolean {
   const code = String(candidate.code ?? candidate.cause?.code ?? '').toUpperCase();
   if (code === 'QUOTA_ALLOCATION_EXHAUSTED'
     || code === 'YOUTUBE_KEY_CAP_EXCEEDED'
-    || code === 'YOUTUBE_KEY_CAP_UNAVAILABLE') return true;
+    || code === 'YOUTUBE_KEY_CAP_UNAVAILABLE'
+    || code === 'YOUTUBE_KEY_POOL_CAPACITY_EXHAUSTED') return true;
   const message = String(candidate.message ?? candidate.cause?.message ?? '').toLowerCase();
   return message.includes(ENRICHMENT_CAPACITY_MESSAGE_FRAGMENT);
 }

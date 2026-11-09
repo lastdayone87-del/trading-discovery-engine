@@ -253,6 +253,22 @@ test('probe allocation and per-key cap exhaustion defer without consuming an att
   const keyDecision = decideJobFailure(keyCap, 1, 5, now);
   assert.equal(keyDecision.disposition, 'RETRYING_WITHOUT_ATTEMPT');
   assert.equal(keyDecision.runAfter, getNextYouTubeQuotaResetAt(new Date(now)));
+
+  // Pool preflight exhaustion wakes on the lease-aware retry hint rather than
+  // sleeping until reset, and never consumes a durable attempt.
+  const poolRetryAt = now + 60_000;
+  const poolCap = Object.assign(new Error('pool cap'), {
+    code: 'YOUTUBE_KEY_POOL_CAPACITY_EXHAUSTED',
+    retryAt: poolRetryAt,
+  });
+  const poolDecision = decideJobFailure(poolCap, 3, 3, now, now - 7 * 60 * 60_000);
+  assert.equal(poolDecision.disposition, 'RETRYING_WITHOUT_ATTEMPT');
+  assert.equal(poolDecision.runAfter, poolRetryAt);
+  assert.equal(poolDecision.operationallyBlocked, undefined);
+
+  const noHint = decideJobFailure({ code: 'YOUTUBE_KEY_POOL_CAPACITY_EXHAUSTED' }, 3, 3, now);
+  assert.equal(noHint.disposition, 'RETRYING_WITHOUT_ATTEMPT');
+  assert.equal(noHint.runAfter, getNextYouTubeQuotaResetAt(new Date(now)));
 });
 
 test('normal allocation exhaustion keeps its transient age limit; probe markers do not', async () => {
