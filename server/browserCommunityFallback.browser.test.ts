@@ -951,3 +951,34 @@ test('real DOM: the only shadow host after the element bound still reports a gap
       'the post-bound invite is not read; the truncation flag is what keeps coverage honest');
   });
 });
+
+test('real DOM: M2b never clicks form submission/reset or download controls', { skip: process.platform === 'android', timeout: 60_000 }, async () => {
+  await withControlPage(`<!doctype html><html><body>
+    <form><button>Join our community default</button></form>
+    <form><button type="submit">Join our community submit</button></form>
+    <form><button type="reset">Join our community reset</button></form>
+    <form><button type="button">Join our community type button</button></form>
+    <form><button type="invalid">Join our community invalid</button></form>
+    <form><button type="button ">Join our community padded</button></form>
+    <form><button><svg width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="8"></circle></svg></button></form>
+    <form><button form="missing-form" type="submit">Join our community detached</button></form>
+    <form><input type="submit" value="Join our community input submit"></form>
+    <form><input type="image" alt="Join our community input image"></form>
+    <form><input type="reset" value="Join our community input reset"></form>
+    <input type="submit" value="Join our community formless input">
+    <input type="button" role="button" value="Subscribe">
+    <fieldset disabled><button type="button" aria-label="Join our community disabled"><svg width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="8"></circle></svg></button></fieldset>
+    <a href="https://discord.gg/room" download>Join our community download</a>
+    <a href="https://discord.gg/room">Join our community anchor</a>
+  </body></html>`, async (page) => {
+    const enumeration = await enumeratePageControls(page);
+    assert.equal(enumeration.total, 16);
+    assert.equal(enumeration.controls.length, 3, 'non-submitting button, detached-form button, and ordinary anchor remain clickable');
+    assert.equal(enumeration.opaqueInteractiveControls, 12, 'form and form-less submit/reset/download/input controls plus one icon-only submit and the uncovered input button are unsafe surfaces');
+    const texts = enumeration.controls.map(control => control.text);
+    assert.equal(texts.filter(text => text.includes('type button')).length, 1, 'the type=button survivor is retained');
+    assert.equal(texts.filter(text => text.includes('detached')).length, 1, 'the detached-form survivor is retained');
+    assert.equal(texts.filter(text => text.includes('anchor')).length, 1, 'the ordinary anchor survivor is retained');
+    assert.ok(!texts.some(text => /download|invalid|padded|input submit|input image|input reset|formless|Subscribe|disabled/.test(text)));
+  });
+});

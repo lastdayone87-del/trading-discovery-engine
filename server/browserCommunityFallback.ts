@@ -143,9 +143,10 @@ export interface BrowserFallbackTelemetry {
   /** Revealed same-origin navigation candidates left unqueued or unvisited by
    * the bounded page budget. Counted as a bounded gap, not a clean run. */
   revealedSameOriginDropped?: number;
-  /** Control elements with no text, accessible label, href, or structural
-   * disclosure. Their content cannot be inspected without visual recognition;
-   * recorded so an opaque control can never be certified as a clean absence. */
+  /** Control elements that cannot be safely clicked: opaque icon-only
+   * controls, form submission/reset controls, and download links. Their
+   * content cannot be inspected without an unsafe interaction; recorded so
+   * they can never be certified as a clean absence. */
   opaqueInteractiveControls?: number;
   frameCount?: number;
   /** Open shadow roots observed in the light DOM. */
@@ -536,7 +537,7 @@ export const COMMUNITY_HINTS = /discord|community|join|chat|member|membership|vi
  * shared by enumeration and clicking so locator indexes always refer to the
  * same full query.
  */
-export const RENDERED_CONTROL_SELECTOR = 'a,button,[role="button"],[role="tab"],[role="menuitem"],summary,[aria-expanded="false"],[aria-haspopup]';
+export const RENDERED_CONTROL_SELECTOR = 'a,button,input[type="submit"],input[type="image"],input[type="reset"],[role="button"],[role="tab"],[role="menuitem"],summary,[aria-expanded="false"],[aria-haspopup]';
 
 /**
  * Telegram channel pages contain a link for virtually every message. Those
@@ -1206,7 +1207,16 @@ export function enumerateRenderedControlNodes(
       }
     }
     const ariaLabel = element.getAttribute('aria-label') || '';
-    const baseText = `${element.innerText || ''} ${href || ''} ${ariaLabel}`;
+    // Only the excluded submit/image/reset inputs need value/alt for coverage
+    // accounting. Adding those labels to every input would turn previously
+    // skipped input buttons (e.g. `<input type="button" value="Subscribe">`)
+    // into new hint-matched click targets.
+    const excludedInputType = tagName === 'input'
+      && ['submit', 'image', 'reset'].includes((element as HTMLInputElement).type);
+    const inputLabel = excludedInputType
+      ? `${(element as HTMLInputElement).value || ''} ${(element as HTMLInputElement).alt || ''}`
+      : '';
+    const baseText = `${element.innerText || ''} ${href || ''} ${ariaLabel} ${inputLabel}`;
     // P1.2: resolve labels the original filter ignored. A bounded descendant
     // text walk adds visually hidden text (innerText omits it) without
     // materializing a pathological control's entire subtree.
@@ -1409,6 +1419,7 @@ export function enumerateRenderedControlNodes(
     // be revealed.
     const hasAnyHref = typeof href === 'string' && href.length > 0;
     const interactiveControl = tagName === 'button'
+      || tagName === 'input'
       || role === 'button'
       || role === 'tab'
       || role === 'menuitem'
@@ -1429,17 +1440,66 @@ export function enumerateRenderedControlNodes(
       ? Array.from(element.getClientRects())
       : [];
     const renderedBox = clientRects.some(rect => rect.width > 0 && rect.height > 0);
-    const hiddenControl = !renderedBox
+    const hiddenControl = hidden
+      || !renderedBox
       || (element as HTMLElement).hidden
       || element.getAttribute('aria-hidden') === 'true'
       || style.display === 'none'
       || style.visibility === 'hidden';
     const disabledControl = (element as HTMLButtonElement).disabled === true
-      || element.getAttribute('aria-disabled') === 'true';
+      || element.getAttribute('aria-disabled') === 'true'
+      || element.matches(':disabled');
+    // M2b: a click must never submit/reset a form or trigger a download.
+    // These controls can mutate server state or leave the document without
+    // revealing inspectable content, so they are counted as unsafe
+    // interaction surfaces (never a clean absence) and excluded from clicks.
+    // Native form association is authoritative. An explicit `form` attribute
+    // that names a missing form detaches the control; do not fall back to an
+    // ancestor form in that case. Browser-normalized `.type` is authoritative:
+    // invalid/padded button types behave as submit.
+    const hasFormAttribute = element.hasAttribute('form');
+    const nativeForm = tagName === 'button'
+      ? (element as HTMLButtonElement).form
+      : tagName === 'input'
+        ? (element as HTMLInputElement).form
+        : null;
+    const associatedForm = nativeForm || (!hasFormAttribute ? element.closest('form') : null);
+    const effectiveType = tagName === 'button'
+      ? (element as HTMLButtonElement).type
+      : tagName === 'input'
+        ? (element as HTMLInputElement).type
+        : '';
+    // Submit/image/reset inputs are a new selector class for coverage; exclude
+    // them from clicks unconditionally, even without a form. A form-less input
+    // can still carry a state-changing handler. Buttons retain the existing
+    // behavior unless they are associated with a form that would submit/reset.
+    const inputSubmitLike = tagName === 'input'
+      && (effectiveType === 'submit' || effectiveType === 'image' || effectiveType === 'reset');
+    const submitsOrResetsForm = inputSubmitLike
+      || (!!associatedForm && tagName === 'button' && (effectiveType === 'submit' || effectiveType === 'reset'));
+    const downloadsFile = tagName === 'a' && element.hasAttribute('download');
+    if (submitsOrResetsForm || downloadsFile) {
+      // Preserve both unsafe-action coverage (a control that would otherwise
+      // have been clicked) and the existing opaque-control gap (a visible,
+      // enabled, unlabeled interactive control that may reveal content).
+      const wouldHaveBeenClicked = hintMatchedControl || isDisclosure;
+      const wouldHaveBeenOpaque = interactiveControl
+        && !openSummary
+        && !hasAccessibleEvidence
+        && !hintMatchedControl
+        && !isDisclosure;
+      if (!hiddenControl && !disabledControl && (wouldHaveBeenClicked || wouldHaveBeenOpaque)) {
+        opaqueInteractiveControls++;
+      }
+      continue;
+    }
     if (interactiveControl && !hiddenControl && !disabledControl && !hintMatchedControl && !isDisclosure && !openSummary && !hasAccessibleEvidence) {
       opaqueInteractiveControls++;
     }
     if (openSummary) continue;
+    // Disabled controls (including fieldset-inherited disabled and
+    // aria-disabled) are not interaction surfaces and are never clicked.
+    if (disabledControl) continue;
     if (!hintMatchedControl && !isDisclosure) continue;
     // A structural anchor that navigates away is enqueue-owned and never
     // clicked: replacing the document would strand the remaining menu

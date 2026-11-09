@@ -458,3 +458,50 @@ export function isNuisanceVocabularySurface(term: string): boolean {
   const letters = value.match(/\p{L}/gu)?.length ?? 0;
   return letters === 0 || /[#@]/u.test(value) || /^[0-9]+$/u.test(value);
 }
+
+export interface DashboardTerminologyEligibility {
+  search_eligible: boolean;
+  search_eligibility_reasons: string[];
+}
+
+/**
+ * Display projection for the terminology dashboard. The raw database flag can
+ * be stale after the gate tightens or a lifecycle refresh is missed; the
+ * planner filters through this same pure gate at read time. Showing the
+ * computed result prevents an emoji/hashtag/format-only row from appearing as
+ * "search eligible" when it can never become a planner atom.
+ */
+export function dashboardSearchEligibility(row: {
+  canonical_term: string;
+  term_type?: string | null;
+  country?: string | null;
+  language?: string | null;
+  lifecycle_status?: string | null;
+  search_eligible?: boolean | null;
+}): DashboardTerminologyEligibility {
+  const gate = isSearchableTradingTerm({
+    term: row.canonical_term,
+    termType: row.term_type,
+    country: row.country,
+    language: row.language,
+  });
+  const lifecycleEligible = row.lifecycle_status === 'SEARCH_TRIAL' || row.lifecycle_status === 'PROVEN_SEARCH_TERM';
+  return {
+    // The planner requires the persisted flag too: a quality/lifecycle refresh
+    // can revoke it while the row still carries SEARCH_TRIAL/PROVEN status.
+    search_eligible: row.search_eligible === true && lifecycleEligible && gate.eligible,
+    search_eligibility_reasons: gate.eligible ? [] : gate.reasons,
+  };
+}
+
+/**
+ * Stable dashboard ordering: computed planner eligibility first, then the
+ * original SQL order (yield/last-observed). This prevents a stale flagged row
+ * from occupying a page ahead of a genuinely eligible row.
+ */
+export function orderDashboardTerminologyRows<T extends { search_eligible: boolean }>(rows: T[]): T[] {
+  return rows
+    .map((row, index) => ({ row, index }))
+    .sort((a, b) => Number(b.row.search_eligible) - Number(a.row.search_eligible) || a.index - b.index)
+    .map(({ row }) => row);
+}
