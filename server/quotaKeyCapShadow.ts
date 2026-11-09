@@ -175,7 +175,7 @@ export function isYouTubeKeyCapError(error: unknown): boolean {
  *  - AVAILABLE: remaining >= requested units.
  *  - PERMANENTLY_EXHAUSTED: settled usage alone has reached the cap; only the
  *    Pacific reset can restore capacity.
- *  - TEMPORARILY_UNAVAILABLE: settled usage is below the cap and settling all
+ *  - TEMPORARILY_UNAVAILABLE: settled usage is below the cap and releasing all
  *    in-flight leases would leave enough room, so a lease release may restore
  *    capacity.
  *  - INSUFFICIENT_UNTIL_RESET: settled usage plus the request exceeds the cap

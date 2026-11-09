@@ -4437,6 +4437,19 @@ export function classifyManualRecheckAcquisitionFailure(error: any): {
     };
   }
 
+  // Pool-wide key-cap admission is a capacity wait, not a provider failure.
+  // Preserve its code and retry horizon through manual rechecks so the job
+  // defers attempt-free instead of aging into a terminal failure.
+  if (String(error?.code || error?.cause?.code || '') === 'YOUTUBE_KEY_POOL_CAPACITY_EXHAUSTED') {
+    return {
+      errorClass: 'TRANSIENT',
+      retryable: true,
+      code,
+      retryAt: Number.isFinite(retryAt) ? retryAt : undefined,
+      retryAfterMs: Number.isFinite(retryAfterMs) ? retryAfterMs : undefined,
+    };
+  }
+
   // Attempt-free infrastructure retries are deliberately opt-in. The
   // upstream error itself must already carry a recognized transient
   // class and explicitly say it is retryable. Status codes, messages,
@@ -4559,11 +4572,12 @@ export async function triggerManualRecheck(
       const probeControl = failure.probeQuotaExceeded === true
         || failure.probeQuotaDisabled === true
         || failure.probeQuotaUnavailable === true;
+      const capacityControl = failure.code === 'YOUTUBE_KEY_POOL_CAPACITY_EXHAUSTED';
       console.warn(`[Manual Recheck] Fresh YouTube creator acquisition failed for ${channelId}; preserving prior trading classification: ${detail}`);
       return {
         success: false,
         message: `Manual re-scan could not acquire fresh YouTube creator evidence. Existing trading classification was preserved. ${detail}`,
-        code: probeControl ? failure.code : 'MANUAL_RESCAN_UPSTREAM_FAILURE',
+        code: probeControl || capacityControl ? failure.code : 'MANUAL_RESCAN_UPSTREAM_FAILURE',
         retryable: failure.retryable,
         errorClass: failure.errorClass,
         retryAt: failure.retryAt,

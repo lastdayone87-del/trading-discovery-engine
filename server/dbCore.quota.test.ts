@@ -299,6 +299,20 @@ test('normal allocation exhaustion keeps its transient age limit; probe markers 
   assert.equal(decideJobFailure(unavailable, 3, 3, now, now).disposition, 'RETRYING_WITHOUT_ATTEMPT');
 });
 
+test('manual recheck preserves pool-capacity waits through classification', async () => {
+  const { classifyManualRecheckAcquisitionFailure } = await import('./queueManager');
+  const now = Date.now();
+  const retryAt = now + 60_000;
+  const classified = classifyManualRecheckAcquisitionFailure(Object.assign(new Error('key pool capacity'), {
+    code: 'YOUTUBE_KEY_POOL_CAPACITY_EXHAUSTED',
+    retryAt,
+  }));
+  assert.equal(classified.retryable, true);
+  assert.equal(classified.errorClass, 'TRANSIENT');
+  assert.equal(classified.code, 'YOUTUBE_KEY_POOL_CAPACITY_EXHAUSTED');
+  assert.equal(classified.retryAt, retryAt);
+});
+
 test('manual recheck preserves probe policy waits through provider wrapping', async () => {
   const { classifyManualRecheckAcquisitionFailure } = await import('./queueManager');
   const { ProbeQuotaDisabledError, ProbeQuotaExceededError } = await import('./quotaKeyCapShadow');
