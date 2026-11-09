@@ -1032,7 +1032,13 @@ async function processChannelThroughPipelineInContext(
           }
         }
         else{
-          try{await scheduleInvestigationStep({investigationId:candidate.investigationId,channelId:candidate.channelId,diagnosticId:classificationDiagnosticId,actionType:appliedAction,jobType:'ENRICH_CHANNEL',jobPayload:payload,priority,maxAttempts:4,idempotencyKey:enrichmentKey,policyVersion:INVESTIGATION_POLICY_VERSION,utilityContractVersion:'utility-constraints-v1',deadlineMinutes:Number(await getAppSetting('investigation_deadline_minutes','30'))||30});}
+          try{
+            const scheduled=await scheduleInvestigationStep({investigationId:candidate.investigationId,channelId:candidate.channelId,diagnosticId:classificationDiagnosticId,actionType:appliedAction,jobType:'ENRICH_CHANNEL',jobPayload:payload,priority,maxAttempts:4,idempotencyKey:enrichmentKey,policyVersion:INVESTIGATION_POLICY_VERSION,utilityContractVersion:'utility-constraints-v1',deadlineMinutes:Number(await getAppSetting('investigation_deadline_minutes','30'))||30});
+            // An already-claimed owner cannot accept a workflow step. Reuse it
+            // through the idempotent queue path rather than reporting that the
+            // investigation scheduled work it does not own.
+            if(!scheduled.stepId)enqueued=await enqueueEnrichment();
+          }
           catch(error){if(candidate.investigationId)throw error;console.error(`[Investigation] Initial transactional scheduling failed for ${candidate.channelId}; using compatible queue fallback.`,error);enqueued=await enqueueEnrichment();}
         }
       }else enqueued=await enqueueEnrichment();
