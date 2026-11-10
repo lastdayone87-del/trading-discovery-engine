@@ -32,8 +32,11 @@ test('fixture validation rejects unknown enums instead of silently dropping rows
   broken[0].systemPrediction = 'BROKEN';
   assert.throws(() => normalizeHumanEvaluationSamples(broken), /HUMAN_EVALUATION_FIXTURE_INVALID/);
   broken[0].systemPrediction = 'ABSTAIN';
-  broken[0].decidedAt = 'not-a-date';
+  broken[0].decidedAt = '2026-11-10';
   assert.throws(() => normalizeHumanEvaluationSamples(broken), /HUMAN_EVALUATION_FIXTURE_INVALID/);
+  broken[0].decidedAt = '2026-11-10T00:00:00.000Z';
+  broken[1].sampleKey = broken[0].sampleKey;
+  assert.throws(() => normalizeHumanEvaluationSamples(broken), /duplicate sampleKey/);
 });
 
 test('fixture metrics expose precision, recall, FPR and FNR without forcing abstentions', () => {
@@ -168,7 +171,8 @@ test('review and evaluation routes are reviewer-protected and registered', () =>
   assert.match(server, /app\.get\('\/api\/human-evaluation\/samples'/);
   assert.match(server, /app\.get\('\/api\/human-evaluation\/metrics'/);
   assert.match(server, /offset \+= page\.length/);
-  assert.match(server, /state: \(req\.query\.state/);
+  assert.match(server, /const requestedState = String\(req\.query\.state/);
+  assert.match(server, /state,/);
   const auth = readFileSync(new URL('./operatorAuth.ts', import.meta.url), 'utf8');
   assert.match(auth, /intake-deferred/);
   assert.match(auth, /human-evaluation\\\/samples/);

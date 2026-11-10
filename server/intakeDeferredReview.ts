@@ -428,7 +428,7 @@ function fixtureError(index: number, field: string, expected: string): never {
  */
 export function normalizeHumanEvaluationSamples(input: unknown): HumanEvaluationSample[] {
   if (!Array.isArray(input)) throw new Error('HUMAN_EVALUATION_FIXTURE_INVALID: root must be an array');
-  return input.map((entry, index) => {
+  const normalized = input.map((entry, index) => {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
       fixtureError(index, 'root', 'must be an object');
     }
@@ -460,7 +460,10 @@ export function normalizeHumanEvaluationSamples(input: unknown): HumanEvaluation
     if (typeof row.channelName === 'string' && row.channelName.trim()) evidenceSnapshot.channelName = row.channelName.trim();
     if (typeof row.youtubeUrl === 'string' && row.youtubeUrl.trim()) evidenceSnapshot.youtubeUrl = row.youtubeUrl.trim();
     const decidedAt = requiredString('decidedAt');
-    if (Number.isNaN(Date.parse(decidedAt))) fixtureError(index, 'decidedAt', 'must be an ISO timestamp');
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(decidedAt)
+      || Number.isNaN(Date.parse(decidedAt))) {
+      fixtureError(index, 'decidedAt', 'must be an ISO-8601 UTC timestamp');
+    }
     return {
       sampleKey: requiredString('sampleKey'),
       channelId: optionalString('channelId'),
@@ -478,6 +481,14 @@ export function normalizeHumanEvaluationSamples(input: unknown): HumanEvaluation
       decidedAt: new Date(decidedAt).toISOString(),
     };
   });
+  const seen = new Set<string>();
+  for (const sample of normalized) {
+    if (seen.has(sample.sampleKey)) {
+      throw new Error(`HUMAN_EVALUATION_FIXTURE_INVALID: duplicate sampleKey ${sample.sampleKey}`);
+    }
+    seen.add(sample.sampleKey);
+  }
+  return normalized;
 }
 
 export async function listHumanEvaluationSamples(filters: {

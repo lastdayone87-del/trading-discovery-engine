@@ -41,7 +41,7 @@ CREATE INDEX IF NOT EXISTS idx_intake_deferred_reviews_language
 CREATE TABLE IF NOT EXISTS intake_deferred_review_decisions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   decision_key TEXT NOT NULL UNIQUE,
-  channel_id TEXT NOT NULL REFERENCES channels(channel_id) ON DELETE CASCADE,
+  channel_id TEXT NOT NULL REFERENCES channels(channel_id) ON DELETE RESTRICT,
   decision TEXT NOT NULL CHECK (decision IN ('TRADING','NON_TRADING','AMBIGUOUS')),
   reviewer TEXT NOT NULL,
   reason TEXT,

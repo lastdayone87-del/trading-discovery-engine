@@ -51,6 +51,8 @@ function asRecord(value: unknown): Record<string, any> {
 
 const IntakeDeferredReview: React.FC = () => {
   const [items, setItems] = useState<DeferredItem[]>([]);
+  const [offset, setOffset] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
   const [selected, setSelected] = useState<DeferredDetails | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -66,7 +68,7 @@ const IntakeDeferredReview: React.FC = () => {
   const [correctedLanguage, setCorrectedLanguage] = useState('');
   const [busy, setBusy] = useState(false);
 
-  const loadList = useCallback(async () => {
+  const loadList = useCallback(async (nextOffset = 0) => {
     setLoading(true); setError('');
     try {
       const params = new URLSearchParams();
@@ -75,9 +77,13 @@ const IntakeDeferredReview: React.FC = () => {
       if (language.trim()) params.set('language', language.trim());
       if (stateFilter !== 'ALL') params.set('state', stateFilter);
       params.set('limit', '100');
+      params.set('offset', String(nextOffset));
       const response = await apiFetch(`/api/intake-deferred?${params}`, { headers: reviewerHeaders() });
       if (!response.ok) throw new Error(await responseError(response));
-      setItems(await response.json());
+      const page = await response.json() as DeferredItem[];
+      setItems(page);
+      setOffset(nextOffset);
+      setHasMore(page.length === 100);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Unable to load deferred intake channels.');
     } finally { setLoading(false); }
@@ -100,7 +106,7 @@ const IntakeDeferredReview: React.FC = () => {
     } finally { setLoading(false); }
   };
 
-  useEffect(() => { void loadList(); }, []);
+  useEffect(() => { void loadList(0); }, []);
 
   const submitDecision = async () => {
     if (!selected || selected.state !== 'PENDING') return;
@@ -130,7 +136,7 @@ const IntakeDeferredReview: React.FC = () => {
       const result = await response.json();
       setSuccess(`Decision saved at version ${result.reviewVersion || selected.reviewVersion + 1}.`);
       await loadDetails(selected.channelId);
-      await loadList();
+      await loadList(offset);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Unable to save the intake decision.');
     } finally { setBusy(false); }
@@ -163,7 +169,7 @@ const IntakeDeferredReview: React.FC = () => {
               <option value="SUPERSEDED">Superseded</option>
               <option value="ALL">All states</option>
             </select>
-            <button onClick={() => void loadList()} className="rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white">Refresh</button>
+            <button onClick={() => void loadList(0)} className="rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white">Refresh</button>
           </div>
         </div>
         {error && <div className="mt-3 rounded-lg bg-rose-50 p-2 text-xs text-rose-700 dark:bg-rose-950/40 dark:text-rose-300">{error}</div>}
@@ -200,6 +206,13 @@ const IntakeDeferredReview: React.FC = () => {
               {!items.length && !loading && <tr><td colSpan={7} className="px-2 py-6 text-center text-slate-500">No deferred channels.</td></tr>}
             </tbody>
           </table>
+        </div>
+        <div className="mt-3 flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+          <span>{items.length ? `Showing ${offset + 1}–${offset + items.length}` : 'No rows'}</span>
+          <span className="flex gap-2">
+            <button disabled={offset === 0 || loading} onClick={() => void loadList(Math.max(0, offset - 100))} className="rounded-lg border border-slate-300 px-3 py-1.5 font-semibold disabled:opacity-40 dark:border-slate-700">Previous</button>
+            <button disabled={!hasMore || loading} onClick={() => void loadList(offset + 100)} className="rounded-lg border border-slate-300 px-3 py-1.5 font-semibold disabled:opacity-40 dark:border-slate-700">Next</button>
+          </span>
         </div>
         {loading && <div className="mt-2 text-xs text-slate-500">Loading…</div>}
       </div>
@@ -262,7 +275,10 @@ const IntakeDeferredReview: React.FC = () => {
             </div>
             {selected.state !== 'PENDING' && (
               <p className="mt-3 rounded-lg bg-amber-50 p-2 text-[11px] text-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
-                This review is {selected.state}. Decisions are immutable; a new evidence recheck will open a new review version if needed.
+                This review is {selected.state}. Decisions are immutable.
+                {selected.state === 'DECIDED' && selected.decision === 'AMBIGUOUS'
+                  ? ' A changed-evidence recheck will open a new review version.'
+                  : ' This row is retained for audit only.'}
               </p>
             )}
             <button disabled={busy || selected.state !== 'PENDING' || !reason.trim()} onClick={() => void submitDecision()} className="mt-4 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-semibold text-white disabled:opacity-40">
