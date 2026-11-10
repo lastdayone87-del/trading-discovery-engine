@@ -77,6 +77,12 @@ Source: `acquisition_lane_events`, one row per inspection pass.
 | DISCOVERY floor | 35% | `discovery_share_below_floor` |
 | No browser data | — | `no_browser_crawl_data` |
 
+The gate compares **unrounded** values: `observedBrowserCrawlsPerHourRaw` and
+`discoverySharePctRaw` expose them next to the rounded display fields. A rate
+of 39.996/h displays as `40` but fails the 40/h gate. The discovery floor is
+evaluated by integer cross-multiplication at 0.01% precision, so an exact 57%
+share cannot fail as `56.99999999999999` from binary percentage noise.
+
 `--check` exits non-zero when any failure code is present. Use it for the
 post-soak gate, not for the first minutes after a deploy; a fresh window
 legitimately reports `no_browser_crawl_data` until the first rendered crawl
