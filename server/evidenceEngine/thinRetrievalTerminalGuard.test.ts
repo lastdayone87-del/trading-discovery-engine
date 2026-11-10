@@ -364,7 +364,7 @@ test('a short keyword bio is not enough for the thin-retrieval exception', () =>
     positiveItem('pos-bio', 'PLATFORM_BROKER_PROPFIRM', 'channel_bio', 'fam-bio', 24),
     positiveItem('pos-link', 'EXTERNAL_RESOURCE', 'external_link_domain', 'fam-link', 18),
   ];
-  const { stages } = decide(thinRetrievalInput, evidence, sufficientCollection(), strongCreatorComposition);
+  const { stages } = decide({ ...thinRetrievalInput, description: 'Forex trading signals' }, evidence, sufficientCollection(), strongCreatorComposition);
   assert.equal(stages.lifecycleAction, 'REVIEW');
 });
 

@@ -53,10 +53,11 @@ function count(record: Record<string, number>, key: string | undefined | null) {
 }
 
 function videoTextsFromRow(row: any): string[] {
-  const texts: string[] = (Array.isArray(row.videos) ? row.videos : [])
+  // One text per distinct video. Collapsing identical text would let two
+  // distinct uploads slip below the guard's sample threshold.
+  return (Array.isArray(row.videos) ? row.videos : [])
     .map((video: any) => [video.title, video.description].filter(Boolean).join(' ').trim())
     .filter((text: string) => Boolean(text));
-  return [...new Set(texts)];
 }
 
 const output: any = { readOnly: true, groundTruth: false, note: 'Production status is used only for engineering coverage diagnostics, never as human ground truth.', cohorts: {} };

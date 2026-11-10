@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { VerificationDecision } from '../evidenceEngine/types';
-import { resolveClassificationRouting, resolveClassificationRoutingMode } from './deterministicFirst';
+import { nonTradingContentFocus, resolveClassificationRouting, resolveClassificationRoutingMode } from './deterministicFirst';
 
 type DecisionOverrides = Partial<VerificationDecision> & {
   providers?: VerificationDecision['evidenceCollection']['providers'];
@@ -212,6 +212,39 @@ test('a strong trading phrase in the bio does not mask a non-trading video sampl
   }), {
     independentEvidence: true,
     videoTexts: ['dance choreography', 'music cover', 'cooking recipe', 'daily vlog'],
+  });
+  assert.equal(routed.route, 'HUMAN_REVIEW');
+});
+
+test('word boundaries keep guidance, credit spreads, market reactions and corporate earnings out of the guard', () => {
+  const focus = nonTradingContentFocus('Weekly guidance on credit spreads, market reaction and corporate earnings.');
+  assert.equal(focus.total, 0);
+  assert.deepEqual(focus.categories, []);
+});
+
+test('broker URLs and repeated description footers do not create non-trading focus', () => {
+  const footer = 'Trade with our broker: https://broker.example.com/referral?ref=trader';
+  const routed = resolveClassificationRouting(decision({
+    status: 'TRADING_CONFIRMED', confidenceScore: 90, recognitionState: 'AMBIGUOUS_THIN', semanticPolicy: 'BOUNDED_WAIT',
+    providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
+  }), {
+    independentEvidence: true,
+    videoTexts: [
+      `EURUSD forecast Monday\n${footer}`,
+      `GBPUSD outlook Tuesday\n${footer}`,
+      `USDJPY weekly forecast\n${footer}`,
+    ],
+  });
+  assert.equal(routed.route, 'SEMANTIC_TRADING');
+});
+
+test('Distinct videos with identical off-topic metadata still count toward the guard', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'TRADING_CONFIRMED', confidenceScore: 90, recognitionState: 'AMBIGUOUS_THIN', semanticPolicy: 'BOUNDED_WAIT',
+    providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
+  }), {
+    independentEvidence: true,
+    videoTexts: ['dance choreography music', 'dance choreography music', 'dance choreography music'],
   });
   assert.equal(routed.route, 'HUMAN_REVIEW');
 });
