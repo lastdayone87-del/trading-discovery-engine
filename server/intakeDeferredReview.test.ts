@@ -34,6 +34,8 @@ test('fixture validation rejects unknown enums instead of silently dropping rows
   broken[0].systemPrediction = 'ABSTAIN';
   broken[0].decidedAt = '2026-11-10';
   assert.throws(() => normalizeHumanEvaluationSamples(broken), /HUMAN_EVALUATION_FIXTURE_INVALID/);
+  broken[0].decidedAt = '2026-02-30T00:00:00.000Z';
+  assert.throws(() => normalizeHumanEvaluationSamples(broken), /HUMAN_EVALUATION_FIXTURE_INVALID/);
   broken[0].decidedAt = '2026-11-10T00:00:00.000Z';
   broken[1].sampleKey = broken[0].sampleKey;
   assert.throws(() => normalizeHumanEvaluationSamples(broken), /duplicate sampleKey/);

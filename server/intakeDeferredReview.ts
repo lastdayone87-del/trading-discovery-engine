@@ -460,9 +460,11 @@ export function normalizeHumanEvaluationSamples(input: unknown): HumanEvaluation
     if (typeof row.channelName === 'string' && row.channelName.trim()) evidenceSnapshot.channelName = row.channelName.trim();
     if (typeof row.youtubeUrl === 'string' && row.youtubeUrl.trim()) evidenceSnapshot.youtubeUrl = row.youtubeUrl.trim();
     const decidedAt = requiredString('decidedAt');
+    const decidedDate = new Date(decidedAt);
     if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(decidedAt)
-      || Number.isNaN(Date.parse(decidedAt))) {
-      fixtureError(index, 'decidedAt', 'must be an ISO-8601 UTC timestamp');
+      || Number.isNaN(decidedDate.getTime())
+      || decidedDate.toISOString() !== decidedAt) {
+      fixtureError(index, 'decidedAt', 'must be a calendar-valid ISO-8601 UTC timestamp');
     }
     return {
       sampleKey: requiredString('sampleKey'),
@@ -478,7 +480,7 @@ export function normalizeHumanEvaluationSamples(input: unknown): HumanEvaluation
       evidenceSnapshot,
       reviewer: requiredString('reviewer'),
       notes: optionalString('notes'),
-      decidedAt: new Date(decidedAt).toISOString(),
+      decidedAt: decidedDate.toISOString(),
     };
   });
   const seen = new Set<string>();
