@@ -128,6 +128,8 @@ export interface AcquisitionLaneTelemetryLike {
   pagesInspected?: unknown;
   requestsStarted?: unknown;
   requestsFinished?: unknown;
+  requestsFailed?: unknown;
+  navigationTimeouts?: unknown;
   clicksSucceeded?: unknown;
   gateWaitMs?: unknown;
 }
@@ -362,6 +364,11 @@ export function summarizeAcquisitionInspection(input: {
     const hasCrawlEvidence = nonNegativeCount(telemetry.pagesInspected) > 0
       || nonNegativeCount(telemetry.requestsStarted) > 0
       || nonNegativeCount(telemetry.requestsFinished) > 0
+      // A first navigation that fails on every attempt never enters the
+      // request handler, so requestsStarted stays zero. The failure/timeout
+      // counters still prove the rendered run consumed the slot.
+      || nonNegativeCount(telemetry.requestsFailed) > 0
+      || nonNegativeCount(telemetry.navigationTimeouts) > 0
       || nonNegativeCount(telemetry.clicksSucceeded) > 0;
     if (!hasCrawlEvidence) return;
     const requestedUrl = String(observation.requestedUrl || '').trim();

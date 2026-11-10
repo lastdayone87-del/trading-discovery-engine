@@ -32,12 +32,12 @@ Source: `acquisition_lane_events`, one row per inspection pass.
 
 - **Browser crawl**: a unique, non-empty seed URL whose observation carries
   `telemetry.mode = 'RENDERED'` **and positive crawl evidence** (pages
-  inspected, requests started/finished, or clicks succeeded). It is written to
-  the row's `detail.renderedCrawls` count. A pass can contain several rendered
-  seeds, and each one consumes the single browser slot. Static HTTP
-  observations (`mode = 'STATIC'`), no-work outcomes, gate refusals/launch
-  failures with zero evidence, URL-less observations, and shared-evidence rows
-  (no refetch) are not browser crawls.
+  inspected, requests started/finished/failed, navigation timeouts, or clicks
+  succeeded). It is written to the row's `detail.renderedCrawls` count. A pass
+  can contain several rendered seeds, and each one consumes the single browser
+  slot. Static HTTP observations (`mode = 'STATIC'`), no-work outcomes, gate
+  refusals/launch failures with zero evidence, URL-less observations, and
+  shared-evidence rows (no refetch) are not browser crawls.
 - **Inspection pass**: one lane-event row. Outcome counts (`completedPasses`,
   `failedPasses`, `deferredPasses`, etc.) are per pass, not per browser crawl.
 - **All lanes count toward the browser ceiling**, including `MAINTENANCE`

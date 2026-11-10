@@ -102,12 +102,15 @@ test('rendered crawl count is per unique rendered seed and excludes static/share
         { requestedUrl: 'https://refused.example', surface: 'CREATOR_WEBSITES', outcome: 'CAPACITY_DEFERRED', telemetry: { mode: 'RENDERED', pagesInspected: 0, requestsStarted: 0 } },
         // Started then failed before a page was processed: requests prove work.
         { requestedUrl: 'https://started.example', surface: 'CREATOR_WEBSITES', outcome: 'ACQUISITION_FAILED', telemetry: { mode: 'RENDERED', pagesInspected: 0, requestsStarted: 1 } },
+        // Initial navigation failed on every attempt: the handler was never
+        // entered, but the failure/timeout counters prove the crawl ran.
+        { requestedUrl: 'https://nav-failed.example', surface: 'CREATOR_WEBSITES', outcome: 'ACQUISITION_FAILED', telemetry: { mode: 'RENDERED', pagesInspected: 0, requestsFailed: 3, navigationTimeouts: 1 } },
         // A URL-less rendered observation cannot certify a unique seed.
         { surface: 'CREATOR_WEBSITES', outcome: 'ACQUIRED', telemetry: { mode: 'RENDERED', pagesInspected: 1 } },
       ],
     },
   });
-  assert.equal(summary.renderedCrawls, 3);
+  assert.equal(summary.renderedCrawls, 4);
 
   const noRendered = summarizeAcquisitionInspection({
     inspection: {
