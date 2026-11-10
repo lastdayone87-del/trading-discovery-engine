@@ -434,6 +434,32 @@ export function capDemandSignalCandidates<T>(candidates: T[], count: number): T[
   return candidates.slice(0, Math.floor(requested * 0.3));
 }
 
+const SAFE_REVIEWED_MARKET_QUALIFIER = /\b(dax|ibex|cac|bel ?20|euronext|nyse|nasdaq|s&p|ftse|aex|smi|omx|tsx|asx|nzx|sgx|nikkei|topix|kospi|bist|bovespa|moex|jse|hose|set|bursa|stock\s*exchange|bourse|börse|beurs|market\s*outlook|market\s*wrap|opening|session|تحليل|تداول)\b/iu;
+
+/**
+ * Whether a reviewed native surface is currently eligible to stand alone.
+ * Saved rows can carry older ambiguity/companion metadata, so execution
+ * authority re-evaluates the surface with this same rule instead of rejecting
+ * a phrase that the current planner still emits.
+ */
+export function isReviewedNativeStandaloneSurface(input: {
+  term: string;
+  type?: string | null;
+  specificity?: number | null;
+  ambiguity?: number | null;
+}): boolean {
+  const term = String(input.term || '').normalize('NFKC').trim().replace(/\s+/g, ' ');
+  if (!term) return false;
+  const type = String(input.type || '').toUpperCase();
+  const reviewedMethod = type === 'METHOD'
+    && Number(input.specificity ?? 0) >= 55
+    && Number(input.ambiguity ?? 100) <= 60;
+  const reviewedMarket = type === 'MARKET'
+    && (queryTokenCount(term) >= 3
+      || (SAFE_REVIEWED_MARKET_QUALIFIER.test(term) && !/\bsti\b/i.test(term)));
+  return reviewedMethod || reviewedMarket;
+}
+
 function countryAtoms(country: string, vocabulary?: CountryVocabulary): SearchAtom[] {
   const curated = (COUNTRY_SEARCH_ATOMS[country] || []).map(([term, type, intent]) => atom(term, type, intent, 1, 'CURATED'));
   const nativeQueries = (COUNTRY_NATIVE_QUERY_ATOMS[country] || []).map(([term, type, intent]) => {
@@ -445,18 +471,16 @@ function countryAtoms(country: string, vocabulary?: CountryVocabulary): SearchAt
     // MARKET/METHOD phrases into the standalone band by raising specificity to
     // at least 60 and lowering ambiguity to at most 45; that override is
     // intentional and the evaluated semantic class remains in the audit trail.
-    const nativeTokens = queryTokenCount(nativeAtom.term);
-    const safeMarketQualifier = /\b(dax|ibex|cac|bel ?20|euronext|nyse|nasdaq|s&p|ftse|aex|smi|omx|tsx|asx|nzx|sgx|nikkei|topix|kospi|bist|bovespa|moex|jse|hose|set|bursa|stock\s*exchange|bourse|börse|beurs|market\s*outlook|market\s*wrap|opening|session|تحليل|تداول)\b/iu;
-    const reviewedMethod = nativeAtom.type === 'METHOD'
-      && nativeAtom.retrievalPolicy.specificity >= 55
-      && nativeAtom.retrievalPolicy.ambiguity <= 60;
     // Specific multi-token market phrases (DAX Analyse heute, NZX 50
     // analysis, Singapore market outlook) are safe reviewed surfaces. Short
     // acronym/broker surfaces (STI analysis, Bolero aandelen, DBS Vickers)
     // remain modifier-only. Broker/platform names are never standalone.
-    const reviewedMarket = nativeAtom.type === 'MARKET'
-      && (nativeTokens >= 3 || (safeMarketQualifier.test(nativeAtom.term) && !/\bsti\b/i.test(nativeAtom.term)));
-    const reviewedStandalone = reviewedMethod || reviewedMarket;
+    const reviewedStandalone = isReviewedNativeStandaloneSurface({
+      term: nativeAtom.term,
+      type: nativeAtom.type,
+      specificity: nativeAtom.retrievalPolicy.specificity,
+      ambiguity: nativeAtom.retrievalPolicy.ambiguity,
+    });
     nativeAtom.retrievalPolicy = {
       ...nativeAtom.retrievalPolicy,
       ...(reviewedStandalone ? {

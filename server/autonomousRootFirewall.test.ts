@@ -82,6 +82,38 @@ test('reviewed native method phrases are authorized as standalone surfaces', () 
   assert.equal(decision.eligible, true, decision.reasonCodes.join(','));
 });
 
+test('saved reviewed market phrases are re-evaluated under the current standalone rule', () => {
+  for (const [text, country] of [['DAX Analyse heute', 'Germany'], ['Singapore market outlook', 'Singapore']] as const) {
+    const decision = evaluateAutonomousQueryAuthority(query({
+      query: text,
+      country,
+      generation_metadata: {
+        queryTemplate: 'SINGLE_ATOM',
+        retrievalSpecificity: {
+          policyVersion: RETRIEVAL_SPECIFICITY_POLICY_VERSION,
+          eligibility: 'STANDALONE',
+          specificity: 42,
+          ambiguity: 72,
+        },
+        atoms: [{
+          type: 'MARKET',
+          origin: 'COUNTRY_VOCABULARY',
+          term: text,
+          retrievalPolicy: {
+            policyVersion: RETRIEVAL_SPECIFICITY_POLICY_VERSION,
+            eligibility: 'STANDALONE',
+            specificity: 42,
+            ambiguity: 72,
+            requiredCompanionClasses: ['INSTRUMENT', 'METHOD'],
+            reasonCodes: ['REVIEWED_NATIVE_PHRASE'],
+          },
+        }],
+      },
+    } as any));
+    assert.equal(decision.eligible, true, `${text}: ${decision.reasonCodes.join(',')}`);
+  }
+});
+
 test('a deselected persistent promotion stops standalone native rows', () => {
   const metadata = {
     queryTemplate: 'SINGLE_ATOM',

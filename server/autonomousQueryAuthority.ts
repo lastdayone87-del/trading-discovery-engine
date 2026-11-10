@@ -1,5 +1,5 @@
 import type { QueryRecord } from '../src/types';
-import { isBareShortTicker, isForbiddenProseQuery, isRetrievalOrientedQuery } from './queryPlanner';
+import { isBareShortTicker, isForbiddenProseQuery, isRetrievalOrientedQuery, isReviewedNativeStandaloneSurface } from './queryPlanner';
 import { isExtractedStandaloneQuery } from './terminologySearchability';
 import { RETRIEVAL_SPECIFICITY_POLICY_VERSION } from './retrievalSpecificity';
 import { revalidateQueryRecordAdmission } from './queryQuality/admission';
@@ -282,9 +282,16 @@ export function evaluateAutonomousQueryAuthority(
       ...(primaryIsMethod ? [] : topLevelCompanionClasses),
       ...atomCompanionClasses,
     ])];
+    const currentReviewedStandalone = earlyReviewedNativeSurface && isReviewedNativeStandaloneSurface({
+      term: String(atoms[0]?.term || query.query),
+      type: String(atoms[0]?.type || ''),
+      specificity: Number(specificity.specificity),
+      ambiguity: Number(specificity.ambiguity),
+    });
     if (
       template === 'SINGLE_ATOM'
       && earlyReviewedNativeSurface
+      && !currentReviewedStandalone
       && (companionClasses.length > 0 || Number(specificity.ambiguity) >= 60)
     ) {
       return {
