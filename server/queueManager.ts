@@ -3459,6 +3459,10 @@ export async function inspectAndValidateChannel(
     slicePass: Math.max(1, Math.floor(attribution?.slicePass || 1)),
     ...(attribution?.workRemaining !== undefined ? { workRemaining: attribution.workRemaining } : {}),
   };
+  // Call sites deliberately use `void`: telemetry is observational and a slow
+  // or contended database must never hold an acquisition worker open. The
+  // writer catches its own failures, so this cannot become an unhandled
+  // rejection.
   const recordLaneEvent = async (
     inspection: AcquisitionLaneInspection | null | undefined,
     retryDirective?: CommunityRetryDirective,
@@ -3480,7 +3484,7 @@ export async function inspectAndValidateChannel(
 
   if (isTerminalState(channel) && !isManualScan) {
     console.log(`[Queue Manager] Channel '${channel.channel_name}' (${channel.channel_id}) is in terminal state '${channel.country_status}' / '${channel.trading_status}'. Aborting inspection.`);
-    await recordLaneEvent(undefined);
+    void recordLaneEvent(undefined);
     return;
   }
 
@@ -3488,7 +3492,7 @@ export async function inspectAndValidateChannel(
   if (qStatus.channelProcessing.isPaused) {
     channel.scan_status = 'PENDING';
     await upsertChannel(channel);
-    await recordLaneEvent(undefined);
+    void recordLaneEvent(undefined);
     return;
   }
 
@@ -3519,7 +3523,7 @@ export async function inspectAndValidateChannel(
       }];
       await upsertChannel(channel);
       console.warn(JSON.stringify({event:'excluded_channel_blocked',channelId:channel.channel_id,detectedCountry:channel.country,reason:storedBlock.reason,context:'retry_owned_reacquire',timestamp:rejectionNow}));
-      await recordLaneEvent(undefined);
+      void recordLaneEvent(undefined);
       return;
     }
   }
@@ -3976,7 +3980,7 @@ export async function inspectAndValidateChannel(
     // Phase 0 lane baseline: classify the pass after all projection writes. A
     // post-start throw without an inspection object is INCONCLUSIVE, never
     // NEVER_EXECUTED; a capacity directive is a deferral, never a failure.
-    await recordLaneEvent(
+    void recordLaneEvent(
       inspection || (inspectionStarted ? { acquisitionStatus: 'INCONCLUSIVE' } : undefined),
       retryDirective || inspection?.retryDirective,
     );

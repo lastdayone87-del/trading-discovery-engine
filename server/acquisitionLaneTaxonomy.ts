@@ -123,9 +123,15 @@ export function sanitizeAcquisitionAttribution(input: unknown): AcquisitionAttri
 }
 
 export interface AcquisitionLaneTelemetryLike {
+  /** `RENDERED` marks a real browser crawl; `STATIC` marks an HTTP fetch. */
+  mode?: unknown;
+  /** Gate-admission timestamp for this rendered seed, when available. */
+  crawlStartedAt?: unknown;
   pagesInspected?: unknown;
   requestsStarted?: unknown;
   requestsFinished?: unknown;
+  requestsFailed?: unknown;
+  navigationTimeouts?: unknown;
   clicksSucceeded?: unknown;
   gateWaitMs?: unknown;
 }
@@ -177,6 +183,18 @@ export interface AcquisitionLaneSummary {
   outcome: AcquisitionOutcome;
   pagesInspected: number;
   requestsStarted: number;
+  /**
+   * Unique seed URLs that actually ran the rendered browser crawler in this
+   * inspection pass. A pass can contain several seeds, and static observations
+   * must never be counted as browser crawls. Shared evidence rows are excluded
+   * because they did not refetch. Optional for callers/tests that predate the
+   * counter; the durable writer stores `0` when absent.
+   */
+  renderedCrawls?: number;
+  /** Gate-admission timestamps for the counted rendered seeds, when known.
+   * Bounded; used to bucket crawls by their actual hour instead of the
+   * inspection's finish hour. */
+  renderedCrawlStartedAt?: string[];
   /** Longest gate wait observed in this inspection (not a sum: each seed has
    * its own crawl and adding waits would overstate capacity pressure). */
   gateWaitMs?: number;
@@ -338,6 +356,40 @@ export function summarizeAcquisitionInspection(input: {
     : [];
   const directive = input.retryDirective || inspection?.retryDirective;
 
+  // One rendered crawl per unique seed URL. `mode` is set by the crawler
+  // telemetry constructors (RENDERED vs STATIC); shared-evidence rows carry a
+  // lender's counters and must not inflate the browser-slot count. A rendered
+  // label alone is not enough: gate refusals and launch failures also carry it
+  // with zero work, so require positive crawl evidence. A URL-less observation
+  // cannot certify a unique seed and is not counted.
+  const renderedSeeds = new Map<string, string>();
+  observations.forEach(observation => {
+    if (String(observation.telemetry?.mode || '').trim().toUpperCase() !== 'RENDERED') return;
+    if (observation.sharedEvidenceFrom) return;
+    const telemetry = observation.telemetry || {};
+    const hasCrawlEvidence = nonNegativeCount(telemetry.pagesInspected) > 0
+      || nonNegativeCount(telemetry.requestsStarted) > 0
+      || nonNegativeCount(telemetry.requestsFinished) > 0
+      // A first navigation that fails on every attempt never enters the
+      // request handler, so requestsStarted stays zero. The failure/timeout
+      // counters still prove the rendered run consumed the slot.
+      || nonNegativeCount(telemetry.requestsFailed) > 0
+      || nonNegativeCount(telemetry.navigationTimeouts) > 0
+      || nonNegativeCount(telemetry.clicksSucceeded) > 0;
+    if (!hasCrawlEvidence) return;
+    const requestedUrl = String(observation.requestedUrl || '').trim();
+    if (!requestedUrl) return;
+    const surface = String(observation.surface || '').trim();
+    const rawStartedAt = typeof telemetry.crawlStartedAt === 'string' ? telemetry.crawlStartedAt : '';
+    const startedAt = Number.isFinite(Date.parse(rawStartedAt))
+      ? new Date(rawStartedAt).toISOString()
+      : '';
+    const key = `${surface}|${requestedUrl}`;
+    if (!renderedSeeds.has(key) || (!renderedSeeds.get(key) && startedAt)) {
+      renderedSeeds.set(key, startedAt);
+    }
+  });
+
   let pagesInspected = 0;
   let requestsStarted = 0;
   let gateWaitMs: number | undefined;
@@ -392,10 +444,13 @@ export function summarizeAcquisitionInspection(input: {
     conclusiveBlockObservations,
     processedObservations,
   };
+  const renderedCrawlStartedAt = [...renderedSeeds.values()].filter(Boolean).slice(0, 32);
   const summary = (outcome: AcquisitionOutcome, capacityEvent?: string): AcquisitionLaneSummary => ({
     outcome,
     pagesInspected,
     requestsStarted,
+    renderedCrawls: renderedSeeds.size,
+    ...(renderedCrawlStartedAt.length ? { renderedCrawlStartedAt } : {}),
     ...(gateWaitMs !== undefined ? { gateWaitMs } : {}),
     workRemaining,
     ...(capacityEvent ? { capacityEvent } : {}),

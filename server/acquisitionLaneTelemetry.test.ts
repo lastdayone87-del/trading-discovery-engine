@@ -29,7 +29,7 @@ import {
   operationsTelemetrySnapshot,
   resetOperationsTelemetry,
 } from './operationsTelemetry';
-import { safeCrawlerTelemetry } from './crawlerTelemetry';
+import { renderedCrawlerTelemetry, safeCrawlerTelemetry } from './crawlerTelemetry';
 
 test.beforeEach(() => {
   resetOperationsTelemetry();
@@ -86,6 +86,71 @@ test('never executed is reserved for no work signal', () => {
     }).outcome,
     'INSPECTED_NO_MATCH',
   );
+});
+
+test('rendered crawl count is per unique rendered seed and excludes static/shared rows', () => {
+  const summary = summarizeAcquisitionInspection({
+    inspection: {
+      acquisitionOutcomes: [
+        { requestedUrl: 'https://a.example', surface: 'CREATOR_WEBSITES', outcome: 'FOUND', telemetry: { mode: 'RENDERED', pagesInspected: 1, crawlStartedAt: '2026-11-10T11:00:00.000Z' } },
+        // Same seed repeated in one pass is still one browser crawl.
+        { requestedUrl: 'https://a.example', surface: 'CREATOR_WEBSITES', outcome: 'FOUND', telemetry: { mode: 'RENDERED', pagesInspected: 1, crawlStartedAt: '2026-11-10T11:00:00.000Z' } },
+        { requestedUrl: 'https://b.example', surface: 'CREATOR_WEBSITES', outcome: 'PARTIALLY_INSPECTED', telemetry: { mode: 'RENDERED', pagesInspected: 1, crawlStartedAt: '2026-11-10T11:30:00.000Z' } },
+        { requestedUrl: 'https://c.example', surface: 'CREATOR_WEBSITES', outcome: 'ACQUIRED', telemetry: { mode: 'STATIC', pagesInspected: 1 } },
+        { requestedUrl: 'https://d.example', surface: 'CREATOR_WEBSITES', outcome: 'FOUND', sharedEvidenceFrom: 'https://b.example', telemetry: { mode: 'RENDERED', pagesInspected: 1 } },
+        // Gate refusal/launch failure: rendered label, zero work.
+        { requestedUrl: 'https://refused.example', surface: 'CREATOR_WEBSITES', outcome: 'CAPACITY_DEFERRED', telemetry: { mode: 'RENDERED', pagesInspected: 0, requestsStarted: 0 } },
+        // Started then failed before a page was processed: requests prove work.
+        { requestedUrl: 'https://started.example', surface: 'CREATOR_WEBSITES', outcome: 'ACQUISITION_FAILED', telemetry: { mode: 'RENDERED', pagesInspected: 0, requestsStarted: 1, crawlStartedAt: '2026-11-10T12:00:00.000Z' } },
+        // Initial navigation failed on every attempt: the handler was never
+        // entered, but the failure/timeout counters prove the crawl ran.
+        { requestedUrl: 'https://nav-failed.example', surface: 'CREATOR_WEBSITES', outcome: 'ACQUISITION_FAILED', telemetry: { mode: 'RENDERED', pagesInspected: 0, requestsFailed: 3, navigationTimeouts: 1 } },
+        // A URL-less rendered observation cannot certify a unique seed.
+        { surface: 'CREATOR_WEBSITES', outcome: 'ACQUIRED', telemetry: { mode: 'RENDERED', pagesInspected: 1 } },
+      ],
+    },
+  });
+  assert.equal(summary.renderedCrawls, 4);
+  assert.deepEqual(summary.renderedCrawlStartedAt, [
+    '2026-11-10T11:00:00.000Z',
+    '2026-11-10T11:30:00.000Z',
+    '2026-11-10T12:00:00.000Z',
+  ]);
+
+  const noRendered = summarizeAcquisitionInspection({
+    inspection: {
+      acquisitionOutcomes: [
+        { requestedUrl: 'https://static.example', surface: 'CREATOR_WEBSITES', outcome: 'INSPECTED_NO_MATCH', telemetry: { mode: 'STATIC', pagesInspected: 1 } },
+        { requestedUrl: 'https://unknown.example', surface: 'CREATOR_WEBSITES', outcome: 'INCONCLUSIVE' },
+      ],
+    },
+  });
+  assert.equal(noRendered.renderedCrawls, 0);
+});
+
+test('rendered producer preserves gate-admission time for hour attribution', () => {
+  const producerInput = {
+    requestsStarted: 1,
+    crawlStartedAt: '2026-11-10T11:00:00.000Z',
+  };
+  const producerTelemetry = renderedCrawlerTelemetry({
+    inspectedPages: 1,
+    clicks: 0,
+    complete: true,
+    telemetry: producerInput,
+  });
+  const summary = summarizeAcquisitionInspection({
+    inspection: {
+      acquisitionOutcomes: [{
+        requestedUrl: 'https://producer.example',
+        surface: 'CREATOR_WEBSITES',
+        outcome: 'ACQUIRED',
+        telemetry: producerTelemetry,
+      }],
+    },
+  });
+  assert.equal(summary.renderedCrawls, 1);
+  assert.deepEqual(summary.renderedCrawlStartedAt, ['2026-11-10T11:00:00.000Z']);
 });
 
 test('acquired and external blocking require affirmative evidence', () => {
@@ -281,6 +346,7 @@ test('lane telemetry writer appends one bounded row when enabled', async () => {
     summary: {
       pagesInspected: 1,
       requestsStarted: 1,
+      renderedCrawls: 2,
       workRemaining: 0,
       signals: {
         observations: 1,
@@ -312,8 +378,50 @@ test('lane telemetry writer appends one bounded row when enabled', async () => {
   const detail = JSON.parse(String(calls[0].values[12]));
   assert.equal(detail.note, 'bounded');
   assert.equal(detail.ignored, undefined, 'nested detail values are dropped');
+  assert.equal(detail.renderedCrawls, 2);
   assert.equal(detail.observations, 1);
   assert.equal(detail.processedObservations, 1);
+});
+
+test('renderedCrawls is reserved before caller detail and cannot be overridden', async () => {
+  const calls: Array<{ sql: string; values: unknown[] }> = [];
+  const filler = Object.fromEntries(
+    Array.from({ length: 20 }, (_, index) => [`k${index}`, index]),
+  );
+  await recordAcquisitionLaneEvent({
+    attribution: { lane: 'RETRY', channelId: 'chan-3', jobId: 'job-3' },
+    outcome: 'ACQUIRED',
+    summary: {
+      pagesInspected: 1,
+      requestsStarted: 1,
+      renderedCrawls: 2,
+      renderedCrawlStartedAt: ['2026-11-10T11:00:00.000Z', '2026-11-10T11:05:00.000Z'],
+      workRemaining: 0,
+      signals: {
+        observations: 1,
+        effectiveObservations: 1,
+        requiredObservations: 1,
+        foundObservations: 1,
+        failedObservations: 0,
+        partialObservations: 0,
+        inspectedNoMatchObservations: 0,
+        retryOwningObservations: 0,
+        infrastructureFailureObservations: 0,
+        conclusiveBlockObservations: 0,
+        processedObservations: 1,
+      },
+    },
+    detail: { ...filler, renderedCrawls: 999 },
+  }, {
+    enabled: () => true,
+    query: async (sql, values) => { calls.push({ sql, values }); return undefined; },
+  });
+  const detail = JSON.parse(String(calls[0].values[12]));
+  assert.equal(detail.renderedCrawls, 2, 'summary value wins and survives the 20-key bound');
+  assert.deepEqual(detail.renderedCrawlStartedAt, [
+    '2026-11-10T11:00:00.000Z',
+    '2026-11-10T11:05:00.000Z',
+  ]);
 });
 
 test('lane telemetry writer reports duplicate no-ops, bounds capacityEvent, and never throws', async () => {

@@ -219,6 +219,14 @@ export interface BrowserFallbackTelemetry {
    * instrumentation.
    */
   gateWaitMs?: number;
+  /**
+   * UTC timestamp when the gate admitted this rendered seed. Used to attribute
+   * each browser crawl to the correct hour when an inspection crosses an hour
+   * boundary. Absent for gate refusals/launch failures before admission.
+   */
+  crawlStartedAt?: string;
+  /** UTC timestamp when this rendered seed's crawl ended. */
+  crawlFinishedAt?: string;
 }
 
 export function browserFallbackTelemetrySummary(telemetry: BrowserFallbackTelemetry): string {
@@ -4460,6 +4468,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
       // consumes budget while waiting behind a serialized predecessor instead
       // of occupying a gate slot with a fresh clock — the pre-lock semantics.
       const startedAt = gateAdmittedAtMs;
+      telemetry.crawlStartedAt = new Date(startedAt).toISOString();
       const { PlaywrightCrawler, RequestQueue, Configuration } = await import('crawlee');
       // Crawlee 3.18 registers anonymous process-wide `migrating`/`aborting`
       // listeners for every RequestQueue instance and never removes them, and
@@ -6178,6 +6187,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         publishEvidenceControlCertificate(true);
         return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,coverageGapRetryable:true,failureClass,telemetry,dropReasons:drops.snapshot(),interactionGap:interactionGap||undefined,evidenceControlsTotal:evidenceControlsSeen||undefined,evidenceControlsClicked:evidenceControlsClicked||undefined,evidenceControlsFailed:evidenceControlsFailed||undefined,evidenceControlsSkipped:evidenceControlsSkipped||undefined,evidenceControlsNavigableOnly:(evidenceControlsNavigableOnly&&!evidenceControlsClickableWindow)||undefined,evidenceControlsUncertified:(evidenceControlsUncertified||uncertifiedRequestKeys.size>0)||undefined,evidenceControlsOffsetAdvance:evidenceControlsOffsetAdvance||undefined,detail:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
       } finally {
+        telemetry.crawlFinishedAt = new Date().toISOString();
         // The isolated queue must never outlive its crawl: the lifecycle
         // finalizer drops it on success, failure, and unexpected throws alike
         // (best-effort with a bounded warning — see dropIsolatedRenderedQueue)
@@ -6203,6 +6213,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
       }
     }));
   } catch (error:any) {
+    if (!telemetry.crawlFinishedAt) telemetry.crawlFinishedAt = new Date().toISOString();
     const candidates=mergeDiscordCandidates(discovered);
     const saturated=error?.message==='RENDERED_FALLBACK_SATURATED';
     // Saturation is explicit browser-gate capacity, not a browser defect: keep
