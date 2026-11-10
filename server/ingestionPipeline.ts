@@ -903,10 +903,12 @@ async function processChannelThroughPipelineInContext(
   const classificationDiagnosticId=await observeProductionDiagnosticReliably({type:'PRODUCTION_DIAGNOSTIC',input:{channelId:candidate.channelId,input:productionClassification.input,decision:productionClassification.decision,jobId:activeJobId,queryRunId:activeRunId,nominationId:candidate.nominationId}})
     .catch(error=>{console.warn(`[ClassificationDiagnostics] write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error);return undefined;});
   let tradingVal = productionClassification.result;
-  if (routingActive && classificationRouting?.reasonCodes.includes('NON_TERMINAL_NEGATIVE_EVIDENCE_REQUIRES_REVIEW')) {
+  if (routingActive && classificationRouting?.humanReview === true
+    && (classificationRouting.reasonCodes.includes('NON_TERMINAL_NEGATIVE_EVIDENCE_REQUIRES_REVIEW')
+      || classificationRouting.reasonCodes.includes('NON_TRADING_CONTENT_FOCUS_REQUIRES_REVIEW'))) {
     // The evidence policy already refuses keyword-only rejection; this is the
-    // final pipeline guard so a malformed NON_TRADING decision cannot skip
-    // human review.
+    // final pipeline guard so a malformed NON_TRADING decision, or a confirmed
+    // decision whose video sample contradicts its bio, cannot skip human review.
     tradingVal = { ...tradingVal, status: 'UNCERTAIN' };
   }
   void recordAdmissionShadow({channelId:candidate.channelId,priorState:'NOT_EVALUATED',classificationStatus:productionClassification.decision.status,

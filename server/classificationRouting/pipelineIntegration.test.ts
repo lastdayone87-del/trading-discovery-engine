@@ -7,7 +7,7 @@ const pipeline = readFileSync(new URL('../ingestionPipeline.ts', import.meta.url
 test('pipeline uses the deterministic routing decision for review and non-terminal negative guards', () => {
   assert.match(pipeline, /resolveClassificationRoutingMode/);
   assert.match(pipeline, /deterministicReview\s*=\s*routingActive\s*&&\s*classificationRouting\?\.humanReview/);
-  assert.match(pipeline, /NON_TERMINAL_NEGATIVE_EVIDENCE_REQUIRES_REVIEW/);
+  assert.match(pipeline, /NON_TERMINAL_NEGATIVE_EVIDENCE_REQUIRES_REVIEW/);assert.match(pipeline, /NON_TRADING_CONTENT_FOCUS_REQUIRES_REVIEW/);
   assert.match(pipeline, /plausibleTradingHypothesis:independentHypothesis\|\|deterministicReview/);
 });
 

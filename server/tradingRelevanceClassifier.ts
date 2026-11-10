@@ -48,7 +48,17 @@ export async function classifyTradingRelevanceDetailed(
   input.evidence_corpus = buildCanonicalEvidenceCorpus(input);
   const decision: VerificationDecision = await verifyChannelTradingRelevance(input);
   const corroboration = decision.stagedClassification?.stages.find(stage => stage.stage === 'CORROBORATION');
-  const routing = resolveClassificationRouting(decision, { independentEvidence: corroboration?.disposition === 'PASS' });
+  const channelText = [
+    input.channel_name, input.description,
+    ...(input.video_titles || []), ...(input.video_descriptions || []),
+    ...(input.videos || []).flatMap(video => [video.title, video.description || '']),
+  ].filter(Boolean).join(' ');
+  const videoSampleCount = input.videos?.length || input.video_titles?.length || 0;
+  const routing = resolveClassificationRouting(decision, {
+    independentEvidence: corroboration?.disposition === 'PASS',
+    channelText,
+    videoSampleCount,
+  });
   decision.deterministicRouting = routing;
 
   // Map to legacy breakdown format while adding rich evidence audit details

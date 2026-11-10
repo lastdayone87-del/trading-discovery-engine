@@ -46,6 +46,10 @@ export interface ClassificationRoutingOptions {
    * only when the evidence is already sufficient and independent.
    */
   independentEvidence?: boolean;
+  /** Creator-owned text used only for a precision review guard. */
+  channelText?: string;
+  /** Number of observed video documents in the evidence bundle. */
+  videoSampleCount?: number;
   mode?: 'ACTIVE' | 'LEGACY';
 }
 
@@ -53,6 +57,27 @@ type RoutingInput = Pick<
   VerificationDecision,
   'status' | 'confidenceScore' | 'evidenceCollection' | 'recognitionState' | 'semanticPolicy' | 'decisionPolicy' | 'classificationMethod'
 >;
+
+export const STRONG_TRADING_ANALYSIS = /(technical\s*analysis|price\s*action|market\s*analysis|\bict\b|\bsmc\b|day\s*trad|swing\s*trad|scalp|live\s*trad|trade\s*setup|trade\s*journal|back\s*test|backtest|risk\s*management|chart\s*analysis|market\s*structure|volume\s*profile|footprint|forex\s*analysis|futures?\s*analysis|options?\s*analysis|stock\s*analysis|crypto\s*analysis|support\s*and\s*resistance|candlestick|breakout|pullback|moving\s*average|\brsi\b|\bmacd\b|fibonacci|elliott|wyckoff|\bpnl\b|p\s*&\s*l|trading\s*strategy|trading\s*education|market\s*update|market\s*recap|price\s*analysis|market\s*outlook|gold\s*analysis|silver\s*analysis|metals?\s*analysis|commodity\s*analysis|platinum\s*analysis|capital\s*market|\bvix\b|macro\s*(?:analysis|outlook|commentary|positioning)|market\s*crash|прогноз|анализ|تحلیل\s*(?:تکنیکال|بازار|فنی)|ترید|معامله\s*گری|технический\s*анализ|анализ\s*рынка|трейдинг|analyse\s*(?:technique|du\s*marché)|analyse\s*de\s*marché|技術分析|技術的な分析|차트\s*분석|기술적\s*분석|analyse\s*technique|an[aá]lisis\s*t[eé]cnico|analisi\s*tecnica|technische\s*analyse|teknik\s*analiz|テクニカル分析|技术分析|تحليل\s*فني|технический\s*анализ)/iu;
+const NON_TRADING_FOCUS: Array<[string, RegExp]> = [
+  ['ENTERTAINMENT', /(dance|dancing|choreography|music|song|lyrics|vlog|prank|recipe|cooking|gaming|gameplay|fortnite|minecraft|makeup|beauty|unboxing|reaction)/giu],
+  ['PROMOTION', /(memecoin|meme\s*coin|presale|pre-sale|airdrop|nft|play[\s-]*to[\s-]*earn|giveaway|sponsorship|sponsored|referral|token\s*launch|pump|buy\s*\$|contract\s*address)/giu],
+  ['PERSONAL_FINANCE', /(personal\s*finance|debt|budget|credit\s*card|credit|savings?|mortgage|retirement|paycheck|money\s*management|get\s*out\s*of\s*debt|win\s*with\s*money)/giu],
+  ['EXCHANGE_CORPORATE', /(stock\s*exchange|listing|award|gong|corporate|annual\s*report|market\s*opening|ceremony|beleggingsoplossing)/giu],
+];
+
+export function nonTradingContentFocus(text: string): { total: number; categories: string[] } {
+  const categories: string[] = [];
+  let total = 0;
+  for (const [name, pattern] of NON_TRADING_FOCUS) {
+    const matches = text.match(pattern) || [];
+    if (matches.length > 0) {
+      categories.push(name);
+      total += matches.length;
+    }
+  }
+  return { total, categories };
+}
 
 function semanticProviderReports(decision: RoutingInput) {
   return (decision.evidenceCollection.providers || []).filter(provider =>
@@ -157,6 +182,25 @@ export function resolveClassificationRouting(
   }
 
   if (decision.status === 'TRADING_CONFIRMED') {
+    // Precision review guard: a trading bio can be keyword spam or a
+    // finance-adjacent channel. When a real video sample repeatedly shows
+    // entertainment/promotion/personal-finance/exchange-corporate focus and
+    // contains no strong trading-analysis phrase, do not terminalize; send
+    // the case to human review. This never rejects and never overrides a
+    // video sample that actually contains trading analysis.
+    if (options.videoSampleCount != null && options.videoSampleCount >= 3 && options.channelText) {
+      const focus = nonTradingContentFocus(options.channelText);
+      const strongAnalysisCount = (options.channelText.match(new RegExp(STRONG_TRADING_ANALYSIS.source, 'giu')) || []).length;
+      if (strongAnalysisCount < 1 && focus.total >= 2 && focus.categories.length > 0) {
+        return result({
+          route: 'HUMAN_REVIEW', confidence, evidenceSufficiency: sufficiency,
+          recognitionState, semanticPolicy, semanticUsed: semantic.used, semanticAttempted: semantic.attempted,
+          humanReview: true,
+          fallbackReason: 'NON_TRADING_CONTENT_FOCUS_REQUIRES_REVIEW',
+          reasonCodes: ['NON_TRADING_CONTENT_FOCUS_REQUIRES_REVIEW', ...focus.categories.map(category => `NON_TRADING_FOCUS_${category}`)],
+        });
+      }
+    }
     if (semantic.used) {
       return result({
         route: 'SEMANTIC_TRADING', confidence, evidenceSufficiency: sufficiency,
