@@ -123,6 +123,8 @@ export function sanitizeAcquisitionAttribution(input: unknown): AcquisitionAttri
 }
 
 export interface AcquisitionLaneTelemetryLike {
+  /** `RENDERED` marks a real browser crawl; `STATIC` marks an HTTP fetch. */
+  mode?: unknown;
   pagesInspected?: unknown;
   requestsStarted?: unknown;
   requestsFinished?: unknown;
@@ -177,6 +179,14 @@ export interface AcquisitionLaneSummary {
   outcome: AcquisitionOutcome;
   pagesInspected: number;
   requestsStarted: number;
+  /**
+   * Unique seed URLs that actually ran the rendered browser crawler in this
+   * inspection pass. A pass can contain several seeds, and static observations
+   * must never be counted as browser crawls. Shared evidence rows are excluded
+   * because they did not refetch. Optional for callers/tests that predate the
+   * counter; the durable writer stores `0` when absent.
+   */
+  renderedCrawls?: number;
   /** Longest gate wait observed in this inspection (not a sum: each seed has
    * its own crawl and adding waits would overstate capacity pressure). */
   gateWaitMs?: number;
@@ -338,6 +348,18 @@ export function summarizeAcquisitionInspection(input: {
     : [];
   const directive = input.retryDirective || inspection?.retryDirective;
 
+  // One rendered crawl per unique seed URL. `mode` is set by the crawler
+  // telemetry constructors (RENDERED vs STATIC); shared-evidence rows carry a
+  // lender's counters and must not inflate the browser-slot count.
+  const renderedSeeds = new Set<string>();
+  observations.forEach((observation, index) => {
+    if (String(observation.telemetry?.mode || '').trim().toUpperCase() !== 'RENDERED') return;
+    if (observation.sharedEvidenceFrom) return;
+    const surface = String(observation.surface || '').trim();
+    const requestedUrl = String(observation.requestedUrl || '').trim();
+    renderedSeeds.add(`${surface}|${requestedUrl || `#${index}`}`);
+  });
+
   let pagesInspected = 0;
   let requestsStarted = 0;
   let gateWaitMs: number | undefined;
@@ -396,6 +418,7 @@ export function summarizeAcquisitionInspection(input: {
     outcome,
     pagesInspected,
     requestsStarted,
+    renderedCrawls: renderedSeeds.size,
     ...(gateWaitMs !== undefined ? { gateWaitMs } : {}),
     workRemaining,
     ...(capacityEvent ? { capacityEvent } : {}),

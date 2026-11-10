@@ -88,6 +88,32 @@ test('never executed is reserved for no work signal', () => {
   );
 });
 
+test('rendered crawl count is per unique rendered seed and excludes static/shared rows', () => {
+  const summary = summarizeAcquisitionInspection({
+    inspection: {
+      acquisitionOutcomes: [
+        { requestedUrl: 'https://a.example', surface: 'CREATOR_WEBSITES', outcome: 'FOUND', telemetry: { mode: 'RENDERED', pagesInspected: 1 } },
+        // Same seed repeated in one pass is still one browser crawl.
+        { requestedUrl: 'https://a.example', surface: 'CREATOR_WEBSITES', outcome: 'FOUND', telemetry: { mode: 'RENDERED', pagesInspected: 1 } },
+        { requestedUrl: 'https://b.example', surface: 'CREATOR_WEBSITES', outcome: 'PARTIALLY_INSPECTED', telemetry: { mode: 'RENDERED', pagesInspected: 1 } },
+        { requestedUrl: 'https://c.example', surface: 'CREATOR_WEBSITES', outcome: 'ACQUIRED', telemetry: { mode: 'STATIC', pagesInspected: 1 } },
+        { requestedUrl: 'https://d.example', surface: 'CREATOR_WEBSITES', outcome: 'FOUND', sharedEvidenceFrom: 'https://b.example', telemetry: { mode: 'RENDERED', pagesInspected: 1 } },
+      ],
+    },
+  });
+  assert.equal(summary.renderedCrawls, 2);
+
+  const noRendered = summarizeAcquisitionInspection({
+    inspection: {
+      acquisitionOutcomes: [
+        { requestedUrl: 'https://static.example', surface: 'CREATOR_WEBSITES', outcome: 'INSPECTED_NO_MATCH', telemetry: { mode: 'STATIC', pagesInspected: 1 } },
+        { requestedUrl: 'https://unknown.example', surface: 'CREATOR_WEBSITES', outcome: 'INCONCLUSIVE' },
+      ],
+    },
+  });
+  assert.equal(noRendered.renderedCrawls, 0);
+});
+
 test('acquired and external blocking require affirmative evidence', () => {
   const found = summarizeAcquisitionInspection({
     inspection: { acquisitionOutcomes: [{ required: true, outcome: 'FOUND' }] },
@@ -281,6 +307,7 @@ test('lane telemetry writer appends one bounded row when enabled', async () => {
     summary: {
       pagesInspected: 1,
       requestsStarted: 1,
+      renderedCrawls: 2,
       workRemaining: 0,
       signals: {
         observations: 1,
@@ -312,6 +339,7 @@ test('lane telemetry writer appends one bounded row when enabled', async () => {
   const detail = JSON.parse(String(calls[0].values[12]));
   assert.equal(detail.note, 'bounded');
   assert.equal(detail.ignored, undefined, 'nested detail values are dropped');
+  assert.equal(detail.renderedCrawls, 2);
   assert.equal(detail.observations, 1);
   assert.equal(detail.processedObservations, 1);
 });

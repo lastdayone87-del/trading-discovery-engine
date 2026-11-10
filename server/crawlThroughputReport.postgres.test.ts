@@ -40,6 +40,9 @@ maybe('the durable writer and report work together on the append-only table', as
   const db = await getDb();
   const client = await db.connect();
   const suffix = uniqueSuffix();
+  // Capture one timestamp before the inserts so a UTC-hour rollover cannot
+  // move the fixtures outside the one-hour report window mid-test.
+  const now = new Date();
   const channelIds = [
     `UCphase2-report-discovery-a-${suffix}`,
     `UCphase2-report-discovery-b-${suffix}`,
@@ -67,11 +70,12 @@ maybe('the durable writer and report work together on the append-only table', as
         summary: {
           pagesInspected: 2,
           requestsStarted: 3,
+          renderedCrawls: 1,
           ...(fixture.gateWaitMs !== undefined ? { gateWaitMs: fixture.gateWaitMs } : {}),
           workRemaining: 0,
           signals: signals(),
         },
-        observedAt: new Date().toISOString(),
+        observedAt: now.toISOString(),
       }, {
         enabled: () => true,
         query: (sql, values) => client.query(sql, values),
@@ -79,11 +83,10 @@ maybe('the durable writer and report work together on the append-only table', as
       assert.equal(written, true, `writer must persist ${fixture.channelId}`);
     }
 
-    const now = new Date();
     const windowStart = crawlThroughputWindowStart(now, 1);
     const result = await client.query(
       `SELECT observed_at, lane, outcome, gate_wait_ms,
-              pages_inspected, requests_started, capacity_event, channel_id
+              pages_inspected, requests_started, capacity_event, detail, channel_id
          FROM acquisition_lane_events
         WHERE observed_at >= $1
         ORDER BY observed_at`,
@@ -95,8 +98,9 @@ maybe('the durable writer and report work together on the append-only table', as
     assert.equal(rows.length, 3);
 
     const report = buildCrawlThroughputReport(rows, { windowHours: 1, now });
-    assert.equal(report.totals.capacityCrawlAttempts, 3);
-    assert.equal(report.totals.discoveryCrawlAttempts, 2);
+    assert.equal(report.totals.inspectionPasses, 3);
+    assert.equal(report.totals.browserCrawls, 3);
+    assert.equal(report.totals.discoveryBrowserCrawls, 2);
     assert.equal(report.gates.discoverySharePct, 66.67);
     assert.deepEqual(report.totals.gateWait, {
       samples: 2,

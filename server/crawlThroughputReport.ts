@@ -2,18 +2,18 @@
  * Phase 2 Option C crawl-throughput report (pure).
  *
  * The report is derived from the append-only `acquisition_lane_events`
- * baseline. It deliberately separates capacity-lane crawls (DISCOVERY,
- * ENRICHMENT, RETRY, MANUAL) from maintenance events: maintenance jobs are
- * DB-local and must not consume the single browser-slot budget.
+ * baseline. One lane event is one inspection pass; `detail.renderedCrawls`
+ * records how many unique seed URLs actually ran the rendered browser crawler
+ * in that pass. Static HTTP observations are deliberately not browser crawls.
  *
  * Two gates are reported:
- *   * capacity crawls/hour against the 40/h nominal target and the 48/h
- *     emergency ceiling; and
- *   * the DISCOVERY share of capacity crawls against the 35% floor.
+ *   * rendered browser crawls/hour against the 40/h nominal target and the
+ *     48/h emergency ceiling; and
+ *   * the DISCOVERY share of rendered browser crawls against the 35% floor.
  *
- * An event counts as a crawl attempt unless the outcome proves no crawl
- * started (NEVER_EXECUTED, CAPACITY_DEFERRED, RUNTIME_UNAVAILABLE). A failed
- * or inconclusive crawl still consumed slot time and therefore counts.
+ * Every lane is included in the browser-crawl total, including MAINTENANCE
+ * (recovery workers can invoke the browser fallback) and UNKNOWN. Those lanes
+ * are separately counted so no browser work can hide from the ceiling.
  */
 
 export const PHASE2_NOMINAL_CRAWLS_PER_HOUR = 40;
@@ -24,8 +24,14 @@ export const PHASE2_REPORT_MAX_WINDOW_HOURS = 168;
 
 const HOUR_MS = 60 * 60 * 1000;
 
-const CAPACITY_LANES = new Set(['DISCOVERY', 'ENRICHMENT', 'RETRY', 'MANUAL']);
-const KNOWN_LANES = new Set([...CAPACITY_LANES, 'MAINTENANCE', 'UNKNOWN']);
+const KNOWN_LANES = new Set([
+  'DISCOVERY',
+  'ENRICHMENT',
+  'RETRY',
+  'MANUAL',
+  'MAINTENANCE',
+  'UNKNOWN',
+]);
 const KNOWN_OUTCOMES = new Set([
   'ACQUIRED',
   'INSPECTED_NO_MATCH',
@@ -37,7 +43,6 @@ const KNOWN_OUTCOMES = new Set([
   'NEVER_EXECUTED',
   'INCONCLUSIVE',
 ]);
-const NO_CRAWL_OUTCOMES = new Set(['NEVER_EXECUTED', 'CAPACITY_DEFERRED', 'RUNTIME_UNAVAILABLE']);
 const COMPLETED_OUTCOMES = new Set([
   'ACQUIRED',
   'INSPECTED_NO_MATCH',
@@ -53,21 +58,21 @@ export interface CrawlThroughputEventRow {
   pages_inspected?: unknown;
   requests_started?: unknown;
   capacity_event?: unknown;
+  detail?: unknown;
 }
 
 export interface CrawlThroughputBucket {
   /** ISO timestamp for the start of the UTC hour. */
   hour: string;
-  events: number;
-  crawlAttempts: number;
-  capacityCrawlAttempts: number;
-  discoveryCrawlAttempts: number;
-  completed: number;
-  failed: number;
-  deferred: number;
-  runtimeUnavailable: number;
-  inconclusive: number;
-  neverExecuted: number;
+  inspectionPasses: number;
+  browserCrawls: number;
+  discoveryBrowserCrawls: number;
+  completedPasses: number;
+  failedPasses: number;
+  deferredPasses: number;
+  runtimeUnavailablePasses: number;
+  inconclusivePasses: number;
+  neverExecutedPasses: number;
   discoverySharePct: number | null;
   gateWait: {
     samples: number;
@@ -77,17 +82,19 @@ export interface CrawlThroughputBucket {
 }
 
 export interface CrawlThroughputTotals {
-  events: number;
-  crawlAttempts: number;
-  capacityCrawlAttempts: number;
-  discoveryCrawlAttempts: number;
-  otherLaneAttempts: number;
-  completed: number;
-  failed: number;
-  deferred: number;
-  runtimeUnavailable: number;
-  inconclusive: number;
-  neverExecuted: number;
+  inspectionPasses: number;
+  browserCrawls: number;
+  discoveryBrowserCrawls: number;
+  maintenanceBrowserCrawls: number;
+  unknownBrowserCrawls: number;
+  completedPasses: number;
+  failedPasses: number;
+  deferredPasses: number;
+  runtimeUnavailablePasses: number;
+  inconclusivePasses: number;
+  neverExecutedPasses: number;
+  /** Passes whose row predates or lacks a trustworthy `renderedCrawls`. */
+  unmeteredPasses: number;
   discoverySharePct: number | null;
   gateWait: {
     samples: number;
@@ -101,18 +108,26 @@ export interface CrawlThroughputGates {
   emergencyCeilingPerHour: number;
   discoveryFloorPct: number;
   elapsedHours: number;
-  observedCrawlsPerHour: number;
-  peakCrawlsPerHour: number;
+  observedBrowserCrawlsPerHour: number;
+  peakBrowserCrawlsPerHour: number;
   discoverySharePct: number | null;
   nominalTargetMet: boolean;
   emergencyCeilingExceeded: boolean;
   discoveryFloorMet: boolean;
 }
 
+export type CrawlThroughputLane = 'DISCOVERY' | 'ENRICHMENT' | 'RETRY' | 'MANUAL' | 'MAINTENANCE' | 'UNKNOWN';
+
+export type CrawlThroughputLaneTotals = Record<CrawlThroughputLane, {
+  inspectionPasses: number;
+  browserCrawls: number;
+}>;
+
 export interface CrawlThroughputReport {
   generatedAt: string;
   windowHours: number;
   windowStart: string;
+  lanes: CrawlThroughputLaneTotals;
   totals: CrawlThroughputTotals;
   buckets: CrawlThroughputBucket[];
   gates: CrawlThroughputGates;
@@ -164,21 +179,6 @@ function average(sum: number, samples: number): number | null {
   return Math.round(sum / samples);
 }
 
-function parseBoundedInteger(rawValue: string, flag: string, min: number, max: number): number {
-  if (!/^\d+$/.test(rawValue)) {
-    throw new Error(`${flag} must be an integer between ${min} and ${max}: "${rawValue}"`);
-  }
-  const value = Number(rawValue);
-  if (!Number.isSafeInteger(value) || value < min || value > max) {
-    throw new Error(`${flag} must be an integer between ${min} and ${max}: "${rawValue}"`);
-  }
-  return value;
-}
-
-/**
- * Strict argument parsing: unknown or malformed tokens fail instead of being
- * silently ignored. A bare `--window-hours` must not be treated as a default.
- */
 /**
  * First UTC hour bucket included by the report. The current hour is partial;
  * the window includes it plus the preceding `windowHours - 1` hours.
@@ -194,6 +194,21 @@ export function crawlThroughputWindowStart(now: Date, windowHours?: number): Dat
   return new Date(currentHourMs - (hours - 1) * HOUR_MS);
 }
 
+function parseBoundedInteger(rawValue: string, flag: string, min: number, max: number): number {
+  if (!/^\d+$/.test(rawValue)) {
+    throw new Error(`${flag} must be an integer between ${min} and ${max}: "${rawValue}"`);
+  }
+  const value = Number(rawValue);
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new Error(`${flag} must be an integer between ${min} and ${max}: "${rawValue}"`);
+  }
+  return value;
+}
+
+/**
+ * Strict argument parsing: unknown or malformed tokens fail instead of being
+ * silently ignored. A bare `--window-hours` must not be treated as a default.
+ */
 export function parsePhase2CrawlThroughputReportArgs(
   argv: readonly string[],
 ): CrawlThroughputReportArgs {
@@ -224,18 +239,28 @@ export function parsePhase2CrawlThroughputReportArgs(
   return args;
 }
 
+function renderedCrawlsFromRow(row: CrawlThroughputEventRow): { value: number; metered: boolean } {
+  const detail = row.detail;
+  if (!detail || typeof detail !== 'object' || Array.isArray(detail)) {
+    return { value: 0, metered: false };
+  }
+  const raw = (detail as Record<string, unknown>).renderedCrawls;
+  const parsed = typeof raw === 'number' ? raw : Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return { value: 0, metered: false };
+  return { value: Math.floor(parsed), metered: true };
+}
+
 interface MutableBucket {
   hourMs: number;
-  events: number;
-  crawlAttempts: number;
-  capacityCrawlAttempts: number;
-  discoveryCrawlAttempts: number;
-  completed: number;
-  failed: number;
-  deferred: number;
-  runtimeUnavailable: number;
-  inconclusive: number;
-  neverExecuted: number;
+  inspectionPasses: number;
+  browserCrawls: number;
+  discoveryBrowserCrawls: number;
+  completedPasses: number;
+  failedPasses: number;
+  deferredPasses: number;
+  runtimeUnavailablePasses: number;
+  inconclusivePasses: number;
+  neverExecutedPasses: number;
   gateWaitSamples: number;
   gateWaitSum: number;
   gateWaitMax: number;
@@ -244,16 +269,15 @@ interface MutableBucket {
 function emptyBucket(hourMs: number): MutableBucket {
   return {
     hourMs,
-    events: 0,
-    crawlAttempts: 0,
-    capacityCrawlAttempts: 0,
-    discoveryCrawlAttempts: 0,
-    completed: 0,
-    failed: 0,
-    deferred: 0,
-    runtimeUnavailable: 0,
-    inconclusive: 0,
-    neverExecuted: 0,
+    inspectionPasses: 0,
+    browserCrawls: 0,
+    discoveryBrowserCrawls: 0,
+    completedPasses: 0,
+    failedPasses: 0,
+    deferredPasses: 0,
+    runtimeUnavailablePasses: 0,
+    inconclusivePasses: 0,
+    neverExecutedPasses: 0,
     gateWaitSamples: 0,
     gateWaitSum: 0,
     gateWaitMax: 0,
@@ -263,17 +287,16 @@ function emptyBucket(hourMs: number): MutableBucket {
 function finalizeBucket(bucket: MutableBucket): CrawlThroughputBucket {
   return {
     hour: isoHour(bucket.hourMs),
-    events: bucket.events,
-    crawlAttempts: bucket.crawlAttempts,
-    capacityCrawlAttempts: bucket.capacityCrawlAttempts,
-    discoveryCrawlAttempts: bucket.discoveryCrawlAttempts,
-    completed: bucket.completed,
-    failed: bucket.failed,
-    deferred: bucket.deferred,
-    runtimeUnavailable: bucket.runtimeUnavailable,
-    inconclusive: bucket.inconclusive,
-    neverExecuted: bucket.neverExecuted,
-    discoverySharePct: percent(bucket.discoveryCrawlAttempts, bucket.capacityCrawlAttempts),
+    inspectionPasses: bucket.inspectionPasses,
+    browserCrawls: bucket.browserCrawls,
+    discoveryBrowserCrawls: bucket.discoveryBrowserCrawls,
+    completedPasses: bucket.completedPasses,
+    failedPasses: bucket.failedPasses,
+    deferredPasses: bucket.deferredPasses,
+    runtimeUnavailablePasses: bucket.runtimeUnavailablePasses,
+    inconclusivePasses: bucket.inconclusivePasses,
+    neverExecutedPasses: bucket.neverExecutedPasses,
+    discoverySharePct: percent(bucket.discoveryBrowserCrawls, bucket.browserCrawls),
     gateWait: {
       samples: bucket.gateWaitSamples,
       averageMs: average(bucket.gateWaitSum, bucket.gateWaitSamples),
@@ -315,9 +338,22 @@ export function buildCrawlThroughputReport(
   let invalidTimestamp = 0;
   let unknownLane = 0;
   let unknownOutcome = 0;
+  let unmeteredPasses = 0;
   let totalGateWaitSamples = 0;
   let totalGateWaitSum = 0;
   let totalGateWaitMax = 0;
+  let browserCrawls = 0;
+  let discoveryBrowserCrawls = 0;
+  let maintenanceBrowserCrawls = 0;
+  let unknownBrowserCrawls = 0;
+  const laneTotals: CrawlThroughputLaneTotals = {
+    DISCOVERY: { inspectionPasses: 0, browserCrawls: 0 },
+    ENRICHMENT: { inspectionPasses: 0, browserCrawls: 0 },
+    RETRY: { inspectionPasses: 0, browserCrawls: 0 },
+    MANUAL: { inspectionPasses: 0, browserCrawls: 0 },
+    MAINTENANCE: { inspectionPasses: 0, browserCrawls: 0 },
+    UNKNOWN: { inspectionPasses: 0, browserCrawls: 0 },
+  };
 
   for (const row of rows) {
     const observedMs = typeof row.observed_at === 'string' || row.observed_at instanceof Date
@@ -332,16 +368,13 @@ export function buildCrawlThroughputReport(
       continue;
     }
 
-    const lane = String(row.lane || '').trim().toUpperCase();
+    const rawLane = String(row.lane || '').trim().toUpperCase();
+    const lane = (KNOWN_LANES.has(rawLane) ? rawLane : 'UNKNOWN') as CrawlThroughputLane;
+    if (lane === 'UNKNOWN' && rawLane !== 'UNKNOWN') unknownLane += 1;
+
     const outcome = String(row.outcome || '').trim().toUpperCase();
-    if (!KNOWN_LANES.has(lane)) {
-      unknownLane += 1;
-      continue;
-    }
-    if (!KNOWN_OUTCOMES.has(outcome)) {
-      unknownOutcome += 1;
-      continue;
-    }
+    const knownOutcome = KNOWN_OUTCOMES.has(outcome);
+    if (!knownOutcome) unknownOutcome += 1;
 
     const hourMs = Math.floor(observedMs / HOUR_MS) * HOUR_MS;
     const bucket = buckets.get(hourMs);
@@ -350,23 +383,31 @@ export function buildCrawlThroughputReport(
       continue;
     }
 
-    bucket.events += 1;
-    const capacityLane = CAPACITY_LANES.has(lane);
-    const noCrawl = NO_CRAWL_OUTCOMES.has(outcome);
-    if (!noCrawl) {
-      bucket.crawlAttempts += 1;
-      if (capacityLane) {
-        bucket.capacityCrawlAttempts += 1;
-        if (lane === 'DISCOVERY') bucket.discoveryCrawlAttempts += 1;
-      }
+    const rendered = renderedCrawlsFromRow(row);
+    if (!rendered.metered) unmeteredPasses += 1;
+
+    bucket.inspectionPasses += 1;
+    bucket.browserCrawls += rendered.value;
+    browserCrawls += rendered.value;
+    laneTotals[lane].inspectionPasses += 1;
+    laneTotals[lane].browserCrawls += rendered.value;
+    if (lane === 'DISCOVERY') {
+      bucket.discoveryBrowserCrawls += rendered.value;
+      discoveryBrowserCrawls += rendered.value;
+    } else if (lane === 'MAINTENANCE') {
+      maintenanceBrowserCrawls += rendered.value;
+    } else if (lane === 'UNKNOWN') {
+      unknownBrowserCrawls += rendered.value;
     }
 
-    if (outcome === 'CAPACITY_DEFERRED') bucket.deferred += 1;
-    else if (outcome === 'RUNTIME_UNAVAILABLE') bucket.runtimeUnavailable += 1;
-    else if (outcome === 'NEVER_EXECUTED') bucket.neverExecuted += 1;
-    else if (outcome === 'INCONCLUSIVE') bucket.inconclusive += 1;
-    else if (outcome === 'ACQUISITION_FAILED') bucket.failed += 1;
-    else if (COMPLETED_OUTCOMES.has(outcome)) bucket.completed += 1;
+    if (knownOutcome) {
+      if (outcome === 'CAPACITY_DEFERRED') bucket.deferredPasses += 1;
+      else if (outcome === 'RUNTIME_UNAVAILABLE') bucket.runtimeUnavailablePasses += 1;
+      else if (outcome === 'NEVER_EXECUTED') bucket.neverExecutedPasses += 1;
+      else if (outcome === 'INCONCLUSIVE') bucket.inconclusivePasses += 1;
+      else if (outcome === 'ACQUISITION_FAILED') bucket.failedPasses += 1;
+      else if (COMPLETED_OUTCOMES.has(outcome)) bucket.completedPasses += 1;
+    }
 
     const gateWaitMs = numeric(row.gate_wait_ms);
     if (gateWaitMs > 0) {
@@ -384,69 +425,70 @@ export function buildCrawlThroughputReport(
     .map(finalizeBucket);
 
   const totals = finalized.reduce<CrawlThroughputTotals>((acc, bucket) => {
-    acc.events += bucket.events;
-    acc.crawlAttempts += bucket.crawlAttempts;
-    acc.capacityCrawlAttempts += bucket.capacityCrawlAttempts;
-    acc.discoveryCrawlAttempts += bucket.discoveryCrawlAttempts;
-    acc.otherLaneAttempts += bucket.crawlAttempts - bucket.capacityCrawlAttempts;
-    acc.completed += bucket.completed;
-    acc.failed += bucket.failed;
-    acc.deferred += bucket.deferred;
-    acc.runtimeUnavailable += bucket.runtimeUnavailable;
-    acc.inconclusive += bucket.inconclusive;
-    acc.neverExecuted += bucket.neverExecuted;
+    acc.inspectionPasses += bucket.inspectionPasses;
+    acc.browserCrawls += bucket.browserCrawls;
+    acc.discoveryBrowserCrawls += bucket.discoveryBrowserCrawls;
+    acc.completedPasses += bucket.completedPasses;
+    acc.failedPasses += bucket.failedPasses;
+    acc.deferredPasses += bucket.deferredPasses;
+    acc.runtimeUnavailablePasses += bucket.runtimeUnavailablePasses;
+    acc.inconclusivePasses += bucket.inconclusivePasses;
+    acc.neverExecutedPasses += bucket.neverExecutedPasses;
     acc.gateWait.samples += bucket.gateWait.samples;
     acc.gateWait.maxMs = Math.max(acc.gateWait.maxMs ?? 0, bucket.gateWait.maxMs ?? 0);
     return acc;
   }, {
-    events: 0,
-    crawlAttempts: 0,
-    capacityCrawlAttempts: 0,
-    discoveryCrawlAttempts: 0,
-    otherLaneAttempts: 0,
-    completed: 0,
-    failed: 0,
-    deferred: 0,
-    runtimeUnavailable: 0,
-    inconclusive: 0,
-    neverExecuted: 0,
+    inspectionPasses: 0,
+    browserCrawls: 0,
+    discoveryBrowserCrawls: 0,
+    maintenanceBrowserCrawls,
+    unknownBrowserCrawls,
+    completedPasses: 0,
+    failedPasses: 0,
+    deferredPasses: 0,
+    runtimeUnavailablePasses: 0,
+    inconclusivePasses: 0,
+    neverExecutedPasses: 0,
+    unmeteredPasses,
     discoverySharePct: null,
     gateWait: { samples: 0, averageMs: null, maxMs: null },
   });
 
   totals.gateWait.averageMs = average(totalGateWaitSum, totalGateWaitSamples);
   totals.gateWait.maxMs = totalGateWaitSamples > 0 ? totalGateWaitMax : null;
-  totals.discoverySharePct = percent(totals.discoveryCrawlAttempts, totals.capacityCrawlAttempts);
+  totals.discoverySharePct = percent(totals.discoveryBrowserCrawls, totals.browserCrawls);
 
-  const peakCrawlsPerHour = finalized.reduce(
-    (max, bucket) => Math.max(max, bucket.capacityCrawlAttempts),
+  const peakBrowserCrawlsPerHour = finalized.reduce(
+    (max, bucket) => Math.max(max, bucket.browserCrawls),
     0,
   );
-  const observedCrawlsPerHour = Math.round((totals.capacityCrawlAttempts / elapsedHours) * 100) / 100;
+  const observedBrowserCrawlsPerHour = Math.round((browserCrawls / elapsedHours) * 100) / 100;
   const discoverySharePct = totals.discoverySharePct;
-  const nominalTargetMet = totals.capacityCrawlAttempts > 0 && observedCrawlsPerHour >= nominalTargetPerHour;
-  const emergencyCeilingExceeded = peakCrawlsPerHour > emergencyCeilingPerHour;
+  const nominalTargetMet = browserCrawls > 0 && observedBrowserCrawlsPerHour >= nominalTargetPerHour;
+  const emergencyCeilingExceeded = peakBrowserCrawlsPerHour > emergencyCeilingPerHour;
   const discoveryFloorMet = discoverySharePct !== null && discoverySharePct >= discoveryFloorPct;
 
   const failures: string[] = [];
-  if (totals.capacityCrawlAttempts === 0) {
-    failures.push('no_capacity_crawl_data');
+  if (browserCrawls === 0) {
+    failures.push('no_browser_crawl_data');
   } else {
-    if (!nominalTargetMet) failures.push('crawls_per_hour_below_nominal_target');
+    if (!nominalTargetMet) failures.push('browser_crawls_per_hour_below_nominal_target');
     if (!discoveryFloorMet) failures.push('discovery_share_below_floor');
   }
-  if (emergencyCeilingExceeded) failures.push('peak_crawls_per_hour_above_emergency_ceiling');
+  if (emergencyCeilingExceeded) failures.push('peak_browser_crawls_per_hour_above_emergency_ceiling');
 
   const warnings: string[] = [];
   if (invalidTimestamp > 0) warnings.push(`invalid_timestamp_rows:${invalidTimestamp}`);
   if (ignoredOutOfWindow > 0) warnings.push(`out_of_window_rows:${ignoredOutOfWindow}`);
   if (unknownLane > 0) warnings.push(`unknown_lane_rows:${unknownLane}`);
   if (unknownOutcome > 0) warnings.push(`unknown_outcome_rows:${unknownOutcome}`);
+  if (unmeteredPasses > 0) warnings.push(`unmetered_rendered_crawl_rows:${unmeteredPasses}`);
 
   return {
     generatedAt: now.toISOString(),
     windowHours,
     windowStart: isoHour(startHourMs),
+    lanes: laneTotals,
     totals,
     buckets: finalized,
     gates: {
@@ -454,8 +496,8 @@ export function buildCrawlThroughputReport(
       emergencyCeilingPerHour,
       discoveryFloorPct,
       elapsedHours: Math.round(elapsedHours * 100) / 100,
-      observedCrawlsPerHour,
-      peakCrawlsPerHour,
+      observedBrowserCrawlsPerHour,
+      peakBrowserCrawlsPerHour,
       discoverySharePct,
       nominalTargetMet,
       emergencyCeilingExceeded,

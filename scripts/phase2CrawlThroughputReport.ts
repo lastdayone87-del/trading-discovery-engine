@@ -47,7 +47,7 @@ async function main(): Promise<void> {
     try {
       const result = await client.query(
         `SELECT observed_at, lane, outcome, gate_wait_ms,
-                pages_inspected, requests_started, capacity_event
+                pages_inspected, requests_started, capacity_event, detail
            FROM acquisition_lane_events
           WHERE observed_at >= $1
           ORDER BY observed_at`,

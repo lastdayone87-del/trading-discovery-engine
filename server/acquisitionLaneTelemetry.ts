@@ -28,7 +28,7 @@ export function acquisitionLaneTelemetryEnabled(env: NodeJS.ProcessEnv = process
 export interface AcquisitionLaneEventInput {
   attribution: AcquisitionAttribution;
   outcome: AcquisitionOutcome;
-  summary: Pick<AcquisitionLaneSummary, 'pagesInspected' | 'requestsStarted' | 'gateWaitMs' | 'workRemaining' | 'signals'>;
+  summary: Pick<AcquisitionLaneSummary, 'pagesInspected' | 'requestsStarted' | 'renderedCrawls' | 'gateWaitMs' | 'workRemaining' | 'signals'>;
   observedAt?: string;
   capacityEvent?: string;
   detail?: Record<string, unknown>;
@@ -104,6 +104,7 @@ export async function recordAcquisitionLaneEvent(
   const observedAt = isoTimestamp(input.observedAt);
   const detail = boundedDetail({
     ...input.detail,
+    renderedCrawls: input.summary.renderedCrawls ?? 0,
     observations: input.summary.signals.observations,
     requiredObservations: input.summary.signals.requiredObservations,
     retryOwningObservations: input.summary.signals.retryOwningObservations,
