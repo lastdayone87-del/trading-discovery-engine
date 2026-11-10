@@ -30,6 +30,7 @@ import {
   getStandaloneExtractedQueryCandidates,
   linkExtractedQueryCandidate,
   markExtractedQueryCandidatesAttempted,
+  markExtractedQueryCandidatesCapDeferred,
   reconcileExtractedQueryCandidates,
   persistQueryTerminologyDigest,
   getQueryRunReward,
@@ -2004,6 +2005,11 @@ export async function generateCandidateQueriesForCountry(
   // available for the next batch.
   const rotateExtractedIds = [...offeredExtractedIds]
     .filter(id => !plannedExtractedCandidateIds.has(id) && !capDeferredExtractedIds.has(id));
+  if (capDeferredExtractedIds.size) {
+    await markExtractedQueryCandidatesCapDeferred([...capDeferredExtractedIds]).catch(error => {
+      console.warn('[Extracted Query] failed to record cap deferral', error instanceof Error ? error.message : String(error));
+    });
+  }
   const attemptedExtractedIds = [...new Set([...plannedExtractedCandidateIds, ...rotateExtractedIds])];
   if (attemptedExtractedIds.length) {
     await markExtractedQueryCandidatesAttempted(attemptedExtractedIds).catch(error => {

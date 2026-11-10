@@ -366,6 +366,11 @@ test('ordinary Japanese phrases are rejected while trading terminology remains e
       sources: video('للتداول اليوم'), country: 'United Arab Emirates', language: 'ar',
     }).some(candidate => candidate.candidateText === 'للتداول اليوم'),
   );
+  assert.ok(
+    deriveDeterministicQueryCandidates({
+      sources: video('تداولات اليوم'), country: 'United Arab Emirates', language: 'ar',
+    }).some(candidate => candidate.candidateText === 'تداولات اليوم'),
+  );
   assert.deepEqual(
     deriveDeterministicQueryCandidates({
       sources: video('التسوق في دبي'), country: 'United Arab Emirates', language: 'ar',
