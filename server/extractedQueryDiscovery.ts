@@ -160,7 +160,7 @@ const SCRIPT_INTENT_TOKENS: Array<{ script: RegExp; tokens: string[] }> = [
     tokens: [
       'トレード', '先物', 'チャート', 'テクニカル', '日足', '時間足', 'ローソク足',
       '板読み', '板情報', 'デイトレード', 'スイング', '株式取引', '株価', '株価指数',
-      '日経平均', 'ビットコイン', 'イーサリアム', '仮想通貨', '暗号資産', 'オプション',
+      '日経平均', 'ビットコイン', 'イーサリアム', '仮想通貨', '暗号資産',
       'レバレッジ', 'ナンピン', 'サポートライン', 'レジスタンスライン', 'ファンダメンタルズ',
     ],
   },
@@ -220,8 +220,10 @@ function containsLiteralPhrase(source: string, candidate: string): boolean {
 }
 
 function containsNativeToken(text: string, token: string): boolean {
-  // Han/Kana/Hangul terms are unspaced; a substring is the meaningful match.
-  if (/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(token)) {
+  // Han/Kana are unspaced; Tamil/Arabic attach articles and inflections, so a
+  // substring is the meaningful match there. Hangul is spaced and must use a
+  // real word boundary (주식 must not match 주식회사).
+  if (/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Tamil}\p{Script=Arabic}]/u.test(token)) {
     return text.includes(token);
   }
   const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

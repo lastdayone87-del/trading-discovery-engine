@@ -317,6 +317,15 @@ test('ordinary Japanese phrases are rejected while trading terminology remains e
       title,
     );
   }
+  for (const title of ['車のオプション', 'オプション設定']) {
+    assert.deepEqual(
+      deriveDeterministicQueryCandidates({
+        sources: video(title), country: 'Japan', language: 'ja',
+      }),
+      [],
+      title,
+    );
+  }
   for (const title of ['日経225先物', '板情報', '高配当株', 'ビットコイン投資', 'オプション取引', 'デイトレード', 'テクニカル分析', '金利見通し', '相場分析']) {
     assert.ok(
       deriveDeterministicQueryCandidates({
@@ -331,10 +340,31 @@ test('ordinary Japanese phrases are rejected while trading terminology remains e
     }),
     [],
   );
+  assert.deepEqual(
+    deriveDeterministicQueryCandidates({
+      sources: video('주식회사'), country: 'South Korea', language: 'ko',
+    }),
+    [],
+  );
   assert.ok(
     deriveDeterministicQueryCandidates({
       sources: video('금값'), country: 'South Korea', language: 'ko',
     }).some(candidate => candidate.candidateText === '금값'),
+  );
+  assert.ok(
+    deriveDeterministicQueryCandidates({
+      sources: video('주식 시장'), country: 'South Korea', language: 'ko',
+    }).some(candidate => candidate.candidateText === '주식 시장'),
+  );
+  assert.ok(
+    deriveDeterministicQueryCandidates({
+      sources: video('أسعار الذهب'), country: 'United Arab Emirates', language: 'ar',
+    }).some(candidate => candidate.candidateText === 'أسعار الذهب'),
+  );
+  assert.ok(
+    deriveDeterministicQueryCandidates({
+      sources: video('சந்தையில் வர்த்தகம்'), country: 'Singapore', language: 'ta',
+    }).some(candidate => candidate.candidateText === 'சந்தையில் வர்த்தகம்'),
   );
 });
 

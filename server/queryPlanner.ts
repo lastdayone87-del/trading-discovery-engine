@@ -532,7 +532,10 @@ function countryAtoms(country: string, vocabulary?: CountryVocabulary): SearchAt
  */
 export function capExtractedStandaloneShare<T extends { metadata: { queryTemplate?: string } }>(planned: T[]): T[] {
   if (!planned.length) return planned;
-  const maxExtracted = Math.floor(planned.length * 0.4);
+  const extractedCount = planned.filter(item => item.metadata?.queryTemplate === 'EXTRACTED_STANDALONE').length;
+  const otherCount = planned.length - extractedCount;
+  // k / (k + others) <= 0.4  =>  k <= (2/3) * others.
+  const maxExtracted = Math.floor((otherCount * 2) / 3);
   let kept = 0;
   return planned.filter(item => {
     if (item.metadata?.queryTemplate !== 'EXTRACTED_STANDALONE') return true;
