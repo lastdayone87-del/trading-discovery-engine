@@ -239,18 +239,29 @@ export function parsePhase2CrawlThroughputReportArgs(
   return args;
 }
 
-function renderedCrawlsFromRow(row: CrawlThroughputEventRow): { value: number; metered: boolean } {
+function renderedCrawlsFromRow(row: CrawlThroughputEventRow): {
+  value: number;
+  metered: boolean;
+  startedAt: string[];
+} {
   const detail = row.detail;
   if (!detail || typeof detail !== 'object' || Array.isArray(detail)) {
-    return { value: 0, metered: false };
+    return { value: 0, metered: false, startedAt: [] };
   }
   const raw = (detail as Record<string, unknown>).renderedCrawls;
   // JSONB numbers arrive as numbers. Never coerce strings, null, booleans, or
   // fractional values into a crawl count; mark the pass unmetered instead.
   if (typeof raw !== 'number' || !Number.isSafeInteger(raw) || raw < 0) {
-    return { value: 0, metered: false };
+    return { value: 0, metered: false, startedAt: [] };
   }
-  return { value: raw, metered: true };
+  const rawStartedAt = (detail as Record<string, unknown>).renderedCrawlStartedAt;
+  const startedAt = Array.isArray(rawStartedAt)
+    ? rawStartedAt
+      .filter((item): item is string => typeof item === 'string' && Number.isFinite(Date.parse(item)))
+      .slice(0, 32)
+      .map(item => new Date(item).toISOString())
+    : [];
+  return { value: raw, metered: true, startedAt };
 }
 
 interface MutableBucket {
@@ -390,18 +401,33 @@ export function buildCrawlThroughputReport(
     if (!rendered.metered) unmeteredPasses += 1;
 
     bucket.inspectionPasses += 1;
-    bucket.browserCrawls += rendered.value;
     browserCrawls += rendered.value;
     laneTotals[lane].inspectionPasses += 1;
     laneTotals[lane].browserCrawls += rendered.value;
     if (lane === 'DISCOVERY') {
-      bucket.discoveryBrowserCrawls += rendered.value;
       discoveryBrowserCrawls += rendered.value;
     } else if (lane === 'MAINTENANCE') {
       maintenanceBrowserCrawls += rendered.value;
     } else if (lane === 'UNKNOWN') {
       unknownBrowserCrawls += rendered.value;
     }
+
+    // Attribute each rendered crawl to its own gate-admission hour when the
+    // event carries timestamps. Missing timestamps fall back to the
+    // inspection row's hour, so no crawl can disappear from the totals.
+    let attributed = 0;
+    for (const startedAt of rendered.startedAt.slice(0, rendered.value)) {
+      const startedMs = Date.parse(startedAt);
+      const startedHourMs = Math.floor(startedMs / HOUR_MS) * HOUR_MS;
+      const target = buckets.get(startedHourMs);
+      if (!target) continue;
+      target.browserCrawls += 1;
+      if (lane === 'DISCOVERY') target.discoveryBrowserCrawls += 1;
+      attributed += 1;
+    }
+    const remainder = Math.max(0, rendered.value - attributed);
+    bucket.browserCrawls += remainder;
+    if (lane === 'DISCOVERY') bucket.discoveryBrowserCrawls += remainder;
 
     if (knownOutcome) {
       if (outcome === 'CAPACITY_DEFERRED') bucket.deferredPasses += 1;

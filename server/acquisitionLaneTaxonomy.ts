@@ -125,6 +125,8 @@ export function sanitizeAcquisitionAttribution(input: unknown): AcquisitionAttri
 export interface AcquisitionLaneTelemetryLike {
   /** `RENDERED` marks a real browser crawl; `STATIC` marks an HTTP fetch. */
   mode?: unknown;
+  /** Gate-admission timestamp for this rendered seed, when available. */
+  crawlStartedAt?: unknown;
   pagesInspected?: unknown;
   requestsStarted?: unknown;
   requestsFinished?: unknown;
@@ -189,6 +191,10 @@ export interface AcquisitionLaneSummary {
    * counter; the durable writer stores `0` when absent.
    */
   renderedCrawls?: number;
+  /** Gate-admission timestamps for the counted rendered seeds, when known.
+   * Bounded; used to bucket crawls by their actual hour instead of the
+   * inspection's finish hour. */
+  renderedCrawlStartedAt?: string[];
   /** Longest gate wait observed in this inspection (not a sum: each seed has
    * its own crawl and adding waits would overstate capacity pressure). */
   gateWaitMs?: number;
@@ -356,7 +362,7 @@ export function summarizeAcquisitionInspection(input: {
   // label alone is not enough: gate refusals and launch failures also carry it
   // with zero work, so require positive crawl evidence. A URL-less observation
   // cannot certify a unique seed and is not counted.
-  const renderedSeeds = new Set<string>();
+  const renderedSeeds = new Map<string, string>();
   observations.forEach(observation => {
     if (String(observation.telemetry?.mode || '').trim().toUpperCase() !== 'RENDERED') return;
     if (observation.sharedEvidenceFrom) return;
@@ -374,7 +380,14 @@ export function summarizeAcquisitionInspection(input: {
     const requestedUrl = String(observation.requestedUrl || '').trim();
     if (!requestedUrl) return;
     const surface = String(observation.surface || '').trim();
-    renderedSeeds.add(`${surface}|${requestedUrl}`);
+    const rawStartedAt = typeof telemetry.crawlStartedAt === 'string' ? telemetry.crawlStartedAt : '';
+    const startedAt = Number.isFinite(Date.parse(rawStartedAt))
+      ? new Date(rawStartedAt).toISOString()
+      : '';
+    const key = `${surface}|${requestedUrl}`;
+    if (!renderedSeeds.has(key) || (!renderedSeeds.get(key) && startedAt)) {
+      renderedSeeds.set(key, startedAt);
+    }
   });
 
   let pagesInspected = 0;
@@ -431,11 +444,13 @@ export function summarizeAcquisitionInspection(input: {
     conclusiveBlockObservations,
     processedObservations,
   };
+  const renderedCrawlStartedAt = [...renderedSeeds.values()].filter(Boolean).slice(0, 32);
   const summary = (outcome: AcquisitionOutcome, capacityEvent?: string): AcquisitionLaneSummary => ({
     outcome,
     pagesInspected,
     requestsStarted,
     renderedCrawls: renderedSeeds.size,
+    ...(renderedCrawlStartedAt.length ? { renderedCrawlStartedAt } : {}),
     ...(gateWaitMs !== undefined ? { gateWaitMs } : {}),
     workRemaining,
     ...(capacityEvent ? { capacityEvent } : {}),

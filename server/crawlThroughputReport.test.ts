@@ -14,6 +14,7 @@ import {
 
 interface RowOptions {
   renderedCrawls?: number;
+  renderedCrawlStartedAt?: string[];
   gateWaitMs?: number;
   omitDetail?: boolean;
 }
@@ -34,14 +35,24 @@ function row(
     capacity_event: null,
     ...(options.omitDetail
       ? {}
-      : { detail: { renderedCrawls: options.renderedCrawls ?? 0 } }),
+      : {
+        detail: {
+          renderedCrawls: options.renderedCrawls ?? 0,
+          ...(options.renderedCrawlStartedAt
+            ? { renderedCrawlStartedAt: options.renderedCrawlStartedAt }
+            : {}),
+        },
+      }),
   };
 }
 
 test('report counts rendered seed crawls, not inspection passes, and includes maintenance', () => {
   const report = buildCrawlThroughputReport([
     row('2026-11-10T11:10:00.000Z', 'DISCOVERY', 'ACQUIRED', { renderedCrawls: 1, gateWaitMs: 1200 }),
-    row('2026-11-10T11:40:00.000Z', 'RETRY', 'PARTIALLY_INSPECTED', { renderedCrawls: 2 }),
+    row('2026-11-10T11:40:00.000Z', 'RETRY', 'PARTIALLY_INSPECTED', {
+      renderedCrawls: 2,
+      renderedCrawlStartedAt: ['2026-11-10T11:35:00.000Z', '2026-11-10T12:05:00.000Z'],
+    }),
     row('2026-11-10T12:10:00.000Z', 'ENRICHMENT', 'CAPACITY_DEFERRED', { renderedCrawls: 0 }),
     row('2026-11-10T12:20:00.000Z', 'MAINTENANCE', 'ACQUIRED', { renderedCrawls: 1 }),
   ], {
@@ -57,15 +68,15 @@ test('report counts rendered seed crawls, not inspection passes, and includes ma
 
   const first = report.buckets[0];
   assert.equal(first.inspectionPasses, 2);
-  assert.equal(first.browserCrawls, 3, 'two seeds in one RETRY pass are two crawls');
+  assert.equal(first.browserCrawls, 2, 'the RETRY crawl admitted at 11:35 stays in hour 11');
   assert.equal(first.discoveryBrowserCrawls, 1);
   assert.equal(first.completedPasses, 2);
-  assert.equal(first.discoverySharePct, 33.33);
+  assert.equal(first.discoverySharePct, 50);
   assert.deepEqual(first.gateWait, { samples: 1, averageMs: 1200, maxMs: 1200 });
 
   const second = report.buckets[1];
   assert.equal(second.inspectionPasses, 2);
-  assert.equal(second.browserCrawls, 1, 'recovery maintenance can use the browser slot');
+  assert.equal(second.browserCrawls, 2, 'the second RETRY crawl plus maintenance recovery');
   assert.equal(second.discoveryBrowserCrawls, 0);
   assert.equal(second.deferredPasses, 1);
   assert.equal(second.completedPasses, 1);
@@ -88,13 +99,35 @@ test('report counts rendered seed crawls, not inspection passes, and includes ma
   // 4 rendered crawls over the 1.5 elapsed hours from 11:00 to 12:30.
   assert.equal(report.gates.elapsedHours, 1.5);
   assert.equal(report.gates.observedBrowserCrawlsPerHour, 2.67);
-  assert.equal(report.gates.peakBrowserCrawlsPerHour, 3);
+  assert.equal(report.gates.peakBrowserCrawlsPerHour, 2);
   assert.equal(report.gates.nominalTargetMet, false);
   assert.equal(report.gates.discoveryFloorMet, false);
   assert.deepEqual(report.failures, [
     'browser_crawls_per_hour_below_nominal_target',
     'discovery_share_below_floor',
   ]);
+});
+
+test('each rendered crawl is bucketed by its gate-admission hour, not the inspection finish', () => {
+  const report = buildCrawlThroughputReport([
+    row('2026-11-10T12:05:00.000Z', 'DISCOVERY', 'ACQUIRED', {
+      renderedCrawls: 2,
+      // The inspection finished at 12:05, but one seed was admitted at 11:55.
+      renderedCrawlStartedAt: ['2026-11-10T11:55:00.000Z', '2026-11-10T12:04:00.000Z'],
+    }),
+  ], {
+    windowHours: 2,
+    now: new Date('2026-11-10T12:30:00.000Z'),
+  });
+
+  assert.equal(report.buckets[0].hour, '2026-11-10T11:00:00.000Z');
+  assert.equal(report.buckets[0].browserCrawls, 1);
+  assert.equal(report.buckets[0].discoveryBrowserCrawls, 1);
+  assert.equal(report.buckets[1].hour, '2026-11-10T12:00:00.000Z');
+  assert.equal(report.buckets[1].browserCrawls, 1);
+  assert.equal(report.buckets[1].discoveryBrowserCrawls, 1);
+  assert.equal(report.totals.browserCrawls, 2);
+  assert.equal(report.gates.peakBrowserCrawlsPerHour, 1);
 });
 
 test('report does not fabricate a rate when no browser crawl exists', () => {

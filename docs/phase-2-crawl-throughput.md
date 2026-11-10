@@ -54,7 +54,11 @@ Source: `acquisition_lane_events`, one row per inspection pass.
   in the window. The current UTC hour is partial, so the denominator uses real
   elapsed time instead of assuming a full hour.
 - **Peak browser crawls/hour**: the largest rendered crawl count in any single
-  UTC hour bucket. This is the emergency-ceiling signal.
+  UTC hour bucket. Crawls are attributed to their own
+  `detail.renderedCrawlStartedAt` (gate admission) hour when that timestamp is
+  present, so a multi-seed inspection crossing a UTC boundary cannot move
+  earlier crawls into the finish hour. Missing timestamps fall back to the
+  inspection row's hour. This is the emergency-ceiling signal.
 - **DISCOVERY share**: DISCOVERY rendered crawls divided by all rendered
   crawls. Maintenance and unknown browser work stay in the denominator.
 - **Unmetered pass**: a row without a trustworthy `detail.renderedCrawls`

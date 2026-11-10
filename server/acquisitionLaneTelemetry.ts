@@ -28,7 +28,7 @@ export function acquisitionLaneTelemetryEnabled(env: NodeJS.ProcessEnv = process
 export interface AcquisitionLaneEventInput {
   attribution: AcquisitionAttribution;
   outcome: AcquisitionOutcome;
-  summary: Pick<AcquisitionLaneSummary, 'pagesInspected' | 'requestsStarted' | 'renderedCrawls' | 'gateWaitMs' | 'workRemaining' | 'signals'>;
+  summary: Pick<AcquisitionLaneSummary, 'pagesInspected' | 'requestsStarted' | 'renderedCrawls' | 'renderedCrawlStartedAt' | 'gateWaitMs' | 'workRemaining' | 'signals'>;
   observedAt?: string;
   capacityEvent?: string;
   detail?: Record<string, unknown>;
@@ -73,6 +73,12 @@ function boundedDetail(detail: Record<string, unknown> | undefined): Record<stri
       out[key] = value;
     } else if (typeof value === 'boolean') {
       out[key] = value;
+    } else if (key === 'renderedCrawlStartedAt' && Array.isArray(value)) {
+      // Bounded per-crawl gate-admission timestamps for hour attribution.
+      out[key] = value
+        .filter((item): item is string => typeof item === 'string')
+        .slice(0, 32)
+        .map(item => item.slice(0, 40));
     }
     keys++;
   }
@@ -105,10 +111,18 @@ export async function recordAcquisitionLaneEvent(
   // Reserve the crawl counter before caller detail consumes the bounded key
   // budget, and never let caller detail override it.
   const callerDetail = input.detail && typeof input.detail === 'object' ? input.detail : {};
-  const { renderedCrawls: _callerRenderedCrawls, ...reservedDetail } = callerDetail;
+  const {
+    renderedCrawls: _callerRenderedCrawls,
+    renderedCrawlStartedAt: _callerRenderedCrawlStartedAt,
+    ...reservedDetail
+  } = callerDetail;
   void _callerRenderedCrawls;
+  void _callerRenderedCrawlStartedAt;
   const detail = boundedDetail({
     renderedCrawls: input.summary.renderedCrawls ?? 0,
+    ...(input.summary.renderedCrawlStartedAt?.length
+      ? { renderedCrawlStartedAt: input.summary.renderedCrawlStartedAt }
+      : {}),
     ...reservedDetail,
     observations: input.summary.signals.observations,
     requiredObservations: input.summary.signals.requiredObservations,

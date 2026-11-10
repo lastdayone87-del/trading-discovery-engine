@@ -29,7 +29,7 @@ import {
   operationsTelemetrySnapshot,
   resetOperationsTelemetry,
 } from './operationsTelemetry';
-import { safeCrawlerTelemetry } from './crawlerTelemetry';
+import { renderedCrawlerTelemetry, safeCrawlerTelemetry } from './crawlerTelemetry';
 
 test.beforeEach(() => {
   resetOperationsTelemetry();
@@ -92,16 +92,16 @@ test('rendered crawl count is per unique rendered seed and excludes static/share
   const summary = summarizeAcquisitionInspection({
     inspection: {
       acquisitionOutcomes: [
-        { requestedUrl: 'https://a.example', surface: 'CREATOR_WEBSITES', outcome: 'FOUND', telemetry: { mode: 'RENDERED', pagesInspected: 1 } },
+        { requestedUrl: 'https://a.example', surface: 'CREATOR_WEBSITES', outcome: 'FOUND', telemetry: { mode: 'RENDERED', pagesInspected: 1, crawlStartedAt: '2026-11-10T11:00:00.000Z' } },
         // Same seed repeated in one pass is still one browser crawl.
-        { requestedUrl: 'https://a.example', surface: 'CREATOR_WEBSITES', outcome: 'FOUND', telemetry: { mode: 'RENDERED', pagesInspected: 1 } },
-        { requestedUrl: 'https://b.example', surface: 'CREATOR_WEBSITES', outcome: 'PARTIALLY_INSPECTED', telemetry: { mode: 'RENDERED', pagesInspected: 1 } },
+        { requestedUrl: 'https://a.example', surface: 'CREATOR_WEBSITES', outcome: 'FOUND', telemetry: { mode: 'RENDERED', pagesInspected: 1, crawlStartedAt: '2026-11-10T11:00:00.000Z' } },
+        { requestedUrl: 'https://b.example', surface: 'CREATOR_WEBSITES', outcome: 'PARTIALLY_INSPECTED', telemetry: { mode: 'RENDERED', pagesInspected: 1, crawlStartedAt: '2026-11-10T11:30:00.000Z' } },
         { requestedUrl: 'https://c.example', surface: 'CREATOR_WEBSITES', outcome: 'ACQUIRED', telemetry: { mode: 'STATIC', pagesInspected: 1 } },
         { requestedUrl: 'https://d.example', surface: 'CREATOR_WEBSITES', outcome: 'FOUND', sharedEvidenceFrom: 'https://b.example', telemetry: { mode: 'RENDERED', pagesInspected: 1 } },
         // Gate refusal/launch failure: rendered label, zero work.
         { requestedUrl: 'https://refused.example', surface: 'CREATOR_WEBSITES', outcome: 'CAPACITY_DEFERRED', telemetry: { mode: 'RENDERED', pagesInspected: 0, requestsStarted: 0 } },
         // Started then failed before a page was processed: requests prove work.
-        { requestedUrl: 'https://started.example', surface: 'CREATOR_WEBSITES', outcome: 'ACQUISITION_FAILED', telemetry: { mode: 'RENDERED', pagesInspected: 0, requestsStarted: 1 } },
+        { requestedUrl: 'https://started.example', surface: 'CREATOR_WEBSITES', outcome: 'ACQUISITION_FAILED', telemetry: { mode: 'RENDERED', pagesInspected: 0, requestsStarted: 1, crawlStartedAt: '2026-11-10T12:00:00.000Z' } },
         // Initial navigation failed on every attempt: the handler was never
         // entered, but the failure/timeout counters prove the crawl ran.
         { requestedUrl: 'https://nav-failed.example', surface: 'CREATOR_WEBSITES', outcome: 'ACQUISITION_FAILED', telemetry: { mode: 'RENDERED', pagesInspected: 0, requestsFailed: 3, navigationTimeouts: 1 } },
@@ -111,6 +111,11 @@ test('rendered crawl count is per unique rendered seed and excludes static/share
     },
   });
   assert.equal(summary.renderedCrawls, 4);
+  assert.deepEqual(summary.renderedCrawlStartedAt, [
+    '2026-11-10T11:00:00.000Z',
+    '2026-11-10T11:30:00.000Z',
+    '2026-11-10T12:00:00.000Z',
+  ]);
 
   const noRendered = summarizeAcquisitionInspection({
     inspection: {
@@ -121,6 +126,31 @@ test('rendered crawl count is per unique rendered seed and excludes static/share
     },
   });
   assert.equal(noRendered.renderedCrawls, 0);
+});
+
+test('rendered producer preserves gate-admission time for hour attribution', () => {
+  const producerInput = {
+    requestsStarted: 1,
+    crawlStartedAt: '2026-11-10T11:00:00.000Z',
+  };
+  const producerTelemetry = renderedCrawlerTelemetry({
+    inspectedPages: 1,
+    clicks: 0,
+    complete: true,
+    telemetry: producerInput,
+  });
+  const summary = summarizeAcquisitionInspection({
+    inspection: {
+      acquisitionOutcomes: [{
+        requestedUrl: 'https://producer.example',
+        surface: 'CREATOR_WEBSITES',
+        outcome: 'ACQUIRED',
+        telemetry: producerTelemetry,
+      }],
+    },
+  });
+  assert.equal(summary.renderedCrawls, 1);
+  assert.deepEqual(summary.renderedCrawlStartedAt, ['2026-11-10T11:00:00.000Z']);
 });
 
 test('acquired and external blocking require affirmative evidence', () => {
@@ -365,6 +395,7 @@ test('renderedCrawls is reserved before caller detail and cannot be overridden',
       pagesInspected: 1,
       requestsStarted: 1,
       renderedCrawls: 2,
+      renderedCrawlStartedAt: ['2026-11-10T11:00:00.000Z', '2026-11-10T11:05:00.000Z'],
       workRemaining: 0,
       signals: {
         observations: 1,
@@ -387,6 +418,10 @@ test('renderedCrawls is reserved before caller detail and cannot be overridden',
   });
   const detail = JSON.parse(String(calls[0].values[12]));
   assert.equal(detail.renderedCrawls, 2, 'summary value wins and survives the 20-key bound');
+  assert.deepEqual(detail.renderedCrawlStartedAt, [
+    '2026-11-10T11:00:00.000Z',
+    '2026-11-10T11:05:00.000Z',
+  ]);
 });
 
 test('lane telemetry writer reports duplicate no-ops, bounds capacityEvent, and never throws', async () => {

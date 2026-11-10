@@ -71,6 +71,7 @@ maybe('the durable writer and report work together on the append-only table', as
           pagesInspected: 2,
           requestsStarted: 3,
           renderedCrawls: 1,
+          renderedCrawlStartedAt: [now.toISOString()],
           ...(fixture.gateWaitMs !== undefined ? { gateWaitMs: fixture.gateWaitMs } : {}),
           workRemaining: 0,
           signals: signals(),
@@ -96,6 +97,11 @@ maybe('the durable writer and report work together on the append-only table', as
     // restrict the report input to this transaction's channel IDs.
     const rows = result.rows.filter(row => channelIds.includes(String(row.channel_id)));
     assert.equal(rows.length, 3);
+    assert.ok(
+      rows.every(row => Array.isArray(row.detail?.renderedCrawlStartedAt)
+        && row.detail.renderedCrawlStartedAt.length === 1),
+      'the writer must persist the per-crawl admission timestamp array',
+    );
 
     const report = buildCrawlThroughputReport(rows, { windowHours: 1, now });
     assert.equal(report.totals.inspectionPasses, 3);
