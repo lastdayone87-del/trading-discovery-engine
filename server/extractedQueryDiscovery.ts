@@ -116,7 +116,7 @@ const SCRIPT_INTENT_TOKENS: Array<{ script: RegExp; tokens: string[] }> = [
       '港股', '美股', '行情', 'K線', 'K线', '技術分析', '技术分析', '短線', '短线', '波段',
       // Kanji-only Japanese surfaces share Han; include their finance terms so
       // titles such as 日経225先物 are not rejected before language detection.
-      '日経', '先物', '相場', '株', '投資', '戦略', '見方', '日足', '時間足', '板', '注文',
+      '日経', '先物', '相場', '株', '投資', '戦略', '見方', '日足', '時間足', '板読み', '注文',
       '証券', '為替', '金利', '指数', '銘柄', 'チャート',
     ],
   },
@@ -124,7 +124,7 @@ const SCRIPT_INTENT_TOKENS: Array<{ script: RegExp; tokens: string[] }> = [
     script: /[\p{Script=Hiragana}\p{Script=Katakana}]/u,
     tokens: [
       'トレード', '相場', '分析', '株', '先物', 'チャート', 'テクニカル', '戦略', '投資', '見方',
-      '日足', '時間足', 'ローソク足', '注文', '板', 'デイトレード', 'スイング',
+      '日足', '時間足', 'ローソク足', '注文', '板読み', 'デイトレード', 'スイング',
     ],
   },
   {
