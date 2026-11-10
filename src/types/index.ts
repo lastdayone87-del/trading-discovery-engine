@@ -101,12 +101,19 @@ export interface TradingRelevanceBreakdown {
   consistency_ratio: number;
   ai_reviewed: boolean;
   fast_heuristic_status?: 'FAST_ACCEPT' | 'FAST_REJECT' | 'UNCERTAIN';
-  classification_method?: 'FAST_HEURISTIC_ACCEPT' | 'FAST_HEURISTIC_REJECT' | 'AI_SEMANTIC_CLASSIFIER' | 'DETERMINISTIC_EVIDENCE' | 'HEURISTIC_ONLY' | 'DEGRADED_HEURISTIC';
+  classification_method?: 'FAST_HEURISTIC_ACCEPT' | 'FAST_HEURISTIC_REJECT' | 'AI_SEMANTIC_CLASSIFIER' | 'SEMANTIC_ABSTAINED' | 'DETERMINISTIC_EVIDENCE' | 'HEURISTIC_ONLY' | 'DEGRADED_HEURISTIC';
   /** C3 display basis: never present a neutral prior as a measured score. */
   confidence_basis?: 'CALIBRATED' | 'NEUTRAL_PRIOR' | 'HEURISTIC' | 'NONE';
   ai_prompt_payload?: string;
   ai_raw_response?: string;
   ai_model?: string;
+  /** Integrated deterministic-first routing metadata. */
+  classification_route?: string;
+  deterministic_fast_track?: boolean;
+  semantic_used?: boolean;
+  human_review_candidate?: boolean;
+  routing_fallback_reason?: string | null;
+  routing_policy_version?: string;
   reasoning: string[];
 }
 

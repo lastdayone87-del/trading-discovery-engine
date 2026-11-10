@@ -314,3 +314,51 @@ test('insufficient coverage preserves affirmative REVIEW and a supported termina
   const noAffirmative = decide(input, [], sufficientCollection(), composition);
   assert.equal(noAffirmative.stages.lifecycleAction, 'ENRICH');
 });
+
+const strongCreatorComposition = {
+  version: 'contextual-composition-v2',
+  focus: 'TRADING_DOMINANT',
+  observedFamilies: 2,
+  informativeFamilies: 2,
+  duplicateFamiliesCollapsed: 0,
+  tradingFamilies: 2,
+  tradingCoreFamilies: 2,
+  tradingAdjacentFamilies: 0,
+  financeAdjacentFamilies: 0,
+  unrelatedFamilies: 0,
+  uninformativeFamilies: 0,
+  alternativeFamilies: 0,
+  neutralFamilies: 0,
+  recentTradingFamilies: 1,
+  recentAlternativeFamilies: 0,
+  tradingCoverage: 1,
+  alternativeCoverage: 0,
+  financeCoverage: 0,
+  unrelatedCoverage: 0,
+  temporalCoverage: 'KNOWN',
+  nonTitleTierAFamilies: 2,
+  explicitCreatorTrading: true,
+  explicitCreatorAlternative: false,
+  namePriorTrading: false,
+  familyClassifications: [],
+  reasonCodes: ['EXPLICIT_CREATOR_TRADING_STATEMENT'],
+} as ContextualCompositionReport;
+
+test('strong creator-owned composition confirms even when a retrieval-only input lacks hydrated videos', () => {
+  const evidence = [
+    positiveItem('pos-bio', 'PLATFORM_BROKER_PROPFIRM', 'channel_bio', 'fam-bio', 24),
+    positiveItem('pos-link', 'EXTERNAL_RESOURCE', 'external_link_domain', 'fam-link', 18),
+  ];
+  const { stages, decision } = decide(thinRetrievalInput, evidence, sufficientCollection(), strongCreatorComposition);
+  assert.equal(stages.lifecycleAction, 'CONFIRM');
+  assert.equal(decision.status, 'TRADING_CONFIRMED');
+});
+
+test('thin retrieval input without a strong creator-owned composition still routes to review', () => {
+  const evidence = [
+    positiveItem('pos-bio', 'TERMINOLOGY', 'channel_bio', 'fam-bio', 20),
+    positiveItem('pos-link', 'INSTRUMENT', 'external_link_domain', 'fam-link', 18),
+  ];
+  const { stages } = decide(thinRetrievalInput, evidence, sufficientCollection());
+  assert.equal(stages.lifecycleAction, 'REVIEW');
+});

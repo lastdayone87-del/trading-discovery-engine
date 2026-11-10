@@ -4,7 +4,7 @@ import type {
 } from './types';
 import { isSemanticClassificationSource } from './types';
 import { collapseSourceIndependentObservations } from '../entityResolution';
-import { dedupeWeightByFieldGroup, hasCreatorLevelUnrelatedAttribution } from './decisionPolicy';
+import { compositionConfirmsTrading, dedupeWeightByFieldGroup, hasCreatorLevelUnrelatedAttribution } from './decisionPolicy';
 import type { ContextualCompositionReport } from './contextualComposition';
 import { negativeEvidencePolicyWeight, terminalNegativeItems } from './negativeEvidenceRole';
 
@@ -224,10 +224,13 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
     else if (composition.focus === 'MIXED' && lifecycleAction === 'CONFIRM') lifecycleAction = 'REVIEW';
     else if (composition.focus === 'TRADING_DOMINANT' && lifecycleAction === 'CONFIRM' && !compositionCorroborates) lifecycleAction = 'REVIEW';
   }
-  // Anti-contamination safeguard: a retrieval-only stage-0 input is known to
-  // rest on title/bio alone. Even without a composition object, it must not
-  // confirm; legacy callers route to review instead of bypassing hydration.
-  if (lifecycleAction === 'CONFIRM' && isThinRetrievalInputRequiringHydration(input)) lifecycleAction = 'REVIEW';
+  // Anti-contamination safeguard: a retrieval-only stage-0 input must not
+  // confirm on the matched document. A strong creator-owned composition
+  // (explicit creator statement, non-title Tier A family, no dominant
+  // alternative) is already affirmative evidence and may confirm even when
+  // the hydrated video sample is absent. Everything else stays in review.
+  const strongCreatorComposition = Boolean(composition && compositionConfirmsTrading(composition));
+  if (lifecycleAction === 'CONFIRM' && isThinRetrievalInputRequiringHydration(input) && !strongCreatorComposition) lifecycleAction = 'REVIEW';
   const lifecycle = result('LIFECYCLE', 'PASS', [`ROUTE_${lifecycleAction}`], [], { action: lifecycleAction });
   return { pipelineVersion: STAGED_CLASSIFICATION_VERSION, stages: [availability, candidate, corroboration, contradiction, lifecycle], lifecycleAction };
 }

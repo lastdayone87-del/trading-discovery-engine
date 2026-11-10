@@ -52,6 +52,7 @@ import {
   persistedQuotaOrigin,
   runWithOfficialYouTubeQuotaOrigin,
 } from './officialYouTubeQuotaFence';
+import { resolveClassificationRoutingMode } from './classificationRouting/deterministicFirst';
 import { resolvePipelineQuotaOrigin } from './quotaOrigin';
 import { isProbeQuotaControlError, YouTubeKeyCapUnavailableError } from './quotaKeyCapShadow';
 import { isYouTubeQuotaAccountingError } from './youtubeKeyHealth';
@@ -885,6 +886,9 @@ async function processChannelThroughPipelineInContext(
     activity_metadata:{latest_upload_at:candidate.latestUploadAt,uploads_last_30_days:candidate.uploadsLast30Days,uploads_last_90_days:candidate.uploadsLast90Days,uploads_last_365_days:candidate.uploadsLast365Days,activity_band:candidate.activityBand,activity_score:candidate.activityScore,observed_at:candidate.activityObservedAt}
   };
   const productionClassification = await classifyTradingRelevanceDetailed(classifierInput);
+  const classificationRouting = productionClassification.decision.deterministicRouting;
+  const routingActive = resolveClassificationRoutingMode() === 'ACTIVE';
+  const deterministicReview = routingActive && classificationRouting?.humanReview === true;
   const decisionReadyWithoutFailedProvider=hasDecisionGradeEvidenceWithoutFailedProviders(productionClassification.decision);
   const enrichmentProviderFailure=enrichmentOperationalFailure(
     productionClassification.decision.evidenceCollection,
@@ -899,6 +903,12 @@ async function processChannelThroughPipelineInContext(
   const classificationDiagnosticId=await observeProductionDiagnosticReliably({type:'PRODUCTION_DIAGNOSTIC',input:{channelId:candidate.channelId,input:productionClassification.input,decision:productionClassification.decision,jobId:activeJobId,queryRunId:activeRunId,nominationId:candidate.nominationId}})
     .catch(error=>{console.warn(`[ClassificationDiagnostics] write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error);return undefined;});
   let tradingVal = productionClassification.result;
+  if (routingActive && classificationRouting?.reasonCodes.includes('NON_TERMINAL_NEGATIVE_EVIDENCE_REQUIRES_REVIEW')) {
+    // The evidence policy already refuses keyword-only rejection; this is the
+    // final pipeline guard so a malformed NON_TRADING decision cannot skip
+    // human review.
+    tradingVal = { ...tradingVal, status: 'UNCERTAIN' };
+  }
   void recordAdmissionShadow({channelId:candidate.channelId,priorState:'NOT_EVALUATED',classificationStatus:productionClassification.decision.status,
     investigationState:productionClassification.decision.status==='UNCERTAIN'?'ACTIVE':'COMPLETED',classificationDiagnosticId,
     candidateHypothesis:{category:productionClassification.decision.category,positiveEvidenceCount:productionClassification.decision.positiveEvidence.length},
@@ -1054,9 +1064,11 @@ async function processChannelThroughPipelineInContext(
     const legacyAction:EvidenceActionType=currentStage>=2?'HUMAN_REVIEW':currentStage===1?'VIDEO_PLAYLIST_CORROBORATION':'CHANNEL_RECENT_METADATA';
     let evidencePlan:EvidenceActionPlan|undefined;
     try {const quota=await getQuota();evidencePlan=await planAndRecordEvidenceAction({channelId:candidate.channelId,diagnosticId:classificationDiagnosticId,decision:productionClassification.decision,rawInput:productionClassification.input,legacyAction,providerQuotaRemaining:Math.max(0,quota.dailyLimit-quota.unitsUsed)});} catch(error){console.warn(`[VOI Evidence] Planning failed for ${candidate.channelId}; preserving legacy enrichment.`,error instanceof Error?error.message:error);}
-    const appliedAction=evidencePlan?.appliedAction||legacyAction,shouldReview=appliedAction==='HUMAN_REVIEW';
+    const appliedAction=evidencePlan?.appliedAction||legacyAction;
+    const shouldReview=appliedAction==='HUMAN_REVIEW'||deterministicReview;
+    if(deterministicReview)console.log(`[Unified Ingestion Pipeline - Routing] Channel '${candidate.channelName}' reached human review: ${classificationRouting?.fallbackReason||'DETERMINISTIC_AMBIGUITY'}.`);
     const corroboration=productionClassification.decision.stagedClassification?.stages.find(stage=>stage.stage==='CORROBORATION');
-    const reviewEligibilityInput={classificationStatus:'UNCERTAIN',investigationState:shouldReview?'UNRESOLVED':'ACTIVE',plausibleTradingHypothesis:independentHypothesis,evidenceSufficient:productionClassification.decision.evidenceCollection.sufficiency==='SUFFICIENT',independentEvidence:corroboration?.disposition==='PASS',countryAllowed:true,operationalFailure:false,providerDegraded:resolveReviewProviderDegraded(productionClassification.decision.evidenceCollection),unsupportedLanguage:productionClassification.decision.evidenceCollection.providers.some(provider=>provider.outcome==='ABSTAINED_UNSUPPORTED_LANGUAGE'),terminalDecision:false};
+    const reviewEligibilityInput={classificationStatus:'UNCERTAIN',investigationState:shouldReview?'UNRESOLVED':'ACTIVE',plausibleTradingHypothesis:independentHypothesis||deterministicReview,evidenceSufficient:productionClassification.decision.evidenceCollection.sufficiency==='SUFFICIENT',independentEvidence:corroboration?.disposition==='PASS',countryAllowed:true,operationalFailure:false,providerDegraded:resolveReviewProviderDegraded(productionClassification.decision.evidenceCollection),unsupportedLanguage:productionClassification.decision.evidenceCollection.providers.some(provider=>provider.outcome==='ABSTAINED_UNSUPPORTED_LANGUAGE'),terminalDecision:false};
     const reviewEligibility=evaluateReviewEligibilityV2(reviewEligibilityInput);
     const lifecycle = resolveUncertainLifecycle(shouldReview,reviewEligibility);
     // Preserve an evidence-complete human-ambiguity decision as NEEDS_REVIEW.

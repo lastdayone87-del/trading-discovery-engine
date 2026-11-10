@@ -255,6 +255,22 @@ export interface VerificationDecision {
   compositionReport?: ContextualCompositionReport;
   /** Full C6 assessment for diagnostics/replay. Optional for older fixtures. */
   recognitionAssessment?: RecognitionAssessment;
+  /** Integrated deterministic-first operational route. */
+  deterministicRouting?: {
+    version: string;
+    route: string;
+    fastTrack: boolean;
+    semanticUsed: boolean;
+    semanticAttempted: boolean;
+    humanReview: boolean;
+    enrich: boolean;
+    confidence: number;
+    evidenceSufficiency: EvidenceSufficiency;
+    recognitionState: string | null;
+    semanticPolicy: string | null;
+    fallbackReason: string | null;
+    reasonCodes: string[];
+  };
   composition?: {
     focus: 'TRADING_DOMINANT' | 'ALTERNATIVE_DOMINANT' | 'MIXED' | 'INSUFFICIENT_COVERAGE' | 'QUERY_ONLY';
     observedFamilies: number;
