@@ -127,6 +127,7 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
       setReasonOther('');
       setNotes('');
     } catch (err) {
+      if (requestId !== bundleRequest.current) return;
       setError(err instanceof Error ? err.message : 'Could not load review evidence.');
       setBundle(null);
     } finally {
@@ -136,13 +137,21 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
 
   useEffect(() => { void loadCatalog(); }, [loadCatalog]);
   useEffect(() => { void loadQueue(); }, [loadQueue]);
-  useEffect(() => { if (selected) void loadBundle(selected); }, [selected, loadBundle]);
+  useEffect(() => {
+    if (!selected) return;
+    setBundle(null);
+    void loadBundle(selected);
+  }, [selected, loadBundle]);
 
   const current = useMemo(() => queue.find(item => item.channelId === selected) || bundle?.review || null, [queue, selected, bundle]);
   const reasons = catalog[action] || [];
 
   const submit = async () => {
     if (!current || !bundle) return;
+    if (bundle.review.channelId !== current.channelId || bundle.review.state !== 'PENDING') {
+      setError('The selected channel changed while its evidence was loading. Reload the selection before deciding.');
+      return;
+    }
     if (!reasonCode) { setError('Select a review reason before submitting.'); return; }
     if (reasonCode === 'OTHER' && !reasonOther.trim()) { setError('Describe the other reason before submitting.'); return; }
     setSubmitting(true);
@@ -324,9 +333,9 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
                     <option value="">Select reason…</option>
                     {reasons.map(reason => <option key={reason.code} value={reason.code}>{reason.label}</option>)}
                   </select>
-                  {reasonCode === 'OTHER' && <input value={reasonOther} onChange={e => setReasonOther(e.target.value)} placeholder="Other reason" className="rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent px-2.5 py-2 text-xs" />}
+                  {reasonCode === 'OTHER' && <input aria-label="Other reason" value={reasonOther} onChange={e => setReasonOther(e.target.value)} placeholder="Other reason" className="rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent px-2.5 py-2 text-xs" />}
                   <input value={notes} onChange={e => setNotes(e.target.value)} placeholder="Optional notes" className="rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent px-2.5 py-2 text-xs" />
-                  <button disabled={submitting || !reasonCode} onClick={() => void submit()} className="rounded-lg bg-indigo-600 text-white px-4 py-2 text-xs font-semibold disabled:opacity-40 inline-flex items-center justify-center gap-2">
+                  <button disabled={submitting || loadingBundle || !reasonCode || !bundle || bundle.review.channelId !== current.channelId} onClick={() => void submit()} className="rounded-lg bg-indigo-600 text-white px-4 py-2 text-xs font-semibold disabled:opacity-40 inline-flex items-center justify-center gap-2">
                     {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : action === 'APPROVE' ? <CheckCircle2 className="w-4 h-4" /> : <XCircle className="w-4 h-4" />}
                     Submit
                   </button>
