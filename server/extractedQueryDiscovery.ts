@@ -66,7 +66,7 @@ const CLICKBAIT_PATTERNS: RegExp[] = [
   /[!]{2,}/u,
   /\b(uh oh|oh no|wait for it)\b/iu,
 ];
-const CTA_FORMAT = /\b(click|watch|download|notification|bell|button|shorts|reels|vlog|podcast|interview)\b/iu;
+const CTA_FORMAT = /\b(click|watch|download|notification|bell|button|shorts|reels?|vlog|podcast|interview)\b/iu;
 const EMOJI_OR_SYMBOL = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{200D}]/u;
 const EMOJI_OR_SYMBOL_GLOBAL = new RegExp(EMOJI_OR_SYMBOL.source, 'gu');
 const LEADING_STOPWORDS = new Set([

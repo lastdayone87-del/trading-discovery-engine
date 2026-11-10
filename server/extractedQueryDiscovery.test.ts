@@ -84,6 +84,10 @@ test('nuisance-only titles and promo fragments are rejected before the ledger', 
     sourceKind: 'VIDEO_TITLE', sourceIndex: 0, sourceTitle: 'Follow for trading signals',
   }), null);
   assert.equal(assessExtractedQueryCandidate({
+    text: 'Reel DAX trading analysis', country: 'Germany', language: 'de',
+    sourceKind: 'VIDEO_TITLE', sourceIndex: 0, sourceTitle: 'Reel DAX trading analysis',
+  }), null);
+  assert.equal(assessExtractedQueryCandidate({
     text: 'DAX Analyse 12/05', country: 'Germany', language: 'de',
     sourceKind: 'VIDEO_TITLE', sourceIndex: 0, sourceTitle: 'DAX Analyse 12/05',
   }), null);
