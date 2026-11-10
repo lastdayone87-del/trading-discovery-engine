@@ -161,9 +161,9 @@ function hasTradingIntent(text: string): boolean {
   for (const { script, tokens } of SCRIPT_INTENT_TOKENS) {
     if (script.test(text) && tokens.some(token => text.includes(token))) return true;
   }
-  // Unspaced scripts carry intent in a single surface; let the Q0 shape and
-  // script gate decide after this deterministic intent check.
-  return /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(text);
+  // Non-Latin surfaces must match a finance/market token. A blanket "any
+  // unspaced script" pass would admit travel, gaming and lifestyle titles.
+  return false;
 }
 
 function trimLeadingStopwords(words: string[]): string[] {
