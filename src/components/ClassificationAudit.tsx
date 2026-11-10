@@ -239,7 +239,7 @@ export const ClassificationAudit: React.FC = () => {
                 </div>
                 <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[10px] text-slate-500">
                   <span>{row.country || 'Unknown country'}</span>
-                  <span>· {row.evidence?.channel?.sourceCohort || row.cohortKey}</span>
+                  <span>· {row.latestLabel ? (row.evidence?.channel?.sourceCohort || row.cohortKey) : 'cohort hidden until labeled'}</span>
                   <span>· {row.status}</span>
                   {row.latestLabel && <span>· {row.latestLabel}</span>}
                 </div>
@@ -269,7 +269,7 @@ export const ClassificationAudit: React.FC = () => {
               <div className="flex flex-wrap items-start gap-3">
                 <div>
                   <div className="text-sm font-bold">{item.channelName || item.channelId}</div>
-                  <div className="text-xs text-slate-500 mt-1">{item.country || 'Unknown country'} · {item.evidence?.channel?.sourceCohort || item.cohortKey}</div>
+                  <div className="text-xs text-slate-500 mt-1">{item.country || 'Unknown country'} · {item.latestLabel ? (item.evidence?.channel?.sourceCohort || item.cohortKey) : 'cohort hidden until labeled'}</div>
                   {item.youtubeUrl && <a href={item.youtubeUrl} target="_blank" rel="noreferrer" className="text-xs text-indigo-600 inline-flex items-center gap-1 mt-1">Open channel <ExternalLink className="w-3 h-3" /></a>}
                 </div>
                 <div className="ml-auto text-right text-[11px] text-slate-400">
@@ -291,10 +291,10 @@ export const ClassificationAudit: React.FC = () => {
                 <div>
                   <div className="text-[11px] text-slate-400 mb-1">Recent videos ({videos.length})</div>
                   <div className="max-h-64 overflow-auto space-y-1">
-                    {videos.slice(0, 12).map((video: any, index: number) => (
+                    {videos.map((video: any, index: number) => (
                       <div key={`${video.id || index}`} className="rounded border border-slate-100 dark:border-slate-800 p-2 text-[11px]">
                         <div className="font-medium text-slate-700 dark:text-slate-200">{video.title || video}</div>
-                        {video.description && <div className="text-slate-500 mt-1 line-clamp-2">{video.description}</div>}
+                        {video.description && <div className="text-slate-500 mt-1 whitespace-pre-wrap">{video.description}</div>}
                       </div>
                     ))}
                   </div>

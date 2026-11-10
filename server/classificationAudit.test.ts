@@ -79,3 +79,12 @@ test('audit filter changes clear stale queue state and reload through the curren
   assert.match(ui, /\[status, offset, reloadToken\]/);
   assert.match(ui, /disabled=\{submitting\}/);
 });
+
+test('the importer validates the whole file before the first write', () => {
+  const source = readFileSync(new URL('../scripts/importClassificationAuditLabels.ts', import.meta.url), 'utf8');
+  const validation = source.indexOf('validateAuditLabelRows(labels');
+  const firstWrite = source.indexOf('const createdItem = await createClassificationAuditItem');
+  assert.ok(validation >= 0);
+  assert.ok(firstWrite >= 0);
+  assert.ok(validation < firstWrite);
+});

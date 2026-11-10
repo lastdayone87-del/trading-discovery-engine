@@ -21,6 +21,9 @@ test('audit UI shows raw evidence before the classifier suggestion and records i
   assert.match(ui, /NON_TRADING/);
   assert.match(ui, /UNCERTAIN/);
   assert.match(ui, /Record label/);
+  assert.match(ui, /cohort hidden until labeled/);
+  assert.doesNotMatch(ui, /videos\.slice\(0, 12\)/);
+  assert.match(ui, /videos\.map/);
 });
 
 test('audit console supports corrections, filters, pagination, history and stale-response guards', () => {

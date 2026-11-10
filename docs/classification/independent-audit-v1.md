@@ -17,16 +17,18 @@
 
 ## Results
 
-For the 221 decisive human labels:
+For the 221 decisive audit labels:
 
-| Evaluated decision | Precision | Recall | FPR | FNR | Coverage |
-|---|---:|---:|---:|---:|---:|
-| Stored full engine decision | 95.9% | 70.3% | 8.9% | 0.0% | 74.7% |
-| New routing + precision guard | **100.0%** | 69.7% | **0.0%** | **0.0%** | 71.9% |
-| Deterministic-only engine | **100.0%** | 38.2% | **0.0%** | **0.0%** | 29.4% |
+| Evaluated decision | Precision | Recall | FPR | Explicit FNR | Positive miss | Coverage |
+|---|---:|---:|---:|---:|---:|---:|
+| Stored full engine decision | 95.9% | 70.3% | 8.9% | 0.0% | 29.7% | 74.7% |
+| New routing + precision guard | **100.0%** | 69.7% | **0.0%** | **0.0%** | 30.3% | 71.9% |
+| Deterministic-only engine | **100.0%** | 64.8% | **0.0%** | **0.0%** | 35.2% | 49.3% |
+
+`Explicit FNR` counts only explicit `NON_TRADING` predictions. `Positive miss` includes audited trading labels that abstained or remained unresolved. For the routing decision, 50 positive labels were unresolved rather than explicitly rejected; for the deterministic-only engine, 58 were unresolved. This is why explicit FNR is 0% while recall is below 100%.
 
 - Confusion matrix for the routing + guard: TP 115, FP 0, TN 44, FN 0.
-- The deterministic-only engine resolves obvious trading channels without semantic spend and without false positives in this sample. The remainder goes to AI/enrichment, not human review. The stricter thin-retrieval exemption deliberately trades deterministic coverage for precision: a stage-0 bio-only candidate must have a substantial creator bio and a creator-bio Tier A family before it can confirm.
+- The deterministic-only engine resolves obvious trading channels without semantic spend and without false positives in this sample. The replay treats the sampled channel videos as hydrated evidence (stage 1), not as retrieval-selected match text. The remainder goes to AI/enrichment, not human review.
 - The new routing guard escalates confirmed channels to human review when the video sample repeatedly contradicts the bio. It never rejects.
 
 ### Cohort breakdown
@@ -74,7 +76,7 @@ All five were escalated to human review by the new precision guard:
 
 ## False negatives
 
-None observed among the 221 decisive labels. This is a small sample; zero observed false negatives does not prove zero population false negatives.
+No explicit false-negative prediction was observed among the 221 decisive labels. This does not mean every trading channel was resolved: 50 routing positive labels and 58 deterministic-only positive labels abstained or remained unresolved. This is a small sample; zero observed false negatives does not prove zero population false negatives.
 
 ## Unresolved cases
 
@@ -90,7 +92,7 @@ These cases require more evidence or operator judgment; they are not counted as 
 
 ## Limitations
 
-- Labels are an independent **AI-assisted evidence audit** with exact quotes, not operator-entered human labels. The classification audit console lets operators inspect, filter, and correct every label with an append-only history.
+- Labels are an independent **AI-assisted evidence audit** with exact quotes, not operator-entered human labels. The classification audit console lets operators inspect, filter, and correct every label with an append-only history. The report therefore says “audit labels,” not “human labels.”
 - Audit labels are isolated from the sealed evaluation dataset. The audit ledger does not widen or write to `evaluation_ground_truth_labels`.
 - Negative sample size is 56; FPR estimates have wide uncertainty.
 - 50 audited channels had no production diagnostic and are excluded from the full-engine comparison.

@@ -54,12 +54,11 @@ export function buildAuditChannelInput(item: ClassificationAuditWorkItem): RawCh
     video_descriptions: videos.map(video => video.description),
     videos,
     external_links: item.links || [],
-    enrichment_stage: 0,
-    search_match_context: {
-      type: 'CHANNEL',
-      title: item.channelName,
-      description: item.description || '',
-    },
+    // The audit worklist contains stored channel evidence, not the search
+    // document that happened to match. Treat the sampled videos as hydrated
+    // and authoritative rather than as retrieval-selected match content.
+    enrichment_stage: 1,
+    videoDescriptionsAuthoritative: true,
   };
 }
 
@@ -74,4 +73,19 @@ export function buildAuditEvidenceInput(item: ClassificationAuditWorkItem) {
     })),
     external_links: item.links || [],
   };
+}
+
+/** Validate an entire import before the first database write. */
+export function validateAuditLabelRows<T extends { itemId: string; label: string }>(
+  rows: T[],
+  validItemIds: ReadonlySet<string>,
+): void {
+  const validLabels = new Set(['TRADING_CONFIRMED', 'NON_TRADING', 'UNCERTAIN']);
+  const seen = new Set<string>();
+  for (const row of rows) {
+    if (!row.itemId || !validItemIds.has(row.itemId)) throw new Error(`UNKNOWN_AUDIT_ITEM:${row.itemId || 'EMPTY'}`);
+    if (!validLabels.has(row.label)) throw new Error(`INVALID_AUDIT_LABEL:${row.itemId}:${row.label}`);
+    if (seen.has(row.itemId)) throw new Error(`DUPLICATE_AUDIT_LABEL:${row.itemId}`);
+    seen.add(row.itemId);
+  }
 }

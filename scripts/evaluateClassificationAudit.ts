@@ -96,10 +96,10 @@ async function main() {
       country: item.country || null,
       script: scriptFor(item),
       sourceCohort: manifest.get(item.itemId)?.sourceCohort || 'UNKNOWN',
-      humanLabel: label.label,
-      humanConfidence: label.confidence ?? null,
-      humanEvidence: label.evidence || [],
-      humanNotes: label.notes || null,
+      auditLabel: label.label,
+      auditConfidence: label.confidence ?? null,
+      auditEvidence: label.evidence || [],
+      auditNotes: label.notes || null,
       predictedStatus: decision.status,
       route: routing.route,
       fastTrack: routing.fastTrack,
@@ -116,19 +116,19 @@ async function main() {
     });
   }
 
-  const labeled = rows.filter(row => row.humanLabel === 'TRADING_CONFIRMED' || row.humanLabel === 'NON_TRADING');
-  const unresolved = rows.filter(row => row.humanLabel === 'UNCERTAIN');
+  const labeled = rows.filter(row => row.auditLabel === 'TRADING_CONFIRMED' || row.auditLabel === 'NON_TRADING');
+  const unresolved = rows.filter(row => row.auditLabel === 'UNCERTAIN');
   const resolved = labeled.filter(row => row.resolved);
-  const tp = resolved.filter(row => row.humanLabel === 'TRADING_CONFIRMED' && row.predictedStatus === 'TRADING_CONFIRMED').length;
-  const fp = resolved.filter(row => row.humanLabel === 'NON_TRADING' && row.predictedStatus === 'TRADING_CONFIRMED').length;
-  const tn = resolved.filter(row => row.humanLabel === 'NON_TRADING' && row.predictedStatus === 'NON_TRADING').length;
-  const fn = resolved.filter(row => row.humanLabel === 'TRADING_CONFIRMED' && row.predictedStatus === 'NON_TRADING').length;
-  const positives = labeled.filter(row => row.humanLabel === 'TRADING_CONFIRMED').length;
-  const negatives = labeled.filter(row => row.humanLabel === 'NON_TRADING').length;
+  const tp = resolved.filter(row => row.auditLabel === 'TRADING_CONFIRMED' && row.predictedStatus === 'TRADING_CONFIRMED').length;
+  const fp = resolved.filter(row => row.auditLabel === 'NON_TRADING' && row.predictedStatus === 'TRADING_CONFIRMED').length;
+  const tn = resolved.filter(row => row.auditLabel === 'NON_TRADING' && row.predictedStatus === 'NON_TRADING').length;
+  const fn = resolved.filter(row => row.auditLabel === 'TRADING_CONFIRMED' && row.predictedStatus === 'NON_TRADING').length;
+  const positives = labeled.filter(row => row.auditLabel === 'TRADING_CONFIRMED').length;
+  const negatives = labeled.filter(row => row.auditLabel === 'NON_TRADING').length;
   const metrics = {
-    humanLabels: labels.length,
-    decisiveHumanLabels: labeled.length,
-    humanUncertain: unresolved.length,
+    auditLabels: labels.length,
+    decisiveAuditLabels: labeled.length,
+    auditUncertain: unresolved.length,
     deterministicResolved: resolved.length,
     deterministicAbstained: labeled.length - resolved.length,
     coveragePct: pct(resolved.length, labeled.length),
@@ -136,6 +136,8 @@ async function main() {
     precision: pct(tp, tp + fp), recall: pct(tp, positives),
     falsePositiveRate: pct(fp, negatives), falseNegativeRate: pct(fn, positives),
     accuracyOnResolved: pct(tp + tn, resolved.length),
+    positiveMissRate: ratio(positives - tp, positives),
+    unresolvedPositives: positives - tp - fn,
     fastTrackResolved: rows.filter(row => row.fastTrack && row.resolved).length,
     humanReviewRoute: rows.filter(row => row.route === 'HUMAN_REVIEW').length,
     enrichRoute: rows.filter(row => row.route === 'ENRICH').length,
@@ -150,15 +152,15 @@ async function main() {
     }
     return [...groups.entries()].map(([name, group]) => {
       const groupResolved = group.filter(row => row.resolved);
-      const gtp = groupResolved.filter(row => row.humanLabel === 'TRADING_CONFIRMED' && row.predictedStatus === 'TRADING_CONFIRMED').length;
-      const gfp = groupResolved.filter(row => row.humanLabel === 'NON_TRADING' && row.predictedStatus === 'TRADING_CONFIRMED').length;
-      const gtn = groupResolved.filter(row => row.humanLabel === 'NON_TRADING' && row.predictedStatus === 'NON_TRADING').length;
-      const gfn = groupResolved.filter(row => row.humanLabel === 'TRADING_CONFIRMED' && row.predictedStatus === 'NON_TRADING').length;
+      const gtp = groupResolved.filter(row => row.auditLabel === 'TRADING_CONFIRMED' && row.predictedStatus === 'TRADING_CONFIRMED').length;
+      const gfp = groupResolved.filter(row => row.auditLabel === 'NON_TRADING' && row.predictedStatus === 'TRADING_CONFIRMED').length;
+      const gtn = groupResolved.filter(row => row.auditLabel === 'NON_TRADING' && row.predictedStatus === 'NON_TRADING').length;
+      const gfn = groupResolved.filter(row => row.auditLabel === 'TRADING_CONFIRMED' && row.predictedStatus === 'NON_TRADING').length;
       return {
         name, total: group.length, resolved: groupResolved.length,
-        precision: ratio(gtp, gtp + gfp), recall: ratio(gtp, group.filter(row => row.humanLabel === 'TRADING_CONFIRMED').length),
-        falsePositiveRate: ratio(gfp, group.filter(row => row.humanLabel === 'NON_TRADING').length),
-        falseNegativeRate: ratio(gfn, group.filter(row => row.humanLabel === 'TRADING_CONFIRMED').length),
+        precision: ratio(gtp, gtp + gfp), recall: ratio(gtp, group.filter(row => row.auditLabel === 'TRADING_CONFIRMED').length),
+        falsePositiveRate: ratio(gfp, group.filter(row => row.auditLabel === 'NON_TRADING').length),
+        falseNegativeRate: ratio(gfn, group.filter(row => row.auditLabel === 'TRADING_CONFIRMED').length),
       };
     }).sort((a, b) => b.total - a.total);
   }

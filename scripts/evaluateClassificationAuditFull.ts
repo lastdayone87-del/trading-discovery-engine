@@ -24,21 +24,26 @@ const predictedFromRoute = (route: string) => route === 'DETERMINISTIC_TRADING' 
   : route === 'DETERMINISTIC_NON_TRADING' || route === 'SEMANTIC_NON_TRADING' ? 'NON_TRADING' : null;
 
 function metrics(rows: any[], predictor: (row: any) => string | null) {
-  const labeled = rows.filter(row => row.humanLabel === 'TRADING_CONFIRMED' || row.humanLabel === 'NON_TRADING');
+  const labeled = rows.filter(row => row.auditLabel === 'TRADING_CONFIRMED' || row.auditLabel === 'NON_TRADING');
   const resolved = labeled.filter(row => predictor(row) !== null);
-  const pos = labeled.filter(row => row.humanLabel === 'TRADING_CONFIRMED').length;
-  const neg = labeled.filter(row => row.humanLabel === 'NON_TRADING').length;
-  const tp = resolved.filter(row => row.humanLabel === 'TRADING_CONFIRMED' && predictor(row) === 'TRADING_CONFIRMED').length;
-  const fp = resolved.filter(row => row.humanLabel === 'NON_TRADING' && predictor(row) === 'TRADING_CONFIRMED').length;
-  const tn = resolved.filter(row => row.humanLabel === 'NON_TRADING' && predictor(row) === 'NON_TRADING').length;
-  const fn = resolved.filter(row => row.humanLabel === 'TRADING_CONFIRMED' && predictor(row) === 'NON_TRADING').length;
+  const pos = labeled.filter(row => row.auditLabel === 'TRADING_CONFIRMED').length;
+  const neg = labeled.filter(row => row.auditLabel === 'NON_TRADING').length;
+  const tp = resolved.filter(row => row.auditLabel === 'TRADING_CONFIRMED' && predictor(row) === 'TRADING_CONFIRMED').length;
+  const fp = resolved.filter(row => row.auditLabel === 'NON_TRADING' && predictor(row) === 'TRADING_CONFIRMED').length;
+  const tn = resolved.filter(row => row.auditLabel === 'NON_TRADING' && predictor(row) === 'NON_TRADING').length;
+  const fn = resolved.filter(row => row.auditLabel === 'TRADING_CONFIRMED' && predictor(row) === 'NON_TRADING').length;
   return {
-    humanDecisive: labeled.length, resolved: resolved.length, abstained: labeled.length - resolved.length,
+    decisiveAuditLabels: labeled.length, resolved: resolved.length, abstained: labeled.length - resolved.length,
     coveragePct: pct(resolved.length, labeled.length),
     tp, fp, tn, fn, positives: pos, negatives: neg,
     precision: ratio(tp, tp + fp), recall: ratio(tp, pos),
     falsePositiveRate: ratio(fp, neg), falseNegativeRate: ratio(fn, pos),
     accuracyOnResolved: ratio(tp + tn, resolved.length),
+    // FNR counts only explicit NON_TRADING predictions. Positive miss includes
+    // audited trading labels that abstained or were left unresolved.
+    positiveMissRate: ratio(pos - tp, pos),
+    unresolvedPositives: pos - tp - fn,
+    unresolvedNegatives: neg - tn - fp,
   };
 }
 
@@ -74,7 +79,7 @@ for (const label of labels) {
   rows.push({
     itemId: item.itemId, channelId: item.channelId, channelName: item.channelName,
     country: item.country || null, script: scriptFor(item), sourceCohort: source.sourceCohort,
-    humanLabel: label.label, humanConfidence: label.confidence ?? null, humanEvidence: label.evidence || [], humanNotes: label.notes || null,
+    auditLabel: label.label, auditConfidence: label.confidence ?? null, auditEvidence: label.evidence || [], auditNotes: label.notes || null,
     hasDiagnostic: !!decision,
     storedStatus: decision?.status || null,
     storedCategory: decision?.category || null,
@@ -99,9 +104,9 @@ const report = {
     productionClassificationsUsedAsGroundTruth: false,
     labels: rows.length,
     byLabel: {
-      TRADING_CONFIRMED: rows.filter(row => row.humanLabel === 'TRADING_CONFIRMED').length,
-      NON_TRADING: rows.filter(row => row.humanLabel === 'NON_TRADING').length,
-      UNCERTAIN: rows.filter(row => row.humanLabel === 'UNCERTAIN').length,
+      TRADING_CONFIRMED: rows.filter(row => row.auditLabel === 'TRADING_CONFIRMED').length,
+      NON_TRADING: rows.filter(row => row.auditLabel === 'NON_TRADING').length,
+      UNCERTAIN: rows.filter(row => row.auditLabel === 'UNCERTAIN').length,
     },
     withProductionDiagnostic: withDiagnostic.length,
   },
@@ -112,23 +117,23 @@ const report = {
     country,
     stored: metrics(withDiagnostic.filter(row => (row.country || 'UNKNOWN') === country), row => row.storedPrediction),
     routing: metrics(withDiagnostic.filter(row => (row.country || 'UNKNOWN') === country), row => row.routePrediction),
-  })).sort((a, b) => b.stored.humanDecisive - a.stored.humanDecisive),
+  })).sort((a, b) => b.stored.decisiveAuditLabels - a.stored.decisiveAuditLabels),
   byScript: [...new Set(withDiagnostic.map(row => row.script))].map(script => ({
     script,
     stored: metrics(withDiagnostic.filter(row => row.script === script), row => row.storedPrediction),
     routing: metrics(withDiagnostic.filter(row => row.script === script), row => row.routePrediction),
-  })).sort((a, b) => b.stored.humanDecisive - a.stored.humanDecisive),
+  })).sort((a, b) => b.stored.decisiveAuditLabels - a.stored.decisiveAuditLabels),
   // The audit sample is stratified, so the headline metrics are sample-weighted
   // and must be read alongside these cohort-level figures.
   bySourceCohort: [...new Set(withDiagnostic.map(row => row.sourceCohort))].map(cohort => ({
     cohort,
     stored: metrics(withDiagnostic.filter(row => row.sourceCohort === cohort), row => row.storedPrediction),
     routing: metrics(withDiagnostic.filter(row => row.sourceCohort === cohort), row => row.routePrediction),
-  })).sort((a, b) => b.stored.humanDecisive - a.stored.humanDecisive),
+  })).sort((a, b) => b.stored.decisiveAuditLabels - a.stored.decisiveAuditLabels),
   examples: {
-    storedFalsePositives: withDiagnostic.filter(row => row.humanLabel === 'NON_TRADING' && row.storedPrediction === 'TRADING_CONFIRMED').slice(0, 20),
-    storedFalseNegatives: withDiagnostic.filter(row => row.humanLabel === 'TRADING_CONFIRMED' && row.storedPrediction === 'NON_TRADING').slice(0, 20),
-    humanUncertain: withDiagnostic.filter(row => row.humanLabel === 'UNCERTAIN').slice(0, 20),
+    storedFalsePositives: withDiagnostic.filter(row => row.auditLabel === 'NON_TRADING' && row.storedPrediction === 'TRADING_CONFIRMED').slice(0, 20),
+    storedFalseNegatives: withDiagnostic.filter(row => row.auditLabel === 'TRADING_CONFIRMED' && row.storedPrediction === 'NON_TRADING').slice(0, 20),
+    auditUncertain: withDiagnostic.filter(row => row.auditLabel === 'UNCERTAIN').slice(0, 20),
   },
   rows,
 };

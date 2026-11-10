@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createClassificationAuditItem, labelClassificationAuditItem, type ClassificationAuditEvidence } from '../server/classificationAudit';
-import { buildAuditEvidenceInput } from '../server/classificationAuditWorklist';
+import { buildAuditEvidenceInput, validateAuditLabelRows } from '../server/classificationAuditWorklist';
 
 const dataDir = process.env.CLASSIFICATION_AUDIT_DIR || '/tmp/opencode/classification-audit-data';
 const cohortKey = process.env.CLASSIFICATION_AUDIT_COHORT || 'audit-2026-11-10-v1';
@@ -9,6 +9,7 @@ const labelsFile = process.env.CLASSIFICATION_AUDIT_LABELS || path.join(dataDir,
 const work = new Map<string, any>(fs.readFileSync(path.join(dataDir, 'worklist.jsonl'), 'utf8').split('\n').filter(Boolean).map(line => { const row = JSON.parse(line); return [row.itemId, row]; }));
 const manifest = new Map<string, any>(fs.readFileSync(path.join(dataDir, 'manifest.jsonl'), 'utf8').split('\n').filter(Boolean).map(line => { const row = JSON.parse(line); return [row.itemId, row]; }));
 const labels = fs.readFileSync(labelsFile, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line));
+validateAuditLabelRows(labels, new Set(work.keys()));
 let imported = 0, created = 0, idempotent = 0;
 for (const label of labels) {
   const item = work.get(label.itemId);
