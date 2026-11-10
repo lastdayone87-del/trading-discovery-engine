@@ -372,7 +372,7 @@ export function buildDeferredTradingIntakeChannel(
   source: DiscoverySource,
   now: string,
   reasonCodes: string[],
-  countryState?: { country: string; status: CountryStatus; score: number },
+  countryState?: { country: string; status: CountryStatus; score: number; gateDisposition?: string },
 ): ChannelRecord {
   const channel: ChannelRecord = existing ? { ...existing } : {
     channel_id: candidate.channelId,
@@ -398,9 +398,17 @@ export function buildDeferredTradingIntakeChannel(
   channel.last_checked = now;
   channel.scan_attempts = existing?.scan_attempts || 0;
   if (countryState) {
-    channel.country = countryState.country;
-    channel.country_status = countryState.status;
-    channel.confidence_score = countryState.score;
+    // Preserve an existing resolved country only for genuinely sparse
+    // incoming evidence. A reviewable UNCERTAIN result that detected a
+    // different creator country must still replace the stored snapshot.
+    const preserveExistingCountry = Boolean(existing?.country)
+      && shouldPreserveResolvedCountry(existing?.country_status, countryState.status)
+      && countryState.gateDisposition !== 'NEEDS_REVIEW';
+    if (!preserveExistingCountry) {
+      channel.country = countryState.country;
+      channel.country_status = countryState.status;
+      channel.confidence_score = countryState.score;
+    }
   }
   if (!channel.country_status) channel.country_status = 'UNCERTAIN';
   if (!channel.country) channel.country = '';
@@ -762,7 +770,12 @@ async function processChannelThroughPipelineInContext(
       source,
       now,
       retrievalTriage.reasonCodes,
-      deferredCountry ? { country: deferredCreatorCountry, status: deferredCountry.status, score: deferredCountry.score } : undefined,
+      deferredCountry ? {
+        country: deferredCreatorCountry,
+        status: deferredCountry.status,
+        score: deferredCountry.score,
+        gateDisposition: deferredCountry.gateDisposition,
+      } : undefined,
     );
     if (deferredCountry?.status === 'REJECTED' && deferredCreatorCountry) {
       // Match the main Gate-1 path: an unknown candidate is reported as
