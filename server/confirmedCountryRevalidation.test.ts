@@ -125,3 +125,13 @@ test('active-work detection covers community retries and can exclude the termina
   assert.match(pipeline,/hasActiveEnrichmentJob\(existing\.channel_id, options\?\.jobId\)/);
   assert.doesNotMatch(pipeline,/shouldSkipDeepEnrichment && options\?\.forceClassification/);
 });
+
+test('ordinary and Discord classification admission share one atomic per-channel lock', () => {
+  const db = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
+  const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  assert.match(db, /export async function enqueueClassificationJobAtomic/);
+  assert.match(db, /classification-admit:/);
+  assert.match(db, /pg_advisory_xact_lock/);
+  assert.match(queue, /enqueueClassificationJobAtomic\(raw\.channelId/);
+  assert.match(queue, /enqueueClassificationJobAtomic\(channel\.channel_id/);
+});

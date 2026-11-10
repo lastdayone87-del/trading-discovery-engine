@@ -3,6 +3,7 @@ import { ENRICHMENT_WORKER_BASELINE, ENRICHMENT_WORKER_SCALE_CEILING, enrichment
 import {
   getDb,
   enqueueJob,
+  enqueueClassificationJobAtomic,
   claimNextJob,
   type ClaimBudgetGuard,
   completeJob,
@@ -1257,7 +1258,7 @@ export async function admitDiscoveredChannel(input: {
         buildProvisionalClassificationChannel(raw, source),
       );
     }
-    const queued = await enqueueJob(CLASSIFICATION_JOB_TYPE, buildClassificationJobPayload({
+    const queued = await enqueueClassificationJobAtomic(raw.channelId, buildClassificationJobPayload({
       candidate: raw,
       targetCountry,
       source,
@@ -1280,6 +1281,10 @@ export async function admitDiscoveredChannel(input: {
       idempotencyKey: classificationJobIdempotencyKey(raw.channelId),
       preventReopen: true,
     });
+    if (!queued) {
+      const channel = existing || await getChannelById(raw.channelId);
+      return { outcome: classificationPendingOutcome(raw, channel), pending: true };
+    }
     if (queued.status === 'PENDING' || queued.status === 'PROCESSING') {
       backpressure.globalPending += 1;
       backpressure.scopedPending += 1;
@@ -3402,8 +3407,7 @@ export async function enqueueDiscordEvidenceReclassification(
       enrichmentStage: rawDetails?.enrichmentStage || 0,
     };
     const config = deps.config || resolveClassificationDecouplingConfig();
-    const enqueue = deps.enqueue || enqueueJob;
-    const queued = await enqueue(CLASSIFICATION_JOB_TYPE, buildClassificationJobPayload({
+    const payload = buildClassificationJobPayload({
       candidate,
       targetCountry,
       source,
@@ -3412,13 +3416,17 @@ export async function enqueueDiscordEvidenceReclassification(
       quotaOrigin: channel.quota_origin === 'PROBE' ? 'PROBE' : 'NORMAL',
       forceExtraction: false,
       forceClassification: true,
-    }), {
+    });
+    const opts = {
       priority: config.priority,
       maxAttempts: config.maxAttempts,
       idempotencyKey: `discord-classify:${channel.channel_id}:${classificationDayBucket()}`,
       preventReopen: true,
-    });
-    return queued.status === 'PENDING' || queued.status === 'PROCESSING';
+    };
+    const queued = deps.enqueue
+      ? await deps.enqueue(CLASSIFICATION_JOB_TYPE, payload, opts)
+      : await enqueueClassificationJobAtomic(channel.channel_id, payload, opts);
+    return queued != null && (queued.status === 'PENDING' || queued.status === 'PROCESSING');
   } catch (error) {
     console.warn(`[DiscordEvidence] reclassification enqueue failed for ${channel.channel_id}:`, error instanceof Error ? error.message : error);
     return false;

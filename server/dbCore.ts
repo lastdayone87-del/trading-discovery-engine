@@ -1503,6 +1503,41 @@ export async function getClassificationBackpressureState(queryScopeKey: string):
   };
 }
 
+/**
+ * Admit one durable classification for a channel atomically. The advisory
+ * transaction lock serializes ordinary discovery admission and the Discord
+ * evidence pass, so a check-then-insert race cannot create two active
+ * classification jobs for the same channel.
+ */
+export async function enqueueClassificationJobAtomic(
+  channelId: string,
+  payload: any,
+  opts: Parameters<typeof enqueueJob>[2] = {},
+): Promise<DurableJob | null> {
+  const db = await getDb();
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`classification-admit:${channelId}`]);
+    const active = await client.query(
+      `SELECT 1 FROM jobs WHERE type=$1 AND status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$2 LIMIT 1`,
+      [CLASSIFICATION_JOB_TYPE, channelId],
+    );
+    if (active.rowCount) {
+      await client.query('COMMIT');
+      return null;
+    }
+    const job = await enqueueJob(CLASSIFICATION_JOB_TYPE, payload, { ...opts, clientOverride: client });
+    await client.query('COMMIT');
+    return job;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 /** True while a durable classification for this channel is still claimable. */
 export async function hasActiveClassificationJob(channelId: string): Promise<boolean> {
   const db = await getDb();
