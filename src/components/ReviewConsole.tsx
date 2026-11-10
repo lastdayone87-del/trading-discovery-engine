@@ -137,15 +137,25 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
     }
   }, []);
 
+  const refreshConsole = useCallback(async () => {
+    await loadQueue();
+    if (selected) await loadBundle(selected);
+  }, [loadQueue, loadBundle, selected]);
+
   useEffect(() => { void loadCatalog(); }, [loadCatalog]);
   useEffect(() => { void loadQueue(); }, [loadQueue]);
   useEffect(() => {
-    if (!selected) return;
+    if (!selected) {
+      bundleRequest.current += 1;
+      setBundle(null);
+      setLoadingBundle(false);
+      return;
+    }
     setBundle(null);
     void loadBundle(selected);
   }, [selected, loadBundle]);
 
-  const current = useMemo(() => queue.find(item => item.channelId === selected) || bundle?.review || null, [queue, selected, bundle]);
+  const current = useMemo(() => queue.find(item => item.channelId === selected) || null, [queue, selected]);
   const reasons = catalog[action] || [];
 
   const submit = async () => {
@@ -202,7 +212,7 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
           <div className="flex items-center gap-2 mb-3">
             <ShieldAlert className="w-5 h-5 text-indigo-600" />
             <h2 className="text-sm font-bold text-slate-900 dark:text-white">Review console</h2>
-            <button onClick={() => void loadQueue()} className="ml-auto p-1.5 rounded border border-slate-200 dark:border-slate-700" aria-label="Refresh queue" title="Refresh queue">
+            <button onClick={() => void refreshConsole()} className="ml-auto p-1.5 rounded border border-slate-200 dark:border-slate-700" aria-label="Refresh queue and evidence" title="Refresh queue and evidence">
               <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
             </button>
           </div>

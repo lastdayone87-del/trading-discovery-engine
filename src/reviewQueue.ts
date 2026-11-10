@@ -14,7 +14,10 @@ export function parseReviewQueuePage<T extends { channelId: string }>(data: unkn
   const items = Array.isArray(body?.items)
     ? body.items.filter((item): item is T => Boolean(item) && typeof (item as { channelId?: unknown }).channelId === 'string')
     : [];
-  const total = Number.isFinite(Number(body?.total)) ? Math.max(0, Number(body?.total)) : items.length;
+  const rawTotal = body?.total;
+  const total = typeof rawTotal === 'number' && Number.isInteger(rawTotal) && rawTotal >= 0
+    ? rawTotal
+    : items.length;
   return { items, total };
 }
 

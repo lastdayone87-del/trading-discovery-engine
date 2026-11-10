@@ -265,8 +265,8 @@ export async function getReviewEvidence(
   // An existing snapshot is authoritative even when a key array is empty:
   // empty documents/assertions means the run had none, not "match anything".
   const snapshotScope = Boolean(creatorFocusRow);
-  const exactDocumentScope = snapshotScope && !documentScope.malformed;
-  const exactAssertionScope = snapshotScope && !assertionScope.malformed;
+  const exactDocumentScope = snapshotScope && documentScope.present && !documentScope.malformed;
+  const exactAssertionScope = snapshotScope && assertionScope.present && !assertionScope.malformed;
   const fallbackCutoff = options.cutoff || (diagnosticRow ? new Date(diagnosticRow.created_at).toISOString() : undefined);
   const shouldQueryDocuments = !exactDocumentScope || documentScope.keys.length > 0;
   const shouldQueryAssertions = !exactAssertionScope || assertionScope.keys.length > 0;
@@ -306,6 +306,8 @@ export async function getReviewEvidence(
   if (eligibilityWarning) bundle.warnings.push(eligibilityWarning);
   if (diagnosticWarning) bundle.warnings.push(diagnosticWarning);
   if (diagnosticRow && !snapshotScope) bundle.warnings.push('EVIDENCE_SCOPE_TEMPORAL_FALLBACK');
+  if (snapshotScope && !documentScope.present) bundle.warnings.push('EVIDENCE_DOCUMENT_SCOPE_MISSING');
+  if (snapshotScope && !assertionScope.present) bundle.warnings.push('EVIDENCE_ASSERTION_SCOPE_MISSING');
   if (documentScope.malformed) bundle.warnings.push('EVIDENCE_DOCUMENT_SCOPE_MALFORMED');
   if (assertionScope.malformed) bundle.warnings.push('EVIDENCE_ASSERTION_SCOPE_MALFORMED');
   if (exactDocumentScope && documentScope.keys.length === 0) bundle.warnings.push('EVIDENCE_DOCUMENT_SCOPE_EMPTY');

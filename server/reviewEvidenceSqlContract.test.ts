@@ -30,6 +30,9 @@ test('review evidence is scoped to the exact Creator Focus document and assertio
   assert.match(source, /EVIDENCE_DOCUMENT_SCOPE_MALFORMED/);
   assert.match(source, /EVIDENCE_ASSERTION_SCOPE_MALFORMED/);
   assert.match(source, /EVIDENCE_DOCUMENT_SCOPE_EMPTY/);
+  assert.match(source, /EVIDENCE_DOCUMENT_SCOPE_MISSING/);
+  assert.match(source, /EVIDENCE_ASSERTION_SCOPE_MISSING/);
+  assert.match(source, /documentScope\.present/);
   assert.match(source, /EVIDENCE_ASSERTION_SCOPE_EMPTY/);
 });
 

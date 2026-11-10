@@ -22,6 +22,9 @@ test('review queue pagination parses the durable total and filters malformed row
     items: [{ channelId: 'chan-1' }],
     total: 1,
   });
+  assert.equal(parseReviewQueuePage({ items: [{ channelId: 'chan-1' }], total: null }).total, 1);
+  assert.equal(parseReviewQueuePage({ items: [{ channelId: 'chan-1' }], total: '120' }).total, 1);
+  assert.equal(parseReviewQueuePage({ items: [{ channelId: 'chan-1' }], total: 2.5 }).total, 1);
 });
 
 test('changing pages keeps or replaces the selection predictably', () => {

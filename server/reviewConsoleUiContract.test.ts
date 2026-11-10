@@ -30,7 +30,7 @@ test('review console guards stale responses and supports the OTHER reason contra
   assert.match(ui, /reviewReasonOther/);
   assert.match(ui, /reasonCode === 'OTHER'/);
   assert.match(ui, /storedEvidenceItems/);
-  assert.match(ui, /aria-label="Refresh queue"/);
+  assert.match(ui, /aria-label="Refresh queue and evidence"/);
 });
 
 test('review console never submits a stale bundle for a newly selected channel',()=>{
@@ -45,6 +45,10 @@ test('review console paginates without reloading on selection and shows creation
   assert.match(ui, /selectionAfterQueueLoad/);
   assert.match(ui, /reviewQueuePageState/);
   assert.match(ui, /creatorFocusSummary/);
+  assert.match(ui, /refreshConsole/);
+  assert.match(ui, /loadBundle\(selected\)/);
+  assert.match(ui, /queue\.find\(item => item\.channelId === selected\)/);
+  assert.doesNotMatch(ui, /\|\| bundle\?\.review/);
   assert.match(ui, /Previous/);
   assert.match(ui, /Next/);
   assert.match(ui, /creatorFocusSnapshot/);
