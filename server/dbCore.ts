@@ -2320,11 +2320,28 @@ export async function getStandaloneExtractedQueryCandidates(country: string, lim
            AND ql.status = 'ACTIVE'
            AND ql.normalized_query = c.normalized_text
        )
-     ORDER BY c.last_attempted_at NULLS FIRST, c.confidence DESC, c.updated_at DESC, c.id ASC
+     ORDER BY c.last_cap_deferred_at NULLS FIRST, c.last_attempted_at NULLS FIRST,
+       c.confidence DESC, c.updated_at DESC, c.id ASC
      LIMIT $2`,
     [canonicalCountry(country), Math.max(1, Math.min(100, Math.trunc(limit)))],
   );
   return res.rows.map(mapExtractedCandidate);
+}
+
+/**
+ * Lower the priority of candidates deferred by the actual-batch cap. They stay
+ * eligible (no cooldown), but move behind rows that have never been deferred.
+ */
+export async function markExtractedQueryCandidatesCapDeferred(ids: number[]): Promise<void> {
+  const values = ids.filter(id => Number.isSafeInteger(id) && id > 0);
+  if (!values.length) return;
+  const db = await getDb();
+  await db.query(
+    `UPDATE extracted_query_candidates
+     SET last_cap_deferred_at=now(), cap_deferral_count=cap_deferral_count+1, updated_at=now()
+     WHERE id = ANY($1::bigint[])`,
+    [values],
+  );
 }
 
 /** Record that the planner was offered these candidates, so it can rotate. */

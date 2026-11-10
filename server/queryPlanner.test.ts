@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ExtractedTermRecord, QueryRecord } from '../src/types';
-import { isCountryScriptCompatible, isRetrievalOrientedQuery, isReviewedNativeStandaloneSurface, limitRepeatedPrimaryTerms, normalizeQuery, planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, queriesOutsideCooldown, queryTokenCount, rotateAwayFromMostRecentIntent } from './queryPlanner';
+import { capExtractedStandaloneShare, isCountryScriptCompatible, isRetrievalOrientedQuery, isReviewedNativeStandaloneSurface, limitRepeatedPrimaryTerms, normalizeQuery, planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, queriesOutsideCooldown, queryTokenCount, rotateAwayFromMostRecentIntent } from './queryPlanner';
 import { ORGANIC_QUERY_POLICY_VERSION } from './organicQueryExpansion';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
 import { admitQueryRecord } from './queryQuality/admission';
@@ -415,6 +415,44 @@ test('blocked extracted text does not consume the 40% planner slot', () => {
   assert.equal(extracted.length, 1, planned.map(item => `${item.metadata.queryTemplate}:${item.query}`).join(' | '));
   assert.equal(extracted[0].query, 'DAX Orderflow Strategie');
   assert.equal((extracted[0].metadata as any).extractedCandidateId, 9102);
+});
+
+test('extracted standalone share is capped by the actual planned batch', () => {
+  const extracted = (id: number) => ({ metadata: { queryTemplate: 'EXTRACTED_STANDALONE' }, id });
+  const other = (id: number) => ({ metadata: { queryTemplate: 'SINGLE_ATOM' }, id });
+  assert.deepEqual(capExtractedStandaloneShare([extracted(1)]), []);
+  assert.deepEqual(capExtractedStandaloneShare([extracted(1), other(2)]).map(item => item.id), [2]);
+  assert.deepEqual(capExtractedStandaloneShare([extracted(1), other(2), other(3)]).map(item => item.id), [1, 2, 3]);
+  assert.deepEqual(capExtractedStandaloneShare([extracted(1), extracted(2), other(3)]).map(item => item.id), [3]);
+  assert.deepEqual(capExtractedStandaloneShare([extracted(1), extracted(2), other(3), other(4)]).map(item => item.id), [1, 3, 4]);
+  assert.deepEqual(capExtractedStandaloneShare([extracted(1), extracted(2), other(3), other(4), other(5)]).map(item => item.id), [1, 2, 3, 4, 5]);
+  assert.deepEqual(capExtractedStandaloneShare([extracted(1), extracted(2), extracted(3), other(4), other(5), other(6)]).map(item => item.id), [1, 2, 4, 5, 6]);
+  assert.deepEqual(capExtractedStandaloneShare([]), []);
+  const deferredHelper: number[] = [];
+  capExtractedStandaloneShare(
+    [extracted(1), extracted(2), other(3)],
+    items => deferredHelper.push(...items.map(item => item.id)),
+  );
+  assert.deepEqual(deferredHelper, [1, 2]);
+
+  const deferredPlanner: number[] = [];
+  const underfilled = planDiverseQueries({
+    country: 'Test Land',
+    count: 4,
+    learnedVocabulary: [],
+    existingQueries: [],
+    standaloneExtractedCandidates: [{
+      id: 9201,
+      candidateText: 'DAX Orderflow Strategie',
+      language: 'de',
+      intent: 'strategy',
+      confidence: 0.8,
+      sourceTitle: 'DAX Orderflow Strategie',
+    }],
+    onExtractedCapDeferred: ids => deferredPlanner.push(...ids),
+  });
+  assert.deepEqual(underfilled, []);
+  assert.deepEqual(deferredPlanner, [9201]);
 });
 
 test('ambiguous short modifiers are not used by frontier target fallback', () => {
