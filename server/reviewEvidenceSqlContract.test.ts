@@ -21,12 +21,16 @@ test('review evidence selects explicit diagnostic columns and bounded evidence r
 test('review evidence is scoped to the exact Creator Focus document and assertion keys', () => {
   assert.match(source, /document_keys/);
   assert.match(source, /assertion_keys/);
-  assert.match(source, /documentKeys: exactDocumentScope \? documentKeys : undefined/);
-  assert.match(source, /assertionKeys: exactAssertionScope \? assertionKeys : undefined/);
+  assert.match(source, /documentKeys: exactDocumentScope \? documentScope\.keys : undefined/);
+  assert.match(source, /assertionKeys: exactAssertionScope \? assertionScope\.keys : undefined/);
   assert.match(source, /classificationDiagnosticId: diagnosticRow\?\.id/);
   assert.match(source, /EVIDENCE_SCOPE_TEMPORAL_FALLBACK/);
   assert.match(source, /EVIDENCE_DOCUMENT_SCOPE_INCOMPLETE/);
   assert.match(source, /EVIDENCE_ASSERTION_SCOPE_INCOMPLETE/);
+  assert.match(source, /EVIDENCE_DOCUMENT_SCOPE_MALFORMED/);
+  assert.match(source, /EVIDENCE_ASSERTION_SCOPE_MALFORMED/);
+  assert.match(source, /EVIDENCE_DOCUMENT_SCOPE_EMPTY/);
+  assert.match(source, /EVIDENCE_ASSERTION_SCOPE_EMPTY/);
 });
 
 test('review evidence uses real Creator Focus columns', () => {

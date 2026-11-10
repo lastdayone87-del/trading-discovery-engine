@@ -63,17 +63,30 @@ function asRecord(value: unknown): Record<string, unknown> {
   return {};
 }
 
-function asStringArray(value: unknown): string[] {
-  if (Array.isArray(value)) return value.filter((entry): entry is string => typeof entry === 'string');
+export interface ParsedKeyScope {
+  keys: string[];
+  present: boolean;
+  malformed: boolean;
+}
+
+/**
+ * Parse a Creator Focus key array without silently discarding malformed
+ * entries. An existing empty array is an exact empty scope; a missing value is
+ * a legacy snapshot that needs a temporal fallback.
+ */
+export function parseKeyScope(value: unknown): ParsedKeyScope {
+  if (value == null) return { keys: [], present: false, malformed: false };
+  let parsed = value;
   if (typeof value === 'string') {
     try {
-      const parsed = JSON.parse(value);
-      if (Array.isArray(parsed)) return parsed.filter((entry): entry is string => typeof entry === 'string');
+      parsed = JSON.parse(value);
     } catch {
-      // ignore malformed legacy payloads
+      return { keys: [], present: true, malformed: true };
     }
   }
-  return [];
+  if (!Array.isArray(parsed)) return { keys: [], present: true, malformed: true };
+  const keys = parsed.filter((entry): entry is string => typeof entry === 'string');
+  return { keys, present: true, malformed: keys.length !== parsed.length };
 }
 
 function asArray(value: unknown): unknown[] {
@@ -247,29 +260,32 @@ export async function getReviewEvidence(
     creatorFocusRow = result?.rows[0] || null;
   }
 
-  const documentKeys = asStringArray(creatorFocusRow?.document_keys);
-  const assertionKeys = asStringArray(creatorFocusRow?.assertion_keys);
-  const exactDocumentScope = documentKeys.length > 0;
-  const exactAssertionScope = assertionKeys.length > 0;
-  const cutoff = exactDocumentScope
-    ? undefined
-    : options.cutoff || (diagnosticRow ? new Date(diagnosticRow.created_at).toISOString() : undefined);
+  const documentScope = parseKeyScope(creatorFocusRow?.document_keys);
+  const assertionScope = parseKeyScope(creatorFocusRow?.assertion_keys);
+  // An existing snapshot is authoritative even when a key array is empty:
+  // empty documents/assertions means the run had none, not "match anything".
+  const snapshotScope = Boolean(creatorFocusRow);
+  const exactDocumentScope = snapshotScope && !documentScope.malformed;
+  const exactAssertionScope = snapshotScope && !assertionScope.malformed;
+  const fallbackCutoff = options.cutoff || (diagnosticRow ? new Date(diagnosticRow.created_at).toISOString() : undefined);
+  const shouldQueryDocuments = !exactDocumentScope || documentScope.keys.length > 0;
+  const shouldQueryAssertions = !exactAssertionScope || assertionScope.keys.length > 0;
 
   let documentsUnavailable = false;
   let assertionsUnavailable = false;
   let coverageUnavailable = false;
   const [evidenceDocuments, evidenceAssertions, evidenceCoverage] = await Promise.all([
-    listEvidenceDocuments({
+    !shouldQueryDocuments ? Promise.resolve([]) : listEvidenceDocuments({
       channelId,
-      documentKeys: exactDocumentScope ? documentKeys : undefined,
-      limit: Math.min(250, Math.max(1, options.documentLimit || 50, documentKeys.length)),
-      cutoff,
+      documentKeys: exactDocumentScope ? documentScope.keys : undefined,
+      limit: Math.min(250, Math.max(1, options.documentLimit || 50, documentScope.keys.length)),
+      cutoff: exactDocumentScope ? undefined : fallbackCutoff,
     }).catch(() => { documentsUnavailable = true; return []; }),
-    listEvidenceAssertions({
+    !shouldQueryAssertions ? Promise.resolve([]) : listEvidenceAssertions({
       channelId,
-      assertionKeys: exactAssertionScope ? assertionKeys : undefined,
-      limit: Math.min(250, Math.max(1, options.assertionLimit || 100, assertionKeys.length)),
-      cutoff,
+      assertionKeys: exactAssertionScope ? assertionScope.keys : undefined,
+      limit: Math.min(250, Math.max(1, options.assertionLimit || 100, assertionScope.keys.length)),
+      cutoff: exactAssertionScope ? undefined : fallbackCutoff,
     }).catch(() => { assertionsUnavailable = true; return []; }),
     listEvidenceCoverage({
       channelId,
@@ -289,9 +305,13 @@ export async function getReviewEvidence(
   });
   if (eligibilityWarning) bundle.warnings.push(eligibilityWarning);
   if (diagnosticWarning) bundle.warnings.push(diagnosticWarning);
-  if (diagnosticRow && !exactDocumentScope) bundle.warnings.push('EVIDENCE_SCOPE_TEMPORAL_FALLBACK');
-  if (exactDocumentScope && evidenceDocuments.length < documentKeys.length) bundle.warnings.push('EVIDENCE_DOCUMENT_SCOPE_INCOMPLETE');
-  if (exactAssertionScope && evidenceAssertions.length < assertionKeys.length) bundle.warnings.push('EVIDENCE_ASSERTION_SCOPE_INCOMPLETE');
+  if (diagnosticRow && !snapshotScope) bundle.warnings.push('EVIDENCE_SCOPE_TEMPORAL_FALLBACK');
+  if (documentScope.malformed) bundle.warnings.push('EVIDENCE_DOCUMENT_SCOPE_MALFORMED');
+  if (assertionScope.malformed) bundle.warnings.push('EVIDENCE_ASSERTION_SCOPE_MALFORMED');
+  if (exactDocumentScope && documentScope.keys.length === 0) bundle.warnings.push('EVIDENCE_DOCUMENT_SCOPE_EMPTY');
+  if (exactAssertionScope && assertionScope.keys.length === 0) bundle.warnings.push('EVIDENCE_ASSERTION_SCOPE_EMPTY');
+  if (exactDocumentScope && evidenceDocuments.length < documentScope.keys.length) bundle.warnings.push('EVIDENCE_DOCUMENT_SCOPE_INCOMPLETE');
+  if (exactAssertionScope && evidenceAssertions.length < assertionScope.keys.length) bundle.warnings.push('EVIDENCE_ASSERTION_SCOPE_INCOMPLETE');
   if (diagnosticRow && !coverageUnavailable && evidenceCoverage.length === 0) bundle.warnings.push('EVIDENCE_COVERAGE_NOT_FOUND');
   if (documentsUnavailable) bundle.warnings.push('EVIDENCE_DOCUMENTS_UNAVAILABLE');
   if (assertionsUnavailable) bundle.warnings.push('EVIDENCE_ASSERTIONS_UNAVAILABLE');

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
-import { mapReviewEvidenceRows } from './reviewEvidence';
+import { mapReviewEvidenceRows, parseKeyScope } from './reviewEvidence';
 
 const review: any = {
   channelId: 'chan-1',
@@ -66,4 +66,14 @@ test('evidence read failures are surfaced as warnings',()=>{
   for (const warning of ['EVIDENCE_DOCUMENTS_UNAVAILABLE','EVIDENCE_ASSERTIONS_UNAVAILABLE','EVIDENCE_COVERAGE_UNAVAILABLE','CREATOR_FOCUS_UNAVAILABLE','ELIGIBILITY_DECISION_NOT_FOUND','CLASSIFICATION_DIAGNOSTIC_NOT_FOUND','CLASSIFICATION_DIAGNOSTIC_ID_MISSING','ELIGIBILITY_DECISION_ID_MISSING','EVIDENCE_SCOPE_TEMPORAL_FALLBACK','EVIDENCE_DOCUMENT_SCOPE_INCOMPLETE','EVIDENCE_ASSERTION_SCOPE_INCOMPLETE','EVIDENCE_COVERAGE_NOT_FOUND']) {
     assert.match(source, new RegExp(warning));
   }
+});
+
+test('scope parsing distinguishes missing, empty, and malformed key arrays', () => {
+  assert.deepEqual(parseKeyScope(undefined), { keys: [], present: false, malformed: false });
+  assert.deepEqual(parseKeyScope([]), { keys: [], present: true, malformed: false });
+  assert.deepEqual(parseKeyScope(['a', 'b']), { keys: ['a', 'b'], present: true, malformed: false });
+  assert.deepEqual(parseKeyScope('["a"]'), { keys: ['a'], present: true, malformed: false });
+  assert.deepEqual(parseKeyScope(['a', 2]), { keys: ['a'], present: true, malformed: true });
+  assert.deepEqual(parseKeyScope('{bad json'), { keys: [], present: true, malformed: true });
+  assert.deepEqual(parseKeyScope({ a: 1 }), { keys: [], present: true, malformed: true });
 });

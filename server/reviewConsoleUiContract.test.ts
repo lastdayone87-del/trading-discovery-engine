@@ -41,13 +41,16 @@ test('review console never submits a stale bundle for a newly selected channel',
 });
 
 test('review console paginates without reloading on selection and shows creation focus evidence', () => {
-  assert.match(ui, /data\.items/);
-  assert.match(ui, /data\.total/);
+  assert.match(ui, /parseReviewQueuePage/);
+  assert.match(ui, /selectionAfterQueueLoad/);
+  assert.match(ui, /reviewQueuePageState/);
+  assert.match(ui, /creatorFocusSummary/);
   assert.match(ui, /Previous/);
   assert.match(ui, /Next/);
   assert.match(ui, /creatorFocusSnapshot/);
   assert.match(ui, /creator_focus_distribution/);
-  assert.match(ui, /lower_confidence_bound/);
-  assert.match(ui, /document_keys/);
+  assert.match(ui, /creatorFocus\.lowerConfidenceBound/);
+  assert.match(ui, /creatorFocus\.documentCount/);
+  assert.match(ui, /creatorFocus\.assertionCount/);
   assert.match(navbar, /operationalSummary \? operationalSummary\.pendingReviews : '…'/);
 });

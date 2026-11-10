@@ -3,6 +3,7 @@ import { AlertTriangle, CheckCircle2, ChevronLeft, ChevronRight, ExternalLink, L
 import { apiFetch } from '../apiClient';
 import { submitReviewDecision } from '../reviewDecision';
 import { canSubmitReviewForSelection, reviewEvidenceIsDecidable } from '../reviewSelection';
+import { creatorFocusSummary, parseReviewQueuePage, reviewQueuePageState, selectionAfterQueueLoad } from '../reviewQueue';
 import { newRequestId } from '../apiClient';
 
 interface ReviewQueueItem {
@@ -90,14 +91,11 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
       if (country.trim()) params.set('country', country.trim());
       const response = await apiFetch(`/api/reviews?${params.toString()}`);
       if (!response.ok) throw new Error(await response.text() || 'Could not load the review queue.');
-      const data = await response.json() as { items: ReviewQueueItem[]; total: number };
+      const data = parseReviewQueuePage<ReviewQueueItem>(await response.json());
       if (requestId !== queueRequest.current) return;
-      setQueue(data.items || []);
-      setTotal(Number(data.total || 0));
-      setSelected(previous => {
-        if (previous && data.items?.some(item => item.channelId === previous)) return previous;
-        return data.items?.[0]?.channelId || null;
-      });
+      setQueue(data.items);
+      setTotal(data.total);
+      setSelected(previous => selectionAfterQueueLoad(previous, data.items));
     } catch (err) {
       if (requestId !== queueRequest.current) return;
       setError(err instanceof Error ? err.message : 'Could not load the review queue.');
@@ -187,6 +185,8 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
   const decision = bundle?.diagnostic?.decision || {};
   const collection = decision.evidenceCollection || {};
   const routing = decision.deterministicRouting || {};
+  const creatorFocus = creatorFocusSummary(bundle?.creatorFocusSnapshot);
+  const queuePage = reviewQueuePageState(total, offset);
   const storedEvidenceItems = Array.isArray(bundle?.diagnostic?.evidenceItems) ? bundle!.diagnostic!.evidenceItems : [];
   const positive = Array.isArray(decision.positiveEvidence) && decision.positiveEvidence.length
     ? decision.positiveEvidence
@@ -233,7 +233,7 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
             <button disabled={offset === 0 || loading} onClick={() => setOffset(Math.max(0, offset - 50))} className="inline-flex items-center gap-1 rounded border border-slate-200 dark:border-slate-700 px-2 py-1 disabled:opacity-40">
               <ChevronLeft className="w-3 h-3" /> Previous
             </button>
-            <span className="text-slate-500">Page {Math.floor(offset / 50) + 1} of {Math.max(1, Math.ceil(total / 50))}</span>
+            <span className="text-slate-500">Page {queuePage.page} of {queuePage.pageCount}</span>
             <button disabled={offset + 50 >= total || loading} onClick={() => setOffset(offset + 50)} className="inline-flex items-center gap-1 rounded border border-slate-200 dark:border-slate-700 px-2 py-1 disabled:opacity-40">
               Next <ChevronRight className="w-3 h-3" />
             </button>
@@ -324,18 +324,18 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
             </Section>
 
             <Section title="Creator Focus snapshot (shadow, non-authoritative)">
-              {!bundle.creatorFocusSnapshot && <div className="text-xs text-slate-400">No Creator Focus snapshot is recorded for this diagnostic.</div>}
-              {bundle.creatorFocusSnapshot && (
+              {!creatorFocus && <div className="text-xs text-slate-400">No Creator Focus snapshot is recorded for this diagnostic.</div>}
+              {creatorFocus && (
                 <div className="grid gap-3 md:grid-cols-2">
                   <div className="text-xs space-y-1">
-                    <div><span className="text-slate-400">Mode:</span> {bundle.creatorFocusSnapshot.mode || '—'}</div>
-                    <div><span className="text-slate-400">Proposed:</span> {bundle.creatorFocusSnapshot.proposed_status || '—'}</div>
-                    <div><span className="text-slate-400">Effective:</span> {bundle.creatorFocusSnapshot.effective_status || 'UNCERTAIN'}</div>
-                    <div><span className="text-slate-400">Probability:</span> {bundle.creatorFocusSnapshot.probability ?? '—'}</div>
-                    <div><span className="text-slate-400">Lower confidence bound:</span> {bundle.creatorFocusSnapshot.lower_confidence_bound ?? '—'}</div>
-                    <div><span className="text-slate-400">Observed:</span> {date(bundle.creatorFocusSnapshot.observed_at)}</div>
-                    <div><span className="text-slate-400">Scoped documents:</span> {Array.isArray(bundle.creatorFocusSnapshot.document_keys) ? bundle.creatorFocusSnapshot.document_keys.length : 0}</div>
-                    <div><span className="text-slate-400">Scoped assertions:</span> {Array.isArray(bundle.creatorFocusSnapshot.assertion_keys) ? bundle.creatorFocusSnapshot.assertion_keys.length : 0}</div>
+                    <div><span className="text-slate-400">Mode:</span> {creatorFocus.mode}</div>
+                    <div><span className="text-slate-400">Proposed:</span> {creatorFocus.proposedStatus}</div>
+                    <div><span className="text-slate-400">Effective:</span> {creatorFocus.effectiveStatus}</div>
+                    <div><span className="text-slate-400">Probability:</span> {creatorFocus.probability ?? '—'}</div>
+                    <div><span className="text-slate-400">Lower confidence bound:</span> {creatorFocus.lowerConfidenceBound ?? '—'}</div>
+                    <div><span className="text-slate-400">Observed:</span> {date(creatorFocus.observedAt)}</div>
+                    <div><span className="text-slate-400">Scoped documents:</span> {creatorFocus.documentCount}</div>
+                    <div><span className="text-slate-400">Scoped assertions:</span> {creatorFocus.assertionCount}</div>
                   </div>
                   <div className="space-y-2">
                     <div><div className="text-[11px] text-slate-400 mb-1">Focus distribution</div><JsonBlock value={bundle.creatorFocusSnapshot.creator_focus_distribution} /></div>
