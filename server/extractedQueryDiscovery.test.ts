@@ -243,6 +243,26 @@ test('non-Latin native scripts pass intent and preserve their script', () => {
     }),
     [],
   );
+  assert.deepEqual(
+    deriveDeterministicQueryCandidates({
+      sources: video('Cryptography course'),
+      country: 'United Kingdom', language: 'en',
+    }),
+    [],
+  );
+  const dax40 = deriveDeterministicQueryCandidates({
+    sources: video('DAX40 Analyse'),
+    country: 'Germany', language: 'de',
+  });
+  assert.ok(dax40.some(candidate => candidate.candidateText === 'DAX40 Analyse'));
+  for (const title of ['高配当株', '株主優待']) {
+    assert.ok(
+      deriveDeterministicQueryCandidates({
+        sources: video(title), country: 'Japan', language: 'ja',
+      }).some(candidate => candidate.candidateText === title),
+      title,
+    );
+  }
 
   const offTopic = deriveDeterministicQueryCandidates({
     sources: video('木板安装教程'),

@@ -119,7 +119,7 @@ const SCRIPT_INTENT_TOKENS: Array<{ script: RegExp; tokens: string[] }> = [
       // Prefer compounds over bare words (株, 注文, 指数, 見方, 戦略) that occur
       // in ordinary Japanese and Chinese text.
       '日経', '先物', '相場', '投資', '日足', '時間足', '板読み', '板情報', '前場', '後場', '東京市場', '株式取引', '株価',
-      '株価指数', '日経平均', '証券', '為替', '金利', '銘柄', 'チャート',
+      '株価指数', '日経平均', '高配当株', '株主優待', '配当', '株主', '証券', '為替', '金利', '銘柄', 'チャート',
     ],
   },
   {
@@ -200,8 +200,12 @@ function hasTradingIntent(text: string): boolean {
   // Mixed native titles often carry their instrument as an ASCII ticker
   // (ETHの見方, DAX Analyse). Treat a known strong ticker as intent without
   // widening the generic native token list.
-  const asciiTerms = (text.match(/\b[A-Za-z]+\b/gu) || []) as string[];
-  if (asciiTerms.some(term => STRONG_INTENT_TOKENS.has(term.toLocaleLowerCase('en')))) return true;
+  const asciiTerms = (text.match(/\b[A-Za-z][A-Za-z0-9]{1,}\b/gu) || []) as string[];
+  if (asciiTerms.some(term => {
+    const lower = term.toLocaleLowerCase('en');
+    return STRONG_INTENT_TOKENS.has(lower)
+      || STRONG_INTENT_TOKENS.has(lower.replace(/\d+$/u, ''));
+  })) return true;
   for (const { script, tokens } of SCRIPT_INTENT_TOKENS) {
     if (script.test(text) && tokens.some(token => text.includes(token))) return true;
   }
