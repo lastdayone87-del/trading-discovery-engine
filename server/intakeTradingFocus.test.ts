@@ -180,9 +180,9 @@ test('incidental market words do not admit a music channel with a hard domain si
     channelName: 'Backstage Sessions',
     description: 'Official music video. Streaming options available.',
     videoTitles: ['Artist shares backstage footage'],
-    matchedDocument: { type: 'VIDEO', title: 'Backstage Sessions', description: 'Official music video.' },
+    matchedDocument: { type: 'VIDEO', title: 'Backstage Sessions', description: '' },
   });
-  assert.notEqual(decision.decision, 'ADMIT');
+  assert.equal(decision.decision, 'DEFER');
 });
 
 test('generic hard-negative words in video text defer instead of withholding a market channel', () => {
