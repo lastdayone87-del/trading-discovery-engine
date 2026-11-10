@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { providerCooldownReadCache } from './cooldownReadCache';
 
 export type ProviderStatus = 'SUCCESS'|'TIMEOUT'|'CANCELLED'|'RATE_LIMITED'|'TRANSIENT_ERROR'|'PERMANENT_ERROR';
 export type ProviderErrorClass = 'TIMEOUT'|'CANCELLED'|'RATE_LIMIT'|'TRANSIENT'|'PERMANENT_INPUT'|'CREDENTIALS_EXHAUSTED';
@@ -424,19 +425,20 @@ export function decideGeminiCapacity(operation:string, snapshot:GeminiCapacitySn
  */
 export async function getGeminiSemanticCooldownExpiry(
   nowMs: number = Date.now(),
-  query: (sql: string, values?: unknown[]) => Promise<{ rows: any[] }> = async (sql, values) => {
-    const { getDb } = await import('./db');
-    const db = await getDb();
-    return db.query(sql, values);
-  },
+  query?: (sql: string, values?: unknown[]) => Promise<{ rows: any[] }>,
 ): Promise<number | undefined> {
   const orgIds = [...new Set(configuredGeminiOrgIds())];
   // No configured paid-Gemini account means this pool gate has no account to
   // describe; a global unscoped read would only group independent projects.
   if (!orgIds.length) return undefined;
-  const config = geminiCapacityConfig();
-  try {
-    const res = await query(
+  const load = async (): Promise<number | undefined> => {
+    const config = geminiCapacityConfig();
+    const run = query ?? (async (sql: string, values?: unknown[]) => {
+      const { getDb } = await import('./db');
+      const db = await getDb();
+      return db.query(sql, values);
+    });
+    const res = await run(
       `SELECT occurred_at,
               MAX((request_metadata->>'cooldownUntilMs')::bigint)
                 FILTER (WHERE request_metadata->>'cooldownUntilMs' ~ '^[0-9]+$') OVER () AS cooldown_until_ms
@@ -450,6 +452,14 @@ export async function getGeminiSemanticCooldownExpiry(
     const row = res.rows[0];
     if (!row?.occurred_at) return undefined;
     return providerCooldownExpiryMs(row.occurred_at, row.cooldown_until_ms, config.semanticRateLimitCooldownMs, nowMs);
+  };
+  // Tests and other callers that inject a query seam must observe their own
+  // read immediately; only the production DB path is cached.
+  if (query) {
+    try { return await load(); } catch { return undefined; }
+  }
+  try {
+    return await providerCooldownReadCache.get('gemini:pool', nowMs, load);
   } catch {
     return undefined;
   }
@@ -475,12 +485,19 @@ export async function isGeminiSemanticCooldownActive(nowMs: number = Date.now())
  * after deploy, after which every semantic path tags its rows). A 429 on one
  * account never affects another account's window.
  */
-export async function getGeminiOrgSemanticCooldownExpiry(orgId: string, nowMs: number = Date.now()): Promise<number | undefined> {
-  const config = geminiCapacityConfig();
-  try {
-    const { getDb } = await import('./db');
-    const db = await getDb();
-    const res = await db.query(
+export async function getGeminiOrgSemanticCooldownExpiry(
+  orgId: string,
+  nowMs: number = Date.now(),
+  query?: (sql: string, values?: unknown[]) => Promise<{ rows: any[] }>,
+): Promise<number | undefined> {
+  const load = async (): Promise<number | undefined> => {
+    const config = geminiCapacityConfig();
+    const run = query ?? (async (sql: string, values?: unknown[]) => {
+      const { getDb } = await import('./db');
+      const db = await getDb();
+      return db.query(sql, values);
+    });
+    const res = await run(
       `SELECT occurred_at,
               MAX((request_metadata->>'cooldownUntilMs')::bigint)
                 FILTER (WHERE request_metadata->>'cooldownUntilMs' ~ '^[0-9]+$') OVER () AS cooldown_until_ms
@@ -494,6 +511,12 @@ export async function getGeminiOrgSemanticCooldownExpiry(orgId: string, nowMs: n
     const row = res.rows[0];
     if (!row?.occurred_at) return undefined;
     return providerCooldownExpiryMs(row.occurred_at, row.cooldown_until_ms, config.semanticRateLimitCooldownMs, nowMs);
+  };
+  if (query) {
+    try { return await load(); } catch { return undefined; }
+  }
+  try {
+    return await providerCooldownReadCache.get(`gemini:org:${orgId}`, nowMs, load);
   } catch {
     return undefined;
   }
