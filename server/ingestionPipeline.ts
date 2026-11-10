@@ -622,9 +622,10 @@ async function processChannelThroughPipelineInContext(
   // Discord work, require a cheap plausible trading hypothesis from the matched
   // retrieval document. Withheld candidates remain preserved in the nomination
   // ledger and can be rediscovered later by independent evidence.
-  if (options?.forceClassification !== true) {
-    const retrievalTriage = triageAutonomousSearchCandidate(candidate, source, isEnrichmentPass);
-    if (retrievalTriage.disposition === 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS') {
+  const retrievalTriage = options?.forceClassification === true
+    ? null
+    : triageAutonomousSearchCandidate(candidate, source, isEnrichmentPass);
+  if (retrievalTriage && retrievalTriage.disposition === 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS') {
       console.log(`[Unified Ingestion Pipeline - Triage] Withholding '${candidate.channelName}' before provider spend: ${retrievalTriage.reasonCodes.join(', ')}.`);
       void recordAdmissionShadow({
         channelId:candidate.channelId, priorState:'NOT_EVALUATED', classificationStatus:'UNCERTAIN', investigationState:'COMPLETED',
@@ -635,7 +636,6 @@ async function processChannelThroughPipelineInContext(
         channelId:candidate.channelId, channelName:candidate.channelName, isNew:!existing, wasKnown:!!existing, persisted:false,
         countryStatus:'UNCERTAIN', tradingStatus:'UNCERTAIN', discordStatus:'NOT_FOUND', discordInvite:null, channelRecord:undefined
       };
-    }
   }
 
   // A DEFER is not a rejection. The cheap evidence is insufficient to justify
@@ -645,7 +645,7 @@ async function processChannelThroughPipelineInContext(
   // authoritative review policy requires a plausible hypothesis, and the
   // channels table trigger would rewrite an unbacked NEEDS_REVIEW back to
   // ENRICHMENT_PENDING. A later rediscovery/review carries fresh evidence.
-  if (retrievalTriage.disposition === 'DEFER_NO_CONFIDENT_EVIDENCE') {
+  if (retrievalTriage && retrievalTriage.disposition === 'DEFER_NO_CONFIDENT_EVIDENCE') {
     console.log(`[Unified Ingestion Pipeline - Triage] Deferring '${candidate.channelName}' from enrichment: ${retrievalTriage.reasonCodes.join(', ')}.`);
     void recordAdmissionShadow({
       channelId:candidate.channelId, priorState:'NOT_EVALUATED', classificationStatus:'UNCERTAIN', investigationState:'DEFERRED',

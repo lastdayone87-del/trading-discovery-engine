@@ -285,9 +285,9 @@ test('playlist-adapter observations are non-authoritative by construction', () =
 test('Gate 1 threads description provenance at every validation call', () => {
   const source = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
   const matches = source.match(/videoDescriptionsAuthoritative:\s*candidate\.videoDescriptionsAuthoritative/g) || [];
-  // Four validateChannelCountry calls (Gate 1, hydration, public-about, and
-  // the DEFER country check) plus the Gate-2 classifier input.
-  assert.equal(matches.length, 5);
+  // One shared validateCountryWithHydration builder (Gate 1, hydration, and
+  // public-about), the DEFER country check, and the Gate-2 classifier input.
+  assert.equal(matches.length, 3);
 });
 
 test('channel enrichment produces the authoritative recent-channel sample', () => {
