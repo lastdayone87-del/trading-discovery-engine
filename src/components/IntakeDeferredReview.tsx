@@ -1,5 +1,5 @@
-import React, { useCallback, useEffect, useState } from 'react';
-import { apiFetch } from '../apiClient';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { apiFetch, newRequestId } from '../apiClient';
 import { responseError } from '../reviewDecision';
 
 type Decision = 'TRADING' | 'NON_TRADING' | 'AMBIGUOUS';
@@ -50,6 +50,7 @@ function asRecord(value: unknown): Record<string, any> {
 }
 
 const IntakeDeferredReview: React.FC = () => {
+  const selectionRequest = useRef(0);
   const [items, setItems] = useState<DeferredItem[]>([]);
   const [offset, setOffset] = useState(0);
   const [hasMore, setHasMore] = useState(false);
@@ -90,11 +91,14 @@ const IntakeDeferredReview: React.FC = () => {
   }, [search, country, language, stateFilter]);
 
   const loadDetails = async (channelId: string) => {
+    const requestId = selectionRequest.current + 1;
+    selectionRequest.current = requestId;
     setLoading(true); setError(''); setSuccess('');
     try {
       const response = await apiFetch(`/api/intake-deferred/${encodeURIComponent(channelId)}`, { headers: reviewerHeaders() });
       if (!response.ok) throw new Error(await responseError(response));
       const details = await response.json() as DeferredDetails;
+      if (selectionRequest.current !== requestId) return;
       setSelected(details);
       setCorrectedCountry('');
       setCorrectedLanguage('');
@@ -102,8 +106,12 @@ const IntakeDeferredReview: React.FC = () => {
       setNotes(details.notes || '');
       setDecision(details.decision === 'NON_TRADING' ? 'NON_TRADING' : details.decision === 'AMBIGUOUS' ? 'AMBIGUOUS' : 'TRADING');
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Unable to load deferred channel details.');
-    } finally { setLoading(false); }
+      if (selectionRequest.current === requestId) {
+        setError(e instanceof Error ? e.message : 'Unable to load deferred channel details.');
+      }
+    } finally {
+      if (selectionRequest.current === requestId) setLoading(false);
+    }
   };
 
   useEffect(() => { void loadList(0); }, []);
@@ -122,7 +130,7 @@ const IntakeDeferredReview: React.FC = () => {
         headers: {
           ...reviewerHeaders(),
           'Content-Type': 'application/json',
-          'Idempotency-Key': crypto.randomUUID(),
+          'Idempotency-Key': newRequestId(),
         },
         body: JSON.stringify({
           reviewVersion: selected.reviewVersion,

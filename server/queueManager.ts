@@ -1350,6 +1350,50 @@ async function processIntakeDeferredRecheckJob(
     await completeJob(job.id);
     return true;
   }
+  // The recheck must not spend enrichment quota on a creator whose stored
+  // country is already confirmed excluded, or on a channel below the absolute
+  // low-audience floor. Both gates run before quota reservation and provider
+  // work, exactly like the normal ENRICH claim path.
+  const storedExclusion = await getCountryExclusion(channel.country);
+  const countryBlock = shouldBlockEnrichClaimForCountry(channel.country_status, channel.country, storedExclusion);
+  if (countryBlock) {
+    const rejectedAt = new Date().toISOString();
+    channel.country_status = 'REJECTED';
+    channel.scan_status = 'COMPLETED';
+    channel.scope_eligibility = resolveScopeEligibility(channel.country);
+    channel.last_checked = rejectedAt;
+    channel.inspection_trail = [...(channel.inspection_trail || []), {
+      step: 'COUNTRY_VALIDATION',
+      title: `Country Validation (${channel.country})`,
+      status: 'REJECTED',
+      details: `${channel.country} is excluded by policy: ${countryBlock.reason}. Recheck cancelled before quota spend.`,
+      timestamp: rejectedAt,
+    }];
+    await upsertChannel(channel);
+    await (await getDb()).query(
+      `UPDATE intake_deferred_reviews SET state='SUPERSEDED',next_recheck_at=NULL,updated_at=now()
+       WHERE channel_id=$1 AND state IN ('PENDING','DECIDED')`,
+      [channelId],
+    );
+    await completeJob(job.id);
+    return true;
+  }
+  const recheckAudience = channel.subscriber_count ?? candidate.subscriberCount;
+  if (evaluateLowAudienceGate(recheckAudience == null ? undefined : String(recheckAudience)).shouldSkipDeepEnrichment) {
+    const skippedAt = new Date().toISOString();
+    channel.scan_status = 'SKIPPED_LOW_AUDIENCE';
+    channel.last_checked = skippedAt;
+    channel.inspection_trail = [...(channel.inspection_trail || []), {
+      step: 'BIO',
+      title: 'Low-Audience Budget Gate',
+      status: 'SKIPPED',
+      details: `Subscribers: ${recheckAudience ?? 'unknown'} (< 30). Intake recheck completed without provider work.`,
+      timestamp: skippedAt,
+    }];
+    await upsertChannel(channel);
+    await completeJob(job.id);
+    return true;
+  }
   const dailyBudget = getDailyYouTubeQuotaBudget();
   const enrichmentPercent = Number(await getAppSetting('discovery_enrichment_quota_percent', process.env.DISCOVERY_ENRICHMENT_QUOTA_PERCENT || '10'));
   let reserved = false;
@@ -1395,6 +1439,7 @@ async function processIntakeDeferredRecheckJob(
       [channelId],
     );
     const priorHash = review.rows[0]?.last_evidence_hash || null;
+    const evidenceChanged = priorHash !== evidenceHash;
     const now = new Date().toISOString();
     const snapshot = {
       system_snapshot: {
@@ -1485,11 +1530,13 @@ async function processIntakeDeferredRecheckJob(
          system_snapshot=excluded.system_snapshot,evidence_snapshot=excluded.evidence_snapshot,
          recheck_attempts=excluded.recheck_attempts,last_checked_at=excluded.last_checked_at,
          next_recheck_at=excluded.next_recheck_at,last_evidence_hash=excluded.last_evidence_hash,
+         review_version=CASE WHEN $9::boolean THEN intake_deferred_reviews.review_version+1
+                             ELSE intake_deferred_reviews.review_version END,
          state=CASE WHEN excluded.state='SUPERSEDED' THEN 'SUPERSEDED'
                     WHEN intake_deferred_reviews.state='PENDING' THEN excluded.state
                     ELSE intake_deferred_reviews.state END,
          updated_at=now()`,
-      [channelId, snapshot.state, JSON.stringify(snapshot.system_snapshot), JSON.stringify(snapshot.evidence_snapshot), snapshot.recheck_attempts, now, snapshot.next_recheck_at, evidenceHash],
+      [channelId, snapshot.state, JSON.stringify(snapshot.system_snapshot), JSON.stringify(snapshot.evidence_snapshot), snapshot.recheck_attempts, now, snapshot.next_recheck_at, evidenceHash, evidenceChanged],
     );
     if (focus.decision === 'DEFER' && priorHash && priorHash !== evidenceHash) {
       // A human AMBIGUOUS label is still actionable when the bounded recheck
@@ -1498,8 +1545,7 @@ async function processIntakeDeferredRecheckJob(
       await (await getDb()).query(
         `UPDATE intake_deferred_reviews
          SET state='PENDING',decision=NULL,reviewer=NULL,reason=NULL,notes=NULL,
-             corrections='{}'::jsonb,decided_at=NULL,
-             review_version=review_version+1,updated_at=now()
+             corrections='{}'::jsonb,decided_at=NULL,updated_at=now()
          WHERE channel_id=$1 AND state='DECIDED' AND decision='AMBIGUOUS'`,
         [channelId],
       );

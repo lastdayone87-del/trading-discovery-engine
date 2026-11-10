@@ -464,10 +464,11 @@ export function normalizeHumanEvaluationSamples(input: unknown): HumanEvaluation
     if (!timestamp) fixtureError(index, 'decidedAt', 'must be a valid ISO-8601 UTC timestamp');
     const [, year, month, day, hour, minute, second, fraction] = timestamp;
     const millis = fraction ? Number(fraction.padEnd(3, '0')) : 0;
-    const decidedDate = new Date(Date.UTC(
-      Number(year), Number(month) - 1, Number(day),
-      Number(hour), Number(minute), Number(second), millis,
-    ));
+    // Date.UTC remaps years 0000-0099 to 1900-1999. setUTCFullYear preserves
+    // the literal year so a valid `0001-...` timestamp is not rejected.
+    const decidedDate = new Date(0);
+    decidedDate.setUTCFullYear(Number(year), Number(month) - 1, Number(day));
+    decidedDate.setUTCHours(Number(hour), Number(minute), Number(second), millis);
     if (
       decidedDate.getUTCFullYear() !== Number(year)
       || decidedDate.getUTCMonth() !== Number(month) - 1

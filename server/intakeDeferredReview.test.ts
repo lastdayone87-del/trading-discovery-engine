@@ -45,6 +45,9 @@ test('fixture validation rejects unknown enums instead of silently dropping rows
   const fractional = structuredClone(fixture) as Array<Record<string, any>>;
   fractional[0].decidedAt = '2026-11-10T00:00:00.5Z';
   assert.equal(normalizeHumanEvaluationSamples(fractional)[0].decidedAt, '2026-11-10T00:00:00.500Z');
+  const earlyYear = structuredClone(fixture) as Array<Record<string, any>>;
+  earlyYear[0].decidedAt = '0001-01-01T00:00:00Z';
+  assert.equal(normalizeHumanEvaluationSamples(earlyYear)[0].decidedAt, '0001-01-01T00:00:00.000Z');
 });
 
 test('fixture metrics expose precision, recall, FPR and FNR without forcing abstentions', () => {
@@ -151,6 +154,12 @@ test('deferred recheck uses the durable ENRICH carrier with bounded stage-1 evid
   assert.match(worker, /units: 2/);
   assert.match(worker, /recheck_attempts: Number\(review\.rows\[0\]\?\.recheck_attempts \|\| 0\) \+ 1/);
   assert.match(worker, /last_evidence_hash/);
+  assert.match(worker, /review_version=CASE WHEN \$9::boolean/);
+  const gate = worker.indexOf('const storedExclusion = await getCountryExclusion(channel.country)');
+  const reserve = worker.indexOf("reserved = await tryReserveQuota({", gate);
+  assert.ok(gate >= 0 && reserve > gate, 'country and low-audience gates must run before recheck quota reservation');
+  assert.match(worker, /shouldBlockEnrichClaimForCountry\(channel\.country_status/);
+  assert.match(worker, /evaluateLowAudienceGate\(recheckAudience/);
   assert.match(worker, /focus\.decision === 'WITHHOLD'/);
   assert.match(worker, /focus\.decision === 'ADMIT'/);
   assert.match(worker, /intake-recheck-enrich:/);
@@ -202,6 +211,8 @@ test('review UI preserves system reasoning separately from human decisions', () 
   assert.match(ui, /stateFilter/);
   assert.match(ui, /selected\.state !== 'PENDING'/);
   assert.match(ui, /X-Reviewer-Id/);
+  assert.match(ui, /newRequestId\(\)/);
+  assert.match(ui, /selectionRequest/);
   assert.doesNotMatch(ui, /Authorization: `Bearer \$\{token\}`/);
 });
 
