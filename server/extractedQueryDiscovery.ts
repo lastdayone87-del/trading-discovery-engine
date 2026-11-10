@@ -174,7 +174,7 @@ const SCRIPT_INTENT_TOKENS: Array<{ script: RegExp; tokens: string[] }> = [
   },
   {
     script: /[\p{Script=Arabic}]/u,
-    tokens: ['تداول', 'سوق', 'أسهم', 'ذهب', 'تحليل', 'استراتيجية', 'عملات', 'نفط', 'مؤشر', 'استثمار', 'فوركس'],
+    tokens: ['تداول', 'سوق', 'أسهم', 'الذهب', 'سعر الذهب', 'أسعار الذهب', 'تداول الذهب', 'تحليل', 'استراتيجية', 'عملات', 'نفط', 'مؤشر', 'استثمار', 'فوركس'],
   },
 ];
 
@@ -228,8 +228,14 @@ function containsNativeToken(text: string, token: string): boolean {
   const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   if (/\p{Script=Arabic}/u.test(token)) {
     // Arabic attaches articles/particles (الذهب, للسوق, للتداول) but arbitrary
-    // substrings such as التسوق ("shopping") must not match سوق.
-    return new RegExp(`(?<![\\p{L}\\p{N}])(?:ال|لل|بال|كال|فال|وال|و|ف|ب|ل|ك)?${escaped}(?:يات|تان|ات|ين|ون|ان|ية)?(?![\\p{L}\\p{N}])`, 'iu').test(text);
+    // substrings such as التسوق ("shopping") must not match سوق. Pronoun
+    // endings are allowed only on explicit trading nouns: تداولنا is trading,
+    // while ذهبنا is the past-tense verb "we went".
+    const allowsPronounEnding = /^(?:تداول|سوق|أسهم|استثمار|تحليل|عملات|نفط|مؤشر|فوركس)$/u.test(token);
+    const suffix = allowsPronounEnding
+      ? '(?:يات|تان|ات|ين|ون|ان|ية|ها|هم|هن|كم|نا|ك)?'
+      : '(?:يات|تان|ات|ين|ون|ان|ية)?';
+    return new RegExp(`(?<![\\p{L}\\p{N}])(?:ال|لل|بال|كال|فال|وال|و|ف|ب|ل|ك)?${escaped}${suffix}(?![\\p{L}\\p{N}])`, 'iu').test(text);
   }
   // Hangul is spaced: require a real word boundary and rely on explicit
   // compounds (주식거래, 주식시장) instead of matching 주식 inside 주식회사.

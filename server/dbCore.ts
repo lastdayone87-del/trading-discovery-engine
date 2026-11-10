@@ -2338,7 +2338,7 @@ export async function markExtractedQueryCandidatesCapDeferred(ids: number[]): Pr
   const db = await getDb();
   await db.query(
     `UPDATE extracted_query_candidates
-     SET last_cap_deferred_at=now(), cap_deferral_count=cap_deferral_count+1
+     SET last_cap_deferred_at=now(), cap_deferral_count=cap_deferral_count+1, updated_at=now()
      WHERE id = ANY($1::bigint[])`,
     [values],
   );
