@@ -22,6 +22,7 @@ import {
   PHASE2_CRAWL_THROUGHPUT_USAGE,
   type CrawlThroughputEventRow,
 } from '../server/crawlThroughputReport';
+import { resolveRenderedAdmissionConfig } from '../server/renderedAdmissionGovernor';
 
 async function writeStdout(text: string): Promise<void> {
   await new Promise<void>((resolve, reject) => {
@@ -60,9 +61,15 @@ async function main(): Promise<void> {
       throw error;
     }
 
+    // Keep the report gates aligned with the same env-configured admission
+    // limits the governor uses. Defaults remain 40/48/35.
+    const admission = resolveRenderedAdmissionConfig(process.env);
     const report = buildCrawlThroughputReport(rows, {
       windowHours: args.windowHours,
       now,
+      nominalTargetPerHour: admission.nominalPerHour,
+      emergencyCeilingPerHour: admission.emergencyPerHour,
+      discoveryFloorPct: admission.discoveryFloorPct,
     });
     const json = JSON.stringify(report, null, 2);
     if (args.out) writeFileSync(args.out, `${json}\n`, 'utf8');

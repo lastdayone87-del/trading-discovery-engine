@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { DEFAULT_BROWSER_FALLBACK_BUDGET, DECLARATIVE_SHADOW_SCAN_MAX_BYTES, advanceRenderedLifecycleStage, beginRenderedDeclarativeShadowScan, browserCauseSnippet, browserFallbackTelemetrySummary, buildRenderedLinkBaseline, classifyCrawlCatch, classifyRenderedPopupDestination, collectRenderedCrossOriginCandidates, countDeclarativeClosedShadowRoots, createRenderedRouteGuard, disposeRenderedRouteGuards, installRenderedRouteCloseCleanup, isDiscordDestinationUrl, isNativeDiscordInviteUrl, isExpectedRenderedRouteShutdownError, isTelegramPostPermalink, mergeRenderedPageContextCounts, planRevealedSameOriginEnqueues, popupMarkupEvidenceSourceUrl, readRenderedDeclarativeShadowScan, renderedPopupWaitTimeoutMs, RenderedFallbackGate, renderedFallbackGate, resolveRenderedZeroPageReason, retainSkippableAnchorEvidence, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback, shouldRecordSaturatedBaselineGap, shouldSkipPreexistingSiblingPage, sumRenderedPageContextCounts, type BrowserFallbackTelemetry, type RenderedRouteLike } from './browserCommunityFallback';
+import { RenderedAdmissionGovernor } from './renderedAdmissionGovernor';
 import { inferDiscordOwnership, makeDiscordCandidate } from './discordCandidates';
 import { redactCauseSnippet } from './crawlerTelemetry';
 import { classifyRenderedCrawlerFailure, isRenderedNavigationTimeout, renderedCrawlerHostBackoffMs, renderedCrawlerRetryPolicy } from './renderedCrawlerPolicy';
@@ -466,6 +467,59 @@ test('rendered browser gate rejects unbounded pending launches', async () => {
   await assert.rejects(gate.run(async () => undefined), /RENDERED_FALLBACK_SATURATED/);
   release();
   await Promise.all([first, second]);
+});
+
+test('rendered admission governor denies over-budget crawls as capacity', async () => {
+  const clock = { now: 0 };
+  const governor = new RenderedAdmissionGovernor({
+    enabled: true,
+    nominalPerHour: 1,
+    emergencyPerHour: 1,
+    discoveryFloorPct: 0,
+    windowMs: 60_000,
+  }, () => clock.now);
+  const gate = new RenderedFallbackGate(1, 4, governor);
+
+  assert.equal(await gate.run(async () => 'first', 'RETRY'), 'first');
+  await assert.rejects(
+    gate.run(async () => 'second', 'RETRY'),
+    /RENDERED_FALLBACK_SATURATED/,
+  );
+  assert.deepEqual(gate.snapshot(), { active: 0, pending: 0, concurrency: 1, maxPending: 4 });
+
+  clock.now = 60_001;
+  assert.equal(await gate.run(async () => 'third', 'RETRY'), 'third');
+  assert.equal(gate.admissionSnapshot().admissionsInWindow, 1);
+});
+
+test('rendered gate prioritizes a discovery waiter when the floor is short', async () => {
+  const governor = new RenderedAdmissionGovernor({
+    enabled: true,
+    nominalPerHour: 10,
+    emergencyPerHour: 10,
+    discoveryFloorPct: 35,
+    windowMs: 60_000,
+  }, () => 0);
+  const gate = new RenderedFallbackGate(1, 4, governor);
+  const order: string[] = [];
+  let releaseFirst!: () => void;
+  const firstBlocked = new Promise<void>(resolve => { releaseFirst = resolve; });
+
+  const first = gate.run(async () => {
+    order.push('enrichment-start');
+    await firstBlocked;
+    order.push('enrichment-end');
+  }, 'ENRICHMENT');
+  await new Promise(resolve => setTimeout(resolve, 0));
+
+  const retry = gate.run(async () => { order.push('retry'); }, 'RETRY');
+  const discovery = gate.run(async () => { order.push('discovery'); }, 'DISCOVERY');
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(gate.snapshot(), { active: 1, pending: 2, concurrency: 1, maxPending: 4 });
+
+  releaseFirst();
+  await Promise.all([first, retry, discovery]);
+  assert.deepEqual(order, ['enrichment-start', 'enrichment-end', 'discovery', 'retry']);
 });
 
 test('does not launch browser after static Discord success', () => {

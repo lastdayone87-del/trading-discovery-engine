@@ -3643,7 +3643,8 @@ export async function inspectAndValidateChannel(
       forceLiveFetch: isManualScan || !rawDetails?.description,
       scanAttempts: inspectionClickOffsetForRetry(channel.scan_attempts, executionMarker),
       clickOffsets: executionMarker?.isRetryOwnedReacquire ? resolveInspectionClickOffsets(executionMarker.clickOffsets) : undefined,
-      bypassBorrowedCoverage: resolveBorrowBypassForInspectionMarker(executionMarker)
+      bypassBorrowedCoverage: resolveBorrowBypassForInspectionMarker(executionMarker),
+      renderedAdmissionLane: laneAttribution.lane
     });
     // Carry only controls this run actually examined into any retry directive.
     // A pre-click failure leaves the previous per-seed offsets unchanged, so

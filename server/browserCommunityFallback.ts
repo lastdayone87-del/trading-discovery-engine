@@ -33,6 +33,12 @@ import {
   isRenderedNavigationTimeout,
   type RenderedCrawlerFailureClass,
 } from './renderedCrawlerPolicy';
+import type { AcquisitionLane } from './acquisitionLaneKeys';
+import {
+  renderedAdmissionGovernor,
+  type RenderedAdmissionDecision,
+  type RenderedAdmissionGovernorLike,
+} from './renderedAdmissionGovernor';
 
 export interface BrowserFallbackBudget {
   maxPages: number;
@@ -68,6 +74,9 @@ export interface BrowserFallbackBudget {
    * and every navigation/subrequest is also checked here. Tests inject a
    * deterministic resolver; production defaults to system DNS. */
   resolveHost?: DnsResolver;
+  /** Acquisition lane for the Phase 2 admission governor. Optional/additive:
+   * direct callers default to UNKNOWN at the gate. */
+  admissionLane?: AcquisitionLane;
   /**
    * Test-only seam for the full-crawler browser fixtures. Production callers
    * must omit this: the default is the production loopback egress proxy,
@@ -3749,13 +3758,27 @@ function boundedEnvInt(value: string | undefined, fallback: number, min: number,
   return Math.min(max, Math.max(min, Math.floor(parsed)));
 }
 
+interface RenderedGateWaiter {
+  lane: AcquisitionLane;
+  grant: () => void;
+}
+
 export class RenderedFallbackGate {
   private active = 0;
-  private readonly waiters: Array<() => void> = [];
+  private readonly waiters: RenderedGateWaiter[] = [];
+  private lastDeniedLogAtMs = 0;
 
-  constructor(readonly concurrency: number, readonly maxPending: number) {}
+  constructor(
+    readonly concurrency: number,
+    readonly maxPending: number,
+    private readonly admissionGovernor: RenderedAdmissionGovernorLike = renderedAdmissionGovernor,
+  ) {}
 
-  private acquire(): Promise<() => void> {
+  private pendingLanes(): Set<AcquisitionLane> {
+    return new Set(this.waiters.map(waiter => waiter.lane));
+  }
+
+  private acquire(lane: AcquisitionLane): Promise<() => void> {
     if (this.active >= this.concurrency && this.waiters.length >= this.maxPending) return Promise.reject(new Error('RENDERED_FALLBACK_SATURATED'));
     return new Promise(resolve => {
       const grant = () => {
@@ -3765,16 +3788,55 @@ export class RenderedFallbackGate {
           if (released) return;
           released = true;
           this.active--;
-          const next = this.waiters.shift();
-          if (next) next();
+          this.grantNextWaiter();
         });
       };
-      if (this.active < this.concurrency) grant(); else this.waiters.push(grant);
+      if (this.active < this.concurrency) grant(); else this.waiters.push({ lane, grant });
     });
   }
 
-  async run<T>(operation: (admittedAtMs: number) => Promise<T>): Promise<T> {
-    const release = await this.acquire();
+  private grantNextWaiter(): void {
+    if (this.waiters.length === 0) return;
+    const pending = this.pendingLanes();
+    let index = 0;
+    // When the discovery floor is short and discovery work is queued, admit
+    // the discovery waiter before non-discovery waiters. The governor still
+    // performs the final rate/floor check after the slot is granted.
+    if (this.admissionGovernor.shouldReserveDiscovery(pending)) {
+      const discoveryIndex = this.waiters.findIndex(waiter => waiter.lane === 'DISCOVERY');
+      if (discoveryIndex >= 0) index = discoveryIndex;
+    }
+    const [next] = this.waiters.splice(index, 1);
+    next?.grant();
+  }
+
+  private logDenied(decision: RenderedAdmissionDecision): void {
+    const now = Date.now();
+    if (now - this.lastDeniedLogAtMs < 60_000) return;
+    this.lastDeniedLogAtMs = now;
+    console.warn(JSON.stringify({
+      event: 'rendered_admission_denied',
+      lane: decision.lane,
+      reason: decision.reason,
+      admissionsInWindow: decision.admissionsInWindow,
+      discoveryAdmissionsInWindow: decision.discoveryAdmissionsInWindow,
+      limit: decision.limit,
+      emergency: decision.emergency,
+      retryAt: decision.retryAtMs ? new Date(decision.retryAtMs).toISOString() : null,
+      timestamp: new Date(now).toISOString(),
+    }));
+  }
+
+  async run<T>(operation: (admittedAtMs: number) => Promise<T>, lane: AcquisitionLane = 'UNKNOWN'): Promise<T> {
+    const release = await this.acquire(lane);
+    const decision = this.admissionGovernor.admit(lane, this.pendingLanes());
+    if (!decision.admitted) {
+      this.logDenied(decision);
+      release();
+      // Existing capacity class: the retry policy treats this as attempt-free
+      // and the inspector records CAPACITY_DEFERRED rather than a failure.
+      throw new Error('RENDERED_FALLBACK_SATURATED');
+    }
     // Admission is timestamped here so callers can start budget clocks at the
     // moment the gate slot was granted, even if they serialize internally
     // afterwards (see withRenderedQueueLifecycleLock).
@@ -3783,6 +3845,10 @@ export class RenderedFallbackGate {
 
   snapshot(): { active: number; pending: number; concurrency: number; maxPending: number } {
     return { active: this.active, pending: this.waiters.length, concurrency: this.concurrency, maxPending: this.maxPending };
+  }
+
+  admissionSnapshot(): ReturnType<RenderedAdmissionGovernorLike['snapshot']> {
+    return this.admissionGovernor.snapshot();
   }
 }
 
@@ -6211,7 +6277,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           await egressProxy?.close().catch(() => undefined);
         }
       }
-    }));
+    }), limits.admissionLane || 'UNKNOWN');
   } catch (error:any) {
     if (!telemetry.crawlFinishedAt) telemetry.crawlFinishedAt = new Date().toISOString();
     const candidates=mergeDiscordCandidates(discovered);

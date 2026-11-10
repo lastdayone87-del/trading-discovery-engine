@@ -97,7 +97,9 @@ npm run phase2:crawl-throughput -- --window-hours=6 --out=phase2-report.json
 ```
 
 The CLI uses `createReadOnlyDbPool()`, one `REPEATABLE READ READ ONLY`
-transaction, and never writes.
+transaction, and never writes. It reads the `RENDERED_ADMISSION_*` environment
+values so its gate thresholds match the deployed admission governor; the
+defaults remain 40/h, 48/h, and 35%.
 
 ## Production activation
 
