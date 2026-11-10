@@ -95,6 +95,7 @@ import {
   getIntakeDeferredReview,
   listHumanEvaluationSamples,
   listIntakeDeferredReviews,
+  type HumanEvaluationSample,
 } from './server/intakeDeferredReview';
 import {REVIEW_REASON_CATALOG,REVIEW_REASON_CATALOG_VERSION} from './server/reviewReasons';
 import { resolveReviewerIdentity, reviewerDefaultsAvailable, reviewerTokenIsValid } from './server/reviewerCredentials';
@@ -350,7 +351,7 @@ async function startServer() {
   });
   app.get('/api/human-evaluation/metrics', requireReviewer, async (_req, res) => {
     try {
-      const samples = [];
+      const samples: HumanEvaluationSample[] = [];
       let offset = 0;
       for (;;) {
         const page = await listHumanEvaluationSamples({ limit: 1000, offset });

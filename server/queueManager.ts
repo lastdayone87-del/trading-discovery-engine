@@ -1497,7 +1497,8 @@ async function processIntakeDeferredRecheckJob(
       // decision remains in the immutable decision ledger.
       await (await getDb()).query(
         `UPDATE intake_deferred_reviews
-         SET state='PENDING',decision=NULL,reviewer=NULL,reason=NULL,notes=NULL,decided_at=NULL,
+         SET state='PENDING',decision=NULL,reviewer=NULL,reason=NULL,notes=NULL,
+             corrections='{}'::jsonb,decided_at=NULL,
              review_version=review_version+1,updated_at=now()
          WHERE channel_id=$1 AND state='DECIDED' AND decision='AMBIGUOUS'`,
         [channelId],
