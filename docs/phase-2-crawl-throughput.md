@@ -58,7 +58,10 @@ Source: `acquisition_lane_events`, one row per inspection pass.
   `detail.renderedCrawlStartedAt` (gate admission) hour when that timestamp is
   present, so a multi-seed inspection crossing a UTC boundary cannot move
   earlier crawls into the finish hour. Missing timestamps fall back to the
-  inspection row's hour. This is the emergency-ceiling signal.
+  inspection row's hour. A **known** admission timestamp outside the selected
+  window is excluded from the window totals and surfaced as
+  `outOfWindowBrowserCrawls`; it is never folded into the inspection hour.
+  This is the emergency-ceiling signal.
 - **DISCOVERY share**: DISCOVERY rendered crawls divided by all rendered
   crawls. Maintenance and unknown browser work stay in the denominator.
 - **Unmetered pass**: a row without a trustworthy `detail.renderedCrawls`

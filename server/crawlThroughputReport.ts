@@ -95,6 +95,8 @@ export interface CrawlThroughputTotals {
   neverExecutedPasses: number;
   /** Passes whose row predates or lacks a trustworthy `renderedCrawls`. */
   unmeteredPasses: number;
+  /** Known rendered crawls whose admission time fell outside the window. */
+  outOfWindowBrowserCrawls: number;
   discoverySharePct: number | null;
   gateWait: {
     samples: number;
@@ -356,10 +358,9 @@ export function buildCrawlThroughputReport(
   let totalGateWaitSamples = 0;
   let totalGateWaitSum = 0;
   let totalGateWaitMax = 0;
-  let browserCrawls = 0;
-  let discoveryBrowserCrawls = 0;
   let maintenanceBrowserCrawls = 0;
   let unknownBrowserCrawls = 0;
+  let outOfWindowBrowserCrawls = 0;
   const laneTotals: CrawlThroughputLaneTotals = {
     DISCOVERY: { inspectionPasses: 0, browserCrawls: 0 },
     ENRICHMENT: { inspectionPasses: 0, browserCrawls: 0 },
@@ -401,33 +402,38 @@ export function buildCrawlThroughputReport(
     if (!rendered.metered) unmeteredPasses += 1;
 
     bucket.inspectionPasses += 1;
-    browserCrawls += rendered.value;
     laneTotals[lane].inspectionPasses += 1;
-    laneTotals[lane].browserCrawls += rendered.value;
-    if (lane === 'DISCOVERY') {
-      discoveryBrowserCrawls += rendered.value;
-    } else if (lane === 'MAINTENANCE') {
-      maintenanceBrowserCrawls += rendered.value;
-    } else if (lane === 'UNKNOWN') {
-      unknownBrowserCrawls += rendered.value;
-    }
 
     // Attribute each rendered crawl to its own gate-admission hour when the
-    // event carries timestamps. Missing timestamps fall back to the
-    // inspection row's hour, so no crawl can disappear from the totals.
-    let attributed = 0;
-    for (const startedAt of rendered.startedAt.slice(0, rendered.value)) {
+    // event carries timestamps. Known admissions outside the window belong to
+    // another window and are excluded, not folded into this row's hour.
+    // Missing timestamps fall back to the inspection row's hour.
+    const knownStartedAt = rendered.startedAt.slice(0, rendered.value);
+    let inWindowCrawls = 0;
+    for (const startedAt of knownStartedAt) {
       const startedMs = Date.parse(startedAt);
+      if (startedMs < startHourMs || startedMs > nowMs) {
+        outOfWindowBrowserCrawls += 1;
+        continue;
+      }
       const startedHourMs = Math.floor(startedMs / HOUR_MS) * HOUR_MS;
       const target = buckets.get(startedHourMs);
-      if (!target) continue;
+      if (!target) {
+        outOfWindowBrowserCrawls += 1;
+        continue;
+      }
       target.browserCrawls += 1;
       if (lane === 'DISCOVERY') target.discoveryBrowserCrawls += 1;
-      attributed += 1;
+      inWindowCrawls += 1;
     }
-    const remainder = Math.max(0, rendered.value - attributed);
-    bucket.browserCrawls += remainder;
-    if (lane === 'DISCOVERY') bucket.discoveryBrowserCrawls += remainder;
+    const fallbackCrawls = Math.max(0, rendered.value - knownStartedAt.length);
+    bucket.browserCrawls += fallbackCrawls;
+    if (lane === 'DISCOVERY') bucket.discoveryBrowserCrawls += fallbackCrawls;
+    inWindowCrawls += fallbackCrawls;
+
+    laneTotals[lane].browserCrawls += inWindowCrawls;
+    if (lane === 'MAINTENANCE') maintenanceBrowserCrawls += inWindowCrawls;
+    else if (lane === 'UNKNOWN') unknownBrowserCrawls += inWindowCrawls;
 
     if (knownOutcome) {
       if (outcome === 'CAPACITY_DEFERRED') bucket.deferredPasses += 1;
@@ -479,6 +485,7 @@ export function buildCrawlThroughputReport(
     inconclusivePasses: 0,
     neverExecutedPasses: 0,
     unmeteredPasses,
+    outOfWindowBrowserCrawls,
     discoverySharePct: null,
     gateWait: { samples: 0, averageMs: null, maxMs: null },
   });
@@ -491,14 +498,14 @@ export function buildCrawlThroughputReport(
     (max, bucket) => Math.max(max, bucket.browserCrawls),
     0,
   );
-  const observedBrowserCrawlsPerHour = Math.round((browserCrawls / elapsedHours) * 100) / 100;
+  const observedBrowserCrawlsPerHour = Math.round((totals.browserCrawls / elapsedHours) * 100) / 100;
   const discoverySharePct = totals.discoverySharePct;
-  const nominalTargetMet = browserCrawls > 0 && observedBrowserCrawlsPerHour >= nominalTargetPerHour;
+  const nominalTargetMet = totals.browserCrawls > 0 && observedBrowserCrawlsPerHour >= nominalTargetPerHour;
   const emergencyCeilingExceeded = peakBrowserCrawlsPerHour > emergencyCeilingPerHour;
   const discoveryFloorMet = discoverySharePct !== null && discoverySharePct >= discoveryFloorPct;
 
   const failures: string[] = [];
-  if (browserCrawls === 0) {
+  if (totals.browserCrawls === 0) {
     failures.push('no_browser_crawl_data');
   } else {
     if (!nominalTargetMet) failures.push('browser_crawls_per_hour_below_nominal_target');
@@ -512,6 +519,9 @@ export function buildCrawlThroughputReport(
   if (unknownLane > 0) warnings.push(`unknown_lane_rows:${unknownLane}`);
   if (unknownOutcome > 0) warnings.push(`unknown_outcome_rows:${unknownOutcome}`);
   if (unmeteredPasses > 0) warnings.push(`unmetered_rendered_crawl_rows:${unmeteredPasses}`);
+  if (outOfWindowBrowserCrawls > 0) {
+    warnings.push(`out_of_window_rendered_crawls:${outOfWindowBrowserCrawls}`);
+  }
 
   return {
     generatedAt: now.toISOString(),

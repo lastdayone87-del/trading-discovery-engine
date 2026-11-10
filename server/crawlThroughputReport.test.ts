@@ -130,6 +130,29 @@ test('each rendered crawl is bucketed by its gate-admission hour, not the inspec
   assert.equal(report.gates.peakBrowserCrawlsPerHour, 1);
 });
 
+test('known out-of-window admission times are excluded, not folded into the row hour', () => {
+  const report = buildCrawlThroughputReport([
+    row('2026-11-10T12:05:00.000Z', 'DISCOVERY', 'ACQUIRED', {
+      renderedCrawls: 2,
+      // One crawl admitted before the 11:00 window start; the second crawl has
+      // no timestamp and must still fall back to the inspection hour.
+      renderedCrawlStartedAt: ['2026-11-10T10:55:00.000Z'],
+    }),
+  ], {
+    windowHours: 2,
+    now: new Date('2026-11-10T12:30:00.000Z'),
+  });
+
+  assert.equal(report.buckets[0].browserCrawls, 0);
+  assert.equal(report.buckets[1].browserCrawls, 1);
+  assert.equal(report.totals.browserCrawls, 1);
+  assert.equal(report.totals.discoveryBrowserCrawls, 1);
+  assert.equal(report.totals.outOfWindowBrowserCrawls, 1);
+  assert.equal(report.totals.inspectionPasses, 1);
+  assert.equal(report.gates.peakBrowserCrawlsPerHour, 1);
+  assert.ok(report.warnings.includes('out_of_window_rendered_crawls:1'));
+});
+
 test('report does not fabricate a rate when no browser crawl exists', () => {
   const report = buildCrawlThroughputReport([], {
     windowHours: 2,

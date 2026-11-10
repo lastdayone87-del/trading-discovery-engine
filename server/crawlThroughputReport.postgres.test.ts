@@ -107,6 +107,7 @@ maybe('the durable writer and report work together on the append-only table', as
     assert.equal(report.totals.inspectionPasses, 3);
     assert.equal(report.totals.browserCrawls, 3);
     assert.equal(report.totals.discoveryBrowserCrawls, 2);
+    assert.equal(report.totals.outOfWindowBrowserCrawls, 0);
     assert.equal(report.gates.discoverySharePct, 66.67);
     assert.deepEqual(report.totals.gateWait, {
       samples: 2,
