@@ -8,10 +8,25 @@ const load = (name: string) => fs.readFileSync(path.join(dataDir, name), 'utf8')
 const work = new Map<string, any>(load('worklist.jsonl').map(row => [row.itemId, row]));
 const manifest = new Map<string, any>(load('manifest.jsonl').map(row => [row.itemId, row]));
 const labels = load('audit-labels.jsonl');
-const diagnostics = new Map<string, any>(load('diagnostics.jsonl').map(row => [String(row.channel_id), row]));
-const deterministicRows = fs.existsSync(path.join(dataDir, 'evaluation.json'))
-  ? new Map<string, any>(JSON.parse(fs.readFileSync(path.join(dataDir, 'evaluation.json'), 'utf8')).rows.map((row: any) => [row.channelId, row]))
-  : new Map<string, any>();
+const evaluationPath = path.join(dataDir, 'evaluation.json');
+if (!fs.existsSync(evaluationPath)) {
+  throw new Error(`Missing ${evaluationPath}; run evaluateClassificationAudit.ts before the full replay.`);
+}
+const deterministicRows = new Map<string, any>(
+  JSON.parse(fs.readFileSync(evaluationPath, 'utf8')).rows.map((row: any) => [row.channelId, row]),
+);
+const diagnostics = new Map<string, any>();
+let duplicateDiagnostics = 0;
+for (const row of load('diagnostics.jsonl')) {
+  const channelId = String(row.channel_id);
+  const existing = diagnostics.get(channelId);
+  if (!existing) {
+    diagnostics.set(channelId, row);
+    continue;
+  }
+  duplicateDiagnostics += 1;
+  if (new Date(row.created_at).getTime() > new Date(existing.created_at).getTime()) diagnostics.set(channelId, row);
+}
 
 const pct = (n: number, d: number) => d ? Math.round((n / d) * 1000) / 10 : 0;
 const ratio = (n: number, d: number) => d ? pct(n, d) : null;
@@ -113,6 +128,7 @@ const report = {
     },
     withProductionDiagnostic: withDiagnostic.length,
     unmatchedLabels,
+    duplicateDiagnostics,
   },
   fullStoredDecision: metrics(withDiagnostic, row => row.storedPrediction),
   deterministicRoutingOnStoredDecision: metrics(withDiagnostic, row => row.routePrediction),

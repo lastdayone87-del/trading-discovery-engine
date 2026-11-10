@@ -27,6 +27,8 @@ test('audit UI shows raw evidence before the classifier suggestion and records i
   assert.match(ui, /useState<'TRADING_CONFIRMED' \| 'NON_TRADING' \| 'UNCERTAIN' \| null>\(null\)/);
   assert.match(ui, /selected !== item\.id/);
   assert.match(ui, /typeof video === 'string'/);
+  assert.match(ui, /!notes\.trim\(\)/);
+  assert.match(ui, /Add an evidence note before recording the label/);
 });
 
 test('audit console supports corrections, filters, pagination, history and stale-response guards', () => {

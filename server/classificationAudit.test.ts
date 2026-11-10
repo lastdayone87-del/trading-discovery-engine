@@ -97,3 +97,10 @@ test('audit routes reject malformed ids and normalize non-numeric pagination', (
   assert.match(audit, /Number\.isFinite\(value\)/);
   assert.match(audit, /Math\.trunc\(value as number\)/);
 });
+
+test('the full replay fails fast without its deterministic prerequisite and reports duplicate diagnostics', () => {
+  const source = readFileSync(new URL('../scripts/evaluateClassificationAuditFull.ts', import.meta.url), 'utf8');
+  assert.match(source, /run evaluateClassificationAudit\.ts before the full replay/);
+  assert.match(source, /duplicateDiagnostics/);
+  assert.match(source, /new Date\(row\.created_at\).getTime\(\) > new Date\(existing\.created_at\)\.getTime\(\)/);
+});

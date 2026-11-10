@@ -154,6 +154,7 @@ export const ClassificationAudit: React.FC = () => {
 
   const submit = async () => {
     if (!item || !label || selected !== item.id) return;
+    if (!notes.trim()) { setError('Add an evidence note before recording the label.'); return; }
     setSubmitting(true);
     setError(null);
     setNotice(null);
