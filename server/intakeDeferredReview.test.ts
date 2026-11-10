@@ -204,6 +204,8 @@ test('review and evaluation routes are reviewer-protected and registered', () =>
   assert.match(server, /app\.get\('\/api\/human-evaluation\/samples'/);
   assert.match(server, /app\.get\('\/api\/human-evaluation\/metrics'/);
   assert.match(server, /offset \+= page\.length/);
+  assert.match(server, /req\.operator\?\.actorId \|\| claimedReviewer/);
+  assert.match(server, /reviewerClaimed/);
   assert.match(server, /const requestedState = String\(req\.query\.state/);
   assert.match(server, /state,/);
   const auth = readFileSync(new URL('./operatorAuth.ts', import.meta.url), 'utf8');

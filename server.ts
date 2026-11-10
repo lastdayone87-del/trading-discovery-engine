@@ -318,8 +318,15 @@ async function startServer() {
   });
   app.post('/api/intake-deferred/:channelId/decision', requireReviewer, async (req, res) => {
     try {
-      const reviewer = resolveReviewerIdentity(req.header('x-reviewer-id')) || req.operator?.actorId;
+      // The authenticated actor is authoritative. A supplied reviewer header
+      // is retained only as an audit annotation, never as the ledger identity.
+      const claimedReviewer = resolveReviewerIdentity(req.header('x-reviewer-id'));
+      const reviewer = req.operator?.actorId || claimedReviewer;
       if (!reviewer) return res.status(400).json({ error: 'Reviewer identity is required.', code: 'REVIEW_VALIDATION_ERROR' });
+      const corrections = {
+        ...(req.body.corrections && typeof req.body.corrections === 'object' ? req.body.corrections : {}),
+        ...(claimedReviewer && claimedReviewer !== reviewer ? { reviewerClaimed: claimedReviewer } : {}),
+      };
       const result = await decideIntakeDeferredReview({
         channelId: req.params.channelId,
         expectedVersion: Number(req.body.reviewVersion),
@@ -327,7 +334,7 @@ async function startServer() {
         decision: req.body.decision,
         reason: String(req.body.reason || ''),
         notes: req.body.notes,
-        corrections: req.body.corrections,
+        corrections,
         idempotencyKey: req.header('idempotency-key') || String(req.body.idempotencyKey || ''),
       });
       console.info('[IntakeDeferredReview] Decision committed', { requestId: req.requestId, channelId: req.params.channelId, decision: req.body.decision, idempotent: result.idempotent });
