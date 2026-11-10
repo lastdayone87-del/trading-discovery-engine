@@ -460,10 +460,23 @@ export function normalizeHumanEvaluationSamples(input: unknown): HumanEvaluation
     if (typeof row.channelName === 'string' && row.channelName.trim()) evidenceSnapshot.channelName = row.channelName.trim();
     if (typeof row.youtubeUrl === 'string' && row.youtubeUrl.trim()) evidenceSnapshot.youtubeUrl = row.youtubeUrl.trim();
     const decidedAt = requiredString('decidedAt');
-    const decidedDate = new Date(decidedAt);
-    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(decidedAt)
-      || Number.isNaN(decidedDate.getTime())
-      || decidedDate.toISOString() !== decidedAt) {
+    const timestamp = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?Z$/.exec(decidedAt);
+    if (!timestamp) fixtureError(index, 'decidedAt', 'must be a valid ISO-8601 UTC timestamp');
+    const [, year, month, day, hour, minute, second, fraction] = timestamp;
+    const millis = fraction ? Number(fraction.padEnd(3, '0')) : 0;
+    const decidedDate = new Date(Date.UTC(
+      Number(year), Number(month) - 1, Number(day),
+      Number(hour), Number(minute), Number(second), millis,
+    ));
+    if (
+      decidedDate.getUTCFullYear() !== Number(year)
+      || decidedDate.getUTCMonth() !== Number(month) - 1
+      || decidedDate.getUTCDate() !== Number(day)
+      || decidedDate.getUTCHours() !== Number(hour)
+      || decidedDate.getUTCMinutes() !== Number(minute)
+      || decidedDate.getUTCSeconds() !== Number(second)
+      || decidedDate.getUTCMilliseconds() !== millis
+    ) {
       fixtureError(index, 'decidedAt', 'must be a calendar-valid ISO-8601 UTC timestamp');
     }
     return {

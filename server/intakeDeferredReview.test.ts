@@ -39,6 +39,12 @@ test('fixture validation rejects unknown enums instead of silently dropping rows
   broken[0].decidedAt = '2026-11-10T00:00:00.000Z';
   broken[1].sampleKey = broken[0].sampleKey;
   assert.throws(() => normalizeHumanEvaluationSamples(broken), /duplicate sampleKey/);
+  const noMillis = structuredClone(fixture) as Array<Record<string, any>>;
+  noMillis[0].decidedAt = '2026-11-10T00:00:00Z';
+  assert.equal(normalizeHumanEvaluationSamples(noMillis)[0].decidedAt, '2026-11-10T00:00:00.000Z');
+  const fractional = structuredClone(fixture) as Array<Record<string, any>>;
+  fractional[0].decidedAt = '2026-11-10T00:00:00.5Z';
+  assert.equal(normalizeHumanEvaluationSamples(fractional)[0].decidedAt, '2026-11-10T00:00:00.500Z');
 });
 
 test('fixture metrics expose precision, recall, FPR and FNR without forcing abstentions', () => {
@@ -207,5 +213,8 @@ test('LIKELY excluded-country recheck never feeds the weak stored country back a
   assert.match(source, /'COMPLETED','FAILED','FAILED_PERMANENT','SKIPPED_LOW_AUDIENCE'/);
   assert.match(source, /Country Recheck/);
   assert.match(source, /state='SUPERSEDED'/);
-  assert.match(source, /result\.status === 'CONFIRMED' && detected && result\.gateDisposition === 'ALLOW_NORMAL'/);
+  assert.match(source, /args\.result\.status === 'CONFIRMED' && args\.detected && args\.result\.gateDisposition === 'ALLOW_NORMAL'/);
+  assert.match(source, /snapshotReviewVersion/);
+  assert.match(source, /FOR UPDATE OF r,c/);
+  assert.match(source, /String\(row\.country \|\| ''\) !== String\(args\.snapshotCountry/);
 });
