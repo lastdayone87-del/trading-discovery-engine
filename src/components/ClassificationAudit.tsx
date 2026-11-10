@@ -75,6 +75,7 @@ export const ClassificationAudit: React.FC = () => {
   const [history, setHistory] = useState<AuditLabel[]>([]);
   const [status, setStatus] = useState<AuditStatusFilter>('PENDING');
   const [offset, setOffset] = useState(0);
+  const [reloadToken, setReloadToken] = useState(0);
   const [loading, setLoading] = useState(false);
   const [loadingItem, setLoadingItem] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -108,7 +109,7 @@ export const ClassificationAudit: React.FC = () => {
     } finally {
       if (requestId === queueRequest.current) setLoading(false);
     }
-  }, [status, offset]);
+  }, [status, offset, reloadToken]);
 
   const loadItem = useCallback(async (id: string) => {
     const requestId = ++itemRequest.current;
@@ -168,7 +169,9 @@ export const ClassificationAudit: React.FC = () => {
       setHistory([]);
       setSelected(null);
       setOffset(0);
-      await load();
+      // Reload through the current filter rather than a closure captured before
+      // a filter change.
+      setReloadToken(value => value + 1);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not record the audit label.');
     } finally {
@@ -177,11 +180,14 @@ export const ClassificationAudit: React.FC = () => {
   };
 
   const changeStatus = (next: AuditStatusFilter) => {
+    if (submitting) return;
     setStatus(next);
     setOffset(0);
     setSelected(null);
     setItem(null);
     setHistory([]);
+    setItems([]);
+    setTotal(0);
   };
 
   const input = item?.evidence?.input || {};
@@ -209,8 +215,9 @@ export const ClassificationAudit: React.FC = () => {
             <select
               aria-label="Audit status filter"
               value={status}
+              disabled={submitting}
               onChange={event => changeStatus(event.target.value as AuditStatusFilter)}
-              className="rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent px-2 py-1.5 text-[11px]"
+              className="rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent px-2 py-1.5 text-[11px] disabled:opacity-40"
             >
               <option value="PENDING">Pending</option>
               <option value="ALL">All</option>
@@ -240,11 +247,11 @@ export const ClassificationAudit: React.FC = () => {
             ))}
           </div>
           <div className="flex items-center justify-between border-t border-slate-100 dark:border-slate-800 px-3 py-2 text-[11px]">
-            <button disabled={offset === 0 || loading} onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))} className="inline-flex items-center gap-1 rounded border border-slate-200 dark:border-slate-700 px-2 py-1 disabled:opacity-40">
+            <button disabled={offset === 0 || loading || submitting} onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))} className="inline-flex items-center gap-1 rounded border border-slate-200 dark:border-slate-700 px-2 py-1 disabled:opacity-40">
               <ChevronLeft className="w-3 h-3" /> Previous
             </button>
             <span className="text-slate-500">Page {page} of {pageCount}</span>
-            <button disabled={offset + PAGE_SIZE >= total || loading} onClick={() => setOffset(offset + PAGE_SIZE)} className="inline-flex items-center gap-1 rounded border border-slate-200 dark:border-slate-700 px-2 py-1 disabled:opacity-40">
+            <button disabled={offset + PAGE_SIZE >= total || loading || submitting} onClick={() => setOffset(offset + PAGE_SIZE)} className="inline-flex items-center gap-1 rounded border border-slate-200 dark:border-slate-700 px-2 py-1 disabled:opacity-40">
               Next <ChevronRight className="w-3 h-3" />
             </button>
           </div>

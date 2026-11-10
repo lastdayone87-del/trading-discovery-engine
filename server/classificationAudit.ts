@@ -215,6 +215,31 @@ export async function listClassificationAuditLabelHistory(auditItemId: string): 
   return result.rows.map(mapLabel);
 }
 
+export interface AuditLabelIdentity {
+  id: string;
+  label: string;
+  provenance: string;
+  idempotency_key: string | null;
+  labeled_at: string | Date;
+}
+
+/**
+ * A repeated importer call must return the original result even when an
+ * operator has since corrected the label. The key is therefore looked up
+ * across the full history, never only at the latest row.
+ */
+export function findIdempotentAuditLabel(
+  rows: AuditLabelIdentity[],
+  input: { label: string; provenance: string; idempotencyKey?: string },
+): AuditLabelIdentity | null {
+  if (!input.idempotencyKey) return null;
+  return rows.find(row =>
+    row.idempotency_key === input.idempotencyKey
+    && row.label === input.label
+    && row.provenance === input.provenance,
+  ) || null;
+}
+
 export async function labelClassificationAuditItem(input: {
   auditItemId: string;
   label: ClassificationAuditLabel;
@@ -244,12 +269,17 @@ export async function labelClassificationAuditItem(input: {
       [input.auditItemId],
     );
     const latest = existing.rows[0] || null;
-    if (latest && latest.label === input.label && latest.provenance === provenance
-      && input.idempotencyKey && latest.idempotency_key === input.idempotencyKey) {
+    const idempotent = findIdempotentAuditLabel(existing.rows, {
+      label: input.label,
+      provenance,
+      idempotencyKey: input.idempotencyKey,
+    });
+    if (idempotent) {
       await client.query('COMMIT');
+      const current = latest || idempotent;
       return {
-        item: mapItem({ ...item, latest_label: latest.label, latest_provenance: latest.provenance, latest_labeled_at: latest.labeled_at }),
-        labelId: String(latest.id),
+        item: mapItem({ ...item, latest_label: current.label, latest_provenance: current.provenance, latest_labeled_at: current.labeled_at }),
+        labelId: String(idempotent.id),
         idempotent: true,
       };
     }

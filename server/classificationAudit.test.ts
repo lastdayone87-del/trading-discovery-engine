@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
-import { labelClassificationAuditItem } from './classificationAudit';
+import { findIdempotentAuditLabel, labelClassificationAuditItem } from './classificationAudit';
 
 test('audit labels reject invalid values and missing reviewers before touching the database', async () => {
   await assert.rejects(
@@ -40,7 +40,7 @@ test('audit queue joins the latest label for an item and never uses production s
 test('audit label corrections version correctly and export filters by the audit cohort',()=>{
   const source = readFileSync(new URL('./classificationAudit.ts', import.meta.url), 'utf8');
   assert.match(source, /existing\.rowCount \|\| 0/);
-  assert.match(source, /latest\.idempotency_key === input\.idempotencyKey/);
+  assert.match(source, /findIdempotentAuditLabel/);
   assert.match(source, /cohortKey: item\.cohort_key/);
   assert.match(source, /JOIN classification_audit_items a ON a\.id=l\.audit_item_id/);
   assert.match(source, /a\.cohort_key=\$1/);
@@ -51,4 +51,31 @@ test('audit label history is an append-only read model', () => {
   assert.match(source, /export async function listClassificationAuditLabelHistory/);
   assert.match(source, /FROM classification_audit_labels l/);
   assert.match(source, /ORDER BY l\.labeled_at DESC,l\.id DESC/);
+});
+
+test('a re-import returns the original label without replacing a later operator correction', () => {
+  const rows = [
+    { id: 'corrected', label: 'NON_TRADING', provenance: 'OPERATOR_AUDIT', idempotency_key: 'operator-key', labeled_at: '2026-01-02' },
+    { id: 'original', label: 'TRADING_CONFIRMED', provenance: 'AI_ASSISTED_AUDIT', idempotency_key: 'import-key', labeled_at: '2026-01-01' },
+  ];
+  const match = findIdempotentAuditLabel(rows, {
+    label: 'TRADING_CONFIRMED',
+    provenance: 'AI_ASSISTED_AUDIT',
+    idempotencyKey: 'import-key',
+  });
+  assert.equal(match?.id, 'original');
+  assert.equal(findIdempotentAuditLabel(rows, {
+    label: 'TRADING_CONFIRMED',
+    provenance: 'AI_ASSISTED_AUDIT',
+    idempotencyKey: 'new-key',
+  }), null);
+});
+
+test('audit filter changes clear stale queue state and reload through the current filter', () => {
+  const ui = readFileSync(new URL('../src/components/ClassificationAudit.tsx', import.meta.url), 'utf8');
+  assert.match(ui, /setItems\(\[\]\)/);
+  assert.match(ui, /setTotal\(0\)/);
+  assert.match(ui, /setReloadToken\(value => value \+ 1\)/);
+  assert.match(ui, /\[status, offset, reloadToken\]/);
+  assert.match(ui, /disabled=\{submitting\}/);
 });
