@@ -373,3 +373,33 @@ test('chart links do not erase trading analysis on the same description line', (
   });
   assert.equal(routed.route, 'SEMANTIC_TRADING');
 });
+
+test('a shared financial-sounding footer does not bypass the review guard', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'TRADING_CONFIRMED', confidenceScore: 90, recognitionState: 'AMBIGUOUS_THIN', semanticPolicy: 'BOUNDED_WAIT',
+    providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
+  }), {
+    independentEvidence: true,
+    videoTexts: [
+      'Dance choreography\nSubscribe for daily market analysis',
+      'Makeup tutorial\nSubscribe for daily market analysis',
+      'Cooking recipe\nSubscribe for daily market analysis',
+    ],
+  });
+  assert.equal(routed.route, 'HUMAN_REVIEW');
+});
+
+test('a repeated broker referral footer with a promotion does not create focus', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'TRADING_CONFIRMED', confidenceScore: 90, recognitionState: 'AMBIGUOUS_THIN', semanticPolicy: 'BOUNDED_WAIT',
+    providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
+  }), {
+    independentEvidence: true,
+    videoTexts: [
+      'EURUSD trade recap Monday\nReferral link: memecoin giveaway https://broker.example.com/1',
+      'GBPUSD trade recap Tuesday\nReferral link: memecoin giveaway https://broker.example.com/2',
+      'USDJPY trade recap Wednesday\nReferral link: memecoin giveaway https://broker.example.com/3',
+    ],
+  });
+  assert.equal(routed.route, 'SEMANTIC_TRADING');
+});

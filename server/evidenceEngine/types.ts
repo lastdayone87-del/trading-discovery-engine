@@ -258,7 +258,7 @@ export interface VerificationDecision {
   /** Integrated deterministic-first operational route. */
   deterministicRouting?: {
     version: string;
-    route: string;
+    route: 'DETERMINISTIC_TRADING' | 'SEMANTIC_TRADING' | 'DETERMINISTIC_NON_TRADING' | 'SEMANTIC_NON_TRADING' | 'HUMAN_REVIEW' | 'ENRICH' | 'UNCERTAIN';
     fastTrack: boolean;
     semanticUsed: boolean;
     semanticAttempted: boolean;

@@ -115,13 +115,16 @@ export function stripRepeatedFooterLines(texts: string[]): string[] {
       if (index === 0) return true;
       const normalized = normalizedLines[index];
       if (!normalized) return false;
-      if (!FOOTER_BOILERPLATE.test(line)) {
-        return !((counts.get(normalized) || 0) >= 2 && REPEATED_PROMO_FOOTER.test(normalized));
+      const repeated = (counts.get(normalized) || 0) >= 2;
+      if (FOOTER_BOILERPLATE.test(line)) {
+        // A footer-like line repeated across videos is shared boilerplate, even
+        // if it contains a financial phrase such as "daily market analysis".
+        if (repeated) return false;
+        // A unique line may legitimately contain both a chart link and the
+        // video's own analysis; keep the substantive text.
+        return FINANCIAL_LINE.test(normalized);
       }
-      // Keep the substantive part of a line that also carries a chart/affiliate
-      // link. Only drop a boilerplate line when it contains no financial
-      // evidence of its own.
-      return FINANCIAL_LINE.test(normalized);
+      return !(repeated && REPEATED_PROMO_FOOTER.test(normalized));
     });
     return stripDistributionText(kept.join(' ')).trim();
   });
