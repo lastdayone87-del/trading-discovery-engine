@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ExtractedTermRecord, QueryRecord } from '../src/types';
-import { isCountryScriptCompatible, isRetrievalOrientedQuery, limitRepeatedPrimaryTerms, normalizeQuery, planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, queriesOutsideCooldown, queryTokenCount, rotateAwayFromMostRecentIntent } from './queryPlanner';
+import { isCountryScriptCompatible, isRetrievalOrientedQuery, isReviewedNativeStandaloneSurface, limitRepeatedPrimaryTerms, normalizeQuery, planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, queriesOutsideCooldown, queryTokenCount, rotateAwayFromMostRecentIntent } from './queryPlanner';
 import { ORGANIC_QUERY_POLICY_VERSION } from './organicQueryExpansion';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
 import { admitQueryRecord } from './queryQuality/admission';
@@ -524,6 +524,13 @@ test('reviewed native trading methods remain standalone while ambiguous markets 
 
   const singapore = planDiverseQueries({ country: 'Singapore', count: 12, learnedVocabulary: [], existingQueries: [] });
   assert.equal(singapore.some(item => normalizeQuery(item.query) === normalizeQuery('STI analysis')), false);
+});
+
+test('reviewed standalone rule keeps broker surfaces out and Arabic qualifiers in', () => {
+  assert.equal(isReviewedNativeStandaloneSurface({ term: 'Bourse Direct', type: 'BROKER', specificity: 62, ambiguity: 48 }), false);
+  assert.equal(isReviewedNativeStandaloneSurface({ term: 'STI analysis today', type: 'MARKET', specificity: 42, ambiguity: 72 }), false);
+  assert.equal(isReviewedNativeStandaloneSurface({ term: 'DAX Analyse heute', type: 'MARKET', specificity: 42, ambiguity: 72 }), true);
+  assert.equal(isReviewedNativeStandaloneSurface({ term: 'تحليل السوق', type: 'MARKET', specificity: 42, ambiguity: 72 }), true);
 });
 
 test('reviewed native proposal does not stutter an anchor already in the phrase', () => {

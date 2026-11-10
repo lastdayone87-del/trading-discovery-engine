@@ -434,7 +434,11 @@ export function capDemandSignalCandidates<T>(candidates: T[], count: number): T[
   return candidates.slice(0, Math.floor(requested * 0.3));
 }
 
-const SAFE_REVIEWED_MARKET_QUALIFIER = /\b(dax|ibex|cac|bel ?20|euronext|nyse|nasdaq|s&p|ftse|aex|smi|omx|tsx|asx|nzx|sgx|nikkei|topix|kospi|bist|bovespa|moex|jse|hose|set|bursa|stock\s*exchange|bourse|börse|beurs|market\s*outlook|market\s*wrap|opening|session|تحليل|تداول)\b/iu;
+const SAFE_REVIEWED_MARKET_QUALIFIER = new RegExp(
+  '\\b(dax|ibex|cac|bel ?20|euronext|nyse|nasdaq|s&p|ftse|aex|smi|omx|tsx|asx|nzx|sgx|nikkei|topix|kospi|bist|bovespa|moex|jse|hose|set|bursa|stock\\s*exchange|bourse|börse|beurs|market\\s*outlook|market\\s*wrap|opening|session)\\b'
+  + '|(?<![\\p{L}\\p{N}])(?:تحليل|تداول)(?![\\p{L}\\p{N}])',
+  'iu',
+);
 
 /**
  * Whether a reviewed native surface is currently eligible to stand alone.
@@ -455,8 +459,8 @@ export function isReviewedNativeStandaloneSurface(input: {
     && Number(input.specificity ?? 0) >= 55
     && Number(input.ambiguity ?? 100) <= 60;
   const reviewedMarket = type === 'MARKET'
-    && (queryTokenCount(term) >= 3
-      || (SAFE_REVIEWED_MARKET_QUALIFIER.test(term) && !/\bsti\b/i.test(term)));
+    && !/\bsti\b/i.test(term)
+    && (queryTokenCount(term) >= 3 || SAFE_REVIEWED_MARKET_QUALIFIER.test(term));
   return reviewedMethod || reviewedMarket;
 }
 

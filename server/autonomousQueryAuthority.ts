@@ -282,17 +282,19 @@ export function evaluateAutonomousQueryAuthority(
       ...(primaryIsMethod ? [] : topLevelCompanionClasses),
       ...atomCompanionClasses,
     ])];
-    const currentReviewedStandalone = earlyReviewedNativeSurface && isReviewedNativeStandaloneSurface({
-      term: String(atoms[0]?.term || query.query),
-      type: String(atoms[0]?.type || ''),
-      specificity: Number(specificity.specificity),
-      ambiguity: Number(specificity.ambiguity),
-    });
+    const currentReviewedStandalone = earlyReviewedNativeSurface && (
+      String(atoms[0]?.type || '').toUpperCase() === 'METHOD'
+      || isReviewedNativeStandaloneSurface({
+        term: String(atoms[0]?.term || query.query),
+        type: String(atoms[0]?.type || ''),
+        specificity: Number(atoms[0]?.retrievalPolicy?.specificity ?? specificity.specificity),
+        ambiguity: Number(atoms[0]?.retrievalPolicy?.ambiguity ?? specificity.ambiguity),
+      })
+    );
     if (
       template === 'SINGLE_ATOM'
       && earlyReviewedNativeSurface
       && !currentReviewedStandalone
-      && (companionClasses.length > 0 || Number(specificity.ambiguity) >= 60)
     ) {
       return {
         eligible: false,

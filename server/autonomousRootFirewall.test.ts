@@ -82,6 +82,38 @@ test('reviewed native method phrases are authorized as standalone surfaces', () 
   assert.equal(decision.eligible, true, decision.reasonCodes.join(','));
 });
 
+test('saved reviewed broker singles are rejected under the current standalone rule', () => {
+  for (const [text, country] of [['Bourse Direct', 'France'], ['XTB DAX', 'Germany'], ['Boursorama CAC 40', 'France']] as const) {
+    const decision = evaluateAutonomousQueryAuthority(query({
+      query: text,
+      country,
+      generation_metadata: {
+        queryTemplate: 'SINGLE_ATOM',
+        retrievalSpecificity: {
+          policyVersion: RETRIEVAL_SPECIFICITY_POLICY_VERSION,
+          eligibility: 'STANDALONE',
+          specificity: 62,
+          ambiguity: 48,
+        },
+        atoms: [{
+          type: 'BROKER',
+          origin: 'COUNTRY_VOCABULARY',
+          term: text,
+          retrievalPolicy: {
+            policyVersion: RETRIEVAL_SPECIFICITY_POLICY_VERSION,
+            eligibility: 'STANDALONE',
+            specificity: 62,
+            ambiguity: 48,
+            reasonCodes: ['REVIEWED_NATIVE_PHRASE'],
+          },
+        }],
+      },
+    } as any));
+    assert.equal(decision.eligible, false, `${text} must not execute alone`);
+    assert.ok(decision.reasonCodes.includes('REVIEWED_NATIVE_REQUIRES_COMPANION'));
+  }
+});
+
 test('saved reviewed market phrases are re-evaluated under the current standalone rule', () => {
   for (const [text, country] of [['DAX Analyse heute', 'Germany'], ['Singapore market outlook', 'Singapore']] as const) {
     const decision = evaluateAutonomousQueryAuthority(query({
