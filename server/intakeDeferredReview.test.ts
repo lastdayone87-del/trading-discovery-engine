@@ -88,6 +88,9 @@ test('deferred review migration and decision path preserve human evidence and la
   assert.match(module, /c\.scan_status='INTAKE_DEFERRED'/);
   assert.match(module, /review_version\+1/);
   assert.match(module, /channel\.country_status === 'CONFIRMED'/);
+  const cancelJobs = module.indexOf("UPDATE jobs SET status='FAILED'");
+  const lockRows = module.indexOf('FOR UPDATE OF r,c');
+  assert.ok(cancelJobs >= 0 && lockRows > cancelJobs, 'NON_TRADING job cancellation must precede the review/channel lock');
   const pipeline = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
   assert.match(pipeline, /recordIntakeDeferredReview/);
   const ui = readFileSync(new URL('../src/components/IntakeDeferredReview.tsx', import.meta.url), 'utf8');
@@ -165,6 +168,10 @@ test('deferred recheck uses the durable ENRICH carrier with bounded stage-1 evid
   assert.match(worker, /shouldBlockEnrichClaimForCountry\(channel\.country_status/);
   assert.match(worker, /evaluateLowAudienceGate\(recheckAudience/);
   assert.match(worker, /SKIPPED_LOW_AUDIENCE[\s\S]*state='SUPERSEDED'/);
+  assert.match(worker, /clientOverride: admitClient/);
+  const audienceLock = worker.indexOf('SELECT 1 FROM intake_deferred_reviews WHERE channel_id=$1 FOR UPDATE');
+  const audienceUpdate = worker.indexOf("scan_status='SKIPPED_LOW_AUDIENCE'");
+  assert.ok(audienceLock >= 0 && audienceUpdate > audienceLock, 'low-audience review row must be locked before the channel update');
   assert.match(worker, /focus\.decision === 'WITHHOLD'/);
   assert.match(worker, /focus\.decision === 'ADMIT'/);
   assert.match(worker, /intake-recheck-enrich:/);

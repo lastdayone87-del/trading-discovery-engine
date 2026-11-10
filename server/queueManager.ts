@@ -1396,6 +1396,10 @@ async function processIntakeDeferredRecheckJob(
     try {
       await audienceClient.query('BEGIN');
       audienceTransaction = true;
+      await audienceClient.query(
+        `SELECT 1 FROM intake_deferred_reviews WHERE channel_id=$1 FOR UPDATE`,
+        [channelId],
+      );
       const projected = await audienceClient.query(
         `UPDATE channels
          SET scan_status='SKIPPED_LOW_AUDIENCE',last_checked=$2,inspection_trail=$3::jsonb,updated_at=now()
@@ -1523,19 +1527,56 @@ async function processIntakeDeferredRecheckJob(
         details: `Bounded evidence recheck admitted the channel: ${focus.reasonCodes.join(', ')}`,
         timestamp: now,
       }];
-      await upsertChannel(channel);
-      await enqueueJob('ENRICH_CHANNEL', {
-        channelId,
-        targetCountry,
-        source,
-        candidate: { ...enriched, enrichmentStage: 1 },
-        enrichmentStage: 1,
-        intakeRecheckAdmitted: true,
-      }, {
-        priority: AUTONOMOUS_CONTINUATION_JOB_PRIORITY,
-        maxAttempts: 4,
-        idempotencyKey: `intake-recheck-enrich:${channelId}:${job.id}`,
-      });
+      // Commit the channel projection and the follow-up enrichment job in one
+      // transaction. Committing ENRICHMENT_PENDING first would strand the
+      // channel if the enqueue failed, because a retry sees a non-deferred row.
+      const admitDb = await getDb();
+      const admitClient = await admitDb.connect();
+      let admitTransaction = false;
+      try {
+        await admitClient.query('BEGIN');
+        admitTransaction = true;
+        const projected = await admitClient.query(
+          `UPDATE channels
+           SET trading_status='UNCERTAIN',scan_status='ENRICHMENT_PENDING',
+               last_checked=$2,inspection_trail=$3::jsonb,updated_at=now()
+           WHERE channel_id=$1 AND scan_status='INTAKE_DEFERRED'`,
+          [channelId, now, JSON.stringify(channel.inspection_trail)],
+        );
+        if (!projected.rowCount) {
+          await admitClient.query('ROLLBACK');
+          admitTransaction = false;
+          await completeJob(job.id);
+          return true;
+        }
+        const admitted = await enqueueJob('ENRICH_CHANNEL', {
+          channelId,
+          targetCountry,
+          source,
+          candidate: { ...enriched, enrichmentStage: 1 },
+          enrichmentStage: 1,
+          intakeRecheckAdmitted: true,
+        }, {
+          priority: AUTONOMOUS_CONTINUATION_JOB_PRIORITY,
+          maxAttempts: 4,
+          idempotencyKey: `intake-recheck-enrich:${channelId}:${job.id}`,
+          clientOverride: admitClient,
+        });
+        if (admitted.status !== 'PENDING' && admitted.status !== 'PROCESSING') {
+          await admitClient.query('ROLLBACK');
+          admitTransaction = false;
+          console.warn('[IntakeRecheck] Admitted follow-up job was not runnable; leaving channel deferred for retry.');
+          await completeJob(job.id);
+          return true;
+        }
+        await admitClient.query('COMMIT');
+        admitTransaction = false;
+      } catch (error) {
+        if (admitTransaction) await admitClient.query('ROLLBACK').catch(() => undefined);
+        throw error;
+      } finally {
+        admitClient.release();
+      }
     } else {
       channel.last_checked = now;
       channel.inspection_trail = [...(channel.inspection_trail || []), {

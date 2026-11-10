@@ -239,6 +239,17 @@ export async function decideIntakeDeferredReview(input: DecideIntakeDeferredInpu
       await client.query('COMMIT');
       return { decision: prior.rows[0], idempotent: true };
     }
+    if (input.decision === 'NON_TRADING') {
+      // Lock/update jobs before the review+channel rows to match the worker's
+      // job-then-channel completion order and avoid deadlocks. A later version
+      // conflict rolls this back.
+      await client.query(
+        `UPDATE jobs SET status='FAILED',last_error='Cancelled by human intake rejection',
+           locked_by=NULL,locked_at=NULL,updated_at=now()
+         WHERE status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$1`,
+        [input.channelId],
+      );
+    }
     const locked = await client.query(
       `SELECT r.*,to_jsonb(c) channel_snapshot
        FROM intake_deferred_reviews r JOIN channels c USING(channel_id)
@@ -257,7 +268,11 @@ export async function decideIntakeDeferredReview(input: DecideIntakeDeferredInpu
       [input.idempotencyKey],
     );
     if (replay.rowCount) {
-      await client.query('COMMIT');
+      if (String(replay.rows[0].decision) !== input.decision) {
+        await client.query('ROLLBACK');
+      } else {
+        await client.query('COMMIT');
+      }
       return { decision: replay.rows[0], idempotent: true };
     }
     if (Number(row.review_version) !== input.expectedVersion) {
@@ -348,12 +363,6 @@ export async function decideIntakeDeferredReview(input: DecideIntakeDeferredInpu
         clientOverride: client,
       });
     } else if (input.decision === 'NON_TRADING') {
-      await client.query(
-        `UPDATE jobs SET status='FAILED',last_error='Cancelled by human intake rejection',
-           locked_by=NULL,locked_at=NULL,updated_at=now()
-         WHERE status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$1`,
-        [input.channelId],
-      );
       await client.query(
         `UPDATE channels SET trading_status='HUMAN_REJECTED',scan_status='SKIPPED_NON_TRADING',
            country=COALESCE(NULLIF($2,''),country),updated_at=now() WHERE channel_id=$1`,
