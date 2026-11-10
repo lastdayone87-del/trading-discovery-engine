@@ -223,16 +223,15 @@ test('word boundaries keep guidance, credit spreads, market reactions and corpor
 });
 
 test('repeated promotional footers and URLs do not create non-trading focus', () => {
-  const footer = 'memecoin giveaway: https://broker.example.com/referral?ref=trader';
   const routed = resolveClassificationRouting(decision({
     status: 'TRADING_CONFIRMED', confidenceScore: 90, recognitionState: 'AMBIGUOUS_THIN', semanticPolicy: 'BOUNDED_WAIT',
     providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
   }), {
     independentEvidence: true,
     videoTexts: [
-      `EURUSD trade recap Monday\n${footer}`,
-      `GBPUSD trade recap Tuesday\n${footer}`,
-      `USDJPY trade recap Wednesday\n${footer}`,
+      `EURUSD trade recap Monday\nmemecoin giveaway\nhttps://broker.example.com/ref=1`,
+      `GBPUSD trade recap Tuesday\nmemecoin giveaway\nhttps://broker.example.com/ref=2`,
+      `USDJPY trade recap Wednesday\nmemecoin giveaway\nhttps://broker.example.com/ref=3`,
     ],
   });
   assert.equal(routed.route, 'SEMANTIC_TRADING');
@@ -301,7 +300,61 @@ test('Bitcoin and Nasdaq forecasts count as strong market analysis', () => {
     providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
   }), {
     independentEvidence: true,
-    videoTexts: ['Bitcoin forecast this week', 'Nasdaq outlook and levels', 'weekend dance vlog'],
+    videoTexts: ['Bitcoin forecast this week\nmakeup tutorial', 'Nasdaq outlook and levels\nbeauty routine', 'weekend dance vlog'],
   });
   assert.equal(routed.route, 'SEMANTIC_TRADING');
+});
+
+test('repeated music credits are treated as boilerplate, not entertainment focus', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'TRADING_CONFIRMED', confidenceScore: 90, recognitionState: 'AMBIGUOUS_THIN', semanticPolicy: 'BOUNDED_WAIT',
+    providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
+  }), {
+    independentEvidence: true,
+    videoTexts: [
+      'Gold update\nMusic: Track A',
+      'Silver update\nMusic: Track B',
+      'EURUSD update\nMusic: Track C',
+    ],
+  });
+  assert.equal(routed.route, 'SEMANTIC_TRADING');
+});
+
+test('beauty titles do not match the asset name dow', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'TRADING_CONFIRMED', confidenceScore: 90, recognitionState: 'AMBIGUOUS_THIN', semanticPolicy: 'BOUNDED_WAIT',
+    providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
+  }), {
+    independentEvidence: true,
+    videoTexts: ['Eyeshadow preview', 'Makeup tutorial', 'Beauty routine'],
+  });
+  assert.equal(routed.route, 'HUMAN_REVIEW');
+});
+
+test('a bare currency ticker does not bypass the personal-finance focus guard', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'TRADING_CONFIRMED', confidenceScore: 90, recognitionState: 'AMBIGUOUS_THIN', semanticPolicy: 'BOUNDED_WAIT',
+    providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
+  }), {
+    independentEvidence: true,
+    videoTexts: ['EURUSD', 'Retirement savings', 'Budget tips'],
+  });
+  assert.equal(routed.route, 'HUMAN_REVIEW');
+});
+
+test('semantic ambiguity with sufficient independent evidence goes to human review', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'UNCERTAIN', confidenceScore: 64, recognitionState: 'AMBIGUOUS_CONFLICT', semanticPolicy: 'BOUNDED_WAIT',
+    providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
+  }), { independentEvidence: true });
+  assert.equal(routed.route, 'HUMAN_REVIEW');
+  assert.equal(routed.fallbackReason, 'SEMANTIC_AMBIGUOUS_WITH_SUFFICIENT_EVIDENCE');
+});
+
+test('semantic ambiguity without independent evidence still enriches', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'UNCERTAIN', confidenceScore: 64, recognitionState: 'AMBIGUOUS_CONFLICT', semanticPolicy: 'BOUNDED_WAIT',
+    providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
+  }), { independentEvidence: false });
+  assert.equal(routed.route, 'ENRICH');
 });
