@@ -1283,7 +1283,7 @@ export async function getDashboardOperationalSummary(env:NodeJS.ProcessEnv=proce
   // Stored means every durable channel row; serving eligibility is a separate policy.
   const result=await db.query(`SELECT COUNT(*)::int stored_channels,
     COUNT(*) FILTER(WHERE discord_status IN('ACTIVE','ACTIVE_LOW_VOLUME'))::int active_discords,
-    COUNT(*) FILTER(WHERE scan_status IN('PENDING','LOCKED','ENRICHMENT_PENDING','ENRICHING','NEEDS_REVIEW','CLASSIFICATION_PENDING'))::int pending_scans,
+    COUNT(*) FILTER(WHERE scan_status IN('PENDING','LOCKED','ENRICHMENT_PENDING','ENRICHING','INTAKE_DEFERRED','NEEDS_REVIEW','CLASSIFICATION_PENDING'))::int pending_scans,
     (SELECT COUNT(*)::int FROM channel_reviews WHERE state='PENDING') pending_reviews,
     (SELECT COUNT(*)::int FROM channels c WHERE c.discord_discovery_status='NOT_DISCOVERED' AND c.discord_validation_status='NOT_STARTED' AND (c.inspection_trail IS NULL OR c.inspection_trail::text IN ('[]','null')) AND NOT EXISTS(SELECT 1 FROM discord_candidates dc WHERE dc.channel_id=c.channel_id)) legacy_unclassified_channels
     FROM channels`);

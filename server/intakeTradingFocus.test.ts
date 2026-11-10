@@ -67,12 +67,13 @@ test('genuine multilingual trading channels are admitted without English trading
   ] as const;
   for (const [label, title, secondary] of examples) {
     const decision = assessIntakeTradingFocus({
-      channelName: label,
+      channelName: `${label} channel`,
       description: title,
       matchedDocument: { type: 'VIDEO', title: secondary, description: '' },
       videoTitles: [secondary],
     });
     assert.equal(decision.decision, 'ADMIT', `${label}: ${decision.reasonCodes.join(',')}`);
+    assert.ok(decision.positiveFamilies.some(family => family.endsWith('_TRADING')), `${label} must be admitted by native trading evidence, got ${decision.positiveFamilies.join(',')}`);
   }
 });
 
@@ -113,14 +114,43 @@ test('polysemous single market words still do not admit', () => {
 });
 
 
-test('ingestion pipeline persists a DEFER as NEEDS_REVIEW without an enrichment enqueue', () => {
+test('ingestion pipeline persists a DEFER as INTAKE_DEFERRED without an enrichment enqueue', () => {
   const source = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
   const start = source.indexOf("retrievalTriage.disposition === 'DEFER_NO_CONFIDENT_EVIDENCE'");
   const end = source.indexOf('// Step 1: GATE 1', start);
   assert.ok(start >= 0 && end > start, 'DEFER branch must exist before Gate 1');
   const block = source.slice(start, end);
-  assert.match(block, /buildDeferredTradingReviewChannel/);
-  assert.match(source, /function buildDeferredTradingReviewChannel[\s\S]*channel\.scan_status = 'NEEDS_REVIEW'/);
-  assert.match(source, /function buildDeferredTradingReviewChannel[\s\S]*channel\.trading_status = 'NEEDS_REVIEW'/);
+  assert.match(block, /buildDeferredTradingIntakeChannel/);
+  assert.match(source, /function buildDeferredTradingIntakeChannel[\s\S]*channel\.scan_status = 'INTAKE_DEFERRED'/);
+  assert.match(source, /function buildDeferredTradingIntakeChannel[\s\S]*channel\.trading_status = 'UNCERTAIN'/);
   assert.doesNotMatch(block, /enqueueJob\s*\(/);
+});
+
+
+test('incidental Indic share/investment words do not admit an unrelated channel', () => {
+  const decision = assessIntakeTradingFocus({
+    channelName: 'सामान्य चैनल',
+    description: 'कृपया व्हिडिओ शेयर करें और चैनल को सब्सक्राइब करें. निवेश के बारे में बाद में बताएंगे.',
+    matchedDocument: { type: 'CHANNEL', title: 'सामान्य चैनल', description: 'कृपया शेयर करें' },
+  });
+  assert.notEqual(decision.decision, 'ADMIT');
+});
+
+test('trading coaching language admits a genuine trading educator', () => {
+  const decision = assessIntakeTradingFocus({
+    channelName: 'Price Action Coach',
+    description: 'Day trading coaching and daily preparation for price action traders.',
+    matchedDocument: { type: 'CHANNEL', title: 'Price Action Coach', description: 'Day trading coaching' },
+  });
+  assert.equal(decision.decision, 'ADMIT');
+});
+
+test('an incidental music word in an explicit trading video does not withhold the channel', () => {
+  const decision = assessIntakeTradingFocus({
+    channelName: 'Desk Notes',
+    description: 'Price action trading and risk management.',
+    matchedDocument: { type: 'VIDEO', title: 'Price action single trade review', description: 'One trade, one plan.' },
+    videoTitles: ['Price action single trade review'],
+  });
+  assert.equal(decision.decision, 'ADMIT');
 });

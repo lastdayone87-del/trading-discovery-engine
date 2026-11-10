@@ -55,22 +55,22 @@ const HIGH_SPECIFICITY_TRADING_SIGNALS: Array<[string, RegExp]> = [
   // High-specificity trading vocabulary in the production Indic and other
   // non-Latin markets. These are explicit market/trading concepts, not generic
   // script presence. They let a genuine creator pass without requiring English.
-  ['HINDI_TRADING', /(ट्रेडिंग|शेयर|शेयर\s*बाजार|निवेश|निफ्टी|सेंसेक्स|स्टॉक|क्रिप्टो|फॉरेक्स|तकनीकी\s*विश्लेषण|प्राइस\s*एक्शन|इंट्राडे|डे\s*ट्रेडिंग)/u],
-  ['MARATHI_TRADING', /(ट्रेडिंग|शेअर|शेअर\s*बाजार|गुंतवणूक|निफ्टी|सेन्सेक्स|स्टॉक|क्रिप्टो|फॉरेक्स|तांत्रिक\s*विश्लेषण|चार्ट)/u],
-  ['GUJARATI_TRADING', /(ટ્રેડિંગ|શેર|શેર\s*બજાર|રોકાણ|નિફ્ટી|સેન્સેક્સ|સ્ટોક|ક્રિપ્ટો|ફોરેક્સ|ટેકનિકલ\s*વિશ્લેષણ|ચાર્ટ)/u],
-  ['BENGALI_TRADING', /(শেয়ার|শেয়ার\s*বাজার|ট্রেডিং|বিনিয়োগ|নিফটি|সেনসেন্স|স্টক|ক্রিপ্টো|ফরেক্স)/u],
-  ['TELUGU_TRADING', /(స్టాక్|స్టాక్\s*మార్కెట్|ట్రేడింగ్|షేర్|పెట్టుబడి|నిఫ్టీ|సెన్సెక్స్|క్రిప్టో|ఫారెక్స్)/u],
-  ['KANNADA_TRADING', /(ಸ್ಟಾಕ್|ಸ್ಟಾಕ್\s*ಮಾರ್ಕೆಟ್|ಟ್ರೇಡಿಂಗ್|ಷೇರ್|ಹೂಡಿಕೆ|ನಿಫ್ಟಿ|ಸೆನ್ಸೆಕ್ಸ್|ಕ್ರಿಪ್ಟೋ|ಫಾರೆಕ್ಸ್)/u],
-  ['MALAYALAM_TRADING', /(സ്റ്റോക്ക്|സ്റ്റോക്ക്\s*മാർക്കറ്റ്|ട്രേഡിംഗ്|ഓഹരി|നിക്ഷേപം|നിഫ്റ്റി|സെൻസെക്സ്|ക്രിപ്റ്റോ|ഫോറെക്സ്)/u],
-  ['PUNJABI_TRADING', /(ਸ਼ੇਅਰ|ਸ਼ੇਅਰ\s*ਬਾਜ਼ਾਰ|ਟ੍ਰੇਡਿੰਗ|ਨਿਵੇਸ਼|ਨਿਫਟੀ|ਸੈਂਸੈਕਸ|ਸਟਾਕ|ਕ੍ਰਿਪਟੋ|ਫੋਰੈਕਸ)/u],
-  ['ARABIC_TRADING', /(تداول|أسهم|الأسهم|بورصة|البورصة|استثمار|فوركس|تحليل\s*فني|عملات\s*رقمية)/u],
-  ['TURKISH_TRADING', /(?<![\p{L}\p{N}])(borsa\s+istanbul|bist\s*100|hisse|hisseler|yatırım|yatirim|döviz|doviz|kripto|forex|trading|teknik\s*analiz)(?![\p{L}\p{N}])/iu],
-  ['INDONESIAN_MALAY_TRADING', /(?<![\p{L}\p{N}])(saham|investasi|investor|kripto|forex|trading|analisis\s+teknikal)(?![\p{L}\p{N}])/iu],
-  ['VIETNAMESE_TRADING', /(?<![\p{L}\p{N}])(chứng\s*khoán|chung\s*khoan|đầu\s*tư|dau\s*tu|giao\s*dịch|giao\s*dich|cổ\s*phiếu|co\s*phieu|tiền\s*điện\s*tử|tien\s*dien\s*tu|forex|trading)(?![\p{L}\p{N}])/iu],
+  ['HINDI_TRADING', /(ट्रेडिंग|शेयर\s*बाजार|शेयर\s*मार्केट|निफ्टी|सेंसेक्स|स्टॉक\s*मार्केट|स्टॉक|क्रिप्टो|फॉरेक्स|तकनीकी\s*विश्लेषण|प्राइस\s*एक्शन|इंट्राडे|डे\s*ट्रेडिंग|म्यूचुअल\s*फंड)/u],
+  ['MARATHI_TRADING', /(ट्रेडिंग|शेअर\s*बाजार|शेअर\s*मार्केट|निफ्टी|सेन्सेक्स|स्टॉक\s*मार्केट|स्टॉक|क्रिप्टो|फॉरेक्स|तांत्रिक\s*विश्लेषण|चार्ट|इंट्राडे)/u],
+  ['GUJARATI_TRADING', /(ટ્રેડિંગ|શેર\s*બજાર|નિફ્ટી|સેન્સેક્સ|સ્ટોક\s*માર્કેટ|સ્ટોક|ક્રિપ્ટો|ફોરેક્સ|ટેકનિકલ\s*વિશ્લેષણ|ચાર્ટ)/u],
+  ['BENGALI_TRADING', /(শেয়ার\s*বাজার|ট্রেডিং|নিফটি|সেনসেন্স|স্টক\s*মার্কেট|স্টক|ক্রিপ্টো|ফরেক্স|বিনিয়োগ\s*পরামর্শ)/u],
+  ['TELUGU_TRADING', /(స్టాక్\s*మార్కెట్|స్టాక్|ట్రేడింగ్|షేర్\s*మార్కెట్|నిఫ్టీ|సెన్సెక్స్|క్రిప్టో|ఫారెక్స్|పెట్టుబడి\s*మార్గదర్శనం)/u],
+  ['KANNADA_TRADING', /(ಸ್ಟಾಕ್\s*ಮಾರ್ಕೆಟ್|ಸ್ಟಾಕ್|ಟ್ರೇಡಿಂಗ್|ಷೇರ್\s*ಮಾರ್ಕೆಟ್|ನಿಫ್ಟಿ|ಸೆನ್ಸೆಕ್ಸ್|ಕ್ರಿಪ್ಟೋ|ಫಾರೆಕ್ಸ್|ಹೂಡಿಕೆ\s*ಮಾರ್ಗದರ್ಶನ)/u],
+  ['MALAYALAM_TRADING', /(സ്റ്റോക്ക്\s*മാർക്കറ്റ്|സ്റ്റോക്ക്|ട്രേഡിംഗ്|ഓഹരി\s*വിപണി|നിഫ്റ്റി|സെൻസെക്സ്|ക്രിപ്റ്റോ|ഫോറെക്സ്|നിക്ഷേപ\s*മാർഗ്ഗനിർദ്ദേശം)/u],
+  ['PUNJABI_TRADING', /(ਸ਼ੇਅਰ\s*ਬਾਜ਼ਾਰ|ਟ੍ਰੇਡਿੰਗ|ਨਿਫਟੀ|ਸੈਂਸੈਕਸ|ਸਟਾਕ\s*ਮਾਰਕੀਟ|ਸਟਾਕ|ਕ੍ਰਿਪਟੋ|ਫੋਰੈਕਸ)/u],
+  ['ARABIC_TRADING', /(تداول|أسهم|الأسهم|بورصة|البورصة|فوركس|تحليل\s*فني|عملات\s*رقمية)/u],
+  ['TURKISH_TRADING', /(?<![\p{L}\p{N}])(borsa\s+istanbul|bist\s*100|hisse|hisseler|yatırım|yatirim|döviz|doviz|kripto|teknik\s*analiz)(?![\p{L}\p{N}])/iu],
+  ['INDONESIAN_MALAY_TRADING', /(?<![\p{L}\p{N}])(saham|investasi|investor|kripto|analisis\s+teknikal)(?![\p{L}\p{N}])/iu],
+  ['VIETNAMESE_TRADING', /(?<![\p{L}\p{N}])(chứng\s*khoán|chung\s*khoan|giao\s*dịch|giao\s*dich|cổ\s*phiếu|co\s*phieu|tiền\s*điện\s*tử|tien\s*dien\s*tu)(?![\p{L}\p{N}])/iu],
   ['THAI_TRADING', /(หุ้น|การลงทุน|เทรด|คริปโต|ฟอเร็กซ์)/u],
-  ['KOREAN_TRADING', /(주식|투자|트레이딩|선물|외환|코인|차트)/u],
-  ['CHINESE_TRADING', /(股票|投资|交易|期货|外汇|加密货币|技术分析)/u],
-  ['CYRILLIC_TRADING', /(трейдинг|акции|инвестиции|форекс|биржа|криптовалюта)/u],
+  ['KOREAN_TRADING', /(주식|트레이딩|선물|외환)/u],
+  ['CHINESE_TRADING', /(股票|期货|外汇|加密货币|技术分析)/u],
+  ['CYRILLIC_TRADING', /(трейдинг|акции|форекс|биржа|криптовалюта)/u],
 ];
 
 /**
@@ -91,7 +91,7 @@ const MARKET_CONTEXT_SIGNALS: Array<[string, RegExp]> = [
 const HARD_NON_TRADING_SIGNALS: Array<[string, RegExp]> = [
   ['GAMING', /\b(gameplay|walkthrough|playthrough|minecraft|roblox|fortnite|valorant|league\s*of\s*legends|gta\s*v|gta\s*5|call\s*of\s*duty|pokemon|pokémon|genshin|esports?|gaming\s*channel)\b/iu],
   ['COOKING_RECIPES', /\b(recipe|recipes|cooking|kitchen|bake|baking|chef|cuisine|mukbang|delicious\s*food|street\s*food)\b/iu],
-  ['MUSIC_ARTIST', /\b(official\s*music\s*video|music\s*video|official\s*audio|lyrics?|lyric\s*video|album|single|singer|song|musician|record\s*label|clip\s*officiel|chanson|artiste|zouk)\b/iu],
+  ['MUSIC_ARTIST', /\b(official\s*music\s*video|music\s*video|official\s*audio|lyrics?|lyric\s*video|album|singer|musician|record\s*label|clip\s*officiel|chanson|artiste|zouk)\b/iu],
   ['BEAUTY_ENTERTAINMENT', /\b(celebrity\s*gossip|makeup\s*tutorial|beauty\s*vlog|toy\s*review)\b/iu],
   ['GENERIC_PERSONAL_FINANCE', /\b(personal\s*finance|budgeting|credit\s*card\s*points|save\s*money|paying\s*off\s*debt|mortgage\s*calculator)\b/iu],
 ];
@@ -105,15 +105,16 @@ const HARD_NON_TRADING_SIGNALS: Array<[string, RegExp]> = [
  * rejected.
  */
 const ADDITIONAL_NON_TRADING_SIGNALS: Array<[string, RegExp]> = [
-  ['EDUCATION_EXAM_RECRUITMENT', /(?:\b(?:mpsc|upsc|gpsc|psi|aso|neet|jee|exam|exams|syllabus|admit\s*card|question\s*paper|competitive\s*exam|government\s*exam|government\s*job|recruitment|sarkari|naukri|bharti|preparation|coaching|scholarship|ntse|mtse|talathi|gramsevak)\b|परीक्षा|स्पर्धा|भरती|नोकरी|प्रश्नपत्र|निकाल|तयारी|राज्यसेवा|तलाठी|ग्रामसेवक|पोलीस|ભરતી|પરીક્ષા|સ્પર્ધાત્મક|તૈયારી|સરકારી|નોકરી|પરિણામ|ਪਰੀਖਿਆ|ਭਰਤੀ|ਤਿਆਰੀ|পরীক্ষা|চাকরি|প্রস্তুতি|పరీక్ష|ఉద్యోగం|సిద్ధత|ಪರೀಕ್ಷೆ|ಉದ್ಯೋಗ|ತಯಾರಿ|പരീക്ഷ|ജോലി|തയ്യാറെടുപ്പ്)/iu],
+  ['EDUCATION_EXAM_RECRUITMENT', /(?:\b(?:mpsc|upsc|gpsc|psi|aso|neet|jee|exam|exams|syllabus|admit\s*card|question\s*paper|competitive\s*exam|government\s*exam|government\s*job|recruitment|sarkari|naukri|bharti|scholarship|ntse|mtse|talathi|gramsevak)\b|परीक्षा|स्पर्धा|भरती|नोकरी|प्रश्नपत्र|निकाल|तयारी|राज्यसेवा|तलाठी|ग्रामसेवक|पोलीस|ભરતી|પરીક્ષા|સ્પર્ધાત્મક|તૈયારી|સરકારી|નોકરી|પરિણામ|ਪਰੀਖਿਆ|ਭਰਤੀ|ਤਿਆਰੀ|পরীক্ষা|চাকরি|প্রস্তুতি|పరీక్ష|ఉద్యోగం|సిద్ధత|ಪರೀಕ್ಷೆ|ಉದ್ಯೋಗ|ತಯಾರಿ|പരീക്ഷ|ജോലി|തയ്യാറെടുപ്പ്)/iu],
   ['VEHICLE_SALE', /(?:\b(?:bolero|mahindra|car\s*sale|vehicle\s*sale|second\s*hand|for\s*sale|bikau)\b|गाड़ी|ગાડી|ਗੱਡੀ|বিক্রি|విక్రయం|ಮಾರಾಟ|വിൽപ്പന)/iu],
-  ['HEALTH_MEDICAL', /\b(epidemiologist|sexually\s*transmitted|\bsti\s+(?:symptoms|infection|test)|hiv|health\s*center|symptoms|infection|medical|doctor|nurse|biology)\b/iu],
+  ['HEALTH_MEDICAL', /\b(epidemiologist|sexually\s*transmitted|\bsti\s+(?:symptoms|infection|test)|hiv|health\s*center|symptoms|infection|biology)\b/iu],
   ['RELIGION_DEVOTION', /(?:\b(?:jai\s*shri\s*ram|bhajan|devotional|puja|mandir|temple|quran|bible)\b|जय\s*श्री\s*राम|भजन|मंदिर|पूजा|જય\s*શ્રી\s*રામ|ભજન|మందిర్|பஜனை)/iu],
   ['VILLAGE_FAMILY_VLOG', /(?:\b(?:village|family\s*vlog|daily\s*vlog|samajsevi)\b|गांव|ग्रामीण|समाजसेवी|गाँव|ગામ|ਪਿੰਡ|গ্রাম|గ్రామం|ಹಳ್ಳಿ|ഗ്രാമം)/iu],
 ];
 
 /** Softer format cues are only contradictions when no real trading signal exists. */
 const SOFT_NON_TRADING_SIGNALS: Array<[string, RegExp]> = [
+  ['EDUCATION_FORMAT', /\b(coaching|preparation|course|courses|tutorial|lesson|classes)\b/iu],
   ['GENERAL_VLOG', /\b(vlog|vlogging|prank|pranks|unboxing|reaction\s*video)\b/iu],
 ];
 
@@ -206,24 +207,22 @@ export function assessIntakeTradingFocus(input: IntakeTradingFocusInput): Intake
   const negativeFamilies = unique([...hard, ...additional, ...soft]);
   const matchedSignals = unique([...high, ...market, ...hard, ...additional, ...soft]);
 
-  // Strong unrelated domains win over accidental finance vocabulary. This is
-  // intentionally the same precedence as the previous triage: an artist or
-  // gaming hit containing "options" must not enter the canonical pipeline.
-  if (hard.length) {
-    return decision('WITHHOLD', [
-      high.length ? 'CONFLICTING_RETRIEVAL_DOMAINS' : 'EXPLICIT_NON_TRADING_DOMAIN_DETECTED',
-      'EXPLICIT_NON_TRADING_SIGNAL_DETECTED',
+  // A channel with explicit trading evidence and a competing domain is
+  // ambiguous. Preserve it for review rather than withholding it outright: one
+  // incidental music/recipe word in an otherwise genuine trading channel must
+  // not discard the creator. A hard-only result still withholds.
+  if (high.length && (hard.length || additional.length)) {
+    return decision('DEFER', [
+      'CONFLICTING_TRADING_AND_UNRELATED_EVIDENCE',
+      'ROUTE_TO_REVIEW',
       'DO_NOT_SPEND_ENRICHMENT_QUOTA',
     ], positiveFamilies, negativeFamilies, matchedSignals);
   }
 
-  // A channel can genuinely cover both trading and an exam/education audience.
-  // Do not spend the expensive path and do not permanently reject; route it to
-  // review with both evidence families visible.
-  if (high.length && additional.length) {
-    return decision('DEFER', [
-      'CONFLICTING_TRADING_AND_UNRELATED_EVIDENCE',
-      'ROUTE_TO_REVIEW',
+  if (hard.length) {
+    return decision('WITHHOLD', [
+      'EXPLICIT_NON_TRADING_DOMAIN_DETECTED',
+      'EXPLICIT_NON_TRADING_SIGNAL_DETECTED',
       'DO_NOT_SPEND_ENRICHMENT_QUOTA',
     ], positiveFamilies, negativeFamilies, matchedSignals);
   }

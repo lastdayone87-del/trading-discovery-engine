@@ -833,6 +833,7 @@ export function assessChannelCountry(
         ...(input.videoDescriptions || []),
         ...(nonEmptyBio ? [nonEmptyBio] : []),
       ];
+      const bioIncluded = nonEmptyBio.length > 0 && languageSamples.length > (input.videoDescriptions || []).length;
       const aggregated = aggregateContentLanguage(languageSamples, input.playlists || []);
       if (aggregated) {
         const isLiveExcluded = (country: string): boolean =>
@@ -841,7 +842,7 @@ export function assessChannelCountry(
         // excluded. If any set member is not excluded, emit nothing.
         if (aggregated.countries.every(isLiveExcluded)) {
           const representative = [...aggregated.countries].sort((a, b) => a.localeCompare(b))[0];
-          const firstVoting = (input.videoDescriptions || []).map(text => (text || '').trim()).filter(Boolean)
+          const firstVoting = languageSamples.map(text => (text || '').trim()).filter(Boolean)
             .find(text => voteVideoDescriptionLanguage(text) === aggregated.language) || '';
           const setLabel = `candidate countries [${aggregated.countries.join(', ')}]`;
           const languageItem: CountryInferenceEvidence = {
@@ -850,10 +851,10 @@ export function assessChannelCountry(
             detectedCountry: representative,
             confidence: aggregated.confidence,
             ...(aggregated.countries.length > 1 ? { candidateCountries: [...aggregated.countries] } : {}),
-            matchedValue: `${aggregated.votes}/${aggregated.usable} ${aggregated.language}`,
+            matchedValue: `${aggregated.votes}/${aggregated.usable} ${aggregated.language}${bioIncluded ? ' (includes channel bio)' : ''}`,
             matchedContext: firstVoting.slice(0, 160),
-            sourceField: 'videoDescriptions',
-            reasoning: `${aggregated.votes}/${aggregated.usable} recent video descriptions in ${aggregated.language} (${setLabel}, all currently excluded).`
+            sourceField: bioIncluded ? 'videoDescriptions+aboutBio' : 'videoDescriptions',
+            reasoning: `${aggregated.votes}/${aggregated.usable} creator-written language samples in ${aggregated.language}${bioIncluded ? ' including the channel bio' : ''} (${setLabel}, all currently excluded).`
           };
           const policy: CountryInferenceEvidence = {
             source: 'EXCLUSION_POLICY',
@@ -937,7 +938,9 @@ export function assessChannelCountry(
       evidenceAvailability,
       gateDisposition: 'NEEDS_REVIEW',
       confidence,
-      reasoning: `${detectedCreatorCountry} is excluded by policy (${excluded.reason}), but the available evidence is mention-grade or indirect. Review is required before enrichment.`,
+      reasoning: conflict
+        ? `Conflicting country evidence prevents a reliable ${detectedCreatorCountry} attribution, and ${detectedCreatorCountry} is excluded by policy (${excluded.reason}). Review is required before enrichment.`
+        : `${detectedCreatorCountry} is excluded by policy (${excluded.reason}), but the available evidence is mention-grade or indirect. Review is required before enrichment.`,
       decisiveEvidence
     };
   }

@@ -277,7 +277,7 @@ test('music creator is withheld even when retrieval text contains an accidental 
   assert.ok(decision.matchedSignals.includes('MUSIC_ARTIST'));
 });
 
-test('dominant unrelated domain beats a stray high-specificity trading phrase', () => {
+test('a stray trading phrase plus a dominant unrelated domain is deferred, not withheld', () => {
   const decision = triageAutonomousSearchCandidate({
     channelId: 'UCmusic00000000000000002', channelName: 'Artist Channel', youtubeUrl: 'https://youtube.com/channel/music2',
     description: '', videoTitles: ['New single'], videoDescriptions: [''],
@@ -287,8 +287,8 @@ test('dominant unrelated domain beats a stray high-specificity trading phrase', 
       description: 'Singer talks about trading stories in the studio.'
     }
   }, 'automated_query', false);
-  assert.equal(decision.disposition, 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS');
-  assert.ok(decision.reasonCodes.includes('CONFLICTING_RETRIEVAL_DOMAINS'));
+  assert.equal(decision.disposition, 'DEFER_NO_CONFIDENT_EVIDENCE');
+  assert.ok(decision.reasonCodes.includes('CONFLICTING_TRADING_AND_UNRELATED_EVIDENCE'));
 });
 
 test('one broad financial product word is not enough for canonical autonomous admission', () => {

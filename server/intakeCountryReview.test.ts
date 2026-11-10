@@ -54,6 +54,8 @@ test('excluded-country market references alone never reject a creator', () => {
     aboutBio: 'I trade NIFTY, NSE and Indian stocks from Singapore. Market coverage, not my domicile.',
     discoveryCountry: 'Singapore',
   }, INDIA);
+  assert.equal(result.status, 'UNCERTAIN');
+  assert.equal(result.gateDisposition, 'NEEDS_REVIEW');
   assert.notEqual(result.status, 'REJECTED');
 });
 
@@ -63,7 +65,8 @@ test('a known non-excluded country is not overridden by excluded-language conten
     videoDescriptions: samples(VIETNAMESE, 10),
   });
   assert.equal(result.detectedCreatorCountry, 'United States');
-  assert.notEqual(result.countryStatus, 'REJECTED');
+  assert.equal(result.countryStatus, 'CONFIRMED');
+  assert.equal(result.gateDisposition, 'ALLOW_NORMAL');
 });
 
 test('dominant Marathi/Gujarati evidence with enough samples rejects under the language policy', () => {
@@ -80,7 +83,10 @@ test('dominant Marathi/Gujarati evidence with enough samples rejects under the l
     videoDescriptions: samples(GUJARATI, 8),
   });
   assert.equal(gujarati.countryStatus, 'REJECTED');
-  assert.equal(gujarati.countryEvidence.some(item => item.source === 'AGGREGATED_CONTENT_LANGUAGE'), true);
+  const gujaratiLanguage = gujarati.countryEvidence.find(item => item.source === 'AGGREGATED_CONTENT_LANGUAGE');
+  assert.ok(gujaratiLanguage);
+  assert.equal(gujaratiLanguage.sourceField, 'videoDescriptions+aboutBio');
+  assert.match(gujaratiLanguage.matchedValue || '', /includes channel bio/);
 });
 
 test('mixed Marathi/Hindi samples abstain rather than guess', () => {
