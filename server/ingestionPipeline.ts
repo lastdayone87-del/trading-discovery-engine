@@ -398,9 +398,20 @@ export function buildDeferredTradingIntakeChannel(
   channel.last_checked = now;
   channel.scan_attempts = existing?.scan_attempts || 0;
   if (countryState) {
-    channel.country = countryState.country;
-    channel.country_status = countryState.status;
-    channel.confidence_score = countryState.score;
+    const incomingResolved = countryState.status === 'CONFIRMED'
+      || countryState.status === 'LIKELY'
+      || countryState.status === 'REJECTED';
+    const existingResolved = existing?.country_status === 'CONFIRMED'
+      || existing?.country_status === 'LIKELY'
+      || existing?.country_status === 'REJECTED';
+    // A sparse rediscovery can produce an unresolved result while the caller
+    // still supplies the stored country as a fallback. Do not let that erase a
+    // previously resolved country decision.
+    if (incomingResolved || !existingResolved) {
+      channel.country = countryState.country;
+      channel.country_status = countryState.status;
+      channel.confidence_score = countryState.score;
+    }
   }
   if (!channel.country_status) channel.country_status = 'UNCERTAIN';
   if (!channel.country) channel.country = '';

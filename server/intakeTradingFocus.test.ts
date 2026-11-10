@@ -175,6 +175,35 @@ test('deferred channel persistence uses INTAKE_DEFERRED and does not manufacture
   assert.equal(channel.inspection_trail.at(-1)?.step, 'BIO');
 });
 
+test('sparse rediscovery does not downgrade a resolved country on a deferred row', () => {
+  const existing = {
+    channel_id: 'UCdefer00000000000000002',
+    channel_name: 'Deferred Trader',
+    youtube_url: 'https://youtube.com/channel/UCdefer00000000000000002',
+    country: 'Germany',
+    country_status: 'CONFIRMED',
+    confidence_score: 95,
+    scan_status: 'ENRICHMENT_PENDING',
+    trading_status: 'UNCERTAIN',
+    scan_attempts: 0,
+    inspection_trail: [],
+  } as any;
+  const channel = buildDeferredTradingIntakeChannel({
+    channelId: existing.channel_id,
+    channelName: existing.channel_name,
+    youtubeUrl: existing.youtube_url,
+    description: 'Sparse metadata',
+    videoTitles: [],
+  }, existing, 'automated_query', '2026-11-10T00:00:00.000Z', ['INSUFFICIENT_CHANNEL_EVIDENCE'], {
+    country: 'Germany',
+    status: 'UNCERTAIN',
+    score: 0,
+  });
+  assert.equal(channel.country, 'Germany');
+  assert.equal(channel.country_status, 'CONFIRMED');
+  assert.equal(channel.confidence_score, 95);
+});
+
 test('incidental market words do not admit a music channel with a hard domain signal', () => {
   const decision = assessIntakeTradingFocus({
     channelName: 'Backstage Sessions',
