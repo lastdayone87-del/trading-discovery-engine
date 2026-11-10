@@ -13,10 +13,14 @@ FROM mcr.microsoft.com/playwright:v1.62.1-noble
 # capacity work, Oct 2026; production database holds no override for this
 # knob because it is env-only). Takes effect on next deploy only. An
 # explicit runtime value still overrides this baked default.
+# Phase 2 Option C: persist the append-only acquisition lane baseline so
+# crawls/hour, gate wait, and the discovery share are measurable. The writer
+# is observational only and can never change an acquisition result.
 ENV NODE_ENV=production \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     PLAYWRIGHT_SKIP_BROWSER_GC=1 \
     COMMUNITY_RETRY_WORKER_CONCURRENCY=3 \
+    ACQUISITION_LANE_TELEMETRY_ENABLED=true \
     SEARCH_WORKER_CONCURRENCY=4
 
 WORKDIR /app
