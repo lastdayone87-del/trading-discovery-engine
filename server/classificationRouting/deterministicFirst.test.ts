@@ -162,3 +162,34 @@ test('query-only evidence enriches without semantic spend', () => {
   }), { independentEvidence: true });
   assert.equal(routed.route, 'ENRICH');
 });
+
+test('a confirmed channel whose video sample contradicts its bio is sent to human review', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'TRADING_CONFIRMED', confidenceScore: 90, recognitionState: 'DECISIVE_TRADING', semanticPolicy: 'SKIP',
+    providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
+  }), {
+    independentEvidence: true, videoSampleCount: 10,
+    channelText: 'Forex trading live analysis. dance choreography trending music song vlog',
+  });
+  assert.equal(routed.route, 'HUMAN_REVIEW');
+  assert.equal(routed.fallbackReason, 'NON_TRADING_CONTENT_FOCUS_REQUIRES_REVIEW');
+});
+
+test('a confirmed channel with real trading analysis in its videos is not sent to review', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'TRADING_CONFIRMED', confidenceScore: 90, recognitionState: 'DECISIVE_TRADING', semanticPolicy: 'SKIP',
+    providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
+  }), {
+    independentEvidence: true, videoSampleCount: 10,
+    channelText: 'EURUSD technical analysis price action live trading market structure breakout',
+  });
+  assert.equal(routed.route, 'SEMANTIC_TRADING');
+});
+
+test('a bio-only confirmation is not reviewed by the video mismatch guard', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'TRADING_CONFIRMED', confidenceScore: 90, recognitionState: 'DECISIVE_TRADING', semanticPolicy: 'SKIP',
+    providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
+  }), { independentEvidence: true, videoSampleCount: 0, channelText: 'Forex trader' });
+  assert.equal(routed.route, 'SEMANTIC_TRADING');
+});

@@ -6,6 +6,7 @@ import { SearchPanel } from './components/SearchPanel';
 import { ResultsTable } from './components/ResultsTable';
 import type { DashboardChannelFilters } from './components/ResultsTable';
 import { PendingRecheckPanel } from './components/PendingRecheckPanel';
+import { ClassificationAudit } from './components/ClassificationAudit';
 import { QueueMonitor } from './components/QueueMonitor';
 import { CountrySettings } from './components/CountrySettings';
 import { InspectionModal } from './components/InspectionModal';
@@ -14,7 +15,7 @@ import { RegressionSuiteDashboard } from './components/RegressionSuiteDashboard'
 import { channelListingSearchParams } from './channelListingQuery';
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'discovery' | 'intelligence' | 'regression' | 'results' | 'pending' | 'queues' | 'settings'>('discovery');
+  const [activeTab, setActiveTab] = useState<'discovery' | 'intelligence' | 'regression' | 'results' | 'pending' | 'audit' | 'queues' | 'settings'>('discovery');
 
 
   const [channels, setChannels] = useState<ChannelRecord[]>([]);
@@ -343,6 +344,10 @@ export default function App() {
             />
             {channelTotal>100&&<div className="flex items-center justify-end gap-2 text-xs"><button disabled={channelOffset===0} onClick={()=>changeChannelPage(Math.max(0,channelOffset-100))} className="rounded border px-3 py-1.5 disabled:opacity-40">Previous</button><span>{channelOffset+1}–{Math.min(channelOffset+100,channelTotal)} of {channelTotal}</span><button disabled={channelOffset+100>=channelTotal} onClick={()=>changeChannelPage(channelOffset+100)} className="rounded border px-3 py-1.5 disabled:opacity-40">Next</button></div>}
           </div>
+        )}
+
+        {activeTab === 'audit' && (
+          <ClassificationAudit />
         )}
 
         {activeTab === 'pending' && (
