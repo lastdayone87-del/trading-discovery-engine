@@ -72,7 +72,7 @@ import {
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
 import { reserveIncrementalTreatmentPageQuota, releaseIncrementalTreatmentPageReservation, enqueueChildAndCommitPageReservation } from './retrievalPolicyCanary';
 import { resolveExecutionSearchWindow } from './retrievalExperiment';
-import { assessQueryResultConsistency } from './queryResultConsistency';
+import { assessQueryResultConsistency, shouldContinueSearchAfterConsistency } from './queryResultConsistency';
 import { trialContinuationCap } from './discoveryFrontierTrials';
 import { aggregatedLanguageCandidateSet, mergeCountryValidationResults, validateChannelCountry } from './countryValidator';
 import { runChannelInspection, hasProcessedAcquisitionEvidence } from './inspector';
@@ -704,7 +704,7 @@ async function finalizeAutonomousSearchRun(args: AutonomousRunFinalizationArgs):
   }
   await completeQueryRun(args.queryRunId, {
     ...finalMetrics,
-    ...(args.queryHold ? { queryHold: args.queryHold } : {}),
+    ...(args.queryHold?.hold ? { queryHold: args.queryHold } : {}),
     uniqueChannels: finalMetrics.newChannels,
     qualityChannels: finalMetrics.qualityChannels,
     communitiesDiscovered: finalMetrics.communitiesDiscovered,
@@ -2414,7 +2414,12 @@ export async function processNextSearchJob(
         await completeJob(job.id);
         return true;
       }
-      if (continuationEnabled && !queryResultHold && decision.shouldContinue && searchPage?.nextPageToken) {
+      if (shouldContinueSearchAfterConsistency({
+        queryResultHold,
+        continuationEnabled,
+        decisionShouldContinue: decision.shouldContinue === true,
+        hasNextPageToken: Boolean(searchPage?.nextPageToken),
+      })) {
         let incPageReservationId: string | undefined;
 
         // Incremental Treatment Page Quota Reservation Boundary

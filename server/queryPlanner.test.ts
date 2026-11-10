@@ -512,14 +512,31 @@ test('ambiguous reviewed-native market and broker surfaces are never planned as 
 });
 
 test('reviewed native trading methods remain standalone while ambiguous markets do not', () => {
-  const spain = planDiverseQueries({ country: 'Spain', count: 20, learnedVocabulary: [], existingQueries: [] });
-  assert.ok(spain.some(item => normalizeQuery(item.query) === normalizeQuery('velas japonesas')
+  // A normal 10-query batch must keep at least one reviewed method standalone.
+  const spain10 = planDiverseQueries({ country: 'Spain', count: 10, learnedVocabulary: [], existingQueries: [] });
+  assert.ok(spain10.some(item => normalizeQuery(item.query) === normalizeQuery('velas japonesas')
     && item.metadata.queryTemplate === 'SINGLE_ATOM'));
-  assert.ok(spain.some(item => normalizeQuery(item.query) === normalizeQuery('operativa intradía')
+  // At a larger batch both reviewed methods must be represented; this is not
+  // a substitute for the normal-count assertion above.
+  const spain20 = planDiverseQueries({ country: 'Spain', count: 20, learnedVocabulary: [], existingQueries: [] });
+  assert.ok(spain20.some(item => normalizeQuery(item.query) === normalizeQuery('operativa intradía')
     && item.metadata.queryTemplate === 'SINGLE_ATOM'));
 
   const singapore = planDiverseQueries({ country: 'Singapore', count: 12, learnedVocabulary: [], existingQueries: [] });
   assert.equal(singapore.some(item => normalizeQuery(item.query) === normalizeQuery('STI analysis')), false);
+});
+
+test('reviewed native proposal does not stutter an anchor already in the phrase', () => {
+  const native = planCountryNativeProposalQuery({
+    country: 'Germany',
+    nativeTerm: 'DAX Analyse',
+    targetIntent: 'market_analysis',
+    allocationLineage: {},
+  });
+  if (native) {
+    assert.notEqual(normalizeQuery(native.query), normalizeQuery('DAX DAX Analyse'));
+    assert.notEqual(normalizeQuery(native.query), normalizeQuery('DAX DAX'));
+  }
 });
 
 

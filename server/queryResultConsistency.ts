@@ -32,6 +32,23 @@ export interface QueryResultConsistencyChannel {
   } | null;
 }
 
+/**
+ * The only place that decides whether a held query may enqueue another page.
+ * Kept pure so the hold/continuation contract is tested directly instead of
+ * only by grepping the worker.
+ */
+export function shouldContinueSearchAfterConsistency(args: {
+  queryResultHold: boolean;
+  continuationEnabled: boolean;
+  decisionShouldContinue: boolean;
+  hasNextPageToken: boolean;
+}): boolean {
+  return args.continuationEnabled
+    && !args.queryResultHold
+    && args.decisionShouldContinue
+    && args.hasNextPageToken;
+}
+
 export interface QueryResultConsistencyDecision {
   hold: boolean;
   sampleSize: number;
@@ -43,17 +60,33 @@ export interface QueryResultConsistencyDecision {
   policyVersion: string;
 }
 
+function sameSurface(a: string, b: string): boolean {
+  const clean = (value: string) => value.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('und');
+  return clean(a) === clean(b);
+}
+
 function channelContentTexts(channel: QueryResultConsistencyChannel): string[] {
   const document = channel.matchedDocument;
-  const texts = [
-    channel.description,
-    document?.title,
-    document?.description,
-  ].filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
-  // A channel name alone is a weak signal (brands are often Latin even when
-  // the creator publishes in another script). Use it only when no content
-  // field is available at all, so a Latin name cannot mask a non-Latin bio.
-  return texts.length ? texts : (channel.channelName ? [channel.channelName] : []);
+  const channelDescription = typeof channel.description === 'string' ? channel.description.trim() : '';
+  const documentTitle = typeof document?.title === 'string' ? document.title.trim() : '';
+  const documentDescription = typeof document?.description === 'string' ? document.description.trim() : '';
+  // A channel name alone is a weak signal: brands are often Latin even when
+  // the creator publishes in another script, and a non-Latin name is not
+  // evidence of the channel's content language. A matched document title that
+  // merely repeats the channel name is still name-only. Exclude those rows; if
+  // that leaves too few rows the guard fails open.
+  const titleIsJustName = Boolean(
+    documentTitle
+    && channel.channelName
+    && sameSurface(documentTitle, channel.channelName)
+    && !documentDescription
+    && !channelDescription,
+  );
+  return [
+    channelDescription,
+    titleIsJustName ? '' : documentTitle,
+    documentDescription,
+  ].filter((value): value is string => value.length > 0);
 }
 
 function textHasExpectedScript(text: string, expected: ReadonlySet<string>): boolean {

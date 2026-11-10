@@ -337,7 +337,15 @@ export function planCountryNativeProposalQuery(args: {
   if (reviewedPhrase && queryTokenCount(nativeTerm) > 3) return wholePhrase();
   const anchor = countryAtoms(args.country, args.countryVocabulary)
     .filter(item => ['STANDALONE', 'ANCHOR_ONLY'].includes(item.retrievalPolicy.eligibility))
-    .find(item => isRetrievalOrientedQuery(args.country, `${item.term} ${nativeTerm}`));
+    .find(item => {
+      // Do not create stuttering pairs such as `DAX DAX Analyse`: if the
+      // reviewed phrase already contains the anchor token, run the phrase
+      // whole instead of prefixing it again.
+      const anchorTokens = new Set(normalizeQuery(item.term).split(' '));
+      const repeatsAnchor = normalizeQuery(nativeTerm).split(' ')
+        .some(token => token.length >= 3 && anchorTokens.has(token));
+      return !repeatsAnchor && isRetrievalOrientedQuery(args.country, `${item.term} ${nativeTerm}`);
+    });
   if (!anchor) return reviewedPhrase ? wholePhrase() : null;
   const query = `${anchor.term} ${nativeTerm}`;
   // Even a short reviewed phrase can overflow once the anchor is added; in
@@ -431,10 +439,12 @@ function countryAtoms(country: string, vocabulary?: CountryVocabulary): SearchAt
   const nativeQueries = (COUNTRY_NATIVE_QUERY_ATOMS[country] || []).map(([term, type, intent]) => {
     const nativeAtom = atom(term, type, intent, 1, 'COUNTRY_VOCABULARY');
     // Reviewed local surfaces are audit provenance, not an authorization to
-    // ignore retrieval specificity. Keep the policy evaluated for the atom's
-    // actual semantic class. High-ambiguity MARKET/BROKER/PLATFORM surfaces
-    // remain MODIFIER_ONLY and are paired with an authorized anchor below;
-    // only atoms whose own policy is STANDALONE may be selected as singles.
+    // ignore retrieval specificity. High-ambiguity MARKET/BROKER/PLATFORM
+    // surfaces remain MODIFIER_ONLY and are paired with an authorized anchor
+    // below. The reviewed allowlist deliberately promotes only curated
+    // MARKET/METHOD phrases into the standalone band by raising specificity to
+    // at least 60 and lowering ambiguity to at most 45; that override is
+    // intentional and the evaluated semantic class remains in the audit trail.
     const nativeTokens = queryTokenCount(nativeAtom.term);
     const safeMarketQualifier = /\b(dax|ibex|cac|bel ?20|euronext|nyse|nasdaq|s&p|ftse|aex|smi|omx|tsx|asx|nzx|sgx|nikkei|topix|kospi|bist|bovespa|moex|jse|hose|set|bursa|stock\s*exchange|bourse|börse|beurs|market\s*outlook|market\s*wrap|opening|session|تحليل|تداول)\b/iu;
     const reviewedMethod = nativeAtom.type === 'METHOD'
@@ -923,7 +933,7 @@ export function planDiverseQueries(args: {
           extractedCandidateSourceTitle: candidate.extracted.sourceTitle || undefined,
         } : {}),
         ...(scopePromotedAnchor || scopePromotedRegion ? { scopePromoted: true, promotionBasis: args.scopePromotionBasis } : {}),
-        retrievalSpecificity:{policyVersion:primary.retrievalPolicy.policyVersion,eligibility:primary.retrievalPolicy.eligibility,specificity:primary.retrievalPolicy.specificity,ambiguity:primary.retrievalPolicy.ambiguity,reasonCodes:primary.retrievalPolicy.reasonCodes},
+        retrievalSpecificity:{policyVersion:primary.retrievalPolicy.policyVersion,eligibility:primary.retrievalPolicy.eligibility,specificity:primary.retrievalPolicy.specificity,ambiguity:primary.retrievalPolicy.ambiguity,reasonCodes:primary.retrievalPolicy.reasonCodes,requiredCompanionClasses:primary.retrievalPolicy.requiredCompanionClasses},
         atoms: candidate.atoms.map((item, position) => ({ ...item, role: position === 0 ? 'ANCHOR' : 'MODIFIER', position })),
         localTier1Term: primary.term,
         learnedTerm: candidate.extracted ? undefined : candidate.atoms.find(item => item.type === 'LEARNED')?.term,
@@ -1028,7 +1038,8 @@ export function reformulatePollutedQuery(args: {
             eligibility: primaryAtom.retrievalPolicy.eligibility,
             specificity: primaryAtom.retrievalPolicy.specificity,
             ambiguity: primaryAtom.retrievalPolicy.ambiguity,
-            reasonCodes: primaryAtom.retrievalPolicy.reasonCodes
+            reasonCodes: primaryAtom.retrievalPolicy.reasonCodes,
+            requiredCompanionClasses: primaryAtom.retrievalPolicy.requiredCompanionClasses
           }
         }
       };

@@ -265,9 +265,23 @@ export function evaluateAutonomousQueryAuthority(
     // Bolero, a broker/platform name) must not execute alone.
     const earlyReviewedNativeSurface = Array.isArray(atoms[0]?.retrievalPolicy?.reasonCodes)
       && atoms[0].retrievalPolicy.reasonCodes.includes('REVIEWED_NATIVE_PHRASE');
-    const companionClasses = Array.isArray(specificity.requiredCompanionClasses)
-      ? specificity.requiredCompanionClasses
+    const primaryIsMethod = String(atoms[0]?.type || '').toUpperCase() === 'METHOD';
+    const topLevelCompanionClasses = Array.isArray(specificity.requiredCompanionClasses)
+      ? specificity.requiredCompanionClasses.map(String)
       : [];
+    // Legacy rows predate the top-level copy and may still carry the
+    // requirement only on the atom. Exclude METHOD atoms: reviewed methods
+    // are explicitly authorized standalone and their generic companion
+    // requirement must not override that.
+    const atomCompanionClasses = atoms
+      .filter(atom => String(atom.type || '').toUpperCase() !== 'METHOD')
+      .flatMap(atom => Array.isArray(atom.retrievalPolicy?.requiredCompanionClasses)
+        ? atom.retrievalPolicy.requiredCompanionClasses.map(String)
+        : []);
+    const companionClasses = [...new Set([
+      ...(primaryIsMethod ? [] : topLevelCompanionClasses),
+      ...atomCompanionClasses,
+    ])];
     if (
       template === 'SINGLE_ATOM'
       && earlyReviewedNativeSurface

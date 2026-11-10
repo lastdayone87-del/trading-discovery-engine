@@ -2678,7 +2678,11 @@ export async function holdQueryForResultConsistency(queryId:number,runId:string|
     await client.query(
       `UPDATE query_library
        SET collection='REJECTED',
-           generation_metadata=COALESCE(generation_metadata,'{}'::jsonb)||$2::jsonb
+           generation_metadata=jsonb_set(
+             COALESCE(generation_metadata,'{}'::jsonb)||$2::jsonb,
+             '{queryHold,at}',
+             to_jsonb(COALESCE(generation_metadata->'queryHold'->>'at', $2::jsonb->'queryHold'->>'at'))
+           )
        WHERE id=$1`,
       [queryId,JSON.stringify(payload)],
     );
@@ -2686,7 +2690,11 @@ export async function holdQueryForResultConsistency(queryId:number,runId:string|
       await client.query(
         `UPDATE query_runs
          SET next_page_token=NULL,
-             performance_details=COALESCE(performance_details,'{}'::jsonb)||$2::jsonb
+             performance_details=jsonb_set(
+               COALESCE(performance_details,'{}'::jsonb)||$2::jsonb,
+               '{queryHold,at}',
+               to_jsonb(COALESCE(performance_details->'queryHold'->>'at', $2::jsonb->'queryHold'->>'at'))
+             )
          WHERE id=$1`,
         [runId,JSON.stringify(payload)],
       );
@@ -5333,7 +5341,7 @@ export async function completeQueryRun(runId: string, metrics: {
    */
   latencyBreakdownMs?: { workerTotalMs: number; quotaWaitMs: number; retrievalMs: number; channelProcessingMs: number };
   /** Post-retrieval consistency hold, persisted atomically with completion. */
-  queryHold?: unknown;
+  queryHold?: { hold?: boolean } | null;
 }): Promise<void> {
   const db = await getDb();
   const client = await db.connect();

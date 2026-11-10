@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { assessQueryResultConsistency } from './queryResultConsistency';
+import { assessQueryResultConsistency, shouldContinueSearchAfterConsistency } from './queryResultConsistency';
 
 function channels(values: Array<{ name: string; description?: string; title?: string }>) {
   return values.map(value => ({
@@ -89,6 +89,23 @@ test('does not hold below the minimum sample or when the incompatible share is b
   assert.equal(borderline.hold, false);
 });
 
+test('name-only results are not enough to hold a query', () => {
+  const decision = assessQueryResultConsistency('United States', channels(
+    Array.from({ length: 12 }, (_, index) => ({ name: `Ֆինանսական-${index}` })),
+  ));
+  assert.equal(decision.hold, false);
+  assert.ok(decision.reasonCodes.includes('INSUFFICIENT_RESULT_SAMPLE'));
+});
+
+test('held queries never authorize a continuation page', () => {
+  const base = { continuationEnabled: true, decisionShouldContinue: true, hasNextPageToken: true };
+  assert.equal(shouldContinueSearchAfterConsistency({ ...base, queryResultHold: true }), false);
+  assert.equal(shouldContinueSearchAfterConsistency({ ...base, queryResultHold: false }), true);
+  assert.equal(shouldContinueSearchAfterConsistency({ ...base, queryResultHold: false, continuationEnabled: false }), false);
+  assert.equal(shouldContinueSearchAfterConsistency({ ...base, queryResultHold: false, decisionShouldContinue: false }), false);
+  assert.equal(shouldContinueSearchAfterConsistency({ ...base, queryResultHold: false, hasNextPageToken: false }), false);
+});
+
 test('fails open for a country without a script profile', () => {
   const decision = assessQueryResultConsistency('Atlantis', channels(
     Array.from({ length: 12 }, (_, index) => ({ name: `a-${index}`, description: 'تحليل السوق.' })),
@@ -105,8 +122,9 @@ test('search worker applies the consistency guard before processing a page and q
   const hold = source.indexOf('holdQueryForResultConsistency(queryId!');
   assert.ok(guard >= 0, 'consistency guard must be wired into the search worker');
   assert.ok(loop > guard, 'the guard must run before the channel processing loop');
-  assert.ok(hold >= 0, 'the worker must quarantine the query on a hold');
-  assert.match(source, /continuationEnabled && !queryResultHold && decision\.shouldContinue/);
+  assert.ok(hold > guard && hold < loop, 'the hold must run after the guard and before channel processing');
+  assert.match(source, /shouldContinueSearchAfterConsistency\(\{/);
+  assert.match(source, /args\.queryHold\?\.hold \? \{ queryHold: args\.queryHold \}/);
   assert.match(source, /createContinuation: queryResultHold \? false/);
 });
 
