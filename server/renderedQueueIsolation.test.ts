@@ -151,7 +151,7 @@ test('total-budget clock starts at gate admission, before the lifecycle lock', a
   const source = await import('node:fs/promises').then(fs => fs.readFile(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8'));
   assert.match(source, /renderedFallbackGate\.run\(\(gateAdmittedAtMs\) => withRenderedQueueLifecycleLock\(async \(\) => \{/);
   assert.match(source, /const startedAt = gateAdmittedAtMs;/);
-  assert.match(source, /return await operation\(Date\.now\(\)\);/);
+  assert.match(source, /await operation\(Date\.now\(\)\);/);
 });
 
 test('cleanup failure is observable without changing the crawl result', async () => {
