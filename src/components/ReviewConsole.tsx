@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AlertTriangle, CheckCircle2, ChevronRight, ExternalLink, Loader2, RefreshCw, ShieldAlert, XCircle } from 'lucide-react';
 import { apiFetch } from '../apiClient';
 import { submitReviewDecision } from '../reviewDecision';
-import { canSubmitReviewForSelection } from '../reviewSelection';
+import { canSubmitReviewForSelection, reviewEvidenceIsDecidable } from '../reviewSelection';
 import { newRequestId } from '../apiClient';
 
 interface ReviewQueueItem {
@@ -149,7 +149,7 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
 
   const submit = async () => {
     if (!current || !bundle) return;
-    if (!canSubmitReviewForSelection(bundle, current.channelId)) {
+    if (!canSubmitReviewForSelection(bundle, current.channelId) || !reviewEvidenceIsDecidable(bundle)) {
       setError('The selected channel changed while its evidence was loading. Reload the selection before deciding.');
       return;
     }
@@ -336,7 +336,7 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
                   </select>
                   {reasonCode === 'OTHER' && <input aria-label="Other reason" value={reasonOther} onChange={e => setReasonOther(e.target.value)} placeholder="Other reason" className="rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent px-2.5 py-2 text-xs" />}
                   <input value={notes} onChange={e => setNotes(e.target.value)} placeholder="Optional notes" className="rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent px-2.5 py-2 text-xs" />
-                  <button disabled={submitting || loadingBundle || !reasonCode || !canSubmitReviewForSelection(bundle, current?.channelId || null)} onClick={() => void submit()} className="rounded-lg bg-indigo-600 text-white px-4 py-2 text-xs font-semibold disabled:opacity-40 inline-flex items-center justify-center gap-2">
+                  <button disabled={submitting || loadingBundle || !reasonCode || !canSubmitReviewForSelection(bundle, current?.channelId || null) || !reviewEvidenceIsDecidable(bundle)} onClick={() => void submit()} className="rounded-lg bg-indigo-600 text-white px-4 py-2 text-xs font-semibold disabled:opacity-40 inline-flex items-center justify-center gap-2">
                     {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : action === 'APPROVE' ? <CheckCircle2 className="w-4 h-4" /> : <XCircle className="w-4 h-4" />}
                     Submit
                   </button>

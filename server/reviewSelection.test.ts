@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { canSubmitReviewForSelection } from '../src/reviewSelection';
+import { canSubmitReviewForSelection, reviewEvidenceIsDecidable } from '../src/reviewSelection';
 
 test('a review can only be submitted for the selected pending channel', () => {
   const bundle = { review: { channelId: 'chan-1', state: 'PENDING' } };
@@ -8,4 +8,10 @@ test('a review can only be submitted for the selected pending channel', () => {
   assert.equal(canSubmitReviewForSelection(bundle, 'chan-2'), false);
   assert.equal(canSubmitReviewForSelection({ review: { channelId: 'chan-1', state: 'APPROVED' } }, 'chan-1'), false);
   assert.equal(canSubmitReviewForSelection(null, 'chan-1'), false);
+});
+
+test('a missing pinned lineage blocks the decision',()=>{
+  assert.equal(reviewEvidenceIsDecidable({ warnings: [] }), true);
+  assert.equal(reviewEvidenceIsDecidable({ warnings: ['ELIGIBILITY_DECISION_NOT_FOUND'] }), false);
+  assert.equal(reviewEvidenceIsDecidable({ warnings: ['CLASSIFICATION_DIAGNOSTIC_NOT_FOUND'] }), false);
 });

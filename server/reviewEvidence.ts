@@ -168,6 +168,7 @@ export async function getReviewEvidence(
     if (!eligibilityRow) eligibilityWarning = 'ELIGIBILITY_DECISION_NOT_FOUND';
   }
   if (!eligibilityRow) {
+    if (!eligibilityDecisionId) eligibilityWarning = 'ELIGIBILITY_DECISION_ID_MISSING';
     const result = await db.query(
       `SELECT d.*,p.status AS projection_status,p.version AS projection_version,
               p.evidence_checksum AS projection_evidence_checksum,
