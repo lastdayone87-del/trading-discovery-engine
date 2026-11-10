@@ -265,6 +265,14 @@ export function isReviewedNativePhrase(term: string): boolean {
   return reviewedNativePhraseLanguages(term).length > 0;
 }
 
+/** True when the surface contains a reviewed native phrase, not just equals it. */
+export function containsReviewedNativePhrase(term: string): boolean {
+  const key = phraseKey(term);
+  if (!key) return false;
+  return Object.values(REVIEWED_NATIVE_PHRASES)
+    .some(values => values.some(value => key.includes(phraseKey(value))));
+}
+
 /**
  * Compounds whose local reading is not trading intent. `トレード` is a
  * reviewed Japanese semantic, but `トレードオフ` (trade-off) and

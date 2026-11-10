@@ -274,6 +274,11 @@ test('non-Latin native scripts pass intent and preserve their script', () => {
     }),
     [],
   );
+  const dutch = deriveDeterministicQueryCandidates({
+    sources: video('opties handelen'),
+    country: 'Netherlands', language: 'nl',
+  });
+  assert.ok(dutch.some(candidate => candidate.candidateText === 'opties handelen'));
   for (const title of ['高配当株', '株主優待']) {
     assert.ok(
       deriveDeterministicQueryCandidates({

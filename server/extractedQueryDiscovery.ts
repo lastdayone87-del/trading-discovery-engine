@@ -9,7 +9,7 @@
  */
 import { createHash } from 'node:crypto';
 import { detectLanguage } from './languageDetection';
-import { hasGovernedTradingSemantics, isSearchableTradingTerm } from './terminologySearchability';
+import { containsReviewedNativePhrase, hasGovernedTradingSemantics, isSearchableTradingTerm } from './terminologySearchability';
 
 export type ExtractedCandidateSourceKind = 'VIDEO_TITLE' | 'PLAYLIST_TITLE' | 'PLAYLIST_DESCRIPTION' | 'DESCRIPTION';
 
@@ -211,7 +211,9 @@ function hasTradingIntent(text: string, country?: string | null, language?: stri
   // such as "Apex" must not turn a gaming title into a trading query. Latin
   // text still needs a strong term or two weak trading terms above.
   const hasNonLatinScript = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Script=Tamil}\p{Script=Arabic}]/u.test(text);
-  if (hasNonLatinScript && hasGovernedTradingSemantics(text, { country, language })) return true;
+  const hasReviewedLatinPhrase = containsReviewedNativePhrase(text);
+  if ((hasNonLatinScript || hasReviewedLatinPhrase)
+    && hasGovernedTradingSemantics(text, { country, language })) return true;
   // Mixed native titles often carry their instrument as an ASCII ticker
   // (ETHの見方, DAX Analyse). Treat a known strong ticker as intent without
   // widening the generic native token list.
