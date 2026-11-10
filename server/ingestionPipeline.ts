@@ -372,7 +372,7 @@ export function buildDeferredTradingIntakeChannel(
   source: DiscoverySource,
   now: string,
   reasonCodes: string[],
-  countryState?: { country: string; status: CountryStatus; score: number },
+  countryState?: { country: string; status: CountryStatus; score: number; gateDisposition?: string },
 ): ChannelRecord {
   const channel: ChannelRecord = existing ? { ...existing } : {
     channel_id: candidate.channelId,
@@ -398,16 +398,13 @@ export function buildDeferredTradingIntakeChannel(
   channel.last_checked = now;
   channel.scan_attempts = existing?.scan_attempts || 0;
   if (countryState) {
-    const incomingResolved = countryState.status === 'CONFIRMED'
-      || countryState.status === 'LIKELY'
-      || countryState.status === 'REJECTED';
-    const existingResolved = existing?.country_status === 'CONFIRMED'
-      || existing?.country_status === 'LIKELY'
-      || existing?.country_status === 'REJECTED';
-    // A sparse rediscovery can produce an unresolved result while the caller
-    // still supplies the stored country as a fallback. Do not let that erase a
-    // previously resolved country decision.
-    if (incomingResolved || !existingResolved) {
+    // Preserve an existing resolved country only for genuinely sparse
+    // incoming evidence. A reviewable UNCERTAIN result that detected a
+    // different creator country must still replace the stored snapshot.
+    const preserveExistingCountry = Boolean(existing?.country)
+      && shouldPreserveResolvedCountry(existing?.country_status, countryState.status)
+      && countryState.gateDisposition !== 'NEEDS_REVIEW';
+    if (!preserveExistingCountry) {
       channel.country = countryState.country;
       channel.country_status = countryState.status;
       channel.confidence_score = countryState.score;
@@ -773,7 +770,12 @@ async function processChannelThroughPipelineInContext(
       source,
       now,
       retrievalTriage.reasonCodes,
-      deferredCountry ? { country: deferredCreatorCountry, status: deferredCountry.status, score: deferredCountry.score } : undefined,
+      deferredCountry ? {
+        country: deferredCreatorCountry,
+        status: deferredCountry.status,
+        score: deferredCountry.score,
+        gateDisposition: deferredCountry.gateDisposition,
+      } : undefined,
     );
     if (deferredCountry?.status === 'REJECTED' && deferredCreatorCountry) {
       // Match the main Gate-1 path: an unknown candidate is reported as
