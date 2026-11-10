@@ -55,10 +55,17 @@ export async function getReviewDetails(channelId:string) {
 }
 
 /** A retry of an already-committed decision must not be re-blocked by a new guard. */
-export async function hasReviewDecisionIdempotencyKey(idempotencyKey: string): Promise<boolean> {
+export async function hasReviewDecisionIdempotencyKey(
+  idempotencyKey: string,
+  channelId: string,
+  action: string,
+): Promise<boolean> {
   if (!idempotencyKey.trim()) return false;
   const db = await getDb();
-  const result = await db.query('SELECT 1 FROM channel_review_decisions WHERE idempotency_key=$1 LIMIT 1', [idempotencyKey]);
+  const result = await db.query(
+    'SELECT 1 FROM channel_review_decisions WHERE idempotency_key=$1 AND channel_id=$2 AND decision=$3 LIMIT 1',
+    [idempotencyKey, channelId, action],
+  );
   return (result.rowCount || 0) > 0;
 }
 
@@ -73,8 +80,10 @@ export async function decideReview(input:DecideInput) {
     await client.query('BEGIN');
     const prior=await client.query(`SELECT d.*,r.state,r.review_version current_review_version,c.trading_status,c.scan_status,c.discord_status
       FROM channel_review_decisions d JOIN channel_reviews r USING(channel_id) JOIN channels c USING(channel_id)
-      WHERE d.idempotency_key=$1`,[input.idempotencyKey]);
+      WHERE d.idempotency_key=$1 AND d.channel_id=$2`,[input.idempotencyKey,input.channelId]);
     if(prior.rowCount){const saved=prior.rows[0];await client.query('COMMIT');return {decision:saved,review:{state:saved.state,reviewVersion:saved.current_review_version},channel:{channelId:saved.channel_id,tradingStatus:saved.trading_status,scanStatus:saved.scan_status,discordStatus:saved.discord_status},queuePending:saved.state==='PENDING',idempotent:true};}
+    const keyOwner=await client.query('SELECT channel_id FROM channel_review_decisions WHERE idempotency_key=$1 LIMIT 1',[input.idempotencyKey]);
+    if(keyOwner.rowCount&&keyOwner.rows[0].channel_id!==input.channelId)throw new ReviewConflictError('Idempotency key belongs to another review.');
     // Canonical lock order is jobs -> channel. The migration 153 terminal-job
     // trigger already holds the job row before it touches the channel. Taking
     // the channel first here (the old order) let a worker hold the job while

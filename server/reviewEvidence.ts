@@ -270,6 +270,8 @@ export async function getReviewEvidence(
   const exactAssertionScope = snapshotScope && assertionScope.present && !assertionScope.malformed;
   const uniqueDocumentKeys = [...new Set(documentScope.keys)];
   const uniqueAssertionKeys = [...new Set(assertionScope.keys)];
+  const expectedDocumentCount = Math.min(250, uniqueDocumentKeys.length);
+  const expectedAssertionCount = Math.min(250, uniqueAssertionKeys.length);
   const fallbackCutoff = options.cutoff || (diagnosticRow ? new Date(diagnosticRow.created_at).toISOString() : undefined);
   const shouldQueryDocuments = !exactDocumentScope || uniqueDocumentKeys.length > 0;
   const shouldQueryAssertions = !exactAssertionScope || uniqueAssertionKeys.length > 0;
@@ -315,8 +317,10 @@ export async function getReviewEvidence(
   if (assertionScope.malformed) bundle.warnings.push('EVIDENCE_ASSERTION_SCOPE_MALFORMED');
   if (exactDocumentScope && documentScope.keys.length === 0) bundle.warnings.push('EVIDENCE_DOCUMENT_SCOPE_EMPTY');
   if (exactAssertionScope && assertionScope.keys.length === 0) bundle.warnings.push('EVIDENCE_ASSERTION_SCOPE_EMPTY');
-  if (exactDocumentScope && evidenceDocuments.length < uniqueDocumentKeys.length) bundle.warnings.push('EVIDENCE_DOCUMENT_SCOPE_INCOMPLETE');
-  if (exactAssertionScope && evidenceAssertions.length < uniqueAssertionKeys.length) bundle.warnings.push('EVIDENCE_ASSERTION_SCOPE_INCOMPLETE');
+  if (uniqueDocumentKeys.length > 250) bundle.warnings.push('EVIDENCE_DOCUMENT_SCOPE_TRUNCATED');
+  if (uniqueAssertionKeys.length > 250) bundle.warnings.push('EVIDENCE_ASSERTION_SCOPE_TRUNCATED');
+  if (exactDocumentScope && evidenceDocuments.length < expectedDocumentCount) bundle.warnings.push('EVIDENCE_DOCUMENT_SCOPE_INCOMPLETE');
+  if (exactAssertionScope && evidenceAssertions.length < expectedAssertionCount) bundle.warnings.push('EVIDENCE_ASSERTION_SCOPE_INCOMPLETE');
   if (diagnosticRow && !coverageUnavailable && evidenceCoverage.length === 0) bundle.warnings.push('EVIDENCE_COVERAGE_NOT_FOUND');
   if (documentsUnavailable) bundle.warnings.push('EVIDENCE_DOCUMENTS_UNAVAILABLE');
   if (assertionsUnavailable) bundle.warnings.push('EVIDENCE_ASSERTIONS_UNAVAILABLE');
