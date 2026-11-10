@@ -269,8 +269,12 @@ export function isReviewedNativePhrase(term: string): boolean {
 export function containsReviewedNativePhrase(term: string): boolean {
   const key = phraseKey(term);
   if (!key) return false;
-  return Object.values(REVIEWED_NATIVE_PHRASES)
-    .some(values => values.some(value => key.includes(phraseKey(value))));
+  return Object.values(REVIEWED_NATIVE_PHRASES).some(values => values.some(value => {
+    const phrase = phraseKey(value);
+    if (!phrase) return false;
+    const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, 'iu').test(key);
+  }));
 }
 
 /**

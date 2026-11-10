@@ -6,6 +6,7 @@ import {
   assessLlmQueryCandidates,
   normalizeExtractedCandidate,
 } from './extractedQueryDiscovery';
+import { containsReviewedNativePhrase } from './terminologySearchability';
 
 const video = (text: string) => [{ kind: 'VIDEO_TITLE' as const, index: 0, text }];
 
@@ -279,6 +280,8 @@ test('non-Latin native scripts pass intent and preserve their script', () => {
     country: 'Netherlands', language: 'nl',
   });
   assert.ok(dutch.some(candidate => candidate.candidateText === 'opties handelen'));
+  assert.equal(containsReviewedNativePhrase('opties handelen'), true);
+  assert.equal(containsReviewedNativePhrase('opties handelenx'), false);
   for (const title of ['高配当株', '株主優待']) {
     assert.ok(
       deriveDeterministicQueryCandidates({
