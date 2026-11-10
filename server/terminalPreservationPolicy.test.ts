@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ChannelRecord, DiscoverySource } from '../src/types';
-import { countryPolicySnapshotFromRow, countryPolicySnapshotMatches, machineNonTradingRediscoveryEligible, shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldRevalidateConfirmedCountry, shouldShortCircuitConfirmedRediscovery, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
+import { countryPolicySnapshotFromRow, countryPolicySnapshotMatches, machineNonTradingRediscoveryEligible, shouldPreserveResolvedCountry, shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldRevalidateConfirmedCountry, shouldShortCircuitConfirmedRediscovery, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
 
 const NOW = Date.parse('2026-08-16T04:00:00.000Z');
 
@@ -125,4 +125,13 @@ test('raw channel rows map snake_case country columns before comparison', () => 
     countryPolicySnapshotFromRow({ country_status: 'UNCERTAIN', country: '', trading_status: 'TRADING_CONFIRMED', scan_status: 'COMPLETED' }),
     { countryStatus: 'UNCERTAIN', country: '', tradingStatus: 'TRADING_CONFIRMED', scanStatus: 'COMPLETED' },
   );
+});
+
+test('a country-only pass never downgrades a resolved country to uncertain', () => {
+  assert.equal(shouldPreserveResolvedCountry('CONFIRMED', 'UNCERTAIN'), true);
+  assert.equal(shouldPreserveResolvedCountry('LIKELY', 'UNCERTAIN'), true);
+  assert.equal(shouldPreserveResolvedCountry('REJECTED', 'UNCERTAIN'), true);
+  assert.equal(shouldPreserveResolvedCountry('CONFIRMED', 'LIKELY'), false);
+  assert.equal(shouldPreserveResolvedCountry('UNCERTAIN', 'UNCERTAIN'), false);
+  assert.equal(shouldPreserveResolvedCountry(undefined, 'UNCERTAIN'), false);
 });

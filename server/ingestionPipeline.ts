@@ -37,7 +37,7 @@ import { enrichmentOperationalFailure, hasDecisionGradeEvidenceWithoutFailedProv
 import { recordAdmissionShadow } from './candidateAdmission/shadowEvaluator';
 import { recordReviewEligibilityShadow } from './reviewEligibility/store';
 import { evaluateReviewEligibilityV2, resolveReviewProviderDegraded } from './reviewEligibility/policy';
-import { shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldRevalidateConfirmedCountry, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
+import { shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldPreserveResolvedCountry, shouldRevalidateConfirmedCountry, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
 import { CANDIDATE_TRIAGE_POLICY_VERSION, hasIndependentTradingHypothesis, triageAutonomousSearchCandidate } from './candidateTriage';
 import { evaluateLowAudienceGate, parseSubscriberCountNumber, shouldReclassifyPreservedCompletedChannel, shouldStopDeepInspectionForForcedPass } from './lowAudienceGate';
 import { validatedDiscordEvidenceInvite } from './discordEvidence';
@@ -1085,9 +1085,11 @@ async function processChannelThroughPipelineInContext(
       trading_relevance_breakdown: tradingVal.breakdown
     };
 
-    uncertainChannel.country_status = countryVal.status;
-    uncertainChannel.country = creatorCountry;
-    uncertainChannel.confidence_score = countryVal.score;
+    if (!shouldPreserveResolvedCountry(existing?.country_status, countryVal.status)) {
+      uncertainChannel.country_status = countryVal.status;
+      uncertainChannel.country = creatorCountry;
+      uncertainChannel.confidence_score = countryVal.score;
+    }
     uncertainChannel.trading_status = finalUncertainStatus;
     uncertainChannel.trading_confidence_score = tradingVal.confidenceScore;
     uncertainChannel.trading_category = tradingVal.category;
@@ -1142,8 +1144,7 @@ async function processChannelThroughPipelineInContext(
     };
     // Preserve a previously validated country when this pass has no new
     // country evidence; only replace it with a resolved result.
-    const countryResolved = countryVal.status === 'CONFIRMED' || countryVal.status === 'LIKELY';
-    if (countryResolved || existing.country_status === 'UNCERTAIN' || !existing.country_status) {
+    if (!shouldPreserveResolvedCountry(lowAudienceSnapshot.countryStatus, countryVal.status)) {
       existing.country_status = countryVal.status;
       existing.country = creatorCountry;
       existing.confidence_score = countryVal.score;

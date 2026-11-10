@@ -74,6 +74,19 @@ export function shouldBypassPreservationForDiscordEvidence(
     && channel?.scan_status !== 'SKIPPED_EXCLUDED';
 }
 
+/**
+ * A country-only evidence pass must not downgrade a previously resolved
+ * country decision to UNCERTAIN just because this pass found nothing new.
+ */
+export function shouldPreserveResolvedCountry(
+  existingStatus: string | null | undefined,
+  incomingStatus: string | null | undefined,
+): boolean {
+  const resolved = (value: string | null | undefined) =>
+    value === 'CONFIRMED' || value === 'LIKELY' || value === 'REJECTED';
+  return resolved(existingStatus) && !resolved(incomingStatus);
+}
+
 export interface CountryPolicySnapshot {
   countryStatus?: string | null;
   country?: string | null;
