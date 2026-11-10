@@ -82,6 +82,70 @@ test('reviewed native method phrases are authorized as standalone surfaces', () 
   assert.equal(decision.eligible, true, decision.reasonCodes.join(','));
 });
 
+test('saved reviewed broker singles are rejected under the current standalone rule', () => {
+  for (const [text, country] of [['Bourse Direct', 'France'], ['XTB DAX', 'Germany'], ['Boursorama CAC 40', 'France']] as const) {
+    const decision = evaluateAutonomousQueryAuthority(query({
+      query: text,
+      country,
+      generation_metadata: {
+        queryTemplate: 'SINGLE_ATOM',
+        retrievalSpecificity: {
+          policyVersion: RETRIEVAL_SPECIFICITY_POLICY_VERSION,
+          eligibility: 'STANDALONE',
+          specificity: 62,
+          ambiguity: 48,
+        },
+        atoms: [{
+          type: 'BROKER',
+          origin: 'COUNTRY_VOCABULARY',
+          term: text,
+          retrievalPolicy: {
+            policyVersion: RETRIEVAL_SPECIFICITY_POLICY_VERSION,
+            eligibility: 'STANDALONE',
+            specificity: 62,
+            ambiguity: 48,
+            reasonCodes: ['REVIEWED_NATIVE_PHRASE'],
+          },
+        }],
+      },
+    } as any));
+    assert.equal(decision.eligible, false, `${text} must not execute alone`);
+    assert.ok(decision.reasonCodes.includes('REVIEWED_NATIVE_REQUIRES_COMPANION'));
+  }
+});
+
+test('saved reviewed market phrases are re-evaluated under the current standalone rule', () => {
+  for (const [text, country] of [['DAX Analyse heute', 'Germany'], ['Singapore market outlook', 'Singapore']] as const) {
+    const decision = evaluateAutonomousQueryAuthority(query({
+      query: text,
+      country,
+      generation_metadata: {
+        queryTemplate: 'SINGLE_ATOM',
+        retrievalSpecificity: {
+          policyVersion: RETRIEVAL_SPECIFICITY_POLICY_VERSION,
+          eligibility: 'STANDALONE',
+          specificity: 42,
+          ambiguity: 72,
+        },
+        atoms: [{
+          type: 'MARKET',
+          origin: 'COUNTRY_VOCABULARY',
+          term: text,
+          retrievalPolicy: {
+            policyVersion: RETRIEVAL_SPECIFICITY_POLICY_VERSION,
+            eligibility: 'STANDALONE',
+            specificity: 42,
+            ambiguity: 72,
+            requiredCompanionClasses: ['INSTRUMENT', 'METHOD'],
+            reasonCodes: ['REVIEWED_NATIVE_PHRASE'],
+          },
+        }],
+      },
+    } as any));
+    assert.equal(decision.eligible, true, `${text}: ${decision.reasonCodes.join(',')}`);
+  }
+});
+
 test('a deselected persistent promotion stops standalone native rows', () => {
   const metadata = {
     queryTemplate: 'SINGLE_ATOM',
@@ -115,6 +179,68 @@ test('a deselected persistent promotion stops standalone native rows', () => {
     generation_metadata: { ...metadata, promotionBasis: 'DIRECT_TARGET' },
   } as any);
   assert.equal(evaluateAutonomousQueryAuthority(direct, { scopePromotionActive: false }).eligible, true);
+});
+
+test('legacy reviewed broker atom-level companion requirement blocks a bare single', () => {
+  const decision = evaluateAutonomousQueryAuthority(query({
+    query: 'Bolero aandelen',
+    country: 'Belgium',
+    generation_metadata: {
+      queryTemplate: 'SINGLE_ATOM',
+      retrievalSpecificity: {
+        policyVersion: RETRIEVAL_SPECIFICITY_POLICY_VERSION,
+        eligibility: 'STANDALONE',
+        specificity: 62,
+        ambiguity: 48,
+      },
+      atoms: [{
+        type: 'BROKER',
+        origin: 'COUNTRY_VOCABULARY',
+        term: 'Bolero aandelen',
+        retrievalPolicy: {
+          policyVersion: RETRIEVAL_SPECIFICITY_POLICY_VERSION,
+          eligibility: 'STANDALONE',
+          specificity: 62,
+          ambiguity: 48,
+          requiredCompanionClasses: ['INSTRUMENT', 'METHOD'],
+          reasonCodes: ['REVIEWED_NATIVE_PHRASE'],
+        },
+      }],
+    },
+  } as any));
+  assert.equal(decision.eligible, false);
+  assert.ok(decision.reasonCodes.includes('REVIEWED_NATIVE_REQUIRES_COMPANION'));
+});
+
+test('reviewed method ignores legacy atom-level generic companion requirements', () => {
+  const decision = evaluateAutonomousQueryAuthority(query({
+    query: 'velas japonesas',
+    country: 'Spain',
+    generation_metadata: {
+      queryTemplate: 'SINGLE_ATOM',
+      scopePromoted: true,
+      retrievalSpecificity: {
+        policyVersion: RETRIEVAL_SPECIFICITY_POLICY_VERSION,
+        eligibility: 'STANDALONE',
+        specificity: 60,
+        ambiguity: 45,
+      },
+      atoms: [{
+        type: 'METHOD',
+        origin: 'COUNTRY_VOCABULARY',
+        term: 'velas japonesas',
+        retrievalPolicy: {
+          policyVersion: RETRIEVAL_SPECIFICITY_POLICY_VERSION,
+          eligibility: 'STANDALONE',
+          specificity: 60,
+          ambiguity: 45,
+          requiredCompanionClasses: ['INSTRUMENT', 'MARKET'],
+          reasonCodes: ['REVIEWED_NATIVE_PHRASE'],
+        },
+      }],
+    },
+  } as any), { scopePromotionActive: true });
+  assert.equal(decision.eligible, true, decision.reasonCodes.join(','));
 });
 
 test('autonomous candidate with no trading signal is withheld before expensive processing', () => {
@@ -183,4 +309,35 @@ test('multiple concrete market contexts can corroborate a retrieval hypothesis w
   }, 'automated_query', false);
   assert.equal(decision.disposition, 'PLAUSIBLE_TRADING_HYPOTHESIS');
   assert.ok(decision.reasonCodes.includes('MULTIPLE_MARKET_CONTEXT_SIGNALS_CORROBORATE_RETRIEVAL'));
+});
+
+
+test('reviewed native market rows with retained companion requirements cannot execute alone', () => {
+  const decision = evaluateAutonomousQueryAuthority(query({
+    query: 'STI analysis',
+    country: 'Singapore',
+    generation_metadata: {
+      queryTemplate: 'SINGLE_ATOM',
+      retrievalSpecificity: {
+        policyVersion: RETRIEVAL_SPECIFICITY_POLICY_VERSION,
+        eligibility: 'STANDALONE',
+        ambiguity: 72,
+        requiredCompanionClasses: ['INSTRUMENT', 'METHOD', 'STRATEGY', 'PLATFORM'],
+      },
+      atoms: [{
+        type: 'MARKET',
+        origin: 'COUNTRY_VOCABULARY',
+        term: 'STI analysis',
+        retrievalPolicy: {
+          policyVersion: RETRIEVAL_SPECIFICITY_POLICY_VERSION,
+          eligibility: 'STANDALONE',
+          ambiguity: 72,
+          requiredCompanionClasses: ['INSTRUMENT', 'METHOD', 'STRATEGY', 'PLATFORM'],
+          reasonCodes: ['REVIEWED_NATIVE_PHRASE', 'AMBIGUOUS_MARKET_CONTEXT_REQUIRES_COMPANION'],
+        },
+      }],
+    },
+  } as any));
+  assert.equal(decision.eligible, false);
+  assert.ok(decision.reasonCodes.includes('REVIEWED_NATIVE_REQUIRES_COMPANION'));
 });

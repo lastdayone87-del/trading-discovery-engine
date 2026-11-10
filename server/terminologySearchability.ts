@@ -96,6 +96,8 @@ const MATH_ALPHANUMERIC = /[\u{1D400}-\u{1D7FF}]/u;
 const COUNTRY_SCRIPTS: Record<string, ReadonlySet<string>> = {
   Japan: new Set(['Jpan', 'Hani', 'Latn']),
   'United Arab Emirates': new Set(['Arab', 'Latn']),
+  // Tamil is an official Singapore language; a Singapore query may legitimately
+  // return Tamil-language creators even when the query itself is Latin.
   Singapore: new Set(['Latn', 'Hani', 'Taml']),
 };
 const LATIN_COUNTRIES = new Set([
@@ -111,12 +113,20 @@ const SCRIPT_PATTERNS: Array<[string, RegExp]> = [
   ['Hani', /\p{Script=Han}/u],
   ['Jpan', /[\p{Script=Katakana}\p{Script=Hiragana}]/u],
   ['Cyrl', /\p{Script=Cyrillic}/u],
+  ['Grek', /\p{Script=Greek}/u],
   ['Arab', /\p{Script=Arabic}/u],
   ['Hang', /\p{Script=Hangul}/u],
   ['Deva', /\p{Script=Devanagari}/u],
   ['Hebr', /\p{Script=Hebrew}/u],
   ['Thai', /\p{Script=Thai}/u],
+  ['Gujr', /\p{Script=Gujarati}/u],
   ['Taml', /\p{Script=Tamil}/u],
+  ['Telu', /\p{Script=Telugu}/u],
+  ['Knda', /\p{Script=Kannada}/u],
+  ['Mlym', /\p{Script=Malayalam}/u],
+  ['Guru', /\p{Script=Gurmukhi}/u],
+  ['Beng', /\p{Script=Bengali}/u],
+  ['Sinh', /\p{Script=Sinhala}/u],
   ['Latn', /\p{Script=Latin}/u],
 ];
 
@@ -141,6 +151,46 @@ function scriptsOf(value: string): Set<string> {
     out.add(/[\p{Script=Common}\p{Script=Inherited}]/u.test(char) ? 'Zyyy' : 'Zzzz');
   }
   return out;
+}
+
+/**
+ * Script profile used by the post-retrieval query consistency check. Returns
+ * null for countries without a declared profile so callers fail open and never
+ * hold a query for an unsupported market. The profile is intentionally
+ * conservative: Latin-script markets accept Latin results; multilingual
+ * markets add their official/expected scripts.
+ */
+export function expectedScriptsForCountry(country: string): ReadonlySet<string> | null {
+  const normalized = String(country || '').trim();
+  if (!normalized) return null;
+  if (Object.prototype.hasOwnProperty.call(COUNTRY_SCRIPTS, normalized)) return COUNTRY_SCRIPTS[normalized];
+  if (LATIN_COUNTRIES.has(normalized)) return new Set(['Latn']);
+  return null;
+}
+
+/** Every script represented by at least one letter in the value. */
+export function detectScripts(value: string): string[] {
+  return [...scriptsOf(value)].filter(script => script !== 'Zyyy');
+}
+
+/**
+ * The script that carries the most letters in a field. Used by the result
+ * consistency guard so a few Latin acronyms in a Marathi/Gujarati bio cannot
+ * make the field look Latin-compatible. Common/Inherited characters are
+ * ignored; ties return null (no dominant script).
+ */
+export function dominantScript(value: string): string | null {
+  const counts = new Map<string, number>();
+  for (const char of normalize(value)) {
+    if (!/\p{L}/u.test(char)) continue;
+    if (/[\p{Script=Common}\p{Script=Inherited}]/u.test(char)) continue;
+    const script = SCRIPT_PATTERNS.find(([, pattern]) => pattern.test(char))?.[0] || 'Zzzz';
+    counts.set(script, (counts.get(script) || 0) + 1);
+  }
+  const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  if (!ranked.length) return null;
+  if (ranked.length > 1 && ranked[0][1] === ranked[1][1]) return null;
+  return ranked[0][0];
 }
 
 function normalize(term: string): string {

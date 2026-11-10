@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ExtractedTermRecord, QueryRecord } from '../src/types';
-import { isCountryScriptCompatible, isRetrievalOrientedQuery, limitRepeatedPrimaryTerms, normalizeQuery, planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, queriesOutsideCooldown, queryTokenCount, rotateAwayFromMostRecentIntent } from './queryPlanner';
+import { isCountryScriptCompatible, isRetrievalOrientedQuery, isReviewedNativeStandaloneSurface, limitRepeatedPrimaryTerms, normalizeQuery, planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, queriesOutsideCooldown, queryTokenCount, rotateAwayFromMostRecentIntent } from './queryPlanner';
 import { ORGANIC_QUERY_POLICY_VERSION } from './organicQueryExpansion';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
 import { admitQueryRecord } from './queryQuality/admission';
@@ -244,12 +244,15 @@ test('planner produces novel local instrument-market variants when every current
   });
   assert.equal(planned.length, 8);
   assert.ok(planned.every(item => !existing.some(saved => normalizeQuery(saved.query) === normalizeQuery(item.query))));
-  // Native local singles are now part of the pool, but the instrument-market
-  // fallback shape must still be available for a fully cooling-down library.
+  // Ambiguous native market/broker surfaces must never become singles; they
+  // remain useful as companion-shaped queries. The instrument-market fallback
+  // must still be available for a fully cooling-down library.
   const instrumentMarket = planned.filter(item => item.metadata.queryTemplate === 'INSTRUMENT_MARKET');
   assert.ok(instrumentMarket.length > 0, 'no novel instrument-market fallback was planned');
   assert.ok(instrumentMarket.every(item => /BEL|EURUSD/i.test(item.query)));
-  assert.ok(planned.some(item => item.metadata.queryTemplate === 'SINGLE_ATOM'));
+  assert.equal(planned.some(item => normalizeQuery(item.query) === normalizeQuery('Bolero aandelen')), false);
+  assert.ok(planned.some(item => /Bolero aandelen/.test(item.query)
+    && ((item.metadata as any).atoms as unknown[]).length >= 2));
 });
 
 test('accepted extracted queries are planned as standalone surfaces and pass admission/authority', () => {
@@ -489,4 +492,73 @@ test('short-ticker atoms survive to form qualified pairs but never search alone'
     `expected a qualified OBX pair among: ${queries.join(' | ')}`,
   );
   assert.ok(queries.every(query => isRetrievalOrientedQuery('Norway', query)));
+});
+
+
+test('ambiguous reviewed-native market and broker surfaces are never planned as standalone queries', () => {
+  const singapore = planDiverseQueries({ country: 'Singapore', count: 12, learnedVocabulary: [], existingQueries: [] });
+  const belgium = planDiverseQueries({ country: 'Belgium', count: 12, learnedVocabulary: [], existingQueries: [] });
+  const all = [...singapore, ...belgium];
+
+  const normalized = all.map(item => normalizeQuery(item.query));
+  assert.equal(normalized.includes(normalizeQuery('STI analysis')), false);
+  assert.equal(normalized.includes(normalizeQuery('Bolero aandelen')), false);
+  assert.equal(normalized.includes(normalizeQuery('DBS Vickers')), false);
+
+  for (const item of all.filter(entry => /sti analysis|bolero aandelen|dbs vickers/i.test(normalizeQuery(entry.query)))) {
+    const atoms = (item.metadata as any).atoms as Array<Record<string, unknown>>;
+    assert.ok(atoms.length >= 2, `${item.query} must retain an authorized companion`);
+  }
+});
+
+test('reviewed native trading methods remain standalone while ambiguous markets do not', () => {
+  // A normal 10-query batch must keep at least one reviewed method standalone.
+  const spain10 = planDiverseQueries({ country: 'Spain', count: 10, learnedVocabulary: [], existingQueries: [] });
+  assert.ok(spain10.some(item => normalizeQuery(item.query) === normalizeQuery('velas japonesas')
+    && item.metadata.queryTemplate === 'SINGLE_ATOM'));
+  // At a larger batch both reviewed methods must be represented; this is not
+  // a substitute for the normal-count assertion above.
+  const spain20 = planDiverseQueries({ country: 'Spain', count: 20, learnedVocabulary: [], existingQueries: [] });
+  assert.ok(spain20.some(item => normalizeQuery(item.query) === normalizeQuery('operativa intradía')
+    && item.metadata.queryTemplate === 'SINGLE_ATOM'));
+
+  const singapore = planDiverseQueries({ country: 'Singapore', count: 12, learnedVocabulary: [], existingQueries: [] });
+  assert.equal(singapore.some(item => normalizeQuery(item.query) === normalizeQuery('STI analysis')), false);
+});
+
+test('reviewed standalone rule keeps broker surfaces out and Arabic qualifiers in', () => {
+  assert.equal(isReviewedNativeStandaloneSurface({ term: 'Bourse Direct', type: 'BROKER', specificity: 62, ambiguity: 48 }), false);
+  assert.equal(isReviewedNativeStandaloneSurface({ term: 'Boursorama CAC 40', type: 'MARKET', specificity: 42, ambiguity: 72 }), false);
+  assert.equal(isReviewedNativeStandaloneSurface({ term: 'XTB DAX', type: 'MARKET', specificity: 42, ambiguity: 72 }), false);
+  assert.equal(isReviewedNativeStandaloneSurface({ term: 'STI analysis today', type: 'MARKET', specificity: 42, ambiguity: 72 }), false);
+  assert.equal(isReviewedNativeStandaloneSurface({ term: 'DAX Analyse heute', type: 'MARKET', specificity: 42, ambiguity: 72 }), true);
+  assert.equal(isReviewedNativeStandaloneSurface({ term: 'تحليل السوق', type: 'MARKET', specificity: 42, ambiguity: 72 }), true);
+});
+
+test('reviewed native proposal does not stutter an anchor already in the phrase', () => {
+  const native = planCountryNativeProposalQuery({
+    country: 'Germany',
+    nativeTerm: 'DAX Analyse',
+    targetIntent: 'market_analysis',
+    allocationLineage: {},
+  });
+  if (native) {
+    assert.notEqual(normalizeQuery(native.query), normalizeQuery('DAX DAX Analyse'));
+    assert.notEqual(normalizeQuery(native.query), normalizeQuery('DAX DAX'));
+  }
+});
+
+
+test('specific multi-token native market phrases remain standalone without stuttering pairs', () => {
+  const germany = planDiverseQueries({ country: 'Germany', count: 20, learnedVocabulary: [], existingQueries: [] });
+  const singapore = planDiverseQueries({ country: 'Singapore', count: 12, learnedVocabulary: [], existingQueries: [] });
+  assert.ok(germany.some(item => normalizeQuery(item.query) === normalizeQuery('DAX Analyse heute')
+    && item.metadata.queryTemplate === 'SINGLE_ATOM'));
+  assert.ok(singapore.some(item => normalizeQuery(item.query) === normalizeQuery('Singapore market outlook')
+    && item.metadata.queryTemplate === 'SINGLE_ATOM'));
+  for (const item of [...germany, ...singapore]) {
+    const normalized = normalizeQuery(item.query);
+    assert.notEqual(normalized, normalizeQuery('DAX Orderflow DAX'));
+    assert.notEqual(normalized, normalizeQuery('DAX XTB DAX'));
+  }
 });
