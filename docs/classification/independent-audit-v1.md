@@ -1,0 +1,94 @@
+# Independent Classification Audit v1
+
+**Status:** evidence report for the deterministic-first classifier. No production decisions were changed to produce this report.
+
+## Methodology
+
+- **Sampling:** 300 channels stratified from real production classification evidence:
+  - 100 from `TRADING_CONFIRMED`
+  - 50 from `NON_TRADING`
+  - 75 from `NEEDS_REVIEW`
+  - 75 from `UNCERTAIN`
+- **Prediction-blind worklist:** each row contained only the channel id/name, country, bio, video titles/descriptions, and links. Production status and classifier suggestions were excluded from the labeling file.
+- **Independent audit:** six batches of 50 channels were audited from the raw evidence. Every decisive label required supporting quotes; every quote was checked as an exact substring of the cited field.
+- **Labels:** `TRADING_CONFIRMED` (165), `NON_TRADING` (56), `UNCERTAIN` (79). The labels do not use production classifications as ground truth.
+- **Diagnostic coverage:** 250 of the 300 audited channels had a production classification diagnostic suitable for full-engine replay.
+
+## Results
+
+For the 221 decisive human labels:
+
+| Evaluated decision | Precision | Recall | FPR | FNR | Coverage |
+|---|---:|---:|---:|---:|---:|
+| Stored full engine decision | 95.9% | 70.3% | 8.9% | 0.0% | 74.7% |
+| New routing + precision guard | **100.0%** | 69.1% | **0.0%** | **0.0%** | 71.5% |
+| Deterministic-only engine | **100.0%** | 64.8% | **0.0%** | **0.0%** | 49.3% |
+
+- Confusion matrix for the routing + guard: TP 114, FP 0, TN 44, FN 0.
+- The deterministic-only engine resolves obvious trading channels without semantic spend and without false positives in this sample.
+- The new routing guard escalates confirmed channels to human review when the video sample repeatedly contradicts the bio. It never rejects.
+
+### Country breakdown (stored engine → routing)
+
+| Country | Decisive labels | Stored precision | Stored recall | Routing precision | Routing recall |
+|---|---:|---:|---:|---:|---:|
+| Unknown | 104 | 97.8% | 62.5% | 100% | 62.5% |
+| United States | 50 | 93.9% | 79.5% | 100% | 76.9% |
+| Germany | 20 | 100% | 76.5% | 100% | 76.5% |
+| United Kingdom | 11 | 100% | 90.0% | 100% | 90.0% |
+| France | 6 | 100% | 66.7% | 100% | 66.7% |
+| United Arab Emirates | 5 | 75.0% | 100% | 100% | 100% |
+| Australia | 5 | 100% | 60.0% | 100% | 40.0% |
+| Canada | 5 | n/a (all abstained) | n/a | n/a | n/a |
+
+### Script breakdown
+
+| Script | Decisive labels | Stored precision | Stored recall | Routing precision | Routing recall |
+|---|---:|---:|---:|---:|---:|
+| Latin | 201 | 96.5% | 72.8% | 100% | 71.5% |
+| Mixed/multi-script | 20 | 85.7% | 42.9% | 100% | 42.9% |
+
+## False positives found in the stored full engine
+
+All five were escalated to human review by the new precision guard:
+
+1. **AEX NL** — stock-exchange corporate/ceremonial channel, not trading content.
+2. **Trading Live: Stock Forex Cryptocurrency** — trading keyword bio but dance/music uploads.
+3. **Rachel Cruze** — personal finance/debt/budgeting, not financial-market trading.
+4. **Crypto Woman** — sponsored NFT/play-to-earn promotions, not trading analysis.
+5. **Pino** — memecoin marketing/skits, not trading analysis.
+
+## False negatives
+
+None observed among the 221 decisive labels. This is a small sample; zero observed false negatives does not prove zero population false negatives.
+
+## Unresolved cases
+
+79 channels were labeled `UNCERTAIN` because the available evidence was genuinely insufficient or mixed. Examples:
+
+- **Andy Campillo** — multi-topic lifestyle channel where trading is one of several pillars; no videos available.
+- **Analyshasse** — mostly lifestyle/wealth clips; trading appears through a community link and one earnings video.
+- **CoderForTraders** — single bio line about trading-product development; no corroborating videos.
+- **Nq Zeus** — two trading repost clips mixed with an unrelated broadcast.
+- **Crypto Hulk** — crypto news/opinion and buy calls with a broker affiliate, without clear trading education or analysis.
+
+These cases require more evidence or operator judgment; they are not counted as correct or incorrect in precision/recall.
+
+## Limitations
+
+- Labels are an independent **AI-assisted evidence audit** with exact quotes, not operator-entered human labels. The classification audit console lets operators inspect and correct every label.
+- Negative sample size is 56; FPR estimates have wide uncertainty.
+- 50 audited channels had no production diagnostic and are excluded from the full-engine comparison.
+- The sample is stratified by production cohort; it is not a uniform random sample of all channels.
+- `TRADING_CONFIRMED` vs finance-adjacent (personal finance, investing, exchange corporate, crypto promotion) is a judgment boundary. The report uses a trading-activity/analysis/education definition.
+
+## Reproduction
+
+```bash
+npm run classification:seed-audit
+npm run classification:import-audit-labels
+npm run classification:evaluate-audit
+npx tsx scripts/evaluateClassificationAuditFull.ts
+```
+
+The worklist, labels, diagnostics export, and full evaluation JSON are generated under the configured audit data directory. The commands are read-only with respect to production classification decisions; the seed/import commands write only audit items and labels.
