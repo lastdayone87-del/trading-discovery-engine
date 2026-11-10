@@ -250,7 +250,7 @@ export function assessIntakeTradingFocus(input: IntakeTradingFocusInput): Intake
   // hypothesis established by two independent market families. They still
   // block a single ambiguous market word below.
   const blockingSoft = soft.filter(name => name !== 'EDUCATION_FORMAT');
-  if (new Set(market).size >= 2 && !blockingSoft.length && !additional.length) {
+  if (new Set(market).size >= 2 && !blockingSoft.length && !additional.length && !hardChannel.length) {
     return decision('ADMIT', ['MULTIPLE_MARKET_CONTEXT_SIGNALS_CORROBORATE_RETRIEVAL'], positiveFamilies, negativeFamilies, matchedSignals);
   }
 

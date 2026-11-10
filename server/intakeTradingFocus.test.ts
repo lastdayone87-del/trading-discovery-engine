@@ -175,6 +175,16 @@ test('deferred channel persistence uses INTAKE_DEFERRED and does not manufacture
   assert.equal(channel.inspection_trail.at(-1)?.step, 'BIO');
 });
 
+test('incidental market words do not admit a music channel with a hard domain signal', () => {
+  const decision = assessIntakeTradingFocus({
+    channelName: 'Backstage Sessions',
+    description: 'Official music video. Streaming options available.',
+    videoTitles: ['Artist shares backstage footage'],
+    matchedDocument: { type: 'VIDEO', title: 'Backstage Sessions', description: 'Official music video.' },
+  });
+  assert.notEqual(decision.decision, 'ADMIT');
+});
+
 test('generic hard-negative words in video text defer instead of withholding a market channel', () => {
   const decision = assessIntakeTradingFocus({
     channelName: 'DAX Weekly',
