@@ -41,7 +41,7 @@ function inputFromRow(row: any): RawChannelInput {
     video_titles: normalizedVideos.map((video: any) => video.title),
     video_descriptions: normalizedVideos.map((video: any) => video.description),
     videos: normalizedVideos,
-    external_links: [],
+    external_links: row.external_links ?? row.links ?? [],
     enrichment_stage: Number(row.enrichment_stage ?? row.enrichmentStage ?? 0),
     videoDescriptionsAuthoritative: row.videoDescriptionsAuthoritative === true,
     ...(row.search_match_context || row.searchMatchContext

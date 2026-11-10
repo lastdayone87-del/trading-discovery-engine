@@ -48,10 +48,11 @@ function metrics(rows: any[], predictor: (row: any) => string | null) {
 }
 
 const rows: any[] = [];
+let unmatchedLabels = 0;
 for (const label of labels) {
   const item = work.get(label.itemId);
   const source = manifest.get(label.itemId);
-  if (!item || !source) continue;
+  if (!item || !source) { unmatchedLabels += 1; continue; }
   const diagnostic = diagnostics.get(item.channelId);
   const decision = diagnostic?.decision || null;
   let routing: any = null;
@@ -111,6 +112,7 @@ const report = {
       UNCERTAIN: rows.filter(row => row.auditLabel === 'UNCERTAIN').length,
     },
     withProductionDiagnostic: withDiagnostic.length,
+    unmatchedLabels,
   },
   fullStoredDecision: metrics(withDiagnostic, row => row.storedPrediction),
   deterministicRoutingOnStoredDecision: metrics(withDiagnostic, row => row.routePrediction),
