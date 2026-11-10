@@ -82,7 +82,7 @@ test('fixture metadata quality follows the same rule as persisted reviews', () =
 });
 
 test('deferred review migration and decision path preserve human evidence and labels', () => {
-  const migration = readFileSync(new URL('./db/migrations/175_intake_deferred_review.sql', import.meta.url), 'utf8');
+  const migration = readFileSync(new URL('./db/migrations/176_intake_deferred_review.sql', import.meta.url), 'utf8');
   assert.match(migration, /CREATE TABLE IF NOT EXISTS intake_deferred_reviews/);
   assert.match(migration, /CREATE TABLE IF NOT EXISTS intake_deferred_review_decisions/);
   assert.match(migration, /CREATE TABLE IF NOT EXISTS human_evaluation_samples/);
