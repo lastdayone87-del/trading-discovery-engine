@@ -176,3 +176,10 @@ test('research cycle trigger enforces admin authentication at the middleware lay
   assert.deepEqual(await run('operator'),{next:false,status:403});
   assert.deepEqual(await run(undefined),{next:false,status:401});
 });
+
+test('review evidence is an explicit operator-only read route',()=>{
+  const matching=routePolicyInventory.filter(item=>item.method==='GET'&&new RegExp(item.pattern).test('/api/reviews/UC123/evidence'));
+  assert.equal(matching.length,1,'/api/reviews/:id/evidence must resolve to exactly one explicit route policy');
+  assert.equal(matching[0].policy,'operator');
+  assert.equal(matching[0].action,'review.evidence.read');
+});
