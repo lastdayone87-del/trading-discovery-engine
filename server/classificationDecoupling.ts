@@ -252,6 +252,7 @@ export interface ClassificationJobPayload {
   catalogPin?: unknown;
   quotaOrigin: 'NORMAL' | 'PROBE';
   forceExtraction: boolean;
+  forceClassification?: boolean;
 }
 
 export function buildClassificationJobPayload(input: {
@@ -266,6 +267,7 @@ export function buildClassificationJobPayload(input: {
   catalogPin?: unknown;
   quotaOrigin: 'NORMAL' | 'PROBE';
   forceExtraction: boolean;
+  forceClassification?: boolean;
 }): ClassificationJobPayload {
   return {
     channelId: input.candidate.channelId,
@@ -280,6 +282,7 @@ export function buildClassificationJobPayload(input: {
     ...(input.catalogPin !== undefined ? { catalogPin: input.catalogPin } : {}),
     quotaOrigin: input.quotaOrigin,
     forceExtraction: input.forceExtraction,
+    ...(input.forceClassification ? { forceClassification: true } : {}),
   };
 }
 

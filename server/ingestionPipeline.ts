@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { ChannelRecord, DiscoverySource, DiscordStatus } from '../src/types';
 import { DiscoveredChannelRaw, classifierLanguageInputs, fetchYouTubeChannelCountryMetadata } from './youtube';
-import { aggregatedLanguageCandidateSet, validateChannelCountry } from './countryValidator';
+import { aggregatedLanguageCandidateSet, validateChannelCountry, type ValidationResult } from './countryValidator';
 import { bumpGate1Evaluation } from './operationsTelemetry';
 import type { AcquisitionLane } from './acquisitionLaneKeys';
 import { resolveScopeEligibility } from './scopeEligibility';
@@ -13,11 +13,13 @@ import { applyPublicAboutToCandidate, fetchLiveYouTubeChannelData, shouldAttempt
 import {
   getChannelById,
   upsertChannel,
+  upsertChannelWithResult,
   enqueueJob,
   getJobByIdempotencyKey,
   getQuota,
   getAppSetting,
-  getDb
+  getDb,
+  hasActiveEnrichmentJob
 } from './db';
 import { calculateCreatorQualityScore, extractVocabularyFromCreator, invokeChannelVocabularyExtraction, replayVocabularyForRetry, resolveExtractionVideoIds } from './queryIntelligence';
 import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
@@ -38,9 +40,10 @@ import { enrichmentOperationalFailure, hasDecisionGradeEvidenceWithoutFailedProv
 import { recordAdmissionShadow } from './candidateAdmission/shadowEvaluator';
 import { recordReviewEligibilityShadow } from './reviewEligibility/store';
 import { evaluateReviewEligibilityV2, resolveReviewProviderDegraded } from './reviewEligibility/policy';
-import { shouldPreserveExistingChannel } from './terminalPreservationPolicy';
+import { shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldPreserveResolvedCountry, shouldRevalidateConfirmedCountry, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
 import { CANDIDATE_TRIAGE_POLICY_VERSION, hasIndependentTradingHypothesis, triageAutonomousSearchCandidate } from './candidateTriage';
 import { evaluateLowAudienceGate, parseSubscriberCountNumber, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
+import { validatedDiscordEvidenceInvite } from './discordEvidence';
 import { shouldReactivateCommunityRecovery, reactivateCommunityRecovery } from './communityRecovery';
 import { maybeRunDiscoveryEvidenceExtraction } from './discovery/evidencePipeline';
 import {
@@ -50,6 +53,8 @@ import {
   runWithOfficialYouTubeQuotaOrigin,
 } from './officialYouTubeQuotaFence';
 import { resolvePipelineQuotaOrigin } from './quotaOrigin';
+import { isProbeQuotaControlError, YouTubeKeyCapUnavailableError } from './quotaKeyCapShadow';
+import { isYouTubeQuotaAccountingError } from './youtubeKeyHealth';
 
 // Extraction is best-effort and flag-gated, but a burst of ingestion jobs must
 // not open hundreds of concurrent staging transactions. Serialize the
@@ -198,6 +203,167 @@ export interface PipelineExecutionOptions {
   /** Phase 0 acquisition lane for durable lane telemetry (optional). */
   lane?: AcquisitionLane;
   jobType?: string;
+  /** Discord-evidence reclassification must evaluate a previously COMPLETED
+   * row once; confirmed rows remain terminal. */
+  forceClassification?: boolean;
+}
+
+/**
+ * Shared country-evidence hydration for the ordinary Gate-1 pass and the
+ * confirmed-row country-only revalidation. A confirmed row skips trading
+ * classification, but it must still fetch the same official metadata and
+ * keyless About fallback before deciding that country remains unresolved.
+ */
+async function validateCountryWithHydration(
+  candidate: IngestionCandidate,
+  existing: ChannelRecord | null,
+  targetCountry: string,
+  now: string,
+  options: { includeAudience?: boolean } = {},
+): Promise<ValidationResult> {
+  const build = () => validateChannelCountry({
+    channelName: candidate.channelName,
+    description: candidate.description,
+    videoTitles: candidate.videoTitles,
+    locationTag: candidate.locationTag,
+    externalLinks: candidate.channelLinks,
+    metadataStatus: candidate.countryMetadataStatus,
+    videoDescriptions: candidate.videoDescriptions,
+    videoDescriptionsAuthoritative: candidate.videoDescriptionsAuthoritative,
+    playlists: candidate.playlists,
+  }, targetCountry);
+  let countryVal = await build();
+  const includeAudience = options.includeAudience === true;
+  const subscriberEvidenceMissing = includeAudience && evaluateLowAudienceGate(candidate.subscriberCount).reasonCode === 'SUBSCRIBER_COUNT_UNAVAILABLE';
+  const needsCountryHydration = countryVal.status === 'UNCERTAIN' && candidate.countryMetadataStatus !== 'AVAILABLE_NOT_DECLARED';
+  if (needsCountryHydration || subscriberEvidenceMissing) {
+    const hydrated = await fetchYouTubeChannelCountryMetadata(candidate.channelId, candidate);
+    Object.assign(candidate, hydrated);
+    countryVal = await build();
+  }
+  const subscriberEvidenceMissingAfterOfficial = includeAudience && evaluateLowAudienceGate(candidate.subscriberCount).reasonCode === 'SUBSCRIBER_COUNT_UNAVAILABLE';
+  const publicAboutStatus = (candidate as any).publicAboutStatus || existing?.public_about_status || 'NOT_ATTEMPTED';
+  const publicAboutAttempts = Number((candidate as any).publicAboutAttempts ?? existing?.public_about_attempts ?? 0);
+  const publicAboutAttempted = Boolean(
+    (candidate as any).publicAboutAttempted ||
+    publicAboutStatus === 'ATTEMPTED_SUCCEEDED' ||
+    publicAboutStatus === 'ATTEMPTED_EMPTY' ||
+    existing?.inspection_trail?.some(s => s.details?.includes('Public About') || s.title?.includes('Live About'))
+  );
+  const countryFallbackWanted = shouldAttemptPublicAboutCountryFallback({
+    countryStatus: countryVal.status,
+    countryMetadataStatus: candidate.countryMetadataStatus,
+    description: candidate.description,
+    publicAboutStatus,
+    publicAboutAttempts,
+    publicAboutAttempted,
+  });
+  const countryAlreadyRejected = countryVal.status === 'REJECTED'
+    || countryVal.gateDisposition === 'REJECT_EXCLUDED'
+    || countryVal.gateDisposition === 'REJECT_UNSUPPORTED';
+  const subscriberFallbackWanted = includeAudience
+    && subscriberEvidenceMissingAfterOfficial
+    && candidate.countryMetadataStatus === 'UNAVAILABLE'
+    && !countryAlreadyRejected
+    && publicAboutAttempts < 2;
+  if (countryFallbackWanted || subscriberFallbackWanted) {
+    const beforeDescription = candidate.description;
+    const beforeLinks = [...(candidate.channelLinks || [])];
+    (candidate as any).publicAboutAttempted = true;
+    (candidate as any).publicAboutAttempts = publicAboutAttempts + 1;
+    (candidate as any).publicAboutCheckedAt = now;
+    candidate.countryMetadataCheckedAt = now;
+    try {
+      const liveAbout = await fetchLiveYouTubeChannelData(candidate.youtubeUrl);
+      if (applyPublicAboutToCandidate(candidate, liveAbout)) {
+        (candidate as any).publicAboutStatus = 'ATTEMPTED_SUCCEEDED';
+        const afterLinks = candidate.channelLinks || [];
+        const linksChanged = afterLinks.length !== beforeLinks.length
+          || afterLinks.some((link, index) => link !== beforeLinks[index]);
+        if (countryFallbackWanted || candidate.description !== beforeDescription || linksChanged) {
+          countryVal = await build();
+        }
+      } else {
+        (candidate as any).publicAboutStatus = liveAbout ? 'ATTEMPTED_EMPTY' : 'ATTEMPTED_FAILED';
+      }
+    } catch (error) {
+      (candidate as any).publicAboutStatus = 'ATTEMPTED_FAILED';
+      console.warn(`[Unified Ingestion Pipeline - Gate 1] Public About fallback failed for ${candidate.channelId}:`, error instanceof Error ? error.message : error);
+    }
+  }
+  return countryVal;
+}
+
+export interface ConfirmedCountryRevalidationResult {
+  countryChecked: boolean;
+  rejectionApplied: boolean;
+}
+
+export interface ConfirmedCountryRevalidationDeps {
+  hydrate?: (
+    candidate: IngestionCandidate,
+    existing: ChannelRecord,
+    targetCountry: string,
+    now: string,
+  ) => Promise<ValidationResult>;
+}
+
+/**
+ * Country-only revalidation for a preserved TRADING_CONFIRMED row. Trading
+ * classification is never re-run; the function gathers country evidence,
+ * applies the rejection projection, and reports whether the row changed.
+ * Quota policy/accounting failures propagate to the caller's retry lifecycle.
+ */
+export async function revalidateConfirmedCountryForPreservedRow(
+  candidate: IngestionCandidate,
+  existing: ChannelRecord,
+  targetCountry: string,
+  now: string,
+  deps: ConfirmedCountryRevalidationDeps = {},
+): Promise<ConfirmedCountryRevalidationResult> {
+  try {
+    // Search results can be sparse. Use the same official metadata and public
+    // About hydration as Gate 1 before preserving the confirmed trading
+    // decision; only trading classification is skipped.
+    const hydrate = deps.hydrate
+      || ((input: IngestionCandidate, row: ChannelRecord, country: string, at: string) =>
+        validateCountryWithHydration(input, row, country, at, { includeAudience: false }));
+    const countryCheck = await hydrate(candidate, existing, targetCountry, now);
+    applyCandidateObservability(existing, candidate);
+    if (countryCheck.status === 'REJECTED' && countryCheck.detectedCreatorCountry) {
+      applyGate1CountryRejectionToExisting(existing, {
+        creatorCountry: countryCheck.detectedCreatorCountry,
+        score: countryCheck.score,
+        validationStep: {
+          step: 'COUNTRY_VALIDATION',
+          title: `Country Validation (${countryCheck.detectedCreatorCountry})`,
+          status: 'REJECTED',
+          details: countryCheck.decisionLogs,
+          timestamp: now,
+        },
+        now,
+      }, candidate);
+      return { countryChecked: true, rejectionApplied: true };
+    }
+    if ((countryCheck.status === 'CONFIRMED' || countryCheck.status === 'LIKELY') && countryCheck.detectedCreatorCountry) {
+      existing.country = countryCheck.detectedCreatorCountry;
+      existing.country_status = countryCheck.status;
+      existing.confidence_score = countryCheck.score;
+    }
+    return { countryChecked: true, rejectionApplied: false };
+  } catch (error) {
+    // Probe/quota policy and accounting failures are not evidence failures:
+    // propagating them keeps the caller's retry lifecycle and prevents a paid
+    // request from being silently replayed elsewhere.
+    if (error instanceof OfficialYouTubeQuotaFenceError
+      || error instanceof YouTubeKeyCapUnavailableError
+      || isProbeQuotaControlError(error)
+      || isYouTubeQuotaAccountingError(error)) {
+      throw error;
+    }
+    console.warn(`[Unified Ingestion Pipeline] Confirmed-country revalidation failed for ${candidate.channelId}; preserving confirmed row:`, error instanceof Error ? error.message : error);
+    return { countryChecked: false, rejectionApplied: false };
+  }
 }
 
 export async function processChannelThroughPipeline(
@@ -275,9 +441,52 @@ async function processChannelThroughPipelineInContext(
     }
     // Preserve terminal rows for every ordinary discovery lane. Explicit
     // operator recheck is the only supported terminal override.
-    if (shouldPreserveExistingChannel(existing, source, isManualScan, Date.now(), { allowActiveEnrichmentClassification: isEnrichmentPass === true && existing.trading_status === 'UNCERTAIN' })) {
+    if (shouldPreserveExistingChannel(existing, source, isManualScan, Date.now(), { allowActiveEnrichmentClassification: isEnrichmentPass === true && existing.trading_status === 'UNCERTAIN' }) && !shouldBypassPreservationForDiscordEvidence(existing, options?.forceClassification === true)) {
+      let confirmedCountryChecked = false;
+      const countryRevalidation = shouldRevalidateConfirmedCountry(existing, isManualScan);
+      // Capture the policy this pass read; the write below must not overwrite
+      // a concurrent rejection/confirmation committed while hydration ran.
+      const countryPolicySnapshot = countryRevalidation
+        ? {
+            countryStatus: existing.country_status,
+            country: existing.country,
+            tradingStatus: existing.trading_status,
+            scanStatus: existing.scan_status,
+          }
+        : undefined;
+      // A guarded write can be skipped when another pass changed the country
+      // decision. Re-read the committed row so the returned outcome and
+      // sighting projection never report a value the database rejected.
+      const persistPreservedRow = async (): Promise<void> => {
+        const written = await upsertChannelWithResult(existing, countryPolicySnapshot ? { requireCountrySnapshot: countryPolicySnapshot } : undefined);
+        if (!written) {
+          const refreshed = await getChannelById(candidate.channelId);
+          if (refreshed) Object.assign(existing, refreshed);
+        }
+      };
+      if (countryRevalidation) {
+        const revalidation = await revalidateConfirmedCountryForPreservedRow(candidate, existing, targetCountry, now);
+        confirmedCountryChecked = revalidation.countryChecked;
+        if (revalidation.rejectionApplied) {
+          await persistPreservedRow();
+          return {
+            channelId: candidate.channelId,
+            channelName: candidate.channelName,
+            isNew: false,
+            wasKnown: true,
+            persisted: true,
+            countryStatus: existing.country_status,
+            tradingStatus: existing.trading_status,
+            discordStatus: existing.discord_status,
+            discordInvite: existing.discord_invite || null,
+            channelRecord: existing,
+            skippedTerminalState: true,
+          };
+        }
+      }
+
       const refreshedAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount);
-      if (shouldReclassifyPreservedCompletedChannel(existing.scan_status, refreshedAudienceGate)) {
+      if (shouldReclassifyPreservedCompletedChannel(existing.scan_status, refreshedAudienceGate, existing.trading_status)) {
         console.log(`[Unified Ingestion Pipeline] Refreshing preserved completed channel '${candidate.channelName}' as low-audience after fresh official subscriber metadata.`);
         existing.subscriber_count = candidate.subscriberCount;
         existing.scan_status = 'SKIPPED_LOW_AUDIENCE';
@@ -292,7 +501,7 @@ async function processChannelThroughPipelineInContext(
             timestamp: now,
           },
         ];
-        await upsertChannel(existing);
+        await persistPreservedRow();
         return {
           channelId: candidate.channelId,
           channelName: candidate.channelName,
@@ -315,7 +524,7 @@ async function processChannelThroughPipelineInContext(
       // committed cannot strand missing rows behind this early return.
       await replayVocabularyForRetry(existing, candidate, source, options?.forceExtraction ?? false);
       // Update basic existing metadata if changed
-      let updated = false;
+      let updated = confirmedCountryChecked;
       if (candidate.subscriberCount && candidate.subscriberCount !== existing.subscriber_count) {
         existing.subscriber_count = candidate.subscriberCount;
         updated = true;
@@ -324,8 +533,19 @@ async function processChannelThroughPipelineInContext(
         existing.channel_thumbnail_url = candidate.channelThumbnailUrl;
         updated = true;
       }
+      let activeEnrichmentJob = false;
+      if (existing.trading_status === 'TRADING_CONFIRMED') {
+        try { activeEnrichmentJob = await hasActiveEnrichmentJob(existing.channel_id, options?.jobId); } catch { activeEnrichmentJob = true; }
+      }
+      const confirmedScanStatus = existing.trading_status === 'TRADING_CONFIRMED'
+        ? terminalScanStatusForConfirmedRediscovery(existing.scan_status, activeEnrichmentJob)
+        : existing.scan_status;
+      if (confirmedScanStatus !== existing.scan_status) {
+        existing.scan_status = confirmedScanStatus;
+        updated = true;
+      }
       if (updated) {
-        await upsertChannel(existing);
+        await persistPreservedRow();
       }
 
       return {
@@ -349,119 +569,28 @@ async function processChannelThroughPipelineInContext(
   // Discord work, require a cheap plausible trading hypothesis from the matched
   // retrieval document. Withheld candidates remain preserved in the nomination
   // ledger and can be rediscovered later by independent evidence.
-  const retrievalTriage = triageAutonomousSearchCandidate(candidate, source, isEnrichmentPass);
-  if (retrievalTriage.disposition === 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS') {
-    console.log(`[Unified Ingestion Pipeline - Triage] Withholding '${candidate.channelName}' before provider spend: ${retrievalTriage.reasonCodes.join(', ')}.`);
-    void recordAdmissionShadow({
-      channelId:candidate.channelId, priorState:'NOT_EVALUATED', classificationStatus:'UNCERTAIN', investigationState:'COMPLETED',
-      candidateHypothesis:{plausibleTradingHypothesis:false,triagePolicyVersion:CANDIDATE_TRIAGE_POLICY_VERSION,matchedSignals:retrievalTriage.matchedSignals},
-      evidenceCoverage:{stage:'RETRIEVAL_TRIAGE',reasonCodes:retrievalTriage.reasonCodes,enrichmentStage:candidate.enrichmentStage||0}
-    }).catch(error=>console.warn(`[CandidateAdmission] retrieval-triage shadow write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
-    return {
-      channelId:candidate.channelId, channelName:candidate.channelName, isNew:!existing, wasKnown:!!existing, persisted:false,
-      countryStatus:'UNCERTAIN', tradingStatus:'UNCERTAIN', discordStatus:'NOT_FOUND', discordInvite:null, channelRecord:undefined
-    };
+  if (options?.forceClassification !== true) {
+    const retrievalTriage = triageAutonomousSearchCandidate(candidate, source, isEnrichmentPass);
+    if (retrievalTriage.disposition === 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS') {
+      console.log(`[Unified Ingestion Pipeline - Triage] Withholding '${candidate.channelName}' before provider spend: ${retrievalTriage.reasonCodes.join(', ')}.`);
+      void recordAdmissionShadow({
+        channelId:candidate.channelId, priorState:'NOT_EVALUATED', classificationStatus:'UNCERTAIN', investigationState:'COMPLETED',
+        candidateHypothesis:{plausibleTradingHypothesis:false,triagePolicyVersion:CANDIDATE_TRIAGE_POLICY_VERSION,matchedSignals:retrievalTriage.matchedSignals},
+        evidenceCoverage:{stage:'RETRIEVAL_TRIAGE',reasonCodes:retrievalTriage.reasonCodes,enrichmentStage:candidate.enrichmentStage||0}
+      }).catch(error=>console.warn(`[CandidateAdmission] retrieval-triage shadow write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
+      return {
+        channelId:candidate.channelId, channelName:candidate.channelName, isNew:!existing, wasKnown:!!existing, persisted:false,
+        countryStatus:'UNCERTAIN', tradingStatus:'UNCERTAIN', discordStatus:'NOT_FOUND', discordInvite:null, channelRecord:undefined
+      };
+    }
   }
 
   // Step 1: GATE 1 - Country Validation Hard Gate
-  let countryVal = await validateChannelCountry(
-    {
-      channelName: candidate.channelName,
-      description: candidate.description,
-      videoTitles: candidate.videoTitles,
-      locationTag: candidate.locationTag,
-      externalLinks: candidate.channelLinks,
-      metadataStatus: candidate.countryMetadataStatus,
-      videoDescriptions: candidate.videoDescriptions,
-      videoDescriptionsAuthoritative: candidate.videoDescriptionsAuthoritative,
-      playlists: candidate.playlists
-    },
-    targetCountry
-  );
-
   // Country uncertainty and subscriber availability are both cheap official
-  // channel-metadata concerns. If either is unresolved, hydrate them together
-  // with one channels.list request before semantic AI, enrichment, or Discord.
-  const subscriberEvidenceMissing = evaluateLowAudienceGate(candidate.subscriberCount).reasonCode === 'SUBSCRIBER_COUNT_UNAVAILABLE';
-  const needsCountryHydration = countryVal.status === 'UNCERTAIN' && candidate.countryMetadataStatus !== 'AVAILABLE_NOT_DECLARED';
-  if (needsCountryHydration || subscriberEvidenceMissing) {
-    const hydrated = await fetchYouTubeChannelCountryMetadata(candidate.channelId, candidate);
-    Object.assign(candidate, hydrated);
-    countryVal = await validateChannelCountry({ channelName:candidate.channelName, description:candidate.description,
-      videoTitles:candidate.videoTitles, locationTag:candidate.locationTag, externalLinks:candidate.channelLinks, metadataStatus:candidate.countryMetadataStatus, videoDescriptions:candidate.videoDescriptions, videoDescriptionsAuthoritative:candidate.videoDescriptionsAuthoritative, playlists:candidate.playlists }, targetCountry);
-  }
-
-  // Gate 1 evidence-only fallback: if country remains uncertain and candidate lacks usable About text,
-  // retrieve the public channel page without an API key and re-run the country validator.
-  // The same page is also the keyless audience source: when official metadata
-  // left the subscriber count unknown, its About/header text carries the public
-  // count even while the Data API cap is exhausted.
-  const subscriberEvidenceMissingAfterOfficial =
-    evaluateLowAudienceGate(candidate.subscriberCount).reasonCode === 'SUBSCRIBER_COUNT_UNAVAILABLE';
-  const publicAboutStatus = (candidate as any).publicAboutStatus || existing?.public_about_status || 'NOT_ATTEMPTED';
-  const publicAboutAttempts = Number((candidate as any).publicAboutAttempts ?? existing?.public_about_attempts ?? 0);
-  const publicAboutAttempted = Boolean(
-    (candidate as any).publicAboutAttempted ||
-    publicAboutStatus === 'ATTEMPTED_SUCCEEDED' ||
-    publicAboutStatus === 'ATTEMPTED_EMPTY' ||
-    existing?.inspection_trail?.some(s => s.details?.includes('Public About') || s.title?.includes('Live About'))
-  );
-  const countryFallbackWanted = shouldAttemptPublicAboutCountryFallback({
-    countryStatus: countryVal.status,
-    countryMetadataStatus: candidate.countryMetadataStatus,
-    description: candidate.description,
-    publicAboutStatus,
-    publicAboutAttempts,
-    publicAboutAttempted
-  });
-  // The audience source is independent of the country gate. Allow one retry
-  // beyond the country fallback's single attempt so channels first parsed
-  // before subscriber extraction existed can still be hydrated. Only pay for
-  // the public page when the official call actually failed: a successful
-  // channels.list that omits the count means YouTube hides it, and scraping
-  // cannot reveal it.
-  const countryAlreadyRejected = countryVal.status === 'REJECTED'
-    || countryVal.gateDisposition === 'REJECT_EXCLUDED'
-    || countryVal.gateDisposition === 'REJECT_UNSUPPORTED';
-  const subscriberFallbackWanted = subscriberEvidenceMissingAfterOfficial
-    && candidate.countryMetadataStatus === 'UNAVAILABLE'
-    && !countryAlreadyRejected
-    && publicAboutAttempts < 2;
-  if (countryFallbackWanted || subscriberFallbackWanted) {
-    const beforeDescription = candidate.description;
-    const beforeLinks = [...(candidate.channelLinks || [])];
-    (candidate as any).publicAboutAttempted = true;
-    (candidate as any).publicAboutAttempts = publicAboutAttempts + 1;
-    (candidate as any).publicAboutCheckedAt = now;
-    candidate.countryMetadataCheckedAt = now;
-    try {
-      const liveAbout = await fetchLiveYouTubeChannelData(candidate.youtubeUrl);
-      if (applyPublicAboutToCandidate(candidate, liveAbout)) {
-        (candidate as any).publicAboutStatus = 'ATTEMPTED_SUCCEEDED';
-        const afterLinks = candidate.channelLinks || [];
-        const linksChanged = afterLinks.length !== beforeLinks.length
-          || afterLinks.some((link, index) => link !== beforeLinks[index]);
-        if (countryFallbackWanted || candidate.description !== beforeDescription || linksChanged) {
-          countryVal = await validateChannelCountry({
-            channelName: candidate.channelName,
-            description: candidate.description,
-            videoTitles: candidate.videoTitles,
-            locationTag: candidate.locationTag,
-            externalLinks: candidate.channelLinks,
-            metadataStatus: candidate.countryMetadataStatus,
-            videoDescriptions: candidate.videoDescriptions,
-            videoDescriptionsAuthoritative: candidate.videoDescriptionsAuthoritative,
-            playlists: candidate.playlists,
-          }, targetCountry);
-        }
-      } else {
-        (candidate as any).publicAboutStatus = liveAbout ? 'ATTEMPTED_EMPTY' : 'ATTEMPTED_FAILED';
-      }
-    } catch (error) {
-      (candidate as any).publicAboutStatus = 'ATTEMPTED_FAILED';
-      console.warn(`[Unified Ingestion Pipeline - Gate 1] Public About fallback failed for ${candidate.channelId}:`, error instanceof Error ? error.message : error);
-    }
-  }
+  // channel-metadata concerns. Hydrate them together with one channels.list
+  // request before semantic AI, enrichment, or Discord, then fall back to the
+  // keyless public page when country evidence is still sparse.
+  const countryVal = await validateCountryWithHydration(candidate, existing, targetCountry, now, { includeAudience: true });
 
   // ABSOLUTE INVARIANT:
   // creatorCountry represents creator-level evidence ONLY. It is null if no creator evidence exists.
@@ -747,6 +876,10 @@ async function processChannelThroughPipelineInContext(
     playlists:candidate.playlists,
     transcript_excerpts:candidate.transcriptExcerpts,detected_languages:languageInputs.detected_languages,visual_evidence:candidate.visualEvidence,
     pinned_comment:candidate.pinnedComment,enrichment_stage:candidate.enrichmentStage||0,
+    // Completed Discord validation is stored evidence. Supply it to the
+    // existing DiscordProvider so classification evaluates the complete
+    // evidence set; the provider/policy still decides whether it is enough.
+    discord_invite:validatedDiscordEvidenceInvite(existing) || undefined,
     subscriber_count:parseSubscriberCountNumber(candidate.subscriberCount),video_count:structuredVideos.length,
     search_match_context:candidate.matchedDocument?{type:candidate.matchedDocument.type,provider_native_id:candidate.matchedDocument.providerNativeId,title:candidate.matchedDocument.title,description:candidate.matchedDocument.description,published_at:candidate.matchedDocument.publishedAt,locator:candidate.matchedDocument.locator}:undefined,
     activity_metadata:{latest_upload_at:candidate.latestUploadAt,uploads_last_30_days:candidate.uploadsLast30Days,uploads_last_90_days:candidate.uploadsLast90Days,uploads_last_365_days:candidate.uploadsLast365Days,activity_band:candidate.activityBand,activity_score:candidate.activityScore,observed_at:candidate.activityObservedAt}
@@ -956,9 +1089,11 @@ async function processChannelThroughPipelineInContext(
       trading_relevance_breakdown: tradingVal.breakdown
     };
 
-    uncertainChannel.country_status = countryVal.status;
-    uncertainChannel.country = creatorCountry;
-    uncertainChannel.confidence_score = countryVal.score;
+    if (!shouldPreserveResolvedCountry(existing?.country_status, countryVal.status)) {
+      uncertainChannel.country_status = countryVal.status;
+      uncertainChannel.country = creatorCountry;
+      uncertainChannel.confidence_score = countryVal.score;
+    }
     uncertainChannel.trading_status = finalUncertainStatus;
     uncertainChannel.trading_confidence_score = tradingVal.confidenceScore;
     uncertainChannel.trading_category = tradingVal.category;
@@ -1084,7 +1219,7 @@ async function processChannelThroughPipelineInContext(
       isNew: !existing,
       wasKnown: !!existing,
       persisted: true,
-      countryStatus: countryVal.status,
+      countryStatus: authoritativeChannel.country_status,
       tradingStatus: authoritativeChannel.trading_status || finalUncertainStatus,
       discordStatus: authoritativeChannel.discord_status,
       discordInvite: authoritativeChannel.discord_invite ?? null,

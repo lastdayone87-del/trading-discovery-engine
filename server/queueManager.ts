@@ -3,6 +3,7 @@ import { ENRICHMENT_WORKER_BASELINE, ENRICHMENT_WORKER_SCALE_CEILING, enrichment
 import {
   getDb,
   enqueueJob,
+  enqueueClassificationJobAtomic,
   claimNextJob,
   type ClaimBudgetGuard,
   completeJob,
@@ -62,8 +63,10 @@ import {
   deleteClassificationPlaceholder,
   getClassificationBackpressureState,
   hasActiveClassificationJob,
+  hasActiveEnrichmentJob,
   reconcileClassificationSighting,
   projectClassificationFailureIfPending,
+  isRetryableInfrastructureFailure,
 } from './db';
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
 import { reserveIncrementalTreatmentPageQuota, releaseIncrementalTreatmentPageReservation, enqueueChildAndCommitPageReservation } from './retrievalPolicyCanary';
@@ -87,7 +90,8 @@ import { resolveScopeEligibility } from './scopeEligibility';
 import { processChannelThroughPipeline, isTerminalState, applyGate1CountryRejectionToExisting, type PipelineExecutionOptions } from './ingestionPipeline';
 import { evaluateLowAudienceGate, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
 import { applyPublicAboutToCandidate, fetchLiveYouTubeChannelData } from './youtubePublicAbout';
-import { shouldPreserveExistingChannel } from './terminalPreservationPolicy';
+import { shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldRevalidateConfirmedCountry, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
+import { shouldEnqueueDiscordEvidenceReclassification, validatedDiscordEvidenceInvite } from './discordEvidence';
 import { resolveTerminalEnrichmentFailure } from './enrichmentLifecycle';
 import { recordEvidenceActionOutcome } from './voiEvidenceController';
 import { completeInvestigationStep, failInvestigationStep, heartbeatInvestigationStep, startInvestigationStep } from './investigationWorkflow';
@@ -98,7 +102,8 @@ import {
   runWithOfficialYouTubeQuotaOrigin,
 } from './officialYouTubeQuotaFence';
 import { resolveJobQuotaOrigin } from './quotaOrigin';
-import { isProbeQuotaControlError } from './quotaKeyCapShadow';
+import { isProbeQuotaControlError, YouTubeKeyCapUnavailableError } from './quotaKeyCapShadow';
+import { isYouTubeQuotaAccountingError } from './youtubeKeyHealth';
 import { assertCountryAllowed, ExcludedCountryError, getCountryExclusion, shouldBlockEnrichClaimForCountry } from './countryExclusion';
 import { randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
@@ -130,6 +135,7 @@ import {
   buildProvisionalClassificationChannel,
   classificationAdmission,
   classificationJobIdempotencyKey,
+  classificationDayBucket,
   classificationQueryScopeKey,
   mapClassificationOutcomeToFunnelOutcome,
   resolveClassificationDecouplingConfig,
@@ -1168,10 +1174,37 @@ export async function admitDiscoveredChannel(input: {
 }): Promise<{ outcome: ProcessDiscoveredChannelOutcome | null; pending: boolean }> {
   const { raw, targetCountry, source, backpressure } = input;
   const existing = input.existing === undefined ? await getChannelById(raw.channelId) : input.existing;
+  // A confirmed trading row must not be classified again, but an unresolved
+  // creator country still gets the deterministic Gate-1 pass through the
+  // normal pipeline. This keeps country policy current without semantic spend.
+  if (existing && shouldRevalidateConfirmedCountry(existing, false)) {
+    try {
+      return {
+        outcome: await processDiscoveredChannelContained(raw, targetCountry, source, {
+          forceExtraction: input.forceExtraction,
+          jobId: input.discoveryJobId,
+          runId: input.queryRunId,
+        }),
+        pending: false,
+      };
+    } catch (error) {
+      // Quota policy and accounting failures are retryable infrastructure
+      // signals, not evidence. Do not convert them into a successful
+      // preserved outcome that skips the unfinished country check.
+      if (error instanceof OfficialYouTubeQuotaFenceError
+        || error instanceof YouTubeKeyCapUnavailableError
+        || isProbeQuotaControlError(error)
+        || isYouTubeQuotaAccountingError(error)
+        || isRetryableInfrastructureFailure(error)) {
+        throw error;
+      }
+      console.warn(`[TerminalPreservation] confirmed country revalidation failed for ${raw.channelId}; preserving confirmed row:`, error instanceof Error ? error.message : error);
+    }
+  }
   if (
     existing
     && shouldPreserveExistingChannel(existing, source, false)
-    && !shouldReclassifyPreservedCompletedChannel(existing.scan_status, evaluateLowAudienceGate(raw.subscriberCount))
+    && !shouldReclassifyPreservedCompletedChannel(existing.scan_status, evaluateLowAudienceGate(raw.subscriberCount), existing.trading_status)
   ) {
     // Preserved rows still need the legacy repair pass: a retried search job
     // may be repairing vocabulary that failed after its observation committed,
@@ -1184,6 +1217,17 @@ export async function admitDiscoveredChannel(input: {
     }
     if (raw.channelThumbnailUrl && raw.channelThumbnailUrl !== existing.channel_thumbnail_url) {
       existing.channel_thumbnail_url = raw.channelThumbnailUrl;
+      metadataUpdated = true;
+    }
+    let activeEnrichmentJob = false;
+    if (existing.trading_status === 'TRADING_CONFIRMED') {
+      try { activeEnrichmentJob = await hasActiveEnrichmentJob(existing.channel_id); } catch { activeEnrichmentJob = true; }
+    }
+    const confirmedScanStatus = existing.trading_status === 'TRADING_CONFIRMED'
+      ? terminalScanStatusForConfirmedRediscovery(existing.scan_status, activeEnrichmentJob)
+      : existing.scan_status;
+    if (confirmedScanStatus !== existing.scan_status) {
+      existing.scan_status = confirmedScanStatus;
       metadataUpdated = true;
     }
     if (metadataUpdated) await upsertChannel(existing);
@@ -1214,7 +1258,7 @@ export async function admitDiscoveredChannel(input: {
         buildProvisionalClassificationChannel(raw, source),
       );
     }
-    const queued = await enqueueJob(CLASSIFICATION_JOB_TYPE, buildClassificationJobPayload({
+    const queued = await enqueueClassificationJobAtomic(raw.channelId, buildClassificationJobPayload({
       candidate: raw,
       targetCountry,
       source,
@@ -1237,6 +1281,15 @@ export async function admitDiscoveredChannel(input: {
       idempotencyKey: classificationJobIdempotencyKey(raw.channelId),
       preventReopen: true,
     });
+    if (!queued) {
+      // A concurrent worker may own the active classification, but if this
+      // worker won the insert-only placeholder, the row is still this query's
+      // novel discovery. Re-reading it would report wasKnown=true.
+      const channel = insertedPlaceholder
+        ? existing
+        : (existing || await getChannelById(raw.channelId));
+      return { outcome: classificationPendingOutcome(raw, channel), pending: true };
+    }
     if (queued.status === 'PENDING' || queued.status === 'PROCESSING') {
       backpressure.globalPending += 1;
       backpressure.scopedPending += 1;
@@ -3154,6 +3207,7 @@ export async function processClassificationJob(job: DurableJob): Promise<void> {
       jobId: job.id,
       runId: payload.queryRunId,
       quotaOrigin: payload.quotaOrigin,
+      forceClassification: payload.forceClassification === true,
       lane: 'DISCOVERY',
       jobType: 'CLASSIFY_DISCOVERED_CHANNEL',
     },
@@ -3288,6 +3342,100 @@ export interface ChannelInspectionAttributionInput {
   jobId?: string;
   slicePass?: number;
   workRemaining?: number;
+}
+
+
+export interface DiscordReclassificationDeps {
+  hasActiveClassificationJob?: (channelId: string) => Promise<boolean>;
+  db?: { query: (sql: string, values?: unknown[]) => Promise<{ rows: any[] }> };
+  enqueue?: (type: string, payload: unknown, opts: Record<string, unknown>) => Promise<{ status: string }>;
+  config?: { priority: number; maxAttempts: number };
+  checkCountryAllowed?: (country: string) => Promise<void>;
+}
+
+/**
+ * After a successful Discord validation, an unconfirmed channel earns one
+ * bounded classification pass with the stored invite available as evidence.
+ * The pass is day-scoped and preventReopen keeps it from looping; an active
+ * classification already owns the work. This never confirms by itself.
+ */
+export async function enqueueDiscordEvidenceReclassification(
+  channel: ChannelRecord,
+  rawDetails?: DiscoveredChannelRaw,
+  deps: DiscordReclassificationDeps = {},
+): Promise<boolean> {
+  // The audience minimum is absolute: a stored or freshly validated Discord
+  // invite never authorizes classification, crawling, or retrieval for a
+  // channel below 30 subscribers. The pipeline gate enforces the same rule;
+  // stop before creating even the classification job.
+  const audienceCount = rawDetails?.subscriberCount ?? channel.subscriber_count;
+  if (evaluateLowAudienceGate(audienceCount == null ? undefined : String(audienceCount)).shouldSkipDeepEnrichment) {
+    return false;
+  }
+  const invite = validatedDiscordEvidenceInvite(channel);
+  let active = false;
+  try {
+    active = await (deps.hasActiveClassificationJob || hasActiveClassificationJob)(channel.channel_id);
+  } catch {
+    active = true; // fail safe: do not add a second classification while status is unknown
+  }
+  if (!shouldEnqueueDiscordEvidenceReclassification({
+    tradingStatus: channel.trading_status,
+    invite,
+    hasActiveClassificationJob: active,
+  })) return false;
+  try {
+    const db = deps.db || await getDb();
+    const sighting = await db.query(
+      `SELECT metadata->>'targetCountry' AS target_country
+         FROM channel_sightings
+        WHERE channel_id=$1 AND metadata->>'targetCountry' IS NOT NULL
+        ORDER BY observed_at DESC LIMIT 1`,
+      [channel.channel_id],
+    );
+    // channel.country is creator evidence, never retrieval context. Without a
+    // recorded target we cannot safely reconstruct the classification scope.
+    const targetCountry = String(sighting.rows[0]?.target_country || '').trim();
+    if (!targetCountry) return false;
+    await (deps.checkCountryAllowed || assertCountryAllowed)(targetCountry, 'discord-evidence-reclassification');
+    const source = (channel.discovery_source || 'recheck') as DiscoverySource;
+    const candidate: DiscoveredChannelRaw = {
+      ...(rawDetails || {}),
+      channelId: channel.channel_id,
+      channelName: channel.channel_name,
+      youtubeUrl: channel.youtube_url,
+      description: rawDetails?.description || '',
+      videoTitles: rawDetails?.videoTitles || [],
+      channelLinks: rawDetails?.channelLinks || [],
+      subscriberCount: rawDetails?.subscriberCount || channel.subscriber_count,
+      channelThumbnailUrl: rawDetails?.channelThumbnailUrl || channel.channel_thumbnail_url,
+      enrichmentStage: rawDetails?.enrichmentStage || 0,
+    };
+    const config = deps.config || resolveClassificationDecouplingConfig();
+    const payload = buildClassificationJobPayload({
+      candidate,
+      targetCountry,
+      source,
+      queryScopeKey: `discord:${channel.channel_id}`,
+      discoveryJobId: `discord-reclassify:${channel.channel_id}`,
+      quotaOrigin: channel.quota_origin === 'PROBE' ? 'PROBE' : 'NORMAL',
+      forceExtraction: false,
+      forceClassification: true,
+    });
+    const opts = {
+      priority: config.priority,
+      maxAttempts: config.maxAttempts,
+      idempotencyKey: `discord-classify:${channel.channel_id}:${classificationDayBucket()}`,
+      preventReopen: true,
+    };
+    const queued = deps.enqueue
+      ? await deps.enqueue(CLASSIFICATION_JOB_TYPE, payload, opts)
+      : await enqueueClassificationJobAtomic(channel.channel_id, payload, opts);
+    return queued != null && (queued.status === 'PENDING' || queued.status === 'PROCESSING');
+  } catch (error) {
+    console.warn(`[DiscordEvidence] reclassification enqueue failed for ${channel.channel_id}:`, error instanceof Error ? error.message : error);
+    return false;
+  }
 }
 
 export async function inspectAndValidateChannel(
@@ -3820,6 +3968,11 @@ export async function inspectAndValidateChannel(
     // paths did not project a validation result, so they keep the ordinary
     // stale-snapshot guard.
     await upsertChannel(channel,{freshDiscordValidation:discordValidationProjected});
+    if (discordValidationProjected) {
+      await enqueueDiscordEvidenceReclassification(channel, rawDetails).catch(error => {
+        console.warn(`[DiscordEvidence] reclassification trigger failed for ${channel.channel_id}:`, error instanceof Error ? error.message : error);
+      });
+    }
     // Phase 0 lane baseline: classify the pass after all projection writes. A
     // post-start throw without an inspection object is INCONCLUSIVE, never
     // NEVER_EXECUTED; a capacity directive is a deferral, never a failure.
@@ -4706,7 +4859,7 @@ export async function triggerManualRecheck(
       if (canContinueCommunityInspectionAfterDegradedManualClassification({
         existingTradingStatus: preserved.trading_status,
         errorCode: code
-      })) {
+      }) && !evaluateLowAudienceGate(preserved.subscriber_count).shouldSkipDeepEnrichment) {
         console.warn(`[Manual Recheck] Gemini classification coverage is degraded for already-confirmed trading creator ${channelId}; preserving TRADING_CONFIRMED and continuing fresh community inspection.`);
         try {
           preserved.trading_status = 'TRADING_CONFIRMED';

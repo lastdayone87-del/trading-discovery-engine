@@ -55,15 +55,14 @@ export function evaluateLowAudienceGate(rawSubscriberCount?: string, threshold =
   return { shouldSkipDeepEnrichment: false, subscriberCountNumber: count, reasonCode: 'SUFFICIENT_AUDIENCE_PROCEED' };
 }
 
-/**
- * A fresh known-low audience result may update a preserved completed row so
- * the stored record remains auditable but leaves the normal operator corpus.
- * Unknown audience data never qualifies, and non-completed workflow states
- * remain visible to their owning workflow instead of being hidden here.
- */
 export function shouldReclassifyPreservedCompletedChannel(
   existingScanStatus: string | undefined,
   gate: LowAudienceGateResult,
+  tradingStatus?: string | null,
 ): boolean {
+  // A confirmed trading classification is permanent under ordinary
+  // rediscovery. A later low subscriber observation may be recorded, but it
+  // must not move a confirmed channel into the low-audience skip lane.
+  if (tradingStatus === 'TRADING_CONFIRMED') return false;
   return existingScanStatus === 'COMPLETED' && gate.shouldSkipDeepEnrichment;
 }
