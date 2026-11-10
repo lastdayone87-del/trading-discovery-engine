@@ -46,10 +46,8 @@ export interface ClassificationRoutingOptions {
    * only when the evidence is already sufficient and independent.
    */
   independentEvidence?: boolean;
-  /** Creator-owned text used only for a precision review guard. */
-  channelText?: string;
-  /** Number of observed video documents in the evidence bundle. */
-  videoSampleCount?: number;
+  /** Per-video text documents used only for a precision review guard. */
+  videoTexts?: string[];
   mode?: 'ACTIVE' | 'LEGACY';
 }
 
@@ -188,16 +186,22 @@ export function resolveClassificationRouting(
     // contains no strong trading-analysis phrase, do not terminalize; send
     // the case to human review. This never rejects and never overrides a
     // video sample that actually contains trading analysis.
-    if (options.videoSampleCount != null && options.videoSampleCount >= 3 && options.channelText) {
-      const focus = nonTradingContentFocus(options.channelText);
-      const strongAnalysisCount = (options.channelText.match(new RegExp(STRONG_TRADING_ANALYSIS.source, 'giu')) || []).length;
-      if (strongAnalysisCount < 1 && focus.total >= 2 && focus.categories.length > 0) {
+    const videoTexts = (options.videoTexts || []).map(text => String(text || '').trim()).filter(Boolean);
+    if (videoTexts.length >= 3) {
+      const focusByVideo = videoTexts.map(text => nonTradingContentFocus(text));
+      const focusedVideos = focusByVideo.filter(focus => focus.total >= 1);
+      const strongAnalysisVideos = videoTexts.filter(text => {
+        STRONG_TRADING_ANALYSIS.lastIndex = 0;
+        return STRONG_TRADING_ANALYSIS.test(text);
+      }).length;
+      if (strongAnalysisVideos === 0 && focusedVideos.length >= 2) {
+        const categories = [...new Set(focusedVideos.flatMap(focus => focus.categories))];
         return result({
           route: 'HUMAN_REVIEW', confidence, evidenceSufficiency: sufficiency,
           recognitionState, semanticPolicy, semanticUsed: semantic.used, semanticAttempted: semantic.attempted,
           humanReview: true,
           fallbackReason: 'NON_TRADING_CONTENT_FOCUS_REQUIRES_REVIEW',
-          reasonCodes: ['NON_TRADING_CONTENT_FOCUS_REQUIRES_REVIEW', ...focus.categories.map(category => `NON_TRADING_FOCUS_${category}`)],
+          reasonCodes: ['NON_TRADING_CONTENT_FOCUS_REQUIRES_REVIEW', ...categories.map(category => `NON_TRADING_FOCUS_${category}`)],
         });
       }
     }

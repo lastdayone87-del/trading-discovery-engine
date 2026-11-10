@@ -1,6 +1,6 @@
 import { TradingClassificationResult, TradingRelevanceBreakdown } from '../src/types';
 import { buildCanonicalEvidenceCorpus, verifyChannelTradingRelevance, VerificationDecision, type RawChannelInput } from './evidenceEngine';
-import { resolveClassificationRouting } from './classificationRouting/deterministicFirst';
+import { resolveClassificationRouting, resolveClassificationRoutingMode } from './classificationRouting/deterministicFirst';
 
 /**
  * Main Entry Point: Classifies a YouTube Channel's Trading Relevance
@@ -48,18 +48,19 @@ export async function classifyTradingRelevanceDetailed(
   input.evidence_corpus = buildCanonicalEvidenceCorpus(input);
   const decision: VerificationDecision = await verifyChannelTradingRelevance(input);
   const corroboration = decision.stagedClassification?.stages.find(stage => stage.stage === 'CORROBORATION');
-  const channelText = [
-    input.channel_name, input.description,
-    ...(input.video_titles || []), ...(input.video_descriptions || []),
-    ...(input.videos || []).flatMap(video => [video.title, video.description || '']),
-  ].filter(Boolean).join(' ');
-  const videoSampleCount = input.videos?.length || input.video_titles?.length || 0;
+  const routingMode = resolveClassificationRoutingMode();
+  const videoDocuments = input.videos?.length
+    ? input.videos
+    : (input.video_titles || []).map((title, index) => ({ title, description: input.video_descriptions?.[index] || '' }));
+  const videoTexts = [...new Set(videoDocuments
+    .map(video => [video.title, video.description].filter(Boolean).join(' ').trim())
+    .filter(Boolean))];
   const routing = resolveClassificationRouting(decision, {
     independentEvidence: corroboration?.disposition === 'PASS',
-    channelText,
-    videoSampleCount,
+    videoTexts,
+    mode: routingMode,
   });
-  decision.deterministicRouting = routing;
+  if (routingMode === 'ACTIVE') decision.deterministicRouting = routing;
 
   // Map to legacy breakdown format while adding rich evidence audit details
   const reasoningLogs: string[] = [
@@ -90,16 +91,24 @@ export async function classifyTradingRelevanceDetailed(
   // An abstention is not semantic service. Use the routing result so a
   // deterministic fast-track is not misreported as AI-reviewed and a
   // semantic abstention is not presented as a semantic verdict.
-  const semanticServed = routing.semanticUsed;
-  const classificationMethod: TradingRelevanceBreakdown['classification_method'] = routing.route === 'DETERMINISTIC_TRADING' || routing.route === 'DETERMINISTIC_NON_TRADING'
-    ? 'DETERMINISTIC_EVIDENCE'
-    : semanticServed
-      ? 'AI_SEMANTIC_CLASSIFIER'
-      : routing.semanticAttempted
-        ? 'SEMANTIC_ABSTAINED'
-        : decision.classificationMethod === 'DEGRADED_HEURISTIC'
-          ? 'DEGRADED_HEURISTIC'
-          : 'HEURISTIC_ONLY';
+  const legacyReporting = routingMode === 'LEGACY';
+  const semanticServed = legacyReporting
+    ? (!!decision.geminiSemanticSummary || String(decision.classificationMethod || '').startsWith('SEMANTIC_'))
+    : routing.semanticUsed;
+  const classificationMethod: TradingRelevanceBreakdown['classification_method'] = legacyReporting
+    ? (semanticServed ? 'AI_SEMANTIC_CLASSIFIER'
+      : decision.classificationMethod === 'DETERMINISTIC_EVIDENCE' ? 'DETERMINISTIC_EVIDENCE'
+        : decision.classificationMethod === 'DEGRADED_HEURISTIC' ? 'DEGRADED_HEURISTIC'
+          : 'HEURISTIC_ONLY')
+    : routing.route === 'DETERMINISTIC_TRADING' || routing.route === 'DETERMINISTIC_NON_TRADING'
+      ? 'DETERMINISTIC_EVIDENCE'
+      : semanticServed
+        ? 'AI_SEMANTIC_CLASSIFIER'
+        : routing.semanticAttempted
+          ? 'SEMANTIC_ABSTAINED'
+          : decision.classificationMethod === 'DEGRADED_HEURISTIC'
+            ? 'DEGRADED_HEURISTIC'
+            : 'HEURISTIC_ONLY';
   const noEvidence = decision.evidenceCount !== undefined
     ? decision.evidenceCount === 0
     : [...decision.positiveEvidence, ...decision.negativeEvidence].every(item => item.category === 'SEMANTIC_ABSTENTION');
