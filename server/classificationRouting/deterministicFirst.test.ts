@@ -222,20 +222,51 @@ test('word boundaries keep guidance, credit spreads, market reactions and corpor
   assert.deepEqual(focus.categories, []);
 });
 
-test('broker URLs and repeated description footers do not create non-trading focus', () => {
-  const footer = 'Trade with our broker: https://broker.example.com/referral?ref=trader';
+test('repeated promotional footers and URLs do not create non-trading focus', () => {
+  const footer = 'memecoin giveaway: https://broker.example.com/referral?ref=trader';
   const routed = resolveClassificationRouting(decision({
     status: 'TRADING_CONFIRMED', confidenceScore: 90, recognitionState: 'AMBIGUOUS_THIN', semanticPolicy: 'BOUNDED_WAIT',
     providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
   }), {
     independentEvidence: true,
     videoTexts: [
-      `EURUSD forecast Monday\n${footer}`,
-      `GBPUSD outlook Tuesday\n${footer}`,
-      `USDJPY weekly forecast\n${footer}`,
+      `EURUSD trade recap Monday\n${footer}`,
+      `GBPUSD trade recap Tuesday\n${footer}`,
+      `USDJPY trade recap Wednesday\n${footer}`,
     ],
   });
   assert.equal(routed.route, 'SEMANTIC_TRADING');
+});
+
+test('repeated trading titles survive footer removal', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'TRADING_CONFIRMED', confidenceScore: 90, recognitionState: 'AMBIGUOUS_THIN', semanticPolicy: 'BOUNDED_WAIT',
+    providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
+  }), {
+    independentEvidence: true,
+    videoTexts: [
+      'Live trading\nMusic: track one',
+      'Live trading\nMusic: track two',
+      'Live trading\nMusic: track three',
+    ],
+  });
+  assert.equal(routed.route, 'SEMANTIC_TRADING');
+});
+
+test('generic personal-finance outlooks still reach review', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'TRADING_CONFIRMED', confidenceScore: 90, recognitionState: 'AMBIGUOUS_THIN', semanticPolicy: 'BOUNDED_WAIT',
+    providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
+  }), {
+    independentEvidence: true,
+    videoTexts: ['Retirement savings outlook', 'How to budget your paycheck', 'Pay off your mortgage'],
+  });
+  assert.equal(routed.route, 'HUMAN_REVIEW');
+});
+
+test('pump-and-dump is not counted as promotion', () => {
+  assert.equal(nonTradingContentFocus('pump-and-dump scheme').total, 0);
+  assert.equal(nonTradingContentFocus('pump and dump scheme').total, 0);
 });
 
 test('Distinct videos with identical off-topic metadata still count toward the guard', () => {
