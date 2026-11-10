@@ -1701,7 +1701,7 @@ export async function upsertChannelWithResult(channel: ChannelRecord, options?: 
 }
 
 /** Compatibility wrapper for callers that only need the write side effect. */
-export async function upsertChannel(channel: ChannelRecord, options?: Omit<UpsertChannelOptions, 'requireCountrySnapshot'>): Promise<void> {
+export async function upsertChannel(channel: ChannelRecord, options?: Omit<UpsertChannelOptions, 'requireCountrySnapshot' | 'requireStatusSnapshot'>): Promise<void> {
   await upsertChannelWithResult(channel, options);
 }
 

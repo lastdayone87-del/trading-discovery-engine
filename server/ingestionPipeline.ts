@@ -496,6 +496,7 @@ async function processChannelThroughPipelineInContext(
         await upsertChannel(reactivated);
         existing.scan_status = reactivated.scan_status;
         existing.discord_status = reactivated.discord_status;
+        if (existingStatusSnapshot) existingStatusSnapshot.scan_status = reactivated.scan_status;
       }
     }
     // Preserve terminal rows for every ordinary discovery lane. Explicit
