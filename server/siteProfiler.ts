@@ -605,9 +605,10 @@ export interface ProfilerFetch {
    * provenance now that the profiler follows redirects itself. */
   redirectsFollowed: string[];
   /** True when a redirect destination was refused before any request touched
-   * it (non-public, malformed, or unresolvable). A typed, observable
-   * inspection limitation — callers treat the non-2xx status as a skip,
-   * never as NOT_FOUND or negative evidence. */
+   * it (non-public, malformed, unresolvable, or cross-origin when an allowed
+   * origin is enforced). A typed, observable inspection limitation — callers
+   * treat the non-2xx status as a skip, never as NOT_FOUND or negative
+   * evidence. */
   redirectRejected: boolean;
   /** The refused destination, present only when redirectRejected. */
   rejectedRedirect?: string;
@@ -623,10 +624,10 @@ export interface ProfilerFetch {
   bodyProbeFailed?: boolean;
 }
 
-/** Why a redirect chain stopped. Non-public and malformed destinations are
- * security/input barriers; DNS and timeout classes are retryable transport
- * failures; loop/limit classes describe a bounded chain that never reached a
- * final response. */
+/** Why a redirect chain stopped. Non-public, malformed, and cross-origin
+ * destinations are security/input/scope barriers; DNS and timeout classes are
+ * retryable transport failures; loop/limit classes describe a bounded chain
+ * that never reached a final response. */
 export type ProfilerRedirectFailure =
   | 'NON_PUBLIC_DESTINATION'
   | 'MALFORMED_LOCATION'

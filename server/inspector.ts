@@ -827,7 +827,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
           continue;
         }
         let absolute:string;
-        try{absolute=new URL(String(rawSrc),documentBase).toString();}catch{seedCeiling??='frame-slice';drops.count('frame-slice');drops.countUnique('invalid-protocol',String(rawSrc));continue;}
+        try{absolute=new URL(String(rawSrc),documentBase).toString();}catch{drops.countUnique('invalid-protocol',String(rawSrc));continue;}
         const discordSurface=discordPublicSurfaceFor(absolute);
         if(discordSurface){
           anyIframeContent=true;

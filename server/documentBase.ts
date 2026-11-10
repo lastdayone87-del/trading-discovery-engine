@@ -63,7 +63,10 @@ function firstHtmlBaseHref($: cheerio.CheerioAPI): string {
  * Resolve the document base URL from an already-parsed document.
  *
  * Use this when the caller already loaded the HTML: it avoids parsing the same
- * page a second time just to find the first base href.
+ * page a second time just to find the first base href. `fallbackBase` is the
+ * base to inherit when the document has no usable `<base href>` (used by
+ * `srcdoc` frames to inherit the embedding document's base); it defaults to
+ * `finalUrl`.
  */
 export function resolveDocumentBaseUrlFromRoot(
   $: cheerio.CheerioAPI,
@@ -89,9 +92,9 @@ export function resolveDocumentBaseUrlFromRoot(
  * HTML uses the first base element that carries an href (later bases are
  * ignored), and relative links resolve against that URL rather than the
  * document's own URL. Only http(s) bases are accepted: a missing, empty,
- * unparsable, or non-http(s) base falls back to `finalUrl` unchanged so callers
- * keep their existing behavior and never follow a script/data base. SVG
- * `<base>` elements are ignored.
+ * unparsable, or non-http(s) base falls back to `fallbackBase` (or `finalUrl`
+ * when omitted) unchanged, so callers keep their existing behavior and never
+ * follow a script/data base. SVG `<base>` elements are ignored.
  *
  * The returned URL preserves any query string and fragment from the base, as a
  * browser's document base URL would. A fragment on the base never changes the

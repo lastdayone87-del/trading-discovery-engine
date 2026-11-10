@@ -291,7 +291,22 @@ test('M4a marks the seed partial when the Discord iframe surface cap is exceeded
   assert.equal(result.foundInvite, null);
   assert.equal(result.acquisitionStatus, 'PARTIALLY_INSPECTED');
   assert.ok(result.retryDirective);
+  const widgetCalls = calls.filter(url => url.includes('/widget.json'));
+  assert.equal(widgetCalls.length, 5, 'all five in-cap widget surfaces are inspected');
+  for (const id of ids.slice(0, 5)) {
+    assert.ok(widgetCalls.some(url => url.includes(id)), `widget ${id} was inspected`);
+  }
   assert.ok(!calls.some(url => url.includes(ids[5]!)), 'the sixth widget is not fetched after the cap');
+});
+
+test('M4b treats an unparseable frame src as an exclusion, not coverage loss', async () => {
+  const { result, calls } = await inspectWithFrames(
+    '<iframe src="https://["></iframe>',
+    {},
+  );
+  assert.equal(result.foundInvite, null);
+  assert.equal(result.acquisitionStatus, 'INSPECTED_NO_MATCH');
+  assert.deepEqual(calls, ['https://creator.example/']);
 });
 
 test('M4b shared-root lenders with iframe content are not reused', () => {
