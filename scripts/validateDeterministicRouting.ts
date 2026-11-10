@@ -56,7 +56,7 @@ function videoTextsFromRow(row: any): string[] {
   // One text per distinct video. Collapsing identical text would let two
   // distinct uploads slip below the guard's sample threshold.
   return (Array.isArray(row.videos) ? row.videos : [])
-    .map((video: any) => [video.title, video.description].filter(Boolean).join(' ').trim())
+    .map((video: any) => [video.title, video.description].filter(Boolean).join('\n').trim())
     .filter((text: string) => Boolean(text));
 }
 

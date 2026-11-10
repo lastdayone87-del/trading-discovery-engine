@@ -25,7 +25,7 @@ for (const item of work) {
   const input = buildAuditChannelInput(item);
   const decision = await engine.evaluateChannel(input);
   const videoTexts = normalizeAuditVideos(item)
-    .map(video => [video.title, video.description].filter(Boolean).join(' ').trim())
+    .map(video => [video.title, video.description].filter(Boolean).join('\n').trim())
     .filter(Boolean);
   const routing = resolveClassificationRouting(decision, {
     independentEvidence: decision.stagedClassification?.stages.find(stage => stage.stage === 'CORROBORATION')?.disposition === 'PASS',

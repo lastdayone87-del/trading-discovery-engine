@@ -76,7 +76,7 @@ async function main() {
     if (!item) continue;
     const decision = await engine.evaluateChannel(inputFor(item));
     const videoTexts = normalizeAuditVideos(item)
-      .map(video => [video.title, video.description].filter(Boolean).join(' ').trim())
+      .map(video => [video.title, video.description].filter(Boolean).join('\n').trim())
       .filter(Boolean);
     const routing = resolveClassificationRouting(decision, {
       independentEvidence: decision.stagedClassification?.stages.find(stage => stage.stage === 'CORROBORATION')?.disposition === 'PASS',

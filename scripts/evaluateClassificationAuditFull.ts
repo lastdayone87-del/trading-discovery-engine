@@ -60,9 +60,11 @@ for (const label of labels) {
     const videoDocuments: any[] = normalized.videos?.length
       ? normalized.videos
       : (normalized.video_titles || []).map((title: string, index: number) => ({ title, description: normalized.video_descriptions?.[index] || '' }));
-    const videoTexts = [...new Set(videoDocuments
-      .map((video: any) => [video.title, video.description].filter(Boolean).join(' ').trim())
-      .filter(Boolean))];
+    // Keep one document per video and preserve the title/description line
+    // boundary so shared footer lines can be identified safely.
+    const videoTexts = videoDocuments
+      .map((video: any) => [video.title, video.description].filter(Boolean).join('\n').trim())
+      .filter(Boolean);
     routing = resolveClassificationRouting({
       status: decision.status,
       confidenceScore: decision.confidenceScore,
