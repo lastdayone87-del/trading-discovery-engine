@@ -16,11 +16,18 @@ FROM mcr.microsoft.com/playwright:v1.62.1-noble
 # Phase 2 Option C: persist the append-only acquisition lane baseline so
 # crawls/hour, gate wait, and the discovery share are measurable. The writer
 # is observational only and can never change an acquisition result.
+# The rendered-admission governor enforces the single-slot budget: 40/h
+# nominal, 48/h emergency when queued demand exists, and a 35% DISCOVERY floor
+# whenever discovery work is waiting. Local/CI harnesses default it off.
 ENV NODE_ENV=production \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     PLAYWRIGHT_SKIP_BROWSER_GC=1 \
     COMMUNITY_RETRY_WORKER_CONCURRENCY=3 \
     ACQUISITION_LANE_TELEMETRY_ENABLED=true \
+    RENDERED_ADMISSION_GOVERNOR_ENABLED=true \
+    RENDERED_ADMISSION_NOMINAL_PER_HOUR=40 \
+    RENDERED_ADMISSION_EMERGENCY_PER_HOUR=48 \
+    RENDERED_ADMISSION_DISCOVERY_FLOOR_PCT=35 \
     SEARCH_WORKER_CONCURRENCY=4
 
 WORKDIR /app

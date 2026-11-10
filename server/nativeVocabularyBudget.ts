@@ -9,7 +9,7 @@ import { createHash } from 'node:crypto';
  * calls/day, $5.00/day) so the cost cap can never be exceeded by outstanding
  * work. Rule-based extraction is never budgeted.
  */
-export const NATIVE_VOCABULARY_AI_PROMPT_VERSION = 'native-vocabulary-v2';
+export const NATIVE_VOCABULARY_AI_PROMPT_VERSION = 'native-vocabulary-v3';
 
 export interface NativeVocabularyAiBudgetPolicy {
   dailyCalls: number;

@@ -1,5 +1,6 @@
 import type { QueryRecord } from '../src/types';
-import { isBareShortTicker, isRetrievalOrientedQuery } from './queryPlanner';
+import { isBareShortTicker, isForbiddenProseQuery, isRetrievalOrientedQuery } from './queryPlanner';
+import { isExtractedStandaloneQuery } from './terminologySearchability';
 import { RETRIEVAL_SPECIFICITY_POLICY_VERSION } from './retrievalSpecificity';
 import { revalidateQueryRecordAdmission } from './queryQuality/admission';
 
@@ -197,12 +198,24 @@ export function evaluateAutonomousQueryAuthority(
 ): AutonomousQueryAuthorityDecision {
   const reasons: string[] = [];
   if (query.collection === 'REJECTED') return { eligible: false, reasonCodes: ['QUERY_ALREADY_REJECTED'] };
-  if (!isRetrievalOrientedQuery(query.country, query.query)) return { eligible: false, reasonCodes: ['CURRENT_RETRIEVAL_SHAPE_FAILED'] };
 
   const metadata = metadataOf(query);
   const specificity = metadata.retrievalSpecificity as Record<string, any> | undefined;
   const atoms = Array.isArray(metadata.atoms) ? metadata.atoms as Array<Record<string, any>> : [];
   const template = String(metadata.queryTemplate || '');
+  // The template alone is not provenance. Require the planner-stamped marker
+  // and a positive ledger candidate id before granting the semantic bypass.
+  const extractedCandidateId = Number(metadata.extractedCandidateId || 0);
+  const extractedStandalone = template === 'EXTRACTED_STANDALONE'
+    && atoms.length === 1
+    && metadata.extractedStandalone === true
+    && Number.isSafeInteger(extractedCandidateId)
+    && extractedCandidateId > 0;
+  const shapeOk = extractedStandalone
+    ? !isForbiddenProseQuery(query.query)
+      && isExtractedStandaloneQuery({ term: query.query, country: query.country, language: typeof metadata.extractedCandidateLanguage === 'string' ? metadata.extractedCandidateLanguage : undefined })
+    : isRetrievalOrientedQuery(query.country, query.query);
+  if (!shapeOk) return { eligible: false, reasonCodes: ['CURRENT_RETRIEVAL_SHAPE_FAILED'] };
   // A persistent scope promotion is valid only while the operator still has
   // the country selected. Check this for every promoted shape, including
   // STANDALONE native singles, because their eligibility otherwise bypasses

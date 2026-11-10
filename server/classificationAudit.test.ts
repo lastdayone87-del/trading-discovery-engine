@@ -16,7 +16,7 @@ test('audit labels reject invalid values and missing reviewers before touching t
 
 test('audit label persistence is transactional and isolated from sealed evaluation ground truth', () => {
   const source = readFileSync(new URL('./classificationAudit.ts', import.meta.url), 'utf8');
-  const migration = readFileSync(new URL('./db/migrations/175_classification_audit.sql', import.meta.url), 'utf8');
+  const migration = readFileSync(new URL('./db/migrations/176_classification_audit.sql', import.meta.url), 'utf8');
   assert.match(source, /BEGIN/);
   assert.match(source, /COMMIT/);
   assert.match(source, /ROLLBACK/);
