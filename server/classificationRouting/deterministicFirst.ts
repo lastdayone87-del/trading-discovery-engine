@@ -56,7 +56,7 @@ type RoutingInput = Pick<
   'status' | 'confidenceScore' | 'evidenceCollection' | 'recognitionState' | 'semanticPolicy' | 'decisionPolicy' | 'classificationMethod'
 >;
 
-export const STRONG_TRADING_ANALYSIS = /(technical\s*analysis|price\s*action|market\s*analysis|\bict\b|\bsmc\b|day\s*trad|swing\s*trad|scalp|live\s*trad|trade\s*setup|trade\s*journal|back\s*test|backtest|risk\s*management|chart\s*analysis|market\s*structure|volume\s*profile|footprint|forex\s*analysis|futures?\s*analysis|options?\s*analysis|stock\s*analysis|crypto\s*analysis|support\s*and\s*resistance|candlestick|breakout|pullback|moving\s*average|\brsi\b|\bmacd\b|fibonacci|elliott|wyckoff|\bpnl\b|p\s*&\s*l|trading\s*strategy|trading\s*education|market\s*update|market\s*recap|\b(?:market|price|weekly|daily|fx|forex|stock|crypto|gold|silver|oil|index|indices|futures?|commodity|currency|bitcoin|btc|ethereum|eth|nasdaq|s&p|sp500|dow|dax|ftse|nikkei|bond|yield|dollar|euro|pound|yen|rupee|altcoin|copper|eurusd|gbpusd|usdjpy|audusd|usdcad|usdchf|nzdusd|xauusd|xagusd)\s+(?:forecast|outlook|preview)|\btechnical\s+outlook\b|price\s*analysis|gold\s*analysis|silver\s*analysis|metals?\s*analysis|commodity\s*analysis|platinum\s*analysis|capital\s*market|\bvix\b|macro\s*(?:analysis|outlook|commentary|positioning)|market\s*crash|прогноз|анализ|تحلیل\s*(?:تکنیکال|بازار|فنی)|ترید|معامله\s*گری|технический\s*анализ|анализ\s*рынка|трейдинг|analyse\s*(?:technique|du\s*marché)|analyse\s*de\s*marché|技術分析|技術的な分析|차트\s*분석|기술적\s*분석|analyse\s*technique|an[aá]lisis\s*t[eé]cnico|analisi\s*tecnica|technische\s*analyse|teknik\s*analiz|テクニカル分析|技术分析|تحليل\s*فني|технический\s*анализ)/iu;
+export const STRONG_TRADING_ANALYSIS = /(technical\s*analysis|price\s*action|market\s*analysis|\bict\b|\bsmc\b|day\s*trad|swing\s*trad|scalp|live\s*trad|trade\s*setup|trade\s*journal|back\s*test|backtest|risk\s*management|chart\s*analysis|market\s*structure|volume\s*profile|footprint|forex\s*analysis|futures?\s*analysis|options?\s*analysis|stock\s*analysis|crypto\s*analysis|support\s*and\s*resistance|candlestick|breakout|pullback|moving\s*average|\brsi\b|\bmacd\b|fibonacci|elliott|wyckoff|\bpnl\b|p\s*&\s*l|trading\s*strategy|trading\s*education|market\s*update|market\s*recap|\b(?:market|price|weekly|daily|fx|forex|stock|crypto|gold|silver|oil|index|indices|futures?|commodity|currency|bitcoin|btc|ethereum|eth|nasdaq|s&p|sp500|dow|dax|ftse|nikkei|bond|yield|dollar|euro|pound|yen|rupee|altcoin|copper|eurusd|gbpusd|usdjpy|audusd|usdcad|usdchf|nzdusd|xauusd|xagusd)\s+(?:forecast|outlook|preview)|\btechnical\s+outlook\b|\b(?:eurusd|gbpusd|usdjpy|audusd|usdcad|usdchf|nzdusd|xauusd|xagusd|bitcoin|btc|ethereum|eth|nasdaq)\s+(?:analysis|update|review|recap|setup|levels)\b|price\s*analysis|gold\s*analysis|silver\s*analysis|metals?\s*analysis|commodity\s*analysis|platinum\s*analysis|capital\s*market|\bvix\b|macro\s*(?:analysis|outlook|commentary|positioning)|market\s*crash|прогноз|анализ|تحلیل\s*(?:تکنیکال|بازار|فنی)|ترید|معامله\s*گری|технический\s*анализ|анализ\s*рынка|трейдинг|analyse\s*(?:technique|du\s*marché)|analyse\s*de\s*marché|技術分析|技術的な分析|차트\s*분석|기술적\s*분석|analyse\s*technique|an[aá]lisis\s*t[eé]cnico|analisi\s*tecnica|technische\s*analyse|teknik\s*analiz|テクニカル分析|技术分析|تحليل\s*فني|технический\s*анализ)/iu;
 
 const NON_TRADING_FOCUS: Array<[string, RegExp]> = [
   ['ENTERTAINMENT', /\b(?:dance|dancing|choreography|music|song|lyrics|vlog|prank|recipe|cooking|gaming|gameplay|fortnite|minecraft|makeup|beauty|unboxing|(?<!market\s)(?<!price\s)reaction)s?\b/giu],
@@ -90,6 +90,7 @@ export function stripDistributionText(text: string): string {
  * Remove lines repeated across videos (broker footers, affiliate blocks) so a
  * shared description footer cannot count as repeated non-trading focus.
  */
+const FINANCIAL_LINE = /\b(?:trading|trader|trade|market|forex|fx|futures?|options?|stocks?|crypto|bitcoin|btc|ethereum|eth|nasdaq|gold|silver|oil|indices?|index|eurusd|gbpusd|usdjpy|audusd|usdcad|usdchf|nzdusd|xauusd|xagusd|chart|price|analysis|setup|backtest|pnl|rsi|macd|fibonacci|elliott|wyckoff|support|resistance)\b/iu;
 const REPEATED_PROMO_FOOTER = /\b(?:memecoin|meme\s*coin|giveaway|airdrop|presale|pre-sale|nft|play[\s-]*to[\s-]*earn|token\s*launch|link\s+below|description\s+below)\b/iu;
 const FOOTER_BOILERPLATE = /(https?:\/\/|www\.|\bfollow\b|\bsubscribe\b|\binstagram\b|\btwitter\b|\bx\.com\b|\btelegram\b|\bdiscord\b|\bwebsite\b|\blinktr|\baffiliate\b|\breferral\b|\bsponsored\s+by\b|\bcontact\b|\bemail\b|\bmusic\s*:|\bcredit\s*:|©|copyright|disclaimer|risk\s*warning|\bbroker\s+(?:link|account|partner)\b|\bsign\s*up\b|\bjoin\s+(?:us|our|the)\b)/iu;
 
@@ -112,9 +113,15 @@ export function stripRepeatedFooterLines(texts: string[]): string[] {
     // must still count toward the focus guard.
     const kept = lines.filter((line, index) => {
       if (index === 0) return true;
-      if (FOOTER_BOILERPLATE.test(line)) return false;
       const normalized = normalizedLines[index];
-      return !((counts.get(normalized) || 0) >= 2 && REPEATED_PROMO_FOOTER.test(normalized));
+      if (!normalized) return false;
+      if (!FOOTER_BOILERPLATE.test(line)) {
+        return !((counts.get(normalized) || 0) >= 2 && REPEATED_PROMO_FOOTER.test(normalized));
+      }
+      // Keep the substantive part of a line that also carries a chart/affiliate
+      // link. Only drop a boilerplate line when it contains no financial
+      // evidence of its own.
+      return FINANCIAL_LINE.test(normalized);
     });
     return stripDistributionText(kept.join(' ')).trim();
   });
