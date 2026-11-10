@@ -2220,11 +2220,17 @@ export async function persistExtractedQueryCandidates(
          candidate_key,country,language,script,candidate_text,normalized_text,source_kind,source_channel_id,source_video_id,source_title,intent,confidence,decision,rejection_reasons,standalone_eligible,duplicate_sources
        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16::jsonb)
        ON CONFLICT (country, language, candidate_key) DO UPDATE SET
-         duplicate_count=extracted_query_candidates.duplicate_count+1,
-         -- Retain a bounded sample of sightings; the counter remains exact.
-         duplicate_sources=CASE WHEN extracted_query_candidates.duplicate_count < 20
-           THEN extracted_query_candidates.duplicate_sources || EXCLUDED.duplicate_sources
-           ELSE extracted_query_candidates.duplicate_sources END,
+         duplicate_count=CASE WHEN extracted_query_candidates.duplicate_sources @> EXCLUDED.duplicate_sources
+           THEN extracted_query_candidates.duplicate_count
+           ELSE extracted_query_candidates.duplicate_count+1 END,
+         -- Retain a bounded sample of distinct sightings; the counter remains exact.
+         duplicate_sources=CASE
+           WHEN extracted_query_candidates.duplicate_sources @> EXCLUDED.duplicate_sources
+             THEN extracted_query_candidates.duplicate_sources
+           WHEN extracted_query_candidates.duplicate_count < 20
+             THEN extracted_query_candidates.duplicate_sources || EXCLUDED.duplicate_sources
+           ELSE extracted_query_candidates.duplicate_sources
+         END,
          decision=CASE WHEN EXCLUDED.decision='ACCEPTED' THEN 'ACCEPTED' ELSE extracted_query_candidates.decision END,
          confidence=CASE WHEN EXCLUDED.decision='ACCEPTED' THEN GREATEST(extracted_query_candidates.confidence, EXCLUDED.confidence) ELSE extracted_query_candidates.confidence END,
          standalone_eligible=CASE WHEN EXCLUDED.decision='ACCEPTED' THEN EXCLUDED.standalone_eligible ELSE extracted_query_candidates.standalone_eligible END,
@@ -2271,13 +2277,58 @@ function mapExtractedCandidate(row: any): ExtractedQueryCandidateRecord {
 
 export async function getStandaloneExtractedQueryCandidates(country: string, limit = 20): Promise<ExtractedQueryCandidateRecord[]> {
   const db = await getDb();
+  // Exclude rows already represented by a live query and rotate rows that
+  // were offered to the planner but could not be selected. Without this a
+  // permanently blocked high-confidence row would occupy the bounded serving
+  // window on every generation.
   const res = await db.query(
-    `SELECT * FROM extracted_query_candidates
-     WHERE country=$1 AND decision='ACCEPTED' AND standalone_eligible=true AND duplicate_of IS NULL AND query_id IS NULL
-     ORDER BY confidence DESC, updated_at DESC, id ASC LIMIT $2`,
+    `SELECT c.* FROM extracted_query_candidates c
+     WHERE c.country=$1 AND c.decision='ACCEPTED' AND c.standalone_eligible=true
+       AND c.duplicate_of IS NULL AND c.query_id IS NULL
+       AND (c.last_attempted_at IS NULL OR c.last_attempted_at < now() - interval '1 hour')
+       AND NOT EXISTS (
+         SELECT 1 FROM query_library ql
+         WHERE LOWER(ql.country)=LOWER($1)
+           AND ql.collection <> 'REJECTED'
+           AND ql.normalized_query = c.normalized_text
+       )
+     ORDER BY c.last_attempted_at NULLS FIRST, c.confidence DESC, c.updated_at DESC, c.id ASC
+     LIMIT $2`,
     [canonicalCountry(country), Math.max(1, Math.min(100, Math.trunc(limit)))],
   );
   return res.rows.map(mapExtractedCandidate);
+}
+
+/** Record that the planner was offered these candidates, so it can rotate. */
+export async function markExtractedQueryCandidatesAttempted(ids: number[]): Promise<void> {
+  const values = ids.filter(id => Number.isSafeInteger(id) && id > 0);
+  if (!values.length) return;
+  const db = await getDb();
+  await db.query(
+    `UPDATE extracted_query_candidates
+     SET last_attempted_at=now(), attempt_count=attempt_count+1, updated_at=now()
+     WHERE id = ANY($1::bigint[])`,
+    [values],
+  );
+}
+
+/**
+ * Link ledger rows whose text already exists in the country's live query
+ * library. This heals a transient failure between query creation and linking,
+ * and prevents existing text from consuming the extracted serving window.
+ */
+export async function reconcileExtractedQueryCandidates(country: string): Promise<number> {
+  const db = await getDb();
+  const result = await db.query(
+    `UPDATE extracted_query_candidates c
+     SET query_id=q.id, updated_at=now()
+     FROM query_library q
+     WHERE LOWER(c.country)=LOWER($1) AND c.decision='ACCEPTED' AND c.standalone_eligible=true
+       AND c.query_id IS NULL AND LOWER(q.country)=LOWER($1)
+       AND q.collection <> 'REJECTED' AND q.normalized_query = c.normalized_text`,
+    [canonicalCountry(country)],
+  );
+  return result.rowCount || 0;
 }
 
 export async function linkExtractedQueryCandidate(candidateId: number, queryId: number): Promise<void> {

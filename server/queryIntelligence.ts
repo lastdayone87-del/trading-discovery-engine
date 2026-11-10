@@ -29,6 +29,8 @@ import {
   persistExtractedQueryCandidates,
   getStandaloneExtractedQueryCandidates,
   linkExtractedQueryCandidate,
+  markExtractedQueryCandidatesAttempted,
+  reconcileExtractedQueryCandidates,
   persistQueryTerminologyDigest,
   getQueryRunReward,
   isRetryableInfrastructureFailure
@@ -42,7 +44,7 @@ import { getYouTubeQuotaDay } from './youtubeQuotaDay';
 import { assertCountryAllowed } from './countryExclusion';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
 import { isTerminologyKillSwitchActive, TERMINOLOGY_KILL_SWITCH_KEY } from './terminologyKillSwitch';
-import { planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, rotateAwayFromMostRecentIntent, reformulatePollutedQuery, shouldGenerateNativeQueries } from './queryPlanner';
+import { normalizeQuery, planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, rotateAwayFromMostRecentIntent, reformulatePollutedQuery, shouldGenerateNativeQueries } from './queryPlanner';
 import { revalidateQueryRecordAdmission, withQueryAdmission, type QueryRecordAdmission } from './queryQuality/admission';
 import { isRewardEligibleQuota } from './queryQuality/accounting';
 import { selectionHistoryFor } from './queryQuality/composition';
@@ -268,9 +270,10 @@ export function findRuleInstrumentHits(
   videoTitles: string[],
   description: string,
   videoIds?: Array<string | null>,
-  origins?: ExtractionSourceOrigins
+  origins?: ExtractionSourceOrigins,
+  playlists?: Array<{ id?: string; name: string; description?: string }>,
 ): RuleInstrumentHit[] {
-  const sources = buildLiteralSources(channelName, videoTitles, description, videoIds, origins);
+  const sources = buildLiteralSources(channelName, videoTitles, description, videoIds, origins, playlists);
   const hits: RuleInstrumentHit[] = [];
   for (const instrument of KNOWN_INSTRUMENT_TERMS) {
     const located = findLiteralSpan(instrument, sources);
@@ -355,6 +358,17 @@ export interface ExtractionSourceOrigins {
  * channel-name duplicates) are excluded from provenance evidence rather than
  * mislabeled as VIDEO_TITLE/DESCRIPTION. Exported for unit testing.
  */
+/**
+ * Playlists complement video evidence; they never become a playlist-only
+ * extraction source. Exported so the pipeline rule is directly testable.
+ */
+export function selectComplementaryPlaylists<T extends { name: string; description?: string }>(
+  videoTitles: string[],
+  playlists?: T[],
+): T[] {
+  return videoTitles.length > 0 ? (playlists || []) : [];
+}
+
 export function buildLiteralSources(
   channelName: string,
   videoTitles: string[],
@@ -726,6 +740,7 @@ export interface VocabularyAdmissibilityContext {
   sources: LiteralSourceText[];
   baseline: NoveltyBaseline;
   language?: string;
+  country?: string;
   ruleObserved: Set<string>;
 }
 
@@ -734,8 +749,8 @@ export function isAdmissibleParsed(
   ctx: VocabularyAdmissibilityContext
 ): boolean {
   if (!parsed) return false;
-  const buckets = [parsed.terminology, parsed.instruments, parsed.phrases, parsed.formats, parsed.queries];
-  return buckets.some(
+  const vocabularyBuckets = [parsed.terminology, parsed.instruments, parsed.phrases, parsed.formats];
+  const vocabularyAdmissible = vocabularyBuckets.some(
     bucket =>
       Array.isArray(bucket) &&
       bucket.some(raw => {
@@ -750,6 +765,26 @@ export function isAdmissibleParsed(
         return verdict.admit === true;
       })
   );
+  if (vocabularyAdmissible) return true;
+  // The queries bucket has its own shape/intent/grounding rules. A literal but
+  // unusable query (for example "live") must not suppress provider fallback.
+  if (!ctx.country || !Array.isArray(parsed.queries)) return false;
+  const sources = ctx.sources
+    .filter(source => source.kind !== 'CHANNEL_NAME')
+    .map(source => ({
+      kind: source.kind as ExtractedQuerySource['kind'],
+      index: source.index,
+      text: source.text,
+      videoId: source.videoId ?? null,
+    }));
+  if (!sources.length) return false;
+  return assessLlmQueryCandidates({
+    queries: parsed.queries,
+    sources,
+    country: ctx.country,
+    language: ctx.language,
+    maxCandidates: 10,
+  }).length > 0;
 }
 
 export async function admitNativeCandidates(args: {
@@ -905,7 +940,7 @@ export async function extractVocabularyFromCreator(
   // twins below (different observation types would otherwise record the same
   // source mention twice and inflate evidence and occurrences).
   const ruleObserved = new Set<string>();
-  for (const hit of findRuleInstrumentHits(channel.channel_name, videoTitles, description, videoIds, origins)) {
+  for (const hit of findRuleInstrumentHits(channel.channel_name, videoTitles, description, videoIds, origins, videoTitles.length > 0 ? playlists : [])) {
     // Persistence ordering mirrors the AI path: terminology evidence first,
     // extracted-term row only after a valid observation exists.
     const observationType = (hit.located.sourceKind === 'PLAYLIST_TITLE' || hit.located.sourceKind === 'PLAYLIST_DESCRIPTION')
@@ -931,10 +966,13 @@ export async function extractVocabularyFromCreator(
   // sources, rule spans, or quoted prompt context.
   const effTitles = origins?.videoTitlesAreMetadata === false ? [] : videoTitles;
   const effDesc = origins?.descriptionIsMetadata === false ? '' : description;
+  // Playlists are complementary context only. A channel with no video titles
+  // must not begin discovery from playlist text alone.
+  const effectivePlaylists = selectComplementaryPlaylists(effTitles, playlists);
   // Literal sources are built before any provider attempt. Playlist titles and
   // descriptions are first-class context candidates, never separate shadow
   // inputs: they pass the same literal-span, quality and standalone gates.
-  const literalSources = buildLiteralSources(channel.channel_name, effTitles, effDesc, videoIds, origins, playlists);
+  const literalSources = buildLiteralSources(channel.channel_name, effTitles, effDesc, videoIds, origins, effectivePlaylists);
   const extractedSources: ExtractedQuerySource[] = literalSources
     .filter(source => source.kind !== 'CHANNEL_NAME')
     .map(source => ({ kind: source.kind as ExtractedQuerySource['kind'], index: source.index, text: source.text, videoId: source.videoId ?? null }));
@@ -977,9 +1015,9 @@ Description: "${effDesc}"
 Recent Titles:
 ${effTitles.map(t => `- ${t}`).join('\n')}
 Playlist Titles:
-${(playlists || []).map(p => `- ${p.name}`).join('\n')}
+${effectivePlaylists.map(p => `- ${p.name}`).join('\n')}
 Playlist Descriptions:
-${(playlists || []).filter(p => p.description).map(p => `- ${p.description}`).join('\n')}
+${effectivePlaylists.filter(p => p.description).map(p => `- ${p.description}`).join('\n')}
 
 Identify localized trading vocabulary used by traders in ${channel.country}. Each bucket has a strict trading meaning:
 - "terminology": native market, method, execution or platform language used by traders (for example "analyse technique", "order flow", "scalping").
@@ -1816,6 +1854,9 @@ export async function generateCandidateQueriesForCountry(
   options: { scopePromotionBasis?: 'PERSISTENT_SCOPE_SELECTION' | 'DIRECT_TARGET' } = {}
 ): Promise<QueryRecord[]> {
   await assertCountryAllowed(country, 'query_generation');
+  await reconcileExtractedQueryCandidates(country).catch(error => {
+    console.warn('[Extracted Query] reconciliation failed', error instanceof Error ? error.message : String(error));
+  });
   const [vocabs, extractedTerms, existingQueries, provenTerminology, organicCandidates, standaloneExtractedCandidates] = await Promise.all([
     getCountryVocabularies(),
     getExtractedVocabulary(country),
@@ -1824,6 +1865,45 @@ export async function generateCandidateQueriesForCountry(
     getPublishedOrganicQueryCandidates(country),
     getStandaloneExtractedQueryCandidates(country)
   ]);
+  // Reconcile ledger rows against existing query text before planning. A
+  // transient link failure then self-heals instead of stranding outcomes, and
+  // blocked text never occupies the extracted serving window. Rows offered to
+  // the planner rotate on a short cooldown even if a gate rejects them.
+  const existingQueryLinks = new Map(
+    existingQueries
+      .filter(query => query.collection !== 'REJECTED')
+      .map(query => [normalizeQuery(query.query), query.id] as const),
+  );
+  const linkCandidate = async (candidateId: number, queryId: number): Promise<void> => {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await linkExtractedQueryCandidate(candidateId, queryId);
+        return;
+      } catch (error) {
+        if (attempt === 1) {
+          // Reconciliation on the next generation will retry the link.
+          console.warn('[Extracted Query] failed to link candidate', {
+            candidateId, queryId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+    }
+  };
+  const pendingExtractedCandidates = [];
+  for (const candidate of standaloneExtractedCandidates) {
+    const existingId = existingQueryLinks.get(normalizeQuery(candidate.candidateText));
+    if (existingId) {
+      await linkCandidate(candidate.id, existingId);
+      continue;
+    }
+    pendingExtractedCandidates.push(candidate);
+  }
+  if (pendingExtractedCandidates.length) {
+    await markExtractedQueryCandidatesAttempted(pendingExtractedCandidates.map(candidate => candidate.id)).catch(error => {
+      console.warn('[Extracted Query] failed to record planner attempt', error instanceof Error ? error.message : String(error));
+    });
+  }
   const countryVocab = vocabs.find(v => v.country.toLowerCase() === country.toLowerCase());
   // Free signals are candidate vocabulary only. Read stored signals when the
   // flag is on; on a cold country, refresh once (provider failure falls back
@@ -1861,7 +1941,7 @@ export async function generateCandidateQueriesForCountry(
     organicCandidates,
     freeSignalCandidates,
     demandSignalCandidates,
-    standaloneExtractedCandidates: standaloneExtractedCandidates.map(candidate => ({
+    standaloneExtractedCandidates: pendingExtractedCandidates.map(candidate => ({
       id: candidate.id,
       candidateText: candidate.candidateText,
       language: candidate.language,
@@ -1898,9 +1978,7 @@ export async function generateCandidateQueriesForCountry(
     }, { history });
     const extractedCandidateId = Number((candidate.metadata as any)?.extractedCandidateId || 0);
     if (Number.isSafeInteger(extractedCandidateId) && extractedCandidateId > 0) {
-      await linkExtractedQueryCandidate(extractedCandidateId, record.id).catch(error => {
-        console.warn('[Extracted Query] failed to link candidate to query', { candidateId: extractedCandidateId, queryId: record.id, error: error instanceof Error ? error.message : String(error) });
-      });
+      await linkCandidate(extractedCandidateId, record.id);
     }
     const aliasOf = candidate.metadata?.aliasOf;
     history.push({

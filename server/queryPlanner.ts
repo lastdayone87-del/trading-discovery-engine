@@ -721,7 +721,7 @@ export function planDiverseQueries(args: {
   // for each creator-derived candidate still ahead in the ordering; deferred
   // filler is retried after the first pass when a reserved candidate fails a
   // gate, so the portfolio is not underfilled.
-  const CREATOR_DERIVED_TEMPLATES = new Set(['ANCHOR_LEARNED', 'ORGANIC_STANDALONE', 'ANCHOR_ORGANIC']);
+  const CREATOR_DERIVED_TEMPLATES = new Set(['ANCHOR_LEARNED', 'EXTRACTED_STANDALONE', 'ORGANIC_STANDALONE', 'ANCHOR_ORGANIC']);
   const isCreatorDerived = (candidate: (typeof candidates)[number]) => CREATOR_DERIVED_TEMPLATES.has(candidate.template);
   const creatorRemainingAfter = new Array<number>(candidates.length + 1).fill(0);
   for (let index = candidates.length - 1; index >= 0; index -= 1) {
@@ -745,7 +745,14 @@ export function planDiverseQueries(args: {
     if (hasTier3) tier3Used++;
     const tiers = [...new Set(candidate.atoms.map(item => item.tier))] as QueryKnowledgeTier[];
     const primary = candidate.atoms[0];
-    const preferredLanguage = supportedLanguages.length ? supportedLanguages[planned.length % supportedLanguages.length] : undefined;
+    // A native extracted query must carry its own language into admission and
+    // the search worker. Batch rotation only applies to generated surfaces.
+    const extractedLanguage = candidate.extracted?.language;
+    const preferredLanguage = candidate.template === 'EXTRACTED_STANDALONE'
+      && extractedLanguage
+      && supportedLanguages.includes(extractedLanguage)
+      ? extractedLanguage
+      : supportedLanguages.length ? supportedLanguages[planned.length % supportedLanguages.length] : undefined;
     const freeSignalTerminology = candidate.freeSignal
       ? provenBySurface.get(normalizeQuery(candidate.freeSignal.surface))
       : undefined;

@@ -10,6 +10,8 @@ import {
   persistExtractedQueryCandidates,
   getStandaloneExtractedQueryCandidates,
   getExtractedQueryCandidates,
+  markExtractedQueryCandidatesAttempted,
+  reconcileExtractedQueryCandidates,
   resetQueryIntelligenceSummaryCacheForTests,
 } from './db';
 import { getTerminologyDashboardPage } from './terminologyIntelligence';
@@ -143,6 +145,7 @@ test('Stage 4 PostgreSQL: extracted query ledger deduplicates and serves accepte
   process.env.PGSSL = 'disable';
   const db = await getDb();
   const suffix = `extracted-ledger-${Date.now()}-${process.pid}`;
+  let reconciledQueryId: number | null = null;
   try {
     const candidate = {
       candidateKey: `${suffix}-key`,
@@ -163,11 +166,43 @@ test('Stage 4 PostgreSQL: extracted query ledger deduplicates and serves accepte
     };
     assert.deepEqual(await persistExtractedQueryCandidates([candidate]), { accepted: 1, rejected: 0, duplicates: 0 });
     assert.deepEqual(await persistExtractedQueryCandidates([{ ...candidate, sourceChannelId: 'channel-test-2' }]), { accepted: 0, rejected: 0, duplicates: 1 });
+    // Re-observing the same source is a reprocessing event, not a new sighting.
+    await persistExtractedQueryCandidates([candidate]);
+    const duplicateCount = (await db.query(
+      'SELECT duplicate_count FROM extracted_query_candidates WHERE candidate_key=$1',
+      [candidate.candidateKey],
+    )).rows[0].duplicate_count;
+    assert.equal(Number(duplicateCount), 1);
     const standalone = await getStandaloneExtractedQueryCandidates('United States', 50);
     assert.ok(standalone.some(row => row.candidateKey === candidate.candidateKey));
+    const candidateId = standalone.find(row => row.candidateKey === candidate.candidateKey)!.id;
+    // A transient pre-link failure self-heals from existing query text.
+    const reconciledQuery = await db.query(
+      `INSERT INTO query_library(query,country,collection,intent,normalized_query,performance_score,times_executed)
+       VALUES($1,'United States','EXPERIMENTAL','GENERAL',$2,0,0) RETURNING id`,
+      [`${suffix} reconciled query`, 'matching normalized text'],
+    );
+    reconciledQueryId = Number(reconciledQuery.rows[0].id);
+    await persistExtractedQueryCandidates([{
+      ...candidate,
+      candidateKey: `${suffix}-reconciled`,
+      candidateText: 'Matching normalized text',
+      normalizedText: 'matching normalized text',
+    }]);
+    assert.ok(await reconcileExtractedQueryCandidates('United States') >= 1);
+    const reconciledRow = await db.query(
+      'SELECT query_id FROM extracted_query_candidates WHERE candidate_key=$1',
+      [`${suffix}-reconciled`],
+    );
+    assert.equal(Number(reconciledRow.rows[0].query_id), reconciledQueryId);
+    await markExtractedQueryCandidatesAttempted([candidateId]);
+    const rotated = await getStandaloneExtractedQueryCandidates('United States', 50);
+    assert.ok(!rotated.some(row => row.candidateKey === candidate.candidateKey));
+    await db.query('UPDATE extracted_query_candidates SET last_attempted_at=NULL WHERE id=$1', [candidateId]);
     const lcb = await getExtractedQueryCandidates('United States', 100, 0);
     assert.ok(lcb.some(row => row.candidateKey === candidate.candidateKey));
   } finally {
     await db.query('DELETE FROM extracted_query_candidates WHERE candidate_key LIKE $1', [`${suffix}%`]).catch(() => undefined);
+    if (reconciledQueryId) await db.query('DELETE FROM query_library WHERE id=$1', [reconciledQueryId]).catch(() => undefined);
   }
 });

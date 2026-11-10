@@ -108,6 +108,8 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
   const [queries, setQueries] = useState<QueryRecord[]>([]);
   const [terminology, setTerminology] = useState<CanonicalTradingTerm[]>([]);
   const [extractedCandidates, setExtractedCandidates] = useState<ExtractedCandidateLCB[]>([]);
+  const [extractedCandidatesError, setExtractedCandidatesError] = useState<string | null>(null);
+  const [extractedOffset, setExtractedOffset] = useState(0);
   const [logs, setLogs] = useState<QueryExecutionLog[]>([]);
   const [summary, setSummary] = useState<QueryIntelligenceSummary | null>(null);
   const [qualityDashboardState, setQualityDashboard] = useState<QualityDashboard | null>(null);
@@ -198,7 +200,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
       // must not discard a healthy quality response and show the wrong error.
       // Heavy lists are fetched only for the visible tab; the small summary
       // supplies the tab counts even if a list request fails.
-      const extractionParams = new URLSearchParams({ limit: '50' });
+      const extractionParams = new URLSearchParams({ limit: '50', offset: String(extractedOffset) });
       if (requestCountry !== 'All') extractionParams.set('country', requestCountry);
       const [libRes, terminologyRes, extractionRes, logRes, statusRes, scopeRes, qualityRes] = await Promise.all([
         includeLibrary ? apiFetch(`/api/query-intelligence/library?${libraryParams.toString()}`).catch(() => null) : Promise.resolve(null),
@@ -264,7 +266,18 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
       if (requestId !== fetchSequence.current) return;
       if (lib) setQueries(lib);
       if (terminologyData) setTerminology(terminologyData);
-      if (extractionData) setExtractedCandidates(extractionData);
+      if (includeExtraction) {
+        if (!extractionRes || !extractionRes.ok) {
+          setExtractedCandidates([]);
+          setExtractedCandidatesError('Unable to load extraction candidates.');
+        } else if (Array.isArray(extractionData)) {
+          setExtractedCandidates(extractionData);
+          setExtractedCandidatesError(null);
+        } else {
+          setExtractedCandidates([]);
+          setExtractedCandidatesError('The extraction candidate projection returned an unreadable response.');
+        }
+      }
       if (logData) setLogs(logData);
       if (statusData) setStatus(statusData);
       if (scopeData) {
@@ -287,10 +300,17 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
     setQualityDashboard(null);
     setQualityDashboardCountry(null);
     setQualityDashboardError(null);
+    setExtractedCandidates([]);
+    setExtractedCandidatesError(null);
     fetchData();
     const interval = setInterval(fetchData, 10000); // refresh every 10s
     return () => clearInterval(interval);
-  }, [selectedCountry, selectedCollection, activeSubTab]);
+  }, [selectedCountry, selectedCollection, activeSubTab, extractedOffset]);
+
+  // Page numbers belong to a country. Reset them when the filter changes.
+  useEffect(() => {
+    setExtractedOffset(0);
+  }, [selectedCountry]);
 
   // Handle Pause / Resume toggle
   const handleTogglePause = async () => {
@@ -863,7 +883,25 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
                   <h4 className="text-xs font-black text-slate-900 dark:text-white">Extraction LCB — accepted and rejected query candidates</h4>
                   <p className="text-[10px] text-slate-500">Source title, extraction decision, standalone eligibility and actual discovery/quota outcomes.</p>
                 </div>
-                <span className="text-[10px] font-mono text-slate-500">{extractedCandidates.length} rows</span>
+                <div className="flex items-center gap-2">
+                  {extractedCandidatesError ? (
+                    <span className="text-[10px] text-rose-600 dark:text-rose-400">{extractedCandidatesError}</span>
+                  ) : (
+                    <span className="text-[10px] font-mono text-slate-500">{extractedCandidates.length} rows · page {Math.floor(extractedOffset / 50) + 1}</span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setExtractedOffset(Math.max(0, extractedOffset - 50))}
+                    disabled={extractedOffset === 0}
+                    className="rounded border border-slate-300 px-1.5 py-0.5 text-[10px] disabled:opacity-40 dark:border-slate-600"
+                  >Prev</button>
+                  <button
+                    type="button"
+                    onClick={() => setExtractedOffset(extractedOffset + 50)}
+                    disabled={extractedCandidates.length < 50}
+                    className="rounded border border-slate-300 px-1.5 py-0.5 text-[10px] disabled:opacity-40 dark:border-slate-600"
+                  >Next</button>
+                </div>
               </div>
               <div className="max-h-72 overflow-auto rounded-lg border border-slate-200 dark:border-slate-800">
                 <table className="w-full text-left text-[10px]">
@@ -871,8 +909,10 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
                     <tr><th className="p-1.5">Candidate</th><th className="p-1.5">Market</th><th className="p-1.5">Decision</th><th className="p-1.5">Standalone</th><th className="p-1.5">Sightings</th><th className="p-1.5">Runs / quota</th><th className="p-1.5">New / quality</th></tr>
                   </thead>
                   <tbody>
-                    {extractedCandidates.length === 0 ? (
-                      <tr><td className="p-2 text-slate-500" colSpan={7}>No extraction candidates recorded yet.</td></tr>
+                    {extractedCandidatesError ? (
+                      <tr><td className="p-2 text-rose-500" colSpan={7}>{extractedCandidatesError}</td></tr>
+                    ) : extractedCandidates.length === 0 ? (
+                      <tr><td className="p-2 text-slate-500" colSpan={7}>No extraction candidates recorded for this page.</td></tr>
                     ) : extractedCandidates.map(item => (
                       <tr key={item.id} className="border-t border-slate-100 dark:border-slate-800 align-top">
                         <td className="p-1.5">

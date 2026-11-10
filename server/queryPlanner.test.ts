@@ -318,6 +318,8 @@ test('non-Latin extracted standalone queries plan, admit and keep execution auth
   });
   const extracted = planned.find(item => item.metadata.queryTemplate === 'EXTRACTED_STANDALONE');
   assert.ok(extracted, `no native extracted standalone query: ${planned.map(item => `${item.metadata.queryTemplate}:${item.query}`).join(' | ')}`);
+  assert.equal((extracted.metadata as any).preferredLanguage, 'ta');
+  assert.equal((extracted.metadata as any).languageLineage.selectedLanguage, 'ta');
   const admitted = admitQueryRecord({
     query: extracted.query,
     country: 'Singapore',
@@ -344,6 +346,29 @@ test('non-Latin extracted standalone queries plan, admit and keep execution auth
     generation_metadata: extracted.metadata,
   });
   assert.equal(authority.eligible, true, authority.reasonCodes.join(','));
+});
+
+test('extracted standalone queries survive creator-derived reservation pressure', () => {
+  const terminology: ExtractedTermRecord[] = ['DAX', 'Orderflow', 'Footprint', 'Liquidität', 'Risikomanagement', 'Chartanalyse', 'Scalping', 'Breakout']
+    .map((value, index) => term(index + 1, value, 2, 5));
+  const planned = planDiverseQueries({
+    country: 'Germany',
+    count: 4,
+    learnedVocabulary: terminology,
+    existingQueries: [],
+    standaloneExtractedCandidates: [{
+      id: 9003,
+      candidateText: 'Footprint Trading DAX',
+      language: 'de',
+      intent: 'strategy',
+      confidence: 0.8,
+      sourceTitle: 'Footprint Trading DAX Orderflow',
+    }],
+  });
+  assert.ok(
+    planned.some(item => item.metadata.queryTemplate === 'EXTRACTED_STANDALONE' && item.query === 'Footprint Trading DAX'),
+    planned.map(item => `${item.metadata.queryTemplate}:${item.query}`).join(' | '),
+  );
 });
 
 test('ambiguous short modifiers are not used by frontier target fallback', () => {

@@ -22,12 +22,14 @@ CREATE TABLE IF NOT EXISTS extracted_query_candidates (
   duplicate_count INTEGER NOT NULL DEFAULT 0,
   duplicate_sources JSONB NOT NULL DEFAULT '[]'::jsonb,
   query_id INTEGER REFERENCES query_library(id) ON DELETE SET NULL,
+  last_attempted_at TIMESTAMPTZ,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE(country, language, candidate_key)
 );
 CREATE INDEX IF NOT EXISTS idx_extracted_query_candidates_serving
-  ON extracted_query_candidates(country, decision, standalone_eligible, duplicate_of, query_id);
+  ON extracted_query_candidates(country, decision, standalone_eligible, duplicate_of, query_id, last_attempted_at);
 CREATE INDEX IF NOT EXISTS idx_extracted_query_candidates_query
   ON extracted_query_candidates(query_id) WHERE query_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_extracted_query_candidates_recent

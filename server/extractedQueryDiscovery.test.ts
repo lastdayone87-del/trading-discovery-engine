@@ -62,6 +62,48 @@ test('nuisance-only titles and promo fragments are rejected before the ledger', 
   }), null);
 });
 
+test('ambiguous single words do not turn everyday titles into searches', () => {
+  for (const title of ['Day in the Life', 'Movie Review Tonight', 'Customer Support Tips']) {
+    const rejected: string[] = [];
+    const accepted = deriveDeterministicQueryCandidates({
+      sources: video(title), country: 'United States', language: 'en',
+      onRejected: candidate => rejected.push(...candidate.reasons),
+    });
+    assert.deepEqual(accepted, [], title);
+    assert.ok(rejected.includes('NO_TRADING_INTENT'), `${title}: ${rejected.join(',')}`);
+  }
+  const useful = deriveDeterministicQueryCandidates({
+    sources: video('Volume Profile and Price Action'),
+    country: 'United States', language: 'en',
+  });
+  assert.ok(useful.some(candidate => /Volume Profile/i.test(candidate.candidateText)));
+});
+
+test('LLM grounding uses word boundaries, not substrings inside other words', () => {
+  const reasons: string[] = [];
+  const accepted = assessLlmQueryCandidates({
+    queries: ['order flow'],
+    sources: video('disorder flow trading setup'),
+    country: 'United States', language: 'en',
+    onRejected: candidate => reasons.push(...candidate.reasons),
+  });
+  assert.deepEqual(accepted, []);
+  assert.ok(reasons.includes('NOT_LITERAL_SOURCE'));
+});
+
+test('emoji and hashtag-only sources leave a nuisance audit row', () => {
+  const rejected = [] as Array<{ candidateText: string; reasons: string[]; candidateKey: string }>;
+  const accepted = deriveDeterministicQueryCandidates({
+    sources: video('🔴 #trading'),
+    country: 'United States', language: 'en',
+    onRejected: candidate => rejected.push(candidate),
+  });
+  assert.deepEqual(accepted, []);
+  assert.equal(rejected.length, 1);
+  assert.ok(rejected[0].candidateKey.startsWith('nuisance:'));
+  assert.deepEqual(rejected[0].reasons, ['NO_TEXT']);
+});
+
 test('native-language unspaced candidates and playlist context are supported', () => {
   const japanese = deriveDeterministicQueryCandidates({
     sources: video('日足と4時間足が逆向きなら見送る|ETHの見方'),

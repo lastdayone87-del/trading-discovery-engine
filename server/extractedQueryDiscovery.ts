@@ -7,6 +7,7 @@
  * surfaces are reported through the same assessment so the LCB can explain
  * what was discarded and why.
  */
+import { createHash } from 'node:crypto';
 import { detectLanguage } from './languageDetection';
 import { isSearchableTradingTerm } from './terminologySearchability';
 
@@ -68,23 +69,34 @@ const LEADING_STOPWORDS = new Set([
   'de', 'la', 'le', 'les', 'du', 'des', 'et', 'der', 'die', 'das', 'und', 'het', 'een', 'van', 'en',
   'el', 'los', 'las', 'y', 'il', 'gli', 'di', 'e', 'para', 'por', 'con', 'sur', 'dans',
 ]);
-const INTENT_TOKENS = new Set([
-  'trade', 'trading', 'trader', 'market', 'markets', 'analysis', 'analyse', 'analisi', 'analisis',
-  'technical', 'technique', 'technische', 'tecnica', 'técnica', 'price', 'action', 'volume', 'profile',
-  'order', 'flow', 'orderflow', 'footprint', 'breakout', 'scalp', 'scalping', 'futures', 'forex', 'crypto',
-  'bitcoin', 'btc', 'eth', 'nasdaq', 'nq', 'dax', 'gold', 'silver', 'oil', 'stock', 'stocks', 'options',
-  'strategy', 'strategie', 'stratégie', 'strategi', 'risk', 'liquidity', 'chart', 'charts', 'chartanalyse',
-  'charttechnik', 'gex', 'gamma', 'delta', 'vwap', 'seasonality', 'recap', 'review', 'bourse', 'bolsa',
-  'aandelen', 'aktien', 'aktier', 'aksi', 'aksje', 'acciones', 'azioni', 'titoli', 'mercado', 'mercato',
-  'markt', 'beurs', 'intradia', 'intradía', 'intraday', 'daytrading', 'day', 'swing', 'invest', 'investing',
-  'investir', 'portefeuille', 'portfolio', 'soporte', 'support', 'resistencia', 'resistance', 'widerstand',
-  'unterstutzung', 'unterstützung', 'haussier', 'baissier', 'bullish', 'bearish', 'elliott', 'fibonacci',
-  'hedge', 'arbitrage', 'bonds', 'yields', 'commodities', 'indices', 'index', 'etf', 'candlestick',
-  'backtest', 'backtesting', 'algorithmic', 'quant', 'position', 'leverage', 'margin', 'volatility',
-  'sentiment', 'fundamental', 'fundamentals', 'handel', 'handelsstrategie', 'börse', 'boerse',
-  'aktie', 'aksjer', 'aksje', 'trade', 'trades', 'traden', 'handeln', 'operar', 'operativa',
-  'comercio', 'negociación', 'negociacion', 'négociation', 'investisse', 'inversión', 'inversion',
+const STRONG_INTENT_TOKENS = new Set([
+  'trade', 'trading', 'trader', 'trades', 'traden', 'handel', 'handelsstrategie',
+  'technical', 'technische', 'tecnica', 'técnica', 'technique', 'chartanalyse', 'charttechnik',
+  'orderflow', 'footprint', 'breakout', 'scalp', 'scalping', 'futures', 'forex', 'crypto',
+  'bitcoin', 'btc', 'eth', 'nasdaq', 'nq', 'dax', 'gold', 'silver', 'oil', 'stock', 'stocks',
+  'options', 'strategy', 'strategie', 'stratégie', 'strategi', 'liquidity', 'gex', 'gamma',
+  'delta', 'vwap', 'seasonality', 'bourse', 'bolsa', 'aandelen', 'aktien', 'aktie', 'aktier',
+  'aksi', 'aksje', 'aksjer', 'acciones', 'azioni', 'titoli', 'mercado', 'mercato', 'markt',
+  'beurs', 'intradia', 'intradía', 'intraday', 'daytrading', 'portefeuille', 'portfolio',
+  'haussier', 'baissier', 'bullish', 'bearish', 'elliott', 'fibonacci', 'hedge', 'arbitrage',
+  'bonds', 'yields', 'commodities', 'etf', 'candlestick', 'backtest', 'backtesting',
+  'algorithmic', 'quant', 'leverage', 'volatility', 'fundamental', 'fundamentals',
+  'börse', 'boerse',
 ]);
+// Ambiguous words are not enough on their own. Two weak trading words
+// ("volume profile", "price action", "market analysis") still form a useful
+// query, while "movie review tonight" or "customer support tips" do not.
+const WEAK_INTENT_TOKENS = new Set([
+  'analysis', 'analyse', 'analisi', 'analisis', 'market', 'markets', 'mercado', 'mercato',
+  'markt', 'price', 'action', 'volume', 'profile', 'order', 'flow', 'day', 'swing',
+  'review', 'recap', 'chart', 'charts', 'risk', 'management', 'support', 'resistance',
+  'soporte', 'resistencia', 'widerstand', 'unterstutzung', 'unterstützung', 'index',
+  'indices', 'position', 'sizing', 'margin', 'structure', 'outlook', 'trend', 'signal',
+  'signals', 'pattern', 'patterns', 'zone', 'zones', 'level', 'levels', 'sentiment',
+  'invest', 'investing', 'investir', 'inversión', 'inversion', 'comercio', 'operar',
+  'operativa', 'negociación', 'negociacion', 'négociation', 'investisse',
+]);
+
 
 // Script-scoped trading intent for native surfaces the English token list
 // cannot see. Substring matching is intentional: Han/Kana/Hangul are unspaced,
@@ -151,13 +163,28 @@ function candidateSegments(title: string): string[] {
   return rawSegments(title).filter(segment => !isClickbait(segment));
 }
 
+function containsLiteralPhrase(source: string, candidate: string): boolean {
+  if (!candidate) return false;
+  // Unspaced native surfaces have no word boundary; substring grounding is
+  // the only meaningful literal check. Spaced phrases use Unicode-aware
+  // boundaries so "order flow" cannot match inside "disorder flow".
+  if (!/\s/u.test(candidate)) return source.includes(candidate);
+  const escaped = candidate.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, 'iu').test(source);
+}
+
 function hasTradingIntent(text: string): boolean {
   const words = text
     .toLocaleLowerCase('en')
     .split(/\s+/gu)
     .map(word => word.replace(/[^\p{L}\p{N}]/gu, ''))
     .filter(Boolean);
-  if (words.some(word => INTENT_TOKENS.has(word))) return true;
+  let weakMatches = 0;
+  for (const word of words) {
+    if (STRONG_INTENT_TOKENS.has(word)) return true;
+    if (WEAK_INTENT_TOKENS.has(word)) weakMatches += 1;
+  }
+  if (weakMatches >= 2) return true;
   for (const { script, tokens } of SCRIPT_INTENT_TOKENS) {
     if (script.test(text) && tokens.some(token => text.includes(token))) return true;
   }
@@ -213,15 +240,23 @@ function rejectedCandidate(input: {
   sourceTitle: string;
   reasons: string[];
 }): ExtractedQueryCandidate | null {
-  const candidateText = normalizeExtractedCandidate(input.text);
-  if (!candidateText) return null;
+  let candidateText = normalizeExtractedCandidate(input.text);
+  // Symbol/emoji-only surfaces normalize to nothing but still deserve an
+  // audit row. Keep the original bounded surface and a stable synthetic key.
+  let candidateKey = candidateText.toLocaleLowerCase('en');
+  if (!candidateText) {
+    const raw = String(input.sourceTitle || input.text || '').trim();
+    if (!raw) return null;
+    candidateText = raw.slice(0, 80);
+    candidateKey = `nuisance:${createHash('sha1').update(raw).digest('hex').slice(0, 20)}`;
+  }
   const detected = detectLanguage(candidateText, { countryHint: input.country });
   const language = detected.language !== 'und'
     ? detected.language
     : (input.language || detected.language);
   const normalizedText = candidateText.toLocaleLowerCase('en');
   return {
-    candidateKey: normalizedText,
+    candidateKey,
     candidateText,
     normalizedText,
     country: input.country,
@@ -392,6 +427,14 @@ export function deriveDeterministicQueryCandidates(args: {
     seen: new Set(),
   };
   for (const source of args.sources) {
+    if (!normalizeExtractedCandidate(source.text)) {
+      emitRejection(sink, {
+        text: source.text, country: args.country, language: args.language,
+        sourceKind: source.kind, sourceIndex: source.index, sourceVideoId: source.videoId,
+        sourceTitle: source.text, reasons: ['NO_TEXT'],
+      });
+      continue;
+    }
     if (source.kind === 'DESCRIPTION' || source.kind === 'PLAYLIST_DESCRIPTION') {
       // Descriptions are context, not standalone title candidates unless they
       // contain a compact phrase; use only short first segments.
@@ -477,7 +520,7 @@ export function assessLlmQueryCandidates(args: {
     if (typeof raw !== 'string') continue;
     const normalizedRaw = normalizeExtractedCandidate(raw).toLocaleLowerCase('en');
     const literalSource = args.sources.find(item =>
-      normalizeExtractedCandidate(item.text).toLocaleLowerCase('en').includes(normalizedRaw));
+      containsLiteralPhrase(normalizeExtractedCandidate(item.text).toLocaleLowerCase('en'), normalizedRaw));
     const source = literalSource || args.sources[0];
     if (!source) continue;
     const assessment = assessExtractedQueryCandidateDetailed({

@@ -822,6 +822,11 @@ test('admissibility gate requires admission-passable candidates', () => {
   assert.equal(isAdmissibleParsed({ terminology: 'DAX' }, ctx), false);
   assert.equal(isAdmissibleParsed({ terminology: [] }, ctx), false);
   assert.equal(isAdmissibleParsed({ terminology: [42, null] }, ctx), false);
+  // Query-only provider responses use the extracted-query gate, not the
+  // weaker vocabulary literal check.
+  const queryCtx = admissibilityContext({ country: 'Germany' });
+  assert.equal(isAdmissibleParsed({ queries: ['live'] }, queryCtx), false);
+  assert.equal(isAdmissibleParsed({ queries: ['DAX Analyse'] }, queryCtx), true);
   // Not literally present: classifier rejects as non-literal.
   assert.equal(isAdmissibleParsed({ terminology: ['NonexistentTermXYZ'] }, ctx), false);
   // Too short for admission.
