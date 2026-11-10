@@ -358,3 +358,18 @@ test('semantic ambiguity without independent evidence still enriches', () => {
   }), { independentEvidence: false });
   assert.equal(routed.route, 'ENRICH');
 });
+
+test('chart links do not erase trading analysis on the same description line', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'TRADING_CONFIRMED', confidenceScore: 90, recognitionState: 'AMBIGUOUS_THIN', semanticPolicy: 'BOUNDED_WAIT',
+    providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
+  }), {
+    independentEvidence: true,
+    videoTexts: [
+      'makeup tutorial\nEURUSD analysis https://chart.example.com/1',
+      'beauty routine\nGBPUSD analysis https://chart.example.com/2',
+      'dance vlog\nUSDJPY analysis https://chart.example.com/3',
+    ],
+  });
+  assert.equal(routed.route, 'SEMANTIC_TRADING');
+});
