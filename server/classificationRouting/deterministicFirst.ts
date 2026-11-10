@@ -56,12 +56,13 @@ type RoutingInput = Pick<
   'status' | 'confidenceScore' | 'evidenceCollection' | 'recognitionState' | 'semanticPolicy' | 'decisionPolicy' | 'classificationMethod'
 >;
 
-export const STRONG_TRADING_ANALYSIS = /(technical\s*analysis|price\s*action|market\s*analysis|\bict\b|\bsmc\b|day\s*trad|swing\s*trad|scalp|live\s*trad|trade\s*setup|trade\s*journal|back\s*test|backtest|risk\s*management|chart\s*analysis|market\s*structure|volume\s*profile|footprint|forex\s*analysis|futures?\s*analysis|options?\s*analysis|stock\s*analysis|crypto\s*analysis|support\s*and\s*resistance|candlestick|breakout|pullback|moving\s*average|\brsi\b|\bmacd\b|fibonacci|elliott|wyckoff|\bpnl\b|p\s*&\s*l|trading\s*strategy|trading\s*education|market\s*update|market\s*recap|price\s*analysis|market\s*outlook|gold\s*analysis|silver\s*analysis|metals?\s*analysis|commodity\s*analysis|platinum\s*analysis|capital\s*market|\bvix\b|macro\s*(?:analysis|outlook|commentary|positioning)|market\s*crash|прогноз|анализ|تحلیل\s*(?:تکنیکال|بازار|فنی)|ترید|معامله\s*گری|технический\s*анализ|анализ\s*рынка|трейдинг|analyse\s*(?:technique|du\s*marché)|analyse\s*de\s*marché|技術分析|技術的な分析|차트\s*분석|기술적\s*분석|analyse\s*technique|an[aá]lisis\s*t[eé]cnico|analisi\s*tecnica|technische\s*analyse|teknik\s*analiz|テクニカル分析|技术分析|تحليل\s*فني|технический\s*анализ)/iu;
+export const STRONG_TRADING_ANALYSIS = /(technical\s*analysis|price\s*action|market\s*analysis|\bict\b|\bsmc\b|day\s*trad|swing\s*trad|scalp|live\s*trad|trade\s*setup|trade\s*journal|back\s*test|backtest|risk\s*management|chart\s*analysis|market\s*structure|volume\s*profile|footprint|forex\s*analysis|futures?\s*analysis|options?\s*analysis|stock\s*analysis|crypto\s*analysis|support\s*and\s*resistance|candlestick|breakout|pullback|moving\s*average|\brsi\b|\bmacd\b|fibonacci|elliott|wyckoff|\bpnl\b|p\s*&\s*l|trading\s*strategy|trading\s*education|market\s*update|market\s*recap|market\s*(?:forecast|outlook|preview)|weekly\s*(?:forecast|outlook|preview)|price\s*(?:forecast|outlook)|\bforecast\b|\boutlook\b|price\s*analysis|gold\s*analysis|silver\s*analysis|metals?\s*analysis|commodity\s*analysis|platinum\s*analysis|capital\s*market|\bvix\b|macro\s*(?:analysis|outlook|commentary|positioning)|market\s*crash|прогноз|анализ|تحلیل\s*(?:تکنیکال|بازار|فنی)|ترید|معامله\s*گری|технический\s*анализ|анализ\s*рынка|трейдинг|analyse\s*(?:technique|du\s*marché)|analyse\s*de\s*marché|技術分析|技術的な分析|차트\s*분석|기술적\s*분석|analyse\s*technique|an[aá]lisis\s*t[eé]cnico|analisi\s*tecnica|technische\s*analyse|teknik\s*analiz|テクニカル分析|技术分析|تحليل\s*فني|технический\s*анализ)/iu;
+
 const NON_TRADING_FOCUS: Array<[string, RegExp]> = [
-  ['ENTERTAINMENT', /(dance|dancing|choreography|music|song|lyrics|vlog|prank|recipe|cooking|gaming|gameplay|fortnite|minecraft|makeup|beauty|unboxing|reaction)/giu],
-  ['PROMOTION', /(memecoin|meme\s*coin|presale|pre-sale|airdrop|nft|play[\s-]*to[\s-]*earn|giveaway|sponsorship|sponsored|referral|token\s*launch|pump|buy\s*\$|contract\s*address)/giu],
-  ['PERSONAL_FINANCE', /(personal\s*finance|debt|budget|credit\s*card|credit|savings?|mortgage|retirement|paycheck|money\s*management|get\s*out\s*of\s*debt|win\s*with\s*money)/giu],
-  ['EXCHANGE_CORPORATE', /(stock\s*exchange|listing|award|gong|corporate|annual\s*report|market\s*opening|ceremony|beleggingsoplossing)/giu],
+  ['ENTERTAINMENT', /\b(?:dance|dancing|choreography|music|song|lyrics|vlog|prank|recipe|cooking|gaming|gameplay|fortnite|minecraft|makeup|beauty|unboxing|(?<!market\s)(?<!price\s)reaction)s?\b/giu],
+  ['PROMOTION', /\b(?:memecoin|meme\s*coin|presale|pre-sale|airdrop|nft|play[\s-]*to[\s-]*earn|giveaway|token\s*launch|pump(?!\s*(?:and|&|n)\s*dump)|contract\s*address)s?\b|\bbuy\s*\$/giu],
+  ['PERSONAL_FINANCE', /\b(?:personal\s*finance|debt|budgeting?|credit\s*(?:card|score|repair)|savings?|mortgage|retirement|paycheck|money\s*management|get\s*out\s*of\s*debt|win\s*with\s*money)\b/giu],
+  ['EXCHANGE_CORPORATE', /\b(?:stock\s*exchange|exchange\s*listing|listing\s*ceremony|award|gong|annual\s*report|market\s*opening|opening\s*ceremony|beleggingsoplossing)\b/giu],
 ];
 
 export function nonTradingContentFocus(text: string): { total: number; categories: string[] } {
@@ -75,6 +76,36 @@ export function nonTradingContentFocus(text: string): { total: number; categorie
     }
   }
   return { total, categories };
+}
+
+/** URLs and contact details are distribution boilerplate, not subject evidence. */
+export function stripDistributionText(text: string): string {
+  return text
+    .replace(/https?:\/\/\S+/giu, ' ')
+    .replace(/\bwww\.\S+/giu, ' ')
+    .replace(/\b[\w.+-]+@[\w.-]+\.\w+\b/giu, ' ');
+}
+
+/**
+ * Remove lines repeated across videos (broker footers, affiliate blocks) so a
+ * shared description footer cannot count as repeated non-trading focus.
+ */
+export function stripRepeatedFooterLines(texts: string[]): string[] {
+  const linesByVideo = texts.map(text => stripDistributionText(text)
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean));
+  const counts = new Map<string, number>();
+  for (const lines of linesByVideo) {
+    for (const line of new Set(lines)) counts.set(line, (counts.get(line) || 0) + 1);
+  }
+  return linesByVideo.map(lines => {
+    // A single-line video is its subject, not a footer. Keep it even when two
+    // distinct uploads share the same metadata.
+    if (lines.length <= 1) return lines.join(' ').trim();
+    const kept = lines.filter(line => (counts.get(line) || 0) < 2);
+    return (kept.length ? kept : lines.slice(0, 1)).join(' ').trim();
+  });
 }
 
 function semanticProviderReports(decision: RoutingInput) {
@@ -186,7 +217,7 @@ export function resolveClassificationRouting(
     // contains no strong trading-analysis phrase, do not terminalize; send
     // the case to human review. This never rejects and never overrides a
     // video sample that actually contains trading analysis.
-    const videoTexts = (options.videoTexts || []).map(text => String(text || '').trim()).filter(Boolean);
+    const videoTexts = stripRepeatedFooterLines((options.videoTexts || []).map(text => String(text || '').trim()).filter(Boolean));
     if (videoTexts.length >= 3) {
       const focusByVideo = videoTexts.map(text => nonTradingContentFocus(text));
       const focusedVideos = focusByVideo.filter(focus => focus.total >= 1);

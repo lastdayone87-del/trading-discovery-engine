@@ -3,6 +3,20 @@ import { buildCanonicalEvidenceCorpus, verifyChannelTradingRelevance, Verificati
 import { resolveClassificationRouting, resolveClassificationRoutingMode } from './classificationRouting/deterministicFirst';
 
 /**
+ * Semantic provider outcomes only. A deterministic provider failure must not
+ * relabel a semantic attempt as degraded or abstained.
+ */
+export function semanticProviderOutcomeFlags(
+  providers: Array<{ provider?: string; outcome?: string }>,
+): { abstained: boolean; failed: boolean } {
+  const semantic = providers.filter(provider => /semantic/.test(String(provider.provider)));
+  return {
+    abstained: semantic.some(provider => String(provider.outcome).startsWith('ABSTAINED_')),
+    failed: semantic.some(provider => String(provider.outcome).startsWith('FAILED_')),
+  };
+}
+
+/**
  * Main Entry Point: Classifies a YouTube Channel's Trading Relevance
  * Architecture: Evidence-Based Trading Verification Engine
  * 1. Independent Providers (Channel, Video, External, Country Knowledge, Gemini OSINT, Discord)
@@ -52,9 +66,11 @@ export async function classifyTradingRelevanceDetailed(
   const videoDocuments = input.videos?.length
     ? input.videos
     : (input.video_titles || []).map((title, index) => ({ title, description: input.video_descriptions?.[index] || '' }));
-  const videoTexts = [...new Set(videoDocuments
+  // Keep one document per video. Collapsing identical text would hide two
+  // distinct uploads from the mismatch guard.
+  const videoTexts = videoDocuments
     .map(video => [video.title, video.description].filter(Boolean).join(' ').trim())
-    .filter(Boolean))];
+    .filter(Boolean);
   const routing = resolveClassificationRouting(decision, {
     independentEvidence: corroboration?.disposition === 'PASS',
     videoTexts,
@@ -92,8 +108,10 @@ export async function classifyTradingRelevanceDetailed(
   // deterministic fast-track is not misreported as AI-reviewed and a
   // semantic abstention is not presented as a semantic verdict.
   const legacyReporting = routingMode === 'LEGACY';
-  const semanticAbstained = (decision.evidenceCollection.providers || []).some(provider => String(provider.outcome).startsWith('ABSTAINED_'));
-  const semanticFailed = (decision.evidenceCollection.providers || []).some(provider => String(provider.outcome).startsWith('FAILED_'));
+  // Only semantic provider failures/abstentions may affect semantic labels;
+  // a deterministic provider failure must not relabel a semantic attempt.
+  const { abstained: semanticAbstained, failed: semanticFailed } =
+    semanticProviderOutcomeFlags(decision.evidenceCollection.providers || []);
   const semanticServed = legacyReporting
     ? (!!decision.geminiSemanticSummary || String(decision.classificationMethod || '').startsWith('SEMANTIC_'))
     : routing.semanticUsed;
