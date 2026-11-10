@@ -8,6 +8,11 @@ test('Phase 12 diagnostics and materialization routes are governed',()=>{
  // authenticated read policy as the heavy list endpoints.
  const summary = routePolicyInventory.find(r => r.method === 'GET' && new RegExp(r.pattern).test('/api/query-intelligence/summary'));
  assert.equal(summary?.policy, 'operator');
+ // The extraction LCB is a full-list operator projection, not a public read.
+ const extracted = routePolicyInventory.filter(r => r.method === 'GET' && new RegExp(r.pattern).test('/api/query-intelligence/extracted-candidates'));
+ assert.equal(extracted.length, 1);
+ assert.equal(extracted[0].policy, 'operator');
+ assert.equal(extracted[0].action, 'administration.read');
 });
 
 test('maps admin, operator, and transitional reviewer credentials without exposing tokens',()=>{

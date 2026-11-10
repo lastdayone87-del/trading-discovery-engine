@@ -23,6 +23,7 @@ test('language detection identifies supported market languages from real local s
     ['aktiehandel OMXC25', 'Denmark', 'da'],
     ['aksjehandel OBX', 'Norway', 'no'],
     ['technical analysis NQ futures', 'United States', 'en'],
+    ['தங்கம் விலை பகுப்பாய்வு', 'Singapore', 'ta'],
   ];
   for (const [text, countryHint, expected] of cases) {
     const result = detectLanguage(text, { countryHint });
@@ -32,7 +33,9 @@ test('language detection identifies supported market languages from real local s
   assert.equal(detectLanguage('日経225先物', { countryHint: 'Japan' }).language, 'ja');
   assert.equal(detectLanguage('デイトレード').script, 'Jpan');
   assert.equal(detectLanguage('股票交易').language, 'zh');
+  assert.equal(detectLanguage('தங்கம் விலை பகுப்பாய்வு').script, 'Taml');
   assert.equal(languageScript('ja'), 'Jpan');
+  assert.equal(languageScript('ta'), 'Taml');
   assert.equal(languageScript('fr'), 'Latn');
 });
 
