@@ -547,17 +547,31 @@ test('rendered gate bounds a queued wait as capacity', async () => {
     discoveryFloorPct: 0,
     windowMs: 60_000,
   }, () => 0);
-  const gate = new RenderedFallbackGate(1, 2, governor, 25);
+  const gate = new RenderedFallbackGate(1, 2, governor, 1_000);
+  assert.equal(gate.maxWaitMs, 1_000, 'explicit waits are clamped to the supported range');
   let releaseFirst!: () => void;
   const blocker = new Promise<void>(resolve => { releaseFirst = resolve; });
 
   const first = gate.run(async () => { await blocker; }, 'RETRY');
   await new Promise(resolve => setTimeout(resolve, 0));
-  await assert.rejects(
-    gate.run(async () => undefined, 'RETRY'),
-    (error: any) => error?.message === 'RENDERED_FALLBACK_SATURATED'
-      && typeof error.retryAt === 'number',
-  );
+  // Keep a ref'd handle alive so the unref'd production waiter timer cannot be
+  // cancelled by an otherwise idle test event loop.
+  const keepAlive = setTimeout(() => undefined, 3_000);
+  try {
+    await assert.rejects(
+      gate.run(async () => undefined, 'RETRY'),
+      (error: any) => {
+        const now = Date.now();
+        const retryAt = Number(error?.retryAt);
+        const gateWaitMs = Number(error?.gateWaitMs);
+        return error?.message === 'RENDERED_FALLBACK_SATURATED'
+          && retryAt > now && retryAt <= now + 2_000
+          && gateWaitMs >= 900 && gateWaitMs <= 2_000;
+      },
+    );
+  } finally {
+    clearTimeout(keepAlive);
+  }
   assert.equal(gate.snapshot().pending, 0, 'the timed-out waiter is removed');
 
   const third = gate.run(async () => 'third', 'RETRY');

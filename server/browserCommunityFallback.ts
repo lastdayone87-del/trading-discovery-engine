@@ -3790,18 +3790,24 @@ export class RenderedFallbackGate {
   private readonly waiters: RenderedGateWaiter[] = [];
   private lastDeniedLogAtMs = 0;
   private lastWaitTimeoutLogAtMs = 0;
+  readonly maxWaitMs: number;
 
   constructor(
     readonly concurrency: number,
     readonly maxPending: number,
     private readonly admissionGovernor: RenderedAdmissionGovernorLike = renderedAdmissionGovernor,
-    readonly maxWaitMs: number = boundedEnvInt(
+    maxWaitMs: number = boundedEnvInt(
       process.env.RENDERED_FALLBACK_MAX_WAIT_MS,
       90_000,
       1_000,
       300_000,
     ),
-  ) {}
+  ) {
+    const parsed = Number(maxWaitMs);
+    this.maxWaitMs = Number.isFinite(parsed)
+      ? Math.min(300_000, Math.max(1_000, Math.floor(parsed)))
+      : 90_000;
+  }
 
   private pendingLanes(): Set<AcquisitionLane> {
     return new Set(this.waiters.map(waiter => waiter.lane));
@@ -3811,9 +3817,10 @@ export class RenderedFallbackGate {
     return Math.max(1, Math.ceil(this.maxPending * 0.35));
   }
 
-  private saturationError(): Error {
+  private saturationError(gateWaitMs?: number): Error {
     return Object.assign(new Error('RENDERED_FALLBACK_SATURATED'), {
       retryAt: Date.now() + this.maxWaitMs,
+      ...(gateWaitMs !== undefined ? { gateWaitMs } : {}),
     });
   }
 
@@ -3853,12 +3860,14 @@ export class RenderedFallbackGate {
       // A queued crawl must not hold a worker for an unbounded gate wait. The
       // timeout is a capacity deferral, never an acquisition failure; the
       // existing saturation class keeps retry accounting attempt-free.
+      const waitStartedAt = Date.now();
       waiter.timer = setTimeout(() => {
         const index = this.waiters.indexOf(waiter);
         if (index < 0) return; // granted concurrently; grant() cleared the timer
         this.waiters.splice(index, 1);
+        const gateWaitMs = Math.max(0, Date.now() - waitStartedAt);
         this.logWaitTimeout(lane);
-        reject(this.saturationError());
+        reject(this.saturationError(gateWaitMs));
       }, this.maxWaitMs);
       waiter.timer.unref?.();
       this.waiters.push(waiter);
@@ -6395,6 +6404,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
     const saturated=error?.message==='RENDERED_FALLBACK_SATURATED';
     const retryAtValue = Number(error?.retryAt);
     const retryAt = Number.isFinite(retryAtValue) && retryAtValue > 0 ? retryAtValue : undefined;
+    const timedOutWaitMs = Number(error?.gateWaitMs);
+    if (Number.isFinite(timedOutWaitMs) && timedOutWaitMs > 0) {
+      telemetry.gateWaitMs = Math.max(telemetry.gateWaitMs || 0, timedOutWaitMs);
+    }
     const failedAdmissionId = Number(error?.admissionId);
     if (Number.isSafeInteger(failedAdmissionId) && failedAdmissionId > 0
       && !renderedCrawlStarted({ inspectedPages, telemetry })) {

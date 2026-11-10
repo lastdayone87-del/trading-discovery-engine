@@ -16,7 +16,7 @@ dated 2026-07-29 and must keep its original values.
 | `RENDERED_ADMISSION_NOMINAL_PER_HOUR` | `40` | `server/renderedAdmissionGovernor.ts`, `.env.example` | Rolling 60-minute rendered-crawl admissions; clamped to [1, 1000]. |
 | `RENDERED_ADMISSION_EMERGENCY_PER_HOUR` | `48` | `server/renderedAdmissionGovernor.ts`, `.env.example` | Emergency allowance used only when the nominal window is full and another rendered request is queued; clamped to [nominal, 1000]. |
 | `RENDERED_ADMISSION_DISCOVERY_FLOOR_PCT` | `35` | `server/renderedAdmissionGovernor.ts`, `.env.example` | DISCOVERY share reserved whenever discovery work is queued; clamped to [0, 100], evaluated at 0.01% precision. |
-| `RENDERED_FALLBACK_MAX_WAIT_MS` | `90000` | `server/browserCommunityFallback.ts`, `.env.example` | Maximum gate-queue wait for one rendered request; clamped to [1s, 300s]. A timed-out waiter is removed and deferred as `RENDERED_FALLBACK_SATURATED` capacity. The admitted crawl's own total budget remains 60s. |
+| `RENDERED_FALLBACK_MAX_WAIT_MS` | `90000` | `Dockerfile` (`ENV`), `server/browserCommunityFallback.ts`, `.env.example` | Maximum gate-queue wait for one rendered request; clamped to [1s, 300s] for both explicit and environment values. A timed-out waiter is removed and deferred as `RENDERED_FALLBACK_SATURATED` capacity. The admitted crawl's own total budget remains 60s. |
 
 Basis: previously authorized production capacity change (October 2026);
 `SEARCH_WORKER_CONCURRENCY=4` restores that change in code after it was lost
