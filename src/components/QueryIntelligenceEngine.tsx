@@ -110,7 +110,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
   const [extractedCandidates, setExtractedCandidates] = useState<ExtractedCandidateLCB[]>([]);
   const [extractedCandidatesError, setExtractedCandidatesError] = useState<string | null>(null);
   const [extractedOffset, setExtractedOffset] = useState(0);
-  const [extractedSnapshot, setExtractedSnapshot] = useState(() => new Date().toISOString());
+  const [extractedSnapshot, setExtractedSnapshot] = useState<string | null>(null);
   const [logs, setLogs] = useState<QueryExecutionLog[]>([]);
   const [summary, setSummary] = useState<QueryIntelligenceSummary | null>(null);
   const [qualityDashboardState, setQualityDashboard] = useState<QualityDashboard | null>(null);
@@ -201,7 +201,8 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
       // must not discard a healthy quality response and show the wrong error.
       // Heavy lists are fetched only for the visible tab; the small summary
       // supplies the tab counts even if a list request fails.
-      const extractionParams = new URLSearchParams({ limit: '50', offset: String(extractedOffset), before: extractedSnapshot });
+      const extractionParams = new URLSearchParams({ limit: '50', offset: String(extractedOffset) });
+      if (extractedSnapshot) extractionParams.set('before', extractedSnapshot);
       if (requestCountry !== 'All') extractionParams.set('country', requestCountry);
       const [libRes, terminologyRes, extractionRes, logRes, statusRes, scopeRes, qualityRes] = await Promise.all([
         includeLibrary ? apiFetch(`/api/query-intelligence/library?${libraryParams.toString()}`).catch(() => null) : Promise.resolve(null),
@@ -268,6 +269,10 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
       if (lib) setQueries(lib);
       if (terminologyData) setTerminology(terminologyData);
       if (includeExtraction) {
+        if (!extractedSnapshot && extractionRes?.ok) {
+          const issuedSnapshot = extractionRes.headers.get('x-extracted-snapshot');
+          if (issuedSnapshot) setExtractedSnapshot(issuedSnapshot);
+        }
         if (!extractionRes || !extractionRes.ok) {
           setExtractedCandidates([]);
           setExtractedCandidatesError('Unable to load extraction candidates.');
@@ -311,7 +316,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
   // Page numbers belong to a country. Reset them when the filter changes.
   useEffect(() => {
     setExtractedOffset(0);
-    setExtractedSnapshot(new Date().toISOString());
+    setExtractedSnapshot(null);
   }, [selectedCountry]);
 
   // Handle Pause / Resume toggle
@@ -907,7 +912,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
                     type="button"
                     onClick={() => {
                       setExtractedOffset(0);
-                      setExtractedSnapshot(new Date().toISOString());
+                      setExtractedSnapshot(null);
                     }}
                     className="rounded border border-slate-300 px-1.5 py-0.5 text-[10px] dark:border-slate-600"
                   >Refresh</button>

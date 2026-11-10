@@ -668,6 +668,9 @@ async function startServer() {
       const before = beforeRaw && Number.isFinite(Date.parse(beforeRaw))
         ? new Date(beforeRaw).toISOString()
         : undefined;
+      // The browser must not supply its own clock as the page boundary.
+      const snapshot = before || new Date().toISOString();
+      res.setHeader('X-Extracted-Snapshot', snapshot);
       res.json(await getExtractedQueryCandidates(country, limit, offset, before));
     } catch (err: any) {
       res.status(500).json({ error: err.message });

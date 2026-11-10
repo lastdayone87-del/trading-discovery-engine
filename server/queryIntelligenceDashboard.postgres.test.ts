@@ -183,6 +183,15 @@ test('Stage 4 PostgreSQL: extracted query ledger deduplicates and serves accepte
     )).rows[0];
     assert.equal(Number(capped.duplicate_count), 19);
     assert.equal(Number(capped.sample_size), 20);
+    const snapshot = (await db.query('SELECT now() AS snapshot')).rows[0].snapshot as Date;
+    await persistExtractedQueryCandidates([{
+      ...candidate,
+      candidateKey: `${suffix}-after-snapshot`,
+      candidateText: 'After snapshot analysis',
+      normalizedText: 'after snapshot analysis',
+    }]);
+    const beforeRows = await getExtractedQueryCandidates(testCountry, 100, 0, snapshot.toISOString());
+    assert.ok(!beforeRows.some(row => row.candidateKey === `${suffix}-after-snapshot`));
     const standalone = await getStandaloneExtractedQueryCandidates(testCountry, 50);
     assert.ok(standalone.some(row => row.candidateKey === candidate.candidateKey));
     const candidateId = standalone.find(row => row.candidateKey === candidate.candidateKey)!.id;
