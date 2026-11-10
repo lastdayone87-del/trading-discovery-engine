@@ -231,6 +231,18 @@ test('non-Latin native scripts pass intent and preserve their script', () => {
     country: 'Japan', language: 'ja',
   });
   assert.ok(orderBook.some(candidate => candidate.candidateText === '板情報'));
+  const mixedTrading = deriveDeterministicQueryCandidates({
+    sources: video('TRADINGの見方'),
+    country: 'Japan', language: 'ja',
+  });
+  assert.ok(mixedTrading.some(candidate => candidate.candidateText === 'TRADINGの見方'));
+  assert.deepEqual(
+    deriveDeterministicQueryCandidates({
+      sources: video('Silverstone race day'),
+      country: 'United Kingdom', language: 'en',
+    }),
+    [],
+  );
 
   const offTopic = deriveDeterministicQueryCandidates({
     sources: video('木板安装教程'),

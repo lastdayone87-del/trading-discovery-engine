@@ -200,7 +200,7 @@ function hasTradingIntent(text: string): boolean {
   // Mixed native titles often carry their instrument as an ASCII ticker
   // (ETHの見方, DAX Analyse). Treat a known strong ticker as intent without
   // widening the generic native token list.
-  const asciiTerms = (text.match(/[A-Za-z]{2,6}/gu) || []) as string[];
+  const asciiTerms = (text.match(/\b[A-Za-z]+\b/gu) || []) as string[];
   if (asciiTerms.some(term => STRONG_INTENT_TOKENS.has(term.toLocaleLowerCase('en')))) return true;
   for (const { script, tokens } of SCRIPT_INTENT_TOKENS) {
     if (script.test(text) && tokens.some(token => text.includes(token))) return true;
