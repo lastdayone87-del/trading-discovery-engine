@@ -107,6 +107,15 @@ const WEAK_INTENT_TOKENS = new Set([
 // cannot see. Substring matching is intentional: Han/Kana/Hangul are unspaced,
 // and Tamil/Arabic inflect their trading nouns. The list is deliberately
 // narrow (finance/market nouns only), not a generic native-language pass.
+// Numbered instrument roots (DAX40, NQ100, SPX500). Only these may drop a
+// trailing number when matching intent; stripping digits from every strong
+// word would admit brands such as Delta2024 Airlines.
+const NUMBERED_TICKER_BASES = new Set([
+  'dax', 'nq', 'es', 'ym', 'rty', 'spx', 'ndx', 'ftse', 'cac', 'ibex', 'omx',
+  'stoxx', 'hsi', 'nikkei', 'usd', 'eur', 'gbp', 'jpy', 'aud', 'cad', 'chf',
+  'btc', 'eth', 'xau', 'xag', 'wti', 'brent',
+]);
+
 const SCRIPT_INTENT_TOKENS: Array<{ script: RegExp; tokens: string[] }> = [
   {
     script: /[\p{Script=Han}]/u,
@@ -203,8 +212,9 @@ function hasTradingIntent(text: string): boolean {
   const asciiTerms = (text.match(/\b[A-Za-z][A-Za-z0-9]{1,}\b/gu) || []) as string[];
   if (asciiTerms.some(term => {
     const lower = term.toLocaleLowerCase('en');
-    return STRONG_INTENT_TOKENS.has(lower)
-      || STRONG_INTENT_TOKENS.has(lower.replace(/\d+$/u, ''));
+    if (STRONG_INTENT_TOKENS.has(lower)) return true;
+    const base = lower.replace(/\d+$/u, '');
+    return base !== lower && NUMBERED_TICKER_BASES.has(base);
   })) return true;
   for (const { script, tokens } of SCRIPT_INTENT_TOKENS) {
     if (script.test(text) && tokens.some(token => text.includes(token))) return true;

@@ -255,6 +255,13 @@ test('non-Latin native scripts pass intent and preserve their script', () => {
     country: 'Germany', language: 'de',
   });
   assert.ok(dax40.some(candidate => candidate.candidateText === 'DAX40 Analyse'));
+  assert.deepEqual(
+    deriveDeterministicQueryCandidates({
+      sources: video('Delta2024 Airlines'),
+      country: 'United States', language: 'en',
+    }),
+    [],
+  );
   for (const title of ['高配当株', '株主優待']) {
     assert.ok(
       deriveDeterministicQueryCandidates({
