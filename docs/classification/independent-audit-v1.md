@@ -22,11 +22,11 @@ For the 221 decisive human labels:
 | Evaluated decision | Precision | Recall | FPR | FNR | Coverage |
 |---|---:|---:|---:|---:|---:|
 | Stored full engine decision | 95.9% | 70.3% | 8.9% | 0.0% | 74.7% |
-| New routing + precision guard | **100.0%** | 69.1% | **0.0%** | **0.0%** | 71.5% |
-| Deterministic-only engine | **100.0%** | 64.8% | **0.0%** | **0.0%** | 49.3% |
+| New routing + precision guard | **100.0%** | 69.7% | **0.0%** | **0.0%** | 71.9% |
+| Deterministic-only engine | **100.0%** | 38.2% | **0.0%** | **0.0%** | 29.4% |
 
-- Confusion matrix for the routing + guard: TP 114, FP 0, TN 44, FN 0.
-- The deterministic-only engine resolves obvious trading channels without semantic spend and without false positives in this sample. It routes 3 cases to human review rather than auto-confirming them.
+- Confusion matrix for the routing + guard: TP 115, FP 0, TN 44, FN 0.
+- The deterministic-only engine resolves obvious trading channels without semantic spend and without false positives in this sample. The remainder goes to AI/enrichment, not human review. The stricter thin-retrieval exemption deliberately trades deterministic coverage for precision: a stage-0 bio-only candidate must have a substantial creator bio and a creator-bio Tier A family before it can confirm.
 - The new routing guard escalates confirmed channels to human review when the video sample repeatedly contradicts the bio. It never rejects.
 
 ### Cohort breakdown
@@ -36,7 +36,7 @@ The sample is stratified by production cohort, so the headline figures are sampl
 | Source cohort | Decisive labels | Routing resolved | Coverage | Precision | Recall | FPR |
 |---|---:|---:|---:|---:|---:|---:|
 | `TRADING_CONFIRMED` | 93 | 88 | 94.6% | 100% | 100% | 0% |
-| `NEEDS_REVIEW` | 70 | 21 | 30.0% | 100% | 32.3% | 0% |
+| `NEEDS_REVIEW` | 70 | 22 | 31.4% | 100% | 33.8% | 0% |
 | `NON_TRADING` | 44 | 44 | 100% | N/A (no positives) | N/A | 0% |
 | `UNCERTAIN` | 14 | 5 | 35.7% | 100% | 41.7% | 0% |
 
