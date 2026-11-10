@@ -21,3 +21,14 @@ test('review console exposes the evidence and routing that drove the decision', 
   assert.match(ui, /eligibility/);
   assert.match(ui, /review\.history/);
 });
+
+test('review console guards stale responses and supports the OTHER reason contract',()=>{
+  assert.match(ui, /queueRequest/);
+  assert.match(ui, /bundleRequest/);
+  assert.match(ui, /requestId !== queueRequest\.current/);
+  assert.match(ui, /requestId !== bundleRequest\.current/);
+  assert.match(ui, /reviewReasonOther/);
+  assert.match(ui, /reasonCode === 'OTHER'/);
+  assert.match(ui, /storedEvidenceItems/);
+  assert.match(ui, /aria-label="Refresh queue"/);
+});

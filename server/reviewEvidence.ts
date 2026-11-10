@@ -209,10 +209,14 @@ export async function getReviewEvidence(
   }
 
   const cutoff = options.cutoff || (diagnosticRow ? new Date(diagnosticRow.created_at).toISOString() : undefined);
+  let documentsUnavailable = false;
+  let assertionsUnavailable = false;
+  let coverageUnavailable = false;
+  let creatorFocusUnavailable = false;
   const [evidenceDocuments, evidenceAssertions, evidenceCoverage, creatorFocus] = await Promise.all([
-    listEvidenceDocuments({ channelId, limit: Math.min(100, Math.max(1, options.documentLimit || 50)), cutoff }).catch(() => []),
-    listEvidenceAssertions({ channelId, limit: Math.min(200, Math.max(1, options.assertionLimit || 100)), cutoff }).catch(() => []),
-    listEvidenceCoverage({ channelId, limit: Math.min(50, Math.max(1, options.coverageLimit || 20)), cutoff }).catch(() => []),
+    listEvidenceDocuments({ channelId, limit: Math.min(100, Math.max(1, options.documentLimit || 50)), cutoff }).catch(() => { documentsUnavailable = true; return []; }),
+    listEvidenceAssertions({ channelId, limit: Math.min(200, Math.max(1, options.assertionLimit || 100)), cutoff }).catch(() => { assertionsUnavailable = true; return []; }),
+    listEvidenceCoverage({ channelId, limit: Math.min(50, Math.max(1, options.coverageLimit || 20)), cutoff }).catch(() => { coverageUnavailable = true; return []; }),
     diagnosticRow ? db.query(
       `SELECT id,classification_diagnostic_id,classifier_version,policy_version,observed_at,
               document_count,independent_families,trading_mass,alternative_mass,lower_confidence_bound
@@ -221,10 +225,10 @@ export async function getReviewEvidence(
         ORDER BY observed_at DESC,id DESC
         LIMIT 1`,
       [diagnosticRow.id],
-    ).then(result => result.rows[0] || null).catch(() => null) : Promise.resolve(null),
+    ).then(result => result.rows[0] || null).catch(() => { creatorFocusUnavailable = true; return null; }) : Promise.resolve(null),
   ]);
 
-  return mapReviewEvidenceRows({
+  const bundle = mapReviewEvidenceRows({
     review,
     eligibilityRow,
     diagnosticRow,
@@ -233,4 +237,9 @@ export async function getReviewEvidence(
     evidenceCoverage,
     creatorFocusRow: creatorFocus,
   });
+  if (documentsUnavailable) bundle.warnings.push('EVIDENCE_DOCUMENTS_UNAVAILABLE');
+  if (assertionsUnavailable) bundle.warnings.push('EVIDENCE_ASSERTIONS_UNAVAILABLE');
+  if (coverageUnavailable) bundle.warnings.push('EVIDENCE_COVERAGE_UNAVAILABLE');
+  if (creatorFocusUnavailable) bundle.warnings.push('CREATOR_FOCUS_UNAVAILABLE');
+  return bundle;
 }

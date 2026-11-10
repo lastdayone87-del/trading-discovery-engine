@@ -60,3 +60,10 @@ test('review evidence reader is read-only', () => {
   const source = readFileSync(new URL('./reviewEvidence.ts', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /\bINSERT\b|\bUPDATE\b|\bDELETE\b|\bTRUNCATE\b/);
 });
+
+test('evidence read failures are surfaced as warnings',()=>{
+  const source = readFileSync(new URL('./reviewEvidence.ts', import.meta.url), 'utf8');
+  for (const warning of ['EVIDENCE_DOCUMENTS_UNAVAILABLE','EVIDENCE_ASSERTIONS_UNAVAILABLE','EVIDENCE_COVERAGE_UNAVAILABLE','CREATOR_FOCUS_UNAVAILABLE']) {
+    assert.match(source, new RegExp(warning));
+  }
+});

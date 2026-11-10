@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, CheckCircle2, ChevronRight, ExternalLink, Loader2, RefreshCw, ShieldAlert, XCircle } from 'lucide-react';
 import { apiFetch } from '../apiClient';
 import { submitReviewDecision } from '../reviewDecision';
@@ -71,10 +71,14 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
   const [action, setAction] = useState<'APPROVE' | 'REJECT'>('APPROVE');
   const [reasonCode, setReasonCode] = useState('');
   const [notes, setNotes] = useState('');
+  const [reasonOther, setReasonOther] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const queueRequest = useRef(0);
+  const bundleRequest = useRef(0);
 
   const loadQueue = useCallback(async () => {
+    const requestId = ++queueRequest.current;
     setLoading(true);
     setError(null);
     try {
@@ -84,6 +88,7 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
       const response = await apiFetch(`/api/reviews?${params.toString()}`);
       if (!response.ok) throw new Error(await response.text() || 'Could not load the review queue.');
       const items = await response.json() as ReviewQueueItem[];
+      if (requestId !== queueRequest.current) return;
       setQueue(items);
       if (items.length && !selected) setSelected(items[0].channelId);
       if (selected && !items.some(item => item.channelId === selected)) {
@@ -108,14 +113,18 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
   }, []);
 
   const loadBundle = useCallback(async (channelId: string) => {
+    const requestId = ++bundleRequest.current;
     setLoadingBundle(true);
     setError(null);
     try {
       const response = await apiFetch(`/api/reviews/${encodeURIComponent(channelId)}/evidence`);
       if (!response.ok) throw new Error(await response.text() || 'Could not load review evidence.');
-      setBundle(await response.json() as ReviewEvidenceBundle);
+      const data = await response.json() as ReviewEvidenceBundle;
+      if (requestId !== bundleRequest.current) return;
+      setBundle(data);
       setAction('APPROVE');
       setReasonCode('');
+      setReasonOther('');
       setNotes('');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not load review evidence.');
@@ -135,6 +144,7 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
   const submit = async () => {
     if (!current || !bundle) return;
     if (!reasonCode) { setError('Select a review reason before submitting.'); return; }
+    if (reasonCode === 'OTHER' && !reasonOther.trim()) { setError('Describe the other reason before submitting.'); return; }
     setSubmitting(true);
     setError(null);
     setNotice(null);
@@ -145,6 +155,7 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
         reviewVersion: Number(bundle.review.reviewVersion || current.reviewVersion),
         reviewReasonCode: reasonCode,
         reviewReasonVersion: catalogVersion,
+        reviewReasonOther: reasonCode === 'OTHER' ? reasonOther.trim() : undefined,
         notes,
       }, apiFetch, {}, newRequestId());
       setNotice(`${action === 'APPROVE' ? 'Approved' : 'Rejected'} ${current.channelName}.`);
@@ -162,8 +173,13 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
   const decision = bundle?.diagnostic?.decision || {};
   const collection = decision.evidenceCollection || {};
   const routing = decision.deterministicRouting || {};
-  const positive = Array.isArray(decision.positiveEvidence) ? decision.positiveEvidence : [];
-  const negative = Array.isArray(decision.negativeEvidence) ? decision.negativeEvidence : [];
+  const storedEvidenceItems = Array.isArray(bundle?.diagnostic?.evidenceItems) ? bundle!.diagnostic!.evidenceItems : [];
+  const positive = Array.isArray(decision.positiveEvidence) && decision.positiveEvidence.length
+    ? decision.positiveEvidence
+    : storedEvidenceItems.filter((item: any) => item.polarity === 'POSITIVE');
+  const negative = Array.isArray(decision.negativeEvidence) && decision.negativeEvidence.length
+    ? decision.negativeEvidence
+    : storedEvidenceItems.filter((item: any) => item.polarity === 'NEGATIVE');
 
   return (
     <div className="grid gap-4 lg:grid-cols-[minmax(280px,380px)_1fr]">
@@ -172,7 +188,7 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
           <div className="flex items-center gap-2 mb-3">
             <ShieldAlert className="w-5 h-5 text-indigo-600" />
             <h2 className="text-sm font-bold text-slate-900 dark:text-white">Review console</h2>
-            <button onClick={() => void loadQueue()} className="ml-auto p-1.5 rounded border border-slate-200 dark:border-slate-700" title="Refresh queue">
+            <button onClick={() => void loadQueue()} className="ml-auto p-1.5 rounded border border-slate-200 dark:border-slate-700" aria-label="Refresh queue" title="Refresh queue">
               <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
             </button>
           </div>
@@ -300,14 +316,15 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
             <Section title="Decision">
               <div className="grid gap-3 md:grid-cols-[auto_1fr]">
                 <div className="flex gap-2">
-                  <button onClick={() => { setAction('APPROVE'); setReasonCode(''); }} className={`rounded-lg px-3 py-2 text-xs font-semibold ${action === 'APPROVE' ? 'bg-emerald-600 text-white' : 'border border-slate-200 dark:border-slate-700'}`}>Approve</button>
-                  <button onClick={() => { setAction('REJECT'); setReasonCode(''); }} className={`rounded-lg px-3 py-2 text-xs font-semibold ${action === 'REJECT' ? 'bg-rose-600 text-white' : 'border border-slate-200 dark:border-slate-700'}`}>Reject</button>
+                  <button onClick={() => { setAction('APPROVE'); setReasonCode(''); setReasonOther(''); }} className={`rounded-lg px-3 py-2 text-xs font-semibold ${action === 'APPROVE' ? 'bg-emerald-600 text-white' : 'border border-slate-200 dark:border-slate-700'}`}>Approve</button>
+                  <button onClick={() => { setAction('REJECT'); setReasonCode(''); setReasonOther(''); }} className={`rounded-lg px-3 py-2 text-xs font-semibold ${action === 'REJECT' ? 'bg-rose-600 text-white' : 'border border-slate-200 dark:border-slate-700'}`}>Reject</button>
                 </div>
                 <div className="grid gap-2 md:grid-cols-[1fr_1.5fr_auto]">
                   <select value={reasonCode} onChange={e => setReasonCode(e.target.value)} className="rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent px-2.5 py-2 text-xs">
                     <option value="">Select reason…</option>
                     {reasons.map(reason => <option key={reason.code} value={reason.code}>{reason.label}</option>)}
                   </select>
+                  {reasonCode === 'OTHER' && <input value={reasonOther} onChange={e => setReasonOther(e.target.value)} placeholder="Other reason" className="rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent px-2.5 py-2 text-xs" />}
                   <input value={notes} onChange={e => setNotes(e.target.value)} placeholder="Optional notes" className="rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent px-2.5 py-2 text-xs" />
                   <button disabled={submitting || !reasonCode} onClick={() => void submit()} className="rounded-lg bg-indigo-600 text-white px-4 py-2 text-xs font-semibold disabled:opacity-40 inline-flex items-center justify-center gap-2">
                     {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : action === 'APPROVE' ? <CheckCircle2 className="w-4 h-4" /> : <XCircle className="w-4 h-4" />}
