@@ -12,6 +12,7 @@ on:
       - 'server/acquisitionLaneKeys.ts'
       - 'server/crawlerTelemetry.ts'
       - 'server/inspector.ts'
+      - 'server/queueManager.ts'
       - 'scripts/phase2CrawlThroughputReport.ts'
       - 'server/db/migrations/**'
       - 'server/db.ts'
