@@ -135,3 +135,14 @@ test('a country-only pass never downgrades a resolved country to uncertain', () 
   assert.equal(shouldPreserveResolvedCountry('UNCERTAIN', 'UNCERTAIN'), false);
   assert.equal(shouldPreserveResolvedCountry(undefined, 'UNCERTAIN'), false);
 });
+
+test('a live enrichment job classifies an uncertain row even when a stale projection marked it completed', () => {
+  const completedUncertain = base({ trading_status: 'UNCERTAIN', scan_status: 'COMPLETED', country_status: 'CONFIRMED' });
+  assert.equal(shouldPreserveExistingChannel(completedUncertain, 'automated_query', false), true);
+  assert.equal(shouldPreserveExistingChannel(completedUncertain, 'automated_query', false, Date.now(), { allowActiveEnrichmentClassification: true }), false);
+  // The active-job exception never reopens confirmed, country-terminal, or non-trading rows.
+  assert.equal(shouldPreserveExistingChannel(base({ trading_status: 'TRADING_CONFIRMED', scan_status: 'COMPLETED' }), 'automated_query', false, Date.now(), { allowActiveEnrichmentClassification: true }), true);
+  assert.equal(shouldPreserveExistingChannel(base({ country_status: 'REJECTED', scan_status: 'COMPLETED' }), 'automated_query', false, Date.now(), { allowActiveEnrichmentClassification: true }), true);
+  assert.equal(shouldPreserveExistingChannel(base({ trading_status: 'NON_TRADING', scan_status: 'SKIPPED_NON_TRADING', last_checked: new Date().toISOString() }), 'automated_query', false, Date.now(), { allowActiveEnrichmentClassification: true }), true);
+
+});

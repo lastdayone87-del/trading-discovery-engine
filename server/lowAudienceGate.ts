@@ -55,24 +55,6 @@ export function evaluateLowAudienceGate(rawSubscriberCount?: string, threshold =
   return { shouldSkipDeepEnrichment: false, subscriberCountNumber: count, reasonCode: 'SUFFICIENT_AUDIENCE_PROCEED' };
 }
 
-/**
- * The bounded Discord evidence pass may evaluate classification for a known
- * low-audience channel, but it must not pay for a fresh deep inspection or
- * Discord crawl afterward.
- */
-export function shouldStopDeepInspectionForForcedPass(
-  forceClassification: boolean,
-  subscriberCount: string | number | null | undefined,
-): boolean {
-  return forceClassification === true && evaluateLowAudienceGate(subscriberCount == null ? undefined : String(subscriberCount)).shouldSkipDeepEnrichment;
-}
-
-/**
- * A fresh known-low audience result may update a preserved completed row so
- * the stored record remains auditable but leaves the normal operator corpus.
- * Unknown audience data never qualifies, and non-completed workflow states
- * remain visible to their owning workflow instead of being hidden here.
- */
 export function shouldReclassifyPreservedCompletedChannel(
   existingScanStatus: string | undefined,
   gate: LowAudienceGateResult,

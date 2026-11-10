@@ -21,6 +21,79 @@ export function resolveUncertainLifecycle(wantsHumanReview: boolean, eligibility
   return { scanStatus: 'ENRICHMENT_PENDING', tradingStatus: 'UNCERTAIN', shouldEnqueue: true };
 }
 
+
+
+/**
+ * A terminal enrichment job is durable evidence that the work already ran.
+ * When a later rediscovery is blocked from reopening it, the channel must not
+ * remain ENRICHMENT_PENDING with no runnable job. A blocked COMPLETED job
+ * projects COMPLETED; a blocked FAILED job projects FAILED. Terminal/review
+ * states are preserved verbatim, and an active owner elsewhere keeps the
+ * pending marker.
+ */
+export function resolveEnrichmentReopenBlockedLifecycle(
+  channel: Pick<ChannelRecord, 'scan_status' | 'trading_status'>,
+  options: { blockedJobStatus?: string | null; hasOtherActiveEnrichmentJob?: boolean } = {},
+): { scanStatus: ScanStatus; tradingStatus: TradingStatus } {
+  const active = channel.scan_status === 'ENRICHMENT_PENDING'
+    || channel.scan_status === 'ENRICHING'
+    || channel.scan_status === 'LOCKED';
+  if (!active || options.hasOtherActiveEnrichmentJob === true) {
+    return { scanStatus: channel.scan_status, tradingStatus: channel.trading_status };
+  }
+  // A blocked FAILED job is terminal for this pass; it is not completed work.
+  // An active job elsewhere owns the channel and must keep the pending state.
+  return {
+    scanStatus: String(options.blockedJobStatus || '').toUpperCase() === 'FAILED' ? 'FAILED' : 'COMPLETED',
+    tradingStatus: channel.trading_status,
+  };
+}
+
+/**
+ * An enrichment pass must not schedule the stage it just executed. The worker
+ * caps the evidence-action sequence (currently stage 3); once a pass reaches
+ * the cap, a repeated request is a bookkeeping loop, not new evidence work.
+ */
+export function isEnrichmentStageExhausted(
+  isEnrichmentPass: boolean,
+  currentStage: number,
+  nextStage: number,
+): boolean {
+  return isEnrichmentPass === true && nextStage <= Math.max(0, currentStage);
+}
+
+export type ExistingEnrichmentAction =
+  | 'SCHEDULE_WORKFLOW'
+  | 'REUSE_ACTIVE'
+  | 'RETRY_FAILED'
+  | 'PROJECT_TERMINAL'
+  | 'ENQUEUE_IDEMPOTENT';
+
+/**
+ * The stable channel/stage key is the single owner of ordinary enrichment.
+ * Before the workflow lane creates an investigation step, it must reuse an
+ * active job, retry a failed one through the ordinary reopen path, and treat
+ * a completed one as terminal. A lookup failure cannot distinguish these
+ * states, so it uses the idempotent ordinary enqueue without a workflow step.
+ */
+export function resolveExistingEnrichmentAction(
+  status: string | null | undefined,
+  lookupFailed: boolean = false,
+): ExistingEnrichmentAction {
+  if (lookupFailed) return 'ENQUEUE_IDEMPOTENT';
+  switch (String(status || '').toUpperCase()) {
+    case 'PENDING':
+    case 'PROCESSING':
+      return 'REUSE_ACTIVE';
+    case 'FAILED':
+      return 'RETRY_FAILED';
+    case 'COMPLETED':
+      return 'PROJECT_TERMINAL';
+    default:
+      return 'SCHEDULE_WORKFLOW';
+  }
+}
+
 export interface TerminalEnrichmentFailureProjection {
   shouldProject: boolean;
   scanStatus: ScanStatus;

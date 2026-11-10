@@ -130,3 +130,34 @@ test('confirmed channels and active classifications never get a Discord reclassi
   }), false);
   assert.equal(enqueued, 0);
 });
+
+test('low-audience channels never get a Discord reclassification job, with or without a validated invite', async () => {
+  let enqueued = 0;
+  const deps = {
+    hasActiveClassificationJob: async () => false,
+    db: { query: async () => ({ rows: [{ target_country: 'Netherlands' }] }) },
+    checkCountryAllowed: async () => undefined,
+    enqueue: async () => { enqueued += 1; return { status: 'PENDING' }; },
+    config: { priority: 15, maxAttempts: 4 },
+  };
+  for (const overrides of [
+    { subscriber_count: '12' },
+    { subscriber_count: '29' },
+    { subscriber_count: '12', discord_invite: null, discord_validation_status: 'NOT_STARTED' as const },
+  ]) {
+    assert.equal(await enqueueDiscordEvidenceReclassification(channel(overrides), undefined, deps), false, JSON.stringify(overrides));
+  }
+  assert.equal(enqueued, 0);
+});
+
+test('a channel at 30 subscribers with valid Discord evidence follows the normal classification pass', async () => {
+  let enqueued = 0;
+  assert.equal(await enqueueDiscordEvidenceReclassification(channel({ subscriber_count: '30' }), undefined, {
+    hasActiveClassificationJob: async () => false,
+    db: { query: async () => ({ rows: [{ target_country: 'Netherlands' }] }) },
+    checkCountryAllowed: async () => undefined,
+    enqueue: async () => { enqueued += 1; return { status: 'PENDING' }; },
+    config: { priority: 15, maxAttempts: 4 },
+  }), true);
+  assert.equal(enqueued, 1);
+});

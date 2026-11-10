@@ -3354,6 +3354,14 @@ export async function enqueueDiscordEvidenceReclassification(
   rawDetails?: DiscoveredChannelRaw,
   deps: DiscordReclassificationDeps = {},
 ): Promise<boolean> {
+  // The audience minimum is absolute: a stored or freshly validated Discord
+  // invite never authorizes classification, crawling, or retrieval for a
+  // channel below 30 subscribers. The pipeline gate enforces the same rule;
+  // stop before creating even the classification job.
+  const audienceCount = rawDetails?.subscriberCount ?? channel.subscriber_count;
+  if (evaluateLowAudienceGate(audienceCount == null ? undefined : String(audienceCount)).shouldSkipDeepEnrichment) {
+    return false;
+  }
   const invite = validatedDiscordEvidenceInvite(channel);
   let active = false;
   try {
@@ -4838,7 +4846,7 @@ export async function triggerManualRecheck(
       if (canContinueCommunityInspectionAfterDegradedManualClassification({
         existingTradingStatus: preserved.trading_status,
         errorCode: code
-      })) {
+      }) && !evaluateLowAudienceGate(preserved.subscriber_count).shouldSkipDeepEnrichment) {
         console.warn(`[Manual Recheck] Gemini classification coverage is degraded for already-confirmed trading creator ${channelId}; preserving TRADING_CONFIRMED and continuing fresh community inspection.`);
         try {
           preserved.trading_status = 'TRADING_CONFIRMED';

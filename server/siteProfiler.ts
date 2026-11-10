@@ -605,9 +605,10 @@ export interface ProfilerFetch {
    * provenance now that the profiler follows redirects itself. */
   redirectsFollowed: string[];
   /** True when a redirect destination was refused before any request touched
-   * it (non-public, malformed, or unresolvable). A typed, observable
-   * inspection limitation — callers treat the non-2xx status as a skip,
-   * never as NOT_FOUND or negative evidence. */
+   * it (non-public, malformed, unresolvable, or cross-origin when an allowed
+   * origin is enforced). A typed, observable inspection limitation — callers
+   * treat the non-2xx status as a skip, never as NOT_FOUND or negative
+   * evidence. */
   redirectRejected: boolean;
   /** The refused destination, present only when redirectRejected. */
   rejectedRedirect?: string;
@@ -623,17 +624,18 @@ export interface ProfilerFetch {
   bodyProbeFailed?: boolean;
 }
 
-/** Why a redirect chain stopped. Non-public and malformed destinations are
- * security/input barriers; DNS and timeout classes are retryable transport
- * failures; loop/limit classes describe a bounded chain that never reached a
- * final response. */
+/** Why a redirect chain stopped. Non-public, malformed, and cross-origin
+ * destinations are security/input/scope barriers; DNS and timeout classes are
+ * retryable transport failures; loop/limit classes describe a bounded chain
+ * that never reached a final response. */
 export type ProfilerRedirectFailure =
   | 'NON_PUBLIC_DESTINATION'
   | 'MALFORMED_LOCATION'
   | 'DNS_RESOLUTION_FAILED'
   | 'DNS_TIMEOUT'
   | 'REDIRECT_LOOP'
-  | 'REDIRECT_LIMIT';
+  | 'REDIRECT_LIMIT'
+  | 'CROSS_ORIGIN_REDIRECT';
 
 export interface ProfilerTransportFailure {
   name: string;
@@ -661,6 +663,9 @@ export interface ProfilerFetchOptions {
   terminalNotFoundBodyMaxChars?: number;
   /** Deadline for the 404/410 body probe. Defaults to 1500ms. */
   terminalNotFoundBodyTimeoutMs?: number;
+  /** When set, reject a redirect before contacting it if its resolved origin
+   * differs. Used by same-origin iframe traversal. */
+  allowedRedirectOrigin?: string;
 }
 
 /** Maximum redirect hops per profiler inventory fetch. Conservative:
@@ -938,6 +943,24 @@ export async function fetchProfilerUrl(
           rejectedRedirect: location,
           redirectFailure: 'MALFORMED_LOCATION',
         };
+      }
+      if (options.allowedRedirectOrigin) {
+        let sameOrigin = false;
+        try { sameOrigin = new URL(nextUrl).origin === options.allowedRedirectOrigin; } catch { sameOrigin = false; }
+        if (!sameOrigin) {
+          await cancelRedirectBody(response);
+          return {
+            status: response.status,
+            contentType: response.headers.get('content-type') || '',
+            text: '',
+            truncated: false,
+            finalUrl: response.url || currentUrl,
+            redirectsFollowed,
+            redirectRejected: true,
+            rejectedRedirect: nextUrl,
+            redirectFailure: 'CROSS_ORIGIN_REDIRECT',
+          };
+        }
       }
       if (visited.has(nextUrl)) {
         // Loop: stop at the last safe URL instead of burning the hop budget.
