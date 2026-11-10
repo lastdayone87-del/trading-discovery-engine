@@ -940,8 +940,8 @@ async function processChannelThroughPipelineInContext(
       persisted: true,
       countryStatus: countryVal.status,
       tradingStatus: 'NEEDS_REVIEW',
-      discordStatus: 'UNCERTAIN',
-      discordInvite: null,
+      discordStatus: reviewChannel.discord_status,
+      discordInvite: reviewChannel.discord_invite || null,
       channelRecord: reviewChannel
     };
   }

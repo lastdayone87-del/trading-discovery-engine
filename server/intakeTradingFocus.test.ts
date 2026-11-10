@@ -122,8 +122,12 @@ test('ingestion pipeline persists a DEFER as INTAKE_DEFERRED without an enrichme
   assert.ok(start >= 0 && end > start, 'DEFER branch must exist before Gate 1');
   const block = source.slice(start, end);
   assert.match(block, /buildDeferredTradingIntakeChannel/);
-  assert.match(source, /function buildDeferredTradingIntakeChannel[\s\S]*channel\.scan_status = 'INTAKE_DEFERRED'/);
-  assert.match(source, /function buildDeferredTradingIntakeChannel[\s\S]*channel\.trading_status = 'UNCERTAIN'/);
+  const builderStart = source.indexOf('function buildDeferredTradingIntakeChannel');
+  const builderEnd = source.indexOf('\nexport async function processChannelThroughPipeline(', builderStart);
+  assert.ok(builderStart >= 0 && builderEnd > builderStart);
+  const builder = source.slice(builderStart, builderEnd);
+  assert.match(builder, /channel\.scan_status = 'INTAKE_DEFERRED'/);
+  assert.match(builder, /channel\.trading_status = 'UNCERTAIN'/);
   assert.doesNotMatch(block, /enqueueJob\s*\(/);
 });
 

@@ -960,7 +960,7 @@ export function assessChannelCountry(
       confidence,
       reasoning: conflict
         ? `Conflicting country evidence prevents a reliable ${detectedCreatorCountry} attribution, and ${detectedCreatorCountry} is excluded by policy (${excluded.reason}). Review is required before enrichment.`
-        : `${detectedCreatorCountry} is excluded by policy (${excluded.reason}), but the available evidence is mention-grade or indirect. Review is required before enrichment.`,
+        : `${detectedCreatorCountry} is excluded by policy (${excluded.reason}), but the available evidence does not establish a domicile-grade exclusion. Review is required before enrichment.`,
       decisiveEvidence
     };
   }
