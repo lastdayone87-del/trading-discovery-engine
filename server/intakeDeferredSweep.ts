@@ -53,6 +53,7 @@ export async function sweepIntakeDeferredReviews(options: {
     const channelId = String(row.channel_id);
     const client = await db.connect();
     let acquired = false;
+    let inTransaction = false;
     try {
       const lock = await client.query(
         `SELECT pg_try_advisory_lock(hashtext($1)) AS locked`,
@@ -63,7 +64,27 @@ export async function sweepIntakeDeferredReviews(options: {
         locked += 1;
         continue;
       }
-      const evidence = row.evidence_snapshot || {};
+      await client.query('BEGIN');
+      inTransaction = true;
+      // Re-read under the lock: a human decision may have committed after the
+      // due-row snapshot, and the old recheck must not act on a newer review.
+      const lockedReview = await client.query(
+        `SELECT r.review_version,r.state,r.decision,r.evidence_snapshot,c.scan_status
+         FROM intake_deferred_reviews r JOIN channels c USING(channel_id)
+         WHERE r.channel_id=$1 FOR UPDATE OF r`,
+        [channelId],
+      );
+      const review = lockedReview.rows[0];
+      const stateEligible = review
+        && (review.state === 'PENDING' || (review.state === 'DECIDED' && review.decision === 'AMBIGUOUS'));
+      if (!review || review.scan_status !== 'INTAKE_DEFERRED' || !stateEligible) {
+        skipped += 1;
+        await client.query('COMMIT');
+        inTransaction = false;
+        continue;
+      }
+      const reviewVersion = Number(review.review_version);
+      const evidence = review.evidence_snapshot || {};
       const job = await enqueueJob('ENRICH_CHANNEL', {
         channelId,
         targetCountry: evidence.targetCountry || 'GLOBAL',
@@ -74,22 +95,24 @@ export async function sweepIntakeDeferredReviews(options: {
       }, {
         priority: 5,
         maxAttempts: 4,
-        idempotencyKey: `intake-recheck:${channelId}:${row.review_version}`,
+        idempotencyKey: `intake-recheck:${channelId}:${reviewVersion}`,
         clientOverride: client,
       });
-      if (job.status === 'PENDING' || job.status === 'PROCESSING') {
-        enqueued += 1;
-        await client.query(
-          `UPDATE intake_deferred_reviews
-           SET next_recheck_at=now()+interval '1 hour',last_checked_at=now(),
-               recheck_attempts=recheck_attempts+1,updated_at=now()
-           WHERE channel_id=$1`,
-          [channelId],
-        );
-      } else {
-        skipped += 1;
-      }
+      const runnable = job.status === 'PENDING' || job.status === 'PROCESSING';
+      // Runnable work is rechecked after an hour if the worker disappears;
+      // a capped/blocked reopen backs off so it cannot monopolize every batch.
+      await client.query(
+        `UPDATE intake_deferred_reviews
+         SET next_recheck_at=now()+($2::text||' minutes')::interval,last_checked_at=now(),updated_at=now()
+         WHERE channel_id=$1 AND review_version=$3`,
+        [channelId, runnable ? '60' : '360', reviewVersion],
+      );
+      if (runnable) enqueued += 1;
+      else skipped += 1;
+      await client.query('COMMIT');
+      inTransaction = false;
     } catch (error) {
+      if (inTransaction) await client.query('ROLLBACK').catch(() => undefined);
       skipped += 1;
       console.warn(JSON.stringify({
         event: 'intake_deferred_recheck_enqueue_failed',
@@ -189,7 +212,8 @@ export async function reconcileLikelyExcludedCountryCandidates(options: {
     if (result.status === 'REJECTED' && detected) {
       const rejection = await db.query(
         `UPDATE channels
-         SET country_status='REJECTED',country=$2,confidence_score=$3,scan_status='COMPLETED',
+         SET country_status='REJECTED',country=$2,confidence_score=$3,
+             scan_status=CASE WHEN scan_status='SKIPPED_LOW_AUDIENCE' THEN scan_status ELSE 'COMPLETED' END,
              last_checked=now(),scope_eligibility=$4,
              inspection_trail=$5::jsonb,updated_at=now()
          WHERE channel_id=$1
@@ -251,10 +275,15 @@ export async function reconcileLikelyExcludedCountryCandidates(options: {
       retained += 1;
       continue;
     }
-    review += 1;
-    await db.query(
+    const reviewWrite = await db.query(
       `UPDATE channels SET last_checked=now(),inspection_trail=$2::jsonb,updated_at=now()
-       WHERE channel_id=$1`,
+       WHERE channel_id=$1
+       AND NOT EXISTS (
+         SELECT 1 FROM jobs j
+         WHERE j.status IN ('PENDING','PROCESSING')
+           AND j.payload->>'channelId'=channels.channel_id
+           AND j.type IN ('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','CLASSIFY_DISCOVERED_CHANNEL')
+       )`,
       [channelId, JSON.stringify(recentRecheck ? trail : [...trail, {
         step: 'COUNTRY_VALIDATION',
         title: `Country Recheck (${detected || row.country})`,
@@ -263,6 +292,8 @@ export async function reconcileLikelyExcludedCountryCandidates(options: {
         timestamp: now,
       }])],
     );
+    if (reviewWrite.rowCount) review += 1;
+    else skipped += 1;
   }
   return { scanned: rows.rowCount || 0, rejected, retained, review, skipped };
 }

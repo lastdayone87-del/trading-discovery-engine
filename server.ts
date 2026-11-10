@@ -297,10 +297,15 @@ async function startServer() {
   // rows; they are the dedicated INTAKE_DEFERRED interface.
   app.get('/api/intake-deferred', requireReviewer, async (req, res) => {
     try {
+      const requestedState = String(req.query.state || '').toUpperCase();
+      const state = ['PENDING', 'DECIDED', 'SUPERSEDED'].includes(requestedState)
+        ? requestedState as 'PENDING' | 'DECIDED' | 'SUPERSEDED'
+        : undefined;
       res.json(await listIntakeDeferredReviews({
         country: req.query.country as string | undefined,
         language: req.query.language as string | undefined,
         search: req.query.search as string | undefined,
+        state,
         limit: Number(req.query.limit || 50),
         offset: Number(req.query.offset || 0),
       }));
@@ -327,7 +332,7 @@ async function startServer() {
       console.info('[IntakeDeferredReview] Decision committed', { requestId: req.requestId, channelId: req.params.channelId, decision: req.body.decision, idempotent: result.idempotent });
       res.json(result);
     } catch (err: any) {
-      const status = Number(err?.status) || (err?.message?.includes('required') || err?.message?.startsWith('reviewVersion') ? 422 : 500);
+      const status = Number(err?.status) || (err?.message?.includes('required') || err?.message?.startsWith('reviewVersion') || err?.message?.startsWith('decision must') ? 422 : 500);
       console.error('[IntakeDeferredReview] Decision failed', { requestId: req.requestId, channelId: req.params.channelId, status, error: err instanceof Error ? err.message : 'Unknown error' });
       res.status(status).json({ error: status === 500 ? 'The intake review decision could not be saved.' : err.message, code: status === 409 ? 'REVIEW_CONFLICT' : status === 404 ? 'REVIEW_NOT_FOUND' : status === 422 ? 'REVIEW_VALIDATION_ERROR' : 'REVIEW_PERSISTENCE_ERROR', requestId: req.requestId });
     }
@@ -345,7 +350,14 @@ async function startServer() {
   });
   app.get('/api/human-evaluation/metrics', requireReviewer, async (_req, res) => {
     try {
-      const samples = await listHumanEvaluationSamples({ limit: 500 });
+      const samples = [];
+      let offset = 0;
+      for (;;) {
+        const page = await listHumanEvaluationSamples({ limit: 1000, offset });
+        samples.push(...page);
+        if (page.length < 1000) break;
+        offset += page.length;
+      }
       res.json({
         overall: computeEvaluationMetrics(samples),
         byLanguage: computeEvaluationBreakdown(samples, 'language'),

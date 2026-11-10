@@ -1,25 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { computeEvaluationBreakdown, computeEvaluationMetrics, type HumanEvaluationSample } from './intakeDeferredReview';
+import {
+  computeEvaluationBreakdown,
+  computeEvaluationMetrics,
+  normalizeHumanEvaluationSamples,
+  type HumanEvaluationSample,
+} from './intakeDeferredReview';
 
-const fixture = JSON.parse(readFileSync(new URL('./fixtures/humanEvaluationSeed.json', import.meta.url), 'utf8')) as Array<Record<string, any>>;
-const samples: HumanEvaluationSample[] = fixture.map(sample => ({
-  sampleKey: sample.sampleKey,
-  channelId: sample.channelId,
-  stratum: sample.stratum,
-  systemStatus: sample.systemStatus,
-  systemPrediction: sample.systemPrediction,
-  humanLabel: sample.humanLabel,
-  humanConfidence: sample.humanConfidence,
-  language: sample.language,
-  country: sample.country,
-  metadataQuality: sample.metadataQuality,
-  evidenceSnapshot: sample.evidence,
-  reviewer: sample.reviewer,
-  notes: sample.notes,
-  decidedAt: '2026-11-10T00:00:00.000Z',
-}));
+const fixture = JSON.parse(readFileSync(new URL('./fixtures/humanEvaluationSeed.json', import.meta.url), 'utf8'));
+const samples: HumanEvaluationSample[] = normalizeHumanEvaluationSamples(fixture);
 
 test('human-verified fixture covers every admission status and does not force ambiguous labels', () => {
   const strata = new Set(samples.map(sample => sample.stratum));
@@ -34,16 +24,31 @@ test('human-verified fixture covers every admission status and does not force am
   assert.equal(covered.tp + covered.fp + covered.tn + covered.fn + covered.ambiguous + covered.abstained, samples.length);
 });
 
+test('fixture validation rejects unknown enums instead of silently dropping rows', () => {
+  const broken = structuredClone(fixture) as Array<Record<string, any>>;
+  broken[0].humanLabel = 'MAYBE';
+  assert.throws(() => normalizeHumanEvaluationSamples(broken), /HUMAN_EVALUATION_FIXTURE_INVALID/);
+  broken[0].humanLabel = 'TRADING';
+  broken[0].systemPrediction = 'BROKEN';
+  assert.throws(() => normalizeHumanEvaluationSamples(broken), /HUMAN_EVALUATION_FIXTURE_INVALID/);
+  broken[0].systemPrediction = 'ABSTAIN';
+  broken[0].decidedAt = 'not-a-date';
+  assert.throws(() => normalizeHumanEvaluationSamples(broken), /HUMAN_EVALUATION_FIXTURE_INVALID/);
+});
+
 test('fixture metrics expose precision, recall, FPR and FNR without forcing abstentions', () => {
   const metrics = computeEvaluationMetrics(samples);
-  assert.ok(metrics.tp > 0 && metrics.tn > 0);
+  assert.equal(metrics.tp, 8);
   assert.equal(metrics.fp, 0);
-  assert.equal(metrics.fn, 0);
+  assert.equal(metrics.tn, 5);
+  assert.equal(metrics.fn, 1);
+  assert.equal(metrics.ambiguous, 7);
+  assert.equal(metrics.abstained, 15);
   assert.equal(metrics.precision, 1);
-  assert.equal(metrics.recall, 1);
+  assert.equal(metrics.recall, 0.8889);
   assert.equal(metrics.falsePositiveRate, 0);
-  assert.equal(metrics.falseNegativeRate, 0);
-  assert.ok(metrics.coverage > 0 && metrics.coverage < 1);
+  assert.equal(metrics.falseNegativeRate, 0.1111);
+  assert.equal(metrics.coverage, 0.3889);
   const languages = computeEvaluationBreakdown(samples, 'language');
   assert.ok(languages.length >= 2);
 });
@@ -57,10 +62,14 @@ test('deferred review migration and decision path preserve human evidence and la
   assert.match(migration, /INSERT INTO intake_deferred_reviews/);
   assert.match(migration, /c\.scan_status='INTAKE_DEFERRED'/);
   assert.match(migration, /ON CONFLICT\(channel_id\) DO NOTHING/);
+  assert.match(migration, /intake_deferred_review_decisions_immutable/);
+  assert.match(migration, /GREATEST\(/);
   const module = readFileSync(new URL('./intakeDeferredReview.ts', import.meta.url), 'utf8');
   assert.match(module, /idempotency_key/);
   assert.match(module, /human_evaluation_samples/);
   assert.match(module, /intake-review-enrich/);
+  assert.match(module, /Re-check the idempotency key under the lock/);
+  assert.match(module, /language=COALESCE\(NULLIF\(\$8,''\),language\)/);
   const pipeline = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
   assert.match(pipeline, /recordIntakeDeferredReview/);
   const ui = readFileSync(new URL('../src/components/IntakeDeferredReview.tsx', import.meta.url), 'utf8');
@@ -74,7 +83,10 @@ test('deferred evidence sweep is bounded, deduplicated and retry-safe', () => {
   assert.match(source, /pg_try_advisory_lock/);
   assert.match(source, /NOT EXISTS/);
   assert.match(source, /intake-recheck:\$\{channelId\}/);
-  assert.match(source, /next_recheck_at=now\(\)\+interval '1 hour'/);
+  assert.match(source, /FOR UPDATE OF r/);
+  assert.match(source, /review_version=\$3/);
+  assert.match(source, /next_recheck_at=now\(\)\+\(\$2::text\|\|' minutes'\)::interval/);
+  assert.match(source, /SKIPPED_LOW_AUDIENCE/);
   assert.match(source, /country_status='LIKELY'/);
   assert.match(source, /result\.status === 'REJECTED'/);
 });
@@ -131,6 +143,10 @@ test('deferred recheck uses the durable ENRICH carrier with bounded stage-1 evid
   assert.match(worker, /focus\.decision === 'WITHHOLD'/);
   assert.match(worker, /focus\.decision === 'ADMIT'/);
   assert.match(worker, /intake-recheck-enrich:/);
+  assert.match(worker, /SKIPPED_NON_TRADING/);
+  assert.match(worker, /job\.payload\?\.intakeRecheck === true/);
+  assert.match(worker, /channel\.scan_status === 'INTAKE_DEFERRED'/);
+  assert.match(worker, /matchedDocument: enriched\.matchedDocument/);
   assert.doesNotMatch(worker, /new pipeline|INTAKE_RECHECK_QUEUE/);
 });
 
@@ -151,6 +167,8 @@ test('review and evaluation routes are reviewer-protected and registered', () =>
   assert.match(server, /app\.post\('\/api\/intake-deferred\/:channelId\/decision'/);
   assert.match(server, /app\.get\('\/api\/human-evaluation\/samples'/);
   assert.match(server, /app\.get\('\/api\/human-evaluation\/metrics'/);
+  assert.match(server, /offset \+= page\.length/);
+  assert.match(server, /state: \(req\.query\.state/);
   const auth = readFileSync(new URL('./operatorAuth.ts', import.meta.url), 'utf8');
   assert.match(auth, /intake-deferred/);
   assert.match(auth, /human-evaluation\\\/samples/);
@@ -169,6 +187,10 @@ test('review UI preserves system reasoning separately from human decisions', () 
   assert.match(ui, /videoTitles/);
   assert.match(ui, /Corrected country/);
   assert.match(ui, /Corrected language/);
+  assert.match(ui, /stateFilter/);
+  assert.match(ui, /selected\.state !== 'PENDING'/);
+  assert.match(ui, /X-Reviewer-Id/);
+  assert.doesNotMatch(ui, /Authorization: `Bearer \$\{token\}`/);
 });
 
 test('LIKELY excluded-country recheck never feeds the weak stored country back as proof', () => {

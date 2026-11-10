@@ -128,6 +128,7 @@ export async function listIntakeDeferredReviews(filters: {
   country?: string;
   language?: string;
   search?: string;
+  state?: IntakeDeferredState;
   limit?: number;
   offset?: number;
 } = {}): Promise<IntakeDeferredReview[]> {
@@ -142,9 +143,10 @@ export async function listIntakeDeferredReviews(filters: {
      WHERE ($1::text IS NULL OR LOWER(c.country)=LOWER($1))
        AND ($2::text IS NULL OR LOWER(r.language)=LOWER($2))
        AND ($3::text IS NULL OR c.channel_name ILIKE '%'||$3||'%' OR c.channel_id ILIKE '%'||$3||'%')
+       AND ($4::text IS NULL OR r.state=$4)
      ORDER BY r.next_recheck_at NULLS FIRST, r.updated_at DESC
-     LIMIT $4 OFFSET $5`,
-    [filters.country || null, filters.language || null, filters.search || null, limit, offset],
+     LIMIT $5 OFFSET $6`,
+    [filters.country || null, filters.language || null, filters.search || null, filters.state || null, limit, offset],
   );
   return result.rows.map(mapReview);
 }
@@ -232,6 +234,17 @@ export async function decideIntakeDeferredReview(input: DecideIntakeDeferredInpu
       throw Object.assign(new Error('INTAKE_DEFERRED_REVIEW_NOT_FOUND'), { status: 404 });
     }
     const row = locked.rows[0];
+    // A concurrent retry may have committed while this transaction waited on
+    // the review lock. Re-check the idempotency key under the lock so the
+    // loser returns the committed decision instead of a spurious 409.
+    const replay = await client.query(
+      `SELECT * FROM intake_deferred_review_decisions WHERE idempotency_key=$1`,
+      [input.idempotencyKey],
+    );
+    if (replay.rowCount) {
+      await client.query('COMMIT');
+      return { decision: replay.rows[0], idempotent: true };
+    }
     if (Number(row.review_version) !== input.expectedVersion) {
       throw Object.assign(new Error(`Review version is ${row.review_version}; received ${input.expectedVersion}.`), { status: 409 });
     }
@@ -241,6 +254,7 @@ export async function decideIntakeDeferredReview(input: DecideIntakeDeferredInpu
     const channel = row.channel_snapshot as ChannelRecord;
     const corrections = input.corrections || {};
     const correctedCountry = typeof corrections.country === 'string' ? corrections.country.trim() : '';
+    const correctedLanguage = typeof corrections.language === 'string' ? corrections.language.trim() : '';
     const countryToCheck = correctedCountry || channel.country || '';
     if (input.decision === 'TRADING' && countryToCheck) {
       const exclusion = await client.query(
@@ -331,6 +345,7 @@ export async function decideIntakeDeferredReview(input: DecideIntakeDeferredInpu
     await client.query(
       `UPDATE intake_deferred_reviews SET state='DECIDED',decision=$2,reviewer=$3,reason=$4,
          notes=$5,corrections=$6::jsonb,review_version=$7,decided_at=now(),
+         language=COALESCE(NULLIF($8,''),language),
          next_recheck_at=CASE WHEN $2='AMBIGUOUS' THEN now()+interval '7 days' ELSE NULL END,
          updated_at=now() WHERE channel_id=$1`,
       [
@@ -341,6 +356,7 @@ export async function decideIntakeDeferredReview(input: DecideIntakeDeferredInpu
         input.notes?.trim() || null,
         JSON.stringify(corrections),
         nextVersion,
+        correctedLanguage,
       ],
     );
     const humanLabel = input.decision === 'TRADING' ? 'TRADING'
@@ -359,7 +375,7 @@ export async function decideIntakeDeferredReview(input: DecideIntakeDeferredInpu
         channel.trading_status === 'TRADING_CONFIRMED' ? 'TRADING'
           : ['NON_TRADING', 'HUMAN_REJECTED'].includes(String(channel.trading_status || '')) ? 'NON_TRADING' : 'ABSTAIN',
         humanLabel,
-        row.language || null,
+        correctedLanguage || row.language || null,
         correctedCountry || row.country || channel.country || null,
         row.metadata_quality || null,
         JSON.stringify({
@@ -398,21 +414,89 @@ export interface HumanEvaluationSample {
   decidedAt: string;
 }
 
+const HUMAN_LABELS = ['TRADING', 'NON_TRADING', 'AMBIGUOUS'] as const;
+const SYSTEM_PREDICTIONS = ['TRADING', 'NON_TRADING', 'ABSTAIN'] as const;
+const HUMAN_CONFIDENCES = ['HIGH', 'MEDIUM', 'LOW'] as const;
+
+function fixtureError(index: number, field: string, expected: string): never {
+  throw new Error(`HUMAN_EVALUATION_FIXTURE_INVALID: sample[${index}].${field} ${expected}`);
+}
+
+/**
+ * Validate a fixture before it is seeded or scored. A bad enum must fail
+ * loudly rather than disappear from one side of the confusion matrix.
+ */
+export function normalizeHumanEvaluationSamples(input: unknown): HumanEvaluationSample[] {
+  if (!Array.isArray(input)) throw new Error('HUMAN_EVALUATION_FIXTURE_INVALID: root must be an array');
+  return input.map((entry, index) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      fixtureError(index, 'root', 'must be an object');
+    }
+    const row = entry as Record<string, unknown>;
+    const requiredString = (field: string): string => {
+      const value = row[field];
+      if (typeof value !== 'string' || !value.trim()) fixtureError(index, field, 'must be a non-empty string');
+      return value.trim();
+    };
+    const optionalString = (field: string): string | null => {
+      const value = row[field];
+      if (value === null || value === undefined) return null;
+      if (typeof value !== 'string') fixtureError(index, field, 'must be a string or null');
+      return value.trim() || null;
+    };
+    const enumValue = <T extends string>(field: string, allowed: readonly T[], nullable = false): T | null => {
+      const value = row[field];
+      if (nullable && (value === null || value === undefined)) return null;
+      if (typeof value !== 'string' || !allowed.includes(value as T)) {
+        fixtureError(index, field, `must be one of ${allowed.join(', ')}`);
+      }
+      return value as T;
+    };
+    const evidence = row.evidenceSnapshot ?? row.evidence;
+    if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) {
+      fixtureError(index, 'evidence', 'must be an object');
+    }
+    const evidenceSnapshot = { ...(evidence as Record<string, unknown>) };
+    if (typeof row.channelName === 'string' && row.channelName.trim()) evidenceSnapshot.channelName = row.channelName.trim();
+    if (typeof row.youtubeUrl === 'string' && row.youtubeUrl.trim()) evidenceSnapshot.youtubeUrl = row.youtubeUrl.trim();
+    const decidedAt = requiredString('decidedAt');
+    if (Number.isNaN(Date.parse(decidedAt))) fixtureError(index, 'decidedAt', 'must be an ISO timestamp');
+    return {
+      sampleKey: requiredString('sampleKey'),
+      channelId: optionalString('channelId'),
+      stratum: requiredString('stratum'),
+      systemStatus: optionalString('systemStatus'),
+      systemPrediction: enumValue('systemPrediction', SYSTEM_PREDICTIONS, true),
+      humanLabel: enumValue('humanLabel', HUMAN_LABELS)!,
+      humanConfidence: (enumValue('humanConfidence', HUMAN_CONFIDENCES) || 'MEDIUM') as HumanEvaluationSample['humanConfidence'],
+      language: optionalString('language'),
+      country: optionalString('country'),
+      metadataQuality: optionalString('metadataQuality'),
+      evidenceSnapshot,
+      reviewer: requiredString('reviewer'),
+      notes: optionalString('notes'),
+      decidedAt: new Date(decidedAt).toISOString(),
+    };
+  });
+}
+
 export async function listHumanEvaluationSamples(filters: {
   language?: string;
   country?: string;
   label?: string;
   limit?: number;
+  offset?: number;
 } = {}): Promise<HumanEvaluationSample[]> {
   const db = await getDb();
-  const limit = Math.min(500, Math.max(1, filters.limit || 200));
+  const limit = Math.min(5000, Math.max(1, filters.limit || 200));
+  const offset = Math.max(0, Math.trunc(filters.offset || 0));
   const result = await db.query(
     `SELECT * FROM human_evaluation_samples
      WHERE ($1::text IS NULL OR LOWER(language)=LOWER($1))
        AND ($2::text IS NULL OR LOWER(country)=LOWER($2))
        AND ($3::text IS NULL OR human_label=$3)
-     ORDER BY decided_at DESC LIMIT $4`,
-    [filters.language || null, filters.country || null, filters.label || null, limit],
+     ORDER BY decided_at DESC, sample_key LIMIT $4 OFFSET $5`,
+    [filters.language || null, filters.country || null, filters.label || null, limit, offset],
   );
   return result.rows.map((row: any) => ({
     sampleKey: String(row.sample_key),

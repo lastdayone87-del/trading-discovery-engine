@@ -38,9 +38,11 @@ interface DeferredDetails extends DeferredItem {
 }
 
 function reviewerHeaders(): Record<string, string> {
-  const token = localStorage.getItem('review-token') || '';
+  // apiFetch already adds the operator token (with the legacy review-token
+  // fallback). Only the individual reviewer identity is added here so a stale
+  // review-token cannot override a valid operator session.
   const reviewer = localStorage.getItem('reviewer-id') || '';
-  return token && reviewer ? { Authorization: `Bearer ${token}`, 'X-Reviewer-Id': reviewer } : {};
+  return reviewer ? { 'X-Reviewer-Id': reviewer } : {};
 }
 
 function asRecord(value: unknown): Record<string, any> {
@@ -56,6 +58,7 @@ const IntakeDeferredReview: React.FC = () => {
   const [search, setSearch] = useState('');
   const [country, setCountry] = useState('');
   const [language, setLanguage] = useState('');
+  const [stateFilter, setStateFilter] = useState<'PENDING' | 'DECIDED' | 'SUPERSEDED' | 'ALL'>('PENDING');
   const [decision, setDecision] = useState<Decision>('TRADING');
   const [reason, setReason] = useState('Human verification after bounded evidence recheck.');
   const [notes, setNotes] = useState('');
@@ -70,6 +73,7 @@ const IntakeDeferredReview: React.FC = () => {
       if (search.trim()) params.set('search', search.trim());
       if (country.trim()) params.set('country', country.trim());
       if (language.trim()) params.set('language', language.trim());
+      if (stateFilter !== 'ALL') params.set('state', stateFilter);
       params.set('limit', '100');
       const response = await apiFetch(`/api/intake-deferred?${params}`, { headers: reviewerHeaders() });
       if (!response.ok) throw new Error(await responseError(response));
@@ -77,7 +81,7 @@ const IntakeDeferredReview: React.FC = () => {
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Unable to load deferred intake channels.');
     } finally { setLoading(false); }
-  }, [search, country, language]);
+  }, [search, country, language, stateFilter]);
 
   const loadDetails = async (channelId: string) => {
     setLoading(true); setError(''); setSuccess('');
@@ -86,8 +90,10 @@ const IntakeDeferredReview: React.FC = () => {
       if (!response.ok) throw new Error(await responseError(response));
       const details = await response.json() as DeferredDetails;
       setSelected(details);
-      setCorrectedCountry(details.country || '');
-      setCorrectedLanguage(details.language || '');
+      setCorrectedCountry('');
+      setCorrectedLanguage('');
+      setReason(details.reason || 'Human verification after bounded evidence recheck.');
+      setNotes(details.notes || '');
       setDecision(details.decision === 'NON_TRADING' ? 'NON_TRADING' : details.decision === 'AMBIGUOUS' ? 'AMBIGUOUS' : 'TRADING');
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Unable to load deferred channel details.');
@@ -97,12 +103,14 @@ const IntakeDeferredReview: React.FC = () => {
   useEffect(() => { void loadList(); }, []);
 
   const submitDecision = async () => {
-    if (!selected) return;
+    if (!selected || selected.state !== 'PENDING') return;
     setBusy(true); setError(''); setSuccess('');
     try {
       const corrections: Record<string, unknown> = {};
-      if (correctedCountry.trim()) corrections.country = correctedCountry.trim();
-      if (correctedLanguage.trim()) corrections.language = correctedLanguage.trim();
+      const countryValue = correctedCountry.trim();
+      const languageValue = correctedLanguage.trim();
+      if (countryValue && countryValue !== (selected.country || '')) corrections.country = countryValue;
+      if (languageValue && languageValue !== (selected.language || '')) corrections.language = languageValue;
       const response = await apiFetch(`/api/intake-deferred/${encodeURIComponent(selected.channelId)}/decision`, {
         method: 'POST',
         headers: {
@@ -149,6 +157,12 @@ const IntakeDeferredReview: React.FC = () => {
             <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search channel" className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-950" />
             <input value={country} onChange={e => setCountry(e.target.value)} placeholder="Country" className="w-28 rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-950" />
             <input value={language} onChange={e => setLanguage(e.target.value)} placeholder="Language" className="w-28 rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-950" />
+            <select value={stateFilter} onChange={e => setStateFilter(e.target.value as typeof stateFilter)} aria-label="Review state" className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-950">
+              <option value="PENDING">Pending</option>
+              <option value="DECIDED">Decided</option>
+              <option value="SUPERSEDED">Superseded</option>
+              <option value="ALL">All states</option>
+            </select>
             <button onClick={() => void loadList()} className="rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white">Refresh</button>
           </div>
         </div>
@@ -169,8 +183,12 @@ const IntakeDeferredReview: React.FC = () => {
             </thead>
             <tbody>
               {items.map(item => (
-                <tr key={item.channelId} onClick={() => void loadDetails(item.channelId)} className="cursor-pointer border-t border-slate-100 hover:bg-slate-50 dark:border-slate-800 dark:hover:bg-slate-800/50">
-                  <td className="px-2 py-2 font-semibold text-slate-900 dark:text-white">{item.channelName}</td>
+                <tr key={item.channelId} className="border-t border-slate-100 hover:bg-slate-50 dark:border-slate-800 dark:hover:bg-slate-800/50">
+                  <td className="px-2 py-2 font-semibold text-slate-900 dark:text-white">
+                    <button type="button" onClick={() => void loadDetails(item.channelId)} className="text-left hover:underline focus:underline focus:outline-none">
+                      {item.channelName}
+                    </button>
+                  </td>
                   <td className="px-2 py-2">{item.country || 'UNKNOWN'} <span className="text-slate-400">({item.countryStatus || 'UNCERTAIN'})</span></td>
                   <td className="px-2 py-2">{item.language || 'und'}</td>
                   <td className="px-2 py-2">{item.metadataQuality || 'UNKNOWN'}</td>
@@ -198,6 +216,7 @@ const IntakeDeferredReview: React.FC = () => {
               <div>Metadata: <b>{selected.metadataQuality || 'UNKNOWN'}</b></div>
               <div>Trading: <b>{selected.tradingStatus || 'UNCERTAIN'}</b></div>
               <div>Scan: <b>{selected.scanStatus || 'UNKNOWN'}</b></div>
+              <div>Review state: <b>{selected.state}</b></div>
             </div>
             <div className="mt-3">
               <div className="font-semibold text-slate-800 dark:text-slate-200">System reason</div>
@@ -227,21 +246,26 @@ const IntakeDeferredReview: React.FC = () => {
           <div className="rounded-xl border border-slate-200 bg-white p-4 text-xs dark:border-slate-800 dark:bg-slate-900">
             <h3 className="text-sm font-bold text-slate-900 dark:text-white">Human decision</h3>
             <p className="mt-1 text-slate-500 dark:text-slate-400">System prediction: <b>{selected.tradingStatus || 'UNCERTAIN'}</b>. This is not the label.</p>
-            <label className="mt-3 block font-semibold">Decision</label>
-            <select value={decision} onChange={e => setDecision(e.target.value as Decision)} className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 dark:border-slate-700 dark:bg-slate-950">
+            <label htmlFor="intake-decision" className="mt-3 block font-semibold">Decision</label>
+            <select id="intake-decision" value={decision} onChange={e => setDecision(e.target.value as Decision)} className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 dark:border-slate-700 dark:bg-slate-950">
               <option value="TRADING">TRADING</option>
               <option value="NON_TRADING">NON_TRADING</option>
               <option value="AMBIGUOUS">AMBIGUOUS / insufficient evidence</option>
             </select>
-            <label className="mt-3 block font-semibold">Reason</label>
-            <textarea value={reason} onChange={e => setReason(e.target.value)} rows={3} className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 dark:border-slate-700 dark:bg-slate-950" />
-            <label className="mt-3 block font-semibold">Notes / corrections</label>
-            <textarea value={notes} onChange={e => setNotes(e.target.value)} rows={3} placeholder="What evidence did you inspect? What did the system miss?" className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 dark:border-slate-700 dark:bg-slate-950" />
+            <label htmlFor="intake-reason" className="mt-3 block font-semibold">Reason</label>
+            <textarea id="intake-reason" value={reason} onChange={e => setReason(e.target.value)} rows={3} className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 dark:border-slate-700 dark:bg-slate-950" />
+            <label htmlFor="intake-notes" className="mt-3 block font-semibold">Notes / corrections</label>
+            <textarea id="intake-notes" value={notes} onChange={e => setNotes(e.target.value)} rows={3} placeholder="What evidence did you inspect? What did the system miss?" className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 dark:border-slate-700 dark:bg-slate-950" />
             <div className="mt-3 grid grid-cols-2 gap-2">
-              <div><label className="block font-semibold">Corrected country</label><input value={correctedCountry} onChange={e => setCorrectedCountry(e.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 dark:border-slate-700 dark:bg-slate-950" /></div>
-              <div><label className="block font-semibold">Corrected language</label><input value={correctedLanguage} onChange={e => setCorrectedLanguage(e.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 dark:border-slate-700 dark:bg-slate-950" /></div>
+              <div><label htmlFor="intake-country" className="block font-semibold">Corrected country</label><input id="intake-country" value={correctedCountry} onChange={e => setCorrectedCountry(e.target.value)} placeholder={selected.country || 'UNKNOWN'} className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 dark:border-slate-700 dark:bg-slate-950" /></div>
+              <div><label htmlFor="intake-language" className="block font-semibold">Corrected language</label><input id="intake-language" value={correctedLanguage} onChange={e => setCorrectedLanguage(e.target.value)} placeholder={selected.language || 'und'} className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 dark:border-slate-700 dark:bg-slate-950" /></div>
             </div>
-            <button disabled={busy || !reason.trim()} onClick={() => void submitDecision()} className="mt-4 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-semibold text-white disabled:opacity-40">
+            {selected.state !== 'PENDING' && (
+              <p className="mt-3 rounded-lg bg-amber-50 p-2 text-[11px] text-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+                This review is {selected.state}. Decisions are immutable; a new evidence recheck will open a new review version if needed.
+              </p>
+            )}
+            <button disabled={busy || selected.state !== 'PENDING' || !reason.trim()} onClick={() => void submitDecision()} className="mt-4 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-semibold text-white disabled:opacity-40">
               {busy ? 'Saving…' : 'Save human decision'}
             </button>
             <p className="mt-2 text-[11px] text-slate-500 dark:text-slate-400">TRADING returns the channel to normal enrichment; NON_TRADING closes it; AMBIGUOUS keeps it deferred for a later evidence recheck.</p>

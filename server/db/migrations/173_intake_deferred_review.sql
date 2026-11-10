@@ -57,6 +57,17 @@ CREATE TABLE IF NOT EXISTS intake_deferred_review_decisions (
 CREATE INDEX IF NOT EXISTS idx_intake_deferred_review_decisions_channel
   ON intake_deferred_review_decisions(channel_id, decided_at DESC);
 
+-- Human decisions are append-only. Corrections create a new version; the
+-- prior decision rows remain available to the review history.
+CREATE OR REPLACE FUNCTION prevent_intake_deferred_decision_mutation() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION 'intake_deferred_review_decisions is immutable';
+END $$;
+DROP TRIGGER IF EXISTS intake_deferred_review_decisions_immutable ON intake_deferred_review_decisions;
+CREATE TRIGGER intake_deferred_review_decisions_immutable
+  BEFORE UPDATE OR DELETE ON intake_deferred_review_decisions
+  FOR EACH ROW EXECUTE FUNCTION prevent_intake_deferred_decision_mutation();
+
 -- Human-verified evaluation samples. The system prediction is recorded for
 -- comparison only; human_label is the independent ground truth and may be
 -- AMBIGUOUS when the available evidence is insufficient.
@@ -109,9 +120,14 @@ SELECT
   c.country,
   CASE
     WHEN COALESCE(length(j.payload->'candidate'->>'description'),0) >= 80 THEN 'RICH'
-    WHEN COALESCE(jsonb_array_length(
-      CASE WHEN jsonb_typeof(j.payload->'candidate'->'videoTitles')='array'
-           THEN j.payload->'candidate'->'videoTitles' ELSE '[]'::jsonb END),0) > 0 THEN 'LIMITED'
+    WHEN GREATEST(
+      COALESCE(jsonb_array_length(
+        CASE WHEN jsonb_typeof(j.payload->'candidate'->'videoTitles')='array'
+             THEN j.payload->'candidate'->'videoTitles' ELSE '[]'::jsonb END),0),
+      COALESCE(jsonb_array_length(
+        CASE WHEN jsonb_typeof(j.payload->'candidate'->'videoDescriptions')='array'
+             THEN j.payload->'candidate'->'videoDescriptions' ELSE '[]'::jsonb END),0)
+    ) > 0 THEN 'LIMITED'
     ELSE 'SPARSE'
   END,
   0,

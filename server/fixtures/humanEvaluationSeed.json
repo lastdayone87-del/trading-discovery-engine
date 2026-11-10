@@ -31,7 +31,8 @@
       "notes": "Bio explicitly teaches trading financial markets."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Bio explicitly teaches trading financial markets."
+    "notes": "Bio explicitly teaches trading financial markets.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UC3hGVIypZXjsYNuCXBN_--w",
@@ -65,7 +66,8 @@
       "notes": "SAP ERP consultancy; no trading content."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "SAP ERP consultancy; no trading content."
+    "notes": "SAP ERP consultancy; no trading content.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UC737gu1CYSLXi_WnKQIOs-Q",
@@ -99,7 +101,8 @@
       "notes": "Journalist/filmmaker channel; no trading content."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Journalist/filmmaker channel; no trading content."
+    "notes": "Journalist/filmmaker channel; no trading content.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCABO3uIMu2FNHv7L5VcVMUw",
@@ -109,8 +112,8 @@
     "stratum": "TRADING_CONFIRMED",
     "systemStatus": "TRADING_CONFIRMED",
     "systemPrediction": "TRADING",
-    "humanLabel": "AMBIGUOUS",
-    "humanConfidence": "LOW",
+    "humanLabel": "TRADING",
+    "humanConfidence": "HIGH",
     "language": "en",
     "country": "UNKNOWN",
     "metadataQuality": "SPARSE",
@@ -130,10 +133,11 @@
       ],
       "matchedTitle": "Tajine Trading",
       "matchedDescription": "",
-      "notes": "Name suggests trading but no bio/video evidence available."
+      "notes": "Video titles show DAX/Nasdaq scalping, live trades, and a full trading course; bio unavailable."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Name suggests trading but no bio/video evidence available."
+    "notes": "Video titles show DAX/Nasdaq scalping, live trades, and a full trading course; bio unavailable.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCBMte3V9RM1aAnDMa2V0Qvg",
@@ -158,7 +162,8 @@
       "notes": "Hedge-fund/Wall Street market content; finance professional."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Hedge-fund/Wall Street market content; finance professional."
+    "notes": "Hedge-fund/Wall Street market content; finance professional.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCDFV-vTfrc3CF_fN516Z9WA",
@@ -192,7 +197,8 @@
       "notes": "Thai trading education and trader-growth content."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Thai trading education and trader-growth content."
+    "notes": "Thai trading education and trader-growth content.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCENW0ZwwrW6NG52OJnRxNLg",
@@ -226,7 +232,8 @@
       "notes": "Innovative-company investment content; trading focus unclear."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Innovative-company investment content; trading focus unclear."
+    "notes": "Innovative-company investment content; trading focus unclear.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCGHeDORbvdrYiD7TPZDvmfw",
@@ -236,8 +243,8 @@
     "stratum": "TRADING_CONFIRMED",
     "systemStatus": "TRADING_CONFIRMED",
     "systemPrediction": "TRADING",
-    "humanLabel": "AMBIGUOUS",
-    "humanConfidence": "LOW",
+    "humanLabel": "TRADING",
+    "humanConfidence": "HIGH",
     "language": "en",
     "country": "UNKNOWN",
     "metadataQuality": "SPARSE",
@@ -257,10 +264,11 @@
       ],
       "matchedTitle": "Quant Matrix Trading",
       "matchedDescription": "",
-      "notes": "Name suggests trading but no bio/video evidence available."
+      "notes": "Video titles show candlestick, indicator, and strategy testing on S&P 500/Nasdaq; bio unavailable."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Name suggests trading but no bio/video evidence available."
+    "notes": "Video titles show candlestick, indicator, and strategy testing on S&P 500/Nasdaq; bio unavailable.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCMi4flxQqy2dhc0S3aqLk0Q",
@@ -283,7 +291,8 @@
       "notes": "No bio or video evidence available."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "No bio or video evidence available."
+    "notes": "No bio or video evidence available.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCT43ffXmotx7i903Yxcwxjw",
@@ -306,7 +315,8 @@
       "notes": "FX/rates/equities/commodities trader and trading educator."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "FX/rates/equities/commodities trader and trading educator."
+    "notes": "FX/rates/equities/commodities trader and trading educator.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCTia5ng0rbduizMCQqEepbg",
@@ -329,7 +339,8 @@
       "notes": "Tennis instruction; no trading content."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Tennis instruction; no trading content."
+    "notes": "Tennis instruction; no trading content.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCYcGGR8mGuR-i1x8VLoS5LA",
@@ -352,7 +363,8 @@
       "notes": "No bio or video evidence available."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "No bio or video evidence available."
+    "notes": "No bio or video evidence available.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCZ3xbFFOidW_XR_H0tUta5w",
@@ -386,7 +398,8 @@
       "notes": "FX/commodities/stocks trading education channel."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "FX/commodities/stocks trading education channel."
+    "notes": "FX/commodities/stocks trading education channel.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCb1gLe0QmI9KuscaVFVXvWA",
@@ -409,7 +422,8 @@
       "notes": "Trading name but no bio/video evidence available."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Trading name but no bio/video evidence available."
+    "notes": "Trading name but no bio/video evidence available.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCbey9sN16vfSwHa9VVDjwdA",
@@ -443,7 +457,8 @@
       "notes": "Trading ideas, education and coaching."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Trading ideas, education and coaching."
+    "notes": "Trading ideas, education and coaching.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCe7FwZomazZsHhkAY1V5vNQ",
@@ -477,7 +492,8 @@
       "notes": "Data-driven daytrading/scalping strategies."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Data-driven daytrading/scalping strategies."
+    "notes": "Data-driven daytrading/scalping strategies.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCgIBEWlXXbjSdIHIS0gs1Lw",
@@ -500,7 +516,8 @@
       "notes": "Smart Money Concept trading analysis and education."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Smart Money Concept trading analysis and education."
+    "notes": "Smart Money Concept trading analysis and education.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UChyPtUkMxSuBFMC8VCibLew",
@@ -523,7 +540,8 @@
       "notes": "FOREX TRADER bio."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "FOREX TRADER bio."
+    "notes": "FOREX TRADER bio.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCj7H5YM92ADaCmGdaldoIug",
@@ -546,7 +564,8 @@
       "notes": "Insufficient evidence for a confident label."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Insufficient evidence for a confident label."
+    "notes": "Insufficient evidence for a confident label.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UClGVuFHu1-k4vITj5-mCldg",
@@ -580,7 +599,8 @@
       "notes": "News/documentary magazine; no trading content."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "News/documentary magazine; no trading content."
+    "notes": "News/documentary magazine; no trading content.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCmHZCpLCEjxezGjjt9iUPuw",
@@ -614,7 +634,8 @@
       "notes": "DAX trading academy and trading education."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "DAX trading academy and trading education."
+    "notes": "DAX trading academy and trading education.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCmJxc6lt_leWBcZ4WaUeeSQ",
@@ -637,7 +658,8 @@
       "notes": "Free trading education, SNX model."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Free trading education, SNX model."
+    "notes": "Free trading education, SNX model.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCmcmQu4-jo3lxK-iEaMKSkg",
@@ -660,7 +682,8 @@
       "notes": "No bio or video evidence available."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "No bio or video evidence available."
+    "notes": "No bio or video evidence available.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCnh3T-0EmH5XSmxzOAsX6Hw",
@@ -670,7 +693,7 @@
     "stratum": "NON_TRADING",
     "systemStatus": "NON_TRADING",
     "systemPrediction": "NON_TRADING",
-    "humanLabel": "NON_TRADING",
+    "humanLabel": "TRADING",
     "humanConfidence": "HIGH",
     "language": "ta",
     "country": "UNKNOWN",
@@ -691,10 +714,11 @@
       ],
       "matchedTitle": "🛑𝐋𝐈𝐕𝐄 𝐓𝐫𝐚𝐝𝐢𝐧𝐠 𝐅𝐎𝐑𝐄𝐗 - 📈 𝐄𝐔𝐑/𝐔𝐒𝐃, 𝐔𝐒𝐃/𝐉𝐏𝐘,𝐍𝐐,𝐗𝐀𝐔𝐔𝐒𝐃✍️𝐓𝐀𝐌𝐈𝐋🎯/Mr.Pollachian",
       "matchedDescription": "Official Instagram https://www.instagram.com/mr.mohanraj897?igsh=MXM4azRzM292Zm0wbg== Chennal Instagram ...",
-      "notes": "Personal/fact/entertainment channel; no trading content."
+      "notes": "Video titles are live Forex/indices/gold trading streams in Tamil."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Personal/fact/entertainment channel; no trading content."
+    "notes": "Video titles are live Forex/indices/gold trading streams in Tamil.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCoAaX58Val5denuxlucjWjQ",
@@ -704,8 +728,8 @@
     "stratum": "UNCERTAIN",
     "systemStatus": "ENRICHMENT_PENDING",
     "systemPrediction": "ABSTAIN",
-    "humanLabel": "AMBIGUOUS",
-    "humanConfidence": "LOW",
+    "humanLabel": "TRADING",
+    "humanConfidence": "HIGH",
     "language": "en",
     "country": "UNKNOWN",
     "metadataQuality": "RICH",
@@ -716,10 +740,11 @@
       ],
       "matchedTitle": "Gold Live Trading Session | XAUUSD Analysis | HA Gold Hunter",
       "matchedDescription": "Welcome to our weekly Gold forecast by HA Gold Hunter. In this video, we break down the XAU/USD chart to help you understand ...",
-      "notes": "Insufficient evidence for a confident label."
+      "notes": "Bio and video describe daily XAU/USD analysis, trading signals, and trading education."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Insufficient evidence for a confident label."
+    "notes": "Bio and video describe daily XAU/USD analysis, trading signals, and trading education.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCp4JQ_Zxbe3XiK9ADfOyCsA",
@@ -753,7 +778,8 @@
       "notes": "Trading community with Whop/Discord; trading content."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Trading community with Whop/Discord; trading content."
+    "notes": "Trading community with Whop/Discord; trading content.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCsR-oBB7cabU76oTguE17Qw",
@@ -776,7 +802,8 @@
       "notes": "Crypto/market analysis and trading education."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Crypto/market analysis and trading education."
+    "notes": "Crypto/market analysis and trading education.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCtaeIuP_XrbpkgcsoEvP0OA",
@@ -810,7 +837,8 @@
       "notes": "Forex/indices/crypto trading education."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Forex/indices/crypto trading education."
+    "notes": "Forex/indices/crypto trading education.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCtak3C1t8k3u8CVzVGYvemA",
@@ -844,7 +872,8 @@
       "notes": "Tennis coaching; no trading content."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Tennis coaching; no trading content."
+    "notes": "Tennis coaching; no trading content.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCvNSF3dZfzpkgdQhSp5tSwA",
@@ -878,7 +907,8 @@
       "notes": "Forex trading name; no bio but clear trading surface."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Forex trading name; no bio but clear trading surface."
+    "notes": "Forex trading name; no bio but clear trading surface.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCvdUwTPXGL40G5TbyPPVfAA",
@@ -912,7 +942,8 @@
       "notes": "Bullion dealer market commentary; creator trading focus unclear."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Bullion dealer market commentary; creator trading focus unclear."
+    "notes": "Bullion dealer market commentary; creator trading focus unclear.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCy2G0r24TcNzCwgYHovDP-A",
@@ -946,7 +977,8 @@
       "notes": "Trading journey/lifestyle content."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Trading journey/lifestyle content."
+    "notes": "Trading journey/lifestyle content.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UC98yxWRy7tEyQyQ_6eWA0pA",
@@ -969,7 +1001,8 @@
       "notes": "Investigated production false positive."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Investigated production false positive; no trading evidence."
+    "notes": "Investigated production false positive; no trading evidence.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCfB5LT2qF_95CARDJH-AtGQ",
@@ -992,7 +1025,8 @@
       "notes": "Investigated production false positive."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Investigated production false positive; no trading evidence."
+    "notes": "Investigated production false positive; no trading evidence.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCrpo3sxUWY2LNHEx7K2obSQ",
@@ -1015,7 +1049,8 @@
       "notes": "Investigated production false positive."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Investigated production false positive; no trading evidence."
+    "notes": "Investigated production false positive; no trading evidence.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   },
   {
     "sampleKey": "audit-UCbvZAjEy8TfpwHxntfh94-w",
@@ -1038,6 +1073,7 @@
       "notes": "Investigated production false positive."
     },
     "reviewer": "codex-audit-2026-11-10",
-    "notes": "Investigated production false positive; no trading evidence."
+    "notes": "Investigated production false positive; no trading evidence.",
+    "decidedAt": "2026-11-10T00:00:00.000Z"
   }
 ]

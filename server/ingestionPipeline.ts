@@ -853,7 +853,7 @@ async function processChannelThroughPipelineInContext(
         country: deferred.country,
         language: candidate.detectedLanguages?.[0]?.language || null,
         metadataQuality,
-      }).catch(error => console.warn(`[IntakeDeferredReview] evidence snapshot failed for ${candidate.channelId}:`, error instanceof Error ? error.message : error));
+      });
     }
     return {
       channelId: candidate.channelId,

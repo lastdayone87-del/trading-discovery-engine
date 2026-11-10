@@ -1382,8 +1382,13 @@ async function processIntakeDeferredRecheckJob(
       videoDescriptions: enriched.videoDescriptions,
     });
     const evidenceHash = createHash('sha256').update(JSON.stringify({
+      channelName: enriched.channelName || null,
+      description: enriched.description || null,
+      matchedDocument: enriched.matchedDocument || null,
       titles: enriched.videoTitles || [],
       descriptions: enriched.videoDescriptions || [],
+      channelLinks: enriched.channelLinks || [],
+      locationTag: enriched.locationTag || null,
     })).digest('hex');
     const review = await (await getDb()).query(
       `SELECT review_version,last_evidence_hash,recheck_attempts FROM intake_deferred_reviews WHERE channel_id=$1`,
@@ -1426,7 +1431,7 @@ async function processIntakeDeferredRecheckJob(
     };
     if (focus.decision === 'WITHHOLD') {
       channel.trading_status = 'NON_TRADING';
-      channel.scan_status = 'COMPLETED';
+      channel.scan_status = 'SKIPPED_NON_TRADING';
       channel.last_checked = now;
       channel.inspection_trail = [...(channel.inspection_trail || []), {
         step: 'BIO',
@@ -1486,6 +1491,18 @@ async function processIntakeDeferredRecheckJob(
          updated_at=now()`,
       [channelId, snapshot.state, JSON.stringify(snapshot.system_snapshot), JSON.stringify(snapshot.evidence_snapshot), snapshot.recheck_attempts, now, snapshot.next_recheck_at, evidenceHash],
     );
+    if (focus.decision === 'DEFER' && priorHash && priorHash !== evidenceHash) {
+      // A human AMBIGUOUS label is still actionable when the bounded recheck
+      // actually found new evidence. Reopen a new review version; the prior
+      // decision remains in the immutable decision ledger.
+      await (await getDb()).query(
+        `UPDATE intake_deferred_reviews
+         SET state='PENDING',decision=NULL,reviewer=NULL,reason=NULL,notes=NULL,decided_at=NULL,
+             review_version=review_version+1,updated_at=now()
+         WHERE channel_id=$1 AND state='DECIDED' AND decision='AMBIGUOUS'`,
+        [channelId],
+      );
+    }
     await finishQuotaReservation('ENRICH_CHANNEL', job.id, true);
     reserved = false;
     await completeJob(job.id);
@@ -2768,7 +2785,27 @@ export async function processNextSearchJob(
         }
       }
     }
-    if (job.type === 'ENRICH_CHANNEL' && terminal) {
+    if (job.type === 'ENRICH_CHANNEL' && terminal && job.payload?.intakeRecheck === true) {
+      const channelId = String(job.payload?.channelId || '');
+      const channel = channelId ? await getChannelById(channelId) : null;
+      if (channel && channel.scan_status === 'INTAKE_DEFERRED') {
+        const failedAt = new Date().toISOString();
+        channel.last_checked = failedAt;
+        channel.inspection_trail = [...(channel.inspection_trail || []), {
+          step: 'BIO',
+          title: 'Intake recheck: operational failure',
+          status: 'PARTIAL',
+          details: `Bounded evidence recheck failed; channel remains deferred for recovery: ${String(err?.message || err).slice(0, 300)}`,
+          timestamp: failedAt,
+        }];
+        await upsertChannel(channel);
+        await (await getDb()).query(
+          `UPDATE intake_deferred_reviews SET next_recheck_at=now()+interval '6 hours',updated_at=now()
+           WHERE channel_id=$1 AND state IN ('PENDING','DECIDED')`,
+          [channelId],
+        );
+      }
+    } else if (job.type === 'ENRICH_CHANNEL' && terminal) {
       const channelId = String(job.payload?.channelId || '');
       const channel = channelId ? await getChannelById(channelId) : null;
       if (channel && channel.trading_status === 'UNCERTAIN') {
