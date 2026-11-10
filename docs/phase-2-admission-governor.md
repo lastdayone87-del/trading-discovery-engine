@@ -34,9 +34,10 @@ requests could queue, and nothing reserved capacity for discovery work.
   at least one slot) so the floor can see the demand.
 - **Denial:** reuses the existing `RENDERED_FALLBACK_SATURATED` capacity class.
   The retry policy already treats that class as attempt-free, and the inspector
-  records `CAPACITY_DEFERRED`, never a genuine acquisition failure. The denial
-  carries the governor's `retryAt` hint; rendered observations persist it, so a
-  durable retry can wait for the window to free a slot.
+  records `CAPACITY_DEFERRED`, never a genuine acquisition failure. Rate-limit
+  and reserve denials carry the governor's `retryAt` hint when a capacity
+  expiry exists; rendered observations persist it, so a durable retry can wait
+  for the window to free a slot. A 100% reserve has no expiry hint.
 - **Failed starts are refunded:** if the proxy/browser setup fails before
   navigation actually runs — no handler entry, page evidence, or request
   counter — the gate removes that admission from the window. A failed start

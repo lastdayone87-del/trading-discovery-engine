@@ -539,6 +539,29 @@ test('rendered gate refunds a zero-work startup failure', async () => {
   assert.equal(gate.admissionSnapshot().admissionsInWindow, 1);
 });
 
+test('rendered gate exposes the admission id on a rejected startup', async () => {
+  const governor = new RenderedAdmissionGovernor({
+    enabled: true,
+    nominalPerHour: 1,
+    emergencyPerHour: 1,
+    discoveryFloorPct: 0,
+    windowMs: 60_000,
+  }, () => 0);
+  const gate = new RenderedFallbackGate(1, 4, governor);
+  let admissionId = 0;
+
+  await assert.rejects(
+    gate.run(async () => { throw new Error('proxy startup failed'); }, 'RETRY'),
+    (error: any) => {
+      admissionId = Number(error?.admissionId);
+      return Number.isSafeInteger(admissionId) && admissionId > 0;
+    },
+  );
+  assert.equal(gate.admissionSnapshot().admissionsInWindow, 1);
+  assert.equal(gate.refund(admissionId), true);
+  assert.equal(gate.admissionSnapshot().admissionsInWindow, 0);
+});
+
 test('rendered gate keeps a discovery slot when the non-discovery queue is full', async () => {
   const governor = new RenderedAdmissionGovernor({
     enabled: true,
@@ -557,6 +580,12 @@ test('rendered gate keeps a discovery slot when the non-discovery queue is full'
   const discovery = gate.run(async () => undefined, 'DISCOVERY');
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(gate.snapshot().pending, 2, 'discovery may use the extra queue reserve');
+
+  // The extra slot is exclusive to discovery: another RETRY is rejected.
+  await assert.rejects(
+    gate.run(async () => undefined, 'RETRY'),
+    /RENDERED_FALLBACK_SATURATED/,
+  );
 
   releaseFirst();
   await Promise.all([first, retry, discovery]);

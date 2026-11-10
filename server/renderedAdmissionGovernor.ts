@@ -9,10 +9,11 @@
  *     already queued (the emergency allowance);
  *   * at least 35% DISCOVERY crawls whenever discovery work is queued.
  *
- * The floor is demand-aware: when no DISCOVERY request is waiting, non-discovery
- * work may use the remaining budget (the report will still show the lower
- * discovery share). When discovery work is waiting, non-DISCOVERY admissions
- * are denied while the projected share would fall below the floor.
+ * The floor is strict: non-DISCOVERY admissions are capped at the budget left
+ * after reserving 35% of the selected limit for DISCOVERY, even when no
+ * discovery request is currently queued. Unused reserve is not reassigned to
+ * non-discovery work. When discovery work is waiting, the gate also selects a
+ * discovery waiter before FIFO non-discovery waiters.
  *
  * A denied admission is surfaced as the existing
  * `RENDERED_FALLBACK_SATURATED` capacity class, which the retry policy already
@@ -281,11 +282,20 @@ export class RenderedAdmissionGovernor implements RenderedAdmissionGovernorLike 
       const discoveryReserve = Math.ceil(limit * floorBasisPoints / 10000);
       const nonDiscoveryLimit = Math.max(0, limit - discoveryReserve);
       if (this.nonDiscoveryCount() >= nonDiscoveryLimit) {
+        // The reserve frees when enough non-DISCOVERY admissions expire to
+        // bring the count below the cap. A 100% reserve never frees.
+        const nonDiscoveryAdmissions = this.admissions.filter(
+          admission => admission.lane !== 'DISCOVERY',
+        );
+        const retryIndex = nonDiscoveryLimit > 0
+          ? Math.max(0, nonDiscoveryAdmissions.length - nonDiscoveryLimit)
+          : -1;
+        const retryAt = retryIndex >= 0 ? nonDiscoveryAdmissions[retryIndex] : undefined;
         return {
           ...base,
           admitted: false,
           reason: 'DISCOVERY_FLOOR',
-          retryAtMs: null,
+          retryAtMs: retryAt ? retryAt.atMs + this.config.windowMs : null,
         };
       }
     }

@@ -172,6 +172,7 @@ test('governor strictly reserves 35% of the window for DISCOVERY', () => {
   const blocked = governor.admit('RETRY', none);
   assert.equal(blocked.admitted, false);
   assert.equal(blocked.reason, 'DISCOVERY_FLOOR');
+  assert.equal(blocked.retryAtMs, 60_000, 'the oldest non-discovery reservation expiry');
 
   for (let index = 0; index < 14; index++) {
     assert.equal(governor.admit('DISCOVERY', none).admitted, true, `discovery ${index + 1}`);
@@ -260,4 +261,6 @@ test('inspection lane is wired into every rendered fallback call', () => {
   const fallback = readFileSync(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8');
   assert.match(fallback, /limits\.admissionLane \|\| 'UNKNOWN'/);
   assert.match(fallback, /retryAt,telemetry/, 'saturation result must carry the governor retry hint');
+  assert.match(fallback, /renderedFallbackGate\.refund\(failedAdmissionId\)/);
+  assert.match(fallback, /renderedCrawlStarted\(\{ inspectedPages, telemetry \}\)/);
 });

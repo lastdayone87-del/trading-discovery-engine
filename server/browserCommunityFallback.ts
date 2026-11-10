@@ -3887,6 +3887,14 @@ export class RenderedFallbackGate {
         this.admissionGovernor.refund(decision.admissionId);
       }
       return result;
+    } catch (error) {
+      // A rejected operation may also be a pre-work startup failure. Attach the
+      // admission id so the caller can refund only when telemetry proves no
+      // navigation ran; a post-work rejection stays counted.
+      if (decision.admissionId !== null && error && typeof error === 'object') {
+        Object.assign(error, { admissionId: decision.admissionId });
+      }
+      throw error;
     } finally { release(); }
   }
 
@@ -3896,6 +3904,10 @@ export class RenderedFallbackGate {
 
   admissionSnapshot(): ReturnType<RenderedAdmissionGovernorLike['snapshot']> {
     return this.admissionGovernor.snapshot();
+  }
+
+  refund(admissionId: number): boolean {
+    return this.admissionGovernor.refund(admissionId);
   }
 }
 
@@ -6331,6 +6343,11 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
     const saturated=error?.message==='RENDERED_FALLBACK_SATURATED';
     const retryAtValue = Number(error?.retryAt);
     const retryAt = Number.isFinite(retryAtValue) && retryAtValue > 0 ? retryAtValue : undefined;
+    const failedAdmissionId = Number(error?.admissionId);
+    if (Number.isSafeInteger(failedAdmissionId) && failedAdmissionId > 0
+      && !renderedCrawlStarted({ inspectedPages, telemetry })) {
+      renderedFallbackGate.refund(failedAdmissionId);
+    }
     // Saturation is explicit browser-gate capacity, not a browser defect: keep
     // it classified as capacity (so retry accounting can defer attempt-free)
     // without marking the browser capability itself unavailable.
