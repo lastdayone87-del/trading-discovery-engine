@@ -80,7 +80,7 @@ export const ClassificationAudit: React.FC = () => {
   const [loadingItem, setLoadingItem] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [label, setLabel] = useState<'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN'>('TRADING_CONFIRMED');
+  const [label, setLabel] = useState<'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | null>(null);
   const [notes, setNotes] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [showSuggestion, setShowSuggestion] = useState(false);
@@ -129,7 +129,7 @@ export const ClassificationAudit: React.FC = () => {
       if (requestId !== itemRequest.current) return;
       setItem(loaded);
       setHistory(labels);
-      setLabel(isAuditLabel(loaded.latestLabel) ? loaded.latestLabel : 'TRADING_CONFIRMED');
+      setLabel(isAuditLabel(loaded.latestLabel) ? loaded.latestLabel : null);
       setNotes('');
       setShowSuggestion(false);
     } catch (err) {
@@ -153,7 +153,7 @@ export const ClassificationAudit: React.FC = () => {
   }, [selected, loadItem]);
 
   const submit = async () => {
-    if (!item) return;
+    if (!item || !label || selected !== item.id) return;
     setSubmitting(true);
     setError(null);
     setNotice(null);
@@ -293,7 +293,7 @@ export const ClassificationAudit: React.FC = () => {
                   <div className="max-h-64 overflow-auto space-y-1">
                     {videos.map((video: any, index: number) => (
                       <div key={`${video.id || index}`} className="rounded border border-slate-100 dark:border-slate-800 p-2 text-[11px]">
-                        <div className="font-medium text-slate-700 dark:text-slate-200">{video.title || video}</div>
+                        <div className="font-medium text-slate-700 dark:text-slate-200">{typeof video === 'string' ? video : (video.title || video.description || 'Untitled video')}</div>
                         {video.description && <div className="text-slate-500 mt-1 whitespace-pre-wrap">{video.description}</div>}
                       </div>
                     ))}
@@ -333,7 +333,7 @@ export const ClassificationAudit: React.FC = () => {
               </div>
               <div className="mt-3 grid gap-2 md:grid-cols-[1fr_auto]">
                 <input value={notes} onChange={event => setNotes(event.target.value)} placeholder="Evidence note (what in the bio/videos supports this label?)" className="rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent px-2.5 py-2 text-xs" />
-                <button disabled={submitting || !label} onClick={() => void submit()} className="rounded-lg bg-indigo-600 text-white px-4 py-2 text-xs font-semibold disabled:opacity-40 inline-flex items-center justify-center gap-2">
+                <button disabled={submitting || !label || !item || selected !== item.id} onClick={() => void submit()} className="rounded-lg bg-indigo-600 text-white px-4 py-2 text-xs font-semibold disabled:opacity-40 inline-flex items-center justify-center gap-2">
                   {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />}
                   Record label
                 </button>
