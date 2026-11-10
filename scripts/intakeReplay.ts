@@ -66,7 +66,9 @@ function text(row: Row): string {
 }
 
 function increment(map: Record<string, number>, key: string | undefined): void {
-  map[key || 'MISSING'] = (map[key || 'MISSING'] || 0) + 1;
+  const name = key || 'MISSING';
+  const current = Object.prototype.hasOwnProperty.call(map, name) ? map[name] : 0;
+  map[name] = current + 1;
 }
 
 const inputPath = process.argv[2];

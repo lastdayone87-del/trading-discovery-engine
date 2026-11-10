@@ -114,3 +114,15 @@ test('all configured excluded countries reject strong domicile evidence', () => 
     assert.equal(result.status, 'REJECTED', `${country}: ${result.status} ${result.reasoning}`);
   }
 });
+
+test('existing confirmed rows keep their trading decision but persist fresh deferred country evidence', () => {
+  const source = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
+  const start = source.indexOf("if (existing && (existing.trading_status === 'TRADING_CONFIRMED'");
+  const end = source.indexOf('const intakeChannel = buildDeferredTradingIntakeChannel', start);
+  assert.ok(start >= 0 && end > start);
+  const section = source.slice(start, end);
+  assert.match(section, /reviewableCountry/);
+  assert.match(section, /existing\.country_status = deferredCountry\.status/);
+  assert.match(section, /existing\.trading_status/);
+  assert.match(section, /channelRecord: existing/);
+});

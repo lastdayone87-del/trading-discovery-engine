@@ -600,9 +600,20 @@ export interface AggregatedContentLanguage {
  */
 export function aggregateContentLanguage(
   descriptions: string[],
-  playlists: Array<{ name?: string; description?: string }> = []
+  playlists: Array<{ name?: string; description?: string }> = [],
+  options: { additionalSamples?: string[] } = {}
 ): AggregatedContentLanguage | null {
-  const usableTexts = (descriptions || []).map(text => (text || '').trim()).filter(Boolean).slice(0, 10);
+  // Keep the bounded recent-video sample, but append creator-level samples
+  // (the About/bio) without evicting the tenth video. The mixed-language guard
+  // below must see both the bio and all ten video samples.
+  const videoTexts = (descriptions || [])
+    .map(text => (text || '').trim())
+    .filter(Boolean)
+    .slice(0, 10);
+  const additionalTexts = (options.additionalSamples || [])
+    .map(text => (text || '').trim())
+    .filter(Boolean);
+  const usableTexts = [...videoTexts, ...additionalTexts];
   if (usableTexts.length < AGGREGATED_LANGUAGE_MIN_USABLE) return null;
   const tally = new Map<string, number>();
   for (const text of usableTexts) {
@@ -829,15 +840,14 @@ export function assessChannelCountry(
       // so a channel with seven authoritative video descriptions plus a bio
       // can meet the evidence floor; a bio alone still cannot reject.
       const nonEmptyBio = String(input.aboutBio || '').trim();
-      const languageSamples = [
-        // Put the creator bio first: aggregateContentLanguage considers only
-        // the first 10 samples, and the bio is the one creator-level sample
-        // that must never be dropped by a full recent-video set.
-        ...(nonEmptyBio ? [nonEmptyBio] : []),
-        ...(input.videoDescriptions || []),
-      ];
+      const languageSamples = [...(input.videoDescriptions || [])];
       const bioIncluded = nonEmptyBio.length > 0;
-      const aggregated = aggregateContentLanguage(languageSamples, input.playlists || []);
+      // Add the bio as an extra sample after the bounded ten-video window.
+      // Prepending it would drop the tenth video and could hide a second
+      // language that the mixed-language guard depends on.
+      const aggregated = aggregateContentLanguage(languageSamples, input.playlists || [], {
+        additionalSamples: nonEmptyBio ? [nonEmptyBio] : [],
+      });
       if (aggregated) {
         const isLiveExcluded = (country: string): boolean =>
           findCountryExclusion(country, exclusions) !== null;
@@ -845,7 +855,8 @@ export function assessChannelCountry(
         // excluded. If any set member is not excluded, emit nothing.
         if (aggregated.countries.every(isLiveExcluded)) {
           const representative = [...aggregated.countries].sort((a, b) => a.localeCompare(b))[0];
-          const firstVoting = languageSamples.map(text => (text || '').trim()).filter(Boolean)
+          const firstVoting = [nonEmptyBio, ...languageSamples]
+            .map(text => (text || '').trim()).filter(Boolean)
             .find(text => voteVideoDescriptionLanguage(text) === aggregated.language) || '';
           const setLabel = `candidate countries [${aggregated.countries.join(', ')}]`;
           const languageItem: CountryInferenceEvidence = {

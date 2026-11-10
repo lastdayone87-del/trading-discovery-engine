@@ -705,14 +705,37 @@ async function processChannelThroughPipelineInContext(
           channelRecord: preserved,
         };
       }
+      // Preserve the trading decision, but do not discard fresh country
+      // evidence that Gate 1 routed to review. A mention-grade excluded
+      // country is LIKELY, not REJECTED, so it must be visible to the review
+      // path instead of being replaced by the old country status.
+      const reviewableCountry = deferredCountry
+        && deferredCreatorCountry
+        && (deferredCountry.gateDisposition === 'NEEDS_REVIEW'
+          || deferredCountry.status === 'LIKELY'
+          || deferredCountry.status === 'CONFIRMED');
+      if (reviewableCountry) {
+        existing.country = deferredCreatorCountry;
+        existing.country_status = deferredCountry.status;
+        existing.confidence_score = deferredCountry.score;
+        existing.last_checked = now;
+        existing.inspection_trail = [...(existing.inspection_trail || []), {
+          step: 'COUNTRY_VALIDATION',
+          title: `Country Validation (${deferredCreatorCountry})`,
+          status: deferredCountry.status === 'CONFIRMED' || deferredCountry.status === 'LIKELY' ? 'FOUND' : 'PARTIAL',
+          details: deferredCountry.decisionLogs,
+          timestamp: now,
+        }];
+        await upsertChannel(existing);
+      }
       return {
         channelId: candidate.channelId,
         channelName: candidate.channelName,
         isNew: false,
         wasKnown: true,
         persisted: true,
-        countryStatus: existing.country_status as IngestionPipelineOutcome['countryStatus'],
-        detectedCountry: existing.country || null,
+        countryStatus: reviewableCountry ? deferredCountry.status : existing.country_status as IngestionPipelineOutcome['countryStatus'],
+        detectedCountry: reviewableCountry ? deferredCreatorCountry : (existing.country || null),
         tradingStatus: existing.trading_status || 'UNCERTAIN',
         discordStatus: existing.discord_status,
         discordInvite: existing.discord_invite || null,
@@ -734,7 +757,7 @@ async function processChannelThroughPipelineInContext(
         return {
           channelId: candidate.channelId,
           channelName: candidate.channelName,
-          isNew: true,
+          isNew: false,
           wasKnown: false,
           persisted: false,
           countryStatus: 'REJECTED',

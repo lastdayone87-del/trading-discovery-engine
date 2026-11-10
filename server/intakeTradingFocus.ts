@@ -197,9 +197,18 @@ export function assessIntakeTradingFocus(input: IntakeTradingFocusInput): Intake
 
   const high = matchAny(channelText, HIGH_SPECIFICITY_TRADING_SIGNALS);
   const market = matchAny(channelText, MARKET_CONTEXT_SIGNALS);
-  const hard = matchAny(channelText, HARD_NON_TRADING_SIGNALS);
-  const additional = matchAny(channelText, ADDITIONAL_NON_TRADING_SIGNALS);
+  // Hard domains are high-precision when they appear in the retrieval surface
+  // (channel name + matched document). The same word in a long bio or video
+  // description can be incidental ("kitchen table walkthrough"), so channel
+  // text alone routes to review instead of a terminal WITHHOLD.
+  const hardChannel = matchAny(channelText, HARD_NON_TRADING_SIGNALS);
+  const hardRetrieval = matchAny(retrievalText, HARD_NON_TRADING_SIGNALS);
+  const additionalChannel = matchAny(channelText, ADDITIONAL_NON_TRADING_SIGNALS);
+  const additionalRetrieval = matchAny(retrievalText, ADDITIONAL_NON_TRADING_SIGNALS);
   const soft = matchAny(channelText, SOFT_NON_TRADING_SIGNALS);
+  const hard = unique([...hardChannel, ...hardRetrieval]);
+  const additional = unique([...additionalChannel, ...additionalRetrieval]);
+  const competingChannel = unique([...hardChannel, ...additionalChannel]);
   const positiveFamilies = unique([
     ...high,
     ...(new Set(market).size >= 2 ? market : []),
@@ -219,7 +228,7 @@ export function assessIntakeTradingFocus(input: IntakeTradingFocusInput): Intake
     ], positiveFamilies, negativeFamilies, matchedSignals);
   }
 
-  if (hard.length) {
+  if (hardRetrieval.length) {
     return decision('WITHHOLD', [
       'EXPLICIT_NON_TRADING_DOMAIN_DETECTED',
       'EXPLICIT_NON_TRADING_SIGNAL_DETECTED',
@@ -245,10 +254,20 @@ export function assessIntakeTradingFocus(input: IntakeTradingFocusInput): Intake
     return decision('ADMIT', ['MULTIPLE_MARKET_CONTEXT_SIGNALS_CORROBORATE_RETRIEVAL'], positiveFamilies, negativeFamilies, matchedSignals);
   }
 
-  if (additional.length) {
+  if (additionalRetrieval.length) {
     return decision('WITHHOLD', [
       'EXPLICIT_NON_TRADING_DOMAIN_DETECTED',
       'EXPLICIT_NON_TRADING_SIGNAL_DETECTED',
+      'DO_NOT_SPEND_ENRICHMENT_QUOTA',
+    ], positiveFamilies, negativeFamilies, matchedSignals);
+  }
+
+  // A competing domain seen only in the bio/video text is not enough to
+  // terminal-reject a channel: preserve it for review without enrichment spend.
+  if (competingChannel.length) {
+    return decision('DEFER', [
+      'CHANNEL_COMPETING_DOMAIN_REVIEW',
+      'ROUTE_TO_REVIEW',
       'DO_NOT_SPEND_ENRICHMENT_QUOTA',
     ], positiveFamilies, negativeFamilies, matchedSignals);
   }

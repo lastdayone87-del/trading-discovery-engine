@@ -140,6 +140,15 @@ test('approved language map covers the eligible excluded-country languages', () 
   assert.deepEqual(AGGREGATED_CONTENT_LANGUAGES.Punjabi.countries, ['India', 'Pakistan']);
 });
 
+test('the bio is appended without evicting the tenth video from the mixed-language guard', () => {
+  const aggregated = aggregateContentLanguage(
+    [...Array.from({ length: 8 }, () => VI), ...Array.from({ length: 2 }, () => HI)],
+    [],
+    { additionalSamples: [VI] },
+  );
+  assert.equal(aggregated, null, 'two Hindi videos must still block Vietnamese rejection after adding the bio');
+});
+
 test('every map entry is rejection-capable on its own: countries plus at least one signal group', () => {
   // Data-driven contract: extending coverage to a new excluded-country
   // language must only add a complete entry here — no code branches. An

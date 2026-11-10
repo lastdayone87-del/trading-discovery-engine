@@ -171,6 +171,28 @@ test('deferred channel persistence uses INTAKE_DEFERRED and does not manufacture
   assert.equal(channel.inspection_trail.at(-1)?.step, 'BIO');
 });
 
+test('generic hard-negative words in video text defer instead of withholding a market channel', () => {
+  const decision = assessIntakeTradingFocus({
+    channelName: 'DAX Weekly',
+    description: 'DAX market analysis and weekly levels.',
+    videoTitles: ['Kitchen table walkthrough of my DAX process'],
+    matchedDocument: { type: 'VIDEO', title: 'DAX Weekly levels', description: 'DAX market analysis.' },
+  });
+  assert.notEqual(decision.decision, 'WITHHOLD');
+});
+
+test('conflicting non-Latin evidence is not recorded as a legacy admission', () => {
+  const baseline = observeKeywordBaseline({
+    channelId: 'UClegacy0000000000000002',
+    channelName: 'ट्रेडिंग Kitchen',
+    youtubeUrl: 'https://youtube.com/channel/UClegacy0000000000000002',
+    description: '',
+    videoTitles: [],
+    matchedDocument: { type: 'CHANNEL', title: 'ट्रेडिंग Kitchen' },
+  });
+  assert.equal(baseline.baseline, 'WOULD_WITHHOLD');
+});
+
 test('keyword baseline preserves the old non-Latin coverage pass for observational comparison', () => {
   const baseline = observeKeywordBaseline({
     channelId: 'UClegacy0000000000000001',
