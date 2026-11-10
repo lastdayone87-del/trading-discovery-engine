@@ -311,6 +311,7 @@ test('a sub-target rate cannot round up into the nominal gate', () => {
 
   assert.equal(report.gates.elapsedHours, 1);
   assert.equal(report.gates.observedBrowserCrawlsPerHour, 40);
+  assert.ok(Math.abs(report.gates.observedBrowserCrawlsPerHourRaw - 39.996) < 1e-6);
   assert.equal(report.gates.nominalTargetMet, false);
   assert.ok(report.failures.includes('browser_crawls_per_hour_below_nominal_target'));
 });
@@ -327,8 +328,26 @@ test('a sub-floor discovery share cannot round up into the floor', () => {
   });
 
   assert.equal(report.gates.discoverySharePct, 33.33);
+  assert.ok(Math.abs((report.gates.discoverySharePctRaw ?? 0) - 33.325) < 1e-9);
   assert.equal(report.gates.discoveryFloorMet, false);
   assert.ok(report.failures.includes('discovery_share_below_floor'));
+});
+
+test('an exact integer floor is not lost to binary percentage noise', () => {
+  // 57 / 100 is exactly 57%, but (57 / 100) * 100 is 56.99999999999999.
+  const report = buildCrawlThroughputReport([
+    row('2026-11-10T11:30:00.000Z', 'DISCOVERY', 'ACQUIRED', { renderedCrawls: 57 }),
+    row('2026-11-10T11:31:00.000Z', 'RETRY', 'ACQUIRED', { renderedCrawls: 43 }),
+  ], {
+    windowHours: 1,
+    now: new Date('2026-11-10T11:59:00.000Z'),
+    discoveryFloorPct: 57,
+  });
+
+  assert.equal(report.gates.discoverySharePct, 57);
+  assert.ok(Math.abs((report.gates.discoverySharePctRaw ?? 0) - 57) < 1e-9);
+  assert.equal(report.gates.discoveryFloorMet, true);
+  assert.ok(!report.failures.includes('discovery_share_below_floor'));
 });
 
 test('the report keeps the approved Option C thresholds', () => {

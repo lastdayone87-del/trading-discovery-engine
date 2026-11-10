@@ -110,9 +110,15 @@ export interface CrawlThroughputGates {
   emergencyCeilingPerHour: number;
   discoveryFloorPct: number;
   elapsedHours: number;
+  /** Rounded for display; the gate compares `observedBrowserCrawlsPerHourRaw`. */
   observedBrowserCrawlsPerHour: number;
+  /** Unrounded rate that the nominal gate actually evaluates. */
+  observedBrowserCrawlsPerHourRaw: number;
   peakBrowserCrawlsPerHour: number;
+  /** Rounded for display; the floor gate uses integer cross-multiplication. */
   discoverySharePct: number | null;
+  /** Unrounded share that the floor gate actually evaluates. */
+  discoverySharePctRaw: number | null;
   nominalTargetMet: boolean;
   emergencyCeilingExceeded: boolean;
   discoveryFloorMet: boolean;
@@ -506,11 +512,17 @@ export function buildCrawlThroughputReport(
   const rawDiscoverySharePct = totals.browserCrawls > 0
     ? (totals.discoveryBrowserCrawls / totals.browserCrawls) * 100
     : null;
+  // A tiny tolerance keeps an exactly-at-target rate from failing on binary
+  // division noise, while still rejecting 39.996/h.
   const nominalTargetMet = totals.browserCrawls > 0
-    && rawObservedBrowserCrawlsPerHour >= nominalTargetPerHour;
+    && rawObservedBrowserCrawlsPerHour >= nominalTargetPerHour - 1e-9;
   const emergencyCeilingExceeded = peakBrowserCrawlsPerHour > emergencyCeilingPerHour;
-  const discoveryFloorMet = rawDiscoverySharePct !== null
-    && rawDiscoverySharePct >= discoveryFloorPct;
+  // Integer cross-multiplication avoids 57/100 becoming 56.99999999999999 and
+  // failing an exact 57% floor. The configured floor is evaluated at 0.01%
+  // precision (basis points).
+  const discoveryFloorBasisPoints = Math.round(discoveryFloorPct * 100);
+  const discoveryFloorMet = totals.browserCrawls > 0
+    && totals.discoveryBrowserCrawls * 10000 >= discoveryFloorBasisPoints * totals.browserCrawls;
 
   const failures: string[] = [];
   if (totals.browserCrawls === 0) {
@@ -544,8 +556,10 @@ export function buildCrawlThroughputReport(
       discoveryFloorPct,
       elapsedHours: Math.round(elapsedHours * 100) / 100,
       observedBrowserCrawlsPerHour,
+      observedBrowserCrawlsPerHourRaw: rawObservedBrowserCrawlsPerHour,
       peakBrowserCrawlsPerHour,
       discoverySharePct,
+      discoverySharePctRaw: rawDiscoverySharePct,
       nominalTargetMet,
       emergencyCeilingExceeded,
       discoveryFloorMet,
