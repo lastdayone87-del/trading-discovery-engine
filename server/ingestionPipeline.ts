@@ -1122,7 +1122,7 @@ async function processChannelThroughPipelineInContext(
       isNew: !existing,
       wasKnown: !!existing,
       persisted: true,
-      countryStatus: countryVal.status,
+      countryStatus: authoritativeChannel.country_status,
       tradingStatus: authoritativeChannel.trading_status || finalUncertainStatus,
       discordStatus: authoritativeChannel.discord_status,
       discordInvite: authoritativeChannel.discord_invite ?? null,
