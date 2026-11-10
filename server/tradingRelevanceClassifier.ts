@@ -115,9 +115,10 @@ export async function classifyTradingRelevanceDetailed(
   const breakdown: TradingRelevanceBreakdown = {
     stage_a_score: Math.round(decision.totalPositiveWeight),
     consistency_ratio: decision.multiVideoConsistencyRatio,
+    ai_reviewed: semanticServed,
     // Cost accounting needs attempted AI calls (including abstentions), while
-    // `semantic_used` below reports whether semantic evidence actually served.
-    ai_reviewed: legacyReporting ? semanticServed : (routing.semanticUsed || routing.semanticAttempted),
+    // `ai_reviewed`/`semantic_used` report whether semantic evidence served.
+    semantic_attempted: legacyReporting ? semanticServed : routing.semanticAttempted,
     fast_heuristic_status: decision.status === 'TRADING_CONFIRMED' ? 'FAST_ACCEPT' : decision.status === 'NON_TRADING' ? 'FAST_REJECT' : 'UNCERTAIN',
     classification_method: classificationMethod,
     // Every non-empty assessment is scored by the unified decision policy,
