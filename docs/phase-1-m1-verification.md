@@ -30,9 +30,10 @@ surfaces through the same boundaries used in production:
 projection outputs that feed `upsertChannel`; actual upsert/database behavior is
 covered by the existing pg-tests and is a separate integration boundary. The
 suite injects `creatorLikelyTrading:false` and an empty URL failure-history
-loader to avoid channel/failure DB reads; remaining settings lookups are
-read-only. No writes or migrations are initiated by the suite. Run it under the
-disposable CI database.
+loader and deletes `DATABASE_URL` for its test process, so `getDb()` cannot
+open, migrate, or seed a configured developer database; settings reads fail
+closed to defaults and no DB writes occur. Run it under the disposable CI
+database.
 
 ## Scenario matrix
 
@@ -71,6 +72,7 @@ node --import tsx --test \
   server/recallSafeAcquisition.test.ts
 ```
 
-Results: M1 matrix **12/12**; Phase 1 regression sweep **200/200**; `tsc`
-passes. No production code, settings, data, migrations, or deployments were
+Results: M1 matrix **13/13**; Phase 1 regression sweep **201/201**; `tsc`
+passes. The suite was also run with a deliberately invalid `DATABASE_URL` to
+prove it does not connect to a configured database. No production code, settings, data, migrations, or deployments were
 changed by this verification unit.

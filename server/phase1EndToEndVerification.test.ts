@@ -5,7 +5,13 @@ import { canonicalDiscordInviteId, mergeDiscordCandidates } from './discordCandi
 import { projectDiscordValidation } from './discordProjection';
 import { validateDiscordInvite } from './discordValidator';
 import { detectPendingDiscoveryWork, projectNotFoundAfterInspection } from './queueManager';
+import type { AcquisitionSurface } from './inspector';
 import { runChannelInspectionForTest as runChannelInspection } from './testCrawlHelpers';
+
+// M1 is a deterministic static-acquisition suite. Remove any configured DB URL
+// for this test process so getDb() cannot migrate or seed a developer database;
+// settings reads fail closed to defaults and no DB writes occur.
+delete process.env.DATABASE_URL;
 
 const DESCRIPTIONS = ['one', 'two', 'three', 'four', 'five'];
 
@@ -73,7 +79,7 @@ async function validateAndProject(code: string, candidate: Parameters<typeof pro
 async function expectFound(
   input: Parameters<typeof runChannelInspection>[0],
   code: string,
-  expectedSurfaces: string[],
+  expectedSurfaces: AcquisitionSurface[],
 ) {
   const result = await runChannelInspection({...input, creatorLikelyTrading: false, urlFailureHistoryLoader: async () => []});
   assert.equal(result.foundInvite, code);
@@ -90,7 +96,7 @@ async function expectFound(
   assert.equal(candidate.nativeInviteCode, code);
   const surfaces = new Set(candidate.observations?.map(observation => observation.sourceSurface));
   for (const surface of expectedSurfaces) {
-    assert.ok(surfaces.has(surface as never), `candidate provenance includes ${surface}`);
+    assert.ok(surfaces.has(surface), `candidate provenance includes ${surface}`);
   }
 
   const { validation, projected } = await validateAndProject(code, candidate);
@@ -351,4 +357,8 @@ test('M1 M4a: a failed widget fetch stays partial and retry-owned', async () => 
       throw new Error(`unexpected fetch: ${url}`);
     }) as typeof fetch,
   });
+});
+
+test('M1 runs without a configured database', () => {
+  assert.equal(process.env.DATABASE_URL, undefined, 'the suite must not connect to a configured developer database');
 });
