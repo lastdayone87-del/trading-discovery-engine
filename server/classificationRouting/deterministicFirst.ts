@@ -53,7 +53,7 @@ export interface ClassificationRoutingOptions {
 
 type RoutingInput = Pick<
   VerificationDecision,
-  'status' | 'confidenceScore' | 'evidenceCollection' | 'recognitionState' | 'semanticPolicy' | 'decisionPolicy' | 'classificationMethod'
+  'status' | 'confidenceScore' | 'evidenceCollection' | 'recognitionState' | 'semanticPolicy' | 'decisionPolicy' | 'classificationMethod' | 'geminiSemanticSummary'
 >;
 
 export const STRONG_TRADING_ANALYSIS = /(technical\s*analysis|price\s*action|market\s*analysis|\bict\b|\bsmc\b|day\s*trad|swing\s*trad|scalp|live\s*trad|trade\s*setup|trade\s*journal|back\s*test|backtest|risk\s*management|chart\s*analysis|market\s*structure|volume\s*profile|footprint|forex\s*analysis|futures?\s*analysis|options?\s*analysis|stock\s*analysis|crypto\s*analysis|support\s*and\s*resistance|candlestick|breakout|pullback|moving\s*average|\brsi\b|\bmacd\b|fibonacci|elliott|wyckoff|\bpnl\b|p\s*&\s*l|trading\s*strategy|trading\s*education|market\s*update|market\s*recap|\b(?:market|price|weekly|daily|fx|forex|stock|crypto|gold|silver|oil|index|indices|futures?|commodity|currency|bitcoin|btc|ethereum|eth|nasdaq|s&p|sp500|dow|dax|ftse|nikkei|bonds?|yields?|dollar|euro|pound|yen|rupee|altcoin|copper|dax|ftse|nikkei|dow|s&p|sp500|vix|natural\s*gas|crude|eurusd|gbpusd|usdjpy|audusd|usdcad|usdchf|nzdusd|xauusd|xagusd)\s+(?:forecast|outlook|preview)|\btechnical\s+outlook\b|\b(?:eurusd|gbpusd|usdjpy|audusd|usdcad|usdchf|nzdusd|xauusd|xagusd|bitcoin|btc|ethereum|eth|nasdaq)\s+(?:analysis|update|review|recap|setup|levels)\b|price\s*analysis|gold\s*analysis|silver\s*analysis|metals?\s*analysis|commodity\s*analysis|platinum\s*analysis|capital\s*market|\bvix\b|macro\s*(?:analysis|outlook|commentary|positioning)|market\s*crash|прогноз|анализ|تحلیل\s*(?:تکنیکال|بازار|فنی)|ترید|معامله\s*گری|технический\s*анализ|анализ\s*рынка|трейдинг|analyse\s*(?:technique|du\s*marché)|analyse\s*de\s*marché|技術分析|技術的な分析|차트\s*분석|기술적\s*분석|analyse\s*technique|an[aá]lisis\s*t[eé]cnico|analisi\s*tecnica|technische\s*analyse|teknik\s*analiz|テクニカル分析|技术分析|تحليل\s*فني|технический\s*анализ)/iu;
@@ -257,6 +257,15 @@ export function resolveClassificationRouting(
           reasonCodes: ['NON_TRADING_CONTENT_FOCUS_REQUIRES_REVIEW', ...categories.map(category => `NON_TRADING_FOCUS_${category}`)],
         });
       }
+    }
+    if (semantic.used && decision.geminiSemanticSummary?.isTrading === 'NO') {
+      return result({
+        route: 'HUMAN_REVIEW', confidence, evidenceSufficiency: sufficiency,
+        recognitionState, semanticPolicy, semanticUsed: true, semanticAttempted: semantic.attempted,
+        humanReview: true,
+        fallbackReason: 'SEMANTIC_OPPOSES_CONFIRMATION',
+        reasonCodes: ['SEMANTIC_OPPOSES_CONFIRMATION'],
+      });
     }
     if (semantic.used) {
       return result({

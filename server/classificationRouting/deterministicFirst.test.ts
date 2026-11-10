@@ -413,3 +413,13 @@ test('LEGACY routing returns the legacy route vocabulary', () => {
   const nonTrading = resolveClassificationRouting(decision({ status: 'NON_TRADING', confidenceScore: 10 }), { mode: 'LEGACY' });
   assert.equal(nonTrading.route, 'SEMANTIC_NON_TRADING');
 });
+
+test('a serving semantic NO assessment sends a confirmed decision to review', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'TRADING_CONFIRMED', confidenceScore: 90, recognitionState: 'DECISIVE_TRADING', semanticPolicy: 'BOUNDED_WAIT',
+    geminiSemanticSummary: { isTrading: 'NO', concepts: [], instruments: [], reason: 'opposes trading' },
+    providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
+  }), { independentEvidence: true });
+  assert.equal(routed.route, 'HUMAN_REVIEW');
+  assert.equal(routed.fallbackReason, 'SEMANTIC_OPPOSES_CONFIRMATION');
+});
