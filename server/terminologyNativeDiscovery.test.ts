@@ -2509,7 +2509,7 @@ test('rule-admitted instruments are filtered from AI candidates', () => {
   assert.match(source, /excludeRuleAdmittedInstruments\(values, ruleObserved\)/);
 });
 
-test('ineligible extracted rows rotate without consuming the offer', () => {
+test('extracted offer predicate rejects prose and admits native Tamil for Singapore', () => {
   assert.equal(isOfferableExtractedCandidate({ candidateText: 'DAX Orderflow Strategie', language: 'de' }, 'Germany'), true);
   assert.equal(isOfferableExtractedCandidate({ candidateText: 'weekly trade breakdown', language: 'en' }, 'United States'), false);
   assert.equal(isOfferableExtractedCandidate({ candidateText: 'தங்கம் விலை பகுப்பாய்வு', language: 'ta' }, 'Singapore'), true);
