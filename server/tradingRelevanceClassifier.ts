@@ -69,7 +69,7 @@ export async function classifyTradingRelevanceDetailed(
   // Keep one document per video. Collapsing identical text would hide two
   // distinct uploads from the mismatch guard.
   const videoTexts = videoDocuments
-    .map(video => [video.title, video.description].filter(Boolean).join(' ').trim())
+    .map(video => [video.title, video.description].filter(Boolean).join('\n').trim())
     .filter(Boolean);
   const routing = resolveClassificationRouting(decision, {
     independentEvidence: corroboration?.disposition === 'PASS',

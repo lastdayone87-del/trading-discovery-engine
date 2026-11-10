@@ -56,12 +56,12 @@ type RoutingInput = Pick<
   'status' | 'confidenceScore' | 'evidenceCollection' | 'recognitionState' | 'semanticPolicy' | 'decisionPolicy' | 'classificationMethod'
 >;
 
-export const STRONG_TRADING_ANALYSIS = /(technical\s*analysis|price\s*action|market\s*analysis|\bict\b|\bsmc\b|day\s*trad|swing\s*trad|scalp|live\s*trad|trade\s*setup|trade\s*journal|back\s*test|backtest|risk\s*management|chart\s*analysis|market\s*structure|volume\s*profile|footprint|forex\s*analysis|futures?\s*analysis|options?\s*analysis|stock\s*analysis|crypto\s*analysis|support\s*and\s*resistance|candlestick|breakout|pullback|moving\s*average|\brsi\b|\bmacd\b|fibonacci|elliott|wyckoff|\bpnl\b|p\s*&\s*l|trading\s*strategy|trading\s*education|market\s*update|market\s*recap|(?:market|price|weekly|daily|fx|forex|stock|crypto|gold|silver|oil|index|indices|futures?|commodity|currency|bitcoin|btc|ethereum|eth|nasdaq|s&p|sp500|dow|dax|ftse|nikkei|bond|yield|dollar|euro|pound|yen|rupee|altcoin|copper|eurusd|gbpusd|usdjpy|audusd|usdcad|usdchf|nzdusd|xauusd|xagusd)\s+(?:forecast|outlook|preview)|\b(?:eurusd|gbpusd|usdjpy|audusd|usdcad|usdchf|nzdusd|xauusd|xagusd)\b|\btechnical\s+outlook\b|price\s*analysis|gold\s*analysis|silver\s*analysis|metals?\s*analysis|commodity\s*analysis|platinum\s*analysis|capital\s*market|\bvix\b|macro\s*(?:analysis|outlook|commentary|positioning)|market\s*crash|прогноз|анализ|تحلیل\s*(?:تکنیکال|بازار|فنی)|ترید|معامله\s*گری|технический\s*анализ|анализ\s*рынка|трейдинг|analyse\s*(?:technique|du\s*marché)|analyse\s*de\s*marché|技術分析|技術的な分析|차트\s*분석|기술적\s*분석|analyse\s*technique|an[aá]lisis\s*t[eé]cnico|analisi\s*tecnica|technische\s*analyse|teknik\s*analiz|テクニカル分析|技术分析|تحليل\s*فني|технический\s*анализ)/iu;
+export const STRONG_TRADING_ANALYSIS = /(technical\s*analysis|price\s*action|market\s*analysis|\bict\b|\bsmc\b|day\s*trad|swing\s*trad|scalp|live\s*trad|trade\s*setup|trade\s*journal|back\s*test|backtest|risk\s*management|chart\s*analysis|market\s*structure|volume\s*profile|footprint|forex\s*analysis|futures?\s*analysis|options?\s*analysis|stock\s*analysis|crypto\s*analysis|support\s*and\s*resistance|candlestick|breakout|pullback|moving\s*average|\brsi\b|\bmacd\b|fibonacci|elliott|wyckoff|\bpnl\b|p\s*&\s*l|trading\s*strategy|trading\s*education|market\s*update|market\s*recap|\b(?:market|price|weekly|daily|fx|forex|stock|crypto|gold|silver|oil|index|indices|futures?|commodity|currency|bitcoin|btc|ethereum|eth|nasdaq|s&p|sp500|dow|dax|ftse|nikkei|bond|yield|dollar|euro|pound|yen|rupee|altcoin|copper|eurusd|gbpusd|usdjpy|audusd|usdcad|usdchf|nzdusd|xauusd|xagusd)\s+(?:forecast|outlook|preview)|\btechnical\s+outlook\b|price\s*analysis|gold\s*analysis|silver\s*analysis|metals?\s*analysis|commodity\s*analysis|platinum\s*analysis|capital\s*market|\bvix\b|macro\s*(?:analysis|outlook|commentary|positioning)|market\s*crash|прогноз|анализ|تحلیل\s*(?:تکنیکال|بازار|فنی)|ترید|معامله\s*گری|технический\s*анализ|анализ\s*рынка|трейдинг|analyse\s*(?:technique|du\s*marché)|analyse\s*de\s*marché|技術分析|技術的な分析|차트\s*분석|기술적\s*분석|analyse\s*technique|an[aá]lisis\s*t[eé]cnico|analisi\s*tecnica|technische\s*analyse|teknik\s*analiz|テクニカル分析|技术分析|تحليل\s*فني|технический\s*анализ)/iu;
 
 const NON_TRADING_FOCUS: Array<[string, RegExp]> = [
   ['ENTERTAINMENT', /\b(?:dance|dancing|choreography|music|song|lyrics|vlog|prank|recipe|cooking|gaming|gameplay|fortnite|minecraft|makeup|beauty|unboxing|(?<!market\s)(?<!price\s)reaction)s?\b/giu],
   ['PROMOTION', /\b(?:memecoin|meme\s*coin|presale|pre-sale|airdrop|nft|play[\s-]*to[\s-]*earn|giveaway|token\s*launch|pump(?![\s-]*(?:and|&|n)[\s-]*dump\b)|contract\s*address)s?\b|\bbuy\s*\$/giu],
-  ['PERSONAL_FINANCE', /\b(?:personal\s*finance|debt|budgeting?|credit\s*(?:card|score|repair)|savings?|mortgage|retirement|paycheck|money\s*management|get\s*out\s*of\s*debt|win\s*with\s*money)\b/giu],
+  ['PERSONAL_FINANCE', /\b(?:personal\s*finance|debt|budget(?:ing)?|credit\s*(?:card|score|repair)|savings?|mortgage|retirement|paycheck|money\s*management|get\s*out\s*of\s*debt|win\s*with\s*money)\b/giu],
   ['EXCHANGE_CORPORATE', /\b(?:stock\s*exchange|exchange\s*listing|listing\s*ceremony|award|gong|annual\s*report|market\s*opening|opening\s*ceremony|beleggingsoplossing)\b/giu],
 ];
 
@@ -90,26 +90,32 @@ export function stripDistributionText(text: string): string {
  * Remove lines repeated across videos (broker footers, affiliate blocks) so a
  * shared description footer cannot count as repeated non-trading focus.
  */
-const FOOTER_BOILERPLATE = /(https?:\/\/|www\.|\bfollow\b|\bsubscribe\b|\binstagram\b|\btwitter\b|\bx\.com\b|\btelegram\b|\bdiscord\b|\bwebsite\b|\blinktr|\baffiliate\b|\breferral\b|\bsponsor|\bcontact\b|\bemail\b|©|copyright|disclaimer|risk\s*warning|\bbroker\b|\bsign\s*up\b|\bjoin\s+(?:us|our|the)\b)/iu;
+const REPEATED_PROMO_FOOTER = /\b(?:memecoin|meme\s*coin|giveaway|airdrop|presale|pre-sale|nft|play[\s-]*to[\s-]*earn|token\s*launch|link\s+below|description\s+below)\b/iu;
+const FOOTER_BOILERPLATE = /(https?:\/\/|www\.|\bfollow\b|\bsubscribe\b|\binstagram\b|\btwitter\b|\bx\.com\b|\btelegram\b|\bdiscord\b|\bwebsite\b|\blinktr|\baffiliate\b|\breferral\b|\bsponsored\s+by\b|\bcontact\b|\bemail\b|\bmusic\s*:|\bcredit\s*:|©|copyright|disclaimer|risk\s*warning|\bbroker\s+(?:link|account|partner)\b|\bsign\s*up\b|\bjoin\s+(?:us|our|the)\b)/iu;
 
 export function stripRepeatedFooterLines(texts: string[]): string[] {
   const linesByVideo = texts.map(text => text
     .split(/\r?\n/)
     .map(line => line.trim())
     .filter(Boolean));
+  // Count lines after stripping tracking URLs so the same affiliate footer is
+  // recognized even when every video has a different query string.
+  const normalizedLinesByVideo = linesByVideo.map(lines => lines.map(line => stripDistributionText(line).trim()));
   const counts = new Map<string, number>();
-  for (const lines of linesByVideo) {
+  for (const lines of normalizedLinesByVideo) {
     for (const line of new Set(lines)) counts.set(line, (counts.get(line) || 0) + 1);
   }
-  return linesByVideo.map(lines => {
-    // The first line is the video's subject/title. Only remove repeated lines
-    // that look like distribution boilerplate; repeated subject evidence must
-    // still count toward the focus guard.
-    const kept = lines.filter((line, index) =>
-      index === 0
-      || (counts.get(line) || 0) < 2
-      || !FOOTER_BOILERPLATE.test(line),
-    );
+  return linesByVideo.map((lines, videoIndex) => {
+    const normalizedLines = normalizedLinesByVideo[videoIndex];
+    // The first line is the video's subject/title. Only remove distribution
+    // boilerplate or a repeated promotional footer; repeated subject evidence
+    // must still count toward the focus guard.
+    const kept = lines.filter((line, index) => {
+      if (index === 0) return true;
+      if (FOOTER_BOILERPLATE.test(line)) return false;
+      const normalized = normalizedLines[index];
+      return !((counts.get(normalized) || 0) >= 2 && REPEATED_PROMO_FOOTER.test(normalized));
+    });
     return stripDistributionText(kept.join(' ')).trim();
   });
 }
@@ -311,14 +317,19 @@ export function resolveClassificationRouting(
     });
   }
 
-  const semanticUnresolved = semantic.failed || semantic.abstained
+  // If semantic AI actually served evidence and the decision is still
+  // UNCERTAIN, the ambiguity has already survived the AI fallback. Sufficient
+  // independent evidence belongs in human review, not another enrichment loop.
+  const semanticUnresolved = semantic.failed || semantic.abstained || semantic.used
     || (!semantic.used && (semanticPolicy === 'NONE' || semanticPolicy === 'BOUNDED_WAIT'));
   if (semanticUnresolved && independent) {
     const fallbackReason = semantic.failed
       ? 'SEMANTIC_FAILED_WITH_SUFFICIENT_EVIDENCE'
       : semantic.abstained
         ? 'SEMANTIC_ABSTAINED_WITH_SUFFICIENT_EVIDENCE'
-        : 'NO_SEMANTIC_CAPACITY_WITH_SUFFICIENT_EVIDENCE';
+        : semantic.used
+          ? 'SEMANTIC_AMBIGUOUS_WITH_SUFFICIENT_EVIDENCE'
+          : 'NO_SEMANTIC_CAPACITY_WITH_SUFFICIENT_EVIDENCE';
     return result({
       route: 'HUMAN_REVIEW', confidence, evidenceSufficiency: sufficiency,
       recognitionState, semanticPolicy, semanticUsed: semantic.used, semanticAttempted: semantic.attempted,
