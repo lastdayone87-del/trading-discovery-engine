@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { DEFAULT_BROWSER_FALLBACK_BUDGET, DECLARATIVE_SHADOW_SCAN_MAX_BYTES, advanceRenderedLifecycleStage, beginRenderedDeclarativeShadowScan, browserCauseSnippet, browserFallbackTelemetrySummary, buildRenderedLinkBaseline, classifyCrawlCatch, classifyRenderedPopupDestination, collectRenderedCrossOriginCandidates, countDeclarativeClosedShadowRoots, createRenderedRouteGuard, disposeRenderedRouteGuards, installRenderedRouteCloseCleanup, isDiscordDestinationUrl, isNativeDiscordInviteUrl, isExpectedRenderedRouteShutdownError, isTelegramPostPermalink, mergeRenderedPageContextCounts, planRevealedSameOriginEnqueues, popupMarkupEvidenceSourceUrl, readRenderedDeclarativeShadowScan, renderedPopupWaitTimeoutMs, RenderedFallbackGate, renderedFallbackGate, resolveRenderedZeroPageReason, retainSkippableAnchorEvidence, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback, shouldRecordSaturatedBaselineGap, shouldSkipPreexistingSiblingPage, sumRenderedPageContextCounts, type BrowserFallbackTelemetry, type RenderedRouteLike } from './browserCommunityFallback';
+import { DEFAULT_BROWSER_FALLBACK_BUDGET, DECLARATIVE_SHADOW_SCAN_MAX_BYTES, advanceRenderedLifecycleStage, beginRenderedDeclarativeShadowScan, browserCauseSnippet, browserFallbackTelemetrySummary, buildRenderedLinkBaseline, classifyCrawlCatch, classifyRenderedPopupDestination, collectRenderedCrossOriginCandidates, countDeclarativeClosedShadowRoots, createRenderedRouteGuard, disposeRenderedRouteGuards, installRenderedRouteCloseCleanup, isDiscordDestinationUrl, isNativeDiscordInviteUrl, isExpectedRenderedRouteShutdownError, isTelegramPostPermalink, mergeRenderedPageContextCounts, planRevealedSameOriginEnqueues, popupMarkupEvidenceSourceUrl, readRenderedDeclarativeShadowScan, renderedCrawlStarted, renderedPopupWaitTimeoutMs, RenderedFallbackGate, renderedFallbackGate, resolveRenderedZeroPageReason, retainSkippableAnchorEvidence, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback, shouldRecordSaturatedBaselineGap, shouldSkipPreexistingSiblingPage, sumRenderedPageContextCounts, type BrowserFallbackTelemetry, type RenderedRouteLike } from './browserCommunityFallback';
 import { RenderedAdmissionGovernor } from './renderedAdmissionGovernor';
 import { inferDiscordOwnership, makeDiscordCandidate } from './discordCandidates';
 import { redactCauseSnippet } from './crawlerTelemetry';
@@ -467,6 +467,25 @@ test('rendered browser gate rejects unbounded pending launches', async () => {
   await assert.rejects(gate.run(async () => undefined), /RENDERED_FALLBACK_SATURATED/);
   release();
   await Promise.all([first, second]);
+});
+
+test('rendered crawl work is recognized once the handler is entered', () => {
+  assert.equal(renderedCrawlStarted({
+    inspectedPages: 0,
+    telemetry: { lastLifecycleStage: 'HANDLER_ENTERED' } as unknown as BrowserFallbackTelemetry,
+  }), true);
+  assert.equal(renderedCrawlStarted({
+    inspectedPages: 0,
+    telemetry: { lastLifecycleStage: 'PAGE_PROCESSED' } as unknown as BrowserFallbackTelemetry,
+  }), true);
+  assert.equal(renderedCrawlStarted({
+    inspectedPages: 0,
+    telemetry: { lastLifecycleStage: 'CRAWLER_RUNNING' } as unknown as BrowserFallbackTelemetry,
+  }), false);
+  assert.equal(renderedCrawlStarted({
+    inspectedPages: 0,
+    telemetry: { lastLifecycleStage: 'CRAWLER_RUNNING', requestsFailed: 1 } as unknown as BrowserFallbackTelemetry,
+  }), true);
 });
 
 test('rendered admission governor denies over-budget crawls as capacity', async () => {

@@ -37,9 +37,12 @@ requests could queue, and nothing reserved capacity for discovery work.
   records `CAPACITY_DEFERRED`, never a genuine acquisition failure. The denial
   carries the governor's `retryAt` hint; rendered observations persist it, so a
   durable retry can wait for the window to free a slot.
-- **Failed starts are refunded:** if the proxy/browser setup fails before a
-  request starts, the gate removes that admission from the window. A failed
-  start cannot consume an hour of capacity or count toward the discovery floor.
+- **Failed starts are refunded:** if the proxy/browser setup fails before
+  navigation actually runs — no handler entry, page evidence, or request
+  counter — the gate removes that admission from the window. A failed start
+  cannot consume an hour of capacity or count toward the discovery floor.
+  `HANDLER_ENTERED`/`PAGE_PROCESSED` counts as real work even when the counter
+  snapshot is still zero.
 - **Process scope:** the window is in-process. The production deployment is a
   single app container with one browser slot, so a restart resets the rolling
   window; no multi-replica guarantee is claimed.

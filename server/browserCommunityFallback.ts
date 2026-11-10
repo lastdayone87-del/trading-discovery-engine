@@ -238,10 +238,17 @@ export interface BrowserFallbackTelemetry {
   crawlFinishedAt?: string;
 }
 
-/** True when the rendered result proves at least one request actually ran. */
-function renderedCrawlStarted(result: BrowserFallbackResult): boolean {
+/** True when the rendered result proves navigation actually ran. */
+export function renderedCrawlStarted(
+  result: Pick<BrowserFallbackResult, 'inspectedPages' | 'telemetry'>,
+): boolean {
   const telemetry = result.telemetry;
   return result.inspectedPages > 0
+    // A crawl can enter the handler and load a page, then hit the deadline
+    // before the counter snapshot increments. The lifecycle stage is the
+    // affirmative evidence that navigation ran and the slot was consumed.
+    || telemetry?.lastLifecycleStage === 'HANDLER_ENTERED'
+    || telemetry?.lastLifecycleStage === 'PAGE_PROCESSED'
     || (telemetry?.requestsStarted || 0) > 0
     || (telemetry?.requestsFinished || 0) > 0
     || (telemetry?.requestsFailed || 0) > 0
@@ -4563,7 +4570,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
 
   try {
     const gateRequestedAtMs = Date.now();
-    return await renderedFallbackGate.run((gateAdmittedAtMs) => withRenderedQueueLifecycleLock(async () => {
+    return await renderedFallbackGate.run<BrowserFallbackResult>((gateAdmittedAtMs) => withRenderedQueueLifecycleLock(async () => {
       // Admission wait is capacity evidence, measured before the lifecycle
       // lock so serialized crawls correctly show gate pressure. It is never
       // an acquisition failure or a reason to consume retry ownership.
