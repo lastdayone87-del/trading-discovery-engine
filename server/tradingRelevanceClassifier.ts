@@ -115,7 +115,9 @@ export async function classifyTradingRelevanceDetailed(
   const breakdown: TradingRelevanceBreakdown = {
     stage_a_score: Math.round(decision.totalPositiveWeight),
     consistency_ratio: decision.multiVideoConsistencyRatio,
-    ai_reviewed: semanticServed,
+    // Cost accounting needs attempted AI calls (including abstentions), while
+    // `semantic_used` below reports whether semantic evidence actually served.
+    ai_reviewed: legacyReporting ? semanticServed : (routing.semanticUsed || routing.semanticAttempted),
     fast_heuristic_status: decision.status === 'TRADING_CONFIRMED' ? 'FAST_ACCEPT' : decision.status === 'NON_TRADING' ? 'FAST_REJECT' : 'UNCERTAIN',
     classification_method: classificationMethod,
     // Every non-empty assessment is scored by the unified decision policy,
@@ -124,15 +126,17 @@ export async function classifyTradingRelevanceDetailed(
     ai_model: decision.geminiSemanticSummary?.modelUsed || decision.versions.geminiModelVersion,
     ai_prompt_payload: decision.geminiSemanticSummary ? JSON.stringify(decision.geminiSemanticSummary) : undefined,
     ai_raw_response: decision.geminiSemanticSummary ? decision.geminiSemanticSummary.reason : undefined,
-    classification_route: routing.route,
-    deterministic_fast_track: routing.fastTrack,
-    semantic_used: routing.semanticUsed,
-    human_review_candidate: routing.humanReview,
-    routing_fallback_reason: routing.fallbackReason,
-    routing_policy_version: routing.version,
+    ...(legacyReporting ? {} : {
+      classification_route: routing.route,
+      deterministic_fast_track: routing.fastTrack,
+      semantic_used: routing.semanticUsed,
+      human_review_candidate: routing.humanReview,
+      routing_fallback_reason: routing.fallbackReason,
+      routing_policy_version: routing.version,
+    }),
     reasoning: [
       ...reasoningLogs,
-      `Deterministic-first route: ${routing.route} | fastTrack=${routing.fastTrack} | semanticUsed=${routing.semanticUsed} | fallback=${routing.fallbackReason || 'none'} | ${routing.reasonCodes.join(', ')}`,
+      ...(legacyReporting ? [] : [`Deterministic-first route: ${routing.route} | fastTrack=${routing.fastTrack} | semanticUsed=${routing.semanticUsed} | fallback=${routing.fallbackReason || 'none'} | ${routing.reasonCodes.join(', ')}`]),
     ]
   };
 
