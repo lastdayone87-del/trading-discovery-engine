@@ -434,6 +434,8 @@ export function capDemandSignalCandidates<T>(candidates: T[], count: number): T[
   return candidates.slice(0, Math.floor(requested * 0.3));
 }
 
+const REVIEWED_BROKER_PLATFORM_SURFACE = /\b(bourse\s*direct|xtb|boursorama|trade\s*republic|scalable\s*capital|etoro|ig\s*group|interactive\s*brokers|degiro|bolero|dbs\s*vickers|trading\s*212|swissquote|saxo|plus500|cmc\s*markets|fidelity|robinhood|webull)\b/iu;
+
 const SAFE_REVIEWED_MARKET_QUALIFIER = new RegExp(
   '\\b(dax|ibex|cac|bel ?20|euronext|nyse|nasdaq|s&p|ftse|aex|smi|omx|tsx|asx|nzx|sgx|nikkei|topix|kospi|bist|bovespa|moex|jse|hose|set|bursa|stock\\s*exchange|bourse|börse|beurs|market\\s*outlook|market\\s*wrap|opening|session)\\b'
   + '|(?<![\\p{L}\\p{N}])(?:تحليل|تداول)(?![\\p{L}\\p{N}])',
@@ -455,6 +457,7 @@ export function isReviewedNativeStandaloneSurface(input: {
   const term = String(input.term || '').normalize('NFKC').trim().replace(/\s+/g, ' ');
   if (!term) return false;
   const type = String(input.type || '').toUpperCase();
+  if (['BROKER', 'PLATFORM', 'PROPFIRM'].includes(type) || REVIEWED_BROKER_PLATFORM_SURFACE.test(term)) return false;
   const reviewedMethod = type === 'METHOD'
     && Number(input.specificity ?? 0) >= 55
     && Number(input.ambiguity ?? 100) <= 60;

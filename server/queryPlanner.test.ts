@@ -528,6 +528,8 @@ test('reviewed native trading methods remain standalone while ambiguous markets 
 
 test('reviewed standalone rule keeps broker surfaces out and Arabic qualifiers in', () => {
   assert.equal(isReviewedNativeStandaloneSurface({ term: 'Bourse Direct', type: 'BROKER', specificity: 62, ambiguity: 48 }), false);
+  assert.equal(isReviewedNativeStandaloneSurface({ term: 'Boursorama CAC 40', type: 'MARKET', specificity: 42, ambiguity: 72 }), false);
+  assert.equal(isReviewedNativeStandaloneSurface({ term: 'XTB DAX', type: 'MARKET', specificity: 42, ambiguity: 72 }), false);
   assert.equal(isReviewedNativeStandaloneSurface({ term: 'STI analysis today', type: 'MARKET', specificity: 42, ambiguity: 72 }), false);
   assert.equal(isReviewedNativeStandaloneSurface({ term: 'DAX Analyse heute', type: 'MARKET', specificity: 42, ambiguity: 72 }), true);
   assert.equal(isReviewedNativeStandaloneSurface({ term: 'تحليل السوق', type: 'MARKET', specificity: 42, ambiguity: 72 }), true);
