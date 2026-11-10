@@ -68,7 +68,7 @@ function text(row: Row): string {
 function increment(map: Record<string, number>, key: string | undefined): void {
   const name = key || 'MISSING';
   const current = Object.prototype.hasOwnProperty.call(map, name) ? map[name] : 0;
-  map[name] = current + 1;
+  Object.defineProperty(map, name, { value: current + 1, enumerable: true, configurable: true, writable: true });
 }
 
 const inputPath = process.argv[2];

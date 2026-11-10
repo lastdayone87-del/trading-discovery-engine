@@ -598,6 +598,12 @@ export interface AggregatedContentLanguage {
  * (a playlist voting a different eligible language voids dominance), never
  * decide. Pure function — no I/O, no quota.
  */
+/**
+ * Aggregate the bounded ten-video language sample plus any creator-level
+ * `additionalSamples` (for example the About/bio). Additional samples are
+ * appended after the ten-video window and count toward `usable`, the share
+ * denominator, and the mixed-language guard.
+ */
 export function aggregateContentLanguage(
   descriptions: string[],
   playlists: Array<{ name?: string; description?: string }> = [],

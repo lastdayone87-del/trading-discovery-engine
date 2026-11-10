@@ -711,9 +711,7 @@ async function processChannelThroughPipelineInContext(
       // path instead of being replaced by the old country status.
       const reviewableCountry = deferredCountry
         && deferredCreatorCountry
-        && (deferredCountry.gateDisposition === 'NEEDS_REVIEW'
-          || deferredCountry.status === 'LIKELY'
-          || deferredCountry.status === 'CONFIRMED');
+        && deferredCountry.gateDisposition === 'NEEDS_REVIEW';
       if (reviewableCountry) {
         existing.country = deferredCreatorCountry;
         existing.country_status = deferredCountry.status;

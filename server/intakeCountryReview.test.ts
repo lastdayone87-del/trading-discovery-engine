@@ -123,6 +123,6 @@ test('existing confirmed rows keep their trading decision but persist fresh defe
   const section = source.slice(start, end);
   assert.match(section, /reviewableCountry/);
   assert.match(section, /existing\.country_status = deferredCountry\.status/);
-  assert.match(section, /existing\.trading_status/);
+  assert.doesNotMatch(section, /existing\.trading_status\s*=(?!=)/);
   assert.match(section, /channelRecord: existing/);
 });
