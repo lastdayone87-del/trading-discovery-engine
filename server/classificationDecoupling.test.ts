@@ -280,6 +280,15 @@ test('an owned placeholder insert stays novel while a conflict re-reads the winn
     queue,
     /if \(queued\.status === 'PENDING' \|\| queued\.status === 'PROCESSING'\) \{[\s\S]{0,400}const channel = existing \|\| await getChannelById\(raw\.channelId\);/,
   );
+  // The atomic-admission rejection path must preserve the same novelty rule.
+  assert.match(
+    queue,
+    /if \(!queued\) \{[\s\S]{0,400}const channel = insertedPlaceholder\s*\? existing\s*: \(existing \|\| await getChannelById\(raw\.channelId\)\);/,
+  );
+  assert.doesNotMatch(
+    queue,
+    /if \(!queued\) \{[\s\S]{0,250}const channel = existing \|\| await getChannelById\(raw\.channelId\);/,
+  );
 });
 
 test('sweep revisions are recency-bounded and one-shot', () => {

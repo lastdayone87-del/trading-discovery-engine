@@ -1282,7 +1282,12 @@ export async function admitDiscoveredChannel(input: {
       preventReopen: true,
     });
     if (!queued) {
-      const channel = existing || await getChannelById(raw.channelId);
+      // A concurrent worker may own the active classification, but if this
+      // worker won the insert-only placeholder, the row is still this query's
+      // novel discovery. Re-reading it would report wasKnown=true.
+      const channel = insertedPlaceholder
+        ? existing
+        : (existing || await getChannelById(raw.channelId));
       return { outcome: classificationPendingOutcome(raw, channel), pending: true };
     }
     if (queued.status === 'PENDING' || queued.status === 'PROCESSING') {
