@@ -34,6 +34,18 @@ export async function listReviewQueue(filters:{country?:string;search?:string;li
   return r.rows.map(map);
 }
 
+/** Paginated review queue with a durable count for the operator console. */
+export async function listReviewQueuePage(filters:{country?:string;search?:string;limit?:number;offset?:number}={}) {
+  const [items,count]=await Promise.all([
+    listReviewQueue(filters),
+    (async()=>{const db=await getDb();const r=await db.query(`SELECT COUNT(*)::int AS total
+      FROM channel_reviews r JOIN channels c USING(channel_id) WHERE r.state='PENDING'
+        AND ($1::text IS NULL OR c.country=$1) AND ($2::text IS NULL OR c.channel_name ILIKE '%'||$2||'%' OR c.channel_id ILIKE '%'||$2||'%')`,
+      [filters.country||null,filters.search||null]);return Number(r.rows[0]?.total||0);})(),
+  ]);
+  return {items,total:count};
+}
+
 export async function getReviewDetails(channelId:string) {
   const db=await getDb(); const [item,history]=await Promise.all([
     db.query(`SELECT r.*,c.channel_name,c.youtube_url,c.country,c.trading_status,c.scan_status,c.quality_score,c.discord_status FROM channel_reviews r JOIN channels c USING(channel_id) WHERE r.channel_id=$1`,[channelId]),

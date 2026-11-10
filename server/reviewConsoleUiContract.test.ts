@@ -39,3 +39,15 @@ test('review console never submits a stale bundle for a newly selected channel',
   assert.match(ui, /loadingBundle/);
   assert.match(ui, /aria-label="Other reason"/);
 });
+
+test('review console paginates without reloading on selection and shows creation focus evidence', () => {
+  assert.match(ui, /data\.items/);
+  assert.match(ui, /data\.total/);
+  assert.match(ui, /Previous/);
+  assert.match(ui, /Next/);
+  assert.match(ui, /creatorFocusSnapshot/);
+  assert.match(ui, /creator_focus_distribution/);
+  assert.match(ui, /lower_confidence_bound/);
+  assert.match(ui, /document_keys/);
+  assert.match(navbar, /operationalSummary \? operationalSummary\.pendingReviews : '…'/);
+});

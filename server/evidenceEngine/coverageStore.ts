@@ -26,7 +26,14 @@ export async function persistEvidenceCoverage(snapshot: EvidenceCoverageSnapshot
   return { inserted: false, id: existing.rows[0]?.id ? String(existing.rows[0].id) : undefined };
 }
 
-export async function listEvidenceCoverage(input: { channelId?: string; limit?: number; offset?: number; cutoff?: string } = {}) {
+export async function listEvidenceCoverage(input: {
+  channelId?: string;
+  limit?: number;
+  offset?: number;
+  cutoff?: string;
+  /** Exact diagnostic, when the snapshot has one. */
+  classificationDiagnosticId?: string;
+} = {}) {
   const db = await getDb();
   const limit = Math.min(250, Math.max(1, input.limit || 100));
   const offset = Math.max(0, input.offset || 0);
@@ -34,8 +41,9 @@ export async function listEvidenceCoverage(input: { channelId?: string; limit?: 
     `SELECT * FROM evidence_coverage_snapshots
       WHERE ($1::text IS NULL OR channel_id=$1)
         AND ($2::timestamptz IS NULL OR observed_at<=$2)
-      ORDER BY observed_at DESC,id LIMIT $3 OFFSET $4`,
-    [input.channelId || null, input.cutoff || null, limit, offset]
+        AND ($3::uuid IS NULL OR classification_diagnostic_id=$3)
+      ORDER BY observed_at DESC,id LIMIT $4 OFFSET $5`,
+    [input.channelId || null, input.cutoff || null, input.classificationDiagnosticId || null, limit, offset]
   );
   return result.rows;
 }

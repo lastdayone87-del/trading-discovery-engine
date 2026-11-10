@@ -12,11 +12,13 @@ interface Props {
 }
 
 export const Navbar: React.FC<Props> = ({ activeTab, setActiveTab, queueStatus, quotaInfo, matchingResults, operationalSummary }) => {
+  // Do not show a misleading zero while the summary request is still loading.
+  const pendingReviews = operationalSummary ? operationalSummary.pendingReviews : '…';
   const navItems = [
     { id: 'discovery', label: 'Discovery & Search', icon: Radar },
     { id: 'intelligence', label: 'Query Intelligence', icon: Brain },
     { id: 'regression', label: 'Regression Suite', icon: ShieldCheck },
-    { id: 'review', label: `Review Console (${operationalSummary?.pendingReviews ?? 0})`, icon: ShieldAlert },
+    { id: 'review', label: `Review Console (${pendingReviews})`, icon: ShieldAlert },
     { id: 'results', label: `Channels Table (${matchingResults})`, icon: Table },
     { id: 'pending', label: 'Pending & Re-checks', icon: Clock },
     { id: 'queues', label: 'Queue Monitor', icon: Cpu },

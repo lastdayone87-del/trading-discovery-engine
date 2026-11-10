@@ -67,11 +67,25 @@ export async function persistEvidenceDocuments(
   }
 }
 
-export async function listEvidenceDocuments(input: { channelId?: string; subjectEntityId?: string; limit?: number; offset?: number; cutoff?: string } = {}) {
+export async function listEvidenceDocuments(input: {
+  channelId?: string;
+  subjectEntityId?: string;
+  limit?: number;
+  offset?: number;
+  cutoff?: string;
+  /** Exact document keys from the diagnostic's Creator Focus snapshot. */
+  documentKeys?: string[];
+} = {}) {
   const db = await getDb(), limit = Math.min(250, Math.max(1, input.limit || 100)), offset = Math.max(0, input.offset || 0);
+  const documentKeys = input.documentKeys?.length ? input.documentKeys.slice(0, 250) : null;
   const result = await db.query(
-    `SELECT * FROM evidence_documents WHERE ($1::text IS NULL OR channel_id=$1) AND ($2::uuid IS NULL OR subject_entity_id=$2) AND ($3::timestamptz IS NULL OR observed_at<=$3) ORDER BY observed_at DESC,id LIMIT $4 OFFSET $5`,
-    [input.channelId || null, input.subjectEntityId || null, input.cutoff || null, limit, offset]
+    `SELECT * FROM evidence_documents
+      WHERE ($1::text IS NULL OR channel_id=$1)
+        AND ($2::uuid IS NULL OR subject_entity_id=$2)
+        AND ($3::timestamptz IS NULL OR observed_at<=$3)
+        AND ($4::text[] IS NULL OR document_key=ANY($4))
+      ORDER BY observed_at DESC,id LIMIT $5 OFFSET $6`,
+    [input.channelId || null, input.subjectEntityId || null, input.cutoff || null, documentKeys, limit, offset]
   );
   return result.rows;
 }

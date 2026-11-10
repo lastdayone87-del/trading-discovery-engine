@@ -63,6 +63,19 @@ function asRecord(value: unknown): Record<string, unknown> {
   return {};
 }
 
+function asStringArray(value: unknown): string[] {
+  if (Array.isArray(value)) return value.filter((entry): entry is string => typeof entry === 'string');
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) return parsed.filter((entry): entry is string => typeof entry === 'string');
+    } catch {
+      // ignore malformed legacy payloads
+    }
+  }
+  return [];
+}
+
 function asArray(value: unknown): unknown[] {
   if (Array.isArray(value)) return value;
   if (typeof value === 'string') {
@@ -214,24 +227,55 @@ export async function getReviewEvidence(
     if (!diagnosticWarning && !diagnosticId) diagnosticWarning = 'CLASSIFICATION_DIAGNOSTIC_ID_MISSING';
   }
 
-  const cutoff = options.cutoff || (diagnosticRow ? new Date(diagnosticRow.created_at).toISOString() : undefined);
-  let documentsUnavailable = false;
-  let assertionsUnavailable = false;
-  let coverageUnavailable = false;
+  // Resolve the exact Creator Focus snapshot first. Its document/assertion
+  // keys are the only exact scope for the evidence the classifier saw; a
+  // timestamp cutoff would also include observations from earlier runs.
+  let creatorFocusRow: any = null;
   let creatorFocusUnavailable = false;
-  const [evidenceDocuments, evidenceAssertions, evidenceCoverage, creatorFocus] = await Promise.all([
-    listEvidenceDocuments({ channelId, limit: Math.min(100, Math.max(1, options.documentLimit || 50)), cutoff }).catch(() => { documentsUnavailable = true; return []; }),
-    listEvidenceAssertions({ channelId, limit: Math.min(200, Math.max(1, options.assertionLimit || 100)), cutoff }).catch(() => { assertionsUnavailable = true; return []; }),
-    listEvidenceCoverage({ channelId, limit: Math.min(50, Math.max(1, options.coverageLimit || 20)), cutoff }).catch(() => { coverageUnavailable = true; return []; }),
-    diagnosticRow ? db.query(
-      `SELECT id,classification_diagnostic_id,classifier_version,policy_version,observed_at,
-              document_count,independent_families,trading_mass,alternative_mass,lower_confidence_bound
+  if (diagnosticRow) {
+    const result = await db.query(
+      `SELECT id,classification_diagnostic_id,evidence_coverage_snapshot_id,
+              classifier_version,policy_version,observed_at,mode,
+              document_keys,assertion_keys,creator_focus_distribution,
+              proposed_status,effective_status,probability,lower_confidence_bound,reason_codes
          FROM creator_focus_classification_snapshots
         WHERE classification_diagnostic_id=$1
         ORDER BY observed_at DESC,id DESC
         LIMIT 1`,
       [diagnosticRow.id],
-    ).then(result => result.rows[0] || null).catch(() => { creatorFocusUnavailable = true; return null; }) : Promise.resolve(null),
+    ).catch(() => { creatorFocusUnavailable = true; return null; });
+    creatorFocusRow = result?.rows[0] || null;
+  }
+
+  const documentKeys = asStringArray(creatorFocusRow?.document_keys);
+  const assertionKeys = asStringArray(creatorFocusRow?.assertion_keys);
+  const exactDocumentScope = documentKeys.length > 0;
+  const exactAssertionScope = assertionKeys.length > 0;
+  const cutoff = exactDocumentScope
+    ? undefined
+    : options.cutoff || (diagnosticRow ? new Date(diagnosticRow.created_at).toISOString() : undefined);
+
+  let documentsUnavailable = false;
+  let assertionsUnavailable = false;
+  let coverageUnavailable = false;
+  const [evidenceDocuments, evidenceAssertions, evidenceCoverage] = await Promise.all([
+    listEvidenceDocuments({
+      channelId,
+      documentKeys: exactDocumentScope ? documentKeys : undefined,
+      limit: Math.min(250, Math.max(1, options.documentLimit || 50, documentKeys.length)),
+      cutoff,
+    }).catch(() => { documentsUnavailable = true; return []; }),
+    listEvidenceAssertions({
+      channelId,
+      assertionKeys: exactAssertionScope ? assertionKeys : undefined,
+      limit: Math.min(250, Math.max(1, options.assertionLimit || 100, assertionKeys.length)),
+      cutoff,
+    }).catch(() => { assertionsUnavailable = true; return []; }),
+    listEvidenceCoverage({
+      channelId,
+      classificationDiagnosticId: diagnosticRow?.id,
+      limit: Math.min(50, Math.max(1, options.coverageLimit || 20)),
+    }).catch(() => { coverageUnavailable = true; return []; }),
   ]);
 
   const bundle = mapReviewEvidenceRows({
@@ -241,10 +285,14 @@ export async function getReviewEvidence(
     evidenceDocuments,
     evidenceAssertions,
     evidenceCoverage,
-    creatorFocusRow: creatorFocus,
+    creatorFocusRow,
   });
   if (eligibilityWarning) bundle.warnings.push(eligibilityWarning);
   if (diagnosticWarning) bundle.warnings.push(diagnosticWarning);
+  if (diagnosticRow && !exactDocumentScope) bundle.warnings.push('EVIDENCE_SCOPE_TEMPORAL_FALLBACK');
+  if (exactDocumentScope && evidenceDocuments.length < documentKeys.length) bundle.warnings.push('EVIDENCE_DOCUMENT_SCOPE_INCOMPLETE');
+  if (exactAssertionScope && evidenceAssertions.length < assertionKeys.length) bundle.warnings.push('EVIDENCE_ASSERTION_SCOPE_INCOMPLETE');
+  if (diagnosticRow && !coverageUnavailable && evidenceCoverage.length === 0) bundle.warnings.push('EVIDENCE_COVERAGE_NOT_FOUND');
   if (documentsUnavailable) bundle.warnings.push('EVIDENCE_DOCUMENTS_UNAVAILABLE');
   if (assertionsUnavailable) bundle.warnings.push('EVIDENCE_ASSERTIONS_UNAVAILABLE');
   if (coverageUnavailable) bundle.warnings.push('EVIDENCE_COVERAGE_UNAVAILABLE');

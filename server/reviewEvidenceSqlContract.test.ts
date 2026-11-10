@@ -15,8 +15,41 @@ test('review evidence selects explicit diagnostic columns and bounded evidence r
   assert.match(source, /evidence_items/);
   assert.match(source, /staged_report/);
   assert.match(source, /provider_execution/);
-  assert.match(source, /Math\.min\(100,\s*Math\.max\(1,\s*options\.documentLimit\s*\|\|\s*50\)\)/);
-  assert.match(source, /Math\.min\(200,\s*Math\.max\(1,\s*options\.assertionLimit\s*\|\|\s*100\)\)/);
-  assert.match(source, /Math\.min\(50,\s*Math\.max\(1,\s*options\.coverageLimit\s*\|\|\s*20\)\)/);
   assert.doesNotMatch(source, /SELECT\s+\*\s+FROM production_classification_diagnostics/i);
+});
+
+test('review evidence is scoped to the exact Creator Focus document and assertion keys', () => {
+  assert.match(source, /document_keys/);
+  assert.match(source, /assertion_keys/);
+  assert.match(source, /documentKeys: exactDocumentScope \? documentKeys : undefined/);
+  assert.match(source, /assertionKeys: exactAssertionScope \? assertionKeys : undefined/);
+  assert.match(source, /classificationDiagnosticId: diagnosticRow\?\.id/);
+  assert.match(source, /EVIDENCE_SCOPE_TEMPORAL_FALLBACK/);
+  assert.match(source, /EVIDENCE_DOCUMENT_SCOPE_INCOMPLETE/);
+  assert.match(source, /EVIDENCE_ASSERTION_SCOPE_INCOMPLETE/);
+});
+
+test('review evidence uses real Creator Focus columns', () => {
+  assert.match(source, /creator_focus_distribution/);
+  assert.match(source, /lower_confidence_bound/);
+  assert.match(source, /probability/);
+  assert.match(source, /proposed_status/);
+  assert.match(source, /effective_status/);
+  assert.doesNotMatch(source, /document_count,independent_families,trading_mass,alternative_mass/);
+});
+
+test('the review queue endpoint returns a durable total for pagination', () => {
+  const store = readFileSync(new URL('./reviewStore.ts', import.meta.url), 'utf8');
+  assert.match(store, /export async function listReviewQueuePage/);
+  assert.match(store, /COUNT\(\*\)::int AS total/);
+  assert.match(store, /return \{items,total:count\}/);
+});
+
+test('evidence stores support exact-key and exact-diagnostic scoping', () => {
+  const documents = readFileSync(new URL('./evidenceEngine/documentStore.ts', import.meta.url), 'utf8');
+  const assertions = readFileSync(new URL('./evidenceEngine/assertionStore.ts', import.meta.url), 'utf8');
+  const coverage = readFileSync(new URL('./evidenceEngine/coverageStore.ts', import.meta.url), 'utf8');
+  assert.match(documents, /document_key=ANY\(\$4\)/);
+  assert.match(assertions, /assertion_key=ANY\(\$4\)/);
+  assert.match(coverage, /classification_diagnostic_id=\$3/);
 });

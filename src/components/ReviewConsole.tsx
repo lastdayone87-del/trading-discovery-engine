@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertTriangle, CheckCircle2, ChevronRight, ExternalLink, Loader2, RefreshCw, ShieldAlert, XCircle } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, ChevronLeft, ChevronRight, ExternalLink, Loader2, RefreshCw, ShieldAlert, XCircle } from 'lucide-react';
 import { apiFetch } from '../apiClient';
 import { submitReviewDecision } from '../reviewDecision';
 import { canSubmitReviewForSelection, reviewEvidenceIsDecidable } from '../reviewSelection';
@@ -60,6 +60,8 @@ function JsonBlock({ value }: { value: unknown }) {
 
 export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ onReviewCompleted }) => {
   const [queue, setQueue] = useState<ReviewQueueItem[]>([]);
+  const [total, setTotal] = useState(0);
+  const [offset, setOffset] = useState(0);
   const [selected, setSelected] = useState<string | null>(null);
   const [bundle, setBundle] = useState<ReviewEvidenceBundle | null>(null);
   const [loading, setLoading] = useState(false);
@@ -83,25 +85,26 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
     setLoading(true);
     setError(null);
     try {
-      const params = new URLSearchParams({ limit: '50' });
+      const params = new URLSearchParams({ limit: '50', offset: String(offset) });
       if (search.trim()) params.set('search', search.trim());
       if (country.trim()) params.set('country', country.trim());
       const response = await apiFetch(`/api/reviews?${params.toString()}`);
       if (!response.ok) throw new Error(await response.text() || 'Could not load the review queue.');
-      const items = await response.json() as ReviewQueueItem[];
+      const data = await response.json() as { items: ReviewQueueItem[]; total: number };
       if (requestId !== queueRequest.current) return;
-      setQueue(items);
-      if (items.length && !selected) setSelected(items[0].channelId);
-      if (selected && !items.some(item => item.channelId === selected)) {
-        setSelected(items[0]?.channelId || null);
-        setBundle(null);
-      }
+      setQueue(data.items || []);
+      setTotal(Number(data.total || 0));
+      setSelected(previous => {
+        if (previous && data.items?.some(item => item.channelId === previous)) return previous;
+        return data.items?.[0]?.channelId || null;
+      });
     } catch (err) {
+      if (requestId !== queueRequest.current) return;
       setError(err instanceof Error ? err.message : 'Could not load the review queue.');
     } finally {
-      setLoading(false);
+      if (requestId === queueRequest.current) setLoading(false);
     }
-  }, [search, country, selected]);
+  }, [search, country, offset]);
 
   const loadCatalog = useCallback(async () => {
     try {
@@ -171,6 +174,7 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
       setNotice(`${action === 'APPROVE' ? 'Approved' : 'Rejected'} ${current.channelName}.`);
       setBundle(null);
       setSelected(null);
+      setOffset(0);
       await loadQueue();
       onReviewCompleted?.();
     } catch (err) {
@@ -203,10 +207,10 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
             </button>
           </div>
           <div className="grid grid-cols-2 gap-2">
-            <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search channel" className="rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent px-2.5 py-2 text-xs" />
-            <input value={country} onChange={e => setCountry(e.target.value)} placeholder="Country" className="rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent px-2.5 py-2 text-xs" />
+            <input value={search} onChange={e => { setSearch(e.target.value); setOffset(0); }} placeholder="Search channel" className="rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent px-2.5 py-2 text-xs" />
+            <input value={country} onChange={e => { setCountry(e.target.value); setOffset(0); }} placeholder="Country" className="rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent px-2.5 py-2 text-xs" />
           </div>
-          <div className="mt-2 text-[11px] text-slate-500">{queue.length} pending in this page</div>
+          <div className="mt-2 text-[11px] text-slate-500">{total} pending in this queue</div>
         </div>
         <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden">
           {queue.length === 0 && !loading && <div className="p-4 text-xs text-slate-500">No pending reviews.</div>}
@@ -224,6 +228,15 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
                 </div>
               </button>
             ))}
+          </div>
+          <div className="flex items-center justify-between border-t border-slate-100 dark:border-slate-800 px-3 py-2 text-[11px]">
+            <button disabled={offset === 0 || loading} onClick={() => setOffset(Math.max(0, offset - 50))} className="inline-flex items-center gap-1 rounded border border-slate-200 dark:border-slate-700 px-2 py-1 disabled:opacity-40">
+              <ChevronLeft className="w-3 h-3" /> Previous
+            </button>
+            <span className="text-slate-500">Page {Math.floor(offset / 50) + 1} of {Math.max(1, Math.ceil(total / 50))}</span>
+            <button disabled={offset + 50 >= total || loading} onClick={() => setOffset(offset + 50)} className="inline-flex items-center gap-1 rounded border border-slate-200 dark:border-slate-700 px-2 py-1 disabled:opacity-40">
+              Next <ChevronRight className="w-3 h-3" />
+            </button>
           </div>
         </div>
       </div>
@@ -308,6 +321,28 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
                 <div><div className="text-[11px] text-slate-400 mb-1">Assertions ({bundle.evidenceAssertions.length})</div><JsonBlock value={bundle.evidenceAssertions} /></div>
                 <div><div className="text-[11px] text-slate-400 mb-1">Coverage ({bundle.evidenceCoverage.length})</div><JsonBlock value={bundle.evidenceCoverage} /></div>
               </div>
+            </Section>
+
+            <Section title="Creator Focus snapshot (shadow, non-authoritative)">
+              {!bundle.creatorFocusSnapshot && <div className="text-xs text-slate-400">No Creator Focus snapshot is recorded for this diagnostic.</div>}
+              {bundle.creatorFocusSnapshot && (
+                <div className="grid gap-3 md:grid-cols-2">
+                  <div className="text-xs space-y-1">
+                    <div><span className="text-slate-400">Mode:</span> {bundle.creatorFocusSnapshot.mode || '—'}</div>
+                    <div><span className="text-slate-400">Proposed:</span> {bundle.creatorFocusSnapshot.proposed_status || '—'}</div>
+                    <div><span className="text-slate-400">Effective:</span> {bundle.creatorFocusSnapshot.effective_status || 'UNCERTAIN'}</div>
+                    <div><span className="text-slate-400">Probability:</span> {bundle.creatorFocusSnapshot.probability ?? '—'}</div>
+                    <div><span className="text-slate-400">Lower confidence bound:</span> {bundle.creatorFocusSnapshot.lower_confidence_bound ?? '—'}</div>
+                    <div><span className="text-slate-400">Observed:</span> {date(bundle.creatorFocusSnapshot.observed_at)}</div>
+                    <div><span className="text-slate-400">Scoped documents:</span> {Array.isArray(bundle.creatorFocusSnapshot.document_keys) ? bundle.creatorFocusSnapshot.document_keys.length : 0}</div>
+                    <div><span className="text-slate-400">Scoped assertions:</span> {Array.isArray(bundle.creatorFocusSnapshot.assertion_keys) ? bundle.creatorFocusSnapshot.assertion_keys.length : 0}</div>
+                  </div>
+                  <div className="space-y-2">
+                    <div><div className="text-[11px] text-slate-400 mb-1">Focus distribution</div><JsonBlock value={bundle.creatorFocusSnapshot.creator_focus_distribution} /></div>
+                    <div><div className="text-[11px] text-slate-400 mb-1">Reason codes</div><JsonBlock value={bundle.creatorFocusSnapshot.reason_codes} /></div>
+                  </div>
+                </div>
+              )}
             </Section>
 
             <Section title="Decision history">
