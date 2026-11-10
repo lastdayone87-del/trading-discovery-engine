@@ -286,7 +286,7 @@ function rejectedCandidate(input: {
   if (!candidateText) {
     const raw = String(input.sourceTitle || input.text || '').trim();
     if (!raw) return null;
-    candidateText = raw.slice(0, 80);
+    candidateText = Array.from(raw).slice(0, 80).join('');
     candidateKey = `nuisance:${createHash('sha1').update(raw).digest('hex').slice(0, 20)}`;
   }
   const detected = detectLanguage(candidateText, { countryHint: input.country });

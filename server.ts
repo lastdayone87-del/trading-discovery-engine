@@ -664,7 +664,11 @@ async function startServer() {
       const country = typeof req.query.country === 'string' && req.query.country.trim() ? req.query.country.trim() : undefined;
       const limit = Math.max(1, Math.min(500, parseInt(req.query.limit as string) || 100));
       const offset = Math.max(0, Math.min(100000, parseInt(req.query.offset as string) || 0));
-      res.json(await getExtractedQueryCandidates(country, limit, offset));
+      const beforeRaw = typeof req.query.before === 'string' ? req.query.before : '';
+      const before = beforeRaw && Number.isFinite(Date.parse(beforeRaw))
+        ? new Date(beforeRaw).toISOString()
+        : undefined;
+      res.json(await getExtractedQueryCandidates(country, limit, offset, before));
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }

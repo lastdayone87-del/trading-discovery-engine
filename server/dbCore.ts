@@ -2294,6 +2294,7 @@ export async function getStandaloneExtractedQueryCandidates(country: string, lim
          SELECT 1 FROM query_library ql
          WHERE LOWER(ql.country)=LOWER($1)
            AND ql.collection <> 'REJECTED'
+           AND ql.status = 'ACTIVE'
            AND ql.normalized_query = c.normalized_text
        )
      ORDER BY c.last_attempted_at NULLS FIRST, c.confidence DESC, c.updated_at DESC, c.id ASC
@@ -2329,7 +2330,7 @@ export async function reconcileExtractedQueryCandidates(country: string): Promis
      FROM query_library q
      WHERE LOWER(c.country)=LOWER($1) AND c.decision='ACCEPTED' AND c.standalone_eligible=true
        AND c.query_id IS NULL AND LOWER(q.country)=LOWER($1)
-       AND q.collection <> 'REJECTED' AND q.normalized_query = c.normalized_text`,
+       AND q.collection <> 'REJECTED' AND q.status = 'ACTIVE' AND q.normalized_query = c.normalized_text`,
     [canonicalCountry(country)],
   );
   return result.rowCount || 0;
@@ -2340,7 +2341,7 @@ export async function linkExtractedQueryCandidate(candidateId: number, queryId: 
   await db.query('UPDATE extracted_query_candidates SET query_id=$2,updated_at=now() WHERE id=$1 AND query_id IS NULL', [candidateId, queryId]);
 }
 
-export async function getExtractedQueryCandidates(country?: string, limit = 100, offset = 0): Promise<Array<ExtractedQueryCandidateRecord & { collection: string | null; runs: number; quota: number; newChannels: number; qualityCreators: number }>> {
+export async function getExtractedQueryCandidates(country?: string, limit = 100, offset = 0, before?: string | null): Promise<Array<ExtractedQueryCandidateRecord & { collection: string | null; runs: number; quota: number; newChannels: number; qualityCreators: number }>> {
   const db = await getDb();
   const bounded = Math.max(1, Math.min(500, Math.trunc(limit)));
   const skipped = Math.max(0, Math.min(100000, Math.trunc(offset)));
@@ -2353,8 +2354,9 @@ export async function getExtractedQueryCandidates(country?: string, limit = 100,
      LEFT JOIN LATERAL (SELECT count(*)::int runs, COALESCE(SUM(quota_used),0)::float/100.0 AS quota FROM query_runs WHERE query_id=c.query_id) r ON true
      LEFT JOIN LATERAL (SELECT COALESCE(SUM(unique_new_channels),0)::int new_channels, COALESCE(SUM(quality_creators_discovered),0)::int quality_creators FROM query_execution_logs WHERE query_id=c.query_id) l ON true
      WHERE ($1::text IS NULL OR LOWER(c.country)=LOWER($1))
+       AND ($4::timestamptz IS NULL OR c.created_at <= $4::timestamptz)
      ORDER BY c.created_at DESC, c.id DESC LIMIT $2 OFFSET $3`,
-    [country ? canonicalCountry(country) : null, bounded, skipped],
+    [country ? canonicalCountry(country) : null, bounded, skipped, before || null],
   );
   return res.rows.map((row: any) => ({ ...mapExtractedCandidate(row), collection: row.collection || null, runs: Number(row.runs || 0), quota: Number(row.quota || 0), newChannels: Number(row.new_channels || 0), qualityCreators: Number(row.quality_creators || 0) }));
 }

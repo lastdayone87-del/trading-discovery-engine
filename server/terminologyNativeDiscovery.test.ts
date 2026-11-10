@@ -2004,6 +2004,7 @@ test('playlist context can supply instrument evidence without replacing video in
     [{ name: 'ES Futures Playlist' }],
   );
   assert.ok(hits.some(hit => hit.instrument === 'ES' && hit.located.sourceKind === 'PLAYLIST_TITLE'));
+  assert.ok(hits.some(hit => hit.instrument === 'DAX' && hit.located.sourceKind === 'VIDEO_TITLE'));
   assert.deepEqual(selectComplementaryPlaylists([], [{ name: 'ES Futures Playlist' }]), []);
 });
 

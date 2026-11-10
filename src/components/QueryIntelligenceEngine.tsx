@@ -110,6 +110,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
   const [extractedCandidates, setExtractedCandidates] = useState<ExtractedCandidateLCB[]>([]);
   const [extractedCandidatesError, setExtractedCandidatesError] = useState<string | null>(null);
   const [extractedOffset, setExtractedOffset] = useState(0);
+  const [extractedSnapshot, setExtractedSnapshot] = useState(() => new Date().toISOString());
   const [logs, setLogs] = useState<QueryExecutionLog[]>([]);
   const [summary, setSummary] = useState<QueryIntelligenceSummary | null>(null);
   const [qualityDashboardState, setQualityDashboard] = useState<QualityDashboard | null>(null);
@@ -200,7 +201,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
       // must not discard a healthy quality response and show the wrong error.
       // Heavy lists are fetched only for the visible tab; the small summary
       // supplies the tab counts even if a list request fails.
-      const extractionParams = new URLSearchParams({ limit: '50', offset: String(extractedOffset) });
+      const extractionParams = new URLSearchParams({ limit: '50', offset: String(extractedOffset), before: extractedSnapshot });
       if (requestCountry !== 'All') extractionParams.set('country', requestCountry);
       const [libRes, terminologyRes, extractionRes, logRes, statusRes, scopeRes, qualityRes] = await Promise.all([
         includeLibrary ? apiFetch(`/api/query-intelligence/library?${libraryParams.toString()}`).catch(() => null) : Promise.resolve(null),
@@ -305,11 +306,12 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
     fetchData();
     const interval = setInterval(fetchData, 10000); // refresh every 10s
     return () => clearInterval(interval);
-  }, [selectedCountry, selectedCollection, activeSubTab, extractedOffset]);
+  }, [selectedCountry, selectedCollection, activeSubTab, extractedOffset, extractedSnapshot]);
 
   // Page numbers belong to a country. Reset them when the filter changes.
   useEffect(() => {
     setExtractedOffset(0);
+    setExtractedSnapshot(new Date().toISOString());
   }, [selectedCountry]);
 
   // Handle Pause / Resume toggle
@@ -901,6 +903,14 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
                     disabled={extractedCandidates.length < 50}
                     className="rounded border border-slate-300 px-1.5 py-0.5 text-[10px] disabled:opacity-40 dark:border-slate-600"
                   >Next</button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setExtractedOffset(0);
+                      setExtractedSnapshot(new Date().toISOString());
+                    }}
+                    className="rounded border border-slate-300 px-1.5 py-0.5 text-[10px] dark:border-slate-600"
+                  >Refresh</button>
                 </div>
               </div>
               <div className="max-h-72 overflow-auto rounded-lg border border-slate-200 dark:border-slate-800">
