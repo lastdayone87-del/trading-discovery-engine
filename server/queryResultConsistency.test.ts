@@ -97,6 +97,17 @@ test('name-only results are not enough to hold a query', () => {
   assert.ok(decision.reasonCodes.includes('INSUFFICIENT_RESULT_SAMPLE'));
 });
 
+test('a matched title that repeats the channel name never overrides English content', () => {
+  const decision = assessQueryResultConsistency('United States', channels(
+    Array.from({ length: 10 }, (_, index) => ({
+      name: `中文频道-${index}`,
+      description: 'US market analysis and trading education.',
+    })),
+  ));
+  assert.equal(decision.hold, false);
+  assert.ok(decision.reasonCodes.includes('QUERY_RESULT_SCRIPT_CONSISTENT'));
+});
+
 test('held queries never authorize a continuation page', () => {
   const base = { continuationEnabled: true, decisionShouldContinue: true, hasNextPageToken: true };
   assert.equal(shouldContinueSearchAfterConsistency({ ...base, queryResultHold: true }), false);

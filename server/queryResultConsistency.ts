@@ -78,9 +78,7 @@ function channelContentTexts(channel: QueryResultConsistencyChannel): string[] {
   const titleIsJustName = Boolean(
     documentTitle
     && channel.channelName
-    && sameSurface(documentTitle, channel.channelName)
-    && !documentDescription
-    && !channelDescription,
+    && sameSurface(documentTitle, channel.channelName),
   );
   return [
     channelDescription,
