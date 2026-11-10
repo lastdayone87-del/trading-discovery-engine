@@ -1533,6 +1533,7 @@ async function processIntakeDeferredRecheckJob(
       const admitDb = await getDb();
       const admitClient = await admitDb.connect();
       let admitTransaction = false;
+      let admitNeedsSettlement = false;
       try {
         await admitClient.query('BEGIN');
         admitTransaction = true;
@@ -1546,11 +1547,8 @@ async function processIntakeDeferredRecheckJob(
         if (!projected.rowCount) {
           await admitClient.query('ROLLBACK');
           admitTransaction = false;
-          await finishQuotaReservation('ENRICH_CHANNEL', job.id, true);
-          reserved = false;
-          await completeJob(job.id);
-          return true;
-        }
+          admitNeedsSettlement = true;
+        } else {
         const admitted = await enqueueJob('ENRICH_CHANNEL', {
           channelId,
           targetCountry,
@@ -1564,22 +1562,27 @@ async function processIntakeDeferredRecheckJob(
           idempotencyKey: `intake-recheck-enrich:${channelId}:${job.id}`,
           clientOverride: admitClient,
         });
-        if (admitted.status !== 'PENDING' && admitted.status !== 'PROCESSING') {
-          await admitClient.query('ROLLBACK');
-          admitTransaction = false;
-          console.warn('[IntakeRecheck] Admitted follow-up job was not runnable; leaving channel deferred for retry.');
-          await finishQuotaReservation('ENRICH_CHANNEL', job.id, true);
-          reserved = false;
-          await completeJob(job.id);
-          return true;
+          if (admitted.status !== 'PENDING' && admitted.status !== 'PROCESSING') {
+            await admitClient.query('ROLLBACK');
+            admitTransaction = false;
+            admitNeedsSettlement = true;
+            console.warn('[IntakeRecheck] Admitted follow-up job was not runnable; leaving channel deferred for retry.');
+          } else {
+            await admitClient.query('COMMIT');
+            admitTransaction = false;
+          }
         }
-        await admitClient.query('COMMIT');
-        admitTransaction = false;
       } catch (error) {
         if (admitTransaction) await admitClient.query('ROLLBACK').catch(() => undefined);
         throw error;
       } finally {
         admitClient.release();
+      }
+      if (admitNeedsSettlement) {
+        await finishQuotaReservation('ENRICH_CHANNEL', job.id, true);
+        reserved = false;
+        await completeJob(job.id);
+        return true;
       }
     } else {
       channel.last_checked = now;

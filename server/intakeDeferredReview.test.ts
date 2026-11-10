@@ -171,7 +171,8 @@ test('deferred recheck uses the durable ENRICH carrier with bounded stage-1 evid
   assert.match(worker, /SKIPPED_LOW_AUDIENCE[\s\S]*state='SUPERSEDED'/);
   assert.match(worker, /clientOverride: admitClient/);
   const admitCleanup = worker.indexOf("await finishQuotaReservation('ENRICH_CHANNEL', job.id, true)");
-  assert.ok(admitCleanup >= 0, 'early ADMIT returns must settle the quota reservation');
+  const admitRelease = worker.indexOf('admitClient.release()');
+  assert.ok(admitCleanup >= 0 && admitRelease >= 0 && admitRelease < admitCleanup, 'ADMIT cleanup must run after releasing the admission client');
   const audienceLock = worker.indexOf('SELECT 1 FROM intake_deferred_reviews WHERE channel_id=$1 FOR UPDATE');
   const audienceUpdate = worker.indexOf("scan_status='SKIPPED_LOW_AUDIENCE'");
   assert.ok(audienceLock >= 0 && audienceUpdate > audienceLock, 'low-audience review row must be locked before the channel update');
