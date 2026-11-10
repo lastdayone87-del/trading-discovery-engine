@@ -340,18 +340,48 @@ const strongCreatorComposition = {
   explicitCreatorTrading: true,
   explicitCreatorAlternative: false,
   namePriorTrading: false,
-  familyClassifications: [],
+  familyClassifications: [{ sourceFamilyId: 'fam-bio', field: 'channel_bio', focus: 'TRADING_CORE', recent: true, tierA: true, duplicateGroupId: null, signals: [], suppressedSignals: [] }],
   reasonCodes: ['EXPLICIT_CREATOR_TRADING_STATEMENT'],
 } as ContextualCompositionReport;
+
+const richCreatorBioInput = {
+  ...thinRetrievalInput,
+  description: 'Professional forex and futures trader sharing live market analysis, technical analysis, price action, trade setups and risk management education for active traders.',
+};
 
 test('strong creator-owned composition confirms even when a retrieval-only input lacks hydrated videos', () => {
   const evidence = [
     positiveItem('pos-bio', 'PLATFORM_BROKER_PROPFIRM', 'channel_bio', 'fam-bio', 24),
     positiveItem('pos-link', 'EXTERNAL_RESOURCE', 'external_link_domain', 'fam-link', 18),
   ];
-  const { stages, decision } = decide(thinRetrievalInput, evidence, sufficientCollection(), strongCreatorComposition);
+  const { stages, decision } = decide(richCreatorBioInput, evidence, sufficientCollection(), strongCreatorComposition);
   assert.equal(stages.lifecycleAction, 'CONFIRM');
   assert.equal(decision.status, 'TRADING_CONFIRMED');
+});
+
+test('a short keyword bio is not enough for the thin-retrieval exception', () => {
+  const evidence = [
+    positiveItem('pos-bio', 'PLATFORM_BROKER_PROPFIRM', 'channel_bio', 'fam-bio', 24),
+    positiveItem('pos-link', 'EXTERNAL_RESOURCE', 'external_link_domain', 'fam-link', 18),
+  ];
+  const { stages } = decide(thinRetrievalInput, evidence, sufficientCollection(), strongCreatorComposition);
+  assert.equal(stages.lifecycleAction, 'REVIEW');
+});
+
+test('LEGACY restores the thin-retrieval review guard', () => {
+  const previous = process.env.DETERMINISTIC_CLASSIFICATION_ROUTING;
+  process.env.DETERMINISTIC_CLASSIFICATION_ROUTING = 'LEGACY';
+  try {
+    const evidence = [
+      positiveItem('pos-bio', 'PLATFORM_BROKER_PROPFIRM', 'channel_bio', 'fam-bio', 24),
+      positiveItem('pos-link', 'EXTERNAL_RESOURCE', 'external_link_domain', 'fam-link', 18),
+    ];
+    const { stages } = decide(richCreatorBioInput, evidence, sufficientCollection(), strongCreatorComposition);
+    assert.equal(stages.lifecycleAction, 'REVIEW');
+  } finally {
+    if (previous === undefined) delete process.env.DETERMINISTIC_CLASSIFICATION_ROUTING;
+    else process.env.DETERMINISTIC_CLASSIFICATION_ROUTING = previous;
+  }
 });
 
 test('thin retrieval input without a strong creator-owned composition still routes to review', () => {

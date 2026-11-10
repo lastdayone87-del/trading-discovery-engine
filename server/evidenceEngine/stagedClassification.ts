@@ -5,6 +5,7 @@ import type {
 import { isSemanticClassificationSource } from './types';
 import { collapseSourceIndependentObservations } from '../entityResolution';
 import { compositionConfirmsTrading, dedupeWeightByFieldGroup, hasCreatorLevelUnrelatedAttribution } from './decisionPolicy';
+import { resolveClassificationRoutingMode } from '../classificationRouting/deterministicFirst';
 import type { ContextualCompositionReport } from './contextualComposition';
 import { negativeEvidencePolicyWeight, terminalNegativeItems } from './negativeEvidenceRole';
 
@@ -229,7 +230,13 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   // (explicit creator statement, non-title Tier A family, no dominant
   // alternative) is already affirmative evidence and may confirm even when
   // the hydrated video sample is absent. Everything else stays in review.
-  const strongCreatorComposition = Boolean(composition && compositionConfirmsTrading(composition));
+  const substantialCreatorBio = String(input.description || '').trim().length >= 80;
+  const creatorBioTierA = Boolean(composition?.familyClassifications?.some(family =>
+    family.field === 'channel_bio' && family.tierA && family.focus === 'TRADING_CORE'));
+  const strongCreatorComposition = resolveClassificationRoutingMode() === 'ACTIVE'
+    && substantialCreatorBio
+    && creatorBioTierA
+    && Boolean(composition && compositionConfirmsTrading(composition));
   if (lifecycleAction === 'CONFIRM' && isThinRetrievalInputRequiringHydration(input) && !strongCreatorComposition) lifecycleAction = 'REVIEW';
   const lifecycle = result('LIFECYCLE', 'PASS', [`ROUTE_${lifecycleAction}`], [], { action: lifecycleAction });
   return { pipelineVersion: STAGED_CLASSIFICATION_VERSION, stages: [availability, candidate, corroboration, contradiction, lifecycle], lifecycleAction };

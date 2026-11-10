@@ -92,6 +92,8 @@ export async function classifyTradingRelevanceDetailed(
   // deterministic fast-track is not misreported as AI-reviewed and a
   // semantic abstention is not presented as a semantic verdict.
   const legacyReporting = routingMode === 'LEGACY';
+  const semanticAbstained = (decision.evidenceCollection.providers || []).some(provider => String(provider.outcome).startsWith('ABSTAINED_'));
+  const semanticFailed = (decision.evidenceCollection.providers || []).some(provider => String(provider.outcome).startsWith('FAILED_'));
   const semanticServed = legacyReporting
     ? (!!decision.geminiSemanticSummary || String(decision.classificationMethod || '').startsWith('SEMANTIC_'))
     : routing.semanticUsed;
@@ -105,7 +107,7 @@ export async function classifyTradingRelevanceDetailed(
       : semanticServed
         ? 'AI_SEMANTIC_CLASSIFIER'
         : routing.semanticAttempted
-          ? 'SEMANTIC_ABSTAINED'
+          ? semanticAbstained ? 'SEMANTIC_ABSTAINED' : semanticFailed ? 'DEGRADED_HEURISTIC' : 'SEMANTIC_ABSTAINED'
           : decision.classificationMethod === 'DEGRADED_HEURISTIC'
             ? 'DEGRADED_HEURISTIC'
             : 'HEURISTIC_ONLY';

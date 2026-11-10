@@ -27,19 +27,20 @@ const engine = new EvidenceBasedTradingEngine([
 
 function inputFromRow(row: any): RawChannelInput {
   const videos = Array.isArray(row.videos) ? row.videos : [];
+  const normalizedVideos = videos.map((video: any, index: number) => ({
+    id: video.id || `${row.channelId}:${index}`,
+    title: String(video.title || ''),
+    description: String(video.description || ''),
+    published_at: video.published_at || undefined,
+  })).filter((video: any) => video.title);
   return {
     channel_id: String(row.channelId || ''),
     channel_name: String(row.channelName || ''),
     description: String(row.description || ''),
     country: row.country || undefined,
-    video_titles: videos.map((video: any) => String(video.title || '')).filter(Boolean),
-    video_descriptions: videos.map((video: any) => String(video.description || '')).filter(Boolean),
-    videos: videos.map((video: any, index: number) => ({
-      id: video.id || `${row.channelId}:${index}`,
-      title: String(video.title || ''),
-      description: String(video.description || ''),
-      published_at: video.published_at || undefined,
-    })).filter((video: any) => video.title),
+    video_titles: normalizedVideos.map((video: any) => video.title),
+    video_descriptions: normalizedVideos.map((video: any) => video.description),
+    videos: normalizedVideos,
     external_links: [],
     enrichment_stage: 0,
     search_match_context: { type: 'CHANNEL', title: String(row.channelName || ''), description: String(row.description || '') },
@@ -51,22 +52,31 @@ function count(record: Record<string, number>, key: string | undefined | null) {
   record[k] = (record[k] || 0) + 1;
 }
 
+function videoTextsFromRow(row: any): string[] {
+  const texts: string[] = (Array.isArray(row.videos) ? row.videos : [])
+    .map((video: any) => [video.title, video.description].filter(Boolean).join(' ').trim())
+    .filter((text: string) => Boolean(text));
+  return [...new Set(texts)];
+}
+
 const output: any = { readOnly: true, groundTruth: false, note: 'Production status is used only for engineering coverage diagnostics, never as human ground truth.', cohorts: {} };
 for (const [name, path] of files) {
-  if (!fs.existsSync(path)) continue;
+  if (!fs.existsSync(path)) throw new Error(`Missing cohort file: ${path}`);
   const rows = fs.readFileSync(path, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line));
   const summary: any = { rows: rows.length, status: {}, recognition: {}, semanticPolicy: {}, routes: {}, confirmedByDeterministic: 0, nonTradingByDeterministic: 0, examples: [] };
   for (const row of rows) {
     const decision = await engine.evaluateChannel(inputFromRow(row));
+    const videoTexts = videoTextsFromRow(row);
     const routing = resolveClassificationRouting(decision, {
       independentEvidence: decision.stagedClassification?.stages.find(stage => stage.stage === 'CORROBORATION')?.disposition === 'PASS',
+      videoTexts,
     });
     count(summary.status, decision.status);
     count(summary.recognition, decision.recognitionState);
     count(summary.semanticPolicy, decision.semanticPolicy);
     count(summary.routes, routing.route);
-    if (decision.status === 'TRADING_CONFIRMED') summary.confirmedByDeterministic += 1;
-    if (decision.status === 'NON_TRADING') summary.nonTradingByDeterministic += 1;
+    if (routing.route === 'DETERMINISTIC_TRADING') summary.confirmedByDeterministic += 1;
+    if (routing.route === 'DETERMINISTIC_NON_TRADING') summary.nonTradingByDeterministic += 1;
     if (summary.examples.length < 25 && decision.status !== 'TRADING_CONFIRMED' && (decision.recognitionState === 'AMBIGUOUS_THIN' || decision.recognitionState === 'INSUFFICIENT')) {
       summary.examples.push({
         channelId: row.channelId,
