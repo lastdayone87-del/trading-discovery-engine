@@ -51,12 +51,12 @@ for (const label of labels) {
   let routing: any = null;
   if (decision) {
     const normalized = diagnostic.normalized_input || {};
-    const channelText = [
-      normalized.channel_name, normalized.description,
-      ...(normalized.video_titles || []), ...(normalized.video_descriptions || []),
-      ...(normalized.videos || []).flatMap((video: any) => [video.title, video.description || '']),
-    ].filter(Boolean).join(' ');
-    const videoSampleCount = normalized.videos?.length || normalized.video_titles?.length || 0;
+    const videoDocuments: any[] = normalized.videos?.length
+      ? normalized.videos
+      : (normalized.video_titles || []).map((title: string, index: number) => ({ title, description: normalized.video_descriptions?.[index] || '' }));
+    const videoTexts = [...new Set(videoDocuments
+      .map((video: any) => [video.title, video.description].filter(Boolean).join(' ').trim())
+      .filter(Boolean))];
     routing = resolveClassificationRouting({
       status: decision.status,
       confidenceScore: decision.confidenceScore,
@@ -67,8 +67,7 @@ for (const label of labels) {
       classificationMethod: decision.classificationMethod,
     }, {
       independentEvidence: decision.stagedClassification?.stages?.find((stage: any) => stage.stage === 'CORROBORATION')?.disposition === 'PASS',
-      channelText,
-      videoSampleCount,
+      videoTexts,
     });
   }
   rows.push({

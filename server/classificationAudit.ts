@@ -192,22 +192,25 @@ export async function labelClassificationAuditItem(input: {
     const item = itemResult.rows[0];
     const provenance = input.provenance || 'HUMAN_REVIEW';
     const existing = await client.query(
-      `SELECT id,label,provenance FROM evaluation_ground_truth_labels
+      `SELECT id,label,provenance,evidence_snapshot,labeled_at FROM evaluation_ground_truth_labels
         WHERE channel_id=$1 AND evidence_snapshot->>'auditItemId'=$2
-        ORDER BY labeled_at DESC,id DESC LIMIT 1`,
+        ORDER BY labeled_at DESC,id DESC`,
       [item.channel_id, input.auditItemId],
     );
-    if (existing.rowCount && existing.rows[0].label === input.label
-      && existing.rows[0].provenance === provenance
-      && item.status === 'LABELED') {
+    const latest = existing.rows[0] || null;
+    const latestKey = latest?.evidence_snapshot?.idempotencyKey;
+    if (latest && latest.label === input.label && latest.provenance === provenance
+      && input.idempotencyKey && latestKey === input.idempotencyKey) {
       await client.query('COMMIT');
-      return { item: mapItem({ ...item, latest_label: existing.rows[0].label, latest_provenance: existing.rows[0].provenance, latest_labeled_at: new Date().toISOString() }), labelId: String(existing.rows[0].id), idempotent: true };
+      return { item: mapItem({ ...item, latest_label: latest.label, latest_provenance: latest.provenance, latest_labeled_at: latest.labeled_at }), labelId: String(latest.id), idempotent: true };
     }
     const version = Number(existing.rowCount || 0) + 1;
     const labelKey = `classification-audit:${item.cohort_key}:${item.channel_id}:v${version}`;
     const evidenceSnapshot = {
       ...(typeof item.evidence_snapshot === 'string' ? JSON.parse(item.evidence_snapshot) : item.evidence_snapshot),
+      cohortKey: item.cohort_key,
       auditItemId: input.auditItemId,
+      idempotencyKey: input.idempotencyKey || null,
       reviewer: input.reviewer.trim(),
       notes: input.notes?.trim() || null,
       reasonCodes: input.reasonCodes || [],
@@ -249,9 +252,10 @@ export async function exportClassificationAuditLabels(filters: { cohortKey?: str
     `SELECT l.id,l.channel_id,l.label,l.provenance,l.reviewer_count,l.disagreement,
             l.label_policy_version,l.evidence_snapshot,l.labeled_at,c.channel_name,c.country
        FROM evaluation_ground_truth_labels l
+       JOIN classification_audit_items a ON a.id::text=l.evidence_snapshot->>'auditItemId'
        JOIN channels c ON c.channel_id=l.channel_id
       WHERE l.evidence_snapshot->>'auditItemId' IS NOT NULL
-        AND ($1::text IS NULL OR l.evidence_snapshot->>'cohortKey'=$1)
+        AND ($1::text IS NULL OR a.cohort_key=$1)
       ORDER BY l.labeled_at DESC,l.id DESC
       LIMIT $2`,
     [filters.cohortKey || null, limit],

@@ -32,3 +32,12 @@ test('audit queue joins the latest label for an item and never uses production s
   assert.match(source, /ORDER BY x\.labeled_at DESC,x\.id DESC/);
   assert.doesNotMatch(source, /label\s*=\s*c\.trading_status/i);
 });
+
+test('audit label corrections version correctly and export filters by the audit cohort',()=>{
+  const source = readFileSync(new URL('./classificationAudit.ts', import.meta.url), 'utf8');
+  assert.match(source, /existing\.rowCount \|\| 0/);
+  assert.match(source, /latestKey === input\.idempotencyKey/);
+  assert.match(source, /cohortKey: item\.cohort_key/);
+  assert.match(source, /JOIN classification_audit_items a ON a\.id::text=l\.evidence_snapshot->>'auditItemId'/);
+  assert.match(source, /a\.cohort_key=\$1/);
+});

@@ -87,11 +87,12 @@ async function main() {
     const item = work.get(label.itemId);
     if (!item) continue;
     const decision = await engine.evaluateChannel(inputFor(item));
-    const channelText = [item.channelName, item.description, ...(item.videos || []).flatMap(video => [video.title, video.description])].filter(Boolean).join(' ');
+    const videoTexts = [...new Set((item.videos || [])
+      .map(video => [video.title, video.description].filter(Boolean).join(' ').trim())
+      .filter(Boolean))];
     const routing = resolveClassificationRouting(decision, {
       independentEvidence: decision.stagedClassification?.stages.find(stage => stage.stage === 'CORROBORATION')?.disposition === 'PASS',
-      channelText,
-      videoSampleCount: (item.videos || []).length,
+      videoTexts,
     });
     const predicted = decision.status === 'TRADING_CONFIRMED' || decision.status === 'NON_TRADING' ? decision.status : null;
     const resolved = predicted !== null;
