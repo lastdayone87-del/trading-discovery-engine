@@ -174,6 +174,15 @@ test('Stage 4 PostgreSQL: extracted query ledger deduplicates and serves accepte
       [candidate.candidateKey],
     )).rows[0].duplicate_count;
     assert.equal(Number(duplicateCount), 1);
+    for (let index = 0; index < 25; index += 1) {
+      await persistExtractedQueryCandidates([{ ...candidate, sourceChannelId: `channel-${index}` }]);
+    }
+    const capped = (await db.query(
+      'SELECT duplicate_count, jsonb_array_length(duplicate_sources) AS sample_size FROM extracted_query_candidates WHERE candidate_key=$1',
+      [candidate.candidateKey],
+    )).rows[0];
+    assert.equal(Number(capped.duplicate_count), 19);
+    assert.equal(Number(capped.sample_size), 20);
     const standalone = await getStandaloneExtractedQueryCandidates(testCountry, 50);
     assert.ok(standalone.some(row => row.candidateKey === candidate.candidateKey));
     const candidateId = standalone.find(row => row.candidateKey === candidate.candidateKey)!.id;

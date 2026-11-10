@@ -232,6 +232,15 @@ test('non-Latin native scripts pass intent and preserve their script', () => {
     country: 'Singapore', language: 'zh',
   });
   assert.deepEqual(offTopic, []);
+  for (const title of ['老板的日常', '株式会社の日常', '人生戦略', '注文の多い料理店']) {
+    assert.deepEqual(
+      deriveDeterministicQueryCandidates({
+        sources: video(title), country: 'Japan', language: 'ja',
+      }),
+      [],
+      title,
+    );
+  }
 });
 
 test('LLM candidates use the same deterministic gate and duplicates merge', () => {

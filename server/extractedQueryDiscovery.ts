@@ -111,20 +111,23 @@ const SCRIPT_INTENT_TOKENS: Array<{ script: RegExp; tokens: string[] }> = [
   {
     script: /[\p{Script=Han}]/u,
     tokens: [
-      '股票', '股市', '交易', '策略', '分析', '黄金', '外匯', '外汇', '期貨', '期货', '比特幣', '比特币',
-      '加密', '市場', '市场', '趨勢', '趋势', '支撐', '支撑', '阻力', '投資', '投资', '基金', '期權', '期权',
+      '股票', '股市', '交易', '黄金', '外匯', '外汇', '期貨', '期货', '比特幣', '比特币',
+      '加密', '趨勢', '趋势', '支撐', '支撑', '阻力', '投資', '投资', '基金', '期權', '期权',
       '港股', '美股', '行情', 'K線', 'K线', '技術分析', '技术分析', '短線', '短线', '波段',
       // Kanji-only Japanese surfaces share Han; include their finance terms so
       // titles such as 日経225先物 are not rejected before language detection.
-      '日経', '先物', '相場', '株', '投資', '戦略', '見方', '日足', '時間足', '板読み', '注文',
-      '証券', '為替', '金利', '指数', '銘柄', 'チャート',
+      // Prefer compounds over bare words (株, 注文, 指数, 見方, 戦略) that occur
+      // in ordinary Japanese and Chinese text.
+      '日経', '先物', '相場', '投資', '日足', '時間足', '板読み', '株式取引', '株価',
+      '株価指数', '日経平均', '証券', '為替', '金利', '銘柄', 'チャート',
     ],
   },
   {
     script: /[\p{Script=Hiragana}\p{Script=Katakana}]/u,
     tokens: [
-      'トレード', '相場', '分析', '株', '先物', 'チャート', 'テクニカル', '戦略', '投資', '見方',
-      '日足', '時間足', 'ローソク足', '注文', '板読み', 'デイトレード', 'スイング',
+      'トレード', '相場', '先物', 'チャート', 'テクニカル', '投資',
+      '日足', '時間足', 'ローソク足', '板読み', 'デイトレード', 'スイング',
+      '株式取引', '株価', '株価指数', '日経平均',
     ],
   },
   {
@@ -194,6 +197,11 @@ function hasTradingIntent(text: string): boolean {
     if (WEAK_INTENT_TOKENS.has(word)) weakMatches += 1;
   }
   if (weakMatches >= 2) return true;
+  // Mixed native titles often carry their instrument as an ASCII ticker
+  // (ETHの見方, DAX Analyse). Treat a known strong ticker as intent without
+  // widening the generic native token list.
+  const asciiTerms = (text.match(/[A-Za-z]{2,6}/gu) || []) as string[];
+  if (asciiTerms.some(term => STRONG_INTENT_TOKENS.has(term.toLocaleLowerCase('en')))) return true;
   for (const { script, tokens } of SCRIPT_INTENT_TOKENS) {
     if (script.test(text) && tokens.some(token => text.includes(token))) return true;
   }
