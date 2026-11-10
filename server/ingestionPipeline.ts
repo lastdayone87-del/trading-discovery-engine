@@ -275,7 +275,7 @@ async function processChannelThroughPipelineInContext(
     }
     // Preserve terminal rows for every ordinary discovery lane. Explicit
     // operator recheck is the only supported terminal override.
-    if (shouldPreserveExistingChannel(existing, source, isManualScan)) {
+    if (shouldPreserveExistingChannel(existing, source, isManualScan, Date.now(), { allowActiveEnrichmentClassification: isEnrichmentPass === true && existing.trading_status === 'UNCERTAIN' })) {
       const refreshedAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount);
       if (shouldReclassifyPreservedCompletedChannel(existing.scan_status, refreshedAudienceGate)) {
         console.log(`[Unified Ingestion Pipeline] Refreshing preserved completed channel '${candidate.channelName}' as low-audience after fresh official subscriber metadata.`);

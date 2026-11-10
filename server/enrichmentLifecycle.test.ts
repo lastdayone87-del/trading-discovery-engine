@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFileSync } from 'node:fs';
 import { isEnrichmentStageExhausted, resolveEnrichmentReopenBlockedLifecycle, resolveExistingEnrichmentAction, resolveTerminalEnrichmentFailure, resolveUncertainLifecycle } from './enrichmentLifecycle';
 import { evaluateReviewEligibilityV2 } from './reviewEligibility/policy';
 
@@ -122,4 +123,9 @@ test('an enrichment pass stops scheduling the stage it already ran', () => {
   assert.equal(isEnrichmentStageExhausted(true, 1, 2), false);
   assert.equal(isEnrichmentStageExhausted(true, 0, 1), false);
   assert.equal(isEnrichmentStageExhausted(false, 2, 2), false);
+});
+
+test('an active enrichment pass may classify a row a stale projection marked completed', () => {
+  const pipeline = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
+  assert.match(pipeline, /allowActiveEnrichmentClassification: isEnrichmentPass === true && existing\.trading_status === 'UNCERTAIN'/);
 });
