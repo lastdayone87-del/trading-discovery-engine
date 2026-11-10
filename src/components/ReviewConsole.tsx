@@ -80,6 +80,7 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
   const [notice, setNotice] = useState<string | null>(null);
   const queueRequest = useRef(0);
   const bundleRequest = useRef(0);
+  const selectedRef = useRef<string | null>(null);
 
   const loadQueue = useCallback(async () => {
     const requestId = ++queueRequest.current;
@@ -92,13 +93,15 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
       const response = await apiFetch(`/api/reviews?${params.toString()}`);
       if (!response.ok) throw new Error(await response.text() || 'Could not load the review queue.');
       const data = parseReviewQueuePage<ReviewQueueItem>(await response.json());
-      if (requestId !== queueRequest.current) return;
+      if (requestId !== queueRequest.current) return false;
       setQueue(data.items);
       setTotal(data.total);
       setSelected(previous => selectionAfterQueueLoad(previous, data.items));
+      return true;
     } catch (err) {
-      if (requestId !== queueRequest.current) return;
+      if (requestId !== queueRequest.current) return false;
       setError(err instanceof Error ? err.message : 'Could not load the review queue.');
+      return false;
     } finally {
       if (requestId === queueRequest.current) setLoading(false);
     }
@@ -138,10 +141,15 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
   }, []);
 
   const refreshConsole = useCallback(async () => {
-    await loadQueue();
-    if (selected) await loadBundle(selected);
-  }, [loadQueue, loadBundle, selected]);
+    const target = selectedRef.current;
+    const loaded = await loadQueue();
+    if (!loaded) return;
+    // If the operator selected another channel while the queue was loading,
+    // let the selection effect load it instead of overwriting it with A.
+    if (target && selectedRef.current === target) await loadBundle(target);
+  }, [loadQueue, loadBundle]);
 
+  useEffect(() => { selectedRef.current = selected; }, [selected]);
   useEffect(() => { void loadCatalog(); }, [loadCatalog]);
   useEffect(() => { void loadQueue(); }, [loadQueue]);
   useEffect(() => {

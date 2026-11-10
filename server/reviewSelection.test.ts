@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { canSubmitReviewForSelection, reviewEvidenceIsDecidable } from '../src/reviewSelection';
+import { canSubmitReviewForSelection, reviewEvidenceIsDecidable, reviewEvidenceWarningsBlockDecision } from '../src/reviewSelection';
 
 test('a review can only be submitted for the selected pending channel', () => {
   const bundle = { review: { channelId: 'chan-1', state: 'PENDING' } };
@@ -25,4 +25,15 @@ test('a missing pinned lineage blocks the decision',()=>{
   assert.equal(reviewEvidenceIsDecidable({ warnings: ['EVIDENCE_ASSERTION_SCOPE_MISSING'] }), false);
   assert.equal(reviewEvidenceIsDecidable({ warnings: ['EVIDENCE_DOCUMENT_SCOPE_EMPTY'] }), true);
   assert.equal(reviewEvidenceIsDecidable({ warnings: ['EVIDENCE_SCOPE_TEMPORAL_FALLBACK'] }), true);
+});
+
+test('only blocking evidence warnings are returned to the decision endpoint', () => {
+  assert.deepEqual(
+    reviewEvidenceWarningsBlockDecision([
+      'EVIDENCE_SCOPE_TEMPORAL_FALLBACK',
+      'EVIDENCE_DOCUMENT_SCOPE_INCOMPLETE',
+      'EVIDENCE_COVERAGE_NOT_FOUND',
+    ]),
+    ['EVIDENCE_DOCUMENT_SCOPE_INCOMPLETE'],
+  );
 });

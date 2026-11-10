@@ -3,6 +3,7 @@ import { listEvidenceAssertions } from './evidenceEngine/assertionStore';
 import { listEvidenceCoverage } from './evidenceEngine/coverageStore';
 import { listEvidenceDocuments } from './evidenceEngine/documentStore';
 import { getReviewDetails } from './reviewStore';
+import { reviewEvidenceWarningsBlockDecision } from '../src/reviewEvidencePolicy';
 
 export const REVIEW_EVIDENCE_VERSION = 'review-evidence-v1';
 
@@ -320,4 +321,14 @@ export async function getReviewEvidence(
   if (coverageUnavailable) bundle.warnings.push('EVIDENCE_COVERAGE_UNAVAILABLE');
   if (creatorFocusUnavailable) bundle.warnings.push('CREATOR_FOCUS_UNAVAILABLE');
   return bundle;
+}
+
+/** Server-authoritative guard used by the review decision endpoint. */
+export async function blockingReviewEvidenceWarnings(channelId: string): Promise<string[]> {
+  const bundle = await getReviewEvidence(channelId, {
+    documentLimit: 1,
+    assertionLimit: 1,
+    coverageLimit: 1,
+  });
+  return reviewEvidenceWarningsBlockDecision(bundle.warnings);
 }

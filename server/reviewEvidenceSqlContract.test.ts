@@ -33,6 +33,8 @@ test('review evidence is scoped to the exact Creator Focus document and assertio
   assert.match(source, /EVIDENCE_DOCUMENT_SCOPE_MISSING/);
   assert.match(source, /EVIDENCE_ASSERTION_SCOPE_MISSING/);
   assert.match(source, /documentScope\.present/);
+  assert.match(source, /assertionScope\.present/);
+  assert.match(source, /blockingReviewEvidenceWarnings/);
   assert.match(source, /EVIDENCE_ASSERTION_SCOPE_EMPTY/);
 });
 
@@ -59,4 +61,11 @@ test('evidence stores support exact-key and exact-diagnostic scoping', () => {
   assert.match(documents, /document_key=ANY\(\$4\)/);
   assert.match(assertions, /assertion_key=ANY\(\$4\)/);
   assert.match(coverage, /classification_diagnostic_id=\$3/);
+});
+
+test('the authoritative decision route revalidates blocking evidence scope', () => {
+  const server = readFileSync(new URL('../server.ts', import.meta.url), 'utf8');
+  assert.match(server, /blockingReviewEvidenceWarnings\(req\.params\.channelId\)/);
+  assert.match(server, /REVIEW_EVIDENCE_INCOMPLETE/);
+  assert.match(server, /action!=='FORCE_RESCAN'/);
 });
