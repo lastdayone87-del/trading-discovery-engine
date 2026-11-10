@@ -13,6 +13,7 @@ import {
   classificationDayBucket,
   classificationJobIdempotencyKey,
   classificationQueryScopeKey,
+  enrichmentJobIdempotencyKey,
   mapClassificationOutcomeToFunnelOutcome,
   resolveClassificationDecouplingConfig,
   resolveEnrichmentWorkerCount,
@@ -117,6 +118,22 @@ test('day-bucketed idempotency key is stable within a UTC day and changes next d
   assert.equal(classificationJobIdempotencyKey('chan-1', morning), 'classify:chan-1:2026-11-07');
   assert.equal(classificationJobIdempotencyKey('chan-1', evening), classificationJobIdempotencyKey('chan-1', morning));
   assert.notEqual(classificationJobIdempotencyKey('chan-1', Date.UTC(2026, 10, 8, 0, 0, 1)), classificationJobIdempotencyKey('chan-1', morning));
+});
+
+test('ordinary enrichment identity is stable per stage across days; explicit rechecks get fresh keys', () => {
+  const morning = Date.UTC(2026, 10, 7, 1, 0, 0);
+  const nextDay = Date.UTC(2026, 10, 8, 1, 0, 0);
+  assert.equal(enrichmentJobIdempotencyKey('chan-1', 1, morning), 'enrich:chan-1:stage:1');
+  assert.equal(enrichmentJobIdempotencyKey('chan-1', 1, nextDay), 'enrich:chan-1:stage:1');
+  assert.notEqual(enrichmentJobIdempotencyKey('chan-1', 2, morning), enrichmentJobIdempotencyKey('chan-1', 1, morning));
+  assert.equal(
+    enrichmentJobIdempotencyKey('chan-1', 1, morning, { explicitRecheck: true, recheckNonce: 42 }),
+    'enrich:chan-1:stage:1:recheck:42',
+  );
+  assert.notEqual(
+    enrichmentJobIdempotencyKey('chan-1', 1, morning, { explicitRecheck: true, recheckNonce: 42 }),
+    enrichmentJobIdempotencyKey('chan-1', 1, morning),
+  );
 });
 
 test('per-query scope prefers the run, then query+country, then normalized text', () => {

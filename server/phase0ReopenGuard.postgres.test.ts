@@ -196,6 +196,50 @@ maybe('a reopen records prior status and keeps generation-scoped attempt history
   await db.query(`UPDATE jobs SET status='COMPLETED',completed_at=now() WHERE id=$1`, [fixture.id]);
 });
 
+
+maybe('preventCompletedReopen keeps completed enrichment terminal while failed work still retries', async t => {
+  const db = await getDb();
+  await resetGuard(db);
+  const fixture = await insertTerminalJob(db, ENRICH_TYPE, 'COMPLETED');
+  t.after(async () => {
+    await cleanup(db, fixture);
+    await resetGuard(db);
+  });
+
+  const blocked = await enqueueJob(
+    ENRICH_TYPE,
+    { channelId: fixture.channelId },
+    { idempotencyKey: fixture.key, priority: 1_000_000_000, maxAttempts: 3, clientOverride: db, preventCompletedReopen: true },
+  );
+  assert.equal(blocked.status, 'COMPLETED');
+  assert.equal(blocked.reopen_blocked, true);
+  const completed = (await db.query(
+    `SELECT status,reopen_generation FROM jobs WHERE id=$1`,
+    [fixture.id],
+  )).rows[0];
+  assert.equal(completed.status, 'COMPLETED');
+  assert.equal(Number(completed.reopen_generation), 0);
+  assert.equal(
+    Number((await db.query(`SELECT count(*)::int AS n FROM job_reopen_events WHERE job_id=$1`, [fixture.id])).rows[0].n),
+    0,
+    'a blocked completion must not record a reopen event',
+  );
+
+  await db.query(`UPDATE jobs SET status='FAILED',completed_at=NULL WHERE id=$1`, [fixture.id]);
+  const retried = await enqueueJob(
+    ENRICH_TYPE,
+    { channelId: fixture.channelId },
+    { idempotencyKey: fixture.key, priority: 1_000_000_000, maxAttempts: 3, clientOverride: db, preventCompletedReopen: true },
+  );
+  assert.equal(retried.status, 'PENDING');
+  assert.equal(retried.reopen_blocked, undefined);
+  assert.equal(
+    Number((await db.query(`SELECT reopen_generation FROM jobs WHERE id=$1`, [fixture.id])).rows[0].reopen_generation),
+    1,
+    'failed work remains eligible for a normal retry',
+  );
+});
+
 maybe('the enabled guard blocks the reopen after the per-channel cap', async t => {
   process.env[ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV] = 'true';
   const db = await getDb();

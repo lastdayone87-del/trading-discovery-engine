@@ -24,16 +24,144 @@ export function reduceInvestigation(projection:InvestigationProjection,event:{ty
 export interface ScheduleInvestigationInput {investigationId?:string;channelId:string;diagnosticId?:string;actionType:string;jobType:string;jobPayload:Record<string,unknown>;priority:number;maxAttempts:number;idempotencyKey:string;policyVersion:string;utilityContractVersion:string;deadlineMinutes?:number}
 const rowToJob=(row:any):DurableJob=>({id:row.id,type:row.type,status:row.status,payload:typeof row.payload==='string'?JSON.parse(row.payload):row.payload,attempts:row.attempts,max_attempts:row.max_attempts,run_after:new Date(row.run_after).toISOString(),locked_by:row.locked_by,locked_at:row.locked_at,last_error:row.last_error,created_at:new Date(row.created_at).toISOString()});
 export async function scheduleInvestigationStep(input:ScheduleInvestigationInput):Promise<{investigationId:string;stepId:string;job:DurableJob;sequence:number}>{
-  const db=await getDb(),client=await db.connect(),context={channelId:input.channelId,diagnosticId:input.diagnosticId||null,purpose:'TRADING_RELEVANCE'},contextChecksum=investigationChecksum(context);try{await client.query('BEGIN');let investigation:any;if(input.investigationId){const found=await client.query(`SELECT * FROM investigations WHERE id=$1 FOR UPDATE`,[input.investigationId]);if(!found.rowCount)throw new Error('INVESTIGATION_NOT_FOUND');investigation=found.rows[0];if(investigation.subject_id!==input.channelId)throw new Error('INVESTIGATION_SUBJECT_MISMATCH');}else{const investigationKey=investigationChecksum({channelId:input.channelId,diagnosticId:input.diagnosticId||input.idempotencyKey,policyVersion:input.policyVersion}),inserted=await client.query(`INSERT INTO investigations(investigation_key,subject_type,subject_id,purpose,state,policy_version,utility_contract_version,initial_context,context_checksum,deadline_at) VALUES($1,'CHANNEL',$2,'TRADING_RELEVANCE','ACTIVE',$3,$4,$5,$6,now()+($7||' minutes')::interval) ON CONFLICT(investigation_key) DO NOTHING RETURNING *`,[investigationKey,input.channelId,input.policyVersion,input.utilityContractVersion,JSON.stringify(context),contextChecksum,String(input.deadlineMinutes||30)]);const selected=inserted.rowCount?inserted:await client.query(`SELECT * FROM investigations WHERE investigation_key=$1 FOR UPDATE`,[investigationKey]);investigation=selected.rows[0];if(inserted.rowCount)await client.query(`INSERT INTO investigation_events(event_key,investigation_id,event_type,payload,policy_version) VALUES($1,$2,'INVESTIGATION_STARTED',$3,$4) ON CONFLICT(event_key) DO NOTHING`,[`investigation:${investigation.id}:started`,investigation.id,JSON.stringify(context),input.policyVersion]);}
-    if(investigation.state!=='ACTIVE')throw new Error(`INVESTIGATION_NOT_ACTIVE:${investigation.state}`);if(new Date(investigation.deadline_at).getTime()<=Date.now())throw new InvestigationDeadlineExceededError();const existing=await client.query(`SELECT s.id step_id,s.sequence_number,j.* FROM investigation_steps s JOIN jobs j ON j.id=s.job_id WHERE s.investigation_id=$1 AND s.action_type=$2 AND s.state IN('PENDING','RUNNING','RETRYING') ORDER BY s.sequence_number DESC LIMIT 1`,[investigation.id,input.actionType]);if(existing.rowCount){await client.query('COMMIT');const row=existing.rows[0];return {investigationId:investigation.id,stepId:row.step_id,job:rowToJob(row),sequence:row.sequence_number};}
-    const next=await client.query(`SELECT COALESCE(MAX(sequence_number),0)+1 sequence FROM investigation_steps WHERE investigation_id=$1`,[investigation.id]),sequence=Number(next.rows[0].sequence),stepKey=investigationChecksum({investigationId:investigation.id,sequence,actionType:input.actionType,inputChecksum:investigationChecksum(input.jobPayload)}),payload={...input.jobPayload,investigationId:investigation.id,investigationStepId:null};const job=await client.query(`INSERT INTO jobs(type,payload,priority,max_attempts,run_after,idempotency_key) VALUES($1,$2,$3,$4,now(),$5) ON CONFLICT(idempotency_key) DO UPDATE SET idempotency_key=excluded.idempotency_key RETURNING *`,[input.jobType,JSON.stringify(payload),input.priority,input.maxAttempts,input.idempotencyKey]);const step=await client.query(`INSERT INTO investigation_steps(investigation_id,classification_diagnostic_id,step_key,sequence_number,action_type,state,job_id,input_snapshot,input_checksum,policy_version) VALUES($1,$2,$3,$4,$5,'PENDING',$6,$7,$8,$9) RETURNING *`,[investigation.id,input.diagnosticId||null,stepKey,sequence,input.actionType,job.rows[0].id,JSON.stringify(input.jobPayload),investigationChecksum(input.jobPayload),input.policyVersion]);payload.investigationStepId=step.rows[0].id;await client.query(`UPDATE jobs SET payload=$2 WHERE id=$1`,[job.rows[0].id,JSON.stringify(payload)]);await client.query(`UPDATE investigations SET current_step_id=$2,version=version+1,updated_at=now() WHERE id=$1`,[investigation.id,step.rows[0].id]);await client.query(`INSERT INTO investigation_events(event_key,investigation_id,step_id,event_type,payload,policy_version) VALUES($1,$2,$3,'STEP_SCHEDULED',$4,$5)`,[`investigation:${investigation.id}:step:${sequence}:scheduled`,investigation.id,step.rows[0].id,JSON.stringify({actionType:input.actionType,jobId:job.rows[0].id,inputChecksum:investigationChecksum(input.jobPayload)}),input.policyVersion]);await client.query('COMMIT');return {investigationId:investigation.id,stepId:step.rows[0].id,job:rowToJob({...job.rows[0],payload}),sequence};}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
+  const db=await getDb(),client=await db.connect(),context={channelId:input.channelId,diagnosticId:input.diagnosticId||null,purpose:'TRADING_RELEVANCE'},contextChecksum=investigationChecksum(context);
+  try{
+    await client.query('BEGIN');
+    // Serialize schedulers for one stable key. A fallback enqueue may have
+    // created and even claimed the job outside this transaction; that owner
+    // must be reused instead of attaching a step it will never run.
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`,[`investigation-schedule:${input.idempotencyKey}`]);
+    const owned=await client.query(`SELECT j.*,s.id step_id,s.sequence_number,s.investigation_id step_investigation_id FROM jobs j LEFT JOIN investigation_steps s ON s.job_id=j.id WHERE j.idempotency_key=$1 ORDER BY s.sequence_number DESC NULLS LAST LIMIT 1 FOR UPDATE OF j`,[input.idempotencyKey]);
+    let ownedJob:any=null;
+    if(owned.rowCount){
+      const row=owned.rows[0];
+      if(row.step_id||String(row.status)!=='PENDING'){
+        await client.query('COMMIT');
+        return {investigationId:row.step_investigation_id||input.investigationId||'',stepId:row.step_id||'',job:rowToJob(row),sequence:Number(row.sequence_number||0)};
+      }
+      // An unclaimed PENDING fallback owner is safe to attach: the FOR UPDATE
+      // row lock above prevents a worker from claiming it before this commit.
+      ownedJob=row;
+    }
+    let investigation:any;
+    if(input.investigationId){
+      const found=await client.query(`SELECT * FROM investigations WHERE id=$1 FOR UPDATE`,[input.investigationId]);
+      if(!found.rowCount)throw new Error('INVESTIGATION_NOT_FOUND');
+      investigation=found.rows[0];
+      if(investigation.subject_id!==input.channelId)throw new Error('INVESTIGATION_SUBJECT_MISMATCH');
+    }else{
+      const investigationKey=investigationChecksum({channelId:input.channelId,diagnosticId:input.diagnosticId||input.idempotencyKey,policyVersion:input.policyVersion}),inserted=await client.query(`INSERT INTO investigations(investigation_key,subject_type,subject_id,purpose,state,policy_version,utility_contract_version,initial_context,context_checksum,deadline_at) VALUES($1,'CHANNEL',$2,'TRADING_RELEVANCE','ACTIVE',$3,$4,$5,$6,now()+($7||' minutes')::interval) ON CONFLICT(investigation_key) DO NOTHING RETURNING *`,[investigationKey,input.channelId,input.policyVersion,input.utilityContractVersion,JSON.stringify(context),contextChecksum,String(input.deadlineMinutes||30)]);
+      const selected=inserted.rowCount?inserted:await client.query(`SELECT * FROM investigations WHERE investigation_key=$1 FOR UPDATE`,[investigationKey]);
+      investigation=selected.rows[0];
+      if(inserted.rowCount)await client.query(`INSERT INTO investigation_events(event_key,investigation_id,event_type,payload,policy_version) VALUES($1,$2,'INVESTIGATION_STARTED',$3,$4) ON CONFLICT(event_key) DO NOTHING`,[`investigation:${investigation.id}:started`,investigation.id,JSON.stringify(context),input.policyVersion]);
+    }
+    if(investigation.state!=='ACTIVE')throw new Error(`INVESTIGATION_NOT_ACTIVE:${investigation.state}`);
+    if(new Date(investigation.deadline_at).getTime()<=Date.now())throw new InvestigationDeadlineExceededError();
+    const existing=await client.query(`SELECT s.id step_id,s.sequence_number,j.* FROM investigation_steps s JOIN jobs j ON j.id=s.job_id WHERE s.investigation_id=$1 AND s.action_type=$2 AND s.state IN('PENDING','RUNNING','RETRYING') ORDER BY s.sequence_number DESC LIMIT 1`,[investigation.id,input.actionType]);
+    if(existing.rowCount){
+      await client.query('COMMIT');
+      const row=existing.rows[0];
+      return {investigationId:investigation.id,stepId:row.step_id,job:rowToJob(row),sequence:row.sequence_number};
+    }
+    const next=await client.query(`SELECT COALESCE(MAX(sequence_number),0)+1 sequence FROM investigation_steps WHERE investigation_id=$1`,[investigation.id]),sequence=Number(next.rows[0].sequence),stepKey=investigationChecksum({investigationId:investigation.id,sequence,actionType:input.actionType,inputChecksum:investigationChecksum(input.jobPayload)});
+    let jobRow:any;
+    if(ownedJob){
+      const priorPayload=typeof ownedJob.payload==='string'?JSON.parse(ownedJob.payload):(ownedJob.payload||{});
+      jobRow=ownedJob;
+      ownedJob.payload={...priorPayload,...input.jobPayload,investigationId:investigation.id,investigationStepId:null};
+    }else{
+      const payload={...input.jobPayload,investigationId:investigation.id,investigationStepId:null};
+      const job=await client.query(`INSERT INTO jobs(type,payload,priority,max_attempts,run_after,idempotency_key) VALUES($1,$2,$3,$4,now(),$5) ON CONFLICT(idempotency_key) DO UPDATE SET idempotency_key=excluded.idempotency_key RETURNING *`,[input.jobType,JSON.stringify(payload),input.priority,input.maxAttempts,input.idempotencyKey]);
+      jobRow=job.rows[0];
+      // The job insert holds the row lock until commit, so a worker cannot
+      // claim it while this transaction attaches the step. If another
+      // scheduler won the key race, reuse its step; if work already started or
+      // finished, do not attach a step that would never run.
+      const ownerStep=await client.query(`SELECT s.id step_id,s.sequence_number,s.investigation_id FROM investigation_steps s WHERE s.job_id=$1 ORDER BY s.sequence_number DESC LIMIT 1`,[jobRow.id]);
+      if(ownerStep.rowCount){
+        await client.query('ROLLBACK');
+        const row=ownerStep.rows[0];
+        return {investigationId:row.investigation_id,stepId:row.step_id,job:rowToJob(jobRow),sequence:Number(row.sequence_number||0)};
+      }
+      if(String(jobRow.status)!=='PENDING'){
+        await client.query('ROLLBACK');
+        return {investigationId:input.investigationId||'',stepId:'',job:rowToJob(jobRow),sequence:0};
+      }
+      jobRow.payload=payload;
+    }
+    const step=await client.query(`INSERT INTO investigation_steps(investigation_id,classification_diagnostic_id,step_key,sequence_number,action_type,state,job_id,input_snapshot,input_checksum,policy_version) VALUES($1,$2,$3,$4,$5,'PENDING',$6,$7,$8,$9) RETURNING *`,[investigation.id,input.diagnosticId||null,stepKey,sequence,input.actionType,jobRow.id,JSON.stringify(input.jobPayload),investigationChecksum(input.jobPayload),input.policyVersion]);
+    jobRow.payload={...(jobRow.payload||{}),investigationStepId:step.rows[0].id};
+    await client.query(`UPDATE jobs SET payload=$2 WHERE id=$1`,[jobRow.id,JSON.stringify(jobRow.payload)]);
+    await client.query(`UPDATE investigations SET current_step_id=$2,version=version+1,updated_at=now() WHERE id=$1`,[investigation.id,step.rows[0].id]);
+    await client.query(`INSERT INTO investigation_events(event_key,investigation_id,step_id,event_type,payload,policy_version) VALUES($1,$2,$3,'STEP_SCHEDULED',$4,$5)`,[`investigation:${investigation.id}:step:${sequence}:scheduled`,investigation.id,step.rows[0].id,JSON.stringify({actionType:input.actionType,jobId:jobRow.id,inputChecksum:investigationChecksum(input.jobPayload)}),input.policyVersion]);
+    await client.query('COMMIT');
+    return {investigationId:investigation.id,stepId:step.rows[0].id,job:rowToJob(jobRow),sequence};
+  }catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
 }
-
 export async function startInvestigationStep(input:{investigationId:string;stepId:string;jobId:string;attempt:number;workerId:string;leaseSeconds?:number}){const db=await getDb(),client=await db.connect();try{await client.query('BEGIN');const step=await client.query(`SELECT s.*,i.deadline_at FROM investigation_steps s JOIN investigations i ON i.id=s.investigation_id WHERE s.id=$1 AND s.investigation_id=$2 AND s.job_id=$3 FOR UPDATE OF s,i`,[input.stepId,input.investigationId,input.jobId]);if(!step.rowCount)throw new Error('INVESTIGATION_STEP_NOT_FOUND');if(['COMPLETED','FAILED','SKIPPED'].includes(step.rows[0].state)){await client.query('COMMIT');return false;}if(new Date(step.rows[0].deadline_at).getTime()<=Date.now()){if(shouldRefreshOperationalRetryDeadline(step.rows[0].state,step.rows[0].failure_class)){const setting=await client.query(`SELECT setting_value FROM app_settings WHERE setting_key='investigation_deadline_minutes' LIMIT 1`),minutes=parseInvestigationDeadlineMinutes(setting.rows[0]?.setting_value,30);await client.query(`UPDATE investigations SET deadline_at=now()+($2||' minutes')::interval,updated_at=now() WHERE id=$1 AND state='ACTIVE'`,[input.investigationId,String(minutes)]);await client.query(`INSERT INTO investigation_events(event_key,investigation_id,step_id,event_type,payload,policy_version) SELECT $1,$2,$3,'INVESTIGATION_DEADLINE_REFRESHED',$4,policy_version FROM investigation_steps WHERE id=$3 ON CONFLICT(event_key) DO NOTHING`,[`investigation:${input.investigationId}:step:${input.stepId}:attempt:${input.attempt}:operational-deadline-refresh`,input.investigationId,input.stepId,JSON.stringify({jobId:input.jobId,attempt:input.attempt,deadlineMinutes:minutes,failureClass:step.rows[0].failure_class})]);}else throw new InvestigationDeadlineExceededError();}await client.query(`UPDATE investigation_steps SET state='RUNNING',attempt_count=GREATEST(attempt_count,$4),worker_id=$5,started_at=COALESCE(started_at,now()),lease_expires_at=now()+($6||' seconds')::interval,updated_at=now() WHERE id=$1 AND investigation_id=$2 AND job_id=$3`,[input.stepId,input.investigationId,input.jobId,input.attempt,input.workerId,String(input.leaseSeconds||120)]);await client.query(`INSERT INTO investigation_events(event_key,investigation_id,step_id,event_type,payload,policy_version) SELECT $1,$2,$3,'STEP_STARTED',$4,policy_version FROM investigation_steps WHERE id=$3 ON CONFLICT(event_key) DO NOTHING`,[`investigation:${input.investigationId}:step:${input.stepId}:attempt:${input.attempt}:started`,input.investigationId,input.stepId,JSON.stringify({jobId:input.jobId,attempt:input.attempt,workerId:input.workerId})]);await client.query('COMMIT');return true;}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}}
 export async function heartbeatInvestigationStep(input:{investigationId:string;stepId:string;jobId:string;workerId:string;leaseSeconds?:number}){const db=await getDb();await db.query(`UPDATE investigation_steps SET lease_expires_at=now()+($5||' seconds')::interval,updated_at=now() WHERE id=$1 AND investigation_id=$2 AND job_id=$3 AND worker_id=$4 AND state='RUNNING'`,[input.stepId,input.investigationId,input.jobId,input.workerId,String(input.leaseSeconds||120)]);}
 
 export async function completeInvestigationStep(input:{investigationId:string;stepId:string;jobId:string;resultingStatus:string;output:unknown}){const db=await getDb(),client=await db.connect(),outputChecksum=investigationChecksum(input.output);try{await client.query('BEGIN');const step=await client.query(`SELECT s.*,i.current_step_id FROM investigation_steps s JOIN investigations i ON i.id=s.investigation_id WHERE s.id=$1 AND s.investigation_id=$2 AND s.job_id=$3 FOR UPDATE OF s,i`,[input.stepId,input.investigationId,input.jobId]);if(!step.rowCount)throw new Error('INVESTIGATION_STEP_NOT_FOUND');if(step.rows[0].state==='COMPLETED'){await client.query('COMMIT');return;}const successor=await client.query(`SELECT 1 FROM investigation_steps WHERE investigation_id=$1 AND sequence_number>$2 AND state IN('PENDING','RUNNING','RETRYING') LIMIT 1`,[input.investigationId,step.rows[0].sequence_number]),state:InvestigationState=input.resultingStatus==='POLICY_REJECTED'?'SUPERSEDED':input.resultingStatus==='TRADING_CONFIRMED'||input.resultingStatus==='NON_TRADING'?'COMPLETED':input.resultingStatus==='NEEDS_REVIEW'?'NEEDS_REVIEW':successor.rowCount?'ACTIVE':'UNRESOLVED';await client.query(`UPDATE investigation_steps SET state='COMPLETED',resulting_status=$2,output_checksum=$3,completed_at=now(),lease_expires_at=NULL,updated_at=now() WHERE id=$1`,[input.stepId,input.resultingStatus,outputChecksum]);await client.query(`UPDATE jobs SET status='COMPLETED',completed_at=now(),locked_by=NULL,locked_at=NULL,updated_at=now() WHERE id=$1`,[input.jobId]);await client.query(`UPDATE job_attempts SET status='COMPLETED',finished_at=now() WHERE job_id=$1 AND finished_at IS NULL`,[input.jobId]);await client.query(`UPDATE investigations SET state=$2,version=version+1,completed_at=CASE WHEN $2='ACTIVE' THEN NULL ELSE now() END,updated_at=now() WHERE id=$1`,[input.investigationId,state]);await client.query(`INSERT INTO investigation_events(event_key,investigation_id,step_id,event_type,payload,policy_version) SELECT $1,$2,$3,'STEP_COMPLETED',$4,policy_version FROM investigation_steps WHERE id=$3 ON CONFLICT(event_key) DO NOTHING`,[`investigation:${input.investigationId}:step:${input.stepId}:completed`,input.investigationId,input.stepId,JSON.stringify({resultingStatus:input.resultingStatus,outputChecksum})]);if(state!=='ACTIVE'){const terminalEvent=state==='NEEDS_REVIEW'?'INVESTIGATION_REVIEW':state==='SUPERSEDED'?'INVESTIGATION_SUPERSEDED':'INVESTIGATION_COMPLETED';await client.query(`INSERT INTO investigation_events(event_key,investigation_id,event_type,payload,policy_version) SELECT $1,id,$2,$3,policy_version FROM investigations WHERE id=$4 ON CONFLICT(event_key) DO NOTHING`,[`investigation:${input.investigationId}:terminal`,terminalEvent,JSON.stringify({resultingStatus:input.resultingStatus}),input.investigationId]);}await client.query('COMMIT');}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}}
 export async function failInvestigationStep(input:{investigationId:string;stepId:string;jobId:string;attempt:number;terminal:boolean;failureClass:string}){const db=await getDb(),client=await db.connect();try{await client.query('BEGIN');const target=input.terminal?'FAILED':'RETRYING';await client.query(`UPDATE investigation_steps SET state=$4,failure_class=$5,lease_expires_at=NULL,completed_at=CASE WHEN $4='FAILED' THEN now() ELSE completed_at END,updated_at=now() WHERE id=$1 AND investigation_id=$2 AND job_id=$3 AND state NOT IN('COMPLETED','SKIPPED')`,[input.stepId,input.investigationId,input.jobId,target,input.failureClass.slice(0,100)]);if(input.terminal)await client.query(`UPDATE investigations SET state='OPERATIONALLY_BLOCKED',version=version+1,completed_at=now(),updated_at=now() WHERE id=$1 AND state='ACTIVE'`,[input.investigationId]);await client.query(`INSERT INTO investigation_events(event_key,investigation_id,step_id,event_type,payload,policy_version) SELECT $1,$2,$3,$4,$5,policy_version FROM investigation_steps WHERE id=$3 ON CONFLICT(event_key) DO NOTHING`,[`investigation:${input.investigationId}:step:${input.stepId}:attempt:${input.attempt}:${target.toLowerCase()}`,input.investigationId,input.stepId,input.terminal?'STEP_FAILED':'STEP_RETRYING',JSON.stringify({jobId:input.jobId,attempt:input.attempt,failureClass:input.failureClass})]);await client.query('COMMIT');}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}}
+
+/**
+ * Reopen a terminal workflow step for one ordinary retry of its stable
+ * enrichment job. The job itself is reopened by enqueueJob under the same
+ * key; restoring the step and investigation keeps deadline checks and
+ * outcome history attached to that retry.
+ */
+export async function retryInvestigationStep(input:{investigationId:string;stepId:string}):Promise<boolean>{
+  const db=await getDb(),client=await db.connect();
+  try{
+    await client.query('BEGIN');
+    const step=await client.query(`SELECT s.id,s.investigation_id,s.state,s.attempt_count,i.state investigation_state,i.policy_version FROM investigation_steps s JOIN investigations i ON i.id=s.investigation_id WHERE s.id=$1 AND s.investigation_id=$2 FOR UPDATE OF s,i`,[input.stepId,input.investigationId]);
+    if(!step.rowCount)throw new Error('INVESTIGATION_STEP_NOT_FOUND');
+    const row=step.rows[0];
+    // An in-flight RUNNING step is owned by a worker; never downgrade it.
+    if(!['FAILED','RETRYING','PENDING'].includes(row.state)){await client.query('COMMIT');return false;}
+    if(row.investigation_state!=='ACTIVE'&&row.investigation_state!=='OPERATIONALLY_BLOCKED'){await client.query('COMMIT');return false;}
+    const attempt=Number(row.attempt_count||0)+1;
+    // Preserve failure_class: an operational retry needs it to refresh an
+    // expired investigation deadline instead of failing the retry.
+    await client.query(`UPDATE investigation_steps SET state='RETRYING',attempt_count=$3,completed_at=NULL,lease_expires_at=NULL,updated_at=now() WHERE id=$1 AND investigation_id=$2 AND state IN ('FAILED','RETRYING','PENDING')`,[input.stepId,input.investigationId,attempt]);
+    await client.query(`UPDATE investigations SET state='ACTIVE',completed_at=NULL,version=version+1,updated_at=now() WHERE id=$1 AND state IN ('ACTIVE','OPERATIONALLY_BLOCKED')`,[input.investigationId]);
+    await client.query(`INSERT INTO investigation_events(event_key,investigation_id,step_id,event_type,payload,policy_version) VALUES($1,$2,$3,'STEP_RETRY_REQUESTED',$4,$5) ON CONFLICT(event_key) DO NOTHING`,[`investigation:${input.investigationId}:step:${input.stepId}:attempt:${attempt}:retry-requested`,input.investigationId,input.stepId,JSON.stringify({reason:'ORDINARY_REDISCOVERY_RETRY'}),row.policy_version]);
+    await client.query('COMMIT');return true;
+  }catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
+}
+
+/**
+ * Put a step back into the blocked projection after a retry could not be
+ * admitted. Unlike failInvestigationStep, this preserves the operational
+ * failure_class so a later retry can still refresh an expired deadline.
+ */
+export async function restoreBlockedInvestigationStep(input:{investigationId:string;stepId:string;jobId:string;reason:string}):Promise<void>{
+  const db=await getDb(),client=await db.connect();
+  try{
+    await client.query('BEGIN');
+    const step=await client.query(`SELECT s.id,s.investigation_id,s.state,s.attempt_count,s.policy_version,i.state investigation_state,j.status job_status FROM investigation_steps s JOIN investigations i ON i.id=s.investigation_id JOIN jobs j ON j.id=s.job_id WHERE s.id=$1 AND s.investigation_id=$2 AND s.job_id=$3 FOR UPDATE OF s,i,j`,[input.stepId,input.investigationId,input.jobId]);
+    if(!step.rowCount){await client.query('COMMIT');return;}
+    const row=step.rows[0];
+    // Only the retry this call just restored may be rolled back. A worker that
+    // has started it (RUNNING), another retry that completed it, or another
+    // caller that already reopened the job owns the work now.
+    if(row.state!=='RETRYING'||row.job_status!=='FAILED'){await client.query('COMMIT');return;}
+    const attempt=Number(row.attempt_count||0)+1;
+    if(['COMPLETED','NEEDS_REVIEW','POLICY_REJECTED','SUPERSEDED'].includes(row.investigation_state)){
+      // The investigation became terminal while this retry was being admitted.
+      // Retire the unadmitted step as SKIPPED so a later projection repair
+      // cannot reactivate it, without changing the terminal investigation.
+      const skipped=await client.query(`UPDATE investigation_steps SET state='SKIPPED',lease_expires_at=NULL,completed_at=COALESCE(completed_at,now()),updated_at=now() WHERE id=$1 AND investigation_id=$2 AND job_id=$3 AND state='RETRYING'`,[input.stepId,input.investigationId,input.jobId]);
+      if(skipped.rowCount)await client.query(`INSERT INTO investigation_events(event_key,investigation_id,step_id,event_type,payload,policy_version) VALUES($1,$2,$3,'STEP_SKIPPED',$4,$5) ON CONFLICT(event_key) DO NOTHING`,[`investigation:${input.investigationId}:step:${input.stepId}:attempt:${attempt}:blocked:${input.reason}:skipped`,input.investigationId,input.stepId,JSON.stringify({jobId:input.jobId,reason:input.reason}),row.policy_version]);
+      await client.query('COMMIT');return;
+    }
+    const restored=await client.query(`UPDATE investigation_steps SET state='FAILED',lease_expires_at=NULL,completed_at=COALESCE(completed_at,now()),updated_at=now() WHERE id=$1 AND investigation_id=$2 AND job_id=$3 AND state='RETRYING'`,[input.stepId,input.investigationId,input.jobId]);
+    if(!restored.rowCount){await client.query('COMMIT');return;}
+    await client.query(`UPDATE investigations SET state='OPERATIONALLY_BLOCKED',version=version+1,completed_at=COALESCE(completed_at,now()),updated_at=now() WHERE id=$1 AND state='ACTIVE'`,[input.investigationId]);
+    await client.query(`INSERT INTO investigation_events(event_key,investigation_id,step_id,event_type,payload,policy_version) VALUES($1,$2,$3,'STEP_FAILED',$4,$5) ON CONFLICT(event_key) DO NOTHING`,[`investigation:${input.investigationId}:step:${input.stepId}:attempt:${attempt}:blocked:${input.reason}`,input.investigationId,input.stepId,JSON.stringify({jobId:input.jobId,reason:input.reason}),row.policy_version]);
+    await client.query('COMMIT');
+  }catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
+}
 
 export async function recoverStaleInvestigationSteps(limit=100){const db=await getDb(),rows=await db.query(`SELECT s.id step_id,s.investigation_id,s.job_id,s.attempt_count,s.policy_version FROM investigation_steps s JOIN jobs j ON j.id=s.job_id WHERE s.state='RUNNING' AND (s.lease_expires_at<now() OR j.status='PENDING') ORDER BY s.updated_at FOR UPDATE SKIP LOCKED LIMIT $1`,[Math.min(500,Math.max(1,limit))]);for(const row of rows.rows)await failInvestigationStep({investigationId:row.investigation_id,stepId:row.step_id,jobId:row.job_id,attempt:row.attempt_count,terminal:false,failureClass:'STALE_LEASE_RECOVERED'});return rows.rowCount||0;}
 let lastOrphanReconciliationAt=0;

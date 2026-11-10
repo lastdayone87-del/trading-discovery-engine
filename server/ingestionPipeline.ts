@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { ChannelRecord, DiscoverySource, DiscordStatus } from '../src/types';
 import { DiscoveredChannelRaw, classifierLanguageInputs, fetchYouTubeChannelCountryMetadata } from './youtube';
 import { aggregatedLanguageCandidateSet, validateChannelCountry } from './countryValidator';
@@ -13,6 +14,7 @@ import {
   getChannelById,
   upsertChannel,
   enqueueJob,
+  getJobByIdempotencyKey,
   getQuota,
   getAppSetting,
   getDb
@@ -20,7 +22,8 @@ import {
 import { calculateCreatorQualityScore, extractVocabularyFromCreator, invokeChannelVocabularyExtraction, replayVocabularyForRetry, resolveExtractionVideoIds } from './queryIntelligence';
 import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { enqueueTermHarvest } from './candidateCorpus';
-import { resolveUncertainLifecycle } from './enrichmentLifecycle';
+import { isEnrichmentStageExhausted, resolveEnrichmentReopenBlockedLifecycle, resolveExistingEnrichmentAction, resolveUncertainLifecycle } from './enrichmentLifecycle';
+import { enrichmentJobIdempotencyKey } from './classificationDecoupling';
 import {ConfigurableWeightedStrategy,evaluateClassificationStages,buildCanonicalEvidenceCorpus,getLayeredKnowledgeContext,type EvidenceCollectionReport,type RawChannelInput} from './evidenceEngine';
 import { buildContextualComposition } from './evidenceEngine/contextualComposition';
 import { contentLanguagePacks } from './evidenceEngine/multilingualTerminology';
@@ -28,7 +31,7 @@ import { LANGUAGE_KNOWLEDGE_PACKS } from './evidenceEngine/knowledgePacks';
 import { observeProductionDiagnosticReliably, observeRetrievalAssignmentReliably } from './phaseBObservationOutbox';
 import { buildDecisionEvaluationSamplingPolicy } from './decisionEvaluationSamplingPolicy';
 import { ACTIONS, deriveVitalityScheduling, planAndRecordEvidenceAction, type EvidenceActionType, type EvidenceActionPlan } from './voiEvidenceController';
-import { INVESTIGATION_POLICY_VERSION, scheduleInvestigationStep } from './investigationWorkflow';
+import { INVESTIGATION_POLICY_VERSION, restoreBlockedInvestigationStep, retryInvestigationStep, scheduleInvestigationStep } from './investigationWorkflow';
 import {assignRelease5Serving} from './release5/rollout';
 import { deterministicUuid, entityChecksum, observeYouTubeChannelEntity, sourceFamilyIdentity } from './entityResolution';
 import { enrichmentOperationalFailure, hasDecisionGradeEvidenceWithoutFailedProviders, manualRecheckDegradedError } from './enrichmentOperationalFailure';
@@ -272,7 +275,7 @@ async function processChannelThroughPipelineInContext(
     }
     // Preserve terminal rows for every ordinary discovery lane. Explicit
     // operator recheck is the only supported terminal override.
-    if (shouldPreserveExistingChannel(existing, source, isManualScan)) {
+    if (shouldPreserveExistingChannel(existing, source, isManualScan, Date.now(), { allowActiveEnrichmentClassification: isEnrichmentPass === true && existing.trading_status === 'UNCERTAIN' })) {
       const refreshedAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount);
       if (shouldReclassifyPreservedCompletedChannel(existing.scan_status, refreshedAudienceGate)) {
         console.log(`[Unified Ingestion Pipeline] Refreshing preserved completed channel '${candidate.channelName}' as low-audience after fresh official subscriber metadata.`);
@@ -974,12 +977,105 @@ async function processChannelThroughPipelineInContext(
 
     if (lifecycle.shouldEnqueue) {
       const action=ACTIONS.find(item=>item.action===appliedAction),nextStage=action?.enrichmentStage||Math.min(2,currentStage+1);
-      const vitality=deriveVitalityScheduling(productionClassification.input.activity_metadata,productionClassification.decision.timestamp),priority=10+vitality.jobPriorityDelta,payload={ channelId: candidate.channelId, targetCountry, source, candidate, enrichmentStage:nextStage, quotaOrigin: currentOfficialYouTubeQuotaOrigin() === 'PROBE' ? 'PROBE' : 'NORMAL', evidenceAcquisitionDecisionId:evidencePlan?.decisionId, evidenceAction:appliedAction, vitalityScheduling:vitality };
-      const workflowAssignment=await assignRelease5Serving('INVESTIGATION_WORKFLOW',candidate.channelId).catch(()=>({assigned:false,mode:'OFF'})),legacyWorkflowEnabled=await getAppSetting('investigation_workflow_enabled','false')==='true';
-      if(workflowAssignment.assigned||legacyWorkflowEnabled){
-        try{await scheduleInvestigationStep({investigationId:candidate.investigationId,channelId:candidate.channelId,diagnosticId:classificationDiagnosticId,actionType:appliedAction,jobType:'ENRICH_CHANNEL',jobPayload:payload,priority,maxAttempts:4,idempotencyKey:`investigation-step:${candidate.channelId}:${classificationDiagnosticId||now}:${appliedAction}`,policyVersion:INVESTIGATION_POLICY_VERSION,utilityContractVersion:'utility-constraints-v1',deadlineMinutes:Number(await getAppSetting('investigation_deadline_minutes','30'))||30});}
-        catch(error){if(candidate.investigationId)throw error;console.error(`[Investigation] Initial transactional scheduling failed for ${candidate.channelId}; using compatible queue fallback.`,error);await enqueueJob('ENRICH_CHANNEL',payload,{priority,maxAttempts:4,idempotencyKey:`enrich:${candidate.channelId}:stage:${nextStage}`});}
-      }else await enqueueJob('ENRICH_CHANNEL',payload,{priority,maxAttempts:4,idempotencyKey:`enrich:${candidate.channelId}:stage:${nextStage}`});
+      if(isEnrichmentStageExhausted(isEnrichmentPass,currentStage,nextStage)){
+        // The pass already executed this stage. Close the machine-owned
+        // marker instead of enqueueing the same stage forever.
+        const terminal=resolveEnrichmentReopenBlockedLifecycle(authoritativeChannel,{blockedJobStatus:'COMPLETED',hasOtherActiveEnrichmentJob:false});
+        if(terminal.scanStatus!==authoritativeChannel.scan_status){
+          const refreshed=await projectBlockedEnrichmentScanStatus(candidate.channelId,terminal.scanStatus,now,options?.jobId);
+          if(refreshed)Object.assign(authoritativeChannel,refreshed);
+        }
+      }else{
+        const vitality=deriveVitalityScheduling(productionClassification.input.activity_metadata,productionClassification.decision.timestamp),priority=10+vitality.jobPriorityDelta,payload={ channelId: candidate.channelId, targetCountry, source, candidate, enrichmentStage:nextStage, quotaOrigin: currentOfficialYouTubeQuotaOrigin() === 'PROBE' ? 'PROBE' : 'NORMAL', evidenceAcquisitionDecisionId:evidencePlan?.decisionId, evidenceAction:appliedAction, vitalityScheduling:vitality };
+        // Ordinary rediscovery must not turn completed enrichment back into
+        // PENDING or create a second job beside active work. The stable
+        // channel/stage identity makes enqueue naturally idempotent across day
+        // boundaries; preventCompletedReopen keeps completed work terminal while
+        // still allowing a FAILED job to retry. Explicit rechecks use a fresh
+        // recheck key and are never blocked by an earlier completed pass.
+        const explicitRecheck=isManualScan||source==='recheck';
+        const enrichmentKey=enrichmentJobIdempotencyKey(candidate.channelId,nextStage,Date.now(),{explicitRecheck,recheckNonce:explicitRecheck?randomUUID():undefined});
+        const enqueueEnrichment=(extra?:Record<string,unknown>)=>enqueueJob('ENRICH_CHANNEL',extra?{...payload,...extra}:payload,{priority,maxAttempts:4,idempotencyKey:enrichmentKey,...(explicitRecheck?{}:{preventCompletedReopen:true})});
+        // Recover a failed workflow owner: restore its step before reopening the
+        // stable job so the worker keeps investigation tracking. If admission is
+        // refused or the enqueue fails, put the blocked projection back.
+        const enqueueWorkflowRetry=async(failed:{id:string},investigationId:string,stepId:string)=>{
+          let retryLinkage:Record<string,unknown>|undefined;
+          if(investigationId&&stepId){
+            try{if(await retryInvestigationStep({investigationId,stepId}))retryLinkage={investigationId,investigationStepId:stepId};}
+            catch(error){console.warn(`[Investigation] Failed to reopen step for ${candidate.channelId}; retrying without workflow linkage:`,error instanceof Error?error.message:error);}
+          }
+          try{
+            const job=await enqueueEnrichment(retryLinkage);
+            if(retryLinkage&&job?.reopen_blocked===true){
+              await restoreBlockedInvestigationStep({investigationId,stepId,jobId:failed.id,reason:'RETRY_NOT_ADMITTED'})
+                .catch(error=>console.warn(`[Investigation] Failed to restore blocked step for ${candidate.channelId}:`,error instanceof Error?error.message:error));
+            }
+            return job;
+          }catch(error){
+            if(retryLinkage){
+              await restoreBlockedInvestigationStep({investigationId,stepId,jobId:failed.id,reason:'RETRY_ENQUEUE_FAILED'})
+                .catch(restoreError=>console.warn(`[Investigation] Failed to restore blocked step for ${candidate.channelId}:`,restoreError instanceof Error?restoreError.message:restoreError));
+            }
+            throw error;
+          }
+        };
+        const scheduleWorkflowOwner=async()=>{
+          const scheduled=await scheduleInvestigationStep({investigationId:candidate.investigationId,channelId:candidate.channelId,diagnosticId:classificationDiagnosticId,actionType:appliedAction,jobType:'ENRICH_CHANNEL',jobPayload:payload,priority,maxAttempts:4,idempotencyKey:enrichmentKey,policyVersion:INVESTIGATION_POLICY_VERSION,utilityContractVersion:'utility-constraints-v1',deadlineMinutes:Number(await getAppSetting('investigation_deadline_minutes','30'))||30});
+          // A failed owner needs its step restored before the job reopen. An
+          // already-claimed owner cannot accept a step and is reused through the
+          // idempotent queue path; a completed owner drives the blocked lifecycle
+          // projection.
+          if(scheduled.job.status==='FAILED')return enqueueWorkflowRetry(scheduled.job,scheduled.investigationId,scheduled.stepId);
+          if(!scheduled.stepId||scheduled.job.status!=='PENDING')return enqueueEnrichment();
+          return undefined;
+        };
+        const workflowAssignment=await assignRelease5Serving('INVESTIGATION_WORKFLOW',candidate.channelId).catch(()=>({assigned:false,mode:'OFF'})),legacyWorkflowEnabled=await getAppSetting('investigation_workflow_enabled','false')==='true';
+        let enqueued: Awaited<ReturnType<typeof enqueueJob>> | undefined;
+        if(workflowAssignment.assigned||legacyWorkflowEnabled){
+          // The workflow lane must reuse the stable channel/stage owner instead
+          // of scheduling a second job under a per-classification key. An
+          // existing active job already owns the work, a completed one is
+          // terminal, and failed work retries through the ordinary reopen path.
+          let existing: Awaited<ReturnType<typeof getJobByIdempotencyKey>> = null,lookupFailed=false;
+          if(!explicitRecheck){
+            try{existing=await getJobByIdempotencyKey(enrichmentKey);}
+            catch(error){lookupFailed=true;console.warn(`[Investigation] Stable enrichment lookup failed for ${candidate.channelId}; using the idempotent queue path:`,error instanceof Error?error.message:error);}
+          }
+          const admission=resolveExistingEnrichmentAction(explicitRecheck?null:existing?.status,lookupFailed);
+          if(admission==='REUSE_ACTIVE'&&existing)enqueued=existing;
+          else if(admission==='PROJECT_TERMINAL'&&existing)enqueued={...existing,reopen_blocked:true};
+          else if(admission==='RETRY_FAILED'&&existing){
+            enqueued=await enqueueWorkflowRetry(existing,String(existing.payload?.investigationId||''),String(existing.payload?.investigationStepId||''));
+          }
+          else if(admission==='ENQUEUE_IDEMPOTENT'){
+            // The stable-key read failed, but the scheduler can still find and
+            // restore a failed workflow owner. Fall back to the idempotent queue
+            // only when scheduling itself fails.
+            try{enqueued=await scheduleWorkflowOwner();}
+            catch(error){if(candidate.investigationId)throw error;console.error(`[Investigation] Lookup-recovery scheduling failed for ${candidate.channelId}; using compatible queue fallback.`,error);enqueued=await enqueueEnrichment();}
+          }
+          else{
+            try{enqueued=await scheduleWorkflowOwner();}
+            catch(error){if(candidate.investigationId)throw error;console.error(`[Investigation] Initial transactional scheduling failed for ${candidate.channelId}; using compatible queue fallback.`,error);enqueued=await enqueueEnrichment();}
+          }
+        }else enqueued=await enqueueEnrichment();
+        if(enqueued?.reopen_blocked===true){
+          // The stable same-stage pass is already terminal. Project the honest
+          // terminal state, but update only the committed row's scan status so
+          // a concurrent recovery/recheck cannot be overwritten by this stale
+          // snapshot. The same UPDATE excludes a later-stage active job in one
+          // statement, which narrows the race to a job committed after that
+          // statement's snapshot. A worker that still owns the channel will
+          // reassert its marker; no separate read can orphan the pending row.
+          // A blocked FAILED job is FAILED, never COMPLETED.
+          const blocked=resolveEnrichmentReopenBlockedLifecycle(authoritativeChannel,{blockedJobStatus:enqueued.status,hasOtherActiveEnrichmentJob:false});
+          if(blocked.scanStatus!==authoritativeChannel.scan_status){
+            const refreshed=await projectBlockedEnrichmentScanStatus(candidate.channelId,blocked.scanStatus,now,options?.jobId);
+            if(refreshed)Object.assign(authoritativeChannel,refreshed);
+          }
+        }
+      }
     }
 
     return {
@@ -1122,6 +1218,33 @@ async function processChannelThroughPipelineInContext(
     discordInvite: finalChannel.discord_invite || null,
     channelRecord: finalChannel
   };
+}
+
+/**
+ * Project a blocked enrichment owner's terminal scan state without clobbering
+ * a later-stage active job. One statement keeps the ownership check and write
+ * in the same snapshot.
+ */
+async function projectBlockedEnrichmentScanStatus(
+  channelId: string,
+  targetScanStatus: ChannelRecord['scan_status'],
+  now: string,
+  excludeJobId?: string | null,
+): Promise<ChannelRecord | null> {
+  const db = await getDb();
+  await db.query(
+    `UPDATE channels c SET scan_status=$2,last_checked=$3,updated_at=now()
+      WHERE c.channel_id=$1 AND c.scan_status = ANY($4::text[])
+        AND NOT EXISTS (
+          SELECT 1 FROM jobs j
+           WHERE j.type='ENRICH_CHANNEL'
+             AND j.status IN ('PENDING','PROCESSING')
+             AND j.payload->>'channelId'=c.channel_id
+             AND ($5::uuid IS NULL OR j.id<>$5::uuid)
+        )`,
+    [channelId, targetScanStatus, now, ['ENRICHMENT_PENDING','ENRICHING','LOCKED'], excludeJobId || null],
+  );
+  return getChannelById(channelId);
 }
 
 function applyCandidateObservability(channel: ChannelRecord, candidate: IngestionCandidate): void {

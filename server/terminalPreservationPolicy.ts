@@ -24,6 +24,16 @@ export function machineNonTradingRediscoveryEligible(existing: ChannelRecord, no
   return now - checkedAt >= machineNonTradingReconsiderAfterMs();
 }
 
+export interface ChannelPreservationOptions {
+  /**
+   * A live enrichment job is authoritative for an UNCERTAIN row. A stale
+   * blocked-reopen projection may have marked the row COMPLETED just before
+   * that job was admitted; the job must still classify instead of being
+   * skipped by the completed-row preservation rule.
+   */
+  allowActiveEnrichmentClassification?: boolean;
+}
+
 /**
  * Decide whether discovery should preserve an existing row before any expensive
  * country/trading/community work begins.
@@ -42,11 +52,13 @@ export function machineNonTradingRediscoveryEligible(existing: ChannelRecord, no
  * the row is preserved. Otherwise a previously admitted excluded-country
  * creator can remain permanently hidden behind a stale UNCERTAIN country state.
  */
+
 export function shouldPreserveExistingChannel(
   existing: ChannelRecord,
   source: DiscoverySource,
   isManualScan: boolean,
-  now = Date.now()
+  now = Date.now(),
+  options: ChannelPreservationOptions = {},
 ): boolean {
   // Keep the explicit Stage-1 serving/evaluation separation visible: ordinary
   // discovery follows preservation policy; the recheck lane is the deliberate
@@ -76,7 +88,7 @@ export function shouldPreserveExistingChannel(
 
     return !isManualScan && (
       existing.trading_status === 'TRADING_CONFIRMED' ||
-      existing.scan_status === 'COMPLETED'
+      (existing.scan_status === 'COMPLETED' && options.allowActiveEnrichmentClassification !== true)
     );
   }
 
