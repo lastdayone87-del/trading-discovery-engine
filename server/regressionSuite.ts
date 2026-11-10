@@ -1298,7 +1298,7 @@ export async function runRegressionTestSuite(customRunLabel?: string): Promise<R
     );
 
     // Track API units (2 units for Stage A/B, +5 units if Stage C AI triggered)
-    totalApiUnitsConsumed += relevance.breakdown.ai_reviewed ? 7 : 2;
+    totalApiUnitsConsumed += (relevance.breakdown.semantic_attempted ?? relevance.breakdown.ai_reviewed) ? 7 : 2;
 
     const predictedTrading = relevance.status;
 
