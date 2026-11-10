@@ -1,7 +1,8 @@
 # Phase 2 Option C — crawl throughput telemetry
 
-**Status:** Unit 1 implemented (telemetry activation, rendered-crawl counting,
-read-only report, tests).
+**Status:** Units 1–2 implemented (telemetry activation, rendered-crawl
+counting, read-only report, and the admission governor documented in
+`docs/phase-2-admission-governor.md`).
 **Tracking:** #616.
 **Program constraints:** no new infrastructure, no server upgrade, exactly one
 browser slot, **40 browser crawls/hour nominal**, **48 browser crawls/hour
@@ -130,20 +131,20 @@ acquisition result path.
 5. After deploy, confirm the env flag on the app container and run the report
    against production read-only. Expect `no_browser_crawl_data` only until the
    first rendered inspections land, then non-zero per-lane counts.
-6. Unit 2 may not rely on the report until at least one full UTC hour of
-   rendered events is present.
+6. The admission governor's rolling-window decisions can be cross-checked
+   against the report once at least one full UTC hour of rendered events is
+   present; see `docs/phase-2-admission-governor.md`.
 
 ## Known boundary
 
 One lane event summarizes an inspection pass; `detail.renderedCrawls` records
 how many rendered seed crawls it contained. The report therefore measures
 **actual rendered seed crawls**, not static HTTP fetches or individual pages
-inside one browser run. Unit 2's admission governor will meter the gate
+inside one browser run. The Unit 2 admission governor meters the gate
 admission itself, so the two measurements can be cross-checked.
 
 ## Non-goals
 
-- No admission governor yet (Unit 2).
 - No crawl deadline/fairness change yet (Unit 3).
 - No retry-backlog mutation (Unit 4).
 - No new browser slot, worker pool, migration, or server upgrade.

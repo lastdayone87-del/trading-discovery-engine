@@ -238,6 +238,17 @@ export interface BrowserFallbackTelemetry {
   crawlFinishedAt?: string;
 }
 
+/** True when the rendered result proves at least one request actually ran. */
+function renderedCrawlStarted(result: BrowserFallbackResult): boolean {
+  const telemetry = result.telemetry;
+  return result.inspectedPages > 0
+    || (telemetry?.requestsStarted || 0) > 0
+    || (telemetry?.requestsFinished || 0) > 0
+    || (telemetry?.requestsFailed || 0) > 0
+    || (telemetry?.navigationTimeouts || 0) > 0
+    || (telemetry?.clicksSucceeded || 0) > 0;
+}
+
 export function browserFallbackTelemetrySummary(telemetry: BrowserFallbackTelemetry): string {
   const base = `telemetry{started:${telemetry.requestsStarted},finished:${telemetry.requestsFinished},failed:${telemetry.requestsFailed},navigationTimeouts:${telemetry.navigationTimeouts},blocked:${telemetry.blockedRequests},rateLimited:${telemetry.rateLimitedRequests},transient:${telemetry.transientRequests},hostBackoffs:${telemetry.hostBackoffsApplied},clicksStarted:${telemetry.clicksStarted},clicksSucceeded:${telemetry.clicksSucceeded},clicksFailed:${telemetry.clicksFailed},clickFailureClasses:${JSON.stringify(telemetry.clickFailureClasses)}}`;
   // Stage/reason suffixes are conditional: snapshots predating instrumentation
@@ -298,6 +309,8 @@ export interface BrowserFallbackResult {
   clicks: number;
   complete: boolean;
   retryable: boolean;
+  /** Earliest capacity retry hint when admission was rate-limited. */
+  retryAt?: number;
   /**
    * True when the per-seed time budget expired before coverage completed.
    * Threaded separately from failure classes so budget expiration stays
@@ -3778,8 +3791,19 @@ export class RenderedFallbackGate {
     return new Set(this.waiters.map(waiter => waiter.lane));
   }
 
+  private discoveryQueueReserve(): number {
+    return Math.max(1, Math.ceil(this.maxPending * 0.35));
+  }
+
   private acquire(lane: AcquisitionLane): Promise<() => void> {
-    if (this.active >= this.concurrency && this.waiters.length >= this.maxPending) return Promise.reject(new Error('RENDERED_FALLBACK_SATURATED'));
+    if (this.active >= this.concurrency) {
+      // Discovery may use a small extra queue reserve so a full non-discovery
+      // queue cannot hide discovery demand from the floor governor.
+      const pendingLimit = lane === 'DISCOVERY'
+        ? this.maxPending + this.discoveryQueueReserve()
+        : this.maxPending;
+      if (this.waiters.length >= pendingLimit) return Promise.reject(new Error('RENDERED_FALLBACK_SATURATED'));
+    }
     return new Promise(resolve => {
       const grant = () => {
         this.active++;
@@ -3827,20 +3851,36 @@ export class RenderedFallbackGate {
     }));
   }
 
-  async run<T>(operation: (admittedAtMs: number) => Promise<T>, lane: AcquisitionLane = 'UNKNOWN'): Promise<T> {
+  async run<T>(
+    operation: (admittedAtMs: number) => Promise<T>,
+    lane: AcquisitionLane = 'UNKNOWN',
+    options: { isWorkStarted?: (result: T) => boolean } = {},
+  ): Promise<T> {
+    const queuedDemand = this.active >= this.concurrency;
     const release = await this.acquire(lane);
-    const decision = this.admissionGovernor.admit(lane, this.pendingLanes());
+    const decision = this.admissionGovernor.admit(lane, this.pendingLanes(), queuedDemand);
     if (!decision.admitted) {
       this.logDenied(decision);
       release();
       // Existing capacity class: the retry policy treats this as attempt-free
       // and the inspector records CAPACITY_DEFERRED rather than a failure.
-      throw new Error('RENDERED_FALLBACK_SATURATED');
+      throw Object.assign(new Error('RENDERED_FALLBACK_SATURATED'), {
+        retryAt: decision.retryAtMs ?? undefined,
+        admissionReason: decision.reason ?? undefined,
+      });
     }
     // Admission is timestamped here so callers can start budget clocks at the
     // moment the gate slot was granted, even if they serialize internally
     // afterwards (see withRenderedQueueLifecycleLock).
-    try { return await operation(Date.now()); } finally { release(); }
+    try {
+      const result = await operation(Date.now());
+      // A proxy/browser startup failure can return a zero-work result. Refund
+      // that reservation so a failed start cannot consume an hour of capacity.
+      if (decision.admissionId !== null && options.isWorkStarted && !options.isWorkStarted(result)) {
+        this.admissionGovernor.refund(decision.admissionId);
+      }
+      return result;
+    } finally { release(); }
   }
 
   snapshot(): { active: number; pending: number; concurrency: number; maxPending: number } {
@@ -6277,11 +6317,13 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           await egressProxy?.close().catch(() => undefined);
         }
       }
-    }), limits.admissionLane || 'UNKNOWN');
+    }), limits.admissionLane || 'UNKNOWN', { isWorkStarted: renderedCrawlStarted });
   } catch (error:any) {
     if (!telemetry.crawlFinishedAt) telemetry.crawlFinishedAt = new Date().toISOString();
     const candidates=mergeDiscordCandidates(discovered);
     const saturated=error?.message==='RENDERED_FALLBACK_SATURATED';
+    const retryAtValue = Number(error?.retryAt);
+    const retryAt = Number.isFinite(retryAtValue) && retryAtValue > 0 ? retryAtValue : undefined;
     // Saturation is explicit browser-gate capacity, not a browser defect: keep
     // it classified as capacity (so retry accounting can defer attempt-free)
     // without marking the browser capability itself unavailable.
@@ -6296,7 +6338,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
     // P0.2 diagnostic: a gate/browser rejection processed no page, so coverage
     // is unknown rather than complete. P1.7 owns any outcome consequence.
     telemetry.coverageReason = resolveRenderedCoverageReason({ pagesInspected: 0 });
-    return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,detail:saturated?`Rendered acquisition deferred because the process-wide browser launch gate is saturated; ${browserFallbackTelemetrySummary(telemetry)}`:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
+    return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,retryAt,telemetry,detail:saturated?`Rendered acquisition deferred because the process-wide browser launch gate is saturated; ${browserFallbackTelemetrySummary(telemetry)}`:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
   }
 }
 

@@ -1608,7 +1608,10 @@ export async function processNextSearchJob(
           forceExtraction: job.payload.forceExtraction === true || isRepairEligibleRetry(job),
           jobId: job.id,
           runId: typeof job.payload.queryRunId === 'string' ? job.payload.queryRunId : undefined,
-          lane: 'ENRICHMENT',
+          // This branch replays the deferred discovery pipeline, not an
+          // enrichment-only retry: keep it in the DISCOVERY lane so the
+          // admission governor's floor sees the real demand.
+          lane: 'DISCOVERY',
           jobType: job.type,
         });
         await completeJob(job.id);

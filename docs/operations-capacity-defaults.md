@@ -28,5 +28,11 @@ database value (verified read-only).
   `SEARCH_WORKER_CONCURRENCY=4`, unless an explicit runtime override sets a
   different value — in that case `.Config.Env` shows the overridden value,
   which wins by design.
+- The same env output must show `ACQUISITION_LANE_TELEMETRY_ENABLED=true` and
+  the admission budget: `RENDERED_ADMISSION_GOVERNOR_ENABLED=true`,
+  `RENDERED_ADMISSION_NOMINAL_PER_HOUR=40`,
+  `RENDERED_ADMISSION_EMERGENCY_PER_HOUR=48`, and
+  `RENDERED_ADMISSION_DISCOVERY_FLOOR_PCT=35` (or an explicitly approved
+  override). If the governor is disabled, the 40/48/35 budget is not enforced.
 - Read-only database `SELECT setting_value FROM app_settings WHERE
   setting_key='discovery_target_queue_depth'` still returns `30`.

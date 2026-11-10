@@ -483,13 +483,64 @@ test('rendered admission governor denies over-budget crawls as capacity', async 
   assert.equal(await gate.run(async () => 'first', 'RETRY'), 'first');
   await assert.rejects(
     gate.run(async () => 'second', 'RETRY'),
-    /RENDERED_FALLBACK_SATURATED/,
+    (error: any) => error?.message === 'RENDERED_FALLBACK_SATURATED' && error.retryAt === 60_000,
+    'rate-limited work must carry the next window expiry',
   );
   assert.deepEqual(gate.snapshot(), { active: 0, pending: 0, concurrency: 1, maxPending: 4 });
 
   clock.now = 60_001;
   assert.equal(await gate.run(async () => 'third', 'RETRY'), 'third');
   assert.equal(gate.admissionSnapshot().admissionsInWindow, 1);
+});
+
+test('rendered gate refunds a zero-work startup failure', async () => {
+  const governor = new RenderedAdmissionGovernor({
+    enabled: true,
+    nominalPerHour: 1,
+    emergencyPerHour: 1,
+    discoveryFloorPct: 0,
+    windowMs: 60_000,
+  }, () => 0);
+  const gate = new RenderedFallbackGate(1, 4, governor);
+
+  const failedStart = await gate.run(
+    async () => ({ started: false }),
+    'RETRY',
+    { isWorkStarted: result => result.started },
+  );
+  assert.equal(failedStart.started, false);
+  assert.equal(gate.admissionSnapshot().admissionsInWindow, 0);
+
+  const started = await gate.run(
+    async () => ({ started: true }),
+    'RETRY',
+    { isWorkStarted: result => result.started },
+  );
+  assert.equal(started.started, true);
+  assert.equal(gate.admissionSnapshot().admissionsInWindow, 1);
+});
+
+test('rendered gate keeps a discovery slot when the non-discovery queue is full', async () => {
+  const governor = new RenderedAdmissionGovernor({
+    enabled: true,
+    nominalPerHour: 100,
+    emergencyPerHour: 100,
+    discoveryFloorPct: 0,
+    windowMs: 60_000,
+  }, () => 0);
+  const gate = new RenderedFallbackGate(1, 1, governor);
+  let releaseFirst!: () => void;
+  const blocker = new Promise<void>(resolve => { releaseFirst = resolve; });
+
+  const first = gate.run(async () => { await blocker; }, 'RETRY');
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const retry = gate.run(async () => undefined, 'RETRY');
+  const discovery = gate.run(async () => undefined, 'DISCOVERY');
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(gate.snapshot().pending, 2, 'discovery may use the extra queue reserve');
+
+  releaseFirst();
+  await Promise.all([first, retry, discovery]);
 });
 
 test('rendered gate prioritizes a discovery waiter when the floor is short', async () => {

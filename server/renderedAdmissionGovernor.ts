@@ -48,6 +48,8 @@ export interface RenderedAdmissionDecision {
   admitted: boolean;
   reason: RenderedAdmissionDenialReason | null;
   lane: AcquisitionLane;
+  /** Governor admission id, used to refund a pre-crawl failure. */
+  admissionId: number | null;
   admissionsInWindow: number;
   discoveryAdmissionsInWindow: number;
   limit: number;
@@ -72,12 +74,15 @@ export interface RenderedAdmissionGovernorLike {
   admit: (
     lane: AcquisitionLane,
     pendingLanes: ReadonlySet<AcquisitionLane>,
+    queuedDemand?: boolean,
   ) => RenderedAdmissionDecision;
+  refund: (admissionId: number) => boolean;
   shouldReserveDiscovery: (pendingLanes: ReadonlySet<AcquisitionLane>) => boolean;
   snapshot: () => RenderedAdmissionSnapshot;
 }
 
 interface Admission {
+  id: number;
   atMs: number;
   lane: AcquisitionLane;
 }
@@ -96,7 +101,9 @@ function boundedPct(value: unknown, fallback: number): number {
 
 function rawEnv(env: NodeJS.ProcessEnv, key: string): string | undefined {
   const value = env[key];
-  return typeof value === 'string' ? value.trim() : undefined;
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
 }
 
 export function renderedAdmissionGovernorEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -144,6 +151,7 @@ export class RenderedAdmissionGovernor implements RenderedAdmissionGovernorLike 
   private readonly config: RenderedAdmissionConfig;
   private readonly now: () => number;
   private readonly admissions: Admission[] = [];
+  private nextAdmissionId = 1;
 
   constructor(config: Partial<RenderedAdmissionConfig> = {}, now: () => number = Date.now) {
     const base = resolveRenderedAdmissionConfig();
@@ -180,6 +188,22 @@ export class RenderedAdmissionGovernor implements RenderedAdmissionGovernorLike 
     );
   }
 
+  private nonDiscoveryCount(): number {
+    return this.admissions.length - this.discoveryCount();
+  }
+
+  /**
+   * Remove an admission that never produced crawl work (for example, the
+   * egress proxy or browser launch failed before a request started). Returns
+   * true only when the id was still reserved.
+   */
+  refund(admissionId: number): boolean {
+    const index = this.admissions.findIndex(admission => admission.id === admissionId);
+    if (index < 0) return false;
+    this.admissions.splice(index, 1);
+    return true;
+  }
+
   private shouldReserveDiscoveryAt(
     pendingLanes: ReadonlySet<AcquisitionLane>,
   ): boolean {
@@ -199,17 +223,20 @@ export class RenderedAdmissionGovernor implements RenderedAdmissionGovernorLike 
   admit(
     lane: AcquisitionLane,
     pendingLanes: ReadonlySet<AcquisitionLane>,
+    queuedDemand: boolean = false,
   ): RenderedAdmissionDecision {
     const nowMs = this.now();
     this.prune(nowMs);
     const total = this.admissions.length;
     const discovery = this.discoveryCount();
+    const admissionId = this.nextAdmissionId++;
 
     if (!this.config.enabled) {
       return {
         admitted: true,
         reason: null,
         lane,
+        admissionId: null,
         admissionsInWindow: total,
         discoveryAdmissionsInWindow: discovery,
         limit: 0,
@@ -218,13 +245,15 @@ export class RenderedAdmissionGovernor implements RenderedAdmissionGovernorLike 
       };
     }
 
-    // Emergency only engages when the nominal budget is already full and other
-    // rendered work is queued. A solitary 41st request without backlog is
-    // denied until the window frees a slot.
-    const emergency = pendingLanes.size > 0 && total >= this.config.nominalPerHour;
+    // Emergency engages when the nominal budget is already full and demand is
+    // queued: either this request waited behind the active crawl, or another
+    // rendered request is already in the queue.
+    const emergency = (pendingLanes.size > 0 || queuedDemand)
+      && total >= this.config.nominalPerHour;
     const limit = emergency ? this.config.emergencyPerHour : this.config.nominalPerHour;
     const base = {
       lane,
+      admissionId: null,
       admissionsInWindow: total,
       discoveryAdmissionsInWindow: discovery,
       limit,
@@ -232,29 +261,41 @@ export class RenderedAdmissionGovernor implements RenderedAdmissionGovernorLike 
     };
 
     if (total >= limit) {
-      const oldest = this.admissions[0];
+      // Report the expiry that actually frees a slot: enough oldest admissions
+      // must leave to bring the window below this limit.
+      const retryIndex = Math.max(0, total - limit);
+      const retryAt = this.admissions[retryIndex];
       return {
         ...base,
         admitted: false,
         reason: 'RATE_LIMIT',
-        retryAtMs: oldest ? oldest.atMs + this.config.windowMs : nowMs,
+        retryAtMs: retryAt ? retryAt.atMs + this.config.windowMs : nowMs,
       };
     }
 
-    if (lane !== 'DISCOVERY' && this.shouldReserveDiscoveryAt(pendingLanes)) {
-      return {
-        ...base,
-        admitted: false,
-        reason: 'DISCOVERY_FLOOR',
-        retryAtMs: null,
-      };
+    // Strict discovery reserve: non-discovery admissions can never occupy the
+    // 35% of the selected limit reserved for DISCOVERY. Unused reserve is not
+    // reassigned to non-discovery work.
+    if (lane !== 'DISCOVERY') {
+      const floorBasisPoints = Math.round(this.config.discoveryFloorPct * 100);
+      const discoveryReserve = Math.ceil(limit * floorBasisPoints / 10000);
+      const nonDiscoveryLimit = Math.max(0, limit - discoveryReserve);
+      if (this.nonDiscoveryCount() >= nonDiscoveryLimit) {
+        return {
+          ...base,
+          admitted: false,
+          reason: 'DISCOVERY_FLOOR',
+          retryAtMs: null,
+        };
+      }
     }
 
-    this.admissions.push({ atMs: nowMs, lane });
+    this.admissions.push({ id: admissionId, atMs: nowMs, lane });
     return {
       ...base,
       admitted: true,
       reason: null,
+      admissionId,
       admissionsInWindow: total + 1,
       discoveryAdmissionsInWindow: discovery + (lane === 'DISCOVERY' ? 1 : 0),
       retryAtMs: null,
