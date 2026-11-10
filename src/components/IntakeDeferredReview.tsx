@@ -118,6 +118,8 @@ const IntakeDeferredReview: React.FC = () => {
 
   const submitDecision = async () => {
     if (!selected || selected.state !== 'PENDING') return;
+    const submittedChannelId = selected.channelId;
+    const submittedToken = selectionRequest.current;
     setBusy(true); setError(''); setSuccess('');
     try {
       const corrections: Record<string, unknown> = {};
@@ -143,7 +145,9 @@ const IntakeDeferredReview: React.FC = () => {
       if (!response.ok) throw new Error(await responseError(response));
       const result = await response.json();
       setSuccess(`Decision saved at version ${result.reviewVersion || selected.reviewVersion + 1}.`);
-      await loadDetails(selected.channelId);
+      if (selectionRequest.current === submittedToken) {
+        await loadDetails(submittedChannelId);
+      }
       await loadList(offset);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Unable to save the intake decision.');

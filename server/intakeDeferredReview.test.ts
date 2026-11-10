@@ -84,6 +84,9 @@ test('deferred review migration and decision path preserve human evidence and la
   assert.match(module, /intake-review-enrich/);
   assert.match(module, /Re-check the idempotency key under the lock/);
   assert.match(module, /language=COALESCE\(NULLIF\(\$8,''\),language\)/);
+  assert.match(module, /intake_deferred_reviews\.state='SUPERSEDED'/);
+  assert.match(module, /review_version\+1/);
+  assert.match(module, /channel\.country_status === 'CONFIRMED'/);
   const pipeline = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
   assert.match(pipeline, /recordIntakeDeferredReview/);
   const ui = readFileSync(new URL('../src/components/IntakeDeferredReview.tsx', import.meta.url), 'utf8');
@@ -160,6 +163,7 @@ test('deferred recheck uses the durable ENRICH carrier with bounded stage-1 evid
   assert.ok(gate >= 0 && reserve > gate, 'country and low-audience gates must run before recheck quota reservation');
   assert.match(worker, /shouldBlockEnrichClaimForCountry\(channel\.country_status/);
   assert.match(worker, /evaluateLowAudienceGate\(recheckAudience/);
+  assert.match(worker, /SKIPPED_LOW_AUDIENCE[\s\S]*state='SUPERSEDED'/);
   assert.match(worker, /focus\.decision === 'WITHHOLD'/);
   assert.match(worker, /focus\.decision === 'ADMIT'/);
   assert.match(worker, /intake-recheck-enrich:/);
@@ -213,6 +217,7 @@ test('review UI preserves system reasoning separately from human decisions', () 
   assert.match(ui, /X-Reviewer-Id/);
   assert.match(ui, /newRequestId\(\)/);
   assert.match(ui, /selectionRequest/);
+  assert.match(ui, /submittedToken/);
   assert.doesNotMatch(ui, /Authorization: `Bearer \$\{token\}`/);
 });
 

@@ -1391,6 +1391,11 @@ async function processIntakeDeferredRecheckJob(
       timestamp: skippedAt,
     }];
     await upsertChannel(channel);
+    await (await getDb()).query(
+      `UPDATE intake_deferred_reviews SET state='SUPERSEDED',next_recheck_at=NULL,updated_at=now()
+       WHERE channel_id=$1 AND state IN ('PENDING','DECIDED')`,
+      [channelId],
+    );
     await completeJob(job.id);
     return true;
   }

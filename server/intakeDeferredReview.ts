@@ -110,9 +110,20 @@ export async function recordIntakeDeferredReview(input: IntakeDeferredReviewInpu
        language=COALESCE(excluded.language,intake_deferred_reviews.language),
        country=COALESCE(excluded.country,intake_deferred_reviews.country),
        metadata_quality=COALESCE(excluded.metadata_quality,intake_deferred_reviews.metadata_quality),
+       review_version=CASE WHEN intake_deferred_reviews.state='SUPERSEDED'
+         THEN intake_deferred_reviews.review_version+1 ELSE intake_deferred_reviews.review_version END,
+       state=CASE WHEN intake_deferred_reviews.state='SUPERSEDED'
+         THEN 'PENDING' ELSE intake_deferred_reviews.state END,
+       decision=CASE WHEN intake_deferred_reviews.state='SUPERSEDED' THEN NULL ELSE intake_deferred_reviews.decision END,
+       reviewer=CASE WHEN intake_deferred_reviews.state='SUPERSEDED' THEN NULL ELSE intake_deferred_reviews.reviewer END,
+       reason=CASE WHEN intake_deferred_reviews.state='SUPERSEDED' THEN NULL ELSE intake_deferred_reviews.reason END,
+       notes=CASE WHEN intake_deferred_reviews.state='SUPERSEDED' THEN NULL ELSE intake_deferred_reviews.notes END,
+       corrections=CASE WHEN intake_deferred_reviews.state='SUPERSEDED' THEN '{}'::jsonb ELSE intake_deferred_reviews.corrections END,
+       decided_at=CASE WHEN intake_deferred_reviews.state='SUPERSEDED' THEN NULL ELSE intake_deferred_reviews.decided_at END,
+       next_recheck_at=CASE WHEN intake_deferred_reviews.state='SUPERSEDED' THEN now()+interval '1 hour' ELSE intake_deferred_reviews.next_recheck_at END,
        last_checked_at=now(),
        updated_at=now()
-     WHERE intake_deferred_reviews.state='PENDING'`,
+     WHERE intake_deferred_reviews.state IN ('PENDING','SUPERSEDED')`,
     [
       input.channelId,
       JSON.stringify(system),
@@ -256,13 +267,22 @@ export async function decideIntakeDeferredReview(input: DecideIntakeDeferredInpu
     const correctedCountry = typeof corrections.country === 'string' ? corrections.country.trim() : '';
     const correctedLanguage = typeof corrections.language === 'string' ? corrections.language.trim() : '';
     const countryToCheck = correctedCountry || channel.country || '';
-    if (input.decision === 'TRADING' && countryToCheck) {
-      const exclusion = await client.query(
-        `SELECT country_name,reason FROM excluded_countries WHERE LOWER(country_name)=LOWER($1) LIMIT 1`,
-        [countryToCheck],
-      );
-      if (exclusion.rowCount) {
-        throw Object.assign(new Error(`Country ${countryToCheck} is excluded by policy: ${exclusion.rows[0].reason}`), { status: 422 });
+    if (input.decision === 'TRADING') {
+      // A caller-supplied correction must not erase an independently confirmed
+      // excluded country. Check both the confirmed stored finding and the
+      // proposed correction before allowing enrichment.
+      const countriesToCheck = [...new Set([
+        ...(channel.country_status === 'CONFIRMED' && channel.country ? [channel.country] : []),
+        ...(countryToCheck ? [countryToCheck] : []),
+      ])];
+      for (const country of countriesToCheck) {
+        const exclusion = await client.query(
+          `SELECT country_name,reason FROM excluded_countries WHERE LOWER(country_name)=LOWER($1) LIMIT 1`,
+          [country],
+        );
+        if (exclusion.rowCount) {
+          throw Object.assign(new Error(`Country ${country} is excluded by policy: ${exclusion.rows[0].reason}`), { status: 422 });
+        }
       }
     }
     const nextVersion = Number(row.review_version) + 1;
