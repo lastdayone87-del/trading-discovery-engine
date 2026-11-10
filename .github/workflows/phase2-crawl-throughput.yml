@@ -11,6 +11,11 @@ on:
       - 'server/acquisitionLaneTaxonomy.ts'
       - 'server/acquisitionLaneKeys.ts'
       - 'server/crawlerTelemetry.ts'
+      - 'server/browserCommunityFallback.ts'
+      - 'server/browserCommunityFallback.test.ts'
+      - 'server/renderedAdmissionGovernor.ts'
+      - 'server/renderedAdmissionGovernor.test.ts'
+      - 'server/renderedCrawlerPolicy.ts'
       - 'server/inspector.ts'
       - 'server/queueManager.ts'
       - 'scripts/phase2CrawlThroughputReport.ts'
@@ -21,6 +26,7 @@ on:
       - 'Dockerfile'
       - '.env.example'
       - 'docs/phase-2-crawl-throughput.md'
+      - 'docs/phase-2-admission-governor.md'
       - 'docs/operations-capacity-defaults.md'
       - 'package.json'
       - 'package-lock.json'
@@ -67,7 +73,7 @@ jobs:
         run: npx tsx scripts/runMigrations.ts
       - name: TypeScript check
         run: npx tsc --noEmit
-      - name: Phase 2 report static assertions
-        run: node --import tsx --test server/crawlThroughputReport.test.ts server/acquisitionLaneTelemetry.test.ts
+      - name: Phase 2 report and admission static assertions
+        run: node --import tsx --test server/crawlThroughputReport.test.ts server/acquisitionLaneTelemetry.test.ts server/renderedAdmissionGovernor.test.ts server/browserCommunityFallback.test.ts
       - name: Phase 2 report PostgreSQL regression
         run: node --import tsx --test server/crawlThroughputReport.postgres.test.ts
