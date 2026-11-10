@@ -18,6 +18,7 @@ import {
   getQueryLibraryPage,
   getVocabularyPage,
   getQueryIntelligenceSummary,
+  getExtractedQueryCandidates,
   getRecentQueryExecutionLogs,
   getExtractedVocabulary,
   setQueryCollection,
@@ -652,6 +653,18 @@ async function startServer() {
   app.get('/api/query-intelligence/summary', async (_req, res) => {
     try {
       res.json(await getQueryIntelligenceSummary());
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 14c. Extraction candidate LCB ledger (accepted and rejected, with results).
+  app.get('/api/query-intelligence/extracted-candidates', async (req, res) => {
+    try {
+      const country = typeof req.query.country === 'string' && req.query.country.trim() ? req.query.country.trim() : undefined;
+      const limit = Math.max(1, Math.min(500, parseInt(req.query.limit as string) || 100));
+      const offset = Math.max(0, Math.min(100000, parseInt(req.query.offset as string) || 0));
+      res.json(await getExtractedQueryCandidates(country, limit, offset));
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }

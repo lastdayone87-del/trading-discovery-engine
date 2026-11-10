@@ -2153,6 +2153,157 @@ export async function getQueryIntelligenceSummary(options:{now?:number;force?:bo
   (SELECT COUNT(*)::int FROM query_execution_logs) AS execution_log_count`); const r=res.rows[0]||{}; const value={queryCount:Number(r.query_count||0),provenCount:Number(r.proven_count||0),experimentalCount:Number(r.experimental_count||0),rejectedCount:Number(r.rejected_count||0),vocabularyCount:Number(r.vocabulary_count||0),terminologyCount:Number(r.terminology_count||0),searchEligibleTerminologyCount:Number(r.search_eligible_count||0),executionLogCount:Number(r.execution_log_count||0)}; queryIntelligenceSummaryCache={at:now,value}; return value;}
 export async function getQueriesByCountry(country:string):Promise<QueryRecord[]>{const db=await getDb(); const res=await db.query(`SELECT * FROM query_library WHERE LOWER(country)=LOWER($1) AND status='ACTIVE' ORDER BY performance_score DESC,times_executed ASC`,[country]); return res.rows.map(rowToQuery);}
 
+export interface ExtractedQueryCandidateRecord {
+  id: number;
+  candidateKey: string;
+  country: string;
+  language: string;
+  script: string;
+  candidateText: string;
+  normalizedText: string;
+  sourceKind: string;
+  sourceChannelId: string | null;
+  sourceVideoId: string | null;
+  sourceTitle: string | null;
+  intent: string;
+  confidence: number;
+  decision: 'ACCEPTED' | 'REJECTED';
+  rejectionReasons: string[];
+  standaloneEligible: boolean;
+  duplicateOf: number | null;
+  duplicateCount: number;
+  duplicateSources: Array<{ kind?: string; channelId?: string | null; videoId?: string | null; title?: string | null }>;
+  queryId: number | null;
+  createdAt: string;
+}
+
+/**
+ * Persist the integrated extraction ledger. A candidate is unique per country
+ * and language; repeated sightings increment duplicate metadata instead of
+ * creating another planner surface.
+ */
+export async function persistExtractedQueryCandidates(
+  candidates: Array<{
+    candidateKey: string;
+    candidateText: string;
+    normalizedText: string;
+    country: string;
+    language: string;
+    script: string;
+    sourceKind: string;
+    sourceChannelId?: string | null;
+    sourceVideoId?: string | null;
+    sourceTitle?: string | null;
+    intent?: string;
+    confidence?: number;
+    accepted: boolean;
+    standaloneEligible: boolean;
+    reasons?: string[];
+  }>,
+): Promise<{ accepted: number; rejected: number; duplicates: number }> {
+  const db = await getDb();
+  let accepted = 0;
+  let rejected = 0;
+  let duplicates = 0;
+  for (const candidate of candidates) {
+    const source = {
+      kind: candidate.sourceKind,
+      channelId: candidate.sourceChannelId || null,
+      videoId: candidate.sourceVideoId || null,
+      title: candidate.sourceTitle || null,
+    };
+    // One atomic upsert per candidate: repeated sightings only update duplicate
+    // metadata, and two workers extracting the same surface cannot race into
+    // the unique constraint. `xmax = 0` distinguishes an insert from an update.
+    const result = await db.query(
+      `INSERT INTO extracted_query_candidates(
+         candidate_key,country,language,script,candidate_text,normalized_text,source_kind,source_channel_id,source_video_id,source_title,intent,confidence,decision,rejection_reasons,standalone_eligible,duplicate_sources
+       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16::jsonb)
+       ON CONFLICT (country, language, candidate_key) DO UPDATE SET
+         duplicate_count=extracted_query_candidates.duplicate_count+1,
+         -- Retain a bounded sample of sightings; the counter remains exact.
+         duplicate_sources=CASE WHEN extracted_query_candidates.duplicate_count < 20
+           THEN extracted_query_candidates.duplicate_sources || EXCLUDED.duplicate_sources
+           ELSE extracted_query_candidates.duplicate_sources END,
+         decision=CASE WHEN EXCLUDED.decision='ACCEPTED' THEN 'ACCEPTED' ELSE extracted_query_candidates.decision END,
+         confidence=CASE WHEN EXCLUDED.decision='ACCEPTED' THEN GREATEST(extracted_query_candidates.confidence, EXCLUDED.confidence) ELSE extracted_query_candidates.confidence END,
+         standalone_eligible=CASE WHEN EXCLUDED.decision='ACCEPTED' THEN EXCLUDED.standalone_eligible ELSE extracted_query_candidates.standalone_eligible END,
+         rejection_reasons=CASE
+           WHEN EXCLUDED.decision='ACCEPTED' THEN '[]'::jsonb
+           WHEN extracted_query_candidates.decision='ACCEPTED' THEN extracted_query_candidates.rejection_reasons
+           ELSE EXCLUDED.rejection_reasons
+         END,
+         updated_at=now()
+       RETURNING (xmax = 0) AS inserted`,
+      [
+        candidate.candidateKey, canonicalCountry(candidate.country), candidate.language, candidate.script,
+        candidate.candidateText, candidate.normalizedText, candidate.sourceKind, candidate.sourceChannelId || null,
+        candidate.sourceVideoId || null, candidate.sourceTitle || null, candidate.intent || 'strategy',
+        Number.isFinite(candidate.confidence) ? candidate.confidence : 0, candidate.accepted ? 'ACCEPTED' : 'REJECTED',
+        JSON.stringify(candidate.reasons || []), candidate.standaloneEligible, JSON.stringify([source]),
+      ],
+    );
+    if (result.rows[0]?.inserted === true) {
+      if (candidate.accepted) accepted += 1; else rejected += 1;
+    } else {
+      duplicates += 1;
+    }
+  }
+  return { accepted, rejected, duplicates };
+}
+
+function mapExtractedCandidate(row: any): ExtractedQueryCandidateRecord {
+  return {
+    id: Number(row.id), candidateKey: String(row.candidate_key || ''), country: String(row.country || ''),
+    language: String(row.language || 'und'), script: String(row.script || 'Zyyy'),
+    candidateText: String(row.candidate_text || ''), normalizedText: String(row.normalized_text || ''),
+    sourceKind: String(row.source_kind || ''), sourceChannelId: row.source_channel_id ? String(row.source_channel_id) : null,
+    sourceVideoId: row.source_video_id ? String(row.source_video_id) : null, sourceTitle: row.source_title ? String(row.source_title) : null,
+    intent: String(row.intent || 'strategy'), confidence: Number(row.confidence || 0),
+    decision: row.decision === 'ACCEPTED' ? 'ACCEPTED' : 'REJECTED',
+    rejectionReasons: Array.isArray(row.rejection_reasons) ? row.rejection_reasons.map(String) : [],
+    standaloneEligible: row.standalone_eligible === true, duplicateOf: row.duplicate_of ? Number(row.duplicate_of) : null,
+    duplicateCount: Number(row.duplicate_count || 0),
+    duplicateSources: Array.isArray(row.duplicate_sources) ? row.duplicate_sources : [],
+    queryId: row.query_id ? Number(row.query_id) : null, createdAt: iso(row.created_at) || '',
+  };
+}
+
+export async function getStandaloneExtractedQueryCandidates(country: string, limit = 20): Promise<ExtractedQueryCandidateRecord[]> {
+  const db = await getDb();
+  const res = await db.query(
+    `SELECT * FROM extracted_query_candidates
+     WHERE country=$1 AND decision='ACCEPTED' AND standalone_eligible=true AND duplicate_of IS NULL AND query_id IS NULL
+     ORDER BY confidence DESC, updated_at DESC, id ASC LIMIT $2`,
+    [canonicalCountry(country), Math.max(1, Math.min(100, Math.trunc(limit)))],
+  );
+  return res.rows.map(mapExtractedCandidate);
+}
+
+export async function linkExtractedQueryCandidate(candidateId: number, queryId: number): Promise<void> {
+  const db = await getDb();
+  await db.query('UPDATE extracted_query_candidates SET query_id=$2,updated_at=now() WHERE id=$1 AND query_id IS NULL', [candidateId, queryId]);
+}
+
+export async function getExtractedQueryCandidates(country?: string, limit = 100, offset = 0): Promise<Array<ExtractedQueryCandidateRecord & { collection: string | null; runs: number; quota: number; newChannels: number; qualityCreators: number }>> {
+  const db = await getDb();
+  const bounded = Math.max(1, Math.min(500, Math.trunc(limit)));
+  const skipped = Math.max(0, Math.min(100000, Math.trunc(offset)));
+  const res = await db.query(
+    `SELECT c.*, ql.collection,
+       COALESCE(r.runs,0)::int AS runs, COALESCE(r.quota,0)::int AS quota,
+       COALESCE(l.new_channels,0)::int AS new_channels, COALESCE(l.quality_creators,0)::int AS quality_creators
+     FROM extracted_query_candidates c
+     LEFT JOIN query_library ql ON ql.id=c.query_id
+     LEFT JOIN LATERAL (SELECT count(*)::int runs, COALESCE(SUM(quota_used),0)::int quota FROM query_runs WHERE query_id=c.query_id) r ON true
+     LEFT JOIN LATERAL (SELECT COALESCE(SUM(unique_new_channels),0)::int new_channels, COALESCE(SUM(quality_creators_discovered),0)::int quality_creators FROM query_execution_logs WHERE query_id=c.query_id) l ON true
+     WHERE ($1::text IS NULL OR LOWER(c.country)=LOWER($1))
+     ORDER BY c.created_at DESC, c.id DESC LIMIT $2 OFFSET $3`,
+    [country ? canonicalCountry(country) : null, bounded, skipped],
+  );
+  return res.rows.map((row: any) => ({ ...mapExtractedCandidate(row), collection: row.collection || null, runs: Number(row.runs || 0), quota: Number(row.quota || 0), newChannels: Number(row.new_channels || 0), qualityCreators: Number(row.quality_creators || 0) }));
+}
+
 export interface QueryTerminologyCurrentStatus {
   queryId: number;
   termId: number;

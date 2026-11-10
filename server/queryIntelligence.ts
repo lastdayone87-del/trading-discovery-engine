@@ -26,6 +26,9 @@ import {
   getInFlightPrimaryTermUsage,
   getActiveQueryRunQueryIds,
   getQueryTerminologyCurrentStatuses,
+  persistExtractedQueryCandidates,
+  getStandaloneExtractedQueryCandidates,
+  linkExtractedQueryCandidate,
   persistQueryTerminologyDigest,
   getQueryRunReward,
   isRetryableInfrastructureFailure
@@ -66,6 +69,7 @@ import type { ExplicitTerminologyLanguageContext } from './terminologyLanguageCo
 import { canonicalCountry } from './countryInference';
 import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { isNuisanceVocabularySurface, reviewedNativePhraseLanguages } from './terminologySearchability';
+import { assessLlmQueryCandidates, deriveDeterministicQueryCandidates, type ExtractedQueryCandidate, type ExtractedQuerySource } from './extractedQueryDiscovery';
 import { countrySearchLanguageCandidates, normalizeLanguageCode } from './countrySearchHints';
 import { executeProviderCall, resolveGeminiRouteId } from './providerResilience';
 import { geminiOrgIdForSlot } from './evidenceEngine/providers/GeminiSemanticProvider';
@@ -332,7 +336,7 @@ export function hasNativeExtractionText(channelName: string, titles: string[], d
  * treats that as a provider failure with warn-and-skip, distinct from
  * persistence failures in admission, which propagate for retry).
  */
-export function parseNativeVocabularyResponse(resText: string): { terminology?: unknown; instruments?: unknown; phrases?: unknown; formats?: unknown } | undefined {
+export function parseNativeVocabularyResponse(resText: string): { terminology?: unknown; instruments?: unknown; phrases?: unknown; formats?: unknown; queries?: unknown } | undefined {
   const jsonMatch = (resText || '').match(/\{[\s\S]*\}/);
   if (!jsonMatch) return undefined;
   return JSON.parse(jsonMatch[0]);
@@ -356,7 +360,8 @@ export function buildLiteralSources(
   videoTitles: string[],
   description: string,
   videoIds?: Array<string | null>,
-  origins?: ExtractionSourceOrigins
+  origins?: ExtractionSourceOrigins,
+  playlists?: Array<{ id?: string; name: string; description?: string }>,
 ): LiteralSourceText[] {
   return [
     { kind: 'CHANNEL_NAME', index: 0, text: channelName },
@@ -366,6 +371,10 @@ export function buildLiteralSources(
     ...(origins?.descriptionIsMetadata === false
       ? []
       : [{ kind: 'DESCRIPTION' as const, index: 0, text: description }]),
+    ...(playlists || []).flatMap((playlist, index) => [
+      { kind: 'PLAYLIST_TITLE' as const, index, text: playlist.name },
+      ...(playlist.description ? [{ kind: 'PLAYLIST_DESCRIPTION' as const, index, text: playlist.description }] : []),
+    ]),
   ];
 }
 
@@ -515,6 +524,7 @@ export interface ExtractionVideoSource {
   videos?: Array<{ id?: string; title: string; language?: string }>;
   matchedDocument?: { type?: string; providerNativeId?: string; title?: string };
   description?: string;
+  playlists?: Array<{ id?: string; name: string; description?: string }>;
   detectedLanguages?: Array<{ language: string; confidence?: number }>;
 }
 
@@ -549,7 +559,11 @@ export async function replayVocabularyForRetry(
     candidate.description ?? '',
     false,
     selectExplicitTerminologyLanguageContext(candidate),
-    resolveExtractionVideoIds(candidate)
+    resolveExtractionVideoIds(candidate),
+    undefined,
+    undefined,
+    undefined,
+    candidate.playlists
   );
   return true;
 }
@@ -680,7 +694,8 @@ export async function invokeChannelVocabularyExtraction(
     extractionVideoIds,
     undefined,
     undefined,
-    options
+    options,
+    candidate.playlists
   );
   return extractionVideoIds;
 }
@@ -715,11 +730,11 @@ export interface VocabularyAdmissibilityContext {
 }
 
 export function isAdmissibleParsed(
-  parsed: { terminology?: unknown; instruments?: unknown; phrases?: unknown; formats?: unknown } | undefined,
+  parsed: { terminology?: unknown; instruments?: unknown; phrases?: unknown; formats?: unknown; queries?: unknown } | undefined,
   ctx: VocabularyAdmissibilityContext
 ): boolean {
   if (!parsed) return false;
-  const buckets = [parsed.terminology, parsed.instruments, parsed.phrases, parsed.formats];
+  const buckets = [parsed.terminology, parsed.instruments, parsed.phrases, parsed.formats, parsed.queries];
   return buckets.some(
     bucket =>
       Array.isArray(bucket) &&
@@ -740,7 +755,7 @@ export function isAdmissibleParsed(
 export async function admitNativeCandidates(args: {
   channel: ChannelRecord;
   sources: LiteralSourceText[];
-  parsed: { terminology?: unknown[]; instruments?: unknown[]; phrases?: unknown[]; formats?: unknown[] };
+  parsed: { terminology?: unknown[]; instruments?: unknown[]; phrases?: unknown[]; formats?: unknown[]; queries?: unknown[] };
   baseline: NoveltyBaseline;
   language?: string;
   locale?: string;
@@ -860,7 +875,8 @@ export async function extractVocabularyFromCreator(
     /** Autonomous run/page provenance for exact novel-term attribution. */
     queryRunId?: string;
     queryPageNumber?: number;
-  }
+  },
+  playlists?: Array<{ id?: string; name: string; description?: string }>,
 ): Promise<ExtractedTermRecord[]> {
   const extracted: ExtractedTermRecord[] = [];
 
@@ -892,7 +908,10 @@ export async function extractVocabularyFromCreator(
   for (const hit of findRuleInstrumentHits(channel.channel_name, videoTitles, description, videoIds, origins)) {
     // Persistence ordering mirrors the AI path: terminology evidence first,
     // extracted-term row only after a valid observation exists.
-    const ruleObservation = await observeTerminologyDetailed({ term: hit.instrument, country: channel.country, termType: 'INSTRUMENT', observationType: humanApproved ? 'HUMAN_APPROVED_CHANNEL' : hit.located.sourceKind, channelId: channel.channel_id, videoId: hit.located.videoId ?? undefined, humanApproved, language: languageContext?.language, locale: languageContext?.locale, communityFingerprint: channel.discord_invite || undefined, promotionEligible: false, evidence: { extractor: 'KNOWN_INSTRUMENT_V1', sourceType: hit.located.sourceKind, qualityVersion: 'native-v1', literal: true, sourceRef: { kind: hit.located.sourceKind, index: hit.located.sourceIndex, span: hit.located.span, videoId: hit.located.videoId ?? null, sourceHash: hit.located.sourceHash }, novel: false, knownAs: `instrument:${hit.instrument}`, generic: true, spamConfirmed: false, spamSignals: [] as string[], sourceSpamSignals: hit.sourceSpamSignals, translationRisk: null } });
+    const observationType = (hit.located.sourceKind === 'PLAYLIST_TITLE' || hit.located.sourceKind === 'PLAYLIST_DESCRIPTION')
+      ? 'ENRICHMENT'
+      : humanApproved ? 'HUMAN_APPROVED_CHANNEL' : hit.located.sourceKind;
+    const ruleObservation = await observeTerminologyDetailed({ term: hit.instrument, country: channel.country, termType: 'INSTRUMENT', observationType, channelId: channel.channel_id, videoId: hit.located.videoId ?? undefined, humanApproved, language: languageContext?.language, locale: languageContext?.locale, communityFingerprint: channel.discord_invite || undefined, promotionEligible: false, evidence: { extractor: 'KNOWN_INSTRUMENT_V1', sourceType: hit.located.sourceKind, qualityVersion: 'native-v1', literal: true, sourceRef: { kind: hit.located.sourceKind, index: hit.located.sourceIndex, span: hit.located.span, videoId: hit.located.videoId ?? null, sourceHash: hit.located.sourceHash }, novel: false, knownAs: `instrument:${hit.instrument}`, generic: true, spamConfirmed: false, spamSignals: [] as string[], sourceSpamSignals: hit.sourceSpamSignals, translationRisk: null } });
     if (ruleObservation == null) continue;
     ruleObserved.add(normalizeTerm(hit.instrument));
     // Legacy-vocabulary bypass guard: lower-quality creators still contribute
@@ -912,6 +931,37 @@ export async function extractVocabularyFromCreator(
   // sources, rule spans, or quoted prompt context.
   const effTitles = origins?.videoTitlesAreMetadata === false ? [] : videoTitles;
   const effDesc = origins?.descriptionIsMetadata === false ? '' : description;
+  // Literal sources are built before any provider attempt. Playlist titles and
+  // descriptions are first-class context candidates, never separate shadow
+  // inputs: they pass the same literal-span, quality and standalone gates.
+  const literalSources = buildLiteralSources(channel.channel_name, effTitles, effDesc, videoIds, origins, playlists);
+  const extractedSources: ExtractedQuerySource[] = literalSources
+    .filter(source => source.kind !== 'CHANNEL_NAME')
+    .map(source => ({ kind: source.kind as ExtractedQuerySource['kind'], index: source.index, text: source.text, videoId: source.videoId ?? null }));
+  // Accepted and rejected deterministic candidates share one ledger write so
+  // the LCB can explain what the extractor discarded before any provider spend.
+  const rejectedQueryCandidates = new Map<string, ExtractedQueryCandidate>();
+  const collectRejection = (candidate: ExtractedQueryCandidate) => {
+    if (!rejectedQueryCandidates.has(candidate.candidateKey)) {
+      rejectedQueryCandidates.set(candidate.candidateKey, candidate);
+    }
+  };
+  const persistCandidates = async (accepted: ExtractedQueryCandidate[]) => {
+    if (!accepted.length && !rejectedQueryCandidates.size) return;
+    await persistExtractedQueryCandidates([
+      ...accepted.map(candidate => ({ ...candidate, sourceChannelId: channel.channel_id })),
+      ...[...rejectedQueryCandidates.values()].map(candidate => ({ ...candidate, sourceChannelId: channel.channel_id })),
+    ]);
+    rejectedQueryCandidates.clear();
+  };
+  const deterministicQueryCandidates = deriveDeterministicQueryCandidates({
+    sources: extractedSources,
+    country: channel.country,
+    language: languageContext?.language,
+    maxCandidates: 30,
+    onRejected: collectRejection,
+  });
+  await persistCandidates(deterministicQueryCandidates);
   // Groq runs on its own key configuration: only the Gemini fallback is
   // gated on the Gemini client.
   if (hasNativeExtractionText(channel.channel_name, effTitles, effDesc)) {
@@ -919,19 +969,24 @@ export async function extractVocabularyFromCreator(
     // extraction. Persistence failures from admission below are NOT caught
     // here: they propagate to the caller for retry instead of being
     // misreported as Gemini errors or silently swallowed.
-    let parsed: { terminology?: unknown; instruments?: unknown; phrases?: unknown; formats?: unknown } | undefined;
+    let parsed: { terminology?: unknown; instruments?: unknown; phrases?: unknown; formats?: unknown; queries?: unknown } | undefined;
     let parsedSource: 'GROQ' | 'GEMINI' = 'GEMINI';
     const prompt = `Analyze this YouTube trading channel and recent video titles for country "${channel.country}".
 Channel Name: "${channel.channel_name}"
 Description: "${effDesc}"
 Recent Titles:
 ${effTitles.map(t => `- ${t}`).join('\n')}
+Playlist Titles:
+${(playlists || []).map(p => `- ${p.name}`).join('\n')}
+Playlist Descriptions:
+${(playlists || []).filter(p => p.description).map(p => `- ${p.description}`).join('\n')}
 
 Identify localized trading vocabulary used by traders in ${channel.country}. Each bucket has a strict trading meaning:
 - "terminology": native market, method, execution or platform language used by traders (for example "analyse technique", "order flow", "scalping").
 - "instruments": tradeable instruments, exchanges or contracts (for example "NQ Futures", "XAUUSD", "DAX").
 - "phrases": multiword phrases with a genuine market/trading meaning (for example "live trading", "trade review", "risk management").
 - "formats": trading-specific content formats only (for example "live trading", "trade review"), never generic packaging.
+- "queries": clean native-language discovery queries. Use 2-6 words. Split composite titles into useful independent candidates. Remove promotional suffixes, CTAs, clickbait, dates, episode labels, hashtags, emoji, metadata and incomplete fragments. Preserve the original language; do not translate. Only include phrases with genuine trading intent.
 Quote every term EXACTLY as it appears in the texts above: do not paraphrase, translate, or invent terms.
 Exclude calls to action (subscribe, like, comment, notification), channel boilerplate, episode/part/volume labels, emoji-only or symbol-only surfaces, hashtags, URLs, handles, and generic words such as "free", "video", "channel", "interview", "live" or "session" without a trading qualifier. Do not return "Subscribe and Like button", "Free Interviews", "Épisode 6", "🔴" or "#trading".
 Return ONLY a valid JSON object with format:
@@ -939,17 +994,17 @@ Return ONLY a valid JSON object with format:
   "terminology": ["term1", "term2"],
   "instruments": ["inst1"],
   "phrases": ["phrase1"],
-  "formats": ["format1"]
+  "formats": ["format1"],
+  "queries": ["native search phrase"]
 }`;
 
-    // Literal sources are built before any provider attempt, and the novelty
-    // baseline loads here too, so the success/failure boundary below can
-    // apply the real admission checks. Pure/sync sources; baseline infra
-    // failures throw here (fail fast, no provider spend) and the job retries.
-    const literalSources = buildLiteralSources(channel.channel_name, effTitles, effDesc, videoIds, origins);
+    // Literal sources were built before any provider attempt; the novelty
+    // baseline loads here so the success/failure boundary below can apply the
+    // real admission checks. Pure/sync sources; baseline infra failures throw
+    // here (fail fast, no provider spend) and the job retries.
     const baseline = await loadNoveltyBaseline(channel.country);
     const isAdmissible = (
-      p: { terminology?: unknown; instruments?: unknown; phrases?: unknown; formats?: unknown } | undefined
+      p: { terminology?: unknown; instruments?: unknown; phrases?: unknown; formats?: unknown; queries?: unknown } | undefined
     ): boolean =>
       isAdmissibleParsed(p, {
         sources: literalSources,
@@ -1183,6 +1238,15 @@ Return ONLY a valid JSON object with format:
             return getExtractedVocabulary(channel.country);
           }
         }
+        const llmQueryCandidates = assessLlmQueryCandidates({
+          queries: Array.isArray(parsed.queries) ? parsed.queries : [],
+          sources: extractedSources,
+          country: channel.country,
+          language: languageContext?.language,
+          maxCandidates: 30,
+          onRejected: collectRejection,
+        });
+        await persistCandidates(llmQueryCandidates);
         await admitNativeCandidates({
           channel,
           sources: literalSources,
@@ -1191,6 +1255,7 @@ Return ONLY a valid JSON object with format:
             instruments: deduped(Array.isArray(parsed.instruments) ? parsed.instruments : undefined),
             phrases: deduped(Array.isArray(parsed.phrases) ? parsed.phrases : undefined),
             formats: deduped(Array.isArray(parsed.formats) ? parsed.formats : undefined),
+            queries: deduped(Array.isArray(parsed.queries) ? parsed.queries : undefined),
           },
           baseline,
           language: languageContext?.language,
@@ -1751,12 +1816,13 @@ export async function generateCandidateQueriesForCountry(
   options: { scopePromotionBasis?: 'PERSISTENT_SCOPE_SELECTION' | 'DIRECT_TARGET' } = {}
 ): Promise<QueryRecord[]> {
   await assertCountryAllowed(country, 'query_generation');
-  const [vocabs, extractedTerms, existingQueries, provenTerminology, organicCandidates] = await Promise.all([
+  const [vocabs, extractedTerms, existingQueries, provenTerminology, organicCandidates, standaloneExtractedCandidates] = await Promise.all([
     getCountryVocabularies(),
     getExtractedVocabulary(country),
     getQueriesByCountry(country),
     getPlannerTerminology(country),
-    getPublishedOrganicQueryCandidates(country)
+    getPublishedOrganicQueryCandidates(country),
+    getStandaloneExtractedQueryCandidates(country)
   ]);
   const countryVocab = vocabs.find(v => v.country.toLowerCase() === country.toLowerCase());
   // Free signals are candidate vocabulary only. Read stored signals when the
@@ -1795,6 +1861,14 @@ export async function generateCandidateQueriesForCountry(
     organicCandidates,
     freeSignalCandidates,
     demandSignalCandidates,
+    standaloneExtractedCandidates: standaloneExtractedCandidates.map(candidate => ({
+      id: candidate.id,
+      candidateText: candidate.candidateText,
+      language: candidate.language,
+      intent: candidate.intent,
+      confidence: candidate.confidence,
+      sourceTitle: candidate.sourceTitle,
+    })),
     mode,
     scopePromotionBasis: options.scopePromotionBasis
   });
@@ -1822,6 +1896,12 @@ export async function generateCandidateQueriesForCountry(
       primaryTerm: candidate.primaryTerm,
       generationMetadata: candidate.metadata
     }, { history });
+    const extractedCandidateId = Number((candidate.metadata as any)?.extractedCandidateId || 0);
+    if (Number.isSafeInteger(extractedCandidateId) && extractedCandidateId > 0) {
+      await linkExtractedQueryCandidate(extractedCandidateId, record.id).catch(error => {
+        console.warn('[Extracted Query] failed to link candidate to query', { candidateId: extractedCandidateId, queryId: record.id, error: error instanceof Error ? error.message : String(error) });
+      });
+    }
     const aliasOf = candidate.metadata?.aliasOf;
     history.push({
       query: record.query,

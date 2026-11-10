@@ -96,7 +96,7 @@ export const KNOWN_INSTRUMENT_TERMS = [
 ];
 
 export interface LiteralSourceText {
-  kind: 'CHANNEL_NAME' | 'VIDEO_TITLE' | 'DESCRIPTION';
+  kind: 'CHANNEL_NAME' | 'VIDEO_TITLE' | 'DESCRIPTION' | 'PLAYLIST_TITLE' | 'PLAYLIST_DESCRIPTION';
   index: number;
   text: string;
   videoId?: string | null;

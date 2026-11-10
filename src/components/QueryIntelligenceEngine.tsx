@@ -43,6 +43,28 @@ interface QueryIntelligenceSummary {
   executionLogCount: number;
 }
 
+interface ExtractedCandidateLCB {
+  id: number;
+  candidateText: string;
+  sourceKind: string;
+  sourceTitle: string | null;
+  country: string;
+  language: string;
+  script: string;
+  intent: string;
+  confidence: number;
+  decision: 'ACCEPTED' | 'REJECTED';
+  rejectionReasons: string[];
+  standaloneEligible: boolean;
+  duplicateCount: number;
+  collection: string | null;
+  runs: number;
+  quota: number;
+  newChannels: number;
+  qualityCreators: number;
+  createdAt: string;
+}
+
 interface QualityDashboardRun {
   runId: string;
   queryId: number;
@@ -85,6 +107,7 @@ interface QualityDashboard {
 export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }) => {
   const [queries, setQueries] = useState<QueryRecord[]>([]);
   const [terminology, setTerminology] = useState<CanonicalTradingTerm[]>([]);
+  const [extractedCandidates, setExtractedCandidates] = useState<ExtractedCandidateLCB[]>([]);
   const [logs, setLogs] = useState<QueryExecutionLog[]>([]);
   const [summary, setSummary] = useState<QueryIntelligenceSummary | null>(null);
   const [qualityDashboardState, setQualityDashboard] = useState<QualityDashboard | null>(null);
@@ -152,6 +175,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
     const includeQuality = activeTab === 'quality';
     const includeLibrary = activeTab === 'library';
     const includeTerminology = activeTab === 'vocabulary';
+    const includeExtraction = activeTab === 'vocabulary';
     const includeLogs = activeTab === 'logs';
     try {
       const qualityUrl = requestCountry === 'All'
@@ -174,9 +198,12 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
       // must not discard a healthy quality response and show the wrong error.
       // Heavy lists are fetched only for the visible tab; the small summary
       // supplies the tab counts even if a list request fails.
-      const [libRes, terminologyRes, logRes, statusRes, scopeRes, qualityRes] = await Promise.all([
+      const extractionParams = new URLSearchParams({ limit: '50' });
+      if (requestCountry !== 'All') extractionParams.set('country', requestCountry);
+      const [libRes, terminologyRes, extractionRes, logRes, statusRes, scopeRes, qualityRes] = await Promise.all([
         includeLibrary ? apiFetch(`/api/query-intelligence/library?${libraryParams.toString()}`).catch(() => null) : Promise.resolve(null),
         includeTerminology ? apiFetch('/api/query-intelligence/terminology?limit=200').catch(() => null) : Promise.resolve(null),
+        includeExtraction ? apiFetch(`/api/query-intelligence/extracted-candidates?${extractionParams.toString()}`).catch(() => null) : Promise.resolve(null),
         includeLogs ? apiFetch('/api/query-intelligence/logs?limit=50').catch(() => null) : Promise.resolve(null),
         apiFetch('/api/query-intelligence/status').catch(() => null),
         apiFetch('/api/query-intelligence/scope').catch(() => null),
@@ -225,9 +252,10 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
       const read = (response: Response | null) => response?.ok
         ? response.json().catch(() => null)
         : Promise.resolve(null);
-      const [lib, terminologyData, logData, statusData, scopeData] = await Promise.all([
+      const [lib, terminologyData, extractionData, logData, statusData, scopeData] = await Promise.all([
         read(libRes),
         read(terminologyRes),
+        read(extractionRes),
         read(logRes),
         read(statusRes),
         read(scopeRes),
@@ -236,6 +264,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
       if (requestId !== fetchSequence.current) return;
       if (lib) setQueries(lib);
       if (terminologyData) setTerminology(terminologyData);
+      if (extractionData) setExtractedCandidates(extractionData);
       if (logData) setLogs(logData);
       if (statusData) setStatus(statusData);
       if (scopeData) {
@@ -828,6 +857,43 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
         {/* --- SUB-TAB 2: EXTRACTED VOCABULARY --- */}
         {activeSubTab === 'vocabulary' && (
           <div className="space-y-4">
+            <div className="rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900/40 p-3">
+              <div className="flex items-center justify-between gap-3 pb-2">
+                <div>
+                  <h4 className="text-xs font-black text-slate-900 dark:text-white">Extraction LCB — accepted and rejected query candidates</h4>
+                  <p className="text-[10px] text-slate-500">Source title, extraction decision, standalone eligibility and actual discovery/quota outcomes.</p>
+                </div>
+                <span className="text-[10px] font-mono text-slate-500">{extractedCandidates.length} rows</span>
+              </div>
+              <div className="max-h-72 overflow-auto rounded-lg border border-slate-200 dark:border-slate-800">
+                <table className="w-full text-left text-[10px]">
+                  <thead className="sticky top-0 bg-slate-100 dark:bg-slate-800 text-slate-500">
+                    <tr><th className="p-1.5">Candidate</th><th className="p-1.5">Market</th><th className="p-1.5">Decision</th><th className="p-1.5">Standalone</th><th className="p-1.5">Sightings</th><th className="p-1.5">Runs / quota</th><th className="p-1.5">New / quality</th></tr>
+                  </thead>
+                  <tbody>
+                    {extractedCandidates.length === 0 ? (
+                      <tr><td className="p-2 text-slate-500" colSpan={7}>No extraction candidates recorded yet.</td></tr>
+                    ) : extractedCandidates.map(item => (
+                      <tr key={item.id} className="border-t border-slate-100 dark:border-slate-800 align-top">
+                        <td className="p-1.5">
+                          <div className="font-mono font-bold text-slate-800 dark:text-slate-200">{item.candidateText}</div>
+                          {item.sourceTitle && <div className="text-[9px] text-slate-400 truncate max-w-[260px]" title={item.sourceTitle}>Source: {item.sourceTitle}</div>}
+                        </td>
+                        <td className="p-1.5">{item.country}<div className="text-slate-400">{item.language} · {item.script}</div></td>
+                        <td className="p-1.5">
+                          <span className={item.decision === 'ACCEPTED' ? 'text-emerald-600 dark:text-emerald-400 font-bold' : 'text-rose-600 dark:text-rose-400 font-bold'}>{item.decision}</span>
+                          {item.rejectionReasons.length > 0 && <div className="text-[9px] text-rose-500">{item.rejectionReasons.join(', ')}</div>}
+                        </td>
+                        <td className="p-1.5">{item.standaloneEligible ? 'yes' : 'no'}</td>
+                        <td className="p-1.5 font-mono">{item.duplicateCount + 1}</td>
+                        <td className="p-1.5 font-mono">{item.runs} / {item.quota}</td>
+                        <td className="p-1.5 font-mono">{item.newChannels} / {item.qualityCreators}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
             <p className="text-xs text-slate-500 dark:text-slate-400">
               Canonical terminology is learned from durable production evidence. Promotion requires creator and community diversity; search performance is time-decayed and all lifecycle changes remain auditable.
             </p>

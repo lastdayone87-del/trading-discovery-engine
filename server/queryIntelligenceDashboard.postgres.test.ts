@@ -7,6 +7,9 @@ import {
   getVocabularyPage,
   getQueryTerminologyCurrentStatuses,
   persistQueryTerminologyDigest,
+  persistExtractedQueryCandidates,
+  getStandaloneExtractedQueryCandidates,
+  getExtractedQueryCandidates,
   resetQueryIntelligenceSummaryCacheForTests,
 } from './db';
 import { getTerminologyDashboardPage } from './terminologyIntelligence';
@@ -132,4 +135,39 @@ after(async () => {
   if (!databaseUrl) return;
   const db = await getDb();
   await db.end().catch(() => undefined);
+});
+
+
+test('Stage 4 PostgreSQL: extracted query ledger deduplicates and serves accepted standalone candidates', { skip: databaseUrl ? false : 'PHASE4_POSTGRES_URL is required' }, async () => {
+  process.env.DATABASE_URL = databaseUrl!;
+  process.env.PGSSL = 'disable';
+  const db = await getDb();
+  const suffix = `extracted-ledger-${Date.now()}-${process.pid}`;
+  try {
+    const candidate = {
+      candidateKey: `${suffix}-key`,
+      candidateText: 'Weekly trade analysis',
+      normalizedText: 'weekly trade analysis',
+      country: 'United States',
+      language: 'en',
+      script: 'Latn',
+      sourceKind: 'VIDEO_TITLE',
+      sourceChannelId: 'channel-test',
+      sourceVideoId: 'video-test',
+      sourceTitle: 'Weekly trade analysis - promo suffix',
+      intent: 'strategy',
+      confidence: 0.8,
+      accepted: true,
+      standaloneEligible: true,
+      reasons: [],
+    };
+    assert.deepEqual(await persistExtractedQueryCandidates([candidate]), { accepted: 1, rejected: 0, duplicates: 0 });
+    assert.deepEqual(await persistExtractedQueryCandidates([{ ...candidate, sourceChannelId: 'channel-test-2' }]), { accepted: 0, rejected: 0, duplicates: 1 });
+    const standalone = await getStandaloneExtractedQueryCandidates('United States', 50);
+    assert.ok(standalone.some(row => row.candidateKey === candidate.candidateKey));
+    const lcb = await getExtractedQueryCandidates('United States', 100, 0);
+    assert.ok(lcb.some(row => row.candidateKey === candidate.candidateKey));
+  } finally {
+    await db.query('DELETE FROM extracted_query_candidates WHERE candidate_key LIKE $1', [`${suffix}%`]).catch(() => undefined);
+  }
 });

@@ -4,6 +4,7 @@ import type { ExtractedTermRecord, QueryRecord } from '../src/types';
 import { isCountryScriptCompatible, isRetrievalOrientedQuery, limitRepeatedPrimaryTerms, normalizeQuery, planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, queriesOutsideCooldown, queryTokenCount, rotateAwayFromMostRecentIntent } from './queryPlanner';
 import { ORGANIC_QUERY_POLICY_VERSION } from './organicQueryExpansion';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
+import { admitQueryRecord } from './queryQuality/admission';
 
 function query(overrides: Partial<QueryRecord>): QueryRecord {
   return {
@@ -249,6 +250,100 @@ test('planner produces novel local instrument-market variants when every current
   assert.ok(instrumentMarket.length > 0, 'no novel instrument-market fallback was planned');
   assert.ok(instrumentMarket.every(item => /BEL|EURUSD/i.test(item.query)));
   assert.ok(planned.some(item => item.metadata.queryTemplate === 'SINGLE_ATOM'));
+});
+
+test('accepted extracted queries are planned as standalone surfaces and pass admission/authority', () => {
+  const candidate = {
+    id: 9001,
+    candidateText: 'QQQ Entries with Volume Profile',
+    language: 'en',
+    intent: 'strategy',
+    confidence: 0.8,
+    sourceTitle: 'How to Time QQQ Entries with Volume Profile + GEX',
+  };
+  const planned = planDiverseQueries({
+    country: 'United States',
+    count: 8,
+    learnedVocabulary: [],
+    existingQueries: [],
+    standaloneExtractedCandidates: [candidate],
+  });
+  const extracted = planned.find(item => item.metadata.queryTemplate === 'EXTRACTED_STANDALONE');
+  assert.ok(extracted, `no extracted standalone query: ${planned.map(item => `${item.metadata.queryTemplate}:${item.query}`).join(' | ')}`);
+  assert.equal(extracted.query, candidate.candidateText);
+  assert.equal((extracted.metadata as any).extractedCandidateId, candidate.id);
+  const admitted = admitQueryRecord({
+    query: extracted.query,
+    country: 'United States',
+    primary_term: extracted.primaryTerm,
+    generation_metadata: extracted.metadata,
+  });
+  assert.equal(admitted.eligible, true, admitted.reasonCodes.join(','));
+  const authority = evaluateAutonomousQueryAuthority({
+    id: 1,
+    query: extracted.query,
+    country: 'United States',
+    collection: 'EXPERIMENTAL',
+    intent: extracted.intent,
+    times_executed: 0,
+    total_channels_found: 0,
+    unique_channels_found: 0,
+    quality_channels_found: 0,
+    community_channels_found: 0,
+    avg_quality_score: 0,
+    performance_score: 0,
+    created_at: '2026-08-01T00:00:00.000Z',
+    status: 'ACTIVE',
+    primary_term: extracted.primaryTerm,
+    generation_metadata: extracted.metadata,
+  });
+  assert.equal(authority.eligible, true, authority.reasonCodes.join(','));
+});
+
+test('non-Latin extracted standalone queries plan, admit and keep execution authority', () => {
+  const candidate = {
+    id: 9002,
+    candidateText: 'தங்கம் விலை பகுப்பாய்வு',
+    language: 'ta',
+    intent: 'market_analysis',
+    confidence: 0.8,
+    sourceTitle: 'தங்கம் விலை பகுப்பாய்வு',
+  };
+  const planned = planDiverseQueries({
+    country: 'Singapore',
+    count: 8,
+    learnedVocabulary: [],
+    existingQueries: [],
+    standaloneExtractedCandidates: [candidate],
+  });
+  const extracted = planned.find(item => item.metadata.queryTemplate === 'EXTRACTED_STANDALONE');
+  assert.ok(extracted, `no native extracted standalone query: ${planned.map(item => `${item.metadata.queryTemplate}:${item.query}`).join(' | ')}`);
+  const admitted = admitQueryRecord({
+    query: extracted.query,
+    country: 'Singapore',
+    primary_term: extracted.primaryTerm,
+    generation_metadata: extracted.metadata,
+  });
+  assert.equal(admitted.eligible, true, admitted.reasonCodes.join(','));
+  const authority = evaluateAutonomousQueryAuthority({
+    id: 2,
+    query: extracted.query,
+    country: 'Singapore',
+    collection: 'EXPERIMENTAL',
+    intent: extracted.intent,
+    times_executed: 0,
+    total_channels_found: 0,
+    unique_channels_found: 0,
+    quality_channels_found: 0,
+    community_channels_found: 0,
+    avg_quality_score: 0,
+    performance_score: 0,
+    created_at: '2026-08-01T00:00:00.000Z',
+    status: 'ACTIVE',
+    primary_term: extracted.primaryTerm,
+    generation_metadata: extracted.metadata,
+  });
+  assert.equal(authority.eligible, true, authority.reasonCodes.join(','));
 });
 
 test('ambiguous short modifiers are not used by frontier target fallback', () => {
