@@ -229,7 +229,7 @@ function containsNativeToken(text: string, token: string): boolean {
   if (/\p{Script=Arabic}/u.test(token)) {
     // Arabic attaches articles/particles (الذهب, للسوق, للتداول) but arbitrary
     // substrings such as التسوق ("shopping") must not match سوق.
-    return new RegExp(`(?<![\\p{L}\\p{N}])(?:ال|لل|بال|كال|فال|وال|و|ف|ب|ل|ك)?${escaped}(?:يات|تان|ات|ين|ون|ان|ية|ها|هم|هن|كم|نا|ك)?(?![\\p{L}\\p{N}])`, 'iu').test(text);
+    return new RegExp(`(?<![\\p{L}\\p{N}])(?:ال|لل|بال|كال|فال|وال|و|ف|ب|ل|ك)?${escaped}(?:يات|تان|ات|ين|ون|ان|ية)?(?![\\p{L}\\p{N}])`, 'iu').test(text);
   }
   // Hangul is spaced: require a real word boundary and rely on explicit
   // compounds (주식거래, 주식시장) instead of matching 주식 inside 주식회사.
