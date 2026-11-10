@@ -113,8 +113,8 @@ test('Vietnamese-specific character set excludes French-shared diacritics', () =
   }
 });
 
-test('Nepali content never votes Hindi', () => {
-  assert.equal(voteVideoDescriptionLanguage(NE_VETO), null);
+test('Nepali content never votes Hindi and votes Nepali only with corroboration', () => {
+  assert.equal(voteVideoDescriptionLanguage(NE_VETO), 'Nepali');
   assert.equal(voteVideoDescriptionLanguage(NE_SCRIPT_ONLY), null);
 });
 
@@ -122,16 +122,31 @@ test('Devanagari script alone never votes Hindi', () => {
   assert.equal(voteVideoDescriptionLanguage(DEVANAGARI_ONLY), null);
 });
 
-test('approved language map covers exactly the five eligible languages', () => {
-  assert.deepEqual(Object.keys(AGGREGATED_CONTENT_LANGUAGES).sort(), ['Bengali', 'Hindi', 'Tagalog', 'Urdu', 'Vietnamese']);
+test('approved language map covers the eligible excluded-country languages', () => {
+  assert.deepEqual(Object.keys(AGGREGATED_CONTENT_LANGUAGES).sort(), ['Bengali', 'Gujarati', 'Hindi', 'Kannada', 'Malayalam', 'Marathi', 'Nepali', 'Punjabi', 'Sinhala', 'Tagalog', 'Telugu', 'Urdu', 'Vietnamese']);
   assert.deepEqual(AGGREGATED_CONTENT_LANGUAGES.Bengali.countries, ['Bangladesh', 'India']);
   assert.deepEqual(AGGREGATED_CONTENT_LANGUAGES.Urdu.countries, ['Pakistan', 'India']);
   // Hindi maps to India only: Nepali is distinguished by evidence, never
   // blurred into the candidate set.
   assert.deepEqual(AGGREGATED_CONTENT_LANGUAGES.Hindi.countries, ['India']);
-  // Shared-script guardrails stay data-driven on the Hindi entry.
+  // Shared-script guardrails stay data-driven on the Hindi/Marathi/Nepali
+  // Devanagari entries.
   assert.equal(AGGREGATED_CONTENT_LANGUAGES.Hindi.scriptNeedsCorroboration, true);
   assert.ok((AGGREGATED_CONTENT_LANGUAGES.Hindi.vetoWords || []).length > 0);
+  assert.equal(AGGREGATED_CONTENT_LANGUAGES.Marathi.scriptNeedsCorroboration, true);
+  assert.equal(AGGREGATED_CONTENT_LANGUAGES.Nepali.scriptNeedsCorroboration, true);
+  assert.deepEqual(AGGREGATED_CONTENT_LANGUAGES.Gujarati.countries, ['India']);
+  assert.deepEqual(AGGREGATED_CONTENT_LANGUAGES.Telugu.countries, ['India']);
+  assert.deepEqual(AGGREGATED_CONTENT_LANGUAGES.Punjabi.countries, ['India', 'Pakistan']);
+});
+
+test('the bio is appended without evicting the tenth video from the mixed-language guard', () => {
+  const aggregated = aggregateContentLanguage(
+    [...Array.from({ length: 8 }, () => VI), ...Array.from({ length: 2 }, () => HI)],
+    [],
+    { additionalSamples: [VI] },
+  );
+  assert.equal(aggregated, null, 'two Hindi videos must still block Vietnamese rejection after adding the bio');
 });
 
 test('every map entry is rejection-capable on its own: countries plus at least one signal group', () => {
@@ -279,8 +294,9 @@ test('playlist-adapter observations are non-authoritative by construction', () =
 test('Gate 1 threads description provenance at every validation call', () => {
   const source = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
   const matches = source.match(/videoDescriptionsAuthoritative:\s*candidate\.videoDescriptionsAuthoritative/g) || [];
-  // Three validateChannelCountry calls plus the Gate-2 classifier input.
-  assert.equal(matches.length, 4);
+  // One shared validateCountryWithHydration builder (Gate 1, hydration, and
+  // public-about), the DEFER country check, and the Gate-2 classifier input.
+  assert.equal(matches.length, 3);
 });
 
 test('channel enrichment produces the authoritative recent-channel sample', () => {

@@ -1623,7 +1623,19 @@ export async function reconcileClassificationSighting(input: {
   return result.rowCount || 0;
 }
 
-export interface UpsertChannelOptions { preserveDiscordOnUpdate?: boolean; allowDiscordClear?: boolean; freshDiscordValidation?: boolean; requireCountrySnapshot?: CountryPolicySnapshot }
+export interface UpsertChannelOptions {
+  preserveDiscordOnUpdate?: boolean;
+  allowDiscordClear?: boolean;
+  freshDiscordValidation?: boolean;
+  requireCountrySnapshot?: CountryPolicySnapshot;
+  /** Refuse the write when a concurrent decision changed these projections. */
+  requireStatusSnapshot?: {
+    country?: string | null;
+    country_status?: string | null;
+    scan_status?: string | null;
+    trading_status?: string | null;
+  };
+}
 
 export async function upsertChannelWithResult(channel: ChannelRecord, options?: UpsertChannelOptions): Promise<boolean> {
   const db = await getDb();
@@ -1653,6 +1665,17 @@ export async function upsertChannelWithResult(channel: ChannelRecord, options?: 
       await client.query('COMMIT');
       return false;
     }
+    if (options?.requireStatusSnapshot && locked) {
+      const expected = options.requireStatusSnapshot;
+      const changed = (expected.country !== undefined && String(locked.country || '') !== String(expected.country || ''))
+        || (expected.country_status !== undefined && String(locked.country_status || '') !== String(expected.country_status || ''))
+        || (expected.scan_status !== undefined && String(locked.scan_status || '') !== String(expected.scan_status || ''))
+        || (expected.trading_status !== undefined && String(locked.trading_status || '') !== String(expected.trading_status || ''));
+      if (changed) {
+        await client.query('COMMIT');
+        return false;
+      }
+    }
     const preserveDiscord = options?.preserveDiscordOnUpdate === true
       || shouldRetainLockedDiscordProjection(channel, locked, options);
     if (preserveDiscord && locked) {
@@ -1678,7 +1701,7 @@ export async function upsertChannelWithResult(channel: ChannelRecord, options?: 
 }
 
 /** Compatibility wrapper for callers that only need the write side effect. */
-export async function upsertChannel(channel: ChannelRecord, options?: Omit<UpsertChannelOptions, 'requireCountrySnapshot'>): Promise<void> {
+export async function upsertChannel(channel: ChannelRecord, options?: Omit<UpsertChannelOptions, 'requireCountrySnapshot' | 'requireStatusSnapshot'>): Promise<void> {
   await upsertChannelWithResult(channel, options);
 }
 

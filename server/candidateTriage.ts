@@ -2,99 +2,29 @@ import type { DiscoverySource } from '../src/types';
 import type { VerificationDecision } from './evidenceEngine';
 import type { DiscoveredChannelRaw } from './youtube';
 import { uncoveredFailedProviders } from './enrichmentOperationalFailure';
+import {
+  assessIntakeTradingFocus,
+  hasCoveredNonLatinScript,
+  INTAKE_TRADING_FOCUS_POLICY_VERSION,
+  type IntakeTradingFocusAssessment,
+} from './intakeTradingFocus';
 
-// v5 adds the precision-first Latin-market finance lexicon. The version must
-// move with any triage decision change so the frozen benchmark gate detects
-// drift instead of silently accepting different candidate admissions.
-export const CANDIDATE_TRIAGE_POLICY_VERSION = 'candidate-triage-v5-latin-market-finance';
+export { hasCoveredNonLatinScript };
 
-export type SearchCandidateTriageDisposition = 'PLAUSIBLE_TRADING_HYPOTHESIS' | 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS' | 'NOT_APPLICABLE';
+// v6 replaces the non-Latin blanket admission with an evidence-based
+// ADMIT/WITHHOLD/DEFER assessment shared by the inline and durable paths.
+export const CANDIDATE_TRIAGE_POLICY_VERSION = 'candidate-triage-v6-intake-trading-focus';
+
+export type SearchCandidateTriageDisposition =
+  | 'PLAUSIBLE_TRADING_HYPOTHESIS'
+  | 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS'
+  | 'DEFER_NO_CONFIDENT_EVIDENCE'
+  | 'NOT_APPLICABLE';
 
 export interface SearchCandidateTriageDecision {
   disposition: SearchCandidateTriageDisposition;
   reasonCodes: string[];
   matchedSignals: string[];
-}
-
-/**
- * High-specificity trading signals are strong enough to establish a cheap
- * retrieval hypothesis by themselves. They describe trading activity/methods,
- * rather than merely naming a financial product that can occur in unrelated
- * content.
- */
-const HIGH_SPECIFICITY_TRADING_SIGNALS: Array<[string, RegExp]> = [
-  ['TRADING_LITERAL', /\b(trading|trader|day\s*trading|swing\s*trading|intraday|scalping|scalper)\b/iu],
-  ['TECHNICAL_METHOD', /\b(technical\s*analysis|price\s*action|order\s*flow|footprint|market\s*structure|volume\s*profile|liquidity\s*sweep|fair\s*value\s*gap|smart\s*money|ict\b|smc\b)\b/iu],
-  ['TRADING_VENUE_OR_PROGRAM', /\b(fx\s*trading|futures?\s*trading|options?\s*trading|cfd\s*trading|spread\s*betting|prop\s*firm|funded\s*trader)\b/iu],
-  ['LOCAL_TECHNICAL_ANALYSIS', /\b(analyse\s*technique|analisi\s*tecnica|an[aá]lisis\s*t[eé]cnico|technische\s*analyse|teknisk\s*analys|teknisk\s*analyse|b[oö]rsen?analyse|beursanalyse|aktiehandel|daghandel|futuros\s*trading|opciones\s*trading)\b/iu],
-  ['JAPANESE_TRADING', /(トレード|デイトレード|先物取引|テクニカル分析|板読み|オーダーフロー)/u],
-  // C1b precision-first Latin-market lexicon. Generic "market"/"trade" is
-  // deliberately absent: a shared Latin script does not make an unrelated
-  // creator a trading hypothesis. These are high-specificity finance terms in
-  // production market languages.
-  // Bare `bolsa`/`borsa` are ordinary words (handbag, stock exchange) and
-  // must not admit an unrelated creator before the soft-negative check.
-  // `borsa di <anything>` also matches ordinary Italian ("borsa di studio",
-  // scholarship), so only named exchanges qualify as a high-specificity signal.
-  // Bare French `bourse` (scholarship, purse) and Dutch `beurs` (trade fair,
-  // purse) are equally ambiguous, so only qualified market phrases qualify.
-  ['LATIN_MARKET_FINANCE', /\b(börse|aandelen|aktien|aktiehandel|aksjer|aksjehandel|osakkeet|osakekaupank[aä]ynti|børs|borsen|gielda|giełda|bolsa\s+de\s+valores|borsa\s+italiana|borsa\s+di\s+(?:milano|tokyo|londra|new\s+york|francoforte|parigi|madrid|zurigo|hong\s+kong)|mercado\s*de\s*valores|investir\s*en\s*bourse|bourse\s+(?:en\s*ligne|de\s*paris|de\s*bruxelles|de\s*luxembourg|de(?:s)?\s*valeurs?)|analyse\s*boursi[eè]re|cours\s*de\s*bourse|march[eé]\s*boursier|trading\s*boursier|beurs\s*(?:analyse|handel|nieuws|beleggen|strategie|video'?s?)|aandelenbeurs|effectenbeurs|beursbeleggen|beurshandel|analyse\s*technique|analisi\s*tecnica|an[aá]lisis\s*t[eé]cnico|piano\s*di\s*trading|plan\s*de\s*trading|plan\s*de\s*inversi[oó]n)\b/iu]
-];
-
-/**
- * Market/product names are useful corroboration but are deliberately weaker.
- * Words such as "options", "shares", "futures" and "crypto" are polysemous
- * and must not independently turn an unrelated creator into a trading candidate.
- */
-const MARKET_CONTEXT_SIGNALS: Array<[string, RegExp]> = [
-  ['FOREX_MARKET', /\b(forex|eurusd|gbpusd|usdcad|audusd|nzdusd|usdchf|usdjpy)\b/iu],
-  ['DERIVATIVES_MARKET', /\b(futures?|options?|0dte|cfd)\b/iu],
-  ['EQUITY_MARKET', /\b(stocks?|equities|shares?|nasdaq|s&p\s*500|sp500|dax(?:\s*40)?|cac\s*40|ftse\s*100|ibex\s*35|aex|bel\s*20|smi|omx(?:c25|s30)?|tsx(?:\s*60)?|asx(?:\s*200)?)\b/iu],
-  ['CRYPTO_MARKET', /\b(crypto|bitcoin|ethereum|btc|eth)\b/iu],
-  ['FUTURES_CONTRACT', /\b(nq\s*futures?|es\s*futures?)\b/iu]
-];
-
-/** Strong domain contradictions. These beat accidental market-word matches. */
-const HARD_NON_TRADING_SIGNALS: Array<[string, RegExp]> = [
-  ['GAMING', /\b(gameplay|walkthrough|playthrough|minecraft|roblox|fortnite|valorant|league\s*of\s*legends|gta\s*v|gta\s*5|call\s*of\s*duty|pokemon|pokémon|genshin|esports?|gaming\s*channel)\b/iu],
-  ['COOKING_RECIPES', /\b(recipe|recipes|cooking|kitchen|bake|baking|chef|cuisine|mukbang|delicious\s*food|street\s*food)\b/iu],
-  ['MUSIC_ARTIST', /\b(official\s*music\s*video|music\s*video|official\s*audio|lyrics?|lyric\s*video|album|single|singer|song|musician|record\s*label|clip\s*officiel|chanson|artiste|zouk)\b/iu],
-  ['BEAUTY_ENTERTAINMENT', /\b(celebrity\s*gossip|makeup\s*tutorial|beauty\s*vlog|toy\s*review)\b/iu],
-  ['GENERIC_PERSONAL_FINANCE', /\b(personal\s*finance|budgeting|credit\s*card\s*points|save\s*money|paying\s*off\s*debt|mortgage\s*calculator)\b/iu]
-];
-
-/** Softer format cues are only contradictions when no real trading signal exists. */
-const SOFT_NON_TRADING_SIGNALS: Array<[string, RegExp]> = [
-  ['GENERAL_VLOG', /\b(vlog|vlogging|prank|pranks|unboxing|reaction\s*video)\b/iu]
-];
-
-/**
- * C1b Unicode-script coverage test. Requires at least two letters from one of
- * the scripts the cheap lexical router does not model. Mathematical
- * Alphanumeric Symbols (U+1D400-U+1D7FF) are decorative, not a script, and
- * must not turn an emoji/symbol surface into a covered candidate.
- */
-const NON_LATIN_SCRIPT_PATTERNS: RegExp[] = [
-  /\p{Script=Han}/u, /\p{Script=Hiragana}/u, /\p{Script=Katakana}/u,
-  /\p{Script=Hangul}/u, /\p{Script=Arabic}/u, /\p{Script=Cyrillic}/u,
-  /\p{Script=Hebrew}/u, /\p{Script=Thai}/u, /\p{Script=Devanagari}/u,
-  /\p{Script=Greek}/u, /\p{Script=Kannada}/u,
-  /\p{Script=Bengali}/u, /\p{Script=Tamil}/u, /\p{Script=Telugu}/u,
-  /\p{Script=Malayalam}/u, /\p{Script=Gujarati}/u, /\p{Script=Gurmukhi}/u,
-  /\p{Script=Sinhala}/u, /\p{Script=Khmer}/u, /\p{Script=Lao}/u,
-  /\p{Script=Myanmar}/u, /\p{Script=Georgian}/u, /\p{Script=Armenian}/u,
-  /\p{Script=Ethiopic}/u,
-];
-
-export function hasCoveredNonLatinScript(value: string): boolean {
-  // Strip Mathematical Alphanumeric Symbols before NFKC: normalization would
-  // otherwise fold them into ordinary Greek/Latin letters and defeat the
-  // decorative-symbol exclusion.
-  const normalized = String(value || '').replace(/[\u{1D400}-\u{1D7FF}]/gu, ' ').normalize('NFKC');
-  return NON_LATIN_SCRIPT_PATTERNS.some(pattern => {
-    const matches = normalized.match(new RegExp(pattern.source, 'gu')) || [];
-    return matches.length >= 2;
-  });
 }
 
 function staleMatchedVideo(candidate: DiscoveredChannelRaw, now = Date.now()): boolean {
@@ -107,10 +37,35 @@ function staleMatchedVideo(candidate: DiscoveredChannelRaw, now = Date.now()): b
   return now - publishedAt > maxAgeDays * 86_400_000;
 }
 
+function mapDecision(assessment: IntakeTradingFocusAssessment): SearchCandidateTriageDecision {
+  if (assessment.decision === 'ADMIT') {
+    return {
+      disposition: 'PLAUSIBLE_TRADING_HYPOTHESIS',
+      reasonCodes: assessment.reasonCodes,
+      matchedSignals: assessment.matchedSignals,
+    };
+  }
+  if (assessment.decision === 'DEFER') {
+    return {
+      disposition: 'DEFER_NO_CONFIDENT_EVIDENCE',
+      reasonCodes: assessment.reasonCodes,
+      matchedSignals: assessment.matchedSignals,
+    };
+  }
+  return {
+    disposition: 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS',
+    reasonCodes: assessment.reasonCodes,
+    matchedSignals: assessment.matchedSignals,
+  };
+}
+
 /**
  * Cheap routing-only firewall. Search-match content is never promoted to
  * creator-level evidence; it is used only to decide whether an autonomous
  * result is worth spending additional provider quota on.
+ *
+ * The focus assessment is channel-level: it uses the channel bio plus every
+ * available video title/description, not only the matched search document.
  */
 export function triageAutonomousSearchCandidate(
   candidate: DiscoveredChannelRaw,
@@ -128,7 +83,7 @@ export function triageAutonomousSearchCandidate(
     return {
       disposition: 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS',
       reasonCodes: ['STALE_RETRIEVAL_DOCUMENT', 'DO_NOT_SPEND_ENRICHMENT_QUOTA'],
-      matchedSignals: []
+      matchedSignals: [],
     };
   }
 
@@ -152,90 +107,18 @@ export function triageAutonomousSearchCandidate(
     return {
       disposition: 'PLAUSIBLE_TRADING_HYPOTHESIS',
       reasonCodes: ['RELATIONSHIP_DERIVED_HYPOTHESIS', 'RELATIONSHIP_CORROBORATION_VIA_ENRICHMENT_PASS'],
-      matchedSignals: [`RELATIONSHIP_${relationship.kind.toUpperCase()}`, `RELATIONSHIP_DEPTH_${relationship.depth}`]
+      matchedSignals: [`RELATIONSHIP_${relationship.kind.toUpperCase()}`, `RELATIONSHIP_DEPTH_${relationship.depth}`],
     };
   }
 
-  const retrievalText = [
-    candidate.channelName,
-    candidate.matchedDocument?.title,
-    candidate.matchedDocument?.description
-  ].filter(Boolean).join(' ').normalize('NFKC');
-
-  const highSpecificity = HIGH_SPECIFICITY_TRADING_SIGNALS.filter(([, pattern]) => pattern.test(retrievalText)).map(([name]) => name);
-  const marketContext = MARKET_CONTEXT_SIGNALS.filter(([, pattern]) => pattern.test(retrievalText)).map(([name]) => name);
-  const hardNegative = HARD_NON_TRADING_SIGNALS.filter(([, pattern]) => pattern.test(retrievalText)).map(([name]) => name);
-  const softNegative = SOFT_NON_TRADING_SIGNALS.filter(([, pattern]) => pattern.test(retrievalText)).map(([name]) => name);
-
-  // Dominant unrelated-domain evidence wins over accidental finance vocabulary.
-  // This is the key admission boundary that prevents artist/gaming/recipe hits
-  // containing words such as "options" or "shares" from entering the canonical
-  // creator pipeline and consuming enrichment/Discord quota.
-  if (hardNegative.length) {
-    return {
-      disposition: 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS',
-      reasonCodes: [
-        highSpecificity.length ? 'CONFLICTING_RETRIEVAL_DOMAINS' : 'EXPLICIT_NON_TRADING_DOMAIN_DETECTED',
-        // Retained compatibility alias for existing audit consumers/tests.
-        'EXPLICIT_NON_TRADING_SIGNAL_DETECTED',
-        'DO_NOT_SPEND_ENRICHMENT_QUOTA'
-      ],
-      matchedSignals: [...hardNegative, ...highSpecificity, ...marketContext]
-    };
-  }
-
-  if (highSpecificity.length) {
-    return {
-      disposition: 'PLAUSIBLE_TRADING_HYPOTHESIS',
-      reasonCodes: [
-        'RETRIEVAL_DOCUMENT_HAS_HIGH_SPECIFICITY_TRADING_SIGNAL',
-        // Retained compatibility alias for existing audit consumers/tests.
-        'RETRIEVAL_DOCUMENT_HAS_EXPLICIT_TRADING_SIGNAL'
-      ],
-      matchedSignals: [...highSpecificity, ...marketContext]
-    };
-  }
-
-  // Multiple independent market-context families can establish a bounded
-  // hypothesis (for example NQ futures + options), but one broad product word
-  // alone is intentionally insufficient for canonical admission.
-  if (new Set(marketContext).size >= 2 && !softNegative.length) {
-    return {
-      disposition: 'PLAUSIBLE_TRADING_HYPOTHESIS',
-      reasonCodes: ['MULTIPLE_MARKET_CONTEXT_SIGNALS_CORROBORATE_RETRIEVAL'],
-      matchedSignals: marketContext
-    };
-  }
-
-  // C1b: a single broad market word or soft format cue is still ambiguous.
-  // The retrieval document is provenance, not evidence, so it cannot by
-  // itself authorize enrichment spend. Covered non-Latin scripts keep the
-  // conservative route because this cheap router cannot classify them.
-  if (marketContext.length || softNegative.length) {
-    return {
-      disposition: 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS',
-      reasonCodes: [
-        'AMBIGUOUS_RETRIEVAL_CONTEXT',
-        'ROUTE_TO_UNCERTAIN',
-        'DO_NOT_SPEND_ENRICHMENT_QUOTA'
-      ],
-      matchedSignals: [...marketContext, ...softNegative]
-    };
-  }
-
-  if (hasCoveredNonLatinScript(retrievalText)) {
-    return {
-      disposition: 'PLAUSIBLE_TRADING_HYPOTHESIS',
-      reasonCodes: ['NON_LATIN_ROUTING_COVERAGE_CONSERVATIVE_PASS'],
-      matchedSignals: []
-    };
-  }
-
-  return {
-    disposition: 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS',
-    reasonCodes: ['NO_EXPLICIT_TRADING_SIGNAL_IN_RETRIEVAL_DOCUMENT', 'DO_NOT_SPEND_ENRICHMENT_QUOTA'],
-    matchedSignals: []
-  };
+  const assessment = assessIntakeTradingFocus({
+    channelName: candidate.channelName,
+    description: candidate.description,
+    matchedDocument: candidate.matchedDocument,
+    videoTitles: candidate.videoTitles,
+    videoDescriptions: candidate.videoDescriptions,
+  });
+  return mapDecision(assessment);
 }
 
 /**
@@ -282,9 +165,33 @@ export function observeKeywordBaseline(
   source: DiscoverySource = 'automated_query',
 ): { baseline: KeywordBaseline; reasonCodes: string[] } {
   const { relationshipProvenance: _ignored, ...unmarked } = candidate;
-  const decision = triageAutonomousSearchCandidate(unmarked as DiscoveredChannelRaw, source, false);
+  // The baseline describes the old retrieval-document funnel: channel name +
+  // matched document only. Channel bio and video fields were not part of that
+  // predicate and must not change the observational comparison.
+  const decision = triageAutonomousSearchCandidate({
+    ...(unmarked as DiscoveredChannelRaw),
+    description: '',
+    videoTitles: [],
+    videoDescriptions: [],
+  }, source, false);
+  const retrievalText = [
+    unmarked.channelName,
+    unmarked.matchedDocument?.title,
+    unmarked.matchedDocument?.description,
+  ].filter((value): value is string => typeof value === 'string' && value.trim().length > 0).join(' ');
+  // v6 stopped auto-admitting non-Latin retrieval text. The observational
+  // baseline must still describe the old funnel, which did admit it.
+  const pureNonLatinDefer = decision.disposition === 'DEFER_NO_CONFIDENT_EVIDENCE'
+    && decision.reasonCodes.includes('NON_LATIN_INSUFFICIENT_TRADING_EVIDENCE')
+    && !decision.reasonCodes.includes('CONFLICTING_TRADING_AND_UNRELATED_EVIDENCE');
+  if (pureNonLatinDefer && hasCoveredNonLatinScript(retrievalText)) {
+    return { baseline: 'WOULD_ADMIT', reasonCodes: ['LEGACY_NON_LATIN_COVERAGE_PASS'] };
+  }
   return {
     baseline: decision.disposition === 'PLAUSIBLE_TRADING_HYPOTHESIS' ? 'WOULD_ADMIT' : 'WOULD_WITHHOLD',
     reasonCodes: decision.reasonCodes,
   };
 }
+
+/** Shared policy version for admission audits. */
+export { INTAKE_TRADING_FOCUS_POLICY_VERSION };
