@@ -403,3 +403,13 @@ test('a repeated broker referral footer with a promotion does not create focus',
   });
   assert.equal(routed.route, 'SEMANTIC_TRADING');
 });
+
+test('LEGACY routing returns the legacy route vocabulary', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'TRADING_CONFIRMED', confidenceScore: 90,
+  }), { mode: 'LEGACY' });
+  assert.equal(routed.route, 'SEMANTIC_TRADING');
+  assert.deepEqual(routed.reasonCodes, ['LEGACY_ROUTING']);
+  const nonTrading = resolveClassificationRouting(decision({ status: 'NON_TRADING', confidenceScore: 10 }), { mode: 'LEGACY' });
+  assert.equal(nonTrading.route, 'SEMANTIC_NON_TRADING');
+});
