@@ -49,8 +49,12 @@ export interface ExtractedQueryAssessment {
 const PROMO_PATTERNS: RegExp[] = [
   /\b(free\s+(signals?|money|course|group|access|training|webinar)|gratis|gratuit|kostenlos|gratuita)\b/iu,
   /\b(subscribe|abonne|abonnieren|suscr[ií]bete|rejoindre|beitreten|follow me|join (my|our|the) (group|channel|telegram|discord))\b/iu,
+  /\b(follow\s+(me|us|for|to)|like\s+(and|this|for)|join\s+(now|us|for|my|our|the))\b/iu,
   /\b(telegram|whatsapp|discord|link in bio|giveaway|promo|discount|offer)\b/iu,
   /\b(episode|ep|part|pt|vol|volume|season|saison|temporada|staffel)\s*#?\d+/iu,
+  // Two-part dates require two-digit day/month so prices such as 1.5 or
+  // ranges such as 20-30 are not misclassified as promotional dates.
+  /\b(?:0[1-9]|[12]\d|3[01])[\/-](?:0[1-9]|1[0-2])\b/u,
   /\b(?:0?[1-9]|[12]\d|3[01])[\/.-](?:0?[1-9]|1[0-2])[\/.-]\d{2,4}\b/u,
   /\b(20\d{2})\b/u,
   // Native promotional markers matter most on unspaced scripts, where the
@@ -62,7 +66,7 @@ const CLICKBAIT_PATTERNS: RegExp[] = [
   /[!]{2,}/u,
   /\b(uh oh|oh no|wait for it)\b/iu,
 ];
-const CTA_FORMAT = /\b(click|watch|download|notification|bell|button|shorts?|reels?|vlog|podcast|interview)\b/iu;
+const CTA_FORMAT = /\b(click|watch|download|notification|bell|button|shorts|reels|vlog|podcast|interview)\b/iu;
 const EMOJI_OR_SYMBOL = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{200D}]/u;
 const EMOJI_OR_SYMBOL_GLOBAL = new RegExp(EMOJI_OR_SYMBOL.source, 'gu');
 const LEADING_STOPWORDS = new Set([

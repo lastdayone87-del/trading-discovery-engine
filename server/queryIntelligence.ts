@@ -1051,6 +1051,7 @@ Return ONLY a valid JSON object with format:
         sources: literalSources,
         baseline,
         language: languageContext?.language,
+        country: channel.country,
         ruleObserved,
       });
     // Daily AI extraction budget: one logical call per channel/metadata/day,

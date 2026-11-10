@@ -203,7 +203,14 @@ export function evaluateAutonomousQueryAuthority(
   const specificity = metadata.retrievalSpecificity as Record<string, any> | undefined;
   const atoms = Array.isArray(metadata.atoms) ? metadata.atoms as Array<Record<string, any>> : [];
   const template = String(metadata.queryTemplate || '');
-  const extractedStandalone = template === 'EXTRACTED_STANDALONE' && atoms.length === 1;
+  // The template alone is not provenance. Require the planner-stamped marker
+  // and a positive ledger candidate id before granting the semantic bypass.
+  const extractedCandidateId = Number(metadata.extractedCandidateId || 0);
+  const extractedStandalone = template === 'EXTRACTED_STANDALONE'
+    && atoms.length === 1
+    && metadata.extractedStandalone === true
+    && Number.isSafeInteger(extractedCandidateId)
+    && extractedCandidateId > 0;
   const shapeOk = extractedStandalone
     ? !isForbiddenProseQuery(query.query)
       && isExtractedStandaloneQuery({ term: query.query, country: query.country, language: typeof metadata.extractedCandidateLanguage === 'string' ? metadata.extractedCandidateLanguage : undefined })

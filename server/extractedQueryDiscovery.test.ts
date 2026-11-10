@@ -75,6 +75,18 @@ test('nuisance-only titles and promo fragments are rejected before the ledger', 
     text: '1.5 extension trading strategy', country: 'United States', language: 'en',
     sourceKind: 'VIDEO_TITLE', sourceIndex: 0, sourceTitle: '1.5 extension trading strategy',
   }));
+  assert.ok(assessExtractedQueryCandidate({
+    text: 'short selling strategy', country: 'United States', language: 'en',
+    sourceKind: 'VIDEO_TITLE', sourceIndex: 0, sourceTitle: 'short selling strategy',
+  }));
+  assert.equal(assessExtractedQueryCandidate({
+    text: 'Follow for trading signals', country: 'United States', language: 'en',
+    sourceKind: 'VIDEO_TITLE', sourceIndex: 0, sourceTitle: 'Follow for trading signals',
+  }), null);
+  assert.equal(assessExtractedQueryCandidate({
+    text: 'DAX Analyse 12/05', country: 'Germany', language: 'de',
+    sourceKind: 'VIDEO_TITLE', sourceIndex: 0, sourceTitle: 'DAX Analyse 12/05',
+  }), null);
 });
 
 test('ambiguous single words do not turn everyday titles into searches', () => {

@@ -298,6 +298,14 @@ test('accepted extracted queries are planned as standalone surfaces and pass adm
     generation_metadata: extracted.metadata,
   });
   assert.equal(authority.eligible, true, authority.reasonCodes.join(','));
+  const forged = evaluateAutonomousQueryAuthority(query({
+    id: 3,
+    query: extracted.query,
+    country: 'United States',
+    generation_metadata: { ...extracted.metadata, extractedCandidateId: undefined },
+  }));
+  assert.equal(forged.eligible, false);
+  assert.ok(forged.reasonCodes.includes('CURRENT_RETRIEVAL_SHAPE_FAILED'), forged.reasonCodes.join(','));
   const blockedProse = planDiverseQueries({
     country: 'United States',
     count: 8,
