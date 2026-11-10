@@ -741,6 +741,8 @@ export interface VocabularyAdmissibilityContext {
   baseline: NoveltyBaseline;
   language?: string;
   country?: string;
+  /** False when the creator may supply observations but not discovery terms. */
+  queryCandidatesEligible?: boolean;
   ruleObserved: Set<string>;
 }
 
@@ -766,6 +768,7 @@ export function isAdmissibleParsed(
       })
   );
   if (vocabularyAdmissible) return true;
+  if (ctx.queryCandidatesEligible === false) return false;
   // The queries bucket has its own shape/intent/grounding rules. A literal but
   // unusable query (for example "live") must not suppress provider fallback.
   // An admissible query-only response is still useful: the caller persists it
@@ -972,6 +975,11 @@ export async function extractVocabularyFromCreator(
   // Playlists are complementary context only. A channel with no video titles
   // must not begin discovery from playlist text alone.
   const effectivePlaylists = selectComplementaryPlaylists(effTitles, playlists);
+  // Below-quality creators may contribute observations, but their text must
+  // not become discovery queries. The same flag also keeps query-only provider
+  // responses from suppressing Gemini fallback for an unusable bucket.
+  const queryCandidatesEligible = options?.promotionEligible !== false
+    && options?.persistLegacyTerm !== false;
   // Literal sources are built before any provider attempt. Playlist titles and
   // descriptions are first-class context candidates, never separate shadow
   // inputs: they pass the same literal-span, quality and standalone gates.
@@ -995,14 +1003,16 @@ export async function extractVocabularyFromCreator(
     ]);
     rejectedQueryCandidates.clear();
   };
-  const deterministicQueryCandidates = deriveDeterministicQueryCandidates({
-    sources: extractedSources,
-    country: channel.country,
-    language: languageContext?.language,
-    maxCandidates: 30,
-    onRejected: collectRejection,
-  });
-  await persistCandidates(deterministicQueryCandidates);
+  const deterministicQueryCandidates = queryCandidatesEligible
+    ? deriveDeterministicQueryCandidates({
+        sources: extractedSources,
+        country: channel.country,
+        language: languageContext?.language,
+        maxCandidates: 30,
+        onRejected: collectRejection,
+      })
+    : [];
+  if (queryCandidatesEligible) await persistCandidates(deterministicQueryCandidates);
   // Groq runs on its own key configuration: only the Gemini fallback is
   // gated on the Gemini client.
   if (hasNativeExtractionText(channel.channel_name, effTitles, effDesc)) {
@@ -1052,6 +1062,7 @@ Return ONLY a valid JSON object with format:
         baseline,
         language: languageContext?.language,
         country: channel.country,
+        queryCandidatesEligible,
         ruleObserved,
       });
     // Daily AI extraction budget: one logical call per channel/metadata/day,
@@ -1281,15 +1292,17 @@ Return ONLY a valid JSON object with format:
             return getExtractedVocabulary(channel.country);
           }
         }
-        const llmQueryCandidates = assessLlmQueryCandidates({
-          queries: Array.isArray(parsed.queries) ? parsed.queries : [],
-          sources: extractedSources,
-          country: channel.country,
-          language: languageContext?.language,
-          maxCandidates: 30,
-          onRejected: collectRejection,
-        });
-        await persistCandidates(llmQueryCandidates);
+        const llmQueryCandidates = queryCandidatesEligible
+          ? assessLlmQueryCandidates({
+              queries: Array.isArray(parsed.queries) ? parsed.queries : [],
+              sources: extractedSources,
+              country: channel.country,
+              language: languageContext?.language,
+              maxCandidates: 30,
+              onRejected: collectRejection,
+            })
+          : [];
+        if (queryCandidatesEligible) await persistCandidates(llmQueryCandidates);
         await admitNativeCandidates({
           channel,
           sources: literalSources,
@@ -1904,8 +1917,11 @@ export async function generateCandidateQueriesForCountry(
     }
     pendingExtractedCandidates.push(candidate);
   }
-  if (pendingExtractedCandidates.length) {
-    await markExtractedQueryCandidatesAttempted(pendingExtractedCandidates.map(candidate => candidate.id)).catch(error => {
+  // Only the bounded offer is marked attempted. Unoffered rows stay fresh for
+  // the next batch instead of waiting out the rotation cooldown.
+  const extractedOffer = pendingExtractedCandidates.slice(0, Math.max(0, Math.floor(count * 0.4)));
+  if (extractedOffer.length) {
+    await markExtractedQueryCandidatesAttempted(extractedOffer.map(candidate => candidate.id)).catch(error => {
       console.warn('[Extracted Query] failed to record planner attempt', error instanceof Error ? error.message : String(error));
     });
   }
@@ -1946,7 +1962,7 @@ export async function generateCandidateQueriesForCountry(
     organicCandidates,
     freeSignalCandidates,
     demandSignalCandidates,
-    standaloneExtractedCandidates: pendingExtractedCandidates.map(candidate => ({
+    standaloneExtractedCandidates: extractedOffer.map(candidate => ({
       id: candidate.id,
       candidateText: candidate.candidateText,
       language: candidate.language,

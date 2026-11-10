@@ -114,6 +114,10 @@ const SCRIPT_INTENT_TOKENS: Array<{ script: RegExp; tokens: string[] }> = [
       '股票', '股市', '交易', '策略', '分析', '黄金', '外匯', '外汇', '期貨', '期货', '比特幣', '比特币',
       '加密', '市場', '市场', '趨勢', '趋势', '支撐', '支撑', '阻力', '投資', '投资', '基金', '期權', '期权',
       '港股', '美股', '行情', 'K線', 'K线', '技術分析', '技术分析', '短線', '短线', '波段',
+      // Kanji-only Japanese surfaces share Han; include their finance terms so
+      // titles such as 日経225先物 are not rejected before language detection.
+      '日経', '先物', '相場', '株', '投資', '戦略', '見方', '日足', '時間足', '板', '注文',
+      '証券', '為替', '金利', '指数', '銘柄', 'チャート',
     ],
   },
   {

@@ -216,6 +216,12 @@ test('non-Latin native scripts pass intent and preserve their script', () => {
     country: 'Japan', language: 'ja',
   });
   assert.ok(shortJapanese.some(candidate => candidate.candidateText === '板読み'));
+
+  const kanjiOnly = deriveDeterministicQueryCandidates({
+    sources: video('日経225先物'),
+    country: 'Japan', language: 'ja',
+  });
+  assert.ok(kanjiOnly.some(candidate => candidate.candidateText === '日経225先物'));
 });
 
 test('LLM candidates use the same deterministic gate and duplicates merge', () => {

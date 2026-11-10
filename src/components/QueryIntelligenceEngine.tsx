@@ -906,7 +906,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
               <div className="max-h-72 overflow-auto rounded-lg border border-slate-200 dark:border-slate-800">
                 <table className="w-full text-left text-[10px]">
                   <thead className="sticky top-0 bg-slate-100 dark:bg-slate-800 text-slate-500">
-                    <tr><th className="p-1.5">Candidate</th><th className="p-1.5">Market</th><th className="p-1.5">Decision</th><th className="p-1.5">Standalone</th><th className="p-1.5">Sightings</th><th className="p-1.5">Runs / quota</th><th className="p-1.5">New / quality</th></tr>
+                    <tr><th className="p-1.5">Candidate</th><th className="p-1.5">Market</th><th className="p-1.5">Decision</th><th className="p-1.5">Standalone</th><th className="p-1.5">Sightings (sample)</th><th className="p-1.5">Runs / quota</th><th className="p-1.5">New / quality</th></tr>
                   </thead>
                   <tbody>
                     {extractedCandidatesError ? (

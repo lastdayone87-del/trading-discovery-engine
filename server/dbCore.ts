@@ -2219,14 +2219,19 @@ export async function persistExtractedQueryCandidates(
          candidate_key,country,language,script,candidate_text,normalized_text,source_kind,source_channel_id,source_video_id,source_title,intent,confidence,decision,rejection_reasons,standalone_eligible,duplicate_sources
        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16::jsonb)
        ON CONFLICT (country, language, candidate_key) DO UPDATE SET
-         duplicate_count=CASE WHEN extracted_query_candidates.duplicate_sources @> EXCLUDED.duplicate_sources
-           THEN extracted_query_candidates.duplicate_count
-           ELSE extracted_query_candidates.duplicate_count+1 END,
-         -- Retain a bounded sample of distinct sightings; the counter remains exact.
+         duplicate_count=CASE
+           WHEN extracted_query_candidates.duplicate_sources @> EXCLUDED.duplicate_sources
+             THEN extracted_query_candidates.duplicate_count
+           WHEN jsonb_array_length(extracted_query_candidates.duplicate_sources) < 20
+             THEN extracted_query_candidates.duplicate_count+1
+           ELSE extracted_query_candidates.duplicate_count
+         END,
+         -- The counter tracks the bounded distinct-source sample, so an
+         -- identity beyond the cap cannot inflate retries as new sightings.
          duplicate_sources=CASE
            WHEN extracted_query_candidates.duplicate_sources @> EXCLUDED.duplicate_sources
              THEN extracted_query_candidates.duplicate_sources
-           WHEN extracted_query_candidates.duplicate_count < 20
+           WHEN jsonb_array_length(extracted_query_candidates.duplicate_sources) < 20
              THEN extracted_query_candidates.duplicate_sources || EXCLUDED.duplicate_sources
            ELSE extracted_query_candidates.duplicate_sources
          END,

@@ -827,6 +827,10 @@ test('admissibility gate requires admission-passable candidates', () => {
   const queryCtx = admissibilityContext({ country: 'Germany' });
   assert.equal(isAdmissibleParsed({ queries: ['live'] }, queryCtx), false);
   assert.equal(isAdmissibleParsed({ queries: ['DAX Analyse'] }, queryCtx), true);
+  assert.equal(isAdmissibleParsed(
+    { queries: ['DAX Analyse'] },
+    admissibilityContext({ country: 'Germany', queryCandidatesEligible: false }),
+  ), false);
   // Not literally present: classifier rejects as non-literal.
   assert.equal(isAdmissibleParsed({ terminology: ['NonexistentTermXYZ'] }, ctx), false);
   // Too short for admission.
