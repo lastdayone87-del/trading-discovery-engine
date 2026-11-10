@@ -125,7 +125,7 @@ test('an enrichment pass stops scheduling the stage it already ran', () => {
   assert.equal(isEnrichmentStageExhausted(false, 2, 2), false);
 });
 
-test('an active enrichment pass may classify a row a stale projection marked completed', () => {
+test('ingestion pipeline wires the active-enrichment preservation exception', () => {
   const pipeline = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
   assert.match(pipeline, /allowActiveEnrichmentClassification: isEnrichmentPass === true && existing\.trading_status === 'UNCERTAIN'/);
 });
