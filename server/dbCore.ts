@@ -1513,9 +1513,13 @@ export async function enqueueClassificationJobAtomic(
   channelId: string,
   payload: any,
   opts: Parameters<typeof enqueueJob>[2] = {},
+  deps: { client?: any } = {},
 ): Promise<DurableJob | null> {
-  const client = opts.clientOverride || await (await getDb()).connect();
-  const ownsClient = !opts.clientOverride;
+  // The helper owns the transaction. `deps.client` exists only so tests can
+  // drive the locking/admission branches; production callers must not pass a
+  // client that is already inside a caller-owned transaction.
+  const client = deps.client || await (await getDb()).connect();
+  const ownsClient = !deps.client;
   try {
     await client.query('BEGIN');
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`classification-admit:${channelId}`]);

@@ -174,8 +174,7 @@ test('atomic classification admission locks, rechecks, and inserts one job', asy
     priority: 1,
     maxAttempts: 4,
     idempotencyKey: 'classify:chan-1:2026-11-10',
-    clientOverride: client as any,
-  });
+  }, { client });
   assert.equal(job?.status, 'PENDING');
   assert.ok(calls.some(call => call.text.includes('pg_advisory_xact_lock')));
   assert.ok(calls.some(call => call.text.includes('SELECT 1 FROM jobs')));
@@ -189,8 +188,7 @@ test('atomic classification admission refuses while another classification is ac
     priority: 1,
     maxAttempts: 4,
     idempotencyKey: 'classify:chan-1:2026-11-10',
-    clientOverride: client as any,
-  });
+  }, { client });
   assert.equal(job, null);
   assert.equal(calls.filter(call => call.text.includes('INSERT INTO jobs')).length, 0);
 });
