@@ -498,11 +498,19 @@ export function buildCrawlThroughputReport(
     (max, bucket) => Math.max(max, bucket.browserCrawls),
     0,
   );
-  const observedBrowserCrawlsPerHour = Math.round((totals.browserCrawls / elapsedHours) * 100) / 100;
+  // Gate on the raw values. Rounding first lets 39.996/h display as 40.00 and
+  // pass the nominal gate, and 33.325% display as 33.33 and pass a 33.33 floor.
+  const rawObservedBrowserCrawlsPerHour = totals.browserCrawls / elapsedHours;
+  const observedBrowserCrawlsPerHour = Math.round(rawObservedBrowserCrawlsPerHour * 100) / 100;
   const discoverySharePct = totals.discoverySharePct;
-  const nominalTargetMet = totals.browserCrawls > 0 && observedBrowserCrawlsPerHour >= nominalTargetPerHour;
+  const rawDiscoverySharePct = totals.browserCrawls > 0
+    ? (totals.discoveryBrowserCrawls / totals.browserCrawls) * 100
+    : null;
+  const nominalTargetMet = totals.browserCrawls > 0
+    && rawObservedBrowserCrawlsPerHour >= nominalTargetPerHour;
   const emergencyCeilingExceeded = peakBrowserCrawlsPerHour > emergencyCeilingPerHour;
-  const discoveryFloorMet = discoverySharePct !== null && discoverySharePct >= discoveryFloorPct;
+  const discoveryFloorMet = rawDiscoverySharePct !== null
+    && rawDiscoverySharePct >= discoveryFloorPct;
 
   const failures: string[] = [];
   if (totals.browserCrawls === 0) {

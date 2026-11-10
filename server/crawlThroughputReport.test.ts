@@ -300,6 +300,37 @@ test('window start is the exact first UTC hour bucket', () => {
   );
 });
 
+test('a sub-target rate cannot round up into the nominal gate', () => {
+  // 40 crawls over 1.0001 elapsed hours = 39.996/h, which displays as 40.00.
+  const report = buildCrawlThroughputReport([
+    row('2026-11-10T11:30:00.000Z', 'DISCOVERY', 'ACQUIRED', { renderedCrawls: 40 }),
+  ], {
+    windowHours: 2,
+    now: new Date('2026-11-10T12:00:00.360Z'),
+  });
+
+  assert.equal(report.gates.elapsedHours, 1);
+  assert.equal(report.gates.observedBrowserCrawlsPerHour, 40);
+  assert.equal(report.gates.nominalTargetMet, false);
+  assert.ok(report.failures.includes('browser_crawls_per_hour_below_nominal_target'));
+});
+
+test('a sub-floor discovery share cannot round up into the floor', () => {
+  // 1333 / 4000 = 33.325%, which displays as 33.33.
+  const report = buildCrawlThroughputReport([
+    row('2026-11-10T11:30:00.000Z', 'DISCOVERY', 'ACQUIRED', { renderedCrawls: 1333 }),
+    row('2026-11-10T11:31:00.000Z', 'RETRY', 'ACQUIRED', { renderedCrawls: 2667 }),
+  ], {
+    windowHours: 1,
+    now: new Date('2026-11-10T11:59:00.000Z'),
+    discoveryFloorPct: 33.33,
+  });
+
+  assert.equal(report.gates.discoverySharePct, 33.33);
+  assert.equal(report.gates.discoveryFloorMet, false);
+  assert.ok(report.failures.includes('discovery_share_below_floor'));
+});
+
 test('the report keeps the approved Option C thresholds', () => {
   assert.equal(PHASE2_NOMINAL_CRAWLS_PER_HOUR, 40);
   assert.equal(PHASE2_EMERGENCY_CRAWLS_PER_HOUR, 48);
