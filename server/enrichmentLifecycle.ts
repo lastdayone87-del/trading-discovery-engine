@@ -24,10 +24,12 @@ export function resolveUncertainLifecycle(wantsHumanReview: boolean, eligibility
 
 
 /**
- * A completed enrichment job is durable evidence that the work already ran.
+ * A terminal enrichment job is durable evidence that the work already ran.
  * When a later rediscovery is blocked from reopening it, the channel must not
- * remain ENRICHMENT_PENDING with no runnable job. Active scan states collapse
- * to COMPLETED; terminal/review states are preserved verbatim.
+ * remain ENRICHMENT_PENDING with no runnable job. A blocked COMPLETED job
+ * projects COMPLETED; a blocked FAILED job projects FAILED. Terminal/review
+ * states are preserved verbatim, and an active owner elsewhere keeps the
+ * pending marker.
  */
 export function resolveEnrichmentReopenBlockedLifecycle(
   channel: Pick<ChannelRecord, 'scan_status' | 'trading_status'>,

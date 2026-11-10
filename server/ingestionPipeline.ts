@@ -986,95 +986,95 @@ async function processChannelThroughPipelineInContext(
           if(refreshed)Object.assign(authoritativeChannel,refreshed);
         }
       }else{
-      const vitality=deriveVitalityScheduling(productionClassification.input.activity_metadata,productionClassification.decision.timestamp),priority=10+vitality.jobPriorityDelta,payload={ channelId: candidate.channelId, targetCountry, source, candidate, enrichmentStage:nextStage, quotaOrigin: currentOfficialYouTubeQuotaOrigin() === 'PROBE' ? 'PROBE' : 'NORMAL', evidenceAcquisitionDecisionId:evidencePlan?.decisionId, evidenceAction:appliedAction, vitalityScheduling:vitality };
-      // Ordinary rediscovery must not turn completed enrichment back into
-      // PENDING or create a second job beside active work. The stable
-      // channel/stage identity makes enqueue naturally idempotent across day
-      // boundaries; preventCompletedReopen keeps completed work terminal while
-      // still allowing a FAILED job to retry. Explicit rechecks use a fresh
-      // recheck key and are never blocked by an earlier completed pass.
-      const explicitRecheck=isManualScan||source==='recheck';
-      const enrichmentKey=enrichmentJobIdempotencyKey(candidate.channelId,nextStage,Date.now(),{explicitRecheck,recheckNonce:explicitRecheck?randomUUID():undefined});
-      const enqueueEnrichment=(extra?:Record<string,unknown>)=>enqueueJob('ENRICH_CHANNEL',extra?{...payload,...extra}:payload,{priority,maxAttempts:4,idempotencyKey:enrichmentKey,...(explicitRecheck?{}:{preventCompletedReopen:true})});
-      // Recover a failed workflow owner: restore its step before reopening the
-      // stable job so the worker keeps investigation tracking. If admission is
-      // refused or the enqueue fails, put the blocked projection back.
-      const enqueueWorkflowRetry=async(failed:{id:string},investigationId:string,stepId:string)=>{
-        let retryLinkage:Record<string,unknown>|undefined;
-        if(investigationId&&stepId){
-          try{if(await retryInvestigationStep({investigationId,stepId}))retryLinkage={investigationId,investigationStepId:stepId};}
-          catch(error){console.warn(`[Investigation] Failed to reopen step for ${candidate.channelId}; retrying without workflow linkage:`,error instanceof Error?error.message:error);}
-        }
-        try{
-          const job=await enqueueEnrichment(retryLinkage);
-          if(retryLinkage&&job?.reopen_blocked===true){
-            await restoreBlockedInvestigationStep({investigationId,stepId,jobId:failed.id,reason:'RETRY_NOT_ADMITTED'})
-              .catch(error=>console.warn(`[Investigation] Failed to restore blocked step for ${candidate.channelId}:`,error instanceof Error?error.message:error));
+        const vitality=deriveVitalityScheduling(productionClassification.input.activity_metadata,productionClassification.decision.timestamp),priority=10+vitality.jobPriorityDelta,payload={ channelId: candidate.channelId, targetCountry, source, candidate, enrichmentStage:nextStage, quotaOrigin: currentOfficialYouTubeQuotaOrigin() === 'PROBE' ? 'PROBE' : 'NORMAL', evidenceAcquisitionDecisionId:evidencePlan?.decisionId, evidenceAction:appliedAction, vitalityScheduling:vitality };
+        // Ordinary rediscovery must not turn completed enrichment back into
+        // PENDING or create a second job beside active work. The stable
+        // channel/stage identity makes enqueue naturally idempotent across day
+        // boundaries; preventCompletedReopen keeps completed work terminal while
+        // still allowing a FAILED job to retry. Explicit rechecks use a fresh
+        // recheck key and are never blocked by an earlier completed pass.
+        const explicitRecheck=isManualScan||source==='recheck';
+        const enrichmentKey=enrichmentJobIdempotencyKey(candidate.channelId,nextStage,Date.now(),{explicitRecheck,recheckNonce:explicitRecheck?randomUUID():undefined});
+        const enqueueEnrichment=(extra?:Record<string,unknown>)=>enqueueJob('ENRICH_CHANNEL',extra?{...payload,...extra}:payload,{priority,maxAttempts:4,idempotencyKey:enrichmentKey,...(explicitRecheck?{}:{preventCompletedReopen:true})});
+        // Recover a failed workflow owner: restore its step before reopening the
+        // stable job so the worker keeps investigation tracking. If admission is
+        // refused or the enqueue fails, put the blocked projection back.
+        const enqueueWorkflowRetry=async(failed:{id:string},investigationId:string,stepId:string)=>{
+          let retryLinkage:Record<string,unknown>|undefined;
+          if(investigationId&&stepId){
+            try{if(await retryInvestigationStep({investigationId,stepId}))retryLinkage={investigationId,investigationStepId:stepId};}
+            catch(error){console.warn(`[Investigation] Failed to reopen step for ${candidate.channelId}; retrying without workflow linkage:`,error instanceof Error?error.message:error);}
           }
-          return job;
-        }catch(error){
-          if(retryLinkage){
-            await restoreBlockedInvestigationStep({investigationId,stepId,jobId:failed.id,reason:'RETRY_ENQUEUE_FAILED'})
-              .catch(restoreError=>console.warn(`[Investigation] Failed to restore blocked step for ${candidate.channelId}:`,restoreError instanceof Error?restoreError.message:restoreError));
+          try{
+            const job=await enqueueEnrichment(retryLinkage);
+            if(retryLinkage&&job?.reopen_blocked===true){
+              await restoreBlockedInvestigationStep({investigationId,stepId,jobId:failed.id,reason:'RETRY_NOT_ADMITTED'})
+                .catch(error=>console.warn(`[Investigation] Failed to restore blocked step for ${candidate.channelId}:`,error instanceof Error?error.message:error));
+            }
+            return job;
+          }catch(error){
+            if(retryLinkage){
+              await restoreBlockedInvestigationStep({investigationId,stepId,jobId:failed.id,reason:'RETRY_ENQUEUE_FAILED'})
+                .catch(restoreError=>console.warn(`[Investigation] Failed to restore blocked step for ${candidate.channelId}:`,restoreError instanceof Error?restoreError.message:restoreError));
+            }
+            throw error;
           }
-          throw error;
+        };
+        const scheduleWorkflowOwner=async()=>{
+          const scheduled=await scheduleInvestigationStep({investigationId:candidate.investigationId,channelId:candidate.channelId,diagnosticId:classificationDiagnosticId,actionType:appliedAction,jobType:'ENRICH_CHANNEL',jobPayload:payload,priority,maxAttempts:4,idempotencyKey:enrichmentKey,policyVersion:INVESTIGATION_POLICY_VERSION,utilityContractVersion:'utility-constraints-v1',deadlineMinutes:Number(await getAppSetting('investigation_deadline_minutes','30'))||30});
+          // A failed owner needs its step restored before the job reopen. An
+          // already-claimed owner cannot accept a step and is reused through the
+          // idempotent queue path; a completed owner drives the blocked lifecycle
+          // projection.
+          if(scheduled.job.status==='FAILED')return enqueueWorkflowRetry(scheduled.job,scheduled.investigationId,scheduled.stepId);
+          if(!scheduled.stepId||scheduled.job.status!=='PENDING')return enqueueEnrichment();
+          return undefined;
+        };
+        const workflowAssignment=await assignRelease5Serving('INVESTIGATION_WORKFLOW',candidate.channelId).catch(()=>({assigned:false,mode:'OFF'})),legacyWorkflowEnabled=await getAppSetting('investigation_workflow_enabled','false')==='true';
+        let enqueued: Awaited<ReturnType<typeof enqueueJob>> | undefined;
+        if(workflowAssignment.assigned||legacyWorkflowEnabled){
+          // The workflow lane must reuse the stable channel/stage owner instead
+          // of scheduling a second job under a per-classification key. An
+          // existing active job already owns the work, a completed one is
+          // terminal, and failed work retries through the ordinary reopen path.
+          let existing: Awaited<ReturnType<typeof getJobByIdempotencyKey>> = null,lookupFailed=false;
+          if(!explicitRecheck){
+            try{existing=await getJobByIdempotencyKey(enrichmentKey);}
+            catch(error){lookupFailed=true;console.warn(`[Investigation] Stable enrichment lookup failed for ${candidate.channelId}; using the idempotent queue path:`,error instanceof Error?error.message:error);}
+          }
+          const admission=resolveExistingEnrichmentAction(explicitRecheck?null:existing?.status,lookupFailed);
+          if(admission==='REUSE_ACTIVE'&&existing)enqueued=existing;
+          else if(admission==='PROJECT_TERMINAL'&&existing)enqueued={...existing,reopen_blocked:true};
+          else if(admission==='RETRY_FAILED'&&existing){
+            enqueued=await enqueueWorkflowRetry(existing,String(existing.payload?.investigationId||''),String(existing.payload?.investigationStepId||''));
+          }
+          else if(admission==='ENQUEUE_IDEMPOTENT'){
+            // The stable-key read failed, but the scheduler can still find and
+            // restore a failed workflow owner. Fall back to the idempotent queue
+            // only when scheduling itself fails.
+            try{enqueued=await scheduleWorkflowOwner();}
+            catch(error){if(candidate.investigationId)throw error;console.error(`[Investigation] Lookup-recovery scheduling failed for ${candidate.channelId}; using compatible queue fallback.`,error);enqueued=await enqueueEnrichment();}
+          }
+          else{
+            try{enqueued=await scheduleWorkflowOwner();}
+            catch(error){if(candidate.investigationId)throw error;console.error(`[Investigation] Initial transactional scheduling failed for ${candidate.channelId}; using compatible queue fallback.`,error);enqueued=await enqueueEnrichment();}
+          }
+        }else enqueued=await enqueueEnrichment();
+        if(enqueued?.reopen_blocked===true){
+          // The stable same-stage pass is already terminal. Project the honest
+          // terminal state, but update only the committed row's scan status so
+          // a concurrent recovery/recheck cannot be overwritten by this stale
+          // snapshot. The same UPDATE excludes a later-stage active job in one
+          // statement, which narrows the race to a job committed after that
+          // statement's snapshot. A worker that still owns the channel will
+          // reassert its marker; no separate read can orphan the pending row.
+          // A blocked FAILED job is FAILED, never COMPLETED.
+          const blocked=resolveEnrichmentReopenBlockedLifecycle(authoritativeChannel,{blockedJobStatus:enqueued.status,hasOtherActiveEnrichmentJob:false});
+          if(blocked.scanStatus!==authoritativeChannel.scan_status){
+            const refreshed=await projectBlockedEnrichmentScanStatus(candidate.channelId,blocked.scanStatus,now,options?.jobId);
+            if(refreshed)Object.assign(authoritativeChannel,refreshed);
+          }
         }
-      };
-      const scheduleWorkflowOwner=async()=>{
-        const scheduled=await scheduleInvestigationStep({investigationId:candidate.investigationId,channelId:candidate.channelId,diagnosticId:classificationDiagnosticId,actionType:appliedAction,jobType:'ENRICH_CHANNEL',jobPayload:payload,priority,maxAttempts:4,idempotencyKey:enrichmentKey,policyVersion:INVESTIGATION_POLICY_VERSION,utilityContractVersion:'utility-constraints-v1',deadlineMinutes:Number(await getAppSetting('investigation_deadline_minutes','30'))||30});
-        // A failed owner needs its step restored before the job reopen. An
-        // already-claimed owner cannot accept a step and is reused through the
-        // idempotent queue path; a completed owner drives the blocked lifecycle
-        // projection.
-        if(scheduled.job.status==='FAILED')return enqueueWorkflowRetry(scheduled.job,scheduled.investigationId,scheduled.stepId);
-        if(!scheduled.stepId||scheduled.job.status!=='PENDING')return enqueueEnrichment();
-        return undefined;
-      };
-      const workflowAssignment=await assignRelease5Serving('INVESTIGATION_WORKFLOW',candidate.channelId).catch(()=>({assigned:false,mode:'OFF'})),legacyWorkflowEnabled=await getAppSetting('investigation_workflow_enabled','false')==='true';
-      let enqueued: Awaited<ReturnType<typeof enqueueJob>> | undefined;
-      if(workflowAssignment.assigned||legacyWorkflowEnabled){
-        // The workflow lane must reuse the stable channel/stage owner instead
-        // of scheduling a second job under a per-classification key. An
-        // existing active job already owns the work, a completed one is
-        // terminal, and failed work retries through the ordinary reopen path.
-        let existing: Awaited<ReturnType<typeof getJobByIdempotencyKey>> = null,lookupFailed=false;
-        if(!explicitRecheck){
-          try{existing=await getJobByIdempotencyKey(enrichmentKey);}
-          catch(error){lookupFailed=true;console.warn(`[Investigation] Stable enrichment lookup failed for ${candidate.channelId}; using the idempotent queue path:`,error instanceof Error?error.message:error);}
-        }
-        const admission=resolveExistingEnrichmentAction(explicitRecheck?null:existing?.status,lookupFailed);
-        if(admission==='REUSE_ACTIVE'&&existing)enqueued=existing;
-        else if(admission==='PROJECT_TERMINAL'&&existing)enqueued={...existing,reopen_blocked:true};
-        else if(admission==='RETRY_FAILED'&&existing){
-          enqueued=await enqueueWorkflowRetry(existing,String(existing.payload?.investigationId||''),String(existing.payload?.investigationStepId||''));
-        }
-        else if(admission==='ENQUEUE_IDEMPOTENT'){
-          // The stable-key read failed, but the scheduler can still find and
-          // restore a failed workflow owner. Fall back to the idempotent queue
-          // only when scheduling itself fails.
-          try{enqueued=await scheduleWorkflowOwner();}
-          catch(error){if(candidate.investigationId)throw error;console.error(`[Investigation] Lookup-recovery scheduling failed for ${candidate.channelId}; using compatible queue fallback.`,error);enqueued=await enqueueEnrichment();}
-        }
-        else{
-          try{enqueued=await scheduleWorkflowOwner();}
-          catch(error){if(candidate.investigationId)throw error;console.error(`[Investigation] Initial transactional scheduling failed for ${candidate.channelId}; using compatible queue fallback.`,error);enqueued=await enqueueEnrichment();}
-        }
-      }else enqueued=await enqueueEnrichment();
-      if(enqueued?.reopen_blocked===true){
-        // The stable same-stage pass is already terminal. Project the honest
-        // terminal state, but update only the committed row's scan status so
-        // a concurrent recovery/recheck cannot be overwritten by this stale
-        // snapshot. The same UPDATE excludes a later-stage active job in one
-        // statement, which narrows the race to a job committed after that
-        // statement's snapshot. A worker that still owns the channel will
-        // reassert its marker; no separate read can orphan the pending row.
-        // A blocked FAILED job is FAILED, never COMPLETED.
-        const blocked=resolveEnrichmentReopenBlockedLifecycle(authoritativeChannel,{blockedJobStatus:enqueued.status,hasOtherActiveEnrichmentJob:false});
-        if(blocked.scanStatus!==authoritativeChannel.scan_status){
-          const refreshed=await projectBlockedEnrichmentScanStatus(candidate.channelId,blocked.scanStatus,now,options?.jobId);
-          if(refreshed)Object.assign(authoritativeChannel,refreshed);
-        }
-      }
       }
     }
 
