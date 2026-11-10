@@ -49,6 +49,9 @@ test('review console paginates without reloading on selection and shows creation
   assert.match(ui, /selectedRef/);
   assert.match(ui, /selectedRef\.current === target/);
   assert.match(ui, /if \(!loaded\) return/);
+  assert.match(ui, /selectChannel/);
+  assert.match(ui, /catalogError/);
+  assert.match(ui, /bundleRequest\.current \+= 1/);
   assert.match(ui, /loadBundle\(selected\)/);
   assert.match(ui, /queue\.find\(item => item\.channelId === selected\)/);
   assert.doesNotMatch(ui, /\|\| bundle\?\.review/);

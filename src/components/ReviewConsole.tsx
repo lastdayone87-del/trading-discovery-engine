@@ -72,6 +72,7 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
   const [country, setCountry] = useState('');
   const [catalog, setCatalog] = useState<Record<string, Array<{ code: string; label: string }>>>({});
   const [catalogVersion, setCatalogVersion] = useState('');
+  const [catalogError, setCatalogError] = useState<string | null>(null);
   const [action, setAction] = useState<'APPROVE' | 'REJECT'>('APPROVE');
   const [reasonCode, setReasonCode] = useState('');
   const [notes, setNotes] = useState('');
@@ -112,8 +113,9 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
       const data = await reasonCatalog();
       setCatalog(data.actions || {});
       setCatalogVersion(data.version || '');
+      setCatalogError(null);
     } catch {
-      // The queue still works; the decision form reports the missing catalog.
+      setCatalogError('The governed review-reason catalog is unavailable; refresh before deciding.');
     }
   }, []);
 
@@ -139,6 +141,19 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
       setLoadingBundle(false);
     }
   }, []);
+
+  const selectChannel = useCallback((channelId: string) => {
+    if (channelId === selectedRef.current) {
+      void loadBundle(channelId);
+      return;
+    }
+    // Clear immediately so the previous channel's evidence cannot be submitted
+    // while the new bundle is loading.
+    bundleRequest.current += 1;
+    setBundle(null);
+    setSelected(channelId);
+    setLoadingBundle(true);
+  }, [loadBundle]);
 
   const refreshConsole = useCallback(async () => {
     const target = selectedRef.current;
@@ -234,7 +249,7 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
           {queue.length === 0 && !loading && <div className="p-4 text-xs text-slate-500">No pending reviews.</div>}
           <div className="max-h-[65vh] overflow-auto divide-y divide-slate-100 dark:divide-slate-800">
             {queue.map(item => (
-              <button key={item.channelId} onClick={() => setSelected(item.channelId)} className={`w-full text-left p-3 hover:bg-slate-50 dark:hover:bg-slate-800/60 ${selected === item.channelId ? 'bg-indigo-50 dark:bg-indigo-950/30' : ''}`}>
+              <button key={item.channelId} onClick={() => selectChannel(item.channelId)} className={`w-full text-left p-3 hover:bg-slate-50 dark:hover:bg-slate-800/60 ${selected === item.channelId ? 'bg-indigo-50 dark:bg-indigo-950/30' : ''}`}>
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-semibold text-slate-900 dark:text-white truncate">{item.channelName}</span>
                   <ChevronRight className="w-3.5 h-3.5 ml-auto text-slate-400" />
@@ -395,6 +410,7 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
                   </button>
                 </div>
               </div>
+              {catalogError && <div className="mt-2 text-[11px] text-amber-600">{catalogError}</div>}
               <div className="text-[10px] text-slate-400 mt-2">Reviewer identity and authorization come from the existing operator session. Decisions are immutable and version-checked.</div>
             </Section>
           </>
