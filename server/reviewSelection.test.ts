@@ -14,4 +14,7 @@ test('a missing pinned lineage blocks the decision',()=>{
   assert.equal(reviewEvidenceIsDecidable({ warnings: [] }), true);
   assert.equal(reviewEvidenceIsDecidable({ warnings: ['ELIGIBILITY_DECISION_NOT_FOUND'] }), false);
   assert.equal(reviewEvidenceIsDecidable({ warnings: ['CLASSIFICATION_DIAGNOSTIC_NOT_FOUND'] }), false);
+  assert.equal(reviewEvidenceIsDecidable({ warnings: ['ELIGIBILITY_DECISION_ID_MISSING'] }), false);
+  assert.equal(reviewEvidenceIsDecidable({ warnings: ['CLASSIFICATION_DIAGNOSTIC_MISSING'] }), false);
+  assert.equal(reviewEvidenceIsDecidable({ warnings: ['ELIGIBILITY_DECISION_MISSING'] }), false);
 });

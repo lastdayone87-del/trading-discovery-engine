@@ -1,11 +1,19 @@
 /** A review decision is only valid for the currently selected pending review. */
 /** A pinned lineage that could not be loaded must not be silently decided. */
+const BLOCKING_LINEAGE_WARNINGS = new Set([
+  'ELIGIBILITY_DECISION_MISSING',
+  'ELIGIBILITY_DECISION_ID_MISSING',
+  'ELIGIBILITY_DECISION_NOT_FOUND',
+  'CLASSIFICATION_DIAGNOSTIC_MISSING',
+  'CLASSIFICATION_DIAGNOSTIC_ID_MISSING',
+  'CLASSIFICATION_DIAGNOSTIC_NOT_FOUND',
+]);
+
 export function reviewEvidenceIsDecidable(
   bundle: { warnings?: string[] } | null,
 ): boolean {
   const warnings = bundle?.warnings || [];
-  return !warnings.includes('ELIGIBILITY_DECISION_NOT_FOUND')
-    && !warnings.includes('CLASSIFICATION_DIAGNOSTIC_NOT_FOUND');
+  return !warnings.some(warning => BLOCKING_LINEAGE_WARNINGS.has(warning));
 }
 
 export function canSubmitReviewForSelection(
