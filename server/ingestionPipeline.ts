@@ -728,6 +728,24 @@ async function processChannelThroughPipelineInContext(
       deferredCountry ? { country: deferredCreatorCountry, status: deferredCountry.status, score: deferredCountry.score } : undefined,
     );
     if (deferredCountry?.status === 'REJECTED' && deferredCreatorCountry) {
+      // Match the main Gate-1 path: an unknown candidate is reported as
+      // rejected without creating a row; only an existing row is projected.
+      if (!existing) {
+        return {
+          channelId: candidate.channelId,
+          channelName: candidate.channelName,
+          isNew: true,
+          wasKnown: false,
+          persisted: false,
+          countryStatus: 'REJECTED',
+          detectedCountry: deferredCreatorCountry,
+          rejectionReason: deferredCountry.rejectionReason,
+          tradingStatus: 'UNCERTAIN',
+          discordStatus: 'NOT_FOUND',
+          discordInvite: null,
+          channelRecord: undefined,
+        };
+      }
       applyGate1CountryRejectionToExisting(intakeChannel, {
         creatorCountry: deferredCreatorCountry,
         score: deferredCountry.score,
