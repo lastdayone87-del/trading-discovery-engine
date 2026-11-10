@@ -1514,8 +1514,8 @@ export async function enqueueClassificationJobAtomic(
   payload: any,
   opts: Parameters<typeof enqueueJob>[2] = {},
 ): Promise<DurableJob | null> {
-  const db = await getDb();
-  const client = await db.connect();
+  const client = opts.clientOverride || await (await getDb()).connect();
+  const ownsClient = !opts.clientOverride;
   try {
     await client.query('BEGIN');
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`classification-admit:${channelId}`]);
@@ -1534,7 +1534,7 @@ export async function enqueueClassificationJobAtomic(
     await client.query('ROLLBACK');
     throw error;
   } finally {
-    client.release();
+    if (ownsClient) client.release();
   }
 }
 
