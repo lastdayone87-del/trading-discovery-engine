@@ -33,6 +33,16 @@ export interface IntakeDeferredReview {
   createdAt: string;
 }
 
+export function deriveMetadataQuality(input: {
+  description?: string | null;
+  videoTitles?: string[] | null;
+  videoDescriptions?: string[] | null;
+}): 'RICH' | 'LIMITED' | 'SPARSE' {
+  const videoCount = Math.max(input.videoTitles?.length || 0, input.videoDescriptions?.length || 0);
+  if (videoCount >= 3 && String(input.description || '').trim().length >= 80) return 'RICH';
+  return videoCount >= 1 ? 'LIMITED' : 'SPARSE';
+}
+
 export interface IntakeDeferredReviewInput {
   channelId: string;
   targetCountry: string;

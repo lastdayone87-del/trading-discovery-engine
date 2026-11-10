@@ -38,7 +38,7 @@ import {assignRelease5Serving} from './release5/rollout';
 import { deterministicUuid, entityChecksum, observeYouTubeChannelEntity, sourceFamilyIdentity } from './entityResolution';
 import { enrichmentOperationalFailure, hasDecisionGradeEvidenceWithoutFailedProviders, manualRecheckDegradedError } from './enrichmentOperationalFailure';
 import { recordAdmissionShadow } from './candidateAdmission/shadowEvaluator';
-import { recordIntakeDeferredReview } from './intakeDeferredReview';
+import { deriveMetadataQuality, recordIntakeDeferredReview } from './intakeDeferredReview';
 import { recordReviewEligibilityShadow } from './reviewEligibility/store';
 import { evaluateReviewEligibilityV2, resolveReviewProviderDegraded } from './reviewEligibility/policy';
 import { shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldPreserveResolvedCountry, shouldRevalidateConfirmedCountry, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
@@ -829,10 +829,11 @@ async function processChannelThroughPipelineInContext(
     const deferredWrite = await upsertChannelWithResult(intakeChannel, existingStatusSnapshot ? { requireStatusSnapshot: existingStatusSnapshot } : undefined);
     const deferred = deferredWrite ? intakeChannel : (await getChannelById(candidate.channelId) || intakeChannel);
     if (retrievalTriage.focus) {
-      const videoCount = Math.max(candidate.videoTitles?.length || 0, candidate.videoDescriptions?.length || 0);
-      const metadataQuality = videoCount >= 3 && (candidate.description?.trim().length || 0) >= 80
-        ? 'RICH'
-        : videoCount >= 1 ? 'LIMITED' : 'SPARSE';
+      const metadataQuality = deriveMetadataQuality({
+        description: candidate.description,
+        videoTitles: candidate.videoTitles,
+        videoDescriptions: candidate.videoDescriptions,
+      });
       await recordIntakeDeferredReview({
         channelId: candidate.channelId,
         targetCountry,

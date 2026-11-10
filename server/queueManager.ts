@@ -159,6 +159,7 @@ import { processFeaturedChannelInspectionJob } from './featuredChannelAdapterWor
 import { processCountryBoundaryReprocessJob } from './countryBoundaryRecovery';
 import { QuotaAllocationExhaustedError } from './quotaCapacity';
 import { assessIntakeTradingFocus } from './intakeTradingFocus';
+import { deriveMetadataQuality } from './intakeDeferredReview';
 import { isGeminiSemanticCooldownActive, isGeminiOrgCooldownActive, isGroqSemanticCooldownActive, isGroqOrgCooldownActive, isGeminiFreeSemanticCooldownActive } from './providerResilience';
 import { shouldUseGroqSemantic, configuredGroqRoutes, groqOrgCooldownRemainingMs, groqRouteOrg } from './evidenceEngine/providers/GroqSemanticProvider';
 import { configuredGeminiRoutes, geminiRouteOrg } from './evidenceEngine/providers/GeminiSemanticProvider';
@@ -1448,6 +1449,57 @@ async function processIntakeDeferredRecheckJob(
       });
       if (!toppedUp) throw new QuotaAllocationExhaustedError('ENRICHMENT');
     }, 'enrichment');
+    // Fresh country evidence from the same bounded fetch must be evaluated
+    // before the trading-focus transition. A newly discovered excluded country
+    // is terminal; a confirmed/likely country is projected into the channel.
+    let recheckCountry: Awaited<ReturnType<typeof validateChannelCountry>> | null = null;
+    try {
+      recheckCountry = await validateChannelCountry({
+        channelName: enriched.channelName,
+        description: enriched.description,
+        videoTitles: enriched.videoTitles,
+        locationTag: enriched.locationTag,
+        externalLinks: enriched.channelLinks,
+        metadataStatus: enriched.countryMetadataStatus,
+        videoDescriptions: enriched.videoDescriptions,
+        videoDescriptionsAuthoritative: enriched.videoDescriptionsAuthoritative,
+        playlists: enriched.playlists,
+      }, targetCountry);
+    } catch (error) {
+      console.warn(`[IntakeRecheck] Country validation failed for ${channelId}; preserving current country evidence:`, error instanceof Error ? error.message : error);
+    }
+    if (recheckCountry?.status === 'REJECTED' && recheckCountry.detectedCreatorCountry) {
+      const rejectedAt = new Date().toISOString();
+      channel.country_status = 'REJECTED';
+      channel.country = recheckCountry.detectedCreatorCountry;
+      channel.confidence_score = recheckCountry.score;
+      channel.scope_eligibility = resolveScopeEligibility(channel.country);
+      channel.scan_status = 'COMPLETED';
+      channel.last_checked = rejectedAt;
+      channel.inspection_trail = [...(channel.inspection_trail || []), {
+        step: 'COUNTRY_VALIDATION',
+        title: `Country Validation (${channel.country})`,
+        status: 'REJECTED',
+        details: recheckCountry.decisionLogs,
+        timestamp: rejectedAt,
+      }];
+      await upsertChannel(channel);
+      await (await getDb()).query(
+        `UPDATE intake_deferred_reviews SET state='SUPERSEDED',next_recheck_at=NULL,updated_at=now()
+         WHERE channel_id=$1 AND state IN ('PENDING','DECIDED')`,
+        [channelId],
+      );
+      await finishQuotaReservation('ENRICH_CHANNEL', job.id, true);
+      reserved = false;
+      await completeJob(job.id);
+      return true;
+    }
+    if (recheckCountry && recheckCountry.detectedCreatorCountry
+      && (recheckCountry.status === 'CONFIRMED' || recheckCountry.status === 'LIKELY')) {
+      channel.country = recheckCountry.detectedCreatorCountry;
+      channel.country_status = recheckCountry.status;
+      channel.confidence_score = recheckCountry.score;
+    }
     const focus = assessIntakeTradingFocus({
       channelName: enriched.channelName,
       description: enriched.description,
@@ -1470,6 +1522,11 @@ async function processIntakeDeferredRecheckJob(
     );
     const priorHash = review.rows[0]?.last_evidence_hash || null;
     const evidenceChanged = priorHash !== evidenceHash;
+    const metadataQuality = deriveMetadataQuality({
+      description: enriched.description,
+      videoTitles: enriched.videoTitles,
+      videoDescriptions: enriched.videoDescriptions,
+    });
     const now = new Date().toISOString();
     const snapshot = {
       system_snapshot: {
@@ -1540,9 +1597,10 @@ async function processIntakeDeferredRecheckJob(
         const projected = await admitClient.query(
           `UPDATE channels
            SET trading_status='UNCERTAIN',scan_status='ENRICHMENT_PENDING',
+               country=$4,country_status=$5,confidence_score=$6,scope_eligibility=$7,
                last_checked=$2,inspection_trail=$3::jsonb,updated_at=now()
            WHERE channel_id=$1 AND scan_status='INTAKE_DEFERRED'`,
-          [channelId, now, JSON.stringify(channel.inspection_trail)],
+          [channelId, now, JSON.stringify(channel.inspection_trail), channel.country, channel.country_status, channel.confidence_score, channel.scope_eligibility || resolveScopeEligibility(channel.country)],
         );
         if (!projected.rowCount) {
           await admitClient.query('ROLLBACK');
@@ -1597,20 +1655,21 @@ async function processIntakeDeferredRecheckJob(
     }
     await (await getDb()).query(
       `INSERT INTO intake_deferred_reviews(
-         channel_id,review_version,state,system_snapshot,evidence_snapshot,recheck_attempts,
-         last_checked_at,next_recheck_at,last_evidence_hash,updated_at
-       ) VALUES($1,1,$2,$3::jsonb,$4::jsonb,$5,$6,$7,$8,now())
+         channel_id,review_version,state,system_snapshot,evidence_snapshot,metadata_quality,
+         recheck_attempts,last_checked_at,next_recheck_at,last_evidence_hash,updated_at
+       ) VALUES($1,1,$2,$3::jsonb,$4::jsonb,$5,$6,$7,$8,$9,now())
        ON CONFLICT(channel_id) DO UPDATE SET
          system_snapshot=excluded.system_snapshot,evidence_snapshot=excluded.evidence_snapshot,
+         metadata_quality=excluded.metadata_quality,
          recheck_attempts=excluded.recheck_attempts,last_checked_at=excluded.last_checked_at,
          next_recheck_at=excluded.next_recheck_at,last_evidence_hash=excluded.last_evidence_hash,
-         review_version=CASE WHEN $9::boolean THEN intake_deferred_reviews.review_version+1
+         review_version=CASE WHEN $10::boolean THEN intake_deferred_reviews.review_version+1
                              ELSE intake_deferred_reviews.review_version END,
          state=CASE WHEN excluded.state='SUPERSEDED' THEN 'SUPERSEDED'
                     WHEN intake_deferred_reviews.state='PENDING' THEN excluded.state
                     ELSE intake_deferred_reviews.state END,
          updated_at=now()`,
-      [channelId, snapshot.state, JSON.stringify(snapshot.system_snapshot), JSON.stringify(snapshot.evidence_snapshot), snapshot.recheck_attempts, now, snapshot.next_recheck_at, evidenceHash, evidenceChanged],
+      [channelId, snapshot.state, JSON.stringify(snapshot.system_snapshot), JSON.stringify(snapshot.evidence_snapshot), metadataQuality, snapshot.recheck_attempts, now, snapshot.next_recheck_at, evidenceHash, evidenceChanged],
     );
     if (focus.decision === 'DEFER' && priorHash && priorHash !== evidenceHash) {
       // A human AMBIGUOUS label is still actionable when the bounded recheck

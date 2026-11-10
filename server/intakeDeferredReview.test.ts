@@ -177,7 +177,7 @@ test('deferred recheck uses the durable ENRICH carrier with bounded stage-1 evid
   assert.match(worker, /units: 2/);
   assert.match(worker, /recheck_attempts: Number\(review\.rows\[0\]\?\.recheck_attempts \|\| 0\) \+ 1/);
   assert.match(worker, /last_evidence_hash/);
-  assert.match(worker, /review_version=CASE WHEN \$9::boolean/);
+  assert.match(worker, /review_version=CASE WHEN \$10::boolean/);
   const gate = worker.indexOf('const storedExclusion = await getCountryExclusion(channel.country)');
   const reserve = worker.indexOf("reserved = await tryReserveQuota({", gate);
   assert.ok(gate >= 0 && reserve > gate, 'country and low-audience gates must run before recheck quota reservation');
@@ -185,9 +185,14 @@ test('deferred recheck uses the durable ENRICH carrier with bounded stage-1 evid
   assert.match(worker, /evaluateLowAudienceGate\(recheckAudience/);
   assert.match(worker, /SKIPPED_LOW_AUDIENCE[\s\S]*state='SUPERSEDED'/);
   assert.match(worker, /clientOverride: admitClient/);
-  const admitCleanup = worker.indexOf("await finishQuotaReservation('ENRICH_CHANNEL', job.id, true)");
+  assert.match(worker, /recheckCountry\?\.status === 'REJECTED'/);
+  assert.match(worker, /metadata_quality=excluded\.metadata_quality/);
+  assert.match(worker, /\$10::boolean/);
+  assert.match(worker, /deriveMetadataQuality\(/);
   const admitRelease = worker.indexOf('admitClient.release()');
-  assert.ok(admitCleanup >= 0 && admitRelease >= 0 && admitRelease < admitCleanup, 'ADMIT cleanup must run after releasing the admission client');
+  const admitSettlement = worker.indexOf('if (admitNeedsSettlement)', admitRelease);
+  const admitCleanup = worker.indexOf("await finishQuotaReservation('ENRICH_CHANNEL', job.id, true)", admitSettlement);
+  assert.ok(admitRelease >= 0 && admitSettlement > admitRelease && admitCleanup > admitSettlement, 'ADMIT cleanup must run after releasing the admission client');
   const audienceLock = worker.indexOf('SELECT 1 FROM intake_deferred_reviews WHERE channel_id=$1 FOR UPDATE');
   const audienceUpdate = worker.indexOf("scan_status='SKIPPED_LOW_AUDIENCE'");
   assert.ok(audienceLock >= 0 && audienceUpdate > audienceLock, 'low-audience review row must be locked before the channel update');
