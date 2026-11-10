@@ -172,12 +172,14 @@ export async function getDb(): Promise<InstanceType<typeof Pool>> {
  * default makes every transaction read-only as defense in depth; callers
  * should still open an explicit REPEATABLE READ READ ONLY snapshot.
  */
-export function createReadOnlyDbPool(): InstanceType<typeof Pool> {
+export function createReadOnlyDbPool(
+  applicationName = 'phase0-url-work-ledger-report',
+): InstanceType<typeof Pool> {
   return new Pool({
     connectionString: requireDatabaseUrl(),
     ssl: postgresSslOptions(),
     max: 1,
-    application_name: 'phase0-url-work-ledger-report',
+    application_name: applicationName,
     options: '-c default_transaction_read_only=on',
   });
 }

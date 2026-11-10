@@ -1,0 +1,73 @@
+name: Phase 2 crawl throughput telemetry
+
+on:
+  pull_request:
+    paths:
+      - 'server/crawlThroughputReport.ts'
+      - 'server/crawlThroughputReport.test.ts'
+      - 'server/crawlThroughputReport.postgres.test.ts'
+      - 'server/acquisitionLaneTelemetry.ts'
+      - 'server/acquisitionLaneTelemetry.test.ts'
+      - 'server/acquisitionLaneTaxonomy.ts'
+      - 'server/acquisitionLaneKeys.ts'
+      - 'server/crawlerTelemetry.ts'
+      - 'server/inspector.ts'
+      - 'server/queueManager.ts'
+      - 'scripts/phase2CrawlThroughputReport.ts'
+      - 'server/db/migrations/**'
+      - 'server/db.ts'
+      - 'server/dbCore.ts'
+      - 'scripts/runMigrations.ts'
+      - 'Dockerfile'
+      - '.env.example'
+      - 'docs/phase-2-crawl-throughput.md'
+      - 'docs/operations-capacity-defaults.md'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
+      - '.github/workflows/phase2-crawl-throughput.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pg-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: phase2_crawl_throughput
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d phase2_crawl_throughput"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/phase2_crawl_throughput
+      # The append-only regression writes fixtures, so it is opt-in and only
+      # runs against this dedicated scratch database.
+      PHASE2_CRAWL_REPORT_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/phase2_crawl_throughput
+      PGSSL: disable
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Apply migrations to isolated test database
+        run: npx tsx scripts/runMigrations.ts
+      - name: TypeScript check
+        run: npx tsc --noEmit
+      - name: Phase 2 report static assertions
+        run: node --import tsx --test server/crawlThroughputReport.test.ts server/acquisitionLaneTelemetry.test.ts
+      - name: Phase 2 report PostgreSQL regression
+        run: node --import tsx --test server/crawlThroughputReport.postgres.test.ts
