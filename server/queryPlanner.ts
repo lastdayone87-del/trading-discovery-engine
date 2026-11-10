@@ -523,6 +523,25 @@ function countryAtoms(country: string, vocabulary?: CountryVocabulary): SearchAt
   return [...unique.values()];
 }
 
+/**
+ * Cap extracted standalone queries by the actual planned batch size. The
+ * pre-selection cap bounds the requested offer; this second guard prevents an
+ * underfilled batch (for example one surviving query) from being 100%
+ * extracted. The 40% share is an initial safeguard, not a permanent ceiling:
+ * later allocation policy can raise it only with measured evidence.
+ */
+export function capExtractedStandaloneShare<T extends { metadata: { queryTemplate?: string } }>(planned: T[]): T[] {
+  if (!planned.length) return planned;
+  const maxExtracted = Math.floor(planned.length * 0.4);
+  let kept = 0;
+  return planned.filter(item => {
+    if (item.metadata?.queryTemplate !== 'EXTRACTED_STANDALONE') return true;
+    if (kept >= maxExtracted) return false;
+    kept += 1;
+    return true;
+  });
+}
+
 export function planDiverseQueries(args: {
   country: string;
   count: number;
@@ -1034,7 +1053,7 @@ export function planDiverseQueries(args: {
     if (planned.length >= count) break;
     trySelect(candidate);
   }
-  return planned;
+  return capExtractedStandaloneShare(planned);
 }
 
 export function reformulatePollutedQuery(args: {

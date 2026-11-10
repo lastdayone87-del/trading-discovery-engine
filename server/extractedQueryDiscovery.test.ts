@@ -307,6 +307,59 @@ test('non-Latin native scripts pass intent and preserve their script', () => {
   }
 });
 
+test('ordinary Japanese phrases are rejected while trading terminology remains eligible', () => {
+  for (const title of ['投資詐欺', '株主総会', '金利が上がる', '相場がいい', '今日の天気', '株式会社の日常']) {
+    assert.deepEqual(
+      deriveDeterministicQueryCandidates({
+        sources: video(title), country: 'Japan', language: 'ja',
+      }),
+      [],
+      title,
+    );
+  }
+  for (const title of ['日経225先物', '板情報', '高配当株', 'ビットコイン投資', 'オプション取引', 'デイトレード', 'テクニカル分析', '金利見通し', '相場分析']) {
+    assert.ok(
+      deriveDeterministicQueryCandidates({
+        sources: video(title), country: 'Japan', language: 'ja',
+      }).some(candidate => candidate.candidateText === title),
+      title,
+    );
+  }
+  assert.deepEqual(
+    deriveDeterministicQueryCandidates({
+      sources: video('금요일'), country: 'South Korea', language: 'ko',
+    }),
+    [],
+  );
+  assert.ok(
+    deriveDeterministicQueryCandidates({
+      sources: video('금값'), country: 'South Korea', language: 'ko',
+    }).some(candidate => candidate.candidateText === '금값'),
+  );
+});
+
+test('trailing prepositions are trimmed without discarding the trading phrase', () => {
+  const german = deriveDeterministicQueryCandidates({
+    sources: video('Technische Analyse für'),
+    country: 'Germany', language: 'de',
+  });
+  assert.ok(german.some(candidate => candidate.candidateText === 'Technische Analyse'));
+  assert.ok(german.every(candidate => !/\bfür$/iu.test(candidate.candidateText)));
+
+  const middle = deriveDeterministicQueryCandidates({
+    sources: video('Orderflow für DAX'),
+    country: 'Germany', language: 'de',
+  });
+  assert.ok(middle.some(candidate => candidate.candidateText === 'Orderflow für DAX'));
+
+  assert.ok(
+    deriveDeterministicQueryCandidates({
+      sources: video('Footprint Trading DAX'),
+      country: 'Germany', language: 'de',
+    }).some(candidate => candidate.candidateText === 'Footprint Trading DAX'),
+  );
+});
+
 test('LLM candidates use the same deterministic gate and duplicates merge', () => {
   const sources = video('Weekly trade analysis');
   const reasons: string[] = [];
