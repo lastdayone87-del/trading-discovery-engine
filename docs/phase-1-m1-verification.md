@@ -11,7 +11,9 @@ surfaces through the same boundaries used in production:
 1. **Acquisition/inspection** — `runChannelInspection` with deterministic fake
    transports and the shared acquisition policies. The suite uses
    `publicTestResolver` in place of production DNS; real DNS/destination
-   resolution is not exercised.
+   resolution is not exercised. It exercises the static acquisition path;
+   rendered fallback/click behavior is not exercised here and is covered by
+   the browser suites (M2b/rendered).
 2. **Candidate extraction** — structured `DiscordCandidate` retention, canonical
    invite identity, and source-surface observations.
 3. **Deduplication/ownership** — `mergeDiscordCandidates` with creator context;
