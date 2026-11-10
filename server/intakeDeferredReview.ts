@@ -123,7 +123,11 @@ export async function recordIntakeDeferredReview(input: IntakeDeferredReviewInpu
        next_recheck_at=CASE WHEN intake_deferred_reviews.state='SUPERSEDED' THEN now()+interval '1 hour' ELSE intake_deferred_reviews.next_recheck_at END,
        last_checked_at=now(),
        updated_at=now()
-     WHERE intake_deferred_reviews.state IN ('PENDING','SUPERSEDED')`,
+     WHERE intake_deferred_reviews.state IN ('PENDING','SUPERSEDED')
+       AND EXISTS (
+         SELECT 1 FROM channels c
+         WHERE c.channel_id=$1 AND c.scan_status='INTAKE_DEFERRED'
+       )`,
     [
       input.channelId,
       JSON.stringify(system),

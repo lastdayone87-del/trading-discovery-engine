@@ -85,6 +85,7 @@ test('deferred review migration and decision path preserve human evidence and la
   assert.match(module, /Re-check the idempotency key under the lock/);
   assert.match(module, /language=COALESCE\(NULLIF\(\$8,''\),language\)/);
   assert.match(module, /intake_deferred_reviews\.state='SUPERSEDED'/);
+  assert.match(module, /c\.scan_status='INTAKE_DEFERRED'/);
   assert.match(module, /review_version\+1/);
   assert.match(module, /channel\.country_status === 'CONFIRMED'/);
   const pipeline = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
@@ -218,6 +219,7 @@ test('review UI preserves system reasoning separately from human decisions', () 
   assert.match(ui, /newRequestId\(\)/);
   assert.match(ui, /selectionRequest/);
   assert.match(ui, /submittedToken/);
+  assert.match(ui, /loading \|\| selected\.state !== 'PENDING'/);
   assert.doesNotMatch(ui, /Authorization: `Bearer \$\{token\}`/);
 });
 

@@ -117,7 +117,7 @@ const IntakeDeferredReview: React.FC = () => {
   useEffect(() => { void loadList(0); }, []);
 
   const submitDecision = async () => {
-    if (!selected || selected.state !== 'PENDING') return;
+    if (loading || !selected || selected.state !== 'PENDING') return;
     const submittedChannelId = selected.channelId;
     const submittedToken = selectionRequest.current;
     setBusy(true); setError(''); setSuccess('');
@@ -293,7 +293,7 @@ const IntakeDeferredReview: React.FC = () => {
                   : ' This row is retained for audit only.'}
               </p>
             )}
-            <button disabled={busy || selected.state !== 'PENDING' || !reason.trim()} onClick={() => void submitDecision()} className="mt-4 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-semibold text-white disabled:opacity-40">
+            <button disabled={busy || loading || selected.state !== 'PENDING' || !reason.trim()} onClick={() => void submitDecision()} className="mt-4 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-semibold text-white disabled:opacity-40">
               {busy ? 'Saving…' : 'Save human decision'}
             </button>
             <p className="mt-2 text-[11px] text-slate-500 dark:text-slate-400">TRADING returns the channel to normal enrichment; NON_TRADING closes it; AMBIGUOUS keeps it deferred for a later evidence recheck.</p>

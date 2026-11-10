@@ -1390,12 +1390,33 @@ async function processIntakeDeferredRecheckJob(
       details: `Subscribers: ${recheckAudience ?? 'unknown'} (< 30). Intake recheck completed without provider work.`,
       timestamp: skippedAt,
     }];
-    await upsertChannel(channel);
-    await (await getDb()).query(
-      `UPDATE intake_deferred_reviews SET state='SUPERSEDED',next_recheck_at=NULL,updated_at=now()
-       WHERE channel_id=$1 AND state IN ('PENDING','DECIDED')`,
-      [channelId],
-    );
+    const audienceDb = await getDb();
+    const audienceClient = await audienceDb.connect();
+    let audienceTransaction = false;
+    try {
+      await audienceClient.query('BEGIN');
+      audienceTransaction = true;
+      const projected = await audienceClient.query(
+        `UPDATE channels
+         SET scan_status='SKIPPED_LOW_AUDIENCE',last_checked=$2,inspection_trail=$3::jsonb,updated_at=now()
+         WHERE channel_id=$1 AND scan_status='INTAKE_DEFERRED'`,
+        [channelId, skippedAt, JSON.stringify(channel.inspection_trail)],
+      );
+      if (projected.rowCount) {
+        await audienceClient.query(
+          `UPDATE intake_deferred_reviews SET state='SUPERSEDED',next_recheck_at=NULL,updated_at=now()
+           WHERE channel_id=$1 AND state IN ('PENDING','DECIDED')`,
+          [channelId],
+        );
+      }
+      await audienceClient.query('COMMIT');
+      audienceTransaction = false;
+    } catch (error) {
+      if (audienceTransaction) await audienceClient.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      audienceClient.release();
+    }
     await completeJob(job.id);
     return true;
   }
