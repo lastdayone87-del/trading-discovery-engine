@@ -731,7 +731,15 @@ async function processChannelThroughPipelineInContext(
           details: deferredCountry.decisionLogs,
           timestamp: now,
         }];
-        await upsertChannelWithResult(existing, existingStatusSnapshot ? { requireStatusSnapshot: existingStatusSnapshot } : undefined);
+        // This pass intentionally updates country evidence, so guard only the
+        // trading/scan ownership fields; a concurrent country rejection is
+        // still preserved by the normal checked write below.
+        await upsertChannelWithResult(existing, existingStatusSnapshot ? {
+          requireStatusSnapshot: {
+            scan_status: existingStatusSnapshot.scan_status,
+            trading_status: existingStatusSnapshot.trading_status,
+          },
+        } : undefined);
       }
       const current = await getChannelById(candidate.channelId) || existing;
       return {

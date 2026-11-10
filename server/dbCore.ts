@@ -1667,10 +1667,10 @@ export async function upsertChannelWithResult(channel: ChannelRecord, options?: 
     }
     if (options?.requireStatusSnapshot && locked) {
       const expected = options.requireStatusSnapshot;
-      const changed = String(locked.country || '') !== String(expected.country || '')
-        || String(locked.country_status || '') !== String(expected.country_status || '')
-        || String(locked.scan_status || '') !== String(expected.scan_status || '')
-        || String(locked.trading_status || '') !== String(expected.trading_status || '');
+      const changed = (expected.country !== undefined && String(locked.country || '') !== String(expected.country || ''))
+        || (expected.country_status !== undefined && String(locked.country_status || '') !== String(expected.country_status || ''))
+        || (expected.scan_status !== undefined && String(locked.scan_status || '') !== String(expected.scan_status || ''))
+        || (expected.trading_status !== undefined && String(locked.trading_status || '') !== String(expected.trading_status || ''));
       if (changed) {
         await client.query('COMMIT');
         return false;
