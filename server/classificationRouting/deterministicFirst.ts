@@ -89,7 +89,7 @@ function semanticSignals(decision: RoutingInput) {
     used: providers.some(provider => provider.outcome === 'EXECUTED_WITH_EVIDENCE')
       || /^SEMANTIC_/.test(String(decision.classificationMethod || '')),
     attempted: providers.some(provider =>
-      provider.availability === 'AVAILABLE'
+      (provider.availability === 'AVAILABLE' || provider.availability === 'FAILED')
       && provider.outcome !== 'SUPPRESSED_BY_POLICY'
       && provider.outcome !== 'NOT_APPLICABLE'
       && provider.outcome !== 'UNAVAILABLE_CONFIGURATION',
