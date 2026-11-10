@@ -279,3 +279,29 @@ test('Distinct videos with identical off-topic metadata still count toward the g
   });
   assert.equal(routed.route, 'HUMAN_REVIEW');
 });
+
+test('repeated off-topic subject lines are not stripped as distribution boilerplate', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'TRADING_CONFIRMED', confidenceScore: 90, recognitionState: 'AMBIGUOUS_THIN', semanticPolicy: 'BOUNDED_WAIT',
+    providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
+  }), {
+    independentEvidence: true,
+    videoTexts: [
+      'Monday recap\nDance music',
+      'Tuesday recap\nDance music',
+      'Wednesday recap\nDance music',
+    ],
+  });
+  assert.equal(routed.route, 'HUMAN_REVIEW');
+});
+
+test('Bitcoin and Nasdaq forecasts count as strong market analysis', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'TRADING_CONFIRMED', confidenceScore: 90, recognitionState: 'AMBIGUOUS_THIN', semanticPolicy: 'BOUNDED_WAIT',
+    providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
+  }), {
+    independentEvidence: true,
+    videoTexts: ['Bitcoin forecast this week', 'Nasdaq outlook and levels', 'weekend dance vlog'],
+  });
+  assert.equal(routed.route, 'SEMANTIC_TRADING');
+});
