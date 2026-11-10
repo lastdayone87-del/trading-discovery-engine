@@ -231,7 +231,7 @@ function containsNativeToken(text: string, token: string): boolean {
     // substrings such as التسوق ("shopping") must not match سوق. Pronoun
     // endings are allowed only on explicit trading nouns: تداولنا is trading,
     // while ذهبنا is the past-tense verb "we went".
-    const allowsPronounEnding = /^(?:تداول|سوق|أسهم|استثمار|تحليل|عملات|نفط|مؤشر|فوركس)$/u.test(token);
+    const allowsPronounEnding = /^(?:تداول|أسهم|استثمار|تحليل|عملات|نفط|مؤشر|فوركس)$/u.test(token);
     const suffix = allowsPronounEnding
       ? '(?:يات|تان|ات|ين|ون|ان|ية|ها|هم|هن|كم|نا|ك)?'
       : '(?:يات|تان|ات|ين|ون|ان|ية)?';
