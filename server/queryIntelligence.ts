@@ -1942,14 +1942,10 @@ export async function generateCandidateQueriesForCountry(
       console.warn('[Extracted Query] failed to rotate ineligible candidates', error instanceof Error ? error.message : String(error));
     });
   }
-  // Only the bounded eligible offer is marked attempted. Unoffered rows stay
-  // fresh for the next batch instead of waiting out the rotation cooldown.
+  // Offer only the bounded eligible slice. Attempts are recorded after
+  // planning, so a candidate discarded solely by the actual-batch cap stays
+  // available for the next batch instead of waiting out a cooldown.
   const extractedOffer = eligibleExtractedCandidates.slice(0, Math.max(0, Math.floor(count * 0.4)));
-  if (extractedOffer.length) {
-    await markExtractedQueryCandidatesAttempted(extractedOffer.map(candidate => candidate.id)).catch(error => {
-      console.warn('[Extracted Query] failed to record planner attempt', error instanceof Error ? error.message : String(error));
-    });
-  }
   const countryVocab = vocabs.find(v => v.country.toLowerCase() === country.toLowerCase());
   // Free signals are candidate vocabulary only. Read stored signals when the
   // flag is on; on a cold country, refresh once (provider failure falls back
@@ -1998,6 +1994,14 @@ export async function generateCandidateQueriesForCountry(
     mode,
     scopePromotionBasis: options.scopePromotionBasis
   });
+  const plannedExtractedCandidateIds = [...new Set(planned
+    .map(item => Number((item.metadata as any)?.extractedCandidateId || 0))
+    .filter(id => Number.isSafeInteger(id) && id > 0))];
+  if (plannedExtractedCandidateIds.length) {
+    await markExtractedQueryCandidatesAttempted(plannedExtractedCandidateIds).catch(error => {
+      console.warn('[Extracted Query] failed to record planner attempt', error instanceof Error ? error.message : String(error));
+    });
+  }
   const newQueries: QueryRecord[] = [];
   // One country history read for the batch. Without this every planned
   // candidate rescans every same-country row to rebuild duplicate history.
