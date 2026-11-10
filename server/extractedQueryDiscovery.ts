@@ -118,7 +118,7 @@ const SCRIPT_INTENT_TOKENS: Array<{ script: RegExp; tokens: string[] }> = [
       // titles such as 日経225先物 are not rejected before language detection.
       // Prefer compounds over bare words (株, 注文, 指数, 見方, 戦略) that occur
       // in ordinary Japanese and Chinese text.
-      '日経', '先物', '相場', '投資', '日足', '時間足', '板読み', '株式取引', '株価',
+      '日経', '先物', '相場', '投資', '日足', '時間足', '板読み', '板情報', '前場', '後場', '東京市場', '株式取引', '株価',
       '株価指数', '日経平均', '証券', '為替', '金利', '銘柄', 'チャート',
     ],
   },
@@ -126,7 +126,7 @@ const SCRIPT_INTENT_TOKENS: Array<{ script: RegExp; tokens: string[] }> = [
     script: /[\p{Script=Hiragana}\p{Script=Katakana}]/u,
     tokens: [
       'トレード', '相場', '先物', 'チャート', 'テクニカル', '投資',
-      '日足', '時間足', 'ローソク足', '板読み', 'デイトレード', 'スイング',
+      '日足', '時間足', 'ローソク足', '板読み', '板情報', 'デイトレード', 'スイング',
       '株式取引', '株価', '株価指数', '日経平均',
     ],
   },

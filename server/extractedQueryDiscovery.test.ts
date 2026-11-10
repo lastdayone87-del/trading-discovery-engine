@@ -226,6 +226,11 @@ test('non-Latin native scripts pass intent and preserve their script', () => {
     country: 'Japan', language: 'ja',
   });
   assert.ok(kanjiOnly.some(candidate => candidate.candidateText === '日経225先物'));
+  const orderBook = deriveDeterministicQueryCandidates({
+    sources: video('板情報'),
+    country: 'Japan', language: 'ja',
+  });
+  assert.ok(orderBook.some(candidate => candidate.candidateText === '板情報'));
 
   const offTopic = deriveDeterministicQueryCandidates({
     sources: video('木板安装教程'),
