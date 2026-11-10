@@ -48,9 +48,9 @@ export function resolveEnrichmentReopenBlockedLifecycle(
 }
 
 /**
- * An enrichment pass must not schedule the stage it just executed. The stage
- * sequence is bounded at 2; once a pass reaches it, a repeated request is a
- * bookkeeping loop, not new evidence work.
+ * An enrichment pass must not schedule the stage it just executed. The worker
+ * caps the evidence-action sequence (currently stage 3); once a pass reaches
+ * the cap, a repeated request is a bookkeeping loop, not new evidence work.
  */
 export function isEnrichmentStageExhausted(
   isEnrichmentPass: boolean,

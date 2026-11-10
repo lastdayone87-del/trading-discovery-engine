@@ -982,20 +982,7 @@ async function processChannelThroughPipelineInContext(
         // marker instead of enqueueing the same stage forever.
         const terminal=resolveEnrichmentReopenBlockedLifecycle(authoritativeChannel,{blockedJobStatus:'COMPLETED',hasOtherActiveEnrichmentJob:false});
         if(terminal.scanStatus!==authoritativeChannel.scan_status){
-          const db=await getDb();
-          await db.query(
-            `UPDATE channels c SET scan_status=$2,last_checked=$3,updated_at=now()
-              WHERE c.channel_id=$1 AND c.scan_status = ANY($4::text[])
-                AND NOT EXISTS (
-                  SELECT 1 FROM jobs j
-                   WHERE j.type='ENRICH_CHANNEL'
-                     AND j.status IN ('PENDING','PROCESSING')
-                     AND j.payload->>'channelId'=c.channel_id
-                     AND ($5::uuid IS NULL OR j.id<>$5::uuid)
-                )`,
-            [candidate.channelId,terminal.scanStatus,now,['ENRICHMENT_PENDING','ENRICHING','LOCKED'],options?.jobId||null],
-          );
-          const refreshed=await getChannelById(candidate.channelId);
+          const refreshed=await projectBlockedEnrichmentScanStatus(candidate.channelId,terminal.scanStatus,now,options?.jobId);
           if(refreshed)Object.assign(authoritativeChannel,refreshed);
         }
       }else{
@@ -1084,20 +1071,7 @@ async function processChannelThroughPipelineInContext(
         // A blocked FAILED job is FAILED, never COMPLETED.
         const blocked=resolveEnrichmentReopenBlockedLifecycle(authoritativeChannel,{blockedJobStatus:enqueued.status,hasOtherActiveEnrichmentJob:false});
         if(blocked.scanStatus!==authoritativeChannel.scan_status){
-          const db=await getDb();
-          await db.query(
-            `UPDATE channels c SET scan_status=$2,last_checked=$3,updated_at=now()
-              WHERE c.channel_id=$1 AND c.scan_status = ANY($4::text[])
-                AND NOT EXISTS (
-                  SELECT 1 FROM jobs j
-                   WHERE j.type='ENRICH_CHANNEL'
-                     AND j.status IN ('PENDING','PROCESSING')
-                     AND j.payload->>'channelId'=c.channel_id
-                     AND ($5::uuid IS NULL OR j.id<>$5::uuid)
-                )`,
-            [candidate.channelId,blocked.scanStatus,now,['ENRICHMENT_PENDING','ENRICHING','LOCKED'],options?.jobId||null],
-          );
-          const refreshed=await getChannelById(candidate.channelId);
+          const refreshed=await projectBlockedEnrichmentScanStatus(candidate.channelId,blocked.scanStatus,now,options?.jobId);
           if(refreshed)Object.assign(authoritativeChannel,refreshed);
         }
       }
@@ -1244,6 +1218,33 @@ async function processChannelThroughPipelineInContext(
     discordInvite: finalChannel.discord_invite || null,
     channelRecord: finalChannel
   };
+}
+
+/**
+ * Project a blocked enrichment owner's terminal scan state without clobbering
+ * a later-stage active job. One statement keeps the ownership check and write
+ * in the same snapshot.
+ */
+async function projectBlockedEnrichmentScanStatus(
+  channelId: string,
+  targetScanStatus: ChannelRecord['scan_status'],
+  now: string,
+  excludeJobId?: string | null,
+): Promise<ChannelRecord | null> {
+  const db = await getDb();
+  await db.query(
+    `UPDATE channels c SET scan_status=$2,last_checked=$3,updated_at=now()
+      WHERE c.channel_id=$1 AND c.scan_status = ANY($4::text[])
+        AND NOT EXISTS (
+          SELECT 1 FROM jobs j
+           WHERE j.type='ENRICH_CHANNEL'
+             AND j.status IN ('PENDING','PROCESSING')
+             AND j.payload->>'channelId'=c.channel_id
+             AND ($5::uuid IS NULL OR j.id<>$5::uuid)
+        )`,
+    [channelId, targetScanStatus, now, ['ENRICHMENT_PENDING','ENRICHING','LOCKED'], excludeJobId || null],
+  );
+  return getChannelById(channelId);
 }
 
 function applyCandidateObservability(channel: ChannelRecord, candidate: IngestionCandidate): void {
