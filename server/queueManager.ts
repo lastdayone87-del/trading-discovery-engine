@@ -107,7 +107,7 @@ import { resolveJobQuotaOrigin } from './quotaOrigin';
 import { isProbeQuotaControlError, YouTubeKeyCapUnavailableError } from './quotaKeyCapShadow';
 import { isYouTubeQuotaAccountingError } from './youtubeKeyHealth';
 import { assertCountryAllowed, ExcludedCountryError, getCountryExclusion, shouldBlockEnrichClaimForCountry } from './countryExclusion';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
 import { computeEffectivePageBudget, evaluateContinuation, evaluateContinuationV2, planPersistedPageRecovery, resumeModeForProvider, shouldCreateContinuationSegment, type ContinuationDecisionV2, type ContinuationResumeMode } from './continuationPolicy';
 import { evaluateAutonomousQueryAuthority, isDemandSignalRecord, isScopePromotedRecord } from './autonomousQueryAuthority';
@@ -158,6 +158,7 @@ import { processPlaylistInspectionJob } from './playlistAdapterWorker';
 import { processFeaturedChannelInspectionJob } from './featuredChannelAdapterWorker';
 import { processCountryBoundaryReprocessJob } from './countryBoundaryRecovery';
 import { QuotaAllocationExhaustedError } from './quotaCapacity';
+import { assessIntakeTradingFocus } from './intakeTradingFocus';
 import { isGeminiSemanticCooldownActive, isGeminiOrgCooldownActive, isGroqSemanticCooldownActive, isGroqOrgCooldownActive, isGeminiFreeSemanticCooldownActive } from './providerResilience';
 import { shouldUseGroqSemantic, configuredGroqRoutes, groqOrgCooldownRemainingMs, groqRouteOrg } from './evidenceEngine/providers/GroqSemanticProvider';
 import { configuredGeminiRoutes, geminiRouteOrg } from './evidenceEngine/providers/GeminiSemanticProvider';
@@ -1329,6 +1330,173 @@ export async function admitDiscoveredChannel(input: {
 }
 
 /**
+ * Bounded evidence recheck for INTAKE_DEFERRED channels.
+ *
+ * This is the same durable ENRICH_CHANNEL carrier, not a parallel pipeline:
+ * one 2-unit stage-1 evidence fetch, a fresh trading-focus assessment, and a
+ * deterministic transition. WITHHOLD closes the channel; ADMIT hands it to
+ * the normal enrichment path; DEFER keeps it deferred with a new due time.
+ * The recheck is idempotent at the sweep layer and retry-safe at the job layer.
+ */
+async function processIntakeDeferredRecheckJob(
+  job: DurableJob,
+  channel: any,
+  channelId: string,
+  targetCountry: string,
+  source: DiscoverySource,
+  candidate: DiscoveredChannelRaw,
+): Promise<boolean> {
+  if (!channel || channel.scan_status !== 'INTAKE_DEFERRED') {
+    await completeJob(job.id);
+    return true;
+  }
+  const dailyBudget = getDailyYouTubeQuotaBudget();
+  const enrichmentPercent = Number(await getAppSetting('discovery_enrichment_quota_percent', process.env.DISCOVERY_ENRICHMENT_QUOTA_PERCENT || '10'));
+  let reserved = false;
+  try {
+    reserved = await tryReserveQuota({
+      operationType: 'ENRICH_CHANNEL',
+      operationId: job.id,
+      allocation: 'ENRICHMENT',
+      units: 2,
+      dailyBudget,
+      allocationPercent: enrichmentPercent,
+    });
+    if (!reserved) throw new QuotaAllocationExhaustedError('ENRICHMENT');
+    const enriched = await fetchYouTubeChannelEnrichment(channelId, candidate, 1, async additionalUnits => {
+      const toppedUp = await topUpQuotaReservation({
+        operationType: 'ENRICH_CHANNEL',
+        operationId: job.id,
+        allocation: 'ENRICHMENT',
+        additionalUnits,
+        dailyBudget,
+        allocationPercent: enrichmentPercent,
+      });
+      if (!toppedUp) throw new QuotaAllocationExhaustedError('ENRICHMENT');
+    }, 'enrichment');
+    const focus = assessIntakeTradingFocus({
+      channelName: enriched.channelName,
+      description: enriched.description,
+      matchedDocument: enriched.matchedDocument,
+      videoTitles: enriched.videoTitles,
+      videoDescriptions: enriched.videoDescriptions,
+    });
+    const evidenceHash = createHash('sha256').update(JSON.stringify({
+      titles: enriched.videoTitles || [],
+      descriptions: enriched.videoDescriptions || [],
+    })).digest('hex');
+    const review = await (await getDb()).query(
+      `SELECT review_version,last_evidence_hash,recheck_attempts FROM intake_deferred_reviews WHERE channel_id=$1`,
+      [channelId],
+    );
+    const priorHash = review.rows[0]?.last_evidence_hash || null;
+    const now = new Date().toISOString();
+    const snapshot = {
+      system_snapshot: {
+        reasonCodes: focus.reasonCodes,
+        matchedSignals: focus.matchedSignals,
+        positiveFamilies: focus.positiveFamilies,
+        negativeFamilies: focus.negativeFamilies,
+        policyVersion: focus.policyVersion,
+        recheck: true,
+      },
+      evidence_snapshot: {
+        candidate: {
+          channelName: enriched.channelName,
+          youtubeUrl: enriched.youtubeUrl,
+          description: enriched.description,
+          videoTitles: enriched.videoTitles,
+          videoDescriptions: enriched.videoDescriptions,
+          matchedDocument: enriched.matchedDocument,
+          channelLinks: enriched.channelLinks,
+          subscriberCount: enriched.subscriberCount,
+          locationTag: enriched.locationTag,
+        },
+        focus,
+        targetCountry,
+        source,
+      },
+      last_evidence_hash: evidenceHash,
+      last_checked_at: now,
+      recheck_attempts: Number(review.rows[0]?.recheck_attempts || 0) + 1,
+      next_recheck_at: focus.decision === 'DEFER'
+        ? new Date(Date.now() + (priorHash === evidenceHash ? 7 * 86_400_000 : 86_400_000)).toISOString()
+        : null,
+      state: focus.decision === 'DEFER' ? 'PENDING' : 'SUPERSEDED',
+    };
+    if (focus.decision === 'WITHHOLD') {
+      channel.trading_status = 'NON_TRADING';
+      channel.scan_status = 'COMPLETED';
+      channel.last_checked = now;
+      channel.inspection_trail = [...(channel.inspection_trail || []), {
+        step: 'BIO',
+        title: 'Intake recheck: withheld',
+        status: 'NOT_FOUND',
+        details: `Bounded evidence recheck withheld the channel: ${focus.reasonCodes.join(', ')}`,
+        timestamp: now,
+      }];
+      await upsertChannel(channel);
+    } else if (focus.decision === 'ADMIT') {
+      channel.trading_status = 'UNCERTAIN';
+      channel.scan_status = 'ENRICHMENT_PENDING';
+      channel.last_checked = now;
+      channel.inspection_trail = [...(channel.inspection_trail || []), {
+        step: 'BIO',
+        title: 'Intake recheck: admitted',
+        status: 'FOUND',
+        details: `Bounded evidence recheck admitted the channel: ${focus.reasonCodes.join(', ')}`,
+        timestamp: now,
+      }];
+      await upsertChannel(channel);
+      await enqueueJob('ENRICH_CHANNEL', {
+        channelId,
+        targetCountry,
+        source,
+        candidate: { ...enriched, enrichmentStage: 1 },
+        enrichmentStage: 1,
+        intakeRecheckAdmitted: true,
+      }, {
+        priority: AUTONOMOUS_CONTINUATION_JOB_PRIORITY,
+        maxAttempts: 4,
+        idempotencyKey: `intake-recheck-enrich:${channelId}:${job.id}`,
+      });
+    } else {
+      channel.last_checked = now;
+      channel.inspection_trail = [...(channel.inspection_trail || []), {
+        step: 'BIO',
+        title: 'Intake recheck: still deferred',
+        status: 'PARTIAL',
+        details: `Bounded evidence recheck found no decisive change: ${focus.reasonCodes.join(', ')}`,
+        timestamp: now,
+      }];
+      await upsertChannel(channel);
+    }
+    await (await getDb()).query(
+      `INSERT INTO intake_deferred_reviews(
+         channel_id,review_version,state,system_snapshot,evidence_snapshot,recheck_attempts,
+         last_checked_at,next_recheck_at,last_evidence_hash,updated_at
+       ) VALUES($1,1,$2,$3::jsonb,$4::jsonb,$5,$6,$7,$8,now())
+       ON CONFLICT(channel_id) DO UPDATE SET
+         system_snapshot=excluded.system_snapshot,evidence_snapshot=excluded.evidence_snapshot,
+         recheck_attempts=excluded.recheck_attempts,last_checked_at=excluded.last_checked_at,
+         next_recheck_at=excluded.next_recheck_at,last_evidence_hash=excluded.last_evidence_hash,
+         state=CASE WHEN excluded.state='SUPERSEDED' THEN 'SUPERSEDED'
+                    WHEN intake_deferred_reviews.state='PENDING' THEN excluded.state
+                    ELSE intake_deferred_reviews.state END,
+         updated_at=now()`,
+      [channelId, snapshot.state, JSON.stringify(snapshot.system_snapshot), JSON.stringify(snapshot.evidence_snapshot), snapshot.recheck_attempts, now, snapshot.next_recheck_at, evidenceHash],
+    );
+    await finishQuotaReservation('ENRICH_CHANNEL', job.id, true);
+    reserved = false;
+    await completeJob(job.id);
+    return true;
+  } catch (error) {
+    if (reserved) await finishQuotaReservation('ENRICH_CHANNEL', job.id, false).catch(() => undefined);
+    throw error;
+  }
+}
+
+/**
  * Worker loop that processes one durable search or enrichment job.
  */
 export async function processNextSearchJob(
@@ -1622,6 +1790,9 @@ export async function processNextSearchJob(
         return true;
       }
       const channel = await getChannelById(channelId);
+      if (job.payload.intakeRecheck === true) {
+        return await processIntakeDeferredRecheckJob(job, channel, channelId, targetCountry, source, candidate);
+      }
       // REJECTED rows are terminal for every pipeline (isTerminalState) and
       // are additionally guarded explicitly here (P2) so a future terminal
       // state change can never let an excluded creator spend enrichment quota.

@@ -25,6 +25,8 @@ export interface SearchCandidateTriageDecision {
   disposition: SearchCandidateTriageDisposition;
   reasonCodes: string[];
   matchedSignals: string[];
+  /** Present for DEFER so the pipeline can persist the evidence snapshot. */
+  focus?: IntakeTradingFocusAssessment;
 }
 
 function staleMatchedVideo(candidate: DiscoveredChannelRaw, now = Date.now()): boolean {
@@ -50,6 +52,7 @@ function mapDecision(assessment: IntakeTradingFocusAssessment): SearchCandidateT
       disposition: 'DEFER_NO_CONFIDENT_EVIDENCE',
       reasonCodes: assessment.reasonCodes,
       matchedSignals: assessment.matchedSignals,
+      focus: assessment,
     };
   }
   return {

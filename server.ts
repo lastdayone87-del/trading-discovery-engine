@@ -88,6 +88,14 @@ import { verifyChannelTradingRelevance, generateClassificationReport } from './s
 import { assertCountryAllowed, ExcludedCountryError } from './server/countryExclusion';
 import { getManualSearchSession, listManualSearchSessions, requestManualSearchCancellation } from './server/manualSearchStore';
 import { decideReview, getReviewDetails, listReviewQueue, ReviewConflictError, ReviewNotFoundError } from './server/reviewStore';
+import {
+  computeEvaluationBreakdown,
+  computeEvaluationMetrics,
+  decideIntakeDeferredReview,
+  getIntakeDeferredReview,
+  listHumanEvaluationSamples,
+  listIntakeDeferredReviews,
+} from './server/intakeDeferredReview';
 import {REVIEW_REASON_CATALOG,REVIEW_REASON_CATALOG_VERSION} from './server/reviewReasons';
 import { resolveReviewerIdentity, reviewerDefaultsAvailable, reviewerTokenIsValid } from './server/reviewerCredentials';
 import { operatorAuthorization, validateOperatorConfiguration } from './server/operatorAuth';
@@ -284,6 +292,69 @@ async function startServer() {
   app.post('/api/reviews/:channelId/approve',requireReviewer,reviewAction('APPROVE'));
   app.post('/api/reviews/:channelId/reject',requireReviewer,reviewAction('REJECT'));
   app.post('/api/reviews/:channelId/force-rescan',requireReviewer,reviewAction('FORCE_RESCAN'));
+
+  // Deferred-intake human review. These are not channel_reviews/NEEDS_REVIEW
+  // rows; they are the dedicated INTAKE_DEFERRED interface.
+  app.get('/api/intake-deferred', requireReviewer, async (req, res) => {
+    try {
+      res.json(await listIntakeDeferredReviews({
+        country: req.query.country as string | undefined,
+        language: req.query.language as string | undefined,
+        search: req.query.search as string | undefined,
+        limit: Number(req.query.limit || 50),
+        offset: Number(req.query.offset || 0),
+      }));
+    } catch (err: any) { sendOperationError(res, err); }
+  });
+  app.get('/api/intake-deferred/:channelId', requireReviewer, async (req, res) => {
+    try { res.json(await getIntakeDeferredReview(req.params.channelId)); }
+    catch (err: any) { res.status(Number(err?.status) || 500).json({ error: err.message, code: 'INTAKE_DEFERRED_REVIEW_READ_ERROR' }); }
+  });
+  app.post('/api/intake-deferred/:channelId/decision', requireReviewer, async (req, res) => {
+    try {
+      const reviewer = resolveReviewerIdentity(req.header('x-reviewer-id')) || req.operator?.actorId;
+      if (!reviewer) return res.status(400).json({ error: 'Reviewer identity is required.', code: 'REVIEW_VALIDATION_ERROR' });
+      const result = await decideIntakeDeferredReview({
+        channelId: req.params.channelId,
+        expectedVersion: Number(req.body.reviewVersion),
+        reviewer,
+        decision: req.body.decision,
+        reason: String(req.body.reason || ''),
+        notes: req.body.notes,
+        corrections: req.body.corrections,
+        idempotencyKey: req.header('idempotency-key') || String(req.body.idempotencyKey || ''),
+      });
+      console.info('[IntakeDeferredReview] Decision committed', { requestId: req.requestId, channelId: req.params.channelId, decision: req.body.decision, idempotent: result.idempotent });
+      res.json(result);
+    } catch (err: any) {
+      const status = Number(err?.status) || (err?.message?.includes('required') || err?.message?.startsWith('reviewVersion') ? 422 : 500);
+      console.error('[IntakeDeferredReview] Decision failed', { requestId: req.requestId, channelId: req.params.channelId, status, error: err instanceof Error ? err.message : 'Unknown error' });
+      res.status(status).json({ error: status === 500 ? 'The intake review decision could not be saved.' : err.message, code: status === 409 ? 'REVIEW_CONFLICT' : status === 404 ? 'REVIEW_NOT_FOUND' : status === 422 ? 'REVIEW_VALIDATION_ERROR' : 'REVIEW_PERSISTENCE_ERROR', requestId: req.requestId });
+    }
+  });
+
+  app.get('/api/human-evaluation/samples', requireReviewer, async (req, res) => {
+    try {
+      res.json(await listHumanEvaluationSamples({
+        language: req.query.language as string | undefined,
+        country: req.query.country as string | undefined,
+        label: req.query.label as string | undefined,
+        limit: Number(req.query.limit || 200),
+      }));
+    } catch (err: any) { sendOperationError(res, err); }
+  });
+  app.get('/api/human-evaluation/metrics', requireReviewer, async (_req, res) => {
+    try {
+      const samples = await listHumanEvaluationSamples({ limit: 500 });
+      res.json({
+        overall: computeEvaluationMetrics(samples),
+        byLanguage: computeEvaluationBreakdown(samples, 'language'),
+        byCountry: computeEvaluationBreakdown(samples, 'country'),
+        byMetadataQuality: computeEvaluationBreakdown(samples, 'metadataQuality'),
+        sampleCount: samples.length,
+      });
+    } catch (err: any) { sendOperationError(res, err); }
+  });
 
   // Health check
   app.get('/api/health', (_req, res) => {

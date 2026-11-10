@@ -12,6 +12,7 @@ import { COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_RETRY_REASON } fr
 import { projectProviderDeferredEnrichment, reconcileOperationalEnrichmentRecovery } from './operationalEnrichmentRecovery';
 import { triggerPhaseBObservationReconciliation } from './phaseBObservationOutbox';
 import { enqueueCommunityAcquisitionRetry, enqueueOperationalEnrichmentRecoveryJob, resumeOrphanedAutonomousPages } from './queueManager';
+import { reconcileLikelyExcludedCountryCandidates, sweepIntakeDeferredReviews } from './intakeDeferredSweep';
 
 /**
  * Non-claim-critical maintenance cadence. Worker pools still tick every second
@@ -32,6 +33,8 @@ export interface OperationalMaintenanceDependencies {
   resumeOrphanedAutonomousPages(): Promise<unknown>;
   /** Delayed repair of pending classification sightings; runs at minute scale. */
   reconcileStaleClassificationSightings(): Promise<unknown>;
+  sweepIntakeDeferredReviews?(): Promise<unknown>;
+  reconcileLikelyExcludedCountryCandidates?(): Promise<unknown>;
 }
 
 export interface OperationalMaintenanceSnapshot {
@@ -60,6 +63,8 @@ export interface OperationalMaintenanceSchedulerOptions {
   clearTimer?: (timer: unknown) => void;
   /** Interval for the delayed classification-sighting sweep. */
   classificationSightingSweepIntervalMs?: number;
+  /** Interval for deferred-intake evidence and LIKELY-country reconciliation. */
+  intakeRecoveryIntervalMs?: number;
   /** Warn when a single sweep remains in flight longer than this. */
   watchdogMs?: number;
   setWatchdog?: (callback: () => void, delayMs: number) => unknown;
@@ -76,6 +81,8 @@ export function createOperationalMaintenanceScheduler(
 ): OperationalMaintenanceScheduler {
   const intervalMs = options.intervalMs ?? OPERATIONAL_MAINTENANCE_INTERVAL_MS;
   const classificationSightingSweepIntervalMs = options.classificationSightingSweepIntervalMs ?? 60_000;
+  const intakeRecoveryIntervalMs = options.intakeRecoveryIntervalMs ?? 60_000;
+  let lastIntakeRecoveryMs: number | null = null;
   const now = options.now ?? Date.now;
   const setTimer = options.setTimer ?? ((callback: () => void, delayMs: number) => {
     const timer = setTimeout(callback, delayMs);
@@ -188,6 +195,28 @@ export function createOperationalMaintenanceScheduler(
     await isolate('autonomous_orphan_resume', () => dependencies.resumeOrphanedAutonomousPages());
     // The delayed-classification sweep is minute-scale, not tick-scale. Use
     // the scheduler's clock so tests and runtime share one cadence source.
+    if (lastIntakeRecoveryMs === null || nowMs - lastIntakeRecoveryMs >= intakeRecoveryIntervalMs) {
+      lastIntakeRecoveryMs = nowMs;
+      if (dependencies.sweepIntakeDeferredReviews) {
+        await isolate('intake_deferred_evidence_sweep', async () => {
+          const result = await dependencies.sweepIntakeDeferredReviews!() as
+            { scanned?: number; enqueued?: number; skipped?: number; locked?: number } | undefined;
+          if (Number(result?.enqueued || 0) > 0) {
+            console.info(`[Operational Maintenance] intake deferred rechecks enqueued=${result?.enqueued} scanned=${result?.scanned} skipped=${result?.skipped} locked=${result?.locked}.`);
+          }
+        });
+      }
+      if (dependencies.reconcileLikelyExcludedCountryCandidates) {
+        await isolate('likely_excluded_country_reconciliation', async () => {
+          const result = await dependencies.reconcileLikelyExcludedCountryCandidates!() as
+            { scanned?: number; rejected?: number; retained?: number; review?: number } | undefined;
+          if (Number(result?.scanned || 0) > 0) {
+            console.info(`[Operational Maintenance] likely excluded-country recheck scanned=${result?.scanned} rejected=${result?.rejected} retained=${result?.retained} review=${result?.review}.`);
+          }
+        });
+      }
+    }
+
     if (lastClassificationSightingSweepMs === null
       || nowMs - lastClassificationSightingSweepMs >= classificationSightingSweepIntervalMs) {
       // Stamp before running so a failing sweep backs off instead of retrying
@@ -306,7 +335,9 @@ function createDefaultDependencies(): OperationalMaintenanceDependencies {
     ),
     triggerPhaseBObservationReconciliation: () => triggerPhaseBObservationReconciliation(),
     resumeOrphanedAutonomousPages: () => resumeOrphanedAutonomousPages(),
-    reconcileStaleClassificationSightings: () => reconcileStaleClassificationSightings(200)
+    reconcileStaleClassificationSightings: () => reconcileStaleClassificationSightings(200),
+    sweepIntakeDeferredReviews: () => sweepIntakeDeferredReviews({ limit: 10, minAgeMinutes: 60 }),
+    reconcileLikelyExcludedCountryCandidates: () => reconcileLikelyExcludedCountryCandidates({ limit: 20 })
   };
 }
 
