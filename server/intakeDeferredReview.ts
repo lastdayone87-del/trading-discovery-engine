@@ -236,9 +236,10 @@ export async function decideIntakeDeferredReview(input: DecideIntakeDeferredInpu
       [input.idempotencyKey],
     );
     if (prior.rowCount) {
-      if (String(prior.rows[0].decision) !== input.decision) {
+      if (String(prior.rows[0].channel_id) !== input.channelId
+        || String(prior.rows[0].decision) !== input.decision) {
         await client.query('ROLLBACK');
-        throw Object.assign(new Error('Idempotency key was already used for a different decision.'), { status: 409 });
+        throw Object.assign(new Error('Idempotency key was already used for a different channel or decision.'), { status: 409 });
       }
       await client.query('COMMIT');
       return { decision: prior.rows[0], idempotent: true };
@@ -272,9 +273,10 @@ export async function decideIntakeDeferredReview(input: DecideIntakeDeferredInpu
       [input.idempotencyKey],
     );
     if (replay.rowCount) {
-      if (String(replay.rows[0].decision) !== input.decision) {
+      if (String(replay.rows[0].channel_id) !== input.channelId
+        || String(replay.rows[0].decision) !== input.decision) {
         await client.query('ROLLBACK');
-        throw Object.assign(new Error('Idempotency key was already used for a different decision.'), { status: 409 });
+        throw Object.assign(new Error('Idempotency key was already used for a different channel or decision.'), { status: 409 });
       }
       await client.query('COMMIT');
       return { decision: replay.rows[0], idempotent: true };

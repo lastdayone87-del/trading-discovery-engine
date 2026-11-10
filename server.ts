@@ -320,8 +320,8 @@ async function startServer() {
     try {
       // The authenticated actor is authoritative. A supplied reviewer header
       // is retained only as an audit annotation, never as the ledger identity.
-      const claimedReviewer = resolveReviewerIdentity(req.header('x-reviewer-id'));
-      const reviewer = req.operator?.actorId || claimedReviewer;
+      const claimedReviewer = req.header('x-reviewer-id')?.trim() || undefined;
+      const reviewer = req.operator?.actorId || resolveReviewerIdentity(claimedReviewer);
       if (!reviewer) return res.status(400).json({ error: 'Reviewer identity is required.', code: 'REVIEW_VALIDATION_ERROR' });
       const corrections = {
         ...(req.body.corrections && typeof req.body.corrections === 'object' ? req.body.corrections : {}),

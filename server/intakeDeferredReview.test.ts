@@ -67,6 +67,20 @@ test('fixture metrics expose precision, recall, FPR and FNR without forcing abst
   assert.ok(languages.length >= 2);
 });
 
+test('fixture metadata quality follows the same rule as persisted reviews', () => {
+  for (const sample of fixture as Array<Record<string, any>>) {
+    const evidence = sample.evidence || {};
+    const titles = Array.isArray(evidence.videoTitles) ? evidence.videoTitles : [];
+    const descriptions = Array.isArray(evidence.videoDescriptions) ? evidence.videoDescriptions : [];
+    const description = String(evidence.description || '').trim();
+    const videoCount = Math.max(titles.length, descriptions.length);
+    const expected = videoCount >= 3 && description.length >= 80
+      ? 'RICH'
+      : videoCount >= 1 ? 'LIMITED' : 'SPARSE';
+    assert.equal(sample.metadataQuality, expected, `${sample.channelName} metadata quality`);
+  }
+});
+
 test('deferred review migration and decision path preserve human evidence and labels', () => {
   const migration = readFileSync(new URL('./db/migrations/175_intake_deferred_review.sql', import.meta.url), 'utf8');
   assert.match(migration, /CREATE TABLE IF NOT EXISTS intake_deferred_reviews/);
@@ -88,7 +102,8 @@ test('deferred review migration and decision path preserve human evidence and la
   assert.match(module, /c\.scan_status='INTAKE_DEFERRED'/);
   assert.match(module, /review_version\+1/);
   assert.match(module, /channel\.country_status === 'CONFIRMED'/);
-  assert.match(module, /Idempotency key was already used for a different decision/);
+  assert.match(module, /Idempotency key was already used for a different channel or decision/);
+  assert.match(module, /prior\.rows\[0\]\.channel_id/);
   const cancelJobs = module.indexOf("UPDATE jobs SET status='FAILED'");
   const lockRows = module.indexOf('FOR UPDATE OF r,c');
   assert.ok(cancelJobs >= 0 && lockRows > cancelJobs, 'NON_TRADING job cancellation must precede the review/channel lock');
@@ -204,7 +219,7 @@ test('review and evaluation routes are reviewer-protected and registered', () =>
   assert.match(server, /app\.get\('\/api\/human-evaluation\/samples'/);
   assert.match(server, /app\.get\('\/api\/human-evaluation\/metrics'/);
   assert.match(server, /offset \+= page\.length/);
-  assert.match(server, /req\.operator\?\.actorId \|\| claimedReviewer/);
+  assert.match(server, /req\.operator\?\.actorId \|\| resolveReviewerIdentity\(claimedReviewer\)/);
   assert.match(server, /reviewerClaimed/);
   assert.match(server, /const requestedState = String\(req\.query\.state/);
   assert.match(server, /state,/);
