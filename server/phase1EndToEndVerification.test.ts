@@ -75,7 +75,7 @@ async function expectFound(
   code: string,
   expectedSurfaces: string[],
 ) {
-  const result = await runChannelInspection(input);
+  const result = await runChannelInspection({...input, creatorLikelyTrading: false, urlFailureHistoryLoader: async () => []});
   assert.equal(result.foundInvite, code);
   assert.equal(result.acquisitionStatus, 'FOUND');
   assert.ok(result.discordCandidates?.length, 'inspection must retain a structured candidate');
@@ -100,7 +100,7 @@ async function expectFound(
 }
 
 async function expectCleanNegative(input: Parameters<typeof runChannelInspection>[0]) {
-  const result = await runChannelInspection(input);
+  const result = await runChannelInspection({...input, creatorLikelyTrading: false, urlFailureHistoryLoader: async () => []});
   assert.equal(result.foundInvite, null);
   assert.equal(result.acquisitionStatus, 'INSPECTED_NO_MATCH');
   assert.equal(result.retryDirective, undefined);
@@ -108,8 +108,8 @@ async function expectCleanNegative(input: Parameters<typeof runChannelInspection
   let enqueued = 0;
   await projectNotFoundAfterInspection(
     channel,
-    result as never,
-    result as never,
+    result,
+    result,
     true,
     async () => { enqueued += 1; },
   );
@@ -120,10 +120,13 @@ async function expectCleanNegative(input: Parameters<typeof runChannelInspection
   return result;
 }
 
-async function expectPending(input: Parameters<typeof runChannelInspection>[0]) {
-  const result = await runChannelInspection(input);
+async function expectPending(
+  input: Parameters<typeof runChannelInspection>[0],
+  expectedStatus: 'PARTIALLY_INSPECTED' | 'ACQUISITION_FAILED' = 'PARTIALLY_INSPECTED',
+) {
+  const result = await runChannelInspection({...input, creatorLikelyTrading: false, urlFailureHistoryLoader: async () => []});
   assert.equal(result.foundInvite, null);
-  assert.equal(result.acquisitionStatus, 'PARTIALLY_INSPECTED');
+  assert.equal(result.acquisitionStatus, expectedStatus);
   assert.ok(result.retryDirective, 'uninspected surface owns a retry directive');
   const pending = detectPendingDiscoveryWork(
     {
@@ -131,10 +134,29 @@ async function expectPending(input: Parameters<typeof runChannelInspection>[0]) 
       discord_validation_status: 'NOT_STARTED',
       discord_discovery_status: 'NOT_DISCOVERED',
     },
-    result as never,
+    result,
   );
   assert.equal(pending.pending, true);
   assert.ok(pending.reasons.includes('community-retry-directive'));
+
+  const channel = blankChannel();
+  let enqueued = 0;
+  let directive: unknown;
+  await projectNotFoundAfterInspection(
+    channel,
+    result,
+    result,
+    true,
+    async (_channelId, value) => {
+      enqueued += 1;
+      directive = value;
+    },
+  );
+  assert.equal(channel.discord_status, 'UNCERTAIN');
+  assert.equal(channel.discord_validation_status, 'RETRY_PENDING');
+  assert.equal(channel.scan_status, 'FAILED');
+  assert.equal(enqueued, 1, 'the pending projection schedules exactly one durable retry');
+  assert.equal((directive as { retryReason?: unknown })?.retryReason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
   return result;
 }
 
@@ -176,7 +198,7 @@ test('M1 L1: pinned-comment candidate carries provenance through projection', as
   assert.equal(candidate.ownershipStatus, 'UNCERTAIN', 'a pinned comment alone is not ownership-proof');
 });
 
-test('M1 M2a/M2b: static formaction is extracted even though M2b never clicks submit controls', async () => {
+test('M1 M2a: static formaction is extracted; M2b click exclusion is covered by its browser suite', async () => {
   await expectFound({
     channelId: 'e2e-m2',
     channelName: 'E2E Test Creator',
@@ -197,6 +219,8 @@ test('M1 M2a/M2b: static formaction is extracted even though M2b never clicks su
 });
 
 test('M1 M4a: Discord widget iframe resolves through widget.json and projects', async () => {
+  const calls: string[] = [];
+  const widgetIframeUrl = 'https://discord.com/widget?id=322850917248663552';
   const { result } = await expectFound({
     channelId: 'e2e-m4a',
     channelName: 'E2E Test Creator',
@@ -205,15 +229,16 @@ test('M1 M4a: Discord widget iframe resolves through widget.json and projects', 
     videoDescriptions: DESCRIPTIONS,
     externalFetchImpl: (async (input: any) => {
       const url = String(input);
-      if (url === 'https://creator.example/') {
-        return html('<iframe src="https://discord.com/widget?id=322850917248663552"></iframe>');
-      }
+      calls.push(url);
+      if (url === 'https://creator.example/') return html(`<iframe src="${widgetIframeUrl}"></iframe>`);
       if (url.includes('/widget.json')) {
         return json({ name: 'Futures Trading', instant_invite: 'https://discord.gg/m4a-room' });
       }
       throw new Error(`unexpected fetch: ${url}`);
     }) as typeof fetch,
   }, 'm4a-room', ['CREATOR_WEBSITES']);
+  assert.ok(calls.some(url => url.includes('/widget.json')), 'the public widget JSON is fetched');
+  assert.ok(!calls.includes(widgetIframeUrl), 'the cross-origin widget iframe HTML is never fetched');
   const widgetOutcome = result.acquisitionOutcomes?.find(outcome => outcome.requestedUrl.includes('/widget?id='));
   assert.equal(widgetOutcome?.required, false, 'the optional parent site keeps the widget failure optional');
 });
@@ -253,15 +278,35 @@ test('M1 dedupe/ownership: the same invite from H1 and L1 collapses to one owned
   assert.equal(candidate.observations?.filter(observation => observation.sourceSurface === 'PINNED_COMMENT').length, 1);
 });
 
+test('M1 H1: a failed server-page surface stays retry-owned', async () => {
+  await expectPending({
+    channelId: 'e2e-h1-fail',
+    channelName: 'E2E Test Creator',
+    channelBio: 'No invite',
+    channelLinks: ['https://discord.com/servers/trading-322850917248663552'],
+    videoDescriptions: DESCRIPTIONS,
+    externalFetchImpl: (async () => html('unavailable', 503)) as typeof fetch,
+  }, 'ACQUISITION_FAILED');
+});
+
 test('M1 H2: a confirmed optional 404 is a clean negative with no retry', async () => {
-  await expectCleanNegative({
+  const calls: string[] = [];
+  const result = await expectCleanNegative({
     channelId: 'e2e-h2-clean',
     channelName: 'E2E Test Creator',
     channelBio: 'https://creator.example/missing',
     channelLinks: [],
     videoDescriptions: DESCRIPTIONS,
-    externalFetchImpl: (async () => html('<h1>Page not found</h1><p>This page does not exist.</p>', 404)) as typeof fetch,
+    externalFetchImpl: (async (input: any) => {
+      calls.push(String(input));
+      return html('<h1>Page not found</h1><p>This page does not exist.</p>', 404);
+    }) as typeof fetch,
   });
+  assert.ok(calls.includes('https://creator.example/missing'));
+  const outcome = result.acquisitionOutcomes?.find(item =>
+    item.surface === 'CREATOR_WEBSITES' && item.requestedUrl.includes('/missing'));
+  assert.equal(outcome?.httpStatus, 404);
+  assert.equal(outcome?.staticNotFoundBodyConfirmed, true);
 });
 
 test('M1 H2: an optional 503 remains partial and owns durable retry work', async () => {
@@ -286,6 +331,24 @@ test('M1 M4b: a failed same-origin iframe cannot become a clean negative', async
       const url = String(input);
       if (url === 'https://creator.example/') return html('<iframe src="/frame"></iframe>');
       throw new Error('same-origin frame unavailable');
+    }) as typeof fetch,
+  });
+});
+
+test('M1 M4a: a failed widget fetch stays partial and retry-owned', async () => {
+  await expectPending({
+    channelId: 'e2e-m4a-fail',
+    channelName: 'E2E Test Creator',
+    channelBio: 'No invite',
+    channelLinks: ['https://creator.example/'],
+    videoDescriptions: DESCRIPTIONS,
+    externalFetchImpl: (async (input: any) => {
+      const url = String(input);
+      if (url === 'https://creator.example/') {
+        return html('<iframe src="https://discord.com/widget?id=322850917248663552"></iframe>');
+      }
+      if (url.includes('/widget.json')) return html('unavailable', 503);
+      throw new Error(`unexpected fetch: ${url}`);
     }) as typeof fetch,
   });
 });
