@@ -102,9 +102,14 @@ export async function recordAcquisitionLaneEvent(
   if (!enabled) return false;
 
   const observedAt = isoTimestamp(input.observedAt);
+  // Reserve the crawl counter before caller detail consumes the bounded key
+  // budget, and never let caller detail override it.
+  const callerDetail = input.detail && typeof input.detail === 'object' ? input.detail : {};
+  const { renderedCrawls: _callerRenderedCrawls, ...reservedDetail } = callerDetail;
+  void _callerRenderedCrawls;
   const detail = boundedDetail({
-    ...input.detail,
     renderedCrawls: input.summary.renderedCrawls ?? 0,
+    ...reservedDetail,
     observations: input.summary.signals.observations,
     requiredObservations: input.summary.signals.requiredObservations,
     retryOwningObservations: input.summary.signals.retryOwningObservations,

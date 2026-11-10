@@ -350,14 +350,24 @@ export function summarizeAcquisitionInspection(input: {
 
   // One rendered crawl per unique seed URL. `mode` is set by the crawler
   // telemetry constructors (RENDERED vs STATIC); shared-evidence rows carry a
-  // lender's counters and must not inflate the browser-slot count.
+  // lender's counters and must not inflate the browser-slot count. A rendered
+  // label alone is not enough: gate refusals and launch failures also carry it
+  // with zero work, so require positive crawl evidence. A URL-less observation
+  // cannot certify a unique seed and is not counted.
   const renderedSeeds = new Set<string>();
-  observations.forEach((observation, index) => {
+  observations.forEach(observation => {
     if (String(observation.telemetry?.mode || '').trim().toUpperCase() !== 'RENDERED') return;
     if (observation.sharedEvidenceFrom) return;
-    const surface = String(observation.surface || '').trim();
+    const telemetry = observation.telemetry || {};
+    const hasCrawlEvidence = nonNegativeCount(telemetry.pagesInspected) > 0
+      || nonNegativeCount(telemetry.requestsStarted) > 0
+      || nonNegativeCount(telemetry.requestsFinished) > 0
+      || nonNegativeCount(telemetry.clicksSucceeded) > 0;
+    if (!hasCrawlEvidence) return;
     const requestedUrl = String(observation.requestedUrl || '').trim();
-    renderedSeeds.add(`${surface}|${requestedUrl || `#${index}`}`);
+    if (!requestedUrl) return;
+    const surface = String(observation.surface || '').trim();
+    renderedSeeds.add(`${surface}|${requestedUrl}`);
   });
 
   let pagesInspected = 0;

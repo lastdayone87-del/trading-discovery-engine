@@ -245,9 +245,12 @@ function renderedCrawlsFromRow(row: CrawlThroughputEventRow): { value: number; m
     return { value: 0, metered: false };
   }
   const raw = (detail as Record<string, unknown>).renderedCrawls;
-  const parsed = typeof raw === 'number' ? raw : Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 0) return { value: 0, metered: false };
-  return { value: Math.floor(parsed), metered: true };
+  // JSONB numbers arrive as numbers. Never coerce strings, null, booleans, or
+  // fractional values into a crawl count; mark the pass unmetered instead.
+  if (typeof raw !== 'number' || !Number.isSafeInteger(raw) || raw < 0) {
+    return { value: 0, metered: false };
+  }
+  return { value: raw, metered: true };
 }
 
 interface MutableBucket {

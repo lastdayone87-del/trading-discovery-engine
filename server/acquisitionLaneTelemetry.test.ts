@@ -98,10 +98,16 @@ test('rendered crawl count is per unique rendered seed and excludes static/share
         { requestedUrl: 'https://b.example', surface: 'CREATOR_WEBSITES', outcome: 'PARTIALLY_INSPECTED', telemetry: { mode: 'RENDERED', pagesInspected: 1 } },
         { requestedUrl: 'https://c.example', surface: 'CREATOR_WEBSITES', outcome: 'ACQUIRED', telemetry: { mode: 'STATIC', pagesInspected: 1 } },
         { requestedUrl: 'https://d.example', surface: 'CREATOR_WEBSITES', outcome: 'FOUND', sharedEvidenceFrom: 'https://b.example', telemetry: { mode: 'RENDERED', pagesInspected: 1 } },
+        // Gate refusal/launch failure: rendered label, zero work.
+        { requestedUrl: 'https://refused.example', surface: 'CREATOR_WEBSITES', outcome: 'CAPACITY_DEFERRED', telemetry: { mode: 'RENDERED', pagesInspected: 0, requestsStarted: 0 } },
+        // Started then failed before a page was processed: requests prove work.
+        { requestedUrl: 'https://started.example', surface: 'CREATOR_WEBSITES', outcome: 'ACQUISITION_FAILED', telemetry: { mode: 'RENDERED', pagesInspected: 0, requestsStarted: 1 } },
+        // A URL-less rendered observation cannot certify a unique seed.
+        { surface: 'CREATOR_WEBSITES', outcome: 'ACQUIRED', telemetry: { mode: 'RENDERED', pagesInspected: 1 } },
       ],
     },
   });
-  assert.equal(summary.renderedCrawls, 2);
+  assert.equal(summary.renderedCrawls, 3);
 
   const noRendered = summarizeAcquisitionInspection({
     inspection: {
@@ -342,6 +348,42 @@ test('lane telemetry writer appends one bounded row when enabled', async () => {
   assert.equal(detail.renderedCrawls, 2);
   assert.equal(detail.observations, 1);
   assert.equal(detail.processedObservations, 1);
+});
+
+test('renderedCrawls is reserved before caller detail and cannot be overridden', async () => {
+  const calls: Array<{ sql: string; values: unknown[] }> = [];
+  const filler = Object.fromEntries(
+    Array.from({ length: 20 }, (_, index) => [`k${index}`, index]),
+  );
+  await recordAcquisitionLaneEvent({
+    attribution: { lane: 'RETRY', channelId: 'chan-3', jobId: 'job-3' },
+    outcome: 'ACQUIRED',
+    summary: {
+      pagesInspected: 1,
+      requestsStarted: 1,
+      renderedCrawls: 2,
+      workRemaining: 0,
+      signals: {
+        observations: 1,
+        effectiveObservations: 1,
+        requiredObservations: 1,
+        foundObservations: 1,
+        failedObservations: 0,
+        partialObservations: 0,
+        inspectedNoMatchObservations: 0,
+        retryOwningObservations: 0,
+        infrastructureFailureObservations: 0,
+        conclusiveBlockObservations: 0,
+        processedObservations: 1,
+      },
+    },
+    detail: { ...filler, renderedCrawls: 999 },
+  }, {
+    enabled: () => true,
+    query: async (sql, values) => { calls.push({ sql, values }); return undefined; },
+  });
+  const detail = JSON.parse(String(calls[0].values[12]));
+  assert.equal(detail.renderedCrawls, 2, 'summary value wins and survives the 20-key bound');
 });
 
 test('lane telemetry writer reports duplicate no-ops, bounds capacityEvent, and never throws', async () => {

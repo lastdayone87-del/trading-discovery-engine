@@ -203,6 +203,31 @@ test('unknown lanes and unmetered rows stay visible instead of disappearing', ()
   ]);
 });
 
+test('malformed renderedCrawls values are unmetered and never coerced', () => {
+  const base = {
+    observed_at: '2026-11-10T12:10:00.000Z',
+    lane: 'DISCOVERY',
+    outcome: 'ACQUIRED',
+  };
+  const report = buildCrawlThroughputReport([
+    { ...base, detail: { renderedCrawls: '2' } },
+    { ...base, detail: { renderedCrawls: 2.5 } },
+    { ...base, detail: { renderedCrawls: -1 } },
+    { ...base, detail: { renderedCrawls: null } },
+    { ...base, detail: { renderedCrawls: 2 } },
+  ], {
+    windowHours: 1,
+    now: new Date('2026-11-10T12:30:00.000Z'),
+  });
+
+  assert.equal(report.totals.inspectionPasses, 5);
+  assert.equal(report.totals.unmeteredPasses, 4);
+  assert.equal(report.totals.browserCrawls, 2);
+  assert.equal(report.totals.discoveryBrowserCrawls, 2);
+  assert.equal(report.totals.discoverySharePct, 100);
+  assert.ok(report.warnings.includes('unmetered_rendered_crawl_rows:4'));
+});
+
 test('window start is the exact first UTC hour bucket', () => {
   assert.equal(
     crawlThroughputWindowStart(new Date('2026-11-10T12:30:00.000Z'), 24).toISOString(),
@@ -251,6 +276,13 @@ test('argument parsing is strict and bounded', () => {
   );
   assert.throws(() => parsePhase2CrawlThroughputReportArgs(['--out=']), /--out/);
   assert.throws(() => parsePhase2CrawlThroughputReportArgs(['--check=true']), /unknown argument/);
+});
+
+test('queue inspection emits lane telemetry without awaiting the observation write', () => {
+  const source = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  assert.match(source, /recordAcquisitionInspectionEvent\(/);
+  assert.match(source, /void recordLaneEvent\(/);
+  assert.doesNotMatch(source, /await recordLaneEvent\(/);
 });
 
 test('the production image enables the durable writer and the local example stays opt-in', () => {

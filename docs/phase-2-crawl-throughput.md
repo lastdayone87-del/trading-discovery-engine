@@ -30,12 +30,14 @@ admission, retry, ordering, or browser concurrency.
 
 Source: `acquisition_lane_events`, one row per inspection pass.
 
-- **Browser crawl**: a unique seed URL whose observation carries
-  `telemetry.mode = 'RENDERED'`, written to the row's
-  `detail.renderedCrawls` count. A pass can contain several rendered seeds, and
-  each one consumes the single browser slot. Static HTTP observations
-  (`mode = 'STATIC'`), no-work outcomes, and shared-evidence rows (no refetch)
-  are not browser crawls.
+- **Browser crawl**: a unique, non-empty seed URL whose observation carries
+  `telemetry.mode = 'RENDERED'` **and positive crawl evidence** (pages
+  inspected, requests started/finished, or clicks succeeded). It is written to
+  the row's `detail.renderedCrawls` count. A pass can contain several rendered
+  seeds, and each one consumes the single browser slot. Static HTTP
+  observations (`mode = 'STATIC'`), no-work outcomes, gate refusals/launch
+  failures with zero evidence, URL-less observations, and shared-evidence rows
+  (no refetch) are not browser crawls.
 - **Inspection pass**: one lane-event row. Outcome counts (`completedPasses`,
   `failedPasses`, `deferredPasses`, etc.) are per pass, not per browser crawl.
 - **All lanes count toward the browser ceiling**, including `MAINTENANCE`
@@ -70,8 +72,8 @@ Source: `acquisition_lane_events`, one row per inspection pass.
 
 `--check` exits non-zero when any failure code is present. Use it for the
 post-soak gate, not for the first minutes after a deploy; a fresh window
-legitimately reports `no_browser_crawl_data` until rendered inspections
-complete.
+legitimately reports `no_browser_crawl_data` until the first rendered crawl
+with positive work evidence is recorded.
 
 ## Running the report
 
