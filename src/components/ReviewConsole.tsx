@@ -138,31 +138,32 @@ export const ReviewConsole: React.FC<{ onReviewCompleted?: () => void }> = ({ on
       setError(err instanceof Error ? err.message : 'Could not load review evidence.');
       setBundle(null);
     } finally {
-      setLoadingBundle(false);
+      if (requestId === bundleRequest.current) setLoadingBundle(false);
     }
   }, []);
 
   const selectChannel = useCallback((channelId: string) => {
+    // Invalidate any in-flight evidence request and clear the old bundle
+    // immediately. Re-clicking the current row also reloads safely.
+    bundleRequest.current += 1;
+    setBundle(null);
+    setLoadingBundle(true);
     if (channelId === selectedRef.current) {
       void loadBundle(channelId);
       return;
     }
-    // Clear immediately so the previous channel's evidence cannot be submitted
-    // while the new bundle is loading.
-    bundleRequest.current += 1;
-    setBundle(null);
     setSelected(channelId);
-    setLoadingBundle(true);
   }, [loadBundle]);
 
   const refreshConsole = useCallback(async () => {
     const target = selectedRef.current;
     const loaded = await loadQueue();
+    await loadCatalog();
     if (!loaded) return;
     // If the operator selected another channel while the queue was loading,
     // let the selection effect load it instead of overwriting it with A.
     if (target && selectedRef.current === target) await loadBundle(target);
-  }, [loadQueue, loadBundle]);
+  }, [loadQueue, loadBundle, loadCatalog]);
 
   useEffect(() => { selectedRef.current = selected; }, [selected]);
   useEffect(() => { void loadCatalog(); }, [loadCatalog]);
