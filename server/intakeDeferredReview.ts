@@ -236,6 +236,10 @@ export async function decideIntakeDeferredReview(input: DecideIntakeDeferredInpu
       [input.idempotencyKey],
     );
     if (prior.rowCount) {
+      if (String(prior.rows[0].decision) !== input.decision) {
+        await client.query('ROLLBACK');
+        throw Object.assign(new Error('Idempotency key was already used for a different decision.'), { status: 409 });
+      }
       await client.query('COMMIT');
       return { decision: prior.rows[0], idempotent: true };
     }
@@ -270,9 +274,9 @@ export async function decideIntakeDeferredReview(input: DecideIntakeDeferredInpu
     if (replay.rowCount) {
       if (String(replay.rows[0].decision) !== input.decision) {
         await client.query('ROLLBACK');
-      } else {
-        await client.query('COMMIT');
+        throw Object.assign(new Error('Idempotency key was already used for a different decision.'), { status: 409 });
       }
+      await client.query('COMMIT');
       return { decision: replay.rows[0], idempotent: true };
     }
     if (Number(row.review_version) !== input.expectedVersion) {

@@ -1546,6 +1546,8 @@ async function processIntakeDeferredRecheckJob(
         if (!projected.rowCount) {
           await admitClient.query('ROLLBACK');
           admitTransaction = false;
+          await finishQuotaReservation('ENRICH_CHANNEL', job.id, true);
+          reserved = false;
           await completeJob(job.id);
           return true;
         }
@@ -1566,6 +1568,8 @@ async function processIntakeDeferredRecheckJob(
           await admitClient.query('ROLLBACK');
           admitTransaction = false;
           console.warn('[IntakeRecheck] Admitted follow-up job was not runnable; leaving channel deferred for retry.');
+          await finishQuotaReservation('ENRICH_CHANNEL', job.id, true);
+          reserved = false;
           await completeJob(job.id);
           return true;
         }
