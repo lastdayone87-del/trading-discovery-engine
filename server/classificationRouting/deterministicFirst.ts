@@ -56,11 +56,11 @@ type RoutingInput = Pick<
   'status' | 'confidenceScore' | 'evidenceCollection' | 'recognitionState' | 'semanticPolicy' | 'decisionPolicy' | 'classificationMethod'
 >;
 
-export const STRONG_TRADING_ANALYSIS = /(technical\s*analysis|price\s*action|market\s*analysis|\bict\b|\bsmc\b|day\s*trad|swing\s*trad|scalp|live\s*trad|trade\s*setup|trade\s*journal|back\s*test|backtest|risk\s*management|chart\s*analysis|market\s*structure|volume\s*profile|footprint|forex\s*analysis|futures?\s*analysis|options?\s*analysis|stock\s*analysis|crypto\s*analysis|support\s*and\s*resistance|candlestick|breakout|pullback|moving\s*average|\brsi\b|\bmacd\b|fibonacci|elliott|wyckoff|\bpnl\b|p\s*&\s*l|trading\s*strategy|trading\s*education|market\s*update|market\s*recap|market\s*(?:forecast|outlook|preview)|weekly\s*(?:forecast|outlook|preview)|price\s*(?:forecast|outlook)|\bforecast\b|\boutlook\b|price\s*analysis|gold\s*analysis|silver\s*analysis|metals?\s*analysis|commodity\s*analysis|platinum\s*analysis|capital\s*market|\bvix\b|macro\s*(?:analysis|outlook|commentary|positioning)|market\s*crash|прогноз|анализ|تحلیل\s*(?:تکنیکال|بازار|فنی)|ترید|معامله\s*گری|технический\s*анализ|анализ\s*рынка|трейдинг|analyse\s*(?:technique|du\s*marché)|analyse\s*de\s*marché|技術分析|技術的な分析|차트\s*분석|기술적\s*분석|analyse\s*technique|an[aá]lisis\s*t[eé]cnico|analisi\s*tecnica|technische\s*analyse|teknik\s*analiz|テクニカル分析|技术分析|تحليل\s*فني|технический\s*анализ)/iu;
+export const STRONG_TRADING_ANALYSIS = /(technical\s*analysis|price\s*action|market\s*analysis|\bict\b|\bsmc\b|day\s*trad|swing\s*trad|scalp|live\s*trad|trade\s*setup|trade\s*journal|back\s*test|backtest|risk\s*management|chart\s*analysis|market\s*structure|volume\s*profile|footprint|forex\s*analysis|futures?\s*analysis|options?\s*analysis|stock\s*analysis|crypto\s*analysis|support\s*and\s*resistance|candlestick|breakout|pullback|moving\s*average|\brsi\b|\bmacd\b|fibonacci|elliott|wyckoff|\bpnl\b|p\s*&\s*l|trading\s*strategy|trading\s*education|market\s*update|market\s*recap|(?:market|price|weekly|daily|fx|forex|stock|crypto|gold|silver|oil|index|indices|futures?|commodity|currency|eurusd|gbpusd|usdjpy|audusd|usdcad|usdchf|nzdusd|xauusd|xagusd)\s+(?:forecast|outlook|preview)|\b(?:eurusd|gbpusd|usdjpy|audusd|usdcad|usdchf|nzdusd|xauusd|xagusd)\b|\btechnical\s+outlook\b|price\s*analysis|gold\s*analysis|silver\s*analysis|metals?\s*analysis|commodity\s*analysis|platinum\s*analysis|capital\s*market|\bvix\b|macro\s*(?:analysis|outlook|commentary|positioning)|market\s*crash|прогноз|анализ|تحلیل\s*(?:تکنیکال|بازار|فنی)|ترید|معامله\s*گری|технический\s*анализ|анализ\s*рынка|трейдинг|analyse\s*(?:technique|du\s*marché)|analyse\s*de\s*marché|技術分析|技術的な分析|차트\s*분석|기술적\s*분석|analyse\s*technique|an[aá]lisis\s*t[eé]cnico|analisi\s*tecnica|technische\s*analyse|teknik\s*analiz|テクニカル分析|技术分析|تحليل\s*فني|технический\s*анализ)/iu;
 
 const NON_TRADING_FOCUS: Array<[string, RegExp]> = [
   ['ENTERTAINMENT', /\b(?:dance|dancing|choreography|music|song|lyrics|vlog|prank|recipe|cooking|gaming|gameplay|fortnite|minecraft|makeup|beauty|unboxing|(?<!market\s)(?<!price\s)reaction)s?\b/giu],
-  ['PROMOTION', /\b(?:memecoin|meme\s*coin|presale|pre-sale|airdrop|nft|play[\s-]*to[\s-]*earn|giveaway|token\s*launch|pump(?!\s*(?:and|&|n)\s*dump)|contract\s*address)s?\b|\bbuy\s*\$/giu],
+  ['PROMOTION', /\b(?:memecoin|meme\s*coin|presale|pre-sale|airdrop|nft|play[\s-]*to[\s-]*earn|giveaway|token\s*launch|pump(?![\s-]*(?:and|&|n)[\s-]*dump\b)|contract\s*address)s?\b|\bbuy\s*\$/giu],
   ['PERSONAL_FINANCE', /\b(?:personal\s*finance|debt|budgeting?|credit\s*(?:card|score|repair)|savings?|mortgage|retirement|paycheck|money\s*management|get\s*out\s*of\s*debt|win\s*with\s*money)\b/giu],
   ['EXCHANGE_CORPORATE', /\b(?:stock\s*exchange|exchange\s*listing|listing\s*ceremony|award|gong|annual\s*report|market\s*opening|opening\s*ceremony|beleggingsoplossing)\b/giu],
 ];
@@ -102,9 +102,10 @@ export function stripRepeatedFooterLines(texts: string[]): string[] {
   return linesByVideo.map(lines => {
     // A single-line video is its subject, not a footer. Keep it even when two
     // distinct uploads share the same metadata.
-    if (lines.length <= 1) return lines.join(' ').trim();
-    const kept = lines.filter(line => (counts.get(line) || 0) < 2);
-    return (kept.length ? kept : lines.slice(0, 1)).join(' ').trim();
+    // The first line is the video's subject/title. Footer removal applies only
+    // to the lines after it, so repeated titles never disappear.
+    const kept = lines.filter((line, index) => index === 0 || (counts.get(line) || 0) < 2);
+    return kept.join(' ').trim();
   });
 }
 
