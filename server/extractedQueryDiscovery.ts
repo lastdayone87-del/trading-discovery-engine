@@ -111,7 +111,7 @@ const WEAK_INTENT_TOKENS = new Set([
 // trailing number when matching intent; stripping digits from every strong
 // word would admit brands such as Delta2024 Airlines.
 const NUMBERED_TICKER_BASES = new Set([
-  'dax', 'nq', 'es', 'ym', 'rty', 'spx', 'ndx', 'ftse', 'cac', 'ibex', 'omx',
+  'dax', 'nq', 'es', 'ym', 'rty', 'spx', 'ndx', 'nasdaq', 'sp', 'dow', 'russell', 'vix', 'ftse', 'cac', 'ibex', 'omx',
   'stoxx', 'hsi', 'nikkei', 'usd', 'eur', 'gbp', 'jpy', 'aud', 'cad', 'chf',
   'btc', 'eth', 'xau', 'xag', 'wti', 'brent',
 ]);
