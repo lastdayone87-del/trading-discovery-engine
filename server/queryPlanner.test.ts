@@ -4,6 +4,7 @@ import type { ExtractedTermRecord, QueryRecord } from '../src/types';
 import { isCountryScriptCompatible, isRetrievalOrientedQuery, limitRepeatedPrimaryTerms, normalizeQuery, planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, queriesOutsideCooldown, queryTokenCount, rotateAwayFromMostRecentIntent } from './queryPlanner';
 import { ORGANIC_QUERY_POLICY_VERSION } from './organicQueryExpansion';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
+import { admitQueryRecord } from './queryQuality/admission';
 
 function query(overrides: Partial<QueryRecord>): QueryRecord {
   return {
@@ -249,6 +250,168 @@ test('planner produces novel local instrument-market variants when every current
   assert.ok(instrumentMarket.length > 0, 'no novel instrument-market fallback was planned');
   assert.ok(instrumentMarket.every(item => /BEL|EURUSD/i.test(item.query)));
   assert.ok(planned.some(item => item.metadata.queryTemplate === 'SINGLE_ATOM'));
+});
+
+test('accepted extracted queries are planned as standalone surfaces and pass admission/authority', () => {
+  const candidate = {
+    id: 9001,
+    candidateText: 'QQQ Entries with Volume Profile',
+    language: 'en',
+    intent: 'strategy',
+    confidence: 0.8,
+    sourceTitle: 'How to Time QQQ Entries with Volume Profile + GEX',
+  };
+  const planned = planDiverseQueries({
+    country: 'United States',
+    count: 8,
+    learnedVocabulary: [],
+    existingQueries: [],
+    standaloneExtractedCandidates: [candidate],
+  });
+  const extracted = planned.find(item => item.metadata.queryTemplate === 'EXTRACTED_STANDALONE');
+  assert.ok(extracted, `no extracted standalone query: ${planned.map(item => `${item.metadata.queryTemplate}:${item.query}`).join(' | ')}`);
+  assert.equal(extracted.query, candidate.candidateText);
+  assert.equal((extracted.metadata as any).extractedCandidateId, candidate.id);
+  const admitted = admitQueryRecord({
+    query: extracted.query,
+    country: 'United States',
+    primary_term: extracted.primaryTerm,
+    generation_metadata: extracted.metadata,
+  });
+  assert.equal(admitted.eligible, true, admitted.reasonCodes.join(','));
+  const authority = evaluateAutonomousQueryAuthority({
+    id: 1,
+    query: extracted.query,
+    country: 'United States',
+    collection: 'EXPERIMENTAL',
+    intent: extracted.intent,
+    times_executed: 0,
+    total_channels_found: 0,
+    unique_channels_found: 0,
+    quality_channels_found: 0,
+    community_channels_found: 0,
+    avg_quality_score: 0,
+    performance_score: 0,
+    created_at: '2026-08-01T00:00:00.000Z',
+    status: 'ACTIVE',
+    primary_term: extracted.primaryTerm,
+    generation_metadata: extracted.metadata,
+  });
+  assert.equal(authority.eligible, true, authority.reasonCodes.join(','));
+  const forged = evaluateAutonomousQueryAuthority(query({
+    id: 3,
+    query: extracted.query,
+    country: 'United States',
+    generation_metadata: { ...extracted.metadata, extractedCandidateId: undefined },
+  }));
+  assert.equal(forged.eligible, false);
+  assert.ok(forged.reasonCodes.includes('CURRENT_RETRIEVAL_SHAPE_FAILED'), forged.reasonCodes.join(','));
+  const blockedProse = planDiverseQueries({
+    country: 'United States',
+    count: 8,
+    learnedVocabulary: [],
+    existingQueries: [],
+    standaloneExtractedCandidates: [{
+      id: 9009,
+      candidateText: 'weekly trade breakdown',
+      language: 'en',
+      intent: 'strategy',
+      confidence: 0.8,
+      sourceTitle: 'weekly trade breakdown',
+    }],
+  });
+  assert.ok(!blockedProse.some(item => item.metadata.queryTemplate === 'EXTRACTED_STANDALONE'));
+});
+
+test('non-Latin extracted standalone queries plan, admit and keep execution authority', () => {
+  const candidate = {
+    id: 9002,
+    candidateText: 'தங்கம் விலை பகுப்பாய்வு',
+    language: 'ta',
+    intent: 'market_analysis',
+    confidence: 0.8,
+    sourceTitle: 'தங்கம் விலை பகுப்பாய்வு',
+  };
+  const planned = planDiverseQueries({
+    country: 'Singapore',
+    count: 8,
+    learnedVocabulary: [],
+    existingQueries: [],
+    standaloneExtractedCandidates: [candidate],
+  });
+  const extracted = planned.find(item => item.metadata.queryTemplate === 'EXTRACTED_STANDALONE');
+  assert.ok(extracted, `no native extracted standalone query: ${planned.map(item => `${item.metadata.queryTemplate}:${item.query}`).join(' | ')}`);
+  assert.equal(extracted.query, candidate.candidateText);
+  assert.equal((extracted.metadata as any).extractedCandidateId, candidate.id);
+  assert.equal(isCountryScriptCompatible('Singapore', extracted.query), true);
+  assert.equal((extracted.metadata as any).preferredLanguage, 'ta');
+  assert.equal((extracted.metadata as any).languageLineage.selectedLanguage, 'ta');
+  const admitted = admitQueryRecord({
+    query: extracted.query,
+    country: 'Singapore',
+    primary_term: extracted.primaryTerm,
+    generation_metadata: extracted.metadata,
+  });
+  assert.equal(admitted.eligible, true, admitted.reasonCodes.join(','));
+  const authority = evaluateAutonomousQueryAuthority({
+    id: 2,
+    query: extracted.query,
+    country: 'Singapore',
+    collection: 'EXPERIMENTAL',
+    intent: extracted.intent,
+    times_executed: 0,
+    total_channels_found: 0,
+    unique_channels_found: 0,
+    quality_channels_found: 0,
+    community_channels_found: 0,
+    avg_quality_score: 0,
+    performance_score: 0,
+    created_at: '2026-08-01T00:00:00.000Z',
+    status: 'ACTIVE',
+    primary_term: extracted.primaryTerm,
+    generation_metadata: extracted.metadata,
+  });
+  assert.equal(authority.eligible, true, authority.reasonCodes.join(','));
+});
+
+test('extracted standalone queries survive creator-derived reservation pressure', () => {
+  const terminology: ExtractedTermRecord[] = ['DAX', 'Orderflow', 'Footprint', 'Liquidität', 'Risikomanagement', 'Chartanalyse', 'Scalping', 'Breakout']
+    .map((value, index) => term(index + 1, value, 2, 5));
+  const planned = planDiverseQueries({
+    country: 'Germany',
+    count: 4,
+    learnedVocabulary: terminology,
+    existingQueries: [],
+    standaloneExtractedCandidates: [{
+      id: 9003,
+      candidateText: 'Footprint Trading DAX',
+      language: 'de',
+      intent: 'strategy',
+      confidence: 0.8,
+      sourceTitle: 'Footprint Trading DAX Orderflow',
+    }],
+  });
+  assert.ok(
+    planned.some(item => item.metadata.queryTemplate === 'EXTRACTED_STANDALONE' && item.query === 'Footprint Trading DAX'),
+    planned.map(item => `${item.metadata.queryTemplate}:${item.query}`).join(' | '),
+  );
+});
+
+test('blocked extracted text does not consume the 40% planner slot', () => {
+  const planned = planDiverseQueries({
+    country: 'Germany',
+    count: 4,
+    learnedVocabulary: [],
+    existingQueries: [query({ id: 77, query: 'Footprint Trading DAX', country: 'Germany' })],
+    standaloneExtractedCandidates: [
+      { id: 9101, candidateText: 'Footprint Trading DAX', language: 'de', intent: 'strategy', confidence: 0.9, sourceTitle: 'x' },
+      { id: 9102, candidateText: 'DAX Orderflow Strategie', language: 'de', intent: 'strategy', confidence: 0.7, sourceTitle: 'y' },
+    ],
+  });
+  const extracted = planned.filter(item => item.metadata.queryTemplate === 'EXTRACTED_STANDALONE');
+  assert.equal(extracted.length, 1, planned.map(item => `${item.metadata.queryTemplate}:${item.query}`).join(' | '));
+  assert.equal(extracted[0].query, 'DAX Orderflow Strategie');
+  assert.equal((extracted[0].metadata as any).extractedCandidateId, 9102);
 });
 
 test('ambiguous short modifiers are not used by frontier target fallback', () => {

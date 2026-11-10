@@ -214,6 +214,22 @@ test('Q2: a mixed candidate cannot borrow the legacy composition limit', () => {
   assert.ok(decision.reasonCodes.includes('TOO_MANY_TOKENS'));
 });
 
+test('Q2: a mixed candidate cannot borrow the extracted-standalone semantic bypass', () => {
+  const mixed = buildQueryCandidate({
+    query: 'தங்கம் விலை பகுப்பாய்வு 今日の料理',
+    country: 'Singapore',
+    language: 'ta',
+    atoms: [
+      { term: 'தங்கம் விலை பகுப்பாய்வு', role: 'ANCHOR', type: 'TERMINOLOGY', provenance: 'EXTRACTED_STANDALONE', language: 'ta' },
+      { term: '今日の料理', role: 'MODIFIER', type: 'TERMINOLOGY', provenance: 'EXTRACTED_STANDALONE', language: 'ja' },
+    ],
+    source: 'LEARNED_TERMINOLOGY',
+  });
+  const decision = evaluateQueryComposition(mixed);
+  assert.equal(decision.eligible, false);
+  assert.ok(decision.reasonCodes.includes('TERM_NO_TRADING_SEMANTICS'), decision.reasonCodes.join(','));
+});
+
 test('Q2: every planned query for all production countries is admitted', () => {
   let total = 0;
   let admitted = 0;

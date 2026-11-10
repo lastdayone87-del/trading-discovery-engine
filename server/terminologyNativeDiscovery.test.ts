@@ -32,6 +32,8 @@ import {
   loadNoveltyBaseline,
   replayVocabularyForRetry,
   admitNativeCandidates,
+  selectComplementaryPlaylists,
+  isOfferableExtractedCandidate,
   alignVideoIdsToTitles,
   buildLiteralSources,
   defaultReconcileExtractedTerm,
@@ -1997,6 +1999,16 @@ test('over-length candidates are rejected by the length guard, not by missing in
   assert.equal(calls.length, 0);
 });
 
+test('playlist context can supply instrument evidence without replacing video input', () => {
+  const hits = findRuleInstrumentHits(
+    'Kanal', ['DAX trading heute'], '', undefined, undefined,
+    [{ name: 'ES Futures Playlist' }],
+  );
+  assert.ok(hits.some(hit => hit.instrument === 'ES' && hit.located.sourceKind === 'PLAYLIST_TITLE'));
+  assert.ok(hits.some(hit => hit.instrument === 'DAX' && hit.located.sourceKind === 'VIDEO_TITLE'));
+  assert.deepEqual(selectComplementaryPlaylists([], [{ name: 'ES Futures Playlist' }]), []);
+});
+
 test('rule-based instrument matching respects token boundaries', () => {
   assert.deepEqual(findRuleInstrumentHits('heroes and best trades', [], ''), []);
   const hits = findRuleInstrumentHits('trade ES Futures today', [], '');
@@ -2495,6 +2507,18 @@ test('rule-admitted instruments are filtered from AI candidates', () => {
   assert.equal(excludeRuleAdmittedInstruments(undefined, ruleObserved), undefined);
   const source = readFileSync(new URL('./queryIntelligence.ts', import.meta.url), 'utf8');
   assert.match(source, /excludeRuleAdmittedInstruments\(values, ruleObserved\)/);
+});
+
+test('extracted offer predicate rejects prose and admits native Tamil for Singapore', () => {
+  assert.equal(isOfferableExtractedCandidate({ candidateText: 'DAX Orderflow Strategie', language: 'de' }, 'Germany'), true);
+  assert.equal(isOfferableExtractedCandidate({ candidateText: 'weekly trade breakdown', language: 'en' }, 'United States'), false);
+  assert.equal(isOfferableExtractedCandidate({ candidateText: 'தங்கம் விலை பகுப்பாய்வு', language: 'ta' }, 'Singapore'), true);
+});
+
+test('playlists never trigger extraction without video evidence', () => {
+  const playlists = [{ name: 'Live FOREX TRADING LESSONS' }];
+  assert.deepEqual(selectComplementaryPlaylists([], playlists), []);
+  assert.deepEqual(selectComplementaryPlaylists(['Weekly trade analysis'], playlists), playlists);
 });
 
 test('extraction admits only literal, non-spam candidates with observe-first ordering', () => {
