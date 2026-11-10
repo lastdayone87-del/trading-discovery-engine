@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ChannelRecord, DiscoverySource } from '../src/types';
-import { machineNonTradingRediscoveryEligible, shouldPreserveExistingChannel } from './terminalPreservationPolicy';
+import { countryPolicySnapshotFromRow, countryPolicySnapshotMatches, machineNonTradingRediscoveryEligible, shouldPreserveResolvedCountry, shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldRevalidateConfirmedCountry, shouldShortCircuitConfirmedRediscovery, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
 
 const NOW = Date.parse('2026-08-16T04:00:00.000Z');
 
@@ -67,4 +67,82 @@ test('explicit recheck remains immediate terminal override lane', () => {
 
 test('manual search can still refresh a non-terminal stable trading row', () => {
   assert.equal(shouldPreserveExistingChannel(base(), source('manual_search'), true, NOW), false);
+});
+
+test('TRADING_CONFIRMED is preserved under ordinary rediscovery even with uncertain country', () => {
+  const confirmed = base({ trading_status: 'TRADING_CONFIRMED', country_status: 'UNCERTAIN', country: '' });
+  assert.equal(shouldShortCircuitConfirmedRediscovery(confirmed, false), true);
+  assert.equal(shouldPreserveExistingChannel(confirmed, source('automated_query'), false, NOW), true);
+  assert.equal(shouldShortCircuitConfirmedRediscovery(confirmed, true), false);
+});
+
+test('an active enrichment marker on a confirmed row is projected COMPLETED on rediscovery', () => {
+  assert.equal(terminalScanStatusForConfirmedRediscovery('ENRICHMENT_PENDING', false), 'COMPLETED');
+  assert.equal(terminalScanStatusForConfirmedRediscovery('ENRICHING', false), 'COMPLETED');
+  assert.equal(terminalScanStatusForConfirmedRediscovery('LOCKED', false), 'LOCKED');
+  assert.equal(terminalScanStatusForConfirmedRediscovery('ENRICHING', true), 'ENRICHING', 'a live job owns the marker');
+  assert.equal(terminalScanStatusForConfirmedRediscovery('NEEDS_REVIEW', false), 'NEEDS_REVIEW');
+  assert.equal(terminalScanStatusForConfirmedRediscovery('FAILED', false), 'FAILED');
+});
+
+test('confirmed rows with unresolved country get only the deterministic country pass', () => {
+  const confirmedUnknown = base({ trading_status: 'TRADING_CONFIRMED', country_status: 'UNCERTAIN', country: '' });
+  assert.equal(shouldRevalidateConfirmedCountry(confirmedUnknown, false), true);
+  assert.equal(shouldRevalidateConfirmedCountry(confirmedUnknown, true), false);
+  assert.equal(shouldRevalidateConfirmedCountry(base(), false), false);
+  assert.equal(shouldRevalidateConfirmedCountry(base({ trading_status: 'UNCERTAIN', country_status: 'UNCERTAIN' }), false), false);
+});
+
+test('Discord bypass never reopens country-terminal or confirmed rows', () => {
+  const completed = base({ trading_status: 'UNCERTAIN', scan_status: 'COMPLETED', country_status: 'CONFIRMED' });
+  assert.equal(shouldBypassPreservationForDiscordEvidence(completed, true), true);
+  assert.equal(shouldBypassPreservationForDiscordEvidence(base({ trading_status: 'TRADING_CONFIRMED', scan_status: 'COMPLETED' }), true), false);
+  assert.equal(shouldBypassPreservationForDiscordEvidence(base({ trading_status: 'UNCERTAIN', scan_status: 'COMPLETED', country_status: 'REJECTED' }), true), false);
+  assert.equal(shouldBypassPreservationForDiscordEvidence(base({ trading_status: 'UNCERTAIN', scan_status: 'SKIPPED_EXCLUDED' }), true), false);
+  assert.equal(shouldBypassPreservationForDiscordEvidence(completed, false), false);
+});
+
+test('a slow country pass cannot overwrite a concurrent rejection or confirmation', () => {
+  const unconfirmed = { countryStatus: 'UNCERTAIN', country: '' };
+  assert.equal(countryPolicySnapshotMatches(unconfirmed, unconfirmed), true);
+  assert.equal(countryPolicySnapshotMatches({ countryStatus: 'REJECTED', country: 'Netherlands' }, unconfirmed), false);
+  assert.equal(countryPolicySnapshotMatches({ countryStatus: 'CONFIRMED', country: 'Netherlands' }, unconfirmed), false);
+  assert.equal(countryPolicySnapshotMatches({ countryStatus: 'UNCERTAIN', country: 'Belgium' }, unconfirmed), false);
+  assert.equal(countryPolicySnapshotMatches(null, unconfirmed), false);
+  const policy = { countryStatus: 'UNCERTAIN', country: '', tradingStatus: 'TRADING_CONFIRMED', scanStatus: 'COMPLETED' };
+  assert.equal(countryPolicySnapshotMatches({ ...policy }, policy), true);
+  assert.equal(countryPolicySnapshotMatches({ ...policy, tradingStatus: 'NON_TRADING' }, policy), false);
+  assert.equal(countryPolicySnapshotMatches({ ...policy, scanStatus: 'ENRICHMENT_PENDING' }, policy), false);
+});
+
+test('raw channel rows map snake_case country columns before comparison', () => {
+  const row = { country_status: 'UNCERTAIN', country: '' };
+  assert.deepEqual(countryPolicySnapshotFromRow(row), { countryStatus: 'UNCERTAIN', country: '' });
+  assert.equal(countryPolicySnapshotMatches(countryPolicySnapshotFromRow(row), { countryStatus: 'UNCERTAIN', country: '' }), true);
+  assert.equal(countryPolicySnapshotMatches(countryPolicySnapshotFromRow({ country_status: 'REJECTED', country: 'Germany' }), { countryStatus: 'UNCERTAIN', country: '' }), false);
+  assert.equal(countryPolicySnapshotFromRow(null), null);
+  assert.deepEqual(
+    countryPolicySnapshotFromRow({ country_status: 'UNCERTAIN', country: '', trading_status: 'TRADING_CONFIRMED', scan_status: 'COMPLETED' }),
+    { countryStatus: 'UNCERTAIN', country: '', tradingStatus: 'TRADING_CONFIRMED', scanStatus: 'COMPLETED' },
+  );
+});
+
+test('a country-only pass never downgrades a resolved country to uncertain', () => {
+  assert.equal(shouldPreserveResolvedCountry('CONFIRMED', 'UNCERTAIN'), true);
+  assert.equal(shouldPreserveResolvedCountry('LIKELY', 'UNCERTAIN'), true);
+  assert.equal(shouldPreserveResolvedCountry('REJECTED', 'UNCERTAIN'), true);
+  assert.equal(shouldPreserveResolvedCountry('CONFIRMED', 'LIKELY'), false);
+  assert.equal(shouldPreserveResolvedCountry('UNCERTAIN', 'UNCERTAIN'), false);
+  assert.equal(shouldPreserveResolvedCountry(undefined, 'UNCERTAIN'), false);
+});
+
+test('a live enrichment job classifies an uncertain row even when a stale projection marked it completed', () => {
+  const completedUncertain = base({ trading_status: 'UNCERTAIN', scan_status: 'COMPLETED', country_status: 'CONFIRMED' });
+  assert.equal(shouldPreserveExistingChannel(completedUncertain, 'automated_query', false), true);
+  assert.equal(shouldPreserveExistingChannel(completedUncertain, 'automated_query', false, Date.now(), { allowActiveEnrichmentClassification: true }), false);
+  // The active-job exception never reopens confirmed, country-terminal, or non-trading rows.
+  assert.equal(shouldPreserveExistingChannel(base({ trading_status: 'TRADING_CONFIRMED', scan_status: 'COMPLETED' }), 'automated_query', false, Date.now(), { allowActiveEnrichmentClassification: true }), true);
+  assert.equal(shouldPreserveExistingChannel(base({ country_status: 'REJECTED', scan_status: 'COMPLETED' }), 'automated_query', false, Date.now(), { allowActiveEnrichmentClassification: true }), true);
+  assert.equal(shouldPreserveExistingChannel(base({ trading_status: 'NON_TRADING', scan_status: 'SKIPPED_NON_TRADING', last_checked: new Date().toISOString() }), 'automated_query', false, Date.now(), { allowActiveEnrichmentClassification: true }), true);
+
 });

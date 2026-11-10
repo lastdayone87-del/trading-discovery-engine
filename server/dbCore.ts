@@ -23,6 +23,7 @@ import { invalidateProviderCooldownCache, providerCooldownReadCache } from './co
 import { sanitizeSubscriberCountText } from './lowAudienceGate';
 import { countryIdentitySql } from './countryExclusionRules';
 import { classifyDiscoveryVisibility } from './discoveryStateVisibility';
+import { countryPolicySnapshotFromRow, countryPolicySnapshotMatches, type CountryPolicySnapshot } from './terminalPreservationPolicy';
 import { safeCrawlerTelemetry, type CrawlerTelemetry } from './crawlerTelemetry';
 import { admitBulkEnqueue, commitBulkEnqueue, releaseBulkEnqueue, BulkEnqueueGuardError } from './acquisitionBulkEnqueueGuard';
 import { sanitizeAcquisitionAttribution, type AcquisitionAttribution } from './acquisitionLaneTaxonomy';
@@ -1519,6 +1520,45 @@ export async function getClassificationBackpressureState(queryScopeKey: string):
   };
 }
 
+/**
+ * Admit one durable classification for a channel atomically. The advisory
+ * transaction lock serializes ordinary discovery admission and the Discord
+ * evidence pass, so a check-then-insert race cannot create two active
+ * classification jobs for the same channel.
+ */
+export async function enqueueClassificationJobAtomic(
+  channelId: string,
+  payload: any,
+  opts: Parameters<typeof enqueueJob>[2] = {},
+  deps: { client?: any } = {},
+): Promise<DurableJob | null> {
+  // The helper owns the transaction. `deps.client` exists only so tests can
+  // drive the locking/admission branches; production callers must not pass a
+  // client that is already inside a caller-owned transaction.
+  const client = deps.client || await (await getDb()).connect();
+  const ownsClient = !deps.client;
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`classification-admit:${channelId}`]);
+    const active = await client.query(
+      `SELECT 1 FROM jobs WHERE type=$1 AND status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$2 LIMIT 1`,
+      [CLASSIFICATION_JOB_TYPE, channelId],
+    );
+    if (active.rowCount) {
+      await client.query('COMMIT');
+      return null;
+    }
+    const job = await enqueueJob(CLASSIFICATION_JOB_TYPE, payload, { ...opts, clientOverride: client });
+    await client.query('COMMIT');
+    return job;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    if (ownsClient) client.release();
+  }
+}
+
 /** True while a durable classification for this channel is still claimable. */
 export async function hasActiveClassificationJob(channelId: string): Promise<boolean> {
   const db = await getDb();
@@ -1581,13 +1621,15 @@ export async function reconcileClassificationSighting(input: {
   return result.rowCount || 0;
 }
 
-export async function upsertChannel(channel: ChannelRecord, options?: { preserveDiscordOnUpdate?: boolean; allowDiscordClear?: boolean; freshDiscordValidation?: boolean }): Promise<void> {
+export interface UpsertChannelOptions { preserveDiscordOnUpdate?: boolean; allowDiscordClear?: boolean; freshDiscordValidation?: boolean; requireCountrySnapshot?: CountryPolicySnapshot }
+
+export async function upsertChannelWithResult(channel: ChannelRecord, options?: UpsertChannelOptions): Promise<boolean> {
   const db = await getDb();
   const client = await db.connect();
   try {
     await client.query('BEGIN');
     const prior = await client.query(
-      `SELECT quality_score,trading_status,${DISCORD_PROJECTION_WRITE_COLUMNS.join(',')} FROM channels WHERE channel_id=$1 FOR UPDATE`,
+      `SELECT quality_score,trading_status,country,country_status,scan_status,${DISCORD_PROJECTION_WRITE_COLUMNS.join(',')} FROM channels WHERE channel_id=$1 FOR UPDATE`,
       [channel.channel_id]
     );
     // The row is locked above for this transaction. A classification-only write
@@ -1598,6 +1640,17 @@ export async function upsertChannel(channel: ChannelRecord, options?: { preserve
     // upsert passes `freshDiscordValidation` so fresh validation outcomes
     // (including operational failures and retry-pending evidence) apply.
     const locked = prior.rowCount ? prior.rows[0] : null;
+    // A slow country revalidation must not write its snapshot over a
+    // concurrent rejection or confirmation. The row lock makes this check and
+    // the write one atomic decision.
+    if (options?.requireCountrySnapshot && locked
+      && !countryPolicySnapshotMatches(
+        countryPolicySnapshotFromRow(locked),
+        options.requireCountrySnapshot,
+      )) {
+      await client.query('COMMIT');
+      return false;
+    }
     const preserveDiscord = options?.preserveDiscordOnUpdate === true
       || shouldRetainLockedDiscordProjection(channel, locked, options);
     if (preserveDiscord && locked) {
@@ -1613,12 +1666,18 @@ export async function upsertChannel(channel: ChannelRecord, options?: { preserve
       }
     }
     await client.query('COMMIT');
+    return true;
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;
   } finally {
     client.release();
   }
+}
+
+/** Compatibility wrapper for callers that only need the write side effect. */
+export async function upsertChannel(channel: ChannelRecord, options?: Omit<UpsertChannelOptions, 'requireCountrySnapshot'>): Promise<void> {
+  await upsertChannelWithResult(channel, options);
 }
 
 /**
@@ -1825,6 +1884,26 @@ export async function getProductionBacklogDepth(): Promise<number> {
   const db=await getDb();
   const res=await db.query(`SELECT COUNT(*)::int AS count FROM jobs WHERE status IN ('PENDING','PROCESSING') AND type IN ('SEARCH_YOUTUBE','MANUAL_SEARCH_PAGE','AUTONOMOUS_DISCOVERY_CYCLE','PROCESS_CHANNEL','ENRICH_CHANNEL',$1)`,[CLASSIFICATION_JOB_TYPE]);
   return Number(res.rows[0]?.count||0);
+}
+
+/**
+ * Active work that may still mutate a channel's scan/trading projection:
+ * ordinary enrichment, post-approval/force rechecks, and an already-queued
+ * classification. Rediscovery must not project a live row COMPLETED while any
+ * of these still owns the channel.
+ */
+export async function hasActiveEnrichmentJob(channelId: string, excludeJobId?: string | null): Promise<boolean> {
+  const db = await getDb();
+  const res = await db.query(
+    `SELECT 1 FROM jobs
+      WHERE type IN ('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION',$2)
+        AND status IN ('PENDING','PROCESSING')
+        AND payload->>'channelId'=$1
+        AND ($3::uuid IS NULL OR id <> $3::uuid)
+      LIMIT 1`,
+    [channelId, CLASSIFICATION_JOB_TYPE, excludeJobId || null],
+  );
+  return Boolean(res.rowCount);
 }
 
 export async function toggleQueuePause(queueName:string,isPaused:boolean):Promise<void>{
@@ -3172,7 +3251,7 @@ export async function evaluateClaimGuard(client: ClaimBudgetClient, guard: Claim
     return { admitted: false, exhausted: true };
   }
 }
-export async function enqueueJob(type:string,payload:any,opts:{priority?:number;maxAttempts?:number;runAfter?:string;idempotencyKey?:string;clientOverride?:any;preventReopen?:boolean}={}):Promise<DurableJob>{
+export async function enqueueJob(type:string,payload:any,opts:{priority?:number;maxAttempts?:number;runAfter?:string;idempotencyKey?:string;clientOverride?:any;preventReopen?:boolean;preventCompletedReopen?:boolean}={}):Promise<DurableJob>{
   // Default-off bulk admission. When disabled this only counts and warns.
   // When enabled it enforces the explicit withBulkEnqueueTransaction scope or
   // the rolling 60s window before an unbounded burst reaches the queue.
@@ -3187,9 +3266,18 @@ export async function enqueueJob(type:string,payload:any,opts:{priority?:number;
   try{
   db=opts.clientOverride||await getDb();
   const reopenClockSql=reopenClockUpdateSql(acquisitionJobClockV2Enabled());
+  const reopenSet=`payload=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.payload ELSE jobs.payload END,status=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 'PENDING' ELSE jobs.status END,priority=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.priority ELSE jobs.priority END,max_attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.max_attempts ELSE jobs.max_attempts END,attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 0 ELSE jobs.attempts END,run_after=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.run_after ELSE jobs.run_after END,locked_by=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_by END,locked_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_at END,last_error=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.last_error END,completed_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.completed_at END,updated_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN now() ELSE jobs.updated_at END${reopenClockSql}`;
+  // Three explicit conflict policies:
+  //  - preventReopen: never reopen any terminal row (explicit recovery only).
+  //  - preventCompletedReopen: keep a completed job terminal, but still let a
+  //    failed job retry. Ordinary rediscovery must not turn finished enrichment
+  //    work back into PENDING, while genuine retries must remain possible.
+  //  - default: legacy reopen of both COMPLETED and FAILED work.
   const sql=opts.preventReopen
     ?`INSERT INTO jobs(type,payload,priority,max_attempts,run_after,idempotency_key,catalog_version_id,catalog_policy_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(idempotency_key) DO UPDATE SET updated_at=jobs.updated_at RETURNING *`
-    :`INSERT INTO jobs(type,payload,priority,max_attempts,run_after,idempotency_key,catalog_version_id,catalog_policy_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(idempotency_key) DO UPDATE SET payload=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.payload ELSE jobs.payload END,status=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 'PENDING' ELSE jobs.status END,priority=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.priority ELSE jobs.priority END,max_attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.max_attempts ELSE jobs.max_attempts END,attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 0 ELSE jobs.attempts END,run_after=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.run_after ELSE jobs.run_after END,locked_by=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_by END,locked_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_at END,last_error=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.last_error END,completed_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.completed_at END,updated_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN now() ELSE jobs.updated_at END${reopenClockSql} RETURNING *`;
+    :opts.preventCompletedReopen
+      ?`INSERT INTO jobs(type,payload,priority,max_attempts,run_after,idempotency_key,catalog_version_id,catalog_policy_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(idempotency_key) DO UPDATE SET ${reopenSet} WHERE jobs.status <> 'COMPLETED' RETURNING *`
+      :`INSERT INTO jobs(type,payload,priority,max_attempts,run_after,idempotency_key,catalog_version_id,catalog_policy_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(idempotency_key) DO UPDATE SET ${reopenSet} RETURNING *`;
   res=await db.query(sql,[type,JSON.stringify(payload),opts.priority||0,opts.maxAttempts||3,opts.runAfter||new Date().toISOString(),opts.idempotencyKey||null,payload?.catalogPin?.catalogVersionId||null,payload?.catalogPin?.policyVersion||null]);
   }catch(error){
     releaseBulkEnqueue(bulkAdmission);
@@ -3216,6 +3304,14 @@ export async function enqueueJob(type:string,payload:any,opts:{priority?:number;
   }
   throw new Error('JOB_ENQUEUE_LOST_ROW');
 }
+/** Exact durable owner of an idempotency key, including terminal rows. */
+export async function getJobByIdempotencyKey(idempotencyKey: string): Promise<DurableJob | null> {
+  if (!idempotencyKey) return null;
+  const db = await getDb();
+  const res = await db.query('SELECT * FROM jobs WHERE idempotency_key=$1 LIMIT 1', [idempotencyKey]);
+  return res.rows[0] ? rowToJob(res.rows[0]) : null;
+}
+
 function rowToJob(r:any):DurableJob{return {id:r.id,type:r.type,status:r.status,payload:parseJson(r.payload,{}),attempts:r.attempts,max_attempts:r.max_attempts,run_after:iso(r.run_after)||'',locked_by:r.locked_by,locked_at:iso(r.locked_at),last_error:r.last_error,created_at:iso(r.created_at)||'',reopen_generation:r.reopen_generation==null?0:Number(r.reopen_generation)};}
 export async function claimNextJob(workerId:string,types?:string[],excludedErrorPatterns?:string[],excludedReconciliationStatuses?:string[],budgetGuards:ClaimBudgetGuard[]=[]):Promise<DurableJob|null>{const db=await getDb(); const client=await db.connect(); let claimed:DurableJob|null=null;try{await client.query('BEGIN');
     // Single priority-preserving claim loop: always consider the globally

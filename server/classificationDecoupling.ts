@@ -156,6 +156,24 @@ export function classificationDayBucket(now: number = Date.now()): string {
 }
 
 /**
+ * Ordinary enrichment identity is stable per channel and stage. Rediscovery
+ * cannot create a second job for the same stage or reopen a completed pass;
+ * later stages and explicit operator rechecks use distinct keys. Ordinary
+ * discovery pairs this key with preventCompletedReopen.
+ */
+export function enrichmentJobIdempotencyKey(
+  channelId: string,
+  stage: number,
+  now: number = Date.now(),
+  options: { explicitRecheck?: boolean; recheckNonce?: string | number } = {},
+): string {
+  const base = `enrich:${channelId}:stage:${Math.max(1, Math.floor(stage) || 1)}`;
+  return options.explicitRecheck
+    ? `${base}:recheck:${typeof options.recheckNonce === 'string' ? options.recheckNonce : Math.floor(options.recheckNonce ?? now)}`
+    : base;
+}
+
+/**
  * Durable idempotency key. `preventReopen: true` must accompany this key so a
  * COMPLETED/FAILED job from the same day is never silently reopened; a later
  * day or an explicit operator recheck earns a new classification attempt.
@@ -234,6 +252,7 @@ export interface ClassificationJobPayload {
   catalogPin?: unknown;
   quotaOrigin: 'NORMAL' | 'PROBE';
   forceExtraction: boolean;
+  forceClassification?: boolean;
 }
 
 export function buildClassificationJobPayload(input: {
@@ -248,6 +267,7 @@ export function buildClassificationJobPayload(input: {
   catalogPin?: unknown;
   quotaOrigin: 'NORMAL' | 'PROBE';
   forceExtraction: boolean;
+  forceClassification?: boolean;
 }): ClassificationJobPayload {
   return {
     channelId: input.candidate.channelId,
@@ -262,6 +282,7 @@ export function buildClassificationJobPayload(input: {
     ...(input.catalogPin !== undefined ? { catalogPin: input.catalogPin } : {}),
     quotaOrigin: input.quotaOrigin,
     forceExtraction: input.forceExtraction,
+    ...(input.forceClassification ? { forceClassification: true } : {}),
   };
 }
 
