@@ -22,7 +22,7 @@ import {
 import { calculateCreatorQualityScore, extractVocabularyFromCreator, invokeChannelVocabularyExtraction, replayVocabularyForRetry, resolveExtractionVideoIds } from './queryIntelligence';
 import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { enqueueTermHarvest } from './candidateCorpus';
-import { resolveEnrichmentReopenBlockedLifecycle, resolveExistingEnrichmentAction, resolveUncertainLifecycle } from './enrichmentLifecycle';
+import { isEnrichmentStageExhausted, resolveEnrichmentReopenBlockedLifecycle, resolveExistingEnrichmentAction, resolveUncertainLifecycle } from './enrichmentLifecycle';
 import { enrichmentJobIdempotencyKey } from './classificationDecoupling';
 import {ConfigurableWeightedStrategy,evaluateClassificationStages,buildCanonicalEvidenceCorpus,getLayeredKnowledgeContext,type EvidenceCollectionReport,type RawChannelInput} from './evidenceEngine';
 import { buildContextualComposition } from './evidenceEngine/contextualComposition';
@@ -977,6 +977,28 @@ async function processChannelThroughPipelineInContext(
 
     if (lifecycle.shouldEnqueue) {
       const action=ACTIONS.find(item=>item.action===appliedAction),nextStage=action?.enrichmentStage||Math.min(2,currentStage+1);
+      if(isEnrichmentStageExhausted(isEnrichmentPass,currentStage,nextStage)){
+        // The pass already executed this stage. Close the machine-owned
+        // marker instead of enqueueing the same stage forever.
+        const terminal=resolveEnrichmentReopenBlockedLifecycle(authoritativeChannel,{blockedJobStatus:'COMPLETED',hasOtherActiveEnrichmentJob:false});
+        if(terminal.scanStatus!==authoritativeChannel.scan_status){
+          const db=await getDb();
+          await db.query(
+            `UPDATE channels c SET scan_status=$2,last_checked=$3,updated_at=now()
+              WHERE c.channel_id=$1 AND c.scan_status = ANY($4::text[])
+                AND NOT EXISTS (
+                  SELECT 1 FROM jobs j
+                   WHERE j.type='ENRICH_CHANNEL'
+                     AND j.status IN ('PENDING','PROCESSING')
+                     AND j.payload->>'channelId'=c.channel_id
+                     AND ($5::uuid IS NULL OR j.id<>$5::uuid)
+                )`,
+            [candidate.channelId,terminal.scanStatus,now,['ENRICHMENT_PENDING','ENRICHING','LOCKED'],options?.jobId||null],
+          );
+          const refreshed=await getChannelById(candidate.channelId);
+          if(refreshed)Object.assign(authoritativeChannel,refreshed);
+        }
+      }else{
       const vitality=deriveVitalityScheduling(productionClassification.input.activity_metadata,productionClassification.decision.timestamp),priority=10+vitality.jobPriorityDelta,payload={ channelId: candidate.channelId, targetCountry, source, candidate, enrichmentStage:nextStage, quotaOrigin: currentOfficialYouTubeQuotaOrigin() === 'PROBE' ? 'PROBE' : 'NORMAL', evidenceAcquisitionDecisionId:evidencePlan?.decisionId, evidenceAction:appliedAction, vitalityScheduling:vitality };
       // Ordinary rediscovery must not turn completed enrichment back into
       // PENDING or create a second job beside active work. The stable
@@ -1078,6 +1100,7 @@ async function processChannelThroughPipelineInContext(
           const refreshed=await getChannelById(candidate.channelId);
           if(refreshed)Object.assign(authoritativeChannel,refreshed);
         }
+      }
       }
     }
 

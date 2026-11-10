@@ -47,6 +47,19 @@ export function resolveEnrichmentReopenBlockedLifecycle(
   };
 }
 
+/**
+ * An enrichment pass must not schedule the stage it just executed. The stage
+ * sequence is bounded at 2; once a pass reaches it, a repeated request is a
+ * bookkeeping loop, not new evidence work.
+ */
+export function isEnrichmentStageExhausted(
+  isEnrichmentPass: boolean,
+  currentStage: number,
+  nextStage: number,
+): boolean {
+  return isEnrichmentPass === true && nextStage <= Math.max(0, currentStage);
+}
+
 export type ExistingEnrichmentAction =
   | 'SCHEDULE_WORKFLOW'
   | 'REUSE_ACTIVE'

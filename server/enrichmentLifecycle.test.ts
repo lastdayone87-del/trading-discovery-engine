@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { resolveEnrichmentReopenBlockedLifecycle, resolveExistingEnrichmentAction, resolveTerminalEnrichmentFailure, resolveUncertainLifecycle } from './enrichmentLifecycle';
+import { isEnrichmentStageExhausted, resolveEnrichmentReopenBlockedLifecycle, resolveExistingEnrichmentAction, resolveTerminalEnrichmentFailure, resolveUncertainLifecycle } from './enrichmentLifecycle';
 import { evaluateReviewEligibilityV2 } from './reviewEligibility/policy';
 
 const base={classificationStatus:'UNCERTAIN',investigationState:'UNRESOLVED',plausibleTradingHypothesis:true,evidenceSufficient:true,independentEvidence:true,countryAllowed:true,operationalFailure:false,providerDegraded:false,unsupportedLanguage:false,terminalDecision:false};
@@ -114,4 +114,12 @@ test('workflow scheduling reuses the stable channel/stage owner instead of creat
   // A failed lookup must not schedule a second key; the ordinary enqueue is idempotent.
   assert.equal(resolveExistingEnrichmentAction('PENDING', true), 'ENQUEUE_IDEMPOTENT');
   assert.equal(resolveExistingEnrichmentAction(null, true), 'ENQUEUE_IDEMPOTENT');
+});
+
+test('an enrichment pass stops scheduling the stage it already ran', () => {
+  assert.equal(isEnrichmentStageExhausted(true, 2, 2), true);
+  assert.equal(isEnrichmentStageExhausted(true, 2, 1), true);
+  assert.equal(isEnrichmentStageExhausted(true, 1, 2), false);
+  assert.equal(isEnrichmentStageExhausted(true, 0, 1), false);
+  assert.equal(isEnrichmentStageExhausted(false, 2, 2), false);
 });
