@@ -530,19 +530,28 @@ function countryAtoms(country: string, vocabulary?: CountryVocabulary): SearchAt
  * extracted. The 40% share is an initial safeguard, not a permanent ceiling:
  * later allocation policy can raise it only with measured evidence.
  */
-export function capExtractedStandaloneShare<T extends { metadata: { queryTemplate?: string } }>(planned: T[]): T[] {
+export function capExtractedStandaloneShare<T extends { metadata: { queryTemplate?: string } }>(
+  planned: T[],
+  onDeferred?: (deferred: T[]) => void,
+): T[] {
   if (!planned.length) return planned;
   const extractedCount = planned.filter(item => item.metadata?.queryTemplate === 'EXTRACTED_STANDALONE').length;
   const otherCount = planned.length - extractedCount;
   // k / (k + others) <= 0.4  =>  k <= (2/3) * others.
   const maxExtracted = Math.floor((otherCount * 2) / 3);
   let kept = 0;
-  return planned.filter(item => {
+  const deferred: T[] = [];
+  const capped = planned.filter(item => {
     if (item.metadata?.queryTemplate !== 'EXTRACTED_STANDALONE') return true;
-    if (kept >= maxExtracted) return false;
+    if (kept >= maxExtracted) {
+      deferred.push(item);
+      return false;
+    }
     kept += 1;
     return true;
   });
+  if (deferred.length) onDeferred?.(deferred);
+  return capped;
 }
 
 export function planDiverseQueries(args: {
@@ -581,6 +590,8 @@ export function planDiverseQueries(args: {
    * authorization source.
    */
   scopePromotionBasis?: 'PERSISTENT_SCOPE_SELECTION' | 'DIRECT_TARGET';
+  /** Cap-deferred extracted candidates remain eligible for a later batch. */
+  onExtractedCapDeferred?: (candidateIds: number[]) => void;
 }): PlannedQuery[] {
   const count = Math.max(1, args.count);
   const mode = args.mode || (args.existingQueries.length ? 'EXPLORATION' : 'COLD_START');
@@ -1056,7 +1067,12 @@ export function planDiverseQueries(args: {
     if (planned.length >= count) break;
     trySelect(candidate);
   }
-  return capExtractedStandaloneShare(planned);
+  return capExtractedStandaloneShare(planned, deferred => {
+    const ids = deferred
+      .map(item => Number((item.metadata as any)?.extractedCandidateId || 0))
+      .filter(id => Number.isSafeInteger(id) && id > 0);
+    if (ids.length) args.onExtractedCapDeferred?.(ids);
+  });
 }
 
 export function reformulatePollutedQuery(args: {

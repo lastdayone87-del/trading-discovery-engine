@@ -428,7 +428,14 @@ test('extracted standalone share is capped by the actual planned batch', () => {
   assert.deepEqual(capExtractedStandaloneShare([extracted(1), extracted(2), other(3), other(4), other(5)]).map(item => item.id), [1, 2, 3, 4, 5]);
   assert.deepEqual(capExtractedStandaloneShare([extracted(1), extracted(2), extracted(3), other(4), other(5), other(6)]).map(item => item.id), [1, 2, 4, 5, 6]);
   assert.deepEqual(capExtractedStandaloneShare([]), []);
+  const deferredHelper: number[] = [];
+  capExtractedStandaloneShare(
+    [extracted(1), extracted(2), other(3)],
+    items => deferredHelper.push(...items.map(item => item.id)),
+  );
+  assert.deepEqual(deferredHelper, [1, 2]);
 
+  const deferredPlanner: number[] = [];
   const underfilled = planDiverseQueries({
     country: 'Test Land',
     count: 4,
@@ -442,8 +449,10 @@ test('extracted standalone share is capped by the actual planned batch', () => {
       confidence: 0.8,
       sourceTitle: 'DAX Orderflow Strategie',
     }],
+    onExtractedCapDeferred: ids => deferredPlanner.push(...ids),
   });
   assert.deepEqual(underfilled, []);
+  assert.deepEqual(deferredPlanner, [9201]);
 });
 
 test('ambiguous short modifiers are not used by frontier target fallback', () => {

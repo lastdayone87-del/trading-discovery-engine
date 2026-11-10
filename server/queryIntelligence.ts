@@ -1973,6 +1973,7 @@ export async function generateCandidateQueriesForCountry(
         sourceIds: [signal.providerSignalId || `${signal.provider}:${signal.normalizedSurface}`],
       }))
     : [];
+  const capDeferredExtractedIds = new Set<number>();
   const planned = planDiverseQueries({
     country,
     count,
@@ -1992,13 +1993,20 @@ export async function generateCandidateQueriesForCountry(
       sourceTitle: candidate.sourceTitle,
     })),
     mode,
-    scopePromotionBasis: options.scopePromotionBasis
+    scopePromotionBasis: options.scopePromotionBasis,
+    onExtractedCapDeferred: ids => ids.forEach(id => capDeferredExtractedIds.add(id)),
   });
-  const plannedExtractedCandidateIds = [...new Set(planned
+  const plannedExtractedCandidateIds = new Set(planned
     .map(item => Number((item.metadata as any)?.extractedCandidateId || 0))
-    .filter(id => Number.isSafeInteger(id) && id > 0))];
-  if (plannedExtractedCandidateIds.length) {
-    await markExtractedQueryCandidatesAttempted(plannedExtractedCandidateIds).catch(error => {
+    .filter(id => Number.isSafeInteger(id) && id > 0));
+  const offeredExtractedIds = new Set(extractedOffer.map(candidate => candidate.id));
+  // Rotate planner-blocked or failed offers, but leave cap-deferred candidates
+  // available for the next batch.
+  const rotateExtractedIds = [...offeredExtractedIds]
+    .filter(id => !plannedExtractedCandidateIds.has(id) && !capDeferredExtractedIds.has(id));
+  const attemptedExtractedIds = [...new Set([...plannedExtractedCandidateIds, ...rotateExtractedIds])];
+  if (attemptedExtractedIds.length) {
+    await markExtractedQueryCandidatesAttempted(attemptedExtractedIds).catch(error => {
       console.warn('[Extracted Query] failed to record planner attempt', error instanceof Error ? error.message : String(error));
     });
   }

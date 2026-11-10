@@ -166,7 +166,7 @@ const SCRIPT_INTENT_TOKENS: Array<{ script: RegExp; tokens: string[] }> = [
   },
   {
     script: /[\p{Script=Hangul}]/u,
-    tokens: ['주식', '시장', '거래', '분석', '전략', '투자', '비트코인', '이더리움', '암호화폐', '선물', '옵션', '차트', '주가', '코스피', '코스닥', '환율', '원화', '매매', '금값', '금시세', '금투자'],
+    tokens: ['주식', '시장', '거래', '분석', '전략', '투자', '비트코인', '이더리움', '암호화폐', '선물', '옵션', '차트', '주가', '코스피', '코스닥', '환율', '원화', '매매', '금값', '금시세', '금투자', '주식거래', '주식시장', '주식투자', '주식매매', '주식분석', '주식전략'],
   },
   {
     script: /[\p{Script=Tamil}]/u,
@@ -220,13 +220,19 @@ function containsLiteralPhrase(source: string, candidate: string): boolean {
 }
 
 function containsNativeToken(text: string, token: string): boolean {
-  // Han/Kana are unspaced; Tamil/Arabic attach articles and inflections, so a
-  // substring is the meaningful match there. Hangul is spaced and must use a
-  // real word boundary (주식 must not match 주식회사).
-  if (/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Tamil}\p{Script=Arabic}]/u.test(token)) {
+  // Han/Kana are unspaced and Tamil inflects by suffix; substring matching is
+  // the meaningful form there.
+  if (/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Tamil}]/u.test(token)) {
     return text.includes(token);
   }
   const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (/\p{Script=Arabic}/u.test(token)) {
+    // Arabic attaches articles/particles (الذهب, للسوق, للتداول) but arbitrary
+    // substrings such as التسوق ("shopping") must not match سوق.
+    return new RegExp(`(?<![\\p{L}\\p{N}])(?:ال|لل|بال|كال|فال|وال|و|ف|ب|ل|ك)?${escaped}(?![\\p{L}\\p{N}])`, 'iu').test(text);
+  }
+  // Hangul is spaced: require a real word boundary and rely on explicit
+  // compounds (주식거래, 주식시장) instead of matching 주식 inside 주식회사.
   return new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, 'iu').test(text);
 }
 
