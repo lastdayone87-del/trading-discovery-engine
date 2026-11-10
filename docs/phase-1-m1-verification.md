@@ -32,8 +32,7 @@ covered by the existing pg-tests and is a separate integration boundary. The
 suite injects `creatorLikelyTrading:false` and an empty URL failure-history
 loader and deletes `DATABASE_URL` for its test process, so `getDb()` cannot
 open, migrate, or seed a configured developer database; settings reads fail
-closed to defaults and no DB writes occur. Run it under the disposable CI
-database.
+closed to defaults and no DB writes occur.
 
 ## Scenario matrix
 
