@@ -9,7 +9,7 @@
  */
 import { createHash } from 'node:crypto';
 import { detectLanguage } from './languageDetection';
-import { isSearchableTradingTerm } from './terminologySearchability';
+import { hasGovernedTradingSemantics, isSearchableTradingTerm } from './terminologySearchability';
 
 export type ExtractedCandidateSourceKind = 'VIDEO_TITLE' | 'PLAYLIST_TITLE' | 'PLAYLIST_DESCRIPTION' | 'DESCRIPTION';
 
@@ -194,7 +194,7 @@ function containsLiteralPhrase(source: string, candidate: string): boolean {
   return new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, 'iu').test(source);
 }
 
-function hasTradingIntent(text: string): boolean {
+function hasTradingIntent(text: string, country?: string | null, language?: string | null): boolean {
   const words = text
     .toLocaleLowerCase('en')
     .split(/\s+/gu)
@@ -206,6 +206,10 @@ function hasTradingIntent(text: string): boolean {
     if (WEAK_INTENT_TOKENS.has(word)) weakMatches += 1;
   }
   if (weakMatches >= 2) return true;
+  // The governed multilingual lexicon is the authority for native finance
+  // semantics. The local token lists below are a fast path, not the only
+  // source of truth for Japanese/Chinese/Tamil/Arabic vocabulary.
+  if (hasGovernedTradingSemantics(text, { country, language })) return true;
   // Mixed native titles often carry their instrument as an ASCII ticker
   // (ETHの見方, DAX Analyse). Treat a known strong ticker as intent without
   // widening the generic native token list.
@@ -343,7 +347,7 @@ export function assessExtractedQueryCandidateDetailed(input: {
     if (words.length < (unspaced ? 1 : 2)) reasons.push('TOO_FEW_WORDS');
     if (words.length > 6) reasons.push('TOO_MANY_WORDS');
     if (!/\p{L}/u.test(candidateText)) reasons.push('NO_LETTERS');
-    if (!hasTradingIntent(candidateText)) reasons.push('NO_TRADING_INTENT');
+    if (!hasTradingIntent(candidateText, input.country, language === 'und' ? undefined : language)) reasons.push('NO_TRADING_INTENT');
     // A segment made only of generic tokens is noise even if it survived a title.
     if (words.every(word => /^(live|video|channel|session|analysis|analyse|trading)$/iu.test(word))) {
       reasons.push('GENERIC_ONLY');
